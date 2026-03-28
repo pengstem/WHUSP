@@ -17,3 +17,5 @@ pushall.sh
 .vscode/*.log
 
 develop-guide/
+AGENTS.md
+CLAUDE.md
