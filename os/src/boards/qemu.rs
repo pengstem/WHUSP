@@ -7,13 +7,11 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use fdt::{Fdt, node::FdtNode};
 use riscv::register::sie;
+use virtio_drivers::{DeviceType, VirtIOHeader};
 
 const MMIO_REGION_CAPACITY: usize = 7;
-const NET_IRQ: usize = 4;
 const KEYBOARD_IRQ: usize = 5;
 const MOUSE_IRQ: usize = 6;
-const GPU_IRQ: usize = 7;
-const BLOCK_IRQ: usize = 8;
 const EARLY_UART_BASE: usize = 0x1000_0000;
 
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
@@ -184,6 +182,26 @@ fn set_required_device(slot: &mut IrqDevice, value: IrqDevice, context: &str) {
     *slot = value;
 }
 
+fn push_device_mmio_region(config: &mut BoardConfig, device: IrqDevice) {
+    push_mmio_region(
+        config,
+        MmioRange {
+            base: device.base,
+            size: device.size,
+        },
+    );
+}
+
+fn virtio_device_type(device: IrqDevice) -> DeviceType {
+    let header = unsafe { &*(device.base as *const VirtIOHeader) };
+    assert!(
+        header.verify(),
+        "virtio-mmio device at {:#x} has an invalid header",
+        device.base
+    );
+    header.device_type()
+}
+
 unsafe extern "C" {
     safe fn ekernel();
 }
@@ -251,57 +269,35 @@ pub fn init_from_dtb(dtb_addr: usize) {
             continue;
         }
         let device = irq_device(node, "virtio-mmio");
-        match device.irq {
-            BLOCK_IRQ => {
-                set_required_device(&mut config.block, device, "virtio block");
-                push_mmio_region(
-                    &mut config,
-                    MmioRange {
-                        base: device.base,
-                        size: device.size,
-                    },
-                );
+        match virtio_device_type(device) {
+            DeviceType::Block => {
+                if config.block.base == 0 {
+                    set_required_device(&mut config.block, device, "virtio block");
+                    push_device_mmio_region(&mut config, device);
+                }
             }
-            GPU_IRQ => {
+            DeviceType::GPU => {
                 set_required_device(&mut config.gpu, device, "virtio gpu");
-                push_mmio_region(
-                    &mut config,
-                    MmioRange {
-                        base: device.base,
-                        size: device.size,
-                    },
-                );
+                push_device_mmio_region(&mut config, device);
             }
-            KEYBOARD_IRQ => {
-                set_required_device(&mut config.keyboard, device, "virtio keyboard");
-                push_mmio_region(
-                    &mut config,
-                    MmioRange {
-                        base: device.base,
-                        size: device.size,
-                    },
-                );
+            // The MMIO header only tells us that this is a virtio-input device.
+            // Keep the existing IRQ split to decide which input transport is the
+            // keyboard and which one is the mouse.
+            DeviceType::Input => match device.irq {
+                KEYBOARD_IRQ => {
+                    set_required_device(&mut config.keyboard, device, "virtio keyboard");
+                    push_device_mmio_region(&mut config, device);
+                }
+                MOUSE_IRQ => {
+                    set_required_device(&mut config.mouse, device, "virtio mouse");
+                    push_device_mmio_region(&mut config, device);
+                }
+                _ => panic!("unsupported virtio input IRQ {}", device.irq),
             }
-            MOUSE_IRQ => {
-                set_required_device(&mut config.mouse, device, "virtio mouse");
-                push_mmio_region(
-                    &mut config,
-                    MmioRange {
-                        base: device.base,
-                        size: device.size,
-                    },
-                );
-            }
-            NET_IRQ => {
+            DeviceType::Network => {
                 assert!(config.net.is_none(), "duplicate virtio net device in DTB");
                 config.net = Some(device);
-                push_mmio_region(
-                    &mut config,
-                    MmioRange {
-                        base: device.base,
-                        size: device.size,
-                    },
-                );
+                push_device_mmio_region(&mut config, device);
             }
             _ => {}
         }
