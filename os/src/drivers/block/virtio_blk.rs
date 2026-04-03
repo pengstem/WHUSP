@@ -6,9 +6,6 @@ use crate::task::schedule;
 use alloc::collections::BTreeMap;
 use virtio_drivers::{BlkResp, RespStatus, VirtIOBlk, VirtIOHeader};
 
-#[allow(unused)]
-const VIRTIO0: usize = 0x10008000;
-
 pub struct VirtIOBlock {
     virtio_blk: UPIntrFreeCell<VirtIOBlk<'static, VirtioHal>>,
     condvars: BTreeMap<u16, Condvar>,
@@ -68,9 +65,10 @@ impl BlockDevice for VirtIOBlock {
 
 impl VirtIOBlock {
     pub fn new() -> Self {
+        let base_addr = crate::board::block_base();
         let virtio_blk = unsafe {
             UPIntrFreeCell::new(
-                VirtIOBlk::<VirtioHal>::new(&mut *(VIRTIO0 as *mut VirtIOHeader)).unwrap(),
+                VirtIOBlk::<VirtioHal>::new(&mut *(base_addr as *mut VirtIOHeader)).unwrap(),
             )
         };
         let mut condvars = BTreeMap::new();

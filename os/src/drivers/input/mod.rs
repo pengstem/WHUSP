@@ -6,9 +6,6 @@ use alloc::sync::Arc;
 use core::any::Any;
 use virtio_drivers::{VirtIOHeader, VirtIOInput};
 
-const VIRTIO5: usize = 0x10005000;
-const VIRTIO6: usize = 0x10006000;
-
 struct VirtIOInputInner {
     virtio_input: VirtIOInput<'static, VirtioHal>,
     events: VecDeque<u64>,
@@ -26,8 +23,10 @@ pub trait InputDevice: Send + Sync + Any {
 }
 
 lazy_static::lazy_static!(
-    pub static ref KEYBOARD_DEVICE: Arc<dyn InputDevice> = Arc::new(VirtIOInputWrapper::new(VIRTIO5));
-    pub static ref MOUSE_DEVICE: Arc<dyn InputDevice> = Arc::new(VirtIOInputWrapper::new(VIRTIO6));
+    pub static ref KEYBOARD_DEVICE: Arc<dyn InputDevice> =
+        Arc::new(VirtIOInputWrapper::new(crate::board::keyboard_base()));
+    pub static ref MOUSE_DEVICE: Arc<dyn InputDevice> =
+        Arc::new(VirtIOInputWrapper::new(crate::board::mouse_base()));
 );
 
 impl VirtIOInputWrapper {

@@ -6,8 +6,6 @@ use alloc::sync::Arc;
 use lazy_static::*;
 use virtio_drivers::{VirtIOHeader, VirtIONet};
 
-const VIRTIO8: usize = 0x10004000;
-
 lazy_static! {
     pub static ref NET_DEVICE: Arc<dyn NetDevice> = Arc::new(VirtIONetWrapper::new());
 }
@@ -37,8 +35,10 @@ impl NetDevice for VirtIONetWrapper {
 
 impl VirtIONetWrapper {
     pub fn new() -> Self {
+        let base_addr =
+            crate::board::net_base().expect("DTB is missing a virtio net device for NET_DEVICE");
         unsafe {
-            let virtio = VirtIONet::<VirtioHal>::new(&mut *(VIRTIO8 as *mut VirtIOHeader))
+            let virtio = VirtIONet::<VirtioHal>::new(&mut *(base_addr as *mut VirtIOHeader))
                 .expect("can't create net device by virtio");
             VirtIONetWrapper(UPIntrFreeCell::new(virtio))
         }
