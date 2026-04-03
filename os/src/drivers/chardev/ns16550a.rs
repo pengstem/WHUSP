@@ -124,15 +124,15 @@ struct NS16550aInner {
     read_buffer: VecDeque<u8>,
 }
 
-pub struct NS16550a<const BASE_ADDR: usize> {
+pub struct NS16550a {
     inner: UPIntrFreeCell<NS16550aInner>,
     condvar: Condvar,
 }
 
-impl<const BASE_ADDR: usize> NS16550a<BASE_ADDR> {
-    pub fn new() -> Self {
+impl NS16550a {
+    pub fn new(base_addr: usize) -> Self {
         let inner = NS16550aInner {
-            ns16550a: NS16550aRaw::new(BASE_ADDR),
+            ns16550a: NS16550aRaw::new(base_addr),
             read_buffer: VecDeque::new(),
         };
         //inner.ns16550a.init();
@@ -148,7 +148,7 @@ impl<const BASE_ADDR: usize> NS16550a<BASE_ADDR> {
     }
 }
 
-impl<const BASE_ADDR: usize> CharDevice for NS16550a<BASE_ADDR> {
+impl CharDevice for NS16550a {
     fn init(&self) {
         let mut inner = self.inner.exclusive_access();
         inner.ns16550a.init();

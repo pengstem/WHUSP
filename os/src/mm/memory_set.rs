@@ -2,7 +2,7 @@ use super::{FrameTracker, frame_alloc};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
-use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE};
+use crate::config::{PAGE_SIZE, TRAMPOLINE, memory_end, mmio_regions};
 use crate::sync::UPIntrFreeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -146,18 +146,18 @@ impl MemorySet {
         memory_set.push(
             MapArea::new(
                 (ekernel as usize).into(),
-                MEMORY_END.into(),
+                memory_end().into(),
                 MapType::Identical,
                 MapPermission::R | MapPermission::W,
             ),
             None,
         );
         //println!("mapping memory-mapped registers");
-        for pair in MMIO {
+        for pair in mmio_regions() {
             memory_set.push(
                 MapArea::new(
-                    (*pair).0.into(),
-                    ((*pair).0 + (*pair).1).into(),
+                    pair.base.into(),
+                    (pair.base + pair.size).into(),
                     MapType::Identical,
                     MapPermission::R | MapPermission::W,
                 ),

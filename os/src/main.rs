@@ -59,14 +59,22 @@ lazy_static! {
 }
 
 #[unsafe(no_mangle)]
-pub fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
+pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     clear_bss();
     BOOT_HART_ID.store(hart_id, Ordering::Relaxed);
     DTB_ADDR.store(dtb_addr, Ordering::Relaxed);
-    logging::init();
-    info!("boot hart_id={}, dtb_addr={:#x}", hart_id, dtb_addr);
+    board::init_from_dtb(dtb_addr);
     mm::init();
     UART.init();
+    logging::init();
+    info!("boot hart_id={}, dtb_addr={:#x}", hart_id, dtb_addr);
+    info!(
+        "board config: clock_freq={}, memory_end={:#x}, uart={:#x}, plic={:#x}",
+        board::clock_freq(),
+        board::memory_end(),
+        board::uart_base(),
+        board::plic_base(),
+    );
     info!("KERN: init gpu");
     let _gpu = GPU_DEVICE.clone();
     info!("KERN: init keyboard");

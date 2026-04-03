@@ -1,5 +1,5 @@
 use super::{PhysAddr, PhysPageNum};
-use crate::config::MEMORY_END;
+use crate::config::memory_end;
 use crate::sync::UPIntrFreeCell;
 use alloc::vec::Vec;
 use core::fmt::{self, Debug, Formatter};
@@ -104,7 +104,7 @@ pub fn init_frame_allocator() {
     }
     FRAME_ALLOCATOR.exclusive_access().init(
         PhysAddr::from(ekernel as usize).ceil(),
-        PhysAddr::from(MEMORY_END).floor(),
+        PhysAddr::from(memory_end()).floor(),
     );
 }
 

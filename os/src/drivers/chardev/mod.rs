@@ -13,5 +13,6 @@ pub trait CharDevice {
 }
 
 lazy_static! {
-    pub static ref UART: Arc<CharDeviceImpl> = Arc::new(CharDeviceImpl::new());
+    pub static ref UART: Arc<CharDeviceImpl> =
+        Arc::new(CharDeviceImpl::new(crate::board::uart_base()));
 }

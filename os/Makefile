@@ -78,7 +78,7 @@ QEMU_ARGS := -machine virt \
 			 -bios default \
 			 -serial stdio \
 			 $(GUI_OPTION) \
-			 -device loader,file=$(KERNEL_ELF) \
+			 -kernel $(KERNEL_ELF) \
 			 -drive file=$(FS_IMG),if=none,format=raw,id=x0 \
 			 -device virtio-blk-device,drive=x0 \
 			 -device virtio-gpu-device \

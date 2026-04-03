@@ -9,4 +9,14 @@ pub const PAGE_SIZE_BITS: usize = 0xc;
 pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
 pub const TRAP_CONTEXT_BASE: usize = TRAMPOLINE - PAGE_SIZE;
 
-pub use crate::board::{CLOCK_FREQ, MEMORY_END, MMIO};
+pub fn clock_freq() -> usize {
+    crate::board::clock_freq()
+}
+
+pub fn memory_end() -> usize {
+    crate::board::memory_end()
+}
+
+pub fn mmio_regions() -> &'static [crate::board::MmioRange] {
+    crate::board::mmio_regions()
+}
