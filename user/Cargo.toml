@@ -3,6 +3,7 @@ name = "user_lib"
 version = "0.1.0"
 authors = ["Yifan Wu <shinbokuow@163.com>"]
 edition = "2024"
+autobins = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -15,5 +16,364 @@ embedded-graphics = "0.7.1"
 oorandom ="11"
 virtio-input-decoder = "0.1.4"
 
+[lib]
+test = false
+bench = false
+doctest = false
+
 [profile.release]
 debug = true
+
+[[bin]]
+name = "adder"
+path = "src/bin/adder.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "adder_atomic"
+path = "src/bin/adder_atomic.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "adder_mutex_blocking"
+path = "src/bin/adder_mutex_blocking.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "adder_mutex_spin"
+path = "src/bin/adder_mutex_spin.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "adder_peterson_spin"
+path = "src/bin/adder_peterson_spin.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "adder_peterson_yield"
+path = "src/bin/adder_peterson_yield.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "adder_simple_spin"
+path = "src/bin/adder_simple_spin.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "adder_simple_yield"
+path = "src/bin/adder_simple_yield.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "barrier_condvar"
+path = "src/bin/barrier_condvar.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "barrier_fail"
+path = "src/bin/barrier_fail.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "cat"
+path = "src/bin/cat.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "cmdline_args"
+path = "src/bin/cmdline_args.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "condsync_condvar"
+path = "src/bin/condsync_condvar.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "condsync_sem"
+path = "src/bin/condsync_sem.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "count_lines"
+path = "src/bin/count_lines.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "eisenberg"
+path = "src/bin/eisenberg.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "exit"
+path = "src/bin/exit.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "fantastic_text"
+path = "src/bin/fantastic_text.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "filetest_simple"
+path = "src/bin/filetest_simple.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "forktest"
+path = "src/bin/forktest.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "forktest2"
+path = "src/bin/forktest2.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "forktest_simple"
+path = "src/bin/forktest_simple.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "forktree"
+path = "src/bin/forktree.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "gui_move"
+path = "src/bin/gui_move.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "gui_shape"
+path = "src/bin/gui_shape.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "gui_snake"
+path = "src/bin/gui_snake.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "gui_tri"
+path = "src/bin/gui_tri.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "hello_world"
+path = "src/bin/hello_world.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "huge_write"
+path = "src/bin/huge_write.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "huge_write_mt"
+path = "src/bin/huge_write_mt.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "infloop"
+path = "src/bin/infloop.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "initproc"
+path = "src/bin/initproc.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "inputdev_event"
+path = "src/bin/inputdev_event.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "matrix"
+path = "src/bin/matrix.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "mpsc_sem"
+path = "src/bin/mpsc_sem.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "peterson"
+path = "src/bin/peterson.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "phil_din_mutex"
+path = "src/bin/phil_din_mutex.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "pipe_large_test"
+path = "src/bin/pipe_large_test.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "pipetest"
+path = "src/bin/pipetest.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "priv_csr"
+path = "src/bin/priv_csr.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "priv_inst"
+path = "src/bin/priv_inst.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "race_adder_arg"
+path = "src/bin/race_adder_arg.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "random_num"
+path = "src/bin/random_num.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "run_pipe_test"
+path = "src/bin/run_pipe_test.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "sleep"
+path = "src/bin/sleep.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "sleep_simple"
+path = "src/bin/sleep_simple.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "stack_overflow"
+path = "src/bin/stack_overflow.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "stackful_coroutine"
+path = "src/bin/stackful_coroutine.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "stackless_coroutine"
+path = "src/bin/stackless_coroutine.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "store_fault"
+path = "src/bin/store_fault.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "sync_sem"
+path = "src/bin/sync_sem.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "tcp_simplehttp"
+path = "src/bin/tcp_simplehttp.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "threads"
+path = "src/bin/threads.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "threads_arg"
+path = "src/bin/threads_arg.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "udp"
+path = "src/bin/udp.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "until_timeout"
+path = "src/bin/until_timeout.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "user_shell"
+path = "src/bin/user_shell.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "usertests"
+path = "src/bin/usertests.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "yield"
+path = "src/bin/yield.rs"
+test = false
+bench = false
