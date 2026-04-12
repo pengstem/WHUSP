@@ -1,0 +1,120 @@
+name: CI PR
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-pr-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  format-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2025-05-20
+          components: rustfmt, rust-src, llvm-tools-preview
+          targets: riscv64gc-unknown-none-elf
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            os -> os/target
+            user -> user/target
+
+      - name: Check formatting
+        run: |
+          cargo fmt --manifest-path os/Cargo.toml --all --check
+          cargo fmt --manifest-path user/Cargo.toml --all --check
+
+  rv-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2025-05-20
+          components: rust-src, llvm-tools-preview
+          targets: riscv64gc-unknown-none-elf
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            os -> os/target
+            user -> user/target
+
+      - name: Build kernel and user programs
+        run: |
+          make -C os kernel
+          make -C user build
+
+  root-artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2025-05-20
+          components: rust-src, llvm-tools-preview
+          targets: riscv64gc-unknown-none-elf
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            os -> os/target
+            user -> user/target
+
+      - name: Build root artifacts
+        run: |
+          make kernel-rv
+          make disk.img
+          test -f kernel-rv
+          test -f disk.img
+
+      - name: Upload root artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: root-rv-artifacts
+          path: |
+            kernel-rv
+            disk.img
+          if-no-files-found: error
+
+  makefile-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Makefile entrypoints
+        run: |
+          make -n run-rv-dev
+          make -n run-rv-contest TEST_DISK=/tmp/sdcard-rv.img

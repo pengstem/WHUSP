@@ -1,0 +1,68 @@
+name: Contest Gap
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: contest-gap-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  contest-gap:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2025-05-20
+          components: rust-src, llvm-tools-preview
+          targets: riscv64gc-unknown-none-elf
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            os -> os/target
+            user -> user/target
+
+      - name: Run contest entry build and summarize gap
+        shell: bash
+        run: |
+          set -euo pipefail
+          make all
+
+          rv_status=missing
+          la_status=missing
+          disk_status=missing
+
+          [[ -f kernel-rv ]] && rv_status=present
+          [[ -f kernel-la ]] && la_status=present
+          [[ -f disk.img ]] && disk_status=present
+
+          {
+            echo "## Contest artifact gap"
+            echo ""
+            echo "| Artifact | Status |"
+            echo "| --- | --- |"
+            echo "| kernel-rv | ${rv_status} |"
+            echo "| kernel-la | ${la_status} |"
+            echo "| disk.img | ${disk_status} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          [[ -f kernel-rv ]]
+          [[ -f kernel-la ]]

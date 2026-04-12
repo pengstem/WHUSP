@@ -55,3 +55,4 @@
 - [ ] 分析 `huge_write` 在 EXT4 路径上的瓶颈（分配、flush、缓存、写入粒度）
 - [ ] 优化 EXT4 顺序写路径，让 `huge_write` 不再明显慢于旧 `easy-fs`
 - [ ] 给 LoongArch 提前保留根构建入口和最小验证脚本（可并行）
+- [ ] 更合适比赛开发的 github ci（可并行）
