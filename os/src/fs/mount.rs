@@ -15,8 +15,7 @@ const AUX_MOUNT_ID: MountId = MountId(1);
 lazy_static! {
     static ref PRIMARY_MOUNT: UPIntrFreeCell<Option<Ext4Mount>> =
         unsafe { UPIntrFreeCell::new(None) };
-    static ref AUX_MOUNT: UPIntrFreeCell<Option<Ext4Mount>> =
-        unsafe { UPIntrFreeCell::new(None) };
+    static ref AUX_MOUNT: UPIntrFreeCell<Option<Ext4Mount>> = unsafe { UPIntrFreeCell::new(None) };
     static ref MOUNTS_INITIALIZED: UPIntrFreeCell<bool> = unsafe { UPIntrFreeCell::new(false) };
 }
 
@@ -43,7 +42,10 @@ pub fn init_mounts() {
         *slot = block_device(1).and_then(|device| match Ext4Mount::open(device) {
             Ok(mount) => Some(mount),
             Err(err) => {
-                warn!("failed to mount auxiliary ext4 disk on BLOCK_DEVICES[1]: {:?}", err);
+                warn!(
+                    "failed to mount auxiliary ext4 disk on BLOCK_DEVICES[1]: {:?}",
+                    err
+                );
                 None
             }
         });

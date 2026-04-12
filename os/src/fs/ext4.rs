@@ -42,7 +42,8 @@ impl Ext4BlockDevice for KernelDisk {
             if block.len() != EXT4_DEV_BSIZE {
                 return Err(Ext4Error::new(EIO as _, "unaligned block read"));
             }
-            self.dev.read_block(block_id as usize + index, &mut block_buf);
+            self.dev
+                .read_block(block_id as usize + index, &mut block_buf);
             block.copy_from_slice(&block_buf);
         }
         Ok(buf.len())
@@ -137,9 +138,7 @@ impl Ext4Mount {
     }
 
     pub(super) fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
-        self.fs
-            .read_at(ino, buf, offset)
-            .expect("ext4 read failed")
+        self.fs.read_at(ino, buf, offset).expect("ext4 read failed")
     }
 
     pub(super) fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize {

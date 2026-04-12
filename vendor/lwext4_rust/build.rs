@@ -22,7 +22,9 @@ fn main() {
             if cfg!(feature = "std") { "OFF" } else { "ON" }
         ));
         configure_toolchain(&arch, &mut cmd);
-        let status = cmd.status().expect("failed to execute process: make lwext4");
+        let status = cmd
+            .status()
+            .expect("failed to execute process: make lwext4");
         assert!(status.success());
     }
     generates_bindings_to_rust(binding_include_arg(&arch));

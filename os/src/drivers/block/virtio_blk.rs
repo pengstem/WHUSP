@@ -82,10 +82,10 @@ impl VirtIOBlock {
     pub fn new(base_addr: usize, irq: usize) -> Self {
         let header = unsafe { &mut *(base_addr as *mut VirtIOHeader) };
         // The first config-space field of a virtio block device is its 512-byte sector count.
-        let capacity_blocks = unsafe { read_volatile(header.config_space() as *const u64) as usize };
-        let virtio_blk = unsafe {
-            UPIntrFreeCell::new(VirtIOBlk::<VirtioHal>::new(header).unwrap())
-        };
+        let capacity_blocks =
+            unsafe { read_volatile(header.config_space() as *const u64) as usize };
+        let virtio_blk =
+            unsafe { UPIntrFreeCell::new(VirtIOBlk::<VirtioHal>::new(header).unwrap()) };
         let mut condvars = BTreeMap::new();
         let channels = virtio_blk.exclusive_access().virt_queue_size();
         for i in 0..channels {
