@@ -1,4 +1,7 @@
+mod ext4;
 mod inode;
+mod mount;
+mod path;
 mod pipe;
 mod stdio;
 
@@ -11,6 +14,19 @@ pub trait File: Send + Sync {
     fn write(&self, buf: UserBuffer) -> usize;
 }
 
-pub use inode::{OpenFlags, list_apps, open_file};
+pub fn init() {
+    mount::init_mounts();
+}
+
+pub fn list_apps() {
+    mount::mount_status_log();
+    println!("/**** APPS ****");
+    for app in mount::list_root_apps() {
+        println!("{}", app);
+    }
+    println!("**************/")
+}
+
+pub use inode::{OpenFlags, open_file};
 pub use pipe::make_pipe;
 pub use stdio::{Stdin, Stdout};

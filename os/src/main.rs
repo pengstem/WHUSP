@@ -86,6 +86,7 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     trap::enable_timer_interrupt();
     timer::set_next_trigger();
     board::device_init(hart_id);
+    fs::init();
     fs::list_apps();
     task::add_initproc();
     *DEV_NON_BLOCKING_ACCESS.exclusive_access() = true;
