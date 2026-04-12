@@ -8,6 +8,8 @@ use virtio_drivers::{BlkResp, RespStatus, VirtIOBlk, VirtIOHeader};
 
 pub struct VirtIOBlock {
     virtio_blk: UPIntrFreeCell<VirtIOBlk<'static, VirtioHal>>,
+    base_addr: usize,
+    irq: usize,
     capacity_blocks: usize,
     condvars: BTreeMap<u16, Condvar>,
 }
@@ -69,8 +71,15 @@ impl VirtIOBlock {
         self.capacity_blocks as u64
     }
 
-    pub fn new() -> Self {
-        let base_addr = crate::board::block_base();
+    pub fn irq(&self) -> usize {
+        self.irq
+    }
+
+    pub fn base_addr(&self) -> usize {
+        self.base_addr
+    }
+
+    pub fn new(base_addr: usize, irq: usize) -> Self {
         let header = unsafe { &mut *(base_addr as *mut VirtIOHeader) };
         // The first config-space field of a virtio block device is its 512-byte sector count.
         let capacity_blocks = unsafe { read_volatile(header.config_space() as *const u64) as usize };
@@ -85,6 +94,8 @@ impl VirtIOBlock {
         }
         Self {
             virtio_blk,
+            base_addr,
+            irq,
             capacity_blocks,
             condvars,
         }

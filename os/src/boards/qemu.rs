@@ -1,5 +1,4 @@
 use crate::BOOT_HART_ID;
-use crate::drivers::block::BLOCK_DEVICE;
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::drivers::plic::{IntrTargetPriority, PLIC};
 use crate::drivers::{KEYBOARD_DEVICE, MOUSE_DEVICE};
@@ -7,13 +6,10 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use fdt::{Fdt, node::FdtNode};
 use riscv::register::sie;
+use virtio_drivers::{DeviceType, VirtIOHeader};
 
-const MMIO_REGION_CAPACITY: usize = 7;
-const NET_IRQ: usize = 4;
-const KEYBOARD_IRQ: usize = 5;
-const MOUSE_IRQ: usize = 6;
-const GPU_IRQ: usize = 7;
-const BLOCK_IRQ: usize = 8;
+const BLOCK_DEVICE_CAPACITY: usize = 8;
+const MMIO_REGION_CAPACITY: usize = 10;
 const EARLY_UART_BASE: usize = 0x1000_0000;
 
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
@@ -26,10 +22,10 @@ pub struct MmioRange {
 }
 
 #[derive(Clone, Copy, Default)]
-struct IrqDevice {
-    base: usize,
-    size: usize,
-    irq: usize,
+pub struct IrqDevice {
+    pub base: usize,
+    pub size: usize,
+    pub irq: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -38,7 +34,8 @@ struct BoardConfig {
     memory_end: usize,
     uart: IrqDevice,
     plic: MmioRange,
-    block: IrqDevice,
+    blocks: [IrqDevice; BLOCK_DEVICE_CAPACITY],
+    block_count: usize,
     gpu: IrqDevice,
     keyboard: IrqDevice,
     mouse: IrqDevice,
@@ -58,11 +55,12 @@ impl BoardConfig {
                 irq: 0,
             },
             plic: MmioRange { base: 0, size: 0 },
-            block: IrqDevice {
+            blocks: [IrqDevice {
                 base: 0,
                 size: 0,
                 irq: 0,
-            },
+            }; BLOCK_DEVICE_CAPACITY],
+            block_count: 0,
             gpu: IrqDevice {
                 base: 0,
                 size: 0,
@@ -184,6 +182,15 @@ fn set_required_device(slot: &mut IrqDevice, value: IrqDevice, context: &str) {
     *slot = value;
 }
 
+fn push_block_device(config: &mut BoardConfig, value: IrqDevice) {
+    assert!(
+        config.block_count < config.blocks.len(),
+        "too many virtio block devices discovered in DTB"
+    );
+    config.blocks[config.block_count] = value;
+    config.block_count += 1;
+}
+
 fn push_device_mmio_region(config: &mut BoardConfig, device: IrqDevice) {
     push_mmio_region(
         config,
@@ -196,6 +203,15 @@ fn push_device_mmio_region(config: &mut BoardConfig, device: IrqDevice) {
 
 unsafe extern "C" {
     safe fn ekernel();
+}
+
+fn virtio_device_type(base: usize) -> Option<DeviceType> {
+    let header = unsafe { &*(base as *const VirtIOHeader) };
+    if header.verify() {
+        Some(header.device_type())
+    } else {
+        None
+    }
 }
 
 pub fn init_from_dtb(dtb_addr: usize) {
@@ -261,24 +277,26 @@ pub fn init_from_dtb(dtb_addr: usize) {
             continue;
         }
         let device = irq_device(node, "virtio-mmio");
-        match device.irq {
-            BLOCK_IRQ => {
-                set_required_device(&mut config.block, device, "virtio block");
+        match virtio_device_type(device.base) {
+            Some(DeviceType::Block) => {
+                push_block_device(&mut config, device);
                 push_device_mmio_region(&mut config, device);
             }
-            GPU_IRQ => {
+            Some(DeviceType::GPU) => {
                 set_required_device(&mut config.gpu, device, "virtio gpu");
                 push_device_mmio_region(&mut config, device);
             }
-            KEYBOARD_IRQ => {
-                set_required_device(&mut config.keyboard, device, "virtio keyboard");
+            Some(DeviceType::Input) => {
+                if config.keyboard.base == 0 {
+                    set_required_device(&mut config.keyboard, device, "virtio keyboard");
+                } else if config.mouse.base == 0 {
+                    set_required_device(&mut config.mouse, device, "virtio mouse");
+                } else {
+                    panic!("too many virtio input devices in DTB");
+                }
                 push_device_mmio_region(&mut config, device);
             }
-            MOUSE_IRQ => {
-                set_required_device(&mut config.mouse, device, "virtio mouse");
-                push_device_mmio_region(&mut config, device);
-            }
-            NET_IRQ => {
+            Some(DeviceType::Network) => {
                 assert!(config.net.is_none(), "duplicate virtio net device in DTB");
                 config.net = Some(device);
                 push_device_mmio_region(&mut config, device);
@@ -287,7 +305,7 @@ pub fn init_from_dtb(dtb_addr: usize) {
         }
     }
 
-    assert_ne!(config.block.base, 0, "DTB is missing virtio block device");
+    assert_ne!(config.block_count, 0, "DTB is missing virtio block device");
     assert_ne!(config.gpu.base, 0, "DTB is missing virtio gpu device");
     assert_ne!(
         config.keyboard.base, 0,
@@ -329,12 +347,9 @@ pub fn plic_base() -> usize {
     board_config().plic.base
 }
 
-pub fn block_base() -> usize {
-    board_config().block.base
-}
-
-pub fn block_irq() -> usize {
-    board_config().block.irq
+pub fn block_devices() -> &'static [IrqDevice] {
+    let config = board_config();
+    &config.blocks[..config.block_count]
 }
 
 pub fn gpu_base() -> usize {
@@ -368,9 +383,13 @@ pub fn device_init(hart_id: usize) {
     plic.set_threshold(hart_id, supervisor, 0);
     plic.set_threshold(hart_id, machine, 1);
 
-    for irq in [keyboard_irq(), mouse_irq(), block_irq(), uart_irq()] {
+    for irq in [keyboard_irq(), mouse_irq(), uart_irq()] {
         plic.enable(hart_id, supervisor, irq);
         plic.set_priority(irq, 1);
+    }
+    for block in block_devices() {
+        plic.enable(hart_id, supervisor, block.irq);
+        plic.set_priority(block.irq, 1);
     }
 
     unsafe {
@@ -384,17 +403,15 @@ pub fn irq_handler() {
     let intr_src_id = plic.claim(hart_id, IntrTargetPriority::Supervisor);
     let keyboard_irq = keyboard_irq() as u32;
     let mouse_irq = mouse_irq() as u32;
-    let block_irq = block_irq() as u32;
     let uart_irq = uart_irq() as u32;
 
     if intr_src_id == keyboard_irq {
         KEYBOARD_DEVICE.handle_irq();
     } else if intr_src_id == mouse_irq {
         MOUSE_DEVICE.handle_irq();
-    } else if intr_src_id == block_irq {
-        BLOCK_DEVICE.handle_irq();
     } else if intr_src_id == uart_irq {
         UART.handle_irq();
+    } else if crate::drivers::block::handle_irq(intr_src_id as usize) {
     } else {
         panic!("unsupported IRQ {}", intr_src_id);
     }
