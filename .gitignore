@@ -14,6 +14,8 @@ os/.gdb_history
 os/virt.out
 tools/
 pushall.sh
+disk.img
+kernel-rv
 
 develop-guide/
 AGENTS.md
