@@ -58,6 +58,11 @@ jobs:
       - name: Mark checkout as safe
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      - name: Prepare musl cross include path for lwext4 bindgen
+        run: |
+          mkdir -p /usr/riscv64-linux-musl/lib/musl
+          ln -sfn /opt/riscv64-linux-musl-cross/riscv64-linux-musl/include /usr/riscv64-linux-musl/lib/musl/include
+
       - name: Build kernel and user programs
         run: |
           make -C os kernel
@@ -75,6 +80,11 @@ jobs:
 
       - name: Mark checkout as safe
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Prepare musl cross include path for lwext4 bindgen
+        run: |
+          mkdir -p /usr/riscv64-linux-musl/lib/musl
+          ln -sfn /opt/riscv64-linux-musl-cross/riscv64-linux-musl/include /usr/riscv64-linux-musl/lib/musl/include
 
       - name: Build root artifacts
         run: |
