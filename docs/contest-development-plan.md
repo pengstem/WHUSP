@@ -1,0 +1,55 @@
+# OSKernel2026 开发任务清单
+
+- [ ] 重写根目录 `Makefile`，让 `make all` 成为正式提交入口
+- [ ] 让根目录 `make all` 产出 `kernel-rv`
+- [ ] 让根目录 `make all` 产出 `kernel-la`
+- [ ] 清理提交链路对隐藏目录 `.cargo` 的依赖
+- [ ] 把远程 Cargo 依赖改成离线可构建方案
+- [ ] 在本地验证无网络构建仍然可用
+- [ ] 修正 `os/src/boards/qemu.rs`，去掉对 GPU 的硬依赖
+- [ ] 修正 `os/src/boards/qemu.rs`，去掉对键盘的硬依赖
+- [ ] 修正 `os/src/boards/qemu.rs`，去掉对鼠标的硬依赖
+- [ ] 用官方评测风格的无头 QEMU 命令验证内核可以启动
+- [ ] 升级块设备发现逻辑，支持识别多个 virtio block 设备
+- [ ] 明确区分评测盘 `x0` 和自带盘 `x1`
+- [ ] 设计并实现测试盘挂载路径
+- [ ] 接入评测 EXT4 测试盘的只读访问
+- [ ] 保留现有 easy-fs 路径，避免一次性替换整个文件系统主线
+- [ ] 修改 `initproc`，支持比赛模式启动
+- [ ] 新增 submit runner 用户程序
+- [ ] 让 submit runner 按固定顺序串行执行测试脚本
+- [ ] 输出精确的 `#### OS COMP TEST GROUP START xxxxx ####`
+- [ ] 输出精确的 `#### OS COMP TEST GROUP END xxxxx ####`
+- [ ] 在所有测试组结束后主动关机
+- [ ] 补齐 `basic-musl` 需要的 syscall
+- [ ] 升级 `openat` 相关语义
+- [ ] 升级 `execve` 的 `argv/envp` 传递
+- [ ] 升级 `wait4/waitpid` 相关语义
+- [ ] 补齐目录遍历与 `getdents64`
+- [ ] 补齐 `stat/fstat/newfstatat` 相关语义
+- [ ] 补齐 `mmap/munmap/brk` 相关语义
+- [ ] 让 `/musl/basic_testcode.sh` 可以完整跑通
+- [ ] 推进 `busybox` 需要的 shell / pipe / 重定向语义
+- [ ] 推进 `lua` 所需的文件与执行环境兼容性
+- [ ] 推进 `libctest-musl` 所需的动态链接与共享库运行时
+- [ ] 补齐 `/lib/ld-musl-riscv64.so.1` 路径支持
+- [ ] 推进 glibc 变体运行
+- [ ] 补齐 `/lib/ld-linux-riscv64-lp64d.so.1` 路径支持
+- [ ] 让 `/glibc/basic_testcode.sh` 可以运行
+- [ ] 推进 `iozone`
+- [ ] 推进 `unixbench`
+- [ ] 推进 `lmbench`
+- [ ] 推进 `iperf`
+- [ ] 推进 `netperf`
+- [ ] 推进 `cyclictest`
+- [ ] 推进 `ltp`
+- [ ] 推进 LoongArch 最小可构建路径
+- [ ] 推进 LoongArch 最小可启动路径
+- [ ] 推进 LoongArch 的 submit runner 闭环
+- [ ] 建立官方 QEMU 启动命令的本地复现脚本（可并行）
+- [ ] 建立官方容器里的 smoke test 脚本（可并行）
+- [ ] 建立 `basic` 用例到 syscall 的逐项对照表（可并行）
+- [ ] 对比 `RustOsWhu` / `NighthawkOS` 的提交路径并提炼可复用做法（可并行）
+- [ ] 评估 EXT4 方案的许可证、维护成本和提交打包方式（可并行）
+- [ ] 给 LoongArch 提前保留根构建入口和最小验证脚本（可并行）
+
