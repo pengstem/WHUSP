@@ -1,7 +1,7 @@
 .*/*
 !.github/*
-!.vscode/settings.json
 !.devcontainer/devcontainer.json
+.idea/
 .vscode/
 
 **/target/
@@ -14,7 +14,6 @@ os/.gdb_history
 os/virt.out
 tools/
 pushall.sh
-.vscode/*.log
 
 develop-guide/
 AGENTS.md
