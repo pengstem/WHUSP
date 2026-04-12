@@ -305,6 +305,8 @@ pub fn init_from_dtb(dtb_addr: usize) {
         }
     }
 
+    config.blocks[..config.block_count].sort_by_key(|device| device.base);
+
     assert_ne!(config.block_count, 0, "DTB is missing virtio block device");
     assert_ne!(config.gpu.base, 0, "DTB is missing virtio gpu device");
     assert_ne!(
