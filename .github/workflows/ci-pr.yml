@@ -91,5 +91,5 @@ jobs:
 
       - name: Check Makefile entrypoints
         run: |
-          make -n run-rv-dev
+          make -n run-rv
           make -n run-rv-contest TEST_DISK=/tmp/sdcard-rv.img

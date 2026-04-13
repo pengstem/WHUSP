@@ -39,13 +39,11 @@ MEM ?= 1G
 SMP ?= 1
 BIOS ?= default
 RTC_BASE ?= utc
-HOSTFWD_UDP ?= 6200
-GUEST_UDP ?= 2000
-HOSTFWD_TCP ?= 6201
-GUEST_TCP ?= 80
 GUI ?= off
-TEST_DISK ?=
+TEST_DISK ?=$(FS_IMG)
 AUX_DISK ?=
+PRIMARY_DISK ?=
+EXTRA_QEMU_ARGS ?=
 
 ifeq ($(GUI),off)
 QEMU_CONSOLE_ARGS := -nographic
@@ -53,12 +51,8 @@ else
 QEMU_CONSOLE_ARGS := -serial stdio
 endif
 
-QEMU_TEST_PRIMARY_DISK_ARGS = \
-	-drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
-	-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
-
-QEMU_DEV_PRIMARY_DISK_ARGS = \
-	-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
+QEMU_PRIMARY_DISK_ARGS = \
+	-drive file=$(PRIMARY_DISK),if=none,format=raw,id=x0 \
 	-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 
 ifneq ($(strip $(AUX_DISK)),)
@@ -78,26 +72,14 @@ QEMU_COMMON_ARGS = \
 	-no-reboot \
 	-rtc base=$(RTC_BASE)
 
-QEMU_CONTEST_NET_ARGS = \
+QEMU_NET_ARGS = \
 	-device virtio-net-device,netdev=net \
 	-netdev user,id=net
 
-QEMU_DEV_NET_ARGS = \
-	-device virtio-net-device,netdev=net0 \
-	-netdev user,id=net0,hostfwd=udp::$(HOSTFWD_UDP)-:$(GUEST_UDP),hostfwd=tcp::$(HOSTFWD_TCP)-:$(GUEST_TCP)
-
-QEMU_CONTEST_ARGS = \
-	$(QEMU_TEST_PRIMARY_DISK_ARGS) \
-	$(QEMU_CONTEST_NET_ARGS) \
+QEMU_ARGS = \
+	$(QEMU_PRIMARY_DISK_ARGS) \
+	$(QEMU_NET_ARGS) \
 	$(QEMU_COMMON_ARGS)
-
-QEMU_DEV_ARGS = \
-	$(QEMU_DEV_PRIMARY_DISK_ARGS) \
-	$(QEMU_DEV_NET_ARGS) \
-	$(QEMU_COMMON_ARGS) \
-	-device virtio-gpu-device \
-	-device virtio-keyboard-device \
-	-device virtio-mouse-device
 
 # Tooling
 OBJDUMP := rust-objdump --arch-name=$(OBJDUMP_ARCH)
@@ -138,28 +120,22 @@ fs-img: $(APPS)
 $(APPS):
 
 run: qemu-version-check kernel
-	@if [ -z "$(TEST_DISK)" ]; then \
-		echo "TEST_DISK is required for contest-style run."; \
-		echo "Example: make run TEST_DISK=/path/to/sdcard-rv.img AUX_DISK=../disk.img"; \
-		echo "For local development with the generated fs.img, use: make run-dev"; \
-		exit 1; \
-	fi
-	@if [ ! -f "$(TEST_DISK)" ]; then \
-		echo "TEST_DISK does not exist: $(TEST_DISK)"; \
-		exit 1; \
-	fi
-	@if [ -n "$(AUX_DISK)" ] && [ ! -f "$(AUX_DISK)" ]; then \
-		echo "AUX_DISK does not exist: $(AUX_DISK)"; \
-		exit 1; \
-	fi
-	@$(QEMU) $(QEMU_CONTEST_ARGS)
+	@$(MAKE) --no-print-directory run-inner PRIMARY_DISK="$(TEST_DISK)" AUX_DISK="$(AUX_DISK)"
 
-run-dev: qemu-version-check build
+run-inner:
+	@if [ -z "$(PRIMARY_DISK)" ]; then \
+		echo "PRIMARY_DISK is required."; \
+		exit 1; \
+	fi
+	@if [ ! -f "$(PRIMARY_DISK)" ]; then \
+		echo "PRIMARY_DISK does not exist: $(PRIMARY_DISK)"; \
+		exit 1; \
+	fi
 	@if [ -n "$(AUX_DISK)" ] && [ ! -f "$(AUX_DISK)" ]; then \
 		echo "AUX_DISK does not exist: $(AUX_DISK)"; \
 		exit 1; \
 	fi
-	@$(QEMU) $(QEMU_DEV_ARGS)
+	@$(QEMU) $(QEMU_ARGS) $(EXTRA_QEMU_ARGS)
 
 fdt:
 	@$(QEMU) -machine virt,dumpdtb=virt.out -m 128m
@@ -169,10 +145,6 @@ qemu-version-check:
 	@sh scripts/qemu-ver-check.sh $(QEMU)
 
 debug: qemu-version-check kernel
-	@if [ -z "$(TEST_DISK)" ]; then \
-		echo "TEST_DISK is required. Use TEST_DISK=/path/to/sdcard-rv.img or run-dev for the local fs image."; \
-		exit 1; \
-	fi
 	@if [ ! -f "$(TEST_DISK)" ]; then \
 		echo "TEST_DISK does not exist: $(TEST_DISK)"; \
 		exit 1; \
@@ -182,15 +154,11 @@ debug: qemu-version-check kernel
 		exit 1; \
 	fi
 	@tmux new-session -d \
-		"$(QEMU) $(QEMU_CONTEST_ARGS) -s -S" && \
+		"$(MAKE) --no-print-directory run-inner PRIMARY_DISK='$(TEST_DISK)' AUX_DISK='$(AUX_DISK)' EXTRA_QEMU_ARGS='-s -S'" && \
 		tmux split-window -h "$(GDB) -ex 'file $(KERNEL_ELF)' -ex 'set arch $(GDB_ARCH)' -ex 'target remote localhost:1234'" && \
 		tmux -2 attach-session -d
 
 gdbserver: qemu-version-check kernel
-	@if [ -z "$(TEST_DISK)" ]; then \
-		echo "TEST_DISK is required. Use TEST_DISK=/path/to/sdcard-rv.img or run-dev for the local fs image."; \
-		exit 1; \
-	fi
 	@if [ ! -f "$(TEST_DISK)" ]; then \
 		echo "TEST_DISK does not exist: $(TEST_DISK)"; \
 		exit 1; \
@@ -199,7 +167,7 @@ gdbserver: qemu-version-check kernel
 		echo "AUX_DISK does not exist: $(AUX_DISK)"; \
 		exit 1; \
 	fi
-	@$(QEMU) $(QEMU_CONTEST_ARGS) -s -S
+	@$(MAKE) --no-print-directory run-inner PRIMARY_DISK="$(TEST_DISK)" AUX_DISK="$(AUX_DISK)" EXTRA_QEMU_ARGS="-s -S"
 
 gdbclient:
 	@$(GDB) -ex 'file $(KERNEL_ELF)' -ex 'set arch $(GDB_ARCH)' -ex 'target remote localhost:1234'
@@ -217,4 +185,4 @@ disasm-vim: kernel
 
 FORCE:
 
-.PHONY: build env kernel clean disasm disasm-vim fs-img run run-dev debug gdbserver gdbclient fdt qemu-version-check FORCE
+.PHONY: build env kernel clean disasm disasm-vim fs-img run run-inner debug gdbserver gdbclient fdt qemu-version-check FORCE

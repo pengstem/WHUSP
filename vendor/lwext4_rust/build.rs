@@ -1,11 +1,15 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    let c_path = PathBuf::from("c/lwext4")
+    let c_src_path = PathBuf::from("c/lwext4")
         .canonicalize()
         .expect("cannot canonicalize path");
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is unset"));
+    let c_build_path = out_dir.join("lwext4-src");
+    stage_lwext4_source(&c_src_path, &c_build_path);
 
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let lwext4_lib = &format!("lwext4-{arch}");
@@ -14,7 +18,7 @@ fn main() {
         cmd.args([
             "musl-generic",
             "-C",
-            c_path.to_str().expect("invalid path of lwext4"),
+            c_build_path.to_str().expect("invalid path of lwext4"),
         ])
         .arg(format!("ARCH={arch}"))
         .arg(format!(
@@ -27,15 +31,30 @@ fn main() {
             .expect("failed to execute process: make lwext4");
         assert!(status.success());
     }
-    generates_bindings_to_rust(binding_include_arg(&arch));
+    generates_bindings_to_rust(&c_build_path, binding_include_arg(&arch));
 
     println!("cargo:rustc-link-lib=static={lwext4_lib}");
-    println!(
-        "cargo:rustc-link-search=native={}",
-        c_path.to_str().unwrap()
-    );
+    println!("cargo:rustc-link-search=native={}", c_build_path.display());
     println!("cargo:rerun-if-changed=c/wrapper.h");
-    println!("cargo:rerun-if-changed={}/src", c_path.to_str().unwrap());
+    println!("cargo:rerun-if-changed={}/src", c_src_path.to_str().unwrap());
+    println!("cargo:rerun-if-changed={}/Makefile", c_src_path.to_str().unwrap());
+    println!(
+        "cargo:rerun-if-changed={}/toolchain/musl-generic.cmake",
+        c_src_path.to_str().unwrap()
+    );
+}
+
+fn stage_lwext4_source(src: &Path, dst: &Path) {
+    if dst.exists() {
+        fs::remove_dir_all(dst).expect("failed to clean staged lwext4 source");
+    }
+    fs::create_dir_all(dst.parent().expect("staged source has no parent"))
+        .expect("failed to create OUT_DIR parent for staged lwext4 source");
+    let status = Command::new("cp")
+        .args(["-a", &format!("{}/.", src.display()), dst.to_str().unwrap()])
+        .status()
+        .expect("failed to stage lwext4 source into OUT_DIR");
+    assert!(status.success());
 }
 
 fn configure_toolchain(arch: &str, cmd: &mut Command) {
@@ -75,7 +94,7 @@ fn binding_include_arg(arch: &str) -> Option<String> {
         .map(|path| format!("-I{path}"))
 }
 
-fn generates_bindings_to_rust(mpath: Option<String>) {
+fn generates_bindings_to_rust(c_build_path: &Path, mpath: Option<String>) {
     let target = env::var("TARGET").unwrap();
     if target.ends_with("-softfloat") {
         // Clang does not recognize the `-softfloat` suffix
@@ -87,8 +106,8 @@ fn generates_bindings_to_rust(mpath: Option<String>) {
         .wrap_unsafe_ops(true)
         // The input header we would like to generate bindings for.
         .header("c/wrapper.h")
-        .clang_arg("-I./c/lwext4/include")
-        .clang_arg("-I./c/lwext4/build_musl-generic/include/")
+        .clang_arg(format!("-I{}/include", c_build_path.display()))
+        .clang_arg(format!("-I{}/build_musl-generic/include/", c_build_path.display()))
         .layout_tests(false)
         // Tell cargo to invalidate the built crate whenever any of the included header files changed.
         .parse_callbacks(Box::new(CustomCargoCallbacks));

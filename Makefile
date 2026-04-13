@@ -10,8 +10,8 @@ else
 $(error Unsupported ARCH '$(ARCH)' in root Makefile. Only ARCH=riscv64 is wired today.)
 endif
 
-TEST_DISK ?=
-AUX_DISK ?=$(CURDIR)/disk.img
+TEST_DISK ?=$(CURDIR)/disk.img
+AUX_DISK ?=
 
 all: kernel-rv disk.img
 
@@ -23,16 +23,10 @@ disk.img:
 	@$(MAKE) --no-print-directory -C os ARCH=$(ARCH) MODE=$(MODE) TEST=$(TEST) fs-img
 	@cp $(DISK_SRC) disk.img
 
-run-rv-dev: all
-	@$(MAKE) --no-print-directory -C os ARCH=$(ARCH) MODE=$(MODE) TEST=$(TEST) run-dev AUX_DISK="$(AUX_DISK)"
-
-run-rv-contest: all
-	@if [ -z "$(TEST_DISK)" ]; then \
-		echo "TEST_DISK is required. Example:"; \
-		echo "  make run-rv-contest TEST_DISK=/path/to/sdcard-rv.img"; \
-		exit 1; \
-	fi
+run-rv: all
 	@$(MAKE) --no-print-directory -C os ARCH=$(ARCH) MODE=$(MODE) TEST=$(TEST) run TEST_DISK="$(TEST_DISK)" AUX_DISK="$(AUX_DISK)"
+
+run-rv-contest: run-rv
 
 fmt:
 	@cd os && cargo fmt
@@ -43,4 +37,4 @@ clean:
 	@$(MAKE) --no-print-directory -C user clean
 	@rm -f kernel-rv disk.img
 
-.PHONY: all kernel-rv disk.img run-rv-dev run-rv-contest fmt clean
+.PHONY: all kernel-rv disk.img run-rv run-rv-contest fmt clean
