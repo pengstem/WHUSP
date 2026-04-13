@@ -119,7 +119,7 @@ fs-img: $(APPS)
 
 $(APPS):
 
-run: qemu-version-check kernel
+run: kernel
 	@$(MAKE) --no-print-directory run-inner PRIMARY_DISK="$(PRIMARY_DISK)" AUX_DISK="$(AUX_DISK)"
 
 run-inner:
@@ -141,10 +141,7 @@ fdt:
 	@$(QEMU) -machine virt,dumpdtb=virt.out -m 128m
 	@fdtdump virt.out
 
-qemu-version-check:
-	@sh scripts/qemu-ver-check.sh $(QEMU)
-
-debug: qemu-version-check kernel
+debug: kernel
 	@if [ ! -f "$(PRIMARY_DISK)" ]; then \
 		echo "PRIMARY_DISK does not exist: $(PRIMARY_DISK)"; \
 		exit 1; \
@@ -158,7 +155,7 @@ debug: qemu-version-check kernel
 		tmux split-window -h "$(GDB) -ex 'file $(KERNEL_ELF)' -ex 'set arch $(GDB_ARCH)' -ex 'target remote localhost:1234'" && \
 		tmux -2 attach-session -d
 
-gdbserver: qemu-version-check kernel
+gdbserver: kernel
 	@if [ ! -f "$(PRIMARY_DISK)" ]; then \
 		echo "PRIMARY_DISK does not exist: $(PRIMARY_DISK)"; \
 		exit 1; \
@@ -185,4 +182,4 @@ disasm-vim: kernel
 
 FORCE:
 
-.PHONY: build env kernel clean disasm disasm-vim fs-img run run-inner debug gdbserver gdbclient fdt qemu-version-check FORCE
+.PHONY: build env kernel clean disasm disasm-vim fs-img run run-inner debug gdbserver gdbclient fdt FORCE
