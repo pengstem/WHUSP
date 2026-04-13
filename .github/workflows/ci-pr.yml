@@ -45,7 +45,7 @@ jobs:
           cargo fmt --manifest-path user/Cargo.toml --all --check
           rustfmt --check vendor/lwext4_rust/build.rs
 
-  rv-build:
+  official-image-build:
     runs-on: ubuntu-latest
     container:
       image: zhouzhouyi/os-contest:20260104
@@ -67,24 +67,6 @@ jobs:
         run: |
           make -C os kernel
           make -C user build
-
-  root-artifacts:
-    runs-on: ubuntu-latest
-    container:
-      image: zhouzhouyi/os-contest:20260104
-    env:
-      BINDGEN_EXTRA_CLANG_ARGS: --sysroot=/opt/riscv64-linux-musl-cross/riscv64-linux-musl -I/opt/riscv64-linux-musl-cross/riscv64-linux-musl/include
-      BINDGEN_EXTRA_CLANG_ARGS_riscv64gc_unknown_none_elf: --sysroot=/opt/riscv64-linux-musl-cross/riscv64-linux-musl -I/opt/riscv64-linux-musl-cross/riscv64-linux-musl/include
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Mark checkout as safe
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Prepare musl cross include path for lwext4 bindgen
-        run: |
-          mkdir -p /usr/riscv64-linux-musl/lib/musl
-          ln -sfn /opt/riscv64-linux-musl-cross/riscv64-linux-musl/include /usr/riscv64-linux-musl/lib/musl/include
 
       - name: Build root artifacts
         run: |

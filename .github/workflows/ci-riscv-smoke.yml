@@ -19,7 +19,7 @@ env:
   BINDGEN_EXTRA_CLANG_ARGS_riscv64gc_unknown_none_elf: --sysroot=/opt/riscv64-linux-musl-cross/riscv64-linux-musl -I/opt/riscv64-linux-musl-cross/riscv64-linux-musl/include
 
 jobs:
-  build-in-official-image:
+  official-image-smoke:
     runs-on: ubuntu-latest
     container:
       image: zhouzhouyi/os-contest:20260104
@@ -41,31 +41,10 @@ jobs:
           test -f kernel-rv
           test -f disk.img
 
-      - name: Upload smoke artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: riscv-smoke-artifacts
-          path: |
-            kernel-rv
-            disk.img
-          if-no-files-found: error
-
-  boot-smoke-headless:
-    runs-on: ubuntu-latest
-    needs: build-in-official-image
-    container:
-      image: zhouzhouyi/os-contest:20260104
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: riscv-smoke-artifacts
-
       - name: Boot with official RISC-V device shape
         shell: bash
         run: |
+          set +e
           set -o pipefail
           timeout 15s qemu-system-riscv64 \
             -machine virt \
@@ -82,6 +61,7 @@ jobs:
             -rtc base=utc \
             2>&1 | tee boot.log
           status=${PIPESTATUS[0]}
+          set -e
           if [[ "${status}" != "0" && "${status}" != "124" ]]; then
             exit "${status}"
           fi
@@ -90,30 +70,10 @@ jobs:
           grep -q "KERN: mouse device unavailable" boot.log
           grep -q "Rust user shell" boot.log
 
-      - name: Upload headless boot log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: riscv-headless-boot-log
-          path: boot.log
-          if-no-files-found: warn
-
-  contest-style-aux-disk-smoke:
-    runs-on: ubuntu-latest
-    needs: build-in-official-image
-    container:
-      image: zhouzhouyi/os-contest:20260104
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: riscv-smoke-artifacts
-
-      - name: Boot with second disk attached
+      - name: Boot with auxiliary disk bootstrap fallback
         shell: bash
         run: |
+          set +e
           set -o pipefail
           cp disk.img primary-test.img
           timeout 15s qemu-system-riscv64 \
@@ -133,16 +93,20 @@ jobs:
             -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1 \
             2>&1 | tee aux-boot.log
           status=${PIPESTATUS[0]}
+          set -e
           if [[ "${status}" != "0" && "${status}" != "124" ]]; then
             exit "${status}"
           fi
-          grep -q "mounted dev-mode test disk at /testdisk" aux-boot.log
+          grep -q "primary filesystem mounted from BLOCK_DEVICES\\[0\\]" aux-boot.log
+          grep -q "auxiliary filesystem mounted from BLOCK_DEVICES\\[1\\] for bootstrap lookup" aux-boot.log
           grep -q "Rust user shell" aux-boot.log
 
-      - name: Upload aux-disk boot log
+      - name: Upload smoke logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: riscv-aux-disk-boot-log
-          path: aux-boot.log
-          if-no-files-found: warn
+          name: riscv-smoke-logs
+          path: |
+            boot.log
+            aux-boot.log
+          if-no-files-found: error
