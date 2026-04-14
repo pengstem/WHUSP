@@ -18,6 +18,7 @@ lazy_static! {
 }
 
 pub fn init_mounts() {
+    // TODO: a little bit too much ...
     let already_initialized = MOUNTS_INITIALIZED.exclusive_session(|initialized| {
         if *initialized {
             true
@@ -37,10 +38,7 @@ pub fn init_mounts() {
             match Ext4Mount::open(device.clone()) {
                 Ok(mount) => Some(mount),
                 Err(err) => {
-                    warn!(
-                        "failed to mount filesystem on BLOCK_DEVICES[{}]: {:?}",
-                        index, err
-                    );
+                    warn!("failed to mount filesystem on BLOCK_DEVICES[{index}]: {err:?}");
                     None
                 }
             }
@@ -61,6 +59,7 @@ pub(super) fn mount_exists(mount_id: MountId) -> bool {
         .is_some_and(|slot| slot.exclusive_session(|mount| mount.is_some()))
 }
 
+// TODO: maybe we could skip this function
 pub(super) fn primary_mount_id() -> MountId {
     MountId(0)
 }
@@ -69,15 +68,9 @@ pub fn mount_status_log() {
     info!("filesystem mounted from BLOCK_DEVICES[0] at /");
     for index in 1..MOUNTS.len() {
         if mount_exists(MountId(index)) {
-            info!(
-                "filesystem mounted from BLOCK_DEVICES[{}] at /x{}",
-                index, index
-            );
+            info!("filesystem mounted from BLOCK_DEVICES[{index}] at /x{index}");
         } else {
-            info!(
-                "filesystem on BLOCK_DEVICES[{}] is unavailable at /x{}",
-                index, index
-            );
+            info!("filesystem on BLOCK_DEVICES[{index}] is unavailable at /x{index}",);
         }
     }
 }

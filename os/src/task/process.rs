@@ -71,7 +71,7 @@ impl ProcessControlBlock {
     pub fn inner_exclusive_access(&self) -> UPIntrRefMut<'_, ProcessControlBlockInner> {
         self.inner.exclusive_access()
     }
-
+    // TODO: to understand
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
         // memory_set with elf program headers/trampoline/trap context/user stack
         let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);

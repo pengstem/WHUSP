@@ -13,6 +13,7 @@ use lwext4_rust::{
 pub(super) struct KernelHal;
 
 impl SystemHal for KernelHal {
+    // TODO: could try to implement this
     fn now() -> Option<Duration> {
         None
     }
@@ -25,26 +26,21 @@ pub(super) struct KernelDisk {
 
 impl Ext4BlockDevice for KernelDisk {
     fn write_blocks(&mut self, block_id: u64, buf: &[u8]) -> Ext4Result<usize> {
-        let mut block_buf = [0u8; EXT4_DEV_BSIZE];
         for (index, block) in buf.chunks(EXT4_DEV_BSIZE).enumerate() {
             if block.len() != EXT4_DEV_BSIZE {
                 return Err(Ext4Error::new(EIO as _, "unaligned block write"));
             }
-            block_buf.copy_from_slice(block);
-            self.dev.write_block(block_id as usize + index, &block_buf);
+            self.dev.write_block(block_id as usize + index, block);
         }
         Ok(buf.len())
     }
 
     fn read_blocks(&mut self, block_id: u64, buf: &mut [u8]) -> Ext4Result<usize> {
-        let mut block_buf = [0u8; EXT4_DEV_BSIZE];
         for (index, block) in buf.chunks_mut(EXT4_DEV_BSIZE).enumerate() {
             if block.len() != EXT4_DEV_BSIZE {
                 return Err(Ext4Error::new(EIO as _, "unaligned block read"));
             }
-            self.dev
-                .read_block(block_id as usize + index, &mut block_buf);
-            block.copy_from_slice(&block_buf);
+            self.dev.read_block(block_id as usize + index, block);
         }
         Ok(buf.len())
     }
@@ -134,6 +130,7 @@ impl Ext4Mount {
     }
 
     pub(super) fn set_len(&mut self, ino: u32, len: u64) -> Option<()> {
+        // TODO: ok() make the error messages lost
         self.fs.set_len(ino, len).ok()
     }
 

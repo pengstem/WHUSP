@@ -83,8 +83,8 @@ impl FrameAllocator for StackFrameAllocator {
     fn dealloc(&mut self, ppn: PhysPageNum) {
         let ppn = ppn.0;
         // validity check
-        if ppn >= self.current || self.recycled.iter().any(|&v| v == ppn) {
-            panic!("Frame ppn={:#x} has not been allocated!", ppn);
+        if ppn >= self.current || self.recycled.contains(&ppn) {
+            panic!("Frame ppn={ppn:#x} has not been allocated!");
         }
         // recycle
         self.recycled.push(ppn);

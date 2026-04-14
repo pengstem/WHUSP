@@ -9,10 +9,12 @@ mod switch;
 mod task;
 
 use self::id::TaskUserRes;
+use crate::drivers::block;
 use crate::fs::{OpenFlags, open_file};
 use crate::sbi::shutdown;
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{format, sync::Arc, vec::Vec};
 use lazy_static::*;
+use log::info;
 use manager::fetch_task;
 use process::ProcessControlBlock;
 use switch::__switch;
@@ -143,14 +145,29 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 
 lazy_static! {
     pub static ref INITPROC: Arc<ProcessControlBlock> = {
-        let inode = open_file("initproc", OpenFlags::RDONLY).unwrap();
-        let v = inode.read_all();
-        ProcessControlBlock::new(v.as_slice())
+        let (path, initproc_data) =
+            open_initproc_data().expect("initproc not found on any mounted disk");
+        info!("loading initproc from {path}");
+        ProcessControlBlock::new(initproc_data.as_slice())
     };
 }
 
 pub fn add_initproc() {
     let _initproc = INITPROC.clone();
+}
+
+// TODO: add the init program to the kernel
+fn open_initproc_data() -> Option<(alloc::string::String, Vec<u8>)> {
+    if let Some(inode) = open_file("/initproc", OpenFlags::RDONLY) {
+        return Some(("/initproc".into(), inode.read_all()));
+    }
+    for index in 1..block::block_count() {
+        let path = format!("/x{index}/initproc");
+        if let Some(inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+            return Some((path, inode.read_all()));
+        }
+    }
+    None
 }
 
 pub fn check_signals_of_current() -> Option<(i32, &'static str)> {

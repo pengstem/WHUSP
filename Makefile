@@ -42,6 +42,7 @@ run-rv-contest: run-rv
 fmt:
 	@cd os && cargo fmt
 	@cd user && cargo fmt
+	@cd vendor/lwext4_rust && cargo fmt
 
 clean:
 	@$(MAKE) --no-print-directory -C os clean

@@ -66,7 +66,7 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     mm::init();
     UART.init();
     logging::init();
-    info!("boot hart_id={}, dtb_addr={:#x}", hart_id, dtb_addr);
+    info!("boot hart_id={hart_id}, dtb_addr={dtb_addr:#x}");
     info!(
         "board config: clock_freq={}, memory_end={:#x}, uart={:#x}, plic={:#x}",
         board::clock_freq(),
@@ -74,21 +74,25 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
         board::uart_base(),
         board::plic_base(),
     );
+
     if let Some(_gpu) = GPU_DEVICE.as_ref() {
         info!("KERN: init gpu");
     } else {
         info!("KERN: gpu device unavailable");
     }
+
     if let Some(_keyboard) = KEYBOARD_DEVICE.as_ref() {
         info!("KERN: init keyboard");
     } else {
         info!("KERN: keyboard device unavailable");
     }
+
     if let Some(_mouse) = MOUSE_DEVICE.as_ref() {
         info!("KERN: init mouse");
     } else {
         info!("KERN: mouse device unavailable");
     }
+
     info!("KERN: init trap");
     trap::init();
     trap::enable_timer_interrupt();
