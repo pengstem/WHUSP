@@ -6,15 +6,21 @@ extern crate user_lib;
 use user_lib::println;
 use user_lib::{exec, fork, wait, yield_};
 
+const SHELL_CANDIDATES: [(&str, &str); 2] = [
+    ("/user_shell", "/user_shell\0"),
+    ("/x1/user_shell", "/x1/user_shell\0"),
+];
+
 #[unsafe(no_mangle)]
 fn main() -> i32 {
     if fork() == 0 {
-        let shell_path = "/x1/user_shell";
-        let shell_path_cstr = "/x1/user_shell\0";
-        if exec(shell_path_cstr, &[core::ptr::null::<u8>()]) == -1 {
+        for (shell_path, shell_path_cstr) in SHELL_CANDIDATES {
+            if exec(shell_path_cstr, &[core::ptr::null::<u8>()]) != -1 {
+                return 0;
+            }
             println!("initproc: failed to exec {}", shell_path);
-            return -1;
         }
+        -1
     } else {
         loop {
             let mut exit_code: i32 = 0;
@@ -32,5 +38,4 @@ fn main() -> i32 {
             */
         }
     }
-    0
 }
