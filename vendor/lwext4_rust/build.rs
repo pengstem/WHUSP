@@ -31,7 +31,7 @@ fn main() {
             .expect("failed to execute process: make lwext4");
         assert!(status.success());
     }
-    generates_bindings_to_rust(&c_build_path, binding_include_arg(&arch));
+    generates_bindings_to_rust(&arch, &c_build_path);
 
     println!("cargo:rustc-link-lib=static={lwext4_lib}");
     println!("cargo:rustc-link-search=native={}", c_build_path.display());
@@ -85,27 +85,77 @@ fn configure_toolchain(arch: &str, cmd: &mut Command) {
     }
 }
 
-fn binding_include_arg(arch: &str) -> Option<String> {
-    let candidates: &[&str] = match arch {
-        "riscv64" => &[
-            "/usr/riscv64-linux-musl/lib/musl/include",
-            "/usr/riscv64-linux-gnu/include",
-        ],
-        "x86_64" => &["/usr/include"],
-        _ => &[],
-    };
-    candidates
-        .iter()
-        .find(|path| Path::new(path).exists())
-        .map(|path| format!("-I{path}"))
+fn compiler_output(compiler: &str, arg: &str) -> Option<String> {
+    let output = Command::new(compiler).arg(arg).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
-fn generates_bindings_to_rust(c_build_path: &Path, mpath: Option<String>) {
-    let target = env::var("TARGET").unwrap();
-    if target.ends_with("-softfloat") {
-        // Clang does not recognize the `-softfloat` suffix
-        unsafe { env::set_var("TARGET", target.replace("-softfloat", "")) };
+fn push_include_arg(args: &mut Vec<String>, path: impl AsRef<Path>) {
+    let path = path.as_ref();
+    if path.exists() {
+        args.push(format!("-I{}", path.display()));
     }
+}
+
+fn binding_clang_args(arch: &str) -> Vec<String> {
+    match arch {
+        "riscv64" => {
+            let mut args = vec![
+                "--target=riscv64-unknown-linux-musl".to_string(),
+                "-march=rv64gc".to_string(),
+                "-mabi=lp64d".to_string(),
+                "-mcmodel=medany".to_string(),
+            ];
+
+            if let Some(sysroot) = compiler_output("riscv64-linux-musl-gcc", "-print-sysroot") {
+                if sysroot != "/" {
+                    args.push(format!("--sysroot={sysroot}"));
+                    push_include_arg(&mut args, Path::new(&sysroot).join("include"));
+                    push_include_arg(&mut args, Path::new(&sysroot).join("usr/include"));
+                }
+            }
+
+            if let Some(gcc_include) =
+                compiler_output("riscv64-linux-musl-gcc", "-print-file-name=include")
+            {
+                push_include_arg(&mut args, gcc_include);
+            }
+
+            for candidate in [
+                "/usr/riscv64-linux-musl/include",
+                "/usr/riscv64-linux-musl/lib/musl/include",
+            ] {
+                push_include_arg(&mut args, candidate);
+            }
+
+            args
+        }
+        "x86_64" => vec!["-I/usr/include".to_string()],
+        _ => Vec::new(),
+    }
+}
+
+fn bindgen_target(arch: &str, cargo_target: &str) -> String {
+    match arch {
+        // Bindgen only needs a clang-compatible target for parsing C headers.
+        // The kernel itself still builds for riscv64gc-unknown-none-elf.
+        "riscv64" => "riscv64-unknown-linux-musl".to_string(),
+        _ => cargo_target.replace("-softfloat", ""),
+    }
+}
+
+fn generates_bindings_to_rust(arch: &str, c_build_path: &Path) {
+    let cargo_target = env::var("TARGET").unwrap();
+    unsafe { env::set_var("TARGET", bindgen_target(arch, &cargo_target)) };
 
     let mut bindings = bindgen::Builder::default()
         .use_core()
@@ -120,13 +170,13 @@ fn generates_bindings_to_rust(c_build_path: &Path, mpath: Option<String>) {
         .layout_tests(false)
         // Tell cargo to invalidate the built crate whenever any of the included header files changed.
         .parse_callbacks(Box::new(CustomCargoCallbacks));
-    if let Some(mpath) = mpath {
-        bindings = bindings.clang_arg(mpath);
+    for arg in binding_clang_args(arch) {
+        bindings = bindings.clang_arg(arg);
     }
     let bindings = bindings.generate().expect("Unable to generate bindings");
 
     // Restore the original target environment variable
-    unsafe { env::set_var("TARGET", target) };
+    unsafe { env::set_var("TARGET", cargo_target) };
 
     // Write the bindings to the $OUT_DIR/bindings.rs file.
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
