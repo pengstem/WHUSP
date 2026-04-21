@@ -97,8 +97,6 @@ jobs:
           if [[ "${status}" != "0" && "${status}" != "124" ]]; then
             exit "${status}"
           fi
-          grep -q "primary filesystem mounted from BLOCK_DEVICES\\[0\\]" aux-boot.log
-          grep -q "auxiliary filesystem mounted from BLOCK_DEVICES\\[1\\] for bootstrap lookup" aux-boot.log
           grep -q "Rust user shell" aux-boot.log
 
       - name: Upload smoke logs

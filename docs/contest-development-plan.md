@@ -56,8 +56,23 @@
 - [ ] 优化 EXT4 顺序写路径，让 `huge_write` 不再明显慢于旧 `easy-fs`
 - [ ] 给 LoongArch 提前保留根构建入口和最小验证脚本（可并行）
 - [x] 更合适比赛开发的 github ci（可并行）
+- [ ] 升级dependencies😄
 - [ ] cwd in pcb
-      - no chdir
-      - no getcwd
-      - no openat/AT_FDCWD
-      - no .. support
+      - [x] widen syscall arg forwarding to 6 args for Linux pathname syscalls
+      - [x] add pcb `cwd_path` string alongside `WorkingDir`
+      - [x] allow directory fd open and dirfd base extraction
+      - [x] implement `chdir(49)`
+      - [x] implement `getcwd(17)`
+      - [x] upgrade syscall 56 to real `openat`
+      - [x] implement `mkdirat(34)`
+      - [x] implement `unlinkat(35)` for file removal
+      - [ ] implement `fchdir(50)`
+      - [ ] implement `newfstatat` / `fstatat`
+      - [ ] implement `readlinkat`
+      - [ ] implement `faccessat`
+      - [ ] implement `renameat2`
+      - [ ] implement `chroot`
+      - [ ] implement `openat2`
+      - [ ] support `..` in relative path resolution
+      - [ ] support symlink traversal / nofollow semantics
+      - [ ] make mount/umount target path respect cwd-relative resolution

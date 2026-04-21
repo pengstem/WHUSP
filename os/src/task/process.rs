@@ -24,6 +24,7 @@ pub struct ProcessControlBlockInner {
     pub is_zombie: bool,
     pub memory_set: MemorySet,
     pub cwd: WorkingDir,
+    pub cwd_path: String,
     pub parent: Option<Weak<ProcessControlBlock>>,
     pub children: Vec<Arc<ProcessControlBlock>>,
     pub exit_code: i32,
@@ -77,6 +78,16 @@ impl ProcessControlBlock {
         self.inner.exclusive_access().cwd
     }
 
+    pub fn working_dir_path(&self) -> String {
+        self.inner.exclusive_access().cwd_path.clone()
+    }
+
+    pub fn set_working_dir(&self, cwd: WorkingDir, cwd_path: String) {
+        let mut inner = self.inner.exclusive_access();
+        inner.cwd = cwd;
+        inner.cwd_path = cwd_path;
+    }
+
     // TODO: to understand
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
         // memory_set with elf program headers/trampoline/trap context/user stack
@@ -90,6 +101,7 @@ impl ProcessControlBlock {
                     is_zombie: false,
                     memory_set,
                     cwd: WorkingDir::root(),
+                    cwd_path: "/".into(),
                     parent: None,
                     children: Vec::new(),
                     exit_code: 0,
@@ -218,6 +230,7 @@ impl ProcessControlBlock {
                     is_zombie: false,
                     memory_set,
                     cwd: parent.cwd,
+                    cwd_path: parent.cwd_path.clone(),
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
                     exit_code: 0,

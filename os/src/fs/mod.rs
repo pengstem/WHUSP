@@ -12,6 +12,9 @@ pub trait File: Send + Sync {
     fn writable(&self) -> bool;
     fn read(&self, buf: UserBuffer) -> usize;
     fn write(&self, buf: UserBuffer) -> usize;
+    fn working_dir(&self) -> Option<WorkingDir> {
+        None
+    }
 }
 
 pub fn init() {
@@ -29,6 +32,7 @@ pub fn list_apps() {
 
 pub(crate) use inode::open_file_at;
 pub use inode::{OpenFlags, open_file};
-pub(crate) use path::WorkingDir;
+pub(crate) use inode::{lookup_dir_at, mkdir_at, unlink_file_at};
+pub(crate) use path::{WorkingDir, normalize_path};
 pub use pipe::make_pipe;
 pub use stdio::{Stdin, Stdout};

@@ -7,7 +7,7 @@ use lazy_static::*;
 use log::{info, warn};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct MountId(pub(super) usize);
+pub(crate) struct MountId(pub(crate) usize);
 
 lazy_static! {
     static ref MOUNTS: Vec<UPIntrFreeCell<Option<Ext4Mount>>> = BLOCK_DEVICES

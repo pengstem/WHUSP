@@ -1,8 +1,12 @@
+const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_DUP: usize = 24;
 const SYSCALL_CONNECT: usize = 29;
 const SYSCALL_LISTEN: usize = 30;
 const SYSCALL_ACCEPT: usize = 31;
-const SYSCALL_OPEN: usize = 56;
+const SYSCALL_MKDIRAT: usize = 34;
+const SYSCALL_UNLINKAT: usize = 35;
+const SYSCALL_CHDIR: usize = 49;
+const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
 const SYSCALL_PIPE: usize = 59;
 const SYSCALL_READ: usize = 63;
@@ -16,6 +20,8 @@ const SYSCALL_GETPID: usize = 172;
 const SYSCALL_FORK: usize = 220;
 const SYSCALL_EXEC: usize = 221;
 const SYSCALL_WAITPID: usize = 260;
+
+// TODO: remove or unify these syscalls
 const SYSCALL_THREAD_CREATE: usize = 1000;
 const SYSCALL_GETTID: usize = 1001;
 const SYSCALL_WAITTID: usize = 1002;
@@ -49,13 +55,22 @@ use process::*;
 use sync::*;
 use thread::*;
 
-pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
+pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     match syscall_id {
+        SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_DUP => sys_dup(args[0]),
         SYSCALL_CONNECT => sys_connect(args[0] as _, args[1] as _, args[2] as _),
         SYSCALL_LISTEN => sys_listen(args[0] as _),
         SYSCALL_ACCEPT => sys_accept(args[0] as _),
-        SYSCALL_OPEN => sys_open(args[0] as *const u8, args[1] as u32),
+        SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
+        SYSCALL_OPENAT => sys_openat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as u32,
+            args[3] as u32,
+        ),
         SYSCALL_CLOSE => sys_close(args[0]),
         SYSCALL_PIPE => sys_pipe(args[0] as *mut usize),
         SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),

@@ -61,6 +61,7 @@ pub(super) enum FsNodeKind {
     Other,
 }
 
+// TODO: i think we missed some types here
 fn into_node_kind(kind: InodeType) -> FsNodeKind {
     match kind {
         InodeType::Directory => FsNodeKind::Directory,
@@ -135,6 +136,21 @@ impl Ext4Mount {
         self.fs
             .create(parent_ino, leaf_name, InodeType::RegularFile, 0o644)
             .ok()
+    }
+
+    pub(super) fn create_dir(
+        &mut self,
+        parent_ino: u32,
+        leaf_name: &str,
+        mode: u32,
+    ) -> Option<u32> {
+        self.fs
+            .create(parent_ino, leaf_name, InodeType::Directory, mode)
+            .ok()
+    }
+
+    pub(super) fn unlink(&mut self, parent_ino: u32, leaf_name: &str) -> Option<()> {
+        self.fs.unlink(parent_ino, leaf_name).ok()
     }
 
     pub(super) fn set_len(&mut self, ino: u32, len: u64) -> Option<()> {

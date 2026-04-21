@@ -1,7 +1,11 @@
+const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_DUP: usize = 24;
 const SYSCALL_CONNECT: usize = 29;
 const SYSCALL_LISTEN: usize = 30;
 const SYSCALL_ACCEPT: usize = 31;
+const SYSCALL_MKDIRAT: usize = 34;
+const SYSCALL_UNLINKAT: usize = 35;
+const SYSCALL_CHDIR: usize = 49;
 const SYSCALL_OPEN: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
 const SYSCALL_PIPE: usize = 59;
@@ -33,7 +37,9 @@ const SYSCALL_FRAMEBUFFER_FLUSH: usize = 2001;
 const SYSCALL_EVENT_GET: usize = 3000;
 const SYSCALL_KEY_PRESSED: usize = 3001;
 
-fn syscall(id: usize, args: [usize; 3]) -> isize {
+const AT_FDCWD: isize = -100;
+
+fn syscall(id: usize, args: [usize; 6]) -> isize {
     let mut ret: isize;
     unsafe {
         core::arch::asm!(
@@ -41,6 +47,9 @@ fn syscall(id: usize, args: [usize; 3]) -> isize {
             inlateout("x10") args[0] => ret,
             in("x11") args[1],
             in("x12") args[2],
+            in("x13") args[3],
+            in("x14") args[4],
+            in("x15") args[5],
             in("x17") id
         );
     }
@@ -48,148 +57,214 @@ fn syscall(id: usize, args: [usize; 3]) -> isize {
 }
 
 pub fn sys_dup(fd: usize) -> isize {
-    syscall(SYSCALL_DUP, [fd, 0, 0])
+    syscall(SYSCALL_DUP, [fd, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_connect(dest: u32, sport: u16, dport: u16) -> isize {
     syscall(
         SYSCALL_CONNECT,
-        [dest as usize, sport as usize, dport as usize],
+        [dest as usize, sport as usize, dport as usize, 0, 0, 0],
     )
 }
 
 // just listen for tcp connections now
 pub fn sys_listen(sport: u16) -> isize {
-    syscall(SYSCALL_LISTEN, [sport as usize, 0, 0])
+    syscall(SYSCALL_LISTEN, [sport as usize, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_accept(socket_fd: usize) -> isize {
-    syscall(SYSCALL_ACCEPT, [socket_fd, 0, 0])
+    syscall(SYSCALL_ACCEPT, [socket_fd, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_open(path: &str, flags: u32) -> isize {
-    syscall(SYSCALL_OPEN, [path.as_ptr() as usize, flags as usize, 0])
+    syscall(
+        SYSCALL_OPEN,
+        [
+            AT_FDCWD as usize,
+            path.as_ptr() as usize,
+            flags as usize,
+            0o644,
+            0,
+            0,
+        ],
+    )
+}
+
+pub fn sys_openat(dirfd: isize, path: &str, flags: u32, mode: u32) -> isize {
+    syscall(
+        SYSCALL_OPEN,
+        [
+            dirfd as usize,
+            path.as_ptr() as usize,
+            flags as usize,
+            mode as usize,
+            0,
+            0,
+        ],
+    )
+}
+
+pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
+    syscall(SYSCALL_GETCWD, [buf as usize, size, 0, 0, 0, 0])
+}
+
+pub fn sys_chdir(path: &str) -> isize {
+    syscall(SYSCALL_CHDIR, [path.as_ptr() as usize, 0, 0, 0, 0, 0])
+}
+
+pub fn sys_mkdirat(dirfd: isize, path: &str, mode: u32) -> isize {
+    syscall(
+        SYSCALL_MKDIRAT,
+        [
+            dirfd as usize,
+            path.as_ptr() as usize,
+            mode as usize,
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+pub fn sys_unlinkat(dirfd: isize, path: &str, flags: u32) -> isize {
+    syscall(
+        SYSCALL_UNLINKAT,
+        [
+            dirfd as usize,
+            path.as_ptr() as usize,
+            flags as usize,
+            0,
+            0,
+            0,
+        ],
+    )
 }
 
 pub fn sys_close(fd: usize) -> isize {
-    syscall(SYSCALL_CLOSE, [fd, 0, 0])
+    syscall(SYSCALL_CLOSE, [fd, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_pipe(pipe: &mut [usize]) -> isize {
-    syscall(SYSCALL_PIPE, [pipe.as_mut_ptr() as usize, 0, 0])
+    syscall(SYSCALL_PIPE, [pipe.as_mut_ptr() as usize, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_read(fd: usize, buffer: &mut [u8]) -> isize {
     syscall(
         SYSCALL_READ,
-        [fd, buffer.as_mut_ptr() as usize, buffer.len()],
+        [fd, buffer.as_mut_ptr() as usize, buffer.len(), 0, 0, 0],
     )
 }
 
 pub fn sys_write(fd: usize, buffer: &[u8]) -> isize {
-    syscall(SYSCALL_WRITE, [fd, buffer.as_ptr() as usize, buffer.len()])
+    syscall(
+        SYSCALL_WRITE,
+        [fd, buffer.as_ptr() as usize, buffer.len(), 0, 0, 0],
+    )
 }
 
 pub fn sys_exit(exit_code: i32) -> ! {
-    syscall(SYSCALL_EXIT, [exit_code as usize, 0, 0]);
+    syscall(SYSCALL_EXIT, [exit_code as usize, 0, 0, 0, 0, 0]);
     panic!("sys_exit never returns!");
 }
 
 pub fn sys_sleep(sleep_ms: usize) -> isize {
-    syscall(SYSCALL_SLEEP, [sleep_ms, 0, 0])
+    syscall(SYSCALL_SLEEP, [sleep_ms, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_yield() -> isize {
-    syscall(SYSCALL_YIELD, [0, 0, 0])
+    syscall(SYSCALL_YIELD, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_kill(pid: usize, signal: i32) -> isize {
-    syscall(SYSCALL_KILL, [pid, signal as usize, 0])
+    syscall(SYSCALL_KILL, [pid, signal as usize, 0, 0, 0, 0])
 }
 
 pub fn sys_get_time() -> isize {
-    syscall(SYSCALL_GET_TIME, [0, 0, 0])
+    syscall(SYSCALL_GET_TIME, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_getpid() -> isize {
-    syscall(SYSCALL_GETPID, [0, 0, 0])
+    syscall(SYSCALL_GETPID, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_fork() -> isize {
-    syscall(SYSCALL_FORK, [0, 0, 0])
+    syscall(SYSCALL_FORK, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_exec(path: &str, args: &[*const u8]) -> isize {
     syscall(
         SYSCALL_EXEC,
-        [path.as_ptr() as usize, args.as_ptr() as usize, 0],
+        [path.as_ptr() as usize, args.as_ptr() as usize, 0, 0, 0, 0],
     )
 }
 
 pub fn sys_waitpid(pid: isize, exit_code: *mut i32) -> isize {
-    syscall(SYSCALL_WAITPID, [pid as usize, exit_code as usize, 0])
+    syscall(
+        SYSCALL_WAITPID,
+        [pid as usize, exit_code as usize, 0, 0, 0, 0],
+    )
 }
 
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
-    syscall(SYSCALL_THREAD_CREATE, [entry, arg, 0])
+    syscall(SYSCALL_THREAD_CREATE, [entry, arg, 0, 0, 0, 0])
 }
 
 pub fn sys_gettid() -> isize {
-    syscall(SYSCALL_GETTID, [0; 3])
+    syscall(SYSCALL_GETTID, [0; 6])
 }
 
 pub fn sys_waittid(tid: usize) -> isize {
-    syscall(SYSCALL_WAITTID, [tid, 0, 0])
+    syscall(SYSCALL_WAITTID, [tid, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_mutex_create(blocking: bool) -> isize {
-    syscall(SYSCALL_MUTEX_CREATE, [blocking as usize, 0, 0])
+    syscall(SYSCALL_MUTEX_CREATE, [blocking as usize, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_mutex_lock(id: usize) -> isize {
-    syscall(SYSCALL_MUTEX_LOCK, [id, 0, 0])
+    syscall(SYSCALL_MUTEX_LOCK, [id, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_mutex_unlock(id: usize) -> isize {
-    syscall(SYSCALL_MUTEX_UNLOCK, [id, 0, 0])
+    syscall(SYSCALL_MUTEX_UNLOCK, [id, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_semaphore_create(res_count: usize) -> isize {
-    syscall(SYSCALL_SEMAPHORE_CREATE, [res_count, 0, 0])
+    syscall(SYSCALL_SEMAPHORE_CREATE, [res_count, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_semaphore_up(sem_id: usize) -> isize {
-    syscall(SYSCALL_SEMAPHORE_UP, [sem_id, 0, 0])
+    syscall(SYSCALL_SEMAPHORE_UP, [sem_id, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_semaphore_down(sem_id: usize) -> isize {
-    syscall(SYSCALL_SEMAPHORE_DOWN, [sem_id, 0, 0])
+    syscall(SYSCALL_SEMAPHORE_DOWN, [sem_id, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_condvar_create() -> isize {
-    syscall(SYSCALL_CONDVAR_CREATE, [0, 0, 0])
+    syscall(SYSCALL_CONDVAR_CREATE, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_condvar_signal(condvar_id: usize) -> isize {
-    syscall(SYSCALL_CONDVAR_SIGNAL, [condvar_id, 0, 0])
+    syscall(SYSCALL_CONDVAR_SIGNAL, [condvar_id, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
-    syscall(SYSCALL_CONDVAR_WAIT, [condvar_id, mutex_id, 0])
+    syscall(SYSCALL_CONDVAR_WAIT, [condvar_id, mutex_id, 0, 0, 0, 0])
 }
 
 pub fn sys_framebuffer() -> isize {
-    syscall(SYSCALL_FRAMEBUFFER, [0, 0, 0])
+    syscall(SYSCALL_FRAMEBUFFER, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_framebuffer_flush() -> isize {
-    syscall(SYSCALL_FRAMEBUFFER_FLUSH, [0, 0, 0])
+    syscall(SYSCALL_FRAMEBUFFER_FLUSH, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_event_get() -> isize {
-    syscall(SYSCALL_EVENT_GET, [0, 0, 0])
+    syscall(SYSCALL_EVENT_GET, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_key_pressed() -> isize {
-    syscall(SYSCALL_KEY_PRESSED, [0, 0, 0])
+    syscall(SYSCALL_KEY_PRESSED, [0, 0, 0, 0, 0, 0])
 }

@@ -1,7 +1,7 @@
 use super::File;
 use super::ext4::FsNodeKind;
 use super::mount::{MountId, with_mount};
-use super::path::{ResolvedOpen, WorkingDir, resolve_open_target};
+use super::path::{ResolvedOpen, WorkingDir, resolve_open_target, resolve_parent_target};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use alloc::sync::Arc;
@@ -11,6 +11,7 @@ use bitflags::*;
 pub struct OSInode {
     readable: bool,
     writable: bool,
+    kind: FsNodeKind,
     inner: UPIntrFreeCell<OSInodeInner>,
 }
 
@@ -21,10 +22,11 @@ pub struct OSInodeInner {
 }
 
 impl OSInode {
-    fn new(readable: bool, writable: bool, mount_id: MountId, ino: u32) -> Self {
+    fn new(readable: bool, writable: bool, kind: FsNodeKind, mount_id: MountId, ino: u32) -> Self {
         Self {
             readable,
             writable,
+            kind,
             inner: unsafe {
                 UPIntrFreeCell::new(OSInodeInner {
                     offset: 0,
@@ -54,58 +56,80 @@ impl OSInode {
     }
 }
 
+// TODO: more flags to implemnent
 bitflags! {
     pub struct OpenFlags: u32 {
         const RDONLY = 0;
         const WRONLY = 1 << 0;
         const RDWR = 1 << 1;
-        const CREATE = 1 << 9;
-        const TRUNC = 1 << 10;
+        const CREATE = 0o100;
+        const TRUNC = 0o1000;
+        const DIRECTORY = 0o200000;
     }
 }
 
 impl OpenFlags {
     pub fn read_write(&self) -> (bool, bool) {
-        if self.is_empty() {
-            (true, false)
-        } else if self.contains(Self::WRONLY) {
-            (false, true)
-        } else {
-            (true, true)
+        match self.bits & 0b11 {
+            0 => (true, false),
+            1 => (false, true),
+            2 => (true, true),
+            _ => (false, false),
         }
+    }
+
+    pub fn writable_target(&self) -> bool {
+        matches!(self.bits & 0b11, 1 | 2)
+    }
+
+    pub fn can_open_directory(&self) -> bool {
+        !self.writable_target() && !self.contains(Self::CREATE) && !self.contains(Self::TRUNC)
     }
 }
 
 fn open_file_impl(cwd: Option<WorkingDir>, name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
-    let (readable, writable) = flags.read_write();
     let resolved = resolve_open_target(
         cwd,
         name,
-        writable || flags.contains(OpenFlags::TRUNC),
+        flags.writable_target() || flags.contains(OpenFlags::TRUNC),
         flags.contains(OpenFlags::CREATE),
     )?;
 
-    let (mount_id, ino) = match resolved {
+    let (mount_id, ino, kind, readable, writable) = match resolved {
         ResolvedOpen::Existing(file) => {
             if file.kind == FsNodeKind::Directory {
-                return None;
+                if !flags.can_open_directory() {
+                    return None;
+                }
+                (file.mount_id, file.ino, file.kind, false, false)
+            } else {
+                let (readable, writable) = flags.read_write();
+                if flags.contains(OpenFlags::TRUNC) {
+                    with_mount(file.mount_id, |mount| mount.set_len(file.ino, 0))
+                        .expect("filesystem mount is missing")?;
+                }
+                (file.mount_id, file.ino, file.kind, readable, writable)
             }
-            if flags.contains(OpenFlags::TRUNC) || flags.contains(OpenFlags::CREATE) {
-                with_mount(file.mount_id, |mount| mount.set_len(file.ino, 0))
-                    .expect("filesystem mount is missing")?;
-            }
-            (file.mount_id, file.ino)
         }
         ResolvedOpen::Create(target) => {
             let ino = with_mount(target.mount_id, |mount| {
                 mount.create_file(target.parent_ino, target.leaf_name)
             })
             .expect("filesystem mount is missing")?;
-            (target.mount_id, ino)
+            let (readable, writable) = flags.read_write();
+            (
+                target.mount_id,
+                ino,
+                FsNodeKind::RegularFile,
+                readable,
+                writable,
+            )
         }
     };
 
-    Some(Arc::new(OSInode::new(readable, writable, mount_id, ino)))
+    Some(Arc::new(OSInode::new(
+        readable, writable, kind, mount_id, ino,
+    )))
 }
 
 pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
@@ -114,6 +138,46 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
 
 pub(crate) fn open_file_at(cwd: WorkingDir, name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     open_file_impl(Some(cwd), name, flags)
+}
+
+pub(crate) fn lookup_dir_at(cwd: WorkingDir, name: &str) -> Option<WorkingDir> {
+    match resolve_open_target(Some(cwd), name, false, false)? {
+        ResolvedOpen::Existing(file) if file.kind == FsNodeKind::Directory => {
+            Some(WorkingDir::new(file.mount_id, file.ino))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn mkdir_at(cwd: WorkingDir, name: &str, mode: u32) -> Option<()> {
+    if matches!(
+        resolve_open_target(Some(cwd), name, false, false),
+        Some(ResolvedOpen::Existing(_))
+    ) {
+        return None;
+    }
+    let target = resolve_parent_target(Some(cwd), name)?;
+    with_mount(target.mount_id, |mount| {
+        mount.create_dir(target.parent_ino, target.leaf_name, mode)
+    })
+    .expect("filesystem mount is missing")?;
+    Some(())
+}
+
+pub(crate) fn unlink_file_at(cwd: WorkingDir, name: &str) -> Option<()> {
+    let resolved = resolve_open_target(Some(cwd), name, false, false)?;
+    let ResolvedOpen::Existing(file) = resolved else {
+        return None;
+    };
+    if file.kind == FsNodeKind::Directory {
+        return None;
+    }
+    let target = resolve_parent_target(Some(cwd), name)?;
+    with_mount(target.mount_id, |mount| {
+        mount.unlink(target.parent_ino, target.leaf_name)
+    })
+    .expect("filesystem mount is missing")?;
+    Some(())
 }
 
 impl File for OSInode {
@@ -126,6 +190,9 @@ impl File for OSInode {
     }
 
     fn read(&self, mut buf: UserBuffer) -> usize {
+        if self.kind == FsNodeKind::Directory {
+            return 0;
+        }
         let mut inner = self.inner.exclusive_access();
         let mut total_read_size = 0usize;
         for slice in buf.buffers.iter_mut() {
@@ -143,6 +210,9 @@ impl File for OSInode {
     }
 
     fn write(&self, buf: UserBuffer) -> usize {
+        if self.kind == FsNodeKind::Directory {
+            return 0;
+        }
         let mut inner = self.inner.exclusive_access();
         let mut total_write_size = 0usize;
         for slice in buf.buffers.iter() {
@@ -154,5 +224,13 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+
+    fn working_dir(&self) -> Option<WorkingDir> {
+        if self.kind != FsNodeKind::Directory {
+            return None;
+        }
+        let inner = self.inner.exclusive_access();
+        Some(WorkingDir::new(inner.mount_id, inner.ino))
     }
 }
