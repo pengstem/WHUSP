@@ -38,6 +38,15 @@ pub struct MemorySet {
     areas: Vec<MapArea>,
 }
 
+pub struct ElfLoadInfo {
+    pub memory_set: MemorySet,
+    pub ustack_base: usize,
+    pub entry_point: usize,
+    pub phdr: usize,
+    pub phent: usize,
+    pub phnum: usize,
+}
+
 impl MemorySet {
     pub fn new_bare() -> Self {
         Self {
@@ -166,9 +175,9 @@ impl MemorySet {
         }
         memory_set
     }
-    /// Include sections in elf and trampoline,
-    /// also returns user_sp_base and entry point.
-    pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize) {
+    /// Include sections in elf and trampoline, returning metadata needed to
+    /// build a Linux-style initial user stack.
+    pub fn from_elf(elf_data: &[u8]) -> ElfLoadInfo {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
@@ -178,10 +187,18 @@ impl MemorySet {
         let magic = elf_header.pt1.magic;
         assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
         let ph_count = elf_header.pt2.ph_count();
+        let ph_entry_size = elf_header.pt2.ph_entry_size();
+        let ph_offset = elf_header.pt2.ph_offset() as usize;
+        let ph_size = ph_entry_size as usize * ph_count as usize;
+        let mut phdr = 0;
         let mut max_end_vpn = VirtPageNum(0);
         for i in 0..ph_count {
             let ph = elf.program_header(i).unwrap();
-            if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
+            let ph_type = ph.get_type().unwrap();
+            if ph_type == xmas_elf::program::Type::Phdr {
+                phdr = ph.virtual_addr() as usize;
+            }
+            if ph_type == xmas_elf::program::Type::Load {
                 let start_va: VirtAddr = (ph.virtual_addr() as usize).into();
                 let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize).into();
                 let mut map_perm = MapPermission::U;
@@ -201,16 +218,26 @@ impl MemorySet {
                     map_area,
                     Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
                 );
+                if phdr == 0 {
+                    let load_offset = ph.offset() as usize;
+                    let load_file_end = load_offset + ph.file_size() as usize;
+                    if ph_offset >= load_offset && ph_offset + ph_size <= load_file_end {
+                        phdr = ph.virtual_addr() as usize + (ph_offset - load_offset);
+                    }
+                }
             }
         }
         let max_end_va: VirtAddr = max_end_vpn.into();
         let mut user_stack_base: usize = max_end_va.into();
         user_stack_base += PAGE_SIZE;
-        (
+        ElfLoadInfo {
             memory_set,
-            user_stack_base,
-            elf.header.pt2.entry_point() as usize,
-        )
+            ustack_base: user_stack_base,
+            entry_point: elf.header.pt2.entry_point() as usize,
+            phdr,
+            phent: ph_entry_size as usize,
+            phnum: ph_count as usize,
+        }
     }
     pub fn from_existed_user(user_space: &MemorySet) -> MemorySet {
         let mut memory_set = Self::new_bare();

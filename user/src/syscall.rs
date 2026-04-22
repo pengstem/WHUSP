@@ -194,9 +194,21 @@ pub fn sys_fork() -> isize {
 }
 
 pub fn sys_exec(path: &str, args: &[*const u8]) -> isize {
+    let empty_env: [*const u8; 1] = [core::ptr::null()];
+    sys_execve(path, args, &empty_env)
+}
+
+pub fn sys_execve(path: &str, args: &[*const u8], envs: &[*const u8]) -> isize {
     syscall(
         SYSCALL_EXEC,
-        [path.as_ptr() as usize, args.as_ptr() as usize, 0, 0, 0, 0],
+        [
+            path.as_ptr() as usize,
+            args.as_ptr() as usize,
+            envs.as_ptr() as usize,
+            0,
+            0,
+            0,
+        ],
     )
 }
 

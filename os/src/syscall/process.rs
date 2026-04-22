@@ -70,25 +70,34 @@ fn sys_clone_thread(args: CloneArgs) -> isize {
     cloned.tid as isize
 }
 
-pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
+fn translated_string_array(token: usize, mut ptr: *const usize) -> Vec<String> {
+    if ptr.is_null() {
+        return Vec::new();
+    }
+    let mut strings = Vec::new();
+    loop {
+        let string_ptr = *translated_ref(token, ptr);
+        if string_ptr == 0 {
+            break;
+        }
+        strings.push(translated_str(token, string_ptr as *const u8));
+        unsafe {
+            ptr = ptr.add(1);
+        }
+    }
+    strings
+}
+
+pub fn sys_exec(path: *const u8, args: *const usize, envs: *const usize) -> isize {
     let process = current_process();
     let token = current_user_token();
     let path = translated_str(token, path);
-    let mut args_vec: Vec<String> = Vec::new();
-    loop {
-        let arg_str_ptr = *translated_ref(token, args);
-        if arg_str_ptr == 0 {
-            break;
-        }
-        args_vec.push(translated_str(token, arg_str_ptr as *const u8));
-        unsafe {
-            args = args.add(1);
-        }
-    }
+    let args_vec = translated_string_array(token, args);
+    let envs_vec = translated_string_array(token, envs);
     if let Some(app_inode) = open_file_at(process.working_dir(), path.as_str(), OpenFlags::RDONLY) {
         let all_data = app_inode.read_all();
         let argc = args_vec.len();
-        process.exec(all_data.as_slice(), args_vec);
+        process.exec(all_data.as_slice(), args_vec, envs_vec);
         // return argc because cx.x[10] will be covered with it later
         argc as isize
     } else {
