@@ -5,7 +5,6 @@
 #[macro_use]
 pub mod console;
 mod file;
-mod io;
 mod lang_items;
 mod net;
 mod sync;
@@ -21,7 +20,6 @@ use core::ptr::addr_of_mut;
 use alloc::vec::Vec;
 use buddy_system_allocator::LockedHeap;
 pub use file::*;
-pub use io::*;
 pub use net::*;
 pub use sync::*;
 use syscall::*;

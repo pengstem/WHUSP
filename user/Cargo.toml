@@ -12,9 +12,7 @@ buddy_system_allocator = "0.6"
 bitflags = "1.2.1"
 riscv = { git = "https://github.com/rcore-os/riscv", features = ["inline-asm"] }
 lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
-embedded-graphics = "0.7.1"
 oorandom ="11"
-virtio-input-decoder = "0.1.4"
 
 [lib]
 test = false
@@ -163,30 +161,6 @@ test = false
 bench = false
 
 [[bin]]
-name = "gui_move"
-path = "src/bin/gui_move.rs"
-test = false
-bench = false
-
-[[bin]]
-name = "gui_shape"
-path = "src/bin/gui_shape.rs"
-test = false
-bench = false
-
-[[bin]]
-name = "gui_snake"
-path = "src/bin/gui_snake.rs"
-test = false
-bench = false
-
-[[bin]]
-name = "gui_tri"
-path = "src/bin/gui_tri.rs"
-test = false
-bench = false
-
-[[bin]]
 name = "hello_world"
 path = "src/bin/hello_world.rs"
 test = false
@@ -213,12 +187,6 @@ bench = false
 [[bin]]
 name = "initproc"
 path = "src/bin/initproc.rs"
-test = false
-bench = false
-
-[[bin]]
-name = "inputdev_event"
-path = "src/bin/inputdev_event.rs"
 test = false
 bench = false
 
