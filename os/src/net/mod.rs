@@ -34,7 +34,7 @@ lazy_static::lazy_static! {
 }
 
 pub fn net_interrupt_handler() {
-    let mut recv_buf = vec![0u8; 1024];
+    let mut recv_buf = vec![0u8; 2048];
 
     let len = NET_DEVICE.receive(&mut recv_buf);
 

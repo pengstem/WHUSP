@@ -3,10 +3,14 @@ use crate::drivers::chardev::{CharDevice, UART};
 use crate::drivers::plic::{IntrTargetPriority, PLIC};
 use crate::drivers::{KEYBOARD_DEVICE, MOUSE_DEVICE};
 use core::cell::UnsafeCell;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 use fdt::{Fdt, node::FdtNode};
 use riscv::register::sie;
-use virtio_drivers::{DeviceType, VirtIOHeader};
+use virtio_drivers::transport::{
+    DeviceType, Transport,
+    mmio::{MmioTransport, VirtIOHeader},
+};
 
 const BLOCK_DEVICE_CAPACITY: usize = 8;
 const MMIO_REGION_CAPACITY: usize = 10;
@@ -193,13 +197,11 @@ unsafe extern "C" {
     safe fn ekernel();
 }
 
-fn virtio_device_type(base: usize) -> Option<DeviceType> {
-    let header = unsafe { &*(base as *const VirtIOHeader) };
-    if header.verify() {
-        Some(header.device_type())
-    } else {
-        None
-    }
+fn virtio_device_type(device: IrqDevice) -> Option<DeviceType> {
+    let header = NonNull::new(device.base as *mut VirtIOHeader).unwrap();
+    unsafe { MmioTransport::new(header, device.size) }
+        .ok()
+        .map(|transport| transport.device_type())
 }
 
 pub fn init_from_dtb(dtb_addr: usize) {
@@ -265,7 +267,7 @@ pub fn init_from_dtb(dtb_addr: usize) {
             continue;
         }
         let device = irq_device(node, "virtio-mmio");
-        match virtio_device_type(device.base) {
+        match virtio_device_type(device) {
             Some(DeviceType::Block) => {
                 push_block_device(&mut config, device);
                 push_device_mmio_region(&mut config, device);
@@ -336,28 +338,28 @@ pub fn block_devices() -> &'static [IrqDevice] {
     &config.blocks[..config.block_count]
 }
 
-pub fn gpu_base() -> Option<usize> {
-    board_config().gpu.map(|device| device.base)
+pub fn gpu_device() -> Option<IrqDevice> {
+    board_config().gpu
 }
 
-pub fn keyboard_base() -> Option<usize> {
-    board_config().keyboard.map(|device| device.base)
+pub fn keyboard_device() -> Option<IrqDevice> {
+    board_config().keyboard
 }
 
 pub fn keyboard_irq() -> Option<usize> {
     board_config().keyboard.map(|device| device.irq)
 }
 
-pub fn mouse_base() -> Option<usize> {
-    board_config().mouse.map(|device| device.base)
+pub fn mouse_device() -> Option<IrqDevice> {
+    board_config().mouse
 }
 
 pub fn mouse_irq() -> Option<usize> {
     board_config().mouse.map(|device| device.irq)
 }
 
-pub fn net_base() -> Option<usize> {
-    board_config().net.map(|device| device.base)
+pub fn net_device() -> Option<IrqDevice> {
+    board_config().net
 }
 
 pub fn device_init(hart_id: usize) {

@@ -6,7 +6,7 @@ mod page_table;
 
 pub use address::VPNRange;
 pub use address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
-pub use frame_allocator::{FrameTracker, frame_alloc, frame_alloc_more, frame_dealloc};
+pub use frame_allocator::{FrameTracker, frame_alloc, frame_alloc_more};
 pub use memory_set::{KERNEL_SPACE, MapArea, MapPermission, MapType, MemorySet, kernel_token};
 use page_table::PTEFlags;
 pub use page_table::{

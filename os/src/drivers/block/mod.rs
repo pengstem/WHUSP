@@ -13,7 +13,7 @@ lazy_static! {
         .iter()
         .enumerate()
         .map(|(index, device)| {
-            let block_device = Arc::new(BlockDeviceImpl::new(device.base, device.irq));
+            let block_device = Arc::new(BlockDeviceImpl::new(*device));
             info!(
                 "block device[{}]: base={:#x}, irq={}, sectors={}",
                 index,

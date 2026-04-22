@@ -6,7 +6,17 @@ use crate::sync::{Condvar, UPIntrFreeCell};
 use crate::task::schedule;
 use alloc::collections::VecDeque;
 use bitflags::*;
-use volatile::{ReadOnly, Volatile, WriteOnly};
+use core::ptr::NonNull;
+use volatile::{
+    VolatilePtr,
+    access::{ReadOnly, WriteOnly},
+};
+
+const RBR: usize = 0;
+const THR: usize = 0;
+const IER_REG: usize = 1;
+const MCR_REG: usize = 4;
+const LSR_REG: usize = 5;
 
 bitflags! {
     /// InterruptEnableRegister
@@ -33,57 +43,19 @@ bitflags! {
     }
 }
 
-#[repr(C)]
-#[allow(dead_code)]
-struct ReadWithoutDLAB {
-    /// receiver buffer register
-    pub rbr: ReadOnly<u8>,
-    /// interrupt enable register
-    pub ier: Volatile<IER>,
-    /// interrupt identification register
-    pub iir: ReadOnly<u8>,
-    /// line control register
-    pub lcr: Volatile<u8>,
-    /// model control register
-    pub mcr: Volatile<MCR>,
-    /// line status register
-    pub lsr: ReadOnly<LSR>,
-    /// ignore MSR
-    _padding1: ReadOnly<u8>,
-    /// ignore SCR
-    _padding2: ReadOnly<u8>,
-}
-
-#[repr(C)]
-#[allow(dead_code)]
-struct WriteWithoutDLAB {
-    /// transmitter holding register
-    pub thr: WriteOnly<u8>,
-    /// interrupt enable register
-    pub ier: Volatile<IER>,
-    /// ignore FCR
-    _padding0: ReadOnly<u8>,
-    /// line control register
-    pub lcr: Volatile<u8>,
-    /// modem control register
-    pub mcr: Volatile<MCR>,
-    /// line status register
-    pub lsr: ReadOnly<LSR>,
-    /// ignore other registers
-    _padding1: ReadOnly<u16>,
-}
-
 pub struct NS16550aRaw {
     base_addr: usize,
 }
 
 impl NS16550aRaw {
-    fn read_end(&mut self) -> &mut ReadWithoutDLAB {
-        unsafe { &mut *(self.base_addr as *mut ReadWithoutDLAB) }
+    fn read_reg(&self, offset: usize) -> u8 {
+        let ptr = NonNull::new((self.base_addr + offset) as *mut u8).unwrap();
+        unsafe { VolatilePtr::new_restricted(ReadOnly, ptr).read() }
     }
 
-    fn write_end(&mut self) -> &mut WriteWithoutDLAB {
-        unsafe { &mut *(self.base_addr as *mut WriteWithoutDLAB) }
+    fn write_reg(&self, offset: usize, value: u8) {
+        let ptr = NonNull::new((self.base_addr + offset) as *mut u8).unwrap();
+        unsafe { VolatilePtr::new_restricted(WriteOnly, ptr).write(value) };
     }
 
     pub fn new(base_addr: usize) -> Self {
@@ -91,31 +63,29 @@ impl NS16550aRaw {
     }
 
     pub fn init(&mut self) {
-        let read_end = self.read_end();
         let mut mcr = MCR::empty();
         mcr |= MCR::DATA_TERMINAL_READY;
         mcr |= MCR::REQUEST_TO_SEND;
         mcr |= MCR::AUX_OUTPUT2;
-        read_end.mcr.write(mcr);
+        self.write_reg(MCR_REG, mcr.bits());
         let ier = IER::RX_AVAILABLE;
-        read_end.ier.write(ier);
+        self.write_reg(IER_REG, ier.bits());
     }
 
     pub fn read(&mut self) -> Option<u8> {
-        let read_end = self.read_end();
-        let lsr = read_end.lsr.read();
+        let lsr = LSR::from_bits_truncate(self.read_reg(LSR_REG));
         if lsr.contains(LSR::DATA_AVAILABLE) {
-            Some(read_end.rbr.read())
+            Some(self.read_reg(RBR))
         } else {
             None
         }
     }
 
     pub fn write(&mut self, ch: u8) {
-        let write_end = self.write_end();
         loop {
-            if write_end.lsr.read().contains(LSR::THR_EMPTY) {
-                write_end.thr.write(ch);
+            let lsr = LSR::from_bits_truncate(self.read_reg(LSR_REG));
+            if lsr.contains(LSR::THR_EMPTY) {
+                self.write_reg(THR, ch);
                 break;
             }
         }

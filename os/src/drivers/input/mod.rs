@@ -1,13 +1,14 @@
-use crate::drivers::bus::virtio::VirtioHal;
+use crate::board::IrqDevice;
+use crate::drivers::bus::virtio::{VirtioHal, VirtioTransport, mmio_transport};
 use crate::sync::{Condvar, UPIntrFreeCell};
 use crate::task::schedule;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::any::Any;
-use virtio_drivers::{VirtIOHeader, VirtIOInput};
+use virtio_drivers::device::input::VirtIOInput;
 
 struct VirtIOInputInner {
-    virtio_input: VirtIOInput<'static, VirtioHal>,
+    virtio_input: VirtIOInput<VirtioHal, VirtioTransport>,
     events: VecDeque<u64>,
 }
 
@@ -23,18 +24,20 @@ pub trait InputDevice: Send + Sync + Any {
 }
 
 lazy_static::lazy_static!(
-    pub static ref KEYBOARD_DEVICE: Option<Arc<dyn InputDevice>> = crate::board::keyboard_base()
-        .map(|addr| Arc::new(VirtIOInputWrapper::new(addr)) as Arc<dyn InputDevice>);
-    pub static ref MOUSE_DEVICE: Option<Arc<dyn InputDevice>> = crate::board::mouse_base()
-        .map(|addr| Arc::new(VirtIOInputWrapper::new(addr)) as Arc<dyn InputDevice>);
+    pub static ref KEYBOARD_DEVICE: Option<Arc<dyn InputDevice>> = crate::board::keyboard_device()
+        .map(|device| Arc::new(VirtIOInputWrapper::new(device)) as Arc<dyn InputDevice>);
+    pub static ref MOUSE_DEVICE: Option<Arc<dyn InputDevice>> = crate::board::mouse_device()
+        .map(|device| Arc::new(VirtIOInputWrapper::new(device)) as Arc<dyn InputDevice>);
 );
 
 impl VirtIOInputWrapper {
-    pub fn new(addr: usize) -> Self {
+    pub fn new(device: IrqDevice) -> Self {
         let inner = VirtIOInputInner {
-            virtio_input: unsafe {
-                VirtIOInput::<VirtioHal>::new(&mut *(addr as *mut VirtIOHeader)).unwrap()
-            },
+            virtio_input: VirtIOInput::<VirtioHal, _>::new(mmio_transport(
+                device.base,
+                device.size,
+            ))
+            .unwrap(),
             events: VecDeque::new(),
         };
         Self {

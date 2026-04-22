@@ -1,10 +1,10 @@
-use crate::drivers::bus::virtio::VirtioHal;
+use crate::drivers::bus::virtio::{VirtioHal, VirtioTransport, mmio_transport};
 use crate::sync::UPIntrFreeCell;
 use alloc::{sync::Arc, vec::Vec};
 use core::any::Any;
 use embedded_graphics::pixelcolor::Rgb888;
 use tinybmp::Bmp;
-use virtio_drivers::{VirtIOGpu, VirtIOHeader};
+use virtio_drivers::device::gpu::VirtIOGpu;
 
 pub trait GpuDevice: Send + Sync + Any {
     fn get_framebuffer(&self) -> &mut [u8];
@@ -12,21 +12,21 @@ pub trait GpuDevice: Send + Sync + Any {
 }
 
 lazy_static::lazy_static!(
-    pub static ref GPU_DEVICE: Option<Arc<dyn GpuDevice>> = crate::board::gpu_base()
+    pub static ref GPU_DEVICE: Option<Arc<dyn GpuDevice>> = crate::board::gpu_device()
         .map(|_| Arc::new(VirtIOGpuWrapper::new()) as Arc<dyn GpuDevice>);
 );
 
 pub struct VirtIOGpuWrapper {
-    gpu: UPIntrFreeCell<VirtIOGpu<'static, VirtioHal>>,
+    gpu: UPIntrFreeCell<VirtIOGpu<VirtioHal, VirtioTransport>>,
     fb: &'static [u8],
 }
 static BMP_DATA: &[u8] = include_bytes!("../../assert/mouse.bmp");
 impl VirtIOGpuWrapper {
     pub fn new() -> Self {
-        let base_addr = crate::board::gpu_base().expect("GPU device is unavailable");
+        let device = crate::board::gpu_device().expect("GPU device is unavailable");
         unsafe {
             let mut virtio =
-                VirtIOGpu::<VirtioHal>::new(&mut *(base_addr as *mut VirtIOHeader)).unwrap();
+                VirtIOGpu::<VirtioHal, _>::new(mmio_transport(device.base, device.size)).unwrap();
 
             let fbuffer = virtio.setup_framebuffer().unwrap();
             let len = fbuffer.len();
