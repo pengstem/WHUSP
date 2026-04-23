@@ -83,10 +83,15 @@ impl MemorySet {
     /// Add a new MapArea into this MemorySet.
     /// Assuming that there are no conflicts in the virtual address
     /// space.
-    pub fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
+    pub fn push(&mut self, map_area: MapArea, data: Option<&[u8]>) {
+        self.push_with_offset(map_area, data, 0);
+    }
+
+    // TODO: seem to be a extra layer of abstration
+    fn push_with_offset(&mut self, mut map_area: MapArea, data: Option<&[u8]>, data_offset: usize) {
         map_area.map(&mut self.page_table);
         if let Some(data) = data {
-            map_area.copy_data(&self.page_table, data);
+            map_area.copy_data(&self.page_table, data, data_offset);
         }
         self.areas.push(map_area);
     }
@@ -214,9 +219,10 @@ impl MemorySet {
                 }
                 let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
                 max_end_vpn = map_area.vpn_range.get_end();
-                memory_set.push(
+                memory_set.push_with_offset(
                     map_area,
                     Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
+                    start_va.page_offset(),
                 );
                 if phdr == 0 {
                     let load_offset = ph.offset() as usize;
@@ -343,26 +349,26 @@ impl MapArea {
             self.unmap_one(page_table, vpn);
         }
     }
-    /// data: start-aligned but maybe with shorter length
-    /// assume that all frames were cleared before
-    pub fn copy_data(&mut self, page_table: &PageTable, data: &[u8]) {
+    /// Copy file-backed bytes into a framed area at the given page offset.
+    /// Unwritten bytes stay zero-filled from frame allocation.
+    pub fn copy_data(&mut self, page_table: &PageTable, data: &[u8], data_offset: usize) {
         assert_eq!(self.map_type, MapType::Framed);
-        let mut start: usize = 0;
+        assert!(data_offset < PAGE_SIZE);
+        let mut copied = 0usize;
         let mut current_vpn = self.vpn_range.get_start();
         let len = data.len();
-        // TODO: this loop could be refactor for better clarity
-        loop {
-            let src = &data[start..len.min(start + PAGE_SIZE)];
+        let mut page_offset = data_offset;
+        while copied < len {
+            let copy_len = (PAGE_SIZE - page_offset).min(len - copied);
+            let src = &data[copied..copied + copy_len];
             let dst = &mut page_table
                 .translate(current_vpn)
                 .unwrap()
                 .ppn()
-                .get_bytes_array()[..src.len()];
+                .get_bytes_array()[page_offset..page_offset + copy_len];
             dst.copy_from_slice(src);
-            start += PAGE_SIZE;
-            if start >= len {
-                break;
-            }
+            copied += copy_len;
+            page_offset = 0;
             current_vpn.step();
         }
     }
