@@ -10,6 +10,56 @@ use super::errno::{SysError, SysResult};
 
 const AT_FDCWD: isize = -100;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxKstat {
+    st_dev: u64,
+    st_ino: u64,
+    st_mode: u32,
+    st_nlink: u32,
+    st_uid: u32,
+    st_gid: u32,
+    st_rdev: u64,
+    __pad: u64,
+    st_size: i64,
+    st_blksize: u32,
+    __pad2: i32,
+    st_blocks: u64,
+    st_atime_sec: i64,
+    st_atime_nsec: i64,
+    st_mtime_sec: i64,
+    st_mtime_nsec: i64,
+    st_ctime_sec: i64,
+    st_ctime_nsec: i64,
+    __unused: [u32; 2],
+}
+
+impl From<crate::fs::FileStat> for LinuxKstat {
+    fn from(stat: crate::fs::FileStat) -> Self {
+        Self {
+            st_dev: stat.dev,
+            st_ino: stat.ino,
+            st_mode: stat.mode,
+            st_nlink: stat.nlink,
+            st_uid: stat.uid,
+            st_gid: stat.gid,
+            st_rdev: stat.rdev,
+            __pad: 0,
+            st_size: stat.size as i64,
+            st_blksize: stat.blksize,
+            __pad2: 0,
+            st_blocks: stat.blocks,
+            st_atime_sec: stat.atime_sec as i64,
+            st_atime_nsec: stat.atime_nsec as i64,
+            st_mtime_sec: stat.mtime_sec as i64,
+            st_mtime_nsec: stat.mtime_nsec as i64,
+            st_ctime_sec: stat.ctime_sec as i64,
+            st_ctime_nsec: stat.ctime_nsec as i64,
+            __unused: [0; 2],
+        }
+    }
+}
+
 fn dirfd_base(dirfd: isize) -> SysResult<WorkingDir> {
     let process = current_process();
     if dirfd == AT_FDCWD {
@@ -136,6 +186,26 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> SysResult {
     let process = current_process();
     let cwd_path = process.working_dir_path();
     copy_c_string_to_user(buf, size, cwd_path.as_str())
+}
+
+pub fn sys_fstat(fd: usize, statbuf: *mut LinuxKstat) -> SysResult {
+    if statbuf.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    let token = current_user_token();
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let Some(file) = inner
+        .fd_table
+        .get(fd)
+        .and_then(|file| file.as_ref())
+        .cloned()
+    else {
+        return Err(SysError::EBADF);
+    };
+    drop(inner);
+    *translated_refmut(token, statbuf) = file.stat().into();
+    Ok(0)
 }
 
 pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> SysResult {

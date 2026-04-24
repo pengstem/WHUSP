@@ -1,3 +1,4 @@
+use super::FileStat;
 use crate::drivers::block::VirtIOBlock;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -175,6 +176,29 @@ impl Ext4Mount {
     pub(super) fn set_len(&mut self, ino: u32, len: u64) -> Option<()> {
         // TODO: ok() make the error messages lost
         self.fs.set_len(ino, len).ok()
+    }
+
+    pub(super) fn stat(&mut self, ino: u32) -> Option<FileStat> {
+        let mut attr = lwext4_rust::FileAttr::default();
+        self.fs.get_attr(ino, &mut attr).ok()?;
+        Some(FileStat {
+            dev: attr.device,
+            ino: attr.ino as u64,
+            mode: attr.mode,
+            nlink: attr.nlink as u32,
+            uid: attr.uid,
+            gid: attr.gid,
+            rdev: 0,
+            size: attr.size,
+            blksize: attr.block_size as u32,
+            blocks: attr.blocks,
+            atime_sec: attr.atime.as_secs(),
+            atime_nsec: attr.atime.subsec_nanos(),
+            mtime_sec: attr.mtime.as_secs(),
+            mtime_nsec: attr.mtime.subsec_nanos(),
+            ctime_sec: attr.ctime.as_secs(),
+            ctime_nsec: attr.ctime.subsec_nanos(),
+        })
     }
 
     pub(super) fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {

@@ -1,7 +1,7 @@
-use super::File;
 use super::ext4::FsNodeKind;
 use super::mount::{MountId, with_mount};
 use super::path::{ResolvedOpen, WorkingDir, resolve_open_target, resolve_parent_target};
+use super::{File, FileStat};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use alloc::sync::Arc;
@@ -226,6 +226,15 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+
+    fn stat(&self) -> FileStat {
+        let inner = self.inner.exclusive_access();
+        let mut stat = with_mount(inner.mount_id, |mount| mount.stat(inner.ino))
+            .expect("filesystem mount is missing")
+            .expect("inode stat failed");
+        stat.dev = inner.mount_id.0 as u64;
+        stat
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {

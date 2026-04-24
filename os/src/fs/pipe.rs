@@ -1,4 +1,4 @@
-use super::File;
+use super::{File, FileStat, S_IFIFO};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use alloc::sync::{Arc, Weak};
@@ -169,5 +169,8 @@ impl File for Pipe {
                 }
             }
         }
+    }
+    fn stat(&self) -> FileStat {
+        FileStat::with_mode(S_IFIFO | 0o600)
     }
 }
