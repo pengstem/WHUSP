@@ -2,13 +2,26 @@ use crate::fs::{
     OpenFlags, WorkingDir, lookup_dir_at, make_pipe, mkdir_at, normalize_path, open_file_at,
     unlink_file_at,
 };
-use crate::mm::{UserBuffer, translated_byte_buffer, translated_refmut, translated_str};
+use crate::mm::{
+    PageTable, StepByOne, UserBuffer, VirtAddr, translated_byte_buffer, translated_refmut,
+    translated_str,
+};
 use crate::task::{current_process, current_user_token};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::mem::size_of;
 
 use super::errno::{SysError, SysResult};
 
 const AT_FDCWD: isize = -100;
+const IOV_MAX: usize = 1024;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxIovec {
+    base: usize,
+    len: usize,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -58,6 +71,75 @@ impl From<crate::fs::FileStat> for LinuxKstat {
             __unused: [0; 2],
         }
     }
+}
+
+// TODO: i think these functions are taking the responsibility of the mm module
+fn translated_byte_buffer_checked(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+) -> SysResult<Vec<&'static mut [u8]>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut start = ptr as usize;
+    let end = start.checked_add(len).ok_or(SysError::EFAULT)?;
+    let page_table = PageTable::from_token(token);
+    let mut buffers = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let pte = page_table.translate(vpn).ok_or(SysError::EFAULT)?;
+        if !pte.is_valid() || !pte.readable() {
+            return Err(SysError::EFAULT);
+        }
+        let ppn = pte.ppn();
+        vpn.step();
+        let mut end_va: VirtAddr = vpn.into();
+        end_va = end_va.min(VirtAddr::from(end));
+        if end_va.page_offset() == 0 {
+            buffers.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
+        } else {
+            buffers.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
+        }
+        start = end_va.into();
+    }
+    Ok(buffers)
+}
+
+fn read_user_usize(token: usize, addr: usize) -> SysResult<usize> {
+    let mut bytes = [0u8; size_of::<usize>()];
+    let buffers = translated_byte_buffer_checked(token, addr as *const u8, bytes.len())?;
+    let mut copied = 0usize;
+    for buffer in buffers.iter() {
+        let next = copied + buffer.len();
+        bytes[copied..next].copy_from_slice(buffer);
+        copied = next;
+    }
+    Ok(usize::from_ne_bytes(bytes))
+}
+
+fn read_user_iovecs(
+    token: usize,
+    iov: *const LinuxIovec,
+    iovcnt: usize,
+) -> SysResult<Vec<LinuxIovec>> {
+    let entry_size = size_of::<LinuxIovec>();
+    let mut iovecs = Vec::new();
+    let mut total_len = 0usize;
+    for index in 0..iovcnt {
+        let entry_addr = (iov as usize)
+            .checked_add(index.checked_mul(entry_size).ok_or(SysError::EFAULT)?)
+            .ok_or(SysError::EFAULT)?;
+        let base = read_user_usize(token, entry_addr)?;
+        let len = read_user_usize(token, entry_addr + size_of::<usize>())?;
+        total_len = total_len.checked_add(len).ok_or(SysError::EINVAL)?;
+        if total_len > isize::MAX as usize {
+            return Err(SysError::EINVAL);
+        }
+        iovecs.push(LinuxIovec { base, len });
+    }
+    Ok(iovecs)
 }
 
 fn dirfd_base(dirfd: isize) -> SysResult<WorkingDir> {
@@ -125,6 +207,52 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
     } else {
         Err(SysError::EBADF)
     }
+}
+
+pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult {
+    if iovcnt == 0 {
+        return Ok(0);
+    }
+    if iovcnt > IOV_MAX {
+        return Err(SysError::EINVAL);
+    }
+    if iov.is_null() {
+        return Err(SysError::EFAULT);
+    }
+
+    let token = current_user_token();
+    let iovecs = read_user_iovecs(token, iov, iovcnt)?;
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return Err(SysError::EBADF);
+    }
+    let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+        return Err(SysError::EBADF);
+    };
+    if !file.writable() {
+        return Err(SysError::EBADF);
+    }
+    drop(inner);
+
+    let mut total_written = 0usize;
+    for iovec in iovecs {
+        if iovec.len == 0 {
+            continue;
+        }
+        let buffers =
+            match translated_byte_buffer_checked(token, iovec.base as *const u8, iovec.len) {
+                Ok(buffers) => buffers,
+                Err(_) if total_written > 0 => return Ok(total_written as isize),
+                Err(err) => return Err(err),
+            };
+        let written = file.write(UserBuffer::new(buffers));
+        total_written += written;
+        if written < iovec.len {
+            break;
+        }
+    }
+    Ok(total_written as isize)
 }
 
 pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> SysResult {
