@@ -147,6 +147,16 @@ pub(crate) fn open_file_at(cwd: WorkingDir, name: &str, flags: OpenFlags) -> Opt
     open_file_impl(Some(cwd), name, flags)
 }
 
+pub(crate) fn stat_at(cwd: WorkingDir, name: &str) -> Option<FileStat> {
+    let ResolvedOpen::Existing(file) = resolve_open_target(Some(cwd), name, false, false)? else {
+        return None;
+    };
+    let mut stat = with_mount(file.mount_id, |mount| mount.stat(file.ino))
+        .expect("filesystem mount is missing")?;
+    stat.dev = file.mount_id.0 as u64;
+    Some(stat)
+}
+
 pub(crate) fn lookup_dir_at(cwd: WorkingDir, name: &str) -> Option<WorkingDir> {
     match resolve_open_target(Some(cwd), name, false, false)? {
         ResolvedOpen::Existing(file) if file.kind == FsNodeKind::Directory => {

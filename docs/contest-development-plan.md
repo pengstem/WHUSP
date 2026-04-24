@@ -33,7 +33,7 @@
   - [x] `openat(56)` 基础版本
   - [x] `mkdirat(34)` / `unlinkat(35)` / `chdir(49)` / `getcwd(17)`
   - [ ] 升级 `openat` 相关语义（flags / mode / O_CREAT / O_DIRECTORY 完整行为）
-  - [ ] 升级 `execve` 的 `argv/envp` 传递（当前 `sys_exec` 只接 2 参数，无 envp）
+  - [x] 升级 `execve` 的 `argv/envp` 传递（当前 `sys_exec` 只接 2 参数，无 envp）
   - [ ] 升级 `wait4/waitpid` 相关语义（options / rusage）
   - [ ] 补齐 `stat/fstat/newfstatat` 相关语义
   - [ ] 补齐 `mmap/munmap/brk` 相关语义
@@ -45,6 +45,7 @@
 - [ ] `sys_waitpid`(260) 升级为 `sys_wait4(pid, wstatus, options, rusage)`：当前 `os/src/syscall/process.rs:72` 只接 2 参，且"still running 返回 -2" 非标准 —— Linux 默认应阻塞等待，`WNOHANG` flag 才立即返 0
 - [ ] 实现 `sys_exit_group`(94)：当前只有 `sys_exit`(93)，但 libc 的 `exit()` 走的是 exit_group，缺它多线程程序无法干净终止整个线程组
 - [ ] 修正 `sys_kill`(129) 信号参数类型：`os/src/syscall/process.rs:106` 用 `SignalFlags::from_bits(signal)` 把信号当 bitflags，但 Linux 信号号是整数（SIGKILL=9、SIGTERM=15 不是位标志），应直接按 signum 分发
+- [ ] errno support?
 
 ## P2.5 — cwd in pcb 收尾
 

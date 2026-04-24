@@ -1,6 +1,6 @@
 use crate::fs::{
-    OpenFlags, WorkingDir, lookup_dir_at, make_pipe, mkdir_at, normalize_path, open_file_at,
-    unlink_file_at,
+    File, OpenFlags, WorkingDir, lookup_dir_at, make_pipe, mkdir_at, normalize_path, open_file_at,
+    stat_at, unlink_file_at,
 };
 use crate::mm::{
     PageTable, StepByOne, UserBuffer, VirtAddr, translated_byte_buffer, translated_refmut,
@@ -14,6 +14,10 @@ use core::mem::size_of;
 use super::errno::{SysError, SysResult};
 
 const AT_FDCWD: isize = -100;
+const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+const AT_NO_AUTOMOUNT: i32 = 0x800;
+const AT_EMPTY_PATH: i32 = 0x1000;
+const VALID_FSTATAT_FLAGS: i32 = AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH;
 const IOV_MAX: usize = 1024;
 
 #[repr(C)]
@@ -143,21 +147,13 @@ fn read_user_iovecs(
 }
 
 fn dirfd_base(dirfd: isize) -> SysResult<WorkingDir> {
-    let process = current_process();
     if dirfd == AT_FDCWD {
-        return Ok(process.working_dir());
+        return Ok(current_process().working_dir());
     }
     if dirfd < 0 {
         return Err(SysError::EBADF);
     }
-    let inner = process.inner_exclusive_access();
-    let file = inner
-        .fd_table
-        .get(dirfd as usize)
-        .and_then(|file| file.as_ref())
-        .ok_or(SysError::EBADF)?
-        .clone();
-    drop(inner);
+    let file = get_file_by_fd(dirfd as usize)?;
     file.working_dir().ok_or(SysError::ENOTDIR)
 }
 
@@ -187,6 +183,36 @@ fn copy_c_string_to_user(ptr: *mut u8, buf_len: usize, string: &str) -> SysResul
         written += 1;
     }
     Ok(ptr as isize)
+}
+
+fn get_file_by_fd(fd: usize) -> SysResult<Arc<dyn File + Send + Sync>> {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    inner
+        .fd_table
+        .get(fd)
+        .and_then(|file| file.as_ref())
+        .cloned()
+        .ok_or(SysError::EBADF)
+}
+
+fn write_stat_to_user(
+    token: usize,
+    statbuf: *mut LinuxKstat,
+    stat: crate::fs::FileStat,
+) -> SysResult {
+    *translated_refmut(token, statbuf) = stat.into();
+    Ok(0)
+}
+
+fn stat_by_dirfd(dirfd: isize) -> SysResult<crate::fs::FileStat> {
+    if dirfd == AT_FDCWD {
+        return stat_at(current_process().working_dir(), ".").ok_or(SysError::ENOENT);
+    }
+    if dirfd < 0 {
+        return Err(SysError::EBADF);
+    }
+    Ok(get_file_by_fd(dirfd as usize)?.stat())
 }
 
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
@@ -321,19 +347,46 @@ pub fn sys_fstat(fd: usize, statbuf: *mut LinuxKstat) -> SysResult {
         return Err(SysError::EFAULT);
     }
     let token = current_user_token();
-    let process = current_process();
-    let inner = process.inner_exclusive_access();
-    let Some(file) = inner
-        .fd_table
-        .get(fd)
-        .and_then(|file| file.as_ref())
-        .cloned()
-    else {
-        return Err(SysError::EBADF);
+    let file = get_file_by_fd(fd)?;
+    write_stat_to_user(token, statbuf, file.stat())
+}
+
+pub fn sys_fstatat(
+    dirfd: isize,
+    pathname: *const u8,
+    statbuf: *mut LinuxKstat,
+    flags: i32,
+) -> SysResult {
+    if statbuf.is_null() || pathname.is_null() {
+        // CONTEXT: Linux 6.11 allows NULL + AT_EMPTY_PATH, but the current user-pointer helpers
+        // assume a non-null C string. Keep the older behavior until pathname translation is widened.
+        return Err(SysError::EFAULT);
+    }
+    if flags & !VALID_FSTATAT_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+
+    let token = current_user_token();
+    let path = translated_str(token, pathname);
+    if path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(SysError::ENOENT);
+        }
+        return write_stat_to_user(token, statbuf, stat_by_dirfd(dirfd)?);
+    }
+
+    // CONTEXT: `AT_NO_AUTOMOUNT` is a no-op on modern Linux, and this resolver has no automount
+    // concept. Accept the bit for libc compatibility without changing lookup behavior.
+    // CONTEXT: The current path resolver does not distinguish follow vs nofollow on the final path
+    // component yet. Accept `AT_SYMLINK_NOFOLLOW` so libc and LTP can reach this syscall, but it
+    // is not enforced until symlink-aware lookup lands.
+    let base = if path.starts_with('/') {
+        WorkingDir::root()
+    } else {
+        dirfd_base(dirfd)?
     };
-    drop(inner);
-    *translated_refmut(token, statbuf) = file.stat().into();
-    Ok(0)
+    let stat = stat_at(base, path.as_str()).ok_or(SysError::ENOENT)?;
+    write_stat_to_user(token, statbuf, stat)
 }
 
 pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> SysResult {
