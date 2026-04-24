@@ -65,14 +65,19 @@ bitflags! {
         const WRONLY = 1 << 0;
         const RDWR = 1 << 1;
         const CREATE = 0o100;
+        const NOCTTY = 0o400;
         const TRUNC = 0o1000;
+        const LARGEFILE = 0o100000;
         const DIRECTORY = 0o200000;
+        const CLOEXEC = 0o2000000;
     }
 }
 
 impl OpenFlags {
+    const ACCESS_MODE_MASK: u32 = 0b11;
+
     pub fn read_write(&self) -> (bool, bool) {
-        match self.bits() & 0b11 {
+        match self.bits() & Self::ACCESS_MODE_MASK {
             0 => (true, false),
             1 => (false, true),
             2 => (true, true),
@@ -81,7 +86,7 @@ impl OpenFlags {
     }
 
     pub fn writable_target(&self) -> bool {
-        matches!(self.bits() & 0b11, 1 | 2)
+        matches!(self.bits() & Self::ACCESS_MODE_MASK, 1 | 2)
     }
 
     pub fn can_open_directory(&self) -> bool {
