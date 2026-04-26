@@ -6,11 +6,21 @@ use crate::task::{
     suspend_current_and_run_next,
 };
 use crate::timer::get_time_ms;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::str;
 
 use super::errno::{SysError, SysResult};
+
+const ELF_MAGIC: &[u8] = b"\x7fELF";
+const SHEBANG_MAGIC: &[u8] = b"#!";
+const SHEBANG_RECURSION_LIMIT: usize = 4;
+
+struct ScriptInterpreter {
+    path: String,
+    optional_arg: Option<String>,
+}
 
 pub fn sys_exit(exit_code: i32) -> ! {
     exit_current_and_run_next(exit_code);
@@ -90,21 +100,196 @@ fn translated_string_array(token: usize, mut ptr: *const usize) -> Vec<String> {
     strings
 }
 
-pub fn sys_exec(path: *const u8, args: *const usize, envs: *const usize) -> SysResult {
+fn is_space_or_tab(byte: u8) -> bool {
+    byte == b' ' || byte == b'\t'
+}
+
+fn trim_script_line(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    while end > 0 && (is_space_or_tab(line[end - 1]) || line[end - 1] == b'\r') {
+        end -= 1;
+    }
+    &line[..end]
+}
+
+fn parse_shebang(data: &[u8]) -> SysResult<Option<ScriptInterpreter>> {
+    if !data.starts_with(SHEBANG_MAGIC) {
+        return Ok(None);
+    }
+
+    let line_end = data
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(data.len());
+    let line = trim_script_line(&data[SHEBANG_MAGIC.len()..line_end]);
+    let Some(name_start) = line.iter().position(|byte| !is_space_or_tab(*byte)) else {
+        return Err(SysError::ENOEXEC);
+    };
+    let rest = &line[name_start..];
+    let name_end = rest
+        .iter()
+        .position(|byte| is_space_or_tab(*byte))
+        .unwrap_or(rest.len());
+    let interpreter = str::from_utf8(&rest[..name_end]).map_err(|_| SysError::ENOEXEC)?;
+    if interpreter.is_empty() {
+        return Err(SysError::ENOEXEC);
+    }
+
+    let optional_arg = rest[name_end..]
+        .iter()
+        .position(|byte| !is_space_or_tab(*byte))
+        .map(|arg_start| {
+            str::from_utf8(&rest[name_end + arg_start..])
+                .map(|arg| arg.to_string())
+                .map_err(|_| SysError::ENOEXEC)
+        })
+        .transpose()?;
+
+    Ok(Some(ScriptInterpreter {
+        path: interpreter.to_string(),
+        optional_arg,
+    }))
+}
+
+fn is_path_under(path: &str, root: &str) -> bool {
+    match path.strip_prefix(root) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/'),
+        None => false,
+    }
+}
+
+fn libc_test_root(cwd_path: &str, script_path: &str) -> Option<&'static str> {
+    if is_path_under(script_path, "/musl") || is_path_under(cwd_path, "/musl") {
+        Some("/musl")
+    } else if is_path_under(script_path, "/glibc") || is_path_under(cwd_path, "/glibc") {
+        Some("/glibc")
+    } else {
+        None
+    }
+}
+
+fn busybox_fallback(
+    interpreter: &ScriptInterpreter,
+    script_path: &str,
+) -> Option<(String, Vec<String>)> {
+    let cwd_path = current_process().working_dir_path();
+    let root = libc_test_root(cwd_path.as_str(), script_path)?;
+    let mut busybox_path = String::from(root);
+    busybox_path.push_str("/busybox");
+
+    let mut args = Vec::new();
+    args.push(busybox_path.clone());
+    match interpreter.path.as_str() {
+        "/bin/sh" | "/bin/bash" | "sh" | "bash" => args.push(String::from("sh")),
+        "/busybox" | "/bin/busybox" | "busybox" => {}
+        _ => return None,
+    }
+    if let Some(optional_arg) = interpreter.optional_arg.as_ref() {
+        args.push(optional_arg.clone());
+    }
+    Some((busybox_path, args))
+}
+
+fn interpreter_candidates(
+    interpreter: &ScriptInterpreter,
+    script_path: &str,
+) -> Vec<(String, Vec<String>)> {
+    let mut direct_args = Vec::new();
+    direct_args.push(interpreter.path.clone());
+    if let Some(optional_arg) = interpreter.optional_arg.as_ref() {
+        direct_args.push(optional_arg.clone());
+    }
+
+    let mut candidates = Vec::new();
+    candidates.push((interpreter.path.clone(), direct_args));
+    if let Some(fallback) = busybox_fallback(interpreter, script_path) {
+        // CONTEXT: Official-style test disks put shell-capable BusyBox under
+        // `/musl` or `/glibc` instead of providing a real `/bin/sh`.
+        candidates.push(fallback);
+    }
+    candidates
+}
+
+fn read_exec_file(path: &str) -> SysResult<Vec<u8>> {
     let process = current_process();
+    let Some(app_inode) = open_file_at(process.working_dir(), path, OpenFlags::RDONLY) else {
+        return Err(SysError::ENOENT);
+    };
+    Ok(app_inode.read_all())
+}
+
+fn append_script_args(
+    mut args: Vec<String>,
+    script_path: String,
+    original_args: Vec<String>,
+) -> Vec<String> {
+    args.push(script_path);
+    args.extend(original_args.into_iter().skip(1));
+    args
+}
+
+fn exec_script(
+    script_path: String,
+    args: Vec<String>,
+    envs: Vec<String>,
+    interpreter: ScriptInterpreter,
+    depth: usize,
+) -> SysResult {
+    if depth >= SHEBANG_RECURSION_LIMIT {
+        return Err(SysError::ELOOP);
+    }
+
+    for (interpreter_path, candidate_args) in
+        interpreter_candidates(&interpreter, script_path.as_str())
+    {
+        let Ok(interpreter_data) = read_exec_file(interpreter_path.as_str()) else {
+            continue;
+        };
+        let next_args = append_script_args(candidate_args, script_path, args);
+        return exec_loaded_program(
+            interpreter_path,
+            next_args,
+            envs,
+            depth + 1,
+            interpreter_data,
+        );
+    }
+
+    Err(SysError::ENOENT)
+}
+
+fn exec_loaded_program(
+    path: String,
+    args: Vec<String>,
+    envs: Vec<String>,
+    depth: usize,
+    data: Vec<u8>,
+) -> SysResult {
+    if data.starts_with(ELF_MAGIC) {
+        let argc = args.len();
+        current_process().exec(data.as_slice(), args, envs);
+        // return argc because cx.x[10] will be covered with it later
+        return Ok(argc as isize);
+    }
+
+    let Some(interpreter) = parse_shebang(data.as_slice())? else {
+        return Err(SysError::ENOEXEC);
+    };
+    exec_script(path, args, envs, interpreter, depth)
+}
+
+fn exec_path(path: String, args: Vec<String>, envs: Vec<String>) -> SysResult {
+    let data = read_exec_file(path.as_str())?;
+    exec_loaded_program(path, args, envs, 0, data)
+}
+
+pub fn sys_exec(path: *const u8, args: *const usize, envs: *const usize) -> SysResult {
     let token = current_user_token();
     let path = translated_str(token, path);
     let args_vec = translated_string_array(token, args);
     let envs_vec = translated_string_array(token, envs);
-    if let Some(app_inode) = open_file_at(process.working_dir(), path.as_str(), OpenFlags::RDONLY) {
-        let all_data = app_inode.read_all();
-        let argc = args_vec.len();
-        process.exec(all_data.as_slice(), args_vec, envs_vec);
-        // return argc because cx.x[10] will be covered with it later
-        Ok(argc as isize)
-    } else {
-        Err(SysError::ENOENT)
-    }
+    exec_path(path, args_vec, envs_vec)
 }
 
 pub fn sys_kill(pid: usize, signal: u32) -> SysResult {

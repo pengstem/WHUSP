@@ -21,6 +21,7 @@ pub enum SysError {
     ENOTTY = 25,
     ENOSYS = 38,
     ENOTEMPTY = 39,
+    ELOOP = 40,
     ERANGE = 34,
 }
 
