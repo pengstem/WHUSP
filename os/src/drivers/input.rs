@@ -1,5 +1,5 @@
 use crate::board::IrqDevice;
-use crate::drivers::bus::virtio::{VirtioHal, VirtioTransport, mmio_transport};
+use crate::drivers::virtio::{VirtioHal, VirtioTransport, mmio_transport};
 use crate::sync::UPIntrFreeCell;
 use alloc::sync::Arc;
 use core::any::Any;

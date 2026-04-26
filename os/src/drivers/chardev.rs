@@ -1,16 +1,32 @@
 ///! Ref: https://www.lammertbies.nl/comm/info/serial-uart
 ///! Ref: ns16550a datasheet: https://datasheetspdf.com/pdf-file/605590/NationalSemiconductor/NS16550A/1
 ///! Ref: ns16450 datasheet: https://datasheetspdf.com/pdf-file/1311818/NationalSemiconductor/NS16450/1
-use super::CharDevice;
+use crate::board::CharDeviceImpl;
 use crate::sync::{Condvar, UPIntrFreeCell};
 use crate::task::schedule;
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use bitflags::*;
 use core::ptr::NonNull;
+use lazy_static::*;
 use volatile::{
     VolatilePtr,
     access::{ReadOnly, WriteOnly},
 };
+
+pub trait CharDevice {
+    fn init(&self);
+    fn read(&self) -> u8;
+    fn try_read(&self) -> Option<u8>;
+    fn has_input(&self) -> bool;
+    fn write(&self, ch: u8);
+    fn handle_irq(&self);
+}
+
+lazy_static! {
+    pub static ref UART: Arc<CharDeviceImpl> =
+        Arc::new(CharDeviceImpl::new(crate::board::uart_base()));
+}
 
 const RBR: usize = 0;
 const THR: usize = 0;
