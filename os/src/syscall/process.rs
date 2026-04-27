@@ -27,6 +27,14 @@ pub fn sys_exit(exit_code: i32) -> ! {
     panic!("Unreachable in sys_exit!");
 }
 
+pub fn sys_exit_group(exit_code: i32) -> ! {
+    // UNFINISHED: Linux exit_group terminates every thread in the current
+    // thread group; this compatibility path currently relies on the existing
+    // process-exit behavior and is complete only for single-threaded callers.
+    exit_current_and_run_next(exit_code);
+    panic!("Unreachable in sys_exit_group!");
+}
+
 pub fn sys_yield() -> isize {
     suspend_current_and_run_next();
     0

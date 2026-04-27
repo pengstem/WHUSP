@@ -1,3 +1,4 @@
+use super::exec::{ExecStackInfo, init_user_stack};
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
 use super::process::{ProcessControlBlock, ProcessControlBlockInner};
@@ -8,6 +9,7 @@ use crate::fs::{OpenFlags, Stdin, Stdout, WorkingDir};
 use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet};
 use crate::sync::UPIntrFreeCell;
 use crate::trap::{TrapContext, trap_handler};
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -41,12 +43,14 @@ impl ProcessControlBlock {
         inner.memory_set.token()
     }
 
-    pub fn new(elf_data: &[u8]) -> Arc<Self> {
+    pub fn new_with_args(elf_data: &[u8], args: Vec<String>, envs: Vec<String>) -> Arc<Self> {
         let ElfLoadInfo {
             memory_set,
             ustack_base,
             entry_point,
-            ..
+            phdr,
+            phent,
+            phnum,
         } = MemorySet::from_elf(elf_data);
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
@@ -80,18 +84,32 @@ impl ProcessControlBlock {
             ustack_base,
             true,
         ));
+        let process_token = process.inner_exclusive_access().memory_set.token();
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
-        let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();
+        let user_sp = task_inner.res.as_ref().unwrap().ustack_top();
         let kstack_top = task.kstack.get_top();
-        drop(task_inner);
-        *trap_cx = TrapContext::app_init_context(
+        let mut app_trap_cx = TrapContext::app_init_context(
             entry_point,
-            ustack_top,
+            user_sp,
             KERNEL_SPACE.exclusive_access().token(),
             kstack_top,
             trap_handler as usize,
         );
+        let stack_info = ExecStackInfo {
+            entry_point,
+            phdr,
+            phent,
+            phnum,
+        };
+        let (stack_top, argv_base, envp_base) =
+            init_user_stack(process_token, user_sp, &args, &envs, &stack_info);
+        app_trap_cx.set_sp(stack_top);
+        app_trap_cx.x[10] = args.len();
+        app_trap_cx.x[11] = argv_base;
+        app_trap_cx.x[12] = envp_base;
+        *trap_cx = app_trap_cx;
+        drop(task_inner);
 
         let mut process_inner = process.inner_exclusive_access();
         process_inner.tasks.push(Some(Arc::clone(&task)));

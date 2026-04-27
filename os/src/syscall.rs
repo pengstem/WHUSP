@@ -19,6 +19,7 @@ const SYSCALL_PPOLL: usize = 73;
 const SYSCALL_NEWFSTATAT: usize = 79;
 const SYSCALL_FSTAT: usize = 80;
 const SYSCALL_EXIT: usize = 93;
+const SYSCALL_EXIT_GROUP: usize = 94;
 const SYSCALL_WAITID: usize = 95;
 const SYSCALL_SLEEP: usize = 101;
 const SYSCALL_YIELD: usize = 124;
@@ -70,6 +71,9 @@ use wait::*;
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     if syscall_id == SYSCALL_EXIT {
         sys_exit(args[0] as i32);
+    }
+    if syscall_id == SYSCALL_EXIT_GROUP {
+        sys_exit_group(args[0] as i32);
     }
 
     ret(match syscall_id {

@@ -21,11 +21,11 @@ const AT_EGID: usize = 14;
 const AT_SECURE: usize = 23;
 const AT_RANDOM: usize = 25;
 
-struct ExecStackInfo {
-    entry_point: usize,
-    phdr: usize,
-    phent: usize,
-    phnum: usize,
+pub(super) struct ExecStackInfo {
+    pub(super) entry_point: usize,
+    pub(super) phdr: usize,
+    pub(super) phent: usize,
+    pub(super) phnum: usize,
 }
 
 fn align_down(value: usize, align: usize) -> usize {
@@ -62,7 +62,7 @@ fn push_user_strings(token: usize, user_sp: &mut usize, strings: &[String]) -> V
         .collect()
 }
 
-fn init_user_stack(
+pub(super) fn init_user_stack(
     token: usize,
     stack_top: usize,
     args: &[String],

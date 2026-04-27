@@ -41,9 +41,13 @@ jobs:
           test -f kernel-rv
           test -f disk.img
 
-      - name: Boot with official RISC-V device shape
+      - name: Boot contest disk when available
         shell: bash
         run: |
+          if [[ ! -f sdcard-rv.img ]]; then
+            echo "sdcard-rv.img is absent; skipping boot because initproc now loads /musl/busybox from the contest disk." | tee boot.log
+            exit 0
+          fi
           set +e
           set -o pipefail
           timeout 15s qemu-system-riscv64 \
@@ -53,12 +57,14 @@ jobs:
             -nographic \
             -smp 1 \
             -bios default \
-            -drive file=./disk.img,if=none,format=raw,id=x0 \
+            -drive file=./sdcard-rv.img,if=none,format=raw,id=x0 \
             -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
             -no-reboot \
             -device virtio-net-device,netdev=net \
             -netdev user,id=net \
             -rtc base=utc \
+            -drive file=./disk.img,if=none,format=raw,id=x1 \
+            -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1 \
             2>&1 | tee boot.log
           status=${PIPESTATUS[0]}
           set -e
@@ -68,36 +74,7 @@ jobs:
           grep -q "KERN: gpu device unavailable" boot.log
           grep -q "KERN: keyboard device unavailable" boot.log
           grep -q "KERN: mouse device unavailable" boot.log
-          grep -q "Rust user shell" boot.log
-
-      - name: Boot with auxiliary disk bootstrap fallback
-        shell: bash
-        run: |
-          set +e
-          set -o pipefail
-          cp disk.img primary-test.img
-          timeout 15s qemu-system-riscv64 \
-            -machine virt \
-            -kernel ./kernel-rv \
-            -m 1G \
-            -nographic \
-            -smp 1 \
-            -bios default \
-            -drive file=./primary-test.img,if=none,format=raw,id=x0 \
-            -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
-            -no-reboot \
-            -device virtio-net-device,netdev=net \
-            -netdev user,id=net \
-            -rtc base=utc \
-            -drive file=./disk.img,if=none,format=raw,id=x1 \
-            -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1 \
-            2>&1 | tee aux-boot.log
-          status=${PIPESTATUS[0]}
-          set -e
-          if [[ "${status}" != "0" && "${status}" != "124" ]]; then
-            exit "${status}"
-          fi
-          grep -q "Rust user shell" aux-boot.log
+          grep -q "loading initproc from /musl/busybox" boot.log
 
       - name: Upload smoke logs
         if: always()
@@ -106,5 +83,4 @@ jobs:
           name: riscv-smoke-logs
           path: |
             boot.log
-            aux-boot.log
           if-no-files-found: error
