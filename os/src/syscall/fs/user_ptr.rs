@@ -101,7 +101,11 @@ pub(super) fn read_user_value<T: Copy>(token: usize, ptr: *const T) -> SysResult
     Ok(unsafe { value.assume_init() })
 }
 
-pub(super) fn write_user_value<T: Copy>(token: usize, ptr: *mut T, value: &T) -> SysResult<()> {
+pub(in crate::syscall) fn write_user_value<T: Copy>(
+    token: usize,
+    ptr: *mut T,
+    value: &T,
+) -> SysResult<()> {
     let bytes =
         unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
     copy_to_user(token, ptr.cast::<u8>(), bytes)

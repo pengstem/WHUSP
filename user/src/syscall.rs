@@ -19,6 +19,7 @@ const SYSCALL_WAITID: usize = 95;
 const SYSCALL_SLEEP: usize = 101;
 const SYSCALL_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
+const SYSCALL_UNAME: usize = 160;
 const SYSCALL_GET_TIME: usize = 169;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_GETPPID: usize = 173;
@@ -239,6 +240,10 @@ pub fn sys_yield() -> isize {
 
 pub fn sys_kill(pid: usize, signal: i32) -> isize {
     syscall(SYSCALL_KILL, [pid, signal as usize, 0, 0, 0, 0])
+}
+
+pub fn sys_uname(buf: *mut u8) -> isize {
+    syscall(SYSCALL_UNAME, [buf as usize, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_get_time() -> isize {

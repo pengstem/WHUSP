@@ -12,14 +12,48 @@ use alloc::vec::Vec;
 use core::str;
 
 use super::errno::{SysError, SysResult};
+use super::fs::user_ptr::write_user_value;
 
 const ELF_MAGIC: &[u8] = b"\x7fELF";
 const SHEBANG_MAGIC: &[u8] = b"#!";
 const SHEBANG_RECURSION_LIMIT: usize = 4;
+const UTS_FIELD_LEN: usize = 65;
 
 struct ScriptInterpreter {
     path: String,
     optional_arg: Option<String>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LinuxUtsName {
+    sysname: [u8; UTS_FIELD_LEN],
+    nodename: [u8; UTS_FIELD_LEN],
+    release: [u8; UTS_FIELD_LEN],
+    version: [u8; UTS_FIELD_LEN],
+    machine: [u8; UTS_FIELD_LEN],
+    domainname: [u8; UTS_FIELD_LEN],
+}
+
+impl LinuxUtsName {
+    fn field(value: &str) -> [u8; UTS_FIELD_LEN] {
+        let mut field = [0u8; UTS_FIELD_LEN];
+        let bytes = value.as_bytes();
+        let len = bytes.len().min(UTS_FIELD_LEN - 1);
+        field[..len].copy_from_slice(&bytes[..len]);
+        field
+    }
+
+    fn current() -> Self {
+        Self {
+            sysname: Self::field("Linux"),
+            nodename: Self::field("WHUSP"),
+            release: Self::field("6.8.0-whusp"),
+            version: Self::field("#1 SMP OSKernel2026"),
+            machine: Self::field("riscv64"),
+            domainname: Self::field("(none)"),
+        }
+    }
 }
 
 pub fn sys_exit(exit_code: i32) -> ! {
@@ -52,6 +86,13 @@ pub fn sys_getppid() -> isize {
     // UNFINISHED: PID namespaces and child subreapers are not modeled yet, so
     // this returns the single-namespace parent recorded in the PCB.
     current_process().getppid() as isize
+}
+
+pub fn sys_uname(name: *mut LinuxUtsName) -> SysResult {
+    // UNFINISHED: UTS namespaces, sethostname/setdomainname, and Linux
+    // personality-based uname release overrides are not implemented.
+    write_user_value(current_user_token(), name, &LinuxUtsName::current())?;
+    Ok(0)
 }
 
 pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usize) -> SysResult {

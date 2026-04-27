@@ -7,6 +7,30 @@ pub const WNOWAIT: i32 = 0x01000000;
 pub const P_ALL: i32 = 0;
 pub const P_PID: i32 = 1;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UtsName {
+    pub sysname: [u8; 65],
+    pub nodename: [u8; 65],
+    pub release: [u8; 65],
+    pub version: [u8; 65],
+    pub machine: [u8; 65],
+    pub domainname: [u8; 65],
+}
+
+impl Default for UtsName {
+    fn default() -> Self {
+        Self {
+            sysname: [0; 65],
+            nodename: [0; 65],
+            release: [0; 65],
+            version: [0; 65],
+            machine: [0; 65],
+            domainname: [0; 65],
+        }
+    }
+}
+
 fn wait_exit_code(status: i32) -> i32 {
     if status < 0 {
         status
@@ -29,6 +53,9 @@ pub fn getpid() -> isize {
 }
 pub fn getppid() -> isize {
     sys_getppid()
+}
+pub fn uname(buf: &mut UtsName) -> isize {
+    sys_uname(buf as *mut _ as *mut u8)
 }
 pub fn brk(addr: usize) -> usize {
     sys_brk(addr) as usize

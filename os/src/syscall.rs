@@ -25,6 +25,7 @@ const SYSCALL_WAITID: usize = 95;
 const SYSCALL_SLEEP: usize = 101;
 const SYSCALL_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
+const SYSCALL_UNAME: usize = 160;
 const SYSCALL_GET_TIME: usize = 169;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_GETPPID: usize = 173;
@@ -132,6 +133,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SLEEP => Ok(sys_sleep(args[0])),
         SYSCALL_YIELD => Ok(sys_yield()),
         SYSCALL_KILL => sys_kill(args[0], args[1] as u32),
+        SYSCALL_UNAME => sys_uname(args[0] as *mut LinuxUtsName),
         SYSCALL_GET_TIME => Ok(sys_get_time()),
         SYSCALL_GETPID => Ok(sys_getpid()),
         SYSCALL_GETPPID => Ok(sys_getppid()),
