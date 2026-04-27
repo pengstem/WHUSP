@@ -32,7 +32,7 @@ pub fn sys_fstat(fd: usize, statbuf: *mut LinuxKstat) -> SysResult {
     write_stat_to_user(token, statbuf, file.stat())
 }
 
-pub fn sys_fstatat(
+pub fn sys_newfstatat(
     dirfd: isize,
     pathname: *const u8,
     statbuf: *mut LinuxKstat,

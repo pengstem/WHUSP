@@ -16,16 +16,16 @@ const SYSCALL_READ: usize = 63;
 const SYSCALL_WRITE: usize = 64;
 const SYSCALL_EXIT: usize = 93;
 const SYSCALL_WAITID: usize = 95;
-const SYSCALL_SLEEP: usize = 101;
-const SYSCALL_YIELD: usize = 124;
+const SYSCALL_NANOSLEEP: usize = 101;
+const SYSCALL_SCHED_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
 const SYSCALL_UNAME: usize = 160;
-const SYSCALL_GET_TIME: usize = 169;
+const SYSCALL_GETTIMEOFDAY: usize = 169;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_GETPPID: usize = 173;
 const SYSCALL_BRK: usize = 214;
 const SYSCALL_CLONE: usize = 220;
-const SYSCALL_EXEC: usize = 221;
+const SYSCALL_EXECVE: usize = 221;
 const SYSCALL_WAIT4: usize = 260;
 const SYSCALL_NET_CONNECT: usize = 2000;
 const SYSCALL_NET_LISTEN: usize = 2001;
@@ -44,6 +44,13 @@ const SYSCALL_CONDVAR_SIGNAL: usize = 1031;
 const SYSCALL_CONDVAR_WAIT: usize = 1032;
 
 const AT_FDCWD: isize = -100;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TimeVal {
+    sec: isize,
+    usec: isize,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -231,11 +238,11 @@ pub fn sys_exit(exit_code: i32) -> ! {
 }
 
 pub fn sys_sleep(sleep_ms: usize) -> isize {
-    syscall(SYSCALL_SLEEP, [sleep_ms, 0, 0, 0, 0, 0])
+    syscall(SYSCALL_NANOSLEEP, [sleep_ms, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_yield() -> isize {
-    syscall(SYSCALL_YIELD, [0, 0, 0, 0, 0, 0])
+    syscall(SYSCALL_SCHED_YIELD, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_kill(pid: usize, signal: i32) -> isize {
@@ -247,7 +254,18 @@ pub fn sys_uname(buf: *mut u8) -> isize {
 }
 
 pub fn sys_get_time() -> isize {
-    syscall(SYSCALL_GET_TIME, [0, 0, 0, 0, 0, 0])
+    let mut time = TimeVal::default();
+    let ret = syscall(
+        SYSCALL_GETTIMEOFDAY,
+        [&mut time as *mut TimeVal as usize, 0, 0, 0, 0, 0],
+    );
+    if ret < 0 {
+        ret
+    } else {
+        time.sec
+            .saturating_mul(1000)
+            .saturating_add(time.usec / 1000)
+    }
 }
 
 pub fn sys_getpid() -> isize {
@@ -274,7 +292,7 @@ pub fn sys_exec(path: &str, args: &[*const u8]) -> isize {
 
 pub fn sys_execve(path: &str, args: &[*const u8], envs: &[*const u8]) -> isize {
     syscall(
-        SYSCALL_EXEC,
+        SYSCALL_EXECVE,
         [
             path.as_ptr() as usize,
             args.as_ptr() as usize,

@@ -5,7 +5,7 @@ use crate::task::{
     current_task, current_user_token, exit_current_and_run_next, pid2process,
     suspend_current_and_run_next,
 };
-use crate::timer::get_time_ms;
+use crate::timer::get_time_us;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -33,6 +33,20 @@ pub struct LinuxUtsName {
     version: [u8; UTS_FIELD_LEN],
     machine: [u8; UTS_FIELD_LEN],
     domainname: [u8; UTS_FIELD_LEN],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxTimeVal {
+    tv_sec: isize,
+    tv_usec: isize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxTimezone {
+    tz_minuteswest: i32,
+    tz_dsttime: i32,
 }
 
 impl LinuxUtsName {
@@ -69,13 +83,30 @@ pub fn sys_exit_group(exit_code: i32) -> ! {
     panic!("Unreachable in sys_exit_group!");
 }
 
-pub fn sys_yield() -> isize {
+pub fn sys_sched_yield() -> isize {
     suspend_current_and_run_next();
     0
 }
 
-pub fn sys_get_time() -> isize {
-    get_time_ms() as isize
+pub fn sys_gettimeofday(tv: *mut LinuxTimeVal, tz: *mut LinuxTimezone) -> SysResult {
+    let token = current_user_token();
+    if !tv.is_null() {
+        // UNFINISHED: Linux gettimeofday reports CLOCK_REALTIME wall-clock time
+        // since the Unix epoch; this kernel has no RTC-backed epoch yet, so the
+        // value is derived from the monotonic machine timer.
+        let current_us = get_time_us();
+        let time = LinuxTimeVal {
+            tv_sec: (current_us / 1_000_000) as isize,
+            tv_usec: (current_us % 1_000_000) as isize,
+        };
+        write_user_value(token, tv, &time)?;
+    }
+    if !tz.is_null() {
+        // CONTEXT: Linux keeps the timezone argument only for legacy callers.
+        // This kernel has no timezone state, so report UTC-compatible zeroes.
+        write_user_value(token, tz, &LinuxTimezone::default())?;
+    }
+    Ok(0)
 }
 
 pub fn sys_getpid() -> isize {
@@ -344,7 +375,7 @@ fn exec_path(path: String, args: Vec<String>, envs: Vec<String>) -> SysResult {
     exec_loaded_program(path, args, envs, 0, data)
 }
 
-pub fn sys_exec(path: *const u8, args: *const usize, envs: *const usize) -> SysResult {
+pub fn sys_execve(path: *const u8, args: *const usize, envs: *const usize) -> SysResult {
     let token = current_user_token();
     let path = translated_str(token, path);
     let args_vec = translated_string_array(token, args);

@@ -76,7 +76,7 @@ pub fn trap_handler() -> ! {
                 cx.x[17],
                 [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]],
             );
-            // cx is changed during sys_exec, so we have to call it again
+            // cx is changed during sys_execve, so we have to call it again
             cx = current_trap_cx();
             cx.x[10] = result as usize;
         }

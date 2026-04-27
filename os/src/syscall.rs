@@ -22,21 +22,22 @@ const SYSCALL_FSTAT: usize = 80;
 const SYSCALL_EXIT: usize = 93;
 const SYSCALL_EXIT_GROUP: usize = 94;
 const SYSCALL_WAITID: usize = 95;
-const SYSCALL_SLEEP: usize = 101;
-const SYSCALL_YIELD: usize = 124;
+const SYSCALL_NANOSLEEP: usize = 101;
+const SYSCALL_SCHED_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
 const SYSCALL_UNAME: usize = 160;
-const SYSCALL_GET_TIME: usize = 169;
+const SYSCALL_GETTIMEOFDAY: usize = 169;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_GETPPID: usize = 173;
 const SYSCALL_BRK: usize = 214;
 const SYSCALL_MUNMAP: usize = 215;
 const SYSCALL_CLONE: usize = 220;
-const SYSCALL_EXEC: usize = 221;
+const SYSCALL_EXECVE: usize = 221;
 const SYSCALL_MMAP: usize = 222;
 const SYSCALL_WAIT4: usize = 260;
 
-// TODO: remove or unify these syscalls
+// Repo-private teaching/demo syscalls. They are intentionally outside the
+// Linux RISC-V syscall table and should not be treated as Linux ABI names.
 const SYSCALL_NET_CONNECT: usize = 2000;
 const SYSCALL_NET_LISTEN: usize = 2001;
 const SYSCALL_NET_ACCEPT: usize = 2002;
@@ -116,7 +117,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *const u8,
             args[4],
         ),
-        SYSCALL_NEWFSTATAT => sys_fstatat(
+        SYSCALL_NEWFSTATAT => sys_newfstatat(
             args[0] as isize,
             args[1] as *const u8,
             args[2] as *mut LinuxKstat,
@@ -130,17 +131,19 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as i32,
             args[4] as *mut RUsage,
         ),
-        SYSCALL_SLEEP => Ok(sys_sleep(args[0])),
-        SYSCALL_YIELD => Ok(sys_yield()),
+        SYSCALL_NANOSLEEP => Ok(sys_nanosleep_ms_compat(args[0])),
+        SYSCALL_SCHED_YIELD => Ok(sys_sched_yield()),
         SYSCALL_KILL => sys_kill(args[0], args[1] as u32),
         SYSCALL_UNAME => sys_uname(args[0] as *mut LinuxUtsName),
-        SYSCALL_GET_TIME => Ok(sys_get_time()),
+        SYSCALL_GETTIMEOFDAY => {
+            sys_gettimeofday(args[0] as *mut LinuxTimeVal, args[1] as *mut LinuxTimezone)
+        }
         SYSCALL_GETPID => Ok(sys_getpid()),
         SYSCALL_GETPPID => Ok(sys_getppid()),
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
-        SYSCALL_EXEC => sys_exec(
+        SYSCALL_EXECVE => sys_execve(
             args[0] as *const u8,
             args[1] as *const usize,
             args[2] as *const usize,

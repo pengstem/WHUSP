@@ -3,7 +3,10 @@ use crate::task::{block_current_and_run_next, current_process, current_task};
 use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
 
-pub fn sys_sleep(ms: usize) -> isize {
+pub fn sys_nanosleep_ms_compat(ms: usize) -> isize {
+    // UNFINISHED: Linux nanosleep takes request/remain timespec user pointers
+    // and may report the remaining time after interruption. This compatibility
+    // path still serves the original Rust user library's millisecond scalar ABI.
     let expire_ms = get_time_ms() + ms;
     let task = current_task().unwrap();
     add_timer(expire_ms, task);
