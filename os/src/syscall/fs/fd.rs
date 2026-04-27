@@ -1,10 +1,12 @@
 use crate::fs::{File, OpenFlags, make_pipe};
-use crate::mm::translated_refmut;
 use crate::task::{FD_LIMIT, FdFlags, FdTableEntry, current_process, current_user_token};
 use alloc::sync::Arc;
+use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
-use super::user_ptr::{read_user_value, write_user_value};
+use super::user_ptr::{
+    UserBufferAccess, read_user_value, translated_byte_buffer_checked, write_user_value,
+};
 
 const F_DUPFD: usize = 0;
 const F_GETFD: usize = 1;
@@ -15,6 +17,7 @@ const F_GETLK: usize = 5;
 const F_SETLK: usize = 6;
 const F_SETLKW: usize = 7;
 const F_DUPFD_CLOEXEC: usize = 1030;
+const VALID_PIPE2_FLAGS: u32 = OpenFlags::NONBLOCK.bits() | OpenFlags::CLOEXEC.bits();
 
 const F_RDLCK: i16 = 0;
 const F_WRLCK: i16 = 1;
@@ -58,17 +61,75 @@ pub fn sys_close(fd: usize) -> SysResult {
     Ok(0)
 }
 
-pub fn sys_pipe(pipe: *mut usize) -> SysResult {
-    let process = current_process();
+fn pipe2_open_flags(flags: u32) -> SysResult<OpenFlags> {
+    if flags & !VALID_PIPE2_FLAGS != 0 {
+        // UNFINISHED: pipe2 currently supports only O_NONBLOCK and O_CLOEXEC;
+        // Linux O_DIRECT packet mode and notification pipes are not implemented.
+        return Err(SysError::EINVAL);
+    }
+    Ok(OpenFlags::from_bits_truncate(flags))
+}
+
+fn validate_pipefd(token: usize, pipefd: *mut i32) -> SysResult<()> {
+    translated_byte_buffer_checked(
+        token,
+        pipefd as *const u8,
+        size_of::<[i32; 2]>(),
+        UserBufferAccess::Write,
+    )
+    .map(|_| ())
+}
+
+fn write_pipefd_pair(token: usize, pipefd: *mut i32, fds: [i32; 2]) -> SysResult<()> {
+    let mut bytes = [0u8; size_of::<[i32; 2]>()];
+    let fd_size = size_of::<i32>();
+    bytes[..fd_size].copy_from_slice(&fds[0].to_ne_bytes());
+    bytes[fd_size..].copy_from_slice(&fds[1].to_ne_bytes());
+
+    let mut copied = 0usize;
+    for buffer in translated_byte_buffer_checked(
+        token,
+        pipefd as *const u8,
+        bytes.len(),
+        UserBufferAccess::Write,
+    )? {
+        let next = copied + buffer.len();
+        buffer.copy_from_slice(&bytes[copied..next]);
+        copied = next;
+    }
+    Ok(())
+}
+
+pub fn sys_pipe2(pipefd: *mut i32, flags: u32) -> SysResult {
+    let pipe_flags = pipe2_open_flags(flags)?;
     let token = current_user_token();
+    validate_pipefd(token, pipefd)?;
+
+    let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let (pipe_read, pipe_write) = make_pipe();
-    let read_fd = inner.alloc_fd();
-    inner.fd_table[read_fd] = Some(FdTableEntry::from_file(pipe_read, OpenFlags::RDONLY));
-    let write_fd = inner.alloc_fd();
-    inner.fd_table[write_fd] = Some(FdTableEntry::from_file(pipe_write, OpenFlags::WRONLY));
-    *translated_refmut(token, pipe) = read_fd;
-    *translated_refmut(token, unsafe { pipe.add(1) }) = write_fd;
+    let read_fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
+    inner.fd_table[read_fd] = Some(FdTableEntry::from_file(
+        pipe_read,
+        OpenFlags::RDONLY | pipe_flags,
+    ));
+    let write_fd = match inner.alloc_fd_from(0) {
+        Some(fd) => fd,
+        None => {
+            inner.fd_table[read_fd] = None;
+            return Err(SysError::EMFILE);
+        }
+    };
+    inner.fd_table[write_fd] = Some(FdTableEntry::from_file(
+        pipe_write,
+        OpenFlags::WRONLY | pipe_flags,
+    ));
+
+    if let Err(err) = write_pipefd_pair(token, pipefd, [read_fd as i32, write_fd as i32]) {
+        inner.fd_table[read_fd] = None;
+        inner.fd_table[write_fd] = None;
+        return Err(err);
+    }
     Ok(0)
 }
 

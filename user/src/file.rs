@@ -80,8 +80,8 @@ pub fn getdents64(fd: usize, buf: &mut [u8]) -> isize {
 pub fn close(fd: usize) -> isize {
     compat_ret(sys_close(fd))
 }
-pub fn pipe(pipe_fd: &mut [usize]) -> isize {
-    compat_ret(sys_pipe(pipe_fd))
+pub fn pipe(pipe_fd: &mut [i32; 2]) -> isize {
+    compat_ret(sys_pipe2(pipe_fd, 0))
 }
 pub fn read(fd: usize, buf: &mut [u8]) -> isize {
     compat_ret(sys_read(fd, buf))

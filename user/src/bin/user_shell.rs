@@ -200,10 +200,10 @@ pub fn main() -> i32 {
                         println!("Invalid command: Inputs/Outputs cannot be correctly binded!");
                     } else {
                         // create pipes
-                        let mut pipes_fd: Vec<[usize; 2]> = Vec::new();
+                        let mut pipes_fd: Vec<[i32; 2]> = Vec::new();
                         if !process_arguments_list.is_empty() {
                             for _ in 0..process_arguments_list.len() - 1 {
-                                let mut pipe_fd = [0usize; 2];
+                                let mut pipe_fd = [0i32; 2];
                                 pipe(&mut pipe_fd);
                                 pipes_fd.push(pipe_fd);
                             }
@@ -246,19 +246,19 @@ pub fn main() -> i32 {
                                 // receive input from the previous process
                                 if i > 0 {
                                     close(0);
-                                    let read_end = pipes_fd.get(i - 1).unwrap()[0];
+                                    let read_end = pipes_fd.get(i - 1).unwrap()[0] as usize;
                                     assert_eq!(dup(read_end), 0);
                                 }
                                 // send output to the next process
                                 if i < process_arguments_list.len() - 1 {
                                     close(1);
-                                    let write_end = pipes_fd.get(i).unwrap()[1];
+                                    let write_end = pipes_fd.get(i).unwrap()[1] as usize;
                                     assert_eq!(dup(write_end), 1);
                                 }
                                 // close all pipe ends inherited from the parent process
                                 for pipe_fd in pipes_fd.iter() {
-                                    close(pipe_fd[0]);
-                                    close(pipe_fd[1]);
+                                    close(pipe_fd[0] as usize);
+                                    close(pipe_fd[1] as usize);
                                 }
                                 // execute new application
                                 if exec(args_copy[0].as_str(), args_addr.as_slice()) == -1 {
@@ -271,8 +271,8 @@ pub fn main() -> i32 {
                             }
                         }
                         for pipe_fd in pipes_fd.iter() {
-                            close(pipe_fd[0]);
-                            close(pipe_fd[1]);
+                            close(pipe_fd[0] as usize);
+                            close(pipe_fd[1] as usize);
                         }
                         let mut exit_code: i32 = 0;
                         for pid in children.into_iter() {

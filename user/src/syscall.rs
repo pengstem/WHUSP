@@ -7,7 +7,7 @@ const SYSCALL_UNLINKAT: usize = 35;
 const SYSCALL_CHDIR: usize = 49;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
-const SYSCALL_PIPE: usize = 59;
+const SYSCALL_PIPE2: usize = 59;
 const SYSCALL_GETDENTS64: usize = 61;
 const SYSCALL_READ: usize = 63;
 const SYSCALL_WRITE: usize = 64;
@@ -174,8 +174,11 @@ pub fn sys_close(fd: usize) -> isize {
     syscall(SYSCALL_CLOSE, [fd, 0, 0, 0, 0, 0])
 }
 
-pub fn sys_pipe(pipe: &mut [usize]) -> isize {
-    syscall(SYSCALL_PIPE, [pipe.as_mut_ptr() as usize, 0, 0, 0, 0, 0])
+pub fn sys_pipe2(pipe: &mut [i32; 2], flags: u32) -> isize {
+    syscall(
+        SYSCALL_PIPE2,
+        [pipe.as_mut_ptr() as usize, flags as usize, 0, 0, 0, 0],
+    )
 }
 
 pub fn sys_read(fd: usize, buffer: &mut [u8]) -> isize {
