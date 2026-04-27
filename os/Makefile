@@ -3,6 +3,8 @@ ARCH ?= riscv64
 MODE ?= release
 BOARD ?= qemu
 TEST ?=
+CARGO_HOME ?= $(abspath ../vendor)
+export CARGO_HOME
 
 ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf

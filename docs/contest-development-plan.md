@@ -6,9 +6,9 @@
 - [x] 让根目录 `make all` 产出 `kernel-rv`
 - [ ] 让根目录 `make all` 产出 `kernel-la`
 - [x] 清理提交链路对隐藏目录 `.cargo` 的依赖（仓库已无 `.cargo/`）
-- [ ] 把远程 Cargo 依赖改成离线可构建方案（`riscv` / `virtio-drivers` / `lose-net-stack` 目前仍是 git 源）
-- [ ] 在本地验证无网络构建仍然可用
-- [ ] 修改 `initproc`，支持比赛模式启动（当前只会 exec `user_shell`）
+- [x] 把远程 Cargo 依赖改成离线可构建方案（`vendor/crates` + `vendor/config.toml`）
+- [x] 在本地验证无网络构建仍然可用（`CARGO_NET_OFFLINE=true make all`）
+- [x] 修改 `initproc`，支持比赛模式启动（当前内核直接加载 `/musl/busybox sh`）
 - [ ] 新增 submit runner 用户程序
 - [ ] 让 submit runner 按固定顺序串行执行测试脚本
 - [ ] 输出精确的 `#### OS COMP TEST GROUP START xxxxx ####`
@@ -37,13 +37,23 @@
   - [ ] 升级 `wait4/waitpid` 相关语义（options / rusage）
   - [ ] 补齐 `stat/fstat/newfstatat` 相关语义
   - [ ] 补齐 `mmap/munmap/brk` 相关语义
+- [ ] 根据 `/musl/basic/run-all.sh` 输出继续补齐（2026-04-27）
+  - [x] 当前已跑通（至少 basic 用例已观察通过）：`brk` / `chdir` / `clone` / `close` / `dup2` / `execve` / `exit` / `fork` / `fstat` / `getcwd` / `getdents64` / `getpid` / `mkdirat` / `mmap` / `munmap` / `openat` / `pipe` / `read` / `unlinkat` / `wait4(wait/waitpid)` / `write` / `yield`
+  - [ ] `dup` 语义仍异常（`test_dup` 触发 assert）
+  - [ ] `getppid(173)` 仍异常（`test_getppid` 输出 error）
+  - [ ] `gettimeofday(169)` 语义仍不兼容（`test_gettimeofday` 输出 error）
+  - [ ] `sleep` 相关语义仍不兼容（`test_sleep` 触发 assert）
+  - [ ] `times(153)` 未补齐（`test_times` 触发 assert）
+  - [ ] `uname(160)` 仍不兼容（`test_uname` 触发 assert）
+  - [ ] `mount(40)` / `umount2(39)` 竞赛测试语义仍需完善（`mount` 当前返回 `-19`）
 - [ ] 让 `/musl/basic_testcode.sh` 可以完整跑通
+  - [ ] 非 syscall 问题：`/musl/basic_testcode.sh` 无 shebang，需用 `./busybox sh ./basic_testcode.sh` 执行
 
 ### syscall ABI 合规性审计（参考 `reference-project/RocketOS`、`oskernel_neverdown`、`NighthawkOS`、`RustOsWhu`；每条独立一轮，动手前对照 `man 2` + 参考实现）
 
 - [x] 统一 `SYSCALL_OPENAT = 56` 命名：user 侧 `user/src/syscall.rs:9` 写作 `SYSCALL_OPEN`，kernel 侧 `os/src/syscall/mod.rs:9` 写作 `SYSCALL_OPENAT`，同号异名；语义已经是 openat，只是命名需要对齐
-- [ ] `sys_waitpid`(260) 升级为 `sys_wait4(pid, wstatus, options, rusage)`：当前 `os/src/syscall/process.rs:72` 只接 2 参，且"still running 返回 -2" 非标准 —— Linux 默认应阻塞等待，`WNOHANG` flag 才立即返 0
-- [ ] 实现 `sys_exit_group`(94)：当前只有 `sys_exit`(93)，但 libc 的 `exit()` 走的是 exit_group，缺它多线程程序无法干净终止整个线程组
+- [x] `sys_waitpid`(260) 升级为 `sys_wait4(pid, wstatus, options, rusage)`（基础路径已接入，后续继续补 Linux 细节）
+- [x] 实现 `sys_exit_group`(94)（当前为单线程兼容实现，后续补完整线程组语义）
 - [ ] 修正 `sys_kill`(129) 信号参数类型：`os/src/syscall/process.rs:106` 用 `SignalFlags::from_bits(signal)` 把信号当 bitflags，但 Linux 信号号是整数（SIGKILL=9、SIGTERM=15 不是位标志），应直接按 signum 分发
 - [ ] errno support?
 

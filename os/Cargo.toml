@@ -13,6 +13,7 @@ xmas-elf = "0.10.0"
 volatile = "0.6.1"
 virtio-drivers = "0.13.0"
 lose-net-stack = { git = "https://github.com/yfblock/lose-net-stack", rev = "1a73a861bb9b" }
+# vendored from https://github.com/Mivik/lwext4_rust commit 7088e08, with local follow-up patches.
 lwext4_rust = { path = "../vendor/lwext4_rust", default-features = false }
 log = "0.4"
 sbi-rt = { version = "0.0.3", features = ["legacy"] }

@@ -6,6 +6,7 @@ use crate::trap::TrapContext;
 use alloc::sync::Arc;
 use core::arch::asm;
 use lazy_static::*;
+use riscv::register::sstatus;
 
 pub struct Processor {
     current: Option<Arc<TaskControlBlock>>,
@@ -52,7 +53,11 @@ pub fn run_tasks() {
                 __switch(idle_task_cx_ptr, next_task_cx_ptr);
             }
         } else {
-            println!("no tasks available in run_tasks");
+            drop(processor);
+            unsafe {
+                sstatus::set_sie();
+                asm!("wfi");
+            }
         }
     }
 }

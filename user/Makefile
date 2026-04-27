@@ -1,5 +1,7 @@
 TARGET := riscv64gc-unknown-none-elf
 MODE := release
+CARGO_HOME ?= $(abspath ../vendor)
+export CARGO_HOME
 APP_DIR := src/bin
 TARGET_DIR := target/$(TARGET)/$(MODE)
 APPS := $(wildcard $(APP_DIR)/*.rs)

@@ -1,6 +1,8 @@
 ARCH ?= riscv64
 MODE ?= release
 TEST ?=
+CARGO_HOME ?= $(CURDIR)/vendor
+export CARGO_HOME
 
 ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
@@ -8,8 +10,8 @@ KERNEL_SRC := os/target/$(TARGET)/$(MODE)/os
 KERNEL_STAMP := os/target/$(TARGET)/$(MODE)/kernel-rv.stamp
 DISK_SRC := user/target/$(TARGET)/$(MODE)/fs.img
 DISK_STAMP := user/target/$(TARGET)/$(MODE)/fs-img.$(if $(strip $(TEST)),$(TEST),default).stamp
-KERNEL_INPUTS := Makefile os/Cargo.toml $(wildcard os/Cargo.lock) os/Makefile os/build.rs rust-toolchain.toml $(shell find os/src -type f ! -name linker.ld) $(shell find vendor/lwext4_rust -type f ! -path '*/target/*' ! -path '*/build_musl-generic/*')
-USER_INPUTS := user/Cargo.toml user/Makefile $(wildcard user/Cargo.lock) $(shell find user/src -type f)
+ KERNEL_INPUTS := Makefile os/Cargo.toml $(wildcard os/Cargo.lock) os/Makefile os/build.rs rust-toolchain.toml vendor/config.toml $(shell find os/src -type f ! -name linker.ld) $(shell find vendor/lwext4_rust -type f ! -path '*/target/*' ! -path '*/build_musl-generic/*')
+ USER_INPUTS := user/Cargo.toml user/Makefile vendor/config.toml $(wildcard user/Cargo.lock) $(shell find user/src -type f)
 else
 $(error Unsupported ARCH '$(ARCH)' in root Makefile. Only ARCH=riscv64 is wired today.)
 endif

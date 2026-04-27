@@ -1,0 +1,11 @@
+upstream_repo = https://github.com/Mivik/lwext4_rust
+upstream_commit = 7088e08
+upstream_note = pre-printf-compat-version-bump snapshot
+
+workspace_import_commit = 8e6f026ad13a7ffb53becb002e4b7b8063232f8d
+workspace_local_patch = 806c518 (build.rs update)
+
+submodule_repo = https://github.com/Starry-Mix-THU/lwext4.git
+
+placement = vendor/lwext4_rust
+rationale = keep hand-maintained ext4 wrapper separate from cargo-vendor managed vendor/crates

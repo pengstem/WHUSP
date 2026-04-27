@@ -21,3 +21,13 @@ develop-guide/
 AGENTS.md
 CLAUDE.md
 .codex
+
+# CARGO_HOME is set to ./vendor; keep only curated vendored sources/config tracked.
+vendor/.global-cache
+vendor/.package-cache
+vendor/.package-cache-mutate
+vendor/.crates*.toml
+vendor/.crates*.json
+vendor/bin/
+vendor/git/
+vendor/registry/
