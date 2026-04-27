@@ -50,6 +50,9 @@ fn compat_ret(ret: isize) -> isize {
 pub fn dup(fd: usize) -> isize {
     compat_ret(sys_dup(fd))
 }
+pub fn dup3(old_fd: usize, new_fd: usize, flags: u32) -> isize {
+    compat_ret(sys_dup3(old_fd, new_fd, flags))
+}
 pub fn fcntl(fd: usize, op: usize, arg: usize) -> isize {
     compat_ret(sys_fcntl(fd, op, arg))
 }

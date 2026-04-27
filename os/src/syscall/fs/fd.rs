@@ -18,6 +18,7 @@ const F_SETLK: usize = 6;
 const F_SETLKW: usize = 7;
 const F_DUPFD_CLOEXEC: usize = 1030;
 const VALID_PIPE2_FLAGS: u32 = OpenFlags::NONBLOCK.bits() | OpenFlags::CLOEXEC.bits();
+const VALID_DUP3_FLAGS: u32 = OpenFlags::CLOEXEC.bits();
 
 const F_RDLCK: i16 = 0;
 const F_WRLCK: i16 = 1;
@@ -142,8 +143,40 @@ pub fn sys_dup(fd: usize) -> SysResult {
         .and_then(|entry| entry.as_ref())
         .cloned()
         .ok_or(SysError::EBADF)?;
-    let new_fd = inner.alloc_fd();
+    let new_fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
     inner.fd_table[new_fd] = Some(entry.duplicate(FdFlags::empty()));
+    Ok(new_fd as isize)
+}
+
+pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> SysResult {
+    if flags & !VALID_DUP3_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+    if new_fd >= FD_LIMIT {
+        return Err(SysError::EBADF);
+    }
+
+    let fd_flags = if flags & OpenFlags::CLOEXEC.bits() != 0 {
+        FdFlags::CLOEXEC
+    } else {
+        FdFlags::empty()
+    };
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let entry = inner
+        .fd_table
+        .get(old_fd)
+        .and_then(|entry| entry.as_ref())
+        .cloned()
+        .ok_or(SysError::EBADF)?;
+    if old_fd == new_fd {
+        return Err(SysError::EINVAL);
+    }
+    while inner.fd_table.len() <= new_fd {
+        inner.fd_table.push(None);
+    }
+    inner.fd_table[new_fd] = Some(entry.duplicate(fd_flags));
     Ok(new_fd as isize)
 }
 

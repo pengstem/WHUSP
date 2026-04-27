@@ -1,5 +1,6 @@
 const SYSCALL_GETCWD: usize = 17;
-const SYSCALL_DUP: usize = 24;
+const SYSCALL_DUP: usize = 23;
+const SYSCALL_DUP3: usize = 24;
 const SYSCALL_FCNTL: usize = 25;
 const SYSCALL_IOCTL: usize = 29;
 const SYSCALL_MKDIRAT: usize = 34;
@@ -78,6 +79,10 @@ fn syscall(id: usize, args: [usize; 6]) -> isize {
 
 pub fn sys_dup(fd: usize) -> isize {
     syscall(SYSCALL_DUP, [fd, 0, 0, 0, 0, 0])
+}
+
+pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> isize {
+    syscall(SYSCALL_DUP3, [old_fd, new_fd, flags as usize, 0, 0, 0])
 }
 
 pub fn sys_fcntl(fd: usize, op: usize, arg: usize) -> isize {
