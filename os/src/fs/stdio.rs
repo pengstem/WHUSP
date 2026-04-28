@@ -55,6 +55,9 @@ impl File for Stdin {
     fn stat(&self) -> FileStat {
         FileStat::with_mode(S_IFCHR | 0o666)
     }
+    fn is_tty(&self) -> bool {
+        true
+    }
 }
 
 impl File for Stdout {
@@ -82,5 +85,8 @@ impl File for Stdout {
     }
     fn stat(&self) -> FileStat {
         FileStat::with_mode(S_IFCHR | 0o666)
+    }
+    fn is_tty(&self) -> bool {
+        true
     }
 }

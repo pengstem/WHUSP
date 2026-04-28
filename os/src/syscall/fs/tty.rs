@@ -1,7 +1,5 @@
-use crate::fs::{File, S_IFCHR};
 use crate::sync::UPIntrFreeCell;
 use crate::task::current_user_token;
-use alloc::sync::Arc;
 use lazy_static::lazy_static;
 
 use super::super::errno::{SysError, SysResult};
@@ -120,14 +118,9 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(ConsoleTtyState::new()) };
 }
 
-fn is_console_tty(file: &Arc<dyn File + Send + Sync>) -> bool {
-    let stat = file.stat();
-    stat.mode & S_IFCHR == S_IFCHR
-}
-
 pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
     let file = get_file_by_fd(fd)?;
-    if !is_console_tty(&file) {
+    if !file.is_tty() {
         return Err(SysError::ENOTTY);
     }
 

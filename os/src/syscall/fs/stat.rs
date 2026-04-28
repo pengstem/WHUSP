@@ -1,4 +1,4 @@
-use crate::fs::{FileStat, WorkingDir, stat_at};
+use crate::fs::{FileStat, WorkingDir, stat_at, stat_devfs_child};
 use crate::mm::translated_str;
 use crate::task::{current_process, current_user_token};
 
@@ -54,6 +54,13 @@ pub fn sys_newfstatat(
             return Err(SysError::ENOENT);
         }
         return write_stat_to_user(token, statbuf, stat_by_dirfd(dirfd)?);
+    }
+    if !path.starts_with('/') && dirfd != AT_FDCWD && dirfd >= 0 {
+        let file = get_file_by_fd(dirfd as usize)?;
+        if file.is_devfs_dir() {
+            let stat = stat_devfs_child(path.as_str()).ok_or(SysError::ENOENT)?;
+            return write_stat_to_user(token, statbuf, stat);
+        }
     }
 
     // CONTEXT: `AT_NO_AUTOMOUNT` is a no-op on modern Linux, and this resolver has no automount

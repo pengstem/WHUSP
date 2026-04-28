@@ -1,8 +1,10 @@
 use crate::fs::{
-    OpenFlags, WorkingDir, lookup_dir_at, mkdir_at, normalize_path, open_file_at, unlink_file_at,
+    File, OpenFlags, WorkingDir, lookup_dir_at, mkdir_at, normalize_path, open_devfs_child,
+    open_file_at, unlink_file_at,
 };
 use crate::mm::{UserBuffer, translated_byte_buffer, translated_str};
 use crate::task::{FdTableEntry, current_process, current_user_token};
+use alloc::sync::Arc;
 
 use super::super::errno::{SysError, SysResult};
 use super::fd::get_file_by_fd;
@@ -47,6 +49,31 @@ fn copy_c_string_to_user(ptr: *mut u8, buf_len: usize, string: &str) -> SysResul
     Ok(ptr as isize)
 }
 
+fn install_open_file(file: Arc<dyn File + Send + Sync>, flags: OpenFlags) -> SysResult {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = inner.alloc_fd();
+    inner.fd_table[fd] = Some(FdTableEntry::from_file(file, flags));
+    Ok(fd as isize)
+}
+
+fn open_devfs_child_from_dirfd(
+    dirfd: isize,
+    path: &str,
+    flags: OpenFlags,
+) -> SysResult<Option<Arc<dyn File + Send + Sync>>> {
+    if path.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
+        return Ok(None);
+    }
+    let file = get_file_by_fd(dirfd as usize)?;
+    if !file.is_devfs_dir() {
+        return Ok(None);
+    }
+    open_devfs_child(path, flags)
+        .map(Some)
+        .ok_or(SysError::ENOENT)
+}
+
 pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> SysResult {
     let token = current_user_token();
     let path = translated_str(token, path);
@@ -56,15 +83,14 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> SysR
     if flags.bits() & 0b11 == 0b11 {
         return Err(SysError::EINVAL);
     }
+    if let Some(file) = open_devfs_child_from_dirfd(dirfd, path.as_str(), flags)? {
+        return install_open_file(file, flags);
+    }
     let base = path_base(dirfd, path.as_str())?;
-    let process = current_process();
-    let Some(inode) = open_file_at(base, path.as_str(), flags) else {
+    let Some(file) = open_file_at(base, path.as_str(), flags) else {
         return Err(SysError::ENOENT);
     };
-    let mut inner = process.inner_exclusive_access();
-    let fd = inner.alloc_fd();
-    inner.fd_table[fd] = Some(FdTableEntry::from_file(inode, flags));
-    Ok(fd as isize)
+    install_open_file(file, flags)
 }
 
 pub fn sys_chdir(path: *const u8) -> SysResult {

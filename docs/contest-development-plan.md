@@ -12,7 +12,7 @@
 - [x] 已有一次 RISC-V 全量手工运行记录：`develop-guide/contest-full-test-run-2026-04-27.md`。这次是主机注入命令，不是最终 submit runner。
 - [x] `basic-musl` 在该记录中能跑到 END marker，官方 `judge_basic.py` 结果是 `55 / 102`。
 - [x] 在 2026-04-27 全量手工运行记录之后，源码又接入了 `times(153)`、`mprotect(226)`、`nanosleep(101)`、`clock_nanosleep(115)`、`gettimeofday(169)`、`uname(160)` 等修复，旧的跑分记录需要重跑刷新。
-- [ ] `kernel-la`、submit runner、全组串行执行、自动 marker 管理、结束后主动关机还没有完成。
+- [ ] `kernel-la`、submit runner、全组串行执行、自动 marker 管理、结束后主动关机。
 
 ## 判断
 
@@ -64,7 +64,7 @@
 - [x] 额外块设备 lazy-open 后可动态覆盖真实目录 `/x1`、`/x2`。
 - [x] 接入评测 EXT4 测试盘的只读访问和普通路径读取。
 - [x] 内核已有 SBI shutdown primitive，panic 或无任务时可关机。
-- [ ] submit runner 主动调用关机仍未完成，不能把这个 primitive 等同于 P0 关机闭环。
+- [ ] submit runner 主动调用关机。
 
 ## P2 - `basic-musl` 与 syscall 兼容
 
@@ -106,7 +106,6 @@
 - [x] 上次全量记录中 `basic-musl` 官方 judge 为 `55 / 102`。
 - [x] 上次记录中已经拿满的 basic 子项：`brk`、`chdir`、`clone`、`close`、`dup`、`fork`、`fstat`、`getcwd`、`getppid`、`mkdir`、`uname`、`yield`。
 - [ ] 2026-04-27 全量记录之后新增的 `times`、`mprotect`、`nanosleep` 等实现尚未重新跑完整 judge。
-- [ ] `basic-musl` 尚未拿满 `102 / 102`。
 
 ### 当前 `basic-musl` 剩余缺口
 
@@ -281,8 +280,8 @@
 
 ### 阶段 0：冻结采用路线
 
-- [ ] 记录结论：采用 `RocketOS` 风格的内置 `arch/` 拆分作为主线，吸收 `NighthawkOS` 的小 HAL facade 组织方式。
-- [ ] 记录结论：`reference-project/polyhal` 只作为设计/代码参考，不先接入完整 runtime。
+- [ ] 采用内置 `arch/` 拆分作为主线，吸收 `NighthawkOS` 的小 HAL facade 组织方式。
+- [ ] `polyhal` 只作为设计/代码参考，不先接入完整 runtime。
 - [ ] 复查可借用点：LoongArch `_start`、DMW/MMU 初始化、TLB refill、CSR timer、GED shutdown、virtio-pci 块设备、syscall register ABI。
 
 ### 阶段 1：先做 RISC-V 行为不变的架构拆分

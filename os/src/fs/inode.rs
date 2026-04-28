@@ -1,3 +1,4 @@
+use super::devfs;
 use super::ext4::FsNodeKind;
 use super::mount::{MountId, with_mount};
 use super::path::{
@@ -162,11 +163,21 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     open_file_impl(None, name, flags)
 }
 
-pub(crate) fn open_file_at(cwd: WorkingDir, name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
-    open_file_impl(Some(cwd), name, flags)
+pub(crate) fn open_file_at(
+    cwd: WorkingDir,
+    name: &str,
+    flags: OpenFlags,
+) -> Option<Arc<dyn File + Send + Sync>> {
+    if let Some(file) = devfs::open(name, flags) {
+        return Some(file);
+    }
+    open_file_impl(Some(cwd), name, flags).map(|inode| inode as Arc<dyn File + Send + Sync>)
 }
 
 pub(crate) fn stat_at(cwd: WorkingDir, name: &str) -> Option<FileStat> {
+    if let Some(stat) = devfs::stat(name) {
+        return Some(stat);
+    }
     let ResolvedOpen::Existing(file) = resolve_open_target(Some(cwd), name, false, false)? else {
         return None;
     };

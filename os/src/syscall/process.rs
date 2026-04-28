@@ -1,4 +1,4 @@
-use crate::fs::{OpenFlags, open_file_at};
+use crate::fs::{File, OpenFlags, open_file_at};
 use crate::mm::{translated_ref, translated_refmut, translated_str};
 use crate::task::{
     CloneArgs, CloneFlags, ProcessCpuTimesSnapshot, SignalFlags, add_task, clone_current_thread,
@@ -336,10 +336,18 @@ fn interpreter_candidates(
 
 fn read_exec_file(path: &str) -> SysResult<Vec<u8>> {
     let process = current_process();
-    let Some(app_inode) = open_file_at(process.working_dir(), path, OpenFlags::RDONLY) else {
+    let Some(app_file) = open_file_at(process.working_dir(), path, OpenFlags::RDONLY) else {
         return Err(SysError::ENOENT);
     };
-    Ok(app_inode.read_all())
+    Ok(read_all_file(app_file))
+}
+
+fn read_all_file(file: Arc<dyn File + Send + Sync>) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.resize(file.stat().size as usize, 0);
+    let len = file.read_at(0, data.as_mut_slice());
+    data.truncate(len);
+    data
 }
 
 fn append_script_args(

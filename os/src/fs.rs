@@ -1,3 +1,4 @@
+mod devfs;
 mod ext4;
 mod inode;
 mod mount;
@@ -93,6 +94,12 @@ pub trait File: Send + Sync {
     fn working_dir(&self) -> Option<WorkingDir> {
         None
     }
+    fn is_tty(&self) -> bool {
+        false
+    }
+    fn is_devfs_dir(&self) -> bool {
+        false
+    }
 }
 
 pub fn init() {
@@ -108,6 +115,7 @@ pub fn list_apps() {
     println!("**************/")
 }
 
+pub(crate) use devfs::{open_child as open_devfs_child, stat_child as stat_devfs_child};
 pub(crate) use inode::open_file_at;
 pub use inode::{OpenFlags, open_file};
 pub(crate) use inode::{
