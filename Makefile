@@ -46,9 +46,6 @@ run-rv: all
 	fi
 	@$(MAKE) --no-print-directory -C os ARCH=$(ARCH) MODE=$(MODE) TEST=$(TEST) run-inner PRIMARY_DISK="$(TEST_DISK)" AUX_DISK="$(CONTEST_AUX_DISK)"
 
-run-rv-dev: all
-	@$(MAKE) --no-print-directory -C os ARCH=$(ARCH) MODE=$(MODE) TEST=$(TEST) run-inner PRIMARY_DISK="$(PRIMARY_DISK)" AUX_DISK="$(AUX_DISK)"
-
 run-rv-contest: run-rv
 
 fmt:
