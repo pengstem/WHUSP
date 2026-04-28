@@ -16,6 +16,7 @@ tools/
 pushall.sh
 *.img
 kernel-rv
+kernel-la
 
 develop-guide/
 AGENTS.md

@@ -73,10 +73,20 @@ impl LinuxUtsName {
             nodename: Self::field("WHUSP"),
             release: Self::field("6.8.0-whusp"),
             version: Self::field("#1 SMP OSKernel2026"),
-            machine: Self::field("riscv64"),
+            machine: Self::field(machine_name()),
             domainname: Self::field("(none)"),
         }
     }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn machine_name() -> &'static str {
+    "loongarch64"
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn machine_name() -> &'static str {
+    "riscv64"
 }
 
 fn clock_ticks_to_isize(ticks: usize) -> isize {

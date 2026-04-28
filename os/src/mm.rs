@@ -5,7 +5,7 @@ mod frame_allocator;
 mod heap_allocator;
 mod kernel_space;
 mod memory_set;
-mod page_table;
+pub mod page_table;
 mod user_space;
 
 pub use address::VPNRange;

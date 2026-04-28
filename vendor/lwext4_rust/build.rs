@@ -73,6 +73,14 @@ fn configure_toolchain(arch: &str, cmd: &mut Command) {
             cmd.env("OBJDUMP", "riscv64-linux-gnu-objdump");
             cmd.env("SIZE", "riscv64-linux-gnu-size");
         }
+        "loongarch64" => {
+            cmd.env("CC", "loongarch64-linux-musl-gcc");
+            cmd.env("CXX", "loongarch64-linux-gnu-g++");
+            cmd.env("AR", "loongarch64-linux-gnu-ar");
+            cmd.env("OBJCOPY", "loongarch64-linux-gnu-objcopy");
+            cmd.env("OBJDUMP", "loongarch64-linux-gnu-objdump");
+            cmd.env("SIZE", "loongarch64-linux-gnu-size");
+        }
         "x86_64" => {
             cmd.env("CC", "cc");
             cmd.env("CXX", "c++");
@@ -139,6 +147,33 @@ fn binding_clang_args(arch: &str) -> Vec<String> {
 
             args
         }
+        "loongarch64" => {
+            let mut args = vec!["--target=loongarch64-unknown-linux-musl".to_string()];
+
+            if let Some(sysroot) = compiler_output("loongarch64-linux-musl-gcc", "-print-sysroot") {
+                if sysroot != "/" {
+                    args.push(format!("--sysroot={sysroot}"));
+                    push_include_arg(&mut args, Path::new(&sysroot).join("include"));
+                    push_include_arg(&mut args, Path::new(&sysroot).join("usr/include"));
+                }
+            }
+
+            if let Some(gcc_include) =
+                compiler_output("loongarch64-linux-musl-gcc", "-print-file-name=include")
+            {
+                push_include_arg(&mut args, gcc_include);
+            }
+
+            for candidate in [
+                "/usr/loongarch64-linux-musl/include",
+                "/usr/loongarch64-linux-musl/lib/musl/include",
+                "/opt/loongarch64-linux-musl-cross/loongarch64-linux-musl/include",
+            ] {
+                push_include_arg(&mut args, candidate);
+            }
+
+            args
+        }
         "x86_64" => vec!["-I/usr/include".to_string()],
         _ => Vec::new(),
     }
@@ -149,6 +184,7 @@ fn bindgen_target(arch: &str, cargo_target: &str) -> String {
         // Bindgen only needs a clang-compatible target for parsing C headers.
         // The kernel itself still builds for riscv64gc-unknown-none-elf.
         "riscv64" => "riscv64-unknown-linux-musl".to_string(),
+        "loongarch64" => "loongarch64-unknown-linux-musl".to_string(),
         _ => cargo_target.replace("-softfloat", ""),
     }
 }

@@ -5,7 +5,6 @@ authors = ["Pengsteam <2285566738@qq.com>"]
 edition = "2024"
 
 [dependencies]
-riscv = { git = "https://github.com/rcore-os/riscv", features = ["inline-asm"] }
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
 buddy_system_allocator = "0.13.0"
 bitflags = "2.11.1"
@@ -16,8 +15,14 @@ lose-net-stack = { git = "https://github.com/yfblock/lose-net-stack", rev = "1a7
 # vendored from https://github.com/Mivik/lwext4_rust commit 7088e08, with local follow-up patches.
 lwext4_rust = { path = "../vendor/lwext4_rust", default-features = false }
 log = "0.4"
-sbi-rt = { version = "0.0.3", features = ["legacy"] }
 fdt = "0.1.5"
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+riscv = { git = "https://github.com/rcore-os/riscv", features = ["inline-asm"] }
+sbi-rt = { version = "0.0.3", features = ["legacy"] }
+
+[target.'cfg(target_arch = "loongarch64")'.dependencies]
+loongArch64 = { path = "../vendor/crates/loongArch64" }
 
 [profile.release]
 debug = true

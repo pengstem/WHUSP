@@ -1,5 +1,5 @@
 use crate::DEV_NON_BLOCKING_ACCESS;
-use crate::board::{BlockDeviceImpl, IrqDevice};
+use crate::board::{BlockDeviceConfig, BlockDeviceImpl};
 use crate::drivers::virtio::{VirtioHal, VirtioTransport, mmio_transport};
 use crate::sync::{Condvar, UPIntrFreeCell};
 use crate::task::schedule;
@@ -102,8 +102,19 @@ impl VirtIOBlock {
         }
     }
 
-    pub fn new(device: IrqDevice) -> Self {
-        let transport = mmio_transport(device.base, device.size);
+    pub fn new(device: BlockDeviceConfig) -> Self {
+        let (transport, base_addr, irq) = match device {
+            BlockDeviceConfig::Mmio(device) => (
+                mmio_transport(device.base, device.size),
+                device.base,
+                device.irq,
+            ),
+            BlockDeviceConfig::Pci(device) => (
+                crate::board::pci_transport(device).into(),
+                device.ecam_base,
+                device.irq,
+            ),
+        };
         let virtio_blk = VirtIOBlk::<VirtioHal, _>::new(transport).unwrap();
         let capacity_blocks = virtio_blk.capacity() as usize;
         let channels = virtio_blk.virt_queue_size();
@@ -115,8 +126,8 @@ impl VirtIOBlock {
         }
         Self {
             virtio_blk,
-            base_addr: device.base,
-            irq: device.irq,
+            base_addr,
+            irq,
             capacity_blocks,
             condvars,
         }

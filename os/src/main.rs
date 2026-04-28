@@ -99,7 +99,9 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     task::add_initproc();
     // CONTEXT: Keep boot-time filesystem setup synchronous before the scheduler
     // runs, then allow task-time block I/O to sleep behind the mount locks.
-    *DEV_NON_BLOCKING_ACCESS.exclusive_access() = true;
+    // CONTEXT: LoongArch PCI interrupt routing is not wired yet; keep block
+    // I/O polling there so the first test-disk path does not sleep forever.
+    *DEV_NON_BLOCKING_ACCESS.exclusive_access() = cfg!(not(target_arch = "loongarch64"));
     task::run_tasks();
     panic!("Unreachable in rust_main!");
 }

@@ -1,6 +1,9 @@
 use super::frame_alloc;
 use super::page_table::PTEFlags;
-use super::{FrameTracker, PageTable, PhysPageNum, StepByOne, VPNRange, VirtAddr, VirtPageNum};
+use super::{
+    FrameTracker, PageTable, PhysAddr, PhysPageNum, StepByOne, VPNRange, VirtAddr, VirtPageNum,
+};
+use crate::arch::mm as arch_mm;
 use crate::config::PAGE_SIZE;
 use crate::fs::File;
 use alloc::collections::BTreeMap;
@@ -105,7 +108,7 @@ impl MapArea {
         page_table: &mut PageTable,
         permission: MapPermission,
     ) -> bool {
-        let pte_flags = PTEFlags::from_bits(permission.bits()).unwrap();
+        let pte_flags = PTEFlags::from_bits_truncate(permission.bits());
         if self.is_mmap() {
             for vpn in self.data_frames.keys().copied() {
                 if !page_table.remap_flags(vpn, pte_flags) {
@@ -125,7 +128,10 @@ impl MapArea {
 
     pub(super) fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum = match self.map_type {
-            MapType::Identical => PhysPageNum(vpn.0),
+            MapType::Identical => {
+                let va: VirtAddr = vpn.into();
+                PhysAddr::from(arch_mm::virt_to_phys(usize::from(va))).floor()
+            }
             MapType::Framed => {
                 let frame = frame_alloc().unwrap();
                 let ppn = frame.ppn;
@@ -133,7 +139,7 @@ impl MapArea {
                 ppn
             }
         };
-        let pte_flags = PTEFlags::from_bits(self.map_perm.bits()).unwrap();
+        let pte_flags = PTEFlags::from_bits_truncate(self.map_perm.bits());
         page_table.map(vpn, ppn, pte_flags);
     }
 
@@ -170,7 +176,7 @@ impl MapArea {
         }
         let ppn = frame.ppn;
         self.data_frames.insert(vpn, frame);
-        let pte_flags = PTEFlags::from_bits(self.map_perm.bits()).unwrap();
+        let pte_flags = PTEFlags::from_bits_truncate(self.map_perm.bits());
         page_table.map(vpn, ppn, pte_flags);
         true
     }

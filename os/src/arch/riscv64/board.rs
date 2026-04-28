@@ -32,13 +32,36 @@ pub struct IrqDevice {
     pub irq: usize,
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct PciDevice {
+    pub ecam_base: usize,
+    pub bar_mem_start: usize,
+    pub bar_mem_end: usize,
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub irq: usize,
+}
+
+#[derive(Clone, Copy)]
+pub enum BlockDeviceConfig {
+    Mmio(IrqDevice),
+    Pci(PciDevice),
+}
+
+impl Default for BlockDeviceConfig {
+    fn default() -> Self {
+        Self::Mmio(IrqDevice::default())
+    }
+}
+
 #[derive(Clone, Copy)]
 struct BoardConfig {
     clock_freq: usize,
     memory_end: usize,
     uart: IrqDevice,
     plic: MmioRange,
-    blocks: [IrqDevice; BLOCK_DEVICE_CAPACITY],
+    blocks: [BlockDeviceConfig; BLOCK_DEVICE_CAPACITY],
     block_count: usize,
     gpu: Option<IrqDevice>,
     keyboard: Option<IrqDevice>,
@@ -59,11 +82,11 @@ impl BoardConfig {
                 irq: 0,
             },
             plic: MmioRange { base: 0, size: 0 },
-            blocks: [IrqDevice {
+            blocks: [BlockDeviceConfig::Mmio(IrqDevice {
                 base: 0,
                 size: 0,
                 irq: 0,
-            }; BLOCK_DEVICE_CAPACITY],
+            }); BLOCK_DEVICE_CAPACITY],
             block_count: 0,
             gpu: None,
             keyboard: None,
@@ -179,7 +202,7 @@ fn push_block_device(config: &mut BoardConfig, value: IrqDevice) {
         config.block_count < config.blocks.len(),
         "too many virtio block devices discovered in DTB"
     );
-    config.blocks[config.block_count] = value;
+    config.blocks[config.block_count] = BlockDeviceConfig::Mmio(value);
     config.block_count += 1;
 }
 
@@ -295,7 +318,14 @@ pub fn init_from_dtb(dtb_addr: usize) {
         }
     }
 
-    config.blocks[..config.block_count].sort_by_key(|device| device.base);
+    config.blocks[..config.block_count].sort_by_key(|device| match device {
+        BlockDeviceConfig::Mmio(device) => device.base,
+        BlockDeviceConfig::Pci(device) => {
+            ((device.bus as usize) << 16)
+                | ((device.device as usize) << 8)
+                | device.function as usize
+        }
+    });
 
     assert_ne!(config.block_count, 0, "DTB is missing virtio block device");
     assert_ne!(config.uart.base, 0, "DTB is missing uart base");
@@ -333,9 +363,13 @@ pub fn plic_base() -> usize {
     board_config().plic.base
 }
 
-pub fn block_devices() -> &'static [IrqDevice] {
+pub fn block_devices() -> &'static [BlockDeviceConfig] {
     let config = board_config();
     &config.blocks[..config.block_count]
+}
+
+pub fn pci_transport(_device: PciDevice) -> virtio_drivers::transport::pci::PciTransport {
+    unreachable!("RISC-V QEMU uses virtio-mmio block devices")
 }
 
 pub fn gpu_device() -> Option<IrqDevice> {
@@ -376,6 +410,9 @@ pub fn device_init(hart_id: usize) {
         plic.set_priority(irq, 1);
     }
     for block in block_devices() {
+        let BlockDeviceConfig::Mmio(block) = block else {
+            unreachable!("RISC-V QEMU uses virtio-mmio block devices");
+        };
         plic.enable(hart_id, supervisor, block.irq);
         plic.set_priority(block.irq, 1);
     }

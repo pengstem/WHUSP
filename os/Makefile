@@ -20,7 +20,6 @@ OBJDUMP_ARCH := loongarch64
 OBJCOPY_ARCH := loongarch64
 GDB := loongarch64-linux-gnu-gdb
 GDB_ARCH := loongarch64
-LOONGARCH_UNSUPPORTED := 1
 else
 $(error Unsupported ARCH '$(ARCH)' in os/Makefile. Supported values are riscv64 and loongarch64)
 endif
@@ -34,6 +33,10 @@ TARGET_DIR := target/$(TARGET)/$(MODE)
 KERNEL_ELF := $(TARGET_DIR)/os
 KERNEL_BIN := $(KERNEL_ELF).bin
 DISASM_TMP := $(TARGET_DIR)/asm
+LINKER_SCRIPT := src/linker-$(BOARD).ld
+ifeq ($(ARCH),loongarch64)
+LINKER_SCRIPT := src/linker-loongarch64.ld
+endif
 
 # QEMU defaults
 MEM ?= 1G
@@ -55,15 +58,16 @@ endif
 ifeq ($(ARCH),loongarch64)
 QEMU_PRIMARY_DISK_ARGS = \
 	-drive file=$(PRIMARY_DISK),if=none,format=raw,id=x0 \
-	-device virtio-blk-pci,drive=x0,bus=virtio-mmio-bus.0
+	-device virtio-blk-pci,drive=x0
 
 ifneq ($(strip $(AUX_DISK)),)
 QEMU_AUX_DISK_ARGS = \
 	-drive file=$(AUX_DISK),if=none,format=raw,id=x1 \
-	-device virtio-blk-pci,drive=x1,bus=virtio-mmio-bus.1
+	-device virtio-blk-pci,drive=x1
 endif
 
 QEMU_COMMON_ARGS = \
+	-machine virt \
 	-m $(MEM) \
 	$(QEMU_CONSOLE_ARGS) \
 	-smp $(SMP) \
@@ -120,23 +124,13 @@ env:
 	(rustup component list --installed | grep '^rust-src') >/dev/null 2>&1 || rustup component add rust-src
 	(rustup component list --installed | grep '^llvm-tools-preview') >/dev/null 2>&1 || rustup component add llvm-tools-preview
 
-ifeq ($(LOONGARCH_UNSUPPORTED),1)
-kernel: loongarch-unsupported
-
-loongarch-unsupported:
-	@echo "LoongArch kernel runtime is not implemented yet."
-	@echo "This target only reserves ARCH=loongarch64 build/run plumbing."
-	@echo "Next stage: implement arch/loongarch64 entry, console/shutdown, timer, trap, mm, and context."
-	@exit 1
-else
 kernel: env $(KERNEL_ELF)
 
 $(KERNEL_ELF): FORCE
 	@echo Platform: $(BOARD)
-	@cp src/linker-$(BOARD).ld src/linker.ld
-	@cargo build $(MODE_ARG)
+	@cp $(LINKER_SCRIPT) src/linker.ld
+	@cargo build $(MODE_ARG) --target $(TARGET)
 	@rm src/linker.ld
-endif
 
 $(KERNEL_BIN): $(KERNEL_ELF)
 	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $@
@@ -204,4 +198,4 @@ disasm-vim: kernel
 
 FORCE:
 
-.PHONY: build env kernel loongarch-unsupported clean disasm disasm-vim run run-inner debug gdbserver gdbclient fdt FORCE
+.PHONY: build env kernel clean disasm disasm-vim run run-inner debug gdbserver gdbclient fdt FORCE

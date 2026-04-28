@@ -8,7 +8,9 @@ RISCV_TARGET := riscv64gc-unknown-none-elf
 LOONGARCH_TARGET := loongarch64-unknown-none
 KERNEL_RV_SRC := os/target/$(RISCV_TARGET)/$(MODE)/os
 KERNEL_RV_STAMP := os/target/$(RISCV_TARGET)/$(MODE)/kernel-rv.stamp
-KERNEL_INPUTS := Makefile os/Cargo.toml $(wildcard os/Cargo.lock) os/Makefile os/build.rs rust-toolchain.toml vendor/config.toml $(shell find os/src -type f ! -name linker.ld) $(shell find vendor/lwext4_rust -type f ! -path '*/target/*' ! -path '*/build_musl-generic/*')
+KERNEL_LA_SRC := os/target/$(LOONGARCH_TARGET)/$(MODE)/os
+KERNEL_LA_STAMP := os/target/$(LOONGARCH_TARGET)/$(MODE)/kernel-la.stamp
+KERNEL_INPUTS := Makefile os/Cargo.toml $(wildcard os/Cargo.lock) os/.cargo/config.toml os/Makefile os/build.rs rust-toolchain.toml vendor/config.toml $(shell find os/src -type f ! -name linker.ld) $(shell find vendor/lwext4_rust -type f ! -path '*/target/*' ! -path '*/build_musl-generic/*')
 
 TEST_DISK ?=$(CURDIR)/sdcard-rv.img
 TEST_DISK_LA ?=$(CURDIR)/sdcard-la.img
@@ -19,7 +21,7 @@ ifneq ($(strip $(CONTEST_AUX_DISK)),)
 RUN_RV_AUX_ARG := AUX_DISK="$(CONTEST_AUX_DISK)"
 endif
 
-all: kernel-rv
+all: kernel-rv kernel-la
 
 $(KERNEL_RV_SRC) $(KERNEL_RV_STAMP) &: $(KERNEL_INPUTS)
 	@$(MAKE) --no-print-directory -C os ARCH=riscv64 MODE=$(MODE) kernel
@@ -28,8 +30,12 @@ $(KERNEL_RV_SRC) $(KERNEL_RV_STAMP) &: $(KERNEL_INPUTS)
 kernel-rv: $(KERNEL_RV_SRC) $(KERNEL_RV_STAMP)
 	@cp $(KERNEL_RV_SRC) kernel-rv
 
-kernel-la:
+$(KERNEL_LA_SRC) $(KERNEL_LA_STAMP) &: $(KERNEL_INPUTS) $(shell find vendor/crates/loongArch64 -type f 2>/dev/null)
 	@$(MAKE) --no-print-directory -C os ARCH=loongarch64 MODE=$(MODE) kernel
+	@touch $(KERNEL_LA_STAMP)
+
+kernel-la: $(KERNEL_LA_SRC) $(KERNEL_LA_STAMP)
+	@cp $(KERNEL_LA_SRC) kernel-la
 
 run-rv: kernel-rv
 	@if [ -z "$(TEST_DISK)" ]; then \
