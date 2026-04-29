@@ -5,7 +5,6 @@
 .vscode/
 
 **/target/
-**/Cargo.lock
 
 os/src/link_app.S
 os/src/linker.ld
@@ -23,7 +22,6 @@ AGENTS.md
 CLAUDE.md
 .codex
 
-# CARGO_HOME is set to ./vendor; keep only curated vendored sources/config tracked.
 vendor/.global-cache
 vendor/.package-cache
 vendor/.package-cache-mutate
@@ -32,4 +30,3 @@ vendor/.crates*.json
 vendor/bin/
 vendor/git/
 vendor/registry/
-!vendor/crates/**/Cargo.lock
