@@ -39,18 +39,6 @@ const SYSCALL_MMAP: usize = 222;
 const SYSCALL_MPROTECT: usize = 226;
 const SYSCALL_WAIT4: usize = 260;
 
-// Repo-private teaching/demo syscalls. They are intentionally outside the
-// Linux RISC-V syscall table and should not be treated as Linux ABI names.
-const SYSCALL_MUTEX_CREATE: usize = 1010;
-const SYSCALL_MUTEX_LOCK: usize = 1011;
-const SYSCALL_MUTEX_UNLOCK: usize = 1012;
-const SYSCALL_SEMAPHORE_CREATE: usize = 1020;
-const SYSCALL_SEMAPHORE_UP: usize = 1021;
-const SYSCALL_SEMAPHORE_DOWN: usize = 1022;
-const SYSCALL_CONDVAR_CREATE: usize = 1030;
-const SYSCALL_CONDVAR_SIGNAL: usize = 1031;
-const SYSCALL_CONDVAR_WAIT: usize = 1032;
-
 mod errno;
 mod fs;
 mod memory;
@@ -159,15 +147,6 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as i32,
             args[3] as *mut RUsage,
         ),
-        SYSCALL_MUTEX_CREATE => Ok(sys_mutex_create(args[0] == 1)),
-        SYSCALL_MUTEX_LOCK => Ok(sys_mutex_lock(args[0])),
-        SYSCALL_MUTEX_UNLOCK => Ok(sys_mutex_unlock(args[0])),
-        SYSCALL_SEMAPHORE_CREATE => Ok(sys_semaphore_create(args[0])),
-        SYSCALL_SEMAPHORE_UP => Ok(sys_semaphore_up(args[0])),
-        SYSCALL_SEMAPHORE_DOWN => Ok(sys_semaphore_down(args[0])),
-        SYSCALL_CONDVAR_CREATE => Ok(sys_condvar_create()),
-        SYSCALL_CONDVAR_SIGNAL => Ok(sys_condvar_signal(args[0])),
-        SYSCALL_CONDVAR_WAIT => Ok(sys_condvar_wait(args[0], args[1])),
         _ => Err(SysError::ENOSYS),
     })
 }
