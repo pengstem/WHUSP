@@ -73,9 +73,6 @@ impl ProcessControlBlock {
                     cpu_times: ProcessCpuTimes::default(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
-                    mutex_list: Vec::new(),
-                    semaphore_list: Vec::new(),
-                    condvar_list: Vec::new(),
                 })
             },
         });
@@ -149,9 +146,6 @@ impl ProcessControlBlock {
                     cpu_times: ProcessCpuTimes::default(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
-                    mutex_list: Vec::new(),
-                    semaphore_list: Vec::new(),
-                    condvar_list: Vec::new(),
                 })
             },
         });

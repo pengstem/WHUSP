@@ -2,7 +2,7 @@ use super::id::RecycleAllocator;
 use super::{FD_LIMIT, FdTableEntry, PidHandle, SignalFlags, TaskControlBlock};
 use crate::fs::WorkingDir;
 use crate::mm::MemorySet;
-use crate::sync::{Condvar, Mutex, Semaphore, UPIntrFreeCell, UPIntrRefMut};
+use crate::sync::{UPIntrFreeCell, UPIntrRefMut};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -96,9 +96,6 @@ pub struct ProcessControlBlockInner {
     pub cpu_times: ProcessCpuTimes,
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     pub task_res_allocator: RecycleAllocator,
-    pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
-    pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
-    pub condvar_list: Vec<Option<Arc<Condvar>>>,
 }
 
 impl ProcessControlBlockInner {
