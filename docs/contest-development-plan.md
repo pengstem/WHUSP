@@ -253,7 +253,7 @@
 ### 已完成或部分完成
 
 - [x] Linux syscall 号常量已大体对齐 RISC-V Linux ABI。
-- [x] repo-private net syscalls 已移出 Linux 29-31，当前在 2000-2002。
+- [x] repo-private net syscalls 已从 Linux 29-31 移出并最终退役，避免继续占用私有 ABI。
 - [x] `FdTableEntry` 已承载 fd flags 和 status flags，是 `fcntl` / close-on-exec 的基础。
 - [x] 部分 UAPI 类型已集中到 `os/src/syscall/fs/uapi.rs`。
 

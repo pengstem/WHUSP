@@ -6,8 +6,6 @@
 pub mod console;
 mod file;
 mod lang_items;
-mod net;
-mod sync;
 mod syscall;
 mod task;
 
@@ -21,8 +19,6 @@ use core::ptr::addr_of_mut;
 use alloc::vec::Vec;
 use buddy_system_allocator::LockedHeap;
 pub use file::*;
-pub use net::*;
-pub use sync::*;
 pub use syscall::SigInfo;
 use syscall::*;
 pub use task::*;

@@ -11,7 +11,6 @@ autobins = false
 buddy_system_allocator = "0.6"
 bitflags = "1.2.1"
 riscv = { git = "https://github.com/rcore-os/riscv", features = ["inline-asm"] }
-lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
 oorandom ="11"
 
 [lib]
@@ -187,18 +186,6 @@ bench = false
 [[bin]]
 name = "store_fault"
 path = "src/bin/store_fault.rs"
-test = false
-bench = false
-
-[[bin]]
-name = "tcp_simplehttp"
-path = "src/bin/tcp_simplehttp.rs"
-test = false
-bench = false
-
-[[bin]]
-name = "udp"
-path = "src/bin/udp.rs"
 test = false
 bench = false
 

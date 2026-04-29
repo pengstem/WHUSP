@@ -27,18 +27,6 @@ const SYSCALL_BRK: usize = 214;
 const SYSCALL_CLONE: usize = 220;
 const SYSCALL_EXECVE: usize = 221;
 const SYSCALL_WAIT4: usize = 260;
-const SYSCALL_NET_CONNECT: usize = 2000;
-const SYSCALL_NET_LISTEN: usize = 2001;
-const SYSCALL_NET_ACCEPT: usize = 2002;
-const SYSCALL_MUTEX_CREATE: usize = 1010;
-const SYSCALL_MUTEX_LOCK: usize = 1011;
-const SYSCALL_MUTEX_UNLOCK: usize = 1012;
-const SYSCALL_SEMAPHORE_CREATE: usize = 1020;
-const SYSCALL_SEMAPHORE_UP: usize = 1021;
-const SYSCALL_SEMAPHORE_DOWN: usize = 1022;
-const SYSCALL_CONDVAR_CREATE: usize = 1030;
-const SYSCALL_CONDVAR_SIGNAL: usize = 1031;
-const SYSCALL_CONDVAR_WAIT: usize = 1032;
 
 const AT_FDCWD: isize = -100;
 
@@ -104,22 +92,6 @@ pub fn sys_fcntl(fd: usize, op: usize, arg: usize) -> isize {
 
 pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> isize {
     syscall(SYSCALL_IOCTL, [fd, request, argp, 0, 0, 0])
-}
-
-pub fn sys_connect(dest: u32, sport: u16, dport: u16) -> isize {
-    syscall(
-        SYSCALL_NET_CONNECT,
-        [dest as usize, sport as usize, dport as usize, 0, 0, 0],
-    )
-}
-
-// just listen for tcp connections now
-pub fn sys_listen(sport: u16) -> isize {
-    syscall(SYSCALL_NET_LISTEN, [sport as usize, 0, 0, 0, 0, 0])
-}
-
-pub fn sys_accept(socket_fd: usize) -> isize {
-    syscall(SYSCALL_NET_ACCEPT, [socket_fd, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_open(path: &str, flags: u32) -> isize {
@@ -347,40 +319,4 @@ pub fn sys_waitid(
             0,
         ],
     )
-}
-
-pub fn sys_mutex_create(blocking: bool) -> isize {
-    syscall(SYSCALL_MUTEX_CREATE, [blocking as usize, 0, 0, 0, 0, 0])
-}
-
-pub fn sys_mutex_lock(id: usize) -> isize {
-    syscall(SYSCALL_MUTEX_LOCK, [id, 0, 0, 0, 0, 0])
-}
-
-pub fn sys_mutex_unlock(id: usize) -> isize {
-    syscall(SYSCALL_MUTEX_UNLOCK, [id, 0, 0, 0, 0, 0])
-}
-
-pub fn sys_semaphore_create(res_count: usize) -> isize {
-    syscall(SYSCALL_SEMAPHORE_CREATE, [res_count, 0, 0, 0, 0, 0])
-}
-
-pub fn sys_semaphore_up(sem_id: usize) -> isize {
-    syscall(SYSCALL_SEMAPHORE_UP, [sem_id, 0, 0, 0, 0, 0])
-}
-
-pub fn sys_semaphore_down(sem_id: usize) -> isize {
-    syscall(SYSCALL_SEMAPHORE_DOWN, [sem_id, 0, 0, 0, 0, 0])
-}
-
-pub fn sys_condvar_create() -> isize {
-    syscall(SYSCALL_CONDVAR_CREATE, [0, 0, 0, 0, 0, 0])
-}
-
-pub fn sys_condvar_signal(condvar_id: usize) -> isize {
-    syscall(SYSCALL_CONDVAR_SIGNAL, [condvar_id, 0, 0, 0, 0, 0])
-}
-
-pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
-    syscall(SYSCALL_CONDVAR_WAIT, [condvar_id, mutex_id, 0, 0, 0, 0])
 }

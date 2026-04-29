@@ -44,8 +44,6 @@ APP_NAMES := \
 	stackful_coroutine \
 	stackless_coroutine \
 	store_fault \
-	tcp_simplehttp \
-	udp \
 	until_timeout \
 	user_shell \
 	usertests \
