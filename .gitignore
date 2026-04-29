@@ -32,3 +32,4 @@ vendor/.crates*.json
 vendor/bin/
 vendor/git/
 vendor/registry/
+!vendor/crates/**/Cargo.lock
