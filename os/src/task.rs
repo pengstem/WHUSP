@@ -103,8 +103,9 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     // record exit code
     task_inner.exit_code = Some(exit_code);
     task_inner.res = None;
-    // here we do not remove the thread since we are still using the kstack
-    // it will be deallocated when sys_waittid is called
+    // UNFINISHED: Exited non-main threads stay in the process task table until
+    // process teardown. Linux clear_child_tid/futex-based join cleanup is not
+    // implemented here yet.
     drop(task_inner);
     drop(task);
     // however, if this is the main thread of current process

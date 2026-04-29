@@ -139,17 +139,3 @@ pub fn kill(pid: usize, signal: i32) -> isize {
 pub fn sleep(sleep_ms: usize) {
     sys_sleep(sleep_ms);
 }
-
-pub fn gettid() -> isize {
-    sys_gettid()
-}
-pub fn waittid(tid: usize) -> isize {
-    loop {
-        match sys_waittid(tid) {
-            -2 => {
-                yield_();
-            }
-            exit_code => return exit_code,
-        }
-    }
-}

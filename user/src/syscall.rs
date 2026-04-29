@@ -30,8 +30,6 @@ const SYSCALL_WAIT4: usize = 260;
 const SYSCALL_NET_CONNECT: usize = 2000;
 const SYSCALL_NET_LISTEN: usize = 2001;
 const SYSCALL_NET_ACCEPT: usize = 2002;
-const SYSCALL_GETTID: usize = 1001;
-const SYSCALL_WAITTID: usize = 1002;
 const SYSCALL_MUTEX_CREATE: usize = 1010;
 const SYSCALL_MUTEX_LOCK: usize = 1011;
 const SYSCALL_MUTEX_UNLOCK: usize = 1012;
@@ -349,14 +347,6 @@ pub fn sys_waitid(
             0,
         ],
     )
-}
-
-pub fn sys_gettid() -> isize {
-    syscall(SYSCALL_GETTID, [0; 6])
-}
-
-pub fn sys_waittid(tid: usize) -> isize {
-    syscall(SYSCALL_WAITTID, [tid, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_mutex_create(blocking: bool) -> isize {
