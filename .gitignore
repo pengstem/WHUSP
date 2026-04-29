@@ -21,6 +21,7 @@ develop-guide/
 AGENTS.md
 CLAUDE.md
 .codex
+!vendor/crates/**/AGENTS.md
 
 vendor/.global-cache
 vendor/.package-cache

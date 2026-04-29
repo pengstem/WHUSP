@@ -23,7 +23,7 @@ kernel-la:
 	@cp -f $(KERNEL_LA_SRC) kernel-la
 
 run-rv: kernel-rv
-	@$(MAKE) --no-print-directory -C os ARCH=riscv64 MODE=$(MODE) run-inner PRIMARY_DISK="$(TEST_DISK)" AUX_DISK="$(CONTEST_AUX_DISK)"
+	@$(MAKE) --no-print-directory -C os ARCH=riscv64 MODE=$(MODE) run-inner PRIMARY_DISK="$(TEST_DISK)"
 
 run-la: kernel-la
 	@$(MAKE) --no-print-directory -C os ARCH=loongarch64 MODE=$(MODE) run-inner PRIMARY_DISK="$(TEST_DISK_LA)"
