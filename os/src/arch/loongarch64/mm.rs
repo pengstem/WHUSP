@@ -1,10 +1,11 @@
 use core::arch::asm;
-use loongArch64::register::{pgdh, pgdl};
 
 pub const VIRT_ADDR_START: usize = 0x9000_0000_0000_0000;
 const DIRECT_MAP_MASK: usize = 0xf000_0000_0000_0000;
 const PHYS_ADDR_MASK: usize = 0x0000_ffff_ffff_ffff;
 const PTE_ADDR_MASK: usize = 0x0000_ffff_ffff_f000;
+const LA_CSR_PGDL: usize = 0x19;
+const LA_CSR_PGDH: usize = 0x1a;
 const PA_WIDTH: usize = 48;
 const VA_WIDTH: usize = 48;
 const PPN_WIDTH: usize = PA_WIDTH - crate::config::PAGE_SIZE_BITS;
@@ -28,9 +29,22 @@ pub fn page_table_root_ppn(token: usize) -> usize {
 }
 
 pub fn activate_page_table(token: usize) {
-    pgdl::set_base(token);
-    pgdh::set_base(token);
+    write_page_table_roots(token, token);
     flush_tlb_all();
+}
+
+fn write_page_table_roots(pgdl_token: usize, pgdh_token: usize) {
+    unsafe {
+        asm!(
+            "csrwr {pgdl}, {pgdl_csr}",
+            "csrwr {pgdh}, {pgdh_csr}",
+            pgdl = inout(reg) pgdl_token => _,
+            pgdh = inout(reg) pgdh_token => _,
+            pgdl_csr = const LA_CSR_PGDL,
+            pgdh_csr = const LA_CSR_PGDH,
+            options(nomem, nostack),
+        );
+    }
 }
 
 pub fn flush_tlb_all() {

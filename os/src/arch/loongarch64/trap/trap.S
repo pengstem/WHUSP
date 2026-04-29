@@ -111,8 +111,10 @@ __trap_vector_base:
     csrrd   $sp, KSAVE_CTX
     SAVE_REGS
     ld.d    $t0, $sp, 34*8
+    # csrwr writes the old CSR value back to its source register.
+    move    $t1, $t0
     csrwr   $t0, LA_CSR_PGDL
-    csrwr   $t0, LA_CSR_PGDH
+    csrwr   $t1, LA_CSR_PGDH
     dbar    0
     invtlb  0x00, $r0, $r0
     ld.d    $t1, $sp, 36*8
@@ -120,9 +122,12 @@ __trap_vector_base:
     jirl    $zero, $t1, 0
 
 __restore:
+    ld.d    $t0, $a0, 34*8
+    move    $t1, $a1
+    move    $t2, $t0
     csrwr   $a0, KSAVE_CTX
-    csrwr   $a1, LA_CSR_PGDL
-    csrwr   $a1, LA_CSR_PGDH
+    csrwr   $t1, LA_CSR_PGDL
+    csrwr   $t2, LA_CSR_PGDH
     dbar    0
     invtlb  0x00, $r0, $r0
     csrrd   $sp, KSAVE_CTX
