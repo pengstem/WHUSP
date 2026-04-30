@@ -1,6 +1,6 @@
 use crate::fs::{
-    File, OpenFlags, WorkingDir, lookup_dir_at, mkdir_at, normalize_path, open_devfs_child,
-    open_file_at, rename_at, rmdir_at, unlink_file_at,
+    File, OpenFlags, WorkingDir, link_file_at, lookup_dir_at, mkdir_at, normalize_path,
+    open_devfs_child, open_file_at, rename_at, rmdir_at, unlink_file_at,
 };
 use crate::mm::UserBuffer;
 use crate::task::{FdTableEntry, current_process, current_user_token};
@@ -141,6 +141,27 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> SysResult {
     } else {
         unlink_file_at(base, path.as_str())?;
     }
+    Ok(0)
+}
+
+pub fn sys_linkat(
+    olddirfd: isize,
+    oldpath: *const u8,
+    newdirfd: isize,
+    newpath: *const u8,
+    flags: u32,
+) -> SysResult {
+    // UNFINISHED: Linux linkat supports AT_SYMLINK_FOLLOW and AT_EMPTY_PATH; this kernel currently implements pathname hard links only.
+    if flags != 0 {
+        return Err(SysError::EINVAL);
+    }
+
+    let token = current_user_token();
+    let oldpath = read_user_c_string(token, oldpath, PATH_MAX)?;
+    let newpath = read_user_c_string(token, newpath, PATH_MAX)?;
+    let old_base = path_base(olddirfd, oldpath.as_str())?;
+    let new_base = path_base(newdirfd, newpath.as_str())?;
+    link_file_at(old_base, oldpath.as_str(), new_base, newpath.as_str())?;
     Ok(0)
 }
 

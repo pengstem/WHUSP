@@ -41,6 +41,7 @@ impl From<crate::fs::FsError> for SysError {
             crate::fs::FsError::NotDir => Self::ENOTDIR,
             crate::fs::FsError::IsDir => Self::EISDIR,
             crate::fs::FsError::AlreadyExists => Self::EEXIST,
+            crate::fs::FsError::PermissionDenied => Self::EPERM,
             crate::fs::FsError::InvalidInput => Self::EINVAL,
             crate::fs::FsError::NotEmpty => Self::ENOTEMPTY,
             crate::fs::FsError::Busy => Self::EBUSY,

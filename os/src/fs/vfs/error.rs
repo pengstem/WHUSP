@@ -4,6 +4,7 @@ pub(crate) enum FsError {
     NotDir,
     IsDir,
     AlreadyExists,
+    PermissionDenied,
     InvalidInput,
     NotEmpty,
     Busy,
