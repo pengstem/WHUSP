@@ -1,6 +1,6 @@
 use crate::fs::{
     File, OpenFlags, WorkingDir, link_file_at, lookup_dir_at, mkdir_at, normalize_path,
-    open_devfs_child, open_file_at, rename_at, rmdir_at, unlink_file_at,
+    open_devfs_child, open_file_at, rename_at, rmdir_at, symlink_at, unlink_file_at,
 };
 use crate::mm::UserBuffer;
 use crate::task::{FdTableEntry, current_process, current_user_token};
@@ -162,6 +162,20 @@ pub fn sys_linkat(
     let old_base = path_base(olddirfd, oldpath.as_str())?;
     let new_base = path_base(newdirfd, newpath.as_str())?;
     link_file_at(old_base, oldpath.as_str(), new_base, newpath.as_str())?;
+    Ok(0)
+}
+
+pub fn sys_symlinkat(target: *const u8, newdirfd: isize, linkpath: *const u8) -> SysResult {
+    let token = current_user_token();
+    let target = read_user_c_string(token, target, PATH_MAX)?;
+    let linkpath = read_user_c_string(token, linkpath, PATH_MAX)?;
+    if target.is_empty() || linkpath.is_empty() {
+        return Err(SysError::ENOENT);
+    }
+    let base = path_base(newdirfd, linkpath.as_str())?;
+    symlink_at(base, target.as_str(), linkpath.as_str())?;
+    // UNFINISHED: Linux path lookup follows symlink targets, and readlinkat()
+    // returns link contents. This syscall only creates real EXT4 symlink nodes.
     Ok(0)
 }
 

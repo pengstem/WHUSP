@@ -206,6 +206,40 @@ pub(crate) fn link_file_at(
     Ok(())
 }
 
+pub(crate) fn symlink_at(cwd: WorkingDir, target: &str, link_name: &str) -> FsResult {
+    match final_component(link_name) {
+        None => return Err(FsError::NotFound),
+        Some("." | ".." | "/") => return Err(FsError::AlreadyExists),
+        _ => {}
+    }
+
+    let link_has_trailing_slash = has_trailing_slash(link_name);
+    let create_target = resolve_create_parent(Some(cwd), trimmed_nonroot_path(link_name))?;
+    with_mount(create_target.parent.mount_id, |mount| {
+        match mount.lookup_component_from(create_target.parent.ino, create_target.leaf_name) {
+            Ok((_, kind)) => {
+                if link_has_trailing_slash && kind != FsNodeKind::Directory {
+                    return Err(FsError::NotDir);
+                }
+                return Err(FsError::AlreadyExists);
+            }
+            Err(FsError::NotFound) => {
+                if link_has_trailing_slash {
+                    return Err(FsError::NotFound);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+        mount.symlink(
+            create_target.parent.ino,
+            create_target.leaf_name,
+            target.as_bytes(),
+        )
+    })
+    .ok_or(FsError::Io)??;
+    Ok(())
+}
+
 pub(crate) fn rename_at(
     old_cwd: WorkingDir,
     old_name: &str,
