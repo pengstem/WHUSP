@@ -146,6 +146,12 @@ impl FileSystemBackend for Ext4Mount {
             .map_err(map_ext4_error)
     }
 
+    fn link(&mut self, parent_ino: u32, leaf_name: &str, child_ino: u32) -> FsResult {
+        self.fs
+            .link(parent_ino, leaf_name, child_ino)
+            .map_err(map_ext4_error)
+    }
+
     fn unlink(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult {
         self.fs
             .unlink(parent_ino, leaf_name)

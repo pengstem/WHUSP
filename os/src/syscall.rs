@@ -5,6 +5,7 @@ const SYSCALL_FCNTL: usize = 25;
 const SYSCALL_IOCTL: usize = 29;
 const SYSCALL_MKDIRAT: usize = 34;
 const SYSCALL_UNLINKAT: usize = 35;
+const SYSCALL_LINKAT: usize = 37;
 const SYSCALL_UMOUNT2: usize = 39;
 const SYSCALL_MOUNT: usize = 40;
 const SYSCALL_CHDIR: usize = 49;
@@ -39,6 +40,7 @@ const SYSCALL_MMAP: usize = 222;
 const SYSCALL_MPROTECT: usize = 226;
 const SYSCALL_WAIT4: usize = 260;
 const SYSCALL_RENAMEAT2: usize = 276;
+const SYSCALL_STATX: usize = 291;
 
 mod errno;
 mod fs;
@@ -70,6 +72,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_LINKAT => sys_linkat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as isize,
+            args[3] as *const u8,
+            args[4] as u32,
+        ),
         SYSCALL_RENAMEAT2 => sys_renameat2(
             args[0] as isize,
             args[1] as *const u8,
@@ -113,6 +122,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as i32,
         ),
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut LinuxKstat),
+        SYSCALL_STATX => sys_statx(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as i32,
+            args[3] as u32,
+            args[4] as *mut LinuxStatx,
+        ),
         SYSCALL_WAITID => sys_waitid(
             args[0] as i32,
             args[1] as i32,

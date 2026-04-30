@@ -153,6 +153,59 @@ pub(crate) fn mkdir_at(cwd: WorkingDir, name: &str, mode: u32) -> FsResult {
     Ok(())
 }
 
+pub(crate) fn link_file_at(
+    old_cwd: WorkingDir,
+    old_name: &str,
+    new_cwd: WorkingDir,
+    new_name: &str,
+) -> FsResult {
+    match final_component(old_name) {
+        None => return Err(FsError::NotFound),
+        Some("." | ".." | "/") => return Err(FsError::PermissionDenied),
+        _ => {}
+    }
+    match final_component(new_name) {
+        None => return Err(FsError::NotFound),
+        Some("." | ".." | "/") => return Err(FsError::AlreadyExists),
+        _ => {}
+    }
+
+    let old_has_trailing_slash = has_trailing_slash(old_name);
+    let new_has_trailing_slash = has_trailing_slash(new_name);
+    let old_target = resolve_create_parent(Some(old_cwd), trimmed_nonroot_path(old_name))?;
+    let new_target = resolve_create_parent(Some(new_cwd), trimmed_nonroot_path(new_name))?;
+    if old_target.parent.mount_id != new_target.parent.mount_id {
+        return Err(FsError::CrossDevice);
+    }
+
+    let (old_node, old_kind) = lookup_node(old_target.parent, old_target.leaf_name)?;
+    if old_has_trailing_slash && old_kind != FsNodeKind::Directory {
+        return Err(FsError::NotDir);
+    }
+    if old_kind == FsNodeKind::Directory || old_node.ino == EXT4_ROOT_INO {
+        return Err(FsError::PermissionDenied);
+    }
+    with_mount(new_target.parent.mount_id, |mount| {
+        match mount.lookup_component_from(new_target.parent.ino, new_target.leaf_name) {
+            Ok((_, kind)) => {
+                if new_has_trailing_slash && kind != FsNodeKind::Directory {
+                    return Err(FsError::NotDir);
+                }
+                return Err(FsError::AlreadyExists);
+            }
+            Err(FsError::NotFound) => {
+                if new_has_trailing_slash {
+                    return Err(FsError::NotFound);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+        mount.link(new_target.parent.ino, new_target.leaf_name, old_node.ino)
+    })
+    .ok_or(FsError::Io)??;
+    Ok(())
+}
+
 pub(crate) fn rename_at(
     old_cwd: WorkingDir,
     old_name: &str,
