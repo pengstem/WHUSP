@@ -413,8 +413,12 @@ fn exec_loaded_program(
         return Ok(0);
     }
 
-    let Some(interpreter) = parse_shebang(data.as_slice())? else {
-        return Err(SysError::ENOEXEC);
+    let interpreter = match parse_shebang(data.as_slice())? {
+        Some(interp) => interp,
+        None => ScriptInterpreter {
+            path: String::from("/bin/sh"),
+            optional_arg: None,
+        },
     };
     exec_script(path, args, envs, interpreter, depth)
 }
