@@ -16,6 +16,7 @@ pub enum SysError {
     EFAULT = 14,
     ENOTBLK = 15,
     EBUSY = 16,
+    EEXIST = 17,
     ENODEV = 19,
     ENOTDIR = 20,
     EISDIR = 21,
@@ -31,6 +32,24 @@ pub enum SysError {
 }
 
 pub type SysResult<T = isize> = Result<T, SysError>;
+
+impl From<crate::fs::FsError> for SysError {
+    fn from(error: crate::fs::FsError) -> Self {
+        match error {
+            crate::fs::FsError::NotFound => Self::ENOENT,
+            crate::fs::FsError::NotDir => Self::ENOTDIR,
+            crate::fs::FsError::IsDir => Self::EISDIR,
+            crate::fs::FsError::AlreadyExists => Self::EEXIST,
+            crate::fs::FsError::InvalidInput => Self::EINVAL,
+            crate::fs::FsError::NotEmpty => Self::ENOTEMPTY,
+            crate::fs::FsError::Busy => Self::EBUSY,
+            crate::fs::FsError::Io => Self::EIO,
+            crate::fs::FsError::NameTooLong => Self::ENAMETOOLONG,
+            crate::fs::FsError::Loop => Self::ELOOP,
+            crate::fs::FsError::Unsupported => Self::ENOTSUP,
+        }
+    }
+}
 
 pub fn ret(result: SysResult<isize>) -> isize {
     match result {

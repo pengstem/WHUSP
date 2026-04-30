@@ -86,8 +86,7 @@ pub fn sys_mount(
 
     let device_index = parse_virtio_block_source(source.as_str())?;
     let process = current_process();
-    let target_dir = lookup_mount_target_dir_at(process.working_dir(), target.as_str())
-        .ok_or(SysError::ENOENT)?;
+    let target_dir = lookup_mount_target_dir_at(process.working_dir(), target.as_str())?;
     mount_block_device_at(target_dir, device_index).map_err(mount_error_to_errno)?;
     Ok(0)
 }
@@ -102,8 +101,7 @@ pub fn sys_umount2(target: *const u8, flags: i32) -> SysResult {
     let token = current_user_token();
     let target = read_user_c_string(token, target, PATH_MAX)?;
     let process = current_process();
-    let target_dir = lookup_mount_target_dir_at(process.working_dir(), target.as_str())
-        .ok_or(SysError::ENOENT)?;
+    let target_dir = lookup_mount_target_dir_at(process.working_dir(), target.as_str())?;
     unmount_at(target_dir).map_err(mount_error_to_errno)?;
     Ok(0)
 }

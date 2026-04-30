@@ -90,8 +90,8 @@ pub trait File: Send + Sync {
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
     }
-    fn read_dirent64(&self, _buf: UserBuffer) -> isize {
-        -1
+    fn read_dirent64(&self, _buf: UserBuffer) -> FsResult<isize> {
+        Err(FsError::NotDir)
     }
     fn working_dir(&self) -> Option<WorkingDir> {
         None
@@ -123,10 +123,14 @@ pub fn list_apps() {
 
 pub(crate) use devfs::{open_child as open_devfs_child, stat_child as stat_devfs_child};
 pub use inode::OpenFlags;
-pub(crate) use inode::{lookup_mount_target_dir_at, mkdir_at, unlink_file_at};
+pub(crate) use inode::{lookup_mount_target_dir_at, mkdir_at, rmdir_at, unlink_file_at};
 pub(crate) use mount::{MountError, mount_block_device_at, unmount_at};
 pub(crate) use path::{WorkingDir, normalize_path};
 pub use pipe::make_pipe;
 pub use stdio::{Stdin, Stdout};
 pub(crate) use vfs::open_file;
-pub(crate) use vfs::{lookup_dir_at, open_file_at, stat_at};
+pub(crate) use vfs::{FsError, FsResult, lookup_dir_at, open_file_at, stat_at};
+
+pub(self) fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}

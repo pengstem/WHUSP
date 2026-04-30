@@ -1,6 +1,7 @@
 use crate::fs::FileStat;
 
 pub(super) const AT_FDCWD: isize = -100;
+pub(super) const AT_REMOVEDIR: u32 = 0x200;
 pub(super) const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 pub(super) const AT_NO_AUTOMOUNT: i32 = 0x800;
 pub(super) const AT_EMPTY_PATH: i32 = 0x1000;
