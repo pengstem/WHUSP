@@ -1,18 +1,20 @@
 # OSKernel2026 开发任务清单
 
-更新时间：2026-04-28
+更新时间：2026-04-30
 
 ## 快照
 
-- [x] 根目录 `make all` 已作为 RISC-V 主构建入口，当前默认产物是根目录 `kernel-rv`。
+- [x] 根目录 `make all` 已作为提交构建入口，当前目标是同时产出根目录 `kernel-rv` 和 `kernel-la`。
+- [x] 根 `Makefile` 的 `kernel-rv` 通过 `os/ ARCH=riscv64` 构建，`kernel-la` 通过 `os/ ARCH=loongarch64` 构建。
 - [x] 当前仓库已 vendoring Cargo 依赖到 `vendor/crates`，并通过 `vendor/config.toml` 支持离线构建。
 - [x] 2026-04-28 移除默认 `user/` / `disk.img` 链路后，本地重新验证 `CARGO_NET_OFFLINE=true make all` 成功。
-- [x] `make run-rv` 是默认比赛形态启动：`x0 = sdcard-rv.img`，默认不再挂载 `x1`。
+- [x] `make run-rv` 是默认 RISC-V 比赛形态启动：`x0 = sdcard-rv.img`，当前不传 `CONTEST_AUX_DISK` / `AUX_DISK`，也不挂载 `x1`。
+- [x] `make run-la` 已有入口：`x0 = sdcard-la.img`。这只表示有构建/启动入口，不代表 LoongArch 比赛运行已经完整可用。
 - [x] 内核当前直接从评测盘加载 `/musl/busybox sh` 作为 initproc。
 - [x] 已有一次 RISC-V 全量手工运行记录：`develop-guide/contest-full-test-run-2026-04-27.md`。这次是主机注入命令，不是最终 submit runner。
 - [x] `basic-musl` 在该记录中能跑到 END marker，官方 `judge_basic.py` 结果是 `55 / 102`。
 - [x] 在 2026-04-27 全量手工运行记录之后，源码又接入了 `times(153)`、`mprotect(226)`、`nanosleep(101)`、`clock_nanosleep(115)`、`gettimeofday(169)`、`uname(160)` 等修复，旧的跑分记录需要重跑刷新。
-- [ ] `kernel-la`、submit runner、全组串行执行、自动 marker 管理、结束后主动关机。
+- [ ] LoongArch 运行验证、submit runner、全组串行执行、自动 marker 管理、结束后主动关机。
 
 ## 判断
 
@@ -20,30 +22,32 @@
 2. P2.6 的 VFS/EXT4 锁问题是第二优先级。它会同时影响 BusyBox pipeline、UnixBench、Lmbench、LTP 和重复 exec。
 3. `basic-musl` 还能短线补分，但要避免把 `/dev/vda2`、vfat、VFS 并发、FAT 支持混成一个大改。
 4. `mprotect` 已经接入源码，glibc 的旧失败结论需要重新验证；如果 glibc 仍失败，再从动态加载器日志继续收窄。
-5. LoongArch 先不要抢主线。当前 RISC-V 提交闭环没稳定前，LoongArch 只能做路线冻结和低风险架构拆分准备。
+5. LoongArch 有 `kernel-la` / `run-la` 入口和产物目标，但比赛运行仍要按具体验证记录描述；当前 RISC-V 提交闭环没稳定前，不让 LoongArch 抢主线。
 
 ## P0 - 提交
 
 ### 已完成
 
 - [x] 重写根目录 `Makefile`，让 `make all` 成为正式提交入口。
-- [x] 根目录 `make all` 产出 `kernel-rv`。
+- [x] 根目录 `make all` 产出 `kernel-rv` 和 `kernel-la`。
+- [x] 根目录 `make kernel-rv` / `make kernel-la` 分别调用 `os/` 的 `ARCH=riscv64` / `ARCH=loongarch64`。
 - [x] 根目录 `make all` 不再依赖仓库内 `user/`、rootfs 镜像打包或 `disk.img`。
 - [x] 清理提交链路对隐藏目录 `.cargo` 的依赖，仓库根目录当前没有 `.cargo/`。
 - [x] 把远程 Cargo 依赖改成离线可构建方案：`vendor/crates` + `vendor/config.toml`。
 - [x] 本地重新验证离线构建入口仍可用：`CARGO_NET_OFFLINE=true make all`。
 - [x] 接入比赛模式 initproc：内核直接加载 `/musl/busybox sh`。
-- [x] `make run-rv` 默认使用 `sdcard-rv.img` 作为评测盘；`CONTEST_AUX_DISK` 只在显式传入时挂载为可选辅助盘。
+- [x] `make run-rv` 默认使用 `sdcard-rv.img` 作为评测盘；当前根目标只传 `PRIMARY_DISK=$(TEST_DISK)`，不再把 `CONTEST_AUX_DISK` 传给 `os/Makefile`。
+- [x] `make run-la` 默认使用 `sdcard-la.img` 作为评测盘；当前根目标只传 `PRIMARY_DISK=$(TEST_DISK_LA)`。
+- [x] `os/Makefile` 的 `run-inner` 会检查 `PRIMARY_DISK`；`AUX_DISK` 变量存在且会被检查，但当前 QEMU 命令没有挂载 `x1`。
 
 ### 未完成
 
-- [ ] 让根目录 `make all` 产出 `kernel-la`。
 - [ ] 新增 submit runner 用户程序或等价启动入口。
 - [ ] submit runner 按固定顺序串行执行测试脚本。
 - [ ] runner 输出精确的 `#### OS COMP TEST GROUP START xxxxx ####`。
 - [ ] runner 输出精确的 `#### OS COMP TEST GROUP END xxxxx ####`。
 - [ ] 所有测试组结束后主动关机，而不是依赖超时或主机杀 QEMU。
-- [ ] 在官方 contest Docker 中重新跑 `make all` 和默认单盘 `make run-rv`。
+- [ ] 在官方 contest Docker 中重新跑 `make all`、默认单盘 `make run-rv`，并按需要单独验证 `make run-la`。
 
 ### 顺序
 
@@ -60,6 +64,7 @@
 - [x] 用 CI smoke 覆盖官方评测风格的无头 QEMU 启动。
 - [x] 块设备发现支持多个 virtio block 设备，`BLOCK_DEVICE_CAPACITY = 8`，并按 MMIO base 排序。
 - [x] 明确区分评测盘 `x0` 和可选辅助块设备 `x1`。
+- [x] 当前根 `run-rv` / `run-la` 只挂载 `x0`；`x1` 只能通过后续显式 QEMU/Makefile 接线验证。
 - [x] EXT4 测试盘作为主根文件系统挂载到 `/`。
 - [x] 额外块设备 lazy-open 后可动态覆盖真实目录 `/x1`、`/x2`。
 - [x] 接入评测 EXT4 测试盘的只读访问和普通路径读取。
@@ -160,11 +165,11 @@
 
 ### 阶段 1：修掉 mount/EXT4 跨调度借用 panic
 
-- [ ] 新增可睡眠的内核互斥原语，例如 `SleepMutex<T>` / `BlockingMutex<T>`。
-- [ ] 将可能等待 I/O 的 mount slot 从 `UPIntrFreeCell` 迁出。
-- [ ] 保持 `DYNAMIC_MOUNTS` 只做短临界区元数据操作，不进入块设备 I/O。
-- [ ] 改造 `with_mount()`：同一 mount 被其他任务使用时应等待，而不是 `borrow_mut()` panic。
-- [ ] 验证 BusyBox pipeline、`/musl/basic/pipe`、`/musl/basic/gettimeofday`、默认单盘 `make run-rv`。
+- [x] 新增可睡眠的内核互斥原语，例如 `SleepMutex<T>` / `BlockingMutex<T>`。
+- [x] 将可能等待 I/O 的 mount slot 从 `UPIntrFreeCell` 迁出。
+- [x] 保持 `DYNAMIC_MOUNTS` 只做短临界区元数据操作，不进入块设备 I/O。
+- [x] 改造 `with_mount()`：同一 mount 被其他任务使用时应等待，而不是 `borrow_mut()` panic。
+- [x] 验证 BusyBox pipeline、`/musl/basic/pipe`、`/musl/basic/gettimeofday`、默认单盘 `make run-rv`。
 
 ### 阶段 1.5：块 I/O 策略与文件对象锁边界
 
@@ -172,14 +177,21 @@
 - [x] 官方 QEMU 形态中 RV 使用 `virtio-blk-device`，LA 使用 `virtio-blk-pci`，因此设备后端和中断成熟度可以按架构分别验收。
 - [x] NighthawkOS / RocketOS 的 submit runner 都采用 `fork` / `execve` / `waitpid` 串行运行测试脚本，RocketOS 最后主动 `shutdown()`。
 - [x] RocketOS / RustOsWhu 的 RV 与 LA virtio block 路径均以同步 `read_blocks` / `write_blocks` 作为稳定基线。
-- [ ] 短期将 `DEV_NON_BLOCKING_ACCESS` 默认保持为 `false`，RV/LA 都先走同步块 I/O，确保 `busybox-musl` pipeline 不再卡在 START marker 后。
-- [ ] 保留架构差异说明：LA 在 virtio-pci 外部 IRQ 路径未验收前保持 polling/sync；RV 只有通过 BusyBox/basic 回归后才允许重新打开 nonblocking。
-- [ ] 梳理所有 `OSInode` / fd 文件对象持有 `UPIntrFreeCell` guard 后进入 `with_mount()` / EXT4 / block I/O 的路径。
-- [ ] 将文件 offset / status 更新拆成短临界区；实际 `read_at` / `write_at` / `stat` / `read_dirent64` I/O 不持有 `UPIntrFreeCell` guard 跨 `schedule()`。
-- [ ] 对共享 offset 的 `read` / `write` / `write_append` / `read_dirent64` 增加可睡眠文件对象锁或等价序列化方案。
-- [ ] 保持 `DYNAMIC_MOUNTS` 只覆盖短元数据临界区；长 I/O 状态继续放在可睡眠锁保护下。
-- [ ] 重新验证 `./busybox cat ./busybox_cmd.txt | while read line`、完整 `busybox_testcode.sh`、`/musl/basic/pipe`、`/musl/basic/gettimeofday`。
-- [ ] 只有 RV 通过上述回归后，才允许把 RV 的 nonblocking block I/O 重新打开；LA 等 virtio-pci IRQ / 外部中断路径单独通过验收后再考虑。
+- [x] 短期将 `DEV_NON_BLOCKING_ACCESS` 默认保持为 `false`，RV/LA 都先走同步块 I/O，确保 `busybox-musl` pipeline 不再卡在 START marker 后。
+- [x] 保留架构差异说明：LA 在 virtio-pci 外部 IRQ 路径未验收前保持 polling/sync；RV 只有通过 BusyBox/basic 回归后才允许重新打开 nonblocking。
+- [x] 梳理所有 `OSInode` / fd 文件对象持有 `UPIntrFreeCell` guard 后进入 `with_mount()` / EXT4 / block I/O 的路径。
+- [x] 将文件 offset / status 更新拆成短临界区；实际 `read_at` / `write_at` / `stat` / `read_dirent64` I/O 不持有 `UPIntrFreeCell` guard 跨 `schedule()`。
+- [x] 对共享 offset 的 `read` / `write` / `write_append` / `read_dirent64` 增加可睡眠文件对象锁或等价序列化方案。
+- [x] 保持 `DYNAMIC_MOUNTS` 只覆盖短元数据临界区；长 I/O 状态继续放在可睡眠锁保护下。
+- [x] 重新验证 `./busybox cat ./busybox_cmd.txt | while read line`、完整 `busybox_testcode.sh`、`/musl/basic/pipe`、`/musl/basic/gettimeofday`。
+- [x] 只有 RV 通过上述回归后，才允许把 RV 的 nonblocking block I/O 重新打开；LA 等 virtio-pci IRQ / 外部中断路径单独通过验收后再考虑。
+
+2026-04-30 阶段 1.5 验证记录：
+
+- `tools/contest_runner/run_groups.py --arch rv --libcs musl --groups busybox --out develop-guide/test-run-logs/2026-04-30-phase1_5/busybox-rv-musl --no-build`：`busybox-musl` end-seen，`42 / 55`。
+- `tools/contest_runner/run_groups.py --arch rv --libcs musl --groups basic --out develop-guide/test-run-logs/2026-04-30-phase1_5/basic-rv-musl --no-build`：`basic-musl` end-seen，`56 / 102`，`test_gettimeofday` 与 `test_pipe` 都打印 END。
+- `timeout 25s make run-rv`：默认单盘启动到 `/musl/busybox sh`，timeout 只用于截断交互式 shell。
+- 当前默认策略仍是同步块 I/O；RV nonblocking 不是默认值，后续若重新打开必须重新跑同一组回归。
 
 ### 阶段 2：拆出最小 VFS 对象层
 
@@ -310,30 +322,30 @@
 
 ### 阶段 2A：LoongArch 构建入口骨架
 
-- [x] 根 `Makefile` 新增 `kernel-la` 目标，但当前明确失败，不生成假的 LoongArch ELF。
-- [x] 根 `Makefile` 新增 `run-la` 目标，预留 `sdcard-la.img` 和可选 `disk-la.img` 的 QEMU 启动链路。
-- [x] `os/Makefile` 支持 `ARCH=loongarch64` 的 target/QEMU/virtio-pci 变量，并在 `kernel` 目标明确提示 runtime 未实现。
+- [x] 根 `Makefile` 新增 `kernel-la` 目标，并通过 `os/ ARCH=loongarch64` 构建根目录 `kernel-la`。
+- [x] 根 `Makefile` 新增 `run-la` 目标，当前只把 `sdcard-la.img` 作为 `PRIMARY_DISK` / `x0` 传给 `os/ run-inner`。
+- [x] `os/Makefile` 支持 `ARCH=loongarch64` 的 target/QEMU/virtio-pci 变量，并使用真实 `kernel` 构建入口。
 - [x] `user/Makefile` 对 `ARCH=loongarch64` 明确失败，说明用户态 syscall wrapper 属于阶段 5。
 - [x] `rust-toolchain.toml` 纳入 `loongarch64-unknown-none` target。
-- [x] 验证 `make kernel-la` / `make run-la` 不再是缺目标，而是明确停在 LoongArch runtime 未实现。
+- [x] 验证 `make kernel-la` / `make run-la` 不再是缺目标；后续仍需按测试场景验证 LoongArch 比赛运行能力。
 
 ### 阶段 2B：真正产出 `kernel-la`
 
-- [ ] 根 `make all` 同时产出 `kernel-rv` 和真实 `kernel-la`。
-- [ ] 新增 LoongArch linker script，不复用 RISC-V `linker-qemu.ld`。
-- [ ] `os/Makefile` 的 `ARCH=loongarch64 kernel` 从 fail-loudly 改为真实构建。
-- [ ] 将 LoongArch 所需 crate/toolchain 依赖纳入离线构建路径。
+- [x] 根 `make all` 同时产出 `kernel-rv` 和 `kernel-la`。
+- [x] 新增 LoongArch linker script，不复用 RISC-V `linker-qemu.ld`。
+- [x] `os/Makefile` 的 `ARCH=loongarch64 kernel` 已是真实构建。
+- [ ] 在官方 contest Docker 中复核 LoongArch 所需 crate/toolchain 依赖的离线构建路径。
 
 ### 阶段 3：LoongArch 最小内核可启动
 
-- [ ] 实现 `arch/loongarch64/entry`。
-- [ ] 实现 `arch/loongarch64/console`。
-- [ ] 实现 `arch/loongarch64/shutdown`。
-- [ ] 实现 `arch/loongarch64/time`。
-- [ ] 实现 `arch/loongarch64/trap`。
-- [ ] 实现 `arch/loongarch64/mm`。
-- [ ] 实现 `arch/loongarch64/context`。
-- [ ] 验证 QEMU LoongArch 能启动到内核日志，并能主动 shutdown。
+- [ ] 复核并补齐 `arch/loongarch64/entry` 的比赛运行路径。
+- [ ] 复核并补齐 `arch/loongarch64/console` 的串口输出/输入路径。
+- [ ] 复核并补齐 `arch/loongarch64/shutdown` 的关机路径。
+- [ ] 复核并补齐 `arch/loongarch64/time` 的定时器路径。
+- [ ] 复核并补齐 `arch/loongarch64/trap` 的异常、syscall 和返回路径。
+- [ ] 复核并补齐 `arch/loongarch64/mm` 的 DMW、TLB 和页表切换路径。
+- [ ] 复核并补齐 `arch/loongarch64/context` / `switch.S` 的上下文切换路径。
+- [ ] 验证 QEMU LoongArch 能稳定跑官方评测盘脚本，并能主动 shutdown。
 
 ### 阶段 4：LoongArch 设备与文件系统路径
 
@@ -359,7 +371,7 @@
 - [ ] `make all`。
 - [ ] `CARGO_NET_OFFLINE=true make all`。
 - [ ] `make run-rv` 不回退。
-- [ ] `make run-la` 或等价命令能启动 `sdcard-la.img`。
+- [ ] `make run-la` 或等价命令能启动 `sdcard-la.img` 并完成目标测试场景。
 - [ ] 官方 contest Docker 中验证 `kernel-rv`、`kernel-la` 产物名正确。
 
 ## 基础设施与研究记录

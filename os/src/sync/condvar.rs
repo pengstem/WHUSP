@@ -1,5 +1,5 @@
 use crate::sync::UPIntrFreeCell;
-use crate::task::{TaskContext, TaskControlBlock, block_current_task, current_task, wakeup_task};
+use crate::task::{TaskContext, TaskControlBlock, block_current_task_no_schedule, wakeup_task};
 use alloc::{collections::VecDeque, sync::Arc};
 
 pub struct Condvar {
@@ -29,9 +29,10 @@ impl Condvar {
     }
 
     pub fn wait_no_sched(&self) -> *mut TaskContext {
+        let (task, task_cx_ptr) = block_current_task_no_schedule();
         self.inner.exclusive_session(|inner| {
-            inner.wait_queue.push_back(current_task().unwrap());
+            inner.wait_queue.push_back(task);
         });
-        block_current_task()
+        task_cx_ptr
     }
 }

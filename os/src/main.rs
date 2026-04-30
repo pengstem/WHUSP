@@ -96,10 +96,10 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     fs::init();
     fs::list_apps();
     task::add_initproc();
-    // CONTEXT: Keep boot-time filesystem setup synchronous before the scheduler
-    // runs, then allow task-time block I/O to sleep behind the mount locks.
-    // CONTEXT: LoongArch PCI interrupt routing is not wired yet; keep block
-    // I/O polling there so the first test-disk path does not sleep forever.
+    // CONTEXT: Keep contest block I/O synchronous by default. RV can only
+    // re-enable nonblocking access after BusyBox/basic regressions pass with
+    // file-object lock boundaries, and LA must stay polling/sync until the
+    // virtio-pci external IRQ path is validated.
     *DEV_NON_BLOCKING_ACCESS.exclusive_access() = cfg!(not(target_arch = "loongarch64"));
     task::run_tasks();
     panic!("Unreachable in rust_main!");

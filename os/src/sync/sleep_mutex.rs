@@ -1,5 +1,7 @@
 use super::UPIntrFreeCell;
-use crate::task::{TaskControlBlock, block_current_and_run_next, current_task, wakeup_task};
+use crate::task::{
+    TaskContext, TaskControlBlock, block_current_task_no_schedule, schedule, wakeup_task,
+};
 use alloc::{collections::VecDeque, sync::Arc};
 use core::{
     cell::UnsafeCell,
@@ -39,11 +41,11 @@ impl<T> SleepMutex<T> {
     pub fn lock(&self) -> SleepMutexGuard<'_, T> {
         let mut inner = self.inner.exclusive_access();
         if inner.locked {
-            inner
-                .wait_queue
-                .push_back(current_task().expect("SleepMutex contention requires a current task"));
+            let (task, task_cx_ptr): (Arc<TaskControlBlock>, *mut TaskContext) =
+                block_current_task_no_schedule();
+            inner.wait_queue.push_back(task);
             drop(inner);
-            block_current_and_run_next();
+            schedule(task_cx_ptr);
         } else {
             inner.locked = true;
         }

@@ -81,11 +81,26 @@ pub fn suspend_current_and_run_next() {
 
 /// This function must be followed by a schedule
 pub fn block_current_task() -> *mut TaskContext {
+    let (_task, task_cx_ptr) = block_current_task_no_schedule();
+    task_cx_ptr
+}
+
+/// Mark the current task blocked and remove it from the processor without
+/// scheduling. The caller must either enqueue the task on a wait queue and then
+/// call `schedule`, or otherwise make it reachable for a later wakeup.
+///
+/// # Safety (logical)
+/// The returned `Arc` must remain alive (e.g. on a wait queue) until after
+/// `schedule(task_cx_ptr)` completes, because the pointer targets memory
+/// owned by the `TaskControlBlock`.
+pub fn block_current_task_no_schedule() -> (Arc<TaskControlBlock>, *mut TaskContext) {
     account_current_system_time();
     let task = take_current_task().unwrap();
     let mut task_inner = task.inner_exclusive_access();
     task_inner.task_status = TaskStatus::Blocked;
-    &mut task_inner.task_cx as *mut TaskContext
+    let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
+    drop(task_inner);
+    (task, task_cx_ptr)
 }
 
 pub fn block_current_and_run_next() {

@@ -6,7 +6,7 @@ use super::path::{
 };
 use super::{File, FileStat};
 use crate::mm::UserBuffer;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SleepMutex;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -16,13 +16,13 @@ pub struct OSInode {
     readable: bool,
     writable: bool,
     kind: FsNodeKind,
-    inner: UPIntrFreeCell<OSInodeInner>,
-}
-
-pub struct OSInodeInner {
-    offset: usize,
     mount_id: MountId,
     ino: u32,
+    state: SleepMutex<OSInodeState>,
+}
+
+pub struct OSInodeState {
+    offset: usize,
 }
 
 impl OSInode {
@@ -31,29 +31,25 @@ impl OSInode {
             readable,
             writable,
             kind,
-            inner: unsafe {
-                UPIntrFreeCell::new(OSInodeInner {
-                    offset: 0,
-                    mount_id,
-                    ino,
-                })
-            },
+            mount_id,
+            ino,
+            state: SleepMutex::new(OSInodeState { offset: 0 }),
         }
     }
 
     pub fn read_all(&self) -> Vec<u8> {
-        let mut inner = self.inner.exclusive_access();
-        let mut buffer = [0u8; 512];
+        let mut state = self.state.lock();
+        let mut buffer = [0u8; 4096];
         let mut data = Vec::new();
         loop {
-            let len = with_mount(inner.mount_id, |mount| {
-                mount.read_at(inner.ino, &mut buffer, inner.offset as u64)
+            let len = with_mount(self.mount_id, |mount| {
+                mount.read_at(self.ino, &mut buffer, state.offset as u64)
             })
             .expect("filesystem mount is missing");
             if len == 0 {
                 break;
             }
-            inner.offset += len;
+            state.offset += len;
             data.extend_from_slice(&buffer[..len]);
         }
         data
@@ -245,17 +241,17 @@ impl File for OSInode {
         if self.kind == FsNodeKind::Directory {
             return 0;
         }
-        let mut inner = self.inner.exclusive_access();
+        let mut state = self.state.lock();
         let mut total_read_size = 0usize;
         for slice in buf.buffers.iter_mut() {
-            let read_size = with_mount(inner.mount_id, |mount| {
-                mount.read_at(inner.ino, slice, inner.offset as u64)
+            let read_size = with_mount(self.mount_id, |mount| {
+                mount.read_at(self.ino, slice, state.offset as u64)
             })
             .expect("filesystem mount is missing");
             if read_size == 0 {
                 break;
             }
-            inner.offset += read_size;
+            state.offset += read_size;
             total_read_size += read_size;
         }
         total_read_size
@@ -265,14 +261,14 @@ impl File for OSInode {
         if self.kind == FsNodeKind::Directory {
             return 0;
         }
-        let mut inner = self.inner.exclusive_access();
+        let mut state = self.state.lock();
         let mut total_write_size = 0usize;
         for slice in buf.buffers.iter() {
-            let write_size = with_mount(inner.mount_id, |mount| {
-                mount.write_at(inner.ino, slice, inner.offset as u64)
+            let write_size = with_mount(self.mount_id, |mount| {
+                mount.write_at(self.ino, slice, state.offset as u64)
             })
             .expect("filesystem mount is missing");
-            inner.offset += write_size;
+            state.offset += write_size;
             total_write_size += write_size;
         }
         total_write_size
@@ -282,31 +278,30 @@ impl File for OSInode {
         if self.kind == FsNodeKind::Directory {
             return 0;
         }
-        let mut inner = self.inner.exclusive_access();
-        let Some(stat) = with_mount(inner.mount_id, |mount| mount.stat(inner.ino))
+        let mut state = self.state.lock();
+        let Some(stat) = with_mount(self.mount_id, |mount| mount.stat(self.ino))
             .expect("filesystem mount is missing")
         else {
             return 0;
         };
-        inner.offset = stat.size as usize;
+        state.offset = stat.size as usize;
         let mut total_write_size = 0usize;
         for slice in buf.buffers.iter() {
-            let write_size = with_mount(inner.mount_id, |mount| {
-                mount.write_at(inner.ino, slice, inner.offset as u64)
+            let write_size = with_mount(self.mount_id, |mount| {
+                mount.write_at(self.ino, slice, state.offset as u64)
             })
             .expect("filesystem mount is missing");
-            inner.offset += write_size;
+            state.offset += write_size;
             total_write_size += write_size;
         }
         total_write_size
     }
 
     fn stat(&self) -> FileStat {
-        let inner = self.inner.exclusive_access();
-        let mut stat = with_mount(inner.mount_id, |mount| mount.stat(inner.ino))
+        let mut stat = with_mount(self.mount_id, |mount| mount.stat(self.ino))
             .expect("filesystem mount is missing")
             .expect("inode stat failed");
-        stat.dev = inner.mount_id.0 as u64;
+        stat.dev = self.mount_id.0 as u64;
         stat
     }
 
@@ -314,9 +309,8 @@ impl File for OSInode {
         if self.kind == FsNodeKind::Directory {
             return 0;
         }
-        let inner = self.inner.exclusive_access();
-        with_mount(inner.mount_id, |mount| {
-            mount.read_at(inner.ino, buf, offset as u64)
+        with_mount(self.mount_id, |mount| {
+            mount.read_at(self.ino, buf, offset as u64)
         })
         .expect("filesystem mount is missing")
     }
@@ -325,9 +319,8 @@ impl File for OSInode {
         if self.kind == FsNodeKind::Directory {
             return 0;
         }
-        let inner = self.inner.exclusive_access();
-        with_mount(inner.mount_id, |mount| {
-            mount.write_at(inner.ino, buf, offset as u64)
+        with_mount(self.mount_id, |mount| {
+            mount.write_at(self.ino, buf, offset as u64)
         })
         .expect("filesystem mount is missing")
     }
@@ -336,10 +329,10 @@ impl File for OSInode {
         if self.kind != FsNodeKind::Directory {
             return -1;
         }
-        let mut inner = self.inner.exclusive_access();
+        let mut state = self.state.lock();
         let mut kernel_buf = vec![0u8; user_buf.len()];
-        let Some((read_size, next_offset)) = with_mount(inner.mount_id, |mount| {
-            mount.read_dirent64(inner.ino, inner.offset as u64, &mut kernel_buf)
+        let Some((read_size, next_offset)) = with_mount(self.mount_id, |mount| {
+            mount.read_dirent64(self.ino, state.offset as u64, &mut kernel_buf)
         })
         .expect("filesystem mount is missing") else {
             return -1;
@@ -353,7 +346,7 @@ impl File for OSInode {
                 *byte_ref = kernel_buf[idx];
             }
         }
-        inner.offset = next_offset as usize;
+        state.offset = next_offset as usize;
         read_size as isize
     }
 
@@ -361,7 +354,6 @@ impl File for OSInode {
         if self.kind != FsNodeKind::Directory {
             return None;
         }
-        let inner = self.inner.exclusive_access();
-        Some(WorkingDir::new(inner.mount_id, inner.ino))
+        Some(WorkingDir::new(self.mount_id, self.ino))
     }
 }
