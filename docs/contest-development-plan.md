@@ -126,6 +126,28 @@
 - [ ] 最小 `/dev/null` / devfs 尚未实现，影响 `netperf`、`iperf`、LTP 等 harness。
 - [ ] `sys_kill(129)` 仍把 Linux signum 当 bitflags 解析，需要按整数信号号修正。
 
+### 2026-04-30 测试刷新后新增缺口
+
+| 优先级 | Syscall / 功能 | 解锁测试 | 当前症状 | 修复方向 |
+|--------|---------------|----------|---------|---------|
+| 1 | 无 shebang 脚本 execve fallback | libctest-musl 整组 | `./run-static.sh: not found`（busybox fallback 到 `/bin/sh` 不存在） | `exec_loaded_program` 中对非 ELF 非 shebang 文件构造虚拟 `#!/bin/sh` 解释器，走已有 `busybox_fallback` 路径 |
+| 2 | `renameat2(276)` | busybox `mv` | `Function not implemented` (ENOSYS) | 在 ext4 层实现 rename 操作 |
+| 3 | `utimensat(88)` | busybox `touch` | `Function not implemented` (ENOSYS) | 在 VFS/ext4 层支持修改文件时间戳 |
+| 4 | `unlinkat(AT_REMOVEDIR)` / rmdir 语义 | busybox `rmdir` | 返回 `EINVAL` 而非成功 | 检查 `unlinkat` 的 `AT_REMOVEDIR` flag 分流到 ext4 rmdir |
+| 5 | `linkat(37)` | busybox `cp` | 返回 `EINVAL` | 检查 flags 解析或在 ext4 层实现硬链接 |
+| 6 | Lua FP/signal SIGSEGV | lua round_num, sin30 | `Segmentation Fault, SIGSEGV=11` | 调查 FPU 上下文保存/恢复或 mmap 边界问题 |
+| 7 | `kill(129)` 信号投递 | busybox `kill $!` | `Invalid argument` | 修正 signum 解析（整数 vs bitflags） |
+| 8 | `/proc` 文件系统 | busybox df/ps/free | `No such file or directory` | 实现 procfs 最小子集（/proc/mounts, /proc/meminfo, /proc/[pid]/stat） |
+
+### 2026-04-30 测试结果快照
+
+| 测试组 | 通过 | 失败 | 通过率 |
+|--------|------|------|--------|
+| basic-musl | 31/32 | 1 (mount) | 97% |
+| busybox-musl | 43/55 | 12 | 78% |
+| lua-musl | 7/9 | 2 (round_num, sin30) | 78% |
+| libctest-musl | 0 | blocked (无 shebang fallback) | 0% |
+
 ## P2.5 - cwd in PCB 收尾
 
 ### 已完成
