@@ -6,6 +6,10 @@ pub(super) const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 pub(super) const AT_NO_AUTOMOUNT: i32 = 0x800;
 pub(super) const AT_EMPTY_PATH: i32 = 0x1000;
 pub(super) const VALID_FSTATAT_FLAGS: i32 = AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH;
+pub(super) const RENAME_NOREPLACE: u32 = 1 << 0;
+pub(super) const RENAME_EXCHANGE: u32 = 1 << 1;
+pub(super) const RENAME_WHITEOUT: u32 = 1 << 2;
+pub(super) const VALID_RENAME_FLAGS: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
 
 pub(super) const IOV_MAX: usize = 1024;
 pub(super) const PPOLL_MAX_NFDS: usize = 4096;

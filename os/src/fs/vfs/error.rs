@@ -7,6 +7,7 @@ pub(crate) enum FsError {
     InvalidInput,
     NotEmpty,
     Busy,
+    CrossDevice,
     Io,
     NameTooLong,
     Loop,

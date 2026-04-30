@@ -152,6 +152,12 @@ impl FileSystemBackend for Ext4Mount {
             .map_err(map_ext4_error)
     }
 
+    fn rename(&mut self, src_dir: u32, src_name: &str, dst_dir: u32, dst_name: &str) -> FsResult {
+        self.fs
+            .rename(src_dir, src_name, dst_dir, dst_name)
+            .map_err(map_ext4_error)
+    }
+
     fn set_len(&mut self, ino: u32, len: u64) -> FsResult {
         self.fs.set_len(ino, len).map_err(map_ext4_error)
     }
