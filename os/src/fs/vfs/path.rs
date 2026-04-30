@@ -222,7 +222,12 @@ pub(crate) fn resolve_create_parent(
 ) -> FsResult<VfsCreateTarget<'_>> {
     let (parent_path, leaf_name) = split_parent_path(path)?;
     let parent_path = parent_path_for_lookup(path, parent_path);
-    let parent = resolve_existing(cwd, parent_path, LookupMode::Normal)?;
+    let parent = if parent_path.is_empty() {
+        let cursor = start_cursor(cwd, path);
+        follow_mounted_root(cursor).as_path()
+    } else {
+        resolve_existing(cwd, parent_path, LookupMode::Normal)?
+    };
     if parent.kind != FsNodeKind::Directory {
         return Err(FsError::NotDir);
     }
