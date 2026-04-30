@@ -114,7 +114,7 @@ fn copy_from_user(token: usize, ptr: *const u8, dst: &mut [u8]) -> SysResult<()>
     Ok(())
 }
 
-fn copy_to_user(token: usize, ptr: *mut u8, src: &[u8]) -> SysResult<()> {
+pub(super) fn copy_to_user(token: usize, ptr: *mut u8, src: &[u8]) -> SysResult<()> {
     let buffers = translated_byte_buffer_checked(
         token,
         ptr.cast_const(),

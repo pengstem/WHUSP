@@ -1,3 +1,11 @@
+use super::super::errno::{SysError, SysResult};
+use super::fd::get_file_by_fd;
+use super::uapi::{
+    AT_FDCWD, AT_REMOVEDIR, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, VALID_RENAME_FLAGS,
+};
+use super::user_ptr::{
+    PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, translated_byte_buffer_checked,
+};
 use crate::fs::{
     File, OpenFlags, WorkingDir, link_file_at, lookup_dir_at, mkdir_at, normalize_path,
     open_devfs_child, open_file_at, rename_at, rmdir_at, symlink_at, unlink_file_at,
@@ -5,15 +13,7 @@ use crate::fs::{
 use crate::mm::UserBuffer;
 use crate::task::{FdTableEntry, current_process, current_user_token};
 use alloc::sync::Arc;
-
-use super::super::errno::{SysError, SysResult};
-use super::fd::get_file_by_fd;
-use super::uapi::{
-    AT_FDCWD, AT_REMOVEDIR, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, VALID_RENAME_FLAGS,
-};
-use super::user_ptr::{
-    PATH_MAX, UserBufferAccess, read_user_c_string, translated_byte_buffer_checked,
-};
+use alloc::vec;
 
 pub(super) fn dirfd_base(dirfd: isize) -> SysResult<WorkingDir> {
     if dirfd == AT_FDCWD {
@@ -58,6 +58,21 @@ fn copy_c_string_to_user(ptr: *mut u8, buf_len: usize, string: &str) -> SysResul
         written += 1;
     }
     Ok(ptr as isize)
+}
+
+fn readlink_file_to_user(
+    file: Arc<dyn File + Send + Sync>,
+    buf: *mut u8,
+    bufsiz: usize,
+) -> SysResult {
+    // UNFINISHED: double-buffers through a kernel-side allocation; ideally
+    // the VFS readlink would accept a UserBuffer to write into user pages
+    // directly and avoid the extra copy.
+    let mut kernel_buf = vec![0u8; PATH_MAX];
+    let read_len = file.readlink(&mut kernel_buf)?;
+    let copy_len = read_len.min(bufsiz);
+    copy_to_user(current_user_token(), buf, &kernel_buf[..copy_len])?;
+    Ok(copy_len as isize)
 }
 
 fn install_open_file(file: Arc<dyn File + Send + Sync>, flags: OpenFlags) -> SysResult {
@@ -174,9 +189,31 @@ pub fn sys_symlinkat(target: *const u8, newdirfd: isize, linkpath: *const u8) ->
     }
     let base = path_base(newdirfd, linkpath.as_str())?;
     symlink_at(base, target.as_str(), linkpath.as_str())?;
-    // UNFINISHED: Linux path lookup follows symlink targets, and readlinkat()
-    // returns link contents. This syscall only creates real EXT4 symlink nodes.
+    // UNFINISHED: Linux path lookup follows symlink targets. This syscall only
+    // creates real EXT4 symlink nodes; path resolution remains partial.
     Ok(0)
+}
+
+pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize) -> SysResult {
+    if bufsiz == 0 {
+        return Err(SysError::EINVAL);
+    }
+
+    let token = current_user_token();
+    let path = read_user_c_string(token, path, PATH_MAX)?;
+    let file = if path.is_empty() {
+        if dirfd == AT_FDCWD {
+            return Err(SysError::ENOENT);
+        }
+        if dirfd < 0 {
+            return Err(SysError::EBADF);
+        }
+        get_file_by_fd(dirfd as usize)?
+    } else {
+        let base = path_base(dirfd, path.as_str())?;
+        open_file_at(base, path.as_str(), OpenFlags::PATH | OpenFlags::NOFOLLOW)?
+    };
+    readlink_file_to_user(file, buf, bufsiz)
 }
 
 pub fn sys_renameat2(

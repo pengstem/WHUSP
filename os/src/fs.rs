@@ -93,6 +93,9 @@ pub trait File: Send + Sync {
     fn read_dirent64(&self, _buf: UserBuffer) -> FsResult<isize> {
         Err(FsError::NotDir)
     }
+    fn readlink(&self, _buf: &mut [u8]) -> FsResult<usize> {
+        Err(FsError::InvalidInput)
+    }
     fn working_dir(&self) -> Option<WorkingDir> {
         None
     }

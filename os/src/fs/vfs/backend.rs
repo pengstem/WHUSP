@@ -25,6 +25,7 @@ pub(crate) trait FileSystemBackend: Send {
     fn rename(&mut self, src_dir: u32, src_name: &str, dst_dir: u32, dst_name: &str) -> FsResult;
     fn set_len(&mut self, ino: u32, len: u64) -> FsResult;
     fn stat(&mut self, ino: u32) -> FsResult<FileStat>;
+    fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize>;
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize;
     fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize;
     fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)>;

@@ -99,12 +99,15 @@ fn open_vfs_file_impl(
                 if flags.contains(OpenFlags::DIRECTORY) {
                     return Err(FsError::NotDir);
                 }
-                if path.kind == FsNodeKind::Symlink && flags.contains(OpenFlags::NOFOLLOW) {
-                    return Err(FsError::Loop);
-                }
                 if path.kind == FsNodeKind::Symlink {
-                    // UNFINISHED: Linux openat follows final symlinks unless O_NOFOLLOW
-                    // or O_PATH says otherwise. This VFS does not read symlink targets yet.
+                    if flags.contains(OpenFlags::NOFOLLOW) && !flags.contains(OpenFlags::PATH) {
+                        return Err(FsError::Loop);
+                    }
+                    // UNFINISHED: Linux openat follows final symlinks unless O_NOFOLLOW.
+                    // This VFS still leaves the symlink inode open for compatibility.
+                    // CONTEXT: readlinkat("", fd) needs an O_PATH|O_NOFOLLOW fd
+                    // that refers to the symlink itself; full O_PATH semantics are
+                    // intentionally deferred.
                 }
                 let (readable, writable) = flags.read_write();
                 if flags.contains(OpenFlags::TRUNC) && flags.writable_target() {
@@ -259,6 +262,16 @@ impl File for VfsFile {
         }
         *offset = next_offset as usize;
         Ok(read_size as isize)
+    }
+
+    fn readlink(&self, buf: &mut [u8]) -> FsResult<usize> {
+        if self.kind != FsNodeKind::Symlink {
+            return Err(FsError::InvalidInput);
+        }
+        with_mount(self.node.mount_id, |mount| {
+            mount.readlink(self.node.ino, buf)
+        })
+        .ok_or(FsError::Io)?
     }
 
     fn working_dir(&self) -> Option<WorkingDir> {

@@ -137,8 +137,8 @@ fn maybe_follow_symlink(
     if cursor.kind == FsNodeKind::Symlink {
         // UNFINISHED: Linux pathname lookup follows symlinks according to
         // LOOKUP_FOLLOW, O_NOFOLLOW, and final-vs-non-final component rules.
-        // The current EXT4 wrapper has no readlink path yet, so symlink nodes
-        // remain unresolved here.
+        // This VFS has readlink support for syscall compatibility, but symlink
+        // target traversal remains unresolved here.
     }
     Ok(cursor)
 }

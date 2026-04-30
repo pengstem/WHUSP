@@ -7,8 +7,8 @@ use bitflags::*;
 use lwext4_rust::ffi::EXT4_ROOT_INO;
 
 // UNFINISHED: Linux open/openat define additional status and creation flags
-// such as O_SYNC, O_DSYNC, O_PATH, O_TMPFILE, O_NOATIME, and O_ASYNC. This
-// kernel accepts only the flags represented below.
+// such as O_SYNC, O_DSYNC, O_TMPFILE, O_NOATIME, and O_ASYNC. This kernel
+// accepts only the flags represented below.
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct OpenFlags: u32 {
@@ -26,6 +26,7 @@ bitflags! {
         const DIRECTORY = 0o200000;
         const NOFOLLOW = 0o400000;
         const CLOEXEC = 0o2000000;
+        const PATH = 0o10000000;
     }
 }
 
@@ -35,6 +36,9 @@ impl OpenFlags {
         OpenFlags::APPEND.bits() | OpenFlags::NONBLOCK.bits() | OpenFlags::DIRECT.bits();
 
     pub fn read_write(&self) -> (bool, bool) {
+        if self.contains(Self::PATH) {
+            return (false, false);
+        }
         match self.bits() & Self::ACCESS_MODE_MASK {
             0 => (true, false),
             1 => (false, true),
@@ -44,6 +48,9 @@ impl OpenFlags {
     }
 
     pub fn writable_target(&self) -> bool {
+        if self.contains(Self::PATH) {
+            return false;
+        }
         matches!(self.bits() & Self::ACCESS_MODE_MASK, 1 | 2)
     }
 
@@ -53,7 +60,8 @@ impl OpenFlags {
 
     pub fn file_status_flags(flags: Self) -> Self {
         Self::from_bits_truncate(
-            flags.bits() & (Self::ACCESS_MODE_MASK | Self::FCNTL_MUTABLE_STATUS_MASK),
+            flags.bits()
+                & (Self::ACCESS_MODE_MASK | Self::PATH.bits() | Self::FCNTL_MUTABLE_STATUS_MASK),
         )
     }
 

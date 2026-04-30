@@ -208,6 +208,10 @@ impl FileSystemBackend for Ext4Mount {
         })
     }
 
+    fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
+        self.fs.read_at(ino, buf, 0).map_err(map_ext4_error)
+    }
+
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
         self.fs.read_at(ino, buf, offset).expect("ext4 read failed")
     }
