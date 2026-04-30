@@ -20,6 +20,7 @@ pub(crate) trait FileSystemBackend: Send {
     fn create_file(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult<u32>;
     fn create_dir(&mut self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32>;
     fn link(&mut self, parent_ino: u32, leaf_name: &str, child_ino: u32) -> FsResult;
+    fn symlink(&mut self, parent_ino: u32, leaf_name: &str, target: &[u8]) -> FsResult;
     fn unlink(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult;
     fn rename(&mut self, src_dir: u32, src_name: &str, dst_dir: u32, dst_name: &str) -> FsResult;
     fn set_len(&mut self, ino: u32, len: u64) -> FsResult;

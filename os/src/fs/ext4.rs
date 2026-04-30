@@ -64,6 +64,8 @@ const DT_UNKNOWN: u8 = 0;
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
+// lwext4_rust::ffi does not export ENAMETOOLONG; define it locally.
+const ENAMETOOLONG: u32 = 36;
 
 fn into_node_kind(kind: InodeType) -> FsNodeKind {
     match kind {
@@ -99,6 +101,7 @@ fn map_ext4_error(err: Ext4Error) -> FsError {
         EEXIST => FsError::AlreadyExists,
         EINVAL => FsError::InvalidInput,
         ENOTEMPTY => FsError::NotEmpty,
+        ENAMETOOLONG => FsError::NameTooLong,
         EIO => FsError::Io,
         ENOTSUP => FsError::Unsupported,
         _ => FsError::Io,
@@ -150,6 +153,20 @@ impl FileSystemBackend for Ext4Mount {
         self.fs
             .link(parent_ino, leaf_name, child_ino)
             .map_err(map_ext4_error)
+    }
+
+    fn symlink(&mut self, parent_ino: u32, leaf_name: &str, target: &[u8]) -> FsResult {
+        let ino = self
+            .fs
+            .create(parent_ino, leaf_name, InodeType::Symlink, 0o777)
+            .map_err(map_ext4_error)?;
+        match self.fs.set_symlink(ino, target).map_err(map_ext4_error) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let _ = self.fs.unlink(parent_ino, leaf_name);
+                Err(err)
+            }
+        }
     }
 
     fn unlink(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult {
