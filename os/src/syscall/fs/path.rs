@@ -1,6 +1,6 @@
 use crate::fs::{
     File, OpenFlags, WorkingDir, lookup_dir_at, mkdir_at, normalize_path, open_devfs_child,
-    open_file_at, rmdir_at, unlink_file_at,
+    open_file_at, rename_at, rmdir_at, unlink_file_at,
 };
 use crate::mm::UserBuffer;
 use crate::task::{FdTableEntry, current_process, current_user_token};
@@ -8,7 +8,9 @@ use alloc::sync::Arc;
 
 use super::super::errno::{SysError, SysResult};
 use super::fd::get_file_by_fd;
-use super::uapi::{AT_FDCWD, AT_REMOVEDIR};
+use super::uapi::{
+    AT_FDCWD, AT_REMOVEDIR, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, VALID_RENAME_FLAGS,
+};
 use super::user_ptr::{
     PATH_MAX, UserBufferAccess, read_user_c_string, translated_byte_buffer_checked,
 };
@@ -139,6 +141,42 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> SysResult {
     } else {
         unlink_file_at(base, path.as_str())?;
     }
+    Ok(0)
+}
+
+pub fn sys_renameat2(
+    olddirfd: isize,
+    oldpath: *const u8,
+    newdirfd: isize,
+    newpath: *const u8,
+    flags: u32,
+) -> SysResult {
+    if flags & !VALID_RENAME_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+    if flags & RENAME_EXCHANGE != 0 {
+        // UNFINISHED: Linux RENAME_EXCHANGE atomically swaps two existing pathnames.
+        // The current EXT4/VFS wrapper only supports one-way rename.
+        return Err(SysError::EINVAL);
+    }
+    if flags & RENAME_WHITEOUT != 0 {
+        // UNFINISHED: Linux RENAME_WHITEOUT creates an overlay/union whiteout
+        // device while renaming. This kernel has no overlay filesystem support.
+        return Err(SysError::EINVAL);
+    }
+
+    let token = current_user_token();
+    let oldpath = read_user_c_string(token, oldpath, PATH_MAX)?;
+    let newpath = read_user_c_string(token, newpath, PATH_MAX)?;
+    let old_base = path_base(olddirfd, oldpath.as_str())?;
+    let new_base = path_base(newdirfd, newpath.as_str())?;
+    rename_at(
+        old_base,
+        oldpath.as_str(),
+        new_base,
+        newpath.as_str(),
+        flags & RENAME_NOREPLACE != 0,
+    )?;
     Ok(0)
 }
 

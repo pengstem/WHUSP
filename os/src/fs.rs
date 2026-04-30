@@ -123,7 +123,7 @@ pub fn list_apps() {
 
 pub(crate) use devfs::{open_child as open_devfs_child, stat_child as stat_devfs_child};
 pub use inode::OpenFlags;
-pub(crate) use inode::{lookup_mount_target_dir_at, mkdir_at, rmdir_at, unlink_file_at};
+pub(crate) use inode::{lookup_mount_target_dir_at, mkdir_at, rename_at, rmdir_at, unlink_file_at};
 pub(crate) use mount::{MountError, mount_block_device_at, unmount_at};
 pub(crate) use path::{WorkingDir, normalize_path};
 pub use pipe::make_pipe;

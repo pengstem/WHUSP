@@ -4,6 +4,7 @@ use super::vfs::{
     FsError, FsNodeKind, FsResult, VfsNodeId, resolve_create_parent, resolve_mount_target,
 };
 use bitflags::*;
+use lwext4_rust::ffi::EXT4_ROOT_INO;
 
 // UNFINISHED: Linux open/openat define additional status and creation flags
 // such as O_SYNC, O_DSYNC, O_PATH, O_TMPFILE, O_NOATIME, and O_ASYNC. This
@@ -79,6 +80,53 @@ fn final_component(name: &str) -> Option<&str> {
     trimmed.rsplit('/').find(|component| !component.is_empty())
 }
 
+fn has_trailing_slash(name: &str) -> bool {
+    name.len() > 1 && name.ends_with('/')
+}
+
+fn validate_rename_path(name: &str) -> FsResult {
+    match final_component(name) {
+        None => Err(FsError::NotFound),
+        Some("/") => Err(FsError::Busy),
+        Some("." | "..") => Err(FsError::InvalidInput),
+        Some(_) => Ok(()),
+    }
+}
+
+fn lookup_node(parent: VfsNodeId, leaf_name: &str) -> FsResult<(VfsNodeId, FsNodeKind)> {
+    let (ino, kind) = with_mount(parent.mount_id, |mount| {
+        mount.lookup_component_from(parent.ino, leaf_name)
+    })
+    .ok_or(FsError::Io)??;
+    Ok((VfsNodeId::new(parent.mount_id, ino), kind))
+}
+
+// UNFINISHED: MAX_DEPTH is a defensive bound, not strict Linux semantics;
+// extremely deep but legitimate directory trees would be misreported as ELOOP.
+fn is_descendant_or_self(mut node: VfsNodeId, ancestor: VfsNodeId) -> FsResult<bool> {
+    const MAX_DEPTH: usize = 256;
+    if node.mount_id != ancestor.mount_id {
+        return Ok(false);
+    }
+    with_mount(node.mount_id, |mount| {
+        for _ in 0..MAX_DEPTH {
+            if node == ancestor {
+                return Ok(true);
+            }
+            if node.ino == EXT4_ROOT_INO {
+                return Ok(false);
+            }
+            let (parent_ino, kind) = mount.lookup_component_from(node.ino, "..")?;
+            if kind != FsNodeKind::Directory || parent_ino == node.ino {
+                return Err(FsError::Loop);
+            }
+            node = VfsNodeId::new(node.mount_id, parent_ino);
+        }
+        Err(FsError::Loop)
+    })
+    .ok_or(FsError::Io)?
+}
+
 pub(crate) fn lookup_mount_target_dir_at(cwd: WorkingDir, name: &str) -> FsResult<WorkingDir> {
     let file = resolve_mount_target(Some(cwd), name)?;
     if file.kind != FsNodeKind::Directory {
@@ -105,8 +153,79 @@ pub(crate) fn mkdir_at(cwd: WorkingDir, name: &str, mode: u32) -> FsResult {
     Ok(())
 }
 
+pub(crate) fn rename_at(
+    old_cwd: WorkingDir,
+    old_name: &str,
+    new_cwd: WorkingDir,
+    new_name: &str,
+    no_replace: bool,
+) -> FsResult {
+    validate_rename_path(old_name)?;
+    validate_rename_path(new_name)?;
+
+    let old_has_trailing_slash = has_trailing_slash(old_name);
+    let new_has_trailing_slash = has_trailing_slash(new_name);
+    let old_target = resolve_create_parent(Some(old_cwd), trimmed_nonroot_path(old_name))?;
+    let new_target = resolve_create_parent(Some(new_cwd), trimmed_nonroot_path(new_name))?;
+    if old_target.parent.mount_id != new_target.parent.mount_id {
+        return Err(FsError::CrossDevice);
+    }
+
+    let (old_node, old_kind) = lookup_node(old_target.parent, old_target.leaf_name)?;
+    if old_has_trailing_slash && old_kind != FsNodeKind::Directory {
+        return Err(FsError::NotDir);
+    }
+    if old_node.ino == EXT4_ROOT_INO || mounted_root_for(old_node).is_some() {
+        return Err(FsError::Busy);
+    }
+
+    match lookup_node(new_target.parent, new_target.leaf_name) {
+        Ok((new_node, new_kind)) => {
+            if new_has_trailing_slash && new_kind != FsNodeKind::Directory {
+                return Err(FsError::NotDir);
+            }
+            if no_replace {
+                return Err(FsError::AlreadyExists);
+            }
+            if old_node == new_node {
+                return Ok(());
+            }
+            if mounted_root_for(new_node).is_some() {
+                return Err(FsError::Busy);
+            }
+            if old_kind == FsNodeKind::Directory && new_kind != FsNodeKind::Directory {
+                return Err(FsError::NotDir);
+            }
+            if old_kind != FsNodeKind::Directory && new_kind == FsNodeKind::Directory {
+                return Err(FsError::IsDir);
+            }
+        }
+        Err(FsError::NotFound) => {
+            if new_has_trailing_slash {
+                return Err(FsError::NotFound);
+            }
+        }
+        Err(err) => return Err(err),
+    }
+
+    if old_kind == FsNodeKind::Directory && is_descendant_or_self(new_target.parent, old_node)? {
+        return Err(FsError::InvalidInput);
+    }
+
+    with_mount(old_target.parent.mount_id, |mount| {
+        mount.rename(
+            old_target.parent.ino,
+            old_target.leaf_name,
+            new_target.parent.ino,
+            new_target.leaf_name,
+        )
+    })
+    .ok_or(FsError::Io)??;
+    Ok(())
+}
+
 pub(crate) fn unlink_file_at(cwd: WorkingDir, name: &str) -> FsResult {
-    let has_trailing_slash = name.len() > 1 && name.ends_with('/');
+    let trailing_slash = has_trailing_slash(name);
     match final_component(name) {
         Some("." | ".." | "/") => return Err(FsError::IsDir),
         _ => {}
@@ -114,7 +233,7 @@ pub(crate) fn unlink_file_at(cwd: WorkingDir, name: &str) -> FsResult {
     let target = resolve_create_parent(Some(cwd), trimmed_nonroot_path(name))?;
     with_mount(target.parent.mount_id, |mount| {
         let (_, kind) = mount.lookup_component_from(target.parent.ino, target.leaf_name)?;
-        if has_trailing_slash && kind != FsNodeKind::Directory {
+        if trailing_slash && kind != FsNodeKind::Directory {
             return Err(FsError::NotDir);
         }
         if kind == FsNodeKind::Directory {
