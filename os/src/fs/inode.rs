@@ -1,7 +1,6 @@
-use super::ext4::FsNodeKind;
 use super::mount::with_mount;
 use super::path::WorkingDir;
-use super::vfs::{resolve_create_parent, resolve_mount_target};
+use super::vfs::{FsNodeKind, resolve_create_parent, resolve_mount_target};
 use bitflags::*;
 
 // TODO: add remaining Linux open flags as syscall coverage needs them.

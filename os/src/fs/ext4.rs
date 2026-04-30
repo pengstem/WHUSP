@@ -1,4 +1,5 @@
 use super::FileStat;
+use super::vfs::{FileSystemBackend, FsNodeKind};
 use crate::drivers::block::VirtIOBlock;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -61,14 +62,6 @@ const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FsNodeKind {
-    Directory,
-    RegularFile,
-    Symlink,
-    Other,
-}
-
 // TODO: i think we missed some types here
 fn into_node_kind(kind: InodeType) -> FsNodeKind {
     match kind {
@@ -105,8 +98,10 @@ impl Ext4Mount {
             fs: KernelExt4Fs::new(KernelDisk { dev: device }, EXT4_CONFIG)?,
         })
     }
+}
 
-    pub(super) fn lookup_component_from(
+impl FileSystemBackend for Ext4Mount {
+    fn lookup_component_from(
         &mut self,
         parent_ino: u32,
         component: &str,
@@ -116,33 +111,28 @@ impl Ext4Mount {
         Some((entry.ino(), into_node_kind(entry.inode_type())))
     }
 
-    pub(super) fn create_file(&mut self, parent_ino: u32, leaf_name: &str) -> Option<u32> {
+    fn create_file(&mut self, parent_ino: u32, leaf_name: &str) -> Option<u32> {
         self.fs
             .create(parent_ino, leaf_name, InodeType::RegularFile, 0o644)
             .ok()
     }
 
-    pub(super) fn create_dir(
-        &mut self,
-        parent_ino: u32,
-        leaf_name: &str,
-        mode: u32,
-    ) -> Option<u32> {
+    fn create_dir(&mut self, parent_ino: u32, leaf_name: &str, mode: u32) -> Option<u32> {
         self.fs
             .create(parent_ino, leaf_name, InodeType::Directory, mode)
             .ok()
     }
 
-    pub(super) fn unlink(&mut self, parent_ino: u32, leaf_name: &str) -> Option<()> {
+    fn unlink(&mut self, parent_ino: u32, leaf_name: &str) -> Option<()> {
         self.fs.unlink(parent_ino, leaf_name).ok()
     }
 
-    pub(super) fn set_len(&mut self, ino: u32, len: u64) -> Option<()> {
+    fn set_len(&mut self, ino: u32, len: u64) -> Option<()> {
         // TODO: ok() make the error messages lost
         self.fs.set_len(ino, len).ok()
     }
 
-    pub(super) fn stat(&mut self, ino: u32) -> Option<FileStat> {
+    fn stat(&mut self, ino: u32) -> Option<FileStat> {
         let mut attr = lwext4_rust::FileAttr::default();
         self.fs.get_attr(ino, &mut attr).ok()?;
         Some(FileStat {
@@ -165,22 +155,17 @@ impl Ext4Mount {
         })
     }
 
-    pub(super) fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
+    fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
         self.fs.read_at(ino, buf, offset).expect("ext4 read failed")
     }
 
-    pub(super) fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize {
+    fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize {
         self.fs
             .write_at(ino, buf, offset)
             .expect("ext4 write failed")
     }
 
-    pub(super) fn read_dirent64(
-        &mut self,
-        ino: u32,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> Option<(usize, u64)> {
+    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> Option<(usize, u64)> {
         let mut reader = self.fs.read_dir(ino, offset).ok()?;
         let mut written = 0usize;
         let mut next_offset = offset;
@@ -220,7 +205,7 @@ impl Ext4Mount {
         Some((written, next_offset))
     }
 
-    pub(super) fn list_root_names(&mut self) -> Vec<String> {
+    fn list_root_names(&mut self) -> Vec<String> {
         let mut names = Vec::new();
         let mut reader = self
             .fs
