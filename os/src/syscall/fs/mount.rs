@@ -52,6 +52,7 @@ fn mount_error_to_errno(error: MountError) -> SysError {
     match error {
         MountError::SourceMissing => SysError::ENODEV,
         MountError::InvalidFilesystem => SysError::EINVAL,
+        MountError::InvalidTarget => SysError::ENOENT,
         MountError::TargetBusy | MountError::StaticRoot => SysError::EBUSY,
         MountError::TargetNotMounted => SysError::EINVAL,
     }

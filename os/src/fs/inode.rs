@@ -1,8 +1,7 @@
 use super::ext4::FsNodeKind;
 use super::mount::with_mount;
-use super::path::{
-    ResolvedOpen, WorkingDir, resolve_mount_target, resolve_open_target, resolve_parent_target,
-};
+use super::path::WorkingDir;
+use super::vfs::{resolve_create_parent, resolve_mount_target};
 use bitflags::*;
 
 // TODO: add remaining Linux open flags as syscall coverage needs them.
@@ -61,35 +60,33 @@ impl OpenFlags {
 
 pub(crate) fn lookup_mount_target_dir_at(cwd: WorkingDir, name: &str) -> Option<WorkingDir> {
     let file = resolve_mount_target(Some(cwd), name)?;
-    (file.kind == FsNodeKind::Directory).then_some(WorkingDir::new(file.mount_id, file.ino))
+    (file.kind == FsNodeKind::Directory)
+        .then_some(WorkingDir::new(file.node.mount_id, file.node.ino))
 }
 
 pub(crate) fn mkdir_at(cwd: WorkingDir, name: &str, mode: u32) -> Option<()> {
-    if matches!(
-        resolve_open_target(Some(cwd), name, false, false),
-        Some(ResolvedOpen::Existing(_))
-    ) {
-        return None;
-    }
-    let target = resolve_parent_target(Some(cwd), name)?;
-    with_mount(target.mount_id, |mount| {
-        mount.create_dir(target.parent_ino, target.leaf_name, mode)
+    let target = resolve_create_parent(Some(cwd), name)?;
+    with_mount(target.parent.mount_id, |mount| {
+        if mount
+            .lookup_component_from(target.parent.ino, target.leaf_name)
+            .is_some()
+        {
+            return None;
+        }
+        mount.create_dir(target.parent.ino, target.leaf_name, mode)
     })
     .expect("filesystem mount is missing")?;
     Some(())
 }
 
 pub(crate) fn unlink_file_at(cwd: WorkingDir, name: &str) -> Option<()> {
-    let resolved = resolve_open_target(Some(cwd), name, false, false)?;
-    let ResolvedOpen::Existing(file) = resolved else {
-        return None;
-    };
-    if file.kind == FsNodeKind::Directory {
-        return None;
-    }
-    let target = resolve_parent_target(Some(cwd), name)?;
-    with_mount(target.mount_id, |mount| {
-        mount.unlink(target.parent_ino, target.leaf_name)
+    let target = resolve_create_parent(Some(cwd), name)?;
+    with_mount(target.parent.mount_id, |mount| {
+        let (_, kind) = mount.lookup_component_from(target.parent.ino, target.leaf_name)?;
+        if kind == FsNodeKind::Directory {
+            return None;
+        }
+        mount.unlink(target.parent.ino, target.leaf_name)
     })
     .expect("filesystem mount is missing")?;
     Some(())

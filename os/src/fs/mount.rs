@@ -1,5 +1,6 @@
 use super::ext4::{Ext4Mount, FsNodeKind};
 use super::path::WorkingDir;
+use super::vfs::VfsNodeId;
 use crate::drivers::block::BLOCK_DEVICES;
 use crate::sync::{SleepMutex, UPIntrFreeCell};
 use alloc::vec::Vec;
@@ -13,8 +14,8 @@ pub(crate) struct MountId(pub(crate) usize);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DynamicMount {
-    target_mount_id: MountId,
-    target_ino: u32,
+    target: VfsNodeId,
+    covered_parent: VfsNodeId,
     source_mount_id: MountId,
 }
 
@@ -22,6 +23,7 @@ struct DynamicMount {
 pub(crate) enum MountError {
     SourceMissing,
     InvalidFilesystem,
+    InvalidTarget,
     TargetBusy,
     TargetNotMounted,
     StaticRoot,
@@ -100,19 +102,45 @@ fn ensure_mount_open(mount_id: MountId) -> Result<(), MountError> {
     Ok(())
 }
 
-pub(super) fn mounted_root_for(mount_id: MountId, ino: u32) -> Option<MountId> {
+pub(super) fn mounted_root_for(target: VfsNodeId) -> Option<MountId> {
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         mounts
             .iter()
             .rev()
-            .find(|mount| mount.target_mount_id == mount_id && mount.target_ino == ino)
+            .find(|mount| mount.target == target)
             .map(|mount| mount.source_mount_id)
     })
 }
 
-// TODO: maybe we could skip this function
+pub(super) fn mounted_root_parent(source_mount_id: MountId) -> Option<VfsNodeId> {
+    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        // UNFINISHED: MountId currently names one opened block-device
+        // filesystem, not a distinct mount instance. If the same source is
+        // mounted at multiple targets, `..` from that source root follows the
+        // newest dynamic mount instead of a per-mount parent reference.
+        mounts
+            .iter()
+            .rev()
+            .find(|mount| mount.source_mount_id == source_mount_id)
+            .map(|mount| mount.covered_parent)
+    })
+}
+
 pub(super) fn primary_mount_id() -> MountId {
     MountId(0)
+}
+
+fn lookup_covered_parent(target: VfsNodeId) -> Result<VfsNodeId, MountError> {
+    let Some((parent_ino, kind)) = with_mount(target.mount_id, |mount| {
+        mount.lookup_component_from(target.ino, "..")
+    })
+    .flatten() else {
+        return Err(MountError::InvalidTarget);
+    };
+    if kind != FsNodeKind::Directory {
+        return Err(MountError::InvalidTarget);
+    }
+    Ok(VfsNodeId::new(target.mount_id, parent_ino))
 }
 
 pub(crate) fn mount_block_device_at(
@@ -120,30 +148,27 @@ pub(crate) fn mount_block_device_at(
     device_index: usize,
 ) -> Result<(), MountError> {
     let source_mount_id = MountId(device_index);
-    if target.ino() == EXT4_ROOT_INO {
+    let target = VfsNodeId::new(target.mount_id(), target.ino());
+    if target.ino == EXT4_ROOT_INO {
         return Err(MountError::StaticRoot);
     }
 
-    let target_is_busy = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
-        mounts.iter().any(|mount| {
-            mount.target_mount_id == target.mount_id() && mount.target_ino == target.ino()
-        })
-    });
+    let target_is_busy = DYNAMIC_MOUNTS
+        .exclusive_session(|mounts| mounts.iter().any(|mount| mount.target == target));
     if target_is_busy {
         return Err(MountError::TargetBusy);
     }
 
+    let covered_parent = lookup_covered_parent(target)?;
     ensure_mount_open(source_mount_id)?;
 
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
-        if mounts.iter().any(|mount| {
-            mount.target_mount_id == target.mount_id() && mount.target_ino == target.ino()
-        }) {
+        if mounts.iter().any(|mount| mount.target == target) {
             return Err(MountError::TargetBusy);
         }
         mounts.push(DynamicMount {
-            target_mount_id: target.mount_id(),
-            target_ino: target.ino(),
+            target,
+            covered_parent,
             source_mount_id,
         });
         Ok(())
@@ -151,10 +176,9 @@ pub(crate) fn mount_block_device_at(
 }
 
 pub(crate) fn unmount_at(target: WorkingDir) -> Result<(), MountError> {
+    let target = VfsNodeId::new(target.mount_id(), target.ino());
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
-        if let Some(index) = mounts.iter().rposition(|mount| {
-            mount.target_mount_id == target.mount_id() && mount.target_ino == target.ino()
-        }) {
+        if let Some(index) = mounts.iter().rposition(|mount| mount.target == target) {
             mounts.remove(index);
             Ok(())
         } else {

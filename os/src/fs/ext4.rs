@@ -65,6 +65,7 @@ const DT_LNK: u8 = 10;
 pub(crate) enum FsNodeKind {
     Directory,
     RegularFile,
+    Symlink,
     Other,
 }
 
@@ -73,6 +74,7 @@ fn into_node_kind(kind: InodeType) -> FsNodeKind {
     match kind {
         InodeType::Directory => FsNodeKind::Directory,
         InodeType::RegularFile => FsNodeKind::RegularFile,
+        InodeType::Symlink => FsNodeKind::Symlink,
         _ => FsNodeKind::Other,
     }
 }
