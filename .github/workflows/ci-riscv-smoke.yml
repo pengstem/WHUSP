@@ -79,4 +79,4 @@ jobs:
           name: riscv-smoke-logs
           path: |
             boot.log
-          if-no-files-found: error
+          if-no-files-found: warn

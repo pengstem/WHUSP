@@ -5,10 +5,5 @@ replace-with = "vendored-sources"
 git = "https://github.com/rcore-os/riscv"
 replace-with = "vendored-sources"
 
-[source."git+https://github.com/yfblock/lose-net-stack?rev=1a73a861bb9b"]
-git = "https://github.com/yfblock/lose-net-stack"
-rev = "1a73a861bb9b"
-replace-with = "vendored-sources"
-
 [source.vendored-sources]
 directory = "vendor/crates"
