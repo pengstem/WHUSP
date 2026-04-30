@@ -211,8 +211,19 @@ pub(crate) fn mount_block_device_at(
 
 pub(crate) fn unmount_at(target: WorkingDir) -> Result<(), MountError> {
     let target = VfsNodeId::new(target.mount_id(), target.ino());
+    if target.ino == EXT4_ROOT_INO && target.mount_id == primary_mount_id() {
+        return Err(MountError::StaticRoot);
+    }
+    let is_root_ino = target.ino == EXT4_ROOT_INO;
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
-        if let Some(index) = mounts.iter().rposition(|mount| mount.target == target) {
+        let index = if is_root_ino {
+            mounts
+                .iter()
+                .rposition(|mount| mount.source_mount_id == target.mount_id)
+        } else {
+            mounts.iter().rposition(|mount| mount.target == target)
+        };
+        if let Some(index) = index {
             mounts.remove(index);
             Ok(())
         } else {

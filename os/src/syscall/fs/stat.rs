@@ -1,12 +1,11 @@
 use crate::fs::{FileStat, WorkingDir, stat_at, stat_devfs_child};
-use crate::mm::translated_str;
 use crate::task::{current_process, current_user_token};
 
 use super::super::errno::{SysError, SysResult};
 use super::fd::get_file_by_fd;
 use super::path::dirfd_base;
 use super::uapi::{AT_EMPTY_PATH, AT_FDCWD, LinuxKstat, VALID_FSTATAT_FLAGS};
-use super::user_ptr::write_user_value;
+use super::user_ptr::{PATH_MAX, read_user_c_string, write_user_value};
 
 fn write_stat_to_user(token: usize, statbuf: *mut LinuxKstat, stat: FileStat) -> SysResult {
     write_user_value(token, statbuf, &stat.into())?;
@@ -48,7 +47,7 @@ pub fn sys_newfstatat(
     }
 
     let token = current_user_token();
-    let path = translated_str(token, pathname);
+    let path = read_user_c_string(token, pathname, PATH_MAX)?;
     if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
             return Err(SysError::ENOENT);

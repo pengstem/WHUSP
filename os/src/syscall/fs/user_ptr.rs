@@ -1,4 +1,5 @@
 use crate::mm::{PageTable, StepByOne, VirtAddr};
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::{MaybeUninit, size_of};
 
@@ -47,6 +48,42 @@ pub(super) fn translated_byte_buffer_checked(
         start = end_va.into();
     }
     Ok(buffers)
+}
+
+pub(super) const PATH_MAX: usize = 4096;
+
+pub(super) fn read_user_c_string(
+    token: usize,
+    ptr: *const u8,
+    max_len: usize,
+) -> SysResult<String> {
+    if ptr.is_null() {
+        return Err(SysError::EFAULT);
+    }
+
+    let mut string = String::with_capacity(64);
+    let mut offset = 0usize;
+    while offset < max_len {
+        let addr = (ptr as usize).checked_add(offset).ok_or(SysError::EFAULT)?;
+        let page_remaining = crate::config::PAGE_SIZE - (addr & (crate::config::PAGE_SIZE - 1));
+        let chunk_len = page_remaining.min(max_len - offset);
+        let buffers = translated_byte_buffer_checked(
+            token,
+            addr as *const u8,
+            chunk_len,
+            UserBufferAccess::Read,
+        )?;
+        for buffer in &buffers {
+            for &byte in buffer.iter() {
+                if byte == 0 {
+                    return Ok(string);
+                }
+                string.push(byte as char);
+            }
+        }
+        offset += chunk_len;
+    }
+    Err(SysError::ENAMETOOLONG)
 }
 
 pub(super) fn read_user_usize(token: usize, addr: usize) -> SysResult<usize> {

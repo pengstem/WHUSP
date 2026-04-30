@@ -1,35 +1,8 @@
-use alloc::string::String;
-
 use crate::fs::{MountError, lookup_mount_target_dir_at, mount_block_device_at, unmount_at};
 use crate::task::{current_process, current_user_token};
 
 use super::super::errno::{SysError, SysResult};
-use super::user_ptr::{UserBufferAccess, translated_byte_buffer_checked};
-
-const PATH_MAX: usize = 4096;
-
-fn read_user_c_string(token: usize, ptr: *const u8, max_len: usize) -> SysResult<String> {
-    if ptr.is_null() {
-        return Err(SysError::EFAULT);
-    }
-
-    let mut string = String::new();
-    for offset in 0..max_len {
-        let addr = (ptr as usize).checked_add(offset).ok_or(SysError::EFAULT)?;
-        let buffers =
-            translated_byte_buffer_checked(token, addr as *const u8, 1, UserBufferAccess::Read)?;
-        let byte = buffers
-            .first()
-            .and_then(|buffer| buffer.first())
-            .copied()
-            .ok_or(SysError::EFAULT)?;
-        if byte == 0 {
-            return Ok(string);
-        }
-        string.push(byte as char);
-    }
-    Err(SysError::ENAMETOOLONG)
-}
+use super::user_ptr::{PATH_MAX, read_user_c_string};
 
 fn parse_virtio_block_source(source: &str) -> SysResult<usize> {
     let Some(suffix) = source.strip_prefix("/dev/vd") else {

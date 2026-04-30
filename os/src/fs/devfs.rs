@@ -136,12 +136,15 @@ fn lookup_child(path: &str) -> Option<DevNode> {
     }
 }
 
-fn open_node(node: DevNode, flags: OpenFlags) -> Option<Arc<dyn File + Send + Sync>> {
+fn open_node(node: DevNode, flags: OpenFlags) -> FsResult<Arc<dyn File + Send + Sync>> {
+    if flags.contains(OpenFlags::CREATE | OpenFlags::EXCL) {
+        return Err(FsError::AlreadyExists);
+    }
     if node == DevNode::Root {
         if !flags.can_open_directory() {
-            return None;
+            return Err(FsError::IsDir);
         }
-        return Some(Arc::new(DevFsFile::new(
+        return Ok(Arc::new(DevFsFile::new(
             node,
             false,
             false,
@@ -149,10 +152,10 @@ fn open_node(node: DevNode, flags: OpenFlags) -> Option<Arc<dyn File + Send + Sy
         )));
     }
     if flags.contains(OpenFlags::DIRECTORY) {
-        return None;
+        return Err(FsError::NotDir);
     }
     let (readable, writable) = flags.read_write();
-    Some(Arc::new(DevFsFile::new(
+    Ok(Arc::new(DevFsFile::new(
         node,
         readable,
         writable,
@@ -160,15 +163,22 @@ fn open_node(node: DevNode, flags: OpenFlags) -> Option<Arc<dyn File + Send + Sy
     )))
 }
 
-pub(crate) fn open(path: &str, flags: OpenFlags) -> Option<Arc<dyn File + Send + Sync>> {
-    open_node(lookup_absolute(path)?, flags)
+pub(crate) fn open(path: &str, flags: OpenFlags) -> FsResult<Option<Arc<dyn File + Send + Sync>>> {
+    lookup_absolute(path)
+        .map(|node| open_node(node, flags))
+        .transpose()
 }
 
-pub(crate) fn open_child(path: &str, flags: OpenFlags) -> Option<Arc<dyn File + Send + Sync>> {
+pub(crate) fn open_child(
+    path: &str,
+    flags: OpenFlags,
+) -> FsResult<Option<Arc<dyn File + Send + Sync>>> {
     if path.contains('/') {
-        return None;
+        return Ok(None);
     }
-    open_node(lookup_child(path)?, flags)
+    lookup_child(path)
+        .map(|node| open_node(node, flags))
+        .transpose()
 }
 
 fn stat_node(node: DevNode) -> FileStat {
