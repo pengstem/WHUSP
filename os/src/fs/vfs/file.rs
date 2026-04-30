@@ -5,7 +5,7 @@ use super::super::mount::with_mount;
 use super::super::path::WorkingDir;
 use super::super::status_flags::StatusFlagsCell;
 use super::super::{File, FileStat};
-use super::path::{self as vfs_path, VfsOpenTarget};
+use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
 use super::{VfsNodeId, VfsPath};
 use crate::mm::UserBuffer;
 use crate::sync::SleepMutex;
@@ -83,12 +83,7 @@ fn open_vfs_file_impl(
     name: &str,
     flags: OpenFlags,
 ) -> Option<Arc<VfsFile>> {
-    let resolved = vfs_path::resolve_open(
-        cwd,
-        name,
-        flags.writable_target() || flags.contains(OpenFlags::TRUNC),
-        flags.contains(OpenFlags::CREATE),
-    )?;
+    let resolved = vfs_path::resolve_open(cwd, name, flags.contains(OpenFlags::CREATE))?;
 
     let (path, readable, writable) = match resolved {
         VfsOpenTarget::Existing(path) => {
@@ -150,7 +145,7 @@ pub(crate) fn stat_at(cwd: WorkingDir, name: &str) -> Option<FileStat> {
     if let Some(stat) = devfs::stat(name) {
         return Some(stat);
     }
-    let path = vfs_path::resolve_existing(Some(cwd), name)?;
+    let path = vfs_path::resolve_existing(Some(cwd), name, LookupMode::Normal)?;
     let mut stat = with_mount(path.node.mount_id, |mount| mount.stat(path.node.ino))
         .expect("filesystem mount is missing")?;
     stat.dev = path.node.mount_id.0 as u64;
@@ -158,7 +153,7 @@ pub(crate) fn stat_at(cwd: WorkingDir, name: &str) -> Option<FileStat> {
 }
 
 pub(crate) fn lookup_dir_at(cwd: WorkingDir, name: &str) -> Option<WorkingDir> {
-    vfs_path::resolve_existing(Some(cwd), name)?.working_dir()
+    vfs_path::resolve_existing(Some(cwd), name, LookupMode::Normal)?.working_dir()
 }
 
 impl File for VfsFile {

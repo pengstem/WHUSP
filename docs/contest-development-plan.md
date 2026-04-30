@@ -222,7 +222,9 @@
 
 ### 阶段 5：补 Linux VFS 关键语义
 
+- [ ] 建立 VFS/FS 错误传播模型：将 pathname/create/unlink/rmdir 等接口从 `Option` 折叠错误逐步迁到 `Result<_, FsError>` 或等价类型，并在 syscall 边界统一映射为 Linux `errno`。
 - [ ] 完善 `openat`。
+- [ ] 完善 `mkdirat/unlinkat/rmdir` 的 Linux errno：区分 `EEXIST`、`ENOENT`、`ENOTDIR`、`EISDIR`、`EINVAL`、`ENOTEMPTY`、`EBUSY`、`EIO` 等场景，并补齐 `unlinkat(AT_REMOVEDIR)` 到 rmdir 语义的分流。
 - [ ] 完善 `newfstatat/fstat/lstat`。
 - [ ] 完善 `getdents64`。
 - [ ] 完善 `renameat2/linkat/symlinkat/readlinkat/faccessat/fchdir`。
