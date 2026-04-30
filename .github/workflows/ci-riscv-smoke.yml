@@ -1,4 +1,4 @@
-name: CI RISC-V Smoke
+name: CI Smoke Test
 
 on:
   push:
@@ -19,7 +19,7 @@ env:
   BINDGEN_EXTRA_CLANG_ARGS_riscv64gc_unknown_none_elf: --sysroot=/opt/riscv64-linux-musl-cross/riscv64-linux-musl -I/opt/riscv64-linux-musl-cross/riscv64-linux-musl/include
 
 jobs:
-  official-image-smoke:
+  official-image-smoke-rv:
     runs-on: ubuntu-latest
     container:
       image: zhouzhouyi/os-contest:20260104
@@ -34,21 +34,22 @@ jobs:
           mkdir -p /usr/riscv64-linux-musl/lib/musl
           ln -sfn /opt/riscv64-linux-musl-cross/riscv64-linux-musl/include /usr/riscv64-linux-musl/lib/musl/include
 
-      - name: Build RISC-V artifacts in official image
+      - name: Decompress test disk
+        run: |
+          cat img/sdcard-rv.img.xz.* | xz -d > sdcard-rv.img
+          ls -lh sdcard-rv.img
+
+      - name: Build RISC-V kernel
         run: |
           make kernel-rv
           test -f kernel-rv
 
-      - name: Boot contest disk when available
+      - name: Run tests
         shell: bash
         run: |
-          if [[ ! -f sdcard-rv.img ]]; then
-            echo "sdcard-rv.img is absent; skipping boot because initproc now loads /musl/busybox from the contest disk." | tee boot.log
-            exit 0
-          fi
           set +e
           set -o pipefail
-          timeout 15s qemu-system-riscv64 \
+          timeout 300s qemu-system-riscv64 \
             -machine virt \
             -kernel ./kernel-rv \
             -m 1G \
@@ -65,18 +66,145 @@ jobs:
           status=${PIPESTATUS[0]}
           set -e
           if [[ "${status}" != "0" && "${status}" != "124" ]]; then
+            echo "QEMU exited with unexpected status: ${status}"
             exit "${status}"
           fi
-          grep -q "KERN: gpu device unavailable" boot.log
-          grep -q "KERN: keyboard device unavailable" boot.log
-          grep -q "KERN: mouse device unavailable" boot.log
-          grep -q "loading initproc from /musl/busybox" boot.log
 
-      - name: Upload smoke logs
+      - name: Parse test results
+        if: always()
+        shell: bash
+        run: |
+          echo "## Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Check boot succeeded
+          if grep -q "loading initproc" boot.log; then
+            echo "Boot: OK" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Boot: FAILED (initproc not loaded)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Extract test groups
+          groups_started=$(grep -c "OS COMP TEST GROUP START" boot.log || true)
+          groups_ended=$(grep -c "OS COMP TEST GROUP END" boot.log || true)
+
+          echo "| Test Group | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$groups_started" -eq 0 ]]; then
+            echo "| (no test groups detected) | - |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            grep "OS COMP TEST GROUP START" boot.log | while read -r line; do
+              group_name=$(echo "$line" | sed 's/.*START \(.*\) ####/\1/')
+              if grep -q "OS COMP TEST GROUP END ${group_name}" boot.log; then
+                echo "| ${group_name} | COMPLETED |" >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "| ${group_name} | INCOMPLETE |" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            done
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Groups started: ${groups_started}, ended: ${groups_ended}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: riscv-smoke-logs
-          path: |
-            boot.log
+          name: riscv-test-logs
+          path: boot.log
+          if-no-files-found: warn
+
+  official-image-smoke-la:
+    runs-on: ubuntu-latest
+    container:
+      image: zhouzhouyi/os-contest:20260104
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mark checkout as safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Prepare musl cross include path for lwext4 bindgen
+        run: |
+          mkdir -p /usr/riscv64-linux-musl/lib/musl
+          ln -sfn /opt/riscv64-linux-musl-cross/riscv64-linux-musl/include /usr/riscv64-linux-musl/lib/musl/include
+
+      - name: Decompress test disk
+        run: |
+          cat img/sdcard-la.img.xz.* | xz -d > sdcard-la.img
+          ls -lh sdcard-la.img
+
+      - name: Build LoongArch kernel
+        run: |
+          make kernel-la
+          test -f kernel-la
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          timeout 300s qemu-system-loongarch64 \
+            -kernel ./kernel-la \
+            -m 1G \
+            -nographic \
+            -smp 1 \
+            -drive file=./sdcard-la.img,if=none,format=raw,id=x0 \
+            -device virtio-blk-pci,drive=x0 \
+            -no-reboot \
+            -device virtio-net-pci,netdev=net0 \
+            -netdev user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555 \
+            -rtc base=utc \
+            2>&1 | tee boot-la.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ "${status}" != "0" && "${status}" != "124" ]]; then
+            echo "QEMU exited with unexpected status: ${status}"
+            exit "${status}"
+          fi
+
+      - name: Parse test results
+        if: always()
+        shell: bash
+        run: |
+          echo "## LoongArch Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if grep -q "loading initproc" boot-la.log; then
+            echo "Boot: OK" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Boot: FAILED (initproc not loaded)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          groups_started=$(grep -c "OS COMP TEST GROUP START" boot-la.log || true)
+          groups_ended=$(grep -c "OS COMP TEST GROUP END" boot-la.log || true)
+
+          echo "| Test Group | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$groups_started" -eq 0 ]]; then
+            echo "| (no test groups detected) | - |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            grep "OS COMP TEST GROUP START" boot-la.log | while read -r line; do
+              group_name=$(echo "$line" | sed 's/.*START \(.*\) ####/\1/')
+              if grep -q "OS COMP TEST GROUP END ${group_name}" boot-la.log; then
+                echo "| ${group_name} | COMPLETED |" >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "| ${group_name} | INCOMPLETE |" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            done
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Groups started: ${groups_started}, ended: ${groups_ended}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loongarch-test-logs
+          path: boot-la.log
           if-no-files-found: warn

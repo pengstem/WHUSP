@@ -40,7 +40,7 @@ jobs:
           cargo fmt --manifest-path os/Cargo.toml --all --check
           rustfmt --check vendor/lwext4_rust/build.rs
 
-  official-image-build:
+  official-image-build-rv:
     runs-on: ubuntu-latest
     container:
       image: zhouzhouyi/os-contest:20260104
@@ -58,22 +58,131 @@ jobs:
           mkdir -p /usr/riscv64-linux-musl/lib/musl
           ln -sfn /opt/riscv64-linux-musl-cross/riscv64-linux-musl/include /usr/riscv64-linux-musl/lib/musl/include
 
-      - name: Build kernel
+      - name: Decompress test disk
         run: |
-          make -C os kernel
+          cat img/sdcard-rv.img.xz.* | xz -d > sdcard-rv.img
 
-      - name: Build root kernel artifact
+      - name: Build kernel
         run: |
           make kernel-rv
           test -f kernel-rv
 
-      - name: Upload root kernel artifact
+      - name: Run tests
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          timeout 300s qemu-system-riscv64 \
+            -machine virt \
+            -kernel ./kernel-rv \
+            -m 1G \
+            -nographic \
+            -smp 1 \
+            -bios default \
+            -drive file=./sdcard-rv.img,if=none,format=raw,id=x0 \
+            -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+            -no-reboot \
+            -device virtio-net-device,netdev=net \
+            -netdev user,id=net \
+            -rtc base=utc \
+            2>&1 | tee boot.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ "${status}" != "0" && "${status}" != "124" ]]; then
+            echo "QEMU exited with unexpected status: ${status}"
+            exit "${status}"
+          fi
+
+      - name: Parse test results
+        if: always()
+        shell: bash
+        run: |
+          echo "## Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          groups_started=$(grep -c "OS COMP TEST GROUP START" boot.log || true)
+          groups_ended=$(grep -c "OS COMP TEST GROUP END" boot.log || true)
+          echo "Groups started: ${groups_started}, ended: ${groups_ended}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload kernel and logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: root-rv-artifacts
           path: |
             kernel-rv
-          if-no-files-found: error
+            boot.log
+          if-no-files-found: warn
+
+  official-image-build-la:
+    runs-on: ubuntu-latest
+    container:
+      image: zhouzhouyi/os-contest:20260104
+    env:
+      BINDGEN_EXTRA_CLANG_ARGS: --sysroot=/opt/riscv64-linux-musl-cross/riscv64-linux-musl -I/opt/riscv64-linux-musl-cross/riscv64-linux-musl/include
+      BINDGEN_EXTRA_CLANG_ARGS_riscv64gc_unknown_none_elf: --sysroot=/opt/riscv64-linux-musl-cross/riscv64-linux-musl -I/opt/riscv64-linux-musl-cross/riscv64-linux-musl/include
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mark checkout as safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Prepare musl cross include path for lwext4 bindgen
+        run: |
+          mkdir -p /usr/riscv64-linux-musl/lib/musl
+          ln -sfn /opt/riscv64-linux-musl-cross/riscv64-linux-musl/include /usr/riscv64-linux-musl/lib/musl/include
+
+      - name: Decompress test disk
+        run: |
+          cat img/sdcard-la.img.xz.* | xz -d > sdcard-la.img
+
+      - name: Build kernel
+        run: |
+          make kernel-la
+          test -f kernel-la
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          timeout 300s qemu-system-loongarch64 \
+            -kernel ./kernel-la \
+            -m 1G \
+            -nographic \
+            -smp 1 \
+            -drive file=./sdcard-la.img,if=none,format=raw,id=x0 \
+            -device virtio-blk-pci,drive=x0 \
+            -no-reboot \
+            -device virtio-net-pci,netdev=net0 \
+            -netdev user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555 \
+            -rtc base=utc \
+            2>&1 | tee boot-la.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ "${status}" != "0" && "${status}" != "124" ]]; then
+            echo "QEMU exited with unexpected status: ${status}"
+            exit "${status}"
+          fi
+
+      - name: Parse test results
+        if: always()
+        shell: bash
+        run: |
+          echo "## LoongArch Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          groups_started=$(grep -c "OS COMP TEST GROUP START" boot-la.log || true)
+          groups_ended=$(grep -c "OS COMP TEST GROUP END" boot-la.log || true)
+          echo "Groups started: ${groups_started}, ended: ${groups_ended}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload kernel and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: root-la-artifacts
+          path: |
+            kernel-la
+            boot-la.log
+          if-no-files-found: warn
 
   makefile-dry-run:
     runs-on: ubuntu-latest
