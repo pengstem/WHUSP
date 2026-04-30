@@ -1,8 +1,10 @@
-use super::ext4::{Ext4Mount, FsNodeKind};
+use super::ext4::Ext4Mount;
 use super::path::WorkingDir;
-use super::vfs::VfsNodeId;
+use super::vfs::{FileSystemBackend, FsNodeKind, VfsNodeId};
 use crate::drivers::block::BLOCK_DEVICES;
 use crate::sync::{SleepMutex, UPIntrFreeCell};
+use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::{format, string::String};
 use lazy_static::*;
@@ -19,6 +21,15 @@ struct DynamicMount {
     source_mount_id: MountId,
 }
 
+struct MountedFs {
+    backend: SleepMutex<Box<dyn FileSystemBackend>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackendKind {
+    Ext4,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MountError {
     SourceMissing,
@@ -30,7 +41,7 @@ pub(crate) enum MountError {
 }
 
 lazy_static! {
-    static ref MOUNTS: Vec<SleepMutex<Option<Ext4Mount>>> = BLOCK_DEVICES
+    static ref MOUNTS: Vec<SleepMutex<Option<Arc<MountedFs>>>> = BLOCK_DEVICES
         .iter()
         .map(|_| SleepMutex::new(None))
         .collect();
@@ -56,18 +67,46 @@ pub fn init_mounts() {
         .first()
         .expect("DTB is missing a block device")
         .clone();
-    let primary_mount =
-        Ext4Mount::open(primary_device).expect("failed to mount primary ext4 filesystem");
+    let primary_mount = open_backend(BackendKind::Ext4, primary_device)
+        .expect("failed to mount primary ext4 filesystem");
     *MOUNTS[0].lock() = Some(primary_mount);
 
     mount_extra_block_devices();
 }
 
-pub(super) fn with_mount<V>(mount_id: MountId, f: impl FnOnce(&mut Ext4Mount) -> V) -> Option<V> {
-    MOUNTS.get(mount_id.0).and_then(|slot| {
-        let mut mount = slot.lock();
-        mount.as_mut().map(f)
-    })
+impl MountedFs {
+    fn new(backend: Box<dyn FileSystemBackend>) -> Arc<Self> {
+        Arc::new(Self {
+            backend: SleepMutex::new(backend),
+        })
+    }
+}
+
+fn open_backend(
+    kind: BackendKind,
+    device: Arc<crate::drivers::block::VirtIOBlock>,
+) -> Result<Arc<MountedFs>, MountError> {
+    match kind {
+        BackendKind::Ext4 => Ext4Mount::open(device)
+            .map(|mount| MountedFs::new(Box::new(mount)))
+            .map_err(|err| {
+                warn!("ext4 open failed: {:?}", err);
+                MountError::InvalidFilesystem
+            }),
+    }
+}
+
+pub(super) fn with_mount<V>(
+    mount_id: MountId,
+    f: impl FnOnce(&mut dyn FileSystemBackend) -> V,
+) -> Option<V> {
+    let mounted = {
+        let slot = MOUNTS.get(mount_id.0)?;
+        let guard = slot.lock();
+        guard.as_ref().cloned()
+    }?;
+    let mut backend = mounted.backend.lock();
+    Some(f(&mut **backend))
 }
 
 pub(super) fn mount_exists(mount_id: MountId) -> bool {
@@ -86,19 +125,15 @@ fn ensure_mount_open(mount_id: MountId) -> Result<(), MountError> {
         .ok_or(MountError::SourceMissing)?
         .clone();
 
-    let mut slot = slot.lock();
-    if slot.is_some() {
+    if slot.lock().is_some() {
         return Ok(());
     }
 
-    let mount = Ext4Mount::open(device).map_err(|err| {
-        warn!(
-            "failed to open ext4 filesystem on BLOCK_DEVICES[{}]: {:?}",
-            mount_id.0, err
-        );
-        MountError::InvalidFilesystem
-    })?;
-    *slot = Some(mount);
+    let mount = open_backend(BackendKind::Ext4, device)?;
+    let mut guard = slot.lock();
+    if guard.is_none() {
+        *guard = Some(mount);
+    }
     Ok(())
 }
 

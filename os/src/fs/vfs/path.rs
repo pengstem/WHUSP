@@ -1,7 +1,6 @@
-use super::super::ext4::FsNodeKind;
 use super::super::mount::{mounted_root_for, mounted_root_parent, primary_mount_id, with_mount};
 use super::super::path::WorkingDir;
-use super::VfsNodeId;
+use super::{FsNodeKind, VfsNodeId};
 use lwext4_rust::ffi::EXT4_ROOT_INO;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

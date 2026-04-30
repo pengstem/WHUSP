@@ -1,12 +1,11 @@
 use super::super::devfs;
-use super::super::ext4::FsNodeKind;
 use super::super::inode::OpenFlags;
 use super::super::mount::with_mount;
 use super::super::path::WorkingDir;
 use super::super::status_flags::StatusFlagsCell;
 use super::super::{File, FileStat};
 use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
-use super::{VfsNodeId, VfsPath};
+use super::{FsNodeKind, VfsNodeId, VfsPath};
 use crate::mm::UserBuffer;
 use crate::sync::SleepMutex;
 use alloc::sync::Arc;
