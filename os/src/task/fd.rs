@@ -1,5 +1,4 @@
 use crate::fs::{File, OpenFlags};
-use crate::sync::UPIntrFreeCell;
 use alloc::sync::Arc;
 use bitflags::bitflags;
 
@@ -12,14 +11,9 @@ bitflags! {
     }
 }
 
-pub struct FileDescription {
-    file: Arc<dyn File + Send + Sync>,
-    status_flags: UPIntrFreeCell<OpenFlags>,
-}
-
 #[derive(Clone)]
 pub struct FdTableEntry {
-    description: Arc<FileDescription>,
+    file: Arc<dyn File + Send + Sync>,
     fd_flags: FdFlags,
 }
 
@@ -30,32 +24,23 @@ impl FdTableEntry {
         } else {
             FdFlags::empty()
         };
-        Self::new(file, OpenFlags::file_status_flags(open_flags), fd_flags)
+        file.set_status_flags(OpenFlags::file_status_flags(open_flags));
+        Self::new(file, fd_flags)
     }
 
-    pub fn new(
-        file: Arc<dyn File + Send + Sync>,
-        status_flags: OpenFlags,
-        fd_flags: FdFlags,
-    ) -> Self {
-        Self {
-            description: Arc::new(FileDescription {
-                file,
-                status_flags: unsafe { UPIntrFreeCell::new(status_flags) },
-            }),
-            fd_flags,
-        }
+    pub fn new(file: Arc<dyn File + Send + Sync>, fd_flags: FdFlags) -> Self {
+        Self { file, fd_flags }
     }
 
     pub fn duplicate(&self, fd_flags: FdFlags) -> Self {
         Self {
-            description: Arc::clone(&self.description),
+            file: Arc::clone(&self.file),
             fd_flags,
         }
     }
 
     pub fn file(&self) -> Arc<dyn File + Send + Sync> {
-        Arc::clone(&self.description.file)
+        Arc::clone(&self.file)
     }
 
     pub fn fd_flags(&self) -> FdFlags {
@@ -67,11 +52,11 @@ impl FdTableEntry {
     }
 
     pub fn status_flags(&self) -> OpenFlags {
-        *self.description.status_flags.exclusive_access()
+        self.file.status_flags()
     }
 
     pub fn set_status_flags(&self, flags: OpenFlags) {
-        *self.description.status_flags.exclusive_access() = flags;
+        self.file.set_status_flags(flags);
     }
 
     pub fn close_on_exec(&self) -> bool {

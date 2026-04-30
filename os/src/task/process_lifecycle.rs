@@ -65,9 +65,18 @@ impl ProcessControlBlock {
                     children: Vec::new(),
                     exit_code: 0,
                     fd_table: vec![
-                        Some(FdTableEntry::from_file(Arc::new(Stdin), OpenFlags::RDONLY)),
-                        Some(FdTableEntry::from_file(Arc::new(Stdout), OpenFlags::WRONLY)),
-                        Some(FdTableEntry::from_file(Arc::new(Stdout), OpenFlags::WRONLY)),
+                        Some(FdTableEntry::from_file(
+                            Arc::new(Stdin::new()),
+                            OpenFlags::RDONLY,
+                        )),
+                        Some(FdTableEntry::from_file(
+                            Arc::new(Stdout::new()),
+                            OpenFlags::WRONLY,
+                        )),
+                        Some(FdTableEntry::from_file(
+                            Arc::new(Stdout::new()),
+                            OpenFlags::WRONLY,
+                        )),
                     ],
                     signals: SignalFlags::empty(),
                     cpu_times: ProcessCpuTimes::default(),

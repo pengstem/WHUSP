@@ -1,10 +1,32 @@
-use super::{File, FileStat, PollEvents, S_IFCHR};
+use super::status_flags::StatusFlagsCell;
+use super::{File, FileStat, OpenFlags, PollEvents, S_IFCHR};
 use crate::drivers::chardev::CharDevice;
 use crate::drivers::chardev::UART;
 use crate::mm::UserBuffer;
 
-pub struct Stdin;
-pub struct Stdout;
+pub struct Stdin {
+    status_flags: StatusFlagsCell,
+}
+
+pub struct Stdout {
+    status_flags: StatusFlagsCell,
+}
+
+impl Stdin {
+    pub fn new() -> Self {
+        Self {
+            status_flags: StatusFlagsCell::new(OpenFlags::RDONLY),
+        }
+    }
+}
+
+impl Stdout {
+    pub fn new() -> Self {
+        Self {
+            status_flags: StatusFlagsCell::new(OpenFlags::WRONLY),
+        }
+    }
+}
 
 impl File for Stdin {
     fn readable(&self) -> bool {
@@ -55,6 +77,12 @@ impl File for Stdin {
     fn stat(&self) -> FileStat {
         FileStat::with_mode(S_IFCHR | 0o666)
     }
+    fn status_flags(&self) -> OpenFlags {
+        self.status_flags.get()
+    }
+    fn set_status_flags(&self, flags: OpenFlags) {
+        self.status_flags.set(flags);
+    }
     fn is_tty(&self) -> bool {
         true
     }
@@ -85,6 +113,12 @@ impl File for Stdout {
     }
     fn stat(&self) -> FileStat {
         FileStat::with_mode(S_IFCHR | 0o666)
+    }
+    fn status_flags(&self) -> OpenFlags {
+        self.status_flags.get()
+    }
+    fn set_status_flags(&self, flags: OpenFlags) {
+        self.status_flags.set(flags);
     }
     fn is_tty(&self) -> bool {
         true

@@ -1,4 +1,5 @@
-use super::{File, FileStat, PollEvents, S_IFIFO};
+use super::status_flags::StatusFlagsCell;
+use super::{File, FileStat, OpenFlags, PollEvents, S_IFIFO};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use alloc::sync::{Arc, Weak};
@@ -9,6 +10,7 @@ pub struct Pipe {
     readable: bool,
     writable: bool,
     buffer: Arc<UPIntrFreeCell<PipeRingBuffer>>,
+    status_flags: StatusFlagsCell,
 }
 
 impl Pipe {
@@ -17,6 +19,7 @@ impl Pipe {
             readable: true,
             writable: false,
             buffer,
+            status_flags: StatusFlagsCell::new(OpenFlags::RDONLY),
         }
     }
     pub fn write_end_with_buffer(buffer: Arc<UPIntrFreeCell<PipeRingBuffer>>) -> Self {
@@ -24,6 +27,7 @@ impl Pipe {
             readable: false,
             writable: true,
             buffer,
+            status_flags: StatusFlagsCell::new(OpenFlags::WRONLY),
         }
     }
 }
@@ -191,6 +195,12 @@ impl File for Pipe {
     }
     fn stat(&self) -> FileStat {
         FileStat::with_mode(S_IFIFO | 0o600)
+    }
+    fn status_flags(&self) -> OpenFlags {
+        self.status_flags.get()
+    }
+    fn set_status_flags(&self, flags: OpenFlags) {
+        self.status_flags.set(flags);
     }
     fn poll(&self, events: PollEvents) -> PollEvents {
         let ring_buffer = self.buffer.exclusive_access();

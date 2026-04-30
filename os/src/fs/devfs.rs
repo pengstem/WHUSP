@@ -1,3 +1,4 @@
+use super::status_flags::StatusFlagsCell;
 use super::{File, FileStat, OpenFlags, PollEvents, S_IFCHR, S_IFDIR};
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::UserBuffer;
@@ -51,15 +52,17 @@ struct DevFsFile {
     readable: bool,
     writable: bool,
     offset: UPIntrFreeCell<usize>,
+    status_flags: StatusFlagsCell,
 }
 
 impl DevFsFile {
-    fn new(node: DevNode, readable: bool, writable: bool) -> Self {
+    fn new(node: DevNode, readable: bool, writable: bool, status_flags: OpenFlags) -> Self {
         Self {
             node,
             readable,
             writable,
             offset: unsafe { UPIntrFreeCell::new(0) },
+            status_flags: StatusFlagsCell::new(status_flags),
         }
     }
 }
@@ -140,13 +143,23 @@ fn open_node(node: DevNode, flags: OpenFlags) -> Option<Arc<dyn File + Send + Sy
         if !flags.can_open_directory() {
             return None;
         }
-        return Some(Arc::new(DevFsFile::new(node, false, false)));
+        return Some(Arc::new(DevFsFile::new(
+            node,
+            false,
+            false,
+            OpenFlags::file_status_flags(flags),
+        )));
     }
     if flags.contains(OpenFlags::DIRECTORY) {
         return None;
     }
     let (readable, writable) = flags.read_write();
-    Some(Arc::new(DevFsFile::new(node, readable, writable)))
+    Some(Arc::new(DevFsFile::new(
+        node,
+        readable,
+        writable,
+        OpenFlags::file_status_flags(flags),
+    )))
 }
 
 pub(crate) fn open(path: &str, flags: OpenFlags) -> Option<Arc<dyn File + Send + Sync>> {
@@ -330,6 +343,14 @@ impl File for DevFsFile {
 
     fn stat(&self) -> FileStat {
         stat_node(self.node)
+    }
+
+    fn status_flags(&self) -> OpenFlags {
+        self.status_flags.get()
+    }
+
+    fn set_status_flags(&self, flags: OpenFlags) {
+        self.status_flags.set(flags);
     }
 
     fn read_dirent64(&self, user_buf: UserBuffer) -> isize {

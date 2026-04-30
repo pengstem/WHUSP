@@ -4,7 +4,9 @@ mod inode;
 mod mount;
 mod path;
 mod pipe;
+mod status_flags;
 mod stdio;
+mod vfs;
 
 use crate::mm::UserBuffer;
 use bitflags::bitflags;
@@ -94,6 +96,10 @@ pub trait File: Send + Sync {
     fn working_dir(&self) -> Option<WorkingDir> {
         None
     }
+    fn status_flags(&self) -> inode::OpenFlags {
+        inode::OpenFlags::empty()
+    }
+    fn set_status_flags(&self, _flags: inode::OpenFlags) {}
     fn is_tty(&self) -> bool {
         false
     }
@@ -116,12 +122,11 @@ pub fn list_apps() {
 }
 
 pub(crate) use devfs::{open_child as open_devfs_child, stat_child as stat_devfs_child};
-pub(crate) use inode::open_file_at;
-pub use inode::{OpenFlags, open_file};
-pub(crate) use inode::{
-    lookup_dir_at, lookup_mount_target_dir_at, mkdir_at, stat_at, unlink_file_at,
-};
+pub use inode::OpenFlags;
+pub(crate) use inode::{lookup_mount_target_dir_at, mkdir_at, unlink_file_at};
 pub(crate) use mount::{MountError, mount_block_device_at, unmount_at};
 pub(crate) use path::{WorkingDir, normalize_path};
 pub use pipe::make_pipe;
 pub use stdio::{Stdin, Stdout};
+pub(crate) use vfs::open_file;
+pub(crate) use vfs::{lookup_dir_at, open_file_at, stat_at};
