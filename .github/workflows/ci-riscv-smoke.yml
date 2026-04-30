@@ -49,7 +49,9 @@ jobs:
         run: |
           set +e
           set -o pipefail
-          timeout 300s qemu-system-riscv64 \
+          # Wait for shell to be ready, then feed commands
+          { sleep 5; cat .github/scripts/ci-test-input.sh; } | \
+          timeout 600s qemu-system-riscv64 \
             -machine virt \
             -kernel ./kernel-rv \
             -m 1G \
@@ -63,7 +65,7 @@ jobs:
             -netdev user,id=net \
             -rtc base=utc \
             2>&1 | tee boot.log
-          status=${PIPESTATUS[0]}
+          status=${PIPESTATUS[1]}
           set -e
           if [[ "${status}" != "0" && "${status}" != "124" ]]; then
             echo "QEMU exited with unexpected status: ${status}"
@@ -146,7 +148,8 @@ jobs:
         run: |
           set +e
           set -o pipefail
-          timeout 300s qemu-system-loongarch64 \
+          { sleep 5; cat .github/scripts/ci-test-input.sh; } | \
+          timeout 600s qemu-system-loongarch64 \
             -kernel ./kernel-la \
             -m 1G \
             -nographic \
@@ -158,7 +161,7 @@ jobs:
             -netdev user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555 \
             -rtc base=utc \
             2>&1 | tee boot-la.log
-          status=${PIPESTATUS[0]}
+          status=${PIPESTATUS[1]}
           set -e
           if [[ "${status}" != "0" && "${status}" != "124" ]]; then
             echo "QEMU exited with unexpected status: ${status}"
