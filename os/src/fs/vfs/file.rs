@@ -5,7 +5,7 @@ use super::super::path::WorkingDir;
 use super::super::status_flags::StatusFlagsCell;
 use super::super::{File, FileStat};
 use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
-use super::{FsNodeKind, VfsNodeId, VfsPath};
+use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
 use crate::mm::UserBuffer;
 use crate::sync::SleepMutex;
 use alloc::sync::Arc;
@@ -57,10 +57,11 @@ impl VfsFile {
         }
         let mut offset = self.offset.lock();
         if append {
-            let Some(stat) = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))
-                .expect("filesystem mount is missing")
-            else {
-                return 0;
+            let stat = match with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino)) {
+                Some(Ok(stat)) => stat,
+                _ => {
+                    return 0;
+                }
             };
             *offset = stat.size as usize;
         }
@@ -81,30 +82,46 @@ fn open_vfs_file_impl(
     cwd: Option<WorkingDir>,
     name: &str,
     flags: OpenFlags,
-) -> Option<Arc<VfsFile>> {
+) -> FsResult<Arc<VfsFile>> {
     let resolved = vfs_path::resolve_open(cwd, name, flags.contains(OpenFlags::CREATE))?;
 
     let (path, readable, writable) = match resolved {
         VfsOpenTarget::Existing(path) => {
+            if flags.contains(OpenFlags::CREATE | OpenFlags::EXCL) {
+                return Err(FsError::AlreadyExists);
+            }
             if path.kind == FsNodeKind::Directory {
                 if !flags.can_open_directory() {
-                    return None;
+                    return Err(FsError::IsDir);
                 }
                 (path, false, false)
             } else {
+                if flags.contains(OpenFlags::DIRECTORY) {
+                    return Err(FsError::NotDir);
+                }
+                if path.kind == FsNodeKind::Symlink && flags.contains(OpenFlags::NOFOLLOW) {
+                    return Err(FsError::Loop);
+                }
+                if path.kind == FsNodeKind::Symlink {
+                    // UNFINISHED: Linux openat follows final symlinks unless O_NOFOLLOW
+                    // or O_PATH says otherwise. This VFS does not read symlink targets yet.
+                }
                 let (readable, writable) = flags.read_write();
-                if flags.contains(OpenFlags::TRUNC) {
+                if flags.contains(OpenFlags::TRUNC) && flags.writable_target() {
                     with_mount(path.node.mount_id, |mount| mount.set_len(path.node.ino, 0))
-                        .expect("filesystem mount is missing")?;
+                        .ok_or(FsError::Io)??;
                 }
                 (path, readable, writable)
             }
         }
         VfsOpenTarget::Create(target) => {
+            if flags.contains(OpenFlags::DIRECTORY) {
+                return Err(FsError::InvalidInput);
+            }
             let ino = with_mount(target.parent.mount_id, |mount| {
                 mount.create_file(target.parent.ino, target.leaf_name)
             })
-            .expect("filesystem mount is missing")?;
+            .ok_or(FsError::Io)??;
             let (readable, writable) = flags.read_write();
             (
                 VfsPath::new(
@@ -117,7 +134,7 @@ fn open_vfs_file_impl(
         }
     };
 
-    Some(Arc::new(VfsFile::new(
+    Ok(Arc::new(VfsFile::new(
         path,
         readable,
         writable,
@@ -125,7 +142,7 @@ fn open_vfs_file_impl(
     )))
 }
 
-pub(crate) fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<VfsFile>> {
+pub(crate) fn open_file(name: &str, flags: OpenFlags) -> FsResult<Arc<VfsFile>> {
     open_vfs_file_impl(None, name, flags)
 }
 
@@ -133,26 +150,28 @@ pub(crate) fn open_file_at(
     cwd: WorkingDir,
     name: &str,
     flags: OpenFlags,
-) -> Option<Arc<dyn File + Send + Sync>> {
+) -> FsResult<Arc<dyn File + Send + Sync>> {
     if let Some(file) = devfs::open(name, flags) {
-        return Some(file);
+        return Ok(file);
     }
     open_vfs_file_impl(Some(cwd), name, flags).map(|file| file as Arc<dyn File + Send + Sync>)
 }
 
-pub(crate) fn stat_at(cwd: WorkingDir, name: &str) -> Option<FileStat> {
+pub(crate) fn stat_at(cwd: WorkingDir, name: &str) -> FsResult<FileStat> {
     if let Some(stat) = devfs::stat(name) {
-        return Some(stat);
+        return Ok(stat);
     }
     let path = vfs_path::resolve_existing(Some(cwd), name, LookupMode::Normal)?;
-    let mut stat = with_mount(path.node.mount_id, |mount| mount.stat(path.node.ino))
-        .expect("filesystem mount is missing")?;
+    let mut stat =
+        with_mount(path.node.mount_id, |mount| mount.stat(path.node.ino)).ok_or(FsError::Io)??;
     stat.dev = path.node.mount_id.0 as u64;
-    Some(stat)
+    Ok(stat)
 }
 
-pub(crate) fn lookup_dir_at(cwd: WorkingDir, name: &str) -> Option<WorkingDir> {
-    vfs_path::resolve_existing(Some(cwd), name, LookupMode::Normal)?.working_dir()
+pub(crate) fn lookup_dir_at(cwd: WorkingDir, name: &str) -> FsResult<WorkingDir> {
+    vfs_path::resolve_existing(Some(cwd), name, LookupMode::Normal)?
+        .working_dir()
+        .ok_or(FsError::NotDir)
 }
 
 impl File for VfsFile {
@@ -220,20 +239,18 @@ impl File for VfsFile {
         .expect("filesystem mount is missing")
     }
 
-    fn read_dirent64(&self, user_buf: UserBuffer) -> isize {
+    fn read_dirent64(&self, user_buf: UserBuffer) -> FsResult<isize> {
         if self.kind != FsNodeKind::Directory {
-            return -1;
+            return Err(FsError::NotDir);
         }
         let mut offset = self.offset.lock();
         let mut kernel_buf = vec![0u8; user_buf.len()];
-        let Some((read_size, next_offset)) = with_mount(self.node.mount_id, |mount| {
+        let (read_size, next_offset) = with_mount(self.node.mount_id, |mount| {
             mount.read_dirent64(self.node.ino, *offset as u64, &mut kernel_buf)
         })
-        .expect("filesystem mount is missing") else {
-            return -1;
-        };
+        .ok_or(FsError::Io)??;
         if read_size == 0 {
-            return 0;
+            return Ok(0);
         }
         for (idx, byte_ref) in user_buf.into_iter().take(read_size).enumerate() {
             unsafe {
@@ -241,7 +258,7 @@ impl File for VfsFile {
             }
         }
         *offset = next_offset as usize;
-        read_size as isize
+        Ok(read_size as isize)
     }
 
     fn working_dir(&self) -> Option<WorkingDir> {

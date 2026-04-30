@@ -1,12 +1,14 @@
 use super::FileStat;
-use super::vfs::{FileSystemBackend, FsNodeKind};
+use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
 use crate::drivers::block::VirtIOBlock;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::str;
 use core::time::Duration;
-use lwext4_rust::ffi::{EIO, EXT4_ROOT_INO};
+use lwext4_rust::ffi::{
+    EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, ENOTSUP, EXT4_ROOT_INO,
+};
 use lwext4_rust::{
     BlockDevice as Ext4BlockDevice, EXT4_DEV_BSIZE, Ext4Error, Ext4Filesystem, Ext4Result,
     FsConfig, InodeType, SystemHal,
@@ -15,7 +17,8 @@ use lwext4_rust::{
 pub(super) struct KernelHal;
 
 impl SystemHal for KernelHal {
-    // TODO: could try to implement this
+    // UNFINISHED: Linux stat timestamps should reflect filesystem time updates;
+    // this HAL currently exposes no wall-clock source to lwext4.
     fn now() -> Option<Duration> {
         None
     }
@@ -62,12 +65,14 @@ const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
 
-// TODO: i think we missed some types here
 fn into_node_kind(kind: InodeType) -> FsNodeKind {
     match kind {
         InodeType::Directory => FsNodeKind::Directory,
         InodeType::RegularFile => FsNodeKind::RegularFile,
         InodeType::Symlink => FsNodeKind::Symlink,
+        // UNFINISHED: Linux distinguishes block devices, character devices,
+        // sockets, and FIFOs in stat/getdents; this VFS currently groups the
+        // non-directory, non-regular, non-symlink EXT4 types as Other.
         _ => FsNodeKind::Other,
     }
 }
@@ -81,8 +86,23 @@ fn into_linux_dtype(kind: InodeType) -> u8 {
     }
 }
 
-fn align_up(value: usize, align: usize) -> usize {
-    (value + align - 1) & !(align - 1)
+use super::align_up;
+
+fn map_ext4_error(err: Ext4Error) -> FsError {
+    // UNFINISHED: lwext4 exposes raw errno values that are not all mapped
+    // into this kernel's VFS error model yet; unmapped codes fall back to Io.
+    let code = err.code as u32;
+    match code {
+        ENOENT => FsError::NotFound,
+        ENOTDIR => FsError::NotDir,
+        EISDIR => FsError::IsDir,
+        EEXIST => FsError::AlreadyExists,
+        EINVAL => FsError::InvalidInput,
+        ENOTEMPTY => FsError::NotEmpty,
+        EIO => FsError::Io,
+        ENOTSUP => FsError::Unsupported,
+        _ => FsError::Io,
+    }
 }
 
 pub(super) struct Ext4Mount {
@@ -105,37 +125,41 @@ impl FileSystemBackend for Ext4Mount {
         &mut self,
         parent_ino: u32,
         component: &str,
-    ) -> Option<(u32, FsNodeKind)> {
-        let mut result = self.fs.lookup(parent_ino, component).ok()?;
+    ) -> FsResult<(u32, FsNodeKind)> {
+        let mut result = self
+            .fs
+            .lookup(parent_ino, component)
+            .map_err(map_ext4_error)?;
         let entry = result.entry();
-        Some((entry.ino(), into_node_kind(entry.inode_type())))
+        Ok((entry.ino(), into_node_kind(entry.inode_type())))
     }
 
-    fn create_file(&mut self, parent_ino: u32, leaf_name: &str) -> Option<u32> {
+    fn create_file(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult<u32> {
         self.fs
             .create(parent_ino, leaf_name, InodeType::RegularFile, 0o644)
-            .ok()
+            .map_err(map_ext4_error)
     }
 
-    fn create_dir(&mut self, parent_ino: u32, leaf_name: &str, mode: u32) -> Option<u32> {
+    fn create_dir(&mut self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32> {
         self.fs
             .create(parent_ino, leaf_name, InodeType::Directory, mode)
-            .ok()
+            .map_err(map_ext4_error)
     }
 
-    fn unlink(&mut self, parent_ino: u32, leaf_name: &str) -> Option<()> {
-        self.fs.unlink(parent_ino, leaf_name).ok()
+    fn unlink(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult {
+        self.fs
+            .unlink(parent_ino, leaf_name)
+            .map_err(map_ext4_error)
     }
 
-    fn set_len(&mut self, ino: u32, len: u64) -> Option<()> {
-        // TODO: ok() make the error messages lost
-        self.fs.set_len(ino, len).ok()
+    fn set_len(&mut self, ino: u32, len: u64) -> FsResult {
+        self.fs.set_len(ino, len).map_err(map_ext4_error)
     }
 
-    fn stat(&mut self, ino: u32) -> Option<FileStat> {
+    fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
         let mut attr = lwext4_rust::FileAttr::default();
-        self.fs.get_attr(ino, &mut attr).ok()?;
-        Some(FileStat {
+        self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
+        Ok(FileStat {
             dev: attr.device,
             ino: attr.ino as u64,
             mode: attr.mode,
@@ -165,8 +189,8 @@ impl FileSystemBackend for Ext4Mount {
             .expect("ext4 write failed")
     }
 
-    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> Option<(usize, u64)> {
-        let mut reader = self.fs.read_dir(ino, offset).ok()?;
+    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
+        let mut reader = self.fs.read_dir(ino, offset).map_err(map_ext4_error)?;
         let mut written = 0usize;
         let mut next_offset = offset;
 
@@ -182,12 +206,12 @@ impl FileSystemBackend for Ext4Mount {
             // TODO:a classic performance loss?
             if d_reclen > buf.len().saturating_sub(written) {
                 if written == 0 {
-                    return None;
+                    return Err(FsError::InvalidInput);
                 }
                 break;
             }
 
-            reader.step().ok()?;
+            reader.step().map_err(map_ext4_error)?;
             next_offset = reader.offset();
 
             let entry_buf = &mut buf[written..written + d_reclen];
@@ -202,7 +226,7 @@ impl FileSystemBackend for Ext4Mount {
             written += d_reclen;
         }
 
-        Some((written, next_offset))
+        Ok((written, next_offset))
     }
 
     fn list_root_names(&mut self) -> Vec<String> {

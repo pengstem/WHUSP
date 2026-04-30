@@ -12,7 +12,7 @@ pub(super) struct KernelInitProc {
 }
 
 pub(super) fn load() -> Option<KernelInitProc> {
-    let inode = open_file(BUSYBOX_PATH, OpenFlags::RDONLY)?;
+    let inode = open_file(BUSYBOX_PATH, OpenFlags::RDONLY).ok()?;
     Some(KernelInitProc {
         path: BUSYBOX_PATH.into(),
         data: inode.read_all(),

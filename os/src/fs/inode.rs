@@ -1,9 +1,13 @@
-use super::mount::with_mount;
+use super::mount::{mounted_root_for, with_mount};
 use super::path::WorkingDir;
-use super::vfs::{FsNodeKind, resolve_create_parent, resolve_mount_target};
+use super::vfs::{
+    FsError, FsNodeKind, FsResult, VfsNodeId, resolve_create_parent, resolve_mount_target,
+};
 use bitflags::*;
 
-// TODO: add remaining Linux open flags as syscall coverage needs them.
+// UNFINISHED: Linux open/openat define additional status and creation flags
+// such as O_SYNC, O_DSYNC, O_PATH, O_TMPFILE, O_NOATIME, and O_ASYNC. This
+// kernel accepts only the flags represented below.
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct OpenFlags: u32 {
@@ -11,6 +15,7 @@ bitflags! {
         const WRONLY = 1 << 0;
         const RDWR = 1 << 1;
         const CREATE = 0o100;
+        const EXCL = 0o200;
         const NOCTTY = 0o400;
         const TRUNC = 0o1000;
         const APPEND = 0o2000;
@@ -18,6 +23,7 @@ bitflags! {
         const DIRECT = 0o40000;
         const LARGEFILE = 0o100000;
         const DIRECTORY = 0o200000;
+        const NOFOLLOW = 0o400000;
         const CLOEXEC = 0o2000000;
     }
 }
@@ -57,36 +63,54 @@ impl OpenFlags {
     }
 }
 
-pub(crate) fn lookup_mount_target_dir_at(cwd: WorkingDir, name: &str) -> Option<WorkingDir> {
+pub(crate) fn lookup_mount_target_dir_at(cwd: WorkingDir, name: &str) -> FsResult<WorkingDir> {
     let file = resolve_mount_target(Some(cwd), name)?;
-    (file.kind == FsNodeKind::Directory)
-        .then_some(WorkingDir::new(file.node.mount_id, file.node.ino))
+    if file.kind != FsNodeKind::Directory {
+        return Err(FsError::NotDir);
+    }
+    Ok(WorkingDir::new(file.node.mount_id, file.node.ino))
 }
 
-pub(crate) fn mkdir_at(cwd: WorkingDir, name: &str, mode: u32) -> Option<()> {
+pub(crate) fn mkdir_at(cwd: WorkingDir, name: &str, mode: u32) -> FsResult {
     let target = resolve_create_parent(Some(cwd), name)?;
     with_mount(target.parent.mount_id, |mount| {
-        if mount
-            .lookup_component_from(target.parent.ino, target.leaf_name)
-            .is_some()
-        {
-            return None;
+        match mount.lookup_component_from(target.parent.ino, target.leaf_name) {
+            Ok(_) => return Err(FsError::AlreadyExists),
+            Err(FsError::NotFound) => {}
+            Err(err) => return Err(err),
         }
         mount.create_dir(target.parent.ino, target.leaf_name, mode)
     })
-    .expect("filesystem mount is missing")?;
-    Some(())
+    .ok_or(FsError::Io)??;
+    Ok(())
 }
 
-pub(crate) fn unlink_file_at(cwd: WorkingDir, name: &str) -> Option<()> {
+pub(crate) fn unlink_file_at(cwd: WorkingDir, name: &str) -> FsResult {
     let target = resolve_create_parent(Some(cwd), name)?;
     with_mount(target.parent.mount_id, |mount| {
         let (_, kind) = mount.lookup_component_from(target.parent.ino, target.leaf_name)?;
         if kind == FsNodeKind::Directory {
-            return None;
+            return Err(FsError::IsDir);
         }
         mount.unlink(target.parent.ino, target.leaf_name)
     })
-    .expect("filesystem mount is missing")?;
-    Some(())
+    .ok_or(FsError::Io)??;
+    Ok(())
+}
+
+pub(crate) fn rmdir_at(cwd: WorkingDir, name: &str) -> FsResult {
+    let target = resolve_create_parent(Some(cwd), name)?;
+    with_mount(target.parent.mount_id, |mount| {
+        let (ino, kind) = mount.lookup_component_from(target.parent.ino, target.leaf_name)?;
+        if kind != FsNodeKind::Directory {
+            return Err(FsError::NotDir);
+        }
+        let node = VfsNodeId::new(target.parent.mount_id, ino);
+        if mounted_root_for(node).is_some() || ino == lwext4_rust::ffi::EXT4_ROOT_INO {
+            return Err(FsError::Busy);
+        }
+        mount.unlink(target.parent.ino, target.leaf_name)
+    })
+    .ok_or(FsError::Io)??;
+    Ok(())
 }

@@ -346,9 +346,7 @@ fn interpreter_candidates(
 
 fn read_exec_file(path: &str) -> SysResult<Vec<u8>> {
     let process = current_process();
-    let Some(app_file) = open_file_at(process.working_dir(), path, OpenFlags::RDONLY) else {
-        return Err(SysError::ENOENT);
-    };
+    let app_file = open_file_at(process.working_dir(), path, OpenFlags::RDONLY)?;
     Ok(read_all_file(app_file))
 }
 

@@ -15,7 +15,7 @@ fn write_stat_to_user(token: usize, statbuf: *mut LinuxKstat, stat: FileStat) ->
 
 fn stat_by_dirfd(dirfd: isize) -> SysResult<FileStat> {
     if dirfd == AT_FDCWD {
-        return stat_at(current_process().working_dir(), ".").ok_or(SysError::ENOENT);
+        return Ok(stat_at(current_process().working_dir(), ".")?);
     }
     if dirfd < 0 {
         return Err(SysError::EBADF);
@@ -65,14 +65,14 @@ pub fn sys_newfstatat(
 
     // CONTEXT: `AT_NO_AUTOMOUNT` is a no-op on modern Linux, and this resolver has no automount
     // concept. Accept the bit for libc compatibility without changing lookup behavior.
-    // CONTEXT: The current path resolver does not distinguish follow vs nofollow on the final path
-    // component yet. Accept `AT_SYMLINK_NOFOLLOW` so libc and LTP can reach this syscall, but it
-    // is not enforced until symlink-aware lookup lands.
+    // UNFINISHED: The current path resolver does not distinguish follow vs nofollow on the final
+    // path component yet. `AT_SYMLINK_NOFOLLOW` is accepted but not enforced until symlink-aware
+    // lookup lands.
     let base = if path.starts_with('/') {
         WorkingDir::root()
     } else {
         dirfd_base(dirfd)?
     };
-    let stat = stat_at(base, path.as_str()).ok_or(SysError::ENOENT)?;
+    let stat = stat_at(base, path.as_str())?;
     write_stat_to_user(token, statbuf, stat)
 }

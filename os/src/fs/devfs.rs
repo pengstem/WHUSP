@@ -1,5 +1,5 @@
 use super::status_flags::StatusFlagsCell;
-use super::{File, FileStat, OpenFlags, PollEvents, S_IFCHR, S_IFDIR};
+use super::{File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFCHR, S_IFDIR};
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
@@ -110,9 +110,7 @@ fn linux_makedev(major: u64, minor: u64) -> u64 {
     (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
 }
 
-fn align_up(value: usize, align: usize) -> usize {
-    (value + align - 1) & !(align - 1)
-}
+use super::align_up;
 
 fn lookup_absolute(path: &str) -> Option<DevNode> {
     // UNFINISHED: This lightweight devfs is not a mountable filesystem yet.
@@ -249,7 +247,7 @@ fn read_zero(user_buf: UserBuffer) -> usize {
     len
 }
 
-fn copy_dirents(entries_offset: &mut usize, user_buf: UserBuffer) -> isize {
+fn copy_dirents(entries_offset: &mut usize, user_buf: UserBuffer) -> FsResult<isize> {
     let mut kernel_buf = vec![0u8; user_buf.len()];
     let mut written = 0usize;
 
@@ -261,7 +259,7 @@ fn copy_dirents(entries_offset: &mut usize, user_buf: UserBuffer) -> isize {
         );
         if d_reclen > kernel_buf.len().saturating_sub(written) {
             if written == 0 {
-                return -1;
+                return Err(FsError::InvalidInput);
             }
             break;
         }
@@ -281,14 +279,14 @@ fn copy_dirents(entries_offset: &mut usize, user_buf: UserBuffer) -> isize {
     }
 
     if written == 0 {
-        return 0;
+        return Ok(0);
     }
     for (idx, byte_ref) in user_buf.into_iter().take(written).enumerate() {
         unsafe {
             *byte_ref = kernel_buf[idx];
         }
     }
-    written as isize
+    Ok(written as isize)
 }
 
 impl File for DevFsFile {
@@ -353,9 +351,9 @@ impl File for DevFsFile {
         self.status_flags.set(flags);
     }
 
-    fn read_dirent64(&self, user_buf: UserBuffer) -> isize {
+    fn read_dirent64(&self, user_buf: UserBuffer) -> FsResult<isize> {
         if self.node != DevNode::Root {
-            return -1;
+            return Err(FsError::NotDir);
         }
         let mut offset = self.offset.exclusive_access();
         copy_dirents(&mut *offset, user_buf)

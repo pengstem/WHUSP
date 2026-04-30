@@ -1,6 +1,6 @@
 use super::ext4::Ext4Mount;
 use super::path::WorkingDir;
-use super::vfs::{FileSystemBackend, FsNodeKind, VfsNodeId};
+use super::vfs::{FileSystemBackend, FsError, FsNodeKind, VfsNodeId};
 use crate::drivers::block::BLOCK_DEVICES;
 use crate::sync::{SleepMutex, UPIntrFreeCell};
 use alloc::boxed::Box;
@@ -166,12 +166,11 @@ pub(super) fn primary_mount_id() -> MountId {
 }
 
 fn lookup_covered_parent(target: VfsNodeId) -> Result<VfsNodeId, MountError> {
-    let Some((parent_ino, kind)) = with_mount(target.mount_id, |mount| {
+    let (parent_ino, kind) = with_mount(target.mount_id, |mount| {
         mount.lookup_component_from(target.ino, "..")
     })
-    .flatten() else {
-        return Err(MountError::InvalidTarget);
-    };
+    .ok_or(MountError::InvalidTarget)?
+    .map_err(|_| MountError::InvalidTarget)?;
     if kind != FsNodeKind::Directory {
         return Err(MountError::InvalidTarget);
     }
@@ -225,17 +224,25 @@ pub(crate) fn unmount_at(target: WorkingDir) -> Result<(), MountError> {
 fn ensure_extra_mount_target(index: usize) -> Option<WorkingDir> {
     let name = format!("x{index}");
     with_mount(primary_mount_id(), |mount| {
-        if let Some((ino, kind)) = mount.lookup_component_from(EXT4_ROOT_INO, &name) {
-            if kind == FsNodeKind::Directory {
-                return Some(WorkingDir::new(primary_mount_id(), ino));
+        match mount.lookup_component_from(EXT4_ROOT_INO, &name) {
+            Ok((ino, kind)) => {
+                if kind == FsNodeKind::Directory {
+                    return Some(WorkingDir::new(primary_mount_id(), ino));
+                }
+                warn!("cannot auto-mount BLOCK_DEVICES[{index}]: /{name} is not a directory");
+                return None;
             }
-            warn!("cannot auto-mount BLOCK_DEVICES[{index}]: /{name} is not a directory");
-            return None;
+            Err(FsError::NotFound) => {}
+            Err(err) => {
+                warn!("cannot lookup /{name} for BLOCK_DEVICES[{index}] auto-mount: {err:?}");
+                return None;
+            }
         }
 
         mount
             .create_dir(EXT4_ROOT_INO, &name, 0o755)
             .map(|ino| WorkingDir::new(primary_mount_id(), ino))
+            .ok()
             .or_else(|| {
                 warn!("cannot create /{name} for BLOCK_DEVICES[{index}] auto-mount");
                 None

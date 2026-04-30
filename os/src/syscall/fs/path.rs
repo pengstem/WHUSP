@@ -1,6 +1,6 @@
 use crate::fs::{
     File, OpenFlags, WorkingDir, lookup_dir_at, mkdir_at, normalize_path, open_devfs_child,
-    open_file_at, unlink_file_at,
+    open_file_at, rmdir_at, unlink_file_at,
 };
 use crate::mm::{UserBuffer, translated_byte_buffer, translated_str};
 use crate::task::{FdTableEntry, current_process, current_user_token};
@@ -8,7 +8,8 @@ use alloc::sync::Arc;
 
 use super::super::errno::{SysError, SysResult};
 use super::fd::get_file_by_fd;
-use super::uapi::AT_FDCWD;
+use super::uapi::{AT_FDCWD, AT_REMOVEDIR};
+use super::user_ptr::{UserBufferAccess, translated_byte_buffer_checked};
 
 pub(super) fn dirfd_base(dirfd: isize) -> SysResult<WorkingDir> {
     if dirfd == AT_FDCWD {
@@ -87,9 +88,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> SysR
         return install_open_file(file, flags);
     }
     let base = path_base(dirfd, path.as_str())?;
-    let Some(file) = open_file_at(base, path.as_str(), flags) else {
-        return Err(SysError::ENOENT);
-    };
+    let file = open_file_at(base, path.as_str(), flags)?;
     install_open_file(file, flags)
 }
 
@@ -98,9 +97,7 @@ pub fn sys_chdir(path: *const u8) -> SysResult {
     let token = current_user_token();
     let path = translated_str(token, path);
     let cwd = process.working_dir();
-    let Some(next_cwd) = lookup_dir_at(cwd, path.as_str()) else {
-        return Err(SysError::ENOENT);
-    };
+    let next_cwd = lookup_dir_at(cwd, path.as_str())?;
     let Some(next_path) = normalize_path(&process.working_dir_path(), path.as_str()) else {
         return Err(SysError::ENOENT);
     };
@@ -118,25 +115,23 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> SysResult {
     let token = current_user_token();
     let path = translated_str(token, path);
     let base = path_base(dirfd, path.as_str())?;
-    if mkdir_at(base, path.as_str(), mode).is_some() {
-        Ok(0)
-    } else {
-        Err(SysError::ENOENT)
-    }
+    mkdir_at(base, path.as_str(), mode)?;
+    Ok(0)
 }
 
 pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> SysResult {
-    if flags != 0 {
+    if flags & !AT_REMOVEDIR != 0 {
         return Err(SysError::EINVAL);
     }
     let token = current_user_token();
     let path = translated_str(token, path);
     let base = path_base(dirfd, path.as_str())?;
-    if unlink_file_at(base, path.as_str()).is_some() {
-        Ok(0)
+    if flags & AT_REMOVEDIR != 0 {
+        rmdir_at(base, path.as_str())?;
     } else {
-        Err(SysError::ENOENT)
+        unlink_file_at(base, path.as_str())?;
     }
+    Ok(0)
 }
 
 pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> SysResult {
@@ -144,6 +139,8 @@ pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> SysResult {
         return Err(SysError::EINVAL);
     }
     let token = current_user_token();
+    let buffers =
+        translated_byte_buffer_checked(token, buf.cast_const(), len, UserBufferAccess::Write)?;
     let process = current_process();
     let inner = process.inner_exclusive_access();
     let Some(file) = inner
@@ -155,5 +152,5 @@ pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> SysResult {
         return Err(SysError::EBADF);
     };
     drop(inner);
-    Ok(file.read_dirent64(UserBuffer::new(translated_byte_buffer(token, buf, len))))
+    Ok(file.read_dirent64(UserBuffer::new(buffers))?)
 }
