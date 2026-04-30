@@ -62,7 +62,7 @@ const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum FsNodeKind {
+pub(crate) enum FsNodeKind {
     Directory,
     RegularFile,
     Other,
