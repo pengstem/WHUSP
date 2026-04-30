@@ -63,6 +63,22 @@ impl OpenFlags {
     }
 }
 
+fn trimmed_nonroot_path(name: &str) -> &str {
+    let trimmed = name.trim_end_matches('/');
+    if trimmed.is_empty() { name } else { trimmed }
+}
+
+fn final_component(name: &str) -> Option<&str> {
+    if name.is_empty() {
+        return None;
+    }
+    let trimmed = name.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Some("/");
+    }
+    trimmed.rsplit('/').find(|component| !component.is_empty())
+}
+
 pub(crate) fn lookup_mount_target_dir_at(cwd: WorkingDir, name: &str) -> FsResult<WorkingDir> {
     let file = resolve_mount_target(Some(cwd), name)?;
     if file.kind != FsNodeKind::Directory {
@@ -72,7 +88,11 @@ pub(crate) fn lookup_mount_target_dir_at(cwd: WorkingDir, name: &str) -> FsResul
 }
 
 pub(crate) fn mkdir_at(cwd: WorkingDir, name: &str, mode: u32) -> FsResult {
-    let target = resolve_create_parent(Some(cwd), name)?;
+    match final_component(name) {
+        Some("." | ".." | "/") => return Err(FsError::AlreadyExists),
+        _ => {}
+    }
+    let target = resolve_create_parent(Some(cwd), trimmed_nonroot_path(name))?;
     with_mount(target.parent.mount_id, |mount| {
         match mount.lookup_component_from(target.parent.ino, target.leaf_name) {
             Ok(_) => return Err(FsError::AlreadyExists),
@@ -86,9 +106,17 @@ pub(crate) fn mkdir_at(cwd: WorkingDir, name: &str, mode: u32) -> FsResult {
 }
 
 pub(crate) fn unlink_file_at(cwd: WorkingDir, name: &str) -> FsResult {
-    let target = resolve_create_parent(Some(cwd), name)?;
+    let has_trailing_slash = name.len() > 1 && name.ends_with('/');
+    match final_component(name) {
+        Some("." | ".." | "/") => return Err(FsError::IsDir),
+        _ => {}
+    }
+    let target = resolve_create_parent(Some(cwd), trimmed_nonroot_path(name))?;
     with_mount(target.parent.mount_id, |mount| {
         let (_, kind) = mount.lookup_component_from(target.parent.ino, target.leaf_name)?;
+        if has_trailing_slash && kind != FsNodeKind::Directory {
+            return Err(FsError::NotDir);
+        }
         if kind == FsNodeKind::Directory {
             return Err(FsError::IsDir);
         }
@@ -99,7 +127,14 @@ pub(crate) fn unlink_file_at(cwd: WorkingDir, name: &str) -> FsResult {
 }
 
 pub(crate) fn rmdir_at(cwd: WorkingDir, name: &str) -> FsResult {
-    let target = resolve_create_parent(Some(cwd), name)?;
+    match final_component(name) {
+        Some(".") => return Err(FsError::InvalidInput),
+        Some("..") => return Err(FsError::NotEmpty),
+        Some("/") => return Err(FsError::Busy),
+        _ => {}
+    }
+
+    let target = resolve_create_parent(Some(cwd), trimmed_nonroot_path(name))?;
     with_mount(target.parent.mount_id, |mount| {
         let (ino, kind) = mount.lookup_component_from(target.parent.ino, target.leaf_name)?;
         if kind != FsNodeKind::Directory {

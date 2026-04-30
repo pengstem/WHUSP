@@ -151,7 +151,7 @@ pub(crate) fn open_file_at(
     name: &str,
     flags: OpenFlags,
 ) -> FsResult<Arc<dyn File + Send + Sync>> {
-    if let Some(file) = devfs::open(name, flags) {
+    if let Some(file) = devfs::open(name, flags)? {
         return Ok(file);
     }
     open_vfs_file_impl(Some(cwd), name, flags).map(|file| file as Arc<dyn File + Send + Sync>)
