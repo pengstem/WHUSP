@@ -10,17 +10,17 @@ const CLOCK_MONOTONIC: i32 = 1;
 const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
 const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
 const TIMER_ABSTIME: u32 = 1;
-const NSEC_PER_SEC: isize = 1_000_000_000;
-const NSEC_PER_MSEC: usize = 1_000_000;
+pub(crate) const NSEC_PER_SEC: isize = 1_000_000_000;
+pub(crate) const NSEC_PER_MSEC: usize = 1_000_000;
 
-fn validate_timespec(time: LinuxTimeSpec) -> SysResult<LinuxTimeSpec> {
+pub(crate) fn validate_timespec(time: LinuxTimeSpec) -> SysResult<LinuxTimeSpec> {
     if time.tv_sec < 0 || !(0..NSEC_PER_SEC).contains(&time.tv_nsec) {
         return Err(SysError::EINVAL);
     }
     Ok(time)
 }
 
-fn timespec_to_ms_ceil(time: LinuxTimeSpec) -> SysResult<usize> {
+pub(crate) fn timespec_to_ms_ceil(time: LinuxTimeSpec) -> SysResult<usize> {
     let sec_ms = (time.tv_sec as usize)
         .checked_mul(1000)
         .ok_or(SysError::EINVAL)?;

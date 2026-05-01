@@ -4,61 +4,10 @@ use crate::timer::get_time_ms;
 use super::errno::{SysError, SysResult};
 use super::fs::LinuxTimeSpec;
 use super::fs::user_ptr::{read_user_value, write_user_value};
+use super::sync::{timespec_to_ms_ceil, validate_timespec};
+use super::wait::LinuxSigInfo;
 
 const LINUX_RT_SIGSET_SIZE: usize = 8;
-const NSEC_PER_SEC: isize = 1_000_000_000;
-const NSEC_PER_MSEC: usize = 1_000_000;
-const SIGKILL: u32 = 9;
-const SIGSTOP: u32 = 19;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct RtSigInfo {
-    si_signo: i32,
-    si_errno: i32,
-    si_code: i32,
-    si_trapno: i32,
-    si_pid: i32,
-    si_uid: u32,
-    si_status: i32,
-    si_utime: u32,
-    si_stime: u32,
-    si_value: u64,
-    pad: [u32; 20],
-    align: [u64; 0],
-}
-
-impl RtSigInfo {
-    fn from_signal_info(info: SignalInfo) -> Self {
-        Self {
-            si_signo: info.signo,
-            si_code: info.code,
-            si_pid: info.pid,
-            si_uid: info.uid,
-            si_status: info.status,
-            ..Self::default()
-        }
-    }
-}
-
-fn validate_timespec(time: LinuxTimeSpec) -> SysResult<LinuxTimeSpec> {
-    if time.tv_sec < 0 || !(0..NSEC_PER_SEC).contains(&time.tv_nsec) {
-        return Err(SysError::EINVAL);
-    }
-    Ok(time)
-}
-
-fn timespec_to_ms_ceil(time: LinuxTimeSpec) -> SysResult<usize> {
-    let sec_ms = (time.tv_sec as usize)
-        .checked_mul(1000)
-        .ok_or(SysError::EINVAL)?;
-    let nsec_ms = if time.tv_nsec == 0 {
-        0
-    } else {
-        ((time.tv_nsec as usize) + NSEC_PER_MSEC - 1) / NSEC_PER_MSEC
-    };
-    sec_ms.checked_add(nsec_ms).ok_or(SysError::EINVAL)
-}
 
 fn timeout_deadline_ms(token: usize, timeout: *const LinuxTimeSpec) -> SysResult<Option<usize>> {
     if timeout.is_null() {
@@ -73,15 +22,7 @@ fn timeout_deadline_ms(token: usize, timeout: *const LinuxTimeSpec) -> SysResult
 }
 
 fn linux_sigset_to_flags(raw: u64) -> SignalFlags {
-    let mut flags = SignalFlags::empty();
-    for signum in 1..32 {
-        if raw & (1u64 << (signum - 1)) != 0 {
-            if let Some(flag) = SignalFlags::from_signum(signum) {
-                flags |= flag;
-            }
-        }
-    }
-    flags
+    SignalFlags::from_bits_truncate((raw as u32) << 1)
 }
 
 fn read_signal_set(token: usize, set: *const u8, sigsetsize: usize) -> SysResult<SignalFlags> {
@@ -90,12 +31,8 @@ fn read_signal_set(token: usize, set: *const u8, sigsetsize: usize) -> SysResult
     }
     let raw_set = read_user_value(token, set.cast::<u64>())?;
     let mut flags = linux_sigset_to_flags(raw_set);
-    if let Some(sigkill) = SignalFlags::from_signum(SIGKILL) {
-        flags.remove(sigkill);
-    }
-    if let Some(sigstop) = SignalFlags::from_signum(SIGSTOP) {
-        flags.remove(sigstop);
-    }
+    flags.remove(SignalFlags::SIGKILL);
+    flags.remove(SignalFlags::SIGSTOP);
     // UNFINISHED: This kernel currently tracks ordinary signals 1..31 in a
     // process-wide bitset. Linux realtime signal queues, per-thread pending
     // sets, and full signal-mask interaction are not modeled yet.
@@ -141,14 +78,14 @@ fn consume_pending_signal(signum: u32) {
 fn try_return_pending_signal(
     token: usize,
     wanted: SignalFlags,
-    info_ptr: *mut RtSigInfo,
+    info_ptr: *mut LinuxSigInfo,
 ) -> SysResult<Option<isize>> {
     let Some((signum, info)) = peek_pending_signal(wanted) else {
         return Ok(None);
     };
 
     if !info_ptr.is_null() {
-        let info = RtSigInfo::from_signal_info(info);
+        let info = LinuxSigInfo::from_signal_info(info);
         write_user_value(token, info_ptr, &info)?;
     }
     consume_pending_signal(signum);
@@ -157,7 +94,7 @@ fn try_return_pending_signal(
 
 pub fn sys_rt_sigtimedwait(
     set: *const u8,
-    info: *mut RtSigInfo,
+    info: *mut LinuxSigInfo,
     timeout: *const LinuxTimeSpec,
     sigsetsize: usize,
 ) -> SysResult {

@@ -1,5 +1,5 @@
 use crate::mm::translated_refmut;
-use crate::task::{block_current_and_run_next, current_process};
+use crate::task::{CLD_EXITED, SIGCHLD, SignalInfo, block_current_and_run_next, current_process};
 use alloc::sync::Arc;
 
 use super::errno::{SysError, SysResult};
@@ -13,8 +13,6 @@ const WNOWAIT: i32 = 0x01000000;
 const P_ALL: i32 = 0;
 const P_PID: i32 = 1;
 
-const SIGCHLD: i32 = 17;
-const CLD_EXITED: i32 = 1;
 const CLD_KILLED: i32 = 2;
 
 #[repr(C)]
@@ -46,7 +44,7 @@ pub struct RUsage {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct LinuxSigInfo {
     si_signo: i32,
     si_errno: i32,
@@ -60,6 +58,19 @@ pub struct LinuxSigInfo {
     si_value: u64,
     pad: [u32; 20],
     align: [u64; 0],
+}
+
+impl LinuxSigInfo {
+    pub(super) fn from_signal_info(info: SignalInfo) -> Self {
+        Self {
+            si_signo: info.signo,
+            si_code: info.code,
+            si_pid: info.pid,
+            si_uid: info.uid,
+            si_status: info.status,
+            ..Self::default()
+        }
+    }
 }
 
 fn wait_status(exit_code: i32) -> i32 {
@@ -192,7 +203,7 @@ pub fn sys_waitid(
             let token = inner.memory_set.token();
             if !infop.is_null() {
                 *translated_refmut(token, infop) = LinuxSigInfo {
-                    si_signo: SIGCHLD,
+                    si_signo: SIGCHLD as i32,
                     si_code,
                     si_pid: child_pid as i32,
                     si_status,

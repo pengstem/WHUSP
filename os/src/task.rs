@@ -32,7 +32,7 @@ pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
     current_user_token, run_tasks, schedule, take_current_task,
 };
-pub use signal::{SIGNAL_INFO_SLOTS, SignalFlags, SignalInfo};
+pub use signal::{CLD_EXITED, SIGCHLD, SIGNAL_INFO_SLOTS, SignalFlags, SignalInfo};
 pub use task::{TaskControlBlock, TaskStatus};
 
 fn with_current_process(process_fn: impl FnOnce(&ProcessControlBlock)) {
@@ -181,8 +181,11 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             let parent_task = {
                 let mut parent_inner = parent.inner_exclusive_access();
                 parent_inner.signals |= SignalFlags::SIGCHLD;
-                parent_inner.signal_infos[17] =
-                    Some(SignalInfo::child_exit(17, pid as i32, exit_code));
+                parent_inner.signal_infos[SIGCHLD as usize] = Some(SignalInfo::child_exit(
+                    SIGCHLD as i32,
+                    pid as i32,
+                    exit_code,
+                ));
                 parent_inner
                     .tasks
                     .first()

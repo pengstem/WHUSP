@@ -1,8 +1,6 @@
-use super::{TaskControlBlock, current_task};
+use super::{SIGCHLD, TaskControlBlock, current_task};
 use alloc::sync::Arc;
 use bitflags::bitflags;
-
-const SIGCHLD: u32 = 17;
 
 bitflags! {
     /// Linux `clone(2)` flags. Low 8 bits of the raw `flags` argument are the

@@ -5,12 +5,10 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
+use super::super::sync::{timespec_to_ms_ceil, validate_timespec};
 use super::fd::get_file_by_fd;
 use super::uapi::{LinuxPollFd, LinuxTimeSpec, PPOLL_MAX_NFDS};
 use super::user_ptr::{read_user_value, write_user_value};
-
-const NSEC_PER_SEC: isize = 1_000_000_000;
-const NSEC_PER_MSEC: usize = 1_000_000;
 
 fn read_user_pollfds(
     token: usize,
@@ -69,19 +67,8 @@ fn timeout_deadline_ms(token: usize, timeout: *const LinuxTimeSpec) -> SysResult
     if timeout.is_null() {
         return Ok(None);
     }
-    let timeout = read_user_value(token, timeout)?;
-    if timeout.tv_sec < 0 || !(0..NSEC_PER_SEC).contains(&timeout.tv_nsec) {
-        return Err(SysError::EINVAL);
-    }
-    let sec_ms = (timeout.tv_sec as usize)
-        .checked_mul(1000)
-        .ok_or(SysError::EINVAL)?;
-    let nsec_ms = if timeout.tv_nsec == 0 {
-        0
-    } else {
-        ((timeout.tv_nsec as usize) + NSEC_PER_MSEC - 1) / NSEC_PER_MSEC
-    };
-    let timeout_ms = sec_ms.checked_add(nsec_ms).ok_or(SysError::EINVAL)?;
+    let timeout = validate_timespec(read_user_value(token, timeout)?)?;
+    let timeout_ms = timespec_to_ms_ceil(timeout)?;
     let deadline_ms = get_time_ms()
         .checked_add(timeout_ms)
         .ok_or(SysError::EINVAL)?;

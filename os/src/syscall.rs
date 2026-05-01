@@ -186,7 +186,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_KILL => sys_kill(args[0], args[1] as u32),
         SYSCALL_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(
             args[0] as *const u8,
-            args[1] as *mut RtSigInfo,
+            args[1] as *mut LinuxSigInfo,
             args[2] as *const LinuxTimeSpec,
             args[3],
         ),
