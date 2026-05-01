@@ -443,8 +443,27 @@ pub fn sys_kill(pid: usize, signal: u32) -> SysResult {
             Ok(0)
         } else {
             Err(SysError::EINVAL)
+const SYSLOG_ACTION_READ_ALL: usize = 3;
+const SYSLOG_ACTION_SIZE_BUFFER: usize = 10;
+const SYSLOG_BUF_SIZE: usize = 4096;
+
+static SYSLOG_FAKE_MSG: &[u8] = b"<5>[    0.000000] Linux version 5.10.0 (whusp@oscomp)\n";
+
+pub fn sys_syslog(log_type: usize, buf: *mut u8, len: usize) -> SysResult {
+    match log_type {
+        SYSLOG_ACTION_SIZE_BUFFER => Ok(SYSLOG_BUF_SIZE as isize),
+        SYSLOG_ACTION_READ_ALL => {
+            if buf.is_null() || len == 0 {
+                return Ok(0);
+            }
+            let token = current_user_token();
+            let msg = SYSLOG_FAKE_MSG;
+            let copy_len = msg.len().min(len);
+            for i in 0..copy_len {
+                *translated_refmut(token, unsafe { buf.add(i) }) = msg[i];
+            }
+            Ok(copy_len as isize)
         }
-    } else {
-        Err(SysError::ESRCH)
+        _ => Ok(0),
     }
 }
