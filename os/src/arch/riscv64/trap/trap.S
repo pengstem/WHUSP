@@ -1,10 +1,20 @@
 .altmacro
+.option arch, +d
 .macro SAVE_GP n
     sd x\n, \n*8(sp)
 .endm
 .macro LOAD_GP n
     ld x\n, \n*8(sp)
 .endm
+.macro SAVE_FP n
+    fsd f\n, (37+\n)*8(sp)
+.endm
+.macro LOAD_FP n
+    fld f\n, (37+\n)*8(sp)
+.endm
+.equ SSTATUS_FS_DIRTY, 0x6000
+.equ SSTATUS_FS_MASK, 0x6000
+.equ FCSR_OFFSET, 69
     .section .text.trampoline
     .globl __alltraps
     .globl __restore
@@ -33,6 +43,19 @@ __alltraps:
     # read user stack from sscratch and save it in TrapContext
     csrr t2, sscratch
     sd t2, 2*8(sp)
+    # CONTEXT: User FP state lives in TrapContext in this kernel; switch.S only
+    # carries kernel scheduling state. Temporarily enable FS while copying it.
+    li t2, SSTATUS_FS_DIRTY
+    csrs sstatus, t2
+    .set n, 0
+    .rept 32
+        SAVE_FP %n
+        .set n, n+1
+    .endr
+    frcsr t2
+    sw t2, FCSR_OFFSET*8(sp)
+    li t2, SSTATUS_FS_MASK
+    csrc sstatus, t2
     # load kernel_satp into t0
     ld t0, 34*8(sp)
     # load trap_handler into t1
@@ -56,8 +79,18 @@ __restore:
     # restore sstatus/sepc
     ld t0, 32*8(sp)
     ld t1, 33*8(sp)
-    csrw sstatus, t0
+    li t2, SSTATUS_FS_DIRTY
+    or t2, t0, t2
+    csrw sstatus, t2
     csrw sepc, t1
+    .set n, 0
+    .rept 32
+        LOAD_FP %n
+        .set n, n+1
+    .endr
+    lw t2, FCSR_OFFSET*8(sp)
+    fscsr t2
+    csrw sstatus, t0
     # restore general purpose registers except x0/sp
     ld x1, 1*8(sp)
     ld x3, 3*8(sp)

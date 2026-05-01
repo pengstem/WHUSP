@@ -1,5 +1,5 @@
 // TODO: all hard-coded, well some of them need tuning i believe
-pub const USER_STACK_SIZE: usize = 4096 * 2;
+pub const USER_STACK_SIZE: usize = 4096 * 32;
 pub const USER_HEAP_SIZE: usize = 0x20_0000;
 pub const USER_MMAP_BASE: usize = 0x6000_0000;
 pub const USER_MMAP_LIMIT: usize = 0x7000_0000;
