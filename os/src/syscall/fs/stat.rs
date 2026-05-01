@@ -30,7 +30,7 @@ fn stat_by_dirfd(dirfd: isize) -> SysResult<FileStat> {
 }
 
 // UNFINISHED: AT_SYMLINK_NOFOLLOW is accepted but the resolver does not distinguish follow vs nofollow on the final component yet.
-fn resolve_stat(dirfd: isize, path: &str) -> SysResult<FileStat> {
+pub(super) fn resolve_stat(dirfd: isize, path: &str) -> SysResult<FileStat> {
     if path.is_empty() {
         return stat_by_dirfd(dirfd);
     }

@@ -1,13 +1,15 @@
 use super::super::errno::{SysError, SysResult};
 use super::fd::get_file_by_fd;
+use super::stat::resolve_stat;
 use super::uapi::{
-    AT_FDCWD, AT_REMOVEDIR, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, VALID_RENAME_FLAGS,
+    AT_EACCESS, AT_FDCWD, AT_REMOVEDIR, F_OK, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT,
+    VALID_ACCESS_MODE, VALID_FACCESSAT_FLAGS, VALID_RENAME_FLAGS, X_OK,
 };
 use super::user_ptr::{
     PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, translated_byte_buffer_checked,
 };
 use crate::fs::{
-    File, OpenFlags, WorkingDir, link_file_at, lookup_dir_at, mkdir_at, normalize_path,
+    File, FileStat, OpenFlags, WorkingDir, link_file_at, lookup_dir_at, mkdir_at, normalize_path,
     open_devfs_child, open_file_at, rename_at, rmdir_at, symlink_at, unlink_file_at,
 };
 use crate::mm::UserBuffer;
@@ -32,6 +34,19 @@ fn path_base(dirfd: isize, path: &str) -> SysResult<WorkingDir> {
     } else {
         dirfd_base(dirfd)
     }
+}
+
+fn check_access_mode(stat: &FileStat, mode: i32) -> SysResult<()> {
+    if mode == F_OK {
+        return Ok(());
+    }
+
+    // UNFINISHED: The kernel runs all user tasks as uid 0 — only the root
+    // execute-bit check is meaningful until real credentials are implemented.
+    if mode & X_OK != 0 && stat.mode & 0o111 == 0 {
+        return Err(SysError::EACCES);
+    }
+    Ok(())
 }
 
 fn copy_c_string_to_user(ptr: *mut u8, buf_len: usize, string: &str) -> SysResult {
@@ -115,6 +130,27 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> SysR
     let base = path_base(dirfd, path.as_str())?;
     let file = open_file_at(base, path.as_str(), flags)?;
     install_open_file(file, flags)
+}
+
+pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32, flags: i32) -> SysResult {
+    if mode & !VALID_ACCESS_MODE != 0 || flags & !VALID_FACCESSAT_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+    // CONTEXT: AT_EACCESS is accepted as a no-op because this kernel does not
+    // yet distinguish real and effective credentials for user tasks.
+    let _use_effective_ids = flags & AT_EACCESS != 0;
+
+    let token = current_user_token();
+    let path = read_user_c_string(token, path, PATH_MAX)?;
+    if path.is_empty() {
+        // UNFINISHED: Linux faccessat with AT_EMPTY_PATH can operate on dirfd;
+        // this syscall currently implements only pathname-based access checks.
+        return Err(SysError::ENOENT);
+    }
+
+    let stat = resolve_stat(dirfd, path.as_str())?;
+    check_access_mode(&stat, mode)?;
+    Ok(0)
 }
 
 pub fn sys_chdir(path: *const u8) -> SysResult {

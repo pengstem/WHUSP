@@ -1,6 +1,6 @@
 # OSKernel2026 开发任务清单
 
-更新时间：2026-04-30
+更新时间：2026-05-01
 
 ## 快照
 
@@ -126,7 +126,7 @@
 - [ ] 最小 `/dev/null` / devfs 尚未实现，影响 `netperf`、`iperf`、LTP 等 harness。
 - [ ] `sys_kill(129)` 仍把 Linux signum 当 bitflags 解析，需要按整数信号号修正。
 
-### 2026-04-30 测试刷新后新增缺口
+### 2026-05-01 测试刷新后新增缺口
 
 | 优先级 | Syscall / 功能 | 解锁测试 | 当前症状 | 修复方向 |
 |--------|---------------|----------|---------|---------|
@@ -135,11 +135,17 @@
 | 3 | `utimensat(88)` | busybox `touch` | `Function not implemented` (ENOSYS) | 在 VFS/ext4 层支持修改文件时间戳 |
 | 4 | `unlinkat(AT_REMOVEDIR)` / rmdir 语义 | busybox `rmdir` | 返回 `EINVAL` 而非成功 | 检查 `unlinkat` 的 `AT_REMOVEDIR` flag 分流到 ext4 rmdir |
 | 5 | `linkat(37)` | busybox `cp` | 返回 `EINVAL` | 检查 flags 解析或在 ext4 层实现硬链接 |
-| 6 | Lua FP/signal SIGSEGV | lua round_num, sin30 | `Segmentation Fault, SIGSEGV=11` | 调查 FPU 上下文保存/恢复或 mmap 边界问题 |
-| 7 | `kill(129)` 信号投递 | busybox `kill $!` | `Invalid argument` | 修正 signum 解析（整数 vs bitflags） |
-| 8 | `/proc` 文件系统 | busybox df/ps/free | `No such file or directory` | 实现 procfs 最小子集（/proc/mounts, /proc/meminfo, /proc/[pid]/stat） |
+| 6 | FPU 寄存器（f0-f31, fcsr）未保存/恢复 | lua round_num, sin30 | `Segmentation Fault, SIGSEGV=11` | `trap.S`/`switch.S`/`TrapContext` 均未保存浮点寄存器，多进程 FPU 状态互相污染导致计算错误 | 在 trap.S 和 switch.S 中加入 f0-f31 + fcsr 的保存/恢复；进程初始化时设置 `mstatus.FS` = Initial |
+| 7 | `kill(129)` — signal=0 进程存活检查 | libctest 每用例开头 | `Invalid argument` (EINVAL) | 在 `sys_kill` 中当 `signal==0` 时直接返回 `Ok(0)`（不发信号，仅检查进程存在） |
+| 8 | `kill(129)` — 信号投递 | busybox `kill $!` | `Invalid argument` | 修正 signum 解析（整数 vs bitflags） |
+| 9 | `/proc` 文件系统 | busybox df/ps/free | `No such file or directory` | 实现 procfs 最小子集（/proc/mounts, /proc/meminfo, /proc/[pid]/stat） |
+| 10 | `lseek(62)` | libctest fdopen/fscanf/fwscanf 等 | `ftello/fseeko` 返回 `Function not implemented` (ENOSYS=38) | 给 `File` trait 加 `seek` 方法；`VfsFile` 修改 `SleepMutex<usize>` offset；pipe/stdio 返回 `ESPIPE` |
+| 11 | `prlimit64(261)` 支持 `getrlimit(RLIMIT_NOFILE)` | libctest 每用例开头 | `getrlimit 3: Function not implemented` | 实现 `prlimit64`，返回当前 `FD_LIMIT` 值 |
+| 12 | `rt_sigtimedwait(137)` | libctest 每用例结尾 | `sigtimedwait failed: Function not implemented` | 新增 syscall 137，至少返回 `EAGAIN`（无待处理信号） |
+| 13 | 创建 `/tmp` 目录 | libctest mkstemp 相关用例 | `mkstemp(tmp) failed (errno = 2 = ENOENT)` | 在 EXT4 文件系统初始化时创建 `/tmp` 目录 |
+| 14 | 线程取消 / `pthread_cancel` | libctest pthread_cancel_points | `pthread_cancel(td) failed: Function not implemented` | 调查线程取消所需的底层支持（信号投递、`rt_sigprocmask` 等） |
 
-### 2026-04-30 测试结果快照
+### 2026-05-01 测试结果快照
 
 | 测试组 | 通过 | 失败 | 通过率 |
 |--------|------|------|--------|
