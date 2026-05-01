@@ -1,9 +1,9 @@
 use crate::fs::{File, OpenFlags, open_file_at};
 use crate::mm::{translated_ref, translated_refmut, translated_str};
 use crate::task::{
-    CloneArgs, CloneFlags, ProcessCpuTimesSnapshot, SignalFlags, add_task, clone_current_thread,
-    current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
-    suspend_current_and_run_next,
+    CloneArgs, CloneFlags, ProcessCpuTimesSnapshot, SignalFlags, SignalInfo, add_task,
+    clone_current_thread, current_process, current_task, current_user_token,
+    exit_current_and_run_next, pid2process, suspend_current_and_run_next,
 };
 use crate::timer::{get_time_clock_ticks, us_to_clock_ticks};
 use alloc::string::{String, ToString};
@@ -437,7 +437,12 @@ pub fn sys_kill(pid: usize, signal: u32) -> SysResult {
     let flag = SignalFlags::from_signum(signal).ok_or(SysError::EINVAL)?;
     let process = pid2process(pid).ok_or(SysError::ESRCH)?;
     if !flag.is_empty() {
-        process.inner_exclusive_access().signals |= flag;
+        let sender_pid = current_process().getpid() as i32;
+        let mut inner = process.inner_exclusive_access();
+        inner.signals |= flag;
+        if (signal as usize) < inner.signal_infos.len() {
+            inner.signal_infos[signal as usize] = Some(SignalInfo::user(signal as i32, sender_pid));
+        }
     }
     Ok(0)
 }

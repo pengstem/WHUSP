@@ -1,5 +1,8 @@
 use super::id::RecycleAllocator;
-use super::{FD_LIMIT, FdTableEntry, PidHandle, SignalFlags, TaskControlBlock, TaskStatus};
+use super::{
+    FD_LIMIT, FdTableEntry, PidHandle, SIGNAL_INFO_SLOTS, SignalFlags, SignalInfo,
+    TaskControlBlock, TaskStatus,
+};
 use crate::fs::WorkingDir;
 use crate::mm::MemorySet;
 use crate::sync::{UPIntrFreeCell, UPIntrRefMut};
@@ -105,6 +108,7 @@ pub struct ProcessControlBlockInner {
     pub exit_code: i32,
     pub fd_table: Vec<Option<FdTableEntry>>,
     pub signals: SignalFlags,
+    pub signal_infos: [Option<SignalInfo>; SIGNAL_INFO_SLOTS],
     pub cpu_times: ProcessCpuTimes,
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     pub task_res_allocator: RecycleAllocator,

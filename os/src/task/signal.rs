@@ -1,5 +1,10 @@
 use bitflags::*;
 
+pub const SIGNAL_INFO_SLOTS: usize = 32;
+
+pub const SI_USER: i32 = 0;
+pub const CLD_EXITED: i32 = 1;
+
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct SignalFlags: u32 {
@@ -21,6 +26,37 @@ bitflags! {
         const SIGCHLD   = 1 << 17;
         const SIGCONT   = 1 << 18;
         const SIGSTOP   = 1 << 19;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SignalInfo {
+    pub signo: i32,
+    pub code: i32,
+    pub pid: i32,
+    pub uid: u32,
+    pub status: i32,
+}
+
+impl SignalInfo {
+    pub fn user(signo: i32, pid: i32) -> Self {
+        Self {
+            signo,
+            code: SI_USER,
+            pid,
+            uid: 0,
+            status: 0,
+        }
+    }
+
+    pub fn child_exit(signo: i32, pid: i32, status: i32) -> Self {
+        Self {
+            signo,
+            code: CLD_EXITED,
+            pid,
+            uid: 0,
+            status,
+        }
     }
 }
 

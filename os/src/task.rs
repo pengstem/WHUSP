@@ -32,7 +32,7 @@ pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
     current_user_token, run_tasks, schedule, take_current_task,
 };
-pub use signal::SignalFlags;
+pub use signal::{SIGNAL_INFO_SLOTS, SignalFlags, SignalInfo};
 pub use task::{TaskControlBlock, TaskStatus};
 
 fn with_current_process(process_fn: impl FnOnce(&ProcessControlBlock)) {
@@ -178,11 +178,16 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         recycle_res.clear();
 
         if let Some(parent) = parent {
-            let parent_task = parent
-                .inner_exclusive_access()
-                .tasks
-                .first()
-                .and_then(|task| task.as_ref().map(Arc::clone));
+            let parent_task = {
+                let mut parent_inner = parent.inner_exclusive_access();
+                parent_inner.signals |= SignalFlags::SIGCHLD;
+                parent_inner.signal_infos[17] =
+                    Some(SignalInfo::child_exit(17, pid as i32, exit_code));
+                parent_inner
+                    .tasks
+                    .first()
+                    .and_then(|task| task.as_ref().map(Arc::clone))
+            };
             if let Some(parent_task) = parent_task {
                 let is_blocked =
                     parent_task.inner_exclusive_access().task_status == TaskStatus::Blocked;
