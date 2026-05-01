@@ -225,7 +225,7 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32, flags: i32) -> Sy
         return Err(SysError::ENOENT);
     }
 
-    let stat = resolve_stat(dirfd, path.as_str())?;
+    let stat = resolve_stat(dirfd, path.as_str(), true)?;
     check_access_mode(&stat, mode)?;
     Ok(0)
 }
@@ -281,9 +281,6 @@ pub fn sys_utimensat(
         return apply_utimensat_to_file(file, atime, mtime, now);
     }
 
-    // UNFINISHED: Linux AT_SYMLINK_NOFOLLOW updates the symlink inode itself.
-    // Current path resolution still has partial final-symlink semantics; accept
-    // the flag for libc/BusyBox compatibility and route through O_PATH.
     let open_flags = if flags & AT_SYMLINK_NOFOLLOW != 0 {
         OpenFlags::PATH | OpenFlags::NOFOLLOW
     } else {
@@ -394,8 +391,6 @@ pub fn sys_symlinkat(target: *const u8, newdirfd: isize, linkpath: *const u8) ->
     }
     let base = path_base(newdirfd, linkpath.as_str())?;
     symlink_at(base, target.as_str(), linkpath.as_str())?;
-    // UNFINISHED: Linux path lookup follows symlink targets. This syscall only
-    // creates real EXT4 symlink nodes; path resolution remains partial.
     Ok(0)
 }
 

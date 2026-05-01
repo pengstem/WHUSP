@@ -5,8 +5,8 @@ use super::super::errno::{SysError, SysResult};
 use super::fd::get_file_by_fd;
 use super::path::dirfd_base;
 use super::uapi::{
-    AT_EMPTY_PATH, AT_FDCWD, LinuxKstat, LinuxStatfs, LinuxStatx, STATX_RESERVED,
-    VALID_FSTATAT_FLAGS, VALID_STATX_FLAGS,
+    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, LinuxKstat, LinuxStatfs, LinuxStatx,
+    STATX_RESERVED, VALID_FSTATAT_FLAGS, VALID_STATX_FLAGS,
 };
 use super::user_ptr::{PATH_MAX, read_user_c_string, write_user_value};
 
@@ -21,7 +21,7 @@ fn write_stat_result<T: From<FileStat> + Copy>(
 
 fn stat_by_dirfd(dirfd: isize) -> SysResult<FileStat> {
     if dirfd == AT_FDCWD {
-        return Ok(stat_at(current_process().working_dir(), ".")?);
+        return Ok(stat_at(current_process().working_dir(), ".", true)?);
     }
     if dirfd < 0 {
         return Err(SysError::EBADF);
@@ -29,8 +29,11 @@ fn stat_by_dirfd(dirfd: isize) -> SysResult<FileStat> {
     Ok(get_file_by_fd(dirfd as usize)?.stat())
 }
 
-// UNFINISHED: AT_SYMLINK_NOFOLLOW is accepted but the resolver does not distinguish follow vs nofollow on the final component yet.
-pub(super) fn resolve_stat(dirfd: isize, path: &str) -> SysResult<FileStat> {
+pub(super) fn resolve_stat(
+    dirfd: isize,
+    path: &str,
+    follow_final_symlink: bool,
+) -> SysResult<FileStat> {
     if path.is_empty() {
         return stat_by_dirfd(dirfd);
     }
@@ -46,7 +49,7 @@ pub(super) fn resolve_stat(dirfd: isize, path: &str) -> SysResult<FileStat> {
     } else {
         dirfd_base(dirfd)?
     };
-    Ok(stat_at(base, path)?)
+    Ok(stat_at(base, path, follow_final_symlink)?)
 }
 
 pub fn sys_fstat(fd: usize, statbuf: *mut LinuxKstat) -> SysResult {
@@ -76,7 +79,12 @@ pub fn sys_newfstatat(
     if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
         return Err(SysError::ENOENT);
     }
-    write_stat_result(token, statbuf, resolve_stat(dirfd, path.as_str())?)
+    let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
+    write_stat_result(
+        token,
+        statbuf,
+        resolve_stat(dirfd, path.as_str(), follow_final_symlink)?,
+    )
 }
 
 pub fn sys_statfs(pathname: *const u8, statfsbuf: *mut LinuxStatfs) -> SysResult {
@@ -88,7 +96,7 @@ pub fn sys_statfs(pathname: *const u8, statfsbuf: *mut LinuxStatfs) -> SysResult
     if path.is_empty() {
         return Err(SysError::ENOENT);
     }
-    let stat = resolve_stat(AT_FDCWD, path.as_str())?;
+    let stat = resolve_stat(AT_FDCWD, path.as_str(), true)?;
     let fs_stat = statfs_for_mount(MountId(stat.dev as usize)).ok_or(SysError::ENOSYS)?;
     write_user_value(token, statfsbuf, &LinuxStatfs::from(fs_stat))?;
     Ok(0)
@@ -113,5 +121,10 @@ pub fn sys_statx(
     if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
         return Err(SysError::ENOENT);
     }
-    write_stat_result(token, statxbuf, resolve_stat(dirfd, path.as_str())?)
+    let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
+    write_stat_result(
+        token,
+        statxbuf,
+        resolve_stat(dirfd, path.as_str(), follow_final_symlink)?,
+    )
 }

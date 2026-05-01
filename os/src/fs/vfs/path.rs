@@ -3,8 +3,13 @@ use super::super::mount::{
 };
 use super::super::path::WorkingDir;
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId};
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 
 const EXT4_NAME_MAX: usize = 255;
+const SYMLINK_TARGET_MAX: usize = 4096;
+const MAX_SYMLINK_FOLLOWS: usize = 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct VfsPath {
@@ -24,8 +29,19 @@ pub(crate) enum VfsOpenTarget<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LookupMode {
-    Normal,
+    FollowFinal,
+    NoFollowFinal,
     MountTarget,
+}
+
+impl LookupMode {
+    fn follow_final_symlink(self) -> bool {
+        matches!(self, Self::FollowFinal | Self::MountTarget)
+    }
+
+    fn follow_final_mount(self) -> bool {
+        !matches!(self, Self::MountTarget)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -131,18 +147,24 @@ fn start_cursor(cwd: Option<WorkingDir>, path: &str) -> VfsCursor {
     }
 }
 
-fn maybe_follow_symlink(
-    cursor: VfsCursor,
-    _mode: LookupMode,
-    _is_final: bool,
-) -> FsResult<VfsCursor> {
-    if cursor.kind == FsNodeKind::Symlink {
-        // UNFINISHED: Linux pathname lookup follows symlinks according to
-        // LOOKUP_FOLLOW, O_NOFOLLOW, and final-vs-non-final component rules.
-        // This VFS has readlink support for syscall compatibility, but symlink
-        // target traversal remains unresolved here.
+fn path_components(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .map(String::from)
+        .collect()
+}
+
+fn read_symlink_target(cursor: VfsCursor) -> FsResult<String> {
+    let mut buffer = vec![0u8; SYMLINK_TARGET_MAX + 1];
+    let len = with_mount(cursor.node.mount_id, |mount| {
+        mount.readlink(cursor.node.ino, &mut buffer)
+    })
+    .ok_or(FsError::Io)??;
+    if len > SYMLINK_TARGET_MAX {
+        return Err(FsError::NameTooLong);
     }
-    Ok(cursor)
+    let target = core::str::from_utf8(&buffer[..len]).map_err(|_| FsError::InvalidInput)?;
+    Ok(String::from(target))
 }
 
 fn resolve_path_inner(
@@ -153,26 +175,48 @@ fn resolve_path_inner(
     if path.is_empty() {
         return Err(FsError::NotFound);
     }
-    let follow_final_mount = mode == LookupMode::Normal;
     let mut cursor = start_cursor(cwd, path);
-    let mut components = path
-        .split('/')
-        .filter(|component| !component.is_empty() && *component != ".")
-        .peekable();
-    if follow_final_mount && components.peek().is_none() {
+    let mut components = path_components(path);
+    let mut index = 0usize;
+    let mut symlink_follows = 0usize;
+
+    if mode.follow_final_mount() && components.is_empty() {
         cursor = follow_mounted_root(cursor);
     }
-    while let Some(component) = components.next() {
-        let is_final = components.peek().is_none();
+    while index < components.len() {
+        let is_final = index + 1 == components.len();
+        let component = components[index].as_str();
         if component == ".." {
             cursor = lookup_parent(cursor)?;
         } else {
+            let parent = cursor;
             cursor = lookup_child_raw(cursor, component)?;
-            cursor = maybe_follow_symlink(cursor, mode, is_final)?;
+            if cursor.kind == FsNodeKind::Symlink && (!is_final || mode.follow_final_symlink()) {
+                if symlink_follows == MAX_SYMLINK_FOLLOWS {
+                    return Err(FsError::Loop);
+                }
+                symlink_follows += 1;
+
+                let target = read_symlink_target(cursor)?;
+                let mut next_components = path_components(target.as_str());
+                next_components.extend(components[index + 1..].iter().cloned());
+                components = next_components;
+                index = 0;
+                cursor = if target.starts_with('/') {
+                    VfsCursor::root()
+                } else {
+                    parent
+                };
+                if mode.follow_final_mount() && components.is_empty() {
+                    cursor = follow_mounted_root(cursor);
+                }
+                continue;
+            }
         }
-        if follow_final_mount || !is_final {
+        if mode.follow_final_mount() || !is_final {
             cursor = follow_mounted_root(cursor);
         }
+        index += 1;
     }
     Ok(cursor)
 }
@@ -228,7 +272,7 @@ pub(crate) fn resolve_create_parent(
         let cursor = start_cursor(cwd, path);
         follow_mounted_root(cursor).as_path()
     } else {
-        resolve_existing(cwd, parent_path, LookupMode::Normal)?
+        resolve_existing(cwd, parent_path, LookupMode::FollowFinal)?
     };
     if parent.kind != FsNodeKind::Directory {
         return Err(FsError::NotDir);
@@ -242,9 +286,15 @@ pub(crate) fn resolve_create_parent(
 pub(crate) fn resolve_open(
     cwd: Option<WorkingDir>,
     path: &str,
+    follow_final_symlink: bool,
     for_create: bool,
 ) -> FsResult<VfsOpenTarget<'_>> {
-    match resolve_existing(cwd, path, LookupMode::Normal) {
+    let mode = if follow_final_symlink {
+        LookupMode::FollowFinal
+    } else {
+        LookupMode::NoFollowFinal
+    };
+    match resolve_existing(cwd, path, mode) {
         Ok(existing) => return Ok(VfsOpenTarget::Existing(existing)),
         Err(FsError::NotFound) if for_create => {}
         Err(err) => return Err(err),

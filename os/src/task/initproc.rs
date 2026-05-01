@@ -22,10 +22,10 @@ pub(super) fn load() -> Option<KernelInitProc> {
         data: inode.read_all(),
         argv: vec![
             BUSYBOX_PATH.into(),
-            BUSYBOX_APPLET.into(),
-            // BUSYBOX_COMMAND_FLAG.into(),
-            // BASIC_MUSL_RUNNER.into(),
+            "sh".into(),
+            "-c".into(),
+            "/musl/busybox mkdir -p /bin && /musl/busybox --install -s /bin && exec /musl/busybox sh".into(),
         ],
-        envp: Vec::new(),
+        envp: vec!["PATH=/:/bin:/sbin:/usr/bin:/usr/local/bin".into()],
     })
 }

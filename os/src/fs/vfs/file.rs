@@ -83,7 +83,13 @@ fn open_vfs_file_impl(
     name: &str,
     flags: OpenFlags,
 ) -> FsResult<Arc<VfsFile>> {
-    let resolved = vfs_path::resolve_open(cwd, name, flags.contains(OpenFlags::CREATE))?;
+    let follow_final_symlink = !flags.contains(OpenFlags::NOFOLLOW);
+    let resolved = vfs_path::resolve_open(
+        cwd,
+        name,
+        follow_final_symlink,
+        flags.contains(OpenFlags::CREATE),
+    )?;
 
     let (path, readable, writable) = match resolved {
         VfsOpenTarget::Existing(path) => {
@@ -103,8 +109,6 @@ fn open_vfs_file_impl(
                     if flags.contains(OpenFlags::NOFOLLOW) && !flags.contains(OpenFlags::PATH) {
                         return Err(FsError::Loop);
                     }
-                    // UNFINISHED: Linux openat follows final symlinks unless O_NOFOLLOW.
-                    // This VFS still leaves the symlink inode open for compatibility.
                     // CONTEXT: readlinkat("", fd) needs an O_PATH|O_NOFOLLOW fd
                     // that refers to the symlink itself; full O_PATH semantics are
                     // intentionally deferred.
@@ -160,11 +164,20 @@ pub(crate) fn open_file_at(
     open_vfs_file_impl(Some(cwd), name, flags).map(|file| file as Arc<dyn File + Send + Sync>)
 }
 
-pub(crate) fn stat_at(cwd: WorkingDir, name: &str) -> FsResult<FileStat> {
+pub(crate) fn stat_at(
+    cwd: WorkingDir,
+    name: &str,
+    follow_final_symlink: bool,
+) -> FsResult<FileStat> {
     if let Some(stat) = devfs::stat(name) {
         return Ok(stat);
     }
-    let path = vfs_path::resolve_existing(Some(cwd), name, LookupMode::Normal)?;
+    let mode = if follow_final_symlink {
+        LookupMode::FollowFinal
+    } else {
+        LookupMode::NoFollowFinal
+    };
+    let path = vfs_path::resolve_existing(Some(cwd), name, mode)?;
     let mut stat =
         with_mount(path.node.mount_id, |mount| mount.stat(path.node.ino)).ok_or(FsError::Io)??;
     stat.dev = path.node.mount_id.0 as u64;
@@ -172,7 +185,7 @@ pub(crate) fn stat_at(cwd: WorkingDir, name: &str) -> FsResult<FileStat> {
 }
 
 pub(crate) fn lookup_dir_at(cwd: WorkingDir, name: &str) -> FsResult<WorkingDir> {
-    vfs_path::resolve_existing(Some(cwd), name, LookupMode::Normal)?
+    vfs_path::resolve_existing(Some(cwd), name, LookupMode::FollowFinal)?
         .working_dir()
         .ok_or(FsError::NotDir)
 }
