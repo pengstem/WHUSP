@@ -62,6 +62,13 @@ pub struct FileTimestamp {
     pub nsec: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SeekWhence {
+    Set,
+    Current,
+    End,
+}
+
 impl FileTimestamp {
     pub fn now() -> Self {
         Self::from_nanos(crate::timer::wall_time_nanos())
@@ -118,6 +125,9 @@ pub trait File: Send + Sync {
     }
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
+    }
+    fn seek(&self, _offset: i64, _whence: SeekWhence) -> FsResult<usize> {
+        Err(FsError::IllegalSeek)
     }
     fn read_dirent64(&self, _buf: UserBuffer) -> FsResult<isize> {
         Err(FsError::NotDir)

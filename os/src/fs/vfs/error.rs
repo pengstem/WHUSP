@@ -15,6 +15,7 @@ pub(crate) enum FsError {
     Unsupported,
     ReadOnly,
     NoSpace,
+    IllegalSeek,
 }
 
 pub(crate) type FsResult<T = ()> = Result<T, FsError>;

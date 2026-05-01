@@ -25,6 +25,7 @@ pub enum SysError {
     EMFILE = 24,
     ENOTTY = 25,
     ENOSPC = 28,
+    ESPIPE = 29,
     EROFS = 30,
     ERANGE = 34,
     ENAMETOOLONG = 36,
@@ -54,6 +55,7 @@ impl From<crate::fs::FsError> for SysError {
             crate::fs::FsError::Unsupported => Self::ENOTSUP,
             crate::fs::FsError::ReadOnly => Self::EROFS,
             crate::fs::FsError::NoSpace => Self::ENOSPC,
+            crate::fs::FsError::IllegalSeek => Self::ESPIPE,
         }
     }
 }

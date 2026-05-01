@@ -1,4 +1,4 @@
-use crate::fs::{OpenFlags, PollEvents, S_IFDIR};
+use crate::fs::{OpenFlags, PollEvents, S_IFDIR, SeekWhence};
 use crate::mm::{UserBuffer, translated_byte_buffer};
 use crate::task::{FdTableEntry, current_user_token};
 use alloc::vec::Vec;
@@ -51,6 +51,23 @@ fn write_with_status_flags(entry: &FdTableEntry, buf: UserBuffer) -> usize {
     } else {
         file.write(buf)
     }
+}
+
+pub fn sys_lseek(fd: usize, offset: i64, whence: usize) -> SysResult {
+    let whence = match whence {
+        0 => SeekWhence::Set,
+        1 => SeekWhence::Current,
+        2 => SeekWhence::End,
+        // UNFINISHED: Linux SEEK_DATA and SEEK_HOLE are not implemented yet.
+        // They require sparse-file data/hole discovery in the filesystem layer.
+        _ => return Err(SysError::EINVAL),
+    };
+    let file = get_file_by_fd(fd)?;
+    let new_offset = file.seek(offset, whence)?;
+    if new_offset > isize::MAX as usize {
+        return Err(SysError::EINVAL);
+    }
+    Ok(new_offset as isize)
 }
 
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {

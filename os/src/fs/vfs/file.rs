@@ -3,7 +3,7 @@ use super::super::inode::OpenFlags;
 use super::super::mount::with_mount;
 use super::super::path::WorkingDir;
 use super::super::status_flags::StatusFlagsCell;
-use super::super::{File, FileStat, FileTimestamp};
+use super::super::{File, FileStat, FileTimestamp, SeekWhence};
 use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
 use crate::mm::UserBuffer;
@@ -253,6 +253,27 @@ impl File for VfsFile {
             mount.write_at(self.node.ino, buf, offset as u64)
         })
         .expect("filesystem mount is missing")
+    }
+
+    fn seek(&self, offset: i64, whence: SeekWhence) -> FsResult<usize> {
+        let mut current = self.offset.lock();
+        let base = match whence {
+            SeekWhence::Set => 0i128,
+            SeekWhence::Current => *current as i128,
+            SeekWhence::End => {
+                let stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))
+                    .ok_or(FsError::Io)??;
+                stat.size as i128
+            }
+        };
+        let new_offset = base
+            .checked_add(offset as i128)
+            .ok_or(FsError::InvalidInput)?;
+        if new_offset < 0 || new_offset > usize::MAX as i128 || new_offset > isize::MAX as i128 {
+            return Err(FsError::InvalidInput);
+        }
+        *current = new_offset as usize;
+        Ok(*current)
     }
 
     fn read_dirent64(&self, user_buf: UserBuffer) -> FsResult<isize> {
