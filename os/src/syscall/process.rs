@@ -5,7 +5,7 @@ use crate::task::{
     current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
     suspend_current_and_run_next,
 };
-use crate::timer::{get_time_clock_ticks, get_time_us, us_to_clock_ticks};
+use crate::timer::{get_time_clock_ticks, us_to_clock_ticks};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -125,13 +125,10 @@ pub fn sys_sched_yield() -> isize {
 pub fn sys_gettimeofday(tv: *mut LinuxTimeVal, tz: *mut LinuxTimezone) -> SysResult {
     let token = current_user_token();
     if !tv.is_null() {
-        // UNFINISHED: Linux gettimeofday reports CLOCK_REALTIME wall-clock time
-        // since the Unix epoch; this kernel has no RTC-backed epoch yet, so the
-        // value is derived from the monotonic machine timer.
-        let current_us = get_time_us();
+        let wall_ns = crate::timer::wall_time_nanos();
         let time = LinuxTimeVal {
-            tv_sec: (current_us / 1_000_000) as isize,
-            tv_usec: (current_us % 1_000_000) as isize,
+            tv_sec: (wall_ns / 1_000_000_000) as isize,
+            tv_usec: ((wall_ns % 1_000_000_000) / 1_000) as isize,
         };
         write_user_value(token, tv, &time)?;
     }

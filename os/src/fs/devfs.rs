@@ -16,6 +16,7 @@ enum DevNode {
     Zero,
     Tty,
     TtyS0,
+    Rtc,
 }
 
 impl DevNode {
@@ -26,6 +27,7 @@ impl DevNode {
             Self::Zero => 3,
             Self::Tty => 4,
             Self::TtyS0 => 5,
+            Self::Rtc => 6,
         }
     }
 
@@ -36,6 +38,7 @@ impl DevNode {
             Self::Zero => linux_makedev(1, 5),
             Self::Tty => linux_makedev(5, 0),
             Self::TtyS0 => linux_makedev(4, 64),
+            Self::Rtc => linux_makedev(253, 0),
         }
     }
 
@@ -70,7 +73,7 @@ struct DevDirEntry {
     dtype: u8,
 }
 
-const DEV_DIR_ENTRIES: [DevDirEntry; 6] = [
+const DEV_DIR_ENTRIES: [DevDirEntry; 7] = [
     DevDirEntry {
         node: DevNode::Root,
         name: b".",
@@ -101,6 +104,11 @@ const DEV_DIR_ENTRIES: [DevDirEntry; 6] = [
         name: b"ttyS0",
         dtype: DT_CHR,
     },
+    DevDirEntry {
+        node: DevNode::Rtc,
+        name: b"rtc",
+        dtype: DT_CHR,
+    },
 ];
 
 fn linux_makedev(major: u64, minor: u64) -> u64 {
@@ -118,6 +126,7 @@ fn lookup_absolute(path: &str) -> Option<DevNode> {
         "/dev/zero" => Some(DevNode::Zero),
         "/dev/tty" => Some(DevNode::Tty),
         "/dev/ttyS0" => Some(DevNode::TtyS0),
+        "/dev/rtc" | "/dev/rtc0" | "/dev/misc/rtc" => Some(DevNode::Rtc),
         _ => None,
     }
 }
@@ -129,6 +138,7 @@ fn lookup_child(path: &str) -> Option<DevNode> {
         "zero" => Some(DevNode::Zero),
         "tty" => Some(DevNode::Tty),
         "ttyS0" => Some(DevNode::TtyS0),
+        "rtc" | "rtc0" => Some(DevNode::Rtc),
         _ => None,
     }
 }
@@ -307,7 +317,7 @@ impl File for DevFsFile {
 
     fn read(&self, user_buf: UserBuffer) -> usize {
         match self.node {
-            DevNode::Root | DevNode::Null => 0,
+            DevNode::Root | DevNode::Null | DevNode::Rtc => 0,
             DevNode::Zero => read_zero(user_buf),
             DevNode::Tty | DevNode::TtyS0 => read_console(user_buf),
         }
@@ -315,7 +325,7 @@ impl File for DevFsFile {
 
     fn write(&self, user_buf: UserBuffer) -> usize {
         match self.node {
-            DevNode::Root => 0,
+            DevNode::Root | DevNode::Rtc => 0,
             DevNode::Null | DevNode::Zero => user_buf.len(),
             DevNode::Tty | DevNode::TtyS0 => write_console(user_buf),
         }
@@ -368,6 +378,10 @@ impl File for DevFsFile {
 
     fn is_tty(&self) -> bool {
         self.node.is_tty()
+    }
+
+    fn is_rtc(&self) -> bool {
+        self.node == DevNode::Rtc
     }
 
     fn is_devfs_dir(&self) -> bool {

@@ -67,6 +67,7 @@ struct BoardConfig {
     keyboard: Option<IrqDevice>,
     mouse: Option<IrqDevice>,
     net: Option<IrqDevice>,
+    rtc_base: usize,
     mmio_regions: [MmioRange; MMIO_REGION_CAPACITY],
     mmio_region_count: usize,
 }
@@ -92,6 +93,7 @@ impl BoardConfig {
             keyboard: None,
             mouse: None,
             net: None,
+            rtc_base: 0,
             mmio_regions: [MmioRange { base: 0, size: 0 }; MMIO_REGION_CAPACITY],
             mmio_region_count: 0,
         }
@@ -327,6 +329,12 @@ pub fn init_from_dtb(dtb_addr: usize) {
         }
     });
 
+    if let Some(rtc_node) = fdt.find_compatible(&["google,goldfish-rtc"]) {
+        let rtc_range = first_reg(rtc_node, "goldfish-rtc");
+        config.rtc_base = rtc_range.base;
+        push_mmio_region(&mut config, rtc_range);
+    }
+
     assert_ne!(config.block_count, 0, "DTB is missing virtio block device");
     assert_ne!(config.uart.base, 0, "DTB is missing uart base");
     assert_ne!(config.plic.base, 0, "DTB is missing plic base");
@@ -394,6 +402,10 @@ pub fn mouse_irq() -> Option<usize> {
 
 pub fn net_device() -> Option<IrqDevice> {
     board_config().net
+}
+
+pub fn rtc_base() -> usize {
+    board_config().rtc_base
 }
 
 pub fn device_init(hart_id: usize) {

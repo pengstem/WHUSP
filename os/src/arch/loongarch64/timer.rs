@@ -1,4 +1,5 @@
 use core::cmp::Ordering;
+use core::sync::atomic::AtomicU64;
 
 use crate::config::clock_freq;
 use crate::sbi::set_timer;
@@ -12,6 +13,26 @@ use loongArch64::time::Time;
 pub const TICKS_PER_SEC: usize = 100;
 const MSEC_PER_SEC: usize = 1000;
 const USEC_PER_SEC: usize = 1_000_000;
+const NSEC_PER_SEC: u64 = 1_000_000_000;
+
+static EPOCH_OFFSET_NS: AtomicU64 = AtomicU64::new(0);
+
+fn get_time_nanos() -> u64 {
+    let ticks = Time::read() as u64;
+    let freq = clock_freq() as u64;
+    let secs = ticks / freq;
+    let rem_ticks = ticks % freq;
+    secs * NSEC_PER_SEC + rem_ticks * NSEC_PER_SEC / freq
+}
+
+pub fn init_wall_clock() {
+    // UNFINISHED: LoongArch RTC discovery not yet implemented
+    let _ = &EPOCH_OFFSET_NS;
+}
+
+pub fn wall_time_nanos() -> u64 {
+    get_time_nanos().wrapping_add(EPOCH_OFFSET_NS.load(core::sync::atomic::Ordering::Relaxed))
+}
 
 pub fn get_time() -> usize {
     Time::read()

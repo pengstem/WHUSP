@@ -115,6 +115,9 @@ pub trait File: Send + Sync {
     fn is_tty(&self) -> bool {
         false
     }
+    fn is_rtc(&self) -> bool {
+        false
+    }
     fn is_devfs_dir(&self) -> bool {
         false
     }

@@ -58,6 +58,7 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     DTB_ADDR.store(dtb_addr, Ordering::Relaxed);
     board::init_from_dtb(dtb_addr);
     mm::init();
+    timer::init_wall_clock();
     UART.init();
     logging::init();
     info!("boot hart_id={hart_id}, dtb_addr={dtb_addr:#x}");

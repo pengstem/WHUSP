@@ -11,6 +11,7 @@ const TCSETS: usize = 0x5402;
 const TCSETSW: usize = 0x5403;
 const TCSETSF: usize = 0x5404;
 const TIOCGWINSZ: usize = 0x5413;
+const RTC_RD_TIME: usize = 0x80247009;
 
 const BRKINT: u32 = 0x0002;
 const ICRNL: u32 = 0x0100;
@@ -120,6 +121,11 @@ lazy_static! {
 
 pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
     let file = get_file_by_fd(fd)?;
+
+    if file.is_rtc() {
+        return handle_rtc_ioctl(request, argp);
+    }
+
     if !file.is_tty() {
         return Err(SysError::ENOTTY);
     }
@@ -144,5 +150,90 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
             Ok(0)
         }
         _ => Err(SysError::ENOTTY),
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxRtcTime {
+    tm_sec: i32,
+    tm_min: i32,
+    tm_hour: i32,
+    tm_mday: i32,
+    tm_mon: i32,
+    tm_year: i32,
+    tm_wday: i32,
+    tm_yday: i32,
+    tm_isdst: i32,
+}
+
+fn handle_rtc_ioctl(request: usize, argp: usize) -> SysResult {
+    match request {
+        RTC_RD_TIME => {
+            let nanos = crate::timer::wall_time_nanos();
+            let rtc_time = nanos_to_rtc_time(nanos);
+            let token = current_user_token();
+            write_user_value(token, argp as *mut LinuxRtcTime, &rtc_time)?;
+            Ok(0)
+        }
+        _ => Err(SysError::ENOTTY),
+    }
+}
+
+fn nanos_to_rtc_time(nanos: u64) -> LinuxRtcTime {
+    let total_secs = (nanos / 1_000_000_000) as i64;
+
+    let secs_in_day = (total_secs.rem_euclid(86400)) as i32;
+    let mut days = total_secs.div_euclid(86400);
+
+    let tm_sec = secs_in_day % 60;
+    let tm_min = (secs_in_day % 3600) / 60;
+    let tm_hour = secs_in_day / 3600;
+
+    // Jan 1 1970 was Thursday (4)
+    let tm_wday = ((days.rem_euclid(7)) as i32 + 4) % 7;
+
+    // Howard Hinnant's civil_from_days algorithm
+    days += 719468;
+    let era = (if days >= 0 { days } else { days - 146096 }) / 146097;
+    let doe = (days - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    let is_leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    let month_days: [i32; 12] = [
+        31,
+        if is_leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut tm_yday = (d as i32) - 1;
+    for i in 0..(m as usize - 1) {
+        tm_yday += month_days[i];
+    }
+
+    LinuxRtcTime {
+        tm_sec,
+        tm_min,
+        tm_hour,
+        tm_mday: d as i32,
+        tm_mon: (m as i32) - 1,
+        tm_year: (y as i32) - 1900,
+        tm_wday,
+        tm_yday,
+        tm_isdst: 0,
     }
 }
