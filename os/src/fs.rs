@@ -1,6 +1,7 @@
 mod devfs;
 mod dirent;
 mod ext4;
+mod fat;
 mod inode;
 mod mount;
 mod path;
@@ -138,7 +139,9 @@ pub(crate) use inode::{
     link_file_at, lookup_mount_target_dir_at, mkdir_at, rename_at, rmdir_at, symlink_at,
     unlink_file_at,
 };
-pub(crate) use mount::{MountError, MountId, mount_block_device_at, statfs_for_mount, unmount_at};
+pub(crate) use mount::{
+    MountError, MountId, mount_block_device_at, mount_fat_device_at, statfs_for_mount, unmount_at,
+};
 pub(crate) use path::{WorkingDir, normalize_path};
 pub use pipe::make_pipe;
 pub use stdio::{Stdin, Stdout};

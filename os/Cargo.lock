@@ -117,6 +117,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fatfs"
+version = "0.4.0"
+dependencies = [
+ "bitflags 2.11.1",
+ "log",
+]
+
+[[package]]
 name = "fdt"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -212,6 +220,7 @@ version = "0.1.1"
 dependencies = [
  "bitflags 2.11.1",
  "buddy_system_allocator",
+ "fatfs",
  "fdt",
  "lazy_static",
  "log",

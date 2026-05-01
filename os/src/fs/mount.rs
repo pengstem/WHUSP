@@ -1,4 +1,5 @@
 use super::ext4::Ext4Mount;
+use super::fat::FatMount;
 use super::path::WorkingDir;
 use super::procfs::ProcFs;
 use super::tmpfs::TmpFs;
@@ -53,6 +54,12 @@ pub(crate) struct MountInfo {
     pub(crate) target: String,
     pub(crate) fs_type: &'static str,
     pub(crate) options: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlockPartition {
+    pub(crate) start_block: u64,
+    pub(crate) block_count: u64,
 }
 
 lazy_static! {
@@ -119,6 +126,16 @@ fn block_source_name(device_index: usize) -> String {
     }
 }
 
+fn block_partition_source_name(device_index: usize, partition_index: usize) -> String {
+    format!("{}{}", block_source_name(device_index), partition_index)
+}
+
+fn read_le_u32(bytes: &[u8]) -> u32 {
+    let mut value = [0u8; 4];
+    value.copy_from_slice(bytes);
+    u32::from_le_bytes(value)
+}
+
 fn open_backend(
     kind: BackendKind,
     device: Arc<crate::drivers::block::VirtIOBlock>,
@@ -139,6 +156,16 @@ fn open_backend(
                 MountError::InvalidFilesystem
             }),
     }
+}
+
+fn register_mount(mounted: Arc<MountedFs>) -> MountId {
+    let mount_id = MountId(NEXT_MOUNT_ID.fetch_add(1, Ordering::SeqCst));
+    let mut mounts = MOUNTS.lock();
+    if mount_id.0 >= mounts.len() {
+        mounts.resize_with(mount_id.0 + 1, || None);
+    }
+    mounts[mount_id.0] = Some(mounted);
+    mount_id
 }
 
 pub(super) fn with_mount<V>(
@@ -269,18 +296,105 @@ pub(crate) fn mount_block_device_at(
     })
 }
 
+fn read_mbr_partition(
+    device: &crate::drivers::block::VirtIOBlock,
+    partition_index: usize,
+) -> Result<BlockPartition, MountError> {
+    if !(1..=4).contains(&partition_index) {
+        return Err(MountError::SourceMissing);
+    }
+    let mut mbr = [0u8; 512];
+    device.read_block(0, &mut mbr);
+    if mbr[510] != 0x55 || mbr[511] != 0xaa {
+        return Err(MountError::SourceMissing);
+    }
+    let entry_offset = 446 + (partition_index - 1) * 16;
+    let entry = &mbr[entry_offset..entry_offset + 16];
+    let partition_type = entry[4];
+    let start_block = read_le_u32(&entry[8..12]) as u64;
+    let block_count = read_le_u32(&entry[12..16]) as u64;
+    if partition_type == 0 || start_block == 0 || block_count == 0 {
+        return Err(MountError::SourceMissing);
+    }
+    let end_block = start_block
+        .checked_add(block_count)
+        .ok_or(MountError::SourceMissing)?;
+    if end_block > device.num_blocks() {
+        return Err(MountError::SourceMissing);
+    }
+    Ok(BlockPartition {
+        start_block,
+        block_count,
+    })
+}
+
+pub(crate) fn mount_fat_device_at(
+    target: WorkingDir,
+    device_index: usize,
+    partition_index: Option<usize>,
+) -> Result<MountId, MountError> {
+    let device = BLOCK_DEVICES
+        .get(device_index)
+        .ok_or(MountError::SourceMissing)?
+        .clone();
+    let (source, partition) = if let Some(partition_index) = partition_index {
+        (
+            block_partition_source_name(device_index, partition_index),
+            read_mbr_partition(&device, partition_index)?,
+        )
+    } else {
+        (
+            block_source_name(device_index),
+            BlockPartition {
+                start_block: 0,
+                block_count: device.num_blocks(),
+            },
+        )
+    };
+    let fat_mount = FatMount::open(device, partition).map_err(|err| {
+        warn!("fat open failed: {:?}", err);
+        MountError::InvalidFilesystem
+    })?;
+    mount_new_fs_at(
+        target,
+        MountedFs::new(Box::new(fat_mount), source, "vfat", "rw"),
+    )
+}
+
+fn mount_new_fs_at(target: WorkingDir, mounted: Arc<MountedFs>) -> Result<MountId, MountError> {
+    let target = VfsNodeId::new(target.mount_id(), target.ino());
+    if root_ino_for(target.mount_id).is_some_and(|root_ino| target.ino == root_ino) {
+        return Err(MountError::StaticRoot);
+    }
+
+    let target_is_busy = DYNAMIC_MOUNTS
+        .exclusive_session(|mounts| mounts.iter().any(|mount| mount.target == target));
+    if target_is_busy {
+        return Err(MountError::TargetBusy);
+    }
+
+    let covered_parent = lookup_covered_parent(target)?;
+    let target_path = mount_point_for_target(target);
+    let source_mount_id = register_mount(mounted);
+    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        if mounts.iter().any(|mount| mount.target == target) {
+            return Err(MountError::TargetBusy);
+        }
+        mounts.push(DynamicMount {
+            target,
+            covered_parent,
+            source_mount_id,
+            target_path,
+        });
+        Ok(source_mount_id)
+    })
+}
+
 pub(crate) fn register_pseudo_mount(
     backend: Box<dyn FileSystemBackend>,
     fs_type: &'static str,
 ) -> MountId {
-    let mount_id = MountId(NEXT_MOUNT_ID.fetch_add(1, Ordering::SeqCst));
-    let mounted = MountedFs::new(backend, fs_type.into(), fs_type, "rw");
-    let mut mounts = MOUNTS.lock();
-    if mount_id.0 >= mounts.len() {
-        mounts.resize_with(mount_id.0 + 1, || None);
-    }
-    mounts[mount_id.0] = Some(mounted);
-    mount_id
+    register_mount(MountedFs::new(backend, fs_type.into(), fs_type, "rw"))
 }
 
 pub(crate) fn mount_pseudo_fs_at(

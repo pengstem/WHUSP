@@ -15,6 +15,7 @@ virtio-drivers = "0.13.0"
 lwext4_rust = { path = "../vendor/lwext4_rust", default-features = false }
 log = "0.4"
 fdt = "0.1.5"
+fatfs = { path = "../vendor/crates/fatfs", default-features = false, features = ["alloc", "lfn", "unicode"] }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 riscv = { git = "https://github.com/rcore-os/riscv", features = ["inline-asm"] }
