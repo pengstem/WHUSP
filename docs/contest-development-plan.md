@@ -1,6 +1,6 @@
 # OSKernel2026 开发任务清单
 
-更新时间：2026-05-01
+更新时间：2026-05-02
 
 ## 快照
 
@@ -19,9 +19,9 @@
 ## 判断
 
 1. 最高优先级仍是 P0 submit runner 闭环。没有它，每次测试都依赖主机注入命令，不能稳定复现比赛提交形态。
-2. P2.6 的 VFS/EXT4 锁问题是第二优先级。它会同时影响 BusyBox pipeline、UnixBench、Lmbench、LTP 和重复 exec。
-3. `basic-musl` 还能短线补分，但要避免把 `/dev/vda2`、vfat、VFS 并发、FAT 支持混成一个大改。
-4. `mprotect` 已经接入源码，glibc 的旧失败结论需要重新验证；如果 glibc 仍失败，再从动态加载器日志继续收窄。
+2. P2.6 的 VFS/EXT4 长临界区和伪文件系统前置工作已完成，当前第二优先级转为补齐文件语义细节：`lseek` 回归、`fstat/stat` 稳健性、时间戳和目录/挂载边界。
+3. `basic-musl` 还能短线补分，但要把 `dup2`、`wait/waitpid`、`pipe`、`mount/umount` 等剩余扣分点分开处理。
+4. `mprotect` 已经接入源码，glibc 变体可以进入真实测试主体；后续按具体失败日志继续收窄。
 5. LoongArch 有 `kernel-la` / `run-la` 入口和产物目标，但比赛运行仍要按具体验证记录描述；当前 RISC-V 提交闭环没稳定前，不让 LoongArch 抢主线。
 
 ## P0 - 提交
@@ -83,20 +83,26 @@
 - [x] `mkdirat(34)`。
 - [x] `unlinkat(35)`。
 - [x] `umount2(39)`，支持严格的动态 EXT4 mount 范围和 busy-mount 检查。
-- [x] `mount(40)`，当前仅支持 whole-disk ext4，例如 `/dev/vda`。
+- [x] `mount(40)`，支持 whole-disk ext4、`/dev/vdXN` 分区解析、FAT/VFAT adapter 和 tmpfs fallback。
 - [x] `statfs(43)`，支持当前 VFS mount 的最小 filesystem 统计，解锁 BusyBox `df`。
 - [x] `chdir(49)`。
 - [x] `openat(56)` 基础路径、dirfd、目录 fd 能力。
 - [x] `pipe2(59)`，使用 Linux `int[2]` ABI，支持 `O_NONBLOCK` / `O_CLOEXEC`。
 - [x] `getdents64(61)`。
+- [x] `lseek(62)`，支持普通文件 `SEEK_SET` / `SEEK_CUR` / `SEEK_END`，pipe/stdio 返回 `ESPIPE`。
 - [x] `readv(65)` 和 `writev(66)`。
 - [x] `ppoll(73)` 最小 BusyBox 兼容。
 - [x] `newfstatat(79)` 和 `fstat(80)` 基础实现。
+- [x] `utimensat(88)` / `futimens` 基础实现，支持 fd、`AT_FDCWD`、`AT_EMPTY_PATH`、`UTIME_NOW`、`UTIME_OMIT`。
 - [x] `exit_group(94)` 单线程兼容实现。
 - [x] `waitid(95)` 基础实现。
 - [x] `nanosleep(101)` 和 `clock_nanosleep(115)` 基础实现。
+- [x] `syslog(116)` 最小兼容，解锁 BusyBox `dmesg`。
+- [x] `kill(129)` 按 Linux signum 解析，支持 signal 0 检查和基础信号投递。
+- [x] `rt_sigtimedwait(137)` 基础实现，可读取 pending signal，超时返回 `EAGAIN`。
 - [x] `times(153)` 源码已接入，使用当前进程 CPU time 快照。
 - [x] `uname(160)` 源码已接入，返回 Linux 风格 `utsname`。
+- [x] `getrlimit(163)` / `setrlimit(164)` / `prlimit64(261)` 基础实现，当前以 `RLIMIT_NOFILE` 等进程资源表为核心。
 - [x] `gettimeofday(169)` 源码已接入，当前基于 monotonic timer。
 - [x] `getppid(173)`。
 - [x] `brk(214)`。
@@ -118,49 +124,58 @@
 - [x] 可通过 `cd /musl && ./busybox sh ./basic_testcode.sh` 手工跑到 END marker。
 - [x] 上次全量记录中 `basic-musl` 官方 judge 为 `56 / 102`（2026-04-30 phase4-basic）。
 - [x] 上次记录中已经拿满的 basic 子项：`brk`、`chdir`、`clone`、`close`、`dup`、`fork`、`fstat`、`getcwd`、`getppid`、`mkdir`、`openat`、`uname`、`yield`。
-- [x] 2026-04-27 全量记录之后新增的 `times`、`mprotect`、`nanosleep` 等实现已在 2026-04-30 重跑中验证（56/102），2026-05-01 进一步提升到 31/32 子项。
+- [x] 2026-04-27 全量记录之后新增的 `times`、`mprotect`、`nanosleep`、`utimensat` 等实现已在后续重跑中验证；最新 basic 记录为 `60 / 102`。
 
 ### 当前 `basic-musl` 剩余缺口
 
-- [ ] `dup2` / `dup3` 兼容细节：2026-04-30 judge 中 `test_dup2` 为 `0 / 2`，2026-05-01 快照声称 31/32 子项通过需重新验证。
+- [ ] `dup2` / `dup3` 兼容细节：最新 basic 记录中 `test_dup2` 仍为 `0 / 2`。
 - [ ] `times(153)` 2026-04-30 judge 为 `1 / 6`，需重跑确认。
 - [ ] `gettimeofday(169)` 2026-04-30 judge 为 `1 / 3`，需重跑确认。
-- [ ] `mount(40)` / `umount2(39)` 的比赛测试语义未完成：`/dev/vda2` 分区源和 `vfat` 均未支持。
+- [ ] `mount(40)` / `umount2(39)` 的比赛测试语义未完成：已有 `/dev/vdXN` 分区解析和 FAT/VFAT adapter，但 basic mount/umount 仍只有 `2 / 5`。
 - [ ] `wait4/waitpid` 的 status、options、rusage 细节仍不足。
 - [ ] `openat` 的 `flags/mode/O_CREAT/O_DIRECTORY/O_APPEND/O_TRUNC/O_EXCL/O_NOFOLLOW` 仍需补齐。
 - [ ] `newfstatat/fstat/lstat` 的目录、pipe、stdio、设备号、时间戳、nlink 等细节仍需审计。
 - [ ] `getdents64` 的 offset 稳定性、跨 mount readdir、buffer 边界还需补齐。
 - [ ] `pipe` 的阻塞、非阻塞、关闭端、错误码等 Linux 细节还不完整。
 - [x] 最小 `/dev/null` / devfs 已实现，支持 `/dev/null`、`/dev/zero`、`/dev/random`、`/dev/urandom`。
-- [ ] `sys_kill(129)` 仍把 Linux signum 当 bitflags 解析，需要按整数信号号修正。
+- [x] `sys_kill(129)` 已按 Linux signum 解析；`busybox sh -c 'sleep 5' & ./busybox kill $!` 已通过。
 
-### 2026-05-01 测试刷新后新增缺口
+### 2026-05-02 当前新增缺口
 
-| 优先级 | Syscall / 功能 | 解锁测试 | 当前症状 | 修复方向 |
-|--------|---------------|----------|---------|---------|
-| ~~1~~ | ~~无 shebang 脚本 execve fallback~~ | ~~libctest-musl 整组~~ | ✅ 已实现 | 非 ELF 非 shebang 文件构造虚拟 `#!/bin/sh` 解释器，走 `busybox_fallback` 路径 |
-| ~~2~~ | ~~`renameat2(276)`~~ | ~~busybox `mv`~~ | ✅ 已实现 | `RENAME_NOREPLACE` 支持；`RENAME_EXCHANGE`/`RENAME_WHITEOUT` 返回 EINVAL |
-| 3 | `utimensat(88)` | busybox `touch` | `Function not implemented` (ENOSYS) | 在 VFS/ext4 层支持修改文件时间戳 |
-| ~~4~~ | ~~`unlinkat(AT_REMOVEDIR)` / rmdir 语义~~ | ~~busybox `rmdir`~~ | ✅ 已实现 | `AT_REMOVEDIR` flag 正确分流到 `rmdir_at` |
-| ~~5~~ | ~~`linkat(37)`~~ | ~~busybox `cp`~~ | ✅ 已实现 | 通过 `link_file_at` 创建硬链接；flags 暂不支持 |
-| ~~6~~ | ~~RISC-V FPU 状态 + 用户栈过小~~ | ~~lua round_num, sin30~~ | ✅ 已修复，`rv-musl-lua`/`rv-glibc-lua` 均 9/9 | 已在 `TrapContext`/`trap.S` 保存恢复 f0-f31 + fcsr；同时实测 SIGSEGV 根因是 musl `fmt_fp` 路径越过 8KiB 用户栈，已将用户栈调到 128KiB | 用户 FPU 状态在 trap 边界落入每线程 `TrapContext`，调度器 `switch.S` 仍只保存内核上下文 |
-| ~~7~~ | ~~`kill(129)` — signal=0 进程存活检查~~ | ~~libctest 每用例开头~~ | ✅ 已工作 | `SignalFlags::from_bits(0)` 返回空集，不投递信号，仅检查 PID 存在 |
-| 8 | `kill(129)` — 信号投递 | busybox `kill $!` | `Invalid argument` | 修正 signum 解析（整数 vs bitflags） |
-| ~~9~~ | ~~/proc 文件系统~~ | ~~busybox df/ps/free~~ | ✅ 已实现，`df/free/ps/uptime` 通过 | procfs 最小子集 + `statfs(43)` |
-| 10 | `lseek(62)` | libctest fdopen/fscanf/fwscanf 等 | `ftello/fseeko` 返回 `Function not implemented` (ENOSYS=38) | 给 `File` trait 加 `seek` 方法；`VfsFile` 修改 `SleepMutex<usize>` offset；pipe/stdio 返回 `ESPIPE` |
-| 11 | `prlimit64(261)` 支持 `getrlimit(RLIMIT_NOFILE)` | libctest 每用例开头 | `getrlimit 3: Function not implemented` | 实现 `prlimit64`，返回当前 `FD_LIMIT` 值 |
-| 12 | `rt_sigtimedwait(137)` | libctest 每用例结尾 | `sigtimedwait failed: Function not implemented` | 新增 syscall 137，至少返回 `EAGAIN`（无待处理信号） |
-| ~~13~~ | ~~创建 `/tmp` 目录~~ | ~~libctest mkstemp 相关用例~~ | ✅ tmpfs 已挂载到 `/tmp`；完整 libctest 仍被更早 syscall 缺口阻塞 | `TmpFs` backend 挂载到 `/tmp`，`busybox mktemp` / `mktemp -d` 已验证 |
-| 14 | 线程取消 / `pthread_cancel` | libctest pthread_cancel_points | `pthread_cancel(td) failed: Function not implemented` | 调查线程取消所需的底层支持（信号投递、`rt_sigprocmask` 等） |
+已完成或不再适用的 2026-05-01 项已从 TODO 表移除：shebang fallback、`renameat2`、`unlinkat(AT_REMOVEDIR)`、`linkat`、RISC-V FPU/用户栈、`kill(0)`、`kill` 投递、procfs、tmpfs `/tmp`、`lseek`、`prlimit64`、`rt_sigtimedwait`、`utimensat`。
 
-### 2026-05-01 测试结果快照
+| 优先级 | 功能 | 关联测试 | 当前症状 | 修复方向 |
+|--------|------|----------|----------|----------|
+| 1 | `dup2` / `dup3` 细节 | `basic-musl` | `test_dup2` 仍为 `0 / 2` | 按 Linux 语义复查 oldfd==newfd、close-on-exec、fd 覆盖和错误码 |
+| 2 | `mount(40)` / `umount2(39)` | `basic-musl` | `test_mount`、`test_umount` 仍各只有 `2 / 5` | 继续修 FAT/VFAT、分区挂载、busy target、umount 后路径状态和错误码 |
+| 3 | `wait4/waitpid` / exit status | `basic-musl`、pthread 相关 | `test_wait`、`test_waitpid` 均为 `1 / 4` | 补 status 编码、options、rusage、线程组和被 signal 终止后的回收 |
+| 4 | pipe / fd I/O 语义 | `basic-musl`、BusyBox pipeline | `test_pipe` 仍为 `1 / 4` | 补阻塞/非阻塞、关闭端、EOF、`EPIPE`、SIGPIPE、poll readiness |
+| 5 | 线程取消 / futex / signal 协作 | `libctest pthread_cancel*` | `pthread_cancel(td)` 仍失败或超时 | 调查 musl 取消点、`tkill/tgkill`、signal mask、futex wait/wake 和线程退出唤醒 |
+| 6 | socket 最小 IPv4 UDP/TCP | `libctest socket` | socket 系列 syscall 仍 ENOSYS | 决定是否实现 loopback 最小语义，或明确作为网络扩展项延后 |
+
+### 2026-05-02 测试结果快照
 
 | 测试组 | 通过 | 失败 | 通过率 |
 |--------|------|------|--------|
-| basic-musl | 31/32 | 1 (mount) | 97% |
-| busybox-musl | 49/55 | 6 | 89% |
+| basic-musl | 60/102 | 20 个扣分子项 | 59% |
+| busybox-musl | 52/55 | 3 (`which ls`, `hwclock`, `kill 10`) | 95% |
 | lua-musl | 9/9 | 0 | 100% (FPU fix + 128KiB stack) |
-| libctest-musl | 0/220 | timeout before END | 需先补 `rt_sigtimedwait` / `prlimit64` / `lseek` |
+| libctest-musl | 未重新 judge | 手工运行仍未到 END | 主要卡在 fscanf/ungetc/stat/pthread/socket/utime 等语义 |
+
+### 2026-05-02 `libctest-musl` 手工运行新增 TODO
+
+这次在 `/musl $ ./libctest_testcode.sh` 中已经有大量 libc 纯计算/字符串类用例通过，但整组仍未到 END；当前失败集中在下面几类内核语义缺口。
+
+| 优先级 | Syscall / 功能 | 关联用例 | 当前症状 | TODO |
+|--------|---------------|----------|----------|------|
+| 1 | fscanf/ungetc/stat 的卡死点 | `fscanf`、`stat`、`ungetc` | 仍被 runner SIGKILL 超时 | 在 `lseek` 已接入后重新跑单项，区分 fd offset、stdio 缓冲、`read` EOF、`stat` 死锁和资源回收问题 |
+| 2 | tmpfile / 匿名临时文件写入链路 | `fwscanf`、`utime`、后续 `tmpfile` 相关用例 | 旧日志显示 `write: No error information`；需在 `lseek/utimensat` 后复测 | 审计 `/tmp` 上 `O_TMPFILE`/匿名临时文件兼容、`open(O_CREAT|O_EXCL)` fallback、tmpfs `write_at` 返回值和 errno |
+| 3 | `fstat/stat` 稳健性 | `stat`、`utime` | 旧日志里 `utime` 在 `fstat` 路径触发 VFS panic；需确认是否已修复 | 复查 tmpfs、匿名临时文件、已 unlink 但仍打开文件、目录和设备文件的 inode 生命周期处理 |
+| 4 | 线程取消和 futex/信号协作 | `pthread_cancel_points`、`pthread_cancel` | `pthread_cancel(td) failed: Function not implemented` 后线程用例超时 | 明确 musl `pthread_cancel` 依赖的 `tkill/tgkill`、signal mask、cancel point 唤醒、futex wait/wake 行为 |
+| 5 | pthread 条件变量 / TSD | `pthread_cond`、`pthread_tsd` | 用例被 SIGKILL 超时 | 审计 `futex(98)`、`clone` TLS/clear_child_tid、线程退出唤醒、robust list/TSD destructor 需求 |
+| 6 | signal mask 保存恢复 | `setjmp` | `siglongjmp incorrectly restored mask` | 补齐 `rt_sigprocmask(135)`、`rt_sigaction(134)`、`rt_sigreturn(139)` 与每线程 signal mask 保存恢复 |
+| 7 | socket 最小 IPv4 UDP/TCP 语义 | `socket` | `socket/bind/getsockname/setsockopt/sendto/recvfrom/listen/connect/accept` 全部 ENOSYS | 至少实现 `AF_INET` + UDP loopback/本机收发、TCP listen/connect/accept 的最小兼容；或明确先作为非主线网络得分项延后 |
+| 8 | 超时/杀进程后的资源回收 | `fscanf`、`pthread_*`、`stat`、`ungetc` | 多个用例由 runner SIGKILL 后结束 | 确认 SIGKILL 能终止所有线程、释放 fd/锁/futex waiter，避免后续用例继承坏状态或持锁死锁 |
 
 ## P2.5 - cwd in PCB 收尾
 
@@ -300,17 +315,17 @@
 - [x] 在 `init_mounts()` 中挂载 tmpfs 到 `/tmp`。
 - [x] 验证：`/musl/busybox sh -c 'echo hello > /tmp/test'`、`cat /tmp/test`、`mkdir /tmp/dir`、`ls /tmp`、`rm /tmp/test`、`rmdir /tmp/dir`。
 - [x] 验证：`/musl/busybox mktemp /tmp/tmp.XXXXXX` 和 `/musl/busybox mktemp -d /tmp/dir.XXXXXX` 均成功，覆盖 mkstemp/mkdtemp 的核心路径。
-- [ ] `touch /tmp/test` 仍被 `utimensat(88)` ENOSYS 阻塞；这不是 tmpfs create/write/read 路径失败。
-- [ ] 完整 `libctest-musl` 仍在 mkstemp/mkdtemp 前被 `rt_sigtimedwait(137)`、`prlimit64(261)`、`lseek(62)` 等缺口阻塞。
+- [x] `touch /tmp/test` 已通过 `utimensat(88)` 基础实现解锁；`busybox touch test.txt` 在最新 busybox 记录中 success。
+- [ ] 完整 `libctest-musl` 仍需重跑确认；旧阻塞点 `rt_sigtimedwait(137)`、`prlimit64(261)`、`lseek(62)` 已有源码实现，不再作为 ENOSYS TODO。
 
 2026-05-01 阶段 4 验证记录：
 
 - `make fmt`：通过。
 - `make all`：通过，产出 `kernel-rv` 和 `kernel-la`。
 - `CARGO_NET_OFFLINE=true make all`：通过。
-- `make run-rv` 手工验收：`/tmp` 上 create/write/read/mkdir/readdir/unlink/rmdir 均成功；`busybox mktemp` / `mktemp -d` 均成功；`touch` 因 `utimensat(88)` 返回 ENOSYS。
+- `make run-rv` 手工验收：`/tmp` 上 create/write/read/mkdir/readdir/unlink/rmdir 均成功；`busybox mktemp` / `mktemp -d` 均成功。
 - `tools/contest_runner/run_groups.py --arch rv --libcs musl --groups busybox --out develop-guide/test-run-logs/2026-05-01-phase4/busybox-rv-musl --no-build`：`busybox-musl` end-seen，保持 `49 / 55`，未退化。
-- `tools/contest_runner/run_groups.py --arch rv --libcs musl --groups libctest --out develop-guide/test-run-logs/2026-05-01-phase4/libctest-rv-musl --no-build`：未到 END，`0 / 220`；日志确认进入 libctest 后先被 `rt_sigtimedwait`、`kill`、`getrlimit`、`lseek` 阻塞，未形成 tmpfs 结论。
+- `tools/contest_runner/run_groups.py --arch rv --libcs musl --groups libctest --out develop-guide/test-run-logs/2026-05-01-phase4/libctest-rv-musl --no-build`：未到 END，`0 / 220`；这是旧记录，里面的 `rt_sigtimedwait` / `getrlimit` / `lseek` ENOSYS 结论已过期。
 
 ### 阶段 5：devfs 迁移为 VFS backend（LOW）
 
@@ -326,7 +341,7 @@
 
 ### 阶段 6：正规化路径解析与 mount crossing
 
-- [ ] 消除 `os/src/fs/vfs/path.rs` 对 `EXT4_ROOT_INO` 的残余依赖。
+- [x] 消除 `os/src/fs/vfs/path.rs` 对 `EXT4_ROOT_INO` 的残余依赖。
 - [ ] 修复 mounted root 下 `..` 的语义：精确匹配 mount instance 而非 `rposition`。
 - [ ] 实现 symlink traversal（max depth = 40）：
   - 非 final component 的 symlink 必须 follow。
@@ -339,7 +354,8 @@
 - [ ] 完善 `mkdirat/unlinkat/rmdir` 的 Linux errno 映射。
 - [ ] 完善 `newfstatat/fstat/lstat` 的设备号、时间戳、nlink。
 - [ ] 完善 `getdents64` 的 offset 稳定性和 buffer 边界。
-- [ ] 完善 `mount/umount2`：支持 `fstype` 参数（"proc"/"tmpfs"/"ext4"/"vfat"），busy target 检查。
+- [x] `mount/umount2` 已支持 `fstype` 参数（"ext4"/"vfat"/"fat32"/"fat"/"tmpfs"/"ramfs"）和 busy target 基础检查。
+- [ ] 继续完善 `mount/umount2` 的比赛语义：FAT/VFAT 真实行为、umount 后状态、分区错误码和 fallback 策略。
 - [ ] 所有不完整语义用 `// UNFINISHED:` 标出。
 
 ### 阶段 8：缓存与性能
@@ -359,11 +375,11 @@
 - [ ] pipeline 复现不 panic，重复运行 5 次不死锁。
 - [x] `busybox-musl` 完整脚本打印 END marker。
 - [x] `busybox-musl` 中 `df`、`free`、`ps`、`uptime` 命令通过（依赖 procfs）。
-- [ ] `libctest-musl` 中 `mkstemp`、`mkdtemp` 用例通过（依赖 tmpfs）。
+- [ ] `libctest-musl` 中 `mkstemp`、`mkdtemp` 用例通过（依赖 tmpfs；需在新版 `lseek/rt_sigtimedwait/prlimit64` 后重跑）。
 - [ ] `basic-musl` 文件系统相关用例全部通过。
 - [x] `/proc/mounts` 输出格式被 `df` 正确解析。
 - [x] `/proc/meminfo` 输出格式被 `free` 正确解析。
-- [ ] LA 的 nonblocking block I/O 不作为当前门槛。
+- [x] LA 的 nonblocking block I/O 不作为当前门槛；当前默认仍以同步块 I/O 稳定性为准。
 
 ## P2.6.3 - procfs 实现细节
 
@@ -405,7 +421,7 @@ procfs 解锁的 busybox 命令（当前因 `/proc` 不存在而失败）：
 4. 补充 `/proc/uptime` 和 `/proc/<PID>/*`。
 5. 重跑 `busybox-musl` judge，确认得分提升。
 
-当前状态：以上 5 步已完成。`busybox-musl` 从 2026-05-01 快照的 `43 / 55` 提升到 `49 / 55`。
+当前状态：以上 5 步已完成。`busybox-musl` 已从早期 `43 / 55` 提升到 50+ 分；最新校准按 `52 / 55` 记录，剩余项单独跟踪。
 
 ## P2.6.4 - tmpfs 实现细节
 
@@ -454,19 +470,18 @@ pub(crate) struct TmpFs {
 3. 挂载 tmpfs 到 `/tmp`，替代 ext4 上的 `/tmp` 目录。
 4. 验证 libctest mkstemp/mkdtemp。
 
-当前状态：tmpfs backend 和 `/tmp` 挂载已完成；`busybox mktemp` / `mktemp -d` 已验证。完整 libctest 仍需先补 `rt_sigtimedwait(137)`、`prlimit64(261)` 和 `lseek(62)`，否则跑不到 mkstemp/mkdtemp 的有效验收点。
+当前状态：tmpfs backend 和 `/tmp` 挂载已完成；`busybox mktemp` / `mktemp -d` / `touch` 已验证。完整 libctest 需要在新版 `lseek`、`rt_sigtimedwait`、`prlimit64`、`utimensat` 后重跑。
 
 ## P2.6.5 - 可选 FAT/VFAT 支持路线图
 
-- [ ] 采用 `starry-fatfs` 作为首选 FAT 库，导入 crate 名仍按 `fatfs` 使用。
-- [ ] vendoring 前复核离线构建，把 FAT 依赖纳入 `vendor/crates`。
-- [ ] 为 WHUSP 块设备实现 `fatfs::Read` / `fatfs::Write` / `fatfs::Seek` 适配层。
-- [ ] 在 `os/src/fs` 新增 FAT mount wrapper。
-- [ ] 泛化当前 mount 表，让它能同时承载 EXT4 与 FAT。
-- [ ] 在 `sys_mount` 中接受 `fstype == "vfat"` / `"fat32"`。
-- [ ] 先补 `/dev/vda2` 分区源解析，否则 basic mount 测例仍无法定位 FAT 分区。
+- [x] 采用 vendored `fatfs`，`os/Cargo.toml` 已通过 `vendor/crates/fatfs` 离线引入。
+- [x] 为 WHUSP 块设备实现 `fatfs::Read` / `fatfs::Write` / `fatfs::Seek` 适配层。
+- [x] 在 `os/src/fs/fat.rs` 新增 FAT mount wrapper。
+- [x] 泛化当前 mount 表，让它能同时承载 EXT4、FAT 和伪文件系统 mount。
+- [x] 在 `sys_mount` 中接受 `fstype == "vfat"` / `"fat32"` / `"fat"`。
+- [x] 支持 `/dev/vdXN` 分区源解析，basic mount 测例不再卡在无法定位 FAT 分区。
 - [ ] 首轮不承诺 symlink、Unix owner/mode、hard link、完整时间戳和大小写规则；缺口用 `// UNFINISHED:` 标明。
-- [ ] 验证顺序：FAT32 镜像只读 lookup/read，create/write/read/remove，最后跑 `/musl/basic/mount` 和 `/musl/basic/umount`。
+- [ ] 验证 FAT32 镜像只读 lookup/read、create/write/read/remove，并重跑 `/musl/basic/mount` 和 `/musl/basic/umount`。
 
 ## P2.7 - syscall 层瘦身路线图
 
@@ -490,14 +505,14 @@ pub(crate) struct TmpFs {
 ## P3 - 扩展 libc 与动态链接
 
 - [x] `mprotect(226)` 源码已接入，用于解锁 glibc 动态加载器的第一道门。
-- [ ] 重跑 glibc 组，确认旧的 `cannot apply additional memory protection after relocation` 是否消失。
-- [ ] 推进 `busybox-musl` 的 shell、pipe、pipeline、重定向语义。
-- [ ] 推进 `lua-musl` 所需的 mmap/brk/fs/signal 兼容性。
+- [x] 重跑 glibc 组，旧的 `cannot apply additional memory protection after relocation` 已不再是全局入口阻塞；`lua-glibc` 可跑到 END。
+- [x] `busybox-musl` 的 shell、pipe、pipeline、重定向主路径已可跑完整脚本到 END；剩余 `which ls`、`hwclock`、kill 相关细节单独跟踪。
+- [x] `lua-musl` 所需的 mmap/brk/fs/signal/FPU/用户栈主路径已完成，`lua-musl` 9/9。
 - [ ] 推进 `libctest-musl` 的工作目录、脚本布局和动态链接运行时。
-- [ ] 补齐 `/lib/ld-musl-riscv64.so.1` 路径支持。
+- [ ] 补齐或验证 `/lib/ld-musl-riscv64.so.1` 路径支持。
 - [ ] 推进 glibc 变体运行。
-- [ ] 补齐 `/lib/ld-linux-riscv64-lp64d.so.1` 路径支持。
-- [ ] 让 `/glibc/basic_testcode.sh` 可以进入真实测试主体并跑到 marker。
+- [ ] 补齐或验证 `/lib/ld-linux-riscv64-lp64d.so.1` 路径支持。
+- [ ] 让 `/glibc/basic_testcode.sh` 在当前代码上重新跑到 marker，并刷新 judge 结果。
 
 ## P4 - 性能与压力测试
 

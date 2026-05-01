@@ -168,7 +168,7 @@ fn install_open_file(
 ) -> SysResult {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-    let fd = inner.alloc_fd();
+    let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
     let dir_path = file.working_dir().and(dir_path);
     inner.fd_table[fd] = Some(FdTableEntry::from_file_with_dir_path(file, flags, dir_path));
     Ok(fd as isize)

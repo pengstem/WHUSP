@@ -18,8 +18,8 @@ use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
 use log::info;
 use manager::fetch_task;
-pub(crate) use process::ProcessProcSnapshot;
 pub use process::{ProcessControlBlock, ProcessCpuTimesSnapshot};
+pub(crate) use process::{ProcessProcSnapshot, RLimit, RLimitResource};
 
 pub use crate::arch::TaskContext;
 pub use clone::{CloneArgs, CloneFlags, clone_current_thread};

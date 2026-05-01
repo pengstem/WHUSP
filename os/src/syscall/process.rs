@@ -1,8 +1,8 @@
 use crate::fs::{File, OpenFlags, open_file_at};
 use crate::mm::{translated_ref, translated_refmut, translated_str};
 use crate::task::{
-    CloneArgs, CloneFlags, ProcessCpuTimesSnapshot, SignalFlags, SignalInfo, add_task,
-    clone_current_thread, current_process, current_task, current_user_token,
+    CloneArgs, CloneFlags, ProcessCpuTimesSnapshot, RLimit, RLimitResource, SignalFlags,
+    SignalInfo, add_task, clone_current_thread, current_process, current_task, current_user_token,
     exit_current_and_run_next, pid2process, suspend_current_and_run_next,
 };
 use crate::timer::{get_time_clock_ticks, us_to_clock_ticks};
@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use core::str;
 
 use super::errno::{SysError, SysResult};
-use super::fs::user_ptr::write_user_value;
+use super::fs::user_ptr::{read_user_value, write_user_value};
 
 const ELF_MAGIC: &[u8] = b"\x7fELF";
 const SHEBANG_MAGIC: &[u8] = b"#!";
@@ -163,6 +163,72 @@ pub fn sys_times(tms: *mut LinuxTms) -> SysResult {
         write_user_value(current_user_token(), tms, &linux_tms)?;
     }
     Ok(clock_ticks_to_isize(get_time_clock_ticks()))
+}
+
+fn rlimit_target_process(pid: usize) -> SysResult<Arc<crate::task::ProcessControlBlock>> {
+    if pid == 0 {
+        Ok(current_process())
+    } else {
+        // UNFINISHED: Linux prlimit64 checks real/effective/saved UIDs and
+        // CAP_SYS_RESOURCE before operating on another process. This kernel
+        // does not model credentials yet, so a live PID is accepted.
+        pid2process(pid).ok_or(SysError::ESRCH)
+    }
+}
+
+fn validate_new_rlimit(current: RLimit, new_limit: RLimit) -> SysResult<()> {
+    if new_limit.rlim_cur > new_limit.rlim_max {
+        return Err(SysError::EINVAL);
+    }
+    if new_limit.rlim_max > current.rlim_max {
+        // UNFINISHED: Raising a hard resource limit should be allowed for a
+        // task with CAP_SYS_RESOURCE. Capabilities are not modeled yet.
+        return Err(SysError::EPERM);
+    }
+    Ok(())
+}
+
+pub fn sys_prlimit64(
+    pid: usize,
+    resource: i32,
+    new_limit: *const RLimit,
+    old_limit: *mut RLimit,
+) -> SysResult {
+    let resource = RLimitResource::from_raw(resource).ok_or(SysError::EINVAL)?;
+    let token = current_user_token();
+    let new_limit = if new_limit.is_null() {
+        None
+    } else {
+        Some(read_user_value(token, new_limit)?)
+    };
+    let process = rlimit_target_process(pid)?;
+    let mut inner = process.inner_exclusive_access();
+    let current = inner.resource_limits.get(resource);
+
+    if let Some(new_limit) = new_limit {
+        validate_new_rlimit(current, new_limit)?;
+    }
+    if !old_limit.is_null() {
+        write_user_value(token, old_limit, &current)?;
+    }
+    if let Some(new_limit) = new_limit {
+        inner.resource_limits.set(resource, new_limit);
+    }
+    Ok(0)
+}
+
+pub fn sys_getrlimit(resource: i32, old_limit: *mut RLimit) -> SysResult {
+    if old_limit.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    sys_prlimit64(0, resource, core::ptr::null(), old_limit)
+}
+
+pub fn sys_setrlimit(resource: i32, new_limit: *const RLimit) -> SysResult {
+    if new_limit.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    sys_prlimit64(0, resource, new_limit, core::ptr::null_mut())
 }
 
 pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usize) -> SysResult {

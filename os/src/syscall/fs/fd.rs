@@ -1,5 +1,5 @@
 use crate::fs::{File, OpenFlags, make_pipe};
-use crate::task::{FD_LIMIT, FdFlags, FdTableEntry, current_process, current_user_token};
+use crate::task::{FdFlags, FdTableEntry, current_process, current_user_token};
 use alloc::sync::Arc;
 use core::mem::size_of;
 
@@ -152,9 +152,6 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> SysResult {
     if flags & !VALID_DUP3_FLAGS != 0 {
         return Err(SysError::EINVAL);
     }
-    if new_fd >= FD_LIMIT {
-        return Err(SysError::EBADF);
-    }
 
     let fd_flags = if flags & OpenFlags::CLOEXEC.bits() != 0 {
         FdFlags::CLOEXEC
@@ -173,6 +170,9 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> SysResult {
     if old_fd == new_fd {
         return Err(SysError::EINVAL);
     }
+    if new_fd >= inner.nofile_limit() {
+        return Err(SysError::EBADF);
+    }
     while inner.fd_table.len() <= new_fd {
         inner.fd_table.push(None);
     }
@@ -181,11 +181,11 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> SysResult {
 }
 
 fn fcntl_dup(fd: usize, lower_bound: usize, fd_flags: FdFlags) -> SysResult {
-    if lower_bound >= FD_LIMIT {
-        return Err(SysError::EINVAL);
-    }
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
+    if lower_bound >= inner.nofile_limit() {
+        return Err(SysError::EINVAL);
+    }
     let entry = inner
         .fd_table
         .get(fd)

@@ -3,12 +3,120 @@ use super::{
     FD_LIMIT, FdTableEntry, PidHandle, SIGNAL_INFO_SLOTS, SignalFlags, SignalInfo,
     TaskControlBlock, TaskStatus,
 };
+use crate::config::USER_STACK_SIZE;
 use crate::fs::WorkingDir;
 use crate::mm::MemorySet;
 use crate::sync::{UPIntrFreeCell, UPIntrRefMut};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+
+pub const RLIM_INFINITY: usize = usize::MAX;
+const RLIMIT_COUNT: usize = RLimitResource::RtTime as usize + 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RLimit {
+    pub rlim_cur: usize,
+    pub rlim_max: usize,
+}
+
+impl RLimit {
+    const fn fixed(value: usize) -> Self {
+        Self {
+            rlim_cur: value,
+            rlim_max: value,
+        }
+    }
+
+    const fn infinity() -> Self {
+        Self {
+            rlim_cur: RLIM_INFINITY,
+            rlim_max: RLIM_INFINITY,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum RLimitResource {
+    Cpu = 0,
+    FSize = 1,
+    Data = 2,
+    Stack = 3,
+    Core = 4,
+    Rss = 5,
+    NProc = 6,
+    NoFile = 7,
+    MemLock = 8,
+    As = 9,
+    Locks = 10,
+    SigPending = 11,
+    MsgQueue = 12,
+    Nice = 13,
+    RtPrio = 14,
+    RtTime = 15,
+}
+
+impl RLimitResource {
+    pub fn from_raw(resource: i32) -> Option<Self> {
+        match resource {
+            0 => Some(Self::Cpu),
+            1 => Some(Self::FSize),
+            2 => Some(Self::Data),
+            3 => Some(Self::Stack),
+            4 => Some(Self::Core),
+            5 => Some(Self::Rss),
+            6 => Some(Self::NProc),
+            7 => Some(Self::NoFile),
+            8 => Some(Self::MemLock),
+            9 => Some(Self::As),
+            10 => Some(Self::Locks),
+            11 => Some(Self::SigPending),
+            12 => Some(Self::MsgQueue),
+            13 => Some(Self::Nice),
+            14 => Some(Self::RtPrio),
+            15 => Some(Self::RtTime),
+            _ => None,
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ProcessResourceLimits {
+    limits: [RLimit; RLIMIT_COUNT],
+}
+
+impl ProcessResourceLimits {
+    pub fn new() -> Self {
+        // UNFINISHED: Except RLIMIT_NOFILE, these limits are currently stored
+        // for getrlimit/setrlimit compatibility but are not enforced by the
+        // memory, scheduler, signal, or fork paths yet.
+        let mut limits = [RLimit::infinity(); RLIMIT_COUNT];
+        limits[RLimitResource::Stack.index()] = RLimit::fixed(USER_STACK_SIZE);
+        limits[RLimitResource::NoFile.index()] = RLimit::fixed(FD_LIMIT);
+        limits[RLimitResource::Core.index()] = RLimit::fixed(0);
+        Self { limits }
+    }
+
+    pub fn get(&self, resource: RLimitResource) -> RLimit {
+        self.limits[resource.index()]
+    }
+
+    pub fn set(&mut self, resource: RLimitResource, limit: RLimit) {
+        self.limits[resource.index()] = limit;
+    }
+}
+
+impl Default for ProcessResourceLimits {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProcessCpuTimesSnapshot {
@@ -107,6 +215,7 @@ pub struct ProcessControlBlockInner {
     pub children: Vec<Arc<ProcessControlBlock>>,
     pub exit_code: i32,
     pub fd_table: Vec<Option<FdTableEntry>>,
+    pub resource_limits: ProcessResourceLimits,
     pub signals: SignalFlags,
     pub signal_infos: [Option<SignalInfo>; SIGNAL_INFO_SLOTS],
     pub cpu_times: ProcessCpuTimes,
@@ -120,21 +229,25 @@ impl ProcessControlBlockInner {
         self.memory_set.token()
     }
 
-    pub fn alloc_fd(&mut self) -> usize {
-        self.alloc_fd_from(0).expect("fd table exhausted")
+    pub fn nofile_limit(&self) -> usize {
+        self.resource_limits
+            .get(RLimitResource::NoFile)
+            .rlim_cur
+            .min(FD_LIMIT)
     }
 
     pub fn alloc_fd_from(&mut self, lower_bound: usize) -> Option<usize> {
-        if lower_bound >= FD_LIMIT {
+        let limit = self.nofile_limit();
+        if lower_bound >= limit {
             return None;
         }
         if let Some(fd) =
-            (lower_bound..self.fd_table.len().min(FD_LIMIT)).find(|fd| self.fd_table[*fd].is_none())
+            (lower_bound..self.fd_table.len().min(limit)).find(|fd| self.fd_table[*fd].is_none())
         {
             Some(fd)
         } else {
             let fd = self.fd_table.len().max(lower_bound);
-            if fd >= FD_LIMIT {
+            if fd >= limit {
                 return None;
             }
             while self.fd_table.len() <= fd {

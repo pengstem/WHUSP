@@ -38,6 +38,8 @@ const SYSCALL_KILL: usize = 129;
 const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
 const SYSCALL_TIMES: usize = 153;
 const SYSCALL_UNAME: usize = 160;
+const SYSCALL_GETRLIMIT: usize = 163;
+const SYSCALL_SETRLIMIT: usize = 164;
 const SYSCALL_GETTIMEOFDAY: usize = 169;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_GETPPID: usize = 173;
@@ -48,6 +50,7 @@ const SYSCALL_EXECVE: usize = 221;
 const SYSCALL_MMAP: usize = 222;
 const SYSCALL_MPROTECT: usize = 226;
 const SYSCALL_WAIT4: usize = 260;
+const SYSCALL_PRLIMIT64: usize = 261;
 const SYSCALL_RENAMEAT2: usize = 276;
 const SYSCALL_STATX: usize = 291;
 
@@ -59,6 +62,7 @@ mod signal;
 mod sync;
 mod wait;
 
+use crate::task::RLimit;
 use errno::{SysError, ret};
 use fs::*;
 use memory::*;
@@ -192,6 +196,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_TIMES => sys_times(args[0] as *mut LinuxTms),
         SYSCALL_UNAME => sys_uname(args[0] as *mut LinuxUtsName),
+        SYSCALL_GETRLIMIT => sys_getrlimit(args[0] as i32, args[1] as *mut RLimit),
+        SYSCALL_SETRLIMIT => sys_setrlimit(args[0] as i32, args[1] as *const RLimit),
         SYSCALL_GETTIMEOFDAY => {
             sys_gettimeofday(args[0] as *mut LinuxTimeVal, args[1] as *mut LinuxTimezone)
         }
@@ -212,6 +218,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[1] as *mut i32,
             args[2] as i32,
             args[3] as *mut RUsage,
+        ),
+        SYSCALL_PRLIMIT64 => sys_prlimit64(
+            args[0],
+            args[1] as i32,
+            args[2] as *const RLimit,
+            args[3] as *mut RLimit,
         ),
         _ => Err(SysError::ENOSYS),
     })
