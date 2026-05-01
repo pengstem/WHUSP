@@ -57,6 +57,10 @@ impl FdTableEntry {
         Arc::clone(&self.file)
     }
 
+    pub fn vfs_mount_id(&self) -> Option<crate::fs::MountId> {
+        self.file.vfs_mount_id()
+    }
+
     pub fn dir_path(&self) -> Option<&str> {
         self.dir_path.as_deref()
     }

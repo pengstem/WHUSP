@@ -3,6 +3,7 @@ use super::path::WorkingDir;
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, VfsNodeId};
 use crate::drivers::block::BLOCK_DEVICES;
 use crate::sync::{SleepMutex, UPIntrFreeCell};
+use crate::task::any_process_references_mount;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -223,12 +224,13 @@ pub(crate) fn unmount_at(target: WorkingDir) -> Result<(), MountError> {
         } else {
             mounts.iter().rposition(|mount| mount.target == target)
         };
-        if let Some(index) = index {
-            mounts.remove(index);
-            Ok(())
-        } else {
-            Err(MountError::TargetNotMounted)
+        let index = index.ok_or(MountError::TargetNotMounted)?;
+        let source_mount_id = mounts[index].source_mount_id;
+        if any_process_references_mount(source_mount_id) {
+            return Err(MountError::TargetBusy);
         }
+        mounts.remove(index);
+        Ok(())
     })
 }
 

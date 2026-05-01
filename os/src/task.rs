@@ -24,6 +24,7 @@ pub use crate::arch::TaskContext;
 pub use clone::{CloneArgs, CloneFlags, clone_current_thread};
 pub(crate) use fd::{FD_LIMIT, FdFlags, FdTableEntry};
 pub use id::{IDLE_PID, KernelStack, PidHandle, kstack_alloc, pid_alloc};
+pub(crate) use manager::any_process_references_mount;
 pub use manager::{add_task, pid2process, remove_from_pid2process, wakeup_task};
 pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,

@@ -164,6 +164,16 @@ impl ProcessControlBlock {
         inner.cwd_path = cwd_path;
     }
 
+    pub(crate) fn references_vfs_mount(&self, mount_id: crate::fs::MountId) -> bool {
+        let inner = self.inner.exclusive_access();
+        inner.cwd.mount_id() == mount_id
+            || inner
+                .fd_table
+                .iter()
+                .flatten()
+                .any(|entry| entry.vfs_mount_id() == Some(mount_id))
+    }
+
     pub fn getpid(&self) -> usize {
         self.pid.0
     }

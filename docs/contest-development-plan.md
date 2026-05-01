@@ -142,10 +142,10 @@
 | 3 | `utimensat(88)` | busybox `touch` | `Function not implemented` (ENOSYS) | 在 VFS/ext4 层支持修改文件时间戳 |
 | ~~4~~ | ~~`unlinkat(AT_REMOVEDIR)` / rmdir 语义~~ | ~~busybox `rmdir`~~ | ✅ 已实现 | `AT_REMOVEDIR` flag 正确分流到 `rmdir_at` |
 | ~~5~~ | ~~`linkat(37)`~~ | ~~busybox `cp`~~ | ✅ 已实现 | 通过 `link_file_at` 创建硬链接；flags 暂不支持 |
-| 6 | FPU 寄存器（f0-f31, fcsr）未保存/恢复 | lua round_num, sin30 | `Segmentation Fault, SIGSEGV=11` | `trap.S`/`switch.S`/`TrapContext` 均未保存浮点寄存器，多进程 FPU 状态互相污染导致计算错误 | 在 trap.S 和 switch.S 中加入 f0-f31 + fcsr 的保存/恢复；进程初始化时设置 `mstatus.FS` = Initial |
+| ~~6~~ | ~~RISC-V FPU 状态 + 用户栈过小~~ | ~~lua round_num, sin30~~ | ✅ 已修复，`rv-musl-lua`/`rv-glibc-lua` 均 9/9 | 已在 `TrapContext`/`trap.S` 保存恢复 f0-f31 + fcsr；同时实测 SIGSEGV 根因是 musl `fmt_fp` 路径越过 8KiB 用户栈，已将用户栈调到 128KiB | 用户 FPU 状态在 trap 边界落入每线程 `TrapContext`，调度器 `switch.S` 仍只保存内核上下文 |
 | ~~7~~ | ~~`kill(129)` — signal=0 进程存活检查~~ | ~~libctest 每用例开头~~ | ✅ 已工作 | `SignalFlags::from_bits(0)` 返回空集，不投递信号，仅检查 PID 存在 |
 | 8 | `kill(129)` — 信号投递 | busybox `kill $!` | `Invalid argument` | 修正 signum 解析（整数 vs bitflags） |
-| 9 | `/proc` 文件系统 | busybox df/ps/free | `No such file or directory` | 实现 procfs 最小子集（/proc/mounts, /proc/meminfo, /proc/[pid]/stat） |
+| 9 | `/proc` 文件系统 | busybox df/ps/free | `No such file or directory` | 实现 procfs 最小子集（详见 P2.6.3）：/proc/mounts, /proc/meminfo, /proc/uptime, /proc/[pid]/stat |
 | 10 | `lseek(62)` | libctest fdopen/fscanf/fwscanf 等 | `ftello/fseeko` 返回 `Function not implemented` (ENOSYS=38) | 给 `File` trait 加 `seek` 方法；`VfsFile` 修改 `SleepMutex<usize>` offset；pipe/stdio 返回 `ESPIPE` |
 | 11 | `prlimit64(261)` 支持 `getrlimit(RLIMIT_NOFILE)` | libctest 每用例开头 | `getrlimit 3: Function not implemented` | 实现 `prlimit64`，返回当前 `FD_LIMIT` 值 |
 | 12 | `rt_sigtimedwait(137)` | libctest 每用例结尾 | `sigtimedwait failed: Function not implemented` | 新增 syscall 137，至少返回 `EAGAIN`（无待处理信号） |
@@ -228,62 +228,201 @@
 - `timeout 25s make run-rv`：默认单盘启动到 `/musl/busybox sh`，timeout 只用于截断交互式 shell。
 - 当前默认策略仍是同步块 I/O；RV nonblocking 不是默认值，后续若重新打开必须重新跑同一组回归。
 
-### 阶段 2：拆出最小 VFS 对象层
+### 阶段 2：泛化 mount 系统以支持伪文件系统
 
-- [ ] 新建 `os/src/fs/vfs/`，先只承载类型与转发逻辑，不改用户可见语义。
-- [ ] 定义 `VfsNodeId { mount_id, ino }`。
-- [ ] 定义 `VfsPath { node, kind }`。
-- [ ] 定义 `VfsFile { node, offset, readable, writable, status_flags }`。
-- [ ] 保留现有 `File` trait 作为 fd table 对外接口。
-- [ ] 将 `open_file_at/stat_at/lookup_dir_at` 改成调用 VFS 层。
-- [ ] 每次迁移后跑 `make all`、默认单盘 `make run-rv`、contest-style basic 文件系统抽测。
+**目标**：让 mount 表不再绑定块设备索引，使 procfs/tmpfs/devfs 可以作为普通 mount 实例注册。
 
-### 阶段 3：正规化路径解析与 mount crossing
+**优先级**：HIGH — procfs/tmpfs 的前置条件。
 
-- [ ] 把 `path.rs` 的 `PathCursor` 迁到 VFS 层。
-- [ ] 明确处理覆盖目录和被挂载文件系统根目录的关系。
-- [ ] 记录 mounted root 的父目录信息，修复 mounted root 下 `..` 的临时行为。
-- [ ] 区分普通 lookup、mount target lookup、create parent lookup。
-- [ ] 为 symlink 预留接口；未实现处保留 `// UNFINISHED:`。
-- [ ] 验证绝对路径、相对路径、`..`、`/x1`、mount target、unmount 后路径行为。
+- [ ] 将 `MountId` 从块设备索引改为全局递增的 mount 实例 ID。
+  - 修改 `os/src/fs/mount.rs`：新增 `NEXT_MOUNT_ID: AtomicUsize`。
+  - 块设备 mount 仍占据前 N 个 slot，pseudo-fs mount 从 N 开始分配。
+- [ ] 将 `MOUNTS` 从固定长度 `Vec<SleepMutex<Option<Arc<MountedFs>>>>` 改为可动态增长的结构。
+- [ ] 在 `MountedFs` 中新增 `fs_type: &'static str` 字段（"ext4" / "proc" / "tmpfs" / "devtmpfs"）。
+- [ ] 新增 `register_pseudo_mount(backend: Box<dyn FileSystemBackend>, fs_type: &'static str) -> MountId`。
+- [ ] 在 `FileSystemBackend` trait 中新增 `fn root_ino(&self) -> u32 { 2 }` 默认方法。
+- [ ] 修改 `os/src/fs/vfs/path.rs`：移除对 `lwext4_rust::ffi::EXT4_ROOT_INO` 的直接依赖。
+  - `VfsCursor::root()` 使用 `root_ino()` 查询。
+  - `is_mount_root()` 查询对应 mount 的 `root_ino()`。
+  - `follow_mounted_root()` 使用 `root_ino_for(mount_id)` 而非硬编码 2。
+- [ ] 新增 `mount_pseudo_fs_at(target: WorkingDir, backend: Box<dyn FileSystemBackend>, fs_type: &'static str) -> Result<MountId, MountError>`。
+- [ ] 新增 `list_mounts() -> Vec<MountInfo>` 供 procfs `/proc/mounts` 使用。
+- [ ] 验证：`make all`、`make run-rv`、`basic-musl` 文件系统用例不回退。
 
-### 阶段 4：把 EXT4 后端收敛成 VFS backend trait
+### 阶段 3：procfs 实现（HIGH — 解锁 ~12 busybox 命令）
 
-- [ ] 定义 `FileSystemBackend` trait：`lookup/read/write/stat/create/unlink/readdir`。
-- [ ] 让 `Ext4Mount` 实现 backend trait。
-- [ ] 将 backend 锁放在 mount 实例内部。
-- [ ] 为后续 `tmpfs/devfs/procfs` 预留 backend 注册点。
-- [ ] 验证现有 `File` trait 对 fd table 的行为不变。
+**目标**：实现最小 procfs 并挂载到 `/proc`，解锁 `df`、`free`、`ps`、`uptime`。
 
-### 阶段 5：补 Linux VFS 关键语义
+**新建文件**：`os/src/fs/procfs.rs`
 
-- [ ] 建立 VFS/FS 错误传播模型：将 pathname/create/unlink/rmdir 等接口从 `Option` 折叠错误逐步迁到 `Result<_, FsError>` 或等价类型，并在 syscall 边界统一映射为 Linux `errno`。
-- [ ] 完善 `openat`。
-- [ ] 完善 `mkdirat/unlinkat/rmdir` 的 Linux errno：区分 `EEXIST`、`ENOENT`、`ENOTDIR`、`EISDIR`、`EINVAL`、`ENOTEMPTY`、`EBUSY`、`EIO` 等场景，并补齐 `unlinkat(AT_REMOVEDIR)` 到 rmdir 语义的分流。
-- [ ] 完善 `newfstatat/fstat/lstat`。
-- [ ] 完善 `getdents64`。
-- [ ] 完善 `renameat2/linkat/symlinkat/readlinkat/faccessat/fchdir`（基础路径已接入，Linux 边界语义待补齐）。
-- [ ] 完善 `mount/umount2` 的 busy target、mounted root、相对路径、错误码。
-- [ ] 所有不完整语义必须用 `// UNFINISHED:` 标出具体 Linux 缺口。
+- [ ] 新建 `os/src/fs/procfs.rs`，实现 `FileSystemBackend` trait。
+- [ ] 定义 procfs inode 编号方案（root=2, mounts=3, meminfo=4, uptime=5, PID 目录=100+PID, PID 子文件=10000+PID*10+offset）。
+- [ ] 实现 `/proc/mounts`：调用 `mount::list_mounts()`，格式 `<device> <mountpoint> <fstype> <options> 0 0`。
+- [ ] 实现 `/proc/meminfo`：从 frame allocator 获取 total/free 帧数。
+  - 需要在 `os/src/mm/frame_allocator.rs` 新增 `pub fn frame_stats() -> (usize, usize)`。
+  - 输出 `MemTotal`、`MemFree`、`MemAvailable`、`Buffers`(0)、`Cached`(0)、`SwapTotal`(0)、`SwapFree`(0)。
+- [ ] 实现 `/proc/uptime`：格式 `SECONDS.NN IDLE.NN\n`，从 arch timer 计算。
+- [ ] 实现 `/proc` 目录 readdir：列出固定条目 + 当前存活 PID（从 `PID2PCB` 迭代）。
+- [ ] 实现 `/proc/<PID>/stat`：Linux 格式 `pid (comm) state ppid ...`。
+- [ ] 实现 `/proc/<PID>/status`：`Name:\tcomm\nState:\tS\nPid:\tN\nPPid:\tN\nVmRSS:\tN kB\n`。
+- [ ] 实现 `/proc/<PID>/cmdline`：NUL-separated argv。
+  - 需要在 `ProcessControlBlockInner` 新增 `cmdline: Vec<String>`，在 `execve` 时保存。
+- [ ] 所有写操作返回 `FsError::ReadOnly`。
+- [ ] 在 `init_mounts()` 末尾挂载 procfs 到 `/proc`。
+- [ ] 验证：`/musl/busybox df`、`/musl/busybox free`、`/musl/busybox ps`、`/musl/busybox uptime`。
 
-### 阶段 6：缓存与性能
+### 阶段 4：tmpfs 实现（MEDIUM — 解锁 libctest mkstemp/mkdtemp）
 
-- [ ] 语义稳定后再加 inode cache，cache key 使用 `(mount_id, ino)`。
+**目标**：实现内存文件系统并挂载到 `/tmp`。
+
+**新建文件**：`os/src/fs/tmpfs.rs`
+
+- [ ] 新建 `os/src/fs/tmpfs.rs`，实现 `FileSystemBackend` trait。
+- [ ] 内部数据结构：`TmpfsInode { kind, mode, nlink, data: Vec<u8>, children: BTreeMap<String, u32>, parent_ino }` + `TmpFs { inodes: BTreeMap<u32, TmpfsInode>, next_ino }`。
+- [ ] 实现完整 POSIX 文件操作：create_file、create_dir、unlink、rename、link、symlink、read_at、write_at、set_len、readlink。
+- [ ] `read_at` / `write_at` 直接操作 `data: Vec<u8>`，write 时自动扩展。
+- [ ] 在 `init_mounts()` 中挂载 tmpfs 到 `/tmp`。
+- [ ] 验证：`/musl/busybox touch /tmp/test`、`mkdir /tmp/dir`、libctest `mkstemp`/`mkdtemp`。
+
+### 阶段 5：devfs 迁移为 VFS backend（LOW）
+
+**目标**：将 devfs 从 VFS 前拦截改为标准 mount，统一路径解析语义。
+
+- [ ] 重构 `os/src/fs/devfs.rs`，实现 `FileSystemBackend` trait。
+  - `lookup_component_from`：root 下匹配 "null"/"zero"/"tty"/"ttyS0"/"random"/"urandom"。
+  - `read_at` / `write_at`：根据 ino 分发到 UART / null / zero 逻辑。
+  - `stat`：返回 `S_IFCHR` + 正确的 rdev。
+- [ ] 在 `init_mounts()` 中挂载 devfs 到 `/dev`。
+- [ ] 移除 `open_file_at` 和 `stat_at` 中的 devfs 前置拦截。
+- [ ] 验证：`ls /dev`、`echo test > /dev/null`、所有依赖 `/dev/null` 的测试不回退。
+
+### 阶段 6：正规化路径解析与 mount crossing
+
+- [ ] 消除 `os/src/fs/vfs/path.rs` 对 `EXT4_ROOT_INO` 的残余依赖。
+- [ ] 修复 mounted root 下 `..` 的语义：精确匹配 mount instance 而非 `rposition`。
+- [ ] 实现 symlink traversal（max depth = 40）：
+  - 非 final component 的 symlink 必须 follow。
+  - final component 根据 `O_NOFOLLOW` / `AT_SYMLINK_NOFOLLOW` 决定。
+- [ ] 验证：跨 mount symlink、`..` 穿越 mount boundary。
+
+### 阶段 7：补 Linux VFS 关键语义
+
+- [ ] 完善 `openat` 的 `O_CREAT|O_EXCL`、`O_TRUNC`、`O_APPEND`、`O_DIRECTORY`、`O_NOFOLLOW` 组合。
+- [ ] 完善 `mkdirat/unlinkat/rmdir` 的 Linux errno 映射。
+- [ ] 完善 `newfstatat/fstat/lstat` 的设备号、时间戳、nlink。
+- [ ] 完善 `getdents64` 的 offset 稳定性和 buffer 边界。
+- [ ] 完善 `mount/umount2`：支持 `fstype` 参数（"proc"/"tmpfs"/"ext4"/"vfat"），busy target 检查。
+- [ ] 所有不完整语义用 `// UNFINISHED:` 标出。
+
+### 阶段 8：缓存与性能
+
+- [ ] 语义稳定后加 inode cache，cache key 使用 `(mount_id, ino)`。
 - [ ] 加正向 dentry cache；负向 cache 等 rename/unlink 语义稳定后再考虑。
 - [ ] 加简单 page/block cache，先服务 ELF 加载、顺序读、`getdents64`。
 - [ ] 为 cache 加失效路径：`create/unlink/rename/truncate/write`。
-- [ ] 对比 `huge_write`、BusyBox pipeline、重复 exec BusyBox 的性能与正确性。
+- [ ] procfs/tmpfs 不需要 block cache（纯内存），但 dentry cache 可覆盖。
 
-### 阶段 7：验收门槛
+### 阶段 9：验收门槛
 
 - [ ] `make fmt`。
 - [ ] `make all`。
 - [ ] `CARGO_NET_OFFLINE=true make all`。
-- [ ] `make run-rv` 下执行 `/musl/basic_testcode.sh` 或等价 BusyBox shell 包装。
+- [ ] `make run-rv` 下 `/musl/basic_testcode.sh` 通过。
 - [ ] pipeline 复现不 panic，重复运行 5 次不死锁。
-- [ ] `busybox-musl` 完整脚本能打印 END marker；如果重新打开 RV nonblocking，同一回归必须继续通过。
-- [ ] LA 的 nonblocking block I/O 不作为当前门槛，等 virtio-pci IRQ / 外部中断路径单独验收。
+- [ ] `busybox-musl` 完整脚本打印 END marker。
+- [ ] `busybox-musl` 中 `df`、`free`、`ps`、`uptime` 命令通过（依赖 procfs）。
+- [ ] `libctest-musl` 中 `mkstemp`、`mkdtemp` 用例通过（依赖 tmpfs）。
 - [ ] `basic-musl` 文件系统相关用例全部通过。
+- [ ] `/proc/mounts` 输出格式被 `df` 正确解析。
+- [ ] `/proc/meminfo` 输出格式被 `free` 正确解析。
+- [ ] LA 的 nonblocking block I/O 不作为当前门槛。
+
+## P2.6.3 - procfs 实现细节
+
+### 设计决策
+
+1. **直接实现 `FileSystemBackend` trait**：不引入 Dentry/Inode/SuperBlock 三层抽象，当前 trait 已足够。
+2. **内容按需生成**：每次 `read_at` 动态生成文件内容，不缓存。procfs 文件通常 < 4KB。
+3. **确定性 inode 编号**：PID → ino 映射，避免维护分配器。
+4. **只读**：不支持 `/proc/sys` 等可写接口。
+
+### 需要新增的内核基础设施
+
+| 基础设施 | 位置 | 用途 |
+|----------|------|------|
+| `frame_stats() -> (total, free)` | `os/src/mm/frame_allocator.rs` | `/proc/meminfo` |
+| `ProcessControlBlockInner::cmdline` | `os/src/task/process.rs` | `/proc/<PID>/cmdline` |
+| `list_mounts() -> Vec<MountInfo>` | `os/src/fs/mount.rs` | `/proc/mounts` |
+| `get_uptime_secs() -> f64` | `os/src/arch/riscv64/timer.rs` | `/proc/uptime` |
+| `PID2PCB` 只读迭代接口 | `os/src/task/manager.rs` | `/proc` 目录列表 |
+
+### 预期比赛得分影响
+
+procfs 解锁的 busybox 命令（当前因 `/proc` 不存在而失败）：
+
+| 命令 | 依赖的 proc 文件 |
+|------|-----------------|
+| `df` | `/proc/mounts` |
+| `free` | `/proc/meminfo` |
+| `ps` | `/proc/uptime` + `/proc/<PID>/stat` |
+| `uptime` | `/proc/uptime` |
+| `cat /proc/mounts` | `/proc/mounts` |
+| `mount`（无参数） | `/proc/mounts` |
+
+### 实现顺序
+
+1. 先完成阶段 2 mount 泛化的最小子集：`register_pseudo_mount` + `root_ino()` 方法。
+2. 实现 procfs 骨架：只有 `/proc/mounts` 和 `/proc/meminfo`。
+3. 挂载并验证 `busybox df` 和 `busybox free`。
+4. 补充 `/proc/uptime` 和 `/proc/<PID>/*`。
+5. 重跑 `busybox-musl` judge，确认得分提升。
+
+## P2.6.4 - tmpfs 实现细节
+
+### 设计决策
+
+1. **纯内存 BTreeMap 存储**：inode 数据存在 `Vec<u8>`，目录结构用 `BTreeMap<String, u32>`。
+2. **无容量限制**：当前不设 tmpfs 大小上限（内核堆足够大）。
+3. **标准 VFS 语义**：支持 create/read/write/unlink/mkdir/rmdir/rename/link/symlink 全套操作。
+4. **时间戳**：使用 `get_time_us()` 填充 ctime/mtime。
+
+### 数据结构
+
+```rust
+struct TmpfsInode {
+    kind: FsNodeKind,
+    mode: u32,
+    nlink: u32,
+    data: Vec<u8>,
+    children: BTreeMap<String, u32>,
+    parent_ino: u32,
+    ctime_us: u64,
+    mtime_us: u64,
+}
+
+pub(crate) struct TmpFs {
+    inodes: BTreeMap<u32, TmpfsInode>,
+    next_ino: u32,
+}
+```
+
+### 预期比赛得分影响
+
+| 测试组 | 用例 | 依赖 |
+|--------|------|------|
+| libctest-musl | `mkstemp` | `/tmp` 可写 |
+| libctest-musl | `mkdtemp` | `/tmp` 可写 |
+| libctest-musl | `tmpfile` | `/tmp` 可写 |
+| busybox-musl | `mktemp` | `/tmp` 可写 |
+
+注意：即使不用 tmpfs，在 ext4 上 `mkdir /tmp` 也能部分解决问题。但 tmpfs 是更正确的方案（不污染评测盘、不需要写权限）。
+
+### 实现顺序
+
+1. 临时方案：在 `init_mounts()` 中对 ext4 根执行 `create_dir(root, "tmp", 0o1777)` 作为过渡。
+2. 阶段 2 mount 泛化完成后，实现 tmpfs backend。
+3. 挂载 tmpfs 到 `/tmp`，替代 ext4 上的 `/tmp` 目录。
+4. 验证 libctest mkstemp/mkdtemp。
 
 ## P2.6.5 - 可选 FAT/VFAT 支持路线图
 

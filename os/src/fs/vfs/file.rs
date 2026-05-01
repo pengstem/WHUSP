@@ -281,6 +281,10 @@ impl File for VfsFile {
         Some(WorkingDir::new(self.node.mount_id, self.node.ino))
     }
 
+    fn vfs_mount_id(&self) -> Option<super::super::mount::MountId> {
+        Some(self.node.mount_id)
+    }
+
     fn status_flags(&self) -> OpenFlags {
         self.status_flags.get()
     }

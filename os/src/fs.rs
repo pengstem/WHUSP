@@ -99,6 +99,9 @@ pub trait File: Send + Sync {
     fn working_dir(&self) -> Option<WorkingDir> {
         None
     }
+    fn vfs_mount_id(&self) -> Option<mount::MountId> {
+        None
+    }
     fn status_flags(&self) -> inode::OpenFlags {
         inode::OpenFlags::empty()
     }
@@ -130,7 +133,7 @@ pub(crate) use inode::{
     link_file_at, lookup_mount_target_dir_at, mkdir_at, rename_at, rmdir_at, symlink_at,
     unlink_file_at,
 };
-pub(crate) use mount::{MountError, mount_block_device_at, unmount_at};
+pub(crate) use mount::{MountError, MountId, mount_block_device_at, unmount_at};
 pub(crate) use path::{WorkingDir, normalize_path};
 pub use pipe::make_pipe;
 pub use stdio::{Stdin, Stdout};

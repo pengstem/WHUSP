@@ -50,6 +50,12 @@ pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
     map.get(&pid).map(Arc::clone)
 }
 
+pub(crate) fn any_process_references_mount(mount_id: crate::fs::MountId) -> bool {
+    let map = PID2PCB.exclusive_access();
+    map.values()
+        .any(|process| process.references_vfs_mount(mount_id))
+}
+
 pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
     PID2PCB.exclusive_access().insert(pid, process);
 }
