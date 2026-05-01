@@ -140,7 +140,8 @@ pub(crate) use inode::{
     unlink_file_at,
 };
 pub(crate) use mount::{
-    MountError, MountId, mount_block_device_at, mount_fat_device_at, statfs_for_mount, unmount_at,
+    MountError, MountId, mount_block_device_at, mount_fat_device_at, mount_tmpfs_at,
+    statfs_for_mount, unmount_at,
 };
 pub(crate) use path::{WorkingDir, normalize_path};
 pub use pipe::make_pipe;

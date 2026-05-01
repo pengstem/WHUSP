@@ -430,6 +430,10 @@ pub(crate) fn mount_pseudo_fs_at(
     })
 }
 
+pub(crate) fn mount_tmpfs_at(target: WorkingDir) -> Result<MountId, MountError> {
+    mount_pseudo_fs_at(target, Box::new(TmpFs::new()), "tmpfs")
+}
+
 pub(crate) fn unmount_at(target: WorkingDir) -> Result<(), MountError> {
     let target = VfsNodeId::new(target.mount_id(), target.ino());
     let target_is_root =
