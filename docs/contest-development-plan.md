@@ -12,8 +12,8 @@
 - [x] `make run-la` 已有入口：`x0 = sdcard-la.img`。这只表示有构建/启动入口，不代表 LoongArch 比赛运行已经完整可用。
 - [x] 内核当前直接从评测盘加载 `/musl/busybox sh` 作为 initproc。
 - [x] 已有一次 RISC-V 全量手工运行记录：`develop-guide/contest-full-test-run-2026-04-27.md`。这次是主机注入命令，不是最终 submit runner。
-- [x] `basic-musl` 在该记录中能跑到 END marker，官方 `judge_basic.py` 结果是 `55 / 102`。
-- [x] 在 2026-04-27 全量手工运行记录之后，源码又接入了 `times(153)`、`mprotect(226)`、`nanosleep(101)`、`clock_nanosleep(115)`、`gettimeofday(169)`、`uname(160)` 等修复，旧的跑分记录需要重跑刷新。
+- [x] `basic-musl` 在该记录中能跑到 END marker，2026-04-30 重跑 judge 结果是 `56 / 102`。
+- [x] 在 2026-04-27 全量手工运行记录之后，源码又接入了 `times(153)`、`mprotect(226)`、`nanosleep(101)`、`clock_nanosleep(115)`、`gettimeofday(169)`、`uname(160)` 等修复；2026-04-30 重跑已验证提升。
 - [ ] LoongArch 运行验证、submit runner、全组串行执行、自动 marker 管理、结束后主动关机。
 
 ## 判断
@@ -82,8 +82,9 @@
 - [x] `ioctl(29)` 最小 tty 兼容。
 - [x] `mkdirat(34)`。
 - [x] `unlinkat(35)`。
-- [x] `umount2(39)`，当前仅支持严格的动态 EXT4 mount 范围。
+- [x] `umount2(39)`，支持严格的动态 EXT4 mount 范围和 busy-mount 检查。
 - [x] `mount(40)`，当前仅支持 whole-disk ext4，例如 `/dev/vda`。
+- [x] `statfs(43)`，支持当前 VFS mount 的最小 filesystem 统计，解锁 BusyBox `df`。
 - [x] `chdir(49)`。
 - [x] `openat(56)` 基础路径、dirfd、目录 fd 能力。
 - [x] `pipe2(59)`，使用 Linux `int[2]` ABI，支持 `O_NONBLOCK` / `O_CLOEXEC`。
@@ -115,15 +116,15 @@
 ### 已验证的 `basic-musl` 结果
 
 - [x] 可通过 `cd /musl && ./busybox sh ./basic_testcode.sh` 手工跑到 END marker。
-- [x] 上次全量记录中 `basic-musl` 官方 judge 为 `55 / 102`。
-- [x] 上次记录中已经拿满的 basic 子项：`brk`、`chdir`、`clone`、`close`、`dup`、`fork`、`fstat`、`getcwd`、`getppid`、`mkdir`、`uname`、`yield`。
-- [ ] 2026-04-27 全量记录之后新增的 `times`、`mprotect`、`nanosleep` 等实现尚未重新跑完整 judge。
+- [x] 上次全量记录中 `basic-musl` 官方 judge 为 `56 / 102`（2026-04-30 phase4-basic）。
+- [x] 上次记录中已经拿满的 basic 子项：`brk`、`chdir`、`clone`、`close`、`dup`、`fork`、`fstat`、`getcwd`、`getppid`、`mkdir`、`openat`、`uname`、`yield`。
+- [x] 2026-04-27 全量记录之后新增的 `times`、`mprotect`、`nanosleep` 等实现已在 2026-04-30 重跑中验证（56/102），2026-05-01 进一步提升到 31/32 子项。
 
 ### 当前 `basic-musl` 剩余缺口
 
-- [ ] `dup2` / `dup3` 兼容细节：上次 judge 中 `test_dup2` 为 `0 / 2`。
-- [ ] `times(153)` 需要重跑 judge；源码已接入，但旧日志仍是 `0 / 6`。
-- [ ] `gettimeofday(169)` 需要补齐 judge 细粒度断言，旧结果是 `1 / 3`。
+- [ ] `dup2` / `dup3` 兼容细节：2026-04-30 judge 中 `test_dup2` 为 `0 / 2`，2026-05-01 快照声称 31/32 子项通过需重新验证。
+- [ ] `times(153)` 2026-04-30 judge 为 `1 / 6`，需重跑确认。
+- [ ] `gettimeofday(169)` 2026-04-30 judge 为 `1 / 3`，需重跑确认。
 - [ ] `mount(40)` / `umount2(39)` 的比赛测试语义未完成：`/dev/vda2` 分区源和 `vfat` 均未支持。
 - [ ] `wait4/waitpid` 的 status、options、rusage 细节仍不足。
 - [ ] `openat` 的 `flags/mode/O_CREAT/O_DIRECTORY/O_APPEND/O_TRUNC/O_EXCL/O_NOFOLLOW` 仍需补齐。
@@ -137,7 +138,7 @@
 
 | 优先级 | Syscall / 功能 | 解锁测试 | 当前症状 | 修复方向 |
 |--------|---------------|----------|---------|---------|
-| 1 | 无 shebang 脚本 execve fallback | libctest-musl 整组 | `./run-static.sh: not found`（busybox fallback 到 `/bin/sh` 不存在） | `exec_loaded_program` 中对非 ELF 非 shebang 文件构造虚拟 `#!/bin/sh` 解释器，走已有 `busybox_fallback` 路径 |
+| ~~1~~ | ~~无 shebang 脚本 execve fallback~~ | ~~libctest-musl 整组~~ | ✅ 已实现 | 非 ELF 非 shebang 文件构造虚拟 `#!/bin/sh` 解释器，走 `busybox_fallback` 路径 |
 | ~~2~~ | ~~`renameat2(276)`~~ | ~~busybox `mv`~~ | ✅ 已实现 | `RENAME_NOREPLACE` 支持；`RENAME_EXCHANGE`/`RENAME_WHITEOUT` 返回 EINVAL |
 | 3 | `utimensat(88)` | busybox `touch` | `Function not implemented` (ENOSYS) | 在 VFS/ext4 层支持修改文件时间戳 |
 | ~~4~~ | ~~`unlinkat(AT_REMOVEDIR)` / rmdir 语义~~ | ~~busybox `rmdir`~~ | ✅ 已实现 | `AT_REMOVEDIR` flag 正确分流到 `rmdir_at` |
@@ -145,11 +146,11 @@
 | ~~6~~ | ~~RISC-V FPU 状态 + 用户栈过小~~ | ~~lua round_num, sin30~~ | ✅ 已修复，`rv-musl-lua`/`rv-glibc-lua` 均 9/9 | 已在 `TrapContext`/`trap.S` 保存恢复 f0-f31 + fcsr；同时实测 SIGSEGV 根因是 musl `fmt_fp` 路径越过 8KiB 用户栈，已将用户栈调到 128KiB | 用户 FPU 状态在 trap 边界落入每线程 `TrapContext`，调度器 `switch.S` 仍只保存内核上下文 |
 | ~~7~~ | ~~`kill(129)` — signal=0 进程存活检查~~ | ~~libctest 每用例开头~~ | ✅ 已工作 | `SignalFlags::from_bits(0)` 返回空集，不投递信号，仅检查 PID 存在 |
 | 8 | `kill(129)` — 信号投递 | busybox `kill $!` | `Invalid argument` | 修正 signum 解析（整数 vs bitflags） |
-| 9 | `/proc` 文件系统 | busybox df/ps/free | `No such file or directory` | 实现 procfs 最小子集（详见 P2.6.3）：/proc/mounts, /proc/meminfo, /proc/uptime, /proc/[pid]/stat |
+| ~~9~~ | ~~/proc 文件系统~~ | ~~busybox df/ps/free~~ | ✅ 已实现，`df/free/ps/uptime` 通过 | procfs 最小子集 + `statfs(43)` |
 | 10 | `lseek(62)` | libctest fdopen/fscanf/fwscanf 等 | `ftello/fseeko` 返回 `Function not implemented` (ENOSYS=38) | 给 `File` trait 加 `seek` 方法；`VfsFile` 修改 `SleepMutex<usize>` offset；pipe/stdio 返回 `ESPIPE` |
 | 11 | `prlimit64(261)` 支持 `getrlimit(RLIMIT_NOFILE)` | libctest 每用例开头 | `getrlimit 3: Function not implemented` | 实现 `prlimit64`，返回当前 `FD_LIMIT` 值 |
 | 12 | `rt_sigtimedwait(137)` | libctest 每用例结尾 | `sigtimedwait failed: Function not implemented` | 新增 syscall 137，至少返回 `EAGAIN`（无待处理信号） |
-| 13 | 创建 `/tmp` 目录 | libctest mkstemp 相关用例 | `mkstemp(tmp) failed (errno = 2 = ENOENT)` | 在 EXT4 文件系统初始化时创建 `/tmp` 目录 |
+| ~~13~~ | ~~创建 `/tmp` 目录~~ | ~~libctest mkstemp 相关用例~~ | ✅ tmpfs 已挂载到 `/tmp`；完整 libctest 仍被更早 syscall 缺口阻塞 | `TmpFs` backend 挂载到 `/tmp`，`busybox mktemp` / `mktemp -d` 已验证 |
 | 14 | 线程取消 / `pthread_cancel` | libctest pthread_cancel_points | `pthread_cancel(td) failed: Function not implemented` | 调查线程取消所需的底层支持（信号投递、`rt_sigprocmask` 等） |
 
 ### 2026-05-01 测试结果快照
@@ -157,9 +158,9 @@
 | 测试组 | 通过 | 失败 | 通过率 |
 |--------|------|------|--------|
 | basic-musl | 31/32 | 1 (mount) | 97% |
-| busybox-musl | 43/55 | 12 | 78% |
-| lua-musl | 7/9 | 2 (round_num, sin30) | 78% |
-| libctest-musl | 0 | blocked (无 shebang fallback) | 0% |
+| busybox-musl | 49/55 | 6 | 89% |
+| lua-musl | 9/9 | 0 | 100% (FPU fix + 128KiB stack) |
+| libctest-musl | 0/220 | timeout before END | 需先补 `rt_sigtimedwait` / `prlimit64` / `lseek` |
 
 ## P2.5 - cwd in PCB 收尾
 
@@ -176,12 +177,15 @@
 - [x] `mount(40)` / `umount2(39)` 的目标路径使用当前进程 cwd 做相对路径解析。
 - [x] 基础 `..` 解析已接入。
 
-### 未完成
+### 已完成（新增）
 
 - [x] `fchdir(50)`。
-- [x] `readlinkat`。
-- [x] `faccessat`。
-- [x] `renameat2`。
+- [x] `readlinkat(78)`。
+- [x] `faccessat(48)`。
+- [x] `renameat2(276)`。
+
+### 未完成
+
 - [ ] `chroot`。
 - [ ] `openat2`。
 - [ ] symlink traversal / nofollow semantics。
@@ -234,20 +238,25 @@
 
 **优先级**：HIGH — procfs/tmpfs 的前置条件。
 
-- [ ] 将 `MountId` 从块设备索引改为全局递增的 mount 实例 ID。
+- [x] 将 `MountId` 从块设备索引改为全局递增的 mount 实例 ID。
   - 修改 `os/src/fs/mount.rs`：新增 `NEXT_MOUNT_ID: AtomicUsize`。
   - 块设备 mount 仍占据前 N 个 slot，pseudo-fs mount 从 N 开始分配。
-- [ ] 将 `MOUNTS` 从固定长度 `Vec<SleepMutex<Option<Arc<MountedFs>>>>` 改为可动态增长的结构。
-- [ ] 在 `MountedFs` 中新增 `fs_type: &'static str` 字段（"ext4" / "proc" / "tmpfs" / "devtmpfs"）。
-- [ ] 新增 `register_pseudo_mount(backend: Box<dyn FileSystemBackend>, fs_type: &'static str) -> MountId`。
-- [ ] 在 `FileSystemBackend` trait 中新增 `fn root_ino(&self) -> u32 { 2 }` 默认方法。
-- [ ] 修改 `os/src/fs/vfs/path.rs`：移除对 `lwext4_rust::ffi::EXT4_ROOT_INO` 的直接依赖。
+- [x] 将 `MOUNTS` 从固定长度 `Vec<SleepMutex<Option<Arc<MountedFs>>>>` 改为可动态增长的结构。
+- [x] 在 `MountedFs` 中新增 `fs_type: &'static str` 字段（"ext4" / "proc" / "tmpfs" / "devtmpfs"）。
+- [x] 新增 `register_pseudo_mount(backend: Box<dyn FileSystemBackend>, fs_type: &'static str) -> MountId`。
+- [x] 在 `FileSystemBackend` trait 中新增 `fn root_ino(&self) -> u32 { 2 }` 默认方法。
+- [x] 修改 `os/src/fs/vfs/path.rs`：移除对 `lwext4_rust::ffi::EXT4_ROOT_INO` 的直接依赖。
   - `VfsCursor::root()` 使用 `root_ino()` 查询。
   - `is_mount_root()` 查询对应 mount 的 `root_ino()`。
   - `follow_mounted_root()` 使用 `root_ino_for(mount_id)` 而非硬编码 2。
-- [ ] 新增 `mount_pseudo_fs_at(target: WorkingDir, backend: Box<dyn FileSystemBackend>, fs_type: &'static str) -> Result<MountId, MountError>`。
-- [ ] 新增 `list_mounts() -> Vec<MountInfo>` 供 procfs `/proc/mounts` 使用。
-- [ ] 验证：`make all`、`make run-rv`、`basic-musl` 文件系统用例不回退。
+- [x] 新增 `mount_pseudo_fs_at(target: WorkingDir, backend: Box<dyn FileSystemBackend>, fs_type: &'static str) -> Result<MountId, MountError>`。
+- [x] 新增 `list_mounts() -> Vec<MountInfo>` 供 procfs `/proc/mounts` 使用。
+- [x] 验证：`make all`、`make run-rv`、`basic-musl` 文件系统用例不回退。
+
+2026-05-01 阶段 2 验证记录：
+
+- `make all`：通过，产出 `kernel-rv` 和 `kernel-la`。
+- `tools/contest_runner/run_groups.py --arch rv --libcs musl --groups basic --out develop-guide/test-run-logs/2026-05-01-phase2/basic-rv-musl --no-build`：`basic-musl` end-seen，`56 / 102`，未退化；该阶段是 procfs/tmpfs 前置结构，未预期直接涨分。
 
 ### 阶段 3：procfs 实现（HIGH — 解锁 ~12 busybox 命令）
 
@@ -255,21 +264,28 @@
 
 **新建文件**：`os/src/fs/procfs.rs`
 
-- [ ] 新建 `os/src/fs/procfs.rs`，实现 `FileSystemBackend` trait。
-- [ ] 定义 procfs inode 编号方案（root=2, mounts=3, meminfo=4, uptime=5, PID 目录=100+PID, PID 子文件=10000+PID*10+offset）。
-- [ ] 实现 `/proc/mounts`：调用 `mount::list_mounts()`，格式 `<device> <mountpoint> <fstype> <options> 0 0`。
-- [ ] 实现 `/proc/meminfo`：从 frame allocator 获取 total/free 帧数。
-  - 需要在 `os/src/mm/frame_allocator.rs` 新增 `pub fn frame_stats() -> (usize, usize)`。
+- [x] 新建 `os/src/fs/procfs.rs`，实现 `FileSystemBackend` trait。
+- [x] 定义 procfs inode 编号方案（root=2, mounts=3, meminfo=4, uptime=5, PID 目录=100+PID, PID 子文件=10000+PID*10+offset）。
+- [x] 实现 `/proc/mounts`：调用 `mount::list_mounts()`，格式 `<device> <mountpoint> <fstype> <options> 0 0`。
+- [x] 实现 `/proc/meminfo`：从 frame allocator 获取 total/free 帧数。
+  - 已在 `os/src/mm/frame_allocator.rs` 新增 `pub fn frame_stats() -> (usize, usize)`。
   - 输出 `MemTotal`、`MemFree`、`MemAvailable`、`Buffers`(0)、`Cached`(0)、`SwapTotal`(0)、`SwapFree`(0)。
-- [ ] 实现 `/proc/uptime`：格式 `SECONDS.NN IDLE.NN\n`，从 arch timer 计算。
-- [ ] 实现 `/proc` 目录 readdir：列出固定条目 + 当前存活 PID（从 `PID2PCB` 迭代）。
-- [ ] 实现 `/proc/<PID>/stat`：Linux 格式 `pid (comm) state ppid ...`。
-- [ ] 实现 `/proc/<PID>/status`：`Name:\tcomm\nState:\tS\nPid:\tN\nPPid:\tN\nVmRSS:\tN kB\n`。
-- [ ] 实现 `/proc/<PID>/cmdline`：NUL-separated argv。
-  - 需要在 `ProcessControlBlockInner` 新增 `cmdline: Vec<String>`，在 `execve` 时保存。
-- [ ] 所有写操作返回 `FsError::ReadOnly`。
-- [ ] 在 `init_mounts()` 末尾挂载 procfs 到 `/proc`。
-- [ ] 验证：`/musl/busybox df`、`/musl/busybox free`、`/musl/busybox ps`、`/musl/busybox uptime`。
+- [x] 实现 `/proc/uptime`：格式 `SECONDS.NN IDLE.NN\n`，从内核 timer 计算。
+- [x] 实现 `/proc` 目录 readdir：列出固定条目 + 当前存活 PID（从 `PID2PCB` 迭代）。
+- [x] 实现 `/proc/<PID>/stat`：Linux 格式 `pid (comm) state ppid ...`。
+- [x] 实现 `/proc/<PID>/status`：`Name:\tcomm\nState:\tS\nPid:\tN\nPPid:\tN\nVmRSS:\tN kB\n`。
+- [x] 实现 `/proc/<PID>/cmdline`：NUL-separated argv。
+  - 已在 `ProcessControlBlockInner` 新增 `cmdline: Vec<String>`，在 `execve` 时保存。
+- [x] 所有写操作返回 `FsError::ReadOnly`。
+- [x] 在 `init_mounts()` 末尾挂载 procfs 到 `/proc`。
+- [x] 补 `statfs(43)`，让 BusyBox `df` 能查询 `/`、`/proc`、`/tmp` 的 filesystem 统计。
+- [x] 验证：`/musl/busybox df`、`/musl/busybox free`、`/musl/busybox ps`、`/musl/busybox uptime`。
+
+2026-05-01 阶段 3 验证记录：
+
+- `make fmt`：通过。
+- `make all`：通过，产出 `kernel-rv` 和 `kernel-la`。
+- `tools/contest_runner/run_groups.py --arch rv --libcs musl --groups busybox --out develop-guide/test-run-logs/2026-05-01-phase3-statfs/busybox-rv-musl --no-build`：`busybox-musl` end-seen，`49 / 55`；`df`、`free`、`ps`、`uptime` 均 success。
 
 ### 阶段 4：tmpfs 实现（MEDIUM — 解锁 libctest mkstemp/mkdtemp）
 
@@ -277,12 +293,24 @@
 
 **新建文件**：`os/src/fs/tmpfs.rs`
 
-- [ ] 新建 `os/src/fs/tmpfs.rs`，实现 `FileSystemBackend` trait。
-- [ ] 内部数据结构：`TmpfsInode { kind, mode, nlink, data: Vec<u8>, children: BTreeMap<String, u32>, parent_ino }` + `TmpFs { inodes: BTreeMap<u32, TmpfsInode>, next_ino }`。
-- [ ] 实现完整 POSIX 文件操作：create_file、create_dir、unlink、rename、link、symlink、read_at、write_at、set_len、readlink。
-- [ ] `read_at` / `write_at` 直接操作 `data: Vec<u8>`，write 时自动扩展。
-- [ ] 在 `init_mounts()` 中挂载 tmpfs 到 `/tmp`。
-- [ ] 验证：`/musl/busybox touch /tmp/test`、`mkdir /tmp/dir`、libctest `mkstemp`/`mkdtemp`。
+- [x] 新建 `os/src/fs/tmpfs.rs`，实现 `FileSystemBackend` trait。
+- [x] 内部数据结构：`TmpfsInode { kind, mode, nlink, data: Vec<u8>, children: BTreeMap<String, u32>, parent_ino, ctime_us, mtime_us }` + `TmpFs { inodes: BTreeMap<u32, TmpfsInode>, next_ino }`。
+- [x] 实现 VFS 需要的文件操作：create_file、create_dir、unlink、rename、link、symlink、read_at、write_at、set_len、readlink。
+- [x] `read_at` / `write_at` 直接操作 `data: Vec<u8>`，write 时自动扩展。
+- [x] 在 `init_mounts()` 中挂载 tmpfs 到 `/tmp`。
+- [x] 验证：`/musl/busybox sh -c 'echo hello > /tmp/test'`、`cat /tmp/test`、`mkdir /tmp/dir`、`ls /tmp`、`rm /tmp/test`、`rmdir /tmp/dir`。
+- [x] 验证：`/musl/busybox mktemp /tmp/tmp.XXXXXX` 和 `/musl/busybox mktemp -d /tmp/dir.XXXXXX` 均成功，覆盖 mkstemp/mkdtemp 的核心路径。
+- [ ] `touch /tmp/test` 仍被 `utimensat(88)` ENOSYS 阻塞；这不是 tmpfs create/write/read 路径失败。
+- [ ] 完整 `libctest-musl` 仍在 mkstemp/mkdtemp 前被 `rt_sigtimedwait(137)`、`prlimit64(261)`、`lseek(62)` 等缺口阻塞。
+
+2026-05-01 阶段 4 验证记录：
+
+- `make fmt`：通过。
+- `make all`：通过，产出 `kernel-rv` 和 `kernel-la`。
+- `CARGO_NET_OFFLINE=true make all`：通过。
+- `make run-rv` 手工验收：`/tmp` 上 create/write/read/mkdir/readdir/unlink/rmdir 均成功；`busybox mktemp` / `mktemp -d` 均成功；`touch` 因 `utimensat(88)` 返回 ENOSYS。
+- `tools/contest_runner/run_groups.py --arch rv --libcs musl --groups busybox --out develop-guide/test-run-logs/2026-05-01-phase4/busybox-rv-musl --no-build`：`busybox-musl` end-seen，保持 `49 / 55`，未退化。
+- `tools/contest_runner/run_groups.py --arch rv --libcs musl --groups libctest --out develop-guide/test-run-logs/2026-05-01-phase4/libctest-rv-musl --no-build`：未到 END，`0 / 220`；日志确认进入 libctest 后先被 `rt_sigtimedwait`、`kill`、`getrlimit`、`lseek` 阻塞，未形成 tmpfs 结论。
 
 ### 阶段 5：devfs 迁移为 VFS backend（LOW）
 
@@ -324,17 +352,17 @@
 
 ### 阶段 9：验收门槛
 
-- [ ] `make fmt`。
-- [ ] `make all`。
-- [ ] `CARGO_NET_OFFLINE=true make all`。
+- [x] `make fmt`。
+- [x] `make all`。
+- [x] `CARGO_NET_OFFLINE=true make all`。
 - [ ] `make run-rv` 下 `/musl/basic_testcode.sh` 通过。
 - [ ] pipeline 复现不 panic，重复运行 5 次不死锁。
-- [ ] `busybox-musl` 完整脚本打印 END marker。
-- [ ] `busybox-musl` 中 `df`、`free`、`ps`、`uptime` 命令通过（依赖 procfs）。
+- [x] `busybox-musl` 完整脚本打印 END marker。
+- [x] `busybox-musl` 中 `df`、`free`、`ps`、`uptime` 命令通过（依赖 procfs）。
 - [ ] `libctest-musl` 中 `mkstemp`、`mkdtemp` 用例通过（依赖 tmpfs）。
 - [ ] `basic-musl` 文件系统相关用例全部通过。
-- [ ] `/proc/mounts` 输出格式被 `df` 正确解析。
-- [ ] `/proc/meminfo` 输出格式被 `free` 正确解析。
+- [x] `/proc/mounts` 输出格式被 `df` 正确解析。
+- [x] `/proc/meminfo` 输出格式被 `free` 正确解析。
 - [ ] LA 的 nonblocking block I/O 不作为当前门槛。
 
 ## P2.6.3 - procfs 实现细节
@@ -353,7 +381,7 @@
 | `frame_stats() -> (total, free)` | `os/src/mm/frame_allocator.rs` | `/proc/meminfo` |
 | `ProcessControlBlockInner::cmdline` | `os/src/task/process.rs` | `/proc/<PID>/cmdline` |
 | `list_mounts() -> Vec<MountInfo>` | `os/src/fs/mount.rs` | `/proc/mounts` |
-| `get_uptime_secs() -> f64` | `os/src/arch/riscv64/timer.rs` | `/proc/uptime` |
+| `get_time_us()` | `os/src/timer.rs` | `/proc/uptime` |
 | `PID2PCB` 只读迭代接口 | `os/src/task/manager.rs` | `/proc` 目录列表 |
 
 ### 预期比赛得分影响
@@ -376,6 +404,8 @@ procfs 解锁的 busybox 命令（当前因 `/proc` 不存在而失败）：
 3. 挂载并验证 `busybox df` 和 `busybox free`。
 4. 补充 `/proc/uptime` 和 `/proc/<PID>/*`。
 5. 重跑 `busybox-musl` judge，确认得分提升。
+
+当前状态：以上 5 步已完成。`busybox-musl` 从 2026-05-01 快照的 `43 / 55` 提升到 `49 / 55`。
 
 ## P2.6.4 - tmpfs 实现细节
 
@@ -423,6 +453,8 @@ pub(crate) struct TmpFs {
 2. 阶段 2 mount 泛化完成后，实现 tmpfs backend。
 3. 挂载 tmpfs 到 `/tmp`，替代 ext4 上的 `/tmp` 目录。
 4. 验证 libctest mkstemp/mkdtemp。
+
+当前状态：tmpfs backend 和 `/tmp` 挂载已完成；`busybox mktemp` / `mktemp -d` 已验证。完整 libctest 仍需先补 `rt_sigtimedwait(137)`、`prlimit64(261)` 和 `lseek(62)`，否则跑不到 mkstemp/mkdtemp 的有效验收点。
 
 ## P2.6.5 - 可选 FAT/VFAT 支持路线图
 
