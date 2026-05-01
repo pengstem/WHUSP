@@ -9,6 +9,7 @@ const SYSCALL_SYMLINKAT: usize = 36;
 const SYSCALL_LINKAT: usize = 37;
 const SYSCALL_UMOUNT2: usize = 39;
 const SYSCALL_MOUNT: usize = 40;
+const SYSCALL_STATFS: usize = 43;
 const SYSCALL_FACCESSAT: usize = 48;
 const SYSCALL_CHDIR: usize = 49;
 const SYSCALL_FCHDIR: usize = 50;
@@ -101,6 +102,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3],
             args[4] as *const u8,
         ),
+        SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut LinuxStatfs),
         SYSCALL_FACCESSAT => sys_faccessat(
             args[0] as isize,
             args[1] as *const u8,

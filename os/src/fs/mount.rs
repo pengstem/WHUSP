@@ -1,6 +1,8 @@
 use super::ext4::Ext4Mount;
 use super::path::WorkingDir;
-use super::vfs::{FileSystemBackend, FsError, FsNodeKind, VfsNodeId};
+use super::procfs::ProcFs;
+use super::tmpfs::TmpFs;
+use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, VfsNodeId};
 use crate::drivers::block::BLOCK_DEVICES;
 use crate::sync::{SleepMutex, UPIntrFreeCell};
 use crate::task::any_process_references_mount;
@@ -8,21 +10,25 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::{format, string::String};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::*;
 use log::{info, warn};
-use lwext4_rust::ffi::EXT4_ROOT_INO;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MountId(pub(crate) usize);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DynamicMount {
     target: VfsNodeId,
     covered_parent: VfsNodeId,
     source_mount_id: MountId,
+    target_path: String,
 }
 
 struct MountedFs {
+    source: String,
+    fs_type: &'static str,
+    options: &'static str,
     backend: SleepMutex<Box<dyn FileSystemBackend>>,
 }
 
@@ -41,15 +47,22 @@ pub(crate) enum MountError {
     StaticRoot,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct MountInfo {
+    pub(crate) source: String,
+    pub(crate) target: String,
+    pub(crate) fs_type: &'static str,
+    pub(crate) options: &'static str,
+}
+
 lazy_static! {
-    static ref MOUNTS: Vec<SleepMutex<Option<Arc<MountedFs>>>> = BLOCK_DEVICES
-        .iter()
-        .map(|_| SleepMutex::new(None))
-        .collect();
+    static ref MOUNTS: SleepMutex<Vec<Option<Arc<MountedFs>>>> = SleepMutex::new(Vec::new());
     static ref MOUNTS_INITIALIZED: UPIntrFreeCell<bool> = unsafe { UPIntrFreeCell::new(false) };
     static ref DYNAMIC_MOUNTS: UPIntrFreeCell<Vec<DynamicMount>> =
         unsafe { UPIntrFreeCell::new(Vec::new()) };
 }
+
+static NEXT_MOUNT_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub fn init_mounts() {
     let already_initialized = MOUNTS_INITIALIZED.exclusive_session(|initialized| {
@@ -68,28 +81,59 @@ pub fn init_mounts() {
         .first()
         .expect("DTB is missing a block device")
         .clone();
-    let primary_mount = open_backend(BackendKind::Ext4, primary_device)
+    let primary_mount = open_backend(BackendKind::Ext4, primary_device, 0)
         .expect("failed to mount primary ext4 filesystem");
-    *MOUNTS[0].lock() = Some(primary_mount);
+    let block_mount_count = BLOCK_DEVICES.len();
+    {
+        let mut mounts = MOUNTS.lock();
+        mounts.resize_with(block_mount_count, || None);
+        mounts[0] = Some(primary_mount);
+    }
+    NEXT_MOUNT_ID.store(block_mount_count, Ordering::SeqCst);
 
     mount_extra_block_devices();
+    mount_kernel_pseudo_filesystems();
 }
 
 impl MountedFs {
-    fn new(backend: Box<dyn FileSystemBackend>) -> Arc<Self> {
+    fn new(
+        backend: Box<dyn FileSystemBackend>,
+        source: String,
+        fs_type: &'static str,
+        options: &'static str,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            source,
+            fs_type,
+            options,
             backend: SleepMutex::new(backend),
         })
+    }
+}
+
+fn block_source_name(device_index: usize) -> String {
+    if device_index < 26 {
+        format!("/dev/vd{}", (b'a' + device_index as u8) as char)
+    } else {
+        format!("/dev/vd{device_index}")
     }
 }
 
 fn open_backend(
     kind: BackendKind,
     device: Arc<crate::drivers::block::VirtIOBlock>,
+    device_index: usize,
 ) -> Result<Arc<MountedFs>, MountError> {
     match kind {
         BackendKind::Ext4 => Ext4Mount::open(device)
-            .map(|mount| MountedFs::new(Box::new(mount)))
+            .map(|mount| {
+                MountedFs::new(
+                    Box::new(mount),
+                    block_source_name(device_index),
+                    "ext4",
+                    "rw",
+                )
+            })
             .map_err(|err| {
                 warn!("ext4 open failed: {:?}", err);
                 MountError::InvalidFilesystem
@@ -102,40 +146,53 @@ pub(super) fn with_mount<V>(
     f: impl FnOnce(&mut dyn FileSystemBackend) -> V,
 ) -> Option<V> {
     let mounted = {
-        let slot = MOUNTS.get(mount_id.0)?;
-        let guard = slot.lock();
-        guard.as_ref().cloned()
+        let mounts = MOUNTS.lock();
+        mounts
+            .get(mount_id.0)
+            .and_then(|mount| mount.as_ref().cloned())
     }?;
     let mut backend = mounted.backend.lock();
     Some(f(&mut **backend))
 }
 
 pub(super) fn mount_exists(mount_id: MountId) -> bool {
-    MOUNTS.get(mount_id.0).is_some_and(|slot| {
-        let mount = slot.lock();
-        mount.is_some()
-    })
+    let mounts = MOUNTS.lock();
+    mounts.get(mount_id.0).is_some_and(Option::is_some)
 }
 
 fn ensure_mount_open(mount_id: MountId) -> Result<(), MountError> {
-    let Some(slot) = MOUNTS.get(mount_id.0) else {
-        return Err(MountError::SourceMissing);
-    };
     let device = BLOCK_DEVICES
         .get(mount_id.0)
         .ok_or(MountError::SourceMissing)?
         .clone();
 
-    if slot.lock().is_some() {
-        return Ok(());
+    {
+        let mounts = MOUNTS.lock();
+        let Some(mount) = mounts.get(mount_id.0) else {
+            return Err(MountError::SourceMissing);
+        };
+        if mount.is_some() {
+            return Ok(());
+        }
     }
 
-    let mount = open_backend(BackendKind::Ext4, device)?;
-    let mut guard = slot.lock();
-    if guard.is_none() {
-        *guard = Some(mount);
+    let mount = open_backend(BackendKind::Ext4, device, mount_id.0)?;
+    let mut mounts = MOUNTS.lock();
+    let Some(slot) = mounts.get_mut(mount_id.0) else {
+        return Err(MountError::SourceMissing);
+    };
+    if slot.is_none() {
+        *slot = Some(mount);
     }
     Ok(())
+}
+
+pub(super) fn root_ino_for(mount_id: MountId) -> Option<u32> {
+    with_mount(mount_id, |mount| mount.root_ino())
+}
+
+fn primary_root_ino() -> u32 {
+    root_ino_for(primary_mount_id()).unwrap_or(2)
 }
 
 pub(super) fn mounted_root_for(target: VfsNodeId) -> Option<MountId> {
@@ -184,7 +241,7 @@ pub(crate) fn mount_block_device_at(
 ) -> Result<(), MountError> {
     let source_mount_id = MountId(device_index);
     let target = VfsNodeId::new(target.mount_id(), target.ino());
-    if target.ino == EXT4_ROOT_INO {
+    if root_ino_for(target.mount_id).is_some_and(|root_ino| target.ino == root_ino) {
         return Err(MountError::StaticRoot);
     }
 
@@ -195,6 +252,7 @@ pub(crate) fn mount_block_device_at(
     }
 
     let covered_parent = lookup_covered_parent(target)?;
+    let target_path = mount_point_for_target(target);
     ensure_mount_open(source_mount_id)?;
 
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
@@ -205,19 +263,68 @@ pub(crate) fn mount_block_device_at(
             target,
             covered_parent,
             source_mount_id,
+            target_path,
         });
         Ok(())
     })
 }
 
-pub(crate) fn unmount_at(target: WorkingDir) -> Result<(), MountError> {
+pub(crate) fn register_pseudo_mount(
+    backend: Box<dyn FileSystemBackend>,
+    fs_type: &'static str,
+) -> MountId {
+    let mount_id = MountId(NEXT_MOUNT_ID.fetch_add(1, Ordering::SeqCst));
+    let mounted = MountedFs::new(backend, fs_type.into(), fs_type, "rw");
+    let mut mounts = MOUNTS.lock();
+    if mount_id.0 >= mounts.len() {
+        mounts.resize_with(mount_id.0 + 1, || None);
+    }
+    mounts[mount_id.0] = Some(mounted);
+    mount_id
+}
+
+pub(crate) fn mount_pseudo_fs_at(
+    target: WorkingDir,
+    backend: Box<dyn FileSystemBackend>,
+    fs_type: &'static str,
+) -> Result<MountId, MountError> {
     let target = VfsNodeId::new(target.mount_id(), target.ino());
-    if target.ino == EXT4_ROOT_INO && target.mount_id == primary_mount_id() {
+    if root_ino_for(target.mount_id).is_some_and(|root_ino| target.ino == root_ino) {
         return Err(MountError::StaticRoot);
     }
-    let is_root_ino = target.ino == EXT4_ROOT_INO;
+
+    let target_is_busy = DYNAMIC_MOUNTS
+        .exclusive_session(|mounts| mounts.iter().any(|mount| mount.target == target));
+    if target_is_busy {
+        return Err(MountError::TargetBusy);
+    }
+
+    let covered_parent = lookup_covered_parent(target)?;
+    let target_path = mount_point_for_target(target);
+    let source_mount_id = register_pseudo_mount(backend, fs_type);
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
-        let index = if is_root_ino {
+        if mounts.iter().any(|mount| mount.target == target) {
+            return Err(MountError::TargetBusy);
+        }
+        mounts.push(DynamicMount {
+            target,
+            covered_parent,
+            source_mount_id,
+            target_path,
+        });
+        Ok(source_mount_id)
+    })
+}
+
+pub(crate) fn unmount_at(target: WorkingDir) -> Result<(), MountError> {
+    let target = VfsNodeId::new(target.mount_id(), target.ino());
+    let target_is_root =
+        root_ino_for(target.mount_id).is_some_and(|root_ino| target.ino == root_ino);
+    if target_is_root && target.mount_id == primary_mount_id() {
+        return Err(MountError::StaticRoot);
+    }
+    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        let index = if target_is_root {
             mounts
                 .iter()
                 .rposition(|mount| mount.source_mount_id == target.mount_id)
@@ -235,33 +342,7 @@ pub(crate) fn unmount_at(target: WorkingDir) -> Result<(), MountError> {
 }
 
 fn ensure_extra_mount_target(index: usize) -> Option<WorkingDir> {
-    let name = format!("x{index}");
-    with_mount(primary_mount_id(), |mount| {
-        match mount.lookup_component_from(EXT4_ROOT_INO, &name) {
-            Ok((ino, kind)) => {
-                if kind == FsNodeKind::Directory {
-                    return Some(WorkingDir::new(primary_mount_id(), ino));
-                }
-                warn!("cannot auto-mount BLOCK_DEVICES[{index}]: /{name} is not a directory");
-                return None;
-            }
-            Err(FsError::NotFound) => {}
-            Err(err) => {
-                warn!("cannot lookup /{name} for BLOCK_DEVICES[{index}] auto-mount: {err:?}");
-                return None;
-            }
-        }
-
-        mount
-            .create_dir(EXT4_ROOT_INO, &name, 0o755)
-            .map(|ino| WorkingDir::new(primary_mount_id(), ino))
-            .ok()
-            .or_else(|| {
-                warn!("cannot create /{name} for BLOCK_DEVICES[{index}] auto-mount");
-                None
-            })
-    })
-    .flatten()
+    ensure_primary_dir(&format!("x{index}"), 0o755)
 }
 
 fn source_has_dynamic_mount(source_mount_id: MountId) -> bool {
@@ -287,9 +368,55 @@ fn mount_extra_block_devices() {
     }
 }
 
+fn ensure_primary_dir(name: &str, mode: u32) -> Option<WorkingDir> {
+    let root_ino = primary_root_ino();
+    with_mount(primary_mount_id(), |mount| {
+        match mount.lookup_component_from(root_ino, name) {
+            Ok((ino, kind)) => {
+                if kind == FsNodeKind::Directory {
+                    return Some(WorkingDir::new(primary_mount_id(), ino));
+                }
+                warn!("cannot mount pseudo filesystem at /{name}: target is not a directory");
+                return None;
+            }
+            Err(FsError::NotFound) => {}
+            Err(err) => {
+                warn!("cannot lookup /{name} for pseudo filesystem mount: {err:?}");
+                return None;
+            }
+        }
+
+        mount
+            .create_dir(root_ino, name, mode)
+            .map(|ino| WorkingDir::new(primary_mount_id(), ino))
+            .ok()
+            .or_else(|| {
+                warn!("cannot create /{name} for pseudo filesystem mount");
+                None
+            })
+    })
+    .flatten()
+}
+
+fn mount_kernel_pseudo_filesystems() {
+    if let Some(target) = ensure_primary_dir("proc", 0o555) {
+        match mount_pseudo_fs_at(target, Box::new(ProcFs::new()), "proc") {
+            Ok(_) => info!("filesystem mounted from proc at /proc"),
+            Err(err) => warn!("failed to mount proc at /proc: {err:?}"),
+        }
+    }
+    if let Some(target) = ensure_primary_dir("tmp", 0o1777) {
+        match mount_pseudo_fs_at(target, Box::new(TmpFs::new()), "tmpfs") {
+            Ok(_) => info!("filesystem mounted from tmpfs at /tmp"),
+            Err(err) => warn!("failed to mount tmpfs at /tmp: {err:?}"),
+        }
+    }
+}
+
 pub fn mount_status_log() {
     info!("filesystem mounted from BLOCK_DEVICES[0] at /");
-    for index in 1..MOUNTS.len() {
+    let mounts_len = MOUNTS.lock().len();
+    for index in 1..mounts_len {
         if source_has_dynamic_mount(MountId(index)) {
             info!("filesystem mounted from BLOCK_DEVICES[{index}] at /x{index}");
         } else if mount_exists(MountId(index)) {
@@ -302,4 +429,67 @@ pub fn mount_status_log() {
 
 pub fn list_root_apps() -> Vec<String> {
     with_mount(primary_mount_id(), |mount| mount.list_root_names()).unwrap_or_default()
+}
+
+fn mount_metadata(mount_id: MountId) -> Option<(String, &'static str, &'static str)> {
+    let mounted = {
+        let mounts = MOUNTS.lock();
+        mounts
+            .get(mount_id.0)
+            .and_then(|mount| mount.as_ref().cloned())
+    }?;
+    Some((mounted.source.clone(), mounted.fs_type, mounted.options))
+}
+
+fn mount_point_for_target(target: VfsNodeId) -> String {
+    if target.mount_id == primary_mount_id() && target.ino == primary_root_ino() {
+        return "/".into();
+    }
+    if target.mount_id == primary_mount_id() {
+        let root_ino = primary_root_ino();
+        if let Some(path) = with_mount(primary_mount_id(), |mount| {
+            for name in mount.list_root_names() {
+                if let Ok((ino, kind)) = mount.lookup_component_from(root_ino, &name) {
+                    if ino == target.ino && kind == FsNodeKind::Directory {
+                        return Some(format!("/{name}"));
+                    }
+                }
+            }
+            None
+        })
+        .flatten()
+        {
+            return path;
+        }
+    }
+    format!("<mount:{}:{}>", target.mount_id.0, target.ino)
+}
+
+pub(crate) fn list_mounts() -> Vec<MountInfo> {
+    let mut infos = Vec::new();
+    if let Some((source, fs_type, options)) = mount_metadata(primary_mount_id()) {
+        infos.push(MountInfo {
+            source,
+            target: "/".into(),
+            fs_type,
+            options,
+        });
+    }
+
+    let dynamic_mounts = DYNAMIC_MOUNTS.exclusive_session(|mounts| mounts.clone());
+    for mount in dynamic_mounts {
+        if let Some((source, fs_type, options)) = mount_metadata(mount.source_mount_id) {
+            infos.push(MountInfo {
+                source,
+                target: mount.target_path,
+                fs_type,
+                options,
+            });
+        }
+    }
+    infos
+}
+
+pub(crate) fn statfs_for_mount(mount_id: MountId) -> Option<FileSystemStat> {
+    with_mount(mount_id, |backend| backend.statfs())
 }

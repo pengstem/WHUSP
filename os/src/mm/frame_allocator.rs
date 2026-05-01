@@ -40,6 +40,7 @@ trait FrameAllocator {
 }
 
 pub struct StackFrameAllocator {
+    start: usize,
     current: usize,
     end: usize,
     recycled: Vec<usize>,
@@ -47,14 +48,25 @@ pub struct StackFrameAllocator {
 
 impl StackFrameAllocator {
     pub fn init(&mut self, l: PhysPageNum, r: PhysPageNum) {
+        self.start = l.0;
         self.current = l.0;
         self.end = r.0;
         // println!("last {} Physical Frames.", self.end - self.current);
+    }
+
+    pub fn stats(&self) -> (usize, usize) {
+        let total = self.end.saturating_sub(self.start);
+        let free = self
+            .end
+            .saturating_sub(self.current)
+            .saturating_add(self.recycled.len());
+        (total, free)
     }
 }
 impl FrameAllocator for StackFrameAllocator {
     fn new() -> Self {
         Self {
+            start: 0,
             current: 0,
             end: 0,
             recycled: Vec::new(),
@@ -125,6 +137,10 @@ pub fn frame_alloc_more(num: usize) -> Option<Vec<FrameTracker>> {
 
 pub fn frame_dealloc(ppn: PhysPageNum) {
     FRAME_ALLOCATOR.exclusive_access().dealloc(ppn);
+}
+
+pub fn frame_stats() -> (usize, usize) {
+    FRAME_ALLOCATOR.exclusive_access().stats()
 }
 
 #[allow(unused)]

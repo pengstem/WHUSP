@@ -1,11 +1,14 @@
 mod devfs;
+mod dirent;
 mod ext4;
 mod inode;
 mod mount;
 mod path;
 mod pipe;
+mod procfs;
 mod status_flags;
 mod stdio;
+mod tmpfs;
 mod vfs;
 
 use crate::mm::UserBuffer;
@@ -16,6 +19,8 @@ const DEFAULT_BLOCK_SIZE: u32 = 4096;
 pub const S_IFIFO: u32 = 0o010000;
 pub const S_IFCHR: u32 = 0o020000;
 pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFREG: u32 = 0o100000;
+pub const S_IFLNK: u32 = 0o120000;
 
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,12 +138,12 @@ pub(crate) use inode::{
     link_file_at, lookup_mount_target_dir_at, mkdir_at, rename_at, rmdir_at, symlink_at,
     unlink_file_at,
 };
-pub(crate) use mount::{MountError, MountId, mount_block_device_at, unmount_at};
+pub(crate) use mount::{MountError, MountId, mount_block_device_at, statfs_for_mount, unmount_at};
 pub(crate) use path::{WorkingDir, normalize_path};
 pub use pipe::make_pipe;
 pub use stdio::{Stdin, Stdout};
 pub(crate) use vfs::open_file;
-pub(crate) use vfs::{FsError, FsResult, lookup_dir_at, open_file_at, stat_at};
+pub(crate) use vfs::{FileSystemStat, FsError, FsResult, lookup_dir_at, open_file_at, stat_at};
 
 pub(self) fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)

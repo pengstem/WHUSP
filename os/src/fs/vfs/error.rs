@@ -13,6 +13,8 @@ pub(crate) enum FsError {
     NameTooLong,
     Loop,
     Unsupported,
+    ReadOnly,
+    NoSpace,
 }
 
 pub(crate) type FsResult<T = ()> = Result<T, FsError>;

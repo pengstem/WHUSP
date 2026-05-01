@@ -1,5 +1,8 @@
 use super::FileStat;
-use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
+use super::dirent::{
+    DT_DIR, DT_LNK, DT_REG, DT_UNKNOWN, LINUX_DIRENT64_ALIGN, LINUX_DIRENT64_HEADER_SIZE,
+};
+use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult};
 use crate::drivers::block::VirtIOBlock;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -58,12 +61,6 @@ impl Ext4BlockDevice for KernelDisk {
 type KernelExt4Fs = Ext4Filesystem<KernelHal, KernelDisk>;
 
 const EXT4_CONFIG: FsConfig = FsConfig { bcache_size: 256 };
-const LINUX_DIRENT64_HEADER_SIZE: usize = 19;
-const LINUX_DIRENT64_ALIGN: usize = 8;
-const DT_UNKNOWN: u8 = 0;
-const DT_DIR: u8 = 4;
-const DT_REG: u8 = 8;
-const DT_LNK: u8 = 10;
 // lwext4_rust::ffi does not export ENAMETOOLONG; define it locally.
 const ENAMETOOLONG: u32 = 36;
 
@@ -124,6 +121,33 @@ impl Ext4Mount {
 }
 
 impl FileSystemBackend for Ext4Mount {
+    fn statfs(&mut self) -> FileSystemStat {
+        match self.fs.stat() {
+            Ok(st) => FileSystemStat {
+                magic: 0xEF53,
+                block_size: st.block_size as u64,
+                blocks: st.blocks_count,
+                free_blocks: st.free_blocks_count,
+                available_blocks: st.free_blocks_count,
+                files: st.inodes_count as u64,
+                free_files: st.free_inodes_count as u64,
+                max_name_len: 255,
+                flags: 0,
+            },
+            Err(_) => FileSystemStat {
+                magic: 0xEF53,
+                block_size: 4096,
+                blocks: 0,
+                free_blocks: 0,
+                available_blocks: 0,
+                files: 4096,
+                free_files: 2048,
+                max_name_len: 255,
+                flags: 0,
+            },
+        }
+    }
+
     fn lookup_component_from(
         &mut self,
         parent_ino: u32,

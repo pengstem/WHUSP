@@ -1,12 +1,12 @@
-use crate::fs::{FileStat, WorkingDir, stat_at, stat_devfs_child};
+use crate::fs::{FileStat, MountId, WorkingDir, stat_at, stat_devfs_child, statfs_for_mount};
 use crate::task::{current_process, current_user_token};
 
 use super::super::errno::{SysError, SysResult};
 use super::fd::get_file_by_fd;
 use super::path::dirfd_base;
 use super::uapi::{
-    AT_EMPTY_PATH, AT_FDCWD, LinuxKstat, LinuxStatx, STATX_RESERVED, VALID_FSTATAT_FLAGS,
-    VALID_STATX_FLAGS,
+    AT_EMPTY_PATH, AT_FDCWD, LinuxKstat, LinuxStatfs, LinuxStatx, STATX_RESERVED,
+    VALID_FSTATAT_FLAGS, VALID_STATX_FLAGS,
 };
 use super::user_ptr::{PATH_MAX, read_user_c_string, write_user_value};
 
@@ -77,6 +77,21 @@ pub fn sys_newfstatat(
         return Err(SysError::ENOENT);
     }
     write_stat_result(token, statbuf, resolve_stat(dirfd, path.as_str())?)
+}
+
+pub fn sys_statfs(pathname: *const u8, statfsbuf: *mut LinuxStatfs) -> SysResult {
+    if statfsbuf.is_null() || pathname.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    let token = current_user_token();
+    let path = read_user_c_string(token, pathname, PATH_MAX)?;
+    if path.is_empty() {
+        return Err(SysError::ENOENT);
+    }
+    let stat = resolve_stat(AT_FDCWD, path.as_str())?;
+    let fs_stat = statfs_for_mount(MountId(stat.dev as usize)).ok_or(SysError::ENOSYS)?;
+    write_user_value(token, statfsbuf, &LinuxStatfs::from(fs_stat))?;
+    Ok(0)
 }
 
 pub fn sys_statx(

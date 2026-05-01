@@ -61,6 +61,7 @@ impl ProcessControlBlock {
                     memory_set,
                     cwd: WorkingDir::root(),
                     cwd_path: "/".into(),
+                    cmdline: args.clone(),
                     parent: None,
                     children: Vec::new(),
                     exit_code: 0,
@@ -130,6 +131,7 @@ impl ProcessControlBlock {
         let new_fd_table = parent.fd_table.clone();
         let cwd = parent.cwd;
         let cwd_path = parent.cwd_path.clone();
+        let cmdline = parent.cmdline.clone();
         let ustack_base = parent
             .get_task(0)
             .inner_exclusive_access()
@@ -147,6 +149,7 @@ impl ProcessControlBlock {
                     memory_set,
                     cwd,
                     cwd_path,
+                    cmdline,
                     parent: Some(Arc::downgrade(&child_parent)),
                     children: Vec::new(),
                     exit_code: 0,

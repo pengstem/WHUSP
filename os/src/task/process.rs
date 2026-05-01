@@ -1,5 +1,5 @@
 use super::id::RecycleAllocator;
-use super::{FD_LIMIT, FdTableEntry, PidHandle, SignalFlags, TaskControlBlock};
+use super::{FD_LIMIT, FdTableEntry, PidHandle, SignalFlags, TaskControlBlock, TaskStatus};
 use crate::fs::WorkingDir;
 use crate::mm::MemorySet;
 use crate::sync::{UPIntrFreeCell, UPIntrRefMut};
@@ -13,6 +13,17 @@ pub struct ProcessCpuTimesSnapshot {
     pub system_us: usize,
     pub children_user_us: usize,
     pub children_system_us: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProcessProcSnapshot {
+    pub(crate) pid: usize,
+    pub(crate) ppid: usize,
+    pub(crate) comm: String,
+    pub(crate) state: char,
+    pub(crate) cmdline: Vec<String>,
+    pub(crate) cpu_times: ProcessCpuTimesSnapshot,
+    pub(crate) thread_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -88,6 +99,7 @@ pub struct ProcessControlBlockInner {
     pub memory_set: MemorySet,
     pub cwd: WorkingDir,
     pub cwd_path: String,
+    pub cmdline: Vec<String>,
     pub parent: Option<Weak<ProcessControlBlock>>,
     pub children: Vec<Arc<ProcessControlBlock>>,
     pub exit_code: i32,
@@ -188,6 +200,44 @@ impl ProcessControlBlock {
 
     pub fn getppid(&self) -> usize {
         self.parent_process().map_or(0, |parent| parent.getpid())
+    }
+
+    pub(crate) fn proc_snapshot(&self) -> ProcessProcSnapshot {
+        let inner = self.inner_exclusive_access();
+        let state = if inner.is_zombie {
+            'Z'
+        } else if inner
+            .tasks
+            .iter()
+            .flatten()
+            .any(|task| task.inner_exclusive_access().task_status == TaskStatus::Running)
+        {
+            'R'
+        } else {
+            'S'
+        };
+        let comm = inner
+            .cmdline
+            .first()
+            .and_then(|arg| arg.rsplit('/').next())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("process")
+            .chars()
+            .take(15)
+            .collect();
+        ProcessProcSnapshot {
+            pid: self.pid.0,
+            ppid: inner
+                .parent
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .map_or(0, |parent| parent.getpid()),
+            comm,
+            state,
+            cmdline: inner.cmdline.clone(),
+            cpu_times: inner.cpu_times.snapshot(),
+            thread_count: inner.thread_count(),
+        }
     }
 
     pub fn mark_user_time_entry(&self, now_us: usize) {

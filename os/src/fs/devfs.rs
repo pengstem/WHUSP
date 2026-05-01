@@ -1,3 +1,4 @@
+use super::dirent::{DT_CHR, DT_DIR, LINUX_DIRENT64_ALIGN, LINUX_DIRENT64_HEADER_SIZE};
 use super::status_flags::StatusFlagsCell;
 use super::{File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFCHR, S_IFDIR};
 use crate::drivers::chardev::{CharDevice, UART};
@@ -7,10 +8,6 @@ use alloc::sync::Arc;
 use alloc::vec;
 
 const DEVFS_DEV: u64 = 0x646576;
-const LINUX_DIRENT64_HEADER_SIZE: usize = 19;
-const LINUX_DIRENT64_ALIGN: usize = 8;
-const DT_CHR: u8 = 2;
-const DT_DIR: u8 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DevNode {

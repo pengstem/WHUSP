@@ -1,5 +1,4 @@
-use super::mount::{MountId, primary_mount_id};
-use lwext4_rust::ffi::EXT4_ROOT_INO;
+use super::mount::{MountId, primary_mount_id, root_ino_for};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WorkingDir {
@@ -9,9 +8,10 @@ pub(crate) struct WorkingDir {
 
 impl WorkingDir {
     pub(crate) fn root() -> Self {
+        let mount_id = primary_mount_id();
         Self {
-            mount_id: primary_mount_id(),
-            ino: EXT4_ROOT_INO,
+            mount_id,
+            ino: root_ino_for(mount_id).unwrap_or(2),
         }
     }
 

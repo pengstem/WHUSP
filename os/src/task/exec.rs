@@ -151,6 +151,7 @@ impl ProcessControlBlock {
         {
             let mut inner = self.inner_exclusive_access();
             inner.memory_set = memory_set;
+            inner.cmdline = args.clone();
             for fd in inner.fd_table.iter_mut() {
                 if fd
                     .as_ref()

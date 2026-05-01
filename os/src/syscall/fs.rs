@@ -16,6 +16,6 @@ pub use path::{
     sys_openat, sys_readlinkat, sys_renameat2, sys_symlinkat, sys_unlinkat,
 };
 pub use poll::sys_ppoll;
-pub use stat::{sys_fstat, sys_newfstatat, sys_statx};
+pub use stat::{sys_fstat, sys_newfstatat, sys_statfs, sys_statx};
 pub use tty::sys_ioctl;
-pub use uapi::{LinuxIovec, LinuxKstat, LinuxPollFd, LinuxStatx, LinuxTimeSpec};
+pub use uapi::{LinuxIovec, LinuxKstat, LinuxPollFd, LinuxStatfs, LinuxStatx, LinuxTimeSpec};

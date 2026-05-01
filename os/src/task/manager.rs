@@ -1,7 +1,8 @@
-use super::{ProcessControlBlock, TaskControlBlock, TaskStatus};
+use super::{ProcessControlBlock, ProcessProcSnapshot, TaskControlBlock, TaskStatus};
 use crate::sync::UPIntrFreeCell;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use lazy_static::*;
 
 pub struct TaskManager {
@@ -50,9 +51,24 @@ pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
     map.get(&pid).map(Arc::clone)
 }
 
+pub(crate) fn list_process_snapshots() -> Vec<ProcessProcSnapshot> {
+    let processes = {
+        let map = PID2PCB.exclusive_access();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    processes
+        .into_iter()
+        .map(|process| process.proc_snapshot())
+        .collect()
+}
+
 pub(crate) fn any_process_references_mount(mount_id: crate::fs::MountId) -> bool {
-    let map = PID2PCB.exclusive_access();
-    map.values()
+    let processes = {
+        let map = PID2PCB.exclusive_access();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    processes
+        .iter()
         .any(|process| process.references_vfs_mount(mount_id))
 }
 

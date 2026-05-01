@@ -96,6 +96,23 @@ pub struct LinuxKstat {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxStatfs {
+    f_type: i64,
+    f_bsize: i64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [i32; 2],
+    f_namelen: i64,
+    f_frsize: i64,
+    f_flags: i64,
+    f_spare: [i64; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct LinuxStatxTimestamp {
     tv_sec: i64,
     tv_nsec: u32,
@@ -168,6 +185,25 @@ impl From<FileStat> for LinuxKstat {
             st_ctime_sec: stat.ctime_sec as i64,
             st_ctime_nsec: stat.ctime_nsec as i64,
             __unused: [0; 2],
+        }
+    }
+}
+
+impl From<crate::fs::FileSystemStat> for LinuxStatfs {
+    fn from(stat: crate::fs::FileSystemStat) -> Self {
+        Self {
+            f_type: stat.magic,
+            f_bsize: stat.block_size as i64,
+            f_blocks: stat.blocks,
+            f_bfree: stat.free_blocks,
+            f_bavail: stat.available_blocks,
+            f_files: stat.files,
+            f_ffree: stat.free_files,
+            f_fsid: [0; 2],
+            f_namelen: stat.max_name_len as i64,
+            f_frsize: stat.block_size as i64,
+            f_flags: stat.flags as i64,
+            f_spare: [0; 4],
         }
     }
 }

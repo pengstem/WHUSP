@@ -1,7 +1,8 @@
-use super::super::mount::{mounted_root_for, mounted_root_parent, primary_mount_id, with_mount};
+use super::super::mount::{
+    mounted_root_for, mounted_root_parent, primary_mount_id, root_ino_for, with_mount,
+};
 use super::super::path::WorkingDir;
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId};
-use lwext4_rust::ffi::EXT4_ROOT_INO;
 
 const EXT4_NAME_MAX: usize = 255;
 
@@ -46,8 +47,9 @@ impl VfsPath {
 
 impl VfsCursor {
     fn root() -> Self {
+        let mount_id = primary_mount_id();
         Self {
-            node: VfsNodeId::new(primary_mount_id(), EXT4_ROOT_INO),
+            node: VfsNodeId::new(mount_id, root_ino_for(mount_id).unwrap_or(2)),
             kind: FsNodeKind::Directory,
         }
     }
@@ -64,7 +66,7 @@ impl VfsCursor {
     }
 
     fn is_mount_root(self) -> bool {
-        self.node.ino == EXT4_ROOT_INO
+        root_ino_for(self.node.mount_id).is_some_and(|root_ino| self.node.ino == root_ino)
     }
 }
 
@@ -74,7 +76,7 @@ fn follow_mounted_root(cursor: VfsCursor) -> VfsCursor {
     }
     if let Some(mount_id) = mounted_root_for(cursor.node) {
         return VfsCursor {
-            node: VfsNodeId::new(mount_id, EXT4_ROOT_INO),
+            node: VfsNodeId::new(mount_id, root_ino_for(mount_id).unwrap_or(2)),
             kind: FsNodeKind::Directory,
         };
     }

@@ -11,7 +11,38 @@ pub(crate) enum FsNodeKind {
     Other,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FileSystemStat {
+    pub(crate) magic: i64,
+    pub(crate) block_size: u64,
+    pub(crate) blocks: u64,
+    pub(crate) free_blocks: u64,
+    pub(crate) available_blocks: u64,
+    pub(crate) files: u64,
+    pub(crate) free_files: u64,
+    pub(crate) max_name_len: u64,
+    pub(crate) flags: u64,
+}
+
 pub(crate) trait FileSystemBackend: Send {
+    fn root_ino(&self) -> u32 {
+        2
+    }
+
+    fn statfs(&mut self) -> FileSystemStat {
+        FileSystemStat {
+            magic: 0,
+            block_size: 4096,
+            blocks: 0,
+            free_blocks: 0,
+            available_blocks: 0,
+            files: 1024,
+            free_files: 1024,
+            max_name_len: 255,
+            flags: 0,
+        }
+    }
+
     fn lookup_component_from(
         &mut self,
         parent_ino: u32,
