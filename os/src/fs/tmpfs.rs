@@ -1,7 +1,6 @@
 use super::dirent::{DT_DIR, DT_LNK, DT_REG, RawDirEntry, write_dir_entries};
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
-use super::{FileStat, S_IFDIR, S_IFLNK, S_IFREG};
-use crate::timer::get_time_us;
+use super::{FileStat, FileTimestamp, S_IFDIR, S_IFLNK, S_IFREG};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -15,8 +14,9 @@ struct TmpfsInode {
     data: Vec<u8>,
     children: BTreeMap<String, u32>,
     parent_ino: u32,
-    ctime_us: u64,
-    mtime_us: u64,
+    atime: FileTimestamp,
+    ctime: FileTimestamp,
+    mtime: FileTimestamp,
 }
 
 pub(super) struct TmpFs {
@@ -26,7 +26,7 @@ pub(super) struct TmpFs {
 
 impl TmpfsInode {
     fn new(kind: FsNodeKind, mode: u32, parent_ino: u32) -> Self {
-        let now = get_time_us() as u64;
+        let now = FileTimestamp::now();
         let nlink = if kind == FsNodeKind::Directory { 2 } else { 1 };
         Self {
             kind,
@@ -35,15 +35,16 @@ impl TmpfsInode {
             data: Vec::new(),
             children: BTreeMap::new(),
             parent_ino,
-            ctime_us: now,
-            mtime_us: now,
+            atime: now,
+            ctime: now,
+            mtime: now,
         }
     }
 
     fn touch(&mut self) {
-        let now = get_time_us() as u64;
-        self.ctime_us = now;
-        self.mtime_us = now;
+        let now = FileTimestamp::now();
+        self.ctime = now;
+        self.mtime = now;
     }
 }
 
@@ -343,22 +344,38 @@ impl FileSystemBackend for TmpFs {
             FsNodeKind::Directory => inode.children.len() as u64,
             _ => inode.data.len() as u64,
         };
-        let sec = inode.mtime_us / 1_000_000;
-        let nsec = ((inode.mtime_us % 1_000_000) * 1000) as u32;
         Ok(FileStat {
             mode: inode.mode,
             nlink: inode.nlink,
             size,
             blocks: size.div_ceil(512),
             blksize: super::DEFAULT_BLOCK_SIZE,
-            atime_sec: sec,
-            atime_nsec: nsec,
-            mtime_sec: sec,
-            mtime_nsec: nsec,
-            ctime_sec: inode.ctime_us / 1_000_000,
-            ctime_nsec: ((inode.ctime_us % 1_000_000) * 1000) as u32,
+            atime_sec: inode.atime.sec,
+            atime_nsec: inode.atime.nsec,
+            mtime_sec: inode.mtime.sec,
+            mtime_nsec: inode.mtime.nsec,
+            ctime_sec: inode.ctime.sec,
+            ctime_nsec: inode.ctime.nsec,
             ..FileStat::default()
         })
+    }
+
+    fn set_times(
+        &mut self,
+        ino: u32,
+        atime: Option<FileTimestamp>,
+        mtime: Option<FileTimestamp>,
+        ctime: FileTimestamp,
+    ) -> FsResult {
+        let inode = self.inode_mut(ino)?;
+        if let Some(atime) = atime {
+            inode.atime = atime;
+        }
+        if let Some(mtime) = mtime {
+            inode.mtime = mtime;
+        }
+        inode.ctime = ctime;
+        Ok(())
     }
 
     fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
@@ -381,6 +398,11 @@ impl FileSystemBackend for TmpFs {
         let start = (offset as usize).min(inode.data.len());
         let len = buf.len().min(inode.data.len() - start);
         buf[..len].copy_from_slice(&inode.data[start..start + len]);
+        if len > 0 {
+            if let Ok(inode) = self.inode_mut(ino) {
+                inode.atime = FileTimestamp::now();
+            }
+        }
         len
     }
 

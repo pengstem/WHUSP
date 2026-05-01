@@ -1,4 +1,5 @@
-use super::super::FileStat;
+use super::super::{FileStat, FileTimestamp};
+use super::FsError;
 use super::FsResult;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -55,6 +56,15 @@ pub(crate) trait FileSystemBackend: Send {
     fn unlink(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult;
     fn rename(&mut self, src_dir: u32, src_name: &str, dst_dir: u32, dst_name: &str) -> FsResult;
     fn set_len(&mut self, ino: u32, len: u64) -> FsResult;
+    fn set_times(
+        &mut self,
+        _ino: u32,
+        _atime: Option<FileTimestamp>,
+        _mtime: Option<FileTimestamp>,
+        _ctime: FileTimestamp,
+    ) -> FsResult {
+        Err(FsError::Unsupported)
+    }
     fn stat(&mut self, ino: u32) -> FsResult<FileStat>;
     fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize>;
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize;

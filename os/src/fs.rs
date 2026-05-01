@@ -56,6 +56,29 @@ pub struct FileStat {
     pub ctime_nsec: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FileTimestamp {
+    pub sec: u64,
+    pub nsec: u32,
+}
+
+impl FileTimestamp {
+    pub fn now() -> Self {
+        Self::from_nanos(crate::timer::wall_time_nanos())
+    }
+
+    pub fn from_nanos(nanos: u64) -> Self {
+        Self {
+            sec: nanos / 1_000_000_000,
+            nsec: (nanos % 1_000_000_000) as u32,
+        }
+    }
+
+    pub fn to_duration(self) -> core::time::Duration {
+        core::time::Duration::new(self.sec, self.nsec)
+    }
+}
+
 impl FileStat {
     pub fn with_mode(mode: u32) -> Self {
         Self {
@@ -101,6 +124,14 @@ pub trait File: Send + Sync {
     }
     fn readlink(&self, _buf: &mut [u8]) -> FsResult<usize> {
         Err(FsError::InvalidInput)
+    }
+    fn set_times(
+        &self,
+        _atime: Option<FileTimestamp>,
+        _mtime: Option<FileTimestamp>,
+        _ctime: FileTimestamp,
+    ) -> FsResult {
+        Err(FsError::Unsupported)
     }
     fn working_dir(&self) -> Option<WorkingDir> {
         None

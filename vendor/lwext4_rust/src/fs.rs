@@ -133,6 +133,25 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
     pub fn set_len(&mut self, ino: u32, len: u64) -> Ext4Result<()> {
         self.inode_ref(ino)?.set_len(len)
     }
+    pub fn set_times(
+        &mut self,
+        ino: u32,
+        atime: Option<Duration>,
+        mtime: Option<Duration>,
+        ctime: Option<Duration>,
+    ) -> Ext4Result<()> {
+        let mut inode = self.inode_ref(ino)?;
+        if let Some(atime) = atime {
+            inode.set_atime(&atime);
+        }
+        if let Some(mtime) = mtime {
+            inode.set_mtime(&mtime);
+        }
+        if let Some(ctime) = ctime {
+            inode.set_ctime(&ctime);
+        }
+        Ok(())
+    }
     pub fn set_symlink(&mut self, ino: u32, buf: &[u8]) -> Ext4Result<()> {
         self.inode_ref(ino)?.set_symlink(buf)
     }

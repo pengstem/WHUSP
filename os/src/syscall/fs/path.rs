@@ -2,15 +2,18 @@ use super::super::errno::{SysError, SysResult};
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::stat::resolve_stat;
 use super::uapi::{
-    AT_EACCESS, AT_FDCWD, AT_REMOVEDIR, F_OK, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT,
-    VALID_ACCESS_MODE, VALID_FACCESSAT_FLAGS, VALID_RENAME_FLAGS, X_OK,
+    AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, F_OK, LinuxTimeSpec,
+    RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, UTIME_NOW, UTIME_OMIT, VALID_ACCESS_MODE,
+    VALID_FACCESSAT_FLAGS, VALID_RENAME_FLAGS, VALID_UTIMENSAT_FLAGS, X_OK,
 };
+use super::user_ptr::read_user_value;
 use super::user_ptr::{
     PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, translated_byte_buffer_checked,
 };
 use crate::fs::{
-    File, FileStat, OpenFlags, WorkingDir, link_file_at, lookup_dir_at, mkdir_at, normalize_path,
-    open_devfs_child, open_file_at, rename_at, rmdir_at, symlink_at, unlink_file_at,
+    File, FileStat, FileTimestamp, OpenFlags, WorkingDir, link_file_at, lookup_dir_at, mkdir_at,
+    normalize_path, open_devfs_child, open_file_at, rename_at, rmdir_at, symlink_at,
+    unlink_file_at,
 };
 use crate::mm::UserBuffer;
 use crate::task::{FdTableEntry, current_process, current_user_token};
@@ -48,6 +51,53 @@ fn check_access_mode(stat: &FileStat, mode: i32) -> SysResult<()> {
         return Err(SysError::EACCES);
     }
     Ok(())
+}
+
+fn parse_utimensat_time(
+    time: LinuxTimeSpec,
+    now: FileTimestamp,
+) -> SysResult<Option<FileTimestamp>> {
+    match time.tv_nsec {
+        UTIME_NOW => Ok(Some(now)),
+        UTIME_OMIT => Ok(None),
+        0..=999_999_999 => {
+            if time.tv_sec < 0 {
+                // UNFINISHED: Linux accepts negative timestamps on filesystems
+                // that can represent pre-epoch times. This kernel timestamp
+                // model is unsigned for now, so reject them.
+                return Err(SysError::EINVAL);
+            }
+            Ok(Some(FileTimestamp {
+                sec: time.tv_sec as u64,
+                nsec: time.tv_nsec as u32,
+            }))
+        }
+        _ => Err(SysError::EINVAL),
+    }
+}
+
+fn read_utimensat_times(
+    times: *const LinuxTimeSpec,
+    now: FileTimestamp,
+) -> SysResult<(Option<FileTimestamp>, Option<FileTimestamp>, bool)> {
+    if times.is_null() {
+        return Ok((Some(now), Some(now), false));
+    }
+
+    let token = current_user_token();
+    let atime = parse_utimensat_time(read_user_value(token, times)?, now)?;
+    let mtime = parse_utimensat_time(read_user_value(token, times.wrapping_add(1))?, now)?;
+    Ok((atime, mtime, atime.is_none() && mtime.is_none()))
+}
+
+fn apply_utimensat_to_file(
+    file: Arc<dyn File + Send + Sync>,
+    atime: Option<FileTimestamp>,
+    mtime: Option<FileTimestamp>,
+    ctime: FileTimestamp,
+) -> SysResult {
+    file.set_times(atime, mtime, ctime)?;
+    Ok(0)
 }
 
 fn copy_c_string_to_user(ptr: *mut u8, buf_len: usize, string: &str) -> SysResult {
@@ -178,6 +228,74 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32, flags: i32) -> Sy
     let stat = resolve_stat(dirfd, path.as_str())?;
     check_access_mode(&stat, mode)?;
     Ok(0)
+}
+
+pub fn sys_utimensat(
+    dirfd: isize,
+    pathname: *const u8,
+    times: *const LinuxTimeSpec,
+    flags: i32,
+) -> SysResult {
+    if flags & !VALID_UTIMENSAT_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+
+    let now = FileTimestamp::now();
+    let (atime, mtime, all_omitted) = read_utimensat_times(times, now)?;
+    if all_omitted {
+        return Ok(0);
+    }
+    // UNFINISHED: Linux checks write access, ownership, capabilities, and
+    // immutable/append-only inode flags before changing timestamps. This kernel
+    // currently has no real credential or inode-flag model, so existing targets
+    // are allowed once pathname/fd resolution succeeds.
+
+    if pathname.is_null() {
+        if flags != 0 {
+            return Err(SysError::EINVAL);
+        }
+        if dirfd == AT_FDCWD {
+            return Err(SysError::EFAULT);
+        }
+        if dirfd < 0 {
+            return Err(SysError::EBADF);
+        }
+        let file = get_file_by_fd(dirfd as usize)?;
+        return apply_utimensat_to_file(file, atime, mtime, now);
+    }
+
+    let token = current_user_token();
+    let path = read_user_c_string(token, pathname, PATH_MAX)?;
+    if path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(SysError::ENOENT);
+        }
+        if dirfd == AT_FDCWD {
+            let file = open_file_at(current_process().working_dir(), ".", OpenFlags::PATH)?;
+            return apply_utimensat_to_file(file, atime, mtime, now);
+        }
+        if dirfd < 0 {
+            return Err(SysError::EBADF);
+        }
+        let file = get_file_by_fd(dirfd as usize)?;
+        return apply_utimensat_to_file(file, atime, mtime, now);
+    }
+
+    // UNFINISHED: Linux AT_SYMLINK_NOFOLLOW updates the symlink inode itself.
+    // Current path resolution still has partial final-symlink semantics; accept
+    // the flag for libc/BusyBox compatibility and route through O_PATH.
+    let open_flags = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+        OpenFlags::PATH | OpenFlags::NOFOLLOW
+    } else {
+        OpenFlags::PATH
+    };
+
+    if let Some(file) = open_devfs_child_from_dirfd(dirfd, path.as_str(), open_flags)? {
+        return apply_utimensat_to_file(file, atime, mtime, now);
+    }
+    let base = path_base(dirfd, path.as_str())?;
+    let file = open_file_at(base, path.as_str(), open_flags)?;
+    apply_utimensat_to_file(file, atime, mtime, now)
 }
 
 pub fn sys_chdir(path: *const u8) -> SysResult {

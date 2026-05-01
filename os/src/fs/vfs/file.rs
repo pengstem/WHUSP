@@ -3,7 +3,7 @@ use super::super::inode::OpenFlags;
 use super::super::mount::with_mount;
 use super::super::path::WorkingDir;
 use super::super::status_flags::StatusFlagsCell;
-use super::super::{File, FileStat};
+use super::super::{File, FileStat, FileTimestamp};
 use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
 use crate::mm::UserBuffer;
@@ -270,6 +270,18 @@ impl File for VfsFile {
         }
         with_mount(self.node.mount_id, |mount| {
             mount.readlink(self.node.ino, buf)
+        })
+        .ok_or(FsError::Io)?
+    }
+
+    fn set_times(
+        &self,
+        atime: Option<FileTimestamp>,
+        mtime: Option<FileTimestamp>,
+        ctime: FileTimestamp,
+    ) -> FsResult {
+        with_mount(self.node.mount_id, |mount| {
+            mount.set_times(self.node.ino, atime, mtime, ctime)
         })
         .ok_or(FsError::Io)?
     }

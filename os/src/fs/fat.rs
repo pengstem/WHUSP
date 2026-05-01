@@ -1,7 +1,7 @@
 use super::dirent::{DT_DIR, DT_REG, RawDirEntry, write_dir_entries};
 use super::mount::BlockPartition;
 use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult};
-use super::{FileStat, S_IFDIR, S_IFREG};
+use super::{FileStat, FileTimestamp, S_IFDIR, S_IFREG};
 use crate::drivers::block::VirtIOBlock;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -452,6 +452,19 @@ impl FileSystemBackend for FatMount {
         } else {
             Self::grow_file(&mut file, len)
         }
+    }
+
+    fn set_times(
+        &mut self,
+        _ino: u32,
+        _atime: Option<FileTimestamp>,
+        _mtime: Option<FileTimestamp>,
+        _ctime: FileTimestamp,
+    ) -> FsResult {
+        // UNFINISHED: FAT/VFAT stores timestamps in DOS date/time fields with
+        // different precision and timezone rules; this first adapter does not
+        // translate Linux utimensat timestamps back into directory entries yet.
+        Err(FsError::Unsupported)
     }
 
     fn stat(&mut self, ino: u32) -> FsResult<FileStat> {

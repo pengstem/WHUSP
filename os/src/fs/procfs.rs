@@ -1,7 +1,7 @@
 use super::dirent::{DT_DIR, DT_REG, RawDirEntry, write_dir_entries};
 use super::mount;
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
-use super::{FileStat, S_IFDIR, S_IFREG};
+use super::{FileStat, FileTimestamp, S_IFDIR, S_IFREG};
 use crate::config::PAGE_SIZE;
 use crate::mm::frame_stats;
 use crate::task::{ProcessProcSnapshot, list_process_snapshots, pid2process};
@@ -358,6 +358,16 @@ impl FileSystemBackend for ProcFs {
     }
 
     fn set_len(&mut self, _ino: u32, _len: u64) -> FsResult {
+        Err(FsError::ReadOnly)
+    }
+
+    fn set_times(
+        &mut self,
+        _ino: u32,
+        _atime: Option<FileTimestamp>,
+        _mtime: Option<FileTimestamp>,
+        _ctime: FileTimestamp,
+    ) -> FsResult {
         Err(FsError::ReadOnly)
     }
 

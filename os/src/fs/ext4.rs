@@ -1,8 +1,8 @@
-use super::FileStat;
 use super::dirent::{
     DT_DIR, DT_LNK, DT_REG, DT_UNKNOWN, LINUX_DIRENT64_ALIGN, LINUX_DIRENT64_HEADER_SIZE,
 };
 use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult};
+use super::{FileStat, FileTimestamp};
 use crate::drivers::block::VirtIOBlock;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -207,6 +207,23 @@ impl FileSystemBackend for Ext4Mount {
 
     fn set_len(&mut self, ino: u32, len: u64) -> FsResult {
         self.fs.set_len(ino, len).map_err(map_ext4_error)
+    }
+
+    fn set_times(
+        &mut self,
+        ino: u32,
+        atime: Option<FileTimestamp>,
+        mtime: Option<FileTimestamp>,
+        ctime: FileTimestamp,
+    ) -> FsResult {
+        self.fs
+            .set_times(
+                ino,
+                atime.map(FileTimestamp::to_duration),
+                mtime.map(FileTimestamp::to_duration),
+                Some(ctime.to_duration()),
+            )
+            .map_err(map_ext4_error)
     }
 
     fn stat(&mut self, ino: u32) -> FsResult<FileStat> {

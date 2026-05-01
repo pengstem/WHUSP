@@ -13,7 +13,7 @@ pub use io::{sys_read, sys_readv, sys_write, sys_writev};
 pub use mount::{sys_mount, sys_umount2};
 pub use path::{
     sys_chdir, sys_faccessat, sys_fchdir, sys_getcwd, sys_getdents64, sys_linkat, sys_mkdirat,
-    sys_openat, sys_readlinkat, sys_renameat2, sys_symlinkat, sys_unlinkat,
+    sys_openat, sys_readlinkat, sys_renameat2, sys_symlinkat, sys_unlinkat, sys_utimensat,
 };
 pub use poll::sys_ppoll;
 pub use stat::{sys_fstat, sys_newfstatat, sys_statfs, sys_statx};
