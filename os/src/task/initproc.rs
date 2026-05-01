@@ -3,7 +3,9 @@ use alloc::{string::String, vec, vec::Vec};
 
 const BUSYBOX_PATH: &str = "/musl/busybox";
 const BUSYBOX_APPLET: &str = "sh";
+#[allow(unused)]
 const BUSYBOX_COMMAND_FLAG: &str = "-c";
+#[allow(unused)]
 const BASIC_MUSL_RUNNER: &str = "cd /musl && ./busybox sh ./basic_testcode.sh";
 
 pub(super) struct KernelInitProc {
@@ -21,8 +23,8 @@ pub(super) fn load() -> Option<KernelInitProc> {
         argv: vec![
             BUSYBOX_PATH.into(),
             BUSYBOX_APPLET.into(),
-            BUSYBOX_COMMAND_FLAG.into(),
-            BASIC_MUSL_RUNNER.into(),
+            // BUSYBOX_COMMAND_FLAG.into(),
+            // BASIC_MUSL_RUNNER.into(),
         ],
         envp: Vec::new(),
     })

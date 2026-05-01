@@ -1,5 +1,5 @@
 use super::super::errno::{SysError, SysResult};
-use super::fd::get_file_by_fd;
+use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::stat::resolve_stat;
 use super::uapi::{
     AT_EACCESS, AT_FDCWD, AT_REMOVEDIR, F_OK, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT,
@@ -14,6 +14,7 @@ use crate::fs::{
 };
 use crate::mm::UserBuffer;
 use crate::task::{FdTableEntry, current_process, current_user_token};
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 
@@ -90,11 +91,36 @@ fn readlink_file_to_user(
     Ok(copy_len as isize)
 }
 
-fn install_open_file(file: Arc<dyn File + Send + Sync>, flags: OpenFlags) -> SysResult {
+fn openat_dir_path(dirfd: isize, path: &str) -> SysResult<Option<String>> {
+    if path.starts_with('/') {
+        return Ok(normalize_path("/", path));
+    }
+    if dirfd == AT_FDCWD {
+        return Ok(normalize_path(&current_process().working_dir_path(), path));
+    }
+    if dirfd < 0 {
+        return Err(SysError::EBADF);
+    }
+
+    let entry = get_fd_entry_by_fd(dirfd as usize)?;
+    if entry.file().working_dir().is_none() {
+        return Err(SysError::ENOTDIR);
+    }
+    Ok(entry
+        .dir_path()
+        .and_then(|base_path| normalize_path(base_path, path)))
+}
+
+fn install_open_file(
+    file: Arc<dyn File + Send + Sync>,
+    flags: OpenFlags,
+    dir_path: Option<String>,
+) -> SysResult {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let fd = inner.alloc_fd();
-    inner.fd_table[fd] = Some(FdTableEntry::from_file(file, flags));
+    let dir_path = file.working_dir().and(dir_path);
+    inner.fd_table[fd] = Some(FdTableEntry::from_file_with_dir_path(file, flags, dir_path));
     Ok(fd as isize)
 }
 
@@ -125,11 +151,12 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> SysR
         return Err(SysError::EINVAL);
     }
     if let Some(file) = open_devfs_child_from_dirfd(dirfd, path.as_str(), flags)? {
-        return install_open_file(file, flags);
+        return install_open_file(file, flags, None);
     }
+    let dir_path = openat_dir_path(dirfd, path.as_str())?;
     let base = path_base(dirfd, path.as_str())?;
     let file = open_file_at(base, path.as_str(), flags)?;
-    install_open_file(file, flags)
+    install_open_file(file, flags, dir_path)
 }
 
 pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32, flags: i32) -> SysResult {
@@ -163,6 +190,30 @@ pub fn sys_chdir(path: *const u8) -> SysResult {
         return Err(SysError::ENOENT);
     };
     process.set_working_dir(next_cwd, next_path);
+    Ok(0)
+}
+
+pub fn sys_fchdir(fd: usize) -> SysResult {
+    let entry = get_fd_entry_by_fd(fd)?;
+    let file = entry.file();
+    if file.is_devfs_dir() {
+        // UNFINISHED: Lightweight devfs directories do not have a WorkingDir
+        // representation, so they cannot become the process cwd yet.
+        return Err(SysError::ENOTSUP);
+    }
+    let Some(next_cwd) = file.working_dir() else {
+        return Err(SysError::ENOTDIR);
+    };
+    let Some(next_path) = entry.dir_path() else {
+        // UNFINISHED: Linux fchdir keeps cwd as a directory object even when
+        // the original pathname is unavailable. This kernel's getcwd path is
+        // still string-backed, so fchdir needs path metadata from openat.
+        return Err(SysError::ENOTSUP);
+    };
+    // UNFINISHED: Linux fchdir checks search permission unless credentials can
+    // bypass it. This kernel currently runs user tasks as uid 0 and has no
+    // real/effective credential or supplementary-group model.
+    current_process().set_working_dir(next_cwd, String::from(next_path));
     Ok(0)
 }
 

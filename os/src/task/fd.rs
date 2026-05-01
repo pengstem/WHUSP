@@ -1,4 +1,5 @@
 use crate::fs::{File, OpenFlags};
+use alloc::string::String;
 use alloc::sync::Arc;
 use bitflags::bitflags;
 
@@ -15,32 +16,49 @@ bitflags! {
 pub struct FdTableEntry {
     file: Arc<dyn File + Send + Sync>,
     fd_flags: FdFlags,
+    // UNFINISHED: This is a pathname snapshot for getcwd-compatible fchdir;
+    // Linux keeps directory objects alive across rename/unlink and reconstructs
+    // cwd differently.
+    dir_path: Option<String>,
 }
 
 impl FdTableEntry {
     pub fn from_file(file: Arc<dyn File + Send + Sync>, open_flags: OpenFlags) -> Self {
+        Self::from_file_with_dir_path(file, open_flags, None)
+    }
+
+    pub fn from_file_with_dir_path(
+        file: Arc<dyn File + Send + Sync>,
+        open_flags: OpenFlags,
+        dir_path: Option<String>,
+    ) -> Self {
         let fd_flags = if open_flags.contains(OpenFlags::CLOEXEC) {
             FdFlags::CLOEXEC
         } else {
             FdFlags::empty()
         };
         file.set_status_flags(OpenFlags::file_status_flags(open_flags));
-        Self::new(file, fd_flags)
-    }
-
-    pub fn new(file: Arc<dyn File + Send + Sync>, fd_flags: FdFlags) -> Self {
-        Self { file, fd_flags }
+        Self {
+            file,
+            fd_flags,
+            dir_path,
+        }
     }
 
     pub fn duplicate(&self, fd_flags: FdFlags) -> Self {
         Self {
             file: Arc::clone(&self.file),
             fd_flags,
+            dir_path: self.dir_path.clone(),
         }
     }
 
     pub fn file(&self) -> Arc<dyn File + Send + Sync> {
         Arc::clone(&self.file)
+    }
+
+    pub fn dir_path(&self) -> Option<&str> {
+        self.dir_path.as_deref()
     }
 
     pub fn fd_flags(&self) -> FdFlags {

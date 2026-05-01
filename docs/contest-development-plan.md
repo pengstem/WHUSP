@@ -104,6 +104,13 @@
 - [x] `execve` 支持 `argv/envp`，并支持 shebang 脚本解释器重写。
 - [x] 官方评测盘无 `/bin/sh` 时，脚本解释器可 fallback 到 `/musl/busybox` 或 `/glibc/busybox`。
 - [x] fd table 已有 `FdTableEntry`，区分 fd flags 和 file status flags，并支持 close-on-exec。
+- [x] `symlinkat(36)`。
+- [x] `linkat(37)`。
+- [x] `renameat2(276)` 基础实现：支持 `RENAME_NOREPLACE`。
+- [x] `faccessat(48)` 基础实现：F_OK 存在性检查和 X_OK 执行位检查。
+- [x] `fchdir(50)`。
+- [x] `readlinkat(78)`。
+- [x] `statx(291)` 基础实现。
 
 ### 已验证的 `basic-musl` 结果
 
@@ -123,7 +130,7 @@
 - [ ] `newfstatat/fstat/lstat` 的目录、pipe、stdio、设备号、时间戳、nlink 等细节仍需审计。
 - [ ] `getdents64` 的 offset 稳定性、跨 mount readdir、buffer 边界还需补齐。
 - [ ] `pipe` 的阻塞、非阻塞、关闭端、错误码等 Linux 细节还不完整。
-- [ ] 最小 `/dev/null` / devfs 尚未实现，影响 `netperf`、`iperf`、LTP 等 harness。
+- [x] 最小 `/dev/null` / devfs 已实现，支持 `/dev/null`、`/dev/zero`、`/dev/random`、`/dev/urandom`。
 - [ ] `sys_kill(129)` 仍把 Linux signum 当 bitflags 解析，需要按整数信号号修正。
 
 ### 2026-05-01 测试刷新后新增缺口
@@ -131,12 +138,12 @@
 | 优先级 | Syscall / 功能 | 解锁测试 | 当前症状 | 修复方向 |
 |--------|---------------|----------|---------|---------|
 | 1 | 无 shebang 脚本 execve fallback | libctest-musl 整组 | `./run-static.sh: not found`（busybox fallback 到 `/bin/sh` 不存在） | `exec_loaded_program` 中对非 ELF 非 shebang 文件构造虚拟 `#!/bin/sh` 解释器，走已有 `busybox_fallback` 路径 |
-| 2 | `renameat2(276)` | busybox `mv` | `Function not implemented` (ENOSYS) | 在 ext4 层实现 rename 操作 |
+| ~~2~~ | ~~`renameat2(276)`~~ | ~~busybox `mv`~~ | ✅ 已实现 | `RENAME_NOREPLACE` 支持；`RENAME_EXCHANGE`/`RENAME_WHITEOUT` 返回 EINVAL |
 | 3 | `utimensat(88)` | busybox `touch` | `Function not implemented` (ENOSYS) | 在 VFS/ext4 层支持修改文件时间戳 |
-| 4 | `unlinkat(AT_REMOVEDIR)` / rmdir 语义 | busybox `rmdir` | 返回 `EINVAL` 而非成功 | 检查 `unlinkat` 的 `AT_REMOVEDIR` flag 分流到 ext4 rmdir |
-| 5 | `linkat(37)` | busybox `cp` | 返回 `EINVAL` | 检查 flags 解析或在 ext4 层实现硬链接 |
+| ~~4~~ | ~~`unlinkat(AT_REMOVEDIR)` / rmdir 语义~~ | ~~busybox `rmdir`~~ | ✅ 已实现 | `AT_REMOVEDIR` flag 正确分流到 `rmdir_at` |
+| ~~5~~ | ~~`linkat(37)`~~ | ~~busybox `cp`~~ | ✅ 已实现 | 通过 `link_file_at` 创建硬链接；flags 暂不支持 |
 | 6 | FPU 寄存器（f0-f31, fcsr）未保存/恢复 | lua round_num, sin30 | `Segmentation Fault, SIGSEGV=11` | `trap.S`/`switch.S`/`TrapContext` 均未保存浮点寄存器，多进程 FPU 状态互相污染导致计算错误 | 在 trap.S 和 switch.S 中加入 f0-f31 + fcsr 的保存/恢复；进程初始化时设置 `mstatus.FS` = Initial |
-| 7 | `kill(129)` — signal=0 进程存活检查 | libctest 每用例开头 | `Invalid argument` (EINVAL) | 在 `sys_kill` 中当 `signal==0` 时直接返回 `Ok(0)`（不发信号，仅检查进程存在） |
+| ~~7~~ | ~~`kill(129)` — signal=0 进程存活检查~~ | ~~libctest 每用例开头~~ | ✅ 已工作 | `SignalFlags::from_bits(0)` 返回空集，不投递信号，仅检查 PID 存在 |
 | 8 | `kill(129)` — 信号投递 | busybox `kill $!` | `Invalid argument` | 修正 signum 解析（整数 vs bitflags） |
 | 9 | `/proc` 文件系统 | busybox df/ps/free | `No such file or directory` | 实现 procfs 最小子集（/proc/mounts, /proc/meminfo, /proc/[pid]/stat） |
 | 10 | `lseek(62)` | libctest fdopen/fscanf/fwscanf 等 | `ftello/fseeko` 返回 `Function not implemented` (ENOSYS=38) | 给 `File` trait 加 `seek` 方法；`VfsFile` 修改 `SleepMutex<usize>` offset；pipe/stdio 返回 `ESPIPE` |
@@ -171,10 +178,10 @@
 
 ### 未完成
 
-- [ ] `fchdir(50)`。
-- [ ] `readlinkat`。
-- [ ] `faccessat`。
-- [ ] `renameat2`。
+- [x] `fchdir(50)`。
+- [x] `readlinkat`。
+- [x] `faccessat`。
+- [x] `renameat2`。
 - [ ] `chroot`。
 - [ ] `openat2`。
 - [ ] symlink traversal / nofollow semantics。
@@ -255,7 +262,7 @@
 - [ ] 完善 `mkdirat/unlinkat/rmdir` 的 Linux errno：区分 `EEXIST`、`ENOENT`、`ENOTDIR`、`EISDIR`、`EINVAL`、`ENOTEMPTY`、`EBUSY`、`EIO` 等场景，并补齐 `unlinkat(AT_REMOVEDIR)` 到 rmdir 语义的分流。
 - [ ] 完善 `newfstatat/fstat/lstat`。
 - [ ] 完善 `getdents64`。
-- [ ] 完善 `renameat2/linkat/symlinkat/readlinkat/faccessat/fchdir`。
+- [ ] 完善 `renameat2/linkat/symlinkat/readlinkat/faccessat/fchdir`（基础路径已接入，Linux 边界语义待补齐）。
 - [ ] 完善 `mount/umount2` 的 busy target、mounted root、相对路径、错误码。
 - [ ] 所有不完整语义必须用 `// UNFINISHED:` 标出具体 Linux 缺口。
 
