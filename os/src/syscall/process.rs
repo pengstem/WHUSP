@@ -437,12 +437,14 @@ pub fn sys_execve(path: *const u8, args: *const usize, envs: *const usize) -> Sy
 }
 
 pub fn sys_kill(pid: usize, signal: u32) -> SysResult {
-    if let Some(process) = pid2process(pid) {
-        if let Some(flag) = SignalFlags::from_bits(signal) {
-            process.inner_exclusive_access().signals |= flag;
-            Ok(0)
-        } else {
-            Err(SysError::EINVAL)
+    let flag = SignalFlags::from_signum(signal).ok_or(SysError::EINVAL)?;
+    let process = pid2process(pid).ok_or(SysError::ESRCH)?;
+    if !flag.is_empty() {
+        process.inner_exclusive_access().signals |= flag;
+    }
+    Ok(0)
+}
+
 const SYSLOG_ACTION_READ_ALL: usize = 3;
 const SYSLOG_ACTION_SIZE_BUFFER: usize = 10;
 const SYSLOG_BUF_SIZE: usize = 4096;
