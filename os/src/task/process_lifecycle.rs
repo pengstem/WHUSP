@@ -50,12 +50,15 @@ impl ProcessControlBlock {
             memory_set,
             ustack_base,
             entry_point,
-            aux_entry,
+            program_entry,
             phdr,
             phent,
             phnum,
             interp_base,
-        } = MemorySet::from_elf(elf_data, None);
+        } = {
+            let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
+            MemorySet::from_elf(&elf, None)
+        };
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
             pid: pid_handle,
@@ -104,7 +107,7 @@ impl ProcessControlBlock {
         let user_sp = task_inner.res.as_ref().unwrap().ustack_top();
         let kstack_top = task.kstack.get_top();
         let stack_info = ExecStackInfo {
-            entry_point: aux_entry,
+            at_entry: program_entry,
             phdr,
             phent,
             phnum,

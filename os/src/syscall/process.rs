@@ -1,7 +1,5 @@
 use crate::fs::{File, OpenFlags, open_file_at};
-use crate::mm::{
-    elf_interpreter_path, elf_needs_interpreter, translated_ref, translated_refmut, translated_str,
-};
+use crate::mm::{elf_required_interpreter_path, translated_ref, translated_refmut, translated_str};
 use crate::sbi::shutdown;
 use crate::task::{
     CloneArgs, CloneFlags, ProcessCpuTimesSnapshot, RLimit, RLimitResource, SignalFlags,
@@ -473,23 +471,28 @@ fn read_all_file(file: Arc<dyn File + Send + Sync>) -> SysResult<Vec<u8>> {
 }
 
 fn read_elf_interpreter(path: &str) -> SysResult<Vec<u8>> {
-    match path {
+    const REDIRECTS: &[(&str, &str)] = &[
         // CONTEXT: libc-test's musl dynamic binary names the soft-float
         // interpreter as a symlink to libc.so. Official test sources state
         // that kernels should redirect this path when the disk image does not
         // provide the symlink entry.
-        "/lib/ld-musl-riscv64-sf.so.1" | "/lib/ld-musl-riscv64.so.1" => {
-            read_exec_file("/musl/lib/libc.so").or_else(|_| read_exec_file(path))
-        }
+        ("/lib/ld-musl-riscv64-sf.so.1", "/musl/lib/libc.so"),
+        ("/lib/ld-musl-riscv64.so.1", "/musl/lib/libc.so"),
         // CONTEXT: Official-style RISC-V glibc disks keep the real loader under
         // `/glibc/lib`; the root `/lib` alias may be a plain redirect file in
         // local test images and must not be treated as the loader payload.
-        "/lib/ld-linux-riscv64-lp64d.so.1" => {
-            read_exec_file("/glibc/lib/ld-linux-riscv64-lp64d.so.1")
-                .or_else(|_| read_exec_file(path))
+        (
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
+        ),
+    ];
+
+    for (alias, target) in REDIRECTS {
+        if path == *alias {
+            return read_exec_file(target).or_else(|_| read_exec_file(path));
         }
-        _ => read_exec_file(path),
     }
+    read_exec_file(path)
 }
 
 fn append_script_args(
@@ -540,15 +543,19 @@ fn exec_loaded_program(
     data: Vec<u8>,
 ) -> SysResult {
     if data.starts_with(ELF_MAGIC) {
+        let elf = xmas_elf::ElfFile::new(data.as_slice()).map_err(|_| SysError::ENOEXEC)?;
         // CONTEXT: Some contest basic binaries are PIE and carry PT_INTERP but
         // have no DT_NEEDED entries. They ran as directly-entered self-contained
         // test programs before dynamic linker support; keep that compatibility
         // path while using PT_INTERP for binaries that actually need DSOs.
-        let interpreter_data = elf_interpreter_path(data.as_slice())
-            .filter(|_| elf_needs_interpreter(data.as_slice()))
-            .map(|path| read_elf_interpreter(path.as_str()))
+        let interpreter_data = elf_required_interpreter_path(&elf)
+            .map(read_elf_interpreter)
             .transpose()?;
-        current_process().exec(data.as_slice(), interpreter_data.as_deref(), args, envs);
+        let interpreter_elf = interpreter_data
+            .as_ref()
+            .map(|data| xmas_elf::ElfFile::new(data.as_slice()).map_err(|_| SysError::ENOEXEC))
+            .transpose()?;
+        current_process().exec(&elf, interpreter_elf.as_ref(), args, envs);
         // CONTEXT: Linux execve starts a new image instead of returning to the
         // old program. For PT_INTERP ELFs, the kernel enters the dynamic linker
         // while auxv still describes the original executable.

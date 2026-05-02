@@ -22,7 +22,7 @@ const AT_SECURE: usize = 23;
 const AT_RANDOM: usize = 25;
 
 pub(super) struct ExecStackInfo {
-    pub(super) entry_point: usize,
+    pub(super) at_entry: usize,
     pub(super) phdr: usize,
     pub(super) phent: usize,
     pub(super) phnum: usize,
@@ -85,7 +85,7 @@ pub(super) fn init_user_stack(
         (AT_PHENT, stack_info.phent),
         (AT_PHNUM, stack_info.phnum),
         (AT_PAGESZ, PAGE_SIZE),
-        (AT_ENTRY, stack_info.entry_point),
+        (AT_ENTRY, stack_info.at_entry),
         (AT_BASE, stack_info.interp_base),
         (AT_FLAGS, 0),
         (AT_UID, 0),
@@ -133,8 +133,8 @@ impl ProcessControlBlock {
     /// Only support processes with a single thread.
     pub fn exec(
         self: &Arc<Self>,
-        elf_data: &[u8],
-        interpreter_data: Option<&[u8]>,
+        elf: &xmas_elf::ElfFile<'_>,
+        interpreter: Option<&xmas_elf::ElfFile<'_>>,
         args: Vec<String>,
         envs: Vec<String>,
     ) {
@@ -143,14 +143,14 @@ impl ProcessControlBlock {
             memory_set,
             ustack_base,
             entry_point,
-            aux_entry,
+            program_entry,
             phdr,
             phent,
             phnum,
             interp_base,
-        } = MemorySet::from_elf(elf_data, interpreter_data);
+        } = MemorySet::from_elf(elf, interpreter);
         let stack_info = ExecStackInfo {
-            entry_point: aux_entry,
+            at_entry: program_entry,
             phdr,
             phent,
             phnum,

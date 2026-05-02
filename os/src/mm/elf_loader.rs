@@ -1,7 +1,7 @@
 use super::address::page_align_up;
 use super::{MapArea, MapPermission, MapType, MemorySet, VirtAddr};
 use crate::config::{DL_INTERP_OFFSET, PAGE_SIZE, USER_HEAP_SIZE, USER_MMAP_BASE};
-use alloc::string::{String, ToString};
+use core::ffi::CStr;
 use core::str;
 use xmas_elf::dynamic::Tag;
 use xmas_elf::program::{SegmentData, Type};
@@ -10,67 +10,52 @@ pub struct ElfLoadInfo {
     pub memory_set: MemorySet,
     pub ustack_base: usize,
     pub entry_point: usize,
-    pub aux_entry: usize,
+    pub program_entry: usize,
     pub phdr: usize,
     pub phent: usize,
     pub phnum: usize,
     pub interp_base: usize,
 }
 
-pub fn elf_interpreter_path(elf_data: &[u8]) -> Option<String> {
-    let elf = xmas_elf::ElfFile::new(elf_data).ok()?;
+pub fn elf_required_interpreter_path<'a>(elf: &'a xmas_elf::ElfFile<'a>) -> Option<&'a str> {
+    let mut interpreter_path = None;
+    let mut needs_interpreter = false;
     for i in 0..elf.header.pt2.ph_count() {
         let ph = elf.program_header(i).ok()?;
-        if ph.get_type().ok()? != Type::Interp {
-            continue;
-        }
-        let start = ph.offset() as usize;
-        let len = ph.file_size() as usize;
-        let bytes = elf_data.get(start..start.checked_add(len)?)?;
-        let end = bytes
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(bytes.len());
-        return str::from_utf8(&bytes[..end]).ok().map(ToString::to_string);
-    }
-    None
-}
-
-pub fn elf_needs_interpreter(elf_data: &[u8]) -> bool {
-    let Ok(elf) = xmas_elf::ElfFile::new(elf_data) else {
-        return false;
-    };
-    for i in 0..elf.header.pt2.ph_count() {
-        let Ok(ph) = elf.program_header(i) else {
-            continue;
-        };
-        if ph.get_type().ok() != Some(Type::Dynamic) {
-            continue;
-        }
-        let Ok(data) = ph.get_data(&elf) else {
-            continue;
-        };
-        match data {
-            SegmentData::Dynamic32(entries) => {
-                if entries
-                    .iter()
-                    .any(|entry| entry.get_tag().ok() == Some(Tag::Needed))
-                {
-                    return true;
-                }
+        match ph.get_type().ok()? {
+            Type::Interp => {
+                let start = ph.offset() as usize;
+                let len = ph.file_size() as usize;
+                let bytes = elf.input.get(start..start.checked_add(len)?)?;
+                interpreter_path = CStr::from_bytes_until_nul(bytes)
+                    .ok()
+                    .and_then(|path| path.to_str().ok());
             }
-            SegmentData::Dynamic64(entries) => {
-                if entries
-                    .iter()
-                    .any(|entry| entry.get_tag().ok() == Some(Tag::Needed))
-                {
-                    return true;
+            Type::Dynamic => {
+                let Ok(data) = ph.get_data(elf) else {
+                    continue;
+                };
+                match data {
+                    SegmentData::Dynamic32(entries) => {
+                        needs_interpreter = entries
+                            .iter()
+                            .any(|entry| entry.get_tag().ok() == Some(Tag::Needed));
+                    }
+                    SegmentData::Dynamic64(entries) => {
+                        needs_interpreter = entries
+                            .iter()
+                            .any(|entry| entry.get_tag().ok() == Some(Tag::Needed));
+                    }
+                    _ => {}
                 }
             }
             _ => {}
         }
+        if interpreter_path.is_some() && needs_interpreter {
+            break;
+        }
     }
-    false
+    needs_interpreter.then_some(interpreter_path).flatten()
 }
 
 fn phdr_address(elf: &xmas_elf::ElfFile<'_>) -> usize {
@@ -94,8 +79,11 @@ fn phdr_address(elf: &xmas_elf::ElfFile<'_>) -> usize {
     phdr
 }
 
-fn map_elf_load_segments(memory_set: &mut MemorySet, elf_data: &[u8], load_bias: usize) -> usize {
-    let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
+fn map_elf_load_segments(
+    memory_set: &mut MemorySet,
+    elf: &xmas_elf::ElfFile<'_>,
+    load_bias: usize,
+) -> usize {
     let mut max_end_va = 0usize;
     for i in 0..elf.header.pt2.ph_count() {
         let ph = elf.program_header(i).unwrap();
@@ -120,7 +108,7 @@ fn map_elf_load_segments(memory_set: &mut MemorySet, elf_data: &[u8], load_bias:
         let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
         memory_set.push_with_offset(
             map_area,
-            Some(&elf_data[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
+            Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
             start_va.page_offset(),
         );
     }
@@ -128,24 +116,29 @@ fn map_elf_load_segments(memory_set: &mut MemorySet, elf_data: &[u8], load_bias:
 }
 
 impl MemorySet {
-    pub fn from_elf(elf_data: &[u8], interpreter_data: Option<&[u8]>) -> ElfLoadInfo {
+    pub fn from_elf(
+        elf: &xmas_elf::ElfFile<'_>,
+        interpreter: Option<&xmas_elf::ElfFile<'_>>,
+    ) -> ElfLoadInfo {
         let mut memory_set = Self::new_bare();
         memory_set.map_trampoline();
-        let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
         let elf_header = elf.header;
         let magic = elf_header.pt1.magic;
         assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
         let ph_count = elf_header.pt2.ph_count();
         let ph_entry_size = elf_header.pt2.ph_entry_size();
-        let phdr = phdr_address(&elf);
-        let max_end_va = map_elf_load_segments(&mut memory_set, elf_data, 0);
-        let aux_entry = elf.header.pt2.entry_point() as usize;
-        let mut entry_point = aux_entry;
+        let phdr = phdr_address(elf);
+        let max_end_va = map_elf_load_segments(&mut memory_set, elf, 0);
+        let program_entry = elf.header.pt2.entry_point() as usize;
+        let mut entry_point = program_entry;
         let mut interp_base = 0usize;
-        if let Some(interpreter_data) = interpreter_data {
-            let interp_elf = xmas_elf::ElfFile::new(interpreter_data).unwrap();
-            map_elf_load_segments(&mut memory_set, interpreter_data, DL_INTERP_OFFSET);
-            entry_point = DL_INTERP_OFFSET + interp_elf.header.pt2.entry_point() as usize;
+        if let Some(interpreter) = interpreter {
+            // CONTEXT: The loader is placed far above the normal executable
+            // image. Heap placement must stay based on the main program, so the
+            // interpreter's max VA is intentionally not folded into max_end_va.
+            let _interp_max_end_va =
+                map_elf_load_segments(&mut memory_set, interpreter, DL_INTERP_OFFSET);
+            entry_point = DL_INTERP_OFFSET + interpreter.header.pt2.entry_point() as usize;
             interp_base = DL_INTERP_OFFSET;
         }
         let heap_base = page_align_up(max_end_va + PAGE_SIZE);
@@ -169,7 +162,7 @@ impl MemorySet {
             memory_set,
             ustack_base: user_stack_base,
             entry_point,
-            aux_entry,
+            program_entry,
             phdr,
             phent: ph_entry_size as usize,
             phnum: ph_count as usize,

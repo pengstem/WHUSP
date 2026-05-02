@@ -7,10 +7,10 @@ const BUSYBOX_APPLET: &str = "sh";
 const BUSYBOX_COMMAND_FLAG: &str = "-c";
 const TEST_LIBCS: &[&str] = &["/musl", "/glibc"];
 const TEST_SCRIPTS: &[&str] = &[
-    // "basic_testcode.sh",
-    // "busybox_testcode.sh",
-    // "lua_testcode.sh",
-    "libctest_testcode.sh",
+    "basic_testcode.sh",
+    "busybox_testcode.sh",
+    "lua_testcode.sh",
+    // "libctest_testcode.sh",
     // "iozone_testcode.sh",
     // "unixbench_testcode.sh",
     // "iperf_testcode.sh",
