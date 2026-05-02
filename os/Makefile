@@ -2,6 +2,7 @@ ARCH ?= riscv64
 MODE ?= release
 CARGO_HOME ?= $(abspath ../vendor)
 export CARGO_HOME
+CARGO_CONFIG_DIR ?= dotcargo
 
 ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
@@ -22,7 +23,12 @@ PRIMARY_DISK ?= $(DEFAULT_DISK)
 AUX_DISK ?=
 COMMA := ,
 
+prepare-cargo-config:
+	@rm -rf .cargo
+	@ln -sfn $(CARGO_CONFIG_DIR) .cargo
+
 kernel:
+	@$(MAKE) --no-print-directory prepare-cargo-config
 	@cargo build $(MODE_ARG) --target $(TARGET)
 
 run: kernel
@@ -52,8 +58,12 @@ else ifeq ($(ARCH),loongarch64)
 		-rtc base=utc 
 endif
 
+fmt: prepare-cargo-config
+	@cargo fmt
+
 clean:
+	@rm -rf .cargo
 	@cargo clean
 	@rm -f src/linker.ld
 
-.PHONY: kernel run run-inner clean
+.PHONY: prepare-cargo-config kernel run run-inner fmt clean

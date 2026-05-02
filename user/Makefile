@@ -2,6 +2,7 @@ ARCH ?= riscv64
 MODE := release
 CARGO_HOME ?= $(abspath ../vendor)
 export CARGO_HOME
+CARGO_CONFIG_DIR ?= dotcargo
 
 ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
@@ -57,7 +58,12 @@ CP := cp
 
 TEST ?= 
 
+prepare-cargo-config:
+	@rm -rf .cargo
+	@ln -sfn $(CARGO_CONFIG_DIR) .cargo
+
 elf: $(APPS)
+	@$(MAKE) --no-print-directory prepare-cargo-config
 	@cargo build --release
 ifeq ($(TEST), 1)
 	@$(CP) $(TARGET_DIR)/usertests $(TARGET_DIR)/initproc
@@ -69,6 +75,7 @@ binary: elf
 build: binary
 
 clean:
+	@rm -rf .cargo
 	@cargo clean
 
-.PHONY: elf binary build clean
+.PHONY: prepare-cargo-config elf binary build clean

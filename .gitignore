@@ -8,13 +8,14 @@
 
 os/src/link_app.S
 os/src/linker.ld
+os/.cargo
+os/.cargo/
 os/last-*
 os/.gdb_history
 os/virt.out
 tools/
 pushall.sh
 *.img
-!img/**
 kernel-rv
 kernel-la
 
@@ -32,3 +33,5 @@ vendor/.crates*.json
 vendor/bin/
 vendor/git/
 vendor/registry/
+user/.cargo
+user/.cargo/

@@ -28,7 +28,7 @@ run-rv: kernel-rv
 run-la: kernel-la
 	@$(MAKE) --no-print-directory -C os ARCH=loongarch64 MODE=$(MODE) run-inner PRIMARY_DISK="$(TEST_DISK_LA)"
 fmt:
-	@cd os && cargo fmt
+	@$(MAKE) --no-print-directory -C os fmt
 	@cd vendor/lwext4_rust && cargo fmt
 
 clean:
