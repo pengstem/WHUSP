@@ -31,6 +31,7 @@ const SYSCALL_EXIT: usize = 93;
 const SYSCALL_EXIT_GROUP: usize = 94;
 const SYSCALL_WAITID: usize = 95;
 const SYSCALL_NANOSLEEP: usize = 101;
+const SYSCALL_CLOCK_GETTIME: usize = 113;
 const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 const SYSCALL_SYSLOG: usize = 116;
 const SYSCALL_SCHED_YIELD: usize = 124;
@@ -179,6 +180,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[0] as *const LinuxTimeSpec,
             args[1] as *mut LinuxTimeSpec,
         ),
+        SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as i32, args[1] as *mut LinuxTimeSpec),
         SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(
             args[0] as i32,
             args[1] as u32,

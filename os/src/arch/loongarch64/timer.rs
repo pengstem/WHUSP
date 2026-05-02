@@ -25,13 +25,17 @@ fn get_time_nanos() -> u64 {
     secs * NSEC_PER_SEC + rem_ticks * NSEC_PER_SEC / freq
 }
 
+pub fn monotonic_time_nanos() -> u64 {
+    get_time_nanos()
+}
+
 pub fn init_wall_clock() {
     // UNFINISHED: LoongArch RTC discovery not yet implemented
     let _ = &EPOCH_OFFSET_NS;
 }
 
 pub fn wall_time_nanos() -> u64 {
-    get_time_nanos().wrapping_add(EPOCH_OFFSET_NS.load(core::sync::atomic::Ordering::Relaxed))
+    monotonic_time_nanos().wrapping_add(EPOCH_OFFSET_NS.load(core::sync::atomic::Ordering::Relaxed))
 }
 
 pub fn get_time() -> usize {
