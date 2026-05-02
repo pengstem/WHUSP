@@ -410,15 +410,15 @@ fn interpreter_candidates(
 fn read_exec_file(path: &str) -> SysResult<Vec<u8>> {
     let process = current_process();
     let app_file = open_file_at(process.working_dir(), path, OpenFlags::RDONLY)?;
-    Ok(read_all_file(app_file))
+    read_all_file(app_file)
 }
 
-fn read_all_file(file: Arc<dyn File + Send + Sync>) -> Vec<u8> {
+fn read_all_file(file: Arc<dyn File + Send + Sync>) -> SysResult<Vec<u8>> {
     let mut data = Vec::new();
-    data.resize(file.stat().size as usize, 0);
+    data.resize(file.stat()?.size as usize, 0);
     let len = file.read_at(0, data.as_mut_slice());
     data.truncate(len);
-    data
+    Ok(data)
 }
 
 fn append_script_args(

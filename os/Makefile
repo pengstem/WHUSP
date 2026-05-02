@@ -54,7 +54,7 @@ else ifeq ($(ARCH),loongarch64)
 		-drive file=$(PRIMARY_DISK),if=none,format=raw,id=x0 \
 		-device virtio-blk-pci,drive=x0 -no-reboot \
 		-device virtio-net-pci,netdev=net0 \
-		-netdev user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555 \
+		-netdev user,id=net0 \
 		-rtc base=utc 
 endif
 

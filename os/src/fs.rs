@@ -117,8 +117,8 @@ pub trait File: Send + Sync {
         }
         ready
     }
-    fn stat(&self) -> FileStat {
-        FileStat::default()
+    fn stat(&self) -> FsResult<FileStat> {
+        Ok(FileStat::default())
     }
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
         0

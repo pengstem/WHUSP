@@ -145,7 +145,7 @@ pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult 
     if !file.readable() {
         return Err(SysError::EBADF);
     }
-    if file.stat().mode & S_IFDIR == S_IFDIR {
+    if file.stat()?.mode & S_IFDIR == S_IFDIR {
         return Err(SysError::EISDIR);
     }
     let entry = get_fd_entry_by_fd(fd)?;

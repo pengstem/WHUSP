@@ -4,6 +4,7 @@ use super::dirent::{
 use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult};
 use super::{FileStat, FileTimestamp};
 use crate::drivers::block::VirtIOBlock;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -107,6 +108,8 @@ fn map_ext4_error(err: Ext4Error) -> FsError {
 
 pub(super) struct Ext4Mount {
     fs: KernelExt4Fs,
+    open_inodes: BTreeMap<u32, usize>,
+    pending_unlinks: BTreeSet<u32>,
 }
 
 unsafe impl Send for Ext4Mount {}
@@ -116,6 +119,8 @@ impl Ext4Mount {
     pub(super) fn open(device: Arc<VirtIOBlock>) -> Result<Self, Ext4Error> {
         Ok(Self {
             fs: KernelExt4Fs::new(KernelDisk { dev: device }, EXT4_CONFIG)?,
+            open_inodes: BTreeMap::new(),
+            pending_unlinks: BTreeSet::new(),
         })
     }
 }
@@ -194,9 +199,31 @@ impl FileSystemBackend for Ext4Mount {
     }
 
     fn unlink(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult {
-        self.fs
-            .unlink(parent_ino, leaf_name)
-            .map_err(map_ext4_error)
+        let mut lookup = self
+            .fs
+            .lookup(parent_ino, leaf_name)
+            .map_err(map_ext4_error)?;
+        let child_ino = lookup.entry().ino();
+        let defer_free = self.open_inodes.get(&child_ino).copied().unwrap_or(0) > 0;
+        drop(lookup);
+
+        // UNFINISHED: Linux also keeps opened directories alive across unlink.
+        // This ext4 path currently defers final free only for non-directory
+        // inodes, which is enough for mkstemp/unlink/fstat file workloads.
+        let deferred = if defer_free {
+            self.fs
+                .unlink_defer_free(parent_ino, leaf_name)
+                .map_err(map_ext4_error)?
+        } else {
+            self.fs
+                .unlink(parent_ino, leaf_name)
+                .map_err(map_ext4_error)?;
+            None
+        };
+        if let Some(ino) = deferred {
+            self.pending_unlinks.insert(ino);
+        }
+        Ok(())
     }
 
     fn rename(&mut self, src_dir: u32, src_name: &str, dst_dir: u32, dst_name: &str) -> FsResult {
@@ -224,6 +251,28 @@ impl FileSystemBackend for Ext4Mount {
                 Some(ctime.to_duration()),
             )
             .map_err(map_ext4_error)
+    }
+
+    fn retain_inode(&mut self, ino: u32) -> FsResult {
+        let mut attr = lwext4_rust::FileAttr::default();
+        self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
+        *self.open_inodes.entry(ino).or_insert(0) += 1;
+        Ok(())
+    }
+
+    fn release_inode(&mut self, ino: u32) -> FsResult {
+        let Some(open_count) = self.open_inodes.get_mut(&ino) else {
+            return Ok(());
+        };
+        if *open_count > 1 {
+            *open_count -= 1;
+            return Ok(());
+        }
+        self.open_inodes.remove(&ino);
+        if self.pending_unlinks.remove(&ino) {
+            self.fs.free_unlinked_inode(ino).map_err(map_ext4_error)?;
+        }
+        Ok(())
     }
 
     fn stat(&mut self, ino: u32) -> FsResult<FileStat> {

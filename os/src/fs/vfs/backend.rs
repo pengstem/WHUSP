@@ -65,6 +65,12 @@ pub(crate) trait FileSystemBackend: Send {
     ) -> FsResult {
         Err(FsError::Unsupported)
     }
+    fn retain_inode(&mut self, ino: u32) -> FsResult {
+        self.stat(ino).map(|_| ())
+    }
+    fn release_inode(&mut self, _ino: u32) -> FsResult {
+        Ok(())
+    }
     fn stat(&mut self, ino: u32) -> FsResult<FileStat>;
     fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize>;
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize;

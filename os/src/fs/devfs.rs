@@ -432,8 +432,8 @@ impl File for DevFsFile {
         }
     }
 
-    fn stat(&self) -> FileStat {
-        stat_node(self.node)
+    fn stat(&self) -> FsResult<FileStat> {
+        Ok(stat_node(self.node))
     }
 
     fn status_flags(&self) -> OpenFlags {

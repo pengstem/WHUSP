@@ -1,5 +1,5 @@
 use super::status_flags::StatusFlagsCell;
-use super::{File, FileStat, OpenFlags, PollEvents, S_IFIFO};
+use super::{File, FileStat, FsResult, OpenFlags, PollEvents, S_IFIFO};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use alloc::sync::{Arc, Weak};
@@ -193,8 +193,8 @@ impl File for Pipe {
             }
         }
     }
-    fn stat(&self) -> FileStat {
-        FileStat::with_mode(S_IFIFO | 0o600)
+    fn stat(&self) -> FsResult<FileStat> {
+        Ok(FileStat::with_mode(S_IFIFO | 0o600))
     }
     fn status_flags(&self) -> OpenFlags {
         self.status_flags.get()

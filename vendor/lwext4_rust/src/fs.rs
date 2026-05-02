@@ -217,7 +217,38 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         Ok(())
     }
 
+    fn free_unlinked_inode_ref(inode_ref: &mut InodeRef<Hal>) -> Ext4Result {
+        inode_ref.truncate(0)?;
+        unsafe {
+            ext4_inode_set_del_time(inode_ref.inner.inode, u32::MAX);
+            inode_ref.mark_dirty();
+            ext4_fs_free_inode(inode_ref.inner.as_mut());
+        }
+        Ok(())
+    }
+
+    pub fn free_unlinked_inode(&mut self, ino: u32) -> Ext4Result {
+        let mut inode_ref = self.inode_ref(ino)?;
+        if inode_ref.nlink() != 0 {
+            return Ok(());
+        }
+        Self::free_unlinked_inode_ref(&mut inode_ref)
+    }
+
     pub fn unlink(&mut self, dir: u32, name: &str) -> Ext4Result {
+        self.unlink_maybe_defer_free(dir, name, false).map(|_| ())
+    }
+
+    pub fn unlink_defer_free(&mut self, dir: u32, name: &str) -> Ext4Result<Option<u32>> {
+        self.unlink_maybe_defer_free(dir, name, true)
+    }
+
+    fn unlink_maybe_defer_free(
+        &mut self,
+        dir: u32,
+        name: &str,
+        defer_free: bool,
+    ) -> Ext4Result<Option<u32>> {
         let mut dir_ref = self.inode_ref(dir)?;
         let child = self.clone_ref(&dir_ref).lookup(name)?.entry().ino();
         let mut child_ref = self.inode_ref(child)?;
@@ -238,14 +269,12 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             child_ref.dec_nlink();
         }
         if child_ref.nlink() == 0 {
-            child_ref.truncate(0)?;
-            unsafe {
-                ext4_inode_set_del_time(child_ref.inner.inode, u32::MAX);
-                child_ref.mark_dirty();
-                ext4_fs_free_inode(child_ref.inner.as_mut());
+            if defer_free && !child_ref.is_dir() {
+                return Ok(Some(child));
             }
+            Self::free_unlinked_inode_ref(&mut child_ref)?;
         }
-        Ok(())
+        Ok(None)
     }
 
     pub fn stat(&mut self) -> Ext4Result<StatFs> {

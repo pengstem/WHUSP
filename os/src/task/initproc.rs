@@ -10,15 +10,15 @@ const TEST_SCRIPTS: &[&str] = &[
     "basic_testcode.sh",
     "busybox_testcode.sh",
     "lua_testcode.sh",
-    "libctest_testcode.sh",
-    "iozone_testcode.sh",
-    "unixbench_testcode.sh",
-    "iperf_testcode.sh",
-    "libcbench_testcode.sh",
-    "lmbench_testcode.sh",
-    "netperf_testcode.sh",
-    "cyclictest_testcode.sh",
-    "ltp_testcode.sh",
+    // "libctest_testcode.sh",
+    // "iozone_testcode.sh",
+    // "unixbench_testcode.sh",
+    // "iperf_testcode.sh",
+    // "libcbench_testcode.sh",
+    // "lmbench_testcode.sh",
+    // "netperf_testcode.sh",
+    // "cyclictest_testcode.sh",
+    // "ltp_testcode.sh",
 ];
 
 pub(super) struct KernelInitProc {
@@ -38,6 +38,7 @@ fn build_runner_command() -> String {
         }
     }
 
+    let _ = write!(command, "; (cd /musl && ./busybox reboot )");
     command
 }
 

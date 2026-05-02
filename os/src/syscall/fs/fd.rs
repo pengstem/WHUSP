@@ -51,14 +51,17 @@ pub(super) fn get_file_by_fd(fd: usize) -> SysResult<Arc<dyn File + Send + Sync>
 
 pub fn sys_close(fd: usize) -> SysResult {
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return Err(SysError::EBADF);
-    }
-    if inner.fd_table[fd].is_none() {
-        return Err(SysError::EBADF);
-    }
-    inner.fd_table[fd].take();
+    let entry = {
+        let mut inner = process.inner_exclusive_access();
+        if fd >= inner.fd_table.len() {
+            return Err(SysError::EBADF);
+        }
+        let Some(entry) = inner.fd_table[fd].take() else {
+            return Err(SysError::EBADF);
+        };
+        entry
+    };
+    drop(entry);
     Ok(0)
 }
 

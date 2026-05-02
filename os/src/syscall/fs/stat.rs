@@ -29,7 +29,7 @@ fn stat_by_dirfd(dirfd: isize) -> SysResult<FileStat> {
     if dirfd < 0 {
         return Err(SysError::EBADF);
     }
-    Ok(get_file_by_fd(dirfd as usize)?.stat())
+    Ok(get_file_by_fd(dirfd as usize)?.stat()?)
 }
 
 pub(super) fn resolve_stat(
@@ -66,7 +66,7 @@ pub fn sys_fstat(fd: usize, statbuf: *mut LinuxKstat) -> SysResult {
     }
     let token = current_user_token();
     let file = get_file_by_fd(fd)?;
-    write_stat_result(token, statbuf, file.stat())
+    write_stat_result(token, statbuf, file.stat()?)
 }
 
 pub fn sys_newfstatat(

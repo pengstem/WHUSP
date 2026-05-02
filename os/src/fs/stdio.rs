@@ -1,5 +1,5 @@
 use super::status_flags::StatusFlagsCell;
-use super::{File, FileStat, OpenFlags, PollEvents, S_IFCHR};
+use super::{File, FileStat, FsResult, OpenFlags, PollEvents, S_IFCHR};
 use crate::drivers::chardev::CharDevice;
 use crate::drivers::chardev::UART;
 use crate::mm::UserBuffer;
@@ -74,8 +74,8 @@ impl File for Stdin {
             PollEvents::empty()
         }
     }
-    fn stat(&self) -> FileStat {
-        FileStat::with_mode(S_IFCHR | 0o666)
+    fn stat(&self) -> FsResult<FileStat> {
+        Ok(FileStat::with_mode(S_IFCHR | 0o666))
     }
     fn status_flags(&self) -> OpenFlags {
         self.status_flags.get()
@@ -111,8 +111,8 @@ impl File for Stdout {
             PollEvents::empty()
         }
     }
-    fn stat(&self) -> FileStat {
-        FileStat::with_mode(S_IFCHR | 0o666)
+    fn stat(&self) -> FsResult<FileStat> {
+        Ok(FileStat::with_mode(S_IFCHR | 0o666))
     }
     fn status_flags(&self) -> OpenFlags {
         self.status_flags.get()

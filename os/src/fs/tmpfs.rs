@@ -11,6 +11,8 @@ struct TmpfsInode {
     kind: FsNodeKind,
     mode: u32,
     nlink: u32,
+    open_count: usize,
+    pending_delete: bool,
     data: Vec<u8>,
     children: BTreeMap<String, u32>,
     parent_ino: u32,
@@ -32,6 +34,8 @@ impl TmpfsInode {
             kind,
             mode,
             nlink,
+            open_count: 0,
+            pending_delete: false,
             data: Vec::new(),
             children: BTreeMap::new(),
             parent_ino,
@@ -141,6 +145,10 @@ impl TmpFs {
             return;
         };
         if kind == FsNodeKind::Directory {
+            // UNFINISHED: Linux keeps opened directories alive across unlink
+            // until the last file reference is closed. This tmpfs currently
+            // delays deletion only for non-directory inodes needed by
+            // mkstemp/unlink/fstat style file workloads.
             if parent_ino != ino {
                 if let Some(parent) = self.inodes.get_mut(&parent_ino) {
                     parent.nlink = parent.nlink.saturating_sub(1);
@@ -154,7 +162,11 @@ impl TmpFs {
             inode.nlink = inode.nlink.saturating_sub(1);
             inode.touch();
             if inode.nlink == 0 {
-                self.inodes.remove(&ino);
+                if inode.open_count == 0 {
+                    self.inodes.remove(&ino);
+                } else {
+                    inode.pending_delete = true;
+                }
             }
         }
     }
@@ -335,6 +347,24 @@ impl FileSystemBackend for TmpFs {
         }
         inode.data.resize(len as usize, 0);
         inode.touch();
+        Ok(())
+    }
+
+    fn retain_inode(&mut self, ino: u32) -> FsResult {
+        let inode = self.inode_mut(ino)?;
+        inode.open_count += 1;
+        Ok(())
+    }
+
+    fn release_inode(&mut self, ino: u32) -> FsResult {
+        let should_remove = {
+            let inode = self.inode_mut(ino)?;
+            inode.open_count = inode.open_count.saturating_sub(1);
+            inode.open_count == 0 && inode.nlink == 0 && inode.pending_delete
+        };
+        if should_remove {
+            self.inodes.remove(&ino);
+        }
         Ok(())
     }
 

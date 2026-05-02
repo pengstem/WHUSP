@@ -22,15 +22,24 @@ pub(crate) struct VfsFile {
 }
 
 impl VfsFile {
-    fn new(path: VfsPath, readable: bool, writable: bool, status_flags: OpenFlags) -> Self {
-        Self {
+    fn new(
+        path: VfsPath,
+        readable: bool,
+        writable: bool,
+        status_flags: OpenFlags,
+    ) -> FsResult<Self> {
+        with_mount(path.node.mount_id, |mount| {
+            mount.retain_inode(path.node.ino)
+        })
+        .ok_or(FsError::Io)??;
+        Ok(Self {
             node: path.node,
             kind: path.kind,
             offset: SleepMutex::new(0),
             readable,
             writable,
             status_flags: StatusFlagsCell::new(status_flags),
-        }
+        })
     }
 
     pub(crate) fn read_all(&self) -> Vec<u8> {
@@ -146,7 +155,7 @@ fn open_vfs_file_impl(
         readable,
         writable,
         OpenFlags::file_status_flags(flags),
-    )))
+    )?))
 }
 
 pub(crate) fn open_file(name: &str, flags: OpenFlags) -> FsResult<Arc<VfsFile>> {
@@ -227,12 +236,11 @@ impl File for VfsFile {
         self.write_inner(buf, true)
     }
 
-    fn stat(&self) -> FileStat {
+    fn stat(&self) -> FsResult<FileStat> {
         let mut stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))
-            .expect("filesystem mount is missing")
-            .expect("inode stat failed");
+            .ok_or(FsError::Io)??;
         stat.dev = self.node.mount_id.0 as u64;
-        stat
+        Ok(stat)
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
@@ -337,5 +345,13 @@ impl File for VfsFile {
 
     fn set_status_flags(&self, flags: OpenFlags) {
         self.status_flags.set(flags);
+    }
+}
+
+impl Drop for VfsFile {
+    fn drop(&mut self) {
+        let _ = with_mount(self.node.mount_id, |mount| {
+            mount.release_inode(self.node.ino)
+        });
     }
 }
