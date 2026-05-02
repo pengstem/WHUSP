@@ -60,7 +60,7 @@ jobs:
 
       - name: Decompress test disk
         run: |
-          cat img/sdcard-rv.img.xz.* | xz -d > sdcard-rv.img
+          bash img/decompress.sh
 
       - name: Build kernel
         run: |
@@ -133,7 +133,7 @@ jobs:
 
       - name: Decompress test disk
         run: |
-          cat img/sdcard-la.img.xz.* | xz -d > sdcard-la.img
+          bash img/decompress.sh
 
       - name: Build kernel
         run: |

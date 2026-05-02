@@ -36,7 +36,7 @@ jobs:
 
       - name: Decompress test disk
         run: |
-          cat img/sdcard-rv.img.xz.* | xz -d > sdcard-rv.img
+          bash img/decompress.sh
           ls -lh sdcard-rv.img
 
       - name: Build RISC-V kernel
@@ -122,7 +122,7 @@ jobs:
 
       - name: Decompress test disk
         run: |
-          cat img/sdcard-la.img.xz.* | xz -d > sdcard-la.img
+          bash img/decompress.sh
           ls -lh sdcard-la.img
 
       - name: Build LoongArch kernel
