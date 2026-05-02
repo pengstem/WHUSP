@@ -3,6 +3,7 @@ pub const USER_STACK_SIZE: usize = 4096 * 32;
 pub const USER_HEAP_SIZE: usize = 0x20_0000;
 pub const USER_MMAP_BASE: usize = 0x6000_0000;
 pub const USER_MMAP_LIMIT: usize = 0x7000_0000;
+pub const DL_INTERP_OFFSET: usize = 0x30_0000_0000;
 pub const KERNEL_STACK_SIZE: usize = 4096 * 2;
 pub const KERNEL_HEAP_SIZE: usize = 0x100_0000;
 pub const PAGE_SIZE: usize = 0x1000;

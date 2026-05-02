@@ -117,7 +117,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     let task = take_current_task().unwrap();
     let mut task_inner = task.inner_exclusive_access();
     let process = task.process.upgrade().unwrap();
-    let tid = task_inner.res.as_ref().unwrap().tid;
+    let tid = task_inner.tid;
     // record exit code
     task_inner.exit_code = Some(exit_code);
     task_inner.res = None;
@@ -233,13 +233,17 @@ pub fn add_initproc() {
 }
 
 pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
-    let process = current_process();
+    let task = current_task()?;
+    let process = task.process.upgrade()?;
     let process_inner = process.inner_exclusive_access();
     process_inner.signals.check_error()
 }
 
 pub fn current_add_signal(signal: SignalFlags) {
-    let process = current_process();
-    let mut process_inner = process.inner_exclusive_access();
-    process_inner.signals |= signal;
+    if let Some(task) = current_task()
+        && let Some(process) = task.process.upgrade()
+    {
+        let mut process_inner = process.inner_exclusive_access();
+        process_inner.signals |= signal;
+    }
 }

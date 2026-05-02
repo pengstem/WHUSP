@@ -11,7 +11,7 @@ mod user_space;
 pub use address::VPNRange;
 pub use address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
 pub use area::{MapArea, MapPermission, MapType, MmapFlush};
-pub use elf_loader::ElfLoadInfo;
+pub use elf_loader::{ElfLoadInfo, elf_interpreter_path, elf_needs_interpreter};
 pub use frame_allocator::{FrameTracker, frame_alloc, frame_alloc_more, frame_stats};
 pub use kernel_space::{KERNEL_SPACE, kernel_token};
 pub use memory_set::MemorySet;

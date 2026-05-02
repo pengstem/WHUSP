@@ -50,10 +50,12 @@ impl ProcessControlBlock {
             memory_set,
             ustack_base,
             entry_point,
+            aux_entry,
             phdr,
             phent,
             phnum,
-        } = MemorySet::from_elf(elf_data);
+            interp_base,
+        } = MemorySet::from_elf(elf_data, None);
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
             pid: pid_handle,
@@ -102,10 +104,11 @@ impl ProcessControlBlock {
         let user_sp = task_inner.res.as_ref().unwrap().ustack_top();
         let kstack_top = task.kstack.get_top();
         let stack_info = ExecStackInfo {
-            entry_point,
+            entry_point: aux_entry,
             phdr,
             phent,
             phnum,
+            interp_base,
         };
         let (stack_top, _, _) = init_user_stack(process_token, user_sp, &args, &envs, &stack_info);
         let app_trap_cx = TrapContext::app_init_context(

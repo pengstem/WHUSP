@@ -164,6 +164,54 @@ impl MemorySet {
         Some(start)
     }
 
+    pub fn mmap_fixed_area(
+        &mut self,
+        start: usize,
+        len: usize,
+        permission: MapPermission,
+        backing_file: Option<Arc<dyn File + Send + Sync>>,
+        file_offset: usize,
+        shared: bool,
+        writable: bool,
+    ) -> Option<(usize, Vec<MmapFlush>)> {
+        if start % PAGE_SIZE != 0 {
+            return None;
+        }
+        let map_len = page_align_up(len);
+        let end = start.checked_add(map_len)?;
+        let start_vpn = VirtAddr::from(start).floor();
+        let end_vpn = VirtAddr::from(end).floor();
+
+        self.split_area_at(start_vpn);
+        self.split_area_at(end_vpn);
+
+        let mut flushes = Vec::new();
+        let mut idx = 0;
+        while idx < self.areas.len() {
+            let area_start = self.areas[idx].vpn_range.get_start();
+            let area_end = self.areas[idx].vpn_range.get_end();
+            if area_start < end_vpn && area_end > start_vpn {
+                let mut area = self.areas.remove(idx);
+                flushes.extend(area.collect_mmap_flushes(&self.page_table));
+                area.unmap_resident(&mut self.page_table);
+            } else {
+                idx += 1;
+            }
+        }
+
+        let mut area = MapArea::new(start.into(), end.into(), MapType::Framed, permission);
+        area.mmap_info = Some(MmapInfo {
+            shared,
+            writable,
+            len,
+            file_offset,
+            backing_file,
+        });
+        self.areas.push(area);
+        self.mmap_next = self.mmap_next.max(end);
+        Some((start, flushes))
+    }
+
     pub fn prepare_mmap_page_fault(
         &self,
         addr: usize,

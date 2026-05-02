@@ -29,6 +29,7 @@ impl TaskControlBlock {
 
 pub struct TaskControlBlockInner {
     pub res: Option<TaskUserRes>,
+    pub tid: usize,
     pub trap_cx_ppn: PhysPageNum,
     pub task_cx: TaskContext,
     pub task_status: TaskStatus,
@@ -55,6 +56,7 @@ impl TaskControlBlock {
         alloc_user_res: bool,
     ) -> Self {
         let res = TaskUserRes::new(Arc::clone(&process), ustack_base, alloc_user_res);
+        let tid = res.tid;
         let trap_cx_ppn = res.trap_cx_ppn();
         let kstack = kstack_alloc();
         let kstack_top = kstack.get_top();
@@ -64,6 +66,7 @@ impl TaskControlBlock {
             inner: unsafe {
                 UPIntrFreeCell::new(TaskControlBlockInner {
                     res: Some(res),
+                    tid,
                     trap_cx_ppn,
                     task_cx: TaskContext::goto_trap_return(kstack_top),
                     task_status: TaskStatus::Ready,

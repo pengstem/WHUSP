@@ -26,6 +26,7 @@ pub(super) struct ExecStackInfo {
     pub(super) phdr: usize,
     pub(super) phent: usize,
     pub(super) phnum: usize,
+    pub(super) interp_base: usize,
 }
 
 fn align_down(value: usize, align: usize) -> usize {
@@ -85,7 +86,7 @@ pub(super) fn init_user_stack(
         (AT_PHNUM, stack_info.phnum),
         (AT_PAGESZ, PAGE_SIZE),
         (AT_ENTRY, stack_info.entry_point),
-        (AT_BASE, 0),
+        (AT_BASE, stack_info.interp_base),
         (AT_FLAGS, 0),
         (AT_UID, 0),
         (AT_EUID, 0),
@@ -130,21 +131,30 @@ pub(super) fn init_user_stack(
 
 impl ProcessControlBlock {
     /// Only support processes with a single thread.
-    pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) {
+    pub fn exec(
+        self: &Arc<Self>,
+        elf_data: &[u8],
+        interpreter_data: Option<&[u8]>,
+        args: Vec<String>,
+        envs: Vec<String>,
+    ) {
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
         let ElfLoadInfo {
             memory_set,
             ustack_base,
             entry_point,
+            aux_entry,
             phdr,
             phent,
             phnum,
-        } = MemorySet::from_elf(elf_data);
+            interp_base,
+        } = MemorySet::from_elf(elf_data, interpreter_data);
         let stack_info = ExecStackInfo {
-            entry_point,
+            entry_point: aux_entry,
             phdr,
             phent,
             phnum,
+            interp_base,
         };
         let new_token = memory_set.token();
 
