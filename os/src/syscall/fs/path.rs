@@ -12,8 +12,8 @@ use super::user_ptr::{
 };
 use crate::fs::{
     File, FileStat, FileTimestamp, OpenFlags, WorkingDir, link_file_at, lookup_dir_at, mkdir_at,
-    normalize_path, open_devfs_child, open_file_at, rename_at, rmdir_at, symlink_at,
-    unlink_file_at,
+    normalize_path, open_devfs_child, open_devfs_misc_child, open_file_at, rename_at, rmdir_at,
+    symlink_at, unlink_file_at,
 };
 use crate::mm::UserBuffer;
 use crate::task::{FdTableEntry, current_process, current_user_token};
@@ -186,9 +186,12 @@ fn open_devfs_child_from_dirfd(
     if !file.is_devfs_dir() {
         return Ok(None);
     }
-    open_devfs_child(path, flags)?
-        .map(Some)
-        .ok_or(SysError::ENOENT)
+    let child = if file.is_devfs_misc_dir() {
+        open_devfs_misc_child(path, flags)?
+    } else {
+        open_devfs_child(path, flags)?
+    };
+    child.map(Some).ok_or(SysError::ENOENT)
 }
 
 pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> SysResult {

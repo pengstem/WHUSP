@@ -1,4 +1,7 @@
-use crate::fs::{FileStat, MountId, WorkingDir, stat_at, stat_devfs_child, statfs_for_mount};
+use crate::fs::{
+    FileStat, MountId, WorkingDir, stat_at, stat_devfs_child, stat_devfs_misc_child,
+    statfs_for_mount,
+};
 use crate::task::{current_process, current_user_token};
 
 use super::super::errno::{SysError, SysResult};
@@ -41,7 +44,12 @@ pub(super) fn resolve_stat(
     if !is_absolute && dirfd != AT_FDCWD && dirfd >= 0 {
         let file = get_file_by_fd(dirfd as usize)?;
         if file.is_devfs_dir() {
-            return stat_devfs_child(path).ok_or(SysError::ENOENT);
+            let stat = if file.is_devfs_misc_dir() {
+                stat_devfs_misc_child(path)
+            } else {
+                stat_devfs_child(path)
+            };
+            return stat.ok_or(SysError::ENOENT);
         }
     }
     let base = if is_absolute {

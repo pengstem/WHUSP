@@ -121,6 +121,10 @@ lazy_static! {
 
 pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
     let file = get_file_by_fd(fd)?;
+    // CONTEXT: musl-style ioctl callers may sign-extend 32-bit request
+    // numbers such as RTC_RD_TIME into the syscall register. Linux ioctl
+    // command numbers are matched on their low 32 bits here.
+    let request = request & 0xffff_ffff;
 
     if file.is_rtc() {
         return handle_rtc_ioctl(request, argp);

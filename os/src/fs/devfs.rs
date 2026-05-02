@@ -12,6 +12,7 @@ const DEVFS_DEV: u64 = 0x646576;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DevNode {
     Root,
+    Misc,
     Null,
     Zero,
     Tty,
@@ -23,17 +24,18 @@ impl DevNode {
     fn ino(self) -> u64 {
         match self {
             Self::Root => 1,
-            Self::Null => 2,
-            Self::Zero => 3,
-            Self::Tty => 4,
-            Self::TtyS0 => 5,
-            Self::Rtc => 6,
+            Self::Misc => 2,
+            Self::Null => 3,
+            Self::Zero => 4,
+            Self::Tty => 5,
+            Self::TtyS0 => 6,
+            Self::Rtc => 7,
         }
     }
 
     fn rdev(self) -> u64 {
         match self {
-            Self::Root => 0,
+            Self::Root | Self::Misc => 0,
             Self::Null => linux_makedev(1, 3),
             Self::Zero => linux_makedev(1, 5),
             Self::Tty => linux_makedev(5, 0),
@@ -73,7 +75,7 @@ struct DevDirEntry {
     dtype: u8,
 }
 
-const DEV_DIR_ENTRIES: [DevDirEntry; 7] = [
+const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 9] = [
     DevDirEntry {
         node: DevNode::Root,
         name: b".",
@@ -109,6 +111,34 @@ const DEV_DIR_ENTRIES: [DevDirEntry; 7] = [
         name: b"rtc",
         dtype: DT_CHR,
     },
+    DevDirEntry {
+        node: DevNode::Rtc,
+        name: b"rtc0",
+        dtype: DT_CHR,
+    },
+    DevDirEntry {
+        node: DevNode::Misc,
+        name: b"misc",
+        dtype: DT_DIR,
+    },
+];
+
+const MISC_DEV_DIR_ENTRIES: [DevDirEntry; 3] = [
+    DevDirEntry {
+        node: DevNode::Misc,
+        name: b".",
+        dtype: DT_DIR,
+    },
+    DevDirEntry {
+        node: DevNode::Root,
+        name: b"..",
+        dtype: DT_DIR,
+    },
+    DevDirEntry {
+        node: DevNode::Rtc,
+        name: b"rtc",
+        dtype: DT_CHR,
+    },
 ];
 
 fn linux_makedev(major: u64, minor: u64) -> u64 {
@@ -122,6 +152,7 @@ fn lookup_absolute(path: &str) -> Option<DevNode> {
     // Only absolute /dev paths and explicit /dev directory fds are handled.
     match path {
         "/dev" | "/dev/" => Some(DevNode::Root),
+        "/dev/misc" | "/dev/misc/" => Some(DevNode::Misc),
         "/dev/null" => Some(DevNode::Null),
         "/dev/zero" => Some(DevNode::Zero),
         "/dev/tty" => Some(DevNode::Tty),
@@ -131,14 +162,24 @@ fn lookup_absolute(path: &str) -> Option<DevNode> {
     }
 }
 
-fn lookup_child(path: &str) -> Option<DevNode> {
-    match path {
-        "." | ".." => Some(DevNode::Root),
-        "null" => Some(DevNode::Null),
-        "zero" => Some(DevNode::Zero),
-        "tty" => Some(DevNode::Tty),
-        "ttyS0" => Some(DevNode::TtyS0),
-        "rtc" | "rtc0" => Some(DevNode::Rtc),
+fn lookup_child(parent: DevNode, path: &str) -> Option<DevNode> {
+    match parent {
+        DevNode::Root => match path {
+            "." | ".." => Some(DevNode::Root),
+            "misc" => Some(DevNode::Misc),
+            "null" => Some(DevNode::Null),
+            "zero" => Some(DevNode::Zero),
+            "tty" => Some(DevNode::Tty),
+            "ttyS0" => Some(DevNode::TtyS0),
+            "rtc" | "rtc0" => Some(DevNode::Rtc),
+            _ => None,
+        },
+        DevNode::Misc => match path {
+            "." => Some(DevNode::Misc),
+            ".." => Some(DevNode::Root),
+            "rtc" => Some(DevNode::Rtc),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -147,7 +188,7 @@ fn open_node(node: DevNode, flags: OpenFlags) -> FsResult<Arc<dyn File + Send + 
     if flags.contains(OpenFlags::CREATE | OpenFlags::EXCL) {
         return Err(FsError::AlreadyExists);
     }
-    if node == DevNode::Root {
+    if matches!(node, DevNode::Root | DevNode::Misc) {
         if !flags.can_open_directory() {
             return Err(FsError::IsDir);
         }
@@ -183,13 +224,25 @@ pub(crate) fn open_child(
     if path.contains('/') {
         return Ok(None);
     }
-    lookup_child(path)
+    lookup_child(DevNode::Root, path)
+        .map(|node| open_node(node, flags))
+        .transpose()
+}
+
+pub(crate) fn open_misc_child(
+    path: &str,
+    flags: OpenFlags,
+) -> FsResult<Option<Arc<dyn File + Send + Sync>>> {
+    if path.contains('/') {
+        return Ok(None);
+    }
+    lookup_child(DevNode::Misc, path)
         .map(|node| open_node(node, flags))
         .transpose()
 }
 
 fn stat_node(node: DevNode) -> FileStat {
-    let mode = if node == DevNode::Root {
+    let mode = if matches!(node, DevNode::Root | DevNode::Misc) {
         S_IFDIR | 0o755
     } else {
         S_IFCHR | 0o666
@@ -198,7 +251,11 @@ fn stat_node(node: DevNode) -> FileStat {
     stat.dev = DEVFS_DEV;
     stat.ino = node.ino();
     stat.rdev = node.rdev();
-    stat.nlink = if node == DevNode::Root { 2 } else { 1 };
+    stat.nlink = if matches!(node, DevNode::Root | DevNode::Misc) {
+        2
+    } else {
+        1
+    };
     stat.blocks = 0;
     stat
 }
@@ -211,7 +268,14 @@ pub(crate) fn stat_child(path: &str) -> Option<FileStat> {
     if path.contains('/') {
         return None;
     }
-    Some(stat_node(lookup_child(path)?))
+    Some(stat_node(lookup_child(DevNode::Root, path)?))
+}
+
+pub(crate) fn stat_misc_child(path: &str) -> Option<FileStat> {
+    if path.contains('/') {
+        return None;
+    }
+    Some(stat_node(lookup_child(DevNode::Misc, path)?))
 }
 
 fn read_console(user_buf: UserBuffer) -> usize {
@@ -264,12 +328,24 @@ fn read_zero(user_buf: UserBuffer) -> usize {
     len
 }
 
-fn copy_dirents(entries_offset: &mut usize, user_buf: UserBuffer) -> FsResult<isize> {
+fn dir_entries(node: DevNode) -> Option<&'static [DevDirEntry]> {
+    match node {
+        DevNode::Root => Some(&ROOT_DEV_DIR_ENTRIES),
+        DevNode::Misc => Some(&MISC_DEV_DIR_ENTRIES),
+        _ => None,
+    }
+}
+
+fn copy_dirents(
+    entries: &'static [DevDirEntry],
+    entries_offset: &mut usize,
+    user_buf: UserBuffer,
+) -> FsResult<isize> {
     let mut kernel_buf = vec![0u8; user_buf.len()];
     let mut written = 0usize;
 
-    while *entries_offset < DEV_DIR_ENTRIES.len() {
-        let entry = &DEV_DIR_ENTRIES[*entries_offset];
+    while *entries_offset < entries.len() {
+        let entry = &entries[*entries_offset];
         let d_reclen = align_up(
             LINUX_DIRENT64_HEADER_SIZE + entry.name.len() + 1,
             LINUX_DIRENT64_ALIGN,
@@ -317,7 +393,7 @@ impl File for DevFsFile {
 
     fn read(&self, user_buf: UserBuffer) -> usize {
         match self.node {
-            DevNode::Root | DevNode::Null | DevNode::Rtc => 0,
+            DevNode::Root | DevNode::Misc | DevNode::Null | DevNode::Rtc => 0,
             DevNode::Zero => read_zero(user_buf),
             DevNode::Tty | DevNode::TtyS0 => read_console(user_buf),
         }
@@ -325,7 +401,7 @@ impl File for DevFsFile {
 
     fn write(&self, user_buf: UserBuffer) -> usize {
         match self.node {
-            DevNode::Root | DevNode::Rtc => 0,
+            DevNode::Root | DevNode::Misc | DevNode::Rtc => 0,
             DevNode::Null | DevNode::Zero => user_buf.len(),
             DevNode::Tty | DevNode::TtyS0 => write_console(user_buf),
         }
@@ -369,11 +445,9 @@ impl File for DevFsFile {
     }
 
     fn read_dirent64(&self, user_buf: UserBuffer) -> FsResult<isize> {
-        if self.node != DevNode::Root {
-            return Err(FsError::NotDir);
-        }
+        let entries = dir_entries(self.node).ok_or(FsError::NotDir)?;
         let mut offset = self.offset.exclusive_access();
-        copy_dirents(&mut *offset, user_buf)
+        copy_dirents(entries, &mut *offset, user_buf)
     }
 
     fn is_tty(&self) -> bool {
@@ -385,6 +459,10 @@ impl File for DevFsFile {
     }
 
     fn is_devfs_dir(&self) -> bool {
-        self.node == DevNode::Root
+        matches!(self.node, DevNode::Root | DevNode::Misc)
+    }
+
+    fn is_devfs_misc_dir(&self) -> bool {
+        self.node == DevNode::Misc
     }
 }

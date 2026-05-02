@@ -162,6 +162,9 @@ pub trait File: Send + Sync {
     fn is_devfs_dir(&self) -> bool {
         false
     }
+    fn is_devfs_misc_dir(&self) -> bool {
+        false
+    }
 }
 
 pub fn init() {
@@ -177,7 +180,10 @@ pub fn list_apps() {
     println!("**************/")
 }
 
-pub(crate) use devfs::{open_child as open_devfs_child, stat_child as stat_devfs_child};
+pub(crate) use devfs::{
+    open_child as open_devfs_child, open_misc_child as open_devfs_misc_child,
+    stat_child as stat_devfs_child, stat_misc_child as stat_devfs_misc_child,
+};
 pub use inode::OpenFlags;
 pub(crate) use inode::{
     link_file_at, lookup_mount_target_dir_at, mkdir_at, rename_at, rmdir_at, symlink_at,
