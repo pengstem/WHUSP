@@ -58,20 +58,16 @@ impl FutexManager {
     }
 
     fn remove_waiter(&mut self, key: FutexKey, task: &Arc<TaskControlBlock>) -> bool {
-        let Some(queue) = self.waiters.get_mut(&key) else {
-            return false;
+        let removed = {
+            let Some(queue) = self.waiters.get_mut(&key) else {
+                return false;
+            };
+            let old_len = queue.len();
+            queue.retain(|waiter| !Arc::ptr_eq(&waiter.task, task));
+            old_len != queue.len()
         };
-        let Some(index) = queue
-            .iter()
-            .position(|waiter| Arc::ptr_eq(&waiter.task, task))
-        else {
-            return false;
-        };
-        queue.remove(index);
-        if queue.is_empty() {
-            self.waiters.remove(&key);
-        }
-        true
+        self.remove_empty_queue(key);
+        removed
     }
 
     fn wake(&mut self, key: FutexKey, limit: usize, bitset: u32) -> Vec<Arc<TaskControlBlock>> {
@@ -79,21 +75,19 @@ impl FutexManager {
             return Vec::new();
         };
         let mut tasks = Vec::new();
-        let mut index = 0;
-        while index < queue.len() && tasks.len() < limit {
-            let waiter = &queue[index];
-            if waiter.bitset & bitset == 0
-                || waiter.task.inner_exclusive_access().task_status != TaskStatus::Blocked
-            {
-                index += 1;
+        let mut kept = VecDeque::new();
+        while let Some(waiter) = queue.pop_front() {
+            if !waiter.is_blocked() {
                 continue;
             }
-            let waiter = queue.remove(index).unwrap();
-            tasks.push(waiter.task);
+            if waiter.bitset & bitset != 0 && tasks.len() < limit {
+                tasks.push(waiter.task);
+            } else {
+                kept.push_back(waiter);
+            }
         }
-        if queue.is_empty() {
-            self.waiters.remove(&key);
-        }
+        *queue = kept;
+        self.remove_empty_queue(key);
         tasks
     }
 
@@ -108,33 +102,56 @@ impl FutexManager {
             return (Vec::new(), 0);
         };
         let mut tasks = Vec::new();
-        let mut moved = Vec::new();
-        let mut index = 0;
-        while index < queue.len() && (tasks.len() < wake_limit || moved.len() < requeue_limit) {
-            if tasks.len() < wake_limit {
-                let waiter = &queue[index];
-                if waiter.task.inner_exclusive_access().task_status == TaskStatus::Blocked {
-                    let waiter = queue.remove(index).unwrap();
-                    tasks.push(waiter.task);
-                    continue;
-                }
-            } else {
-                let waiter = &queue[index];
-                if waiter.task.inner_exclusive_access().task_status == TaskStatus::Blocked {
-                    moved.push(queue.remove(index).unwrap());
-                    continue;
-                }
+        let mut moved = VecDeque::new();
+        let mut kept = VecDeque::new();
+        while let Some(waiter) = queue.pop_front() {
+            if !waiter.is_blocked() {
+                continue;
             }
-            index += 1;
+            if tasks.len() < wake_limit {
+                tasks.push(waiter.task);
+            } else if moved.len() < requeue_limit {
+                moved.push_back(waiter);
+            } else {
+                kept.push_back(waiter);
+            }
         }
-        if queue.is_empty() {
-            self.waiters.remove(&source);
-        }
+        *queue = kept;
+        self.remove_empty_queue(source);
         let moved_len = moved.len();
         if moved_len > 0 {
             self.waiters.entry(target).or_default().extend(moved);
         }
         (tasks, moved_len)
+    }
+
+    fn remove_process(&mut self, process_id: usize) {
+        self.waiters.retain(|key, queue| {
+            if key.process_id == process_id {
+                return false;
+            }
+            queue.retain(|waiter| {
+                waiter.is_blocked()
+                    && waiter
+                        .task
+                        .process
+                        .upgrade()
+                        .is_some_and(|process| process.getpid() != process_id)
+            });
+            !queue.is_empty()
+        });
+    }
+
+    fn remove_empty_queue(&mut self, key: FutexKey) {
+        if matches!(self.waiters.get(&key), Some(queue) if queue.is_empty()) {
+            self.waiters.remove(&key);
+        }
+    }
+}
+
+impl FutexWaiter {
+    fn is_blocked(&self) -> bool {
+        self.task.inner_exclusive_access().task_status == TaskStatus::Blocked
     }
 }
 
@@ -244,11 +261,14 @@ fn read_futex_word(addr: usize) -> SysResult<u32> {
     read_user_value(current_user_token(), addr as *const u32)
 }
 
-fn futex_timeout_relative(timeout: *const LinuxTimeSpec) -> SysResult<Option<usize>> {
+pub(crate) fn relative_timeout_deadline_ms(
+    token: usize,
+    timeout: *const LinuxTimeSpec,
+) -> SysResult<Option<usize>> {
     if timeout.is_null() {
         return Ok(None);
     }
-    let request = validate_timespec(read_user_value(current_user_token(), timeout)?)?;
+    let request = validate_timespec(read_user_value(token, timeout)?)?;
     let duration_ms = timespec_to_ms_ceil(request)?;
     Ok(Some(
         get_time_ms()
@@ -286,20 +306,16 @@ fn futex_wait(
     bitset: u32,
 ) -> SysResult {
     let key = futex_key(addr, private);
+    let timeout_expired = matches!(timeout_ms, Some(deadline_ms) if deadline_ms <= get_time_ms());
     let task = current_task().unwrap();
-    if let Some(deadline_ms) = timeout_ms
-        && deadline_ms <= get_time_ms()
-    {
-        if read_futex_word(addr)? != expected {
-            return Err(SysError::EAGAIN);
-        }
-        return Err(SysError::ETIMEDOUT);
-    }
 
     let task_cx_ptr = {
         let mut manager = FUTEX_MANAGER.exclusive_access();
         if read_futex_word(addr)? != expected {
             return Err(SysError::EAGAIN);
+        }
+        if timeout_expired {
+            return Err(SysError::ETIMEDOUT);
         }
         let (blocked_task, task_cx_ptr) = block_current_task_no_schedule();
         manager
@@ -327,9 +343,11 @@ fn futex_wait(
 fn futex_wake(addr: usize, private: bool, limit: usize, bitset: u32) -> usize {
     let key = futex_key(addr, private);
     let tasks = FUTEX_MANAGER.exclusive_access().wake(key, limit, bitset);
-    let count = tasks.len();
+    let mut count = 0;
     for task in tasks {
-        wakeup_task(task);
+        if wakeup_task(task) {
+            count += 1;
+        }
     }
     count
 }
@@ -351,11 +369,24 @@ fn futex_requeue(
         FUTEX_MANAGER
             .exclusive_access()
             .requeue(source, target, wake_limit, requeue_limit);
-    let count = tasks.len() + moved;
+    let mut count = moved;
     for task in tasks {
-        wakeup_task(task);
+        if wakeup_task(task) {
+            count += 1;
+        }
     }
     Ok(count)
+}
+
+pub(crate) fn remove_process_futex_waiters(process_id: usize) {
+    FUTEX_MANAGER.exclusive_access().remove_process(process_id);
+}
+
+fn futex_count(raw: usize) -> SysResult<usize> {
+    if raw > i32::MAX as usize {
+        return Err(SysError::EINVAL);
+    }
+    Ok(raw)
 }
 
 pub(crate) fn validate_timespec(time: LinuxTimeSpec) -> SysResult<LinuxTimeSpec> {
@@ -448,6 +479,9 @@ pub fn sys_futex(
     }
 
     let command = futex_op & FUTEX_CMD_MASK;
+    if matches!(command, FUTEX_WAIT_BITSET | FUTEX_WAKE_BITSET) && val3 == 0 {
+        return Err(SysError::EINVAL);
+    }
     let private = futex_op & FUTEX_PRIVATE_FLAG != 0;
     let clock_backend = if futex_op & FUTEX_CLOCK_REALTIME != 0 {
         ClockBackend::Wall
@@ -460,36 +494,42 @@ pub fn sys_futex(
             addr,
             private,
             val,
-            futex_timeout_relative(timeout)?,
+            relative_timeout_deadline_ms(current_user_token(), timeout)?,
             FUTEX_BITSET_MATCH_ANY,
         ),
-        FUTEX_WAIT_BITSET => {
-            if val3 == 0 {
-                return Err(SysError::EINVAL);
-            }
-            futex_wait(
-                addr,
-                private,
-                val,
-                futex_timeout_absolute(timeout, clock_backend)?,
-                val3,
-            )
-        }
-        FUTEX_WAKE => Ok(futex_wake(addr, private, val as usize, FUTEX_BITSET_MATCH_ANY) as isize),
+        FUTEX_WAIT_BITSET => futex_wait(
+            addr,
+            private,
+            val,
+            futex_timeout_absolute(timeout, clock_backend)?,
+            val3,
+        ),
+        FUTEX_WAKE => Ok(futex_wake(
+            addr,
+            private,
+            futex_count(val as usize)?,
+            FUTEX_BITSET_MATCH_ANY,
+        ) as isize),
         FUTEX_WAKE_BITSET => {
-            if val3 == 0 {
-                return Err(SysError::EINVAL);
-            }
-            Ok(futex_wake(addr, private, val as usize, val3) as isize)
+            Ok(futex_wake(addr, private, futex_count(val as usize)?, val3) as isize)
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             let addr2 = uaddr2 as usize;
-            let requeue_limit = timeout as usize;
+            // CONTEXT: FUTEX_REQUEUE/CMP_REQUEUE use the fourth syscall
+            // register as val2, but syscall dispatch has already cast that
+            // register to this pointer-typed timeout parameter.
+            let requeue_limit = futex_count(timeout as usize)?;
             if command == FUTEX_CMP_REQUEUE && read_futex_word(addr)? != val3 {
                 return Err(SysError::EAGAIN);
             }
-            futex_requeue(addr, private, val as usize, requeue_limit, addr2)
-                .map(|count| count as isize)
+            futex_requeue(
+                addr,
+                private,
+                futex_count(val as usize)?,
+                requeue_limit,
+                addr2,
+            )
+            .map(|count| count as isize)
         }
         // UNFINISHED: PI futexes, FUTEX_WAKE_OP, and futex_waitv are not
         // implemented. The libctest pthread and loader paths need the classic

@@ -4,22 +4,10 @@ use crate::timer::get_time_ms;
 use super::errno::{SysError, SysResult};
 use super::fs::LinuxTimeSpec;
 use super::fs::user_ptr::{read_user_value, write_user_value};
-use super::sync::{timespec_to_ms_ceil, validate_timespec};
+use super::sync::relative_timeout_deadline_ms;
 use super::wait::LinuxSigInfo;
 
 const LINUX_RT_SIGSET_SIZE: usize = 8;
-
-fn timeout_deadline_ms(token: usize, timeout: *const LinuxTimeSpec) -> SysResult<Option<usize>> {
-    if timeout.is_null() {
-        return Ok(None);
-    }
-    let timeout = validate_timespec(read_user_value(token, timeout)?)?;
-    let timeout_ms = timespec_to_ms_ceil(timeout)?;
-    let deadline_ms = get_time_ms()
-        .checked_add(timeout_ms)
-        .ok_or(SysError::EINVAL)?;
-    Ok(Some(deadline_ms))
-}
 
 fn linux_sigset_to_flags(raw: u64) -> SignalFlags {
     SignalFlags::from_bits_truncate((raw as u32) << 1)
@@ -100,7 +88,7 @@ pub fn sys_rt_sigtimedwait(
 ) -> SysResult {
     let token = current_user_token();
     let wanted = read_signal_set(token, set, sigsetsize)?;
-    let deadline_ms = timeout_deadline_ms(token, timeout)?;
+    let deadline_ms = relative_timeout_deadline_ms(token, timeout)?;
 
     loop {
         if let Some(signum) = try_return_pending_signal(token, wanted, info)? {

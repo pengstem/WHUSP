@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
-use super::super::sync::{timespec_to_ms_ceil, validate_timespec};
+use super::super::sync::relative_timeout_deadline_ms;
 use super::fd::get_file_by_fd;
 use super::uapi::{LinuxPollFd, LinuxTimeSpec, PPOLL_MAX_NFDS};
 use super::user_ptr::{read_user_value, write_user_value};
@@ -63,18 +63,6 @@ fn poll_events_to_user(events: PollEvents) -> i16 {
     events.bits() as i16
 }
 
-fn timeout_deadline_ms(token: usize, timeout: *const LinuxTimeSpec) -> SysResult<Option<usize>> {
-    if timeout.is_null() {
-        return Ok(None);
-    }
-    let timeout = validate_timespec(read_user_value(token, timeout)?)?;
-    let timeout_ms = timespec_to_ms_ceil(timeout)?;
-    let deadline_ms = get_time_ms()
-        .checked_add(timeout_ms)
-        .ok_or(SysError::EINVAL)?;
-    Ok(Some(deadline_ms))
-}
-
 fn scan_pollfds(pollfds: &mut [LinuxPollFd]) -> usize {
     let mut ready = 0usize;
     for pollfd in pollfds.iter_mut() {
@@ -119,7 +107,7 @@ pub fn sys_ppoll(
 
     let token = current_user_token();
     let mut pollfds = read_user_pollfds(token, fds.cast_const(), nfds)?;
-    let deadline_ms = timeout_deadline_ms(token, timeout)?;
+    let deadline_ms = relative_timeout_deadline_ms(token, timeout)?;
 
     loop {
         let ready = scan_pollfds(&mut pollfds);

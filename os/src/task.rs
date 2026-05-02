@@ -143,6 +143,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
                 shutdown(false);
             }
         }
+        crate::syscall::remove_process_futex_waiters(pid);
         remove_from_pid2process(pid);
         let mut process_inner = process.inner_exclusive_access();
         // mark this process as a zombie process

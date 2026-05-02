@@ -74,6 +74,8 @@ use signal::*;
 use sync::*;
 use wait::*;
 
+pub(crate) use sync::remove_process_futex_waiters;
+
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     if syscall_id == SYSCALL_EXIT {
         sys_exit(args[0] as i32);

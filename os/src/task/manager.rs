@@ -35,12 +35,15 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
     TASK_MANAGER.exclusive_access().add(task);
 }
 
-pub fn wakeup_task(task: Arc<TaskControlBlock>) {
+pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
     let mut task_inner = task.inner_exclusive_access();
     if task_inner.task_status == TaskStatus::Blocked {
         task_inner.task_status = TaskStatus::Ready;
         drop(task_inner);
         add_task(task);
+        true
+    } else {
+        false
     }
 }
 
