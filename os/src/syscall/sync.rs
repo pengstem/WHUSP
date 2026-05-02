@@ -1,9 +1,16 @@
-use crate::task::{block_current_and_run_next, current_task, current_user_token};
+use crate::task::{
+    TaskControlBlock, TaskStatus, block_current_and_run_next, block_current_task_no_schedule,
+    current_process, current_task, current_user_token, schedule, wakeup_task,
+};
 use crate::timer::{add_timer, get_time_ms, monotonic_time_nanos, wall_time_nanos};
 
 use super::errno::{SysError, SysResult};
 use super::fs::LinuxTimeSpec;
 use super::fs::user_ptr::{read_user_value, write_user_value};
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use lazy_static::*;
 
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
@@ -16,6 +23,125 @@ const CLOCK_BOOTTIME: i32 = 7;
 const TIMER_ABSTIME: u32 = 1;
 pub(crate) const NSEC_PER_SEC: isize = 1_000_000_000;
 pub(crate) const NSEC_PER_MSEC: usize = 1_000_000;
+
+const FUTEX_WAIT: u32 = 0;
+const FUTEX_WAKE: u32 = 1;
+const FUTEX_REQUEUE: u32 = 3;
+const FUTEX_CMP_REQUEUE: u32 = 4;
+const FUTEX_WAIT_BITSET: u32 = 9;
+const FUTEX_WAKE_BITSET: u32 = 10;
+const FUTEX_CMD_MASK: u32 = 0x7f;
+const FUTEX_PRIVATE_FLAG: u32 = 0x80;
+const FUTEX_CLOCK_REALTIME: u32 = 0x100;
+const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FutexKey {
+    process_id: usize,
+    addr: usize,
+}
+
+struct FutexWaiter {
+    task: Arc<TaskControlBlock>,
+    bitset: u32,
+}
+
+struct FutexManager {
+    waiters: BTreeMap<FutexKey, VecDeque<FutexWaiter>>,
+}
+
+impl FutexManager {
+    fn new() -> Self {
+        Self {
+            waiters: BTreeMap::new(),
+        }
+    }
+
+    fn remove_waiter(&mut self, key: FutexKey, task: &Arc<TaskControlBlock>) -> bool {
+        let Some(queue) = self.waiters.get_mut(&key) else {
+            return false;
+        };
+        let Some(index) = queue
+            .iter()
+            .position(|waiter| Arc::ptr_eq(&waiter.task, task))
+        else {
+            return false;
+        };
+        queue.remove(index);
+        if queue.is_empty() {
+            self.waiters.remove(&key);
+        }
+        true
+    }
+
+    fn wake(&mut self, key: FutexKey, limit: usize, bitset: u32) -> Vec<Arc<TaskControlBlock>> {
+        let Some(queue) = self.waiters.get_mut(&key) else {
+            return Vec::new();
+        };
+        let mut tasks = Vec::new();
+        let mut index = 0;
+        while index < queue.len() && tasks.len() < limit {
+            let waiter = &queue[index];
+            if waiter.bitset & bitset == 0
+                || waiter.task.inner_exclusive_access().task_status != TaskStatus::Blocked
+            {
+                index += 1;
+                continue;
+            }
+            let waiter = queue.remove(index).unwrap();
+            tasks.push(waiter.task);
+        }
+        if queue.is_empty() {
+            self.waiters.remove(&key);
+        }
+        tasks
+    }
+
+    fn requeue(
+        &mut self,
+        source: FutexKey,
+        target: FutexKey,
+        wake_limit: usize,
+        requeue_limit: usize,
+    ) -> (Vec<Arc<TaskControlBlock>>, usize) {
+        let Some(queue) = self.waiters.get_mut(&source) else {
+            return (Vec::new(), 0);
+        };
+        let mut tasks = Vec::new();
+        let mut moved = Vec::new();
+        let mut index = 0;
+        while index < queue.len() && (tasks.len() < wake_limit || moved.len() < requeue_limit) {
+            if tasks.len() < wake_limit {
+                let waiter = &queue[index];
+                if waiter.task.inner_exclusive_access().task_status == TaskStatus::Blocked {
+                    let waiter = queue.remove(index).unwrap();
+                    tasks.push(waiter.task);
+                    continue;
+                }
+            } else {
+                let waiter = &queue[index];
+                if waiter.task.inner_exclusive_access().task_status == TaskStatus::Blocked {
+                    moved.push(queue.remove(index).unwrap());
+                    continue;
+                }
+            }
+            index += 1;
+        }
+        if queue.is_empty() {
+            self.waiters.remove(&source);
+        }
+        let moved_len = moved.len();
+        if moved_len > 0 {
+            self.waiters.entry(target).or_default().extend(moved);
+        }
+        (tasks, moved_len)
+    }
+}
+
+lazy_static! {
+    static ref FUTEX_MANAGER: crate::sync::UPIntrFreeCell<FutexManager> =
+        unsafe { crate::sync::UPIntrFreeCell::new(FutexManager::new()) };
+}
 
 #[derive(Clone, Copy)]
 enum ClockBackend {
@@ -88,6 +214,148 @@ fn current_clock_nanos(backend: ClockBackend) -> u64 {
         ClockBackend::Wall => wall_time_nanos(),
         ClockBackend::Monotonic => monotonic_time_nanos(),
     }
+}
+
+fn futex_key(addr: usize, private: bool) -> FutexKey {
+    // UNFINISHED: Shared futex keys should be derived from the backing physical
+    // object so unrelated processes can synchronize through shared mappings.
+    // libctest and musl pthread paths exercised here use process-private
+    // futexes, so virtual-address keys are sufficient for this compatibility
+    // subset.
+    FutexKey {
+        process_id: if private {
+            current_process().getpid()
+        } else {
+            0
+        },
+        addr,
+    }
+}
+
+fn validate_futex_addr(addr: usize) -> SysResult {
+    if addr % core::mem::size_of::<u32>() != 0 {
+        return Err(SysError::EINVAL);
+    }
+    Ok(0)
+}
+
+fn read_futex_word(addr: usize) -> SysResult<u32> {
+    validate_futex_addr(addr)?;
+    read_user_value(current_user_token(), addr as *const u32)
+}
+
+fn futex_timeout_relative(timeout: *const LinuxTimeSpec) -> SysResult<Option<usize>> {
+    if timeout.is_null() {
+        return Ok(None);
+    }
+    let request = validate_timespec(read_user_value(current_user_token(), timeout)?)?;
+    let duration_ms = timespec_to_ms_ceil(request)?;
+    Ok(Some(
+        get_time_ms()
+            .checked_add(duration_ms)
+            .ok_or(SysError::EINVAL)?,
+    ))
+}
+
+fn futex_timeout_absolute(
+    timeout: *const LinuxTimeSpec,
+    backend: ClockBackend,
+) -> SysResult<Option<usize>> {
+    if timeout.is_null() {
+        return Ok(None);
+    }
+    let request = validate_timespec(read_user_value(current_user_token(), timeout)?)?;
+    let deadline_nanos = timespec_to_nanos(request)?;
+    let now_nanos = current_clock_nanos(backend);
+    if deadline_nanos <= now_nanos {
+        return Ok(Some(get_time_ms()));
+    }
+    let duration_ms = nanos_to_ms_ceil(deadline_nanos - now_nanos)?;
+    Ok(Some(
+        get_time_ms()
+            .checked_add(duration_ms)
+            .ok_or(SysError::EINVAL)?,
+    ))
+}
+
+fn futex_wait(
+    addr: usize,
+    private: bool,
+    expected: u32,
+    timeout_ms: Option<usize>,
+    bitset: u32,
+) -> SysResult {
+    let key = futex_key(addr, private);
+    let task = current_task().unwrap();
+    if let Some(deadline_ms) = timeout_ms
+        && deadline_ms <= get_time_ms()
+    {
+        if read_futex_word(addr)? != expected {
+            return Err(SysError::EAGAIN);
+        }
+        return Err(SysError::ETIMEDOUT);
+    }
+
+    let task_cx_ptr = {
+        let mut manager = FUTEX_MANAGER.exclusive_access();
+        if read_futex_word(addr)? != expected {
+            return Err(SysError::EAGAIN);
+        }
+        let (blocked_task, task_cx_ptr) = block_current_task_no_schedule();
+        manager
+            .waiters
+            .entry(key)
+            .or_default()
+            .push_back(FutexWaiter {
+                task: blocked_task,
+                bitset,
+            });
+        task_cx_ptr
+    };
+
+    if let Some(deadline_ms) = timeout_ms {
+        add_timer(deadline_ms, Arc::clone(&task));
+    }
+    schedule(task_cx_ptr);
+
+    if timeout_ms.is_some() && FUTEX_MANAGER.exclusive_access().remove_waiter(key, &task) {
+        return Err(SysError::ETIMEDOUT);
+    }
+    Ok(0)
+}
+
+fn futex_wake(addr: usize, private: bool, limit: usize, bitset: u32) -> usize {
+    let key = futex_key(addr, private);
+    let tasks = FUTEX_MANAGER.exclusive_access().wake(key, limit, bitset);
+    let count = tasks.len();
+    for task in tasks {
+        wakeup_task(task);
+    }
+    count
+}
+
+fn futex_requeue(
+    addr: usize,
+    private: bool,
+    wake_limit: usize,
+    requeue_limit: usize,
+    addr2: usize,
+) -> SysResult<usize> {
+    validate_futex_addr(addr2)?;
+    let source = futex_key(addr, private);
+    let target = futex_key(addr2, private);
+    if source == target {
+        return Err(SysError::EINVAL);
+    }
+    let (tasks, moved) =
+        FUTEX_MANAGER
+            .exclusive_access()
+            .requeue(source, target, wake_limit, requeue_limit);
+    let count = tasks.len() + moved;
+    for task in tasks {
+        wakeup_task(task);
+    }
+    Ok(count)
 }
 
 pub(crate) fn validate_timespec(time: LinuxTimeSpec) -> SysResult<LinuxTimeSpec> {
@@ -163,6 +431,71 @@ pub fn sys_nanosleep(req: *const LinuxTimeSpec, _rem: *mut LinuxTimeSpec) -> Sys
     // to rem when interrupted by a handled signal. This kernel currently lacks
     // non-fatal signal delivery and signal-driven wakeups for sleeping tasks.
     sleep_for_ms(timespec_to_ms_ceil(request)?)
+}
+
+pub fn sys_futex(
+    uaddr: *mut u32,
+    futex_op: u32,
+    val: u32,
+    timeout: *const LinuxTimeSpec,
+    uaddr2: *mut u32,
+    val3: u32,
+) -> SysResult {
+    let addr = uaddr as usize;
+    validate_futex_addr(addr)?;
+    if futex_op & !(FUTEX_CMD_MASK | FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME) != 0 {
+        return Err(SysError::EINVAL);
+    }
+
+    let command = futex_op & FUTEX_CMD_MASK;
+    let private = futex_op & FUTEX_PRIVATE_FLAG != 0;
+    let clock_backend = if futex_op & FUTEX_CLOCK_REALTIME != 0 {
+        ClockBackend::Wall
+    } else {
+        ClockBackend::Monotonic
+    };
+
+    match command {
+        FUTEX_WAIT => futex_wait(
+            addr,
+            private,
+            val,
+            futex_timeout_relative(timeout)?,
+            FUTEX_BITSET_MATCH_ANY,
+        ),
+        FUTEX_WAIT_BITSET => {
+            if val3 == 0 {
+                return Err(SysError::EINVAL);
+            }
+            futex_wait(
+                addr,
+                private,
+                val,
+                futex_timeout_absolute(timeout, clock_backend)?,
+                val3,
+            )
+        }
+        FUTEX_WAKE => Ok(futex_wake(addr, private, val as usize, FUTEX_BITSET_MATCH_ANY) as isize),
+        FUTEX_WAKE_BITSET => {
+            if val3 == 0 {
+                return Err(SysError::EINVAL);
+            }
+            Ok(futex_wake(addr, private, val as usize, val3) as isize)
+        }
+        FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
+            let addr2 = uaddr2 as usize;
+            let requeue_limit = timeout as usize;
+            if command == FUTEX_CMP_REQUEUE && read_futex_word(addr)? != val3 {
+                return Err(SysError::EAGAIN);
+            }
+            futex_requeue(addr, private, val as usize, requeue_limit, addr2)
+                .map(|count| count as isize)
+        }
+        // UNFINISHED: PI futexes, FUTEX_WAKE_OP, and futex_waitv are not
+        // implemented. The libctest pthread and loader paths need the classic
+        // wait/wake and requeue subset above.
+        _ => Err(SysError::ENOSYS),
+    }
 }
 
 fn nanos_to_timespec(nanos: u64) -> LinuxTimeSpec {

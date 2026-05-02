@@ -37,9 +37,11 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
 
 pub fn wakeup_task(task: Arc<TaskControlBlock>) {
     let mut task_inner = task.inner_exclusive_access();
-    task_inner.task_status = TaskStatus::Ready;
-    drop(task_inner);
-    add_task(task);
+    if task_inner.task_status == TaskStatus::Blocked {
+        task_inner.task_status = TaskStatus::Ready;
+        drop(task_inner);
+        add_task(task);
+    }
 }
 
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
