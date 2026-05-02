@@ -599,7 +599,7 @@ pub(crate) struct TmpFs {
 
 ## 基础设施与研究记录
 
-- [x] 建立官方 QEMU 启动命令的本地复现脚本，CI `ci-riscv-smoke.yml` 覆盖。
+- [x] 建立官方 QEMU 启动命令的本地复现脚本，CI `ci-riscv-smoke.yml` 只做 smoke：确认 initproc 启动并看到 `basic-musl` 的 START/END marker。
 - [x] 建立官方容器里的 smoke test 脚本。
 - [x] 建立 basic 用例到 syscall 的逐项对照表：`develop-guide/linux-syscall-implementation-survey.md`。
 - [x] 对比 `RustOsWhu` / `NighthawkOS` 的提交路径并提炼可复用做法：`develop-guide/reference-project-notes.md`。
