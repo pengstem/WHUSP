@@ -1,5 +1,6 @@
 use crate::fs::{File, OpenFlags, open_file_at};
 use crate::mm::{translated_ref, translated_refmut, translated_str};
+use crate::sbi::shutdown;
 use crate::task::{
     CloneArgs, CloneFlags, ProcessCpuTimesSnapshot, RLimit, RLimitResource, SignalFlags,
     SignalInfo, add_task, clone_current_thread, current_process, current_task, current_user_token,
@@ -18,6 +19,16 @@ const ELF_MAGIC: &[u8] = b"\x7fELF";
 const SHEBANG_MAGIC: &[u8] = b"#!";
 const SHEBANG_RECURSION_LIMIT: usize = 4;
 const UTS_FIELD_LEN: usize = 65;
+const LINUX_REBOOT_MAGIC1: u32 = 0xfee1_dead;
+const LINUX_REBOOT_MAGIC2: u32 = 0x2812_1969;
+const LINUX_REBOOT_MAGIC2A: u32 = 0x0512_1996;
+const LINUX_REBOOT_MAGIC2B: u32 = 0x1604_1998;
+const LINUX_REBOOT_MAGIC2C: u32 = 0x2011_2000;
+const LINUX_REBOOT_CMD_RESTART: u32 = 0x0123_4567;
+const LINUX_REBOOT_CMD_HALT: u32 = 0xcdef_0123;
+const LINUX_REBOOT_CMD_CAD_ON: u32 = 0x89ab_cdef;
+const LINUX_REBOOT_CMD_CAD_OFF: u32 = 0x0000_0000;
+const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321_fedc;
 
 struct ScriptInterpreter {
     path: String,
@@ -120,6 +131,44 @@ pub fn sys_exit_group(exit_code: i32) -> ! {
 pub fn sys_sched_yield() -> isize {
     suspend_current_and_run_next();
     0
+}
+
+fn has_linux_reboot_magic(magic: u32, magic2: u32) -> bool {
+    magic == LINUX_REBOOT_MAGIC1
+        && matches!(
+            magic2,
+            LINUX_REBOOT_MAGIC2
+                | LINUX_REBOOT_MAGIC2A
+                | LINUX_REBOOT_MAGIC2B
+                | LINUX_REBOOT_MAGIC2C
+        )
+}
+
+pub fn sys_reboot(magic: usize, magic2: usize, op: usize, _arg: usize) -> SysResult {
+    let magic = magic as u32;
+    let magic2 = magic2 as u32;
+    let op = op as u32;
+    if !has_linux_reboot_magic(magic, magic2) {
+        return Err(SysError::EINVAL);
+    }
+
+    // UNFINISHED: Linux requires CAP_SYS_BOOT in the caller's user namespace
+    // and returns EPERM for unprivileged callers. This kernel has no real
+    // credential or capability model yet and runs contest user tasks as root.
+    match op {
+        LINUX_REBOOT_CMD_CAD_OFF | LINUX_REBOOT_CMD_CAD_ON => Ok(0),
+        LINUX_REBOOT_CMD_HALT | LINUX_REBOOT_CMD_POWER_OFF | LINUX_REBOOT_CMD_RESTART => {
+            // UNFINISHED: RESTART should reset and reboot the machine. The
+            // current arch layer exposes only a shutdown/poweroff primitive,
+            // which is the contest-critical behavior under QEMU -no-reboot.
+            // CONTEXT: Linux leaves filesystem syncing to callers before
+            // reboot(2), so this path does not add an implicit sync.
+            shutdown(false)
+        }
+        // UNFINISHED: RESTART2, KEXEC, and SW_SUSPEND require reboot strings,
+        // kernel-image handoff, or suspend support that this kernel lacks.
+        _ => Err(SysError::EINVAL),
+    }
 }
 
 pub fn sys_gettimeofday(tv: *mut LinuxTimeVal, tz: *mut LinuxTimezone) -> SysResult {

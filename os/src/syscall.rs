@@ -37,6 +37,7 @@ const SYSCALL_SYSLOG: usize = 116;
 const SYSCALL_SCHED_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
 const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
+const SYSCALL_REBOOT: usize = 142;
 const SYSCALL_TIMES: usize = 153;
 const SYSCALL_UNAME: usize = 160;
 const SYSCALL_GETRLIMIT: usize = 163;
@@ -196,6 +197,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *const LinuxTimeSpec,
             args[3],
         ),
+        SYSCALL_REBOOT => sys_reboot(args[0], args[1], args[2], args[3]),
         SYSCALL_TIMES => sys_times(args[0] as *mut LinuxTms),
         SYSCALL_UNAME => sys_uname(args[0] as *mut LinuxUtsName),
         SYSCALL_GETRLIMIT => sys_getrlimit(args[0] as i32, args[1] as *mut RLimit),
