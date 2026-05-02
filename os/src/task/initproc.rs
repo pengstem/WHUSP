@@ -1,18 +1,44 @@
 use crate::fs::{OpenFlags, open_file};
 use alloc::{string::String, vec, vec::Vec};
+use core::fmt::Write;
 
 const BUSYBOX_PATH: &str = "/musl/busybox";
 const BUSYBOX_APPLET: &str = "sh";
-#[allow(unused)]
 const BUSYBOX_COMMAND_FLAG: &str = "-c";
-#[allow(unused)]
-const BASIC_MUSL_RUNNER: &str = "cd /musl && ./busybox sh ./basic_testcode.sh";
+const TEST_LIBCS: &[&str] = &["/musl", "/glibc"];
+const TEST_SCRIPTS: &[&str] = &[
+    "basic_testcode.sh",
+    "busybox_testcode.sh",
+    "lua_testcode.sh",
+    "libctest_testcode.sh",
+    "iozone_testcode.sh",
+    "unixbench_testcode.sh",
+    "iperf_testcode.sh",
+    "libcbench_testcode.sh",
+    "lmbench_testcode.sh",
+    "netperf_testcode.sh",
+    "cyclictest_testcode.sh",
+    "ltp_testcode.sh",
+];
 
 pub(super) struct KernelInitProc {
     pub(super) path: String,
     pub(super) data: Vec<u8>,
     pub(super) argv: Vec<String>,
     pub(super) envp: Vec<String>,
+}
+
+fn build_runner_command() -> String {
+    let mut command =
+        String::from("/musl/busybox mkdir -p /bin && /musl/busybox --install -s /bin");
+
+    for script in TEST_SCRIPTS {
+        for libc_root in TEST_LIBCS {
+            let _ = write!(command, "; (cd {libc_root} && ./busybox sh ./{script})");
+        }
+    }
+
+    command
 }
 
 pub(super) fn load() -> Option<KernelInitProc> {
@@ -22,9 +48,9 @@ pub(super) fn load() -> Option<KernelInitProc> {
         data: inode.read_all(),
         argv: vec![
             BUSYBOX_PATH.into(),
-            "sh".into(),
-            "-c".into(),
-            "/musl/busybox mkdir -p /bin && /musl/busybox --install -s /bin && exec /musl/busybox sh".into(),
+            BUSYBOX_APPLET.into(),
+            BUSYBOX_COMMAND_FLAG.into(),
+            build_runner_command(),
         ],
         envp: vec!["PATH=/:/bin:/sbin:/usr/bin:/usr/local/bin".into()],
     })
