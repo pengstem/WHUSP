@@ -29,6 +29,7 @@ pub(crate) use fd::{FD_LIMIT, FdFlags, FdTableEntry};
 pub use id::{IDLE_PID, KernelStack, PidHandle, kstack_alloc, pid_alloc};
 pub(crate) use manager::any_process_references_mount;
 pub(crate) use manager::list_process_snapshots;
+pub(crate) use manager::remove_ready_tasks_of_process;
 pub use manager::{add_task, pid2process, remove_from_pid2process, wakeup_task};
 pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
@@ -135,8 +136,52 @@ pub(crate) fn reap_exited_tasks() {
     EXITED_TASKS.exclusive_access().clear();
 }
 
-/// Exit the current 'Running' task and run the next task in task list.
-pub fn exit_current_and_run_next(exit_code: i32) {
+fn terminate_sibling_threads(
+    process: &Arc<ProcessControlBlock>,
+    current_tid: usize,
+    process_token: usize,
+    process_id: usize,
+    exit_code: i32,
+) {
+    let mut clear_child_tids = Vec::new();
+    let mut recycle_res = Vec::<TaskUserRes>::new();
+    let mut exited_threads = Vec::new();
+    {
+        let mut process_inner = process.inner_exclusive_access();
+        for (tid, task_slot) in process_inner.tasks.iter_mut().enumerate() {
+            if tid == current_tid {
+                continue;
+            }
+            let Some(task) = task_slot.as_ref().map(Arc::clone) else {
+                continue;
+            };
+            let mut task_inner = task.inner_exclusive_access();
+            task_inner.task_status = TaskStatus::Exited;
+            task_inner.exit_code = Some(exit_code);
+            if let Some(clear_child_tid) = task_inner.clear_child_tid.take() {
+                clear_child_tids.push(clear_child_tid);
+            }
+            if let Some(res) = task_inner.res.take() {
+                recycle_res.push(res);
+            }
+            drop(task_inner);
+            if tid != 0 {
+                exited_threads.push(task);
+                *task_slot = None;
+            }
+        }
+    }
+
+    for clear_child_tid in clear_child_tids {
+        crate::syscall::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
+    }
+    recycle_res.clear();
+    for task in exited_threads {
+        queue_exited_task(task);
+    }
+}
+
+fn exit_current(exit_code: i32, group_exit: bool) {
     account_current_system_time();
     let task = take_current_task().unwrap();
     let process = task.process.upgrade().unwrap();
@@ -147,15 +192,14 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     let clear_child_tid = task_inner.clear_child_tid.take();
     // record exit code
     task_inner.exit_code = Some(exit_code);
-    drop(task_inner);
-    if tid != 0 {
-        if let Some(clear_child_tid) = clear_child_tid {
-            crate::syscall::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
-        }
-    }
-    let mut task_inner = task.inner_exclusive_access();
+    task_inner.task_status = TaskStatus::Exited;
     task_inner.res = None;
     drop(task_inner);
+    if let Some(clear_child_tid) = clear_child_tid {
+        crate::syscall::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
+    }
+
+    let process_exit = group_exit || tid == 0;
     let exited_thread = if tid == 0 {
         None
     } else {
@@ -169,9 +213,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         queue_exited_task(task);
     }
     drop(task);
-    // however, if this is the main thread of current process
-    // the process should terminate at once
-    if tid == 0 {
+    if process_exit {
         let pid = process.getpid();
         if pid == IDLE_PID || Arc::ptr_eq(&process, &INITPROC) {
             println!(
@@ -186,6 +228,8 @@ pub fn exit_current_and_run_next(exit_code: i32) {
                 shutdown(false);
             }
         }
+        terminate_sibling_threads(&process, tid, process_token, process_id, exit_code);
+        remove_ready_tasks_of_process(pid);
         crate::syscall::remove_process_futex_waiters(pid);
         remove_from_pid2process(pid);
         let mut process_inner = process.inner_exclusive_access();
@@ -204,22 +248,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             }
         }
 
-        // deallocate user res (including tid/trap_cx/ustack) of all threads
-        // it has to be done before we dealloc the whole memory_set
-        // otherwise they will be deallocated twice
-        let mut recycle_res = Vec::<TaskUserRes>::new();
-        for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
-            let task = task.as_ref().unwrap();
-            let mut task_inner = task.inner_exclusive_access();
-            if let Some(res) = task_inner.res.take() {
-                recycle_res.push(res);
-            }
-        }
-        // dealloc_tid and dealloc_user_res require access to PCB inner, so we
-        // need to collect those user res first, then release process_inner
-        // for now to avoid deadlock/double borrow problem.
         drop(process_inner);
-        recycle_res.clear();
 
         if let Some(parent) = parent {
             let parent_task = {
@@ -250,10 +279,9 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         process_inner.memory_set.recycle_data_pages();
         // drop file descriptors
         process_inner.fd_table.clear();
-        // Remove all tasks except for the main thread itself.
-        // This is because we are still using the kstack under the TCB
-        // of the main thread. This TCB, including its kstack, will be
-        // deallocated when the process is reaped via waitpid.
+        // Keep only the main task in the zombie process for waitpid reaping.
+        // Non-main exiting tasks are parked in EXITED_TASKS until their kernel
+        // stacks are no longer active across the next schedule boundary.
         while process_inner.tasks.len() > 1 {
             process_inner.tasks.pop();
         }
@@ -262,6 +290,15 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     // we do not have to save task context
     let mut _unused = TaskContext::zero_init();
     schedule(&mut _unused as *mut _);
+}
+
+/// Exit the current 'Running' task and run the next task in task list.
+pub fn exit_current_and_run_next(exit_code: i32) {
+    exit_current(exit_code, false);
+}
+
+pub fn exit_current_group_and_run_next(exit_code: i32) {
+    exit_current(exit_code, true);
 }
 
 lazy_static! {

@@ -6,7 +6,7 @@ use crate::syscall::syscall;
 use crate::task::{
     SignalFlags, account_current_system_time_until, account_current_user_time_until,
     check_signals_of_current, current_add_signal, current_process, current_trap_cx,
-    current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
+    current_trap_cx_user_va, current_user_token, exit_current_group_and_run_next,
     mark_current_user_time_entry, suspend_current_and_run_next,
 };
 use crate::timer::{check_timer, get_time_us, set_next_trigger};
@@ -133,7 +133,7 @@ pub fn trap_handler() -> ! {
     // check signals
     if let Some((errno, msg)) = check_signals_of_current() {
         println!("[kernel] {}", msg);
-        exit_current_and_run_next(errno);
+        exit_current_group_and_run_next(errno);
     }
     trap_return();
 }

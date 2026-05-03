@@ -75,7 +75,7 @@ impl LinuxSigInfo {
 
 fn wait_status(exit_code: i32) -> i32 {
     if exit_code < 0 {
-        exit_code
+        (-exit_code) & 0x7f
     } else {
         (exit_code & 0xff) << 8
     }

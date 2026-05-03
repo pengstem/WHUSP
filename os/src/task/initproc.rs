@@ -72,8 +72,11 @@ fn build_runner_command() -> String {
             let _ = write!(command, "; (cd {libc_root} && ./busybox sh ./{script})");
         }
     }
-
-    let _ = write!(command, "; (cd /musl && ./busybox reboot )");
+    if TEST_SCRIPTS.is_empty() {
+        let _ = write!(command, ";(sh)");
+    } else {
+        let _ = write!(command, "; (cd /musl && ./busybox reboot )");
+    }
     command
 }
 

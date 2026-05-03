@@ -20,7 +20,19 @@ impl TaskManager {
         self.ready_queue.push_back(task);
     }
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        while let Some(task) = self.ready_queue.pop_front() {
+            if task.inner_exclusive_access().task_status != TaskStatus::Exited {
+                return Some(task);
+            }
+        }
+        None
+    }
+    pub fn remove_process_tasks(&mut self, process_id: usize) {
+        self.ready_queue.retain(|task| {
+            task.process
+                .upgrade()
+                .is_none_or(|process| process.getpid() != process_id)
+        });
     }
 }
 
@@ -49,6 +61,12 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
 
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     TASK_MANAGER.exclusive_access().fetch()
+}
+
+pub(crate) fn remove_ready_tasks_of_process(process_id: usize) {
+    TASK_MANAGER
+        .exclusive_access()
+        .remove_process_tasks(process_id);
 }
 
 pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {

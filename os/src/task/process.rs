@@ -384,4 +384,13 @@ impl ProcessControlBlock {
     pub fn cpu_times_snapshot(&self) -> ProcessCpuTimesSnapshot {
         self.inner_exclusive_access().cpu_times.snapshot()
     }
+
+    pub(crate) fn tasks_snapshot(&self) -> Vec<Arc<TaskControlBlock>> {
+        self.inner_exclusive_access()
+            .tasks
+            .iter()
+            .flatten()
+            .map(Arc::clone)
+            .collect()
+    }
 }

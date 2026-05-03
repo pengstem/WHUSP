@@ -4,7 +4,8 @@ use crate::sbi::shutdown;
 use crate::task::{
     CloneArgs, CloneFlags, ProcessCpuTimesSnapshot, RLimit, RLimitResource, SignalFlags,
     SignalInfo, add_task, clone_current_thread, current_process, current_task, current_user_token,
-    exit_current_and_run_next, pid2process, suspend_current_and_run_next,
+    exit_current_and_run_next, exit_current_group_and_run_next, pid2process,
+    suspend_current_and_run_next, wakeup_task,
 };
 use crate::timer::{get_time_clock_ticks, us_to_clock_ticks};
 use alloc::string::{String, ToString};
@@ -121,10 +122,7 @@ pub fn sys_exit(exit_code: i32) -> ! {
 }
 
 pub fn sys_exit_group(exit_code: i32) -> ! {
-    // UNFINISHED: Linux exit_group terminates every thread in the current
-    // thread group; this compatibility path currently relies on the existing
-    // process-exit behavior and is complete only for single-threaded callers.
-    exit_current_and_run_next(exit_code);
+    exit_current_group_and_run_next(exit_code);
     panic!("Unreachable in sys_exit_group!");
 }
 
@@ -631,6 +629,11 @@ pub fn sys_kill(pid: usize, signal: u32) -> SysResult {
         inner.signals |= flag;
         if (signal as usize) < inner.signal_infos.len() {
             inner.signal_infos[signal as usize] = Some(SignalInfo::user(signal as i32, sender_pid));
+        }
+    }
+    if flag.check_error().is_some() {
+        for task in process.tasks_snapshot() {
+            wakeup_task(task);
         }
     }
     Ok(0)
