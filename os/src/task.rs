@@ -336,14 +336,18 @@ pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
     let process = task.process.upgrade()?;
     let pending = {
         let task_inner = task.inner_exclusive_access();
-        task_inner.pending_signals & !task_inner.signal_mask
+        SignalFlags::from_bits_retain(
+            task_inner.pending_signals.bits() & !task_inner.signal_mask.bits(),
+        )
     };
     let signum = pending.bits().trailing_zeros() as usize;
     if signum >= SIGNAL_INFO_SLOTS {
         return None;
     }
     let action = process.inner_exclusive_access().signal_actions[signum];
-    if action.is_ignore() {
+    // CONTEXT: Linux's default disposition for SIGCHLD is ignore. Shells and
+    // runtest still reap children with wait/waitid or explicit sigtimedwait.
+    if action.is_ignore() || (signum == SIGCHLD as usize && !action.has_user_handler()) {
         let mut task_inner = task.inner_exclusive_access();
         if let Some(signal) = SignalFlags::from_signum(signum as u32) {
             task_inner.pending_signals.remove(signal);

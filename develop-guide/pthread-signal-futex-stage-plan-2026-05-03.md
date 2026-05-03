@@ -34,6 +34,9 @@ Local ABI evidence:
 - musl `pthread_cancel` installs and sends signal 33.
 - musl `__restore` invokes syscall 139.
 - musl cancel handlers inspect the interrupted PC from the `ucontext_t` passed as the third signal-handler argument.
+- musl/riscv64 `cancel_handler` reads the first raw signal-mask word at
+  `ucontext + 40`, ORs in raw bit `1 << 32` for signal 33, and reads/writes the
+  interrupted PC at `ucontext + 176`.
 
 ## Stage Checklist
 
@@ -84,3 +87,23 @@ Local ABI evidence:
   process-wide `signal_actions` table; added syscall dispatch and basic
   implementations for `tkill`, `tgkill`, `rt_sigaction`, `rt_sigprocmask`, and
   the `rt_sigreturn` Stage B boundary.
+- 2026-05-03 Stage B resume: continue from the uncommitted RISC-V signal-frame
+  work. First remove temporary `signal-probe` diagnostics, preserve the raw-bit
+  signal-set fixes needed for musl signal 33, then validate the narrow
+  `pthread_cancel` path on a fresh copied RV test disk before broadening to
+  `pthread_cancel-points`.
+- 2026-05-03 Stage B: fixed the RISC-V signal frame so the generated
+  `ucontext` carries both the old raw sigmask at offset 40 and the interrupted
+  PC at offset 176. `rt_sigreturn` now restores the thread mask from the
+  user-modifiable `ucontext` sigmask, not from a private saved-mask field, which
+  lets musl's deferred cancel handler block SIGCANCEL before returning to the
+  interrupted instruction.
+- 2026-05-03 Stage B validation: with a fresh copy of
+  `../reference-project/NighthawkOS/sdcard-rv.img` at
+  `/tmp/sdcard-rv-signal.img`, `make kernel-rv` passed, and the manual shell
+  run `cd /musl && ./runtest.exe -w entry-static.exe pthread_cancel` printed
+  `Pass!`. The follow-up probe
+  `./runtest.exe -w entry-static.exe pthread_cancel-points` now fails with
+  `FAIL pthread_cancel-points [signal Hangup]`, so Stage C starts from that
+  first remaining cancel-point evidence rather than the old `rt_sigreturn`
+  loop.

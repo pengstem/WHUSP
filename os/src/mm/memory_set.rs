@@ -1,4 +1,7 @@
-use super::{MapArea, MapPermission, MapType, PageTable, PageTableEntry, VirtAddr, VirtPageNum};
+use super::{
+    MapArea, MapPermission, MapType, PageTable, PageTableEntry, VirtAddr, VirtPageNum,
+    page_table::PTEFlags,
+};
 use crate::arch::mm as arch_mm;
 use alloc::vec::Vec;
 
@@ -75,6 +78,9 @@ impl MemorySet {
     }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.page_table.translate(vpn)
+    }
+    pub fn remap_existing_page_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
+        self.page_table.remap_flags(vpn, flags)
     }
     pub fn recycle_data_pages(&mut self) {
         //*self = Self::new_bare();

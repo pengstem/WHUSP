@@ -73,6 +73,8 @@ pub fn trap_handler() -> ! {
     account_current_user_time_until(get_time_us());
     let estat = estat::read();
     let badv = badv::read().vaddr();
+    let trap_pc = current_trap_cx().era;
+    let mut interrupted_pc = trap_pc;
     match estat.cause() {
         Trap::Exception(Exception::Syscall) => {
             let mut cx = current_trap_cx();
@@ -83,6 +85,9 @@ pub fn trap_handler() -> ! {
                 [cx.x[4], cx.x[5], cx.x[6], cx.x[7], cx.x[8], cx.x[9]],
             );
             cx = current_trap_cx();
+            if cx.era != trap_pc + 4 {
+                interrupted_pc = cx.era;
+            }
             cx.x[4] = result as usize;
         }
         Trap::Exception(Exception::StorePageFault)
@@ -122,6 +127,9 @@ pub fn trap_handler() -> ! {
                 other, badv
             );
         }
+    }
+    if crate::arch::signal::deliver_pending_signal(interrupted_pc) {
+        trap_return();
     }
     if let Some((errno, msg)) = check_signals_of_current() {
         println!("[kernel] {}", msg);

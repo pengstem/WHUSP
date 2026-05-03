@@ -34,7 +34,6 @@ bitflags! {
 pub struct SignalAction {
     pub handler: usize,
     pub flags: usize,
-    pub restorer: usize,
     pub mask: SignalFlags,
 }
 
@@ -86,7 +85,10 @@ impl SignalFlags {
         } else if signum >= SIGNAL_INFO_SLOTS as u32 {
             None
         } else {
-            Some(Self::from_bits_truncate(1u128 << signum))
+            // CONTEXT: Linux real-time signals are ABI-visible even when this
+            // kernel has no named per-signal semantics for them yet. musl uses
+            // signal 33 as SIGCANCEL for pthread cancellation.
+            Some(Self::from_bits_retain(1u128 << signum))
         }
     }
 

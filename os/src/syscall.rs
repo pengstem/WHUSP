@@ -64,7 +64,7 @@ const SYSCALL_PRLIMIT64: usize = 261;
 const SYSCALL_RENAMEAT2: usize = 276;
 const SYSCALL_STATX: usize = 291;
 
-mod errno;
+pub(crate) mod errno;
 mod fs;
 mod memory;
 mod process;

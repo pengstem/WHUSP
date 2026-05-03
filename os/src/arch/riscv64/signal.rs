@@ -1,0 +1,369 @@
+use crate::mm::{
+    MmapFaultAccess, MmapFaultResult, PageTable, StepByOne, VirtAddr, page_table::PTEFlags,
+};
+use crate::syscall::errno::{SysError, SysResult};
+use crate::task::{
+    SIGNAL_INFO_SLOTS, SignalAction, SignalFlags, SignalInfo, current_add_signal, current_process,
+    current_task, current_trap_cx, current_user_token,
+};
+use crate::trap::TrapContext;
+use core::mem::{MaybeUninit, offset_of, size_of};
+use core::slice;
+
+const SIGNAL_FRAME_MAGIC: usize = 0x5753_4947_4652_414d;
+const SIGNAL_STACK_ALIGN: usize = 16;
+const SA_NODEFER: usize = 0x4000_0000;
+const SIGCANCEL: usize = 33;
+const RT_SIGRETURN_TRAMPOLINE: [u32; 2] = [0x08b0_0893, 0x0000_0073];
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxSigInfoCompat {
+    si_signo: i32,
+    si_errno: i32,
+    si_code: i32,
+    si_trapno: i32,
+    si_pid: i32,
+    si_uid: u32,
+    si_status: i32,
+    si_utime: u32,
+    si_stime: u32,
+    si_value: u64,
+    pad: [u32; 20],
+    align: [u64; 0],
+}
+
+impl LinuxSigInfoCompat {
+    fn from_signal_info(info: SignalInfo) -> Self {
+        Self {
+            si_signo: info.signo,
+            si_errno: 0,
+            si_code: info.code,
+            si_trapno: 0,
+            si_pid: info.pid,
+            si_uid: info.uid,
+            si_status: info.status,
+            si_utime: 0,
+            si_stime: 0,
+            si_value: 0,
+            pad: [0; 20],
+            align: [],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxUContextCompat {
+    // CONTEXT: musl/riscv64's pthread cancel handler reads uc_sigmask at
+    // ucontext+40 and the interrupted PC at ucontext+176.
+    prefix_until_sigmask: [u8; 40],
+    sigmask: u64,
+    prefix_until_pc: [u8; 128],
+    pc: usize,
+}
+
+impl LinuxUContextCompat {
+    fn new(interrupted_pc: usize, old_mask: SignalFlags) -> Self {
+        Self {
+            prefix_until_sigmask: [0; 40],
+            sigmask: flags_to_linux_sigset(old_mask),
+            prefix_until_pc: [0; 128],
+            pc: interrupted_pc,
+        }
+    }
+
+    fn restored_signal_mask(self) -> SignalFlags {
+        let mut mask = linux_sigset_to_flags(self.sigmask);
+        mask.remove(SignalFlags::SIGKILL);
+        mask.remove(SignalFlags::SIGSTOP);
+        mask
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RiscvSignalFrame {
+    magic: usize,
+    trampoline: [u32; 2],
+    saved_context: TrapContext,
+    siginfo: LinuxSigInfoCompat,
+    ucontext: LinuxUContextCompat,
+}
+
+struct PendingUserSignal {
+    signum: u32,
+    info: SignalInfo,
+    action: SignalAction,
+    old_mask: SignalFlags,
+}
+
+fn linux_sigset_to_flags(raw: u64) -> SignalFlags {
+    SignalFlags::from_bits_retain((raw as u128) << 1)
+}
+
+fn flags_to_linux_sigset(flags: SignalFlags) -> u64 {
+    (flags.bits() >> 1) as u64
+}
+
+fn handle_mmap_page_fault(addr: usize, access: MmapFaultAccess) -> bool {
+    let process = current_process();
+    let fault = {
+        let inner = process.inner_exclusive_access();
+        inner.memory_set.prepare_mmap_page_fault(addr, access)
+    };
+    let Some(fault) = fault else {
+        return false;
+    };
+    match fault {
+        MmapFaultResult::Handled => true,
+        MmapFaultResult::Page(page) => {
+            let Some(frame) = page.build_frame() else {
+                return false;
+            };
+            let mut inner = process.inner_exclusive_access();
+            inner.memory_set.install_mmap_fault_page(page, frame)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum UserBufferAccess {
+    Read,
+    Write,
+}
+
+impl UserBufferAccess {
+    fn mmap_access(self) -> MmapFaultAccess {
+        match self {
+            Self::Read => MmapFaultAccess::Read,
+            Self::Write => MmapFaultAccess::Write,
+        }
+    }
+
+    fn pte_allows(self, flags: PTEFlags) -> bool {
+        match self {
+            Self::Read => flags.contains(PTEFlags::R),
+            Self::Write => flags.contains(PTEFlags::W),
+        }
+    }
+}
+
+fn checked_user_buffers(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    access: UserBufferAccess,
+) -> SysResult<alloc::vec::Vec<&'static mut [u8]>> {
+    if len == 0 {
+        return Ok(alloc::vec::Vec::new());
+    }
+    let mut start = ptr as usize;
+    let end = start.checked_add(len).ok_or(SysError::EFAULT)?;
+    let mut buffers = alloc::vec::Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let mut pte = PageTable::from_token(token)
+            .translate(vpn)
+            .ok_or(SysError::EFAULT)?;
+        if !pte.is_valid() || !access.pte_allows(pte.flags()) || pte.ppn().0 == 0 {
+            if !handle_mmap_page_fault(start, access.mmap_access()) {
+                return Err(SysError::EFAULT);
+            }
+            pte = PageTable::from_token(token)
+                .translate(vpn)
+                .ok_or(SysError::EFAULT)?;
+            if !pte.is_valid() || !access.pte_allows(pte.flags()) || pte.ppn().0 == 0 {
+                return Err(SysError::EFAULT);
+            }
+        }
+        let ppn = pte.ppn();
+        vpn.step();
+        let mut end_va: VirtAddr = vpn.into();
+        end_va = end_va.min(VirtAddr::from(end));
+        if end_va.page_offset() == 0 {
+            buffers.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
+        } else {
+            buffers.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
+        }
+        start = end_va.into();
+    }
+    Ok(buffers)
+}
+
+fn copy_to_user<T: Copy>(token: usize, dst: usize, value: &T) -> SysResult<()> {
+    let bytes = unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
+    let buffers = checked_user_buffers(
+        token,
+        dst as *const u8,
+        bytes.len(),
+        UserBufferAccess::Write,
+    )?;
+    let mut offset = 0;
+    for buffer in buffers {
+        let end = offset + buffer.len();
+        buffer.copy_from_slice(&bytes[offset..end]);
+        offset = end;
+    }
+    Ok(())
+}
+
+fn copy_from_user<T: Copy>(token: usize, src: usize) -> SysResult<T> {
+    let mut value = MaybeUninit::<T>::uninit();
+    let bytes =
+        unsafe { slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size_of::<T>()) };
+    let buffers =
+        checked_user_buffers(token, src as *const u8, bytes.len(), UserBufferAccess::Read)?;
+    let mut offset = 0;
+    for buffer in buffers {
+        let end = offset + buffer.len();
+        bytes[offset..end].copy_from_slice(buffer);
+        offset = end;
+    }
+    Ok(unsafe { value.assume_init() })
+}
+
+fn make_trampoline_page_executable(trampoline_ptr: usize) -> bool {
+    let process = current_process();
+    let vpn = VirtAddr::from(trampoline_ptr).floor();
+    let mut inner = process.inner_exclusive_access();
+    let Some(pte) = inner.memory_set.translate(vpn) else {
+        return false;
+    };
+    // CONTEXT: Linux/RISC-V signal return uses a tiny user-space
+    // rt_sigreturn trampoline. pthread stacks come from mmap(PROT_READ|WRITE),
+    // so grant execute only to the page that holds this generated trampoline.
+    if !inner
+        .memory_set
+        .remap_existing_page_flags(vpn, pte.flags() | PTEFlags::X)
+    {
+        return false;
+    }
+    crate::arch::mm::flush_tlb_all();
+    true
+}
+
+fn remove_pending_signal(signum: usize, signal: SignalFlags) {
+    let Some(task) = current_task() else {
+        return;
+    };
+    let mut task_inner = task.inner_exclusive_access();
+    task_inner.pending_signals.remove(signal);
+    if let Some(slot) = task_inner.signal_infos.get_mut(signum) {
+        *slot = None;
+    }
+}
+
+fn take_pending_user_signal() -> Option<PendingUserSignal> {
+    let task = current_task()?;
+    let process = current_process();
+    for signum in 1..SIGNAL_INFO_SLOTS {
+        let signal = SignalFlags::from_signum(signum as u32)?;
+        let pending = {
+            let task_inner = task.inner_exclusive_access();
+            let unmasked_bits = task_inner.pending_signals.bits() & !task_inner.signal_mask.bits();
+            SignalFlags::from_bits_retain(unmasked_bits).contains(signal)
+        };
+        if !pending {
+            continue;
+        }
+        if signum != SIGCANCEL {
+            // UNFINISHED: Full Linux signal delivery must support every
+            // user-installed handler. This stage deliberately limits signal
+            // frames to musl's pthread cancellation signal while the generic
+            // signal ABI is still being validated.
+            continue;
+        }
+
+        let action = process.inner_exclusive_access().signal_actions[signum];
+        if action.is_ignore() {
+            remove_pending_signal(signum, signal);
+            continue;
+        }
+        if !action.has_user_handler() {
+            continue;
+        }
+
+        let mut task_inner = task.inner_exclusive_access();
+        let info = task_inner
+            .signal_infos
+            .get(signum)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| SignalInfo::user(signum as i32, 0));
+        let old_mask = task_inner.signal_mask;
+        task_inner.pending_signals.remove(signal);
+        if let Some(slot) = task_inner.signal_infos.get_mut(signum) {
+            *slot = None;
+        }
+        task_inner.signal_mask |= action.mask;
+        if action.flags & SA_NODEFER == 0 {
+            task_inner.signal_mask |= signal;
+        }
+        return Some(PendingUserSignal {
+            signum: signum as u32,
+            info,
+            action,
+            old_mask,
+        });
+    }
+    None
+}
+
+pub fn deliver_pending_signal(interrupted_pc: usize) -> bool {
+    let Some(delivery) = take_pending_user_signal() else {
+        return false;
+    };
+    let saved_context = *current_trap_cx();
+    let user_sp = saved_context.x[2];
+    let frame_sp = (user_sp - size_of::<RiscvSignalFrame>()) & !(SIGNAL_STACK_ALIGN - 1);
+    let frame = RiscvSignalFrame {
+        magic: SIGNAL_FRAME_MAGIC,
+        trampoline: RT_SIGRETURN_TRAMPOLINE,
+        saved_context,
+        siginfo: LinuxSigInfoCompat::from_signal_info(delivery.info),
+        ucontext: LinuxUContextCompat::new(interrupted_pc, delivery.old_mask),
+    };
+    let token = current_user_token();
+    if copy_to_user(token, frame_sp, &frame).is_err() {
+        current_add_signal(SignalFlags::SIGSEGV);
+        return false;
+    }
+
+    let siginfo_ptr = frame_sp + offset_of!(RiscvSignalFrame, siginfo);
+    let ucontext_ptr = frame_sp + offset_of!(RiscvSignalFrame, ucontext);
+    let trampoline_ptr = frame_sp + offset_of!(RiscvSignalFrame, trampoline);
+    if !make_trampoline_page_executable(trampoline_ptr) {
+        current_add_signal(SignalFlags::SIGSEGV);
+        return false;
+    }
+
+    let trap_cx = current_trap_cx();
+    trap_cx.x = saved_context.x;
+    trap_cx.sepc = delivery.action.handler;
+    trap_cx.set_sp(frame_sp);
+    trap_cx.x[1] = trampoline_ptr;
+    trap_cx.x[10] = delivery.signum as usize;
+    trap_cx.x[11] = siginfo_ptr;
+    trap_cx.x[12] = ucontext_ptr;
+    true
+}
+
+pub fn sys_rt_sigreturn() -> SysResult {
+    let token = current_user_token();
+    let signal_sp = current_trap_cx().x[2];
+    let frame: RiscvSignalFrame = copy_from_user(token, signal_sp)?;
+    if frame.magic != SIGNAL_FRAME_MAGIC {
+        return Err(SysError::EINVAL);
+    }
+
+    if let Some(task) = current_task() {
+        task.inner_exclusive_access().signal_mask = frame.ucontext.restored_signal_mask();
+    }
+    let mut restored_context = frame.saved_context;
+    restored_context.sepc = frame.ucontext.pc;
+    let return_value = restored_context.x[10] as isize;
+    *current_trap_cx() = restored_context;
+    Ok(return_value)
+}

@@ -65,6 +65,8 @@ pub fn trap_handler() -> ! {
     account_current_user_time_until(get_time_us());
     let scause = scause::read();
     let stval = stval::read();
+    let trap_pc = current_trap_cx().sepc;
+    let mut interrupted_pc = trap_pc;
     // println!("into {:?}", scause.cause());
     match scause.cause() {
         Trap::Exception(Exception::UserEnvCall) => {
@@ -81,6 +83,9 @@ pub fn trap_handler() -> ! {
             );
             // cx is changed during sys_execve, so we have to call it again
             cx = current_trap_cx();
+            if cx.sepc != trap_pc + 4 {
+                interrupted_pc = cx.sepc;
+            }
             cx.x[10] = result as usize;
         }
         Trap::Exception(Exception::StorePageFault) => {
@@ -129,6 +134,9 @@ pub fn trap_handler() -> ! {
                 stval
             );
         }
+    }
+    if crate::arch::signal::deliver_pending_signal(interrupted_pc) {
+        trap_return();
     }
     // check signals
     if let Some((errno, msg)) = check_signals_of_current() {

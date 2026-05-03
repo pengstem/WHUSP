@@ -17,7 +17,7 @@ const SIG_UNBLOCK: usize = 1;
 const SIG_SETMASK: usize = 2;
 
 fn linux_sigset_to_flags(raw: u64) -> SignalFlags {
-    SignalFlags::from_bits_truncate((raw as u128) << 1)
+    SignalFlags::from_bits_retain((raw as u128) << 1)
 }
 
 fn flags_to_linux_sigset(flags: SignalFlags) -> u64 {
@@ -95,7 +95,6 @@ fn try_return_pending_signal(
 struct LinuxKernelSigAction {
     handler: usize,
     flags: usize,
-    restorer: usize,
     mask: u64,
 }
 
@@ -104,7 +103,6 @@ impl From<SignalAction> for LinuxKernelSigAction {
         Self {
             handler: action.handler,
             flags: action.flags,
-            restorer: action.restorer,
             mask: flags_to_linux_sigset(action.mask),
         }
     }
@@ -117,7 +115,6 @@ fn signal_action_from_linux(raw: LinuxKernelSigAction) -> SignalAction {
     SignalAction {
         handler: raw.handler,
         flags: raw.flags,
-        restorer: raw.restorer,
         mask,
     }
 }
@@ -248,9 +245,7 @@ pub fn sys_rt_sigprocmask(
 }
 
 pub fn sys_rt_sigreturn() -> SysResult {
-    // UNFINISHED: Stage A only wires the syscall surface. RISC-V signal-frame
-    // restoration is implemented in the next signal delivery stage.
-    Err(SysError::ENOSYS)
+    crate::arch::signal::sys_rt_sigreturn()
 }
 
 pub fn sys_rt_sigtimedwait(
