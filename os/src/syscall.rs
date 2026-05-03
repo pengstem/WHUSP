@@ -30,6 +30,7 @@ const SYSCALL_UTIMENSAT: usize = 88;
 const SYSCALL_EXIT: usize = 93;
 const SYSCALL_EXIT_GROUP: usize = 94;
 const SYSCALL_WAITID: usize = 95;
+const SYSCALL_SET_TID_ADDRESS: usize = 96;
 const SYSCALL_FUTEX: usize = 98;
 const SYSCALL_NANOSLEEP: usize = 101;
 const SYSCALL_CLOCK_GETTIME: usize = 113;
@@ -46,6 +47,7 @@ const SYSCALL_SETRLIMIT: usize = 164;
 const SYSCALL_GETTIMEOFDAY: usize = 169;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_GETPPID: usize = 173;
+const SYSCALL_GETTID: usize = 178;
 const SYSCALL_BRK: usize = 214;
 const SYSCALL_MUNMAP: usize = 215;
 const SYSCALL_CLONE: usize = 220;
@@ -74,7 +76,7 @@ use signal::*;
 use sync::*;
 use wait::*;
 
-pub(crate) use sync::remove_process_futex_waiters;
+pub(crate) use sync::{clear_child_tid_and_wake, remove_process_futex_waiters};
 
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     if syscall_id == SYSCALL_EXIT {
@@ -180,6 +182,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as i32,
             args[4] as *mut RUsage,
         ),
+        SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0]),
         SYSCALL_FUTEX => sys_futex(
             args[0] as *mut u32,
             args[1] as u32,
@@ -218,6 +221,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         }
         SYSCALL_GETPID => Ok(sys_getpid()),
         SYSCALL_GETPPID => Ok(sys_getppid()),
+        SYSCALL_GETTID => Ok(sys_gettid()),
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),

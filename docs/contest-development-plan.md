@@ -150,7 +150,7 @@
 | 2 | `mount(40)` / `umount2(39)` | `basic-musl` | `test_mount`、`test_umount` 仍各只有 `2 / 5` | 继续修 FAT/VFAT、分区挂载、busy target、umount 后路径状态和错误码 |
 | 3 | `wait4/waitpid` / exit status | `basic-musl`、pthread 相关 | `test_wait`、`test_waitpid` 均为 `1 / 4` | 补 status 编码、options、rusage、线程组和被 signal 终止后的回收 |
 | 4 | pipe / fd I/O 语义 | `basic-musl`、BusyBox pipeline | `test_pipe` 仍为 `1 / 4` | 补阻塞/非阻塞、关闭端、EOF、`EPIPE`、SIGPIPE、poll readiness |
-| 5 | 线程取消 / futex / signal 协作 | `libctest pthread_cancel*` | `pthread_cancel(td)` 仍失败或超时 | 调查 musl 取消点、`tkill/tgkill`、signal mask、futex wait/wake 和线程退出唤醒 |
+| 5 | pthread/libctest 线程支线 | `libctest pthread_*` | `pthread_cancel(td)` 仍失败或超时；cond/TSD/robust 用例也会卡住 | 按 P2.7 的顺序拆解：TID/退出清理、classic futex、定向 signal/cancel、PI futex、robust futex |
 | 6 | socket 最小 IPv4 UDP/TCP | `libctest socket` | socket 系列 syscall 仍 ENOSYS | 决定是否实现 loopback 最小语义，或明确作为网络扩展项延后 |
 
 ### 2026-05-02 测试结果快照
@@ -171,11 +171,50 @@
 | 1 | fscanf/ungetc/stat 的卡死点 | `fscanf`、`stat`、`ungetc` | 仍被 runner SIGKILL 超时 | 在 `lseek` 已接入后重新跑单项，区分 fd offset、stdio 缓冲、`read` EOF、`stat` 死锁和资源回收问题 |
 | 2 | tmpfile / 匿名临时文件写入链路 | `fwscanf`、`utime`、后续 `tmpfile` 相关用例 | 旧日志显示 `write: No error information`；需在 `lseek/utimensat` 后复测 | 审计 `/tmp` 上 `O_TMPFILE`/匿名临时文件兼容、`open(O_CREAT|O_EXCL)` fallback、tmpfs `write_at` 返回值和 errno |
 | 3 | `fstat/stat` 稳健性 | `stat`、`utime` | 旧日志里 `utime` 在 `fstat` 路径触发 VFS panic；需确认是否已修复 | 复查 tmpfs、匿名临时文件、已 unlink 但仍打开文件、目录和设备文件的 inode 生命周期处理 |
-| 4 | 线程取消和 futex/信号协作 | `pthread_cancel_points`、`pthread_cancel` | `pthread_cancel(td) failed: Function not implemented` 后线程用例超时 | 明确 musl `pthread_cancel` 依赖的 `tkill/tgkill`、signal mask、cancel point 唤醒、futex wait/wake 行为 |
-| 5 | pthread 条件变量 / TSD | `pthread_cond`、`pthread_tsd` | 用例被 SIGKILL 超时 | 审计 `futex(98)`、`clone` TLS/clear_child_tid、线程退出唤醒、robust list/TSD destructor 需求 |
-| 6 | signal mask 保存恢复 | `setjmp` | `siglongjmp incorrectly restored mask` | 补齐 `rt_sigprocmask(135)`、`rt_sigaction(134)`、`rt_sigreturn(139)` 与每线程 signal mask 保存恢复 |
-| 7 | socket 最小 IPv4 UDP/TCP 语义 | `socket` | `socket/bind/getsockname/setsockopt/sendto/recvfrom/listen/connect/accept` 全部 ENOSYS | 至少实现 `AF_INET` + UDP loopback/本机收发、TCP listen/connect/accept 的最小兼容；或明确先作为非主线网络得分项延后 |
-| 8 | 超时/杀进程后的资源回收 | `fscanf`、`pthread_*`、`stat`、`ungetc` | 多个用例由 runner SIGKILL 后结束 | 确认 SIGKILL 能终止所有线程、释放 fd/锁/futex waiter，避免后续用例继承坏状态或持锁死锁 |
+| 4 | pthread/libctest 线程支线 | `pthread_cancel*`、`pthread_cond`、`pthread_tsd`、`pthread_mutex*`、`pthread_robust` | 取消、条件变量、TSD、PI/robust mutex 用例仍失败或超时 | 详见 P2.7，先补线程退出和 classic futex，再补 signal/cancel、PI futex、robust owner-death |
+| 5 | signal mask 保存恢复 | `setjmp`、pthread cancel | `siglongjmp incorrectly restored mask`；取消信号也依赖每线程 mask | 补齐 `rt_sigprocmask(135)`、`rt_sigaction(134)`、`rt_sigreturn(139)` 与每线程 signal mask 保存恢复 |
+| 6 | socket 最小 IPv4 UDP/TCP 语义 | `socket` | `socket/bind/getsockname/setsockopt/sendto/recvfrom/listen/connect/accept` 全部 ENOSYS | 至少实现 `AF_INET` + UDP loopback/本机收发、TCP listen/connect/accept 的最小兼容；或明确先作为非主线网络得分项延后 |
+| 7 | 超时/杀进程后的资源回收 | `fscanf`、`pthread_*`、`stat`、`ungetc` | 多个用例由 runner SIGKILL 后结束 | 确认 SIGKILL 能终止所有线程、释放 fd/锁/futex waiter，避免后续用例继承坏状态或持锁死锁 |
+
+## P2.7 - pthread/libctest 线程支线
+
+**目标**：先打通 `rv-musl entry-static.exe pthread_*` 静态用例。动态 pthread 用例仍受 PT_INTERP / 动态链接路线影响，不作为本支线第一验收目标。
+
+### 用例拆分
+
+| 测试文件 | 最可能卡点 | 推荐阶段 | 验收信号 |
+|----------|------------|----------|----------|
+| `pthread_mutex.c` | `futex` WAIT/WAKE、`clock_gettime`、`clone`、`pthread_join` | 阶段 1-2 | 普通、errorcheck、recursive mutex 的 relock/unlock 语义不超时，返回值符合预期 |
+| `pthread_cond.c` | `futex` WAIT/WAKE，可能用到 REQUEUE/CMP_REQUEUE；`nanosleep`；多 waiter 唤醒 | 阶段 2 | signal/broadcast 都能唤醒等待线程，三个 waiter 全部 join 成功 |
+| `pthread_tsd.c` | `clone` TLS、线程退出、`CLONE_CHILD_CLEARTID`、join futex wake、TSD destructor | 阶段 1-2 | 子线程退出后 TSD destructor 执行，主线程 TSD 不被破坏 |
+| `pthread_cancel.c` | `tgkill`/`tkill`、`rt_sigaction`、`rt_sigreturn`、cancel signal、cleanup handler、join | 阶段 3-4 | async cancel 和 sleep cancel 都返回 `PTHREAD_CANCELED`，cleanup handler 全部执行 |
+| `pthread_cancel-points.c` | cancel point、sem/futex wait、`clock_gettime`、`openat`/`close`/`unlinkat`、`/dev/shm` | 阶段 4 | sem_wait、sem_timedwait、pthread_join 作为取消点生效；`shm_open` 场景不被误取消 |
+| `pthread_mutex_pi.c` | `FUTEX_LOCK_PI`、`FUTEX_UNLOCK_PI`、`FUTEX_TRYLOCK_PI`，至少不能直接 ENOSYS | 阶段 5 | PI mutex 的 relock/unlock 错误码与非 PI 版本一致；真实优先级继承可暂标 `UNFINISHED` |
+| `pthread_robust.c` | `set_robust_list`、`get_robust_list`、owner-death、robust futex、PI futex | 阶段 6 | owner 线程退出后 lock 返回 `EOWNERDEAD`，consistent 后可恢复；未恢复时返回 `ENOTRECOVERABLE` |
+
+### 推荐推进顺序
+
+1. [ ] **线程 ID 地基**：区分内核 task slot tid 和 Linux-visible TID；补 `gettid(178)`、`set_tid_address(96)`，并让 `tkill/tgkill`、robust list、clear-child-tid 都使用 Linux-visible TID。
+2. [ ] **线程退出清理**：消费 `CLONE_CHILD_CLEARTID` / `set_tid_address` 保存的 `clear_child_tid`，非主线程退出时写 0、`futex_wake(1)`、从 task table 移除并回收线程资源。
+3. [ ] **classic futex 校准**：复查现有 `futex(98)` 的 WAIT、WAKE、WAIT_BITSET、WAKE_BITSET、REQUEUE、CMP_REQUEUE 的 errno、timeout、返回计数和 waiter 清理，先满足 musl pthread mutex/cond/join。
+4. [ ] **先过非取消 pthread 用例**：按 `pthread_mutex.c` -> `pthread_cond.c` -> `pthread_tsd.c` 顺序验收，确认基础线程创建、TLS、join、futex wake 不再超时。
+5. [ ] **signal/cancel 地基**：补 `tkill(130)`、`tgkill(131)`、`rt_sigprocmask(135)`、`rt_sigaction(134)`、`rt_sigreturn(139)`；把 signal pending/mask 从 process-wide 位图推进到每线程语义，并能唤醒可中断等待。
+6. [ ] **pthread cancel**：按 `pthread_cancel.c` -> `pthread_cancel-points.c` 验收，确保 cancel signal 不误杀整个进程，cleanup handler 执行，取消点和非取消点行为分开。
+7. [ ] **PI futex 最小兼容**：补 `FUTEX_LOCK_PI`、`FUTEX_UNLOCK_PI`、`FUTEX_TRYLOCK_PI` 的 owner/waiter 语义；真实 priority inheritance 可先保留 `// UNFINISHED:`。
+8. [ ] **robust futex**：补 `set_robust_list(99)` / `get_robust_list(100)`，线程退出时遍历 robust list，设置 `FUTEX_OWNER_DIED` 并唤醒 waiter。
+
+### 验收命令
+
+- [ ] `make kernel-rv`。
+- [ ] item 级运行：`cd /musl && ./runtest.exe -w entry-static.exe pthread_mutex`。
+- [ ] item 级运行：`cd /musl && ./runtest.exe -w entry-static.exe pthread_cond`。
+- [ ] item 级运行：`cd /musl && ./runtest.exe -w entry-static.exe pthread_tsd`。
+- [ ] item 级运行：`cd /musl && ./runtest.exe -w entry-static.exe pthread_cancel`。
+- [ ] item 级运行：`cd /musl && ./runtest.exe -w entry-static.exe pthread_cancel_points`。
+- [ ] item 级运行：`cd /musl && ./runtest.exe -w entry-static.exe pthread_mutex_pi`。
+- [ ] item 级运行：`cd /musl && ./runtest.exe -w entry-static.exe pthread_robust`。
+- [ ] 回归：`tools/contest_runner/run_groups.py --arch rv --libcs musl --groups basic,busybox,lua` 不退化。
+- [ ] 完整组：`tools/contest_runner/run_groups.py --arch rv --libcs musl --groups libctest` 能跑过 pthread 段，不再因 pthread 用例 SIGKILL 超时。
 
 ## P2.5 - cwd in PCB 收尾
 

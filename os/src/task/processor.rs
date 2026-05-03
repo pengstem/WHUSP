@@ -51,6 +51,7 @@ pub fn run_tasks() {
             unsafe {
                 __switch(idle_task_cx_ptr, next_task_cx_ptr);
             }
+            super::reap_exited_tasks();
         } else {
             drop(processor);
             hart::enable_interrupt_and_wait();

@@ -1,4 +1,4 @@
-use super::{SIGCHLD, TaskControlBlock, current_task};
+use super::{SIGCHLD, TaskControlBlock, current_task, pid_alloc};
 use alloc::sync::Arc;
 use bitflags::bitflags;
 
@@ -58,7 +58,7 @@ impl CloneArgs {
 
 pub struct ClonedThread {
     pub task: Arc<TaskControlBlock>,
-    pub tid: usize,
+    pub linux_tid: usize,
 }
 
 pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
@@ -73,8 +73,10 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     let parent_trap_cx = *current_task.inner_exclusive_access().get_trap_cx();
     let new_task = Arc::new(TaskControlBlock::new(process, ustack_base, true));
     let mut new_task_inner = new_task.inner_exclusive_access();
-    let new_tid = new_task_inner.res.as_ref().unwrap().tid;
     let new_ustack_top = new_task_inner.res.as_ref().unwrap().ustack_top();
+    let linux_tid = pid_alloc();
+    let new_linux_tid = linux_tid.0;
+    new_task_inner.linux_tid = Some(linux_tid);
     let new_trap_cx = new_task_inner.get_trap_cx();
     *new_trap_cx = parent_trap_cx;
     new_trap_cx.set_a0(0);
@@ -93,6 +95,6 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     drop(new_task_inner);
     ClonedThread {
         task: new_task,
-        tid: new_tid,
+        linux_tid: new_linux_tid,
     }
 }

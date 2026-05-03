@@ -193,10 +193,21 @@ pub fn sys_getpid() -> isize {
     current_task().unwrap().process.upgrade().unwrap().getpid() as isize
 }
 
+pub fn sys_gettid() -> isize {
+    current_task().unwrap().linux_tid() as isize
+}
+
 pub fn sys_getppid() -> isize {
     // UNFINISHED: PID namespaces and child subreapers are not modeled yet, so
     // this returns the single-namespace parent recorded in the PCB.
     current_process().getppid() as isize
+}
+
+pub fn sys_set_tid_address(tidptr: usize) -> SysResult {
+    let task = current_task().unwrap();
+    let tid = task.linux_tid();
+    task.inner_exclusive_access().clear_child_tid = if tidptr == 0 { None } else { Some(tidptr) };
+    Ok(tid as isize)
 }
 
 pub fn sys_uname(name: *mut LinuxUtsName) -> SysResult {
@@ -336,13 +347,21 @@ fn sys_clone_thread(args: CloneArgs) -> SysResult {
     let process_token = process.attach_task(Arc::clone(&cloned.task));
 
     if args.flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
-        write_user_value(process_token, args.ptid as *mut i32, &(cloned.tid as i32))?;
+        write_user_value(
+            process_token,
+            args.ptid as *mut i32,
+            &(cloned.linux_tid as i32),
+        )?;
     }
     if args.flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
-        write_user_value(process_token, args.ctid as *mut i32, &(cloned.tid as i32))?;
+        write_user_value(
+            process_token,
+            args.ctid as *mut i32,
+            &(cloned.linux_tid as i32),
+        )?;
     }
     add_task(cloned.task);
-    Ok(cloned.tid as isize)
+    Ok(cloned.linux_tid as isize)
 }
 
 fn translated_string_array(token: usize, mut ptr: *const usize) -> Vec<String> {

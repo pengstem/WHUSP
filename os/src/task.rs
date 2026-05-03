@@ -14,6 +14,7 @@ mod task;
 use self::id::TaskUserRes;
 use crate::arch::__switch;
 use crate::sbi::shutdown;
+use crate::sync::UPIntrFreeCell;
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
 use log::info;
@@ -111,20 +112,50 @@ pub fn block_current_and_run_next() {
     schedule(task_cx_ptr);
 }
 
+lazy_static! {
+    static ref EXITED_TASKS: UPIntrFreeCell<Vec<Arc<TaskControlBlock>>> =
+        unsafe { UPIntrFreeCell::new(Vec::new()) };
+}
+
+fn queue_exited_task(task: Arc<TaskControlBlock>) {
+    EXITED_TASKS.exclusive_access().push(task);
+}
+
+pub(crate) fn reap_exited_tasks() {
+    EXITED_TASKS.exclusive_access().clear();
+}
+
 /// Exit the current 'Running' task and run the next task in task list.
 pub fn exit_current_and_run_next(exit_code: i32) {
     account_current_system_time();
     let task = take_current_task().unwrap();
-    let mut task_inner = task.inner_exclusive_access();
     let process = task.process.upgrade().unwrap();
+    let process_token = process.inner_exclusive_access().memory_set.token();
+    let process_id = process.getpid();
+    let mut task_inner = task.inner_exclusive_access();
     let tid = task_inner.tid;
+    let clear_child_tid = task_inner.clear_child_tid.take();
     // record exit code
     task_inner.exit_code = Some(exit_code);
-    task_inner.res = None;
-    // UNFINISHED: Exited non-main threads stay in the process task table until
-    // process teardown. Linux clear_child_tid/futex-based join cleanup is not
-    // implemented here yet.
     drop(task_inner);
+    if let Some(clear_child_tid) = clear_child_tid {
+        crate::syscall::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
+    }
+    let mut task_inner = task.inner_exclusive_access();
+    task_inner.res = None;
+    drop(task_inner);
+    let exited_thread = if tid == 0 {
+        None
+    } else {
+        let mut process_inner = process.inner_exclusive_access();
+        if tid < process_inner.tasks.len() {
+            process_inner.tasks[tid] = None;
+        }
+        Some(Arc::clone(&task))
+    };
+    if let Some(task) = exited_thread {
+        queue_exited_task(task);
+    }
     drop(task);
     // however, if this is the main thread of current process
     // the process should terminate at once

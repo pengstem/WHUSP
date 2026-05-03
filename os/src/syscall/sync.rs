@@ -239,12 +239,12 @@ fn futex_key(addr: usize, private: bool) -> FutexKey {
     // libctest and musl pthread paths exercised here use process-private
     // futexes, so virtual-address keys are sufficient for this compatibility
     // subset.
+    futex_key_for_process(addr, private, current_process().getpid())
+}
+
+fn futex_key_for_process(addr: usize, private: bool, process_id: usize) -> FutexKey {
     FutexKey {
-        process_id: if private {
-            current_process().getpid()
-        } else {
-            0
-        },
+        process_id: if private { process_id } else { 0 },
         addr,
     }
 }
@@ -341,7 +341,17 @@ fn futex_wait(
 }
 
 fn futex_wake(addr: usize, private: bool, limit: usize, bitset: u32) -> usize {
-    let key = futex_key(addr, private);
+    futex_wake_for_process(addr, private, current_process().getpid(), limit, bitset)
+}
+
+fn futex_wake_for_process(
+    addr: usize,
+    private: bool,
+    process_id: usize,
+    limit: usize,
+    bitset: u32,
+) -> usize {
+    let key = futex_key_for_process(addr, private, process_id);
     let tasks = FUTEX_MANAGER.exclusive_access().wake(key, limit, bitset);
     let mut count = 0;
     for task in tasks {
@@ -350,6 +360,20 @@ fn futex_wake(addr: usize, private: bool, limit: usize, bitset: u32) -> usize {
         }
     }
     count
+}
+
+pub(crate) fn clear_child_tid_and_wake(token: usize, process_id: usize, addr: usize) {
+    if addr == 0 {
+        return;
+    }
+    if write_user_value(token, addr as *mut i32, &0).is_err() {
+        return;
+    }
+    let _ = futex_wake_for_process(addr, false, process_id, 1, FUTEX_BITSET_MATCH_ANY);
+    // CONTEXT: Linux specifies FUTEX_WAKE without FUTEX_PRIVATE_FLAG for
+    // clear_child_tid. This kernel keeps private and shared futex wait queues
+    // separate, so also wake the process-private key used by common libc paths.
+    let _ = futex_wake_for_process(addr, true, process_id, 1, FUTEX_BITSET_MATCH_ANY);
 }
 
 fn futex_requeue(

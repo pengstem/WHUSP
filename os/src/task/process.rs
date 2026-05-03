@@ -266,7 +266,11 @@ impl ProcessControlBlockInner {
     }
 
     pub fn thread_count(&self) -> usize {
-        self.tasks.len()
+        self.tasks
+            .iter()
+            .flatten()
+            .filter(|task| task.inner_exclusive_access().exit_code.is_none())
+            .count()
     }
 
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
