@@ -29,13 +29,14 @@ pub(crate) use fd::{FD_LIMIT, FdFlags, FdTableEntry};
 pub use id::{IDLE_PID, KernelStack, PidHandle, kstack_alloc, pid_alloc};
 pub(crate) use manager::any_process_references_mount;
 pub(crate) use manager::list_process_snapshots;
+pub(crate) use manager::processes_snapshot;
 pub(crate) use manager::remove_ready_tasks_of_process;
 pub use manager::{add_task, pid2process, remove_from_pid2process, wakeup_task};
 pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
     current_user_token, run_tasks, schedule, take_current_task,
 };
-pub use signal::{CLD_EXITED, SIGCHLD, SIGNAL_INFO_SLOTS, SignalFlags, SignalInfo};
+pub use signal::{CLD_EXITED, SIGCHLD, SIGNAL_INFO_SLOTS, SignalAction, SignalFlags, SignalInfo};
 pub use task::{TaskControlBlock, TaskStatus};
 
 fn with_current_process(process_fn: impl FnOnce(&ProcessControlBlock)) {
@@ -181,6 +182,24 @@ fn terminate_sibling_threads(
     }
 }
 
+pub(crate) fn queue_signal_to_task(
+    task: Arc<TaskControlBlock>,
+    signal: SignalFlags,
+    info: SignalInfo,
+) {
+    if signal.is_empty() {
+        return;
+    }
+    {
+        let mut task_inner = task.inner_exclusive_access();
+        task_inner.pending_signals |= signal;
+        if let Some(slot) = task_inner.signal_infos.get_mut(info.signo as usize) {
+            *slot = Some(info);
+        }
+    }
+    wakeup_task(task);
+}
+
 fn exit_current(exit_code: i32, group_exit: bool) {
     account_current_system_time();
     let task = take_current_task().unwrap();
@@ -252,19 +271,18 @@ fn exit_current(exit_code: i32, group_exit: bool) {
 
         if let Some(parent) = parent {
             let parent_task = {
-                let mut parent_inner = parent.inner_exclusive_access();
-                parent_inner.signals |= SignalFlags::SIGCHLD;
-                parent_inner.signal_infos[SIGCHLD as usize] = Some(SignalInfo::child_exit(
-                    SIGCHLD as i32,
-                    pid as i32,
-                    exit_code,
-                ));
+                let parent_inner = parent.inner_exclusive_access();
                 parent_inner
                     .tasks
                     .first()
                     .and_then(|task| task.as_ref().map(Arc::clone))
             };
             if let Some(parent_task) = parent_task {
+                queue_signal_to_task(
+                    Arc::clone(&parent_task),
+                    SignalFlags::SIGCHLD,
+                    SignalInfo::child_exit(SIGCHLD as i32, pid as i32, exit_code),
+                );
                 let is_blocked =
                     parent_task.inner_exclusive_access().task_status == TaskStatus::Blocked;
                 if is_blocked {
@@ -316,15 +334,37 @@ pub fn add_initproc() {
 pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
     let task = current_task()?;
     let process = task.process.upgrade()?;
-    let process_inner = process.inner_exclusive_access();
-    process_inner.signals.check_error()
+    let pending = {
+        let task_inner = task.inner_exclusive_access();
+        task_inner.pending_signals & !task_inner.signal_mask
+    };
+    let signum = pending.bits().trailing_zeros() as usize;
+    if signum >= SIGNAL_INFO_SLOTS {
+        return None;
+    }
+    let action = process.inner_exclusive_access().signal_actions[signum];
+    if action.is_ignore() {
+        let mut task_inner = task.inner_exclusive_access();
+        if let Some(signal) = SignalFlags::from_signum(signum as u32) {
+            task_inner.pending_signals.remove(signal);
+        }
+        if let Some(slot) = task_inner.signal_infos.get_mut(signum) {
+            *slot = None;
+        }
+        return None;
+    }
+    if action.has_user_handler() {
+        return None;
+    }
+    pending.check_error()
 }
 
 pub fn current_add_signal(signal: SignalFlags) {
-    if let Some(task) = current_task()
-        && let Some(process) = task.process.upgrade()
-    {
-        let mut process_inner = process.inner_exclusive_access();
-        process_inner.signals |= signal;
+    if signal.is_empty() {
+        return;
+    }
+    if let Some(task) = current_task() {
+        let signum = signal.bits().trailing_zeros() as i32;
+        queue_signal_to_task(task, signal, SignalInfo::user(signum, 0));
     }
 }

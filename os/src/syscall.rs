@@ -38,7 +38,12 @@ const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 const SYSCALL_SYSLOG: usize = 116;
 const SYSCALL_SCHED_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
+const SYSCALL_TKILL: usize = 130;
+const SYSCALL_TGKILL: usize = 131;
+const SYSCALL_RT_SIGACTION: usize = 134;
+const SYSCALL_RT_SIGPROCMASK: usize = 135;
 const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
+const SYSCALL_RT_SIGRETURN: usize = 139;
 const SYSCALL_REBOOT: usize = 142;
 const SYSCALL_TIMES: usize = 153;
 const SYSCALL_UNAME: usize = 160;
@@ -205,12 +210,24 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_SCHED_YIELD => Ok(sys_sched_yield()),
         SYSCALL_KILL => sys_kill(args[0], args[1] as u32),
+        SYSCALL_TKILL => sys_tkill(args[0], args[1] as u32),
+        SYSCALL_TGKILL => sys_tgkill(args[0], args[1], args[2] as u32),
+        SYSCALL_RT_SIGACTION => sys_rt_sigaction(
+            args[0] as u32,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+        ),
+        SYSCALL_RT_SIGPROCMASK => {
+            sys_rt_sigprocmask(args[0], args[1] as *const u8, args[2] as *mut u8, args[3])
+        }
         SYSCALL_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(
             args[0] as *const u8,
             args[1] as *mut LinuxSigInfo,
             args[2] as *const LinuxTimeSpec,
             args[3],
         ),
+        SYSCALL_RT_SIGRETURN => sys_rt_sigreturn(),
         SYSCALL_REBOOT => sys_reboot(args[0], args[1], args[2], args[3]),
         SYSCALL_TIMES => sys_times(args[0] as *mut LinuxTms),
         SYSCALL_UNAME => sys_uname(args[0] as *mut LinuxUtsName),

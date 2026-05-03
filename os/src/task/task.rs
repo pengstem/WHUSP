@@ -1,5 +1,8 @@
 use super::id::{PidHandle, TaskUserRes};
-use super::{KernelStack, ProcessControlBlock, TaskContext, kstack_alloc};
+use super::{
+    KernelStack, ProcessControlBlock, SIGNAL_INFO_SLOTS, SignalFlags, SignalInfo, TaskContext,
+    kstack_alloc,
+};
 use crate::trap::TrapContext;
 use crate::{
     mm::PhysPageNum,
@@ -45,6 +48,9 @@ pub struct TaskControlBlockInner {
     pub exit_code: Option<i32>,
     pub linux_tid: Option<PidHandle>,
     pub clear_child_tid: Option<usize>,
+    pub pending_signals: SignalFlags,
+    pub signal_infos: [Option<SignalInfo>; SIGNAL_INFO_SLOTS],
+    pub signal_mask: SignalFlags,
 }
 
 impl TaskControlBlockInner {
@@ -83,6 +89,9 @@ impl TaskControlBlock {
                     exit_code: None,
                     linux_tid: None,
                     clear_child_tid: None,
+                    pending_signals: SignalFlags::empty(),
+                    signal_infos: [None; SIGNAL_INFO_SLOTS],
+                    signal_mask: SignalFlags::empty(),
                 })
             },
         }

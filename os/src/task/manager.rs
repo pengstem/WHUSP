@@ -74,6 +74,11 @@ pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
     map.get(&pid).map(Arc::clone)
 }
 
+pub(crate) fn processes_snapshot() -> Vec<Arc<ProcessControlBlock>> {
+    let map = PID2PCB.exclusive_access();
+    map.values().cloned().collect()
+}
+
 pub(crate) fn list_process_snapshots() -> Vec<ProcessProcSnapshot> {
     let processes = {
         let map = PID2PCB.exclusive_access();

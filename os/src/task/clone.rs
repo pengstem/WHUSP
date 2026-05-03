@@ -70,13 +70,17 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
         .as_ref()
         .unwrap()
         .ustack_base;
-    let parent_trap_cx = *current_task.inner_exclusive_access().get_trap_cx();
+    let parent_inner = current_task.inner_exclusive_access();
+    let parent_trap_cx = *parent_inner.get_trap_cx();
+    let parent_signal_mask = parent_inner.signal_mask;
+    drop(parent_inner);
     let new_task = Arc::new(TaskControlBlock::new(process, ustack_base, true));
     let mut new_task_inner = new_task.inner_exclusive_access();
     let new_ustack_top = new_task_inner.res.as_ref().unwrap().ustack_top();
     let linux_tid = pid_alloc();
     let new_linux_tid = linux_tid.0;
     new_task_inner.linux_tid = Some(linux_tid);
+    new_task_inner.signal_mask = parent_signal_mask;
     let new_trap_cx = new_task_inner.get_trap_cx();
     *new_trap_cx = parent_trap_cx;
     new_trap_cx.set_a0(0);

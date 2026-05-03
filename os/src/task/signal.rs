@@ -1,32 +1,50 @@
 use bitflags::*;
 
-pub const SIGNAL_INFO_SLOTS: usize = 32;
+pub const SIGNAL_INFO_SLOTS: usize = 65;
 
 pub const SI_USER: i32 = 0;
 pub const SIGCHLD: u32 = 17;
 pub const CLD_EXITED: i32 = 1;
 
 bitflags! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct SignalFlags: u32 {
-        const SIGHUP    = 1 << 1;
-        const SIGINT    = 1 << 2;
-        const SIGQUIT   = 1 << 3;
-        const SIGILL    = 1 << 4;
-        const SIGTRAP   = 1 << 5;
-        const SIGABRT   = 1 << 6;
-        const SIGBUS    = 1 << 7;
-        const SIGFPE    = 1 << 8;
-        const SIGKILL   = 1 << 9;
-        const SIGUSR1   = 1 << 10;
-        const SIGSEGV   = 1 << 11;
-        const SIGUSR2   = 1 << 12;
-        const SIGPIPE   = 1 << 13;
-        const SIGALRM   = 1 << 14;
-        const SIGTERM   = 1 << 15;
-        const SIGCHLD   = 1 << 17;
-        const SIGCONT   = 1 << 18;
-        const SIGSTOP   = 1 << 19;
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct SignalFlags: u128 {
+        const SIGHUP    = 1u128 << 1;
+        const SIGINT    = 1u128 << 2;
+        const SIGQUIT   = 1u128 << 3;
+        const SIGILL    = 1u128 << 4;
+        const SIGTRAP   = 1u128 << 5;
+        const SIGABRT   = 1u128 << 6;
+        const SIGBUS    = 1u128 << 7;
+        const SIGFPE    = 1u128 << 8;
+        const SIGKILL   = 1u128 << 9;
+        const SIGUSR1   = 1u128 << 10;
+        const SIGSEGV   = 1u128 << 11;
+        const SIGUSR2   = 1u128 << 12;
+        const SIGPIPE   = 1u128 << 13;
+        const SIGALRM   = 1u128 << 14;
+        const SIGTERM   = 1u128 << 15;
+        const SIGCHLD   = 1u128 << 17;
+        const SIGCONT   = 1u128 << 18;
+        const SIGSTOP   = 1u128 << 19;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SignalAction {
+    pub handler: usize,
+    pub flags: usize,
+    pub restorer: usize,
+    pub mask: SignalFlags,
+}
+
+impl SignalAction {
+    pub fn is_ignore(&self) -> bool {
+        self.handler == 1
+    }
+
+    pub fn has_user_handler(&self) -> bool {
+        self.handler > 1
     }
 }
 
@@ -65,10 +83,10 @@ impl SignalFlags {
     pub fn from_signum(signum: u32) -> Option<Self> {
         if signum == 0 {
             Some(Self::empty())
-        } else if signum > 31 {
+        } else if signum >= SIGNAL_INFO_SLOTS as u32 {
             None
         } else {
-            Some(Self::from_bits_truncate(1 << signum))
+            Some(Self::from_bits_truncate(1u128 << signum))
         }
     }
 

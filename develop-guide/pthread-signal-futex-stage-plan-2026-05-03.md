@@ -79,3 +79,8 @@ Local ABI evidence:
 ## Move Log
 
 - 2026-05-03: Created this plan before code movement. No source movement yet.
+- 2026-05-03 Stage A: moved pending signal bits, signal info slots, and signal
+  mask into `TaskControlBlockInner`; replaced PCB pending signal storage with a
+  process-wide `signal_actions` table; added syscall dispatch and basic
+  implementations for `tkill`, `tgkill`, `rt_sigaction`, `rt_sigprocmask`, and
+  the `rt_sigreturn` Stage B boundary.

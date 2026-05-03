@@ -5,7 +5,7 @@ use super::process::{
     ProcessControlBlock, ProcessControlBlockInner, ProcessCpuTimes, ProcessResourceLimits,
 };
 use super::{
-    CloneArgs, CloneFlags, FdTableEntry, SignalFlags, TaskControlBlock, add_task, pid_alloc,
+    CloneArgs, CloneFlags, FdTableEntry, SignalAction, TaskControlBlock, add_task, pid_alloc,
 };
 use crate::fs::{OpenFlags, Stdin, Stdout, WorkingDir};
 use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet};
@@ -87,8 +87,7 @@ impl ProcessControlBlock {
                         )),
                     ],
                     resource_limits: ProcessResourceLimits::new(),
-                    signals: SignalFlags::empty(),
-                    signal_infos: [None; super::SIGNAL_INFO_SLOTS],
+                    signal_actions: [SignalAction::default(); super::SIGNAL_INFO_SLOTS],
                     cpu_times: ProcessCpuTimes::default(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -143,6 +142,7 @@ impl ProcessControlBlock {
         let cwd = parent.cwd;
         let cwd_path = parent.cwd_path.clone();
         let cmdline = parent.cmdline.clone();
+        let signal_actions = parent.signal_actions;
         let ustack_base = parent
             .get_task(0)
             .inner_exclusive_access()
@@ -150,6 +150,7 @@ impl ProcessControlBlock {
             .as_ref()
             .unwrap()
             .ustack_base();
+        let parent_signal_mask = parent.get_task(0).inner_exclusive_access().signal_mask;
         drop(parent);
 
         let child = Arc::new(Self {
@@ -166,8 +167,7 @@ impl ProcessControlBlock {
                     exit_code: 0,
                     fd_table: new_fd_table,
                     resource_limits,
-                    signals: SignalFlags::empty(),
-                    signal_infos: [None; super::SIGNAL_INFO_SLOTS],
+                    signal_actions,
                     cpu_times: ProcessCpuTimes::default(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -192,6 +192,7 @@ impl ProcessControlBlock {
         let trap_cx = task_inner.get_trap_cx();
         trap_cx.kernel_sp = task.kstack.get_top();
         drop(task_inner);
+        task.inner_exclusive_access().signal_mask = parent_signal_mask;
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);
         child

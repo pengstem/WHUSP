@@ -4,7 +4,7 @@ use crate::sbi::shutdown;
 use crate::task::{
     CloneArgs, CloneFlags, ProcessCpuTimesSnapshot, RLimit, RLimitResource, SignalFlags,
     SignalInfo, add_task, clone_current_thread, current_process, current_task, current_user_token,
-    exit_current_and_run_next, exit_current_group_and_run_next, pid2process,
+    exit_current_and_run_next, exit_current_group_and_run_next, pid2process, queue_signal_to_task,
     suspend_current_and_run_next, wakeup_task,
 };
 use crate::timer::{get_time_clock_ticks, us_to_clock_ticks};
@@ -625,10 +625,19 @@ pub fn sys_kill(pid: usize, signal: u32) -> SysResult {
     let process = pid2process(pid).ok_or(SysError::ESRCH)?;
     if !flag.is_empty() {
         let sender_pid = current_process().getpid() as i32;
-        let mut inner = process.inner_exclusive_access();
-        inner.signals |= flag;
-        if (signal as usize) < inner.signal_infos.len() {
-            inner.signal_infos[signal as usize] = Some(SignalInfo::user(signal as i32, sender_pid));
+        let target = {
+            let tasks = process.tasks_snapshot();
+            tasks
+                .iter()
+                .find(|task| {
+                    let task_inner = task.inner_exclusive_access();
+                    !(task_inner.signal_mask & flag).contains(flag)
+                })
+                .cloned()
+                .or_else(|| tasks.first().cloned())
+        };
+        if let Some(task) = target {
+            queue_signal_to_task(task, flag, SignalInfo::user(signal as i32, sender_pid));
         }
     }
     if flag.check_error().is_some() {
