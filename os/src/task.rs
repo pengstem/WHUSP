@@ -148,8 +148,10 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     // record exit code
     task_inner.exit_code = Some(exit_code);
     drop(task_inner);
-    if let Some(clear_child_tid) = clear_child_tid {
-        crate::syscall::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
+    if tid != 0 {
+        if let Some(clear_child_tid) = clear_child_tid {
+            crate::syscall::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
+        }
     }
     let mut task_inner = task.inner_exclusive_access();
     task_inner.res = None;
