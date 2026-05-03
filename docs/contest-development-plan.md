@@ -194,12 +194,12 @@
 
 ### 推荐推进顺序
 
-1. [ ] **线程 ID 地基**：区分内核 task slot tid 和 Linux-visible TID；补 `gettid(178)`、`set_tid_address(96)`，并让 `tkill/tgkill`、robust list、clear-child-tid 都使用 Linux-visible TID。
-2. [ ] **线程退出清理**：消费 `CLONE_CHILD_CLEARTID` / `set_tid_address` 保存的 `clear_child_tid`，非主线程退出时写 0、`futex_wake(1)`、从 task table 移除并回收线程资源。
-3. [ ] **classic futex 校准**：复查现有 `futex(98)` 的 WAIT、WAKE、WAIT_BITSET、WAKE_BITSET、REQUEUE、CMP_REQUEUE 的 errno、timeout、返回计数和 waiter 清理，先满足 musl pthread mutex/cond/join。
-4. [ ] **先过非取消 pthread 用例**：按 `pthread_mutex.c` -> `pthread_cond.c` -> `pthread_tsd.c` 顺序验收，确认基础线程创建、TLS、join、futex wake 不再超时。
-5. [ ] **signal/cancel 地基**：补 `tkill(130)`、`tgkill(131)`、`rt_sigprocmask(135)`、`rt_sigaction(134)`、`rt_sigreturn(139)`；把 signal pending/mask 从 process-wide 位图推进到每线程语义，并能唤醒可中断等待。
-6. [ ] **pthread cancel**：按 `pthread_cancel.c` -> `pthread_cancel-points.c` 验收，确保 cancel signal 不误杀整个进程，cleanup handler 执行，取消点和非取消点行为分开。
+1. [x] **线程 ID 地基**：区分内核 task slot tid 和 Linux-visible TID；补 `gettid(178)`、`set_tid_address(96)`，并让 `tkill/tgkill`、robust list、clear-child-tid 都使用 Linux-visible TID。
+2. [x] **线程退出清理**：消费 `CLONE_CHILD_CLEARTID` / `set_tid_address` 保存的 `clear_child_tid`，非主线程退出时写 0、`futex_wake(1)`、从 task table 移除并回收线程资源。
+3. [x] **classic futex 校准**：复查现有 `futex(98)` 的 WAIT、WAKE、WAIT_BITSET、WAKE_BITSET、REQUEUE、CMP_REQUEUE 的 errno、timeout、返回计数和 waiter 清理，先满足 musl pthread mutex/cond/join。
+4. [x] **先过非取消 pthread 用例**：按 `pthread_mutex.c` -> `pthread_cond.c` -> `pthread_tsd.c` 顺序验收，确认基础线程创建、TLS、join、futex wake 不再超时。
+5. [x] **signal/cancel 地基**：补 `tkill(130)`、`tgkill(131)`、`rt_sigprocmask(135)`、`rt_sigaction(134)`、`rt_sigreturn(139)`；把 signal pending/mask 从 process-wide 位图推进到每线程语义，并能唤醒可中断等待。
+6. [x] **pthread cancel**：按 `pthread_cancel.c` -> `pthread_cancel-points.c` 验收，确保 cancel signal 不误杀整个进程，cleanup handler 执行，取消点和非取消点行为分开。
 7. [ ] **PI futex 最小兼容**：补 `FUTEX_LOCK_PI`、`FUTEX_UNLOCK_PI`、`FUTEX_TRYLOCK_PI` 的 owner/waiter 语义；真实 priority inheritance 可先保留 `// UNFINISHED:`。
 8. [ ] **robust futex**：补 `set_robust_list(99)` / `get_robust_list(100)`，线程退出时遍历 robust list，设置 `FUTEX_OWNER_DIED` 并唤醒 waiter。
 

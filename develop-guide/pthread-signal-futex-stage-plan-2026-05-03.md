@@ -107,3 +107,20 @@ Local ABI evidence:
   `FAIL pthread_cancel-points [signal Hangup]`, so Stage C starts from that
   first remaining cancel-point evidence rather than the old `rt_sigreturn`
   loop.
+- 2026-05-04 Stage C direction: removed the experimental kernel-side musl
+  cancel-state filter. That filter left SIGCANCEL pending and unmasked, which
+  let earlier cancellation state contaminate the final non-cancel `shm_open`
+  scenario. The replacement is the Linux-like wait boundary: keep normal
+  SIGCANCEL handler delivery and make `futex_wait` remove its waiter and return
+  `EINTR` when it is woken without a futex wake or timeout.
+- 2026-05-04 Stage C root cause: `pthread_cancel-points` reached the final
+  `shm_open` scenario, but `shm_open("/testshm", O_RDWR|O_CREAT, 0666)` failed
+  because the kernel had no `/dev/shm` tmpfs. The test then entered `t_error`,
+  whose `write(64)` path is a musl cancellation point, so the pending cancel
+  request turned the diagnostic path into `PTHREAD_CANCELED`. Linux man-pages
+  document POSIX SHM as normally backed by a tmpfs mounted at `/dev/shm`, so the
+  kernel now mounts tmpfs there instead of adding a path rewrite.
+- 2026-05-04 Stage C validation: with a temporary initproc command running
+  `cd /musl && ./runtest.exe -w entry-static.exe pthread_cancel_points`,
+  `make kernel-rv` passed and the QEMU run printed `Pass!` for
+  `pthread_cancel_points` after mounting `/dev/shm`.

@@ -488,28 +488,44 @@ fn mount_extra_block_devices() {
 
 fn ensure_primary_dir(name: &str, mode: u32) -> Option<WorkingDir> {
     let root_ino = primary_root_ino();
-    with_mount(primary_mount_id(), |mount| {
-        match mount.lookup_component_from(root_ino, name) {
+    ensure_primary_child_dir(
+        WorkingDir::new(primary_mount_id(), root_ino),
+        name,
+        mode,
+        &format!("/{name}"),
+    )
+}
+
+fn ensure_primary_child_dir(
+    parent: WorkingDir,
+    name: &str,
+    mode: u32,
+    display_path: &str,
+) -> Option<WorkingDir> {
+    with_mount(parent.mount_id(), |mount| {
+        match mount.lookup_component_from(parent.ino(), name) {
             Ok((ino, kind)) => {
                 if kind == FsNodeKind::Directory {
-                    return Some(WorkingDir::new(primary_mount_id(), ino));
+                    return Some(WorkingDir::new(parent.mount_id(), ino));
                 }
-                warn!("cannot mount pseudo filesystem at /{name}: target is not a directory");
+                warn!(
+                    "cannot mount pseudo filesystem at {display_path}: target is not a directory"
+                );
                 return None;
             }
             Err(FsError::NotFound) => {}
             Err(err) => {
-                warn!("cannot lookup /{name} for pseudo filesystem mount: {err:?}");
+                warn!("cannot lookup {display_path} for pseudo filesystem mount: {err:?}");
                 return None;
             }
         }
 
         mount
-            .create_dir(root_ino, name, mode)
-            .map(|ino| WorkingDir::new(primary_mount_id(), ino))
+            .create_dir(parent.ino(), name, mode)
+            .map(|ino| WorkingDir::new(parent.mount_id(), ino))
             .ok()
             .or_else(|| {
-                warn!("cannot create /{name} for pseudo filesystem mount");
+                warn!("cannot create {display_path} for pseudo filesystem mount");
                 None
             })
     })
@@ -527,6 +543,14 @@ fn mount_kernel_pseudo_filesystems() {
         match mount_pseudo_fs_at(target, Box::new(TmpFs::new()), "tmpfs") {
             Ok(_) => info!("filesystem mounted from tmpfs at /tmp"),
             Err(err) => warn!("failed to mount tmpfs at /tmp: {err:?}"),
+        }
+    }
+    if let Some(dev) = ensure_primary_dir("dev", 0o755) {
+        if let Some(target) = ensure_primary_child_dir(dev, "shm", 0o1777, "/dev/shm") {
+            match mount_pseudo_fs_at(target, Box::new(TmpFs::new()), "tmpfs") {
+                Ok(_) => info!("filesystem mounted from tmpfs at /dev/shm"),
+                Err(err) => warn!("failed to mount tmpfs at /dev/shm: {err:?}"),
+            }
         }
     }
 }

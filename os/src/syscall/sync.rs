@@ -348,11 +348,16 @@ fn futex_wait(
     }
     schedule(task_cx_ptr);
 
+    let mut manager = FUTEX_MANAGER.exclusive_access();
+    let still_waiting = manager.remove_waiter(key, &task) || manager.remove_waiter_any(&task);
     if futex_timeout_expired(timeout_ms) {
-        let mut manager = FUTEX_MANAGER.exclusive_access();
-        if manager.remove_waiter(key, &task) || manager.remove_waiter_any(&task) {
+        if still_waiting {
             return Err(SysError::ETIMEDOUT);
         }
+        return Ok(0);
+    }
+    if still_waiting {
+        return Err(SysError::EINTR);
     }
     Ok(0)
 }

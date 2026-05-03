@@ -2,7 +2,7 @@ mod context;
 
 use crate::config::TRAMPOLINE;
 use crate::mm::{MmapFaultAccess, MmapFaultResult};
-use crate::syscall::syscall;
+use crate::syscall::{errno::SysError, syscall};
 use crate::task::{
     SignalFlags, account_current_system_time_until, account_current_user_time_until,
     check_signals_of_current, current_add_signal, current_process, current_trap_cx,
@@ -77,13 +77,18 @@ pub fn trap_handler() -> ! {
             enable_supervisor_interrupt();
 
             // get system call return value
+            let syscall_id = cx.x[17];
             let result = syscall(
-                cx.x[17],
+                syscall_id,
                 [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]],
             );
             // cx is changed during sys_execve, so we have to call it again
             cx = current_trap_cx();
             if cx.sepc != trap_pc + 4 {
+                interrupted_pc = cx.sepc;
+            } else if result == -(SysError::EINTR as isize) {
+                interrupted_pc = trap_pc;
+            } else {
                 interrupted_pc = cx.sepc;
             }
             cx.x[10] = result as usize;
