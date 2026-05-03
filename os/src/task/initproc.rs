@@ -6,19 +6,33 @@ const BUSYBOX_PATH: &str = "/musl/busybox";
 const BUSYBOX_APPLET: &str = "sh";
 const BUSYBOX_COMMAND_FLAG: &str = "-c";
 const TEST_LIBCS: &[&str] = &["/musl", "/glibc"];
-const TEST_SCRIPTS: &[&str] = &[
-    // "basic_testcode.sh",
-    // "busybox_testcode.sh",
-    // "lua_testcode.sh",
+const ALL_TESTS: &[&str] = &[
+    "basic_testcode.sh",
+    "busybox_testcode.sh",
+    "lua_testcode.sh",
     "libctest_testcode.sh",
-    // "iozone_testcode.sh",
-    // "unixbench_testcode.sh",
-    // "iperf_testcode.sh",
-    // "libcbench_testcode.sh",
-    // "lmbench_testcode.sh",
-    // "netperf_testcode.sh",
-    // "cyclictest_testcode.sh",
-    // "ltp_testcode.sh",
+    "iozone_testcode.sh",
+    "unixbench_testcode.sh",
+    "iperf_testcode.sh",
+    "libcbench_testcode.sh",
+    "lmbench_testcode.sh",
+    "netperf_testcode.sh",
+    "cyclictest_testcode.sh",
+    "ltp_testcode.sh",
+];
+const TEST_SCRIPTS: &[&str] = &[
+    "basic_testcode.sh",
+    "busybox_testcode.sh",
+    "lua_testcode.sh",
+    "libctest_testcode.sh",
+    "iozone_testcode.sh",
+    "unixbench_testcode.sh",
+    "iperf_testcode.sh",
+    "libcbench_testcode.sh",
+    "lmbench_testcode.sh",
+    "netperf_testcode.sh",
+    "cyclictest_testcode.sh",
+    "ltp_testcode.sh",
 ];
 
 pub(super) struct KernelInitProc {
@@ -32,6 +46,26 @@ fn build_runner_command() -> String {
     let mut command =
         String::from("/musl/busybox mkdir -p /bin && /musl/busybox --install -s /bin");
 
+    for test in ALL_TESTS {
+        if !TEST_SCRIPTS.contains(test) {
+            let _ = write!(
+                command,
+                "; echo '#### OS COMP TEST GROUP START {test}-musl ####' "
+            );
+            let _ = write!(
+                command,
+                "; echo '#### OS COMP TEST GROUP END {test}-musl ####' "
+            );
+            let _ = write!(
+                command,
+                "; echo '#### OS COMP TEST GROUP START {test}-glibc ####' "
+            );
+            let _ = write!(
+                command,
+                "; echo '#### OS COMP TEST GROUP END {test}-glibc ####' "
+            );
+        }
+    }
     for script in TEST_SCRIPTS {
         for libc_root in TEST_LIBCS {
             let _ = write!(command, "; (cd {libc_root} && ./busybox sh ./{script})");

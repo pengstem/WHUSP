@@ -280,7 +280,25 @@ pub fn sys_setrlimit(resource: i32, new_limit: *const RLimit) -> SysResult {
     sys_prlimit64(0, resource, new_limit, core::ptr::null_mut())
 }
 
-pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usize) -> SysResult {
+fn clone_tls_and_ctid_args(raw_arg4: usize, raw_arg5: usize) -> (usize, usize) {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        (raw_arg5, raw_arg4)
+    }
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        (raw_arg4, raw_arg5)
+    }
+}
+
+pub fn sys_clone(
+    flags: usize,
+    stack: usize,
+    ptid: usize,
+    raw_arg4: usize,
+    raw_arg5: usize,
+) -> SysResult {
+    let (tls, ctid) = clone_tls_and_ctid_args(raw_arg4, raw_arg5);
     let Some(args) = CloneArgs::parse(flags, stack, ptid, tls, ctid) else {
         return Err(SysError::EINVAL);
     };
@@ -304,10 +322,10 @@ fn sys_clone_process(args: CloneArgs) -> SysResult {
 
     if args.flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
         let parent_token = current_user_token();
-        *translated_refmut(parent_token, args.ptid as *mut i32) = new_pid as i32;
+        write_user_value(parent_token, args.ptid as *mut i32, &(new_pid as i32))?;
     }
     if args.flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
-        *translated_refmut(child_token, args.ctid as *mut i32) = new_pid as i32;
+        write_user_value(child_token, args.ctid as *mut i32, &(new_pid as i32))?;
     }
     Ok(new_pid as isize)
 }
@@ -318,10 +336,10 @@ fn sys_clone_thread(args: CloneArgs) -> SysResult {
     let process_token = process.attach_task(Arc::clone(&cloned.task));
 
     if args.flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
-        *translated_refmut(process_token, args.ptid as *mut i32) = cloned.tid as i32;
+        write_user_value(process_token, args.ptid as *mut i32, &(cloned.tid as i32))?;
     }
     if args.flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
-        *translated_refmut(process_token, args.ctid as *mut i32) = cloned.tid as i32;
+        write_user_value(process_token, args.ctid as *mut i32, &(cloned.tid as i32))?;
     }
     add_task(cloned.task);
     Ok(cloned.tid as isize)

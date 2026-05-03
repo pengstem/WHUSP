@@ -148,9 +148,9 @@ impl MemorySet {
         shared: bool,
         writable: bool,
     ) -> Option<usize> {
-        let map_len = page_align_up(len);
+        let map_len = checked_page_align_up(len)?;
         let start = self.alloc_mmap_range(map_len)?;
-        let end = start + map_len;
+        let end = start.checked_add(map_len)?;
         let mut area = MapArea::new(start.into(), end.into(), MapType::Framed, permission);
         area.mmap_info = Some(MmapInfo {
             shared,
@@ -160,7 +160,7 @@ impl MemorySet {
             backing_file,
         });
         self.areas.push(area);
-        self.mmap_next = end;
+        self.mmap_next = next_mmap_hint(end);
         Some(start)
     }
 
@@ -177,7 +177,7 @@ impl MemorySet {
         if start % PAGE_SIZE != 0 {
             return None;
         }
-        let map_len = page_align_up(len);
+        let map_len = checked_page_align_up(len)?;
         let end = start.checked_add(map_len)?;
         let start_vpn = VirtAddr::from(start).floor();
         let end_vpn = VirtAddr::from(end).floor();
@@ -208,7 +208,6 @@ impl MemorySet {
             backing_file,
         });
         self.areas.push(area);
-        self.mmap_next = self.mmap_next.max(end);
         Some((start, flushes))
     }
 
@@ -326,16 +325,24 @@ impl MemorySet {
         if len == 0 || len > USER_MMAP_LIMIT - USER_MMAP_BASE {
             return None;
         }
-        let mut start = page_align_up(self.mmap_next.max(USER_MMAP_BASE));
-        while start
-            .checked_add(len)
-            .is_some_and(|end| end <= USER_MMAP_LIMIT)
-        {
-            let end = start + len;
-            if !self.range_overlaps(start, end) {
-                return Some(start);
+        let hint = normalized_mmap_hint(self.mmap_next);
+        self.find_mmap_hole(hint, USER_MMAP_LIMIT, len)
+            .or_else(|| self.find_mmap_hole(USER_MMAP_BASE, hint, len))
+    }
+
+    fn find_mmap_hole(&self, start: usize, limit: usize, len: usize) -> Option<usize> {
+        if start >= limit {
+            return None;
+        }
+        let mut cursor = page_align_up(start);
+        while let Some(end) = cursor.checked_add(len) {
+            if end > limit {
+                break;
             }
-            start += PAGE_SIZE;
+            if !self.range_overlaps(cursor, end) {
+                return Some(cursor);
+            }
+            cursor = cursor.checked_add(PAGE_SIZE)?;
         }
         None
     }
@@ -409,5 +416,26 @@ impl MemorySet {
                     .as_ref()
                     .is_none_or(|file| file.writable())
             })
+    }
+}
+
+fn checked_page_align_up(addr: usize) -> Option<usize> {
+    addr.checked_add(PAGE_SIZE - 1)
+        .map(|addr| addr & !(PAGE_SIZE - 1))
+}
+
+fn normalized_mmap_hint(hint: usize) -> usize {
+    if hint < USER_MMAP_BASE || hint >= USER_MMAP_LIMIT {
+        USER_MMAP_BASE
+    } else {
+        page_align_up(hint)
+    }
+}
+
+fn next_mmap_hint(end: usize) -> usize {
+    if end >= USER_MMAP_LIMIT {
+        USER_MMAP_BASE
+    } else {
+        end
     }
 }
