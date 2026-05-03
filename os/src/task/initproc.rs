@@ -6,6 +6,7 @@ const BUSYBOX_PATH: &str = "/musl/busybox";
 const BUSYBOX_APPLET: &str = "sh";
 const BUSYBOX_COMMAND_FLAG: &str = "-c";
 const TEST_LIBCS: &[&str] = &["/musl", "/glibc"];
+const TEST: bool = false;
 const ALL_TESTS: &[&str] = &[
     "basic_testcode.sh",
     "busybox_testcode.sh",
@@ -25,7 +26,7 @@ const TEST_SCRIPTS: &[&str] = &[
     // "basic_testcode.sh",
     // "busybox_testcode.sh",
     // "lua_testcode.sh",
-    "libctest_testcode.sh",
+    // "libctest_testcode.sh",
     // "iozone_testcode.sh",
     // "unixbench_testcode.sh",
     // "iperf_testcode.sh",
@@ -72,7 +73,7 @@ fn build_runner_command() -> String {
             let _ = write!(command, "; (cd {libc_root} && ./busybox sh ./{script})");
         }
     }
-    if TEST_SCRIPTS.is_empty() {
+    if TEST_SCRIPTS.is_empty() && TEST {
         let _ = write!(command, ";(sh)");
     } else {
         let _ = write!(command, "; (cd /musl && ./busybox reboot )");
