@@ -27,13 +27,12 @@ impl TaskControlBlock {
     }
 
     pub fn linux_tid(&self) -> usize {
-        let inner = self.inner_exclusive_access();
-        if let Some(tid) = inner.linux_tid.as_ref() {
-            tid.0
-        } else {
-            drop(inner);
-            self.process.upgrade().unwrap().getpid()
-        }
+        let tid = self
+            .inner_exclusive_access()
+            .linux_tid
+            .as_ref()
+            .map(|handle| handle.0);
+        tid.unwrap_or_else(|| self.process.upgrade().unwrap().getpid())
     }
 }
 

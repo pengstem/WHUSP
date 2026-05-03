@@ -20,6 +20,7 @@ const ALL_TESTS: &[&str] = &[
     "cyclictest_testcode.sh",
     "ltp_testcode.sh",
 ];
+// CONTEXT: temporary - only libctest enabled for pthread bringup; restore all before merge.
 const TEST_SCRIPTS: &[&str] = &[
     // "basic_testcode.sh",
     // "busybox_testcode.sh",

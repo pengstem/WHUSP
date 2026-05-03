@@ -16,6 +16,7 @@ use crate::arch::__switch;
 use crate::sbi::shutdown;
 use crate::sync::UPIntrFreeCell;
 use alloc::{sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::*;
 use log::info;
 use manager::fetch_task;
@@ -112,6 +113,11 @@ pub fn block_current_and_run_next() {
     schedule(task_cx_ptr);
 }
 
+static EXITED_DIRTY: AtomicBool = AtomicBool::new(false);
+
+// CONTEXT: EXITED_TASKS defers Arc<TaskControlBlock> drops past the
+// __switch boundary so kernel stacks remain mapped until the next
+// scheduling tick completes.
 lazy_static! {
     static ref EXITED_TASKS: UPIntrFreeCell<Vec<Arc<TaskControlBlock>>> =
         unsafe { UPIntrFreeCell::new(Vec::new()) };
@@ -119,9 +125,13 @@ lazy_static! {
 
 fn queue_exited_task(task: Arc<TaskControlBlock>) {
     EXITED_TASKS.exclusive_access().push(task);
+    EXITED_DIRTY.store(true, Ordering::Release);
 }
 
 pub(crate) fn reap_exited_tasks() {
+    if !EXITED_DIRTY.swap(false, Ordering::Acquire) {
+        return;
+    }
     EXITED_TASKS.exclusive_access().clear();
 }
 
@@ -130,7 +140,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     account_current_system_time();
     let task = take_current_task().unwrap();
     let process = task.process.upgrade().unwrap();
-    let process_token = process.inner_exclusive_access().memory_set.token();
+    let process_token = process.inner_exclusive_access().get_user_token();
     let process_id = process.getpid();
     let mut task_inner = task.inner_exclusive_access();
     let tid = task_inner.tid;
