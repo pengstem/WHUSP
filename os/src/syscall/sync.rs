@@ -70,6 +70,17 @@ impl FutexManager {
         removed
     }
 
+    fn remove_waiter_any(&mut self, task: &Arc<TaskControlBlock>) -> bool {
+        let mut removed = false;
+        self.waiters.retain(|_, queue| {
+            let old_len = queue.len();
+            queue.retain(|waiter| !Arc::ptr_eq(&waiter.task, task));
+            removed |= old_len != queue.len();
+            !queue.is_empty()
+        });
+        removed
+    }
+
     fn wake(&mut self, key: FutexKey, limit: usize, bitset: u32) -> Vec<Arc<TaskControlBlock>> {
         let Some(queue) = self.waiters.get_mut(&key) else {
             return Vec::new();
@@ -298,6 +309,10 @@ fn futex_timeout_absolute(
     ))
 }
 
+fn futex_timeout_expired(timeout_ms: Option<usize>) -> bool {
+    matches!(timeout_ms, Some(deadline_ms) if deadline_ms <= get_time_ms())
+}
+
 fn futex_wait(
     addr: usize,
     private: bool,
@@ -306,7 +321,6 @@ fn futex_wait(
     bitset: u32,
 ) -> SysResult {
     let key = futex_key(addr, private);
-    let timeout_expired = matches!(timeout_ms, Some(deadline_ms) if deadline_ms <= get_time_ms());
     let task = current_task().unwrap();
 
     let task_cx_ptr = {
@@ -314,7 +328,7 @@ fn futex_wait(
         if read_futex_word(addr)? != expected {
             return Err(SysError::EAGAIN);
         }
-        if timeout_expired {
+        if futex_timeout_expired(timeout_ms) {
             return Err(SysError::ETIMEDOUT);
         }
         let (blocked_task, task_cx_ptr) = block_current_task_no_schedule();
@@ -334,8 +348,11 @@ fn futex_wait(
     }
     schedule(task_cx_ptr);
 
-    if timeout_ms.is_some() && FUTEX_MANAGER.exclusive_access().remove_waiter(key, &task) {
-        return Err(SysError::ETIMEDOUT);
+    if futex_timeout_expired(timeout_ms) {
+        let mut manager = FUTEX_MANAGER.exclusive_access();
+        if manager.remove_waiter(key, &task) || manager.remove_waiter_any(&task) {
+            return Err(SysError::ETIMEDOUT);
+        }
     }
     Ok(0)
 }
@@ -382,6 +399,7 @@ fn futex_requeue(
     wake_limit: usize,
     requeue_limit: usize,
     addr2: usize,
+    count_requeued: bool,
 ) -> SysResult<usize> {
     validate_futex_addr(addr2)?;
     let source = futex_key(addr, private);
@@ -393,7 +411,7 @@ fn futex_requeue(
         FUTEX_MANAGER
             .exclusive_access()
             .requeue(source, target, wake_limit, requeue_limit);
-    let mut count = moved;
+    let mut count = if count_requeued { moved } else { 0 };
     for task in tasks {
         if wakeup_task(task) {
             count += 1;
@@ -411,6 +429,19 @@ fn futex_count(raw: usize) -> SysResult<usize> {
         return Err(SysError::EINVAL);
     }
     Ok(raw)
+}
+
+fn validate_futex_clock_option(command: u32, futex_op: u32) -> SysResult<()> {
+    if futex_op & FUTEX_CLOCK_REALTIME == 0 {
+        return Ok(());
+    }
+    match command {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => Ok(()),
+        // UNFINISHED: FUTEX_WAIT_REQUEUE_PI and FUTEX_LOCK_PI2 also accept
+        // FUTEX_CLOCK_REALTIME on Linux, but PI futexes are outside the
+        // classic pthread mutex/cond/join subset implemented here.
+        _ => Err(SysError::ENOSYS),
+    }
 }
 
 pub(crate) fn validate_timespec(time: LinuxTimeSpec) -> SysResult<LinuxTimeSpec> {
@@ -503,6 +534,7 @@ pub fn sys_futex(
     }
 
     let command = futex_op & FUTEX_CMD_MASK;
+    validate_futex_clock_option(command, futex_op)?;
     if matches!(command, FUTEX_WAIT_BITSET | FUTEX_WAKE_BITSET) && val3 == 0 {
         return Err(SysError::EINVAL);
     }
@@ -552,6 +584,7 @@ pub fn sys_futex(
                 futex_count(val as usize)?,
                 requeue_limit,
                 addr2,
+                command == FUTEX_CMP_REQUEUE,
             )
             .map(|count| count as isize)
         }
