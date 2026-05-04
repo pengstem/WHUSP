@@ -2,7 +2,9 @@ use crate::task::{
     TaskControlBlock, TaskStatus, block_current_and_run_next, block_current_task_no_schedule,
     current_process, current_task, current_user_token, schedule, wakeup_task,
 };
-use crate::timer::{add_timer, get_time_ms, monotonic_time_nanos, wall_time_nanos};
+use crate::timer::{
+    add_real_timer, add_timer, get_time_ms, get_time_us, monotonic_time_nanos, wall_time_nanos,
+};
 
 use super::errno::{SysError, SysResult};
 use super::fs::LinuxTimeSpec;
@@ -24,6 +26,8 @@ const CLOCK_BOOTTIME: i32 = 7;
 const TIMER_ABSTIME: u32 = 1;
 pub(crate) const NSEC_PER_SEC: isize = 1_000_000_000;
 pub(crate) const NSEC_PER_MSEC: usize = 1_000_000;
+const USEC_PER_SEC: usize = 1_000_000;
+const ITIMER_REAL: i32 = 0;
 
 const FUTEX_WAIT: u32 = 0;
 const FUTEX_WAKE: u32 = 1;
@@ -55,6 +59,20 @@ struct LinuxRobustListHead {
 #[derive(Clone, Copy)]
 struct LinuxRobustList {
     next: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxTimeValCompat {
+    tv_sec: isize,
+    tv_usec: isize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxITimerVal {
+    it_interval: LinuxTimeValCompat,
+    it_value: LinuxTimeValCompat,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -787,6 +805,108 @@ fn nanos_to_ms_ceil(nanos: u64) -> SysResult<usize> {
 
 pub(crate) fn timespec_to_ms_ceil(time: LinuxTimeSpec) -> SysResult<usize> {
     nanos_to_ms_ceil(timespec_to_nanos(time)?)
+}
+
+fn validate_itimer_kind(which: i32) -> SysResult<()> {
+    if which == ITIMER_REAL {
+        return Ok(());
+    }
+    // UNFINISHED: Linux also supports ITIMER_VIRTUAL and ITIMER_PROF. They
+    // require CPU-time accounting driven signal delivery, while UnixBench's
+    // alarm() path only depends on ITIMER_REAL.
+    Err(SysError::EINVAL)
+}
+
+fn timeval_to_us(time: LinuxTimeValCompat) -> SysResult<usize> {
+    if time.tv_sec < 0 || time.tv_usec < 0 || time.tv_usec >= USEC_PER_SEC as isize {
+        return Err(SysError::EINVAL);
+    }
+    (time.tv_sec as usize)
+        .checked_mul(USEC_PER_SEC)
+        .and_then(|sec_us| sec_us.checked_add(time.tv_usec as usize))
+        .ok_or(SysError::EINVAL)
+}
+
+fn us_to_timeval(us: usize) -> LinuxTimeValCompat {
+    LinuxTimeValCompat {
+        tv_sec: (us / USEC_PER_SEC) as isize,
+        tv_usec: (us % USEC_PER_SEC) as isize,
+    }
+}
+
+fn itimerval_from_us(interval_us: usize, value_us: usize) -> LinuxITimerVal {
+    LinuxITimerVal {
+        it_interval: us_to_timeval(interval_us),
+        it_value: us_to_timeval(value_us),
+    }
+}
+
+pub fn sys_getitimer(which: i32, value: *mut u8) -> SysResult {
+    validate_itimer_kind(which)?;
+    if value.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    let now_us = get_time_us();
+    let process = current_process();
+    let current = {
+        let inner = process.inner_exclusive_access();
+        itimerval_from_us(
+            inner.real_timer.interval_us,
+            inner.real_timer.remaining_us(now_us),
+        )
+    };
+    write_user_value(
+        current_user_token(),
+        value.cast::<LinuxITimerVal>(),
+        &current,
+    )?;
+    Ok(0)
+}
+
+pub fn sys_setitimer(which: i32, value: *const u8, old_value: *mut u8) -> SysResult {
+    validate_itimer_kind(which)?;
+    let token = current_user_token();
+    // CONTEXT: Linux treats a NULL new_value as a zero itimerval, disabling
+    // the timer. The man page calls this nonportable, but it is Linux ABI.
+    let new_value = if value.is_null() {
+        LinuxITimerVal::default()
+    } else {
+        read_user_value(token, value.cast::<LinuxITimerVal>())?
+    };
+    let interval_us = timeval_to_us(new_value.it_interval)?;
+    let value_us = timeval_to_us(new_value.it_value)?;
+    let now_us = get_time_us();
+    let next_expire_us = if value_us == 0 {
+        0
+    } else {
+        now_us.checked_add(value_us).ok_or(SysError::EINVAL)?
+    };
+    let process = current_process();
+    let old = {
+        let inner = process.inner_exclusive_access();
+        itimerval_from_us(
+            inner.real_timer.interval_us,
+            inner.real_timer.remaining_us(now_us),
+        )
+    };
+    if !old_value.is_null() {
+        write_user_value(token, old_value.cast::<LinuxITimerVal>(), &old)?;
+    }
+    let event = {
+        let mut inner = process.inner_exclusive_access();
+        inner.real_timer.generation = inner.real_timer.generation.wrapping_add(1);
+        inner.real_timer.interval_us = interval_us;
+        inner.real_timer.next_expire_us = next_expire_us;
+        if next_expire_us == 0 {
+            None
+        } else {
+            Some((next_expire_us, inner.real_timer.generation))
+        }
+    };
+    if let Some((expire_us, generation)) = event {
+        add_real_timer(expire_us, generation, process);
+    }
+    Ok(0)
 }
 
 fn sleep_until_ms(expire_ms: usize) {

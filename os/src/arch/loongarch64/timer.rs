@@ -4,9 +4,12 @@ use core::sync::atomic::AtomicU64;
 use crate::config::clock_freq;
 use crate::sbi::set_timer;
 use crate::sync::UPIntrFreeCell;
-use crate::task::{TaskControlBlock, wakeup_task};
+use crate::task::{
+    ProcessControlBlock, SignalFlags, SignalInfo, TaskControlBlock, queue_signal_to_task,
+    wakeup_task,
+};
 use alloc::collections::BinaryHeap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use lazy_static::*;
 use loongArch64::time::Time;
 
@@ -69,6 +72,12 @@ pub struct TimerCondVar {
     pub task: Arc<TaskControlBlock>,
 }
 
+pub struct RealTimerEvent {
+    pub expire_us: usize,
+    pub generation: u64,
+    pub process: Weak<ProcessControlBlock>,
+}
+
 impl PartialEq for TimerCondVar {
     fn eq(&self, other: &Self) -> bool {
         self.expire_ms == other.expire_ms
@@ -91,14 +100,74 @@ impl Ord for TimerCondVar {
     }
 }
 
+impl PartialEq for RealTimerEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.expire_us == other.expire_us && self.generation == other.generation
+    }
+}
+
+impl Eq for RealTimerEvent {}
+
+impl PartialOrd for RealTimerEvent {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RealTimerEvent {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .expire_us
+            .cmp(&self.expire_us)
+            .then_with(|| other.generation.cmp(&self.generation))
+    }
+}
+
 lazy_static! {
     static ref TIMERS: UPIntrFreeCell<BinaryHeap<TimerCondVar>> =
         unsafe { UPIntrFreeCell::new(BinaryHeap::<TimerCondVar>::new()) };
+    static ref REAL_TIMERS: UPIntrFreeCell<BinaryHeap<RealTimerEvent>> =
+        unsafe { UPIntrFreeCell::new(BinaryHeap::<RealTimerEvent>::new()) };
 }
 
 pub fn add_timer(expire_ms: usize, task: Arc<TaskControlBlock>) {
     let mut timers = TIMERS.exclusive_access();
     timers.push(TimerCondVar { expire_ms, task });
+}
+
+pub fn add_real_timer(expire_us: usize, generation: u64, process: Arc<ProcessControlBlock>) {
+    let mut timers = REAL_TIMERS.exclusive_access();
+    timers.push(RealTimerEvent {
+        expire_us,
+        generation,
+        process: Arc::downgrade(&process),
+    });
+}
+
+fn check_real_timers(current_us: usize) {
+    loop {
+        let event = {
+            let mut timers = REAL_TIMERS.exclusive_access();
+            let Some(timer) = timers.peek() else {
+                return;
+            };
+            if timer.expire_us > current_us {
+                return;
+            }
+            timers.pop().unwrap()
+        };
+        let Some(process) = event.process.upgrade() else {
+            continue;
+        };
+        let Some((task, next_timer)) = process.expire_real_timer(event.generation, current_us)
+        else {
+            continue;
+        };
+        queue_signal_to_task(task, SignalFlags::SIGALRM, SignalInfo::user(14, 0));
+        if let Some((next_expire_us, generation)) = next_timer {
+            add_real_timer(next_expire_us, generation, process);
+        }
+    }
 }
 
 pub fn check_timer() {
@@ -113,4 +182,5 @@ pub fn check_timer() {
             }
         }
     });
+    check_real_timers(get_time_us());
 }

@@ -15,6 +15,7 @@ use core::mem::{offset_of, size_of};
 const SIGNAL_FRAME_MAGIC: usize = 0x5753_4947_4652_414d;
 const SIGNAL_STACK_ALIGN: usize = 16;
 const SA_NODEFER: usize = 0x4000_0000;
+const SIGALRM: usize = 14;
 const SIGCANCEL: usize = 33;
 const RT_SIGRETURN_TRAMPOLINE: [u32; 2] = [0x08b0_0893, 0x0000_0073];
 
@@ -118,11 +119,12 @@ fn take_pending_user_signal() -> Option<PendingUserSignal> {
             if !pending.contains(signal) {
                 continue;
             }
-            if signum != SIGCANCEL {
+            if signum != SIGCANCEL && signum != SIGALRM {
                 // UNFINISHED: Full Linux signal delivery must support every
-                // user-installed handler. This stage deliberately limits signal
-                // frames to musl's pthread cancellation signal while the generic
-                // signal ABI is still being validated.
+                // user-installed handler. This stage deliberately limits
+                // signal frames to musl's pthread cancellation signal and
+                // ITIMER_REAL/SIGALRM while the generic signal ABI is still
+                // being validated.
                 continue;
             }
             selected = Some((signum, signal));

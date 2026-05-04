@@ -35,6 +35,8 @@ const SYSCALL_FUTEX: usize = 98;
 const SYSCALL_SET_ROBUST_LIST: usize = 99;
 const SYSCALL_GET_ROBUST_LIST: usize = 100;
 const SYSCALL_NANOSLEEP: usize = 101;
+const SYSCALL_GETITIMER: usize = 102;
+const SYSCALL_SETITIMER: usize = 103;
 const SYSCALL_CLOCK_GETTIME: usize = 113;
 const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 const SYSCALL_SYSLOG: usize = 116;
@@ -231,6 +233,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[0] as *const LinuxTimeSpec,
             args[1] as *mut LinuxTimeSpec,
         ),
+        SYSCALL_GETITIMER => sys_getitimer(args[0] as i32, args[1] as *mut u8),
+        SYSCALL_SETITIMER => {
+            sys_setitimer(args[0] as i32, args[1] as *const u8, args[2] as *mut u8)
+        }
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as i32, args[1] as *mut LinuxTimeSpec),
         SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(
             args[0] as i32,

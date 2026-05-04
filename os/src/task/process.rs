@@ -198,6 +198,27 @@ impl ProcessCpuTimes {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ProcessRealTimer {
+    pub(crate) interval_us: usize,
+    pub(crate) next_expire_us: usize,
+    pub(crate) generation: u64,
+}
+
+impl ProcessRealTimer {
+    pub(crate) fn is_armed(&self) -> bool {
+        self.next_expire_us != 0
+    }
+
+    pub(crate) fn remaining_us(&self, now_us: usize) -> usize {
+        if self.is_armed() {
+            self.next_expire_us.saturating_sub(now_us)
+        } else {
+            0
+        }
+    }
+}
+
 pub struct ProcessControlBlock {
     // immutable
     pub pid: PidHandle,
@@ -218,6 +239,7 @@ pub struct ProcessControlBlockInner {
     pub resource_limits: ProcessResourceLimits,
     pub signal_actions: [SignalAction; SIGNAL_INFO_SLOTS],
     pub cpu_times: ProcessCpuTimes,
+    pub(crate) real_timer: ProcessRealTimer,
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     pub task_res_allocator: RecycleAllocator,
 }
@@ -388,6 +410,33 @@ impl ProcessControlBlock {
 
     pub fn cpu_times_snapshot(&self) -> ProcessCpuTimesSnapshot {
         self.inner_exclusive_access().cpu_times.snapshot()
+    }
+
+    pub(crate) fn expire_real_timer(
+        &self,
+        generation: u64,
+        now_us: usize,
+    ) -> Option<(Arc<TaskControlBlock>, Option<(usize, u64)>)> {
+        let mut inner = self.inner_exclusive_access();
+        if inner.real_timer.generation != generation
+            || !inner.real_timer.is_armed()
+            || inner.real_timer.next_expire_us > now_us
+        {
+            return None;
+        }
+        let task = inner
+            .tasks
+            .first()
+            .and_then(|task| task.as_ref().cloned())?;
+        let next_timer = if inner.real_timer.interval_us == 0 {
+            inner.real_timer.next_expire_us = 0;
+            None
+        } else {
+            let next_expire_us = now_us.saturating_add(inner.real_timer.interval_us);
+            inner.real_timer.next_expire_us = next_expire_us;
+            Some((next_expire_us, generation))
+        };
+        Some((task, next_timer))
     }
 
     pub(crate) fn tasks_snapshot(&self) -> Vec<Arc<TaskControlBlock>> {
