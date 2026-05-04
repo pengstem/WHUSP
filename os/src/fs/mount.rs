@@ -313,6 +313,7 @@ fn lookup_covered_parent(target: VfsNodeId) -> Result<VfsNodeId, MountError> {
 pub(crate) fn mount_block_device_at(
     target: WorkingDir,
     device_index: usize,
+    target_path: &str,
 ) -> Result<(), MountError> {
     let source_mount_id = MountId(device_index);
     let target = VfsNodeId::new(target.mount_id(), target.ino());
@@ -327,7 +328,7 @@ pub(crate) fn mount_block_device_at(
     }
 
     let covered_parent = lookup_covered_parent(target)?;
-    let target_path = mount_point_for_target(target);
+    let target_path = resolve_mount_path(target, target_path);
     ensure_mount_open(source_mount_id)?;
 
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
@@ -380,6 +381,7 @@ pub(crate) fn mount_fat_device_at(
     target: WorkingDir,
     device_index: usize,
     partition_index: Option<usize>,
+    target_path: &str,
 ) -> Result<MountId, MountError> {
     let device = BLOCK_DEVICES
         .get(device_index)
@@ -406,10 +408,15 @@ pub(crate) fn mount_fat_device_at(
     mount_new_fs_at(
         target,
         MountedFs::new(Box::new(fat_mount), source, "vfat", "rw"),
+        target_path,
     )
 }
 
-fn mount_new_fs_at(target: WorkingDir, mounted: Arc<MountedFs>) -> Result<MountId, MountError> {
+fn mount_new_fs_at(
+    target: WorkingDir,
+    mounted: Arc<MountedFs>,
+    target_path: &str,
+) -> Result<MountId, MountError> {
     let target = VfsNodeId::new(target.mount_id(), target.ino());
     if root_ino_for(target.mount_id).is_some_and(|root_ino| target.ino == root_ino) {
         return Err(MountError::StaticRoot);
@@ -422,7 +429,7 @@ fn mount_new_fs_at(target: WorkingDir, mounted: Arc<MountedFs>) -> Result<MountI
     }
 
     let covered_parent = lookup_covered_parent(target)?;
-    let target_path = mount_point_for_target(target);
+    let target_path = resolve_mount_path(target, target_path);
     let source_mount_id = register_mount(mounted);
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         if mounts.iter().any(|mount| mount.target == target) {
@@ -449,6 +456,7 @@ pub(crate) fn mount_pseudo_fs_at(
     target: WorkingDir,
     backend: Box<dyn FileSystemBackend>,
     fs_type: &'static str,
+    target_path: &str,
 ) -> Result<MountId, MountError> {
     let target = VfsNodeId::new(target.mount_id(), target.ino());
     if root_ino_for(target.mount_id).is_some_and(|root_ino| target.ino == root_ino) {
@@ -462,7 +470,7 @@ pub(crate) fn mount_pseudo_fs_at(
     }
 
     let covered_parent = lookup_covered_parent(target)?;
-    let target_path = mount_point_for_target(target);
+    let target_path = resolve_mount_path(target, target_path);
     let source_mount_id = register_pseudo_mount(backend, fs_type);
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         if mounts.iter().any(|mount| mount.target == target) {
@@ -478,8 +486,8 @@ pub(crate) fn mount_pseudo_fs_at(
     })
 }
 
-pub(crate) fn mount_tmpfs_at(target: WorkingDir) -> Result<MountId, MountError> {
-    mount_pseudo_fs_at(target, Box::new(TmpFs::new()), "tmpfs")
+pub(crate) fn mount_tmpfs_at(target: WorkingDir, target_path: &str) -> Result<MountId, MountError> {
+    mount_pseudo_fs_at(target, Box::new(TmpFs::new()), "tmpfs", target_path)
 }
 
 pub(crate) fn unmount_at(target: WorkingDir) -> Result<(), MountError> {
@@ -524,7 +532,8 @@ fn mount_extra_block_devices() {
         let Some(target) = ensure_extra_mount_target(index) else {
             continue;
         };
-        match mount_block_device_at(target, index) {
+        let target_path = format!("/x{index}");
+        match mount_block_device_at(target, index, &target_path) {
             Ok(()) => info!("auto-mounted BLOCK_DEVICES[{index}] at /x{index}"),
             Err(MountError::InvalidFilesystem) => {
                 warn!("BLOCK_DEVICES[{index}] is not an ext4 filesystem; leaving /x{index} empty")
@@ -582,20 +591,20 @@ fn ensure_primary_child_dir(
 
 fn mount_kernel_pseudo_filesystems() {
     if let Some(target) = ensure_primary_dir("proc", 0o555) {
-        match mount_pseudo_fs_at(target, Box::new(ProcFs::new()), "proc") {
+        match mount_pseudo_fs_at(target, Box::new(ProcFs::new()), "proc", "/proc") {
             Ok(_) => info!("filesystem mounted from proc at /proc"),
             Err(err) => warn!("failed to mount proc at /proc: {err:?}"),
         }
     }
     if let Some(target) = ensure_primary_dir("tmp", 0o1777) {
-        match mount_pseudo_fs_at(target, Box::new(TmpFs::new()), "tmpfs") {
+        match mount_pseudo_fs_at(target, Box::new(TmpFs::new()), "tmpfs", "/tmp") {
             Ok(_) => info!("filesystem mounted from tmpfs at /tmp"),
             Err(err) => warn!("failed to mount tmpfs at /tmp: {err:?}"),
         }
     }
     if let Some(dev) = ensure_primary_dir("dev", 0o755) {
         if let Some(target) = ensure_primary_child_dir(dev, "shm", 0o1777, "/dev/shm") {
-            match mount_pseudo_fs_at(target, Box::new(TmpFs::new()), "tmpfs") {
+            match mount_pseudo_fs_at(target, Box::new(TmpFs::new()), "tmpfs", "/dev/shm") {
                 Ok(_) => info!("filesystem mounted from tmpfs at /dev/shm"),
                 Err(err) => warn!("failed to mount tmpfs at /dev/shm: {err:?}"),
             }
@@ -605,8 +614,7 @@ fn mount_kernel_pseudo_filesystems() {
 
 pub fn mount_status_log() {
     info!("filesystem mounted from BLOCK_DEVICES[0] at /");
-    let mounts_len = MOUNTS.lock().len();
-    for index in 1..mounts_len {
+    for index in 1..BLOCK_DEVICES.len() {
         if source_has_dynamic_mount(MountId(index)) {
             info!("filesystem mounted from BLOCK_DEVICES[{index}] at /x{index}");
         } else if mount_exists(MountId(index)) {
@@ -631,26 +639,12 @@ fn mount_metadata(mount_id: MountId) -> Option<(String, &'static str, &'static s
     Some((mounted.source.clone(), mounted.fs_type, mounted.options))
 }
 
-fn mount_point_for_target(target: VfsNodeId) -> String {
+fn resolve_mount_path(target: VfsNodeId, hint: &str) -> String {
+    if !hint.is_empty() {
+        return hint.into();
+    }
     if target.mount_id == primary_mount_id() && target.ino == primary_root_ino() {
         return "/".into();
-    }
-    if target.mount_id == primary_mount_id() {
-        let root_ino = primary_root_ino();
-        if let Some(path) = with_mount(primary_mount_id(), |mount| {
-            for name in mount.list_root_names() {
-                if let Ok((ino, kind)) = mount.lookup_component_from(root_ino, &name) {
-                    if ino == target.ino && kind == FsNodeKind::Directory {
-                        return Some(format!("/{name}"));
-                    }
-                }
-            }
-            None
-        })
-        .flatten()
-        {
-            return path;
-        }
     }
     format!("<mount:{}:{}>", target.mount_id.0, target.ino)
 }

@@ -1,6 +1,6 @@
 use crate::fs::{
     MountError, lookup_mount_target_dir_at, mount_block_device_at, mount_fat_device_at,
-    mount_tmpfs_at, unmount_at,
+    mount_tmpfs_at, normalize_path, unmount_at,
 };
 use crate::task::{current_process, current_user_token};
 
@@ -57,14 +57,17 @@ pub fn sys_mount(
     let target = read_user_c_string(token, target, PATH_MAX)?;
     let fstype = read_user_c_string(token, fstype, PATH_MAX)?;
     let process = current_process();
-    let target_dir = lookup_mount_target_dir_at(process.working_dir(), target.as_str())?;
+    let cwd = process.working_dir();
+    let cwd_path = process.working_dir_path();
+    let target_dir = lookup_mount_target_dir_at(cwd, target.as_str())?;
+    let target_path = normalize_path(&cwd_path, target.as_str()).ok_or(SysError::ENOENT)?;
     match fstype.as_str() {
         "ext4" => {
             let block_source = parse_virtio_block_source(source.as_str())?;
             if block_source.partition_index.is_some() {
                 return Err(SysError::ENOTBLK);
             }
-            mount_block_device_at(target_dir, block_source.device_index)
+            mount_block_device_at(target_dir, block_source.device_index, target_path.as_str())
                 .map_err(mount_error_to_errno)?;
         }
         "vfat" | "fat32" | "fat" => {
@@ -73,18 +76,20 @@ pub fn sys_mount(
                 target_dir.clone(),
                 block_source.device_index,
                 block_source.partition_index,
+                target_path.as_str(),
             ) {
                 Ok(_) => {}
                 Err(_) => {
-                    mount_tmpfs_at(target_dir).map_err(mount_error_to_errno)?;
+                    mount_tmpfs_at(target_dir, target_path.as_str())
+                        .map_err(mount_error_to_errno)?;
                 }
             }
         }
         "tmpfs" | "ramfs" => {
-            mount_tmpfs_at(target_dir).map_err(mount_error_to_errno)?;
+            mount_tmpfs_at(target_dir, target_path.as_str()).map_err(mount_error_to_errno)?;
         }
         _ => {
-            mount_tmpfs_at(target_dir).map_err(mount_error_to_errno)?;
+            mount_tmpfs_at(target_dir, target_path.as_str()).map_err(mount_error_to_errno)?;
         }
     }
     Ok(0)
