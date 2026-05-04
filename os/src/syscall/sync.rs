@@ -332,12 +332,15 @@ fn write_futex_word_with_token(token: usize, addr: usize, value: u32) -> SysResu
     write_user_value(token, addr as *mut u32, &value)
 }
 
-fn current_linux_tid_u32() -> SysResult<u32> {
-    let tid = current_task().unwrap().linux_tid();
+fn linux_tid_to_futex_word(tid: usize) -> SysResult<u32> {
     if tid > FUTEX_TID_MASK as usize {
         return Err(SysError::EINVAL);
     }
     Ok(tid as u32)
+}
+
+fn current_linux_tid_u32() -> SysResult<u32> {
+    linux_tid_to_futex_word(current_task().unwrap().linux_tid())
 }
 
 pub(crate) fn relative_timeout_deadline_ms(
@@ -473,6 +476,13 @@ fn clear_pi_waiters_bit_if_idle(addr: usize, key: FutexKey) -> SysResult {
 
 fn futex_try_lock_pi(addr: usize) -> SysResult {
     let tid = current_linux_tid_u32()?;
+    if try_acquire_pi_word(addr, tid)? {
+        return Ok(0);
+    }
+    Err(SysError::EAGAIN)
+}
+
+fn try_acquire_pi_word(addr: usize, tid: u32) -> SysResult<bool> {
     let word = read_futex_word(addr)?;
     let owner_tid = word & FUTEX_TID_MASK;
     if owner_tid == 0 {
@@ -480,12 +490,12 @@ fn futex_try_lock_pi(addr: usize) -> SysResult {
             return Err(SysError::EINVAL);
         }
         write_futex_word(addr, tid)?;
-        return Ok(0);
+        return Ok(true);
     }
     if owner_tid == tid {
         return Err(SysError::EDEADLK);
     }
-    Err(SysError::EAGAIN)
+    Ok(false)
 }
 
 fn futex_lock_pi(addr: usize, private: bool, timeout_ms: Option<usize>) -> SysResult {
@@ -495,21 +505,13 @@ fn futex_lock_pi(addr: usize, private: bool, timeout_ms: Option<usize>) -> SysRe
 
     let task_cx_ptr = {
         let mut manager = FUTEX_MANAGER.exclusive_access();
-        let word = read_futex_word(addr)?;
-        let owner_tid = word & FUTEX_TID_MASK;
-        if owner_tid == 0 {
-            if word & FUTEX_WAITERS != 0 {
-                return Err(SysError::EINVAL);
-            }
-            write_futex_word(addr, tid)?;
+        if try_acquire_pi_word(addr, tid)? {
             return Ok(0);
-        }
-        if owner_tid == tid {
-            return Err(SysError::EDEADLK);
         }
         if futex_timeout_expired(timeout_ms) {
             return Err(SysError::ETIMEDOUT);
         }
+        let word = read_futex_word(addr)?;
         if word & FUTEX_WAITERS == 0 {
             write_futex_word(addr, word | FUTEX_WAITERS)?;
         }
@@ -531,22 +533,20 @@ fn futex_lock_pi(addr: usize, private: bool, timeout_ms: Option<usize>) -> SysRe
     schedule(task_cx_ptr);
 
     let mut manager = FUTEX_MANAGER.exclusive_access();
+    // CONTEXT: This manager has one queue map for classic and PI futex waiters.
+    // A plain requeue by source key can still move this task, so keep the
+    // any-key cleanup fallback until PI waiters are represented separately.
     let still_waiting = manager.remove_waiter(key, &task) || manager.remove_waiter_any(&task);
-    let has_waiters = manager.has_waiters(key);
     drop(manager);
     if futex_timeout_expired(timeout_ms) {
         if still_waiting {
-            if !has_waiters {
-                clear_pi_waiters_bit_if_idle(addr, key)?;
-            }
+            clear_pi_waiters_bit_if_idle(addr, key)?;
             return Err(SysError::ETIMEDOUT);
         }
         return Ok(0);
     }
     if still_waiting {
-        if !has_waiters {
-            clear_pi_waiters_bit_if_idle(addr, key)?;
-        }
+        clear_pi_waiters_bit_if_idle(addr, key)?;
         return Err(SysError::EINTR);
     }
     Ok(0)
@@ -562,15 +562,12 @@ fn futex_unlock_pi(addr: usize, private: bool) -> SysResult {
 
     let (next_task, has_more_waiters) = FUTEX_MANAGER.exclusive_access().wake_one(key);
     if let Some(task) = next_task {
-        let next_tid = task.linux_tid();
-        if next_tid > FUTEX_TID_MASK as usize {
-            return Err(SysError::EINVAL);
-        }
+        let next_tid = linux_tid_to_futex_word(task.linux_tid())?;
         // UNFINISHED: This is PI-futex ownership handoff without scheduler
         // priority boosting. It preserves the Linux futex-word policy needed by
         // musl pthread PRIO_INHERIT mutexes, but it does not implement
         // transitive priority inheritance or priority-ordered waiter selection.
-        write_futex_word(addr, futex_waiters_word(next_tid as u32, has_more_waiters))?;
+        write_futex_word(addr, futex_waiters_word(next_tid, has_more_waiters))?;
         let _ = wakeup_task(task);
     } else {
         write_futex_word(addr, 0)?;
@@ -655,11 +652,10 @@ pub(crate) fn exit_robust_list(task: &Arc<TaskControlBlock>, token: usize, proce
     if head_addr == 0 {
         return;
     }
-    let tid = task.linux_tid();
-    if tid > FUTEX_TID_MASK as usize {
+    let Ok(tid) = linux_tid_to_futex_word(task.linux_tid()) else {
         return;
-    }
-    let _ = exit_robust_list_inner(head_addr, token, process_id, tid as u32);
+    };
+    let _ = exit_robust_list_inner(head_addr, token, process_id, tid);
 }
 
 pub(crate) fn clear_child_tid_and_wake(token: usize, process_id: usize, addr: usize) {
