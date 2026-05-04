@@ -2,7 +2,7 @@ mod context;
 
 use crate::config::TRAMPOLINE;
 use crate::mm::{MmapFaultAccess, MmapFaultResult};
-use crate::syscall::syscall;
+use crate::syscall::{errno::SysError, syscall};
 use crate::task::{
     SignalFlags, account_current_system_time_until, account_current_user_time_until,
     check_signals_of_current, current_add_signal, current_process, current_trap_cx,
@@ -85,9 +85,11 @@ pub fn trap_handler() -> ! {
                 [cx.x[4], cx.x[5], cx.x[6], cx.x[7], cx.x[8], cx.x[9]],
             );
             cx = current_trap_cx();
-            if cx.era != trap_pc + 4 {
-                interrupted_pc = cx.era;
-            }
+            interrupted_pc = if cx.era == trap_pc + 4 && result == -(SysError::EINTR as isize) {
+                trap_pc
+            } else {
+                cx.era
+            };
             cx.x[4] = result as usize;
         }
         Trap::Exception(Exception::StorePageFault)
@@ -138,7 +140,7 @@ pub fn trap_handler() -> ! {
     trap_return();
 }
 
-fn handle_mmap_page_fault(addr: usize, access: MmapFaultAccess) -> bool {
+pub(super) fn handle_mmap_page_fault(addr: usize, access: MmapFaultAccess) -> bool {
     let process = current_process();
     let fault = {
         let inner = process.inner_exclusive_access();
