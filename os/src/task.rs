@@ -39,6 +39,7 @@ pub use processor::{
 pub use signal::{
     CLD_EXITED, SIGCHLD, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SignalAction, SignalFlags, SignalInfo,
 };
+pub(crate) use signal::{flags_to_linux_sigset, linux_sigset_to_flags};
 pub use task::{TaskControlBlock, TaskStatus};
 
 fn with_current_process(process_fn: impl FnOnce(&ProcessControlBlock)) {

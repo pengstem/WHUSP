@@ -6,7 +6,7 @@ mod poll;
 mod stat;
 mod tty;
 mod uapi;
-pub(super) mod user_ptr;
+pub(crate) mod user_ptr;
 
 pub use fd::{sys_close, sys_dup, sys_dup3, sys_fcntl, sys_pipe2};
 pub use io::{sys_lseek, sys_read, sys_readv, sys_write, sys_writev};

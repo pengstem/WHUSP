@@ -83,8 +83,12 @@ use signal::*;
 use sync::*;
 use wait::*;
 
+#[cfg(target_arch = "riscv64")]
+pub(crate) use fs::user_ptr;
 pub(crate) use sync::exit_robust_list;
 pub(crate) use sync::{clear_child_tid_and_wake, remove_process_futex_waiters};
+#[cfg(target_arch = "riscv64")]
+pub(crate) use wait::LinuxSigInfo;
 
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     if syscall_id == SYSCALL_EXIT {

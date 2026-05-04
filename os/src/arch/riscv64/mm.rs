@@ -27,6 +27,12 @@ pub fn flush_tlb_all() {
     }
 }
 
+pub fn flush_tlb_page(va: usize) {
+    unsafe {
+        asm!("sfence.vma {va}, x0", va = in(reg) va);
+    }
+}
+
 pub fn canonicalize_phys_addr(addr: usize) -> usize {
     addr & ((1usize << PA_WIDTH) - 1)
 }

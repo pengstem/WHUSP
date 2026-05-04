@@ -8,6 +8,14 @@ pub const SIGCHLD: u32 = 17;
 pub const SIGSTOP: u32 = 19;
 pub const CLD_EXITED: i32 = 1;
 
+pub(crate) fn linux_sigset_to_flags(raw: u64) -> SignalFlags {
+    SignalFlags::from_bits_retain((raw as u128) << 1)
+}
+
+pub(crate) fn flags_to_linux_sigset(flags: SignalFlags) -> u64 {
+    (flags.bits() >> 1) as u64
+}
+
 bitflags! {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct SignalFlags: u128 {

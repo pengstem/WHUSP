@@ -1,7 +1,8 @@
 use crate::task::{
     ProcessControlBlock, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SignalAction, SignalFlags,
-    SignalInfo, TaskControlBlock, current_process, current_task, current_user_token, pid2process,
-    processes_snapshot, queue_signal_to_task,
+    SignalInfo, TaskControlBlock, current_process, current_task, current_user_token,
+    flags_to_linux_sigset, linux_sigset_to_flags, pid2process, processes_snapshot,
+    queue_signal_to_task,
 };
 use crate::timer::get_time_ms;
 use alloc::sync::Arc;
@@ -16,14 +17,6 @@ const LINUX_RT_SIGSET_SIZE: usize = 8;
 const SIG_BLOCK: usize = 0;
 const SIG_UNBLOCK: usize = 1;
 const SIG_SETMASK: usize = 2;
-
-fn linux_sigset_to_flags(raw: u64) -> SignalFlags {
-    SignalFlags::from_bits_retain((raw as u128) << 1)
-}
-
-fn flags_to_linux_sigset(flags: SignalFlags) -> u64 {
-    (flags.bits() >> 1) as u64
-}
 
 fn read_signal_set(token: usize, set: *const u8, sigsetsize: usize) -> SysResult<SignalFlags> {
     if sigsetsize != LINUX_RT_SIGSET_SIZE {
@@ -79,7 +72,7 @@ fn try_return_pending_signal(
     };
 
     if !info_ptr.is_null() {
-        let info = LinuxSigInfo::from_signal_info(info);
+        let info = LinuxSigInfo::from(info);
         write_user_value(token, info_ptr, &info)?;
     }
     consume_pending_signal(signum);

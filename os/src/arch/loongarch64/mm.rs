@@ -53,6 +53,13 @@ pub fn flush_tlb_all() {
     }
 }
 
+#[allow(dead_code)]
+pub fn flush_tlb_page(va: usize) {
+    unsafe {
+        asm!("dbar 0", "invtlb 0x05, $r0, {va}", va = in(reg) va);
+    }
+}
+
 pub fn canonicalize_phys_addr(addr: usize) -> usize {
     virt_to_phys(addr) & ((1usize << PA_WIDTH) - 1)
 }

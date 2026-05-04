@@ -6,17 +6,29 @@ use core::mem::{MaybeUninit, size_of};
 use super::super::errno::{SysError, SysResult};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum UserBufferAccess {
+pub(crate) enum UserBufferAccess {
     Read,
     Write,
 }
 
-// TODO: i think these functions are taking the responsibility of the mm module
-pub(super) fn translated_byte_buffer_checked(
+pub(crate) type UserFaultHandler = fn(usize, UserBufferAccess) -> bool;
+
+pub(crate) fn translated_byte_buffer_checked(
     token: usize,
     ptr: *const u8,
     len: usize,
     access: UserBufferAccess,
+) -> SysResult<Vec<&'static mut [u8]>> {
+    translated_byte_buffer_checked_with_fault(token, ptr, len, access, None)
+}
+
+// TODO: i think these functions are taking the responsibility of the mm module
+pub(crate) fn translated_byte_buffer_checked_with_fault(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    access: UserBufferAccess,
+    fault_handler: Option<UserFaultHandler>,
 ) -> SysResult<Vec<&'static mut [u8]>> {
     if len == 0 {
         return Ok(Vec::new());
@@ -28,13 +40,17 @@ pub(super) fn translated_byte_buffer_checked(
     while start < end {
         let start_va = VirtAddr::from(start);
         let mut vpn = start_va.floor();
-        let pte = page_table.translate(vpn).ok_or(SysError::EFAULT)?;
-        let permitted = match access {
-            UserBufferAccess::Read => pte.readable(),
-            UserBufferAccess::Write => pte.writable(),
-        };
-        if !pte.is_valid() || !permitted {
-            return Err(SysError::EFAULT);
+        let mut pte = page_table.translate(vpn).ok_or(SysError::EFAULT)?;
+        let reject_zero_ppn = fault_handler.is_some();
+        if !user_pte_allows(pte, access, reject_zero_ppn) {
+            if let Some(fault_handler) = fault_handler {
+                if fault_handler(start, access) {
+                    pte = page_table.translate(vpn).ok_or(SysError::EFAULT)?;
+                }
+            }
+            if !user_pte_allows(pte, access, reject_zero_ppn) {
+                return Err(SysError::EFAULT);
+            }
         }
         let ppn = pte.ppn();
         vpn.step();
@@ -50,9 +66,23 @@ pub(super) fn translated_byte_buffer_checked(
     Ok(buffers)
 }
 
-pub(super) const PATH_MAX: usize = 4096;
+fn user_pte_allows(
+    pte: crate::mm::PageTableEntry,
+    access: UserBufferAccess,
+    reject_zero_ppn: bool,
+) -> bool {
+    if !pte.is_valid() || (reject_zero_ppn && pte.ppn().0 == 0) {
+        return false;
+    }
+    match access {
+        UserBufferAccess::Read => pte.readable(),
+        UserBufferAccess::Write => pte.writable(),
+    }
+}
 
-pub(super) fn read_user_c_string(
+pub(crate) const PATH_MAX: usize = 4096;
+
+pub(crate) fn read_user_c_string(
     token: usize,
     ptr: *const u8,
     max_len: usize,
@@ -86,7 +116,7 @@ pub(super) fn read_user_c_string(
     Err(SysError::ENAMETOOLONG)
 }
 
-pub(super) fn read_user_usize(token: usize, addr: usize) -> SysResult<usize> {
+pub(crate) fn read_user_usize(token: usize, addr: usize) -> SysResult<usize> {
     let mut bytes = [0u8; size_of::<usize>()];
     let buffers = translated_byte_buffer_checked(
         token,
@@ -103,8 +133,19 @@ pub(super) fn read_user_usize(token: usize, addr: usize) -> SysResult<usize> {
     Ok(usize::from_ne_bytes(bytes))
 }
 
-fn copy_from_user(token: usize, ptr: *const u8, dst: &mut [u8]) -> SysResult<()> {
-    let buffers = translated_byte_buffer_checked(token, ptr, dst.len(), UserBufferAccess::Read)?;
+fn copy_from_user(
+    token: usize,
+    ptr: *const u8,
+    dst: &mut [u8],
+    fault_handler: Option<UserFaultHandler>,
+) -> SysResult<()> {
+    let buffers = translated_byte_buffer_checked_with_fault(
+        token,
+        ptr,
+        dst.len(),
+        UserBufferAccess::Read,
+        fault_handler,
+    )?;
     let mut copied = 0usize;
     for buffer in buffers.iter() {
         let next = copied + buffer.len();
@@ -114,12 +155,22 @@ fn copy_from_user(token: usize, ptr: *const u8, dst: &mut [u8]) -> SysResult<()>
     Ok(())
 }
 
-pub(super) fn copy_to_user(token: usize, ptr: *mut u8, src: &[u8]) -> SysResult<()> {
-    let buffers = translated_byte_buffer_checked(
+pub(crate) fn copy_to_user(token: usize, ptr: *mut u8, src: &[u8]) -> SysResult<()> {
+    copy_to_user_with_fault(token, ptr, src, None)
+}
+
+pub(crate) fn copy_to_user_with_fault(
+    token: usize,
+    ptr: *mut u8,
+    src: &[u8],
+    fault_handler: Option<UserFaultHandler>,
+) -> SysResult<()> {
+    let buffers = translated_byte_buffer_checked_with_fault(
         token,
         ptr.cast_const(),
         src.len(),
         UserBufferAccess::Write,
+        fault_handler,
     )?;
     let mut copied = 0usize;
     for buffer in buffers {
@@ -130,20 +181,33 @@ pub(super) fn copy_to_user(token: usize, ptr: *mut u8, src: &[u8]) -> SysResult<
     Ok(())
 }
 
-pub(in crate::syscall) fn read_user_value<T: Copy>(token: usize, ptr: *const T) -> SysResult<T> {
+pub(crate) fn read_user_value<T: Copy>(token: usize, ptr: *const T) -> SysResult<T> {
+    read_user_value_with_fault(token, ptr, None)
+}
+
+pub(crate) fn read_user_value_with_fault<T: Copy>(
+    token: usize,
+    ptr: *const T,
+    fault_handler: Option<UserFaultHandler>,
+) -> SysResult<T> {
     let mut value = MaybeUninit::<T>::uninit();
     let bytes =
         unsafe { core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size_of::<T>()) };
-    copy_from_user(token, ptr.cast::<u8>(), bytes)?;
+    copy_from_user(token, ptr.cast::<u8>(), bytes, fault_handler)?;
     Ok(unsafe { value.assume_init() })
 }
 
-pub(in crate::syscall) fn write_user_value<T: Copy>(
+pub(crate) fn write_user_value<T: Copy>(token: usize, ptr: *mut T, value: &T) -> SysResult<()> {
+    write_user_value_with_fault(token, ptr, value, None)
+}
+
+pub(crate) fn write_user_value_with_fault<T: Copy>(
     token: usize,
     ptr: *mut T,
     value: &T,
+    fault_handler: Option<UserFaultHandler>,
 ) -> SysResult<()> {
     let bytes =
         unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
-    copy_to_user(token, ptr.cast::<u8>(), bytes)
+    copy_to_user_with_fault(token, ptr.cast::<u8>(), bytes, fault_handler)
 }

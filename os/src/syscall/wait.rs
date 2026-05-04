@@ -60,8 +60,8 @@ pub struct LinuxSigInfo {
     align: [u64; 0],
 }
 
-impl LinuxSigInfo {
-    pub(super) fn from_signal_info(info: SignalInfo) -> Self {
+impl From<SignalInfo> for LinuxSigInfo {
+    fn from(info: SignalInfo) -> Self {
         Self {
             si_signo: info.signo,
             si_code: info.code,
