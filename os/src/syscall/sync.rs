@@ -28,12 +28,18 @@ const FUTEX_WAIT: u32 = 0;
 const FUTEX_WAKE: u32 = 1;
 const FUTEX_REQUEUE: u32 = 3;
 const FUTEX_CMP_REQUEUE: u32 = 4;
+const FUTEX_LOCK_PI: u32 = 6;
+const FUTEX_UNLOCK_PI: u32 = 7;
+const FUTEX_TRYLOCK_PI: u32 = 8;
 const FUTEX_WAIT_BITSET: u32 = 9;
 const FUTEX_WAKE_BITSET: u32 = 10;
 const FUTEX_CMD_MASK: u32 = 0x7f;
 const FUTEX_PRIVATE_FLAG: u32 = 0x80;
 const FUTEX_CLOCK_REALTIME: u32 = 0x100;
 const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = !(FUTEX_WAITERS | FUTEX_OWNER_DIED);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct FutexKey {
@@ -100,6 +106,31 @@ impl FutexManager {
         *queue = kept;
         self.remove_empty_queue(key);
         tasks
+    }
+
+    fn wake_one(&mut self, key: FutexKey) -> (Option<Arc<TaskControlBlock>>, bool) {
+        let task = {
+            let Some(queue) = self.waiters.get_mut(&key) else {
+                return (None, false);
+            };
+            let mut selected = None;
+            while let Some(waiter) = queue.pop_front() {
+                if waiter.is_blocked() {
+                    selected = Some(waiter.task);
+                    break;
+                }
+            }
+            selected
+        };
+        self.remove_empty_queue(key);
+        let has_waiters = self.has_waiters(key);
+        (task, has_waiters)
+    }
+
+    fn has_waiters(&self, key: FutexKey) -> bool {
+        self.waiters
+            .get(&key)
+            .is_some_and(|queue| queue.iter().any(FutexWaiter::is_blocked))
     }
 
     fn requeue(
@@ -272,6 +303,19 @@ fn read_futex_word(addr: usize) -> SysResult<u32> {
     read_user_value(current_user_token(), addr as *const u32)
 }
 
+fn write_futex_word(addr: usize, value: u32) -> SysResult<()> {
+    validate_futex_addr(addr)?;
+    write_user_value(current_user_token(), addr as *mut u32, &value)
+}
+
+fn current_linux_tid_u32() -> SysResult<u32> {
+    let tid = current_task().unwrap().linux_tid();
+    if tid > FUTEX_TID_MASK as usize {
+        return Err(SysError::EINVAL);
+    }
+    Ok(tid as u32)
+}
+
 pub(crate) fn relative_timeout_deadline_ms(
     token: usize,
     timeout: *const LinuxTimeSpec,
@@ -384,6 +428,132 @@ fn futex_wake_for_process(
     count
 }
 
+fn futex_waiters_word(owner_tid: u32, has_waiters: bool) -> u32 {
+    if has_waiters {
+        owner_tid | FUTEX_WAITERS
+    } else {
+        owner_tid
+    }
+}
+
+fn clear_pi_waiters_bit_if_idle(addr: usize, key: FutexKey) -> SysResult {
+    if FUTEX_MANAGER.exclusive_access().has_waiters(key) {
+        return Ok(0);
+    }
+    let word = read_futex_word(addr)?;
+    if word & FUTEX_WAITERS != 0 {
+        write_futex_word(addr, word & !FUTEX_WAITERS)?;
+    }
+    Ok(0)
+}
+
+fn futex_try_lock_pi(addr: usize) -> SysResult {
+    let tid = current_linux_tid_u32()?;
+    let word = read_futex_word(addr)?;
+    let owner_tid = word & FUTEX_TID_MASK;
+    if owner_tid == 0 {
+        if word & FUTEX_WAITERS != 0 {
+            return Err(SysError::EINVAL);
+        }
+        write_futex_word(addr, tid)?;
+        return Ok(0);
+    }
+    if owner_tid == tid {
+        return Err(SysError::EDEADLK);
+    }
+    Err(SysError::EAGAIN)
+}
+
+fn futex_lock_pi(addr: usize, private: bool, timeout_ms: Option<usize>) -> SysResult {
+    let key = futex_key(addr, private);
+    let tid = current_linux_tid_u32()?;
+    let task = current_task().unwrap();
+
+    let task_cx_ptr = {
+        let mut manager = FUTEX_MANAGER.exclusive_access();
+        let word = read_futex_word(addr)?;
+        let owner_tid = word & FUTEX_TID_MASK;
+        if owner_tid == 0 {
+            if word & FUTEX_WAITERS != 0 {
+                return Err(SysError::EINVAL);
+            }
+            write_futex_word(addr, tid)?;
+            return Ok(0);
+        }
+        if owner_tid == tid {
+            return Err(SysError::EDEADLK);
+        }
+        if futex_timeout_expired(timeout_ms) {
+            return Err(SysError::ETIMEDOUT);
+        }
+        if word & FUTEX_WAITERS == 0 {
+            write_futex_word(addr, word | FUTEX_WAITERS)?;
+        }
+        let (blocked_task, task_cx_ptr) = block_current_task_no_schedule();
+        manager
+            .waiters
+            .entry(key)
+            .or_default()
+            .push_back(FutexWaiter {
+                task: blocked_task,
+                bitset: FUTEX_BITSET_MATCH_ANY,
+            });
+        task_cx_ptr
+    };
+
+    if let Some(deadline_ms) = timeout_ms {
+        add_timer(deadline_ms, Arc::clone(&task));
+    }
+    schedule(task_cx_ptr);
+
+    let mut manager = FUTEX_MANAGER.exclusive_access();
+    let still_waiting = manager.remove_waiter(key, &task) || manager.remove_waiter_any(&task);
+    let has_waiters = manager.has_waiters(key);
+    drop(manager);
+    if futex_timeout_expired(timeout_ms) {
+        if still_waiting {
+            if !has_waiters {
+                clear_pi_waiters_bit_if_idle(addr, key)?;
+            }
+            return Err(SysError::ETIMEDOUT);
+        }
+        return Ok(0);
+    }
+    if still_waiting {
+        if !has_waiters {
+            clear_pi_waiters_bit_if_idle(addr, key)?;
+        }
+        return Err(SysError::EINTR);
+    }
+    Ok(0)
+}
+
+fn futex_unlock_pi(addr: usize, private: bool) -> SysResult {
+    let key = futex_key(addr, private);
+    let tid = current_linux_tid_u32()?;
+    let word = read_futex_word(addr)?;
+    if word & FUTEX_TID_MASK != tid {
+        return Err(SysError::EPERM);
+    }
+
+    let (next_task, has_more_waiters) = FUTEX_MANAGER.exclusive_access().wake_one(key);
+    if let Some(task) = next_task {
+        let next_tid = task.linux_tid();
+        if next_tid > FUTEX_TID_MASK as usize {
+            return Err(SysError::EINVAL);
+        }
+        // UNFINISHED: This is PI-futex ownership handoff without scheduler
+        // priority boosting. It preserves the Linux futex-word policy needed by
+        // musl pthread PRIO_INHERIT mutexes, but it does not implement
+        // transitive priority inheritance or priority-ordered waiter selection.
+        write_futex_word(addr, futex_waiters_word(next_tid as u32, has_more_waiters))?;
+        let _ = wakeup_task(task);
+    } else {
+        write_futex_word(addr, 0)?;
+    }
+    Ok(0)
+}
+
 pub(crate) fn clear_child_tid_and_wake(token: usize, process_id: usize, addr: usize) {
     if addr == 0 {
         return;
@@ -443,8 +613,8 @@ fn validate_futex_clock_option(command: u32, futex_op: u32) -> SysResult<()> {
     match command {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => Ok(()),
         // UNFINISHED: FUTEX_WAIT_REQUEUE_PI and FUTEX_LOCK_PI2 also accept
-        // FUTEX_CLOCK_REALTIME on Linux, but PI futexes are outside the
-        // classic pthread mutex/cond/join subset implemented here.
+        // FUTEX_CLOCK_REALTIME on Linux. This kernel currently implements only
+        // the older FUTEX_LOCK_PI/FUTEX_TRYLOCK_PI/FUTEX_UNLOCK_PI subset.
         _ => Err(SysError::ENOSYS),
     }
 }
@@ -574,6 +744,13 @@ pub fn sys_futex(
         FUTEX_WAKE_BITSET => {
             Ok(futex_wake(addr, private, futex_count(val as usize)?, val3) as isize)
         }
+        FUTEX_LOCK_PI => futex_lock_pi(
+            addr,
+            private,
+            futex_timeout_absolute(timeout, ClockBackend::Wall)?,
+        ),
+        FUTEX_TRYLOCK_PI => futex_try_lock_pi(addr),
+        FUTEX_UNLOCK_PI => futex_unlock_pi(addr, private),
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             let addr2 = uaddr2 as usize;
             // CONTEXT: FUTEX_REQUEUE/CMP_REQUEUE use the fourth syscall
@@ -593,9 +770,9 @@ pub fn sys_futex(
             )
             .map(|count| count as isize)
         }
-        // UNFINISHED: PI futexes, FUTEX_WAKE_OP, and futex_waitv are not
-        // implemented. The libctest pthread and loader paths need the classic
-        // wait/wake and requeue subset above.
+        // UNFINISHED: FUTEX_WAKE_OP, futex_waitv, and requeue-PI are not
+        // implemented. The libctest pthread paths currently need classic
+        // wait/wake/requeue plus the minimal PI mutex subset above.
         _ => Err(SysError::ENOSYS),
     }
 }

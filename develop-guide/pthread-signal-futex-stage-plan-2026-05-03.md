@@ -124,3 +124,15 @@ Local ABI evidence:
   `cd /musl && ./runtest.exe -w entry-static.exe pthread_cancel_points`,
   `make kernel-rv` passed and the QEMU run printed `Pass!` for
   `pthread_cancel_points` after mounting `/dev/shm`.
+- 2026-05-04 Stage D direction: implement the Linux PI futex word policy for
+  `FUTEX_LOCK_PI`, `FUTEX_TRYLOCK_PI`, and `FUTEX_UNLOCK_PI`: owner TID in the
+  low bits, `FUTEX_WAITERS` while the kernel has queued waiters, and
+  `EDEADLK`/`EPERM` for self-lock and non-owner unlock. Real scheduler priority
+  boosting and priority-ordered waiter selection remain marked `UNFINISHED`.
+- 2026-05-04 Stage D validation: current `sdcard-rv.img` does not include
+  `pthread_mutex_pi` in `libc-test/static.txt`, so `entry-static.exe
+  pthread_mutex_pi` never reaches the testcase table. For validation, compiled
+  `../testsuits-for-oskernel/libc-test/src/functional/pthread_mutex_pi.c` as a
+  temporary static RISC-V musl binary with `src/common/print.c`, injected it
+  into guest `/tmp` via base64 over the interactive shell, and ran it directly.
+  The testcase returned to the shell with no `t_error` output.

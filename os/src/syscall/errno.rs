@@ -28,6 +28,7 @@ pub enum SysError {
     ESPIPE = 29,
     EROFS = 30,
     ERANGE = 34,
+    EDEADLK = 35,
     ENAMETOOLONG = 36,
     ENOSYS = 38,
     ENOTEMPTY = 39,
