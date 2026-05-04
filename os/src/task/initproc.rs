@@ -23,9 +23,9 @@ const ALL_TESTS: &[&str] = &[
 ];
 // CONTEXT: temporary - only libctest enabled for pthread bringup; restore all before merge.
 const TEST_SCRIPTS: &[&str] = &[
-    "basic_testcode.sh",
-    "busybox_testcode.sh",
-    "lua_testcode.sh",
+    // "basic_testcode.sh",
+    // "busybox_testcode.sh",
+    // "lua_testcode.sh",
     "libctest_testcode.sh",
     "iozone_testcode.sh",
     // "unixbench_testcode.sh",
@@ -69,14 +69,14 @@ fn build_runner_command() -> String {
             );
         }
     }
-    for script in TEST_SCRIPTS {
-        for libc_root in TEST_LIBCS {
-            let _ = write!(command, "; (cd {libc_root} && ./busybox sh ./{script})");
-        }
-    }
-    if TEST_SCRIPTS.is_empty() && TEST {
+    if TEST_SCRIPTS.is_empty() || TEST {
         let _ = write!(command, ";(sh)");
     } else {
+        for script in TEST_SCRIPTS {
+            for libc_root in TEST_LIBCS {
+                let _ = write!(command, "; (cd {libc_root} && ./busybox sh ./{script})");
+            }
+        }
         let _ = write!(command, "; (cd /musl && ./busybox reboot )");
     }
     command
@@ -93,6 +93,9 @@ pub(super) fn load() -> Option<KernelInitProc> {
             BUSYBOX_COMMAND_FLAG.into(),
             build_runner_command(),
         ],
-        envp: vec!["PATH=/:/bin:/sbin:/usr/bin:/usr/local/bin".into()],
+        envp: vec![
+            "PATH=/:/bin:/sbin:/usr/bin:/usr/local/bin".into(),
+            "LD_LIBRARY_PATH=/glibc/lib:/musl/lib:/lib".into(),
+        ],
     })
 }

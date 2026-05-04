@@ -520,6 +520,17 @@ fn read_elf_interpreter(path: &str) -> SysResult<Vec<u8>> {
             "/lib/ld-linux-riscv64-lp64d.so.1",
             "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
         ),
+        // CONTEXT: LoongArch glibc/musl images keep loaders under
+        // `/glibc/lib` and `/musl/lib`; the official ELF INTERP path
+        // `/lib64/...` is not materialized on disk, so redirect it here.
+        (
+            "/lib64/ld-linux-loongarch-lp64d.so.1",
+            "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+        ),
+        (
+            "/lib64/ld-musl-loongarch-lp64d.so.1",
+            "/musl/lib/libc.so",
+        ),
     ];
 
     for (alias, target) in REDIRECTS {

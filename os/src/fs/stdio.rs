@@ -99,10 +99,13 @@ impl File for Stdout {
         panic!("Cannot read from stdout!");
     }
     fn write(&self, user_buf: UserBuffer) -> usize {
+        let len = user_buf.len();
         for buffer in user_buf.buffers.iter() {
-            print!("{}", core::str::from_utf8(*buffer).unwrap());
+            for byte in buffer.iter() {
+                UART.write(*byte);
+            }
         }
-        user_buf.len()
+        len
     }
     fn poll(&self, events: PollEvents) -> PollEvents {
         if events.contains(PollEvents::POLLOUT) {
