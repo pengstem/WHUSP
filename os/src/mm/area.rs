@@ -36,6 +36,7 @@ pub(super) struct MmapInfo {
     pub(super) writable: bool,
     pub(super) len: usize,
     pub(super) file_offset: usize,
+    pub(super) file_size: usize,
     pub(super) backing_file: Option<Arc<dyn File + Send + Sync>>,
 }
 
@@ -46,6 +47,7 @@ impl MmapInfo {
             writable: self.writable,
             len: self.len.saturating_sub(offset),
             file_offset: self.file_offset + offset,
+            file_size: self.file_size,
             backing_file: self.backing_file.clone(),
         };
         self.len = self.len.min(offset);

@@ -144,6 +144,7 @@ impl MemorySet {
         len: usize,
         permission: MapPermission,
         backing_file: Option<Arc<dyn File + Send + Sync>>,
+        file_size: usize,
         file_offset: usize,
         shared: bool,
         writable: bool,
@@ -157,6 +158,7 @@ impl MemorySet {
             writable,
             len,
             file_offset,
+            file_size,
             backing_file,
         });
         self.areas.push(area);
@@ -170,6 +172,7 @@ impl MemorySet {
         len: usize,
         permission: MapPermission,
         backing_file: Option<Arc<dyn File + Send + Sync>>,
+        file_size: usize,
         file_offset: usize,
         shared: bool,
         writable: bool,
@@ -205,6 +208,7 @@ impl MemorySet {
             writable,
             len,
             file_offset,
+            file_size,
             backing_file,
         });
         self.areas.push(area);
@@ -231,7 +235,20 @@ impl MemorySet {
 
         let info = area.mmap_info.as_ref().unwrap();
         let area_offset = (vpn.0 - area.vpn_range.get_start().0) * PAGE_SIZE;
-        let read_len = info.len.saturating_sub(area_offset).min(PAGE_SIZE);
+        // UNFINISHED: Linux raises SIGBUS for accesses to file-backed mmap
+        // pages wholly beyond the backing object's end. The current contest
+        // path zero-fills those bytes, but it must at least avoid asking EXT4
+        // to read past EOF for the partial tail page used by dynamic DSOs.
+        let map_read_len = info.len.saturating_sub(area_offset).min(PAGE_SIZE);
+        let file_read_len = info
+            .file_size
+            .saturating_sub(info.file_offset.saturating_add(area_offset))
+            .min(PAGE_SIZE);
+        let read_len = if info.backing_file.is_some() {
+            map_read_len.min(file_read_len)
+        } else {
+            0
+        };
         Some(MmapFaultResult::Page(MmapFaultPage {
             vpn,
             file_offset: info.file_offset + area_offset,

@@ -84,8 +84,8 @@ fn sys_mmap_impl(
     }
 
     let process = current_process();
-    let backing_file = if anonymous {
-        None
+    let (backing_file, file_size) = if anonymous {
+        (None, 0)
     } else {
         let fd = fd as isize;
         if fd < 0 {
@@ -104,7 +104,8 @@ fn sys_mmap_impl(
         if shared && writable && !file.writable() {
             return Err(SysError::EACCES);
         }
-        Some(file)
+        let file_size = file.stat()?.size as usize;
+        (Some(file), file_size)
     };
 
     let mut inner = process.inner_exclusive_access();
@@ -116,6 +117,7 @@ fn sys_mmap_impl(
                 len,
                 permission,
                 backing_file,
+                file_size,
                 offset,
                 shared,
                 writable,
@@ -131,7 +133,15 @@ fn sys_mmap_impl(
     // TODO: why dose map permission do not contain shared and writable
     inner
         .memory_set
-        .mmap_area(len, permission, backing_file, offset, shared, writable)
+        .mmap_area(
+            len,
+            permission,
+            backing_file,
+            file_size,
+            offset,
+            shared,
+            writable,
+        )
         .ok_or(SysError::ENOMEM)
 }
 

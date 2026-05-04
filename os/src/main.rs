@@ -97,11 +97,11 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     fs::init();
     fs::list_apps();
     task::add_initproc();
-    // CONTEXT: Keep contest block I/O synchronous by default. RV can only
-    // re-enable nonblocking access after BusyBox/basic regressions pass with
-    // file-object lock boundaries, and LA must stay polling/sync until the
-    // virtio-pci external IRQ path is validated.
-    *DEV_NON_BLOCKING_ACCESS.exclusive_access() = cfg!(not(target_arch = "loongarch64"));
+    // CONTEXT: Keep contest block I/O synchronous by default. Runtime DSO
+    // loading can fault in file-backed pages after init, and the current
+    // nonblocking VirtIO/Condvar path can leave that read asleep until the
+    // test harness kills the process.
+    *DEV_NON_BLOCKING_ACCESS.exclusive_access() = false;
     task::run_tasks();
     panic!("Unreachable in rust_main!");
 }
