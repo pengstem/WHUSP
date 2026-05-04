@@ -231,10 +231,8 @@ fn do_faccessat(
 
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
-    if path.is_empty() {
-        if flags & AT_EMPTY_PATH == 0 {
-            return Err(SysError::ENOENT);
-        }
+    if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
+        return Err(SysError::ENOENT);
     }
 
     let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
