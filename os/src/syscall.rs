@@ -55,12 +55,28 @@ const SYSCALL_GETTIMEOFDAY: usize = 169;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_GETPPID: usize = 173;
 const SYSCALL_GETTID: usize = 178;
+const SYSCALL_SOCKET: usize = 198;
+const SYSCALL_SOCKETPAIR: usize = 199;
+const SYSCALL_BIND: usize = 200;
+const SYSCALL_LISTEN: usize = 201;
+const SYSCALL_ACCEPT: usize = 202;
+const SYSCALL_CONNECT: usize = 203;
+const SYSCALL_GETSOCKNAME: usize = 204;
+const SYSCALL_GETPEERNAME: usize = 205;
+const SYSCALL_SENDTO: usize = 206;
+const SYSCALL_RECVFROM: usize = 207;
+const SYSCALL_SETSOCKOPT: usize = 208;
+const SYSCALL_GETSOCKOPT: usize = 209;
+const SYSCALL_SHUTDOWN: usize = 210;
+const SYSCALL_SENDMSG: usize = 211;
+const SYSCALL_RECVMSG: usize = 212;
 const SYSCALL_BRK: usize = 214;
 const SYSCALL_MUNMAP: usize = 215;
 const SYSCALL_CLONE: usize = 220;
 const SYSCALL_EXECVE: usize = 221;
 const SYSCALL_MMAP: usize = 222;
 const SYSCALL_MPROTECT: usize = 226;
+const SYSCALL_ACCEPT4: usize = 242;
 const SYSCALL_WAIT4: usize = 260;
 const SYSCALL_PRLIMIT64: usize = 261;
 const SYSCALL_RENAMEAT2: usize = 276;
@@ -69,6 +85,7 @@ const SYSCALL_STATX: usize = 291;
 pub(crate) mod errno;
 mod fs;
 mod memory;
+mod net;
 mod process;
 mod signal;
 mod sync;
@@ -78,6 +95,7 @@ use crate::task::RLimit;
 use errno::{SysError, ret};
 use fs::*;
 use memory::*;
+use net::*;
 use process::*;
 use signal::*;
 use sync::*;
@@ -274,6 +292,41 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *const RLimit,
             args[3] as *mut RLimit,
         ),
+        SYSCALL_SOCKET => sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),
+        SYSCALL_SOCKETPAIR => {
+            sys_socketpair(args[0] as i32, args[1] as i32, args[2] as i32, args[3])
+        }
+        SYSCALL_BIND => sys_bind(args[0], args[1], args[2] as u32),
+        SYSCALL_LISTEN => sys_listen(args[0], args[1] as i32),
+        SYSCALL_ACCEPT => sys_accept(args[0], args[1], args[2]),
+        SYSCALL_ACCEPT4 => sys_accept4(args[0], args[1], args[2], args[3] as i32),
+        SYSCALL_CONNECT => sys_connect(args[0], args[1], args[2] as u32),
+        SYSCALL_GETSOCKNAME => sys_getsockname(args[0], args[1], args[2]),
+        SYSCALL_GETPEERNAME => sys_getpeername(args[0], args[1], args[2]),
+        SYSCALL_SENDTO => sys_sendto(
+            args[0],
+            args[1],
+            args[2],
+            args[3] as i32,
+            args[4],
+            args[5] as u32,
+        ),
+        SYSCALL_RECVFROM => {
+            sys_recvfrom(args[0], args[1], args[2], args[3] as i32, args[4], args[5])
+        }
+        SYSCALL_SETSOCKOPT => sys_setsockopt(
+            args[0],
+            args[1] as i32,
+            args[2] as i32,
+            args[3],
+            args[4] as u32,
+        ),
+        SYSCALL_GETSOCKOPT => {
+            sys_getsockopt(args[0], args[1] as i32, args[2] as i32, args[3], args[4])
+        }
+        SYSCALL_SHUTDOWN => sys_shutdown(args[0], args[1] as i32),
+        SYSCALL_SENDMSG => sys_sendmsg(args[0], args[1], args[2] as i32),
+        SYSCALL_RECVMSG => sys_recvmsg(args[0], args[1], args[2] as i32),
         _ => Err(SysError::ENOSYS),
     })
 }

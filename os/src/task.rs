@@ -58,8 +58,16 @@ pub fn account_current_system_time_until(now_us: usize) {
     with_current_process(|process| process.account_system_time_until(now_us));
 }
 
+fn try_account_current_system_time_until(now_us: usize) {
+    with_current_process(|process| process.try_account_system_time_until(now_us));
+}
+
 pub fn account_current_system_time() {
     account_current_system_time_until(crate::timer::get_time_us());
+}
+
+fn try_account_current_system_time() {
+    try_account_current_system_time_until(crate::timer::get_time_us());
 }
 
 pub fn mark_current_user_time_entry(now_us: usize) {
@@ -104,7 +112,11 @@ pub fn block_current_task() -> *mut TaskContext {
 /// `schedule(task_cx_ptr)` completes, because the pointer targets memory
 /// owned by the `TaskControlBlock`.
 pub fn block_current_task_no_schedule() -> (Arc<TaskControlBlock>, *mut TaskContext) {
-    account_current_system_time();
+    // CONTEXT: `SleepMutex::lock()` can be reached from exit-time destructors
+    // while nearby PCB cleanup is in progress. CPU accounting must not turn
+    // that cleanup path into a RefCell panic; skipping one sample is preferable
+    // to aborting the kernel while the task is about to block.
+    try_account_current_system_time();
     let task = take_current_task().unwrap();
     let mut task_inner = task.inner_exclusive_access();
     task_inner.task_status = TaskStatus::Blocked;
@@ -137,7 +149,11 @@ pub(crate) fn reap_exited_tasks() {
     if !EXITED_DIRTY.swap(false, Ordering::Acquire) {
         return;
     }
-    EXITED_TASKS.exclusive_access().clear();
+    let exited_tasks = {
+        let mut tasks = EXITED_TASKS.exclusive_access();
+        core::mem::take(&mut *tasks)
+    };
+    drop(exited_tasks);
 }
 
 fn terminate_sibling_threads(
@@ -210,22 +226,19 @@ pub(crate) fn queue_signal_to_task(
 
 fn exit_current(exit_code: i32, group_exit: bool) {
     account_current_system_time();
-    let task = take_current_task().unwrap();
-    let process = task.process.upgrade().unwrap();
+    let current = current_task().unwrap();
+    let process = current.process.upgrade().unwrap();
     let process_token = process.inner_exclusive_access().get_user_token();
     let process_id = process.getpid();
-    let mut task_inner = task.inner_exclusive_access();
-    let tid = task_inner.tid;
-    let clear_child_tid = task_inner.clear_child_tid.take();
-    // record exit code
-    task_inner.exit_code = Some(exit_code);
-    task_inner.task_status = TaskStatus::Exited;
-    task_inner.res = None;
-    drop(task_inner);
-    crate::syscall::exit_robust_list(&task, process_token, process_id);
+    let (tid, clear_child_tid) = {
+        let mut task_inner = current.inner_exclusive_access();
+        (task_inner.tid, task_inner.clear_child_tid.take())
+    };
+    crate::syscall::exit_robust_list(&current, process_token, process_id);
     if let Some(clear_child_tid) = clear_child_tid {
         crate::syscall::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
     }
+    current.inner_exclusive_access().res = None;
 
     let process_exit = group_exit || tid == 0;
     let exited_thread = if tid == 0 {
@@ -235,12 +248,8 @@ fn exit_current(exit_code: i32, group_exit: bool) {
         if tid < process_inner.tasks.len() {
             process_inner.tasks[tid] = None;
         }
-        Some(Arc::clone(&task))
+        Some(Arc::clone(&current))
     };
-    if let Some(task) = exited_thread {
-        queue_exited_task(task);
-    }
-    drop(task);
     if process_exit {
         let pid = process.getpid();
         if pid == IDLE_PID || Arc::ptr_eq(&process, &INITPROC) {
@@ -260,23 +269,37 @@ fn exit_current(exit_code: i32, group_exit: bool) {
         remove_ready_tasks_of_process(pid);
         crate::syscall::remove_process_futex_waiters(pid);
         remove_from_pid2process(pid);
-        let mut process_inner = process.inner_exclusive_access();
-        // mark this process as a zombie process
-        process_inner.is_zombie = true;
-        // record exit code of main process
-        process_inner.exit_code = exit_code;
-        let parent = process_inner.parent.as_ref().and_then(|p| p.upgrade());
-
-        {
-            // move all child processes under init process
-            let mut initproc_inner = INITPROC.inner_exclusive_access();
-            for child in process_inner.children.iter() {
-                child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
-                initproc_inner.children.push(child.clone());
+        let (parent, children, fd_table) = {
+            let mut process_inner = process.inner_exclusive_access();
+            // mark this process as a zombie process
+            process_inner.is_zombie = true;
+            // record exit code of main process
+            process_inner.exit_code = exit_code;
+            let parent = process_inner.parent.as_ref().and_then(|p| p.upgrade());
+            let children = core::mem::take(&mut process_inner.children);
+            // deallocate other data in user space i.e. program code/data section
+            process_inner.memory_set.recycle_data_pages();
+            // Take the fd table out while the current task is still installed.
+            // Dropping VFS file objects can take SleepMutex-backed mount locks.
+            let fd_table = core::mem::take(&mut process_inner.fd_table);
+            // Keep only the main task in the zombie process for waitpid reaping.
+            // Non-main exiting tasks are parked in EXITED_TASKS until their kernel
+            // stacks are no longer active across the next schedule boundary.
+            while process_inner.tasks.len() > 1 {
+                process_inner.tasks.pop();
             }
-        }
+            (parent, children, fd_table)
+        };
 
-        drop(process_inner);
+        // move all child processes under init process
+        let mut initproc_inner = INITPROC.inner_exclusive_access();
+        for child in children {
+            child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
+            initproc_inner.children.push(child);
+        }
+        drop(initproc_inner);
+
+        drop(fd_table);
 
         if let Some(parent) = parent {
             let parent_task = {
@@ -299,20 +322,17 @@ fn exit_current(exit_code: i32, group_exit: bool) {
                 }
             }
         }
-
-        let mut process_inner = process.inner_exclusive_access();
-        process_inner.children.clear();
-        // deallocate other data in user space i.e. program code/data section
-        process_inner.memory_set.recycle_data_pages();
-        // drop file descriptors
-        process_inner.fd_table.clear();
-        // Keep only the main task in the zombie process for waitpid reaping.
-        // Non-main exiting tasks are parked in EXITED_TASKS until their kernel
-        // stacks are no longer active across the next schedule boundary.
-        while process_inner.tasks.len() > 1 {
-            process_inner.tasks.pop();
-        }
     }
+    let task = take_current_task().unwrap();
+    let mut task_inner = task.inner_exclusive_access();
+    task_inner.exit_code = Some(exit_code);
+    task_inner.task_status = TaskStatus::Exited;
+    drop(task_inner);
+    if let Some(task) = exited_thread {
+        queue_exited_task(task);
+    }
+    drop(current);
+    drop(task);
     drop(process);
     // we do not have to save task context
     let mut _unused = TaskContext::zero_init();

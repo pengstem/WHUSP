@@ -23,9 +23,9 @@ const ALL_TESTS: &[&str] = &[
 ];
 // CONTEXT: temporary - only libctest enabled for pthread bringup; restore all before merge.
 const TEST_SCRIPTS: &[&str] = &[
-    // "basic_testcode.sh",
-    // "busybox_testcode.sh",
-    // "lua_testcode.sh",
+    "basic_testcode.sh",
+    "busybox_testcode.sh",
+    "lua_testcode.sh",
     "libctest_testcode.sh",
     "iozone_testcode.sh",
     // "unixbench_testcode.sh",
@@ -77,7 +77,7 @@ fn build_runner_command() -> String {
                 let _ = write!(command, "; (cd {libc_root} && ./busybox sh ./{script})");
             }
         }
-        let _ = write!(command, "; (cd /musl && ./busybox reboot )");
+        let _ = write!(command, "; (cd /musl && ./busybox reboot -f)");
     }
     command
 }

@@ -67,6 +67,8 @@ lazy_static! {
     static ref MOUNTS_INITIALIZED: UPIntrFreeCell<bool> = unsafe { UPIntrFreeCell::new(false) };
     static ref DYNAMIC_MOUNTS: UPIntrFreeCell<Vec<DynamicMount>> =
         unsafe { UPIntrFreeCell::new(Vec::new()) };
+    static ref PENDING_INODE_RELEASES: UPIntrFreeCell<Vec<(MountId, u32)>> =
+        unsafe { UPIntrFreeCell::new(Vec::new()) };
 }
 
 static NEXT_MOUNT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -179,7 +181,53 @@ pub(super) fn with_mount<V>(
             .and_then(|mount| mount.as_ref().cloned())
     }?;
     let mut backend = mounted.backend.lock();
+    drain_pending_inode_releases(mount_id, &mut **backend);
     Some(f(&mut **backend))
+}
+
+fn try_with_mount<V>(
+    mount_id: MountId,
+    f: impl FnOnce(&mut dyn FileSystemBackend) -> V,
+) -> Option<V> {
+    let mounted = {
+        let mounts = MOUNTS.try_lock()?;
+        mounts
+            .get(mount_id.0)
+            .and_then(|mount| mount.as_ref().cloned())
+    }?;
+    let mut backend = mounted.backend.try_lock()?;
+    drain_pending_inode_releases(mount_id, &mut **backend);
+    Some(f(&mut **backend))
+}
+
+fn drain_pending_inode_releases(mount_id: MountId, backend: &mut dyn FileSystemBackend) {
+    let pending = {
+        let mut pending = PENDING_INODE_RELEASES.exclusive_access();
+        if pending.is_empty() {
+            return;
+        }
+        core::mem::take(&mut *pending)
+    };
+
+    let mut deferred = Vec::new();
+    for (pending_mount_id, ino) in pending {
+        if pending_mount_id == mount_id {
+            let _ = backend.release_inode(ino);
+        } else {
+            deferred.push((pending_mount_id, ino));
+        }
+    }
+    if !deferred.is_empty() {
+        PENDING_INODE_RELEASES.exclusive_access().extend(deferred);
+    }
+}
+
+pub(super) fn release_inode_from_drop(mount_id: MountId, ino: u32) {
+    if try_with_mount(mount_id, |mount| mount.release_inode(ino)).is_none() {
+        PENDING_INODE_RELEASES
+            .exclusive_access()
+            .push((mount_id, ino));
+    }
 }
 
 pub(super) fn mount_exists(mount_id: MountId) -> bool {

@@ -380,6 +380,12 @@ impl ProcessControlBlock {
             .account_system_until(now_us);
     }
 
+    pub fn try_account_system_time_until(&self, now_us: usize) {
+        if let Some(mut inner) = self.inner.try_exclusive_access() {
+            inner.cpu_times.account_system_until(now_us);
+        }
+    }
+
     pub fn cpu_times_snapshot(&self) -> ProcessCpuTimesSnapshot {
         self.inner_exclusive_access().cpu_times.snapshot()
     }

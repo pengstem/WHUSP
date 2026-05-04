@@ -51,6 +51,16 @@ impl<T> SleepMutex<T> {
         }
         SleepMutexGuard { mutex: self }
     }
+
+    pub fn try_lock(&self) -> Option<SleepMutexGuard<'_, T>> {
+        let mut inner = self.inner.try_exclusive_access()?;
+        if inner.locked {
+            None
+        } else {
+            inner.locked = true;
+            Some(SleepMutexGuard { mutex: self })
+        }
+    }
 }
 
 impl<T> Drop for SleepMutexGuard<'_, T> {

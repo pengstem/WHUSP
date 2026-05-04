@@ -527,10 +527,7 @@ fn read_elf_interpreter(path: &str) -> SysResult<Vec<u8>> {
             "/lib64/ld-linux-loongarch-lp64d.so.1",
             "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
         ),
-        (
-            "/lib64/ld-musl-loongarch-lp64d.so.1",
-            "/musl/lib/libc.so",
-        ),
+        ("/lib64/ld-musl-loongarch-lp64d.so.1", "/musl/lib/libc.so"),
     ];
 
     for (alias, target) in REDIRECTS {

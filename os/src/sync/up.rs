@@ -107,6 +107,17 @@ impl<T> UPIntrFreeCell<T> {
         UPIntrRefMut(Some(self.inner.borrow_mut()))
     }
 
+    pub fn try_exclusive_access(&self) -> Option<UPIntrRefMut<'_, T>> {
+        INTR_MASKING_INFO.get_mut().enter();
+        match self.inner.try_borrow_mut() {
+            Ok(inner) => Some(UPIntrRefMut(Some(inner))),
+            Err(_) => {
+                INTR_MASKING_INFO.get_mut().exit();
+                None
+            }
+        }
+    }
+
     pub fn exclusive_session<F, V>(&self, f: F) -> V
     where
         F: FnOnce(&mut T) -> V,

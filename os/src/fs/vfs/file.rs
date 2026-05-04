@@ -1,6 +1,6 @@
 use super::super::devfs;
 use super::super::inode::OpenFlags;
-use super::super::mount::with_mount;
+use super::super::mount::{release_inode_from_drop, with_mount};
 use super::super::path::WorkingDir;
 use super::super::status_flags::StatusFlagsCell;
 use super::super::{File, FileStat, FileTimestamp, SeekWhence};
@@ -350,8 +350,6 @@ impl File for VfsFile {
 
 impl Drop for VfsFile {
     fn drop(&mut self) {
-        let _ = with_mount(self.node.mount_id, |mount| {
-            mount.release_inode(self.node.ino)
-        });
+        release_inode_from_drop(self.node.mount_id, self.node.ino);
     }
 }
