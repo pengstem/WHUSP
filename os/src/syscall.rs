@@ -84,6 +84,7 @@ const SYSCALL_WAIT4: usize = 260;
 const SYSCALL_PRLIMIT64: usize = 261;
 const SYSCALL_RENAMEAT2: usize = 276;
 const SYSCALL_STATX: usize = 291;
+const SYSCALL_FACCESSAT2: usize = 439;
 
 pub(crate) mod errno;
 mod fs;
@@ -154,6 +155,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut LinuxStatfs),
         SYSCALL_FACCESSAT => sys_faccessat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as i32,
+            args[3] as i32,
+        ),
+        SYSCALL_FACCESSAT2 => sys_faccessat2(
             args[0] as isize,
             args[1] as *const u8,
             args[2] as i32,

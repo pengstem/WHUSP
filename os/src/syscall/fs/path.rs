@@ -4,7 +4,7 @@ use super::stat::resolve_stat;
 use super::uapi::{
     AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, F_OK, LinuxTimeSpec,
     RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, UTIME_NOW, UTIME_OMIT, VALID_ACCESS_MODE,
-    VALID_FACCESSAT_FLAGS, VALID_RENAME_FLAGS, VALID_UTIMENSAT_FLAGS, X_OK,
+    VALID_FACCESSAT_FLAGS, VALID_FACCESSAT2_FLAGS, VALID_RENAME_FLAGS, VALID_UTIMENSAT_FLAGS, X_OK,
 };
 use super::user_ptr::read_user_value;
 use super::user_ptr::{
@@ -45,8 +45,11 @@ fn check_access_mode(stat: &FileStat, mode: i32) -> SysResult<()> {
         return Ok(());
     }
 
-    // UNFINISHED: The kernel runs all user tasks as uid 0 — only the root
-    // execute-bit check is meaningful until real credentials are implemented.
+    // UNFINISHED: Linux access checks depend on real/effective uid, gid,
+    // supplementary groups, path-prefix search permissions, read-only
+    // filesystems, immutable bits, and ETXTBSY. This kernel currently has no
+    // full credential/capability model, so R_OK/W_OK are root-like once the
+    // target resolves, while X_OK still requires any execute bit.
     if mode & X_OK != 0 && stat.mode & 0o111 == 0 {
         return Err(SysError::EACCES);
     }
@@ -212,8 +215,14 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> SysR
     install_open_file(file, flags, dir_path)
 }
 
-pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32, flags: i32) -> SysResult {
-    if mode & !VALID_ACCESS_MODE != 0 || flags & !VALID_FACCESSAT_FLAGS != 0 {
+fn do_faccessat(
+    dirfd: isize,
+    path: *const u8,
+    mode: i32,
+    flags: i32,
+    valid_flags: i32,
+) -> SysResult {
+    if mode & !VALID_ACCESS_MODE != 0 || flags & !valid_flags != 0 {
         return Err(SysError::EINVAL);
     }
     // CONTEXT: AT_EACCESS is accepted as a no-op because this kernel does not
@@ -223,14 +232,23 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32, flags: i32) -> Sy
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
     if path.is_empty() {
-        // UNFINISHED: Linux faccessat with AT_EMPTY_PATH can operate on dirfd;
-        // this syscall currently implements only pathname-based access checks.
-        return Err(SysError::ENOENT);
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(SysError::ENOENT);
+        }
     }
 
-    let stat = resolve_stat(dirfd, path.as_str(), true)?;
+    let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let stat = resolve_stat(dirfd, path.as_str(), follow_final_symlink)?;
     check_access_mode(&stat, mode)?;
     Ok(0)
+}
+
+pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32, flags: i32) -> SysResult {
+    do_faccessat(dirfd, path, mode, flags, VALID_FACCESSAT_FLAGS)
+}
+
+pub fn sys_faccessat2(dirfd: isize, path: *const u8, mode: i32, flags: i32) -> SysResult {
+    do_faccessat(dirfd, path, mode, flags, VALID_FACCESSAT2_FLAGS)
 }
 
 pub fn sys_utimensat(

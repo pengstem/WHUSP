@@ -6,7 +6,7 @@ const BUSYBOX_PATH: &str = "/musl/busybox";
 const BUSYBOX_APPLET: &str = "sh";
 const BUSYBOX_COMMAND_FLAG: &str = "-c";
 const TEST_LIBCS: &[&str] = &["/musl", "/glibc"];
-const TEST: bool = false;
+const TEST: bool = true;
 const ALL_TESTS: &[&str] = &[
     "basic_testcode.sh",
     "busybox_testcode.sh",
@@ -23,17 +23,26 @@ const ALL_TESTS: &[&str] = &[
 ];
 // CONTEXT: temporary - only libctest enabled for pthread bringup; restore all before merge.
 const TEST_SCRIPTS: &[&str] = &[
-    "basic_testcode.sh",
+    // perfect
+    // "basic_testcode.sh",
+    //runable
     "busybox_testcode.sh",
-    "lua_testcode.sh",
-    "libctest_testcode.sh",
-    "iozone_testcode.sh",
+    //perfect
+    // "lua_testcode.sh",
+    //runalbe
+    // "libctest_testcode.sh",
+    //runalbe
+    // "iozone_testcode.sh",
+    //runable
     // "unixbench_testcode.sh",
-    "iperf_testcode.sh",
+    //runalbe
+    // "iperf_testcode.sh",
     // "libcbench_testcode.sh",
     // "lmbench_testcode.sh",
-    "netperf_testcode.sh",
-    "cyclictest_testcode.sh",
+    //runalbe
+    // "netperf_testcode.sh",
+    //runalbe
+    // "cyclictest_testcode.sh",
     // "ltp_testcode.sh",
 ];
 

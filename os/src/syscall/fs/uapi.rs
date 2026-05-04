@@ -16,6 +16,7 @@ pub(super) const W_OK: i32 = 2;
 pub(super) const R_OK: i32 = 4;
 pub(super) const VALID_ACCESS_MODE: i32 = F_OK | X_OK | W_OK | R_OK;
 pub(super) const VALID_FACCESSAT_FLAGS: i32 = AT_EACCESS;
+pub(super) const VALID_FACCESSAT2_FLAGS: i32 = AT_EACCESS | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
 pub(super) const AT_STATX_FORCE_SYNC: i32 = 0x2000;
 pub(super) const AT_STATX_DONT_SYNC: i32 = 0x4000;
 pub(super) const AT_STATX_SYNC_TYPE: i32 = AT_STATX_FORCE_SYNC | AT_STATX_DONT_SYNC;
