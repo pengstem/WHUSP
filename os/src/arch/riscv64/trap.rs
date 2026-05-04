@@ -77,20 +77,17 @@ pub fn trap_handler() -> ! {
             enable_supervisor_interrupt();
 
             // get system call return value
-            let syscall_id = cx.x[17];
             let result = syscall(
-                syscall_id,
+                cx.x[17],
                 [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]],
             );
             // cx is changed during sys_execve, so we have to call it again
             cx = current_trap_cx();
-            if cx.sepc != trap_pc + 4 {
-                interrupted_pc = cx.sepc;
-            } else if result == -(SysError::EINTR as isize) {
-                interrupted_pc = trap_pc;
+            interrupted_pc = if cx.sepc == trap_pc + 4 && result == -(SysError::EINTR as isize) {
+                trap_pc
             } else {
-                interrupted_pc = cx.sepc;
-            }
+                cx.sepc
+            };
             cx.x[10] = result as usize;
         }
         Trap::Exception(Exception::StorePageFault) => {
