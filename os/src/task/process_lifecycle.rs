@@ -143,14 +143,11 @@ impl ProcessControlBlock {
         let cwd_path = parent.cwd_path.clone();
         let cmdline = parent.cmdline.clone();
         let signal_actions = parent.signal_actions;
-        let ustack_base = parent
-            .get_task(0)
-            .inner_exclusive_access()
-            .res
-            .as_ref()
-            .unwrap()
-            .ustack_base();
-        let parent_signal_mask = parent.get_task(0).inner_exclusive_access().signal_mask;
+        let parent_task = parent.get_task(0);
+        let parent_task_inner = parent_task.inner_exclusive_access();
+        let ustack_base = parent_task_inner.res.as_ref().unwrap().ustack_base();
+        let parent_signal_mask = parent_task_inner.signal_mask;
+        drop(parent_task_inner);
         drop(parent);
 
         let child = Arc::new(Self {

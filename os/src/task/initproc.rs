@@ -23,17 +23,17 @@ const ALL_TESTS: &[&str] = &[
 ];
 // CONTEXT: temporary - only libctest enabled for pthread bringup; restore all before merge.
 const TEST_SCRIPTS: &[&str] = &[
-    // "basic_testcode.sh",
-    // "busybox_testcode.sh",
-    // "lua_testcode.sh",
+    "basic_testcode.sh",
+    "busybox_testcode.sh",
+    "lua_testcode.sh",
     "libctest_testcode.sh",
-    // "iozone_testcode.sh",
+    "iozone_testcode.sh",
     // "unixbench_testcode.sh",
-    // "iperf_testcode.sh",
+    "iperf_testcode.sh",
     // "libcbench_testcode.sh",
     // "lmbench_testcode.sh",
-    // "netperf_testcode.sh",
-    // "cyclictest_testcode.sh",
+    "netperf_testcode.sh",
+    "cyclictest_testcode.sh",
     // "ltp_testcode.sh",
 ];
 
@@ -50,21 +50,22 @@ fn build_runner_command() -> String {
 
     for test in ALL_TESTS {
         if !TEST_SCRIPTS.contains(test) {
+            let testname = test.strip_suffix("_testcode.sh").unwrap_or(test);
             let _ = write!(
                 command,
-                "; echo '#### OS COMP TEST GROUP START {test}-musl ####' "
+                "; echo '#### OS COMP TEST GROUP START {testname}-musl ####' "
             );
             let _ = write!(
                 command,
-                "; echo '#### OS COMP TEST GROUP END {test}-musl ####' "
+                "; echo '#### OS COMP TEST GROUP END {testname}-musl ####' "
             );
             let _ = write!(
                 command,
-                "; echo '#### OS COMP TEST GROUP START {test}-glibc ####' "
+                "; echo '#### OS COMP TEST GROUP START {testname}-glibc ####' "
             );
             let _ = write!(
                 command,
-                "; echo '#### OS COMP TEST GROUP END {test}-glibc ####' "
+                "; echo '#### OS COMP TEST GROUP END {testname}-glibc ####' "
             );
         }
     }
