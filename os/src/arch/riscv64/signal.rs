@@ -5,8 +5,8 @@ use crate::syscall::user_ptr::{
 };
 use crate::syscall::{LinuxSigInfo, errno::SysError, errno::SysResult};
 use crate::task::{
-    SIGNAL_INFO_SLOTS, SignalAction, SignalFlags, SignalInfo, current_add_signal, current_process,
-    current_task, current_trap_cx, current_user_token, flags_to_linux_sigset,
+    SIGCHLD, SIGNAL_INFO_SLOTS, SignalAction, SignalFlags, SignalInfo, current_add_signal,
+    current_process, current_task, current_trap_cx, current_user_token, flags_to_linux_sigset,
     linux_sigset_to_flags,
 };
 use crate::trap::TrapContext;
@@ -18,6 +18,10 @@ const SA_NODEFER: usize = 0x4000_0000;
 const SIGALRM: usize = 14;
 const SIGCANCEL: usize = 33;
 const RT_SIGRETURN_TRAMPOLINE: [u32; 2] = [0x08b0_0893, 0x0000_0073];
+
+pub fn can_deliver_user_signal(signum: usize) -> bool {
+    matches!(signum, SIGALRM | SIGCANCEL) || signum == SIGCHLD as usize
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -119,12 +123,12 @@ fn take_pending_user_signal() -> Option<PendingUserSignal> {
             if !pending.contains(signal) {
                 continue;
             }
-            if signum != SIGCANCEL && signum != SIGALRM {
+            if !can_deliver_user_signal(signum) {
                 // UNFINISHED: Full Linux signal delivery must support every
-                // user-installed handler. This stage deliberately limits
-                // signal frames to musl's pthread cancellation signal and
-                // ITIMER_REAL/SIGALRM while the generic signal ABI is still
-                // being validated.
+                // user-installed handler. This stage deliberately limits signal
+                // frames to musl's pthread cancellation signal, ITIMER_REAL's
+                // SIGALRM, and BusyBox ash's SIGCHLD wait wakeup while the
+                // generic signal ABI is still being validated.
                 continue;
             }
             selected = Some((signum, signal));
@@ -152,7 +156,10 @@ fn take_pending_user_signal() -> Option<PendingUserSignal> {
         .copied()
         .flatten()
         .unwrap_or_else(|| SignalInfo::user(signum as i32, 0));
-    let old_mask = task_inner.signal_mask;
+    let old_mask = task_inner
+        .sigsuspend_restore_mask
+        .take()
+        .unwrap_or(task_inner.signal_mask);
     task_inner.clear_pending(signum as u32);
     task_inner.signal_mask |= action.mask;
     if action.flags & SA_NODEFER == 0 {

@@ -390,6 +390,38 @@ pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
     pending.check_error()
 }
 
+pub fn current_has_deliverable_signal() -> bool {
+    let Some(task) = current_task() else {
+        return false;
+    };
+    let Some(process) = task.process.upgrade() else {
+        return false;
+    };
+    let pending = {
+        let task_inner = task.inner_exclusive_access();
+        SignalFlags::from_bits_retain(
+            task_inner.pending_signals.bits() & !task_inner.signal_mask.bits(),
+        )
+    };
+    for signum in 1..SIGNAL_INFO_SLOTS {
+        let Some(signal) = SignalFlags::from_signum(signum as u32) else {
+            continue;
+        };
+        if !pending.contains(signal) {
+            continue;
+        }
+        let action = process.inner_exclusive_access().signal_actions[signum];
+        if action.is_ignore()
+            || !action.has_user_handler()
+            || !crate::arch::signal::can_deliver_user_signal(signum)
+        {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
 pub fn current_add_signal(signal: SignalFlags) {
     if signal.is_empty() {
         return;

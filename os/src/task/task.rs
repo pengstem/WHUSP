@@ -60,6 +60,7 @@ pub struct TaskControlBlockInner {
     pub pending_signals: SignalFlags,
     pub signal_infos: [Option<SignalInfo>; SIGNAL_INFO_SLOTS],
     pub signal_mask: SignalFlags,
+    pub sigsuspend_restore_mask: Option<SignalFlags>,
 }
 
 impl TaskControlBlockInner {
@@ -111,6 +112,7 @@ impl TaskControlBlock {
                     pending_signals: SignalFlags::empty(),
                     signal_infos: [None; SIGNAL_INFO_SLOTS],
                     signal_mask: SignalFlags::empty(),
+                    sigsuspend_restore_mask: None,
                 })
             },
         }

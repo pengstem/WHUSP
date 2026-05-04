@@ -1,8 +1,8 @@
 use crate::task::{
     ProcessControlBlock, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SignalAction, SignalFlags,
-    SignalInfo, TaskControlBlock, current_process, current_task, current_user_token,
-    flags_to_linux_sigset, linux_sigset_to_flags, pid2process, processes_snapshot,
-    queue_signal_to_task,
+    SignalInfo, TaskControlBlock, current_has_deliverable_signal, current_process, current_task,
+    current_user_token, flags_to_linux_sigset, linux_sigset_to_flags, pid2process,
+    processes_snapshot, queue_signal_to_task, suspend_current_and_run_next,
 };
 use crate::timer::get_time_ms;
 use alloc::sync::Arc;
@@ -233,6 +233,29 @@ pub fn sys_rt_sigprocmask(
         }
     }
     Ok(0)
+}
+
+pub fn sys_rt_sigsuspend(mask: *const u8, sigsetsize: usize) -> SysResult {
+    let token = current_user_token();
+    let new_mask = read_signal_set(token, mask, sigsetsize)?;
+    let task = current_task().ok_or(SysError::ESRCH)?;
+    let old_mask = {
+        let mut task_inner = task.inner_exclusive_access();
+        let old_mask = task_inner.signal_mask;
+        task_inner.signal_mask = new_mask;
+        old_mask
+    };
+
+    loop {
+        if current_has_deliverable_signal() {
+            task.inner_exclusive_access().sigsuspend_restore_mask = Some(old_mask);
+            return Err(SysError::EINTR);
+        }
+        // UNFINISHED: Linux rt_sigsuspend sleeps interruptibly until signal
+        // delivery; this kernel still uses cooperative polling instead of a
+        // signal wait queue.
+        suspend_current_and_run_next();
+    }
 }
 
 pub fn sys_rt_sigreturn() -> SysResult {

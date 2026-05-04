@@ -1,5 +1,8 @@
 use crate::mm::translated_refmut;
-use crate::task::{CLD_EXITED, SIGCHLD, SignalInfo, block_current_and_run_next, current_process};
+use crate::task::{
+    CLD_EXITED, SIGCHLD, SignalInfo, block_current_and_run_next, current_has_deliverable_signal,
+    current_process,
+};
 use alloc::sync::Arc;
 
 use super::errno::{SysError, SysResult};
@@ -151,6 +154,9 @@ pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsag
         }
         drop(inner);
         drop(process);
+        if current_has_deliverable_signal() {
+            return Err(SysError::EINTR);
+        }
         block_current_and_run_next();
     }
 }
@@ -230,6 +236,9 @@ pub fn sys_waitid(
         }
         drop(inner);
         drop(process);
+        if current_has_deliverable_signal() {
+            return Err(SysError::EINTR);
+        }
         block_current_and_run_next();
     }
 }

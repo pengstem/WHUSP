@@ -1,5 +1,9 @@
 use crate::syscall::errno::{SysError, SysResult};
 
+pub fn can_deliver_user_signal(_signum: usize) -> bool {
+    false
+}
+
 pub fn deliver_pending_signal(_interrupted_pc: usize) -> bool {
     false
 }
