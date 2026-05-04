@@ -188,11 +188,11 @@ impl ProcessControlBlock {
         child_inner.tasks.push(Some(Arc::clone(&task)));
         drop(child_inner);
 
-        let task_inner = task.inner_exclusive_access();
+        let mut task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         trap_cx.kernel_sp = task.kstack.get_top();
+        task_inner.signal_mask = parent_signal_mask;
         drop(task_inner);
-        task.inner_exclusive_access().signal_mask = parent_signal_mask;
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);
         child

@@ -67,6 +67,15 @@ impl TaskControlBlockInner {
         self.trap_cx_ppn.get_mut()
     }
 
+    pub fn clear_pending(&mut self, signum: u32) {
+        if let Some(flag) = SignalFlags::from_signum(signum) {
+            self.pending_signals.remove(flag);
+        }
+        if let Some(slot) = self.signal_infos.get_mut(signum as usize) {
+            *slot = None;
+        }
+    }
+
     #[allow(unused)]
     fn get_status(&self) -> TaskStatus {
         self.task_status

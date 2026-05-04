@@ -1,6 +1,7 @@
 use crate::task::{
-    SIGNAL_INFO_SLOTS, SignalAction, SignalFlags, SignalInfo, TaskControlBlock, current_process,
-    current_task, current_user_token, pid2process, processes_snapshot, queue_signal_to_task,
+    ProcessControlBlock, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SignalAction, SignalFlags,
+    SignalInfo, TaskControlBlock, current_process, current_task, current_user_token, pid2process,
+    processes_snapshot, queue_signal_to_task,
 };
 use crate::timer::get_time_ms;
 use alloc::sync::Arc;
@@ -65,12 +66,7 @@ fn consume_pending_signal(signum: u32) {
         return;
     };
     let mut inner = task.inner_exclusive_access();
-    if let Some(flag) = SignalFlags::from_signum(signum) {
-        inner.pending_signals.remove(flag);
-    }
-    if let Some(info) = inner.signal_infos.get_mut(signum as usize) {
-        *info = None;
-    }
+    inner.clear_pending(signum);
 }
 
 fn try_return_pending_signal(
@@ -119,24 +115,27 @@ fn signal_action_from_linux(raw: LinuxKernelSigAction) -> SignalAction {
     }
 }
 
-fn validate_signal(signum: u32) -> SysResult<SignalFlags> {
+fn validate_kill_signum(signum: u32) -> SysResult<SignalFlags> {
     SignalFlags::from_signum(signum).ok_or(SysError::EINVAL)
 }
 
-fn validate_action_signal(signum: u32) -> SysResult<usize> {
+fn validate_action_signum(signum: u32) -> SysResult<usize> {
     if signum == 0 || signum as usize >= SIGNAL_INFO_SLOTS {
         return Err(SysError::EINVAL);
     }
     Ok(signum as usize)
 }
 
+fn task_with_tid(process: &ProcessControlBlock, tid: usize) -> Option<Arc<TaskControlBlock>> {
+    process
+        .tasks_snapshot()
+        .into_iter()
+        .find(|task| task.linux_tid() == tid)
+}
+
 fn find_task_by_linux_tid(tid: usize) -> Option<(usize, Arc<TaskControlBlock>)> {
     for process in processes_snapshot() {
-        if let Some(task) = process
-            .tasks_snapshot()
-            .into_iter()
-            .find(|task| task.linux_tid() == tid)
-        {
+        if let Some(task) = task_with_tid(&process, tid) {
             return Some((process.getpid(), task));
         }
     }
@@ -145,14 +144,11 @@ fn find_task_by_linux_tid(tid: usize) -> Option<(usize, Arc<TaskControlBlock>)> 
 
 fn find_task_in_process_by_linux_tid(tgid: usize, tid: usize) -> Option<Arc<TaskControlBlock>> {
     let process = pid2process(tgid)?;
-    process
-        .tasks_snapshot()
-        .into_iter()
-        .find(|task| task.linux_tid() == tid)
+    task_with_tid(&process, tid)
 }
 
 fn queue_user_signal(task: Arc<TaskControlBlock>, signum: u32, sender_pid: i32) -> SysResult<()> {
-    let signal = validate_signal(signum)?;
+    let signal = validate_kill_signum(signum)?;
     if signal.is_empty() {
         return Ok(());
     }
@@ -183,11 +179,8 @@ pub fn sys_rt_sigaction(
     if sigsetsize != LINUX_RT_SIGSET_SIZE {
         return Err(SysError::EINVAL);
     }
-    let signal_index = validate_action_signal(signum)?;
-    if !action.is_null()
-        && (signum == SignalFlags::SIGKILL.bits().trailing_zeros()
-            || signum == SignalFlags::SIGSTOP.bits().trailing_zeros())
-    {
+    let signal_index = validate_action_signum(signum)?;
+    if !action.is_null() && (signum == SIGKILL || signum == SIGSTOP) {
         return Err(SysError::EINVAL);
     }
 
@@ -200,13 +193,16 @@ pub fn sys_rt_sigaction(
             action.cast::<LinuxKernelSigAction>(),
         )?))
     };
-    let old = current_process().inner_exclusive_access().signal_actions[signal_index];
+    let process = current_process();
+    let old = process.inner_exclusive_access().signal_actions[signal_index];
+    // CONTEXT: user memory writes can fault, so release the process lock before
+    // copying out the old action and reacquire it only when installing the new one.
     if !old_action.is_null() {
         let old = LinuxKernelSigAction::from(old);
         write_user_value(token, old_action.cast::<LinuxKernelSigAction>(), &old)?;
     }
     if let Some(new_action) = new_action {
-        current_process().inner_exclusive_access().signal_actions[signal_index] = new_action;
+        process.inner_exclusive_access().signal_actions[signal_index] = new_action;
     }
     Ok(0)
 }
@@ -228,6 +224,8 @@ pub fn sys_rt_sigprocmask(
     };
     let task = current_task().ok_or(SysError::ESRCH)?;
     let old_mask = task.inner_exclusive_access().signal_mask;
+    // CONTEXT: user memory writes can fault, so release the task lock before
+    // copying out the old mask and reacquire it only when installing the new one.
     if !old_set.is_null() {
         let old_raw = flags_to_linux_sigset(old_mask);
         write_user_value(token, old_set.cast::<u64>(), &old_raw)?;

@@ -36,7 +36,9 @@ pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
     current_user_token, run_tasks, schedule, take_current_task,
 };
-pub use signal::{CLD_EXITED, SIGCHLD, SIGNAL_INFO_SLOTS, SignalAction, SignalFlags, SignalInfo};
+pub use signal::{
+    CLD_EXITED, SIGCHLD, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SignalAction, SignalFlags, SignalInfo,
+};
 pub use task::{TaskControlBlock, TaskStatus};
 
 fn with_current_process(process_fn: impl FnOnce(&ProcessControlBlock)) {
@@ -342,6 +344,9 @@ pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
     let process = task.process.upgrade()?;
     let pending = {
         let task_inner = task.inner_exclusive_access();
+        // CONTEXT: bitflags `!` truncates to named flags unless the flag type
+        // declares external bits, while this kernel keeps Linux real-time
+        // signals through `from_bits_retain`.
         SignalFlags::from_bits_retain(
             task_inner.pending_signals.bits() & !task_inner.signal_mask.bits(),
         )
@@ -355,12 +360,7 @@ pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
     // runtest still reap children with wait/waitid or explicit sigtimedwait.
     if action.is_ignore() || (signum == SIGCHLD as usize && !action.has_user_handler()) {
         let mut task_inner = task.inner_exclusive_access();
-        if let Some(signal) = SignalFlags::from_signum(signum as u32) {
-            task_inner.pending_signals.remove(signal);
-        }
-        if let Some(slot) = task_inner.signal_infos.get_mut(signum) {
-            *slot = None;
-        }
+        task_inner.clear_pending(signum as u32);
         return None;
     }
     if action.has_user_handler() {

@@ -3,7 +3,9 @@ use bitflags::*;
 pub const SIGNAL_INFO_SLOTS: usize = 65;
 
 pub const SI_USER: i32 = 0;
+pub const SIGKILL: u32 = 9;
 pub const SIGCHLD: u32 = 17;
+pub const SIGSTOP: u32 = 19;
 pub const CLD_EXITED: i32 = 1;
 
 bitflags! {
