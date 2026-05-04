@@ -10,6 +10,7 @@ use super::fs::user_ptr::{read_user_value, write_user_value};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::mem::size_of;
 use lazy_static::*;
 
 const CLOCK_REALTIME: i32 = 0;
@@ -40,6 +41,21 @@ const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
 const FUTEX_WAITERS: u32 = 0x8000_0000;
 const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
 const FUTEX_TID_MASK: u32 = !(FUTEX_WAITERS | FUTEX_OWNER_DIED);
+const ROBUST_LIST_LIMIT: usize = 2048;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxRobustListHead {
+    list_next: usize,
+    futex_offset: isize,
+    list_op_pending: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxRobustList {
+    next: usize,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct FutexKey {
@@ -299,13 +315,21 @@ fn validate_futex_addr(addr: usize) -> SysResult {
 }
 
 fn read_futex_word(addr: usize) -> SysResult<u32> {
-    validate_futex_addr(addr)?;
-    read_user_value(current_user_token(), addr as *const u32)
+    read_futex_word_with_token(current_user_token(), addr)
 }
 
 fn write_futex_word(addr: usize, value: u32) -> SysResult<()> {
+    write_futex_word_with_token(current_user_token(), addr, value)
+}
+
+fn read_futex_word_with_token(token: usize, addr: usize) -> SysResult<u32> {
     validate_futex_addr(addr)?;
-    write_user_value(current_user_token(), addr as *mut u32, &value)
+    read_user_value(token, addr as *const u32)
+}
+
+fn write_futex_word_with_token(token: usize, addr: usize, value: u32) -> SysResult<()> {
+    validate_futex_addr(addr)?;
+    write_user_value(token, addr as *mut u32, &value)
 }
 
 fn current_linux_tid_u32() -> SysResult<u32> {
@@ -554,6 +578,90 @@ fn futex_unlock_pi(addr: usize, private: bool) -> SysResult {
     Ok(0)
 }
 
+fn robust_futex_addr(entry: usize, futex_offset: isize) -> SysResult<usize> {
+    if futex_offset >= 0 {
+        entry
+            .checked_add(futex_offset as usize)
+            .ok_or(SysError::EFAULT)
+    } else {
+        entry
+            .checked_sub(futex_offset.checked_neg().ok_or(SysError::EFAULT)? as usize)
+            .ok_or(SysError::EFAULT)
+    }
+}
+
+fn handle_robust_futex_death(
+    token: usize,
+    process_id: usize,
+    entry: usize,
+    futex_offset: isize,
+    tid: u32,
+) -> SysResult {
+    let addr = robust_futex_addr(entry, futex_offset)?;
+    let word = read_futex_word_with_token(token, addr)?;
+    if word & FUTEX_TID_MASK != tid {
+        return Ok(0);
+    }
+
+    write_futex_word_with_token(token, addr, (word & FUTEX_WAITERS) | FUTEX_OWNER_DIED)?;
+    if word & FUTEX_WAITERS != 0 {
+        // CONTEXT: Linux wakes a robust futex waiter by keying the futex word.
+        // This kernel still keeps private and shared futex queues separate, so
+        // exit cleanup wakes both keys to cover private pthread robust mutexes
+        // and process-shared robust mutexes.
+        let _ = futex_wake_for_process(addr, false, process_id, 1, FUTEX_BITSET_MATCH_ANY);
+        let _ = futex_wake_for_process(addr, true, process_id, 1, FUTEX_BITSET_MATCH_ANY);
+    }
+    Ok(0)
+}
+
+fn exit_robust_list_inner(
+    head_addr: usize,
+    token: usize,
+    process_id: usize,
+    tid: u32,
+) -> SysResult {
+    let head: LinuxRobustListHead =
+        read_user_value(token, head_addr as *const LinuxRobustListHead)?;
+    let mut entry = head.list_next;
+    let mut remaining = ROBUST_LIST_LIMIT;
+
+    while entry != 0 && entry != head_addr {
+        if remaining == 0 {
+            return Err(SysError::ELOOP);
+        }
+        remaining -= 1;
+        let next = read_user_value::<LinuxRobustList>(token, entry as *const LinuxRobustList)?.next;
+        if entry != head.list_op_pending {
+            handle_robust_futex_death(token, process_id, entry, head.futex_offset, tid)?;
+        }
+        entry = next;
+    }
+
+    if head.list_op_pending != 0 {
+        handle_robust_futex_death(
+            token,
+            process_id,
+            head.list_op_pending,
+            head.futex_offset,
+            tid,
+        )?;
+    }
+    Ok(0)
+}
+
+pub(crate) fn exit_robust_list(task: &Arc<TaskControlBlock>, token: usize, process_id: usize) {
+    let head_addr = task.robust_list_head();
+    if head_addr == 0 {
+        return;
+    }
+    let tid = task.linux_tid();
+    if tid > FUTEX_TID_MASK as usize {
+        return;
+    }
+    let _ = exit_robust_list_inner(head_addr, token, process_id, tid as u32);
+}
+
 pub(crate) fn clear_child_tid_and_wake(token: usize, process_id: usize, addr: usize) {
     if addr == 0 {
         return;
@@ -597,6 +705,42 @@ fn futex_requeue(
 
 pub(crate) fn remove_process_futex_waiters(process_id: usize) {
     FUTEX_MANAGER.exclusive_access().remove_process(process_id);
+}
+
+pub fn sys_set_robust_list(head: usize, len: usize) -> SysResult {
+    if len != size_of::<LinuxRobustListHead>() {
+        return Err(SysError::EINVAL);
+    }
+    current_task().unwrap().set_robust_list_head(head);
+    Ok(0)
+}
+
+fn robust_list_query_task(pid: isize) -> SysResult<Arc<TaskControlBlock>> {
+    if pid < 0 {
+        return Err(SysError::ESRCH);
+    }
+    if pid == 0 {
+        return current_task().ok_or(SysError::ESRCH);
+    }
+
+    let pid = pid as usize;
+    let process = current_process();
+    let process_inner = process.inner_exclusive_access();
+    process_inner
+        .tasks
+        .iter()
+        .filter_map(|task| task.as_ref())
+        .find(|task| task.linux_tid() == pid)
+        .map(Arc::clone)
+        .ok_or(SysError::ESRCH)
+}
+
+pub fn sys_get_robust_list(pid: isize, head_ptr: *mut usize, len_ptr: *mut usize) -> SysResult {
+    let task = robust_list_query_task(pid)?;
+    let token = current_user_token();
+    write_user_value(token, head_ptr, &task.robust_list_head())?;
+    write_user_value(token, len_ptr, &size_of::<LinuxRobustListHead>())?;
+    Ok(0)
 }
 
 fn futex_count(raw: usize) -> SysResult<usize> {

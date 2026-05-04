@@ -146,6 +146,7 @@ fn terminate_sibling_threads(
 ) {
     let mut clear_child_tids = Vec::new();
     let mut recycle_res = Vec::<TaskUserRes>::new();
+    let mut robust_tasks = Vec::new();
     let mut exited_threads = Vec::new();
     {
         let mut process_inner = process.inner_exclusive_access();
@@ -162,6 +163,7 @@ fn terminate_sibling_threads(
             if let Some(clear_child_tid) = task_inner.clear_child_tid.take() {
                 clear_child_tids.push(clear_child_tid);
             }
+            robust_tasks.push(Arc::clone(&task));
             if let Some(res) = task_inner.res.take() {
                 recycle_res.push(res);
             }
@@ -173,6 +175,9 @@ fn terminate_sibling_threads(
         }
     }
 
+    for task in robust_tasks {
+        crate::syscall::exit_robust_list(&task, process_token, process_id);
+    }
     for clear_child_tid in clear_child_tids {
         crate::syscall::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
     }
@@ -214,6 +219,7 @@ fn exit_current(exit_code: i32, group_exit: bool) {
     task_inner.task_status = TaskStatus::Exited;
     task_inner.res = None;
     drop(task_inner);
+    crate::syscall::exit_robust_list(&task, process_token, process_id);
     if let Some(clear_child_tid) = clear_child_tid {
         crate::syscall::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
     }

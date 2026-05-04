@@ -32,6 +32,8 @@ const SYSCALL_EXIT_GROUP: usize = 94;
 const SYSCALL_WAITID: usize = 95;
 const SYSCALL_SET_TID_ADDRESS: usize = 96;
 const SYSCALL_FUTEX: usize = 98;
+const SYSCALL_SET_ROBUST_LIST: usize = 99;
+const SYSCALL_GET_ROBUST_LIST: usize = 100;
 const SYSCALL_NANOSLEEP: usize = 101;
 const SYSCALL_CLOCK_GETTIME: usize = 113;
 const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
@@ -81,6 +83,7 @@ use signal::*;
 use sync::*;
 use wait::*;
 
+pub(crate) use sync::exit_robust_list;
 pub(crate) use sync::{clear_child_tid_and_wake, remove_process_futex_waiters};
 
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
@@ -195,6 +198,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *const LinuxTimeSpec,
             args[4] as *mut u32,
             args[5] as u32,
+        ),
+        SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
+        SYSCALL_GET_ROBUST_LIST => sys_get_robust_list(
+            args[0] as isize,
+            args[1] as *mut usize,
+            args[2] as *mut usize,
         ),
         SYSCALL_NANOSLEEP => sys_nanosleep(
             args[0] as *const LinuxTimeSpec,

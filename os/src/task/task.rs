@@ -37,6 +37,14 @@ impl TaskControlBlock {
             .map(|handle| handle.0);
         tid.unwrap_or_else(|| self.process.upgrade().unwrap().getpid())
     }
+
+    pub fn robust_list_head(&self) -> usize {
+        self.inner_exclusive_access().robust_list_head
+    }
+
+    pub fn set_robust_list_head(&self, head: usize) {
+        self.inner_exclusive_access().robust_list_head = head;
+    }
 }
 
 pub struct TaskControlBlockInner {
@@ -48,6 +56,7 @@ pub struct TaskControlBlockInner {
     pub exit_code: Option<i32>,
     pub linux_tid: Option<PidHandle>,
     pub clear_child_tid: Option<usize>,
+    pub robust_list_head: usize,
     pub pending_signals: SignalFlags,
     pub signal_infos: [Option<SignalInfo>; SIGNAL_INFO_SLOTS],
     pub signal_mask: SignalFlags,
@@ -89,6 +98,7 @@ impl TaskControlBlock {
                     exit_code: None,
                     linux_tid: None,
                     clear_child_tid: None,
+                    robust_list_head: 0,
                     pending_signals: SignalFlags::empty(),
                     signal_infos: [None; SIGNAL_INFO_SLOTS],
                     signal_mask: SignalFlags::empty(),

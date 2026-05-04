@@ -201,18 +201,18 @@
 5. [x] **signal/cancel 地基**：补 `tkill(130)`、`tgkill(131)`、`rt_sigprocmask(135)`、`rt_sigaction(134)`、`rt_sigreturn(139)`；把 signal pending/mask 从 process-wide 位图推进到每线程语义，并能唤醒可中断等待。
 6. [x] **pthread cancel**：按 `pthread_cancel.c` -> `pthread_cancel-points.c` 验收，确保 cancel signal 不误杀整个进程，cleanup handler 执行，取消点和非取消点行为分开。
 7. [x] **PI futex 最小兼容**：补 `FUTEX_LOCK_PI`、`FUTEX_UNLOCK_PI`、`FUTEX_TRYLOCK_PI` 的 owner/waiter 语义；真实 priority inheritance 可先保留 `// UNFINISHED:`。
-8. [ ] **robust futex**：补 `set_robust_list(99)` / `get_robust_list(100)`，线程退出时遍历 robust list，设置 `FUTEX_OWNER_DIED` 并唤醒 waiter。
+8. [x] **robust futex**：补 `set_robust_list(99)` / `get_robust_list(100)`，线程退出时遍历 robust list，设置 `FUTEX_OWNER_DIED` 并唤醒 waiter。
 
 ### 验收命令
 
-- [ ] `make kernel-rv`。
+- [x] `make kernel-rv`。
 - [ ] item 级运行：`cd /musl && ./runtest.exe -w entry-static.exe pthread_mutex`。
 - [ ] item 级运行：`cd /musl && ./runtest.exe -w entry-static.exe pthread_cond`。
 - [ ] item 级运行：`cd /musl && ./runtest.exe -w entry-static.exe pthread_tsd`。
 - [ ] item 级运行：`cd /musl && ./runtest.exe -w entry-static.exe pthread_cancel`。
 - [ ] item 级运行：`cd /musl && ./runtest.exe -w entry-static.exe pthread_cancel_points`。
 - [x] item 级运行：当前 `sdcard-rv.img` 未打包 `pthread_mutex_pi`；用临时编译的 `src/functional/pthread_mutex_pi.c` 静态 RISC-V musl 二进制，经 guest `/tmp` base64 注入后运行无 `t_error` 输出。
-- [ ] item 级运行：`cd /musl && ./runtest.exe -w entry-static.exe pthread_robust`。
+- [x] item 级运行：当前 `sdcard-rv.img` 未打包 `pthread_robust`；用临时编译的 `src/functional/pthread_robust.c` 静态 RISC-V musl 二进制，经 guest base64 注入后运行并返回 `ROBUST_DONE:0`，无 `t_error` 输出。
 - [ ] 回归：`tools/contest_runner/run_groups.py --arch rv --libcs musl --groups basic,busybox,lua` 不退化。
 - [ ] 完整组：`tools/contest_runner/run_groups.py --arch rv --libcs musl --groups libctest` 能跑过 pthread 段，不再因 pthread 用例 SIGKILL 超时。
 

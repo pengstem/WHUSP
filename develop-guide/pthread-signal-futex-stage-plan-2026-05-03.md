@@ -136,3 +136,17 @@ Local ABI evidence:
   temporary static RISC-V musl binary with `src/common/print.c`, injected it
   into guest `/tmp` via base64 over the interactive shell, and ran it directly.
   The testcase returned to the shell with no `t_error` output.
+- 2026-05-04 Stage E direction: store the Linux robust-list head per
+  `TaskControlBlock`, expose `set_robust_list(99)` / `get_robust_list(100)`,
+  and on thread exit scan the circular list plus `list_op_pending`. If the
+  futex owner TID matches the exiting Linux-visible TID, clear the owner bits,
+  preserve `FUTEX_WAITERS`, set `FUTEX_OWNER_DIED`, and wake both private and
+  shared futex queues for the word.
+- 2026-05-04 Stage E validation: current `sdcard-rv.img` also lacks
+  `pthread_robust` in the packaged entry table, so compiled
+  `../testsuits-for-oskernel/libc-test/src/functional/pthread_robust.c` as a
+  temporary static RISC-V musl binary with `src/common/print.c`, injected it
+  into the guest through a base64 stdin pipeline, ran it directly, and observed
+  `ROBUST_DONE:0` with no `t_error` output. The guest `chmod` command returned
+  `Function not implemented`, but the decoded file was executable and the test
+  completed.
