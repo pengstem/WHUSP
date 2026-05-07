@@ -143,7 +143,7 @@ pub(crate) mod user_ptr;
 mod wait;
 
 use crate::task::RLimit;
-use errno::{SysError, ret};
+use errno::{ret, SysError};
 use fs::*;
 use futex::*;
 use memory::*;
@@ -154,6 +154,7 @@ use time::*;
 use uapi::LinuxTimeSpec;
 use wait::*;
 
+pub(crate) use fs::release_record_locks_for_process;
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 pub(crate) use wait::LinuxSigInfo;
 

@@ -17,6 +17,7 @@ use self::id::TaskUserRes;
 use crate::arch::__switch;
 use crate::sbi::shutdown;
 use crate::sync::UPIntrFreeCell;
+use crate::syscall::release_record_locks_for_process;
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::*;
@@ -303,6 +304,7 @@ fn exit_current(exit_code: i32, group_exit: bool) {
         for flush in flushes {
             flush.write_back();
         }
+        release_record_locks_for_process(pid);
 
         // move all child processes under init process
         let mut initproc_inner = INITPROC.inner_exclusive_access();

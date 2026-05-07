@@ -8,7 +8,7 @@ use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{translated_byte_buffer_checked, UserBufferAccess};
-use super::fd_lock::{fcntl_getlk, fcntl_setlk, release_record_locks_for_close};
+use super::fd_lock::{fcntl_getlk, fcntl_setlk, fcntl_setlkw, release_record_locks_for_close};
 
 const F_DUPFD: usize = 0;
 const F_GETFD: usize = 1;
@@ -249,7 +249,8 @@ pub fn sys_fcntl(fd: usize, op: usize, arg: usize) -> SysResult {
             Ok(0)
         }
         F_GETLK => fcntl_getlk(get_fd_entry_by_fd(fd)?, arg as *mut _),
-        F_SETLK | F_SETLKW => fcntl_setlk(get_fd_entry_by_fd(fd)?, arg as *const _),
+        F_SETLK => fcntl_setlk(get_fd_entry_by_fd(fd)?, arg as *const _),
+        F_SETLKW => fcntl_setlkw(get_fd_entry_by_fd(fd)?, arg as *const _),
         F_GETPIPE_SZ => fcntl_get_pipe_size(fd),
         F_SETPIPE_SZ => fcntl_set_pipe_size(fd, arg),
         _ => Err(SysError::EINVAL),

@@ -2,7 +2,11 @@ use crate::fs::{File, SeekWhence};
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{read_user_value, write_user_value};
-use crate::task::{current_process, current_user_token, FdTableEntry};
+use crate::task::{
+    block_current_task_no_schedule, current_process, current_user_token, schedule, wakeup_task,
+    FdTableEntry, TaskControlBlock,
+};
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
@@ -41,8 +45,25 @@ struct PosixLock {
     end: i64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ReleasedRange {
+    key: LockKey,
+    start: i64,
+    end: i64,
+}
+
+struct WaitingLock {
+    key: LockKey,
+    pid: usize,
+    l_type: i16,
+    start: i64,
+    end: i64,
+    task: Arc<TaskControlBlock>,
+}
+
 struct RecordLockTable {
     locks: Vec<PosixLock>,
+    waiters: VecDeque<WaitingLock>,
 }
 
 lazy_static! {
@@ -52,7 +73,10 @@ lazy_static! {
 
 impl RecordLockTable {
     fn new() -> Self {
-        Self { locks: Vec::new() }
+        Self {
+            locks: Vec::new(),
+            waiters: VecDeque::new(),
+        }
     }
 
     fn set_lock(
@@ -62,12 +86,13 @@ impl RecordLockTable {
         l_type: i16,
         start: i64,
         end: i64,
-    ) -> SysResult<()> {
-        if l_type != F_UNLCK && self.find_conflict(key, pid, l_type, start, end).is_some() {
+    ) -> SysResult<Vec<Arc<TaskControlBlock>>> {
+        if l_type != F_UNLCK && !self.find_conflicts(key, pid, l_type, start, end).is_empty() {
             return Err(SysError::EAGAIN);
         }
 
-        self.remove_owned_range(key, pid, start, end);
+        let released = self.remove_owned_range(key, pid, start, end);
+        let wakeups = self.take_waiters_for_released(&released);
         if l_type != F_UNLCK {
             self.locks.push(PosixLock {
                 key,
@@ -78,7 +103,7 @@ impl RecordLockTable {
             });
             self.merge_adjacent();
         }
-        Ok(())
+        Ok(wakeups)
     }
 
     fn find_conflict(
@@ -89,6 +114,19 @@ impl RecordLockTable {
         start: i64,
         end: i64,
     ) -> Option<PosixLock> {
+        self.find_conflicts(key, pid, requested_type, start, end)
+            .into_iter()
+            .min_by_key(|lock| (lock.start, lock.end))
+    }
+
+    fn find_conflicts(
+        &self,
+        key: LockKey,
+        pid: usize,
+        requested_type: i16,
+        start: i64,
+        end: i64,
+    ) -> Vec<PosixLock> {
         self.locks
             .iter()
             .copied()
@@ -98,11 +136,18 @@ impl RecordLockTable {
                     && lock_conflicts(lock.l_type, requested_type)
                     && ranges_overlap(lock.start, lock.end, start, end)
             })
-            .min_by_key(|lock| (lock.start, lock.end))
+            .collect()
     }
 
-    fn remove_owned_range(&mut self, key: LockKey, pid: usize, start: i64, end: i64) {
+    fn remove_owned_range(
+        &mut self,
+        key: LockKey,
+        pid: usize,
+        start: i64,
+        end: i64,
+    ) -> Vec<ReleasedRange> {
         let mut next = Vec::new();
+        let mut released = Vec::new();
         for lock in self.locks.drain(..) {
             if lock.key != key
                 || lock.pid != pid
@@ -112,6 +157,11 @@ impl RecordLockTable {
                 continue;
             }
 
+            released.push(ReleasedRange {
+                key,
+                start: lock.start.max(start),
+                end: lock.end.min(end),
+            });
             if lock.start < start {
                 next.push(PosixLock {
                     end: start - 1,
@@ -126,11 +176,105 @@ impl RecordLockTable {
             }
         }
         self.locks = next;
+        released
     }
 
-    fn release_for_process_file(&mut self, key: LockKey, pid: usize) {
-        self.locks
-            .retain(|lock| !(lock.key == key && lock.pid == pid));
+    fn release_for_process_file(&mut self, key: LockKey, pid: usize) -> Vec<Arc<TaskControlBlock>> {
+        let mut next = Vec::new();
+        let mut released = Vec::new();
+        for lock in self.locks.drain(..) {
+            if lock.key == key && lock.pid == pid {
+                released.push(ReleasedRange {
+                    key,
+                    start: lock.start,
+                    end: lock.end,
+                });
+            } else {
+                next.push(lock);
+            }
+        }
+        self.locks = next;
+        self.take_waiters_for_released(&released)
+    }
+
+    fn release_for_process(&mut self, pid: usize) -> Vec<Arc<TaskControlBlock>> {
+        self.remove_waiters_for_pid(pid);
+        let mut next = Vec::new();
+        let mut released = Vec::new();
+        for lock in self.locks.drain(..) {
+            if lock.pid == pid {
+                released.push(ReleasedRange {
+                    key: lock.key,
+                    start: lock.start,
+                    end: lock.end,
+                });
+            } else {
+                next.push(lock);
+            }
+        }
+        self.locks = next;
+        self.take_waiters_for_released(&released)
+    }
+
+    fn enqueue_waiter(
+        &mut self,
+        key: LockKey,
+        pid: usize,
+        l_type: i16,
+        start: i64,
+        end: i64,
+        task: Arc<TaskControlBlock>,
+    ) {
+        self.waiters.push_back(WaitingLock {
+            key,
+            pid,
+            l_type,
+            start,
+            end,
+            task,
+        });
+    }
+
+    fn would_deadlock(&self, pid: usize, conflicts: &[PosixLock]) -> bool {
+        conflicts.iter().any(|conflict| {
+            self.waiters.iter().any(|waiter| {
+                waiter.pid == conflict.pid
+                    && self.locks.iter().any(|owned| {
+                        owned.pid == pid
+                            && owned.key == waiter.key
+                            && lock_conflicts(owned.l_type, waiter.l_type)
+                            && ranges_overlap(owned.start, owned.end, waiter.start, waiter.end)
+                    })
+            })
+        })
+    }
+
+    fn take_waiters_for_released(
+        &mut self,
+        released: &[ReleasedRange],
+    ) -> Vec<Arc<TaskControlBlock>> {
+        if released.is_empty() {
+            return Vec::new();
+        }
+
+        let mut next = VecDeque::new();
+        let mut wakeups = Vec::new();
+        while let Some(waiter) = self.waiters.pop_front() {
+            if released.iter().any(|range| {
+                waiter.key == range.key
+                    && ranges_overlap(waiter.start, waiter.end, range.start, range.end)
+            }) {
+                wakeups.push(waiter.task);
+            } else {
+                next.push_back(waiter);
+            }
+        }
+        self.waiters = next;
+        wakeups
+    }
+
+    fn remove_waiters_for_pid(&mut self, pid: usize) {
+        self.waiters.retain(|waiter| waiter.pid != pid);
     }
 
     fn merge_adjacent(&mut self) {
@@ -231,6 +375,12 @@ fn check_lock_access(file: &Arc<dyn File + Send + Sync>, l_type: i16) -> SysResu
     }
 }
 
+fn wake_waiters(waiters: Vec<Arc<TaskControlBlock>>) {
+    for task in waiters {
+        let _ = wakeup_task(task);
+    }
+}
+
 pub(super) fn fcntl_getlk(entry: FdTableEntry, lock: *mut LinuxFlock) -> SysResult {
     let file = entry.file();
     let token = current_user_token();
@@ -272,12 +422,49 @@ pub(super) fn fcntl_setlk(entry: FdTableEntry, lock: *const LinuxFlock) -> SysRe
     let (start, end) = flock_range(&file, flock)?;
     let key = lock_key(&file)?;
     let pid = current_process().getpid();
-    // UNFINISHED: F_SETLKW still uses nonblocking F_SETLK behavior; signalable
-    // waits and deadlock detection are not implemented yet.
-    RECORD_LOCK_TABLE
-        .exclusive_access()
-        .set_lock(key, pid, flock.l_type, start, end)?;
+    let waiters =
+        RECORD_LOCK_TABLE
+            .exclusive_access()
+            .set_lock(key, pid, flock.l_type, start, end)?;
+    wake_waiters(waiters);
     Ok(0)
+}
+
+pub(super) fn fcntl_setlkw(entry: FdTableEntry, lock: *const LinuxFlock) -> SysResult {
+    let file = entry.file();
+    let token = current_user_token();
+    let flock = read_user_value(token, lock)?;
+    if !valid_setlk_type(flock.l_type) {
+        return Err(SysError::EINVAL);
+    }
+    check_lock_access(&file, flock.l_type)?;
+
+    let (start, end) = flock_range(&file, flock)?;
+    let key = lock_key(&file)?;
+    let pid = current_process().getpid();
+    // UNFINISHED: F_SETLKW waits are not signal-interruptible yet; Linux can
+    // return EINTR when a blocked lock request is interrupted by a signal.
+    loop {
+        let mut table = RECORD_LOCK_TABLE.exclusive_access();
+        let conflicts = if flock.l_type == F_UNLCK {
+            Vec::new()
+        } else {
+            table.find_conflicts(key, pid, flock.l_type, start, end)
+        };
+        if conflicts.is_empty() {
+            let waiters = table.set_lock(key, pid, flock.l_type, start, end)?;
+            drop(table);
+            wake_waiters(waiters);
+            return Ok(0);
+        }
+        if table.would_deadlock(pid, &conflicts) {
+            return Err(SysError::EDEADLK);
+        }
+        let (task, task_cx_ptr) = block_current_task_no_schedule();
+        table.enqueue_waiter(key, pid, flock.l_type, start, end, task);
+        drop(table);
+        schedule(task_cx_ptr);
+    }
 }
 
 pub(super) fn release_record_locks_for_close(entry: &FdTableEntry) {
@@ -286,7 +473,15 @@ pub(super) fn release_record_locks_for_close(entry: &FdTableEntry) {
         return;
     };
     let pid = current_process().getpid();
-    RECORD_LOCK_TABLE
+    let waiters = RECORD_LOCK_TABLE
         .exclusive_access()
         .release_for_process_file(key, pid);
+    wake_waiters(waiters);
+}
+
+pub(crate) fn release_record_locks_for_process(pid: usize) {
+    let waiters = RECORD_LOCK_TABLE
+        .exclusive_access()
+        .release_for_process(pid);
+    wake_waiters(waiters);
 }
