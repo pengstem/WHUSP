@@ -1,13 +1,13 @@
 use super::trap::handle_mmap_page_fault;
-use crate::mm::{MmapFaultAccess, VirtAddr, page_table::PTEFlags};
+use crate::mm::{page_table::PTEFlags, MmapFaultAccess, VirtAddr};
 use crate::syscall::user_ptr::{
-    UserBufferAccess, read_user_value_with_fault, write_user_value_with_fault,
+    read_user_value_with_fault, write_user_value_with_fault, UserBufferAccess,
 };
-use crate::syscall::{LinuxSigInfo, errno::SysError, errno::SysResult};
+use crate::syscall::{errno::SysError, errno::SysResult, LinuxSigInfo};
 use crate::task::{
-    SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SS_DISABLE, SignalAction, SignalFlags, SignalInfo,
     current_add_signal, current_process, current_task, current_trap_cx, current_user_token,
-    flags_to_linux_sigset, linux_sigset_to_flags,
+    flags_to_linux_sigset, linux_sigset_to_flags, SignalAction, SignalFlags, SignalInfo, SIGKILL,
+    SIGNAL_INFO_SLOTS, SIGRTMIN, SIGRT_1, SIGSTOP, SI_TKILL, SS_DISABLE,
 };
 use crate::trap::TrapContext;
 use core::mem::{offset_of, size_of};
@@ -272,11 +272,16 @@ fn take_pending_user_signal() -> Option<PendingUserSignal> {
     })
 }
 
-pub fn deliver_pending_signal(interrupted_pc: usize) -> bool {
+pub fn deliver_pending_signal(
+    interrupted_pc: usize,
+    syscall_pc_if_interrupted: Option<usize>,
+) -> bool {
     let Some(delivery) = take_pending_user_signal() else {
         return false;
     };
     let saved_context = *current_trap_cx();
+    let interrupted_pc =
+        interrupted_pc_for_delivery(interrupted_pc, syscall_pc_if_interrupted, &delivery);
     let user_sp = signal_frame_stack_top(delivery.action, saved_context.x[2]);
     let frame_sp = (user_sp - size_of::<RiscvSignalFrame>()) & !(SIGNAL_STACK_ALIGN - 1);
     let frame = RiscvSignalFrame {
@@ -325,6 +330,25 @@ pub fn deliver_pending_signal(interrupted_pc: usize) -> bool {
     trap_cx.x[11] = siginfo_ptr;
     trap_cx.x[12] = ucontext_ptr;
     true
+}
+
+fn interrupted_pc_for_delivery(
+    interrupted_pc: usize,
+    syscall_pc_if_interrupted: Option<usize>,
+    delivery: &PendingUserSignal,
+) -> usize {
+    if is_cancellation_signal(delivery.signum as usize, delivery.info) {
+        // CONTEXT: glibc and musl use internal real-time signals for pthread
+        // cancellation. Their RISC-V handlers inspect whether the interrupted
+        // PC lies inside the cancellable syscall ecall window.
+        syscall_pc_if_interrupted.unwrap_or(interrupted_pc)
+    } else {
+        interrupted_pc
+    }
+}
+
+fn is_cancellation_signal(signum: usize, info: SignalInfo) -> bool {
+    matches!(signum, SIGRTMIN | SIGRT_1) && info.code == SI_TKILL
 }
 
 fn signal_frame_stack_top(action: SignalAction, current_sp: usize) -> usize {

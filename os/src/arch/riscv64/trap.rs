@@ -67,6 +67,7 @@ pub fn trap_handler() -> ! {
     let stval = stval::read();
     let trap_pc = current_trap_cx().sepc;
     let mut interrupted_pc = trap_pc;
+    let mut signal_delivery_attempted = false;
     // println!("into {:?}", scause.cause());
     match scause.cause() {
         Trap::Exception(Exception::UserEnvCall) => {
@@ -84,22 +85,25 @@ pub fn trap_handler() -> ! {
             );
             // cx is changed during sys_execve, so we have to call it again
             cx = current_trap_cx();
-            // CONTEXT: glibc/RISC-V deferred cancellation checks whether the
-            // interrupted PC lies inside `__syscall_cancel_arch`'s ecall
-            // window. If a syscall returns EINTR because a user handler became
-            // deliverable, report the ecall PC in ucontext instead of the
-            // already-advanced return PC.
             // UNFINISHED: Full SA_RESTART is not modeled yet. Most interrupted
             // syscalls such as futex, nanosleep, clock_nanosleep, ppoll, and
             // pselect6 currently return EINTR after rt_sigreturn instead of
             // being automatically restarted; wait4/waitid only suppress EINTR
             // for restartable handlers.
-            interrupted_pc = if result == -(SysError::EINTR as isize) {
-                syscall_pc
-            } else {
-                cx.sepc
-            };
+            interrupted_pc = cx.sepc;
             cx.x[10] = result as usize;
+            let syscall_pc_if_interrupted = if result == -(SysError::EINTR as isize) {
+                Some(syscall_pc)
+            } else {
+                None
+            };
+            if crate::arch::signal::deliver_pending_signal(
+                interrupted_pc,
+                syscall_pc_if_interrupted,
+            ) {
+                trap_return();
+            }
+            signal_delivery_attempted = true;
         }
         Trap::Exception(Exception::StorePageFault) => {
             if !handle_mmap_page_fault(stval, MmapFaultAccess::Write) {
@@ -148,7 +152,9 @@ pub fn trap_handler() -> ! {
             );
         }
     }
-    if crate::arch::signal::deliver_pending_signal(interrupted_pc) {
+    if !signal_delivery_attempted
+        && crate::arch::signal::deliver_pending_signal(interrupted_pc, None)
+    {
         trap_return();
     }
     if let Some((errno, _msg)) = check_signals_of_current() {
