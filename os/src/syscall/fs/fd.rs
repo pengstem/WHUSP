@@ -29,6 +29,9 @@ const MAX_PIPE_SIZE_ARG: usize = 1 << 31;
 const F_RDLCK: i16 = 0;
 const F_WRLCK: i16 = 1;
 const F_UNLCK: i16 = 2;
+const SEEK_SET: i16 = 0;
+const SEEK_CUR: i16 = 1;
+const SEEK_END: i16 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -211,11 +214,15 @@ fn valid_flock_type(l_type: i16) -> bool {
     matches!(l_type, F_RDLCK | F_WRLCK | F_UNLCK)
 }
 
+fn valid_flock_whence(l_whence: i16) -> bool {
+    matches!(l_whence, SEEK_SET | SEEK_CUR | SEEK_END)
+}
+
 fn fcntl_getlk(fd: usize, lock: *mut LinuxFlock) -> SysResult {
     let _ = get_fd_entry_by_fd(fd)?;
     let token = current_user_token();
     let mut flock = read_user_value(token, lock.cast_const())?;
-    if !valid_flock_type(flock.l_type) {
+    if !valid_flock_type(flock.l_type) || !valid_flock_whence(flock.l_whence) {
         return Err(SysError::EINVAL);
     }
     // UNFINISHED: byte-range lock conflict tracking is not implemented; report no conflict.
@@ -228,7 +235,7 @@ fn fcntl_setlk(fd: usize, lock: *const LinuxFlock) -> SysResult {
     let _ = get_fd_entry_by_fd(fd)?;
     let token = current_user_token();
     let flock = read_user_value(token, lock)?;
-    if !valid_flock_type(flock.l_type) {
+    if !valid_flock_type(flock.l_type) || !valid_flock_whence(flock.l_whence) {
         return Err(SysError::EINVAL);
     }
     // UNFINISHED: advisory byte-range lock ownership, conflicts, and F_SETLKW waits are ignored.
