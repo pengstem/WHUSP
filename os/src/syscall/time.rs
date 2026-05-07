@@ -1,9 +1,10 @@
 use crate::task::{
-    block_current_and_run_next, current_has_deliverable_signal, current_process, current_task,
-    current_user_token,
+    ProcessCpuTimesSnapshot, block_current_and_run_next, current_has_deliverable_signal,
+    current_process, current_task, current_user_token,
 };
 use crate::timer::{
-    add_real_timer, add_timer, get_time_ms, get_time_us, monotonic_time_nanos, wall_time_nanos,
+    add_real_timer, add_timer, get_time_clock_ticks, get_time_ms, get_time_us,
+    monotonic_time_nanos, us_to_clock_ticks, wall_time_nanos,
 };
 
 use super::errno::{SysError, SysResult};
@@ -26,16 +27,32 @@ const ITIMER_REAL: i32 = 0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-struct LinuxTimeValCompat {
+pub struct LinuxTimeVal {
     tv_sec: isize,
     tv_usec: isize,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxTimezone {
+    tz_minuteswest: i32,
+    tz_dsttime: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxTms {
+    tms_utime: isize,
+    tms_stime: isize,
+    tms_cutime: isize,
+    tms_cstime: isize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 struct LinuxITimerVal {
-    it_interval: LinuxTimeValCompat,
-    it_value: LinuxTimeValCompat,
+    it_interval: LinuxTimeVal,
+    it_value: LinuxTimeVal,
 }
 
 #[derive(Clone, Copy)]
@@ -167,7 +184,22 @@ fn validate_itimer_kind(which: i32) -> SysResult<()> {
     Err(SysError::EINVAL)
 }
 
-fn timeval_to_us(time: LinuxTimeValCompat) -> SysResult<usize> {
+fn clock_ticks_to_isize(ticks: usize) -> isize {
+    ticks.min(isize::MAX as usize) as isize
+}
+
+impl LinuxTms {
+    fn from_cpu_times(times: ProcessCpuTimesSnapshot) -> Self {
+        Self {
+            tms_utime: clock_ticks_to_isize(us_to_clock_ticks(times.user_us)),
+            tms_stime: clock_ticks_to_isize(us_to_clock_ticks(times.system_us)),
+            tms_cutime: clock_ticks_to_isize(us_to_clock_ticks(times.children_user_us)),
+            tms_cstime: clock_ticks_to_isize(us_to_clock_ticks(times.children_system_us)),
+        }
+    }
+}
+
+fn timeval_to_us(time: LinuxTimeVal) -> SysResult<usize> {
     if time.tv_sec < 0 || time.tv_usec < 0 || time.tv_usec >= USEC_PER_SEC as isize {
         return Err(SysError::EINVAL);
     }
@@ -177,8 +209,8 @@ fn timeval_to_us(time: LinuxTimeValCompat) -> SysResult<usize> {
         .ok_or(SysError::EINVAL)
 }
 
-fn us_to_timeval(us: usize) -> LinuxTimeValCompat {
-    LinuxTimeValCompat {
+fn us_to_timeval(us: usize) -> LinuxTimeVal {
+    LinuxTimeVal {
         tv_sec: (us / USEC_PER_SEC) as isize,
         tv_usec: (us % USEC_PER_SEC) as isize,
     }
@@ -257,6 +289,32 @@ pub fn sys_setitimer(which: i32, value: *const u8, old_value: *mut u8) -> SysRes
         add_real_timer(expire_us, generation, process);
     }
     Ok(0)
+}
+
+pub fn sys_gettimeofday(tv: *mut LinuxTimeVal, tz: *mut LinuxTimezone) -> SysResult {
+    let token = current_user_token();
+    if !tv.is_null() {
+        let wall_ns = wall_time_nanos();
+        let time = LinuxTimeVal {
+            tv_sec: (wall_ns / 1_000_000_000) as isize,
+            tv_usec: ((wall_ns % 1_000_000_000) / 1_000) as isize,
+        };
+        write_user_value(token, tv, &time)?;
+    }
+    if !tz.is_null() {
+        // CONTEXT: Linux keeps the timezone argument only for legacy callers.
+        // This kernel has no timezone state, so report UTC-compatible zeroes.
+        write_user_value(token, tz, &LinuxTimezone::default())?;
+    }
+    Ok(0)
+}
+
+pub fn sys_times(tms: *mut LinuxTms) -> SysResult {
+    if !tms.is_null() {
+        let linux_tms = LinuxTms::from_cpu_times(current_process().cpu_times_snapshot());
+        write_user_value(current_user_token(), tms, &linux_tms)?;
+    }
+    Ok(clock_ticks_to_isize(get_time_clock_ticks()))
 }
 
 fn sleep_until_ms(expire_ms: usize) -> SysResult {

@@ -14,7 +14,8 @@ use crate::syscall::user_ptr::{
     write_user_value,
 };
 use crate::task::{
-    FdTableEntry, current_process, current_task, current_user_token, suspend_current_and_run_next,
+    FdTableEntry, current_has_unmasked_signal, current_process, current_user_token,
+    suspend_current_and_run_next,
 };
 use crate::timer::get_time_ms;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -319,7 +320,7 @@ impl LocalSocket {
             if nonblock {
                 return Err(SysError::EAGAIN);
             }
-            if has_unmasked_signal() {
+            if current_has_unmasked_signal() {
                 let peer = InetEndpoint {
                     ip: LOOPBACK_IP,
                     port: 0,
@@ -439,7 +440,7 @@ impl LocalSocket {
             let available = capacity.saturating_sub(peer_inner.stream_rx.len());
             if available == 0 {
                 drop(peer_inner);
-                if has_unmasked_signal() {
+                if current_has_unmasked_signal() {
                     return Err(SysError::EINTR);
                 }
                 suspend_current_and_run_next();
@@ -518,7 +519,7 @@ impl LocalSocket {
             if nonblock {
                 return Err(SysError::EAGAIN);
             }
-            if has_unmasked_signal() {
+            if current_has_unmasked_signal() {
                 return Err(SysError::EINTR);
             }
             suspend_current_and_run_next();
@@ -540,7 +541,7 @@ impl LocalSocket {
             if nonblock {
                 return Err(SysError::EAGAIN);
             }
-            if has_unmasked_signal() {
+            if current_has_unmasked_signal() {
                 return Err(SysError::EINTR);
             }
             suspend_current_and_run_next();
@@ -801,13 +802,6 @@ fn copy_user_to_vec(token: usize, ptr: usize, len: usize) -> SysResult<Vec<u8>> 
         data.extend_from_slice(slice);
     }
     Ok(data)
-}
-
-fn has_unmasked_signal() -> bool {
-    current_task().is_some_and(|task| {
-        let inner = task.inner_exclusive_access();
-        !(inner.pending_signals & !inner.signal_mask).is_empty()
-    })
 }
 
 fn open_flags_from_socket_type(ty: i32) -> SysResult<OpenFlags> {

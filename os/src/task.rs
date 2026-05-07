@@ -445,6 +445,13 @@ pub fn current_has_deliverable_signal() -> bool {
     current_has_deliverable_signal_matching(|_| true)
 }
 
+pub fn current_has_unmasked_signal() -> bool {
+    current_task().is_some_and(|task| {
+        let inner = task.inner_exclusive_access();
+        !(inner.pending_signals & !inner.signal_mask).is_empty()
+    })
+}
+
 pub fn current_has_nonrestartable_signal() -> bool {
     current_has_deliverable_signal_matching(|action| action.flags & SA_RESTART == 0)
 }

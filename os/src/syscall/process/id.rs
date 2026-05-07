@@ -1,4 +1,9 @@
-use super::*;
+use crate::syscall::errno::{SysError, SysResult};
+use crate::task::{
+    SignalFlags, SignalInfo, current_process, current_task, exit_current_and_run_next,
+    exit_current_group_and_run_next, pid2process, processes_snapshot, queue_signal_to_task,
+    suspend_current_and_run_next, wakeup_task,
+};
 
 pub fn sys_exit(exit_code: i32) -> ! {
     exit_current_and_run_next(exit_code);

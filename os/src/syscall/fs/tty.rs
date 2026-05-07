@@ -103,8 +103,8 @@ impl ConsoleTtyState {
                 c_cc,
             },
             winsize: LinuxWinsize {
-                ws_row: 24,
-                ws_col: 80,
+                ws_row: 80,
+                ws_col: 240,
                 ws_xpixel: 0,
                 ws_ypixel: 0,
             },

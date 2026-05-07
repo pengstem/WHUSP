@@ -1,4 +1,12 @@
-use super::*;
+use crate::fs::{File, OpenFlags, open_file_in};
+use crate::mm::elf_required_interpreter_path;
+use crate::syscall::errno::{SysError, SysResult};
+use crate::syscall::user_ptr::{PATH_MAX, read_user_c_string, read_user_usize};
+use crate::task::{current_process, current_user_token};
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::str;
 
 const ELF_MAGIC: &[u8] = b"\x7fELF";
 const SHEBANG_MAGIC: &[u8] = b"#!";

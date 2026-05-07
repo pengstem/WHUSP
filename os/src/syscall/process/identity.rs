@@ -1,4 +1,8 @@
-use super::*;
+use crate::syscall::errno::{SysError, SysResult};
+use crate::syscall::user_ptr::{read_user_value, write_user_value};
+use crate::task::{CAP_SETPCAP, current_process, current_task, current_user_token, pid2process};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 const NGROUPS_MAX: usize = 65536;
 const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
