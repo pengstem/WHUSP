@@ -1,6 +1,6 @@
 use super::dirent::{write_dir_entries, RawDirEntry, DT_DIR, DT_LNK, DT_REG};
 use super::mount;
-use super::pipe::PIPE_BUFFER_SIZE;
+use super::pipe::{PIPE_MAX_CAPACITY, PIPE_MIN_CAPACITY};
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
 use super::{FileStat, FileTimestamp, S_IFDIR, S_IFREG};
 use crate::config::PAGE_SIZE;
@@ -37,7 +37,7 @@ const DEFAULT_PID_MAX: usize = 4_194_304;
 const DEFAULT_PIPE_USER_PAGES_SOFT: usize = 1;
 
 static PROC_PID_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_PID_MAX);
-static PROC_PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(PIPE_BUFFER_SIZE);
+static PROC_PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(PIPE_MAX_CAPACITY);
 static PROC_PIPE_USER_PAGES_SOFT: AtomicUsize = AtomicUsize::new(DEFAULT_PIPE_USER_PAGES_SOFT);
 
 pub(crate) fn pipe_max_size() -> usize {
@@ -433,13 +433,14 @@ fn write_pipe_max_size(buf: &[u8], offset: u64) -> usize {
     let Ok(value) = text.trim().parse::<usize>() else {
         return 0;
     };
-    if value < PAGE_SIZE {
+    if value < PIPE_MIN_CAPACITY {
         return 0;
     }
-    // CONTEXT: pipe capacity is currently fixed to one page. Linux permits
-    // larger dynamic buffers; this sysctl is clamped to the implemented cap so
-    // F_SETPIPE_SZ and new pipe defaults remain internally consistent.
-    PROC_PIPE_MAX_SIZE.store(value.min(PIPE_BUFFER_SIZE), Ordering::Relaxed);
+    // CONTEXT: pipe buffers are dynamically allocated up to the implemented
+    // contest cap. Values above that are accepted but rounded down so
+    // F_SETPIPE_SZ and new unprivileged pipe defaults stay internally
+    // consistent.
+    PROC_PIPE_MAX_SIZE.store(value.min(PIPE_MAX_CAPACITY), Ordering::Relaxed);
     buf.len()
 }
 

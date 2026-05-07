@@ -1,12 +1,14 @@
 use crate::config::PAGE_SIZE;
-use crate::fs::{File, OpenFlags, make_pipe, pipe_max_size};
-use crate::task::{FdFlags, FdTableEntry, current_process, current_user_token};
+use crate::fs::{
+    default_pipe_capacity_for_current_process, make_pipe, pipe_max_size, File, OpenFlags,
+};
+use crate::task::{current_process, current_user_token, FdFlags, FdTableEntry};
 use alloc::sync::Arc;
 use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    UserBufferAccess, read_user_value, translated_byte_buffer_checked, write_user_value,
+    read_user_value, translated_byte_buffer_checked, write_user_value, UserBufferAccess,
 };
 
 const F_DUPFD: usize = 0;
@@ -112,10 +114,11 @@ pub fn sys_pipe2(pipefd: *mut i32, flags: u32) -> SysResult {
     let pipe_flags = pipe2_open_flags(flags)?;
     let token = current_user_token();
     validate_pipefd(token, pipefd)?;
+    let pipe_capacity = default_pipe_capacity_for_current_process();
 
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-    let (pipe_read, pipe_write) = make_pipe();
+    let (pipe_read, pipe_write) = make_pipe(pipe_capacity);
     let read_fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
     inner.fd_table[read_fd] = Some(FdTableEntry::from_file(
         pipe_read,
@@ -254,12 +257,10 @@ fn fcntl_set_pipe_size(fd: usize, requested: usize) -> SysResult {
     if requested > pipe_max_size() {
         return Err(SysError::EPERM);
     }
-    if requested > capacity {
-        // UNFINISHED: pipe buffers are fixed-size in this kernel; Linux can
-        // grow them to a larger rounded page multiple when memory limits allow.
-        return Err(SysError::EPERM);
+    if requested <= capacity {
+        return Ok(capacity as isize);
     }
-    Ok(capacity as isize)
+    Ok(file.set_pipe_capacity(requested)? as isize)
 }
 
 pub fn sys_fcntl(fd: usize, op: usize, arg: usize) -> SysResult {

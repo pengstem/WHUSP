@@ -178,6 +178,9 @@ pub trait File: Send + Sync {
     fn pipe_capacity(&self) -> Option<usize> {
         None
     }
+    fn set_pipe_capacity(&self, _capacity: usize) -> FsResult<usize> {
+        Err(FsError::Unsupported)
+    }
     fn pipe_occupied(&self) -> Option<usize> {
         None
     }
@@ -225,6 +228,7 @@ pub(crate) use mount::{
     mount_tmpfs_at, remount_at, statfs_for_mount, unmount_at,
 };
 pub(crate) use path::{PathContext, WorkingDir, normalize_path_at_root, path_inside_root};
+pub(crate) use pipe::default_pipe_capacity_for_current_process;
 pub use pipe::make_pipe;
 pub(crate) use procfs::pipe_max_size;
 pub(crate) use staticfs::{open_path as open_static_path, stat_path as stat_static_path};
