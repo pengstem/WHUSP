@@ -329,7 +329,7 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
     command.push_str(libc_label(libc_root));
     command.push_str(" ####\"; for file in ltp/testcases/bin/*; do [ -f \"$file\" ] || continue; case_name=${file##*/}; case \"$case_name\" in ");
     append_ltp_blacklist_patterns(command);
-    command.push_str(") echo \"SKIP LTP CASE $case_name\"; continue ;; esac; echo \"RUN LTP CASE $case_name\"; \"$file\"; ret=$?; echo \"FAIL LTP CASE $case_name : $ret\"; done; ./busybox echo \"#### OS COMP TEST GROUP END ltp-");
+    command.push_str(") echo \"SKIP LTP CASE $case_name\"; continue ;; esac; echo \"RUN LTP CASE $case_name\"; \"$file\"; ret=$?; if [ \"$ret\" -eq 0 ]; then echo \"PASS LTP CASE $case_name : $ret\"; else echo \"FAIL LTP CASE $case_name : $ret\"; fi; done; ./busybox echo \"#### OS COMP TEST GROUP END ltp-");
     command.push_str(libc_label(libc_root));
     command.push_str(" ####\"; }");
 }
