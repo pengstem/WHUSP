@@ -10,8 +10,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::task::{
-    block_current_task_no_schedule, current_has_unmasked_signal, current_process, schedule,
-    wakeup_task, TaskControlBlock,
+    TaskControlBlock, block_current_task_no_schedule, current_has_unmasked_signal, current_process,
+    schedule, wakeup_task,
 };
 
 pub struct Pipe {
@@ -378,7 +378,9 @@ impl File for Pipe {
             }
         }
         if self.writable {
-            let can_write = ring_buffer.available_write() > 0;
+            // CONTEXT: Linux reports pipe POLLOUT when a PIPE_BUF-sized write
+            // can proceed without blocking; one free byte is not enough.
+            let can_write = ring_buffer.available_write() >= PAGE_SIZE;
             let peer_closed = ring_buffer.all_read_ends_closed();
             if events.contains(PollEvents::POLLOUT) && (can_write || peer_closed) {
                 ready |= PollEvents::POLLOUT;

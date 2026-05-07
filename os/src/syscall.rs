@@ -1,5 +1,8 @@
 const SYSCALL_FGETXATTR: usize = 10;
 const SYSCALL_GETCWD: usize = 17;
+const SYSCALL_EPOLL_CREATE1: usize = 20;
+const SYSCALL_EPOLL_CTL: usize = 21;
+const SYSCALL_EPOLL_PWAIT: usize = 22;
 const SYSCALL_DUP: usize = 23;
 const SYSCALL_DUP3: usize = 24;
 const SYSCALL_FCNTL: usize = 25;
@@ -133,6 +136,7 @@ const SYSCALL_GETRANDOM: usize = 278;
 const SYSCALL_MEMBARRIER: usize = 283;
 const SYSCALL_STATX: usize = 291;
 const SYSCALL_FACCESSAT2: usize = 439;
+const SYSCALL_EPOLL_PWAIT2: usize = 441;
 
 pub(crate) mod errno;
 mod fs;
@@ -175,6 +179,24 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FGETXATTR => {
             sys_fgetxattr(args[0], args[1] as *const u8, args[2] as *mut u8, args[3])
         }
+        SYSCALL_EPOLL_CREATE1 => sys_epoll_create1(args[0] as u32),
+        SYSCALL_EPOLL_CTL => sys_epoll_ctl(args[0], args[1] as i32, args[2], args[3] as *const u8),
+        SYSCALL_EPOLL_PWAIT => sys_epoll_pwait(
+            args[0],
+            args[1] as *mut u8,
+            args[2] as i32,
+            args[3] as i32,
+            args[4] as *const u8,
+            args[5],
+        ),
+        SYSCALL_EPOLL_PWAIT2 => sys_epoll_pwait2(
+            args[0],
+            args[1] as *mut u8,
+            args[2] as i32,
+            args[3] as *const LinuxTimeSpec,
+            args[4] as *const u8,
+            args[5],
+        ),
         SYSCALL_DUP => sys_dup(args[0]),
         SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2] as u32),
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1], args[2]),

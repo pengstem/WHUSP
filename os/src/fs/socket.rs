@@ -910,10 +910,69 @@ pub fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
     }
 }
 
-pub fn sys_socketpair(_domain: i32, _ty: i32, _protocol: i32, _sv: usize) -> SysResult {
-    // UNFINISHED: socketpair requires AF_UNIX-style paired sockets; AF_INET
-    // loopback sockets above do not implement it.
-    Err(SysError::EAFNOSUPPORT)
+pub fn sys_socketpair(domain: i32, ty: i32, protocol: i32, sv: usize) -> SysResult {
+    if sv == 0 {
+        return Err(SysError::EFAULT);
+    }
+    if domain != AF_UNIX {
+        return Err(SysError::EAFNOSUPPORT);
+    }
+    if protocol != 0 {
+        return Err(SysError::EPROTONOSUPPORT);
+    }
+    let kind = socket_kind_from_type(ty)?;
+    let flags = open_flags_from_socket_type(ty)?;
+
+    let endpoint = InetEndpoint {
+        ip: LOOPBACK_IP,
+        port: 0,
+    };
+    let first_inner = Arc::new(unsafe {
+        UPIntrFreeCell::new(LocalSocketInner::connected(
+            kind,
+            endpoint,
+            endpoint,
+            None,
+            ShutdownState::OPEN,
+        ))
+    });
+    let second_inner = Arc::new(unsafe {
+        UPIntrFreeCell::new(LocalSocketInner::connected(
+            kind,
+            endpoint,
+            endpoint,
+            Some(Arc::downgrade(&first_inner)),
+            ShutdownState::OPEN,
+        ))
+    });
+    first_inner.exclusive_access().peer_socket = Some(Arc::downgrade(&second_inner));
+
+    let first = LocalSocket::from_inner(first_inner, flags);
+    let second = LocalSocket::from_inner(second_inner, flags);
+    let fds = {
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+        let first_fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
+        let second_fd = match inner.alloc_fd_from(first_fd + 1) {
+            Some(fd) => fd,
+            None => {
+                inner.fd_table[first_fd] = None;
+                return Err(SysError::EMFILE);
+            }
+        };
+        inner.fd_table[first_fd] = Some(FdTableEntry::from_file(first, flags));
+        inner.fd_table[second_fd] = Some(FdTableEntry::from_file(second, flags));
+        [first_fd as i32, second_fd as i32]
+    };
+
+    if let Err(err) = write_user_value(current_user_token(), sv as *mut [i32; 2], &fds) {
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+        inner.fd_table[fds[0] as usize] = None;
+        inner.fd_table[fds[1] as usize] = None;
+        return Err(err);
+    }
+    Ok(0)
 }
 
 pub fn sys_bind(fd: usize, addr: usize, addrlen: u32) -> SysResult {

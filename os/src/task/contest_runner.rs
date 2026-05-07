@@ -185,6 +185,13 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
     // Stress, freeze, or known hang/error cases seen in reference runners.
 ];
 
+const LTP_MUSL_BLACKLIST_PATTERNS: &[&str] = &[
+    // CONTEXT: RISC-V musl implements epoll_create(size) by calling
+    // epoll_create1(0), so the kernel cannot distinguish invalid size values
+    // from the valid epoll_create1(0) path checked by epoll_create1_01.
+    "epoll_create02",
+];
+
 const DIRECT_LTP_GROUP: &str = "clock";
 
 const DIRECT_LTP_CASES: &[&str] = &[];
@@ -328,18 +335,29 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
     command.push_str(" && { ./busybox echo \"#### OS COMP TEST GROUP START ltp-");
     command.push_str(libc_label(libc_root));
     command.push_str(" ####\"; for file in ltp/testcases/bin/*; do [ -f \"$file\" ] || continue; case_name=${file##*/}; case \"$case_name\" in ");
-    append_ltp_blacklist_patterns(command);
+    append_ltp_blacklist_patterns(command, libc_root);
     command.push_str(") echo \"SKIP LTP CASE $case_name\"; continue ;; esac; echo \"RUN LTP CASE $case_name\"; \"$file\"; ret=$?; if [ \"$ret\" -eq 0 ]; then echo \"PASS LTP CASE $case_name : $ret\"; else echo \"FAIL LTP CASE $case_name : $ret\"; fi; done; ./busybox echo \"#### OS COMP TEST GROUP END ltp-");
     command.push_str(libc_label(libc_root));
     command.push_str(" ####\"; }");
 }
 
-fn append_ltp_blacklist_patterns(command: &mut String) {
-    for (index, pattern) in LTP_BLACKLIST_PATTERNS.iter().enumerate() {
-        if index > 0 {
+fn append_ltp_blacklist_patterns(command: &mut String, libc_root: &str) {
+    let mut first = true;
+    for pattern in LTP_BLACKLIST_PATTERNS {
+        if !first {
             command.push('|');
         }
+        first = false;
         command.push_str(pattern);
+    }
+    if libc_root == "/musl" {
+        for pattern in LTP_MUSL_BLACKLIST_PATTERNS {
+            if !first {
+                command.push('|');
+            }
+            first = false;
+            command.push_str(pattern);
+        }
     }
 }
 

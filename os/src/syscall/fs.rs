@@ -1,3 +1,4 @@
+mod epoll;
 mod fd;
 mod fd_lock;
 mod io;
@@ -8,6 +9,7 @@ mod stat;
 mod tty;
 mod uapi;
 
+pub use epoll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait, sys_epoll_pwait2};
 pub use fd::{sys_close, sys_dup, sys_dup3, sys_fcntl, sys_pipe2};
 pub(crate) use fd_lock::release_record_locks_for_process;
 pub use io::{

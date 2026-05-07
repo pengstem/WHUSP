@@ -1,13 +1,13 @@
 use crate::config::PAGE_SIZE;
 use crate::fs::{
-    default_pipe_capacity_for_current_process, make_pipe, pipe_max_size, File, OpenFlags,
+    File, OpenFlags, default_pipe_capacity_for_current_process, make_pipe, pipe_max_size,
 };
-use crate::task::{current_process, current_user_token, FdFlags, FdTableEntry};
+use crate::task::{FdFlags, FdTableEntry, current_process, current_user_token};
 use alloc::sync::Arc;
 use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
-use super::super::user_ptr::{translated_byte_buffer_checked, UserBufferAccess};
+use super::super::user_ptr::{UserBufferAccess, translated_byte_buffer_checked};
 use super::fd_lock::{fcntl_getlk, fcntl_setlk, fcntl_setlkw, release_record_locks_for_close};
 
 const F_DUPFD: usize = 0;
@@ -215,7 +215,7 @@ fn fcntl_set_pipe_size(fd: usize, requested: usize) -> SysResult {
     if requested > pipe_max_size() {
         return Err(SysError::EPERM);
     }
-    if requested <= capacity {
+    if requested == capacity {
         return Ok(capacity as isize);
     }
     Ok(file.set_pipe_capacity(requested)? as isize)
