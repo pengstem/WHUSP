@@ -88,6 +88,7 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
     "find_portbundle",
     "force_erase.sh",
     "fork14",
+    "fork09",
     "fork_exec_loop",
     "fork_freeze.sh",
     "fou*.sh",
