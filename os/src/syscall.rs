@@ -118,6 +118,7 @@ const SYSCALL_CLONE: usize = 220;
 const SYSCALL_EXECVE: usize = 221;
 const SYSCALL_MMAP: usize = 222;
 const SYSCALL_MPROTECT: usize = 226;
+const SYSCALL_MSYNC: usize = 227;
 const SYSCALL_ACCEPT4: usize = 242;
 const SYSCALL_WAIT4: usize = 260;
 const SYSCALL_PRLIMIT64: usize = 261;
@@ -140,7 +141,7 @@ pub(crate) mod user_ptr;
 mod wait;
 
 use crate::task::RLimit;
-use errno::{SysError, ret};
+use errno::{ret, SysError};
 use fs::*;
 use futex::*;
 use memory::*;
@@ -412,6 +413,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *const usize,
         ),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
+        SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2] as i32),
         SYSCALL_WAIT4 => sys_wait4(
             args[0] as isize,
             args[1] as *mut i32,

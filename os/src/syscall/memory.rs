@@ -2,7 +2,7 @@ use crate::config::PAGE_SIZE;
 use crate::mm::shm::ShmError;
 use crate::mm::{MapPermission, MemoryProtectError};
 use crate::task::current_process;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 
 use super::errno::{SysError, SysResult};
 
@@ -32,6 +32,10 @@ const MAP_SUPPORTED: usize = MAP_SHARED
     | MAP_NORESERVE
     | MAP_STACK;
 const MAP_TYPE_MASK: usize = 0x03;
+const MS_ASYNC: i32 = 0x1;
+const MS_INVALIDATE: i32 = 0x2;
+const MS_SYNC: i32 = 0x4;
+const MS_SUPPORTED: i32 = MS_ASYNC | MS_INVALIDATE | MS_SYNC;
 
 const MEMBARRIER_CMD_QUERY: i32 = 0;
 const MEMBARRIER_CMD_PRIVATE_EXPEDITED: i32 = 1 << 3;
@@ -254,6 +258,29 @@ pub fn sys_munmap(addr: usize, len: usize) -> SysResult {
             .munmap_area(addr, len)
             .ok_or(SysError::EINVAL)?
     };
+    for flush in flushes {
+        flush.write_back();
+    }
+    Ok(0)
+}
+
+pub fn sys_msync(addr: usize, len: usize, flags: i32) -> SysResult {
+    if addr % PAGE_SIZE != 0 {
+        return Err(SysError::EINVAL);
+    }
+    if flags & !MS_SUPPORTED != 0 || flags & MS_ASYNC != 0 && flags & MS_SYNC != 0 {
+        return Err(SysError::EINVAL);
+    }
+
+    let flushes = current_process()
+        .inner_exclusive_access()
+        .memory_set
+        .msync_area(addr, len)
+        .ok_or(SysError::ENOMEM)?;
+    // UNFINISHED: Linux MS_INVALIDATE also invalidates other mappings and can
+    // fail with EBUSY for locked pages. This kernel has no mlock state and no
+    // cross-process invalidation model yet, so it only validates the mapping
+    // range and writes back dirty shared mmap pages.
     for flush in flushes {
         flush.write_back();
     }

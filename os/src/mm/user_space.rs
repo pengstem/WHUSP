@@ -1,14 +1,14 @@
 use super::address::page_align_up;
 use super::area::{MmapInfo, ShmAreaInfo};
+use super::{frame_alloc, VirtPageNum};
 use super::{
     FrameTracker, MapArea, MapPermission, MapType, MemorySet, MmapFlush, PhysPageNum, VPNRange,
     VirtAddr,
 };
-use super::{VirtPageNum, frame_alloc};
 use crate::arch::mm as arch_mm;
 use crate::config::{PAGE_SIZE, USER_MMAP_BASE, USER_MMAP_LIMIT};
 use crate::fs::File;
-use crate::mm::page_cache::{PAGE_CACHE, PageCacheId, PageCacheKey};
+use crate::mm::page_cache::{PageCacheId, PageCacheKey, PAGE_CACHE};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -526,6 +526,29 @@ impl MemorySet {
                 area.unmap_resident(&mut self.page_table);
             } else {
                 idx += 1;
+            }
+        }
+        Some(flushes)
+    }
+
+    pub fn msync_area(&self, start: usize, len: usize) -> Option<Vec<MmapFlush>> {
+        if len == 0 {
+            return Some(Vec::new());
+        }
+        let map_len = checked_page_align_up(len)?;
+        let end = start.checked_add(map_len)?;
+        let start_vpn = VirtAddr::from(start).floor();
+        let end_vpn = VirtAddr::from(end).floor();
+        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
+            return None;
+        }
+
+        let mut flushes = Vec::new();
+        for area in &self.areas {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            if area.is_mmap() && area_start < end_vpn && area_end > start_vpn {
+                flushes.extend(area.collect_mmap_flushes(&self.page_table));
             }
         }
         Some(flushes)
