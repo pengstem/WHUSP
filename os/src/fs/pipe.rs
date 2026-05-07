@@ -2,10 +2,13 @@ use super::status_flags::StatusFlagsCell;
 use super::{File, FileStat, FsResult, OpenFlags, PollEvents, S_IFIFO};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
+use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
 
-use crate::task::suspend_current_and_run_next;
+use crate::task::{
+    TaskControlBlock, block_current_task_no_schedule, current_has_unmasked_signal, schedule,
+    wakeup_task,
+};
 
 pub struct Pipe {
     readable: bool,
@@ -49,6 +52,8 @@ pub struct PipeRingBuffer {
     status: RingBufferStatus,
     read_end: Option<Weak<Pipe>>,
     write_end: Option<Weak<Pipe>>,
+    read_wait_queue: VecDeque<Arc<TaskControlBlock>>,
+    write_wait_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
 impl PipeRingBuffer {
@@ -60,6 +65,8 @@ impl PipeRingBuffer {
             status: RingBufferStatus::Empty,
             read_end: None,
             write_end: None,
+            read_wait_queue: VecDeque::new(),
+            write_wait_queue: VecDeque::new(),
         }
     }
     pub fn set_read_end(&mut self, read_end: &Arc<Pipe>) {
@@ -113,6 +120,28 @@ impl PipeRingBuffer {
             None => true,
         }
     }
+    fn sleep_reader(&mut self) -> *mut crate::task::TaskContext {
+        let (task, task_cx_ptr) = block_current_task_no_schedule();
+        self.read_wait_queue.push_back(task);
+        task_cx_ptr
+    }
+    fn sleep_writer(&mut self) -> *mut crate::task::TaskContext {
+        let (task, task_cx_ptr) = block_current_task_no_schedule();
+        self.write_wait_queue.push_back(task);
+        task_cx_ptr
+    }
+    fn wake_reader(&mut self) -> Option<Arc<TaskControlBlock>> {
+        self.read_wait_queue.pop_front()
+    }
+    fn wake_writer(&mut self) -> Option<Arc<TaskControlBlock>> {
+        self.write_wait_queue.pop_front()
+    }
+    fn wake_all_readers(&mut self) -> VecDeque<Arc<TaskControlBlock>> {
+        core::mem::take(&mut self.read_wait_queue)
+    }
+    fn wake_all_writers(&mut self) -> VecDeque<Arc<TaskControlBlock>> {
+        core::mem::take(&mut self.write_wait_queue)
+    }
 }
 
 /// Return (read_end, write_end)
@@ -124,6 +153,45 @@ pub fn make_pipe() -> (Arc<Pipe>, Arc<Pipe>) {
     inner.set_read_end(&read_end);
     inner.set_write_end(&write_end);
     (read_end, write_end)
+}
+
+fn wake_task(task: Option<Arc<TaskControlBlock>>) {
+    if let Some(task) = task {
+        let _ = wakeup_task(task);
+    }
+}
+
+fn wake_tasks(tasks: VecDeque<Arc<TaskControlBlock>>) {
+    for task in tasks {
+        let _ = wakeup_task(task);
+    }
+}
+
+fn pipe_wait_interrupted() -> bool {
+    // CONTEXT: File::read/write cannot return EINTR yet, but a pipe wait must
+    // return to the trap path when a signal wakes it so fatal signals can exit.
+    current_has_unmasked_signal()
+}
+
+impl Drop for Pipe {
+    fn drop(&mut self) {
+        let (readers, writers) = {
+            let mut ring_buffer = self.buffer.exclusive_access();
+            let readers = if self.writable {
+                ring_buffer.wake_all_readers()
+            } else {
+                VecDeque::new()
+            };
+            let writers = if self.readable {
+                ring_buffer.wake_all_writers()
+            } else {
+                VecDeque::new()
+            };
+            (readers, writers)
+        };
+        wake_tasks(readers);
+        wake_tasks(writers);
+    }
 }
 
 impl File for Pipe {
@@ -150,39 +218,80 @@ impl File for Pipe {
                 if ring_buffer.all_write_ends_closed() {
                     return 0;
                 }
+                if pipe_wait_interrupted() {
+                    return 0;
+                }
+                let task_cx_ptr = ring_buffer.sleep_reader();
                 drop(ring_buffer);
-                suspend_current_and_run_next();
+                schedule(task_cx_ptr);
                 continue;
             }
-            let mut data = Vec::with_capacity(loop_read);
-            for _ in 0..loop_read {
-                data.push(ring_buffer.read_byte());
+            let mut copied = 0usize;
+            for buffer in buf.buffers.iter_mut() {
+                if copied == loop_read {
+                    break;
+                }
+                let len = buffer.len().min(loop_read - copied);
+                for byte in &mut buffer[..len] {
+                    *byte = ring_buffer.read_byte();
+                }
+                copied += len;
             }
+            let writer = ring_buffer.wake_writer();
             drop(ring_buffer);
-            return buf.copy_from_slice(&data);
+            wake_task(writer);
+            return copied;
         }
     }
     fn write(&self, buf: UserBuffer) -> usize {
         assert!(self.writable());
-        let data = buf.to_vec();
-        let want_to_write = data.len();
+        let want_to_write = buf.len();
         if want_to_write == 0 {
             return 0;
         }
         let mut already_write = 0usize;
         loop {
             let mut ring_buffer = self.buffer.exclusive_access();
+            if ring_buffer.all_read_ends_closed() {
+                // UNFINISHED: Linux returns EPIPE and raises SIGPIPE here.
+                // The current File::write interface cannot propagate fs errors yet.
+                return already_write;
+            }
             let loop_write = ring_buffer.available_write();
             if loop_write == 0 {
+                if pipe_wait_interrupted() {
+                    return already_write;
+                }
+                let task_cx_ptr = ring_buffer.sleep_writer();
                 drop(ring_buffer);
-                suspend_current_and_run_next();
+                schedule(task_cx_ptr);
                 continue;
             }
             let write_len = loop_write.min(want_to_write - already_write);
-            for &byte in &data[already_write..already_write + write_len] {
-                ring_buffer.write_byte(byte);
+            let mut skipped = 0usize;
+            let mut written = 0usize;
+            for buffer in buf.buffers.iter() {
+                if skipped + buffer.len() <= already_write {
+                    skipped += buffer.len();
+                    continue;
+                }
+                let offset = already_write.saturating_sub(skipped);
+                for &byte in &buffer[offset..] {
+                    if written == write_len {
+                        break;
+                    }
+                    ring_buffer.write_byte(byte);
+                    written += 1;
+                }
+                if written == write_len {
+                    break;
+                }
+                skipped += buffer.len();
             }
-            already_write += write_len;
+            already_write += written;
+            let reader = ring_buffer.wake_reader();
+            drop(ring_buffer);
+            wake_task(reader);
             if already_write == want_to_write {
                 return want_to_write;
             }
