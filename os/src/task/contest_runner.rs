@@ -180,131 +180,20 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
     // Stress, freeze, or known hang/error cases seen in reference runners.
 ];
 
-const WEIGHTED_LTP_CASES: &[&str] = &[
-    "fcntl01",
-    "fcntl01_64",
-    "fcntl02",
-    "fcntl02_64",
-    "fcntl03",
-    "fcntl03_64",
-    "fcntl04",
-    "fcntl04_64",
-    "fcntl05",
-    "fcntl05_64",
-    "fcntl07",
-    "fcntl07_64",
-    "fcntl08",
-    "fcntl08_64",
-    "fcntl09",
-    "fcntl09_64",
-    "fcntl10",
-    "fcntl10_64",
-    "fcntl11",
-    "fcntl11_64",
-    "fcntl12",
-    "fcntl12_64",
-    "fcntl13",
-    "fcntl13_64",
-    "fcntl15",
-    "fcntl15_64",
-    "fcntl16",
-    "fcntl16_64",
-    "fcntl17",
-    "fcntl17_64",
-    "fcntl18",
-    "fcntl18_64",
-    "fcntl19",
-    "fcntl19_64",
-    "fcntl20",
-    "fcntl20_64",
-    "fcntl21",
-    "fcntl21_64",
-    "fcntl22",
-    "fcntl22_64",
-    "fcntl23",
-    "fcntl23_64",
-    "fcntl24",
-    "fcntl24_64",
-    "fcntl25",
-    "fcntl25_64",
-    "fcntl26",
-    "fcntl26_64",
-    "fcntl27",
-    "fcntl27_64",
-    "fcntl29",
-    "fcntl29_64",
-    "fcntl30",
-    "fcntl30_64",
-    "fcntl31",
-    "fcntl31_64",
-    "fcntl32",
-    "fcntl32_64",
-    "fcntl33",
-    "fcntl33_64",
-    "fcntl35",
-    "fcntl35_64",
-    "fcntl37",
-    "fcntl37_64",
-    "fcntl38",
-    "fcntl38_64",
-    "fcntl39",
-    "fcntl39_64",
-    "mmap001",
-    "mmap01",
-    "mmap02",
-    "mmap03",
-    "mmap04",
-    "mmap05",
-    "mmap06",
-    "mmap08",
-    "mmap09",
-    "mmap10",
-    "mmap12",
-    "mmap13",
-    "mmap14",
-    "mmap15",
-    "mmap16",
-    "mmap17",
-    "mmap18",
-    "mmap19",
-    "mmap20",
-    "pipe01",
-    "pipe02",
-    "pipe03",
-    "pipe04",
-    "pipe05",
-    "pipe06",
-    "pipe07",
-    "pipe08",
-    "pipe09",
-    "pipe10",
-    "pipe11",
-    "pipe12",
-    "pipe13",
-    "pipe14",
-    "pipe15",
-    "open01",
-    "open02",
-    "open03",
-    "open04",
-    "open06",
-    "open07",
-    "open08",
-    "open09",
-    "open10",
-    "open11",
-    "open12",
-    "open13",
-    "open14",
+const DIRECT_LTP_GROUP: &str = "chmod";
+
+const DIRECT_LTP_CASES: &[&str] = &[
+    "chmod03", "chmod05", "chmod06", "fchmod01", "fchmod02", "fchmod03", "fchmod04", "fchmod05",
+    "fchmod06",
 ];
 
 pub(super) fn build_runner_command() -> String {
-    if WEIGHTED_LTP_CASES.first().is_some() {
+    if DIRECT_LTP_CASES.first().is_some() {
         let mut command = String::new();
         let mut first = true;
         for libc_root in TEST_LIBCS {
             append_separator(&mut command, &mut first);
-            append_weighted_ltp_runner(&mut command, libc_root);
+            append_direct_ltp_runner(&mut command, libc_root);
         }
         command.push_str("; cd /musl && ./busybox reboot -f");
         return command;
@@ -332,19 +221,23 @@ pub(super) fn build_runner_command() -> String {
     command
 }
 
-fn append_weighted_ltp_runner(command: &mut String, libc_root: &str) {
+fn append_direct_ltp_runner(command: &mut String, libc_root: &str) {
     command.push_str("cd ");
     command.push_str(libc_root);
-    command.push_str(" && { ./busybox echo \"#### OS COMP TEST GROUP START ltp-");
+    command.push_str(" && { ./busybox echo \"#### OS COMP TEST GROUP START ");
+    command.push_str(DIRECT_LTP_GROUP);
+    command.push('-');
     command.push_str(libc_label(libc_root));
     command.push_str(" ####\"; for case_name in ");
-    for (index, case_name) in WEIGHTED_LTP_CASES.iter().enumerate() {
+    for (index, case_name) in DIRECT_LTP_CASES.iter().enumerate() {
         if index > 0 {
             command.push(' ');
         }
         command.push_str(case_name);
     }
-    command.push_str("; do if [ ! -x \"./ltp/testcases/bin/$case_name\" ]; then ./busybox echo \"SKIP LTP CASE $case_name\"; continue; fi; ./busybox echo \"RUN LTP CASE $case_name\"; ./ltp/testcases/bin/$case_name; ret=$?; ./busybox echo \"FAIL LTP CASE $case_name : $ret\"; done; ./busybox echo \"#### OS COMP TEST GROUP END ltp-");
+    command.push_str("; do if [ ! -x \"./ltp/testcases/bin/$case_name\" ]; then ./busybox echo \"SKIP CHMOD LTP CASE $case_name\"; continue; fi; ./busybox echo \"RUN CHMOD LTP CASE $case_name\"; ./ltp/testcases/bin/$case_name; ret=$?; ./busybox echo \"CHMOD LTP CASE $case_name : $ret\"; done; ./busybox echo \"#### OS COMP TEST GROUP END ");
+    command.push_str(DIRECT_LTP_GROUP);
+    command.push('-');
     command.push_str(libc_label(libc_root));
     command.push_str(" ####\"; }");
 }
