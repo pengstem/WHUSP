@@ -180,7 +180,7 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
     // Stress, freeze, or known hang/error cases seen in reference runners.
 ];
 
-const DIRECT_LTP_GROUP: &str = "open";
+const DIRECT_LTP_GROUP: &str = "clock";
 
 const DIRECT_LTP_CASES: &[&str] = &[];
 
@@ -266,6 +266,8 @@ fn direct_ltp_label() -> &'static str {
         "PIPE"
     } else if DIRECT_LTP_GROUP == "chmod" {
         "CHMOD"
+    } else if DIRECT_LTP_GROUP == "clock" {
+        "CLOCK"
     } else {
         "LTP"
     }

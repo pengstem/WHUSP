@@ -1,6 +1,6 @@
 use crate::task::{
-    block_current_and_run_next, current_has_deliverable_signal, current_process, current_task,
-    current_user_token, ProcessCpuTimesSnapshot,
+    ProcessCpuTimesSnapshot, block_current_and_run_next, current_has_deliverable_signal,
+    current_process, current_task, current_user_token,
 };
 use crate::timer::{
     add_real_timer, add_timer, get_time_clock_ticks, get_time_ms, get_time_us,
@@ -19,6 +19,8 @@ const CLOCK_MONOTONIC_RAW: i32 = 4;
 const CLOCK_REALTIME_COARSE: i32 = 5;
 const CLOCK_MONOTONIC_COARSE: i32 = 6;
 const CLOCK_BOOTTIME: i32 = 7;
+const CLOCK_REALTIME_ALARM: i32 = 8;
+const CLOCK_BOOTTIME_ALARM: i32 = 9;
 const TIMER_ABSTIME: u32 = 1;
 const NSEC_PER_SEC: isize = 1_000_000_000;
 const NSEC_PER_MSEC: usize = 1_000_000;
@@ -353,6 +355,22 @@ fn nanos_to_timespec(nanos: u64) -> LinuxTimeSpec {
     }
 }
 
+fn clock_getres_resolution(clock_id: i32) -> SysResult<LinuxTimeSpec> {
+    match clock_id {
+        CLOCK_REALTIME
+        | CLOCK_MONOTONIC
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_REALTIME_COARSE
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME
+        | CLOCK_REALTIME_ALARM
+        | CLOCK_BOOTTIME_ALARM => Ok(nanos_to_timespec(1)),
+        _ => Err(SysError::EINVAL),
+    }
+}
+
 fn remaining_until_timespec(expire_ms: usize) -> LinuxTimeSpec {
     let remaining_ms = expire_ms.saturating_sub(get_time_ms());
     let remaining_nanos = (remaining_ms as u64).saturating_mul(NSEC_PER_MSEC as u64);
@@ -400,6 +418,14 @@ pub fn sys_clock_gettime(clock_id: i32, tp: *mut LinuxTimeSpec) -> SysResult {
     }
     let nanos = current_clock_nanos(ClockKind::from_raw(clock_id)?.gettime_backend()?);
     write_user_value(current_user_token(), tp, &nanos_to_timespec(nanos))?;
+    Ok(0)
+}
+
+pub fn sys_clock_getres(clock_id: i32, res: *mut LinuxTimeSpec) -> SysResult {
+    let resolution = clock_getres_resolution(clock_id)?;
+    if !res.is_null() {
+        write_user_value(current_user_token(), res, &resolution)?;
+    }
     Ok(0)
 }
 

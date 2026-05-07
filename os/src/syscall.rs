@@ -56,6 +56,7 @@ const SYSCALL_NANOSLEEP: usize = 101;
 const SYSCALL_GETITIMER: usize = 102;
 const SYSCALL_SETITIMER: usize = 103;
 const SYSCALL_CLOCK_GETTIME: usize = 113;
+const SYSCALL_CLOCK_GETRES: usize = 114;
 const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 const SYSCALL_SYSLOG: usize = 116;
 const SYSCALL_SCHED_YIELD: usize = 124;
@@ -146,7 +147,7 @@ pub(crate) mod user_ptr;
 mod wait;
 
 use crate::task::RLimit;
-use errno::{ret, SysError};
+use errno::{SysError, ret};
 use fs::*;
 use futex::*;
 use memory::*;
@@ -348,6 +349,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             sys_setitimer(args[0] as i32, args[1] as *const u8, args[2] as *mut u8)
         }
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as i32, args[1] as *mut LinuxTimeSpec),
+        SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0] as i32, args[1] as *mut LinuxTimeSpec),
         SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(
             args[0] as i32,
             args[1] as u32,
