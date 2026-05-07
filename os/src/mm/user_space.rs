@@ -187,10 +187,10 @@ impl MemorySet {
         let new_end_vpn = VirtAddr::from(new_mapped_end).floor();
 
         if new_mapped_end > old_mapped_end {
+            if self.range_overlaps(old_mapped_end, new_mapped_end) {
+                return self.brk;
+            }
             let Some(area_idx) = self.find_brk_extension_area(heap_start_vpn, old_end_vpn) else {
-                if self.range_overlaps(old_mapped_end, new_mapped_end) {
-                    return self.brk;
-                }
                 let mut heap_area = MapArea::new(
                     old_mapped_end.into(),
                     new_mapped_end.into(),

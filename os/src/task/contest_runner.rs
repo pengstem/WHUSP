@@ -144,7 +144,6 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
     "run_sched_cliserv.sh",
     "sctp*",
     "shm_test",
-    "shmt09",
     "shmat1",
     "tcp_cc*",
     "test_*",
