@@ -7,6 +7,7 @@ use crate::task::{
 };
 use crate::timer::get_time_ms;
 use alloc::sync::Arc;
+use core::mem::size_of;
 
 use super::errno::{SysError, SysResult};
 use super::time::relative_timeout_deadline_ms;
@@ -23,6 +24,9 @@ const LINUX_SS_AUTODISARM: i32 = 1 << 31;
 fn read_signal_set(token: usize, set: *const u8, sigsetsize: usize) -> SysResult<SignalFlags> {
     if sigsetsize != LINUX_RT_SIGSET_SIZE {
         return Err(SysError::EINVAL);
+    }
+    if (set as usize) < size_of::<u64>() {
+        return Err(SysError::EFAULT);
     }
     let raw_set = read_user_value(token, set.cast::<u64>())?;
     let mut flags = linux_sigset_to_flags(raw_set);
@@ -342,11 +346,18 @@ pub fn sys_rt_sigtimedwait(
 ) -> SysResult {
     let token = current_user_token();
     let wanted = read_signal_set(token, set, sigsetsize)?;
+    if !timeout.is_null() && (timeout as usize) < size_of::<LinuxTimeSpec>() {
+        return Err(SysError::EFAULT);
+    }
     let deadline_ms = relative_timeout_deadline_ms(token, timeout)?;
 
     loop {
         if let Some(signum) = try_return_pending_signal(token, wanted, info)? {
             return Ok(signum);
+        }
+
+        if current_has_interrupting_signal() {
+            return Err(SysError::EINTR);
         }
 
         if let Some(deadline_ms) = deadline_ms {

@@ -146,8 +146,6 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
     "shm_test",
     "shmt09",
     "shmat1",
-    "sigtimedwait01",
-    "sigwaitinfo01",
     "tcp_cc*",
     "test_*",
     "timed_forkbomb",
