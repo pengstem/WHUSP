@@ -6,13 +6,22 @@ use super::super::status_flags::StatusFlagsCell;
 use super::super::{File, FileStat, FileTimestamp, SeekWhence};
 use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
-use crate::mm::{UserBuffer, page_cache::PageCacheId};
+use crate::mm::{page_cache::PageCacheId, UserBuffer};
 use crate::sync::SleepMutex;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
 const VFS_WRITE_CHUNK_SIZE: usize = 64 * 1024;
+const MODE_PERMISSIONS_MASK: u32 = 0o7777;
+const MODE_SETGID: u32 = 0o2000;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FileCreateAttrs {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) mode: u32,
+}
 
 pub(crate) struct VfsFile {
     node: VfsNodeId,
@@ -111,7 +120,7 @@ fn open_vfs_file_impl(
     context: PathContext,
     name: &str,
     flags: OpenFlags,
-    create_owner: Option<(u32, u32)>,
+    create_attrs: Option<FileCreateAttrs>,
 ) -> FsResult<Arc<VfsFile>> {
     let follow_final_symlink = !flags.contains(OpenFlags::NOFOLLOW);
     let resolved = vfs_path::resolve_open_in(
@@ -155,13 +164,26 @@ fn open_vfs_file_impl(
             if flags.contains(OpenFlags::DIRECTORY) {
                 return Err(FsError::InvalidInput);
             }
+            let parent_stat = with_mount(target.parent.mount_id, |mount| {
+                mount.stat(target.parent.ino)
+            })
+            .ok_or(FsError::Io)??;
             let ino = with_mount(target.parent.mount_id, |mount| {
                 mount.create_file(target.parent.ino, target.leaf_name)
             })
             .ok_or(FsError::Io)??;
-            if let Some((uid, gid)) = create_owner {
+            if let Some(attrs) = create_attrs {
+                let gid = if parent_stat.mode & MODE_SETGID != 0 {
+                    parent_stat.gid
+                } else {
+                    attrs.gid
+                };
                 with_mount(target.parent.mount_id, |mount| {
-                    mount.set_owner(ino, Some(uid), Some(gid))
+                    mount.set_owner(ino, Some(attrs.uid), Some(gid))
+                })
+                .ok_or(FsError::Io)??;
+                with_mount(target.parent.mount_id, |mount| {
+                    mount.set_mode(ino, attrs.mode & MODE_PERMISSIONS_MASK)
                 })
                 .ok_or(FsError::Io)??;
             }
@@ -194,21 +216,21 @@ pub(crate) fn open_file_in(
     name: &str,
     flags: OpenFlags,
 ) -> FsResult<Arc<dyn File + Send + Sync>> {
-    open_file_in_with_owner(context, name, flags, None)
+    open_file_in_with_attrs(context, name, flags, None)
 }
 
-pub(crate) fn open_file_in_with_owner(
+pub(crate) fn open_file_in_with_attrs(
     context: PathContext,
     name: &str,
     flags: OpenFlags,
-    create_owner: Option<(u32, u32)>,
+    create_attrs: Option<FileCreateAttrs>,
 ) -> FsResult<Arc<dyn File + Send + Sync>> {
     if context.is_global_root()
         && let Some(file) = devfs::open(name, flags)?
     {
         return Ok(file);
     }
-    open_vfs_file_impl(context, name, flags, create_owner)
+    open_vfs_file_impl(context, name, flags, create_attrs)
         .map(|file| file as Arc<dyn File + Send + Sync>)
 }
 

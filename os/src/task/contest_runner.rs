@@ -180,9 +180,9 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
     // Stress, freeze, or known hang/error cases seen in reference runners.
 ];
 
-const DIRECT_LTP_GROUP: &str = "mmap";
+const DIRECT_LTP_GROUP: &str = "open";
 
-const DIRECT_LTP_CASES: &[&str] = &["mmap04"];
+const DIRECT_LTP_CASES: &[&str] = &["open10"];
 
 pub(super) fn build_runner_command() -> String {
     if DIRECT_LTP_CASES.first().is_some() {
@@ -254,6 +254,8 @@ fn append_direct_ltp_runner(command: &mut String, libc_root: &str) {
 fn direct_ltp_label() -> &'static str {
     if DIRECT_LTP_GROUP == "mmap" {
         "MMAP"
+    } else if DIRECT_LTP_GROUP == "open" {
+        "OPEN"
     } else if DIRECT_LTP_GROUP == "pipe" {
         "PIPE"
     } else if DIRECT_LTP_GROUP == "chmod" {

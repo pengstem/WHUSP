@@ -1,27 +1,27 @@
 use super::super::errno::{SysError, SysResult};
 use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{
-    PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, read_user_value,
-    translated_byte_buffer_checked,
+    copy_to_user, read_user_c_string, read_user_value, translated_byte_buffer_checked,
+    UserBufferAccess, PATH_MAX,
 };
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::stat::resolve_stat_from;
 use super::uapi::{
     AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, F_OK, RENAME_EXCHANGE,
     RENAME_NOREPLACE, RENAME_WHITEOUT, UTIME_NOW, UTIME_OMIT, VALID_ACCESS_MODE,
-    VALID_FACCESSAT_FLAGS, VALID_FACCESSAT2_FLAGS, VALID_RENAME_FLAGS, VALID_UTIMENSAT_FLAGS, W_OK,
+    VALID_FACCESSAT2_FLAGS, VALID_FACCESSAT_FLAGS, VALID_RENAME_FLAGS, VALID_UTIMENSAT_FLAGS, W_OK,
     X_OK,
 };
 use crate::fs::{
-    File, FileStat, FileTimestamp, MountId, OpenFlags, PathContext, S_IFDIR, S_IFREG, WorkingDir,
     chown_in, link_file_in, lookup_dir_in, lookup_dir_with_stat_in, mkdir_in, mount_is_read_only,
     normalize_path_at_root, open_devfs_child, open_devfs_misc_child, open_file_in,
-    open_file_in_with_owner, open_static_path, path_inside_root, rename_in, rmdir_in, symlink_in,
-    truncate_in, unlink_file_in,
+    open_file_in_with_attrs, open_static_path, path_inside_root, rename_in, rmdir_in, symlink_in,
+    truncate_in, unlink_file_in, File, FileCreateAttrs, FileStat, FileTimestamp, MountId,
+    OpenFlags, PathContext, WorkingDir, S_IFDIR, S_IFREG,
 };
 use crate::mm::UserBuffer;
 use crate::task::{
-    CAP_SYS_CHROOT, FdTableEntry, PathSnapshot, current_process, current_user_token,
+    current_process, current_user_token, FdTableEntry, PathSnapshot, CAP_SYS_CHROOT,
 };
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -312,7 +312,7 @@ fn open_devfs_child_from_dirfd(
     child.map(Some).ok_or(SysError::ENOENT)
 }
 
-pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> SysResult {
+pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> SysResult {
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
     let Some(flags) = OpenFlags::from_bits(flags) else {
@@ -334,11 +334,15 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> SysR
     }
     let context = path_context_from(&snapshot, dirfd, path.as_str())?;
     let credentials = current_process().credentials();
-    let file = open_file_in_with_owner(
+    let file = open_file_in_with_attrs(
         context,
         path.as_str(),
         flags,
-        Some((credentials.fsuid, credentials.fsgid)),
+        Some(FileCreateAttrs {
+            uid: credentials.fsuid,
+            gid: credentials.fsgid,
+            mode,
+        }),
     )?;
     install_open_file(file, flags, dir_path)
 }
