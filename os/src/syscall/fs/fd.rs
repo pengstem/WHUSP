@@ -7,9 +7,8 @@ use alloc::sync::Arc;
 use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
-use super::super::user_ptr::{
-    read_user_value, translated_byte_buffer_checked, write_user_value, UserBufferAccess,
-};
+use super::super::user_ptr::{translated_byte_buffer_checked, UserBufferAccess};
+use super::fd_lock::{fcntl_getlk, fcntl_setlk};
 
 const F_DUPFD: usize = 0;
 const F_GETFD: usize = 1;
@@ -25,23 +24,6 @@ const F_GETPIPE_SZ: usize = 1032;
 const VALID_PIPE2_FLAGS: u32 = OpenFlags::NONBLOCK.bits() | OpenFlags::CLOEXEC.bits();
 const VALID_DUP3_FLAGS: u32 = OpenFlags::CLOEXEC.bits();
 const MAX_PIPE_SIZE_ARG: usize = 1 << 31;
-
-const F_RDLCK: i16 = 0;
-const F_WRLCK: i16 = 1;
-const F_UNLCK: i16 = 2;
-const SEEK_SET: i16 = 0;
-const SEEK_CUR: i16 = 1;
-const SEEK_END: i16 = 2;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct LinuxFlock {
-    l_type: i16,
-    l_whence: i16,
-    l_start: i64,
-    l_len: i64,
-    l_pid: i32,
-}
 
 pub(super) fn get_fd_entry_by_fd(fd: usize) -> SysResult<FdTableEntry> {
     let process = current_process();
@@ -210,38 +192,6 @@ fn fcntl_dup(fd: usize, lower_bound: usize, fd_flags: FdFlags) -> SysResult {
     Ok(new_fd as isize)
 }
 
-fn valid_flock_type(l_type: i16) -> bool {
-    matches!(l_type, F_RDLCK | F_WRLCK | F_UNLCK)
-}
-
-fn valid_flock_whence(l_whence: i16) -> bool {
-    matches!(l_whence, SEEK_SET | SEEK_CUR | SEEK_END)
-}
-
-fn fcntl_getlk(fd: usize, lock: *mut LinuxFlock) -> SysResult {
-    let _ = get_fd_entry_by_fd(fd)?;
-    let token = current_user_token();
-    let mut flock = read_user_value(token, lock.cast_const())?;
-    if !valid_flock_type(flock.l_type) || !valid_flock_whence(flock.l_whence) {
-        return Err(SysError::EINVAL);
-    }
-    // UNFINISHED: byte-range lock conflict tracking is not implemented; report no conflict.
-    flock.l_type = F_UNLCK;
-    write_user_value(token, lock, &flock)?;
-    Ok(0)
-}
-
-fn fcntl_setlk(fd: usize, lock: *const LinuxFlock) -> SysResult {
-    let _ = get_fd_entry_by_fd(fd)?;
-    let token = current_user_token();
-    let flock = read_user_value(token, lock)?;
-    if !valid_flock_type(flock.l_type) || !valid_flock_whence(flock.l_whence) {
-        return Err(SysError::EINVAL);
-    }
-    // UNFINISHED: advisory byte-range lock ownership, conflicts, and F_SETLKW waits are ignored.
-    Ok(0)
-}
-
 fn fcntl_get_pipe_size(fd: usize) -> SysResult {
     let file = get_file_by_fd(fd)?;
     file.pipe_capacity()
@@ -297,8 +247,8 @@ pub fn sys_fcntl(fd: usize, op: usize, arg: usize) -> SysResult {
             entry.set_status_flags(status.with_fcntl_status_flags(arg as u32));
             Ok(0)
         }
-        F_GETLK => fcntl_getlk(fd, arg as *mut LinuxFlock),
-        F_SETLK | F_SETLKW => fcntl_setlk(fd, arg as *const LinuxFlock),
+        F_GETLK => fcntl_getlk(get_fd_entry_by_fd(fd)?, arg as *mut _),
+        F_SETLK | F_SETLKW => fcntl_setlk(get_fd_entry_by_fd(fd)?, arg as *const _),
         F_GETPIPE_SZ => fcntl_get_pipe_size(fd),
         F_SETPIPE_SZ => fcntl_set_pipe_size(fd, arg),
         _ => Err(SysError::EINVAL),

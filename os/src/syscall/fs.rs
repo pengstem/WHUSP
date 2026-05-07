@@ -1,4 +1,5 @@
 mod fd;
+mod fd_lock;
 mod io;
 mod mount;
 mod path;
