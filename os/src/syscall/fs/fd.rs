@@ -1,11 +1,11 @@
-use crate::fs::{File, OpenFlags, make_pipe};
-use crate::task::{FdFlags, FdTableEntry, current_process, current_user_token};
+use crate::fs::{make_pipe, File, OpenFlags};
+use crate::task::{current_process, current_user_token, FdFlags, FdTableEntry};
 use alloc::sync::Arc;
 use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    UserBufferAccess, read_user_value, translated_byte_buffer_checked, write_user_value,
+    read_user_value, translated_byte_buffer_checked, write_user_value, UserBufferAccess,
 };
 
 const F_DUPFD: usize = 0;

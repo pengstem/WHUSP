@@ -198,6 +198,7 @@ impl TaskUserRes {
         process_inner.dealloc_tid(self.tid);
     }
 
+    #[cfg(target_arch = "riscv64")]
     pub fn trap_cx_user_va(&self) -> usize {
         trap_cx_bottom_from_tid(self.tid)
     }

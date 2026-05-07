@@ -23,6 +23,7 @@ pub trait CharDevice {
     fn try_read(&self) -> Option<u8>;
     fn has_input(&self) -> bool;
     fn write(&self, ch: u8);
+    #[cfg(target_arch = "riscv64")]
     fn handle_irq(&self);
 }
 
@@ -126,6 +127,9 @@ impl NS16550aInner {
 
 pub struct NS16550a {
     inner: UPIntrFreeCell<NS16550aInner>,
+    // CONTEXT: signaled from the RV IRQ path; LA polls instead of taking
+    // external UART interrupts, so the field stays allocated but unread there.
+    #[allow(dead_code)]
     condvar: Condvar,
 }
 
@@ -188,6 +192,7 @@ impl CharDevice for NS16550a {
         let mut inner = self.inner.exclusive_access();
         inner.ns16550a.write(ch);
     }
+    #[cfg(target_arch = "riscv64")]
     fn handle_irq(&self) {
         let mut count = 0;
         self.inner.exclusive_session(|inner| {

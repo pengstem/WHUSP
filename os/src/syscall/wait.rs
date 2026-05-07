@@ -1,7 +1,7 @@
 use crate::mm::translated_refmut;
 use crate::task::{
-    CLD_EXITED, SIGCHLD, SignalInfo, block_current_and_run_next, current_has_nonrestartable_signal,
-    current_process,
+    block_current_and_run_next, current_has_nonrestartable_signal, current_process, SignalInfo,
+    CLD_EXITED, SIGCHLD,
 };
 use alloc::sync::Arc;
 

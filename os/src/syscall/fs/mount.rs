@@ -1,11 +1,11 @@
 use crate::fs::{
-    MountError, lookup_mount_target_dir_in, mount_block_device_at, mount_fat_device_at,
-    mount_tmpfs_at, normalize_path_at_root, remount_at, unmount_at,
+    lookup_mount_target_dir_in, mount_block_device_at, mount_fat_device_at, mount_tmpfs_at,
+    normalize_path_at_root, remount_at, unmount_at, MountError,
 };
 use crate::task::{current_process, current_user_token};
 
 use super::super::errno::{SysError, SysResult};
-use super::super::user_ptr::{PATH_MAX, read_user_c_string};
+use super::super::user_ptr::{read_user_c_string, PATH_MAX};
 
 const MS_RDONLY: usize = 1;
 const MS_REMOUNT: usize = 32;

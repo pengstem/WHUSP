@@ -1,16 +1,16 @@
-use crate::fs::{File, OpenFlags, PollEvents, S_IFDIR, S_IFREG, SeekWhence};
+use crate::fs::{File, OpenFlags, PollEvents, SeekWhence, S_IFDIR, S_IFREG};
 use crate::mm::UserBuffer;
-use crate::task::{FdTableEntry, current_user_token};
+use crate::task::{current_user_token, FdTableEntry};
 use alloc::vec::Vec;
 use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    UserBufferAccess, read_user_usize, translated_byte_buffer_checked,
-    translated_byte_buffer_checked_with_mmap_fault,
+    read_user_usize, translated_byte_buffer_checked,
+    translated_byte_buffer_checked_with_mmap_fault, UserBufferAccess,
 };
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
-use super::uapi::{IOV_MAX, LinuxIovec};
+use super::uapi::{LinuxIovec, IOV_MAX};
 
 fn read_user_iovecs(
     token: usize,

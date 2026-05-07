@@ -84,6 +84,7 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
         .get_trap_cx()
 }
 
+#[cfg(target_arch = "riscv64")]
 pub fn current_trap_cx_user_va() -> usize {
     current_task()
         .unwrap()

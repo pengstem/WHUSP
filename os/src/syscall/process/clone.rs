@@ -1,7 +1,7 @@
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::write_user_value;
 use crate::task::{
-    CloneArgs, CloneFlags, add_task, clone_current_thread, current_process, current_user_token,
+    add_task, clone_current_thread, current_process, current_user_token, CloneArgs, CloneFlags,
 };
 use alloc::sync::Arc;
 

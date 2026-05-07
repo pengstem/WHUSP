@@ -39,7 +39,11 @@ pub struct IrqDevice {
 #[derive(Clone, Copy, Default)]
 pub struct PciDevice {
     pub ecam_base: usize,
+    // CONTEXT: BAR window captured during DTB scan for future PCI block-device
+    // transport; currently set but not read on the LA boot path.
+    #[allow(dead_code)]
     pub bar_mem_start: usize,
+    #[allow(dead_code)]
     pub bar_mem_end: usize,
     pub bus: u8,
     pub device: u8,
@@ -69,6 +73,9 @@ struct BoardConfig {
     gpu: Option<IrqDevice>,
     keyboard: Option<IrqDevice>,
     mouse: Option<IrqDevice>,
+    // CONTEXT: virtio-net DTB node captured for future LA net support; no
+    // in-kernel net stack consumes it today.
+    #[allow(dead_code)]
     net: Option<IrqDevice>,
     mmio_regions: [MmioRange; MMIO_REGION_CAPACITY],
     mmio_region_count: usize,
@@ -141,6 +148,9 @@ fn board_config() -> &'static BoardConfig {
     BOARD_CONFIG.get()
 }
 
+// CONTEXT: DTB compatible-string matcher reserved for future LA device probes;
+// the LA path currently uses direct name lookups.
+#[allow(dead_code)]
 fn compatible_contains(node: FdtNode<'_, '_>, compatibles: &[&str]) -> bool {
     node.compatible()
         .map(|node_compatibles| {
@@ -442,6 +452,10 @@ pub fn uart_base() -> usize {
     }
 }
 
+// CONTEXT: LA external-IRQ wiring is not implemented (no LA equivalent of the
+// RV PLIC dispatch yet); `uart_irq`/`keyboard_irq`/`mouse_irq`/`net_device`/
+// `irq_handler` mirror the RV64 board API for when LA IRQ support is added.
+#[allow(dead_code)]
 pub fn uart_irq() -> usize {
     board_config().uart.irq
 }
@@ -463,6 +477,7 @@ pub fn keyboard_device() -> Option<IrqDevice> {
     board_config().keyboard
 }
 
+#[allow(dead_code)]
 pub fn keyboard_irq() -> Option<usize> {
     board_config().keyboard.map(|device| device.irq)
 }
@@ -471,10 +486,12 @@ pub fn mouse_device() -> Option<IrqDevice> {
     board_config().mouse
 }
 
+#[allow(dead_code)]
 pub fn mouse_irq() -> Option<usize> {
     board_config().mouse.map(|device| device.irq)
 }
 
+#[allow(dead_code)]
 pub fn net_device() -> Option<IrqDevice> {
     board_config().net
 }
@@ -494,6 +511,7 @@ pub fn device_init(_hart_id: usize) {
     info!("KERN: LoongArch external IRQ setup deferred; block I/O uses polling");
 }
 
+#[allow(dead_code)]
 pub fn irq_handler() {
     warn!("unexpected LoongArch external IRQ");
 }

@@ -35,7 +35,11 @@ pub struct IrqDevice {
 #[derive(Clone, Copy, Default)]
 pub struct PciDevice {
     pub ecam_base: usize,
+    // CONTEXT: BAR window captured during DTB scan for future PCI block-device
+    // transport; not read today because RV currently selects the MMIO path.
+    #[allow(dead_code)]
     pub bar_mem_start: usize,
+    #[allow(dead_code)]
     pub bar_mem_end: usize,
     pub bus: u8,
     pub device: u8,
@@ -46,6 +50,9 @@ pub struct PciDevice {
 #[derive(Clone, Copy)]
 pub enum BlockDeviceConfig {
     Mmio(IrqDevice),
+    // CONTEXT: RV constructs only the `Mmio` variant today; LA already
+    // constructs `Pci`. Variant kept so the type stays symmetric across arches.
+    #[allow(dead_code)]
     Pci(PciDevice),
 }
 
@@ -400,6 +407,9 @@ pub fn mouse_irq() -> Option<usize> {
     board_config().mouse.map(|device| device.irq)
 }
 
+// CONTEXT: virtio-net device is discovered from the DTB but no in-kernel net
+// stack consumes it yet (see CLAUDE.md "Things that surprise people").
+#[allow(dead_code)]
 pub fn net_device() -> Option<IrqDevice> {
     board_config().net
 }

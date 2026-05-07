@@ -77,6 +77,7 @@ impl VirtIOBlock {
         }
     }
 
+    #[cfg(target_arch = "riscv64")]
     pub fn handle_irq(&self) {
         self.virtio_blk.exclusive_session(|blk| {
             let _ = blk.ack_interrupt();
@@ -166,6 +167,7 @@ pub fn block_count() -> usize {
     BLOCK_DEVICES.len()
 }
 
+#[cfg(target_arch = "riscv64")]
 pub fn handle_irq(irq: usize) -> bool {
     if let Some(device) = BLOCK_DEVICES.iter().find(|device| device.irq() == irq) {
         device.handle_irq();
