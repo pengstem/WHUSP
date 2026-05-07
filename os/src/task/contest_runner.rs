@@ -180,12 +180,9 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
     // Stress, freeze, or known hang/error cases seen in reference runners.
 ];
 
-const DIRECT_LTP_GROUP: &str = "chmod";
+const DIRECT_LTP_GROUP: &str = "pipe";
 
-const DIRECT_LTP_CASES: &[&str] = &[
-    "chmod03", "chmod05", "chmod06", "fchmod01", "fchmod02", "fchmod03", "fchmod04", "fchmod05",
-    "fchmod06",
-];
+const DIRECT_LTP_CASES: &[&str] = &["pipe02", "pipe08"];
 
 pub(super) fn build_runner_command() -> String {
     if DIRECT_LTP_CASES.first().is_some() {
@@ -235,7 +232,7 @@ fn append_direct_ltp_runner(command: &mut String, libc_root: &str) {
         }
         command.push_str(case_name);
     }
-    command.push_str("; do if [ ! -x \"./ltp/testcases/bin/$case_name\" ]; then ./busybox echo \"SKIP CHMOD LTP CASE $case_name\"; continue; fi; ./busybox echo \"RUN CHMOD LTP CASE $case_name\"; ./ltp/testcases/bin/$case_name; ret=$?; ./busybox echo \"CHMOD LTP CASE $case_name : $ret\"; done; ./busybox echo \"#### OS COMP TEST GROUP END ");
+    command.push_str("; do if [ ! -x \"./ltp/testcases/bin/$case_name\" ]; then ./busybox echo \"SKIP PIPE LTP CASE $case_name\"; continue; fi; ./busybox echo \"RUN PIPE LTP CASE $case_name\"; ./ltp/testcases/bin/$case_name; ret=$?; ./busybox echo \"PIPE LTP CASE $case_name : $ret\"; done; ./busybox echo \"#### OS COMP TEST GROUP END ");
     command.push_str(DIRECT_LTP_GROUP);
     command.push('-');
     command.push_str(libc_label(libc_root));

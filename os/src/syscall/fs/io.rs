@@ -1,6 +1,6 @@
 use crate::fs::{File, OpenFlags, PollEvents, SeekWhence, S_IFDIR, S_IFREG};
 use crate::mm::UserBuffer;
-use crate::task::{current_user_token, FdTableEntry};
+use crate::task::{current_add_signal, current_user_token, FdTableEntry, SignalFlags};
 use alloc::vec::Vec;
 use core::mem::size_of;
 
@@ -54,6 +54,14 @@ fn write_with_status_flags(entry: &FdTableEntry, buf: UserBuffer) -> usize {
     } else {
         file.write(buf)
     }
+}
+
+fn check_pipe_write_peer(entry: &FdTableEntry, has_data: bool) -> SysResult<()> {
+    if has_data && entry.file().pipe_readers_closed() {
+        current_add_signal(SignalFlags::SIGPIPE);
+        return Err(SysError::EPIPE);
+    }
+    Ok(())
 }
 
 fn checked_position_offset(offset: usize) -> SysResult<usize> {
@@ -328,6 +336,7 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
     if !file.writable() {
         return Err(SysError::EBADF);
     }
+    check_pipe_write_peer(&entry, len > 0)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
     let buffers =
         translated_byte_buffer_checked_with_mmap_fault(token, buf, len, UserBufferAccess::Read)?;
@@ -352,6 +361,8 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
     if !file.writable() {
         return Err(SysError::EBADF);
     }
+    let has_data = iovecs.iter().any(|iovec| iovec.len > 0);
+    check_pipe_write_peer(&entry, has_data)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
 
     let mut total_written = 0usize;

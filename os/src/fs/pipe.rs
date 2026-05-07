@@ -254,8 +254,9 @@ impl File for Pipe {
         loop {
             let mut ring_buffer = self.buffer.exclusive_access();
             if ring_buffer.all_read_ends_closed() {
-                // UNFINISHED: Linux returns EPIPE and raises SIGPIPE here.
-                // The current File::write interface cannot propagate fs errors yet.
+                // CONTEXT: sys_write/sys_writev translate the initial
+                // no-reader case into SIGPIPE/EPIPE. If readers disappear
+                // after a partial write, Linux can report the partial count.
                 return already_write;
             }
             let loop_write = ring_buffer.available_write();
@@ -315,6 +316,9 @@ impl File for Pipe {
     }
     fn pipe_occupied(&self) -> Option<usize> {
         Some(self.buffer.exclusive_access().available_read())
+    }
+    fn pipe_readers_closed(&self) -> bool {
+        self.writable && self.buffer.exclusive_access().all_read_ends_closed()
     }
     fn poll(&self, events: PollEvents) -> PollEvents {
         let ring_buffer = self.buffer.exclusive_access();

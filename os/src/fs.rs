@@ -178,6 +178,9 @@ pub trait File: Send + Sync {
     fn pipe_occupied(&self) -> Option<usize> {
         None
     }
+    fn pipe_readers_closed(&self) -> bool {
+        false
+    }
     fn is_tty(&self) -> bool {
         false
     }

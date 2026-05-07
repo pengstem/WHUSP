@@ -18,6 +18,7 @@ const SA_NODEFER: usize = 0x4000_0000;
 const SIGINT: usize = 2;
 const SIGUSR1: usize = 10;
 const SIGSEGV: usize = 11;
+const SIGPIPE: usize = 13;
 const SIGALRM: usize = 14;
 const SIGTERM: usize = 15;
 const SIGCANCEL: usize = 33;
@@ -27,7 +28,7 @@ const RT_SIGRETURN_TRAMPOLINE: [u32; 2] = [0x0382_2c0b, 0x002b_0000];
 pub fn can_deliver_user_signal(_signum: usize) -> bool {
     matches!(
         _signum,
-        SIGINT | SIGUSR1 | SIGSEGV | SIGALRM | SIGTERM | SIGCANCEL
+        SIGINT | SIGUSR1 | SIGSEGV | SIGPIPE | SIGALRM | SIGTERM | SIGCANCEL
     ) || _signum == SIGCHLD as usize
 }
 
@@ -190,10 +191,10 @@ fn take_pending_user_signal() -> Option<PendingUserSignal> {
                 // user-installed handler. This stage deliberately limits
                 // LoongArch signal frames to libc-test sigreturn's SIGINT,
                 // parent/child rendezvous SIGUSR1, mmap/mprotect SIGSEGV
-                // handlers, ITIMER_REAL's SIGALRM, user cleanup SIGTERM
-                // handlers, musl's pthread cancellation signal, and BusyBox
-                // shell SIGCHLD wakeups while the generic signal ABI is still
-                // being validated.
+                // handlers, pipe SIGPIPE handlers, ITIMER_REAL's SIGALRM,
+                // user cleanup SIGTERM handlers, musl's pthread cancellation
+                // signal, and BusyBox shell SIGCHLD wakeups while the generic
+                // signal ABI is still being validated.
                 continue;
             }
             selected = Some((signum, signal));
