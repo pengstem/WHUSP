@@ -1,7 +1,7 @@
 use crate::mm::translated_refmut;
 use crate::task::{
     block_current_and_run_next, current_has_nonrestartable_signal, current_process, SignalInfo,
-    CLD_EXITED, SIGCHLD,
+    CLD_EXITED, SIGCHLD, remove_from_pid2process,
 };
 use alloc::sync::Arc;
 
@@ -144,6 +144,9 @@ pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsag
             write_rusage(token, rusage);
             inner.cpu_times.add_waited_child(child_times);
 
+            // CONTEXT: Linux keeps a zombie PID visible until the parent reaps it.
+            // Remove the process from PID lookup only at the wait/reap boundary.
+            remove_from_pid2process(found_pid);
             let child = inner.children.remove(idx);
             assert_eq!(Arc::strong_count(&child), 1);
             return Ok(found_pid as isize);
@@ -226,6 +229,9 @@ pub fn sys_waitid(
 
             if options & WNOWAIT == 0 {
                 inner.cpu_times.add_waited_child(child_times);
+                // CONTEXT: WNOWAIT observes the zombie without reaping it; only
+                // the actual reap removes the PID from process lookup.
+                remove_from_pid2process(child_pid);
                 let child = inner.children.remove(idx);
                 assert_eq!(Arc::strong_count(&child), 1);
             }

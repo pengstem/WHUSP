@@ -278,7 +278,6 @@ fn exit_current(exit_code: i32, group_exit: bool) {
         terminate_sibling_threads(&process, tid, process_token, process_id, exit_code);
         remove_ready_tasks_of_process(pid);
         futex::remove_process_futex_waiters(pid);
-        remove_from_pid2process(pid);
         let (parent, children, fd_table, flushes) = {
             let mut process_inner = process.inner_exclusive_access();
             // mark this process as a zombie process
