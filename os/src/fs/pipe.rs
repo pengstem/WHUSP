@@ -36,7 +36,8 @@ impl Pipe {
     }
 }
 
-const RING_BUFFER_SIZE: usize = 4096;
+pub(super) const PIPE_BUFFER_SIZE: usize = 4096;
+const RING_BUFFER_SIZE: usize = PIPE_BUFFER_SIZE;
 
 #[derive(Copy, Clone, PartialEq)]
 enum RingBufferStatus {
@@ -259,6 +260,9 @@ impl File for Pipe {
             }
             let loop_write = ring_buffer.available_write();
             if loop_write == 0 {
+                if self.status_flags.get().contains(OpenFlags::NONBLOCK) {
+                    return already_write;
+                }
                 if pipe_wait_interrupted() {
                     return already_write;
                 }
@@ -305,6 +309,12 @@ impl File for Pipe {
     }
     fn set_status_flags(&self, flags: OpenFlags) {
         self.status_flags.set(flags);
+    }
+    fn pipe_capacity(&self) -> Option<usize> {
+        Some(PIPE_BUFFER_SIZE)
+    }
+    fn pipe_occupied(&self) -> Option<usize> {
+        Some(self.buffer.exclusive_access().available_read())
     }
     fn poll(&self, events: PollEvents) -> PollEvents {
         let ring_buffer = self.buffer.exclusive_access();

@@ -11,6 +11,7 @@ const TCSETS: usize = 0x5402;
 const TCSETSW: usize = 0x5403;
 const TCSETSF: usize = 0x5404;
 const TIOCGWINSZ: usize = 0x5413;
+const FIONREAD: usize = 0x541b;
 const RTC_RD_TIME: usize = 0x80247009;
 
 const BRKINT: u32 = 0x0002;
@@ -128,6 +129,13 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
 
     if file.is_rtc() {
         return handle_rtc_ioctl(request, argp);
+    }
+
+    if request == FIONREAD {
+        let unread = file.pipe_occupied().ok_or(SysError::ENOTTY)? as i32;
+        let token = current_user_token();
+        write_user_value(token, argp as *mut i32, &unread)?;
+        return Ok(0);
     }
 
     if !file.is_tty() {

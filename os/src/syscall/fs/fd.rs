@@ -1,11 +1,12 @@
-use crate::fs::{make_pipe, File, OpenFlags};
-use crate::task::{current_process, current_user_token, FdFlags, FdTableEntry};
+use crate::config::PAGE_SIZE;
+use crate::fs::{File, OpenFlags, make_pipe, pipe_max_size};
+use crate::task::{FdFlags, FdTableEntry, current_process, current_user_token};
 use alloc::sync::Arc;
 use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    read_user_value, translated_byte_buffer_checked, write_user_value, UserBufferAccess,
+    UserBufferAccess, read_user_value, translated_byte_buffer_checked, write_user_value,
 };
 
 const F_DUPFD: usize = 0;
@@ -17,8 +18,11 @@ const F_GETLK: usize = 5;
 const F_SETLK: usize = 6;
 const F_SETLKW: usize = 7;
 const F_DUPFD_CLOEXEC: usize = 1030;
+const F_SETPIPE_SZ: usize = 1031;
+const F_GETPIPE_SZ: usize = 1032;
 const VALID_PIPE2_FLAGS: u32 = OpenFlags::NONBLOCK.bits() | OpenFlags::CLOEXEC.bits();
 const VALID_DUP3_FLAGS: u32 = OpenFlags::CLOEXEC.bits();
+const MAX_PIPE_SIZE_ARG: usize = 1 << 31;
 
 const F_RDLCK: i16 = 0;
 const F_WRLCK: i16 = 1;
@@ -228,6 +232,36 @@ fn fcntl_setlk(fd: usize, lock: *const LinuxFlock) -> SysResult {
     Ok(0)
 }
 
+fn fcntl_get_pipe_size(fd: usize) -> SysResult {
+    let file = get_file_by_fd(fd)?;
+    file.pipe_capacity()
+        .map(|capacity| capacity as isize)
+        .ok_or(SysError::EINVAL)
+}
+
+fn fcntl_set_pipe_size(fd: usize, requested: usize) -> SysResult {
+    let file = get_file_by_fd(fd)?;
+    let capacity = file.pipe_capacity().ok_or(SysError::EINVAL)?;
+    let occupied = file.pipe_occupied().unwrap_or(0);
+
+    if requested > MAX_PIPE_SIZE_ARG {
+        return Err(SysError::EINVAL);
+    }
+    if requested < occupied {
+        return Err(SysError::EBUSY);
+    }
+    let requested = requested.max(PAGE_SIZE);
+    if requested > pipe_max_size() {
+        return Err(SysError::EPERM);
+    }
+    if requested > capacity {
+        // UNFINISHED: pipe buffers are fixed-size in this kernel; Linux can
+        // grow them to a larger rounded page multiple when memory limits allow.
+        return Err(SysError::EPERM);
+    }
+    Ok(capacity as isize)
+}
+
 pub fn sys_fcntl(fd: usize, op: usize, arg: usize) -> SysResult {
     match op {
         F_DUPFD => fcntl_dup(fd, arg, FdFlags::empty()),
@@ -257,6 +291,8 @@ pub fn sys_fcntl(fd: usize, op: usize, arg: usize) -> SysResult {
         }
         F_GETLK => fcntl_getlk(fd, arg as *mut LinuxFlock),
         F_SETLK | F_SETLKW => fcntl_setlk(fd, arg as *const LinuxFlock),
+        F_GETPIPE_SZ => fcntl_get_pipe_size(fd),
+        F_SETPIPE_SZ => fcntl_set_pipe_size(fd, arg),
         _ => Err(SysError::EINVAL),
     }
 }

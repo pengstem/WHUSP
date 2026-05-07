@@ -172,6 +172,12 @@ pub trait File: Send + Sync {
         inode::OpenFlags::empty()
     }
     fn set_status_flags(&self, _flags: inode::OpenFlags) {}
+    fn pipe_capacity(&self) -> Option<usize> {
+        None
+    }
+    fn pipe_occupied(&self) -> Option<usize> {
+        None
+    }
     fn is_tty(&self) -> bool {
         false
     }
@@ -214,6 +220,7 @@ pub(crate) use mount::{
 };
 pub(crate) use path::{PathContext, WorkingDir, normalize_path_at_root, path_inside_root};
 pub use pipe::make_pipe;
+pub(crate) use procfs::pipe_max_size;
 pub(crate) use staticfs::{open_path as open_static_path, stat_path as stat_static_path};
 pub use stdio::{Stdin, Stdout};
 pub(crate) use vfs::open_file;

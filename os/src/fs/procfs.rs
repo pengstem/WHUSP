@@ -1,10 +1,11 @@
-use super::dirent::{write_dir_entries, RawDirEntry, DT_DIR, DT_REG};
+use super::dirent::{DT_DIR, DT_REG, RawDirEntry, write_dir_entries};
 use super::mount;
+use super::pipe::PIPE_BUFFER_SIZE;
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
 use super::{FileStat, FileTimestamp, S_IFDIR, S_IFREG};
 use crate::config::PAGE_SIZE;
 use crate::mm::frame_stats;
-use crate::task::{list_process_snapshots, pid2process, ProcessProcSnapshot};
+use crate::task::{ProcessProcSnapshot, list_process_snapshots, pid2process};
 use crate::timer::{get_time_us, us_to_clock_ticks};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -19,6 +20,9 @@ const CPUINFO_INO: u32 = 6;
 const SYS_DIR_INO: u32 = 7;
 const SYS_KERNEL_DIR_INO: u32 = 8;
 const PID_MAX_INO: u32 = 9;
+const SYS_FS_DIR_INO: u32 = 10;
+const PIPE_MAX_SIZE_INO: u32 = 11;
+const PIPE_USER_PAGES_SOFT_INO: u32 = 12;
 const PID_DIR_BASE: u32 = 100;
 const PID_FILE_BASE: u32 = 10_000;
 const PID_FILE_STRIDE: u32 = 10;
@@ -26,8 +30,15 @@ const PID_STAT_OFFSET: u32 = 0;
 const PID_STATUS_OFFSET: u32 = 1;
 const PID_CMDLINE_OFFSET: u32 = 2;
 const DEFAULT_PID_MAX: usize = 4_194_304;
+const DEFAULT_PIPE_USER_PAGES_SOFT: usize = 1;
 
 static PROC_PID_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_PID_MAX);
+static PROC_PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(PIPE_BUFFER_SIZE);
+static PROC_PIPE_USER_PAGES_SOFT: AtomicUsize = AtomicUsize::new(DEFAULT_PIPE_USER_PAGES_SOFT);
+
+pub(crate) fn pipe_max_size() -> usize {
+    PROC_PIPE_MAX_SIZE.load(Ordering::Relaxed)
+}
 
 pub(super) struct ProcFs;
 
@@ -40,7 +51,10 @@ enum ProcNode {
     Cpuinfo,
     SysDir,
     SysKernelDir,
+    SysFsDir,
     PidMax,
+    PipeMaxSize,
+    PipeUserPagesSoft,
     PidDir(usize),
     PidStat(usize),
     PidStatus(usize),
@@ -82,6 +96,9 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         SYS_DIR_INO => Some(ProcNode::SysDir),
         SYS_KERNEL_DIR_INO => Some(ProcNode::SysKernelDir),
         PID_MAX_INO => Some(ProcNode::PidMax),
+        SYS_FS_DIR_INO => Some(ProcNode::SysFsDir),
+        PIPE_MAX_SIZE_INO => Some(ProcNode::PipeMaxSize),
+        PIPE_USER_PAGES_SOFT_INO => Some(ProcNode::PipeUserPagesSoft),
         ino if ino >= PID_FILE_BASE => {
             let rel = ino - PID_FILE_BASE;
             let pid = (rel / PID_FILE_STRIDE) as usize;
@@ -106,9 +123,11 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
 
 fn node_kind(node: ProcNode) -> FsNodeKind {
     match node {
-        ProcNode::Root | ProcNode::SysDir | ProcNode::SysKernelDir | ProcNode::PidDir(_) => {
-            FsNodeKind::Directory
-        }
+        ProcNode::Root
+        | ProcNode::SysDir
+        | ProcNode::SysKernelDir
+        | ProcNode::SysFsDir
+        | ProcNode::PidDir(_) => FsNodeKind::Directory,
         _ => FsNodeKind::RegularFile,
     }
 }
@@ -176,6 +195,36 @@ fn sys_entries() -> Vec<RawDirEntry> {
         ino: SYS_KERNEL_DIR_INO,
         name: "kernel".into(),
         dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_FS_DIR_INO,
+        name: "fs".into(),
+        dtype: DT_DIR,
+    });
+    entries
+}
+
+fn sys_fs_entries() -> Vec<RawDirEntry> {
+    let mut entries = Vec::new();
+    entries.push(RawDirEntry {
+        ino: SYS_FS_DIR_INO,
+        name: ".".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_DIR_INO,
+        name: "..".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: PIPE_MAX_SIZE_INO,
+        name: "pipe-max-size".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: PIPE_USER_PAGES_SOFT_INO,
+        name: "pipe-user-pages-soft".into(),
+        dtype: DT_REG,
     });
     entries
 }
@@ -294,6 +343,14 @@ fn pid_max_content() -> String {
     format!("{}\n", PROC_PID_MAX.load(Ordering::Relaxed))
 }
 
+fn pipe_max_size_content() -> String {
+    format!("{}\n", pipe_max_size())
+}
+
+fn pipe_user_pages_soft_content() -> String {
+    format!("{}\n", PROC_PIPE_USER_PAGES_SOFT.load(Ordering::Relaxed))
+}
+
 fn write_pid_max(buf: &[u8], offset: u64) -> usize {
     if offset != 0 {
         return 0;
@@ -308,6 +365,26 @@ fn write_pid_max(buf: &[u8], offset: u64) -> usize {
     // compatibility path stores the procfs value for LTP save/restore, but the
     // kernel PID allocator is not yet retuned by this sysctl.
     PROC_PID_MAX.store(value, Ordering::Relaxed);
+    buf.len()
+}
+
+fn write_pipe_max_size(buf: &[u8], offset: u64) -> usize {
+    if offset != 0 {
+        return 0;
+    }
+    let Ok(text) = core::str::from_utf8(buf) else {
+        return 0;
+    };
+    let Ok(value) = text.trim().parse::<usize>() else {
+        return 0;
+    };
+    if value < PAGE_SIZE {
+        return 0;
+    }
+    // CONTEXT: pipe capacity is currently fixed to one page. Linux permits
+    // larger dynamic buffers; this sysctl is clamped to the implemented cap so
+    // F_SETPIPE_SZ and new pipe defaults remain internally consistent.
+    PROC_PIPE_MAX_SIZE.store(value.min(PIPE_BUFFER_SIZE), Ordering::Relaxed);
     buf.len()
 }
 
@@ -380,6 +457,8 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::Uptime => Ok(uptime_content().into_bytes()),
         ProcNode::Cpuinfo => Ok(cpuinfo_content().into_bytes()),
         ProcNode::PidMax => Ok(pid_max_content().into_bytes()),
+        ProcNode::PipeMaxSize => Ok(pipe_max_size_content().into_bytes()),
+        ProcNode::PipeUserPagesSoft => Ok(pipe_user_pages_soft_content().into_bytes()),
         ProcNode::PidStat(pid) => lookup_process(pid)
             .map(pid_stat_content)
             .map(String::into_bytes)
@@ -391,9 +470,11 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::PidCmdline(pid) => lookup_process(pid)
             .map(pid_cmdline_content)
             .ok_or(FsError::NotFound),
-        ProcNode::Root | ProcNode::SysDir | ProcNode::SysKernelDir | ProcNode::PidDir(_) => {
-            Err(FsError::IsDir)
-        }
+        ProcNode::Root
+        | ProcNode::SysDir
+        | ProcNode::SysKernelDir
+        | ProcNode::SysFsDir
+        | ProcNode::PidDir(_) => Err(FsError::IsDir),
     }
 }
 
@@ -445,12 +526,20 @@ impl FileSystemBackend for ProcFs {
                 "." => Ok((SYS_DIR_INO, FsNodeKind::Directory)),
                 ".." => Ok((ROOT_INO, FsNodeKind::Directory)),
                 "kernel" => Ok((SYS_KERNEL_DIR_INO, FsNodeKind::Directory)),
+                "fs" => Ok((SYS_FS_DIR_INO, FsNodeKind::Directory)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::SysKernelDir => match component {
                 "." => Ok((SYS_KERNEL_DIR_INO, FsNodeKind::Directory)),
                 ".." => Ok((SYS_DIR_INO, FsNodeKind::Directory)),
                 "pid_max" => Ok((PID_MAX_INO, FsNodeKind::RegularFile)),
+                _ => Err(FsError::NotFound),
+            },
+            ProcNode::SysFsDir => match component {
+                "." => Ok((SYS_FS_DIR_INO, FsNodeKind::Directory)),
+                ".." => Ok((SYS_DIR_INO, FsNodeKind::Directory)),
+                "pipe-max-size" => Ok((PIPE_MAX_SIZE_INO, FsNodeKind::RegularFile)),
+                "pipe-user-pages-soft" => Ok((PIPE_USER_PAGES_SOFT_INO, FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::PidDir(pid) => match component {
@@ -503,7 +592,7 @@ impl FileSystemBackend for ProcFs {
 
     fn set_len(&mut self, _ino: u32, _len: u64) -> FsResult {
         match decode_node(_ino).ok_or(FsError::NotFound)? {
-            ProcNode::PidMax => Ok(()),
+            ProcNode::PidMax | ProcNode::PipeMaxSize => Ok(()),
             _ => Err(FsError::ReadOnly),
         }
     }
@@ -521,10 +610,12 @@ impl FileSystemBackend for ProcFs {
     fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
         let node = decode_node(ino).ok_or(FsError::NotFound)?;
         let mut stat = match node {
-            ProcNode::Root | ProcNode::SysDir | ProcNode::SysKernelDir | ProcNode::PidDir(_) => {
-                FileStat::with_mode(S_IFDIR | 0o555)
-            }
-            ProcNode::PidMax => FileStat::with_mode(S_IFREG | 0o644),
+            ProcNode::Root
+            | ProcNode::SysDir
+            | ProcNode::SysKernelDir
+            | ProcNode::SysFsDir
+            | ProcNode::PidDir(_) => FileStat::with_mode(S_IFDIR | 0o555),
+            ProcNode::PidMax | ProcNode::PipeMaxSize => FileStat::with_mode(S_IFREG | 0o644),
             _ => FileStat::with_mode(S_IFREG | 0o444),
         };
         stat.dev = 0x70726f63;
@@ -558,6 +649,7 @@ impl FileSystemBackend for ProcFs {
     fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize {
         match decode_node(ino) {
             Some(ProcNode::PidMax) => write_pid_max(buf, offset),
+            Some(ProcNode::PipeMaxSize) => write_pipe_max_size(buf, offset),
             _ => 0,
         }
     }
@@ -567,6 +659,7 @@ impl FileSystemBackend for ProcFs {
             ProcNode::Root => write_dir_entries(&root_entries(), offset, buf),
             ProcNode::SysDir => write_dir_entries(&sys_entries(), offset, buf),
             ProcNode::SysKernelDir => write_dir_entries(&sys_kernel_entries(), offset, buf),
+            ProcNode::SysFsDir => write_dir_entries(&sys_fs_entries(), offset, buf),
             ProcNode::PidDir(pid) => write_dir_entries(&pid_entries(pid), offset, buf),
             _ => Err(FsError::NotDir),
         }
