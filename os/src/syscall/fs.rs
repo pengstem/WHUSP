@@ -18,7 +18,7 @@ pub use mount::{sys_mount, sys_umount2};
 pub use path::{
     sys_chdir, sys_chroot, sys_faccessat, sys_faccessat2, sys_fchdir, sys_getcwd, sys_getdents64,
     sys_linkat, sys_mkdirat, sys_mknodat, sys_openat, sys_readlinkat, sys_renameat2, sys_symlinkat,
-    sys_truncate, sys_unlinkat, sys_utimensat,
+    sys_truncate, sys_umask, sys_unlinkat, sys_utimensat,
 };
 pub use poll::{sys_ppoll, sys_pselect6};
 pub use stat::{

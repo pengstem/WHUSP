@@ -1,5 +1,5 @@
 use super::super::devfs;
-use super::super::inode::OpenFlags;
+use super::super::inode::{link_node_in, OpenFlags};
 use super::super::mount::{mount_supports_page_cache, release_inode_from_drop, with_mount};
 use super::super::path::{PathContext, WorkingDir};
 use super::super::status_flags::StatusFlagsCell;
@@ -8,13 +8,18 @@ use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
 use crate::mm::{page_cache::PageCacheId, UserBuffer};
 use crate::sync::SleepMutex;
+use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 const VFS_WRITE_CHUNK_SIZE: usize = 64 * 1024;
 const MODE_PERMISSIONS_MASK: u32 = 0o7777;
 const MODE_SETGID: u32 = 0o2000;
+const TMPFILE_CREATE_ATTEMPTS: usize = 64;
+
+static TMPFILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FileCreateAttrs {
@@ -243,6 +248,95 @@ fn open_vfs_file_impl(
     )?))
 }
 
+fn create_tmpfile_inode(
+    directory: VfsPath,
+    flags: OpenFlags,
+    create_attrs: Option<FileCreateAttrs>,
+) -> FsResult<Arc<VfsFile>> {
+    if directory.kind != FsNodeKind::Directory {
+        return Err(FsError::NotDir);
+    }
+    let (_, writable) = flags.read_write();
+    if !writable {
+        return Err(FsError::InvalidInput);
+    }
+
+    let parent_stat = with_mount(directory.node.mount_id, |mount| {
+        mount.stat(directory.node.ino)
+    })
+    .ok_or(FsError::Io)??;
+    let (ino, leaf_name) = {
+        let mut created = None;
+        for _ in 0..TMPFILE_CREATE_ATTEMPTS {
+            let seq = TMPFILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let leaf_name = format!(".whusp-tmpfile-{seq:x}");
+            let result = with_mount(directory.node.mount_id, |mount| {
+                mount.create_file(directory.node.ino, leaf_name.as_str())
+            })
+            .ok_or(FsError::Io)?;
+            match result {
+                Ok(ino) => {
+                    created = Some((ino, leaf_name));
+                    break;
+                }
+                Err(FsError::AlreadyExists) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        created.ok_or(FsError::AlreadyExists)?
+    };
+
+    if let Some(attrs) = create_attrs {
+        let gid = if parent_stat.mode & MODE_SETGID != 0 {
+            parent_stat.gid
+        } else {
+            attrs.gid
+        };
+        with_mount(directory.node.mount_id, |mount| {
+            mount.set_owner(ino, Some(attrs.uid), Some(gid))
+        })
+        .ok_or(FsError::Io)??;
+        with_mount(directory.node.mount_id, |mount| {
+            mount.set_mode(ino, attrs.mode & MODE_PERMISSIONS_MASK)
+        })
+        .ok_or(FsError::Io)??;
+    }
+
+    let (readable, writable) = flags.read_write();
+    let file = Arc::new(VfsFile::new(
+        VfsPath::new(
+            VfsNodeId::new(directory.node.mount_id, ino),
+            FsNodeKind::RegularFile,
+        ),
+        readable,
+        writable,
+        OpenFlags::file_status_flags(flags),
+    )?);
+
+    match with_mount(directory.node.mount_id, |mount| {
+        mount.unlink(directory.node.ino, leaf_name.as_str())
+    })
+    .ok_or(FsError::Io)?
+    {
+        Ok(()) => Ok(file),
+        Err(err) => {
+            drop(file);
+            Err(err)
+        }
+    }
+}
+
+pub(crate) fn open_tmpfile_in_with_attrs(
+    context: PathContext,
+    name: &str,
+    flags: OpenFlags,
+    create_attrs: Option<FileCreateAttrs>,
+) -> FsResult<Arc<dyn File + Send + Sync>> {
+    let directory = vfs_path::resolve_existing_in(context, name, LookupMode::FollowFinal)?;
+    create_tmpfile_inode(directory, flags, create_attrs)
+        .map(|file| file as Arc<dyn File + Send + Sync>)
+}
+
 pub(crate) fn open_file(name: &str, flags: OpenFlags) -> FsResult<Arc<VfsFile>> {
     open_vfs_file_impl(PathContext::global_root(), name, flags, None)
 }
@@ -268,6 +362,17 @@ pub(crate) fn open_file_in_with_attrs(
     }
     open_vfs_file_impl(context, name, flags, create_attrs)
         .map(|file| file as Arc<dyn File + Send + Sync>)
+}
+
+pub(crate) fn link_open_file_in(
+    file: Arc<dyn File + Send + Sync>,
+    new_context: PathContext,
+    new_name: &str,
+) -> FsResult {
+    let Some(file) = file.as_any().downcast_ref::<VfsFile>() else {
+        return Err(FsError::CrossDevice);
+    };
+    link_node_in(file.node, file.kind, new_context, new_name)
 }
 
 pub(crate) fn stat_in(

@@ -2,7 +2,7 @@ use super::dirent::{write_dir_entries, RawDirEntry, DT_DIR, DT_LNK, DT_REG};
 use super::mount;
 use super::pipe::{PIPE_MAX_CAPACITY, PIPE_MIN_CAPACITY};
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
-use super::{FileStat, FileTimestamp, S_IFDIR, S_IFREG};
+use super::{FileStat, FileTimestamp, S_IFDIR, S_IFLNK, S_IFREG};
 use crate::config::PAGE_SIZE;
 use crate::mm::frame_stats;
 use crate::task::{list_process_snapshots, pid2process, ProcessProcSnapshot};
@@ -64,6 +64,7 @@ enum ProcNode {
     PidStatus(usize),
     PidCmdline(usize),
     PidFdDir(usize),
+    PidFdEntry(usize, usize),
     PidMaps(usize),
 }
 
@@ -109,6 +110,17 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         SYS_FS_DIR_INO => Some(ProcNode::SysFsDir),
         PIPE_MAX_SIZE_INO => Some(ProcNode::PipeMaxSize),
         PIPE_USER_PAGES_SOFT_INO => Some(ProcNode::PipeUserPagesSoft),
+        ino if ino >= PID_FD_ENTRY_BASE => {
+            let rel = ino - PID_FD_ENTRY_BASE;
+            let pid = (rel / PID_FD_ENTRY_STRIDE) as usize;
+            let fd = (rel % PID_FD_ENTRY_STRIDE) as usize;
+            let process = pid2process(pid)?;
+            let fd_exists = {
+                let inner = process.inner_exclusive_access();
+                inner.fd_table.get(fd).is_some_and(Option::is_some)
+            };
+            fd_exists.then_some(ProcNode::PidFdEntry(pid, fd))
+        }
         ino if ino >= PID_FILE_BASE => {
             let rel = ino - PID_FILE_BASE;
             let pid = (rel / PID_FILE_STRIDE) as usize;
@@ -141,6 +153,7 @@ fn node_kind(node: ProcNode) -> FsNodeKind {
         | ProcNode::SysFsDir
         | ProcNode::PidDir(_)
         | ProcNode::PidFdDir(_) => FsNodeKind::Directory,
+        ProcNode::PidFdEntry(_, _) => FsNodeKind::Symlink,
         _ => FsNodeKind::RegularFile,
     }
 }
@@ -526,6 +539,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::PidCmdline(pid) => lookup_process(pid)
             .map(pid_cmdline_content)
             .ok_or(FsError::NotFound),
+        ProcNode::PidFdEntry(_, _) => Err(FsError::InvalidInput),
         ProcNode::PidMaps(pid) => pid2process(pid)
             .map(|process| process.proc_maps_content().into_bytes())
             .ok_or(FsError::NotFound),
@@ -621,7 +635,18 @@ impl FileSystemBackend for ProcFs {
             ProcNode::PidFdDir(pid) => match component {
                 "." => Ok((pid_file_ino(pid, PID_FD_DIR_OFFSET), FsNodeKind::Directory)),
                 ".." => Ok((pid_dir_ino(pid), FsNodeKind::Directory)),
-                _ => Err(FsError::NotFound),
+                _ => {
+                    let fd = parse_pid(component).ok_or(FsError::NotFound)?;
+                    let process = pid2process(pid).ok_or(FsError::NotFound)?;
+                    let fd_exists = {
+                        let inner = process.inner_exclusive_access();
+                        inner.fd_table.get(fd).is_some_and(Option::is_some)
+                    };
+                    if !fd_exists {
+                        return Err(FsError::NotFound);
+                    }
+                    Ok((pid_fd_entry_ino(pid, fd), FsNodeKind::Symlink))
+                }
             },
             _ => Err(FsError::NotDir),
         }
@@ -683,6 +708,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::SysFsDir
             | ProcNode::PidDir(_)
             | ProcNode::PidFdDir(_) => FileStat::with_mode(S_IFDIR | 0o555),
+            ProcNode::PidFdEntry(_, _) => FileStat::with_mode(S_IFLNK | 0o777),
             ProcNode::PidMax | ProcNode::PipeMaxSize => FileStat::with_mode(S_IFREG | 0o644),
             _ => FileStat::with_mode(S_IFREG | 0o444),
         };
@@ -697,8 +723,26 @@ impl FileSystemBackend for ProcFs {
         Ok(stat)
     }
 
-    fn readlink(&mut self, _ino: u32, _buf: &mut [u8]) -> FsResult<usize> {
-        Err(FsError::InvalidInput)
+    fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
+        let ProcNode::PidFdEntry(pid, fd) = decode_node(ino).ok_or(FsError::NotFound)? else {
+            return Err(FsError::InvalidInput);
+        };
+        let process = pid2process(pid).ok_or(FsError::NotFound)?;
+        let target = {
+            let inner = process.inner_exclusive_access();
+            let entry = inner
+                .fd_table
+                .get(fd)
+                .and_then(Option::as_ref)
+                .ok_or(FsError::NotFound)?;
+            entry
+                .dir_path()
+                .map(String::from)
+                .unwrap_or_else(|| format!("/proc/{pid}/fd/{fd} (deleted)"))
+        };
+        let len = target.len().min(buf.len());
+        buf[..len].copy_from_slice(&target.as_bytes()[..len]);
+        Ok(len)
     }
 
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {

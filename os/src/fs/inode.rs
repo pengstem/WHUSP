@@ -7,8 +7,7 @@ use bitflags::*;
 use lwext4_rust::ffi::EXT4_ROOT_INO;
 
 // UNFINISHED: Linux open/openat define additional status and creation flags
-// such as O_TMPFILE and O_ASYNC. This kernel accepts only the flags
-// represented below.
+// such as O_ASYNC. This kernel accepts only the flags represented below.
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct OpenFlags: u32 {
@@ -30,6 +29,7 @@ bitflags! {
         const CLOEXEC = 0o2000000;
         const SYNC = 0o4010000;
         const PATH = 0o10000000;
+        const TMPFILE = 0o20200000;
     }
 }
 
@@ -37,6 +37,7 @@ impl OpenFlags {
     const ACCESS_MODE_MASK: u32 = 0b11;
     const FCNTL_MUTABLE_STATUS_MASK: u32 =
         OpenFlags::APPEND.bits() | OpenFlags::NONBLOCK.bits() | OpenFlags::DIRECT.bits();
+    const TMPFILE_BASE_MASK: u32 = OpenFlags::TMPFILE.bits() & !OpenFlags::DIRECTORY.bits();
     // CONTEXT: O_DSYNC/O_SYNC are accepted for libc/LTP compatibility even
     // though this filesystem layer does not yet provide synchronous writeback
     // semantics beyond its existing fsync path.
@@ -63,6 +64,10 @@ impl OpenFlags {
 
     pub fn can_open_directory(&self) -> bool {
         !self.writable_target() && !self.contains(Self::CREATE) && !self.contains(Self::TRUNC)
+    }
+
+    pub fn has_tmpfile_base_bit(&self) -> bool {
+        self.bits() & Self::TMPFILE_BASE_MASK != 0
     }
 
     pub fn file_status_flags(flags: Self) -> Self {
@@ -260,6 +265,47 @@ pub(crate) fn link_file_in(
     }
     if old_kind == FsNodeKind::Directory || old_node.ino == EXT4_ROOT_INO {
         return Err(FsError::PermissionDenied);
+    }
+    with_mount(new_target.parent.mount_id, |mount| {
+        match mount.lookup_component_from(new_target.parent.ino, new_target.leaf_name) {
+            Ok((_, kind)) => {
+                if new_has_trailing_slash && kind != FsNodeKind::Directory {
+                    return Err(FsError::NotDir);
+                }
+                return Err(FsError::AlreadyExists);
+            }
+            Err(FsError::NotFound) => {
+                if new_has_trailing_slash {
+                    return Err(FsError::NotFound);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+        mount.link(new_target.parent.ino, new_target.leaf_name, old_node.ino)
+    })
+    .ok_or(FsError::Io)??;
+    Ok(())
+}
+
+pub(crate) fn link_node_in(
+    old_node: VfsNodeId,
+    old_kind: FsNodeKind,
+    new_context: PathContext,
+    new_name: &str,
+) -> FsResult {
+    if old_kind == FsNodeKind::Directory || old_node.ino == EXT4_ROOT_INO {
+        return Err(FsError::PermissionDenied);
+    }
+    match final_component(new_name) {
+        None => return Err(FsError::NotFound),
+        Some("." | ".." | "/") => return Err(FsError::AlreadyExists),
+        _ => {}
+    }
+
+    let new_has_trailing_slash = has_trailing_slash(new_name);
+    let new_target = resolve_create_parent_in(new_context, trimmed_nonroot_path(new_name))?;
+    if old_node.mount_id != new_target.parent.mount_id {
+        return Err(FsError::CrossDevice);
     }
     with_mount(new_target.parent.mount_id, |mount| {
         match mount.lookup_component_from(new_target.parent.ino, new_target.leaf_name) {

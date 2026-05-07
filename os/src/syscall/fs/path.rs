@@ -7,15 +7,16 @@ use super::super::user_ptr::{
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::stat::resolve_stat_from;
 use super::uapi::{
-    AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, F_OK, RENAME_EXCHANGE,
-    RENAME_NOREPLACE, RENAME_WHITEOUT, R_OK, UTIME_NOW, UTIME_OMIT, VALID_ACCESS_MODE,
-    VALID_FACCESSAT2_FLAGS, VALID_FACCESSAT_FLAGS, VALID_RENAME_FLAGS, VALID_UTIMENSAT_FLAGS, W_OK,
-    X_OK,
+    AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+    F_OK, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, R_OK, UTIME_NOW, UTIME_OMIT,
+    VALID_ACCESS_MODE, VALID_FACCESSAT2_FLAGS, VALID_FACCESSAT_FLAGS, VALID_LINKAT_FLAGS,
+    VALID_RENAME_FLAGS, VALID_UTIMENSAT_FLAGS, W_OK, X_OK,
 };
 use crate::fs::{
-    chown_in, create_node_in, link_file_in, lookup_dir_in, lookup_dir_with_stat_in, mkdir_in,
-    mount_is_read_only, normalize_path_at_root, open_devfs_child, open_devfs_misc_child,
-    open_file_in, open_file_in_with_attrs, open_static_path, path_inside_root, rename_in, rmdir_in,
+    chown_in, create_node_in, link_file_in, link_open_file_in, lookup_dir_in,
+    lookup_dir_with_stat_in, mkdir_in, mount_is_read_only, normalize_path_at_root,
+    open_devfs_child, open_devfs_misc_child, open_file_in, open_file_in_with_attrs,
+    open_static_path, open_tmpfile_in_with_attrs, path_inside_root, rename_in, rmdir_in,
     symlink_in, truncate_in, unlink_file_in, File, FileCreateAttrs, FileStat, FileTimestamp,
     FsNodeKind, MountId, OpenFlags, PathContext, WorkingDir, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
     S_IFMT, S_IFREG, S_IFSOCK,
@@ -319,6 +320,14 @@ fn openat_dir_path(snapshot: &PathSnapshot, dirfd: isize, path: &str) -> SysResu
         .and_then(|base_path| normalize_path_at_root(snapshot.root_path.as_str(), base_path, path)))
 }
 
+fn parse_proc_self_fd_path(path: &str) -> Option<usize> {
+    let fd_text = path.strip_prefix("/proc/self/fd/")?;
+    if fd_text.is_empty() || fd_text.contains('/') {
+        return None;
+    }
+    fd_text.parse().ok()
+}
+
 fn install_open_file(
     file: Arc<dyn File + Send + Sync>,
     flags: OpenFlags,
@@ -361,6 +370,12 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> SysRe
     if flags.bits() & 0b11 == 0b11 {
         return Err(SysError::EINVAL);
     }
+    if flags.has_tmpfile_base_bit() && !flags.contains(OpenFlags::TMPFILE) {
+        return Err(SysError::EINVAL);
+    }
+    if flags.contains(OpenFlags::TMPFILE) && !flags.read_write().1 {
+        return Err(SysError::EINVAL);
+    }
     let snapshot = current_process().path_snapshot();
     if let Some(file) = open_devfs_child_from_dirfd(dirfd, path.as_str(), flags)? {
         return install_open_file(file, flags, None);
@@ -373,7 +388,8 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> SysRe
         return install_open_file(file, flags, None);
     }
     let context = path_context_from(&snapshot, dirfd, path.as_str())?;
-    let credentials = current_process().credentials();
+    let process = current_process();
+    let credentials = process.credentials();
     let subject = AccessSubject {
         uid: credentials.fsuid,
         gid: credentials.fsgid,
@@ -381,16 +397,16 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> SysRe
     };
     check_access_path_prefixes_from(&snapshot, dirfd, path.as_str(), subject)?;
     check_open_existing_access_from(&snapshot, dirfd, path.as_str(), flags, subject)?;
-    let file = open_file_in_with_attrs(
-        context,
-        path.as_str(),
-        flags,
-        Some(FileCreateAttrs {
-            uid: credentials.fsuid,
-            gid: credentials.fsgid,
-            mode,
-        }),
-    )?;
+    let create_attrs = Some(FileCreateAttrs {
+        uid: credentials.fsuid,
+        gid: credentials.fsgid,
+        mode: mode & !process.umask(),
+    });
+    let file = if flags.contains(OpenFlags::TMPFILE) {
+        open_tmpfile_in_with_attrs(context, path.as_str(), flags, create_attrs)?
+    } else {
+        open_file_in_with_attrs(context, path.as_str(), flags, create_attrs)?
+    };
     install_open_file(file, flags, dir_path)
 }
 
@@ -626,8 +642,9 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> SysResult {
     let path = read_user_c_string(token, path, PATH_MAX)?;
     let snapshot = current_process().path_snapshot();
     let context = path_context_from(&snapshot, dirfd, path.as_str())?;
-    mkdir_in(context, path.as_str(), mode)?;
-    let credentials = current_process().credentials();
+    let process = current_process();
+    mkdir_in(context, path.as_str(), mode & !process.umask())?;
+    let credentials = process.credentials();
     chown_in(
         context,
         path.as_str(),
@@ -662,14 +679,15 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, dev: u64) -> SysRes
         _ => return Err(SysError::EINVAL),
     };
 
-    let snapshot = current_process().path_snapshot();
+    let process = current_process();
+    let snapshot = process.path_snapshot();
     let context = path_context_from(&snapshot, dirfd, path.as_str())?;
-    let credentials = current_process().credentials();
+    let credentials = process.credentials();
     create_node_in(
         context,
         path.as_str(),
         kind,
-        mode,
+        mode & !process.umask(),
         credentials.fsuid,
         credentials.fsgid,
         dev,
@@ -698,6 +716,10 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> SysResult {
     Ok(0)
 }
 
+pub fn sys_umask(mask: u32) -> SysResult {
+    Ok(current_process().set_umask(mask) as isize)
+}
+
 pub fn sys_linkat(
     olddirfd: isize,
     oldpath: *const u8,
@@ -705,8 +727,7 @@ pub fn sys_linkat(
     newpath: *const u8,
     flags: u32,
 ) -> SysResult {
-    // UNFINISHED: Linux linkat supports AT_SYMLINK_FOLLOW and AT_EMPTY_PATH; this kernel currently implements pathname hard links only.
-    if flags != 0 {
+    if flags & !VALID_LINKAT_FLAGS != 0 {
         return Err(SysError::EINVAL);
     }
 
@@ -714,6 +735,20 @@ pub fn sys_linkat(
     let oldpath = read_user_c_string(token, oldpath, PATH_MAX)?;
     let newpath = read_user_c_string(token, newpath, PATH_MAX)?;
     let snapshot = current_process().path_snapshot();
+    if flags & AT_SYMLINK_FOLLOW != 0
+        && let Some(fd) = parse_proc_self_fd_path(oldpath.as_str())
+    {
+        let file = get_file_by_fd(fd)?;
+        link_open_file_in(
+            file,
+            path_context_from(&snapshot, newdirfd, newpath.as_str())?,
+            newpath.as_str(),
+        )?;
+        return Ok(0);
+    }
+    // UNFINISHED: Linux linkat also supports general AT_SYMLINK_FOLLOW and
+    // AT_EMPTY_PATH behavior. This kernel implements pathname hard links plus
+    // the proc-fd follow path required for linking O_TMPFILE descriptors.
     link_file_in(
         path_context_from(&snapshot, olddirfd, oldpath.as_str())?,
         oldpath.as_str(),

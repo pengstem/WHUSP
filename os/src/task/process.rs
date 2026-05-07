@@ -356,6 +356,7 @@ pub struct ProcessControlBlockInner {
     pub children: Vec<Arc<ProcessControlBlock>>,
     pub exit_code: i32,
     pub fd_table: Vec<Option<FdTableEntry>>,
+    pub umask: u32,
     // UNFINISHED: Linux kernel credentials are per-thread, while POSIX
     // user-space expects process-wide synchronization. This first contest
     // compatibility model keeps credentials on the PCB and shares them across
@@ -578,6 +579,17 @@ impl ProcessControlBlock {
 
     pub fn credentials(&self) -> Credentials {
         self.inner_exclusive_access().credentials.clone()
+    }
+
+    pub fn umask(&self) -> u32 {
+        self.inner_exclusive_access().umask
+    }
+
+    pub fn set_umask(&self, mask: u32) -> u32 {
+        let mut inner = self.inner_exclusive_access();
+        let previous = inner.umask;
+        inner.umask = mask & 0o777;
+        previous
     }
 
     pub fn replace_supplementary_groups(&self, groups: Vec<u32>) {

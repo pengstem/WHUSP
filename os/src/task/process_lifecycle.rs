@@ -1,4 +1,4 @@
-use super::exec::{ExecStackInfo, init_user_stack};
+use super::exec::{init_user_stack, ExecStackInfo};
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
 use super::process::{
@@ -6,12 +6,12 @@ use super::process::{
     ProcessResourceLimits,
 };
 use super::{
-    CloneArgs, CloneFlags, FdTableEntry, SignalAction, TaskControlBlock, add_task, pid_alloc,
+    add_task, pid_alloc, CloneArgs, CloneFlags, FdTableEntry, SignalAction, TaskControlBlock,
 };
 use crate::fs::{OpenFlags, Stdin, Stdout, WorkingDir};
-use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet};
+use crate::mm::{ElfLoadInfo, MemorySet, KERNEL_SPACE};
 use crate::sync::UPIntrFreeCell;
-use crate::trap::{TrapContext, trap_handler};
+use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -91,6 +91,7 @@ impl ProcessControlBlock {
                             OpenFlags::WRONLY,
                         )),
                     ],
+                    umask: 0,
                     credentials: Credentials::root(),
                     resource_limits: ProcessResourceLimits::new(),
                     membarrier_private_expedited_registered: false,
@@ -150,6 +151,7 @@ impl ProcessControlBlock {
         let memory_set = MemorySet::from_existed_user(&parent.memory_set);
         let pid = pid_alloc();
         let new_fd_table = parent.fd_table.clone();
+        let umask = parent.umask;
         let credentials = parent.credentials.clone();
         let resource_limits = parent.resource_limits;
         let membarrier_private_expedited_registered =
@@ -185,6 +187,7 @@ impl ProcessControlBlock {
                     children: Vec::new(),
                     exit_code: 0,
                     fd_table: new_fd_table,
+                    umask,
                     credentials,
                     resource_limits,
                     membarrier_private_expedited_registered,
