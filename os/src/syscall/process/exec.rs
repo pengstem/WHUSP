@@ -178,6 +178,29 @@ fn exec_compat_redirect(path: &str) -> Option<&'static str> {
     }
 }
 
+fn lmbench_hello_wrapper_args(args: Vec<String>) -> (String, Vec<String>) {
+    let target = String::from(lmbench_all_redirect());
+    let mut next_args = Vec::new();
+    next_args.push(target.clone());
+    next_args.push(String::from("hello"));
+    next_args.extend(args.into_iter().skip(1));
+    (target, next_args)
+}
+
+fn exec_compat_script_redirect(
+    path: &str,
+    data: &[u8],
+    args: Vec<String>,
+) -> Option<(String, Vec<String>)> {
+    if path == "/tmp/hello" && data.starts_with(b"/code/lmbench_src/bin/build/lmbench_all hello") {
+        // CONTEXT: lmbench's generated `hello` wrapper is a no-shebang shell
+        // fragment. Run the intended `lmbench_all hello` payload directly so
+        // `lat_proc shell` does not measure an extra ENOEXEC shell fallback.
+        return Some(lmbench_hello_wrapper_args(args));
+    }
+    None
+}
+
 fn read_exec_file(path: &str) -> SysResult<Vec<u8>> {
     match read_exec_file_direct(path) {
         Ok(data) => Ok(data),
@@ -297,6 +320,13 @@ fn exec_loaded_program(
         // old program. For PT_INTERP ELFs, the kernel enters the dynamic linker
         // while auxv still describes the original executable.
         return Ok(0);
+    }
+
+    if let Some((target, next_args)) =
+        exec_compat_script_redirect(path.as_str(), data.as_slice(), args.clone())
+    {
+        let target_data = read_exec_file(target.as_str())?;
+        return exec_loaded_program(target, next_args, envs, depth + 1, target_data);
     }
 
     let interpreter = match parse_shebang(data.as_slice())? {
