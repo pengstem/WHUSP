@@ -128,6 +128,11 @@ impl RecordLockTable {
         self.locks = next;
     }
 
+    fn release_for_process_file(&mut self, key: LockKey, pid: usize) {
+        self.locks
+            .retain(|lock| !(lock.key == key && lock.pid == pid));
+    }
+
     fn merge_adjacent(&mut self) {
         self.locks
             .sort_by_key(|lock| (lock.key, lock.pid, lock.l_type, lock.start, lock.end));
@@ -273,4 +278,15 @@ pub(super) fn fcntl_setlk(entry: FdTableEntry, lock: *const LinuxFlock) -> SysRe
         .exclusive_access()
         .set_lock(key, pid, flock.l_type, start, end)?;
     Ok(0)
+}
+
+pub(super) fn release_record_locks_for_close(entry: &FdTableEntry) {
+    let file = entry.file();
+    let Ok(key) = lock_key(&file) else {
+        return;
+    };
+    let pid = current_process().getpid();
+    RECORD_LOCK_TABLE
+        .exclusive_access()
+        .release_for_process_file(key, pid);
 }

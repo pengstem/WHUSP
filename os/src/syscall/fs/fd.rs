@@ -8,7 +8,7 @@ use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{translated_byte_buffer_checked, UserBufferAccess};
-use super::fd_lock::{fcntl_getlk, fcntl_setlk};
+use super::fd_lock::{fcntl_getlk, fcntl_setlk, release_record_locks_for_close};
 
 const F_DUPFD: usize = 0;
 const F_GETFD: usize = 1;
@@ -52,6 +52,7 @@ pub fn sys_close(fd: usize) -> SysResult {
         };
         entry
     };
+    release_record_locks_for_close(&entry);
     drop(entry);
     Ok(0)
 }
