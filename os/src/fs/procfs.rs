@@ -1,11 +1,11 @@
-use super::dirent::{DT_DIR, DT_LNK, DT_REG, RawDirEntry, write_dir_entries};
+use super::dirent::{write_dir_entries, RawDirEntry, DT_DIR, DT_LNK, DT_REG};
 use super::mount;
 use super::pipe::PIPE_BUFFER_SIZE;
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
 use super::{FileStat, FileTimestamp, S_IFDIR, S_IFREG};
 use crate::config::PAGE_SIZE;
 use crate::mm::frame_stats;
-use crate::task::{ProcessProcSnapshot, list_process_snapshots, pid2process};
+use crate::task::{list_process_snapshots, pid2process, ProcessProcSnapshot};
 use crate::timer::{get_time_us, us_to_clock_ticks};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -30,6 +30,7 @@ const PID_STAT_OFFSET: u32 = 0;
 const PID_STATUS_OFFSET: u32 = 1;
 const PID_CMDLINE_OFFSET: u32 = 2;
 const PID_FD_DIR_OFFSET: u32 = 3;
+const PID_MAPS_OFFSET: u32 = 4;
 const PID_FD_ENTRY_BASE: u32 = 1_000_000;
 const PID_FD_ENTRY_STRIDE: u32 = 4096;
 const DEFAULT_PID_MAX: usize = 4_194_304;
@@ -63,6 +64,7 @@ enum ProcNode {
     PidStatus(usize),
     PidCmdline(usize),
     PidFdDir(usize),
+    PidMaps(usize),
 }
 
 impl ProcFs {
@@ -119,6 +121,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
                 PID_STATUS_OFFSET => Some(ProcNode::PidStatus(pid)),
                 PID_CMDLINE_OFFSET => Some(ProcNode::PidCmdline(pid)),
                 PID_FD_DIR_OFFSET => Some(ProcNode::PidFdDir(pid)),
+                PID_MAPS_OFFSET => Some(ProcNode::PidMaps(pid)),
                 _ => None,
             }
         }
@@ -290,6 +293,11 @@ fn pid_entries(pid: usize) -> Vec<RawDirEntry> {
         ino: pid_file_ino(pid, PID_FD_DIR_OFFSET),
         name: "fd".into(),
         dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_MAPS_OFFSET),
+        name: "maps".into(),
+        dtype: DT_REG,
     });
     entries
 }
@@ -517,6 +525,9 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::PidCmdline(pid) => lookup_process(pid)
             .map(pid_cmdline_content)
             .ok_or(FsError::NotFound),
+        ProcNode::PidMaps(pid) => pid2process(pid)
+            .map(|process| process.proc_maps_content().into_bytes())
+            .ok_or(FsError::NotFound),
         ProcNode::Root
         | ProcNode::SysDir
         | ProcNode::SysKernelDir
@@ -602,10 +613,8 @@ impl FileSystemBackend for ProcFs {
                     pid_file_ino(pid, PID_CMDLINE_OFFSET),
                     FsNodeKind::RegularFile,
                 )),
-                "fd" => Ok((
-                    pid_file_ino(pid, PID_FD_DIR_OFFSET),
-                    FsNodeKind::Directory,
-                )),
+                "fd" => Ok((pid_file_ino(pid, PID_FD_DIR_OFFSET), FsNodeKind::Directory)),
+                "maps" => Ok((pid_file_ino(pid, PID_MAPS_OFFSET), FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::PidFdDir(pid) => match component {

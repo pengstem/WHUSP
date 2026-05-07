@@ -146,6 +146,7 @@ fn sys_mmap_impl(
     let fixed = flags & MAP_FIXED != 0;
     let writable = prot & PROT_WRITE != 0;
     let permission = prot_to_map_permission(prot);
+    let reported_permission = prot_to_reported_map_permission(prot);
     if fixed && addr % PAGE_SIZE != 0 {
         return Err(SysError::EINVAL);
     }
@@ -187,6 +188,7 @@ fn sys_mmap_impl(
                 addr,
                 len,
                 permission,
+                reported_permission,
                 backing_file,
                 file_size,
                 offset,
@@ -208,6 +210,7 @@ fn sys_mmap_impl(
         .mmap_area(
             len,
             permission,
+            reported_permission,
             backing_file,
             file_size,
             offset,
@@ -238,7 +241,12 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> SysResult {
     let mut inner = process.inner_exclusive_access();
     inner
         .memory_set
-        .mprotect_area(addr, len, prot_to_map_permission(prot))
+        .mprotect_area(
+            addr,
+            len,
+            prot_to_map_permission(prot),
+            prot_to_reported_map_permission(prot),
+        )
         .map_err(|err| match err {
             MemoryProtectError::Unmapped => SysError::ENOMEM,
             MemoryProtectError::AccessDenied => SysError::EACCES,
@@ -325,6 +333,20 @@ fn prot_to_map_permission(prot: usize) -> MapPermission {
         permission |= MapPermission::R;
     }
     if writable {
+        permission |= MapPermission::W;
+    }
+    if prot & PROT_EXEC != 0 {
+        permission |= MapPermission::X;
+    }
+    permission
+}
+
+fn prot_to_reported_map_permission(prot: usize) -> MapPermission {
+    let mut permission = MapPermission::U;
+    if prot & PROT_READ != 0 {
+        permission |= MapPermission::R;
+    }
+    if prot & PROT_WRITE != 0 {
         permission |= MapPermission::W;
     }
     if prot & PROT_EXEC != 0 {

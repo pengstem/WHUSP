@@ -262,6 +262,7 @@ impl MemorySet {
         &mut self,
         len: usize,
         permission: MapPermission,
+        reported_permission: MapPermission,
         backing_file: Option<Arc<dyn File + Send + Sync>>,
         file_size: usize,
         file_offset: usize,
@@ -276,6 +277,7 @@ impl MemorySet {
         area.mmap_info = Some(MmapInfo {
             shared,
             writable,
+            reported_perm: reported_permission,
             len,
             file_offset,
             file_size,
@@ -293,6 +295,7 @@ impl MemorySet {
         start: usize,
         len: usize,
         permission: MapPermission,
+        reported_permission: MapPermission,
         backing_file: Option<Arc<dyn File + Send + Sync>>,
         file_size: usize,
         file_offset: usize,
@@ -329,6 +332,7 @@ impl MemorySet {
         area.mmap_info = Some(MmapInfo {
             shared,
             writable,
+            reported_perm: reported_permission,
             len,
             file_offset,
             file_size,
@@ -559,6 +563,7 @@ impl MemorySet {
         start: usize,
         len: usize,
         permission: MapPermission,
+        reported_permission: MapPermission,
     ) -> Result<(), MemoryProtectError> {
         if len == 0 {
             return Ok(());
@@ -587,7 +592,7 @@ impl MemorySet {
             let area_start = area.vpn_range.get_start();
             let area_end = area.vpn_range.get_end();
             if area_start >= start_vpn && area_end <= end_vpn {
-                if !area.remap_permission(&mut self.page_table, permission) {
+                if !area.remap_permission(&mut self.page_table, permission, reported_permission) {
                     return Err(MemoryProtectError::Unmapped);
                 }
                 touched = true;

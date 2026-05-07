@@ -6,7 +6,7 @@ use super::{
 use crate::arch::mm as arch_mm;
 use crate::config::PAGE_SIZE;
 use crate::fs::File;
-use crate::mm::page_cache::{PAGE_CACHE, PageCacheId, PageCacheKey};
+use crate::mm::page_cache::{PageCacheId, PageCacheKey, PAGE_CACHE};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -36,6 +36,7 @@ impl MmapFlush {
 pub(super) struct MmapInfo {
     pub(super) shared: bool,
     pub(super) writable: bool,
+    pub(super) reported_perm: MapPermission,
     pub(super) len: usize,
     pub(super) file_offset: usize,
     pub(super) file_size: usize,
@@ -79,6 +80,7 @@ impl MmapInfo {
         let right = Self {
             shared: self.shared,
             writable: self.writable,
+            reported_perm: self.reported_perm,
             len: self.len.saturating_sub(offset),
             file_offset: self.file_offset + offset,
             file_size: self.file_size,
@@ -162,6 +164,7 @@ impl MapArea {
         &mut self,
         page_table: &mut PageTable,
         permission: MapPermission,
+        reported_permission: MapPermission,
     ) -> bool {
         let pte_flags = PTEFlags::from_bits_truncate(permission.bits());
         if self.is_mmap() {
@@ -172,6 +175,7 @@ impl MapArea {
             }
             if let Some(info) = &mut self.mmap_info {
                 info.writable = permission.contains(MapPermission::W);
+                info.reported_perm = reported_permission;
                 let mut page_cache_pte_flags = pte_flags;
                 if info.shared && info.writable {
                     page_cache_pte_flags.remove(PTEFlags::W);

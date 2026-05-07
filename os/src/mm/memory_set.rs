@@ -1,9 +1,20 @@
 use super::{
-    MapArea, MapPermission, MapType, MmapFlush, PageTable, PageTableEntry, VirtAddr, VirtPageNum,
-    page_table::PTEFlags,
+    page_table::PTEFlags, MapArea, MapPermission, MapType, MmapFlush, PageTable, PageTableEntry,
+    VirtAddr, VirtPageNum,
 };
 use crate::arch::mm as arch_mm;
 use alloc::vec::Vec;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MemoryMapEntry {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) readable: bool,
+    pub(crate) writable: bool,
+    pub(crate) executable: bool,
+    pub(crate) shared: bool,
+    pub(crate) offset: usize,
+}
 
 // TODO: replace vec to a high perfermonce data structure
 pub struct MemorySet {
@@ -98,6 +109,33 @@ impl MemorySet {
         }
         self.areas.clear();
         flushes
+    }
+
+    pub(crate) fn proc_maps_entries(&self) -> Vec<MemoryMapEntry> {
+        let mut entries: Vec<_> = self
+            .areas
+            .iter()
+            .map(|area| {
+                let start_va: VirtAddr = area.vpn_range.get_start().into();
+                let end_va: VirtAddr = area.vpn_range.get_end().into();
+                let reported_perm = area
+                    .mmap_info
+                    .as_ref()
+                    .map_or(area.map_perm, |info| info.reported_perm);
+                MemoryMapEntry {
+                    start: usize::from(start_va),
+                    end: usize::from(end_va),
+                    readable: reported_perm.contains(MapPermission::R),
+                    writable: reported_perm.contains(MapPermission::W),
+                    executable: reported_perm.contains(MapPermission::X),
+                    shared: area.mmap_info.as_ref().is_some_and(|info| info.shared)
+                        || area.is_shm(),
+                    offset: area.mmap_info.as_ref().map_or(0, |info| info.file_offset),
+                }
+            })
+            .collect();
+        entries.sort_by_key(|entry| entry.start);
+        entries
     }
 }
 

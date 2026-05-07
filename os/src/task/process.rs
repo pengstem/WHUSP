@@ -1,12 +1,13 @@
 use super::id::RecycleAllocator;
 use super::{
-    FD_LIMIT, FdTableEntry, PidHandle, SIGNAL_INFO_SLOTS, SignalAction, TaskControlBlock,
-    TaskStatus,
+    FdTableEntry, PidHandle, SignalAction, TaskControlBlock, TaskStatus, FD_LIMIT,
+    SIGNAL_INFO_SLOTS,
 };
 use crate::config::USER_STACK_SIZE;
 use crate::fs::{PathContext, WorkingDir};
 use crate::mm::MemorySet;
 use crate::sync::{UPIntrFreeCell, UPIntrRefMut};
+use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -519,6 +520,26 @@ impl ProcessControlBlock {
             credentials: inner.credentials.clone(),
             thread_count: inner.thread_count(),
         }
+    }
+
+    pub(crate) fn proc_maps_content(&self) -> String {
+        let entries = {
+            let inner = self.inner_exclusive_access();
+            inner.memory_set.proc_maps_entries()
+        };
+        let mut output = String::new();
+        for entry in entries {
+            let mut perms = String::new();
+            perms.push(if entry.readable { 'r' } else { '-' });
+            perms.push(if entry.writable { 'w' } else { '-' });
+            perms.push(if entry.executable { 'x' } else { '-' });
+            perms.push(if entry.shared { 's' } else { 'p' });
+            output.push_str(&format!(
+                "{:x}-{:x} {} {:08x} 00:00 0\n",
+                entry.start, entry.end, perms, entry.offset
+            ));
+        }
+        output
     }
 
     pub fn mark_user_time_entry(&self, now_us: usize) {
