@@ -14,7 +14,7 @@ mod stdio;
 mod tmpfs;
 mod vfs;
 
-use crate::mm::{page_cache::PageCacheId, UserBuffer};
+use crate::mm::{UserBuffer, page_cache::PageCacheId};
 use bitflags::bitflags;
 use core::any::Any;
 
@@ -23,8 +23,11 @@ const DEFAULT_BLOCK_SIZE: u32 = 4096;
 pub const S_IFIFO: u32 = 0o010000;
 pub const S_IFCHR: u32 = 0o020000;
 pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFBLK: u32 = 0o060000;
 pub const S_IFREG: u32 = 0o100000;
 pub const S_IFLNK: u32 = 0o120000;
+pub const S_IFSOCK: u32 = 0o140000;
+pub const S_IFMT: u32 = 0o170000;
 
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,23 +217,23 @@ pub(crate) use devfs::{
 };
 pub use inode::OpenFlags;
 pub(crate) use inode::{
-    link_file_in, lookup_mount_target_dir_in, mkdir_in, rename_in, rmdir_in, symlink_in,
-    unlink_file_in,
+    create_node_in, link_file_in, lookup_mount_target_dir_in, mkdir_in, rename_in, rmdir_in,
+    symlink_in, unlink_file_in,
 };
 pub(crate) use mount::{
-    mount_block_device_at, mount_fat_device_at, mount_is_read_only, mount_tmpfs_at, remount_at,
-    statfs_for_mount, unmount_at, MountError, MountId,
+    MountError, MountId, mount_block_device_at, mount_fat_device_at, mount_is_read_only,
+    mount_tmpfs_at, remount_at, statfs_for_mount, unmount_at,
 };
-pub(crate) use path::{normalize_path_at_root, path_inside_root, PathContext, WorkingDir};
+pub(crate) use path::{PathContext, WorkingDir, normalize_path_at_root, path_inside_root};
 pub use pipe::make_pipe;
 pub(crate) use procfs::pipe_max_size;
 pub(crate) use staticfs::{open_path as open_static_path, stat_path as stat_static_path};
 pub use stdio::{Stdin, Stdout};
 pub(crate) use vfs::open_file;
 pub(crate) use vfs::{
-    chmod_in, chown_in, lookup_dir_in, lookup_dir_with_stat_in, open_file_in,
-    open_file_in_with_attrs, stat_in, truncate_in, FileCreateAttrs, FileSystemStat, FsError,
-    FsResult,
+    FileCreateAttrs, FileSystemStat, FsError, FsNodeKind, FsResult, chmod_in, chown_in,
+    lookup_dir_in, lookup_dir_with_stat_in, open_file_in, open_file_in_with_attrs, stat_in,
+    truncate_in,
 };
 
 pub(self) fn align_up(value: usize, align: usize) -> usize {

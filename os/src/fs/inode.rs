@@ -7,8 +7,8 @@ use bitflags::*;
 use lwext4_rust::ffi::EXT4_ROOT_INO;
 
 // UNFINISHED: Linux open/openat define additional status and creation flags
-// such as O_SYNC, O_DSYNC, O_TMPFILE, O_NOATIME, and O_ASYNC. This kernel
-// accepts only the flags represented below.
+// such as O_TMPFILE, O_NOATIME, and O_ASYNC. This kernel accepts only the
+// flags represented below.
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct OpenFlags: u32 {
@@ -21,11 +21,13 @@ bitflags! {
         const TRUNC = 0o1000;
         const APPEND = 0o2000;
         const NONBLOCK = 0o4000;
+        const DSYNC = 0o10000;
         const DIRECT = 0o40000;
         const LARGEFILE = 0o100000;
         const DIRECTORY = 0o200000;
         const NOFOLLOW = 0o400000;
         const CLOEXEC = 0o2000000;
+        const SYNC = 0o4010000;
         const PATH = 0o10000000;
     }
 }
@@ -34,6 +36,10 @@ impl OpenFlags {
     const ACCESS_MODE_MASK: u32 = 0b11;
     const FCNTL_MUTABLE_STATUS_MASK: u32 =
         OpenFlags::APPEND.bits() | OpenFlags::NONBLOCK.bits() | OpenFlags::DIRECT.bits();
+    // CONTEXT: O_DSYNC/O_SYNC are accepted for libc/LTP compatibility even
+    // though this filesystem layer does not yet provide synchronous writeback
+    // semantics beyond its existing fsync path.
+    const ACCEPTED_SYNC_STATUS_MASK: u32 = OpenFlags::DSYNC.bits() | OpenFlags::SYNC.bits();
 
     pub fn read_write(&self) -> (bool, bool) {
         if self.contains(Self::PATH) {
@@ -61,7 +67,10 @@ impl OpenFlags {
     pub fn file_status_flags(flags: Self) -> Self {
         Self::from_bits_truncate(
             flags.bits()
-                & (Self::ACCESS_MODE_MASK | Self::PATH.bits() | Self::FCNTL_MUTABLE_STATUS_MASK),
+                & (Self::ACCESS_MODE_MASK
+                    | Self::PATH.bits()
+                    | Self::FCNTL_MUTABLE_STATUS_MASK
+                    | Self::ACCEPTED_SYNC_STATUS_MASK),
         )
     }
 
@@ -91,6 +100,9 @@ fn final_component(name: &str) -> Option<&str> {
 fn has_trailing_slash(name: &str) -> bool {
     name.len() > 1 && name.ends_with('/')
 }
+
+const MODE_PERMISSIONS_MASK: u32 = 0o7777;
+const MODE_SETGID: u32 = 0o2000;
 
 fn validate_rename_path(name: &str) -> FsResult {
     match final_component(name) {
@@ -159,6 +171,56 @@ pub(crate) fn mkdir_in(context: PathContext, name: &str, mode: u32) -> FsResult 
     })
     .ok_or(FsError::Io)??;
     Ok(())
+}
+
+pub(crate) fn create_node_in(
+    context: PathContext,
+    name: &str,
+    kind: FsNodeKind,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    rdev: u64,
+) -> FsResult {
+    match final_component(name) {
+        None => return Err(FsError::NotFound),
+        Some("." | ".." | "/") => return Err(FsError::AlreadyExists),
+        _ => {}
+    }
+    let trailing_slash = has_trailing_slash(name);
+    let target = resolve_create_parent_in(context, trimmed_nonroot_path(name))?;
+    with_mount(target.parent.mount_id, |mount| {
+        match mount.lookup_component_from(target.parent.ino, target.leaf_name) {
+            Ok((_, existing_kind)) => {
+                if trailing_slash && existing_kind != FsNodeKind::Directory {
+                    return Err(FsError::NotDir);
+                }
+                return Err(FsError::AlreadyExists);
+            }
+            Err(FsError::NotFound) => {
+                if trailing_slash {
+                    return Err(FsError::NotFound);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+        let parent_stat = mount.stat(target.parent.ino)?;
+        let ino = mount.create_node(
+            target.parent.ino,
+            target.leaf_name,
+            kind,
+            mode & MODE_PERMISSIONS_MASK,
+            rdev,
+        )?;
+        let gid = if parent_stat.mode & MODE_SETGID != 0 {
+            parent_stat.gid
+        } else {
+            gid
+        };
+        mount.set_owner(ino, Some(uid), Some(gid))?;
+        mount.set_mode(ino, mode & MODE_PERMISSIONS_MASK)
+    })
+    .ok_or(FsError::Io)?
 }
 
 pub(crate) fn link_file_in(

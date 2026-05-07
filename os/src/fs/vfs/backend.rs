@@ -9,6 +9,8 @@ pub(crate) enum FsNodeKind {
     Directory,
     RegularFile,
     Symlink,
+    Fifo,
+    CharacterDevice,
     Other,
 }
 
@@ -50,6 +52,19 @@ pub(crate) trait FileSystemBackend: Send {
         component: &str,
     ) -> FsResult<(u32, FsNodeKind)>;
     fn create_file(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult<u32>;
+    fn create_node(
+        &mut self,
+        parent_ino: u32,
+        leaf_name: &str,
+        kind: FsNodeKind,
+        _mode: u32,
+        _rdev: u64,
+    ) -> FsResult<u32> {
+        match kind {
+            FsNodeKind::RegularFile => self.create_file(parent_ino, leaf_name),
+            _ => Err(FsError::Unsupported),
+        }
+    }
     fn create_dir(&mut self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32>;
     fn link(&mut self, parent_ino: u32, leaf_name: &str, child_ino: u32) -> FsResult;
     fn symlink(&mut self, parent_ino: u32, leaf_name: &str, target: &[u8]) -> FsResult;

@@ -1,5 +1,6 @@
 use super::dirent::{
-    DT_DIR, DT_LNK, DT_REG, DT_UNKNOWN, LINUX_DIRENT64_ALIGN, LINUX_DIRENT64_HEADER_SIZE,
+    DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_UNKNOWN, LINUX_DIRENT64_ALIGN,
+    LINUX_DIRENT64_HEADER_SIZE,
 };
 use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult};
 use super::{FileStat, FileTimestamp};
@@ -70,9 +71,11 @@ fn into_node_kind(kind: InodeType) -> FsNodeKind {
         InodeType::Directory => FsNodeKind::Directory,
         InodeType::RegularFile => FsNodeKind::RegularFile,
         InodeType::Symlink => FsNodeKind::Symlink,
-        // UNFINISHED: Linux distinguishes block devices, character devices,
-        // sockets, and FIFOs in stat/getdents; this VFS currently groups the
-        // non-directory, non-regular, non-symlink EXT4 types as Other.
+        InodeType::Fifo => FsNodeKind::Fifo,
+        InodeType::CharacterDevice => FsNodeKind::CharacterDevice,
+        // UNFINISHED: Linux distinguishes block devices and sockets in
+        // stat/getdents; this VFS currently keeps those less-used EXT4 types
+        // grouped as Other.
         _ => FsNodeKind::Other,
     }
 }
@@ -82,6 +85,8 @@ fn into_linux_dtype(kind: InodeType) -> u8 {
         InodeType::Directory => DT_DIR,
         InodeType::RegularFile => DT_REG,
         InodeType::Symlink => DT_LNK,
+        InodeType::Fifo => DT_FIFO,
+        InodeType::CharacterDevice => DT_CHR,
         _ => DT_UNKNOWN,
     }
 }
@@ -170,6 +175,28 @@ impl FileSystemBackend for Ext4Mount {
     fn create_file(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult<u32> {
         self.fs
             .create(parent_ino, leaf_name, InodeType::RegularFile, 0o644)
+            .map_err(map_ext4_error)
+    }
+
+    fn create_node(
+        &mut self,
+        parent_ino: u32,
+        leaf_name: &str,
+        kind: FsNodeKind,
+        mode: u32,
+        _rdev: u64,
+    ) -> FsResult<u32> {
+        let inode_type = match kind {
+            FsNodeKind::RegularFile => InodeType::RegularFile,
+            FsNodeKind::Fifo => InodeType::Fifo,
+            FsNodeKind::CharacterDevice => InodeType::CharacterDevice,
+            _ => return Err(FsError::InvalidInput),
+        };
+        // UNFINISHED: The vendored lwext4 wrapper can create special inode
+        // types, but it does not yet expose storing device major/minor payloads
+        // for character/block devices. open11 only needs the node to open.
+        self.fs
+            .create(parent_ino, leaf_name, inode_type, mode)
             .map_err(map_ext4_error)
     }
 

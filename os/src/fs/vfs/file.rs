@@ -6,7 +6,7 @@ use super::super::status_flags::StatusFlagsCell;
 use super::super::{File, FileStat, FileTimestamp, SeekWhence};
 use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
-use crate::mm::{page_cache::PageCacheId, UserBuffer};
+use crate::mm::{UserBuffer, page_cache::PageCacheId};
 use crate::sync::SleepMutex;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -143,6 +143,17 @@ fn open_vfs_file_impl(
             } else {
                 if flags.contains(OpenFlags::DIRECTORY) {
                     return Err(FsError::NotDir);
+                }
+                if path.kind == FsNodeKind::Fifo {
+                    let (readable, writable) = flags.read_write();
+                    if writable && !readable && flags.contains(OpenFlags::NONBLOCK) {
+                        return Err(FsError::NoDeviceOrAddress);
+                    }
+                    // UNFINISHED: Named FIFO endpoints are not backed by a
+                    // shared pipe object yet. This is enough for the Linux
+                    // no-reader nonblocking writer check in open06, but real
+                    // FIFO data transfer and blocking open pairing are still
+                    // incomplete.
                 }
                 if path.kind == FsNodeKind::Symlink {
                     if flags.contains(OpenFlags::NOFOLLOW) && !flags.contains(OpenFlags::PATH) {

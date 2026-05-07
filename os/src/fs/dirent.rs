@@ -6,6 +6,7 @@ pub(super) const LINUX_DIRENT64_HEADER_SIZE: usize = 19;
 pub(super) const LINUX_DIRENT64_ALIGN: usize = 8;
 
 pub(super) const DT_UNKNOWN: u8 = 0;
+pub(super) const DT_FIFO: u8 = 1;
 pub(super) const DT_CHR: u8 = 2;
 pub(super) const DT_DIR: u8 = 4;
 pub(super) const DT_REG: u8 = 8;

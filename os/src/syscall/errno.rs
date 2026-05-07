@@ -7,6 +7,7 @@ pub enum SysError {
     ESRCH = 3,
     EINTR = 4,
     EIO = 5,
+    ENXIO = 6,
     ENOEXEC = 8,
     EBADF = 9,
     ECHILD = 10,
@@ -69,6 +70,7 @@ impl From<crate::fs::FsError> for SysError {
             crate::fs::FsError::ReadOnly => Self::EROFS,
             crate::fs::FsError::NoSpace => Self::ENOSPC,
             crate::fs::FsError::IllegalSeek => Self::ESPIPE,
+            crate::fs::FsError::NoDeviceOrAddress => Self::ENXIO,
         }
     }
 }

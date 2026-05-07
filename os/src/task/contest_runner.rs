@@ -182,7 +182,7 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
 
 const DIRECT_LTP_GROUP: &str = "open";
 
-const DIRECT_LTP_CASES: &[&str] = &["open10"];
+const DIRECT_LTP_CASES: &[&str] = &["open06", "open11"];
 
 pub(super) fn build_runner_command() -> String {
     if DIRECT_LTP_CASES.first().is_some() {

@@ -1,6 +1,6 @@
-use super::dirent::{DT_DIR, DT_LNK, DT_REG, RawDirEntry, write_dir_entries};
+use super::dirent::{DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, RawDirEntry, write_dir_entries};
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
-use super::{FileStat, FileTimestamp, S_IFDIR, S_IFLNK, S_IFREG};
+use super::{FileStat, FileTimestamp, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -194,6 +194,8 @@ impl TmpFs {
                 FsNodeKind::Directory => DT_DIR,
                 FsNodeKind::RegularFile => DT_REG,
                 FsNodeKind::Symlink => DT_LNK,
+                FsNodeKind::Fifo => DT_FIFO,
+                FsNodeKind::CharacterDevice => DT_CHR,
                 FsNodeKind::Other => 0,
             };
             entries.push(RawDirEntry {
@@ -248,6 +250,23 @@ impl FileSystemBackend for TmpFs {
             FsNodeKind::RegularFile,
             S_IFREG | 0o666,
         )
+    }
+
+    fn create_node(
+        &mut self,
+        parent_ino: u32,
+        leaf_name: &str,
+        kind: FsNodeKind,
+        mode: u32,
+        _rdev: u64,
+    ) -> FsResult<u32> {
+        let file_type = match kind {
+            FsNodeKind::RegularFile => S_IFREG,
+            FsNodeKind::Fifo => S_IFIFO,
+            FsNodeKind::CharacterDevice => S_IFCHR,
+            _ => return Err(FsError::InvalidInput),
+        };
+        self.create_node(parent_ino, leaf_name, kind, file_type | (mode & 0o7777))
     }
 
     fn create_dir(&mut self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32> {
