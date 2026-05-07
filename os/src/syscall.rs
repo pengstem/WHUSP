@@ -1,3 +1,4 @@
+const SYSCALL_FGETXATTR: usize = 10;
 const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_DUP: usize = 23;
 const SYSCALL_DUP3: usize = 24;
@@ -21,6 +22,7 @@ const SYSCALL_CHROOT: usize = 51;
 const SYSCALL_FCHMOD: usize = 52;
 const SYSCALL_FCHMODAT: usize = 53;
 const SYSCALL_FCHOWNAT: usize = 54;
+const SYSCALL_FCHOWN: usize = 55;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
 const SYSCALL_PIPE2: usize = 59;
@@ -168,6 +170,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
 
     ret(match syscall_id {
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
+        SYSCALL_FGETXATTR => {
+            sys_fgetxattr(args[0], args[1] as *const u8, args[2] as *mut u8, args[3])
+        }
         SYSCALL_DUP => sys_dup(args[0]),
         SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2] as u32),
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1], args[2]),
@@ -230,6 +235,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as u32,
             args[4] as i32,
         ),
+        SYSCALL_FCHOWN => sys_fchown(args[0], args[1] as u32, args[2] as u32),
         SYSCALL_OPENAT => sys_openat(
             args[0] as isize,
             args[1] as *const u8,

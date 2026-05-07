@@ -1,20 +1,21 @@
 use crate::fs::{
-    FileStat, MountId, chmod_in, chown_in, mount_is_read_only, stat_devfs_child,
-    stat_devfs_misc_child, stat_in, stat_static_path, statfs_for_mount,
+    chmod_in, chown_in, mount_is_read_only, stat_devfs_child, stat_devfs_misc_child, stat_in,
+    stat_static_path, statfs_for_mount, FileStat, MountId, OpenFlags,
 };
-use crate::task::{PathSnapshot, current_process, current_user_token};
+use crate::task::{current_process, current_user_token, PathSnapshot};
 
 use super::super::errno::{SysError, SysResult};
-use super::super::user_ptr::{PATH_MAX, read_user_c_string, write_user_value};
-use super::fd::get_file_by_fd;
+use super::super::user_ptr::{read_user_c_string, write_user_value, PATH_MAX};
+use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::path::{check_current_access_path_prefixes_from, path_context_from};
 use super::uapi::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, LinuxKstat, LinuxStatfs, LinuxStatx,
+    LinuxKstat, LinuxStatfs, LinuxStatx, AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW,
     STATX_RESERVED, VALID_FCHOWNAT_FLAGS, VALID_FSTATAT_FLAGS, VALID_STATX_FLAGS,
 };
 
 const UID_GID_NO_CHANGE: u32 = u32::MAX;
 const MODE_SETGID: u32 = 0o2000;
+const XATTR_NAME_MAX: usize = 255;
 
 fn write_stat_result<T: From<FileStat> + Copy>(
     token: usize,
@@ -23,6 +24,23 @@ fn write_stat_result<T: From<FileStat> + Copy>(
 ) -> SysResult {
     write_user_value(token, buf, &stat.into())?;
     Ok(0)
+}
+
+fn reject_proc_self_fd_o_path(path: &str) -> SysResult<()> {
+    let Some(fd_text) = path.strip_prefix("/proc/self/fd/") else {
+        return Ok(());
+    };
+    if fd_text.is_empty() || fd_text.contains('/') {
+        return Ok(());
+    }
+    let Ok(fd) = fd_text.parse::<usize>() else {
+        return Ok(());
+    };
+    let entry = get_fd_entry_by_fd(fd)?;
+    if entry.status_flags().contains(OpenFlags::PATH) {
+        return Err(SysError::EBADF);
+    }
+    Ok(())
 }
 
 fn stat_by_dirfd_from(snapshot: &PathSnapshot, dirfd: isize) -> SysResult<FileStat> {
@@ -149,8 +167,15 @@ pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> SysResult {
     let token = current_user_token();
     let path = read_user_c_string(token, pathname, PATH_MAX)?;
     if path.is_empty() {
+        if dirfd >= 0
+            && let Ok(entry) = get_fd_entry_by_fd(dirfd as usize)
+            && entry.status_flags().contains(OpenFlags::PATH)
+        {
+            return Err(SysError::EBADF);
+        }
         return Err(SysError::ENOENT);
     }
+    reject_proc_self_fd_o_path(path.as_str())?;
     let snapshot = current_process().path_snapshot();
     check_current_access_path_prefixes_from(&snapshot, dirfd, path.as_str())?;
     let stat = resolve_stat_from(&snapshot, dirfd, path.as_str(), true)?;
@@ -168,7 +193,11 @@ pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> SysResult {
 }
 
 pub fn sys_fchmod(fd: usize, mode: u32) -> SysResult {
-    let file = get_file_by_fd(fd)?;
+    let entry = get_fd_entry_by_fd(fd)?;
+    if entry.status_flags().contains(OpenFlags::PATH) {
+        return Err(SysError::EBADF);
+    }
+    let file = entry.file();
     let stat = file.stat()?;
     let mode = prepare_mode_change(stat, mode)?;
     file.set_mode(mode)?;
@@ -177,6 +206,19 @@ pub fn sys_fchmod(fd: usize, mode: u32) -> SysResult {
 
 fn decode_chown_id(raw: u32) -> Option<u32> {
     (raw != UID_GID_NO_CHANGE).then_some(raw)
+}
+
+pub fn sys_fchown(fd: usize, owner: u32, group: u32) -> SysResult {
+    let uid = decode_chown_id(owner);
+    let gid = decode_chown_id(group);
+    let entry = get_fd_entry_by_fd(fd)?;
+    if entry.status_flags().contains(OpenFlags::PATH) {
+        return Err(SysError::EBADF);
+    }
+    let file = entry.file();
+    ensure_can_change_owner(file.stat()?, uid, gid)?;
+    file.set_owner(uid, gid)?;
+    Ok(0)
 }
 
 pub fn sys_fchownat(
@@ -196,6 +238,7 @@ pub fn sys_fchownat(
     let gid = decode_chown_id(group);
     let token = current_user_token();
     let path = read_user_c_string(token, pathname, PATH_MAX)?;
+    reject_proc_self_fd_o_path(path.as_str())?;
     let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
     let snapshot = current_process().path_snapshot();
 
@@ -212,7 +255,11 @@ pub fn sys_fchownat(
         if dirfd < 0 {
             return Err(SysError::EBADF);
         }
-        let file = get_file_by_fd(dirfd as usize)?;
+        let entry = get_fd_entry_by_fd(dirfd as usize)?;
+        if entry.status_flags().contains(OpenFlags::PATH) {
+            return Err(SysError::EBADF);
+        }
+        let file = entry.file();
         ensure_can_change_owner(file.stat()?, uid, gid)?;
         file.set_owner(uid, gid)?;
         return Ok(0);
@@ -228,6 +275,22 @@ pub fn sys_fchownat(
         gid,
     )?;
     Ok(0)
+}
+
+pub fn sys_fgetxattr(fd: usize, name: *const u8, value: *mut u8, size: usize) -> SysResult {
+    let entry = get_fd_entry_by_fd(fd)?;
+    if entry.status_flags().contains(OpenFlags::PATH) {
+        return Err(SysError::EBADF);
+    }
+    let token = current_user_token();
+    let _name = read_user_c_string(token, name, XATTR_NAME_MAX + 1)?;
+    if size > 0 && value.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    // UNFINISHED: Extended attribute storage is not implemented. This handler
+    // exists to expose the Linux-visible fd validation and O_PATH EBADF
+    // behavior required before real xattr lookup can be added.
+    Err(SysError::ENOTSUP)
 }
 
 pub fn sys_statfs(pathname: *const u8, statfsbuf: *mut LinuxStatfs) -> SysResult {
