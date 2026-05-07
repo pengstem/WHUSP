@@ -1,9 +1,9 @@
 use crate::task::{
-    current_has_deliverable_signal, current_process, current_task, current_trap_cx,
+    MINSIGSTKSZ, ProcessControlBlock, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SS_DISABLE, SS_ONSTACK,
+    SigAltStack, SignalAction, SignalFlags, SignalInfo, TaskControlBlock,
+    current_has_interrupting_signal, current_process, current_task, current_trap_cx,
     current_user_token, flags_to_linux_sigset, linux_sigset_to_flags, pid2process,
-    processes_snapshot, queue_signal_to_task, suspend_current_and_run_next, ProcessControlBlock,
-    SigAltStack, SignalAction, SignalFlags, SignalInfo, TaskControlBlock, MINSIGSTKSZ, SIGKILL,
-    SIGNAL_INFO_SLOTS, SIGSTOP, SS_DISABLE, SS_ONSTACK,
+    processes_snapshot, queue_signal_to_task, suspend_current_and_run_next,
 };
 use crate::timer::get_time_ms;
 use alloc::sync::Arc;
@@ -319,7 +319,7 @@ pub fn sys_rt_sigsuspend(mask: *const u8, sigsetsize: usize) -> SysResult {
     };
 
     loop {
-        if current_has_deliverable_signal() {
+        if current_has_interrupting_signal() {
             task.inner_exclusive_access().sigsuspend_restore_mask = Some(old_mask);
             return Err(SysError::EINTR);
         }

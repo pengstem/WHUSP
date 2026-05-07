@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::*;
 use log::info;
 use manager::fetch_task;
-pub(crate) use process::{PathSnapshot, ProcessProcSnapshot, RLimit, RLimitResource};
+pub(crate) use process::{Credentials, PathSnapshot, ProcessProcSnapshot, RLimit, RLimitResource};
 pub use process::{ProcessControlBlock, ProcessCpuTimesSnapshot};
 pub(crate) const CAP_SETPCAP: usize = process::CapabilitySets::CAP_SETPCAP;
 pub(crate) const CAP_SYS_CHROOT: usize = process::CapabilitySets::CAP_SYS_CHROOT;
@@ -445,6 +445,41 @@ fn current_has_deliverable_signal_matching(predicate: impl Fn(SignalAction) -> b
 
 pub fn current_has_deliverable_signal() -> bool {
     current_has_deliverable_signal_matching(|_| true)
+}
+
+pub fn current_has_interrupting_signal() -> bool {
+    let Some(task) = current_task() else {
+        return false;
+    };
+    let Some(process) = task.process.upgrade() else {
+        return false;
+    };
+    let pending = {
+        let inner = task.inner_exclusive_access();
+        SignalFlags::from_bits_retain(inner.pending_signals.bits() & !inner.signal_mask.bits())
+    };
+    for signum in 1..SIGNAL_INFO_SLOTS {
+        let Some(signal) = SignalFlags::from_signum(signum as u32) else {
+            continue;
+        };
+        if !pending.contains(signal) {
+            continue;
+        }
+        let action = process.inner_exclusive_access().signal_actions[signum];
+        if action.is_ignore() {
+            continue;
+        }
+        if action.has_user_handler() {
+            if crate::arch::signal::can_deliver_user_signal(signum) {
+                return true;
+            }
+            continue;
+        }
+        if default_signal_error(signum).is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn current_has_unmasked_signal() -> bool {

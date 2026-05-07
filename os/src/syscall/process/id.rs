@@ -1,9 +1,10 @@
 use crate::syscall::errno::{SysError, SysResult};
 use crate::task::{
-    current_process, current_task, exit_current_and_run_next, exit_current_group_and_run_next,
-    pid2process, processes_snapshot, queue_signal_to_task, suspend_current_and_run_next,
-    wakeup_task, SignalFlags, SignalInfo,
+    Credentials, ProcessControlBlock, SignalFlags, SignalInfo, current_process, current_task,
+    exit_current_and_run_next, exit_current_group_and_run_next, pid2process, processes_snapshot,
+    queue_signal_to_task, suspend_current_and_run_next, wakeup_task,
 };
+use alloc::{sync::Arc, vec::Vec};
 
 pub fn sys_exit(exit_code: i32) -> ! {
     exit_current_and_run_next(exit_code);
@@ -97,30 +98,92 @@ pub fn sys_set_tid_address(tidptr: usize) -> SysResult {
     Ok(tid as isize)
 }
 
-pub fn sys_kill(pid: usize, signal: u32) -> SysResult {
-    let flag = SignalFlags::from_signum(signal).ok_or(SysError::EINVAL)?;
-    let process = pid2process(pid).ok_or(SysError::ESRCH)?;
-    if !flag.is_empty() {
-        let sender_pid = current_process().getpid() as i32;
-        let target = {
-            let tasks = process.tasks_snapshot();
-            tasks
-                .iter()
-                .find(|task| {
-                    let task_inner = task.inner_exclusive_access();
-                    !(task_inner.signal_mask & flag).contains(flag)
-                })
-                .cloned()
-                .or_else(|| tasks.first().cloned())
-        };
-        if let Some(task) = target {
-            queue_signal_to_task(task, flag, SignalInfo::user(signal as i32, sender_pid));
-        }
+fn caller_can_signal_target(caller: &Credentials, target: &Credentials) -> bool {
+    // UNFINISHED: Linux kill permission also checks CAP_KILL in the target's
+    // user namespace and has a SIGCONT session rule. This kernel currently has
+    // one credential namespace and process-wide credentials.
+    caller.is_root()
+        || target.uid_matches_saved_set(caller.ruid)
+        || target.uid_matches_saved_set(caller.euid)
+}
+
+fn queue_signal_to_process(
+    process: &Arc<ProcessControlBlock>,
+    signal: SignalFlags,
+    info: SignalInfo,
+) {
+    if signal.is_empty() {
+        return;
     }
-    if flag.check_error().is_some() {
+    let target = {
+        let tasks = process.tasks_snapshot();
+        tasks
+            .iter()
+            .find(|task| {
+                let task_inner = task.inner_exclusive_access();
+                !(task_inner.signal_mask & signal).contains(signal)
+            })
+            .cloned()
+            .or_else(|| tasks.first().cloned())
+    };
+    if let Some(task) = target {
+        queue_signal_to_task(task, signal, info);
+    }
+    if signal.check_error().is_some() {
         for task in process.tasks_snapshot() {
             wakeup_task(task);
         }
+    }
+}
+
+fn kill_targets(pid: isize) -> SysResult<Vec<Arc<ProcessControlBlock>>> {
+    if pid > 0 {
+        return Ok(alloc::vec![
+            pid2process(pid as usize).ok_or(SysError::ESRCH)?
+        ]);
+    }
+    if pid == 0 {
+        let pgid = current_process().process_group_id();
+        return Ok(processes_snapshot()
+            .into_iter()
+            .filter(|process| process.process_group_id() == pgid)
+            .collect());
+    }
+    if pid == -1 {
+        return Ok(processes_snapshot()
+            .into_iter()
+            .filter(|process| process.getpid() != 1)
+            .collect());
+    }
+    let pgid = pid.checked_neg().ok_or(SysError::EINVAL)? as usize;
+    Ok(processes_snapshot()
+        .into_iter()
+        .filter(|process| process.process_group_id() == pgid)
+        .collect())
+}
+
+pub fn sys_kill(pid: isize, signal: u32) -> SysResult {
+    let flag = SignalFlags::from_signum(signal).ok_or(SysError::EINVAL)?;
+    let current = current_process();
+    let sender_pid = current.getpid() as i32;
+    let sender_credentials = current.credentials();
+    let targets = kill_targets(pid)?;
+    if targets.is_empty() {
+        return Err(SysError::ESRCH);
+    }
+
+    let mut permitted = false;
+    for process in targets {
+        let target_credentials = process.credentials();
+        if !caller_can_signal_target(&sender_credentials, &target_credentials) {
+            continue;
+        }
+        permitted = true;
+        queue_signal_to_process(&process, flag, SignalInfo::user(signal as i32, sender_pid));
+    }
+
+    if !permitted {
+        return Err(SysError::EPERM);
     }
     Ok(0)
 }

@@ -108,7 +108,6 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
     "iptables*",
     "kcmp03",
     "keyctl05",
-    "kill08",
     "kill10",
     "lftest",
     "ltpClient",

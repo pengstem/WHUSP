@@ -1,6 +1,6 @@
 use crate::fs::PollEvents;
 use crate::task::{
-    current_has_deliverable_signal, current_user_token, suspend_current_and_run_next,
+    current_has_interrupting_signal, current_user_token, suspend_current_and_run_next,
 };
 use crate::timer::get_time_ms;
 use alloc::vec::Vec;
@@ -127,7 +127,7 @@ pub fn sys_ppoll(
                 return Ok(0);
             }
         }
-        if current_has_deliverable_signal() {
+        if current_has_interrupting_signal() {
             return Err(SysError::EINTR);
         }
         suspend_current_and_run_next();
@@ -270,7 +270,7 @@ pub fn sys_pselect6(
             write_user_fdset(token, exceptfds, &except_output)?;
             return Ok(ready as isize);
         }
-        if current_has_deliverable_signal() {
+        if current_has_interrupting_signal() {
             return Err(SysError::EINTR);
         }
         suspend_current_and_run_next();

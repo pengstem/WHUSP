@@ -141,7 +141,7 @@ pub(crate) mod user_ptr;
 mod wait;
 
 use crate::task::RLimit;
-use errno::{ret, SysError};
+use errno::{SysError, ret};
 use fs::*;
 use futex::*;
 use memory::*;
@@ -339,7 +339,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_SCHED_YIELD => Ok(sys_sched_yield()),
-        SYSCALL_KILL => sys_kill(args[0], args[1] as u32),
+        SYSCALL_KILL => sys_kill(args[0] as isize, args[1] as u32),
         SYSCALL_TKILL => sys_tkill(args[0] as isize, args[1] as u32),
         SYSCALL_TGKILL => sys_tgkill(args[0] as isize, args[1] as isize, args[2] as u32),
         SYSCALL_SIGALTSTACK => sys_sigaltstack(args[0] as *const u8, args[1] as *mut u8),
