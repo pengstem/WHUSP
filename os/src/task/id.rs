@@ -1,6 +1,6 @@
 use super::ProcessControlBlock;
 use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
-use crate::mm::{KERNEL_SPACE, MapPermission, PhysPageNum, VirtAddr};
+use crate::mm::{MapPermission, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPIntrFreeCell;
 use alloc::{
     sync::{Arc, Weak},
@@ -40,6 +40,14 @@ impl RecycleAllocator {
         );
         self.recycled.push(id);
     }
+
+    pub fn dealloc_without_reuse(&mut self, id: usize) {
+        assert!(id < self.current);
+        assert!(
+            !self.recycled.contains(&id),
+            "id {id} has been deallocated!"
+        );
+    }
 }
 
 lazy_static! {
@@ -59,7 +67,13 @@ pub fn pid_alloc() -> PidHandle {
 
 impl Drop for PidHandle {
     fn drop(&mut self) {
-        PID_ALLOCATOR.exclusive_access().dealloc(self.0);
+        // CONTEXT: Linux avoids immediately reusing a just-reaped PID; LTP
+        // fork13 checks this because shell scripts can break when consecutive
+        // fork/wait cycles return the same PID. Keep kernel stack and per-process
+        // resource IDs recyclable, but let Linux-visible PIDs advance monotonically.
+        PID_ALLOCATOR
+            .exclusive_access()
+            .dealloc_without_reuse(self.0);
     }
 }
 

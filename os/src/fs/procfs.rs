@@ -1,14 +1,15 @@
-use super::dirent::{DT_DIR, DT_REG, RawDirEntry, write_dir_entries};
+use super::dirent::{write_dir_entries, RawDirEntry, DT_DIR, DT_REG};
 use super::mount;
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
 use super::{FileStat, FileTimestamp, S_IFDIR, S_IFREG};
 use crate::config::PAGE_SIZE;
 use crate::mm::frame_stats;
-use crate::task::{ProcessProcSnapshot, list_process_snapshots, pid2process};
+use crate::task::{list_process_snapshots, pid2process, ProcessProcSnapshot};
 use crate::timer::{get_time_us, us_to_clock_ticks};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 const ROOT_INO: u32 = 2;
 const MOUNTS_INO: u32 = 3;
@@ -24,6 +25,9 @@ const PID_FILE_STRIDE: u32 = 10;
 const PID_STAT_OFFSET: u32 = 0;
 const PID_STATUS_OFFSET: u32 = 1;
 const PID_CMDLINE_OFFSET: u32 = 2;
+const DEFAULT_PID_MAX: usize = 4_194_304;
+
+static PROC_PID_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_PID_MAX);
 
 pub(super) struct ProcFs;
 
@@ -287,7 +291,24 @@ fn pid_max_content() -> String {
     // negative syscall tests. The allocator is much smaller than Linux's
     // tunable PID space, but returning Linux's common upper bound keeps that
     // chosen PID outside this kernel's live process table.
-    "4194304\n".into()
+    format!("{}\n", PROC_PID_MAX.load(Ordering::Relaxed))
+}
+
+fn write_pid_max(buf: &[u8], offset: u64) -> usize {
+    if offset != 0 {
+        return 0;
+    }
+    let Ok(text) = core::str::from_utf8(buf) else {
+        return 0;
+    };
+    let Ok(value) = text.trim().parse::<usize>() else {
+        return 0;
+    };
+    // UNFINISHED: Linux uses pid_max to control PID allocator wrap. This
+    // compatibility path stores the procfs value for LTP save/restore, but the
+    // kernel PID allocator is not yet retuned by this sysctl.
+    PROC_PID_MAX.store(value, Ordering::Relaxed);
+    buf.len()
 }
 
 fn pid_stat_content(process: ProcessProcSnapshot) -> String {
@@ -481,7 +502,10 @@ impl FileSystemBackend for ProcFs {
     }
 
     fn set_len(&mut self, _ino: u32, _len: u64) -> FsResult {
-        Err(FsError::ReadOnly)
+        match decode_node(_ino).ok_or(FsError::NotFound)? {
+            ProcNode::PidMax => Ok(()),
+            _ => Err(FsError::ReadOnly),
+        }
     }
 
     fn set_times(
@@ -500,6 +524,7 @@ impl FileSystemBackend for ProcFs {
             ProcNode::Root | ProcNode::SysDir | ProcNode::SysKernelDir | ProcNode::PidDir(_) => {
                 FileStat::with_mode(S_IFDIR | 0o555)
             }
+            ProcNode::PidMax => FileStat::with_mode(S_IFREG | 0o644),
             _ => FileStat::with_mode(S_IFREG | 0o444),
         };
         stat.dev = 0x70726f63;
@@ -530,8 +555,11 @@ impl FileSystemBackend for ProcFs {
         len
     }
 
-    fn write_at(&mut self, _ino: u32, _buf: &[u8], _offset: u64) -> usize {
-        0
+    fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize {
+        match decode_node(ino) {
+            Some(ProcNode::PidMax) => write_pid_max(buf, offset),
+            _ => 0,
+        }
     }
 
     fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
