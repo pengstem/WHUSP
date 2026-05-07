@@ -1,4 +1,4 @@
-//! Minimal AF_INET loopback socket syscalls.
+//! Minimal socket syscalls.
 //!
 //! This is not a complete Linux networking stack. It provides the smallest
 //! local TCP/UDP behavior needed by the contest netperf scripts, which use
@@ -24,6 +24,7 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 use lazy_static::lazy_static;
 
+const AF_UNIX: i32 = 1;
 const AF_INET: i32 = 2;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
@@ -887,14 +888,26 @@ fn read_i32_option(token: usize, val: usize, len: u32) -> SysResult<i32> {
 }
 
 pub fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
-    if domain != AF_INET {
-        return Err(SysError::EAFNOSUPPORT);
-    }
     let kind = socket_kind_from_type(ty)?;
-    validate_protocol(kind, protocol)?;
     let flags = open_flags_from_socket_type(ty)?;
-    let socket = LocalSocket::new(kind, flags);
-    Ok(alloc_socket_fd(socket, flags)? as isize)
+    match domain {
+        AF_INET => {
+            validate_protocol(kind, protocol)?;
+            let socket = LocalSocket::new(kind, flags);
+            Ok(alloc_socket_fd(socket, flags)? as isize)
+        }
+        AF_UNIX => {
+            if protocol != 0 {
+                return Err(SysError::EPROTONOSUPPORT);
+            }
+            // CONTEXT: libc group/passwd lookup probes AF_UNIX nscd first.
+            // Full AF_UNIX IPC is not implemented; report the daemon socket as
+            // absent so libc falls back to local database files instead of
+            // preserving EAFNOSUPPORT as the final lookup errno.
+            Err(SysError::ENOENT)
+        }
+        _ => Err(SysError::EAFNOSUPPORT),
+    }
 }
 
 pub fn sys_socketpair(_domain: i32, _ty: i32, _protocol: i32, _sv: usize) -> SysResult {

@@ -1,19 +1,20 @@
 use crate::fs::{
-    chmod_in, chown_in, stat_devfs_child, stat_devfs_misc_child, stat_in, stat_static_path,
-    statfs_for_mount, FileStat, MountId,
+    FileStat, MountId, chmod_in, chown_in, mount_is_read_only, stat_devfs_child,
+    stat_devfs_misc_child, stat_in, stat_static_path, statfs_for_mount,
 };
-use crate::task::{current_process, current_user_token, PathSnapshot};
+use crate::task::{PathSnapshot, current_process, current_user_token};
 
 use super::super::errno::{SysError, SysResult};
-use super::super::user_ptr::{read_user_c_string, write_user_value, PATH_MAX};
+use super::super::user_ptr::{PATH_MAX, read_user_c_string, write_user_value};
 use super::fd::get_file_by_fd;
-use super::path::path_context_from;
+use super::path::{check_current_access_path_prefixes_from, path_context_from};
 use super::uapi::{
-    LinuxKstat, LinuxStatfs, LinuxStatx, AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW,
+    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, LinuxKstat, LinuxStatfs, LinuxStatx,
     STATX_RESERVED, VALID_FCHOWNAT_FLAGS, VALID_FSTATAT_FLAGS, VALID_STATX_FLAGS,
 };
 
 const UID_GID_NO_CHANGE: u32 = u32::MAX;
+const MODE_SETGID: u32 = 0o2000;
 
 fn write_stat_result<T: From<FileStat> + Copy>(
     token: usize,
@@ -104,12 +105,27 @@ pub fn sys_newfstatat(
     )
 }
 
-fn can_change_mode(stat: FileStat) -> bool {
+fn prepare_mode_change(stat: FileStat, mode: u32) -> SysResult<u32> {
+    if mount_is_read_only(MountId(stat.dev as usize)) {
+        return Err(SysError::EROFS);
+    }
     let credentials = current_process().credentials();
     // UNFINISHED: Linux chmod checks CAP_FOWNER and filesystem uid in the
     // caller's user namespace. This kernel only has root-equivalent uid 0 plus
     // stored fsuid.
-    credentials.euid == 0 || credentials.fsuid == stat.uid
+    if credentials.euid != 0 && credentials.fsuid != stat.uid {
+        return Err(SysError::EPERM);
+    }
+    let mut mode = mode;
+    if mode & MODE_SETGID != 0
+        && credentials.euid != 0
+        && credentials.egid != stat.gid
+        && credentials.fsgid != stat.gid
+        && !credentials.groups.iter().any(|group| *group == stat.gid)
+    {
+        mode &= !MODE_SETGID;
+    }
+    Ok(mode)
 }
 
 fn ensure_can_change_owner(_stat: FileStat, uid: Option<u32>, gid: Option<u32>) -> SysResult<()> {
@@ -136,19 +152,26 @@ pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> SysResult {
         return Err(SysError::ENOENT);
     }
     let snapshot = current_process().path_snapshot();
+    check_current_access_path_prefixes_from(&snapshot, dirfd, path.as_str())?;
     let stat = resolve_stat_from(&snapshot, dirfd, path.as_str(), true)?;
-    if !can_change_mode(stat) {
-        return Err(SysError::EPERM);
-    }
-    // UNFINISHED: Linux clears setuid/setgid bits in additional cases depending
-    // on ownership, group membership, and capabilities. The current credential
-    // model is still root-compatible and does not implement those transitions.
+    let mode = prepare_mode_change(stat, mode)?;
+    // UNFINISHED: Linux clears setuid bits in additional cases depending on
+    // capabilities and executable file state. This kernel implements the LTP
+    // visible setgid clearing rule but still lacks full capability handling.
     chmod_in(
         path_context_from(&snapshot, dirfd, path.as_str())?,
         path.as_str(),
         true,
         mode,
     )?;
+    Ok(0)
+}
+
+pub fn sys_fchmod(fd: usize, mode: u32) -> SysResult {
+    let file = get_file_by_fd(fd)?;
+    let stat = file.stat()?;
+    let mode = prepare_mode_change(stat, mode)?;
+    file.set_mode(mode)?;
     Ok(0)
 }
 

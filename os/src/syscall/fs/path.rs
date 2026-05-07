@@ -1,27 +1,27 @@
 use super::super::errno::{SysError, SysResult};
 use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{
-    copy_to_user, read_user_c_string, read_user_value, translated_byte_buffer_checked,
-    UserBufferAccess, PATH_MAX,
+    PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, read_user_value,
+    translated_byte_buffer_checked,
 };
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::stat::resolve_stat_from;
 use super::uapi::{
     AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, F_OK, RENAME_EXCHANGE,
     RENAME_NOREPLACE, RENAME_WHITEOUT, UTIME_NOW, UTIME_OMIT, VALID_ACCESS_MODE,
-    VALID_FACCESSAT2_FLAGS, VALID_FACCESSAT_FLAGS, VALID_RENAME_FLAGS, VALID_UTIMENSAT_FLAGS, W_OK,
+    VALID_FACCESSAT_FLAGS, VALID_FACCESSAT2_FLAGS, VALID_RENAME_FLAGS, VALID_UTIMENSAT_FLAGS, W_OK,
     X_OK,
 };
 use crate::fs::{
-    link_file_in, lookup_dir_in, lookup_dir_with_stat_in, mkdir_in, mount_is_read_only,
+    File, FileStat, FileTimestamp, MountId, OpenFlags, PathContext, S_IFDIR, S_IFREG, WorkingDir,
+    chown_in, link_file_in, lookup_dir_in, lookup_dir_with_stat_in, mkdir_in, mount_is_read_only,
     normalize_path_at_root, open_devfs_child, open_devfs_misc_child, open_file_in,
-    open_static_path, path_inside_root, rename_in, rmdir_in, symlink_in, truncate_in,
-    unlink_file_in, File, FileStat, FileTimestamp, MountId, OpenFlags, PathContext, WorkingDir,
-    S_IFDIR, S_IFREG,
+    open_file_in_with_owner, open_static_path, path_inside_root, rename_in, rmdir_in, symlink_in,
+    truncate_in, unlink_file_in,
 };
 use crate::mm::UserBuffer;
 use crate::task::{
-    current_process, current_user_token, FdTableEntry, PathSnapshot, CAP_SYS_CHROOT,
+    CAP_SYS_CHROOT, FdTableEntry, PathSnapshot, current_process, current_user_token,
 };
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -155,6 +155,20 @@ fn check_access_path_prefixes_from(
         check_access_mode(&stat, X_OK, subject)?;
     }
     Ok(())
+}
+
+pub(super) fn check_current_access_path_prefixes_from(
+    snapshot: &PathSnapshot,
+    dirfd: isize,
+    path: &str,
+) -> SysResult<()> {
+    let credentials = current_process().credentials();
+    let subject = AccessSubject {
+        uid: credentials.fsuid,
+        gid: credentials.fsgid,
+        groups: &credentials.groups,
+    };
+    check_access_path_prefixes_from(snapshot, dirfd, path, subject)
 }
 
 fn parse_utimensat_time(
@@ -319,7 +333,13 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> SysR
         return install_open_file(file, flags, None);
     }
     let context = path_context_from(&snapshot, dirfd, path.as_str())?;
-    let file = open_file_in(context, path.as_str(), flags)?;
+    let credentials = current_process().credentials();
+    let file = open_file_in_with_owner(
+        context,
+        path.as_str(),
+        flags,
+        Some((credentials.fsuid, credentials.fsgid)),
+    )?;
     install_open_file(file, flags, dir_path)
 }
 
@@ -554,10 +574,15 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> SysResult {
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
     let snapshot = current_process().path_snapshot();
-    mkdir_in(
-        path_context_from(&snapshot, dirfd, path.as_str())?,
+    let context = path_context_from(&snapshot, dirfd, path.as_str())?;
+    mkdir_in(context, path.as_str(), mode)?;
+    let credentials = current_process().credentials();
+    chown_in(
+        context,
         path.as_str(),
-        mode,
+        true,
+        Some(credentials.fsuid),
+        Some(credentials.fsgid),
     )?;
     Ok(0)
 }

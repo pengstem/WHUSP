@@ -111,6 +111,7 @@ fn open_vfs_file_impl(
     context: PathContext,
     name: &str,
     flags: OpenFlags,
+    create_owner: Option<(u32, u32)>,
 ) -> FsResult<Arc<VfsFile>> {
     let follow_final_symlink = !flags.contains(OpenFlags::NOFOLLOW);
     let resolved = vfs_path::resolve_open_in(
@@ -158,6 +159,12 @@ fn open_vfs_file_impl(
                 mount.create_file(target.parent.ino, target.leaf_name)
             })
             .ok_or(FsError::Io)??;
+            if let Some((uid, gid)) = create_owner {
+                with_mount(target.parent.mount_id, |mount| {
+                    mount.set_owner(ino, Some(uid), Some(gid))
+                })
+                .ok_or(FsError::Io)??;
+            }
             let (readable, writable) = flags.read_write();
             (
                 VfsPath::new(
@@ -179,7 +186,7 @@ fn open_vfs_file_impl(
 }
 
 pub(crate) fn open_file(name: &str, flags: OpenFlags) -> FsResult<Arc<VfsFile>> {
-    open_vfs_file_impl(PathContext::global_root(), name, flags)
+    open_vfs_file_impl(PathContext::global_root(), name, flags, None)
 }
 
 pub(crate) fn open_file_in(
@@ -187,12 +194,22 @@ pub(crate) fn open_file_in(
     name: &str,
     flags: OpenFlags,
 ) -> FsResult<Arc<dyn File + Send + Sync>> {
+    open_file_in_with_owner(context, name, flags, None)
+}
+
+pub(crate) fn open_file_in_with_owner(
+    context: PathContext,
+    name: &str,
+    flags: OpenFlags,
+    create_owner: Option<(u32, u32)>,
+) -> FsResult<Arc<dyn File + Send + Sync>> {
     if context.is_global_root()
         && let Some(file) = devfs::open(name, flags)?
     {
         return Ok(file);
     }
-    open_vfs_file_impl(context, name, flags).map(|file| file as Arc<dyn File + Send + Sync>)
+    open_vfs_file_impl(context, name, flags, create_owner)
+        .map(|file| file as Arc<dyn File + Send + Sync>)
 }
 
 pub(crate) fn stat_in(
@@ -434,6 +451,13 @@ impl File for VfsFile {
     ) -> FsResult {
         with_mount(self.node.mount_id, |mount| {
             mount.set_times(self.node.ino, atime, mtime, ctime)
+        })
+        .ok_or(FsError::Io)?
+    }
+
+    fn set_mode(&self, mode: u32) -> FsResult {
+        with_mount(self.node.mount_id, |mount| {
+            mount.set_mode(self.node.ino, mode)
         })
         .ok_or(FsError::Io)?
     }

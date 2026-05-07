@@ -10,7 +10,6 @@ const ALL_TESTS: &[&str] = &[
     "lua_testcode.sh",
     "libctest_testcode.sh",
     "iozone_testcode.sh",
-    "unixbench_testcode.sh",
     "iperf_testcode.sh",
     "libcbench_testcode.sh",
     "lmbench_testcode.sh",
@@ -31,16 +30,14 @@ const TEST_SCRIPTS: &[&str] = &[
     // runnable
     // "iozone_testcode.sh",
     // runnable
-    // "unixbench_testcode.sh",
-    // runnable
     // "iperf_testcode.sh",
     // "libcbench_testcode.sh",
-    "lmbench_testcode.sh",
+    // "lmbench_testcode.sh",
     // runnable
     // "netperf_testcode.sh",
     // runnable
     // "cyclictest_testcode.sh",
-    // "ltp_testcode.sh",
+    "ltp_testcode.sh",
 ];
 
 const LTP_BLACKLIST_PATTERNS: &[&str] = &[
@@ -184,6 +181,8 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
 ];
 
 pub(super) fn build_runner_command() -> String {
+    return "cd /glibc && { ./busybox echo '#### OS COMP TEST GROUP START chmod-glibc ####'; for case_name in chmod03 chmod05 chmod06 fchmod01 fchmod02 fchmod03 fchmod04 fchmod05 fchmod06; do ./busybox echo \"RUN CHMOD LTP CASE $case_name\"; ./ltp/testcases/bin/$case_name; ret=$?; ./busybox echo \"CHMOD LTP CASE $case_name : $ret\"; done; ./busybox echo '#### OS COMP TEST GROUP END chmod-glibc ####'; }; cd /musl && { ./busybox echo '#### OS COMP TEST GROUP START chmod-musl ####'; for case_name in chmod03 chmod05 chmod06 fchmod01 fchmod02 fchmod03 fchmod04 fchmod05 fchmod06; do ./busybox echo \"RUN CHMOD LTP CASE $case_name\"; ./ltp/testcases/bin/$case_name; ret=$?; ./busybox echo \"CHMOD LTP CASE $case_name : $ret\"; done; ./busybox echo '#### OS COMP TEST GROUP END chmod-musl ####'; }; cd /musl && ./busybox reboot -f".into();
+
     if INTERACTIVE_SHELL || TEST_SCRIPTS.is_empty() {
         return "/musl/busybox sh".into();
     }

@@ -19,6 +19,8 @@ pub use path::{
     sys_truncate, sys_unlinkat, sys_utimensat,
 };
 pub use poll::{sys_ppoll, sys_pselect6};
-pub use stat::{sys_fchmodat, sys_fchownat, sys_fstat, sys_newfstatat, sys_statfs, sys_statx};
+pub use stat::{
+    sys_fchmod, sys_fchmodat, sys_fchownat, sys_fstat, sys_newfstatat, sys_statfs, sys_statx,
+};
 pub use tty::sys_ioctl;
 pub use uapi::{LinuxIovec, LinuxKstat, LinuxPollFd, LinuxStatfs, LinuxStatx};

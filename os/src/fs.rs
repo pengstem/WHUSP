@@ -153,6 +153,9 @@ pub trait File: Send + Sync {
     ) -> FsResult {
         Err(FsError::Unsupported)
     }
+    fn set_mode(&self, _mode: u32) -> FsResult {
+        Err(FsError::Unsupported)
+    }
     fn set_owner(&self, _uid: Option<u32>, _gid: Option<u32>) -> FsResult {
         Err(FsError::Unsupported)
     }
@@ -216,7 +219,7 @@ pub use stdio::{Stdin, Stdout};
 pub(crate) use vfs::open_file;
 pub(crate) use vfs::{
     FileSystemStat, FsError, FsResult, chmod_in, chown_in, lookup_dir_in, lookup_dir_with_stat_in,
-    open_file_in, stat_in, truncate_in,
+    open_file_in, open_file_in_with_owner, stat_in, truncate_in,
 };
 
 pub(self) fn align_up(value: usize, align: usize) -> usize {
