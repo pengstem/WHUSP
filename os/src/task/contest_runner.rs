@@ -2,7 +2,7 @@ use alloc::{format, string::String};
 
 const TEST_LIBCS: &[&str] = &["/glibc", "/musl"];
 
-const INTERACTIVE_SHELL: bool = true;
+const INTERACTIVE_SHELL: bool = false;
 
 const ALL_TESTS: &[&str] = &[
     "basic_testcode.sh",
@@ -27,7 +27,7 @@ const TEST_SCRIPTS: &[&str] = &[
     // perfect
     // "lua_testcode.sh",
     // runnable
-    "libctest_testcode.sh",
+    // "libctest_testcode.sh",
     // runnable
     // "iozone_testcode.sh",
     // runnable
@@ -35,7 +35,7 @@ const TEST_SCRIPTS: &[&str] = &[
     // runnable
     // "iperf_testcode.sh",
     // "libcbench_testcode.sh",
-    // "lmbench_testcode.sh",
+    "lmbench_testcode.sh",
     // runnable
     // "netperf_testcode.sh",
     // runnable
@@ -268,8 +268,15 @@ fn append_script_command(command: &mut String, libc_root: &str, script: &str) {
 fn append_normal_script(command: &mut String, libc_root: &str, script: &str) {
     command.push_str("cd ");
     command.push_str(libc_root);
-    command.push_str(" && ./busybox sh ./");
+    command.push_str(" && ");
+    if script == "lmbench_testcode.sh" {
+        command.push_str("./busybox rm -f /tmp/hello; ");
+    }
+    command.push_str("./busybox sh ./");
     command.push_str(script);
+    if script == "lmbench_testcode.sh" {
+        command.push_str("; ./busybox rm -f /tmp/hello");
+    }
 }
 
 fn append_ltp_runner(command: &mut String, libc_root: &str) {

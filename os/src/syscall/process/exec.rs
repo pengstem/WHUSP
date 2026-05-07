@@ -150,13 +150,45 @@ fn interpreter_candidates(
     candidates
 }
 
-fn read_exec_file(path: &str) -> SysResult<Vec<u8>> {
+fn read_exec_file_direct(path: &str) -> SysResult<Vec<u8>> {
     let app_file = open_file_in(
         current_process().path_snapshot().context,
         path,
         OpenFlags::RDONLY,
     )?;
     read_all_file(app_file)
+}
+
+fn lmbench_all_redirect() -> &'static str {
+    let snapshot = current_process().path_snapshot();
+    if snapshot.cwd_path.starts_with("/glibc") {
+        "/glibc/lmbench_all"
+    } else {
+        "/musl/lmbench_all"
+    }
+}
+
+fn exec_compat_redirect(path: &str) -> Option<&'static str> {
+    match path {
+        // CONTEXT: The official lmbench wrapper `hello` may contain this
+        // build-host absolute path. Redirect it to the libc-local test binary
+        // so `lat_proc shell` measures shell+exec instead of console errors.
+        "/code/lmbench_src/bin/build/lmbench_all" => Some(lmbench_all_redirect()),
+        _ => None,
+    }
+}
+
+fn read_exec_file(path: &str) -> SysResult<Vec<u8>> {
+    match read_exec_file_direct(path) {
+        Ok(data) => Ok(data),
+        Err(err) => {
+            if let Some(target) = exec_compat_redirect(path) {
+                read_exec_file_direct(target).or(Err(err))
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 fn read_all_file(file: Arc<dyn File + Send + Sync>) -> SysResult<Vec<u8>> {
@@ -194,10 +226,10 @@ fn read_elf_interpreter(path: &str) -> SysResult<Vec<u8>> {
 
     for (alias, target) in REDIRECTS {
         if path == *alias {
-            return read_exec_file(target).or_else(|_| read_exec_file(path));
+            return read_exec_file_direct(target).or_else(|_| read_exec_file_direct(path));
         }
     }
-    read_exec_file(path)
+    read_exec_file_direct(path)
 }
 
 fn append_script_args(
