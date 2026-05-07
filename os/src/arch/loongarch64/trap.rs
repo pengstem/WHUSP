@@ -4,10 +4,10 @@ use crate::config::TRAMPOLINE;
 use crate::mm::{MmapFaultAccess, MmapFaultResult};
 use crate::syscall::syscall;
 use crate::task::{
-    SignalFlags, account_current_system_time_until, account_current_user_time_until,
-    check_signals_of_current, current_add_signal, current_process, current_trap_cx,
-    current_user_token, exit_current_group_and_run_next, mark_current_user_time_entry,
-    suspend_current_and_run_next,
+    account_current_system_time_until, account_current_user_time_until, check_signals_of_current,
+    current_add_signal, current_process, current_trap_cx, current_user_token,
+    exit_current_group_and_run_next, mark_current_user_time_entry, suspend_current_and_run_next,
+    SignalFlags,
 };
 use crate::timer::{check_timer, get_time_us, set_next_trigger};
 use core::arch::global_asm;
@@ -129,8 +129,7 @@ pub fn trap_handler() -> ! {
     if crate::arch::signal::deliver_pending_signal(interrupted_pc) {
         trap_return();
     }
-    if let Some((errno, msg)) = check_signals_of_current() {
-        println!("[kernel] {}", msg);
+    if let Some((errno, _msg)) = check_signals_of_current() {
         exit_current_group_and_run_next(errno);
     }
     trap_return();
