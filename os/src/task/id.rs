@@ -133,12 +133,19 @@ pub struct TaskUserRes {
     pub process: Weak<ProcessControlBlock>,
 }
 
+const USER_STACK_INITIAL_SIZE: usize = PAGE_SIZE * 16;
+
 fn trap_cx_bottom_from_tid(tid: usize) -> usize {
     TRAP_CONTEXT_BASE - tid * PAGE_SIZE
 }
 
 fn ustack_bottom_from_tid(ustack_base: usize, tid: usize) -> usize {
     ustack_base + tid * (PAGE_SIZE + USER_STACK_SIZE)
+}
+
+fn ustack_mapped_bottom_from_tid(ustack_base: usize, tid: usize) -> usize {
+    let ustack_top = ustack_bottom_from_tid(ustack_base, tid) + USER_STACK_SIZE;
+    ustack_top - USER_STACK_INITIAL_SIZE.min(USER_STACK_SIZE)
 }
 
 impl TaskUserRes {
@@ -163,8 +170,12 @@ impl TaskUserRes {
         let process = self.process.upgrade().unwrap();
         let mut process_inner = process.inner_exclusive_access();
         // alloc user stack
-        let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
-        let ustack_top = ustack_bottom + USER_STACK_SIZE;
+        // UNFINISHED: Linux user stacks grow on demand up to the rlimit. This
+        // kernel does not have a general stack-growth fault path yet, so map a
+        // bounded initial window eagerly while preserving the full virtual stack
+        // spacing.
+        let ustack_bottom = ustack_mapped_bottom_from_tid(self.ustack_base, self.tid);
+        let ustack_top = ustack_bottom_from_tid(self.ustack_base, self.tid) + USER_STACK_SIZE;
         process_inner.memory_set.insert_framed_area(
             ustack_bottom.into(),
             ustack_top.into(),
@@ -185,7 +196,8 @@ impl TaskUserRes {
         let process = self.process.upgrade().unwrap();
         let mut process_inner = process.inner_exclusive_access();
         // dealloc ustack manually
-        let ustack_bottom_va: VirtAddr = ustack_bottom_from_tid(self.ustack_base, self.tid).into();
+        let ustack_bottom_va: VirtAddr =
+            ustack_mapped_bottom_from_tid(self.ustack_base, self.tid).into();
         process_inner
             .memory_set
             .remove_area_with_start_vpn(ustack_bottom_va.into());

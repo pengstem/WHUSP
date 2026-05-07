@@ -487,12 +487,12 @@ impl ProcessControlBlock {
         let inner = self.inner_exclusive_access();
         let state = if inner.is_zombie {
             'Z'
-        } else if inner
-            .tasks
-            .iter()
-            .flatten()
-            .any(|task| task.inner_exclusive_access().task_status == TaskStatus::Running)
-        {
+        } else if inner.tasks.iter().flatten().any(|task| {
+            matches!(
+                task.inner_exclusive_access().task_status,
+                TaskStatus::Ready | TaskStatus::Running
+            )
+        }) {
             'R'
         } else {
             'S'

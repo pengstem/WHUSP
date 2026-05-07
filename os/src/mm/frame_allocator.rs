@@ -18,6 +18,10 @@ impl FrameTracker {
         }
         Self { ppn }
     }
+
+    pub fn from_retained(ppn: PhysPageNum) -> Option<Self> {
+        frame_retain(ppn).then_some(Self { ppn })
+    }
 }
 
 impl Debug for FrameTracker {
@@ -44,6 +48,7 @@ pub struct StackFrameAllocator {
     current: usize,
     end: usize,
     recycled: Vec<usize>,
+    ref_counts: Vec<usize>,
 }
 
 impl StackFrameAllocator {
@@ -51,6 +56,9 @@ impl StackFrameAllocator {
         self.start = l.0;
         self.current = l.0;
         self.end = r.0;
+        self.ref_counts.clear();
+        self.ref_counts
+            .resize(self.end.saturating_sub(self.start), 0);
         // println!("last {} Physical Frames.", self.end - self.current);
     }
 
@@ -70,17 +78,20 @@ impl FrameAllocator for StackFrameAllocator {
             current: 0,
             end: 0,
             recycled: Vec::new(),
+            ref_counts: Vec::new(),
         }
     }
     fn alloc(&mut self) -> Option<PhysPageNum> {
-        if let Some(ppn) = self.recycled.pop() {
-            Some(ppn.into())
+        let ppn = if let Some(ppn) = self.recycled.pop() {
+            ppn
         } else if self.current == self.end {
-            None
+            return None;
         } else {
             self.current += 1;
-            Some((self.current - 1).into())
-        }
+            self.current - 1
+        };
+        self.ref_counts[ppn - self.start] = 1;
+        Some(ppn.into())
     }
     fn alloc_more(&mut self, pages: usize) -> Option<Vec<PhysPageNum>> {
         if self.current + pages >= self.end {
@@ -88,18 +99,52 @@ impl FrameAllocator for StackFrameAllocator {
         } else {
             self.current += pages;
             let arr: Vec<usize> = (1..pages + 1).collect();
-            let v = arr.iter().map(|x| (self.current - x).into()).collect();
+            let v = arr
+                .iter()
+                .map(|x| {
+                    let ppn = self.current - x;
+                    self.ref_counts[ppn - self.start] = 1;
+                    ppn.into()
+                })
+                .collect();
             Some(v)
         }
     }
     fn dealloc(&mut self, ppn: PhysPageNum) {
         let ppn = ppn.0;
+        if ppn < self.start || ppn >= self.current {
+            panic!("Frame ppn={ppn:#x} has not been allocated!");
+        }
+        let count = &mut self.ref_counts[ppn - self.start];
+        if *count == 0 {
+            panic!("Frame ppn={ppn:#x} has no reference count!");
+        }
+        if *count > 1 {
+            *count -= 1;
+            return;
+        }
+        *count = 0;
         // validity check
-        if ppn >= self.current || self.recycled.contains(&ppn) {
+        if self.recycled.contains(&ppn) {
             panic!("Frame ppn={ppn:#x} has not been allocated!");
         }
         // recycle
         self.recycled.push(ppn);
+    }
+}
+
+impl StackFrameAllocator {
+    fn retain(&mut self, ppn: PhysPageNum) -> bool {
+        let ppn = ppn.0;
+        if ppn < self.start || ppn >= self.current {
+            return false;
+        }
+        let count = &mut self.ref_counts[ppn - self.start];
+        if *count == 0 {
+            return false;
+        }
+        *count += 1;
+        true
     }
 }
 
@@ -137,6 +182,10 @@ pub fn frame_alloc_more(num: usize) -> Option<Vec<FrameTracker>> {
 
 pub fn frame_dealloc(ppn: PhysPageNum) {
     FRAME_ALLOCATOR.exclusive_access().dealloc(ppn);
+}
+
+pub fn frame_retain(ppn: PhysPageNum) -> bool {
+    FRAME_ALLOCATOR.exclusive_access().retain(ppn)
 }
 
 pub fn frame_stats() -> (usize, usize) {

@@ -158,7 +158,7 @@ impl MemorySet {
                         PAGE_CACHE.exclusive_access().dec_ref(key);
                     }
                 }
-            } else {
+            } else if area.map_perm.contains(MapPermission::W) {
                 memory_set.push(new_area, None);
                 for vpn in area.vpn_range {
                     let src_ppn = user_space.translate(vpn).unwrap().ppn();
@@ -166,6 +166,21 @@ impl MemorySet {
                     dst_ppn
                         .get_bytes_array()
                         .copy_from_slice(src_ppn.get_bytes_array());
+                }
+            } else {
+                memory_set.areas.push(new_area);
+                let area_idx = memory_set.areas.len() - 1;
+                let resident_vpns: Vec<_> = area.data_frames.keys().copied().collect();
+                for vpn in resident_vpns {
+                    let Some(src_pte) = user_space.translate(vpn) else {
+                        continue;
+                    };
+                    let Some(frame) = FrameTracker::from_retained(src_pte.ppn()) else {
+                        continue;
+                    };
+                    let page_table = &mut memory_set.page_table;
+                    let dst_area = &mut memory_set.areas[area_idx];
+                    dst_area.map_existing_frame(page_table, vpn, frame);
                 }
             }
         }
