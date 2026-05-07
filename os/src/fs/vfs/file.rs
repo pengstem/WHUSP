@@ -6,7 +6,7 @@ use super::super::status_flags::StatusFlagsCell;
 use super::super::{File, FileStat, FileTimestamp, SeekWhence};
 use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
-use crate::mm::{UserBuffer, page_cache::PageCacheId};
+use crate::mm::{page_cache::PageCacheId, UserBuffer};
 use crate::sync::SleepMutex;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -113,6 +113,31 @@ impl VfsFile {
             }
         }
         total_write_size
+    }
+
+    fn noatime_snapshot(&self) -> Option<(FileTimestamp, FileTimestamp)> {
+        if !self.status_flags.get().contains(OpenFlags::NOATIME) {
+            return None;
+        }
+        let stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))?.ok()?;
+        Some((
+            FileTimestamp {
+                sec: stat.atime_sec,
+                nsec: stat.atime_nsec,
+            },
+            FileTimestamp {
+                sec: stat.ctime_sec,
+                nsec: stat.ctime_nsec,
+            },
+        ))
+    }
+
+    fn restore_noatime(&self, snapshot: Option<(FileTimestamp, FileTimestamp)>) {
+        if let Some((atime, ctime)) = snapshot {
+            let _ = with_mount(self.node.mount_id, |mount| {
+                mount.set_times(self.node.ino, Some(atime), None, ctime)
+            });
+        }
     }
 }
 
@@ -355,6 +380,7 @@ impl File for VfsFile {
         if self.kind == FsNodeKind::Directory {
             return 0;
         }
+        let noatime_snapshot = self.noatime_snapshot();
         let mut offset = self.offset.lock();
         let mut total_read_size = 0usize;
         for slice in buf.buffers.iter_mut() {
@@ -367,6 +393,10 @@ impl File for VfsFile {
             }
             *offset += read_size;
             total_read_size += read_size;
+        }
+        drop(offset);
+        if total_read_size > 0 {
+            self.restore_noatime(noatime_snapshot);
         }
         total_read_size
     }
@@ -390,10 +420,15 @@ impl File for VfsFile {
         if self.kind == FsNodeKind::Directory {
             return 0;
         }
-        with_mount(self.node.mount_id, |mount| {
+        let noatime_snapshot = self.noatime_snapshot();
+        let read_size = with_mount(self.node.mount_id, |mount| {
             mount.read_at(self.node.ino, buf, offset as u64)
         })
-        .expect("filesystem mount is missing")
+        .expect("filesystem mount is missing");
+        if read_size > 0 {
+            self.restore_noatime(noatime_snapshot);
+        }
+        read_size
     }
 
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize {

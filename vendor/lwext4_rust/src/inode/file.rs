@@ -6,7 +6,7 @@ use core::{
 use super::InodeRef;
 
 use crate::{
-    Ext4Result, InodeType, SystemHal, WritebackGuard, error::Context, ffi::*, util::get_block_size,
+    error::Context, ffi::*, util::get_block_size, Ext4Result, InodeType, SystemHal, WritebackGuard,
 };
 
 fn take<'a>(buf: &mut &'a [u8], cnt: usize) -> &'a [u8] {
@@ -47,6 +47,21 @@ impl<Hal: SystemHal> InodeRef<Hal> {
                 .context("ext4_fs_append_inode_dblk_idx")?;
             Ok((fblock, block))
         }
+    }
+    fn ensure_inode_fblock(&mut self, block: u32) -> Ext4Result<(u64, bool)> {
+        let fblock = self.get_inode_fblock(block)?;
+        if fblock != 0 {
+            return Ok((fblock, false));
+        }
+
+        let fblock = self.init_inode_fblock(block)?;
+        if fblock != 0 {
+            return Ok((fblock, true));
+        }
+
+        let (fblock, new_block) = self.append_inode_fblock()?;
+        assert_eq!(block, new_block);
+        Ok((fblock, true))
     }
 
     fn read_bytes(&mut self, offset: u64, buf: &mut [u8]) -> Ext4Result<()> {
@@ -150,6 +165,8 @@ impl<Hal: SystemHal> InodeRef<Hal> {
     }
 
     pub fn write_at(&mut self, mut buf: &[u8], pos: u64) -> Ext4Result<usize> {
+        static EMPTY: [u8; 4096] = [0; 4096];
+
         unsafe {
             let mut file_size = self.size();
             if pos > file_size {
@@ -159,7 +176,6 @@ impl<Hal: SystemHal> InodeRef<Hal> {
             }
 
             let block_size = get_block_size(self.superblock());
-            let block_count = file_size.div_ceil(block_size as u64) as u32;
             let bdev = (*self.inner.fs).bdev;
 
             if buf.is_empty() {
@@ -169,16 +185,6 @@ impl<Hal: SystemHal> InodeRef<Hal> {
 
             // TODO: symlink?
 
-            let get_fblock = |this: &mut Self, block: u32| -> Ext4Result<u64> {
-                if block < block_count {
-                    this.init_inode_fblock(block)
-                } else {
-                    let (fblock, new_block) = this.append_inode_fblock()?;
-                    assert_eq!(block, new_block);
-                    Ok(fblock)
-                }
-            };
-
             let mut block_start = (pos / block_size as u64) as u32;
             // This is inclusive!
             let block_end = ((pos + buf.len() as u64) / block_size as u64) as u32;
@@ -186,7 +192,10 @@ impl<Hal: SystemHal> InodeRef<Hal> {
             let offset = pos % block_size as u64;
             if offset > 0 {
                 let buf = take(&mut buf, block_size as usize - offset as usize);
-                let fblock = get_fblock(self, block_start)?;
+                let (fblock, new_block) = self.ensure_inode_fblock(block_start)?;
+                if new_block {
+                    self.write_bytes(fblock * block_size as u64, &EMPTY[..block_size as usize])?;
+                }
                 self.write_bytes(fblock * block_size as u64 + offset, buf)?;
                 block_start += 1;
             }
@@ -203,7 +212,7 @@ impl<Hal: SystemHal> InodeRef<Hal> {
                     .context("ext4_blocks_set_direct")
             };
             for block in block_start..block_end {
-                let fblock = get_fblock(self, block)?;
+                let (fblock, _) = self.ensure_inode_fblock(block)?;
                 if fblock != fblock_start + fblock_count as u64 {
                     flush_fblock_segment(&mut buf, fblock_start, fblock_count)?;
                     fblock_start = fblock;
@@ -215,7 +224,10 @@ impl<Hal: SystemHal> InodeRef<Hal> {
 
             assert!(buf.len() < block_size as usize);
             if !buf.is_empty() {
-                let fblock = get_fblock(self, block_end)?;
+                let (fblock, new_block) = self.ensure_inode_fblock(block_end)?;
+                if new_block {
+                    self.write_bytes(fblock * block_size as u64, &EMPTY[..block_size as usize])?;
+                }
                 self.write_bytes(fblock * block_size as u64, buf)?;
             }
 
@@ -272,28 +284,23 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         if len < cur_len {
             self.truncate(len)?;
         } else if len > cur_len {
-            // TODO: correct implementation
             let block_size = get_block_size(self.superblock());
-            let old_blocks = cur_len.div_ceil(block_size as u64) as u32;
-            let new_blocks = len.div_ceil(block_size as u64) as u32;
-            for block in old_blocks..new_blocks {
-                let (fblock, new_block) = self.append_inode_fblock()?;
-                assert_eq!(block, new_block);
-                self.write_bytes(fblock * block_size as u64, &EMPTY[..block_size as usize])?;
+            let old_block_start = (cur_len % block_size as u64) as usize;
+            if cur_len > 0 && old_block_start > 0 {
+                let old_last_block = (cur_len / block_size as u64) as u32;
+                let (fblock, _) = self.ensure_inode_fblock(old_last_block)?;
+                let length = block_size as usize - old_block_start;
+                self.write_bytes(
+                    fblock * block_size as u64 + old_block_start as u64,
+                    &EMPTY[..length],
+                )?;
             }
 
-            // Clear the last block extended part
-            let old_last_block = (cur_len / block_size as u64) as u32;
-            let old_block_start = (cur_len - (old_last_block as u64 * block_size as u64)) as usize;
-            let fblock = self.init_inode_fblock(old_last_block)?;
-            assert!(fblock != 0, "fblock should not be zero");
-            let length = block_size as usize - old_block_start;
-            self.write_bytes(
-                fblock * block_size as u64 + old_block_start as u64,
-                &EMPTY[..length],
-            )?;
-
             unsafe {
+                // UNFINISHED: sparse extension only records the new file size
+                // and zeroes the old tail block. It does not yet implement the
+                // full Linux sparse-file behavior for every indirect-block
+                // layout and read-back edge case.
                 ext4_inode_set_size(self.inner.inode, len);
             }
             self.mark_dirty();

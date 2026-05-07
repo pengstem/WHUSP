@@ -1,28 +1,28 @@
 use super::super::errno::{SysError, SysResult};
 use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{
-    PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, read_user_value,
-    translated_byte_buffer_checked,
+    copy_to_user, read_user_c_string, read_user_value, translated_byte_buffer_checked,
+    UserBufferAccess, PATH_MAX,
 };
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::stat::resolve_stat_from;
 use super::uapi::{
     AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, F_OK, RENAME_EXCHANGE,
-    RENAME_NOREPLACE, RENAME_WHITEOUT, UTIME_NOW, UTIME_OMIT, VALID_ACCESS_MODE,
-    VALID_FACCESSAT_FLAGS, VALID_FACCESSAT2_FLAGS, VALID_RENAME_FLAGS, VALID_UTIMENSAT_FLAGS, W_OK,
+    RENAME_NOREPLACE, RENAME_WHITEOUT, R_OK, UTIME_NOW, UTIME_OMIT, VALID_ACCESS_MODE,
+    VALID_FACCESSAT2_FLAGS, VALID_FACCESSAT_FLAGS, VALID_RENAME_FLAGS, VALID_UTIMENSAT_FLAGS, W_OK,
     X_OK,
 };
 use crate::fs::{
-    File, FileCreateAttrs, FileStat, FileTimestamp, FsNodeKind, MountId, OpenFlags, PathContext,
-    S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, WorkingDir, chown_in,
-    create_node_in, link_file_in, lookup_dir_in, lookup_dir_with_stat_in, mkdir_in,
+    chown_in, create_node_in, link_file_in, lookup_dir_in, lookup_dir_with_stat_in, mkdir_in,
     mount_is_read_only, normalize_path_at_root, open_devfs_child, open_devfs_misc_child,
     open_file_in, open_file_in_with_attrs, open_static_path, path_inside_root, rename_in, rmdir_in,
-    symlink_in, truncate_in, unlink_file_in,
+    symlink_in, truncate_in, unlink_file_in, File, FileCreateAttrs, FileStat, FileTimestamp,
+    FsNodeKind, MountId, OpenFlags, PathContext, WorkingDir, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
+    S_IFMT, S_IFREG, S_IFSOCK,
 };
 use crate::mm::UserBuffer;
 use crate::task::{
-    CAP_SYS_CHROOT, FdTableEntry, PathSnapshot, current_process, current_user_token,
+    current_process, current_user_token, FdTableEntry, PathSnapshot, CAP_SYS_CHROOT,
 };
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -156,6 +156,45 @@ fn check_access_path_prefixes_from(
         check_access_mode(&stat, X_OK, subject)?;
     }
     Ok(())
+}
+
+fn check_open_existing_access_from(
+    snapshot: &PathSnapshot,
+    dirfd: isize,
+    path: &str,
+    flags: OpenFlags,
+    subject: AccessSubject<'_>,
+) -> SysResult<()> {
+    if path.is_empty() {
+        return Err(SysError::ENOENT);
+    }
+    let follow_final_symlink =
+        !flags.contains(OpenFlags::NOFOLLOW) || flags.contains(OpenFlags::PATH);
+    let stat = match resolve_stat_from(snapshot, dirfd, path, follow_final_symlink) {
+        Ok(stat) => stat,
+        Err(SysError::ENOENT) if flags.contains(OpenFlags::CREATE) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+
+    // CONTEXT: Linux gates O_NOATIME on file ownership or CAP_FOWNER. This
+    // kernel's capabilities are still process-wide and not recalculated across
+    // setuid transitions, so uid 0 is the current CAP_FOWNER-equivalent check.
+    if flags.contains(OpenFlags::NOATIME) && subject.uid != stat.uid && !subject.is_root() {
+        return Err(SysError::EPERM);
+    }
+
+    if flags.contains(OpenFlags::PATH) {
+        return Ok(());
+    }
+    let (readable, writable) = flags.read_write();
+    let mut access_mode = F_OK;
+    if readable {
+        access_mode |= R_OK;
+    }
+    if writable || flags.contains(OpenFlags::TRUNC) {
+        access_mode |= W_OK;
+    }
+    check_access_mode(&stat, access_mode, subject)
 }
 
 pub(super) fn check_current_access_path_prefixes_from(
@@ -335,6 +374,13 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> SysRe
     }
     let context = path_context_from(&snapshot, dirfd, path.as_str())?;
     let credentials = current_process().credentials();
+    let subject = AccessSubject {
+        uid: credentials.fsuid,
+        gid: credentials.fsgid,
+        groups: &credentials.groups,
+    };
+    check_access_path_prefixes_from(&snapshot, dirfd, path.as_str(), subject)?;
+    check_open_existing_access_from(&snapshot, dirfd, path.as_str(), flags, subject)?;
     let file = open_file_in_with_attrs(
         context,
         path.as_str(),

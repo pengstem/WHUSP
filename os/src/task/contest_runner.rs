@@ -180,9 +180,9 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
     // Stress, freeze, or known hang/error cases seen in reference runners.
 ];
 
-const DIRECT_LTP_GROUP: &str = "fcntl";
+const DIRECT_LTP_GROUP: &str = "open";
 
-const DIRECT_LTP_CASES: &[&str] = &[];
+const DIRECT_LTP_CASES: &[&str] = &["open13", "open14"];
 
 pub(super) fn build_runner_command() -> String {
     if DIRECT_LTP_CASES.first().is_some() {
@@ -221,7 +221,11 @@ pub(super) fn build_runner_command() -> String {
 fn append_direct_ltp_runner(command: &mut String, libc_root: &str) {
     command.push_str("cd ");
     command.push_str(libc_root);
-    command.push_str(" && { ./busybox echo \"#### OS COMP TEST GROUP START ");
+    command.push_str(" && { PATH=");
+    command.push_str(libc_root);
+    command.push_str(
+        "/ltp/testcases/bin:$PATH; export PATH; ./busybox echo \"#### OS COMP TEST GROUP START ",
+    );
     command.push_str(DIRECT_LTP_GROUP);
     command.push('-');
     command.push_str(libc_label(libc_root));

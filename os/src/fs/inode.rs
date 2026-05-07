@@ -1,14 +1,14 @@
 use super::mount::{mounted_root_for, with_mount};
 use super::path::{PathContext, WorkingDir};
 use super::vfs::{
-    FsError, FsNodeKind, FsResult, VfsNodeId, resolve_create_parent_in, resolve_mount_target_in,
+    resolve_create_parent_in, resolve_mount_target_in, FsError, FsNodeKind, FsResult, VfsNodeId,
 };
 use bitflags::*;
 use lwext4_rust::ffi::EXT4_ROOT_INO;
 
 // UNFINISHED: Linux open/openat define additional status and creation flags
-// such as O_TMPFILE, O_NOATIME, and O_ASYNC. This kernel accepts only the
-// flags represented below.
+// such as O_TMPFILE and O_ASYNC. This kernel accepts only the flags
+// represented below.
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct OpenFlags: u32 {
@@ -26,6 +26,7 @@ bitflags! {
         const LARGEFILE = 0o100000;
         const DIRECTORY = 0o200000;
         const NOFOLLOW = 0o400000;
+        const NOATIME = 0o1000000;
         const CLOEXEC = 0o2000000;
         const SYNC = 0o4010000;
         const PATH = 0o10000000;
@@ -69,6 +70,7 @@ impl OpenFlags {
             flags.bits()
                 & (Self::ACCESS_MODE_MASK
                     | Self::PATH.bits()
+                    | Self::NOATIME.bits()
                     | Self::FCNTL_MUTABLE_STATUS_MASK
                     | Self::ACCEPTED_SYNC_STATUS_MASK),
         )
@@ -83,7 +85,11 @@ impl OpenFlags {
 
 fn trimmed_nonroot_path(name: &str) -> &str {
     let trimmed = name.trim_end_matches('/');
-    if trimmed.is_empty() { name } else { trimmed }
+    if trimmed.is_empty() {
+        name
+    } else {
+        trimmed
+    }
 }
 
 fn final_component(name: &str) -> Option<&str> {

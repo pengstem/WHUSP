@@ -1,4 +1,4 @@
-use super::dirent::{DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, RawDirEntry, write_dir_entries};
+use super::dirent::{write_dir_entries, RawDirEntry, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG};
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
 use super::{FileStat, FileTimestamp, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG};
 use alloc::collections::BTreeMap;
@@ -6,6 +6,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 const ROOT_INO: u32 = 2;
+const TMPFS_INLINE_FILE_LIMIT: usize = 64 * 1024 * 1024;
+const TMPFS_ALLOCATED_PAYLOAD_LIMIT: usize = 64 * 1024 * 1024;
 
 struct TmpfsInode {
     kind: FsNodeKind,
@@ -15,7 +17,9 @@ struct TmpfsInode {
     nlink: u32,
     open_count: usize,
     pending_delete: bool,
+    size: u64,
     data: Vec<u8>,
+    sparse_data: BTreeMap<u64, Vec<u8>>,
     children: BTreeMap<String, u32>,
     parent_ino: u32,
     atime: FileTimestamp,
@@ -40,7 +44,9 @@ impl TmpfsInode {
             nlink,
             open_count: 0,
             pending_delete: false,
+            size: 0,
             data: Vec::new(),
+            sparse_data: BTreeMap::new(),
             children: BTreeMap::new(),
             parent_ino,
             atime: now,
@@ -53,6 +59,84 @@ impl TmpfsInode {
         let now = FileTimestamp::now();
         self.ctime = now;
         self.mtime = now;
+    }
+
+    fn allocated_payload_len(&self) -> usize {
+        self.data.len() + self.sparse_data.values().map(Vec::len).sum::<usize>()
+    }
+
+    fn remove_sparse_range(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        let overlapping: Vec<u64> = self
+            .sparse_data
+            .range(..end)
+            .filter_map(|(&extent_start, data)| {
+                let extent_end = extent_start.saturating_add(data.len() as u64);
+                if extent_end > start {
+                    Some(extent_start)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for extent_start in overlapping {
+            let Some(data) = self.sparse_data.remove(&extent_start) else {
+                continue;
+            };
+            let extent_end = extent_start.saturating_add(data.len() as u64);
+            if extent_start < start {
+                let keep_len = (start - extent_start) as usize;
+                self.sparse_data
+                    .insert(extent_start, data[..keep_len].to_vec());
+            }
+            if extent_end > end {
+                let right_offset = (end - extent_start) as usize;
+                self.sparse_data.insert(end, data[right_offset..].to_vec());
+            }
+        }
+    }
+
+    fn truncate_sparse_to(&mut self, len: u64) {
+        let affected: Vec<u64> = self
+            .sparse_data
+            .range(..)
+            .filter_map(|(&extent_start, data)| {
+                let extent_end = extent_start.saturating_add(data.len() as u64);
+                if extent_start >= len || extent_end > len {
+                    Some(extent_start)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for extent_start in affected {
+            let Some(mut data) = self.sparse_data.remove(&extent_start) else {
+                continue;
+            };
+            if extent_start < len {
+                data.truncate((len - extent_start) as usize);
+                self.sparse_data.insert(extent_start, data);
+            }
+        }
+    }
+
+    fn copy_sparse_to(&self, offset: u64, buf: &mut [u8]) {
+        let end = offset.saturating_add(buf.len() as u64);
+        for (&extent_start, data) in self.sparse_data.range(..end) {
+            let extent_end = extent_start.saturating_add(data.len() as u64);
+            if extent_end <= offset {
+                continue;
+            }
+            let src_start = offset.saturating_sub(extent_start) as usize;
+            let dst_start = extent_start.saturating_sub(offset) as usize;
+            let copy_len = (data.len() - src_start).min(buf.len() - dst_start);
+            buf[dst_start..dst_start + copy_len]
+                .copy_from_slice(&data[src_start..src_start + copy_len]);
+        }
     }
 }
 
@@ -303,6 +387,7 @@ impl FileSystemBackend for TmpFs {
         let ino = self.create_node(parent_ino, leaf_name, FsNodeKind::Symlink, S_IFLNK | 0o777)?;
         let inode = self.inode_mut(ino)?;
         inode.data.extend_from_slice(target);
+        inode.size = target.len() as u64;
         inode.touch();
         Ok(())
     }
@@ -360,15 +445,22 @@ impl FileSystemBackend for TmpFs {
     }
 
     fn set_len(&mut self, ino: u32, len: u64) -> FsResult {
-        const TMPFS_MAX_FILE_SIZE: u64 = 64 * 1024 * 1024;
         let inode = self.inode_mut(ino)?;
         if inode.kind == FsNodeKind::Directory {
             return Err(FsError::IsDir);
         }
-        if len > TMPFS_MAX_FILE_SIZE {
+        if len < inode.size {
+            inode.truncate_sparse_to(len);
+        }
+        if len as usize <= TMPFS_INLINE_FILE_LIMIT {
+            inode.data.resize(len as usize, 0);
+        } else if inode.data.len() as u64 > len {
+            inode.data.truncate(len as usize);
+        }
+        if inode.allocated_payload_len() > TMPFS_ALLOCATED_PAYLOAD_LIMIT {
             return Err(FsError::NoSpace);
         }
-        inode.data.resize(len as usize, 0);
+        inode.size = len;
         inode.touch();
         Ok(())
     }
@@ -395,7 +487,11 @@ impl FileSystemBackend for TmpFs {
         let inode = self.inode(ino)?;
         let size = match inode.kind {
             FsNodeKind::Directory => inode.children.len() as u64,
-            _ => inode.data.len() as u64,
+            _ => inode.size,
+        };
+        let blocks = match inode.kind {
+            FsNodeKind::Directory => size.div_ceil(512),
+            _ => (inode.allocated_payload_len() as u64).div_ceil(512),
         };
         Ok(FileStat {
             mode: inode.mode,
@@ -403,7 +499,7 @@ impl FileSystemBackend for TmpFs {
             uid: inode.uid,
             gid: inode.gid,
             size,
-            blocks: size.div_ceil(512),
+            blocks,
             blksize: super::DEFAULT_BLOCK_SIZE,
             atime_sec: inode.atime.sec,
             atime_nsec: inode.atime.nsec,
@@ -457,7 +553,7 @@ impl FileSystemBackend for TmpFs {
         if inode.kind != FsNodeKind::Symlink {
             return Err(FsError::InvalidInput);
         }
-        let len = buf.len().min(inode.data.len());
+        let len = buf.len().min(inode.size as usize).min(inode.data.len());
         buf[..len].copy_from_slice(&inode.data[..len]);
         Ok(len)
     }
@@ -469,9 +565,18 @@ impl FileSystemBackend for TmpFs {
         if inode.kind == FsNodeKind::Directory {
             return 0;
         }
-        let start = (offset as usize).min(inode.data.len());
-        let len = buf.len().min(inode.data.len() - start);
-        buf[..len].copy_from_slice(&inode.data[start..start + len]);
+        if offset >= inode.size {
+            return 0;
+        }
+        let len = buf.len().min((inode.size - offset) as usize);
+        let out = &mut buf[..len];
+        out.fill(0);
+        if offset < inode.data.len() as u64 {
+            let start = offset as usize;
+            let inline_len = out.len().min(inode.data.len() - start);
+            out[..inline_len].copy_from_slice(&inode.data[start..start + inline_len]);
+        }
+        inode.copy_sparse_to(offset, out);
         if len > 0 {
             if let Ok(inode) = self.inode_mut(ino) {
                 inode.atime = FileTimestamp::now();
@@ -487,12 +592,29 @@ impl FileSystemBackend for TmpFs {
         if inode.kind != FsNodeKind::RegularFile {
             return 0;
         }
-        let start = offset as usize;
-        let end = start.saturating_add(buf.len());
-        if end > inode.data.len() {
-            inode.data.resize(end, 0);
+        let Some(end) = offset.checked_add(buf.len() as u64) else {
+            return 0;
+        };
+        if end as usize <= TMPFS_INLINE_FILE_LIMIT {
+            let start = offset as usize;
+            let end = end as usize;
+            if end > inode.data.len() {
+                inode.data.resize(end, 0);
+            }
+            inode.data[start..end].copy_from_slice(buf);
+            inode.remove_sparse_range(offset, end as u64);
+        } else {
+            inode.remove_sparse_range(offset, end);
+            if inode.allocated_payload_len().saturating_add(buf.len())
+                > TMPFS_ALLOCATED_PAYLOAD_LIMIT
+            {
+                return 0;
+            }
+            inode.sparse_data.insert(offset, buf.to_vec());
         }
-        inode.data[start..end].copy_from_slice(buf);
+        if end > inode.size {
+            inode.size = end;
+        }
         inode.touch();
         buf.len()
     }
