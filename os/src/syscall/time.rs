@@ -96,11 +96,7 @@ impl ClockKind {
             Self::Monotonic | Self::MonotonicRaw | Self::MonotonicCoarse | Self::Boottime => {
                 Ok(ClockBackend::Monotonic)
             }
-            Self::ProcessCpu | Self::ThreadCpu => {
-                // UNFINISHED: CPU clocks require per-process and per-thread CPU
-                // accounting with POSIX clock semantics; expose unsupported for now.
-                Err(SysError::ENOTSUP)
-            }
+            Self::ProcessCpu | Self::ThreadCpu => Err(SysError::EINVAL),
         }
     }
 
@@ -215,6 +211,13 @@ fn us_to_timeval(us: usize) -> LinuxTimeVal {
     LinuxTimeVal {
         tv_sec: (us / USEC_PER_SEC) as isize,
         tv_usec: (us % USEC_PER_SEC) as isize,
+    }
+}
+
+fn us_to_timespec(us: usize) -> LinuxTimeSpec {
+    LinuxTimeSpec {
+        tv_sec: (us / USEC_PER_SEC).min(isize::MAX as usize) as isize,
+        tv_nsec: ((us % USEC_PER_SEC) * 1_000) as isize,
     }
 }
 
@@ -371,6 +374,11 @@ fn clock_getres_resolution(clock_id: i32) -> SysResult<LinuxTimeSpec> {
     }
 }
 
+fn process_cpu_timespec() -> LinuxTimeSpec {
+    let times = current_process().cpu_times_snapshot();
+    us_to_timespec(times.user_us.saturating_add(times.system_us))
+}
+
 fn remaining_until_timespec(expire_ms: usize) -> LinuxTimeSpec {
     let remaining_ms = expire_ms.saturating_sub(get_time_ms());
     let remaining_nanos = (remaining_ms as u64).saturating_mul(NSEC_PER_MSEC as u64);
@@ -416,8 +424,18 @@ pub fn sys_clock_gettime(clock_id: i32, tp: *mut LinuxTimeSpec) -> SysResult {
     if tp.is_null() {
         return Err(SysError::EFAULT);
     }
-    let nanos = current_clock_nanos(ClockKind::from_raw(clock_id)?.gettime_backend()?);
-    write_user_value(current_user_token(), tp, &nanos_to_timespec(nanos))?;
+    let clock = ClockKind::from_raw(clock_id)?;
+    let timespec = match clock {
+        ClockKind::ProcessCpu => process_cpu_timespec(),
+        ClockKind::ThreadCpu => {
+            // UNFINISHED: Thread CPU time currently reuses process-wide
+            // trap-boundary accounting because per-thread CPU accounting is
+            // not represented separately in the task model yet.
+            process_cpu_timespec()
+        }
+        _ => nanos_to_timespec(current_clock_nanos(clock.gettime_backend()?)),
+    };
+    write_user_value(current_user_token(), tp, &timespec)?;
     Ok(0)
 }
 
