@@ -128,14 +128,27 @@ pub fn sys_ftruncate(fd: usize, len: usize) -> SysResult {
     Ok(0)
 }
 
+const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
+const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+const FALLOC_FL_INSERT_RANGE: u32 = 0x20;
+const FALLOC_FL_UNSHARE_RANGE: u32 = 0x40;
+const FALLOC_KNOWN_FLAGS: u32 = FALLOC_FL_KEEP_SIZE
+    | FALLOC_FL_PUNCH_HOLE
+    | FALLOC_FL_COLLAPSE_RANGE
+    | FALLOC_FL_ZERO_RANGE
+    | FALLOC_FL_INSERT_RANGE
+    | FALLOC_FL_UNSHARE_RANGE;
+
 pub fn sys_fallocate(fd: usize, mode: u32, offset: usize, len: usize) -> SysResult {
-    let offset = checked_position_offset(offset)?;
-    if len == 0 || len > isize::MAX as usize {
+    let max_file_size = isize::MAX as usize;
+    if offset > max_file_size || len > max_file_size || len == 0 {
         return Err(SysError::EINVAL);
     }
-    let end = offset.checked_add(len).ok_or(SysError::EINVAL)?;
-    if end > isize::MAX as usize {
-        return Err(SysError::EINVAL);
+    let end = offset.checked_add(len).ok_or(SysError::EFBIG)?;
+    if end > max_file_size {
+        return Err(SysError::EFBIG);
     }
 
     let file = get_file_by_fd(fd)?;
@@ -144,17 +157,33 @@ pub fn sys_fallocate(fd: usize, mode: u32, offset: usize, len: usize) -> SysResu
     }
     ensure_positioned_target(file.as_ref())?;
 
-    if mode != 0 {
-        // UNFINISHED: fallocate currently implements only the default mode.
-        // Linux range operations such as KEEP_SIZE, PUNCH_HOLE, COLLAPSE_RANGE,
-        // ZERO_RANGE, INSERT_RANGE, and UNSHARE_RANGE require filesystem range
-        // allocation/deallocation support that this VFS layer does not expose.
+    if mode & !FALLOC_KNOWN_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+    if mode & FALLOC_FL_PUNCH_HOLE != 0 && mode & FALLOC_FL_KEEP_SIZE == 0 {
+        return Err(SysError::EINVAL);
+    }
+    if mode
+        & (FALLOC_FL_PUNCH_HOLE
+            | FALLOC_FL_COLLAPSE_RANGE
+            | FALLOC_FL_ZERO_RANGE
+            | FALLOC_FL_INSERT_RANGE
+            | FALLOC_FL_UNSHARE_RANGE)
+        != 0
+    {
+        // UNFINISHED: Linux fallocate range operations require filesystem
+        // extent allocation/deallocation support that this VFS layer does not
+        // expose yet.
         return Err(SysError::ENOTSUP);
     }
 
-    if end as u64 > file.stat()?.size {
+    let keep_size = mode & FALLOC_FL_KEEP_SIZE != 0;
+    if !keep_size && end as u64 > file.stat()?.size {
         file.set_len(end)?;
     }
+    // CONTEXT: the current VFS has no block preallocation API. KEEP_SIZE is
+    // accepted as a no-op because its visible contract in LTP sparse-file
+    // cases is that file size must not change.
     Ok(0)
 }
 
