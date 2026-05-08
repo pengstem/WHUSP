@@ -133,7 +133,7 @@ pub struct TaskUserRes {
     pub process: Weak<ProcessControlBlock>,
 }
 
-const USER_STACK_INITIAL_SIZE: usize = PAGE_SIZE * 32;
+const USER_STACK_INITIAL_SIZE: usize = PAGE_SIZE * 64;
 
 fn trap_cx_bottom_from_tid(tid: usize) -> usize {
     TRAP_CONTEXT_BASE - tid * PAGE_SIZE
