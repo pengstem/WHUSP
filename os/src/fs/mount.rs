@@ -41,6 +41,7 @@ struct DynamicMount {
     source_path: String,
     target_path: String,
     is_bind: bool,
+    recursive_bind: bool,
     // Propagated copies of one mount event share this id.
     event_id: usize,
     propagation_parent_path: String,
@@ -580,12 +581,16 @@ fn propagate_mount_event(
                     propagated.peer_group = None;
                 }
             }
+            // CONTEXT: Repeated bind mounts of the same source onto a shared
+            // peer are distinct stack layers. fs_bind03 expects the second
+            // bind of parent1/child1 through share1 to add another layer back
+            // on parent1/child1. Only suppress the same propagation event if
+            // it reaches the same target twice through the peer graph.
             if mounts.iter().any(|mount| {
                 mount.namespace_id == propagated.namespace_id
                     && mount.target == propagated.target
                     && mount.target_path == propagated.target_path
-                    && mount.source_mount_id == propagated.source_mount_id
-                    && mount.source_root == propagated.source_root
+                    && mount.event_id == propagated.event_id
             }) {
                 continue;
             }
@@ -783,7 +788,7 @@ fn propagate_unmount_event(mounts: &mut Vec<DynamicMount>, event: &DynamicMount)
 }
 
 fn is_recursive_bind_child(root: &DynamicMount, mount: &DynamicMount) -> bool {
-    if !root.is_bind || mount.namespace_id != root.namespace_id {
+    if !root.recursive_bind || mount.namespace_id != root.namespace_id {
         return false;
     }
     let Some(target_suffix) = path_suffix(root.target_path.as_str(), mount.target_path.as_str())
@@ -845,6 +850,7 @@ pub(crate) fn mount_block_device_at(
             source_path,
             target_path,
             is_bind: false,
+            recursive_bind: false,
             event_id: next_mount_event_id(),
             propagation_parent_path: String::new(),
             propagation_parent_group: None,
@@ -974,6 +980,7 @@ fn mount_new_fs_at(
             source_path,
             target_path,
             is_bind: false,
+            recursive_bind: false,
             event_id: next_mount_event_id(),
             propagation_parent_path: String::new(),
             propagation_parent_group: None,
@@ -1046,6 +1053,7 @@ pub(crate) fn mount_pseudo_fs_at_with_options(
             source_path,
             target_path,
             is_bind: false,
+            recursive_bind: false,
             event_id: next_mount_event_id(),
             propagation_parent_path: String::new(),
             propagation_parent_group: None,
@@ -1110,6 +1118,7 @@ pub(crate) fn mount_bind_at(
             source_path: source_path.clone(),
             target_path: target_path.clone(),
             is_bind: true,
+            recursive_bind: recursive,
             event_id: next_mount_event_id(),
             propagation_parent_path: String::new(),
             propagation_parent_group: None,
@@ -1359,7 +1368,6 @@ pub(crate) fn unmount_at(
             return Err(MountError::TargetBusy);
         }
         let event = mounts.remove(index);
-        mounts.retain(|mount| mount.event_id != event.event_id);
         // CONTEXT: Recursive bind mounts create a copied mount subtree under
         // the bind root. When that root is unmounted, Linux detaches the copied
         // children with it; otherwise cleanup sees stale paths such as
