@@ -26,6 +26,7 @@ const SYS_FS_DIR_INO: u32 = 10;
 const PIPE_MAX_SIZE_INO: u32 = 11;
 const PIPE_USER_PAGES_SOFT_INO: u32 = 12;
 const DOMAINNAME_INO: u32 = 13;
+const TAINTED_INO: u32 = 14;
 const PID_DIR_BASE: u32 = 100;
 const PID_FILE_BASE: u32 = 10_000;
 const PID_FILE_STRIDE: u32 = 10;
@@ -73,6 +74,7 @@ enum ProcNode {
     PipeMaxSize,
     PipeUserPagesSoft,
     Domainname,
+    Tainted,
     PidDir(usize),
     PidStat(usize),
     PidStatus(usize),
@@ -127,6 +129,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         PIPE_MAX_SIZE_INO => Some(ProcNode::PipeMaxSize),
         PIPE_USER_PAGES_SOFT_INO => Some(ProcNode::PipeUserPagesSoft),
         DOMAINNAME_INO => Some(ProcNode::Domainname),
+        TAINTED_INO => Some(ProcNode::Tainted),
         ino if ino >= PID_FD_ENTRY_BASE => {
             let rel = ino - PID_FD_ENTRY_BASE;
             let pid = (rel / PID_FD_ENTRY_STRIDE) as usize;
@@ -295,6 +298,11 @@ fn sys_kernel_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: DOMAINNAME_INO,
         name: "domainname".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: TAINTED_INO,
+        name: "tainted".into(),
         dtype: DT_REG,
     });
     entries
@@ -616,6 +624,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::PipeMaxSize => Ok(pipe_max_size_content().into_bytes()),
         ProcNode::PipeUserPagesSoft => Ok(pipe_user_pages_soft_content().into_bytes()),
         ProcNode::Domainname => Ok(domainname_content()),
+        ProcNode::Tainted => Ok(b"0\n".to_vec()),
         ProcNode::PidStat(pid) => lookup_process(pid)
             .map(pid_stat_content)
             .map(String::into_bytes)
@@ -700,6 +709,7 @@ impl FileSystemBackend for ProcFs {
                 ".." => Ok((SYS_DIR_INO, FsNodeKind::Directory)),
                 "pid_max" => Ok((PID_MAX_INO, FsNodeKind::RegularFile)),
                 "domainname" => Ok((DOMAINNAME_INO, FsNodeKind::RegularFile)),
+                "tainted" => Ok((TAINTED_INO, FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::SysFsDir => match component {
