@@ -137,6 +137,7 @@ const SYSCALL_RENAMEAT2: usize = 276;
 const SYSCALL_GETRANDOM: usize = 278;
 const SYSCALL_MEMFD_CREATE: usize = 279;
 const SYSCALL_MEMBARRIER: usize = 283;
+const SYSCALL_COPY_FILE_RANGE: usize = 285;
 const SYSCALL_STATX: usize = 291;
 const SYSCALL_FACCESSAT2: usize = 439;
 const SYSCALL_EPOLL_PWAIT2: usize = 441;
@@ -154,7 +155,7 @@ pub(crate) mod user_ptr;
 mod wait;
 
 use crate::task::RLimit;
-use errno::{SysError, ret};
+use errno::{ret, SysError};
 use fs::*;
 use futex::*;
 use memory::*;
@@ -295,6 +296,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4],
         ),
         SYSCALL_FADVISE64 => sys_fadvise64(args[0], args[1] as i64, args[2] as i64, args[3] as i32),
+        SYSCALL_COPY_FILE_RANGE => sys_copy_file_range(
+            args[0],
+            args[1] as *mut i64,
+            args[2],
+            args[3] as *mut i64,
+            args[4],
+            args[5] as u32,
+        ),
         SYSCALL_SPLICE => sys_splice(
             args[0],
             args[1] as *mut i64,

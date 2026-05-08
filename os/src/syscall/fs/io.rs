@@ -1,17 +1,18 @@
-use crate::fs::{File, OpenFlags, PollEvents, S_IFDIR, S_IFMT, S_IFREG, SeekWhence};
+use crate::config::PAGE_SIZE;
+use crate::fs::{File, FileStat, OpenFlags, PollEvents, SeekWhence, S_IFDIR, S_IFMT, S_IFREG};
 use crate::mm::UserBuffer;
-use crate::task::{FdTableEntry, SignalFlags, current_add_signal, current_user_token};
+use crate::task::{current_add_signal, current_user_token, FdTableEntry, SignalFlags};
 use alloc::{vec, vec::Vec};
 use core::mem::size_of;
 use core::ptr::read_volatile;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    UserBufferAccess, read_user_usize, read_user_value, translated_byte_buffer_checked,
-    translated_byte_buffer_checked_with_mmap_fault, write_user_value,
+    read_user_usize, read_user_value, translated_byte_buffer_checked,
+    translated_byte_buffer_checked_with_mmap_fault, write_user_value, UserBufferAccess,
 };
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
-use super::uapi::{IOV_MAX, LinuxIovec};
+use super::uapi::{LinuxIovec, IOV_MAX};
 
 fn read_user_iovecs(
     token: usize,
@@ -233,6 +234,180 @@ pub fn sys_fadvise64(fd: usize, offset: i64, len: i64, advice: i32) -> SysResult
     // valid POSIX_FADV_* hints as advisory, so the observable contest behavior
     // can be represented as a checked no-op for regular files.
     Ok(0)
+}
+
+const COPY_FILE_RANGE_CHUNK: usize = PAGE_SIZE;
+
+fn ensure_copy_file_range_target(file: &(dyn File + Send + Sync)) -> SysResult<FileStat> {
+    let stat = file.stat()?;
+    match stat.mode & S_IFMT {
+        S_IFREG => Ok(stat),
+        S_IFDIR => Err(SysError::EISDIR),
+        _ => Err(SysError::EINVAL),
+    }
+}
+
+fn read_copy_file_range_offset(token: usize, ptr: *mut i64) -> SysResult<Option<usize>> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    let offset = read_user_value(token, ptr.cast_const())?;
+    if offset < 0 {
+        return Err(SysError::EINVAL);
+    }
+    Ok(Some(checked_position_offset(offset as usize)?))
+}
+
+fn write_copy_file_range_offset(
+    token: usize,
+    ptr: *mut i64,
+    offset: Option<usize>,
+) -> SysResult<()> {
+    if !ptr.is_null() {
+        let value = offset.ok_or(SysError::EINVAL)? as i64;
+        write_user_value(token, ptr, &value)?;
+    }
+    Ok(())
+}
+
+fn current_copy_file_range_offset(file: &(dyn File + Send + Sync)) -> SysResult<usize> {
+    Ok(file.seek(0, SeekWhence::Current)?)
+}
+
+fn checked_copy_file_range_end(start: usize, len: usize) -> SysResult<usize> {
+    let end = start.checked_add(len).ok_or(SysError::EOVERFLOW)?;
+    if end > isize::MAX as usize {
+        return Err(SysError::EFBIG);
+    }
+    Ok(end)
+}
+
+fn same_file_range_overlaps(src_start: usize, dst_start: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let src_end = src_start.saturating_add(len);
+    let dst_end = dst_start.saturating_add(len);
+    src_start < dst_end && dst_start < src_end
+}
+
+fn same_copy_file_range_file(
+    in_file: &(dyn File + Send + Sync),
+    out_file: &(dyn File + Send + Sync),
+    in_stat: FileStat,
+    out_stat: FileStat,
+) -> bool {
+    if let (Some(in_id), Some(out_id)) = (in_file.page_cache_id(), out_file.page_cache_id()) {
+        return in_id == out_id;
+    }
+
+    (in_stat.ino != 0 || out_stat.ino != 0)
+        && in_stat.dev == out_stat.dev
+        && in_stat.ino == out_stat.ino
+}
+
+// UNFINISHED: Linux copy_file_range can delegate to filesystem-specific
+// acceleration and Linux 5.19+ may support cross-filesystem copies. This path
+// provides the current contest-visible regular-file semantics by copying
+// through kernel memory and returning EXDEV across different mounts.
+pub fn sys_copy_file_range(
+    fd_in: usize,
+    off_in: *mut i64,
+    fd_out: usize,
+    off_out: *mut i64,
+    len: usize,
+    flags: u32,
+) -> SysResult {
+    if flags != 0 {
+        return Err(SysError::EINVAL);
+    }
+
+    let token = current_user_token();
+    let in_offset_arg = read_copy_file_range_offset(token, off_in)?;
+    let out_offset_arg = read_copy_file_range_offset(token, off_out)?;
+
+    let in_entry = get_fd_entry_by_fd(fd_in)?;
+    let out_entry = get_fd_entry_by_fd(fd_out)?;
+    let in_file = in_entry.file();
+    let out_file = out_entry.file();
+    let in_stat = ensure_copy_file_range_target(in_file.as_ref())?;
+    let out_stat = ensure_copy_file_range_target(out_file.as_ref())?;
+
+    if !in_file.readable() {
+        return Err(SysError::EBADF);
+    }
+    if !out_file.writable() {
+        return Err(SysError::EBADF);
+    }
+    if out_entry.status_flags().contains(OpenFlags::APPEND) {
+        return Err(SysError::EBADF);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    if in_stat.dev != out_stat.dev {
+        return Err(SysError::EXDEV);
+    }
+
+    let mut in_offset = match in_offset_arg {
+        Some(offset) => offset,
+        None => current_copy_file_range_offset(in_file.as_ref())?,
+    };
+    let mut out_offset = match out_offset_arg {
+        Some(offset) => offset,
+        None => current_copy_file_range_offset(out_file.as_ref())?,
+    };
+    checked_copy_file_range_end(out_offset, len)?;
+
+    if same_copy_file_range_file(in_file.as_ref(), out_file.as_ref(), in_stat, out_stat)
+        && same_file_range_overlaps(in_offset, out_offset, len)
+    {
+        return Err(SysError::EINVAL);
+    }
+
+    if out_offset_arg.is_some() {
+        out_file.check_write_at(out_offset, len)?;
+    } else {
+        out_file.check_write(len, false)?;
+    }
+
+    let mut copied = 0usize;
+    let mut buffer = vec![0u8; len.min(COPY_FILE_RANGE_CHUNK)];
+    while copied < len {
+        let want = buffer.len().min(len - copied);
+        let read = if in_offset_arg.is_some() {
+            in_file.read_at(in_offset, &mut buffer[..want])
+        } else {
+            in_file.read(kernel_user_buffer(&mut buffer[..want]))
+        };
+        if read == 0 {
+            break;
+        }
+
+        let written = if out_offset_arg.is_some() {
+            out_file.write_at(out_offset, &buffer[..read])
+        } else {
+            out_file.write(kernel_user_buffer(&mut buffer[..read]))
+        };
+        if written == 0 {
+            break;
+        }
+
+        copied = copied.checked_add(written).ok_or(SysError::EOVERFLOW)?;
+        if in_offset_arg.is_some() {
+            in_offset = in_offset.checked_add(written).ok_or(SysError::EOVERFLOW)?;
+        }
+        if out_offset_arg.is_some() {
+            out_offset = out_offset.checked_add(written).ok_or(SysError::EOVERFLOW)?;
+        }
+        if read < want || written < read {
+            break;
+        }
+    }
+
+    write_copy_file_range_offset(token, off_in, in_offset_arg.map(|_| in_offset))?;
+    write_copy_file_range_offset(token, off_out, out_offset_arg.map(|_| out_offset))?;
+    Ok(copied as isize)
 }
 
 const SPLICE_F_MOVE: u32 = 0x01;

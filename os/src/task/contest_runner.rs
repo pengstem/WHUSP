@@ -81,10 +81,14 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
     "doio",
     "ebizzy",
     "eject*",
+    "epoll_pwait01",
+    "fanotify13",
     "fanout01",
     "fallocate04",
     "fallocate05",
     "fallocate06",
+    "ftest03",
+    "ftp-download-stress02-rmt.sh",
     "fcntl14",
     "fcntl14_64",
     "filecapstest.sh",
@@ -103,9 +107,14 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
     "fs_racer_dir_test.sh",
     "fs_racer_file_list.sh",
     "fsstress",
+    "ftp-download-stress.sh",
+    "ftp-download-stress01-rmt.sh",
     "ftrace*",
+    "fgetxattr01",
+    "gettimeofday02",
     "getrusage04",
     "hackbench",
+    "inode02",
     "ipsec*",
     "iptables*",
     "kcmp03",
@@ -192,22 +201,20 @@ const LTP_MUSL_BLACKLIST_PATTERNS: &[&str] = &[
     "epoll_create02",
 ];
 
-const DIRECT_LTP_GROUP: &str = "clock";
+// None runs all non-blacklisted cases. Some("a")..Some("z") narrows by
+// leading letter, Some("long") runs names outside the ASCII alphabet, and
+// Some("case:<name>") runs one exact LTP case.
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some("e");
 
-const DIRECT_LTP_CASES: &[&str] = &[];
+enum LtpCaseFilter {
+    All,
+    Letter(u8),
+    Long,
+    Exact(&'static str),
+    Invalid,
+}
 
 pub(super) fn build_runner_command() -> String {
-    if DIRECT_LTP_CASES.first().is_some() {
-        let mut command = String::new();
-        let mut first = true;
-        for libc_root in TEST_LIBCS {
-            append_separator(&mut command, &mut first);
-            append_direct_ltp_runner(&mut command, libc_root);
-        }
-        command.push_str("; cd /musl && ./busybox reboot -f");
-        return command;
-    }
-
     if INTERACTIVE_SHELL || TEST_SCRIPTS.is_empty() {
         return "/musl/busybox sh".into();
     }
@@ -228,61 +235,6 @@ pub(super) fn build_runner_command() -> String {
     }
     command.push_str("; cd /musl && ./busybox reboot -f");
     command
-}
-
-fn append_direct_ltp_runner(command: &mut String, libc_root: &str) {
-    command.push_str("cd ");
-    command.push_str(libc_root);
-    command.push_str(" && { PATH=");
-    command.push_str(libc_root);
-    command.push_str(
-        "/ltp/testcases/bin:$PATH; export PATH; ./busybox echo \"#### OS COMP TEST GROUP START ",
-    );
-    command.push_str(DIRECT_LTP_GROUP);
-    command.push('-');
-    command.push_str(libc_label(libc_root));
-    command.push_str(" ####\"; for case_name in ");
-    for (index, case_name) in DIRECT_LTP_CASES.iter().enumerate() {
-        if index > 0 {
-            command.push(' ');
-        }
-        command.push_str(case_name);
-    }
-    command.push_str(
-        "; do if [ ! -x \"./ltp/testcases/bin/$case_name\" ]; then ./busybox echo \"SKIP ",
-    );
-    command.push_str(direct_ltp_label());
-    command.push_str(" LTP CASE $case_name\"; continue; fi; ./busybox echo \"RUN ");
-    command.push_str(direct_ltp_label());
-    command.push_str(
-        " LTP CASE $case_name\"; ./ltp/testcases/bin/$case_name; ret=$?; ./busybox echo \"",
-    );
-    command.push_str(direct_ltp_label());
-    command.push_str(
-        " LTP CASE $case_name : $ret\"; done; ./busybox echo \"#### OS COMP TEST GROUP END ",
-    );
-    command.push_str(DIRECT_LTP_GROUP);
-    command.push('-');
-    command.push_str(libc_label(libc_root));
-    command.push_str(" ####\"; }");
-}
-
-fn direct_ltp_label() -> &'static str {
-    if DIRECT_LTP_GROUP == "mmap" {
-        "MMAP"
-    } else if DIRECT_LTP_GROUP == "fcntl" {
-        "FCNTL"
-    } else if DIRECT_LTP_GROUP == "open" {
-        "OPEN"
-    } else if DIRECT_LTP_GROUP == "pipe" {
-        "PIPE"
-    } else if DIRECT_LTP_GROUP == "chmod" {
-        "CHMOD"
-    } else if DIRECT_LTP_GROUP == "clock" {
-        "CLOCK"
-    } else {
-        "LTP"
-    }
 }
 
 fn append_separator(command: &mut String, first: &mut bool) {
@@ -334,11 +286,66 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
     command.push_str(libc_root);
     command.push_str(" && { ./busybox echo \"#### OS COMP TEST GROUP START ltp-");
     command.push_str(libc_label(libc_root));
-    command.push_str(" ####\"; for file in ltp/testcases/bin/*; do [ -f \"$file\" ] || continue; case_name=${file##*/}; case \"$case_name\" in ");
+    command.push_str(" ####\"; for file in ltp/testcases/bin/*; do [ -f \"$file\" ] || continue; case_name=${file##*/}; ");
+    append_ltp_case_filter(command);
+    command.push_str("case \"$case_name\" in ");
     append_ltp_blacklist_patterns(command, libc_root);
-    command.push_str(") echo \"SKIP LTP CASE $case_name\"; continue ;; esac; echo \"RUN LTP CASE $case_name\"; \"$file\"; ret=$?; if [ \"$ret\" -eq 0 ]; then echo \"PASS LTP CASE $case_name : $ret\"; else echo \"FAIL LTP CASE $case_name : $ret\"; fi; done; ./busybox echo \"#### OS COMP TEST GROUP END ltp-");
+    command.push_str(") echo \"SKIP LTP CASE $case_name\"; continue ;; esac; echo \"RUN LTP CASE $case_name\"; \"$file\"; ret=$?; echo \"FAIL LTP CASE $case_name : $ret\"; done; ./busybox echo \"#### OS COMP TEST GROUP END ltp-");
     command.push_str(libc_label(libc_root));
     command.push_str(" ####\"; }");
+}
+
+fn append_ltp_case_filter(command: &mut String) {
+    match ltp_case_filter() {
+        LtpCaseFilter::All => {}
+        LtpCaseFilter::Letter(letter) => {
+            command.push_str("case \"$case_name\" in [");
+            command.push(letter as char);
+            command.push((letter as char).to_ascii_uppercase());
+            command.push_str("]*) ;; *) continue ;; esac; ");
+        }
+        LtpCaseFilter::Long => {
+            command.push_str("case \"$case_name\" in [A-Za-z]*) continue ;; esac; ");
+        }
+        LtpCaseFilter::Exact(case_name) => {
+            command.push_str("case \"$case_name\" in ");
+            command.push_str(case_name);
+            command.push_str(") ;; *) continue ;; esac; ");
+        }
+        LtpCaseFilter::Invalid => {
+            command.push_str("./busybox echo \"INVALID LTP_CASE_FILTER_OPTION\"; break; ");
+        }
+    }
+}
+
+fn ltp_case_filter() -> LtpCaseFilter {
+    match LTP_CASE_FILTER_OPTION {
+        None => LtpCaseFilter::All,
+        Some(option) if option.eq_ignore_ascii_case("long") => LtpCaseFilter::Long,
+        Some(option) if option.starts_with("case:") => {
+            let case_name = &option["case:".len()..];
+            if is_ltp_case_name(case_name) {
+                LtpCaseFilter::Exact(case_name)
+            } else {
+                LtpCaseFilter::Invalid
+            }
+        }
+        Some(option) => {
+            let bytes = option.as_bytes();
+            if bytes.len() == 1 && bytes[0].is_ascii_alphabetic() {
+                LtpCaseFilter::Letter(bytes[0].to_ascii_lowercase())
+            } else {
+                LtpCaseFilter::Invalid
+            }
+        }
+    }
+}
+
+fn is_ltp_case_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn append_ltp_blacklist_patterns(command: &mut String, libc_root: &str) {

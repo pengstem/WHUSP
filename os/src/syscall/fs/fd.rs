@@ -1,15 +1,15 @@
 use crate::config::PAGE_SIZE;
 use crate::fs::{
-    File, OpenFlags, default_pipe_capacity_for_current_process, make_memfd, make_pipe,
-    pipe_max_size,
+    default_pipe_capacity_for_current_process, make_memfd, make_pipe, pipe_max_size, File,
+    OpenFlags,
 };
-use crate::task::{FdFlags, FdTableEntry, current_process, current_user_token};
+use crate::task::{current_process, current_user_token, FdFlags, FdTableEntry};
 use alloc::sync::Arc;
 use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    UserBufferAccess, read_user_c_string, translated_byte_buffer_checked,
+    read_user_c_string, translated_byte_buffer_checked, UserBufferAccess,
 };
 use super::fd_lock::{fcntl_getlk, fcntl_setlk, fcntl_setlkw, release_record_locks_for_close};
 

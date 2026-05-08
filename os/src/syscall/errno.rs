@@ -36,6 +36,7 @@ pub enum SysError {
     ENOSYS = 38,
     ENOTEMPTY = 39,
     ELOOP = 40,
+    EOVERFLOW = 75,
     EDESTADDRREQ = 89,
     ENOPROTOOPT = 92,
     ENOTSUP = 95,

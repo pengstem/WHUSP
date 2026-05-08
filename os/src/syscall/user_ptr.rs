@@ -1,7 +1,7 @@
 use crate::mm::{MmapFaultAccess, PageTable, StepByOne, VirtAddr};
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::mem::{MaybeUninit, size_of};
+use core::mem::{size_of, MaybeUninit};
 
 use super::errno::{SysError, SysResult};
 
