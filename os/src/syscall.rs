@@ -16,6 +16,7 @@ const SYSCALL_LINKAT: usize = 37;
 const SYSCALL_UMOUNT2: usize = 39;
 const SYSCALL_MOUNT: usize = 40;
 const SYSCALL_STATFS: usize = 43;
+const SYSCALL_FSTATFS: usize = 44;
 const SYSCALL_TRUNCATE: usize = 45;
 const SYSCALL_FTRUNCATE: usize = 46;
 const SYSCALL_FALLOCATE: usize = 47;
@@ -247,6 +248,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4] as *const u8,
         ),
         SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut LinuxStatfs),
+        SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut LinuxStatfs),
         SYSCALL_TRUNCATE => sys_truncate(args[0] as *const u8, args[1]),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1]),
         SYSCALL_FALLOCATE => sys_fallocate(args[0], args[1] as u32, args[2], args[3]),

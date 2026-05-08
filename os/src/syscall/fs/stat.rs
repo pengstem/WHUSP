@@ -1,6 +1,6 @@
 use crate::fs::{
-    FileStat, MountId, OpenFlags, chmod_in, chown_in, mount_is_read_only, stat_devfs_child,
-    stat_devfs_misc_child, stat_in, stat_static_path, statfs_for_mount,
+    FileStat, FileSystemStat, MountId, OpenFlags, chmod_in, chown_in, mount_is_read_only,
+    stat_devfs_child, stat_devfs_misc_child, stat_in, stat_static_path, statfs_for_mount,
 };
 use crate::task::{PathSnapshot, current_process, current_user_token};
 
@@ -16,6 +16,7 @@ use super::uapi::{
 const UID_GID_NO_CHANGE: u32 = u32::MAX;
 const MODE_SETGID: u32 = 0o2000;
 const XATTR_NAME_MAX: usize = 255;
+const PIPEFS_MAGIC: i64 = 0x5049_5045;
 
 fn write_stat_result<T: From<FileStat> + Copy>(
     token: usize,
@@ -313,6 +314,32 @@ pub fn sys_statfs(pathname: *const u8, statfsbuf: *mut LinuxStatfs) -> SysResult
     let fs_stat = statfs_for_mount(MountId(stat.dev as usize)).ok_or(SysError::ENOSYS)?;
     write_user_value(token, statfsbuf, &LinuxStatfs::from(fs_stat))?;
     Ok(0)
+}
+
+pub fn sys_fstatfs(fd: usize, statfsbuf: *mut LinuxStatfs) -> SysResult {
+    let entry = get_fd_entry_by_fd(fd)?;
+    let stat = entry.file().stat()?;
+    let fs_stat = statfs_for_mount(MountId(stat.dev as usize)).unwrap_or_else(anonymous_fd_statfs);
+    let token = current_user_token();
+    write_user_value(token, statfsbuf, &LinuxStatfs::from(fs_stat))?;
+    Ok(0)
+}
+
+fn anonymous_fd_statfs() -> FileSystemStat {
+    // CONTEXT: Anonymous file descriptors such as pipes are not backed by a
+    // mounted VFS object in this kernel, but Linux still lets fstatfs() report
+    // synthetic pipefs-style statistics for them.
+    FileSystemStat {
+        magic: PIPEFS_MAGIC,
+        block_size: 4096,
+        blocks: 0,
+        free_blocks: 0,
+        available_blocks: 0,
+        files: 1024,
+        free_files: 1024,
+        max_name_len: 255,
+        flags: 0,
+    }
 }
 
 pub fn sys_statx(
