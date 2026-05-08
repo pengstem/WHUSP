@@ -782,6 +782,21 @@ fn propagate_unmount_event(mounts: &mut Vec<DynamicMount>, event: &DynamicMount)
     }
 }
 
+fn is_recursive_bind_child(root: &DynamicMount, mount: &DynamicMount) -> bool {
+    if !root.is_bind || mount.namespace_id != root.namespace_id {
+        return false;
+    }
+    let Some(target_suffix) = path_suffix(root.target_path.as_str(), mount.target_path.as_str())
+    else {
+        return false;
+    };
+    if target_suffix.is_empty() {
+        return false;
+    }
+    path_suffix(root.source_path.as_str(), mount.source_path.as_str())
+        .is_some_and(|source_suffix| source_suffix == target_suffix)
+}
+
 pub(crate) fn mount_block_device_at(
     namespace_id: MountNamespaceId,
     target: WorkingDir,
@@ -1150,13 +1165,9 @@ pub(crate) fn move_mount_at(
     let source_path = resolve_mount_path(source, source_path);
     let target_path = resolve_mount_path(target, target_path);
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
-        if mounts.iter().any(|mount| {
-            mount.namespace_id == namespace_id
-                && mount.target == target
-                && mount.target_path == target_path
-        }) {
-            return Err(MountError::TargetBusy);
-        }
+        // CONTEXT: Linux permits multiple mounts to stack on one mount point.
+        // fs_bind_move18 moves parent1 over parent2's self-bind and then
+        // expects two umount(parent2) calls to peel the stack.
         let source_index = mounts
             .iter()
             .rposition(|mount| {
@@ -1349,6 +1360,11 @@ pub(crate) fn unmount_at(
         }
         let event = mounts.remove(index);
         mounts.retain(|mount| mount.event_id != event.event_id);
+        // CONTEXT: Recursive bind mounts create a copied mount subtree under
+        // the bind root. When that root is unmounted, Linux detaches the copied
+        // children with it; otherwise cleanup sees stale paths such as
+        // fs_bind_rbind05's share1/child1 after share1 has been peeled.
+        mounts.retain(|mount| !is_recursive_bind_child(&event, mount));
         propagate_unmount_event(mounts, &event);
         Ok(())
     })

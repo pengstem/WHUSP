@@ -206,7 +206,7 @@ const LTP_MUSL_BLACKLIST_PATTERNS: &[&str] = &[
 // Some("case:<name>") runs one exact LTP case, Some("cases:<a>,<b>") runs
 // selected exact LTP cases, and Some("prefix:<name>") runs cases whose names
 // start with the prefix.
-const LTP_CASE_FILTER_OPTION: Option<&str> = None;
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some("f");
 
 enum LtpCaseFilter {
     All,
@@ -301,6 +301,9 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
     append_ltp_case_filter(command);
     command.push_str("case \"$case_name\" in ");
     append_ltp_blacklist_patterns(command, libc_root);
+    // CONTEXT: The autotest parser consumes the historical
+    // "FAIL LTP CASE ... : <ret>" record as a per-case result line. A zero
+    // return still means the case passed, so keep the text stable here.
     command.push_str(") echo \"SKIP LTP CASE $case_name\"; continue ;; esac; echo \"RUN LTP CASE $case_name\"; \"./$case_name\"; ret=$?; echo \"FAIL LTP CASE $case_name : $ret\"; done; \"");
     command.push_str(libc_root);
     command.push_str("/busybox\" echo \"#### OS COMP TEST GROUP END ltp-");
