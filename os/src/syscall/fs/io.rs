@@ -843,6 +843,10 @@ pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult 
     if file.stat()?.mode & S_IFDIR == S_IFDIR {
         return Err(SysError::EISDIR);
     }
+    let total_len = iovecs.iter().try_fold(0usize, |total, iovec| {
+        total.checked_add(iovec.len).ok_or(SysError::EINVAL)
+    })?;
+    file.check_read(total_len)?;
     let entry = get_fd_entry_by_fd(fd)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLIN)?;
 
@@ -886,6 +890,7 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> SysResult {
     if !file.readable() {
         return Err(SysError::EBADF);
     }
+    file.check_read(len)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLIN)?;
     let buffers =
         translated_byte_buffer_checked_with_mmap_fault(token, buf, len, UserBufferAccess::Write)?;

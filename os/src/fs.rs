@@ -1,5 +1,6 @@
 mod devfs;
 mod dirent;
+mod eventfd;
 mod ext4;
 mod fat;
 mod inode;
@@ -19,6 +20,8 @@ use crate::mm::{UserBuffer, page_cache::PageCacheId};
 use alloc::sync::Arc;
 use bitflags::bitflags;
 use core::any::Any;
+
+pub(crate) use eventfd::make_eventfd;
 
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
 
@@ -141,6 +144,9 @@ pub trait File: Send + Sync {
         Err(FsError::Unsupported)
     }
     fn check_write(&self, _len: usize, _append: bool) -> FsResult {
+        Ok(())
+    }
+    fn check_read(&self, _len: usize) -> FsResult {
         Ok(())
     }
     fn check_write_at(&self, _offset: usize, _len: usize) -> FsResult {

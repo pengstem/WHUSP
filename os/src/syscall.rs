@@ -1,5 +1,6 @@
 const SYSCALL_FGETXATTR: usize = 10;
 const SYSCALL_GETCWD: usize = 17;
+const SYSCALL_EVENTFD2: usize = 19;
 const SYSCALL_EPOLL_CREATE1: usize = 20;
 const SYSCALL_EPOLL_CTL: usize = 21;
 const SYSCALL_EPOLL_PWAIT: usize = 22;
@@ -184,6 +185,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     }
 
     ret(match syscall_id {
+        SYSCALL_EVENTFD2 => sys_eventfd2(args[0] as u32, args[1] as u32),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_FGETXATTR => {
             sys_fgetxattr(args[0], args[1] as *const u8, args[2] as *mut u8, args[3])
