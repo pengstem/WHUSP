@@ -153,9 +153,9 @@ impl ProcessControlBlock {
         child_parent: Arc<Self>,
         mount_namespace_id: crate::fs::MountNamespaceId,
     ) -> Arc<Self> {
-        let parent = self.inner_exclusive_access();
+        let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
-        let memory_set = MemorySet::from_existed_user(&parent.memory_set);
+        let memory_set = MemorySet::from_existed_user(&mut parent.memory_set);
         let pid = pid_alloc();
         let new_fd_table = parent.fd_table.clone();
         let umask = parent.umask;

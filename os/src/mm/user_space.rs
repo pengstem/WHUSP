@@ -96,7 +96,7 @@ impl MmapPageCacheFault {
 }
 
 impl MemorySet {
-    pub fn from_existed_user(user_space: &MemorySet) -> MemorySet {
+    pub fn from_existed_user(user_space: &mut MemorySet) -> MemorySet {
         let mut memory_set = Self::new_bare();
         memory_set.brk_base = user_space.brk_base;
         memory_set.brk = user_space.brk;
@@ -104,7 +104,9 @@ impl MemorySet {
         memory_set.brk_mapped_end = user_space.brk_mapped_end;
         memory_set.mmap_next = user_space.mmap_next;
         memory_set.map_trampoline();
-        for area in &user_space.areas {
+        for area_idx in 0..user_space.areas.len() {
+            user_space.ensure_shared_anonymous_mmap_resident(area_idx);
+            let area = &user_space.areas[area_idx];
             let new_area = MapArea::from_another(area);
             if area.is_shm() {
                 let Some(shmid) = area.shm_segment_id() else {
@@ -197,6 +199,29 @@ impl MemorySet {
             }
         }
         memory_set
+    }
+
+    fn ensure_shared_anonymous_mmap_resident(&mut self, area_idx: usize) {
+        let area = &self.areas[area_idx];
+        let shared_anonymous = area.mmap_info.as_ref().is_some_and(|info| {
+            info.shared && info.backing_file.is_none() && info.page_cache_id.is_none()
+        });
+        if !shared_anonymous {
+            return;
+        }
+
+        let vpn_range = area.vpn_range;
+        for vpn in vpn_range {
+            if self.translate(vpn).is_some_and(|pte| pte.bits != 0) {
+                continue;
+            }
+            let Some(frame) = frame_alloc() else {
+                continue;
+            };
+            let page_table = &mut self.page_table;
+            let area = &mut self.areas[area_idx];
+            area.map_existing_frame(page_table, vpn, frame);
+        }
     }
 
     pub fn set_program_break(&mut self, addr: usize) -> usize {
