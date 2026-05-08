@@ -515,17 +515,34 @@ impl ProcessControlBlock {
 
     pub(crate) fn proc_snapshot(&self) -> ProcessProcSnapshot {
         let inner = self.inner_exclusive_access();
+        let leader_status = inner
+            .tasks
+            .first()
+            .and_then(|task| task.as_ref())
+            .map(|task| task.inner_exclusive_access().task_status);
         let state = if inner.is_zombie {
             'Z'
-        } else if inner.tasks.iter().flatten().any(|task| {
-            matches!(
-                task.inner_exclusive_access().task_status,
-                TaskStatus::Ready | TaskStatus::Running
-            )
-        }) {
-            'R'
         } else {
-            'S'
+            // CONTEXT: Linux /proc/<tgid>/stat reports the thread-group
+            // leader state. LTP uses this to wait until the main thread blocks
+            // even while a helper thread in the same process is still running.
+            match leader_status {
+                Some(TaskStatus::Ready | TaskStatus::Running) => 'R',
+                Some(TaskStatus::Blocked) => 'S',
+                Some(TaskStatus::Exited) => 'Z',
+                None => {
+                    if inner.tasks.iter().flatten().any(|task| {
+                        matches!(
+                            task.inner_exclusive_access().task_status,
+                            TaskStatus::Ready | TaskStatus::Running
+                        )
+                    }) {
+                        'R'
+                    } else {
+                        'S'
+                    }
+                }
+            }
         };
         let comm = inner
             .cmdline
