@@ -4,7 +4,7 @@ use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{read_user_value, write_user_value};
 use crate::task::{
     FdTableEntry, TaskControlBlock, block_current_task_no_schedule, current_process,
-    current_user_token, schedule, wakeup_task,
+    current_user_token, processes_snapshot, schedule, wakeup_task,
 };
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -19,6 +19,11 @@ const SEEK_SET: i16 = 0;
 const SEEK_CUR: i16 = 1;
 const SEEK_END: i16 = 2;
 const LOCK_TO_EOF: i64 = i64::MAX;
+const LOCK_SH: i32 = 1;
+const LOCK_EX: i32 = 2;
+const LOCK_NB: i32 = 4;
+const LOCK_UN: i32 = 8;
+const FLOCK_VALID_FLAGS: i32 = LOCK_SH | LOCK_EX | LOCK_NB | LOCK_UN;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -61,14 +66,39 @@ struct WaitingLock {
     task: Arc<TaskControlBlock>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlockMode {
+    Shared,
+    Exclusive,
+}
+
+struct FlockLock {
+    key: LockKey,
+    owner: Arc<dyn File + Send + Sync>,
+    mode: FlockMode,
+}
+
+struct WaitingFlock {
+    key: LockKey,
+    owner: Arc<dyn File + Send + Sync>,
+    task: Arc<TaskControlBlock>,
+}
+
 struct RecordLockTable {
     locks: Vec<PosixLock>,
     waiters: VecDeque<WaitingLock>,
 }
 
+struct FlockTable {
+    locks: Vec<FlockLock>,
+    waiters: VecDeque<WaitingFlock>,
+}
+
 lazy_static! {
     static ref RECORD_LOCK_TABLE: UPIntrFreeCell<RecordLockTable> =
         unsafe { UPIntrFreeCell::new(RecordLockTable::new()) };
+    static ref FLOCK_TABLE: UPIntrFreeCell<FlockTable> =
+        unsafe { UPIntrFreeCell::new(FlockTable::new()) };
 }
 
 impl RecordLockTable {
@@ -297,6 +327,107 @@ impl RecordLockTable {
     }
 }
 
+impl FlockTable {
+    fn new() -> Self {
+        Self {
+            locks: Vec::new(),
+            waiters: VecDeque::new(),
+        }
+    }
+
+    fn set_lock(
+        &mut self,
+        key: LockKey,
+        owner: Arc<dyn File + Send + Sync>,
+        mode: FlockMode,
+    ) -> SysResult<Vec<Arc<TaskControlBlock>>> {
+        if self.has_conflict(key, &owner, mode) {
+            return Err(SysError::EAGAIN);
+        }
+        self.remove_owner_lock(key, &owner);
+        self.locks.push(FlockLock { key, owner, mode });
+        Ok(self.take_waiters_for_key(key))
+    }
+
+    fn unlock(
+        &mut self,
+        key: LockKey,
+        owner: &Arc<dyn File + Send + Sync>,
+    ) -> Vec<Arc<TaskControlBlock>> {
+        self.remove_owner_lock(key, owner);
+        self.take_waiters_for_key(key)
+    }
+
+    fn release_owner(&mut self, owner: &Arc<dyn File + Send + Sync>) -> Vec<Arc<TaskControlBlock>> {
+        self.remove_waiters_for_owner(owner);
+        let mut released_keys = Vec::new();
+        self.locks.retain(|lock| {
+            if Arc::ptr_eq(&lock.owner, owner) {
+                if !released_keys.contains(&lock.key) {
+                    released_keys.push(lock.key);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        self.take_waiters_for_keys(&released_keys)
+    }
+
+    fn has_conflict(
+        &self,
+        key: LockKey,
+        owner: &Arc<dyn File + Send + Sync>,
+        mode: FlockMode,
+    ) -> bool {
+        self.locks.iter().any(|lock| {
+            lock.key == key
+                && !Arc::ptr_eq(&lock.owner, owner)
+                && flock_modes_conflict(lock.mode, mode)
+        })
+    }
+
+    fn enqueue_waiter(
+        &mut self,
+        key: LockKey,
+        owner: Arc<dyn File + Send + Sync>,
+        task: Arc<TaskControlBlock>,
+    ) {
+        self.waiters.push_back(WaitingFlock { key, owner, task });
+    }
+
+    fn remove_owner_lock(&mut self, key: LockKey, owner: &Arc<dyn File + Send + Sync>) {
+        self.locks
+            .retain(|lock| lock.key != key || !Arc::ptr_eq(&lock.owner, owner));
+    }
+
+    fn remove_waiters_for_owner(&mut self, owner: &Arc<dyn File + Send + Sync>) {
+        self.waiters
+            .retain(|waiter| !Arc::ptr_eq(&waiter.owner, owner));
+    }
+
+    fn take_waiters_for_key(&mut self, key: LockKey) -> Vec<Arc<TaskControlBlock>> {
+        self.take_waiters_for_keys(&[key])
+    }
+
+    fn take_waiters_for_keys(&mut self, keys: &[LockKey]) -> Vec<Arc<TaskControlBlock>> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let mut next = VecDeque::new();
+        let mut wakeups = Vec::new();
+        while let Some(waiter) = self.waiters.pop_front() {
+            if keys.contains(&waiter.key) {
+                wakeups.push(waiter.task);
+            } else {
+                next.push_back(waiter);
+            }
+        }
+        self.waiters = next;
+        wakeups
+    }
+}
+
 fn valid_getlk_type(l_type: i16) -> bool {
     matches!(l_type, F_RDLCK | F_WRLCK)
 }
@@ -311,6 +442,10 @@ fn valid_flock_whence(l_whence: i16) -> bool {
 
 fn lock_conflicts(existing_type: i16, requested_type: i16) -> bool {
     existing_type == F_WRLCK || requested_type == F_WRLCK
+}
+
+fn flock_modes_conflict(existing_mode: FlockMode, requested_mode: FlockMode) -> bool {
+    existing_mode == FlockMode::Exclusive || requested_mode == FlockMode::Exclusive
 }
 
 fn ranges_overlap(first_start: i64, first_end: i64, second_start: i64, second_end: i64) -> bool {
@@ -378,6 +513,57 @@ fn check_lock_access(file: &Arc<dyn File + Send + Sync>, l_type: i16) -> SysResu
 fn wake_waiters(waiters: Vec<Arc<TaskControlBlock>>) {
     for task in waiters {
         let _ = wakeup_task(task);
+    }
+}
+
+fn parse_flock_operation(operation: i32) -> SysResult<(Option<FlockMode>, bool)> {
+    if operation & !FLOCK_VALID_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+    let mode_bits = operation & (LOCK_SH | LOCK_EX | LOCK_UN);
+    let mode = match mode_bits {
+        LOCK_SH => Some(FlockMode::Shared),
+        LOCK_EX => Some(FlockMode::Exclusive),
+        LOCK_UN => None,
+        _ => return Err(SysError::EINVAL),
+    };
+    Ok((mode, operation & LOCK_NB != 0))
+}
+
+fn file_description_still_referenced(file: &Arc<dyn File + Send + Sync>) -> bool {
+    processes_snapshot()
+        .into_iter()
+        .any(|process| process.references_file_description(file))
+}
+
+pub(super) fn flock_operation(entry: FdTableEntry, operation: i32) -> SysResult {
+    let owner = entry.file();
+    let (mode, nonblocking) = parse_flock_operation(operation)?;
+    let key = lock_key(&owner)?;
+    if let Some(mode) = mode {
+        // UNFINISHED: blocking flock waits are not signal-interruptible yet;
+        // Linux can return EINTR when an incompatible lock wait is interrupted.
+        loop {
+            let mut table = FLOCK_TABLE.exclusive_access();
+            match table.set_lock(key, Arc::clone(&owner), mode) {
+                Ok(waiters) => {
+                    drop(table);
+                    wake_waiters(waiters);
+                    return Ok(0);
+                }
+                Err(SysError::EAGAIN) if nonblocking => return Err(SysError::EAGAIN),
+                Err(SysError::EAGAIN) => {}
+                Err(error) => return Err(error),
+            }
+            let (task, task_cx_ptr) = block_current_task_no_schedule();
+            table.enqueue_waiter(key, Arc::clone(&owner), task);
+            drop(table);
+            schedule(task_cx_ptr);
+        }
+    } else {
+        let waiters = FLOCK_TABLE.exclusive_access().unlock(key, &owner);
+        wake_waiters(waiters);
+        Ok(0)
     }
 }
 
@@ -477,6 +663,21 @@ pub(super) fn release_record_locks_for_close(entry: &FdTableEntry) {
         .exclusive_access()
         .release_for_process_file(key, pid);
     wake_waiters(waiters);
+}
+
+pub(super) fn release_flock_locks_for_close(entry: &FdTableEntry) {
+    let file = entry.file();
+    if file_description_still_referenced(&file) {
+        return;
+    }
+    let waiters = FLOCK_TABLE.exclusive_access().release_owner(&file);
+    wake_waiters(waiters);
+}
+
+pub(crate) fn release_flock_locks_for_closed_fd_table(fd_table: &[Option<FdTableEntry>]) {
+    for entry in fd_table.iter().flatten() {
+        release_flock_locks_for_close(entry);
+    }
 }
 
 pub(crate) fn release_record_locks_for_process(pid: usize) {

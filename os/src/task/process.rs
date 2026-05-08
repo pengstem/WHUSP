@@ -461,6 +461,18 @@ impl ProcessControlBlock {
                 .any(|entry| entry.vfs_mount_id() == Some(mount_id))
     }
 
+    pub(crate) fn references_file_description(
+        &self,
+        file: &Arc<dyn crate::fs::File + Send + Sync>,
+    ) -> bool {
+        self.inner
+            .exclusive_access()
+            .fd_table
+            .iter()
+            .flatten()
+            .any(|entry| entry.is_same_file_description(file))
+    }
+
     pub fn getpid(&self) -> usize {
         self.pid.0
     }

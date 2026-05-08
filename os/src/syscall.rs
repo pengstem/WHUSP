@@ -7,6 +7,7 @@ const SYSCALL_DUP: usize = 23;
 const SYSCALL_DUP3: usize = 24;
 const SYSCALL_FCNTL: usize = 25;
 const SYSCALL_IOCTL: usize = 29;
+const SYSCALL_FLOCK: usize = 32;
 const SYSCALL_MKNODAT: usize = 33;
 const SYSCALL_MKDIRAT: usize = 34;
 const SYSCALL_UNLINKAT: usize = 35;
@@ -166,7 +167,7 @@ use time::*;
 use uapi::LinuxTimeSpec;
 use wait::*;
 
-pub(crate) use fs::release_record_locks_for_process;
+pub(crate) use fs::{release_flock_locks_for_closed_fd_table, release_record_locks_for_process};
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 pub(crate) use wait::LinuxSigInfo;
 
@@ -205,6 +206,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2] as u32),
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1], args[2]),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
+        SYSCALL_FLOCK => sys_flock(args[0], args[1] as i32),
         SYSCALL_MKNODAT => sys_mknodat(
             args[0] as isize,
             args[1] as *const u8,

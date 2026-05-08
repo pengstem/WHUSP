@@ -11,7 +11,10 @@ use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
     UserBufferAccess, read_user_c_string, translated_byte_buffer_checked,
 };
-use super::fd_lock::{fcntl_getlk, fcntl_setlk, fcntl_setlkw, release_record_locks_for_close};
+use super::fd_lock::{
+    fcntl_getlk, fcntl_setlk, fcntl_setlkw, flock_operation, release_flock_locks_for_close,
+    release_record_locks_for_close,
+};
 
 const F_DUPFD: usize = 0;
 const F_GETFD: usize = 1;
@@ -62,6 +65,7 @@ pub fn sys_close(fd: usize) -> SysResult {
         entry
     };
     release_record_locks_for_close(&entry);
+    release_flock_locks_for_close(&entry);
     drop(entry);
     Ok(0)
 }
@@ -304,4 +308,9 @@ pub fn sys_fcntl(fd: usize, op: usize, arg: usize) -> SysResult {
         F_GET_SEALS => fcntl_get_seals(fd),
         _ => Err(SysError::EINVAL),
     }
+}
+
+pub fn sys_flock(fd: usize, operation: i32) -> SysResult {
+    let entry = get_fd_entry_by_fd(fd)?;
+    flock_operation(entry, operation)
 }

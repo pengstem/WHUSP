@@ -57,6 +57,10 @@ impl FdTableEntry {
         Arc::clone(&self.file)
     }
 
+    pub(crate) fn is_same_file_description(&self, file: &Arc<dyn File + Send + Sync>) -> bool {
+        Arc::ptr_eq(&self.file, file)
+    }
+
     pub fn vfs_mount_id(&self) -> Option<crate::fs::MountId> {
         self.file.vfs_mount_id()
     }
