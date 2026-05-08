@@ -21,11 +21,36 @@ const TMPFILE_CREATE_ATTEMPTS: usize = 64;
 
 static TMPFILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct FileCreateAttrs {
     pub(crate) uid: u32,
     pub(crate) gid: u32,
+    pub(crate) euid: u32,
+    pub(crate) egid: u32,
+    pub(crate) fsgid: u32,
     pub(crate) mode: u32,
+    pub(crate) umask: u32,
+    pub(crate) groups: Vec<u32>,
+}
+
+impl FileCreateAttrs {
+    fn can_keep_setgid(&self, gid: u32) -> bool {
+        self.euid == 0
+            || self.egid == gid
+            || self.fsgid == gid
+            || self.groups.iter().any(|group| *group == gid)
+    }
+}
+
+fn prepare_created_file_mode(parent_stat: FileStat, attrs: &FileCreateAttrs) -> u32 {
+    let mut mode = attrs.mode;
+    if parent_stat.mode & MODE_SETGID != 0
+        && mode & MODE_SETGID != 0
+        && !attrs.can_keep_setgid(parent_stat.gid)
+    {
+        mode &= !MODE_SETGID;
+    }
+    (mode & !attrs.umask) & MODE_PERMISSIONS_MASK
 }
 
 pub(crate) struct VfsFile {
@@ -223,10 +248,9 @@ fn open_vfs_file_impl(
                     mount.set_owner(ino, Some(attrs.uid), Some(gid))
                 })
                 .ok_or(FsError::Io)??;
-                with_mount(target.parent.mount_id, |mount| {
-                    mount.set_mode(ino, attrs.mode & MODE_PERMISSIONS_MASK)
-                })
-                .ok_or(FsError::Io)??;
+                let mode = prepare_created_file_mode(parent_stat, &attrs);
+                with_mount(target.parent.mount_id, |mount| mount.set_mode(ino, mode))
+                    .ok_or(FsError::Io)??;
             }
             let (readable, writable) = flags.read_write();
             (
@@ -296,10 +320,9 @@ fn create_tmpfile_inode(
             mount.set_owner(ino, Some(attrs.uid), Some(gid))
         })
         .ok_or(FsError::Io)??;
-        with_mount(directory.node.mount_id, |mount| {
-            mount.set_mode(ino, attrs.mode & MODE_PERMISSIONS_MASK)
-        })
-        .ok_or(FsError::Io)??;
+        let mode = prepare_created_file_mode(parent_stat, &attrs);
+        with_mount(directory.node.mount_id, |mount| mount.set_mode(ino, mode))
+            .ok_or(FsError::Io)??;
     }
 
     let (readable, writable) = flags.read_write();

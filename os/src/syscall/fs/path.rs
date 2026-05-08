@@ -454,7 +454,12 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> SysRe
     let create_attrs = Some(FileCreateAttrs {
         uid: credentials.fsuid,
         gid: credentials.fsgid,
-        mode: mode & !process.umask(),
+        euid: credentials.euid,
+        egid: credentials.egid,
+        fsgid: credentials.fsgid,
+        mode,
+        umask: process.umask(),
+        groups: credentials.groups.clone(),
     });
     let file = if flags.contains(OpenFlags::TMPFILE) {
         open_tmpfile_in_with_attrs(context, path.as_str(), flags, create_attrs)?
