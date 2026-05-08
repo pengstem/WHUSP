@@ -1,16 +1,16 @@
-use crate::fs::{File, OpenFlags, PollEvents, SeekWhence, S_IFDIR, S_IFREG};
+use crate::fs::{File, OpenFlags, PollEvents, S_IFDIR, S_IFREG, SeekWhence};
 use crate::mm::UserBuffer;
-use crate::task::{current_add_signal, current_user_token, FdTableEntry, SignalFlags};
-use alloc::vec::Vec;
+use crate::task::{FdTableEntry, SignalFlags, current_add_signal, current_user_token};
+use alloc::{vec, vec::Vec};
 use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    read_user_usize, translated_byte_buffer_checked,
-    translated_byte_buffer_checked_with_mmap_fault, UserBufferAccess,
+    UserBufferAccess, read_user_usize, read_user_value, translated_byte_buffer_checked,
+    translated_byte_buffer_checked_with_mmap_fault, write_user_value,
 };
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
-use super::uapi::{LinuxIovec, IOV_MAX};
+use super::uapi::{IOV_MAX, LinuxIovec};
 
 fn read_user_iovecs(
     token: usize,
@@ -185,6 +185,150 @@ pub fn sys_fallocate(fd: usize, mode: u32, offset: usize, len: usize) -> SysResu
     // accepted as a no-op because its visible contract in LTP sparse-file
     // cases is that file size must not change.
     Ok(0)
+}
+
+const SPLICE_F_MOVE: u32 = 0x01;
+const SPLICE_F_NONBLOCK: u32 = 0x02;
+const SPLICE_F_MORE: u32 = 0x04;
+const SPLICE_F_GIFT: u32 = 0x08;
+const SPLICE_KNOWN_FLAGS: u32 = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
+const SPLICE_COPY_CHUNK: usize = 4096;
+
+// UNFINISHED: Linux splice can move pipe pages without copying and has deeper
+// file-type-specific wakeup semantics. This contest compatibility path copies
+// through kernel memory while preserving the visible fd, offset, and errno
+// behavior needed by current LTP splice cases.
+fn kernel_user_buffer(buf: &mut [u8]) -> UserBuffer {
+    // UserBuffer is also the in-kernel File trait data carrier. The borrowed
+    // slice is consumed synchronously by File::read/write and is not stored.
+    let slice = unsafe { core::mem::transmute::<&mut [u8], &'static mut [u8]>(buf) };
+    UserBuffer::new(vec![slice])
+}
+
+fn read_splice_offset(token: usize, ptr: *mut i64, is_pipe: bool) -> SysResult<Option<i64>> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    if is_pipe {
+        return Err(SysError::ESPIPE);
+    }
+    let offset = read_user_value(token, ptr.cast_const())?;
+    if offset < 0 {
+        return Err(SysError::EINVAL);
+    }
+    Ok(Some(offset))
+}
+
+fn write_splice_offset(token: usize, ptr: *mut i64, offset: Option<i64>) -> SysResult<()> {
+    if let Some(offset) = offset {
+        write_user_value(token, ptr, &offset)?;
+    }
+    Ok(())
+}
+
+fn read_for_splice(entry: &FdTableEntry, offset: Option<i64>, buf: &mut [u8]) -> SysResult<usize> {
+    let file = entry.file();
+    if let Some(offset) = offset {
+        Ok(file.read_at(offset as usize, buf))
+    } else {
+        if file.is_socket() && !file.poll(PollEvents::POLLIN).contains(PollEvents::POLLIN) {
+            return Err(SysError::EINVAL);
+        }
+        ensure_nonblocking_ready(entry, PollEvents::POLLIN)?;
+        Ok(file.read(kernel_user_buffer(buf)))
+    }
+}
+
+fn write_for_splice(entry: &FdTableEntry, offset: Option<i64>, data: &[u8]) -> SysResult<usize> {
+    let file = entry.file();
+    if file.is_dev_full() && !data.is_empty() {
+        return Err(SysError::ENOSPC);
+    }
+    if let Some(offset) = offset {
+        Ok(file.write_at(offset as usize, data))
+    } else {
+        check_pipe_write_peer(entry, !data.is_empty())?;
+        ensure_nonblocking_ready(entry, PollEvents::POLLOUT)?;
+        let mut owned = data.to_vec();
+        Ok(write_with_status_flags(
+            entry,
+            kernel_user_buffer(&mut owned),
+        ))
+    }
+}
+
+pub fn sys_splice(
+    fd_in: usize,
+    off_in: *mut i64,
+    fd_out: usize,
+    off_out: *mut i64,
+    len: usize,
+    flags: u32,
+) -> SysResult {
+    if flags & !SPLICE_KNOWN_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+
+    let token = current_user_token();
+    let in_entry = get_fd_entry_by_fd(fd_in)?;
+    let out_entry = get_fd_entry_by_fd(fd_out)?;
+    let in_file = in_entry.file();
+    let out_file = out_entry.file();
+    if !in_file.readable() {
+        return Err(SysError::EBADF);
+    }
+    if !out_file.writable() {
+        return Err(SysError::EBADF);
+    }
+    if out_entry.status_flags().contains(OpenFlags::APPEND) {
+        return Err(SysError::EINVAL);
+    }
+    if in_file.stat()?.mode & S_IFDIR == S_IFDIR || out_file.stat()?.mode & S_IFDIR == S_IFDIR {
+        return Err(SysError::EINVAL);
+    }
+
+    let in_is_pipe = in_file.is_pipe();
+    let out_is_pipe = out_file.is_pipe();
+    if !in_is_pipe && !out_is_pipe {
+        return Err(SysError::EINVAL);
+    }
+
+    let mut in_offset = read_splice_offset(token, off_in, in_is_pipe)?;
+    let mut out_offset = read_splice_offset(token, off_out, out_is_pipe)?;
+    let mut copied = 0usize;
+    let mut buffer = vec![0u8; len.min(SPLICE_COPY_CHUNK)];
+
+    while copied < len {
+        let want = buffer.len().min(len - copied);
+        let read = read_for_splice(&in_entry, in_offset, &mut buffer[..want])?;
+        if read == 0 {
+            break;
+        }
+        let written = write_for_splice(&out_entry, out_offset, &buffer[..read])?;
+        if written == 0 {
+            break;
+        }
+        copied += written;
+        if let Some(offset) = in_offset.as_mut() {
+            *offset += read as i64;
+        }
+        if let Some(offset) = out_offset.as_mut() {
+            *offset += written as i64;
+        }
+        if read < want && (in_is_pipe || in_file.is_socket()) {
+            break;
+        }
+        if written < read {
+            break;
+        }
+    }
+
+    write_splice_offset(token, off_in, in_offset)?;
+    write_splice_offset(token, off_out, out_offset)?;
+    Ok(copied as isize)
 }
 
 pub fn sys_fsync(fd: usize) -> SysResult {
@@ -365,6 +509,9 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
     if !file.writable() {
         return Err(SysError::EBADF);
     }
+    if file.is_dev_full() && len > 0 {
+        return Err(SysError::ENOSPC);
+    }
     check_pipe_write_peer(&entry, len > 0)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
     let buffers =
@@ -391,6 +538,9 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
         return Err(SysError::EBADF);
     }
     let has_data = iovecs.iter().any(|iovec| iovec.len > 0);
+    if file.is_dev_full() && has_data {
+        return Err(SysError::ENOSPC);
+    }
     check_pipe_write_peer(&entry, has_data)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
 

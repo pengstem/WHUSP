@@ -728,6 +728,9 @@ impl File for LocalSocket {
     fn set_status_flags(&self, flags: OpenFlags) {
         *self.status_flags.exclusive_access() = flags;
     }
+    fn is_socket(&self) -> bool {
+        true
+    }
 }
 
 fn normalize_local_endpoint(endpoint: &mut InetEndpoint) {
@@ -749,6 +752,9 @@ fn normalize_remote_endpoint(endpoint: &mut InetEndpoint) -> SysResult<()> {
 }
 
 fn sockaddr_to_endpoint(addr: LinuxSockAddrIn) -> SysResult<InetEndpoint> {
+    if addr.family as i32 == AF_UNIX {
+        return Err(SysError::ENOENT);
+    }
     if addr.family as i32 != AF_INET {
         return Err(SysError::EAFNOSUPPORT);
     }
@@ -901,10 +907,12 @@ pub fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
                 return Err(SysError::EPROTONOSUPPORT);
             }
             // CONTEXT: libc group/passwd lookup probes AF_UNIX nscd first.
-            // Full AF_UNIX IPC is not implemented; report the daemon socket as
-            // absent so libc falls back to local database files instead of
-            // preserving EAFNOSUPPORT as the final lookup errno.
-            Err(SysError::ENOENT)
+            // Full pathname AF_UNIX IPC is not implemented; connect/bind on a
+            // sockaddr_un still reports ENOENT so libc falls back to local
+            // database files. Creating an unbound AF_UNIX fd is enough for LTP
+            // fd-type probes such as splice07.
+            let socket = LocalSocket::new(kind, flags);
+            Ok(alloc_socket_fd(socket, flags)? as isize)
         }
         _ => Err(SysError::EAFNOSUPPORT),
     }

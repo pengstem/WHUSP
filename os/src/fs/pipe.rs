@@ -391,4 +391,7 @@ impl File for Pipe {
         }
         ready
     }
+    fn is_pipe(&self) -> bool {
+        true
+    }
 }

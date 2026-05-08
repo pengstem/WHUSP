@@ -1,16 +1,18 @@
-use super::dirent::{write_dir_entries, RawDirEntry, DT_DIR, DT_LNK, DT_REG};
+use super::dirent::{DT_DIR, DT_LNK, DT_REG, RawDirEntry, write_dir_entries};
 use super::mount;
 use super::pipe::{PIPE_MAX_CAPACITY, PIPE_MIN_CAPACITY};
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
 use super::{FileStat, FileTimestamp, S_IFDIR, S_IFLNK, S_IFREG};
 use crate::config::PAGE_SIZE;
 use crate::mm::frame_stats;
-use crate::task::{list_process_snapshots, pid2process, ProcessProcSnapshot};
+use crate::sync::UPIntrFreeCell;
+use crate::task::{ProcessProcSnapshot, list_process_snapshots, pid2process};
 use crate::timer::{get_time_us, us_to_clock_ticks};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use lazy_static::lazy_static;
 
 const ROOT_INO: u32 = 2;
 const MOUNTS_INO: u32 = 3;
@@ -23,6 +25,7 @@ const PID_MAX_INO: u32 = 9;
 const SYS_FS_DIR_INO: u32 = 10;
 const PIPE_MAX_SIZE_INO: u32 = 11;
 const PIPE_USER_PAGES_SOFT_INO: u32 = 12;
+const DOMAINNAME_INO: u32 = 13;
 const PID_DIR_BASE: u32 = 100;
 const PID_FILE_BASE: u32 = 10_000;
 const PID_FILE_STRIDE: u32 = 10;
@@ -39,6 +42,14 @@ const DEFAULT_PIPE_USER_PAGES_SOFT: usize = 1;
 static PROC_PID_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_PID_MAX);
 static PROC_PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(PIPE_MAX_CAPACITY);
 static PROC_PIPE_USER_PAGES_SOFT: AtomicUsize = AtomicUsize::new(DEFAULT_PIPE_USER_PAGES_SOFT);
+
+lazy_static! {
+    static ref PROC_DOMAINNAME: UPIntrFreeCell<Vec<u8>> = {
+        let mut value = Vec::new();
+        value.extend_from_slice(b"(none)");
+        unsafe { UPIntrFreeCell::new(value) }
+    };
+}
 
 pub(crate) fn pipe_max_size() -> usize {
     PROC_PIPE_MAX_SIZE.load(Ordering::Relaxed)
@@ -59,6 +70,7 @@ enum ProcNode {
     PidMax,
     PipeMaxSize,
     PipeUserPagesSoft,
+    Domainname,
     PidDir(usize),
     PidStat(usize),
     PidStatus(usize),
@@ -110,6 +122,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         SYS_FS_DIR_INO => Some(ProcNode::SysFsDir),
         PIPE_MAX_SIZE_INO => Some(ProcNode::PipeMaxSize),
         PIPE_USER_PAGES_SOFT_INO => Some(ProcNode::PipeUserPagesSoft),
+        DOMAINNAME_INO => Some(ProcNode::Domainname),
         ino if ino >= PID_FD_ENTRY_BASE => {
             let rel = ino - PID_FD_ENTRY_BASE;
             let pid = (rel / PID_FD_ENTRY_STRIDE) as usize;
@@ -272,6 +285,11 @@ fn sys_kernel_entries() -> Vec<RawDirEntry> {
         name: "pid_max".into(),
         dtype: DT_REG,
     });
+    entries.push(RawDirEntry {
+        ino: DOMAINNAME_INO,
+        name: "domainname".into(),
+        dtype: DT_REG,
+    });
     entries
 }
 
@@ -419,6 +437,12 @@ fn pipe_user_pages_soft_content() -> String {
     format!("{}\n", PROC_PIPE_USER_PAGES_SOFT.load(Ordering::Relaxed))
 }
 
+fn domainname_content() -> Vec<u8> {
+    let mut output = PROC_DOMAINNAME.exclusive_access().clone();
+    output.push(b'\n');
+    output
+}
+
 fn write_pid_max(buf: &[u8], offset: u64) -> usize {
     if offset != 0 {
         return 0;
@@ -455,6 +479,36 @@ fn write_pipe_max_size(buf: &[u8], offset: u64) -> usize {
     // consistent.
     PROC_PIPE_MAX_SIZE.store(value.min(PIPE_MAX_CAPACITY), Ordering::Relaxed);
     buf.len()
+}
+
+fn write_domainname(buf: &[u8], offset: u64) -> usize {
+    let Ok(offset) = usize::try_from(offset) else {
+        return 0;
+    };
+    let end = buf
+        .iter()
+        .position(|byte| *byte == b'\n' || *byte == 0)
+        .unwrap_or(buf.len());
+    let mut value = PROC_DOMAINNAME.exclusive_access();
+    if offset > value.len() {
+        return 0;
+    }
+    value.truncate(offset);
+    value.extend_from_slice(&buf[..end]);
+    buf.len()
+}
+
+fn set_domainname_len(len: u64) -> FsResult {
+    let Ok(len) = usize::try_from(len) else {
+        return Err(FsError::InvalidInput);
+    };
+    let mut value = PROC_DOMAINNAME.exclusive_access();
+    if len <= value.len() {
+        value.truncate(len);
+    } else {
+        value.resize(len, 0);
+    }
+    Ok(())
 }
 
 fn pid_stat_content(process: ProcessProcSnapshot) -> String {
@@ -528,6 +582,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::PidMax => Ok(pid_max_content().into_bytes()),
         ProcNode::PipeMaxSize => Ok(pipe_max_size_content().into_bytes()),
         ProcNode::PipeUserPagesSoft => Ok(pipe_user_pages_soft_content().into_bytes()),
+        ProcNode::Domainname => Ok(domainname_content()),
         ProcNode::PidStat(pid) => lookup_process(pid)
             .map(pid_stat_content)
             .map(String::into_bytes)
@@ -607,6 +662,7 @@ impl FileSystemBackend for ProcFs {
                 "." => Ok((SYS_KERNEL_DIR_INO, FsNodeKind::Directory)),
                 ".." => Ok((SYS_DIR_INO, FsNodeKind::Directory)),
                 "pid_max" => Ok((PID_MAX_INO, FsNodeKind::RegularFile)),
+                "domainname" => Ok((DOMAINNAME_INO, FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::SysFsDir => match component {
@@ -685,6 +741,7 @@ impl FileSystemBackend for ProcFs {
     fn set_len(&mut self, _ino: u32, _len: u64) -> FsResult {
         match decode_node(_ino).ok_or(FsError::NotFound)? {
             ProcNode::PidMax | ProcNode::PipeMaxSize => Ok(()),
+            ProcNode::Domainname => set_domainname_len(_len),
             _ => Err(FsError::ReadOnly),
         }
     }
@@ -709,7 +766,9 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::PidDir(_)
             | ProcNode::PidFdDir(_) => FileStat::with_mode(S_IFDIR | 0o555),
             ProcNode::PidFdEntry(_, _) => FileStat::with_mode(S_IFLNK | 0o777),
-            ProcNode::PidMax | ProcNode::PipeMaxSize => FileStat::with_mode(S_IFREG | 0o644),
+            ProcNode::PidMax | ProcNode::PipeMaxSize | ProcNode::Domainname => {
+                FileStat::with_mode(S_IFREG | 0o644)
+            }
             _ => FileStat::with_mode(S_IFREG | 0o444),
         };
         stat.dev = 0x70726f63;
@@ -762,6 +821,7 @@ impl FileSystemBackend for ProcFs {
         match decode_node(ino) {
             Some(ProcNode::PidMax) => write_pid_max(buf, offset),
             Some(ProcNode::PipeMaxSize) => write_pipe_max_size(buf, offset),
+            Some(ProcNode::Domainname) => write_domainname(buf, offset),
             _ => 0,
         }
     }

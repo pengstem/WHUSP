@@ -15,6 +15,7 @@ enum DevNode {
     Misc,
     Null,
     Zero,
+    Full,
     Random,
     Urandom,
     Tty,
@@ -29,11 +30,12 @@ impl DevNode {
             Self::Misc => 2,
             Self::Null => 3,
             Self::Zero => 4,
-            Self::Random => 5,
-            Self::Urandom => 6,
-            Self::Tty => 7,
-            Self::TtyS0 => 8,
-            Self::Rtc => 9,
+            Self::Full => 5,
+            Self::Random => 6,
+            Self::Urandom => 7,
+            Self::Tty => 8,
+            Self::TtyS0 => 9,
+            Self::Rtc => 10,
         }
     }
 
@@ -42,6 +44,7 @@ impl DevNode {
             Self::Root | Self::Misc => 0,
             Self::Null => linux_makedev(1, 3),
             Self::Zero => linux_makedev(1, 5),
+            Self::Full => linux_makedev(1, 7),
             Self::Random => linux_makedev(1, 8),
             Self::Urandom => linux_makedev(1, 9),
             Self::Tty => linux_makedev(5, 0),
@@ -81,7 +84,7 @@ struct DevDirEntry {
     dtype: u8,
 }
 
-const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 11] = [
+const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 12] = [
     DevDirEntry {
         node: DevNode::Root,
         name: b".",
@@ -100,6 +103,11 @@ const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 11] = [
     DevDirEntry {
         node: DevNode::Zero,
         name: b"zero",
+        dtype: DT_CHR,
+    },
+    DevDirEntry {
+        node: DevNode::Full,
+        name: b"full",
         dtype: DT_CHR,
     },
     DevDirEntry {
@@ -171,6 +179,7 @@ fn lookup_absolute(path: &str) -> Option<DevNode> {
         "/dev/misc" | "/dev/misc/" => Some(DevNode::Misc),
         "/dev/null" => Some(DevNode::Null),
         "/dev/zero" => Some(DevNode::Zero),
+        "/dev/full" => Some(DevNode::Full),
         "/dev/random" => Some(DevNode::Random),
         "/dev/urandom" => Some(DevNode::Urandom),
         "/dev/tty" => Some(DevNode::Tty),
@@ -187,6 +196,7 @@ fn lookup_child(parent: DevNode, path: &str) -> Option<DevNode> {
             "misc" => Some(DevNode::Misc),
             "null" => Some(DevNode::Null),
             "zero" => Some(DevNode::Zero),
+            "full" => Some(DevNode::Full),
             "random" => Some(DevNode::Random),
             "urandom" => Some(DevNode::Urandom),
             "tty" => Some(DevNode::Tty),
@@ -428,7 +438,7 @@ impl File for DevFsFile {
     fn read(&self, user_buf: UserBuffer) -> usize {
         match self.node {
             DevNode::Root | DevNode::Misc | DevNode::Null | DevNode::Rtc => 0,
-            DevNode::Zero => read_zero(user_buf),
+            DevNode::Zero | DevNode::Full => read_zero(user_buf),
             DevNode::Random | DevNode::Urandom => read_random(user_buf),
             DevNode::Tty | DevNode::TtyS0 => read_console(user_buf),
         }
@@ -436,7 +446,7 @@ impl File for DevFsFile {
 
     fn write(&self, user_buf: UserBuffer) -> usize {
         match self.node {
-            DevNode::Root | DevNode::Misc | DevNode::Rtc => 0,
+            DevNode::Root | DevNode::Misc | DevNode::Rtc | DevNode::Full => 0,
             DevNode::Null | DevNode::Zero | DevNode::Random | DevNode::Urandom => user_buf.len(),
             DevNode::Tty | DevNode::TtyS0 => write_console(user_buf),
         }
@@ -499,5 +509,9 @@ impl File for DevFsFile {
 
     fn is_devfs_misc_dir(&self) -> bool {
         self.node == DevNode::Misc
+    }
+
+    fn is_dev_full(&self) -> bool {
+        self.node == DevNode::Full
     }
 }

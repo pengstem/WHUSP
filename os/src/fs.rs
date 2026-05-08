@@ -14,7 +14,7 @@ mod stdio;
 mod tmpfs;
 mod vfs;
 
-use crate::mm::{page_cache::PageCacheId, UserBuffer};
+use crate::mm::{UserBuffer, page_cache::PageCacheId};
 use bitflags::bitflags;
 use core::any::Any;
 
@@ -199,6 +199,15 @@ pub trait File: Send + Sync {
     fn is_devfs_misc_dir(&self) -> bool {
         false
     }
+    fn is_pipe(&self) -> bool {
+        false
+    }
+    fn is_dev_full(&self) -> bool {
+        false
+    }
+    fn is_socket(&self) -> bool {
+        false
+    }
 }
 
 pub fn init() {
@@ -224,10 +233,10 @@ pub(crate) use inode::{
     symlink_in, unlink_file_in,
 };
 pub(crate) use mount::{
-    mount_block_device_at, mount_fat_device_at, mount_is_read_only, mount_tmpfs_at, remount_at,
-    statfs_for_mount, unmount_at, MountError, MountId,
+    MountError, MountId, mount_block_device_at, mount_fat_device_at, mount_is_read_only,
+    mount_tmpfs_at, remount_at, statfs_for_mount, unmount_at,
 };
-pub(crate) use path::{normalize_path_at_root, path_inside_root, PathContext, WorkingDir};
+pub(crate) use path::{PathContext, WorkingDir, normalize_path_at_root, path_inside_root};
 pub(crate) use pipe::default_pipe_capacity_for_current_process;
 pub use pipe::make_pipe;
 pub(crate) use procfs::pipe_max_size;
@@ -235,9 +244,9 @@ pub(crate) use staticfs::{open_path as open_static_path, stat_path as stat_stati
 pub use stdio::{Stdin, Stdout};
 pub(crate) use vfs::open_file;
 pub(crate) use vfs::{
-    chmod_in, chown_in, link_open_file_in, lookup_dir_in, lookup_dir_with_stat_in, open_file_in,
-    open_file_in_with_attrs, open_tmpfile_in_with_attrs, stat_in, truncate_in, FileCreateAttrs,
-    FileSystemStat, FsError, FsNodeKind, FsResult,
+    FileCreateAttrs, FileSystemStat, FsError, FsNodeKind, FsResult, chmod_in, chown_in,
+    link_open_file_in, lookup_dir_in, lookup_dir_with_stat_in, open_file_in,
+    open_file_in_with_attrs, open_tmpfile_in_with_attrs, stat_in, truncate_in,
 };
 
 pub(self) fn align_up(value: usize, align: usize) -> usize {

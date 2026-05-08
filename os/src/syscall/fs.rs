@@ -14,7 +14,7 @@ pub use fd::{sys_close, sys_dup, sys_dup3, sys_fcntl, sys_pipe2};
 pub(crate) use fd_lock::release_record_locks_for_process;
 pub use io::{
     sys_fallocate, sys_fsync, sys_ftruncate, sys_lseek, sys_pread64, sys_preadv, sys_pwrite64,
-    sys_pwritev, sys_read, sys_readv, sys_write, sys_writev,
+    sys_pwritev, sys_read, sys_readv, sys_splice, sys_write, sys_writev,
 };
 pub use mount::{sys_mount, sys_umount2};
 pub use path::{
