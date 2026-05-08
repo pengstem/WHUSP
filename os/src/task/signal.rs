@@ -42,9 +42,22 @@ bitflags! {
         const SIGPIPE   = 1u128 << 13;
         const SIGALRM   = 1u128 << 14;
         const SIGTERM   = 1u128 << 15;
+        const SIGSTKFLT = 1u128 << 16;
         const SIGCHLD   = 1u128 << 17;
         const SIGCONT   = 1u128 << 18;
         const SIGSTOP   = 1u128 << 19;
+        const SIGTSTP   = 1u128 << 20;
+        const SIGTTIN   = 1u128 << 21;
+        const SIGTTOU   = 1u128 << 22;
+        const SIGURG    = 1u128 << 23;
+        const SIGXCPU   = 1u128 << 24;
+        const SIGXFSZ   = 1u128 << 25;
+        const SIGVTALRM = 1u128 << 26;
+        const SIGPROF   = 1u128 << 27;
+        const SIGWINCH  = 1u128 << 28;
+        const SIGPOLL   = 1u128 << 29;
+        const SIGPWR    = 1u128 << 30;
+        const SIGSYS    = 1u128 << 31;
     }
 }
 
@@ -198,6 +211,22 @@ impl SignalFlags {
             Some((-15, "Terminated, SIGTERM=15"))
         } else if self.contains(Self::SIGHUP) {
             Some((-1, "Hangup, SIGHUP=1"))
+        } else if self.contains(Self::SIGSTKFLT) {
+            Some((-16, "Stack Fault, SIGSTKFLT=16"))
+        } else if self.contains(Self::SIGXCPU) {
+            Some((-24, "CPU Time Limit Exceeded, SIGXCPU=24"))
+        } else if self.contains(Self::SIGXFSZ) {
+            Some((-25, "File Size Limit Exceeded, SIGXFSZ=25"))
+        } else if self.contains(Self::SIGVTALRM) {
+            Some((-26, "Virtual Timer Expired, SIGVTALRM=26"))
+        } else if self.contains(Self::SIGPROF) {
+            Some((-27, "Profiling Timer Expired, SIGPROF=27"))
+        } else if self.contains(Self::SIGPOLL) {
+            Some((-29, "I/O Possible, SIGPOLL=29"))
+        } else if self.contains(Self::SIGPWR) {
+            Some((-30, "Power Failure, SIGPWR=30"))
+        } else if self.contains(Self::SIGSYS) {
+            Some((-31, "Bad System Call, SIGSYS=31"))
         } else {
             None
         }
