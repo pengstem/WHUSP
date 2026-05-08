@@ -1,4 +1,4 @@
-use super::exec::{init_user_stack, ExecStackInfo};
+use super::exec::{ExecStackInfo, init_user_stack};
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
 use super::process::{
@@ -6,12 +6,12 @@ use super::process::{
     ProcessResourceLimits,
 };
 use super::{
-    add_task, pid_alloc, CloneArgs, CloneFlags, FdTableEntry, SignalAction, TaskControlBlock,
+    CloneArgs, CloneFlags, FdTableEntry, SignalAction, TaskControlBlock, add_task, pid_alloc,
 };
 use crate::fs::{OpenFlags, Stdin, Stdout, WorkingDir};
-use crate::mm::{ElfLoadInfo, MemorySet, KERNEL_SPACE};
+use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet};
 use crate::sync::UPIntrFreeCell;
-use crate::trap::{trap_handler, TrapContext};
+use crate::trap::{TrapContext, trap_handler};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;

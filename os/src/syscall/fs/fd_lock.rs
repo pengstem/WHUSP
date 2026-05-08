@@ -3,8 +3,8 @@ use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{read_user_value, write_user_value};
 use crate::task::{
-    block_current_task_no_schedule, current_process, current_user_token, schedule, wakeup_task,
-    FdTableEntry, TaskControlBlock,
+    FdTableEntry, TaskControlBlock, block_current_task_no_schedule, current_process,
+    current_user_token, schedule, wakeup_task,
 };
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;

@@ -1,7 +1,7 @@
 use super::id::RecycleAllocator;
 use super::{
-    FdTableEntry, PidHandle, SignalAction, TaskControlBlock, TaskStatus, FD_LIMIT,
-    SIGNAL_INFO_SLOTS,
+    FD_LIMIT, FdTableEntry, PidHandle, SIGNAL_INFO_SLOTS, SignalAction, TaskControlBlock,
+    TaskStatus,
 };
 use crate::config::USER_STACK_SIZE;
 use crate::fs::{PathContext, WorkingDir};

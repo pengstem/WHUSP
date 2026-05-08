@@ -29,9 +29,9 @@ pub(crate) const CAP_SETPCAP: usize = process::CapabilitySets::CAP_SETPCAP;
 pub(crate) const CAP_SYS_CHROOT: usize = process::CapabilitySets::CAP_SYS_CHROOT;
 
 pub use crate::arch::TaskContext;
-pub use clone::{clone_current_thread, CloneArgs, CloneFlags};
-pub(crate) use fd::{FdFlags, FdTableEntry, FD_LIMIT};
-pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
+pub use clone::{CloneArgs, CloneFlags, clone_current_thread};
+pub(crate) use fd::{FD_LIMIT, FdFlags, FdTableEntry};
+pub use id::{IDLE_PID, KernelStack, PidHandle, kstack_alloc, pid_alloc};
 pub(crate) use manager::any_process_references_mount;
 pub(crate) use manager::list_process_snapshots;
 pub(crate) use manager::processes_snapshot;
@@ -44,13 +44,13 @@ pub use processor::{
     run_tasks, schedule, take_current_task,
 };
 pub use signal::{
-    default_signal_action, default_signal_error, DefaultSignalAction, SigAltStack, SignalAction,
-    SignalFlags, SignalInfo, CLD_EXITED, MINSIGSTKSZ, SA_RESTART, SIGCHLD, SIGKILL,
-    SIGNAL_INFO_SLOTS, SIGSTOP, SS_DISABLE, SS_ONSTACK,
+    CLD_EXITED, DefaultSignalAction, MINSIGSTKSZ, SA_RESTART, SIGCHLD, SIGKILL, SIGNAL_INFO_SLOTS,
+    SIGSTOP, SS_DISABLE, SS_ONSTACK, SigAltStack, SignalAction, SignalFlags, SignalInfo,
+    default_signal_action, default_signal_error,
 };
-pub(crate) use signal::{flags_to_linux_sigset, linux_sigset_to_flags};
 #[cfg(target_arch = "riscv64")]
-pub use signal::{SIGRTMIN, SIGRT_1, SI_TKILL};
+pub use signal::{SI_TKILL, SIGRT_1, SIGRTMIN};
+pub(crate) use signal::{flags_to_linux_sigset, linux_sigset_to_flags};
 pub use task::{TaskControlBlock, TaskStatus};
 
 fn with_current_process(process_fn: impl FnOnce(&ProcessControlBlock)) {

@@ -1,7 +1,7 @@
 use super::mount::{mounted_root_for, with_mount};
 use super::path::{PathContext, WorkingDir};
 use super::vfs::{
-    resolve_create_parent_in, resolve_mount_target_in, FsError, FsNodeKind, FsResult, VfsNodeId,
+    FsError, FsNodeKind, FsResult, VfsNodeId, resolve_create_parent_in, resolve_mount_target_in,
 };
 use bitflags::*;
 use lwext4_rust::ffi::EXT4_ROOT_INO;
@@ -90,11 +90,7 @@ impl OpenFlags {
 
 fn trimmed_nonroot_path(name: &str) -> &str {
     let trimmed = name.trim_end_matches('/');
-    if trimmed.is_empty() {
-        name
-    } else {
-        trimmed
-    }
+    if trimmed.is_empty() { name } else { trimmed }
 }
 
 fn final_component(name: &str) -> Option<&str> {

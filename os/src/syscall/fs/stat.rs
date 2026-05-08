@@ -1,15 +1,15 @@
 use crate::fs::{
-    chmod_in, chown_in, mount_is_read_only, stat_devfs_child, stat_devfs_misc_child, stat_in,
-    stat_static_path, statfs_for_mount, FileStat, MountId, OpenFlags,
+    FileStat, MountId, OpenFlags, chmod_in, chown_in, mount_is_read_only, stat_devfs_child,
+    stat_devfs_misc_child, stat_in, stat_static_path, statfs_for_mount,
 };
-use crate::task::{current_process, current_user_token, PathSnapshot};
+use crate::task::{PathSnapshot, current_process, current_user_token};
 
 use super::super::errno::{SysError, SysResult};
-use super::super::user_ptr::{read_user_c_string, write_user_value, PATH_MAX};
+use super::super::user_ptr::{PATH_MAX, read_user_c_string, write_user_value};
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::path::{check_current_access_path_prefixes_from, path_context_from};
 use super::uapi::{
-    LinuxKstat, LinuxStatfs, LinuxStatx, AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW,
+    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, LinuxKstat, LinuxStatfs, LinuxStatx,
     STATX_RESERVED, VALID_FCHOWNAT_FLAGS, VALID_FSTATAT_FLAGS, VALID_STATX_FLAGS,
 };
 

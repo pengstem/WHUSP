@@ -1,13 +1,13 @@
 use super::trap::handle_mmap_page_fault;
-use crate::mm::{page_table::PTEFlags, MmapFaultAccess, VirtAddr};
+use crate::mm::{MmapFaultAccess, VirtAddr, page_table::PTEFlags};
 use crate::syscall::user_ptr::{
-    read_user_value_with_fault, write_user_value_with_fault, UserBufferAccess,
+    UserBufferAccess, read_user_value_with_fault, write_user_value_with_fault,
 };
-use crate::syscall::{errno::SysError, errno::SysResult, LinuxSigInfo};
+use crate::syscall::{LinuxSigInfo, errno::SysError, errno::SysResult};
 use crate::task::{
-    current_add_signal, current_process, current_task, current_trap_cx, current_user_token,
-    flags_to_linux_sigset, linux_sigset_to_flags, SignalAction, SignalFlags, SignalInfo, SIGKILL,
-    SIGNAL_INFO_SLOTS, SIGRTMIN, SIGRT_1, SIGSTOP, SI_TKILL, SS_DISABLE,
+    SI_TKILL, SIGKILL, SIGNAL_INFO_SLOTS, SIGRT_1, SIGRTMIN, SIGSTOP, SS_DISABLE, SignalAction,
+    SignalFlags, SignalInfo, current_add_signal, current_process, current_task, current_trap_cx,
+    current_user_token, flags_to_linux_sigset, linux_sigset_to_flags,
 };
 use crate::trap::TrapContext;
 use core::mem::{offset_of, size_of};
