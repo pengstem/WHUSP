@@ -8,6 +8,7 @@ use crate::task::{
 use crate::timer::get_time_us;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::time::timespec_to_nanos;
@@ -34,6 +35,7 @@ const EPOLL_CLOEXEC: u32 = OpenFlags::CLOEXEC.bits();
 const EPOLL_EVENT_SIZE: usize = 16;
 const EPOLL_EVENT_DATA_OFFSET: usize = 8;
 const EPOLL_MAX_NEST_DEPTH: usize = 5;
+const LINUX_RT_SIGSET_SIZE: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct LinuxEpollEvent {
@@ -208,6 +210,20 @@ fn write_epoll_event(
     bytes[EPOLL_EVENT_DATA_OFFSET..EPOLL_EVENT_DATA_OFFSET + 8]
         .copy_from_slice(&event.data.to_ne_bytes());
     write_user_value(token, addr as *mut [u8; EPOLL_EVENT_SIZE], &bytes)
+}
+
+fn validate_epoll_sigmask(token: usize, sigmask: *const u8, sigsetsize: usize) -> SysResult<()> {
+    if sigmask.is_null() {
+        return Ok(());
+    }
+    if sigsetsize != LINUX_RT_SIGSET_SIZE {
+        return Err(SysError::EINVAL);
+    }
+    if (sigmask as usize) < size_of::<u64>() {
+        return Err(SysError::EFAULT);
+    }
+    let _ = read_user_value(token, sigmask.cast::<u64>())?;
+    Ok(())
 }
 
 fn epoll_file_from(file: &Arc<dyn File + Send + Sync>) -> Option<&EpollFile> {
@@ -437,12 +453,13 @@ pub fn sys_epoll_pwait(
     maxevents: i32,
     timeout_ms: i32,
     sigmask: *const u8,
-    _sigsetsize: usize,
+    sigsetsize: usize,
 ) -> SysResult {
     // UNFINISHED: Linux epoll_pwait() temporarily installs the supplied signal
-    // mask while sleeping. This first implementation accepts the argument as a
-    // no-op so libc epoll_wait() and readiness-oriented LTP cases can run.
-    let _ = sigmask;
+    // mask while sleeping. This validates the ABI pointer/size but still treats
+    // the mask value as a no-op for readiness-oriented LTP cases.
+    let token = current_user_token();
+    validate_epoll_sigmask(token, sigmask, sigsetsize)?;
     sys_epoll_wait_until(
         epfd,
         events,
@@ -457,12 +474,12 @@ pub fn sys_epoll_pwait2(
     maxevents: i32,
     timeout: *const LinuxTimeSpec,
     sigmask: *const u8,
-    _sigsetsize: usize,
+    sigsetsize: usize,
 ) -> SysResult {
     // UNFINISHED: See sys_epoll_pwait(); per-call signal-mask installation is
-    // not implemented yet.
-    let _ = sigmask;
+    // not implemented yet, but invalid user pointers must still fault.
     let token = current_user_token();
+    validate_epoll_sigmask(token, sigmask, sigsetsize)?;
     sys_epoll_wait_until(
         epfd,
         events,
