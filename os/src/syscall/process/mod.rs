@@ -2,6 +2,7 @@ mod clone;
 mod exec;
 mod id;
 mod identity;
+mod namespace;
 mod resource;
 mod system;
 
@@ -17,5 +18,6 @@ pub use identity::{
     sys_setfsuid, sys_setgid, sys_setgroups, sys_setregid, sys_setresgid, sys_setresuid,
     sys_setreuid, sys_setuid,
 };
+pub use namespace::sys_setns;
 pub use resource::{sys_getrlimit, sys_prlimit64, sys_setrlimit};
 pub use system::{LinuxUtsName, sys_getrandom, sys_reboot, sys_syslog, sys_uname};

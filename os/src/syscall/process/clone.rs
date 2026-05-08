@@ -1,3 +1,4 @@
+use crate::fs::clone_mount_namespace;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::write_user_value;
 use crate::task::{
@@ -41,7 +42,12 @@ fn sys_clone_process(args: CloneArgs) -> SysResult {
     } else {
         Arc::clone(&current_process)
     };
-    let new_process = current_process.fork(child_parent);
+    let mount_namespace_id = if args.flags.contains(CloneFlags::CLONE_NEWNS) {
+        clone_mount_namespace(current_process.mount_namespace_id())
+    } else {
+        current_process.mount_namespace_id()
+    };
+    let new_process = current_process.fork(child_parent, mount_namespace_id);
     let new_pid = new_process.getpid();
     let child_token = new_process.configure_cloned_main_task(args);
 

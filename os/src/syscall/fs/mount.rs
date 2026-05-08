@@ -1,7 +1,8 @@
 use crate::fs::{
-    MountError, lookup_existing_dir_in, lookup_mount_target_dir_in, loop_device_is_attached,
-    mount_bind_at, mount_block_device_at, mount_fat_device_at, mount_tmpfs_at,
-    normalize_path_at_root, remount_at, unmount_at,
+    MountError, MountPropagation, lookup_existing_dir_in, lookup_mount_target_dir_in,
+    loop_device_is_attached, mount_bind_at, mount_block_device_at, mount_fat_device_at,
+    mount_tmpfs_at, move_mount_at, normalize_path_at_root, remount_at, set_mount_propagation_at,
+    unmount_at,
 };
 use crate::task::{current_process, current_user_token};
 
@@ -79,7 +80,8 @@ pub fn sys_mount(
     let read_only = flags & MS_RDONLY != 0;
     let process = current_process();
     let snapshot = process.path_snapshot();
-    let target_dir = lookup_mount_target_dir_in(snapshot.context, target.as_str())?;
+    let namespace_id = snapshot.context.namespace_id();
+    let target_dir = lookup_mount_target_dir_in(snapshot.context.clone(), target.as_str())?;
     let target_path = normalize_path_at_root(
         snapshot.root_path.as_str(),
         snapshot.cwd_path.as_str(),
@@ -95,27 +97,39 @@ pub fn sys_mount(
             return Err(SysError::EINVAL);
         }
         // CONTEXT: BusyBox and LTP use mount propagation changes while setting
-        // up bind-mount cases. This kernel has no mount-namespace propagation
-        // model yet, so these mode changes are accepted as no-ops.
+        // up bind-mount cases. This is a contest-sized propagation model: it
+        // tracks private/shared/slave/unbindable labels on dynamic mount
+        // records and propagates bind mount events between peers.
+        let propagation = if flags & MS_SHARED != 0 {
+            MountPropagation::Shared
+        } else if flags & MS_SLAVE != 0 {
+            MountPropagation::Slave
+        } else if flags & MS_UNBINDABLE != 0 {
+            MountPropagation::Unbindable
+        } else {
+            MountPropagation::Private
+        };
+        set_mount_propagation_at(
+            namespace_id,
+            target_path.as_str(),
+            flags & MS_REC != 0,
+            propagation,
+        )
+        .map_err(mount_error_to_errno)?;
         return Ok(0);
     }
 
     if flags & MS_MOVE != 0 {
-        // UNFINISHED: Linux MS_MOVE moves an existing mount tree. The current
-        // VFS only supports adding and removing dynamic mount records.
-        return Err(SysError::ENOTSUP);
-    }
-
-    if flags & MS_BIND != 0 {
         let source = read_user_c_string(token, source, PATH_MAX)?;
-        let source_dir = lookup_existing_dir_in(snapshot.context, source.as_str())?;
+        let source_dir = lookup_mount_target_dir_in(snapshot.context.clone(), source.as_str())?;
         let source_path = normalize_path_at_root(
             snapshot.root_path.as_str(),
             snapshot.cwd_path.as_str(),
             source.as_str(),
         )
         .ok_or(SysError::ENOENT)?;
-        mount_bind_at(
+        move_mount_at(
+            namespace_id,
             source_dir,
             target_dir,
             source_path.as_str(),
@@ -125,8 +139,29 @@ pub fn sys_mount(
         return Ok(0);
     }
 
+    if flags & MS_BIND != 0 {
+        let source = read_user_c_string(token, source, PATH_MAX)?;
+        let source_dir = lookup_existing_dir_in(snapshot.context.clone(), source.as_str())?;
+        let source_path = normalize_path_at_root(
+            snapshot.root_path.as_str(),
+            snapshot.cwd_path.as_str(),
+            source.as_str(),
+        )
+        .ok_or(SysError::ENOENT)?;
+        mount_bind_at(
+            namespace_id,
+            source_dir,
+            target_dir,
+            source_path.as_str(),
+            target_path.as_str(),
+            flags & MS_REC != 0,
+        )
+        .map_err(mount_error_to_errno)?;
+        return Ok(0);
+    }
+
     if flags & MS_REMOUNT != 0 {
-        remount_at(target_dir, read_only).map_err(mount_error_to_errno)?;
+        remount_at(namespace_id, target_dir, read_only).map_err(mount_error_to_errno)?;
         return Ok(0);
     }
     let fstype = read_user_c_string(token, fstype, PATH_MAX)?;
@@ -141,7 +176,7 @@ pub fn sys_mount(
                 // loop device and then mount it as scratch space. Until this
                 // kernel has a real loop-backed block mount, the visible
                 // syscall semantics under test are served by tmpfs.
-                mount_tmpfs_at(target_dir, target_path.as_str(), read_only)
+                mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
                     .map_err(mount_error_to_errno)?;
                 return Ok(0);
             }
@@ -149,8 +184,13 @@ pub fn sys_mount(
             if block_source.partition_index.is_some() {
                 return Err(SysError::ENOTBLK);
             }
-            mount_block_device_at(target_dir, block_source.device_index, target_path.as_str())
-                .map_err(mount_error_to_errno)?;
+            mount_block_device_at(
+                namespace_id,
+                target_dir,
+                block_source.device_index,
+                target_path.as_str(),
+            )
+            .map_err(mount_error_to_errno)?;
         }
         "vfat" | "fat32" | "fat" => {
             let source = read_user_c_string(token, source, PATH_MAX)?;
@@ -158,12 +198,13 @@ pub fn sys_mount(
                 if !loop_device_is_attached(loop_id) {
                     return Err(SysError::ENODEV);
                 }
-                mount_tmpfs_at(target_dir, target_path.as_str(), read_only)
+                mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
                     .map_err(mount_error_to_errno)?;
                 return Ok(0);
             }
             let block_source = parse_virtio_block_source(source.as_str())?;
             match mount_fat_device_at(
+                namespace_id,
                 target_dir.clone(),
                 block_source.device_index,
                 block_source.partition_index,
@@ -171,17 +212,17 @@ pub fn sys_mount(
             ) {
                 Ok(_) => {}
                 Err(_) => {
-                    mount_tmpfs_at(target_dir, target_path.as_str(), read_only)
+                    mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
                         .map_err(mount_error_to_errno)?;
                 }
             }
         }
         "tmpfs" | "ramfs" => {
-            mount_tmpfs_at(target_dir, target_path.as_str(), read_only)
+            mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
                 .map_err(mount_error_to_errno)?;
         }
         _ => {
-            mount_tmpfs_at(target_dir, target_path.as_str(), read_only)
+            mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
                 .map_err(mount_error_to_errno)?;
         }
     }
@@ -193,7 +234,18 @@ pub fn sys_umount2(target: *const u8, _flags: i32) -> SysResult {
     let target = read_user_c_string(token, target, PATH_MAX)?;
     let process = current_process();
     let snapshot = process.path_snapshot();
-    let target_dir = lookup_mount_target_dir_in(snapshot.context, target.as_str())?;
-    unmount_at(target_dir).map_err(mount_error_to_errno)?;
+    let target_dir = lookup_mount_target_dir_in(snapshot.context.clone(), target.as_str())?;
+    let target_path = normalize_path_at_root(
+        snapshot.root_path.as_str(),
+        snapshot.cwd_path.as_str(),
+        target.as_str(),
+    )
+    .ok_or(SysError::ENOENT)?;
+    unmount_at(
+        snapshot.context.namespace_id(),
+        target_dir,
+        target_path.as_str(),
+    )
+    .map_err(mount_error_to_errno)?;
     Ok(0)
 }

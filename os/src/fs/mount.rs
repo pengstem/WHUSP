@@ -18,8 +18,22 @@ use log::{info, warn};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct MountId(pub(crate) usize);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct MountNamespaceId(pub(crate) usize);
+
+pub(crate) const ROOT_MOUNT_NAMESPACE: MountNamespaceId = MountNamespaceId(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MountPropagation {
+    Private,
+    Shared,
+    Slave,
+    Unbindable,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DynamicMount {
+    namespace_id: MountNamespaceId,
     target: VfsNodeId,
     covered_parent: VfsNodeId,
     source_mount_id: MountId,
@@ -27,6 +41,9 @@ struct DynamicMount {
     source_path: String,
     target_path: String,
     is_bind: bool,
+    propagation: MountPropagation,
+    peer_group: Option<usize>,
+    master_group: Option<usize>,
 }
 
 struct MountedFs {
@@ -75,6 +92,8 @@ lazy_static! {
 }
 
 static NEXT_MOUNT_ID: AtomicUsize = AtomicUsize::new(0);
+static NEXT_MOUNT_NAMESPACE_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_PROPAGATION_GROUP: AtomicUsize = AtomicUsize::new(1);
 
 pub fn init_mounts() {
     let already_initialized = MOUNTS_INITIALIZED.exclusive_session(|initialized| {
@@ -242,6 +261,23 @@ pub(super) fn mount_exists(mount_id: MountId) -> bool {
     mounts.get(mount_id.0).is_some_and(Option::is_some)
 }
 
+pub(crate) fn clone_mount_namespace(source_namespace_id: MountNamespaceId) -> MountNamespaceId {
+    let namespace_id = MountNamespaceId(NEXT_MOUNT_NAMESPACE_ID.fetch_add(1, Ordering::SeqCst));
+    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        let cloned_mounts: Vec<_> = mounts
+            .iter()
+            .filter(|mount| mount.namespace_id == source_namespace_id)
+            .cloned()
+            .map(|mut mount| {
+                mount.namespace_id = namespace_id;
+                mount
+            })
+            .collect();
+        mounts.extend(cloned_mounts);
+    });
+    namespace_id
+}
+
 fn ensure_mount_open(mount_id: MountId) -> Result<(), MountError> {
     let device = BLOCK_DEVICES
         .get(mount_id.0)
@@ -277,17 +313,42 @@ fn primary_root_ino() -> u32 {
     root_ino_for(primary_mount_id()).unwrap_or(2)
 }
 
-pub(super) fn mounted_root_for(target: VfsNodeId) -> Option<VfsNodeId> {
+pub(super) fn mounted_root_for(
+    namespace_id: MountNamespaceId,
+    target: VfsNodeId,
+    target_path: &str,
+) -> Option<VfsNodeId> {
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         mounts
             .iter()
             .rev()
-            .find(|mount| mount.target == target)
+            .find(|mount| {
+                mount.namespace_id == namespace_id
+                    && mount.target == target
+                    && mount.target_path == target_path
+            })
             .map(|mount| mount.source_root)
     })
 }
 
-pub(super) fn mounted_root_parent(source_root: VfsNodeId) -> Option<VfsNodeId> {
+pub(super) fn mounted_root_for_any_path(
+    namespace_id: MountNamespaceId,
+    target: VfsNodeId,
+) -> Option<VfsNodeId> {
+    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        mounts
+            .iter()
+            .rev()
+            .find(|mount| mount.namespace_id == namespace_id && mount.target == target)
+            .map(|mount| mount.source_root)
+    })
+}
+
+pub(super) fn mounted_root_parent(
+    namespace_id: MountNamespaceId,
+    source_root: VfsNodeId,
+    target_path: &str,
+) -> Option<VfsNodeId> {
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         // UNFINISHED: VfsNodeId currently names the mounted source node, not a
         // distinct mount instance. If the same source is mounted at multiple
@@ -296,7 +357,11 @@ pub(super) fn mounted_root_parent(source_root: VfsNodeId) -> Option<VfsNodeId> {
         mounts
             .iter()
             .rev()
-            .find(|mount| mount.source_root == source_root)
+            .find(|mount| {
+                mount.namespace_id == namespace_id
+                    && mount.source_root == source_root
+                    && mount.target_path == target_path
+            })
             .map(|mount| mount.covered_parent)
     })
 }
@@ -317,7 +382,234 @@ fn lookup_covered_parent(target: VfsNodeId) -> Result<VfsNodeId, MountError> {
     Ok(VfsNodeId::new(target.mount_id, parent_ino))
 }
 
+fn path_suffix(base: &str, path: &str) -> Option<String> {
+    if base == path {
+        return Some(String::new());
+    }
+    if base == "/" {
+        return path.strip_prefix('/').map(String::from);
+    }
+    let suffix = path.strip_prefix(base)?;
+    suffix.strip_prefix('/').map(String::from)
+}
+
+fn join_mount_path(base: &str, suffix: &str) -> String {
+    if suffix.is_empty() {
+        return String::from(base);
+    }
+    if base == "/" {
+        format!("/{suffix}")
+    } else {
+        format!("{base}/{suffix}")
+    }
+}
+
+fn next_propagation_group() -> usize {
+    NEXT_PROPAGATION_GROUP.fetch_add(1, Ordering::SeqCst)
+}
+
+fn nearest_propagation_mount(
+    mounts: &[DynamicMount],
+    namespace_id: MountNamespaceId,
+    target_path: &str,
+) -> Option<DynamicMount> {
+    mounts
+        .iter()
+        .filter(|mount| {
+            mount.namespace_id == namespace_id
+                && path_suffix(mount.target_path.as_str(), target_path).is_some()
+        })
+        .max_by_key(|mount| mount.target_path.len())
+        .cloned()
+}
+
+fn top_mount_at_path(
+    mounts: &[DynamicMount],
+    namespace_id: MountNamespaceId,
+    target_path: &str,
+) -> Option<DynamicMount> {
+    mounts
+        .iter()
+        .rev()
+        .find(|mount| mount.namespace_id == namespace_id && mount.target_path == target_path)
+        .cloned()
+}
+
+fn propagation_parent_for_new_mount(
+    mounts: &[DynamicMount],
+    namespace_id: MountNamespaceId,
+    target_path: &str,
+) -> Option<DynamicMount> {
+    nearest_propagation_mount(mounts, namespace_id, target_path)
+}
+
+fn initialize_propagation_from_parent(event: &mut DynamicMount, parent: Option<&DynamicMount>) {
+    event.propagation = MountPropagation::Private;
+    event.peer_group = None;
+    event.master_group = None;
+    if parent.is_some_and(|parent| {
+        parent.propagation == MountPropagation::Shared && parent.peer_group.is_some()
+    }) {
+        event.propagation = MountPropagation::Shared;
+        event.peer_group = Some(next_propagation_group());
+    }
+}
+
+fn copy_propagation_from_source(event: &mut DynamicMount, source: &DynamicMount) {
+    event.propagation = source.propagation;
+    event.peer_group = source.peer_group;
+    event.master_group = source.master_group;
+}
+
+fn mapped_child_group(group_map: &mut Vec<(usize, usize)>, parent_group: usize) -> usize {
+    if let Some((_, child_group)) = group_map
+        .iter()
+        .find(|(mapped_parent, _)| *mapped_parent == parent_group)
+    {
+        return *child_group;
+    }
+    let child_group = next_propagation_group();
+    group_map.push((parent_group, child_group));
+    child_group
+}
+
+fn known_child_group(group_map: &[(usize, usize)], parent_group: usize) -> Option<usize> {
+    group_map
+        .iter()
+        .find(|(mapped_parent, _)| *mapped_parent == parent_group)
+        .map(|(_, child_group)| *child_group)
+}
+
+fn queue_group_once(queue: &mut Vec<usize>, group: usize) {
+    if !queue.contains(&group) {
+        queue.push(group);
+    }
+}
+
+fn propagate_mount_event(
+    mounts: &mut Vec<DynamicMount>,
+    event: DynamicMount,
+    source_mount: Option<DynamicMount>,
+) {
+    let Some(source_mount) = source_mount else {
+        return;
+    };
+    let Some(source_group) = source_mount.peer_group else {
+        return;
+    };
+    let Some(source_event_group) = event.peer_group else {
+        return;
+    };
+    let Some(suffix) = path_suffix(
+        source_mount.target_path.as_str(),
+        event.target_path.as_str(),
+    ) else {
+        return;
+    };
+    let mut group_map = Vec::new();
+    group_map.push((source_group, source_event_group));
+    let mut queue = Vec::new();
+    queue.push(source_group);
+    let mut index = 0;
+    while index < queue.len() {
+        let group = queue[index];
+        index += 1;
+        let Some(event_group) = known_child_group(group_map.as_slice(), group) else {
+            continue;
+        };
+        let peers: Vec<_> = mounts
+            .iter()
+            .filter(|peer| peer.peer_group == Some(group) || peer.master_group == Some(group))
+            .cloned()
+            .collect();
+        for peer in peers {
+            let target_path = join_mount_path(peer.target_path.as_str(), suffix.as_str());
+            if peer.namespace_id == event.namespace_id && target_path == event.target_path {
+                continue;
+            }
+            if mounts.iter().any(|mount| {
+                mount.namespace_id == peer.namespace_id
+                    && mount.target == event.target
+                    && mount.target_path == target_path
+                    && mount.source_mount_id == event.source_mount_id
+                    && mount.source_root == event.source_root
+            }) {
+                continue;
+            }
+            let mut propagated = event.clone();
+            propagated.namespace_id = peer.namespace_id;
+            propagated.target_path = target_path;
+            if peer.peer_group == Some(group) {
+                propagated.propagation = MountPropagation::Shared;
+                propagated.peer_group = Some(event_group);
+                propagated.master_group = peer
+                    .master_group
+                    .and_then(|master| known_child_group(&group_map, master));
+            } else {
+                propagated.master_group = Some(event_group);
+                if let Some(peer_group) = peer.peer_group {
+                    let child_group = mapped_child_group(&mut group_map, peer_group);
+                    queue_group_once(&mut queue, peer_group);
+                    propagated.propagation = MountPropagation::Shared;
+                    propagated.peer_group = Some(child_group);
+                } else {
+                    propagated.propagation = MountPropagation::Slave;
+                    propagated.peer_group = None;
+                }
+            }
+            mounts.push(propagated);
+        }
+    }
+}
+
+fn propagate_unmount_event(mounts: &mut Vec<DynamicMount>, event: &DynamicMount) {
+    let Some(source_mount) =
+        nearest_propagation_mount(mounts, event.namespace_id, event.target_path.as_str())
+    else {
+        return;
+    };
+    let Some(source_group) = source_mount.peer_group else {
+        return;
+    };
+    let Some(suffix) = path_suffix(
+        source_mount.target_path.as_str(),
+        event.target_path.as_str(),
+    ) else {
+        return;
+    };
+    let mut queue = Vec::new();
+    queue.push(source_group);
+    let mut index = 0;
+    while index < queue.len() {
+        let group = queue[index];
+        index += 1;
+        let peers: Vec<_> = mounts
+            .iter()
+            .filter(|peer| peer.peer_group == Some(group) || peer.master_group == Some(group))
+            .cloned()
+            .collect();
+        for peer in &peers {
+            if peer.master_group == Some(group) {
+                if let Some(peer_group) = peer.peer_group {
+                    queue_group_once(&mut queue, peer_group);
+                }
+            }
+        }
+        for peer in peers {
+            let target_path = join_mount_path(peer.target_path.as_str(), suffix.as_str());
+            mounts.retain(|mount| {
+                !(mount.namespace_id == peer.namespace_id
+                    && mount.target == event.target
+                    && mount.target_path == target_path
+                    && mount.source_mount_id == event.source_mount_id
+                    && mount.source_root == event.source_root)
+            });
+        }
+    }
+}
+
 pub(crate) fn mount_block_device_at(
+    namespace_id: MountNamespaceId,
     target: WorkingDir,
     device_index: usize,
     target_path: &str,
@@ -328,8 +620,11 @@ pub(crate) fn mount_block_device_at(
         return Err(MountError::StaticRoot);
     }
 
-    let target_is_busy = DYNAMIC_MOUNTS
-        .exclusive_session(|mounts| mounts.iter().any(|mount| mount.target == target));
+    let target_is_busy = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        mounts
+            .iter()
+            .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
+    });
     if target_is_busy {
         return Err(MountError::TargetBusy);
     }
@@ -344,10 +639,16 @@ pub(crate) fn mount_block_device_at(
     let source_path = block_source_name(device_index);
 
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
-        if mounts.iter().any(|mount| mount.target == target) {
+        if mounts
+            .iter()
+            .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
+        {
             return Err(MountError::TargetBusy);
         }
-        mounts.push(DynamicMount {
+        let propagation_parent =
+            propagation_parent_for_new_mount(mounts, namespace_id, target_path.as_str());
+        let mut event = DynamicMount {
+            namespace_id,
             target,
             covered_parent,
             source_mount_id,
@@ -355,7 +656,13 @@ pub(crate) fn mount_block_device_at(
             source_path,
             target_path,
             is_bind: false,
-        });
+            propagation: MountPropagation::Private,
+            peer_group: None,
+            master_group: None,
+        };
+        initialize_propagation_from_parent(&mut event, propagation_parent.as_ref());
+        mounts.push(event.clone());
+        propagate_mount_event(mounts, event, propagation_parent);
         Ok(())
     })
 }
@@ -393,6 +700,7 @@ fn read_mbr_partition(
 }
 
 pub(crate) fn mount_fat_device_at(
+    namespace_id: MountNamespaceId,
     target: WorkingDir,
     device_index: usize,
     partition_index: Option<usize>,
@@ -421,6 +729,7 @@ pub(crate) fn mount_fat_device_at(
         MountError::InvalidFilesystem
     })?;
     mount_new_fs_at(
+        namespace_id,
         target,
         MountedFs::new(Box::new(fat_mount), source, "vfat", "rw"),
         target_path,
@@ -428,6 +737,7 @@ pub(crate) fn mount_fat_device_at(
 }
 
 fn mount_new_fs_at(
+    namespace_id: MountNamespaceId,
     target: WorkingDir,
     mounted: Arc<MountedFs>,
     target_path: &str,
@@ -437,8 +747,11 @@ fn mount_new_fs_at(
         return Err(MountError::StaticRoot);
     }
 
-    let target_is_busy = DYNAMIC_MOUNTS
-        .exclusive_session(|mounts| mounts.iter().any(|mount| mount.target == target));
+    let target_is_busy = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        mounts
+            .iter()
+            .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
+    });
     if target_is_busy {
         return Err(MountError::TargetBusy);
     }
@@ -452,10 +765,16 @@ fn mount_new_fs_at(
         root_ino_for(source_mount_id).ok_or(MountError::SourceMissing)?,
     );
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
-        if mounts.iter().any(|mount| mount.target == target) {
+        if mounts
+            .iter()
+            .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
+        {
             return Err(MountError::TargetBusy);
         }
-        mounts.push(DynamicMount {
+        let propagation_parent =
+            propagation_parent_for_new_mount(mounts, namespace_id, target_path.as_str());
+        let mut event = DynamicMount {
+            namespace_id,
             target,
             covered_parent,
             source_mount_id,
@@ -463,21 +782,29 @@ fn mount_new_fs_at(
             source_path,
             target_path,
             is_bind: false,
-        });
+            propagation: MountPropagation::Private,
+            peer_group: None,
+            master_group: None,
+        };
+        initialize_propagation_from_parent(&mut event, propagation_parent.as_ref());
+        mounts.push(event.clone());
+        propagate_mount_event(mounts, event, propagation_parent);
         Ok(source_mount_id)
     })
 }
 
 pub(crate) fn mount_pseudo_fs_at(
+    namespace_id: MountNamespaceId,
     target: WorkingDir,
     backend: Box<dyn FileSystemBackend>,
     fs_type: &'static str,
     target_path: &str,
 ) -> Result<MountId, MountError> {
-    mount_pseudo_fs_at_with_options(target, backend, fs_type, target_path, "rw")
+    mount_pseudo_fs_at_with_options(namespace_id, target, backend, fs_type, target_path, "rw")
 }
 
 pub(crate) fn mount_pseudo_fs_at_with_options(
+    namespace_id: MountNamespaceId,
     target: WorkingDir,
     backend: Box<dyn FileSystemBackend>,
     fs_type: &'static str,
@@ -489,8 +816,11 @@ pub(crate) fn mount_pseudo_fs_at_with_options(
         return Err(MountError::StaticRoot);
     }
 
-    let target_is_busy = DYNAMIC_MOUNTS
-        .exclusive_session(|mounts| mounts.iter().any(|mount| mount.target == target));
+    let target_is_busy = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        mounts
+            .iter()
+            .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
+    });
     if target_is_busy {
         return Err(MountError::TargetBusy);
     }
@@ -504,10 +834,16 @@ pub(crate) fn mount_pseudo_fs_at_with_options(
     );
     let source_path = fs_type.into();
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
-        if mounts.iter().any(|mount| mount.target == target) {
+        if mounts
+            .iter()
+            .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
+        {
             return Err(MountError::TargetBusy);
         }
-        mounts.push(DynamicMount {
+        let propagation_parent =
+            propagation_parent_for_new_mount(mounts, namespace_id, target_path.as_str());
+        let mut event = DynamicMount {
+            namespace_id,
             target,
             covered_parent,
             source_mount_id,
@@ -515,16 +851,24 @@ pub(crate) fn mount_pseudo_fs_at_with_options(
             source_path,
             target_path,
             is_bind: false,
-        });
+            propagation: MountPropagation::Private,
+            peer_group: None,
+            master_group: None,
+        };
+        initialize_propagation_from_parent(&mut event, propagation_parent.as_ref());
+        mounts.push(event.clone());
+        propagate_mount_event(mounts, event, propagation_parent);
         Ok(source_mount_id)
     })
 }
 
 pub(crate) fn mount_bind_at(
+    namespace_id: MountNamespaceId,
     source: WorkingDir,
     target: WorkingDir,
     source_path: &str,
     target_path: &str,
+    recursive: bool,
 ) -> Result<(), MountError> {
     let source_root = VfsNodeId::new(source.mount_id(), source.ino());
     let target = VfsNodeId::new(target.mount_id(), target.ino());
@@ -536,25 +880,121 @@ pub(crate) fn mount_bind_at(
     let source_path = resolve_mount_path(source_root, source_path);
     let target_path = resolve_mount_path(target, target_path);
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
-        mounts.push(DynamicMount {
+        let recursive_children: Vec<_> = if recursive {
+            mounts
+                .iter()
+                .filter(|mount| {
+                    mount.namespace_id == namespace_id
+                        && mount.target_path != source_path
+                        && path_suffix(source_path.as_str(), mount.target_path.as_str()).is_some()
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let propagation_parent =
+            propagation_parent_for_new_mount(mounts, namespace_id, target_path.as_str());
+        let source_mount = top_mount_at_path(mounts, namespace_id, source_path.as_str());
+        let mut event = DynamicMount {
+            namespace_id,
             target,
             covered_parent,
             source_mount_id: source_root.mount_id,
             source_root,
-            source_path,
-            target_path,
+            source_path: source_path.clone(),
+            target_path: target_path.clone(),
             is_bind: true,
-        });
+            propagation: MountPropagation::Private,
+            peer_group: None,
+            master_group: None,
+        };
+        if let Some(source_mount) = source_mount.as_ref() {
+            copy_propagation_from_source(&mut event, source_mount);
+        } else {
+            initialize_propagation_from_parent(&mut event, propagation_parent.as_ref());
+        }
+        mounts.push(event.clone());
+        if source_mount.is_none() {
+            propagate_mount_event(mounts, event, propagation_parent);
+        }
+        for child in recursive_children {
+            let Some(suffix) = path_suffix(source_path.as_str(), child.target_path.as_str()) else {
+                continue;
+            };
+            let mut cloned = child;
+            cloned.target_path = join_mount_path(target_path.as_str(), suffix.as_str());
+            mounts.push(cloned);
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn move_mount_at(
+    namespace_id: MountNamespaceId,
+    source: WorkingDir,
+    target: WorkingDir,
+    source_path: &str,
+    target_path: &str,
+) -> Result<(), MountError> {
+    let source = VfsNodeId::new(source.mount_id(), source.ino());
+    let target = VfsNodeId::new(target.mount_id(), target.ino());
+    if root_ino_for(target.mount_id).is_some_and(|root_ino| target.ino == root_ino) {
+        return Err(MountError::StaticRoot);
+    }
+
+    let covered_parent = lookup_covered_parent(target)?;
+    let source_path = resolve_mount_path(source, source_path);
+    let target_path = resolve_mount_path(target, target_path);
+    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        if mounts.iter().any(|mount| {
+            mount.namespace_id == namespace_id
+                && mount.target == target
+                && mount.target_path == target_path
+        }) {
+            return Err(MountError::TargetBusy);
+        }
+        let source_index = mounts
+            .iter()
+            .rposition(|mount| {
+                mount.namespace_id == namespace_id
+                    && mount.target == source
+                    && mount.target_path == source_path
+            })
+            .ok_or(MountError::TargetNotMounted)?;
+        let propagation_parent =
+            propagation_parent_for_new_mount(mounts, namespace_id, target_path.as_str());
+        let mut moved = mounts.remove(source_index);
+        moved.target = target;
+        moved.covered_parent = covered_parent;
+        moved.target_path = target_path.clone();
+        mounts.push(moved.clone());
+
+        for mount in mounts.iter_mut() {
+            if mount.namespace_id != namespace_id || mount.target_path == target_path {
+                continue;
+            }
+            let Some(suffix) = path_suffix(source_path.as_str(), mount.target_path.as_str()) else {
+                continue;
+            };
+            if suffix.is_empty() {
+                continue;
+            }
+            mount.target_path = join_mount_path(target_path.as_str(), suffix.as_str());
+        }
+        propagate_mount_event(mounts, moved, propagation_parent);
         Ok(())
     })
 }
 
 pub(crate) fn mount_tmpfs_at(
+    namespace_id: MountNamespaceId,
     target: WorkingDir,
     target_path: &str,
     read_only: bool,
 ) -> Result<MountId, MountError> {
     mount_pseudo_fs_at_with_options(
+        namespace_id,
         target,
         Box::new(TmpFs::new()),
         "tmpfs",
@@ -563,12 +1003,60 @@ pub(crate) fn mount_tmpfs_at(
     )
 }
 
-fn dynamic_mount_at(target: VfsNodeId) -> Option<MountId> {
+pub(crate) fn set_mount_propagation_at(
+    namespace_id: MountNamespaceId,
+    target_path: &str,
+    recursive: bool,
+    propagation: MountPropagation,
+) -> Result<(), MountError> {
+    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        let mut changed = false;
+        for mount in mounts.iter_mut() {
+            if mount.namespace_id != namespace_id {
+                continue;
+            }
+            let matches_path = if recursive {
+                path_suffix(target_path, mount.target_path.as_str()).is_some()
+            } else {
+                mount.target_path == target_path
+            };
+            if matches_path {
+                match propagation {
+                    MountPropagation::Shared => {
+                        if mount.peer_group.is_none() {
+                            mount.peer_group = Some(next_propagation_group());
+                        }
+                        mount.propagation = MountPropagation::Shared;
+                    }
+                    MountPropagation::Slave => {
+                        mount.master_group = mount.peer_group.or(mount.master_group);
+                        mount.peer_group = None;
+                        mount.propagation = MountPropagation::Slave;
+                    }
+                    MountPropagation::Private => {
+                        mount.peer_group = None;
+                        mount.master_group = None;
+                        mount.propagation = MountPropagation::Private;
+                    }
+                    MountPropagation::Unbindable => {
+                        mount.peer_group = None;
+                        mount.master_group = None;
+                        mount.propagation = MountPropagation::Unbindable;
+                    }
+                }
+                changed = true;
+            }
+        }
+        changed.then_some(()).ok_or(MountError::TargetNotMounted)
+    })
+}
+
+fn dynamic_mount_at(namespace_id: MountNamespaceId, target: VfsNodeId) -> Option<MountId> {
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         mounts
             .iter()
             .rev()
-            .find(|mount| mount.target == target)
+            .find(|mount| mount.namespace_id == namespace_id && mount.target == target)
             .map(|mount| mount.source_mount_id)
     })
 }
@@ -585,9 +1073,13 @@ fn set_mount_options(mount_id: MountId, options: &'static str) -> Result<(), Mou
     Ok(())
 }
 
-pub(crate) fn remount_at(target: WorkingDir, read_only: bool) -> Result<(), MountError> {
+pub(crate) fn remount_at(
+    namespace_id: MountNamespaceId,
+    target: WorkingDir,
+    read_only: bool,
+) -> Result<(), MountError> {
     let target = VfsNodeId::new(target.mount_id(), target.ino());
-    let mount_id = dynamic_mount_at(target)
+    let mount_id = dynamic_mount_at(namespace_id, target)
         .or_else(|| {
             root_ino_for(target.mount_id)
                 .is_some_and(|root_ino| target.ino == root_ino)
@@ -597,7 +1089,11 @@ pub(crate) fn remount_at(target: WorkingDir, read_only: bool) -> Result<(), Moun
     set_mount_options(mount_id, mount_options(read_only))
 }
 
-pub(crate) fn unmount_at(target: WorkingDir) -> Result<(), MountError> {
+pub(crate) fn unmount_at(
+    namespace_id: MountNamespaceId,
+    target: WorkingDir,
+    target_path: &str,
+) -> Result<(), MountError> {
     let target = VfsNodeId::new(target.mount_id(), target.ino());
     let target_is_root =
         root_ino_for(target.mount_id).is_some_and(|root_ino| target.ino == root_ino);
@@ -606,16 +1102,23 @@ pub(crate) fn unmount_at(target: WorkingDir) -> Result<(), MountError> {
     }
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         let index = if target_is_root {
-            mounts.iter().rposition(|mount| mount.source_root == target)
+            mounts.iter().rposition(|mount| {
+                mount.namespace_id == namespace_id && mount.source_root == target
+            })
         } else {
-            mounts.iter().rposition(|mount| mount.target == target)
+            mounts.iter().rposition(|mount| {
+                mount.namespace_id == namespace_id
+                    && mount.target == target
+                    && mount.target_path == target_path
+            })
         };
         let index = index.ok_or(MountError::TargetNotMounted)?;
         let source_mount_id = mounts[index].source_mount_id;
         if !mounts[index].is_bind && any_process_references_mount(source_mount_id) {
             return Err(MountError::TargetBusy);
         }
-        mounts.remove(index);
+        let event = mounts.remove(index);
+        propagate_unmount_event(mounts, &event);
         Ok(())
     })
 }
@@ -624,11 +1127,11 @@ fn ensure_extra_mount_target(index: usize) -> Option<WorkingDir> {
     ensure_primary_dir(&format!("x{index}"), 0o755)
 }
 
-fn source_has_dynamic_mount(source_mount_id: MountId) -> bool {
+fn source_has_dynamic_mount(namespace_id: MountNamespaceId, source_mount_id: MountId) -> bool {
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
-        mounts
-            .iter()
-            .any(|mount| mount.source_mount_id == source_mount_id)
+        mounts.iter().any(|mount| {
+            mount.namespace_id == namespace_id && mount.source_mount_id == source_mount_id
+        })
     })
 }
 
@@ -638,7 +1141,7 @@ fn mount_extra_block_devices() {
             continue;
         };
         let target_path = format!("/x{index}");
-        match mount_block_device_at(target, index, &target_path) {
+        match mount_block_device_at(ROOT_MOUNT_NAMESPACE, target, index, &target_path) {
             Ok(()) => info!("auto-mounted BLOCK_DEVICES[{index}] at /x{index}"),
             Err(MountError::InvalidFilesystem) => {
                 warn!("BLOCK_DEVICES[{index}] is not an ext4 filesystem; leaving /x{index} empty")
@@ -696,20 +1199,38 @@ fn ensure_primary_child_dir(
 
 fn mount_kernel_pseudo_filesystems() {
     if let Some(target) = ensure_primary_dir("proc", 0o555) {
-        match mount_pseudo_fs_at(target, Box::new(ProcFs::new()), "proc", "/proc") {
+        match mount_pseudo_fs_at(
+            ROOT_MOUNT_NAMESPACE,
+            target,
+            Box::new(ProcFs::new()),
+            "proc",
+            "/proc",
+        ) {
             Ok(_) => info!("filesystem mounted from proc at /proc"),
             Err(err) => warn!("failed to mount proc at /proc: {err:?}"),
         }
     }
     if let Some(target) = ensure_primary_dir("tmp", 0o1777) {
-        match mount_pseudo_fs_at(target, Box::new(TmpFs::new()), "tmpfs", "/tmp") {
+        match mount_pseudo_fs_at(
+            ROOT_MOUNT_NAMESPACE,
+            target,
+            Box::new(TmpFs::new()),
+            "tmpfs",
+            "/tmp",
+        ) {
             Ok(_) => info!("filesystem mounted from tmpfs at /tmp"),
             Err(err) => warn!("failed to mount tmpfs at /tmp: {err:?}"),
         }
     }
     if let Some(dev) = ensure_primary_dir("dev", 0o755) {
         if let Some(target) = ensure_primary_child_dir(dev, "shm", 0o1777, "/dev/shm") {
-            match mount_pseudo_fs_at(target, Box::new(TmpFs::new()), "tmpfs", "/dev/shm") {
+            match mount_pseudo_fs_at(
+                ROOT_MOUNT_NAMESPACE,
+                target,
+                Box::new(TmpFs::new()),
+                "tmpfs",
+                "/dev/shm",
+            ) {
                 Ok(_) => info!("filesystem mounted from tmpfs at /dev/shm"),
                 Err(err) => warn!("failed to mount tmpfs at /dev/shm: {err:?}"),
             }
@@ -720,7 +1241,7 @@ fn mount_kernel_pseudo_filesystems() {
 pub fn mount_status_log() {
     info!("filesystem mounted from BLOCK_DEVICES[0] at /");
     for index in 1..BLOCK_DEVICES.len() {
-        if source_has_dynamic_mount(MountId(index)) {
+        if source_has_dynamic_mount(ROOT_MOUNT_NAMESPACE, MountId(index)) {
             info!("filesystem mounted from BLOCK_DEVICES[{index}] at /x{index}");
         } else if mount_exists(MountId(index)) {
             info!("filesystem on BLOCK_DEVICES[{index}] is open but not mounted");
@@ -764,7 +1285,7 @@ fn resolve_mount_path(target: VfsNodeId, hint: &str) -> String {
     format!("<mount:{}:{}>", target.mount_id.0, target.ino)
 }
 
-pub(crate) fn list_mounts() -> Vec<MountInfo> {
+pub(crate) fn list_mounts(namespace_id: MountNamespaceId) -> Vec<MountInfo> {
     let mut infos = Vec::new();
     if let Some((source, fs_type, options)) = mount_metadata(primary_mount_id()) {
         infos.push(MountInfo {
@@ -775,7 +1296,13 @@ pub(crate) fn list_mounts() -> Vec<MountInfo> {
         });
     }
 
-    let dynamic_mounts = DYNAMIC_MOUNTS.exclusive_session(|mounts| mounts.clone());
+    let dynamic_mounts = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        mounts
+            .iter()
+            .filter(|mount| mount.namespace_id == namespace_id)
+            .cloned()
+            .collect::<Vec<_>>()
+    });
     for (index, mount) in dynamic_mounts.iter().enumerate() {
         // CONTEXT: BusyBox umount consults /proc/mounts and will issue one
         // umount2 call for each visible duplicate target. For stacked bind

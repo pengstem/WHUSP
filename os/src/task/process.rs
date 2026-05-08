@@ -4,7 +4,7 @@ use super::{
     TaskStatus,
 };
 use crate::config::USER_STACK_SIZE;
-use crate::fs::{PathContext, WorkingDir};
+use crate::fs::{MountNamespaceId, PathContext, WorkingDir};
 use crate::mm::MemorySet;
 use crate::sync::{UPIntrFreeCell, UPIntrRefMut};
 use alloc::format;
@@ -245,6 +245,7 @@ pub(crate) struct ProcessProcSnapshot {
     pub(crate) cpu_times: ProcessCpuTimesSnapshot,
     pub(crate) credentials: Credentials,
     pub(crate) thread_count: usize,
+    pub(crate) mount_namespace_id: MountNamespaceId,
 }
 
 #[derive(Clone, Debug)]
@@ -350,6 +351,7 @@ pub struct ProcessControlBlockInner {
     pub root_path: String,
     pub cwd: WorkingDir,
     pub cwd_path: String,
+    pub mount_namespace_id: MountNamespaceId,
     pub cmdline: Vec<String>,
     pub pgid: usize,
     pub parent: Option<Weak<ProcessControlBlock>>,
@@ -432,10 +434,24 @@ impl ProcessControlBlock {
     pub(crate) fn path_snapshot(&self) -> PathSnapshot {
         let inner = self.inner.exclusive_access();
         PathSnapshot {
-            context: PathContext::new(inner.root, inner.cwd),
+            context: PathContext::new_in_namespace(
+                inner.root,
+                inner.cwd,
+                inner.mount_namespace_id,
+                inner.root_path.clone(),
+                inner.cwd_path.clone(),
+            ),
             cwd_path: inner.cwd_path.clone(),
             root_path: inner.root_path.clone(),
         }
+    }
+
+    pub(crate) fn mount_namespace_id(&self) -> MountNamespaceId {
+        self.inner_exclusive_access().mount_namespace_id
+    }
+
+    pub(crate) fn set_mount_namespace_id(&self, mount_namespace_id: MountNamespaceId) {
+        self.inner_exclusive_access().mount_namespace_id = mount_namespace_id;
     }
 
     pub fn set_working_dir(&self, cwd: WorkingDir, cwd_path: String) {
@@ -534,6 +550,7 @@ impl ProcessControlBlock {
             cpu_times: inner.cpu_times.snapshot(),
             credentials: inner.credentials.clone(),
             thread_count: inner.thread_count(),
+            mount_namespace_id: inner.mount_namespace_id,
         }
     }
 

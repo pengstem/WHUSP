@@ -34,6 +34,8 @@ const PID_STATUS_OFFSET: u32 = 1;
 const PID_CMDLINE_OFFSET: u32 = 2;
 const PID_FD_DIR_OFFSET: u32 = 3;
 const PID_MAPS_OFFSET: u32 = 4;
+const PID_NS_DIR_OFFSET: u32 = 5;
+const PID_NS_MNT_OFFSET: u32 = 6;
 const PID_FD_ENTRY_BASE: u32 = 1_000_000;
 const PID_FD_ENTRY_STRIDE: u32 = 4096;
 const DEFAULT_PID_MAX: usize = 4_194_304;
@@ -78,6 +80,8 @@ enum ProcNode {
     PidFdDir(usize),
     PidFdEntry(usize, usize),
     PidMaps(usize),
+    PidNsDir(usize),
+    PidNsMnt(usize),
 }
 
 impl ProcFs {
@@ -147,6 +151,8 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
                 PID_CMDLINE_OFFSET => Some(ProcNode::PidCmdline(pid)),
                 PID_FD_DIR_OFFSET => Some(ProcNode::PidFdDir(pid)),
                 PID_MAPS_OFFSET => Some(ProcNode::PidMaps(pid)),
+                PID_NS_DIR_OFFSET => Some(ProcNode::PidNsDir(pid)),
+                PID_NS_MNT_OFFSET => Some(ProcNode::PidNsMnt(pid)),
                 _ => None,
             }
         }
@@ -165,7 +171,8 @@ fn node_kind(node: ProcNode) -> FsNodeKind {
         | ProcNode::SysKernelDir
         | ProcNode::SysFsDir
         | ProcNode::PidDir(_)
-        | ProcNode::PidFdDir(_) => FsNodeKind::Directory,
+        | ProcNode::PidFdDir(_)
+        | ProcNode::PidNsDir(_) => FsNodeKind::Directory,
         ProcNode::PidFdEntry(_, _) => FsNodeKind::Symlink,
         _ => FsNodeKind::RegularFile,
     }
@@ -330,6 +337,11 @@ fn pid_entries(pid: usize) -> Vec<RawDirEntry> {
         name: "maps".into(),
         dtype: DT_REG,
     });
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_NS_DIR_OFFSET),
+        name: "ns".into(),
+        dtype: DT_DIR,
+    });
     entries
 }
 
@@ -365,9 +377,30 @@ fn pid_fd_entries(pid: usize) -> FsResult<Vec<RawDirEntry>> {
     Ok(entries)
 }
 
+fn pid_ns_entries(pid: usize) -> Vec<RawDirEntry> {
+    let mut entries = Vec::new();
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_NS_DIR_OFFSET),
+        name: ".".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: pid_dir_ino(pid),
+        name: "..".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_NS_MNT_OFFSET),
+        name: "mnt".into(),
+        dtype: DT_REG,
+    });
+    entries
+}
+
 fn mounts_content() -> String {
     let mut output = String::new();
-    for mount in mount::list_mounts() {
+    let namespace_id = crate::task::current_process().mount_namespace_id();
+    for mount in mount::list_mounts(namespace_id) {
         output.push_str(&format!(
             "{} {} {} {} 0 0\n",
             mount.source, mount.target, mount.fs_type, mount.options
@@ -598,12 +631,16 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::PidMaps(pid) => pid2process(pid)
             .map(|process| process.proc_maps_content().into_bytes())
             .ok_or(FsError::NotFound),
+        ProcNode::PidNsMnt(pid) => lookup_process(pid)
+            .map(|process| format!("mnt:[{}]\n", process.mount_namespace_id.0).into_bytes())
+            .ok_or(FsError::NotFound),
         ProcNode::Root
         | ProcNode::SysDir
         | ProcNode::SysKernelDir
         | ProcNode::SysFsDir
         | ProcNode::PidDir(_)
-        | ProcNode::PidFdDir(_) => Err(FsError::IsDir),
+        | ProcNode::PidFdDir(_)
+        | ProcNode::PidNsDir(_) => Err(FsError::IsDir),
     }
 }
 
@@ -686,6 +723,7 @@ impl FileSystemBackend for ProcFs {
                 )),
                 "fd" => Ok((pid_file_ino(pid, PID_FD_DIR_OFFSET), FsNodeKind::Directory)),
                 "maps" => Ok((pid_file_ino(pid, PID_MAPS_OFFSET), FsNodeKind::RegularFile)),
+                "ns" => Ok((pid_file_ino(pid, PID_NS_DIR_OFFSET), FsNodeKind::Directory)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::PidFdDir(pid) => match component {
@@ -703,6 +741,15 @@ impl FileSystemBackend for ProcFs {
                     }
                     Ok((pid_fd_entry_ino(pid, fd), FsNodeKind::Symlink))
                 }
+            },
+            ProcNode::PidNsDir(pid) => match component {
+                "." => Ok((pid_file_ino(pid, PID_NS_DIR_OFFSET), FsNodeKind::Directory)),
+                ".." => Ok((pid_dir_ino(pid), FsNodeKind::Directory)),
+                "mnt" => Ok((
+                    pid_file_ino(pid, PID_NS_MNT_OFFSET),
+                    FsNodeKind::RegularFile,
+                )),
+                _ => Err(FsError::NotFound),
             },
             _ => Err(FsError::NotDir),
         }
@@ -764,7 +811,8 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::SysKernelDir
             | ProcNode::SysFsDir
             | ProcNode::PidDir(_)
-            | ProcNode::PidFdDir(_) => FileStat::with_mode(S_IFDIR | 0o555),
+            | ProcNode::PidFdDir(_)
+            | ProcNode::PidNsDir(_) => FileStat::with_mode(S_IFDIR | 0o555),
             ProcNode::PidFdEntry(_, _) => FileStat::with_mode(S_IFLNK | 0o777),
             ProcNode::PidMax | ProcNode::PipeMaxSize | ProcNode::Domainname => {
                 FileStat::with_mode(S_IFREG | 0o644)
@@ -834,6 +882,7 @@ impl FileSystemBackend for ProcFs {
             ProcNode::SysFsDir => write_dir_entries(&sys_fs_entries(), offset, buf),
             ProcNode::PidDir(pid) => write_dir_entries(&pid_entries(pid), offset, buf),
             ProcNode::PidFdDir(pid) => write_dir_entries(&pid_fd_entries(pid)?, offset, buf),
+            ProcNode::PidNsDir(pid) => write_dir_entries(&pid_ns_entries(pid), offset, buf),
             _ => Err(FsError::NotDir),
         }
     }

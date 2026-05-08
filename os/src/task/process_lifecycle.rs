@@ -8,7 +8,7 @@ use super::process::{
 use super::{
     CloneArgs, CloneFlags, FdTableEntry, SignalAction, TaskControlBlock, add_task, pid_alloc,
 };
-use crate::fs::{OpenFlags, Stdin, Stdout, WorkingDir};
+use crate::fs::{OpenFlags, ROOT_MOUNT_NAMESPACE, Stdin, Stdout, WorkingDir};
 use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet};
 use crate::sync::UPIntrFreeCell;
 use crate::trap::{TrapContext, trap_handler};
@@ -72,6 +72,7 @@ impl ProcessControlBlock {
                     root_path: "/".into(),
                     cwd: WorkingDir::root(),
                     cwd_path: "/".into(),
+                    mount_namespace_id: ROOT_MOUNT_NAMESPACE,
                     cmdline: args.clone(),
                     pgid: pid,
                     parent: None,
@@ -147,7 +148,11 @@ impl ProcessControlBlock {
     }
 
     /// Only support processes with a single thread.
-    pub fn fork(self: &Arc<Self>, child_parent: Arc<Self>) -> Arc<Self> {
+    pub fn fork(
+        self: &Arc<Self>,
+        child_parent: Arc<Self>,
+        mount_namespace_id: crate::fs::MountNamespaceId,
+    ) -> Arc<Self> {
         let parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
         let memory_set = MemorySet::from_existed_user(&parent.memory_set);
@@ -183,6 +188,7 @@ impl ProcessControlBlock {
                     root_path,
                     cwd,
                     cwd_path,
+                    mount_namespace_id,
                     cmdline,
                     pgid,
                     parent: Some(Arc::downgrade(&child_parent)),

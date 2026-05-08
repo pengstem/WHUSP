@@ -1,4 +1,7 @@
-use super::mount::{MountId, primary_mount_id, root_ino_for};
+use super::mount::{
+    MountId, MountNamespaceId, ROOT_MOUNT_NAMESPACE, primary_mount_id, root_ino_for,
+};
+use alloc::string::String;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WorkingDir {
@@ -6,10 +9,13 @@ pub(crate) struct WorkingDir {
     ino: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PathContext {
     root: WorkingDir,
     cwd: WorkingDir,
+    namespace_id: MountNamespaceId,
+    root_path: String,
+    cwd_path: String,
 }
 
 impl WorkingDir {
@@ -35,25 +41,55 @@ impl WorkingDir {
 }
 
 impl PathContext {
-    pub(crate) fn new(root: WorkingDir, cwd: WorkingDir) -> Self {
-        Self { root, cwd }
+    pub(crate) fn new_in_namespace(
+        root: WorkingDir,
+        cwd: WorkingDir,
+        namespace_id: MountNamespaceId,
+        root_path: String,
+        cwd_path: String,
+    ) -> Self {
+        Self {
+            root,
+            cwd,
+            namespace_id,
+            root_path,
+            cwd_path,
+        }
     }
 
     pub(crate) fn global_root() -> Self {
         let root = WorkingDir::root();
-        Self { root, cwd: root }
+        Self {
+            root,
+            cwd: root,
+            namespace_id: ROOT_MOUNT_NAMESPACE,
+            root_path: "/".into(),
+            cwd_path: "/".into(),
+        }
     }
 
-    pub(crate) fn root(self) -> WorkingDir {
+    pub(crate) fn root(&self) -> WorkingDir {
         self.root
     }
 
-    pub(crate) fn cwd(self) -> WorkingDir {
+    pub(crate) fn cwd(&self) -> WorkingDir {
         self.cwd
     }
 
-    pub(crate) fn is_global_root(self) -> bool {
-        self.root == WorkingDir::root()
+    pub(crate) fn namespace_id(&self) -> MountNamespaceId {
+        self.namespace_id
+    }
+
+    pub(crate) fn root_path(&self) -> &str {
+        self.root_path.as_str()
+    }
+
+    pub(crate) fn cwd_path(&self) -> &str {
+        self.cwd_path.as_str()
+    }
+
+    pub(crate) fn is_global_root(&self) -> bool {
+        self.namespace_id == ROOT_MOUNT_NAMESPACE && self.root == WorkingDir::root()
     }
 }
 

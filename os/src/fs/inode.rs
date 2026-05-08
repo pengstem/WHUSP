@@ -1,4 +1,4 @@
-use super::mount::{mounted_root_for, with_mount};
+use super::mount::{mounted_root_for_any_path, with_mount};
 use super::path::{PathContext, WorkingDir};
 use super::vfs::{
     FsError, FsNodeKind, FsResult, LookupMode, VfsNodeId, resolve_create_parent_in,
@@ -258,8 +258,8 @@ pub(crate) fn link_file_in(
 
     let old_has_trailing_slash = has_trailing_slash(old_name);
     let new_has_trailing_slash = has_trailing_slash(new_name);
-    let old_target = resolve_create_parent_in(old_context, trimmed_nonroot_path(old_name))?;
-    let new_target = resolve_create_parent_in(new_context, trimmed_nonroot_path(new_name))?;
+    let old_target = resolve_create_parent_in(old_context.clone(), trimmed_nonroot_path(old_name))?;
+    let new_target = resolve_create_parent_in(new_context.clone(), trimmed_nonroot_path(new_name))?;
     if old_target.parent.mount_id != new_target.parent.mount_id {
         return Err(FsError::CrossDevice);
     }
@@ -379,8 +379,8 @@ pub(crate) fn rename_in(
 
     let old_has_trailing_slash = has_trailing_slash(old_name);
     let new_has_trailing_slash = has_trailing_slash(new_name);
-    let old_target = resolve_create_parent_in(old_context, trimmed_nonroot_path(old_name))?;
-    let new_target = resolve_create_parent_in(new_context, trimmed_nonroot_path(new_name))?;
+    let old_target = resolve_create_parent_in(old_context.clone(), trimmed_nonroot_path(old_name))?;
+    let new_target = resolve_create_parent_in(new_context.clone(), trimmed_nonroot_path(new_name))?;
     if old_target.parent.mount_id != new_target.parent.mount_id {
         return Err(FsError::CrossDevice);
     }
@@ -389,7 +389,9 @@ pub(crate) fn rename_in(
     if old_has_trailing_slash && old_kind != FsNodeKind::Directory {
         return Err(FsError::NotDir);
     }
-    if old_node.ino == EXT4_ROOT_INO || mounted_root_for(old_node).is_some() {
+    if old_node.ino == EXT4_ROOT_INO
+        || mounted_root_for_any_path(old_context.namespace_id(), old_node).is_some()
+    {
         return Err(FsError::Busy);
     }
 
@@ -404,7 +406,7 @@ pub(crate) fn rename_in(
             if old_node == new_node {
                 return Ok(());
             }
-            if mounted_root_for(new_node).is_some() {
+            if mounted_root_for_any_path(new_context.namespace_id(), new_node).is_some() {
                 return Err(FsError::Busy);
             }
             if old_kind == FsNodeKind::Directory && new_kind != FsNodeKind::Directory {
@@ -444,7 +446,7 @@ pub(crate) fn unlink_file_in(context: PathContext, name: &str) -> FsResult {
         Some("." | ".." | "/") => return Err(FsError::IsDir),
         _ => {}
     }
-    let target = resolve_create_parent_in(context, trimmed_nonroot_path(name))?;
+    let target = resolve_create_parent_in(context.clone(), trimmed_nonroot_path(name))?;
     with_mount(target.parent.mount_id, |mount| {
         let (_, kind) = mount.lookup_component_from(target.parent.ino, target.leaf_name)?;
         if trailing_slash && kind != FsNodeKind::Directory {
@@ -467,14 +469,16 @@ pub(crate) fn rmdir_in(context: PathContext, name: &str) -> FsResult {
         _ => {}
     }
 
-    let target = resolve_create_parent_in(context, trimmed_nonroot_path(name))?;
+    let target = resolve_create_parent_in(context.clone(), trimmed_nonroot_path(name))?;
     with_mount(target.parent.mount_id, |mount| {
         let (ino, kind) = mount.lookup_component_from(target.parent.ino, target.leaf_name)?;
         if kind != FsNodeKind::Directory {
             return Err(FsError::NotDir);
         }
         let node = VfsNodeId::new(target.parent.mount_id, ino);
-        if mounted_root_for(node).is_some() || ino == lwext4_rust::ffi::EXT4_ROOT_INO {
+        if mounted_root_for_any_path(context.namespace_id(), node).is_some()
+            || ino == lwext4_rust::ffi::EXT4_ROOT_INO
+        {
             return Err(FsError::Busy);
         }
         mount.unlink(target.parent.ino, target.leaf_name)

@@ -46,12 +46,28 @@ pub(super) fn path_context_from(
     path: &str,
 ) -> SysResult<PathContext> {
     let root = snapshot.context.root();
-    let cwd = if path.starts_with('/') {
-        root
+    let root_path = snapshot.root_path.clone();
+    let (cwd, cwd_path) = if path.starts_with('/') {
+        (root, root_path.clone())
     } else {
-        dirfd_base_from(snapshot, dirfd)?
+        let cwd = dirfd_base_from(snapshot, dirfd)?;
+        let cwd_path = if dirfd == AT_FDCWD {
+            snapshot.cwd_path.clone()
+        } else {
+            get_fd_entry_by_fd(dirfd as usize)?
+                .dir_path()
+                .map(String::from)
+                .unwrap_or_else(|| snapshot.cwd_path.clone())
+        };
+        (cwd, cwd_path)
     };
-    Ok(PathContext::new(root, cwd))
+    Ok(PathContext::new_in_namespace(
+        root,
+        cwd,
+        snapshot.context.namespace_id(),
+        root_path,
+        cwd_path,
+    ))
 }
 
 fn process_global_path_for(snapshot: &PathSnapshot, path: &str) -> Option<String> {
@@ -627,7 +643,7 @@ pub fn sys_chdir(path: *const u8) -> SysResult {
         groups: &credentials.groups,
     };
     check_access_path_prefixes_from(&snapshot, AT_FDCWD, path.as_str(), subject)?;
-    let next_cwd = lookup_dir_in(snapshot.context, path.as_str())?;
+    let next_cwd = lookup_dir_in(snapshot.context.clone(), path.as_str())?;
     let stat = resolve_stat_from(&snapshot, AT_FDCWD, path.as_str(), true)?;
     check_access_mode(&stat, X_OK, subject)?;
     let Some(next_path) = process_global_path_for(&snapshot, path.as_str()) else {
@@ -653,7 +669,7 @@ pub fn sys_chroot(path: *const u8) -> SysResult {
     };
     let snapshot = process.path_snapshot();
     check_access_path_prefixes_from(&snapshot, AT_FDCWD, path.as_str(), subject)?;
-    let (next_root, stat) = lookup_dir_with_stat_in(snapshot.context, path.as_str())?;
+    let (next_root, stat) = lookup_dir_with_stat_in(snapshot.context.clone(), path.as_str())?;
     check_access_mode(&stat, X_OK, subject)?;
     if credentials.euid != 0
         || !credentials
@@ -710,7 +726,7 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> SysResult {
     let snapshot = current_process().path_snapshot();
     let context = path_context_from(&snapshot, dirfd, path.as_str())?;
     let process = current_process();
-    mkdir_in(context, path.as_str(), mode & !process.umask())?;
+    mkdir_in(context.clone(), path.as_str(), mode & !process.umask())?;
     let credentials = process.credentials();
     chown_in(
         context,

@@ -45,7 +45,7 @@ fn reject_proc_self_fd_o_path(path: &str) -> SysResult<()> {
 
 fn stat_by_dirfd_from(snapshot: &PathSnapshot, dirfd: isize) -> SysResult<FileStat> {
     if dirfd == AT_FDCWD {
-        return Ok(stat_in(snapshot.context, ".", true)?);
+        return Ok(stat_in(snapshot.context.clone(), ".", true)?);
     }
     if dirfd < 0 {
         return Err(SysError::EBADF);
@@ -247,9 +247,15 @@ pub fn sys_fchownat(
             return Err(SysError::ENOENT);
         }
         if dirfd == AT_FDCWD {
-            let stat = stat_in(snapshot.context, ".", follow_final_symlink)?;
+            let stat = stat_in(snapshot.context.clone(), ".", follow_final_symlink)?;
             ensure_can_change_owner(stat, uid, gid)?;
-            chown_in(snapshot.context, ".", follow_final_symlink, uid, gid)?;
+            chown_in(
+                snapshot.context.clone(),
+                ".",
+                follow_final_symlink,
+                uid,
+                gid,
+            )?;
             return Ok(0);
         }
         if dirfd < 0 {

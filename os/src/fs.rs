@@ -278,8 +278,10 @@ pub(crate) use inode::{
 };
 pub(crate) use memfd::make_memfd;
 pub(crate) use mount::{
-    MountError, MountId, mount_bind_at, mount_block_device_at, mount_fat_device_at,
-    mount_is_read_only, mount_tmpfs_at, remount_at, statfs_for_mount, unmount_at,
+    MountError, MountId, MountNamespaceId, MountPropagation, ROOT_MOUNT_NAMESPACE,
+    clone_mount_namespace, mount_bind_at, mount_block_device_at, mount_fat_device_at,
+    mount_is_read_only, mount_tmpfs_at, move_mount_at, remount_at, set_mount_propagation_at,
+    statfs_for_mount, unmount_at,
 };
 pub(crate) use path::{PathContext, WorkingDir, normalize_path_at_root, path_inside_root};
 pub(crate) use pipe::default_pipe_capacity_for_current_process;
