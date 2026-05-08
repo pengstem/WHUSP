@@ -49,6 +49,7 @@ struct DynamicMount {
     propagation: MountPropagation,
     peer_group: Option<usize>,
     master_group: Option<usize>,
+    uncloned_subtree_suffixes: Vec<String>,
 }
 
 struct MountedFs {
@@ -429,9 +430,17 @@ fn nearest_propagation_mount(
         .filter(|mount| {
             mount.namespace_id == namespace_id
                 && path_suffix(mount.target_path.as_str(), target_path).is_some()
+                && !mount_blocks_uncloned_subtree(mount, target_path)
         })
         .max_by_key(|mount| mount.target_path.len())
         .cloned()
+}
+
+fn mount_blocks_uncloned_subtree(mount: &DynamicMount, target_path: &str) -> bool {
+    mount.uncloned_subtree_suffixes.iter().any(|suffix| {
+        let blocked_path = join_mount_path(mount.target_path.as_str(), suffix.as_str());
+        path_suffix(blocked_path.as_str(), target_path).is_some()
+    })
 }
 
 fn top_mount_at_path(
@@ -951,6 +960,7 @@ pub(crate) fn mount_block_device_at(
             propagation: MountPropagation::Private,
             peer_group: None,
             master_group: None,
+            uncloned_subtree_suffixes: Vec::new(),
         };
         initialize_propagation_from_parent(&mut event, propagation_parent.as_ref());
         mounts.push(event.clone());
@@ -1081,6 +1091,7 @@ fn mount_new_fs_at(
             propagation: MountPropagation::Private,
             peer_group: None,
             master_group: None,
+            uncloned_subtree_suffixes: Vec::new(),
         };
         initialize_propagation_from_parent(&mut event, propagation_parent.as_ref());
         mounts.push(event.clone());
@@ -1154,6 +1165,7 @@ pub(crate) fn mount_pseudo_fs_at_with_options(
             propagation: MountPropagation::Private,
             peer_group: None,
             master_group: None,
+            uncloned_subtree_suffixes: Vec::new(),
         };
         initialize_propagation_from_parent(&mut event, propagation_parent.as_ref());
         mounts.push(event.clone());
@@ -1201,6 +1213,11 @@ pub(crate) fn mount_bind_at(
         } else {
             Vec::new()
         };
+        let unbindable_child_suffixes: Vec<_> = recursive_children
+            .iter()
+            .filter(|mount| mount.propagation == MountPropagation::Unbindable)
+            .filter_map(|mount| path_suffix(source_path.as_str(), mount.target_path.as_str()))
+            .collect();
         let propagation_parent =
             propagation_parent_for_new_mount(mounts, namespace_id, target_path.as_str());
         let source_mount =
@@ -1225,6 +1242,7 @@ pub(crate) fn mount_bind_at(
             propagation: MountPropagation::Private,
             peer_group: None,
             master_group: None,
+            uncloned_subtree_suffixes: unbindable_child_suffixes.clone(),
         };
         if let Some(source_mount) = source_mount.as_ref() {
             copy_bind_propagation_from_source(&mut event, source_mount);
@@ -1248,18 +1266,14 @@ pub(crate) fn mount_bind_at(
             .filter(|mount| mount.namespace_id == namespace_id && mount.event_id == root_event_id)
             .cloned()
             .collect();
-        let unbindable_child_paths: Vec<_> = recursive_children
-            .iter()
-            .filter(|mount| mount.propagation == MountPropagation::Unbindable)
-            .map(|mount| mount.target_path.clone())
-            .collect();
         for child in recursive_children {
             let Some(suffix) = path_suffix(source_path.as_str(), child.target_path.as_str()) else {
                 continue;
             };
-            let child_is_under_unbindable = unbindable_child_paths
-                .iter()
-                .any(|path| path_suffix(path.as_str(), child.target_path.as_str()).is_some());
+            let child_is_under_unbindable =
+                unbindable_child_suffixes.iter().any(|uncloned_suffix| {
+                    path_suffix(uncloned_suffix.as_str(), suffix.as_str()).is_some()
+                });
             if child_is_under_unbindable {
                 continue;
             }
