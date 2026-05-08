@@ -1204,25 +1204,73 @@ pub(crate) fn mount_bind_at(
             initialize_propagation_from_parent(&mut event, propagation_parent.as_ref());
         }
         mounts.push(event.clone());
+        let root_event_id = event.event_id;
         propagate_mount_event(mounts, event, propagation_parent);
+        let root_copies: Vec<_> = mounts
+            .iter()
+            .filter(|mount| mount.namespace_id == namespace_id && mount.event_id == root_event_id)
+            .cloned()
+            .collect();
         for child in recursive_children {
             let Some(suffix) = path_suffix(source_path.as_str(), child.target_path.as_str()) else {
                 continue;
             };
-            let mut cloned = child;
-            cloned.target_path = join_mount_path(target_path.as_str(), suffix.as_str());
-            if let Some(parent_suffix) = path_suffix(
-                source_path.as_str(),
-                cloned.propagation_parent_path.as_str(),
-            ) {
-                cloned.propagation_parent_path =
-                    join_mount_path(target_path.as_str(), parent_suffix.as_str());
+            let copied_child_group =
+                (root_copies.len() > 1 && child.peer_group.is_none()).then(next_propagation_group);
+            for root in root_copies
+                .iter()
+                .filter(|root| copied_child_group.is_some() || root.target_path == target_path)
+            {
+                let mut cloned = child.clone();
+                cloned.target_path = join_mount_path(root.target_path.as_str(), suffix.as_str());
+                // CONTEXT: Recursive-bind root cleanup uses source-path
+                // metadata to identify copied children, including stacked
+                // child layers whose real source is outside the source tree.
+                cloned.source_path = join_mount_path(source_path.as_str(), suffix.as_str());
+                if let Some(parent_suffix) = path_suffix(
+                    source_path.as_str(),
+                    cloned.propagation_parent_path.as_str(),
+                ) {
+                    cloned.propagation_parent_path =
+                        join_mount_path(root.target_path.as_str(), parent_suffix.as_str());
+                    cloned.propagation_parent_group = mounts
+                        .iter()
+                        .rev()
+                        .find(|mount| {
+                            mount.namespace_id == namespace_id
+                                && mount.target_path == cloned.propagation_parent_path
+                        })
+                        .and_then(|mount| mount.peer_group)
+                        .or(root.peer_group);
+                } else if copied_child_group.is_some() {
+                    if let Some(parent) = mounts
+                        .iter()
+                        .filter(|mount| {
+                            mount.namespace_id == namespace_id
+                                && mount.peer_group.is_some()
+                                && path_suffix(
+                                    mount.target_path.as_str(),
+                                    cloned.target_path.as_str(),
+                                )
+                                .is_some()
+                        })
+                        .max_by_key(|mount| mount.target_path.len())
+                    {
+                        cloned.propagation_parent_path = parent.target_path.clone();
+                        cloned.propagation_parent_group = parent.peer_group;
+                    }
+                }
+                if let Some(group) = copied_child_group {
+                    cloned.propagation = MountPropagation::Shared;
+                    cloned.peer_group = Some(group);
+                    cloned.master_group = None;
+                }
+                // CONTEXT: Recursive bind children remain propagation peers of
+                // their copied target-side children. Keeping the original
+                // event id lets unmount propagation peel the copied child and
+                // its source peer together, as fs_bind_cloneNS05 expects.
+                mounts.push(cloned);
             }
-            // CONTEXT: Recursive bind children remain propagation peers of
-            // their source children. Keeping the original event id lets
-            // unmount propagation peel the copied child and its source peer
-            // together, as fs_bind_cloneNS05 expects.
-            mounts.push(cloned);
         }
         Ok(())
     })
