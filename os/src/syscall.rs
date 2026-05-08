@@ -155,7 +155,7 @@ pub(crate) mod user_ptr;
 mod wait;
 
 use crate::task::RLimit;
-use errno::{ret, SysError};
+use errno::{SysError, ret};
 use fs::*;
 use futex::*;
 use memory::*;

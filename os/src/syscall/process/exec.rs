@@ -1,7 +1,7 @@
-use crate::fs::{open_file_in, File, OpenFlags};
+use crate::fs::{File, OpenFlags, open_file_in};
 use crate::mm::elf_required_interpreter_path;
 use crate::syscall::errno::{SysError, SysResult};
-use crate::syscall::user_ptr::{read_user_c_string, read_user_usize, PATH_MAX};
+use crate::syscall::user_ptr::{PATH_MAX, read_user_c_string, read_user_usize};
 use crate::task::{current_process, current_user_token};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;

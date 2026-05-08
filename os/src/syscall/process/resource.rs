@@ -1,6 +1,6 @@
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{read_user_value, write_user_value};
-use crate::task::{current_process, current_user_token, pid2process, RLimit, RLimitResource};
+use crate::task::{RLimit, RLimitResource, current_process, current_user_token, pid2process};
 use alloc::sync::Arc;
 
 fn rlimit_target_process(pid: usize) -> SysResult<Arc<crate::task::ProcessControlBlock>> {

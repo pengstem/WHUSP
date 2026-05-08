@@ -2,8 +2,8 @@ use crate::fs::{File, FileStat, OpenFlags, PollEvents, S_IFDIR, S_IFMT};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
-    current_has_interrupting_signal, current_process, current_user_token,
-    suspend_current_and_run_next, FdTableEntry,
+    FdTableEntry, current_has_interrupting_signal, current_process, current_user_token,
+    suspend_current_and_run_next,
 };
 use crate::timer::get_time_us;
 use alloc::sync::Arc;

@@ -2,7 +2,7 @@ use crate::config::PAGE_SIZE;
 use crate::mm::shm::ShmError;
 use crate::mm::{MapPermission, MemoryProtectError};
 use crate::task::current_process;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
 use super::errno::{SysError, SysResult};
 

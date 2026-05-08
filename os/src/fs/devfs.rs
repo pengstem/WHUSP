@@ -412,6 +412,12 @@ fn seek_loop0(
     Ok(*current)
 }
 
+fn seek_null_like(offset_cell: &UPIntrFreeCell<usize>) -> usize {
+    let mut current = offset_cell.exclusive_access();
+    *current = 0;
+    0
+}
+
 pub(crate) fn is_devfs_loop_control(file: &(dyn File + Send + Sync)) -> bool {
     file.as_any()
         .downcast_ref::<DevFsFile>()
@@ -647,6 +653,9 @@ impl File for DevFsFile {
     fn seek(&self, offset: i64, whence: SeekWhence) -> FsResult<usize> {
         if self.node == DevNode::Loop0 {
             return seek_loop0(&self.offset, offset, whence);
+        }
+        if matches!(self.node, DevNode::Null | DevNode::Zero | DevNode::Full) {
+            return Ok(seek_null_like(&self.offset));
         }
         Err(FsError::IllegalSeek)
     }

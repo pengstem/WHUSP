@@ -1,6 +1,6 @@
 use crate::task::{
-    block_current_and_run_next, current_has_deliverable_signal, current_process, current_task,
-    current_user_token, ProcessCpuTimesSnapshot,
+    ProcessCpuTimesSnapshot, block_current_and_run_next, current_has_deliverable_signal,
+    current_process, current_task, current_user_token,
 };
 use crate::timer::{
     add_real_timer, add_timer, get_time_clock_ticks, get_time_ms, get_time_us,

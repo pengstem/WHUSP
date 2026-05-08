@@ -204,7 +204,7 @@ const LTP_MUSL_BLACKLIST_PATTERNS: &[&str] = &[
 // None runs all non-blacklisted cases. Some("a")..Some("z") narrows by
 // leading letter, Some("long") runs names outside the ASCII alphabet, and
 // Some("case:<name>") runs one exact LTP case.
-const LTP_CASE_FILTER_OPTION: Option<&str> = Some("e");
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some("f");
 
 enum LtpCaseFilter {
     All,
@@ -284,13 +284,19 @@ fn append_normal_script(command: &mut String, libc_root: &str, script: &str) {
 fn append_ltp_runner(command: &mut String, libc_root: &str) {
     command.push_str("cd ");
     command.push_str(libc_root);
-    command.push_str(" && { ./busybox echo \"#### OS COMP TEST GROUP START ltp-");
+    command.push_str(" && { export LTPROOT=\"");
+    command.push_str(libc_root);
+    command.push_str(
+        "/ltp\"; export TMPBASE=\"/tmp\"; export PATH=\"$PATH:$LTPROOT/testcases/bin:$LTPROOT/bin\"; ./busybox echo \"#### OS COMP TEST GROUP START ltp-",
+    );
     command.push_str(libc_label(libc_root));
-    command.push_str(" ####\"; for file in ltp/testcases/bin/*; do [ -f \"$file\" ] || continue; case_name=${file##*/}; ");
+    command.push_str(" ####\"; cd \"$LTPROOT/testcases/bin\"; for file in *; do [ -f \"$file\" ] || continue; case_name=${file##*/}; ");
     append_ltp_case_filter(command);
     command.push_str("case \"$case_name\" in ");
     append_ltp_blacklist_patterns(command, libc_root);
-    command.push_str(") echo \"SKIP LTP CASE $case_name\"; continue ;; esac; echo \"RUN LTP CASE $case_name\"; \"$file\"; ret=$?; echo \"FAIL LTP CASE $case_name : $ret\"; done; ./busybox echo \"#### OS COMP TEST GROUP END ltp-");
+    command.push_str(") echo \"SKIP LTP CASE $case_name\"; continue ;; esac; echo \"RUN LTP CASE $case_name\"; \"./$case_name\"; ret=$?; echo \"FAIL LTP CASE $case_name : $ret\"; done; \"");
+    command.push_str(libc_root);
+    command.push_str("/busybox\" echo \"#### OS COMP TEST GROUP END ltp-");
     command.push_str(libc_label(libc_root));
     command.push_str(" ####\"; }");
 }
