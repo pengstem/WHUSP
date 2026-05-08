@@ -142,7 +142,10 @@ pub fn sys_ftruncate(fd: usize, len: usize) -> SysResult {
     }
     let file = get_file_by_fd(fd)?;
     if !file.writable() {
-        return Err(SysError::EBADF);
+        // CONTEXT: POSIX permits either EBADF or EINVAL for ftruncate() on an
+        // fd that is not open for writing; Linux reports EINVAL, and LTP
+        // ftruncate03 checks that Linux-visible errno.
+        return Err(SysError::EINVAL);
     }
     if file.stat()?.mode & S_IFREG != S_IFREG {
         return Err(SysError::EINVAL);
