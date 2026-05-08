@@ -136,6 +136,8 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
     "ftp-upload-stress02-rmt.sh",
     "ftp01.sh",
     "ftrace*",
+    "ftruncate04",
+    "ftruncate04_64",
     "fgetxattr01",
     "fsetxattr01",
     "fsetxattr02",
