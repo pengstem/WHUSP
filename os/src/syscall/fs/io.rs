@@ -1,4 +1,4 @@
-use crate::fs::{File, OpenFlags, PollEvents, S_IFDIR, S_IFREG, SeekWhence};
+use crate::fs::{File, OpenFlags, PollEvents, S_IFDIR, S_IFMT, S_IFREG, SeekWhence};
 use crate::mm::UserBuffer;
 use crate::task::{FdTableEntry, SignalFlags, current_add_signal, current_user_token};
 use alloc::{vec, vec::Vec};
@@ -95,6 +95,14 @@ fn ensure_positioned_target(file: &(dyn File + Send + Sync)) -> SysResult<()> {
         return Err(SysError::ESPIPE);
     }
     Ok(())
+}
+
+fn ensure_fadvise_target(file: &(dyn File + Send + Sync)) -> SysResult<()> {
+    if file.stat()?.mode & S_IFMT == S_IFREG {
+        Ok(())
+    } else {
+        Err(SysError::ESPIPE)
+    }
 }
 
 fn fault_in_read_buffers(buffers: &[&'static mut [u8]]) {
@@ -209,6 +217,21 @@ pub fn sys_fallocate(fd: usize, mode: u32, offset: usize, len: usize) -> SysResu
     // CONTEXT: the current VFS has no block preallocation API. KEEP_SIZE is
     // accepted as a no-op because its visible contract in LTP sparse-file
     // cases is that file size must not change.
+    Ok(0)
+}
+
+pub fn sys_fadvise64(fd: usize, offset: i64, len: i64, advice: i32) -> SysResult {
+    if offset < 0 || len < 0 {
+        return Err(SysError::EINVAL);
+    }
+    let file = get_file_by_fd(fd)?;
+    ensure_fadvise_target(file.as_ref())?;
+    if !(0..=5).contains(&advice) {
+        return Err(SysError::EINVAL);
+    }
+    // CONTEXT: The current VFS has no page-cache advice API. Linux accepts
+    // valid POSIX_FADV_* hints as advisory, so the observable contest behavior
+    // can be represented as a checked no-op for regular files.
     Ok(0)
 }
 
