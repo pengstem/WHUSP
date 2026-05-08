@@ -454,6 +454,22 @@ fn propagation_parent_for_new_mount(
     nearest_propagation_mount(mounts, namespace_id, target_path)
 }
 
+fn propagation_parent_for_existing_mount(
+    mounts: &[DynamicMount],
+    namespace_id: MountNamespaceId,
+    target_path: &str,
+) -> Option<DynamicMount> {
+    mounts
+        .iter()
+        .filter(|mount| {
+            mount.namespace_id == namespace_id
+                && mount.target_path != target_path
+                && path_suffix(mount.target_path.as_str(), target_path).is_some()
+        })
+        .max_by_key(|mount| mount.target_path.len())
+        .cloned()
+}
+
 fn initialize_propagation_from_parent(event: &mut DynamicMount, parent: Option<&DynamicMount>) {
     event.propagation = MountPropagation::Private;
     event.peer_group = None;
@@ -1242,6 +1258,26 @@ pub(crate) fn move_mount_at(
             .ok_or(MountError::TargetNotMounted)?;
         let propagation_parent =
             propagation_parent_for_new_mount(mounts, namespace_id, target_path.as_str());
+        // CONTEXT: Linux rejects MS_MOVE when the source mount resides below a
+        // shared mount, and when moving an unbindable subtree would require
+        // cloning it into a shared destination peer group.
+        if propagation_parent_for_existing_mount(mounts, namespace_id, source_path.as_str())
+            .as_ref()
+            .is_some_and(|parent| {
+                parent.propagation == MountPropagation::Shared && parent.peer_group.is_some()
+            })
+        {
+            return Err(MountError::InvalidArgument);
+        }
+        if propagation_parent.as_ref().is_some_and(|parent| {
+            parent.propagation == MountPropagation::Shared && parent.peer_group.is_some()
+        }) && mounts.iter().any(|mount| {
+            mount.namespace_id == namespace_id
+                && mount.propagation == MountPropagation::Unbindable
+                && path_suffix(source_path.as_str(), mount.target_path.as_str()).is_some()
+        }) {
+            return Err(MountError::InvalidArgument);
+        }
         let mut moved = mounts.remove(source_index);
         moved.target = target;
         moved.covered_parent = covered_parent;
