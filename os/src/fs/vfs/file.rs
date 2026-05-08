@@ -55,19 +55,23 @@ fn prepare_created_file_mode(parent_stat: FileStat, attrs: &FileCreateAttrs) -> 
 
 pub(crate) struct VfsFile {
     node: VfsNodeId,
+    parent: Option<VfsNodeId>,
     kind: FsNodeKind,
     offset: SleepMutex<usize>,
     readable: bool,
     writable: bool,
     status_flags: StatusFlagsCell,
+    suppress_fanotify: bool,
 }
 
 impl VfsFile {
     fn new(
         path: VfsPath,
+        parent: Option<VfsNodeId>,
         readable: bool,
         writable: bool,
         status_flags: OpenFlags,
+        suppress_fanotify: bool,
     ) -> FsResult<Self> {
         with_mount(path.node.mount_id, |mount| {
             mount.retain_inode(path.node.ino)
@@ -75,11 +79,13 @@ impl VfsFile {
         .ok_or(FsError::Io)??;
         Ok(Self {
             node: path.node,
+            parent,
             kind: path.kind,
             offset: SleepMutex::new(0),
             readable,
             writable,
             status_flags: StatusFlagsCell::new(status_flags),
+            suppress_fanotify,
         })
     }
 
@@ -171,12 +177,19 @@ impl VfsFile {
     }
 }
 
+fn parent_hint_for_open(context: &PathContext, name: &str) -> Option<VfsNodeId> {
+    vfs_path::resolve_create_parent_in(context.clone(), name)
+        .ok()
+        .map(|target| target.parent)
+}
+
 fn open_vfs_file_impl(
     context: PathContext,
     name: &str,
     flags: OpenFlags,
     create_attrs: Option<FileCreateAttrs>,
 ) -> FsResult<Arc<VfsFile>> {
+    let parent_hint = parent_hint_for_open(&context, name);
     let follow_final_symlink = !flags.contains(OpenFlags::NOFOLLOW);
     let resolved = vfs_path::resolve_open_in(
         context,
@@ -185,7 +198,7 @@ fn open_vfs_file_impl(
         flags.contains(OpenFlags::CREATE),
     )?;
 
-    let (path, readable, writable) = match resolved {
+    let (path, parent, readable, writable) = match resolved {
         VfsOpenTarget::Existing(path) => {
             if flags.contains(OpenFlags::CREATE | OpenFlags::EXCL) {
                 return Err(FsError::AlreadyExists);
@@ -194,7 +207,7 @@ fn open_vfs_file_impl(
                 if !flags.can_open_directory() {
                     return Err(FsError::IsDir);
                 }
-                (path, false, false)
+                (path, parent_hint, false, false)
             } else {
                 if flags.contains(OpenFlags::DIRECTORY) {
                     return Err(FsError::NotDir);
@@ -223,7 +236,7 @@ fn open_vfs_file_impl(
                     with_mount(path.node.mount_id, |mount| mount.set_len(path.node.ino, 0))
                         .ok_or(FsError::Io)??;
                 }
-                (path, readable, writable)
+                (path, parent_hint, readable, writable)
             }
         }
         VfsOpenTarget::Create(target) => {
@@ -258,6 +271,7 @@ fn open_vfs_file_impl(
                     VfsNodeId::new(target.parent.mount_id, ino),
                     FsNodeKind::RegularFile,
                 ),
+                Some(target.parent),
                 readable,
                 writable,
             )
@@ -266,9 +280,11 @@ fn open_vfs_file_impl(
 
     Ok(Arc::new(VfsFile::new(
         path,
+        parent,
         readable,
         writable,
         OpenFlags::file_status_flags(flags),
+        false,
     )?))
 }
 
@@ -331,9 +347,11 @@ fn create_tmpfile_inode(
             VfsNodeId::new(directory.node.mount_id, ino),
             FsNodeKind::RegularFile,
         ),
+        Some(directory.node),
         readable,
         writable,
         OpenFlags::file_status_flags(flags),
+        false,
     )?);
 
     match with_mount(directory.node.mount_id, |mount| {
@@ -418,6 +436,19 @@ pub(crate) fn stat_in(
         with_mount(path.node.mount_id, |mount| mount.stat(path.node.ino)).ok_or(FsError::Io)??;
     stat.dev = path.node.mount_id.0 as u64;
     Ok(stat)
+}
+
+pub(crate) fn lookup_path_in(
+    context: PathContext,
+    name: &str,
+    follow_final_symlink: bool,
+) -> FsResult<VfsPath> {
+    let mode = if follow_final_symlink {
+        LookupMode::FollowFinal
+    } else {
+        LookupMode::NoFollowFinal
+    };
+    vfs_path::resolve_existing_in(context, name, mode)
 }
 
 pub(crate) fn lookup_dir_with_stat_in(
@@ -712,6 +743,14 @@ impl File for VfsFile {
         Some(WorkingDir::new(self.node.mount_id, self.node.ino))
     }
 
+    fn vfs_node_id(&self) -> Option<VfsNodeId> {
+        Some(self.node)
+    }
+
+    fn vfs_parent_node_id(&self) -> Option<VfsNodeId> {
+        self.parent
+    }
+
     fn vfs_mount_id(&self) -> Option<super::super::mount::MountId> {
         Some(self.node.mount_id)
     }
@@ -729,6 +768,22 @@ impl File for VfsFile {
 
     fn set_status_flags(&self, flags: OpenFlags) {
         self.status_flags.set(flags);
+    }
+
+    fn clone_for_fanotify_event(&self, flags: OpenFlags) -> FsResult<Arc<dyn File + Send + Sync>> {
+        let (readable, writable) = flags.read_write();
+        Ok(Arc::new(VfsFile::new(
+            VfsPath::new(self.node, self.kind),
+            self.parent,
+            readable,
+            writable,
+            OpenFlags::file_status_flags(flags),
+            true,
+        )?))
+    }
+
+    fn suppresses_fanotify(&self) -> bool {
+        self.suppress_fanotify
     }
 }
 

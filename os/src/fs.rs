@@ -204,6 +204,12 @@ pub trait File: Send + Sync {
     fn working_dir(&self) -> Option<WorkingDir> {
         None
     }
+    fn vfs_node_id(&self) -> Option<vfs::VfsNodeId> {
+        None
+    }
+    fn vfs_parent_node_id(&self) -> Option<vfs::VfsNodeId> {
+        None
+    }
     fn vfs_mount_id(&self) -> Option<mount::MountId> {
         None
     }
@@ -214,6 +220,15 @@ pub trait File: Send + Sync {
         inode::OpenFlags::empty()
     }
     fn set_status_flags(&self, _flags: inode::OpenFlags) {}
+    fn clone_for_fanotify_event(
+        &self,
+        _flags: inode::OpenFlags,
+    ) -> FsResult<Arc<dyn File + Send + Sync>> {
+        Err(FsError::Unsupported)
+    }
+    fn suppresses_fanotify(&self) -> bool {
+        false
+    }
     fn pipe_capacity(&self) -> Option<usize> {
         None
     }
@@ -289,10 +304,11 @@ pub use pipe::make_pipe;
 pub(crate) use procfs::pipe_max_size;
 pub(crate) use staticfs::{open_path as open_static_path, stat_path as stat_static_path};
 pub use stdio::{Stdin, Stdout};
+pub(crate) use vfs::VfsNodeId;
 pub(crate) use vfs::open_file;
 pub(crate) use vfs::{
     FileCreateAttrs, FileSystemStat, FsError, FsNodeKind, FsResult, chmod_in, chown_in,
-    link_open_file_in, lookup_dir_in, lookup_dir_with_stat_in, open_file_in,
+    link_open_file_in, lookup_dir_in, lookup_dir_with_stat_in, lookup_path_in, open_file_in,
     open_file_in_with_attrs, open_tmpfile_in_with_attrs, stat_in, truncate_in,
 };
 

@@ -206,7 +206,7 @@ const LTP_MUSL_BLACKLIST_PATTERNS: &[&str] = &[
 // Some("case:<name>") runs one exact LTP case, Some("cases:<a>,<b>") runs
 // selected exact LTP cases, and Some("prefix:<name>") runs cases whose names
 // start with the prefix.
-const LTP_CASE_FILTER_OPTION: Option<&str> = Some("f");
+const LTP_CASE_FILTER_OPTION: Option<&str> = None;
 
 enum LtpCaseFilter {
     All,

@@ -134,6 +134,8 @@ const SYSCALL_MSYNC: usize = 227;
 const SYSCALL_ACCEPT4: usize = 242;
 const SYSCALL_WAIT4: usize = 260;
 const SYSCALL_PRLIMIT64: usize = 261;
+const SYSCALL_FANOTIFY_INIT: usize = 262;
+const SYSCALL_FANOTIFY_MARK: usize = 263;
 const SYSCALL_SETNS: usize = 268;
 const SYSCALL_RENAMEAT2: usize = 276;
 const SYSCALL_GETRANDOM: usize = 278;
@@ -492,6 +494,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[1] as i32,
             args[2] as *const RLimit,
             args[3] as *mut RLimit,
+        ),
+        SYSCALL_FANOTIFY_INIT => sys_fanotify_init(args[0] as u32, args[1] as u32),
+        SYSCALL_FANOTIFY_MARK => sys_fanotify_mark(
+            args[0],
+            args[1] as u32,
+            args[2] as u64,
+            args[3] as isize,
+            args[4] as *const u8,
         ),
         SYSCALL_SETNS => sys_setns(args[0], args[1]),
         SYSCALL_SOCKET => sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),

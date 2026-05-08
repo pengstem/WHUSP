@@ -61,7 +61,7 @@ fn parse_loop_block_source(source: &str) -> Option<usize> {
 fn mount_error_to_errno(error: MountError) -> SysError {
     match error {
         MountError::SourceMissing => SysError::ENODEV,
-        MountError::InvalidFilesystem => SysError::EINVAL,
+        MountError::InvalidFilesystem | MountError::InvalidArgument => SysError::EINVAL,
         MountError::InvalidTarget => SysError::ENOENT,
         MountError::TargetBusy | MountError::StaticRoot => SysError::EBUSY,
         MountError::TargetNotMounted => SysError::EINVAL,

@@ -1,4 +1,5 @@
 mod epoll;
+mod fanotify;
 mod fd;
 mod fd_lock;
 mod io;
@@ -10,6 +11,7 @@ mod tty;
 mod uapi;
 
 pub use epoll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait, sys_epoll_pwait2};
+pub use fanotify::{sys_fanotify_init, sys_fanotify_mark};
 pub use fd::{sys_close, sys_dup, sys_dup3, sys_fcntl, sys_flock, sys_memfd_create, sys_pipe2};
 pub(crate) use fd_lock::{
     release_flock_locks_for_closed_fd_table, release_record_locks_for_process,

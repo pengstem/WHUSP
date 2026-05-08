@@ -1,6 +1,6 @@
 use super::super::mount::MountId;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct VfsNodeId {
     pub(crate) mount_id: MountId,
     pub(crate) ino: u32,

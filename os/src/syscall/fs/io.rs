@@ -11,6 +11,7 @@ use super::super::user_ptr::{
     UserBufferAccess, read_user_usize, read_user_value, translated_byte_buffer_checked,
     translated_byte_buffer_checked_with_mmap_fault, write_user_value,
 };
+use super::fanotify::{fanotify_notify_access, fanotify_notify_modify};
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::uapi::{IOV_MAX, LinuxIovec};
 
@@ -584,6 +585,7 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> SysRes
             break;
         }
     }
+    fanotify_notify_access(&file, total_read);
     Ok(total_read as isize)
 }
 
@@ -614,6 +616,7 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, len: usize, offset: usize) -> Sys
             break;
         }
     }
+    fanotify_notify_modify(&file, total_written);
     Ok(total_written as isize)
 }
 
@@ -670,10 +673,12 @@ pub fn sys_preadv(
             total_read += read;
             offset = offset.checked_add(read).ok_or(SysError::EINVAL)?;
             if read < slice.len() {
+                fanotify_notify_access(&file, total_read);
                 return Ok(total_read as isize);
             }
         }
     }
+    fanotify_notify_access(&file, total_read);
     Ok(total_read as isize)
 }
 
@@ -714,7 +719,10 @@ pub fn sys_pwritev(
             UserBufferAccess::Read,
         ) {
             Ok(buffers) => buffers,
-            Err(_) if total_written > 0 => return Ok(total_written as isize),
+            Err(_) if total_written > 0 => {
+                fanotify_notify_modify(&file, total_written);
+                return Ok(total_written as isize);
+            }
             Err(err) => return Err(err),
         };
         if let Err(err) = file.check_write_at(offset, iovec.len) {
@@ -726,10 +734,12 @@ pub fn sys_pwritev(
             total_written += written;
             offset = offset.checked_add(written).ok_or(SysError::EINVAL)?;
             if written < slice.len() {
+                fanotify_notify_modify(&file, total_written);
                 return Ok(total_written as isize);
             }
         }
     }
+    fanotify_notify_modify(&file, total_written);
     Ok(total_written as isize)
 }
 
@@ -748,7 +758,9 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
     file.check_write(len, entry.status_flags().contains(OpenFlags::APPEND))?;
     let buffers =
         translated_byte_buffer_checked_with_mmap_fault(token, buf, len, UserBufferAccess::Read)?;
-    Ok(write_with_status_flags(&entry, UserBuffer::new(buffers)) as isize)
+    let written = write_with_status_flags(&entry, UserBuffer::new(buffers));
+    fanotify_notify_modify(&file, written);
+    Ok(written as isize)
 }
 
 pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult {
@@ -792,7 +804,10 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
             UserBufferAccess::Read,
         ) {
             Ok(buffers) => buffers,
-            Err(_) if total_written > 0 => return Ok(total_written as isize),
+            Err(_) if total_written > 0 => {
+                fanotify_notify_modify(&file, total_written);
+                return Ok(total_written as isize);
+            }
             Err(err) => return Err(err),
         };
         let written = write_with_status_flags(&entry, UserBuffer::new(buffers));
@@ -801,6 +816,7 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
             break;
         }
     }
+    fanotify_notify_modify(&file, total_written);
     Ok(total_written as isize)
 }
 
@@ -856,6 +872,7 @@ pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult 
             break;
         }
     }
+    fanotify_notify_access(&file, total_read);
     Ok(total_read as isize)
 }
 
@@ -869,5 +886,7 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> SysResult {
     ensure_nonblocking_ready(&entry, PollEvents::POLLIN)?;
     let buffers =
         translated_byte_buffer_checked_with_mmap_fault(token, buf, len, UserBufferAccess::Write)?;
-    Ok(file.read(UserBuffer::new(buffers)) as isize)
+    let read = file.read(UserBuffer::new(buffers));
+    fanotify_notify_access(&file, read);
+    Ok(read as isize)
 }

@@ -11,6 +11,7 @@ use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
     UserBufferAccess, read_user_c_string, translated_byte_buffer_checked,
 };
+use super::fanotify::fanotify_notify_close;
 use super::fd_lock::{
     fcntl_getlk, fcntl_setlk, fcntl_setlkw, flock_operation, release_flock_locks_for_close,
     release_record_locks_for_close,
@@ -66,6 +67,8 @@ pub fn sys_close(fd: usize) -> SysResult {
     };
     release_record_locks_for_close(&entry);
     release_flock_locks_for_close(&entry);
+    let file = entry.file();
+    fanotify_notify_close(&file, file.writable());
     drop(entry);
     Ok(0)
 }

@@ -66,6 +66,7 @@ enum BackendKind {
 pub(crate) enum MountError {
     SourceMissing,
     InvalidFilesystem,
+    InvalidArgument,
     InvalidTarget,
     TargetBusy,
     TargetNotMounted,
@@ -1062,6 +1063,13 @@ pub(crate) fn mount_bind_at(
     let source_path = resolve_mount_path(source_root, source_path);
     let target_path = resolve_mount_path(target, target_path);
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        let source_mount = nearest_propagation_mount(mounts, namespace_id, source_path.as_str());
+        if source_mount
+            .as_ref()
+            .is_some_and(|mount| mount.propagation == MountPropagation::Unbindable)
+        {
+            return Err(MountError::InvalidArgument);
+        }
         let recursive_children: Vec<_> = if recursive {
             mounts
                 .iter()
@@ -1340,6 +1348,7 @@ pub(crate) fn unmount_at(
             return Err(MountError::TargetBusy);
         }
         let event = mounts.remove(index);
+        mounts.retain(|mount| mount.event_id != event.event_id);
         propagate_unmount_event(mounts, &event);
         Ok(())
     })
