@@ -1195,7 +1195,17 @@ pub(crate) fn mount_bind_at(
             };
             let mut cloned = child;
             cloned.target_path = join_mount_path(target_path.as_str(), suffix.as_str());
-            cloned.event_id = next_mount_event_id();
+            if let Some(parent_suffix) = path_suffix(
+                source_path.as_str(),
+                cloned.propagation_parent_path.as_str(),
+            ) {
+                cloned.propagation_parent_path =
+                    join_mount_path(target_path.as_str(), parent_suffix.as_str());
+            }
+            // CONTEXT: Recursive bind children remain propagation peers of
+            // their source children. Keeping the original event id lets
+            // unmount propagation peel the copied child and its source peer
+            // together, as fs_bind_cloneNS05 expects.
             mounts.push(cloned);
         }
         Ok(())
