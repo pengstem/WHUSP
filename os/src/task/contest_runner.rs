@@ -128,6 +128,7 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
     "fsstress",
     "fsx-linux",
     "fsx.sh",
+    "fsync04",
     "ftp-download-stress.sh",
     "ftp-download-stress01-rmt.sh",
     "ftrace*",
