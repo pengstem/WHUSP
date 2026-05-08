@@ -68,6 +68,18 @@ fn mount_error_to_errno(error: MountError) -> SysError {
     }
 }
 
+fn propagation_from_flags(flags: usize) -> MountPropagation {
+    if flags & MS_SHARED != 0 {
+        MountPropagation::Shared
+    } else if flags & MS_SLAVE != 0 {
+        MountPropagation::Slave
+    } else if flags & MS_UNBINDABLE != 0 {
+        MountPropagation::Unbindable
+    } else {
+        MountPropagation::Private
+    }
+}
+
 pub fn sys_mount(
     source: *const u8,
     target: *const u8,
@@ -90,33 +102,34 @@ pub fn sys_mount(
     .ok_or(SysError::ENOENT)?;
 
     let propagation_flags = flags & MS_PROPAGATION_MASK;
-    if propagation_flags != 0 {
-        if propagation_flags.count_ones() != 1
-            || flags & !(MS_PROPAGATION_MASK | MS_PROPAGATION_ALLOWED_EXTRAS) != 0
-        {
+    let propagation_change = if propagation_flags != 0 {
+        if propagation_flags.count_ones() != 1 {
             return Err(SysError::EINVAL);
         }
+        let allowed_flags = MS_PROPAGATION_MASK | MS_PROPAGATION_ALLOWED_EXTRAS | MS_BIND;
+        if flags & !allowed_flags != 0 {
+            return Err(SysError::EINVAL);
+        }
+        Some(propagation_from_flags(flags))
+    } else {
+        None
+    };
+
+    if let Some(propagation) = propagation_change {
         // CONTEXT: BusyBox and LTP use mount propagation changes while setting
         // up bind-mount cases. This is a contest-sized propagation model: it
         // tracks private/shared/slave/unbindable labels on dynamic mount
         // records and propagates bind mount events between peers.
-        let propagation = if flags & MS_SHARED != 0 {
-            MountPropagation::Shared
-        } else if flags & MS_SLAVE != 0 {
-            MountPropagation::Slave
-        } else if flags & MS_UNBINDABLE != 0 {
-            MountPropagation::Unbindable
-        } else {
-            MountPropagation::Private
-        };
-        set_mount_propagation_at(
-            namespace_id,
-            target_path.as_str(),
-            flags & MS_REC != 0,
-            propagation,
-        )
-        .map_err(mount_error_to_errno)?;
-        return Ok(0);
+        if flags & MS_BIND == 0 {
+            set_mount_propagation_at(
+                namespace_id,
+                target_path.as_str(),
+                flags & MS_REC != 0,
+                propagation,
+            )
+            .map_err(mount_error_to_errno)?;
+            return Ok(0);
+        }
     }
 
     if flags & MS_MOVE != 0 {
@@ -157,6 +170,15 @@ pub fn sys_mount(
             flags & MS_REC != 0,
         )
         .map_err(mount_error_to_errno)?;
+        if let Some(propagation) = propagation_change {
+            set_mount_propagation_at(
+                namespace_id,
+                target_path.as_str(),
+                flags & MS_REC != 0,
+                propagation,
+            )
+            .map_err(mount_error_to_errno)?;
+        }
         return Ok(0);
     }
 
