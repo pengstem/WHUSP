@@ -1241,10 +1241,21 @@ pub(crate) fn mount_bind_at(
             .filter(|mount| mount.namespace_id == namespace_id && mount.event_id == root_event_id)
             .cloned()
             .collect();
+        let unbindable_child_paths: Vec<_> = recursive_children
+            .iter()
+            .filter(|mount| mount.propagation == MountPropagation::Unbindable)
+            .map(|mount| mount.target_path.clone())
+            .collect();
         for child in recursive_children {
             let Some(suffix) = path_suffix(source_path.as_str(), child.target_path.as_str()) else {
                 continue;
             };
+            let child_is_under_unbindable = unbindable_child_paths
+                .iter()
+                .any(|path| path_suffix(path.as_str(), child.target_path.as_str()).is_some());
+            if child_is_under_unbindable {
+                continue;
+            }
             let copied_child_group =
                 (root_copies.len() > 1 && child.peer_group.is_none()).then(next_propagation_group);
             for root in root_copies
