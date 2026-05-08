@@ -879,6 +879,12 @@ fn is_mount_descendant(root: &DynamicMount, mount: &DynamicMount) -> bool {
     if root.namespace_id != mount.namespace_id {
         return false;
     }
+    // CONTEXT: Unmounting a later root should reveal older mount layers that
+    // were already present below the target. Only descendants mounted after
+    // this root are part of the subtree that should be detached with it.
+    if mount.event_id <= root.event_id {
+        return false;
+    }
     let Some(suffix) = path_suffix(root.target_path.as_str(), mount.target_path.as_str()) else {
         return false;
     };
