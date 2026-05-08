@@ -9,7 +9,10 @@ use crate::syscall::time::{
     timespec_to_nanos, validate_timespec,
 };
 use crate::syscall::uapi::LinuxTimeSpec;
-use crate::syscall::user_ptr::{read_user_value, write_user_value};
+use crate::syscall::user_ptr::{
+    read_user_value, read_user_value_with_mmap_fault, write_user_value,
+    write_user_value_with_mmap_fault,
+};
 use crate::timer::{add_timer, get_time_ms};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
@@ -234,11 +237,13 @@ fn validate_futex_addr(addr: usize) -> SysResult {
 }
 
 fn read_futex_word(addr: usize) -> SysResult<u32> {
-    read_futex_word_with_token(current_user_token(), addr)
+    validate_futex_addr(addr)?;
+    read_user_value_with_mmap_fault(current_user_token(), addr as *const u32)
 }
 
 fn write_futex_word(addr: usize, value: u32) -> SysResult<()> {
-    write_futex_word_with_token(current_user_token(), addr, value)
+    validate_futex_addr(addr)?;
+    write_user_value_with_mmap_fault(current_user_token(), addr as *mut u32, &value)
 }
 
 fn read_futex_word_with_token(token: usize, addr: usize) -> SysResult<u32> {

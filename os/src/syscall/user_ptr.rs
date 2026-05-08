@@ -214,6 +214,13 @@ pub(crate) fn read_user_value<T: Copy>(token: usize, ptr: *const T) -> SysResult
     read_user_value_with_fault(token, ptr, None)
 }
 
+pub(crate) fn read_user_value_with_mmap_fault<T: Copy>(
+    token: usize,
+    ptr: *const T,
+) -> SysResult<T> {
+    read_user_value_with_fault(token, ptr, Some(mmap_user_fault))
+}
+
 pub(crate) fn read_user_value_with_fault<T: Copy>(
     token: usize,
     ptr: *const T,
@@ -228,6 +235,14 @@ pub(crate) fn read_user_value_with_fault<T: Copy>(
 
 pub(crate) fn write_user_value<T: Copy>(token: usize, ptr: *mut T, value: &T) -> SysResult<()> {
     write_user_value_with_fault(token, ptr, value, None)
+}
+
+pub(crate) fn write_user_value_with_mmap_fault<T: Copy>(
+    token: usize,
+    ptr: *mut T,
+    value: &T,
+) -> SysResult<()> {
+    write_user_value_with_fault(token, ptr, value, Some(mmap_user_fault))
 }
 
 pub(crate) fn write_user_value_with_fault<T: Copy>(
