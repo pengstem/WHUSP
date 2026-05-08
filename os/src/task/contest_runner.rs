@@ -203,8 +203,9 @@ const LTP_MUSL_BLACKLIST_PATTERNS: &[&str] = &[
 
 // None runs all non-blacklisted cases. Some("a")..Some("z") narrows by
 // leading letter, Some("long") runs names outside the ASCII alphabet,
-// Some("case:<name>") runs one exact LTP case, and Some("prefix:<name>")
-// runs cases whose names start with the prefix.
+// Some("case:<name>") runs one exact LTP case, Some("cases:<a>,<b>") runs
+// selected exact LTP cases, and Some("prefix:<name>") runs cases whose names
+// start with the prefix.
 const LTP_CASE_FILTER_OPTION: Option<&str> = Some("f");
 
 enum LtpCaseFilter {
@@ -212,6 +213,7 @@ enum LtpCaseFilter {
     Letter(u8),
     Long,
     Exact(&'static str),
+    ExactSet(&'static str),
     Prefix(&'static str),
     Invalid,
 }
@@ -323,6 +325,11 @@ fn append_ltp_case_filter(command: &mut String) {
             command.push_str(case_name);
             command.push_str(") ;; *) continue ;; esac; ");
         }
+        LtpCaseFilter::ExactSet(case_names) => {
+            command.push_str("case \"$case_name\" in ");
+            append_ltp_case_set_pattern(command, case_names);
+            command.push_str(") ;; *) continue ;; esac; ");
+        }
         LtpCaseFilter::Prefix(prefix) => {
             command.push_str("case \"$case_name\" in ");
             command.push_str(prefix);
@@ -342,6 +349,17 @@ fn ltp_case_filter() -> LtpCaseFilter {
             let case_name = &option["case:".len()..];
             if is_ltp_case_name(case_name) {
                 LtpCaseFilter::Exact(case_name)
+            } else {
+                LtpCaseFilter::Invalid
+            }
+        }
+        Some(option) if option.starts_with("cases:") => {
+            let case_names = &option["cases:".len()..];
+            if case_names
+                .split(',')
+                .all(|case_name| is_ltp_case_name(case_name))
+            {
+                LtpCaseFilter::ExactSet(case_names)
             } else {
                 LtpCaseFilter::Invalid
             }
@@ -370,6 +388,17 @@ fn is_ltp_case_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn append_ltp_case_set_pattern(command: &mut String, case_names: &str) {
+    let mut first = true;
+    for case_name in case_names.split(',') {
+        if !first {
+            command.push('|');
+        }
+        first = false;
+        command.push_str(case_name);
+    }
 }
 
 fn append_ltp_blacklist_patterns(command: &mut String, libc_root: &str) {

@@ -41,6 +41,10 @@ struct DynamicMount {
     source_path: String,
     target_path: String,
     is_bind: bool,
+    // Propagated copies of one mount event share this id.
+    event_id: usize,
+    propagation_parent_path: String,
+    propagation_parent_group: Option<usize>,
     propagation: MountPropagation,
     peer_group: Option<usize>,
     master_group: Option<usize>,
@@ -94,6 +98,7 @@ lazy_static! {
 static NEXT_MOUNT_ID: AtomicUsize = AtomicUsize::new(0);
 static NEXT_MOUNT_NAMESPACE_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_PROPAGATION_GROUP: AtomicUsize = AtomicUsize::new(1);
+static NEXT_MOUNT_EVENT_ID: AtomicUsize = AtomicUsize::new(1);
 
 pub fn init_mounts() {
     let already_initialized = MOUNTS_INITIALIZED.exclusive_session(|initialized| {
@@ -408,6 +413,10 @@ fn next_propagation_group() -> usize {
     NEXT_PROPAGATION_GROUP.fetch_add(1, Ordering::SeqCst)
 }
 
+fn next_mount_event_id() -> usize {
+    NEXT_MOUNT_EVENT_ID.fetch_add(1, Ordering::SeqCst)
+}
+
 fn nearest_propagation_mount(
     mounts: &[DynamicMount],
     namespace_id: MountNamespaceId,
@@ -447,11 +456,22 @@ fn initialize_propagation_from_parent(event: &mut DynamicMount, parent: Option<&
     event.propagation = MountPropagation::Private;
     event.peer_group = None;
     event.master_group = None;
+    record_propagation_parent(event, parent);
     if parent.is_some_and(|parent| {
         parent.propagation == MountPropagation::Shared && parent.peer_group.is_some()
     }) {
         event.propagation = MountPropagation::Shared;
         event.peer_group = Some(next_propagation_group());
+    }
+}
+
+fn record_propagation_parent(event: &mut DynamicMount, parent: Option<&DynamicMount>) {
+    if let Some(parent) = parent.filter(|parent| parent.peer_group.is_some()) {
+        event.propagation_parent_path = parent.target_path.clone();
+        event.propagation_parent_group = parent.peer_group;
+    } else {
+        event.propagation_parent_path.clear();
+        event.propagation_parent_group = None;
     }
 }
 
@@ -483,6 +503,13 @@ fn known_child_group(group_map: &[(usize, usize)], parent_group: usize) -> Optio
 fn queue_group_once(queue: &mut Vec<usize>, group: usize) {
     if !queue.contains(&group) {
         queue.push(group);
+    }
+}
+
+fn retarget_propagated_root(propagated: &mut DynamicMount, peer: &DynamicMount, suffix: &str) {
+    if suffix.is_empty() {
+        propagated.target = peer.target;
+        propagated.covered_parent = peer.covered_parent;
     }
 }
 
@@ -527,24 +554,19 @@ fn propagate_mount_event(
             if peer.namespace_id == event.namespace_id && target_path == event.target_path {
                 continue;
             }
-            if mounts.iter().any(|mount| {
-                mount.namespace_id == peer.namespace_id
-                    && mount.target == event.target
-                    && mount.target_path == target_path
-                    && mount.source_mount_id == event.source_mount_id
-                    && mount.source_root == event.source_root
-            }) {
-                continue;
-            }
             let mut propagated = event.clone();
             propagated.namespace_id = peer.namespace_id;
             propagated.target_path = target_path;
+            retarget_propagated_root(&mut propagated, &peer, suffix.as_str());
+            propagated.propagation_parent_path = peer.target_path.clone();
+            propagated.propagation_parent_group = peer.peer_group;
             if peer.peer_group == Some(group) {
                 propagated.propagation = MountPropagation::Shared;
                 propagated.peer_group = Some(event_group);
-                propagated.master_group = peer
-                    .master_group
-                    .and_then(|master| known_child_group(&group_map, master));
+                propagated.master_group = event.master_group.or_else(|| {
+                    peer.master_group
+                        .and_then(|master| known_child_group(&group_map, master))
+                });
             } else {
                 propagated.master_group = Some(event_group);
                 if let Some(peer_group) = peer.peer_group {
@@ -557,22 +579,175 @@ fn propagate_mount_event(
                     propagated.peer_group = None;
                 }
             }
+            if mounts.iter().any(|mount| {
+                mount.namespace_id == propagated.namespace_id
+                    && mount.target == propagated.target
+                    && mount.target_path == propagated.target_path
+                    && mount.source_mount_id == propagated.source_mount_id
+                    && mount.source_root == propagated.source_root
+            }) {
+                continue;
+            }
             mounts.push(propagated);
         }
     }
 }
 
-fn propagate_unmount_event(mounts: &mut Vec<DynamicMount>, event: &DynamicMount) {
-    let Some(source_mount) =
-        nearest_propagation_mount(mounts, event.namespace_id, event.target_path.as_str())
-    else {
+fn moved_tree_parent(
+    mounts: &[DynamicMount],
+    namespace_id: MountNamespaceId,
+    root_path: &str,
+    target_path: &str,
+) -> Option<(String, usize)> {
+    mounts
+        .iter()
+        .filter(|mount| {
+            mount.namespace_id == namespace_id
+                && mount.target_path != target_path
+                && path_suffix(root_path, mount.target_path.as_str()).is_some()
+                && path_suffix(mount.target_path.as_str(), target_path).is_some()
+                && mount.peer_group.is_some()
+        })
+        .max_by_key(|mount| mount.target_path.len())
+        .and_then(|mount| {
+            mount
+                .peer_group
+                .map(|group| (mount.target_path.clone(), group))
+        })
+}
+
+fn update_moved_tree_parents(
+    mounts: &mut [DynamicMount],
+    namespace_id: MountNamespaceId,
+    source_path: &str,
+    target_path: &str,
+    root_group: Option<usize>,
+) {
+    let snapshot = mounts.to_vec();
+    for mount in mounts.iter_mut() {
+        if mount.namespace_id != namespace_id || mount.target_path == target_path {
+            continue;
+        }
+        if path_suffix(target_path, mount.target_path.as_str()).is_none() {
+            continue;
+        }
+        if let Some(parent_suffix) =
+            path_suffix(source_path, mount.propagation_parent_path.as_str())
+        {
+            mount.propagation_parent_path = join_mount_path(target_path, parent_suffix.as_str());
+            continue;
+        }
+        if mount.propagation_parent_group.is_none() {
+            if let Some((parent_path, parent_group)) = moved_tree_parent(
+                snapshot.as_slice(),
+                namespace_id,
+                target_path,
+                mount.target_path.as_str(),
+            ) {
+                mount.propagation_parent_path = parent_path;
+                mount.propagation_parent_group = Some(parent_group);
+            } else if let Some(root_group) = root_group {
+                mount.propagation_parent_path = target_path.into();
+                mount.propagation_parent_group = Some(root_group);
+            }
+        }
+    }
+}
+
+fn mapped_tree_parent_path(
+    mount: &DynamicMount,
+    source_root_path: &str,
+    target_root_path: &str,
+    fallback_parent: &DynamicMount,
+) -> (String, Option<usize>) {
+    if mount.target_path == source_root_path {
+        return (
+            fallback_parent.target_path.clone(),
+            fallback_parent.peer_group,
+        );
+    }
+    if let Some(parent_suffix) =
+        path_suffix(source_root_path, mount.propagation_parent_path.as_str())
+    {
+        (
+            join_mount_path(target_root_path, parent_suffix.as_str()),
+            mount.propagation_parent_group,
+        )
+    } else {
+        (
+            join_mount_path(target_root_path, ""),
+            mount.propagation_parent_group,
+        )
+    }
+}
+
+fn clone_moved_tree_to_propagation_peers(
+    mounts: &mut Vec<DynamicMount>,
+    moved_tree: &[DynamicMount],
+    moved_root: &DynamicMount,
+    propagation_parent: Option<DynamicMount>,
+) {
+    let Some(propagation_parent) = propagation_parent else {
         return;
     };
-    let Some(source_group) = source_mount.peer_group else {
+    let Some(source_group) = propagation_parent.peer_group else {
+        return;
+    };
+    let Some(root_suffix) = path_suffix(
+        propagation_parent.target_path.as_str(),
+        moved_root.target_path.as_str(),
+    ) else {
+        return;
+    };
+    let peers: Vec<_> = mounts
+        .iter()
+        .filter(|peer| {
+            peer.peer_group == Some(source_group) || peer.master_group == Some(source_group)
+        })
+        .cloned()
+        .collect();
+    for peer in peers {
+        let peer_root_path = join_mount_path(peer.target_path.as_str(), root_suffix.as_str());
+        if peer.namespace_id == moved_root.namespace_id && peer_root_path == moved_root.target_path
+        {
+            continue;
+        }
+        for mount in moved_tree {
+            let Some(suffix) =
+                path_suffix(moved_root.target_path.as_str(), mount.target_path.as_str())
+            else {
+                continue;
+            };
+            let mut cloned = mount.clone();
+            cloned.namespace_id = peer.namespace_id;
+            cloned.target_path = join_mount_path(peer_root_path.as_str(), suffix.as_str());
+            let (parent_path, parent_group) = mapped_tree_parent_path(
+                mount,
+                moved_root.target_path.as_str(),
+                peer_root_path.as_str(),
+                &peer,
+            );
+            cloned.propagation_parent_path = parent_path;
+            cloned.propagation_parent_group = parent_group;
+            if mounts.iter().any(|existing| {
+                existing.namespace_id == cloned.namespace_id
+                    && existing.target == cloned.target
+                    && existing.target_path == cloned.target_path
+                    && existing.event_id == cloned.event_id
+            }) {
+                continue;
+            }
+            mounts.push(cloned);
+        }
+    }
+}
+
+fn propagate_unmount_event(mounts: &mut Vec<DynamicMount>, event: &DynamicMount) {
+    let Some(source_group) = event.propagation_parent_group else {
         return;
     };
     let Some(suffix) = path_suffix(
-        source_mount.target_path.as_str(),
+        event.propagation_parent_path.as_str(),
         event.target_path.as_str(),
     ) else {
         return;
@@ -599,10 +774,8 @@ fn propagate_unmount_event(mounts: &mut Vec<DynamicMount>, event: &DynamicMount)
             let target_path = join_mount_path(peer.target_path.as_str(), suffix.as_str());
             mounts.retain(|mount| {
                 !(mount.namespace_id == peer.namespace_id
-                    && mount.target == event.target
                     && mount.target_path == target_path
-                    && mount.source_mount_id == event.source_mount_id
-                    && mount.source_root == event.source_root)
+                    && mount.event_id == event.event_id)
             });
         }
     }
@@ -656,6 +829,9 @@ pub(crate) fn mount_block_device_at(
             source_path,
             target_path,
             is_bind: false,
+            event_id: next_mount_event_id(),
+            propagation_parent_path: String::new(),
+            propagation_parent_group: None,
             propagation: MountPropagation::Private,
             peer_group: None,
             master_group: None,
@@ -782,6 +958,9 @@ fn mount_new_fs_at(
             source_path,
             target_path,
             is_bind: false,
+            event_id: next_mount_event_id(),
+            propagation_parent_path: String::new(),
+            propagation_parent_group: None,
             propagation: MountPropagation::Private,
             peer_group: None,
             master_group: None,
@@ -851,6 +1030,9 @@ pub(crate) fn mount_pseudo_fs_at_with_options(
             source_path,
             target_path,
             is_bind: false,
+            event_id: next_mount_event_id(),
+            propagation_parent_path: String::new(),
+            propagation_parent_group: None,
             propagation: MountPropagation::Private,
             peer_group: None,
             master_group: None,
@@ -905,25 +1087,38 @@ pub(crate) fn mount_bind_at(
             source_path: source_path.clone(),
             target_path: target_path.clone(),
             is_bind: true,
+            event_id: next_mount_event_id(),
+            propagation_parent_path: String::new(),
+            propagation_parent_group: None,
             propagation: MountPropagation::Private,
             peer_group: None,
             master_group: None,
         };
         if let Some(source_mount) = source_mount.as_ref() {
             copy_propagation_from_source(&mut event, source_mount);
+            record_propagation_parent(&mut event, propagation_parent.as_ref());
+            if event.peer_group.is_none()
+                && propagation_parent.as_ref().is_some_and(|parent| {
+                    parent.propagation == MountPropagation::Shared && parent.peer_group.is_some()
+                })
+            {
+                event.peer_group = Some(next_propagation_group());
+                if event.master_group.is_none() {
+                    event.propagation = MountPropagation::Shared;
+                }
+            }
         } else {
             initialize_propagation_from_parent(&mut event, propagation_parent.as_ref());
         }
         mounts.push(event.clone());
-        if source_mount.is_none() {
-            propagate_mount_event(mounts, event, propagation_parent);
-        }
+        propagate_mount_event(mounts, event, propagation_parent);
         for child in recursive_children {
             let Some(suffix) = path_suffix(source_path.as_str(), child.target_path.as_str()) else {
                 continue;
             };
             let mut cloned = child;
             cloned.target_path = join_mount_path(target_path.as_str(), suffix.as_str());
+            cloned.event_id = next_mount_event_id();
             mounts.push(cloned);
         }
         Ok(())
@@ -968,6 +1163,15 @@ pub(crate) fn move_mount_at(
         moved.target = target;
         moved.covered_parent = covered_parent;
         moved.target_path = target_path.clone();
+        if moved.peer_group.is_none()
+            && propagation_parent
+                .as_ref()
+                .is_some_and(|parent| parent.propagation == MountPropagation::Shared)
+        {
+            initialize_propagation_from_parent(&mut moved, propagation_parent.as_ref());
+        } else {
+            record_propagation_parent(&mut moved, propagation_parent.as_ref());
+        }
         mounts.push(moved.clone());
 
         for mount in mounts.iter_mut() {
@@ -982,7 +1186,27 @@ pub(crate) fn move_mount_at(
             }
             mount.target_path = join_mount_path(target_path.as_str(), suffix.as_str());
         }
-        propagate_mount_event(mounts, moved, propagation_parent);
+        update_moved_tree_parents(
+            mounts.as_mut_slice(),
+            namespace_id,
+            source_path.as_str(),
+            target_path.as_str(),
+            moved.peer_group,
+        );
+        let moved_tree: Vec<_> = mounts
+            .iter()
+            .filter(|mount| {
+                mount.namespace_id == namespace_id
+                    && path_suffix(target_path.as_str(), mount.target_path.as_str()).is_some()
+            })
+            .cloned()
+            .collect();
+        clone_moved_tree_to_propagation_peers(
+            mounts,
+            moved_tree.as_slice(),
+            &moved,
+            propagation_parent,
+        );
         Ok(())
     })
 }
@@ -1107,9 +1331,7 @@ pub(crate) fn unmount_at(
             })
         } else {
             mounts.iter().rposition(|mount| {
-                mount.namespace_id == namespace_id
-                    && mount.target == target
-                    && mount.target_path == target_path
+                mount.namespace_id == namespace_id && mount.target_path == target_path
             })
         };
         let index = index.ok_or(MountError::TargetNotMounted)?;
@@ -1310,13 +1532,13 @@ pub(crate) fn list_mounts(namespace_id: MountNamespaceId) -> Vec<MountInfo> {
         // lower layer becomes visible on the next /proc/mounts read.
         if dynamic_mounts[index + 1..]
             .iter()
-            .any(|later| later.target == mount.target)
+            .any(|later| later.target_path == mount.target_path)
         {
             continue;
         }
-        if let Some((_, fs_type, options)) = mount_metadata(mount.source_mount_id) {
+        if let Some((source, fs_type, options)) = mount_metadata(mount.source_mount_id) {
             infos.push(MountInfo {
-                source: mount.source_path.clone(),
+                source,
                 target: mount.target_path.clone(),
                 fs_type,
                 options,
