@@ -15,6 +15,8 @@ pub struct FileAttr {
     pub nlink: u64,
     /// Permission mode
     pub mode: u32,
+    /// Filesystem-specific inode flags
+    pub flags: u32,
     /// Type of file
     pub node_type: InodeType,
     /// User ID of owner
@@ -71,6 +73,15 @@ impl<Hal: SystemHal> InodeRef<Hal> {
     pub fn set_mode(&mut self, mode: u32) {
         unsafe {
             ext4_inode_set_mode(self.superblock_mut(), self.inner.inode, mode);
+            self.mark_dirty();
+        }
+    }
+    pub fn flags(&self) -> u32 {
+        unsafe { ext4_inode_get_flags(self.inner.inode) }
+    }
+    pub fn set_flags(&mut self, flags: u32) {
+        unsafe {
+            ext4_inode_set_flags(self.inner.inode, flags);
             self.mark_dirty();
         }
     }
@@ -136,6 +147,7 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         attr.ino = u32::from_le(self.inner.index);
         attr.nlink = self.nlink() as _;
         attr.mode = self.mode();
+        attr.flags = self.flags();
         attr.node_type = self.inode_type();
         attr.uid = self.uid() as _;
         attr.gid = self.gid() as _;

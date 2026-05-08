@@ -137,6 +137,13 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         self.inode_ref(ino)?.set_mode(mode);
         Ok(())
     }
+    pub fn inode_flags(&mut self, ino: u32) -> Ext4Result<u32> {
+        Ok(self.inode_ref(ino)?.flags())
+    }
+    pub fn set_inode_flags(&mut self, ino: u32, flags: u32) -> Ext4Result<()> {
+        self.inode_ref(ino)?.set_flags(flags);
+        Ok(())
+    }
     pub fn set_owner(&mut self, ino: u32, uid: u16, gid: u16) -> Ext4Result<()> {
         self.inode_ref(ino)?.set_owner(uid, gid);
         Ok(())

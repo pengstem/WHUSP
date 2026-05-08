@@ -291,6 +291,14 @@ impl FileSystemBackend for Ext4Mount {
         self.fs.set_mode(ino, mode).map_err(map_ext4_error)
     }
 
+    fn inode_flags(&mut self, ino: u32) -> FsResult<u32> {
+        self.fs.inode_flags(ino).map_err(map_ext4_error)
+    }
+
+    fn set_inode_flags(&mut self, ino: u32, flags: u32) -> FsResult {
+        self.fs.set_inode_flags(ino, flags).map_err(map_ext4_error)
+    }
+
     fn set_owner(&mut self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
         let stat = self.stat(ino)?;
         let uid = uid.unwrap_or(stat.uid);

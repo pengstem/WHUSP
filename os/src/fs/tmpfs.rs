@@ -1,4 +1,4 @@
-use super::dirent::{write_dir_entries, RawDirEntry, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG};
+use super::dirent::{DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, RawDirEntry, write_dir_entries};
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
 use super::{FileStat, FileTimestamp, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG};
 use alloc::collections::BTreeMap;
@@ -15,6 +15,7 @@ struct TmpfsInode {
     uid: u32,
     gid: u32,
     nlink: u32,
+    flags: u32,
     open_count: usize,
     pending_delete: bool,
     size: u64,
@@ -42,6 +43,7 @@ impl TmpfsInode {
             uid: 0,
             gid: 0,
             nlink,
+            flags: 0,
             open_count: 0,
             pending_delete: false,
             size: 0,
@@ -544,6 +546,17 @@ impl FileSystemBackend for TmpFs {
         if let Some(gid) = gid {
             inode.gid = gid;
         }
+        inode.ctime = FileTimestamp::now();
+        Ok(())
+    }
+
+    fn inode_flags(&mut self, ino: u32) -> FsResult<u32> {
+        Ok(self.inode(ino)?.flags)
+    }
+
+    fn set_inode_flags(&mut self, ino: u32, flags: u32) -> FsResult {
+        let inode = self.inode_mut(ino)?;
+        inode.flags = flags;
         inode.ctime = FileTimestamp::now();
         Ok(())
     }

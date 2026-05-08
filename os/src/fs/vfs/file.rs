@@ -1,12 +1,12 @@
 use super::super::devfs;
-use super::super::inode::{link_node_in, OpenFlags};
+use super::super::inode::{OpenFlags, link_node_in};
 use super::super::mount::{mount_supports_page_cache, release_inode_from_drop, with_mount};
 use super::super::path::{PathContext, WorkingDir};
 use super::super::status_flags::StatusFlagsCell;
-use super::super::{File, FileStat, FileTimestamp, SeekWhence};
+use super::super::{FS_APPEND_FL, FS_IMMUTABLE_FL, File, FileStat, FileTimestamp, SeekWhence};
 use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
-use crate::mm::{page_cache::PageCacheId, UserBuffer};
+use crate::mm::{UserBuffer, page_cache::PageCacheId};
 use crate::sync::SleepMutex;
 use alloc::format;
 use alloc::sync::Arc;
@@ -550,6 +550,7 @@ impl File for VfsFile {
         if !self.writable {
             return Err(FsError::PermissionDenied);
         }
+        self.check_set_len(len)?;
         with_mount(self.node.mount_id, |mount| {
             mount.set_len(self.node.ino, len as u64)
         })
@@ -640,6 +641,45 @@ impl File for VfsFile {
             mount.set_owner(self.node.ino, uid, gid)
         })
         .ok_or(FsError::Io)?
+    }
+
+    fn inode_flags(&self) -> FsResult<u32> {
+        with_mount(self.node.mount_id, |mount| mount.inode_flags(self.node.ino))
+            .ok_or(FsError::Io)?
+    }
+
+    fn set_inode_flags(&self, flags: u32) -> FsResult {
+        with_mount(self.node.mount_id, |mount| {
+            mount.set_inode_flags(self.node.ino, flags)
+        })
+        .ok_or(FsError::Io)?
+    }
+
+    fn check_write(&self, _len: usize, append: bool) -> FsResult {
+        let flags = self.inode_flags()?;
+        if flags & FS_IMMUTABLE_FL != 0 {
+            return Err(FsError::PermissionDenied);
+        }
+        if flags & FS_APPEND_FL != 0 && !append {
+            return Err(FsError::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    fn check_write_at(&self, _offset: usize, _len: usize) -> FsResult {
+        let flags = self.inode_flags()?;
+        if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
+            return Err(FsError::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    fn check_set_len(&self, _len: usize) -> FsResult {
+        let flags = self.inode_flags()?;
+        if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
+            return Err(FsError::PermissionDenied);
+        }
+        Ok(())
     }
 
     fn working_dir(&self) -> Option<WorkingDir> {

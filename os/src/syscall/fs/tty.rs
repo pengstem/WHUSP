@@ -12,6 +12,10 @@ const LOOP_SET_STATUS: usize = 0x4c02;
 const LOOP_GET_STATUS: usize = 0x4c03;
 const LOOP_CTL_GET_FREE: usize = 0x4c82;
 const BLKGETSIZE64: usize = 0x8008_1272;
+const FS_IOC_GETFLAGS: usize = 0x8008_6601;
+const FS_IOC_SETFLAGS: usize = 0x4008_6602;
+const FS_IOC32_GETFLAGS: usize = 0x8004_6601;
+const FS_IOC32_SETFLAGS: usize = 0x4004_6602;
 const TCGETS: usize = 0x5401;
 const TCSETS: usize = 0x5402;
 const TCSETSW: usize = 0x5403;
@@ -199,6 +203,22 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
         return Ok(0);
     }
 
+    match request {
+        FS_IOC_GETFLAGS | FS_IOC32_GETFLAGS => {
+            let flags = file.inode_flags().map_err(fs_flag_ioctl_error)? as i32;
+            let token = current_user_token();
+            write_user_value(token, argp as *mut i32, &flags)?;
+            return Ok(0);
+        }
+        FS_IOC_SETFLAGS | FS_IOC32_SETFLAGS => {
+            let token = current_user_token();
+            let flags = read_user_value(token, argp as *const i32)? as u32;
+            file.set_inode_flags(flags).map_err(fs_flag_ioctl_error)?;
+            return Ok(0);
+        }
+        _ => {}
+    }
+
     if !file.is_tty() {
         return Err(SysError::ENOTTY);
     }
@@ -223,6 +243,13 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
             Ok(0)
         }
         _ => Err(SysError::ENOTTY),
+    }
+}
+
+fn fs_flag_ioctl_error(error: crate::fs::FsError) -> SysError {
+    match error {
+        crate::fs::FsError::Unsupported => SysError::ENOTTY,
+        _ => error.into(),
     }
 }
 

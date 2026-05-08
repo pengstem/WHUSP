@@ -30,6 +30,8 @@ pub const S_IFREG: u32 = 0o100000;
 pub const S_IFLNK: u32 = 0o120000;
 pub const S_IFSOCK: u32 = 0o140000;
 pub const S_IFMT: u32 = 0o170000;
+pub const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
+pub const FS_APPEND_FL: u32 = 0x0000_0020;
 
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,6 +193,12 @@ pub trait File: Send + Sync {
         Err(FsError::Unsupported)
     }
     fn set_owner(&self, _uid: Option<u32>, _gid: Option<u32>) -> FsResult {
+        Err(FsError::Unsupported)
+    }
+    fn inode_flags(&self) -> FsResult<u32> {
+        Err(FsError::Unsupported)
+    }
+    fn set_inode_flags(&self, _flags: u32) -> FsResult {
         Err(FsError::Unsupported)
     }
     fn working_dir(&self) -> Option<WorkingDir> {

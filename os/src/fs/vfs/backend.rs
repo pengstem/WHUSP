@@ -89,6 +89,12 @@ pub(crate) trait FileSystemBackend: Send {
     fn set_owner(&mut self, _ino: u32, _uid: Option<u32>, _gid: Option<u32>) -> FsResult {
         Err(FsError::Unsupported)
     }
+    fn inode_flags(&mut self, _ino: u32) -> FsResult<u32> {
+        Err(FsError::Unsupported)
+    }
+    fn set_inode_flags(&mut self, _ino: u32, _flags: u32) -> FsResult {
+        Err(FsError::Unsupported)
+    }
     fn retain_inode(&mut self, ino: u32) -> FsResult {
         self.stat(ino).map(|_| ())
     }
