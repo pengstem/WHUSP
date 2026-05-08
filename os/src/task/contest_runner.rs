@@ -81,6 +81,7 @@ const LTP_BLACKLIST_PATTERNS: &[&str] = &[
     "doio",
     "ebizzy",
     "eject*",
+    "event_generator",
     "epoll_pwait01",
     "fanotify13",
     "fanout01",
