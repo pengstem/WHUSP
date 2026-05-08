@@ -273,13 +273,13 @@ pub(crate) use devfs::{
 };
 pub use inode::OpenFlags;
 pub(crate) use inode::{
-    create_node_in, link_file_in, lookup_mount_target_dir_in, mkdir_in, rename_in, rmdir_in,
-    symlink_in, unlink_file_in,
+    create_node_in, link_file_in, lookup_existing_dir_in, lookup_mount_target_dir_in, mkdir_in,
+    rename_in, rmdir_in, symlink_in, unlink_file_in,
 };
 pub(crate) use memfd::make_memfd;
 pub(crate) use mount::{
-    MountError, MountId, mount_block_device_at, mount_fat_device_at, mount_is_read_only,
-    mount_tmpfs_at, remount_at, statfs_for_mount, unmount_at,
+    MountError, MountId, mount_bind_at, mount_block_device_at, mount_fat_device_at,
+    mount_is_read_only, mount_tmpfs_at, remount_at, statfs_for_mount, unmount_at,
 };
 pub(crate) use path::{PathContext, WorkingDir, normalize_path_at_root, path_inside_root};
 pub(crate) use pipe::default_pipe_capacity_for_current_process;

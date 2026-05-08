@@ -23,7 +23,10 @@ struct DynamicMount {
     target: VfsNodeId,
     covered_parent: VfsNodeId,
     source_mount_id: MountId,
+    source_root: VfsNodeId,
+    source_path: String,
     target_path: String,
+    is_bind: bool,
 }
 
 struct MountedFs {
@@ -274,26 +277,26 @@ fn primary_root_ino() -> u32 {
     root_ino_for(primary_mount_id()).unwrap_or(2)
 }
 
-pub(super) fn mounted_root_for(target: VfsNodeId) -> Option<MountId> {
+pub(super) fn mounted_root_for(target: VfsNodeId) -> Option<VfsNodeId> {
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         mounts
             .iter()
             .rev()
             .find(|mount| mount.target == target)
-            .map(|mount| mount.source_mount_id)
+            .map(|mount| mount.source_root)
     })
 }
 
-pub(super) fn mounted_root_parent(source_mount_id: MountId) -> Option<VfsNodeId> {
+pub(super) fn mounted_root_parent(source_root: VfsNodeId) -> Option<VfsNodeId> {
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
-        // UNFINISHED: MountId currently names one opened block-device
-        // filesystem, not a distinct mount instance. If the same source is
-        // mounted at multiple targets, `..` from that source root follows the
-        // newest dynamic mount instead of a per-mount parent reference.
+        // UNFINISHED: VfsNodeId currently names the mounted source node, not a
+        // distinct mount instance. If the same source is mounted at multiple
+        // targets, `..` from that source root follows the newest dynamic mount
+        // instead of a per-mount parent reference.
         mounts
             .iter()
             .rev()
-            .find(|mount| mount.source_mount_id == source_mount_id)
+            .find(|mount| mount.source_root == source_root)
             .map(|mount| mount.covered_parent)
     })
 }
@@ -334,6 +337,11 @@ pub(crate) fn mount_block_device_at(
     let covered_parent = lookup_covered_parent(target)?;
     let target_path = resolve_mount_path(target, target_path);
     ensure_mount_open(source_mount_id)?;
+    let source_root = VfsNodeId::new(
+        source_mount_id,
+        root_ino_for(source_mount_id).ok_or(MountError::SourceMissing)?,
+    );
+    let source_path = block_source_name(device_index);
 
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         if mounts.iter().any(|mount| mount.target == target) {
@@ -343,7 +351,10 @@ pub(crate) fn mount_block_device_at(
             target,
             covered_parent,
             source_mount_id,
+            source_root,
+            source_path,
             target_path,
+            is_bind: false,
         });
         Ok(())
     })
@@ -434,7 +445,12 @@ fn mount_new_fs_at(
 
     let covered_parent = lookup_covered_parent(target)?;
     let target_path = resolve_mount_path(target, target_path);
+    let source_path = mounted.source.clone();
     let source_mount_id = register_mount(mounted);
+    let source_root = VfsNodeId::new(
+        source_mount_id,
+        root_ino_for(source_mount_id).ok_or(MountError::SourceMissing)?,
+    );
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         if mounts.iter().any(|mount| mount.target == target) {
             return Err(MountError::TargetBusy);
@@ -443,7 +459,10 @@ fn mount_new_fs_at(
             target,
             covered_parent,
             source_mount_id,
+            source_root,
+            source_path,
             target_path,
+            is_bind: false,
         });
         Ok(source_mount_id)
     })
@@ -479,6 +498,11 @@ pub(crate) fn mount_pseudo_fs_at_with_options(
     let covered_parent = lookup_covered_parent(target)?;
     let target_path = resolve_mount_path(target, target_path);
     let source_mount_id = register_mount(MountedFs::new(backend, fs_type.into(), fs_type, options));
+    let source_root = VfsNodeId::new(
+        source_mount_id,
+        root_ino_for(source_mount_id).ok_or(MountError::SourceMissing)?,
+    );
+    let source_path = fs_type.into();
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         if mounts.iter().any(|mount| mount.target == target) {
             return Err(MountError::TargetBusy);
@@ -487,9 +511,41 @@ pub(crate) fn mount_pseudo_fs_at_with_options(
             target,
             covered_parent,
             source_mount_id,
+            source_root,
+            source_path,
             target_path,
+            is_bind: false,
         });
         Ok(source_mount_id)
+    })
+}
+
+pub(crate) fn mount_bind_at(
+    source: WorkingDir,
+    target: WorkingDir,
+    source_path: &str,
+    target_path: &str,
+) -> Result<(), MountError> {
+    let source_root = VfsNodeId::new(source.mount_id(), source.ino());
+    let target = VfsNodeId::new(target.mount_id(), target.ino());
+    if root_ino_for(target.mount_id).is_some_and(|root_ino| target.ino == root_ino) {
+        return Err(MountError::StaticRoot);
+    }
+
+    let covered_parent = lookup_covered_parent(target)?;
+    let source_path = resolve_mount_path(source_root, source_path);
+    let target_path = resolve_mount_path(target, target_path);
+    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        mounts.push(DynamicMount {
+            target,
+            covered_parent,
+            source_mount_id: source_root.mount_id,
+            source_root,
+            source_path,
+            target_path,
+            is_bind: true,
+        });
+        Ok(())
     })
 }
 
@@ -550,15 +606,13 @@ pub(crate) fn unmount_at(target: WorkingDir) -> Result<(), MountError> {
     }
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         let index = if target_is_root {
-            mounts
-                .iter()
-                .rposition(|mount| mount.source_mount_id == target.mount_id)
+            mounts.iter().rposition(|mount| mount.source_root == target)
         } else {
             mounts.iter().rposition(|mount| mount.target == target)
         };
         let index = index.ok_or(MountError::TargetNotMounted)?;
         let source_mount_id = mounts[index].source_mount_id;
-        if any_process_references_mount(source_mount_id) {
+        if !mounts[index].is_bind && any_process_references_mount(source_mount_id) {
             return Err(MountError::TargetBusy);
         }
         mounts.remove(index);
@@ -722,11 +776,21 @@ pub(crate) fn list_mounts() -> Vec<MountInfo> {
     }
 
     let dynamic_mounts = DYNAMIC_MOUNTS.exclusive_session(|mounts| mounts.clone());
-    for mount in dynamic_mounts {
-        if let Some((source, fs_type, options)) = mount_metadata(mount.source_mount_id) {
+    for (index, mount) in dynamic_mounts.iter().enumerate() {
+        // CONTEXT: BusyBox umount consults /proc/mounts and will issue one
+        // umount2 call for each visible duplicate target. For stacked bind
+        // mounts, expose only the current top layer; once it is unmounted, the
+        // lower layer becomes visible on the next /proc/mounts read.
+        if dynamic_mounts[index + 1..]
+            .iter()
+            .any(|later| later.target == mount.target)
+        {
+            continue;
+        }
+        if let Some((_, fs_type, options)) = mount_metadata(mount.source_mount_id) {
             infos.push(MountInfo {
-                source,
-                target: mount.target_path,
+                source: mount.source_path.clone(),
+                target: mount.target_path.clone(),
                 fs_type,
                 options,
             });

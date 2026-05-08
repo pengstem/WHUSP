@@ -12,4 +12,6 @@ pub(crate) use file::{
     truncate_in,
 };
 pub(crate) use node::VfsNodeId;
-pub(crate) use path::{VfsPath, resolve_create_parent_in, resolve_mount_target_in};
+pub(crate) use path::{
+    LookupMode, VfsPath, resolve_create_parent_in, resolve_existing_in, resolve_mount_target_in,
+};

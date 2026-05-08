@@ -1,6 +1,7 @@
 use crate::fs::{
-    MountError, lookup_mount_target_dir_in, loop_device_is_attached, mount_block_device_at,
-    mount_fat_device_at, mount_tmpfs_at, normalize_path_at_root, remount_at, unmount_at,
+    MountError, lookup_existing_dir_in, lookup_mount_target_dir_in, loop_device_is_attached,
+    mount_bind_at, mount_block_device_at, mount_fat_device_at, mount_tmpfs_at,
+    normalize_path_at_root, remount_at, unmount_at,
 };
 use crate::task::{current_process, current_user_token};
 
@@ -9,6 +10,16 @@ use super::super::user_ptr::{PATH_MAX, read_user_c_string};
 
 const MS_RDONLY: usize = 1;
 const MS_REMOUNT: usize = 32;
+const MS_BIND: usize = 4096;
+const MS_MOVE: usize = 8192;
+const MS_REC: usize = 16384;
+const MS_SILENT: usize = 32768;
+const MS_UNBINDABLE: usize = 1 << 17;
+const MS_PRIVATE: usize = 1 << 18;
+const MS_SLAVE: usize = 1 << 19;
+const MS_SHARED: usize = 1 << 20;
+const MS_PROPAGATION_MASK: usize = MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED;
+const MS_PROPAGATION_ALLOWED_EXTRAS: usize = MS_REC | MS_SILENT;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct VirtioBlockSource {
@@ -65,21 +76,60 @@ pub fn sys_mount(
 ) -> SysResult {
     let token = current_user_token();
     let target = read_user_c_string(token, target, PATH_MAX)?;
-    let fstype = read_user_c_string(token, fstype, PATH_MAX)?;
     let read_only = flags & MS_RDONLY != 0;
     let process = current_process();
     let snapshot = process.path_snapshot();
     let target_dir = lookup_mount_target_dir_in(snapshot.context, target.as_str())?;
-    if flags & MS_REMOUNT != 0 {
-        remount_at(target_dir, read_only).map_err(mount_error_to_errno)?;
-        return Ok(0);
-    }
     let target_path = normalize_path_at_root(
         snapshot.root_path.as_str(),
         snapshot.cwd_path.as_str(),
         target.as_str(),
     )
     .ok_or(SysError::ENOENT)?;
+
+    let propagation_flags = flags & MS_PROPAGATION_MASK;
+    if propagation_flags != 0 {
+        if propagation_flags.count_ones() != 1
+            || flags & !(MS_PROPAGATION_MASK | MS_PROPAGATION_ALLOWED_EXTRAS) != 0
+        {
+            return Err(SysError::EINVAL);
+        }
+        // CONTEXT: BusyBox and LTP use mount propagation changes while setting
+        // up bind-mount cases. This kernel has no mount-namespace propagation
+        // model yet, so these mode changes are accepted as no-ops.
+        return Ok(0);
+    }
+
+    if flags & MS_MOVE != 0 {
+        // UNFINISHED: Linux MS_MOVE moves an existing mount tree. The current
+        // VFS only supports adding and removing dynamic mount records.
+        return Err(SysError::ENOTSUP);
+    }
+
+    if flags & MS_BIND != 0 {
+        let source = read_user_c_string(token, source, PATH_MAX)?;
+        let source_dir = lookup_existing_dir_in(snapshot.context, source.as_str())?;
+        let source_path = normalize_path_at_root(
+            snapshot.root_path.as_str(),
+            snapshot.cwd_path.as_str(),
+            source.as_str(),
+        )
+        .ok_or(SysError::ENOENT)?;
+        mount_bind_at(
+            source_dir,
+            target_dir,
+            source_path.as_str(),
+            target_path.as_str(),
+        )
+        .map_err(mount_error_to_errno)?;
+        return Ok(0);
+    }
+
+    if flags & MS_REMOUNT != 0 {
+        remount_at(target_dir, read_only).map_err(mount_error_to_errno)?;
+        return Ok(0);
+    }
+    let fstype = read_user_c_string(token, fstype, PATH_MAX)?;
     match fstype.as_str() {
         "ext4" => {
             let source = read_user_c_string(token, source, PATH_MAX)?;

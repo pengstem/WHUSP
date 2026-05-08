@@ -202,15 +202,17 @@ const LTP_MUSL_BLACKLIST_PATTERNS: &[&str] = &[
 ];
 
 // None runs all non-blacklisted cases. Some("a")..Some("z") narrows by
-// leading letter, Some("long") runs names outside the ASCII alphabet, and
-// Some("case:<name>") runs one exact LTP case.
-const LTP_CASE_FILTER_OPTION: Option<&str> = Some("f");
+// leading letter, Some("long") runs names outside the ASCII alphabet,
+// Some("case:<name>") runs one exact LTP case, and Some("prefix:<name>")
+// runs cases whose names start with the prefix.
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some("prefix:fs_bind");
 
 enum LtpCaseFilter {
     All,
     Letter(u8),
     Long,
     Exact(&'static str),
+    Prefix(&'static str),
     Invalid,
 }
 
@@ -284,10 +286,13 @@ fn append_normal_script(command: &mut String, libc_root: &str, script: &str) {
 fn append_ltp_runner(command: &mut String, libc_root: &str) {
     command.push_str("cd ");
     command.push_str(libc_root);
+    // CONTEXT: The fs_bind-focused runner is bounded by the outer QEMU
+    // timeout. LA BusyBox ash currently loses the caller-local timeout value in
+    // LTP's shell helper, so disable LTP's per-case shell timer for this pass.
     command.push_str(" && { export LTPROOT=\"");
     command.push_str(libc_root);
     command.push_str(
-        "/ltp\"; export TMPBASE=\"/tmp\"; export PATH=\"$PATH:$LTPROOT/testcases/bin:$LTPROOT/bin\"; ./busybox echo \"#### OS COMP TEST GROUP START ltp-",
+        "/ltp\"; export TMPBASE=\"/tmp\"; export TST_TIMEOUT=\"-1\"; export PATH=\"$PATH:$LTPROOT/testcases/bin:$LTPROOT/bin\"; ./busybox echo \"#### OS COMP TEST GROUP START ltp-",
     );
     command.push_str(libc_label(libc_root));
     command.push_str(" ####\"; cd \"$LTPROOT/testcases/bin\"; for file in *; do [ -f \"$file\" ] || continue; case_name=${file##*/}; ");
@@ -318,6 +323,11 @@ fn append_ltp_case_filter(command: &mut String) {
             command.push_str(case_name);
             command.push_str(") ;; *) continue ;; esac; ");
         }
+        LtpCaseFilter::Prefix(prefix) => {
+            command.push_str("case \"$case_name\" in ");
+            command.push_str(prefix);
+            command.push_str("*) ;; *) continue ;; esac; ");
+        }
         LtpCaseFilter::Invalid => {
             command.push_str("./busybox echo \"INVALID LTP_CASE_FILTER_OPTION\"; break; ");
         }
@@ -332,6 +342,14 @@ fn ltp_case_filter() -> LtpCaseFilter {
             let case_name = &option["case:".len()..];
             if is_ltp_case_name(case_name) {
                 LtpCaseFilter::Exact(case_name)
+            } else {
+                LtpCaseFilter::Invalid
+            }
+        }
+        Some(option) if option.starts_with("prefix:") => {
+            let prefix = &option["prefix:".len()..];
+            if is_ltp_case_name(prefix) {
+                LtpCaseFilter::Prefix(prefix)
             } else {
                 LtpCaseFilter::Invalid
             }

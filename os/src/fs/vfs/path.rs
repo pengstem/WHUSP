@@ -90,9 +90,9 @@ fn follow_mounted_root(cursor: VfsCursor) -> VfsCursor {
     if cursor.kind != FsNodeKind::Directory {
         return cursor;
     }
-    if let Some(mount_id) = mounted_root_for(cursor.node) {
+    if let Some(node) = mounted_root_for(cursor.node) {
         return VfsCursor {
-            node: VfsNodeId::new(mount_id, root_ino_for(mount_id).unwrap_or(2)),
+            node,
             kind: FsNodeKind::Directory,
         };
     }
@@ -122,7 +122,7 @@ fn lookup_parent(cursor: VfsCursor) -> FsResult<VfsCursor> {
         if cursor.node.mount_id == primary_mount_id() {
             return Ok(VfsCursor::root(PathContext::global_root()));
         }
-        if let Some(parent) = mounted_root_parent(cursor.node.mount_id) {
+        if let Some(parent) = mounted_root_parent(cursor.node) {
             return Ok(VfsCursor {
                 node: parent,
                 kind: FsNodeKind::Directory,

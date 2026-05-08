@@ -1,7 +1,8 @@
 use super::mount::{mounted_root_for, with_mount};
 use super::path::{PathContext, WorkingDir};
 use super::vfs::{
-    FsError, FsNodeKind, FsResult, VfsNodeId, resolve_create_parent_in, resolve_mount_target_in,
+    FsError, FsNodeKind, FsResult, LookupMode, VfsNodeId, resolve_create_parent_in,
+    resolve_existing_in, resolve_mount_target_in,
 };
 use bitflags::*;
 use lwext4_rust::ffi::EXT4_ROOT_INO;
@@ -156,6 +157,14 @@ fn is_descendant_or_self(mut node: VfsNodeId, ancestor: VfsNodeId) -> FsResult<b
 
 pub(crate) fn lookup_mount_target_dir_in(context: PathContext, name: &str) -> FsResult<WorkingDir> {
     let file = resolve_mount_target_in(context, name)?;
+    if file.kind != FsNodeKind::Directory {
+        return Err(FsError::NotDir);
+    }
+    Ok(WorkingDir::new(file.node.mount_id, file.node.ino))
+}
+
+pub(crate) fn lookup_existing_dir_in(context: PathContext, name: &str) -> FsResult<WorkingDir> {
+    let file = resolve_existing_in(context, name, LookupMode::FollowFinal)?;
     if file.kind != FsNodeKind::Directory {
         return Err(FsError::NotDir);
     }
