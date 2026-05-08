@@ -258,6 +258,8 @@ pub fn list_apps() {
 }
 
 pub(crate) use devfs::{
+    attach_loop_device, detach_loop_device, devfs_loop_device_id, find_free_loop_device,
+    is_devfs_loop_control, loop_device_is_attached, loop_device_size,
     open_child as open_devfs_child, open_misc_child as open_devfs_misc_child,
     stat_child as stat_devfs_child, stat_misc_child as stat_devfs_misc_child,
 };

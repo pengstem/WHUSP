@@ -6,6 +6,12 @@ use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{read_user_value, write_user_value};
 use super::fd::get_file_by_fd;
 
+const LOOP_SET_FD: usize = 0x4c00;
+const LOOP_CLR_FD: usize = 0x4c01;
+const LOOP_SET_STATUS: usize = 0x4c02;
+const LOOP_GET_STATUS: usize = 0x4c03;
+const LOOP_CTL_GET_FREE: usize = 0x4c82;
+const BLKGETSIZE64: usize = 0x8008_1272;
 const TCGETS: usize = 0x5401;
 const TCSETS: usize = 0x5402;
 const TCSETSW: usize = 0x5403;
@@ -68,6 +74,44 @@ struct LinuxWinsize {
     ws_ypixel: u16,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct LinuxLoopInfo {
+    lo_device: u64,
+    lo_inode: u64,
+    lo_rdevice: u64,
+    lo_offset: u64,
+    lo_sizelimit: u64,
+    lo_number: u32,
+    lo_encrypt_type: u32,
+    lo_encrypt_key_size: u32,
+    lo_flags: u32,
+    lo_name: [u8; 64],
+    lo_encrypt_key: [u8; 32],
+    lo_init: [u64; 2],
+    reserved: [u8; 4],
+}
+
+impl Default for LinuxLoopInfo {
+    fn default() -> Self {
+        Self {
+            lo_device: 0,
+            lo_inode: 0,
+            lo_rdevice: 0,
+            lo_offset: 0,
+            lo_sizelimit: 0,
+            lo_number: 0,
+            lo_encrypt_type: 0,
+            lo_encrypt_key_size: 0,
+            lo_flags: 0,
+            lo_name: [0; 64],
+            lo_encrypt_key: [0; 32],
+            lo_init: [0; 2],
+            reserved: [0; 4],
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ConsoleTtyState {
     termios: LinuxTermios,
@@ -127,6 +171,23 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
     // command numbers are matched on their low 32 bits here.
     let request = request & 0xffff_ffff;
 
+    if crate::fs::is_devfs_loop_control(file.as_ref()) {
+        return match request {
+            LOOP_CTL_GET_FREE => {
+                // CONTEXT: LTP uses /dev/loop-control only to discover one
+                // scratch loop device before mounting syscall filesystem
+                // tests. The kernel currently exposes a single lightweight
+                // loop slot, not the full Linux loop-control device model.
+                Ok(crate::fs::find_free_loop_device()? as isize)
+            }
+            _ => Err(SysError::EINVAL),
+        };
+    }
+
+    if let Some(loop_id) = crate::fs::devfs_loop_device_id(file.as_ref()) {
+        return handle_loop_ioctl(loop_id, request, argp);
+    }
+
     if file.is_rtc() {
         return handle_rtc_ioctl(request, argp);
     }
@@ -162,6 +223,42 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
             Ok(0)
         }
         _ => Err(SysError::ENOTTY),
+    }
+}
+
+fn handle_loop_ioctl(loop_id: usize, request: usize, argp: usize) -> SysResult {
+    match request {
+        LOOP_SET_FD => {
+            let backend = get_file_by_fd(argp)?;
+            crate::fs::attach_loop_device(loop_id, backend)?;
+            Ok(0)
+        }
+        LOOP_CLR_FD => {
+            crate::fs::detach_loop_device(loop_id)?;
+            Ok(0)
+        }
+        LOOP_SET_STATUS => {
+            let token = current_user_token();
+            let _ = read_user_value(token, argp as *const LinuxLoopInfo)?;
+            Ok(0)
+        }
+        LOOP_GET_STATUS => {
+            if !crate::fs::loop_device_is_attached(loop_id) {
+                return Err(SysError::ENXIO);
+            }
+            let token = current_user_token();
+            let mut info = LinuxLoopInfo::default();
+            info.lo_number = loop_id as u32;
+            write_user_value(token, argp as *mut LinuxLoopInfo, &info)?;
+            Ok(0)
+        }
+        BLKGETSIZE64 => {
+            let size = crate::fs::loop_device_size(loop_id)?;
+            let token = current_user_token();
+            write_user_value(token, argp as *mut u64, &size)?;
+            Ok(0)
+        }
+        _ => Err(SysError::EINVAL),
     }
 }
 

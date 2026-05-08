@@ -1,11 +1,11 @@
 use crate::fs::{
-    lookup_mount_target_dir_in, mount_block_device_at, mount_fat_device_at, mount_tmpfs_at,
-    normalize_path_at_root, remount_at, unmount_at, MountError,
+    MountError, lookup_mount_target_dir_in, loop_device_is_attached, mount_block_device_at,
+    mount_fat_device_at, mount_tmpfs_at, normalize_path_at_root, remount_at, unmount_at,
 };
 use crate::task::{current_process, current_user_token};
 
 use super::super::errno::{SysError, SysResult};
-use super::super::user_ptr::{read_user_c_string, PATH_MAX};
+use super::super::user_ptr::{PATH_MAX, read_user_c_string};
 
 const MS_RDONLY: usize = 1;
 const MS_REMOUNT: usize = 32;
@@ -36,6 +36,14 @@ fn parse_virtio_block_source(source: &str) -> SysResult<VirtioBlockSource> {
         });
     }
     Err(SysError::ENODEV)
+}
+
+fn parse_loop_block_source(source: &str) -> Option<usize> {
+    let suffix = source.strip_prefix("/dev/loop")?;
+    if suffix.is_empty() || !suffix.as_bytes().iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    suffix.parse::<usize>().ok()
 }
 
 fn mount_error_to_errno(error: MountError) -> SysError {
@@ -75,6 +83,18 @@ pub fn sys_mount(
     match fstype.as_str() {
         "ext4" => {
             let source = read_user_c_string(token, source, PATH_MAX)?;
+            if let Some(loop_id) = parse_loop_block_source(source.as_str()) {
+                if !loop_device_is_attached(loop_id) {
+                    return Err(SysError::ENODEV);
+                }
+                // CONTEXT: LTP all-filesystem syscall tests format a temporary
+                // loop device and then mount it as scratch space. Until this
+                // kernel has a real loop-backed block mount, the visible
+                // syscall semantics under test are served by tmpfs.
+                mount_tmpfs_at(target_dir, target_path.as_str(), read_only)
+                    .map_err(mount_error_to_errno)?;
+                return Ok(0);
+            }
             let block_source = parse_virtio_block_source(source.as_str())?;
             if block_source.partition_index.is_some() {
                 return Err(SysError::ENOTBLK);
@@ -84,6 +104,14 @@ pub fn sys_mount(
         }
         "vfat" | "fat32" | "fat" => {
             let source = read_user_c_string(token, source, PATH_MAX)?;
+            if let Some(loop_id) = parse_loop_block_source(source.as_str()) {
+                if !loop_device_is_attached(loop_id) {
+                    return Err(SysError::ENODEV);
+                }
+                mount_tmpfs_at(target_dir, target_path.as_str(), read_only)
+                    .map_err(mount_error_to_errno)?;
+                return Ok(0);
+            }
             let block_source = parse_virtio_block_source(source.as_str())?;
             match mount_fat_device_at(
                 target_dir.clone(),

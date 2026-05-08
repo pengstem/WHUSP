@@ -582,7 +582,16 @@ pub fn sys_chdir(path: *const u8) -> SysResult {
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
     let snapshot = process.path_snapshot();
+    let credentials = process.credentials();
+    let subject = AccessSubject {
+        uid: credentials.fsuid,
+        gid: credentials.fsgid,
+        groups: &credentials.groups,
+    };
+    check_access_path_prefixes_from(&snapshot, AT_FDCWD, path.as_str(), subject)?;
     let next_cwd = lookup_dir_in(snapshot.context, path.as_str())?;
+    let stat = resolve_stat_from(&snapshot, AT_FDCWD, path.as_str(), true)?;
+    check_access_mode(&stat, X_OK, subject)?;
     let Some(next_path) = process_global_path_for(&snapshot, path.as_str()) else {
         return Err(SysError::ENOENT);
     };

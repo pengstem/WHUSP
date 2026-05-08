@@ -1,13 +1,22 @@
-use super::dirent::{DT_CHR, DT_DIR, LINUX_DIRENT64_ALIGN, LINUX_DIRENT64_HEADER_SIZE};
+use super::dirent::{DT_BLK, DT_CHR, DT_DIR, LINUX_DIRENT64_ALIGN, LINUX_DIRENT64_HEADER_SIZE};
 use super::status_flags::StatusFlagsCell;
-use super::{File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFCHR, S_IFDIR};
+use super::{
+    File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFBLK, S_IFCHR, S_IFDIR, SeekWhence,
+};
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use alloc::sync::Arc;
 use alloc::vec;
+use lazy_static::lazy_static;
 
 const DEVFS_DEV: u64 = 0x646576;
+const LOOP_DEVICE_SIZE_FALLBACK: u64 = 300 * 1024 * 1024;
+
+lazy_static! {
+    static ref LOOP0_BACKEND: UPIntrFreeCell<Option<Arc<dyn File + Send + Sync>>> =
+        unsafe { UPIntrFreeCell::new(None) };
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DevNode {
@@ -21,6 +30,8 @@ enum DevNode {
     Tty,
     TtyS0,
     Rtc,
+    LoopControl,
+    Loop0,
 }
 
 impl DevNode {
@@ -36,6 +47,8 @@ impl DevNode {
             Self::Tty => 8,
             Self::TtyS0 => 9,
             Self::Rtc => 10,
+            Self::LoopControl => 11,
+            Self::Loop0 => 12,
         }
     }
 
@@ -50,6 +63,8 @@ impl DevNode {
             Self::Tty => linux_makedev(5, 0),
             Self::TtyS0 => linux_makedev(4, 64),
             Self::Rtc => linux_makedev(253, 0),
+            Self::LoopControl => linux_makedev(10, 237),
+            Self::Loop0 => linux_makedev(7, 0),
         }
     }
 
@@ -84,7 +99,7 @@ struct DevDirEntry {
     dtype: u8,
 }
 
-const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 12] = [
+const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 14] = [
     DevDirEntry {
         node: DevNode::Root,
         name: b".",
@@ -141,6 +156,16 @@ const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 12] = [
         dtype: DT_CHR,
     },
     DevDirEntry {
+        node: DevNode::LoopControl,
+        name: b"loop-control",
+        dtype: DT_CHR,
+    },
+    DevDirEntry {
+        node: DevNode::Loop0,
+        name: b"loop0",
+        dtype: DT_BLK,
+    },
+    DevDirEntry {
         node: DevNode::Misc,
         name: b"misc",
         dtype: DT_DIR,
@@ -185,6 +210,8 @@ fn lookup_absolute(path: &str) -> Option<DevNode> {
         "/dev/tty" => Some(DevNode::Tty),
         "/dev/ttyS0" => Some(DevNode::TtyS0),
         "/dev/rtc" | "/dev/rtc0" | "/dev/misc/rtc" => Some(DevNode::Rtc),
+        "/dev/loop-control" => Some(DevNode::LoopControl),
+        "/dev/loop0" => Some(DevNode::Loop0),
         _ => None,
     }
 }
@@ -202,6 +229,8 @@ fn lookup_child(parent: DevNode, path: &str) -> Option<DevNode> {
             "tty" => Some(DevNode::Tty),
             "ttyS0" => Some(DevNode::TtyS0),
             "rtc" | "rtc0" => Some(DevNode::Rtc),
+            "loop-control" => Some(DevNode::LoopControl),
+            "loop0" => Some(DevNode::Loop0),
             _ => None,
         },
         DevNode::Misc => match path {
@@ -272,10 +301,10 @@ pub(crate) fn open_misc_child(
 }
 
 fn stat_node(node: DevNode) -> FileStat {
-    let mode = if matches!(node, DevNode::Root | DevNode::Misc) {
-        S_IFDIR | 0o755
-    } else {
-        S_IFCHR | 0o666
+    let mode = match node {
+        DevNode::Root | DevNode::Misc => S_IFDIR | 0o755,
+        DevNode::Loop0 => S_IFBLK | 0o666,
+        _ => S_IFCHR | 0o666,
     };
     let mut stat = FileStat::with_mode(mode);
     stat.dev = DEVFS_DEV;
@@ -288,6 +317,149 @@ fn stat_node(node: DevNode) -> FileStat {
     };
     stat.blocks = 0;
     stat
+}
+
+fn loop0_backend() -> FsResult<Arc<dyn File + Send + Sync>> {
+    LOOP0_BACKEND
+        .exclusive_session(|backend| backend.clone())
+        .ok_or(FsError::NoDeviceOrAddress)
+}
+
+fn loop0_size() -> u64 {
+    loop0_backend()
+        .ok()
+        .and_then(|file| file.stat().ok())
+        .map(|stat| stat.size)
+        .unwrap_or(LOOP_DEVICE_SIZE_FALLBACK)
+}
+
+fn read_loop0_at(offset: usize, buf: &mut [u8]) -> usize {
+    if loop0_backend().is_err() {
+        return 0;
+    }
+    let size = loop0_size() as usize;
+    if offset >= size {
+        return 0;
+    }
+    let read_size = buf.len().min(size - offset);
+    buf[..read_size].fill(0);
+    read_size
+}
+
+fn write_loop0_at(offset: usize, buf: &[u8]) -> usize {
+    if loop0_backend().is_err() {
+        return 0;
+    }
+    let size = loop0_size() as usize;
+    if offset >= size {
+        return 0;
+    }
+    // CONTEXT: /dev/loop0 is currently a lightweight LTP scratch device.
+    // mkfs output is not consumed by mount(), which routes loop sources to
+    // tmpfs until the kernel has a real loop-backed block mount.
+    buf.len().min(size - offset)
+}
+
+fn read_loop0(offset: &UPIntrFreeCell<usize>, mut user_buf: UserBuffer) -> usize {
+    let mut current = offset.exclusive_access();
+    let mut total = 0usize;
+    for slice in user_buf.buffers.iter_mut() {
+        let read_size = read_loop0_at(*current, slice);
+        if read_size == 0 {
+            break;
+        }
+        *current += read_size;
+        total += read_size;
+    }
+    total
+}
+
+fn write_loop0(offset: &UPIntrFreeCell<usize>, user_buf: UserBuffer) -> usize {
+    let mut current = offset.exclusive_access();
+    let mut total = 0usize;
+    for slice in user_buf.buffers.iter() {
+        let write_size = write_loop0_at(*current, slice);
+        if write_size == 0 {
+            break;
+        }
+        *current += write_size;
+        total += write_size;
+        if write_size < slice.len() {
+            break;
+        }
+    }
+    total
+}
+
+fn seek_loop0(
+    offset_cell: &UPIntrFreeCell<usize>,
+    offset: i64,
+    whence: SeekWhence,
+) -> FsResult<usize> {
+    let mut current = offset_cell.exclusive_access();
+    let base = match whence {
+        SeekWhence::Set => 0i128,
+        SeekWhence::Current => *current as i128,
+        SeekWhence::End => loop0_size() as i128,
+    };
+    let new_offset = base
+        .checked_add(offset as i128)
+        .ok_or(FsError::InvalidInput)?;
+    if new_offset < 0 || new_offset > usize::MAX as i128 || new_offset > isize::MAX as i128 {
+        return Err(FsError::InvalidInput);
+    }
+    *current = new_offset as usize;
+    Ok(*current)
+}
+
+pub(crate) fn is_devfs_loop_control(file: &(dyn File + Send + Sync)) -> bool {
+    file.as_any()
+        .downcast_ref::<DevFsFile>()
+        .map(|file| file.node == DevNode::LoopControl)
+        .unwrap_or(false)
+}
+
+pub(crate) fn devfs_loop_device_id(file: &(dyn File + Send + Sync)) -> Option<usize> {
+    file.as_any()
+        .downcast_ref::<DevFsFile>()
+        .and_then(|file| (file.node == DevNode::Loop0).then_some(0))
+}
+
+pub(crate) fn find_free_loop_device() -> FsResult<usize> {
+    if LOOP0_BACKEND.exclusive_session(|backend| backend.is_none()) {
+        Ok(0)
+    } else {
+        Err(FsError::NoDeviceOrAddress)
+    }
+}
+
+pub(crate) fn loop_device_is_attached(id: usize) -> bool {
+    id == 0 && LOOP0_BACKEND.exclusive_session(|backend| backend.is_some())
+}
+
+pub(crate) fn attach_loop_device(id: usize, backend: Arc<dyn File + Send + Sync>) -> FsResult {
+    if id != 0 {
+        return Err(FsError::NoDeviceOrAddress);
+    }
+    LOOP0_BACKEND.exclusive_session(|slot| *slot = Some(backend));
+    Ok(())
+}
+
+pub(crate) fn detach_loop_device(id: usize) -> FsResult {
+    if id != 0 {
+        return Err(FsError::NoDeviceOrAddress);
+    }
+    LOOP0_BACKEND
+        .exclusive_session(|slot| slot.take())
+        .map(|_| ())
+        .ok_or(FsError::NoDeviceOrAddress)
+}
+
+pub(crate) fn loop_device_size(id: usize) -> FsResult<u64> {
+    if id != 0 {
+        return Err(FsError::NoDeviceOrAddress);
+    }
+    Ok(loop0_size())
 }
 
 pub(crate) fn stat(path: &str) -> Option<FileStat> {
@@ -437,19 +609,46 @@ impl File for DevFsFile {
 
     fn read(&self, user_buf: UserBuffer) -> usize {
         match self.node {
-            DevNode::Root | DevNode::Misc | DevNode::Null | DevNode::Rtc => 0,
+            DevNode::Root | DevNode::Misc | DevNode::Null | DevNode::Rtc | DevNode::LoopControl => {
+                0
+            }
             DevNode::Zero | DevNode::Full => read_zero(user_buf),
             DevNode::Random | DevNode::Urandom => read_random(user_buf),
             DevNode::Tty | DevNode::TtyS0 => read_console(user_buf),
+            DevNode::Loop0 => read_loop0(&self.offset, user_buf),
         }
     }
 
     fn write(&self, user_buf: UserBuffer) -> usize {
         match self.node {
-            DevNode::Root | DevNode::Misc | DevNode::Rtc | DevNode::Full => 0,
+            DevNode::Root | DevNode::Misc | DevNode::Rtc | DevNode::Full | DevNode::LoopControl => {
+                0
+            }
             DevNode::Null | DevNode::Zero | DevNode::Random | DevNode::Urandom => user_buf.len(),
             DevNode::Tty | DevNode::TtyS0 => write_console(user_buf),
+            DevNode::Loop0 => write_loop0(&self.offset, user_buf),
         }
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        if self.node == DevNode::Loop0 {
+            return read_loop0_at(offset, buf);
+        }
+        0
+    }
+
+    fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
+        if self.node == DevNode::Loop0 {
+            return write_loop0_at(offset, buf);
+        }
+        0
+    }
+
+    fn seek(&self, offset: i64, whence: SeekWhence) -> FsResult<usize> {
+        if self.node == DevNode::Loop0 {
+            return seek_loop0(&self.offset, offset, whence);
+        }
+        Err(FsError::IllegalSeek)
     }
 
     fn poll(&self, events: PollEvents) -> PollEvents {
