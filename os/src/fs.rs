@@ -3,6 +3,7 @@ mod dirent;
 mod ext4;
 mod fat;
 mod inode;
+mod memfd;
 mod mount;
 mod path;
 mod pipe;
@@ -15,6 +16,7 @@ mod tmpfs;
 mod vfs;
 
 use crate::mm::{UserBuffer, page_cache::PageCacheId};
+use alloc::sync::Arc;
 use bitflags::bitflags;
 use core::any::Any;
 
@@ -136,6 +138,35 @@ pub trait File: Send + Sync {
     fn set_len(&self, _len: usize) -> FsResult {
         Err(FsError::Unsupported)
     }
+    fn check_write(&self, _len: usize, _append: bool) -> FsResult {
+        Ok(())
+    }
+    fn check_write_at(&self, _offset: usize, _len: usize) -> FsResult {
+        Ok(())
+    }
+    fn check_set_len(&self, _len: usize) -> FsResult {
+        Ok(())
+    }
+    fn seals(&self) -> FsResult<u32> {
+        Err(FsError::InvalidInput)
+    }
+    fn add_seals(&self, _seals: u32) -> FsResult {
+        Err(FsError::InvalidInput)
+    }
+    fn reopen_from_proc_fd(
+        &self,
+        _flags: inode::OpenFlags,
+    ) -> FsResult<Arc<dyn File + Send + Sync>> {
+        Err(FsError::Unsupported)
+    }
+    fn inc_writable_shared_mmap(&self) {}
+    fn dec_writable_shared_mmap(&self) {}
+    fn blocks_shared_writable_mmap(&self) -> bool {
+        false
+    }
+    fn blocks_file_write(&self) -> bool {
+        false
+    }
     fn sync(&self, _data_only: bool) -> FsResult {
         Ok(())
     }
@@ -205,6 +236,9 @@ pub trait File: Send + Sync {
     fn is_dev_full(&self) -> bool {
         false
     }
+    fn is_memfd(&self) -> bool {
+        false
+    }
     fn is_socket(&self) -> bool {
         false
     }
@@ -232,6 +266,7 @@ pub(crate) use inode::{
     create_node_in, link_file_in, lookup_mount_target_dir_in, mkdir_in, rename_in, rmdir_in,
     symlink_in, unlink_file_in,
 };
+pub(crate) use memfd::make_memfd;
 pub(crate) use mount::{
     MountError, MountId, mount_block_device_at, mount_fat_device_at, mount_is_read_only,
     mount_tmpfs_at, remount_at, statfs_for_mount, unmount_at,

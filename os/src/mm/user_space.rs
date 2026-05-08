@@ -1,14 +1,14 @@
 use super::address::page_align_up;
 use super::area::{MmapInfo, ShmAreaInfo};
-use super::{frame_alloc, VirtPageNum};
 use super::{
     FrameTracker, MapArea, MapPermission, MapType, MemorySet, MmapFlush, PhysPageNum, VPNRange,
     VirtAddr,
 };
+use super::{VirtPageNum, frame_alloc};
 use crate::arch::mm as arch_mm;
 use crate::config::{PAGE_SIZE, USER_MMAP_BASE, USER_MMAP_LIMIT};
 use crate::fs::File;
-use crate::mm::page_cache::{PageCacheId, PageCacheKey, PAGE_CACHE};
+use crate::mm::page_cache::{PAGE_CACHE, PageCacheId, PageCacheKey};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -542,6 +542,7 @@ impl MemorySet {
             if self.areas[idx].is_mmap() && area_start >= start_vpn && area_end <= end_vpn {
                 let mut area = self.areas.remove(idx);
                 flushes.extend(area.collect_mmap_flushes(&self.page_table));
+                area.release_mmap_refs();
                 area.unmap_resident(&mut self.page_table);
             } else {
                 idx += 1;
@@ -713,7 +714,7 @@ impl MemorySet {
                 }
                 info.backing_file
                     .as_ref()
-                    .is_none_or(|file| file.writable())
+                    .is_none_or(|file| file.writable() && !file.blocks_shared_writable_mmap())
             })
     }
 }

@@ -1,6 +1,6 @@
 use super::ProcessControlBlock;
 use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
-use crate::mm::{MapPermission, PhysPageNum, VirtAddr, KERNEL_SPACE};
+use crate::mm::{KERNEL_SPACE, MapPermission, PhysPageNum, VirtAddr};
 use crate::sync::UPIntrFreeCell;
 use alloc::{
     sync::{Arc, Weak},
@@ -133,7 +133,7 @@ pub struct TaskUserRes {
     pub process: Weak<ProcessControlBlock>,
 }
 
-const USER_STACK_INITIAL_SIZE: usize = PAGE_SIZE * 16;
+const USER_STACK_INITIAL_SIZE: usize = PAGE_SIZE * 32;
 
 fn trap_cx_bottom_from_tid(tid: usize) -> usize {
     TRAP_CONTEXT_BASE - tid * PAGE_SIZE

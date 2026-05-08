@@ -1,13 +1,16 @@
 use crate::config::PAGE_SIZE;
 use crate::fs::{
-    File, OpenFlags, default_pipe_capacity_for_current_process, make_pipe, pipe_max_size,
+    File, OpenFlags, default_pipe_capacity_for_current_process, make_memfd, make_pipe,
+    pipe_max_size,
 };
 use crate::task::{FdFlags, FdTableEntry, current_process, current_user_token};
 use alloc::sync::Arc;
 use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
-use super::super::user_ptr::{UserBufferAccess, translated_byte_buffer_checked};
+use super::super::user_ptr::{
+    UserBufferAccess, read_user_c_string, translated_byte_buffer_checked,
+};
 use super::fd_lock::{fcntl_getlk, fcntl_setlk, fcntl_setlkw, release_record_locks_for_close};
 
 const F_DUPFD: usize = 0;
@@ -21,9 +24,15 @@ const F_SETLKW: usize = 7;
 const F_DUPFD_CLOEXEC: usize = 1030;
 const F_SETPIPE_SZ: usize = 1031;
 const F_GETPIPE_SZ: usize = 1032;
+const F_ADD_SEALS: usize = 1033;
+const F_GET_SEALS: usize = 1034;
 const VALID_PIPE2_FLAGS: u32 = OpenFlags::NONBLOCK.bits() | OpenFlags::CLOEXEC.bits();
 const VALID_DUP3_FLAGS: u32 = OpenFlags::CLOEXEC.bits();
 const MAX_PIPE_SIZE_ARG: usize = 1 << 31;
+const MFD_CLOEXEC: u32 = 0x0001;
+const MFD_ALLOW_SEALING: u32 = 0x0002;
+const MFD_VALID_FLAGS: u32 = MFD_CLOEXEC | MFD_ALLOW_SEALING;
+const MEMFD_NAME_MAX: usize = 249;
 
 pub(super) fn get_fd_entry_by_fd(fd: usize) -> SysResult<FdTableEntry> {
     let process = current_process();
@@ -221,6 +230,44 @@ fn fcntl_set_pipe_size(fd: usize, requested: usize) -> SysResult {
     Ok(file.set_pipe_capacity(requested)? as isize)
 }
 
+fn fcntl_get_seals(fd: usize) -> SysResult {
+    Ok(get_file_by_fd(fd)?.seals()? as isize)
+}
+
+fn fcntl_add_seals(fd: usize, seals: u32) -> SysResult {
+    get_file_by_fd(fd)?.add_seals(seals)?;
+    Ok(0)
+}
+
+fn read_memfd_name(name: *const u8) -> SysResult {
+    match read_user_c_string(current_user_token(), name, MEMFD_NAME_MAX + 1) {
+        Ok(_) => Ok(0),
+        Err(SysError::ENAMETOOLONG) => Err(SysError::EINVAL),
+        Err(err) => Err(err),
+    }
+}
+
+pub fn sys_memfd_create(name: *const u8, flags: u32) -> SysResult {
+    read_memfd_name(name)?;
+    if flags & !MFD_VALID_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+    let open_flags = OpenFlags::RDWR
+        | OpenFlags::LARGEFILE
+        | if flags & MFD_CLOEXEC != 0 {
+            OpenFlags::CLOEXEC
+        } else {
+            OpenFlags::empty()
+        };
+    let file = make_memfd(flags & MFD_ALLOW_SEALING != 0);
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
+    inner.fd_table[fd] = Some(FdTableEntry::from_file(file, open_flags));
+    Ok(fd as isize)
+}
+
 pub fn sys_fcntl(fd: usize, op: usize, arg: usize) -> SysResult {
     match op {
         F_DUPFD => fcntl_dup(fd, arg, FdFlags::empty()),
@@ -253,6 +300,8 @@ pub fn sys_fcntl(fd: usize, op: usize, arg: usize) -> SysResult {
         F_SETLKW => fcntl_setlkw(get_fd_entry_by_fd(fd)?, arg as *const _),
         F_GETPIPE_SZ => fcntl_get_pipe_size(fd),
         F_SETPIPE_SZ => fcntl_set_pipe_size(fd, arg),
+        F_ADD_SEALS => fcntl_add_seals(fd, arg as u32),
+        F_GET_SEALS => fcntl_get_seals(fd),
         _ => Err(SysError::EINVAL),
     }
 }

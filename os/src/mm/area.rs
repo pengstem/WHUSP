@@ -6,7 +6,7 @@ use super::{
 use crate::arch::mm as arch_mm;
 use crate::config::PAGE_SIZE;
 use crate::fs::File;
-use crate::mm::page_cache::{PageCacheId, PageCacheKey, PAGE_CACHE};
+use crate::mm::page_cache::{PAGE_CACHE, PageCacheId, PageCacheKey};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -444,6 +444,18 @@ impl MapArea {
             });
         }
         flushes
+    }
+
+    pub(super) fn release_mmap_refs(&self) {
+        let Some(info) = &self.mmap_info else {
+            return;
+        };
+        if info.shared
+            && info.writable
+            && let Some(file) = &info.backing_file
+        {
+            file.dec_writable_shared_mmap();
+        }
     }
 }
 

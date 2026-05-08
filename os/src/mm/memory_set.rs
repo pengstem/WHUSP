@@ -1,6 +1,6 @@
 use super::{
-    page_table::PTEFlags, MapArea, MapPermission, MapType, MmapFlush, PageTable, PageTableEntry,
-    VirtAddr, VirtPageNum,
+    MapArea, MapPermission, MapType, MmapFlush, PageTable, PageTableEntry, VirtAddr, VirtPageNum,
+    page_table::PTEFlags,
 };
 use crate::arch::mm as arch_mm;
 use alloc::vec::Vec;
@@ -101,6 +101,7 @@ impl MemorySet {
         let mut flushes = Vec::new();
         for area in &mut self.areas {
             flushes.extend(area.collect_mmap_flushes(&self.page_table));
+            area.release_mmap_refs();
             if area.is_mmap() || area.is_shm() {
                 area.unmap_resident(&mut self.page_table);
             } else {

@@ -2,7 +2,7 @@ use crate::config::PAGE_SIZE;
 use crate::mm::shm::ShmError;
 use crate::mm::{MapPermission, MemoryProtectError};
 use crate::task::current_process;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
 use super::errno::{SysError, SysResult};
 
@@ -175,9 +175,17 @@ fn sys_mmap_impl(
         if shared && writable && !file.writable() {
             return Err(SysError::EACCES);
         }
+        if shared && writable && file.blocks_shared_writable_mmap() {
+            return Err(SysError::EPERM);
+        }
         let file_size = file.stat()?.size as usize;
         let page_cache_id = if shared { file.page_cache_id() } else { None };
         (Some(file), file_size, page_cache_id)
+    };
+    let writable_shared_file = if shared && writable {
+        backing_file.clone()
+    } else {
+        None
     };
 
     let mut inner = process.inner_exclusive_access();
@@ -198,6 +206,9 @@ fn sys_mmap_impl(
             )
             .ok_or(SysError::ENOMEM)?;
         drop(inner);
+        if let Some(file) = writable_shared_file {
+            file.inc_writable_shared_mmap();
+        }
         for flush in flushes {
             flush.write_back();
         }
@@ -205,7 +216,7 @@ fn sys_mmap_impl(
     }
 
     // TODO: why dose map permission do not contain shared and writable
-    inner
+    let mapped_addr = inner
         .memory_set
         .mmap_area(
             len,
@@ -218,7 +229,12 @@ fn sys_mmap_impl(
             writable,
             page_cache_id,
         )
-        .ok_or(SysError::ENOMEM)
+        .ok_or(SysError::ENOMEM)?;
+    drop(inner);
+    if let Some(file) = writable_shared_file {
+        file.inc_writable_shared_mmap();
+    }
+    Ok(mapped_addr)
 }
 
 pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> SysResult {

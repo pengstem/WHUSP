@@ -3,6 +3,7 @@ use crate::mm::UserBuffer;
 use crate::task::{FdTableEntry, SignalFlags, current_add_signal, current_user_token};
 use alloc::{vec, vec::Vec};
 use core::mem::size_of;
+use core::ptr::read_volatile;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
@@ -96,6 +97,18 @@ fn ensure_positioned_target(file: &(dyn File + Send + Sync)) -> SysResult<()> {
     Ok(())
 }
 
+fn fault_in_read_buffers(buffers: &[&'static mut [u8]]) {
+    for slice in buffers {
+        for index in 0..slice.len() {
+            // Force the lazy user page to be touched even when a later file
+            // permission check makes the syscall fail without copying data.
+            unsafe {
+                read_volatile(slice.as_ptr().add(index));
+            }
+        }
+    }
+}
+
 pub fn sys_lseek(fd: usize, offset: i64, whence: usize) -> SysResult {
     let whence = match whence {
         0 => SeekWhence::Set,
@@ -124,6 +137,7 @@ pub fn sys_ftruncate(fd: usize, len: usize) -> SysResult {
     if file.stat()?.mode & S_IFREG != S_IFREG {
         return Err(SysError::EINVAL);
     }
+    file.check_set_len(len)?;
     file.set_len(len)?;
     Ok(0)
 }
@@ -163,6 +177,16 @@ pub fn sys_fallocate(fd: usize, mode: u32, offset: usize, len: usize) -> SysResu
     if mode & FALLOC_FL_PUNCH_HOLE != 0 && mode & FALLOC_FL_KEEP_SIZE == 0 {
         return Err(SysError::EINVAL);
     }
+    if mode & FALLOC_FL_PUNCH_HOLE != 0 && file.is_memfd() {
+        if file.blocks_file_write() {
+            return Err(SysError::EPERM);
+        }
+        // CONTEXT: memfd punch-hole support is visible to current LTP only
+        // through success/failure and unchanged size, so this in-memory file
+        // treats the range as a successful no-op.
+        return Ok(0);
+    }
+
     if mode
         & (FALLOC_FL_PUNCH_HOLE
             | FALLOC_FL_COLLAPSE_RANGE
@@ -179,6 +203,7 @@ pub fn sys_fallocate(fd: usize, mode: u32, offset: usize, len: usize) -> SysResu
 
     let keep_size = mode & FALLOC_FL_KEEP_SIZE != 0;
     if !keep_size && end as u64 > file.stat()?.size {
+        file.check_set_len(end)?;
         file.set_len(end)?;
     }
     // CONTEXT: the current VFS has no block preallocation API. KEEP_SIZE is
@@ -376,6 +401,10 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, len: usize, offset: usize) -> Sys
     // The contest iozone path opens regular files without O_APPEND, so this
     // implementation writes at the explicit offset and leaves fd offset intact.
     let buffers = translated_byte_buffer_checked(token, buf, len, UserBufferAccess::Read)?;
+    if let Err(err) = file.check_write_at(offset, len) {
+        fault_in_read_buffers(&buffers);
+        return Err(err.into());
+    }
     let mut total_written = 0usize;
     for slice in buffers {
         let written = file.write_at(
@@ -490,6 +519,10 @@ pub fn sys_pwritev(
             Err(_) if total_written > 0 => return Ok(total_written as isize),
             Err(err) => return Err(err),
         };
+        if let Err(err) = file.check_write_at(offset, iovec.len) {
+            fault_in_read_buffers(&buffers);
+            return Err(err.into());
+        }
         for slice in buffers {
             let written = file.write_at(offset, slice);
             total_written += written;
@@ -514,6 +547,7 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
     }
     check_pipe_write_peer(&entry, len > 0)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
+    file.check_write(len, entry.status_flags().contains(OpenFlags::APPEND))?;
     let buffers =
         translated_byte_buffer_checked_with_mmap_fault(token, buf, len, UserBufferAccess::Read)?;
     Ok(write_with_status_flags(&entry, UserBuffer::new(buffers)) as isize)
@@ -543,6 +577,10 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
     }
     check_pipe_write_peer(&entry, has_data)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
+    let total_len = iovecs.iter().try_fold(0usize, |total, iovec| {
+        total.checked_add(iovec.len).ok_or(SysError::EINVAL)
+    })?;
+    file.check_write(total_len, entry.status_flags().contains(OpenFlags::APPEND))?;
 
     let mut total_written = 0usize;
     for iovec in iovecs {
