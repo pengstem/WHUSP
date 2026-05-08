@@ -6,7 +6,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 const ROOT_INO: u32 = 2;
-const TMPFS_INLINE_FILE_LIMIT: usize = 64 * 1024 * 1024;
+// CONTEXT: Larger sparse tmpfs files are represented by sparse extents so
+// high-offset writes do not require one huge zero-filled heap allocation.
+const TMPFS_INLINE_FILE_LIMIT: usize = 1024 * 1024;
 const TMPFS_ALLOCATED_PAYLOAD_LIMIT: usize = 64 * 1024 * 1024;
 
 struct TmpfsInode {
