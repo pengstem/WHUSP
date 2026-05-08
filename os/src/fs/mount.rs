@@ -859,6 +859,36 @@ fn is_recursive_bind_child(root: &DynamicMount, mount: &DynamicMount) -> bool {
         .is_some_and(|source_suffix| source_suffix == target_suffix)
 }
 
+fn is_mount_descendant(root: &DynamicMount, mount: &DynamicMount) -> bool {
+    if root.namespace_id != mount.namespace_id {
+        return false;
+    }
+    let Some(suffix) = path_suffix(root.target_path.as_str(), mount.target_path.as_str()) else {
+        return false;
+    };
+    !suffix.is_empty()
+}
+
+fn detach_mount_descendants(mounts: &mut Vec<DynamicMount>, root: &DynamicMount) {
+    let mut descendants: Vec<_> = mounts
+        .iter()
+        .filter(|mount| is_mount_descendant(root, mount))
+        .cloned()
+        .collect();
+    descendants.sort_by(|left, right| right.target_path.len().cmp(&left.target_path.len()));
+    for descendant in descendants {
+        let Some(index) = mounts.iter().rposition(|mount| {
+            mount.namespace_id == descendant.namespace_id
+                && mount.target_path == descendant.target_path
+                && mount.event_id == descendant.event_id
+        }) else {
+            continue;
+        };
+        let event = mounts.remove(index);
+        propagate_unmount_event(mounts, &event);
+    }
+}
+
 pub(crate) fn mount_block_device_at(
     namespace_id: MountNamespaceId,
     target: WorkingDir,
@@ -1508,9 +1538,10 @@ pub(crate) fn unmount_at(
         }
         let event = mounts.remove(index);
         // CONTEXT: Recursive bind mounts create a copied mount subtree under
-        // the bind root. When that root is unmounted, Linux detaches the copied
-        // children with it; otherwise cleanup sees stale paths such as
-        // fs_bind_rbind05's share1/child1 after share1 has been peeled.
+        // the bind root, and ordinary mounts may have slave/shared descendants.
+        // When a root is unmounted, detach children first and propagate those
+        // unmounts so peer layers are peeled before the root itself goes away.
+        detach_mount_descendants(mounts, &event);
         mounts.retain(|mount| !is_recursive_bind_child(&event, mount));
         propagate_unmount_event(mounts, &event);
         Ok(())
