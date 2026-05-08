@@ -5,8 +5,8 @@ use super::{
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::time::{
-    ClockBackend, current_clock_nanos, nanos_to_ms_ceil, relative_timeout_deadline_ms,
-    timespec_to_nanos, validate_timespec,
+    ClockBackend, current_clock_nanos, relative_timeout_deadline_ms,
+    relative_timeout_deadline_ms_from_nanos, timespec_to_nanos, validate_timespec,
 };
 use crate::syscall::uapi::LinuxTimeSpec;
 use crate::syscall::user_ptr::{
@@ -280,12 +280,9 @@ fn futex_timeout_absolute(
     if deadline_nanos <= now_nanos {
         return Ok(Some(get_time_ms()));
     }
-    let duration_ms = nanos_to_ms_ceil(deadline_nanos - now_nanos)?;
-    Ok(Some(
-        get_time_ms()
-            .checked_add(duration_ms)
-            .ok_or(SysError::EINVAL)?,
-    ))
+    Ok(Some(relative_timeout_deadline_ms_from_nanos(
+        deadline_nanos - now_nanos,
+    )?))
 }
 
 fn futex_timeout_expired(timeout_ms: Option<usize>) -> bool {

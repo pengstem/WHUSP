@@ -154,12 +154,9 @@ pub(crate) fn relative_timeout_deadline_ms(
         return Ok(None);
     }
     let request = validate_timespec(read_user_value(token, timeout)?)?;
-    let duration_ms = timespec_to_ms_ceil(request)?;
-    Ok(Some(
-        get_time_ms()
-            .checked_add(duration_ms)
-            .ok_or(SysError::EINVAL)?,
-    ))
+    Ok(Some(relative_timeout_deadline_ms_from_nanos(
+        timespec_to_nanos(request)?,
+    )?))
 }
 
 pub(crate) fn validate_timespec(time: LinuxTimeSpec) -> SysResult<LinuxTimeSpec> {
@@ -190,6 +187,28 @@ pub(crate) fn nanos_to_ms_ceil(nanos: u64) -> SysResult<usize> {
 
 pub(crate) fn timespec_to_ms_ceil(time: LinuxTimeSpec) -> SysResult<usize> {
     nanos_to_ms_ceil(timespec_to_nanos(time)?)
+}
+
+fn us_to_ms_ceil(us: usize) -> SysResult<usize> {
+    us.checked_add(999)
+        .map(|us| us / 1000)
+        .ok_or(SysError::EINVAL)
+}
+
+fn nanos_to_us_ceil(nanos: u64) -> SysResult<usize> {
+    let us = nanos / 1000 + if nanos % 1000 == 0 { 0 } else { 1 };
+    if us > usize::MAX as u64 {
+        return Err(SysError::EINVAL);
+    }
+    Ok(us as usize)
+}
+
+pub(crate) fn relative_timeout_deadline_ms_from_nanos(duration_nanos: u64) -> SysResult<usize> {
+    let duration_us = nanos_to_us_ceil(duration_nanos)?;
+    let deadline_us = get_time_us()
+        .checked_add(duration_us)
+        .ok_or(SysError::EINVAL)?;
+    us_to_ms_ceil(deadline_us)
 }
 
 fn clock_ticks_to_isize(ticks: usize) -> isize {
