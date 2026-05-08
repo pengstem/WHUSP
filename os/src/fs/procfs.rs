@@ -6,10 +6,13 @@ use super::{FileStat, FileTimestamp, S_IFDIR, S_IFLNK, S_IFREG};
 use crate::config::PAGE_SIZE;
 use crate::mm::frame_stats;
 use crate::sync::UPIntrFreeCell;
-use crate::task::{ProcessProcSnapshot, list_process_snapshots, pid2process};
+use crate::task::{
+    ProcessProcSnapshot, TaskControlBlock, TaskStatus, list_process_snapshots, pid2process,
+};
 use crate::timer::{get_time_us, us_to_clock_ticks};
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
@@ -29,7 +32,7 @@ const DOMAINNAME_INO: u32 = 13;
 const TAINTED_INO: u32 = 14;
 const PID_DIR_BASE: u32 = 100;
 const PID_FILE_BASE: u32 = 10_000;
-const PID_FILE_STRIDE: u32 = 10;
+const PID_FILE_STRIDE: u32 = 16;
 const PID_STAT_OFFSET: u32 = 0;
 const PID_STATUS_OFFSET: u32 = 1;
 const PID_CMDLINE_OFFSET: u32 = 2;
@@ -37,8 +40,16 @@ const PID_FD_DIR_OFFSET: u32 = 3;
 const PID_MAPS_OFFSET: u32 = 4;
 const PID_NS_DIR_OFFSET: u32 = 5;
 const PID_NS_MNT_OFFSET: u32 = 6;
+const PID_TASK_DIR_OFFSET: u32 = 7;
 const PID_FD_ENTRY_BASE: u32 = 1_000_000;
 const PID_FD_ENTRY_STRIDE: u32 = 4096;
+const PID_TASK_INO_TAG_MASK: u32 = 0xC000_0000;
+const PID_TASK_TID_DIR_TAG: u32 = 0x8000_0000;
+const PID_TASK_TID_STAT_TAG: u32 = 0xC000_0000;
+const PID_TASK_PID_SHIFT: usize = 12;
+const PID_TASK_TID_MASK: u32 = (1 << PID_TASK_PID_SHIFT) - 1;
+const PID_TASK_MAX_PID: usize = 1 << (30 - PID_TASK_PID_SHIFT);
+const PID_TASK_MAX_LOCAL_TID: usize = 1 << PID_TASK_PID_SHIFT;
 const DEFAULT_PID_MAX: usize = 4_194_304;
 const DEFAULT_PIPE_USER_PAGES_SOFT: usize = 1;
 
@@ -84,6 +95,9 @@ enum ProcNode {
     PidMaps(usize),
     PidNsDir(usize),
     PidNsMnt(usize),
+    PidTaskDir(usize),
+    PidTaskTidDir(usize, usize),
+    PidTaskTidStat(usize, usize),
 }
 
 impl ProcFs {
@@ -104,8 +118,59 @@ fn pid_fd_entry_ino(pid: usize, fd: usize) -> u32 {
     PID_FD_ENTRY_BASE + pid as u32 * PID_FD_ENTRY_STRIDE + fd as u32
 }
 
+fn pid_task_tid_ino(pid: usize, local_tid: usize, tag: u32) -> Option<u32> {
+    if pid >= PID_TASK_MAX_PID || local_tid >= PID_TASK_MAX_LOCAL_TID {
+        return None;
+    }
+    Some(tag | ((pid as u32) << PID_TASK_PID_SHIFT) | local_tid as u32)
+}
+
+fn pid_task_tid_dir_ino(pid: usize, local_tid: usize) -> Option<u32> {
+    pid_task_tid_ino(pid, local_tid, PID_TASK_TID_DIR_TAG)
+}
+
+fn pid_task_tid_stat_ino(pid: usize, local_tid: usize) -> Option<u32> {
+    pid_task_tid_ino(pid, local_tid, PID_TASK_TID_STAT_TAG)
+}
+
+fn decode_pid_task_tid_ino(ino: u32) -> Option<ProcNode> {
+    let tag = ino & PID_TASK_INO_TAG_MASK;
+    if !matches!(tag, PID_TASK_TID_DIR_TAG | PID_TASK_TID_STAT_TAG) {
+        return None;
+    }
+    let payload = ino & !PID_TASK_INO_TAG_MASK;
+    let pid = (payload >> PID_TASK_PID_SHIFT) as usize;
+    let local_tid = (payload & PID_TASK_TID_MASK) as usize;
+    lookup_task_by_local_tid(pid, local_tid)?;
+    match tag {
+        PID_TASK_TID_DIR_TAG => Some(ProcNode::PidTaskTidDir(pid, local_tid)),
+        PID_TASK_TID_STAT_TAG => Some(ProcNode::PidTaskTidStat(pid, local_tid)),
+        _ => None,
+    }
+}
+
 fn lookup_process(pid: usize) -> Option<ProcessProcSnapshot> {
     pid2process(pid).map(|process| process.proc_snapshot())
+}
+
+fn lookup_task_by_local_tid(pid: usize, local_tid: usize) -> Option<Arc<TaskControlBlock>> {
+    let process = pid2process(pid)?;
+    let inner = process.inner_exclusive_access();
+    inner
+        .tasks
+        .get(local_tid)
+        .and_then(|task| task.as_ref().map(Arc::clone))
+}
+
+fn lookup_task_by_linux_tid(pid: usize, linux_tid: usize) -> Option<Arc<TaskControlBlock>> {
+    pid2process(pid)?
+        .tasks_snapshot()
+        .into_iter()
+        .find(|task| task.linux_tid() == linux_tid)
+}
+
+fn task_local_tid(task: &TaskControlBlock) -> usize {
+    task.inner_exclusive_access().tid
 }
 
 fn parse_pid(component: &str) -> Option<usize> {
@@ -116,6 +181,9 @@ fn parse_pid(component: &str) -> Option<usize> {
 }
 
 fn decode_node(ino: u32) -> Option<ProcNode> {
+    if let Some(node) = decode_pid_task_tid_ino(ino) {
+        return Some(node);
+    }
     match ino {
         ROOT_INO => Some(ProcNode::Root),
         MOUNTS_INO => Some(ProcNode::Mounts),
@@ -156,6 +224,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
                 PID_MAPS_OFFSET => Some(ProcNode::PidMaps(pid)),
                 PID_NS_DIR_OFFSET => Some(ProcNode::PidNsDir(pid)),
                 PID_NS_MNT_OFFSET => Some(ProcNode::PidNsMnt(pid)),
+                PID_TASK_DIR_OFFSET => Some(ProcNode::PidTaskDir(pid)),
                 _ => None,
             }
         }
@@ -175,7 +244,9 @@ fn node_kind(node: ProcNode) -> FsNodeKind {
         | ProcNode::SysFsDir
         | ProcNode::PidDir(_)
         | ProcNode::PidFdDir(_)
-        | ProcNode::PidNsDir(_) => FsNodeKind::Directory,
+        | ProcNode::PidNsDir(_)
+        | ProcNode::PidTaskDir(_)
+        | ProcNode::PidTaskTidDir(_, _) => FsNodeKind::Directory,
         ProcNode::PidFdEntry(_, _) => FsNodeKind::Symlink,
         _ => FsNodeKind::RegularFile,
     }
@@ -350,7 +421,62 @@ fn pid_entries(pid: usize) -> Vec<RawDirEntry> {
         name: "ns".into(),
         dtype: DT_DIR,
     });
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_TASK_DIR_OFFSET),
+        name: "task".into(),
+        dtype: DT_DIR,
+    });
     entries
+}
+
+fn pid_task_entries(pid: usize) -> FsResult<Vec<RawDirEntry>> {
+    let process = pid2process(pid).ok_or(FsError::NotFound)?;
+    let tasks = process.tasks_snapshot();
+    let mut entries = Vec::new();
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_TASK_DIR_OFFSET),
+        name: ".".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: pid_dir_ino(pid),
+        name: "..".into(),
+        dtype: DT_DIR,
+    });
+    for task in tasks {
+        let local_tid = task_local_tid(&task);
+        if let Some(ino) = pid_task_tid_dir_ino(pid, local_tid) {
+            entries.push(RawDirEntry {
+                ino,
+                name: task.linux_tid().to_string(),
+                dtype: DT_DIR,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn pid_task_tid_entries(pid: usize, local_tid: usize) -> FsResult<Vec<RawDirEntry>> {
+    let task_dir_ino = pid_task_tid_dir_ino(pid, local_tid).ok_or(FsError::NotFound)?;
+    let stat_ino = pid_task_tid_stat_ino(pid, local_tid).ok_or(FsError::NotFound)?;
+    lookup_task_by_local_tid(pid, local_tid).ok_or(FsError::NotFound)?;
+    let mut entries = Vec::new();
+    entries.push(RawDirEntry {
+        ino: task_dir_ino,
+        name: ".".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_TASK_DIR_OFFSET),
+        name: "..".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: stat_ino,
+        name: "stat".into(),
+        dtype: DT_REG,
+    });
+    Ok(entries)
 }
 
 fn pid_fd_entries(pid: usize) -> FsResult<Vec<RawDirEntry>> {
@@ -552,7 +678,15 @@ fn set_domainname_len(len: u64) -> FsResult {
     Ok(())
 }
 
-fn pid_stat_content(process: ProcessProcSnapshot) -> String {
+fn task_status_char(status: TaskStatus) -> char {
+    match status {
+        TaskStatus::Ready | TaskStatus::Running => 'R',
+        TaskStatus::Blocked => 'S',
+        TaskStatus::Exited => 'Z',
+    }
+}
+
+fn proc_stat_content(process: ProcessProcSnapshot, stat_pid: usize, state: char) -> String {
     let times = process.cpu_times;
     let utime = us_to_clock_ticks(times.user_us);
     let stime = us_to_clock_ticks(times.system_us);
@@ -564,9 +698,9 @@ fn pid_stat_content(process: ProcessProcSnapshot) -> String {
     // kernel lacks full process accounting.
     format!(
         "{} ({}) {} {} {} {} 0 -1 0 0 0 0 0 {} {} {} {} 20 0 {} 0 0 4096 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-        process.pid,
+        stat_pid,
         process.comm,
-        process.state,
+        state,
         process.ppid,
         process.pgid,
         process.pid,
@@ -576,6 +710,20 @@ fn pid_stat_content(process: ProcessProcSnapshot) -> String {
         cstime,
         process.thread_count,
     )
+}
+
+fn pid_stat_content(process: ProcessProcSnapshot) -> String {
+    let pid = process.pid;
+    let state = process.state;
+    proc_stat_content(process, pid, state)
+}
+
+fn task_stat_content(pid: usize, local_tid: usize) -> FsResult<Vec<u8>> {
+    let process = pid2process(pid).ok_or(FsError::NotFound)?;
+    let process_snapshot = process.proc_snapshot();
+    let task = lookup_task_by_local_tid(pid, local_tid).ok_or(FsError::NotFound)?;
+    let state = task_status_char(task.inner_exclusive_access().task_status);
+    Ok(proc_stat_content(process_snapshot, task.linux_tid(), state).into_bytes())
 }
 
 fn pid_status_content(process: ProcessProcSnapshot) -> String {
@@ -643,13 +791,16 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::PidNsMnt(pid) => lookup_process(pid)
             .map(|process| format!("mnt:[{}]\n", process.mount_namespace_id.0).into_bytes())
             .ok_or(FsError::NotFound),
+        ProcNode::PidTaskTidStat(pid, local_tid) => task_stat_content(pid, local_tid),
         ProcNode::Root
         | ProcNode::SysDir
         | ProcNode::SysKernelDir
         | ProcNode::SysFsDir
         | ProcNode::PidDir(_)
         | ProcNode::PidFdDir(_)
-        | ProcNode::PidNsDir(_) => Err(FsError::IsDir),
+        | ProcNode::PidNsDir(_)
+        | ProcNode::PidTaskDir(_)
+        | ProcNode::PidTaskTidDir(_, _) => Err(FsError::IsDir),
     }
 }
 
@@ -734,6 +885,10 @@ impl FileSystemBackend for ProcFs {
                 "fd" => Ok((pid_file_ino(pid, PID_FD_DIR_OFFSET), FsNodeKind::Directory)),
                 "maps" => Ok((pid_file_ino(pid, PID_MAPS_OFFSET), FsNodeKind::RegularFile)),
                 "ns" => Ok((pid_file_ino(pid, PID_NS_DIR_OFFSET), FsNodeKind::Directory)),
+                "task" => Ok((
+                    pid_file_ino(pid, PID_TASK_DIR_OFFSET),
+                    FsNodeKind::Directory,
+                )),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::PidFdDir(pid) => match component {
@@ -759,6 +914,35 @@ impl FileSystemBackend for ProcFs {
                     pid_file_ino(pid, PID_NS_MNT_OFFSET),
                     FsNodeKind::RegularFile,
                 )),
+                _ => Err(FsError::NotFound),
+            },
+            ProcNode::PidTaskDir(pid) => match component {
+                "." => Ok((
+                    pid_file_ino(pid, PID_TASK_DIR_OFFSET),
+                    FsNodeKind::Directory,
+                )),
+                ".." => Ok((pid_dir_ino(pid), FsNodeKind::Directory)),
+                _ => {
+                    let linux_tid = parse_pid(component).ok_or(FsError::NotFound)?;
+                    let task = lookup_task_by_linux_tid(pid, linux_tid).ok_or(FsError::NotFound)?;
+                    let local_tid = task_local_tid(&task);
+                    let ino = pid_task_tid_dir_ino(pid, local_tid).ok_or(FsError::NotFound)?;
+                    Ok((ino, FsNodeKind::Directory))
+                }
+            },
+            ProcNode::PidTaskTidDir(pid, local_tid) => match component {
+                "." => {
+                    let ino = pid_task_tid_dir_ino(pid, local_tid).ok_or(FsError::NotFound)?;
+                    Ok((ino, FsNodeKind::Directory))
+                }
+                ".." => Ok((
+                    pid_file_ino(pid, PID_TASK_DIR_OFFSET),
+                    FsNodeKind::Directory,
+                )),
+                "stat" => {
+                    let ino = pid_task_tid_stat_ino(pid, local_tid).ok_or(FsError::NotFound)?;
+                    Ok((ino, FsNodeKind::RegularFile))
+                }
                 _ => Err(FsError::NotFound),
             },
             _ => Err(FsError::NotDir),
@@ -822,7 +1006,9 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::SysFsDir
             | ProcNode::PidDir(_)
             | ProcNode::PidFdDir(_)
-            | ProcNode::PidNsDir(_) => FileStat::with_mode(S_IFDIR | 0o555),
+            | ProcNode::PidNsDir(_)
+            | ProcNode::PidTaskDir(_)
+            | ProcNode::PidTaskTidDir(_, _) => FileStat::with_mode(S_IFDIR | 0o555),
             ProcNode::PidFdEntry(_, _) => FileStat::with_mode(S_IFLNK | 0o777),
             ProcNode::PidMax | ProcNode::PipeMaxSize | ProcNode::Domainname => {
                 FileStat::with_mode(S_IFREG | 0o644)
@@ -893,6 +1079,10 @@ impl FileSystemBackend for ProcFs {
             ProcNode::PidDir(pid) => write_dir_entries(&pid_entries(pid), offset, buf),
             ProcNode::PidFdDir(pid) => write_dir_entries(&pid_fd_entries(pid)?, offset, buf),
             ProcNode::PidNsDir(pid) => write_dir_entries(&pid_ns_entries(pid), offset, buf),
+            ProcNode::PidTaskDir(pid) => write_dir_entries(&pid_task_entries(pid)?, offset, buf),
+            ProcNode::PidTaskTidDir(pid, local_tid) => {
+                write_dir_entries(&pid_task_tid_entries(pid, local_tid)?, offset, buf)
+            }
             _ => Err(FsError::NotDir),
         }
     }
