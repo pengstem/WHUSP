@@ -128,19 +128,31 @@ impl MemorySet {
                     dst_area.map_shm_frame(page_table, vpn, mapping.ppn, page_index);
                 }
             } else if area.is_mmap() {
-                // UNFINISHED: MAP_SHARED mappings that cannot enter PAGE_CACHE
-                // still copy resident frames on fork; only page-cache-backed
-                // mappings share PPNs with refcounting.
+                // UNFINISHED: MAP_PRIVATE writable mmap still uses eager copy
+                // instead of Linux-style copy-on-write.
                 memory_set.areas.push(new_area);
                 let area_idx = memory_set.areas.len() - 1;
+                let can_share_resident = area.mmap_info.as_ref().is_some_and(|info| info.shared)
+                    || !area.map_perm.contains(MapPermission::W);
                 let resident_vpns: Vec<_> = area.data_frames.keys().copied().collect();
                 for vpn in resident_vpns {
-                    let src_ppn = user_space.translate(vpn).unwrap().ppn();
-                    let frame = frame_alloc().unwrap();
-                    frame
-                        .ppn
-                        .get_bytes_array()
-                        .copy_from_slice(src_ppn.get_bytes_array());
+                    let Some(src_pte) = user_space.translate(vpn) else {
+                        continue;
+                    };
+                    let frame = if can_share_resident {
+                        FrameTracker::from_retained(src_pte.ppn())
+                    } else {
+                        frame_alloc().map(|frame| {
+                            frame
+                                .ppn
+                                .get_bytes_array()
+                                .copy_from_slice(src_pte.ppn().get_bytes_array());
+                            frame
+                        })
+                    };
+                    let Some(frame) = frame else {
+                        continue;
+                    };
                     let page_table = &mut memory_set.page_table;
                     let dst_area = &mut memory_set.areas[area_idx];
                     dst_area.map_existing_frame(page_table, vpn, frame);
