@@ -367,6 +367,8 @@ pub struct ProcessControlBlockInner {
     pub signal_actions: [SignalAction; SIGNAL_INFO_SLOTS],
     pub cpu_times: ProcessCpuTimes,
     pub(crate) real_timer: ProcessRealTimer,
+    pub(crate) virtual_timer: ProcessRealTimer,
+    pub(crate) prof_timer: ProcessRealTimer,
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     pub task_res_allocator: RecycleAllocator,
 }

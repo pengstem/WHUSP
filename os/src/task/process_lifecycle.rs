@@ -98,6 +98,8 @@ impl ProcessControlBlock {
                     signal_actions: [SignalAction::default(); super::SIGNAL_INFO_SLOTS],
                     cpu_times: ProcessCpuTimes::default(),
                     real_timer: Default::default(),
+                    virtual_timer: Default::default(),
+                    prof_timer: Default::default(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                 })
@@ -194,6 +196,8 @@ impl ProcessControlBlock {
                     signal_actions,
                     cpu_times: ProcessCpuTimes::default(),
                     real_timer: Default::default(),
+                    virtual_timer: Default::default(),
+                    prof_timer: Default::default(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                 })

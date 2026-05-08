@@ -26,6 +26,8 @@ const NSEC_PER_SEC: isize = 1_000_000_000;
 const NSEC_PER_MSEC: usize = 1_000_000;
 const USEC_PER_SEC: usize = 1_000_000;
 const ITIMER_REAL: i32 = 0;
+const ITIMER_VIRTUAL: i32 = 1;
+const ITIMER_PROF: i32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -64,6 +66,13 @@ pub(crate) enum ClockBackend {
 }
 
 #[derive(Clone, Copy)]
+enum ItimerKind {
+    Real,
+    Virtual,
+    Prof,
+}
+
+#[derive(Clone, Copy)]
 enum ClockKind {
     Realtime,
     Monotonic,
@@ -73,6 +82,17 @@ enum ClockKind {
     RealtimeCoarse,
     MonotonicCoarse,
     Boottime,
+}
+
+impl ItimerKind {
+    fn from_raw(which: i32) -> SysResult<Self> {
+        match which {
+            ITIMER_REAL => Ok(Self::Real),
+            ITIMER_VIRTUAL => Ok(Self::Virtual),
+            ITIMER_PROF => Ok(Self::Prof),
+            _ => Err(SysError::EINVAL),
+        }
+    }
 }
 
 impl ClockKind {
@@ -172,16 +192,6 @@ pub(crate) fn timespec_to_ms_ceil(time: LinuxTimeSpec) -> SysResult<usize> {
     nanos_to_ms_ceil(timespec_to_nanos(time)?)
 }
 
-fn validate_itimer_kind(which: i32) -> SysResult<()> {
-    if which == ITIMER_REAL {
-        return Ok(());
-    }
-    // UNFINISHED: Linux also supports ITIMER_VIRTUAL and ITIMER_PROF. They
-    // require CPU-time accounting driven signal delivery, while UnixBench's
-    // alarm() path only depends on ITIMER_REAL.
-    Err(SysError::EINVAL)
-}
-
 fn clock_ticks_to_isize(ticks: usize) -> isize {
     ticks.min(isize::MAX as usize) as isize
 }
@@ -229,7 +239,7 @@ fn itimerval_from_us(interval_us: usize, value_us: usize) -> LinuxITimerVal {
 }
 
 pub fn sys_getitimer(which: i32, value: *mut u8) -> SysResult {
-    validate_itimer_kind(which)?;
+    let kind = ItimerKind::from_raw(which)?;
     if value.is_null() {
         return Err(SysError::EFAULT);
     }
@@ -237,10 +247,12 @@ pub fn sys_getitimer(which: i32, value: *mut u8) -> SysResult {
     let process = current_process();
     let current = {
         let inner = process.inner_exclusive_access();
-        itimerval_from_us(
-            inner.real_timer.interval_us,
-            inner.real_timer.remaining_us(now_us),
-        )
+        let timer = match kind {
+            ItimerKind::Real => &inner.real_timer,
+            ItimerKind::Virtual => &inner.virtual_timer,
+            ItimerKind::Prof => &inner.prof_timer,
+        };
+        itimerval_from_us(timer.interval_us, timer.remaining_us(now_us))
     };
     write_user_value(
         current_user_token(),
@@ -251,7 +263,7 @@ pub fn sys_getitimer(which: i32, value: *mut u8) -> SysResult {
 }
 
 pub fn sys_setitimer(which: i32, value: *const u8, old_value: *mut u8) -> SysResult {
-    validate_itimer_kind(which)?;
+    let kind = ItimerKind::from_raw(which)?;
     let token = current_user_token();
     // CONTEXT: Linux treats a NULL new_value as a zero itimerval, disabling
     // the timer. The man page calls this nonportable, but it is Linux ABI.
@@ -271,23 +283,36 @@ pub fn sys_setitimer(which: i32, value: *const u8, old_value: *mut u8) -> SysRes
     let process = current_process();
     let old = {
         let inner = process.inner_exclusive_access();
-        itimerval_from_us(
-            inner.real_timer.interval_us,
-            inner.real_timer.remaining_us(now_us),
-        )
+        let timer = match kind {
+            ItimerKind::Real => &inner.real_timer,
+            ItimerKind::Virtual => &inner.virtual_timer,
+            ItimerKind::Prof => &inner.prof_timer,
+        };
+        itimerval_from_us(timer.interval_us, timer.remaining_us(now_us))
     };
     if !old_value.is_null() {
         write_user_value(token, old_value.cast::<LinuxITimerVal>(), &old)?;
     }
     let event = {
         let mut inner = process.inner_exclusive_access();
-        inner.real_timer.generation = inner.real_timer.generation.wrapping_add(1);
-        inner.real_timer.interval_us = interval_us;
-        inner.real_timer.next_expire_us = next_expire_us;
-        if next_expire_us == 0 {
-            None
-        } else {
-            Some((next_expire_us, inner.real_timer.generation))
+        let timer = match kind {
+            ItimerKind::Real => &mut inner.real_timer,
+            ItimerKind::Virtual => &mut inner.virtual_timer,
+            ItimerKind::Prof => &mut inner.prof_timer,
+        };
+        timer.generation = timer.generation.wrapping_add(1);
+        timer.interval_us = interval_us;
+        timer.next_expire_us = next_expire_us;
+        match kind {
+            ItimerKind::Real if next_expire_us != 0 => Some((next_expire_us, timer.generation)),
+            ItimerKind::Virtual | ItimerKind::Prof if next_expire_us != 0 => {
+                // UNFINISHED: Linux ITIMER_VIRTUAL and ITIMER_PROF count CPU
+                // time and deliver SIGVTALRM/SIGPROF. This kernel currently
+                // stores their set/get state but does not drive CPU-time
+                // expiration or signal delivery.
+                None
+            }
+            _ => None,
         }
     };
     if let Some((expire_us, generation)) = event {
