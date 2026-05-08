@@ -835,6 +835,13 @@ fn propagate_unmount_event(mounts: &mut Vec<DynamicMount>, event: &DynamicMount)
                 .map(|source_mount| propagated_target_base(source_mount, &peer))
                 .unwrap_or(peer.target_path.as_str());
             let target_path = join_mount_path(target_base, suffix.as_str());
+            // CONTEXT: A copied recursive-bind child can sit directly under a
+            // propagated root that is also its propagation parent. Unmounting
+            // the copied child must not peel that parent stack layer; rbind35
+            // expects the parent layer to remain for a later umount.
+            if target_path == event.propagation_parent_path {
+                continue;
+            }
             mounts.retain(|mount| {
                 !(mount.namespace_id == peer.namespace_id
                     && mount.target_path == target_path
