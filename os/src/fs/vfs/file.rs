@@ -1,6 +1,8 @@
 use super::super::devfs;
 use super::super::inode::{OpenFlags, link_node_in};
-use super::super::mount::{mount_supports_page_cache, release_inode_from_drop, with_mount};
+use super::super::mount::{
+    MountId, mount_is_read_only, mount_supports_page_cache, release_inode_from_drop, with_mount,
+};
 use super::super::path::{PathContext, WorkingDir};
 use super::super::status_flags::StatusFlagsCell;
 use super::super::{FS_APPEND_FL, FS_IMMUTABLE_FL, File, FileStat, FileTimestamp, SeekWhence};
@@ -50,6 +52,14 @@ fn untrack_writable_regular_open(node: VfsNodeId, kind: FsNodeKind, writable: bo
         *count -= 1;
     } else {
         counts.remove(&node);
+    }
+}
+
+fn ensure_mount_writable(mount_id: MountId) -> FsResult {
+    if mount_is_read_only(mount_id) {
+        Err(FsError::ReadOnly)
+    } else {
+        Ok(())
     }
 }
 
@@ -315,6 +325,7 @@ fn open_vfs_file_impl(
                     return Err(FsError::TextBusy);
                 }
                 if flags.contains(OpenFlags::TRUNC) && flags.writable_target() {
+                    ensure_mount_writable(path.node.mount_id)?;
                     with_mount(path.node.mount_id, |mount| mount.set_len(path.node.ino, 0))
                         .ok_or(FsError::Io)??;
                 }
@@ -325,6 +336,7 @@ fn open_vfs_file_impl(
             if flags.contains(OpenFlags::DIRECTORY) {
                 return Err(FsError::InvalidInput);
             }
+            ensure_mount_writable(target.parent.mount_id)?;
             let parent_stat = with_mount(target.parent.mount_id, |mount| {
                 mount.stat(target.parent.ino)
             })
@@ -382,6 +394,7 @@ fn create_tmpfile_inode(
     if !writable {
         return Err(FsError::InvalidInput);
     }
+    ensure_mount_writable(directory.node.mount_id)?;
 
     let parent_stat = with_mount(directory.node.mount_id, |mount| {
         mount.stat(directory.node.ino)
@@ -592,6 +605,7 @@ pub(crate) fn truncate_in(context: PathContext, name: &str, len: usize) -> FsRes
     if path.kind != FsNodeKind::RegularFile {
         return Err(FsError::InvalidInput);
     }
+    ensure_mount_writable(path.node.mount_id)?;
     with_mount(path.node.mount_id, |mount| {
         mount.set_len(path.node.ino, len as u64)
     })
@@ -792,6 +806,7 @@ impl File for VfsFile {
     }
 
     fn check_write(&self, _len: usize, append: bool) -> FsResult {
+        ensure_mount_writable(self.node.mount_id)?;
         let flags = self.inode_flags()?;
         if flags & FS_IMMUTABLE_FL != 0 {
             return Err(FsError::PermissionDenied);
@@ -803,6 +818,7 @@ impl File for VfsFile {
     }
 
     fn check_write_at(&self, _offset: usize, _len: usize) -> FsResult {
+        ensure_mount_writable(self.node.mount_id)?;
         let flags = self.inode_flags()?;
         if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
             return Err(FsError::PermissionDenied);
@@ -811,6 +827,7 @@ impl File for VfsFile {
     }
 
     fn check_set_len(&self, _len: usize) -> FsResult {
+        ensure_mount_writable(self.node.mount_id)?;
         let flags = self.inode_flags()?;
         if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
             return Err(FsError::PermissionDenied);
