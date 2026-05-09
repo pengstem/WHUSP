@@ -30,6 +30,13 @@ impl RLimit {
         }
     }
 
+    const fn soft_with_hard(soft: usize, hard: usize) -> Self {
+        Self {
+            rlim_cur: soft,
+            rlim_max: hard,
+        }
+    }
+
     const fn infinity() -> Self {
         Self {
             rlim_cur: RLIM_INFINITY,
@@ -98,7 +105,8 @@ impl ProcessResourceLimits {
         // for getrlimit/setrlimit compatibility but are not enforced by the
         // memory, scheduler, signal, or fork paths yet.
         let mut limits = [RLimit::infinity(); RLIMIT_COUNT];
-        limits[RLimitResource::Stack.index()] = RLimit::fixed(USER_STACK_SIZE);
+        limits[RLimitResource::Stack.index()] =
+            RLimit::soft_with_hard(USER_STACK_SIZE, RLIM_INFINITY);
         limits[RLimitResource::NoFile.index()] = RLimit::fixed(FD_LIMIT);
         limits[RLimitResource::Core.index()] = RLimit::fixed(0);
         Self { limits }
