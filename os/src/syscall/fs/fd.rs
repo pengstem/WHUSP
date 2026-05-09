@@ -164,6 +164,9 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> SysResult {
     if flags & !VALID_DUP3_FLAGS != 0 {
         return Err(SysError::EINVAL);
     }
+    if old_fd == new_fd {
+        return Err(SysError::EINVAL);
+    }
 
     let fd_flags = if flags & OpenFlags::CLOEXEC.bits() != 0 {
         FdFlags::CLOEXEC
@@ -179,9 +182,6 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> SysResult {
         .and_then(|entry| entry.as_ref())
         .cloned()
         .ok_or(SysError::EBADF)?;
-    if old_fd == new_fd {
-        return Err(SysError::EINVAL);
-    }
     if new_fd >= inner.nofile_limit() {
         return Err(SysError::EBADF);
     }
