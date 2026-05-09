@@ -8,11 +8,13 @@ use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
 use crate::mm::{UserBuffer, page_cache::PageCacheId};
 use crate::sync::SleepMutex;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use lazy_static::lazy_static;
 
 const VFS_WRITE_CHUNK_SIZE: usize = 64 * 1024;
 const MODE_PERMISSIONS_MASK: u32 = 0o7777;
@@ -20,6 +22,47 @@ const MODE_SETGID: u32 = 0o2000;
 const TMPFILE_CREATE_ATTEMPTS: usize = 64;
 
 static TMPFILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+lazy_static! {
+    static ref WRITABLE_REGULAR_OPEN_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =
+        SleepMutex::new(BTreeMap::new());
+}
+
+fn track_writable_regular_open(node: VfsNodeId, kind: FsNodeKind, writable: bool) {
+    if kind != FsNodeKind::RegularFile || !writable {
+        return;
+    }
+    let mut counts = WRITABLE_REGULAR_OPEN_COUNTS.lock();
+    *counts.entry(node).or_insert(0) += 1;
+}
+
+fn untrack_writable_regular_open(node: VfsNodeId, kind: FsNodeKind, writable: bool) {
+    if kind != FsNodeKind::RegularFile || !writable {
+        return;
+    }
+    let mut counts = WRITABLE_REGULAR_OPEN_COUNTS.lock();
+    let Some(count) = counts.get_mut(&node) else {
+        return;
+    };
+    if *count > 1 {
+        *count -= 1;
+    } else {
+        counts.remove(&node);
+    }
+}
+
+pub(crate) fn regular_file_is_open_writable_in(context: PathContext, name: &str) -> FsResult<bool> {
+    let path = vfs_path::resolve_existing_in(context, name, LookupMode::FollowFinal)?;
+    if path.kind != FsNodeKind::RegularFile {
+        return Ok(false);
+    }
+    Ok(WRITABLE_REGULAR_OPEN_COUNTS
+        .lock()
+        .get(&path.node)
+        .copied()
+        .unwrap_or(0)
+        > 0)
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct FileCreateAttrs {
@@ -77,6 +120,7 @@ impl VfsFile {
             mount.retain_inode(path.node.ino)
         })
         .ok_or(FsError::Io)??;
+        track_writable_regular_open(path.node, path.kind, writable);
         Ok(Self {
             node: path.node,
             parent,
@@ -789,6 +833,7 @@ impl File for VfsFile {
 
 impl Drop for VfsFile {
     fn drop(&mut self) {
+        untrack_writable_regular_open(self.node, self.kind, self.writable);
         release_inode_from_drop(self.node.mount_id, self.node.ino);
     }
 }

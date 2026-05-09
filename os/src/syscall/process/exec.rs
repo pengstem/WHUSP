@@ -1,4 +1,7 @@
-use crate::fs::{File, OpenFlags, open_file_in};
+use crate::fs::{
+    File, FileStat, OpenFlags, S_IFMT, S_IFREG, open_file_in, regular_file_is_open_writable_in,
+    stat_in,
+};
 use crate::mm::elf_required_interpreter_path;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{PATH_MAX, read_user_c_string, read_user_usize};
@@ -109,6 +112,43 @@ fn libc_test_root(cwd_path: &str, script_path: &str) -> Option<&'static str> {
     }
 }
 
+fn has_execute_permission(stat: &FileStat) -> bool {
+    let credentials = current_process().credentials();
+    if credentials.fsuid == 0 {
+        return stat.mode & 0o111 != 0;
+    }
+
+    let granted = if credentials.fsuid == stat.uid {
+        (stat.mode >> 6) & 0o7
+    } else if credentials.fsgid == stat.gid
+        || credentials.groups.iter().any(|group| *group == stat.gid)
+    {
+        (stat.mode >> 3) & 0o7
+    } else {
+        stat.mode & 0o7
+    };
+    granted & 0o1 != 0
+}
+
+fn check_exec_file(path: &str) -> SysResult<()> {
+    let context = current_process().path_snapshot().context;
+    let stat = stat_in(context.clone(), path, true)?;
+    if stat.mode & S_IFMT != S_IFREG {
+        return Err(SysError::EACCES);
+    }
+
+    // UNFINISHED: Linux also folds path-prefix search permissions, ACLs,
+    // capabilities, and noexec mounts into exec permission checks. The current
+    // check covers the regular-file DAC and text-busy paths exercised here.
+    if !has_execute_permission(&stat) {
+        return Err(SysError::EACCES);
+    }
+    if regular_file_is_open_writable_in(context, path)? {
+        return Err(SysError::ETXTBSY);
+    }
+    Ok(())
+}
+
 fn busybox_fallback(
     interpreter: &ScriptInterpreter,
     script_path: &str,
@@ -152,6 +192,7 @@ fn interpreter_candidates(
 }
 
 fn read_exec_file_direct(path: &str) -> SysResult<Vec<u8>> {
+    check_exec_file(path)?;
     let app_file = open_file_in(
         current_process().path_snapshot().context,
         path,

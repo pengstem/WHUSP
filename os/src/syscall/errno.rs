@@ -25,6 +25,7 @@ pub enum SysError {
     EINVAL = 22,
     EMFILE = 24,
     ENOTTY = 25,
+    ETXTBSY = 26,
     EFBIG = 27,
     ENOSPC = 28,
     ESPIPE = 29,
