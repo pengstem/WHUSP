@@ -26,6 +26,8 @@ static TMPFILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 lazy_static! {
     static ref WRITABLE_REGULAR_OPEN_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =
         SleepMutex::new(BTreeMap::new());
+    static ref EXECUTABLE_REGULAR_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =
+        SleepMutex::new(BTreeMap::new());
 }
 
 fn track_writable_regular_open(node: VfsNodeId, kind: FsNodeKind, writable: bool) {
@@ -61,6 +63,32 @@ pub(crate) fn regular_file_is_open_writable_in(context: PathContext, name: &str)
 
 pub(crate) fn regular_file_node_is_open_writable(node: VfsNodeId) -> bool {
     WRITABLE_REGULAR_OPEN_COUNTS
+        .lock()
+        .get(&node)
+        .copied()
+        .unwrap_or(0)
+        > 0
+}
+
+pub(crate) fn track_regular_file_executable(node: VfsNodeId) {
+    let mut counts = EXECUTABLE_REGULAR_COUNTS.lock();
+    *counts.entry(node).or_insert(0) += 1;
+}
+
+pub(crate) fn untrack_regular_file_executable(node: VfsNodeId) {
+    let mut counts = EXECUTABLE_REGULAR_COUNTS.lock();
+    let Some(count) = counts.get_mut(&node) else {
+        return;
+    };
+    if *count > 1 {
+        *count -= 1;
+    } else {
+        counts.remove(&node);
+    }
+}
+
+pub(crate) fn regular_file_node_is_executable(node: VfsNodeId) -> bool {
+    EXECUTABLE_REGULAR_COUNTS
         .lock()
         .get(&node)
         .copied()
@@ -280,6 +308,12 @@ fn open_vfs_file_impl(
                     // intentionally deferred.
                 }
                 let (readable, writable) = flags.read_write();
+                if path.kind == FsNodeKind::RegularFile
+                    && writable
+                    && regular_file_node_is_executable(path.node)
+                {
+                    return Err(FsError::TextBusy);
+                }
                 if flags.contains(OpenFlags::TRUNC) && flags.writable_target() {
                     with_mount(path.node.mount_id, |mount| mount.set_len(path.node.ino, 0))
                         .ok_or(FsError::Io)??;

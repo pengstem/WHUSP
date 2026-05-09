@@ -65,6 +65,7 @@ impl From<crate::fs::FsError> for SysError {
             crate::fs::FsError::InvalidInput => Self::EINVAL,
             crate::fs::FsError::NotEmpty => Self::ENOTEMPTY,
             crate::fs::FsError::Busy => Self::EBUSY,
+            crate::fs::FsError::TextBusy => Self::ETXTBSY,
             crate::fs::FsError::CrossDevice => Self::EXDEV,
             crate::fs::FsError::Io => Self::EIO,
             crate::fs::FsError::NameTooLong => Self::ENAMETOOLONG,

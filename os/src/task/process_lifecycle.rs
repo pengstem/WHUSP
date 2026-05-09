@@ -8,7 +8,9 @@ use super::process::{
 use super::{
     CloneArgs, CloneFlags, FdTableEntry, SignalAction, TaskControlBlock, add_task, pid_alloc,
 };
-use crate::fs::{OpenFlags, ROOT_MOUNT_NAMESPACE, Stdin, Stdout, WorkingDir};
+use crate::fs::{
+    OpenFlags, ROOT_MOUNT_NAMESPACE, Stdin, Stdout, WorkingDir, track_regular_file_executable,
+};
 use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet};
 use crate::sync::UPIntrFreeCell;
 use crate::trap::{TrapContext, trap_handler};
@@ -68,6 +70,7 @@ impl ProcessControlBlock {
                 UPIntrFreeCell::new(ProcessControlBlockInner {
                     is_zombie: false,
                     memory_set,
+                    executable_node: None,
                     root: WorkingDir::root(),
                     root_path: "/".into(),
                     cwd: WorkingDir::root(),
@@ -167,6 +170,7 @@ impl ProcessControlBlock {
         let root_path = parent.root_path.clone();
         let cwd = parent.cwd;
         let cwd_path = parent.cwd_path.clone();
+        let executable_node = parent.executable_node;
         let cmdline = parent.cmdline.clone();
         let pgid = parent.pgid;
         let signal_actions = parent.signal_actions;
@@ -184,6 +188,7 @@ impl ProcessControlBlock {
                 UPIntrFreeCell::new(ProcessControlBlockInner {
                     is_zombie: false,
                     memory_set,
+                    executable_node,
                     root,
                     root_path,
                     cwd,
@@ -209,6 +214,9 @@ impl ProcessControlBlock {
                 })
             },
         });
+        if let Some(node) = executable_node {
+            track_regular_file_executable(node);
+        }
         child_parent
             .inner_exclusive_access()
             .children

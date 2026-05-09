@@ -4,7 +4,7 @@ use super::{
     TaskStatus,
 };
 use crate::config::USER_STACK_SIZE;
-use crate::fs::{MountNamespaceId, PathContext, WorkingDir};
+use crate::fs::{MountNamespaceId, PathContext, VfsNodeId, WorkingDir};
 use crate::mm::MemorySet;
 use crate::sync::{UPIntrFreeCell, UPIntrRefMut};
 use alloc::format;
@@ -355,6 +355,7 @@ pub struct ProcessControlBlock {
 pub struct ProcessControlBlockInner {
     pub is_zombie: bool,
     pub memory_set: MemorySet,
+    pub executable_node: Option<VfsNodeId>,
     pub root: WorkingDir,
     pub root_path: String,
     pub cwd: WorkingDir,

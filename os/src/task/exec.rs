@@ -1,5 +1,6 @@
 use super::{SigAltStack, SignalAction, process::ProcessControlBlock};
 use crate::config::PAGE_SIZE;
+use crate::fs::{VfsNodeId, track_regular_file_executable, untrack_regular_file_executable};
 use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet, translated_refmut};
 use crate::trap::{TrapContext, trap_handler};
 use alloc::string::String;
@@ -141,6 +142,7 @@ impl ProcessControlBlock {
         interpreter: Option<&xmas_elf::ElfFile<'_>>,
         args: Vec<String>,
         envs: Vec<String>,
+        executable_node: Option<VfsNodeId>,
     ) {
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
         let ElfLoadInfo {
@@ -166,9 +168,10 @@ impl ProcessControlBlock {
         };
         let new_token = memory_set.token();
 
-        {
+        let previous_executable_node = {
             let mut inner = self.inner_exclusive_access();
             inner.memory_set = memory_set;
+            let previous = core::mem::replace(&mut inner.executable_node, executable_node);
             inner.cmdline = args.clone();
             for action in inner.signal_actions.iter_mut() {
                 if action.has_user_handler() {
@@ -184,6 +187,13 @@ impl ProcessControlBlock {
                     *fd = None;
                 }
             }
+            previous
+        };
+        if let Some(node) = previous_executable_node {
+            untrack_regular_file_executable(node);
+        }
+        if let Some(node) = executable_node {
+            track_regular_file_executable(node);
         }
 
         let task = self.inner_exclusive_access().get_task(0);

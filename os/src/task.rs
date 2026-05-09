@@ -15,6 +15,7 @@ mod task;
 
 use self::id::TaskUserRes;
 use crate::arch::__switch;
+use crate::fs::untrack_regular_file_executable;
 use crate::sbi::shutdown;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::{release_flock_locks_for_closed_fd_table, release_record_locks_for_process};
@@ -279,7 +280,7 @@ fn exit_current(exit_code: i32, group_exit: bool) {
         terminate_sibling_threads(&process, tid, process_token, process_id, exit_code);
         remove_ready_tasks_of_process(pid);
         futex::remove_process_futex_waiters(pid);
-        let (parent, children, fd_table, flushes) = {
+        let (parent, children, fd_table, flushes, executable_node) = {
             let mut process_inner = process.inner_exclusive_access();
             // mark this process as a zombie process
             process_inner.is_zombie = true;
@@ -289,6 +290,7 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             let children = core::mem::take(&mut process_inner.children);
             // deallocate other data in user space i.e. program code/data section
             let flushes = process_inner.memory_set.recycle_data_pages();
+            let executable_node = process_inner.executable_node.take();
             // Take the fd table out while the current task is still installed.
             // Dropping VFS file objects can take SleepMutex-backed mount locks.
             let fd_table = core::mem::take(&mut process_inner.fd_table);
@@ -298,11 +300,14 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             while process_inner.tasks.len() > 1 {
                 process_inner.tasks.pop();
             }
-            (parent, children, fd_table, flushes)
+            (parent, children, fd_table, flushes, executable_node)
         };
 
         for flush in flushes {
             flush.write_back();
+        }
+        if let Some(node) = executable_node {
+            untrack_regular_file_executable(node);
         }
         release_record_locks_for_process(pid);
         release_flock_locks_for_closed_fd_table(&fd_table);

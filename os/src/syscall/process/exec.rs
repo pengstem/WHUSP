@@ -1,6 +1,7 @@
 use crate::fs::{
-    File, FileStat, OpenFlags, PathContext, S_IFLNK, S_IFMT, S_IFREG, open_file_in,
-    regular_file_is_open_writable_in, regular_file_node_is_open_writable, stat_in,
+    File, FileStat, FsNodeKind, OpenFlags, PathContext, S_IFLNK, S_IFMT, S_IFREG, VfsNodeId,
+    lookup_path_in, open_file_in, regular_file_is_open_writable_in,
+    regular_file_node_is_open_writable, stat_in,
 };
 use crate::mm::elf_required_interpreter_path;
 use crate::syscall::errno::{SysError, SysResult};
@@ -178,6 +179,15 @@ fn check_exec_open_file(file: &Arc<dyn File + Send + Sync>) -> SysResult<()> {
         return Err(SysError::ETXTBSY);
     }
     Ok(())
+}
+
+fn executable_node_in(
+    context: PathContext,
+    path: &str,
+    follow_final_symlink: bool,
+) -> Option<VfsNodeId> {
+    let path = lookup_path_in(context, path, follow_final_symlink).ok()?;
+    (path.kind == FsNodeKind::RegularFile).then_some(path.node)
 }
 
 fn busybox_fallback(
@@ -371,6 +381,7 @@ fn exec_script(
             envs,
             depth + 1,
             interpreter_data,
+            None,
         );
     }
 
@@ -383,6 +394,7 @@ fn exec_loaded_program(
     envs: Vec<String>,
     depth: usize,
     data: Vec<u8>,
+    executable_node: Option<VfsNodeId>,
 ) -> SysResult {
     if data.starts_with(ELF_MAGIC) {
         let elf = xmas_elf::ElfFile::new(data.as_slice()).map_err(|_| SysError::ENOEXEC)?;
@@ -397,7 +409,7 @@ fn exec_loaded_program(
             .as_ref()
             .map(|data| xmas_elf::ElfFile::new(data.as_slice()).map_err(|_| SysError::ENOEXEC))
             .transpose()?;
-        current_process().exec(&elf, interpreter_elf.as_ref(), args, envs);
+        current_process().exec(&elf, interpreter_elf.as_ref(), args, envs, executable_node);
         // CONTEXT: Linux execve starts a new image instead of returning to the
         // old program. For PT_INTERP ELFs, the kernel enters the dynamic linker
         // while auxv still describes the original executable.
@@ -408,7 +420,7 @@ fn exec_loaded_program(
         exec_compat_script_redirect(path.as_str(), data.as_slice(), args.clone())
     {
         let target_data = read_exec_file(target.as_str())?;
-        return exec_loaded_program(target, next_args, envs, depth + 1, target_data);
+        return exec_loaded_program(target, next_args, envs, depth + 1, target_data, None);
     }
 
     let interpreter = match parse_shebang(data.as_slice())? {
@@ -424,8 +436,13 @@ fn exec_loaded_program(
 fn exec_path(path: String, args: Vec<String>, envs: Vec<String>) -> SysResult {
     let args = normalize_exec_args(args);
     let envs = normalize_exec_envs(path.as_str(), envs);
+    let executable_node = executable_node_in(
+        current_process().path_snapshot().context,
+        path.as_str(),
+        true,
+    );
     let data = read_exec_file(path.as_str())?;
-    exec_loaded_program(path, args, envs, 0, data)
+    exec_loaded_program(path, args, envs, 0, data, executable_node)
 }
 
 fn exec_path_in(
@@ -437,8 +454,9 @@ fn exec_path_in(
 ) -> SysResult {
     let args = normalize_exec_args(args);
     let envs = normalize_exec_envs(path.as_str(), envs);
+    let executable_node = executable_node_in(context.clone(), path.as_str(), follow_final_symlink);
     let data = read_exec_file_in(context, path.as_str(), follow_final_symlink)?;
-    exec_loaded_program(path, args, envs, 0, data)
+    exec_loaded_program(path, args, envs, 0, data, executable_node)
 }
 
 fn exec_open_file(
@@ -449,12 +467,13 @@ fn exec_open_file(
 ) -> SysResult {
     let args = normalize_exec_args(args);
     let envs = normalize_exec_envs(display_path.as_str(), envs);
+    let executable_node = file.vfs_node_id();
     let data = read_exec_open_file(file)?;
     // UNFINISHED: Linux gives execveat(AT_EMPTY_PATH) scripts a `/dev/fd/N`
     // style script name and has close-on-exec interpreter edge cases. The LTP
     // coverage reached here uses ELF payloads, so this path currently reuses
     // the ordinary script loader without full fd-backed script semantics.
-    exec_loaded_program(display_path, args, envs, 0, data)
+    exec_loaded_program(display_path, args, envs, 0, data, executable_node)
 }
 
 fn normalize_exec_args(mut args: Vec<String>) -> Vec<String> {
