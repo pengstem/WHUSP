@@ -880,9 +880,13 @@ fn is_mount_descendant(root: &DynamicMount, mount: &DynamicMount) -> bool {
         return false;
     }
     // CONTEXT: Unmounting a later root should reveal older mount layers that
-    // were already present below the target. Only descendants mounted after
-    // this root are part of the subtree that should be detached with it.
-    if mount.event_id <= root.event_id {
+    // were already present below the target. A moved shared/slave subtree may
+    // have an older event id while still recording this root as its propagation
+    // parent, as in fs_bind_cloneNS07's parent2 -> parent2/a chain.
+    if mount.event_id <= root.event_id
+        && !(mount.propagation_parent_path == root.target_path
+            && mount.propagation_parent_group == root.peer_group)
+    {
         return false;
     }
     let Some(suffix) = path_suffix(root.target_path.as_str(), mount.target_path.as_str()) else {
