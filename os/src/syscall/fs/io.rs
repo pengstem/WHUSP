@@ -652,7 +652,7 @@ pub fn sys_preadv(
         if iovec.len == 0 {
             continue;
         }
-        translated_byte_buffer_checked(
+        translated_byte_buffer_checked_with_mmap_fault(
             token,
             iovec.base as *const u8,
             iovec.len,
@@ -665,7 +665,7 @@ pub fn sys_preadv(
         if iovec.len == 0 {
             continue;
         }
-        let buffers = translated_byte_buffer_checked(
+        let buffers = translated_byte_buffer_checked_with_mmap_fault(
             token,
             iovec.base as *const u8,
             iovec.len,
@@ -715,7 +715,7 @@ pub fn sys_pwritev(
         if iovec.len == 0 {
             continue;
         }
-        let buffers = match translated_byte_buffer_checked(
+        let buffers = match translated_byte_buffer_checked_with_mmap_fault(
             token,
             iovec.base as *const u8,
             iovec.len,
@@ -800,7 +800,7 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
         if iovec.len == 0 {
             continue;
         }
-        let buffers = match translated_byte_buffer_checked(
+        let buffers = match translated_byte_buffer_checked_with_mmap_fault(
             token,
             iovec.base as *const u8,
             iovec.len,
@@ -854,7 +854,7 @@ pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult 
         if iovec.len == 0 {
             continue;
         }
-        translated_byte_buffer_checked(
+        translated_byte_buffer_checked_with_mmap_fault(
             token,
             iovec.base as *const u8,
             iovec.len,
@@ -867,7 +867,7 @@ pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult 
         if iovec.len == 0 {
             continue;
         }
-        let buffers = translated_byte_buffer_checked(
+        let buffers = translated_byte_buffer_checked_with_mmap_fault(
             token,
             iovec.base as *const u8,
             iovec.len,
