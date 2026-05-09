@@ -4,7 +4,7 @@ use super::super::errno::{SysError, SysResult};
 
 const CLONE_NEWNS: usize = 1 << 17;
 const PID_FILE_BASE: u64 = 10_000;
-const PID_FILE_STRIDE: u64 = 10;
+const PID_FILE_STRIDE: u64 = 16;
 const PID_NS_MNT_OFFSET: u64 = 6;
 
 fn mount_namespace_pid_from_proc_path(path: &str) -> Option<usize> {
