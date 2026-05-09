@@ -328,8 +328,16 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
     // LTP's shell helper, so disable LTP's per-case shell timer for this pass.
     command.push_str(" && { export LTPROOT=\"");
     command.push_str(libc_root);
+    command.push_str("/ltp\"; export TMPBASE=\"/tmp\"; export TST_TIMEOUT=\"-1\"; ");
+    command.push_str("export LD_LIBRARY_PATH=\"");
+    if libc_root == "/musl" {
+        command.push_str("/musl/lib:/glibc/lib:/lib\"; ");
+    } else {
+        command.push_str(libc_root);
+        command.push_str("/lib:/glibc/lib:/musl/lib:/lib\"; ");
+    }
     command.push_str(
-        "/ltp\"; export TMPBASE=\"/tmp\"; export TST_TIMEOUT=\"-1\"; export PATH=\"$PATH:$LTPROOT/testcases/bin:$LTPROOT/bin\"; ./busybox echo \"#### OS COMP TEST GROUP START ltp-",
+        "export PATH=\"$PATH:$LTPROOT/testcases/bin:$LTPROOT/bin\"; ./busybox echo \"#### OS COMP TEST GROUP START ltp-",
     );
     command.push_str(libc_label(libc_root));
     command.push_str(" ####\"; cd \"$LTPROOT/testcases/bin\"; for file in *; do [ -f \"$file\" ] || continue; case_name=${file##*/}; ");
@@ -339,7 +347,11 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
     // CONTEXT: The autotest parser consumes the historical
     // "FAIL LTP CASE ... : <ret>" record as a per-case result line. A zero
     // return still means the case passed, so keep the text stable here.
-    command.push_str(") echo \"SKIP LTP CASE $case_name\"; continue ;; esac; echo \"RUN LTP CASE $case_name\"; \"./$case_name\"; ret=$?; echo \"FAIL LTP CASE $case_name : $ret\"; done; \"");
+    command.push_str(
+        ") echo \"SKIP LTP CASE $case_name\"; continue ;; esac; echo \"RUN LTP CASE $case_name\"; ",
+    );
+    command.push_str("\"./$case_name\"; ");
+    command.push_str("ret=$?; echo \"FAIL LTP CASE $case_name : $ret\"; done; \"");
     command.push_str(libc_root);
     command.push_str("/busybox\" echo \"#### OS COMP TEST GROUP END ltp-");
     command.push_str(libc_label(libc_root));

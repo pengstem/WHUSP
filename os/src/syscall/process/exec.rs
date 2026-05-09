@@ -17,7 +17,13 @@ use core::str;
 const ELF_MAGIC: &[u8] = b"\x7fELF";
 const SHEBANG_MAGIC: &[u8] = b"#!";
 const SHEBANG_RECURSION_LIMIT: usize = 4;
-const CONTEST_LIBRARY_PATH_ENV: &str = "LD_LIBRARY_PATH=/glibc/lib:/musl/lib:/lib";
+fn contest_library_path_env(root: &str) -> &'static str {
+    match root {
+        "/musl" => "LD_LIBRARY_PATH=/musl/lib:/glibc/lib:/lib",
+        "/glibc" => "LD_LIBRARY_PATH=/glibc/lib:/musl/lib:/lib",
+        _ => "LD_LIBRARY_PATH=/lib",
+    }
+}
 const AT_FDCWD: isize = -100;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_EMPTY_PATH: usize = 0x1000;
@@ -491,12 +497,12 @@ fn normalize_exec_envs(path: &str, mut envs: Vec<String>) -> Vec<String> {
         return envs;
     }
     let snapshot = current_process().path_snapshot();
-    if libc_test_root(snapshot.cwd_path.as_str(), path).is_some() {
+    if let Some(root) = libc_test_root(snapshot.cwd_path.as_str(), path) {
         // CONTEXT: Official-style test disks keep glibc/musl DSOs under the
         // libc root instead of materializing the default root `/lib` search
         // tree. Preserve custom envp contents, but add the loader path needed
         // for dynamically linked LTP child helpers.
-        envs.push(String::from(CONTEST_LIBRARY_PATH_ENV));
+        envs.push(String::from(contest_library_path_env(root)));
     }
     envs
 }

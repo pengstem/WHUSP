@@ -19,8 +19,20 @@ const AT_UID: usize = 11;
 const AT_EUID: usize = 12;
 const AT_GID: usize = 13;
 const AT_EGID: usize = 14;
+const AT_HWCAP: usize = 16;
+const AT_CLKTCK: usize = 17;
 const AT_SECURE: usize = 23;
 const AT_RANDOM: usize = 25;
+
+#[cfg(target_arch = "riscv64")]
+const ELF_HWCAP: usize = (1 << ('I' as usize - 'A' as usize))
+    | (1 << ('M' as usize - 'A' as usize))
+    | (1 << ('A' as usize - 'A' as usize))
+    | (1 << ('F' as usize - 'A' as usize))
+    | (1 << ('D' as usize - 'A' as usize))
+    | (1 << ('C' as usize - 'A' as usize));
+#[cfg(not(target_arch = "riscv64"))]
+const ELF_HWCAP: usize = 0;
 
 pub(super) struct ExecStackInfo {
     pub(super) at_entry: usize,
@@ -97,6 +109,8 @@ pub(super) fn init_user_stack(
         (AT_EUID, stack_info.euid as usize),
         (AT_GID, stack_info.gid as usize),
         (AT_EGID, stack_info.egid as usize),
+        (AT_HWCAP, ELF_HWCAP),
+        (AT_CLKTCK, 100),
         (AT_SECURE, 0),
         (AT_RANDOM, random_addr),
     ];
