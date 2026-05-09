@@ -315,8 +315,8 @@ pub(crate) use vfs::open_file;
 pub(crate) use vfs::{
     FileCreateAttrs, FileSystemStat, FsError, FsNodeKind, FsResult, chmod_in, chown_in,
     link_open_file_in, lookup_dir_in, lookup_dir_with_stat_in, lookup_path_in, open_file_in,
-    open_file_in_with_attrs, open_tmpfile_in_with_attrs, regular_file_is_open_writable_in, stat_in,
-    truncate_in,
+    open_file_in_with_attrs, open_tmpfile_in_with_attrs, regular_file_is_open_writable_in,
+    regular_file_node_is_open_writable, stat_in, truncate_in,
 };
 
 pub(self) fn align_up(value: usize, align: usize) -> usize {

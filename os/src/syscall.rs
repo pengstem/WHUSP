@@ -142,6 +142,7 @@ const SYSCALL_SETNS: usize = 268;
 const SYSCALL_RENAMEAT2: usize = 276;
 const SYSCALL_GETRANDOM: usize = 278;
 const SYSCALL_MEMFD_CREATE: usize = 279;
+const SYSCALL_EXECVEAT: usize = 281;
 const SYSCALL_MEMBARRIER: usize = 283;
 const SYSCALL_COPY_FILE_RANGE: usize = 285;
 const SYSCALL_STATX: usize = 291;
@@ -484,6 +485,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[0] as *const u8,
             args[1] as *const usize,
             args[2] as *const usize,
+        ),
+        SYSCALL_EXECVEAT => sys_execveat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *const usize,
+            args[3] as *const usize,
+            args[4],
         ),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2] as i32),

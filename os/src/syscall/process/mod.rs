@@ -7,7 +7,7 @@ mod resource;
 mod system;
 
 pub use clone::sys_clone;
-pub use exec::sys_execve;
+pub use exec::{sys_execve, sys_execveat};
 pub use id::{
     sys_exit, sys_exit_group, sys_getpgid, sys_getpid, sys_getppid, sys_gettid, sys_kill,
     sys_sched_yield, sys_set_tid_address, sys_setpgid, sys_setsid,

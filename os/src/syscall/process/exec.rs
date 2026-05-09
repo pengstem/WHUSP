@@ -1,11 +1,13 @@
 use crate::fs::{
-    File, FileStat, OpenFlags, S_IFMT, S_IFREG, open_file_in, regular_file_is_open_writable_in,
-    stat_in,
+    File, FileStat, OpenFlags, PathContext, S_IFLNK, S_IFMT, S_IFREG, open_file_in,
+    regular_file_is_open_writable_in, regular_file_node_is_open_writable, stat_in,
 };
 use crate::mm::elf_required_interpreter_path;
 use crate::syscall::errno::{SysError, SysResult};
+use crate::syscall::fs::path_context_from;
 use crate::syscall::user_ptr::{PATH_MAX, read_user_c_string, read_user_usize};
 use crate::task::{current_process, current_user_token};
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -15,6 +17,10 @@ const ELF_MAGIC: &[u8] = b"\x7fELF";
 const SHEBANG_MAGIC: &[u8] = b"#!";
 const SHEBANG_RECURSION_LIMIT: usize = 4;
 const CONTEST_LIBRARY_PATH_ENV: &str = "LD_LIBRARY_PATH=/glibc/lib:/musl/lib:/lib";
+const AT_FDCWD: isize = -100;
+const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+const AT_EMPTY_PATH: usize = 0x1000;
+const VALID_EXECVEAT_FLAGS: usize = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
 
 struct ScriptInterpreter {
     path: String,
@@ -130,9 +136,7 @@ fn has_execute_permission(stat: &FileStat) -> bool {
     granted & 0o1 != 0
 }
 
-fn check_exec_file(path: &str) -> SysResult<()> {
-    let context = current_process().path_snapshot().context;
-    let stat = stat_in(context.clone(), path, true)?;
+fn check_exec_stat(stat: &FileStat) -> SysResult<()> {
     if stat.mode & S_IFMT != S_IFREG {
         return Err(SysError::EACCES);
     }
@@ -140,10 +144,37 @@ fn check_exec_file(path: &str) -> SysResult<()> {
     // UNFINISHED: Linux also folds path-prefix search permissions, ACLs,
     // capabilities, and noexec mounts into exec permission checks. The current
     // check covers the regular-file DAC and text-busy paths exercised here.
-    if !has_execute_permission(&stat) {
+    if !has_execute_permission(stat) {
         return Err(SysError::EACCES);
     }
+    Ok(())
+}
+
+fn check_exec_file_in(
+    context: PathContext,
+    path: &str,
+    follow_final_symlink: bool,
+) -> SysResult<()> {
+    if !follow_final_symlink {
+        let stat = stat_in(context.clone(), path, false)?;
+        if stat.mode & S_IFMT == S_IFLNK {
+            return Err(SysError::ELOOP);
+        }
+    }
+    let stat = stat_in(context.clone(), path, true)?;
+    check_exec_stat(&stat)?;
     if regular_file_is_open_writable_in(context, path)? {
+        return Err(SysError::ETXTBSY);
+    }
+    Ok(())
+}
+
+fn check_exec_open_file(file: &Arc<dyn File + Send + Sync>) -> SysResult<()> {
+    let stat = file.stat()?;
+    check_exec_stat(&stat)?;
+    if let Some(node) = file.vfs_node_id()
+        && regular_file_node_is_open_writable(node)
+    {
         return Err(SysError::ETXTBSY);
     }
     Ok(())
@@ -191,14 +222,23 @@ fn interpreter_candidates(
     candidates
 }
 
-fn read_exec_file_direct(path: &str) -> SysResult<Vec<u8>> {
-    check_exec_file(path)?;
-    let app_file = open_file_in(
-        current_process().path_snapshot().context,
-        path,
-        OpenFlags::RDONLY,
-    )?;
+fn read_exec_file_in(
+    context: PathContext,
+    path: &str,
+    follow_final_symlink: bool,
+) -> SysResult<Vec<u8>> {
+    check_exec_file_in(context.clone(), path, follow_final_symlink)?;
+    let app_file = open_file_in(context, path, OpenFlags::RDONLY)?;
     read_all_file(app_file)
+}
+
+fn read_exec_file_direct(path: &str) -> SysResult<Vec<u8>> {
+    read_exec_file_in(current_process().path_snapshot().context, path, true)
+}
+
+fn read_exec_open_file(file: Arc<dyn File + Send + Sync>) -> SysResult<Vec<u8>> {
+    check_exec_open_file(&file)?;
+    read_all_file(file)
 }
 
 fn lmbench_all_redirect() -> &'static str {
@@ -388,6 +428,35 @@ fn exec_path(path: String, args: Vec<String>, envs: Vec<String>) -> SysResult {
     exec_loaded_program(path, args, envs, 0, data)
 }
 
+fn exec_path_in(
+    context: PathContext,
+    path: String,
+    follow_final_symlink: bool,
+    args: Vec<String>,
+    envs: Vec<String>,
+) -> SysResult {
+    let args = normalize_exec_args(args);
+    let envs = normalize_exec_envs(path.as_str(), envs);
+    let data = read_exec_file_in(context, path.as_str(), follow_final_symlink)?;
+    exec_loaded_program(path, args, envs, 0, data)
+}
+
+fn exec_open_file(
+    display_path: String,
+    file: Arc<dyn File + Send + Sync>,
+    args: Vec<String>,
+    envs: Vec<String>,
+) -> SysResult {
+    let args = normalize_exec_args(args);
+    let envs = normalize_exec_envs(display_path.as_str(), envs);
+    let data = read_exec_open_file(file)?;
+    // UNFINISHED: Linux gives execveat(AT_EMPTY_PATH) scripts a `/dev/fd/N`
+    // style script name and has close-on-exec interpreter edge cases. The LTP
+    // coverage reached here uses ELF payloads, so this path currently reuses
+    // the ordinary script loader without full fd-backed script semantics.
+    exec_loaded_program(display_path, args, envs, 0, data)
+}
+
 fn normalize_exec_args(mut args: Vec<String>) -> Vec<String> {
     if args.is_empty() {
         // CONTEXT: Linux fills in a dummy argv[0] for execve() calls that pass
@@ -419,4 +488,56 @@ pub fn sys_execve(path: *const u8, args: *const usize, envs: *const usize) -> Sy
     let args_vec = translated_string_array(token, args)?;
     let envs_vec = translated_string_array(token, envs)?;
     exec_path(path, args_vec, envs_vec)
+}
+
+fn file_by_fd(fd: isize) -> SysResult<Arc<dyn File + Send + Sync>> {
+    if fd < 0 {
+        return Err(SysError::EBADF);
+    }
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    inner
+        .fd_table
+        .get(fd as usize)
+        .and_then(|entry| entry.as_ref())
+        .map(|entry| entry.file())
+        .ok_or(SysError::EBADF)
+}
+
+pub fn sys_execveat(
+    dirfd: isize,
+    path: *const u8,
+    args: *const usize,
+    envs: *const usize,
+    flags: usize,
+) -> SysResult {
+    if flags & !VALID_EXECVEAT_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+
+    let token = current_user_token();
+    let path = read_user_c_string(token, path, PATH_MAX)?;
+    let args_vec = translated_string_array(token, args)?;
+    let envs_vec = translated_string_array(token, envs)?;
+
+    if path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(SysError::ENOENT);
+        }
+        if dirfd == AT_FDCWD {
+            let file = open_file_in(
+                current_process().path_snapshot().context,
+                ".",
+                OpenFlags::PATH,
+            )?;
+            return exec_open_file(String::from("."), file, args_vec, envs_vec);
+        }
+        let file = file_by_fd(dirfd)?;
+        return exec_open_file(format!("/dev/fd/{dirfd}"), file, args_vec, envs_vec);
+    }
+
+    let snapshot = current_process().path_snapshot();
+    let context = path_context_from(&snapshot, dirfd, path.as_str())?;
+    let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
+    exec_path_in(context, path, follow_final_symlink, args_vec, envs_vec)
 }

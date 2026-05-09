@@ -41,7 +41,7 @@ fn dirfd_base_from(snapshot: &PathSnapshot, dirfd: isize) -> SysResult<WorkingDi
     file.working_dir().ok_or(SysError::ENOTDIR)
 }
 
-pub(super) fn path_context_from(
+pub(crate) fn path_context_from(
     snapshot: &PathSnapshot,
     dirfd: isize,
     path: &str,

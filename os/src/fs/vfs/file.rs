@@ -56,12 +56,16 @@ pub(crate) fn regular_file_is_open_writable_in(context: PathContext, name: &str)
     if path.kind != FsNodeKind::RegularFile {
         return Ok(false);
     }
-    Ok(WRITABLE_REGULAR_OPEN_COUNTS
+    Ok(regular_file_node_is_open_writable(path.node))
+}
+
+pub(crate) fn regular_file_node_is_open_writable(node: VfsNodeId) -> bool {
+    WRITABLE_REGULAR_OPEN_COUNTS
         .lock()
-        .get(&path.node)
+        .get(&node)
         .copied()
         .unwrap_or(0)
-        > 0)
+        > 0
 }
 
 #[derive(Clone, Debug)]

@@ -24,6 +24,7 @@ pub use io::{
     sys_writev,
 };
 pub use mount::{sys_mount, sys_umount2};
+pub(crate) use path::path_context_from;
 pub use path::{
     sys_chdir, sys_chroot, sys_faccessat, sys_faccessat2, sys_fchdir, sys_getcwd, sys_getdents64,
     sys_linkat, sys_mkdirat, sys_mknodat, sys_openat, sys_readlinkat, sys_renameat2, sys_symlinkat,
