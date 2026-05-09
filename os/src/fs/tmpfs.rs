@@ -495,9 +495,11 @@ impl FileSystemBackend for TmpFs {
         };
         let blocks = match inode.kind {
             FsNodeKind::Directory => size.div_ceil(512),
+            FsNodeKind::Symlink => 0,
             _ => (inode.allocated_payload_len() as u64).div_ceil(512),
         };
         Ok(FileStat {
+            ino: ino as u64,
             mode: inode.mode,
             nlink: inode.nlink,
             uid: inode.uid,
