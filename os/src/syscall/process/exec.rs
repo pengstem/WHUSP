@@ -11,6 +11,7 @@ use core::str;
 const ELF_MAGIC: &[u8] = b"\x7fELF";
 const SHEBANG_MAGIC: &[u8] = b"#!";
 const SHEBANG_RECURSION_LIMIT: usize = 4;
+const CONTEST_LIBRARY_PATH_ENV: &str = "LD_LIBRARY_PATH=/glibc/lib:/musl/lib:/lib";
 
 struct ScriptInterpreter {
     path: String,
@@ -340,8 +341,35 @@ fn exec_loaded_program(
 }
 
 fn exec_path(path: String, args: Vec<String>, envs: Vec<String>) -> SysResult {
+    let args = normalize_exec_args(args);
+    let envs = normalize_exec_envs(path.as_str(), envs);
     let data = read_exec_file(path.as_str())?;
     exec_loaded_program(path, args, envs, 0, data)
+}
+
+fn normalize_exec_args(mut args: Vec<String>) -> Vec<String> {
+    if args.is_empty() {
+        // CONTEXT: Linux fills in a dummy argv[0] for execve() calls that pass
+        // an empty argument list. LTP execve06 checks that user code never sees
+        // argv[0] as NULL.
+        args.push(String::new());
+    }
+    args
+}
+
+fn normalize_exec_envs(path: &str, mut envs: Vec<String>) -> Vec<String> {
+    if envs.iter().any(|env| env.starts_with("LD_LIBRARY_PATH=")) {
+        return envs;
+    }
+    let snapshot = current_process().path_snapshot();
+    if libc_test_root(snapshot.cwd_path.as_str(), path).is_some() {
+        // CONTEXT: Official-style test disks keep glibc/musl DSOs under the
+        // libc root instead of materializing the default root `/lib` search
+        // tree. Preserve custom envp contents, but add the loader path needed
+        // for dynamically linked LTP child helpers.
+        envs.push(String::from(CONTEST_LIBRARY_PATH_ENV));
+    }
+    envs
 }
 
 pub fn sys_execve(path: *const u8, args: *const usize, envs: *const usize) -> SysResult {
