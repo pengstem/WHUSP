@@ -182,6 +182,10 @@ impl MemorySet {
                     }
                 }
             } else if area.map_perm.contains(MapPermission::W) {
+                // UNFINISHED: Writable private mappings still use eager copy
+                // on fork instead of Linux-style copy-on-write. The bounded
+                // stack window keeps this compatible path within contest memory
+                // pressure for hackbench.
                 if !memory_set.push(new_area, None) {
                     return None;
                 }
