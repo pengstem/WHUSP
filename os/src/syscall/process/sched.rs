@@ -121,6 +121,20 @@ pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: usize) -> SysR
     Ok(AFFINITY_MASK_BYTES as isize)
 }
 
+pub fn sys_sched_setparam(pid: isize, param: usize) -> SysResult {
+    if param == 0 {
+        return Err(SysError::EINVAL);
+    }
+    let sched_param = read_user_value(current_user_token(), param as *const LinuxSchedParam)?;
+    let task = sched_target_task(pid)?;
+    let mut inner = task.inner_exclusive_access();
+    validate_priority_for_policy(inner.sched_policy, sched_param.sched_priority)?;
+    // CONTEXT: This updates only Linux ABI-visible static priority metadata.
+    // The contest scheduler still runs a single non-RT run queue.
+    inner.sched_priority = sched_param.sched_priority;
+    Ok(0)
+}
+
 pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: usize) -> SysResult {
     if param == 0 {
         return Err(SysError::EINVAL);
