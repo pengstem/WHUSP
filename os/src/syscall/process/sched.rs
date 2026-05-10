@@ -8,7 +8,13 @@ use crate::{
 use alloc::sync::Arc;
 use core::mem::size_of;
 
-const SCHED_OTHER: isize = 0;
+const SCHED_OTHER: i32 = 0;
+const SCHED_FIFO: i32 = 1;
+const SCHED_RR: i32 = 2;
+const SCHED_BATCH: i32 = 3;
+const SCHED_IDLE: i32 = 5;
+const SCHED_DEADLINE: i32 = 6;
+const RT_PRIORITY_MAX: isize = 99;
 const AFFINITY_MASK_BYTES: usize = size_of::<usize>();
 
 #[repr(C)]
@@ -45,7 +51,7 @@ pub fn sys_sched_getscheduler(pid: isize) -> SysResult {
     // CONTEXT: The kernel currently runs every task through the same scheduler
     // class, so expose the Linux SCHED_OTHER policy until real per-thread
     // scheduling attributes are introduced.
-    Ok(SCHED_OTHER)
+    Ok(SCHED_OTHER as isize)
 }
 
 pub fn sys_sched_getparam(pid: isize, param: usize) -> SysResult {
@@ -76,4 +82,12 @@ pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: usize) -> SysR
     let affinity_mask = 1usize.to_ne_bytes();
     copy_to_user(current_user_token(), mask as *mut u8, &affinity_mask)?;
     Ok(AFFINITY_MASK_BYTES as isize)
+}
+
+pub fn sys_sched_get_priority_max(policy: i32) -> SysResult {
+    match policy {
+        SCHED_FIFO | SCHED_RR => Ok(RT_PRIORITY_MAX),
+        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => Ok(0),
+        _ => Err(SysError::EINVAL),
+    }
 }
