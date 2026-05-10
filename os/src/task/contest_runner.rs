@@ -1,3 +1,4 @@
+use super::ltp_whitelist::LTP_CASE_WHITELIST;
 use alloc::{format, string::String};
 
 const TEST_LIBCS: &[&str] = &["/glibc", "/musl"];
@@ -19,233 +20,30 @@ const ALL_TESTS: &[&str] = &[
 ];
 
 const TEST_SCRIPTS: &[&str] = &[
-    // perfect
-    "basic_testcode.sh",
-    // runnable
+    // "basic_testcode.sh",
     // "busybox_testcode.sh",
-    // perfect
     // "lua_testcode.sh",
-    // runnable
-    "libctest_testcode.sh",
-    // runnable
+    // "libctest_testcode.sh",
     // "iozone_testcode.sh",
-    // runnable
     // "iperf_testcode.sh",
     // "libcbench_testcode.sh",
     // "lmbench_testcode.sh",
-    // runnable
     // "netperf_testcode.sh",
-    // runnable
-    // "cyclictest_testcode.sh",
+    "cyclictest_testcode.sh",
     // "ltp_testcode.sh",
 ];
 
-const LTP_BLACKLIST_PATTERNS: &[&str] = &[
-    "*-lib.sh",
-    "*_helper",
-    "*_lib.sh",
-    "*lib.sh",
-    "ask_password.sh",
-    "assign_password.sh",
-    "bbr*.sh",
-    "bind06",
-    "bind_noport01.sh",
-    "binfmt_misc*",
-    "block_dev",
-    "broken_ip-*",
-    "busy_poll*",
-    "cacheflush01",
-    "can_*",
-    "cap_bounds_*",
-    "cap_bset_inh_bounds",
-    "cfs_bandwidth01",
-    "cgroup_*",
-    "change_password.sh",
-    "check_*",
-    "clock_settime03",
-    "cpuacct*",
-    "cpufreq_boost",
-    "cpuctl_*",
-    "cpuhotplug*",
-    "cpuset*",
-    "create_datafile",
-    "create_file",
-    "cve-2017-17052",
-    "data",
-    "datafiles",
-    "dccp*",
-    "delete_module02",
-    "dhcp*",
-    "dirtyc0w*",
-    "dns*",
-    "doio",
-    "ebizzy",
-    "eject*",
-    "event_generator",
-    "epoll_pwait01",
-    "fanotify13",
-    "fanout01",
-    "fallocate04",
-    "fallocate05",
-    "fallocate06",
-    "fs_di",
-    "fs_inod",
-    "fs_perms",
-    "ftest03",
-    "ftp-download-stress02-rmt.sh",
-    "fcntl14",
-    "fcntl14_64",
-    "filecapstest.sh",
-    "find_portbundle",
-    "force_erase.sh",
-    "fork09",
-    "fork13",
-    "fork14",
-    "fork_exec_loop",
-    "fork_freeze.sh",
-    "fou*.sh",
-    "frag",
-    "freeze*",
-    "fs_fill",
-    "fsconfig01",
-    "fsconfig02",
-    "fsconfig03",
-    "fsmount01",
-    "fsmount02",
-    "fsopen01",
-    "fsopen02",
-    "fspick01",
-    "fspick02",
-    "fs_racer.sh",
-    "fs_racer_dir_create.sh",
-    "fs_racer_dir_test.sh",
-    "fs_racer_file_concat.sh",
-    "fs_racer_file_create.sh",
-    "fs_racer_file_link.sh",
-    "fs_racer_file_list.sh",
-    "fs_racer_file_rename.sh",
-    "fs_racer_file_rm.sh",
-    "fs_racer_file_symlink.sh",
-    "fsstress",
-    "fsx-linux",
-    "fsx.sh",
-    "fsync04",
-    "ftp-download-stress.sh",
-    "ftp-download-stress01-rmt.sh",
-    "ftp-upload-stress.sh",
-    "ftp-upload-stress01-rmt.sh",
-    "ftp-upload-stress02-rmt.sh",
-    "ftp01.sh",
-    "ftrace*",
-    "ftruncate04",
-    "ftruncate04_64",
-    "futex_waitv*",
-    "futex_wake04",
-    "futimesat01",
-    "fw_load",
-    "fgetxattr01",
-    "fsetxattr01",
-    "fsetxattr02",
-    "gettimeofday02",
-    "getrusage04",
-    "hackbench",
-    "inode02",
-    "ipsec*",
-    "iptables*",
-    "kcmp03",
-    "keyctl05",
-    "lftest",
-    "ltpClient",
-    "ltpServer",
-    "ltpSockets.sh",
-    "ltp_acpi",
-    "mallocstress",
-    "mcast*",
-    "mmap-corruption01",
-    "mmap1",
-    "mmap2",
-    "mmap3",
-    "mmapstress03",
-    "mmapstress05",
-    "mmapstress10",
-    "memcg_test_2",
-    "memcg_test_4",
-    "mmstress",
-    "mmstress_dummy",
-    "mremap01",
-    "mremap02",
-    "mremap03",
-    "mremap04",
-    "mremap05",
-    "mpls*",
-    "open_by_handle_at*",
-    "open_tree*",
-    "openfile",
-    "pids_task2",
-    "pivot_root*",
-    "pthserv",
-    "ptrace*",
-    "remap_file_pages*",
-    "route*",
-    "run_sched_cliserv.sh",
-    "sctp*",
-    "shm_test",
-    "shmat1",
-    "tcp_cc*",
-    "test_*",
-    "timed_forkbomb",
-    "tracepath01.sh",
-    "traceroute01.sh",
-    "tst_*",
-    "udp4-*",
-    "udp6-*",
-    "udp_ipsec*",
-    "uevent*",
-    "umip_basic_test",
-    "unshare01.sh",
-    "userns*",
-    "verify_caps_exec",
-    "vfork*",
-    "vhangup*",
-    "virt_lib.sh",
-    "vlan*.sh",
-    "vma*.sh",
-    "vma02",
-    "vma03",
-    "vma04",
-    "vma05_vdso",
-    "vsock01",
-    "vxlan*.sh",
-    "wc01.sh",
-    "which01.sh",
-    "wireguard*",
-    "write_freezing.sh",
-    "writev03",
-    "zram*",
-    // Host, privileged, namespace, cgroup, or device-environment families.
-    // Interactive MMC password helpers.
-    // LTP helper/library files that are not standalone test cases.
-    // Network test helpers and topology-dependent suites.
-    // Stress, freeze, or known hang/error cases seen in reference runners.
-];
-
-const LTP_MUSL_BLACKLIST_PATTERNS: &[&str] = &[
-    // CONTEXT: RISC-V musl implements epoll_create(size) by calling
-    // epoll_create1(0), so the kernel cannot distinguish invalid size values
-    // from the valid epoll_create1(0) path checked by epoll_create1_01.
-    "epoll_create02",
-];
-
-// None runs all non-blacklisted cases. Some("a")..Some("z") narrows by
-// leading letter, Some("long") runs names outside the ASCII alphabet,
-// Some("case:<name>") runs one exact LTP case, Some("cases:<a>,<b>") runs
-// selected exact LTP cases, Some("prefix:<name>") runs cases whose names
-// start with the prefix, and Some("range:<start>,<end>") runs cases in the
-// lexicographic half-open range [start, end). Empty range bounds are unbounded.
-const LTP_CASE_FILTER_OPTION: Option<&str> = Some("f");
+/// None runs the curated whitelist from ltp_whitelist.rs.
+/// Some("a")..Some("z") narrows by leading letter, Some("long") runs names
+/// outside the ASCII alphabet, Some("case:<name>") runs one exact LTP case,
+/// Some("cases:<a>,<b>") runs selected exact LTP cases, Some("prefix:<name>")
+/// runs cases whose names start with the prefix, and
+/// Some("range:<start>,<end>") runs cases in the lexicographic half-open range
+/// [start, end). Empty range bounds are unbounded.
+const LTP_CASE_FILTER_OPTION: Option<&str> = None;
 
 enum LtpCaseFilter {
-    All,
+    Whitelist,
     Letter(u8),
     Long,
     Exact(&'static str),
@@ -378,14 +176,10 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
     command.push_str(libc_label(libc_root));
     command.push_str(" ####\"; cd \"$LTPROOT/testcases/bin\"; for file in *; do [ -f \"$file\" ] || continue; case_name=${file##*/}; ");
     append_ltp_case_filter(command);
-    command.push_str("case \"$case_name\" in ");
-    append_ltp_blacklist_patterns(command, libc_root);
     // CONTEXT: The autotest parser consumes the historical
     // "FAIL LTP CASE ... : <ret>" record as a per-case result line. A zero
     // return still means the case passed, so keep the text stable here.
-    command.push_str(
-        ") echo \"SKIP LTP CASE $case_name\"; continue ;; esac; echo \"RUN LTP CASE $case_name\"; ",
-    );
+    command.push_str("echo \"RUN LTP CASE $case_name\"; ");
     command.push_str("\"./$case_name\"; ");
     command.push_str("ret=$?; echo \"FAIL LTP CASE $case_name : $ret\"; done; \"");
     command.push_str(libc_root);
@@ -396,7 +190,7 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
 
 fn append_ltp_case_filter(command: &mut String) {
     match ltp_case_filter() {
-        LtpCaseFilter::All => {}
+        LtpCaseFilter::Whitelist => append_ltp_whitelist_filter(command),
         LtpCaseFilter::Letter(letter) => {
             command.push_str("case \"$case_name\" in [");
             command.push(letter as char);
@@ -441,7 +235,7 @@ fn append_ltp_case_filter(command: &mut String) {
 
 fn ltp_case_filter() -> LtpCaseFilter {
     match LTP_CASE_FILTER_OPTION {
-        None => LtpCaseFilter::All,
+        None => LtpCaseFilter::Whitelist,
         Some(option) if option.eq_ignore_ascii_case("long") => LtpCaseFilter::Long,
         Some(option) if option.starts_with("case:") => {
             let case_name = &option["case:".len()..];
@@ -490,6 +284,16 @@ fn ltp_case_filter() -> LtpCaseFilter {
     }
 }
 
+fn append_ltp_whitelist_filter(command: &mut String) {
+    if LTP_CASE_WHITELIST.is_empty() {
+        command.push_str("continue; ");
+        return;
+    }
+    command.push_str("case \"$case_name\" in ");
+    append_ltp_case_slice_pattern(command, LTP_CASE_WHITELIST);
+    command.push_str(") ;; *) continue ;; esac; ");
+}
+
 fn is_ltp_case_boundary(name: &str) -> bool {
     name.is_empty() || is_ltp_case_name(name)
 }
@@ -512,23 +316,14 @@ fn append_ltp_case_set_pattern(command: &mut String, case_names: &str) {
     }
 }
 
-fn append_ltp_blacklist_patterns(command: &mut String, libc_root: &str) {
+fn append_ltp_case_slice_pattern(command: &mut String, case_names: &[&str]) {
     let mut first = true;
-    for pattern in LTP_BLACKLIST_PATTERNS {
+    for case_name in case_names {
         if !first {
             command.push('|');
         }
         first = false;
-        command.push_str(pattern);
-    }
-    if libc_root == "/musl" {
-        for pattern in LTP_MUSL_BLACKLIST_PATTERNS {
-            if !first {
-                command.push('|');
-            }
-            first = false;
-            command.push_str(pattern);
-        }
+        command.push_str(case_name);
     }
 }
 
