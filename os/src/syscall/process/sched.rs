@@ -2,7 +2,7 @@ use crate::{
     syscall::{
         errno::{SysError, SysResult},
         uapi::LinuxTimeSpec,
-        user_ptr::{copy_to_user, write_user_value},
+        user_ptr::{copy_to_user, read_user_value, write_user_value},
     },
     task::{TaskControlBlock, current_task, current_user_token, processes_snapshot},
 };
@@ -15,6 +15,7 @@ const SCHED_RR: i32 = 2;
 const SCHED_BATCH: i32 = 3;
 const SCHED_IDLE: i32 = 5;
 const SCHED_DEADLINE: i32 = 6;
+const SCHED_RESET_ON_FORK: i32 = 0x4000_0000;
 const RT_PRIORITY_MIN: isize = 1;
 const RT_PRIORITY_MAX: isize = 99;
 const RR_INTERVAL_NSEC: isize = 100_000_000;
@@ -57,23 +58,48 @@ fn sched_priority_bounds(policy: i32) -> SysResult<(isize, isize)> {
     }
 }
 
+fn split_settable_policy(policy: i32) -> SysResult<(i32, bool)> {
+    let reset_on_fork = policy & SCHED_RESET_ON_FORK != 0;
+    let base_policy = policy & !SCHED_RESET_ON_FORK;
+    match base_policy {
+        SCHED_OTHER | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE => {
+            Ok((base_policy, reset_on_fork))
+        }
+        _ => Err(SysError::EINVAL),
+    }
+}
+
+fn validate_priority_for_policy(policy: i32, priority: i32) -> SysResult<()> {
+    let (min, max) = sched_priority_bounds(policy)?;
+    let priority = priority as isize;
+    if priority < min || priority > max {
+        return Err(SysError::EINVAL);
+    }
+    Ok(())
+}
+
+fn linux_policy_for_task(task: &TaskControlBlock) -> i32 {
+    let inner = task.inner_exclusive_access();
+    let mut policy = inner.sched_policy;
+    if inner.sched_reset_on_fork {
+        policy |= SCHED_RESET_ON_FORK;
+    }
+    policy
+}
+
 pub fn sys_sched_getscheduler(pid: isize) -> SysResult {
-    let _task = sched_target_task(pid)?;
-    // CONTEXT: The kernel currently runs every task through the same scheduler
-    // class, so expose the Linux SCHED_OTHER policy until real per-thread
-    // scheduling attributes are introduced.
-    Ok(SCHED_OTHER as isize)
+    let task = sched_target_task(pid)?;
+    Ok(linux_policy_for_task(&task) as isize)
 }
 
 pub fn sys_sched_getparam(pid: isize, param: usize) -> SysResult {
     if param == 0 {
         return Err(SysError::EINVAL);
     }
-    let _task = sched_target_task(pid)?;
-    // CONTEXT: The kernel does not yet expose Linux scheduling classes. All
-    // runnable tasks are reported as SCHED_OTHER-compatible, whose static
-    // priority is 0.
-    let sched_param = LinuxSchedParam { sched_priority: 0 };
+    let task = sched_target_task(pid)?;
+    let sched_param = LinuxSchedParam {
+        sched_priority: task.inner_exclusive_access().sched_priority,
+    };
     write_user_value(
         current_user_token(),
         param as *mut LinuxSchedParam,
@@ -95,6 +121,27 @@ pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: usize) -> SysR
     Ok(AFFINITY_MASK_BYTES as isize)
 }
 
+pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: usize) -> SysResult {
+    if param == 0 {
+        return Err(SysError::EINVAL);
+    }
+    let (base_policy, reset_on_fork) = split_settable_policy(policy)?;
+    let sched_param = read_user_value(current_user_token(), param as *const LinuxSchedParam)?;
+    validate_priority_for_policy(base_policy, sched_param.sched_priority)?;
+    let task = sched_target_task(pid)?;
+
+    // CONTEXT: cyclictest only needs Linux ABI-visible scheduling attributes.
+    // The current contest scheduler does not yet run a separate RT queue.
+    // UNFINISHED: Linux permission checks use CAP_SYS_NICE, rlimits, and
+    // per-thread credentials; this compatibility layer currently allows the
+    // root-like contest workload to set RT policies.
+    let mut inner = task.inner_exclusive_access();
+    inner.sched_policy = base_policy;
+    inner.sched_priority = sched_param.sched_priority;
+    inner.sched_reset_on_fork = reset_on_fork;
+    Ok(0)
+}
+
 pub fn sys_sched_get_priority_max(policy: i32) -> SysResult {
     Ok(sched_priority_bounds(policy)?.1)
 }
@@ -108,9 +155,8 @@ pub fn sys_sched_rr_get_interval(pid: isize, interval: *mut LinuxTimeSpec) -> Sy
         return Err(SysError::EFAULT);
     }
     let _task = sched_target_task(pid)?;
-    // CONTEXT: The kernel does not yet store per-thread scheduler policy.
-    // Report Linux's default 100 ms SCHED_RR quantum until Stage 3 introduces
-    // Linux-facing scheduling metadata.
+    // CONTEXT: The kernel does not yet run a separate SCHED_RR queue. Report
+    // Linux's default 100 ms quantum for ABI compatibility.
     let rr_interval = LinuxTimeSpec {
         tv_sec: 0,
         tv_nsec: RR_INTERVAL_NSEC,

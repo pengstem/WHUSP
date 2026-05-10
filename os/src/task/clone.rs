@@ -73,6 +73,9 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     let parent_inner = current_task.inner_exclusive_access();
     let parent_trap_cx = *parent_inner.get_trap_cx();
     let parent_signal_mask = parent_inner.signal_mask;
+    let parent_sched_policy = parent_inner.sched_policy;
+    let parent_sched_priority = parent_inner.sched_priority;
+    let parent_sched_reset_on_fork = parent_inner.sched_reset_on_fork;
     drop(parent_inner);
     let new_task = Arc::new(TaskControlBlock::new(process, ustack_base, true));
     let mut new_task_inner = new_task.inner_exclusive_access();
@@ -81,6 +84,9 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     let new_linux_tid = linux_tid.0;
     new_task_inner.linux_tid = Some(linux_tid);
     new_task_inner.signal_mask = parent_signal_mask;
+    new_task_inner.sched_policy = parent_sched_policy;
+    new_task_inner.sched_priority = parent_sched_priority;
+    new_task_inner.sched_reset_on_fork = parent_sched_reset_on_fork;
     let new_trap_cx = new_task_inner.get_trap_cx();
     *new_trap_cx = parent_trap_cx;
     new_trap_cx.set_a0(0);

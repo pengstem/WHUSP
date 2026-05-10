@@ -179,6 +179,9 @@ impl ProcessControlBlock {
         let ustack_base = parent_task_inner.res.as_ref().unwrap().ustack_base();
         let parent_signal_mask = parent_task_inner.signal_mask;
         let parent_sigaltstack = parent_task_inner.sigaltstack;
+        let parent_sched_policy = parent_task_inner.sched_policy;
+        let parent_sched_priority = parent_task_inner.sched_priority;
+        let parent_sched_reset_on_fork = parent_task_inner.sched_reset_on_fork;
         drop(parent_task_inner);
         drop(parent);
 
@@ -236,6 +239,15 @@ impl ProcessControlBlock {
         trap_cx.kernel_sp = task.kstack.get_top();
         task_inner.signal_mask = parent_signal_mask;
         task_inner.sigaltstack = parent_sigaltstack;
+        if parent_sched_reset_on_fork {
+            task_inner.sched_policy = 0;
+            task_inner.sched_priority = 0;
+            task_inner.sched_reset_on_fork = false;
+        } else {
+            task_inner.sched_policy = parent_sched_policy;
+            task_inner.sched_priority = parent_sched_priority;
+            task_inner.sched_reset_on_fork = false;
+        }
         drop(task_inner);
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);

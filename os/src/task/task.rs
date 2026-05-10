@@ -62,6 +62,9 @@ pub struct TaskControlBlockInner {
     pub signal_mask: SignalFlags,
     pub sigsuspend_restore_mask: Option<SignalFlags>,
     pub sigaltstack: SigAltStack,
+    pub sched_policy: i32,
+    pub sched_priority: i32,
+    pub sched_reset_on_fork: bool,
 }
 
 impl TaskControlBlockInner {
@@ -115,6 +118,9 @@ impl TaskControlBlock {
                     signal_mask: SignalFlags::empty(),
                     sigsuspend_restore_mask: None,
                     sigaltstack: SigAltStack::disabled(),
+                    sched_policy: 0,
+                    sched_priority: 0,
+                    sched_reset_on_fork: false,
                 })
             },
         }
