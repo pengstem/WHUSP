@@ -55,10 +55,11 @@ enum LtpCaseFilter {
 
 pub(super) fn build_runner_command() -> String {
     if INTERACTIVE_SHELL || TEST_SCRIPTS.is_empty() {
-        return "/musl/busybox mkdir -p /tmp/bin && /musl/busybox --install -s /tmp/bin && export PATH=/tmp/bin:/musl:$PATH && cd /musl && exec /musl/busybox sh".into();
+        return "/musl/busybox mkdir -p /tmp/bin && /musl/busybox --install -s /tmp/bin; export PATH=/tmp/bin:/musl:/glibc:$PATH && cd /musl && exec /musl/busybox sh".into();
     }
     let mut command = String::new();
     let mut first = true;
+    append_runtime_environment(&mut command, &mut first);
     for test in ALL_TESTS {
         if !TEST_SCRIPTS.contains(test) {
             let testname = test.strip_suffix("_testcode.sh").unwrap_or(test);
@@ -82,6 +83,11 @@ pub(super) fn build_runner_command() -> String {
     }
     command.push_str("; cd /musl && ./busybox reboot -f");
     command
+}
+
+fn append_runtime_environment(command: &mut String, first: &mut bool) {
+    append_separator(command, first);
+    command.push_str("/musl/busybox mkdir -p /tmp/bin && /musl/busybox --install -s /tmp/bin; export PATH=/tmp/bin:/musl:/glibc:$PATH");
 }
 
 fn append_separator(command: &mut String, first: &mut bool) {
