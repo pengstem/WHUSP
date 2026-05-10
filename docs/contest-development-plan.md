@@ -563,7 +563,7 @@ pub(crate) struct TmpFs {
 - [ ] 推进 `lmbench`。
 - [ ] 推进 `iperf`。
 - [ ] 推进 `netperf`。
-- [ ] 推进 `cyclictest`。
+- [x] `cyclictest` 在当前 RV narrowed runner 中推进到 glibc/musl 四个子项均 `end: success`，且两组均 `kill hackbench: success`；记录见 `develop-guide/test-run-logs/2026-05-10-cyclictest/after-stack-window-256k-420s.raw.log`。
 - [ ] 推进 `ltp`。
 
 ## P5 - LoongArch
