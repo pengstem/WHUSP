@@ -14,6 +14,7 @@ const SCHED_RR: i32 = 2;
 const SCHED_BATCH: i32 = 3;
 const SCHED_IDLE: i32 = 5;
 const SCHED_DEADLINE: i32 = 6;
+const RT_PRIORITY_MIN: isize = 1;
 const RT_PRIORITY_MAX: isize = 99;
 const AFFINITY_MASK_BYTES: usize = size_of::<usize>();
 
@@ -44,6 +45,14 @@ fn sched_target_task(pid: isize) -> SysResult<Arc<TaskControlBlock>> {
         return current_task().ok_or(SysError::ESRCH);
     }
     task_with_linux_tid(pid as usize).ok_or(SysError::ESRCH)
+}
+
+fn sched_priority_bounds(policy: i32) -> SysResult<(isize, isize)> {
+    match policy {
+        SCHED_FIFO | SCHED_RR => Ok((RT_PRIORITY_MIN, RT_PRIORITY_MAX)),
+        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => Ok((0, 0)),
+        _ => Err(SysError::EINVAL),
+    }
 }
 
 pub fn sys_sched_getscheduler(pid: isize) -> SysResult {
@@ -85,9 +94,9 @@ pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: usize) -> SysR
 }
 
 pub fn sys_sched_get_priority_max(policy: i32) -> SysResult {
-    match policy {
-        SCHED_FIFO | SCHED_RR => Ok(RT_PRIORITY_MAX),
-        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => Ok(0),
-        _ => Err(SysError::EINVAL),
-    }
+    Ok(sched_priority_bounds(policy)?.1)
+}
+
+pub fn sys_sched_get_priority_min(policy: i32) -> SysResult {
+    Ok(sched_priority_bounds(policy)?.0)
 }
