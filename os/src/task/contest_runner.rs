@@ -20,13 +20,13 @@ const ALL_TESTS: &[&str] = &[
 
 const TEST_SCRIPTS: &[&str] = &[
     // perfect
-    // "basic_testcode.sh",
+    "basic_testcode.sh",
     // runnable
     // "busybox_testcode.sh",
     // perfect
     // "lua_testcode.sh",
     // runnable
-    // "libctest_testcode.sh",
+    "libctest_testcode.sh",
     // runnable
     // "iozone_testcode.sh",
     // runnable
@@ -37,7 +37,7 @@ const TEST_SCRIPTS: &[&str] = &[
     // "netperf_testcode.sh",
     // runnable
     // "cyclictest_testcode.sh",
-    "ltp_testcode.sh",
+    // "ltp_testcode.sh",
 ];
 
 const LTP_BLACKLIST_PATTERNS: &[&str] = &[
@@ -239,8 +239,9 @@ const LTP_MUSL_BLACKLIST_PATTERNS: &[&str] = &[
 // None runs all non-blacklisted cases. Some("a")..Some("z") narrows by
 // leading letter, Some("long") runs names outside the ASCII alphabet,
 // Some("case:<name>") runs one exact LTP case, Some("cases:<a>,<b>") runs
-// selected exact LTP cases, and Some("prefix:<name>") runs cases whose names
-// start with the prefix.
+// selected exact LTP cases, Some("prefix:<name>") runs cases whose names
+// start with the prefix, and Some("range:<start>,<end>") runs cases in the
+// lexicographic half-open range [start, end). Empty range bounds are unbounded.
 const LTP_CASE_FILTER_OPTION: Option<&str> = Some("f");
 
 enum LtpCaseFilter {
@@ -250,12 +251,13 @@ enum LtpCaseFilter {
     Exact(&'static str),
     ExactSet(&'static str),
     Prefix(&'static str),
+    Range(&'static str, &'static str),
     Invalid,
 }
 
 pub(super) fn build_runner_command() -> String {
     if INTERACTIVE_SHELL || TEST_SCRIPTS.is_empty() {
-        return "/musl/busybox sh".into();
+        return "/musl/busybox mkdir -p /tmp/bin && /musl/busybox --install -s /tmp/bin && export PATH=/tmp/bin:/musl:$PATH && cd /musl && exec /musl/busybox sh".into();
     }
     let mut command = String::new();
     let mut first = true;
@@ -267,6 +269,14 @@ pub(super) fn build_runner_command() -> String {
     }
 
     for script in TEST_SCRIPTS {
+        let script = *script;
+        if script == "libctest_testcode.sh" {
+            let testname = script.strip_suffix("_testcode.sh").unwrap_or(script);
+            append_skipped_group_marker(&mut command, &mut first, testname, "/glibc");
+            append_separator(&mut command, &mut first);
+            append_script_command(&mut command, "/musl", script);
+            continue;
+        }
         for libc_root in TEST_LIBCS {
             append_separator(&mut command, &mut first);
             append_script_command(&mut command, libc_root, script);
@@ -286,24 +296,50 @@ fn append_separator(command: &mut String, first: &mut bool) {
 
 fn append_skipped_group_markers(command: &mut String, first: &mut bool, testname: &str) {
     for libc_root in TEST_LIBCS {
-        let libc = libc_label(libc_root);
-        append_separator(command, first);
-        command.push_str(&format!(
-            "echo '#### OS COMP TEST GROUP START {testname}-{libc} ####'"
-        ));
-        append_separator(command, first);
-        command.push_str(&format!(
-            "echo '#### OS COMP TEST GROUP END {testname}-{libc} ####'"
-        ));
+        append_skipped_group_marker(command, first, testname, libc_root);
     }
+}
+
+fn append_skipped_group_marker(
+    command: &mut String,
+    first: &mut bool,
+    testname: &str,
+    libc_root: &str,
+) {
+    let libc = libc_label(libc_root);
+    append_separator(command, first);
+    command.push_str(&format!(
+        "echo '#### OS COMP TEST GROUP START {testname}-{libc} ####'"
+    ));
+    append_separator(command, first);
+    command.push_str(&format!(
+        "echo '#### OS COMP TEST GROUP END {testname}-{libc} ####'"
+    ));
 }
 
 fn append_script_command(command: &mut String, libc_root: &str, script: &str) {
     if script == "ltp_testcode.sh" {
         append_ltp_runner(command, libc_root);
+    } else if script == "basic_testcode.sh" {
+        append_basic_runner(command, libc_root);
     } else {
         append_normal_script(command, libc_root, script);
     }
+}
+
+fn append_basic_runner(command: &mut String, libc_root: &str) {
+    let libc = libc_label(libc_root);
+    command.push_str("cd ");
+    command.push_str(libc_root);
+    command.push_str(" && ./busybox echo \"#### OS COMP TEST GROUP START basic-");
+    command.push_str(libc);
+    command.push_str(" ####\"; cd ");
+    command.push_str(libc_root);
+    command.push_str("/basic && ../busybox sh ./run-all.sh; cd ");
+    command.push_str(libc_root);
+    command.push_str(" && ./busybox echo \"#### OS COMP TEST GROUP END basic-");
+    command.push_str(libc);
+    command.push_str(" ####\"");
 }
 
 fn append_normal_script(command: &mut String, libc_root: &str, script: &str) {
@@ -385,6 +421,18 @@ fn append_ltp_case_filter(command: &mut String) {
             command.push_str(prefix);
             command.push_str("*) ;; *) continue ;; esac; ");
         }
+        LtpCaseFilter::Range(start, end) => {
+            if !start.is_empty() {
+                command.push_str("[ \"$case_name\" \\< \"");
+                command.push_str(start);
+                command.push_str("\" ] && continue; ");
+            }
+            if !end.is_empty() {
+                command.push_str("[ \"$case_name\" \\< \"");
+                command.push_str(end);
+                command.push_str("\" ] || continue; ");
+            }
+        }
         LtpCaseFilter::Invalid => {
             command.push_str("./busybox echo \"INVALID LTP_CASE_FILTER_OPTION\"; break; ");
         }
@@ -422,6 +470,15 @@ fn ltp_case_filter() -> LtpCaseFilter {
                 LtpCaseFilter::Invalid
             }
         }
+        Some(option) if option.starts_with("range:") => {
+            let range = &option["range:".len()..];
+            if let Some((start, end)) = range.split_once(',') {
+                if is_ltp_case_boundary(start) && is_ltp_case_boundary(end) {
+                    return LtpCaseFilter::Range(start, end);
+                }
+            }
+            LtpCaseFilter::Invalid
+        }
         Some(option) => {
             let bytes = option.as_bytes();
             if bytes.len() == 1 && bytes[0].is_ascii_alphabetic() {
@@ -431,6 +488,10 @@ fn ltp_case_filter() -> LtpCaseFilter {
             }
         }
     }
+}
+
+fn is_ltp_case_boundary(name: &str) -> bool {
+    name.is_empty() || is_ltp_case_name(name)
 }
 
 fn is_ltp_case_name(name: &str) -> bool {
