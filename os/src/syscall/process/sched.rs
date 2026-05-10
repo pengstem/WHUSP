@@ -7,6 +7,8 @@ use crate::{
 };
 use alloc::sync::Arc;
 
+const SCHED_OTHER: isize = 0;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct LinuxSchedParam {
@@ -34,6 +36,14 @@ fn sched_target_task(pid: isize) -> SysResult<Arc<TaskControlBlock>> {
         return current_task().ok_or(SysError::ESRCH);
     }
     task_with_linux_tid(pid as usize).ok_or(SysError::ESRCH)
+}
+
+pub fn sys_sched_getscheduler(pid: isize) -> SysResult {
+    let _task = sched_target_task(pid)?;
+    // CONTEXT: The kernel currently runs every task through the same scheduler
+    // class, so expose the Linux SCHED_OTHER policy until real per-thread
+    // scheduling attributes are introduced.
+    Ok(SCHED_OTHER)
 }
 
 pub fn sys_sched_getparam(pid: isize, param: usize) -> SysResult {
