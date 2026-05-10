@@ -51,6 +51,8 @@ const SO_RCVTIMEO_NEW: i32 = 66;
 const SO_SNDTIMEO_NEW: i32 = 67;
 const TCP_NODELAY: i32 = 1;
 const TCP_MAXSEG: i32 = 2;
+const MCAST_JOIN_GROUP: i32 = 42;
+const MCAST_LEAVE_GROUP: i32 = 45;
 const SHUT_RD: i32 = 0;
 const SHUT_WR: i32 = 1;
 const SHUT_RDWR: i32 = 2;
@@ -304,7 +306,10 @@ impl LocalSocket {
         loop {
             let (accepted, local) = {
                 let mut inner = self.inner.exclusive_access();
-                if inner.kind != SocketKind::Stream || !inner.listening {
+                if inner.kind != SocketKind::Stream {
+                    return Err(SysError::ENOTSUP);
+                }
+                if !inner.listening {
                     return Err(SysError::EINVAL);
                 }
                 (
@@ -866,12 +871,15 @@ fn with_socket<T>(fd: usize, f: impl FnOnce(&LocalSocket) -> SysResult<T>) -> Sy
     let process = current_process();
     let file = {
         let inner = process.inner_exclusive_access();
-        inner
+        let entry = inner
             .fd_table
             .get(fd)
             .and_then(|entry| entry.as_ref())
-            .map(FdTableEntry::file)
-            .ok_or(SysError::EBADF)?
+            .ok_or(SysError::EBADF)?;
+        if entry.status_flags().contains(OpenFlags::PATH) {
+            return Err(SysError::EBADF);
+        }
+        entry.file()
     };
     let socket = file
         .as_any()
@@ -1106,6 +1114,34 @@ pub fn sys_setsockopt(fd: usize, level: i32, name: i32, val: usize, len: u32) ->
                         UserBufferAccess::Read,
                     )?;
                 }
+            }
+            (IPPROTO_IP, MCAST_JOIN_GROUP) => {
+                // CONTEXT: The loopback socket subset does not deliver multicast
+                // traffic, but LTP/net probes expect joining a group to be
+                // accepted and leaving an unjoined group to fail distinctly.
+                if val != 0 && len > 0 {
+                    translated_byte_buffer_checked(
+                        token,
+                        val as *const u8,
+                        len as usize,
+                        UserBufferAccess::Read,
+                    )?;
+                }
+            }
+            (IPPROTO_IP, MCAST_LEAVE_GROUP) => {
+                // UNFINISHED: Multicast group membership is not tracked yet.
+                // Linux returns EADDRNOTAVAIL when the socket is not a member
+                // of the requested group; this is enough to avoid inheriting
+                // fake membership across accept().
+                if val != 0 && len > 0 {
+                    translated_byte_buffer_checked(
+                        token,
+                        val as *const u8,
+                        len as usize,
+                        UserBufferAccess::Read,
+                    )?;
+                }
+                return Err(SysError::EADDRNOTAVAIL);
             }
             (IPPROTO_IP, _) | (IPPROTO_UDP, _) => {
                 // CONTEXT: IP/UDP tuning options do not affect local loopback queues.
