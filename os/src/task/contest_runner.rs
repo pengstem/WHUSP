@@ -1,4 +1,3 @@
-use super::ltp_whitelist::ltp_case_whitelist;
 use alloc::{format, string::String};
 
 const TEST_LIBCS: &[&str] = &["/glibc", "/musl"];
@@ -41,7 +40,7 @@ const TEST_SCRIPTS: &[&str] = &[
 /// runs cases whose names start with the prefix, and
 /// Some("range:<start>,<end>") runs cases in the lexicographic half-open range
 /// [start, end). Empty range bounds are unbounded.
-const LTP_CASE_FILTER_OPTION: Option<&str> = None;
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some("prefix:fcntl");
 
 enum LtpCaseFilter {
     Whitelist,
@@ -202,7 +201,7 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
     );
     command.push_str(libc_label(libc_root));
     command.push_str(" ####\"; cd \"$LTPROOT/testcases/bin\"; for file in *; do [ -f \"$file\" ] || continue; case_name=${file##*/}; ");
-    append_ltp_case_filter(command, libc_root);
+    append_ltp_case_filter(command);
     // CONTEXT: The autotest parser consumes the historical
     // "FAIL LTP CASE ... : <ret>" record as a per-case result line. A zero
     // return still means the case passed, so keep the text stable here.
@@ -215,9 +214,9 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
     command.push_str(" ####\"; }");
 }
 
-fn append_ltp_case_filter(command: &mut String, libc_root: &str) {
+fn append_ltp_case_filter(command: &mut String) {
     match ltp_case_filter() {
-        LtpCaseFilter::Whitelist => append_ltp_whitelist_filter(command, libc_root),
+        LtpCaseFilter::Whitelist => append_ltp_whitelist_filter(command),
         LtpCaseFilter::Letter(letter) => {
             command.push_str("case \"$case_name\" in [");
             command.push(letter as char);
@@ -311,8 +310,8 @@ fn ltp_case_filter() -> LtpCaseFilter {
     }
 }
 
-fn append_ltp_whitelist_filter(command: &mut String, libc_root: &str) {
-    let case_names = ltp_case_whitelist(libc_root);
+fn append_ltp_whitelist_filter(command: &mut String) {
+    let case_names = super::ltp_whitelist::LTP_CASE_WHITELIST;
     if case_names.is_empty() {
         command.push_str("continue; ");
         return;
