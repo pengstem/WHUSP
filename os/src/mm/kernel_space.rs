@@ -28,12 +28,12 @@ pub fn kernel_token() -> usize {
 }
 
 impl MemorySet {
-    pub(super) fn map_trampoline(&mut self) {
-        self.page_table.map(
+    pub(super) fn map_trampoline(&mut self) -> bool {
+        self.page_table.try_map(
             VirtAddr::from(TRAMPOLINE).into(),
             PhysAddr::from(strampoline as usize).into(),
             PTEFlags::R | PTEFlags::X,
-        );
+        )
     }
 
     pub fn new_kernel() -> Self {

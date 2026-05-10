@@ -67,6 +67,13 @@ impl PageTable {
             frames: vec![frame],
         }
     }
+    pub fn try_new() -> Option<Self> {
+        let frame = frame_alloc()?;
+        Some(PageTable {
+            root_ppn: frame.ppn,
+            frames: vec![frame],
+        })
+    }
     /// Temporarily used to get arguments from user space.
     pub fn from_token(satp: usize) -> Self {
         Self {
@@ -85,7 +92,7 @@ impl PageTable {
                 break;
             }
             if !pte.is_valid() {
-                let frame = frame_alloc().unwrap();
+                let frame = frame_alloc()?;
                 *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
                 self.frames.push(frame);
             }
@@ -121,6 +128,22 @@ impl PageTable {
             flags
         };
         *pte = PageTableEntry::new(ppn, flags);
+    }
+    pub fn try_map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
+        let Some(pte) = self.find_pte_create(vpn) else {
+            return false;
+        };
+        if pte.bits != 0 {
+            return false;
+        }
+        let leaf_flags = PTEFlags::R | PTEFlags::W | PTEFlags::X;
+        let flags = if flags.intersects(leaf_flags) {
+            flags | PTEFlags::V
+        } else {
+            flags
+        };
+        *pte = PageTableEntry::new(ppn, flags);
+        true
     }
     #[allow(unused)]
     pub fn unmap(&mut self, vpn: VirtPageNum) {

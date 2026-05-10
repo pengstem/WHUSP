@@ -47,7 +47,9 @@ fn sys_clone_process(args: CloneArgs) -> SysResult {
     } else {
         current_process.mount_namespace_id()
     };
-    let new_process = current_process.fork(child_parent, mount_namespace_id);
+    let new_process = current_process
+        .fork(child_parent, mount_namespace_id)
+        .ok_or(SysError::ENOMEM)?;
     let new_pid = new_process.getpid();
     let child_token = new_process.configure_cloned_main_task(args);
 

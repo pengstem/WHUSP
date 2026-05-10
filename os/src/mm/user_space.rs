@@ -96,16 +96,20 @@ impl MmapPageCacheFault {
 }
 
 impl MemorySet {
-    pub fn from_existed_user(user_space: &mut MemorySet) -> MemorySet {
-        let mut memory_set = Self::new_bare();
+    pub fn from_existed_user(user_space: &mut MemorySet) -> Option<MemorySet> {
+        let mut memory_set = Self::try_new_bare()?;
         memory_set.brk_base = user_space.brk_base;
         memory_set.brk = user_space.brk;
         memory_set.brk_limit = user_space.brk_limit;
         memory_set.brk_mapped_end = user_space.brk_mapped_end;
         memory_set.mmap_next = user_space.mmap_next;
-        memory_set.map_trampoline();
+        if !memory_set.map_trampoline() {
+            return None;
+        }
         for area_idx in 0..user_space.areas.len() {
-            user_space.ensure_shared_anonymous_mmap_resident(area_idx);
+            if !user_space.ensure_shared_anonymous_mmap_resident(area_idx) {
+                return None;
+            }
             let area = &user_space.areas[area_idx];
             let new_area = MapArea::from_another(area);
             if area.is_shm() {
@@ -127,7 +131,9 @@ impl MemorySet {
                     };
                     let page_table = &mut memory_set.page_table;
                     let dst_area = &mut memory_set.areas[area_idx];
-                    dst_area.map_shm_frame(page_table, vpn, mapping.ppn, page_index);
+                    if !dst_area.map_shm_frame(page_table, vpn, mapping.ppn, page_index) {
+                        return None;
+                    }
                 }
             } else if area.is_mmap() {
                 // UNFINISHED: MAP_PRIVATE writable mmap still uses eager copy
@@ -153,11 +159,13 @@ impl MemorySet {
                         })
                     };
                     let Some(frame) = frame else {
-                        continue;
+                        return None;
                     };
                     let page_table = &mut memory_set.page_table;
                     let dst_area = &mut memory_set.areas[area_idx];
-                    dst_area.map_existing_frame(page_table, vpn, frame);
+                    if !dst_area.map_existing_frame(page_table, vpn, frame) {
+                        return None;
+                    }
                 }
                 for (vpn, key) in area.page_cache_mappings() {
                     let Some(ppn) = ({
@@ -170,13 +178,20 @@ impl MemorySet {
                     let dst_area = &mut memory_set.areas[area_idx];
                     if !dst_area.map_page_cache_frame(page_table, vpn, ppn, key) {
                         PAGE_CACHE.exclusive_access().dec_ref(key);
+                        return None;
                     }
                 }
             } else if area.map_perm.contains(MapPermission::W) {
-                memory_set.push(new_area, None);
+                if !memory_set.push(new_area, None) {
+                    return None;
+                }
                 for vpn in area.vpn_range {
-                    let src_ppn = user_space.translate(vpn).unwrap().ppn();
-                    let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
+                    let Some(src_ppn) = user_space.translate(vpn).map(|pte| pte.ppn()) else {
+                        return None;
+                    };
+                    let Some(dst_ppn) = memory_set.translate(vpn).map(|pte| pte.ppn()) else {
+                        return None;
+                    };
                     dst_ppn
                         .get_bytes_array()
                         .copy_from_slice(src_ppn.get_bytes_array());
@@ -190,24 +205,26 @@ impl MemorySet {
                         continue;
                     };
                     let Some(frame) = FrameTracker::from_retained(src_pte.ppn()) else {
-                        continue;
+                        return None;
                     };
                     let page_table = &mut memory_set.page_table;
                     let dst_area = &mut memory_set.areas[area_idx];
-                    dst_area.map_existing_frame(page_table, vpn, frame);
+                    if !dst_area.map_existing_frame(page_table, vpn, frame) {
+                        return None;
+                    }
                 }
             }
         }
-        memory_set
+        Some(memory_set)
     }
 
-    fn ensure_shared_anonymous_mmap_resident(&mut self, area_idx: usize) {
+    fn ensure_shared_anonymous_mmap_resident(&mut self, area_idx: usize) -> bool {
         let area = &self.areas[area_idx];
         let shared_anonymous = area.mmap_info.as_ref().is_some_and(|info| {
             info.shared && info.backing_file.is_none() && info.page_cache_id.is_none()
         });
         if !shared_anonymous {
-            return;
+            return true;
         }
 
         let vpn_range = area.vpn_range;
@@ -216,12 +233,15 @@ impl MemorySet {
                 continue;
             }
             let Some(frame) = frame_alloc() else {
-                continue;
+                return false;
             };
             let page_table = &mut self.page_table;
             let area = &mut self.areas[area_idx];
-            area.map_existing_frame(page_table, vpn, frame);
+            if !area.map_existing_frame(page_table, vpn, frame) {
+                return false;
+            }
         }
+        true
     }
 
     pub fn set_program_break(&mut self, addr: usize) -> usize {
@@ -249,7 +269,9 @@ impl MemorySet {
                     MapType::Framed,
                     MapPermission::R | MapPermission::W | MapPermission::U,
                 );
-                heap_area.map(&mut self.page_table);
+                if !heap_area.map(&mut self.page_table) {
+                    return self.brk;
+                }
                 self.areas.push(heap_area);
                 self.brk = addr;
                 self.brk_mapped_end = new_mapped_end;
@@ -257,7 +279,9 @@ impl MemorySet {
             };
             let heap_area = &mut self.areas[area_idx];
             for vpn in VPNRange::new(old_end_vpn, new_end_vpn) {
-                heap_area.map_one(&mut self.page_table, vpn);
+                if !heap_area.map_one(&mut self.page_table, vpn) {
+                    return self.brk;
+                }
             }
             let area_start = heap_area.vpn_range.get_start();
             heap_area.vpn_range = VPNRange::new(area_start, new_end_vpn);

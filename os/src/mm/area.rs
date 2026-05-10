@@ -197,21 +197,40 @@ impl MapArea {
         true
     }
 
-    pub(super) fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+    pub(super) fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) -> bool {
         let ppn: PhysPageNum = match self.map_type {
             MapType::Identical => {
                 let va: VirtAddr = vpn.into();
                 PhysAddr::from(arch_mm::virt_to_phys(usize::from(va))).floor()
             }
             MapType::Framed => {
-                let frame = frame_alloc().unwrap();
+                let Some(frame) = frame_alloc() else {
+                    return false;
+                };
                 let ppn = frame.ppn;
+                if !page_table.try_map(vpn, ppn, PTEFlags::from_bits_truncate(self.map_perm.bits()))
+                {
+                    return false;
+                }
                 self.data_frames.insert(vpn, frame);
-                ppn
+                return true;
             }
         };
-        let pte_flags = PTEFlags::from_bits_truncate(self.map_perm.bits());
-        page_table.map(vpn, ppn, pte_flags);
+        page_table.try_map(vpn, ppn, PTEFlags::from_bits_truncate(self.map_perm.bits()))
+    }
+
+    pub(super) fn map(&mut self, page_table: &mut PageTable) -> bool {
+        let mut mapped_vpns = Vec::new();
+        for vpn in self.vpn_range {
+            if !self.map_one(page_table, vpn) {
+                for mapped_vpn in mapped_vpns {
+                    self.unmap_one(page_table, mapped_vpn);
+                }
+                return false;
+            }
+            mapped_vpns.push(vpn);
+        }
+        true
     }
 
     pub(super) fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
@@ -219,12 +238,6 @@ impl MapArea {
             self.data_frames.remove(&vpn);
         }
         page_table.unmap(vpn);
-    }
-
-    pub(super) fn map(&mut self, page_table: &mut PageTable) {
-        for vpn in self.vpn_range {
-            self.map_one(page_table, vpn);
-        }
     }
 
     pub(super) fn unmap(&mut self, page_table: &mut PageTable) {
@@ -246,9 +259,11 @@ impl MapArea {
             return true;
         }
         let ppn = frame.ppn;
-        self.data_frames.insert(vpn, frame);
         let pte_flags = PTEFlags::from_bits_truncate(self.map_perm.bits());
-        page_table.map(vpn, ppn, pte_flags);
+        if !page_table.try_map(vpn, ppn, pte_flags) {
+            return false;
+        }
+        self.data_frames.insert(vpn, frame);
         true
     }
 
@@ -278,7 +293,9 @@ impl MapArea {
         if info.shared && info.writable {
             pte_flags.remove(PTEFlags::W);
         }
-        page_table.map(vpn, ppn, pte_flags);
+        if !page_table.try_map(vpn, ppn, pte_flags) {
+            return false;
+        }
         info.page_cache_pages.insert(vpn, key);
         true
     }
@@ -303,7 +320,9 @@ impl MapArea {
             return true;
         }
         let pte_flags = PTEFlags::from_bits_truncate(self.map_perm.bits());
-        page_table.map(vpn, ppn, pte_flags);
+        if !page_table.try_map(vpn, ppn, pte_flags) {
+            return false;
+        }
         info.pages.insert(vpn, page_index);
         true
     }

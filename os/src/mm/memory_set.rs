@@ -39,6 +39,17 @@ impl MemorySet {
             mmap_next: crate::config::USER_MMAP_BASE,
         }
     }
+    pub fn try_new_bare() -> Option<Self> {
+        Some(Self {
+            page_table: PageTable::try_new()?,
+            areas: Vec::new(),
+            brk_base: 0,
+            brk: 0,
+            brk_limit: 0,
+            brk_mapped_end: 0,
+            mmap_next: crate::config::USER_MMAP_BASE,
+        })
+    }
     pub fn token(&self) -> usize {
         self.page_table.token()
     }
@@ -49,7 +60,7 @@ impl MemorySet {
         end_va: VirtAddr,
         permission: MapPermission,
     ) {
-        self.push(
+        let _ = self.push(
             MapArea::new(start_va, end_va, MapType::Framed, permission),
             None,
         );
@@ -72,8 +83,8 @@ impl MemorySet {
     /// Add a new MapArea into this MemorySet.
     /// Assuming that there are no conflicts in the virtual address
     /// space.
-    pub fn push(&mut self, map_area: MapArea, data: Option<&[u8]>) {
-        self.push_with_offset(map_area, data, 0);
+    pub fn push(&mut self, map_area: MapArea, data: Option<&[u8]>) -> bool {
+        self.push_with_offset(map_area, data, 0)
     }
 
     pub(super) fn push_with_offset(
@@ -81,12 +92,15 @@ impl MemorySet {
         mut map_area: MapArea,
         data: Option<&[u8]>,
         data_offset: usize,
-    ) {
-        map_area.map(&mut self.page_table);
+    ) -> bool {
+        if !map_area.map(&mut self.page_table) {
+            return false;
+        }
         if let Some(data) = data {
             map_area.copy_data(&self.page_table, data, data_offset);
         }
         self.areas.push(map_area);
+        true
     }
     pub fn activate(&self) {
         arch_mm::activate_page_table(self.page_table.token());
@@ -143,9 +157,9 @@ impl MemorySet {
 impl Drop for MemorySet {
     fn drop(&mut self) {
         for area in &mut self.areas {
-            if area.is_shm() {
-                area.unmap_resident(&mut self.page_table);
-            }
+            area.release_mmap_refs();
+            area.unmap_resident(&mut self.page_table);
         }
+        self.areas.clear();
     }
 }

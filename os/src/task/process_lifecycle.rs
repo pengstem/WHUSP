@@ -155,10 +155,10 @@ impl ProcessControlBlock {
         self: &Arc<Self>,
         child_parent: Arc<Self>,
         mount_namespace_id: crate::fs::MountNamespaceId,
-    ) -> Arc<Self> {
+    ) -> Option<Arc<Self>> {
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
-        let memory_set = MemorySet::from_existed_user(&mut parent.memory_set);
+        let memory_set = MemorySet::from_existed_user(&mut parent.memory_set)?;
         let pid = pid_alloc();
         let new_fd_table = parent.fd_table.clone();
         let umask = parent.umask;
@@ -251,6 +251,6 @@ impl ProcessControlBlock {
         drop(task_inner);
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);
-        child
+        Some(child)
     }
 }
