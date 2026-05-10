@@ -43,11 +43,10 @@ const TEST_SCRIPTS: &[&str] = &[
 /// [start, end). Empty range bounds are unbounded.
 const LTP_CASE_FILTER_OPTION: Option<&str> = Some(concat!(
     "cases:",
-    "open_tree01,open_tree02,",
-    "move_mount01,move_mount02,",
-    "fsopen01,fsopen02,",
-    "fsconfig01,fsconfig02,fsconfig03,",
-    "fsmount01,fsmount02"
+    "mlock01,mlock02,mlock03,mlock04,mlock05,",
+    "mlock201,mlock202,mlock203,",
+    "mlockall01,mlockall02,mlockall03,",
+    "munlock01,munlock02,munlockall01"
 ));
 
 enum LtpCaseFilter {

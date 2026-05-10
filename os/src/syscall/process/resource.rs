@@ -1,6 +1,8 @@
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{read_user_value, write_user_value};
-use crate::task::{RLimit, RLimitResource, current_process, current_user_token, pid2process};
+use crate::task::{
+    CAP_SYS_RESOURCE, RLimit, RLimitResource, current_process, current_user_token, pid2process,
+};
 use alloc::sync::Arc;
 
 fn rlimit_target_process(pid: usize) -> SysResult<Arc<crate::task::ProcessControlBlock>> {
@@ -14,13 +16,18 @@ fn rlimit_target_process(pid: usize) -> SysResult<Arc<crate::task::ProcessContro
     }
 }
 
-fn validate_new_rlimit(current: RLimit, new_limit: RLimit) -> SysResult<()> {
+fn validate_new_rlimit(
+    current: RLimit,
+    new_limit: RLimit,
+    can_raise_hard_limit: bool,
+) -> SysResult<()> {
     if new_limit.rlim_cur > new_limit.rlim_max {
         return Err(SysError::EINVAL);
     }
-    if new_limit.rlim_max > current.rlim_max {
-        // UNFINISHED: Raising a hard resource limit should be allowed for a
-        // task with CAP_SYS_RESOURCE. Capabilities are not modeled yet.
+    if new_limit.rlim_max > current.rlim_max && !can_raise_hard_limit {
+        // UNFINISHED: Linux checks CAP_SYS_RESOURCE in the caller's user
+        // namespace. This kernel has one process-wide capability set, so root
+        // with the stored CAP_SYS_RESOURCE bit is the current privileged model.
         return Err(SysError::EPERM);
     }
     Ok(())
@@ -39,12 +46,18 @@ pub fn sys_prlimit64(
     } else {
         Some(read_user_value(token, new_limit)?)
     };
+    let credentials = current_process().credentials();
+    let can_raise_hard_limit = credentials.euid == 0
+        && credentials
+            .capabilities
+            .has_effective(CAP_SYS_RESOURCE)
+            .unwrap_or(false);
     let process = rlimit_target_process(pid)?;
     let mut inner = process.inner_exclusive_access();
     let current = inner.resource_limits.get(resource);
 
     if let Some(new_limit) = new_limit {
-        validate_new_rlimit(current, new_limit)?;
+        validate_new_rlimit(current, new_limit, can_raise_hard_limit)?;
     }
     if !old_limit.is_null() {
         write_user_value(token, old_limit, &current)?;

@@ -101,8 +101,9 @@ pub struct ProcessResourceLimits {
 
 impl ProcessResourceLimits {
     pub fn new() -> Self {
-        // UNFINISHED: Except RLIMIT_NOFILE, these limits are currently stored
-        // for getrlimit/setrlimit compatibility but are not enforced by the
+        // UNFINISHED: Except RLIMIT_NOFILE and the mlock-visible
+        // RLIMIT_MEMLOCK subset, these limits are currently stored for
+        // getrlimit/setrlimit compatibility but are not enforced by the
         // memory, scheduler, signal, or fork paths yet.
         let mut limits = [RLimit::infinity(); RLIMIT_COUNT];
         limits[RLimitResource::Stack.index()] =
@@ -145,8 +146,10 @@ pub struct CapabilitySets {
 
 impl CapabilitySets {
     pub const CAP_SETPCAP: usize = 8;
+    pub const CAP_IPC_LOCK: usize = 14;
     pub const CAP_SYS_CHROOT: usize = 18;
     pub const CAP_SYS_ADMIN: usize = 21;
+    pub const CAP_SYS_RESOURCE: usize = 24;
     pub const CAP_LAST_CAP: usize = 40;
 
     fn all_known_bits() -> [u32; 2] {
@@ -255,6 +258,7 @@ pub(crate) struct ProcessProcSnapshot {
     pub(crate) credentials: Credentials,
     pub(crate) thread_count: usize,
     pub(crate) mount_namespace_id: MountNamespaceId,
+    pub(crate) locked_kb: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -578,6 +582,7 @@ impl ProcessControlBlock {
             credentials: inner.credentials.clone(),
             thread_count: inner.thread_count(),
             mount_namespace_id: inner.mount_namespace_id,
+            locked_kb: inner.memory_set.locked_bytes() / 1024,
         }
     }
 
@@ -596,6 +601,35 @@ impl ProcessControlBlock {
             output.push_str(&format!(
                 "{:x}-{:x} {} {:08x} 00:00 0\n",
                 entry.start, entry.end, perms, entry.offset
+            ));
+        }
+        output
+    }
+
+    pub(crate) fn proc_smaps_content(&self) -> String {
+        let entries = {
+            let inner = self.inner_exclusive_access();
+            inner.memory_set.proc_maps_entries()
+        };
+        let mut output = String::new();
+        for entry in entries {
+            let mut perms = String::new();
+            perms.push(if entry.readable { 'r' } else { '-' });
+            perms.push(if entry.writable { 'w' } else { '-' });
+            perms.push(if entry.executable { 'x' } else { '-' });
+            perms.push(if entry.shared { 's' } else { 'p' });
+            output.push_str(&format!(
+                "{:x}-{:x} {} {:08x} 00:00 0\n\
+                 Size:\t{} kB\n\
+                 Rss:\t{} kB\n\
+                 Locked:\t{} kB\n",
+                entry.start,
+                entry.end,
+                perms,
+                entry.offset,
+                (entry.end - entry.start) / 1024,
+                entry.resident_kb,
+                entry.locked_kb,
             ));
         }
         output

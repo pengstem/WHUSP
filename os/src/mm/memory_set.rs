@@ -14,6 +14,8 @@ pub(crate) struct MemoryMapEntry {
     pub(crate) executable: bool,
     pub(crate) shared: bool,
     pub(crate) offset: usize,
+    pub(crate) resident_kb: usize,
+    pub(crate) locked_kb: usize,
 }
 
 // TODO: replace vec to a high perfermonce data structure
@@ -25,6 +27,8 @@ pub struct MemorySet {
     pub(super) brk_limit: usize,
     pub(super) brk_mapped_end: usize,
     pub(super) mmap_next: usize,
+    pub(super) mlock_future: bool,
+    pub(super) mlock_future_on_fault: bool,
 }
 
 impl MemorySet {
@@ -37,6 +41,8 @@ impl MemorySet {
             brk_limit: 0,
             brk_mapped_end: 0,
             mmap_next: crate::config::USER_MMAP_BASE,
+            mlock_future: false,
+            mlock_future_on_fault: false,
         }
     }
     pub fn try_new_bare() -> Option<Self> {
@@ -48,6 +54,8 @@ impl MemorySet {
             brk_limit: 0,
             brk_mapped_end: 0,
             mmap_next: crate::config::USER_MMAP_BASE,
+            mlock_future: false,
+            mlock_future_on_fault: false,
         })
     }
     pub fn token(&self) -> usize {
@@ -146,6 +154,8 @@ impl MemorySet {
                     shared: area.mmap_info.as_ref().is_some_and(|info| info.shared)
                         || area.is_shm(),
                     offset: area.mmap_info.as_ref().map_or(0, |info| info.file_offset),
+                    resident_kb: area.resident_bytes(&self.page_table) / 1024,
+                    locked_kb: area.locked_bytes() / 1024,
                 }
             })
             .collect();

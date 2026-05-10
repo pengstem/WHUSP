@@ -1,7 +1,8 @@
 use crate::config::PAGE_SIZE;
 use crate::mm::shm::ShmError;
 use crate::mm::{MapPermission, MemoryProtectError};
-use crate::task::current_process;
+use crate::syscall::user_ptr::copy_to_user;
+use crate::task::{CAP_IPC_LOCK, RLimitResource, current_process, current_user_token};
 use core::sync::atomic::{Ordering, fence};
 
 use super::errno::{SysError, SysResult};
@@ -36,6 +37,12 @@ const MS_ASYNC: i32 = 0x1;
 const MS_INVALIDATE: i32 = 0x2;
 const MS_SYNC: i32 = 0x4;
 const MS_SUPPORTED: i32 = MS_ASYNC | MS_INVALIDATE | MS_SYNC;
+
+const MLOCK_ONFAULT: usize = 0x1;
+const MCL_CURRENT: usize = 0x1;
+const MCL_FUTURE: usize = 0x2;
+const MCL_ONFAULT: usize = 0x4;
+const MCL_SUPPORTED: usize = MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT;
 
 const MEMBARRIER_CMD_QUERY: i32 = 0;
 const MEMBARRIER_CMD_PRIVATE_EXPEDITED: i32 = 1 << 3;
@@ -288,6 +295,109 @@ pub fn sys_munmap(addr: usize, len: usize) -> SysResult {
     Ok(0)
 }
 
+// UNFINISHED: The kernel still has no swap or page-reclaim path, so these
+// mlock syscalls provide Linux-compatible validation, prefaulting, RLIMIT
+// checks, and procfs accounting without a real unevictable-page mechanism.
+pub fn sys_mlock(addr: usize, len: usize) -> SysResult {
+    let additional = {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        inner
+            .memory_set
+            .additional_locked_bytes_for_range(addr, len)
+            .ok_or(SysError::ENOMEM)?
+    };
+    check_memlock_limit(additional)?;
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    if !inner.memory_set.mlock_range(addr, len, false) {
+        return Err(SysError::ENOMEM);
+    }
+    Ok(0)
+}
+
+pub fn sys_mlock2(addr: usize, len: usize, flags: usize) -> SysResult {
+    if flags & !MLOCK_ONFAULT != 0 {
+        return Err(SysError::EINVAL);
+    }
+    let on_fault = flags & MLOCK_ONFAULT != 0;
+    let additional = {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        inner
+            .memory_set
+            .additional_locked_bytes_for_range(addr, len)
+            .ok_or(SysError::ENOMEM)?
+    };
+    check_memlock_limit(additional)?;
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    if !inner.memory_set.mlock_range(addr, len, on_fault) {
+        return Err(SysError::ENOMEM);
+    }
+    Ok(0)
+}
+
+pub fn sys_munlock(addr: usize, len: usize) -> SysResult {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    if !inner.memory_set.munlock_range(addr, len) {
+        return Err(SysError::ENOMEM);
+    }
+    Ok(0)
+}
+
+pub fn sys_mlockall(flags: usize) -> SysResult {
+    if flags & !MCL_SUPPORTED != 0 || flags & (MCL_CURRENT | MCL_FUTURE) == 0 {
+        return Err(SysError::EINVAL);
+    }
+    let on_fault = flags & MCL_ONFAULT != 0;
+    let lock_current = flags & MCL_CURRENT != 0;
+    let lock_future = flags & MCL_FUTURE != 0;
+    let additional = if lock_current {
+        current_process()
+            .inner_exclusive_access()
+            .memory_set
+            .additional_locked_bytes_for_current()
+    } else {
+        0
+    };
+    check_memlock_limit(additional)?;
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    if lock_current && !inner.memory_set.mlock_current(on_fault) {
+        return Err(SysError::ENOMEM);
+    }
+    if lock_future {
+        inner.memory_set.set_mlock_future(on_fault);
+    }
+    Ok(0)
+}
+
+pub fn sys_munlockall() -> SysResult {
+    current_process()
+        .inner_exclusive_access()
+        .memory_set
+        .munlock_all();
+    Ok(0)
+}
+
+pub fn sys_mincore(addr: usize, len: usize, vec: *mut u8) -> SysResult {
+    if addr % PAGE_SIZE != 0 {
+        return Err(SysError::EINVAL);
+    }
+    let resident = current_process()
+        .inner_exclusive_access()
+        .memory_set
+        .mincore_vec(addr, len)
+        .ok_or(SysError::ENOMEM)?;
+    copy_to_user(current_user_token(), vec, &resident)?;
+    Ok(0)
+}
+
 pub fn sys_msync(addr: usize, len: usize, flags: i32) -> SysResult {
     if addr % PAGE_SIZE != 0 {
         return Err(SysError::EINVAL);
@@ -302,9 +412,10 @@ pub fn sys_msync(addr: usize, len: usize, flags: i32) -> SysResult {
         .msync_area(addr, len)
         .ok_or(SysError::ENOMEM)?;
     // UNFINISHED: Linux MS_INVALIDATE also invalidates other mappings and can
-    // fail with EBUSY for locked pages. This kernel has no mlock state and no
-    // cross-process invalidation model yet, so it only validates the mapping
-    // range and writes back dirty shared mmap pages.
+    // fail with EBUSY for locked pages. This kernel tracks mlock only for
+    // syscall/procfs compatibility and has no cross-process invalidation model
+    // yet, so it only validates the mapping range and writes back dirty shared
+    // mmap pages.
     for flush in flushes {
         flush.write_back();
     }
@@ -340,6 +451,33 @@ pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> SysResult {
         }
         _ => Err(SysError::EINVAL),
     }
+}
+
+fn check_memlock_limit(additional_locked_bytes: usize) -> SysResult<()> {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let credentials = &inner.credentials;
+    let privileged = credentials.euid == 0
+        && credentials
+            .capabilities
+            .has_effective(CAP_IPC_LOCK)
+            .unwrap_or(false);
+    if privileged {
+        return Ok(());
+    }
+
+    let limit = inner.resource_limits.get(RLimitResource::MemLock).rlim_cur;
+    if limit == 0 {
+        return Err(SysError::EPERM);
+    }
+    let locked = inner.memory_set.locked_bytes();
+    if locked
+        .checked_add(additional_locked_bytes)
+        .is_none_or(|total| total > limit)
+    {
+        return Err(SysError::ENOMEM);
+    }
+    Ok(())
 }
 
 fn prot_to_map_permission(prot: usize) -> MapPermission {

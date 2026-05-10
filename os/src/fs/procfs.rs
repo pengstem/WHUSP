@@ -41,6 +41,7 @@ const PID_MAPS_OFFSET: u32 = 4;
 const PID_NS_DIR_OFFSET: u32 = 5;
 const PID_NS_MNT_OFFSET: u32 = 6;
 const PID_TASK_DIR_OFFSET: u32 = 7;
+const PID_SMAPS_OFFSET: u32 = 8;
 const PID_FD_ENTRY_BASE: u32 = 1_000_000;
 const PID_FD_ENTRY_STRIDE: u32 = 4096;
 const PID_TASK_INO_TAG_MASK: u32 = 0xC000_0000;
@@ -93,6 +94,7 @@ enum ProcNode {
     PidFdDir(usize),
     PidFdEntry(usize, usize),
     PidMaps(usize),
+    PidSmaps(usize),
     PidNsDir(usize),
     PidNsMnt(usize),
     PidTaskDir(usize),
@@ -225,6 +227,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
                 PID_NS_DIR_OFFSET => Some(ProcNode::PidNsDir(pid)),
                 PID_NS_MNT_OFFSET => Some(ProcNode::PidNsMnt(pid)),
                 PID_TASK_DIR_OFFSET => Some(ProcNode::PidTaskDir(pid)),
+                PID_SMAPS_OFFSET => Some(ProcNode::PidSmaps(pid)),
                 _ => None,
             }
         }
@@ -414,6 +417,11 @@ fn pid_entries(pid: usize) -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: pid_file_ino(pid, PID_MAPS_OFFSET),
         name: "maps".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_SMAPS_OFFSET),
+        name: "smaps".into(),
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
@@ -736,6 +744,7 @@ fn pid_status_content(process: ProcessProcSnapshot) -> String {
          Uid:\t{}\t{}\t{}\t{}\n\
          Gid:\t{}\t{}\t{}\t{}\n\
          VmRSS:\t0 kB\n\
+         VmLck:\t{} kB\n\
          Threads:\t{}\n",
         process.comm,
         process.state,
@@ -749,6 +758,7 @@ fn pid_status_content(process: ProcessProcSnapshot) -> String {
         cred.egid,
         cred.sgid,
         cred.fsgid,
+        process.locked_kb,
         process.thread_count
     )
 }
@@ -787,6 +797,9 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::PidFdEntry(_, _) => Err(FsError::InvalidInput),
         ProcNode::PidMaps(pid) => pid2process(pid)
             .map(|process| process.proc_maps_content().into_bytes())
+            .ok_or(FsError::NotFound),
+        ProcNode::PidSmaps(pid) => pid2process(pid)
+            .map(|process| process.proc_smaps_content().into_bytes())
             .ok_or(FsError::NotFound),
         ProcNode::PidNsMnt(pid) => lookup_process(pid)
             .map(|process| format!("mnt:[{}]\n", process.mount_namespace_id.0).into_bytes())
@@ -884,6 +897,7 @@ impl FileSystemBackend for ProcFs {
                 )),
                 "fd" => Ok((pid_file_ino(pid, PID_FD_DIR_OFFSET), FsNodeKind::Directory)),
                 "maps" => Ok((pid_file_ino(pid, PID_MAPS_OFFSET), FsNodeKind::RegularFile)),
+                "smaps" => Ok((pid_file_ino(pid, PID_SMAPS_OFFSET), FsNodeKind::RegularFile)),
                 "ns" => Ok((pid_file_ino(pid, PID_NS_DIR_OFFSET), FsNodeKind::Directory)),
                 "task" => Ok((
                     pid_file_ino(pid, PID_TASK_DIR_OFFSET),

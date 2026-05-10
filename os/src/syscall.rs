@@ -142,6 +142,11 @@ const SYSCALL_MMAP: usize = 222;
 const SYSCALL_FADVISE64: usize = 223;
 const SYSCALL_MPROTECT: usize = 226;
 const SYSCALL_MSYNC: usize = 227;
+const SYSCALL_MLOCK: usize = 228;
+const SYSCALL_MUNLOCK: usize = 229;
+const SYSCALL_MLOCKALL: usize = 230;
+const SYSCALL_MUNLOCKALL: usize = 231;
+const SYSCALL_MINCORE: usize = 232;
 const SYSCALL_ACCEPT4: usize = 242;
 const SYSCALL_WAIT4: usize = 260;
 const SYSCALL_PRLIMIT64: usize = 261;
@@ -153,6 +158,7 @@ const SYSCALL_GETRANDOM: usize = 278;
 const SYSCALL_MEMFD_CREATE: usize = 279;
 const SYSCALL_EXECVEAT: usize = 281;
 const SYSCALL_MEMBARRIER: usize = 283;
+const SYSCALL_MLOCK2: usize = 284;
 const SYSCALL_COPY_FILE_RANGE: usize = 285;
 const SYSCALL_STATX: usize = 291;
 const SYSCALL_OPEN_TREE: usize = 428;
@@ -524,6 +530,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
+        SYSCALL_MLOCK => sys_mlock(args[0], args[1]),
+        SYSCALL_MUNLOCK => sys_munlock(args[0], args[1]),
+        SYSCALL_MLOCKALL => sys_mlockall(args[0]),
+        SYSCALL_MUNLOCKALL => sys_munlockall(),
+        SYSCALL_MINCORE => sys_mincore(args[0], args[1], args[2] as *mut u8),
         SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_EXECVE => sys_execve(
             args[0] as *const u8,
@@ -539,6 +550,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2] as i32),
+        SYSCALL_MLOCK2 => sys_mlock2(args[0], args[1], args[2]),
         SYSCALL_WAIT4 => sys_wait4(
             args[0] as isize,
             args[1] as *mut i32,

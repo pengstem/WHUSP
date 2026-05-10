@@ -103,6 +103,8 @@ impl MemorySet {
         memory_set.brk_limit = user_space.brk_limit;
         memory_set.brk_mapped_end = user_space.brk_mapped_end;
         memory_set.mmap_next = user_space.mmap_next;
+        memory_set.mlock_future = false;
+        memory_set.mlock_future_on_fault = false;
         if !memory_set.map_trampoline() {
             return None;
         }
@@ -266,12 +268,37 @@ impl MemorySet {
             if self.range_overlaps(old_mapped_end, new_mapped_end) {
                 return self.brk;
             }
+            if self.mlock_future {
+                let mut heap_area = MapArea::new(
+                    old_mapped_end.into(),
+                    new_mapped_end.into(),
+                    MapType::Framed,
+                    MapPermission::R | MapPermission::W | MapPermission::U,
+                );
+                apply_mlock_flags(
+                    &mut heap_area,
+                    self.mlock_future,
+                    self.mlock_future_on_fault,
+                );
+                if !heap_area.map(&mut self.page_table) {
+                    return self.brk;
+                }
+                self.areas.push(heap_area);
+                self.brk = addr;
+                self.brk_mapped_end = new_mapped_end;
+                return self.brk;
+            }
             let Some(area_idx) = self.find_brk_extension_area(heap_start_vpn, old_end_vpn) else {
                 let mut heap_area = MapArea::new(
                     old_mapped_end.into(),
                     new_mapped_end.into(),
                     MapType::Framed,
                     MapPermission::R | MapPermission::W | MapPermission::U,
+                );
+                apply_mlock_flags(
+                    &mut heap_area,
+                    self.mlock_future,
+                    self.mlock_future_on_fault,
                 );
                 if !heap_area.map(&mut self.page_table) {
                     return self.brk;
@@ -365,6 +392,7 @@ impl MemorySet {
             page_cache_id,
             page_cache_pages: BTreeMap::new(),
         });
+        apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
         self.areas.push(area);
         self.mmap_next = next_mmap_hint(end);
         Some(start)
@@ -420,6 +448,7 @@ impl MemorySet {
             page_cache_id,
             page_cache_pages: BTreeMap::new(),
         });
+        apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
         self.areas.push(area);
         Some((start, flushes))
     }
@@ -449,6 +478,7 @@ impl MemorySet {
         let start_vpn = VirtAddr::from(start).floor();
         let mut area = MapArea::new(start.into(), end.into(), MapType::Framed, permission);
         area.shm_info = Some(ShmAreaInfo::new(shmid, len));
+        apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
         for mapping in pages {
             if mapping.page_index >= map_len / PAGE_SIZE {
                 continue;
@@ -686,6 +716,203 @@ impl MemorySet {
         Ok(())
     }
 
+    pub fn additional_locked_bytes_for_range(&self, start: usize, len: usize) -> Option<usize> {
+        let (start_vpn, end_vpn) = checked_page_range(start, len)?;
+        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
+            return None;
+        }
+        Some(self.unlocked_pages_in_range(start_vpn, end_vpn) * PAGE_SIZE)
+    }
+
+    pub fn additional_locked_bytes_for_current(&self) -> usize {
+        self.areas
+            .iter()
+            .filter(|area| !area.is_locked())
+            .map(|area| area.vpn_range.get_end().0 - area.vpn_range.get_start().0)
+            .sum::<usize>()
+            * PAGE_SIZE
+    }
+
+    pub fn locked_bytes(&self) -> usize {
+        self.areas.iter().map(MapArea::locked_bytes).sum()
+    }
+
+    pub fn mlock_range(&mut self, start: usize, len: usize, on_fault: bool) -> bool {
+        let Some((start_vpn, end_vpn)) = checked_page_range(start, len) else {
+            return false;
+        };
+        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
+            return false;
+        }
+        if !on_fault && !self.prefault_range_for_mlock(start_vpn, end_vpn) {
+            return false;
+        }
+        self.mark_lock_range(start_vpn, end_vpn, on_fault);
+        true
+    }
+
+    pub fn munlock_range(&mut self, start: usize, len: usize) -> bool {
+        let Some((start_vpn, end_vpn)) = checked_page_range(start, len) else {
+            return false;
+        };
+        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
+            return false;
+        }
+        self.split_area_at(start_vpn);
+        self.split_area_at(end_vpn);
+        for area in &mut self.areas {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            if area_start >= start_vpn && area_end <= end_vpn {
+                area.locked = false;
+                area.lock_on_fault = false;
+            }
+        }
+        true
+    }
+
+    pub fn mlock_current(&mut self, on_fault: bool) -> bool {
+        if !on_fault {
+            let ranges: Vec<_> = self
+                .areas
+                .iter()
+                .map(|area| (area.vpn_range.get_start(), area.vpn_range.get_end()))
+                .collect();
+            for (start_vpn, end_vpn) in ranges {
+                if !self.prefault_range_for_mlock(start_vpn, end_vpn) {
+                    return false;
+                }
+            }
+        }
+        for area in &mut self.areas {
+            apply_mlock_flags(area, true, on_fault);
+        }
+        true
+    }
+
+    pub fn set_mlock_future(&mut self, on_fault: bool) {
+        self.mlock_future = true;
+        self.mlock_future_on_fault = on_fault;
+    }
+
+    pub fn munlock_all(&mut self) {
+        for area in &mut self.areas {
+            area.locked = false;
+            area.lock_on_fault = false;
+        }
+        self.mlock_future = false;
+        self.mlock_future_on_fault = false;
+    }
+
+    pub fn mincore_vec(&self, start: usize, len: usize) -> Option<Vec<u8>> {
+        let map_len = checked_page_align_up(len)?;
+        let end = start.checked_add(map_len)?;
+        let start_vpn = VirtAddr::from(start).floor();
+        let end_vpn = VirtAddr::from(end).floor();
+        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
+            return None;
+        }
+        let mut vec = Vec::new();
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            let resident = self
+                .page_table
+                .translate(vpn)
+                .is_some_and(|pte| pte.bits != 0 && pte.ppn().0 != 0);
+            vec.push(if resident { 1 } else { 0 });
+        }
+        Some(vec)
+    }
+
+    fn unlocked_pages_in_range(&self, start: super::VirtPageNum, end: super::VirtPageNum) -> usize {
+        let mut pages = 0;
+        for vpn in VPNRange::new(start, end) {
+            let locked = self.areas.iter().any(|area| {
+                area.vpn_range.get_start() <= vpn
+                    && vpn < area.vpn_range.get_end()
+                    && area.is_locked()
+            });
+            if !locked {
+                pages += 1;
+            }
+        }
+        pages
+    }
+
+    fn prefault_range_for_mlock(
+        &mut self,
+        start: super::VirtPageNum,
+        end: super::VirtPageNum,
+    ) -> bool {
+        for vpn in VPNRange::new(start, end) {
+            if !self.ensure_vpn_resident_for_mlock(vpn) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn ensure_vpn_resident_for_mlock(&mut self, vpn: super::VirtPageNum) -> bool {
+        if self
+            .page_table
+            .translate(vpn)
+            .is_some_and(|pte| pte.bits != 0 && pte.ppn().0 != 0)
+        {
+            return true;
+        }
+        let Some(area) = self
+            .areas
+            .iter()
+            .find(|area| area.vpn_range.get_start() <= vpn && vpn < area.vpn_range.get_end())
+        else {
+            return false;
+        };
+        if !area.is_mmap() {
+            return false;
+        }
+        let access = mlock_fault_access(area.map_perm);
+        let addr = usize::from(VirtAddr::from(vpn));
+        let Some(fault) = self.prepare_mmap_page_fault(addr, access) else {
+            return false;
+        };
+        match fault {
+            MmapFaultResult::Handled => true,
+            MmapFaultResult::Page(page) => {
+                let Some(frame) = page.build_frame() else {
+                    return false;
+                };
+                self.install_mmap_fault_page(page, frame)
+            }
+            MmapFaultResult::PageCache(page) => {
+                let Some(ppn) = page.resolve_ppn() else {
+                    return false;
+                };
+                let key = page.key();
+                let installed = self.install_mmap_page_cache_fault_page(page, ppn);
+                if !installed {
+                    PAGE_CACHE.exclusive_access().dec_ref(key);
+                }
+                installed
+            }
+        }
+    }
+
+    fn mark_lock_range(
+        &mut self,
+        start_vpn: super::VirtPageNum,
+        end_vpn: super::VirtPageNum,
+        on_fault: bool,
+    ) {
+        self.split_area_at(start_vpn);
+        self.split_area_at(end_vpn);
+        for area in &mut self.areas {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            if area_start >= start_vpn && area_end <= end_vpn {
+                apply_mlock_flags(area, true, on_fault);
+            }
+        }
+    }
+
     fn alloc_mmap_range(&self, len: usize) -> Option<usize> {
         if len == 0 || len > USER_MMAP_LIMIT - USER_MMAP_BASE {
             return None;
@@ -787,6 +1014,39 @@ impl MemorySet {
 fn checked_page_align_up(addr: usize) -> Option<usize> {
     addr.checked_add(PAGE_SIZE - 1)
         .map(|addr| addr & !(PAGE_SIZE - 1))
+}
+
+fn checked_page_range(start: usize, len: usize) -> Option<(VirtPageNum, VirtPageNum)> {
+    let start_vpn = VirtAddr::from(start).floor();
+    if len == 0 {
+        return Some((start_vpn, start_vpn));
+    }
+    let end = start.checked_add(len)?;
+    Some((start_vpn, VirtAddr::from(end).ceil()))
+}
+
+fn mlock_fault_access(permission: MapPermission) -> MmapFaultAccess {
+    if permission.contains(MapPermission::R) {
+        MmapFaultAccess::Read
+    } else if permission.contains(MapPermission::W) {
+        MmapFaultAccess::Write
+    } else {
+        MmapFaultAccess::Execute
+    }
+}
+
+fn apply_mlock_flags(area: &mut MapArea, locked: bool, on_fault: bool) {
+    if !locked {
+        return;
+    }
+    if on_fault {
+        if !area.locked {
+            area.lock_on_fault = true;
+        }
+    } else {
+        area.locked = true;
+        area.lock_on_fault = false;
+    }
 }
 
 fn normalized_mmap_hint(hint: usize) -> usize {

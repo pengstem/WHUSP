@@ -27,9 +27,11 @@ use log::info;
 use manager::fetch_task;
 pub(crate) use process::{Credentials, PathSnapshot, ProcessProcSnapshot, RLimit, RLimitResource};
 pub use process::{ProcessControlBlock, ProcessCpuTimesSnapshot};
+pub(crate) const CAP_IPC_LOCK: usize = process::CapabilitySets::CAP_IPC_LOCK;
 pub(crate) const CAP_SETPCAP: usize = process::CapabilitySets::CAP_SETPCAP;
 pub(crate) const CAP_SYS_CHROOT: usize = process::CapabilitySets::CAP_SYS_CHROOT;
 pub(crate) const CAP_SYS_ADMIN: usize = process::CapabilitySets::CAP_SYS_ADMIN;
+pub(crate) const CAP_SYS_RESOURCE: usize = process::CapabilitySets::CAP_SYS_RESOURCE;
 
 pub use crate::arch::TaskContext;
 pub use clone::{CloneArgs, CloneFlags, clone_current_thread};

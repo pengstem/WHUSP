@@ -18,6 +18,8 @@ pub struct MapArea {
     pub(super) map_perm: MapPermission,
     pub(super) mmap_info: Option<MmapInfo>,
     pub(super) shm_info: Option<ShmAreaInfo>,
+    pub(super) locked: bool,
+    pub(super) lock_on_fault: bool,
 }
 
 pub struct MmapFlush {
@@ -109,6 +111,8 @@ impl MapArea {
             map_perm,
             mmap_info: None,
             shm_info: None,
+            locked: false,
+            lock_on_fault: false,
         }
     }
 
@@ -127,6 +131,8 @@ impl MapArea {
                 info.pages.clear();
                 info
             }),
+            locked: false,
+            lock_on_fault: false,
         }
     }
 
@@ -155,6 +161,8 @@ impl MapArea {
             map_perm: self.map_perm,
             mmap_info: right_mmap_info,
             shm_info: right_shm_info,
+            locked: self.locked,
+            lock_on_fault: self.lock_on_fault,
         };
         self.vpn_range = VPNRange::new(start, at);
         Some(right)
@@ -389,6 +397,26 @@ impl MapArea {
 
     pub(super) fn is_shm(&self) -> bool {
         self.shm_info.is_some()
+    }
+
+    pub(super) fn is_locked(&self) -> bool {
+        self.locked || self.lock_on_fault
+    }
+
+    pub(super) fn locked_bytes(&self) -> usize {
+        if !self.is_locked() {
+            return 0;
+        }
+        (self.vpn_range.get_end().0 - self.vpn_range.get_start().0) * PAGE_SIZE
+    }
+
+    pub(super) fn resident_bytes(&self, page_table: &PageTable) -> usize {
+        let resident_pages = self
+            .vpn_range
+            .into_iter()
+            .filter(|vpn| page_table.translate(*vpn).is_some_and(|pte| pte.bits != 0))
+            .count();
+        resident_pages * PAGE_SIZE
     }
 
     pub(super) fn shm_segment_id(&self) -> Option<usize> {
