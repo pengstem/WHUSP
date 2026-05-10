@@ -23,8 +23,13 @@ fn backtrace() {
     let mut fp = crate::arch::backtrace::frame_pointer();
     let stop = current_kstack_top();
     println!("---START BACKTRACE---");
+    if fp == 0 {
+        println!("backtrace unavailable: frame pointer is zero");
+        println!("---END   BACKTRACE---");
+        return;
+    }
     for i in 0..10 {
-        if fp == stop {
+        if fp == stop || fp < 16 {
             break;
         }
         unsafe {

@@ -13,6 +13,9 @@ const ETC_GROUP: &[u8] =
 const ETC_HOSTS: &[u8] = b"127.0.0.1 localhost localhost.localdomain\n";
 const ETC_RESOLV_CONF: &[u8] = b"";
 const ETC_PROTOCOLS: &[u8] = b"ip 0 IP\ntcp 6 TCP\nudp 17 UDP\n";
+#[cfg(target_arch = "loongarch64")]
+const LA_MUSL_COMPAT_SO: &[u8] =
+    include_bytes!("../../assets/loongarch64/liboscomp-musl-compat.so");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StaticNode {
@@ -23,6 +26,14 @@ enum StaticNode {
     Hosts,
     ResolvConf,
     Protocols,
+    #[cfg(target_arch = "loongarch64")]
+    OptDir,
+    #[cfg(target_arch = "loongarch64")]
+    OptOscompSupportDir,
+    #[cfg(target_arch = "loongarch64")]
+    OptOscompSupportLibDir,
+    #[cfg(target_arch = "loongarch64")]
+    LaMuslCompatSo,
 }
 
 pub struct StaticFile {
@@ -50,6 +61,16 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
         "/etc/hosts" => Some(StaticNode::Hosts),
         "/etc/resolv.conf" => Some(StaticNode::ResolvConf),
         "/etc/protocols" => Some(StaticNode::Protocols),
+        #[cfg(target_arch = "loongarch64")]
+        "/opt" | "/opt/" => Some(StaticNode::OptDir),
+        #[cfg(target_arch = "loongarch64")]
+        "/opt/oscomp-support" | "/opt/oscomp-support/" => Some(StaticNode::OptOscompSupportDir),
+        #[cfg(target_arch = "loongarch64")]
+        "/opt/oscomp-support/lib" | "/opt/oscomp-support/lib/" => {
+            Some(StaticNode::OptOscompSupportLibDir)
+        }
+        #[cfg(target_arch = "loongarch64")]
+        "/opt/oscomp-support/lib/liboscomp-musl-compat.so" => Some(StaticNode::LaMuslCompatSo),
         _ => None,
     }
 }
@@ -63,13 +84,36 @@ fn content(node: StaticNode) -> Option<&'static [u8]> {
         StaticNode::ResolvConf => Some(ETC_RESOLV_CONF),
         StaticNode::Protocols => Some(ETC_PROTOCOLS),
         StaticNode::EtcDir => None,
+        #[cfg(target_arch = "loongarch64")]
+        StaticNode::OptDir
+        | StaticNode::OptOscompSupportDir
+        | StaticNode::OptOscompSupportLibDir => None,
+        #[cfg(target_arch = "loongarch64")]
+        StaticNode::LaMuslCompatSo => Some(LA_MUSL_COMPAT_SO),
+    }
+}
+
+fn is_dir(node: StaticNode) -> bool {
+    match node {
+        StaticNode::EtcDir => true,
+        #[cfg(target_arch = "loongarch64")]
+        StaticNode::OptDir
+        | StaticNode::OptOscompSupportDir
+        | StaticNode::OptOscompSupportLibDir => true,
+        _ => false,
     }
 }
 
 fn stat_node(node: StaticNode) -> FileStat {
-    let mut stat = match node {
-        StaticNode::EtcDir => FileStat::with_mode(S_IFDIR | 0o555),
-        _ => FileStat::with_mode(S_IFREG | 0o444),
+    let mut stat = if is_dir(node) {
+        FileStat::with_mode(S_IFDIR | 0o555)
+    } else {
+        let mode = match node {
+            #[cfg(target_arch = "loongarch64")]
+            StaticNode::LaMuslCompatSo => 0o555,
+            _ => 0o444,
+        };
+        FileStat::with_mode(S_IFREG | mode)
     };
     stat.dev = 0x657463;
     stat.ino = match node {
@@ -80,8 +124,16 @@ fn stat_node(node: StaticNode) -> FileStat {
         StaticNode::Hosts => 5,
         StaticNode::ResolvConf => 6,
         StaticNode::Protocols => 7,
+        #[cfg(target_arch = "loongarch64")]
+        StaticNode::OptDir => 8,
+        #[cfg(target_arch = "loongarch64")]
+        StaticNode::OptOscompSupportDir => 9,
+        #[cfg(target_arch = "loongarch64")]
+        StaticNode::OptOscompSupportLibDir => 10,
+        #[cfg(target_arch = "loongarch64")]
+        StaticNode::LaMuslCompatSo => 11,
     };
-    stat.nlink = if node == StaticNode::EtcDir { 2 } else { 1 };
+    stat.nlink = if is_dir(node) { 2 } else { 1 };
     stat.size = content(node).map_or(0, |content| content.len() as u64);
     let now = super::FileTimestamp::now();
     stat.atime_sec = now.sec;
@@ -104,7 +156,7 @@ pub(crate) fn open_path(
     let Some(node) = lookup_absolute(path) else {
         return Ok(None);
     };
-    if node == StaticNode::EtcDir {
+    if is_dir(node) {
         return Err(FsError::IsDir);
     }
     if flags.writable_target() || flags.contains(OpenFlags::TRUNC) {

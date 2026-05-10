@@ -2,6 +2,7 @@ use super::ltp_whitelist::LTP_CASE_WHITELIST;
 use alloc::{format, string::String};
 
 const TEST_LIBCS: &[&str] = &["/glibc", "/musl"];
+const LA_MUSL_COMPAT_PRELOAD: &str = "/opt/oscomp-support/lib/liboscomp-musl-compat.so";
 
 const INTERACTIVE_SHELL: bool = false;
 
@@ -153,11 +154,31 @@ fn append_normal_script(command: &mut String, libc_root: &str, script: &str) {
     if script == "lmbench_testcode.sh" {
         command.push_str("./busybox rm -f /tmp/hello; ");
     }
+    if needs_la_musl_preload(libc_root, script) {
+        command.push_str("LD_PRELOAD=");
+        command.push_str(LA_MUSL_COMPAT_PRELOAD);
+        command.push(' ');
+    }
     command.push_str("./busybox sh ./");
     command.push_str(script);
     if script == "lmbench_testcode.sh" {
         command.push_str("; ./busybox rm -f /tmp/hello");
     }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn needs_la_musl_preload(libc_root: &str, script: &str) -> bool {
+    // CONTEXT: The LoongArch musl libc shipped on the current test disk has
+    // sched_getparam/getscheduler/setparam/setscheduler stubs that return
+    // ENOSYS without issuing a syscall. cyclictest depends on those libc entry
+    // points, so preload a tiny syscall-forwarding compatibility library for
+    // this LoongArch musl group only.
+    libc_root == "/musl" && script == "cyclictest_testcode.sh"
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn needs_la_musl_preload(_libc_root: &str, _script: &str) -> bool {
+    false
 }
 
 fn append_ltp_runner(command: &mut String, libc_root: &str) {

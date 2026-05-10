@@ -2,7 +2,7 @@ use crate::{
     syscall::{
         errno::{SysError, SysResult},
         uapi::LinuxTimeSpec,
-        user_ptr::{copy_to_user, read_user_value, write_user_value},
+        user_ptr::{read_user_value_with_mmap_fault, write_user_value_with_mmap_fault},
     },
     task::{TaskControlBlock, current_task, current_user_token, processes_snapshot},
 };
@@ -100,7 +100,7 @@ pub fn sys_sched_getparam(pid: isize, param: usize) -> SysResult {
     let sched_param = LinuxSchedParam {
         sched_priority: task.inner_exclusive_access().sched_priority,
     };
-    write_user_value(
+    write_user_value_with_mmap_fault(
         current_user_token(),
         param as *mut LinuxSchedParam,
         &sched_param,
@@ -116,8 +116,8 @@ pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: usize) -> SysR
     // CONTEXT: The current contest runtime exposes a single runnable hart to
     // user space and does not model Linux cpusets/cgroups yet, so every task
     // reports an affinity mask containing CPU 0 only.
-    let affinity_mask = 1usize.to_ne_bytes();
-    copy_to_user(current_user_token(), mask as *mut u8, &affinity_mask)?;
+    let affinity_mask = 1usize;
+    write_user_value_with_mmap_fault(current_user_token(), mask as *mut usize, &affinity_mask)?;
     Ok(AFFINITY_MASK_BYTES as isize)
 }
 
@@ -126,7 +126,8 @@ pub fn sys_sched_setaffinity(pid: isize, cpusetsize: usize, mask: usize) -> SysR
         return Err(SysError::EINVAL);
     }
     let _task = sched_target_task(pid)?;
-    let affinity_mask = read_user_value(current_user_token(), mask as *const usize)?;
+    let affinity_mask =
+        read_user_value_with_mmap_fault(current_user_token(), mask as *const usize)?;
     if affinity_mask & 1 == 0 {
         return Err(SysError::EINVAL);
     }
@@ -140,7 +141,8 @@ pub fn sys_sched_setparam(pid: isize, param: usize) -> SysResult {
     if param == 0 {
         return Err(SysError::EINVAL);
     }
-    let sched_param = read_user_value(current_user_token(), param as *const LinuxSchedParam)?;
+    let sched_param =
+        read_user_value_with_mmap_fault(current_user_token(), param as *const LinuxSchedParam)?;
     let task = sched_target_task(pid)?;
     let mut inner = task.inner_exclusive_access();
     validate_priority_for_policy(inner.sched_policy, sched_param.sched_priority)?;
@@ -155,7 +157,8 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: usize) -> SysResul
         return Err(SysError::EINVAL);
     }
     let (base_policy, reset_on_fork) = split_settable_policy(policy)?;
-    let sched_param = read_user_value(current_user_token(), param as *const LinuxSchedParam)?;
+    let sched_param =
+        read_user_value_with_mmap_fault(current_user_token(), param as *const LinuxSchedParam)?;
     validate_priority_for_policy(base_policy, sched_param.sched_priority)?;
     let task = sched_target_task(pid)?;
 
@@ -190,6 +193,6 @@ pub fn sys_sched_rr_get_interval(pid: isize, interval: *mut LinuxTimeSpec) -> Sy
         tv_sec: 0,
         tv_nsec: RR_INTERVAL_NSEC,
     };
-    write_user_value(current_user_token(), interval, &rr_interval)?;
+    write_user_value_with_mmap_fault(current_user_token(), interval, &rr_interval)?;
     Ok(0)
 }
