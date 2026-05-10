@@ -41,13 +41,7 @@ const TEST_SCRIPTS: &[&str] = &[
 /// runs cases whose names start with the prefix, and
 /// Some("range:<start>,<end>") runs cases in the lexicographic half-open range
 /// [start, end). Empty range bounds are unbounded.
-const LTP_CASE_FILTER_OPTION: Option<&str> = Some(concat!(
-    "cases:",
-    "mlock01,mlock02,mlock03,mlock04,mlock05,",
-    "mlock201,mlock202,mlock203,",
-    "mlockall01,mlockall02,mlockall03,",
-    "munlock01,munlock02,munlockall01"
-));
+const LTP_CASE_FILTER_OPTION: Option<&str> = None;
 
 enum LtpCaseFilter {
     Whitelist,

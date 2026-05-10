@@ -13,6 +13,20 @@ pub(super) const LTP_CASE_WHITELIST_GLIBC: &[&str] = &[
     "fsconfig02,fsconfig03,",
     "fsmount01",
     "fsmount02",
+    "mlock01",
+    "mlock02",
+    "mlock03",
+    "mlock04",
+    "mlock05,",
+    "mlock201",
+    "mlock202",
+    "mlock203",
+    "mlockall01",
+    "mlockall02",
+    "mlockall03",
+    "munlock01",
+    "munlock02",
+    "munlockall01",
 ];
 
 pub(super) const LTP_CASE_WHITELIST_MUSL: &[&str] = &[
@@ -30,6 +44,20 @@ pub(super) const LTP_CASE_WHITELIST_MUSL: &[&str] = &[
     "fsconfig02,fsconfig03,",
     "fsmount01",
     "fsmount02",
+    "mlock01",
+    "mlock02",
+    "mlock03",
+    "mlock04",
+    "mlock05,",
+    "mlock201",
+    "mlock202",
+    "mlock203",
+    "mlockall01",
+    "mlockall02",
+    "mlockall03",
+    "munlock01",
+    "munlock02",
+    "munlockall01",
 ];
 
 pub(super) fn ltp_case_whitelist(libc_root: &str) -> &'static [&'static str] {
