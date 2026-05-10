@@ -23,6 +23,6 @@ pub use namespace::sys_setns;
 pub use resource::{sys_getrlimit, sys_prlimit64, sys_setrlimit};
 pub use sched::{
     sys_sched_get_priority_max, sys_sched_get_priority_min, sys_sched_getaffinity,
-    sys_sched_getparam, sys_sched_getscheduler,
+    sys_sched_getparam, sys_sched_getscheduler, sys_sched_rr_get_interval,
 };
 pub use system::{LinuxUtsName, sys_getrandom, sys_reboot, sys_syslog, sys_uname};

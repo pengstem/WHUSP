@@ -72,6 +72,7 @@ const SYSCALL_SCHED_GETAFFINITY: usize = 123;
 const SYSCALL_SCHED_YIELD: usize = 124;
 const SYSCALL_SCHED_GET_PRIORITY_MAX: usize = 125;
 const SYSCALL_SCHED_GET_PRIORITY_MIN: usize = 126;
+const SYSCALL_SCHED_RR_GET_INTERVAL: usize = 127;
 const SYSCALL_KILL: usize = 129;
 const SYSCALL_TKILL: usize = 130;
 const SYSCALL_TGKILL: usize = 131;
@@ -422,6 +423,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SCHED_YIELD => Ok(sys_sched_yield()),
         SYSCALL_SCHED_GET_PRIORITY_MAX => sys_sched_get_priority_max(args[0] as i32),
         SYSCALL_SCHED_GET_PRIORITY_MIN => sys_sched_get_priority_min(args[0] as i32),
+        SYSCALL_SCHED_RR_GET_INTERVAL => {
+            sys_sched_rr_get_interval(args[0] as isize, args[1] as *mut LinuxTimeSpec)
+        }
         SYSCALL_KILL => sys_kill(args[0] as isize, args[1] as u32),
         SYSCALL_TKILL => sys_tkill(args[0] as isize, args[1] as u32),
         SYSCALL_TGKILL => sys_tgkill(args[0] as isize, args[1] as isize, args[2] as u32),

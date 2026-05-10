@@ -1,6 +1,7 @@
 use crate::{
     syscall::{
         errno::{SysError, SysResult},
+        uapi::LinuxTimeSpec,
         user_ptr::{copy_to_user, write_user_value},
     },
     task::{TaskControlBlock, current_task, current_user_token, processes_snapshot},
@@ -16,6 +17,7 @@ const SCHED_IDLE: i32 = 5;
 const SCHED_DEADLINE: i32 = 6;
 const RT_PRIORITY_MIN: isize = 1;
 const RT_PRIORITY_MAX: isize = 99;
+const RR_INTERVAL_NSEC: isize = 100_000_000;
 const AFFINITY_MASK_BYTES: usize = size_of::<usize>();
 
 #[repr(C)]
@@ -99,4 +101,20 @@ pub fn sys_sched_get_priority_max(policy: i32) -> SysResult {
 
 pub fn sys_sched_get_priority_min(policy: i32) -> SysResult {
     Ok(sched_priority_bounds(policy)?.0)
+}
+
+pub fn sys_sched_rr_get_interval(pid: isize, interval: *mut LinuxTimeSpec) -> SysResult {
+    if interval.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    let _task = sched_target_task(pid)?;
+    // CONTEXT: The kernel does not yet store per-thread scheduler policy.
+    // Report Linux's default 100 ms SCHED_RR quantum until Stage 3 introduces
+    // Linux-facing scheduling metadata.
+    let rr_interval = LinuxTimeSpec {
+        tv_sec: 0,
+        tv_nsec: RR_INTERVAL_NSEC,
+    };
+    write_user_value(current_user_token(), interval, &rr_interval)?;
+    Ok(0)
 }
