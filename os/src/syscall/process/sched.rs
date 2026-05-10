@@ -121,6 +121,21 @@ pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: usize) -> SysR
     Ok(AFFINITY_MASK_BYTES as isize)
 }
 
+pub fn sys_sched_setaffinity(pid: isize, cpusetsize: usize, mask: usize) -> SysResult {
+    if cpusetsize < AFFINITY_MASK_BYTES {
+        return Err(SysError::EINVAL);
+    }
+    let _task = sched_target_task(pid)?;
+    let affinity_mask = read_user_value(current_user_token(), mask as *const usize)?;
+    if affinity_mask & 1 == 0 {
+        return Err(SysError::EINVAL);
+    }
+    // CONTEXT: The current contest runtime has only CPU 0 available to user
+    // space. Accept masks that include CPU 0 for ABI compatibility, but do
+    // not perform migration or persist a broader cpuset model yet.
+    Ok(0)
+}
+
 pub fn sys_sched_setparam(pid: isize, param: usize) -> SysResult {
     if param == 0 {
         return Err(SysError::EINVAL);

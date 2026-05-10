@@ -70,6 +70,7 @@ const SYSCALL_SCHED_SETPARAM: usize = 118;
 const SYSCALL_SCHED_SETSCHEDULER: usize = 119;
 const SYSCALL_SCHED_GETSCHEDULER: usize = 120;
 const SYSCALL_SCHED_GETPARAM: usize = 121;
+const SYSCALL_SCHED_SETAFFINITY: usize = 122;
 const SYSCALL_SCHED_GETAFFINITY: usize = 123;
 const SYSCALL_SCHED_YIELD: usize = 124;
 const SYSCALL_SCHED_GET_PRIORITY_MAX: usize = 125;
@@ -425,6 +426,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         }
         SYSCALL_SCHED_GETSCHEDULER => sys_sched_getscheduler(args[0] as isize),
         SYSCALL_SCHED_GETPARAM => sys_sched_getparam(args[0] as isize, args[1]),
+        SYSCALL_SCHED_SETAFFINITY => sys_sched_setaffinity(args[0] as isize, args[1], args[2]),
         SYSCALL_SCHED_GETAFFINITY => sys_sched_getaffinity(args[0] as isize, args[1], args[2]),
         SYSCALL_SCHED_YIELD => Ok(sys_sched_yield()),
         SYSCALL_SCHED_GET_PRIORITY_MAX => sys_sched_get_priority_max(args[0] as i32),
