@@ -146,6 +146,7 @@ pub struct CapabilitySets {
 impl CapabilitySets {
     pub const CAP_SETPCAP: usize = 8;
     pub const CAP_SYS_CHROOT: usize = 18;
+    pub const CAP_SYS_ADMIN: usize = 21;
     pub const CAP_LAST_CAP: usize = 40;
 
     fn all_known_bits() -> [u32; 2] {

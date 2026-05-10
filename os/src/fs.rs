@@ -6,6 +6,7 @@ mod fat;
 mod inode;
 mod memfd;
 mod mount;
+mod mount_fd;
 mod path;
 mod pipe;
 mod procfs;
@@ -22,6 +23,7 @@ use bitflags::bitflags;
 use core::any::Any;
 
 pub(crate) use eventfd::make_eventfd;
+pub(crate) use mount_fd::{DetachedMountFile, FsContextFile, FsContextStateError};
 
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
 

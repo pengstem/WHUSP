@@ -23,7 +23,9 @@ pub use io::{
     sys_pread64, sys_preadv, sys_pwrite64, sys_pwritev, sys_read, sys_readv, sys_splice, sys_write,
     sys_writev,
 };
-pub use mount::{sys_mount, sys_umount2};
+pub use mount::{
+    sys_fsconfig, sys_fsmount, sys_fsopen, sys_mount, sys_move_mount, sys_open_tree, sys_umount2,
+};
 pub(crate) use path::path_context_from;
 pub use path::{
     sys_chdir, sys_chroot, sys_faccessat, sys_faccessat2, sys_fchdir, sys_getcwd, sys_getdents64,

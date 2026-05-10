@@ -41,7 +41,14 @@ const TEST_SCRIPTS: &[&str] = &[
 /// runs cases whose names start with the prefix, and
 /// Some("range:<start>,<end>") runs cases in the lexicographic half-open range
 /// [start, end). Empty range bounds are unbounded.
-const LTP_CASE_FILTER_OPTION: Option<&str> = Some("prefix:accept");
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some(concat!(
+    "cases:",
+    "open_tree01,open_tree02,",
+    "move_mount01,move_mount02,",
+    "fsopen01,fsopen02,",
+    "fsconfig01,fsconfig02,fsconfig03,",
+    "fsmount01,fsmount02"
+));
 
 enum LtpCaseFilter {
     Whitelist,

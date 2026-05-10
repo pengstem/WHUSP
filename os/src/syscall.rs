@@ -155,6 +155,11 @@ const SYSCALL_EXECVEAT: usize = 281;
 const SYSCALL_MEMBARRIER: usize = 283;
 const SYSCALL_COPY_FILE_RANGE: usize = 285;
 const SYSCALL_STATX: usize = 291;
+const SYSCALL_OPEN_TREE: usize = 428;
+const SYSCALL_MOVE_MOUNT: usize = 429;
+const SYSCALL_FSOPEN: usize = 430;
+const SYSCALL_FSCONFIG: usize = 431;
+const SYSCALL_FSMOUNT: usize = 432;
 const SYSCALL_FACCESSAT2: usize = 439;
 const SYSCALL_EPOLL_PWAIT2: usize = 441;
 
@@ -381,6 +386,23 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as u32,
             args[4] as *mut LinuxStatx,
         ),
+        SYSCALL_OPEN_TREE => sys_open_tree(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_MOVE_MOUNT => sys_move_mount(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as isize,
+            args[3] as *const u8,
+            args[4] as u32,
+        ),
+        SYSCALL_FSOPEN => sys_fsopen(args[0] as *const u8, args[1] as u32),
+        SYSCALL_FSCONFIG => sys_fsconfig(
+            args[0] as isize,
+            args[1] as u32,
+            args[2] as *const u8,
+            args[3] as *const u8,
+            args[4] as i32,
+        ),
+        SYSCALL_FSMOUNT => sys_fsmount(args[0] as isize, args[1] as u32, args[2] as u32),
         SYSCALL_WAITID => sys_waitid(
             args[0] as i32,
             args[1] as i32,

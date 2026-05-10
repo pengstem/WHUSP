@@ -287,11 +287,6 @@ pub(crate) fn clone_mount_namespace(source_namespace_id: MountNamespaceId) -> Mo
 }
 
 fn ensure_mount_open(mount_id: MountId) -> Result<(), MountError> {
-    let device = BLOCK_DEVICES
-        .get(mount_id.0)
-        .ok_or(MountError::SourceMissing)?
-        .clone();
-
     {
         let mounts = MOUNTS.lock();
         let Some(mount) = mounts.get(mount_id.0) else {
@@ -301,6 +296,11 @@ fn ensure_mount_open(mount_id: MountId) -> Result<(), MountError> {
             return Ok(());
         }
     }
+
+    let device = BLOCK_DEVICES
+        .get(mount_id.0)
+        .ok_or(MountError::SourceMissing)?
+        .clone();
 
     let mount = open_backend(BackendKind::Ext4, device, mount_id.0)?;
     let mut mounts = MOUNTS.lock();
@@ -1181,6 +1181,80 @@ pub(crate) fn mount_pseudo_fs_at_with_options(
         mounts.push(event.clone());
         propagate_mount_event(mounts, event, propagation_parent);
         Ok(source_mount_id)
+    })
+}
+
+pub(crate) fn create_detached_tmpfs_mount(
+    source: String,
+    read_only: bool,
+) -> Result<WorkingDir, MountError> {
+    let mount_id = register_mount(MountedFs::new(
+        Box::new(TmpFs::new()),
+        source,
+        "tmpfs",
+        mount_options(read_only),
+    ));
+    let root_ino = root_ino_for(mount_id).ok_or(MountError::SourceMissing)?;
+    Ok(WorkingDir::new(mount_id, root_ino))
+}
+
+pub(crate) fn mount_detached_fs_at(
+    namespace_id: MountNamespaceId,
+    source: WorkingDir,
+    target: WorkingDir,
+    source_path: &str,
+    target_path: &str,
+) -> Result<(), MountError> {
+    let source_root = VfsNodeId::new(source.mount_id(), source.ino());
+    let target = VfsNodeId::new(target.mount_id(), target.ino());
+    if root_ino_for(target.mount_id).is_some_and(|root_ino| target.ino == root_ino) {
+        return Err(MountError::StaticRoot);
+    }
+
+    let target_is_busy = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        mounts
+            .iter()
+            .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
+    });
+    if target_is_busy {
+        return Err(MountError::TargetBusy);
+    }
+
+    let covered_parent = lookup_covered_parent(target)?;
+    let source_path = resolve_mount_path(source_root, source_path);
+    let target_path = resolve_mount_path(target, target_path);
+    ensure_mount_open(source_root.mount_id)?;
+    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        if mounts
+            .iter()
+            .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
+        {
+            return Err(MountError::TargetBusy);
+        }
+        let propagation_parent =
+            propagation_parent_for_new_mount(mounts, namespace_id, target_path.as_str());
+        let mut event = DynamicMount {
+            namespace_id,
+            target,
+            covered_parent,
+            source_mount_id: source_root.mount_id,
+            source_root,
+            source_path,
+            target_path,
+            is_bind: false,
+            recursive_bind: false,
+            event_id: next_mount_event_id(),
+            propagation_parent_path: String::new(),
+            propagation_parent_group: None,
+            propagation: MountPropagation::Private,
+            peer_group: None,
+            master_group: None,
+            uncloned_subtree_suffixes: Vec::new(),
+        };
+        initialize_propagation_from_parent(&mut event, propagation_parent.as_ref());
+        mounts.push(event.clone());
+        propagate_mount_event(mounts, event, propagation_parent);
+        Ok(())
     })
 }
 
