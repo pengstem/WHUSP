@@ -21,17 +21,17 @@ const ALL_TESTS: &[&str] = &[
 ];
 
 const TEST_SCRIPTS: &[&str] = &[
-    // "basic_testcode.sh",
-    // "busybox_testcode.sh",
-    // "lua_testcode.sh",
-    // "libctest_testcode.sh",
-    // "iozone_testcode.sh",
-    // "iperf_testcode.sh",
-    // "libcbench_testcode.sh",
-    // "lmbench_testcode.sh",
-    // "netperf_testcode.sh",
+    "basic_testcode.sh",
+    "busybox_testcode.sh",
+    "lua_testcode.sh",
+    "libctest_testcode.sh",
+    "iozone_testcode.sh",
+    "iperf_testcode.sh",
+    "libcbench_testcode.sh",
+    "netperf_testcode.sh",
     "cyclictest_testcode.sh",
     // "ltp_testcode.sh",
+    // "lmbench_testcode.sh",
 ];
 
 /// None runs the curated whitelist from ltp_whitelist.rs.
@@ -41,7 +41,7 @@ const TEST_SCRIPTS: &[&str] = &[
 /// runs cases whose names start with the prefix, and
 /// Some("range:<start>,<end>") runs cases in the lexicographic half-open range
 /// [start, end). Empty range bounds are unbounded.
-const LTP_CASE_FILTER_OPTION: Option<&str> = None;
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some("f");
 
 enum LtpCaseFilter {
     Whitelist,
