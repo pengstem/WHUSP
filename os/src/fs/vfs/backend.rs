@@ -101,6 +101,9 @@ pub(crate) trait FileSystemBackend: Send {
     fn release_inode(&mut self, _ino: u32) -> FsResult {
         Ok(())
     }
+    fn assign_cgroup_pid(&mut self, _dir_ino: u32, _pid: usize) -> FsResult {
+        Err(FsError::InvalidInput)
+    }
     fn stat(&mut self, ino: u32) -> FsResult<FileStat>;
     fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize>;
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize;

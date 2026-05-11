@@ -1,9 +1,10 @@
+use super::cgroupfs::CgroupFs;
 use super::ext4::Ext4Mount;
 use super::fat::FatMount;
 use super::path::WorkingDir;
 use super::procfs::ProcFs;
 use super::tmpfs::TmpFs;
-use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, VfsNodeId};
+use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult, VfsNodeId};
 use crate::drivers::block::BLOCK_DEVICES;
 use crate::sync::{SleepMutex, UPIntrFreeCell};
 use crate::task::any_process_references_mount;
@@ -1538,6 +1539,29 @@ pub(crate) fn mount_tmpfs_at(
         target_path,
         mount_options(read_only),
     )
+}
+
+pub(crate) fn mount_cgroup2_at(
+    namespace_id: MountNamespaceId,
+    target: WorkingDir,
+    target_path: &str,
+    read_only: bool,
+) -> Result<MountId, MountError> {
+    mount_pseudo_fs_at_with_options(
+        namespace_id,
+        target,
+        Box::new(CgroupFs::new()),
+        "cgroup2",
+        target_path,
+        mount_options(read_only),
+    )
+}
+
+pub(crate) fn assign_pid_to_cgroup(node: VfsNodeId, pid: usize) -> FsResult {
+    with_mount(node.mount_id, |mount| {
+        mount.assign_cgroup_pid(node.ino, pid)
+    })
+    .ok_or(FsError::InvalidInput)?
 }
 
 pub(crate) fn set_mount_propagation_at(
