@@ -24,6 +24,7 @@ bitflags! {
         const CLONE_DETACHED        = 1 << 22;
         const CLONE_UNTRACED        = 1 << 23;
         const CLONE_CHILD_SETTID    = 1 << 24;
+        const CLONE_NEWNET          = 1 << 30;
     }
 }
 

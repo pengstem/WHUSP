@@ -61,6 +61,8 @@ pub fn sys_clone(
         sys_clone_thread(args)
     } else if is_vm_vfork_process_clone(args) {
         sys_clone_vm_vfork(args)
+    } else if is_vm_newnet_process_clone(args) {
+        sys_clone_vm_newnet(args)
     } else {
         sys_clone_process(args)
     }
@@ -105,6 +107,8 @@ pub fn sys_clone3(args: *const LinuxCloneArgs, size: usize) -> SysResult {
         sys_clone_thread(clone_args)
     } else if is_vm_vfork_process_clone(clone_args) && args.flags & CLONE_PIDFD == 0 {
         sys_clone_vm_vfork(clone_args)
+    } else if is_vm_newnet_process_clone(clone_args) && args.flags & CLONE_PIDFD == 0 {
+        sys_clone_vm_newnet(clone_args)
     } else {
         let pidfd = if args.flags & CLONE_PIDFD != 0 {
             Some(args.pidfd as *mut i32)
@@ -188,6 +192,12 @@ fn is_vm_vfork_process_clone(args: CloneArgs) -> bool {
         && !args.is_thread()
 }
 
+fn is_vm_newnet_process_clone(args: CloneArgs) -> bool {
+    args.flags
+        .contains(CloneFlags::CLONE_VM | CloneFlags::CLONE_NEWNET)
+        && !args.is_thread()
+}
+
 fn sys_clone_vm_vfork(args: CloneArgs) -> SysResult {
     // UNFINISHED: Linux CLONE_VM without CLONE_THREAD creates a distinct
     // process that shares the mm_struct, and CLONE_VFORK releases the parent
@@ -195,10 +205,26 @@ fn sys_clone_vm_vfork(args: CloneArgs) -> SysResult {
     // CLONE_VM|CLONE_VFORK children that exit without exec by running them as a
     // same-process helper task, so memory writes are visible before the parent
     // clone call returns.
+    sys_clone_vm_helper(args, false)
+}
+
+fn sys_clone_vm_newnet(args: CloneArgs) -> SysResult {
+    // UNFINISHED: Full network namespaces are not implemented. This path is
+    // limited to CLONE_NEWNET|CLONE_VM LTP coverage: run the child as a helper
+    // task so CLONE_VM data writes are visible, and mark it so procfs exposes
+    // default net sysctls while it runs.
+    sys_clone_vm_helper(args, true)
+}
+
+fn sys_clone_vm_helper(args: CloneArgs, synthetic_newnet: bool) -> SysResult {
     let process = current_process();
     let cloned = clone_current_thread(args);
     let linux_tid = cloned.linux_tid;
-    cloned.task.inner_exclusive_access().clone_vm_vfork_helper = true;
+    {
+        let mut task_inner = cloned.task.inner_exclusive_access();
+        task_inner.clone_vm_process_helper = true;
+        task_inner.synthetic_newnet = synthetic_newnet;
+    }
     let process_token = process.attach_task(Arc::clone(&cloned.task));
 
     if args.flags.contains(CloneFlags::CLONE_PARENT_SETTID) {

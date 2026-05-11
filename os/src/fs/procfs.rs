@@ -14,7 +14,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 
 const ROOT_INO: u32 = 2;
@@ -31,6 +31,13 @@ const PIPE_USER_PAGES_SOFT_INO: u32 = 12;
 const DOMAINNAME_INO: u32 = 13;
 const TAINTED_INO: u32 = 14;
 const LEASE_BREAK_TIME_INO: u32 = 15;
+const SYS_NET_DIR_INO: u32 = 16;
+const SYS_NET_IPV4_DIR_INO: u32 = 17;
+const SYS_NET_IPV4_CONF_DIR_INO: u32 = 18;
+const SYS_NET_IPV4_CONF_LO_DIR_INO: u32 = 19;
+const SYS_NET_IPV4_CONF_DEFAULT_DIR_INO: u32 = 20;
+const SYS_NET_IPV4_CONF_LO_TAG_INO: u32 = 21;
+const SYS_NET_IPV4_CONF_DEFAULT_TAG_INO: u32 = 22;
 const PID_DIR_BASE: u32 = 100;
 const PID_FILE_BASE: u32 = 10_000;
 const PID_FILE_STRIDE: u32 = 16;
@@ -55,11 +62,13 @@ const PID_TASK_MAX_LOCAL_TID: usize = 1 << PID_TASK_PID_SHIFT;
 const DEFAULT_PID_MAX: usize = 4_194_304;
 const DEFAULT_PIPE_USER_PAGES_SOFT: usize = 1;
 const DEFAULT_LEASE_BREAK_TIME: usize = 45;
+const DEFAULT_NET_IPV4_CONF_TAG: isize = 0;
 
 static PROC_PID_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_PID_MAX);
 static PROC_PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(PIPE_MAX_CAPACITY);
 static PROC_PIPE_USER_PAGES_SOFT: AtomicUsize = AtomicUsize::new(DEFAULT_PIPE_USER_PAGES_SOFT);
 static PROC_LEASE_BREAK_TIME: AtomicUsize = AtomicUsize::new(DEFAULT_LEASE_BREAK_TIME);
+static PROC_NET_IPV4_CONF_LO_TAG: AtomicIsize = AtomicIsize::new(DEFAULT_NET_IPV4_CONF_TAG);
 
 lazy_static! {
     static ref PROC_DOMAINNAME: UPIntrFreeCell<Vec<u8>> = {
@@ -85,10 +94,17 @@ enum ProcNode {
     SysDir,
     SysKernelDir,
     SysFsDir,
+    SysNetDir,
+    SysNetIpv4Dir,
+    SysNetIpv4ConfDir,
+    SysNetIpv4ConfLoDir,
+    SysNetIpv4ConfDefaultDir,
     PidMax,
     PipeMaxSize,
     PipeUserPagesSoft,
     LeaseBreakTime,
+    NetIpv4ConfLoTag,
+    NetIpv4ConfDefaultTag,
     Domainname,
     Tainted,
     PidDir(usize),
@@ -205,6 +221,13 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         DOMAINNAME_INO => Some(ProcNode::Domainname),
         TAINTED_INO => Some(ProcNode::Tainted),
         LEASE_BREAK_TIME_INO => Some(ProcNode::LeaseBreakTime),
+        SYS_NET_DIR_INO => Some(ProcNode::SysNetDir),
+        SYS_NET_IPV4_DIR_INO => Some(ProcNode::SysNetIpv4Dir),
+        SYS_NET_IPV4_CONF_DIR_INO => Some(ProcNode::SysNetIpv4ConfDir),
+        SYS_NET_IPV4_CONF_LO_DIR_INO => Some(ProcNode::SysNetIpv4ConfLoDir),
+        SYS_NET_IPV4_CONF_DEFAULT_DIR_INO => Some(ProcNode::SysNetIpv4ConfDefaultDir),
+        SYS_NET_IPV4_CONF_LO_TAG_INO => Some(ProcNode::NetIpv4ConfLoTag),
+        SYS_NET_IPV4_CONF_DEFAULT_TAG_INO => Some(ProcNode::NetIpv4ConfDefaultTag),
         ino if ino >= PID_FD_ENTRY_BASE => {
             let rel = ino - PID_FD_ENTRY_BASE;
             let pid = (rel / PID_FD_ENTRY_STRIDE) as usize;
@@ -250,6 +273,11 @@ fn node_kind(node: ProcNode) -> FsNodeKind {
         | ProcNode::SysDir
         | ProcNode::SysKernelDir
         | ProcNode::SysFsDir
+        | ProcNode::SysNetDir
+        | ProcNode::SysNetIpv4Dir
+        | ProcNode::SysNetIpv4ConfDir
+        | ProcNode::SysNetIpv4ConfLoDir
+        | ProcNode::SysNetIpv4ConfDefaultDir
         | ProcNode::PidDir(_)
         | ProcNode::PidFdDir(_)
         | ProcNode::PidNsDir(_)
@@ -328,6 +356,96 @@ fn sys_entries() -> Vec<RawDirEntry> {
         ino: SYS_FS_DIR_INO,
         name: "fs".into(),
         dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_NET_DIR_INO,
+        name: "net".into(),
+        dtype: DT_DIR,
+    });
+    entries
+}
+
+fn sys_net_entries() -> Vec<RawDirEntry> {
+    let mut entries = Vec::new();
+    entries.push(RawDirEntry {
+        ino: SYS_NET_DIR_INO,
+        name: ".".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_DIR_INO,
+        name: "..".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_NET_IPV4_DIR_INO,
+        name: "ipv4".into(),
+        dtype: DT_DIR,
+    });
+    entries
+}
+
+fn sys_net_ipv4_entries() -> Vec<RawDirEntry> {
+    let mut entries = Vec::new();
+    entries.push(RawDirEntry {
+        ino: SYS_NET_IPV4_DIR_INO,
+        name: ".".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_NET_DIR_INO,
+        name: "..".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_NET_IPV4_CONF_DIR_INO,
+        name: "conf".into(),
+        dtype: DT_DIR,
+    });
+    entries
+}
+
+fn sys_net_ipv4_conf_entries() -> Vec<RawDirEntry> {
+    let mut entries = Vec::new();
+    entries.push(RawDirEntry {
+        ino: SYS_NET_IPV4_CONF_DIR_INO,
+        name: ".".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_NET_IPV4_DIR_INO,
+        name: "..".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_NET_IPV4_CONF_LO_DIR_INO,
+        name: "lo".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_NET_IPV4_CONF_DEFAULT_DIR_INO,
+        name: "default".into(),
+        dtype: DT_DIR,
+    });
+    entries
+}
+
+fn sys_net_ipv4_conf_iface_entries(ino: u32, tag_ino: u32) -> Vec<RawDirEntry> {
+    let mut entries = Vec::new();
+    entries.push(RawDirEntry {
+        ino,
+        name: ".".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_NET_IPV4_CONF_DIR_INO,
+        name: "..".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: tag_ino,
+        name: "tag".into(),
+        dtype: DT_REG,
     });
     entries
 }
@@ -626,6 +744,25 @@ fn lease_break_time_content() -> String {
     format!("{}\n", PROC_LEASE_BREAK_TIME.load(Ordering::Relaxed))
 }
 
+fn current_task_uses_synthetic_newnet() -> bool {
+    crate::task::current_task()
+        .map(|task| task.inner_exclusive_access().synthetic_newnet)
+        .unwrap_or(false)
+}
+
+fn net_ipv4_conf_lo_tag_content() -> String {
+    let value = if current_task_uses_synthetic_newnet() {
+        DEFAULT_NET_IPV4_CONF_TAG
+    } else {
+        PROC_NET_IPV4_CONF_LO_TAG.load(Ordering::Relaxed)
+    };
+    format!("{value}\n")
+}
+
+fn net_ipv4_conf_default_tag_content() -> String {
+    format!("{DEFAULT_NET_IPV4_CONF_TAG}\n")
+}
+
 fn domainname_content() -> Vec<u8> {
     let mut output = PROC_DOMAINNAME.exclusive_access().clone();
     output.push(b'\n');
@@ -684,6 +821,23 @@ fn write_lease_break_time(buf: &[u8], offset: u64) -> usize {
     // LTP saves/restores this sysctl around lease tests. Store the value so
     // those file operations behave like a writable Linux procfs knob.
     PROC_LEASE_BREAK_TIME.store(value, Ordering::Relaxed);
+    buf.len()
+}
+
+fn write_net_ipv4_conf_lo_tag(buf: &[u8], offset: u64) -> usize {
+    if offset != 0 {
+        return 0;
+    }
+    let Ok(text) = core::str::from_utf8(buf) else {
+        return 0;
+    };
+    let Ok(value) = text.trim().parse::<isize>() else {
+        return 0;
+    };
+    // UNFINISHED: Linux stores this under the network namespace. This minimal
+    // sysctl state is global except for CLONE_NEWNET compatibility helpers,
+    // which read the default value through net_ipv4_conf_lo_tag_content().
+    PROC_NET_IPV4_CONF_LO_TAG.store(value, Ordering::Relaxed);
     buf.len()
 }
 
@@ -813,6 +967,8 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::PipeMaxSize => Ok(pipe_max_size_content().into_bytes()),
         ProcNode::PipeUserPagesSoft => Ok(pipe_user_pages_soft_content().into_bytes()),
         ProcNode::LeaseBreakTime => Ok(lease_break_time_content().into_bytes()),
+        ProcNode::NetIpv4ConfLoTag => Ok(net_ipv4_conf_lo_tag_content().into_bytes()),
+        ProcNode::NetIpv4ConfDefaultTag => Ok(net_ipv4_conf_default_tag_content().into_bytes()),
         ProcNode::Domainname => Ok(domainname_content()),
         ProcNode::Tainted => Ok(b"0\n".to_vec()),
         ProcNode::PidStat(pid) => lookup_process(pid)
@@ -841,6 +997,11 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         | ProcNode::SysDir
         | ProcNode::SysKernelDir
         | ProcNode::SysFsDir
+        | ProcNode::SysNetDir
+        | ProcNode::SysNetIpv4Dir
+        | ProcNode::SysNetIpv4ConfDir
+        | ProcNode::SysNetIpv4ConfLoDir
+        | ProcNode::SysNetIpv4ConfDefaultDir
         | ProcNode::PidDir(_)
         | ProcNode::PidFdDir(_)
         | ProcNode::PidNsDir(_)
@@ -898,6 +1059,38 @@ impl FileSystemBackend for ProcFs {
                 ".." => Ok((ROOT_INO, FsNodeKind::Directory)),
                 "kernel" => Ok((SYS_KERNEL_DIR_INO, FsNodeKind::Directory)),
                 "fs" => Ok((SYS_FS_DIR_INO, FsNodeKind::Directory)),
+                "net" => Ok((SYS_NET_DIR_INO, FsNodeKind::Directory)),
+                _ => Err(FsError::NotFound),
+            },
+            ProcNode::SysNetDir => match component {
+                "." => Ok((SYS_NET_DIR_INO, FsNodeKind::Directory)),
+                ".." => Ok((SYS_DIR_INO, FsNodeKind::Directory)),
+                "ipv4" => Ok((SYS_NET_IPV4_DIR_INO, FsNodeKind::Directory)),
+                _ => Err(FsError::NotFound),
+            },
+            ProcNode::SysNetIpv4Dir => match component {
+                "." => Ok((SYS_NET_IPV4_DIR_INO, FsNodeKind::Directory)),
+                ".." => Ok((SYS_NET_DIR_INO, FsNodeKind::Directory)),
+                "conf" => Ok((SYS_NET_IPV4_CONF_DIR_INO, FsNodeKind::Directory)),
+                _ => Err(FsError::NotFound),
+            },
+            ProcNode::SysNetIpv4ConfDir => match component {
+                "." => Ok((SYS_NET_IPV4_CONF_DIR_INO, FsNodeKind::Directory)),
+                ".." => Ok((SYS_NET_IPV4_DIR_INO, FsNodeKind::Directory)),
+                "lo" => Ok((SYS_NET_IPV4_CONF_LO_DIR_INO, FsNodeKind::Directory)),
+                "default" => Ok((SYS_NET_IPV4_CONF_DEFAULT_DIR_INO, FsNodeKind::Directory)),
+                _ => Err(FsError::NotFound),
+            },
+            ProcNode::SysNetIpv4ConfLoDir => match component {
+                "." => Ok((SYS_NET_IPV4_CONF_LO_DIR_INO, FsNodeKind::Directory)),
+                ".." => Ok((SYS_NET_IPV4_CONF_DIR_INO, FsNodeKind::Directory)),
+                "tag" => Ok((SYS_NET_IPV4_CONF_LO_TAG_INO, FsNodeKind::RegularFile)),
+                _ => Err(FsError::NotFound),
+            },
+            ProcNode::SysNetIpv4ConfDefaultDir => match component {
+                "." => Ok((SYS_NET_IPV4_CONF_DEFAULT_DIR_INO, FsNodeKind::Directory)),
+                ".." => Ok((SYS_NET_IPV4_CONF_DIR_INO, FsNodeKind::Directory)),
+                "tag" => Ok((SYS_NET_IPV4_CONF_DEFAULT_TAG_INO, FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::SysKernelDir => match component {
@@ -1028,7 +1221,10 @@ impl FileSystemBackend for ProcFs {
 
     fn set_len(&mut self, _ino: u32, _len: u64) -> FsResult {
         match decode_node(_ino).ok_or(FsError::NotFound)? {
-            ProcNode::PidMax | ProcNode::PipeMaxSize | ProcNode::LeaseBreakTime => Ok(()),
+            ProcNode::PidMax
+            | ProcNode::PipeMaxSize
+            | ProcNode::LeaseBreakTime
+            | ProcNode::NetIpv4ConfLoTag => Ok(()),
             ProcNode::Domainname => set_domainname_len(_len),
             _ => Err(FsError::ReadOnly),
         }
@@ -1051,6 +1247,11 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::SysDir
             | ProcNode::SysKernelDir
             | ProcNode::SysFsDir
+            | ProcNode::SysNetDir
+            | ProcNode::SysNetIpv4Dir
+            | ProcNode::SysNetIpv4ConfDir
+            | ProcNode::SysNetIpv4ConfLoDir
+            | ProcNode::SysNetIpv4ConfDefaultDir
             | ProcNode::PidDir(_)
             | ProcNode::PidFdDir(_)
             | ProcNode::PidNsDir(_)
@@ -1060,6 +1261,7 @@ impl FileSystemBackend for ProcFs {
             ProcNode::PidMax
             | ProcNode::PipeMaxSize
             | ProcNode::LeaseBreakTime
+            | ProcNode::NetIpv4ConfLoTag
             | ProcNode::Domainname => FileStat::with_mode(S_IFREG | 0o644),
             _ => FileStat::with_mode(S_IFREG | 0o444),
         };
@@ -1114,6 +1316,7 @@ impl FileSystemBackend for ProcFs {
             Some(ProcNode::PidMax) => write_pid_max(buf, offset),
             Some(ProcNode::PipeMaxSize) => write_pipe_max_size(buf, offset),
             Some(ProcNode::LeaseBreakTime) => write_lease_break_time(buf, offset),
+            Some(ProcNode::NetIpv4ConfLoTag) => write_net_ipv4_conf_lo_tag(buf, offset),
             Some(ProcNode::Domainname) => write_domainname(buf, offset),
             _ => 0,
         }
@@ -1125,6 +1328,27 @@ impl FileSystemBackend for ProcFs {
             ProcNode::SysDir => write_dir_entries(&sys_entries(), offset, buf),
             ProcNode::SysKernelDir => write_dir_entries(&sys_kernel_entries(), offset, buf),
             ProcNode::SysFsDir => write_dir_entries(&sys_fs_entries(), offset, buf),
+            ProcNode::SysNetDir => write_dir_entries(&sys_net_entries(), offset, buf),
+            ProcNode::SysNetIpv4Dir => write_dir_entries(&sys_net_ipv4_entries(), offset, buf),
+            ProcNode::SysNetIpv4ConfDir => {
+                write_dir_entries(&sys_net_ipv4_conf_entries(), offset, buf)
+            }
+            ProcNode::SysNetIpv4ConfLoDir => write_dir_entries(
+                &sys_net_ipv4_conf_iface_entries(
+                    SYS_NET_IPV4_CONF_LO_DIR_INO,
+                    SYS_NET_IPV4_CONF_LO_TAG_INO,
+                ),
+                offset,
+                buf,
+            ),
+            ProcNode::SysNetIpv4ConfDefaultDir => write_dir_entries(
+                &sys_net_ipv4_conf_iface_entries(
+                    SYS_NET_IPV4_CONF_DEFAULT_DIR_INO,
+                    SYS_NET_IPV4_CONF_DEFAULT_TAG_INO,
+                ),
+                offset,
+                buf,
+            ),
             ProcNode::PidDir(pid) => write_dir_entries(&pid_entries(pid), offset, buf),
             ProcNode::PidFdDir(pid) => write_dir_entries(&pid_fd_entries(pid)?, offset, buf),
             ProcNode::PidNsDir(pid) => write_dir_entries(&pid_ns_entries(pid), offset, buf),
