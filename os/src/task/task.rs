@@ -67,6 +67,7 @@ pub struct TaskControlBlockInner {
     pub sched_reset_on_fork: bool,
     pub clone_vm_process_helper: bool,
     pub synthetic_newnet: bool,
+    pub(crate) thread_keyring: Option<i32>,
 }
 
 impl TaskControlBlockInner {
@@ -125,6 +126,7 @@ impl TaskControlBlock {
                     sched_reset_on_fork: false,
                     clone_vm_process_helper: false,
                     synthetic_newnet: false,
+                    thread_keyring: None,
                 })
             },
         }

@@ -38,6 +38,7 @@ pub enum SysError {
     ENOTEMPTY = 39,
     ELOOP = 40,
     EOVERFLOW = 75,
+    EBADMSG = 74,
     EDESTADDRREQ = 89,
     ENOPROTOOPT = 92,
     ENOTSUP = 95,
@@ -50,6 +51,8 @@ pub enum SysError {
     ENOTCONN = 107,
     ECONNREFUSED = 111,
     ETIMEDOUT = 110,
+    EDQUOT = 122,
+    ENOKEY = 126,
 }
 
 pub type SysResult<T = isize> = Result<T, SysError>;

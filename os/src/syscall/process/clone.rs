@@ -240,11 +240,11 @@ fn is_vm_newnet_process_clone(args: CloneArgs) -> bool {
 fn sys_clone_vm_vfork(args: CloneArgs) -> SysResult {
     // UNFINISHED: Linux CLONE_VM without CLONE_THREAD creates a distinct
     // process that shares the mm_struct, and CLONE_VFORK releases the parent
-    // on either execve(2) or _exit(2). This contest compatibility path covers
-    // CLONE_VM|CLONE_VFORK children that exit without exec by running them as a
-    // same-process helper task, so memory writes are visible before the parent
-    // clone call returns.
-    sys_clone_vm_helper(args, false)
+    // on either execve(2) or _exit(2). This contest compatibility path uses a
+    // normal copied-address-space process clone because LTP command helpers use
+    // vfork()+execve(), and this kernel cannot exec a same-process helper task
+    // without replacing the parent's PCB.
+    sys_clone_process(args)
 }
 
 fn sys_clone_vm_newnet(args: CloneArgs) -> SysResult {

@@ -100,6 +100,8 @@ impl ProcessControlBlock {
                     umask: 0,
                     credentials: Credentials::root(),
                     resource_limits: ProcessResourceLimits::new(),
+                    process_keyring: None,
+                    session_keyring: None,
                     membarrier_private_expedited_registered: false,
                     signal_actions: [SignalAction::default(); super::SIGNAL_INFO_SLOTS],
                     cpu_times: ProcessCpuTimes::default(),
@@ -168,6 +170,7 @@ impl ProcessControlBlock {
         let umask = parent.umask;
         let credentials = parent.credentials.clone();
         let resource_limits = parent.resource_limits;
+        let session_keyring = parent.session_keyring;
         let membarrier_private_expedited_registered =
             parent.membarrier_private_expedited_registered;
         let root = parent.root;
@@ -211,6 +214,8 @@ impl ProcessControlBlock {
                     umask,
                     credentials,
                     resource_limits,
+                    process_keyring: None,
+                    session_keyring,
                     membarrier_private_expedited_registered,
                     signal_actions,
                     cpu_times: ProcessCpuTimes::default(),

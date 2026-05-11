@@ -411,6 +411,8 @@ pub struct ProcessControlBlockInner {
     // all threads in the process.
     pub credentials: Credentials,
     pub resource_limits: ProcessResourceLimits,
+    pub(crate) process_keyring: Option<i32>,
+    pub(crate) session_keyring: Option<i32>,
     pub membarrier_private_expedited_registered: bool,
     pub signal_actions: [SignalAction; SIGNAL_INFO_SLOTS],
     pub cpu_times: ProcessCpuTimes,

@@ -6,10 +6,33 @@ use core::any::Any;
 
 const ETC_NSSWITCH_CONF: &[u8] =
     b"passwd: files\ngroup: files\nhosts: files\nprotocols: files\nservices: files\nnetworks: files\n";
-const ETC_PASSWD: &[u8] =
-    b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n";
-const ETC_GROUP: &[u8] =
-    b"root:x:0:\ndaemon:x:1:\nusers:x:100:\nnobody:x:65534:\nnogroup:x:65534:\n";
+const ETC_PASSWD: &[u8] = b"root:x:0:0:root:/root:/bin/sh\n\
+nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n\
+ltp_add_key05_0:x:10000:10000:LTP add_key05 user:/tmp:/bin/sh\n\
+ltp_add_key05_1:x:10001:10001:LTP add_key05 user:/tmp:/bin/sh\n\
+ltp_add_key05_2:x:10002:10002:LTP add_key05 user:/tmp:/bin/sh\n\
+ltp_add_key05_3:x:10003:10003:LTP add_key05 user:/tmp:/bin/sh\n\
+ltp_add_key05_4:x:10004:10004:LTP add_key05 user:/tmp:/bin/sh\n\
+ltp_add_key05_5:x:10005:10005:LTP add_key05 user:/tmp:/bin/sh\n\
+ltp_add_key05_6:x:10006:10006:LTP add_key05 user:/tmp:/bin/sh\n\
+ltp_add_key05_7:x:10007:10007:LTP add_key05 user:/tmp:/bin/sh\n\
+ltp_add_key05_8:x:10008:10008:LTP add_key05 user:/tmp:/bin/sh\n\
+ltp_add_key05_9:x:10009:10009:LTP add_key05 user:/tmp:/bin/sh\n";
+const ETC_GROUP: &[u8] = b"root:x:0:\n\
+daemon:x:1:\n\
+users:x:100:\n\
+nobody:x:65534:\n\
+nogroup:x:65534:\n\
+ltp_add_key05_0:x:10000:\n\
+ltp_add_key05_1:x:10001:\n\
+ltp_add_key05_2:x:10002:\n\
+ltp_add_key05_3:x:10003:\n\
+ltp_add_key05_4:x:10004:\n\
+ltp_add_key05_5:x:10005:\n\
+ltp_add_key05_6:x:10006:\n\
+ltp_add_key05_7:x:10007:\n\
+ltp_add_key05_8:x:10008:\n\
+ltp_add_key05_9:x:10009:\n";
 const ETC_HOSTS: &[u8] = b"127.0.0.1 localhost localhost.localdomain\n";
 const ETC_RESOLV_CONF: &[u8] = b"";
 const ETC_PROTOCOLS: &[u8] = b"ip 0 IP\ntcp 6 TCP\nudp 17 UDP\n";

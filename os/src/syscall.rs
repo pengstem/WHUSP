@@ -142,6 +142,9 @@ const SYSCALL_SENDMSG: usize = 211;
 const SYSCALL_RECVMSG: usize = 212;
 const SYSCALL_BRK: usize = 214;
 const SYSCALL_MUNMAP: usize = 215;
+const SYSCALL_ADD_KEY: usize = 217;
+const SYSCALL_REQUEST_KEY: usize = 218;
+const SYSCALL_KEYCTL: usize = 219;
 const SYSCALL_CLONE: usize = 220;
 const SYSCALL_EXECVE: usize = 221;
 const SYSCALL_MMAP: usize = 222;
@@ -182,6 +185,7 @@ const SYSCALL_EPOLL_PWAIT2: usize = 441;
 pub(crate) mod errno;
 mod fs;
 mod futex;
+pub(crate) mod keyring;
 mod memory;
 mod net;
 mod process;
@@ -195,6 +199,7 @@ use crate::task::RLimit;
 use errno::{SysError, ret};
 use fs::*;
 use futex::*;
+use keyring::*;
 use memory::*;
 use net::*;
 use process::*;
@@ -566,6 +571,20 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SHMDT => sys_shmdt(args[0]),
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
+        SYSCALL_ADD_KEY => sys_add_key(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+            args[4] as i32,
+        ),
+        SYSCALL_REQUEST_KEY => sys_request_key(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3] as i32,
+        ),
+        SYSCALL_KEYCTL => sys_keyctl(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_MLOCK => sys_mlock(args[0], args[1]),
         SYSCALL_MUNLOCK => sys_munlock(args[0], args[1]),
