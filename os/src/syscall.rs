@@ -169,6 +169,7 @@ const SYSCALL_MLOCK2: usize = 284;
 const SYSCALL_COPY_FILE_RANGE: usize = 285;
 const SYSCALL_PWRITEV2: usize = 287;
 const SYSCALL_STATX: usize = 291;
+const SYSCALL_PIDFD_SEND_SIGNAL: usize = 424;
 const SYSCALL_OPEN_TREE: usize = 428;
 const SYSCALL_MOVE_MOUNT: usize = 429;
 const SYSCALL_FSOPEN: usize = 430;
@@ -495,6 +496,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_KILL => sys_kill(args[0] as isize, args[1] as u32),
         SYSCALL_TKILL => sys_tkill(args[0] as isize, args[1] as u32),
         SYSCALL_TGKILL => sys_tgkill(args[0] as isize, args[1] as isize, args[2] as u32),
+        SYSCALL_PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(
+            args[0],
+            args[1] as u32,
+            args[2] as *const LinuxSigInfo,
+            args[3] as u32,
+        ),
         SYSCALL_SIGALTSTACK => sys_sigaltstack(args[0] as *const u8, args[1] as *mut u8),
         SYSCALL_RT_SIGSUSPEND => sys_rt_sigsuspend(args[0] as *const u8, args[1]),
         SYSCALL_RT_SIGACTION => sys_rt_sigaction(

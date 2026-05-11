@@ -3,6 +3,7 @@ mod exec;
 mod id;
 mod identity;
 mod namespace;
+mod pidfd;
 mod resource;
 mod sched;
 mod system;
@@ -20,6 +21,7 @@ pub use identity::{
     sys_setreuid, sys_setuid,
 };
 pub use namespace::sys_setns;
+pub use pidfd::sys_pidfd_send_signal;
 pub use resource::{sys_getrlimit, sys_prlimit64, sys_setrlimit};
 pub use sched::{
     sys_sched_get_priority_max, sys_sched_get_priority_min, sys_sched_getaffinity,

@@ -72,7 +72,29 @@ impl From<SignalInfo> for LinuxSigInfo {
             si_pid: info.pid,
             si_uid: info.uid,
             si_status: info.status,
+            si_value: info.value,
             ..Self::default()
+        }
+    }
+}
+
+impl LinuxSigInfo {
+    pub(crate) fn to_signal_info(self, fallback_signum: u32, fallback_pid: i32) -> SignalInfo {
+        SignalInfo {
+            signo: if self.si_signo == 0 {
+                fallback_signum as i32
+            } else {
+                self.si_signo
+            },
+            code: self.si_code,
+            pid: if self.si_pid == 0 {
+                fallback_pid
+            } else {
+                self.si_pid
+            },
+            uid: self.si_uid,
+            status: self.si_status,
+            value: self.si_value,
         }
     }
 }

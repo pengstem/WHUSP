@@ -7,6 +7,8 @@ use crate::task::{
 use alloc::sync::Arc;
 use core::mem::size_of;
 
+use super::pidfd::install_pidfd_for_current_process;
+
 const CLONE_ARGS_MIN_SIZE: usize = 64;
 const CLONE_PIDFD: u64 = 0x0000_1000;
 const CLONE_SIGHAND: u64 = 0x0000_0800;
@@ -74,12 +76,6 @@ pub fn sys_clone3(args: *const LinuxCloneArgs, size: usize) -> SysResult {
     let args = read_user_value(token, args)?;
     validate_clone3_args(args, token)?;
 
-    if args.flags & CLONE_PIDFD != 0 {
-        // UNFINISHED: pidfd descriptors and pidfd_send_signal are not modeled
-        // yet. Bad pidfd pointers are still reported as EFAULT for clone302.
-        return Err(SysError::EINVAL);
-    }
-
     let stack_top = if args.stack == 0 {
         0
     } else {
@@ -98,9 +94,19 @@ pub fn sys_clone3(args: *const LinuxCloneArgs, size: usize) -> SysResult {
     )
     .ok_or(SysError::EINVAL)?;
     if clone_args.is_thread() {
+        if args.flags & CLONE_PIDFD != 0 {
+            // UNFINISHED: Thread-directed pidfds are not modeled yet because
+            // this kernel's pidfd object records process IDs only.
+            return Err(SysError::EINVAL);
+        }
         sys_clone_thread(clone_args)
     } else {
-        sys_clone_process(clone_args)
+        let pidfd = if args.flags & CLONE_PIDFD != 0 {
+            Some(args.pidfd as *mut i32)
+        } else {
+            None
+        };
+        sys_clone_process_inner(clone_args, pidfd)
     }
 }
 
@@ -130,6 +136,10 @@ fn validate_clone3_args(args: LinuxCloneArgs, token: usize) -> SysResult<()> {
 }
 
 fn sys_clone_process(args: CloneArgs) -> SysResult {
+    sys_clone_process_inner(args, None)
+}
+
+fn sys_clone_process_inner(args: CloneArgs, pidfd: Option<*mut i32>) -> SysResult {
     let current_process = current_process();
     let child_parent = if args.flags.contains(CloneFlags::CLONE_PARENT) {
         current_process.parent_process().ok_or(SysError::EINVAL)?
@@ -146,6 +156,10 @@ fn sys_clone_process(args: CloneArgs) -> SysResult {
         .ok_or(SysError::ENOMEM)?;
     let new_pid = new_process.getpid();
     let child_token = new_process.configure_cloned_main_task(args);
+    if let Some(pidfd) = pidfd {
+        let fd = install_pidfd_for_current_process(new_pid)?;
+        write_user_value(current_user_token(), pidfd, &(fd as i32))?;
+    }
 
     if args.flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
         let parent_token = current_user_token();

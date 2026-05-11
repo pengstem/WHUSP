@@ -86,6 +86,7 @@ pub struct SignalInfo {
     pub pid: i32,
     pub uid: u32,
     pub status: i32,
+    pub value: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -131,6 +132,7 @@ impl SignalInfo {
             pid,
             uid: 0,
             status: 0,
+            value: 0,
         }
     }
 
@@ -141,6 +143,7 @@ impl SignalInfo {
             pid,
             uid: 0,
             status,
+            value: 0,
         }
     }
 
@@ -151,6 +154,7 @@ impl SignalInfo {
             pid,
             uid: 0,
             status: 0,
+            value: 0,
         }
     }
 }

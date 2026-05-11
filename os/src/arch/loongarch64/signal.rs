@@ -18,6 +18,7 @@ const SA_NODEFER: usize = 0x4000_0000;
 const SIGINT: usize = 2;
 const SIGUSR1: usize = 10;
 const SIGSEGV: usize = 11;
+const SIGUSR2: usize = 12;
 const SIGPIPE: usize = 13;
 const SIGALRM: usize = 14;
 const SIGTERM: usize = 15;
@@ -28,7 +29,7 @@ const RT_SIGRETURN_TRAMPOLINE: [u32; 2] = [0x0382_2c0b, 0x002b_0000];
 pub fn can_deliver_user_signal(_signum: usize) -> bool {
     matches!(
         _signum,
-        SIGINT | SIGUSR1 | SIGSEGV | SIGPIPE | SIGALRM | SIGTERM | SIGCANCEL
+        SIGINT | SIGUSR1 | SIGSEGV | SIGUSR2 | SIGPIPE | SIGALRM | SIGTERM | SIGCANCEL
     ) || _signum == SIGCHLD as usize
 }
 
