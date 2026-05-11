@@ -176,8 +176,10 @@ pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsag
             // CONTEXT: Linux keeps a zombie PID visible until the parent reaps it.
             // Remove the process from PID lookup only at the wait/reap boundary.
             remove_from_pid2process(found_pid);
-            let child = inner.children.remove(idx);
-            assert_eq!(Arc::strong_count(&child), 1);
+            // CONTEXT: Reaping completes when the child is removed from both
+            // PID lookup and the parent's child list. Other internal kernel
+            // references must not turn a successful wait into a panic.
+            drop(inner.children.remove(idx));
             return Ok(found_pid as isize);
         }
 
@@ -261,8 +263,9 @@ pub fn sys_waitid(
                 // CONTEXT: WNOWAIT observes the zombie without reaping it; only
                 // the actual reap removes the PID from process lookup.
                 remove_from_pid2process(child_pid);
-                let child = inner.children.remove(idx);
-                assert_eq!(Arc::strong_count(&child), 1);
+                // CONTEXT: See sys_wait4(); waitid reaping has the same
+                // user-visible boundary and must not assert on Arc ownership.
+                drop(inner.children.remove(idx));
             }
             return Ok(0);
         }
