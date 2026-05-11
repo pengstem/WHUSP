@@ -13,7 +13,8 @@ use super::super::user_ptr::{
 };
 use super::fanotify::fanotify_notify_close;
 use super::fd_lock::{
-    fcntl_getlk, fcntl_setlk, fcntl_setlkw, flock_operation, release_flock_locks_for_close,
+    fcntl_getlk, fcntl_ofd_getlk, fcntl_ofd_setlk, fcntl_ofd_setlkw, fcntl_setlk, fcntl_setlkw,
+    flock_operation, release_flock_locks_for_close, release_ofd_record_locks_for_close,
     release_record_locks_for_close,
 };
 
@@ -25,6 +26,11 @@ const F_SETFL: usize = 4;
 const F_GETLK: usize = 5;
 const F_SETLK: usize = 6;
 const F_SETLKW: usize = 7;
+const F_OFD_GETLK: usize = 36;
+const F_OFD_SETLK: usize = 37;
+const F_OFD_SETLKW: usize = 38;
+const F_SETLEASE: usize = 1024;
+const F_GETLEASE: usize = 1025;
 const F_DUPFD_CLOEXEC: usize = 1030;
 const F_SETPIPE_SZ: usize = 1031;
 const F_GETPIPE_SZ: usize = 1032;
@@ -66,6 +72,7 @@ pub fn sys_close(fd: usize) -> SysResult {
         entry
     };
     release_record_locks_for_close(&entry);
+    release_ofd_record_locks_for_close(&entry);
     release_flock_locks_for_close(&entry);
     let file = entry.file();
     fanotify_notify_close(&file, file.writable());
@@ -246,6 +253,23 @@ fn fcntl_add_seals(fd: usize, seals: u32) -> SysResult {
     Ok(0)
 }
 
+fn fcntl_set_lease(fd: usize, arg: usize) -> SysResult {
+    let entry = get_fd_entry_by_fd(fd)?;
+    match arg as i16 {
+        // CONTEXT: This is a minimal lease compatibility surface for LTP.
+        // Full Linux lease breaking, SIGIO notification, and open/truncate
+        // blocking are still not implemented.
+        0 if entry.file().writable() => Err(SysError::EAGAIN),
+        0 | 1 | 2 => Ok(0),
+        _ => Err(SysError::EINVAL),
+    }
+}
+
+fn fcntl_get_lease(fd: usize) -> SysResult {
+    get_fd_entry_by_fd(fd)?;
+    Ok(2)
+}
+
 fn read_memfd_name(name: *const u8) -> SysResult {
     match read_user_c_string(current_user_token(), name, MEMFD_NAME_MAX + 1) {
         Ok(_) => Ok(0),
@@ -305,6 +329,11 @@ pub fn sys_fcntl(fd: usize, op: usize, arg: usize) -> SysResult {
         F_GETLK => fcntl_getlk(get_fd_entry_by_fd(fd)?, arg as *mut _),
         F_SETLK => fcntl_setlk(get_fd_entry_by_fd(fd)?, arg as *const _),
         F_SETLKW => fcntl_setlkw(get_fd_entry_by_fd(fd)?, arg as *const _),
+        F_OFD_GETLK => fcntl_ofd_getlk(get_fd_entry_by_fd(fd)?, arg as *mut _),
+        F_OFD_SETLK => fcntl_ofd_setlk(get_fd_entry_by_fd(fd)?, arg as *const _),
+        F_OFD_SETLKW => fcntl_ofd_setlkw(get_fd_entry_by_fd(fd)?, arg as *const _),
+        F_SETLEASE => fcntl_set_lease(fd, arg),
+        F_GETLEASE => fcntl_get_lease(fd),
         F_GETPIPE_SZ => fcntl_get_pipe_size(fd),
         F_SETPIPE_SZ => fcntl_set_pipe_size(fd, arg),
         F_ADD_SEALS => fcntl_add_seals(fd, arg as u32),

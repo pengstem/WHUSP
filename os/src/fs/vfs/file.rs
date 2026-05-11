@@ -261,6 +261,17 @@ impl VfsFile {
             });
         }
     }
+
+    fn inode_flags_or_empty(&self) -> FsResult<u32> {
+        match self.inode_flags() {
+            Ok(flags) => Ok(flags),
+            // CONTEXT: procfs and other synthetic filesystems do not expose
+            // ext-style inode flags. Treat them as having no immutable/append
+            // bits so writable sysctl-style files can be updated normally.
+            Err(FsError::Unsupported) => Ok(0),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 fn parent_hint_for_open(context: &PathContext, name: &str) -> Option<VfsNodeId> {
@@ -807,7 +818,7 @@ impl File for VfsFile {
 
     fn check_write(&self, _len: usize, append: bool) -> FsResult {
         ensure_mount_writable(self.node.mount_id)?;
-        let flags = self.inode_flags()?;
+        let flags = self.inode_flags_or_empty()?;
         if flags & FS_IMMUTABLE_FL != 0 {
             return Err(FsError::PermissionDenied);
         }
@@ -819,7 +830,7 @@ impl File for VfsFile {
 
     fn check_write_at(&self, _offset: usize, _len: usize) -> FsResult {
         ensure_mount_writable(self.node.mount_id)?;
-        let flags = self.inode_flags()?;
+        let flags = self.inode_flags_or_empty()?;
         if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
             return Err(FsError::PermissionDenied);
         }
@@ -828,7 +839,7 @@ impl File for VfsFile {
 
     fn check_set_len(&self, _len: usize) -> FsResult {
         ensure_mount_writable(self.node.mount_id)?;
-        let flags = self.inode_flags()?;
+        let flags = self.inode_flags_or_empty()?;
         if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
             return Err(FsError::PermissionDenied);
         }

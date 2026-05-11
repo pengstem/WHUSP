@@ -30,6 +30,7 @@ const PIPE_MAX_SIZE_INO: u32 = 11;
 const PIPE_USER_PAGES_SOFT_INO: u32 = 12;
 const DOMAINNAME_INO: u32 = 13;
 const TAINTED_INO: u32 = 14;
+const LEASE_BREAK_TIME_INO: u32 = 15;
 const PID_DIR_BASE: u32 = 100;
 const PID_FILE_BASE: u32 = 10_000;
 const PID_FILE_STRIDE: u32 = 16;
@@ -53,10 +54,12 @@ const PID_TASK_MAX_PID: usize = 1 << (30 - PID_TASK_PID_SHIFT);
 const PID_TASK_MAX_LOCAL_TID: usize = 1 << PID_TASK_PID_SHIFT;
 const DEFAULT_PID_MAX: usize = 4_194_304;
 const DEFAULT_PIPE_USER_PAGES_SOFT: usize = 1;
+const DEFAULT_LEASE_BREAK_TIME: usize = 45;
 
 static PROC_PID_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_PID_MAX);
 static PROC_PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(PIPE_MAX_CAPACITY);
 static PROC_PIPE_USER_PAGES_SOFT: AtomicUsize = AtomicUsize::new(DEFAULT_PIPE_USER_PAGES_SOFT);
+static PROC_LEASE_BREAK_TIME: AtomicUsize = AtomicUsize::new(DEFAULT_LEASE_BREAK_TIME);
 
 lazy_static! {
     static ref PROC_DOMAINNAME: UPIntrFreeCell<Vec<u8>> = {
@@ -85,6 +88,7 @@ enum ProcNode {
     PidMax,
     PipeMaxSize,
     PipeUserPagesSoft,
+    LeaseBreakTime,
     Domainname,
     Tainted,
     PidDir(usize),
@@ -200,6 +204,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         PIPE_USER_PAGES_SOFT_INO => Some(ProcNode::PipeUserPagesSoft),
         DOMAINNAME_INO => Some(ProcNode::Domainname),
         TAINTED_INO => Some(ProcNode::Tainted),
+        LEASE_BREAK_TIME_INO => Some(ProcNode::LeaseBreakTime),
         ino if ino >= PID_FD_ENTRY_BASE => {
             let rel = ino - PID_FD_ENTRY_BASE;
             let pid = (rel / PID_FD_ENTRY_STRIDE) as usize;
@@ -347,6 +352,11 @@ fn sys_fs_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: PIPE_USER_PAGES_SOFT_INO,
         name: "pipe-user-pages-soft".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: LEASE_BREAK_TIME_INO,
+        name: "lease-break-time".into(),
         dtype: DT_REG,
     });
     entries
@@ -612,6 +622,10 @@ fn pipe_user_pages_soft_content() -> String {
     format!("{}\n", PROC_PIPE_USER_PAGES_SOFT.load(Ordering::Relaxed))
 }
 
+fn lease_break_time_content() -> String {
+    format!("{}\n", PROC_LEASE_BREAK_TIME.load(Ordering::Relaxed))
+}
+
 fn domainname_content() -> Vec<u8> {
     let mut output = PROC_DOMAINNAME.exclusive_access().clone();
     output.push(b'\n');
@@ -653,6 +667,23 @@ fn write_pipe_max_size(buf: &[u8], offset: u64) -> usize {
     // F_SETPIPE_SZ and new unprivileged pipe defaults stay internally
     // consistent.
     PROC_PIPE_MAX_SIZE.store(value.min(PIPE_MAX_CAPACITY), Ordering::Relaxed);
+    buf.len()
+}
+
+fn write_lease_break_time(buf: &[u8], offset: u64) -> usize {
+    if offset != 0 {
+        return 0;
+    }
+    let Ok(text) = core::str::from_utf8(buf) else {
+        return 0;
+    };
+    let Ok(value) = text.trim().parse::<usize>() else {
+        return 0;
+    };
+    // CONTEXT: The kernel does not yet implement timed lease breaking, but
+    // LTP saves/restores this sysctl around lease tests. Store the value so
+    // those file operations behave like a writable Linux procfs knob.
+    PROC_LEASE_BREAK_TIME.store(value, Ordering::Relaxed);
     buf.len()
 }
 
@@ -781,6 +812,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::PidMax => Ok(pid_max_content().into_bytes()),
         ProcNode::PipeMaxSize => Ok(pipe_max_size_content().into_bytes()),
         ProcNode::PipeUserPagesSoft => Ok(pipe_user_pages_soft_content().into_bytes()),
+        ProcNode::LeaseBreakTime => Ok(lease_break_time_content().into_bytes()),
         ProcNode::Domainname => Ok(domainname_content()),
         ProcNode::Tainted => Ok(b"0\n".to_vec()),
         ProcNode::PidStat(pid) => lookup_process(pid)
@@ -881,6 +913,7 @@ impl FileSystemBackend for ProcFs {
                 ".." => Ok((SYS_DIR_INO, FsNodeKind::Directory)),
                 "pipe-max-size" => Ok((PIPE_MAX_SIZE_INO, FsNodeKind::RegularFile)),
                 "pipe-user-pages-soft" => Ok((PIPE_USER_PAGES_SOFT_INO, FsNodeKind::RegularFile)),
+                "lease-break-time" => Ok((LEASE_BREAK_TIME_INO, FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::PidDir(pid) => match component {
@@ -995,7 +1028,7 @@ impl FileSystemBackend for ProcFs {
 
     fn set_len(&mut self, _ino: u32, _len: u64) -> FsResult {
         match decode_node(_ino).ok_or(FsError::NotFound)? {
-            ProcNode::PidMax | ProcNode::PipeMaxSize => Ok(()),
+            ProcNode::PidMax | ProcNode::PipeMaxSize | ProcNode::LeaseBreakTime => Ok(()),
             ProcNode::Domainname => set_domainname_len(_len),
             _ => Err(FsError::ReadOnly),
         }
@@ -1024,9 +1057,10 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::PidTaskDir(_)
             | ProcNode::PidTaskTidDir(_, _) => FileStat::with_mode(S_IFDIR | 0o555),
             ProcNode::PidFdEntry(_, _) => FileStat::with_mode(S_IFLNK | 0o777),
-            ProcNode::PidMax | ProcNode::PipeMaxSize | ProcNode::Domainname => {
-                FileStat::with_mode(S_IFREG | 0o644)
-            }
+            ProcNode::PidMax
+            | ProcNode::PipeMaxSize
+            | ProcNode::LeaseBreakTime
+            | ProcNode::Domainname => FileStat::with_mode(S_IFREG | 0o644),
             _ => FileStat::with_mode(S_IFREG | 0o444),
         };
         stat.dev = 0x70726f63;
@@ -1079,6 +1113,7 @@ impl FileSystemBackend for ProcFs {
         match decode_node(ino) {
             Some(ProcNode::PidMax) => write_pid_max(buf, offset),
             Some(ProcNode::PipeMaxSize) => write_pipe_max_size(buf, offset),
+            Some(ProcNode::LeaseBreakTime) => write_lease_break_time(buf, offset),
             Some(ProcNode::Domainname) => write_domainname(buf, offset),
             _ => 0,
         }
