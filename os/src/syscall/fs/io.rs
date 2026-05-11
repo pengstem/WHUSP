@@ -593,16 +593,20 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> SysRes
 }
 
 pub fn sys_pwrite64(fd: usize, buf: *const u8, len: usize, offset: usize) -> SysResult {
-    let offset = checked_position_offset(offset)?;
+    let mut offset = checked_position_offset(offset)?;
+    if len > 0 && buf.is_null() {
+        return Err(SysError::EFAULT);
+    }
     let token = current_user_token();
-    let file = get_file_by_fd(fd)?;
+    let entry = get_fd_entry_by_fd(fd)?;
+    let file = entry.file();
+    ensure_positioned_target(file.as_ref())?;
     if !file.writable() {
         return Err(SysError::EBADF);
     }
-    ensure_positioned_target(file.as_ref())?;
-    // UNFINISHED: Linux's pwrite path has the historical O_APPEND quirk.
-    // The contest iozone path opens regular files without O_APPEND, so this
-    // implementation writes at the explicit offset and leaves fd offset intact.
+    if entry.status_flags().contains(OpenFlags::APPEND) {
+        offset = file.stat()?.size as usize;
+    }
     let buffers = translated_byte_buffer_checked(token, buf, len, UserBufferAccess::Read)?;
     if let Err(err) = file.check_write_at(offset, len) {
         fault_in_read_buffers(&buffers);
@@ -704,16 +708,27 @@ pub fn sys_pwritev(
     let mut offset = checked_position_offset_pair(pos_l, pos_h)?;
     let token = current_user_token();
     let iovecs = read_user_iovecs(token, iov, iovcnt)?;
-    let file = get_file_by_fd(fd)?;
+    let entry = get_fd_entry_by_fd(fd)?;
+    let file = entry.file();
+    ensure_positioned_target(file.as_ref())?;
     if !file.writable() {
         return Err(SysError::EBADF);
     }
-    ensure_positioned_target(file.as_ref())?;
-    // UNFINISHED: See sys_pwrite64 for the Linux O_APPEND quirk.
+    if entry.status_flags().contains(OpenFlags::APPEND) {
+        offset = file.stat()?.size as usize;
+    }
     let mut total_written = 0usize;
     for iovec in iovecs {
         if iovec.len == 0 {
             continue;
+        }
+        if iovec.base == 0 {
+            return if total_written > 0 {
+                fanotify_notify_modify(&file, total_written);
+                Ok(total_written as isize)
+            } else {
+                Err(SysError::EFAULT)
+            };
         }
         let buffers = match translated_byte_buffer_checked_with_mmap_fault(
             token,
@@ -744,6 +759,23 @@ pub fn sys_pwritev(
     }
     fanotify_notify_modify(&file, total_written);
     Ok(total_written as isize)
+}
+
+pub fn sys_pwritev2(
+    fd: usize,
+    iov: *const LinuxIovec,
+    iovcnt: usize,
+    pos_l: usize,
+    pos_h: usize,
+    flags: usize,
+) -> SysResult {
+    if flags != 0 {
+        return Err(SysError::ENOTSUP);
+    }
+    if pos_l == usize::MAX {
+        return sys_writev(fd, iov, iovcnt);
+    }
+    sys_pwritev(fd, iov, iovcnt, pos_l, pos_h)
 }
 
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {

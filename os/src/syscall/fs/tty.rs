@@ -11,6 +11,7 @@ const LOOP_CLR_FD: usize = 0x4c01;
 const LOOP_SET_STATUS: usize = 0x4c02;
 const LOOP_GET_STATUS: usize = 0x4c03;
 const LOOP_CTL_GET_FREE: usize = 0x4c82;
+const BLKSSZGET: usize = 0x1268;
 const BLKGETSIZE64: usize = 0x8008_1272;
 const FS_IOC_GETFLAGS: usize = 0x8008_6601;
 const FS_IOC_SETFLAGS: usize = 0x4008_6602;
@@ -283,6 +284,16 @@ fn handle_loop_ioctl(loop_id: usize, request: usize, argp: usize) -> SysResult {
             let size = crate::fs::loop_device_size(loop_id)?;
             let token = current_user_token();
             write_user_value(token, argp as *mut u64, &size)?;
+            Ok(0)
+        }
+        BLKSSZGET => {
+            // CONTEXT: The lightweight loop device is backed by a regular
+            // scratch file for LTP filesystem tests. Report a conventional
+            // 512-byte logical sector size so O_DIRECT alignment tests can
+            // allocate buffers and offsets before exercising pwritev.
+            let sector_size = 512i32;
+            let token = current_user_token();
+            write_user_value(token, argp as *mut i32, &sector_size)?;
             Ok(0)
         }
         _ => Err(SysError::EINVAL),

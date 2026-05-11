@@ -160,6 +160,7 @@ const SYSCALL_EXECVEAT: usize = 281;
 const SYSCALL_MEMBARRIER: usize = 283;
 const SYSCALL_MLOCK2: usize = 284;
 const SYSCALL_COPY_FILE_RANGE: usize = 285;
+const SYSCALL_PWRITEV2: usize = 287;
 const SYSCALL_STATX: usize = 291;
 const SYSCALL_OPEN_TREE: usize = 428;
 const SYSCALL_MOVE_MOUNT: usize = 429;
@@ -324,6 +325,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2],
             args[3],
             args[4],
+        ),
+        SYSCALL_PWRITEV2 => sys_pwritev2(
+            args[0],
+            args[1] as *const LinuxIovec,
+            args[2],
+            args[3],
+            args[4],
+            args[5],
         ),
         SYSCALL_FADVISE64 => sys_fadvise64(args[0], args[1] as i64, args[2] as i64, args[3] as i32),
         SYSCALL_COPY_FILE_RANGE => sys_copy_file_range(

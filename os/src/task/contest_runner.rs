@@ -40,7 +40,7 @@ const TEST_SCRIPTS: &[&str] = &[
 /// runs cases whose names start with the prefix, and
 /// Some("range:<start>,<end>") runs cases in the lexicographic half-open range
 /// [start, end). Empty range bounds are unbounded.
-const LTP_CASE_FILTER_OPTION: Option<&str> = None;
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some("prefix:clone");
 
 enum LtpCaseFilter {
     Whitelist,
@@ -188,7 +188,9 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
     // LTP's shell helper, so disable LTP's per-case shell timer for this pass.
     command.push_str(" && { export LTPROOT=\"");
     command.push_str(libc_root);
-    command.push_str("/ltp\"; export TMPBASE=\"/tmp\"; export TST_TIMEOUT=\"-1\"; ");
+    command.push_str(
+        "/ltp\"; export TMPBASE=\"/tmp\"; export TST_TIMEOUT=\"-1\"; export LTP_SINGLE_FS_TYPE=\"ext2\"; ",
+    );
     command.push_str("export LD_LIBRARY_PATH=\"");
     if libc_root == "/musl" {
         command.push_str("/musl/lib:/glibc/lib:/lib\"; ");
@@ -197,7 +199,7 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
         command.push_str("/lib:/glibc/lib:/musl/lib:/lib\"; ");
     }
     command.push_str(
-        "export PATH=\"$PATH:$LTPROOT/testcases/bin:$LTPROOT/bin\"; ./busybox echo \"#### OS COMP TEST GROUP START ltp-",
+        "export PATH=\"$PATH:$LTPROOT/testcases/bin:$LTPROOT/bin:/musl/ltp/testcases/bin:/musl/ltp/bin:/glibc/ltp/testcases/bin:/glibc/ltp/bin\"; ./busybox echo \"#### OS COMP TEST GROUP START ltp-",
     );
     command.push_str(libc_label(libc_root));
     command.push_str(" ####\"; cd \"$LTPROOT/testcases/bin\"; for file in *; do [ -f \"$file\" ] || continue; case_name=${file##*/}; ");
