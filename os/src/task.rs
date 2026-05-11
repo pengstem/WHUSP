@@ -229,6 +229,17 @@ fn terminate_sibling_threads(
     }
 }
 
+pub(crate) fn terminate_sibling_threads_for_exec(
+    process: &Arc<ProcessControlBlock>,
+    current_tid: usize,
+    process_token: usize,
+    process_id: usize,
+) {
+    terminate_sibling_threads(process, current_tid, process_token, process_id, 0);
+    remove_ready_tasks_of_process(process_id);
+    futex::remove_process_futex_waiters(process_id);
+}
+
 pub(crate) fn queue_signal_to_task(
     task: Arc<TaskControlBlock>,
     signal: SignalFlags,

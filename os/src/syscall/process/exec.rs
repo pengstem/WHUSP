@@ -415,7 +415,7 @@ fn exec_loaded_program(
             .as_ref()
             .map(|data| xmas_elf::ElfFile::new(data.as_slice()).map_err(|_| SysError::ENOEXEC))
             .transpose()?;
-        current_process().exec(&elf, interpreter_elf.as_ref(), args, envs, executable_node);
+        current_process().exec(&elf, interpreter_elf.as_ref(), args, envs, executable_node)?;
         // CONTEXT: Linux execve starts a new image instead of returning to the
         // old program. For PT_INTERP ELFs, the kernel enters the dynamic linker
         // while auxv still describes the original executable.

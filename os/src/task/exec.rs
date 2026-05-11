@@ -1,7 +1,11 @@
-use super::{SigAltStack, SignalAction, process::ProcessControlBlock};
+use super::{
+    SigAltStack, SignalAction, current_task, process::ProcessControlBlock,
+    terminate_sibling_threads_for_exec,
+};
 use crate::config::PAGE_SIZE;
 use crate::fs::{VfsNodeId, track_regular_file_executable, untrack_regular_file_executable};
 use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet, translated_refmut};
+use crate::syscall::errno::{SysError, SysResult};
 use crate::trap::{TrapContext, trap_handler};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -149,7 +153,6 @@ pub(super) fn init_user_stack(
 }
 
 impl ProcessControlBlock {
-    /// Only support processes with a single thread.
     pub fn exec(
         self: &Arc<Self>,
         elf: &xmas_elf::ElfFile<'_>,
@@ -157,8 +160,21 @@ impl ProcessControlBlock {
         args: Vec<String>,
         envs: Vec<String>,
         executable_node: Option<VfsNodeId>,
-    ) {
-        assert_eq!(self.inner_exclusive_access().thread_count(), 1);
+    ) -> SysResult<()> {
+        let current = current_task().ok_or(SysError::ESRCH)?;
+        let current_tid = current.inner_exclusive_access().tid;
+        let thread_count = self.inner_exclusive_access().thread_count();
+        if thread_count > 1 {
+            if current_tid != 0 {
+                // UNFINISHED: Linux allows execve() from a non-leader thread
+                // by de-threading into the thread-group leader identity. This
+                // phase only supports leader-thread exec with sibling cleanup.
+                return Err(SysError::EINVAL);
+            }
+            let process_token = self.inner_exclusive_access().get_user_token();
+            terminate_sibling_threads_for_exec(self, current_tid, process_token, self.getpid());
+        }
+
         let ElfLoadInfo {
             memory_set,
             ustack_base,
@@ -235,5 +251,6 @@ impl ProcessControlBlock {
             trap_handler as usize,
         );
         *task_inner.get_trap_cx() = trap_cx;
+        Ok(())
     }
 }
