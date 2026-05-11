@@ -1,4 +1,9 @@
 pub(super) const LTP_CASE_WHITELIST: &[&str] = &[
+    "chown01",
+    "chown02",
+    "chown03",
+    "chown04",
+    "chown05",
     "faccessat01",
     "faccessat02",
     "faccessat201",
