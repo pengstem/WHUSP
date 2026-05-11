@@ -14,7 +14,9 @@ use super::uapi::{
 };
 
 const UID_GID_NO_CHANGE: u32 = u32::MAX;
+const MODE_SETUID: u32 = 0o4000;
 const MODE_SETGID: u32 = 0o2000;
+const MODE_GROUP_EXEC: u32 = 0o0010;
 const XATTR_NAME_MAX: usize = 255;
 const PIPEFS_MAGIC: i64 = 0x5049_5045;
 
@@ -147,7 +149,7 @@ fn prepare_mode_change(stat: FileStat, mode: u32) -> SysResult<u32> {
     Ok(mode)
 }
 
-fn ensure_can_change_owner(_stat: FileStat, uid: Option<u32>, gid: Option<u32>) -> SysResult<()> {
+fn ensure_can_change_owner(stat: FileStat, uid: Option<u32>, gid: Option<u32>) -> SysResult<()> {
     let credentials = current_process().credentials();
     if credentials.euid == 0 {
         return Ok(());
@@ -155,10 +157,67 @@ fn ensure_can_change_owner(_stat: FileStat, uid: Option<u32>, gid: Option<u32>) 
     if uid.is_none() && gid.is_none() {
         return Ok(());
     }
-    // UNFINISHED: Linux permits a limited non-root chown group-change case
-    // when the file is owned by the caller and the new group is effective or
-    // supplementary. This first pass keeps non-root ownership mutation denied.
+    if uid.is_none()
+        && stat.uid == credentials.fsuid
+        && let Some(group) = gid
+        && (group == credentials.egid
+            || group == credentials.fsgid
+            || credentials.groups.iter().any(|member| *member == group))
+    {
+        return Ok(());
+    }
     Err(SysError::EPERM)
+}
+
+fn mode_after_chown(stat: FileStat, uid: Option<u32>, gid: Option<u32>) -> Option<u32> {
+    if uid.is_none() && gid.is_none() {
+        return None;
+    }
+    let mut mode = stat.mode;
+    mode &= !MODE_SETUID;
+    if mode & MODE_GROUP_EXEC != 0 {
+        mode &= !MODE_SETGID;
+    }
+    (mode != stat.mode).then_some(mode)
+}
+
+fn prepare_owner_change(stat: FileStat, uid: Option<u32>, gid: Option<u32>) -> SysResult<()> {
+    if mount_is_read_only(MountId(stat.dev as usize)) {
+        return Err(SysError::EROFS);
+    }
+    ensure_can_change_owner(stat, uid, gid)
+}
+
+fn finish_file_owner_change(
+    file: &dyn crate::fs::File,
+    stat: FileStat,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> SysResult {
+    prepare_owner_change(stat, uid, gid)?;
+    file.set_owner(uid, gid)?;
+    if let Some(mode) = mode_after_chown(stat, uid, gid) {
+        file.set_mode(mode)?;
+    }
+    Ok(0)
+}
+
+fn finish_path_owner_change(
+    snapshot: &PathSnapshot,
+    dirfd: isize,
+    path: &str,
+    follow_final_symlink: bool,
+    stat: FileStat,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> SysResult {
+    prepare_owner_change(stat, uid, gid)?;
+    let context = path_context_from(snapshot, dirfd, path)?;
+    chown_in(context.clone(), path, follow_final_symlink, uid, gid)?;
+    if let Some(mode) = mode_after_chown(stat, uid, gid) {
+        chmod_in(context, path, follow_final_symlink, mode)?;
+    }
+    Ok(0)
 }
 
 pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> SysResult {
@@ -217,9 +276,8 @@ pub fn sys_fchown(fd: usize, owner: u32, group: u32) -> SysResult {
         return Err(SysError::EBADF);
     }
     let file = entry.file();
-    ensure_can_change_owner(file.stat()?, uid, gid)?;
-    file.set_owner(uid, gid)?;
-    Ok(0)
+    let stat = file.stat()?;
+    finish_file_owner_change(file.as_ref(), stat, uid, gid)
 }
 
 pub fn sys_fchownat(
@@ -249,15 +307,15 @@ pub fn sys_fchownat(
         }
         if dirfd == AT_FDCWD {
             let stat = stat_in(snapshot.context.clone(), ".", follow_final_symlink)?;
-            ensure_can_change_owner(stat, uid, gid)?;
-            chown_in(
-                snapshot.context.clone(),
+            return finish_path_owner_change(
+                &snapshot,
+                dirfd,
                 ".",
                 follow_final_symlink,
+                stat,
                 uid,
                 gid,
-            )?;
-            return Ok(0);
+            );
         }
         if dirfd < 0 {
             return Err(SysError::EBADF);
@@ -267,21 +325,21 @@ pub fn sys_fchownat(
             return Err(SysError::EBADF);
         }
         let file = entry.file();
-        ensure_can_change_owner(file.stat()?, uid, gid)?;
-        file.set_owner(uid, gid)?;
-        return Ok(0);
+        let stat = file.stat()?;
+        return finish_file_owner_change(file.as_ref(), stat, uid, gid);
     }
 
+    check_current_access_path_prefixes_from(&snapshot, dirfd, path.as_str())?;
     let stat = resolve_stat_from(&snapshot, dirfd, path.as_str(), follow_final_symlink)?;
-    ensure_can_change_owner(stat, uid, gid)?;
-    chown_in(
-        path_context_from(&snapshot, dirfd, path.as_str())?,
+    finish_path_owner_change(
+        &snapshot,
+        dirfd,
         path.as_str(),
         follow_final_symlink,
+        stat,
         uid,
         gid,
-    )?;
-    Ok(0)
+    )
 }
 
 pub fn sys_fgetxattr(fd: usize, name: *const u8, value: *mut u8, size: usize) -> SysResult {
