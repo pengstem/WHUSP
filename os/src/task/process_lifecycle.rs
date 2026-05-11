@@ -6,7 +6,8 @@ use super::process::{
     ProcessResourceLimits,
 };
 use super::{
-    CloneArgs, CloneFlags, FdTableEntry, SignalAction, TaskControlBlock, add_task, pid_alloc,
+    CloneArgs, CloneFlags, FdTableEntry, SIGCHLD, SignalAction, TaskControlBlock, add_task,
+    pid_alloc,
 };
 use crate::fs::{
     OpenFlags, ROOT_MOUNT_NAMESPACE, Stdin, Stdout, WorkingDir, track_regular_file_executable,
@@ -78,6 +79,7 @@ impl ProcessControlBlock {
                     mount_namespace_id: ROOT_MOUNT_NAMESPACE,
                     cmdline: args.clone(),
                     pgid: pid,
+                    exit_signal: SIGCHLD,
                     parent: None,
                     children: Vec::new(),
                     exit_code: 0,
@@ -155,6 +157,7 @@ impl ProcessControlBlock {
         self: &Arc<Self>,
         child_parent: Arc<Self>,
         mount_namespace_id: crate::fs::MountNamespaceId,
+        exit_signal: u32,
     ) -> Option<Arc<Self>> {
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
@@ -199,6 +202,7 @@ impl ProcessControlBlock {
                     mount_namespace_id,
                     cmdline,
                     pgid,
+                    exit_signal,
                     parent: Some(Arc::downgrade(&child_parent)),
                     children: Vec::new(),
                     exit_code: 0,

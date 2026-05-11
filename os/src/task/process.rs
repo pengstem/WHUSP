@@ -368,6 +368,7 @@ pub struct ProcessControlBlockInner {
     pub mount_namespace_id: MountNamespaceId,
     pub cmdline: Vec<String>,
     pub pgid: usize,
+    pub exit_signal: u32,
     pub parent: Option<Weak<ProcessControlBlock>>,
     pub children: Vec<Arc<ProcessControlBlock>>,
     pub exit_code: i32,

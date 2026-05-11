@@ -169,6 +169,7 @@ const SYSCALL_MOVE_MOUNT: usize = 429;
 const SYSCALL_FSOPEN: usize = 430;
 const SYSCALL_FSCONFIG: usize = 431;
 const SYSCALL_FSMOUNT: usize = 432;
+const SYSCALL_CLONE3: usize = 435;
 const SYSCALL_FACCESSAT2: usize = 439;
 const SYSCALL_EPOLL_PWAIT2: usize = 441;
 
@@ -548,6 +549,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MUNLOCKALL => sys_munlockall(),
         SYSCALL_MINCORE => sys_mincore(args[0], args[1], args[2] as *mut u8),
         SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_CLONE3 => sys_clone3(args[0] as *const LinuxCloneArgs, args[1]),
         SYSCALL_EXECVE => sys_execve(
             args[0] as *const u8,
             args[1] as *const usize,

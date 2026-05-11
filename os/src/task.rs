@@ -284,13 +284,14 @@ fn exit_current(exit_code: i32, group_exit: bool) {
         terminate_sibling_threads(&process, tid, process_token, process_id, exit_code);
         remove_ready_tasks_of_process(pid);
         futex::remove_process_futex_waiters(pid);
-        let (parent, children, fd_table, flushes, executable_node) = {
+        let (parent, children, fd_table, flushes, executable_node, exit_signal) = {
             let mut process_inner = process.inner_exclusive_access();
             // mark this process as a zombie process
             process_inner.is_zombie = true;
             // record exit code of main process
             process_inner.exit_code = exit_code;
             let parent = process_inner.parent.as_ref().and_then(|p| p.upgrade());
+            let exit_signal = process_inner.exit_signal;
             let children = core::mem::take(&mut process_inner.children);
             // deallocate other data in user space i.e. program code/data section
             let flushes = process_inner.memory_set.recycle_data_pages();
@@ -304,7 +305,14 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             while process_inner.tasks.len() > 1 {
                 process_inner.tasks.pop();
             }
-            (parent, children, fd_table, flushes, executable_node)
+            (
+                parent,
+                children,
+                fd_table,
+                flushes,
+                executable_node,
+                exit_signal,
+            )
         };
 
         for flush in flushes {
@@ -335,11 +343,15 @@ fn exit_current(exit_code: i32, group_exit: bool) {
                     .and_then(|task| task.as_ref().map(Arc::clone))
             };
             if let Some(parent_task) = parent_task {
-                queue_signal_to_task(
-                    Arc::clone(&parent_task),
-                    SignalFlags::SIGCHLD,
-                    SignalInfo::child_exit(SIGCHLD as i32, pid as i32, exit_code),
-                );
+                if let Some(signal) = SignalFlags::from_signum(exit_signal) {
+                    if !signal.is_empty() {
+                        queue_signal_to_task(
+                            Arc::clone(&parent_task),
+                            signal,
+                            SignalInfo::child_exit(exit_signal as i32, pid as i32, exit_code),
+                        );
+                    }
+                }
                 let is_blocked =
                     parent_task.inner_exclusive_access().task_status == TaskStatus::Blocked;
                 if is_blocked {

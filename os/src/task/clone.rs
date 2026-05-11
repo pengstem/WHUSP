@@ -1,4 +1,4 @@
-use super::{SIGCHLD, TaskControlBlock, current_task, pid_alloc};
+use super::{SIGNAL_INFO_SLOTS, TaskControlBlock, current_task, pid_alloc};
 use alloc::sync::Arc;
 use bitflags::bitflags;
 
@@ -30,6 +30,7 @@ bitflags! {
 #[derive(Copy, Clone)]
 pub struct CloneArgs {
     pub flags: CloneFlags,
+    pub exit_signal: u32,
     pub stack: usize,
     pub ptid: usize,
     pub tls: usize,
@@ -39,11 +40,24 @@ pub struct CloneArgs {
 impl CloneArgs {
     pub fn parse(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usize) -> Option<Self> {
         let exit_signal = (flags & 0xff) as u32;
-        if exit_signal != 0 && exit_signal != SIGCHLD {
+        let flags = CloneFlags::from_bits_truncate((flags & !0xff) as u32);
+        Self::from_parts(flags, exit_signal, stack, ptid, tls, ctid)
+    }
+
+    pub fn from_parts(
+        flags: CloneFlags,
+        exit_signal: u32,
+        stack: usize,
+        ptid: usize,
+        tls: usize,
+        ctid: usize,
+    ) -> Option<Self> {
+        if exit_signal as usize >= SIGNAL_INFO_SLOTS {
             return None;
         }
         Some(Self {
-            flags: CloneFlags::from_bits_truncate((flags & !0xff) as u32),
+            flags,
+            exit_signal,
             stack,
             ptid,
             tls,

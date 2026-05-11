@@ -1,7 +1,7 @@
 use crate::mm::translated_refmut;
 use crate::task::{
-    CLD_EXITED, SIGCHLD, SignalInfo, block_current_and_run_next, current_has_nonrestartable_signal,
-    current_process, remove_from_pid2process,
+    CLD_EXITED, ProcessControlBlock, SIGCHLD, SignalInfo, block_current_and_run_next,
+    current_has_nonrestartable_signal, current_process, remove_from_pid2process,
 };
 use alloc::sync::Arc;
 
@@ -12,6 +12,7 @@ const WUNTRACED: i32 = 2;
 const WEXITED: i32 = 4;
 const WCONTINUED: i32 = 8;
 const WNOWAIT: i32 = 0x01000000;
+const WALL: i32 = 0x40000000;
 
 const P_ALL: i32 = 0;
 const P_PID: i32 = 1;
@@ -92,8 +93,13 @@ fn waitid_code_and_status(exit_code: i32) -> (i32, i32) {
     }
 }
 
-fn wait4_child_matches(child_pid: usize, pid: isize) -> bool {
-    pid == -1 || (pid > 0 && child_pid == pid as usize)
+fn wait4_child_matches(child: &Arc<ProcessControlBlock>, pid: isize, caller_pgid: usize) -> bool {
+    match pid {
+        -1 => true,
+        0 => child.process_group_id() == caller_pgid,
+        pid if pid > 0 => child.getpid() == pid as usize,
+        pid => child.process_group_id() == pid.wrapping_neg() as usize,
+    }
 }
 
 fn waitid_child_matches(child_pid: usize, idtype: i32, id: i32) -> bool {
@@ -107,26 +113,27 @@ fn write_rusage(token: usize, rusage: *mut RUsage) {
 }
 
 pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsage) -> SysResult {
-    if options < 0 || options & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 {
+    if options < 0 || options & !(WNOHANG | WUNTRACED | WCONTINUED | WALL) != 0 {
         return Err(SysError::EINVAL);
     }
-    if pid == 0 || pid < -1 {
-        return Err(SysError::ECHILD);
+    if pid == isize::MIN {
+        return Err(SysError::EINVAL);
     }
 
     loop {
         let process = current_process();
+        let caller_pgid = process.process_group_id();
         let mut inner = process.inner_exclusive_access();
         if !inner
             .children
             .iter()
-            .any(|child| wait4_child_matches(child.getpid(), pid))
+            .any(|child| wait4_child_matches(child, pid, caller_pgid))
         {
             return Err(SysError::ECHILD);
         }
 
         let zombie = inner.children.iter().enumerate().find(|(_, child)| {
-            wait4_child_matches(child.getpid(), pid) && child.inner_exclusive_access().is_zombie
+            wait4_child_matches(child, pid, caller_pgid) && child.inner_exclusive_access().is_zombie
         });
         if let Some((idx, child)) = zombie {
             let (found_pid, exit_code, child_times) = {
