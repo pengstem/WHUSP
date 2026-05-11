@@ -38,6 +38,104 @@ impl Pipe {
             status_flags: StatusFlagsCell::new(OpenFlags::WRONLY),
         }
     }
+
+    pub(crate) fn read_with_status_flags(&self, mut buf: UserBuffer, _flags: OpenFlags) -> usize {
+        assert!(self.readable());
+        let want_to_read = buf.len();
+        if want_to_read == 0 {
+            return 0;
+        }
+        loop {
+            let mut ring_buffer = self.buffer.exclusive_access();
+            let loop_read = ring_buffer.available_read().min(want_to_read);
+            if loop_read == 0 {
+                if ring_buffer.all_write_ends_closed() {
+                    return 0;
+                }
+                if pipe_wait_interrupted() {
+                    return 0;
+                }
+                let task_cx_ptr = ring_buffer.sleep_reader();
+                drop(ring_buffer);
+                schedule(task_cx_ptr);
+                continue;
+            }
+            let mut copied = 0usize;
+            for buffer in buf.buffers.iter_mut() {
+                if copied == loop_read {
+                    break;
+                }
+                let len = buffer.len().min(loop_read - copied);
+                for byte in &mut buffer[..len] {
+                    *byte = ring_buffer.read_byte();
+                }
+                copied += len;
+            }
+            let writer = ring_buffer.wake_writer();
+            drop(ring_buffer);
+            wake_task(writer);
+            return copied;
+        }
+    }
+
+    pub(crate) fn write_with_status_flags(&self, buf: UserBuffer, flags: OpenFlags) -> usize {
+        assert!(self.writable());
+        let want_to_write = buf.len();
+        if want_to_write == 0 {
+            return 0;
+        }
+        let mut already_write = 0usize;
+        loop {
+            let mut ring_buffer = self.buffer.exclusive_access();
+            if ring_buffer.all_read_ends_closed() {
+                // CONTEXT: sys_write/sys_writev translate the initial
+                // no-reader case into SIGPIPE/EPIPE. If readers disappear
+                // after a partial write, Linux can report the partial count.
+                return already_write;
+            }
+            let loop_write = ring_buffer.available_write();
+            if loop_write == 0 {
+                if flags.contains(OpenFlags::NONBLOCK) {
+                    return already_write;
+                }
+                if pipe_wait_interrupted() {
+                    return already_write;
+                }
+                let task_cx_ptr = ring_buffer.sleep_writer();
+                drop(ring_buffer);
+                schedule(task_cx_ptr);
+                continue;
+            }
+            let write_len = loop_write.min(want_to_write - already_write);
+            let mut skipped = 0usize;
+            let mut written = 0usize;
+            for buffer in buf.buffers.iter() {
+                if skipped + buffer.len() <= already_write {
+                    skipped += buffer.len();
+                    continue;
+                }
+                let offset = already_write.saturating_sub(skipped);
+                for &byte in &buffer[offset..] {
+                    if written == write_len {
+                        break;
+                    }
+                    ring_buffer.write_byte(byte);
+                    written += 1;
+                }
+                if written == write_len {
+                    break;
+                }
+                skipped += buffer.len();
+            }
+            already_write += written;
+            let reader = ring_buffer.wake_reader();
+            drop(ring_buffer);
+            wake_task(reader);
+            if already_write == want_to_write {
+                return want_to_write;
+            }
+        }
+    }
 }
 
 pub(super) const PIPE_MIN_CAPACITY: usize = PAGE_SIZE;
@@ -247,101 +345,11 @@ impl File for Pipe {
     fn writable(&self) -> bool {
         self.writable
     }
-    fn read(&self, mut buf: UserBuffer) -> usize {
-        assert!(self.readable());
-        let want_to_read = buf.len();
-        if want_to_read == 0 {
-            return 0;
-        }
-        loop {
-            let mut ring_buffer = self.buffer.exclusive_access();
-            let loop_read = ring_buffer.available_read().min(want_to_read);
-            if loop_read == 0 {
-                if ring_buffer.all_write_ends_closed() {
-                    return 0;
-                }
-                if pipe_wait_interrupted() {
-                    return 0;
-                }
-                let task_cx_ptr = ring_buffer.sleep_reader();
-                drop(ring_buffer);
-                schedule(task_cx_ptr);
-                continue;
-            }
-            let mut copied = 0usize;
-            for buffer in buf.buffers.iter_mut() {
-                if copied == loop_read {
-                    break;
-                }
-                let len = buffer.len().min(loop_read - copied);
-                for byte in &mut buffer[..len] {
-                    *byte = ring_buffer.read_byte();
-                }
-                copied += len;
-            }
-            let writer = ring_buffer.wake_writer();
-            drop(ring_buffer);
-            wake_task(writer);
-            return copied;
-        }
+    fn read(&self, buf: UserBuffer) -> usize {
+        self.read_with_status_flags(buf, self.status_flags.get())
     }
     fn write(&self, buf: UserBuffer) -> usize {
-        assert!(self.writable());
-        let want_to_write = buf.len();
-        if want_to_write == 0 {
-            return 0;
-        }
-        let mut already_write = 0usize;
-        loop {
-            let mut ring_buffer = self.buffer.exclusive_access();
-            if ring_buffer.all_read_ends_closed() {
-                // CONTEXT: sys_write/sys_writev translate the initial
-                // no-reader case into SIGPIPE/EPIPE. If readers disappear
-                // after a partial write, Linux can report the partial count.
-                return already_write;
-            }
-            let loop_write = ring_buffer.available_write();
-            if loop_write == 0 {
-                if self.status_flags.get().contains(OpenFlags::NONBLOCK) {
-                    return already_write;
-                }
-                if pipe_wait_interrupted() {
-                    return already_write;
-                }
-                let task_cx_ptr = ring_buffer.sleep_writer();
-                drop(ring_buffer);
-                schedule(task_cx_ptr);
-                continue;
-            }
-            let write_len = loop_write.min(want_to_write - already_write);
-            let mut skipped = 0usize;
-            let mut written = 0usize;
-            for buffer in buf.buffers.iter() {
-                if skipped + buffer.len() <= already_write {
-                    skipped += buffer.len();
-                    continue;
-                }
-                let offset = already_write.saturating_sub(skipped);
-                for &byte in &buffer[offset..] {
-                    if written == write_len {
-                        break;
-                    }
-                    ring_buffer.write_byte(byte);
-                    written += 1;
-                }
-                if written == write_len {
-                    break;
-                }
-                skipped += buffer.len();
-            }
-            already_write += written;
-            let reader = ring_buffer.wake_reader();
-            drop(ring_buffer);
-            wake_task(reader);
-            if already_write == want_to_write {
-                return want_to_write;
-            }
-        }
+        self.write_with_status_flags(buf, self.status_flags.get())
     }
     fn stat(&self) -> FsResult<FileStat> {
         Ok(FileStat::with_mode(S_IFIFO | 0o600))

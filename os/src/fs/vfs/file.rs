@@ -3,6 +3,7 @@ use super::super::inode::{OpenFlags, link_node_in};
 use super::super::mount::{
     MountId, mount_is_read_only, mount_supports_page_cache, release_inode_from_drop, with_mount,
 };
+use super::super::named_fifo::open_named_fifo;
 use super::super::path::{PathContext, WorkingDir};
 use super::super::status_flags::StatusFlagsCell;
 use super::super::{FS_APPEND_FL, FS_IMMUTABLE_FL, File, FileStat, FileTimestamp, SeekWhence};
@@ -309,17 +310,6 @@ fn open_vfs_file_impl(
                 if flags.contains(OpenFlags::DIRECTORY) {
                     return Err(FsError::NotDir);
                 }
-                if path.kind == FsNodeKind::Fifo {
-                    let (readable, writable) = flags.read_write();
-                    if writable && !readable && flags.contains(OpenFlags::NONBLOCK) {
-                        return Err(FsError::NoDeviceOrAddress);
-                    }
-                    // UNFINISHED: Named FIFO endpoints are not backed by a
-                    // shared pipe object yet. This is enough for the Linux
-                    // no-reader nonblocking writer check in open06, but real
-                    // FIFO data transfer and blocking open pairing are still
-                    // incomplete.
-                }
                 if path.kind == FsNodeKind::Symlink {
                     if flags.contains(OpenFlags::NOFOLLOW) && !flags.contains(OpenFlags::PATH) {
                         return Err(FsError::Loop);
@@ -506,6 +496,23 @@ pub(crate) fn open_file_in_with_attrs(
         && let Some(file) = devfs::open(name, flags)?
     {
         return Ok(file);
+    }
+    let follow_final_symlink = !flags.contains(OpenFlags::NOFOLLOW);
+    let lookup_mode = if follow_final_symlink {
+        LookupMode::FollowFinal
+    } else {
+        LookupMode::NoFollowFinal
+    };
+    if let Ok(path) = vfs_path::resolve_existing_in(context.clone(), name, lookup_mode)
+        && path.kind == FsNodeKind::Fifo
+    {
+        if flags.contains(OpenFlags::CREATE | OpenFlags::EXCL) {
+            return Err(FsError::AlreadyExists);
+        }
+        if flags.contains(OpenFlags::DIRECTORY) {
+            return Err(FsError::NotDir);
+        }
+        return open_named_fifo(path.node, OpenFlags::file_status_flags(flags));
     }
     open_vfs_file_impl(context, name, flags, create_attrs)
         .map(|file| file as Arc<dyn File + Send + Sync>)

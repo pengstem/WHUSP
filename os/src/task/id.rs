@@ -133,7 +133,7 @@ pub struct TaskUserRes {
     pub process: Weak<ProcessControlBlock>,
 }
 
-const USER_STACK_INITIAL_SIZE: usize = PAGE_SIZE * 64;
+const USER_STACK_INITIAL_SIZE: usize = USER_STACK_SIZE;
 
 fn trap_cx_bottom_from_tid(tid: usize) -> usize {
     TRAP_CONTEXT_BASE - tid * PAGE_SIZE
@@ -171,9 +171,9 @@ impl TaskUserRes {
         let mut process_inner = process.inner_exclusive_access();
         // alloc user stack
         // UNFINISHED: Linux user stacks grow on demand up to the rlimit. This
-        // kernel does not have a general stack-growth fault path yet, so map a
-        // bounded initial window eagerly while preserving the full virtual stack
-        // spacing.
+        // kernel does not have a general stack-growth fault path yet, so map
+        // the bounded contest stack eagerly while preserving virtual stack
+        // spacing between threads.
         let ustack_bottom = ustack_mapped_bottom_from_tid(self.ustack_base, self.tid);
         let ustack_top = ustack_bottom_from_tid(self.ustack_base, self.tid) + USER_STACK_SIZE;
         process_inner.memory_set.insert_framed_area(

@@ -7,6 +7,7 @@ mod inode;
 mod memfd;
 mod mount;
 mod mount_fd;
+mod named_fifo;
 mod path;
 mod pipe;
 mod procfs;
