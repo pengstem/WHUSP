@@ -65,6 +65,7 @@ pub struct TaskControlBlockInner {
     pub sched_policy: i32,
     pub sched_priority: i32,
     pub sched_reset_on_fork: bool,
+    pub clone_vm_vfork_helper: bool,
 }
 
 impl TaskControlBlockInner {
@@ -121,6 +122,7 @@ impl TaskControlBlock {
                     sched_policy: 0,
                     sched_priority: 0,
                     sched_reset_on_fork: false,
+                    clone_vm_vfork_helper: false,
                 })
             },
         }

@@ -3,6 +3,7 @@ use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{read_user_value, write_user_value};
 use crate::task::{
     CloneArgs, CloneFlags, add_task, clone_current_thread, current_process, current_user_token,
+    suspend_current_and_run_next,
 };
 use alloc::sync::Arc;
 use core::mem::size_of;
@@ -58,6 +59,8 @@ pub fn sys_clone(
     };
     if args.is_thread() {
         sys_clone_thread(args)
+    } else if is_vm_vfork_process_clone(args) {
+        sys_clone_vm_vfork(args)
     } else {
         sys_clone_process(args)
     }
@@ -100,6 +103,8 @@ pub fn sys_clone3(args: *const LinuxCloneArgs, size: usize) -> SysResult {
             return Err(SysError::EINVAL);
         }
         sys_clone_thread(clone_args)
+    } else if is_vm_vfork_process_clone(clone_args) && args.flags & CLONE_PIDFD == 0 {
+        sys_clone_vm_vfork(clone_args)
     } else {
         let pidfd = if args.flags & CLONE_PIDFD != 0 {
             Some(args.pidfd as *mut i32)
@@ -175,6 +180,50 @@ fn sys_clone_process_inner(args: CloneArgs, pidfd: Option<*mut i32>) -> SysResul
         write_user_value(child_token, args.ctid as *mut i32, &(new_pid as i32))?;
     }
     Ok(new_pid as isize)
+}
+
+fn is_vm_vfork_process_clone(args: CloneArgs) -> bool {
+    args.flags
+        .contains(CloneFlags::CLONE_VM | CloneFlags::CLONE_VFORK)
+        && !args.is_thread()
+}
+
+fn sys_clone_vm_vfork(args: CloneArgs) -> SysResult {
+    // UNFINISHED: Linux CLONE_VM without CLONE_THREAD creates a distinct
+    // process that shares the mm_struct, and CLONE_VFORK releases the parent
+    // on either execve(2) or _exit(2). This contest compatibility path covers
+    // CLONE_VM|CLONE_VFORK children that exit without exec by running them as a
+    // same-process helper task, so memory writes are visible before the parent
+    // clone call returns.
+    let process = current_process();
+    let cloned = clone_current_thread(args);
+    let linux_tid = cloned.linux_tid;
+    cloned.task.inner_exclusive_access().clone_vm_vfork_helper = true;
+    let process_token = process.attach_task(Arc::clone(&cloned.task));
+
+    if args.flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
+        write_user_value(
+            process_token,
+            args.ptid as *mut i32,
+            &(cloned.linux_tid as i32),
+        )?;
+    }
+    if args.flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
+        write_user_value(
+            process_token,
+            args.ctid as *mut i32,
+            &(cloned.linux_tid as i32),
+        )?;
+    }
+    add_task(cloned.task);
+    while process
+        .tasks_snapshot()
+        .iter()
+        .any(|task| task.linux_tid() == linux_tid)
+    {
+        suspend_current_and_run_next();
+    }
+    Ok(linux_tid as isize)
 }
 
 fn sys_clone_thread(args: CloneArgs) -> SysResult {

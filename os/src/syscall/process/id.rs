@@ -12,6 +12,16 @@ pub fn sys_exit(exit_code: i32) -> ! {
 }
 
 pub fn sys_exit_group(exit_code: i32) -> ! {
+    if current_task()
+        .map(|task| task.inner_exclusive_access().clone_vm_vfork_helper)
+        .unwrap_or(false)
+    {
+        // CONTEXT: The CLONE_VM|CLONE_VFORK compatibility path runs the child
+        // as a same-process helper task. libc _exit() may issue exit_group(),
+        // but Linux would terminate only the distinct vfork child process, so
+        // keep the parent process alive and release the helper task instead.
+        exit_current_and_run_next(exit_code);
+    }
     exit_current_group_and_run_next(exit_code);
     panic!("Unreachable in sys_exit_group!");
 }
