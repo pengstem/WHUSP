@@ -96,6 +96,13 @@ pub struct RealTimerEvent {
     pub process: Weak<ProcessControlBlock>,
 }
 
+pub struct PosixTimerEvent {
+    pub expire_us: usize,
+    pub timer_id: usize,
+    pub generation: u64,
+    pub process: Weak<ProcessControlBlock>,
+}
+
 impl PartialEq for TimerCondVar {
     fn eq(&self, other: &Self) -> bool {
         self.expire_ms == other.expire_ms
@@ -139,11 +146,39 @@ impl Ord for RealTimerEvent {
     }
 }
 
+impl PartialEq for PosixTimerEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.expire_us == other.expire_us
+            && self.timer_id == other.timer_id
+            && self.generation == other.generation
+    }
+}
+
+impl Eq for PosixTimerEvent {}
+
+impl PartialOrd for PosixTimerEvent {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PosixTimerEvent {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .expire_us
+            .cmp(&self.expire_us)
+            .then_with(|| other.generation.cmp(&self.generation))
+            .then_with(|| other.timer_id.cmp(&self.timer_id))
+    }
+}
+
 lazy_static! {
     static ref TIMERS: UPIntrFreeCell<BinaryHeap<TimerCondVar>> =
         unsafe { UPIntrFreeCell::new(BinaryHeap::<TimerCondVar>::new()) };
     static ref REAL_TIMERS: UPIntrFreeCell<BinaryHeap<RealTimerEvent>> =
         unsafe { UPIntrFreeCell::new(BinaryHeap::<RealTimerEvent>::new()) };
+    static ref POSIX_TIMERS: UPIntrFreeCell<BinaryHeap<PosixTimerEvent>> =
+        unsafe { UPIntrFreeCell::new(BinaryHeap::<PosixTimerEvent>::new()) };
 }
 
 pub fn add_timer(expire_ms: usize, task: Arc<TaskControlBlock>) {
@@ -155,6 +190,21 @@ pub fn add_real_timer(expire_us: usize, generation: u64, process: Arc<ProcessCon
     let mut timers = REAL_TIMERS.exclusive_access();
     timers.push(RealTimerEvent {
         expire_us,
+        generation,
+        process: Arc::downgrade(&process),
+    });
+}
+
+pub fn add_posix_timer(
+    expire_us: usize,
+    timer_id: usize,
+    generation: u64,
+    process: Arc<ProcessControlBlock>,
+) {
+    let mut timers = POSIX_TIMERS.exclusive_access();
+    timers.push(PosixTimerEvent {
+        expire_us,
+        timer_id,
         generation,
         process: Arc::downgrade(&process),
     });
@@ -186,6 +236,36 @@ fn check_real_timers(current_us: usize) {
     }
 }
 
+fn check_posix_timers(current_us: usize) {
+    loop {
+        let event = {
+            let mut timers = POSIX_TIMERS.exclusive_access();
+            let Some(timer) = timers.peek() else {
+                return;
+            };
+            if timer.expire_us > current_us {
+                return;
+            }
+            timers.pop().unwrap()
+        };
+        let Some(process) = event.process.upgrade() else {
+            continue;
+        };
+        let Some((task, signal, next_timer)) =
+            process.expire_posix_timer(event.timer_id, event.generation, current_us)
+        else {
+            continue;
+        };
+        let signum = signal;
+        if let Some(signal) = SignalFlags::from_signum(signum) {
+            queue_signal_to_task(task, signal, SignalInfo::user(signum as i32, 0));
+        }
+        if let Some((next_expire_us, generation)) = next_timer {
+            add_posix_timer(next_expire_us, event.timer_id, generation, process);
+        }
+    }
+}
+
 pub fn check_timer() {
     let current_ms = get_time_ms();
     TIMERS.exclusive_session(|timers| {
@@ -198,5 +278,7 @@ pub fn check_timer() {
             }
         }
     });
-    check_real_timers(get_time_us());
+    let current_us = get_time_us();
+    check_real_timers(current_us);
+    check_posix_timers(current_us);
 }

@@ -62,6 +62,11 @@ const SYSCALL_GET_ROBUST_LIST: usize = 100;
 const SYSCALL_NANOSLEEP: usize = 101;
 const SYSCALL_GETITIMER: usize = 102;
 const SYSCALL_SETITIMER: usize = 103;
+const SYSCALL_TIMER_CREATE: usize = 107;
+const SYSCALL_TIMER_GETTIME: usize = 108;
+const SYSCALL_TIMER_GETOVERRUN: usize = 109;
+const SYSCALL_TIMER_SETTIME: usize = 110;
+const SYSCALL_TIMER_DELETE: usize = 111;
 const SYSCALL_CLOCK_SETTIME: usize = 112;
 const SYSCALL_CLOCK_GETTIME: usize = 113;
 const SYSCALL_CLOCK_GETRES: usize = 114;
@@ -451,6 +456,18 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SETITIMER => {
             sys_setitimer(args[0] as i32, args[1] as *const u8, args[2] as *mut u8)
         }
+        SYSCALL_TIMER_CREATE => {
+            sys_timer_create(args[0] as i32, args[1] as *const u8, args[2] as *mut i32)
+        }
+        SYSCALL_TIMER_GETTIME => sys_timer_gettime(args[0] as i32, args[1] as *mut _),
+        SYSCALL_TIMER_GETOVERRUN => sys_timer_getoverrun(args[0] as i32),
+        SYSCALL_TIMER_SETTIME => sys_timer_settime(
+            args[0] as i32,
+            args[1] as i32,
+            args[2] as *const _,
+            args[3] as *mut _,
+        ),
+        SYSCALL_TIMER_DELETE => sys_timer_delete(args[0] as i32),
         SYSCALL_CLOCK_SETTIME => sys_clock_settime(args[0] as i32, args[1] as *const LinuxTimeSpec),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as i32, args[1] as *mut LinuxTimeSpec),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0] as i32, args[1] as *mut LinuxTimeSpec),

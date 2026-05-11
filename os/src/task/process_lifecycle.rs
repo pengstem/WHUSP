@@ -106,6 +106,7 @@ impl ProcessControlBlock {
                     real_timer: Default::default(),
                     virtual_timer: Default::default(),
                     prof_timer: Default::default(),
+                    posix_timers: Vec::new(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                 })
@@ -216,6 +217,7 @@ impl ProcessControlBlock {
                     real_timer: Default::default(),
                     virtual_timer: Default::default(),
                     prof_timer: Default::default(),
+                    posix_timers: Vec::new(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                 })

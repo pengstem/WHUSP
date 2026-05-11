@@ -187,6 +187,7 @@ impl ProcessControlBlock {
             inner.memory_set = memory_set;
             let previous = core::mem::replace(&mut inner.executable_node, executable_node);
             inner.cmdline = args.clone();
+            inner.posix_timers.clear();
             for action in inner.signal_actions.iter_mut() {
                 if action.has_user_handler() {
                     *action = SignalAction::default();

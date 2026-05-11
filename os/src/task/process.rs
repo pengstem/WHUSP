@@ -350,6 +350,37 @@ impl ProcessRealTimer {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ProcessPosixTimer {
+    pub(crate) clock_id: i32,
+    pub(crate) signal: u32,
+    pub(crate) interval_us: usize,
+    pub(crate) next_expire_us: usize,
+    pub(crate) generation: u64,
+}
+
+impl ProcessPosixTimer {
+    pub(crate) fn new(clock_id: i32, signal: u32) -> Self {
+        Self {
+            clock_id,
+            signal,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn is_armed(&self) -> bool {
+        self.next_expire_us != 0
+    }
+
+    pub(crate) fn remaining_us(&self, now_us: usize) -> usize {
+        if self.is_armed() {
+            self.next_expire_us.saturating_sub(now_us)
+        } else {
+            0
+        }
+    }
+}
+
 pub struct ProcessControlBlock {
     // immutable
     pub pid: PidHandle,
@@ -386,6 +417,7 @@ pub struct ProcessControlBlockInner {
     pub(crate) real_timer: ProcessRealTimer,
     pub(crate) virtual_timer: ProcessRealTimer,
     pub(crate) prof_timer: ProcessRealTimer,
+    pub(crate) posix_timers: Vec<Option<ProcessPosixTimer>>,
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     pub task_res_allocator: RecycleAllocator,
 }
@@ -719,6 +751,90 @@ impl ProcessControlBlock {
             Some((next_expire_us, generation))
         };
         Some((task, next_timer))
+    }
+
+    pub(crate) fn create_posix_timer(&self, clock_id: i32, signal: u32) -> usize {
+        let mut inner = self.inner_exclusive_access();
+        if let Some((idx, slot)) = inner
+            .posix_timers
+            .iter_mut()
+            .enumerate()
+            .find(|(_, slot)| slot.is_none())
+        {
+            *slot = Some(ProcessPosixTimer::new(clock_id, signal));
+            idx
+        } else {
+            inner
+                .posix_timers
+                .push(Some(ProcessPosixTimer::new(clock_id, signal)));
+            inner.posix_timers.len() - 1
+        }
+    }
+
+    pub(crate) fn posix_timer_clock(&self, timer_id: usize) -> Option<i32> {
+        let inner = self.inner_exclusive_access();
+        Some(inner.posix_timers.get(timer_id)?.as_ref()?.clock_id)
+    }
+
+    pub(crate) fn set_posix_timer(
+        &self,
+        timer_id: usize,
+        interval_us: usize,
+        next_expire_us: usize,
+        now_us: usize,
+    ) -> Option<(usize, usize, u64)> {
+        let mut inner = self.inner_exclusive_access();
+        let timer = inner.posix_timers.get_mut(timer_id)?.as_mut()?;
+        let old_interval_us = timer.interval_us;
+        let old_remaining_us = timer.remaining_us(now_us);
+        timer.generation = timer.generation.wrapping_add(1);
+        timer.interval_us = interval_us;
+        timer.next_expire_us = next_expire_us;
+        Some((old_interval_us, old_remaining_us, timer.generation))
+    }
+
+    pub(crate) fn posix_timer_snapshot(
+        &self,
+        timer_id: usize,
+        now_us: usize,
+    ) -> Option<(usize, usize)> {
+        let inner = self.inner_exclusive_access();
+        let timer = inner.posix_timers.get(timer_id)?.as_ref()?;
+        Some((timer.interval_us, timer.remaining_us(now_us)))
+    }
+
+    pub(crate) fn delete_posix_timer(&self, timer_id: usize) -> Option<()> {
+        let mut inner = self.inner_exclusive_access();
+        let slot = inner.posix_timers.get_mut(timer_id)?;
+        slot.take()?;
+        Some(())
+    }
+
+    pub(crate) fn expire_posix_timer(
+        &self,
+        timer_id: usize,
+        generation: u64,
+        now_us: usize,
+    ) -> Option<(Arc<TaskControlBlock>, u32, Option<(usize, u64)>)> {
+        let mut inner = self.inner_exclusive_access();
+        let timer = inner.posix_timers.get_mut(timer_id)?.as_mut()?;
+        if timer.generation != generation || !timer.is_armed() || timer.next_expire_us > now_us {
+            return None;
+        }
+        let signal = timer.signal;
+        let next_timer = if timer.interval_us == 0 {
+            timer.next_expire_us = 0;
+            None
+        } else {
+            let next_expire_us = now_us.saturating_add(timer.interval_us);
+            timer.next_expire_us = next_expire_us;
+            Some((next_expire_us, timer.generation))
+        };
+        let task = inner
+            .tasks
+            .first()
+            .and_then(|task| task.as_ref().cloned())?;
+        Some((task, signal, next_timer))
     }
 
     pub(crate) fn tasks_snapshot(&self) -> Vec<Arc<TaskControlBlock>> {

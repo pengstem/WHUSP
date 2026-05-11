@@ -4,7 +4,7 @@ use crate::task::{
     current_process, current_task, current_user_token,
 };
 use crate::timer::{
-    add_real_timer, add_timer, get_time_clock_ticks, get_time_ms, get_time_us,
+    add_posix_timer, add_real_timer, add_timer, get_time_clock_ticks, get_time_ms, get_time_us,
     monotonic_time_nanos, set_wall_time_nanos, us_to_clock_ticks, wall_time_nanos,
 };
 use lazy_static::*;
@@ -30,6 +30,9 @@ const USEC_PER_SEC: usize = 1_000_000;
 const ITIMER_REAL: i32 = 0;
 const ITIMER_VIRTUAL: i32 = 1;
 const ITIMER_PROF: i32 = 2;
+const SIGEV_SIGNAL: i32 = 0;
+const SIGEV_NONE: i32 = 1;
+const SIGALRM: u32 = 14;
 const ADJ_OFFSET: u32 = 0x0001;
 const ADJ_FREQUENCY: u32 = 0x0002;
 const ADJ_MAXERROR: u32 = 0x0004;
@@ -101,6 +104,21 @@ pub struct LinuxTms {
 struct LinuxITimerVal {
     it_interval: LinuxTimeVal,
     it_value: LinuxTimeVal,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LinuxITimerSpec {
+    it_interval: LinuxTimeSpec,
+    it_value: LinuxTimeSpec,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxSigeventPrefix {
+    value: usize,
+    signo: i32,
+    notify: i32,
 }
 
 #[repr(C)]
@@ -376,10 +394,60 @@ fn us_to_timespec(us: usize) -> LinuxTimeSpec {
     }
 }
 
+fn itimerspec_from_us(interval_us: usize, value_us: usize) -> LinuxITimerSpec {
+    LinuxITimerSpec {
+        it_interval: us_to_timespec(interval_us),
+        it_value: us_to_timespec(value_us),
+    }
+}
+
 fn itimerval_from_us(interval_us: usize, value_us: usize) -> LinuxITimerVal {
     LinuxITimerVal {
         it_interval: us_to_timeval(interval_us),
         it_value: us_to_timeval(value_us),
+    }
+}
+
+fn decode_sigevent_signal(sevp: *const u8) -> SysResult<u32> {
+    if sevp.is_null() {
+        return Ok(SIGALRM);
+    }
+    let event = read_user_value(current_user_token(), sevp.cast::<LinuxSigeventPrefix>())?;
+    match event.notify {
+        SIGEV_SIGNAL => {
+            let signal = event.signo as u32;
+            if signal == 0 || signal as usize >= crate::task::SIGNAL_INFO_SLOTS {
+                return Err(SysError::EINVAL);
+            }
+            Ok(signal)
+        }
+        SIGEV_NONE => Ok(0),
+        _ => Err(SysError::EINVAL),
+    }
+}
+
+fn itimerspec_to_us(value: LinuxITimerSpec) -> SysResult<(usize, usize)> {
+    Ok((
+        nanos_to_us_ceil(timespec_to_nanos(value.it_interval)?)?,
+        nanos_to_us_ceil(timespec_to_nanos(value.it_value)?)?,
+    ))
+}
+
+fn posix_timer_deadline_us(clock_id: i32, flags: i32, value_us: usize) -> SysResult<usize> {
+    if value_us == 0 {
+        return Ok(0);
+    }
+    if flags & TIMER_ABSTIME as i32 != 0 {
+        let now_nanos = current_clock_nanos(ClockKind::from_raw(clock_id)?.gettime_backend()?);
+        let target_nanos = (value_us as u64)
+            .checked_mul(1_000)
+            .ok_or(SysError::EINVAL)?;
+        let remaining_us = nanos_to_us_ceil(target_nanos.saturating_sub(now_nanos))?;
+        get_time_us()
+            .checked_add(remaining_us)
+            .ok_or(SysError::EINVAL)
+    } else {
+        get_time_us().checked_add(value_us).ok_or(SysError::EINVAL)
     }
 }
 
@@ -463,6 +531,91 @@ pub fn sys_setitimer(which: i32, value: *const u8, old_value: *mut u8) -> SysRes
     if let Some((expire_us, generation)) = event {
         add_real_timer(expire_us, generation, process);
     }
+    Ok(0)
+}
+
+pub fn sys_timer_create(clock_id: i32, sevp: *const u8, timerid: *mut i32) -> SysResult {
+    if timerid.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    // UNFINISHED: POSIX CPU timers, alarm clocks, SIGEV_THREAD, and
+    // SIGEV_THREAD_ID are not modeled yet. This covers the signal timers used
+    // by LTP clock_settime03 and keeps unsupported clocks fail-loud.
+    match ClockKind::from_raw(clock_id)? {
+        ClockKind::Realtime | ClockKind::Monotonic | ClockKind::Boottime => {}
+        _ => return Err(SysError::ENOTSUP),
+    }
+    let signal = decode_sigevent_signal(sevp)?;
+    let id = current_process().create_posix_timer(clock_id, signal);
+    write_user_value(current_user_token(), timerid, &(id as i32))?;
+    Ok(0)
+}
+
+pub fn sys_timer_settime(
+    timerid: i32,
+    flags: i32,
+    new_value: *const LinuxITimerSpec,
+    old_value: *mut LinuxITimerSpec,
+) -> SysResult {
+    if timerid < 0 || flags & !(TIMER_ABSTIME as i32) != 0 {
+        return Err(SysError::EINVAL);
+    }
+    if new_value.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    let new_value = read_user_value(current_user_token(), new_value)?;
+    let (interval_us, value_us) = itimerspec_to_us(new_value)?;
+    let process = current_process();
+    let now_us = get_time_us();
+    let clock_id = process
+        .posix_timer_clock(timerid as usize)
+        .ok_or(SysError::EINVAL)?;
+    let next_expire_us = posix_timer_deadline_us(clock_id, flags, value_us)?;
+    let (old_interval_us, old_remaining_us, generation) = process
+        .set_posix_timer(timerid as usize, interval_us, next_expire_us, now_us)
+        .ok_or(SysError::EINVAL)?;
+    if !old_value.is_null() {
+        let old = itimerspec_from_us(old_interval_us, old_remaining_us);
+        write_user_value(current_user_token(), old_value, &old)?;
+    }
+    if next_expire_us != 0 {
+        add_posix_timer(next_expire_us, timerid as usize, generation, process);
+    }
+    Ok(0)
+}
+
+pub fn sys_timer_gettime(timerid: i32, curr_value: *mut LinuxITimerSpec) -> SysResult {
+    if timerid < 0 {
+        return Err(SysError::EINVAL);
+    }
+    if curr_value.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    let (interval_us, remaining_us) = current_process()
+        .posix_timer_snapshot(timerid as usize, get_time_us())
+        .ok_or(SysError::EINVAL)?;
+    let current = itimerspec_from_us(interval_us, remaining_us);
+    write_user_value(current_user_token(), curr_value, &current)?;
+    Ok(0)
+}
+
+pub fn sys_timer_getoverrun(timerid: i32) -> SysResult {
+    if timerid < 0 {
+        return Err(SysError::EINVAL);
+    }
+    current_process()
+        .posix_timer_snapshot(timerid as usize, get_time_us())
+        .ok_or(SysError::EINVAL)?;
+    Ok(0)
+}
+
+pub fn sys_timer_delete(timerid: i32) -> SysResult {
+    if timerid < 0 {
+        return Err(SysError::EINVAL);
+    }
+    current_process()
+        .delete_posix_timer(timerid as usize)
+        .ok_or(SysError::EINVAL)?;
     Ok(0)
 }
 
