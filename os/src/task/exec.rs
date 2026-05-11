@@ -1,6 +1,6 @@
 use super::{
-    SigAltStack, SignalAction, current_task, process::ProcessControlBlock,
-    terminate_sibling_threads_for_exec,
+    SigAltStack, SignalAction, current_task, prepare_exec_thread_group,
+    process::ProcessControlBlock,
 };
 use crate::config::PAGE_SIZE;
 use crate::fs::{VfsNodeId, track_regular_file_executable, untrack_regular_file_executable};
@@ -162,18 +162,8 @@ impl ProcessControlBlock {
         executable_node: Option<VfsNodeId>,
     ) -> SysResult<()> {
         let current = current_task().ok_or(SysError::ESRCH)?;
-        let current_tid = current.inner_exclusive_access().tid;
-        let thread_count = self.inner_exclusive_access().thread_count();
-        if thread_count > 1 {
-            if current_tid != 0 {
-                // UNFINISHED: Linux allows execve() from a non-leader thread
-                // by de-threading into the thread-group leader identity. This
-                // phase only supports leader-thread exec with sibling cleanup.
-                return Err(SysError::EINVAL);
-            }
-            let process_token = self.inner_exclusive_access().get_user_token();
-            terminate_sibling_threads_for_exec(self, current_tid, process_token, self.getpid());
-        }
+        let process_token = self.inner_exclusive_access().get_user_token();
+        let task = prepare_exec_thread_group(self, current, process_token, self.getpid())?;
 
         let ElfLoadInfo {
             memory_set,
@@ -227,7 +217,6 @@ impl ProcessControlBlock {
             track_regular_file_executable(node);
         }
 
-        let task = self.inner_exclusive_access().get_task(0);
         let mut task_inner = task.inner_exclusive_access();
         task_inner.robust_list_head = 0;
         task_inner.sigsuspend_restore_mask = None;

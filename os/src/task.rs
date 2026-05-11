@@ -19,6 +19,7 @@ use crate::arch::__switch;
 use crate::fs::untrack_regular_file_executable;
 use crate::sbi::shutdown;
 use crate::sync::UPIntrFreeCell;
+use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::{release_flock_locks_for_closed_fd_table, release_record_locks_for_process};
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -229,7 +230,7 @@ fn terminate_sibling_threads(
     }
 }
 
-pub(crate) fn terminate_sibling_threads_for_exec(
+fn terminate_sibling_threads_for_exec(
     process: &Arc<ProcessControlBlock>,
     current_tid: usize,
     process_token: usize,
@@ -238,6 +239,127 @@ pub(crate) fn terminate_sibling_threads_for_exec(
     terminate_sibling_threads(process, current_tid, process_token, process_id, 0);
     remove_ready_tasks_of_process(process_id);
     futex::remove_process_futex_waiters(process_id);
+}
+
+fn rebind_non_leader_for_exec(
+    process: &Arc<ProcessControlBlock>,
+    current: &Arc<TaskControlBlock>,
+    current_tid: usize,
+    process_token: usize,
+    process_id: usize,
+) -> SysResult<()> {
+    let mut clear_child_tids = Vec::new();
+    let mut recycle_res = Vec::<TaskUserRes>::new();
+    let mut robust_tasks = Vec::new();
+    let mut exited_threads = Vec::new();
+    let mut released_thread_keyrings = Vec::new();
+    {
+        let mut process_inner = process.inner_exclusive_access();
+        let current_slot_matches = process_inner
+            .tasks
+            .get(current_tid)
+            .and_then(|slot| slot.as_ref())
+            .is_some_and(|task| Arc::ptr_eq(task, current));
+        if !current_slot_matches {
+            return Err(SysError::ESRCH);
+        }
+        let leader = process_inner
+            .tasks
+            .first()
+            .and_then(|slot| slot.as_ref())
+            .map(Arc::clone)
+            .ok_or(SysError::ESRCH)?;
+        if leader.inner_exclusive_access().res.is_none() {
+            return Err(SysError::ESRCH);
+        }
+
+        let mut leader_res = None;
+        for (tid, task_slot) in process_inner.tasks.iter_mut().enumerate() {
+            let Some(task) = task_slot.as_ref().map(Arc::clone) else {
+                continue;
+            };
+            if Arc::ptr_eq(&task, current) {
+                *task_slot = None;
+                continue;
+            }
+
+            let mut task_inner = task.inner_exclusive_access();
+            task_inner.task_status = TaskStatus::Exited;
+            task_inner.exit_code = Some(0);
+            if let Some(clear_child_tid) = task_inner.clear_child_tid.take() {
+                clear_child_tids.push(clear_child_tid);
+            }
+            if let Some(keyring) = task_inner.thread_keyring.take() {
+                released_thread_keyrings.push(keyring);
+            }
+            robust_tasks.push(Arc::clone(&task));
+            if tid == 0 {
+                leader_res = task_inner.res.take();
+            } else if let Some(res) = task_inner.res.take() {
+                recycle_res.push(res);
+            }
+            drop(task_inner);
+            exited_threads.push(task);
+            *task_slot = None;
+        }
+
+        let leader_res = leader_res.ok_or(SysError::ESRCH)?;
+        let mut current_inner = current.inner_exclusive_access();
+        if let Some(res) = current_inner.res.replace(leader_res) {
+            recycle_res.push(res);
+        }
+        current_inner.tid = 0;
+        current_inner.linux_tid = None;
+        current_inner.clear_child_tid = None;
+        drop(current_inner);
+
+        process_inner.tasks[0] = Some(Arc::clone(current));
+        while process_inner.tasks.len() > 1
+            && process_inner.tasks.last().is_some_and(Option::is_none)
+        {
+            process_inner.tasks.pop();
+        }
+    }
+
+    for task in robust_tasks {
+        futex::exit_robust_list(&task, process_token, process_id);
+    }
+    for clear_child_tid in clear_child_tids {
+        futex::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
+    }
+    for keyring in released_thread_keyrings {
+        crate::syscall::keyring::release_keyring_tree(keyring);
+    }
+    recycle_res.clear();
+    for task in exited_threads {
+        queue_exited_task(task);
+    }
+    remove_ready_tasks_of_process(process_id);
+    futex::remove_process_futex_waiters(process_id);
+    Ok(())
+}
+
+pub(crate) fn prepare_exec_thread_group(
+    process: &Arc<ProcessControlBlock>,
+    current: Arc<TaskControlBlock>,
+    process_token: usize,
+    process_id: usize,
+) -> SysResult<Arc<TaskControlBlock>> {
+    let current_tid = current.inner_exclusive_access().tid;
+    let thread_count = process.inner_exclusive_access().thread_count();
+    if thread_count <= 1 {
+        return if current_tid == 0 {
+            Ok(current)
+        } else {
+            Err(SysError::ESRCH)
+        };
+    }
+    if current_tid == 0 {
+        terminate_sibling_threads_for_exec(process, current_tid, process_token, process_id);
+    } else {
+        rebind_non_leader_for_exec(process, &current, current_tid, process_token, process_id)?;
+    }
+    Ok(current)
 }
 
 pub(crate) fn queue_signal_to_task(
