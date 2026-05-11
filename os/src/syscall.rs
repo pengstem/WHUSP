@@ -62,6 +62,7 @@ const SYSCALL_GET_ROBUST_LIST: usize = 100;
 const SYSCALL_NANOSLEEP: usize = 101;
 const SYSCALL_GETITIMER: usize = 102;
 const SYSCALL_SETITIMER: usize = 103;
+const SYSCALL_CLOCK_SETTIME: usize = 112;
 const SYSCALL_CLOCK_GETTIME: usize = 113;
 const SYSCALL_CLOCK_GETRES: usize = 114;
 const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
@@ -152,6 +153,7 @@ const SYSCALL_WAIT4: usize = 260;
 const SYSCALL_PRLIMIT64: usize = 261;
 const SYSCALL_FANOTIFY_INIT: usize = 262;
 const SYSCALL_FANOTIFY_MARK: usize = 263;
+const SYSCALL_CLOCK_ADJTIME: usize = 266;
 const SYSCALL_SETNS: usize = 268;
 const SYSCALL_RENAMEAT2: usize = 276;
 const SYSCALL_GETRANDOM: usize = 278;
@@ -448,6 +450,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SETITIMER => {
             sys_setitimer(args[0] as i32, args[1] as *const u8, args[2] as *mut u8)
         }
+        SYSCALL_CLOCK_SETTIME => sys_clock_settime(args[0] as i32, args[1] as *const LinuxTimeSpec),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as i32, args[1] as *mut LinuxTimeSpec),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0] as i32, args[1] as *mut LinuxTimeSpec),
         SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(
@@ -580,6 +583,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as isize,
             args[4] as *const u8,
         ),
+        SYSCALL_CLOCK_ADJTIME => sys_clock_adjtime(args[0] as i32, args[1] as *mut LinuxTimex),
         SYSCALL_SETNS => sys_setns(args[0], args[1]),
         SYSCALL_SOCKET => sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),
         SYSCALL_SOCKETPAIR => {

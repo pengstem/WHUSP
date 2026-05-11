@@ -1,11 +1,13 @@
+use crate::sync::UPIntrFreeCell;
 use crate::task::{
     ProcessCpuTimesSnapshot, block_current_and_run_next, current_has_deliverable_signal,
     current_process, current_task, current_user_token,
 };
 use crate::timer::{
     add_real_timer, add_timer, get_time_clock_ticks, get_time_ms, get_time_us,
-    monotonic_time_nanos, us_to_clock_ticks, wall_time_nanos,
+    monotonic_time_nanos, set_wall_time_nanos, us_to_clock_ticks, wall_time_nanos,
 };
+use lazy_static::*;
 
 use super::errno::{SysError, SysResult};
 use super::uapi::LinuxTimeSpec;
@@ -28,6 +30,48 @@ const USEC_PER_SEC: usize = 1_000_000;
 const ITIMER_REAL: i32 = 0;
 const ITIMER_VIRTUAL: i32 = 1;
 const ITIMER_PROF: i32 = 2;
+const ADJ_OFFSET: u32 = 0x0001;
+const ADJ_FREQUENCY: u32 = 0x0002;
+const ADJ_MAXERROR: u32 = 0x0004;
+const ADJ_ESTERROR: u32 = 0x0008;
+const ADJ_STATUS: u32 = 0x0010;
+const ADJ_TIMECONST: u32 = 0x0020;
+const ADJ_MICRO: u32 = 0x1000;
+const ADJ_NANO: u32 = 0x2000;
+const ADJ_TICK: u32 = 0x4000;
+const ADJ_OFFSET_SINGLESHOT: u32 = 0x8001;
+const ADJ_OFFSET_SS_READ: u32 = 0xa001;
+const ADJ_ALL: u32 = ADJ_OFFSET
+    | ADJ_FREQUENCY
+    | ADJ_MAXERROR
+    | ADJ_ESTERROR
+    | ADJ_STATUS
+    | ADJ_TIMECONST
+    | ADJ_TICK;
+const ADJ_SINGLESHOT_FLAG: u32 = ADJ_OFFSET_SINGLESHOT & !ADJ_OFFSET;
+const STA_PLL: i32 = 0x0001;
+const STA_PPSFREQ: i32 = 0x0002;
+const STA_PPSTIME: i32 = 0x0004;
+const STA_FLL: i32 = 0x0008;
+const STA_INS: i32 = 0x0010;
+const STA_DEL: i32 = 0x0020;
+const STA_UNSYNC: i32 = 0x0040;
+const STA_FREQHOLD: i32 = 0x0080;
+const STA_NANO: i32 = 0x2000;
+const STA_MODE: i32 = 0x4000;
+const TIME_OK: isize = 0;
+const TIME_ERROR: isize = 5;
+const TIMEX_SETTABLE_STATUS_BITS: i32 = STA_PLL
+    | STA_PPSFREQ
+    | STA_PPSTIME
+    | STA_FLL
+    | STA_INS
+    | STA_DEL
+    | STA_UNSYNC
+    | STA_FREQHOLD
+    | STA_MODE;
+const TIMEX_SETTABLE_BIT_MODES: u32 = ADJ_ALL | ADJ_MICRO | ADJ_NANO;
+const DEFAULT_TAI_OFFSET_SECS: i32 = 37;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -57,6 +101,84 @@ pub struct LinuxTms {
 struct LinuxITimerVal {
     it_interval: LinuxTimeVal,
     it_value: LinuxTimeVal,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxTimex {
+    modes: u32,
+    offset: isize,
+    freq: isize,
+    maxerror: isize,
+    esterror: isize,
+    status: i32,
+    constant: isize,
+    precision: isize,
+    tolerance: isize,
+    time: LinuxTimeVal,
+    tick: isize,
+    ppsfreq: isize,
+    jitter: isize,
+    shift: i32,
+    stabil: isize,
+    jitcnt: isize,
+    calcnt: isize,
+    errcnt: isize,
+    stbcnt: isize,
+    tai: i32,
+    _padding: [i32; 11],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimexState {
+    offset: isize,
+    freq: isize,
+    maxerror: isize,
+    esterror: isize,
+    status: i32,
+    constant: isize,
+    precision: isize,
+    tolerance: isize,
+    tick: isize,
+    tai: i32,
+}
+
+impl TimexState {
+    const fn new() -> Self {
+        Self {
+            offset: 0,
+            freq: 0,
+            maxerror: 0,
+            esterror: 0,
+            status: 0,
+            constant: 0,
+            precision: 1,
+            tolerance: 0,
+            tick: (USEC_PER_SEC / crate::timer::TICKS_PER_SEC) as isize,
+            tai: DEFAULT_TAI_OFFSET_SECS,
+        }
+    }
+
+    fn resolution_mode(self) -> u32 {
+        if self.status & STA_NANO != 0 {
+            ADJ_NANO
+        } else {
+            ADJ_MICRO
+        }
+    }
+
+    fn time_state(self) -> isize {
+        if self.status & STA_UNSYNC != 0 {
+            TIME_ERROR
+        } else {
+            TIME_OK
+        }
+    }
+}
+
+lazy_static! {
+    static ref TIMEX_STATE: UPIntrFreeCell<TimexState> =
+        unsafe { UPIntrFreeCell::new(TimexState::new()) };
 }
 
 #[derive(Clone, Copy)]
@@ -187,6 +309,10 @@ pub(crate) fn nanos_to_ms_ceil(nanos: u64) -> SysResult<usize> {
 
 pub(crate) fn timespec_to_ms_ceil(time: LinuxTimeSpec) -> SysResult<usize> {
     nanos_to_ms_ceil(timespec_to_nanos(time)?)
+}
+
+fn relative_sleep_deadline_ms(time: LinuxTimeSpec) -> SysResult<usize> {
+    relative_timeout_deadline_ms_from_nanos(timespec_to_nanos(time)?)
 }
 
 fn us_to_ms_ceil(us: usize) -> SysResult<usize> {
@@ -343,12 +469,7 @@ pub fn sys_setitimer(which: i32, value: *const u8, old_value: *mut u8) -> SysRes
 pub fn sys_gettimeofday(tv: *mut LinuxTimeVal, tz: *mut LinuxTimezone) -> SysResult {
     let token = current_user_token();
     if !tv.is_null() {
-        let wall_ns = wall_time_nanos();
-        let time = LinuxTimeVal {
-            tv_sec: (wall_ns / 1_000_000_000) as isize,
-            tv_usec: ((wall_ns % 1_000_000_000) / 1_000) as isize,
-        };
-        write_user_value(token, tv, &time)?;
+        write_user_value(token, tv, &wall_timeval())?;
     }
     if !tz.is_null() {
         // CONTEXT: Linux keeps the timezone argument only for legacy callers.
@@ -402,6 +523,14 @@ fn nanos_to_timespec(nanos: u64) -> LinuxTimeSpec {
     }
 }
 
+fn wall_timeval() -> LinuxTimeVal {
+    let wall_ns = wall_time_nanos();
+    LinuxTimeVal {
+        tv_sec: (wall_ns / 1_000_000_000) as isize,
+        tv_usec: ((wall_ns % 1_000_000_000) / 1_000) as isize,
+    }
+}
+
 fn clock_getres_resolution(clock_id: i32) -> SysResult<LinuxTimeSpec> {
     match clock_id {
         CLOCK_REALTIME
@@ -452,9 +581,7 @@ pub fn sys_nanosleep(req: *const LinuxTimeSpec, rem: *mut LinuxTimeSpec) -> SysR
     if duration_ms == 0 {
         return Ok(0);
     }
-    let expire_ms = get_time_ms()
-        .checked_add(duration_ms)
-        .ok_or(SysError::EINVAL)?;
+    let expire_ms = relative_sleep_deadline_ms(request)?;
     match sleep_until_ms(expire_ms) {
         Err(SysError::EINTR) => {
             write_remaining_sleep_time(token, rem, expire_ms)?;
@@ -480,6 +607,22 @@ pub fn sys_clock_gettime(clock_id: i32, tp: *mut LinuxTimeSpec) -> SysResult {
         _ => nanos_to_timespec(current_clock_nanos(clock.gettime_backend()?)),
     };
     write_user_value(current_user_token(), tp, &timespec)?;
+    Ok(0)
+}
+
+pub fn sys_clock_settime(clock_id: i32, tp: *const LinuxTimeSpec) -> SysResult {
+    if clock_id != CLOCK_REALTIME {
+        return Err(SysError::EINVAL);
+    }
+    if tp.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    let request = validate_timespec(read_user_value(current_user_token(), tp)?)?;
+    let credentials = current_process().credentials();
+    if credentials.euid != 0 {
+        return Err(SysError::EPERM);
+    }
+    set_wall_time_nanos(timespec_to_nanos(request)?);
     Ok(0)
 }
 
@@ -513,9 +656,7 @@ pub fn sys_clock_nanosleep(
         if duration_ms == 0 {
             return Ok(0);
         }
-        let expire_ms = get_time_ms()
-            .checked_add(duration_ms)
-            .ok_or(SysError::EINVAL)?;
+        let expire_ms = relative_sleep_deadline_ms(request)?;
         match sleep_until_ms(expire_ms) {
             Err(SysError::EINTR) => {
                 write_remaining_sleep_time(current_user_token(), rem, expire_ms)?;
@@ -524,4 +665,130 @@ pub fn sys_clock_nanosleep(
             result => result,
         }
     }
+}
+
+fn timex_modes_supported(modes: u32) -> bool {
+    match modes {
+        0 | ADJ_OFFSET_SINGLESHOT | ADJ_OFFSET_SS_READ => true,
+        _ if modes & ADJ_SINGLESHOT_FLAG != 0 => false,
+        _ => modes & !TIMEX_SETTABLE_BIT_MODES == 0,
+    }
+}
+
+fn timex_tick_bounds() -> (isize, isize) {
+    let hz = crate::timer::TICKS_PER_SEC as isize;
+    (900_000 / hz, 1_100_000 / hz)
+}
+
+fn timex_resolution_is_nanos(modes: u32, state: TimexState) -> bool {
+    if modes & ADJ_NANO != 0 {
+        true
+    } else if modes & ADJ_MICRO != 0 {
+        false
+    } else {
+        state.status & STA_NANO != 0
+    }
+}
+
+fn fill_timex_output(timex: &mut LinuxTimex, state: TimexState) {
+    timex.modes = state.resolution_mode();
+    timex.offset = state.offset;
+    timex.freq = state.freq;
+    timex.maxerror = state.maxerror;
+    timex.esterror = state.esterror;
+    timex.status = state.status;
+    timex.constant = state.constant;
+    timex.precision = state.precision;
+    timex.tolerance = state.tolerance;
+    timex.time = wall_timeval();
+    timex.tick = state.tick;
+    timex.ppsfreq = 0;
+    timex.jitter = 0;
+    timex.shift = 0;
+    timex.stabil = 0;
+    timex.jitcnt = 0;
+    timex.calcnt = 0;
+    timex.errcnt = 0;
+    timex.stbcnt = 0;
+    timex.tai = state.tai;
+}
+
+fn update_timex_state(state: &mut TimexState, timex: LinuxTimex) -> SysResult<()> {
+    let modes = timex.modes;
+    if !timex_modes_supported(modes) {
+        return Err(SysError::EINVAL);
+    }
+    if modes & ADJ_MICRO != 0 {
+        state.status &= !STA_NANO;
+    }
+    if modes & ADJ_NANO != 0 {
+        state.status |= STA_NANO;
+    }
+    if modes & ADJ_STATUS != 0 {
+        if timex.status & !TIMEX_SETTABLE_STATUS_BITS != 0 {
+            return Err(SysError::EINVAL);
+        }
+        state.status = (state.status & !TIMEX_SETTABLE_STATUS_BITS)
+            | (timex.status & TIMEX_SETTABLE_STATUS_BITS);
+    }
+    if modes & ADJ_OFFSET != 0 {
+        let limit = if timex_resolution_is_nanos(modes, *state) {
+            500_000isize * 1000
+        } else {
+            500_000isize
+        };
+        if timex.offset <= -limit || timex.offset >= limit {
+            return Err(SysError::EINVAL);
+        }
+        state.offset = timex.offset;
+    }
+    if modes & ADJ_FREQUENCY != 0 {
+        state.freq = timex.freq.clamp(-32_768_000, 32_768_000);
+    }
+    if modes & ADJ_MAXERROR != 0 {
+        state.maxerror = timex.maxerror;
+    }
+    if modes & ADJ_ESTERROR != 0 {
+        state.esterror = timex.esterror;
+    }
+    if modes & ADJ_TIMECONST != 0 {
+        state.constant = timex.constant;
+    }
+    if modes & ADJ_TICK != 0 {
+        let (min_tick, max_tick) = timex_tick_bounds();
+        if timex.tick < min_tick || timex.tick > max_tick {
+            return Err(SysError::EINVAL);
+        }
+        state.tick = timex.tick;
+    }
+    if modes == ADJ_OFFSET_SINGLESHOT {
+        state.offset = timex.offset;
+    }
+    Ok(())
+}
+
+pub fn sys_clock_adjtime(clock_id: i32, timex: *mut LinuxTimex) -> SysResult {
+    if clock_id != CLOCK_REALTIME {
+        return Err(SysError::EINVAL);
+    }
+    if timex.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    let token = current_user_token();
+    let mut user_timex = read_user_value(token, timex)?;
+    let modes = user_timex.modes;
+    let credentials = current_process().credentials();
+    if credentials.euid != 0 && modes != 0 && modes != ADJ_OFFSET_SS_READ {
+        return Err(SysError::EPERM);
+    }
+    let ret = {
+        let mut state = TIMEX_STATE.exclusive_access();
+        if modes != 0 && modes != ADJ_OFFSET_SS_READ {
+            update_timex_state(&mut state, user_timex)?;
+        }
+        fill_timex_output(&mut user_timex, *state);
+        state.time_state()
+    };
+    write_user_value(token, timex, &user_timex)?;
+    Ok(ret)
 }
