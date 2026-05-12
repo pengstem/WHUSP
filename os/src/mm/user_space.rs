@@ -58,6 +58,10 @@ pub struct MmapFaultPage {
 }
 
 impl MmapFaultPage {
+    /// Allocates and optionally fills the private frame for a mmap fault.
+    ///
+    /// The returned frame is not installed into any page table yet; callers
+    /// must revalidate the VMA and install it through `MemorySet`.
     pub fn build_frame(&self) -> Option<FrameTracker> {
         let frame = frame_alloc()?;
         if let Some(file) = &self.backing_file {
@@ -84,6 +88,10 @@ impl MmapPageCacheFault {
         self.key
     }
 
+    /// Resolves the shared page-cache frame for a file-backed MAP_SHARED fault.
+    ///
+    /// This may allocate a new frame and read the backing file when the page is
+    /// not already cached. A successful return owns one page-cache reference.
     pub fn resolve_ppn(&self) -> Option<PhysPageNum> {
         if let Some(ppn) = {
             let mut cache = PAGE_CACHE.exclusive_access();
@@ -104,6 +112,11 @@ impl MmapPageCacheFault {
 }
 
 impl MemorySet {
+    /// Builds a child address space for fork/clone.
+    ///
+    /// This preserves current eager-copy/share behavior without introducing
+    /// COW. File-backed MAP_SHARED and SHM mappings keep their shared backing
+    /// references; writable private mappings are copied eagerly.
     pub fn from_existed_user(user_space: &mut MemorySet) -> Option<MemorySet> {
         let mut memory_set = Self::try_new_bare()?;
         memory_set.brk_base = user_space.brk_base;
@@ -373,6 +386,11 @@ impl MemorySet {
         }
     }
 
+    /// Creates a non-fixed mmap VMA and returns its chosen start address.
+    ///
+    /// No user pages are allocated here unless mlock-future state requests
+    /// later fault accounting; regular mmap contents are populated lazily by
+    /// the page-fault path.
     pub fn mmap_area(
         &mut self,
         len: usize,
@@ -408,6 +426,10 @@ impl MemorySet {
         Some(start)
     }
 
+    /// Replaces an existing virtual range with a fixed mmap area.
+    ///
+    /// Any removed MAP_SHARED pages are returned as deferred flush records so
+    /// the caller can write them back after releasing the memory-set lock.
     pub fn mmap_fixed_area(
         &mut self,
         start: usize,
@@ -531,6 +553,11 @@ impl MemorySet {
         Some(())
     }
 
+    /// Resolves a user mmap fault into either an already-handled fault or work
+    /// that must be completed without holding `MemorySet` mutably.
+    ///
+    /// The returned page work may allocate frames or read files later, so the
+    /// caller must revalidate the VMA through the install helpers.
     pub fn prepare_mmap_page_fault(
         &mut self,
         addr: usize,
@@ -580,7 +607,10 @@ impl MemorySet {
             return Some(MmapFaultResult::Handled);
         }
 
-        let info = area.mmap_info.as_ref().unwrap();
+        let info = area
+            .mmap_info
+            .as_ref()
+            .expect("mmap fault area must carry mmap metadata");
         let area_offset = (vpn.0 - area.vpn_range.get_start().0) * PAGE_SIZE;
         let file_offset = info.file_offset.checked_add(area_offset)?;
         // UNFINISHED: Linux raises SIGBUS for accesses to file-backed mmap
@@ -615,6 +645,10 @@ impl MemorySet {
         }))
     }
 
+    /// Installs a frame produced by `MmapFaultPage::build_frame`.
+    ///
+    /// The VMA is looked up again because the caller may have dropped process
+    /// memory state while allocating or reading the backing file.
     pub fn install_mmap_fault_page(&mut self, page: MmapFaultPage, frame: FrameTracker) -> bool {
         let Some(idx) = self.areas.iter().position(|area| {
             area.is_mmap()
@@ -628,6 +662,10 @@ impl MemorySet {
         area.map_existing_frame(page_table, page.vpn, frame)
     }
 
+    /// Installs a page-cache frame resolved for a MAP_SHARED mmap fault.
+    ///
+    /// The page-cache reference belongs to this mapping only if installation
+    /// succeeds; callers must drop that reference on failure.
     pub fn install_mmap_page_cache_fault_page(
         &mut self,
         page: MmapPageCacheFault,
@@ -645,6 +683,10 @@ impl MemorySet {
         area.map_page_cache_frame(page_table, page.vpn, ppn, page.key)
     }
 
+    /// Unmaps complete mmap VMAs covered by the page-aligned range.
+    ///
+    /// Returned flush records are deferred filesystem writes and should be
+    /// consumed without holding the process memory lock.
     pub fn munmap_area(&mut self, start: usize, len: usize) -> Option<Vec<MmapFlush>> {
         if len == 0 || start % PAGE_SIZE != 0 {
             return None;
@@ -682,6 +724,10 @@ impl MemorySet {
         Some(flushes)
     }
 
+    /// Collects dirty MAP_SHARED writeback records for an `msync` range.
+    ///
+    /// This does not unmap pages. It snapshots data that must be written after
+    /// the caller releases memory-set state.
     pub fn msync_area(&self, start: usize, len: usize) -> Option<Vec<MmapFlush>> {
         if len == 0 {
             return Some(Vec::new());
@@ -773,6 +819,10 @@ impl MemorySet {
         self.areas.iter().map(MapArea::locked_bytes).sum()
     }
 
+    /// Marks a mapped range as locked for mlock/mlock2 accounting.
+    ///
+    /// When `on_fault` is false, mmap pages are faulted in before the lock mark
+    /// is applied so Linux-visible ENOMEM behavior stays deterministic.
     pub fn mlock_range(&mut self, start: usize, len: usize, on_fault: bool) -> bool {
         let Some((start_vpn, end_vpn)) = checked_page_range(start, len) else {
             return false;
@@ -807,6 +857,10 @@ impl MemorySet {
         true
     }
 
+    /// Applies mlockall(MCL_CURRENT) to every current VMA.
+    ///
+    /// Non-ONFAULT mode prefaults mmap pages first; later mappings are governed
+    /// separately by `set_mlock_future`.
     pub fn mlock_current(&mut self, on_fault: bool) -> bool {
         if !on_fault {
             let ranges: Vec<_> = self

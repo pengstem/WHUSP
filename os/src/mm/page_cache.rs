@@ -27,6 +27,10 @@ pub(crate) struct PageCacheKey {
 }
 
 impl PageCacheKey {
+    /// Builds a cache key only for page-aligned file offsets.
+    ///
+    /// The current mmap path caches full file pages; partial-page offsets fall
+    /// back to private fault frames.
     pub(crate) fn from_file_offset(id: PageCacheId, file_offset: usize) -> Option<Self> {
         if file_offset % PAGE_SIZE != 0 {
             return None;
@@ -37,6 +41,7 @@ impl PageCacheKey {
         })
     }
 
+    /// Returns the byte offset represented by this file page key.
     pub(crate) fn file_offset(self) -> usize {
         self.page_index * PAGE_SIZE
     }
@@ -89,12 +94,16 @@ impl PageCache {
         self.pages.contains_key(&key)
     }
 
+    /// Returns a cached frame and pins it for one additional mapping.
     pub(crate) fn get_and_inc_ref(&mut self, key: PageCacheKey) -> Option<PhysPageNum> {
         let page = self.pages.get_mut(&key)?;
         page.ref_count += 1;
         Some(page.ppn())
     }
 
+    /// Inserts a freshly loaded file page or reuses an existing one.
+    ///
+    /// The returned PPN is pinned for the caller's mapping in both cases.
     pub(crate) fn insert_loaded_page_and_inc_ref(
         &mut self,
         key: PageCacheKey,
@@ -112,12 +121,14 @@ impl PageCache {
         ppn
     }
 
+    /// Drops one mapping reference without evicting the cached page.
     pub(crate) fn dec_ref(&mut self, key: PageCacheKey) {
         if let Some(page) = self.pages.get_mut(&key) {
             page.ref_count = page.ref_count.saturating_sub(1);
         }
     }
 
+    /// Drops one mapping reference and removes the page when it is unreferenced.
     pub(crate) fn dec_ref_and_take_if_unused(
         &mut self,
         key: PageCacheKey,
@@ -137,6 +148,7 @@ impl PageCache {
         Some(page.ppn().get_bytes_array()[..len].to_vec())
     }
 
+    /// Marks a shared mmap page dirty after the first write fault.
     pub(crate) fn mark_dirty(&mut self, key: PageCacheKey) -> bool {
         let Some(page) = self.pages.get_mut(&key) else {
             return false;
@@ -154,6 +166,7 @@ impl PageCache {
         Some(page.ppn().get_bytes_array()[..len].to_vec())
     }
 
+    /// Takes a dirty snapshot for writeback and clears the dirty bit.
     pub(crate) fn take_dirty_page_data(
         &mut self,
         key: PageCacheKey,

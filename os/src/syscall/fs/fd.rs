@@ -51,7 +51,7 @@ pub(super) fn get_fd_entry_by_fd(fd: usize) -> SysResult<FdTableEntry> {
     inner.fd_entry(fd).ok_or(SysError::EBADF)
 }
 
-pub(super) fn get_file_by_fd(fd: usize) -> SysResult<Arc<dyn File + Send + Sync>> {
+pub(crate) fn get_file_by_fd(fd: usize) -> SysResult<Arc<dyn File + Send + Sync>> {
     Ok(get_fd_entry_by_fd(fd)?.file())
 }
 

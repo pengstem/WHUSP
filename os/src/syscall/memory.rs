@@ -1,11 +1,13 @@
 use crate::config::PAGE_SIZE;
 use crate::mm::shm::ShmError;
-use crate::mm::{MapPermission, MemoryProtectError};
+use crate::mm::{MapPermission, MemoryProtectError, MmapFlush};
 use crate::syscall::user_ptr::copy_to_user;
 use crate::task::{CAP_IPC_LOCK, RLimitResource, current_process, current_user_token};
+use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
 
 use super::errno::{SysError, SysResult};
+use super::fs::get_file_by_fd;
 
 const PROT_READ: usize = 0x1;
 const PROT_WRITE: usize = 0x2;
@@ -178,18 +180,11 @@ fn sys_mmap_impl(
         }
         (None, 0, None)
     } else {
-        let process = current_process();
         let fd = fd as isize;
         if fd < 0 {
             return Err(SysError::EBADF);
         }
-        let inner = process.inner_exclusive_access();
-        let file = inner
-            .fd_table
-            .get(fd as usize)
-            .and_then(|entry| entry.as_ref())
-            .map(|entry| entry.file())
-            .ok_or(SysError::EBADF)?;
+        let file = get_file_by_fd(fd as usize)?;
         if len == 0 || offset % PAGE_SIZE != 0 {
             return Err(SysError::EINVAL);
         }
@@ -236,9 +231,7 @@ fn sys_mmap_impl(
         if let Some(file) = writable_shared_file {
             file.inc_writable_shared_mmap();
         }
-        for flush in flushes {
-            flush.write_back();
-        }
+        write_back_mmap_flushes(flushes);
         return Ok(mapped_addr);
     }
 
@@ -309,9 +302,7 @@ pub fn sys_munmap(addr: usize, len: usize) -> SysResult {
             .munmap_area(addr, len)
             .ok_or(SysError::EINVAL)?
     };
-    for flush in flushes {
-        flush.write_back();
-    }
+    write_back_mmap_flushes(flushes);
     Ok(0)
 }
 
@@ -436,9 +427,7 @@ pub fn sys_msync(addr: usize, len: usize, flags: i32) -> SysResult {
     // syscall/procfs compatibility and has no cross-process invalidation model
     // yet, so it only validates the mapping range and writes back dirty shared
     // mmap pages.
-    for flush in flushes {
-        flush.write_back();
-    }
+    write_back_mmap_flushes(flushes);
     Ok(0)
 }
 
@@ -498,6 +487,12 @@ fn check_memlock_limit(additional_locked_bytes: usize) -> SysResult<()> {
         return Err(SysError::ENOMEM);
     }
     Ok(())
+}
+
+fn write_back_mmap_flushes(flushes: Vec<MmapFlush>) {
+    for flush in flushes {
+        flush.write_back();
+    }
 }
 
 fn prot_to_map_permission(prot: usize) -> MapPermission {

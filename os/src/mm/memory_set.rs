@@ -18,9 +18,10 @@ pub(crate) struct MemoryMapEntry {
     pub(crate) locked_kb: usize,
 }
 
-// TODO: replace vec to a high perfermonce data structure
 pub struct MemorySet {
     pub(super) page_table: PageTable,
+    // CONTEXT: contest address spaces have a small VMA count today. Keep the
+    // VMA list simple until measured mmap pressure justifies an interval tree.
     pub(super) areas: Vec<MapArea>,
     pub(super) brk_base: usize,
     pub(super) brk: usize,

@@ -58,10 +58,9 @@ pub struct PageTable {
     frames: Vec<FrameTracker>,
 }
 
-/// Assume that it won't oom when creating/mapping.
 impl PageTable {
     pub fn new() -> Self {
-        let frame = frame_alloc().unwrap();
+        let frame = frame_alloc().expect("page table root allocation requires a free frame");
         PageTable {
             root_ppn: frame.ppn,
             frames: vec![frame],
@@ -119,7 +118,9 @@ impl PageTable {
     }
     #[allow(unused)]
     pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
-        let pte = self.find_pte_create(vpn).unwrap();
+        let pte = self
+            .find_pte_create(vpn)
+            .expect("map requires intermediate page-table allocation to succeed");
         assert!(pte.bits == 0, "vpn {:?} is mapped before mapping", vpn);
         let leaf_flags = PTEFlags::R | PTEFlags::W | PTEFlags::X;
         let flags = if flags.intersects(leaf_flags) {
@@ -147,7 +148,9 @@ impl PageTable {
     }
     #[allow(unused)]
     pub fn unmap(&mut self, vpn: VirtPageNum) {
-        let pte = self.find_pte(vpn).unwrap();
+        let pte = self
+            .find_pte(vpn)
+            .expect("unmap requires an existing page-table path");
         assert!(
             pte.is_valid() || pte.bits != 0,
             "vpn {:?} is invalid before unmapping",
@@ -192,11 +195,13 @@ pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
     let va = ptr as usize;
     page_table
         .translate_va(VirtAddr::from(va))
-        .unwrap()
+        .expect("translated_refmut requires a mapped user pointer")
         .get_mut()
 }
 
-// TODO: i think this could be replaced
+// CONTEXT: most syscall copy paths use checked byte-buffer helpers now. Keep
+// this segmented buffer type for legacy in-kernel adapters that still iterate
+// translated slices directly.
 pub struct UserBuffer {
     pub buffers: Vec<&'static mut [u8]>,
 }

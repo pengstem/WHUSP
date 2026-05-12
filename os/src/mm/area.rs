@@ -29,6 +29,10 @@ pub struct MmapFlush {
 }
 
 impl MmapFlush {
+    /// Writes one collected MAP_SHARED dirty page fragment back to its file.
+    ///
+    /// Callers build these records while holding the process memory lock and
+    /// perform the actual filesystem write after that lock has been released.
     pub fn write_back(self) {
         self.file.write_at(self.offset, &self.data);
     }
@@ -277,6 +281,10 @@ impl MapArea {
         true
     }
 
+    /// Maps one shared page-cache frame into this mmap VMA.
+    ///
+    /// The caller must already own one page-cache reference for `key`. This
+    /// method records that reference only after the PTE install succeeds.
     pub(super) fn map_page_cache_frame(
         &mut self,
         page_table: &mut PageTable,
@@ -383,7 +391,7 @@ impl MapArea {
             let src = &data[copied..copied + copy_len];
             let dst = &mut page_table
                 .translate(current_vpn)
-                .unwrap()
+                .expect("copy_data requires pages mapped by MapArea::map")
                 .ppn()
                 .get_bytes_array()[page_offset..page_offset + copy_len];
             dst.copy_from_slice(src);
@@ -466,7 +474,11 @@ impl MapArea {
             let Some(copy_len) = mmap_writeback_len(info, area_offset) else {
                 continue;
             };
-            let src = &page_table.translate(vpn).unwrap().ppn().get_bytes_array()[..copy_len];
+            let src = &page_table
+                .translate(vpn)
+                .expect("resident mmap frame must have a page-table entry")
+                .ppn()
+                .get_bytes_array()[..copy_len];
             flushes.push(MmapFlush {
                 file: file.clone(),
                 offset: info.file_offset + area_offset,
@@ -493,6 +505,10 @@ impl MapArea {
         flushes
     }
 
+    /// Tears down resident mmap pages and releases page-cache references.
+    ///
+    /// Returned flush records are currently empty by design; see the
+    /// `UNFINISHED` note below for the missing implicit MAP_SHARED writeback.
     pub(super) fn take_mmap_flushes(&mut self, page_table: &mut PageTable) -> Vec<MmapFlush> {
         // UNFINISHED: Linux eventually writes dirty MAP_SHARED pages back on
         // munmap/exit. This kernel currently makes msync() the explicit
@@ -521,6 +537,9 @@ impl MapArea {
         Vec::new()
     }
 
+    /// Releases file-level accounting owned by this mmap VMA.
+    ///
+    /// Call this exactly once when the VMA leaves the address space.
     pub(super) fn release_mmap_refs(&self) {
         let Some(info) = &self.mmap_info else {
             return;
