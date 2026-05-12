@@ -76,14 +76,22 @@ pub struct ClonedThread {
     pub linux_tid: usize,
 }
 
+/// Clones the current thread into the same process address space.
+///
+/// The caller has already validated Linux clone flags and user pointers. This
+/// function copies scheduler/signal thread state and returns a task that still
+/// must be attached to the process task table by the caller.
 pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
-    let current_task = current_task().unwrap();
-    let process = current_task.process.upgrade().unwrap();
+    let current_task = current_task().expect("clone_current_thread requires a current task");
+    let process = current_task
+        .process
+        .upgrade()
+        .expect("current task process must exist while cloning a thread");
     let ustack_base = current_task
         .inner_exclusive_access()
         .res
         .as_ref()
-        .unwrap()
+        .expect("user thread must own TaskUserRes while cloning")
         .ustack_base;
     let parent_inner = current_task.inner_exclusive_access();
     let parent_trap_cx = *parent_inner.get_trap_cx();
@@ -94,7 +102,11 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     drop(parent_inner);
     let new_task = Arc::new(TaskControlBlock::new(process, ustack_base, true));
     let mut new_task_inner = new_task.inner_exclusive_access();
-    let new_ustack_top = new_task_inner.res.as_ref().unwrap().ustack_top();
+    let new_ustack_top = new_task_inner
+        .res
+        .as_ref()
+        .expect("new cloned user task must have TaskUserRes")
+        .ustack_top();
     let linux_tid = pid_alloc();
     let new_linux_tid = linux_tid.0;
     new_task_inner.linux_tid = Some(linux_tid);

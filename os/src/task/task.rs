@@ -24,7 +24,10 @@ impl TaskControlBlock {
     }
 
     pub fn get_user_token(&self) -> usize {
-        let process = self.process.upgrade().unwrap();
+        let process = self
+            .process
+            .upgrade()
+            .expect("task process must outlive the task while it is runnable");
         let inner = process.inner_exclusive_access();
         inner.memory_set.token()
     }
@@ -35,7 +38,12 @@ impl TaskControlBlock {
             .linux_tid
             .as_ref()
             .map(|handle| handle.0);
-        tid.unwrap_or_else(|| self.process.upgrade().unwrap().getpid())
+        tid.unwrap_or_else(|| {
+            self.process
+                .upgrade()
+                .expect("main task process must exist while deriving Linux tid")
+                .getpid()
+        })
     }
 
     pub fn robust_list_head(&self) -> usize {

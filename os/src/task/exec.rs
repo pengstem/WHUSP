@@ -153,6 +153,12 @@ pub(super) fn init_user_stack(
 }
 
 impl ProcessControlBlock {
+    /// Replaces the current process image with a new ELF image.
+    ///
+    /// The caller has already resolved the executable/interpreter and copied
+    /// argv/envp from userspace. This function owns the process image switch:
+    /// memory set replacement, close-on-exec cleanup, signal reset, task resource
+    /// rebuild, and initial trap context construction.
     pub fn exec(
         self: &Arc<Self>,
         elf: &xmas_elf::ElfFile<'_>,
@@ -193,7 +199,7 @@ impl ProcessControlBlock {
             inner.memory_set = memory_set;
             let previous = core::mem::replace(&mut inner.executable_node, executable_node);
             inner.cmdline = args.clone();
-            inner.posix_timers.clear();
+            inner.timers.clear_posix_after_exec();
             for action in inner.signal_actions.iter_mut() {
                 if action.has_user_handler() {
                     *action = SignalAction::default();
@@ -221,16 +227,17 @@ impl ProcessControlBlock {
         task_inner.robust_list_head = 0;
         task_inner.sigsuspend_restore_mask = None;
         task_inner.sigaltstack = SigAltStack::disabled();
-        task_inner.res.as_mut().unwrap().ustack_base = ustack_base;
-        task_inner.res.as_mut().unwrap().alloc_user_res();
-        task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
-        let (user_sp, _, _) = init_user_stack(
-            new_token,
-            task_inner.res.as_ref().unwrap().ustack_top(),
-            &args,
-            &envs,
-            &stack_info,
-        );
+        let (trap_cx_ppn, user_stack_top) = {
+            let task_res = task_inner
+                .res
+                .as_mut()
+                .expect("exec task must keep TaskUserRes while rebuilding image");
+            task_res.ustack_base = ustack_base;
+            task_res.alloc_user_res();
+            (task_res.trap_cx_ppn(), task_res.ustack_top())
+        };
+        task_inner.trap_cx_ppn = trap_cx_ppn;
+        let (user_sp, _, _) = init_user_stack(new_token, user_stack_top, &args, &envs, &stack_info);
 
         let trap_cx = TrapContext::app_init_context(
             entry_point,

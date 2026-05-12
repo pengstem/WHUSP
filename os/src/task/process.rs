@@ -4,7 +4,7 @@ use super::{
     TaskStatus,
 };
 use crate::config::USER_STACK_SIZE;
-use crate::fs::{MountNamespaceId, PathContext, VfsNodeId, WorkingDir};
+use crate::fs::{MountNamespaceId, PathContext, ROOT_MOUNT_NAMESPACE, VfsNodeId, WorkingDir};
 use crate::mm::MemorySet;
 use crate::sync::{UPIntrFreeCell, UPIntrRefMut};
 use alloc::format;
@@ -67,6 +67,7 @@ pub enum RLimitResource {
 }
 
 impl RLimitResource {
+    /// Decodes the Linux `RLIMIT_*` resource number used by rlimit syscalls.
     pub fn from_raw(resource: i32) -> Option<Self> {
         match resource {
             0 => Some(Self::Cpu),
@@ -268,6 +269,63 @@ pub(crate) struct PathSnapshot {
     pub(crate) root_path: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ProcessFsContext {
+    root: WorkingDir,
+    root_path: String,
+    cwd: WorkingDir,
+    cwd_path: String,
+    mount_namespace_id: MountNamespaceId,
+}
+
+impl ProcessFsContext {
+    /// Builds the initial filesystem view for PID 1.
+    pub(crate) fn root() -> Self {
+        Self {
+            root: WorkingDir::root(),
+            root_path: "/".into(),
+            cwd: WorkingDir::root(),
+            cwd_path: "/".into(),
+            mount_namespace_id: ROOT_MOUNT_NAMESPACE,
+        }
+    }
+
+    /// Clones the path state for fork while installing the requested namespace.
+    pub(crate) fn forked(&self, mount_namespace_id: MountNamespaceId) -> Self {
+        Self {
+            root: self.root,
+            root_path: self.root_path.clone(),
+            cwd: self.cwd,
+            cwd_path: self.cwd_path.clone(),
+            mount_namespace_id,
+        }
+    }
+
+    fn path_context(&self) -> PathContext {
+        PathContext::new_in_namespace(
+            self.root,
+            self.cwd,
+            self.mount_namespace_id,
+            self.root_path.clone(),
+            self.cwd_path.clone(),
+        )
+    }
+
+    fn set_working_dir(&mut self, cwd: WorkingDir, cwd_path: String) {
+        self.cwd = cwd;
+        self.cwd_path = cwd_path;
+    }
+
+    fn set_root_dir(&mut self, root: WorkingDir, root_path: String) {
+        self.root = root;
+        self.root_path = root_path;
+    }
+
+    fn references_mount(&self, mount_id: crate::fs::MountId) -> bool {
+        self.root.mount_id() == mount_id || self.cwd.mount_id() == mount_id
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProcessCpuTimes {
     // UNFINISHED: CPU accounting is process-wide and trap-boundary based;
@@ -381,6 +439,20 @@ impl ProcessPosixTimer {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct ProcessTimers {
+    pub(crate) real: ProcessRealTimer,
+    pub(crate) virtual_timer: ProcessRealTimer,
+    pub(crate) prof: ProcessRealTimer,
+    pub(crate) posix: Vec<Option<ProcessPosixTimer>>,
+}
+
+impl ProcessTimers {
+    pub(crate) fn clear_posix_after_exec(&mut self) {
+        self.posix.clear();
+    }
+}
+
 pub struct ProcessControlBlock {
     // immutable
     pub pid: PidHandle,
@@ -392,11 +464,7 @@ pub struct ProcessControlBlockInner {
     pub is_zombie: bool,
     pub memory_set: MemorySet,
     pub executable_node: Option<VfsNodeId>,
-    pub root: WorkingDir,
-    pub root_path: String,
-    pub cwd: WorkingDir,
-    pub cwd_path: String,
-    pub mount_namespace_id: MountNamespaceId,
+    pub(crate) fs: ProcessFsContext,
     pub cmdline: Vec<String>,
     pub pgid: usize,
     pub exit_signal: u32,
@@ -416,10 +484,7 @@ pub struct ProcessControlBlockInner {
     pub membarrier_private_expedited_registered: bool,
     pub signal_actions: [SignalAction; SIGNAL_INFO_SLOTS],
     pub cpu_times: ProcessCpuTimes,
-    pub(crate) real_timer: ProcessRealTimer,
-    pub(crate) virtual_timer: ProcessRealTimer,
-    pub(crate) prof_timer: ProcessRealTimer,
-    pub(crate) posix_timers: Vec<Option<ProcessPosixTimer>>,
+    pub(crate) timers: ProcessTimers,
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     pub task_res_allocator: RecycleAllocator,
 }
@@ -498,7 +563,11 @@ impl ProcessControlBlockInner {
     }
 
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
-        self.tasks[tid].as_ref().unwrap().clone()
+        self.tasks
+            .get(tid)
+            .and_then(|task| task.as_ref())
+            .expect("task slot must exist while referenced by process lifecycle code")
+            .clone()
     }
 }
 
@@ -510,42 +579,33 @@ impl ProcessControlBlock {
     pub(crate) fn path_snapshot(&self) -> PathSnapshot {
         let inner = self.inner.exclusive_access();
         PathSnapshot {
-            context: PathContext::new_in_namespace(
-                inner.root,
-                inner.cwd,
-                inner.mount_namespace_id,
-                inner.root_path.clone(),
-                inner.cwd_path.clone(),
-            ),
-            cwd_path: inner.cwd_path.clone(),
-            root_path: inner.root_path.clone(),
+            context: inner.fs.path_context(),
+            cwd_path: inner.fs.cwd_path.clone(),
+            root_path: inner.fs.root_path.clone(),
         }
     }
 
     pub(crate) fn mount_namespace_id(&self) -> MountNamespaceId {
-        self.inner_exclusive_access().mount_namespace_id
+        self.inner_exclusive_access().fs.mount_namespace_id
     }
 
     pub(crate) fn set_mount_namespace_id(&self, mount_namespace_id: MountNamespaceId) {
-        self.inner_exclusive_access().mount_namespace_id = mount_namespace_id;
+        self.inner_exclusive_access().fs.mount_namespace_id = mount_namespace_id;
     }
 
     pub fn set_working_dir(&self, cwd: WorkingDir, cwd_path: String) {
         let mut inner = self.inner.exclusive_access();
-        inner.cwd = cwd;
-        inner.cwd_path = cwd_path;
+        inner.fs.set_working_dir(cwd, cwd_path);
     }
 
     pub fn set_root_dir(&self, root: WorkingDir, root_path: String) {
         let mut inner = self.inner.exclusive_access();
-        inner.root = root;
-        inner.root_path = root_path;
+        inner.fs.set_root_dir(root, root_path);
     }
 
     pub(crate) fn references_vfs_mount(&self, mount_id: crate::fs::MountId) -> bool {
         let inner = self.inner.exclusive_access();
-        inner.root.mount_id() == mount_id
-            || inner.cwd.mount_id() == mount_id
+        inner.fs.references_mount(mount_id)
             || inner
                 .fd_table
                 .iter()
@@ -643,7 +703,7 @@ impl ProcessControlBlock {
             cpu_times: inner.cpu_times.snapshot(),
             credentials: inner.credentials.clone(),
             thread_count: inner.thread_count(),
-            mount_namespace_id: inner.mount_namespace_id,
+            mount_namespace_id: inner.fs.mount_namespace_id,
             locked_kb: inner.memory_set.locked_bytes() / 1024,
         }
     }
@@ -761,9 +821,9 @@ impl ProcessControlBlock {
         now_us: usize,
     ) -> Option<(Arc<TaskControlBlock>, Option<(usize, u64)>)> {
         let mut inner = self.inner_exclusive_access();
-        if inner.real_timer.generation != generation
-            || !inner.real_timer.is_armed()
-            || inner.real_timer.next_expire_us > now_us
+        if inner.timers.real.generation != generation
+            || !inner.timers.real.is_armed()
+            || inner.timers.real.next_expire_us > now_us
         {
             return None;
         }
@@ -771,12 +831,12 @@ impl ProcessControlBlock {
             .tasks
             .first()
             .and_then(|task| task.as_ref().cloned())?;
-        let next_timer = if inner.real_timer.interval_us == 0 {
-            inner.real_timer.next_expire_us = 0;
+        let next_timer = if inner.timers.real.interval_us == 0 {
+            inner.timers.real.next_expire_us = 0;
             None
         } else {
-            let next_expire_us = now_us.saturating_add(inner.real_timer.interval_us);
-            inner.real_timer.next_expire_us = next_expire_us;
+            let next_expire_us = now_us.saturating_add(inner.timers.real.interval_us);
+            inner.timers.real.next_expire_us = next_expire_us;
             Some((next_expire_us, generation))
         };
         Some((task, next_timer))
@@ -785,7 +845,8 @@ impl ProcessControlBlock {
     pub(crate) fn create_posix_timer(&self, clock_id: i32, signal: u32) -> usize {
         let mut inner = self.inner_exclusive_access();
         if let Some((idx, slot)) = inner
-            .posix_timers
+            .timers
+            .posix
             .iter_mut()
             .enumerate()
             .find(|(_, slot)| slot.is_none())
@@ -794,15 +855,16 @@ impl ProcessControlBlock {
             idx
         } else {
             inner
-                .posix_timers
+                .timers
+                .posix
                 .push(Some(ProcessPosixTimer::new(clock_id, signal)));
-            inner.posix_timers.len() - 1
+            inner.timers.posix.len() - 1
         }
     }
 
     pub(crate) fn posix_timer_clock(&self, timer_id: usize) -> Option<i32> {
         let inner = self.inner_exclusive_access();
-        Some(inner.posix_timers.get(timer_id)?.as_ref()?.clock_id)
+        Some(inner.timers.posix.get(timer_id)?.as_ref()?.clock_id)
     }
 
     pub(crate) fn set_posix_timer(
@@ -813,7 +875,7 @@ impl ProcessControlBlock {
         now_us: usize,
     ) -> Option<(usize, usize, u64)> {
         let mut inner = self.inner_exclusive_access();
-        let timer = inner.posix_timers.get_mut(timer_id)?.as_mut()?;
+        let timer = inner.timers.posix.get_mut(timer_id)?.as_mut()?;
         let old_interval_us = timer.interval_us;
         let old_remaining_us = timer.remaining_us(now_us);
         timer.generation = timer.generation.wrapping_add(1);
@@ -828,13 +890,13 @@ impl ProcessControlBlock {
         now_us: usize,
     ) -> Option<(usize, usize)> {
         let inner = self.inner_exclusive_access();
-        let timer = inner.posix_timers.get(timer_id)?.as_ref()?;
+        let timer = inner.timers.posix.get(timer_id)?.as_ref()?;
         Some((timer.interval_us, timer.remaining_us(now_us)))
     }
 
     pub(crate) fn delete_posix_timer(&self, timer_id: usize) -> Option<()> {
         let mut inner = self.inner_exclusive_access();
-        let slot = inner.posix_timers.get_mut(timer_id)?;
+        let slot = inner.timers.posix.get_mut(timer_id)?;
         slot.take()?;
         Some(())
     }
@@ -846,7 +908,7 @@ impl ProcessControlBlock {
         now_us: usize,
     ) -> Option<(Arc<TaskControlBlock>, u32, Option<(usize, u64)>)> {
         let mut inner = self.inner_exclusive_access();
-        let timer = inner.posix_timers.get_mut(timer_id)?.as_mut()?;
+        let timer = inner.timers.posix.get_mut(timer_id)?.as_mut()?;
         if timer.generation != generation || !timer.is_armed() || timer.next_expire_us > now_us {
             return None;
         }

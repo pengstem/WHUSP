@@ -461,9 +461,9 @@ pub fn sys_getitimer(which: i32, value: *mut u8) -> SysResult {
     let current = {
         let inner = process.inner_exclusive_access();
         let timer = match kind {
-            ItimerKind::Real => &inner.real_timer,
-            ItimerKind::Virtual => &inner.virtual_timer,
-            ItimerKind::Prof => &inner.prof_timer,
+            ItimerKind::Real => &inner.timers.real,
+            ItimerKind::Virtual => &inner.timers.virtual_timer,
+            ItimerKind::Prof => &inner.timers.prof,
         };
         itimerval_from_us(timer.interval_us, timer.remaining_us(now_us))
     };
@@ -497,9 +497,9 @@ pub fn sys_setitimer(which: i32, value: *const u8, old_value: *mut u8) -> SysRes
     let old = {
         let inner = process.inner_exclusive_access();
         let timer = match kind {
-            ItimerKind::Real => &inner.real_timer,
-            ItimerKind::Virtual => &inner.virtual_timer,
-            ItimerKind::Prof => &inner.prof_timer,
+            ItimerKind::Real => &inner.timers.real,
+            ItimerKind::Virtual => &inner.timers.virtual_timer,
+            ItimerKind::Prof => &inner.timers.prof,
         };
         itimerval_from_us(timer.interval_us, timer.remaining_us(now_us))
     };
@@ -509,9 +509,9 @@ pub fn sys_setitimer(which: i32, value: *const u8, old_value: *mut u8) -> SysRes
     let event = {
         let mut inner = process.inner_exclusive_access();
         let timer = match kind {
-            ItimerKind::Real => &mut inner.real_timer,
-            ItimerKind::Virtual => &mut inner.virtual_timer,
-            ItimerKind::Prof => &mut inner.prof_timer,
+            ItimerKind::Real => &mut inner.timers.real,
+            ItimerKind::Virtual => &mut inner.timers.virtual_timer,
+            ItimerKind::Prof => &mut inner.timers.prof,
         };
         timer.generation = timer.generation.wrapping_add(1);
         timer.interval_us = interval_us;
@@ -647,7 +647,7 @@ fn sleep_until_ms(expire_ms: usize) -> SysResult {
     if current_has_deliverable_signal() {
         return Err(SysError::EINTR);
     }
-    let task = current_task().unwrap();
+    let task = current_task().expect("sleep syscall must run with a current task");
     add_timer(expire_ms, task);
     block_current_and_run_next();
     if get_time_ms() < expire_ms && current_has_deliverable_signal() {

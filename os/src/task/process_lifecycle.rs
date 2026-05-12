@@ -2,16 +2,14 @@ use super::exec::{ExecStackInfo, init_user_stack};
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
 use super::process::{
-    Credentials, ProcessControlBlock, ProcessControlBlockInner, ProcessCpuTimes,
-    ProcessResourceLimits,
+    Credentials, ProcessControlBlock, ProcessControlBlockInner, ProcessCpuTimes, ProcessFsContext,
+    ProcessResourceLimits, ProcessTimers,
 };
 use super::{
     CloneArgs, CloneFlags, FdTableEntry, SIGCHLD, SignalAction, TaskControlBlock, add_task,
     pid_alloc,
 };
-use crate::fs::{
-    OpenFlags, ROOT_MOUNT_NAMESPACE, Stdin, Stdout, WorkingDir, track_regular_file_executable,
-};
+use crate::fs::{OpenFlags, Stdin, Stdout, track_regular_file_executable};
 use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet};
 use crate::sync::UPIntrFreeCell;
 use crate::trap::{TrapContext, trap_handler};
@@ -21,8 +19,17 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 impl ProcessControlBlock {
+    /// Attaches a newly created task to this process and returns the user token.
+    ///
+    /// The task must already own `TaskUserRes`; the returned token is used to
+    /// finish clone-time user writes after the task is visible to the process.
     pub fn attach_task(&self, task: Arc<TaskControlBlock>) -> usize {
-        let tid = task.inner_exclusive_access().res.as_ref().unwrap().tid;
+        let tid = task
+            .inner_exclusive_access()
+            .res
+            .as_ref()
+            .expect("attached user task must carry TaskUserRes")
+            .tid;
         let mut inner = self.inner_exclusive_access();
         while inner.tasks.len() < tid + 1 {
             inner.tasks.push(None);
@@ -31,9 +38,15 @@ impl ProcessControlBlock {
         inner.memory_set.token()
     }
 
+    /// Configures the cloned main task after fork-style process creation.
+    ///
+    /// This updates only the child-visible trap registers and clear-child-tid
+    /// state; parent resources have already been copied by `fork`.
     pub fn configure_cloned_main_task(&self, args: CloneArgs) -> usize {
         let inner = self.inner_exclusive_access();
-        let task = inner.tasks[0].as_ref().unwrap();
+        let task = inner.tasks[0]
+            .as_ref()
+            .expect("new process must have a main task before clone setup");
         let mut task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         trap_cx.set_a0(0);
@@ -60,7 +73,7 @@ impl ProcessControlBlock {
             phnum,
             interp_base,
         } = {
-            let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
+            let elf = xmas_elf::ElfFile::new(elf_data).expect("init ELF image must be valid");
             MemorySet::from_elf(&elf, None)
         };
         let pid_handle = pid_alloc();
@@ -72,11 +85,7 @@ impl ProcessControlBlock {
                     is_zombie: false,
                     memory_set,
                     executable_node: None,
-                    root: WorkingDir::root(),
-                    root_path: "/".into(),
-                    cwd: WorkingDir::root(),
-                    cwd_path: "/".into(),
-                    mount_namespace_id: ROOT_MOUNT_NAMESPACE,
+                    fs: ProcessFsContext::root(),
                     cmdline: args.clone(),
                     pgid: pid,
                     exit_signal: SIGCHLD,
@@ -105,10 +114,7 @@ impl ProcessControlBlock {
                     membarrier_private_expedited_registered: false,
                     signal_actions: [SignalAction::default(); super::SIGNAL_INFO_SLOTS],
                     cpu_times: ProcessCpuTimes::default(),
-                    real_timer: Default::default(),
-                    virtual_timer: Default::default(),
-                    prof_timer: Default::default(),
-                    posix_timers: Vec::new(),
+                    timers: ProcessTimers::default(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                 })
@@ -123,7 +129,11 @@ impl ProcessControlBlock {
         let process_token = process.inner_exclusive_access().memory_set.token();
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
-        let user_sp = task_inner.res.as_ref().unwrap().ustack_top();
+        let user_sp = task_inner
+            .res
+            .as_ref()
+            .expect("new init task must have TaskUserRes")
+            .ustack_top();
         let kstack_top = task.kstack.get_top();
         let stack_info = ExecStackInfo {
             at_entry: program_entry,
@@ -155,7 +165,10 @@ impl ProcessControlBlock {
         process
     }
 
-    /// Only support processes with a single thread.
+    /// Forks a single-threaded process and installs the child in PID lookup.
+    ///
+    /// The parent process lock is released before creating the child task so
+    /// task construction and scheduler insertion cannot re-enter the parent.
     pub fn fork(
         self: &Arc<Self>,
         child_parent: Arc<Self>,
@@ -163,7 +176,11 @@ impl ProcessControlBlock {
         exit_signal: u32,
     ) -> Option<Arc<Self>> {
         let mut parent = self.inner_exclusive_access();
-        assert_eq!(parent.thread_count(), 1);
+        assert_eq!(
+            parent.thread_count(),
+            1,
+            "fork currently requires a single-threaded parent"
+        );
         let memory_set = MemorySet::from_existed_user(&mut parent.memory_set)?;
         let pid = pid_alloc();
         let new_fd_table = parent.fd_table.clone();
@@ -173,17 +190,18 @@ impl ProcessControlBlock {
         let session_keyring = parent.session_keyring;
         let membarrier_private_expedited_registered =
             parent.membarrier_private_expedited_registered;
-        let root = parent.root;
-        let root_path = parent.root_path.clone();
-        let cwd = parent.cwd;
-        let cwd_path = parent.cwd_path.clone();
+        let fs = parent.fs.forked(mount_namespace_id);
         let executable_node = parent.executable_node;
         let cmdline = parent.cmdline.clone();
         let pgid = parent.pgid;
         let signal_actions = parent.signal_actions;
         let parent_task = parent.get_task(0);
         let parent_task_inner = parent_task.inner_exclusive_access();
-        let ustack_base = parent_task_inner.res.as_ref().unwrap().ustack_base();
+        let ustack_base = parent_task_inner
+            .res
+            .as_ref()
+            .expect("fork parent main task must have TaskUserRes")
+            .ustack_base();
         let parent_signal_mask = parent_task_inner.signal_mask;
         let parent_sigaltstack = parent_task_inner.sigaltstack;
         let parent_sched_policy = parent_task_inner.sched_policy;
@@ -199,11 +217,7 @@ impl ProcessControlBlock {
                     is_zombie: false,
                     memory_set,
                     executable_node,
-                    root,
-                    root_path,
-                    cwd,
-                    cwd_path,
-                    mount_namespace_id,
+                    fs,
                     cmdline,
                     pgid,
                     exit_signal,
@@ -219,10 +233,7 @@ impl ProcessControlBlock {
                     membarrier_private_expedited_registered,
                     signal_actions,
                     cpu_times: ProcessCpuTimes::default(),
-                    real_timer: Default::default(),
-                    virtual_timer: Default::default(),
-                    prof_timer: Default::default(),
-                    posix_timers: Vec::new(),
+                    timers: ProcessTimers::default(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                 })

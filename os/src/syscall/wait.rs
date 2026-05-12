@@ -129,6 +129,10 @@ fn write_rusage(token: usize, rusage: *mut RUsage) {
     }
 }
 
+/// Waits for and reaps a matching child process using Linux wait4 status rules.
+///
+/// Reaping removes the child from both PID lookup and the parent's child list;
+/// `WNOHANG` observes the current state without blocking.
 pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsage) -> SysResult {
     if options < 0 || options & !(WNOHANG | WUNTRACED | WCONTINUED | WALL) != 0 {
         return Err(SysError::EINVAL);
@@ -196,6 +200,10 @@ pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsag
     }
 }
 
+/// Waits for child state changes and optionally leaves the zombie unreaped.
+///
+/// `WNOWAIT` fills `siginfo_t`/`rusage` without removing the child; all other
+/// successful zombie observations complete the same reap boundary as wait4.
 pub fn sys_waitid(
     idtype: i32,
     id: i32,
