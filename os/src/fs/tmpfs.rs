@@ -142,6 +142,15 @@ impl TmpfsInode {
                 .copy_from_slice(&data[src_start..src_start + copy_len]);
         }
     }
+
+    fn write_zero_range(&mut self, offset: u64, end: u64) {
+        if offset < self.data.len() as u64 {
+            let start = offset as usize;
+            let inline_end = end.min(self.data.len() as u64) as usize;
+            self.data[start..inline_end].fill(0);
+        }
+        self.remove_sparse_range(offset, end);
+    }
 }
 
 impl TmpFs {
@@ -612,6 +621,14 @@ impl FileSystemBackend for TmpFs {
         let Some(end) = offset.checked_add(buf.len() as u64) else {
             return 0;
         };
+        if buf.iter().all(|byte| *byte == 0) {
+            inode.write_zero_range(offset, end);
+            if end > inode.size {
+                inode.size = end;
+            }
+            inode.touch();
+            return buf.len();
+        }
         if end as usize <= TMPFS_INLINE_FILE_LIMIT {
             let start = offset as usize;
             let end = end as usize;

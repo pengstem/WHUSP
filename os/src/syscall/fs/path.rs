@@ -18,9 +18,9 @@ use crate::fs::{
     FsNodeKind, MountId, OpenFlags, PathContext, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT,
     S_IFREG, S_IFSOCK, WorkingDir, chown_in, create_node_in, link_file_in, link_open_file_in,
     lookup_dir_in, lookup_dir_with_stat_in, mkdir_in, mount_is_read_only, normalize_path_at_root,
-    open_devfs_child, open_devfs_misc_child, open_file_in, open_file_in_with_attrs,
-    open_static_path, open_tmpfile_in_with_attrs, path_inside_root, rename_in, rmdir_in,
-    symlink_in, truncate_in, unlink_file_in,
+    open_devfs_child, open_devfs_misc_child, open_devfs_pts_child, open_file_in,
+    open_file_in_with_attrs, open_static_path, open_tmpfile_in_with_attrs, path_inside_root,
+    rename_in, rmdir_in, symlink_in, truncate_in, unlink_file_in,
 };
 use crate::mm::UserBuffer;
 use crate::task::{
@@ -421,6 +421,8 @@ fn open_devfs_child_from_dirfd(
     }
     let child = if file.is_devfs_misc_dir() {
         open_devfs_misc_child(path, flags)?
+    } else if file.is_devfs_pts_dir() {
+        open_devfs_pts_child(path, flags)?
     } else {
         open_devfs_child(path, flags)?
     };
@@ -878,6 +880,7 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize
         }
         get_file_by_fd(dirfd as usize)?
     } else {
+        check_current_access_path_prefixes_from(&snapshot, dirfd, path.as_str())?;
         open_file_in(
             path_context_from(&snapshot, dirfd, path.as_str())?,
             path.as_str(),

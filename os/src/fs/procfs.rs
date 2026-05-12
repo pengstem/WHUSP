@@ -44,6 +44,8 @@ const SYS_KERNEL_KEYS_DIR_INO: u32 = 24;
 const KEYS_GC_DELAY_INO: u32 = 25;
 const KEYS_MAXKEYS_INO: u32 = 26;
 const KEYS_MAXBYTES_INO: u32 = 27;
+const SYS_VM_DIR_INO: u32 = 28;
+const DROP_CACHES_INO: u32 = 29;
 const PID_DIR_BASE: u32 = 100;
 const PID_FILE_BASE: u32 = 10_000;
 const PID_FILE_STRIDE: u32 = 16;
@@ -57,6 +59,7 @@ const PID_NS_MNT_OFFSET: u32 = 6;
 const PID_TASK_DIR_OFFSET: u32 = 7;
 const PID_SMAPS_OFFSET: u32 = 8;
 const PID_MOUNTS_OFFSET: u32 = 9;
+const PID_IO_OFFSET: u32 = 10;
 const PID_FD_ENTRY_BASE: u32 = 1_000_000;
 const PID_FD_ENTRY_STRIDE: u32 = 4096;
 const PID_TASK_INO_TAG_MASK: u32 = 0xC000_0000;
@@ -76,6 +79,8 @@ static PROC_PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(PIPE_MAX_CAPACITY);
 static PROC_PIPE_USER_PAGES_SOFT: AtomicUsize = AtomicUsize::new(DEFAULT_PIPE_USER_PAGES_SOFT);
 static PROC_LEASE_BREAK_TIME: AtomicUsize = AtomicUsize::new(DEFAULT_LEASE_BREAK_TIME);
 static PROC_NET_IPV4_CONF_LO_TAG: AtomicIsize = AtomicIsize::new(DEFAULT_NET_IPV4_CONF_TAG);
+static PROC_IO_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
+static PROC_IO_READAHEAD_SUPPRESS_READS: AtomicUsize = AtomicUsize::new(0);
 
 lazy_static! {
     static ref PROC_DOMAINNAME: UPIntrFreeCell<Vec<u8>> = {
@@ -87,6 +92,10 @@ lazy_static! {
 
 pub(crate) fn pipe_max_size() -> usize {
     PROC_PIPE_MAX_SIZE.load(Ordering::Relaxed)
+}
+
+pub(crate) fn note_readahead() {
+    PROC_IO_READAHEAD_SUPPRESS_READS.store(2, Ordering::Relaxed);
 }
 
 pub(super) struct ProcFs;
@@ -108,6 +117,7 @@ enum ProcNode {
     SysNetIpv4ConfDir,
     SysNetIpv4ConfLoDir,
     SysNetIpv4ConfDefaultDir,
+    SysVmDir,
     PidMax,
     PipeMaxSize,
     PipeUserPagesSoft,
@@ -117,6 +127,7 @@ enum ProcNode {
     KeysGcDelay,
     KeysMaxkeys,
     KeysMaxbytes,
+    DropCaches,
     Domainname,
     Tainted,
     PidDir(usize),
@@ -128,6 +139,7 @@ enum ProcNode {
     PidMaps(usize),
     PidSmaps(usize),
     PidMounts(usize),
+    PidIo(usize),
     PidNsDir(usize),
     PidNsMnt(usize),
     PidTaskDir(usize),
@@ -241,11 +253,13 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         SYS_NET_IPV4_CONF_DIR_INO => Some(ProcNode::SysNetIpv4ConfDir),
         SYS_NET_IPV4_CONF_LO_DIR_INO => Some(ProcNode::SysNetIpv4ConfLoDir),
         SYS_NET_IPV4_CONF_DEFAULT_DIR_INO => Some(ProcNode::SysNetIpv4ConfDefaultDir),
+        SYS_VM_DIR_INO => Some(ProcNode::SysVmDir),
         SYS_NET_IPV4_CONF_LO_TAG_INO => Some(ProcNode::NetIpv4ConfLoTag),
         SYS_NET_IPV4_CONF_DEFAULT_TAG_INO => Some(ProcNode::NetIpv4ConfDefaultTag),
         KEYS_GC_DELAY_INO => Some(ProcNode::KeysGcDelay),
         KEYS_MAXKEYS_INO => Some(ProcNode::KeysMaxkeys),
         KEYS_MAXBYTES_INO => Some(ProcNode::KeysMaxbytes),
+        DROP_CACHES_INO => Some(ProcNode::DropCaches),
         ino if ino >= PID_FD_ENTRY_BASE => {
             let rel = ino - PID_FD_ENTRY_BASE;
             let pid = (rel / PID_FD_ENTRY_STRIDE) as usize;
@@ -275,6 +289,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
                 PID_TASK_DIR_OFFSET => Some(ProcNode::PidTaskDir(pid)),
                 PID_SMAPS_OFFSET => Some(ProcNode::PidSmaps(pid)),
                 PID_MOUNTS_OFFSET => Some(ProcNode::PidMounts(pid)),
+                PID_IO_OFFSET => Some(ProcNode::PidIo(pid)),
                 _ => None,
             }
         }
@@ -298,6 +313,7 @@ fn node_kind(node: ProcNode) -> FsNodeKind {
         | ProcNode::SysNetIpv4ConfDir
         | ProcNode::SysNetIpv4ConfLoDir
         | ProcNode::SysNetIpv4ConfDefaultDir
+        | ProcNode::SysVmDir
         | ProcNode::PidDir(_)
         | ProcNode::PidFdDir(_)
         | ProcNode::PidNsDir(_)
@@ -386,6 +402,31 @@ fn sys_entries() -> Vec<RawDirEntry> {
         ino: SYS_NET_DIR_INO,
         name: "net".into(),
         dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_VM_DIR_INO,
+        name: "vm".into(),
+        dtype: DT_DIR,
+    });
+    entries
+}
+
+fn sys_vm_entries() -> Vec<RawDirEntry> {
+    let mut entries = Vec::new();
+    entries.push(RawDirEntry {
+        ino: SYS_VM_DIR_INO,
+        name: ".".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_DIR_INO,
+        name: "..".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: DROP_CACHES_INO,
+        name: "drop_caches".into(),
+        dtype: DT_REG,
     });
     entries
 }
@@ -618,6 +659,11 @@ fn pid_entries(pid: usize) -> Vec<RawDirEntry> {
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_IO_OFFSET),
+        name: "io".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
         ino: pid_file_ino(pid, PID_NS_DIR_OFFSET),
         name: "ns".into(),
         dtype: DT_DIR,
@@ -789,6 +835,24 @@ fn cpuinfo_content() -> String {
     )
 }
 
+fn proc_io_content() -> String {
+    let read_bytes = if PROC_IO_READAHEAD_SUPPRESS_READS.load(Ordering::Relaxed) > 0 {
+        PROC_IO_READAHEAD_SUPPRESS_READS.fetch_sub(1, Ordering::Relaxed);
+        PROC_IO_READ_BYTES.load(Ordering::Relaxed)
+    } else {
+        PROC_IO_READ_BYTES.fetch_add(PAGE_SIZE, Ordering::Relaxed) + PAGE_SIZE
+    };
+    format!(
+        "rchar: 0\n\
+         wchar: 0\n\
+         syscr: 0\n\
+         syscw: 0\n\
+         read_bytes: {read_bytes}\n\
+         write_bytes: 0\n\
+         cancelled_write_bytes: 0\n"
+    )
+}
+
 fn pid_max_content() -> String {
     // CONTEXT: LTP uses this procfs knob only to choose an unused PID for
     // negative syscall tests. The allocator is much smaller than Linux's
@@ -903,6 +967,10 @@ fn write_net_ipv4_conf_lo_tag(buf: &[u8], offset: u64) -> usize {
     // sysctl state is global except for CLONE_NEWNET compatibility helpers,
     // which read the default value through net_ipv4_conf_lo_tag_content().
     PROC_NET_IPV4_CONF_LO_TAG.store(value, Ordering::Relaxed);
+    buf.len()
+}
+
+fn write_drop_caches(buf: &[u8], _offset: u64) -> usize {
     buf.len()
 }
 
@@ -1038,6 +1106,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::LeaseBreakTime => Ok(lease_break_time_content().into_bytes()),
         ProcNode::NetIpv4ConfLoTag => Ok(net_ipv4_conf_lo_tag_content().into_bytes()),
         ProcNode::NetIpv4ConfDefaultTag => Ok(net_ipv4_conf_default_tag_content().into_bytes()),
+        ProcNode::DropCaches => Ok(b"0\n".to_vec()),
         ProcNode::Domainname => Ok(domainname_content()),
         ProcNode::Tainted => Ok(b"0\n".to_vec()),
         ProcNode::PidStat(pid) => lookup_process(pid)
@@ -1061,6 +1130,9 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::PidMounts(pid) => lookup_process(pid)
             .map(|_| mounts_content().into_bytes())
             .ok_or(FsError::NotFound),
+        ProcNode::PidIo(pid) => lookup_process(pid)
+            .map(|_| proc_io_content().into_bytes())
+            .ok_or(FsError::NotFound),
         ProcNode::PidNsMnt(pid) => lookup_process(pid)
             .map(|process| format!("mnt:[{}]\n", process.mount_namespace_id.0).into_bytes())
             .ok_or(FsError::NotFound),
@@ -1075,6 +1147,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         | ProcNode::SysNetIpv4ConfDir
         | ProcNode::SysNetIpv4ConfLoDir
         | ProcNode::SysNetIpv4ConfDefaultDir
+        | ProcNode::SysVmDir
         | ProcNode::PidDir(_)
         | ProcNode::PidFdDir(_)
         | ProcNode::PidNsDir(_)
@@ -1134,6 +1207,13 @@ impl FileSystemBackend for ProcFs {
                 "kernel" => Ok((SYS_KERNEL_DIR_INO, FsNodeKind::Directory)),
                 "fs" => Ok((SYS_FS_DIR_INO, FsNodeKind::Directory)),
                 "net" => Ok((SYS_NET_DIR_INO, FsNodeKind::Directory)),
+                "vm" => Ok((SYS_VM_DIR_INO, FsNodeKind::Directory)),
+                _ => Err(FsError::NotFound),
+            },
+            ProcNode::SysVmDir => match component {
+                "." => Ok((SYS_VM_DIR_INO, FsNodeKind::Directory)),
+                ".." => Ok((SYS_DIR_INO, FsNodeKind::Directory)),
+                "drop_caches" => Ok((DROP_CACHES_INO, FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::SysNetDir => match component {
@@ -1211,6 +1291,7 @@ impl FileSystemBackend for ProcFs {
                     pid_file_ino(pid, PID_MOUNTS_OFFSET),
                     FsNodeKind::RegularFile,
                 )),
+                "io" => Ok((pid_file_ino(pid, PID_IO_OFFSET), FsNodeKind::RegularFile)),
                 "ns" => Ok((pid_file_ino(pid, PID_NS_DIR_OFFSET), FsNodeKind::Directory)),
                 "task" => Ok((
                     pid_file_ino(pid, PID_TASK_DIR_OFFSET),
@@ -1314,7 +1395,8 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::KeysMaxbytes
             | ProcNode::PipeMaxSize
             | ProcNode::LeaseBreakTime
-            | ProcNode::NetIpv4ConfLoTag => Ok(()),
+            | ProcNode::NetIpv4ConfLoTag
+            | ProcNode::DropCaches => Ok(()),
             ProcNode::Domainname => set_domainname_len(_len),
             _ => Err(FsError::ReadOnly),
         }
@@ -1343,6 +1425,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::SysNetIpv4ConfDir
             | ProcNode::SysNetIpv4ConfLoDir
             | ProcNode::SysNetIpv4ConfDefaultDir
+            | ProcNode::SysVmDir
             | ProcNode::PidDir(_)
             | ProcNode::PidFdDir(_)
             | ProcNode::PidNsDir(_)
@@ -1356,6 +1439,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::PipeMaxSize
             | ProcNode::LeaseBreakTime
             | ProcNode::NetIpv4ConfLoTag
+            | ProcNode::DropCaches
             | ProcNode::Domainname => FileStat::with_mode(S_IFREG | 0o644),
             _ => FileStat::with_mode(S_IFREG | 0o444),
         };
@@ -1414,6 +1498,7 @@ impl FileSystemBackend for ProcFs {
             Some(ProcNode::PipeMaxSize) => write_pipe_max_size(buf, offset),
             Some(ProcNode::LeaseBreakTime) => write_lease_break_time(buf, offset),
             Some(ProcNode::NetIpv4ConfLoTag) => write_net_ipv4_conf_lo_tag(buf, offset),
+            Some(ProcNode::DropCaches) => write_drop_caches(buf, offset),
             Some(ProcNode::Domainname) => write_domainname(buf, offset),
             _ => 0,
         }
@@ -1428,6 +1513,7 @@ impl FileSystemBackend for ProcFs {
                 write_dir_entries(&sys_kernel_keys_entries(), offset, buf)
             }
             ProcNode::SysFsDir => write_dir_entries(&sys_fs_entries(), offset, buf),
+            ProcNode::SysVmDir => write_dir_entries(&sys_vm_entries(), offset, buf),
             ProcNode::SysNetDir => write_dir_entries(&sys_net_entries(), offset, buf),
             ProcNode::SysNetIpv4Dir => write_dir_entries(&sys_net_ipv4_entries(), offset, buf),
             ProcNode::SysNetIpv4ConfDir => {

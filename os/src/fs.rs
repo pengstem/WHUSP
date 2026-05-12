@@ -263,6 +263,9 @@ pub trait File: Send + Sync {
     fn is_devfs_misc_dir(&self) -> bool {
         false
     }
+    fn is_devfs_pts_dir(&self) -> bool {
+        false
+    }
     fn is_pipe(&self) -> bool {
         false
     }
@@ -291,10 +294,11 @@ pub fn list_apps() {
 }
 
 pub(crate) use devfs::{
-    attach_loop_device, detach_loop_device, devfs_loop_device_id, find_free_loop_device,
-    is_devfs_loop_control, loop_device_is_attached, loop_device_size,
-    open_child as open_devfs_child, open_misc_child as open_devfs_misc_child,
-    stat_child as stat_devfs_child, stat_misc_child as stat_devfs_misc_child,
+    attach_loop_device, detach_loop_device, devfs_loop_device_id, devfs_pty_lock_state,
+    devfs_pty_number, find_free_loop_device, is_devfs_loop_control, loop_device_is_attached,
+    loop_device_size, open_child as open_devfs_child, open_misc_child as open_devfs_misc_child,
+    open_pts_child as open_devfs_pts_child, set_devfs_pty_locked, stat_child as stat_devfs_child,
+    stat_misc_child as stat_devfs_misc_child, stat_pts_child as stat_devfs_pts_child,
 };
 pub use inode::OpenFlags;
 pub(crate) use inode::{
@@ -311,7 +315,7 @@ pub(crate) use mount::{
 pub(crate) use path::{PathContext, WorkingDir, normalize_path_at_root, path_inside_root};
 pub(crate) use pipe::default_pipe_capacity_for_current_process;
 pub use pipe::make_pipe;
-pub(crate) use procfs::pipe_max_size;
+pub(crate) use procfs::{note_readahead as procfs_note_readahead, pipe_max_size};
 pub(crate) use staticfs::{open_path as open_static_path, stat_path as stat_static_path};
 pub use stdio::{Stdin, Stdout};
 pub(crate) use vfs::VfsNodeId;

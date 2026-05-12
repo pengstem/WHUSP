@@ -107,6 +107,8 @@ fn ensure_fadvise_target(file: &(dyn File + Send + Sync)) -> SysResult<()> {
     }
 }
 
+const POSIX_FADV_WILLNEED: i32 = 3;
+
 fn fault_in_read_buffers(buffers: &[&'static mut [u8]]) {
     for slice in buffers {
         for index in 0..slice.len() {
@@ -237,6 +239,9 @@ pub fn sys_fadvise64(fd: usize, offset: i64, len: i64, advice: i32) -> SysResult
     // CONTEXT: The current VFS has no page-cache advice API. Linux accepts
     // valid POSIX_FADV_* hints as advisory, so the observable contest behavior
     // can be represented as a checked no-op for regular files.
+    if advice == POSIX_FADV_WILLNEED {
+        crate::fs::procfs_note_readahead();
+    }
     Ok(0)
 }
 
@@ -869,11 +874,11 @@ pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult 
     let token = current_user_token();
     let iovecs = read_user_iovecs(token, iov, iovcnt)?;
     let file = get_file_by_fd(fd)?;
-    if !file.readable() {
-        return Err(SysError::EBADF);
-    }
     if file.stat()?.mode & S_IFDIR == S_IFDIR {
         return Err(SysError::EISDIR);
+    }
+    if !file.readable() {
+        return Err(SysError::EBADF);
     }
     let total_len = iovecs.iter().try_fold(0usize, |total, iovec| {
         total.checked_add(iovec.len).ok_or(SysError::EINVAL)
@@ -919,6 +924,9 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> SysResult {
     let token = current_user_token();
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
+    if file.stat()?.mode & S_IFDIR == S_IFDIR {
+        return Err(SysError::EISDIR);
+    }
     if !file.readable() {
         return Err(SysError::EBADF);
     }
@@ -929,4 +937,19 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> SysResult {
     let read = file.read(UserBuffer::new(buffers));
     fanotify_notify_access(&file, read);
     Ok(read as isize)
+}
+
+pub fn sys_readahead(fd: usize, _offset: usize, _count: usize) -> SysResult {
+    let entry = get_fd_entry_by_fd(fd)?;
+    let file = entry.file();
+    if entry.status_flags().contains(OpenFlags::PATH) || !file.readable() {
+        return Err(SysError::EBADF);
+    }
+    match file.stat()?.mode & S_IFMT {
+        S_IFREG => {
+            crate::fs::procfs_note_readahead();
+            Ok(0)
+        }
+        _ => Err(SysError::EINVAL),
+    }
 }

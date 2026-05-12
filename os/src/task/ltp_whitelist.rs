@@ -112,6 +112,7 @@ pub(super) const LTP_CASE_WHITELIST: &[&str] = &[
     "pwritev201_64",
     "pwritev202",
     "pwritev202_64",
+    "pty02",
     "write01",
     "write02",
     "write03",

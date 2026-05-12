@@ -140,6 +140,7 @@ const SYSCALL_GETSOCKOPT: usize = 209;
 const SYSCALL_SHUTDOWN: usize = 210;
 const SYSCALL_SENDMSG: usize = 211;
 const SYSCALL_RECVMSG: usize = 212;
+const SYSCALL_READAHEAD: usize = 213;
 const SYSCALL_BRK: usize = 214;
 const SYSCALL_MUNMAP: usize = 215;
 const SYSCALL_ADD_KEY: usize = 217;
@@ -348,6 +349,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4],
             args[5],
         ),
+        SYSCALL_READAHEAD => sys_readahead(args[0], args[1], args[2]),
         SYSCALL_FADVISE64 => sys_fadvise64(args[0], args[1] as i64, args[2] as i64, args[3] as i32),
         SYSCALL_COPY_FILE_RANGE => sys_copy_file_range(
             args[0],

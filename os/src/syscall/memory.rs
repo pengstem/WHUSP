@@ -19,11 +19,13 @@ const MAP_ANONYMOUS: usize = 0x20;
 const MAP_DENYWRITE: usize = 0x0800;
 const MAP_EXECUTABLE: usize = 0x1000;
 const MAP_NORESERVE: usize = 0x4000;
+const MAP_POPULATE: usize = 0x8000;
 const MAP_STACK: usize = 0x20000;
 // CONTEXT: Linux keeps MAP_DENYWRITE/MAP_EXECUTABLE as ignored legacy flags,
 // and musl/glibc may pass MAP_NORESERVE or MAP_STACK as advisory flags. The
-// current VM has no reservation accounting or stack VMA metadata, so accepting
-// them as no-ops is enough for loader and pthread compatibility.
+// current VM has no reservation accounting, eager MAP_POPULATE prefaulting, or
+// stack VMA metadata, so accepting them as no-ops is enough for loader, pthread,
+// and LTP mmap compatibility.
 const MAP_SUPPORTED: usize = MAP_SHARED
     | MAP_PRIVATE
     | MAP_FIXED
@@ -31,6 +33,7 @@ const MAP_SUPPORTED: usize = MAP_SHARED
     | MAP_DENYWRITE
     | MAP_EXECUTABLE
     | MAP_NORESERVE
+    | MAP_POPULATE
     | MAP_STACK;
 const MAP_TYPE_MASK: usize = 0x03;
 const MS_ASYNC: i32 = 0x1;

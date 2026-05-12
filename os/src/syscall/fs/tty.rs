@@ -21,9 +21,40 @@ const TCGETS: usize = 0x5401;
 const TCSETS: usize = 0x5402;
 const TCSETSW: usize = 0x5403;
 const TCSETSF: usize = 0x5404;
+const TCGETA: usize = 0x5405;
+const TCSETA: usize = 0x5406;
+const TCSETAW: usize = 0x5407;
+const TCSETAF: usize = 0x5408;
+const TCSBRK: usize = 0x5409;
+const TCXONC: usize = 0x540a;
+const TCFLSH: usize = 0x540b;
+const TIOCSCTTY: usize = 0x540e;
 const TIOCGWINSZ: usize = 0x5413;
+const TIOCSWINSZ: usize = 0x5414;
 const FIONREAD: usize = 0x541b;
+const TIOCNOTTY: usize = 0x5422;
+const TIOCSETD: usize = 0x5423;
+const TIOCGETD: usize = 0x5424;
+const TCSBRKP: usize = 0x5425;
+const TIOCVHANGUP: usize = 0x5437;
+const TIOCGPTN: usize = 0x8004_5430;
+const TIOCSPTLCK: usize = 0x4004_5431;
+const TIOCGPTLCK: usize = 0x8004_5439;
+const VT_GETSTATE: usize = 0x5603;
+const VT_ACTIVATE: usize = 0x5606;
+const VT_DISALLOCATE: usize = 0x5608;
+const VT_RESIZE: usize = 0x5609;
+const VT_RESIZEX: usize = 0x560a;
 const RTC_RD_TIME: usize = 0x80247009;
+
+const N_TTY: i32 = 0;
+const TCOOFF: usize = 0;
+const TCOON: usize = 1;
+const TCIOFF: usize = 2;
+const TCION: usize = 3;
+const TCIFLUSH: usize = 0;
+const TCOFLUSH: usize = 1;
+const TCIOFLUSH: usize = 2;
 
 const BRKINT: u32 = 0x0002;
 const ICRNL: u32 = 0x0100;
@@ -71,12 +102,31 @@ struct LinuxTermios {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct LinuxTermio {
+    c_iflag: u16,
+    c_oflag: u16,
+    c_cflag: u16,
+    c_lflag: u16,
+    c_line: u8,
+    c_cc: [u8; 8],
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct LinuxWinsize {
     ws_row: u16,
     ws_col: u16,
     ws_xpixel: u16,
     ws_ypixel: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxVtStat {
+    v_active: u16,
+    v_signal: u16,
+    v_state: u16,
 }
 
 #[repr(C)]
@@ -162,6 +212,28 @@ impl ConsoleTtyState {
     }
 }
 
+fn termios_to_termio(termios: LinuxTermios) -> LinuxTermio {
+    let mut c_cc = [0u8; 8];
+    c_cc.copy_from_slice(&termios.c_cc[..8]);
+    LinuxTermio {
+        c_iflag: termios.c_iflag as u16,
+        c_oflag: termios.c_oflag as u16,
+        c_cflag: termios.c_cflag as u16,
+        c_lflag: termios.c_lflag as u16,
+        c_line: termios.c_line,
+        c_cc,
+    }
+}
+
+fn apply_termio(termios: &mut LinuxTermios, termio: LinuxTermio) {
+    termios.c_iflag = (termios.c_iflag & !0xffff) | termio.c_iflag as u32;
+    termios.c_oflag = (termios.c_oflag & !0xffff) | termio.c_oflag as u32;
+    termios.c_cflag = (termios.c_cflag & !0xffff) | termio.c_cflag as u32;
+    termios.c_lflag = (termios.c_lflag & !0xffff) | termio.c_lflag as u32;
+    termios.c_line = termio.c_line;
+    termios.c_cc[..8].copy_from_slice(&termio.c_cc);
+}
+
 lazy_static! {
     // CONTEXT: stdin/stdout/stderr all point at the same UART-backed console, so a single shared
     // tty state is sufficient until the kernel grows a real per-session tty layer.
@@ -195,6 +267,31 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
 
     if file.is_rtc() {
         return handle_rtc_ioctl(request, argp);
+    }
+
+    match request {
+        TIOCGPTN => {
+            let pty_number = crate::fs::devfs_pty_number(file.as_ref()).ok_or(SysError::ENOTTY)?;
+            let token = current_user_token();
+            write_user_value(token, argp as *mut u32, &pty_number)?;
+            return Ok(0);
+        }
+        TIOCSPTLCK => {
+            let token = current_user_token();
+            let locked = read_user_value(token, argp as *const i32)? != 0;
+            if !crate::fs::set_devfs_pty_locked(file.as_ref(), locked)? {
+                return Err(SysError::ENOTTY);
+            }
+            return Ok(0);
+        }
+        TIOCGPTLCK => {
+            let locked = crate::fs::devfs_pty_lock_state(file.as_ref()).ok_or(SysError::ENOTTY)?;
+            let locked = if locked { 1i32 } else { 0i32 };
+            let token = current_user_token();
+            write_user_value(token, argp as *mut i32, &locked)?;
+            return Ok(0);
+        }
+        _ => {}
     }
 
     if request == FIONREAD {
@@ -238,9 +335,66 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
             CONSOLE_TTY_STATE.exclusive_session(|state| state.termios = termios);
             Ok(0)
         }
+        TCGETA => {
+            let termio =
+                CONSOLE_TTY_STATE.exclusive_session(|state| termios_to_termio(state.termios));
+            write_user_value(token, argp as *mut LinuxTermio, &termio)?;
+            Ok(0)
+        }
+        TCSETA | TCSETAW | TCSETAF => {
+            let termio = read_user_value(token, argp as *const LinuxTermio)?;
+            CONSOLE_TTY_STATE.exclusive_session(|state| apply_termio(&mut state.termios, termio));
+            Ok(0)
+        }
         TIOCGWINSZ => {
             let winsize = CONSOLE_TTY_STATE.exclusive_session(|state| state.winsize);
             write_user_value(token, argp as *mut LinuxWinsize, &winsize)?;
+            Ok(0)
+        }
+        TIOCSWINSZ => {
+            let winsize = read_user_value(token, argp as *const LinuxWinsize)?;
+            CONSOLE_TTY_STATE.exclusive_session(|state| state.winsize = winsize);
+            Ok(0)
+        }
+        TCSBRK | TCSBRKP | TIOCSCTTY | TIOCNOTTY | TIOCVHANGUP => Ok(0),
+        TCXONC => match argp {
+            TCOOFF | TCOON | TCIOFF | TCION => Ok(0),
+            _ => Err(SysError::EINVAL),
+        },
+        TCFLSH => match argp {
+            TCIFLUSH | TCOFLUSH | TCIOFLUSH => Ok(0),
+            _ => Err(SysError::EINVAL),
+        },
+        TIOCGETD => {
+            let discipline = N_TTY;
+            write_user_value(token, argp as *mut i32, &discipline)?;
+            Ok(0)
+        }
+        TIOCSETD => {
+            let discipline = read_user_value(token, argp as *const i32)?;
+            match discipline {
+                N_TTY => Ok(0),
+                // CONTEXT: SLIP/SLCAN/PPP line disciplines create network
+                // devices on Linux, and HDLC has its own protocol buffering.
+                // This kernel has no tty line-discipline
+                // subsystem yet, so report EINVAL instead of pretending those
+                // protocol drivers exist.
+                _ => Err(SysError::EINVAL),
+            }
+        }
+        VT_GETSTATE => {
+            let stat = LinuxVtStat {
+                v_active: 1,
+                v_signal: 0,
+                v_state: 1 << 1,
+            };
+            write_user_value(token, argp as *mut LinuxVtStat, &stat)?;
+            Ok(0)
+        }
+        VT_ACTIVATE | VT_DISALLOCATE | VT_RESIZE | VT_RESIZEX => {
+            // CONTEXT: /dev/tty8 and /dev/tty9 are lightweight virtual-console
+            // compatibility nodes for LTP race tests. There is no framebuffer
+            // console allocation state to switch or free yet.
             Ok(0)
         }
         _ => Err(SysError::ENOTTY),

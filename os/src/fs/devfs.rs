@@ -6,22 +6,34 @@ use super::{
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
+use crate::task::{
+    TaskControlBlock, block_current_task_no_schedule, current_has_unmasked_signal, schedule,
+    wakeup_task,
+};
+use alloc::collections::VecDeque;
+use alloc::string::ToString;
 use alloc::sync::Arc;
-use alloc::vec;
+use alloc::{vec, vec::Vec};
 use lazy_static::lazy_static;
 
 const DEVFS_DEV: u64 = 0x646576;
 const LOOP_DEVICE_SIZE_FALLBACK: u64 = 300 * 1024 * 1024;
+const PTY_BUFFER_CAPACITY: usize = 8192;
+const PTY_TABLE_SIZE: usize = 64;
+const PTY_INO_BASE: u64 = 0x1000;
 
 lazy_static! {
     static ref LOOP0_BACKEND: UPIntrFreeCell<Option<Arc<dyn File + Send + Sync>>> =
         unsafe { UPIntrFreeCell::new(None) };
+    static ref PTY_TABLE: UPIntrFreeCell<PtyTable> =
+        unsafe { UPIntrFreeCell::new(PtyTable::new()) };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DevNode {
     Root,
     Misc,
+    Pts,
     Null,
     Zero,
     Full,
@@ -29,6 +41,9 @@ enum DevNode {
     Urandom,
     Tty,
     TtyS0,
+    Tty8,
+    Tty9,
+    PtMx,
     Rtc,
     LoopControl,
     Loop0,
@@ -39,22 +54,26 @@ impl DevNode {
         match self {
             Self::Root => 1,
             Self::Misc => 2,
-            Self::Null => 3,
-            Self::Zero => 4,
-            Self::Full => 5,
-            Self::Random => 6,
-            Self::Urandom => 7,
-            Self::Tty => 8,
-            Self::TtyS0 => 9,
-            Self::Rtc => 10,
-            Self::LoopControl => 11,
-            Self::Loop0 => 12,
+            Self::Pts => 3,
+            Self::Null => 4,
+            Self::Zero => 5,
+            Self::Full => 6,
+            Self::Random => 7,
+            Self::Urandom => 8,
+            Self::Tty => 9,
+            Self::TtyS0 => 10,
+            Self::Tty8 => 11,
+            Self::Tty9 => 12,
+            Self::PtMx => 13,
+            Self::Rtc => 14,
+            Self::LoopControl => 15,
+            Self::Loop0 => 16,
         }
     }
 
     fn rdev(self) -> u64 {
         match self {
-            Self::Root | Self::Misc => 0,
+            Self::Root | Self::Misc | Self::Pts => 0,
             Self::Null => linux_makedev(1, 3),
             Self::Zero => linux_makedev(1, 5),
             Self::Full => linux_makedev(1, 7),
@@ -62,6 +81,9 @@ impl DevNode {
             Self::Urandom => linux_makedev(1, 9),
             Self::Tty => linux_makedev(5, 0),
             Self::TtyS0 => linux_makedev(4, 64),
+            Self::Tty8 => linux_makedev(4, 8),
+            Self::Tty9 => linux_makedev(4, 9),
+            Self::PtMx => linux_makedev(5, 2),
             Self::Rtc => linux_makedev(253, 0),
             Self::LoopControl => linux_makedev(10, 237),
             Self::Loop0 => linux_makedev(7, 0),
@@ -69,7 +91,7 @@ impl DevNode {
     }
 
     fn is_tty(self) -> bool {
-        matches!(self, Self::Tty | Self::TtyS0)
+        matches!(self, Self::Tty | Self::TtyS0 | Self::Tty8 | Self::Tty9)
     }
 }
 
@@ -93,13 +115,228 @@ impl DevFsFile {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PtyEndpoint {
+    Master,
+    Slave,
+}
+
+struct PtyFile {
+    pair: Arc<UPIntrFreeCell<PtyPair>>,
+    endpoint: PtyEndpoint,
+    readable: bool,
+    writable: bool,
+    status_flags: StatusFlagsCell,
+}
+
+impl PtyFile {
+    fn new(
+        pair: Arc<UPIntrFreeCell<PtyPair>>,
+        endpoint: PtyEndpoint,
+        readable: bool,
+        writable: bool,
+        status_flags: OpenFlags,
+    ) -> Self {
+        Self {
+            pair,
+            endpoint,
+            readable,
+            writable,
+            status_flags: StatusFlagsCell::new(status_flags),
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.pair.exclusive_access().id
+    }
+
+    fn lock_state(&self) -> bool {
+        self.pair.exclusive_access().locked
+    }
+
+    fn set_locked(&self, locked: bool) {
+        self.pair.exclusive_access().locked = locked;
+    }
+}
+
+struct PtyBuffer {
+    data: VecDeque<u8>,
+    read_wait_queue: VecDeque<Arc<TaskControlBlock>>,
+    write_wait_queue: VecDeque<Arc<TaskControlBlock>>,
+}
+
+impl PtyBuffer {
+    fn new() -> Self {
+        Self {
+            data: VecDeque::new(),
+            read_wait_queue: VecDeque::new(),
+            write_wait_queue: VecDeque::new(),
+        }
+    }
+
+    fn available_read(&self) -> usize {
+        self.data.len()
+    }
+
+    fn available_write(&self) -> usize {
+        PTY_BUFFER_CAPACITY.saturating_sub(self.data.len())
+    }
+
+    fn read_byte(&mut self) -> u8 {
+        self.data.pop_front().unwrap_or(0)
+    }
+
+    fn write_byte(&mut self, byte: u8) {
+        if self.data.len() < PTY_BUFFER_CAPACITY {
+            self.data.push_back(byte);
+        }
+    }
+
+    fn sleep_reader(&mut self) -> *mut crate::task::TaskContext {
+        let (task, task_cx_ptr) = block_current_task_no_schedule();
+        self.read_wait_queue.push_back(task);
+        task_cx_ptr
+    }
+
+    fn sleep_writer(&mut self) -> *mut crate::task::TaskContext {
+        let (task, task_cx_ptr) = block_current_task_no_schedule();
+        self.write_wait_queue.push_back(task);
+        task_cx_ptr
+    }
+
+    fn wake_reader(&mut self) -> Option<Arc<TaskControlBlock>> {
+        self.read_wait_queue.pop_front()
+    }
+
+    fn wake_writer(&mut self) -> Option<Arc<TaskControlBlock>> {
+        self.write_wait_queue.pop_front()
+    }
+
+    fn wake_all_readers(&mut self) -> VecDeque<Arc<TaskControlBlock>> {
+        core::mem::take(&mut self.read_wait_queue)
+    }
+
+    fn wake_all_writers(&mut self) -> VecDeque<Arc<TaskControlBlock>> {
+        core::mem::take(&mut self.write_wait_queue)
+    }
+}
+
+struct PtyPair {
+    id: u32,
+    locked: bool,
+    master_open: usize,
+    slave_open: usize,
+    master_to_slave: PtyBuffer,
+    slave_to_master: PtyBuffer,
+}
+
+impl PtyPair {
+    fn new(id: usize) -> Self {
+        Self {
+            id: id as u32,
+            locked: true,
+            master_open: 1,
+            slave_open: 0,
+            master_to_slave: PtyBuffer::new(),
+            slave_to_master: PtyBuffer::new(),
+        }
+    }
+
+    fn input_buffer(&self, endpoint: PtyEndpoint) -> &PtyBuffer {
+        match endpoint {
+            PtyEndpoint::Master => &self.slave_to_master,
+            PtyEndpoint::Slave => &self.master_to_slave,
+        }
+    }
+
+    fn input_buffer_mut(&mut self, endpoint: PtyEndpoint) -> &mut PtyBuffer {
+        match endpoint {
+            PtyEndpoint::Master => &mut self.slave_to_master,
+            PtyEndpoint::Slave => &mut self.master_to_slave,
+        }
+    }
+
+    fn output_buffer(&self, endpoint: PtyEndpoint) -> &PtyBuffer {
+        match endpoint {
+            PtyEndpoint::Master => &self.master_to_slave,
+            PtyEndpoint::Slave => &self.slave_to_master,
+        }
+    }
+
+    fn output_buffer_mut(&mut self, endpoint: PtyEndpoint) -> &mut PtyBuffer {
+        match endpoint {
+            PtyEndpoint::Master => &mut self.master_to_slave,
+            PtyEndpoint::Slave => &mut self.slave_to_master,
+        }
+    }
+
+    fn peer_open(&self, endpoint: PtyEndpoint) -> bool {
+        match endpoint {
+            PtyEndpoint::Master => self.slave_open > 0,
+            PtyEndpoint::Slave => self.master_open > 0,
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.master_open == 0 && self.slave_open == 0
+    }
+}
+
+struct PtyTable {
+    slots: Vec<Option<Arc<UPIntrFreeCell<PtyPair>>>>,
+    next_hint: usize,
+}
+
+impl PtyTable {
+    fn new() -> Self {
+        Self {
+            slots: vec![None; PTY_TABLE_SIZE],
+            next_hint: 0,
+        }
+    }
+
+    fn allocate(&mut self) -> FsResult<Arc<UPIntrFreeCell<PtyPair>>> {
+        for offset in 0..PTY_TABLE_SIZE {
+            let id = (self.next_hint + offset) % PTY_TABLE_SIZE;
+            if self.slots[id].is_none() {
+                let pair = Arc::new(unsafe { UPIntrFreeCell::new(PtyPair::new(id)) });
+                self.slots[id] = Some(pair.clone());
+                self.next_hint = (id + 1) % PTY_TABLE_SIZE;
+                return Ok(pair);
+            }
+        }
+        Err(FsError::NoSpace)
+    }
+
+    fn get(&self, id: usize) -> Option<Arc<UPIntrFreeCell<PtyPair>>> {
+        self.slots.get(id).and_then(|slot| slot.clone())
+    }
+
+    fn active_ids(&self) -> Vec<usize> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(id, slot)| slot.as_ref().map(|_| id))
+            .collect()
+    }
+
+    fn remove_if_same(&mut self, id: usize, pair: &Arc<UPIntrFreeCell<PtyPair>>) {
+        if let Some(slot) = self.slots.get_mut(id)
+            && let Some(current) = slot
+            && Arc::ptr_eq(current, pair)
+        {
+            *slot = None;
+        }
+    }
+}
+
 struct DevDirEntry {
     node: DevNode,
     name: &'static [u8],
     dtype: u8,
 }
 
-const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 14] = [
+const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 18] = [
     DevDirEntry {
         node: DevNode::Root,
         name: b".",
@@ -144,6 +381,26 @@ const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 14] = [
         node: DevNode::TtyS0,
         name: b"ttyS0",
         dtype: DT_CHR,
+    },
+    DevDirEntry {
+        node: DevNode::Tty8,
+        name: b"tty8",
+        dtype: DT_CHR,
+    },
+    DevDirEntry {
+        node: DevNode::Tty9,
+        name: b"tty9",
+        dtype: DT_CHR,
+    },
+    DevDirEntry {
+        node: DevNode::PtMx,
+        name: b"ptmx",
+        dtype: DT_CHR,
+    },
+    DevDirEntry {
+        node: DevNode::Pts,
+        name: b"pts",
+        dtype: DT_DIR,
     },
     DevDirEntry {
         node: DevNode::Rtc,
@@ -202,6 +459,7 @@ fn lookup_absolute(path: &str) -> Option<DevNode> {
     match path {
         "/dev" | "/dev/" => Some(DevNode::Root),
         "/dev/misc" | "/dev/misc/" => Some(DevNode::Misc),
+        "/dev/pts" | "/dev/pts/" => Some(DevNode::Pts),
         "/dev/null" => Some(DevNode::Null),
         "/dev/zero" => Some(DevNode::Zero),
         "/dev/full" => Some(DevNode::Full),
@@ -209,6 +467,9 @@ fn lookup_absolute(path: &str) -> Option<DevNode> {
         "/dev/urandom" => Some(DevNode::Urandom),
         "/dev/tty" => Some(DevNode::Tty),
         "/dev/ttyS0" => Some(DevNode::TtyS0),
+        "/dev/tty8" => Some(DevNode::Tty8),
+        "/dev/tty9" => Some(DevNode::Tty9),
+        "/dev/ptmx" => Some(DevNode::PtMx),
         "/dev/rtc" | "/dev/rtc0" | "/dev/misc/rtc" => Some(DevNode::Rtc),
         "/dev/loop-control" => Some(DevNode::LoopControl),
         "/dev/loop0" => Some(DevNode::Loop0),
@@ -216,11 +477,24 @@ fn lookup_absolute(path: &str) -> Option<DevNode> {
     }
 }
 
+fn parse_pts_id(path: &str) -> Option<usize> {
+    if path.is_empty() || path.contains('/') {
+        return None;
+    }
+    let id = path.parse::<usize>().ok()?;
+    (id < PTY_TABLE_SIZE).then_some(id)
+}
+
+fn parse_absolute_pts_id(path: &str) -> Option<usize> {
+    parse_pts_id(path.strip_prefix("/dev/pts/")?)
+}
+
 fn lookup_child(parent: DevNode, path: &str) -> Option<DevNode> {
     match parent {
         DevNode::Root => match path {
             "." | ".." => Some(DevNode::Root),
             "misc" => Some(DevNode::Misc),
+            "pts" => Some(DevNode::Pts),
             "null" => Some(DevNode::Null),
             "zero" => Some(DevNode::Zero),
             "full" => Some(DevNode::Full),
@@ -228,6 +502,9 @@ fn lookup_child(parent: DevNode, path: &str) -> Option<DevNode> {
             "urandom" => Some(DevNode::Urandom),
             "tty" => Some(DevNode::Tty),
             "ttyS0" => Some(DevNode::TtyS0),
+            "tty8" => Some(DevNode::Tty8),
+            "tty9" => Some(DevNode::Tty9),
+            "ptmx" => Some(DevNode::PtMx),
             "rtc" | "rtc0" => Some(DevNode::Rtc),
             "loop-control" => Some(DevNode::LoopControl),
             "loop0" => Some(DevNode::Loop0),
@@ -239,15 +516,86 @@ fn lookup_child(parent: DevNode, path: &str) -> Option<DevNode> {
             "rtc" => Some(DevNode::Rtc),
             _ => None,
         },
+        DevNode::Pts => match path {
+            "." => Some(DevNode::Pts),
+            ".." => Some(DevNode::Root),
+            _ => None,
+        },
         _ => None,
     }
+}
+
+fn wake_task(task: Option<Arc<TaskControlBlock>>) {
+    if let Some(task) = task {
+        let _ = wakeup_task(task);
+    }
+}
+
+fn wake_tasks(tasks: VecDeque<Arc<TaskControlBlock>>) {
+    for task in tasks {
+        let _ = wakeup_task(task);
+    }
+}
+
+fn pty_wait_interrupted() -> bool {
+    // CONTEXT: File::read/write cannot return EINTR yet. Like pipes, a PTY
+    // wait must return to the trap path when an unmasked signal is pending.
+    current_has_unmasked_signal()
+}
+
+fn open_ptmx(flags: OpenFlags) -> FsResult<Arc<dyn File + Send + Sync>> {
+    if flags.contains(OpenFlags::DIRECTORY) {
+        return Err(FsError::NotDir);
+    }
+    let (readable, writable) = flags.read_write();
+    let pair = PTY_TABLE.exclusive_session(|table| table.allocate())?;
+    Ok(Arc::new(PtyFile::new(
+        pair,
+        PtyEndpoint::Master,
+        readable,
+        writable,
+        OpenFlags::file_status_flags(flags),
+    )))
+}
+
+fn open_pty_slave(id: usize, flags: OpenFlags) -> FsResult<Arc<dyn File + Send + Sync>> {
+    if flags.contains(OpenFlags::CREATE | OpenFlags::EXCL) {
+        return Err(FsError::AlreadyExists);
+    }
+    if flags.contains(OpenFlags::DIRECTORY) {
+        return Err(FsError::NotDir);
+    }
+    let pair = PTY_TABLE
+        .exclusive_session(|table| table.get(id))
+        .ok_or(FsError::NotFound)?;
+    {
+        let mut inner = pair.exclusive_access();
+        if inner.locked {
+            return Err(FsError::PermissionDenied);
+        }
+        if inner.master_open == 0 {
+            return Err(FsError::NoDeviceOrAddress);
+        }
+        inner.slave_open += 1;
+    }
+    let (readable, writable) = flags.read_write();
+    Ok(Arc::new(PtyFile::new(
+        pair,
+        PtyEndpoint::Slave,
+        readable,
+        writable,
+        OpenFlags::file_status_flags(flags),
+    )))
 }
 
 fn open_node(node: DevNode, flags: OpenFlags) -> FsResult<Arc<dyn File + Send + Sync>> {
     if flags.contains(OpenFlags::CREATE | OpenFlags::EXCL) {
         return Err(FsError::AlreadyExists);
     }
-    if matches!(node, DevNode::Root | DevNode::Misc) {
+    if node == DevNode::PtMx {
+        return open_ptmx(flags);
+    }
+    if matches!(node, DevNode::Root | DevNode::Misc | DevNode::Pts) {
         if !flags.can_open_directory() {
             return Err(FsError::IsDir);
         }
@@ -271,6 +619,9 @@ fn open_node(node: DevNode, flags: OpenFlags) -> FsResult<Arc<dyn File + Send + 
 }
 
 pub(crate) fn open(path: &str, flags: OpenFlags) -> FsResult<Option<Arc<dyn File + Send + Sync>>> {
+    if let Some(id) = parse_absolute_pts_id(path) {
+        return open_pty_slave(id, flags).map(Some);
+    }
     lookup_absolute(path)
         .map(|node| open_node(node, flags))
         .transpose()
@@ -280,6 +631,9 @@ pub(crate) fn open_child(
     path: &str,
     flags: OpenFlags,
 ) -> FsResult<Option<Arc<dyn File + Send + Sync>>> {
+    if let Some(rest) = path.strip_prefix("pts/") {
+        return open_pts_child(rest, flags);
+    }
     if path.contains('/') {
         return Ok(None);
     }
@@ -300,23 +654,51 @@ pub(crate) fn open_misc_child(
         .transpose()
 }
 
+pub(crate) fn open_pts_child(
+    path: &str,
+    flags: OpenFlags,
+) -> FsResult<Option<Arc<dyn File + Send + Sync>>> {
+    if path.contains('/') {
+        return Ok(None);
+    }
+    if let Some(node) = lookup_child(DevNode::Pts, path) {
+        return open_node(node, flags).map(Some);
+    }
+    let Some(id) = parse_pts_id(path) else {
+        return Ok(None);
+    };
+    open_pty_slave(id, flags).map(Some)
+}
+
 fn stat_node(node: DevNode) -> FileStat {
     let mode = match node {
-        DevNode::Root | DevNode::Misc => S_IFDIR | 0o755,
+        DevNode::Root | DevNode::Misc | DevNode::Pts => S_IFDIR | 0o755,
         DevNode::Loop0 => S_IFBLK | 0o666,
+        DevNode::PtMx => S_IFCHR | 0o666,
         _ => S_IFCHR | 0o666,
     };
     let mut stat = FileStat::with_mode(mode);
     stat.dev = DEVFS_DEV;
     stat.ino = node.ino();
     stat.rdev = node.rdev();
-    stat.nlink = if matches!(node, DevNode::Root | DevNode::Misc) {
+    stat.nlink = if matches!(node, DevNode::Root | DevNode::Misc | DevNode::Pts) {
         2
     } else {
         1
     };
     stat.blocks = 0;
     stat
+}
+
+fn stat_pty_slave(id: usize) -> Option<FileStat> {
+    PTY_TABLE.exclusive_session(|table| table.get(id))?;
+    let mut stat = FileStat::with_mode(S_IFCHR | 0o620);
+    stat.dev = DEVFS_DEV;
+    stat.ino = PTY_INO_BASE + id as u64;
+    stat.rdev = linux_makedev(136, id as u64);
+    stat.nlink = 1;
+    stat.blocks = 0;
+    Some(stat)
 }
 
 fn loop0_backend() -> FsResult<Arc<dyn File + Send + Sync>> {
@@ -469,10 +851,16 @@ pub(crate) fn loop_device_size(id: usize) -> FsResult<u64> {
 }
 
 pub(crate) fn stat(path: &str) -> Option<FileStat> {
+    if let Some(id) = parse_absolute_pts_id(path) {
+        return stat_pty_slave(id);
+    }
     Some(stat_node(lookup_absolute(path)?))
 }
 
 pub(crate) fn stat_child(path: &str) -> Option<FileStat> {
+    if let Some(rest) = path.strip_prefix("pts/") {
+        return stat_pts_child(rest);
+    }
     if path.contains('/') {
         return None;
     }
@@ -484,6 +872,16 @@ pub(crate) fn stat_misc_child(path: &str) -> Option<FileStat> {
         return None;
     }
     Some(stat_node(lookup_child(DevNode::Misc, path)?))
+}
+
+pub(crate) fn stat_pts_child(path: &str) -> Option<FileStat> {
+    if path.contains('/') {
+        return None;
+    }
+    if let Some(node) = lookup_child(DevNode::Pts, path) {
+        return Some(stat_node(node));
+    }
+    stat_pty_slave(parse_pts_id(path)?)
 }
 
 fn read_console(user_buf: UserBuffer) -> usize {
@@ -546,6 +944,113 @@ fn read_random(user_buf: UserBuffer) -> usize {
     len
 }
 
+fn read_pty(
+    pair: &Arc<UPIntrFreeCell<PtyPair>>,
+    endpoint: PtyEndpoint,
+    mut user_buf: UserBuffer,
+    flags: OpenFlags,
+) -> usize {
+    let want_to_read = user_buf.len();
+    if want_to_read == 0 {
+        return 0;
+    }
+    loop {
+        let mut inner = pair.exclusive_access();
+        let available = inner.input_buffer(endpoint).available_read();
+        if available == 0 {
+            if !inner.peer_open(endpoint) || flags.contains(OpenFlags::NONBLOCK) {
+                return 0;
+            }
+            if pty_wait_interrupted() {
+                return 0;
+            }
+            let task_cx_ptr = inner.input_buffer_mut(endpoint).sleep_reader();
+            drop(inner);
+            schedule(task_cx_ptr);
+            continue;
+        }
+
+        let read_len = available.min(want_to_read);
+        let mut copied = 0usize;
+        for buffer in user_buf.buffers.iter_mut() {
+            if copied == read_len {
+                break;
+            }
+            let len = buffer.len().min(read_len - copied);
+            for byte in &mut buffer[..len] {
+                *byte = inner.input_buffer_mut(endpoint).read_byte();
+            }
+            copied += len;
+        }
+        let writer = inner.input_buffer_mut(endpoint).wake_writer();
+        drop(inner);
+        wake_task(writer);
+        return copied;
+    }
+}
+
+fn write_pty(
+    pair: &Arc<UPIntrFreeCell<PtyPair>>,
+    endpoint: PtyEndpoint,
+    user_buf: UserBuffer,
+    flags: OpenFlags,
+) -> usize {
+    let want_to_write = user_buf.len();
+    if want_to_write == 0 {
+        return 0;
+    }
+    let mut already_written = 0usize;
+    loop {
+        let mut inner = pair.exclusive_access();
+        if !inner.peer_open(endpoint) {
+            return already_written;
+        }
+        let available = inner.output_buffer(endpoint).available_write();
+        if available == 0 {
+            if flags.contains(OpenFlags::NONBLOCK) {
+                return already_written;
+            }
+            if pty_wait_interrupted() {
+                return already_written;
+            }
+            let task_cx_ptr = inner.output_buffer_mut(endpoint).sleep_writer();
+            drop(inner);
+            schedule(task_cx_ptr);
+            continue;
+        }
+
+        let write_len = available.min(want_to_write - already_written);
+        let mut skipped = 0usize;
+        let mut written = 0usize;
+        for buffer in user_buf.buffers.iter() {
+            if skipped + buffer.len() <= already_written {
+                skipped += buffer.len();
+                continue;
+            }
+            let offset = already_written.saturating_sub(skipped);
+            for &byte in &buffer[offset..] {
+                if written == write_len {
+                    break;
+                }
+                inner.output_buffer_mut(endpoint).write_byte(byte);
+                written += 1;
+            }
+            if written == write_len {
+                break;
+            }
+            skipped += buffer.len();
+        }
+
+        already_written += written;
+        let reader = inner.output_buffer_mut(endpoint).wake_reader();
+        drop(inner);
+        wake_task(reader);
+        if already_written == want_to_write {
+            return already_written;
+        }
+    }
+}
+
 fn dir_entries(node: DevNode) -> Option<&'static [DevDirEntry]> {
     match node {
         DevNode::Root => Some(&ROOT_DEV_DIR_ENTRIES),
@@ -600,6 +1105,81 @@ fn copy_dirents(
     Ok(written as isize)
 }
 
+struct DynamicDirEntry {
+    ino: u64,
+    name: alloc::vec::Vec<u8>,
+    dtype: u8,
+}
+
+fn pts_dir_entries() -> alloc::vec::Vec<DynamicDirEntry> {
+    let ids = PTY_TABLE.exclusive_session(|table| table.active_ids());
+    let mut entries = alloc::vec::Vec::with_capacity(ids.len() + 2);
+    entries.push(DynamicDirEntry {
+        ino: DevNode::Pts.ino(),
+        name: b".".to_vec(),
+        dtype: DT_DIR,
+    });
+    entries.push(DynamicDirEntry {
+        ino: DevNode::Root.ino(),
+        name: b"..".to_vec(),
+        dtype: DT_DIR,
+    });
+    for id in ids {
+        entries.push(DynamicDirEntry {
+            ino: PTY_INO_BASE + id as u64,
+            name: id.to_string().into_bytes(),
+            dtype: DT_CHR,
+        });
+    }
+    entries
+}
+
+fn copy_dynamic_dirents(
+    entries: &[DynamicDirEntry],
+    entries_offset: &mut usize,
+    user_buf: UserBuffer,
+) -> FsResult<isize> {
+    let mut kernel_buf = vec![0u8; user_buf.len()];
+    let mut written = 0usize;
+
+    while *entries_offset < entries.len() {
+        let entry = &entries[*entries_offset];
+        let d_reclen = align_up(
+            LINUX_DIRENT64_HEADER_SIZE + entry.name.len() + 1,
+            LINUX_DIRENT64_ALIGN,
+        );
+        if d_reclen > kernel_buf.len().saturating_sub(written) {
+            if written == 0 {
+                return Err(FsError::InvalidInput);
+            }
+            break;
+        }
+
+        let next_offset = *entries_offset + 1;
+        let entry_buf = &mut kernel_buf[written..written + d_reclen];
+        entry_buf.fill(0);
+        entry_buf[0..8].copy_from_slice(&entry.ino.to_ne_bytes());
+        entry_buf[8..16].copy_from_slice(&(next_offset as i64).to_ne_bytes());
+        entry_buf[16..18].copy_from_slice(&(d_reclen as u16).to_ne_bytes());
+        entry_buf[18] = entry.dtype;
+        entry_buf[LINUX_DIRENT64_HEADER_SIZE..LINUX_DIRENT64_HEADER_SIZE + entry.name.len()]
+            .copy_from_slice(entry.name.as_slice());
+
+        written += d_reclen;
+        *entries_offset = next_offset;
+    }
+
+    if written == 0 {
+        return Ok(0);
+    }
+    for (idx, byte_ref) in user_buf.into_iter().take(written).enumerate() {
+        unsafe {
+            *byte_ref = kernel_buf[idx];
+        }
+    }
+    Ok(written as isize)
+}
+
 impl File for DevFsFile {
     fn as_any(&self) -> &dyn core::any::Any {
         self
@@ -615,23 +1195,33 @@ impl File for DevFsFile {
 
     fn read(&self, user_buf: UserBuffer) -> usize {
         match self.node {
-            DevNode::Root | DevNode::Misc | DevNode::Null | DevNode::Rtc | DevNode::LoopControl => {
-                0
-            }
+            DevNode::Root
+            | DevNode::Misc
+            | DevNode::Pts
+            | DevNode::Null
+            | DevNode::Rtc
+            | DevNode::PtMx
+            | DevNode::LoopControl => 0,
             DevNode::Zero | DevNode::Full => read_zero(user_buf),
             DevNode::Random | DevNode::Urandom => read_random(user_buf),
-            DevNode::Tty | DevNode::TtyS0 => read_console(user_buf),
+            DevNode::Tty | DevNode::TtyS0 | DevNode::Tty8 | DevNode::Tty9 => read_console(user_buf),
             DevNode::Loop0 => read_loop0(&self.offset, user_buf),
         }
     }
 
     fn write(&self, user_buf: UserBuffer) -> usize {
         match self.node {
-            DevNode::Root | DevNode::Misc | DevNode::Rtc | DevNode::Full | DevNode::LoopControl => {
-                0
-            }
+            DevNode::Root
+            | DevNode::Misc
+            | DevNode::Pts
+            | DevNode::Rtc
+            | DevNode::Full
+            | DevNode::PtMx
+            | DevNode::LoopControl => 0,
             DevNode::Null | DevNode::Zero | DevNode::Random | DevNode::Urandom => user_buf.len(),
-            DevNode::Tty | DevNode::TtyS0 => write_console(user_buf),
+            DevNode::Tty | DevNode::TtyS0 | DevNode::Tty8 | DevNode::Tty9 => {
+                write_console(user_buf)
+            }
             DevNode::Loop0 => write_loop0(&self.offset, user_buf),
         }
     }
@@ -662,7 +1252,7 @@ impl File for DevFsFile {
 
     fn poll(&self, events: PollEvents) -> PollEvents {
         match self.node {
-            DevNode::Tty | DevNode::TtyS0 => {
+            DevNode::Tty | DevNode::TtyS0 | DevNode::Tty8 | DevNode::Tty9 => {
                 let mut ready = PollEvents::empty();
                 if events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI) && UART.has_input() {
                     ready |= PollEvents::POLLIN;
@@ -698,8 +1288,12 @@ impl File for DevFsFile {
     }
 
     fn read_dirent64(&self, user_buf: UserBuffer) -> FsResult<isize> {
-        let entries = dir_entries(self.node).ok_or(FsError::NotDir)?;
         let mut offset = self.offset.exclusive_access();
+        if self.node == DevNode::Pts {
+            let entries = pts_dir_entries();
+            return copy_dynamic_dirents(entries.as_slice(), &mut *offset, user_buf);
+        }
+        let entries = dir_entries(self.node).ok_or(FsError::NotDir)?;
         copy_dirents(entries, &mut *offset, user_buf)
     }
 
@@ -712,14 +1306,151 @@ impl File for DevFsFile {
     }
 
     fn is_devfs_dir(&self) -> bool {
-        matches!(self.node, DevNode::Root | DevNode::Misc)
+        matches!(self.node, DevNode::Root | DevNode::Misc | DevNode::Pts)
     }
 
     fn is_devfs_misc_dir(&self) -> bool {
         self.node == DevNode::Misc
     }
 
+    fn is_devfs_pts_dir(&self) -> bool {
+        self.node == DevNode::Pts
+    }
+
     fn is_dev_full(&self) -> bool {
         self.node == DevNode::Full
     }
+}
+
+impl Drop for PtyFile {
+    fn drop(&mut self) {
+        let (readers, writers, remove) = {
+            let mut pair = self.pair.exclusive_access();
+            match self.endpoint {
+                PtyEndpoint::Master => {
+                    pair.master_open = pair.master_open.saturating_sub(1);
+                    let readers = pair.master_to_slave.wake_all_readers();
+                    let writers = pair.slave_to_master.wake_all_writers();
+                    (readers, writers, pair.is_closed())
+                }
+                PtyEndpoint::Slave => {
+                    pair.slave_open = pair.slave_open.saturating_sub(1);
+                    let readers = pair.slave_to_master.wake_all_readers();
+                    let writers = pair.master_to_slave.wake_all_writers();
+                    (readers, writers, pair.is_closed())
+                }
+            }
+        };
+        wake_tasks(readers);
+        wake_tasks(writers);
+        if remove {
+            let id = self.id() as usize;
+            PTY_TABLE.exclusive_session(|table| table.remove_if_same(id, &self.pair));
+        }
+    }
+}
+
+impl File for PtyFile {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn readable(&self) -> bool {
+        self.readable
+    }
+
+    fn writable(&self) -> bool {
+        self.writable
+    }
+
+    fn read(&self, user_buf: UserBuffer) -> usize {
+        read_pty(&self.pair, self.endpoint, user_buf, self.status_flags.get())
+    }
+
+    fn write(&self, user_buf: UserBuffer) -> usize {
+        write_pty(&self.pair, self.endpoint, user_buf, self.status_flags.get())
+    }
+
+    fn poll(&self, events: PollEvents) -> PollEvents {
+        let pair = self.pair.exclusive_access();
+        let mut ready = PollEvents::empty();
+        if self.readable {
+            let has_data = pair.input_buffer(self.endpoint).available_read() > 0;
+            let hangup = !pair.peer_open(self.endpoint);
+            if events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI) && (has_data || hangup) {
+                ready |= PollEvents::POLLIN;
+            }
+            if hangup {
+                ready |= PollEvents::POLLHUP;
+            }
+        }
+        if self.writable {
+            let can_write = pair.output_buffer(self.endpoint).available_write() > 0;
+            let peer_closed = !pair.peer_open(self.endpoint);
+            if events.contains(PollEvents::POLLOUT) && (can_write || peer_closed) {
+                ready |= PollEvents::POLLOUT;
+            }
+            if peer_closed {
+                ready |= PollEvents::POLLERR;
+            }
+        }
+        ready
+    }
+
+    fn stat(&self) -> FsResult<FileStat> {
+        Ok(match self.endpoint {
+            PtyEndpoint::Master => stat_node(DevNode::PtMx),
+            PtyEndpoint::Slave => stat_pty_slave(self.id() as usize).unwrap_or_else(|| {
+                let mut stat = FileStat::with_mode(S_IFCHR | 0o620);
+                stat.dev = DEVFS_DEV;
+                stat.ino = PTY_INO_BASE + self.id() as u64;
+                stat.rdev = linux_makedev(136, self.id() as u64);
+                stat
+            }),
+        })
+    }
+
+    fn status_flags(&self) -> OpenFlags {
+        self.status_flags.get()
+    }
+
+    fn set_status_flags(&self, flags: OpenFlags) {
+        self.status_flags.set(flags);
+    }
+
+    fn pipe_occupied(&self) -> Option<usize> {
+        Some(
+            self.pair
+                .exclusive_access()
+                .input_buffer(self.endpoint)
+                .available_read(),
+        )
+    }
+
+    fn is_tty(&self) -> bool {
+        true
+    }
+}
+
+pub(crate) fn devfs_pty_number(file: &(dyn File + Send + Sync)) -> Option<u32> {
+    file.as_any()
+        .downcast_ref::<PtyFile>()
+        .map(|file| file.id())
+}
+
+pub(crate) fn devfs_pty_lock_state(file: &(dyn File + Send + Sync)) -> Option<bool> {
+    file.as_any()
+        .downcast_ref::<PtyFile>()
+        .map(|file| file.lock_state())
+}
+
+pub(crate) fn set_devfs_pty_locked(
+    file: &(dyn File + Send + Sync),
+    locked: bool,
+) -> FsResult<bool> {
+    let Some(file) = file.as_any().downcast_ref::<PtyFile>() else {
+        return Ok(false);
+    };
+    file.set_locked(locked);
+    Ok(true)
 }

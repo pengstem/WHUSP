@@ -660,6 +660,12 @@ pub fn sys_mount(
             mount_cgroup2_at(namespace_id, target_dir, target_path.as_str(), read_only)
                 .map_err(mount_error_to_errno)?;
         }
+        "overlay" => {
+            // CONTEXT: overlayfs is not implemented. Returning ENODEV lets LTP
+            // classify overlay-specific branches as unsupported instead of
+            // mistaking a tmpfs fallback for a real overlay mount.
+            return Err(SysError::ENODEV);
+        }
         _ => {
             mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
                 .map_err(mount_error_to_errno)?;
