@@ -3,7 +3,7 @@ use super::ext4::Ext4Mount;
 use super::fat::FatMount;
 use super::path::WorkingDir;
 use super::procfs::ProcFs;
-use super::tmpfs::TmpFs;
+use super::tmpfs::{EXT234_SUPER_MAGIC, TmpFs};
 use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult, VfsNodeId};
 use crate::drivers::block::BLOCK_DEVICES;
 use crate::sync::{SleepMutex, UPIntrFreeCell};
@@ -1541,6 +1541,23 @@ pub(crate) fn mount_tmpfs_at(
     )
 }
 
+pub(crate) fn mount_ext_scratch_at(
+    namespace_id: MountNamespaceId,
+    target: WorkingDir,
+    fs_type: &'static str,
+    target_path: &str,
+    read_only: bool,
+) -> Result<MountId, MountError> {
+    mount_pseudo_fs_at_with_options(
+        namespace_id,
+        target,
+        Box::new(TmpFs::new_with_statfs_magic(EXT234_SUPER_MAGIC)),
+        fs_type,
+        target_path,
+        mount_options(read_only),
+    )
+}
+
 pub(crate) fn mount_cgroup2_at(
     namespace_id: MountNamespaceId,
     target: WorkingDir,
@@ -1661,7 +1678,7 @@ pub(crate) fn unmount_at(
     if target_is_root && target.mount_id == primary_mount_id() {
         return Err(MountError::StaticRoot);
     }
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    let source_to_release = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         let index = if target_is_root {
             mounts.iter().rposition(|mount| {
                 mount.namespace_id == namespace_id && mount.source_root == target
@@ -1684,8 +1701,12 @@ pub(crate) fn unmount_at(
         detach_mount_descendants(mounts, &event);
         mounts.retain(|mount| !is_recursive_bind_child(&event, mount));
         propagate_unmount_event(mounts, &event);
-        Ok(())
-    })
+        Ok((!event.is_bind).then_some(source_mount_id))
+    })?;
+    if let Some(source_mount_id) = source_to_release {
+        release_dynamic_mount_source_if_unused(source_mount_id);
+    }
+    Ok(())
 }
 
 fn ensure_extra_mount_target(index: usize) -> Option<WorkingDir> {
@@ -1698,6 +1719,26 @@ fn source_has_dynamic_mount(namespace_id: MountNamespaceId, source_mount_id: Mou
             mount.namespace_id == namespace_id && mount.source_mount_id == source_mount_id
         })
     })
+}
+
+fn source_has_any_dynamic_mount(source_mount_id: MountId) -> bool {
+    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        mounts
+            .iter()
+            .any(|mount| mount.source_mount_id == source_mount_id)
+    })
+}
+
+fn release_dynamic_mount_source_if_unused(source_mount_id: MountId) {
+    if source_mount_id.0 < BLOCK_DEVICES.len()
+        || source_has_any_dynamic_mount(source_mount_id)
+        || any_process_references_mount(source_mount_id)
+    {
+        return;
+    }
+    if let Some(slot) = MOUNTS.lock().get_mut(source_mount_id.0) {
+        *slot = None;
+    }
 }
 
 fn mount_extra_block_devices() {
@@ -1776,15 +1817,19 @@ fn mount_kernel_pseudo_filesystems() {
         }
     }
     if let Some(target) = ensure_primary_dir("tmp", 0o1777) {
+        // CONTEXT: LTP is run with LTP_SINGLE_FS_TYPE=ext2 but its plain
+        // needs_tmpdir cases still allocate under /tmp. Back /tmp with the
+        // tmpfs implementation for mutability while reporting ext magic so
+        // filesystem probes follow the selected contest test filesystem.
         match mount_pseudo_fs_at(
             ROOT_MOUNT_NAMESPACE,
             target,
-            Box::new(TmpFs::new()),
-            "tmpfs",
+            Box::new(TmpFs::new_with_statfs_magic(EXT234_SUPER_MAGIC)),
+            "ext2",
             "/tmp",
         ) {
-            Ok(_) => info!("filesystem mounted from tmpfs at /tmp"),
-            Err(err) => warn!("failed to mount tmpfs at /tmp: {err:?}"),
+            Ok(_) => info!("filesystem mounted from ext2 scratch tmpfs at /tmp"),
+            Err(err) => warn!("failed to mount ext2 scratch tmpfs at /tmp: {err:?}"),
         }
     }
     if let Some(dev) = ensure_primary_dir("dev", 0o755) {

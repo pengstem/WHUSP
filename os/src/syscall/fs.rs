@@ -2,6 +2,7 @@ mod epoll;
 mod eventfd;
 mod fanotify;
 mod fd;
+mod fd_compat;
 mod fd_lock;
 mod io;
 mod mount;
@@ -15,6 +16,10 @@ pub use epoll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait, sys_epoll_pwa
 pub use eventfd::sys_eventfd2;
 pub use fanotify::{sys_fanotify_init, sys_fanotify_mark};
 pub use fd::{sys_close, sys_dup, sys_dup3, sys_fcntl, sys_flock, sys_memfd_create, sys_pipe2};
+pub use fd_compat::{
+    sys_bpf, sys_inotify_init1, sys_io_uring_setup, sys_perf_event_open, sys_signalfd4,
+    sys_timerfd_create, sys_userfaultfd,
+};
 pub(crate) use fd_lock::{
     release_flock_locks_for_closed_fd_table, release_record_locks_for_process,
 };
@@ -24,7 +29,8 @@ pub use io::{
     sys_readv, sys_splice, sys_write, sys_writev,
 };
 pub use mount::{
-    sys_fsconfig, sys_fsmount, sys_fsopen, sys_mount, sys_move_mount, sys_open_tree, sys_umount2,
+    sys_fsconfig, sys_fsmount, sys_fsopen, sys_fspick, sys_mount, sys_move_mount, sys_open_tree,
+    sys_umount2,
 };
 pub(crate) use path::path_context_from;
 pub use path::{

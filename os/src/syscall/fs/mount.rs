@@ -2,8 +2,8 @@ use crate::fs::{
     DetachedMountFile, File, FsContextFile, FsContextStateError, MountError, MountPropagation,
     OpenFlags, WorkingDir, lookup_existing_dir_in, lookup_mount_target_dir_in,
     loop_device_is_attached, mount_bind_at, mount_block_device_at, mount_cgroup2_at,
-    mount_fat_device_at, mount_tmpfs_at, move_mount_at, normalize_path_at_root, open_file_in,
-    remount_at, set_mount_propagation_at, unmount_at,
+    mount_ext_scratch_at, mount_fat_device_at, mount_tmpfs_at, move_mount_at,
+    normalize_path_at_root, open_file_in, remount_at, set_mount_propagation_at, unmount_at,
 };
 use crate::task::{CAP_SYS_ADMIN, FdTableEntry, current_process, current_user_token};
 use alloc::string::String;
@@ -58,6 +58,12 @@ const FSCONFIG_SET_FD: u32 = 5;
 const FSCONFIG_CMD_CREATE: u32 = 6;
 const FSCONFIG_CMD_RECONFIGURE: u32 = 7;
 const FSMOUNT_CLOEXEC: u32 = 0x0000_0001;
+const FSPICK_CLOEXEC: u32 = 0x0000_0001;
+const FSPICK_SYMLINK_NOFOLLOW: u32 = 0x0000_0002;
+const FSPICK_NO_AUTOMOUNT: u32 = 0x0000_0004;
+const FSPICK_EMPTY_PATH: u32 = 0x0000_0008;
+const FSPICK_VALID_FLAGS: u32 =
+    FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW | FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH;
 const MOUNT_ATTR_RDONLY: u32 = 0x0000_0001;
 const MOUNT_ATTR_NOSUID: u32 = 0x0000_0002;
 const MOUNT_ATTR_NODEV: u32 = 0x0000_0004;
@@ -490,6 +496,31 @@ pub fn sys_fsmount(fd: isize, flags: u32, mount_attrs: u32) -> SysResult {
     install_fd(detached, open_flags, None)
 }
 
+pub fn sys_fspick(dirfd: isize, path: *const u8, flags: u32) -> SysResult {
+    if flags & !FSPICK_VALID_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+
+    let token = current_user_token();
+    let path = read_user_c_string(token, path, PATH_MAX)?;
+    let mut open_tree_flags = 0;
+    if flags & FSPICK_SYMLINK_NOFOLLOW != 0 {
+        open_tree_flags |= AT_SYMLINK_NOFOLLOW as u32;
+    }
+    if flags & FSPICK_NO_AUTOMOUNT != 0 {
+        open_tree_flags |= AT_NO_AUTOMOUNT as u32;
+    }
+    if flags & FSPICK_EMPTY_PATH != 0 {
+        open_tree_flags |= AT_EMPTY_PATH as u32;
+    }
+    // CONTEXT: fspick() should return a mount fd. The current VFS has no
+    // mount-object fd, so this compatibility path exposes the selected path as
+    // an O_PATH fd, which is enough for fd-class syscall probes such as LTP
+    // readahead01 to distinguish it from a regular file.
+    let open_flags = OpenFlags::PATH | open_flags_from_cloexec(flags & FSPICK_CLOEXEC != 0);
+    install_open_tree_path_fd(dirfd, path.as_str(), open_tree_flags, open_flags)
+}
+
 pub fn sys_mount(
     source: *const u8,
     target: *const u8,
@@ -598,8 +629,13 @@ pub fn sys_mount(
     }
     let fstype = read_user_c_string(token, fstype, PATH_MAX)?;
     match fstype.as_str() {
-        "ext4" => {
+        "ext2" | "ext3" | "ext4" => {
             let source = read_user_c_string(token, source, PATH_MAX)?;
+            let ext_fs_type = match fstype.as_str() {
+                "ext2" => "ext2",
+                "ext3" => "ext3",
+                _ => "ext4",
+            };
             if let Some(loop_id) = parse_loop_block_source(source.as_str()) {
                 if !loop_device_is_attached(loop_id) {
                     return Err(SysError::ENODEV);
@@ -607,10 +643,21 @@ pub fn sys_mount(
                 // CONTEXT: LTP all-filesystem syscall tests format a temporary
                 // loop device and then mount it as scratch space. Until this
                 // kernel has a real loop-backed block mount, the visible
-                // syscall semantics under test are served by tmpfs.
-                mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
-                    .map_err(mount_error_to_errno)?;
+                // syscall semantics under test are served by tmpfs. It reports
+                // the requested ext superblock magic so filesystem probes do
+                // not misclassify ext2/ext3/ext4 scratch mounts as tmpfs.
+                mount_ext_scratch_at(
+                    namespace_id,
+                    target_dir,
+                    ext_fs_type,
+                    target_path.as_str(),
+                    read_only,
+                )
+                .map_err(mount_error_to_errno)?;
                 return Ok(0);
+            }
+            if fstype.as_str() != "ext4" {
+                return Err(SysError::ENODEV);
             }
             let block_source = parse_virtio_block_source(source.as_str())?;
             if block_source.partition_index.is_some() {

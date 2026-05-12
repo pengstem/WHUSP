@@ -10,6 +10,8 @@ use crate::task::{
 use alloc::sync::Arc;
 use core::any::Any;
 
+const PIDFD_NONBLOCK: u32 = OpenFlags::NONBLOCK.bits();
+
 struct PidFdFile {
     pid: usize,
 }
@@ -46,15 +48,19 @@ impl File for PidFdFile {
     }
 }
 
-pub(super) fn install_pidfd_for_current_process(pid: usize) -> SysResult<usize> {
+fn install_pidfd_with_flags(pid: usize, open_flags: OpenFlags) -> SysResult<usize> {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
     inner.fd_table[fd] = Some(FdTableEntry::from_file(
         Arc::new(PidFdFile::new(pid)),
-        OpenFlags::CLOEXEC,
+        open_flags,
     ));
     Ok(fd)
+}
+
+pub(super) fn install_pidfd_for_current_process(pid: usize) -> SysResult<usize> {
+    install_pidfd_with_flags(pid, OpenFlags::CLOEXEC)
 }
 
 fn pid_from_fd(pidfd: usize) -> SysResult<usize> {
@@ -145,4 +151,16 @@ pub fn sys_pidfd_send_signal(
     let info = signal_info_from_user(signum, info)?;
     queue_signal_to_process(&target, signal, info);
     Ok(0)
+}
+
+pub fn sys_pidfd_open(pid: usize, flags: u32) -> SysResult {
+    if flags & !PIDFD_NONBLOCK != 0 {
+        return Err(SysError::EINVAL);
+    }
+    pid2process(pid).ok_or(SysError::ESRCH)?;
+    let mut open_flags = OpenFlags::CLOEXEC;
+    if flags & PIDFD_NONBLOCK != 0 {
+        open_flags |= OpenFlags::NONBLOCK;
+    }
+    Ok(install_pidfd_with_flags(pid, open_flags)? as isize)
 }

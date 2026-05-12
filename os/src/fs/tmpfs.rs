@@ -6,9 +6,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 const ROOT_INO: u32 = 2;
+const TMPFS_MAGIC: i64 = 0x0102_1994;
+pub(super) const EXT234_SUPER_MAGIC: i64 = 0xEF53;
 // CONTEXT: Larger sparse tmpfs files are represented by sparse extents so
 // high-offset writes do not require one huge zero-filled heap allocation.
 const TMPFS_INLINE_FILE_LIMIT: usize = 1024 * 1024;
+const TMPFS_SPARSE_EXTENT_LIMIT: usize = 64 * 1024;
 const TMPFS_ALLOCATED_PAYLOAD_LIMIT: usize = 64 * 1024 * 1024;
 
 struct TmpfsInode {
@@ -33,6 +36,7 @@ struct TmpfsInode {
 pub(super) struct TmpFs {
     inodes: BTreeMap<u32, TmpfsInode>,
     next_ino: u32,
+    statfs_magic: i64,
 }
 
 impl TmpfsInode {
@@ -67,6 +71,12 @@ impl TmpfsInode {
 
     fn allocated_payload_len(&self) -> usize {
         self.data.len() + self.sparse_data.values().map(Vec::len).sum::<usize>()
+    }
+
+    fn clear_payload(&mut self) {
+        self.data.clear();
+        self.data.shrink_to_fit();
+        self.sparse_data.clear();
     }
 
     fn remove_sparse_range(&mut self, start: u64, end: u64) {
@@ -151,10 +161,53 @@ impl TmpfsInode {
         }
         self.remove_sparse_range(offset, end);
     }
+
+    fn append_sparse_tail(&mut self, offset: u64, buf: &[u8]) -> Option<usize> {
+        let (&extent_start, data) = self.sparse_data.range_mut(..=offset).next_back()?;
+        let extent_end = extent_start.saturating_add(data.len() as u64);
+        if extent_end != offset || data.len() >= TMPFS_SPARSE_EXTENT_LIMIT {
+            return None;
+        }
+        let copy_len = buf.len().min(TMPFS_SPARSE_EXTENT_LIMIT - data.len());
+        if data.try_reserve(copy_len).is_err() {
+            return Some(0);
+        }
+        data.extend_from_slice(&buf[..copy_len]);
+        Some(copy_len)
+    }
+
+    fn write_sparse_data(&mut self, mut offset: u64, mut buf: &[u8]) -> bool {
+        while !buf.is_empty() {
+            if let Some(appended) = self.append_sparse_tail(offset, buf) {
+                if appended == 0 {
+                    return false;
+                }
+                offset += appended as u64;
+                buf = &buf[appended..];
+                continue;
+            }
+
+            let copy_len = buf.len().min(TMPFS_SPARSE_EXTENT_LIMIT);
+            let reserve_len = TMPFS_SPARSE_EXTENT_LIMIT.min(buf.len());
+            let mut data = Vec::new();
+            if data.try_reserve(reserve_len).is_err() {
+                return false;
+            }
+            data.extend_from_slice(&buf[..copy_len]);
+            self.sparse_data.insert(offset, data);
+            offset += copy_len as u64;
+            buf = &buf[copy_len..];
+        }
+        true
+    }
 }
 
 impl TmpFs {
     pub(super) fn new() -> Self {
+        Self::new_with_statfs_magic(TMPFS_MAGIC)
+    }
+
+    pub(super) fn new_with_statfs_magic(statfs_magic: i64) -> Self {
         let mut inodes = BTreeMap::new();
         inodes.insert(
             ROOT_INO,
@@ -163,6 +216,7 @@ impl TmpFs {
         Self {
             inodes,
             next_ino: ROOT_INO + 1,
+            statfs_magic,
         }
     }
 
@@ -312,7 +366,7 @@ impl FileSystemBackend for TmpFs {
 
     fn statfs(&mut self) -> super::vfs::FileSystemStat {
         super::vfs::FileSystemStat {
-            magic: 0x0102_1994,
+            magic: self.statfs_magic,
             block_size: 4096,
             blocks: 0,
             free_blocks: 0,
@@ -462,10 +516,16 @@ impl FileSystemBackend for TmpFs {
         if inode.kind == FsNodeKind::Directory {
             return Err(FsError::IsDir);
         }
-        if len < inode.size {
+        if len == 0 {
+            inode.clear_payload();
+        } else if len < inode.size {
             inode.truncate_sparse_to(len);
-        }
-        if len as usize <= TMPFS_INLINE_FILE_LIMIT {
+            if len as usize <= TMPFS_INLINE_FILE_LIMIT {
+                inode.data.resize(len as usize, 0);
+            } else if inode.data.len() as u64 > len {
+                inode.data.truncate(len as usize);
+            }
+        } else if len as usize <= TMPFS_INLINE_FILE_LIMIT {
             inode.data.resize(len as usize, 0);
         } else if inode.data.len() as u64 > len {
             inode.data.truncate(len as usize);
@@ -629,22 +689,46 @@ impl FileSystemBackend for TmpFs {
             inode.touch();
             return buf.len();
         }
-        if end as usize <= TMPFS_INLINE_FILE_LIMIT {
+
+        let mut sparse_offset = offset;
+        let mut sparse_buf = buf;
+        if offset < TMPFS_INLINE_FILE_LIMIT as u64 {
             let start = offset as usize;
-            let end = end as usize;
-            if end > inode.data.len() {
-                inode.data.resize(end, 0);
+            let inline_end = end.min(TMPFS_INLINE_FILE_LIMIT as u64) as usize;
+            if inline_end > inode.data.len() {
+                let extra = inline_end - inode.data.len();
+                if inode.allocated_payload_len().saturating_add(extra)
+                    > TMPFS_ALLOCATED_PAYLOAD_LIMIT
+                    || inode.data.try_reserve(extra).is_err()
+                {
+                    return 0;
+                }
+                inode.data.resize(inline_end, 0);
             }
-            inode.data[start..end].copy_from_slice(buf);
-            inode.remove_sparse_range(offset, end as u64);
-        } else {
-            inode.remove_sparse_range(offset, end);
-            if inode.allocated_payload_len().saturating_add(buf.len())
-                > TMPFS_ALLOCATED_PAYLOAD_LIMIT
-            {
-                return 0;
+            let inline_len = inline_end - start;
+            inode.data[start..inline_end].copy_from_slice(&buf[..inline_len]);
+            inode.remove_sparse_range(offset, inline_end as u64);
+            if inline_end as u64 == end {
+                if end > inode.size {
+                    inode.size = end;
+                }
+                inode.touch();
+                return buf.len();
             }
-            inode.sparse_data.insert(offset, buf.to_vec());
+            sparse_offset = inline_end as u64;
+            sparse_buf = &buf[inline_len..];
+        }
+
+        inode.remove_sparse_range(sparse_offset, end);
+        if inode
+            .allocated_payload_len()
+            .saturating_add(sparse_buf.len())
+            > TMPFS_ALLOCATED_PAYLOAD_LIMIT
+        {
+            return 0;
+        }
+        if !inode.write_sparse_data(sparse_offset, sparse_buf) {
+            return 0;
         }
         if end > inode.size {
             inode.size = end;

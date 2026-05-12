@@ -21,7 +21,7 @@ pub use identity::{
     sys_setreuid, sys_setuid,
 };
 pub use namespace::sys_setns;
-pub use pidfd::sys_pidfd_send_signal;
+pub use pidfd::{sys_pidfd_open, sys_pidfd_send_signal};
 pub use resource::{sys_getrlimit, sys_prlimit64, sys_setrlimit};
 pub use sched::{
     sys_sched_get_priority_max, sys_sched_get_priority_min, sys_sched_getaffinity,
