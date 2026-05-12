@@ -251,11 +251,20 @@ impl PipeRingBuffer {
             None => true,
         }
     }
+    /// Blocks the current reader until bytes arrive or peer teardown changes.
+    ///
+    /// The caller must drop the ring-buffer lock before passing the returned
+    /// context pointer to `schedule()`, otherwise writers cannot wake it.
     fn sleep_reader(&mut self) -> *mut crate::task::TaskContext {
         let (task, task_cx_ptr) = block_current_task_no_schedule();
         self.read_wait_queue.push_back(task);
         task_cx_ptr
     }
+
+    /// Blocks the current writer until pipe capacity or peer teardown changes.
+    ///
+    /// The caller must drop the ring-buffer lock before passing the returned
+    /// context pointer to `schedule()`, otherwise readers cannot wake it.
     fn sleep_writer(&mut self) -> *mut crate::task::TaskContext {
         let (task, task_cx_ptr) = block_current_task_no_schedule();
         self.write_wait_queue.push_back(task);

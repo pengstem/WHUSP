@@ -68,18 +68,21 @@ pub fn current_task() -> Option<Arc<TaskControlBlock>> {
 }
 
 pub fn current_process() -> Arc<ProcessControlBlock> {
-    current_task().unwrap().process.upgrade().unwrap()
+    current_task()
+        .expect("current_process requires a running task")
+        .process
+        .upgrade()
+        .expect("current task process must outlive the task")
 }
 
 pub fn current_user_token() -> usize {
-    // TODO: so many unwrap, maybe change they to expect
-    let task = current_task().unwrap();
+    let task = current_task().expect("current_user_token requires a running task");
     task.get_user_token()
 }
 
 pub fn current_trap_cx() -> &'static mut TrapContext {
     current_task()
-        .unwrap()
+        .expect("current_trap_cx requires a running task")
         .inner_exclusive_access()
         .get_trap_cx()
 }
@@ -87,11 +90,11 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 #[cfg(target_arch = "riscv64")]
 pub fn current_trap_cx_user_va() -> usize {
     current_task()
-        .unwrap()
+        .expect("current_trap_cx_user_va requires a running task")
         .inner_exclusive_access()
         .res
         .as_ref()
-        .unwrap()
+        .expect("current user task must own TaskUserRes")
         .trap_cx_user_va()
 }
 
@@ -101,7 +104,6 @@ pub fn current_kstack_top() -> usize {
     } else {
         hart::boot_stack_top()
     }
-    // current_task().unwrap().kstack.get_top()
 }
 
 pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
