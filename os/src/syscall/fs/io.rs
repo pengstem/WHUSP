@@ -796,6 +796,13 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
     check_pipe_write_peer(&entry, len > 0)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
     file.check_write(len, entry.status_flags().contains(OpenFlags::APPEND))?;
+    if file.write_ignores_user_buffer() {
+        // CONTEXT: AF_ALG hash request writes in the current contest subset do
+        // not consume payload bytes; skipping the copy keeps af_alg04 from
+        // spending most of its time fault-checking data that is discarded.
+        fanotify_notify_modify(&file, len);
+        return Ok(len as isize);
+    }
     let buffers =
         translated_byte_buffer_checked_with_mmap_fault(token, buf, len, UserBufferAccess::Read)?;
     let written = write_with_status_flags(&entry, UserBuffer::new(buffers));

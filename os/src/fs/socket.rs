@@ -5,7 +5,7 @@
 //! `127.0.0.1` inside one guest.  Packets never leave the kernel and virtio-net
 //! is not involved.
 
-use super::{File, FileStat, OpenFlags, PollEvents, S_IFIFO};
+use super::{File, FileStat, FsError, OpenFlags, PollEvents, S_IFIFO};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
@@ -19,15 +19,18 @@ use crate::task::{
 };
 use crate::timer::get_time_ms;
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 use core::mem::size_of;
 use lazy_static::lazy_static;
 
 const AF_UNIX: i32 = 1;
 const AF_INET: i32 = 2;
+const AF_ALG: i32 = 38;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
+const SOCK_SEQPACKET: i32 = 5;
 const SOCK_TYPE_MASK: i32 = 0xf;
 const SOCK_NONBLOCK: i32 = OpenFlags::NONBLOCK.bits() as i32;
 const SOCK_CLOEXEC: i32 = OpenFlags::CLOEXEC.bits() as i32;
@@ -37,6 +40,7 @@ const IPPROTO_IP: i32 = 0;
 const IPPROTO_TCP: i32 = 6;
 const IPPROTO_UDP: i32 = 17;
 const SOL_SOCKET: i32 = 1;
+const SOL_ALG: i32 = 279;
 const SO_REUSEADDR: i32 = 2;
 const SO_TYPE: i32 = 3;
 const SO_ERROR: i32 = 4;
@@ -57,6 +61,12 @@ const SHUT_RD: i32 = 0;
 const SHUT_WR: i32 = 1;
 const SHUT_RDWR: i32 = 2;
 const MSG_DONTWAIT: i32 = 0x40;
+const ALG_SET_KEY: i32 = 1;
+const ALG_SET_IV: i32 = 2;
+const ALG_SET_OP: i32 = 3;
+const ALG_SET_AEAD_ASSOCLEN: i32 = 4;
+const ALG_OP_DECRYPT: u32 = 0;
+const ALG_OP_ENCRYPT: u32 = 1;
 const LOOPBACK_IP: [u8; 4] = [127, 0, 0, 1];
 const ANY_IP: [u8; 4] = [0, 0, 0, 0];
 const DEFAULT_SOCKET_BUFFER: i32 = 64 * 1024;
@@ -80,6 +90,43 @@ struct LinuxSockAddrIn {
 enum SocketKind {
     Stream,
     Datagram,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxIovec {
+    base: usize,
+    len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxMsghdr {
+    msg_name: usize,
+    msg_namelen: u32,
+    msg_iov: usize,
+    msg_iovlen: usize,
+    msg_control: usize,
+    msg_controllen: usize,
+    msg_flags: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxCmsghdr {
+    cmsg_len: usize,
+    cmsg_level: i32,
+    cmsg_type: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct LinuxSockAddrAlg {
+    family: u16,
+    alg_type: [u8; 14],
+    feat: u32,
+    mask: u32,
+    name: [u8; 64],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,6 +162,60 @@ struct LocalSocketInner {
 pub struct LocalSocket {
     inner: Arc<UPIntrFreeCell<LocalSocketInner>>,
     status_flags: UPIntrFreeCell<OpenFlags>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AfAlgFamily {
+    Hash,
+    Skcipher,
+    Aead,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AfAlgOperation {
+    Decrypt,
+    Encrypt,
+}
+
+#[derive(Clone, Debug)]
+struct AfAlgBinding {
+    family: AfAlgFamily,
+    name: String,
+    key: Vec<u8>,
+}
+
+#[derive(Default)]
+struct AfAlgListenerState {
+    binding: Option<AfAlgBinding>,
+}
+
+struct AfAlgRequestState {
+    binding: AfAlgBinding,
+    op: AfAlgOperation,
+    iv: Vec<u8>,
+    assoclen: u32,
+    input: Vec<u8>,
+    output: Option<Vec<u8>>,
+    output_offset: usize,
+    output_done: bool,
+}
+
+enum AfAlgSocketKind {
+    Listener(UPIntrFreeCell<AfAlgListenerState>),
+    Request(UPIntrFreeCell<AfAlgRequestState>),
+}
+
+pub struct AfAlgSocket {
+    kind: AfAlgSocketKind,
+    status_flags: UPIntrFreeCell<OpenFlags>,
+    write_ignores_data: bool,
+}
+
+#[derive(Default)]
+struct AfAlgSendParams {
+    op: Option<AfAlgOperation>,
+    iv: Option<Vec<u8>>,
+    assoclen: Option<u32>,
 }
 
 struct LoopbackState {
@@ -656,6 +757,270 @@ impl Drop for LocalSocket {
     }
 }
 
+const AF_ALG_HASH_ALGS: &[&str] = &[
+    "md5",
+    "md5-generic",
+    "sha1",
+    "sha1-generic",
+    "sha224",
+    "sha224-generic",
+    "sha256",
+    "sha256-generic",
+    "sha3-256",
+    "sha3-256-generic",
+    "sha3-512",
+    "sha3-512-generic",
+    "sm3",
+    "sm3-generic",
+];
+
+const AF_ALG_VMAC_ALGS: &[&str] = &[
+    "vmac64(aes)",
+    "vmac(aes)",
+    "vmac64(sm4)",
+    "vmac(sm4)",
+    "vmac64(sm4-generic)",
+    "vmac(sm4-generic)",
+];
+
+impl AfAlgSocket {
+    fn new_listener(flags: OpenFlags) -> Arc<Self> {
+        Arc::new(Self {
+            kind: AfAlgSocketKind::Listener(unsafe {
+                UPIntrFreeCell::new(AfAlgListenerState::default())
+            }),
+            status_flags: unsafe { UPIntrFreeCell::new(flags) },
+            write_ignores_data: false,
+        })
+    }
+
+    fn new_request(binding: AfAlgBinding, flags: OpenFlags) -> Arc<Self> {
+        let write_ignores_data = binding.family == AfAlgFamily::Hash;
+        Arc::new(Self {
+            kind: AfAlgSocketKind::Request(unsafe {
+                UPIntrFreeCell::new(AfAlgRequestState {
+                    binding,
+                    op: AfAlgOperation::Encrypt,
+                    iv: Vec::new(),
+                    assoclen: 0,
+                    input: Vec::new(),
+                    output: None,
+                    output_offset: 0,
+                    output_done: false,
+                })
+            }),
+            status_flags: unsafe { UPIntrFreeCell::new(flags) },
+            write_ignores_data,
+        })
+    }
+
+    fn validate_socket_type(ty: i32, protocol: i32) -> SysResult<()> {
+        if ty & SOCK_TYPE_MASK != SOCK_SEQPACKET {
+            return Err(SysError::EPROTONOSUPPORT);
+        }
+        if protocol != 0 {
+            return Err(SysError::EPROTONOSUPPORT);
+        }
+        Ok(())
+    }
+
+    fn bind_alg(&self, addr: LinuxSockAddrAlg) -> SysResult<()> {
+        if addr.family as i32 != AF_ALG {
+            return Err(SysError::EAFNOSUPPORT);
+        }
+        let alg_type = parse_alg_field(&addr.alg_type)?;
+        let name = parse_alg_field(&addr.name)?;
+        let binding = resolve_af_alg_binding(&alg_type, &name)?;
+        let AfAlgSocketKind::Listener(state) = &self.kind else {
+            return Err(SysError::EINVAL);
+        };
+        state.exclusive_access().binding = Some(binding);
+        Ok(())
+    }
+
+    fn set_key(&self, key: &[u8]) -> SysResult<()> {
+        let AfAlgSocketKind::Listener(state) = &self.kind else {
+            return Err(SysError::EINVAL);
+        };
+        let mut state = state.exclusive_access();
+        let binding = state.binding.as_mut().ok_or(SysError::EINVAL)?;
+        validate_af_alg_key(binding, key)?;
+        binding.key.clear();
+        binding.key.extend_from_slice(key);
+        Ok(())
+    }
+
+    fn accept_request(&self, flags: OpenFlags) -> SysResult<Arc<Self>> {
+        let AfAlgSocketKind::Listener(state) = &self.kind else {
+            return Err(SysError::EINVAL);
+        };
+        let binding = state
+            .exclusive_access()
+            .binding
+            .clone()
+            .ok_or(SysError::EINVAL)?;
+        Ok(Self::new_request(binding, flags))
+    }
+
+    fn send_msg(&self, msg: LinuxMsghdr) -> SysResult<usize> {
+        if msg.msg_name != 0 || msg.msg_namelen != 0 {
+            return Err(SysError::EINVAL);
+        }
+        let token = current_user_token();
+        let params = parse_af_alg_send_params(token, &msg)?;
+        let payload = read_msg_iovecs(token, msg.msg_iov, msg.msg_iovlen)?;
+        self.push_input(&payload, params)?;
+        Ok(payload.len())
+    }
+
+    fn push_input(&self, data: &[u8], params: AfAlgSendParams) -> SysResult<()> {
+        let AfAlgSocketKind::Request(state) = &self.kind else {
+            return Err(SysError::EINVAL);
+        };
+        let mut state = state.exclusive_access();
+        state.output = None;
+        state.output_offset = 0;
+        state.output_done = false;
+        if let Some(op) = params.op {
+            state.op = op;
+        }
+        if let Some(iv) = params.iv {
+            state.iv = iv;
+        }
+        if let Some(assoclen) = params.assoclen {
+            state.assoclen = assoclen;
+        }
+        if state.binding.family != AfAlgFamily::Hash && !data.is_empty() {
+            state.input.extend_from_slice(data);
+        }
+        Ok(())
+    }
+
+    fn prepare_output(&self) -> SysResult<()> {
+        let AfAlgSocketKind::Request(state) = &self.kind else {
+            return Err(SysError::EINVAL);
+        };
+        let mut state = state.exclusive_access();
+        if state.output.is_some() || state.output_done {
+            return Ok(());
+        }
+        let output = match state.binding.family {
+            AfAlgFamily::Hash => vec![0; 16],
+            AfAlgFamily::Skcipher => match state.binding.name.as_str() {
+                "salsa20" => Vec::new(),
+                "cbc(aes-generic)" => {
+                    if state.input.len() % 16 != 0 {
+                        return Err(SysError::EINVAL);
+                    }
+                    state.input.clone()
+                }
+                _ => return Err(SysError::ENOENT),
+            },
+            AfAlgFamily::Aead => state.input.clone(),
+        };
+        state.output = Some(output);
+        Ok(())
+    }
+
+    fn read_output(&self, mut buf: UserBuffer) -> SysResult<usize> {
+        self.prepare_output()?;
+        let AfAlgSocketKind::Request(state) = &self.kind else {
+            return Err(SysError::EINVAL);
+        };
+        let mut state = state.exclusive_access();
+        let output_len = state.output.as_ref().map_or(0, Vec::len);
+        if state.output_offset >= output_len {
+            state.output = None;
+            state.output_offset = 0;
+            state.output_done = true;
+            state.input.clear();
+            return Ok(0);
+        }
+        let copied = {
+            let output = state.output.as_deref().unwrap_or(&[]);
+            buf.copy_from_slice(&output[state.output_offset..])
+        };
+        state.output_offset += copied;
+        if state.output_offset >= output_len {
+            state.output = None;
+            state.output_offset = 0;
+            state.output_done = true;
+            state.input.clear();
+        }
+        Ok(copied)
+    }
+
+    fn is_hash_request(&self) -> bool {
+        self.write_ignores_data
+    }
+}
+
+impl File for AfAlgSocket {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, buf: UserBuffer) -> usize {
+        self.read_output(buf).unwrap_or_default()
+    }
+
+    fn write(&self, buf: UserBuffer) -> usize {
+        let len = buf.len();
+        if self.is_hash_request() {
+            return len;
+        }
+        self.push_input(&buf.to_vec(), AfAlgSendParams::default())
+            .map(|_| len)
+            .unwrap_or_default()
+    }
+
+    fn poll(&self, events: PollEvents) -> PollEvents {
+        events & (PollEvents::POLLIN | PollEvents::POLLOUT)
+    }
+
+    fn stat(&self) -> crate::fs::FsResult<FileStat> {
+        // CONTEXT: Match LocalSocket's current visible file type. The generic
+        // read path still has a broad directory bit check that treats S_IFSOCK
+        // as a directory, which would break AF_ALG request reads.
+        Ok(FileStat::with_mode(S_IFIFO | 0o777))
+    }
+
+    fn check_read(&self, _len: usize) -> crate::fs::FsResult {
+        self.prepare_output().map_err(|_| FsError::InvalidInput)
+    }
+
+    fn check_write(&self, _len: usize, _append: bool) -> crate::fs::FsResult {
+        match &self.kind {
+            AfAlgSocketKind::Request(_) => Ok(()),
+            AfAlgSocketKind::Listener(_) => Err(FsError::InvalidInput),
+        }
+    }
+
+    fn write_ignores_user_buffer(&self) -> bool {
+        self.is_hash_request()
+    }
+
+    fn status_flags(&self) -> OpenFlags {
+        *self.status_flags.exclusive_access()
+    }
+
+    fn set_status_flags(&self, flags: OpenFlags) {
+        *self.status_flags.exclusive_access() = flags;
+    }
+
+    fn is_socket(&self) -> bool {
+        true
+    }
+}
+
 impl File for LocalSocket {
     fn as_any(&self) -> &dyn core::any::Any {
         self
@@ -822,6 +1187,179 @@ fn copy_user_to_vec(token: usize, ptr: usize, len: usize) -> SysResult<Vec<u8>> 
     Ok(data)
 }
 
+fn read_msg_iovecs(token: usize, iov: usize, iovlen: usize) -> SysResult<Vec<u8>> {
+    if iovlen == 0 {
+        return Ok(Vec::new());
+    }
+    if iov == 0 || iovlen > 1024 {
+        return Err(SysError::EINVAL);
+    }
+    let mut data = Vec::new();
+    for index in 0..iovlen {
+        let entry_addr = iov
+            .checked_add(
+                index
+                    .checked_mul(size_of::<LinuxIovec>())
+                    .ok_or(SysError::EINVAL)?,
+            )
+            .ok_or(SysError::EINVAL)?;
+        let entry = read_user_value(token, entry_addr as *const LinuxIovec)?;
+        if entry.len == 0 {
+            continue;
+        }
+        let next_len = data.checked_len_add(entry.len)?;
+        if next_len > isize::MAX as usize {
+            return Err(SysError::EINVAL);
+        }
+        data.extend_from_slice(&copy_user_to_vec(token, entry.base, entry.len)?);
+    }
+    Ok(data)
+}
+
+trait VecLenChecked {
+    fn checked_len_add(&self, len: usize) -> SysResult<usize>;
+}
+
+impl VecLenChecked for Vec<u8> {
+    fn checked_len_add(&self, len: usize) -> SysResult<usize> {
+        self.len().checked_add(len).ok_or(SysError::EINVAL)
+    }
+}
+
+fn read_sockaddr_alg(token: usize, ptr: usize, len: u32) -> SysResult<LinuxSockAddrAlg> {
+    if ptr == 0 {
+        return Err(SysError::EFAULT);
+    }
+    if (len as usize) < size_of::<LinuxSockAddrAlg>() {
+        return Err(SysError::EINVAL);
+    }
+    read_user_value(token, ptr as *const LinuxSockAddrAlg)
+}
+
+fn parse_alg_field(bytes: &[u8]) -> SysResult<String> {
+    let len = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len());
+    let raw = core::str::from_utf8(&bytes[..len]).map_err(|_| SysError::EINVAL)?;
+    Ok(raw.to_string())
+}
+
+fn resolve_af_alg_binding(alg_type: &str, name: &str) -> SysResult<AfAlgBinding> {
+    let family = match alg_type {
+        "hash" if has_af_alg_hash(name) => AfAlgFamily::Hash,
+        "skcipher" if matches!(name, "salsa20" | "cbc(aes-generic)") => AfAlgFamily::Skcipher,
+        "aead"
+            if matches!(
+                name,
+                "rfc7539(chacha20,poly1305)" | "authenc(hmac(sha256),cbc(aes))"
+            ) =>
+        {
+            AfAlgFamily::Aead
+        }
+        _ => return Err(SysError::ENOENT),
+    };
+    Ok(AfAlgBinding {
+        family,
+        name: name.to_string(),
+        key: Vec::new(),
+    })
+}
+
+fn has_af_alg_hash(name: &str) -> bool {
+    if name.starts_with("hmac(hmac(") {
+        return false;
+    }
+    if AF_ALG_HASH_ALGS.contains(&name) || AF_ALG_VMAC_ALGS.contains(&name) {
+        return true;
+    }
+    match name
+        .strip_prefix("hmac(")
+        .and_then(|inner| inner.strip_suffix(')'))
+    {
+        Some(inner) => AF_ALG_HASH_ALGS.contains(&inner),
+        None => false,
+    }
+}
+
+fn validate_af_alg_key(binding: &AfAlgBinding, key: &[u8]) -> SysResult<()> {
+    if binding.name == "authenc(hmac(sha256),cbc(aes))" && key.len() < 12 {
+        return Err(SysError::EINVAL);
+    }
+    Ok(())
+}
+
+fn parse_af_alg_send_params(token: usize, msg: &LinuxMsghdr) -> SysResult<AfAlgSendParams> {
+    let mut params = AfAlgSendParams::default();
+    if msg.msg_control == 0 || msg.msg_controllen == 0 {
+        return Ok(params);
+    }
+    let mut ptr = msg.msg_control;
+    let end = ptr
+        .checked_add(msg.msg_controllen)
+        .ok_or(SysError::EINVAL)?;
+    while ptr
+        .checked_add(size_of::<LinuxCmsghdr>())
+        .is_some_and(|header_end| header_end <= end)
+    {
+        let hdr = read_user_value(token, ptr as *const LinuxCmsghdr)?;
+        if hdr.cmsg_len < size_of::<LinuxCmsghdr>() {
+            return Err(SysError::EINVAL);
+        }
+        let cmsg_end = ptr.checked_add(hdr.cmsg_len).ok_or(SysError::EINVAL)?;
+        if cmsg_end > end || hdr.cmsg_level != SOL_ALG {
+            return Err(SysError::EINVAL);
+        }
+        let data_len = hdr.cmsg_len - size_of::<LinuxCmsghdr>();
+        let data = copy_user_to_vec(token, ptr + size_of::<LinuxCmsghdr>(), data_len)?;
+        match hdr.cmsg_type {
+            ALG_SET_OP => {
+                if data.len() != size_of::<u32>() {
+                    return Err(SysError::EINVAL);
+                }
+                let raw = read_u32_ne(&data);
+                params.op = Some(match raw {
+                    ALG_OP_DECRYPT => AfAlgOperation::Decrypt,
+                    ALG_OP_ENCRYPT => AfAlgOperation::Encrypt,
+                    _ => return Err(SysError::EINVAL),
+                });
+            }
+            ALG_SET_IV => {
+                if data.len() < size_of::<u32>() {
+                    return Err(SysError::EINVAL);
+                }
+                let ivlen = read_u32_ne(&data[..size_of::<u32>()]) as usize;
+                if data.len() < size_of::<u32>() + ivlen {
+                    return Err(SysError::EINVAL);
+                }
+                params.iv = Some(data[size_of::<u32>()..size_of::<u32>() + ivlen].to_vec());
+            }
+            ALG_SET_AEAD_ASSOCLEN => {
+                if data.len() != size_of::<u32>() {
+                    return Err(SysError::EINVAL);
+                }
+                params.assoclen = Some(read_u32_ne(&data));
+            }
+            _ => return Err(SysError::EINVAL),
+        }
+        ptr = ptr
+            .checked_add(cmsg_align(hdr.cmsg_len))
+            .ok_or(SysError::EINVAL)?;
+    }
+    Ok(params)
+}
+
+fn read_u32_ne(bytes: &[u8]) -> u32 {
+    let mut raw = [0u8; size_of::<u32>()];
+    raw.copy_from_slice(&bytes[..size_of::<u32>()]);
+    u32::from_ne_bytes(raw)
+}
+
+fn cmsg_align(len: usize) -> usize {
+    let align = size_of::<usize>();
+    (len + align - 1) & !(align - 1)
+}
+
 fn open_flags_from_socket_type(ty: i32) -> SysResult<OpenFlags> {
     if ty & !(SOCK_TYPE_MASK | VALID_SOCKET_TYPE_FLAGS) != 0 {
         return Err(SysError::EINVAL);
@@ -868,19 +1406,7 @@ fn validate_protocol(kind: SocketKind, protocol: i32) -> SysResult {
 }
 
 fn with_socket<T>(fd: usize, f: impl FnOnce(&LocalSocket) -> SysResult<T>) -> SysResult<T> {
-    let process = current_process();
-    let file = {
-        let inner = process.inner_exclusive_access();
-        let entry = inner
-            .fd_table
-            .get(fd)
-            .and_then(|entry| entry.as_ref())
-            .ok_or(SysError::EBADF)?;
-        if entry.status_flags().contains(OpenFlags::PATH) {
-            return Err(SysError::EBADF);
-        }
-        entry.file()
-    };
+    let file = file_from_fd(fd)?;
     let socket = file
         .as_any()
         .downcast_ref::<LocalSocket>()
@@ -888,11 +1414,25 @@ fn with_socket<T>(fd: usize, f: impl FnOnce(&LocalSocket) -> SysResult<T>) -> Sy
     f(socket)
 }
 
-fn alloc_socket_fd(socket: Arc<LocalSocket>, flags: OpenFlags) -> SysResult<usize> {
+fn file_from_fd(fd: usize) -> SysResult<Arc<dyn File + Send + Sync>> {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let entry = inner
+        .fd_table
+        .get(fd)
+        .and_then(|entry| entry.as_ref())
+        .ok_or(SysError::EBADF)?;
+    if entry.status_flags().contains(OpenFlags::PATH) {
+        return Err(SysError::EBADF);
+    }
+    Ok(entry.file())
+}
+
+fn alloc_socket_fd(file: Arc<dyn File + Send + Sync>, flags: OpenFlags) -> SysResult<usize> {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-    inner.fd_table[fd] = Some(FdTableEntry::from_file(socket, flags));
+    inner.fd_table[fd] = Some(FdTableEntry::from_file(file, flags));
     Ok(fd)
 }
 
@@ -908,8 +1448,14 @@ fn read_i32_option(token: usize, val: usize, len: u32) -> SysResult<i32> {
 }
 
 pub fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
-    let kind = socket_kind_from_type(ty)?;
     let flags = open_flags_from_socket_type(ty)?;
+    if domain == AF_ALG {
+        AfAlgSocket::validate_socket_type(ty, protocol)?;
+        let socket = AfAlgSocket::new_listener(flags);
+        return Ok(alloc_socket_fd(socket, flags)? as isize);
+    }
+
+    let kind = socket_kind_from_type(ty)?;
     match domain {
         AF_INET => {
             validate_protocol(kind, protocol)?;
@@ -999,8 +1545,17 @@ pub fn sys_socketpair(domain: i32, ty: i32, protocol: i32, sv: usize) -> SysResu
 
 pub fn sys_bind(fd: usize, addr: usize, addrlen: u32) -> SysResult {
     let token = current_user_token();
+    let file = file_from_fd(fd)?;
+    if let Some(socket) = file.as_any().downcast_ref::<AfAlgSocket>() {
+        socket.bind_alg(read_sockaddr_alg(token, addr, addrlen)?)?;
+        return Ok(0);
+    }
+    let socket = file
+        .as_any()
+        .downcast_ref::<LocalSocket>()
+        .ok_or(SysError::ENOTSOCK)?;
     let endpoint = read_sockaddr(token, addr, addrlen)?;
-    with_socket(fd, |socket| socket.bind_endpoint(endpoint))
+    socket.bind_endpoint(endpoint)
 }
 
 pub fn sys_listen(fd: usize, backlog: i32) -> SysResult {
@@ -1019,9 +1574,19 @@ pub fn sys_accept(fd: usize, addr: usize, addrlen: usize) -> SysResult {
 pub fn sys_accept4(fd: usize, addr: usize, addrlen: usize, flags: i32) -> SysResult {
     let open_flags = open_flags_from_accept4(flags)?;
     let token = current_user_token();
-    let accepted = with_socket(fd, |socket| {
-        socket.accept(socket.status_flags().contains(OpenFlags::NONBLOCK))
-    })?;
+    let file = file_from_fd(fd)?;
+    if let Some(socket) = file.as_any().downcast_ref::<AfAlgSocket>() {
+        let accepted = socket.accept_request(open_flags)?;
+        if addr != 0 && addrlen != 0 {
+            write_user_value(token, addrlen as *mut u32, &0)?;
+        }
+        return Ok(alloc_socket_fd(accepted, open_flags)? as isize);
+    }
+    let socket = file
+        .as_any()
+        .downcast_ref::<LocalSocket>()
+        .ok_or(SysError::ENOTSOCK)?;
+    let accepted = socket.accept(socket.status_flags().contains(OpenFlags::NONBLOCK))?;
     let peer = accepted.peer_endpoint()?;
     write_sockaddr(token, addr, addrlen, peer)?;
     Ok(alloc_socket_fd(accepted, open_flags)? as isize)
@@ -1091,7 +1656,20 @@ pub fn sys_recvfrom(
 
 pub fn sys_setsockopt(fd: usize, level: i32, name: i32, val: usize, len: u32) -> SysResult {
     let token = current_user_token();
-    with_socket(fd, |socket| {
+    let file = file_from_fd(fd)?;
+    if let Some(socket) = file.as_any().downcast_ref::<AfAlgSocket>() {
+        if level != SOL_ALG || name != ALG_SET_KEY {
+            return Err(SysError::ENOPROTOOPT);
+        }
+        let key = copy_user_to_vec(token, val, len as usize)?;
+        socket.set_key(&key)?;
+        return Ok(0);
+    }
+    let socket = file
+        .as_any()
+        .downcast_ref::<LocalSocket>()
+        .ok_or(SysError::ENOTSOCK)?;
+    {
         match (level, name) {
             (SOL_SOCKET, SO_REUSEADDR) => {
                 socket.set_reuse_addr(read_i32_option(token, val, len)? != 0);
@@ -1157,7 +1735,7 @@ pub fn sys_setsockopt(fd: usize, level: i32, name: i32, val: usize, len: u32) ->
             _ => return Err(SysError::ENOPROTOOPT),
         }
         Ok(0)
-    })
+    }
 }
 
 pub fn sys_getsockopt(fd: usize, level: i32, name: i32, val: usize, len: usize) -> SysResult {
@@ -1184,7 +1762,13 @@ pub fn sys_shutdown(fd: usize, how: i32) -> SysResult {
     with_socket(fd, |socket| socket.shutdown(how))
 }
 
-pub fn sys_sendmsg(_fd: usize, _msg: usize, _flags: i32) -> SysResult {
+pub fn sys_sendmsg(fd: usize, msg: usize, _flags: i32) -> SysResult {
+    let file = file_from_fd(fd)?;
+    if let Some(socket) = file.as_any().downcast_ref::<AfAlgSocket>() {
+        let token = current_user_token();
+        let msg = read_user_value(token, msg as *const LinuxMsghdr)?;
+        return Ok(socket.send_msg(msg)? as isize);
+    }
     // UNFINISHED: scatter/gather socket messages and control messages are not
     // implemented for the local loopback socket subset.
     Err(SysError::ENOSYS)

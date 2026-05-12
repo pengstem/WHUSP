@@ -152,6 +152,9 @@ pub trait File: Send + Sync {
     fn check_write(&self, _len: usize, _append: bool) -> FsResult {
         Ok(())
     }
+    fn write_ignores_user_buffer(&self) -> bool {
+        false
+    }
     fn check_read(&self, _len: usize) -> FsResult {
         Ok(())
     }
