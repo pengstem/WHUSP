@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 
 const EXT4_NAME_MAX: usize = 255;
 const SYMLINK_TARGET_MAX: usize = 4096;
-const MAX_SYMLINK_FOLLOWS: usize = 40;
+const MAX_SYMLINK_FOLLOWS: usize = 40; // Linux returns ELOOP after 40 symlink resolutions.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct VfsPath {

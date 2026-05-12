@@ -1,18 +1,19 @@
 use crate::fs::{
-    DetachedMountFile, File, FsContextFile, FsContextStateError, MountError, MountPropagation,
-    OpenFlags, WorkingDir, lookup_existing_dir_in, lookup_mount_target_dir_in,
-    loop_device_is_attached, mount_bind_at, mount_block_device_at, mount_cgroup2_at,
-    mount_ext_scratch_at, mount_fat_device_at, mount_tmpfs_at, move_mount_at,
-    normalize_path_at_root, open_file_in, remount_at, set_mount_propagation_at, unmount_at,
+    DetachedMountFile, FsContextFile, FsContextStateError, MountError, MountPropagation, OpenFlags,
+    WorkingDir, lookup_existing_dir_in, lookup_mount_target_dir_in, loop_device_is_attached,
+    mount_bind_at, mount_block_device_at, mount_cgroup2_at, mount_ext_scratch_at,
+    mount_fat_device_at, mount_tmpfs_at, move_mount_at, normalize_path_at_root, open_file_in,
+    remount_at, set_mount_propagation_at, unmount_at,
 };
-use crate::task::{CAP_SYS_ADMIN, FdTableEntry, current_process, current_user_token};
+use crate::task::{CAP_SYS_ADMIN, current_process, current_user_token};
 use alloc::string::String;
-use alloc::sync::Arc;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{PATH_MAX, read_user_c_string};
-use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
-use super::path::{check_current_access_path_prefixes_from, path_context_from};
+use super::fd::{get_fd_entry_by_fd, get_file_by_fd, install_file_fd};
+use super::path::{
+    check_current_access_path_prefixes_from, normalize_path_from, path_context_from,
+};
 use super::uapi::{AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW};
 
 const MS_RDONLY: usize = 1;
@@ -26,10 +27,11 @@ const MS_PRIVATE: usize = 1 << 18;
 const MS_SLAVE: usize = 1 << 19;
 const MS_SHARED: usize = 1 << 20;
 const MS_PROPAGATION_MASK: usize = MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED;
+// Linux accepts MS_REC/MS_SILENT with propagation changes; other extras are rejected.
 const MS_PROPAGATION_ALLOWED_EXTRAS: usize = MS_REC | MS_SILENT;
 const OPEN_TREE_CLONE: u32 = 0x1;
 const OPEN_TREE_CLOEXEC: u32 = OpenFlags::CLOEXEC.bits();
-const AT_RECURSIVE: u32 = 0x8000;
+const AT_RECURSIVE: u32 = 0x8000; // open_tree recursive clone flag, not in older libc headers.
 const VALID_OPEN_TREE_FLAGS: u32 = OPEN_TREE_CLONE
     | OPEN_TREE_CLOEXEC
     | AT_SYMLINK_NOFOLLOW as u32
@@ -148,55 +150,12 @@ fn require_sys_admin() -> SysResult<()> {
     Ok(())
 }
 
-fn install_fd(
-    file: Arc<dyn File + Send + Sync>,
-    flags: OpenFlags,
-    dir_path: Option<String>,
-) -> SysResult {
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-    let dir_path = file.working_dir().and(dir_path);
-    inner.fd_table[fd] = Some(FdTableEntry::from_file_with_dir_path(file, flags, dir_path));
-    Ok(fd as isize)
-}
-
 fn open_flags_from_cloexec(cloexec: bool) -> OpenFlags {
     if cloexec {
         OpenFlags::CLOEXEC
     } else {
         OpenFlags::empty()
     }
-}
-
-fn path_base_for_dirfd(snapshot: &crate::task::PathSnapshot, dirfd: isize) -> SysResult<String> {
-    if dirfd == AT_FDCWD {
-        return Ok(snapshot.cwd_path.clone());
-    }
-    if dirfd < 0 {
-        return Err(SysError::EBADF);
-    }
-    let entry = get_fd_entry_by_fd(dirfd as usize)?;
-    if entry.file().working_dir().is_none() {
-        return Err(SysError::ENOTDIR);
-    }
-    Ok(entry
-        .dir_path()
-        .map(String::from)
-        .unwrap_or_else(|| snapshot.cwd_path.clone()))
-}
-
-fn normalize_path_from_dirfd(
-    snapshot: &crate::task::PathSnapshot,
-    dirfd: isize,
-    path: &str,
-) -> SysResult<String> {
-    let base = if path.starts_with('/') {
-        snapshot.root_path.clone()
-    } else {
-        path_base_for_dirfd(snapshot, dirfd)?
-    };
-    normalize_path_at_root(snapshot.root_path.as_str(), base.as_str(), path).ok_or(SysError::ENOENT)
 }
 
 fn install_open_tree_path_fd(
@@ -212,19 +171,19 @@ fn install_open_tree_path_fd(
         }
         if dirfd == AT_FDCWD {
             let file = open_file_in(snapshot.context.clone(), ".", OpenFlags::PATH)?;
-            return install_fd(file, open_flags, Some(snapshot.cwd_path));
+            return install_file_fd(file, open_flags, Some(snapshot.cwd_path));
         }
         if dirfd < 0 {
             return Err(SysError::EBADF);
         }
         let entry = get_fd_entry_by_fd(dirfd as usize)?;
-        return install_fd(entry.file(), open_flags, entry.dir_path().map(String::from));
+        return install_file_fd(entry.file(), open_flags, entry.dir_path().map(String::from));
     }
 
     check_current_access_path_prefixes_from(&snapshot, dirfd, path)?;
-    let dir_path = normalize_path_from_dirfd(&snapshot, dirfd, path).ok();
+    let dir_path = normalize_path_from(&snapshot, dirfd, path).ok();
     let file = open_file_in(path_context_from(&snapshot, dirfd, path)?, path, open_flags)?;
-    install_fd(file, open_flags, dir_path)
+    install_file_fd(file, open_flags, dir_path)
 }
 
 fn open_tree_source_dir(dirfd: isize, path: &str, flags: u32) -> SysResult<(WorkingDir, String)> {
@@ -251,7 +210,7 @@ fn open_tree_source_dir(dirfd: isize, path: &str, flags: u32) -> SysResult<(Work
     check_current_access_path_prefixes_from(&snapshot, dirfd, path)?;
     let context = path_context_from(&snapshot, dirfd, path)?;
     let source = lookup_existing_dir_in(context, path)?;
-    let source_path = normalize_path_from_dirfd(&snapshot, dirfd, path)?;
+    let source_path = normalize_path_from(&snapshot, dirfd, path)?;
     Ok((source, source_path))
 }
 
@@ -277,7 +236,7 @@ fn move_mount_target(dirfd: isize, path: &str, flags: u32) -> SysResult<(Working
     }
     let context = path_context_from(&snapshot, dirfd, path)?;
     let target = lookup_mount_target_dir_in(context, path)?;
-    let target_path = normalize_path_from_dirfd(&snapshot, dirfd, path)?;
+    let target_path = normalize_path_from(&snapshot, dirfd, path)?;
     Ok((target, target_path))
 }
 
@@ -344,7 +303,7 @@ pub fn sys_open_tree(dirfd: isize, path: *const u8, flags: u32) -> SysResult {
     // mount namespace details. This fd-backed mount subset currently supports
     // directory bind mounts because the VFS mount overlay is directory-rooted.
     let file = DetachedMountFile::new_bind(source, source_path, flags & AT_RECURSIVE != 0);
-    install_fd(file, open_flags, None)
+    install_file_fd(file, open_flags, None)
 }
 
 pub fn sys_move_mount(
@@ -395,7 +354,7 @@ pub fn sys_fsopen(fs_name: *const u8, flags: u32) -> SysResult {
         return Err(SysError::ENODEV);
     }
     let file = FsContextFile::new(fs_name);
-    install_fd(
+    install_file_fd(
         file,
         open_flags_from_cloexec(flags & FSOPEN_CLOEXEC != 0),
         None,
@@ -493,7 +452,7 @@ pub fn sys_fsmount(fd: isize, flags: u32, mount_attrs: u32) -> SysResult {
     let detached = DetachedMountFile::new_tmpfs(spec.source, mount_attrs & MOUNT_ATTR_RDONLY != 0)
         .map_err(mount_error_to_errno)?;
     let open_flags = OpenFlags::PATH | open_flags_from_cloexec(flags & FSMOUNT_CLOEXEC != 0);
-    install_fd(detached, open_flags, None)
+    install_file_fd(detached, open_flags, None)
 }
 
 pub fn sys_fspick(dirfd: isize, path: *const u8, flags: u32) -> SysResult {
@@ -714,6 +673,9 @@ pub fn sys_mount(
             return Err(SysError::ENODEV);
         }
         _ => {
+            // CONTEXT: Several BusyBox/LTP setup paths mount scratch or pseudo
+            // filesystems by name before using only directory semantics. Keep a
+            // tmpfs-backed compatibility mount for unknown non-overlay types.
             mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
                 .map_err(mount_error_to_errno)?;
         }

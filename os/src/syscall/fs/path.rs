@@ -5,7 +5,7 @@ use super::super::user_ptr::{
     translated_byte_buffer_checked,
 };
 use super::fanotify::fanotify_notify_open;
-use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
+use super::fd::{get_fd_entry_by_fd, get_file_by_fd, install_file_fd};
 use super::stat::resolve_stat_from;
 use super::uapi::{
     AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
@@ -23,9 +23,7 @@ use crate::fs::{
     rename_in, rmdir_in, symlink_in, truncate_in, unlink_file_in,
 };
 use crate::mm::UserBuffer;
-use crate::task::{
-    CAP_SYS_CHROOT, FdTableEntry, PathSnapshot, current_process, current_user_token,
-};
+use crate::task::{CAP_SYS_CHROOT, PathSnapshot, current_process, current_user_token};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -41,6 +39,41 @@ fn dirfd_base_from(snapshot: &PathSnapshot, dirfd: isize) -> SysResult<WorkingDi
     file.working_dir().ok_or(SysError::ENOTDIR)
 }
 
+fn dirfd_path_base_from(snapshot: &PathSnapshot, dirfd: isize) -> SysResult<String> {
+    if dirfd == AT_FDCWD {
+        return Ok(snapshot.cwd_path.clone());
+    }
+    if dirfd < 0 {
+        return Err(SysError::EBADF);
+    }
+    let entry = get_fd_entry_by_fd(dirfd as usize)?;
+    if entry.file().working_dir().is_none() {
+        return Err(SysError::ENOTDIR);
+    }
+    Ok(entry
+        .dir_path()
+        .map(String::from)
+        .unwrap_or_else(|| snapshot.cwd_path.clone()))
+}
+
+/// Normalizes a syscall path relative to `dirfd` inside the process root.
+///
+/// This helper belongs to the syscall adapter layer because it interprets
+/// Linux `AT_FDCWD` and directory fd rules; VFS resolvers receive a prepared
+/// `PathContext` and do not read fd tables.
+pub(crate) fn normalize_path_from(
+    snapshot: &PathSnapshot,
+    dirfd: isize,
+    path: &str,
+) -> SysResult<String> {
+    let base = if path.starts_with('/') {
+        snapshot.root_path.clone()
+    } else {
+        dirfd_path_base_from(snapshot, dirfd)?
+    };
+    normalize_path_at_root(snapshot.root_path.as_str(), base.as_str(), path).ok_or(SysError::ENOENT)
+}
+
 pub(crate) fn path_context_from(
     snapshot: &PathSnapshot,
     dirfd: isize,
@@ -52,14 +85,7 @@ pub(crate) fn path_context_from(
         (root, root_path.clone())
     } else {
         let cwd = dirfd_base_from(snapshot, dirfd)?;
-        let cwd_path = if dirfd == AT_FDCWD {
-            snapshot.cwd_path.clone()
-        } else {
-            get_fd_entry_by_fd(dirfd as usize)?
-                .dir_path()
-                .map(String::from)
-                .unwrap_or_else(|| snapshot.cwd_path.clone())
-        };
+        let cwd_path = dirfd_path_base_from(snapshot, dirfd)?;
         (cwd, cwd_path)
     };
     Ok(PathContext::new_in_namespace(
@@ -385,12 +411,7 @@ fn install_open_file(
     flags: OpenFlags,
     dir_path: Option<String>,
 ) -> SysResult {
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-    let dir_path = file.working_dir().and(dir_path);
-    inner.fd_table[fd] = Some(FdTableEntry::from_file_with_dir_path(file, flags, dir_path));
-    Ok(fd as isize)
+    install_file_fd(file, flags, dir_path)
 }
 
 fn open_devfs_child_from_dirfd(
@@ -918,16 +939,6 @@ pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> SysResult {
     let token = current_user_token();
     let buffers =
         translated_byte_buffer_checked(token, buf.cast_const(), len, UserBufferAccess::Write)?;
-    let process = current_process();
-    let inner = process.inner_exclusive_access();
-    let Some(file) = inner
-        .fd_table
-        .get(fd)
-        .and_then(|entry| entry.as_ref())
-        .map(|entry| entry.file())
-    else {
-        return Err(SysError::EBADF);
-    };
-    drop(inner);
+    let file = get_file_by_fd(fd)?;
     Ok(file.read_dirent64(UserBuffer::new(buffers))?)
 }

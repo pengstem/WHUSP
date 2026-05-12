@@ -116,15 +116,22 @@ impl FileStat {
     }
 }
 
+/// Open file description interface used by syscall, VFS, and special fd code.
+///
+/// Required methods cover ordinary byte I/O. Optional methods default to the
+/// Linux-visible behavior for anonymous or non-capable file types, so concrete
+/// files override only the capabilities they actually support.
 pub trait File: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn readable(&self) -> bool;
     fn writable(&self) -> bool;
     fn read(&self, buf: UserBuffer) -> usize;
     fn write(&self, buf: UserBuffer) -> usize;
+    /// Falls back to normal write for files without append-specific offsets.
     fn write_append(&self, buf: UserBuffer) -> usize {
         self.write(buf)
     }
+    /// Reports regular-file style readiness from access mode by default.
     fn poll(&self, events: PollEvents) -> PollEvents {
         let mut ready = PollEvents::empty();
         if events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI | PollEvents::POLLRDHUP)
@@ -137,18 +144,22 @@ pub trait File: Send + Sync {
         }
         ready
     }
+    /// Anonymous fds without filesystem metadata report an empty stat block.
     fn stat(&self) -> FsResult<FileStat> {
         Ok(FileStat::default())
     }
+    /// Non-positionable files return EOF for positioned reads by default.
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
         0
     }
+    /// Non-positionable files accept no positioned write data by default.
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
     }
     fn set_len(&self, _len: usize) -> FsResult {
         Err(FsError::Unsupported)
     }
+    /// Preflight write hooks default to success; constrained files override.
     fn check_write(&self, _len: usize, _append: bool) -> FsResult {
         Ok(())
     }
@@ -164,6 +175,7 @@ pub trait File: Send + Sync {
     fn check_set_len(&self, _len: usize) -> FsResult {
         Ok(())
     }
+    /// Only memfd-like files expose Linux file seals.
     fn seals(&self) -> FsResult<u32> {
         Err(FsError::InvalidInput)
     }
@@ -176,6 +188,7 @@ pub trait File: Send + Sync {
     ) -> FsResult<Arc<dyn File + Send + Sync>> {
         Err(FsError::Unsupported)
     }
+    /// mmap/write exclusion hooks are opt-in for regular file descriptions.
     fn inc_writable_shared_mmap(&self) {}
     fn dec_writable_shared_mmap(&self) {}
     fn blocks_shared_writable_mmap(&self) -> bool {
@@ -184,6 +197,7 @@ pub trait File: Send + Sync {
     fn blocks_file_write(&self) -> bool {
         false
     }
+    /// Most in-memory/special files have no dirty backing store to flush.
     fn sync(&self, _data_only: bool) -> FsResult {
         Ok(())
     }

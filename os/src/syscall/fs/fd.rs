@@ -4,6 +4,7 @@ use crate::fs::{
     pipe_max_size,
 };
 use crate::task::{FdFlags, FdTableEntry, current_process, current_user_token};
+use alloc::string::String;
 use alloc::sync::Arc;
 use core::mem::size_of;
 
@@ -52,6 +53,28 @@ pub(super) fn get_fd_entry_by_fd(fd: usize) -> SysResult<FdTableEntry> {
 
 pub(super) fn get_file_by_fd(fd: usize) -> SysResult<Arc<dyn File + Send + Sync>> {
     Ok(get_fd_entry_by_fd(fd)?.file())
+}
+
+/// Installs a file into the current process fd table and returns the new fd.
+///
+/// `dir_path` is kept only for files that can act as a directory base. This
+/// preserves the fchdir/getcwd compatibility snapshot without making syscall
+/// path adapters mutate the fd table directly.
+pub(super) fn install_file_fd(
+    file: Arc<dyn File + Send + Sync>,
+    flags: OpenFlags,
+    dir_path: Option<String>,
+) -> SysResult {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
+    let dir_path = file.working_dir().and(dir_path);
+    let previous = inner.set_fd_entry(
+        fd,
+        FdTableEntry::from_file_with_dir_path(file, flags, dir_path),
+    );
+    debug_assert!(previous.is_none());
+    Ok(fd as isize)
 }
 
 pub fn sys_close(fd: usize) -> SysResult {
