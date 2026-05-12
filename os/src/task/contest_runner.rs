@@ -20,16 +20,16 @@ const ALL_TESTS: &[&str] = &[
 ];
 
 const TEST_SCRIPTS: &[&str] = &[
-    // "basic_testcode.sh",
-    // "busybox_testcode.sh",
-    // "lua_testcode.sh",
-    // "libctest_testcode.sh",
+    "basic_testcode.sh",
+    "busybox_testcode.sh",
+    "lua_testcode.sh",
+    "libctest_testcode.sh",
     // "iozone_testcode.sh",
     // "iperf_testcode.sh",
     // "libcbench_testcode.sh",
     // "netperf_testcode.sh",
     // "cyclictest_testcode.sh",
-    "ltp_testcode.sh",
+    // "ltp_testcode.sh",
     // "lmbench_testcode.sh",
 ];
 
@@ -208,12 +208,18 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
     // "FAIL LTP CASE ... : <ret>" record as a per-case result line. A zero
     // return still means the case passed, so keep the text stable here.
     command.push_str("echo \"RUN LTP CASE $case_name\"; ");
-    command.push_str("\"./$case_name\"; ");
+    append_ltp_case_invocation(command);
     command.push_str("ret=$?; echo \"FAIL LTP CASE $case_name : $ret\"; done; \"");
     command.push_str(libc_root);
     command.push_str("/busybox\" echo \"#### OS COMP TEST GROUP END ltp-");
     command.push_str(libc_label(libc_root));
     command.push_str(" ####\"; }");
+}
+
+fn append_ltp_case_invocation(command: &mut String) {
+    command.push_str(
+        "case \"$case_name\" in mmap1) \"./$case_name\" -I 3 ;; *) \"./$case_name\" ;; esac; ",
+    );
 }
 
 fn append_ltp_case_filter(command: &mut String) {

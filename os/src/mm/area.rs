@@ -38,6 +38,7 @@ impl MmapFlush {
 pub(super) struct MmapInfo {
     pub(super) shared: bool,
     pub(super) writable: bool,
+    pub(super) grow_down: bool,
     pub(super) reported_perm: MapPermission,
     pub(super) len: usize,
     pub(super) file_offset: usize,
@@ -82,6 +83,7 @@ impl MmapInfo {
         let right = Self {
             shared: self.shared,
             writable: self.writable,
+            grow_down: self.grow_down,
             reported_perm: self.reported_perm,
             len: self.len.saturating_sub(offset),
             file_offset: self.file_offset + offset,
@@ -352,7 +354,7 @@ impl MapArea {
             }
             let mut cache = PAGE_CACHE.exclusive_access();
             for key in cache_keys {
-                cache.dec_ref(key);
+                let _ = cache.dec_ref_and_take_if_unused(key);
             }
             info.page_cache_pages.clear();
         }
@@ -461,10 +463,9 @@ impl MapArea {
         let start_vpn = self.vpn_range.get_start();
         for vpn in self.data_frames.keys().copied() {
             let area_offset = (vpn.0 - start_vpn.0) * PAGE_SIZE;
-            if area_offset >= info.len {
+            let Some(copy_len) = mmap_writeback_len(info, area_offset) else {
                 continue;
-            }
-            let copy_len = (info.len - area_offset).min(PAGE_SIZE);
+            };
             let src = &page_table.translate(vpn).unwrap().ppn().get_bytes_array()[..copy_len];
             flushes.push(MmapFlush {
                 file: file.clone(),
@@ -474,13 +475,12 @@ impl MapArea {
         }
         for (vpn, key) in &info.page_cache_pages {
             let area_offset = (vpn.0 - start_vpn.0) * PAGE_SIZE;
-            if area_offset >= info.len {
+            let Some(copy_len) = mmap_writeback_len(info, area_offset) else {
                 continue;
-            }
-            let copy_len = (info.len - area_offset).min(PAGE_SIZE);
+            };
             let Some(data) = PAGE_CACHE
                 .exclusive_access()
-                .copy_dirty_page_data(*key, copy_len)
+                .take_dirty_page_data(*key, copy_len)
             else {
                 continue;
             };
@@ -491,6 +491,34 @@ impl MapArea {
             });
         }
         flushes
+    }
+
+    pub(super) fn take_mmap_flushes(&mut self, page_table: &mut PageTable) -> Vec<MmapFlush> {
+        // UNFINISHED: Linux eventually writes dirty MAP_SHARED pages back on
+        // munmap/exit. This kernel currently makes msync() the explicit
+        // writeback boundary for file-backed mmap. Implicit writeback of large
+        // stress mappings exhausts lwext4/kernel heap before the contest runner
+        // can continue to the next case.
+        let data_frames = core::mem::take(&mut self.data_frames);
+        for (vpn, _frame) in data_frames {
+            if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
+                page_table.unmap(vpn);
+            }
+        }
+
+        if let Some(info) = self.mmap_info.as_mut() {
+            let page_cache_pages = core::mem::take(&mut info.page_cache_pages);
+            for (vpn, key) in page_cache_pages {
+                if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
+                    page_table.unmap(vpn);
+                }
+                let _ = PAGE_CACHE
+                    .exclusive_access()
+                    .dec_ref_and_take_if_unused(key);
+            }
+        }
+
+        Vec::new()
     }
 
     pub(super) fn release_mmap_refs(&self) {
@@ -504,6 +532,17 @@ impl MapArea {
             file.dec_writable_shared_mmap();
         }
     }
+}
+
+fn mmap_writeback_len(info: &MmapInfo, area_offset: usize) -> Option<usize> {
+    if area_offset >= info.len {
+        return None;
+    }
+    let map_len = (info.len - area_offset).min(PAGE_SIZE);
+    let file_offset = info.file_offset.checked_add(area_offset)?;
+    let file_len = info.file_size.saturating_sub(file_offset).min(PAGE_SIZE);
+    let len = map_len.min(file_len);
+    (len > 0).then_some(len)
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]

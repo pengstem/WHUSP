@@ -13,6 +13,8 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+const STACK_GUARD_GAP_PAGES: usize = 256;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryProtectError {
     Unmapped,
@@ -40,6 +42,12 @@ pub enum MmapFaultResult {
     Handled,
     Page(MmapFaultPage),
     PageCache(MmapPageCacheFault),
+    FatalSigsegv,
+}
+
+enum GrowDownMmapFault {
+    Grown(usize),
+    GuardBlocked,
 }
 
 pub struct MmapFaultPage {
@@ -375,6 +383,7 @@ impl MemorySet {
         file_offset: usize,
         shared: bool,
         writable: bool,
+        grow_down: bool,
         page_cache_id: Option<PageCacheId>,
     ) -> Option<usize> {
         let map_len = checked_page_align_up(len)?;
@@ -384,6 +393,7 @@ impl MemorySet {
         area.mmap_info = Some(MmapInfo {
             shared,
             writable,
+            grow_down,
             reported_perm: reported_permission,
             len,
             file_offset,
@@ -409,6 +419,7 @@ impl MemorySet {
         file_offset: usize,
         shared: bool,
         writable: bool,
+        grow_down: bool,
         page_cache_id: Option<PageCacheId>,
     ) -> Option<(usize, Vec<MmapFlush>)> {
         if start % PAGE_SIZE != 0 {
@@ -423,23 +434,35 @@ impl MemorySet {
         self.split_area_at(end_vpn);
 
         let mut flushes = Vec::new();
+        let mut unmapped = false;
         let mut idx = 0;
         while idx < self.areas.len() {
             let area_start = self.areas[idx].vpn_range.get_start();
             let area_end = self.areas[idx].vpn_range.get_end();
             if area_start < end_vpn && area_end > start_vpn {
                 let mut area = self.areas.remove(idx);
-                flushes.extend(area.collect_mmap_flushes(&self.page_table));
-                area.unmap_resident(&mut self.page_table);
+                unmapped = true;
+                if area.is_mmap() {
+                    flushes.extend(area.take_mmap_flushes(&mut self.page_table));
+                    area.release_mmap_refs();
+                } else if area.is_shm() {
+                    area.unmap_resident(&mut self.page_table);
+                } else {
+                    area.unmap(&mut self.page_table);
+                }
             } else {
                 idx += 1;
             }
+        }
+        if unmapped {
+            arch_mm::flush_tlb_all();
         }
 
         let mut area = MapArea::new(start.into(), end.into(), MapType::Framed, permission);
         area.mmap_info = Some(MmapInfo {
             shared,
             writable,
+            grow_down,
             reported_perm: reported_permission,
             len,
             file_offset,
@@ -514,9 +537,18 @@ impl MemorySet {
         access: MmapFaultAccess,
     ) -> Option<MmapFaultResult> {
         let vpn = VirtAddr::from(addr).floor();
-        let area_idx = self.areas.iter().position(|area| {
+        let area_idx = match self.areas.iter().position(|area| {
             area.is_mmap() && area.vpn_range.get_start() <= vpn && vpn < area.vpn_range.get_end()
-        })?;
+        }) {
+            Some(idx) => idx,
+            None => match self.grow_down_mmap_area_for_fault(vpn, access) {
+                Some(GrowDownMmapFault::Grown(idx)) => idx,
+                Some(GrowDownMmapFault::GuardBlocked) => {
+                    return Some(MmapFaultResult::FatalSigsegv);
+                }
+                None => return None,
+            },
+        };
         let area = &self.areas[area_idx];
         if !access.is_allowed_by(area.map_perm) {
             return None;
@@ -630,18 +662,22 @@ impl MemorySet {
         self.split_area_at(end_vpn);
 
         let mut flushes = Vec::new();
+        let mut unmapped = false;
         let mut idx = 0;
         while idx < self.areas.len() {
             let area_start = self.areas[idx].vpn_range.get_start();
             let area_end = self.areas[idx].vpn_range.get_end();
             if self.areas[idx].is_mmap() && area_start >= start_vpn && area_end <= end_vpn {
                 let mut area = self.areas.remove(idx);
-                flushes.extend(area.collect_mmap_flushes(&self.page_table));
+                unmapped = true;
+                flushes.extend(area.take_mmap_flushes(&mut self.page_table));
                 area.release_mmap_refs();
-                area.unmap_resident(&mut self.page_table);
             } else {
                 idx += 1;
             }
+        }
+        if unmapped {
+            arch_mm::flush_tlb_all();
         }
         Some(flushes)
     }
@@ -876,6 +912,7 @@ impl MemorySet {
         };
         match fault {
             MmapFaultResult::Handled => true,
+            MmapFaultResult::FatalSigsegv => false,
             MmapFaultResult::Page(page) => {
                 let Some(frame) = page.build_frame() else {
                     return false;
@@ -1008,6 +1045,47 @@ impl MemorySet {
                     .as_ref()
                     .is_none_or(|file| file.writable() && !file.blocks_shared_writable_mmap())
             })
+    }
+
+    fn grow_down_mmap_area_for_fault(
+        &mut self,
+        vpn: super::VirtPageNum,
+        access: MmapFaultAccess,
+    ) -> Option<GrowDownMmapFault> {
+        let area_idx = self.areas.iter().position(|area| {
+            let Some(info) = &area.mmap_info else {
+                return false;
+            };
+            let Some(next_vpn) = vpn.0.checked_add(1) else {
+                return false;
+            };
+            // UNFINISHED: Linux also checks the faulting stack pointer,
+            // RLIMIT_STACK, and more VMA flags. This handles the contest
+            // pthread/LTP path by growing anonymous MAP_GROWSDOWN VMAs one
+            // page at a time.
+            info.grow_down
+                && info.backing_file.is_none()
+                && access.is_allowed_by(area.map_perm)
+                && area.vpn_range.get_start().0 == next_vpn
+        })?;
+
+        if !self.grow_down_guard_gap_is_clear(vpn, area_idx) {
+            return Some(GrowDownMmapFault::GuardBlocked);
+        }
+
+        let end = self.areas[area_idx].vpn_range.get_end();
+        self.areas[area_idx].vpn_range = VPNRange::new(vpn, end);
+        Some(GrowDownMmapFault::Grown(area_idx))
+    }
+
+    fn grow_down_guard_gap_is_clear(&self, new_start: super::VirtPageNum, grow_idx: usize) -> bool {
+        let guard_start = new_start.0.saturating_sub(STACK_GUARD_GAP_PAGES);
+        self.areas.iter().enumerate().all(|(idx, area)| {
+            if idx == grow_idx {
+                return true;
+            }
+            area.vpn_range.get_start().0 >= new_start.0 || area.vpn_range.get_end().0 <= guard_start
+        })
     }
 }
 

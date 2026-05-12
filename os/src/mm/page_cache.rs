@@ -118,6 +118,19 @@ impl PageCache {
         }
     }
 
+    pub(crate) fn dec_ref_and_take_if_unused(
+        &mut self,
+        key: PageCacheKey,
+    ) -> Option<PageCachePage> {
+        let page = self.pages.get_mut(&key)?;
+        page.ref_count = page.ref_count.saturating_sub(1);
+        if page.ref_count == 0 {
+            self.pages.remove(&key)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn copy_page_data(&self, key: PageCacheKey, len: usize) -> Option<Vec<u8>> {
         let page = self.pages.get(&key)?;
         let len = len.min(PAGE_SIZE);
@@ -137,6 +150,20 @@ impl PageCache {
         if !page.dirty {
             return None;
         }
+        let len = len.min(PAGE_SIZE);
+        Some(page.ppn().get_bytes_array()[..len].to_vec())
+    }
+
+    pub(crate) fn take_dirty_page_data(
+        &mut self,
+        key: PageCacheKey,
+        len: usize,
+    ) -> Option<Vec<u8>> {
+        let page = self.pages.get_mut(&key)?;
+        if !page.dirty {
+            return None;
+        }
+        page.dirty = false;
         let len = len.min(PAGE_SIZE);
         Some(page.ppn().get_bytes_array()[..len].to_vec())
     }

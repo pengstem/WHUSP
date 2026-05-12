@@ -14,13 +14,18 @@ const PROT_MASK: usize = PROT_READ | PROT_WRITE | PROT_EXEC;
 
 const MAP_SHARED: usize = 0x01;
 const MAP_PRIVATE: usize = 0x02;
+const MAP_SHARED_VALIDATE: usize = 0x03;
 const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
 const MAP_DENYWRITE: usize = 0x0800;
 const MAP_EXECUTABLE: usize = 0x1000;
+const MAP_GROWSDOWN: usize = 0x100;
 const MAP_NORESERVE: usize = 0x4000;
 const MAP_POPULATE: usize = 0x8000;
 const MAP_STACK: usize = 0x20000;
+const MAP_LOCKED: usize = 0x2000;
+const MAP_FILE: usize = 0x0000;
+const MAP_FIXED_NOREPLACE: usize = 0x100000;
 // CONTEXT: Linux keeps MAP_DENYWRITE/MAP_EXECUTABLE as ignored legacy flags,
 // and musl/glibc may pass MAP_NORESERVE or MAP_STACK as advisory flags. The
 // current VM has no reservation accounting, eager MAP_POPULATE prefaulting, or
@@ -32,9 +37,11 @@ const MAP_SUPPORTED: usize = MAP_SHARED
     | MAP_ANONYMOUS
     | MAP_DENYWRITE
     | MAP_EXECUTABLE
+    | MAP_GROWSDOWN
     | MAP_NORESERVE
     | MAP_POPULATE
-    | MAP_STACK;
+    | MAP_STACK
+    | MAP_LOCKED;
 const MAP_TYPE_MASK: usize = 0x03;
 const MS_ASYNC: i32 = 0x1;
 const MS_INVALIDATE: i32 = 0x2;
@@ -137,11 +144,11 @@ fn sys_mmap_impl(
     fd: usize,
     offset: usize,
 ) -> Result<usize, SysError> {
-    if len == 0 || offset % PAGE_SIZE != 0 {
-        return Err(SysError::EINVAL);
-    }
     if prot & !PROT_MASK != 0 {
         return Err(SysError::EINVAL);
+    }
+    if flags & MAP_SHARED_VALIDATE == MAP_SHARED_VALIDATE {
+        return Err(SysError::ENOTSUP);
     }
     if flags & !MAP_SUPPORTED != 0 {
         return Err(SysError::EINVAL);
@@ -154,6 +161,7 @@ fn sys_mmap_impl(
     let shared = map_type == MAP_SHARED;
     let anonymous = flags & MAP_ANONYMOUS != 0;
     let fixed = flags & MAP_FIXED != 0;
+    let grow_down = flags & MAP_GROWSDOWN != 0;
     let writable = prot & PROT_WRITE != 0;
     let permission = prot_to_map_permission(prot);
     let reported_permission = prot_to_reported_map_permission(prot);
@@ -164,10 +172,13 @@ fn sys_mmap_impl(
         return Err(SysError::EINVAL);
     }
 
-    let process = current_process();
     let (backing_file, file_size, page_cache_id) = if anonymous {
+        if len == 0 || offset % PAGE_SIZE != 0 {
+            return Err(SysError::EINVAL);
+        }
         (None, 0, None)
     } else {
+        let process = current_process();
         let fd = fd as isize;
         if fd < 0 {
             return Err(SysError::EBADF);
@@ -179,6 +190,9 @@ fn sys_mmap_impl(
             .and_then(|entry| entry.as_ref())
             .map(|entry| entry.file())
             .ok_or(SysError::EBADF)?;
+        if len == 0 || offset % PAGE_SIZE != 0 {
+            return Err(SysError::EINVAL);
+        }
         if !file.readable() {
             return Err(SysError::EACCES);
         }
@@ -198,7 +212,9 @@ fn sys_mmap_impl(
         None
     };
 
+    let process = current_process();
     let mut inner = process.inner_exclusive_access();
+
     if fixed {
         let (mapped_addr, flushes) = inner
             .memory_set
@@ -212,6 +228,7 @@ fn sys_mmap_impl(
                 offset,
                 shared,
                 writable,
+                grow_down,
                 page_cache_id,
             )
             .ok_or(SysError::ENOMEM)?;
@@ -237,6 +254,7 @@ fn sys_mmap_impl(
             offset,
             shared,
             writable,
+            grow_down,
             page_cache_id,
         )
         .ok_or(SysError::ENOMEM)?;

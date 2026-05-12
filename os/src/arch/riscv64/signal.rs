@@ -300,7 +300,7 @@ pub fn deliver_pending_signal(
     )
     .is_err()
     {
-        current_add_signal(SignalFlags::SIGSEGV);
+        force_default_sigsegv();
         return false;
     }
 
@@ -317,7 +317,7 @@ pub fn deliver_pending_signal(
         trampoline_ptr
     };
     if restorer_ptr == trampoline_ptr && !make_trampoline_page_executable(trampoline_ptr) {
-        current_add_signal(SignalFlags::SIGSEGV);
+        force_default_sigsegv();
         return false;
     }
 
@@ -330,6 +330,17 @@ pub fn deliver_pending_signal(
     trap_cx.x[11] = siginfo_ptr;
     trap_cx.x[12] = ucontext_ptr;
     true
+}
+
+fn force_default_sigsegv() {
+    let signum = SignalFlags::SIGSEGV.bits().trailing_zeros() as usize;
+    current_process().inner_exclusive_access().signal_actions[signum] = SignalAction::default();
+    if let Some(task) = current_task() {
+        task.inner_exclusive_access()
+            .signal_mask
+            .remove(SignalFlags::SIGSEGV);
+    }
+    current_add_signal(SignalFlags::SIGSEGV);
 }
 
 fn interrupted_pc_for_delivery(

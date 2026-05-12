@@ -263,7 +263,7 @@ pub fn deliver_pending_signal(interrupted_pc: usize) -> bool {
     )
     .is_err()
     {
-        current_add_signal(SignalFlags::SIGSEGV);
+        force_default_sigsegv();
         return false;
     }
 
@@ -271,7 +271,7 @@ pub fn deliver_pending_signal(interrupted_pc: usize) -> bool {
     let ucontext_ptr = frame_sp + offset_of!(LoongArchSignalFrame, ucontext);
     let trampoline_ptr = frame_sp + offset_of!(LoongArchSignalFrame, trampoline);
     if !make_trampoline_page_executable(trampoline_ptr) {
-        current_add_signal(SignalFlags::SIGSEGV);
+        force_default_sigsegv();
         return false;
     }
 
@@ -284,6 +284,17 @@ pub fn deliver_pending_signal(interrupted_pc: usize) -> bool {
     trap_cx.x[5] = siginfo_ptr;
     trap_cx.x[6] = ucontext_ptr;
     true
+}
+
+fn force_default_sigsegv() {
+    let signum = SignalFlags::SIGSEGV.bits().trailing_zeros() as usize;
+    current_process().inner_exclusive_access().signal_actions[signum] = SignalAction::default();
+    if let Some(task) = current_task() {
+        task.inner_exclusive_access()
+            .signal_mask
+            .remove(SignalFlags::SIGSEGV);
+    }
+    current_add_signal(SignalFlags::SIGSEGV);
 }
 
 pub fn sys_rt_sigreturn() -> SysResult {

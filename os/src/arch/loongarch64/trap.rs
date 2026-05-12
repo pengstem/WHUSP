@@ -4,8 +4,8 @@ use crate::config::TRAMPOLINE;
 use crate::mm::{MmapFaultAccess, MmapFaultResult};
 use crate::syscall::syscall;
 use crate::task::{
-    SignalFlags, account_current_system_time_until, account_current_user_time_until,
-    check_signals_of_current, current_add_signal, current_process, current_trap_cx,
+    SignalAction, SignalFlags, account_current_system_time_until, account_current_user_time_until,
+    check_signals_of_current, current_add_signal, current_process, current_task, current_trap_cx,
     current_user_token, exit_current_group_and_run_next, mark_current_user_time_entry,
     suspend_current_and_run_next,
 };
@@ -146,6 +146,10 @@ pub(crate) fn handle_mmap_page_fault(addr: usize, access: MmapFaultAccess) -> bo
     };
     match fault {
         MmapFaultResult::Handled => true,
+        MmapFaultResult::FatalSigsegv => {
+            force_default_sigsegv_current();
+            false
+        }
         MmapFaultResult::Page(page) => {
             // UNFINISHED: Linux reports SIGBUS for some file-backed mmap faults,
             // such as pages wholly beyond the backing object; this kernel still
@@ -176,6 +180,17 @@ pub(crate) fn handle_mmap_page_fault(addr: usize, access: MmapFaultAccess) -> bo
             installed
         }
     }
+}
+
+fn force_default_sigsegv_current() {
+    let signum = SignalFlags::SIGSEGV.bits().trailing_zeros() as usize;
+    current_process().inner_exclusive_access().signal_actions[signum] = SignalAction::default();
+    if let Some(task) = current_task() {
+        task.inner_exclusive_access()
+            .signal_mask
+            .remove(SignalFlags::SIGSEGV);
+    }
+    current_add_signal(SignalFlags::SIGSEGV);
 }
 
 #[unsafe(no_mangle)]
