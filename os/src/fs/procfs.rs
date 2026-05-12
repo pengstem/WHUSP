@@ -1,4 +1,4 @@
-use super::dirent::{write_dir_entries, RawDirEntry, DT_DIR, DT_LNK, DT_REG};
+use super::dirent::{DT_DIR, DT_LNK, DT_REG, RawDirEntry, write_dir_entries};
 use super::mount;
 use super::pipe::{PIPE_MAX_CAPACITY, PIPE_MIN_CAPACITY};
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
@@ -8,7 +8,7 @@ use crate::mm::frame_stats;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::keyring;
 use crate::task::{
-    list_process_snapshots, pid2process, ProcessProcSnapshot, TaskControlBlock, TaskStatus,
+    ProcessProcSnapshot, TaskControlBlock, TaskStatus, list_process_snapshots, pid2process,
 };
 use crate::timer::{get_time_us, us_to_clock_ticks};
 use alloc::format;

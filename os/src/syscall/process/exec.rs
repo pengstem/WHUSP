@@ -125,6 +125,31 @@ fn libc_test_root(cwd_path: &str, script_path: &str) -> Option<&'static str> {
     }
 }
 
+fn libc_test_root_from_envs(envs: &[String]) -> Option<&'static str> {
+    for env in envs {
+        if let Some(root) = env.strip_prefix("LTPROOT=") {
+            if is_path_under(root, "/musl") {
+                return Some("/musl");
+            }
+            if is_path_under(root, "/glibc") {
+                return Some("/glibc");
+            }
+        }
+    }
+
+    for env in envs {
+        if let Some(paths) = env.strip_prefix("LD_LIBRARY_PATH=") {
+            if paths.starts_with("/musl/lib") {
+                return Some("/musl");
+            }
+            if paths.starts_with("/glibc/lib") {
+                return Some("/glibc");
+            }
+        }
+    }
+    None
+}
+
 fn has_execute_permission(stat: &FileStat) -> bool {
     let credentials = current_process().credentials();
     if credentials.fsuid == 0 {
@@ -199,9 +224,12 @@ fn executable_node_in(
 fn busybox_fallback(
     interpreter: &ScriptInterpreter,
     script_path: &str,
+    envs: &[String],
 ) -> Option<(String, Vec<String>)> {
     let snapshot = current_process().path_snapshot();
-    let root = libc_test_root(snapshot.cwd_path.as_str(), script_path)?;
+    let root = libc_test_root(snapshot.cwd_path.as_str(), script_path)
+        .or_else(|| libc_test_root_from_envs(envs))
+        .unwrap_or("/musl");
     let mut busybox_path = String::from(root);
     busybox_path.push_str("/busybox");
 
@@ -221,6 +249,7 @@ fn busybox_fallback(
 fn interpreter_candidates(
     interpreter: &ScriptInterpreter,
     script_path: &str,
+    envs: &[String],
 ) -> Vec<(String, Vec<String>)> {
     let mut direct_args = Vec::new();
     direct_args.push(interpreter.path.clone());
@@ -230,9 +259,11 @@ fn interpreter_candidates(
 
     let mut candidates = Vec::new();
     candidates.push((interpreter.path.clone(), direct_args));
-    if let Some(fallback) = busybox_fallback(interpreter, script_path) {
+    if let Some(fallback) = busybox_fallback(interpreter, script_path, envs) {
         // CONTEXT: Official-style test disks put shell-capable BusyBox under
-        // `/musl` or `/glibc` instead of providing a real `/bin/sh`.
+        // `/musl` or `/glibc` instead of providing a real `/bin/sh`. LTP often
+        // executes temporary scripts from `/tmp`, so infer the active libc root
+        // from inherited environment when the path alone is ambiguous.
         candidates.push(fallback);
     }
     candidates
@@ -375,7 +406,7 @@ fn exec_script(
     }
 
     for (interpreter_path, candidate_args) in
-        interpreter_candidates(&interpreter, script_path.as_str())
+        interpreter_candidates(&interpreter, script_path.as_str(), envs.as_slice())
     {
         let Ok(interpreter_data) = read_exec_file(interpreter_path.as_str()) else {
             continue;
@@ -392,6 +423,16 @@ fn exec_script(
     }
 
     Err(SysError::ENOENT)
+}
+
+fn shell_path_redirect(path: &str, envs: &[String]) -> Option<String> {
+    match path {
+        "/bin/sh" | "/bin/bash" => {
+            let root = libc_test_root_from_envs(envs).unwrap_or("/musl");
+            Some(format!("{root}/busybox"))
+        }
+        _ => None,
+    }
 }
 
 fn exec_loaded_program(
@@ -442,6 +483,7 @@ fn exec_loaded_program(
 fn exec_path(path: String, args: Vec<String>, envs: Vec<String>) -> SysResult {
     let args = normalize_exec_args(args);
     let envs = normalize_exec_envs(path.as_str(), envs);
+    let path = shell_path_redirect(path.as_str(), envs.as_slice()).unwrap_or(path);
     let executable_node = executable_node_in(
         current_process().path_snapshot().context,
         path.as_str(),
