@@ -1,6 +1,6 @@
 use crate::arch::loongarch64::mm::phys_to_virt;
 
-const QEMU_GED_POWEROFF: usize = 0x100e_001c;
+const QEMU_GED_POWEROFF: usize = 0x100e_001c; // QEMU virt GED poweroff register.
 
 pub fn set_timer(timer: usize) {
     let now = loongArch64::time::Time::read();

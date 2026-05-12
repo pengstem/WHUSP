@@ -20,6 +20,8 @@ SMP ?= 1
 TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 KERNEL_ELF := $(TARGET_DIR)/$(TARGET)/$(MODE)/os
 PRIMARY_DISK ?= $(DEFAULT_DISK)
+# CONTEXT: retained for explicit experiments only; current QEMU commands below
+# do not attach x1, so submission-style runs stay x0-only.
 AUX_DISK ?=
 COMMA := ,
 

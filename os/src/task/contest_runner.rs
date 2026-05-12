@@ -5,6 +5,8 @@ const LA_MUSL_COMPAT_PRELOAD: &str = "/opt/oscomp-support/lib/liboscomp-musl-com
 
 const INTERACTIVE_SHELL: bool = false;
 
+// CONTEXT: `ALL_TESTS` is the marker universe. Disabled groups still emit
+// START/END pairs so the local scorer and official-style logs stay aligned.
 const ALL_TESTS: &[&str] = &[
     "basic_testcode.sh",
     "busybox_testcode.sh",
@@ -19,6 +21,8 @@ const ALL_TESTS: &[&str] = &[
     "ltp_testcode.sh",
 ];
 
+// CONTEXT: current submit-safe default runs the groups with stable local score
+// signal; skipped groups above still get marker pairs instead of disappearing.
 const TEST_SCRIPTS: &[&str] = &[
     "basic_testcode.sh",
     "busybox_testcode.sh",
@@ -111,6 +115,8 @@ fn append_skipped_group_marker(
     libc_root: &str,
 ) {
     let libc = libc_label(libc_root);
+    // CONTEXT: score_autotest and the official-style parser key on this exact
+    // START/END marker text, including spaces and hashes.
     append_separator(command, first);
     command.push_str(&format!(
         "echo '#### OS COMP TEST GROUP START {testname}-{libc} ####'"
@@ -135,6 +141,8 @@ fn append_basic_runner(command: &mut String, libc_root: &str) {
     let libc = libc_label(libc_root);
     command.push_str("cd ");
     command.push_str(libc_root);
+    // CONTEXT: keep basic's explicit marker text aligned with skipped groups;
+    // the basic script itself does not emit the outer group markers.
     command.push_str(" && ./busybox echo \"#### OS COMP TEST GROUP START basic-");
     command.push_str(libc);
     command.push_str(" ####\"; cd ");
@@ -198,6 +206,8 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
         command.push_str(libc_root);
         command.push_str("/lib:/glibc/lib:/musl/lib:/lib\"; ");
     }
+    // CONTEXT: LTP uses the same outer group marker contract as normal
+    // scripts even though per-case lines use the historical FAIL/RUN format.
     command.push_str(
         "export PATH=\"$PATH:$LTPROOT/testcases/bin:$LTPROOT/bin:/musl/ltp/testcases/bin:/musl/ltp/bin:/glibc/ltp/testcases/bin:/glibc/ltp/bin\"; ./busybox echo \"#### OS COMP TEST GROUP START ltp-",
     );

@@ -9,6 +9,8 @@ KERNEL_LA_SRC := os/target/$(LOONGARCH_TARGET)/$(MODE)/os
 
 TEST_DISK ?= $(CURDIR)/sdcard-rv.img
 TEST_DISK_LA ?= $(CURDIR)/sdcard-la.img
+# CONTEXT: the default contest boot path attaches only the primary x0 test disk.
+# Keep auxiliary disk variables out of run-rv/run-la until x1 is reintroduced deliberately.
 CONTEST_AUX_DISK ?= $(CURDIR)/disk.img
 CONTEST_AUX_DISK_LA ?= $(CURDIR)/disk-la.img
 
