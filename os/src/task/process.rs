@@ -458,6 +458,33 @@ impl ProcessControlBlockInner {
         }
     }
 
+    pub fn fd_entry(&self, fd: usize) -> Option<FdTableEntry> {
+        self.fd_table
+            .get(fd)
+            .and_then(|entry| entry.as_ref())
+            .cloned()
+    }
+
+    /// Removes an fd entry from the process table for lock-free close cleanup.
+    ///
+    /// The returned entry must be closed or dropped after releasing
+    /// `ProcessControlBlockInner` so file cleanup cannot re-enter this lock.
+    pub fn take_fd_entry(&mut self, fd: usize) -> Option<FdTableEntry> {
+        self.fd_table.get_mut(fd)?.take()
+    }
+
+    /// Installs an fd entry at an already validated descriptor number.
+    ///
+    /// Returns the entry that was previously installed at `fd`, if any. The
+    /// caller owns any close cleanup for that returned entry after dropping the
+    /// process lock.
+    pub fn set_fd_entry(&mut self, fd: usize, entry: FdTableEntry) -> Option<FdTableEntry> {
+        while self.fd_table.len() <= fd {
+            self.fd_table.push(None);
+        }
+        self.fd_table[fd].replace(entry)
+    }
+
     pub fn alloc_tid(&mut self) -> usize {
         self.task_res_allocator.alloc()
     }

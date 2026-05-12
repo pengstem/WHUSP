@@ -6,12 +6,20 @@ use bitflags::bitflags;
 pub const FD_LIMIT: usize = 1024;
 
 bitflags! {
+    /// Per-descriptor flags stored in the fd table.
+    ///
+    /// These are separate from file status flags such as `O_APPEND` and
+    /// `O_NONBLOCK`, which belong to the shared open file description.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct FdFlags: u32 {
         const CLOEXEC = 1;
     }
 }
 
+/// One process fd table slot.
+///
+/// `fd_flags` belong to this descriptor only, while status flags are stored on
+/// the shared `File` object so duplicated descriptors observe the same status.
 #[derive(Clone)]
 pub struct FdTableEntry {
     file: Arc<dyn File + Send + Sync>,

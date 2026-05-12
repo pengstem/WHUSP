@@ -47,12 +47,7 @@ const MEMFD_NAME_MAX: usize = 249;
 pub(super) fn get_fd_entry_by_fd(fd: usize) -> SysResult<FdTableEntry> {
     let process = current_process();
     let inner = process.inner_exclusive_access();
-    inner
-        .fd_table
-        .get(fd)
-        .and_then(|entry| entry.as_ref())
-        .cloned()
-        .ok_or(SysError::EBADF)
+    inner.fd_entry(fd).ok_or(SysError::EBADF)
 }
 
 pub(super) fn get_file_by_fd(fd: usize) -> SysResult<Arc<dyn File + Send + Sync>> {
@@ -63,21 +58,23 @@ pub fn sys_close(fd: usize) -> SysResult {
     let process = current_process();
     let entry = {
         let mut inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return Err(SysError::EBADF);
-        }
-        let Some(entry) = inner.fd_table[fd].take() else {
-            return Err(SysError::EBADF);
-        };
-        entry
+        inner.take_fd_entry(fd).ok_or(SysError::EBADF)?
     };
+    close_detached_fd_entry(entry);
+    Ok(0)
+}
+
+/// Completes close cleanup after an fd entry has left the process table.
+///
+/// Call this without holding `ProcessControlBlockInner`; lock and fanotify
+/// cleanup can inspect file state and must not run while the fd table is locked.
+fn close_detached_fd_entry(entry: FdTableEntry) {
     release_record_locks_for_close(&entry);
     release_ofd_record_locks_for_close(&entry);
     release_flock_locks_for_close(&entry);
     let file = entry.file();
     fanotify_notify_close(&file, file.writable());
     drop(entry);
-    Ok(0)
 }
 
 fn pipe2_open_flags(flags: u32) -> SysResult<OpenFlags> {
@@ -126,28 +123,39 @@ pub fn sys_pipe2(pipefd: *mut i32, flags: u32) -> SysResult {
     let pipe_capacity = default_pipe_capacity_for_current_process();
 
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
     let (pipe_read, pipe_write) = make_pipe(pipe_capacity);
-    let read_fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-    inner.fd_table[read_fd] = Some(FdTableEntry::from_file(
-        pipe_read,
-        OpenFlags::RDONLY | pipe_flags,
-    ));
-    let write_fd = match inner.alloc_fd_from(0) {
-        Some(fd) => fd,
-        None => {
-            inner.fd_table[read_fd] = None;
-            return Err(SysError::EMFILE);
+    let mut cleanup_entry = None;
+    let fds = {
+        let mut inner = process.inner_exclusive_access();
+        let read_fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
+        let _ = inner.set_fd_entry(
+            read_fd,
+            FdTableEntry::from_file(pipe_read, OpenFlags::RDONLY | pipe_flags),
+        );
+        if let Some(write_fd) = inner.alloc_fd_from(0) {
+            let _ = inner.set_fd_entry(
+                write_fd,
+                FdTableEntry::from_file(pipe_write, OpenFlags::WRONLY | pipe_flags),
+            );
+            Ok([read_fd, write_fd])
+        } else {
+            cleanup_entry = inner.take_fd_entry(read_fd);
+            Err(SysError::EMFILE)
         }
     };
-    inner.fd_table[write_fd] = Some(FdTableEntry::from_file(
-        pipe_write,
-        OpenFlags::WRONLY | pipe_flags,
-    ));
+    if let Some(entry) = cleanup_entry {
+        close_detached_fd_entry(entry);
+    }
+    let fds = fds?;
 
-    if let Err(err) = write_pipefd_pair(token, pipefd, [read_fd as i32, write_fd as i32]) {
-        inner.fd_table[read_fd] = None;
-        inner.fd_table[write_fd] = None;
+    if let Err(err) = write_pipefd_pair(token, pipefd, [fds[0] as i32, fds[1] as i32]) {
+        let entries = {
+            let mut inner = process.inner_exclusive_access();
+            [inner.take_fd_entry(fds[0]), inner.take_fd_entry(fds[1])]
+        };
+        for entry in entries.into_iter().flatten() {
+            close_detached_fd_entry(entry);
+        }
         return Err(err);
     }
     Ok(0)
@@ -156,14 +164,9 @@ pub fn sys_pipe2(pipefd: *mut i32, flags: u32) -> SysResult {
 pub fn sys_dup(fd: usize) -> SysResult {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-    let entry = inner
-        .fd_table
-        .get(fd)
-        .and_then(|entry| entry.as_ref())
-        .cloned()
-        .ok_or(SysError::EBADF)?;
+    let entry = inner.fd_entry(fd).ok_or(SysError::EBADF)?;
     let new_fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-    inner.fd_table[new_fd] = Some(entry.duplicate(FdFlags::empty()));
+    let _ = inner.set_fd_entry(new_fd, entry.duplicate(FdFlags::empty()));
     Ok(new_fd as isize)
 }
 
@@ -182,20 +185,19 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> SysResult {
     };
 
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let entry = inner
-        .fd_table
-        .get(old_fd)
-        .and_then(|entry| entry.as_ref())
-        .cloned()
-        .ok_or(SysError::EBADF)?;
-    if new_fd >= inner.nofile_limit() {
-        return Err(SysError::EBADF);
+    let replaced = {
+        let mut inner = process.inner_exclusive_access();
+        let entry = inner.fd_entry(old_fd).ok_or(SysError::EBADF)?;
+        if new_fd >= inner.nofile_limit() {
+            return Err(SysError::EBADF);
+        }
+        inner.set_fd_entry(new_fd, entry.duplicate(fd_flags))
+    };
+    if let Some(entry) = replaced {
+        // CONTEXT: Linux dup3 atomically closes an already-open newfd before
+        // reusing it; close-time errors are not reported by dup3.
+        close_detached_fd_entry(entry);
     }
-    while inner.fd_table.len() <= new_fd {
-        inner.fd_table.push(None);
-    }
-    inner.fd_table[new_fd] = Some(entry.duplicate(fd_flags));
     Ok(new_fd as isize)
 }
 
@@ -205,14 +207,9 @@ fn fcntl_dup(fd: usize, lower_bound: usize, fd_flags: FdFlags) -> SysResult {
     if lower_bound >= inner.nofile_limit() {
         return Err(SysError::EINVAL);
     }
-    let entry = inner
-        .fd_table
-        .get(fd)
-        .and_then(|entry| entry.as_ref())
-        .cloned()
-        .ok_or(SysError::EBADF)?;
+    let entry = inner.fd_entry(fd).ok_or(SysError::EBADF)?;
     let new_fd = inner.alloc_fd_from(lower_bound).ok_or(SysError::EMFILE)?;
-    inner.fd_table[new_fd] = Some(entry.duplicate(fd_flags));
+    let _ = inner.set_fd_entry(new_fd, entry.duplicate(fd_flags));
     Ok(new_fd as isize)
 }
 
@@ -295,7 +292,7 @@ pub fn sys_memfd_create(name: *const u8, flags: u32) -> SysResult {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-    inner.fd_table[fd] = Some(FdTableEntry::from_file(file, open_flags));
+    let _ = inner.set_fd_entry(fd, FdTableEntry::from_file(file, open_flags));
     Ok(fd as isize)
 }
 
