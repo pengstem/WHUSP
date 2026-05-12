@@ -1,7 +1,8 @@
 use crate::mm::translated_refmut;
 use crate::task::{
-    CLD_EXITED, ProcessControlBlock, SIGCHLD, SignalInfo, block_current_and_run_next,
+    ProcessControlBlock, SIGCHLD, SignalInfo, block_current_and_run_next,
     current_has_nonrestartable_signal, current_process, remove_from_pid2process,
+    signal_child_status, signal_wait_status,
 };
 use alloc::sync::Arc;
 
@@ -16,8 +17,6 @@ const WALL: i32 = 0x40000000;
 
 const P_ALL: i32 = 0;
 const P_PID: i32 = 1;
-
-const CLD_KILLED: i32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -100,19 +99,15 @@ impl LinuxSigInfo {
 }
 
 fn wait_status(exit_code: i32) -> i32 {
-    if exit_code < 0 {
-        (-exit_code) & 0x7f
+    if let Some(status) = signal_wait_status(exit_code) {
+        status
     } else {
         (exit_code & 0xff) << 8
     }
 }
 
 fn waitid_code_and_status(exit_code: i32) -> (i32, i32) {
-    if exit_code < 0 {
-        (CLD_KILLED, -exit_code)
-    } else {
-        (CLD_EXITED, exit_code & 0xff)
-    }
+    signal_child_status(exit_code)
 }
 
 fn wait4_child_matches(child: &Arc<ProcessControlBlock>, pid: isize, caller_pgid: usize) -> bool {

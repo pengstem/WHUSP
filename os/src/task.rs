@@ -50,9 +50,10 @@ pub use processor::{
     run_tasks, schedule, take_current_task,
 };
 pub use signal::{
-    CLD_EXITED, DefaultSignalAction, MINSIGSTKSZ, SA_RESTART, SIGCHLD, SIGKILL, SIGNAL_INFO_SLOTS,
-    SIGSTOP, SS_DISABLE, SS_ONSTACK, SigAltStack, SignalAction, SignalFlags, SignalInfo,
-    default_signal_action, default_signal_error,
+    DefaultSignalAction, MINSIGSTKSZ, SA_RESTART, SIGCHLD, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP,
+    SS_DISABLE, SS_ONSTACK, SigAltStack, SignalAction, SignalFlags, SignalInfo,
+    default_signal_action, default_signal_error, default_signal_exit_code, signal_child_status,
+    signal_wait_status,
 };
 #[cfg(target_arch = "riscv64")]
 pub use signal::{SI_TKILL, SIGRT_1, SIGRTMIN};
@@ -565,7 +566,16 @@ pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
     if signum >= SIGNAL_INFO_SLOTS {
         return None;
     }
-    let action = process.inner_exclusive_access().signal_actions[signum];
+    let (action, core_limit) = {
+        let process_inner = process.inner_exclusive_access();
+        (
+            process_inner.signal_actions[signum],
+            process_inner
+                .resource_limits
+                .get(RLimitResource::Core)
+                .rlim_cur,
+        )
+    };
     // CONTEXT: Linux's default disposition for SIGCHLD is ignore. PID 1 is
     // also protected from ordinary default-disposition signals unless it has
     // installed a user handler; LTP heartbeat children can otherwise kill the
@@ -582,7 +592,11 @@ pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
     if action.has_user_handler() {
         return None;
     }
-    default_signal_error(signum)
+    let (exit_code, message) = default_signal_error(signum)?;
+    Some((
+        default_signal_exit_code(signum, core_limit).unwrap_or(exit_code),
+        message,
+    ))
 }
 
 fn current_has_deliverable_signal_matching(predicate: impl Fn(SignalAction) -> bool) -> bool {
