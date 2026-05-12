@@ -28,7 +28,7 @@ use crate::task::{
 };
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec;
+use alloc::{vec, vec::Vec};
 
 fn dirfd_base_from(snapshot: &PathSnapshot, dirfd: isize) -> SysResult<WorkingDir> {
     if dirfd == AT_FDCWD {
@@ -315,24 +315,10 @@ fn copy_c_string_to_user(ptr: *mut u8, buf_len: usize, string: &str) -> SysResul
     if buf_len < total_len {
         return Err(SysError::ERANGE);
     }
-    let token = current_user_token();
-    let mut written = 0usize;
-    let buffers = translated_byte_buffer_checked(
-        token,
-        ptr.cast_const(),
-        total_len,
-        UserBufferAccess::Write,
-    )?;
-    for byte_ref in UserBuffer::new(buffers) {
-        unsafe {
-            *byte_ref = if written < string.len() {
-                string.as_bytes()[written]
-            } else {
-                0
-            };
-        }
-        written += 1;
-    }
+    let mut bytes = Vec::with_capacity(total_len);
+    bytes.extend_from_slice(string.as_bytes());
+    bytes.push(0);
+    copy_to_user(current_user_token(), ptr, &bytes)?;
     Ok(ptr as isize)
 }
 

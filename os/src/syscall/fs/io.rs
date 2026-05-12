@@ -3,39 +3,44 @@ use crate::fs::{File, FileStat, OpenFlags, PollEvents, S_IFDIR, S_IFMT, S_IFREG,
 use crate::mm::UserBuffer;
 use crate::task::{FdTableEntry, SignalFlags, current_add_signal, current_user_token};
 use alloc::{vec, vec::Vec};
-use core::mem::size_of;
 use core::ptr::read_volatile;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    UserBufferAccess, read_user_usize, read_user_value, translated_byte_buffer_checked,
+    UserBufferAccess, read_user_array_item, read_user_value, translated_byte_buffer_checked,
     translated_byte_buffer_checked_with_mmap_fault, write_user_value,
 };
 use super::fanotify::{fanotify_notify_access, fanotify_notify_modify};
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::uapi::{IOV_MAX, LinuxIovec};
 
-fn read_user_iovecs(
-    token: usize,
-    iov: *const LinuxIovec,
-    iovcnt: usize,
-) -> SysResult<Vec<LinuxIovec>> {
-    let entry_size = size_of::<LinuxIovec>();
-    let mut iovecs = Vec::new();
+struct UserIovecs {
+    entries: Vec<LinuxIovec>,
+    total_len: usize,
+}
+
+impl UserIovecs {
+    fn has_data(&self) -> bool {
+        self.total_len > 0
+    }
+}
+
+/// Reads a Linux iovec array and validates the aggregate byte count.
+///
+/// Length overflow and counts beyond Linux `SSIZE_MAX` are reported as
+/// `EINVAL`, preserving the visible readv/writev-family ABI boundary.
+fn read_user_iovecs(token: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult<UserIovecs> {
+    let mut entries = Vec::with_capacity(iovcnt);
     let mut total_len = 0usize;
     for index in 0..iovcnt {
-        let entry_addr = (iov as usize)
-            .checked_add(index.checked_mul(entry_size).ok_or(SysError::EFAULT)?)
-            .ok_or(SysError::EFAULT)?;
-        let base = read_user_usize(token, entry_addr)?;
-        let len = read_user_usize(token, entry_addr + size_of::<usize>())?;
-        total_len = total_len.checked_add(len).ok_or(SysError::EINVAL)?;
+        let iovec = read_user_array_item(token, iov, index)?;
+        total_len = total_len.checked_add(iovec.len).ok_or(SysError::EINVAL)?;
         if total_len > isize::MAX as usize {
             return Err(SysError::EINVAL);
         }
-        iovecs.push(LinuxIovec { base, len });
+        entries.push(iovec);
     }
-    Ok(iovecs)
+    Ok(UserIovecs { entries, total_len })
 }
 
 fn ensure_nonblocking_ready(entry: &FdTableEntry, events: PollEvents) -> SysResult<()> {
@@ -657,7 +662,7 @@ pub fn sys_preadv(
     }
     ensure_positioned_target(file.as_ref())?;
 
-    for iovec in iovecs.iter() {
+    for iovec in iovecs.entries.iter() {
         if iovec.len == 0 {
             continue;
         }
@@ -670,7 +675,7 @@ pub fn sys_preadv(
     }
 
     let mut total_read = 0usize;
-    for iovec in iovecs {
+    for iovec in iovecs.entries {
         if iovec.len == 0 {
             continue;
         }
@@ -723,7 +728,7 @@ pub fn sys_pwritev(
         offset = file.stat()?.size as usize;
     }
     let mut total_written = 0usize;
-    for iovec in iovecs {
+    for iovec in iovecs.entries {
         if iovec.len == 0 {
             continue;
         }
@@ -828,19 +833,19 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
     if !file.writable() {
         return Err(SysError::EBADF);
     }
-    let has_data = iovecs.iter().any(|iovec| iovec.len > 0);
+    let has_data = iovecs.has_data();
     if file.is_dev_full() && has_data {
         return Err(SysError::ENOSPC);
     }
     check_pipe_write_peer(&entry, has_data)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
-    let total_len = iovecs.iter().try_fold(0usize, |total, iovec| {
-        total.checked_add(iovec.len).ok_or(SysError::EINVAL)
-    })?;
-    file.check_write(total_len, entry.status_flags().contains(OpenFlags::APPEND))?;
+    file.check_write(
+        iovecs.total_len,
+        entry.status_flags().contains(OpenFlags::APPEND),
+    )?;
 
     let mut total_written = 0usize;
-    for iovec in iovecs {
+    for iovec in iovecs.entries {
         if iovec.len == 0 {
             continue;
         }
@@ -887,14 +892,11 @@ pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult 
     if !file.readable() {
         return Err(SysError::EBADF);
     }
-    let total_len = iovecs.iter().try_fold(0usize, |total, iovec| {
-        total.checked_add(iovec.len).ok_or(SysError::EINVAL)
-    })?;
-    file.check_read(total_len)?;
+    file.check_read(iovecs.total_len)?;
     let entry = get_fd_entry_by_fd(fd)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLIN)?;
 
-    for iovec in iovecs.iter() {
+    for iovec in iovecs.entries.iter() {
         if iovec.len == 0 {
             continue;
         }
@@ -907,7 +909,7 @@ pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult 
     }
 
     let mut total_read = 0usize;
-    for iovec in iovecs {
+    for iovec in iovecs.entries {
         if iovec.len == 0 {
             continue;
         }

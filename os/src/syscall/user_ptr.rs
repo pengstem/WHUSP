@@ -11,6 +11,10 @@ pub(crate) enum UserBufferAccess {
     Write,
 }
 
+/// Optional page-fault hook used while validating a user byte range.
+///
+/// Callers pass this only when the syscall is allowed to materialize lazy user
+/// mappings before copying. A `false` return is reported as `EFAULT`.
 pub(crate) type UserFaultHandler = fn(usize, UserBufferAccess) -> bool;
 
 fn mmap_user_fault(addr: usize, access: UserBufferAccess) -> bool {
@@ -30,16 +34,27 @@ pub(crate) fn translated_byte_buffer_checked(
     translated_byte_buffer_checked_with_fault(token, ptr, len, access, None)
 }
 
+/// Validates a user byte range and faults in mmap-backed pages when needed.
+///
+/// Use this only for syscall copy paths where Linux-visible behavior includes
+/// touching lazy user mappings as part of the copy itself.
 pub(crate) fn translated_byte_buffer_checked_with_mmap_fault(
     token: usize,
     ptr: *const u8,
     len: usize,
     access: UserBufferAccess,
 ) -> SysResult<Vec<&'static mut [u8]>> {
+    // CONTEXT: plain metadata copy helpers use `translated_byte_buffer_checked`
+    // so an unmapped user range still returns `EFAULT` without invoking the
+    // mmap fault handler from an unrelated ABI path.
     translated_byte_buffer_checked_with_fault(token, ptr, len, access, Some(mmap_user_fault))
 }
 
-// TODO: i think these functions are taking the responsibility of the mm module
+/// Validates a user byte range and returns physical page slices covering it.
+///
+/// The returned slices are only valid for the current syscall copy window. This
+/// helper performs permission checks for Linux-visible `EFAULT`; it does not
+/// own address-space policy beyond optionally calling the supplied fault hook.
 pub(crate) fn translated_byte_buffer_checked_with_fault(
     token: usize,
     ptr: *const u8,
@@ -110,6 +125,10 @@ fn user_pte_allows(
 
 pub(crate) const PATH_MAX: usize = 4096;
 
+/// Reads a NUL-terminated string from user memory with an explicit length cap.
+///
+/// Returns `EFAULT` for invalid user memory and `ENAMETOOLONG` when no NUL byte
+/// is found within `max_len`, matching Linux pathname-style ABI boundaries.
 pub(crate) fn read_user_c_string(
     token: usize,
     ptr: *const u8,
@@ -162,6 +181,23 @@ pub(crate) fn read_user_usize(token: usize, addr: usize) -> SysResult<usize> {
     Ok(usize::from_ne_bytes(bytes))
 }
 
+/// Copies one plain ABI value from a user array after checked index arithmetic.
+///
+/// The element is copied byte-for-byte through the checked user access path, so
+/// the user pointer does not need Rust alignment. Address arithmetic overflow
+/// is reported as `EFAULT`, consistent with existing iovec readers.
+pub(crate) fn read_user_array_item<T: Copy>(
+    token: usize,
+    ptr: *const T,
+    index: usize,
+) -> SysResult<T> {
+    let entry_size = size_of::<T>();
+    let entry_addr = (ptr as usize)
+        .checked_add(index.checked_mul(entry_size).ok_or(SysError::EFAULT)?)
+        .ok_or(SysError::EFAULT)?;
+    read_user_value(token, entry_addr as *const T)
+}
+
 fn copy_from_user(
     token: usize,
     ptr: *const u8,
@@ -184,6 +220,7 @@ fn copy_from_user(
     Ok(())
 }
 
+/// Copies kernel bytes into a user buffer after validating write permission.
 pub(crate) fn copy_to_user(token: usize, ptr: *mut u8, src: &[u8]) -> SysResult<()> {
     copy_to_user_with_fault(token, ptr, src, None)
 }
@@ -210,6 +247,10 @@ pub(crate) fn copy_to_user_with_fault(
     Ok(())
 }
 
+/// Reads one plain ABI value from user memory.
+///
+/// The value is copied through bytes rather than dereferenced directly, so this
+/// is safe for unaligned user ABI structs as long as `T: Copy`.
 pub(crate) fn read_user_value<T: Copy>(token: usize, ptr: *const T) -> SysResult<T> {
     read_user_value_with_fault(token, ptr, None)
 }
@@ -233,6 +274,7 @@ pub(crate) fn read_user_value_with_fault<T: Copy>(
     Ok(unsafe { value.assume_init() })
 }
 
+/// Writes one plain ABI value into user memory after checking access rights.
 pub(crate) fn write_user_value<T: Copy>(token: usize, ptr: *mut T, value: &T) -> SysResult<()> {
     write_user_value_with_fault(token, ptr, value, None)
 }

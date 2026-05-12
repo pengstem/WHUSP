@@ -24,8 +24,6 @@ const MAP_NORESERVE: usize = 0x4000;
 const MAP_POPULATE: usize = 0x8000;
 const MAP_STACK: usize = 0x20000;
 const MAP_LOCKED: usize = 0x2000;
-const MAP_FILE: usize = 0x0000;
-const MAP_FIXED_NOREPLACE: usize = 0x100000;
 // CONTEXT: Linux keeps MAP_DENYWRITE/MAP_EXECUTABLE as ignored legacy flags,
 // and musl/glibc may pass MAP_NORESERVE or MAP_STACK as advisory flags. The
 // current VM has no reservation accounting, eager MAP_POPULATE prefaulting, or
@@ -135,7 +133,6 @@ pub fn sys_mmap(
     sys_mmap_impl(addr, len, prot, flags, fd, offset).map(|addr| addr as isize)
 }
 
-// TODO: prot ... i don't think this is a good name
 fn sys_mmap_impl(
     addr: usize,
     len: usize,
@@ -163,7 +160,10 @@ fn sys_mmap_impl(
     let fixed = flags & MAP_FIXED != 0;
     let grow_down = flags & MAP_GROWSDOWN != 0;
     let writable = prot & PROT_WRITE != 0;
-    let permission = prot_to_map_permission(prot);
+    let hardware_permission = prot_to_map_permission(prot);
+    // CONTEXT: writable mappings need hardware read permission on current
+    // targets, but procfs/debug output should report the exact Linux PROT bits
+    // requested by userspace.
     let reported_permission = prot_to_reported_map_permission(prot);
     if fixed && addr % PAGE_SIZE != 0 {
         return Err(SysError::EINVAL);
@@ -221,7 +221,7 @@ fn sys_mmap_impl(
             .mmap_fixed_area(
                 addr,
                 len,
-                permission,
+                hardware_permission,
                 reported_permission,
                 backing_file,
                 file_size,
@@ -242,12 +242,11 @@ fn sys_mmap_impl(
         return Ok(mapped_addr);
     }
 
-    // TODO: why dose map permission do not contain shared and writable
     let mapped_addr = inner
         .memory_set
         .mmap_area(
             len,
-            permission,
+            hardware_permission,
             reported_permission,
             backing_file,
             file_size,
