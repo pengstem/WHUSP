@@ -52,7 +52,9 @@ pub(super) const STATX_BASIC_STATS: u32 = STATX_TYPE
     | STATX_BLOCKS;
 pub(super) const STATX_RESERVED: u32 = 0x8000_0000;
 
+// Linux UIO_MAXIOV: reject larger vectors before copying the user iovec array.
 pub(super) const IOV_MAX: usize = 1024;
+// Local allocation guardrail for ppoll; Linux allows larger rlimit-bound fd sets.
 pub(super) const PPOLL_MAX_NFDS: usize = 4096;
 
 #[repr(C)]
@@ -163,6 +165,7 @@ impl LinuxStatxTimestamp {
     }
 }
 
+/// Converts this kernel's inode snapshot into Linux `struct kstat` layout.
 impl From<FileStat> for LinuxKstat {
     fn from(stat: FileStat) -> Self {
         Self {
@@ -189,6 +192,7 @@ impl From<FileStat> for LinuxKstat {
     }
 }
 
+/// Converts VFS statfs data into the Linux `struct statfs` ABI layout.
 impl From<crate::fs::FileSystemStat> for LinuxStatfs {
     fn from(stat: crate::fs::FileSystemStat) -> Self {
         Self {
@@ -208,6 +212,10 @@ impl From<crate::fs::FileSystemStat> for LinuxStatfs {
     }
 }
 
+/// Converts this kernel's inode snapshot into Linux `struct statx` layout.
+///
+/// Birth time and attribute masks are reported as zero because the current VFS
+/// metadata model does not preserve those fields yet.
 impl From<FileStat> for LinuxStatx {
     fn from(stat: FileStat) -> Self {
         Self {

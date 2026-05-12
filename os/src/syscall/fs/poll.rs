@@ -9,7 +9,7 @@ use core::mem::size_of;
 use super::super::errno::{SysError, SysResult};
 use super::super::time::relative_timeout_deadline_ms;
 use super::super::uapi::LinuxTimeSpec;
-use super::super::user_ptr::{read_user_value, write_user_value};
+use super::super::user_ptr::{read_user_array_item, write_user_array_item};
 use super::fd::get_file_by_fd;
 use super::uapi::{LinuxPollFd, PPOLL_MAX_NFDS};
 
@@ -35,28 +35,14 @@ fn read_user_pollfds(
 
     let mut pollfds = Vec::with_capacity(nfds);
     for index in 0..nfds {
-        let entry_addr = (fds as usize)
-            .checked_add(
-                index
-                    .checked_mul(size_of::<LinuxPollFd>())
-                    .ok_or(SysError::EFAULT)?,
-            )
-            .ok_or(SysError::EFAULT)?;
-        pollfds.push(read_user_value(token, entry_addr as *const LinuxPollFd)?);
+        pollfds.push(read_user_array_item(token, fds, index)?);
     }
     Ok(pollfds)
 }
 
 fn write_user_pollfds(token: usize, fds: *mut LinuxPollFd, pollfds: &[LinuxPollFd]) -> SysResult {
     for (index, pollfd) in pollfds.iter().enumerate() {
-        let entry_addr = (fds as usize)
-            .checked_add(
-                index
-                    .checked_mul(size_of::<LinuxPollFd>())
-                    .ok_or(SysError::EFAULT)?,
-            )
-            .ok_or(SysError::EFAULT)?;
-        write_user_value(token, entry_addr as *mut LinuxPollFd, pollfd)?;
+        write_user_array_item(token, fds, index, pollfd)?;
     }
     Ok(0)
 }
@@ -138,34 +124,15 @@ fn fdset_words(nfds: usize) -> usize {
     nfds.div_ceil(FD_SET_WORD_BITS)
 }
 
-fn walk_fdset_words(
-    token: usize,
-    ptr: usize,
-    word_count: usize,
-    mut visit: impl FnMut(usize, usize, usize) -> SysResult,
-) -> SysResult {
-    for index in 0..word_count {
-        let word_addr = ptr
-            .checked_add(
-                index
-                    .checked_mul(size_of::<usize>())
-                    .ok_or(SysError::EFAULT)?,
-            )
-            .ok_or(SysError::EFAULT)?;
-        visit(token, index, word_addr)?;
-    }
-    Ok(0)
-}
-
 fn read_user_fdset(token: usize, ptr: usize, nfds: usize) -> SysResult<Option<Vec<usize>>> {
     if ptr == 0 {
         return Ok(None);
     }
-    let mut words = Vec::with_capacity(fdset_words(nfds));
-    walk_fdset_words(token, ptr, fdset_words(nfds), |token, _index, word_addr| {
-        words.push(read_user_value(token, word_addr as *const usize)?);
-        Ok(0)
-    })?;
+    let word_count = fdset_words(nfds);
+    let mut words = Vec::with_capacity(word_count);
+    for index in 0..word_count {
+        words.push(read_user_array_item(token, ptr as *const usize, index)?);
+    }
     Ok(Some(words))
 }
 
@@ -173,11 +140,9 @@ fn write_user_fdset(token: usize, ptr: usize, words: &[usize]) -> SysResult {
     if ptr == 0 {
         return Ok(0);
     }
-    walk_fdset_words(token, ptr, words.len(), |token, index, word_addr| {
-        let word = &words[index];
-        write_user_value(token, word_addr as *mut usize, word)?;
-        Ok(0)
-    })?;
+    for (index, word) in words.iter().enumerate() {
+        write_user_array_item(token, ptr as *mut usize, index, word)?;
+    }
     Ok(0)
 }
 

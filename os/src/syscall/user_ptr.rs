@@ -191,11 +191,24 @@ pub(crate) fn read_user_array_item<T: Copy>(
     ptr: *const T,
     index: usize,
 ) -> SysResult<T> {
+    read_user_value(token, user_array_item_addr(ptr, index)? as *const T)
+}
+
+/// Writes one plain ABI value into a user array after checked index arithmetic.
+pub(crate) fn write_user_array_item<T: Copy>(
+    token: usize,
+    ptr: *mut T,
+    index: usize,
+    value: &T,
+) -> SysResult<()> {
+    write_user_value(token, user_array_item_addr(ptr, index)? as *mut T, value)
+}
+
+fn user_array_item_addr<T>(ptr: *const T, index: usize) -> SysResult<usize> {
     let entry_size = size_of::<T>();
-    let entry_addr = (ptr as usize)
+    (ptr as usize)
         .checked_add(index.checked_mul(entry_size).ok_or(SysError::EFAULT)?)
-        .ok_or(SysError::EFAULT)?;
-    read_user_value(token, entry_addr as *const T)
+        .ok_or(SysError::EFAULT)
 }
 
 fn copy_from_user(

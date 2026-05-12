@@ -1,3 +1,7 @@
+/// Linux errno values used by syscall adapters before `ret()` encodes them.
+///
+/// Syscall implementations return these positive enum variants internally; the
+/// architecture trap path exposes failures to userspace as negative `-errno`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(isize)]
 #[allow(dead_code)]
@@ -58,6 +62,7 @@ pub enum SysError {
 pub type SysResult<T = isize> = Result<T, SysError>;
 
 impl From<crate::fs::FsError> for SysError {
+    /// Maps VFS-layer errors onto Linux-visible errno values.
     fn from(error: crate::fs::FsError) -> Self {
         match error {
             crate::fs::FsError::NotFound => Self::ENOENT,
@@ -82,6 +87,7 @@ impl From<crate::fs::FsError> for SysError {
     }
 }
 
+/// Converts a typed syscall result into the Linux register return convention.
 pub fn ret(result: SysResult<isize>) -> isize {
     match result {
         Ok(value) => value,
