@@ -24,16 +24,16 @@ const ALL_TESTS: &[&str] = &[
 // CONTEXT: current submit-safe default runs the groups with stable local score
 // signal; skipped groups above still get marker pairs instead of disappearing.
 const TEST_SCRIPTS: &[&str] = &[
-    "basic_testcode.sh",
-    "busybox_testcode.sh",
-    "lua_testcode.sh",
-    "libctest_testcode.sh",
+    // "basic_testcode.sh",
+    // "busybox_testcode.sh",
+    // "lua_testcode.sh",
+    // "libctest_testcode.sh",
     // "iozone_testcode.sh",
     // "iperf_testcode.sh",
     // "libcbench_testcode.sh",
     // "netperf_testcode.sh",
     // "cyclictest_testcode.sh",
-    // "ltp_testcode.sh",
+    "ltp_testcode.sh",
     // "lmbench_testcode.sh",
 ];
 

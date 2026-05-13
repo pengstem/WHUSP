@@ -2,8 +2,7 @@ use crate::fs::{File, FileStat, OpenFlags, PollEvents, S_IFDIR, S_IFMT};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
-    FdTableEntry, current_has_interrupting_signal, current_process, current_user_token,
-    suspend_current_and_run_next,
+    current_has_interrupting_signal, current_user_token, suspend_current_and_run_next,
 };
 use crate::timer::get_time_us;
 use alloc::sync::Arc;
@@ -14,7 +13,7 @@ use super::super::errno::{SysError, SysResult};
 use super::super::time::timespec_to_nanos;
 use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{read_user_value, write_user_value};
-use super::fd::get_fd_entry_by_fd;
+use super::fd::{get_fd_entry_by_fd, install_file_fd};
 
 const EPOLL_CTL_ADD: i32 = 1;
 const EPOLL_CTL_DEL: i32 = 2;
@@ -302,11 +301,7 @@ pub fn sys_epoll_create1(flags: u32) -> SysResult {
     }
     let open_flags = OpenFlags::from_bits_truncate(flags & EPOLL_CLOEXEC);
     let file = Arc::new(EpollFile::new());
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-    inner.fd_table[fd] = Some(FdTableEntry::from_file(file, open_flags));
-    Ok(fd as isize)
+    install_file_fd(file, open_flags, None)
 }
 
 pub fn sys_epoll_ctl(epfd_raw: usize, op: i32, fd_raw: usize, event: *const u8) -> SysResult {

@@ -378,10 +378,13 @@ fn futex_wake_for_process(
 }
 
 fn wake_futex_tasks(tasks: Vec<Arc<TaskControlBlock>>) -> usize {
-    tasks
-        .into_iter()
-        .filter(|task| wakeup_task(Arc::clone(task)))
-        .count()
+    let mut woken = 0;
+    for task in tasks {
+        if wakeup_task(task) {
+            woken += 1;
+        }
+    }
+    woken
 }
 
 fn futex_waiters_word(owner_tid: u32, has_waiters: bool) -> u32 {

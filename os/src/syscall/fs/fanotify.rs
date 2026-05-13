@@ -1,14 +1,14 @@
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{PATH_MAX, read_user_c_string};
-use super::fd::get_file_by_fd;
+use super::fd::{get_file_by_fd, install_file_fd};
 use super::path::path_context_from;
 use super::uapi::AT_FDCWD;
 use crate::fs::{File, FsNodeKind, OpenFlags, PathContext, PollEvents, VfsNodeId, lookup_path_in};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
-    FdTableEntry, TaskControlBlock, block_current_task_no_schedule,
-    current_has_interrupting_signal, current_process, current_user_token, schedule, wakeup_task,
+    TaskControlBlock, block_current_task_no_schedule, current_has_interrupting_signal,
+    current_process, current_user_token, schedule, wakeup_task,
 };
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
@@ -357,11 +357,7 @@ impl File for FanotifyGroupFile {
 
 fn install_event_fd(file: &Arc<dyn File + Send + Sync>, flags: OpenFlags) -> SysResult<i32> {
     let event_file = file.clone_for_fanotify_event(flags)?;
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-    inner.fd_table[fd] = Some(FdTableEntry::from_file(event_file, flags));
-    Ok(fd as i32)
+    install_file_fd(event_file, flags, None).map(|fd| fd as i32)
 }
 
 fn validate_init_flags(flags: u32) -> Result<(), SysError> {
@@ -403,11 +399,7 @@ pub fn sys_fanotify_init(flags: u32, event_f_flags: u32) -> SysResult {
     }
 
     let file = Arc::new(FanotifyGroupFile::new(FanotifyGroup::new(event_file_flags)));
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-    inner.fd_table[fd] = Some(FdTableEntry::from_file(file, open_flags));
-    Ok(fd as isize)
+    install_file_fd(file, open_flags, None)
 }
 
 fn validate_mark_args(flags: u32, mask: u64) -> Result<(), SysError> {

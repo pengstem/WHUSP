@@ -1,8 +1,9 @@
 use crate::fs::{OpenFlags, S_IFCHR, make_anonymous_fd};
-use crate::task::{FdTableEntry, current_process, current_user_token};
+use crate::task::current_user_token;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::read_user_value;
+use super::fd::install_file_fd;
 
 const FD_NONBLOCK: u32 = OpenFlags::NONBLOCK.bits();
 const FD_CLOEXEC: u32 = OpenFlags::CLOEXEC.bits();
@@ -30,11 +31,7 @@ fn open_flags_from_fd_flags(flags: u32, valid_flags: u32) -> SysResult<OpenFlags
 
 fn install_dummy_readable_fd(open_flags: OpenFlags) -> SysResult {
     let file = make_anonymous_fd(true, false, S_IFCHR | 0o600);
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-    inner.fd_table[fd] = Some(FdTableEntry::from_file(file, open_flags));
-    Ok(fd as isize)
+    install_file_fd(file, open_flags, None)
 }
 
 fn validate_user_pointer(ptr: *const u8) -> SysResult<()> {

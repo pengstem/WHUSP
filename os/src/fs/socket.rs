@@ -10,9 +10,10 @@ use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{
-    UserBufferAccess, copy_to_user, read_user_value, translated_byte_buffer_checked,
-    write_user_value,
+    UserBufferAccess, copy_to_user, read_user_array_item, read_user_value,
+    translated_byte_buffer_checked, write_user_value,
 };
+use crate::syscall::{close_detached_fd_entry, install_file_fd};
 use crate::task::{
     FdTableEntry, current_has_unmasked_signal, current_process, current_user_token,
     suspend_current_and_run_next,
@@ -1196,14 +1197,7 @@ fn read_msg_iovecs(token: usize, iov: usize, iovlen: usize) -> SysResult<Vec<u8>
     }
     let mut data = Vec::new();
     for index in 0..iovlen {
-        let entry_addr = iov
-            .checked_add(
-                index
-                    .checked_mul(size_of::<LinuxIovec>())
-                    .ok_or(SysError::EINVAL)?,
-            )
-            .ok_or(SysError::EINVAL)?;
-        let entry = read_user_value(token, entry_addr as *const LinuxIovec)?;
+        let entry = read_user_array_item(token, iov as *const LinuxIovec, index)?;
         if entry.len == 0 {
             continue;
         }
@@ -1429,11 +1423,7 @@ fn file_from_fd(fd: usize) -> SysResult<Arc<dyn File + Send + Sync>> {
 }
 
 fn alloc_socket_fd(file: Arc<dyn File + Send + Sync>, flags: OpenFlags) -> SysResult<usize> {
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-    inner.fd_table[fd] = Some(FdTableEntry::from_file(file, flags));
-    Ok(fd)
+    install_file_fd(file, flags, None).map(|fd| fd as usize)
 }
 
 fn recv_nonblock(flags: i32, socket: &LocalSocket) -> bool {
@@ -1521,23 +1511,26 @@ pub fn sys_socketpair(domain: i32, ty: i32, protocol: i32, sv: usize) -> SysResu
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
         let first_fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-        let second_fd = match inner.alloc_fd_from(first_fd + 1) {
-            Some(fd) => fd,
-            None => {
-                inner.fd_table[first_fd] = None;
-                return Err(SysError::EMFILE);
-            }
-        };
-        inner.fd_table[first_fd] = Some(FdTableEntry::from_file(first, flags));
-        inner.fd_table[second_fd] = Some(FdTableEntry::from_file(second, flags));
+        let second_fd = inner.alloc_fd_from(first_fd + 1).ok_or(SysError::EMFILE)?;
+        let previous = inner.set_fd_entry(first_fd, FdTableEntry::from_file(first, flags));
+        debug_assert!(previous.is_none());
+        let previous = inner.set_fd_entry(second_fd, FdTableEntry::from_file(second, flags));
+        debug_assert!(previous.is_none());
         [first_fd as i32, second_fd as i32]
     };
 
     if let Err(err) = write_user_value(current_user_token(), sv as *mut [i32; 2], &fds) {
-        let process = current_process();
-        let mut inner = process.inner_exclusive_access();
-        inner.fd_table[fds[0] as usize] = None;
-        inner.fd_table[fds[1] as usize] = None;
+        let entries = {
+            let process = current_process();
+            let mut inner = process.inner_exclusive_access();
+            [
+                inner.take_fd_entry(fds[0] as usize),
+                inner.take_fd_entry(fds[1] as usize),
+            ]
+        };
+        for entry in entries.into_iter().flatten() {
+            close_detached_fd_entry(entry);
+        }
         return Err(err);
     }
     Ok(0)

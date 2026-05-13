@@ -32,11 +32,13 @@ pub fn sys_sched_yield() -> isize {
 }
 
 pub fn sys_getpid() -> isize {
-    current_task().unwrap().process.upgrade().unwrap().getpid() as isize
+    current_process().getpid() as isize
 }
 
 pub fn sys_gettid() -> isize {
-    current_task().unwrap().linux_tid() as isize
+    current_task()
+        .expect("gettid requires a current task")
+        .linux_tid() as isize
 }
 
 pub fn sys_getppid() -> isize {
@@ -102,7 +104,7 @@ pub fn sys_setsid() -> SysResult {
 }
 
 pub fn sys_set_tid_address(tidptr: usize) -> SysResult {
-    let task = current_task().unwrap();
+    let task = current_task().expect("set_tid_address requires a current task");
     let tid = task.linux_tid();
     task.inner_exclusive_access().clear_child_tid = if tidptr == 0 { None } else { Some(tidptr) };
     Ok(tid as isize)

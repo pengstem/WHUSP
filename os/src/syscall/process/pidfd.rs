@@ -2,10 +2,11 @@ use crate::fs::{File, FileStat, OpenFlags};
 use crate::mm::UserBuffer;
 use crate::syscall::LinuxSigInfo;
 use crate::syscall::errno::{SysError, SysResult};
+use crate::syscall::install_file_fd;
 use crate::syscall::user_ptr::read_user_value;
 use crate::task::{
-    Credentials, FdTableEntry, ProcessControlBlock, SignalFlags, SignalInfo, current_process,
-    current_user_token, pid2process, queue_signal_to_task, wakeup_task,
+    Credentials, ProcessControlBlock, SignalFlags, SignalInfo, current_process, current_user_token,
+    pid2process, queue_signal_to_task, wakeup_task,
 };
 use alloc::sync::Arc;
 use core::any::Any;
@@ -49,14 +50,7 @@ impl File for PidFdFile {
 }
 
 fn install_pidfd_with_flags(pid: usize, open_flags: OpenFlags) -> SysResult<usize> {
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-    inner.fd_table[fd] = Some(FdTableEntry::from_file(
-        Arc::new(PidFdFile::new(pid)),
-        open_flags,
-    ));
-    Ok(fd)
+    install_file_fd(Arc::new(PidFdFile::new(pid)), open_flags, None).map(|fd| fd as usize)
 }
 
 pub(super) fn install_pidfd_for_current_process(pid: usize) -> SysResult<usize> {

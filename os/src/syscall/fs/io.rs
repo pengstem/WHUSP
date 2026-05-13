@@ -19,12 +19,6 @@ struct UserIovecs {
     total_len: usize,
 }
 
-impl UserIovecs {
-    fn has_data(&self) -> bool {
-        self.total_len > 0
-    }
-}
-
 /// Reads a Linux iovec array and validates the aggregate byte count.
 ///
 /// Length overflow and counts beyond Linux `SSIZE_MAX` are reported as
@@ -833,7 +827,7 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
     if !file.writable() {
         return Err(SysError::EBADF);
     }
-    let has_data = iovecs.has_data();
+    let has_data = iovecs.total_len > 0;
     if file.is_dev_full() && has_data {
         return Err(SysError::ENOSPC);
     }

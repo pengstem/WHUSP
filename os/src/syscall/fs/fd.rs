@@ -60,7 +60,7 @@ pub(crate) fn get_file_by_fd(fd: usize) -> SysResult<Arc<dyn File + Send + Sync>
 /// `dir_path` is kept only for files that can act as a directory base. This
 /// preserves the fchdir/getcwd compatibility snapshot without making syscall
 /// path adapters mutate the fd table directly.
-pub(super) fn install_file_fd(
+pub(crate) fn install_file_fd(
     file: Arc<dyn File + Send + Sync>,
     flags: OpenFlags,
     dir_path: Option<String>,
@@ -91,7 +91,7 @@ pub fn sys_close(fd: usize) -> SysResult {
 ///
 /// Call this without holding `ProcessControlBlockInner`; lock and fanotify
 /// cleanup can inspect file state and must not run while the fd table is locked.
-fn close_detached_fd_entry(entry: FdTableEntry) {
+pub(crate) fn close_detached_fd_entry(entry: FdTableEntry) {
     release_record_locks_for_close(&entry);
     release_ofd_record_locks_for_close(&entry);
     release_flock_locks_for_close(&entry);
@@ -148,18 +148,25 @@ pub fn sys_pipe2(pipefd: *mut i32, flags: u32) -> SysResult {
     let process = current_process();
     let (pipe_read, pipe_write) = make_pipe(pipe_capacity);
     let mut cleanup_entry = None;
+    // CONTEXT: pipe2 has two rollback shapes. If the write end cannot be
+    // allocated, only the read fd may have been installed under the current
+    // lock. If copying the fd pair to user memory fails later, both fds have
+    // already been published and must be removed with close cleanup after
+    // dropping the process lock.
     let fds = {
         let mut inner = process.inner_exclusive_access();
         let read_fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-        let _ = inner.set_fd_entry(
+        let previous = inner.set_fd_entry(
             read_fd,
             FdTableEntry::from_file(pipe_read, OpenFlags::RDONLY | pipe_flags),
         );
+        debug_assert!(previous.is_none());
         if let Some(write_fd) = inner.alloc_fd_from(0) {
-            let _ = inner.set_fd_entry(
+            let previous = inner.set_fd_entry(
                 write_fd,
                 FdTableEntry::from_file(pipe_write, OpenFlags::WRONLY | pipe_flags),
             );
+            debug_assert!(previous.is_none());
             Ok([read_fd, write_fd])
         } else {
             cleanup_entry = inner.take_fd_entry(read_fd);
@@ -189,7 +196,8 @@ pub fn sys_dup(fd: usize) -> SysResult {
     let mut inner = process.inner_exclusive_access();
     let entry = inner.fd_entry(fd).ok_or(SysError::EBADF)?;
     let new_fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-    let _ = inner.set_fd_entry(new_fd, entry.duplicate(FdFlags::empty()));
+    let previous = inner.set_fd_entry(new_fd, entry.duplicate(FdFlags::empty()));
+    debug_assert!(previous.is_none());
     Ok(new_fd as isize)
 }
 
@@ -232,7 +240,8 @@ fn fcntl_dup(fd: usize, lower_bound: usize, fd_flags: FdFlags) -> SysResult {
     }
     let entry = inner.fd_entry(fd).ok_or(SysError::EBADF)?;
     let new_fd = inner.alloc_fd_from(lower_bound).ok_or(SysError::EMFILE)?;
-    let _ = inner.set_fd_entry(new_fd, entry.duplicate(fd_flags));
+    let previous = inner.set_fd_entry(new_fd, entry.duplicate(fd_flags));
+    debug_assert!(previous.is_none());
     Ok(new_fd as isize)
 }
 
@@ -315,7 +324,8 @@ pub fn sys_memfd_create(name: *const u8, flags: u32) -> SysResult {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-    let _ = inner.set_fd_entry(fd, FdTableEntry::from_file(file, open_flags));
+    let previous = inner.set_fd_entry(fd, FdTableEntry::from_file(file, open_flags));
+    debug_assert!(previous.is_none());
     Ok(fd as isize)
 }
 

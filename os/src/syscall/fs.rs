@@ -15,7 +15,7 @@ mod uapi;
 pub use epoll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait, sys_epoll_pwait2};
 pub use eventfd::sys_eventfd2;
 pub use fanotify::{sys_fanotify_init, sys_fanotify_mark};
-pub(crate) use fd::get_file_by_fd;
+pub(crate) use fd::{close_detached_fd_entry, get_file_by_fd, install_file_fd};
 pub use fd::{sys_close, sys_dup, sys_dup3, sys_fcntl, sys_flock, sys_memfd_create, sys_pipe2};
 pub use fd_compat::{
     sys_bpf, sys_inotify_init1, sys_io_uring_setup, sys_perf_event_open, sys_signalfd4,

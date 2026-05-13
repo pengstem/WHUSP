@@ -28,32 +28,21 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
 
-fn dirfd_base_from(snapshot: &PathSnapshot, dirfd: isize) -> SysResult<WorkingDir> {
+fn dirfd_context_from(snapshot: &PathSnapshot, dirfd: isize) -> SysResult<(WorkingDir, String)> {
     if dirfd == AT_FDCWD {
-        return Ok(snapshot.context.cwd());
-    }
-    if dirfd < 0 {
-        return Err(SysError::EBADF);
-    }
-    let file = get_file_by_fd(dirfd as usize)?;
-    file.working_dir().ok_or(SysError::ENOTDIR)
-}
-
-fn dirfd_path_base_from(snapshot: &PathSnapshot, dirfd: isize) -> SysResult<String> {
-    if dirfd == AT_FDCWD {
-        return Ok(snapshot.cwd_path.clone());
+        return Ok((snapshot.context.cwd(), snapshot.cwd_path.clone()));
     }
     if dirfd < 0 {
         return Err(SysError::EBADF);
     }
     let entry = get_fd_entry_by_fd(dirfd as usize)?;
-    if entry.file().working_dir().is_none() {
-        return Err(SysError::ENOTDIR);
-    }
-    Ok(entry
+    let file = entry.file();
+    let cwd = file.working_dir().ok_or(SysError::ENOTDIR)?;
+    let cwd_path = entry
         .dir_path()
         .map(String::from)
-        .unwrap_or_else(|| snapshot.cwd_path.clone()))
+        .unwrap_or_else(|| snapshot.cwd_path.clone());
+    Ok((cwd, cwd_path))
 }
 
 /// Normalizes a syscall path relative to `dirfd` inside the process root.
@@ -69,7 +58,7 @@ pub(crate) fn normalize_path_from(
     let base = if path.starts_with('/') {
         snapshot.root_path.clone()
     } else {
-        dirfd_path_base_from(snapshot, dirfd)?
+        dirfd_context_from(snapshot, dirfd)?.1
     };
     normalize_path_at_root(snapshot.root_path.as_str(), base.as_str(), path).ok_or(SysError::ENOENT)
 }
@@ -84,9 +73,7 @@ pub(crate) fn path_context_from(
     let (cwd, cwd_path) = if path.starts_with('/') {
         (root, root_path.clone())
     } else {
-        let cwd = dirfd_base_from(snapshot, dirfd)?;
-        let cwd_path = dirfd_path_base_from(snapshot, dirfd)?;
-        (cwd, cwd_path)
+        dirfd_context_from(snapshot, dirfd)?
     };
     Ok(PathContext::new_in_namespace(
         root,
@@ -406,14 +393,6 @@ fn reopen_proc_self_fd(
     }
 }
 
-fn install_open_file(
-    file: Arc<dyn File + Send + Sync>,
-    flags: OpenFlags,
-    dir_path: Option<String>,
-) -> SysResult {
-    install_file_fd(file, flags, dir_path)
-}
-
 fn open_devfs_child_from_dirfd(
     dirfd: isize,
     path: &str,
@@ -453,19 +432,19 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> SysRe
     }
     let snapshot = current_process().path_snapshot();
     if let Some(file) = open_devfs_child_from_dirfd(dirfd, path.as_str(), flags)? {
-        return install_open_file(file, flags, None);
+        return install_file_fd(file, flags, None);
     }
     let dir_path = openat_dir_path(&snapshot, dirfd, path.as_str())?;
     if let Some(path) = dir_path.as_deref()
         && snapshot.context.is_global_root()
         && let Some(file) = open_static_path(path, flags)?
     {
-        return install_open_file(file, flags, None);
+        return install_file_fd(file, flags, None);
     }
     if path.starts_with('/')
         && let Some(file) = reopen_proc_self_fd(path.as_str(), flags)?
     {
-        return install_open_file(file, flags, None);
+        return install_file_fd(file, flags, None);
     }
     let context = path_context_from(&snapshot, dirfd, path.as_str())?;
     let process = current_process();
@@ -493,7 +472,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> SysRe
         open_file_in_with_attrs(context, path.as_str(), flags, create_attrs)?
     };
     let notify_file = Arc::clone(&file);
-    let fd = install_open_file(file, flags, dir_path)?;
+    let fd = install_file_fd(file, flags, dir_path)?;
     fanotify_notify_open(&notify_file);
     Ok(fd)
 }

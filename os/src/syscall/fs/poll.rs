@@ -4,7 +4,6 @@ use crate::task::{
 };
 use crate::timer::get_time_ms;
 use alloc::vec::Vec;
-use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::time::relative_timeout_deadline_ms;
@@ -30,8 +29,6 @@ fn read_user_pollfds(
     if nfds > PPOLL_MAX_NFDS {
         return Err(SysError::EINVAL);
     }
-    nfds.checked_mul(size_of::<LinuxPollFd>())
-        .ok_or(SysError::EINVAL)?;
 
     let mut pollfds = Vec::with_capacity(nfds);
     for index in 0..nfds {

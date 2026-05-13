@@ -1,7 +1,7 @@
 use crate::fs::{OpenFlags, make_eventfd};
-use crate::task::{FdTableEntry, current_process};
 
 use super::super::errno::{SysError, SysResult};
+use super::fd::install_file_fd;
 
 const EFD_SEMAPHORE: u32 = 0x1;
 const EFD_NONBLOCK: u32 = OpenFlags::NONBLOCK.bits();
@@ -22,9 +22,5 @@ pub fn sys_eventfd2(initval: u32, flags: u32) -> SysResult {
     }
 
     let file = make_eventfd(initval as u64, flags & EFD_SEMAPHORE != 0);
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-    inner.fd_table[fd] = Some(FdTableEntry::from_file(file, open_flags));
-    Ok(fd as isize)
+    install_file_fd(file, open_flags, None)
 }

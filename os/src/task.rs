@@ -99,7 +99,7 @@ pub fn mark_current_kernel_time_entry(now_us: usize) {
 pub fn suspend_current_and_run_next() {
     // There must be an application running.
     account_current_system_time();
-    let task = take_current_task().unwrap();
+    let task = take_current_task().expect("suspend_current_and_run_next requires a current task");
 
     // ---- access current TCB exclusively
     let mut task_inner = task.inner_exclusive_access();
@@ -135,7 +135,7 @@ pub fn block_current_task_no_schedule() -> (Arc<TaskControlBlock>, *mut TaskCont
     // that cleanup path into a RefCell panic; skipping one sample is preferable
     // to aborting the kernel while the task is about to block.
     try_account_current_system_time();
-    let task = take_current_task().unwrap();
+    let task = take_current_task().expect("block_current_task_no_schedule requires a current task");
     let mut task_inner = task.inner_exclusive_access();
     task_inner.task_status = TaskStatus::Blocked;
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
@@ -383,8 +383,11 @@ pub(crate) fn queue_signal_to_task(
 
 fn exit_current(exit_code: i32, group_exit: bool) {
     account_current_system_time();
-    let current = current_task().unwrap();
-    let process = current.process.upgrade().unwrap();
+    let current = current_task().expect("exit_current requires a current task");
+    let process = current
+        .process
+        .upgrade()
+        .expect("current task process must outlive the task");
     let process_token = process.inner_exclusive_access().get_user_token();
     let process_id = process.getpid();
     let (tid, clear_child_tid, thread_keyring) = {
@@ -513,7 +516,7 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             }
         }
     }
-    let task = take_current_task().unwrap();
+    let task = take_current_task().expect("exit_current requires the current task to be scheduled");
     let mut task_inner = task.inner_exclusive_access();
     task_inner.exit_code = Some(exit_code);
     task_inner.task_status = TaskStatus::Exited;

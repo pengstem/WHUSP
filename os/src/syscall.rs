@@ -218,7 +218,10 @@ use time::*;
 use uapi::LinuxTimeSpec;
 use wait::*;
 
-pub(crate) use fs::{release_flock_locks_for_closed_fd_table, release_record_locks_for_process};
+pub(crate) use fs::{
+    close_detached_fd_entry, install_file_fd, release_flock_locks_for_closed_fd_table,
+    release_record_locks_for_process,
+};
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 pub(crate) use wait::LinuxSigInfo;
 

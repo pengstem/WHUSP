@@ -58,6 +58,10 @@ pub struct PageTable {
     frames: Vec<FrameTracker>,
 }
 
+// CONTEXT: `try_new`/`try_map` are the recoverable allocation API for user
+// memory paths. The panic-style helpers below are used only where the caller
+// has already committed to a kernel mapping invariant; failure there is a
+// kernel bug or an unrecoverable boot-path allocation failure.
 impl PageTable {
     pub fn new() -> Self {
         let frame = frame_alloc().expect("page table root allocation requires a free frame");
