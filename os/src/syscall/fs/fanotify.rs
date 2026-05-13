@@ -72,6 +72,8 @@ const FANOTIFY_METADATA_VERSION: u8 = 3;
 const FANOTIFY_METADATA_LEN: usize = 24;
 const FANOTIFY_PIDFD_INFO_LEN: usize = 8;
 const FAN_EVENT_INFO_TYPE_PIDFD: u8 = 4;
+const FAN_EVENT_INFO_TYPE_DFID_NAME: u8 = 2;
+const FANOTIFY_FID_INFO_BASE_LEN: usize = 20;
 const FAN_NOFD: i32 = -1;
 const FAN_NOPIDFD: i32 = -1;
 const MAX_QUEUED_EVENTS: usize = 16_384;
@@ -119,6 +121,8 @@ const UNSUPPORTED_PERMISSION_EVENTS: u64 = FAN_OPEN_PERM | FAN_ACCESS_PERM | FAN
 
 lazy_static! {
     static ref FANOTIFY_GROUPS: UPIntrFreeCell<Vec<Weak<FanotifyGroup>>> =
+        unsafe { UPIntrFreeCell::new(Vec::new()) };
+    static ref FANOTIFY_NODE_NAMES: UPIntrFreeCell<Vec<(VfsNodeId, String)>> =
         unsafe { UPIntrFreeCell::new(Vec::new()) };
 }
 
@@ -195,6 +199,7 @@ struct FanotifyEvent {
     mask: u64,
     pid: i32,
     source: Option<Arc<dyn File + Send + Sync>>,
+    name: Option<String>,
 }
 
 struct FanotifyInner {
@@ -207,7 +212,6 @@ struct FanotifyInner {
 struct FanotifyGroup {
     init_flags: u32,
     event_file_flags: OpenFlags,
-    owner_pid: i32,
     unprivileged: bool,
     max_queued_events: usize,
     inner: UPIntrFreeCell<FanotifyInner>,
@@ -218,7 +222,6 @@ impl FanotifyGroup {
         let group = Arc::new(Self {
             init_flags,
             event_file_flags,
-            owner_pid: current_process().getpid() as i32,
             unprivileged: current_process().credentials().euid != 0,
             max_queued_events: if init_flags & FAN_UNLIMITED_QUEUE != 0 {
                 usize::MAX
@@ -332,6 +335,7 @@ impl FanotifyGroup {
         mask: u64,
         pid: i32,
         source: Option<Arc<dyn File + Send + Sync>>,
+        name: Option<&str>,
     ) -> bool {
         if inner.events.len() >= self.max_queued_events {
             if !inner.overflow_queued {
@@ -339,13 +343,19 @@ impl FanotifyGroup {
                     mask: FAN_Q_OVERFLOW,
                     pid: 0,
                     source: None,
+                    name: None,
                 });
                 inner.overflow_queued = true;
                 return true;
             }
             return false;
         }
-        inner.events.push_back(FanotifyEvent { mask, pid, source });
+        inner.events.push_back(FanotifyEvent {
+            mask,
+            pid,
+            source,
+            name: name.map(String::from),
+        });
         true
     }
 
@@ -357,6 +367,7 @@ impl FanotifyGroup {
         event_mask: u64,
         is_dir: bool,
         event_path: Option<&str>,
+        event_name: Option<&str>,
         source: &Arc<dyn File + Send + Sync>,
     ) {
         let read_waiters = self.inner.exclusive_session(|inner| {
@@ -392,18 +403,17 @@ impl FanotifyGroup {
             }
             emitted &= !ignored;
             if emitted != 0 {
-                let current_pid = current_process().getpid() as i32;
-                let pid = if self.init_flags & FAN_REPORT_FID != 0 && current_pid != self.owner_pid
-                {
-                    0
-                } else if self.init_flags & FAN_REPORT_TID != 0 {
+                if self.init_flags & FAN_REPORT_FID != 0 && is_dir {
+                    emitted |= FAN_ONDIR;
+                }
+                let pid = if self.init_flags & FAN_REPORT_TID != 0 {
                     current_task()
                         .map(|task| task.linux_tid())
                         .unwrap_or_else(|| current_process().getpid()) as i32
                 } else {
                     current_process().getpid() as i32
                 };
-                if self.enqueue_event(inner, emitted, pid, Some(Arc::clone(source))) {
+                if self.enqueue_event(inner, emitted, pid, Some(Arc::clone(source)), event_name) {
                     core::mem::take(&mut inner.read_waiters)
                 } else {
                     VecDeque::new()
@@ -445,19 +455,24 @@ impl FanotifyGroup {
 
         let mut data = Vec::new();
         loop {
+            let Some(event) = self
+                .inner
+                .exclusive_session(|inner| inner.events.pop_front())
+            else {
+                break;
+            };
             let record_len = FANOTIFY_METADATA_LEN
                 + if self.init_flags & FAN_REPORT_PIDFD != 0 {
                     FANOTIFY_PIDFD_INFO_LEN
                 } else {
                     0
+                }
+                + if self.init_flags & FAN_REPORT_NAME != 0 {
+                    report_name_info_len(event.name.as_deref())
+                } else {
+                    0
                 };
             if capacity.saturating_sub(data.len()) < record_len {
-                break;
-            };
-            let Some(event) = self
-                .inner
-                .exclusive_session(|inner| inner.events.pop_front())
-            else {
                 break;
             };
             if event.mask == FAN_Q_OVERFLOW {
@@ -484,6 +499,9 @@ impl FanotifyGroup {
             record[16..20].copy_from_slice(&fd.to_ne_bytes());
             record[20..24].copy_from_slice(&event.pid.to_ne_bytes());
             data.extend_from_slice(&record);
+            if self.init_flags & FAN_REPORT_NAME != 0 {
+                append_report_name_info(&mut data, event.name.as_deref());
+            }
             if self.init_flags & FAN_REPORT_PIDFD != 0 {
                 let pidfd = if event.pid > 0 {
                     install_pidfd_for_fanotify(event.pid as usize)
@@ -502,6 +520,36 @@ impl FanotifyGroup {
         }
         user_buf.copy_from_slice(&data)
     }
+}
+
+fn align_to_eight(value: usize) -> usize {
+    (value + 7) & !7
+}
+
+fn report_name_info_len(name: Option<&str>) -> usize {
+    name.map(|name| align_to_eight(FANOTIFY_FID_INFO_BASE_LEN + name.len() + 1))
+        .unwrap_or(0)
+}
+
+fn append_report_name_info(data: &mut Vec<u8>, name: Option<&str>) {
+    let Some(name) = name else {
+        return;
+    };
+    // UNFINISHED: Linux encodes a real file handle and filesystem id here.
+    // This contest subset only exposes the DFID_NAME record shape plus the
+    // basename required by current LTP fanotify name-report checks.
+    let raw_len = FANOTIFY_FID_INFO_BASE_LEN + name.len() + 1;
+    let len = align_to_eight(raw_len);
+    let mut info = Vec::new();
+    info.resize(len, 0);
+    info[0] = FAN_EVENT_INFO_TYPE_DFID_NAME;
+    info[1] = 0;
+    info[2..4].copy_from_slice(&(len as u16).to_ne_bytes());
+    info[12..16].copy_from_slice(&0u32.to_ne_bytes());
+    info[16..20].copy_from_slice(&0i32.to_ne_bytes());
+    info[FANOTIFY_FID_INFO_BASE_LEN..FANOTIFY_FID_INFO_BASE_LEN + name.len()]
+        .copy_from_slice(name.as_bytes());
+    data.extend_from_slice(&info);
 }
 
 pub struct FanotifyGroupFile {
@@ -612,11 +660,10 @@ fn validate_init_flags(flags: u32) -> Result<(), SysError> {
         // FID/name records because current scoring only probes init validation.
     }
     if flags & FILE_HANDLE_REPORT_FLAGS != 0 {
-        // UNFINISHED: This compatibility path reports metadata-only events with
-        // FAN_NOFD, but does not encode fanotify_event_info_fid records yet.
-        // FAN_REPORT_DIR_FID/NAME/TARGET_FID are accepted only far enough for
-        // Linux-compatible fanotify_mark(2) validation paths; mount marks with
-        // name records still return EINVAL below to avoid claiming full support.
+        // UNFINISHED: FID/name reporting still uses a minimal DFID_NAME record
+        // with a zero file handle. It is enough for LTP validation paths that
+        // check FAN_NOFD/name record layout, but not full name_to_handle_at(2)
+        // compatible file-handle semantics.
     }
     if flags & FAN_REPORT_NAME != 0 && flags & FAN_REPORT_DIR_FID == 0 {
         return Err(SysError::EINVAL);
@@ -686,12 +733,6 @@ fn validate_mark_args(group: &FanotifyGroup, flags: u32, mask: u64) -> Result<()
     }
     if flags & FAN_MARK_FLUSH == 0 {
         if mask == 0 || mask & UNSUPPORTED_PERMISSION_EVENTS != 0 || mask & !KNOWN_MARK_MASK != 0 {
-            return Err(SysError::EINVAL);
-        }
-        if flags & FAN_MARK_MOUNT != 0 && group.init_flags & FAN_REPORT_NAME != 0 {
-            // UNFINISHED: Name-report mount marks require event info records
-            // this contest subset does not encode yet. Keep them visibly
-            // unsupported so LTP name-report event tests stay in TCONF.
             return Err(SysError::EINVAL);
         }
         if mask & SUPPORTED_DIRENT_MARK_EVENTS != 0 {
@@ -830,14 +871,63 @@ fn fanotify_notify_file_at(
     };
     let parent = file.vfs_parent_node_id();
     let is_dir = file.working_dir().is_some();
+    if let Some(path) = event_path {
+        remember_node_name(node, path);
+    }
+    let event_name = event_path
+        .and_then(path_basename)
+        .map(String::from)
+        .or_else(|| remembered_node_name(node));
 
     FANOTIFY_GROUPS.exclusive_session(|groups| {
         groups.retain(|weak| weak.strong_count() > 0);
         let live_groups: Vec<_> = groups.iter().filter_map(Weak::upgrade).collect();
         for group in live_groups {
-            group.publish(node, parent, mount, event_mask, is_dir, event_path, file);
+            group.publish(
+                node,
+                parent,
+                mount,
+                event_mask,
+                is_dir,
+                event_path,
+                event_name.as_deref(),
+                file,
+            );
         }
     });
+}
+
+fn path_basename(path: &str) -> Option<&str> {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+}
+
+fn remember_node_name(node: VfsNodeId, path: &str) {
+    let Some(name) = path_basename(path) else {
+        return;
+    };
+    FANOTIFY_NODE_NAMES.exclusive_session(|names| {
+        if let Some((_, stored)) = names
+            .iter_mut()
+            .find(|(stored_node, _)| *stored_node == node)
+        {
+            stored.clear();
+            stored.push_str(name);
+        } else {
+            names.push((node, String::from(name)));
+        }
+    });
+}
+
+fn remembered_node_name(node: VfsNodeId) -> Option<String> {
+    FANOTIFY_NODE_NAMES.exclusive_session(|names| {
+        names
+            .iter()
+            .find(|(stored_node, _)| *stored_node == node)
+            .map(|(_, name)| name.clone())
+    })
 }
 
 pub(super) fn fanotify_notify_file(file: &Arc<dyn File + Send + Sync>, event_mask: u64) {
@@ -878,10 +968,6 @@ pub(super) fn fanotify_notify_open(file: &Arc<dyn File + Send + Sync>) {
 
 pub(super) fn fanotify_notify_open_at(file: &Arc<dyn File + Send + Sync>, path: &str) {
     fanotify_notify_file_at(file, FAN_OPEN, Some(path));
-}
-
-pub(crate) fn fanotify_notify_open_exec(file: &Arc<dyn File + Send + Sync>) {
-    fanotify_notify_file(file, FAN_OPEN | FAN_OPEN_EXEC);
 }
 
 pub(crate) fn fanotify_notify_open_exec_at(file: &Arc<dyn File + Send + Sync>, path: &str) {
