@@ -1,6 +1,7 @@
 use super::super::{FileStat, FileTimestamp};
 use super::FsError;
 use super::FsResult;
+use super::VfsNodeId;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -30,6 +31,10 @@ pub(crate) struct FileSystemStat {
 pub(crate) trait FileSystemBackend: Send {
     fn root_ino(&self) -> u32 {
         2
+    }
+
+    fn overlay_real_node(&mut self, _ino: u32) -> Option<VfsNodeId> {
+        None
     }
 
     fn statfs(&mut self) -> FileSystemStat {

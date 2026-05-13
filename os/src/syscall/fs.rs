@@ -4,6 +4,7 @@ mod fanotify;
 mod fd;
 mod fd_compat;
 mod fd_lock;
+mod file_handle;
 mod io;
 mod mount;
 mod path;
@@ -27,6 +28,7 @@ pub use fd_compat::{
 pub(crate) use fd_lock::{
     release_flock_locks_for_closed_fd_table, release_record_locks_for_process,
 };
+pub use file_handle::sys_name_to_handle_at;
 pub use io::{
     sys_copy_file_range, sys_fadvise64, sys_fallocate, sys_fsync, sys_ftruncate, sys_lseek,
     sys_pread64, sys_preadv, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read, sys_readahead,

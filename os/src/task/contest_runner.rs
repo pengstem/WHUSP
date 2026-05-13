@@ -3,7 +3,7 @@ use alloc::{format, string::String};
 const TEST_LIBCS: &[&str] = &["/glibc", "/musl"];
 const LA_MUSL_COMPAT_PRELOAD: &str = "/opt/oscomp-support/lib/liboscomp-musl-compat.so";
 
-const INTERACTIVE_SHELL: bool = true;
+const INTERACTIVE_SHELL: bool = false;
 
 // CONTEXT: `ALL_TESTS` is the marker universe. Disabled groups still emit
 // START/END pairs so the local scorer and official-style logs stay aligned.
@@ -44,7 +44,7 @@ const TEST_SCRIPTS: &[&str] = &[
 /// runs cases whose names start with the prefix, and
 /// Some("range:<start>,<end>") runs cases in the lexicographic half-open range
 /// [start, end). Empty range bounds are unbounded.
-const LTP_CASE_FILTER_OPTION: Option<&str> = Some("case:fanotify");
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some("prefix:pkey");
 
 enum LtpCaseFilter {
     Whitelist,

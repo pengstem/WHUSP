@@ -10,6 +10,7 @@ mod memfd;
 mod mount;
 mod mount_fd;
 mod named_fifo;
+mod overlayfs;
 mod path;
 mod pipe;
 mod procfs;
@@ -353,8 +354,8 @@ pub(crate) use mount::{
     MountError, MountId, MountNamespaceId, MountPropagation, ROOT_MOUNT_NAMESPACE,
     assign_pid_to_cgroup, clone_mount_namespace, mount_bind_at, mount_block_device_at,
     mount_cgroup2_at, mount_ext_scratch_at, mount_fat_device_at, mount_is_read_only,
-    mount_tmpfs_at, move_mount_at, remount_at, set_mount_propagation_at, statfs_for_mount,
-    unmount_at,
+    mount_overlay_compat_at, mount_tmpfs_at, move_mount_at, overlay_real_node, remount_at,
+    set_mount_propagation_at, statfs_for_mount, unmount_at,
 };
 pub(crate) use path::{PathContext, WorkingDir, normalize_path_at_root, path_inside_root};
 pub(crate) use pipe::default_pipe_capacity_for_current_process;

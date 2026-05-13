@@ -2,8 +2,8 @@ use crate::fs::{
     DetachedMountFile, FsContextFile, FsContextStateError, MountError, MountPropagation, OpenFlags,
     WorkingDir, lookup_existing_dir_in, lookup_mount_target_dir_in, loop_device_is_attached,
     mount_bind_at, mount_block_device_at, mount_cgroup2_at, mount_ext_scratch_at,
-    mount_fat_device_at, mount_tmpfs_at, move_mount_at, normalize_path_at_root, open_file_in,
-    remount_at, set_mount_propagation_at, unmount_at,
+    mount_fat_device_at, mount_overlay_compat_at, mount_tmpfs_at, move_mount_at,
+    normalize_path_at_root, open_file_in, remount_at, set_mount_propagation_at, unmount_at,
 };
 use crate::task::{CAP_SYS_ADMIN, current_process, current_user_token};
 use alloc::string::String;
@@ -501,7 +501,7 @@ pub fn sys_mount(
     target: *const u8,
     fstype: *const u8,
     flags: usize,
-    _data: *const u8,
+    data: *const u8,
 ) -> SysResult {
     let token = current_user_token();
     let target = read_user_c_string(token, target, PATH_MAX)?;
@@ -694,10 +694,25 @@ pub fn sys_mount(
                 .map_err(mount_error_to_errno)?;
         }
         "overlay" => {
-            // CONTEXT: overlayfs is not implemented. Returning ENODEV lets LTP
-            // classify overlay-specific branches as unsupported instead of
-            // mistaking a tmpfs fallback for a real overlay mount.
-            return Err(SysError::ENODEV);
+            let options = if data.is_null() {
+                String::new()
+            } else {
+                read_user_c_string(token, data as *const u8, PATH_MAX)?
+            };
+            let lower =
+                overlay_option_value(options.as_str(), "lowerdir=").ok_or(SysError::EINVAL)?;
+            let upper =
+                overlay_option_value(options.as_str(), "upperdir=").ok_or(SysError::EINVAL)?;
+            let lower_dir = lookup_existing_dir_in(snapshot.context.clone(), lower)?;
+            let upper_dir = lookup_existing_dir_in(snapshot.context.clone(), upper)?;
+            mount_overlay_compat_at(
+                namespace_id,
+                target_dir,
+                lower_dir,
+                upper_dir,
+                target_path.as_str(),
+            )
+            .map_err(mount_error_to_errno)?;
         }
         _ => {
             // CONTEXT: Several BusyBox/LTP setup paths mount scratch or pseudo
@@ -708,6 +723,13 @@ pub fn sys_mount(
         }
     }
     Ok(0)
+}
+
+fn overlay_option_value<'a>(options: &'a str, key: &str) -> Option<&'a str> {
+    options
+        .split(',')
+        .find_map(|item| item.strip_prefix(key))
+        .filter(|value| !value.is_empty())
 }
 
 pub fn sys_umount2(target: *const u8, _flags: i32) -> SysResult {

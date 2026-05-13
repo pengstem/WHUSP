@@ -739,6 +739,9 @@ fn write_loop0_at(offset: usize, buf: &[u8]) -> usize {
     // CONTEXT: /dev/loop0 is currently a lightweight LTP scratch device.
     // mkfs output is not consumed by mount(), which routes loop sources to
     // tmpfs until the kernel has a real loop-backed block mount.
+    if offset == 0 && !buf.is_empty() {
+        super::mount::reset_ext_scratch_mount("/dev/loop0");
+    }
     buf.len().min(size - offset)
 }
 

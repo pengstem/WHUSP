@@ -1,6 +1,7 @@
 use super::cgroupfs::CgroupFs;
 use super::ext4::Ext4Mount;
 use super::fat::FatMount;
+use super::overlayfs::OverlayFs;
 use super::path::WorkingDir;
 use super::procfs::ProcFs;
 use super::tmpfs::{EXT234_SUPER_MAGIC, TmpFs};
@@ -220,6 +221,10 @@ pub(super) fn with_mount<V>(
     let mut backend = mounted.backend.lock();
     drain_pending_inode_releases(mount_id, &mut **backend);
     Some(f(&mut **backend))
+}
+
+pub(crate) fn overlay_real_node(node: VfsNodeId) -> Option<VfsNodeId> {
+    with_mount(node.mount_id, |mount| mount.overlay_real_node(node.ino)).flatten()
 }
 
 fn try_with_mount<V>(
@@ -1540,6 +1545,27 @@ pub(crate) fn mount_tmpfs_at(
         "tmpfs",
         target_path,
         mount_options(read_only),
+    )
+}
+
+pub(crate) fn mount_overlay_compat_at(
+    namespace_id: MountNamespaceId,
+    target: WorkingDir,
+    lower: WorkingDir,
+    upper: WorkingDir,
+    target_path: &str,
+) -> Result<MountId, MountError> {
+    // CONTEXT: This is a minimal overlayfs-compatible mount for LTP fanotify
+    // coverage. It provides upper-first/lower-fallback lookup and delegates
+    // file I/O to the real lower/upper nodes; it is not a full copy-up or
+    // whiteout implementation.
+    mount_pseudo_fs_at_with_options(
+        namespace_id,
+        target,
+        Box::new(OverlayFs::new(lower, upper)),
+        "overlay",
+        target_path,
+        "rw",
     )
 }
 

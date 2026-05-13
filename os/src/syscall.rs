@@ -166,6 +166,7 @@ const SYSCALL_WAIT4: usize = 260;
 const SYSCALL_PRLIMIT64: usize = 261;
 const SYSCALL_FANOTIFY_INIT: usize = 262;
 const SYSCALL_FANOTIFY_MARK: usize = 263;
+const SYSCALL_NAME_TO_HANDLE_AT: usize = 264;
 const SYSCALL_CLOCK_ADJTIME: usize = 266;
 const SYSCALL_SYNCFS: usize = 267;
 const SYSCALL_SETNS: usize = 268;
@@ -678,6 +679,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as u64,
             args[3] as isize,
             args[4] as *const u8,
+        ),
+        SYSCALL_NAME_TO_HANDLE_AT => sys_name_to_handle_at(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3] as *mut i32,
+            args[4] as i32,
         ),
         SYSCALL_PERF_EVENT_OPEN => sys_perf_event_open(
             args[0] as *const u8,
