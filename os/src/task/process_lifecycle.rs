@@ -3,7 +3,7 @@ use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
 use super::process::{
     Credentials, ProcessControlBlock, ProcessControlBlockInner, ProcessCpuTimes, ProcessFsContext,
-    ProcessResourceLimits, ProcessTimers,
+    ProcessResourceLimits, ProcessTimers, empty_process_pkey_rights,
 };
 use super::{
     CloneArgs, CloneFlags, FdTableEntry, SIGCHLD, SignalAction, TaskControlBlock, add_task,
@@ -111,6 +111,7 @@ impl ProcessControlBlock {
                     resource_limits: ProcessResourceLimits::new(),
                     process_keyring: None,
                     session_keyring: None,
+                    pkey_rights: empty_process_pkey_rights(),
                     membarrier_private_expedited_registered: false,
                     signal_actions: [SignalAction::default(); super::SIGNAL_INFO_SLOTS],
                     cpu_times: ProcessCpuTimes::default(),
@@ -188,6 +189,7 @@ impl ProcessControlBlock {
         let credentials = parent.credentials.clone();
         let resource_limits = parent.resource_limits;
         let session_keyring = parent.session_keyring;
+        let pkey_rights = parent.pkey_rights;
         let membarrier_private_expedited_registered =
             parent.membarrier_private_expedited_registered;
         let fs = parent.fs.forked(mount_namespace_id);
@@ -230,6 +232,7 @@ impl ProcessControlBlock {
                     resource_limits,
                     process_keyring: None,
                     session_keyring,
+                    pkey_rights,
                     membarrier_private_expedited_registered,
                     signal_actions,
                     cpu_times: ProcessCpuTimes::default(),

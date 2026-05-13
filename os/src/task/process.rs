@@ -14,6 +14,12 @@ use alloc::vec::Vec;
 
 pub const RLIM_INFINITY: usize = usize::MAX;
 const RLIMIT_COUNT: usize = RLimitResource::RtTime as usize + 1;
+pub(crate) const PROCESS_PKEY_COUNT: usize = 16;
+pub(crate) type ProcessPKeyRights = [Option<usize>; PROCESS_PKEY_COUNT];
+
+pub(crate) fn empty_process_pkey_rights() -> ProcessPKeyRights {
+    [None; PROCESS_PKEY_COUNT]
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -481,6 +487,7 @@ pub struct ProcessControlBlockInner {
     pub resource_limits: ProcessResourceLimits,
     pub(crate) process_keyring: Option<i32>,
     pub(crate) session_keyring: Option<i32>,
+    pub(crate) pkey_rights: ProcessPKeyRights,
     pub membarrier_private_expedited_registered: bool,
     pub signal_actions: [SignalAction; SIGNAL_INFO_SLOTS],
     pub cpu_times: ProcessCpuTimes,

@@ -2,7 +2,9 @@ use crate::config::PAGE_SIZE;
 use crate::mm::shm::ShmError;
 use crate::mm::{MapPermission, MemoryProtectError, MmapFlush};
 use crate::syscall::user_ptr::copy_to_user;
-use crate::task::{CAP_IPC_LOCK, RLimitResource, current_process, current_user_token};
+use crate::task::{
+    CAP_IPC_LOCK, PROCESS_PKEY_COUNT, RLimitResource, current_process, current_user_token,
+};
 use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
 
@@ -53,6 +55,9 @@ const MCL_CURRENT: usize = 0x1;
 const MCL_FUTURE: usize = 0x2;
 const MCL_ONFAULT: usize = 0x4;
 const MCL_SUPPORTED: usize = MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT;
+const PKEY_DISABLE_ACCESS: usize = 0x1;
+const PKEY_DISABLE_WRITE: usize = 0x2;
+const PKEY_ACCESS_RIGHTS_MASK: usize = PKEY_DISABLE_ACCESS | PKEY_DISABLE_WRITE;
 
 const MEMBARRIER_CMD_QUERY: i32 = 0;
 const MEMBARRIER_CMD_PRIVATE_EXPEDITED: i32 = 1 << 3;
@@ -258,6 +263,55 @@ fn sys_mmap_impl(
 }
 
 pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> SysResult {
+    sys_mprotect_impl(addr, len, prot, None)
+}
+
+pub fn sys_pkey_mprotect(addr: usize, len: usize, prot: usize, pkey: isize) -> SysResult {
+    let pkey = match pkey {
+        -1 => None,
+        0 => Some(0),
+        value if value > 0 && (value as usize) < PROCESS_PKEY_COUNT => Some(value as usize),
+        _ => return Err(SysError::EINVAL),
+    };
+    sys_mprotect_impl(addr, len, prot, pkey)
+}
+
+pub fn sys_pkey_alloc(flags: usize, access_rights: usize) -> SysResult {
+    if flags != 0 || access_rights & !PKEY_ACCESS_RIGHTS_MASK != 0 {
+        return Err(SysError::EINVAL);
+    }
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let Some(pkey) = inner
+        .pkey_rights
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(pkey, rights)| rights.is_none().then_some(pkey))
+    else {
+        return Err(SysError::ENOSPC);
+    };
+    inner.pkey_rights[pkey] = Some(access_rights);
+    Ok(pkey as isize)
+}
+
+pub fn sys_pkey_free(pkey: isize) -> SysResult {
+    if pkey <= 0 || (pkey as usize) >= PROCESS_PKEY_COUNT {
+        return Err(SysError::EINVAL);
+    }
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let pkey = pkey as usize;
+    if inner.pkey_rights[pkey].is_none() {
+        return Err(SysError::EINVAL);
+    }
+    inner.pkey_rights[pkey] = None;
+    Ok(0)
+}
+
+fn sys_mprotect_impl(addr: usize, len: usize, prot: usize, pkey: Option<usize>) -> SysResult {
     if addr % PAGE_SIZE != 0 {
         return Err(SysError::EINVAL);
     }
@@ -275,12 +329,17 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> SysResult {
 
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
+    let access_rights = match pkey {
+        Some(0) | None => 0,
+        Some(pkey) => inner.pkey_rights[pkey].ok_or(SysError::EINVAL)?,
+    };
+    let effective_prot = prot_with_pkey_access_rights(prot, access_rights);
     inner
         .memory_set
         .mprotect_area(
             addr,
             len,
-            prot_to_map_permission(prot),
+            prot_to_map_permission(effective_prot),
             prot_to_reported_map_permission(prot),
         )
         .map_err(|err| match err {
@@ -493,6 +552,21 @@ fn write_back_mmap_flushes(flushes: Vec<MmapFlush>) {
     for flush in flushes {
         flush.write_back();
     }
+}
+
+fn prot_with_pkey_access_rights(prot: usize, access_rights: usize) -> usize {
+    // UNFINISHED: This is a contest compatibility model for pkeys. It rewrites
+    // ordinary PTE permissions instead of storing hardware pkey tags and
+    // per-thread PKRU rights, so it covers pkey_mprotect-style restriction and
+    // restore flows but not cheap userspace PKRU flips or signal-time PKRU
+    // behavior.
+    if access_rights & PKEY_DISABLE_ACCESS != 0 {
+        return prot & !(PROT_READ | PROT_WRITE);
+    }
+    if access_rights & PKEY_DISABLE_WRITE != 0 {
+        return prot & !PROT_WRITE;
+    }
+    prot
 }
 
 fn prot_to_map_permission(prot: usize) -> MapPermission {

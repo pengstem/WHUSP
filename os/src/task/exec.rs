@@ -1,6 +1,6 @@
 use super::{
     SigAltStack, SignalAction, current_task, prepare_exec_thread_group,
-    process::ProcessControlBlock,
+    process::{ProcessControlBlock, empty_process_pkey_rights},
 };
 use crate::config::PAGE_SIZE;
 use crate::fs::{VfsNodeId, track_regular_file_executable, untrack_regular_file_executable};
@@ -197,6 +197,7 @@ impl ProcessControlBlock {
         let previous_executable_node = {
             let mut inner = self.inner_exclusive_access();
             inner.memory_set = memory_set;
+            inner.pkey_rights = empty_process_pkey_rights();
             let previous = core::mem::replace(&mut inner.executable_node, executable_node);
             inner.cmdline = args.clone();
             inner.timers.clear_posix_after_exec();
