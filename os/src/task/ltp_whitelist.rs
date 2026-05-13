@@ -168,4 +168,13 @@ pub(super) const LTP_CASE_WHITELIST: &[&str] = &[
     "writev01",
     "writev03",
     "writev07",
+    "splice01",
+    "splice02",
+    "splice03",
+    "splice04",
+    "splice05",
+    "splice06",
+    "splice07",
+    "splice08",
+    "splice09",
 ];

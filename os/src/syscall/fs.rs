@@ -18,8 +18,8 @@ pub use fanotify::{sys_fanotify_init, sys_fanotify_mark};
 pub(crate) use fd::{close_detached_fd_entry, get_file_by_fd, install_file_fd};
 pub use fd::{sys_close, sys_dup, sys_dup3, sys_fcntl, sys_flock, sys_memfd_create, sys_pipe2};
 pub use fd_compat::{
-    sys_bpf, sys_inotify_init1, sys_io_uring_setup, sys_perf_event_open, sys_signalfd4,
-    sys_timerfd_create, sys_userfaultfd,
+    sys_bpf, sys_inotify_init1, sys_io_uring_setup, sys_memfd_secret, sys_perf_event_open,
+    sys_signalfd4, sys_timerfd_create, sys_userfaultfd,
 };
 pub(crate) use fd_lock::{
     release_flock_locks_for_closed_fd_table, release_record_locks_for_process,

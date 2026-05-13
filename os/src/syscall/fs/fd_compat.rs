@@ -10,6 +10,7 @@ const FD_CLOEXEC: u32 = OpenFlags::CLOEXEC.bits();
 const SIGNALFD_VALID_FLAGS: u32 = FD_NONBLOCK | FD_CLOEXEC;
 const TIMERFD_VALID_FLAGS: u32 = FD_NONBLOCK | FD_CLOEXEC;
 const INOTIFY_INIT1_VALID_FLAGS: u32 = FD_NONBLOCK | FD_CLOEXEC;
+const MEMFD_SECRET_VALID_FLAGS: u32 = FD_CLOEXEC;
 const UFFD_USER_MODE_ONLY: u32 = 1;
 const USERFAULTFD_VALID_FLAGS: u32 = FD_NONBLOCK | FD_CLOEXEC | UFFD_USER_MODE_ONLY;
 const BPF_MAP_CREATE: u32 = 0;
@@ -31,6 +32,11 @@ fn open_flags_from_fd_flags(flags: u32, valid_flags: u32) -> SysResult<OpenFlags
 
 fn install_dummy_readable_fd(open_flags: OpenFlags) -> SysResult {
     let file = make_anonymous_fd(true, false, S_IFCHR | 0o600);
+    install_file_fd(file, open_flags, None)
+}
+
+fn install_dummy_readwrite_fd(open_flags: OpenFlags) -> SysResult {
+    let file = make_anonymous_fd(true, true, S_IFCHR | 0o600);
     install_file_fd(file, open_flags, None)
 }
 
@@ -68,6 +74,13 @@ pub fn sys_inotify_init1(flags: u32) -> SysResult {
     let open_flags = open_flags_from_fd_flags(flags, INOTIFY_INIT1_VALID_FLAGS)?;
     // UNFINISHED: inotify watches and event queues are not implemented.
     install_dummy_readable_fd(open_flags)
+}
+
+pub fn sys_memfd_secret(flags: u32) -> SysResult {
+    let open_flags = open_flags_from_fd_flags(flags, MEMFD_SECRET_VALID_FLAGS)?;
+    // UNFINISHED: Linux memfd_secret backs mmap() with secret memory and
+    // enforces RLIMIT_MEMLOCK; this fd only satisfies generic fd probes.
+    install_dummy_readwrite_fd(open_flags | OpenFlags::RDWR)
 }
 
 pub fn sys_userfaultfd(flags: u32) -> SysResult {

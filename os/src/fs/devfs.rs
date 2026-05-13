@@ -1320,6 +1320,18 @@ impl File for DevFsFile {
     fn is_dev_full(&self) -> bool {
         self.node == DevNode::Full
     }
+
+    fn supports_splice_read(&self) -> bool {
+        self.readable && matches!(self.node, DevNode::Zero | DevNode::Full | DevNode::Loop0)
+    }
+
+    fn supports_splice_write(&self) -> bool {
+        self.writable
+            && matches!(
+                self.node,
+                DevNode::Null | DevNode::Zero | DevNode::Full | DevNode::Loop0
+            )
+    }
 }
 
 impl Drop for PtyFile {

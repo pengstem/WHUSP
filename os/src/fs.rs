@@ -297,6 +297,30 @@ pub trait File: Send + Sync {
     fn is_socket(&self) -> bool {
         false
     }
+    fn supports_splice_read(&self) -> bool {
+        if !self.readable() {
+            return false;
+        }
+        if self.is_pipe() || self.is_socket() {
+            return true;
+        }
+        match self.stat() {
+            Ok(stat) => stat.mode & S_IFMT == S_IFREG,
+            Err(_) => false,
+        }
+    }
+    fn supports_splice_write(&self) -> bool {
+        if !self.writable() {
+            return false;
+        }
+        if self.is_pipe() || self.is_socket() {
+            return true;
+        }
+        match self.stat() {
+            Ok(stat) => stat.mode & S_IFMT == S_IFREG,
+            Err(_) => false,
+        }
+    }
 }
 
 pub fn init() {

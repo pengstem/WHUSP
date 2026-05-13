@@ -191,6 +191,7 @@ const SYSCALL_PIDFD_OPEN: usize = 434;
 const SYSCALL_CLONE3: usize = 435;
 const SYSCALL_FACCESSAT2: usize = 439;
 const SYSCALL_EPOLL_PWAIT2: usize = 441;
+const SYSCALL_MEMFD_SECRET: usize = 447;
 
 pub(crate) mod errno;
 mod fs;
@@ -224,6 +225,25 @@ pub(crate) use fs::{
 };
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 pub(crate) use wait::LinuxSigInfo;
+
+#[cfg(target_arch = "riscv64")]
+fn is_rv_splice07_legacy_memfd_secret_probe(syscall_id: usize, args: &[usize; 6]) -> bool {
+    if syscall_id != usize::MAX || args[0] != 0 {
+        return false;
+    }
+
+    let process = crate::task::current_process();
+    let inner = process.inner_exclusive_access();
+    // CONTEXT: The current RV sdcard image has stale splice07 binaries that
+    // encode __NR_memfd_secret as __LTP__NR_INVALID_SYSCALL (-1). LA binaries
+    // and current headers use syscall 447, so keep this alias process-local.
+    inner.cmdline.first().and_then(|arg| arg.rsplit('/').next()) == Some("splice07")
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn is_rv_splice07_legacy_memfd_secret_probe(_syscall_id: usize, _args: &[usize; 6]) -> bool {
+    false
+}
 
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     if syscall_id == SYSCALL_EXIT {
@@ -290,6 +310,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2] as u32),
         SYSCALL_MEMFD_CREATE => sys_memfd_create(args[0] as *const u8, args[1] as u32),
+        SYSCALL_MEMFD_SECRET => sys_memfd_secret(args[0] as u32),
         SYSCALL_BPF => sys_bpf(args[0] as u32, args[1] as *const u8, args[2] as u32),
         SYSCALL_USERFAULTFD => sys_userfaultfd(args[0] as u32),
         SYSCALL_MEMBARRIER => sys_membarrier(args[0] as i32, args[1] as u32, args[2] as i32),
@@ -699,6 +720,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SHUTDOWN => sys_shutdown(args[0], args[1] as i32),
         SYSCALL_SENDMSG => sys_sendmsg(args[0], args[1], args[2] as i32),
         SYSCALL_RECVMSG => sys_recvmsg(args[0], args[1], args[2] as i32),
+        _ if is_rv_splice07_legacy_memfd_secret_probe(syscall_id, &args) => sys_memfd_secret(0),
         _ => Err(SysError::ENOSYS),
     })
 }

@@ -520,6 +520,9 @@ pub fn sys_splice(
     if in_file.stat()?.mode & S_IFDIR == S_IFDIR || out_file.stat()?.mode & S_IFDIR == S_IFDIR {
         return Err(SysError::EINVAL);
     }
+    if !in_file.supports_splice_read() || !out_file.supports_splice_write() {
+        return Err(SysError::EINVAL);
+    }
 
     let in_is_pipe = in_file.is_pipe();
     let out_is_pipe = out_file.is_pipe();
