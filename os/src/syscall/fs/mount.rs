@@ -624,6 +624,7 @@ pub fn sys_mount(
                 mount_ext_scratch_at(
                     namespace_id,
                     target_dir,
+                    source.as_str(),
                     ext_fs_type,
                     target_path.as_str(),
                     read_only,

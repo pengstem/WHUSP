@@ -21,6 +21,7 @@ pub use identity::{
     sys_setreuid, sys_setuid,
 };
 pub use namespace::sys_setns;
+pub(crate) use pidfd::{install_pidfd_for_fanotify, pidfd_fdinfo};
 pub use pidfd::{sys_pidfd_open, sys_pidfd_send_signal};
 pub use resource::{sys_getrlimit, sys_prlimit64, sys_setrlimit};
 pub use sched::{

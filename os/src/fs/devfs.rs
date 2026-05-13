@@ -829,6 +829,7 @@ pub(crate) fn attach_loop_device(id: usize, backend: Arc<dyn File + Send + Sync>
     if id != 0 {
         return Err(FsError::NoDeviceOrAddress);
     }
+    super::mount::reset_ext_scratch_mount("/dev/loop0");
     LOOP0_BACKEND.exclusive_session(|slot| *slot = Some(backend));
     Ok(())
 }

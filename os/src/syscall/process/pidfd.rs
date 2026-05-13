@@ -8,6 +8,8 @@ use crate::task::{
     Credentials, ProcessControlBlock, SignalFlags, SignalInfo, current_process, current_user_token,
     pid2process, queue_signal_to_task, wakeup_task,
 };
+use alloc::format;
+use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
 
@@ -55,6 +57,19 @@ fn install_pidfd_with_flags(pid: usize, open_flags: OpenFlags) -> SysResult<usiz
 
 pub(super) fn install_pidfd_for_current_process(pid: usize) -> SysResult<usize> {
     install_pidfd_with_flags(pid, OpenFlags::CLOEXEC)
+}
+
+pub(crate) fn install_pidfd_for_fanotify(pid: usize) -> SysResult<usize> {
+    pid2process(pid).ok_or(SysError::ESRCH)?;
+    install_pidfd_with_flags(pid, OpenFlags::CLOEXEC)
+}
+
+pub(crate) fn pidfd_fdinfo(file: &Arc<dyn File + Send + Sync>, flags: u32) -> Option<String> {
+    let pidfd = file.as_any().downcast_ref::<PidFdFile>()?;
+    Some(format!(
+        "pos:\t0\nflags:\t{flags:o}\nmnt_id:\t0\nPid:\t{}\nNSpid:\t{}\n",
+        pidfd.pid, pidfd.pid
+    ))
 }
 
 fn pid_from_fd(pidfd: usize) -> SysResult<usize> {

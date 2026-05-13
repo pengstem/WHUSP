@@ -1,11 +1,11 @@
 use crate::fs::{
     File, FileStat, FsNodeKind, OpenFlags, PathContext, S_IFLNK, S_IFMT, S_IFREG, VfsNodeId,
-    lookup_path_in, open_file_in, regular_file_is_open_writable_in,
+    lookup_path_in, normalize_path_at_root, open_file_in, regular_file_is_open_writable_in,
     regular_file_node_is_open_writable, stat_in,
 };
 use crate::mm::elf_required_interpreter_path;
 use crate::syscall::errno::{SysError, SysResult};
-use crate::syscall::fs::path_context_from;
+use crate::syscall::fs::{fanotify_notify_open_exec_at, path_context_from};
 use crate::syscall::user_ptr::{PATH_MAX, read_user_c_string, read_user_usize};
 use crate::task::{current_process, current_user_token};
 use alloc::format;
@@ -275,7 +275,11 @@ fn read_exec_file_in(
     follow_final_symlink: bool,
 ) -> SysResult<Vec<u8>> {
     check_exec_file_in(context.clone(), path, follow_final_symlink)?;
+    let event_path = normalize_path_at_root(context.root_path(), context.cwd_path(), path);
     let app_file = open_file_in(context, path, OpenFlags::RDONLY)?;
+    if let Some(event_path) = event_path.as_deref() {
+        fanotify_notify_open_exec_at(&app_file, event_path);
+    }
     read_all_file(app_file)
 }
 

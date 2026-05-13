@@ -7,6 +7,7 @@ use crate::config::PAGE_SIZE;
 use crate::mm::frame_stats;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::keyring;
+use crate::syscall::{fanotify_evict_evictable_marks, fanotify_fdinfo, pidfd_fdinfo};
 use crate::task::{
     ProcessProcSnapshot, TaskControlBlock, TaskStatus, list_process_snapshots, pid2process,
 };
@@ -47,6 +48,7 @@ const KEYS_MAXKEYS_INO: u32 = 26;
 const KEYS_MAXBYTES_INO: u32 = 27;
 const SYS_VM_DIR_INO: u32 = 28;
 const DROP_CACHES_INO: u32 = 29;
+const VFS_CACHE_PRESSURE_INO: u32 = 31;
 const PID_DIR_BASE: u32 = 100;
 const PID_FILE_BASE: u32 = 10_000;
 const PID_FILE_STRIDE: u32 = 16;
@@ -61,7 +63,9 @@ const PID_TASK_DIR_OFFSET: u32 = 7;
 const PID_SMAPS_OFFSET: u32 = 8;
 const PID_MOUNTS_OFFSET: u32 = 9;
 const PID_IO_OFFSET: u32 = 10;
+const PID_FDINFO_DIR_OFFSET: u32 = 11;
 const PID_FD_ENTRY_BASE: u32 = 1_000_000;
+const PID_FDINFO_ENTRY_BASE: u32 = 2_000_000;
 const PID_FD_ENTRY_STRIDE: u32 = 4096;
 const PID_TASK_INO_TAG_MASK: u32 = 0xC000_0000;
 const PID_TASK_TID_DIR_TAG: u32 = 0x8000_0000;
@@ -81,6 +85,7 @@ static PROC_PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(PIPE_MAX_CAPACITY);
 static PROC_PIPE_USER_PAGES_SOFT: AtomicUsize = AtomicUsize::new(DEFAULT_PIPE_USER_PAGES_SOFT);
 static PROC_LEASE_BREAK_TIME: AtomicUsize = AtomicUsize::new(DEFAULT_LEASE_BREAK_TIME);
 static PROC_NET_IPV4_CONF_LO_TAG: AtomicIsize = AtomicIsize::new(DEFAULT_NET_IPV4_CONF_TAG);
+static PROC_VFS_CACHE_PRESSURE: AtomicUsize = AtomicUsize::new(100);
 static PROC_MEMINFO_CACHED_KB: AtomicUsize = AtomicUsize::new(0);
 static PROC_IO_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PROC_IO_READAHEAD_SUPPRESS_READS: AtomicUsize = AtomicUsize::new(0);
@@ -133,6 +138,7 @@ enum ProcNode {
     KeysMaxkeys,
     KeysMaxbytes,
     DropCaches,
+    VfsCachePressure,
     Domainname,
     Tainted,
     PidDir(usize),
@@ -141,6 +147,8 @@ enum ProcNode {
     PidCmdline(usize),
     PidFdDir(usize),
     PidFdEntry(usize, usize),
+    PidFdInfoDir(usize),
+    PidFdInfoEntry(usize, usize),
     PidMaps(usize),
     PidSmaps(usize),
     PidMounts(usize),
@@ -266,6 +274,18 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         KEYS_MAXKEYS_INO => Some(ProcNode::KeysMaxkeys),
         KEYS_MAXBYTES_INO => Some(ProcNode::KeysMaxbytes),
         DROP_CACHES_INO => Some(ProcNode::DropCaches),
+        VFS_CACHE_PRESSURE_INO => Some(ProcNode::VfsCachePressure),
+        ino if ino >= PID_FDINFO_ENTRY_BASE => {
+            let rel = ino - PID_FDINFO_ENTRY_BASE;
+            let pid = (rel / PID_FD_ENTRY_STRIDE) as usize;
+            let fd = (rel % PID_FD_ENTRY_STRIDE) as usize;
+            let process = pid2process(pid)?;
+            let fd_exists = {
+                let inner = process.inner_exclusive_access();
+                inner.fd_table.get(fd).is_some_and(Option::is_some)
+            };
+            fd_exists.then_some(ProcNode::PidFdInfoEntry(pid, fd))
+        }
         ino if ino >= PID_FD_ENTRY_BASE => {
             let rel = ino - PID_FD_ENTRY_BASE;
             let pid = (rel / PID_FD_ENTRY_STRIDE) as usize;
@@ -296,6 +316,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
                 PID_SMAPS_OFFSET => Some(ProcNode::PidSmaps(pid)),
                 PID_MOUNTS_OFFSET => Some(ProcNode::PidMounts(pid)),
                 PID_IO_OFFSET => Some(ProcNode::PidIo(pid)),
+                PID_FDINFO_DIR_OFFSET => Some(ProcNode::PidFdInfoDir(pid)),
                 _ => None,
             }
         }
@@ -322,6 +343,7 @@ fn node_kind(node: ProcNode) -> FsNodeKind {
         | ProcNode::SysVmDir
         | ProcNode::PidDir(_)
         | ProcNode::PidFdDir(_)
+        | ProcNode::PidFdInfoDir(_)
         | ProcNode::PidNsDir(_)
         | ProcNode::PidTaskDir(_)
         | ProcNode::PidTaskTidDir(_, _) => FsNodeKind::Directory,
@@ -437,6 +459,11 @@ fn sys_vm_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: DROP_CACHES_INO,
         name: "drop_caches".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: VFS_CACHE_PRESSURE_INO,
+        name: "vfs_cache_pressure".into(),
         dtype: DT_REG,
     });
     entries
@@ -655,6 +682,11 @@ fn pid_entries(pid: usize) -> Vec<RawDirEntry> {
         dtype: DT_DIR,
     });
     entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_FDINFO_DIR_OFFSET),
+        name: "fdinfo".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
         ino: pid_file_ino(pid, PID_MAPS_OFFSET),
         name: "maps".into(),
         dtype: DT_REG,
@@ -764,6 +796,42 @@ fn pid_fd_entries(pid: usize) -> FsResult<Vec<RawDirEntry>> {
             ino: pid_fd_entry_ino(pid, fd),
             name: fd.to_string(),
             dtype: DT_LNK,
+        });
+    }
+    Ok(entries)
+}
+
+fn pid_fdinfo_entry_ino(pid: usize, fd: usize) -> u32 {
+    PID_FDINFO_ENTRY_BASE + pid as u32 * PID_FD_ENTRY_STRIDE + fd as u32
+}
+
+fn pid_fdinfo_entries(pid: usize) -> FsResult<Vec<RawDirEntry>> {
+    let process = pid2process(pid).ok_or(FsError::NotFound)?;
+    let fd_names: Vec<_> = {
+        let inner = process.inner_exclusive_access();
+        inner
+            .fd_table
+            .iter()
+            .enumerate()
+            .filter_map(|(fd, entry)| entry.as_ref().map(|_| fd))
+            .collect()
+    };
+    let mut entries = Vec::new();
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_FDINFO_DIR_OFFSET),
+        name: ".".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: pid_dir_ino(pid),
+        name: "..".into(),
+        dtype: DT_DIR,
+    });
+    for fd in fd_names {
+        entries.push(RawDirEntry {
+            ino: pid_fdinfo_entry_ino(pid, fd),
+            name: fd.to_string(),
+            dtype: DT_REG,
         });
     }
     Ok(entries)
@@ -916,6 +984,34 @@ fn net_ipv4_conf_default_tag_content() -> String {
     format!("{DEFAULT_NET_IPV4_CONF_TAG}\n")
 }
 
+fn vfs_cache_pressure_content() -> String {
+    format!("{}\n", PROC_VFS_CACHE_PRESSURE.load(Ordering::Relaxed))
+}
+
+fn pid_fdinfo_content(pid: usize, fd: usize) -> FsResult<String> {
+    let process = pid2process(pid).ok_or(FsError::NotFound)?;
+    let (flags, file) = {
+        let inner = process.inner_exclusive_access();
+        let entry = inner
+            .fd_table
+            .get(fd)
+            .and_then(Option::as_ref)
+            .ok_or(FsError::NotFound)?;
+        (entry.status_flags().bits(), entry.file())
+    };
+    if let Some(pidfd_info) = pidfd_fdinfo(&file, flags) {
+        return Ok(pidfd_info);
+    }
+    let fanotify_info = fanotify_fdinfo(&file).unwrap_or_default();
+    // CONTEXT: Linux exposes fanotify marks through /proc/<pid>/fdinfo/<fd>.
+    // This metadata-only subset reports enough mark/ignored_mask fields for
+    // LTP fanotify09/fanotify10 to distinguish groups with and without ignore
+    // marks; inode and device numbers are still placeholders.
+    Ok(format!(
+        "pos:\t0\nflags:\t{flags:o}\nmnt_id:\t0\n{fanotify_info}"
+    ))
+}
+
 fn domainname_content() -> Vec<u8> {
     let mut output = PROC_DOMAINNAME.exclusive_access().clone();
     output.push(b'\n');
@@ -996,6 +1092,25 @@ fn write_net_ipv4_conf_lo_tag(buf: &[u8], offset: u64) -> usize {
 
 fn write_drop_caches(buf: &[u8], _offset: u64) -> usize {
     PROC_MEMINFO_CACHED_KB.store(0, Ordering::Relaxed);
+    fanotify_evict_evictable_marks();
+    buf.len()
+}
+
+fn write_vfs_cache_pressure(buf: &[u8], offset: u64) -> usize {
+    if offset != 0 {
+        return 0;
+    }
+    let Ok(text) = core::str::from_utf8(buf) else {
+        return 0;
+    };
+    let Ok(value) = text.trim().parse::<usize>() else {
+        return 0;
+    };
+    // CONTEXT: This kernel does not implement VFS dentry/inode cache pressure,
+    // but LTP fanotify10 saves and restores the sysctl around mount-cycle
+    // tests. Store the value so the procfs knob behaves like a writable Linux
+    // compatibility control.
+    PROC_VFS_CACHE_PRESSURE.store(value, Ordering::Relaxed);
     buf.len()
 }
 
@@ -1133,6 +1248,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::NetIpv4ConfLoTag => Ok(net_ipv4_conf_lo_tag_content().into_bytes()),
         ProcNode::NetIpv4ConfDefaultTag => Ok(net_ipv4_conf_default_tag_content().into_bytes()),
         ProcNode::DropCaches => Ok(b"0\n".to_vec()),
+        ProcNode::VfsCachePressure => Ok(vfs_cache_pressure_content().into_bytes()),
         ProcNode::Domainname => Ok(domainname_content()),
         ProcNode::Tainted => Ok(b"0\n".to_vec()),
         ProcNode::PidStat(pid) => lookup_process(pid)
@@ -1147,6 +1263,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
             .map(pid_cmdline_content)
             .ok_or(FsError::NotFound),
         ProcNode::PidFdEntry(_, _) => Err(FsError::InvalidInput),
+        ProcNode::PidFdInfoEntry(pid, fd) => pid_fdinfo_content(pid, fd).map(String::into_bytes),
         ProcNode::PidMaps(pid) => pid2process(pid)
             .map(|process| process.proc_maps_content().into_bytes())
             .ok_or(FsError::NotFound),
@@ -1176,6 +1293,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         | ProcNode::SysVmDir
         | ProcNode::PidDir(_)
         | ProcNode::PidFdDir(_)
+        | ProcNode::PidFdInfoDir(_)
         | ProcNode::PidNsDir(_)
         | ProcNode::PidTaskDir(_)
         | ProcNode::PidTaskTidDir(_, _) => Err(FsError::IsDir),
@@ -1241,6 +1359,7 @@ impl FileSystemBackend for ProcFs {
                 "." => Ok((SYS_VM_DIR_INO, FsNodeKind::Directory)),
                 ".." => Ok((SYS_DIR_INO, FsNodeKind::Directory)),
                 "drop_caches" => Ok((DROP_CACHES_INO, FsNodeKind::RegularFile)),
+                "vfs_cache_pressure" => Ok((VFS_CACHE_PRESSURE_INO, FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::SysNetDir => match component {
@@ -1312,6 +1431,10 @@ impl FileSystemBackend for ProcFs {
                     FsNodeKind::RegularFile,
                 )),
                 "fd" => Ok((pid_file_ino(pid, PID_FD_DIR_OFFSET), FsNodeKind::Directory)),
+                "fdinfo" => Ok((
+                    pid_file_ino(pid, PID_FDINFO_DIR_OFFSET),
+                    FsNodeKind::Directory,
+                )),
                 "maps" => Ok((pid_file_ino(pid, PID_MAPS_OFFSET), FsNodeKind::RegularFile)),
                 "smaps" => Ok((pid_file_ino(pid, PID_SMAPS_OFFSET), FsNodeKind::RegularFile)),
                 "mounts" => Ok((
@@ -1340,6 +1463,25 @@ impl FileSystemBackend for ProcFs {
                         return Err(FsError::NotFound);
                     }
                     Ok((pid_fd_entry_ino(pid, fd), FsNodeKind::Symlink))
+                }
+            },
+            ProcNode::PidFdInfoDir(pid) => match component {
+                "." => Ok((
+                    pid_file_ino(pid, PID_FDINFO_DIR_OFFSET),
+                    FsNodeKind::Directory,
+                )),
+                ".." => Ok((pid_dir_ino(pid), FsNodeKind::Directory)),
+                _ => {
+                    let fd = parse_pid(component).ok_or(FsError::NotFound)?;
+                    let process = pid2process(pid).ok_or(FsError::NotFound)?;
+                    let fd_exists = {
+                        let inner = process.inner_exclusive_access();
+                        inner.fd_table.get(fd).is_some_and(Option::is_some)
+                    };
+                    if !fd_exists {
+                        return Err(FsError::NotFound);
+                    }
+                    Ok((pid_fdinfo_entry_ino(pid, fd), FsNodeKind::RegularFile))
                 }
             },
             ProcNode::PidNsDir(pid) => match component {
@@ -1423,7 +1565,8 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::PipeMaxSize
             | ProcNode::LeaseBreakTime
             | ProcNode::NetIpv4ConfLoTag
-            | ProcNode::DropCaches => Ok(()),
+            | ProcNode::DropCaches
+            | ProcNode::VfsCachePressure => Ok(()),
             ProcNode::Domainname => set_domainname_len(_len),
             _ => Err(FsError::ReadOnly),
         }
@@ -1455,6 +1598,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::SysVmDir
             | ProcNode::PidDir(_)
             | ProcNode::PidFdDir(_)
+            | ProcNode::PidFdInfoDir(_)
             | ProcNode::PidNsDir(_)
             | ProcNode::PidTaskDir(_)
             | ProcNode::PidTaskTidDir(_, _) => FileStat::with_mode(S_IFDIR | 0o555),
@@ -1467,6 +1611,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::LeaseBreakTime
             | ProcNode::NetIpv4ConfLoTag
             | ProcNode::DropCaches
+            | ProcNode::VfsCachePressure
             | ProcNode::Domainname => FileStat::with_mode(S_IFREG | 0o644),
             _ => FileStat::with_mode(S_IFREG | 0o444),
         };
@@ -1526,6 +1671,7 @@ impl FileSystemBackend for ProcFs {
             Some(ProcNode::LeaseBreakTime) => write_lease_break_time(buf, offset),
             Some(ProcNode::NetIpv4ConfLoTag) => write_net_ipv4_conf_lo_tag(buf, offset),
             Some(ProcNode::DropCaches) => write_drop_caches(buf, offset),
+            Some(ProcNode::VfsCachePressure) => write_vfs_cache_pressure(buf, offset),
             Some(ProcNode::Domainname) => write_domainname(buf, offset),
             _ => 0,
         }
@@ -1564,6 +1710,9 @@ impl FileSystemBackend for ProcFs {
             ),
             ProcNode::PidDir(pid) => write_dir_entries(&pid_entries(pid), offset, buf),
             ProcNode::PidFdDir(pid) => write_dir_entries(&pid_fd_entries(pid)?, offset, buf),
+            ProcNode::PidFdInfoDir(pid) => {
+                write_dir_entries(&pid_fdinfo_entries(pid)?, offset, buf)
+            }
             ProcNode::PidNsDir(pid) => write_dir_entries(&pid_ns_entries(pid), offset, buf),
             ProcNode::PidTaskDir(pid) => write_dir_entries(&pid_task_entries(pid)?, offset, buf),
             ProcNode::PidTaskTidDir(pid, local_tid) => {

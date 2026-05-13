@@ -1,12 +1,13 @@
 use crate::fs::{
     FileStat, FileSystemStat, MountId, OpenFlags, chmod_in, chown_in, mount_is_read_only,
-    stat_devfs_child, stat_devfs_misc_child, stat_devfs_pts_child, stat_in, stat_static_path,
-    statfs_for_mount,
+    open_file_in, stat_devfs_child, stat_devfs_misc_child, stat_devfs_pts_child, stat_in,
+    stat_static_path, statfs_for_mount,
 };
 use crate::task::{PathSnapshot, current_process, current_user_token};
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{PATH_MAX, read_user_c_string, write_user_value};
+use super::fanotify::fanotify_notify_attrib;
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::path::{check_current_access_path_prefixes_from, path_context_from};
 use super::uapi::{
@@ -246,12 +247,11 @@ pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> SysResult {
     // UNFINISHED: Linux clears setuid bits in additional cases depending on
     // capabilities and executable file state. This kernel implements the LTP
     // visible setgid clearing rule but still lacks full capability handling.
-    chmod_in(
-        path_context_from(&snapshot, dirfd, path.as_str())?,
-        path.as_str(),
-        true,
-        mode,
-    )?;
+    let context = path_context_from(&snapshot, dirfd, path.as_str())?;
+    chmod_in(context.clone(), path.as_str(), true, mode)?;
+    if let Ok(file) = open_file_in(context, path.as_str(), OpenFlags::PATH) {
+        fanotify_notify_attrib(&file);
+    }
     Ok(0)
 }
 
@@ -264,6 +264,7 @@ pub fn sys_fchmod(fd: usize, mode: u32) -> SysResult {
     let stat = file.stat()?;
     let mode = prepare_mode_change(stat, mode)?;
     file.set_mode(mode)?;
+    fanotify_notify_attrib(&file);
     Ok(0)
 }
 

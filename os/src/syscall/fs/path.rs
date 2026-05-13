@@ -4,7 +4,7 @@ use super::super::user_ptr::{
     PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, read_user_value,
     translated_byte_buffer_checked,
 };
-use super::fanotify::fanotify_notify_open;
+use super::fanotify::{fanotify_notify_open, fanotify_notify_open_at};
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd, install_file_fd};
 use super::stat::resolve_stat_from;
 use super::uapi::{
@@ -472,8 +472,13 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> SysRe
         open_file_in_with_attrs(context, path.as_str(), flags, create_attrs)?
     };
     let notify_file = Arc::clone(&file);
+    let notify_path = dir_path.clone();
     let fd = install_file_fd(file, flags, dir_path)?;
-    fanotify_notify_open(&notify_file);
+    if let Some(path) = notify_path.as_deref() {
+        fanotify_notify_open_at(&notify_file, path);
+    } else {
+        fanotify_notify_open(&notify_file);
+    }
     Ok(fd)
 }
 

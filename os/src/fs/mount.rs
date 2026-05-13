@@ -97,6 +97,8 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(Vec::new()) };
     static ref PENDING_INODE_RELEASES: UPIntrFreeCell<Vec<(MountId, u32)>> =
         unsafe { UPIntrFreeCell::new(Vec::new()) };
+    static ref EXT_SCRATCH_MOUNTS: SleepMutex<Vec<(String, &'static str, Arc<MountedFs>)>> =
+        SleepMutex::new(Vec::new());
 }
 
 static NEXT_MOUNT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -1544,18 +1546,45 @@ pub(crate) fn mount_tmpfs_at(
 pub(crate) fn mount_ext_scratch_at(
     namespace_id: MountNamespaceId,
     target: WorkingDir,
+    source: &str,
     fs_type: &'static str,
     target_path: &str,
     read_only: bool,
 ) -> Result<MountId, MountError> {
-    mount_pseudo_fs_at_with_options(
-        namespace_id,
-        target,
-        Box::new(TmpFs::new_with_statfs_magic(EXT234_SUPER_MAGIC)),
-        fs_type,
-        target_path,
-        mount_options(read_only),
-    )
+    let options = mount_options(read_only);
+    let mounted = {
+        let mut scratch_mounts = EXT_SCRATCH_MOUNTS.lock();
+        if let Some((_, _, mounted)) =
+            scratch_mounts
+                .iter()
+                .find(|(existing_source, existing_fs_type, _)| {
+                    existing_source == source && *existing_fs_type == fs_type
+                })
+        {
+            *mounted.options.lock() = options;
+            mounted.clone()
+        } else {
+            let mounted = MountedFs::new(
+                Box::new(TmpFs::new_with_statfs_magic(EXT234_SUPER_MAGIC)),
+                source.into(),
+                fs_type,
+                options,
+            );
+            scratch_mounts.push((source.into(), fs_type, mounted.clone()));
+            mounted
+        }
+    };
+    // CONTEXT: LTP remounts loop-backed ext scratch filesystems during
+    // fanotify/fs tests and expects files created before umount to still be
+    // visible after mount. Until real loop-backed ext mounts exist, keep the
+    // tmpfs compatibility backend persistent per loop source and fs type.
+    mount_new_fs_at(namespace_id, target, mounted, target_path)
+}
+
+pub(crate) fn reset_ext_scratch_mount(source: &str) {
+    EXT_SCRATCH_MOUNTS
+        .lock()
+        .retain(|(existing_source, _, _)| existing_source != source);
 }
 
 pub(crate) fn mount_cgroup2_at(
