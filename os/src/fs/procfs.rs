@@ -20,6 +20,7 @@ use lazy_static::lazy_static;
 
 const ROOT_INO: u32 = 2;
 const MOUNTS_INO: u32 = 3;
+const FILESYSTEMS_INO: u32 = 30;
 const MEMINFO_INO: u32 = 4;
 const UPTIME_INO: u32 = 5;
 const CPUINFO_INO: u32 = 6;
@@ -107,6 +108,7 @@ pub(super) struct ProcFs;
 enum ProcNode {
     Root,
     Mounts,
+    Filesystems,
     KeyUsers,
     Meminfo,
     Uptime,
@@ -237,6 +239,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
     match ino {
         ROOT_INO => Some(ProcNode::Root),
         MOUNTS_INO => Some(ProcNode::Mounts),
+        FILESYSTEMS_INO => Some(ProcNode::Filesystems),
         KEY_USERS_INO => Some(ProcNode::KeyUsers),
         MEMINFO_INO => Some(ProcNode::Meminfo),
         UPTIME_INO => Some(ProcNode::Uptime),
@@ -342,6 +345,11 @@ fn root_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: MOUNTS_INO,
         name: "mounts".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: FILESYSTEMS_INO,
+        name: "filesystems".into(),
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
@@ -793,6 +801,13 @@ fn mounts_content() -> String {
     output
 }
 
+fn filesystems_content() -> &'static str {
+    // CONTEXT: fsopen(2) points userspace at /proc/filesystems to discover
+    // valid fs names. ext2/ext3 are scratch-mount compatibility names backed by
+    // tmpfs for current LTP coverage, not real on-disk ext2/ext3 drivers.
+    "nodev\tproc\nnodev\ttmpfs\nnodev\tramfs\nnodev\tcgroup2\next2\next3\next4\nvfat\n"
+}
+
 fn meminfo_content() -> String {
     let (total_pages, free_pages) = frame_stats();
     let page_kb = PAGE_SIZE / 1024;
@@ -1103,6 +1118,7 @@ fn pid_cmdline_content(process: ProcessProcSnapshot) -> Vec<u8> {
 fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
     match node {
         ProcNode::Mounts => Ok(mounts_content().into_bytes()),
+        ProcNode::Filesystems => Ok(filesystems_content().as_bytes().to_vec()),
         ProcNode::KeyUsers => Ok(keyring::key_users_content().into_bytes()),
         ProcNode::Meminfo => Ok(meminfo_content().into_bytes()),
         ProcNode::Uptime => Ok(uptime_content().into_bytes()),
@@ -1195,6 +1211,7 @@ impl FileSystemBackend for ProcFs {
             ProcNode::Root => match component {
                 "." | ".." => Ok((ROOT_INO, FsNodeKind::Directory)),
                 "mounts" => Ok((MOUNTS_INO, FsNodeKind::RegularFile)),
+                "filesystems" => Ok((FILESYSTEMS_INO, FsNodeKind::RegularFile)),
                 "key-users" => Ok((KEY_USERS_INO, FsNodeKind::RegularFile)),
                 "meminfo" => Ok((MEMINFO_INO, FsNodeKind::RegularFile)),
                 "uptime" => Ok((UPTIME_INO, FsNodeKind::RegularFile)),

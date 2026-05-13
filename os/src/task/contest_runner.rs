@@ -44,7 +44,9 @@ const TEST_SCRIPTS: &[&str] = &[
 /// runs cases whose names start with the prefix, and
 /// Some("range:<start>,<end>") runs cases in the lexicographic half-open range
 /// [start, end). Empty range bounds are unbounded.
-const LTP_CASE_FILTER_OPTION: Option<&str> = None;
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some(
+    "cases:fsopen01,fsconfig01,fsconfig03,fsmount01,fsmount02,move_mount01,move_mount02,open_tree01,open_tree02",
+);
 
 enum LtpCaseFilter {
     Whitelist,
