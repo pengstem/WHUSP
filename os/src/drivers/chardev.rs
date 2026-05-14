@@ -19,8 +19,10 @@ use volatile::{
 
 pub trait CharDevice {
     fn init(&self);
+    #[allow(dead_code)]
     fn read(&self) -> u8;
     fn try_read(&self) -> Option<u8>;
+    #[allow(dead_code)]
     fn has_input(&self) -> bool;
     fn write(&self, ch: u8);
     #[cfg(target_arch = "riscv64")]
@@ -202,6 +204,7 @@ impl CharDevice for NS16550a {
             }
         });
         if count > 0 {
+            crate::fs::console_tty_drain_uart();
             self.condvar.signal();
         }
     }

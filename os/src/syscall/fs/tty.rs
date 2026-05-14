@@ -1,6 +1,9 @@
-use crate::sync::UPIntrFreeCell;
+use crate::fs::{
+    LinuxTermio, LinuxTermios, LinuxWinsize, apply_console_tty_termio, console_tty_available_bytes,
+    console_tty_foreground_pgid, console_tty_termio, console_tty_termios, console_tty_winsize,
+    set_console_tty_foreground_pgid, set_console_tty_termios, set_console_tty_winsize,
+};
 use crate::task::current_user_token;
-use lazy_static::lazy_static;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{read_user_value, write_user_value};
@@ -29,6 +32,8 @@ const TCSBRK: usize = 0x5409;
 const TCXONC: usize = 0x540a;
 const TCFLSH: usize = 0x540b;
 const TIOCSCTTY: usize = 0x540e;
+const TIOCGPGRP: usize = 0x540f;
+const TIOCSPGRP: usize = 0x5410;
 const TIOCGWINSZ: usize = 0x5413;
 const TIOCSWINSZ: usize = 0x5414;
 const FIONREAD: usize = 0x541b;
@@ -55,71 +60,6 @@ const TCION: usize = 3;
 const TCIFLUSH: usize = 0;
 const TCOFLUSH: usize = 1;
 const TCIOFLUSH: usize = 2;
-
-const BRKINT: u32 = 0x0002;
-const ICRNL: u32 = 0x0100;
-const IXON: u32 = 0x0400;
-const OPOST: u32 = 0x0001;
-const ONLCR: u32 = 0x0004;
-const CS8: u32 = 0x0030;
-const CREAD: u32 = 0x0080;
-const B38400: u32 = 0x000f;
-const ISIG: u32 = 0x0001;
-const ICANON: u32 = 0x0002;
-const ECHO: u32 = 0x0008;
-const ECHOE: u32 = 0x0010;
-const ECHOK: u32 = 0x0020;
-const ECHOCTL: u32 = 0x0200;
-const ECHOKE: u32 = 0x0800;
-const IEXTEN: u32 = 0x8000;
-
-const VINTR: usize = 0;
-const VQUIT: usize = 1;
-const VERASE: usize = 2;
-const VKILL: usize = 3;
-const VEOF: usize = 4;
-const VTIME: usize = 5;
-const VMIN: usize = 6;
-const VSTART: usize = 8;
-const VSTOP: usize = 9;
-const VSUSP: usize = 10;
-const VEOL: usize = 11;
-const VREPRINT: usize = 12;
-const VDISCARD: usize = 13;
-const VWERASE: usize = 14;
-const VLNEXT: usize = 15;
-const VEOL2: usize = 16;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct LinuxTermios {
-    c_iflag: u32,
-    c_oflag: u32,
-    c_cflag: u32,
-    c_lflag: u32,
-    c_line: u8,
-    c_cc: [u8; 19],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct LinuxTermio {
-    c_iflag: u16,
-    c_oflag: u16,
-    c_cflag: u16,
-    c_lflag: u16,
-    c_line: u8,
-    c_cc: [u8; 8],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct LinuxWinsize {
-    ws_row: u16,
-    ws_col: u16,
-    ws_xpixel: u16,
-    ws_ypixel: u16,
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -165,80 +105,6 @@ impl Default for LinuxLoopInfo {
             reserved: [0; 4],
         }
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ConsoleTtyState {
-    termios: LinuxTermios,
-    winsize: LinuxWinsize,
-}
-
-impl ConsoleTtyState {
-    fn new() -> Self {
-        let mut c_cc = [0u8; 19];
-        c_cc[VINTR] = 3;
-        c_cc[VQUIT] = 28;
-        c_cc[VERASE] = 127;
-        c_cc[VKILL] = 21;
-        c_cc[VEOF] = 4;
-        c_cc[VTIME] = 0;
-        c_cc[VMIN] = 1;
-        c_cc[VSTART] = 17;
-        c_cc[VSTOP] = 19;
-        c_cc[VSUSP] = 26;
-        c_cc[VEOL] = 0;
-        c_cc[VREPRINT] = 18;
-        c_cc[VDISCARD] = 15;
-        c_cc[VWERASE] = 23;
-        c_cc[VLNEXT] = 22;
-        c_cc[VEOL2] = 0;
-
-        Self {
-            termios: LinuxTermios {
-                c_iflag: BRKINT | ICRNL | IXON,
-                c_oflag: OPOST | ONLCR,
-                c_cflag: B38400 | CS8 | CREAD,
-                c_lflag: ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN,
-                c_line: 0,
-                c_cc,
-            },
-            winsize: LinuxWinsize {
-                ws_row: 80,
-                ws_col: 240,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            },
-        }
-    }
-}
-
-fn termios_to_termio(termios: LinuxTermios) -> LinuxTermio {
-    let mut c_cc = [0u8; 8];
-    c_cc.copy_from_slice(&termios.c_cc[..8]);
-    LinuxTermio {
-        c_iflag: termios.c_iflag as u16,
-        c_oflag: termios.c_oflag as u16,
-        c_cflag: termios.c_cflag as u16,
-        c_lflag: termios.c_lflag as u16,
-        c_line: termios.c_line,
-        c_cc,
-    }
-}
-
-fn apply_termio(termios: &mut LinuxTermios, termio: LinuxTermio) {
-    termios.c_iflag = (termios.c_iflag & !0xffff) | termio.c_iflag as u32;
-    termios.c_oflag = (termios.c_oflag & !0xffff) | termio.c_oflag as u32;
-    termios.c_cflag = (termios.c_cflag & !0xffff) | termio.c_cflag as u32;
-    termios.c_lflag = (termios.c_lflag & !0xffff) | termio.c_lflag as u32;
-    termios.c_line = termio.c_line;
-    termios.c_cc[..8].copy_from_slice(&termio.c_cc);
-}
-
-lazy_static! {
-    // CONTEXT: stdin/stdout/stderr all point at the same UART-backed console, so a single shared
-    // tty state is sufficient until the kernel grows a real per-session tty layer.
-    static ref CONSOLE_TTY_STATE: UPIntrFreeCell<ConsoleTtyState> =
-        unsafe { UPIntrFreeCell::new(ConsoleTtyState::new()) };
 }
 
 pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
@@ -295,7 +161,11 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
     }
 
     if request == FIONREAD {
-        let unread = file.pipe_occupied().ok_or(SysError::ENOTTY)? as i32;
+        let unread = if file.is_tty() {
+            console_tty_available_bytes()
+        } else {
+            file.pipe_occupied().ok_or(SysError::ENOTTY)?
+        } as i32;
         let token = current_user_token();
         write_user_value(token, argp as *mut i32, &unread)?;
         return Ok(0);
@@ -324,7 +194,7 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
     let token = current_user_token();
     match request {
         TCGETS => {
-            let termios = CONSOLE_TTY_STATE.exclusive_session(|state| state.termios);
+            let termios = console_tty_termios();
             write_user_value(token, argp as *mut LinuxTermios, &termios)?;
             Ok(0)
         }
@@ -332,28 +202,43 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
             let termios = read_user_value(token, argp as *const LinuxTermios)?;
             // CONTEXT: Linux differentiates drain/flush behavior across TCSETS*, but for the
             // contest shell path we only need the termios state to round-trip and persist.
-            CONSOLE_TTY_STATE.exclusive_session(|state| state.termios = termios);
+            set_console_tty_termios(termios);
             Ok(0)
         }
         TCGETA => {
-            let termio =
-                CONSOLE_TTY_STATE.exclusive_session(|state| termios_to_termio(state.termios));
+            let termio = console_tty_termio();
             write_user_value(token, argp as *mut LinuxTermio, &termio)?;
             Ok(0)
         }
         TCSETA | TCSETAW | TCSETAF => {
             let termio = read_user_value(token, argp as *const LinuxTermio)?;
-            CONSOLE_TTY_STATE.exclusive_session(|state| apply_termio(&mut state.termios, termio));
+            apply_console_tty_termio(termio);
+            Ok(0)
+        }
+        TIOCGPGRP => {
+            let pgid = console_tty_foreground_pgid() as i32;
+            write_user_value(token, argp as *mut i32, &pgid)?;
+            Ok(0)
+        }
+        TIOCSPGRP => {
+            let pgid = read_user_value(token, argp as *const i32)?;
+            if pgid <= 0 {
+                return Err(SysError::EINVAL);
+            }
+            // CONTEXT: This console has a single shared foreground process
+            // group; full Linux session/controlling-tty permission checks are
+            // still outside the current tty model.
+            set_console_tty_foreground_pgid(pgid as usize);
             Ok(0)
         }
         TIOCGWINSZ => {
-            let winsize = CONSOLE_TTY_STATE.exclusive_session(|state| state.winsize);
+            let winsize = console_tty_winsize();
             write_user_value(token, argp as *mut LinuxWinsize, &winsize)?;
             Ok(0)
         }
         TIOCSWINSZ => {
             let winsize = read_user_value(token, argp as *const LinuxWinsize)?;
-            CONSOLE_TTY_STATE.exclusive_session(|state| state.winsize = winsize);
+            set_console_tty_winsize(winsize);
             Ok(0)
         }
         TCSBRK | TCSBRKP | TIOCSCTTY | TIOCNOTTY | TIOCVHANGUP => Ok(0),

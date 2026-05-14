@@ -383,6 +383,50 @@ pub(crate) fn queue_signal_to_task(
     wakeup_task(task);
 }
 
+pub(crate) fn current_process_group_id() -> Option<usize> {
+    current_task()
+        .and_then(|task| task.process.upgrade())
+        .map(|process| process.process_group_id())
+}
+
+pub(crate) fn send_tty_signal_to_process_group(pgid: usize, signal: SignalFlags) {
+    if signal.is_empty() {
+        return;
+    }
+    let signum = signal.bits().trailing_zeros() as i32;
+    let info = SignalInfo::user(signum, 0);
+    for process in processes_snapshot()
+        .into_iter()
+        .filter(|process| process.process_group_id() == pgid)
+    {
+        queue_signal_to_process_for_tty(&process, signal, info);
+    }
+}
+
+fn queue_signal_to_process_for_tty(
+    process: &Arc<ProcessControlBlock>,
+    signal: SignalFlags,
+    info: SignalInfo,
+) {
+    let tasks = process.tasks_snapshot();
+    let target = tasks
+        .iter()
+        .find(|task| {
+            let task_inner = task.inner_exclusive_access();
+            !(task_inner.signal_mask & signal).contains(signal)
+        })
+        .cloned()
+        .or_else(|| tasks.first().cloned());
+    if let Some(task) = target {
+        queue_signal_to_task(task, signal, info);
+    }
+    if signal.check_error().is_some() {
+        for task in tasks {
+            wakeup_task(task);
+        }
+    }
+}
+
 fn nearest_child_reaper(parent: Option<Arc<ProcessControlBlock>>) -> Arc<ProcessControlBlock> {
     let mut cursor = parent;
     while let Some(process) = cursor {

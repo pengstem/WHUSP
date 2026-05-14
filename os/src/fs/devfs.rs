@@ -1,7 +1,8 @@
 use super::dirent::{DT_BLK, DT_CHR, DT_DIR, LINUX_DIRENT64_ALIGN, LINUX_DIRENT64_HEADER_SIZE};
 use super::status_flags::StatusFlagsCell;
 use super::{
-    File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFBLK, S_IFCHR, S_IFDIR, SeekWhence,
+    File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFBLK, S_IFCHR, S_IFDIR,
+    SeekWhence, console_tty_poll, console_tty_read,
 };
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::UserBuffer;
@@ -889,33 +890,7 @@ pub(crate) fn stat_pts_child(path: &str) -> Option<FileStat> {
 }
 
 fn read_console(user_buf: UserBuffer) -> usize {
-    let want_to_read = user_buf.len();
-    if want_to_read == 0 {
-        return 0;
-    }
-
-    let mut buf_iter = user_buf.into_iter();
-    let Some(byte_ref) = buf_iter.next() else {
-        return 0;
-    };
-    unsafe {
-        byte_ref.write_volatile(UART.read());
-    }
-
-    let mut already_read = 1usize;
-    while already_read < want_to_read {
-        let Some(ch) = UART.try_read() else {
-            break;
-        };
-        let Some(byte_ref) = buf_iter.next() else {
-            break;
-        };
-        unsafe {
-            byte_ref.write_volatile(ch);
-        }
-        already_read += 1;
-    }
-    already_read
+    console_tty_read(user_buf)
 }
 
 fn write_console(user_buf: UserBuffer) -> usize {
@@ -1258,9 +1233,7 @@ impl File for DevFsFile {
         match self.node {
             DevNode::Tty | DevNode::TtyS0 | DevNode::Tty8 | DevNode::Tty9 => {
                 let mut ready = PollEvents::empty();
-                if events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI) && UART.has_input() {
-                    ready |= PollEvents::POLLIN;
-                }
+                ready |= console_tty_poll(events);
                 if events.contains(PollEvents::POLLOUT) && self.writable {
                     ready |= PollEvents::POLLOUT;
                 }

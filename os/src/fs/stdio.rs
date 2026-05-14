@@ -1,7 +1,8 @@
 use super::status_flags::StatusFlagsCell;
-use super::{File, FileStat, FsResult, OpenFlags, PollEvents, S_IFCHR};
-use crate::drivers::chardev::CharDevice;
-use crate::drivers::chardev::UART;
+use super::{
+    File, FileStat, FsResult, OpenFlags, PollEvents, S_IFCHR, console_tty_poll, console_tty_read,
+};
+use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::UserBuffer;
 
 pub struct Stdin {
@@ -40,43 +41,13 @@ impl File for Stdin {
         false
     }
     fn read(&self, user_buf: UserBuffer) -> usize {
-        let want_to_read = user_buf.len();
-        if want_to_read == 0 {
-            return 0;
-        }
-
-        let mut buf_iter = user_buf.into_iter();
-        let Some(byte_ref) = buf_iter.next() else {
-            return 0;
-        };
-        unsafe {
-            byte_ref.write_volatile(UART.read());
-        }
-
-        let mut already_read = 1usize;
-        while already_read < want_to_read {
-            let Some(ch) = UART.try_read() else {
-                break;
-            };
-            let Some(byte_ref) = buf_iter.next() else {
-                break;
-            };
-            unsafe {
-                byte_ref.write_volatile(ch);
-            }
-            already_read += 1;
-        }
-        already_read
+        console_tty_read(user_buf)
     }
     fn write(&self, _user_buf: UserBuffer) -> usize {
         panic!("Cannot write to stdin!");
     }
     fn poll(&self, events: PollEvents) -> PollEvents {
-        if events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI) && UART.has_input() {
-            PollEvents::POLLIN
-        } else {
-            PollEvents::empty()
-        }
+        console_tty_poll(events)
     }
     fn stat(&self) -> FsResult<FileStat> {
         Ok(FileStat::with_mode(S_IFCHR | 0o666))
