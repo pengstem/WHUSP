@@ -106,17 +106,17 @@ pub fn trap_handler() -> ! {
             signal_delivery_attempted = true;
         }
         Trap::Exception(Exception::StorePageFault) => {
-            if !handle_mmap_page_fault(stval, MmapFaultAccess::Write) {
+            if !handle_user_page_fault(stval, MmapFaultAccess::Write) {
                 current_add_signal(SignalFlags::SIGSEGV);
             }
         }
         Trap::Exception(Exception::InstructionPageFault) => {
-            if !handle_mmap_page_fault(stval, MmapFaultAccess::Execute) {
+            if !handle_user_page_fault(stval, MmapFaultAccess::Execute) {
                 current_add_signal(SignalFlags::SIGSEGV);
             }
         }
         Trap::Exception(Exception::LoadPageFault) => {
-            if !handle_mmap_page_fault(stval, MmapFaultAccess::Read) {
+            if !handle_user_page_fault(stval, MmapFaultAccess::Read) {
                 current_add_signal(SignalFlags::SIGSEGV);
             }
         }
@@ -161,6 +161,20 @@ pub fn trap_handler() -> ! {
         exit_current_group_and_run_next(errno);
     }
     trap_return();
+}
+
+pub(crate) fn handle_user_page_fault(addr: usize, access: MmapFaultAccess) -> bool {
+    if access == MmapFaultAccess::Write {
+        let process = current_process();
+        if process
+            .inner_exclusive_access()
+            .memory_set
+            .resolve_cow_page_fault(addr)
+        {
+            return true;
+        }
+    }
+    handle_mmap_page_fault(addr, access)
 }
 
 pub(crate) fn handle_mmap_page_fault(addr: usize, access: MmapFaultAccess) -> bool {

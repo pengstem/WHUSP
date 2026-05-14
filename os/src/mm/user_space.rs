@@ -5,7 +5,7 @@ use super::{
     FrameTracker, MapArea, MapPermission, MapType, MemorySet, MmapFlush, PageTableEntry,
     PhysPageNum, VPNRange, VirtAddr,
 };
-use super::{VirtPageNum, frame_alloc};
+use super::{VirtPageNum, frame_alloc, frame_ref_count};
 use crate::arch::mm as arch_mm;
 use crate::config::{PAGE_SIZE, USER_MMAP_BASE, USER_MMAP_LIMIT};
 use crate::fs::File;
@@ -314,6 +314,57 @@ impl MemorySet {
                 return false;
             }
         }
+        true
+    }
+
+    pub fn resolve_cow_page_fault(&mut self, addr: usize) -> bool {
+        let vpn = VirtAddr::from(addr).floor();
+        let Some(pte) = self.page_table.translate(vpn) else {
+            return false;
+        };
+        if !pte.is_valid() || pte.writable() || !pte.cow() {
+            return false;
+        }
+        let Some(area_idx) = self
+            .areas
+            .iter()
+            .position(|area| area.vpn_range.get_start() <= vpn && vpn < area.vpn_range.get_end())
+        else {
+            return false;
+        };
+        if !self.areas[area_idx].map_perm.contains(MapPermission::W)
+            || !self.areas[area_idx].data_frames.contains_key(&vpn)
+        {
+            return false;
+        }
+
+        let Some(ref_count) = frame_ref_count(pte.ppn()) else {
+            return false;
+        };
+        if ref_count == 1 {
+            if !self.page_table.restore_write_clear_cow(vpn) {
+                return false;
+            }
+            arch_mm::flush_tlb_page(usize::from(VirtAddr::from(vpn)));
+            return true;
+        }
+
+        let Some(frame) = frame_alloc() else {
+            return false;
+        };
+        frame
+            .ppn
+            .get_bytes_array()
+            .copy_from_slice(pte.ppn().get_bytes_array());
+        let mut flags = pte.flags();
+        flags.remove(PTEFlags::COW);
+        flags.insert(PTEFlags::W);
+        let ppn = frame.ppn;
+        if !self.page_table.replace_leaf(vpn, ppn, flags) {
+            return false;
+        }
+        self.areas[area_idx].data_frames.insert(vpn, frame);
+        arch_mm::flush_tlb_page(usize::from(VirtAddr::from(vpn)));
         true
     }
 
