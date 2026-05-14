@@ -1,9 +1,9 @@
 use crate::fs::{VfsNodeId, assign_pid_to_cgroup, clone_mount_namespace};
 use crate::syscall::errno::{SysError, SysResult};
-use crate::syscall::user_ptr::{read_user_value, write_user_value};
+use crate::syscall::user_ptr::{read_user_value, write_user_value, write_user_value_in_memory_set};
 use crate::task::{
-    CloneArgs, CloneFlags, add_task, clone_current_thread, current_process, current_user_token,
-    suspend_current_and_run_next,
+    CloneArgs, CloneFlags, ProcessControlBlock, add_task, clone_current_thread, current_process,
+    current_user_token, suspend_current_and_run_next,
 };
 use alloc::sync::Arc;
 use core::mem::size_of;
@@ -180,6 +180,15 @@ fn clone3_cgroup_target(args: LinuxCloneArgs) -> SysResult<Option<VfsNodeId>> {
     Ok(Some(VfsNodeId::new(dir.mount_id(), dir.ino())))
 }
 
+fn write_user_value_to_process<T: Copy>(
+    process: &Arc<ProcessControlBlock>,
+    ptr: *mut T,
+    value: &T,
+) -> SysResult<()> {
+    let mut inner = process.inner_exclusive_access();
+    write_user_value_in_memory_set(&mut inner.memory_set, ptr, value)
+}
+
 fn sys_clone_process_inner(
     args: CloneArgs,
     pidfd: Option<*mut i32>,
@@ -200,7 +209,7 @@ fn sys_clone_process_inner(
         .fork(child_parent, mount_namespace_id, args.exit_signal)
         .ok_or(SysError::ENOMEM)?;
     let new_pid = new_process.getpid();
-    let child_token = new_process.configure_cloned_main_task(args);
+    new_process.configure_cloned_main_task(args);
     if let Some(pidfd) = pidfd {
         let fd = install_pidfd_for_current_process(new_pid)?;
         write_user_value(current_user_token(), pidfd, &(fd as i32))?;
@@ -216,11 +225,11 @@ fn sys_clone_process_inner(
             // CONTEXT: Process clone currently copies the address space even
             // when CLONE_VM is requested. Mirror parent_tid into the child copy
             // so CLONE_PARENT_SETTID remains visible to the cloned entry code.
-            write_user_value(child_token, args.ptid as *mut i32, &(new_pid as i32))?;
+            write_user_value_to_process(&new_process, args.ptid as *mut i32, &(new_pid as i32))?;
         }
     }
     if args.flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
-        write_user_value(child_token, args.ctid as *mut i32, &(new_pid as i32))?;
+        write_user_value_to_process(&new_process, args.ctid as *mut i32, &(new_pid as i32))?;
     }
     Ok(new_pid as isize)
 }

@@ -183,7 +183,8 @@ impl MapArea {
         let pte_flags = PTEFlags::from_bits_truncate(permission.bits() as usize);
         if self.is_mmap() {
             for vpn in self.data_frames.keys().copied() {
-                if !page_table.remap_flags(vpn, pte_flags) {
+                let flags = remap_flags_preserving_cow(page_table, vpn, pte_flags);
+                if !page_table.remap_flags(vpn, flags) {
                     return false;
                 }
             }
@@ -202,7 +203,8 @@ impl MapArea {
             }
         } else {
             for vpn in self.vpn_range {
-                if !page_table.remap_flags(vpn, pte_flags) {
+                let flags = remap_flags_preserving_cow(page_table, vpn, pte_flags);
+                if !page_table.remap_flags(vpn, flags) {
                     return false;
                 }
             }
@@ -568,6 +570,18 @@ impl MapArea {
             file.dec_writable_shared_mmap();
         }
     }
+}
+
+fn remap_flags_preserving_cow(
+    page_table: &PageTable,
+    vpn: VirtPageNum,
+    mut flags: PTEFlags,
+) -> PTEFlags {
+    if page_table.translate(vpn).is_some_and(|pte| pte.cow()) {
+        flags.remove(PTEFlags::W);
+        flags.insert(PTEFlags::COW);
+    }
+    flags
 }
 
 fn mmap_writeback_len(info: &MmapInfo, area_offset: usize) -> Option<usize> {
