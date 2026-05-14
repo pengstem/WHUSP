@@ -273,6 +273,17 @@ impl MapArea {
         vpn: VirtPageNum,
         frame: FrameTracker,
     ) -> bool {
+        let pte_flags = PTEFlags::from_bits_truncate(self.map_perm.bits() as usize);
+        self.map_existing_frame_with_flags(page_table, vpn, frame, pte_flags)
+    }
+
+    pub(super) fn map_existing_frame_with_flags(
+        &mut self,
+        page_table: &mut PageTable,
+        vpn: VirtPageNum,
+        frame: FrameTracker,
+        pte_flags: PTEFlags,
+    ) -> bool {
         if self.data_frames.contains_key(&vpn) {
             return true;
         }
@@ -280,7 +291,6 @@ impl MapArea {
             return true;
         }
         let ppn = frame.ppn;
-        let pte_flags = PTEFlags::from_bits_truncate(self.map_perm.bits() as usize);
         if !page_table.try_map(vpn, ppn, pte_flags) {
             return false;
         }

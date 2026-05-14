@@ -1,8 +1,9 @@
 use super::address::page_align_up;
 use super::area::{MmapInfo, ShmAreaInfo};
+use super::page_table::PTEFlags;
 use super::{
-    FrameTracker, MapArea, MapPermission, MapType, MemorySet, MmapFlush, PhysPageNum, VPNRange,
-    VirtAddr,
+    FrameTracker, MapArea, MapPermission, MapType, MemorySet, MmapFlush, PageTableEntry,
+    PhysPageNum, VPNRange, VirtAddr,
 };
 use super::{VirtPageNum, frame_alloc};
 use crate::arch::mm as arch_mm;
@@ -111,14 +112,27 @@ impl MmapPageCacheFault {
     }
 }
 
+fn area_is_private_user_writable(area: &MapArea) -> bool {
+    area.map_perm.contains(MapPermission::W | MapPermission::U)
+        && !area.is_shm()
+        && area.mmap_info.as_ref().is_none_or(|info| !info.shared)
+}
+
+fn cow_flags_from_pte(pte: PageTableEntry) -> PTEFlags {
+    let mut flags = pte.flags();
+    flags.remove(PTEFlags::W);
+    flags.insert(PTEFlags::COW);
+    flags
+}
+
 impl MemorySet {
     /// Builds a child address space for fork/clone.
     ///
-    /// This preserves current eager-copy/share behavior without introducing
-    /// COW. File-backed MAP_SHARED and SHM mappings keep their shared backing
-    /// references; writable private mappings are copied eagerly.
+    /// Writable private user mappings are shared as COW pages. File-backed
+    /// MAP_SHARED and SHM mappings keep their shared backing references.
     pub fn from_existed_user(user_space: &mut MemorySet) -> Option<MemorySet> {
         let mut memory_set = Self::try_new_bare()?;
+        let mut parent_needs_tlb_flush = false;
         memory_set.brk_base = user_space.brk_base;
         memory_set.brk = user_space.brk;
         memory_set.brk_limit = user_space.brk_limit;
@@ -159,18 +173,18 @@ impl MemorySet {
                     }
                 }
             } else if area.is_mmap() {
-                // UNFINISHED: MAP_PRIVATE writable mmap still uses eager copy
-                // instead of Linux-style copy-on-write.
                 memory_set.areas.push(new_area);
                 let area_idx = memory_set.areas.len() - 1;
+                let cow_resident = area_is_private_user_writable(area);
                 let can_share_resident = area.mmap_info.as_ref().is_some_and(|info| info.shared)
-                    || !area.map_perm.contains(MapPermission::W);
+                    || !area.map_perm.contains(MapPermission::W)
+                    || cow_resident;
                 let resident_vpns: Vec<_> = area.data_frames.keys().copied().collect();
                 for vpn in resident_vpns {
-                    let Some(src_pte) = user_space.translate(vpn) else {
+                    let Some(src_pte) = user_space.page_table.translate(vpn) else {
                         continue;
                     };
-                    let frame = if can_share_resident {
+                    let frame = if cow_resident || can_share_resident {
                         FrameTracker::from_retained(src_pte.ppn())
                     } else {
                         frame_alloc().map(|frame| {
@@ -184,10 +198,21 @@ impl MemorySet {
                     let Some(frame) = frame else {
                         return None;
                     };
+                    let pte_flags = if cow_resident {
+                        cow_flags_from_pte(src_pte)
+                    } else {
+                        PTEFlags::from_bits_truncate(area.map_perm.bits() as usize)
+                    };
                     let page_table = &mut memory_set.page_table;
                     let dst_area = &mut memory_set.areas[area_idx];
-                    if !dst_area.map_existing_frame(page_table, vpn, frame) {
+                    if !dst_area.map_existing_frame_with_flags(page_table, vpn, frame, pte_flags) {
                         return None;
+                    }
+                    if cow_resident {
+                        if !user_space.page_table.mark_cow_readonly(vpn) {
+                            return None;
+                        }
+                        parent_needs_tlb_flush = true;
                     }
                 }
                 for (vpn, key) in area.page_cache_mappings() {
@@ -204,11 +229,29 @@ impl MemorySet {
                         return None;
                     }
                 }
+            } else if area_is_private_user_writable(area) {
+                memory_set.areas.push(new_area);
+                let area_idx = memory_set.areas.len() - 1;
+                let resident_vpns: Vec<_> = area.data_frames.keys().copied().collect();
+                for vpn in resident_vpns {
+                    let Some(src_pte) = user_space.page_table.translate(vpn) else {
+                        return None;
+                    };
+                    let Some(frame) = FrameTracker::from_retained(src_pte.ppn()) else {
+                        return None;
+                    };
+                    let pte_flags = cow_flags_from_pte(src_pte);
+                    let page_table = &mut memory_set.page_table;
+                    let dst_area = &mut memory_set.areas[area_idx];
+                    if !dst_area.map_existing_frame_with_flags(page_table, vpn, frame, pte_flags) {
+                        return None;
+                    }
+                    if !user_space.page_table.mark_cow_readonly(vpn) {
+                        return None;
+                    }
+                    parent_needs_tlb_flush = true;
+                }
             } else if area.map_perm.contains(MapPermission::W) {
-                // UNFINISHED: Writable private mappings still use eager copy
-                // on fork instead of Linux-style copy-on-write. The bounded
-                // stack window keeps this compatible path within contest memory
-                // pressure for hackbench.
                 if !memory_set.push(new_area, None) {
                     return None;
                 }
@@ -241,6 +284,9 @@ impl MemorySet {
                     }
                 }
             }
+        }
+        if parent_needs_tlb_flush {
+            arch_mm::flush_tlb_all();
         }
         Some(memory_set)
     }

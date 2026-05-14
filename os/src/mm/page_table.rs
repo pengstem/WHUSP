@@ -186,7 +186,13 @@ impl PageTable {
         let Some(pte) = self.find_pte(vpn) else {
             return false;
         };
-        if !pte.is_valid() || pte.bits == 0 || !pte.writable() {
+        if !pte.is_valid() || pte.bits == 0 {
+            return false;
+        }
+        if pte.cow() && !pte.writable() {
+            return true;
+        }
+        if !pte.writable() {
             return false;
         }
         let mut flags = pte.flags();
