@@ -331,6 +331,7 @@ impl FanotifyGroup {
         event_mask: u64,
         event_path: Option<&str>,
         is_dir: bool,
+        report_ondir: bool,
     ) -> u64 {
         if mask == 0
             || !mark
@@ -343,7 +344,7 @@ impl FanotifyGroup {
         if event_bits == 0 {
             return 0;
         }
-        if is_dir && mask & FAN_ONDIR != 0 {
+        if is_dir && report_ondir && mask & FAN_ONDIR != 0 {
             event_bits | FAN_ONDIR
         } else {
             event_bits
@@ -412,9 +413,18 @@ impl FanotifyGroup {
             let real_node = overlay_real_node(node);
             let real_parent = parent.and_then(overlay_real_node);
             let mut report_node = node;
+            let report_ondir = self.init_flags & FILE_HANDLE_REPORT_FLAGS != 0;
             for mark in inner.marks.iter_mut() {
                 let mut mark_emitted = Self::event_bits_for_mark(
-                    mark, mark.mask, node, parent, mount, event_mask, event_path, is_dir,
+                    mark,
+                    mark.mask,
+                    node,
+                    parent,
+                    mount,
+                    event_mask,
+                    event_path,
+                    is_dir,
+                    report_ondir,
                 );
                 let mut mark_ignored = Self::event_bits_for_mark(
                     mark,
@@ -425,6 +435,7 @@ impl FanotifyGroup {
                     event_mask,
                     event_path,
                     is_dir,
+                    report_ondir,
                 );
                 if let Some(real_node) = real_node {
                     if mark_emitted == 0 {
@@ -437,6 +448,7 @@ impl FanotifyGroup {
                             event_mask,
                             event_path,
                             is_dir,
+                            report_ondir,
                         );
                         if mark_emitted != 0 {
                             report_node = real_node;
@@ -455,6 +467,7 @@ impl FanotifyGroup {
                             event_mask,
                             event_path,
                             is_dir,
+                            report_ondir,
                         );
                     }
                 }
