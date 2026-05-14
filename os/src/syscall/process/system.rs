@@ -1,4 +1,3 @@
-use crate::mm::translated_refmut;
 use crate::sbi::shutdown;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{copy_to_user, write_user_value};
@@ -161,9 +160,7 @@ pub fn sys_syslog(log_type: usize, buf: *mut u8, len: usize) -> SysResult {
             let token = current_user_token();
             let msg = SYSLOG_FAKE_MSG;
             let copy_len = msg.len().min(len);
-            for i in 0..copy_len {
-                *translated_refmut(token, unsafe { buf.add(i) }) = msg[i];
-            }
+            copy_to_user(token, buf, &msg[..copy_len])?;
             Ok(copy_len as isize)
         }
         _ => Ok(0),

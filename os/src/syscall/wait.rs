@@ -1,4 +1,5 @@
-use crate::mm::translated_refmut;
+use crate::mm::MemorySet;
+use crate::syscall::user_ptr::write_user_value_in_memory_set;
 use crate::task::{
     ProcessControlBlock, SIGCHLD, SignalInfo, block_current_and_run_next,
     current_has_nonrestartable_signal, current_process, remove_from_pid2process,
@@ -123,10 +124,11 @@ fn waitid_child_matches(child_pid: usize, idtype: i32, id: i32) -> bool {
     idtype == P_ALL || (idtype == P_PID && child_pid == id as usize)
 }
 
-fn write_rusage(token: usize, rusage: *mut RUsage) {
+fn write_rusage(memory_set: &mut MemorySet, rusage: *mut RUsage) -> SysResult<()> {
     if !rusage.is_null() {
-        *translated_refmut(token, rusage) = RUsage::default();
+        write_user_value_in_memory_set(memory_set, rusage, &RUsage::default())?;
     }
+    Ok(())
 }
 
 /// Waits for and reaps a matching child process using Linux wait4 status rules.
@@ -165,11 +167,14 @@ pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsag
                     child_inner.cpu_times.snapshot(),
                 )
             };
-            let token = inner.memory_set.token();
             if !wstatus.is_null() {
-                *translated_refmut(token, wstatus) = wait_status(exit_code);
+                write_user_value_in_memory_set(
+                    &mut inner.memory_set,
+                    wstatus,
+                    &wait_status(exit_code),
+                )?;
             }
-            write_rusage(token, rusage);
+            write_rusage(&mut inner.memory_set, rusage)?;
             inner.cpu_times.add_waited_child(child_times);
 
             // CONTEXT: Linux keeps a zombie PID visible until the parent reaps it.
@@ -249,17 +254,20 @@ pub fn sys_waitid(
                 )
             };
             let (si_code, si_status) = waitid_code_and_status(exit_code);
-            let token = inner.memory_set.token();
             if !infop.is_null() {
-                *translated_refmut(token, infop) = LinuxSigInfo {
-                    si_signo: SIGCHLD as i32,
-                    si_code,
-                    si_pid: child_pid as i32,
-                    si_status,
-                    ..LinuxSigInfo::default()
-                };
+                write_user_value_in_memory_set(
+                    &mut inner.memory_set,
+                    infop,
+                    &LinuxSigInfo {
+                        si_signo: SIGCHLD as i32,
+                        si_code,
+                        si_pid: child_pid as i32,
+                        si_status,
+                        ..LinuxSigInfo::default()
+                    },
+                )?;
             }
-            write_rusage(token, rusage);
+            write_rusage(&mut inner.memory_set, rusage)?;
 
             if options & WNOWAIT == 0 {
                 inner.cpu_times.add_waited_child(child_times);
@@ -274,11 +282,14 @@ pub fn sys_waitid(
         }
 
         if options & WNOHANG != 0 {
-            let token = inner.memory_set.token();
             if !infop.is_null() {
-                *translated_refmut(token, infop) = LinuxSigInfo::default();
+                write_user_value_in_memory_set(
+                    &mut inner.memory_set,
+                    infop,
+                    &LinuxSigInfo::default(),
+                )?;
             }
-            write_rusage(token, rusage);
+            write_rusage(&mut inner.memory_set, rusage)?;
             return Ok(0);
         }
         drop(inner);

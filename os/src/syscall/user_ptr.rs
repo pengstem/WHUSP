@@ -1,4 +1,4 @@
-use crate::mm::{MmapFaultAccess, PageTable, StepByOne, VirtAddr};
+use crate::mm::{MemorySet, MmapFaultAccess, PageTable, StepByOne, VirtAddr};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::{MaybeUninit, size_of};
@@ -22,7 +22,7 @@ fn mmap_user_fault(addr: usize, access: UserBufferAccess) -> bool {
         UserBufferAccess::Read => MmapFaultAccess::Read,
         UserBufferAccess::Write => MmapFaultAccess::Write,
     };
-    crate::arch::trap::handle_mmap_page_fault(addr, access)
+    crate::arch::trap::handle_user_page_fault(addr, access)
 }
 
 pub(crate) fn translated_byte_buffer_checked(
@@ -86,7 +86,12 @@ pub(crate) fn translated_byte_buffer_checked_with_fault(
         };
         let reject_zero_ppn = fault_handler.is_some();
         if !user_pte_allows(pte, access, reject_zero_ppn) {
-            if let Some(fault_handler) = fault_handler {
+            if access == UserBufferAccess::Write && pte.cow() && !pte.writable() {
+                if !resolve_current_cow_page(token, start) {
+                    return Err(SysError::EFAULT);
+                }
+                pte = page_table.translate(vpn).ok_or(SysError::EFAULT)?;
+            } else if let Some(fault_handler) = fault_handler {
                 if fault_handler(start, access) {
                     pte = page_table.translate(vpn).ok_or(SysError::EFAULT)?;
                 }
@@ -107,6 +112,13 @@ pub(crate) fn translated_byte_buffer_checked_with_fault(
         start = end_va.into();
     }
     Ok(buffers)
+}
+
+fn resolve_current_cow_page(token: usize, addr: usize) -> bool {
+    if token != crate::task::current_user_token() {
+        return false;
+    }
+    crate::arch::trap::handle_user_page_fault(addr, MmapFaultAccess::Write)
 }
 
 fn user_pte_allows(
@@ -233,6 +245,44 @@ fn copy_from_user(
     Ok(())
 }
 
+fn copy_to_user_buffers(buffers: Vec<&'static mut [u8]>, src: &[u8]) {
+    let mut copied = 0usize;
+    for buffer in buffers {
+        let next = copied + buffer.len();
+        buffer.copy_from_slice(&src[copied..next]);
+        copied = next;
+    }
+}
+
+fn resolve_cow_write_range_in_memory_set(
+    memory_set: &mut MemorySet,
+    ptr: *mut u8,
+    len: usize,
+) -> SysResult<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let mut start = ptr as usize;
+    let end = start.checked_add(len).ok_or(SysError::EFAULT)?;
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let vpn = start_va.floor();
+        let pte = memory_set.translate(vpn).ok_or(SysError::EFAULT)?;
+        if pte.cow() && !pte.writable() && !memory_set.resolve_cow_page_fault(start) {
+            return Err(SysError::EFAULT);
+        }
+        let pte = memory_set.translate(vpn).ok_or(SysError::EFAULT)?;
+        if !user_pte_allows(pte, UserBufferAccess::Write, false) {
+            return Err(SysError::EFAULT);
+        }
+        let mut next_vpn = vpn;
+        next_vpn.step();
+        let next_va: VirtAddr = next_vpn.into();
+        start = usize::from(next_va).min(end);
+    }
+    Ok(())
+}
+
 /// Copies kernel bytes into a user buffer after validating write permission.
 pub(crate) fn copy_to_user(token: usize, ptr: *mut u8, src: &[u8]) -> SysResult<()> {
     copy_to_user_with_fault(token, ptr, src, None)
@@ -251,12 +301,23 @@ pub(crate) fn copy_to_user_with_fault(
         UserBufferAccess::Write,
         fault_handler,
     )?;
-    let mut copied = 0usize;
-    for buffer in buffers {
-        let next = copied + buffer.len();
-        buffer.copy_from_slice(&src[copied..next]);
-        copied = next;
-    }
+    copy_to_user_buffers(buffers, src);
+    Ok(())
+}
+
+pub(crate) fn copy_to_user_in_memory_set(
+    memory_set: &mut MemorySet,
+    ptr: *mut u8,
+    src: &[u8],
+) -> SysResult<()> {
+    resolve_cow_write_range_in_memory_set(memory_set, ptr, src.len())?;
+    let buffers = translated_byte_buffer_checked(
+        memory_set.token(),
+        ptr.cast_const(),
+        src.len(),
+        UserBufferAccess::Write,
+    )?;
+    copy_to_user_buffers(buffers, src);
     Ok(())
 }
 
@@ -290,6 +351,16 @@ pub(crate) fn read_user_value_with_fault<T: Copy>(
 /// Writes one plain ABI value into user memory after checking access rights.
 pub(crate) fn write_user_value<T: Copy>(token: usize, ptr: *mut T, value: &T) -> SysResult<()> {
     write_user_value_with_fault(token, ptr, value, None)
+}
+
+pub(crate) fn write_user_value_in_memory_set<T: Copy>(
+    memory_set: &mut MemorySet,
+    ptr: *mut T,
+    value: &T,
+) -> SysResult<()> {
+    let bytes =
+        unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
+    copy_to_user_in_memory_set(memory_set, ptr.cast::<u8>(), bytes)
 }
 
 pub(crate) fn write_user_value_with_mmap_fault<T: Copy>(
