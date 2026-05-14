@@ -14,6 +14,144 @@ const TMPFS_INLINE_FILE_LIMIT: usize = 1024 * 1024;
 const TMPFS_SPARSE_EXTENT_LIMIT: usize = 64 * 1024;
 const TMPFS_ALLOCATED_PAYLOAD_LIMIT: usize = 64 * 1024 * 1024;
 
+enum TmpfsSparseExtent {
+    Bytes(Vec<u8>),
+    Repeated { pattern: Vec<u8>, len: usize },
+}
+
+impl TmpfsSparseExtent {
+    fn len(&self) -> usize {
+        match self {
+            Self::Bytes(data) => data.len(),
+            Self::Repeated { len, .. } => *len,
+        }
+    }
+
+    fn allocated_len(&self) -> usize {
+        match self {
+            Self::Bytes(data) => data.len(),
+            Self::Repeated { pattern, .. } => pattern.len(),
+        }
+    }
+
+    fn matching_pattern_prefix(pattern: &[u8], pattern_offset: usize, buf: &[u8]) -> usize {
+        if pattern.is_empty() {
+            return 0;
+        }
+        for index in 0..buf.len() {
+            if buf[index] != pattern[(pattern_offset + index) % pattern.len()] {
+                return index;
+            }
+        }
+        buf.len()
+    }
+
+    fn rotated_pattern(pattern: &[u8], offset: usize, len: usize) -> Option<Vec<u8>> {
+        if pattern.is_empty() || len == 0 {
+            return None;
+        }
+        let copy_len = pattern.len().min(len);
+        let mut rotated = Vec::new();
+        if rotated.try_reserve(copy_len).is_err() {
+            return None;
+        }
+        for index in 0..copy_len {
+            rotated.push(pattern[(offset + index) % pattern.len()]);
+        }
+        Some(rotated)
+    }
+
+    fn slice(&self, offset: usize, len: usize) -> Option<Self> {
+        if len == 0 || offset >= self.len() {
+            return None;
+        }
+        let len = len.min(self.len() - offset);
+        match self {
+            Self::Bytes(data) => Some(Self::Bytes(data[offset..offset + len].to_vec())),
+            Self::Repeated { pattern, .. } => {
+                let original_pattern_len = pattern.len();
+                let pattern = Self::rotated_pattern(pattern, offset, len)?;
+                if len < original_pattern_len {
+                    Some(Self::Bytes(pattern))
+                } else {
+                    Some(Self::Repeated { pattern, len })
+                }
+            }
+        }
+    }
+
+    fn copy_to(&self, extent_start: u64, offset: u64, buf: &mut [u8]) {
+        let src_start = offset.saturating_sub(extent_start) as usize;
+        let dst_start = extent_start.saturating_sub(offset) as usize;
+        if src_start >= self.len() || dst_start >= buf.len() {
+            return;
+        }
+        let copy_len = (self.len() - src_start).min(buf.len() - dst_start);
+        match self {
+            Self::Bytes(data) => {
+                buf[dst_start..dst_start + copy_len]
+                    .copy_from_slice(&data[src_start..src_start + copy_len]);
+            }
+            Self::Repeated { pattern, .. } => {
+                if pattern.is_empty() {
+                    return;
+                }
+                for index in 0..copy_len {
+                    buf[dst_start + index] = pattern[(src_start + index) % pattern.len()];
+                }
+            }
+        }
+    }
+
+    fn truncate_to(&mut self, len: usize) {
+        match self {
+            Self::Bytes(data) => data.truncate(len),
+            Self::Repeated {
+                len: extent_len, ..
+            } => *extent_len = (*extent_len).min(len),
+        }
+    }
+
+    fn try_append(&mut self, buf: &[u8], allocated_payload_len: usize) -> Option<usize> {
+        match self {
+            Self::Bytes(data) => {
+                if !data.is_empty()
+                    && Self::matching_pattern_prefix(data, data.len(), buf) == buf.len()
+                {
+                    let pattern = core::mem::take(data);
+                    let Some(len) = pattern.len().checked_add(buf.len()) else {
+                        return Some(0);
+                    };
+                    *self = Self::Repeated { len, pattern };
+                    return Some(buf.len());
+                }
+                if data.len() >= TMPFS_SPARSE_EXTENT_LIMIT {
+                    return None;
+                }
+                let copy_len = buf.len().min(TMPFS_SPARSE_EXTENT_LIMIT - data.len());
+                if allocated_payload_len.saturating_add(copy_len) > TMPFS_ALLOCATED_PAYLOAD_LIMIT
+                    || data.try_reserve(copy_len).is_err()
+                {
+                    return Some(0);
+                }
+                data.extend_from_slice(&buf[..copy_len]);
+                Some(copy_len)
+            }
+            Self::Repeated { pattern, len } => {
+                let matched = Self::matching_pattern_prefix(pattern, *len, buf);
+                if matched == 0 {
+                    return None;
+                }
+                let Some(new_len) = len.checked_add(matched) else {
+                    return Some(0);
+                };
+                *len = new_len;
+                Some(matched)
+            }
+        }
+    }
+}
+
 struct TmpfsInode {
     kind: FsNodeKind,
     mode: u32,
@@ -25,7 +163,7 @@ struct TmpfsInode {
     pending_delete: bool,
     size: u64,
     data: Vec<u8>,
-    sparse_data: BTreeMap<u64, Vec<u8>>,
+    sparse_data: BTreeMap<u64, TmpfsSparseExtent>,
     children: BTreeMap<String, u32>,
     parent_ino: u32,
     atime: FileTimestamp,
@@ -70,7 +208,12 @@ impl TmpfsInode {
     }
 
     fn allocated_payload_len(&self) -> usize {
-        self.data.len() + self.sparse_data.values().map(Vec::len).sum::<usize>()
+        self.data.len()
+            + self
+                .sparse_data
+                .values()
+                .map(TmpfsSparseExtent::allocated_len)
+                .sum::<usize>()
     }
 
     fn clear_payload(&mut self) {
@@ -86,8 +229,8 @@ impl TmpfsInode {
         let overlapping: Vec<u64> = self
             .sparse_data
             .range(..end)
-            .filter_map(|(&extent_start, data)| {
-                let extent_end = extent_start.saturating_add(data.len() as u64);
+            .filter_map(|(&extent_start, extent)| {
+                let extent_end = extent_start.saturating_add(extent.len() as u64);
                 if extent_end > start {
                     Some(extent_start)
                 } else {
@@ -97,18 +240,30 @@ impl TmpfsInode {
             .collect();
 
         for extent_start in overlapping {
-            let Some(data) = self.sparse_data.remove(&extent_start) else {
+            let Some(extent) = self.sparse_data.remove(&extent_start) else {
                 continue;
             };
-            let extent_end = extent_start.saturating_add(data.len() as u64);
+            let extent_end = extent_start.saturating_add(extent.len() as u64);
+            let left = if extent_start < start {
+                extent.slice(0, (start - extent_start) as usize)
+            } else {
+                None
+            };
+            let right = if extent_end > end {
+                let right_offset = (end - extent_start) as usize;
+                extent.slice(right_offset, (extent_end - end) as usize)
+            } else {
+                None
+            };
             if extent_start < start {
-                let keep_len = (start - extent_start) as usize;
-                self.sparse_data
-                    .insert(extent_start, data[..keep_len].to_vec());
+                if let Some(left) = left {
+                    self.sparse_data.insert(extent_start, left);
+                }
             }
             if extent_end > end {
-                let right_offset = (end - extent_start) as usize;
-                self.sparse_data.insert(end, data[right_offset..].to_vec());
+                if let Some(right) = right {
+                    self.sparse_data.insert(end, right);
+                }
             }
         }
     }
@@ -117,8 +272,8 @@ impl TmpfsInode {
         let affected: Vec<u64> = self
             .sparse_data
             .range(..)
-            .filter_map(|(&extent_start, data)| {
-                let extent_end = extent_start.saturating_add(data.len() as u64);
+            .filter_map(|(&extent_start, extent)| {
+                let extent_end = extent_start.saturating_add(extent.len() as u64);
                 if extent_start >= len || extent_end > len {
                     Some(extent_start)
                 } else {
@@ -128,28 +283,26 @@ impl TmpfsInode {
             .collect();
 
         for extent_start in affected {
-            let Some(mut data) = self.sparse_data.remove(&extent_start) else {
+            let Some(mut extent) = self.sparse_data.remove(&extent_start) else {
                 continue;
             };
             if extent_start < len {
-                data.truncate((len - extent_start) as usize);
-                self.sparse_data.insert(extent_start, data);
+                extent.truncate_to((len - extent_start) as usize);
+                if extent.len() > 0 {
+                    self.sparse_data.insert(extent_start, extent);
+                }
             }
         }
     }
 
     fn copy_sparse_to(&self, offset: u64, buf: &mut [u8]) {
         let end = offset.saturating_add(buf.len() as u64);
-        for (&extent_start, data) in self.sparse_data.range(..end) {
-            let extent_end = extent_start.saturating_add(data.len() as u64);
+        for (&extent_start, extent) in self.sparse_data.range(..end) {
+            let extent_end = extent_start.saturating_add(extent.len() as u64);
             if extent_end <= offset {
                 continue;
             }
-            let src_start = offset.saturating_sub(extent_start) as usize;
-            let dst_start = extent_start.saturating_sub(offset) as usize;
-            let copy_len = (data.len() - src_start).min(buf.len() - dst_start);
-            buf[dst_start..dst_start + copy_len]
-                .copy_from_slice(&data[src_start..src_start + copy_len]);
+            extent.copy_to(extent_start, offset, buf);
         }
     }
 
@@ -163,17 +316,13 @@ impl TmpfsInode {
     }
 
     fn append_sparse_tail(&mut self, offset: u64, buf: &[u8]) -> Option<usize> {
-        let (&extent_start, data) = self.sparse_data.range_mut(..=offset).next_back()?;
-        let extent_end = extent_start.saturating_add(data.len() as u64);
-        if extent_end != offset || data.len() >= TMPFS_SPARSE_EXTENT_LIMIT {
+        let allocated_payload_len = self.allocated_payload_len();
+        let (&extent_start, extent) = self.sparse_data.range_mut(..=offset).next_back()?;
+        let extent_end = extent_start.saturating_add(extent.len() as u64);
+        if extent_end != offset {
             return None;
         }
-        let copy_len = buf.len().min(TMPFS_SPARSE_EXTENT_LIMIT - data.len());
-        if data.try_reserve(copy_len).is_err() {
-            return Some(0);
-        }
-        data.extend_from_slice(&buf[..copy_len]);
-        Some(copy_len)
+        extent.try_append(buf, allocated_payload_len)
     }
 
     fn write_sparse_data(&mut self, mut offset: u64, mut buf: &[u8]) -> bool {
@@ -188,13 +337,17 @@ impl TmpfsInode {
             }
 
             let copy_len = buf.len().min(TMPFS_SPARSE_EXTENT_LIMIT);
-            let reserve_len = TMPFS_SPARSE_EXTENT_LIMIT.min(buf.len());
+            if self.allocated_payload_len().saturating_add(copy_len) > TMPFS_ALLOCATED_PAYLOAD_LIMIT
+            {
+                return false;
+            }
             let mut data = Vec::new();
-            if data.try_reserve(reserve_len).is_err() {
+            if data.try_reserve(copy_len).is_err() {
                 return false;
             }
             data.extend_from_slice(&buf[..copy_len]);
-            self.sparse_data.insert(offset, data);
+            self.sparse_data
+                .insert(offset, TmpfsSparseExtent::Bytes(data));
             offset += copy_len as u64;
             buf = &buf[copy_len..];
         }
@@ -682,6 +835,24 @@ impl FileSystemBackend for TmpFs {
             return 0;
         };
         if buf.iter().all(|byte| *byte == 0) {
+            if offset >= TMPFS_INLINE_FILE_LIMIT as u64 {
+                // CONTEXT: user writes can be split at page boundaries. Keeping a
+                // zero tail contiguous lets repeated-page payloads compress.
+                if let Some(appended) = inode.append_sparse_tail(offset, buf) {
+                    if appended == 0 {
+                        return 0;
+                    }
+                    if appended < buf.len() {
+                        let zero_start = offset + appended as u64;
+                        inode.write_zero_range(zero_start, end);
+                    }
+                    if end > inode.size {
+                        inode.size = end;
+                    }
+                    inode.touch();
+                    return buf.len();
+                }
+            }
             inode.write_zero_range(offset, end);
             if end > inode.size {
                 inode.size = end;
