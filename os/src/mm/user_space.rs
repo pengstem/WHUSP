@@ -593,7 +593,7 @@ impl MemorySet {
                     return None;
                 }
                 let pte_flags = crate::mm::page_table::PTEFlags::from_bits_truncate(
-                    self.areas[area_idx].map_perm.bits(),
+                    self.areas[area_idx].map_perm.bits() as usize,
                 );
                 if !self.page_table.remap_flags(vpn, pte_flags) {
                     return None;

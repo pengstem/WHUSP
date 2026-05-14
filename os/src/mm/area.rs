@@ -180,7 +180,7 @@ impl MapArea {
         permission: MapPermission,
         reported_permission: MapPermission,
     ) -> bool {
-        let pte_flags = PTEFlags::from_bits_truncate(permission.bits());
+        let pte_flags = PTEFlags::from_bits_truncate(permission.bits() as usize);
         if self.is_mmap() {
             for vpn in self.data_frames.keys().copied() {
                 if !page_table.remap_flags(vpn, pte_flags) {
@@ -222,15 +222,22 @@ impl MapArea {
                     return false;
                 };
                 let ppn = frame.ppn;
-                if !page_table.try_map(vpn, ppn, PTEFlags::from_bits_truncate(self.map_perm.bits()))
-                {
+                if !page_table.try_map(
+                    vpn,
+                    ppn,
+                    PTEFlags::from_bits_truncate(self.map_perm.bits() as usize),
+                ) {
                     return false;
                 }
                 self.data_frames.insert(vpn, frame);
                 return true;
             }
         };
-        page_table.try_map(vpn, ppn, PTEFlags::from_bits_truncate(self.map_perm.bits()))
+        page_table.try_map(
+            vpn,
+            ppn,
+            PTEFlags::from_bits_truncate(self.map_perm.bits() as usize),
+        )
     }
 
     pub(super) fn map(&mut self, page_table: &mut PageTable) -> bool {
@@ -273,7 +280,7 @@ impl MapArea {
             return true;
         }
         let ppn = frame.ppn;
-        let pte_flags = PTEFlags::from_bits_truncate(self.map_perm.bits());
+        let pte_flags = PTEFlags::from_bits_truncate(self.map_perm.bits() as usize);
         if !page_table.try_map(vpn, ppn, pte_flags) {
             return false;
         }
@@ -307,7 +314,7 @@ impl MapArea {
         if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
             return true;
         }
-        let mut pte_flags = PTEFlags::from_bits_truncate(self.map_perm.bits());
+        let mut pte_flags = PTEFlags::from_bits_truncate(self.map_perm.bits() as usize);
         if info.shared && info.writable {
             pte_flags.remove(PTEFlags::W);
         }
@@ -337,7 +344,7 @@ impl MapArea {
         if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
             return true;
         }
-        let pte_flags = PTEFlags::from_bits_truncate(self.map_perm.bits());
+        let pte_flags = PTEFlags::from_bits_truncate(self.map_perm.bits() as usize);
         if !page_table.try_map(vpn, ppn, pte_flags) {
             return false;
         }

@@ -66,7 +66,7 @@ pub fn virt_to_phys(addr: usize) -> usize {
 }
 
 pub fn pte_new_bits(ppn: usize, flags: crate::mm::page_table::PTEFlags) -> usize {
-    ppn << 10 | flags.bits() as usize
+    ppn << 10 | flags.bits()
 }
 
 pub fn pte_ppn(bits: usize) -> usize {
@@ -74,7 +74,7 @@ pub fn pte_ppn(bits: usize) -> usize {
 }
 
 pub fn pte_flags(bits: usize) -> crate::mm::page_table::PTEFlags {
-    crate::mm::page_table::PTEFlags::from_bits_truncate(bits as u8)
+    crate::mm::page_table::PTEFlags::from_bits_truncate(bits)
 }
 
 pub fn pte_is_valid(bits: usize) -> bool {

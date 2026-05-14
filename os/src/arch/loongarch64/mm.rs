@@ -17,6 +17,7 @@ const LA_PTE_PLV_USER: usize = 0b11 << 2;
 const LA_PTE_MAT_CC: usize = 0b01 << 4;
 const LA_PTE_P: usize = 1 << 7;
 const LA_PTE_W: usize = 1 << 8;
+const LA_PTE_COW: usize = 1 << 58;
 const LA_PTE_NR: usize = 1 << 61;
 const LA_PTE_NX: usize = 1 << 62;
 
@@ -118,6 +119,9 @@ pub fn pte_new_bits(ppn: usize, flags: crate::mm::page_table::PTEFlags) -> usize
     if flags.contains(crate::mm::page_table::PTEFlags::U) {
         bits |= LA_PTE_PLV_USER;
     }
+    if flags.contains(crate::mm::page_table::PTEFlags::COW) {
+        bits |= LA_PTE_COW;
+    }
     bits
 }
 
@@ -141,6 +145,9 @@ pub fn pte_flags(bits: usize) -> crate::mm::page_table::PTEFlags {
     }
     if bits & LA_PTE_PLV_USER == LA_PTE_PLV_USER {
         flags |= crate::mm::page_table::PTEFlags::U;
+    }
+    if bits & LA_PTE_COW != 0 {
+        flags |= crate::mm::page_table::PTEFlags::COW;
     }
     flags
 }

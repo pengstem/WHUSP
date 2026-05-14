@@ -14,7 +14,9 @@ pub use address::VPNRange;
 pub use address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
 pub use area::{MapArea, MapPermission, MapType, MmapFlush};
 pub use elf_loader::{ElfLoadInfo, elf_required_interpreter_path};
-pub use frame_allocator::{FrameTracker, frame_alloc, frame_alloc_more, frame_stats};
+pub use frame_allocator::{
+    FrameTracker, frame_alloc, frame_alloc_more, frame_ref_count, frame_stats,
+};
 pub use kernel_space::{KERNEL_SPACE, kernel_token};
 pub use memory_set::MemorySet;
 pub use page_table::{PageTable, PageTableEntry, UserBuffer, translated_refmut};

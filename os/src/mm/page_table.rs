@@ -6,7 +6,7 @@ use bitflags::*;
 
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct PTEFlags: u8 {
+    pub struct PTEFlags: usize {
         const V = 1 << 0;
         const R = 1 << 1;
         const W = 1 << 2;
@@ -15,6 +15,7 @@ bitflags! {
         const G = 1 << 5;
         const A = 1 << 6;
         const D = 1 << 7;
+        const COW = 1 << 8;
     }
 }
 
@@ -50,6 +51,9 @@ impl PageTableEntry {
     }
     pub fn executable(&self) -> bool {
         self.flags().contains(PTEFlags::X)
+    }
+    pub fn cow(&self) -> bool {
+        self.flags().contains(PTEFlags::COW)
     }
 }
 
@@ -176,6 +180,48 @@ impl PageTable {
             flags
         };
         *pte = PageTableEntry::new(pte.ppn(), flags);
+        true
+    }
+    pub fn mark_cow_readonly(&mut self, vpn: VirtPageNum) -> bool {
+        let Some(pte) = self.find_pte(vpn) else {
+            return false;
+        };
+        if !pte.is_valid() || pte.bits == 0 || !pte.writable() {
+            return false;
+        }
+        let mut flags = pte.flags();
+        flags.remove(PTEFlags::W);
+        flags.insert(PTEFlags::COW);
+        *pte = PageTableEntry::new(pte.ppn(), flags);
+        true
+    }
+    pub fn restore_write_clear_cow(&mut self, vpn: VirtPageNum) -> bool {
+        let Some(pte) = self.find_pte(vpn) else {
+            return false;
+        };
+        if !pte.is_valid() || pte.bits == 0 || !pte.cow() {
+            return false;
+        }
+        let mut flags = pte.flags();
+        flags.remove(PTEFlags::COW);
+        flags.insert(PTEFlags::W);
+        *pte = PageTableEntry::new(pte.ppn(), flags);
+        true
+    }
+    pub fn replace_leaf(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
+        let Some(pte) = self.find_pte(vpn) else {
+            return false;
+        };
+        if !pte.is_valid() || pte.bits == 0 {
+            return false;
+        }
+        let leaf_flags = PTEFlags::R | PTEFlags::W | PTEFlags::X;
+        let flags = if flags.intersects(leaf_flags) {
+            flags | PTEFlags::V
+        } else {
+            flags
+        };
+        *pte = PageTableEntry::new(ppn, flags);
         true
     }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {

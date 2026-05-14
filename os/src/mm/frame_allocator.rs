@@ -146,6 +146,15 @@ impl StackFrameAllocator {
         *count += 1;
         true
     }
+
+    fn ref_count(&self, ppn: PhysPageNum) -> Option<usize> {
+        let ppn = ppn.0;
+        if ppn < self.start || ppn >= self.current {
+            return None;
+        }
+        let count = self.ref_counts[ppn - self.start];
+        (count > 0).then_some(count)
+    }
 }
 
 type FrameAllocatorImpl = StackFrameAllocator;
@@ -186,6 +195,10 @@ pub fn frame_dealloc(ppn: PhysPageNum) {
 
 pub fn frame_retain(ppn: PhysPageNum) -> bool {
     FRAME_ALLOCATOR.exclusive_access().retain(ppn)
+}
+
+pub fn frame_ref_count(ppn: PhysPageNum) -> Option<usize> {
+    FRAME_ALLOCATOR.exclusive_access().ref_count(ppn)
 }
 
 pub fn frame_stats() -> (usize, usize) {
