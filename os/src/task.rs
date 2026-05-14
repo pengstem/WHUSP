@@ -60,7 +60,7 @@ pub use signal::{
 #[cfg(target_arch = "riscv64")]
 pub use signal::{SI_TKILL, SIGRT_1, SIGRTMIN};
 pub(crate) use signal::{flags_to_linux_sigset, linux_sigset_to_flags};
-pub use task::{TaskControlBlock, TaskStatus};
+pub use task::{DEFAULT_TIMER_SLACK_NS, SeccompSockFilter, TaskControlBlock, TaskStatus};
 
 fn with_current_process(process_fn: impl FnOnce(&ProcessControlBlock)) {
     if let Some(task) = current_task() {
@@ -383,6 +383,24 @@ pub(crate) fn queue_signal_to_task(
     wakeup_task(task);
 }
 
+fn nearest_child_reaper(parent: Option<Arc<ProcessControlBlock>>) -> Arc<ProcessControlBlock> {
+    let mut cursor = parent;
+    while let Some(process) = cursor {
+        let (is_live_subreaper, next_parent) = {
+            let inner = process.inner_exclusive_access();
+            (
+                inner.is_child_subreaper && !inner.is_zombie,
+                inner.parent.as_ref().and_then(|parent| parent.upgrade()),
+            )
+        };
+        if is_live_subreaper {
+            return process;
+        }
+        cursor = next_parent;
+    }
+    INITPROC.clone()
+}
+
 fn exit_current(exit_code: i32, group_exit: bool) {
     account_current_system_time();
     let current = current_task().expect("exit_current requires a current task");
@@ -482,13 +500,14 @@ fn exit_current(exit_code: i32, group_exit: bool) {
         release_record_locks_for_process(pid);
         release_flock_locks_for_closed_fd_table(&fd_table);
 
-        // move all child processes under init process
-        let mut initproc_inner = INITPROC.inner_exclusive_access();
+        // Move orphaned children under the nearest live subreaper, or init.
+        let reaper = nearest_child_reaper(parent.clone());
+        let mut reaper_inner = reaper.inner_exclusive_access();
         for child in children {
-            child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
-            initproc_inner.children.push(child);
+            child.inner_exclusive_access().parent = Some(Arc::downgrade(&reaper));
+            reaper_inner.children.push(child);
         }
-        drop(initproc_inner);
+        drop(reaper_inner);
 
         drop(fd_table);
 

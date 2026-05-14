@@ -3,7 +3,7 @@ use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
 use super::process::{
     Credentials, ProcessControlBlock, ProcessControlBlockInner, ProcessCpuTimes, ProcessFsContext,
-    ProcessResourceLimits, ProcessTimers, empty_process_pkey_rights,
+    ProcessResourceLimits, ProcessTimers, comm_from_cmdline, empty_process_pkey_rights,
 };
 use super::{
     CloneArgs, CloneFlags, FdTableEntry, SIGCHLD, SignalAction, TaskControlBlock, add_task,
@@ -107,6 +107,13 @@ impl ProcessControlBlock {
                         )),
                     ],
                     umask: 0,
+                    comm: comm_from_cmdline(&args),
+                    pdeath_signal: 0,
+                    dumpable: true,
+                    securebits: 0,
+                    is_child_subreaper: false,
+                    no_new_privs: false,
+                    thp_disabled: false,
                     credentials: Credentials::root(),
                     resource_limits: ProcessResourceLimits::new(),
                     process_keyring: None,
@@ -190,6 +197,11 @@ impl ProcessControlBlock {
         let resource_limits = parent.resource_limits;
         let session_keyring = parent.session_keyring;
         let pkey_rights = parent.pkey_rights;
+        let comm = parent.comm.clone();
+        let dumpable = parent.dumpable;
+        let securebits = parent.securebits;
+        let no_new_privs = parent.no_new_privs;
+        let thp_disabled = parent.thp_disabled;
         let membarrier_private_expedited_registered =
             parent.membarrier_private_expedited_registered;
         let fs = parent.fs.forked(mount_namespace_id);
@@ -209,6 +221,9 @@ impl ProcessControlBlock {
         let parent_sched_policy = parent_task_inner.sched_policy;
         let parent_sched_priority = parent_task_inner.sched_priority;
         let parent_sched_reset_on_fork = parent_task_inner.sched_reset_on_fork;
+        let parent_timer_slack_ns = parent_task_inner.timer_slack_ns;
+        let parent_seccomp_mode = parent_task_inner.seccomp_mode;
+        let parent_seccomp_filter = parent_task_inner.seccomp_filter.clone();
         drop(parent_task_inner);
         drop(parent);
 
@@ -228,6 +243,13 @@ impl ProcessControlBlock {
                     exit_code: 0,
                     fd_table: new_fd_table,
                     umask,
+                    comm,
+                    pdeath_signal: 0,
+                    dumpable,
+                    securebits,
+                    is_child_subreaper: false,
+                    no_new_privs,
+                    thp_disabled,
                     credentials,
                     resource_limits,
                     process_keyring: None,
@@ -264,6 +286,10 @@ impl ProcessControlBlock {
         trap_cx.kernel_sp = task.kstack.get_top();
         task_inner.signal_mask = parent_signal_mask;
         task_inner.sigaltstack = parent_sigaltstack;
+        task_inner.timer_slack_ns = parent_timer_slack_ns;
+        task_inner.default_timer_slack_ns = parent_timer_slack_ns;
+        task_inner.seccomp_mode = parent_seccomp_mode;
+        task_inner.seccomp_filter = parent_seccomp_filter;
         if parent_sched_reset_on_fork {
             task_inner.sched_policy = 0;
             task_inner.sched_priority = 0;

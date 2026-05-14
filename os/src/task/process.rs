@@ -149,6 +149,7 @@ pub struct CapabilitySets {
     pub permitted: [u32; 2],
     pub inheritable: [u32; 2],
     pub bounding: [u32; 2],
+    pub ambient: [u32; 2],
 }
 
 impl CapabilitySets {
@@ -178,12 +179,50 @@ impl CapabilitySets {
             permitted: all,
             inheritable: [0; 2],
             bounding: all,
+            ambient: [0; 2],
         }
     }
 
     pub fn has_effective(&self, cap: usize) -> Option<bool> {
         let (index, mask) = Self::cap_bit(cap)?;
         Some(self.effective[index] & mask != 0)
+    }
+
+    pub fn has_permitted(&self, cap: usize) -> Option<bool> {
+        let (index, mask) = Self::cap_bit(cap)?;
+        Some(self.permitted[index] & mask != 0)
+    }
+
+    pub fn has_inheritable(&self, cap: usize) -> Option<bool> {
+        let (index, mask) = Self::cap_bit(cap)?;
+        Some(self.inheritable[index] & mask != 0)
+    }
+
+    pub fn ambient_contains(&self, cap: usize) -> Option<bool> {
+        let (index, mask) = Self::cap_bit(cap)?;
+        Some(self.ambient[index] & mask != 0)
+    }
+
+    pub fn raise_ambient(&mut self, cap: usize) -> Option<()> {
+        let (index, mask) = Self::cap_bit(cap)?;
+        self.ambient[index] |= mask;
+        Some(())
+    }
+
+    pub fn lower_ambient(&mut self, cap: usize) -> Option<()> {
+        let (index, mask) = Self::cap_bit(cap)?;
+        self.ambient[index] &= !mask;
+        Some(())
+    }
+
+    pub fn clear_ambient(&mut self) {
+        self.ambient = [0; 2];
+    }
+
+    pub fn clamp_ambient_to_permitted_inheritable(&mut self) {
+        for index in 0..self.ambient.len() {
+            self.ambient[index] &= self.permitted[index] & self.inheritable[index];
+        }
     }
 
     pub fn bounding_contains(&self, cap: usize) -> Option<bool> {
@@ -266,6 +305,8 @@ pub(crate) struct ProcessProcSnapshot {
     pub(crate) thread_count: usize,
     pub(crate) mount_namespace_id: MountNamespaceId,
     pub(crate) locked_kb: usize,
+    pub(crate) no_new_privs: bool,
+    pub(crate) timer_slack_ns: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -479,6 +520,13 @@ pub struct ProcessControlBlockInner {
     pub exit_code: i32,
     pub fd_table: Vec<Option<FdTableEntry>>,
     pub umask: u32,
+    pub(crate) comm: String,
+    pub(crate) pdeath_signal: u32,
+    pub(crate) dumpable: bool,
+    pub(crate) securebits: u32,
+    pub(crate) is_child_subreaper: bool,
+    pub(crate) no_new_privs: bool,
+    pub(crate) thp_disabled: bool,
     // UNFINISHED: Linux kernel credentials are per-thread, while POSIX
     // user-space expects process-wide synchronization. This first contest
     // compatibility model keeps credentials on the PCB and shares them across
@@ -576,6 +624,17 @@ impl ProcessControlBlockInner {
             .expect("task slot must exist while referenced by process lifecycle code")
             .clone()
     }
+}
+
+pub(crate) fn comm_from_cmdline(cmdline: &[String]) -> String {
+    cmdline
+        .first()
+        .and_then(|arg| arg.rsplit('/').next())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("process")
+        .chars()
+        .take(15)
+        .collect()
 }
 
 impl ProcessControlBlock {
@@ -687,15 +746,12 @@ impl ProcessControlBlock {
                 }
             }
         };
-        let comm = inner
-            .cmdline
+        let timer_slack_ns = inner
+            .tasks
             .first()
-            .and_then(|arg| arg.rsplit('/').next())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("process")
-            .chars()
-            .take(15)
-            .collect();
+            .and_then(|task| task.as_ref())
+            .map(|task| task.inner_exclusive_access().timer_slack_ns)
+            .unwrap_or(crate::task::DEFAULT_TIMER_SLACK_NS);
         ProcessProcSnapshot {
             pid: self.pid.0,
             ppid: inner
@@ -704,7 +760,7 @@ impl ProcessControlBlock {
                 .and_then(Weak::upgrade)
                 .map_or(0, |parent| parent.getpid()),
             pgid: inner.pgid,
-            comm,
+            comm: inner.comm.clone(),
             state,
             cmdline: inner.cmdline.clone(),
             cpu_times: inner.cpu_times.snapshot(),
@@ -712,6 +768,8 @@ impl ProcessControlBlock {
             thread_count: inner.thread_count(),
             mount_namespace_id: inner.fs.mount_namespace_id,
             locked_kb: inner.memory_set.locked_bytes() / 1024,
+            no_new_privs: inner.no_new_privs,
+            timer_slack_ns,
         }
     }
 

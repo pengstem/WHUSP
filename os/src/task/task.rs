@@ -8,7 +8,20 @@ use crate::{
     mm::PhysPageNum,
     sync::{UPIntrFreeCell, UPIntrRefMut},
 };
-use alloc::sync::{Arc, Weak};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+
+pub const DEFAULT_TIMER_SLACK_NS: usize = 50_000;
+
+#[derive(Clone, Copy)]
+pub struct SeccompSockFilter {
+    pub code: u16,
+    pub jt: u8,
+    pub jf: u8,
+    pub k: u32,
+}
 
 pub struct TaskControlBlock {
     // immutable
@@ -73,6 +86,10 @@ pub struct TaskControlBlockInner {
     pub sched_policy: i32,
     pub sched_priority: i32,
     pub sched_reset_on_fork: bool,
+    pub timer_slack_ns: usize,
+    pub default_timer_slack_ns: usize,
+    pub seccomp_mode: u8,
+    pub seccomp_filter: Option<Vec<SeccompSockFilter>>,
     pub clone_vm_process_helper: bool,
     pub synthetic_newnet: bool,
     pub(crate) thread_keyring: Option<i32>,
@@ -131,6 +148,10 @@ impl TaskControlBlock {
                     sched_policy: 0,
                     sched_priority: 0,
                     sched_reset_on_fork: false,
+                    timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
+                    default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
+                    seccomp_mode: 0,
+                    seccomp_filter: None,
                     clone_vm_process_helper: false,
                     synthetic_newnet: false,
                     thread_keyring: None,

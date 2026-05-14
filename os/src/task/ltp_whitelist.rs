@@ -177,4 +177,12 @@ pub(super) const LTP_CASE_WHITELIST: &[&str] = &[
     "writev01",
     "writev03",
     "writev07",
+    "prctl01",
+    "prctl02",
+    "prctl03",
+    "prctl04",
+    "prctl05",
+    "prctl06",
+    "prctl08",
+    "prctl09",
 ];

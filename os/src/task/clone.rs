@@ -99,6 +99,9 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     let parent_sched_policy = parent_inner.sched_policy;
     let parent_sched_priority = parent_inner.sched_priority;
     let parent_sched_reset_on_fork = parent_inner.sched_reset_on_fork;
+    let parent_timer_slack_ns = parent_inner.timer_slack_ns;
+    let parent_seccomp_mode = parent_inner.seccomp_mode;
+    let parent_seccomp_filter = parent_inner.seccomp_filter.clone();
     drop(parent_inner);
     let new_task = Arc::new(TaskControlBlock::new(process, ustack_base, true));
     let mut new_task_inner = new_task.inner_exclusive_access();
@@ -114,6 +117,10 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     new_task_inner.sched_policy = parent_sched_policy;
     new_task_inner.sched_priority = parent_sched_priority;
     new_task_inner.sched_reset_on_fork = parent_sched_reset_on_fork;
+    new_task_inner.timer_slack_ns = parent_timer_slack_ns;
+    new_task_inner.default_timer_slack_ns = parent_timer_slack_ns;
+    new_task_inner.seccomp_mode = parent_seccomp_mode;
+    new_task_inner.seccomp_filter = parent_seccomp_filter;
     let new_trap_cx = new_task_inner.get_trap_cx();
     *new_trap_cx = parent_trap_cx;
     new_trap_cx.set_a0(0);

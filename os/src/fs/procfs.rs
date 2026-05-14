@@ -64,10 +64,13 @@ const PID_SMAPS_OFFSET: u32 = 8;
 const PID_MOUNTS_OFFSET: u32 = 9;
 const PID_IO_OFFSET: u32 = 10;
 const PID_FDINFO_DIR_OFFSET: u32 = 11;
+const PID_COMM_OFFSET: u32 = 12;
+const PID_TIMERSLACK_OFFSET: u32 = 13;
 const PID_FD_ENTRY_BASE: u32 = 1_000_000;
 const PID_FDINFO_ENTRY_BASE: u32 = 2_000_000;
 const PID_FD_ENTRY_STRIDE: u32 = 4096;
 const PID_TASK_INO_TAG_MASK: u32 = 0xC000_0000;
+const PID_TASK_TID_COMM_TAG: u32 = 0x4000_0000;
 const PID_TASK_TID_DIR_TAG: u32 = 0x8000_0000;
 const PID_TASK_TID_STAT_TAG: u32 = 0xC000_0000;
 const PID_TASK_PID_SHIFT: usize = 12;
@@ -144,7 +147,9 @@ enum ProcNode {
     PidDir(usize),
     PidStat(usize),
     PidStatus(usize),
+    PidComm(usize),
     PidCmdline(usize),
+    PidTimerslack(usize),
     PidFdDir(usize),
     PidFdEntry(usize, usize),
     PidFdInfoDir(usize),
@@ -158,6 +163,7 @@ enum ProcNode {
     PidTaskDir(usize),
     PidTaskTidDir(usize, usize),
     PidTaskTidStat(usize, usize),
+    PidTaskTidComm(usize, usize),
 }
 
 impl ProcFs {
@@ -193,9 +199,16 @@ fn pid_task_tid_stat_ino(pid: usize, local_tid: usize) -> Option<u32> {
     pid_task_tid_ino(pid, local_tid, PID_TASK_TID_STAT_TAG)
 }
 
+fn pid_task_tid_comm_ino(pid: usize, local_tid: usize) -> Option<u32> {
+    pid_task_tid_ino(pid, local_tid, PID_TASK_TID_COMM_TAG)
+}
+
 fn decode_pid_task_tid_ino(ino: u32) -> Option<ProcNode> {
     let tag = ino & PID_TASK_INO_TAG_MASK;
-    if !matches!(tag, PID_TASK_TID_DIR_TAG | PID_TASK_TID_STAT_TAG) {
+    if !matches!(
+        tag,
+        PID_TASK_TID_COMM_TAG | PID_TASK_TID_DIR_TAG | PID_TASK_TID_STAT_TAG
+    ) {
         return None;
     }
     let payload = ino & !PID_TASK_INO_TAG_MASK;
@@ -203,6 +216,7 @@ fn decode_pid_task_tid_ino(ino: u32) -> Option<ProcNode> {
     let local_tid = (payload & PID_TASK_TID_MASK) as usize;
     lookup_task_by_local_tid(pid, local_tid)?;
     match tag {
+        PID_TASK_TID_COMM_TAG => Some(ProcNode::PidTaskTidComm(pid, local_tid)),
         PID_TASK_TID_DIR_TAG => Some(ProcNode::PidTaskTidDir(pid, local_tid)),
         PID_TASK_TID_STAT_TAG => Some(ProcNode::PidTaskTidStat(pid, local_tid)),
         _ => None,
@@ -317,6 +331,8 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
                 PID_MOUNTS_OFFSET => Some(ProcNode::PidMounts(pid)),
                 PID_IO_OFFSET => Some(ProcNode::PidIo(pid)),
                 PID_FDINFO_DIR_OFFSET => Some(ProcNode::PidFdInfoDir(pid)),
+                PID_COMM_OFFSET => Some(ProcNode::PidComm(pid)),
+                PID_TIMERSLACK_OFFSET => Some(ProcNode::PidTimerslack(pid)),
                 _ => None,
             }
         }
@@ -672,6 +688,11 @@ fn pid_entries(pid: usize) -> Vec<RawDirEntry> {
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_COMM_OFFSET),
+        name: "comm".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
         ino: pid_file_ino(pid, PID_CMDLINE_OFFSET),
         name: "cmdline".into(),
         dtype: DT_REG,
@@ -704,6 +725,11 @@ fn pid_entries(pid: usize) -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: pid_file_ino(pid, PID_IO_OFFSET),
         name: "io".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_TIMERSLACK_OFFSET),
+        name: "timerslack_ns".into(),
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
@@ -764,6 +790,11 @@ fn pid_task_tid_entries(pid: usize, local_tid: usize) -> FsResult<Vec<RawDirEntr
     entries.push(RawDirEntry {
         ino: stat_ino,
         name: "stat".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: pid_task_tid_comm_ino(pid, local_tid).ok_or(FsError::NotFound)?,
+        name: "comm".into(),
         dtype: DT_REG,
     });
     Ok(entries)
@@ -1114,6 +1145,33 @@ fn write_vfs_cache_pressure(buf: &[u8], offset: u64) -> usize {
     buf.len()
 }
 
+fn write_pid_timerslack(pid: usize, buf: &[u8], offset: u64) -> usize {
+    if offset != 0 {
+        return 0;
+    }
+    let Ok(text) = core::str::from_utf8(buf) else {
+        return 0;
+    };
+    let Ok(value) = text.trim().parse::<usize>() else {
+        return 0;
+    };
+    let Some(process) = pid2process(pid) else {
+        return 0;
+    };
+    let Some(task) = process
+        .inner_exclusive_access()
+        .tasks
+        .first()
+        .and_then(|task| task.as_ref().map(Arc::clone))
+    else {
+        return 0;
+    };
+    let mut task_inner = task.inner_exclusive_access();
+    task_inner.timer_slack_ns = value;
+    task_inner.default_timer_slack_ns = value;
+    buf.len()
+}
+
 fn write_domainname(buf: &[u8], offset: u64) -> usize {
     let Ok(offset) = usize::try_from(offset) else {
         return 0;
@@ -1192,6 +1250,10 @@ fn task_stat_content(pid: usize, local_tid: usize) -> FsResult<Vec<u8>> {
     Ok(proc_stat_content(process_snapshot, task.linux_tid(), state).into_bytes())
 }
 
+fn capability_hex(bits: [u32; 2]) -> u64 {
+    ((bits[1] as u64) << 32) | bits[0] as u64
+}
+
 fn pid_status_content(process: ProcessProcSnapshot) -> String {
     let cred = process.credentials;
     format!(
@@ -1203,6 +1265,12 @@ fn pid_status_content(process: ProcessProcSnapshot) -> String {
          Gid:\t{}\t{}\t{}\t{}\n\
          VmRSS:\t0 kB\n\
          VmLck:\t{} kB\n\
+         CapInh:\t{:016x}\n\
+         CapPrm:\t{:016x}\n\
+         CapEff:\t{:016x}\n\
+         CapBnd:\t{:016x}\n\
+         CapAmb:\t{:016x}\n\
+         NoNewPrivs:\t{}\n\
          Threads:\t{}\n",
         process.comm,
         process.state,
@@ -1217,8 +1285,22 @@ fn pid_status_content(process: ProcessProcSnapshot) -> String {
         cred.sgid,
         cred.fsgid,
         process.locked_kb,
+        capability_hex(cred.capabilities.inheritable),
+        capability_hex(cred.capabilities.permitted),
+        capability_hex(cred.capabilities.effective),
+        capability_hex(cred.capabilities.bounding),
+        capability_hex(cred.capabilities.ambient),
+        process.no_new_privs as usize,
         process.thread_count
     )
+}
+
+fn pid_comm_content(process: ProcessProcSnapshot) -> Vec<u8> {
+    format!("{}\n", process.comm).into_bytes()
+}
+
+fn pid_timerslack_content(process: ProcessProcSnapshot) -> Vec<u8> {
+    format!("{}\n", process.timer_slack_ns).into_bytes()
 }
 
 fn pid_cmdline_content(process: ProcessProcSnapshot) -> Vec<u8> {
@@ -1259,8 +1341,14 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
             .map(pid_status_content)
             .map(String::into_bytes)
             .ok_or(FsError::NotFound),
+        ProcNode::PidComm(pid) => lookup_process(pid)
+            .map(pid_comm_content)
+            .ok_or(FsError::NotFound),
         ProcNode::PidCmdline(pid) => lookup_process(pid)
             .map(pid_cmdline_content)
+            .ok_or(FsError::NotFound),
+        ProcNode::PidTimerslack(pid) => lookup_process(pid)
+            .map(pid_timerslack_content)
             .ok_or(FsError::NotFound),
         ProcNode::PidFdEntry(_, _) => Err(FsError::InvalidInput),
         ProcNode::PidFdInfoEntry(pid, fd) => pid_fdinfo_content(pid, fd).map(String::into_bytes),
@@ -1280,6 +1368,12 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
             .map(|process| format!("mnt:[{}]\n", process.mount_namespace_id.0).into_bytes())
             .ok_or(FsError::NotFound),
         ProcNode::PidTaskTidStat(pid, local_tid) => task_stat_content(pid, local_tid),
+        ProcNode::PidTaskTidComm(pid, local_tid) => {
+            lookup_task_by_local_tid(pid, local_tid).ok_or(FsError::NotFound)?;
+            lookup_process(pid)
+                .map(pid_comm_content)
+                .ok_or(FsError::NotFound)
+        }
         ProcNode::Root
         | ProcNode::SysDir
         | ProcNode::SysKernelDir
@@ -1426,6 +1520,7 @@ impl FileSystemBackend for ProcFs {
                     pid_file_ino(pid, PID_STATUS_OFFSET),
                     FsNodeKind::RegularFile,
                 )),
+                "comm" => Ok((pid_file_ino(pid, PID_COMM_OFFSET), FsNodeKind::RegularFile)),
                 "cmdline" => Ok((
                     pid_file_ino(pid, PID_CMDLINE_OFFSET),
                     FsNodeKind::RegularFile,
@@ -1442,6 +1537,10 @@ impl FileSystemBackend for ProcFs {
                     FsNodeKind::RegularFile,
                 )),
                 "io" => Ok((pid_file_ino(pid, PID_IO_OFFSET), FsNodeKind::RegularFile)),
+                "timerslack_ns" => Ok((
+                    pid_file_ino(pid, PID_TIMERSLACK_OFFSET),
+                    FsNodeKind::RegularFile,
+                )),
                 "ns" => Ok((pid_file_ino(pid, PID_NS_DIR_OFFSET), FsNodeKind::Directory)),
                 "task" => Ok((
                     pid_file_ino(pid, PID_TASK_DIR_OFFSET),
@@ -1520,6 +1619,10 @@ impl FileSystemBackend for ProcFs {
                     let ino = pid_task_tid_stat_ino(pid, local_tid).ok_or(FsError::NotFound)?;
                     Ok((ino, FsNodeKind::RegularFile))
                 }
+                "comm" => {
+                    let ino = pid_task_tid_comm_ino(pid, local_tid).ok_or(FsError::NotFound)?;
+                    Ok((ino, FsNodeKind::RegularFile))
+                }
                 _ => Err(FsError::NotFound),
             },
             _ => Err(FsError::NotDir),
@@ -1566,7 +1669,8 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::LeaseBreakTime
             | ProcNode::NetIpv4ConfLoTag
             | ProcNode::DropCaches
-            | ProcNode::VfsCachePressure => Ok(()),
+            | ProcNode::VfsCachePressure
+            | ProcNode::PidTimerslack(_) => Ok(()),
             ProcNode::Domainname => set_domainname_len(_len),
             _ => Err(FsError::ReadOnly),
         }
@@ -1612,6 +1716,9 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::NetIpv4ConfLoTag
             | ProcNode::DropCaches
             | ProcNode::VfsCachePressure
+            | ProcNode::PidComm(_)
+            | ProcNode::PidTimerslack(_)
+            | ProcNode::PidTaskTidComm(_, _)
             | ProcNode::Domainname => FileStat::with_mode(S_IFREG | 0o644),
             _ => FileStat::with_mode(S_IFREG | 0o444),
         };
@@ -1672,6 +1779,7 @@ impl FileSystemBackend for ProcFs {
             Some(ProcNode::NetIpv4ConfLoTag) => write_net_ipv4_conf_lo_tag(buf, offset),
             Some(ProcNode::DropCaches) => write_drop_caches(buf, offset),
             Some(ProcNode::VfsCachePressure) => write_vfs_cache_pressure(buf, offset),
+            Some(ProcNode::PidTimerslack(pid)) => write_pid_timerslack(pid, buf, offset),
             Some(ProcNode::Domainname) => write_domainname(buf, offset),
             _ => 0,
         }

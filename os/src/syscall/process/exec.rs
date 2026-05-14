@@ -150,6 +150,23 @@ fn libc_test_root_from_envs(envs: &[String]) -> Option<&'static str> {
     None
 }
 
+fn libc_test_root_from_interpreter(path: &str) -> Option<&'static str> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if name.starts_with("ld-musl") {
+        Some("/musl")
+    } else if name.starts_with("ld-linux") {
+        Some("/glibc")
+    } else {
+        None
+    }
+}
+
+fn push_missing_library_path(envs: &mut Vec<String>, root: &str) {
+    if !envs.iter().any(|env| env.starts_with("LD_LIBRARY_PATH=")) {
+        envs.push(String::from(contest_library_path_env(root)));
+    }
+}
+
 fn has_execute_permission(stat: &FileStat) -> bool {
     let credentials = current_process().credentials();
     if credentials.fsuid == 0 {
@@ -449,13 +466,20 @@ fn exec_loaded_program(
 ) -> SysResult {
     if data.starts_with(ELF_MAGIC) {
         let elf = xmas_elf::ElfFile::new(data.as_slice()).map_err(|_| SysError::ENOEXEC)?;
+        let mut envs = envs;
         // CONTEXT: Some contest basic binaries are PIE and carry PT_INTERP but
         // have no DT_NEEDED entries. They ran as directly-entered self-contained
         // test programs before dynamic linker support; keep that compatibility
         // path while using PT_INTERP for binaries that actually need DSOs.
-        let interpreter_data = elf_required_interpreter_path(&elf)
-            .map(read_elf_interpreter)
-            .transpose()?;
+        let interpreter_path = elf_required_interpreter_path(&elf);
+        if let Some(root) = interpreter_path.and_then(libc_test_root_from_interpreter) {
+            // CONTEXT: LTP may copy a dynamically linked libc-root helper into
+            // a temporary mountpoint and exec it with a minimal custom envp.
+            // The interpreter still identifies the libc family, so preserve the
+            // custom envp and add only the library search path the loader needs.
+            push_missing_library_path(&mut envs, root);
+        }
+        let interpreter_data = interpreter_path.map(read_elf_interpreter).transpose()?;
         let interpreter_elf = interpreter_data
             .as_ref()
             .map(|data| xmas_elf::ElfFile::new(data.as_slice()).map_err(|_| SysError::ENOEXEC))
@@ -539,16 +563,13 @@ fn normalize_exec_args(mut args: Vec<String>) -> Vec<String> {
 }
 
 fn normalize_exec_envs(path: &str, mut envs: Vec<String>) -> Vec<String> {
-    if envs.iter().any(|env| env.starts_with("LD_LIBRARY_PATH=")) {
-        return envs;
-    }
     let snapshot = current_process().path_snapshot();
     if let Some(root) = libc_test_root(snapshot.cwd_path.as_str(), path) {
         // CONTEXT: Official-style test disks keep glibc/musl DSOs under the
         // libc root instead of materializing the default root `/lib` search
         // tree. Preserve custom envp contents, but add the loader path needed
         // for dynamically linked LTP child helpers.
-        envs.push(String::from(contest_library_path_env(root)));
+        push_missing_library_path(&mut envs, root);
     }
     envs
 }

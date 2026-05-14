@@ -1,6 +1,6 @@
 use super::{
     SigAltStack, SignalAction, current_task, prepare_exec_thread_group,
-    process::{ProcessControlBlock, empty_process_pkey_rights},
+    process::{ProcessControlBlock, comm_from_cmdline, empty_process_pkey_rights},
 };
 use crate::config::PAGE_SIZE;
 use crate::fs::{VfsNodeId, track_regular_file_executable, untrack_regular_file_executable};
@@ -200,6 +200,7 @@ impl ProcessControlBlock {
             inner.pkey_rights = empty_process_pkey_rights();
             let previous = core::mem::replace(&mut inner.executable_node, executable_node);
             inner.cmdline = args.clone();
+            inner.comm = comm_from_cmdline(&args);
             inner.timers.clear_posix_after_exec();
             for action in inner.signal_actions.iter_mut() {
                 if action.has_user_handler() {
