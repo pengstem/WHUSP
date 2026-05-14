@@ -1,4 +1,5 @@
 use super::cgroupfs::CgroupFs;
+use super::devfs::DevFs;
 use super::ext4::Ext4Mount;
 use super::fat::FatMount;
 use super::overlayfs::OverlayFs;
@@ -34,9 +35,15 @@ pub(crate) enum MountPropagation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum MountTarget {
+    Node(VfsNodeId),
+    SyntheticPath { parent: VfsNodeId, path: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DynamicMount {
     namespace_id: MountNamespaceId,
-    target: VfsNodeId,
+    target: MountTarget,
     covered_parent: VfsNodeId,
     source_mount_id: MountId,
     source_root: VfsNodeId,
@@ -83,6 +90,12 @@ pub(crate) struct MountInfo {
     pub(crate) target: String,
     pub(crate) fs_type: &'static str,
     pub(crate) options: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SyntheticDirEntry {
+    pub(super) ino: u32,
+    pub(super) name: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,6 +164,16 @@ impl MountedFs {
             options: SleepMutex::new(options),
             backend: SleepMutex::new(backend),
         })
+    }
+}
+
+impl MountTarget {
+    fn node(node: VfsNodeId) -> Self {
+        Self::Node(node)
+    }
+
+    fn is_node(&self, node: VfsNodeId) -> bool {
+        matches!(self, Self::Node(target) if *target == node)
     }
 }
 
@@ -340,7 +363,7 @@ pub(super) fn mounted_root_for(
             .rev()
             .find(|mount| {
                 mount.namespace_id == namespace_id
-                    && mount.target == target
+                    && mount.target.is_node(target)
                     && mount.target_path == target_path
             })
             .map(|mount| mount.source_root)
@@ -355,8 +378,83 @@ pub(super) fn mounted_root_for_any_path(
         mounts
             .iter()
             .rev()
-            .find(|mount| mount.namespace_id == namespace_id && mount.target == target)
+            .find(|mount| mount.namespace_id == namespace_id && mount.target.is_node(target))
             .map(|mount| mount.source_root)
+    })
+}
+
+pub(super) fn mounted_root_for_synthetic_child(
+    namespace_id: MountNamespaceId,
+    parent: VfsNodeId,
+    target_path: &str,
+) -> Option<VfsNodeId> {
+    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        mounts
+            .iter()
+            .rev()
+            .find(|mount| {
+                mount.namespace_id == namespace_id
+                    && matches!(
+                        &mount.target,
+                        MountTarget::SyntheticPath { parent: mount_parent, path }
+                            if *mount_parent == parent && path == target_path
+                    )
+            })
+            .map(|mount| mount.source_root)
+    })
+}
+
+fn direct_synthetic_child_name<'a>(parent_path: &str, target_path: &'a str) -> Option<&'a str> {
+    let child = if parent_path == "/" {
+        target_path.strip_prefix('/')?
+    } else {
+        target_path
+            .strip_prefix(parent_path)
+            .and_then(|path| path.strip_prefix('/'))?
+    };
+    if child.is_empty() || child.contains('/') {
+        None
+    } else {
+        Some(child)
+    }
+}
+
+pub(super) fn synthetic_children_for_dir(
+    namespace_id: MountNamespaceId,
+    parent: VfsNodeId,
+    parent_path: &str,
+) -> Vec<SyntheticDirEntry> {
+    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        let mut entries = Vec::new();
+        for mount in mounts.iter().rev() {
+            if mount.namespace_id != namespace_id {
+                continue;
+            }
+            let MountTarget::SyntheticPath {
+                parent: mount_parent,
+                path,
+            } = &mount.target
+            else {
+                continue;
+            };
+            if *mount_parent != parent {
+                continue;
+            }
+            let Some(name) = direct_synthetic_child_name(parent_path, path.as_str()) else {
+                continue;
+            };
+            if entries
+                .iter()
+                .any(|entry: &SyntheticDirEntry| entry.name == name)
+            {
+                continue;
+            }
+            entries.push(SyntheticDirEntry {
+                ino: mount.source_root.ino,
+                name: String::from(name),
+            });
+        }
+        entries
     })
 }
 
@@ -396,6 +494,13 @@ fn lookup_covered_parent(target: VfsNodeId) -> Result<VfsNodeId, MountError> {
         return Err(MountError::InvalidTarget);
     }
     Ok(VfsNodeId::new(target.mount_id, parent_ino))
+}
+
+fn covered_parent_for_target(target: &MountTarget) -> Result<VfsNodeId, MountError> {
+    match target {
+        MountTarget::Node(node) => lookup_covered_parent(*node),
+        MountTarget::SyntheticPath { parent, .. } => Ok(*parent),
+    }
 }
 
 fn path_suffix(base: &str, path: &str) -> Option<String> {
@@ -554,7 +659,7 @@ fn queue_group_once(queue: &mut Vec<usize>, group: usize) {
 
 fn retarget_propagated_root(propagated: &mut DynamicMount, peer: &DynamicMount, suffix: &str) {
     if suffix.is_empty() {
-        propagated.target = peer.target;
+        propagated.target = peer.target.clone();
         propagated.covered_parent = peer.covered_parent;
     }
 }
@@ -930,10 +1035,11 @@ pub(crate) fn mount_block_device_at(
     target_path: &str,
 ) -> Result<(), MountError> {
     let source_mount_id = MountId(device_index);
-    let target = VfsNodeId::new(target.mount_id(), target.ino());
-    if root_ino_for(target.mount_id).is_some_and(|root_ino| target.ino == root_ino) {
+    let target_node = VfsNodeId::new(target.mount_id(), target.ino());
+    if root_ino_for(target_node.mount_id).is_some_and(|root_ino| target_node.ino == root_ino) {
         return Err(MountError::StaticRoot);
     }
+    let target = MountTarget::node(target_node);
 
     let target_is_busy = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         mounts
@@ -944,8 +1050,8 @@ pub(crate) fn mount_block_device_at(
         return Err(MountError::TargetBusy);
     }
 
-    let covered_parent = lookup_covered_parent(target)?;
-    let target_path = resolve_mount_path(target, target_path);
+    let covered_parent = covered_parent_for_target(&target)?;
+    let target_path = resolve_mount_path(target_node, target_path);
     ensure_mount_open(source_mount_id)?;
     let source_root = VfsNodeId::new(
         source_mount_id,
@@ -1062,11 +1168,25 @@ fn mount_new_fs_at(
     mounted: Arc<MountedFs>,
     target_path: &str,
 ) -> Result<MountId, MountError> {
-    let target = VfsNodeId::new(target.mount_id(), target.ino());
-    if root_ino_for(target.mount_id).is_some_and(|root_ino| target.ino == root_ino) {
+    let target_node = VfsNodeId::new(target.mount_id(), target.ino());
+    if root_ino_for(target_node.mount_id).is_some_and(|root_ino| target_node.ino == root_ino) {
         return Err(MountError::StaticRoot);
     }
+    let target_path = resolve_mount_path(target_node, target_path);
+    mount_new_fs_on_target(
+        namespace_id,
+        MountTarget::node(target_node),
+        mounted,
+        target_path.as_str(),
+    )
+}
 
+fn mount_new_fs_on_target(
+    namespace_id: MountNamespaceId,
+    target: MountTarget,
+    mounted: Arc<MountedFs>,
+    target_path: &str,
+) -> Result<MountId, MountError> {
     let target_is_busy = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         mounts
             .iter()
@@ -1076,8 +1196,8 @@ fn mount_new_fs_at(
         return Err(MountError::TargetBusy);
     }
 
-    let covered_parent = lookup_covered_parent(target)?;
-    let target_path = resolve_mount_path(target, target_path);
+    let covered_parent = covered_parent_for_target(&target)?;
+    let target_path = String::from(target_path);
     let source_path = mounted.source.clone();
     let source_mount_id = register_mount(mounted);
     let source_root = VfsNodeId::new(
@@ -1118,16 +1238,6 @@ fn mount_new_fs_at(
     })
 }
 
-pub(crate) fn mount_pseudo_fs_at(
-    namespace_id: MountNamespaceId,
-    target: WorkingDir,
-    backend: Box<dyn FileSystemBackend>,
-    fs_type: &'static str,
-    target_path: &str,
-) -> Result<MountId, MountError> {
-    mount_pseudo_fs_at_with_options(namespace_id, target, backend, fs_type, target_path, "rw")
-}
-
 pub(crate) fn mount_pseudo_fs_at_with_options(
     namespace_id: MountNamespaceId,
     target: WorkingDir,
@@ -1136,11 +1246,29 @@ pub(crate) fn mount_pseudo_fs_at_with_options(
     target_path: &str,
     options: &'static str,
 ) -> Result<MountId, MountError> {
-    let target = VfsNodeId::new(target.mount_id(), target.ino());
-    if root_ino_for(target.mount_id).is_some_and(|root_ino| target.ino == root_ino) {
+    let target_node = VfsNodeId::new(target.mount_id(), target.ino());
+    if root_ino_for(target_node.mount_id).is_some_and(|root_ino| target_node.ino == root_ino) {
         return Err(MountError::StaticRoot);
     }
+    let target_path = resolve_mount_path(target_node, target_path);
+    mount_pseudo_fs_on_target(
+        namespace_id,
+        MountTarget::node(target_node),
+        backend,
+        fs_type,
+        target_path.as_str(),
+        options,
+    )
+}
 
+fn mount_pseudo_fs_on_target(
+    namespace_id: MountNamespaceId,
+    target: MountTarget,
+    backend: Box<dyn FileSystemBackend>,
+    fs_type: &'static str,
+    target_path: &str,
+    options: &'static str,
+) -> Result<MountId, MountError> {
     let target_is_busy = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         mounts
             .iter()
@@ -1150,8 +1278,8 @@ pub(crate) fn mount_pseudo_fs_at_with_options(
         return Err(MountError::TargetBusy);
     }
 
-    let covered_parent = lookup_covered_parent(target)?;
-    let target_path = resolve_mount_path(target, target_path);
+    let covered_parent = covered_parent_for_target(&target)?;
+    let target_path = String::from(target_path);
     let source_mount_id = register_mount(MountedFs::new(backend, fs_type.into(), fs_type, options));
     let source_root = VfsNodeId::new(
         source_mount_id,
@@ -1214,10 +1342,11 @@ pub(crate) fn mount_detached_fs_at(
     target_path: &str,
 ) -> Result<(), MountError> {
     let source_root = VfsNodeId::new(source.mount_id(), source.ino());
-    let target = VfsNodeId::new(target.mount_id(), target.ino());
-    if root_ino_for(target.mount_id).is_some_and(|root_ino| target.ino == root_ino) {
+    let target_node = VfsNodeId::new(target.mount_id(), target.ino());
+    if root_ino_for(target_node.mount_id).is_some_and(|root_ino| target_node.ino == root_ino) {
         return Err(MountError::StaticRoot);
     }
+    let target = MountTarget::node(target_node);
 
     let target_is_busy = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         mounts
@@ -1228,9 +1357,9 @@ pub(crate) fn mount_detached_fs_at(
         return Err(MountError::TargetBusy);
     }
 
-    let covered_parent = lookup_covered_parent(target)?;
+    let covered_parent = covered_parent_for_target(&target)?;
     let source_path = resolve_mount_path(source_root, source_path);
-    let target_path = resolve_mount_path(target, target_path);
+    let target_path = resolve_mount_path(target_node, target_path);
     ensure_mount_open(source_root.mount_id)?;
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         if mounts
@@ -1275,14 +1404,15 @@ pub(crate) fn mount_bind_at(
     recursive: bool,
 ) -> Result<(), MountError> {
     let source_root = VfsNodeId::new(source.mount_id(), source.ino());
-    let target = VfsNodeId::new(target.mount_id(), target.ino());
-    if root_ino_for(target.mount_id).is_some_and(|root_ino| target.ino == root_ino) {
+    let target_node = VfsNodeId::new(target.mount_id(), target.ino());
+    if root_ino_for(target_node.mount_id).is_some_and(|root_ino| target_node.ino == root_ino) {
         return Err(MountError::StaticRoot);
     }
+    let target = MountTarget::node(target_node);
 
-    let covered_parent = lookup_covered_parent(target)?;
+    let covered_parent = covered_parent_for_target(&target)?;
     let source_path = resolve_mount_path(source_root, source_path);
-    let target_path = resolve_mount_path(target, target_path);
+    let target_path = resolve_mount_path(target_node, target_path);
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         let source_propagation_mount =
             nearest_propagation_mount(mounts, namespace_id, source_path.as_str());
@@ -1438,14 +1568,15 @@ pub(crate) fn move_mount_at(
     target_path: &str,
 ) -> Result<(), MountError> {
     let source = VfsNodeId::new(source.mount_id(), source.ino());
-    let target = VfsNodeId::new(target.mount_id(), target.ino());
-    if root_ino_for(target.mount_id).is_some_and(|root_ino| target.ino == root_ino) {
+    let target_node = VfsNodeId::new(target.mount_id(), target.ino());
+    if root_ino_for(target_node.mount_id).is_some_and(|root_ino| target_node.ino == root_ino) {
         return Err(MountError::StaticRoot);
     }
+    let target = MountTarget::node(target_node);
 
-    let covered_parent = lookup_covered_parent(target)?;
+    let covered_parent = covered_parent_for_target(&target)?;
     let source_path = resolve_mount_path(source, source_path);
-    let target_path = resolve_mount_path(target, target_path);
+    let target_path = resolve_mount_path(target_node, target_path);
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         // CONTEXT: Linux permits multiple mounts to stack on one mount point.
         // fs_bind_move18 moves parent1 over parent2's self-bind and then
@@ -1453,9 +1584,7 @@ pub(crate) fn move_mount_at(
         let source_index = mounts
             .iter()
             .rposition(|mount| {
-                mount.namespace_id == namespace_id
-                    && mount.target == source
-                    && mount.target_path == source_path
+                mount.namespace_id == namespace_id && mount.target_path == source_path
             })
             .ok_or(MountError::TargetNotMounted)?;
         let propagation_parent =
@@ -1689,7 +1818,7 @@ fn dynamic_mount_at(namespace_id: MountNamespaceId, target: VfsNodeId) -> Option
         mounts
             .iter()
             .rev()
-            .find(|mount| mount.namespace_id == namespace_id && mount.target == target)
+            .find(|mount| mount.namespace_id == namespace_id && mount.target.is_node(target))
             .map(|mount| mount.source_mount_id)
     })
 }
@@ -1858,48 +1987,89 @@ fn ensure_primary_child_dir(
     .flatten()
 }
 
+fn primary_root_dir() -> WorkingDir {
+    WorkingDir::new(primary_mount_id(), primary_root_ino())
+}
+
+fn mount_synthetic_pseudo_fs_at(
+    namespace_id: MountNamespaceId,
+    parent: WorkingDir,
+    target_path: &str,
+    backend: Box<dyn FileSystemBackend>,
+    fs_type: &'static str,
+    options: &'static str,
+) -> Result<MountId, MountError> {
+    mount_pseudo_fs_on_target(
+        namespace_id,
+        MountTarget::SyntheticPath {
+            parent: VfsNodeId::new(parent.mount_id(), parent.ino()),
+            path: String::from(target_path),
+        },
+        backend,
+        fs_type,
+        target_path,
+        options,
+    )
+}
+
 fn mount_kernel_pseudo_filesystems() {
-    if let Some(target) = ensure_primary_dir("proc", 0o555) {
-        match mount_pseudo_fs_at(
-            ROOT_MOUNT_NAMESPACE,
-            target,
-            Box::new(ProcFs::new()),
-            "proc",
-            "/proc",
-        ) {
-            Ok(_) => info!("filesystem mounted from proc at /proc"),
-            Err(err) => warn!("failed to mount proc at /proc: {err:?}"),
-        }
+    let root = primary_root_dir();
+    match mount_synthetic_pseudo_fs_at(
+        ROOT_MOUNT_NAMESPACE,
+        root,
+        "/proc",
+        Box::new(ProcFs::new()),
+        "proc",
+        "rw",
+    ) {
+        Ok(_) => info!("filesystem mounted from proc at /proc"),
+        Err(err) => warn!("failed to mount proc at /proc: {err:?}"),
     }
-    if let Some(target) = ensure_primary_dir("tmp", 0o1777) {
-        // CONTEXT: LTP is run with LTP_SINGLE_FS_TYPE=ext2 but its plain
-        // needs_tmpdir cases still allocate under /tmp. Back /tmp with the
-        // tmpfs implementation for mutability while reporting ext magic so
-        // filesystem probes follow the selected contest test filesystem.
-        match mount_pseudo_fs_at(
-            ROOT_MOUNT_NAMESPACE,
-            target,
-            Box::new(TmpFs::new_with_statfs_magic(EXT234_SUPER_MAGIC)),
-            "ext2",
-            "/tmp",
-        ) {
-            Ok(_) => info!("filesystem mounted from ext2 scratch tmpfs at /tmp"),
-            Err(err) => warn!("failed to mount ext2 scratch tmpfs at /tmp: {err:?}"),
-        }
+
+    // CONTEXT: LTP is run with LTP_SINGLE_FS_TYPE=ext2 but its plain
+    // needs_tmpdir cases still allocate under /tmp. Back /tmp with the tmpfs
+    // implementation for mutability while reporting ext magic so filesystem
+    // probes follow the selected contest test filesystem.
+    match mount_synthetic_pseudo_fs_at(
+        ROOT_MOUNT_NAMESPACE,
+        root,
+        "/tmp",
+        Box::new(TmpFs::new_with_statfs_magic(EXT234_SUPER_MAGIC)),
+        "ext2",
+        "rw",
+    ) {
+        Ok(_) => info!("filesystem mounted from ext2 scratch tmpfs at /tmp"),
+        Err(err) => warn!("failed to mount ext2 scratch tmpfs at /tmp: {err:?}"),
     }
-    if let Some(dev) = ensure_primary_dir("dev", 0o755) {
-        if let Some(target) = ensure_primary_child_dir(dev, "shm", 0o1777, "/dev/shm") {
-            match mount_pseudo_fs_at(
+
+    match mount_synthetic_pseudo_fs_at(
+        ROOT_MOUNT_NAMESPACE,
+        root,
+        "/dev",
+        Box::new(DevFs::new()),
+        "devfs",
+        "rw",
+    ) {
+        Ok(dev_mount_id) => {
+            info!("filesystem mounted from devfs at /dev");
+            let Some(dev_root_ino) = root_ino_for(dev_mount_id) else {
+                warn!("failed to mount tmpfs at /dev/shm: devfs root is missing");
+                return;
+            };
+            let dev_root = WorkingDir::new(dev_mount_id, dev_root_ino);
+            match mount_synthetic_pseudo_fs_at(
                 ROOT_MOUNT_NAMESPACE,
-                target,
+                dev_root,
+                "/dev/shm",
                 Box::new(TmpFs::new()),
                 "tmpfs",
-                "/dev/shm",
+                "rw",
             ) {
                 Ok(_) => info!("filesystem mounted from tmpfs at /dev/shm"),
                 Err(err) => warn!("failed to mount tmpfs at /dev/shm: {err:?}"),
             }
         }
+        Err(err) => warn!("failed to mount devfs at /dev: {err:?}"),
     }
 }
 
@@ -1938,6 +2108,10 @@ pub(super) fn mount_supports_page_cache(mount_id: MountId) -> bool {
 
 pub(crate) fn mount_is_read_only(mount_id: MountId) -> bool {
     mount_metadata(mount_id).is_some_and(|(_, _, options)| options == "ro")
+}
+
+pub(super) fn mount_is_devfs(mount_id: MountId) -> bool {
+    mount_metadata(mount_id).is_some_and(|(_, fs_type, _)| fs_type == "devfs")
 }
 
 fn resolve_mount_path(target: VfsNodeId, hint: &str) -> String {
@@ -1993,4 +2167,37 @@ pub(crate) fn list_mounts(namespace_id: MountNamespaceId) -> Vec<MountInfo> {
 
 pub(crate) fn statfs_for_mount(mount_id: MountId) -> Option<FileSystemStat> {
     with_mount(mount_id, |backend| backend.statfs())
+}
+
+pub(crate) fn sync_all_mounts() {
+    let mount_ids = {
+        let mounts = MOUNTS.lock();
+        mounts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, mount)| mount.as_ref().map(|_| MountId(index)))
+            .collect::<Vec<_>>()
+    };
+
+    for mount_id in mount_ids {
+        let _ = with_mount(mount_id, |backend| {
+            let root_ino = backend.root_ino();
+            backend.sync(root_ino, false)
+        });
+    }
+}
+
+pub(crate) fn shutdown_all_mounts() {
+    let mount_ids = {
+        let mounts = MOUNTS.lock();
+        mounts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, mount)| mount.as_ref().map(|_| MountId(index)))
+            .collect::<Vec<_>>()
+    };
+
+    for mount_id in mount_ids {
+        let _ = with_mount(mount_id, |backend| backend.shutdown());
+    }
 }

@@ -79,6 +79,10 @@ pub(crate) trait FileSystemBackend: Send {
     fn sync(&mut self, _ino: u32, _data_only: bool) -> FsResult {
         Ok(())
     }
+    fn shutdown(&mut self) -> FsResult {
+        let root_ino = self.root_ino();
+        self.sync(root_ino, false)
+    }
     fn set_times(
         &mut self,
         _ino: u32,

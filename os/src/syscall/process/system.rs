@@ -96,8 +96,11 @@ pub fn sys_reboot(magic: usize, magic2: usize, op: usize, _arg: usize) -> SysRes
             // UNFINISHED: RESTART should reset and reboot the machine. The
             // current arch layer exposes only a shutdown/poweroff primitive,
             // which is the contest-critical behavior under QEMU -no-reboot.
-            // CONTEXT: Linux leaves filesystem syncing to callers before
-            // reboot(2), so this path does not add an implicit sync.
+            // CONTEXT: This path terminates the VM immediately. Finalize
+            // mounted backends so lwext4 can mark superblocks clean after
+            // user space has issued sync(2); normal sync(2) remains a plain
+            // writeback operation while the filesystem is still mounted.
+            crate::fs::shutdown_all_mounts();
             shutdown(false)
         }
         // UNFINISHED: RESTART2, KEXEC, and SW_SUSPEND require reboot strings,

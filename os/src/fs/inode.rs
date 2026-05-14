@@ -1,8 +1,8 @@
 use super::mount::{mounted_root_for_any_path, with_mount};
 use super::path::{PathContext, WorkingDir};
 use super::vfs::{
-    FsError, FsNodeKind, FsResult, LookupMode, VfsNodeId, resolve_create_parent_in,
-    resolve_existing_in, resolve_mount_target_in,
+    FsError, FsNodeKind, FsResult, LookupMode, VfsCreateTarget, VfsNodeId,
+    resolve_create_parent_in, resolve_existing_in, resolve_mount_target_in,
 };
 use bitflags::*;
 use lwext4_rust::ffi::EXT4_ROOT_INO;
@@ -129,6 +129,37 @@ fn lookup_node(parent: VfsNodeId, leaf_name: &str) -> FsResult<(VfsNodeId, FsNod
     Ok((VfsNodeId::new(parent.mount_id, ino), kind))
 }
 
+fn lookup_create_target(
+    context: &PathContext,
+    target: &VfsCreateTarget<'_>,
+) -> FsResult<Option<(VfsNodeId, FsNodeKind, bool)>> {
+    if let Some(path) = target.synthetic_child(context) {
+        return Ok(Some((path.node, path.kind, true)));
+    }
+    match lookup_node(target.parent, target.leaf_name) {
+        Ok((node, kind)) => Ok(Some((node, kind, false))),
+        Err(FsError::NotFound) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn ensure_create_target_absent(
+    context: &PathContext,
+    target: &VfsCreateTarget<'_>,
+    trailing_slash: bool,
+) -> FsResult {
+    if let Some((_, kind, _)) = lookup_create_target(context, target)? {
+        if trailing_slash && kind != FsNodeKind::Directory {
+            return Err(FsError::NotDir);
+        }
+        return Err(FsError::AlreadyExists);
+    }
+    if trailing_slash {
+        return Err(FsError::NotFound);
+    }
+    Ok(())
+}
+
 // UNFINISHED: MAX_DEPTH is a defensive bound, not strict Linux semantics;
 // extremely deep but legitimate directory trees would be misreported as ELOOP.
 fn is_descendant_or_self(mut node: VfsNodeId, ancestor: VfsNodeId) -> FsResult<bool> {
@@ -176,13 +207,9 @@ pub(crate) fn mkdir_in(context: PathContext, name: &str, mode: u32) -> FsResult 
         Some("." | ".." | "/") => return Err(FsError::AlreadyExists),
         _ => {}
     }
-    let target = resolve_create_parent_in(context, trimmed_nonroot_path(name))?;
+    let target = resolve_create_parent_in(context.clone(), trimmed_nonroot_path(name))?;
+    ensure_create_target_absent(&context, &target, false)?;
     with_mount(target.parent.mount_id, |mount| {
-        match mount.lookup_component_from(target.parent.ino, target.leaf_name) {
-            Ok(_) => return Err(FsError::AlreadyExists),
-            Err(FsError::NotFound) => {}
-            Err(err) => return Err(err),
-        }
         mount.create_dir(target.parent.ino, target.leaf_name, mode)
     })
     .ok_or(FsError::Io)??;
@@ -204,22 +231,9 @@ pub(crate) fn create_node_in(
         _ => {}
     }
     let trailing_slash = has_trailing_slash(name);
-    let target = resolve_create_parent_in(context, trimmed_nonroot_path(name))?;
+    let target = resolve_create_parent_in(context.clone(), trimmed_nonroot_path(name))?;
+    ensure_create_target_absent(&context, &target, trailing_slash)?;
     with_mount(target.parent.mount_id, |mount| {
-        match mount.lookup_component_from(target.parent.ino, target.leaf_name) {
-            Ok((_, existing_kind)) => {
-                if trailing_slash && existing_kind != FsNodeKind::Directory {
-                    return Err(FsError::NotDir);
-                }
-                return Err(FsError::AlreadyExists);
-            }
-            Err(FsError::NotFound) => {
-                if trailing_slash {
-                    return Err(FsError::NotFound);
-                }
-            }
-            Err(err) => return Err(err),
-        }
         let parent_stat = mount.stat(target.parent.ino)?;
         let ino = mount.create_node(
             target.parent.ino,
@@ -264,28 +278,17 @@ pub(crate) fn link_file_in(
         return Err(FsError::CrossDevice);
     }
 
-    let (old_node, old_kind) = lookup_node(old_target.parent, old_target.leaf_name)?;
+    let Some((old_node, old_kind, _)) = lookup_create_target(&old_context, &old_target)? else {
+        return Err(FsError::NotFound);
+    };
     if old_has_trailing_slash && old_kind != FsNodeKind::Directory {
         return Err(FsError::NotDir);
     }
     if old_kind == FsNodeKind::Directory || old_node.ino == EXT4_ROOT_INO {
         return Err(FsError::PermissionDenied);
     }
+    ensure_create_target_absent(&new_context, &new_target, new_has_trailing_slash)?;
     with_mount(new_target.parent.mount_id, |mount| {
-        match mount.lookup_component_from(new_target.parent.ino, new_target.leaf_name) {
-            Ok((_, kind)) => {
-                if new_has_trailing_slash && kind != FsNodeKind::Directory {
-                    return Err(FsError::NotDir);
-                }
-                return Err(FsError::AlreadyExists);
-            }
-            Err(FsError::NotFound) => {
-                if new_has_trailing_slash {
-                    return Err(FsError::NotFound);
-                }
-            }
-            Err(err) => return Err(err),
-        }
         mount.link(new_target.parent.ino, new_target.leaf_name, old_node.ino)
     })
     .ok_or(FsError::Io)??;
@@ -308,25 +311,12 @@ pub(crate) fn link_node_in(
     }
 
     let new_has_trailing_slash = has_trailing_slash(new_name);
-    let new_target = resolve_create_parent_in(new_context, trimmed_nonroot_path(new_name))?;
+    let new_target = resolve_create_parent_in(new_context.clone(), trimmed_nonroot_path(new_name))?;
     if old_node.mount_id != new_target.parent.mount_id {
         return Err(FsError::CrossDevice);
     }
+    ensure_create_target_absent(&new_context, &new_target, new_has_trailing_slash)?;
     with_mount(new_target.parent.mount_id, |mount| {
-        match mount.lookup_component_from(new_target.parent.ino, new_target.leaf_name) {
-            Ok((_, kind)) => {
-                if new_has_trailing_slash && kind != FsNodeKind::Directory {
-                    return Err(FsError::NotDir);
-                }
-                return Err(FsError::AlreadyExists);
-            }
-            Err(FsError::NotFound) => {
-                if new_has_trailing_slash {
-                    return Err(FsError::NotFound);
-                }
-            }
-            Err(err) => return Err(err),
-        }
         mount.link(new_target.parent.ino, new_target.leaf_name, old_node.ino)
     })
     .ok_or(FsError::Io)??;
@@ -341,22 +331,9 @@ pub(crate) fn symlink_in(context: PathContext, target: &str, link_name: &str) ->
     }
 
     let link_has_trailing_slash = has_trailing_slash(link_name);
-    let create_target = resolve_create_parent_in(context, trimmed_nonroot_path(link_name))?;
+    let create_target = resolve_create_parent_in(context.clone(), trimmed_nonroot_path(link_name))?;
+    ensure_create_target_absent(&context, &create_target, link_has_trailing_slash)?;
     with_mount(create_target.parent.mount_id, |mount| {
-        match mount.lookup_component_from(create_target.parent.ino, create_target.leaf_name) {
-            Ok((_, kind)) => {
-                if link_has_trailing_slash && kind != FsNodeKind::Directory {
-                    return Err(FsError::NotDir);
-                }
-                return Err(FsError::AlreadyExists);
-            }
-            Err(FsError::NotFound) => {
-                if link_has_trailing_slash {
-                    return Err(FsError::NotFound);
-                }
-            }
-            Err(err) => return Err(err),
-        }
         mount.symlink(
             create_target.parent.ino,
             create_target.leaf_name,
@@ -385,7 +362,11 @@ pub(crate) fn rename_in(
         return Err(FsError::CrossDevice);
     }
 
-    let (old_node, old_kind) = lookup_node(old_target.parent, old_target.leaf_name)?;
+    let Some((old_node, old_kind, old_is_synthetic)) =
+        lookup_create_target(&old_context, &old_target)?
+    else {
+        return Err(FsError::NotFound);
+    };
     if old_has_trailing_slash && old_kind != FsNodeKind::Directory {
         return Err(FsError::NotDir);
     }
@@ -395,8 +376,8 @@ pub(crate) fn rename_in(
         return Err(FsError::Busy);
     }
 
-    match lookup_node(new_target.parent, new_target.leaf_name) {
-        Ok((new_node, new_kind)) => {
+    match lookup_create_target(&new_context, &new_target)? {
+        Some((new_node, new_kind, new_is_synthetic)) => {
             if new_has_trailing_slash && new_kind != FsNodeKind::Directory {
                 return Err(FsError::NotDir);
             }
@@ -406,7 +387,9 @@ pub(crate) fn rename_in(
             if old_node == new_node {
                 return Ok(());
             }
-            if mounted_root_for_any_path(new_context.namespace_id(), new_node).is_some() {
+            if new_is_synthetic
+                || mounted_root_for_any_path(new_context.namespace_id(), new_node).is_some()
+            {
                 return Err(FsError::Busy);
             }
             if old_kind == FsNodeKind::Directory && new_kind != FsNodeKind::Directory {
@@ -416,14 +399,16 @@ pub(crate) fn rename_in(
                 return Err(FsError::IsDir);
             }
         }
-        Err(FsError::NotFound) => {
+        None => {
             if new_has_trailing_slash {
                 return Err(FsError::NotFound);
             }
         }
-        Err(err) => return Err(err),
     }
 
+    if old_is_synthetic {
+        return Err(FsError::Busy);
+    }
     if old_kind == FsNodeKind::Directory && is_descendant_or_self(new_target.parent, old_node)? {
         return Err(FsError::InvalidInput);
     }
@@ -447,14 +432,19 @@ pub(crate) fn unlink_file_in(context: PathContext, name: &str) -> FsResult {
         _ => {}
     }
     let target = resolve_create_parent_in(context.clone(), trimmed_nonroot_path(name))?;
+    let Some((_, kind, is_synthetic)) = lookup_create_target(&context, &target)? else {
+        return Err(FsError::NotFound);
+    };
+    if trailing_slash && kind != FsNodeKind::Directory {
+        return Err(FsError::NotDir);
+    }
+    if kind == FsNodeKind::Directory {
+        return Err(FsError::IsDir);
+    }
+    if is_synthetic {
+        return Err(FsError::Busy);
+    }
     with_mount(target.parent.mount_id, |mount| {
-        let (_, kind) = mount.lookup_component_from(target.parent.ino, target.leaf_name)?;
-        if trailing_slash && kind != FsNodeKind::Directory {
-            return Err(FsError::NotDir);
-        }
-        if kind == FsNodeKind::Directory {
-            return Err(FsError::IsDir);
-        }
         mount.unlink(target.parent.ino, target.leaf_name)
     })
     .ok_or(FsError::Io)??;
@@ -470,17 +460,19 @@ pub(crate) fn rmdir_in(context: PathContext, name: &str) -> FsResult {
     }
 
     let target = resolve_create_parent_in(context.clone(), trimmed_nonroot_path(name))?;
+    let Some((node, kind, is_synthetic)) = lookup_create_target(&context, &target)? else {
+        return Err(FsError::NotFound);
+    };
+    if kind != FsNodeKind::Directory {
+        return Err(FsError::NotDir);
+    }
+    if is_synthetic
+        || mounted_root_for_any_path(context.namespace_id(), node).is_some()
+        || node.ino == lwext4_rust::ffi::EXT4_ROOT_INO
+    {
+        return Err(FsError::Busy);
+    }
     with_mount(target.parent.mount_id, |mount| {
-        let (ino, kind) = mount.lookup_component_from(target.parent.ino, target.leaf_name)?;
-        if kind != FsNodeKind::Directory {
-            return Err(FsError::NotDir);
-        }
-        let node = VfsNodeId::new(target.parent.mount_id, ino);
-        if mounted_root_for_any_path(context.namespace_id(), node).is_some()
-            || ino == lwext4_rust::ffi::EXT4_ROOT_INO
-        {
-            return Err(FsError::Busy);
-        }
         mount.unlink(target.parent.ino, target.leaf_name)
     })
     .ok_or(FsError::Io)??;

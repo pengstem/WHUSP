@@ -16,7 +16,8 @@ mod uapi;
 pub use epoll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait, sys_epoll_pwait2};
 pub use eventfd::sys_eventfd2;
 pub(crate) use fanotify::{
-    fanotify_evict_evictable_marks, fanotify_fdinfo, fanotify_notify_open_exec_at,
+    fanotify_evict_evictable_marks, fanotify_fdinfo, fanotify_max_queued_events,
+    fanotify_notify_open_exec_at,
 };
 pub use fanotify::{sys_fanotify_init, sys_fanotify_mark};
 pub(crate) use fd::{close_detached_fd_entry, get_file_by_fd, install_file_fd};
@@ -32,7 +33,7 @@ pub use file_handle::sys_name_to_handle_at;
 pub use io::{
     sys_copy_file_range, sys_fadvise64, sys_fallocate, sys_fsync, sys_ftruncate, sys_lseek,
     sys_pread64, sys_preadv, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read, sys_readahead,
-    sys_readv, sys_splice, sys_syncfs, sys_write, sys_writev,
+    sys_readv, sys_splice, sys_sync, sys_syncfs, sys_write, sys_writev,
 };
 pub use mount::{
     sys_fsconfig, sys_fsmount, sys_fsopen, sys_fspick, sys_mount, sys_move_mount, sys_open_tree,

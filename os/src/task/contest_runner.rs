@@ -44,7 +44,7 @@ const TEST_SCRIPTS: &[&str] = &[
 /// runs cases whose names start with the prefix, and
 /// Some("range:<start>,<end>") runs cases in the lexicographic half-open range
 /// [start, end). Empty range bounds are unbounded.
-const LTP_CASE_FILTER_OPTION: Option<&str> = None;
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some("case:fanotify01");
 
 enum LtpCaseFilter {
     Whitelist,
@@ -85,7 +85,7 @@ pub(super) fn build_runner_command() -> String {
             append_script_command(&mut command, libc_root, script);
         }
     }
-    command.push_str("; cd /musl && ./busybox reboot -f");
+    command.push_str("; cd /musl && ./busybox sync; ./busybox reboot -f");
     command
 }
 

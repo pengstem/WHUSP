@@ -36,6 +36,8 @@ const FAN_MOVED_FROM: u64 = 0x0000_0040;
 const FAN_MOVED_TO: u64 = 0x0000_0080;
 const FAN_CREATE: u64 = 0x0000_0100;
 const FAN_DELETE: u64 = 0x0000_0200;
+const FAN_DELETE_SELF: u64 = 0x0000_0400;
+const FAN_MOVE_SELF: u64 = 0x0000_0800;
 const FAN_OPEN_EXEC: u64 = 0x0000_1000;
 const FAN_Q_OVERFLOW: u64 = 0x0000_4000;
 const FAN_OPEN_PERM: u64 = 0x0001_0000;
@@ -82,7 +84,10 @@ const FAN_EVENT_INFO_TYPE_DFID: u8 = 3;
 const FANOTIFY_FID_INFO_BASE_LEN: usize = 20;
 const FAN_NOFD: i32 = -1;
 const FAN_NOPIDFD: i32 = -1;
-const MAX_QUEUED_EVENTS: usize = 16_384;
+// CONTEXT: This limit is exported through /proc/sys/fs/fanotify/max_queued_events.
+// Keeping it modest avoids making fanotify queue overflow tests depend on
+// quadratic directory lookup behavior in the current scratch filesystem.
+const MAX_QUEUED_EVENTS: usize = 1_024;
 const MAX_USER_GROUPS: usize = 129;
 
 const FAN_CLASS_MASK: u32 = FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT;
@@ -96,11 +101,9 @@ const SUPPORTED_INIT_FLAGS: u32 = FAN_CLOEXEC
     | FAN_REPORT_TID
     | FAN_REPORT_FID
     | FAN_REPORT_DIR_FID
-    | FAN_REPORT_NAME
-    | FAN_REPORT_TARGET_FID;
-const FILE_HANDLE_REPORT_FLAGS: u32 =
-    FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME | FAN_REPORT_TARGET_FID;
-const UNSUPPORTED_REPORT_FLAGS: u32 = FAN_REPORT_FD_ERROR | FAN_REPORT_MNT;
+    | FAN_REPORT_NAME;
+const FILE_HANDLE_REPORT_FLAGS: u32 = FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME;
+const UNSUPPORTED_REPORT_FLAGS: u32 = FAN_REPORT_FD_ERROR | FAN_REPORT_MNT | FAN_REPORT_TARGET_FID;
 const KNOWN_MARK_FLAGS: u32 = FAN_MARK_ADD
     | FAN_MARK_REMOVE
     | FAN_MARK_DONT_FOLLOW
@@ -118,11 +121,18 @@ const SUPPORTED_MARK_EVENTS: u64 = FAN_ACCESS
     | FAN_CLOSE_WRITE
     | FAN_CLOSE_NOWRITE
     | FAN_OPEN
+    | FAN_MOVED_FROM
+    | FAN_MOVED_TO
+    | FAN_CREATE
+    | FAN_DELETE
+    | FAN_DELETE_SELF
+    | FAN_MOVE_SELF
     | FAN_OPEN_EXEC;
 const SUPPORTED_MARK_MASK: u64 = SUPPORTED_MARK_EVENTS | FAN_EVENT_ON_CHILD | FAN_ONDIR;
-const SUPPORTED_DIRENT_MARK_EVENTS: u64 =
-    FAN_MOVED_FROM | FAN_MOVED_TO | FAN_CREATE | FAN_DELETE | FAN_RENAME;
-const KNOWN_MARK_MASK: u64 = SUPPORTED_MARK_MASK | SUPPORTED_DIRENT_MARK_EVENTS;
+const SUPPORTED_DIRENT_MARK_EVENTS: u64 = FAN_MOVED_FROM | FAN_MOVED_TO | FAN_CREATE | FAN_DELETE;
+const SUPPORTED_SELF_MARK_EVENTS: u64 = FAN_DELETE_SELF | FAN_MOVE_SELF;
+const KNOWN_MARK_MASK: u64 =
+    SUPPORTED_MARK_MASK | SUPPORTED_DIRENT_MARK_EVENTS | SUPPORTED_SELF_MARK_EVENTS;
 const UNSUPPORTED_PERMISSION_EVENTS: u64 = FAN_OPEN_PERM | FAN_ACCESS_PERM | FAN_OPEN_EXEC_PERM;
 
 lazy_static! {
@@ -212,6 +222,7 @@ struct FanotifyEvent {
     mask: u64,
     pid: i32,
     fid_node: Option<VfsNodeId>,
+    child_fid_node: Option<VfsNodeId>,
     source: Option<Arc<dyn File + Send + Sync>>,
     name: Option<String>,
 }
@@ -357,15 +368,41 @@ impl FanotifyGroup {
         mask: u64,
         pid: i32,
         fid_node: Option<VfsNodeId>,
+        child_fid_node: Option<VfsNodeId>,
         source: Option<Arc<dyn File + Send + Sync>>,
         name: Option<&str>,
     ) -> bool {
-        if let Some(existing) = inner.events.iter_mut().find(|event| {
-            event.mask != FAN_Q_OVERFLOW
-                && event.pid == pid
-                && event.fid_node == fid_node
-                && event.name.as_deref() == name
-        }) {
+        // CONTEXT: fanotify readers must tolerate that events may or may not be
+        // merged. Keep ordinary coalescing O(1), but let close events merge
+        // with a pending open event for the same object because LTP fanotify13
+        // expects FAN_OPEN | FAN_CLOSE_NOWRITE in one record.
+        let merge_past_tail = mask
+            & (FAN_CLOSE_WRITE
+                | FAN_CLOSE_NOWRITE
+                | FAN_MOVED_FROM
+                | FAN_MOVED_TO
+                | FAN_CREATE
+                | FAN_DELETE)
+            != 0
+            || name.is_none();
+        let existing = if merge_past_tail {
+            inner.events.iter_mut().rev().find(|event| {
+                event.mask != FAN_Q_OVERFLOW
+                    && event.pid == pid
+                    && event.fid_node == fid_node
+                    && event.child_fid_node == child_fid_node
+                    && event.name.as_deref() == name
+            })
+        } else {
+            inner.events.back_mut().filter(|event| {
+                event.mask != FAN_Q_OVERFLOW
+                    && event.pid == pid
+                    && event.fid_node == fid_node
+                    && event.child_fid_node == child_fid_node
+                    && event.name.as_deref() == name
+            })
+        };
+        if let Some(existing) = existing {
             existing.mask |= mask;
             if existing.source.is_none() {
                 existing.source = source;
@@ -378,6 +415,7 @@ impl FanotifyGroup {
                     mask: FAN_Q_OVERFLOW,
                     pid: 0,
                     fid_node: None,
+                    child_fid_node: None,
                     source: None,
                     name: None,
                 });
@@ -390,6 +428,7 @@ impl FanotifyGroup {
             mask,
             pid,
             fid_node,
+            child_fid_node,
             source,
             name: name.map(String::from),
         });
@@ -405,14 +444,16 @@ impl FanotifyGroup {
         is_dir: bool,
         event_path: Option<&str>,
         event_name: Option<&str>,
-        source: &Arc<dyn File + Send + Sync>,
+        report_node: Option<VfsNodeId>,
+        child_fid_node: Option<VfsNodeId>,
+        source: Option<&Arc<dyn File + Send + Sync>>,
     ) {
         let read_waiters = self.inner.exclusive_session(|inner| {
             let mut emitted = 0u64;
             let mut ignored = 0u64;
             let real_node = overlay_real_node(node);
             let real_parent = parent.and_then(overlay_real_node);
-            let mut report_node = node;
+            let mut report_node = report_node.unwrap_or(node);
             let report_ondir = self.init_flags & FILE_HANDLE_REPORT_FLAGS != 0;
             for mark in inner.marks.iter_mut() {
                 let mut mark_emitted = Self::event_bits_for_mark(
@@ -489,6 +530,14 @@ impl FanotifyGroup {
             }
             emitted &= !ignored;
             if emitted != 0 {
+                let report_node = if self.init_flags & FAN_REPORT_DIR_FID != 0
+                    && !is_dir
+                    && child_fid_node.is_some()
+                {
+                    parent.unwrap_or(report_node)
+                } else {
+                    report_node
+                };
                 let current_pid = current_process().getpid() as i32;
                 let pid = if self.unprivileged && current_pid != self.owner_pid {
                     0
@@ -504,8 +553,13 @@ impl FanotifyGroup {
                     emitted,
                     pid,
                     Some(report_node),
-                    Some(Arc::clone(source)),
-                    event_name,
+                    child_fid_node,
+                    source.cloned(),
+                    if self.init_flags & FAN_REPORT_NAME != 0 {
+                        event_name
+                    } else {
+                        None
+                    },
                 ) {
                     core::mem::take(&mut inner.read_waiters)
                 } else {
@@ -523,6 +577,25 @@ impl FanotifyGroup {
     fn has_events(&self) -> bool {
         self.inner
             .exclusive_session(|inner| !inner.events.is_empty())
+    }
+
+    fn event_record_len(&self, event: &FanotifyEvent) -> usize {
+        FANOTIFY_METADATA_LEN
+            + if self.init_flags & FAN_REPORT_PIDFD != 0 {
+                FANOTIFY_PIDFD_INFO_LEN
+            } else {
+                0
+            }
+            + if self.init_flags & FILE_HANDLE_REPORT_FLAGS != 0 {
+                report_fid_info_len(
+                    self.init_flags,
+                    event.fid_node,
+                    event.child_fid_node,
+                    event.name.as_deref(),
+                )
+            } else {
+                0
+            }
     }
 
     fn read_events(&self, mut user_buf: UserBuffer, nonblocking: bool) -> usize {
@@ -548,30 +621,20 @@ impl FanotifyGroup {
 
         let mut data = Vec::new();
         loop {
-            let Some(event) = self
-                .inner
-                .exclusive_session(|inner| inner.events.pop_front())
-            else {
-                break;
-            };
-            let record_len = FANOTIFY_METADATA_LEN
-                + if self.init_flags & FAN_REPORT_PIDFD != 0 {
-                    FANOTIFY_PIDFD_INFO_LEN
-                } else {
-                    0
+            let Some((event, record_len)) = self.inner.exclusive_session(|inner| {
+                let event = inner.events.front()?;
+                let record_len = self.event_record_len(event);
+                if capacity.saturating_sub(data.len()) < record_len {
+                    return None;
                 }
-                + if self.init_flags & FILE_HANDLE_REPORT_FLAGS != 0 {
-                    report_fid_info_len(self.init_flags, event.fid_node, event.name.as_deref())
-                } else {
-                    0
-                };
-            if capacity.saturating_sub(data.len()) < record_len {
+                let event = inner.events.pop_front()?;
+                if event.mask == FAN_Q_OVERFLOW {
+                    inner.overflow_queued = false;
+                }
+                Some((event, record_len))
+            }) else {
                 break;
             };
-            if event.mask == FAN_Q_OVERFLOW {
-                self.inner
-                    .exclusive_session(|inner| inner.overflow_queued = false);
-            }
             let fd = if self.init_flags & FILE_HANDLE_REPORT_FLAGS != 0 {
                 FAN_NOFD
             } else {
@@ -597,6 +660,7 @@ impl FanotifyGroup {
                     &mut data,
                     self.init_flags,
                     event.fid_node,
+                    event.child_fid_node,
                     event.name.as_deref(),
                 );
             }
@@ -624,7 +688,12 @@ fn align_to_eight(value: usize) -> usize {
     (value + 7) & !7
 }
 
-fn report_fid_info_len(init_flags: u32, fid_node: Option<VfsNodeId>, name: Option<&str>) -> usize {
+fn report_fid_info_len(
+    init_flags: u32,
+    fid_node: Option<VfsNodeId>,
+    child_fid_node: Option<VfsNodeId>,
+    name: Option<&str>,
+) -> usize {
     if fid_node.is_none() {
         return 0;
     }
@@ -633,13 +702,20 @@ fn report_fid_info_len(init_flags: u32, fid_node: Option<VfsNodeId>, name: Optio
     } else {
         0
     };
-    align_to_eight(FANOTIFY_FID_INFO_BASE_LEN + WHUSP_FILE_HANDLE_BYTES + name_len)
+    let mut len = align_to_eight(FANOTIFY_FID_INFO_BASE_LEN + WHUSP_FILE_HANDLE_BYTES + name_len);
+    if init_flags & (FAN_REPORT_FID | FAN_REPORT_DIR_FID) == (FAN_REPORT_FID | FAN_REPORT_DIR_FID)
+        && child_fid_node.is_some()
+    {
+        len += align_to_eight(FANOTIFY_FID_INFO_BASE_LEN + WHUSP_FILE_HANDLE_BYTES);
+    }
+    len
 }
 
 fn append_report_fid_info(
     data: &mut Vec<u8>,
     init_flags: u32,
     fid_node: Option<VfsNodeId>,
+    child_fid_node: Option<VfsNodeId>,
     name: Option<&str>,
 ) {
     let Some(fid_node) = fid_node else {
@@ -671,6 +747,27 @@ fn append_report_fid_info(
         let name_offset = FANOTIFY_FID_INFO_BASE_LEN + WHUSP_FILE_HANDLE_BYTES;
         info[name_offset..name_offset + name.len()].copy_from_slice(name.as_bytes());
     }
+    data.extend_from_slice(&info);
+
+    if init_flags & (FAN_REPORT_FID | FAN_REPORT_DIR_FID) != (FAN_REPORT_FID | FAN_REPORT_DIR_FID) {
+        return;
+    }
+    let Some(child_fid_node) = child_fid_node else {
+        return;
+    };
+    let len = align_to_eight(FANOTIFY_FID_INFO_BASE_LEN + WHUSP_FILE_HANDLE_BYTES);
+    let mut info = Vec::new();
+    info.resize(len, 0);
+    info[0] = FAN_EVENT_INFO_TYPE_FID;
+    info[1] = 0;
+    info[2..4].copy_from_slice(&(len as u16).to_ne_bytes());
+    let fsid = file_handle_fsid(child_fid_node);
+    info[4..8].copy_from_slice(&fsid[0].to_ne_bytes());
+    info[8..12].copy_from_slice(&fsid[1].to_ne_bytes());
+    write_file_handle_record(
+        &mut info[12..12 + WHUSP_FILE_HANDLE_RECORD_LEN],
+        child_fid_node,
+    );
     data.extend_from_slice(&info);
 }
 
@@ -856,10 +953,12 @@ fn validate_mark_args(group: &FanotifyGroup, flags: u32, mask: u64) -> Result<()
         if mask == 0 || mask & UNSUPPORTED_PERMISSION_EVENTS != 0 || mask & !KNOWN_MARK_MASK != 0 {
             return Err(SysError::EINVAL);
         }
-        if mask & SUPPORTED_DIRENT_MARK_EVENTS != 0 {
+        if mask & (SUPPORTED_DIRENT_MARK_EVENTS | SUPPORTED_SELF_MARK_EVENTS) != 0 {
             if group.init_flags & (FAN_REPORT_FID | FAN_REPORT_DIR_FID) == 0 {
                 return Err(SysError::EINVAL);
             }
+        }
+        if mask & SUPPORTED_DIRENT_MARK_EVENTS != 0 {
             if flags & FAN_MARK_MOUNT != 0 {
                 return Err(SysError::EINVAL);
             }
@@ -947,7 +1046,7 @@ pub fn sys_fanotify_mark(
     validate_mark_args(&group, flags, mask)?;
 
     if flags & FAN_MARK_FLUSH != 0 {
-        if flags != FAN_MARK_FLUSH {
+        if flags & !(FAN_MARK_FLUSH | FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM) != 0 {
             return Err(SysError::EINVAL);
         }
         group.flush();
@@ -1015,7 +1114,83 @@ fn fanotify_notify_file_at(
                 is_dir,
                 event_path,
                 event_name.as_deref(),
-                file,
+                None,
+                Some(node),
+                Some(file),
+            );
+        }
+    });
+}
+
+fn fanotify_notify_dirent_event(
+    file: &Arc<dyn File + Send + Sync>,
+    event_mask: u64,
+    event_path: &str,
+) {
+    let Some(child_node) = file.vfs_node_id() else {
+        return;
+    };
+    let Some(parent_node) = file.vfs_parent_node_id() else {
+        return;
+    };
+    let Some(mount) = file.vfs_mount_id() else {
+        return;
+    };
+    let is_dir = file.working_dir().is_some();
+    remember_node_name(child_node, event_path);
+    let event_name = path_basename(event_path).map(String::from);
+
+    FANOTIFY_GROUPS.exclusive_session(|groups| {
+        groups.retain(|weak| weak.strong_count() > 0);
+        let live_groups: Vec<_> = groups.iter().filter_map(Weak::upgrade).collect();
+        for group in live_groups {
+            group.publish(
+                parent_node,
+                None,
+                mount,
+                event_mask,
+                is_dir,
+                Some(event_path),
+                event_name.as_deref(),
+                Some(parent_node),
+                Some(child_node),
+                None,
+            );
+        }
+    });
+}
+
+fn fanotify_notify_self_event(
+    file: &Arc<dyn File + Send + Sync>,
+    event_mask: u64,
+    event_path: &str,
+) {
+    let Some(node) = file.vfs_node_id() else {
+        return;
+    };
+    let Some(mount) = file.vfs_mount_id() else {
+        return;
+    };
+    let parent = file.vfs_parent_node_id();
+    let is_dir = file.working_dir().is_some();
+    remember_node_name(node, event_path);
+    let event_name = is_dir.then_some(".");
+
+    FANOTIFY_GROUPS.exclusive_session(|groups| {
+        groups.retain(|weak| weak.strong_count() > 0);
+        let live_groups: Vec<_> = groups.iter().filter_map(Weak::upgrade).collect();
+        for group in live_groups {
+            group.publish(
+                node,
+                parent,
+                mount,
+                event_mask,
+                is_dir,
+                Some(event_path),
+                event_name,
+                Some(node),
+                None,
+                None,
             );
         }
     });
@@ -1072,6 +1247,10 @@ pub(crate) fn fanotify_fdinfo(file: &Arc<dyn File + Send + Sync>) -> Option<Stri
     Some(output)
 }
 
+pub(crate) fn fanotify_max_queued_events() -> usize {
+    MAX_QUEUED_EVENTS
+}
+
 pub(crate) fn fanotify_evict_evictable_marks() {
     FANOTIFY_GROUPS.exclusive_session(|groups| {
         groups.retain(|weak| weak.strong_count() > 0);
@@ -1120,4 +1299,24 @@ pub(super) fn fanotify_notify_close(file: &Arc<dyn File + Send + Sync>, writable
     } else {
         fanotify_notify_file(file, FAN_CLOSE_NOWRITE);
     }
+}
+
+pub(super) fn fanotify_notify_create(file: &Arc<dyn File + Send + Sync>, path: &str) {
+    fanotify_notify_dirent_event(file, FAN_CREATE, path);
+}
+
+pub(super) fn fanotify_notify_delete(file: &Arc<dyn File + Send + Sync>, path: &str) {
+    fanotify_notify_dirent_event(file, FAN_DELETE, path);
+    fanotify_notify_self_event(file, FAN_DELETE_SELF, path);
+}
+
+pub(super) fn fanotify_notify_move(
+    old_file: &Arc<dyn File + Send + Sync>,
+    old_path: &str,
+    new_file: &Arc<dyn File + Send + Sync>,
+    new_path: &str,
+) {
+    fanotify_notify_dirent_event(old_file, FAN_MOVED_FROM, old_path);
+    fanotify_notify_dirent_event(new_file, FAN_MOVED_TO, new_path);
+    fanotify_notify_self_event(new_file, FAN_MOVE_SELF, new_path);
 }

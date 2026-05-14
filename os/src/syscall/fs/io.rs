@@ -575,6 +575,11 @@ pub fn sys_fsync(fd: usize) -> SysResult {
     Ok(0)
 }
 
+pub fn sys_sync() -> SysResult {
+    crate::fs::sync_all_mounts();
+    Ok(0)
+}
+
 pub fn sys_syncfs(fd: usize) -> SysResult {
     let file = get_file_by_fd(fd)?;
     // CONTEXT: The current in-kernel filesystems are synchronous enough for

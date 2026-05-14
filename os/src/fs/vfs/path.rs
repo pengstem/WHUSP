@@ -1,5 +1,6 @@
 use super::super::mount::{
-    mounted_root_for, mounted_root_parent, primary_mount_id, root_ino_for, with_mount,
+    mounted_root_for, mounted_root_for_synthetic_child, mounted_root_parent, primary_mount_id,
+    root_ino_for, with_mount,
 };
 use super::super::path::{PathContext, WorkingDir};
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId};
@@ -11,15 +12,17 @@ const EXT4_NAME_MAX: usize = 255;
 const SYMLINK_TARGET_MAX: usize = 4096;
 const MAX_SYMLINK_FOLLOWS: usize = 40; // Linux returns ELOOP after 40 symlink resolutions.
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VfsPath {
     pub(crate) node: VfsNodeId,
     pub(crate) kind: FsNodeKind,
+    pub(crate) visible_path: Option<String>,
 }
 
 pub(crate) struct VfsCreateTarget<'a> {
     pub(crate) parent: VfsNodeId,
     pub(crate) leaf_name: &'a str,
+    pub(crate) leaf_path: String,
 }
 
 pub(crate) enum VfsOpenTarget<'a> {
@@ -53,12 +56,39 @@ struct VfsCursor {
 
 impl VfsPath {
     pub(crate) fn new(node: VfsNodeId, kind: FsNodeKind) -> Self {
-        Self { node, kind }
+        Self {
+            node,
+            kind,
+            visible_path: None,
+        }
+    }
+
+    pub(crate) fn with_visible_path(
+        node: VfsNodeId,
+        kind: FsNodeKind,
+        visible_path: String,
+    ) -> Self {
+        Self {
+            node,
+            kind,
+            visible_path: Some(visible_path),
+        }
     }
 
     pub(crate) fn working_dir(self) -> Option<WorkingDir> {
         (self.kind == FsNodeKind::Directory)
             .then_some(WorkingDir::new(self.node.mount_id, self.node.ino))
+    }
+}
+
+impl VfsCreateTarget<'_> {
+    pub(crate) fn synthetic_child(&self, context: &PathContext) -> Option<VfsPath> {
+        mounted_root_for_synthetic_child(
+            context.namespace_id(),
+            self.parent,
+            self.leaf_path.as_str(),
+        )
+        .map(|node| VfsPath::with_visible_path(node, FsNodeKind::Directory, self.leaf_path.clone()))
     }
 }
 
@@ -82,7 +112,7 @@ impl VfsCursor {
     }
 
     fn as_path(self) -> VfsPath {
-        VfsPath::new(self.node, self.kind)
+        VfsPath::with_visible_path(self.node, self.kind, self.path)
     }
 
     fn is_mount_root(&self) -> bool {
@@ -123,12 +153,31 @@ fn parent_visible_path(path: &str) -> String {
     }
 }
 
-fn lookup_child_raw(cursor: VfsCursor, component: &str) -> FsResult<VfsCursor> {
+fn lookup_child_raw(
+    context: &PathContext,
+    cursor: VfsCursor,
+    component: &str,
+) -> FsResult<VfsCursor> {
     if cursor.kind != FsNodeKind::Directory {
         return Err(FsError::NotDir);
     }
     if component.len() > EXT4_NAME_MAX {
         return Err(FsError::NameTooLong);
+    }
+
+    let child_path = join_visible_path(cursor.path.as_str(), component);
+    if component != ".."
+        && let Some(node) = mounted_root_for_synthetic_child(
+            context.namespace_id(),
+            cursor.node,
+            child_path.as_str(),
+        )
+    {
+        return Ok(VfsCursor {
+            node,
+            kind: FsNodeKind::Directory,
+            path: child_path,
+        });
     }
 
     let (ino, kind) = with_mount(cursor.node.mount_id, |mount| {
@@ -138,7 +187,7 @@ fn lookup_child_raw(cursor: VfsCursor, component: &str) -> FsResult<VfsCursor> {
     Ok(VfsCursor {
         node: VfsNodeId::new(cursor.node.mount_id, ino),
         kind,
-        path: join_visible_path(cursor.path.as_str(), component),
+        path: child_path,
     })
 }
 
@@ -162,7 +211,7 @@ fn lookup_parent(context: &PathContext, cursor: VfsCursor) -> FsResult<VfsCursor
         // back to `/` for that orphaned case.
         return Ok(VfsCursor::root(context));
     }
-    lookup_child_raw(cursor, "..")
+    lookup_child_raw(context, cursor, "..")
 }
 
 fn lookup_parent_in_context(cursor: VfsCursor, context: &PathContext) -> FsResult<VfsCursor> {
@@ -220,7 +269,7 @@ fn resolve_path_inner(context: PathContext, path: &str, mode: LookupMode) -> FsR
             cursor = lookup_parent_in_context(cursor, &context)?;
         } else {
             let parent = cursor.clone();
-            cursor = lookup_child_raw(cursor, component)?;
+            cursor = lookup_child_raw(&context, cursor, component)?;
             if cursor.kind == FsNodeKind::Symlink && (!is_final || mode.follow_final_symlink()) {
                 if symlink_follows == MAX_SYMLINK_FOLLOWS {
                     return Err(FsError::Loop);
@@ -300,9 +349,9 @@ pub(crate) fn resolve_create_parent_in(
     let parent_path = parent_path_for_lookup(path, parent_path);
     let parent = if parent_path.is_empty() {
         let cursor = start_cursor(&context, path);
-        follow_mounted_root(&context, cursor).as_path()
+        follow_mounted_root(&context, cursor)
     } else {
-        resolve_existing_in(context, parent_path, LookupMode::FollowFinal)?
+        resolve_path_inner(context.clone(), parent_path, LookupMode::FollowFinal)?
     };
     if parent.kind != FsNodeKind::Directory {
         return Err(FsError::NotDir);
@@ -310,6 +359,7 @@ pub(crate) fn resolve_create_parent_in(
     Ok(VfsCreateTarget {
         parent: parent.node,
         leaf_name,
+        leaf_path: join_visible_path(parent.path.as_str(), leaf_name),
     })
 }
 

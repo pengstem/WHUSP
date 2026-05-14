@@ -50,6 +50,7 @@ const SYSCALL_SPLICE: usize = 76;
 const SYSCALL_READLINKAT: usize = 78;
 const SYSCALL_NEWFSTATAT: usize = 79;
 const SYSCALL_FSTAT: usize = 80;
+const SYSCALL_SYNC: usize = 81;
 const SYSCALL_FSYNC: usize = 82;
 const SYSCALL_TIMERFD_CREATE: usize = 85;
 const SYSCALL_UTIMENSAT: usize = 88;
@@ -225,8 +226,9 @@ use uapi::LinuxTimeSpec;
 use wait::*;
 
 pub(crate) use fs::{
-    close_detached_fd_entry, fanotify_evict_evictable_marks, fanotify_fdinfo, install_file_fd,
-    release_flock_locks_for_closed_fd_table, release_record_locks_for_process,
+    close_detached_fd_entry, fanotify_evict_evictable_marks, fanotify_fdinfo,
+    fanotify_max_queued_events, install_file_fd, release_flock_locks_for_closed_fd_table,
+    release_record_locks_for_process,
 };
 pub(crate) use process::pidfd_fdinfo;
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
@@ -505,6 +507,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as i32,
         ),
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut LinuxKstat),
+        SYSCALL_SYNC => sys_sync(),
         SYSCALL_FSYNC => sys_fsync(args[0]),
         SYSCALL_SYNCFS => sys_syncfs(args[0]),
         SYSCALL_TIMERFD_CREATE => sys_timerfd_create(args[0] as i32, args[1] as u32),

@@ -7,7 +7,9 @@ use crate::config::PAGE_SIZE;
 use crate::mm::frame_stats;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::keyring;
-use crate::syscall::{fanotify_evict_evictable_marks, fanotify_fdinfo, pidfd_fdinfo};
+use crate::syscall::{
+    fanotify_evict_evictable_marks, fanotify_fdinfo, fanotify_max_queued_events, pidfd_fdinfo,
+};
 use crate::task::{
     ProcessProcSnapshot, TaskControlBlock, TaskStatus, list_process_snapshots, pid2process,
 };
@@ -49,6 +51,8 @@ const KEYS_MAXBYTES_INO: u32 = 27;
 const SYS_VM_DIR_INO: u32 = 28;
 const DROP_CACHES_INO: u32 = 29;
 const VFS_CACHE_PRESSURE_INO: u32 = 31;
+const SYS_FS_FANOTIFY_DIR_INO: u32 = 32;
+const FANOTIFY_MAX_QUEUED_EVENTS_INO: u32 = 33;
 const PID_DIR_BASE: u32 = 100;
 const PID_FILE_BASE: u32 = 10_000;
 const PID_FILE_STRIDE: u32 = 16;
@@ -125,6 +129,7 @@ enum ProcNode {
     SysKernelDir,
     SysKernelKeysDir,
     SysFsDir,
+    SysFsFanotifyDir,
     SysNetDir,
     SysNetIpv4Dir,
     SysNetIpv4ConfDir,
@@ -142,6 +147,7 @@ enum ProcNode {
     KeysMaxbytes,
     DropCaches,
     VfsCachePressure,
+    FanotifyMaxQueuedEvents,
     Domainname,
     Tainted,
     PidDir(usize),
@@ -271,6 +277,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         SYS_KERNEL_KEYS_DIR_INO => Some(ProcNode::SysKernelKeysDir),
         PID_MAX_INO => Some(ProcNode::PidMax),
         SYS_FS_DIR_INO => Some(ProcNode::SysFsDir),
+        SYS_FS_FANOTIFY_DIR_INO => Some(ProcNode::SysFsFanotifyDir),
         PIPE_MAX_SIZE_INO => Some(ProcNode::PipeMaxSize),
         PIPE_USER_PAGES_SOFT_INO => Some(ProcNode::PipeUserPagesSoft),
         DOMAINNAME_INO => Some(ProcNode::Domainname),
@@ -289,6 +296,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         KEYS_MAXBYTES_INO => Some(ProcNode::KeysMaxbytes),
         DROP_CACHES_INO => Some(ProcNode::DropCaches),
         VFS_CACHE_PRESSURE_INO => Some(ProcNode::VfsCachePressure),
+        FANOTIFY_MAX_QUEUED_EVENTS_INO => Some(ProcNode::FanotifyMaxQueuedEvents),
         ino if ino >= PID_FDINFO_ENTRY_BASE => {
             let rel = ino - PID_FDINFO_ENTRY_BASE;
             let pid = (rel / PID_FD_ENTRY_STRIDE) as usize;
@@ -351,6 +359,7 @@ fn node_kind(node: ProcNode) -> FsNodeKind {
         | ProcNode::SysKernelDir
         | ProcNode::SysKernelKeysDir
         | ProcNode::SysFsDir
+        | ProcNode::SysFsFanotifyDir
         | ProcNode::SysNetDir
         | ProcNode::SysNetIpv4Dir
         | ProcNode::SysNetIpv4ConfDir
@@ -595,6 +604,31 @@ fn sys_fs_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: LEASE_BREAK_TIME_INO,
         name: "lease-break-time".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_FS_FANOTIFY_DIR_INO,
+        name: "fanotify".into(),
+        dtype: DT_DIR,
+    });
+    entries
+}
+
+fn sys_fs_fanotify_entries() -> Vec<RawDirEntry> {
+    let mut entries = Vec::new();
+    entries.push(RawDirEntry {
+        ino: SYS_FS_FANOTIFY_DIR_INO,
+        name: ".".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_FS_DIR_INO,
+        name: "..".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: FANOTIFY_MAX_QUEUED_EVENTS_INO,
+        name: "max_queued_events".into(),
         dtype: DT_REG,
     });
     entries
@@ -992,6 +1026,10 @@ fn pipe_user_pages_soft_content() -> String {
     format!("{}\n", PROC_PIPE_USER_PAGES_SOFT.load(Ordering::Relaxed))
 }
 
+fn fanotify_max_queued_events_content() -> String {
+    format!("{}\n", fanotify_max_queued_events())
+}
+
 fn lease_break_time_content() -> String {
     format!("{}\n", PROC_LEASE_BREAK_TIME.load(Ordering::Relaxed))
 }
@@ -1326,6 +1364,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::KeysMaxbytes => Ok(keyring::key_maxbytes_content().into_bytes()),
         ProcNode::PipeMaxSize => Ok(pipe_max_size_content().into_bytes()),
         ProcNode::PipeUserPagesSoft => Ok(pipe_user_pages_soft_content().into_bytes()),
+        ProcNode::FanotifyMaxQueuedEvents => Ok(fanotify_max_queued_events_content().into_bytes()),
         ProcNode::LeaseBreakTime => Ok(lease_break_time_content().into_bytes()),
         ProcNode::NetIpv4ConfLoTag => Ok(net_ipv4_conf_lo_tag_content().into_bytes()),
         ProcNode::NetIpv4ConfDefaultTag => Ok(net_ipv4_conf_default_tag_content().into_bytes()),
@@ -1379,6 +1418,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         | ProcNode::SysKernelDir
         | ProcNode::SysKernelKeysDir
         | ProcNode::SysFsDir
+        | ProcNode::SysFsFanotifyDir
         | ProcNode::SysNetDir
         | ProcNode::SysNetIpv4Dir
         | ProcNode::SysNetIpv4ConfDir
@@ -1510,6 +1550,15 @@ impl FileSystemBackend for ProcFs {
                 "pipe-max-size" => Ok((PIPE_MAX_SIZE_INO, FsNodeKind::RegularFile)),
                 "pipe-user-pages-soft" => Ok((PIPE_USER_PAGES_SOFT_INO, FsNodeKind::RegularFile)),
                 "lease-break-time" => Ok((LEASE_BREAK_TIME_INO, FsNodeKind::RegularFile)),
+                "fanotify" => Ok((SYS_FS_FANOTIFY_DIR_INO, FsNodeKind::Directory)),
+                _ => Err(FsError::NotFound),
+            },
+            ProcNode::SysFsFanotifyDir => match component {
+                "." => Ok((SYS_FS_FANOTIFY_DIR_INO, FsNodeKind::Directory)),
+                ".." => Ok((SYS_FS_DIR_INO, FsNodeKind::Directory)),
+                "max_queued_events" => {
+                    Ok((FANOTIFY_MAX_QUEUED_EVENTS_INO, FsNodeKind::RegularFile))
+                }
                 _ => Err(FsError::NotFound),
             },
             ProcNode::PidDir(pid) => match component {
@@ -1694,6 +1743,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::SysKernelDir
             | ProcNode::SysKernelKeysDir
             | ProcNode::SysFsDir
+            | ProcNode::SysFsFanotifyDir
             | ProcNode::SysNetDir
             | ProcNode::SysNetIpv4Dir
             | ProcNode::SysNetIpv4ConfDir
@@ -1745,9 +1795,11 @@ impl FileSystemBackend for ProcFs {
                 .get(fd)
                 .and_then(Option::as_ref)
                 .ok_or(FsError::NotFound)?;
+            let file = entry.file();
             entry
                 .dir_path()
                 .map(String::from)
+                .or_else(|| file.proc_fd_target())
                 .unwrap_or_else(|| format!("/proc/{pid}/fd/{fd} (deleted)"))
         };
         let len = target.len().min(buf.len());
@@ -1794,6 +1846,9 @@ impl FileSystemBackend for ProcFs {
                 write_dir_entries(&sys_kernel_keys_entries(), offset, buf)
             }
             ProcNode::SysFsDir => write_dir_entries(&sys_fs_entries(), offset, buf),
+            ProcNode::SysFsFanotifyDir => {
+                write_dir_entries(&sys_fs_fanotify_entries(), offset, buf)
+            }
             ProcNode::SysVmDir => write_dir_entries(&sys_vm_entries(), offset, buf),
             ProcNode::SysNetDir => write_dir_entries(&sys_net_entries(), offset, buf),
             ProcNode::SysNetIpv4Dir => write_dir_entries(&sys_net_ipv4_entries(), offset, buf),

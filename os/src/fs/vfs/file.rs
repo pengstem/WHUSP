@@ -1,7 +1,9 @@
 use super::super::devfs;
+use super::super::dirent::{DT_DIR, RawDirEntry, write_dir_entries_with_offset_base};
 use super::super::inode::{OpenFlags, link_node_in};
 use super::super::mount::{
-    MountId, mount_is_read_only, mount_supports_page_cache, release_inode_from_drop, with_mount,
+    MountId, MountNamespaceId, mount_is_devfs, mount_is_read_only, mount_supports_page_cache,
+    release_inode_from_drop, synthetic_children_for_dir, with_mount,
 };
 use super::super::named_fifo::open_named_fifo;
 use super::super::path::{PathContext, WorkingDir};
@@ -13,6 +15,7 @@ use crate::mm::{UserBuffer, page_cache::PageCacheId};
 use crate::sync::SleepMutex;
 use alloc::collections::BTreeMap;
 use alloc::format;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -23,6 +26,7 @@ const VFS_WRITE_CHUNK_SIZE: usize = 64 * 1024;
 const MODE_PERMISSIONS_MASK: u32 = 0o7777;
 const MODE_SETGID: u32 = 0o2000;
 const TMPFILE_CREATE_ATTEMPTS: usize = 64;
+const SYNTHETIC_DIRENT_OFFSET_BASE: u64 = 1 << 60;
 
 static TMPFILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -143,6 +147,8 @@ pub(crate) struct VfsFile {
     node: VfsNodeId,
     parent: Option<VfsNodeId>,
     kind: FsNodeKind,
+    namespace_id: MountNamespaceId,
+    visible_path: Option<String>,
     offset: SleepMutex<usize>,
     readable: bool,
     writable: bool,
@@ -157,17 +163,20 @@ impl VfsFile {
         readable: bool,
         writable: bool,
         status_flags: OpenFlags,
+        namespace_id: MountNamespaceId,
         suppress_fanotify: bool,
     ) -> FsResult<Self> {
-        with_mount(path.node.mount_id, |mount| {
-            mount.retain_inode(path.node.ino)
-        })
-        .ok_or(FsError::Io)??;
-        track_writable_regular_open(path.node, path.kind, writable);
+        let node = path.node;
+        let kind = path.kind;
+        let visible_path = path.visible_path;
+        with_mount(node.mount_id, |mount| mount.retain_inode(node.ino)).ok_or(FsError::Io)??;
+        track_writable_regular_open(node, kind, writable);
         Ok(Self {
-            node: path.node,
+            node,
             parent,
-            kind: path.kind,
+            kind,
+            namespace_id,
+            visible_path,
             offset: SleepMutex::new(0),
             readable,
             writable,
@@ -273,6 +282,28 @@ impl VfsFile {
             Err(err) => Err(err),
         }
     }
+
+    fn read_synthetic_dirent64(&self, entry_offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
+        let Some(parent_path) = self.visible_path.as_deref() else {
+            return Ok((0, entry_offset));
+        };
+        let entries: Vec<RawDirEntry> =
+            synthetic_children_for_dir(self.namespace_id, self.node, parent_path)
+                .into_iter()
+                .map(|entry| RawDirEntry {
+                    ino: entry.ino,
+                    name: entry.name,
+                    dtype: DT_DIR,
+                })
+                .collect();
+        let (read_size, next_entry_offset) = write_dir_entries_with_offset_base(
+            entries.as_slice(),
+            entry_offset,
+            SYNTHETIC_DIRENT_OFFSET_BASE,
+            buf,
+        )?;
+        Ok((read_size, SYNTHETIC_DIRENT_OFFSET_BASE + next_entry_offset))
+    }
 }
 
 fn parent_hint_for_open(context: &PathContext, name: &str) -> Option<VfsNodeId> {
@@ -287,6 +318,7 @@ fn open_vfs_file_impl(
     flags: OpenFlags,
     create_attrs: Option<FileCreateAttrs>,
 ) -> FsResult<Arc<VfsFile>> {
+    let namespace_id = context.namespace_id();
     let parent_hint = parent_hint_for_open(&context, name);
     let follow_final_symlink = !flags.contains(OpenFlags::NOFOLLOW);
     let resolved = vfs_path::resolve_open_in(
@@ -362,9 +394,10 @@ fn open_vfs_file_impl(
             }
             let (readable, writable) = flags.read_write();
             (
-                VfsPath::new(
+                VfsPath::with_visible_path(
                     VfsNodeId::new(target.parent.mount_id, ino),
                     FsNodeKind::RegularFile,
+                    target.leaf_path,
                 ),
                 Some(target.parent),
                 readable,
@@ -379,11 +412,13 @@ fn open_vfs_file_impl(
         readable,
         writable,
         OpenFlags::file_status_flags(flags),
+        namespace_id,
         false,
     )?))
 }
 
 fn create_tmpfile_inode(
+    namespace_id: MountNamespaceId,
     directory: VfsPath,
     flags: OpenFlags,
     create_attrs: Option<FileCreateAttrs>,
@@ -447,6 +482,7 @@ fn create_tmpfile_inode(
         readable,
         writable,
         OpenFlags::file_status_flags(flags),
+        namespace_id,
         false,
     )?);
 
@@ -469,8 +505,9 @@ pub(crate) fn open_tmpfile_in_with_attrs(
     flags: OpenFlags,
     create_attrs: Option<FileCreateAttrs>,
 ) -> FsResult<Arc<dyn File + Send + Sync>> {
+    let namespace_id = context.namespace_id();
     let directory = vfs_path::resolve_existing_in(context, name, LookupMode::FollowFinal)?;
-    create_tmpfile_inode(directory, flags, create_attrs)
+    create_tmpfile_inode(namespace_id, directory, flags, create_attrs)
         .map(|file| file as Arc<dyn File + Send + Sync>)
 }
 
@@ -492,27 +529,29 @@ pub(crate) fn open_file_in_with_attrs(
     flags: OpenFlags,
     create_attrs: Option<FileCreateAttrs>,
 ) -> FsResult<Arc<dyn File + Send + Sync>> {
-    if context.is_global_root()
-        && let Some(file) = devfs::open(name, flags)?
-    {
-        return Ok(file);
-    }
     let follow_final_symlink = !flags.contains(OpenFlags::NOFOLLOW);
     let lookup_mode = if follow_final_symlink {
         LookupMode::FollowFinal
     } else {
         LookupMode::NoFollowFinal
     };
-    if let Ok(path) = vfs_path::resolve_existing_in(context.clone(), name, lookup_mode)
-        && path.kind == FsNodeKind::Fifo
-    {
-        if flags.contains(OpenFlags::CREATE | OpenFlags::EXCL) {
-            return Err(FsError::AlreadyExists);
+    if let Ok(path) = vfs_path::resolve_existing_in(context.clone(), name, lookup_mode) {
+        if mount_is_devfs(path.node.mount_id) {
+            if path.kind == FsNodeKind::Directory {
+                return open_vfs_file_impl(context, name, flags, create_attrs)
+                    .map(|file| file as Arc<dyn File + Send + Sync>);
+            }
+            return devfs::open_inode(path.node.mount_id, path.node.ino, flags);
         }
-        if flags.contains(OpenFlags::DIRECTORY) {
-            return Err(FsError::NotDir);
+        if path.kind == FsNodeKind::Fifo {
+            if flags.contains(OpenFlags::CREATE | OpenFlags::EXCL) {
+                return Err(FsError::AlreadyExists);
+            }
+            if flags.contains(OpenFlags::DIRECTORY) {
+                return Err(FsError::NotDir);
+            }
+            return open_named_fifo(path.node, OpenFlags::file_status_flags(flags));
         }
-        return open_named_fifo(path.node, OpenFlags::file_status_flags(flags));
     }
     open_vfs_file_impl(context, name, flags, create_attrs)
         .map(|file| file as Arc<dyn File + Send + Sync>)
@@ -534,11 +573,6 @@ pub(crate) fn stat_in(
     name: &str,
     follow_final_symlink: bool,
 ) -> FsResult<FileStat> {
-    if context.is_global_root()
-        && let Some(stat) = devfs::stat(name)
-    {
-        return Ok(stat);
-    }
     let mode = if follow_final_symlink {
         LookupMode::FollowFinal
     } else {
@@ -759,10 +793,23 @@ impl File for VfsFile {
         }
         let mut offset = self.offset.lock();
         let mut kernel_buf = vec![0u8; user_buf.len()];
-        let (read_size, next_offset) = with_mount(self.node.mount_id, |mount| {
-            mount.read_dirent64(self.node.ino, *offset as u64, &mut kernel_buf)
-        })
-        .ok_or(FsError::Io)??;
+        let current_offset = *offset as u64;
+        let (read_size, next_offset) = if current_offset >= SYNTHETIC_DIRENT_OFFSET_BASE {
+            self.read_synthetic_dirent64(
+                current_offset - SYNTHETIC_DIRENT_OFFSET_BASE,
+                &mut kernel_buf,
+            )?
+        } else {
+            let (read_size, next_offset) = with_mount(self.node.mount_id, |mount| {
+                mount.read_dirent64(self.node.ino, current_offset, &mut kernel_buf)
+            })
+            .ok_or(FsError::Io)??;
+            if read_size == 0 {
+                self.read_synthetic_dirent64(0, &mut kernel_buf)?
+            } else {
+                (read_size, next_offset)
+            }
+        };
         if read_size == 0 {
             return Ok(0);
         }
@@ -783,6 +830,10 @@ impl File for VfsFile {
             mount.readlink(self.node.ino, buf)
         })
         .ok_or(FsError::Io)?
+    }
+
+    fn proc_fd_target(&self) -> Option<String> {
+        self.visible_path.clone()
     }
 
     fn set_times(
@@ -872,6 +923,18 @@ impl File for VfsFile {
         Some(self.node.mount_id)
     }
 
+    fn is_devfs_dir(&self) -> bool {
+        self.kind == FsNodeKind::Directory && mount_is_devfs(self.node.mount_id)
+    }
+
+    fn is_devfs_misc_dir(&self) -> bool {
+        mount_is_devfs(self.node.mount_id) && devfs::inode_is_misc_dir(self.node.ino)
+    }
+
+    fn is_devfs_pts_dir(&self) -> bool {
+        mount_is_devfs(self.node.mount_id) && devfs::inode_is_pts_dir(self.node.ino)
+    }
+
     fn page_cache_id(&self) -> Option<PageCacheId> {
         if self.kind != FsNodeKind::RegularFile || !mount_supports_page_cache(self.node.mount_id) {
             return None;
@@ -890,11 +953,16 @@ impl File for VfsFile {
     fn clone_for_fanotify_event(&self, flags: OpenFlags) -> FsResult<Arc<dyn File + Send + Sync>> {
         let (readable, writable) = flags.read_write();
         Ok(Arc::new(VfsFile::new(
-            VfsPath::new(self.node, self.kind),
+            VfsPath {
+                node: self.node,
+                kind: self.kind,
+                visible_path: self.visible_path.clone(),
+            },
             self.parent,
             readable,
             writable,
             OpenFlags::file_status_flags(flags),
+            self.namespace_id,
             true,
         )?))
     }

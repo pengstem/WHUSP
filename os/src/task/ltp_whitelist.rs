@@ -86,6 +86,8 @@ pub(super) const LTP_CASE_WHITELIST: &[&str] = &[
     "fanotify12",
     "fanotify13",
     "fanotify14",
+    "fanotify15",
+    "fanotify16",
     "fanotify17",
     "fanotify18",
     "fanotify19",

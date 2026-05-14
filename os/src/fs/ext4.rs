@@ -268,6 +268,10 @@ impl FileSystemBackend for Ext4Mount {
         self.fs.flush().map_err(map_ext4_error)
     }
 
+    fn shutdown(&mut self) -> FsResult {
+        self.fs.shutdown_clean().map_err(map_ext4_error)
+    }
+
     fn set_times(
         &mut self,
         ino: u32,

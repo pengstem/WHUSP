@@ -4,7 +4,10 @@ use super::super::user_ptr::{
     PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, read_user_value,
     translated_byte_buffer_checked,
 };
-use super::fanotify::{fanotify_notify_open, fanotify_notify_open_at};
+use super::fanotify::{
+    fanotify_notify_create, fanotify_notify_delete, fanotify_notify_modify, fanotify_notify_move,
+    fanotify_notify_open, fanotify_notify_open_at,
+};
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd, install_file_fd};
 use super::stat::resolve_stat_from;
 use super::uapi::{
@@ -17,10 +20,10 @@ use crate::fs::{
     FS_APPEND_FL, FS_IMMUTABLE_FL, File, FileCreateAttrs, FileStat, FileTimestamp, FsError,
     FsNodeKind, MountId, OpenFlags, PathContext, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT,
     S_IFREG, S_IFSOCK, WorkingDir, chown_in, create_node_in, link_file_in, link_open_file_in,
-    lookup_dir_in, lookup_dir_with_stat_in, mkdir_in, mount_is_read_only, normalize_path_at_root,
-    open_devfs_child, open_devfs_misc_child, open_devfs_pts_child, open_file_in,
-    open_file_in_with_attrs, open_static_path, open_tmpfile_in_with_attrs, path_inside_root,
-    rename_in, rmdir_in, symlink_in, truncate_in, unlink_file_in,
+    lookup_dir_in, lookup_dir_with_stat_in, lookup_path_in, mkdir_in, mount_is_read_only,
+    normalize_path_at_root, open_devfs_child, open_devfs_misc_child, open_devfs_pts_child,
+    open_file_in, open_file_in_with_attrs, open_static_path, open_tmpfile_in_with_attrs,
+    path_inside_root, rename_in, rmdir_in, symlink_in, truncate_in, unlink_file_in,
 };
 use crate::mm::UserBuffer;
 use crate::task::{CAP_SYS_CHROOT, PathSnapshot, current_process, current_user_token};
@@ -412,7 +415,7 @@ fn open_devfs_child_from_dirfd(
     } else {
         open_devfs_child(path, flags)?
     };
-    child.map(Some).ok_or(SysError::ENOENT)
+    Ok(child)
 }
 
 pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> SysResult {
@@ -447,6 +450,15 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> SysRe
         return install_file_fd(file, flags, None);
     }
     let context = path_context_from(&snapshot, dirfd, path.as_str())?;
+    let created_file = flags.contains(OpenFlags::CREATE)
+        && matches!(
+            lookup_path_in(
+                context.clone(),
+                path.as_str(),
+                !flags.contains(OpenFlags::NOFOLLOW),
+            ),
+            Err(FsError::NotFound)
+        );
     let process = current_process();
     let credentials = process.credentials();
     let subject = AccessSubject {
@@ -474,6 +486,9 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> SysRe
     let notify_file = Arc::clone(&file);
     let notify_path = dir_path.clone();
     let fd = install_file_fd(file, flags, dir_path)?;
+    if created_file && let Some(path) = notify_path.as_deref() {
+        fanotify_notify_create(&notify_file, path);
+    }
     if let Some(path) = notify_path.as_deref() {
         fanotify_notify_open_at(&notify_file, path);
     } else {
@@ -504,11 +519,12 @@ pub fn sys_truncate(path: *const u8, len: usize) -> SysResult {
     let stat = resolve_stat_from(&snapshot, AT_FDCWD, path.as_str(), true)?;
     check_access_mode(&stat, W_OK, subject)?;
 
-    truncate_in(
-        path_context_from(&snapshot, AT_FDCWD, path.as_str())?,
-        path.as_str(),
-        len,
-    )?;
+    let context = path_context_from(&snapshot, AT_FDCWD, path.as_str())?;
+    let notify_file = open_file_in(context.clone(), path.as_str(), OpenFlags::RDONLY).ok();
+    truncate_in(context, path.as_str(), len)?;
+    if let Some(file) = notify_file {
+        fanotify_notify_modify(&file, 1);
+    }
     Ok(0)
 }
 
@@ -722,6 +738,7 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> SysResult {
     let path = read_user_c_string(token, path, PATH_MAX)?;
     let snapshot = current_process().path_snapshot();
     let context = path_context_from(&snapshot, dirfd, path.as_str())?;
+    let notify_context = context.clone();
     let process = current_process();
     mkdir_in(context.clone(), path.as_str(), mode & !process.umask())?;
     let credentials = process.credentials();
@@ -732,6 +749,9 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> SysResult {
         Some(credentials.fsuid),
         Some(credentials.fsgid),
     )?;
+    if let Ok(file) = open_file_in(notify_context, path.as_str(), OpenFlags::PATH) {
+        fanotify_notify_create(&file, path.as_str());
+    }
     Ok(0)
 }
 
@@ -762,6 +782,7 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, dev: u64) -> SysRes
     let process = current_process();
     let snapshot = process.path_snapshot();
     let context = path_context_from(&snapshot, dirfd, path.as_str())?;
+    let notify_context = context.clone();
     let credentials = process.credentials();
     create_node_in(
         context,
@@ -772,6 +793,9 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, dev: u64) -> SysRes
         credentials.fsgid,
         dev,
     )?;
+    if let Ok(file) = open_file_in(notify_context, path.as_str(), OpenFlags::PATH) {
+        fanotify_notify_create(&file, path.as_str());
+    }
     Ok(0)
 }
 
@@ -782,16 +806,15 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> SysResult {
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
     let snapshot = current_process().path_snapshot();
+    let context = path_context_from(&snapshot, dirfd, path.as_str())?;
+    let notify_file = open_file_in(context.clone(), path.as_str(), OpenFlags::PATH).ok();
     if flags & AT_REMOVEDIR != 0 {
-        rmdir_in(
-            path_context_from(&snapshot, dirfd, path.as_str())?,
-            path.as_str(),
-        )?;
+        rmdir_in(context, path.as_str())?;
     } else {
-        unlink_file_in(
-            path_context_from(&snapshot, dirfd, path.as_str())?,
-            path.as_str(),
-        )?;
+        unlink_file_in(context, path.as_str())?;
+    }
+    if let Some(file) = notify_file {
+        fanotify_notify_delete(&file, path.as_str());
     }
     Ok(0)
 }
@@ -906,13 +929,21 @@ pub fn sys_renameat2(
     let oldpath = read_user_c_string(token, oldpath, PATH_MAX)?;
     let newpath = read_user_c_string(token, newpath, PATH_MAX)?;
     let snapshot = current_process().path_snapshot();
+    let old_context = path_context_from(&snapshot, olddirfd, oldpath.as_str())?;
+    let new_context = path_context_from(&snapshot, newdirfd, newpath.as_str())?;
+    let old_notify_file = open_file_in(old_context.clone(), oldpath.as_str(), OpenFlags::PATH).ok();
     rename_in(
-        path_context_from(&snapshot, olddirfd, oldpath.as_str())?,
+        old_context,
         oldpath.as_str(),
-        path_context_from(&snapshot, newdirfd, newpath.as_str())?,
+        new_context.clone(),
         newpath.as_str(),
         flags & RENAME_NOREPLACE != 0,
     )?;
+    if let Some(old_file) = old_notify_file
+        && let Ok(new_file) = open_file_in(new_context, newpath.as_str(), OpenFlags::PATH)
+    {
+        fanotify_notify_move(&old_file, oldpath.as_str(), &new_file, newpath.as_str());
+    }
     Ok(0)
 }
 

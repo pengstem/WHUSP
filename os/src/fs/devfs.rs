@@ -1,5 +1,11 @@
-use super::dirent::{DT_BLK, DT_CHR, DT_DIR, LINUX_DIRENT64_ALIGN, LINUX_DIRENT64_HEADER_SIZE};
+use super::dirent::{
+    DT_BLK, DT_CHR, DT_DIR, LINUX_DIRENT64_ALIGN, LINUX_DIRENT64_HEADER_SIZE, RawDirEntry,
+    write_dir_entries,
+};
+use super::mount::MountId;
+use super::path::WorkingDir;
 use super::status_flags::StatusFlagsCell;
+use super::vfs::{FileSystemBackend, FileSystemStat, FsNodeKind, VfsNodeId};
 use super::{
     File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFBLK, S_IFCHR, S_IFDIR,
     SeekWhence, console_tty_poll, console_tty_read,
@@ -12,16 +18,17 @@ use crate::task::{
     wakeup_task,
 };
 use alloc::collections::VecDeque;
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
 use lazy_static::lazy_static;
 
 const DEVFS_DEV: u64 = 0x646576;
+const DEVFS_MAGIC: i64 = 0x0102_1994;
 const LOOP_DEVICE_SIZE_FALLBACK: u64 = 300 * 1024 * 1024;
 const PTY_BUFFER_CAPACITY: usize = 8192;
 const PTY_TABLE_SIZE: usize = 64;
-const PTY_INO_BASE: u64 = 0x1000;
+const PTY_INO_BASE: u32 = 0x1000;
 
 lazy_static! {
     static ref LOOP0_BACKEND: UPIntrFreeCell<Option<Arc<dyn File + Send + Sync>>> =
@@ -51,7 +58,7 @@ enum DevNode {
 }
 
 impl DevNode {
-    fn ino(self) -> u64 {
+    fn ino(self) -> u32 {
         match self {
             Self::Root => 1,
             Self::Misc => 2,
@@ -94,10 +101,18 @@ impl DevNode {
     fn is_tty(self) -> bool {
         matches!(self, Self::Tty | Self::TtyS0 | Self::Tty8 | Self::Tty9)
     }
+
+    fn kind(self) -> FsNodeKind {
+        match self {
+            Self::Root | Self::Misc | Self::Pts => FsNodeKind::Directory,
+            _ => FsNodeKind::CharacterDevice,
+        }
+    }
 }
 
 struct DevFsFile {
     node: DevNode,
+    mount_id: Option<MountId>,
     readable: bool,
     writable: bool,
     offset: UPIntrFreeCell<usize>,
@@ -105,14 +120,29 @@ struct DevFsFile {
 }
 
 impl DevFsFile {
-    fn new(node: DevNode, readable: bool, writable: bool, status_flags: OpenFlags) -> Self {
+    fn new(
+        node: DevNode,
+        mount_id: Option<MountId>,
+        readable: bool,
+        writable: bool,
+        status_flags: OpenFlags,
+    ) -> Self {
         Self {
             node,
+            mount_id,
             readable,
             writable,
             offset: unsafe { UPIntrFreeCell::new(0) },
             status_flags: StatusFlagsCell::new(status_flags),
         }
+    }
+}
+
+pub(super) struct DevFs;
+
+impl DevFs {
+    pub(super) fn new() -> Self {
+        Self
     }
 }
 
@@ -454,28 +484,31 @@ fn linux_makedev(major: u64, minor: u64) -> u64 {
 
 use super::align_up;
 
-fn lookup_absolute(path: &str) -> Option<DevNode> {
-    // UNFINISHED: This lightweight devfs is not a mountable filesystem yet.
-    // Only absolute /dev paths and explicit /dev directory fds are handled.
-    match path {
-        "/dev" | "/dev/" => Some(DevNode::Root),
-        "/dev/misc" | "/dev/misc/" => Some(DevNode::Misc),
-        "/dev/pts" | "/dev/pts/" => Some(DevNode::Pts),
-        "/dev/null" => Some(DevNode::Null),
-        "/dev/zero" => Some(DevNode::Zero),
-        "/dev/full" => Some(DevNode::Full),
-        "/dev/random" => Some(DevNode::Random),
-        "/dev/urandom" => Some(DevNode::Urandom),
-        "/dev/tty" => Some(DevNode::Tty),
-        "/dev/ttyS0" => Some(DevNode::TtyS0),
-        "/dev/tty8" => Some(DevNode::Tty8),
-        "/dev/tty9" => Some(DevNode::Tty9),
-        "/dev/ptmx" => Some(DevNode::PtMx),
-        "/dev/rtc" | "/dev/rtc0" | "/dev/misc/rtc" => Some(DevNode::Rtc),
-        "/dev/loop-control" => Some(DevNode::LoopControl),
-        "/dev/loop0" => Some(DevNode::Loop0),
+fn node_from_ino(ino: u32) -> Option<DevNode> {
+    match ino {
+        1 => Some(DevNode::Root),
+        2 => Some(DevNode::Misc),
+        3 => Some(DevNode::Pts),
+        4 => Some(DevNode::Null),
+        5 => Some(DevNode::Zero),
+        6 => Some(DevNode::Full),
+        7 => Some(DevNode::Random),
+        8 => Some(DevNode::Urandom),
+        9 => Some(DevNode::Tty),
+        10 => Some(DevNode::TtyS0),
+        11 => Some(DevNode::Tty8),
+        12 => Some(DevNode::Tty9),
+        13 => Some(DevNode::PtMx),
+        14 => Some(DevNode::Rtc),
+        15 => Some(DevNode::LoopControl),
+        16 => Some(DevNode::Loop0),
         _ => None,
     }
+}
+
+fn pty_id_from_ino(ino: u32) -> Option<usize> {
+    let id = ino.checked_sub(PTY_INO_BASE)? as usize;
+    (id < PTY_TABLE_SIZE).then_some(id)
 }
 
 fn parse_pts_id(path: &str) -> Option<usize> {
@@ -484,10 +517,6 @@ fn parse_pts_id(path: &str) -> Option<usize> {
     }
     let id = path.parse::<usize>().ok()?;
     (id < PTY_TABLE_SIZE).then_some(id)
-}
-
-fn parse_absolute_pts_id(path: &str) -> Option<usize> {
-    parse_pts_id(path.strip_prefix("/dev/pts/")?)
 }
 
 fn lookup_child(parent: DevNode, path: &str) -> Option<DevNode> {
@@ -589,7 +618,11 @@ fn open_pty_slave(id: usize, flags: OpenFlags) -> FsResult<Arc<dyn File + Send +
     )))
 }
 
-fn open_node(node: DevNode, flags: OpenFlags) -> FsResult<Arc<dyn File + Send + Sync>> {
+fn open_node_at(
+    node: DevNode,
+    mount_id: Option<MountId>,
+    flags: OpenFlags,
+) -> FsResult<Arc<dyn File + Send + Sync>> {
     if flags.contains(OpenFlags::CREATE | OpenFlags::EXCL) {
         return Err(FsError::AlreadyExists);
     }
@@ -602,6 +635,7 @@ fn open_node(node: DevNode, flags: OpenFlags) -> FsResult<Arc<dyn File + Send + 
         }
         return Ok(Arc::new(DevFsFile::new(
             node,
+            mount_id,
             false,
             false,
             OpenFlags::file_status_flags(flags),
@@ -613,19 +647,15 @@ fn open_node(node: DevNode, flags: OpenFlags) -> FsResult<Arc<dyn File + Send + 
     let (readable, writable) = flags.read_write();
     Ok(Arc::new(DevFsFile::new(
         node,
+        mount_id,
         readable,
         writable,
         OpenFlags::file_status_flags(flags),
     )))
 }
 
-pub(crate) fn open(path: &str, flags: OpenFlags) -> FsResult<Option<Arc<dyn File + Send + Sync>>> {
-    if let Some(id) = parse_absolute_pts_id(path) {
-        return open_pty_slave(id, flags).map(Some);
-    }
-    lookup_absolute(path)
-        .map(|node| open_node(node, flags))
-        .transpose()
+fn open_node(node: DevNode, flags: OpenFlags) -> FsResult<Arc<dyn File + Send + Sync>> {
+    open_node_at(node, None, flags)
 }
 
 pub(crate) fn open_child(
@@ -671,6 +701,26 @@ pub(crate) fn open_pts_child(
     open_pty_slave(id, flags).map(Some)
 }
 
+pub(crate) fn open_inode(
+    mount_id: MountId,
+    ino: u32,
+    flags: OpenFlags,
+) -> FsResult<Arc<dyn File + Send + Sync>> {
+    if let Some(id) = pty_id_from_ino(ino) {
+        return open_pty_slave(id, flags);
+    }
+    let node = node_from_ino(ino).ok_or(FsError::NotFound)?;
+    open_node_at(node, Some(mount_id), flags)
+}
+
+pub(crate) fn inode_is_misc_dir(ino: u32) -> bool {
+    ino == DevNode::Misc.ino()
+}
+
+pub(crate) fn inode_is_pts_dir(ino: u32) -> bool {
+    ino == DevNode::Pts.ino()
+}
+
 fn stat_node(node: DevNode) -> FileStat {
     let mode = match node {
         DevNode::Root | DevNode::Misc | DevNode::Pts => S_IFDIR | 0o755,
@@ -680,7 +730,7 @@ fn stat_node(node: DevNode) -> FileStat {
     };
     let mut stat = FileStat::with_mode(mode);
     stat.dev = DEVFS_DEV;
-    stat.ino = node.ino();
+    stat.ino = node.ino() as u64;
     stat.rdev = node.rdev();
     stat.nlink = if matches!(node, DevNode::Root | DevNode::Misc | DevNode::Pts) {
         2
@@ -695,7 +745,7 @@ fn stat_pty_slave(id: usize) -> Option<FileStat> {
     PTY_TABLE.exclusive_session(|table| table.get(id))?;
     let mut stat = FileStat::with_mode(S_IFCHR | 0o620);
     stat.dev = DEVFS_DEV;
-    stat.ino = PTY_INO_BASE + id as u64;
+    stat.ino = PTY_INO_BASE as u64 + id as u64;
     stat.rdev = linux_makedev(136, id as u64);
     stat.nlink = 1;
     stat.blocks = 0;
@@ -853,13 +903,6 @@ pub(crate) fn loop_device_size(id: usize) -> FsResult<u64> {
         return Err(FsError::NoDeviceOrAddress);
     }
     Ok(loop0_size())
-}
-
-pub(crate) fn stat(path: &str) -> Option<FileStat> {
-    if let Some(id) = parse_absolute_pts_id(path) {
-        return stat_pty_slave(id);
-    }
-    Some(stat_node(lookup_absolute(path)?))
 }
 
 pub(crate) fn stat_child(path: &str) -> Option<FileStat> {
@@ -1062,7 +1105,7 @@ fn copy_dirents(
         let next_offset = *entries_offset + 1;
         let entry_buf = &mut kernel_buf[written..written + d_reclen];
         entry_buf.fill(0);
-        entry_buf[0..8].copy_from_slice(&entry.node.ino().to_ne_bytes());
+        entry_buf[0..8].copy_from_slice(&(entry.node.ino() as u64).to_ne_bytes());
         entry_buf[8..16].copy_from_slice(&(next_offset as i64).to_ne_bytes());
         entry_buf[16..18].copy_from_slice(&(d_reclen as u16).to_ne_bytes());
         entry_buf[18] = entry.dtype;
@@ -1094,18 +1137,18 @@ fn pts_dir_entries() -> alloc::vec::Vec<DynamicDirEntry> {
     let ids = PTY_TABLE.exclusive_session(|table| table.active_ids());
     let mut entries = alloc::vec::Vec::with_capacity(ids.len() + 2);
     entries.push(DynamicDirEntry {
-        ino: DevNode::Pts.ino(),
+        ino: DevNode::Pts.ino() as u64,
         name: b".".to_vec(),
         dtype: DT_DIR,
     });
     entries.push(DynamicDirEntry {
-        ino: DevNode::Root.ino(),
+        ino: DevNode::Root.ino() as u64,
         name: b"..".to_vec(),
         dtype: DT_DIR,
     });
     for id in ids {
         entries.push(DynamicDirEntry {
-            ino: PTY_INO_BASE + id as u64,
+            ino: PTY_INO_BASE as u64 + id as u64,
             name: id.to_string().into_bytes(),
             dtype: DT_CHR,
         });
@@ -1157,6 +1200,159 @@ fn copy_dynamic_dirents(
         }
     }
     Ok(written as isize)
+}
+
+fn static_name(name: &[u8]) -> String {
+    let mut output = String::new();
+    for &byte in name {
+        output.push(byte as char);
+    }
+    output
+}
+
+fn raw_static_entries(entries: &[DevDirEntry]) -> Vec<RawDirEntry> {
+    entries
+        .iter()
+        .map(|entry| RawDirEntry {
+            ino: entry.node.ino(),
+            name: static_name(entry.name),
+            dtype: entry.dtype,
+        })
+        .collect()
+}
+
+fn raw_pts_entries() -> Vec<RawDirEntry> {
+    let ids = PTY_TABLE.exclusive_session(|table| table.active_ids());
+    let mut entries = Vec::with_capacity(ids.len() + 2);
+    entries.push(RawDirEntry {
+        ino: DevNode::Pts.ino(),
+        name: ".".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: DevNode::Root.ino(),
+        name: "..".into(),
+        dtype: DT_DIR,
+    });
+    for id in ids {
+        entries.push(RawDirEntry {
+            ino: PTY_INO_BASE + id as u32,
+            name: id.to_string(),
+            dtype: DT_CHR,
+        });
+    }
+    entries
+}
+
+impl FileSystemBackend for DevFs {
+    fn root_ino(&self) -> u32 {
+        DevNode::Root.ino()
+    }
+
+    fn statfs(&mut self) -> FileSystemStat {
+        FileSystemStat {
+            magic: DEVFS_MAGIC,
+            block_size: 4096,
+            blocks: 0,
+            free_blocks: 0,
+            available_blocks: 0,
+            files: 1024,
+            free_files: 1024,
+            max_name_len: 255,
+            flags: 0,
+        }
+    }
+
+    fn lookup_component_from(
+        &mut self,
+        parent_ino: u32,
+        component: &str,
+    ) -> FsResult<(u32, FsNodeKind)> {
+        let parent = node_from_ino(parent_ino).ok_or(FsError::NotFound)?;
+        if parent == DevNode::Pts
+            && let Some(id) = parse_pts_id(component)
+            && PTY_TABLE.exclusive_session(|table| table.get(id)).is_some()
+        {
+            return Ok((PTY_INO_BASE + id as u32, FsNodeKind::CharacterDevice));
+        }
+        let node = lookup_child(parent, component).ok_or(FsError::NotFound)?;
+        Ok((node.ino(), node.kind()))
+    }
+
+    fn create_file(&mut self, _parent_ino: u32, _leaf_name: &str) -> FsResult<u32> {
+        Err(FsError::ReadOnly)
+    }
+
+    fn create_dir(&mut self, _parent_ino: u32, _leaf_name: &str, _mode: u32) -> FsResult<u32> {
+        Err(FsError::ReadOnly)
+    }
+
+    fn link(&mut self, _parent_ino: u32, _leaf_name: &str, _child_ino: u32) -> FsResult {
+        Err(FsError::ReadOnly)
+    }
+
+    fn symlink(&mut self, _parent_ino: u32, _leaf_name: &str, _target: &[u8]) -> FsResult {
+        Err(FsError::ReadOnly)
+    }
+
+    fn unlink(&mut self, _parent_ino: u32, _leaf_name: &str) -> FsResult {
+        Err(FsError::ReadOnly)
+    }
+
+    fn rename(
+        &mut self,
+        _src_dir: u32,
+        _src_name: &str,
+        _dst_dir: u32,
+        _dst_name: &str,
+    ) -> FsResult {
+        Err(FsError::ReadOnly)
+    }
+
+    fn set_len(&mut self, _ino: u32, _len: u64) -> FsResult {
+        Err(FsError::InvalidInput)
+    }
+
+    fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
+        if let Some(id) = pty_id_from_ino(ino) {
+            return stat_pty_slave(id).ok_or(FsError::NotFound);
+        }
+        let node = node_from_ino(ino).ok_or(FsError::NotFound)?;
+        Ok(stat_node(node))
+    }
+
+    fn readlink(&mut self, _ino: u32, _buf: &mut [u8]) -> FsResult<usize> {
+        Err(FsError::InvalidInput)
+    }
+
+    fn read_at(&mut self, _ino: u32, _buf: &mut [u8], _offset: u64) -> usize {
+        0
+    }
+
+    fn write_at(&mut self, _ino: u32, _buf: &[u8], _offset: u64) -> usize {
+        0
+    }
+
+    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
+        match node_from_ino(ino).ok_or(FsError::NotFound)? {
+            DevNode::Root => {
+                write_dir_entries(&raw_static_entries(&ROOT_DEV_DIR_ENTRIES), offset, buf)
+            }
+            DevNode::Misc => {
+                write_dir_entries(&raw_static_entries(&MISC_DEV_DIR_ENTRIES), offset, buf)
+            }
+            DevNode::Pts => write_dir_entries(&raw_pts_entries(), offset, buf),
+            _ => Err(FsError::NotDir),
+        }
+    }
+
+    fn list_root_names(&mut self) -> Vec<String> {
+        ROOT_DEV_DIR_ENTRIES
+            .iter()
+            .filter(|entry| entry.name != b"." && entry.name != b"..")
+            .map(|entry| static_name(entry.name))
+            .collect()
+    }
 }
 
 impl File for DevFsFile {
@@ -1253,7 +1449,11 @@ impl File for DevFsFile {
     }
 
     fn stat(&self) -> FsResult<FileStat> {
-        Ok(stat_node(self.node))
+        let mut stat = stat_node(self.node);
+        if let Some(mount_id) = self.mount_id {
+            stat.dev = mount_id.0 as u64;
+        }
+        Ok(stat)
     }
 
     fn status_flags(&self) -> OpenFlags {
@@ -1262,6 +1462,23 @@ impl File for DevFsFile {
 
     fn set_status_flags(&self, flags: OpenFlags) {
         self.status_flags.set(flags);
+    }
+
+    fn working_dir(&self) -> Option<WorkingDir> {
+        if !matches!(self.node, DevNode::Root | DevNode::Misc | DevNode::Pts) {
+            return None;
+        }
+        self.mount_id
+            .map(|mount_id| WorkingDir::new(mount_id, self.node.ino()))
+    }
+
+    fn vfs_node_id(&self) -> Option<VfsNodeId> {
+        self.mount_id
+            .map(|mount_id| VfsNodeId::new(mount_id, self.node.ino()))
+    }
+
+    fn vfs_mount_id(&self) -> Option<MountId> {
+        self.mount_id
     }
 
     fn read_dirent64(&self, user_buf: UserBuffer) -> FsResult<isize> {
@@ -1392,7 +1609,7 @@ impl File for PtyFile {
             PtyEndpoint::Slave => stat_pty_slave(self.id() as usize).unwrap_or_else(|| {
                 let mut stat = FileStat::with_mode(S_IFCHR | 0o620);
                 stat.dev = DEVFS_DEV;
-                stat.ino = PTY_INO_BASE + self.id() as u64;
+                stat.ino = PTY_INO_BASE as u64 + self.id() as u64;
                 stat.rdev = linux_makedev(136, self.id() as u64);
                 stat
             }),
