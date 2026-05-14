@@ -5,7 +5,8 @@
 //! `127.0.0.1` inside one guest.  Packets never leave the kernel and virtio-net
 //! is not involved.
 
-use super::{File, FileStat, FsError, OpenFlags, PollEvents, S_IFIFO};
+use super::inode::create_node_in;
+use super::{File, FileStat, FsError, FsNodeKind, OpenFlags, PollEvents, S_IFIFO};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
@@ -28,6 +29,7 @@ use lazy_static::lazy_static;
 
 const AF_UNIX: i32 = 1;
 const AF_INET: i32 = 2;
+const AF_INET6: i32 = 10;
 const AF_ALG: i32 = 38;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
@@ -40,6 +42,8 @@ const VALID_ACCEPT4_FLAGS: i32 = SOCK_NONBLOCK | SOCK_CLOEXEC;
 const IPPROTO_IP: i32 = 0;
 const IPPROTO_TCP: i32 = 6;
 const IPPROTO_UDP: i32 = 17;
+const IPPROTO_SCTP: i32 = 132;
+const IPPROTO_UDPLITE: i32 = 136;
 const SOL_SOCKET: i32 = 1;
 const SOL_ALG: i32 = 279;
 const SO_REUSEADDR: i32 = 2;
@@ -70,6 +74,8 @@ const ALG_OP_DECRYPT: u32 = 0;
 const ALG_OP_ENCRYPT: u32 = 1;
 const LOOPBACK_IP: [u8; 4] = [127, 0, 0, 1];
 const ANY_IP: [u8; 4] = [0, 0, 0, 0];
+const LOOPBACK_IPV6: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+const ANY_IPV6: [u8; 16] = [0; 16];
 const DEFAULT_SOCKET_BUFFER: i32 = 64 * 1024;
 const MAX_LISTEN_BACKLOG: usize = 128;
 
@@ -85,6 +91,30 @@ struct LinuxSockAddrIn {
     port_be: u16,
     addr: u32,
     zero: [u8; 8],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxSockAddrIn6 {
+    family: u16,
+    port_be: u16,
+    flowinfo: u32,
+    addr: [u8; 16],
+    scope_id: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct LinuxSockAddrUn {
+    family: u16,
+    path: [u8; 108],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SocketDomain {
+    Unix,
+    Inet,
+    Inet6,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,16 +166,39 @@ struct InetEndpoint {
     port: u16,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum UnixAddress {
+    Pathname(String),
+    Abstract(Vec<u8>),
+}
+
+#[derive(Clone, Debug)]
+enum UnixSockAddr {
+    Unnamed,
+    Named(UnixAddress),
+}
+
+#[derive(Clone, Debug)]
+enum SocketAddress {
+    Inet(InetEndpoint),
+    Inet6(InetEndpoint),
+    Unix(UnixSockAddr),
+}
+
 #[derive(Clone)]
 struct Datagram {
     data: Vec<u8>,
     from: InetEndpoint,
+    from_unix: Option<UnixAddress>,
 }
 
 struct LocalSocketInner {
+    domain: SocketDomain,
     kind: SocketKind,
     local: Option<InetEndpoint>,
     peer: Option<InetEndpoint>,
+    unix_local: Option<UnixAddress>,
+    unix_peer: Option<UnixAddress>,
     peer_socket: Option<Weak<UPIntrFreeCell<LocalSocketInner>>>,
     accept_queue: VecDeque<Arc<UPIntrFreeCell<LocalSocketInner>>>,
     stream_rx: VecDeque<u8>,
@@ -223,6 +276,7 @@ struct LoopbackState {
     next_ephemeral: u16,
     tcp_listeners: BTreeMap<u16, Weak<UPIntrFreeCell<LocalSocketInner>>>,
     udp_bound: BTreeMap<u16, Weak<UPIntrFreeCell<LocalSocketInner>>>,
+    unix_bound: BTreeMap<UnixAddress, Weak<UPIntrFreeCell<LocalSocketInner>>>,
 }
 
 impl LoopbackState {
@@ -231,6 +285,7 @@ impl LoopbackState {
             next_ephemeral: 49152,
             tcp_listeners: BTreeMap::new(),
             udp_bound: BTreeMap::new(),
+            unix_bound: BTreeMap::new(),
         }
     }
 
@@ -252,6 +307,8 @@ impl LoopbackState {
         self.tcp_listeners
             .retain(|_, socket| socket.strong_count() > 0);
         self.udp_bound.retain(|_, socket| socket.strong_count() > 0);
+        self.unix_bound
+            .retain(|_, socket| socket.strong_count() > 0);
     }
 }
 
@@ -276,11 +333,14 @@ impl ShutdownState {
 }
 
 impl LocalSocketInner {
-    fn new(kind: SocketKind) -> Self {
+    fn new(domain: SocketDomain, kind: SocketKind) -> Self {
         Self {
+            domain,
             kind,
             local: None,
             peer: None,
+            unix_local: None,
+            unix_peer: None,
             peer_socket: None,
             accept_queue: VecDeque::new(),
             stream_rx: VecDeque::new(),
@@ -297,15 +357,20 @@ impl LocalSocketInner {
     }
 
     fn connected(
+        domain: SocketDomain,
         kind: SocketKind,
         local: InetEndpoint,
         peer: InetEndpoint,
         peer_socket: Option<Weak<UPIntrFreeCell<LocalSocketInner>>>,
         shutdown: ShutdownState,
+        unix_local: Option<UnixAddress>,
+        unix_peer: Option<UnixAddress>,
     ) -> Self {
-        let mut inner = Self::new(kind);
+        let mut inner = Self::new(domain, kind);
         inner.local = Some(local);
         inner.peer = Some(peer);
+        inner.unix_local = unix_local;
+        inner.unix_peer = unix_peer;
         inner.peer_socket = peer_socket;
         inner.read_shutdown = shutdown.read;
         inner.write_shutdown = shutdown.write;
@@ -315,9 +380,9 @@ impl LocalSocketInner {
 }
 
 impl LocalSocket {
-    fn new(kind: SocketKind, flags: OpenFlags) -> Arc<Self> {
+    fn new(domain: SocketDomain, kind: SocketKind, flags: OpenFlags) -> Arc<Self> {
         Arc::new(Self {
-            inner: Arc::new(unsafe { UPIntrFreeCell::new(LocalSocketInner::new(kind)) }),
+            inner: Arc::new(unsafe { UPIntrFreeCell::new(LocalSocketInner::new(domain, kind)) }),
             status_flags: unsafe { UPIntrFreeCell::new(flags) },
         })
     }
@@ -333,8 +398,26 @@ impl LocalSocket {
         self.inner.exclusive_access().kind
     }
 
+    fn bind_address(&self, address: SocketAddress) -> SysResult {
+        let domain = self.inner.exclusive_access().domain;
+        match (domain, address) {
+            (SocketDomain::Inet, SocketAddress::Inet(endpoint)) => self.bind_endpoint(endpoint),
+            (SocketDomain::Inet6, SocketAddress::Inet6(endpoint)) => self.bind_endpoint(endpoint),
+            (SocketDomain::Unix, SocketAddress::Unix(UnixSockAddr::Named(address))) => {
+                self.bind_unix(address)
+            }
+            (SocketDomain::Unix, SocketAddress::Unix(UnixSockAddr::Unnamed)) => {
+                Err(SysError::EINVAL)
+            }
+            _ => Err(SysError::EAFNOSUPPORT),
+        }
+    }
+
     fn bind_endpoint(&self, mut endpoint: InetEndpoint) -> SysResult {
-        normalize_local_endpoint(&mut endpoint);
+        normalize_local_endpoint(&mut endpoint)?;
+        if endpoint.port != 0 && endpoint.port < 1024 && current_process().credentials().euid != 0 {
+            return Err(SysError::EACCES);
+        }
         let mut loopback = LOOPBACK.exclusive_access();
         loopback.prune();
         if endpoint.port == 0 {
@@ -362,6 +445,50 @@ impl LocalSocket {
             }
         }
         inner.local = Some(endpoint);
+        Ok(0)
+    }
+
+    fn bind_unix(&self, address: UnixAddress) -> SysResult {
+        {
+            let inner = self.inner.exclusive_access();
+            if inner.local.is_some() {
+                return Err(SysError::EINVAL);
+            }
+        }
+        {
+            let mut loopback = LOOPBACK.exclusive_access();
+            loopback.prune();
+            if loopback
+                .unix_bound
+                .get(&address)
+                .is_some_and(|socket| socket.strong_count() > 0)
+            {
+                return Err(SysError::EADDRINUSE);
+            }
+        }
+        if let UnixAddress::Pathname(path) = &address {
+            create_unix_path_node(path)?;
+        }
+        let mut loopback = LOOPBACK.exclusive_access();
+        loopback.prune();
+        let endpoint = InetEndpoint {
+            ip: LOOPBACK_IP,
+            port: loopback.alloc_port(),
+        };
+        let mut inner = self.inner.exclusive_access();
+        match inner.kind {
+            SocketKind::Stream => {}
+            SocketKind::Datagram => {
+                loopback
+                    .udp_bound
+                    .insert(endpoint.port, Arc::downgrade(&self.inner));
+            }
+        }
+        inner.local = Some(endpoint);
+        inner.unix_local = Some(address.clone());
+        loopback
+            .unix_bound
+            .insert(address, Arc::downgrade(&self.inner));
         Ok(0)
     }
 
@@ -440,11 +567,14 @@ impl LocalSocket {
                 return Ok(Self::from_inner(
                     Arc::new(unsafe {
                         UPIntrFreeCell::new(LocalSocketInner::connected(
+                            SocketDomain::Inet,
                             SocketKind::Stream,
                             local,
                             peer,
                             None,
                             ShutdownState::CLOSED,
+                            None,
+                            None,
                         ))
                     }),
                     OpenFlags::RDWR,
@@ -454,19 +584,21 @@ impl LocalSocket {
         }
     }
 
-    fn connect(&self, mut remote: InetEndpoint) -> SysResult {
-        normalize_remote_endpoint(&mut remote)?;
+    fn connect(&self, remote: SocketAddress) -> SysResult {
+        let (remote, unix_peer) = self.resolve_remote_address(remote)?;
         match self.kind() {
             SocketKind::Datagram => {
                 self.ensure_bound(SocketKind::Datagram)?;
-                self.inner.exclusive_access().peer = Some(remote);
+                let mut inner = self.inner.exclusive_access();
+                inner.peer = Some(remote);
+                inner.unix_peer = unix_peer;
                 Ok(0)
             }
-            SocketKind::Stream => self.connect_stream(remote),
+            SocketKind::Stream => self.connect_stream(remote, unix_peer),
         }
     }
 
-    fn connect_stream(&self, remote: InetEndpoint) -> SysResult {
+    fn connect_stream(&self, remote: InetEndpoint, unix_peer: Option<UnixAddress>) -> SysResult {
         {
             let inner = self.inner.exclusive_access();
             if inner.peer.is_some() {
@@ -493,14 +625,22 @@ impl LocalSocket {
             // launches netperf. Yield briefly so the server can reach listen().
             suspend_current_and_run_next();
         };
+        let listener_unix_local = listener.exclusive_access().unix_local.clone();
+        let (domain, client_unix_local) = {
+            let inner = self.inner.exclusive_access();
+            (inner.domain, inner.unix_local.clone())
+        };
 
         let server_inner = Arc::new(unsafe {
             UPIntrFreeCell::new(LocalSocketInner::connected(
+                domain,
                 SocketKind::Stream,
                 remote,
                 local,
                 Some(Arc::downgrade(&self.inner)),
                 ShutdownState::OPEN,
+                listener_unix_local,
+                client_unix_local,
             ))
         });
 
@@ -513,6 +653,7 @@ impl LocalSocket {
         {
             let mut client = self.inner.exclusive_access();
             client.peer = Some(remote);
+            client.unix_peer = unix_peer;
             client.peer_socket = Some(Arc::downgrade(&server_inner));
         }
         listener
@@ -522,7 +663,31 @@ impl LocalSocket {
         Ok(0)
     }
 
-    fn send_bytes(&self, data: &[u8], remote: Option<InetEndpoint>) -> SysResult<usize> {
+    fn resolve_remote_address(
+        &self,
+        address: SocketAddress,
+    ) -> SysResult<(InetEndpoint, Option<UnixAddress>)> {
+        let domain = self.inner.exclusive_access().domain;
+        match (domain, address) {
+            (SocketDomain::Inet, SocketAddress::Inet(mut endpoint)) => {
+                normalize_remote_endpoint(&mut endpoint)?;
+                Ok((endpoint, None))
+            }
+            (SocketDomain::Inet6, SocketAddress::Inet6(mut endpoint)) => {
+                normalize_remote_endpoint(&mut endpoint)?;
+                Ok((endpoint, None))
+            }
+            (SocketDomain::Unix, SocketAddress::Unix(UnixSockAddr::Named(address))) => {
+                Ok((lookup_unix_endpoint(&address)?, Some(address)))
+            }
+            (SocketDomain::Unix, SocketAddress::Unix(UnixSockAddr::Unnamed)) => {
+                Err(SysError::EINVAL)
+            }
+            _ => Err(SysError::EAFNOSUPPORT),
+        }
+    }
+
+    fn send_bytes(&self, data: &[u8], remote: Option<SocketAddress>) -> SysResult<usize> {
         match self.kind() {
             SocketKind::Stream => self.send_stream(data),
             SocketKind::Datagram => self.send_datagram(data, remote),
@@ -563,12 +728,17 @@ impl LocalSocket {
         Ok(written)
     }
 
-    fn send_datagram(&self, data: &[u8], remote: Option<InetEndpoint>) -> SysResult<usize> {
+    fn send_datagram(&self, data: &[u8], remote: Option<SocketAddress>) -> SysResult<usize> {
         let local = self.ensure_bound(SocketKind::Datagram)?;
-        let mut remote = remote
-            .or_else(|| self.inner.exclusive_access().peer)
-            .ok_or(SysError::EDESTADDRREQ)?;
-        normalize_remote_endpoint(&mut remote)?;
+        let remote = match remote {
+            Some(remote) => self.resolve_remote_address(remote)?.0,
+            None => self
+                .inner
+                .exclusive_access()
+                .peer
+                .ok_or(SysError::EDESTADDRREQ)?,
+        };
+        let local_unix = self.inner.exclusive_access().unix_local.clone();
         let target = {
             let mut loopback = LOOPBACK.exclusive_access();
             loopback.prune();
@@ -586,6 +756,7 @@ impl LocalSocket {
                 target.datagram_rx.push_back(Datagram {
                     data: data.to_vec(),
                     from: local,
+                    from_unix: local_unix,
                 });
             }
         }
@@ -596,7 +767,7 @@ impl LocalSocket {
         &self,
         buf: UserBuffer,
         nonblock: bool,
-    ) -> SysResult<(usize, Option<InetEndpoint>)> {
+    ) -> SysResult<(usize, Option<SocketAddress>)> {
         match self.kind() {
             SocketKind::Stream => self.recv_stream(buf, nonblock).map(|len| (len, None)),
             SocketKind::Datagram => self.recv_datagram(buf, nonblock),
@@ -638,13 +809,22 @@ impl LocalSocket {
         &self,
         buf: UserBuffer,
         nonblock: bool,
-    ) -> SysResult<(usize, Option<InetEndpoint>)> {
+    ) -> SysResult<(usize, Option<SocketAddress>)> {
         loop {
             let packet = self.inner.exclusive_access().datagram_rx.pop_front();
             if let Some(packet) = packet {
                 let mut buf = buf;
                 let copied = buf.copy_from_slice(&packet.data);
-                return Ok((copied, Some(packet.from)));
+                let domain = self.inner.exclusive_access().domain;
+                let from = match domain {
+                    SocketDomain::Inet => SocketAddress::Inet(packet.from),
+                    SocketDomain::Inet6 => SocketAddress::Inet6(packet.from),
+                    SocketDomain::Unix => SocketAddress::Unix(match packet.from_unix {
+                        Some(address) => UnixSockAddr::Named(address),
+                        None => UnixSockAddr::Unnamed,
+                    }),
+                };
+                return Ok((copied, Some(from)));
             }
             if nonblock {
                 return Err(SysError::EAGAIN);
@@ -656,15 +836,35 @@ impl LocalSocket {
         }
     }
 
-    fn local_endpoint(&self) -> InetEndpoint {
-        self.inner.exclusive_access().local.unwrap_or(InetEndpoint {
-            ip: ANY_IP,
-            port: 0,
-        })
+    fn local_address(&self) -> SocketAddress {
+        let inner = self.inner.exclusive_access();
+        match inner.domain {
+            SocketDomain::Inet => SocketAddress::Inet(inner.local.unwrap_or(InetEndpoint {
+                ip: ANY_IP,
+                port: 0,
+            })),
+            SocketDomain::Inet6 => SocketAddress::Inet6(inner.local.unwrap_or(InetEndpoint {
+                ip: ANY_IP,
+                port: 0,
+            })),
+            SocketDomain::Unix => SocketAddress::Unix(match inner.unix_local.clone() {
+                Some(address) => UnixSockAddr::Named(address),
+                None => UnixSockAddr::Unnamed,
+            }),
+        }
     }
 
-    fn peer_endpoint(&self) -> SysResult<InetEndpoint> {
-        self.inner.exclusive_access().peer.ok_or(SysError::ENOTCONN)
+    fn peer_address(&self) -> SysResult<SocketAddress> {
+        let inner = self.inner.exclusive_access();
+        let peer = inner.peer.ok_or(SysError::ENOTCONN)?;
+        Ok(match inner.domain {
+            SocketDomain::Inet => SocketAddress::Inet(peer),
+            SocketDomain::Inet6 => SocketAddress::Inet6(peer),
+            SocketDomain::Unix => SocketAddress::Unix(match inner.unix_peer.clone() {
+                Some(address) => UnixSockAddr::Named(address),
+                None => UnixSockAddr::Unnamed,
+            }),
+        })
     }
 
     fn set_reuse_addr(&self, enabled: bool) {
@@ -729,13 +929,15 @@ impl LocalSocket {
 
 impl Drop for LocalSocket {
     fn drop(&mut self) {
-        let (kind, local, listening, peer) = {
+        let (domain, kind, local, unix_local, listening, peer) = {
             let mut inner = self.inner.exclusive_access();
             inner.read_shutdown = true;
             inner.write_shutdown = true;
             (
+                inner.domain,
                 inner.kind,
                 inner.local,
+                inner.unix_local.clone(),
                 inner.listening,
                 inner.peer_socket.as_ref().and_then(Weak::upgrade),
             )
@@ -753,6 +955,11 @@ impl Drop for LocalSocket {
                 SocketKind::Datagram => {
                     loopback.udp_bound.remove(&local.port);
                 }
+            }
+            if domain == SocketDomain::Unix
+                && let Some(address) = unix_local
+            {
+                loopback.unix_bound.remove(&address);
             }
         }
     }
@@ -1110,10 +1317,16 @@ impl File for LocalSocket {
     }
 }
 
-fn normalize_local_endpoint(endpoint: &mut InetEndpoint) {
+fn normalize_local_endpoint(endpoint: &mut InetEndpoint) -> SysResult<()> {
     if endpoint.ip == ANY_IP {
         endpoint.ip = LOOPBACK_IP;
     }
+    if endpoint.ip != LOOPBACK_IP {
+        // UNFINISHED: only AF_INET loopback is implemented; external routing,
+        // ARP, and virtio-net packet I/O are not wired into socket syscalls yet.
+        return Err(SysError::EADDRNOTAVAIL);
+    }
+    Ok(())
 }
 
 fn normalize_remote_endpoint(endpoint: &mut InetEndpoint) -> SysResult<()> {
@@ -1128,15 +1341,23 @@ fn normalize_remote_endpoint(endpoint: &mut InetEndpoint) -> SysResult<()> {
     Ok(())
 }
 
-fn sockaddr_to_endpoint(addr: LinuxSockAddrIn) -> SysResult<InetEndpoint> {
-    if addr.family as i32 == AF_UNIX {
-        return Err(SysError::ENOENT);
-    }
-    if addr.family as i32 != AF_INET {
-        return Err(SysError::EAFNOSUPPORT);
-    }
-    Ok(InetEndpoint {
+fn sockaddr_to_endpoint(addr: LinuxSockAddrIn) -> InetEndpoint {
+    InetEndpoint {
         ip: addr.addr.to_ne_bytes(),
+        port: u16::from_be(addr.port_be),
+    }
+}
+
+fn sockaddr_in6_to_endpoint(addr: LinuxSockAddrIn6) -> SysResult<InetEndpoint> {
+    let ip = if addr.addr == ANY_IPV6 {
+        ANY_IP
+    } else if addr.addr == LOOPBACK_IPV6 {
+        LOOPBACK_IP
+    } else {
+        return Err(SysError::EADDRNOTAVAIL);
+    };
+    Ok(InetEndpoint {
+        ip,
         port: u16::from_be(addr.port_be),
     })
 }
@@ -1150,32 +1371,186 @@ fn endpoint_to_sockaddr(endpoint: InetEndpoint) -> LinuxSockAddrIn {
     }
 }
 
-fn read_sockaddr(token: usize, ptr: usize, len: u32) -> SysResult<InetEndpoint> {
+fn endpoint_to_sockaddr_in6(endpoint: InetEndpoint) -> LinuxSockAddrIn6 {
+    LinuxSockAddrIn6 {
+        family: AF_INET6 as u16,
+        port_be: endpoint.port.to_be(),
+        flowinfo: 0,
+        addr: if endpoint.ip == ANY_IP {
+            ANY_IPV6
+        } else {
+            LOOPBACK_IPV6
+        },
+        scope_id: 0,
+    }
+}
+
+fn read_socket_address(token: usize, ptr: usize, len: u32) -> SysResult<SocketAddress> {
     if ptr == 0 {
         return Err(SysError::EFAULT);
     }
-    if (len as usize) < size_of::<LinuxSockAddrIn>() {
+    if (len as usize) < size_of::<u16>() {
         return Err(SysError::EINVAL);
     }
-    sockaddr_to_endpoint(read_user_value(token, ptr as *const LinuxSockAddrIn)?)
+    let family = read_user_value(token, ptr as *const u16)? as i32;
+    match family {
+        AF_INET => {
+            if (len as usize) < size_of::<LinuxSockAddrIn>() {
+                return Err(SysError::EINVAL);
+            }
+            let addr = read_user_value(token, ptr as *const LinuxSockAddrIn)?;
+            Ok(SocketAddress::Inet(sockaddr_to_endpoint(addr)))
+        }
+        AF_INET6 => {
+            if (len as usize) < size_of::<LinuxSockAddrIn6>() {
+                return Err(SysError::EINVAL);
+            }
+            let addr = read_user_value(token, ptr as *const LinuxSockAddrIn6)?;
+            Ok(SocketAddress::Inet6(sockaddr_in6_to_endpoint(addr)?))
+        }
+        AF_UNIX => Ok(SocketAddress::Unix(read_unix_sockaddr(token, ptr, len)?)),
+        _ => Err(SysError::EAFNOSUPPORT),
+    }
 }
 
-fn write_sockaddr(token: usize, addr: usize, addrlen: usize, endpoint: InetEndpoint) -> SysResult {
+fn read_unix_sockaddr(token: usize, ptr: usize, len: u32) -> SysResult<UnixSockAddr> {
+    let path_len = (len as usize)
+        .saturating_sub(size_of::<u16>())
+        .min(size_of::<LinuxSockAddrUn>() - size_of::<u16>());
+    if path_len == 0 {
+        return Ok(UnixSockAddr::Unnamed);
+    }
+    let path = copy_user_to_vec(token, ptr + size_of::<u16>(), path_len)?;
+    if path[0] == 0 {
+        return Ok(UnixSockAddr::Named(UnixAddress::Abstract(path)));
+    }
+    let nul = path
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(path.len());
+    if nul == 0 {
+        return Ok(UnixSockAddr::Unnamed);
+    }
+    let path = core::str::from_utf8(&path[..nul]).map_err(|_| SysError::EINVAL)?;
+    Ok(UnixSockAddr::Named(UnixAddress::Pathname(path.to_string())))
+}
+
+fn write_socket_address(
+    token: usize,
+    addr: usize,
+    addrlen: usize,
+    socket_addr: SocketAddress,
+) -> SysResult {
     if addr == 0 || addrlen == 0 {
         return Ok(0);
     }
     let len_ptr = addrlen as *mut u32;
     let len = read_user_value(token, len_ptr.cast_const())?;
-    if (len as usize) < size_of::<LinuxSockAddrIn>() {
+    match socket_addr {
+        SocketAddress::Inet(endpoint) => {
+            if (len as usize) < size_of::<LinuxSockAddrIn>() {
+                return Err(SysError::EINVAL);
+            }
+            write_user_value(
+                token,
+                addr as *mut LinuxSockAddrIn,
+                &endpoint_to_sockaddr(endpoint),
+            )?;
+            write_user_value(token, len_ptr, &(size_of::<LinuxSockAddrIn>() as u32))?;
+        }
+        SocketAddress::Inet6(endpoint) => {
+            if (len as usize) < size_of::<LinuxSockAddrIn6>() {
+                return Err(SysError::EINVAL);
+            }
+            write_user_value(
+                token,
+                addr as *mut LinuxSockAddrIn6,
+                &endpoint_to_sockaddr_in6(endpoint),
+            )?;
+            write_user_value(token, len_ptr, &(size_of::<LinuxSockAddrIn6>() as u32))?;
+        }
+        SocketAddress::Unix(unix_addr) => {
+            write_unix_sockaddr(token, addr, len_ptr, len as usize, unix_addr)?;
+        }
+    }
+    Ok(0)
+}
+
+fn write_unix_sockaddr(
+    token: usize,
+    addr: usize,
+    len_ptr: *mut u32,
+    input_len: usize,
+    unix_addr: UnixSockAddr,
+) -> SysResult<()> {
+    if input_len < size_of::<u16>() {
         return Err(SysError::EINVAL);
     }
-    write_user_value(
-        token,
-        addr as *mut LinuxSockAddrIn,
-        &endpoint_to_sockaddr(endpoint),
-    )?;
-    write_user_value(token, len_ptr, &(size_of::<LinuxSockAddrIn>() as u32))?;
-    Ok(0)
+    let mut raw = LinuxSockAddrUn {
+        family: AF_UNIX as u16,
+        path: [0; 108],
+    };
+    let actual_len = match unix_addr {
+        UnixSockAddr::Unnamed => size_of::<u16>(),
+        UnixSockAddr::Named(UnixAddress::Pathname(path)) => {
+            let bytes = path.as_bytes();
+            let copy_len = bytes.len().min(raw.path.len());
+            raw.path[..copy_len].copy_from_slice(&bytes[..copy_len]);
+            size_of::<u16>() + copy_len + usize::from(copy_len < raw.path.len())
+        }
+        UnixSockAddr::Named(UnixAddress::Abstract(bytes)) => {
+            let copy_len = bytes.len().min(raw.path.len());
+            raw.path[..copy_len].copy_from_slice(&bytes[..copy_len]);
+            size_of::<u16>() + copy_len
+        }
+    };
+    let raw_bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&raw as *const LinuxSockAddrUn).cast::<u8>(),
+            size_of::<LinuxSockAddrUn>(),
+        )
+    };
+    let copy_len = input_len.min(actual_len).min(raw_bytes.len());
+    copy_to_user(token, addr as *mut u8, &raw_bytes[..copy_len])?;
+    write_user_value(token, len_ptr, &(actual_len as u32))?;
+    Ok(())
+}
+
+fn create_unix_path_node(path: &str) -> SysResult<()> {
+    let process = current_process();
+    let snapshot = process.path_snapshot();
+    let credentials = process.credentials();
+    create_node_in(
+        snapshot.context,
+        path,
+        FsNodeKind::Fifo,
+        0o777 & !process.umask(),
+        credentials.fsuid,
+        credentials.fsgid,
+        0,
+    )
+    .map_err(|err| match err {
+        FsError::AlreadyExists => SysError::EADDRINUSE,
+        other => other.into(),
+    })
+}
+
+fn lookup_unix_endpoint(address: &UnixAddress) -> SysResult<InetEndpoint> {
+    let target = {
+        let mut loopback = LOOPBACK.exclusive_access();
+        loopback.prune();
+        loopback.unix_bound.get(address).and_then(Weak::upgrade)
+    };
+    match target {
+        Some(socket) => socket
+            .exclusive_access()
+            .local
+            .ok_or(SysError::ECONNREFUSED),
+        None => match address {
+            UnixAddress::Pathname(_) => Err(SysError::ENOENT),
+            UnixAddress::Abstract(_) => Err(SysError::ECONNREFUSED),
+        },
+    }
 }
 
 fn copy_user_to_vec(token: usize, ptr: usize, len: usize) -> SysResult<Vec<u8>> {
@@ -1386,6 +1761,9 @@ fn socket_kind_from_type(ty: i32) -> SysResult<SocketKind> {
     match ty & SOCK_TYPE_MASK {
         SOCK_STREAM => Ok(SocketKind::Stream),
         SOCK_DGRAM => Ok(SocketKind::Datagram),
+        // CONTEXT: The bind LTP subset only uses AF_UNIX SOCK_SEQPACKET for
+        // connection-oriented local IPC. We reuse the stream queue semantics.
+        SOCK_SEQPACKET => Ok(SocketKind::Stream),
         _ => Err(SysError::EPROTONOSUPPORT),
     }
 }
@@ -1395,6 +1773,10 @@ fn validate_protocol(kind: SocketKind, protocol: i32) -> SysResult {
         (_, IPPROTO_IP) => Ok(0),
         (SocketKind::Stream, IPPROTO_TCP) => Ok(0),
         (SocketKind::Datagram, IPPROTO_UDP) => Ok(0),
+        // CONTEXT: LTP bind04/bind05 only require local loopback bind/connect
+        // behavior for SCTP and UDP-Lite, so both reuse the existing queues.
+        (SocketKind::Stream, IPPROTO_SCTP) => Ok(0),
+        (SocketKind::Datagram, IPPROTO_UDPLITE) => Ok(0),
         _ => Err(SysError::EPROTONOSUPPORT),
     }
 }
@@ -1447,9 +1829,20 @@ pub fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
 
     let kind = socket_kind_from_type(ty)?;
     match domain {
-        AF_INET => {
+        AF_INET | AF_INET6 => {
+            if ty & SOCK_TYPE_MASK == SOCK_SEQPACKET {
+                return Err(SysError::EPROTONOSUPPORT);
+            }
             validate_protocol(kind, protocol)?;
-            let socket = LocalSocket::new(kind, flags);
+            let socket = LocalSocket::new(
+                if domain == AF_INET {
+                    SocketDomain::Inet
+                } else {
+                    SocketDomain::Inet6
+                },
+                kind,
+                flags,
+            );
             Ok(alloc_socket_fd(socket, flags)? as isize)
         }
         AF_UNIX => {
@@ -1457,11 +1850,9 @@ pub fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
                 return Err(SysError::EPROTONOSUPPORT);
             }
             // CONTEXT: libc group/passwd lookup probes AF_UNIX nscd first.
-            // Full pathname AF_UNIX IPC is not implemented; connect/bind on a
-            // sockaddr_un still reports ENOENT so libc falls back to local
-            // database files. Creating an unbound AF_UNIX fd is enough for LTP
-            // fd-type probes such as splice07.
-            let socket = LocalSocket::new(kind, flags);
+            // The local AF_UNIX subset below supports pathname/abstract bind
+            // cases while still returning ENOENT for absent pathname servers.
+            let socket = LocalSocket::new(SocketDomain::Unix, kind, flags);
             Ok(alloc_socket_fd(socket, flags)? as isize)
         }
         _ => Err(SysError::EAFNOSUPPORT),
@@ -1487,20 +1878,26 @@ pub fn sys_socketpair(domain: i32, ty: i32, protocol: i32, sv: usize) -> SysResu
     };
     let first_inner = Arc::new(unsafe {
         UPIntrFreeCell::new(LocalSocketInner::connected(
+            SocketDomain::Unix,
             kind,
             endpoint,
             endpoint,
             None,
             ShutdownState::OPEN,
+            None,
+            None,
         ))
     });
     let second_inner = Arc::new(unsafe {
         UPIntrFreeCell::new(LocalSocketInner::connected(
+            SocketDomain::Unix,
             kind,
             endpoint,
             endpoint,
             Some(Arc::downgrade(&first_inner)),
             ShutdownState::OPEN,
+            None,
+            None,
         ))
     });
     first_inner.exclusive_access().peer_socket = Some(Arc::downgrade(&second_inner));
@@ -1547,8 +1944,8 @@ pub fn sys_bind(fd: usize, addr: usize, addrlen: u32) -> SysResult {
         .as_any()
         .downcast_ref::<LocalSocket>()
         .ok_or(SysError::ENOTSOCK)?;
-    let endpoint = read_sockaddr(token, addr, addrlen)?;
-    socket.bind_endpoint(endpoint)
+    let socket_addr = read_socket_address(token, addr, addrlen)?;
+    socket.bind_address(socket_addr)
 }
 
 pub fn sys_listen(fd: usize, backlog: i32) -> SysResult {
@@ -1580,28 +1977,28 @@ pub fn sys_accept4(fd: usize, addr: usize, addrlen: usize, flags: i32) -> SysRes
         .downcast_ref::<LocalSocket>()
         .ok_or(SysError::ENOTSOCK)?;
     let accepted = socket.accept(socket.status_flags().contains(OpenFlags::NONBLOCK))?;
-    let peer = accepted.peer_endpoint()?;
-    write_sockaddr(token, addr, addrlen, peer)?;
+    let peer = accepted.peer_address()?;
+    write_socket_address(token, addr, addrlen, peer)?;
     Ok(alloc_socket_fd(accepted, open_flags)? as isize)
 }
 
 pub fn sys_connect(fd: usize, addr: usize, addrlen: u32) -> SysResult {
     let token = current_user_token();
-    let endpoint = read_sockaddr(token, addr, addrlen)?;
-    with_socket(fd, |socket| socket.connect(endpoint))
+    let socket_addr = read_socket_address(token, addr, addrlen)?;
+    with_socket(fd, |socket| socket.connect(socket_addr))
 }
 
 pub fn sys_getsockname(fd: usize, addr: usize, addrlen: usize) -> SysResult {
     let token = current_user_token();
     with_socket(fd, |socket| {
-        write_sockaddr(token, addr, addrlen, socket.local_endpoint())
+        write_socket_address(token, addr, addrlen, socket.local_address())
     })
 }
 
 pub fn sys_getpeername(fd: usize, addr: usize, addrlen: usize) -> SysResult {
     let token = current_user_token();
     with_socket(fd, |socket| {
-        write_sockaddr(token, addr, addrlen, socket.peer_endpoint()?)
+        write_socket_address(token, addr, addrlen, socket.peer_address()?)
     })
 }
 
@@ -1618,7 +2015,7 @@ pub fn sys_sendto(
     let remote = if addr == 0 {
         None
     } else {
-        Some(read_sockaddr(token, addr, addrlen)?)
+        Some(read_socket_address(token, addr, addrlen)?)
     };
     with_socket(fd, |socket| Ok(socket.send_bytes(&data, remote)? as isize))
 }
@@ -1641,7 +2038,7 @@ pub fn sys_recvfrom(
     with_socket(fd, |socket| {
         let (read, remote) = socket.recv_bytes(user_buf, recv_nonblock(flags, socket))?;
         if let Some(remote) = remote {
-            write_sockaddr(token, addr, addrlen, remote)?;
+            write_socket_address(token, addr, addrlen, remote)?;
         }
         Ok(read as isize)
     })
