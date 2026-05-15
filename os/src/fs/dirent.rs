@@ -12,6 +12,7 @@ pub(super) const DT_DIR: u8 = 4;
 pub(super) const DT_BLK: u8 = 6;
 pub(super) const DT_REG: u8 = 8;
 pub(super) const DT_LNK: u8 = 10;
+pub(super) const DT_SOCK: u8 = 12;
 
 pub(super) struct RawDirEntry {
     pub(super) ino: u32,

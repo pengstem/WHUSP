@@ -1,12 +1,17 @@
 use crate::fs::{
-    FileStat, FileSystemStat, MountId, OpenFlags, chmod_in, chown_in, mount_is_read_only,
-    open_file_in, stat_devfs_child, stat_devfs_misc_child, stat_devfs_pts_child, stat_in,
-    stat_static_path, statfs_for_mount,
+    FileStat, FileSystemStat, FsNodeKind, MountId, OpenFlags, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
+    S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, VfsNodeId, chmod_in, chown_in, lookup_path_in,
+    mount_is_read_only, open_file_in, stat_devfs_child, stat_devfs_misc_child,
+    stat_devfs_pts_child, stat_in, stat_static_path, statfs_for_mount,
 };
+use crate::sync::SleepMutex;
 use crate::task::{PathSnapshot, current_process, current_user_token};
 
 use super::super::errno::{SysError, SysResult};
-use super::super::user_ptr::{PATH_MAX, read_user_c_string, write_user_value};
+use super::super::user_ptr::{
+    PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, translated_byte_buffer_checked,
+    write_user_value,
+};
 use super::fanotify::fanotify_notify_attrib;
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::path::{check_current_access_path_prefixes_from, path_context_from};
@@ -14,13 +19,31 @@ use super::uapi::{
     AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, LinuxKstat, LinuxStatfs, LinuxStatx,
     STATX_RESERVED, VALID_FCHOWNAT_FLAGS, VALID_FSTATAT_FLAGS, VALID_STATX_FLAGS,
 };
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
+use lazy_static::lazy_static;
 
 const UID_GID_NO_CHANGE: u32 = u32::MAX;
 const MODE_SETUID: u32 = 0o4000;
 const MODE_SETGID: u32 = 0o2000;
 const MODE_GROUP_EXEC: u32 = 0o0010;
 const XATTR_NAME_MAX: usize = 255;
+const XATTR_SIZE_MAX: usize = 64 * 1024;
+const XATTR_CREATE: u32 = 1;
+const XATTR_REPLACE: u32 = 2;
 const PIPEFS_MAGIC: i64 = 0x5049_5045;
+
+lazy_static! {
+    static ref XATTRS: SleepMutex<BTreeMap<(VfsNodeId, String), Vec<u8>>> =
+        SleepMutex::new(BTreeMap::new());
+}
+
+#[derive(Clone, Copy)]
+struct XattrTarget {
+    node: VfsNodeId,
+    kind: FsNodeKind,
+}
 
 fn write_stat_result<T: From<FileStat> + Copy>(
     token: usize,
@@ -346,20 +369,220 @@ pub fn sys_fchownat(
     )
 }
 
-pub fn sys_fgetxattr(fd: usize, name: *const u8, value: *mut u8, size: usize) -> SysResult {
+fn read_xattr_name(token: usize, name: *const u8) -> SysResult<String> {
+    let name = read_user_c_string(token, name, XATTR_NAME_MAX + 1)?;
+    if !xattr_name_supported(name.as_str()) {
+        return Err(SysError::ENOTSUP);
+    }
+    Ok(name)
+}
+
+fn read_xattr_value(token: usize, value: *const u8, size: usize) -> SysResult<Vec<u8>> {
+    if size > XATTR_SIZE_MAX {
+        return Err(SysError::ERANGE);
+    }
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    if value.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    let buffers = translated_byte_buffer_checked(token, value, size, UserBufferAccess::Read)?;
+    let mut bytes = Vec::with_capacity(size);
+    for buffer in buffers {
+        bytes.extend_from_slice(buffer);
+    }
+    Ok(bytes)
+}
+
+fn xattr_name_supported(name: &str) -> bool {
+    matches!(
+        name.split_once('.'),
+        Some(("user" | "trusted" | "security" | "system", suffix)) if !suffix.is_empty()
+    )
+}
+
+fn xattr_user_namespace_allowed(kind: FsNodeKind) -> bool {
+    matches!(kind, FsNodeKind::RegularFile | FsNodeKind::Directory)
+}
+
+fn xattr_kind_from_mode(mode: u32) -> FsNodeKind {
+    match mode & S_IFMT {
+        S_IFDIR => FsNodeKind::Directory,
+        S_IFREG => FsNodeKind::RegularFile,
+        S_IFLNK => FsNodeKind::Symlink,
+        S_IFIFO => FsNodeKind::Fifo,
+        S_IFCHR => FsNodeKind::CharacterDevice,
+        S_IFBLK => FsNodeKind::BlockDevice,
+        S_IFSOCK => FsNodeKind::Socket,
+        _ => FsNodeKind::Other,
+    }
+}
+
+fn xattr_target_from_path(path: *const u8, follow_final_symlink: bool) -> SysResult<XattrTarget> {
+    let token = current_user_token();
+    let path = read_user_c_string(token, path, PATH_MAX)?;
+    if path.is_empty() {
+        return Err(SysError::ENOENT);
+    }
+    let snapshot = current_process().path_snapshot();
+    let context = path_context_from(&snapshot, AT_FDCWD, path.as_str())?;
+    let resolved = lookup_path_in(context, path.as_str(), follow_final_symlink)?;
+    Ok(XattrTarget {
+        node: resolved.node,
+        kind: resolved.kind,
+    })
+}
+
+fn xattr_target_from_fd(fd: usize) -> SysResult<XattrTarget> {
     let entry = get_fd_entry_by_fd(fd)?;
     if entry.status_flags().contains(OpenFlags::PATH) {
         return Err(SysError::EBADF);
     }
+    let file = entry.file();
+    let node = file.vfs_node_id().ok_or(SysError::ENOTSUP)?;
+    let stat = file.stat()?;
+    Ok(XattrTarget {
+        node,
+        kind: xattr_kind_from_mode(stat.mode),
+    })
+}
+
+fn xattr_get(target: XattrTarget, name: &str, value: *mut u8, size: usize) -> SysResult {
     let token = current_user_token();
-    let _name = read_user_c_string(token, name, XATTR_NAME_MAX + 1)?;
-    if size > 0 && value.is_null() {
+    if name.starts_with("user.") && !xattr_user_namespace_allowed(target.kind) {
+        return Err(SysError::ENODATA);
+    }
+    let key = (target.node, String::from(name));
+    let attrs = XATTRS.lock();
+    let stored = attrs.get(&key).ok_or(SysError::ENODATA)?;
+    if size == 0 {
+        return Ok(stored.len() as isize);
+    }
+    if value.is_null() {
         return Err(SysError::EFAULT);
     }
-    // UNFINISHED: Extended attribute storage is not implemented. This handler
-    // exists to expose the Linux-visible fd validation and O_PATH EBADF
-    // behavior required before real xattr lookup can be added.
-    Err(SysError::ENOTSUP)
+    if size < stored.len() {
+        return Err(SysError::ERANGE);
+    }
+    copy_to_user(token, value, stored)?;
+    Ok(stored.len() as isize)
+}
+
+fn xattr_set(target: XattrTarget, name: &str, value: Vec<u8>, flags: u32) -> SysResult {
+    if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 || flags == (XATTR_CREATE | XATTR_REPLACE) {
+        return Err(SysError::EINVAL);
+    }
+    if name.starts_with("user.") && !xattr_user_namespace_allowed(target.kind) {
+        return Err(SysError::ENOTSUP);
+    }
+    // UNFINISHED: xattrs are kept in a kernel in-memory VFS side table. They
+    // are enough for one-boot LTP syscall semantics but are not persisted into
+    // EXT4/TMPFS backing storage and are not reclaimed on every inode reuse.
+    let key = (target.node, String::from(name));
+    let mut attrs = XATTRS.lock();
+    let exists = attrs.contains_key(&key);
+    if flags & XATTR_CREATE != 0 && exists {
+        return Err(SysError::EEXIST);
+    }
+    if flags & XATTR_REPLACE != 0 && !exists {
+        return Err(SysError::ENODATA);
+    }
+    attrs.insert(key, value);
+    Ok(0)
+}
+
+fn xattr_remove(target: XattrTarget, name: &str) -> SysResult {
+    let key = (target.node, String::from(name));
+    if XATTRS.lock().remove(&key).is_some() {
+        Ok(0)
+    } else {
+        Err(SysError::ENODATA)
+    }
+}
+
+pub fn sys_setxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: u32,
+) -> SysResult {
+    let token = current_user_token();
+    let name = read_xattr_name(token, name)?;
+    let value = read_xattr_value(token, value, size)?;
+    let target = xattr_target_from_path(path, true)?;
+    xattr_set(target, name.as_str(), value, flags)
+}
+
+pub fn sys_lsetxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: u32,
+) -> SysResult {
+    let token = current_user_token();
+    let name = read_xattr_name(token, name)?;
+    let value = read_xattr_value(token, value, size)?;
+    let target = xattr_target_from_path(path, false)?;
+    xattr_set(target, name.as_str(), value, flags)
+}
+
+pub fn sys_fsetxattr(
+    fd: usize,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: u32,
+) -> SysResult {
+    let token = current_user_token();
+    let name = read_xattr_name(token, name)?;
+    let value = read_xattr_value(token, value, size)?;
+    let target = xattr_target_from_fd(fd)?;
+    xattr_set(target, name.as_str(), value, flags)
+}
+
+pub fn sys_getxattr(path: *const u8, name: *const u8, value: *mut u8, size: usize) -> SysResult {
+    let token = current_user_token();
+    let name = read_xattr_name(token, name)?;
+    let target = xattr_target_from_path(path, true)?;
+    xattr_get(target, name.as_str(), value, size)
+}
+
+pub fn sys_lgetxattr(path: *const u8, name: *const u8, value: *mut u8, size: usize) -> SysResult {
+    let token = current_user_token();
+    let name = read_xattr_name(token, name)?;
+    let target = xattr_target_from_path(path, false)?;
+    xattr_get(target, name.as_str(), value, size)
+}
+
+pub fn sys_fgetxattr(fd: usize, name: *const u8, value: *mut u8, size: usize) -> SysResult {
+    let token = current_user_token();
+    let name = read_xattr_name(token, name)?;
+    let target = xattr_target_from_fd(fd)?;
+    xattr_get(target, name.as_str(), value, size)
+}
+
+pub fn sys_removexattr(path: *const u8, name: *const u8) -> SysResult {
+    let token = current_user_token();
+    let name = read_xattr_name(token, name)?;
+    let target = xattr_target_from_path(path, true)?;
+    xattr_remove(target, name.as_str())
+}
+
+pub fn sys_lremovexattr(path: *const u8, name: *const u8) -> SysResult {
+    let token = current_user_token();
+    let name = read_xattr_name(token, name)?;
+    let target = xattr_target_from_path(path, false)?;
+    xattr_remove(target, name.as_str())
+}
+
+pub fn sys_fremovexattr(fd: usize, name: *const u8) -> SysResult {
+    let token = current_user_token();
+    let name = read_xattr_name(token, name)?;
+    let target = xattr_target_from_fd(fd)?;
+    xattr_remove(target, name.as_str())
 }
 
 pub fn sys_statfs(pathname: *const u8, statfsbuf: *mut LinuxStatfs) -> SysResult {

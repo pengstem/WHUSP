@@ -1,5 +1,5 @@
 use super::dirent::{
-    DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_UNKNOWN, LINUX_DIRENT64_ALIGN,
+    DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, DT_UNKNOWN, LINUX_DIRENT64_ALIGN,
     LINUX_DIRENT64_HEADER_SIZE,
 };
 use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult};
@@ -73,9 +73,8 @@ fn into_node_kind(kind: InodeType) -> FsNodeKind {
         InodeType::Symlink => FsNodeKind::Symlink,
         InodeType::Fifo => FsNodeKind::Fifo,
         InodeType::CharacterDevice => FsNodeKind::CharacterDevice,
-        // UNFINISHED: Linux distinguishes block devices and sockets in
-        // stat/getdents; this VFS currently keeps those less-used EXT4 types
-        // grouped as Other.
+        InodeType::BlockDevice => FsNodeKind::BlockDevice,
+        InodeType::Socket => FsNodeKind::Socket,
         _ => FsNodeKind::Other,
     }
 }
@@ -87,6 +86,8 @@ fn into_linux_dtype(kind: InodeType) -> u8 {
         InodeType::Symlink => DT_LNK,
         InodeType::Fifo => DT_FIFO,
         InodeType::CharacterDevice => DT_CHR,
+        InodeType::BlockDevice => DT_BLK,
+        InodeType::Socket => DT_SOCK,
         _ => DT_UNKNOWN,
     }
 }
@@ -190,6 +191,8 @@ impl FileSystemBackend for Ext4Mount {
             FsNodeKind::RegularFile => InodeType::RegularFile,
             FsNodeKind::Fifo => InodeType::Fifo,
             FsNodeKind::CharacterDevice => InodeType::CharacterDevice,
+            FsNodeKind::BlockDevice => InodeType::BlockDevice,
+            FsNodeKind::Socket => InodeType::Socket,
             _ => return Err(FsError::InvalidInput),
         };
         // UNFINISHED: The vendored lwext4 wrapper can create special inode

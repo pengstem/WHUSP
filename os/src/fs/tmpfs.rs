@@ -1,6 +1,10 @@
-use super::dirent::{DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, RawDirEntry, write_dir_entries};
+use super::dirent::{
+    DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, RawDirEntry, write_dir_entries,
+};
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
-use super::{FileStat, FileTimestamp, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG};
+use super::{
+    FileStat, FileTimestamp, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK,
+};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -500,6 +504,8 @@ impl TmpFs {
                 FsNodeKind::Symlink => DT_LNK,
                 FsNodeKind::Fifo => DT_FIFO,
                 FsNodeKind::CharacterDevice => DT_CHR,
+                FsNodeKind::BlockDevice => DT_BLK,
+                FsNodeKind::Socket => DT_SOCK,
                 FsNodeKind::Other => 0,
             };
             entries.push(RawDirEntry {
@@ -568,6 +574,8 @@ impl FileSystemBackend for TmpFs {
             FsNodeKind::RegularFile => S_IFREG,
             FsNodeKind::Fifo => S_IFIFO,
             FsNodeKind::CharacterDevice => S_IFCHR,
+            FsNodeKind::BlockDevice => S_IFBLK,
+            FsNodeKind::Socket => S_IFSOCK,
             _ => return Err(FsError::InvalidInput),
         };
         self.create_node(parent_ino, leaf_name, kind, file_type | (mode & 0o7777))

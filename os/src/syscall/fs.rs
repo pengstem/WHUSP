@@ -47,8 +47,9 @@ pub use path::{
 };
 pub use poll::{sys_ppoll, sys_pselect6};
 pub use stat::{
-    sys_fchmod, sys_fchmodat, sys_fchown, sys_fchownat, sys_fgetxattr, sys_fstat, sys_fstatfs,
-    sys_newfstatat, sys_statfs, sys_statx,
+    sys_fchmod, sys_fchmodat, sys_fchown, sys_fchownat, sys_fgetxattr, sys_fremovexattr,
+    sys_fsetxattr, sys_fstat, sys_fstatfs, sys_getxattr, sys_lgetxattr, sys_lremovexattr,
+    sys_lsetxattr, sys_newfstatat, sys_removexattr, sys_setxattr, sys_statfs, sys_statx,
 };
 pub use tty::sys_ioctl;
 pub use uapi::{LinuxIovec, LinuxKstat, LinuxPollFd, LinuxStatfs, LinuxStatx};

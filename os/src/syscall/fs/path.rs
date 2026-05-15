@@ -775,10 +775,8 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, dev: u64) -> SysRes
             }
             FsNodeKind::CharacterDevice
         }
-        // UNFINISHED: Linux mknodat supports block devices and filesystem
-        // socket nodes. This kernel only implements the LTP-visible regular,
-        // FIFO, and character-device create paths for now.
-        S_IFBLK | S_IFSOCK => return Err(SysError::ENOTSUP),
+        S_IFBLK => FsNodeKind::BlockDevice,
+        S_IFSOCK => FsNodeKind::Socket,
         _ => return Err(SysError::EINVAL),
     };
 

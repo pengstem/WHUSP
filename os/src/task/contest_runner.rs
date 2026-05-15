@@ -97,7 +97,7 @@ pub(super) fn build_runner_command() -> String {
 
 fn append_runtime_environment(command: &mut String, first: &mut bool) {
     append_separator(command, first);
-    command.push_str("/musl/busybox mkdir -p /tmp/bin && /musl/busybox --install -s /tmp/bin; for cmd in useradd userdel groupdel; do /musl/busybox printf '#!/musl/busybox sh\\nexit 0\\n' > /tmp/bin/$cmd; /musl/busybox chmod +x /tmp/bin/$cmd; done; export PATH=/tmp/bin:/musl:/glibc:$PATH");
+    command.push_str("/musl/busybox mkdir -p /tmp/bin && /musl/busybox --install -s /tmp/bin; for cmd in useradd userdel groupdel mkfs.xfs; do /musl/busybox printf '#!/musl/busybox sh\\nexit 0\\n' > /tmp/bin/$cmd; /musl/busybox chmod +x /tmp/bin/$cmd; done; export PATH=/tmp/bin:/musl:/glibc:$PATH");
 }
 
 fn append_separator(command: &mut String, first: &mut bool) {

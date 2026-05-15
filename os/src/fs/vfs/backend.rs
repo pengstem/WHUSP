@@ -12,6 +12,8 @@ pub(crate) enum FsNodeKind {
     Symlink,
     Fifo,
     CharacterDevice,
+    BlockDevice,
+    Socket,
     Other,
 }
 

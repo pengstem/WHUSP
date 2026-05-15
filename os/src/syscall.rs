@@ -1,4 +1,12 @@
+const SYSCALL_SETXATTR: usize = 5;
+const SYSCALL_LSETXATTR: usize = 6;
+const SYSCALL_FSETXATTR: usize = 7;
+const SYSCALL_GETXATTR: usize = 8;
+const SYSCALL_LGETXATTR: usize = 9;
 const SYSCALL_FGETXATTR: usize = 10;
+const SYSCALL_REMOVEXATTR: usize = 14;
+const SYSCALL_LREMOVEXATTR: usize = 15;
+const SYSCALL_FREMOVEXATTR: usize = 16;
 const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_EVENTFD2: usize = 19;
 const SYSCALL_EPOLL_CREATE1: usize = 20;
@@ -324,11 +332,47 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     }
 
     ret(match syscall_id {
-        SYSCALL_EVENTFD2 => sys_eventfd2(args[0] as u32, args[1] as u32),
-        SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
+        SYSCALL_SETXATTR => sys_setxattr(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+            args[4] as u32,
+        ),
+        SYSCALL_LSETXATTR => sys_lsetxattr(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+            args[4] as u32,
+        ),
+        SYSCALL_FSETXATTR => sys_fsetxattr(
+            args[0],
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+            args[4] as u32,
+        ),
+        SYSCALL_GETXATTR => sys_getxattr(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+        ),
+        SYSCALL_LGETXATTR => sys_lgetxattr(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+        ),
         SYSCALL_FGETXATTR => {
             sys_fgetxattr(args[0], args[1] as *const u8, args[2] as *mut u8, args[3])
         }
+        SYSCALL_REMOVEXATTR => sys_removexattr(args[0] as *const u8, args[1] as *const u8),
+        SYSCALL_LREMOVEXATTR => sys_lremovexattr(args[0] as *const u8, args[1] as *const u8),
+        SYSCALL_FREMOVEXATTR => sys_fremovexattr(args[0], args[1] as *const u8),
+        SYSCALL_EVENTFD2 => sys_eventfd2(args[0] as u32, args[1] as u32),
+        SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_EPOLL_CREATE1 => sys_epoll_create1(args[0] as u32),
         SYSCALL_EPOLL_CTL => sys_epoll_ctl(args[0], args[1] as i32, args[2], args[3] as *const u8),
         SYSCALL_EPOLL_PWAIT => sys_epoll_pwait(
