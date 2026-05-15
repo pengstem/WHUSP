@@ -39,6 +39,7 @@ const ETC_PROTOCOLS: &[u8] = b"ip 0 IP\ntcp 6 TCP\nudp 17 UDP\n";
 const PROC_BUS_INPUT_DEVICES: &[u8] =
     b"I: Bus=0003 Vendor=0001 Product=0001 Version=0001\nN: Name=\"virtual-device-ltp\"\n";
 const SYS_INPUT0_NAME: &[u8] = b"virtual-device-ltp\n";
+const PROC_RANDOM_ENTROPY_AVAIL: &[u8] = b"256\n";
 #[cfg(target_arch = "loongarch64")]
 const LA_MUSL_COMPAT_SO: &[u8] =
     include_bytes!("../../assets/loongarch64/liboscomp-musl-compat.so");
@@ -54,6 +55,7 @@ enum StaticNode {
     Protocols,
     ProcBusInputDevices,
     SysInput0Name,
+    ProcRandomEntropyAvail,
     #[cfg(target_arch = "loongarch64")]
     OptDir,
     #[cfg(target_arch = "loongarch64")]
@@ -90,6 +92,7 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
         "/etc/resolv.conf" => Some(StaticNode::ResolvConf),
         "/etc/protocols" => Some(StaticNode::Protocols),
         "/proc/bus/input/devices" => Some(StaticNode::ProcBusInputDevices),
+        "/proc/sys/kernel/random/entropy_avail" => Some(StaticNode::ProcRandomEntropyAvail),
         "/sys/devices/virtual/input/input0/name" => Some(StaticNode::SysInput0Name),
         #[cfg(target_arch = "loongarch64")]
         "/opt" | "/opt/" => Some(StaticNode::OptDir),
@@ -115,6 +118,7 @@ fn content(node: StaticNode) -> Option<&'static [u8]> {
         StaticNode::Protocols => Some(ETC_PROTOCOLS),
         StaticNode::ProcBusInputDevices => Some(PROC_BUS_INPUT_DEVICES),
         StaticNode::SysInput0Name => Some(SYS_INPUT0_NAME),
+        StaticNode::ProcRandomEntropyAvail => Some(PROC_RANDOM_ENTROPY_AVAIL),
         StaticNode::EtcDir => None,
         #[cfg(target_arch = "loongarch64")]
         StaticNode::OptDir
@@ -158,6 +162,7 @@ fn stat_node(node: StaticNode) -> FileStat {
         StaticNode::Protocols => 7,
         StaticNode::ProcBusInputDevices => 12,
         StaticNode::SysInput0Name => 13,
+        StaticNode::ProcRandomEntropyAvail => 14,
         #[cfg(target_arch = "loongarch64")]
         StaticNode::OptDir => 8,
         #[cfg(target_arch = "loongarch64")]

@@ -26,6 +26,7 @@ use lazy_static::lazy_static;
 const DEVFS_DEV: u64 = 0x646576;
 const DEVFS_MAGIC: i64 = 0x0102_1994;
 const LOOP_DEVICE_SIZE_FALLBACK: u64 = 300 * 1024 * 1024;
+const LOOP_DEVICE_DEFAULT_READ_AHEAD: usize = 128;
 const PTY_BUFFER_CAPACITY: usize = 8192;
 const PTY_TABLE_SIZE: usize = 64;
 const PTY_INO_BASE: u32 = 0x1000;
@@ -52,6 +53,9 @@ const INPUT_DEFAULT_REP_PERIOD_MS: i32 = 33;
 lazy_static! {
     static ref LOOP0_BACKEND: UPIntrFreeCell<Option<Arc<dyn File + Send + Sync>>> =
         unsafe { UPIntrFreeCell::new(None) };
+    static ref LOOP0_READ_ONLY: UPIntrFreeCell<bool> = unsafe { UPIntrFreeCell::new(false) };
+    static ref LOOP0_READ_AHEAD: UPIntrFreeCell<usize> =
+        unsafe { UPIntrFreeCell::new(LOOP_DEVICE_DEFAULT_READ_AHEAD) };
     static ref PTY_TABLE: UPIntrFreeCell<PtyTable> =
         unsafe { UPIntrFreeCell::new(PtyTable::new()) };
     static ref INPUT_STATE: UPIntrFreeCell<InputState> =
@@ -80,6 +84,8 @@ enum DevNode {
     UInput,
     InputEvent0,
     InputMice,
+    Net,
+    Tun,
 }
 
 impl DevNode {
@@ -105,12 +111,14 @@ impl DevNode {
             Self::UInput => 18,
             Self::InputEvent0 => 19,
             Self::InputMice => 20,
+            Self::Net => 21,
+            Self::Tun => 22,
         }
     }
 
     fn rdev(self) -> u64 {
         match self {
-            Self::Root | Self::Misc | Self::Pts => 0,
+            Self::Root | Self::Misc | Self::Pts | Self::Input | Self::Net => 0,
             Self::Null => linux_makedev(1, 3),
             Self::Zero => linux_makedev(1, 5),
             Self::Full => linux_makedev(1, 7),
@@ -124,10 +132,10 @@ impl DevNode {
             Self::Rtc => linux_makedev(253, 0),
             Self::LoopControl => linux_makedev(10, 237),
             Self::Loop0 => linux_makedev(7, 0),
-            Self::Input => 0,
             Self::UInput => linux_makedev(10, 223),
             Self::InputEvent0 => linux_makedev(13, 64),
             Self::InputMice => linux_makedev(13, 63),
+            Self::Tun => linux_makedev(10, 200),
         }
     }
 
@@ -137,7 +145,7 @@ impl DevNode {
 
     fn kind(self) -> FsNodeKind {
         match self {
-            Self::Root | Self::Misc | Self::Pts | Self::Input => FsNodeKind::Directory,
+            Self::Root | Self::Misc | Self::Pts | Self::Input | Self::Net => FsNodeKind::Directory,
             _ => FsNodeKind::CharacterDevice,
         }
     }
@@ -605,7 +613,7 @@ struct DevDirEntry {
     dtype: u8,
 }
 
-const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 20] = [
+const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 21] = [
     DevDirEntry {
         node: DevNode::Root,
         name: b".",
@@ -677,6 +685,11 @@ const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 20] = [
         dtype: DT_DIR,
     },
     DevDirEntry {
+        node: DevNode::Net,
+        name: b"net",
+        dtype: DT_DIR,
+    },
+    DevDirEntry {
         node: DevNode::UInput,
         name: b"uinput",
         dtype: DT_CHR,
@@ -705,6 +718,24 @@ const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 20] = [
         node: DevNode::Misc,
         name: b"misc",
         dtype: DT_DIR,
+    },
+];
+
+const NET_DEV_DIR_ENTRIES: [DevDirEntry; 3] = [
+    DevDirEntry {
+        node: DevNode::Net,
+        name: b".",
+        dtype: DT_DIR,
+    },
+    DevDirEntry {
+        node: DevNode::Root,
+        name: b"..",
+        dtype: DT_DIR,
+    },
+    DevDirEntry {
+        node: DevNode::Tun,
+        name: b"tun",
+        dtype: DT_CHR,
     },
 ];
 
@@ -782,6 +813,8 @@ fn node_from_ino(ino: u32) -> Option<DevNode> {
         18 => Some(DevNode::UInput),
         19 => Some(DevNode::InputEvent0),
         20 => Some(DevNode::InputMice),
+        21 => Some(DevNode::Net),
+        22 => Some(DevNode::Tun),
         _ => None,
     }
 }
@@ -816,6 +849,7 @@ fn lookup_child(parent: DevNode, path: &str) -> Option<DevNode> {
             "tty9" => Some(DevNode::Tty9),
             "ptmx" => Some(DevNode::PtMx),
             "input" => Some(DevNode::Input),
+            "net" => Some(DevNode::Net),
             "uinput" => Some(DevNode::UInput),
             "rtc" | "rtc0" => Some(DevNode::Rtc),
             "loop-control" => Some(DevNode::LoopControl),
@@ -834,6 +868,12 @@ fn lookup_child(parent: DevNode, path: &str) -> Option<DevNode> {
             "uinput" => Some(DevNode::UInput),
             "event0" => Some(DevNode::InputEvent0),
             "mice" => Some(DevNode::InputMice),
+            _ => None,
+        },
+        DevNode::Net => match path {
+            "." => Some(DevNode::Net),
+            ".." => Some(DevNode::Root),
+            "tun" => Some(DevNode::Tun),
             _ => None,
         },
         DevNode::Pts => match path {
@@ -934,7 +974,7 @@ fn open_node_at(
     }
     if matches!(
         node,
-        DevNode::Root | DevNode::Misc | DevNode::Pts | DevNode::Input
+        DevNode::Root | DevNode::Misc | DevNode::Pts | DevNode::Input | DevNode::Net
     ) {
         if !flags.can_open_directory() {
             return Err(FsError::IsDir);
@@ -974,6 +1014,9 @@ pub(crate) fn open_child(
     if let Some(rest) = path.strip_prefix("input/") {
         return open_input_child(rest, flags);
     }
+    if let Some(rest) = path.strip_prefix("net/") {
+        return open_net_child(rest, flags);
+    }
     if path.contains('/') {
         return Ok(None);
     }
@@ -1002,6 +1045,18 @@ pub(crate) fn open_input_child(
         return Ok(None);
     }
     lookup_child(DevNode::Input, path)
+        .map(|node| open_node(node, flags))
+        .transpose()
+}
+
+pub(crate) fn open_net_child(
+    path: &str,
+    flags: OpenFlags,
+) -> FsResult<Option<Arc<dyn File + Send + Sync>>> {
+    if path.contains('/') {
+        return Ok(None);
+    }
+    lookup_child(DevNode::Net, path)
         .map(|node| open_node(node, flags))
         .transpose()
 }
@@ -1044,7 +1099,9 @@ pub(crate) fn inode_is_pts_dir(ino: u32) -> bool {
 
 fn stat_node(node: DevNode) -> FileStat {
     let mode = match node {
-        DevNode::Root | DevNode::Misc | DevNode::Pts | DevNode::Input => S_IFDIR | 0o755,
+        DevNode::Root | DevNode::Misc | DevNode::Pts | DevNode::Input | DevNode::Net => {
+            S_IFDIR | 0o755
+        }
         DevNode::Loop0 => S_IFBLK | 0o666,
         DevNode::PtMx => S_IFCHR | 0o666,
         _ => S_IFCHR | 0o666,
@@ -1055,7 +1112,7 @@ fn stat_node(node: DevNode) -> FileStat {
     stat.rdev = node.rdev();
     stat.nlink = if matches!(
         node,
-        DevNode::Root | DevNode::Misc | DevNode::Pts | DevNode::Input
+        DevNode::Root | DevNode::Misc | DevNode::Pts | DevNode::Input | DevNode::Net
     ) {
         2
     } else {
@@ -1199,6 +1256,13 @@ pub(crate) fn is_devfs_input_event(file: &(dyn File + Send + Sync)) -> bool {
     file.as_any().downcast_ref::<InputEventFile>().is_some()
 }
 
+pub(crate) fn is_devfs_tun(file: &(dyn File + Send + Sync)) -> bool {
+    file.as_any()
+        .downcast_ref::<DevFsFile>()
+        .map(|file| file.node == DevNode::Tun)
+        .unwrap_or(false)
+}
+
 pub(crate) fn devfs_uinput_set_evbit(file: &(dyn File + Send + Sync), code: usize) -> FsResult {
     let file = file
         .as_any()
@@ -1270,11 +1334,40 @@ pub(crate) fn loop_device_is_attached(id: usize) -> bool {
     id == 0 && LOOP0_BACKEND.exclusive_session(|backend| backend.is_some())
 }
 
+pub(crate) fn loop_device_is_read_only(id: usize) -> bool {
+    id == 0 && LOOP0_READ_ONLY.exclusive_session(|read_only| *read_only)
+}
+
+pub(crate) fn loop_device_set_read_only(id: usize, read_only: bool) -> FsResult {
+    if id != 0 || !loop_device_is_attached(id) {
+        return Err(FsError::NoDeviceOrAddress);
+    }
+    LOOP0_READ_ONLY.exclusive_session(|slot| *slot = read_only);
+    Ok(())
+}
+
+pub(crate) fn loop_device_read_ahead(id: usize) -> FsResult<usize> {
+    if id != 0 || !loop_device_is_attached(id) {
+        return Err(FsError::NoDeviceOrAddress);
+    }
+    Ok(LOOP0_READ_AHEAD.exclusive_session(|read_ahead| *read_ahead))
+}
+
+pub(crate) fn loop_device_set_read_ahead(id: usize, read_ahead: usize) -> FsResult {
+    if id != 0 || !loop_device_is_attached(id) {
+        return Err(FsError::NoDeviceOrAddress);
+    }
+    LOOP0_READ_AHEAD.exclusive_session(|slot| *slot = read_ahead);
+    Ok(())
+}
+
 pub(crate) fn attach_loop_device(id: usize, backend: Arc<dyn File + Send + Sync>) -> FsResult {
     if id != 0 {
         return Err(FsError::NoDeviceOrAddress);
     }
     super::mount::reset_ext_scratch_mount("/dev/loop0");
+    LOOP0_READ_ONLY.exclusive_session(|slot| *slot = false);
+    LOOP0_READ_AHEAD.exclusive_session(|slot| *slot = LOOP_DEVICE_DEFAULT_READ_AHEAD);
     LOOP0_BACKEND.exclusive_session(|slot| *slot = Some(backend));
     Ok(())
 }
@@ -1285,6 +1378,10 @@ pub(crate) fn detach_loop_device(id: usize) -> FsResult {
     }
     LOOP0_BACKEND
         .exclusive_session(|slot| slot.take())
+        .inspect(|_| {
+            LOOP0_READ_ONLY.exclusive_session(|slot| *slot = false);
+            LOOP0_READ_AHEAD.exclusive_session(|slot| *slot = LOOP_DEVICE_DEFAULT_READ_AHEAD);
+        })
         .map(|_| ())
         .ok_or(FsError::NoDeviceOrAddress)
 }
@@ -1302,6 +1399,9 @@ pub(crate) fn stat_child(path: &str) -> Option<FileStat> {
     }
     if let Some(rest) = path.strip_prefix("input/") {
         return stat_input_child(rest);
+    }
+    if let Some(rest) = path.strip_prefix("net/") {
+        return stat_net_child(rest);
     }
     if path.contains('/') {
         return None;
@@ -1321,6 +1421,13 @@ pub(crate) fn stat_input_child(path: &str) -> Option<FileStat> {
         return None;
     }
     Some(stat_node(lookup_child(DevNode::Input, path)?))
+}
+
+pub(crate) fn stat_net_child(path: &str) -> Option<FileStat> {
+    if path.contains('/') {
+        return None;
+    }
+    Some(stat_node(lookup_child(DevNode::Net, path)?))
 }
 
 pub(crate) fn stat_pts_child(path: &str) -> Option<FileStat> {
@@ -1716,6 +1823,7 @@ fn dir_entries(node: DevNode) -> Option<&'static [DevDirEntry]> {
         DevNode::Root => Some(&ROOT_DEV_DIR_ENTRIES),
         DevNode::Misc => Some(&MISC_DEV_DIR_ENTRIES),
         DevNode::Input => Some(&INPUT_DEV_DIR_ENTRIES),
+        DevNode::Net => Some(&NET_DEV_DIR_ENTRIES),
         _ => None,
     }
 }
@@ -1983,6 +2091,9 @@ impl FileSystemBackend for DevFs {
             DevNode::Input => {
                 write_dir_entries(&raw_static_entries(&INPUT_DEV_DIR_ENTRIES), offset, buf)
             }
+            DevNode::Net => {
+                write_dir_entries(&raw_static_entries(&NET_DEV_DIR_ENTRIES), offset, buf)
+            }
             DevNode::Pts => write_dir_entries(&raw_pts_entries(), offset, buf),
             _ => Err(FsError::NotDir),
         }
@@ -2015,6 +2126,7 @@ impl File for DevFsFile {
             DevNode::Root
             | DevNode::Misc
             | DevNode::Input
+            | DevNode::Net
             | DevNode::Pts
             | DevNode::Null
             | DevNode::Rtc
@@ -2027,6 +2139,7 @@ impl File for DevFsFile {
             DevNode::UInput => 0,
             DevNode::InputEvent0 => 0,
             DevNode::InputMice => read_input_mice(self.status_flags.get(), user_buf),
+            DevNode::Tun => 0,
         }
     }
 
@@ -2035,6 +2148,7 @@ impl File for DevFsFile {
             DevNode::Root
             | DevNode::Misc
             | DevNode::Input
+            | DevNode::Net
             | DevNode::Pts
             | DevNode::Rtc
             | DevNode::Full
@@ -2045,7 +2159,7 @@ impl File for DevFsFile {
                 write_console(user_buf)
             }
             DevNode::Loop0 => write_loop0(&self.offset, user_buf),
-            DevNode::UInput | DevNode::InputEvent0 | DevNode::InputMice => 0,
+            DevNode::UInput | DevNode::InputEvent0 | DevNode::InputMice | DevNode::Tun => 0,
         }
     }
 
@@ -2115,7 +2229,7 @@ impl File for DevFsFile {
     fn working_dir(&self) -> Option<WorkingDir> {
         if !matches!(
             self.node,
-            DevNode::Root | DevNode::Misc | DevNode::Pts | DevNode::Input
+            DevNode::Root | DevNode::Misc | DevNode::Pts | DevNode::Input | DevNode::Net
         ) {
             return None;
         }
@@ -2153,7 +2267,7 @@ impl File for DevFsFile {
     fn is_devfs_dir(&self) -> bool {
         matches!(
             self.node,
-            DevNode::Root | DevNode::Misc | DevNode::Pts | DevNode::Input
+            DevNode::Root | DevNode::Misc | DevNode::Pts | DevNode::Input | DevNode::Net
         )
     }
 
@@ -2167,6 +2281,14 @@ impl File for DevFsFile {
 
     fn is_devfs_input_dir(&self) -> bool {
         self.node == DevNode::Input
+    }
+
+    fn is_devfs_net_dir(&self) -> bool {
+        self.node == DevNode::Net
+    }
+
+    fn is_dev_random(&self) -> bool {
+        matches!(self.node, DevNode::Random | DevNode::Urandom)
     }
 
     fn is_dev_full(&self) -> bool {

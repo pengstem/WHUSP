@@ -1,9 +1,10 @@
 use crate::fs::{
     DetachedMountFile, FsContextFile, FsContextStateError, MountError, MountPropagation, OpenFlags,
     WorkingDir, lookup_existing_dir_in, lookup_mount_target_dir_in, loop_device_is_attached,
-    mount_bind_at, mount_block_device_at, mount_cgroup2_at, mount_ext_scratch_at,
-    mount_fat_device_at, mount_overlay_compat_at, mount_tmpfs_at, mounted_source_at, move_mount_at,
-    normalize_path_at_root, open_file_in, remount_at, set_mount_propagation_at, unmount_at,
+    loop_device_is_read_only, mount_bind_at, mount_block_device_at, mount_cgroup2_at,
+    mount_ext_scratch_at, mount_fat_device_at, mount_overlay_compat_at, mount_tmpfs_at,
+    mounted_source_at, move_mount_at, normalize_path_at_root, open_file_in, remount_at,
+    set_mount_propagation_at, unmount_at,
 };
 use crate::task::{CAP_SYS_ADMIN, current_process, current_user_token};
 use alloc::string::String;
@@ -615,6 +616,9 @@ pub fn sys_mount(
             if let Some(loop_id) = parse_loop_block_source(source.as_str()) {
                 if !loop_device_is_attached(loop_id) {
                     return Err(SysError::ENODEV);
+                }
+                if loop_device_is_read_only(loop_id) && !read_only {
+                    return Err(SysError::EACCES);
                 }
                 // CONTEXT: LTP all-filesystem syscall tests format a temporary
                 // loop device and then mount it as scratch space. Until this

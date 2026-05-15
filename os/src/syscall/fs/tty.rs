@@ -14,8 +14,15 @@ const LOOP_CLR_FD: usize = 0x4c01;
 const LOOP_SET_STATUS: usize = 0x4c02;
 const LOOP_GET_STATUS: usize = 0x4c03;
 const LOOP_CTL_GET_FREE: usize = 0x4c82;
+const BLKROSET: usize = 0x125d;
+const BLKROGET: usize = 0x125e;
+const BLKGETSIZE: usize = 0x1260;
+const BLKRASET: usize = 0x1262;
+const BLKRAGET: usize = 0x1263;
 const BLKSSZGET: usize = 0x1268;
 const BLKGETSIZE64: usize = 0x8008_1272;
+const RNDGETENTCNT: usize = 0x8004_5200;
+const TUNGETFEATURES: usize = 0x8004_54cf;
 const EVIOCGVERSION: usize = 0x8004_4501;
 const EVIOCGID: usize = 0x8008_4502;
 const EVIOCGREP: usize = 0x8008_4503;
@@ -83,6 +90,9 @@ const EV_VERSION: i32 = 0x010001;
 const UINPUT_VERSION: u32 = 5;
 const INPUT_REP_DELAY_MS: u32 = 250;
 const INPUT_REP_PERIOD_MS: u32 = 33;
+const RANDOM_ENTROPY_AVAIL: i32 = 256;
+const TUN_SUPPORTED_FEATURES: u32 =
+    0x0001 | 0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0100 | 0x1000 | 0x2000 | 0x4000;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -173,6 +183,14 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
 
     if crate::fs::is_devfs_input_event(file.as_ref()) {
         return handle_input_event_ioctl(file.as_ref(), request, argp);
+    }
+
+    if crate::fs::is_devfs_tun(file.as_ref()) {
+        return handle_tun_ioctl(request, argp);
+    }
+
+    if file.is_dev_random() {
+        return handle_random_ioctl(request, argp);
     }
 
     match request {
@@ -443,6 +461,28 @@ fn handle_input_event_ioctl(
     }
 }
 
+fn handle_tun_ioctl(request: usize, argp: usize) -> SysResult {
+    match request {
+        TUNGETFEATURES => {
+            let token = current_user_token();
+            write_user_value(token, argp as *mut u32, &TUN_SUPPORTED_FEATURES)?;
+            Ok(0)
+        }
+        _ => Err(SysError::EINVAL),
+    }
+}
+
+fn handle_random_ioctl(request: usize, argp: usize) -> SysResult {
+    match request {
+        RNDGETENTCNT => {
+            let token = current_user_token();
+            write_user_value(token, argp as *mut i32, &RANDOM_ENTROPY_AVAIL)?;
+            Ok(0)
+        }
+        _ => Err(SysError::ENOTTY),
+    }
+}
+
 fn fs_flag_ioctl_error(error: crate::fs::FsError) -> SysError {
     match error {
         crate::fs::FsError::Unsupported => SysError::ENOTTY,
@@ -476,10 +516,42 @@ fn handle_loop_ioctl(loop_id: usize, request: usize, argp: usize) -> SysResult {
             write_user_value(token, argp as *mut LinuxLoopInfo, &info)?;
             Ok(0)
         }
+        BLKROSET => {
+            let token = current_user_token();
+            let read_only = read_user_value(token, argp as *const i32)? != 0;
+            crate::fs::loop_device_set_read_only(loop_id, read_only)?;
+            Ok(0)
+        }
+        BLKROGET => {
+            let read_only = if crate::fs::loop_device_is_read_only(loop_id) {
+                1i32
+            } else {
+                0i32
+            };
+            let token = current_user_token();
+            write_user_value(token, argp as *mut i32, &read_only)?;
+            Ok(0)
+        }
+        BLKGETSIZE => {
+            let size = (crate::fs::loop_device_size(loop_id)? / 512) as usize;
+            let token = current_user_token();
+            write_user_value(token, argp as *mut usize, &size)?;
+            Ok(0)
+        }
         BLKGETSIZE64 => {
             let size = crate::fs::loop_device_size(loop_id)?;
             let token = current_user_token();
             write_user_value(token, argp as *mut u64, &size)?;
+            Ok(0)
+        }
+        BLKRASET => {
+            crate::fs::loop_device_set_read_ahead(loop_id, argp)?;
+            Ok(0)
+        }
+        BLKRAGET => {
+            let read_ahead = crate::fs::loop_device_read_ahead(loop_id)?;
+            let token = current_user_token();
+            write_user_value(token, argp as *mut usize, &read_ahead)?;
             Ok(0)
         }
         BLKSSZGET => {

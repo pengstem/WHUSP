@@ -90,7 +90,7 @@ fn checked_position_offset_pair(pos_l: usize, pos_h: usize) -> SysResult<usize> 
 
 fn ensure_positioned_target(file: &(dyn File + Send + Sync)) -> SysResult<()> {
     let mode = file.stat()?.mode;
-    if mode & S_IFDIR == S_IFDIR {
+    if mode & S_IFMT == S_IFDIR {
         return Err(SysError::EISDIR);
     }
     if mode & S_IFREG != S_IFREG {
@@ -907,7 +907,7 @@ pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult 
     let token = current_user_token();
     let iovecs = read_user_iovecs(token, iov, iovcnt)?;
     let file = get_file_by_fd(fd)?;
-    if file.stat()?.mode & S_IFDIR == S_IFDIR {
+    if file.stat()?.mode & S_IFMT == S_IFDIR {
         return Err(SysError::EISDIR);
     }
     if !file.readable() {
@@ -955,7 +955,7 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> SysResult {
     let token = current_user_token();
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
-    if file.stat()?.mode & S_IFDIR == S_IFDIR {
+    if file.stat()?.mode & S_IFMT == S_IFDIR {
         return Err(SysError::EISDIR);
     }
     if !file.readable() {
