@@ -44,8 +44,9 @@ const TEST_SCRIPTS: &[&str] = &[
 /// runs cases whose names start with the prefix, and
 /// Some("range:<start>,<end>") runs cases in the lexicographic half-open range
 /// [start, end). Empty range bounds are unbounded.
-const LTP_CASE_FILTER_OPTION: Option<&str> = Some("case:fanotify01");
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some("prefix:execve");
 
+#[derive(Clone, Copy)]
 enum LtpCaseFilter {
     Whitelist,
     Letter(u8),
@@ -212,18 +213,48 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
         "export PATH=\"$PATH:$LTPROOT/testcases/bin:$LTPROOT/bin:/musl/ltp/testcases/bin:/musl/ltp/bin:/glibc/ltp/testcases/bin:/glibc/ltp/bin\"; ./busybox echo \"#### OS COMP TEST GROUP START ltp-",
     );
     command.push_str(libc_label(libc_root));
-    command.push_str(" ####\"; cd \"$LTPROOT/testcases/bin\"; for file in *; do [ -f \"$file\" ] || continue; case_name=${file##*/}; ");
-    append_ltp_case_filter(command);
+    command.push_str(" ####\"; cd \"$LTPROOT/testcases/bin\"; ");
+    append_ltp_case_loop(command);
+    command.push('"');
+    command.push_str(libc_root);
+    command.push_str("/busybox\" echo \"#### OS COMP TEST GROUP END ltp-");
+    command.push_str(libc_label(libc_root));
+    command.push_str(" ####\"; }");
+}
+
+fn append_ltp_case_loop(command: &mut String) {
+    match ltp_case_filter() {
+        LtpCaseFilter::Whitelist => append_ltp_whitelist_case_loop(command),
+        filter => append_ltp_glob_case_loop(command, filter),
+    }
+}
+
+fn append_ltp_whitelist_case_loop(command: &mut String) {
+    let case_names = super::ltp_whitelist::LTP_CASE_WHITELIST;
+    if case_names.is_empty() {
+        return;
+    }
+    command.push_str("for case_name in ");
+    append_ltp_case_slice_words(command, case_names);
+    command.push_str("; do [ -f \"$case_name\" ] || continue; ");
+    append_ltp_case_execution(command);
+    command.push_str("done; ");
+}
+
+fn append_ltp_glob_case_loop(command: &mut String, filter: LtpCaseFilter) {
+    command.push_str("for file in *; do [ -f \"$file\" ] || continue; case_name=${file##*/}; ");
+    append_ltp_case_filter(command, filter);
+    append_ltp_case_execution(command);
+    command.push_str("done; ");
+}
+
+fn append_ltp_case_execution(command: &mut String) {
     // CONTEXT: The autotest parser consumes the historical
     // "FAIL LTP CASE ... : <ret>" record as a per-case result line. A zero
     // return still means the case passed, so keep the text stable here.
     command.push_str("echo \"RUN LTP CASE $case_name\"; ");
     append_ltp_case_invocation(command);
-    command.push_str("ret=$?; echo \"FAIL LTP CASE $case_name : $ret\"; done; \"");
-    command.push_str(libc_root);
-    command.push_str("/busybox\" echo \"#### OS COMP TEST GROUP END ltp-");
-    command.push_str(libc_label(libc_root));
-    command.push_str(" ####\"; }");
+    command.push_str("ret=$?; echo \"FAIL LTP CASE $case_name : $ret\"; ");
 }
 
 fn append_ltp_case_invocation(command: &mut String) {
@@ -232,8 +263,8 @@ fn append_ltp_case_invocation(command: &mut String) {
     );
 }
 
-fn append_ltp_case_filter(command: &mut String) {
-    match ltp_case_filter() {
+fn append_ltp_case_filter(command: &mut String, filter: LtpCaseFilter) {
+    match filter {
         LtpCaseFilter::Whitelist => append_ltp_whitelist_filter(command),
         LtpCaseFilter::Letter(letter) => {
             command.push_str("case \"$case_name\" in [");
@@ -366,6 +397,17 @@ fn append_ltp_case_slice_pattern(command: &mut String, case_names: &[&str]) {
     for case_name in case_names {
         if !first {
             command.push('|');
+        }
+        first = false;
+        command.push_str(case_name);
+    }
+}
+
+fn append_ltp_case_slice_words(command: &mut String, case_names: &[&str]) {
+    let mut first = true;
+    for case_name in case_names {
+        if !first {
+            command.push(' ');
         }
         first = false;
         command.push_str(case_name);

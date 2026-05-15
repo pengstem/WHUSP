@@ -309,6 +309,17 @@ pub(crate) struct ProcessProcSnapshot {
     pub(crate) timer_slack_ns: usize,
 }
 
+fn proc_task_state(status: TaskStatus, proc_sleeping: bool) -> char {
+    if proc_sleeping {
+        return 'S';
+    }
+    match status {
+        TaskStatus::Ready | TaskStatus::Running => 'R',
+        TaskStatus::Blocked => 'S',
+        TaskStatus::Exited => 'Z',
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PathSnapshot {
     pub(crate) context: PathContext,
@@ -721,7 +732,10 @@ impl ProcessControlBlock {
             .tasks
             .first()
             .and_then(|task| task.as_ref())
-            .map(|task| task.inner_exclusive_access().task_status);
+            .map(|task| {
+                let task_inner = task.inner_exclusive_access();
+                proc_task_state(task_inner.task_status, task_inner.proc_sleeping)
+            });
         let state = if inner.is_zombie {
             'Z'
         } else {
@@ -729,9 +743,7 @@ impl ProcessControlBlock {
             // leader state. LTP uses this to wait until the main thread blocks
             // even while a helper thread in the same process is still running.
             match leader_status {
-                Some(TaskStatus::Ready | TaskStatus::Running) => 'R',
-                Some(TaskStatus::Blocked) => 'S',
-                Some(TaskStatus::Exited) => 'Z',
+                Some(state) => state,
                 None => {
                     if inner.tasks.iter().flatten().any(|task| {
                         matches!(

@@ -2,7 +2,8 @@ use crate::fs::{File, FileStat, OpenFlags, PollEvents, S_IFDIR, S_IFMT};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
-    current_has_interrupting_signal, current_user_token, suspend_current_and_run_next,
+    SignalFlags, current_has_interrupting_signal, current_task, current_user_token,
+    linux_sigset_to_flags, suspend_current_and_run_next,
 };
 use crate::timer::get_time_us;
 use alloc::sync::Arc;
@@ -49,6 +50,48 @@ struct EpollInterest {
     event: LinuxEpollEvent,
     last_ready: u32,
     disabled: bool,
+}
+
+struct ProcSleepGuard {
+    task: Arc<crate::task::TaskControlBlock>,
+}
+
+impl ProcSleepGuard {
+    fn new() -> SysResult<Self> {
+        let task = current_task().ok_or(SysError::ESRCH)?;
+        task.inner_exclusive_access().proc_sleeping = true;
+        Ok(Self { task })
+    }
+}
+
+impl Drop for ProcSleepGuard {
+    fn drop(&mut self) {
+        self.task.inner_exclusive_access().proc_sleeping = false;
+    }
+}
+
+struct TemporarySignalMask {
+    task: Arc<crate::task::TaskControlBlock>,
+    old_mask: SignalFlags,
+}
+
+impl TemporarySignalMask {
+    fn install(mask: SignalFlags) -> SysResult<Self> {
+        let task = current_task().ok_or(SysError::ESRCH)?;
+        let old_mask = {
+            let mut task_inner = task.inner_exclusive_access();
+            let old_mask = task_inner.signal_mask;
+            task_inner.signal_mask = mask;
+            old_mask
+        };
+        Ok(Self { task, old_mask })
+    }
+}
+
+impl Drop for TemporarySignalMask {
+    fn drop(&mut self) {
+        self.task.inner_exclusive_access().signal_mask = self.old_mask;
+    }
 }
 
 pub struct EpollFile {
@@ -211,9 +254,13 @@ fn write_epoll_event(
     write_user_value(token, addr as *mut [u8; EPOLL_EVENT_SIZE], &bytes)
 }
 
-fn validate_epoll_sigmask(token: usize, sigmask: *const u8, sigsetsize: usize) -> SysResult<()> {
+fn read_epoll_sigmask(
+    token: usize,
+    sigmask: *const u8,
+    sigsetsize: usize,
+) -> SysResult<Option<SignalFlags>> {
     if sigmask.is_null() {
-        return Ok(());
+        return Ok(None);
     }
     if sigsetsize != LINUX_RT_SIGSET_SIZE {
         return Err(SysError::EINVAL);
@@ -221,8 +268,11 @@ fn validate_epoll_sigmask(token: usize, sigmask: *const u8, sigsetsize: usize) -
     if (sigmask as usize) < size_of::<u64>() {
         return Err(SysError::EFAULT);
     }
-    let _ = read_user_value(token, sigmask.cast::<u64>())?;
-    Ok(())
+    let raw = read_user_value(token, sigmask.cast::<u64>())?;
+    let mut mask = linux_sigset_to_flags(raw);
+    mask.remove(SignalFlags::SIGKILL);
+    mask.remove(SignalFlags::SIGSTOP);
+    Ok(Some(mask))
 }
 
 fn epoll_file_from(file: &Arc<dyn File + Send + Sync>) -> Option<&EpollFile> {
@@ -423,6 +473,10 @@ fn sys_epoll_wait_until(
     let epoll = epoll_file_from(&epoll_file).ok_or(SysError::EINVAL)?;
     let token = current_user_token();
     let maxevents = maxevents as usize;
+    // CONTEXT: This kernel polls readiness cooperatively instead of parking
+    // epoll waiters on every monitored file. Keep the task runnable while
+    // exposing Linux's sleeping state through /proc for LTP synchronizers.
+    let _proc_sleep = ProcSleepGuard::new()?;
 
     loop {
         let ready = epoll.scan_ready(maxevents);
@@ -450,11 +504,15 @@ pub fn sys_epoll_pwait(
     sigmask: *const u8,
     sigsetsize: usize,
 ) -> SysResult {
-    // UNFINISHED: Linux epoll_pwait() temporarily installs the supplied signal
-    // mask while sleeping. This validates the ABI pointer/size but still treats
-    // the mask value as a no-op for readiness-oriented LTP cases.
+    // UNFINISHED: Linux installs the supplied signal mask atomically with
+    // entering the wait. This kernel applies it around the cooperative polling
+    // loop, which is sufficient for the current single-hart LTP cases.
     let token = current_user_token();
-    validate_epoll_sigmask(token, sigmask, sigsetsize)?;
+    let sigmask = read_epoll_sigmask(token, sigmask, sigsetsize)?;
+    let _mask_guard = match sigmask {
+        Some(mask) => Some(TemporarySignalMask::install(mask)?),
+        None => None,
+    };
     sys_epoll_wait_until(
         epfd,
         events,
@@ -471,10 +529,14 @@ pub fn sys_epoll_pwait2(
     sigmask: *const u8,
     sigsetsize: usize,
 ) -> SysResult {
-    // UNFINISHED: See sys_epoll_pwait(); per-call signal-mask installation is
-    // not implemented yet, but invalid user pointers must still fault.
+    // UNFINISHED: See sys_epoll_pwait(); the mask is applied around the
+    // cooperative wait rather than as a fully atomic sleep transition.
     let token = current_user_token();
-    validate_epoll_sigmask(token, sigmask, sigsetsize)?;
+    let sigmask = read_epoll_sigmask(token, sigmask, sigsetsize)?;
+    let _mask_guard = match sigmask {
+        Some(mask) => Some(TemporarySignalMask::install(mask)?),
+        None => None,
+    };
     sys_epoll_wait_until(
         epfd,
         events,

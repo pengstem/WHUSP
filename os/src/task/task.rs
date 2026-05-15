@@ -74,6 +74,8 @@ pub struct TaskControlBlockInner {
     pub trap_cx_ppn: PhysPageNum,
     pub task_cx: TaskContext,
     pub task_status: TaskStatus,
+    // Linux-visible sleep state for cooperative wait loops that stay runnable.
+    pub proc_sleeping: bool,
     pub exit_code: Option<i32>,
     pub linux_tid: Option<PidHandle>,
     pub clear_child_tid: Option<usize>,
@@ -136,6 +138,7 @@ impl TaskControlBlock {
                     trap_cx_ppn,
                     task_cx: TaskContext::goto_trap_return(kstack_top),
                     task_status: TaskStatus::Ready,
+                    proc_sleeping: false,
                     exit_code: None,
                     linux_tid: None,
                     clear_child_tid: None,

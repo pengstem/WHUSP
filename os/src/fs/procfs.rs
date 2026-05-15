@@ -1240,7 +1240,10 @@ fn set_domainname_len(len: u64) -> FsResult {
     Ok(())
 }
 
-fn task_status_char(status: TaskStatus) -> char {
+fn task_status_char(status: TaskStatus, proc_sleeping: bool) -> char {
+    if proc_sleeping {
+        return 'S';
+    }
     match status {
         TaskStatus::Ready | TaskStatus::Running => 'R',
         TaskStatus::Blocked => 'S',
@@ -1284,7 +1287,10 @@ fn task_stat_content(pid: usize, local_tid: usize) -> FsResult<Vec<u8>> {
     let process = pid2process(pid).ok_or(FsError::NotFound)?;
     let process_snapshot = process.proc_snapshot();
     let task = lookup_task_by_local_tid(pid, local_tid).ok_or(FsError::NotFound)?;
-    let state = task_status_char(task.inner_exclusive_access().task_status);
+    let state = {
+        let task_inner = task.inner_exclusive_access();
+        task_status_char(task_inner.task_status, task_inner.proc_sleeping)
+    };
     Ok(proc_stat_content(process_snapshot, task.linux_tid(), state).into_bytes())
 }
 
