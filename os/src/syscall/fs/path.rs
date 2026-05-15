@@ -720,10 +720,15 @@ pub fn sys_fchdir(fd: usize) -> SysResult {
         // still string-backed, so fchdir needs path metadata from openat.
         return Err(SysError::ENOTSUP);
     };
-    // UNFINISHED: Linux fchdir checks search permission unless credentials can
-    // bypass it. This kernel currently runs user tasks as uid 0 and has no
-    // real/effective credential or supplementary-group model.
-    current_process().set_working_dir(next_cwd, String::from(next_path));
+    let process = current_process();
+    let credentials = process.credentials();
+    let subject = AccessSubject {
+        uid: credentials.fsuid,
+        gid: credentials.fsgid,
+        groups: &credentials.groups,
+    };
+    check_access_mode(&file.stat()?, X_OK, subject)?;
+    process.set_working_dir(next_cwd, String::from(next_path));
     Ok(0)
 }
 

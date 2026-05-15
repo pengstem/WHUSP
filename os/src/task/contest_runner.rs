@@ -4,8 +4,9 @@ const TEST_LIBCS: &[&str] = &["/glibc", "/musl"];
 const LA_MUSL_COMPAT_PRELOAD: &str = "/opt/oscomp-support/lib/liboscomp-musl-compat.so";
 // CONTEXT: Search the manifests that contain the current whitelist, ordered by
 // duplicate-resolution priority. Keep syscalls before smoketest aliases while
-// still covering crypto AF_ALG and pty cases.
-const LTP_RUNTEST_MANIFESTS: &[&str] = &["syscalls", "crypto", "pty", "smoketest", "cve"];
+// still covering fs_bind mount scripts, crypto AF_ALG, and pty cases.
+const LTP_RUNTEST_MANIFESTS: &[&str] =
+    &["syscalls", "fs_bind", "crypto", "pty", "smoketest", "cve"];
 
 const INTERACTIVE_SHELL: bool = false;
 
