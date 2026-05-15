@@ -154,7 +154,8 @@ impl ProcessControlBlock {
             gid: 0,
             egid: 0,
         };
-        let (stack_top, _, _) = init_user_stack(process_token, user_sp, &args, &envs, &stack_info);
+        let (stack_top, _, _) = init_user_stack(process_token, user_sp, &args, &envs, &stack_info)
+            .expect("init process stack arguments must fit");
         let app_trap_cx = TrapContext::app_init_context(
             entry_point,
             stack_top,

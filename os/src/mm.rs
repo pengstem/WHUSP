@@ -19,7 +19,7 @@ pub use frame_allocator::{
 };
 pub use kernel_space::{KERNEL_SPACE, kernel_token};
 pub use memory_set::MemorySet;
-pub use page_table::{PageTable, PageTableEntry, UserBuffer, translated_refmut};
+pub use page_table::{PageTable, PageTableEntry, UserBuffer};
 pub use user_space::{MemoryProtectError, MmapFaultAccess, MmapFaultResult};
 
 pub fn init() {

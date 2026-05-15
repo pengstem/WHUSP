@@ -246,15 +246,6 @@ impl PageTable {
     }
 }
 
-pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
-    let page_table = PageTable::from_token(token);
-    let va = ptr as usize;
-    page_table
-        .translate_va(VirtAddr::from(va))
-        .expect("translated_refmut requires a mapped user pointer")
-        .get_mut()
-}
-
 // CONTEXT: most syscall copy paths use checked byte-buffer helpers now. Keep
 // this segmented buffer type for legacy in-kernel adapters that still iterate
 // translated slices directly.
@@ -265,6 +256,15 @@ pub struct UserBuffer {
 impl UserBuffer {
     pub fn new(buffers: Vec<&'static mut [u8]>) -> Self {
         Self { buffers }
+    }
+    /// Wraps a kernel-owned slice for synchronous in-kernel File trait I/O.
+    ///
+    /// The returned buffer must be consumed immediately and must not be stored
+    /// by the callee. It exists for legacy File::read/write adapters that still
+    /// use UserBuffer as their byte carrier even when the source is kernel memory.
+    pub fn from_kernel_slice_for_sync_io(buf: &mut [u8]) -> Self {
+        let slice = unsafe { core::mem::transmute::<&mut [u8], &'static mut [u8]>(buf) };
+        Self::new(vec![slice])
     }
     pub fn len(&self) -> usize {
         let mut total: usize = 0;

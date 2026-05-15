@@ -813,11 +813,9 @@ impl File for VfsFile {
         if read_size == 0 {
             return Ok(0);
         }
-        for (idx, byte_ref) in user_buf.into_iter().take(read_size).enumerate() {
-            unsafe {
-                *byte_ref = kernel_buf[idx];
-            }
-        }
+        let mut user_buf = user_buf;
+        let copied = user_buf.copy_from_slice(&kernel_buf[..read_size]);
+        debug_assert_eq!(copied, read_size);
         *offset = next_offset as usize;
         Ok(read_size as isize)
     }

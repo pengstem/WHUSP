@@ -44,7 +44,7 @@ const TEST_SCRIPTS: &[&str] = &[
 /// runs cases whose names start with the prefix, and
 /// Some("range:<start>,<end>") runs cases in the lexicographic half-open range
 /// [start, end). Empty range bounds are unbounded.
-const LTP_CASE_FILTER_OPTION: Option<&str> = Some("prefix:execve");
+const LTP_CASE_FILTER_OPTION: Option<&str> = None;
 
 #[derive(Clone, Copy)]
 enum LtpCaseFilter {
@@ -223,44 +223,46 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
 }
 
 fn append_ltp_case_loop(command: &mut String) {
-    match ltp_case_filter() {
-        LtpCaseFilter::Whitelist => append_ltp_whitelist_case_loop(command),
-        filter => append_ltp_glob_case_loop(command, filter),
+    let filter = ltp_case_filter();
+    command.push_str("if [ -f \"$LTPROOT/runtest/syscalls\" ]; then ");
+    match filter {
+        LtpCaseFilter::Whitelist => append_ltp_manifest_whitelist_case_loop(command),
+        _ => append_ltp_runtest_case_loop(command, filter),
     }
+    command.push_str("else ./busybox echo \"LTP runtest/syscalls missing\"; fi; ");
 }
 
-fn append_ltp_whitelist_case_loop(command: &mut String) {
+fn append_ltp_manifest_whitelist_case_loop(command: &mut String) {
     let case_names = super::ltp_whitelist::LTP_CASE_WHITELIST;
     if case_names.is_empty() {
+        command.push_str(":; ");
         return;
     }
-    command.push_str("for case_name in ");
+    // CONTEXT: Preserve the curated whitelist order while still taking the
+    // authoritative command and arguments from runtest/syscalls.
+    command.push_str("for wanted_case in ");
     append_ltp_case_slice_words(command, case_names);
-    command.push_str("; do [ -f \"$case_name\" ] || continue; ");
-    append_ltp_case_execution(command);
+    command.push_str("; do case_cmd=\"\"; while read case_name candidate_cmd; do [ \"$case_name\" = \"$wanted_case\" ] || continue; case_cmd=\"$candidate_cmd\"; break; done < \"$LTPROOT/runtest/syscalls\"; [ -n \"$case_cmd\" ] || continue; case_name=\"$wanted_case\"; ");
+    append_ltp_manifest_case_execution(command);
     command.push_str("done; ");
 }
 
-fn append_ltp_glob_case_loop(command: &mut String, filter: LtpCaseFilter) {
-    command.push_str("for file in *; do [ -f \"$file\" ] || continue; case_name=${file##*/}; ");
+fn append_ltp_runtest_case_loop(command: &mut String, filter: LtpCaseFilter) {
+    // CONTEXT: LTP helper binaries live beside real test programs under
+    // testcases/bin. The runtest manifest is the authoritative list of cases
+    // and preserves per-case arguments such as execve05's stress options.
+    command.push_str("while read case_name case_cmd; do [ -n \"$case_name\" ] || continue; case \"$case_name\" in \\#*) continue ;; esac; [ -n \"$case_cmd\" ] || continue; ");
     append_ltp_case_filter(command, filter);
-    append_ltp_case_execution(command);
-    command.push_str("done; ");
+    append_ltp_manifest_case_execution(command);
+    command.push_str("done < \"$LTPROOT/runtest/syscalls\"; ");
 }
 
-fn append_ltp_case_execution(command: &mut String) {
-    // CONTEXT: The autotest parser consumes the historical
-    // "FAIL LTP CASE ... : <ret>" record as a per-case result line. A zero
-    // return still means the case passed, so keep the text stable here.
+fn append_ltp_manifest_case_execution(command: &mut String) {
+    // CONTEXT: The manifest command may carry arguments or shell fragments, so
+    // execute it as the LTP runner specifies.
     command.push_str("echo \"RUN LTP CASE $case_name\"; ");
-    append_ltp_case_invocation(command);
+    command.push_str("eval \"$case_cmd\"; ");
     command.push_str("ret=$?; echo \"FAIL LTP CASE $case_name : $ret\"; ");
-}
-
-fn append_ltp_case_invocation(command: &mut String) {
-    command.push_str(
-        "case \"$case_name\" in mmap1) \"./$case_name\" -I 3 ;; *) \"./$case_name\" ;; esac; ",
-    );
 }
 
 fn append_ltp_case_filter(command: &mut String, filter: LtpCaseFilter) {

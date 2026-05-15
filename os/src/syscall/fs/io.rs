@@ -430,10 +430,7 @@ const SPLICE_COPY_CHUNK: usize = 4096;
 // through kernel memory while preserving the visible fd, offset, and errno
 // behavior needed by current LTP splice cases.
 fn kernel_user_buffer(buf: &mut [u8]) -> UserBuffer {
-    // UserBuffer is also the in-kernel File trait data carrier. The borrowed
-    // slice is consumed synchronously by File::read/write and is not stored.
-    let slice = unsafe { core::mem::transmute::<&mut [u8], &'static mut [u8]>(buf) };
-    UserBuffer::new(vec![slice])
+    UserBuffer::from_kernel_slice_for_sync_io(buf)
 }
 
 fn read_splice_offset(token: usize, ptr: *mut i64, is_pipe: bool) -> SysResult<Option<i64>> {

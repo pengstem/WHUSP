@@ -2,10 +2,11 @@ use super::{
     SigAltStack, SignalAction, current_task, prepare_exec_thread_group,
     process::{ProcessControlBlock, comm_from_cmdline, empty_process_pkey_rights},
 };
-use crate::config::PAGE_SIZE;
+use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::{VfsNodeId, track_regular_file_executable, untrack_regular_file_executable};
-use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet, translated_refmut};
+use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet};
 use crate::syscall::errno::{SysError, SysResult};
+use crate::syscall::user_ptr::{copy_to_user, write_user_value};
 use crate::trap::{TrapContext, trap_handler};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -54,52 +55,86 @@ fn align_down(value: usize, align: usize) -> usize {
     value & !(align - 1)
 }
 
-fn write_user_byte(token: usize, addr: usize, value: u8) {
-    *translated_refmut(token, addr as *mut u8) = value;
+struct ExecStackLayout {
+    user_sp: usize,
+    argv_base: usize,
+    envp_base: usize,
+    auxv_base: usize,
+    random_addr: usize,
+    arg_ptrs: Vec<usize>,
+    env_ptrs: Vec<usize>,
+    auxv: [(usize, usize); 15],
 }
 
-fn write_user_usize(token: usize, addr: usize, value: usize) {
-    *translated_refmut(token, addr as *mut usize) = value;
+fn stack_low(stack_top: usize) -> SysResult<usize> {
+    // UNFINISHED: Linux derives argv/env limits from ARG_MAX, MAX_ARG_STRLEN,
+    // and RLIMIT_STACK. This contest path only rejects layouts that cannot fit
+    // in the eagerly mapped user stack, so oversized arguments return E2BIG
+    // instead of underflowing the stack writer or panicking in kernel space.
+    stack_top
+        .checked_sub(USER_STACK_SIZE)
+        .ok_or(SysError::E2BIG)
 }
 
-fn write_user_bytes(token: usize, addr: usize, bytes: &[u8]) {
-    for (offset, byte) in bytes.iter().enumerate() {
-        write_user_byte(token, addr + offset, *byte);
+fn checked_stack_sub(sp: usize, amount: usize, low: usize) -> SysResult<usize> {
+    let next = sp.checked_sub(amount).ok_or(SysError::E2BIG)?;
+    if next < low {
+        return Err(SysError::E2BIG);
     }
+    Ok(next)
 }
 
-fn push_user_string(token: usize, user_sp: &mut usize, string: &str) -> usize {
-    *user_sp -= string.len() + 1;
+fn checked_stack_align_down(sp: usize, align: usize, low: usize) -> SysResult<usize> {
+    let next = align_down(sp, align);
+    if next < low {
+        return Err(SysError::E2BIG);
+    }
+    Ok(next)
+}
+
+fn checked_table_size(arg_count: usize, env_count: usize, auxv_count: usize) -> SysResult<usize> {
+    let word = core::mem::size_of::<usize>();
+    let words = 1usize
+        .checked_add(arg_count.checked_add(1).ok_or(SysError::E2BIG)?)
+        .and_then(|value| value.checked_add(env_count.checked_add(1)?))
+        .and_then(|value| value.checked_add(auxv_count.checked_add(1)?.checked_mul(2)?))
+        .ok_or(SysError::E2BIG)?;
+    words.checked_mul(word).ok_or(SysError::E2BIG)
+}
+
+fn plan_user_string(user_sp: &mut usize, stack_low: usize, string: &str) -> SysResult<usize> {
+    let string_len = string.len().checked_add(1).ok_or(SysError::E2BIG)?;
+    *user_sp = checked_stack_sub(*user_sp, string_len, stack_low)?;
     let addr = *user_sp;
-    write_user_bytes(token, addr, string.as_bytes());
-    write_user_byte(token, addr + string.len(), 0);
-    *user_sp = align_down(*user_sp, core::mem::size_of::<usize>());
-    addr
+    *user_sp = checked_stack_align_down(*user_sp, core::mem::size_of::<usize>(), stack_low)?;
+    Ok(addr)
 }
 
-fn push_user_strings(token: usize, user_sp: &mut usize, strings: &[String]) -> Vec<usize> {
-    strings
-        .iter()
-        .map(|string| push_user_string(token, user_sp, string.as_str()))
-        .collect()
+fn plan_user_strings(
+    user_sp: &mut usize,
+    stack_low: usize,
+    strings: &[String],
+) -> SysResult<Vec<usize>> {
+    let mut ptrs = Vec::with_capacity(strings.len());
+    for string in strings {
+        ptrs.push(plan_user_string(user_sp, stack_low, string.as_str())?);
+    }
+    Ok(ptrs)
 }
 
-pub(super) fn init_user_stack(
-    token: usize,
+fn plan_user_stack(
     stack_top: usize,
     args: &[String],
     envs: &[String],
     stack_info: &ExecStackInfo,
-) -> (usize, usize, usize) {
+) -> SysResult<ExecStackLayout> {
+    let stack_low = stack_low(stack_top)?;
     let mut string_sp = stack_top;
-    let env_ptrs = push_user_strings(token, &mut string_sp, envs);
-    let arg_ptrs = push_user_strings(token, &mut string_sp, args);
+    let env_ptrs = plan_user_strings(&mut string_sp, stack_low, envs)?;
+    let arg_ptrs = plan_user_strings(&mut string_sp, stack_low, args)?;
 
-    string_sp -= 16;
+    string_sp = checked_stack_sub(string_sp, 16, stack_low)?;
     let random_addr = string_sp;
-    for offset in 0..16 {
-        write_user_byte(token, random_addr + offset, 0);
-    }
 
     let auxv = [
         (AT_PHDR, stack_info.phdr),
@@ -120,36 +155,92 @@ pub(super) fn init_user_stack(
     ];
 
     let word = core::mem::size_of::<usize>();
-    let table_size = word
-        + (arg_ptrs.len() + 1) * word
-        + (env_ptrs.len() + 1) * word
-        + (auxv.len() + 1) * 2 * word;
-    let user_sp = align_down(align_down(string_sp, 16) - table_size, 16);
+    let table_size = checked_table_size(arg_ptrs.len(), env_ptrs.len(), auxv.len())?;
+    let table_top = checked_stack_align_down(string_sp, 16, stack_low)?;
+    let table_bottom = checked_stack_sub(table_top, table_size, stack_low)?;
+    let user_sp = checked_stack_align_down(table_bottom, 16, stack_low)?;
     let argv_base = user_sp + word;
     let envp_base = argv_base + (arg_ptrs.len() + 1) * word;
     let auxv_base = envp_base + (env_ptrs.len() + 1) * word;
 
-    write_user_usize(token, user_sp, arg_ptrs.len());
-    for (i, ptr) in arg_ptrs.iter().enumerate() {
-        write_user_usize(token, argv_base + i * word, *ptr);
-    }
-    write_user_usize(token, argv_base + arg_ptrs.len() * word, 0);
+    Ok(ExecStackLayout {
+        user_sp,
+        argv_base,
+        envp_base,
+        auxv_base,
+        random_addr,
+        arg_ptrs,
+        env_ptrs,
+        auxv,
+    })
+}
 
-    for (i, ptr) in env_ptrs.iter().enumerate() {
-        write_user_usize(token, envp_base + i * word, *ptr);
-    }
-    write_user_usize(token, envp_base + env_ptrs.len() * word, 0);
+fn write_user_byte(token: usize, addr: usize, value: u8) -> SysResult<()> {
+    copy_to_user(token, addr as *mut u8, &[value])
+}
 
-    for (i, (key, value)) in auxv.iter().enumerate() {
-        let entry = auxv_base + i * 2 * word;
-        write_user_usize(token, entry, *key);
-        write_user_usize(token, entry + word, *value);
-    }
-    let null_entry = auxv_base + auxv.len() * 2 * word;
-    write_user_usize(token, null_entry, AT_NULL);
-    write_user_usize(token, null_entry + word, 0);
+fn write_user_usize(token: usize, addr: usize, value: usize) -> SysResult<()> {
+    write_user_value(token, addr as *mut usize, &value)
+}
 
-    (user_sp, argv_base, envp_base)
+fn write_user_bytes(token: usize, addr: usize, bytes: &[u8]) -> SysResult<()> {
+    copy_to_user(token, addr as *mut u8, bytes)
+}
+
+fn write_user_string(token: usize, addr: usize, string: &str) -> SysResult<()> {
+    write_user_bytes(token, addr, string.as_bytes())?;
+    write_user_byte(token, addr + string.len(), 0)
+}
+
+fn write_user_stack(
+    token: usize,
+    layout: &ExecStackLayout,
+    args: &[String],
+    envs: &[String],
+) -> SysResult<()> {
+    for (addr, string) in layout.env_ptrs.iter().zip(envs.iter()) {
+        write_user_string(token, *addr, string.as_str())?;
+    }
+    for (addr, string) in layout.arg_ptrs.iter().zip(args.iter()) {
+        write_user_string(token, *addr, string.as_str())?;
+    }
+
+    write_user_bytes(token, layout.random_addr, &[0u8; 16])?;
+
+    let word = core::mem::size_of::<usize>();
+    write_user_usize(token, layout.user_sp, layout.arg_ptrs.len())?;
+    for (i, ptr) in layout.arg_ptrs.iter().enumerate() {
+        write_user_usize(token, layout.argv_base + i * word, *ptr)?;
+    }
+    write_user_usize(token, layout.argv_base + layout.arg_ptrs.len() * word, 0)?;
+
+    for (i, ptr) in layout.env_ptrs.iter().enumerate() {
+        write_user_usize(token, layout.envp_base + i * word, *ptr)?;
+    }
+    write_user_usize(token, layout.envp_base + layout.env_ptrs.len() * word, 0)?;
+
+    for (i, (key, value)) in layout.auxv.iter().enumerate() {
+        let entry = layout.auxv_base + i * 2 * word;
+        write_user_usize(token, entry, *key)?;
+        write_user_usize(token, entry + word, *value)?;
+    }
+    let null_entry = layout.auxv_base + layout.auxv.len() * 2 * word;
+    write_user_usize(token, null_entry, AT_NULL)?;
+    write_user_usize(token, null_entry + word, 0)?;
+
+    Ok(())
+}
+
+pub(super) fn init_user_stack(
+    token: usize,
+    stack_top: usize,
+    args: &[String],
+    envs: &[String],
+    stack_info: &ExecStackInfo,
+) -> SysResult<(usize, usize, usize)> {
+    let layout = plan_user_stack(stack_top, args, envs, stack_info)?;
+    write_user_stack(token, &layout, args, envs)?;
+    Ok((layout.user_sp, layout.argv_base, layout.envp_base))
 }
 
 impl ProcessControlBlock {
@@ -192,6 +283,10 @@ impl ProcessControlBlock {
             gid: self.credentials().rgid,
             egid: self.credentials().egid,
         };
+        let expected_user_stack_top = ustack_base
+            .checked_add(USER_STACK_SIZE)
+            .ok_or(SysError::E2BIG)?;
+        let stack_layout = plan_user_stack(expected_user_stack_top, &args, &envs, &stack_info)?;
         let new_token = memory_set.token();
 
         let previous_executable_node = {
@@ -239,7 +334,9 @@ impl ProcessControlBlock {
             (task_res.trap_cx_ppn(), task_res.ustack_top())
         };
         task_inner.trap_cx_ppn = trap_cx_ppn;
-        let (user_sp, _, _) = init_user_stack(new_token, user_stack_top, &args, &envs, &stack_info);
+        debug_assert_eq!(user_stack_top, expected_user_stack_top);
+        write_user_stack(new_token, &stack_layout, &args, &envs)?;
+        let user_sp = stack_layout.user_sp;
 
         let trap_cx = TrapContext::app_init_context(
             entry_point,
