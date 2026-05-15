@@ -8,7 +8,9 @@ use crate::mm::frame_stats;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::keyring;
 use crate::syscall::{
-    fanotify_evict_evictable_marks, fanotify_fdinfo, fanotify_max_queued_events, pidfd_fdinfo,
+    INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES,
+    fanotify_evict_evictable_marks, fanotify_fdinfo, fanotify_max_queued_events, inotify_fdinfo,
+    pidfd_fdinfo,
 };
 use crate::task::{
     ProcessProcSnapshot, TaskControlBlock, TaskStatus, list_process_snapshots, pid2process,
@@ -53,6 +55,10 @@ const DROP_CACHES_INO: u32 = 29;
 const VFS_CACHE_PRESSURE_INO: u32 = 31;
 const SYS_FS_FANOTIFY_DIR_INO: u32 = 32;
 const FANOTIFY_MAX_QUEUED_EVENTS_INO: u32 = 33;
+const SYS_FS_INOTIFY_DIR_INO: u32 = 34;
+const INOTIFY_MAX_QUEUED_EVENTS_INO: u32 = 35;
+const INOTIFY_MAX_USER_INSTANCES_INO: u32 = 36;
+const INOTIFY_MAX_USER_WATCHES_INO: u32 = 37;
 const PID_DIR_BASE: u32 = 100;
 const PID_FILE_BASE: u32 = 10_000;
 const PID_FILE_STRIDE: u32 = 16;
@@ -130,6 +136,7 @@ enum ProcNode {
     SysKernelKeysDir,
     SysFsDir,
     SysFsFanotifyDir,
+    SysFsInotifyDir,
     SysNetDir,
     SysNetIpv4Dir,
     SysNetIpv4ConfDir,
@@ -148,6 +155,9 @@ enum ProcNode {
     DropCaches,
     VfsCachePressure,
     FanotifyMaxQueuedEvents,
+    InotifyMaxQueuedEvents,
+    InotifyMaxUserInstances,
+    InotifyMaxUserWatches,
     Domainname,
     Tainted,
     PidDir(usize),
@@ -278,6 +288,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         PID_MAX_INO => Some(ProcNode::PidMax),
         SYS_FS_DIR_INO => Some(ProcNode::SysFsDir),
         SYS_FS_FANOTIFY_DIR_INO => Some(ProcNode::SysFsFanotifyDir),
+        SYS_FS_INOTIFY_DIR_INO => Some(ProcNode::SysFsInotifyDir),
         PIPE_MAX_SIZE_INO => Some(ProcNode::PipeMaxSize),
         PIPE_USER_PAGES_SOFT_INO => Some(ProcNode::PipeUserPagesSoft),
         DOMAINNAME_INO => Some(ProcNode::Domainname),
@@ -297,6 +308,9 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         DROP_CACHES_INO => Some(ProcNode::DropCaches),
         VFS_CACHE_PRESSURE_INO => Some(ProcNode::VfsCachePressure),
         FANOTIFY_MAX_QUEUED_EVENTS_INO => Some(ProcNode::FanotifyMaxQueuedEvents),
+        INOTIFY_MAX_QUEUED_EVENTS_INO => Some(ProcNode::InotifyMaxQueuedEvents),
+        INOTIFY_MAX_USER_INSTANCES_INO => Some(ProcNode::InotifyMaxUserInstances),
+        INOTIFY_MAX_USER_WATCHES_INO => Some(ProcNode::InotifyMaxUserWatches),
         ino if ino >= PID_FDINFO_ENTRY_BASE => {
             let rel = ino - PID_FDINFO_ENTRY_BASE;
             let pid = (rel / PID_FD_ENTRY_STRIDE) as usize;
@@ -360,6 +374,7 @@ fn node_kind(node: ProcNode) -> FsNodeKind {
         | ProcNode::SysKernelKeysDir
         | ProcNode::SysFsDir
         | ProcNode::SysFsFanotifyDir
+        | ProcNode::SysFsInotifyDir
         | ProcNode::SysNetDir
         | ProcNode::SysNetIpv4Dir
         | ProcNode::SysNetIpv4ConfDir
@@ -611,6 +626,11 @@ fn sys_fs_entries() -> Vec<RawDirEntry> {
         name: "fanotify".into(),
         dtype: DT_DIR,
     });
+    entries.push(RawDirEntry {
+        ino: SYS_FS_INOTIFY_DIR_INO,
+        name: "inotify".into(),
+        dtype: DT_DIR,
+    });
     entries
 }
 
@@ -629,6 +649,36 @@ fn sys_fs_fanotify_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: FANOTIFY_MAX_QUEUED_EVENTS_INO,
         name: "max_queued_events".into(),
+        dtype: DT_REG,
+    });
+    entries
+}
+
+fn sys_fs_inotify_entries() -> Vec<RawDirEntry> {
+    let mut entries = Vec::new();
+    entries.push(RawDirEntry {
+        ino: SYS_FS_INOTIFY_DIR_INO,
+        name: ".".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_FS_DIR_INO,
+        name: "..".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: INOTIFY_MAX_QUEUED_EVENTS_INO,
+        name: "max_queued_events".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: INOTIFY_MAX_USER_INSTANCES_INO,
+        name: "max_user_instances".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: INOTIFY_MAX_USER_WATCHES_INO,
+        name: "max_user_watches".into(),
         dtype: DT_REG,
     });
     entries
@@ -1030,6 +1080,18 @@ fn fanotify_max_queued_events_content() -> String {
     format!("{}\n", fanotify_max_queued_events())
 }
 
+fn inotify_max_queued_events_content() -> String {
+    format!("{INOTIFY_MAX_QUEUED_EVENTS}\n")
+}
+
+fn inotify_max_user_instances_content() -> String {
+    format!("{INOTIFY_MAX_USER_INSTANCES}\n")
+}
+
+fn inotify_max_user_watches_content() -> String {
+    format!("{INOTIFY_MAX_USER_WATCHES}\n")
+}
+
 fn lease_break_time_content() -> String {
     format!("{}\n", PROC_LEASE_BREAK_TIME.load(Ordering::Relaxed))
 }
@@ -1072,12 +1134,13 @@ fn pid_fdinfo_content(pid: usize, fd: usize) -> FsResult<String> {
         return Ok(pidfd_info);
     }
     let fanotify_info = fanotify_fdinfo(&file).unwrap_or_default();
+    let inotify_info = inotify_fdinfo(&file).unwrap_or_default();
     // CONTEXT: Linux exposes fanotify marks through /proc/<pid>/fdinfo/<fd>.
     // This metadata-only subset reports enough mark/ignored_mask fields for
     // LTP fanotify09/fanotify10 to distinguish groups with and without ignore
     // marks; inode and device numbers are still placeholders.
     Ok(format!(
-        "pos:\t0\nflags:\t{flags:o}\nmnt_id:\t0\n{fanotify_info}"
+        "pos:\t0\nflags:\t{flags:o}\nmnt_id:\t0\n{fanotify_info}{inotify_info}"
     ))
 }
 
@@ -1139,6 +1202,22 @@ fn write_lease_break_time(buf: &[u8], offset: u64) -> usize {
     // LTP saves/restores this sysctl around lease tests. Store the value so
     // those file operations behave like a writable Linux procfs knob.
     PROC_LEASE_BREAK_TIME.store(value, Ordering::Relaxed);
+    buf.len()
+}
+
+fn write_inotify_max_user_instances(buf: &[u8], offset: u64) -> usize {
+    if offset != 0 {
+        return 0;
+    }
+    let Ok(text) = core::str::from_utf8(buf) else {
+        return 0;
+    };
+    if text.trim().parse::<usize>().is_err() {
+        return 0;
+    }
+    // CONTEXT: inotify06 saves/restores this sysctl while stress-creating
+    // instances. The current inotify subset does not enforce per-user limits,
+    // but accepting numeric writes keeps the Linux procfs contract visible.
     buf.len()
 }
 
@@ -1371,6 +1450,9 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::PipeMaxSize => Ok(pipe_max_size_content().into_bytes()),
         ProcNode::PipeUserPagesSoft => Ok(pipe_user_pages_soft_content().into_bytes()),
         ProcNode::FanotifyMaxQueuedEvents => Ok(fanotify_max_queued_events_content().into_bytes()),
+        ProcNode::InotifyMaxQueuedEvents => Ok(inotify_max_queued_events_content().into_bytes()),
+        ProcNode::InotifyMaxUserInstances => Ok(inotify_max_user_instances_content().into_bytes()),
+        ProcNode::InotifyMaxUserWatches => Ok(inotify_max_user_watches_content().into_bytes()),
         ProcNode::LeaseBreakTime => Ok(lease_break_time_content().into_bytes()),
         ProcNode::NetIpv4ConfLoTag => Ok(net_ipv4_conf_lo_tag_content().into_bytes()),
         ProcNode::NetIpv4ConfDefaultTag => Ok(net_ipv4_conf_default_tag_content().into_bytes()),
@@ -1425,6 +1507,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         | ProcNode::SysKernelKeysDir
         | ProcNode::SysFsDir
         | ProcNode::SysFsFanotifyDir
+        | ProcNode::SysFsInotifyDir
         | ProcNode::SysNetDir
         | ProcNode::SysNetIpv4Dir
         | ProcNode::SysNetIpv4ConfDir
@@ -1557,6 +1640,7 @@ impl FileSystemBackend for ProcFs {
                 "pipe-user-pages-soft" => Ok((PIPE_USER_PAGES_SOFT_INO, FsNodeKind::RegularFile)),
                 "lease-break-time" => Ok((LEASE_BREAK_TIME_INO, FsNodeKind::RegularFile)),
                 "fanotify" => Ok((SYS_FS_FANOTIFY_DIR_INO, FsNodeKind::Directory)),
+                "inotify" => Ok((SYS_FS_INOTIFY_DIR_INO, FsNodeKind::Directory)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::SysFsFanotifyDir => match component {
@@ -1565,6 +1649,16 @@ impl FileSystemBackend for ProcFs {
                 "max_queued_events" => {
                     Ok((FANOTIFY_MAX_QUEUED_EVENTS_INO, FsNodeKind::RegularFile))
                 }
+                _ => Err(FsError::NotFound),
+            },
+            ProcNode::SysFsInotifyDir => match component {
+                "." => Ok((SYS_FS_INOTIFY_DIR_INO, FsNodeKind::Directory)),
+                ".." => Ok((SYS_FS_DIR_INO, FsNodeKind::Directory)),
+                "max_queued_events" => Ok((INOTIFY_MAX_QUEUED_EVENTS_INO, FsNodeKind::RegularFile)),
+                "max_user_instances" => {
+                    Ok((INOTIFY_MAX_USER_INSTANCES_INO, FsNodeKind::RegularFile))
+                }
+                "max_user_watches" => Ok((INOTIFY_MAX_USER_WATCHES_INO, FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::PidDir(pid) => match component {
@@ -1722,6 +1816,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::KeysMaxbytes
             | ProcNode::PipeMaxSize
             | ProcNode::LeaseBreakTime
+            | ProcNode::InotifyMaxUserInstances
             | ProcNode::NetIpv4ConfLoTag
             | ProcNode::DropCaches
             | ProcNode::VfsCachePressure
@@ -1750,6 +1845,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::SysKernelKeysDir
             | ProcNode::SysFsDir
             | ProcNode::SysFsFanotifyDir
+            | ProcNode::SysFsInotifyDir
             | ProcNode::SysNetDir
             | ProcNode::SysNetIpv4Dir
             | ProcNode::SysNetIpv4ConfDir
@@ -1769,6 +1865,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::KeysMaxbytes
             | ProcNode::PipeMaxSize
             | ProcNode::LeaseBreakTime
+            | ProcNode::InotifyMaxUserInstances
             | ProcNode::NetIpv4ConfLoTag
             | ProcNode::DropCaches
             | ProcNode::VfsCachePressure
@@ -1834,6 +1931,9 @@ impl FileSystemBackend for ProcFs {
             Some(ProcNode::KeysMaxbytes) => keyring::write_key_maxbytes(buf, offset),
             Some(ProcNode::PipeMaxSize) => write_pipe_max_size(buf, offset),
             Some(ProcNode::LeaseBreakTime) => write_lease_break_time(buf, offset),
+            Some(ProcNode::InotifyMaxUserInstances) => {
+                write_inotify_max_user_instances(buf, offset)
+            }
             Some(ProcNode::NetIpv4ConfLoTag) => write_net_ipv4_conf_lo_tag(buf, offset),
             Some(ProcNode::DropCaches) => write_drop_caches(buf, offset),
             Some(ProcNode::VfsCachePressure) => write_vfs_cache_pressure(buf, offset),
@@ -1855,6 +1955,7 @@ impl FileSystemBackend for ProcFs {
             ProcNode::SysFsFanotifyDir => {
                 write_dir_entries(&sys_fs_fanotify_entries(), offset, buf)
             }
+            ProcNode::SysFsInotifyDir => write_dir_entries(&sys_fs_inotify_entries(), offset, buf),
             ProcNode::SysVmDir => write_dir_entries(&sys_vm_entries(), offset, buf),
             ProcNode::SysNetDir => write_dir_entries(&sys_net_entries(), offset, buf),
             ProcNode::SysNetIpv4Dir => write_dir_entries(&sys_net_ipv4_entries(), offset, buf),

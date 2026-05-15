@@ -14,6 +14,7 @@ use super::super::user_ptr::{
 };
 use super::fanotify::fanotify_notify_attrib;
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
+use super::inotify::inotify_notify_attrib;
 use super::path::{check_current_access_path_prefixes_from, path_context_from};
 use super::uapi::{
     AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, LinuxKstat, LinuxStatfs, LinuxStatx,
@@ -274,6 +275,7 @@ pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> SysResult {
     chmod_in(context.clone(), path.as_str(), true, mode)?;
     if let Ok(file) = open_file_in(context, path.as_str(), OpenFlags::PATH) {
         fanotify_notify_attrib(&file);
+        inotify_notify_attrib(&file);
     }
     Ok(0)
 }
@@ -288,6 +290,7 @@ pub fn sys_fchmod(fd: usize, mode: u32) -> SysResult {
     let mode = prepare_mode_change(stat, mode)?;
     file.set_mode(mode)?;
     fanotify_notify_attrib(&file);
+    inotify_notify_attrib(&file);
     Ok(0)
 }
 

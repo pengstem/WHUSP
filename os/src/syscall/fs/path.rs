@@ -9,6 +9,10 @@ use super::fanotify::{
     fanotify_notify_open, fanotify_notify_open_at,
 };
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd, install_file_fd};
+use super::inotify::{
+    inotify_notify_attrib, inotify_notify_create, inotify_notify_delete, inotify_notify_modify,
+    inotify_notify_move, inotify_notify_open, inotify_notify_open_at,
+};
 use super::stat::resolve_stat_from;
 use super::uapi::{
     AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
@@ -324,6 +328,7 @@ fn apply_utimensat_to_file(
         return Err(SysError::EPERM);
     }
     file.set_times(times.atime, times.mtime, ctime)?;
+    inotify_notify_attrib(&file);
     Ok(0)
 }
 
@@ -489,11 +494,14 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> SysRe
     let fd = install_file_fd(file, flags, dir_path)?;
     if created_file && let Some(path) = notify_path.as_deref() {
         fanotify_notify_create(&notify_file, path);
+        inotify_notify_create(&notify_file, path);
     }
     if let Some(path) = notify_path.as_deref() {
         fanotify_notify_open_at(&notify_file, path);
+        inotify_notify_open_at(&notify_file, path);
     } else {
         fanotify_notify_open(&notify_file);
+        inotify_notify_open(&notify_file);
     }
     Ok(fd)
 }
@@ -525,6 +533,7 @@ pub fn sys_truncate(path: *const u8, len: usize) -> SysResult {
     truncate_in(context, path.as_str(), len)?;
     if let Some(file) = notify_file {
         fanotify_notify_modify(&file, 1);
+        inotify_notify_modify(&file, 1);
     }
     Ok(0)
 }
@@ -754,6 +763,7 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> SysResult {
     )?;
     if let Ok(file) = open_file_in(notify_context, path.as_str(), OpenFlags::PATH) {
         fanotify_notify_create(&file, path.as_str());
+        inotify_notify_create(&file, path.as_str());
     }
     Ok(0)
 }
@@ -796,6 +806,7 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, dev: u64) -> SysRes
     )?;
     if let Ok(file) = open_file_in(notify_context, path.as_str(), OpenFlags::PATH) {
         fanotify_notify_create(&file, path.as_str());
+        inotify_notify_create(&file, path.as_str());
     }
     Ok(0)
 }
@@ -816,6 +827,7 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> SysResult {
     }
     if let Some(file) = notify_file {
         fanotify_notify_delete(&file, path.as_str());
+        inotify_notify_delete(&file, path.as_str());
     }
     Ok(0)
 }
@@ -944,6 +956,7 @@ pub fn sys_renameat2(
         && let Ok(new_file) = open_file_in(new_context, newpath.as_str(), OpenFlags::PATH)
     {
         fanotify_notify_move(&old_file, oldpath.as_str(), &new_file, newpath.as_str());
+        inotify_notify_move(&old_file, oldpath.as_str(), &new_file, newpath.as_str());
     }
     Ok(0)
 }

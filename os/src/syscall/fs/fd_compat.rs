@@ -9,7 +9,6 @@ const FD_NONBLOCK: u32 = OpenFlags::NONBLOCK.bits();
 const FD_CLOEXEC: u32 = OpenFlags::CLOEXEC.bits();
 const SIGNALFD_VALID_FLAGS: u32 = FD_NONBLOCK | FD_CLOEXEC;
 const TIMERFD_VALID_FLAGS: u32 = FD_NONBLOCK | FD_CLOEXEC;
-const INOTIFY_INIT1_VALID_FLAGS: u32 = FD_NONBLOCK | FD_CLOEXEC;
 const MEMFD_SECRET_VALID_FLAGS: u32 = FD_CLOEXEC;
 const UFFD_USER_MODE_ONLY: u32 = 1;
 const USERFAULTFD_VALID_FLAGS: u32 = FD_NONBLOCK | FD_CLOEXEC | UFFD_USER_MODE_ONLY;
@@ -67,12 +66,6 @@ pub fn sys_timerfd_create(clockid: i32, flags: u32) -> SysResult {
     let open_flags = open_flags_from_fd_flags(flags, TIMERFD_VALID_FLAGS)?;
     // UNFINISHED: timerfd expiration accounting and read semantics are not
     // implemented; this fd is for fd-class syscall probes.
-    install_dummy_readable_fd(open_flags)
-}
-
-pub fn sys_inotify_init1(flags: u32) -> SysResult {
-    let open_flags = open_flags_from_fd_flags(flags, INOTIFY_INIT1_VALID_FLAGS)?;
-    // UNFINISHED: inotify watches and event queues are not implemented.
     install_dummy_readable_fd(open_flags)
 }
 

@@ -16,6 +16,8 @@ const SYSCALL_DUP: usize = 23;
 const SYSCALL_DUP3: usize = 24;
 const SYSCALL_FCNTL: usize = 25;
 const SYSCALL_INOTIFY_INIT1: usize = 26;
+const SYSCALL_INOTIFY_ADD_WATCH: usize = 27;
+const SYSCALL_INOTIFY_RM_WATCH: usize = 28;
 const SYSCALL_IOCTL: usize = 29;
 const SYSCALL_FLOCK: usize = 32;
 const SYSCALL_MKNODAT: usize = 33;
@@ -234,9 +236,10 @@ use uapi::LinuxTimeSpec;
 use wait::*;
 
 pub(crate) use fs::{
+    INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES,
     close_detached_fd_entry, fanotify_evict_evictable_marks, fanotify_fdinfo,
-    fanotify_max_queued_events, install_file_fd, release_flock_locks_for_closed_fd_table,
-    release_record_locks_for_process,
+    fanotify_max_queued_events, inotify_fdinfo, install_file_fd,
+    release_flock_locks_for_closed_fd_table, release_record_locks_for_process,
 };
 pub(crate) use process::pidfd_fdinfo;
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
@@ -395,6 +398,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2] as u32),
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1], args[2]),
         SYSCALL_INOTIFY_INIT1 => sys_inotify_init1(args[0] as u32),
+        SYSCALL_INOTIFY_ADD_WATCH => {
+            sys_inotify_add_watch(args[0], args[1] as *const u8, args[2] as u32)
+        }
+        SYSCALL_INOTIFY_RM_WATCH => sys_inotify_rm_watch(args[0], args[1] as i32),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
         SYSCALL_FLOCK => sys_flock(args[0], args[1] as i32),
         SYSCALL_MKNODAT => sys_mknodat(

@@ -2,7 +2,7 @@ use crate::fs::{
     DetachedMountFile, FsContextFile, FsContextStateError, MountError, MountPropagation, OpenFlags,
     WorkingDir, lookup_existing_dir_in, lookup_mount_target_dir_in, loop_device_is_attached,
     mount_bind_at, mount_block_device_at, mount_cgroup2_at, mount_ext_scratch_at,
-    mount_fat_device_at, mount_overlay_compat_at, mount_tmpfs_at, move_mount_at,
+    mount_fat_device_at, mount_overlay_compat_at, mount_tmpfs_at, mounted_source_at, move_mount_at,
     normalize_path_at_root, open_file_in, remount_at, set_mount_propagation_at, unmount_at,
 };
 use crate::task::{CAP_SYS_ADMIN, current_process, current_user_token};
@@ -11,6 +11,7 @@ use alloc::string::String;
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{PATH_MAX, read_user_c_string};
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd, install_file_fd};
+use super::inotify::inotify_notify_unmount;
 use super::path::{
     check_current_access_path_prefixes_from, normalize_path_from, path_context_from,
 };
@@ -744,11 +745,15 @@ pub fn sys_umount2(target: *const u8, _flags: i32) -> SysResult {
         target.as_str(),
     )
     .ok_or(SysError::ENOENT)?;
+    let mounted_source = mounted_source_at(snapshot.context.namespace_id(), target_dir);
     unmount_at(
         snapshot.context.namespace_id(),
         target_dir,
         target_path.as_str(),
     )
     .map_err(mount_error_to_errno)?;
+    if let Some(mount) = mounted_source {
+        inotify_notify_unmount(mount);
+    }
     Ok(0)
 }

@@ -5,6 +5,7 @@ mod fd;
 mod fd_compat;
 mod fd_lock;
 mod file_handle;
+mod inotify;
 mod io;
 mod mount;
 mod path;
@@ -23,13 +24,17 @@ pub use fanotify::{sys_fanotify_init, sys_fanotify_mark};
 pub(crate) use fd::{close_detached_fd_entry, get_file_by_fd, install_file_fd};
 pub use fd::{sys_close, sys_dup, sys_dup3, sys_fcntl, sys_flock, sys_memfd_create, sys_pipe2};
 pub use fd_compat::{
-    sys_bpf, sys_inotify_init1, sys_io_uring_setup, sys_memfd_secret, sys_perf_event_open,
-    sys_signalfd4, sys_timerfd_create, sys_userfaultfd,
+    sys_bpf, sys_io_uring_setup, sys_memfd_secret, sys_perf_event_open, sys_signalfd4,
+    sys_timerfd_create, sys_userfaultfd,
 };
 pub(crate) use fd_lock::{
     release_flock_locks_for_closed_fd_table, release_record_locks_for_process,
 };
 pub use file_handle::sys_name_to_handle_at;
+pub(crate) use inotify::{
+    INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES, inotify_fdinfo,
+};
+pub use inotify::{sys_inotify_add_watch, sys_inotify_init1, sys_inotify_rm_watch};
 pub use io::{
     sys_copy_file_range, sys_fadvise64, sys_fallocate, sys_fsync, sys_ftruncate, sys_lseek,
     sys_pread64, sys_preadv, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read, sys_readahead,

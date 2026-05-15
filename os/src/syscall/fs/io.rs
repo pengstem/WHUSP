@@ -12,6 +12,7 @@ use super::super::user_ptr::{
 };
 use super::fanotify::{fanotify_notify_access, fanotify_notify_modify};
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
+use super::inotify::{inotify_notify_access, inotify_notify_modify};
 use super::uapi::{IOV_MAX, LinuxIovec};
 
 struct UserIovecs {
@@ -607,6 +608,7 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> SysRes
         }
     }
     fanotify_notify_access(&file, total_read);
+    inotify_notify_access(&file, total_read);
     Ok(total_read as isize)
 }
 
@@ -642,6 +644,7 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, len: usize, offset: usize) -> Sys
         }
     }
     fanotify_notify_modify(&file, total_written);
+    inotify_notify_modify(&file, total_written);
     Ok(total_written as isize)
 }
 
@@ -699,11 +702,13 @@ pub fn sys_preadv(
             offset = offset.checked_add(read).ok_or(SysError::EINVAL)?;
             if read < slice.len() {
                 fanotify_notify_access(&file, total_read);
+                inotify_notify_access(&file, total_read);
                 return Ok(total_read as isize);
             }
         }
     }
     fanotify_notify_access(&file, total_read);
+    inotify_notify_access(&file, total_read);
     Ok(total_read as isize)
 }
 
@@ -743,6 +748,7 @@ pub fn sys_pwritev(
         if iovec.base == 0 {
             return if total_written > 0 {
                 fanotify_notify_modify(&file, total_written);
+                inotify_notify_modify(&file, total_written);
                 Ok(total_written as isize)
             } else {
                 Err(SysError::EFAULT)
@@ -757,6 +763,7 @@ pub fn sys_pwritev(
             Ok(buffers) => buffers,
             Err(_) if total_written > 0 => {
                 fanotify_notify_modify(&file, total_written);
+                inotify_notify_modify(&file, total_written);
                 return Ok(total_written as isize);
             }
             Err(err) => return Err(err),
@@ -771,11 +778,13 @@ pub fn sys_pwritev(
             offset = offset.checked_add(written).ok_or(SysError::EINVAL)?;
             if written < slice.len() {
                 fanotify_notify_modify(&file, total_written);
+                inotify_notify_modify(&file, total_written);
                 return Ok(total_written as isize);
             }
         }
     }
     fanotify_notify_modify(&file, total_written);
+    inotify_notify_modify(&file, total_written);
     Ok(total_written as isize)
 }
 
@@ -814,12 +823,14 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
         // not consume payload bytes; skipping the copy keeps af_alg04 from
         // spending most of its time fault-checking data that is discarded.
         fanotify_notify_modify(&file, len);
+        inotify_notify_modify(&file, len);
         return Ok(len as isize);
     }
     let buffers =
         translated_byte_buffer_checked_with_mmap_fault(token, buf, len, UserBufferAccess::Read)?;
     let written = write_with_status_flags(&entry, UserBuffer::new(buffers));
     fanotify_notify_modify(&file, written);
+    inotify_notify_modify(&file, written);
     Ok(written as isize)
 }
 
@@ -866,6 +877,7 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
             Ok(buffers) => buffers,
             Err(_) if total_written > 0 => {
                 fanotify_notify_modify(&file, total_written);
+                inotify_notify_modify(&file, total_written);
                 return Ok(total_written as isize);
             }
             Err(err) => return Err(err),
@@ -877,6 +889,7 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
         }
     }
     fanotify_notify_modify(&file, total_written);
+    inotify_notify_modify(&file, total_written);
     Ok(total_written as isize)
 }
 
@@ -934,6 +947,7 @@ pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult 
         }
     }
     fanotify_notify_access(&file, total_read);
+    inotify_notify_access(&file, total_read);
     Ok(total_read as isize)
 }
 
@@ -953,6 +967,7 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> SysResult {
         translated_byte_buffer_checked_with_mmap_fault(token, buf, len, UserBufferAccess::Write)?;
     let read = file.read(UserBuffer::new(buffers));
     fanotify_notify_access(&file, read);
+    inotify_notify_access(&file, read);
     Ok(read as isize)
 }
 

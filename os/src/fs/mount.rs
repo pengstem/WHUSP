@@ -1823,6 +1823,16 @@ fn dynamic_mount_at(namespace_id: MountNamespaceId, target: VfsNodeId) -> Option
     })
 }
 
+pub(crate) fn mounted_source_at(
+    namespace_id: MountNamespaceId,
+    target: WorkingDir,
+) -> Option<MountId> {
+    dynamic_mount_at(
+        namespace_id,
+        VfsNodeId::new(target.mount_id(), target.ino()),
+    )
+}
+
 fn set_mount_options(mount_id: MountId, options: &'static str) -> Result<(), MountError> {
     let mounted = {
         let mounts = MOUNTS.lock();

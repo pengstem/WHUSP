@@ -18,6 +18,7 @@ use super::fd_lock::{
     flock_operation, release_flock_locks_for_close, release_ofd_record_locks_for_close,
     release_record_locks_for_close,
 };
+use super::inotify::inotify_notify_close;
 
 const F_DUPFD: usize = 0;
 const F_GETFD: usize = 1;
@@ -97,6 +98,7 @@ pub(crate) fn close_detached_fd_entry(entry: FdTableEntry) {
     release_flock_locks_for_close(&entry);
     let file = entry.file();
     fanotify_notify_close(&file, file.writable());
+    inotify_notify_close(&file, file.writable());
     drop(entry);
 }
 
