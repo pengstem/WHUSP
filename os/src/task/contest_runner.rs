@@ -5,8 +5,15 @@ const LA_MUSL_COMPAT_PRELOAD: &str = "/opt/oscomp-support/lib/liboscomp-musl-com
 // CONTEXT: Search the manifests that contain the current whitelist, ordered by
 // duplicate-resolution priority. Keep syscalls before smoketest aliases while
 // still covering fs_bind mount scripts, crypto AF_ALG, and pty cases.
-const LTP_RUNTEST_MANIFESTS: &[&str] =
-    &["syscalls", "fs_bind", "crypto", "pty", "smoketest", "cve"];
+const LTP_RUNTEST_MANIFESTS: &[&str] = &[
+    "syscalls",
+    "input",
+    "fs_bind",
+    "crypto",
+    "pty",
+    "smoketest",
+    "cve",
+];
 
 const INTERACTIVE_SHELL: bool = false;
 
@@ -49,9 +56,7 @@ const TEST_SCRIPTS: &[&str] = &[
 /// runs cases whose names start with the prefix, and
 /// Some("range:<start>,<end>") runs cases in the lexicographic half-open range
 /// [start, end). Empty range bounds are unbounded.
-const LTP_CASE_FILTER_OPTION: Option<&str> = Some(
-    "cases:inotify10,inotify02,inotify12,inotify01,inotify04,inotify07,inotify03,inotify08,inotify05,inotify06,inotify_init1_01,inotify_init1_02",
-);
+const LTP_CASE_FILTER_OPTION: Option<&str> = None;
 
 #[derive(Clone, Copy)]
 enum LtpCaseFilter {
