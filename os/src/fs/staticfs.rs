@@ -36,6 +36,9 @@ ltp_add_key05_9:x:10009:\n";
 const ETC_HOSTS: &[u8] = b"127.0.0.1 localhost localhost.localdomain\n";
 const ETC_RESOLV_CONF: &[u8] = b"";
 const ETC_PROTOCOLS: &[u8] = b"ip 0 IP\ntcp 6 TCP\nudp 17 UDP\n";
+const PROC_BUS_INPUT_DEVICES: &[u8] =
+    b"I: Bus=0003 Vendor=0001 Product=0001 Version=0001\nN: Name=\"virtual-device-ltp\"\n";
+const SYS_INPUT0_NAME: &[u8] = b"virtual-device-ltp\n";
 #[cfg(target_arch = "loongarch64")]
 const LA_MUSL_COMPAT_SO: &[u8] =
     include_bytes!("../../assets/loongarch64/liboscomp-musl-compat.so");
@@ -49,6 +52,8 @@ enum StaticNode {
     Hosts,
     ResolvConf,
     Protocols,
+    ProcBusInputDevices,
+    SysInput0Name,
     #[cfg(target_arch = "loongarch64")]
     OptDir,
     #[cfg(target_arch = "loongarch64")]
@@ -84,6 +89,8 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
         "/etc/hosts" => Some(StaticNode::Hosts),
         "/etc/resolv.conf" => Some(StaticNode::ResolvConf),
         "/etc/protocols" => Some(StaticNode::Protocols),
+        "/proc/bus/input/devices" => Some(StaticNode::ProcBusInputDevices),
+        "/sys/devices/virtual/input/input0/name" => Some(StaticNode::SysInput0Name),
         #[cfg(target_arch = "loongarch64")]
         "/opt" | "/opt/" => Some(StaticNode::OptDir),
         #[cfg(target_arch = "loongarch64")]
@@ -106,6 +113,8 @@ fn content(node: StaticNode) -> Option<&'static [u8]> {
         StaticNode::Hosts => Some(ETC_HOSTS),
         StaticNode::ResolvConf => Some(ETC_RESOLV_CONF),
         StaticNode::Protocols => Some(ETC_PROTOCOLS),
+        StaticNode::ProcBusInputDevices => Some(PROC_BUS_INPUT_DEVICES),
+        StaticNode::SysInput0Name => Some(SYS_INPUT0_NAME),
         StaticNode::EtcDir => None,
         #[cfg(target_arch = "loongarch64")]
         StaticNode::OptDir
@@ -147,6 +156,8 @@ fn stat_node(node: StaticNode) -> FileStat {
         StaticNode::Hosts => 5,
         StaticNode::ResolvConf => 6,
         StaticNode::Protocols => 7,
+        StaticNode::ProcBusInputDevices => 12,
+        StaticNode::SysInput0Name => 13,
         #[cfg(target_arch = "loongarch64")]
         StaticNode::OptDir => 8,
         #[cfg(target_arch = "loongarch64")]

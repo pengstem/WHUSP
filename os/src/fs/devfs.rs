@@ -29,12 +29,33 @@ const LOOP_DEVICE_SIZE_FALLBACK: u64 = 300 * 1024 * 1024;
 const PTY_BUFFER_CAPACITY: usize = 8192;
 const PTY_TABLE_SIZE: usize = 64;
 const PTY_INO_BASE: u32 = 0x1000;
+const INPUT_DEVICE_NAME: &str = "virtual-device-ltp";
+const INPUT_EVENT_QUEUE_CAPACITY: usize = 512;
+const INPUT_MICE_QUEUE_CAPACITY: usize = 512;
+const INPUT_EVENT_SIZE: usize = core::mem::size_of::<LinuxInputEvent>();
+const UINPUT_MAX_NAME_SIZE: usize = 80;
+const EV_SYN: u16 = 0x00;
+const EV_KEY: u16 = 0x01;
+const EV_REL: u16 = 0x02;
+const EV_REP: u16 = 0x14;
+const EV_MAX: usize = 0x1f;
+const SYN_REPORT: u16 = 0;
+const REL_MAX: usize = 0x0f;
+const KEY_X: u16 = 45;
+const BTN_RIGHT: u16 = 0x111;
+const KEY_MAX: usize = 0x2ff;
+const REP_DELAY: u16 = 0;
+const REP_PERIOD: u16 = 1;
+const INPUT_DEFAULT_REP_DELAY_MS: i32 = 250;
+const INPUT_DEFAULT_REP_PERIOD_MS: i32 = 33;
 
 lazy_static! {
     static ref LOOP0_BACKEND: UPIntrFreeCell<Option<Arc<dyn File + Send + Sync>>> =
         unsafe { UPIntrFreeCell::new(None) };
     static ref PTY_TABLE: UPIntrFreeCell<PtyTable> =
         unsafe { UPIntrFreeCell::new(PtyTable::new()) };
+    static ref INPUT_STATE: UPIntrFreeCell<InputState> =
+        unsafe { UPIntrFreeCell::new(InputState::new()) };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +76,10 @@ enum DevNode {
     Rtc,
     LoopControl,
     Loop0,
+    Input,
+    UInput,
+    InputEvent0,
+    InputMice,
 }
 
 impl DevNode {
@@ -76,6 +101,10 @@ impl DevNode {
             Self::Rtc => 14,
             Self::LoopControl => 15,
             Self::Loop0 => 16,
+            Self::Input => 17,
+            Self::UInput => 18,
+            Self::InputEvent0 => 19,
+            Self::InputMice => 20,
         }
     }
 
@@ -95,6 +124,10 @@ impl DevNode {
             Self::Rtc => linux_makedev(253, 0),
             Self::LoopControl => linux_makedev(10, 237),
             Self::Loop0 => linux_makedev(7, 0),
+            Self::Input => 0,
+            Self::UInput => linux_makedev(10, 223),
+            Self::InputEvent0 => linux_makedev(13, 64),
+            Self::InputMice => linux_makedev(13, 63),
         }
     }
 
@@ -104,7 +137,7 @@ impl DevNode {
 
     fn kind(self) -> FsNodeKind {
         match self {
-            Self::Root | Self::Misc | Self::Pts => FsNodeKind::Directory,
+            Self::Root | Self::Misc | Self::Pts | Self::Input => FsNodeKind::Directory,
             _ => FsNodeKind::CharacterDevice,
         }
     }
@@ -158,6 +191,211 @@ struct PtyFile {
     readable: bool,
     writable: bool,
     status_flags: StatusFlagsCell,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxInputEvent {
+    tv_sec: usize,
+    tv_usec: usize,
+    event_type: u16,
+    code: u16,
+    value: i32,
+}
+
+#[derive(Clone)]
+struct InputDeviceConfig {
+    name: [u8; UINPUT_MAX_NAME_SIZE],
+    ev_bits: [bool; EV_MAX + 1],
+    key_bits: [bool; KEY_MAX + 1],
+    rel_bits: [bool; REL_MAX + 1],
+}
+
+impl InputDeviceConfig {
+    fn new() -> Self {
+        let mut name = [0u8; UINPUT_MAX_NAME_SIZE];
+        name[..INPUT_DEVICE_NAME.len()].copy_from_slice(INPUT_DEVICE_NAME.as_bytes());
+        Self {
+            name,
+            ev_bits: [false; EV_MAX + 1],
+            key_bits: [false; KEY_MAX + 1],
+            rel_bits: [false; REL_MAX + 1],
+        }
+    }
+
+    fn name_bytes(&self) -> &[u8] {
+        let len = self
+            .name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(self.name.len());
+        &self.name[..len]
+    }
+
+    fn set_name_from_user_dev(&mut self, data: &[u8]) {
+        self.name.fill(0);
+        let len = data
+            .iter()
+            .take(UINPUT_MAX_NAME_SIZE)
+            .position(|byte| *byte == 0)
+            .unwrap_or(UINPUT_MAX_NAME_SIZE);
+        self.name[..len].copy_from_slice(&data[..len]);
+    }
+
+    fn set_evbit(&mut self, code: usize) -> FsResult {
+        set_bool_bit(&mut self.ev_bits, code)
+    }
+
+    fn set_keybit(&mut self, code: usize) -> FsResult {
+        set_bool_bit(&mut self.key_bits, code)
+    }
+
+    fn set_relbit(&mut self, code: usize) -> FsResult {
+        set_bool_bit(&mut self.rel_bits, code)
+    }
+
+    fn supports_ev(&self, event_type: u16) -> bool {
+        self.ev_bits
+            .get(event_type as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn supports_key(&self, code: u16) -> bool {
+        self.supports_ev(EV_KEY) && self.key_bits.get(code as usize).copied().unwrap_or(false)
+    }
+
+    fn supports_rel(&self, code: u16) -> bool {
+        self.supports_ev(EV_REL) && self.rel_bits.get(code as usize).copied().unwrap_or(false)
+    }
+}
+
+fn set_bool_bit(bits: &mut [bool], code: usize) -> FsResult {
+    let bit = bits.get_mut(code).ok_or(FsError::InvalidInput)?;
+    *bit = true;
+    Ok(())
+}
+
+struct UInputConfig {
+    device: InputDeviceConfig,
+    packet_has_event: bool,
+}
+
+impl UInputConfig {
+    fn new() -> Self {
+        Self {
+            device: InputDeviceConfig::new(),
+            packet_has_event: false,
+        }
+    }
+}
+
+struct UInputFile {
+    config: UPIntrFreeCell<UInputConfig>,
+    status_flags: StatusFlagsCell,
+}
+
+impl UInputFile {
+    fn new(flags: OpenFlags) -> Self {
+        Self {
+            config: unsafe { UPIntrFreeCell::new(UInputConfig::new()) },
+            status_flags: StatusFlagsCell::new(OpenFlags::file_status_flags(flags)),
+        }
+    }
+}
+
+struct InputEventFile {
+    client: Arc<UPIntrFreeCell<InputClient>>,
+    readable: bool,
+    writable: bool,
+    status_flags: StatusFlagsCell,
+}
+
+impl InputEventFile {
+    fn new(readable: bool, writable: bool, flags: OpenFlags) -> Self {
+        Self {
+            client: input_open_client(),
+            readable,
+            writable,
+            status_flags: StatusFlagsCell::new(OpenFlags::file_status_flags(flags)),
+        }
+    }
+}
+
+struct InputClient {
+    events: VecDeque<LinuxInputEvent>,
+    read_wait_queue: VecDeque<Arc<TaskControlBlock>>,
+    grabbed: bool,
+    closed: bool,
+}
+
+impl InputClient {
+    fn new() -> Self {
+        Self {
+            events: VecDeque::new(),
+            read_wait_queue: VecDeque::new(),
+            grabbed: false,
+            closed: false,
+        }
+    }
+
+    fn available_read(&self) -> usize {
+        self.events.len() * INPUT_EVENT_SIZE
+    }
+
+    fn push_event(&mut self, event: LinuxInputEvent) -> VecDeque<Arc<TaskControlBlock>> {
+        if self.events.len() >= INPUT_EVENT_QUEUE_CAPACITY {
+            self.events.pop_front();
+        }
+        self.events.push_back(event);
+        core::mem::take(&mut self.read_wait_queue)
+    }
+
+    fn sleep_reader(&mut self) -> *mut crate::task::TaskContext {
+        let (task, task_cx_ptr) = block_current_task_no_schedule();
+        self.read_wait_queue.push_back(task);
+        task_cx_ptr
+    }
+}
+
+struct InputState {
+    device_created: bool,
+    device: InputDeviceConfig,
+    clients: Vec<Arc<UPIntrFreeCell<InputClient>>>,
+    mice_queue: VecDeque<u8>,
+    mice_read_wait_queue: VecDeque<Arc<TaskControlBlock>>,
+}
+
+impl InputState {
+    fn new() -> Self {
+        Self {
+            device_created: false,
+            device: InputDeviceConfig::new(),
+            clients: Vec::new(),
+            mice_queue: VecDeque::new(),
+            mice_read_wait_queue: VecDeque::new(),
+        }
+    }
+
+    fn create_device(&mut self, device: InputDeviceConfig) {
+        self.device_created = true;
+        self.device = device;
+        self.mice_queue.clear();
+    }
+
+    fn destroy_device(&mut self) {
+        self.device_created = false;
+        self.mice_queue.clear();
+        for client in &self.clients {
+            client.exclusive_access().events.clear();
+        }
+    }
+
+    fn sleep_mice_reader(&mut self) -> *mut crate::task::TaskContext {
+        let (task, task_cx_ptr) = block_current_task_no_schedule();
+        self.mice_read_wait_queue.push_back(task);
+        task_cx_ptr
+    }
 }
 
 impl PtyFile {
@@ -367,7 +605,7 @@ struct DevDirEntry {
     dtype: u8,
 }
 
-const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 18] = [
+const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 20] = [
     DevDirEntry {
         node: DevNode::Root,
         name: b".",
@@ -434,6 +672,16 @@ const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 18] = [
         dtype: DT_DIR,
     },
     DevDirEntry {
+        node: DevNode::Input,
+        name: b"input",
+        dtype: DT_DIR,
+    },
+    DevDirEntry {
+        node: DevNode::UInput,
+        name: b"uinput",
+        dtype: DT_CHR,
+    },
+    DevDirEntry {
         node: DevNode::Rtc,
         name: b"rtc",
         dtype: DT_CHR,
@@ -457,6 +705,34 @@ const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 18] = [
         node: DevNode::Misc,
         name: b"misc",
         dtype: DT_DIR,
+    },
+];
+
+const INPUT_DEV_DIR_ENTRIES: [DevDirEntry; 5] = [
+    DevDirEntry {
+        node: DevNode::Input,
+        name: b".",
+        dtype: DT_DIR,
+    },
+    DevDirEntry {
+        node: DevNode::Root,
+        name: b"..",
+        dtype: DT_DIR,
+    },
+    DevDirEntry {
+        node: DevNode::UInput,
+        name: b"uinput",
+        dtype: DT_CHR,
+    },
+    DevDirEntry {
+        node: DevNode::InputEvent0,
+        name: b"event0",
+        dtype: DT_CHR,
+    },
+    DevDirEntry {
+        node: DevNode::InputMice,
+        name: b"mice",
+        dtype: DT_CHR,
     },
 ];
 
@@ -502,6 +778,10 @@ fn node_from_ino(ino: u32) -> Option<DevNode> {
         14 => Some(DevNode::Rtc),
         15 => Some(DevNode::LoopControl),
         16 => Some(DevNode::Loop0),
+        17 => Some(DevNode::Input),
+        18 => Some(DevNode::UInput),
+        19 => Some(DevNode::InputEvent0),
+        20 => Some(DevNode::InputMice),
         _ => None,
     }
 }
@@ -535,6 +815,8 @@ fn lookup_child(parent: DevNode, path: &str) -> Option<DevNode> {
             "tty8" => Some(DevNode::Tty8),
             "tty9" => Some(DevNode::Tty9),
             "ptmx" => Some(DevNode::PtMx),
+            "input" => Some(DevNode::Input),
+            "uinput" => Some(DevNode::UInput),
             "rtc" | "rtc0" => Some(DevNode::Rtc),
             "loop-control" => Some(DevNode::LoopControl),
             "loop0" => Some(DevNode::Loop0),
@@ -544,6 +826,14 @@ fn lookup_child(parent: DevNode, path: &str) -> Option<DevNode> {
             "." => Some(DevNode::Misc),
             ".." => Some(DevNode::Root),
             "rtc" => Some(DevNode::Rtc),
+            _ => None,
+        },
+        DevNode::Input => match path {
+            "." => Some(DevNode::Input),
+            ".." => Some(DevNode::Root),
+            "uinput" => Some(DevNode::UInput),
+            "event0" => Some(DevNode::InputEvent0),
+            "mice" => Some(DevNode::InputMice),
             _ => None,
         },
         DevNode::Pts => match path {
@@ -629,7 +919,23 @@ fn open_node_at(
     if node == DevNode::PtMx {
         return open_ptmx(flags);
     }
-    if matches!(node, DevNode::Root | DevNode::Misc | DevNode::Pts) {
+    if node == DevNode::UInput {
+        if flags.contains(OpenFlags::DIRECTORY) {
+            return Err(FsError::NotDir);
+        }
+        return Ok(Arc::new(UInputFile::new(flags)));
+    }
+    if node == DevNode::InputEvent0 {
+        if flags.contains(OpenFlags::DIRECTORY) {
+            return Err(FsError::NotDir);
+        }
+        let (readable, writable) = flags.read_write();
+        return Ok(Arc::new(InputEventFile::new(readable, writable, flags)));
+    }
+    if matches!(
+        node,
+        DevNode::Root | DevNode::Misc | DevNode::Pts | DevNode::Input
+    ) {
         if !flags.can_open_directory() {
             return Err(FsError::IsDir);
         }
@@ -665,6 +971,9 @@ pub(crate) fn open_child(
     if let Some(rest) = path.strip_prefix("pts/") {
         return open_pts_child(rest, flags);
     }
+    if let Some(rest) = path.strip_prefix("input/") {
+        return open_input_child(rest, flags);
+    }
     if path.contains('/') {
         return Ok(None);
     }
@@ -681,6 +990,18 @@ pub(crate) fn open_misc_child(
         return Ok(None);
     }
     lookup_child(DevNode::Misc, path)
+        .map(|node| open_node(node, flags))
+        .transpose()
+}
+
+pub(crate) fn open_input_child(
+    path: &str,
+    flags: OpenFlags,
+) -> FsResult<Option<Arc<dyn File + Send + Sync>>> {
+    if path.contains('/') {
+        return Ok(None);
+    }
+    lookup_child(DevNode::Input, path)
         .map(|node| open_node(node, flags))
         .transpose()
 }
@@ -723,7 +1044,7 @@ pub(crate) fn inode_is_pts_dir(ino: u32) -> bool {
 
 fn stat_node(node: DevNode) -> FileStat {
     let mode = match node {
-        DevNode::Root | DevNode::Misc | DevNode::Pts => S_IFDIR | 0o755,
+        DevNode::Root | DevNode::Misc | DevNode::Pts | DevNode::Input => S_IFDIR | 0o755,
         DevNode::Loop0 => S_IFBLK | 0o666,
         DevNode::PtMx => S_IFCHR | 0o666,
         _ => S_IFCHR | 0o666,
@@ -732,7 +1053,10 @@ fn stat_node(node: DevNode) -> FileStat {
     stat.dev = DEVFS_DEV;
     stat.ino = node.ino() as u64;
     stat.rdev = node.rdev();
-    stat.nlink = if matches!(node, DevNode::Root | DevNode::Misc | DevNode::Pts) {
+    stat.nlink = if matches!(
+        node,
+        DevNode::Root | DevNode::Misc | DevNode::Pts | DevNode::Input
+    ) {
         2
     } else {
         1
@@ -867,6 +1191,73 @@ pub(crate) fn devfs_loop_device_id(file: &(dyn File + Send + Sync)) -> Option<us
         .and_then(|file| (file.node == DevNode::Loop0).then_some(0))
 }
 
+pub(crate) fn is_devfs_uinput(file: &(dyn File + Send + Sync)) -> bool {
+    file.as_any().downcast_ref::<UInputFile>().is_some()
+}
+
+pub(crate) fn is_devfs_input_event(file: &(dyn File + Send + Sync)) -> bool {
+    file.as_any().downcast_ref::<InputEventFile>().is_some()
+}
+
+pub(crate) fn devfs_uinput_set_evbit(file: &(dyn File + Send + Sync), code: usize) -> FsResult {
+    let file = file
+        .as_any()
+        .downcast_ref::<UInputFile>()
+        .ok_or(FsError::InvalidInput)?;
+    file.config.exclusive_access().device.set_evbit(code)
+}
+
+pub(crate) fn devfs_uinput_set_keybit(file: &(dyn File + Send + Sync), code: usize) -> FsResult {
+    let file = file
+        .as_any()
+        .downcast_ref::<UInputFile>()
+        .ok_or(FsError::InvalidInput)?;
+    file.config.exclusive_access().device.set_keybit(code)
+}
+
+pub(crate) fn devfs_uinput_set_relbit(file: &(dyn File + Send + Sync), code: usize) -> FsResult {
+    let file = file
+        .as_any()
+        .downcast_ref::<UInputFile>()
+        .ok_or(FsError::InvalidInput)?;
+    file.config.exclusive_access().device.set_relbit(code)
+}
+
+pub(crate) fn devfs_uinput_create(file: &(dyn File + Send + Sync)) -> FsResult {
+    let file = file
+        .as_any()
+        .downcast_ref::<UInputFile>()
+        .ok_or(FsError::InvalidInput)?;
+    let device = file.config.exclusive_access().device.clone();
+    INPUT_STATE.exclusive_session(|state| state.create_device(device));
+    Ok(())
+}
+
+pub(crate) fn devfs_uinput_destroy(file: &(dyn File + Send + Sync)) -> FsResult {
+    file.as_any()
+        .downcast_ref::<UInputFile>()
+        .ok_or(FsError::InvalidInput)?;
+    INPUT_STATE.exclusive_session(|state| state.destroy_device());
+    Ok(())
+}
+
+pub(crate) fn devfs_input_event_name(file: &(dyn File + Send + Sync)) -> Option<Vec<u8>> {
+    file.as_any().downcast_ref::<InputEventFile>()?;
+    Some(INPUT_STATE.exclusive_access().device.name_bytes().to_vec())
+}
+
+pub(crate) fn devfs_input_event_set_grabbed(
+    file: &(dyn File + Send + Sync),
+    grabbed: bool,
+) -> FsResult {
+    let file = file
+        .as_any()
+        .downcast_ref::<InputEventFile>()
+        .ok_or(FsError::InvalidInput)?;
+    file.client.exclusive_access().grabbed = grabbed;
+    Ok(())
+}
+
 pub(crate) fn find_free_loop_device() -> FsResult<usize> {
     if LOOP0_BACKEND.exclusive_session(|backend| backend.is_none()) {
         Ok(0)
@@ -909,6 +1300,9 @@ pub(crate) fn stat_child(path: &str) -> Option<FileStat> {
     if let Some(rest) = path.strip_prefix("pts/") {
         return stat_pts_child(rest);
     }
+    if let Some(rest) = path.strip_prefix("input/") {
+        return stat_input_child(rest);
+    }
     if path.contains('/') {
         return None;
     }
@@ -920,6 +1314,13 @@ pub(crate) fn stat_misc_child(path: &str) -> Option<FileStat> {
         return None;
     }
     Some(stat_node(lookup_child(DevNode::Misc, path)?))
+}
+
+pub(crate) fn stat_input_child(path: &str) -> Option<FileStat> {
+    if path.contains('/') {
+        return None;
+    }
+    Some(stat_node(lookup_child(DevNode::Input, path)?))
 }
 
 pub(crate) fn stat_pts_child(path: &str) -> Option<FileStat> {
@@ -961,6 +1362,243 @@ fn read_random(user_buf: UserBuffer) -> usize {
     for (index, byte_ref) in user_buf.into_iter().enumerate() {
         unsafe {
             *byte_ref = (index as u8).wrapping_mul(37).wrapping_add(0xa5);
+        }
+    }
+    len
+}
+
+fn input_wait_interrupted() -> bool {
+    current_has_unmasked_signal()
+}
+
+fn input_open_client() -> Arc<UPIntrFreeCell<InputClient>> {
+    let client = Arc::new(unsafe { UPIntrFreeCell::new(InputClient::new()) });
+    INPUT_STATE.exclusive_session(|state| {
+        if state.device_created && state.device.supports_ev(EV_REP) {
+            let mut inner = client.exclusive_access();
+            let _ = inner.push_event(linux_input_event(
+                EV_REP,
+                REP_DELAY,
+                INPUT_DEFAULT_REP_DELAY_MS,
+            ));
+            let _ = inner.push_event(linux_input_event(
+                EV_REP,
+                REP_PERIOD,
+                INPUT_DEFAULT_REP_PERIOD_MS,
+            ));
+        }
+        state.clients.push(client.clone());
+    });
+    client
+}
+
+fn linux_input_event(event_type: u16, code: u16, value: i32) -> LinuxInputEvent {
+    let nanos = crate::timer::wall_time_nanos();
+    LinuxInputEvent {
+        tv_sec: (nanos / 1_000_000_000) as usize,
+        tv_usec: ((nanos / 1_000) % 1_000_000) as usize,
+        event_type,
+        code,
+        value,
+    }
+}
+
+fn input_event_to_bytes(event: LinuxInputEvent, out: &mut [u8]) {
+    out[0..core::mem::size_of::<usize>()].copy_from_slice(&event.tv_sec.to_ne_bytes());
+    out[8..16].copy_from_slice(&event.tv_usec.to_ne_bytes());
+    out[16..18].copy_from_slice(&event.event_type.to_ne_bytes());
+    out[18..20].copy_from_slice(&event.code.to_ne_bytes());
+    out[20..24].copy_from_slice(&event.value.to_ne_bytes());
+}
+
+fn input_event_from_bytes(input: &[u8]) -> LinuxInputEvent {
+    let mut word = [0u8; core::mem::size_of::<usize>()];
+    word.copy_from_slice(&input[0..8]);
+    let tv_sec = usize::from_ne_bytes(word);
+    word.copy_from_slice(&input[8..16]);
+    let tv_usec = usize::from_ne_bytes(word);
+    let mut half = [0u8; 2];
+    half.copy_from_slice(&input[16..18]);
+    let event_type = u16::from_ne_bytes(half);
+    half.copy_from_slice(&input[18..20]);
+    let code = u16::from_ne_bytes(half);
+    let mut value = [0u8; 4];
+    value.copy_from_slice(&input[20..24]);
+    LinuxInputEvent {
+        tv_sec,
+        tv_usec,
+        event_type,
+        code,
+        value: i32::from_ne_bytes(value),
+    }
+}
+
+fn read_input_event(
+    client: &Arc<UPIntrFreeCell<InputClient>>,
+    mut user_buf: UserBuffer,
+    flags: OpenFlags,
+) -> usize {
+    let want_to_read = user_buf.len() / INPUT_EVENT_SIZE * INPUT_EVENT_SIZE;
+    if want_to_read == 0 {
+        return 0;
+    }
+    loop {
+        let mut inner = client.exclusive_access();
+        let available = inner.available_read();
+        if available == 0 {
+            if flags.contains(OpenFlags::NONBLOCK) || input_wait_interrupted() {
+                return 0;
+            }
+            let task_cx_ptr = inner.sleep_reader();
+            drop(inner);
+            schedule(task_cx_ptr);
+            continue;
+        }
+
+        let read_len = available.min(want_to_read);
+        let mut kernel_buf = vec![0u8; read_len];
+        let mut copied = 0usize;
+        while copied < read_len {
+            let Some(event) = inner.events.pop_front() else {
+                break;
+            };
+            input_event_to_bytes(event, &mut kernel_buf[copied..copied + INPUT_EVENT_SIZE]);
+            copied += INPUT_EVENT_SIZE;
+        }
+        drop(inner);
+        return user_buf.copy_from_slice(&kernel_buf[..copied]);
+    }
+}
+
+fn read_input_mice(flags: OpenFlags, mut user_buf: UserBuffer) -> usize {
+    let want_to_read = user_buf.len() / 3 * 3;
+    if want_to_read == 0 {
+        return 0;
+    }
+    loop {
+        let mut state = INPUT_STATE.exclusive_access();
+        if state.mice_queue.is_empty() {
+            if flags.contains(OpenFlags::NONBLOCK) || input_wait_interrupted() {
+                return 0;
+            }
+            let task_cx_ptr = state.sleep_mice_reader();
+            drop(state);
+            schedule(task_cx_ptr);
+            continue;
+        }
+
+        let read_len = state.mice_queue.len().min(want_to_read) / 3 * 3;
+        let mut kernel_buf = vec![0u8; read_len];
+        for byte in kernel_buf.iter_mut() {
+            *byte = state.mice_queue.pop_front().unwrap_or(0);
+        }
+        drop(state);
+        return user_buf.copy_from_slice(&kernel_buf);
+    }
+}
+
+fn emit_input_event(event: LinuxInputEvent) {
+    let readers = {
+        let state = INPUT_STATE.exclusive_access();
+        if !state.device_created {
+            return;
+        }
+        let grabbed = state.clients.iter().any(|client| {
+            let client = client.exclusive_access();
+            !client.closed && client.grabbed
+        });
+        let mut readers = VecDeque::new();
+        for client in &state.clients {
+            let mut client = client.exclusive_access();
+            if client.closed || (grabbed && !client.grabbed) {
+                continue;
+            }
+            readers.append(&mut client.push_event(event));
+        }
+        readers
+    };
+    wake_tasks(readers);
+}
+
+fn emit_mice_packet(buttons: u8) {
+    let readers = {
+        let mut state = INPUT_STATE.exclusive_access();
+        if !state.device_created {
+            return;
+        }
+        while state.mice_queue.len() + 3 > INPUT_MICE_QUEUE_CAPACITY {
+            state.mice_queue.pop_front();
+        }
+        state.mice_queue.push_back(buttons);
+        state.mice_queue.push_back(0);
+        state.mice_queue.push_back(0);
+        core::mem::take(&mut state.mice_read_wait_queue)
+    };
+    wake_tasks(readers);
+}
+
+fn should_deliver_uinput_event(device: &InputDeviceConfig, event: LinuxInputEvent) -> bool {
+    match event.event_type {
+        EV_REL => device.supports_rel(event.code) && event.value != 0,
+        EV_KEY => device.supports_key(event.code),
+        _ => false,
+    }
+}
+
+fn write_uinput(user_buf: UserBuffer, config: &UPIntrFreeCell<UInputConfig>) -> usize {
+    let len = user_buf.len();
+    let mut data = Vec::with_capacity(len);
+    for slice in user_buf.buffers.iter() {
+        data.extend_from_slice(slice);
+    }
+
+    if data.len() >= UINPUT_MAX_NAME_SIZE && data.len() != INPUT_EVENT_SIZE {
+        config
+            .exclusive_access()
+            .device
+            .set_name_from_user_dev(&data[..UINPUT_MAX_NAME_SIZE]);
+        return len;
+    }
+
+    if data.len() % INPUT_EVENT_SIZE != 0 {
+        return len;
+    }
+
+    for chunk in data.chunks_exact(INPUT_EVENT_SIZE) {
+        let event = input_event_from_bytes(chunk);
+        let mut cfg = config.exclusive_access();
+        match event.event_type {
+            EV_SYN if event.code == SYN_REPORT => {
+                if cfg.packet_has_event {
+                    cfg.packet_has_event = false;
+                    drop(cfg);
+                    emit_input_event(linux_input_event(EV_SYN, SYN_REPORT, 0));
+                }
+            }
+            EV_KEY if should_deliver_uinput_event(&cfg.device, event) => {
+                if cfg.device.supports_ev(EV_REP) && event.code == KEY_X && event.value == 0 {
+                    drop(cfg);
+                    emit_input_event(linux_input_event(EV_KEY, KEY_X, 2));
+                    emit_input_event(linux_input_event(EV_SYN, SYN_REPORT, 0));
+                    cfg = config.exclusive_access();
+                }
+                cfg.packet_has_event = true;
+                let code = event.code;
+                let value = event.value;
+                drop(cfg);
+                emit_input_event(linux_input_event(EV_KEY, code, value));
+                if code == BTN_RIGHT {
+                    emit_mice_packet(if value != 0 { 0x02 } else { 0x00 });
+                }
+            }
+            EV_REL if should_deliver_uinput_event(&cfg.device, event) => {
+                cfg.packet_has_event = true;
+                let code = event.code;
+                let value = event.value;
+                drop(cfg);
+                emit_input_event(linux_input_event(EV_REL, code, value));
+            }
+            _ => {}
         }
     }
     len
@@ -1077,6 +1715,7 @@ fn dir_entries(node: DevNode) -> Option<&'static [DevDirEntry]> {
     match node {
         DevNode::Root => Some(&ROOT_DEV_DIR_ENTRIES),
         DevNode::Misc => Some(&MISC_DEV_DIR_ENTRIES),
+        DevNode::Input => Some(&INPUT_DEV_DIR_ENTRIES),
         _ => None,
     }
 }
@@ -1341,6 +1980,9 @@ impl FileSystemBackend for DevFs {
             DevNode::Misc => {
                 write_dir_entries(&raw_static_entries(&MISC_DEV_DIR_ENTRIES), offset, buf)
             }
+            DevNode::Input => {
+                write_dir_entries(&raw_static_entries(&INPUT_DEV_DIR_ENTRIES), offset, buf)
+            }
             DevNode::Pts => write_dir_entries(&raw_pts_entries(), offset, buf),
             _ => Err(FsError::NotDir),
         }
@@ -1372,6 +2014,7 @@ impl File for DevFsFile {
         match self.node {
             DevNode::Root
             | DevNode::Misc
+            | DevNode::Input
             | DevNode::Pts
             | DevNode::Null
             | DevNode::Rtc
@@ -1381,6 +2024,9 @@ impl File for DevFsFile {
             DevNode::Random | DevNode::Urandom => read_random(user_buf),
             DevNode::Tty | DevNode::TtyS0 | DevNode::Tty8 | DevNode::Tty9 => read_console(user_buf),
             DevNode::Loop0 => read_loop0(&self.offset, user_buf),
+            DevNode::UInput => 0,
+            DevNode::InputEvent0 => 0,
+            DevNode::InputMice => read_input_mice(self.status_flags.get(), user_buf),
         }
     }
 
@@ -1388,6 +2034,7 @@ impl File for DevFsFile {
         match self.node {
             DevNode::Root
             | DevNode::Misc
+            | DevNode::Input
             | DevNode::Pts
             | DevNode::Rtc
             | DevNode::Full
@@ -1398,6 +2045,7 @@ impl File for DevFsFile {
                 write_console(user_buf)
             }
             DevNode::Loop0 => write_loop0(&self.offset, user_buf),
+            DevNode::UInput | DevNode::InputEvent0 | DevNode::InputMice => 0,
         }
     }
 
@@ -1465,7 +2113,10 @@ impl File for DevFsFile {
     }
 
     fn working_dir(&self) -> Option<WorkingDir> {
-        if !matches!(self.node, DevNode::Root | DevNode::Misc | DevNode::Pts) {
+        if !matches!(
+            self.node,
+            DevNode::Root | DevNode::Misc | DevNode::Pts | DevNode::Input
+        ) {
             return None;
         }
         self.mount_id
@@ -1500,7 +2151,10 @@ impl File for DevFsFile {
     }
 
     fn is_devfs_dir(&self) -> bool {
-        matches!(self.node, DevNode::Root | DevNode::Misc | DevNode::Pts)
+        matches!(
+            self.node,
+            DevNode::Root | DevNode::Misc | DevNode::Pts | DevNode::Input
+        )
     }
 
     fn is_devfs_misc_dir(&self) -> bool {
@@ -1509,6 +2163,10 @@ impl File for DevFsFile {
 
     fn is_devfs_pts_dir(&self) -> bool {
         self.node == DevNode::Pts
+    }
+
+    fn is_devfs_input_dir(&self) -> bool {
+        self.node == DevNode::Input
     }
 
     fn is_dev_full(&self) -> bool {
@@ -1525,6 +2183,104 @@ impl File for DevFsFile {
                 self.node,
                 DevNode::Null | DevNode::Zero | DevNode::Full | DevNode::Loop0
             )
+    }
+}
+
+impl File for UInputFile {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn readable(&self) -> bool {
+        false
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, _user_buf: UserBuffer) -> usize {
+        0
+    }
+
+    fn write(&self, user_buf: UserBuffer) -> usize {
+        write_uinput(user_buf, &self.config)
+    }
+
+    fn poll(&self, events: PollEvents) -> PollEvents {
+        let mut ready = PollEvents::empty();
+        if events.contains(PollEvents::POLLOUT) {
+            ready |= PollEvents::POLLOUT;
+        }
+        ready
+    }
+
+    fn stat(&self) -> FsResult<FileStat> {
+        Ok(stat_node(DevNode::UInput))
+    }
+
+    fn status_flags(&self) -> OpenFlags {
+        self.status_flags.get()
+    }
+
+    fn set_status_flags(&self, flags: OpenFlags) {
+        self.status_flags.set(flags);
+    }
+}
+
+impl File for InputEventFile {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn readable(&self) -> bool {
+        self.readable
+    }
+
+    fn writable(&self) -> bool {
+        self.writable
+    }
+
+    fn read(&self, user_buf: UserBuffer) -> usize {
+        read_input_event(&self.client, user_buf, self.status_flags.get())
+    }
+
+    fn write(&self, _user_buf: UserBuffer) -> usize {
+        0
+    }
+
+    fn poll(&self, events: PollEvents) -> PollEvents {
+        let mut ready = PollEvents::empty();
+        if events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI)
+            && self.client.exclusive_access().available_read() > 0
+        {
+            ready |= PollEvents::POLLIN;
+        }
+        if events.contains(PollEvents::POLLOUT) && self.writable {
+            ready |= PollEvents::POLLOUT;
+        }
+        ready
+    }
+
+    fn stat(&self) -> FsResult<FileStat> {
+        Ok(stat_node(DevNode::InputEvent0))
+    }
+
+    fn status_flags(&self) -> OpenFlags {
+        self.status_flags.get()
+    }
+
+    fn set_status_flags(&self, flags: OpenFlags) {
+        self.status_flags.set(flags);
+    }
+}
+
+impl Drop for InputEventFile {
+    fn drop(&mut self) {
+        let mut client = self.client.exclusive_access();
+        client.closed = true;
+        client.grabbed = false;
+        client.events.clear();
     }
 }
 

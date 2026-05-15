@@ -6,7 +6,7 @@ use crate::fs::{
 use crate::task::current_user_token;
 
 use super::super::errno::{SysError, SysResult};
-use super::super::user_ptr::{read_user_value, write_user_value};
+use super::super::user_ptr::{copy_to_user, read_user_value, write_user_value};
 use super::fd::get_file_by_fd;
 
 const LOOP_SET_FD: usize = 0x4c00;
@@ -16,6 +16,24 @@ const LOOP_GET_STATUS: usize = 0x4c03;
 const LOOP_CTL_GET_FREE: usize = 0x4c82;
 const BLKSSZGET: usize = 0x1268;
 const BLKGETSIZE64: usize = 0x8008_1272;
+const EVIOCGVERSION: usize = 0x8004_4501;
+const EVIOCGID: usize = 0x8008_4502;
+const EVIOCGREP: usize = 0x8008_4503;
+const EVIOCGRAB: usize = 0x4004_4590;
+const UI_DEV_CREATE: usize = 0x5501;
+const UI_DEV_DESTROY: usize = 0x5502;
+const UI_DEV_SETUP: usize = 0x405c_5503;
+const UI_SET_EVBIT: usize = 0x4004_5564;
+const UI_SET_KEYBIT: usize = 0x4004_5565;
+const UI_SET_RELBIT: usize = 0x4004_5566;
+const UI_SET_ABSBIT: usize = 0x4004_5567;
+const UI_SET_MSCBIT: usize = 0x4004_5568;
+const UI_SET_LEDBIT: usize = 0x4004_5569;
+const UI_SET_SNDBIT: usize = 0x4004_556a;
+const UI_SET_FFBIT: usize = 0x4004_556b;
+const UI_SET_SWBIT: usize = 0x4004_556d;
+const UI_SET_PROPBIT: usize = 0x4004_556e;
+const UI_GET_VERSION: usize = 0x8004_552d;
 const FS_IOC_GETFLAGS: usize = 0x8008_6601;
 const FS_IOC_SETFLAGS: usize = 0x4008_6602;
 const FS_IOC32_GETFLAGS: usize = 0x8004_6601;
@@ -60,6 +78,20 @@ const TCION: usize = 3;
 const TCIFLUSH: usize = 0;
 const TCOFLUSH: usize = 1;
 const TCIOFLUSH: usize = 2;
+const IOC_READ: usize = 2;
+const EV_VERSION: i32 = 0x010001;
+const UINPUT_VERSION: u32 = 5;
+const INPUT_REP_DELAY_MS: u32 = 250;
+const INPUT_REP_PERIOD_MS: u32 = 33;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxInputId {
+    bustype: u16,
+    vendor: u16,
+    product: u16,
+    version: u16,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -133,6 +165,14 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
 
     if file.is_rtc() {
         return handle_rtc_ioctl(request, argp);
+    }
+
+    if crate::fs::is_devfs_uinput(file.as_ref()) {
+        return handle_uinput_ioctl(file.as_ref(), request, argp);
+    }
+
+    if crate::fs::is_devfs_input_event(file.as_ref()) {
+        return handle_input_event_ioctl(file.as_ref(), request, argp);
     }
 
     match request {
@@ -283,6 +323,123 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
             Ok(0)
         }
         _ => Err(SysError::ENOTTY),
+    }
+}
+
+fn ioctl_nr(request: usize) -> usize {
+    request & 0xff
+}
+
+fn ioctl_type(request: usize) -> usize {
+    (request >> 8) & 0xff
+}
+
+fn ioctl_size(request: usize) -> usize {
+    (request >> 16) & 0x3fff
+}
+
+fn ioctl_dir(request: usize) -> usize {
+    (request >> 30) & 0x3
+}
+
+fn copy_capped_string_to_user(token: usize, argp: usize, bytes: &[u8], size: usize) -> SysResult {
+    if size == 0 {
+        return Ok(0);
+    }
+    let mut out = [0u8; 256];
+    let copied = bytes.len().min(size.saturating_sub(1)).min(out.len() - 1);
+    out[..copied].copy_from_slice(&bytes[..copied]);
+    let total = (copied + 1).min(size).min(out.len());
+    copy_to_user(token, argp as *mut u8, &out[..total])?;
+    Ok(0)
+}
+
+fn handle_uinput_ioctl(
+    file: &(dyn crate::fs::File + Send + Sync),
+    request: usize,
+    argp: usize,
+) -> SysResult {
+    match request {
+        UI_DEV_CREATE => {
+            crate::fs::devfs_uinput_create(file)?;
+            Ok(0)
+        }
+        UI_DEV_DESTROY => {
+            crate::fs::devfs_uinput_destroy(file)?;
+            Ok(0)
+        }
+        UI_DEV_SETUP => Ok(0),
+        UI_SET_EVBIT => {
+            crate::fs::devfs_uinput_set_evbit(file, argp)?;
+            Ok(0)
+        }
+        UI_SET_KEYBIT => {
+            crate::fs::devfs_uinput_set_keybit(file, argp)?;
+            Ok(0)
+        }
+        UI_SET_RELBIT => {
+            crate::fs::devfs_uinput_set_relbit(file, argp)?;
+            Ok(0)
+        }
+        UI_SET_ABSBIT | UI_SET_MSCBIT | UI_SET_LEDBIT | UI_SET_SNDBIT | UI_SET_FFBIT
+        | UI_SET_SWBIT | UI_SET_PROPBIT => Ok(0),
+        UI_GET_VERSION => {
+            let token = current_user_token();
+            write_user_value(token, argp as *mut u32, &UINPUT_VERSION)?;
+            Ok(0)
+        }
+        _ if ioctl_dir(request) == IOC_READ
+            && ioctl_type(request) == b'U' as usize
+            && ioctl_nr(request) == 44 =>
+        {
+            let token = current_user_token();
+            copy_capped_string_to_user(token, argp, b"input0", ioctl_size(request))
+        }
+        _ => Err(SysError::EINVAL),
+    }
+}
+
+fn handle_input_event_ioctl(
+    file: &(dyn crate::fs::File + Send + Sync),
+    request: usize,
+    argp: usize,
+) -> SysResult {
+    match request {
+        EVIOCGVERSION => {
+            let token = current_user_token();
+            write_user_value(token, argp as *mut i32, &EV_VERSION)?;
+            Ok(0)
+        }
+        EVIOCGID => {
+            let token = current_user_token();
+            let id = LinuxInputId {
+                bustype: 0x03,
+                vendor: 0x01,
+                product: 0x01,
+                version: 0x01,
+            };
+            write_user_value(token, argp as *mut LinuxInputId, &id)?;
+            Ok(0)
+        }
+        EVIOCGREP => {
+            let token = current_user_token();
+            let rep = [INPUT_REP_DELAY_MS, INPUT_REP_PERIOD_MS];
+            write_user_value(token, argp as *mut [u32; 2], &rep)?;
+            Ok(0)
+        }
+        EVIOCGRAB => {
+            crate::fs::devfs_input_event_set_grabbed(file, argp != 0)?;
+            Ok(0)
+        }
+        _ if ioctl_dir(request) == IOC_READ
+            && ioctl_type(request) == b'E' as usize
+            && ioctl_nr(request) == 0x06 =>
+        {
+            let name = crate::fs::devfs_input_event_name(file).ok_or(SysError::ENOTTY)?;
+            let token = current_user_token();
+            copy_capped_string_to_user(token, argp, name.as_slice(), ioctl_size(request))
+        }
+        _ => Err(SysError::EINVAL),
     }
 }
 

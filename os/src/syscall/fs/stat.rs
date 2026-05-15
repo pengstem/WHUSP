@@ -1,8 +1,8 @@
 use crate::fs::{
     FileStat, FileSystemStat, FsNodeKind, MountId, OpenFlags, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
     S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, VfsNodeId, chmod_in, chown_in, lookup_path_in,
-    mount_is_read_only, open_file_in, stat_devfs_child, stat_devfs_misc_child,
-    stat_devfs_pts_child, stat_in, stat_static_path, statfs_for_mount,
+    mount_is_read_only, open_file_in, stat_devfs_child, stat_devfs_input_child,
+    stat_devfs_misc_child, stat_devfs_pts_child, stat_in, stat_static_path, statfs_for_mount,
 };
 use crate::sync::SleepMutex;
 use crate::task::{PathSnapshot, current_process, current_user_token};
@@ -97,6 +97,8 @@ pub(super) fn resolve_stat_from(
         if file.is_devfs_dir() {
             let stat = if file.is_devfs_misc_dir() {
                 stat_devfs_misc_child(path)
+            } else if file.is_devfs_input_dir() {
+                stat_devfs_input_child(path)
             } else if file.is_devfs_pts_dir() {
                 stat_devfs_pts_child(path)
             } else {

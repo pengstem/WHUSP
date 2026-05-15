@@ -299,6 +299,9 @@ pub trait File: Send + Sync {
     fn is_devfs_pts_dir(&self) -> bool {
         false
     }
+    fn is_devfs_input_dir(&self) -> bool {
+        false
+    }
     fn is_pipe(&self) -> bool {
         false
     }
@@ -351,11 +354,15 @@ pub fn list_apps() {
 }
 
 pub(crate) use devfs::{
-    attach_loop_device, detach_loop_device, devfs_loop_device_id, devfs_pty_lock_state,
-    devfs_pty_number, find_free_loop_device, is_devfs_loop_control, loop_device_is_attached,
-    loop_device_size, open_child as open_devfs_child, open_misc_child as open_devfs_misc_child,
+    attach_loop_device, detach_loop_device, devfs_input_event_name, devfs_input_event_set_grabbed,
+    devfs_loop_device_id, devfs_pty_lock_state, devfs_pty_number, devfs_uinput_create,
+    devfs_uinput_destroy, devfs_uinput_set_evbit, devfs_uinput_set_keybit, devfs_uinput_set_relbit,
+    find_free_loop_device, is_devfs_input_event, is_devfs_loop_control, is_devfs_uinput,
+    loop_device_is_attached, loop_device_size, open_child as open_devfs_child,
+    open_input_child as open_devfs_input_child, open_misc_child as open_devfs_misc_child,
     open_pts_child as open_devfs_pts_child, set_devfs_pty_locked, stat_child as stat_devfs_child,
-    stat_misc_child as stat_devfs_misc_child, stat_pts_child as stat_devfs_pts_child,
+    stat_input_child as stat_devfs_input_child, stat_misc_child as stat_devfs_misc_child,
+    stat_pts_child as stat_devfs_pts_child,
 };
 pub use inode::OpenFlags;
 pub(crate) use inode::{
