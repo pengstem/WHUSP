@@ -612,6 +612,25 @@ pub(crate) fn lookup_dir_with_stat_in(
     Ok((WorkingDir::new(path.node.mount_id, path.node.ino), stat))
 }
 
+pub(crate) fn lookup_dir_with_stat_path_in(
+    context: PathContext,
+    name: &str,
+) -> FsResult<(WorkingDir, FileStat, String)> {
+    let path = vfs_path::resolve_existing_in(context, name, LookupMode::FollowFinal)?;
+    if path.kind != FsNodeKind::Directory {
+        return Err(FsError::NotDir);
+    }
+    let mut stat =
+        with_mount(path.node.mount_id, |mount| mount.stat(path.node.ino)).ok_or(FsError::Io)??;
+    stat.dev = path.node.mount_id.0 as u64;
+    let visible_path = path.visible_path.ok_or(FsError::NotFound)?;
+    Ok((
+        WorkingDir::new(path.node.mount_id, path.node.ino),
+        stat,
+        visible_path,
+    ))
+}
+
 pub(crate) fn chmod_in(
     context: PathContext,
     name: &str,
@@ -662,12 +681,6 @@ pub(crate) fn truncate_in(context: PathContext, name: &str, len: usize) -> FsRes
         mount.set_len(path.node.ino, len as u64)
     })
     .ok_or(FsError::Io)?
-}
-
-pub(crate) fn lookup_dir_in(context: PathContext, name: &str) -> FsResult<WorkingDir> {
-    vfs_path::resolve_existing_in(context, name, LookupMode::FollowFinal)?
-        .working_dir()
-        .ok_or(FsError::NotDir)
 }
 
 impl File for VfsFile {

@@ -2,7 +2,7 @@ use super::super::mount::{
     mounted_root_for, mounted_root_for_synthetic_child, mounted_root_parent, primary_mount_id,
     root_ino_for, with_mount,
 };
-use super::super::path::{PathContext, WorkingDir};
+use super::super::path::PathContext;
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId};
 use alloc::string::String;
 use alloc::vec;
@@ -73,11 +73,6 @@ impl VfsPath {
             kind,
             visible_path: Some(visible_path),
         }
-    }
-
-    pub(crate) fn working_dir(self) -> Option<WorkingDir> {
-        (self.kind == FsNodeKind::Directory)
-            .then_some(WorkingDir::new(self.node.mount_id, self.node.ino))
     }
 }
 
@@ -165,7 +160,11 @@ fn lookup_child_raw(
         return Err(FsError::NameTooLong);
     }
 
-    let child_path = join_visible_path(cursor.path.as_str(), component);
+    let child_path = if component == ".." {
+        parent_visible_path(cursor.path.as_str())
+    } else {
+        join_visible_path(cursor.path.as_str(), component)
+    };
     if component != ".."
         && let Some(node) = mounted_root_for_synthetic_child(
             context.namespace_id(),

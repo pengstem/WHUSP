@@ -20,10 +20,11 @@ use crate::fs::{
     FS_APPEND_FL, FS_IMMUTABLE_FL, File, FileCreateAttrs, FileStat, FileTimestamp, FsError,
     FsNodeKind, MountId, OpenFlags, PathContext, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT,
     S_IFREG, S_IFSOCK, WorkingDir, chown_in, create_node_in, link_file_in, link_open_file_in,
-    lookup_dir_in, lookup_dir_with_stat_in, lookup_path_in, mkdir_in, mount_is_read_only,
-    normalize_path_at_root, open_devfs_child, open_devfs_misc_child, open_devfs_pts_child,
-    open_file_in, open_file_in_with_attrs, open_static_path, open_tmpfile_in_with_attrs,
-    path_inside_root, rename_in, rmdir_in, symlink_in, truncate_in, unlink_file_in,
+    lookup_dir_with_stat_in, lookup_dir_with_stat_path_in, lookup_path_in, mkdir_in,
+    mount_is_read_only, normalize_path_at_root, open_devfs_child, open_devfs_misc_child,
+    open_devfs_pts_child, open_file_in, open_file_in_with_attrs, open_static_path,
+    open_tmpfile_in_with_attrs, path_inside_root, rename_in, rmdir_in, symlink_in, truncate_in,
+    unlink_file_in,
 };
 use crate::mm::UserBuffer;
 use crate::task::{CAP_SYS_CHROOT, PathSnapshot, current_process, current_user_token};
@@ -656,12 +657,9 @@ pub fn sys_chdir(path: *const u8) -> SysResult {
         groups: &credentials.groups,
     };
     check_access_path_prefixes_from(&snapshot, AT_FDCWD, path.as_str(), subject)?;
-    let next_cwd = lookup_dir_in(snapshot.context.clone(), path.as_str())?;
-    let stat = resolve_stat_from(&snapshot, AT_FDCWD, path.as_str(), true)?;
+    let (next_cwd, stat, next_path) =
+        lookup_dir_with_stat_path_in(snapshot.context.clone(), path.as_str())?;
     check_access_mode(&stat, X_OK, subject)?;
-    let Some(next_path) = process_global_path_for(&snapshot, path.as_str()) else {
-        return Err(SysError::ENOENT);
-    };
     process.set_working_dir(next_cwd, next_path);
     Ok(0)
 }

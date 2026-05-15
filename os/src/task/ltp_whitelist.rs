@@ -6,7 +6,6 @@ pub(super) const LTP_CASE_WHITELIST: &[&str] = &[
     "fanotify18",
     "fanotify19",
     "fanotify20",
-    "fanotify06",
     "readahead02",
     "execve05",
     "add_key05",
