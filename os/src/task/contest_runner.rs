@@ -2,6 +2,10 @@ use alloc::{format, string::String};
 
 const TEST_LIBCS: &[&str] = &["/glibc", "/musl"];
 const LA_MUSL_COMPAT_PRELOAD: &str = "/opt/oscomp-support/lib/liboscomp-musl-compat.so";
+// CONTEXT: Search the manifests that contain the current whitelist, ordered by
+// duplicate-resolution priority. Keep syscalls before smoketest aliases while
+// still covering crypto AF_ALG and pty cases.
+const LTP_RUNTEST_MANIFESTS: &[&str] = &["syscalls", "crypto", "pty", "smoketest", "cve"];
 
 const INTERACTIVE_SHELL: bool = false;
 
@@ -24,16 +28,16 @@ const ALL_TESTS: &[&str] = &[
 // CONTEXT: current submit-safe default runs the groups with stable local score
 // signal; skipped groups above still get marker pairs instead of disappearing.
 const TEST_SCRIPTS: &[&str] = &[
-    // "basic_testcode.sh",
-    // "busybox_testcode.sh",
-    // "lua_testcode.sh",
-    // "libctest_testcode.sh",
+    "basic_testcode.sh",
+    "busybox_testcode.sh",
+    "lua_testcode.sh",
+    "libctest_testcode.sh",
+    "ltp_testcode.sh",
     // "iozone_testcode.sh",
     // "iperf_testcode.sh",
     // "libcbench_testcode.sh",
     // "netperf_testcode.sh",
     // "cyclictest_testcode.sh",
-    "ltp_testcode.sh",
     // "lmbench_testcode.sh",
 ];
 
@@ -224,12 +228,12 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
 
 fn append_ltp_case_loop(command: &mut String) {
     let filter = ltp_case_filter();
-    command.push_str("if [ -f \"$LTPROOT/runtest/syscalls\" ]; then ");
+    command.push_str("if [ -d \"$LTPROOT/runtest\" ]; then ");
     match filter {
         LtpCaseFilter::Whitelist => append_ltp_manifest_whitelist_case_loop(command),
         _ => append_ltp_runtest_case_loop(command, filter),
     }
-    command.push_str("else ./busybox echo \"LTP runtest/syscalls missing\"; fi; ");
+    command.push_str("else /musl/busybox echo \"LTP runtest manifests missing\"; fi; ");
 }
 
 fn append_ltp_manifest_whitelist_case_loop(command: &mut String) {
@@ -238,23 +242,30 @@ fn append_ltp_manifest_whitelist_case_loop(command: &mut String) {
         command.push_str(":; ");
         return;
     }
-    // CONTEXT: Preserve the curated whitelist order while still taking the
-    // authoritative command and arguments from runtest/syscalls.
-    command.push_str("for wanted_case in ");
-    append_ltp_case_slice_words(command, case_names);
-    command.push_str("; do case_cmd=\"\"; while read case_name candidate_cmd; do [ \"$case_name\" = \"$wanted_case\" ] || continue; case_cmd=\"$candidate_cmd\"; break; done < \"$LTPROOT/runtest/syscalls\"; [ -n \"$case_cmd\" ] || continue; case_name=\"$wanted_case\"; ");
+    // CONTEXT: Build a compact selected-case cache in one pass over the runtest
+    // manifests that contain our whitelist. This keeps whitelist execution
+    // ordered without rereading every manifest once per whitelisted case.
+    command.push_str(
+        "ltp_whitelist=\"$TMPBASE/ltp-whitelist.$$\"; ltp_selected=\"$TMPBASE/ltp-selected.$$\"; ",
+    );
+    append_ltp_whitelist_file(command, case_names);
+    command.push_str("/musl/busybox awk 'NR == FNR { order[$2] = $1; next } $1 == \"\" || $1 ~ /^#/ || NF < 2 { next } !($1 in order) { next } { cmd = $0; sub(/^[^[:space:]]+[[:space:]]+/, \"\", cmd); printf \"%s %08d %s %s\\n\", order[$1], ++seq, $1, cmd }' \"$ltp_whitelist\" ");
+    append_ltp_manifest_paths(command);
+    command.push_str(" > \"$ltp_selected\"; ");
+    command.push_str("last_case=\"\"; /musl/busybox sort \"$ltp_selected\" | while read _case_order _entry_seq case_name case_cmd; do [ -n \"$case_cmd\" ] || continue; [ \"$case_name\" = \"$last_case\" ] && continue; last_case=\"$case_name\"; ");
     append_ltp_manifest_case_execution(command);
-    command.push_str("done; ");
+    command.push_str("done; /musl/busybox rm -f \"$ltp_selected\" \"$ltp_whitelist\"; ");
 }
 
 fn append_ltp_runtest_case_loop(command: &mut String, filter: LtpCaseFilter) {
     // CONTEXT: LTP helper binaries live beside real test programs under
-    // testcases/bin. The runtest manifest is the authoritative list of cases
-    // and preserves per-case arguments such as execve05's stress options.
+    // testcases/bin. The runtest manifests are the authoritative lists of cases
+    // and preserve per-case arguments such as execve05's stress options.
+    append_ltp_manifest_loop_start(command);
     command.push_str("while read case_name case_cmd; do [ -n \"$case_name\" ] || continue; case \"$case_name\" in \\#*) continue ;; esac; [ -n \"$case_cmd\" ] || continue; ");
     append_ltp_case_filter(command, filter);
     append_ltp_manifest_case_execution(command);
-    command.push_str("done < \"$LTPROOT/runtest/syscalls\"; ");
+    command.push_str("done < \"$manifest\"; done; ");
 }
 
 fn append_ltp_manifest_case_execution(command: &mut String) {
@@ -372,6 +383,49 @@ fn append_ltp_whitelist_filter(command: &mut String) {
     command.push_str(") ;; *) continue ;; esac; ");
 }
 
+fn append_ltp_manifest_loop_start(command: &mut String) {
+    command.push_str("for manifest_name in ");
+    append_ltp_string_slice_words(command, LTP_RUNTEST_MANIFESTS);
+    command.push_str(
+        "; do manifest=\"$LTPROOT/runtest/$manifest_name\"; [ -f \"$manifest\" ] || continue; ",
+    );
+}
+
+fn append_ltp_manifest_paths(command: &mut String) {
+    let mut first = true;
+    for manifest in LTP_RUNTEST_MANIFESTS {
+        if !first {
+            command.push(' ');
+        }
+        first = false;
+        command.push_str("\"$LTPROOT/runtest/");
+        command.push_str(manifest);
+        command.push('"');
+    }
+}
+
+fn append_ltp_whitelist_file(command: &mut String, case_names: &[&str]) {
+    command.push_str("/musl/busybox cat > \"$ltp_whitelist\" <<'LTP_WHITELIST'\n");
+    for (index, case_name) in case_names.iter().enumerate() {
+        command.push_str(&format!("{index:08}"));
+        command.push(' ');
+        command.push_str(case_name);
+        command.push('\n');
+    }
+    command.push_str("LTP_WHITELIST\n");
+}
+
+fn append_ltp_string_slice_words(command: &mut String, words: &[&str]) {
+    let mut first = true;
+    for word in words {
+        if !first {
+            command.push(' ');
+        }
+        first = false;
+        command.push_str(word);
+    }
+}
+
 fn is_ltp_case_boundary(name: &str) -> bool {
     name.is_empty() || is_ltp_case_name(name)
 }
@@ -399,17 +453,6 @@ fn append_ltp_case_slice_pattern(command: &mut String, case_names: &[&str]) {
     for case_name in case_names {
         if !first {
             command.push('|');
-        }
-        first = false;
-        command.push_str(case_name);
-    }
-}
-
-fn append_ltp_case_slice_words(command: &mut String, case_names: &[&str]) {
-    let mut first = true;
-    for case_name in case_names {
-        if !first {
-            command.push(' ');
         }
         first = false;
         command.push_str(case_name);
