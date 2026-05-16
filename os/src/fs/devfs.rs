@@ -1214,17 +1214,17 @@ fn write_loop0_at(offset: usize, buf: &[u8]) -> usize {
     if loop_device_is_read_only(0) {
         return 0;
     }
-    let size = loop0_size() as usize;
-    if offset >= size {
-        return 0;
-    }
     // CONTEXT: /dev/loop0 is currently a lightweight LTP scratch device.
     // mkfs output is not consumed by mount(), which routes loop sources to
     // tmpfs until the kernel has a real loop-backed block mount.
     if offset == 0 && !buf.is_empty() {
         super::mount::reset_ext_scratch_mount("/dev/loop0");
     }
-    buf.len().min(size - offset)
+    // CONTEXT: BusyBox mkfs.ext2 uses full_write(), which retries forever if a
+    // block-device write returns 0. Since this scratch loop device intentionally
+    // discards mkfs data, report the whole buffer as accepted instead of
+    // exposing an EOF-style short write.
+    buf.len()
 }
 
 fn read_loop0(offset: &UPIntrFreeCell<usize>, mut user_buf: UserBuffer) -> usize {
@@ -2341,15 +2341,25 @@ impl File for DevFsFile {
     }
 
     fn check_write(&self, _len: usize, _append: bool) -> FsResult {
-        if self.node == DevNode::Loop0 && loop_device_is_read_only(0) {
-            return Err(FsError::PermissionDenied);
+        if self.node == DevNode::Loop0 {
+            if !loop_device_is_attached(0) {
+                return Err(FsError::NoDeviceOrAddress);
+            }
+            if loop_device_is_read_only(0) {
+                return Err(FsError::PermissionDenied);
+            }
         }
         Ok(())
     }
 
     fn check_write_at(&self, _offset: usize, _len: usize) -> FsResult {
-        if self.node == DevNode::Loop0 && loop_device_is_read_only(0) {
-            return Err(FsError::PermissionDenied);
+        if self.node == DevNode::Loop0 {
+            if !loop_device_is_attached(0) {
+                return Err(FsError::NoDeviceOrAddress);
+            }
+            if loop_device_is_read_only(0) {
+                return Err(FsError::PermissionDenied);
+            }
         }
         Ok(())
     }
