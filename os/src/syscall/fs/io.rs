@@ -120,6 +120,18 @@ fn write_with_status_flags(entry: &FdTableEntry, buf: UserBuffer) -> usize {
     }
 }
 
+fn checked_write_result(requested: usize, written: usize) -> SysResult {
+    if requested > 0 && written == 0 {
+        // CONTEXT: A no-progress non-empty write makes libc/BusyBox retry loops
+        // spin forever. Backends that cannot accept data must reject the write in
+        // check_write/check_write_at; if they still report no progress, surface a
+        // hard I/O error instead of returning 0 to userspace.
+        Err(SysError::EIO)
+    } else {
+        Ok(written as isize)
+    }
+}
+
 fn check_pipe_write_peer(entry: &FdTableEntry, has_data: bool) -> SysResult<()> {
     if has_data && entry.file().pipe_readers_closed() {
         current_add_signal(SignalFlags::SIGPIPE);
@@ -706,7 +718,7 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, len: usize, offset: usize) -> Sys
     }
     fanotify_notify_modify(&file, total_written);
     inotify_notify_modify(&file, total_written);
-    Ok(total_written as isize)
+    checked_write_result(len, total_written)
 }
 
 pub fn sys_preadv(
@@ -783,6 +795,7 @@ pub fn sys_pwritev(
     if entry.status_flags().contains(OpenFlags::APPEND) {
         offset = file.stat()?.size as usize;
     }
+    let requested_len = iovecs.total_len;
     let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Read);
     let mut total_written = 0usize;
     while let Some(chunk) = cursor.next_chunk() {
@@ -806,13 +819,13 @@ pub fn sys_pwritev(
             if written < slice.len() {
                 fanotify_notify_modify(&file, total_written);
                 inotify_notify_modify(&file, total_written);
-                return Ok(total_written as isize);
+                return checked_write_result(requested_len, total_written);
             }
         }
     }
     fanotify_notify_modify(&file, total_written);
     inotify_notify_modify(&file, total_written);
-    Ok(total_written as isize)
+    checked_write_result(requested_len, total_written)
 }
 
 pub fn sys_pwritev2(
@@ -858,7 +871,7 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
     let written = write_with_status_flags(&entry, UserBuffer::new(buffers));
     fanotify_notify_modify(&file, written);
     inotify_notify_modify(&file, written);
-    Ok(written as isize)
+    checked_write_result(len, written)
 }
 
 pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult {
@@ -890,6 +903,7 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
         entry.status_flags().contains(OpenFlags::APPEND),
     )?;
 
+    let requested_len = iovecs.total_len;
     let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Read);
     let mut total_written = 0usize;
     while let Some(chunk) = cursor.next_chunk() {
@@ -911,7 +925,7 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
     }
     fanotify_notify_modify(&file, total_written);
     inotify_notify_modify(&file, total_written);
-    Ok(total_written as isize)
+    checked_write_result(requested_len, total_written)
 }
 
 pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult {
