@@ -1,8 +1,9 @@
+use super::dentry_cache;
 use super::mount::{mounted_root_for_any_path, with_mount};
 use super::path::{PathContext, WorkingDir};
 use super::vfs::{
-    FsError, FsNodeKind, FsResult, LookupMode, VfsCreateTarget, VfsNodeId,
-    resolve_create_parent_in, resolve_existing_in, resolve_mount_target_in,
+    resolve_create_parent_in, resolve_existing_in, resolve_mount_target_in, FsError, FsNodeKind,
+    FsResult, LookupMode, VfsCreateTarget, VfsNodeId,
 };
 use bitflags::*;
 use lwext4_rust::ffi::EXT4_ROOT_INO;
@@ -91,7 +92,11 @@ impl OpenFlags {
 
 fn trimmed_nonroot_path(name: &str) -> &str {
     let trimmed = name.trim_end_matches('/');
-    if trimmed.is_empty() { name } else { trimmed }
+    if trimmed.is_empty() {
+        name
+    } else {
+        trimmed
+    }
 }
 
 fn final_component(name: &str) -> Option<&str> {
@@ -213,6 +218,7 @@ pub(crate) fn mkdir_in(context: PathContext, name: &str, mode: u32) -> FsResult 
         mount.create_dir(target.parent.ino, target.leaf_name, mode)
     })
     .ok_or(FsError::Io)??;
+    dentry_cache::invalidate_parent(target.parent);
     Ok(())
 }
 
@@ -250,7 +256,9 @@ pub(crate) fn create_node_in(
         mount.set_owner(ino, Some(uid), Some(gid))?;
         mount.set_mode(ino, mode & MODE_PERMISSIONS_MASK)
     })
-    .ok_or(FsError::Io)?
+    .ok_or(FsError::Io)??;
+    dentry_cache::invalidate_parent(target.parent);
+    Ok(())
 }
 
 pub(crate) fn link_file_in(
@@ -292,6 +300,7 @@ pub(crate) fn link_file_in(
         mount.link(new_target.parent.ino, new_target.leaf_name, old_node.ino)
     })
     .ok_or(FsError::Io)??;
+    dentry_cache::invalidate_parent(new_target.parent);
     Ok(())
 }
 
@@ -320,6 +329,7 @@ pub(crate) fn link_node_in(
         mount.link(new_target.parent.ino, new_target.leaf_name, old_node.ino)
     })
     .ok_or(FsError::Io)??;
+    dentry_cache::invalidate_parent(new_target.parent);
     Ok(())
 }
 
@@ -341,6 +351,7 @@ pub(crate) fn symlink_in(context: PathContext, target: &str, link_name: &str) ->
         )
     })
     .ok_or(FsError::Io)??;
+    dentry_cache::invalidate_parent(create_target.parent);
     Ok(())
 }
 
@@ -422,6 +433,10 @@ pub(crate) fn rename_in(
         )
     })
     .ok_or(FsError::Io)??;
+    dentry_cache::invalidate_parent(old_target.parent);
+    if new_target.parent != old_target.parent {
+        dentry_cache::invalidate_parent(new_target.parent);
+    }
     Ok(())
 }
 
@@ -448,6 +463,7 @@ pub(crate) fn unlink_file_in(context: PathContext, name: &str) -> FsResult {
         mount.unlink(target.parent.ino, target.leaf_name)
     })
     .ok_or(FsError::Io)??;
+    dentry_cache::invalidate_parent(target.parent);
     Ok(())
 }
 
@@ -476,5 +492,6 @@ pub(crate) fn rmdir_in(context: PathContext, name: &str) -> FsResult {
         mount.unlink(target.parent.ino, target.leaf_name)
     })
     .ok_or(FsError::Io)??;
+    dentry_cache::invalidate_parent(target.parent);
     Ok(())
 }

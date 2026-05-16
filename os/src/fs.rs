@@ -1,6 +1,7 @@
 mod anonfd;
 mod cgroupfs;
 mod console_tty;
+mod dentry_cache;
 mod devfs;
 mod dirent;
 mod eventfd;

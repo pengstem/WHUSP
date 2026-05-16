@@ -1,17 +1,18 @@
+use super::super::dentry_cache;
 use super::super::devfs;
-use super::super::dirent::{DT_DIR, RawDirEntry, write_dir_entries_with_offset_base};
-use super::super::inode::{OpenFlags, link_node_in};
+use super::super::dirent::{write_dir_entries_with_offset_base, RawDirEntry, DT_DIR};
+use super::super::inode::{link_node_in, OpenFlags};
 use super::super::mount::{
-    MountId, MountNamespaceId, mount_is_devfs, mount_is_read_only, mount_supports_page_cache,
-    release_inode_from_drop, synthetic_children_for_dir, with_mount,
+    mount_is_devfs, mount_is_read_only, mount_supports_page_cache, release_inode_from_drop,
+    synthetic_children_for_dir, with_mount, MountId, MountNamespaceId,
 };
 use super::super::named_fifo::open_named_fifo;
 use super::super::path::{PathContext, WorkingDir};
 use super::super::status_flags::StatusFlagsCell;
-use super::super::{FS_APPEND_FL, FS_IMMUTABLE_FL, File, FileStat, FileTimestamp, SeekWhence};
+use super::super::{File, FileStat, FileTimestamp, SeekWhence, FS_APPEND_FL, FS_IMMUTABLE_FL};
 use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
-use crate::mm::{UserBuffer, page_cache::PageCacheId};
+use crate::mm::{page_cache::PageCacheId, UserBuffer};
 use crate::sync::SleepMutex;
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -382,6 +383,7 @@ fn open_vfs_file_impl(
                 mount.create_file(target.parent.ino, target.leaf_name)
             })
             .ok_or(FsError::Io)??;
+            dentry_cache::invalidate_parent(target.parent);
             if let Some(attrs) = create_attrs {
                 let gid = if parent_stat.mode & MODE_SETGID != 0 {
                     parent_stat.gid
@@ -451,6 +453,7 @@ fn create_tmpfile_inode(
             .ok_or(FsError::Io)?;
             match result {
                 Ok(ino) => {
+                    dentry_cache::invalidate_parent(directory.node);
                     created = Some((ino, leaf_name));
                     break;
                 }
@@ -495,7 +498,10 @@ fn create_tmpfile_inode(
     })
     .ok_or(FsError::Io)?
     {
-        Ok(()) => Ok(file),
+        Ok(()) => {
+            dentry_cache::invalidate_parent(directory.node);
+            Ok(file)
+        }
         Err(err) => {
             drop(file);
             Err(err)

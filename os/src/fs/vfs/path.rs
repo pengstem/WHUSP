@@ -1,8 +1,9 @@
 use super::super::mount::{
-    mounted_root_for, mounted_root_for_synthetic_child, mounted_root_parent, primary_mount_id,
-    root_ino_for, with_mount,
+    mount_supports_dentry_cache, mounted_root_for, mounted_root_for_synthetic_child,
+    mounted_root_parent, primary_mount_id, root_ino_for, with_mount,
 };
 use super::super::path::PathContext;
+use super::super::{dentry_cache, dentry_cache::DentryLookupResult};
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId};
 use alloc::string::String;
 use alloc::vec;
@@ -179,12 +180,41 @@ fn lookup_child_raw(
         });
     }
 
-    let (ino, kind) = with_mount(cursor.node.mount_id, |mount| {
+    let cacheable = component != ".." && mount_supports_dentry_cache(cursor.node.mount_id);
+    if cacheable {
+        match dentry_cache::lookup(context.namespace_id(), cursor.node, component) {
+            Some(DentryLookupResult::Positive { node, kind }) => {
+                return Ok(VfsCursor {
+                    node,
+                    kind,
+                    path: child_path,
+                });
+            }
+            Some(DentryLookupResult::Negative) => return Err(FsError::NotFound),
+            None => {}
+        }
+    }
+
+    let result = with_mount(cursor.node.mount_id, |mount| {
         mount.lookup_component_from(cursor.node.ino, component)
     })
-    .ok_or(FsError::Io)??;
+    .ok_or(FsError::Io)?;
+    let (ino, kind) = match result {
+        Ok(found) => found,
+        Err(FsError::NotFound) => {
+            if cacheable {
+                dentry_cache::insert_negative(context.namespace_id(), cursor.node, component);
+            }
+            return Err(FsError::NotFound);
+        }
+        Err(err) => return Err(err),
+    };
+    let node = VfsNodeId::new(cursor.node.mount_id, ino);
+    if cacheable {
+        dentry_cache::insert_positive(context.namespace_id(), cursor.node, component, node, kind);
+    }
     Ok(VfsCursor {
-        node: VfsNodeId::new(cursor.node.mount_id, ino),
+        node,
         kind,
         path: child_path,
     })

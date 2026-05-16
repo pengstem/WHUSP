@@ -1,11 +1,12 @@
 use super::cgroupfs::CgroupFs;
+use super::dentry_cache;
 use super::devfs::DevFs;
 use super::ext4::Ext4Mount;
 use super::fat::FatMount;
 use super::overlayfs::OverlayFs;
 use super::path::WorkingDir;
 use super::procfs::ProcFs;
-use super::tmpfs::{EXT234_SUPER_MAGIC, TmpFs};
+use super::tmpfs::{TmpFs, EXT234_SUPER_MAGIC};
 use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult, VfsNodeId};
 use crate::drivers::block::BLOCK_DEVICES;
 use crate::sync::{SleepMutex, UPIntrFreeCell};
@@ -180,7 +181,18 @@ impl MountTarget {
 }
 
 fn mount_options(read_only: bool) -> &'static str {
-    if read_only { "ro" } else { "rw" }
+    if read_only {
+        "ro"
+    } else {
+        "rw"
+    }
+}
+
+fn clear_dentry_cache_on_mount_change<T>(result: Result<T, MountError>) -> Result<T, MountError> {
+    if result.is_ok() {
+        dentry_cache::clear_all();
+    }
+    result
 }
 
 fn block_source_name(device_index: usize) -> String {
@@ -1074,7 +1086,7 @@ pub(crate) fn mount_block_device_at(
     );
     let source_path = block_source_name(device_index);
 
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         if mounts
             .iter()
             .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
@@ -1105,7 +1117,7 @@ pub(crate) fn mount_block_device_at(
         mounts.push(event.clone());
         propagate_mount_event(mounts, event, propagation_parent);
         Ok(())
-    })
+    }))
 }
 
 fn read_mbr_partition(
@@ -1219,7 +1231,7 @@ fn mount_new_fs_on_target(
         source_mount_id,
         root_ino_for(source_mount_id).ok_or(MountError::SourceMissing)?,
     );
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         if mounts
             .iter()
             .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
@@ -1250,7 +1262,7 @@ fn mount_new_fs_on_target(
         mounts.push(event.clone());
         propagate_mount_event(mounts, event, propagation_parent);
         Ok(source_mount_id)
-    })
+    }))
 }
 
 pub(crate) fn mount_pseudo_fs_at_with_options(
@@ -1301,7 +1313,7 @@ fn mount_pseudo_fs_on_target(
         root_ino_for(source_mount_id).ok_or(MountError::SourceMissing)?,
     );
     let source_path = fs_type.into();
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         if mounts
             .iter()
             .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
@@ -1332,7 +1344,7 @@ fn mount_pseudo_fs_on_target(
         mounts.push(event.clone());
         propagate_mount_event(mounts, event, propagation_parent);
         Ok(source_mount_id)
-    })
+    }))
 }
 
 pub(crate) fn create_detached_tmpfs_mount(
@@ -1376,7 +1388,7 @@ pub(crate) fn mount_detached_fs_at(
     let source_path = resolve_mount_path(source_root, source_path);
     let target_path = resolve_mount_path(target_node, target_path);
     ensure_mount_open(source_root.mount_id)?;
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         if mounts
             .iter()
             .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
@@ -1407,7 +1419,7 @@ pub(crate) fn mount_detached_fs_at(
         mounts.push(event.clone());
         propagate_mount_event(mounts, event, propagation_parent);
         Ok(())
-    })
+    }))
 }
 
 pub(crate) fn mount_bind_at(
@@ -1428,7 +1440,7 @@ pub(crate) fn mount_bind_at(
     let covered_parent = covered_parent_for_target(&target)?;
     let source_path = resolve_mount_path(source_root, source_path);
     let target_path = resolve_mount_path(target_node, target_path);
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         let source_propagation_mount =
             nearest_propagation_mount(mounts, namespace_id, source_path.as_str());
         if source_propagation_mount
@@ -1572,7 +1584,7 @@ pub(crate) fn mount_bind_at(
             }
         }
         Ok(())
-    })
+    }))
 }
 
 pub(crate) fn move_mount_at(
@@ -1592,7 +1604,7 @@ pub(crate) fn move_mount_at(
     let covered_parent = covered_parent_for_target(&target)?;
     let source_path = resolve_mount_path(source, source_path);
     let target_path = resolve_mount_path(target_node, target_path);
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         // CONTEXT: Linux permits multiple mounts to stack on one mount point.
         // fs_bind_move18 moves parent1 over parent2's self-bind and then
         // expects two umount(parent2) calls to peel the stack.
@@ -1673,7 +1685,7 @@ pub(crate) fn move_mount_at(
             propagation_parent,
         );
         Ok(())
-    })
+    }))
 }
 
 pub(crate) fn mount_tmpfs_at(
@@ -1915,6 +1927,7 @@ pub(crate) fn unmount_at(
     if let Some(source_mount_id) = source_to_release {
         release_dynamic_mount_source_if_unused(source_mount_id);
     }
+    dentry_cache::clear_all();
     Ok(())
 }
 
@@ -2127,6 +2140,11 @@ fn mount_metadata(mount_id: MountId) -> Option<(String, &'static str, &'static s
 }
 
 pub(super) fn mount_supports_page_cache(mount_id: MountId) -> bool {
+    mount_metadata(mount_id)
+        .is_some_and(|(_, fs_type, _)| matches!(fs_type, "ext4" | "vfat" | "tmpfs"))
+}
+
+pub(super) fn mount_supports_dentry_cache(mount_id: MountId) -> bool {
     mount_metadata(mount_id)
         .is_some_and(|(_, fs_type, _)| matches!(fs_type, "ext4" | "vfat" | "tmpfs"))
 }
