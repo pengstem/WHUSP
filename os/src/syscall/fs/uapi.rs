@@ -155,6 +155,18 @@ fn linux_dev_minor(dev: u64) -> u32 {
     ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32
 }
 
+fn linux_makedev(major: u64, minor: u64) -> u64 {
+    (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
+}
+
+fn linux_visible_dev(dev: u64) -> u64 {
+    if linux_dev_major(dev) == 0 {
+        linux_makedev(254, 0)
+    } else {
+        dev
+    }
+}
+
 impl LinuxStatxTimestamp {
     fn new(sec: u64, nsec: u32) -> Self {
         Self {
@@ -168,8 +180,9 @@ impl LinuxStatxTimestamp {
 /// Converts this kernel's inode snapshot into Linux `struct kstat` layout.
 impl From<FileStat> for LinuxKstat {
     fn from(stat: FileStat) -> Self {
+        let dev = linux_visible_dev(stat.dev);
         Self {
-            st_dev: stat.dev,
+            st_dev: dev,
             st_ino: stat.ino,
             st_mode: stat.mode,
             st_nlink: stat.nlink,
@@ -218,6 +231,7 @@ impl From<crate::fs::FileSystemStat> for LinuxStatfs {
 /// metadata model does not preserve those fields yet.
 impl From<FileStat> for LinuxStatx {
     fn from(stat: FileStat) -> Self {
+        let dev = linux_visible_dev(stat.dev);
         Self {
             stx_mask: STATX_BASIC_STATS,
             stx_blksize: stat.blksize,
@@ -237,8 +251,8 @@ impl From<FileStat> for LinuxStatx {
             stx_mtime: LinuxStatxTimestamp::new(stat.mtime_sec, stat.mtime_nsec),
             stx_rdev_major: linux_dev_major(stat.rdev),
             stx_rdev_minor: linux_dev_minor(stat.rdev),
-            stx_dev_major: linux_dev_major(stat.dev),
-            stx_dev_minor: linux_dev_minor(stat.dev),
+            stx_dev_major: linux_dev_major(dev),
+            stx_dev_minor: linux_dev_minor(dev),
             __spare2: [0; 14],
         }
     }

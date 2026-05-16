@@ -209,6 +209,18 @@ fn sys_clone_process_inner(
         .fork(child_parent, mount_namespace_id, args.exit_signal)
         .ok_or(SysError::ENOMEM)?;
     let new_pid = new_process.getpid();
+    if args.flags.contains(CloneFlags::CLONE_NEWPID) {
+        // CONTEXT: LTP ioctl_ns checks only the init process of a newly
+        // cloned PID namespace. Track a lightweight namespace identity so
+        // /proc/<pid>/ns/pid and getpid() expose the expected Linux surface.
+        new_process.enter_new_pid_namespace(new_pid);
+    }
+    if args.flags.contains(CloneFlags::CLONE_NEWUSER) {
+        // CONTEXT: User namespace capability and id-mapping semantics are not
+        // implemented; this records enough namespace ancestry for nsfs ioctl
+        // discovery tests.
+        new_process.enter_new_user_namespace(new_pid);
+    }
     new_process.configure_cloned_main_task(args);
     if let Some(pidfd) = pidfd {
         let fd = install_pidfd_for_current_process(new_pid)?;

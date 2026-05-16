@@ -18,6 +18,7 @@ use crate::task::{
     wakeup_task,
 };
 use alloc::collections::VecDeque;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -26,7 +27,12 @@ use lazy_static::lazy_static;
 const DEVFS_DEV: u64 = 0x646576;
 const DEVFS_MAGIC: i64 = 0x0102_1994;
 const LOOP_DEVICE_SIZE_FALLBACK: u64 = 300 * 1024 * 1024;
+const LOOP_DEVICE_BLOCK_SIZE_DEFAULT: usize = 512;
 const LOOP_DEVICE_DEFAULT_READ_AHEAD: usize = 128;
+const LOOP_FLAG_READ_ONLY: u32 = 1;
+const LOOP_FLAG_AUTOCLEAR: u32 = 4;
+const LOOP_FLAG_PARTSCAN: u32 = 8;
+const LOOP_FLAG_DIRECT_IO: u32 = 16;
 const PTY_BUFFER_CAPACITY: usize = 8192;
 const PTY_TABLE_SIZE: usize = 64;
 const PTY_INO_BASE: u32 = 0x1000;
@@ -51,15 +57,50 @@ const INPUT_DEFAULT_REP_DELAY_MS: i32 = 250;
 const INPUT_DEFAULT_REP_PERIOD_MS: i32 = 33;
 
 lazy_static! {
-    static ref LOOP0_BACKEND: UPIntrFreeCell<Option<Arc<dyn File + Send + Sync>>> =
-        unsafe { UPIntrFreeCell::new(None) };
-    static ref LOOP0_READ_ONLY: UPIntrFreeCell<bool> = unsafe { UPIntrFreeCell::new(false) };
-    static ref LOOP0_READ_AHEAD: UPIntrFreeCell<usize> =
-        unsafe { UPIntrFreeCell::new(LOOP_DEVICE_DEFAULT_READ_AHEAD) };
+    static ref LOOP0_STATE: UPIntrFreeCell<LoopDeviceState> =
+        unsafe { UPIntrFreeCell::new(LoopDeviceState::new()) };
     static ref PTY_TABLE: UPIntrFreeCell<PtyTable> =
         unsafe { UPIntrFreeCell::new(PtyTable::new()) };
     static ref INPUT_STATE: UPIntrFreeCell<InputState> =
         unsafe { UPIntrFreeCell::new(InputState::new()) };
+}
+
+struct LoopDeviceState {
+    backend: Option<Arc<dyn File + Send + Sync>>,
+    backing_path: Option<String>,
+    flags: u32,
+    read_ahead: usize,
+    block_size: usize,
+    size_limit: u64,
+}
+
+impl LoopDeviceState {
+    fn new() -> Self {
+        Self {
+            backend: None,
+            backing_path: None,
+            flags: 0,
+            read_ahead: LOOP_DEVICE_DEFAULT_READ_AHEAD,
+            block_size: LOOP_DEVICE_BLOCK_SIZE_DEFAULT,
+            size_limit: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn read_only(&self) -> bool {
+        self.flags & LOOP_FLAG_READ_ONLY != 0
+    }
+
+    fn set_flag(&mut self, flag: u32, enabled: bool) {
+        if enabled {
+            self.flags |= flag;
+        } else {
+            self.flags &= !flag;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1134,17 +1175,23 @@ fn stat_pty_slave(id: usize) -> Option<FileStat> {
 }
 
 fn loop0_backend() -> FsResult<Arc<dyn File + Send + Sync>> {
-    LOOP0_BACKEND
-        .exclusive_session(|backend| backend.clone())
+    LOOP0_STATE
+        .exclusive_session(|state| state.backend.clone())
         .ok_or(FsError::NoDeviceOrAddress)
 }
 
 fn loop0_size() -> u64 {
-    loop0_backend()
-        .ok()
+    let (backend, size_limit) =
+        LOOP0_STATE.exclusive_session(|state| (state.backend.clone(), state.size_limit));
+    let size = backend
         .and_then(|file| file.stat().ok())
         .map(|stat| stat.size)
-        .unwrap_or(LOOP_DEVICE_SIZE_FALLBACK)
+        .unwrap_or(LOOP_DEVICE_SIZE_FALLBACK);
+    if size_limit == 0 {
+        size
+    } else {
+        size.min(size_limit)
+    }
 }
 
 fn read_loop0_at(offset: usize, buf: &mut [u8]) -> usize {
@@ -1162,6 +1209,9 @@ fn read_loop0_at(offset: usize, buf: &mut [u8]) -> usize {
 
 fn write_loop0_at(offset: usize, buf: &[u8]) -> usize {
     if loop0_backend().is_err() {
+        return 0;
+    }
+    if loop_device_is_read_only(0) {
         return 0;
     }
     let size = loop0_size() as usize;
@@ -1323,7 +1373,7 @@ pub(crate) fn devfs_input_event_set_grabbed(
 }
 
 pub(crate) fn find_free_loop_device() -> FsResult<usize> {
-    if LOOP0_BACKEND.exclusive_session(|backend| backend.is_none()) {
+    if LOOP0_STATE.exclusive_session(|state| state.backend.is_none()) {
         Ok(0)
     } else {
         Err(FsError::NoDeviceOrAddress)
@@ -1331,18 +1381,18 @@ pub(crate) fn find_free_loop_device() -> FsResult<usize> {
 }
 
 pub(crate) fn loop_device_is_attached(id: usize) -> bool {
-    id == 0 && LOOP0_BACKEND.exclusive_session(|backend| backend.is_some())
+    id == 0 && LOOP0_STATE.exclusive_session(|state| state.backend.is_some())
 }
 
 pub(crate) fn loop_device_is_read_only(id: usize) -> bool {
-    id == 0 && LOOP0_READ_ONLY.exclusive_session(|read_only| *read_only)
+    id == 0 && LOOP0_STATE.exclusive_session(|state| state.read_only())
 }
 
 pub(crate) fn loop_device_set_read_only(id: usize, read_only: bool) -> FsResult {
     if id != 0 || !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    LOOP0_READ_ONLY.exclusive_session(|slot| *slot = read_only);
+    LOOP0_STATE.exclusive_session(|state| state.set_flag(LOOP_FLAG_READ_ONLY, read_only));
     Ok(())
 }
 
@@ -1350,25 +1400,33 @@ pub(crate) fn loop_device_read_ahead(id: usize) -> FsResult<usize> {
     if id != 0 || !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    Ok(LOOP0_READ_AHEAD.exclusive_session(|read_ahead| *read_ahead))
+    Ok(LOOP0_STATE.exclusive_session(|state| state.read_ahead))
 }
 
 pub(crate) fn loop_device_set_read_ahead(id: usize, read_ahead: usize) -> FsResult {
     if id != 0 || !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    LOOP0_READ_AHEAD.exclusive_session(|slot| *slot = read_ahead);
+    LOOP0_STATE.exclusive_session(|state| state.read_ahead = read_ahead);
     Ok(())
 }
 
-pub(crate) fn attach_loop_device(id: usize, backend: Arc<dyn File + Send + Sync>) -> FsResult {
+pub(crate) fn attach_loop_device(
+    id: usize,
+    backend: Arc<dyn File + Send + Sync>,
+    read_only: bool,
+    backing_path: Option<String>,
+) -> FsResult {
     if id != 0 {
         return Err(FsError::NoDeviceOrAddress);
     }
     super::mount::reset_ext_scratch_mount("/dev/loop0");
-    LOOP0_READ_ONLY.exclusive_session(|slot| *slot = false);
-    LOOP0_READ_AHEAD.exclusive_session(|slot| *slot = LOOP_DEVICE_DEFAULT_READ_AHEAD);
-    LOOP0_BACKEND.exclusive_session(|slot| *slot = Some(backend));
+    LOOP0_STATE.exclusive_session(|state| {
+        state.reset();
+        state.backend = Some(backend);
+        state.backing_path = backing_path;
+        state.set_flag(LOOP_FLAG_READ_ONLY, read_only);
+    });
     Ok(())
 }
 
@@ -1376,21 +1434,126 @@ pub(crate) fn detach_loop_device(id: usize) -> FsResult {
     if id != 0 {
         return Err(FsError::NoDeviceOrAddress);
     }
-    LOOP0_BACKEND
-        .exclusive_session(|slot| slot.take())
-        .inspect(|_| {
-            LOOP0_READ_ONLY.exclusive_session(|slot| *slot = false);
-            LOOP0_READ_AHEAD.exclusive_session(|slot| *slot = LOOP_DEVICE_DEFAULT_READ_AHEAD);
+    LOOP0_STATE
+        .exclusive_session(|state| {
+            let backend = state.backend.take();
+            if backend.is_some() {
+                state.reset();
+            }
+            backend
         })
         .map(|_| ())
         .ok_or(FsError::NoDeviceOrAddress)
 }
 
 pub(crate) fn loop_device_size(id: usize) -> FsResult<u64> {
-    if id != 0 {
+    if id != 0 || !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
     Ok(loop0_size())
+}
+
+pub(crate) fn loop_device_flags(id: usize) -> FsResult<u32> {
+    if id != 0 || !loop_device_is_attached(id) {
+        return Err(FsError::NoDeviceOrAddress);
+    }
+    Ok(LOOP0_STATE.exclusive_session(|state| state.flags))
+}
+
+pub(crate) fn loop_device_size_limit(id: usize) -> FsResult<u64> {
+    if id != 0 || !loop_device_is_attached(id) {
+        return Err(FsError::NoDeviceOrAddress);
+    }
+    Ok(LOOP0_STATE.exclusive_session(|state| state.size_limit))
+}
+
+pub(crate) fn loop_device_set_status(id: usize, flags: u32, size_limit: Option<u64>) -> FsResult {
+    if id != 0 || !loop_device_is_attached(id) {
+        return Err(FsError::NoDeviceOrAddress);
+    }
+    LOOP0_STATE.exclusive_session(|state| {
+        state.set_flag(LOOP_FLAG_AUTOCLEAR, flags & LOOP_FLAG_AUTOCLEAR != 0);
+        if flags & LOOP_FLAG_PARTSCAN != 0 {
+            state.set_flag(LOOP_FLAG_PARTSCAN, true);
+        }
+        if let Some(size_limit) = size_limit {
+            state.size_limit = size_limit;
+        }
+    });
+    Ok(())
+}
+
+pub(crate) fn loop_device_set_direct_io(id: usize, enabled: bool) -> FsResult {
+    if id != 0 || !loop_device_is_attached(id) {
+        return Err(FsError::NoDeviceOrAddress);
+    }
+    LOOP0_STATE.exclusive_session(|state| state.set_flag(LOOP_FLAG_DIRECT_IO, enabled));
+    Ok(())
+}
+
+pub(crate) fn loop_device_set_block_size(id: usize, block_size: usize) -> FsResult {
+    if id != 0 {
+        return Err(FsError::NoDeviceOrAddress);
+    }
+    LOOP0_STATE.exclusive_session(|state| state.block_size = block_size);
+    Ok(())
+}
+
+pub(crate) fn loop_device_change_fd(
+    id: usize,
+    backend: Arc<dyn File + Send + Sync>,
+    backing_path: Option<String>,
+) -> FsResult {
+    if id != 0 || !loop_device_is_attached(id) || !loop_device_is_read_only(id) {
+        return Err(FsError::InvalidInput);
+    }
+    let old_size = loop0_size();
+    let new_size = backend.stat().map(|stat| stat.size)?;
+    if new_size != old_size {
+        return Err(FsError::InvalidInput);
+    }
+    LOOP0_STATE.exclusive_session(|state| {
+        state.backend = Some(backend);
+        state.backing_path = backing_path;
+    });
+    Ok(())
+}
+
+pub(crate) fn loop_device_sysfs_content(path: &str) -> Option<Vec<u8>> {
+    let content = match path {
+        "/sys/block/loop0/size" => format!("{}\n", loop0_size() / 512),
+        "/sys/block/loop0/ro" => {
+            let read_only = if loop_device_is_read_only(0) { 1 } else { 0 };
+            format!("{read_only}\n")
+        }
+        "/sys/block/loop0/loop/partscan" => {
+            let value = LOOP0_STATE
+                .exclusive_session(|state| (state.flags & LOOP_FLAG_PARTSCAN != 0) as u8);
+            format!("{value}\n")
+        }
+        "/sys/block/loop0/loop/autoclear" => {
+            let value = LOOP0_STATE
+                .exclusive_session(|state| (state.flags & LOOP_FLAG_AUTOCLEAR != 0) as u8);
+            format!("{value}\n")
+        }
+        "/sys/block/loop0/loop/backing_file" => {
+            LOOP0_STATE
+                .exclusive_session(|state| state.backing_path.clone())
+                .unwrap_or_default()
+                + "\n"
+        }
+        "/sys/block/loop0/loop/dio" => {
+            let value = LOOP0_STATE
+                .exclusive_session(|state| (state.flags & LOOP_FLAG_DIRECT_IO != 0) as u8);
+            format!("{value}\n")
+        }
+        "/sys/block/loop0/loop/sizelimit" => {
+            let size_limit = LOOP0_STATE.exclusive_session(|state| state.size_limit);
+            format!("{size_limit}\n")
+        }
+        _ => return None,
+    };
+    Some(content.into_bytes())
 }
 
 pub(crate) fn stat_child(path: &str) -> Option<FileStat> {
@@ -2175,6 +2338,20 @@ impl File for DevFsFile {
             return write_loop0_at(offset, buf);
         }
         0
+    }
+
+    fn check_write(&self, _len: usize, _append: bool) -> FsResult {
+        if self.node == DevNode::Loop0 && loop_device_is_read_only(0) {
+            return Err(FsError::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    fn check_write_at(&self, _offset: usize, _len: usize) -> FsResult {
+        if self.node == DevNode::Loop0 && loop_device_is_read_only(0) {
+            return Err(FsError::PermissionDenied);
+        }
+        Ok(())
     }
 
     fn seek(&self, offset: i64, whence: SeekWhence) -> FsResult<usize> {

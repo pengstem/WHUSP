@@ -1,18 +1,32 @@
+use crate::config::PAGE_SIZE;
 use crate::fs::{
-    LinuxTermio, LinuxTermios, LinuxWinsize, apply_console_tty_termio, console_tty_available_bytes,
-    console_tty_foreground_pgid, console_tty_termio, console_tty_termios, console_tty_winsize,
-    set_console_tty_foreground_pgid, set_console_tty_termios, set_console_tty_winsize,
+    LinuxTermio, LinuxTermios, LinuxWinsize, ProcNamespaceInfo, ProcNamespaceKind,
+    apply_console_tty_termio, console_tty_available_bytes, console_tty_foreground_pgid,
+    console_tty_termio, console_tty_termios, console_tty_winsize, proc_namespace_info_from_path,
+    proc_namespace_kind_name, proc_namespace_stat_ino, set_console_tty_foreground_pgid,
+    set_console_tty_termios, set_console_tty_winsize,
 };
+use crate::mm::UserBuffer;
 use crate::task::current_user_token;
+use alloc::format;
+use alloc::string::String;
+use alloc::sync::Arc;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{copy_to_user, read_user_value, write_user_value};
-use super::fd::get_file_by_fd;
+use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 
 const LOOP_SET_FD: usize = 0x4c00;
 const LOOP_CLR_FD: usize = 0x4c01;
 const LOOP_SET_STATUS: usize = 0x4c02;
 const LOOP_GET_STATUS: usize = 0x4c03;
+const LOOP_SET_STATUS64: usize = 0x4c04;
+const LOOP_GET_STATUS64: usize = 0x4c05;
+const LOOP_CHANGE_FD: usize = 0x4c06;
+const LOOP_SET_CAPACITY: usize = 0x4c07;
+const LOOP_SET_DIRECT_IO: usize = 0x4c08;
+const LOOP_SET_BLOCK_SIZE: usize = 0x4c09;
+const LOOP_CONFIGURE: usize = 0x4c0a;
 const LOOP_CTL_GET_FREE: usize = 0x4c82;
 const BLKROSET: usize = 0x125d;
 const BLKROGET: usize = 0x125e;
@@ -45,6 +59,10 @@ const FS_IOC_GETFLAGS: usize = 0x8008_6601;
 const FS_IOC_SETFLAGS: usize = 0x4008_6602;
 const FS_IOC32_GETFLAGS: usize = 0x8004_6601;
 const FS_IOC32_SETFLAGS: usize = 0x4004_6602;
+const NS_GET_USERNS: usize = 0xb701;
+const NS_GET_PARENT: usize = 0xb702;
+const NS_GET_NSTYPE: usize = 0xb703;
+const NS_GET_OWNER_UID: usize = 0xb704;
 const TCGETS: usize = 0x5401;
 const TCSETS: usize = 0x5402;
 const TCSETSW: usize = 0x5403;
@@ -91,6 +109,14 @@ const UINPUT_VERSION: u32 = 5;
 const INPUT_REP_DELAY_MS: u32 = 250;
 const INPUT_REP_PERIOD_MS: u32 = 33;
 const RANDOM_ENTROPY_AVAIL: i32 = 256;
+const LO_FLAGS_READ_ONLY: u32 = 1;
+const LO_FLAGS_AUTOCLEAR: u32 = 4;
+const LO_FLAGS_PARTSCAN: u32 = 8;
+const LO_FLAGS_DIRECT_IO: u32 = 16;
+const CLONE_NEWNS_VALUE: isize = 0x0002_0000;
+const CLONE_NEWUTS_VALUE: isize = 0x0400_0000;
+const CLONE_NEWUSER_VALUE: isize = 0x1000_0000;
+const CLONE_NEWPID_VALUE: isize = 0x2000_0000;
 const TUN_SUPPORTED_FEATURES: u32 =
     0x0001 | 0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0100 | 0x1000 | 0x2000 | 0x4000;
 
@@ -114,15 +140,14 @@ struct LinuxVtStat {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct LinuxLoopInfo {
-    lo_device: u64,
+    lo_number: i32,
+    lo_device: u32,
     lo_inode: u64,
-    lo_rdevice: u64,
-    lo_offset: u64,
-    lo_sizelimit: u64,
-    lo_number: u32,
-    lo_encrypt_type: u32,
-    lo_encrypt_key_size: u32,
-    lo_flags: u32,
+    lo_rdevice: u32,
+    lo_offset: i32,
+    lo_encrypt_type: i32,
+    lo_encrypt_key_size: i32,
+    lo_flags: i32,
     lo_name: [u8; 64],
     lo_encrypt_key: [u8; 32],
     lo_init: [u64; 2],
@@ -136,7 +161,6 @@ impl Default for LinuxLoopInfo {
             lo_inode: 0,
             lo_rdevice: 0,
             lo_offset: 0,
-            lo_sizelimit: 0,
             lo_number: 0,
             lo_encrypt_type: 0,
             lo_encrypt_key_size: 0,
@@ -146,6 +170,101 @@ impl Default for LinuxLoopInfo {
             lo_init: [0; 2],
             reserved: [0; 4],
         }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct LinuxLoopInfo64 {
+    lo_device: u64,
+    lo_inode: u64,
+    lo_rdevice: u64,
+    lo_offset: u64,
+    lo_sizelimit: u64,
+    lo_number: u32,
+    lo_encrypt_type: u32,
+    lo_encrypt_key_size: u32,
+    lo_flags: u32,
+    lo_file_name: [u8; 64],
+    lo_crypt_name: [u8; 64],
+    lo_encrypt_key: [u8; 32],
+    lo_init: [u64; 2],
+}
+
+impl Default for LinuxLoopInfo64 {
+    fn default() -> Self {
+        Self {
+            lo_device: 0,
+            lo_inode: 0,
+            lo_rdevice: 0,
+            lo_offset: 0,
+            lo_sizelimit: 0,
+            lo_number: 0,
+            lo_encrypt_type: 0,
+            lo_encrypt_key_size: 0,
+            lo_flags: 0,
+            lo_file_name: [0; 64],
+            lo_crypt_name: [0; 64],
+            lo_encrypt_key: [0; 32],
+            lo_init: [0; 2],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct LinuxLoopConfig {
+    fd: u32,
+    block_size: u32,
+    info: LinuxLoopInfo64,
+    reserved: [u64; 8],
+}
+
+#[derive(Debug)]
+struct NamespaceFile {
+    info: ProcNamespaceInfo,
+}
+
+impl NamespaceFile {
+    fn new(info: ProcNamespaceInfo) -> Self {
+        Self { info }
+    }
+}
+
+impl crate::fs::File for NamespaceFile {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        false
+    }
+
+    fn read(&self, _buf: UserBuffer) -> usize {
+        0
+    }
+
+    fn write(&self, _buf: UserBuffer) -> usize {
+        0
+    }
+
+    fn stat(&self) -> crate::fs::FsResult<crate::fs::FileStat> {
+        let mut stat = crate::fs::FileStat::with_mode(crate::fs::S_IFREG | 0o444);
+        stat.dev = 0x6e736673;
+        stat.ino = proc_namespace_stat_ino(self.info.kind, self.info.id);
+        Ok(stat)
+    }
+
+    fn proc_fd_target(&self) -> Option<String> {
+        Some(format!(
+            "{}:[{}]",
+            proc_namespace_kind_name(self.info.kind),
+            proc_namespace_stat_ino(self.info.kind, self.info.id)
+        ))
     }
 }
 
@@ -227,6 +346,10 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
         let token = current_user_token();
         write_user_value(token, argp as *mut i32, &unread)?;
         return Ok(0);
+    }
+
+    if let Some(namespace) = namespace_info_from_file(file.as_ref()) {
+        return handle_namespace_ioctl(namespace, request, argp);
     }
 
     match request {
@@ -372,6 +495,88 @@ fn copy_capped_string_to_user(token: usize, argp: usize, bytes: &[u8], size: usi
     Ok(0)
 }
 
+fn namespace_info_from_file(
+    file: &(dyn crate::fs::File + Send + Sync),
+) -> Option<ProcNamespaceInfo> {
+    if let Some(namespace) = file.as_any().downcast_ref::<NamespaceFile>() {
+        return Some(namespace.info);
+    }
+    file.proc_fd_target()
+        .and_then(|path| proc_namespace_info_from_path(path.as_str()))
+}
+
+fn namespace_type_value(kind: ProcNamespaceKind) -> isize {
+    match kind {
+        ProcNamespaceKind::Mnt => CLONE_NEWNS_VALUE,
+        ProcNamespaceKind::Pid => CLONE_NEWPID_VALUE,
+        ProcNamespaceKind::User => CLONE_NEWUSER_VALUE,
+        ProcNamespaceKind::Uts => CLONE_NEWUTS_VALUE,
+    }
+}
+
+fn install_namespace_fd(info: ProcNamespaceInfo) -> SysResult {
+    let file = Arc::new(NamespaceFile::new(info));
+    super::fd::install_file_fd(
+        file,
+        crate::fs::OpenFlags::RDONLY | crate::fs::OpenFlags::CLOEXEC,
+        None,
+    )
+}
+
+fn handle_namespace_parent_ioctl(info: ProcNamespaceInfo) -> SysResult {
+    match info.kind {
+        ProcNamespaceKind::Pid => {
+            let current = crate::task::current_process().pid_namespace();
+            let parent_id = info.parent_id.ok_or(SysError::EPERM)?;
+            if info.id == current.id {
+                return Err(SysError::EPERM);
+            }
+            install_namespace_fd(ProcNamespaceInfo {
+                kind: ProcNamespaceKind::Pid,
+                id: parent_id,
+                parent_id: None,
+            })
+        }
+        ProcNamespaceKind::User => {
+            let current = crate::task::current_process().user_namespace();
+            let parent_id = info.parent_id.ok_or(SysError::EPERM)?;
+            if info.id == current.id {
+                return Err(SysError::EPERM);
+            }
+            install_namespace_fd(ProcNamespaceInfo {
+                kind: ProcNamespaceKind::User,
+                id: parent_id,
+                parent_id: None,
+            })
+        }
+        ProcNamespaceKind::Mnt | ProcNamespaceKind::Uts => Err(SysError::EINVAL),
+    }
+}
+
+fn handle_namespace_ioctl(info: ProcNamespaceInfo, request: usize, argp: usize) -> SysResult {
+    match request {
+        NS_GET_PARENT => handle_namespace_parent_ioctl(info),
+        NS_GET_USERNS => match info.kind {
+            ProcNamespaceKind::User => handle_namespace_parent_ioctl(info),
+            // UNFINISHED: The kernel records only process-visible user
+            // namespace ancestry. Owning-user-namespace discovery for other
+            // namespace types is deferred until full user namespace support.
+            _ => Err(SysError::EPERM),
+        },
+        NS_GET_NSTYPE => Ok(namespace_type_value(info.kind)),
+        NS_GET_OWNER_UID => {
+            if info.kind != ProcNamespaceKind::User {
+                return Err(SysError::EINVAL);
+            }
+            let uid = 0u32;
+            let token = current_user_token();
+            write_user_value(token, argp as *mut u32, &uid)?;
+            Ok(0)
+        }
+        _ => Err(SysError::ENOTTY),
+    }
+}
+
 fn handle_uinput_ioctl(
     file: &(dyn crate::fs::File + Send + Sync),
     request: usize,
@@ -490,11 +695,78 @@ fn fs_flag_ioctl_error(error: crate::fs::FsError) -> SysError {
     }
 }
 
+fn loop_backend_from_fd(
+    fd: usize,
+) -> SysResult<(
+    alloc::sync::Arc<dyn crate::fs::File + Send + Sync>,
+    bool,
+    Option<String>,
+)> {
+    let entry = get_fd_entry_by_fd(fd)?;
+    let file = entry.file();
+    let read_only = !file.writable();
+    let path = entry
+        .dir_path()
+        .map(String::from)
+        .or_else(|| file.proc_fd_target());
+    Ok((file, read_only, path))
+}
+
+fn validate_loop_block_size(block_size: usize, allow_zero: bool) -> SysResult<Option<usize>> {
+    if block_size == 0 && allow_zero {
+        return Ok(None);
+    }
+    if !(512..=PAGE_SIZE).contains(&block_size) || !block_size.is_power_of_two() {
+        return Err(SysError::EINVAL);
+    }
+    Ok(Some(block_size))
+}
+
+fn copy_loop_name(dst: &mut [u8], path: Option<String>) {
+    let Some(path) = path else {
+        return;
+    };
+    let bytes = path.as_bytes();
+    let len = bytes.len().min(dst.len().saturating_sub(1));
+    dst[..len].copy_from_slice(&bytes[..len]);
+}
+
+fn loop_backing_path_from_sysfs() -> Option<String> {
+    let content = crate::fs::loop_device_sysfs_content("/sys/block/loop0/loop/backing_file")?;
+    let text = core::str::from_utf8(&content).ok()?.trim_end_matches('\n');
+    if text.is_empty() {
+        None
+    } else {
+        Some(String::from(text))
+    }
+}
+
+fn make_loop_info(loop_id: usize) -> SysResult<LinuxLoopInfo> {
+    let mut info = LinuxLoopInfo {
+        lo_number: loop_id as i32,
+        lo_flags: crate::fs::loop_device_flags(loop_id)? as i32,
+        ..LinuxLoopInfo::default()
+    };
+    copy_loop_name(&mut info.lo_name, loop_backing_path_from_sysfs());
+    Ok(info)
+}
+
+fn make_loop_info64(loop_id: usize) -> SysResult<LinuxLoopInfo64> {
+    let mut info = LinuxLoopInfo64 {
+        lo_number: loop_id as u32,
+        lo_flags: crate::fs::loop_device_flags(loop_id)?,
+        lo_sizelimit: crate::fs::loop_device_size_limit(loop_id)?,
+        ..LinuxLoopInfo64::default()
+    };
+    copy_loop_name(&mut info.lo_file_name, loop_backing_path_from_sysfs());
+    Ok(info)
+}
+
 fn handle_loop_ioctl(loop_id: usize, request: usize, argp: usize) -> SysResult {
     match request {
         LOOP_SET_FD => {
-            let backend = get_file_by_fd(argp)?;
-            crate::fs::attach_loop_device(loop_id, backend)?;
+            let (backend, read_only, path) = loop_backend_from_fd(argp)?;
+            crate::fs::attach_loop_device(loop_id, backend, read_only, path)?;
             Ok(0)
         }
         LOOP_CLR_FD => {
@@ -503,7 +775,8 @@ fn handle_loop_ioctl(loop_id: usize, request: usize, argp: usize) -> SysResult {
         }
         LOOP_SET_STATUS => {
             let token = current_user_token();
-            let _ = read_user_value(token, argp as *const LinuxLoopInfo)?;
+            let info = read_user_value(token, argp as *const LinuxLoopInfo)?;
+            crate::fs::loop_device_set_status(loop_id, info.lo_flags as u32, None)?;
             Ok(0)
         }
         LOOP_GET_STATUS => {
@@ -511,9 +784,62 @@ fn handle_loop_ioctl(loop_id: usize, request: usize, argp: usize) -> SysResult {
                 return Err(SysError::ENXIO);
             }
             let token = current_user_token();
-            let mut info = LinuxLoopInfo::default();
-            info.lo_number = loop_id as u32;
+            let info = make_loop_info(loop_id)?;
             write_user_value(token, argp as *mut LinuxLoopInfo, &info)?;
+            Ok(0)
+        }
+        LOOP_SET_STATUS64 => {
+            let token = current_user_token();
+            let info = read_user_value(token, argp as *const LinuxLoopInfo64)?;
+            crate::fs::loop_device_set_status(loop_id, info.lo_flags, Some(info.lo_sizelimit))?;
+            Ok(0)
+        }
+        LOOP_GET_STATUS64 => {
+            if !crate::fs::loop_device_is_attached(loop_id) {
+                return Err(SysError::ENXIO);
+            }
+            let token = current_user_token();
+            let info = make_loop_info64(loop_id)?;
+            write_user_value(token, argp as *mut LinuxLoopInfo64, &info)?;
+            Ok(0)
+        }
+        LOOP_CHANGE_FD => {
+            let (backend, _, path) = loop_backend_from_fd(argp)?;
+            crate::fs::loop_device_change_fd(loop_id, backend, path)?;
+            Ok(0)
+        }
+        LOOP_SET_CAPACITY => {
+            crate::fs::loop_device_size(loop_id)?;
+            Ok(0)
+        }
+        LOOP_SET_DIRECT_IO => {
+            crate::fs::loop_device_set_direct_io(loop_id, argp != 0)?;
+            Ok(0)
+        }
+        LOOP_SET_BLOCK_SIZE => {
+            if let Some(block_size) = validate_loop_block_size(argp, false)? {
+                crate::fs::loop_device_set_block_size(loop_id, block_size)?;
+            }
+            Ok(0)
+        }
+        LOOP_CONFIGURE => {
+            let token = current_user_token();
+            let config = read_user_value(token, argp as *const LinuxLoopConfig)?;
+            let block_size = validate_loop_block_size(config.block_size as usize, true)?;
+            let (backend, fd_read_only, path) = loop_backend_from_fd(config.fd as usize)?;
+            let read_only = fd_read_only || config.info.lo_flags & LO_FLAGS_READ_ONLY != 0;
+            crate::fs::attach_loop_device(loop_id, backend, read_only, path)?;
+            if let Some(block_size) = block_size {
+                crate::fs::loop_device_set_block_size(loop_id, block_size)?;
+            }
+            crate::fs::loop_device_set_status(
+                loop_id,
+                config.info.lo_flags & (LO_FLAGS_AUTOCLEAR | LO_FLAGS_PARTSCAN),
+                Some(config.info.lo_sizelimit),
+            )?;
+            if config.info.lo_flags & LO_FLAGS_DIRECT_IO != 0 {
+                crate::fs::loop_device_set_direct_io(loop_id, true)?;
+            }
             Ok(0)
         }
         BLKROSET => {

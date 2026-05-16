@@ -22,10 +22,14 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 
+// Bound each backend write while a shared file offset lock is held; large user
+// buffers still progress in order without monopolizing one mount backend.
 const VFS_WRITE_CHUNK_SIZE: usize = 64 * 1024;
 const MODE_PERMISSIONS_MASK: u32 = 0o7777;
 const MODE_SETGID: u32 = 0o2000;
 const TMPFILE_CREATE_ATTEMPTS: usize = 64;
+// Synthetic mountpoint entries live in a high offset range so they cannot
+// collide with real backend dirent offsets returned by the filesystem.
 const SYNTHETIC_DIRENT_OFFSET_BASE: u64 = 1 << 60;
 
 static TMPFILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);

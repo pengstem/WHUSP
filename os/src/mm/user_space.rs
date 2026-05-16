@@ -14,6 +14,8 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+// Leave unmapped space below MAP_GROWSDOWN expansion so a stack-like VMA does
+// not grow into an adjacent mapping when handling one-page-at-a-time faults.
 const STACK_GUARD_GAP_PAGES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

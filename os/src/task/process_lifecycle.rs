@@ -123,6 +123,10 @@ impl ProcessControlBlock {
                     signal_actions: [SignalAction::default(); super::SIGNAL_INFO_SLOTS],
                     cpu_times: ProcessCpuTimes::default(),
                     timers: ProcessTimers::default(),
+                    pid_namespace_id: 1,
+                    pid_namespace_parent_id: None,
+                    user_namespace_id: 1,
+                    user_namespace_parent_id: None,
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                 })
@@ -205,6 +209,10 @@ impl ProcessControlBlock {
         let thp_disabled = parent.thp_disabled;
         let membarrier_private_expedited_registered =
             parent.membarrier_private_expedited_registered;
+        let pid_namespace_id = parent.pid_namespace_id;
+        let pid_namespace_parent_id = parent.pid_namespace_parent_id;
+        let user_namespace_id = parent.user_namespace_id;
+        let user_namespace_parent_id = parent.user_namespace_parent_id;
         let fs = parent.fs.forked(mount_namespace_id);
         let executable_node = parent.executable_node;
         let cmdline = parent.cmdline.clone();
@@ -260,6 +268,10 @@ impl ProcessControlBlock {
                     signal_actions,
                     cpu_times: ProcessCpuTimes::default(),
                     timers: ProcessTimers::default(),
+                    pid_namespace_id,
+                    pid_namespace_parent_id,
+                    user_namespace_id,
+                    user_namespace_parent_id,
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                 })

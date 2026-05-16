@@ -304,9 +304,18 @@ pub(crate) struct ProcessProcSnapshot {
     pub(crate) credentials: Credentials,
     pub(crate) thread_count: usize,
     pub(crate) mount_namespace_id: MountNamespaceId,
+    pub(crate) pid_namespace_id: usize,
+    pub(crate) pid_namespace_parent_id: Option<usize>,
+    pub(crate) user_namespace_id: usize,
+    pub(crate) user_namespace_parent_id: Option<usize>,
     pub(crate) locked_kb: usize,
     pub(crate) no_new_privs: bool,
     pub(crate) timer_slack_ns: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProcessNamespace {
+    pub(crate) id: usize,
 }
 
 fn proc_task_state(status: TaskStatus, proc_sleeping: bool) -> char {
@@ -551,6 +560,10 @@ pub struct ProcessControlBlockInner {
     pub signal_actions: [SignalAction; SIGNAL_INFO_SLOTS],
     pub cpu_times: ProcessCpuTimes,
     pub(crate) timers: ProcessTimers,
+    pub(crate) pid_namespace_id: usize,
+    pub(crate) pid_namespace_parent_id: Option<usize>,
+    pub(crate) user_namespace_id: usize,
+    pub(crate) user_namespace_parent_id: Option<usize>,
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     pub task_res_allocator: RecycleAllocator,
 }
@@ -670,6 +683,44 @@ impl ProcessControlBlock {
         self.inner_exclusive_access().fs.mount_namespace_id = mount_namespace_id;
     }
 
+    pub(crate) fn pid_namespace(&self) -> ProcessNamespace {
+        let inner = self.inner_exclusive_access();
+        ProcessNamespace {
+            id: inner.pid_namespace_id,
+        }
+    }
+
+    pub(crate) fn user_namespace(&self) -> ProcessNamespace {
+        let inner = self.inner_exclusive_access();
+        ProcessNamespace {
+            id: inner.user_namespace_id,
+        }
+    }
+
+    pub(crate) fn enter_new_pid_namespace(&self, id: usize) {
+        let mut inner = self.inner_exclusive_access();
+        inner.pid_namespace_parent_id = Some(inner.pid_namespace_id);
+        inner.pid_namespace_id = id;
+    }
+
+    pub(crate) fn enter_new_user_namespace(&self, id: usize) {
+        let mut inner = self.inner_exclusive_access();
+        inner.user_namespace_parent_id = Some(inner.user_namespace_id);
+        inner.user_namespace_id = id;
+    }
+
+    pub(crate) fn visible_pid(&self) -> usize {
+        if self
+            .inner_exclusive_access()
+            .pid_namespace_parent_id
+            .is_some()
+        {
+            1
+        } else {
+            self.pid.0
+        }
+    }
+
     pub fn set_working_dir(&self, cwd: WorkingDir, cwd_path: String) {
         let mut inner = self.inner.exclusive_access();
         inner.fs.set_working_dir(cwd, cwd_path);
@@ -779,6 +830,10 @@ impl ProcessControlBlock {
             credentials: inner.credentials.clone(),
             thread_count: inner.thread_count(),
             mount_namespace_id: inner.fs.mount_namespace_id,
+            pid_namespace_id: inner.pid_namespace_id,
+            pid_namespace_parent_id: inner.pid_namespace_parent_id,
+            user_namespace_id: inner.user_namespace_id,
+            user_namespace_parent_id: inner.user_namespace_parent_id,
             locked_kb: inner.memory_set.locked_bytes() / 1024,
             no_new_privs: inner.no_new_privs,
             timer_slack_ns,

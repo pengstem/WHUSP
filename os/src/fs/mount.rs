@@ -107,6 +107,8 @@ pub(crate) struct BlockPartition {
 lazy_static! {
     static ref MOUNTS: SleepMutex<Vec<Option<Arc<MountedFs>>>> = SleepMutex::new(Vec::new());
     static ref MOUNTS_INITIALIZED: UPIntrFreeCell<bool> = unsafe { UPIntrFreeCell::new(false) };
+    // CONTEXT: Dynamic mount metadata stays under interrupt masking only for
+    // short table edits. Do not perform filesystem or block I/O while holding it.
     static ref DYNAMIC_MOUNTS: UPIntrFreeCell<Vec<DynamicMount>> =
         unsafe { UPIntrFreeCell::new(Vec::new()) };
     static ref PENDING_INODE_RELEASES: UPIntrFreeCell<Vec<(MountId, u32)>> =
@@ -231,6 +233,11 @@ fn register_mount(mounted: Arc<MountedFs>) -> MountId {
     mount_id
 }
 
+/// Runs a backend operation for a mounted filesystem.
+///
+/// The mount table lock is released before the backend lock is taken, and the
+/// closure may enter filesystem or block I/O. Callers must not hold
+/// interrupt-masked mount metadata locks across this boundary.
 pub(super) fn with_mount<V>(
     mount_id: MountId,
     f: impl FnOnce(&mut dyn FileSystemBackend) -> V,
@@ -250,6 +257,10 @@ pub(crate) fn overlay_real_node(node: VfsNodeId) -> Option<VfsNodeId> {
     with_mount(node.mount_id, |mount| mount.overlay_real_node(node.ino)).flatten()
 }
 
+/// Best-effort backend access for drop-time cleanup paths.
+///
+/// If either the mount table or backend is busy, the caller should defer the
+/// cleanup instead of blocking while a file destructor is running.
 fn try_with_mount<V>(
     mount_id: MountId,
     f: impl FnOnce(&mut dyn FileSystemBackend) -> V,
@@ -287,6 +298,10 @@ fn drain_pending_inode_releases(mount_id: MountId, backend: &mut dyn FileSystemB
     }
 }
 
+/// Releases an inode reference from `VfsFile::drop`.
+///
+/// This must not block on mount locks; busy backends are recorded for the next
+/// successful mount operation to drain.
 pub(super) fn release_inode_from_drop(mount_id: MountId, ino: u32) {
     if try_with_mount(mount_id, |mount| mount.release_inode(ino)).is_none() {
         PENDING_INODE_RELEASES

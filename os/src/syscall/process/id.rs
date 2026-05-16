@@ -32,7 +32,7 @@ pub fn sys_sched_yield() -> isize {
 }
 
 pub fn sys_getpid() -> isize {
-    current_process().getpid() as isize
+    current_process().visible_pid() as isize
 }
 
 pub fn sys_gettid() -> isize {
@@ -42,7 +42,8 @@ pub fn sys_gettid() -> isize {
 }
 
 pub fn sys_getppid() -> isize {
-    // UNFINISHED: PID namespaces and child subreapers are not modeled yet, so
+    // UNFINISHED: PID namespace parent translation and child subreapers are
+    // not modeled yet, so
     // this returns the single-namespace parent recorded in the PCB.
     current_process().getppid() as isize
 }

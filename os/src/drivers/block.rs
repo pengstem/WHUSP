@@ -144,6 +144,8 @@ impl VirtIOBlock {
 }
 
 lazy_static! {
+    // CONTEXT: The first DTB-discovered block device is the contest root disk
+    // mounted as x0; additional entries stay addressable for explicit mounts.
     pub static ref BLOCK_DEVICES: Vec<Arc<BlockDeviceImpl>> = crate::board::block_devices()
         .iter()
         .enumerate()

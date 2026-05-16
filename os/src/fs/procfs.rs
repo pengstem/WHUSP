@@ -61,7 +61,7 @@ const INOTIFY_MAX_USER_INSTANCES_INO: u32 = 36;
 const INOTIFY_MAX_USER_WATCHES_INO: u32 = 37;
 const PID_DIR_BASE: u32 = 100;
 const PID_FILE_BASE: u32 = 10_000;
-const PID_FILE_STRIDE: u32 = 16;
+const PID_FILE_STRIDE: u32 = 32;
 const PID_STAT_OFFSET: u32 = 0;
 const PID_STATUS_OFFSET: u32 = 1;
 const PID_CMDLINE_OFFSET: u32 = 2;
@@ -76,6 +76,9 @@ const PID_IO_OFFSET: u32 = 10;
 const PID_FDINFO_DIR_OFFSET: u32 = 11;
 const PID_COMM_OFFSET: u32 = 12;
 const PID_TIMERSLACK_OFFSET: u32 = 13;
+const PID_NS_PID_OFFSET: u32 = 14;
+const PID_NS_USER_OFFSET: u32 = 15;
+const PID_NS_UTS_OFFSET: u32 = 16;
 const PID_FD_ENTRY_BASE: u32 = 1_000_000;
 const PID_FDINFO_ENTRY_BASE: u32 = 2_000_000;
 const PID_FD_ENTRY_STRIDE: u32 = 4096;
@@ -92,6 +95,11 @@ const DEFAULT_PIPE_USER_PAGES_SOFT: usize = 1;
 const DEFAULT_LEASE_BREAK_TIME: usize = 45;
 const DEFAULT_NET_IPV4_CONF_TAG: isize = 0;
 const PROC_MEMINFO_OBSERVED_CACHE_KB: usize = 64 * 1024;
+const PROC_NS_MNT_INO_BASE: u64 = 0x7000_0000;
+const PROC_NS_PID_INO_BASE: u64 = 0x7100_0000;
+const PROC_NS_USER_INO_BASE: u64 = 0x7200_0000;
+const PROC_NS_UTS_INO_BASE: u64 = 0x7300_0000;
+const ROOT_UTS_NAMESPACE_ID: usize = 1;
 
 static PROC_PID_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_PID_MAX);
 static PROC_PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(PIPE_MAX_CAPACITY);
@@ -176,10 +184,28 @@ enum ProcNode {
     PidIo(usize),
     PidNsDir(usize),
     PidNsMnt(usize),
+    PidNsPid(usize),
+    PidNsUser(usize),
+    PidNsUts(usize),
     PidTaskDir(usize),
     PidTaskTidDir(usize, usize),
     PidTaskTidStat(usize, usize),
     PidTaskTidComm(usize, usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcNamespaceKind {
+    Mnt,
+    Pid,
+    User,
+    Uts,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProcNamespaceInfo {
+    pub(crate) kind: ProcNamespaceKind,
+    pub(crate) id: usize,
+    pub(crate) parent_id: Option<usize>,
 }
 
 impl ProcFs {
@@ -241,6 +267,82 @@ fn decode_pid_task_tid_ino(ino: u32) -> Option<ProcNode> {
 
 fn lookup_process(pid: usize) -> Option<ProcessProcSnapshot> {
     pid2process(pid).map(|process| process.proc_snapshot())
+}
+
+fn namespace_info_for_process(
+    process: ProcessProcSnapshot,
+    kind: ProcNamespaceKind,
+) -> ProcNamespaceInfo {
+    match kind {
+        ProcNamespaceKind::Mnt => ProcNamespaceInfo {
+            kind,
+            id: process.mount_namespace_id.0,
+            parent_id: None,
+        },
+        ProcNamespaceKind::Pid => ProcNamespaceInfo {
+            kind,
+            id: process.pid_namespace_id,
+            parent_id: process.pid_namespace_parent_id,
+        },
+        ProcNamespaceKind::User => ProcNamespaceInfo {
+            kind,
+            id: process.user_namespace_id,
+            parent_id: process.user_namespace_parent_id,
+        },
+        ProcNamespaceKind::Uts => ProcNamespaceInfo {
+            kind,
+            id: ROOT_UTS_NAMESPACE_ID,
+            parent_id: None,
+        },
+    }
+}
+
+fn namespace_info_for_pid(pid: usize, kind: ProcNamespaceKind) -> Option<ProcNamespaceInfo> {
+    lookup_process(pid).map(|process| namespace_info_for_process(process, kind))
+}
+
+pub(crate) fn proc_namespace_stat_ino(kind: ProcNamespaceKind, id: usize) -> u64 {
+    let base = match kind {
+        ProcNamespaceKind::Mnt => PROC_NS_MNT_INO_BASE,
+        ProcNamespaceKind::Pid => PROC_NS_PID_INO_BASE,
+        ProcNamespaceKind::User => PROC_NS_USER_INO_BASE,
+        ProcNamespaceKind::Uts => PROC_NS_UTS_INO_BASE,
+    };
+    base + id as u64
+}
+
+pub(crate) fn proc_namespace_kind_name(kind: ProcNamespaceKind) -> &'static str {
+    match kind {
+        ProcNamespaceKind::Mnt => "mnt",
+        ProcNamespaceKind::Pid => "pid",
+        ProcNamespaceKind::User => "user",
+        ProcNamespaceKind::Uts => "uts",
+    }
+}
+
+pub(crate) fn proc_namespace_info_from_path(path: &str) -> Option<ProcNamespaceInfo> {
+    let mut components = path.split('/').filter(|component| !component.is_empty());
+    if components.next()? != "proc" {
+        return None;
+    }
+    let pid = match components.next()? {
+        "self" => crate::task::current_process().getpid(),
+        component => parse_pid(component)?,
+    };
+    if components.next()? != "ns" {
+        return None;
+    }
+    let kind = match components.next()? {
+        "mnt" => ProcNamespaceKind::Mnt,
+        "pid" => ProcNamespaceKind::Pid,
+        "user" => ProcNamespaceKind::User,
+        "uts" => ProcNamespaceKind::Uts,
+        _ => return None,
+    };
+    if components.next().is_some() {
+        return None;
+    }
+    namespace_info_for_pid(pid, kind)
 }
 
 fn lookup_task_by_local_tid(pid: usize, local_tid: usize) -> Option<Arc<TaskControlBlock>> {
@@ -355,6 +457,9 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
                 PID_FDINFO_DIR_OFFSET => Some(ProcNode::PidFdInfoDir(pid)),
                 PID_COMM_OFFSET => Some(ProcNode::PidComm(pid)),
                 PID_TIMERSLACK_OFFSET => Some(ProcNode::PidTimerslack(pid)),
+                PID_NS_PID_OFFSET => Some(ProcNode::PidNsPid(pid)),
+                PID_NS_USER_OFFSET => Some(ProcNode::PidNsUser(pid)),
+                PID_NS_UTS_OFFSET => Some(ProcNode::PidNsUts(pid)),
                 _ => None,
             }
         }
@@ -969,6 +1074,21 @@ fn pid_ns_entries(pid: usize) -> Vec<RawDirEntry> {
         name: "mnt".into(),
         dtype: DT_REG,
     });
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_NS_PID_OFFSET),
+        name: "pid".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_NS_USER_OFFSET),
+        name: "user".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_NS_UTS_OFFSET),
+        name: "uts".into(),
+        dtype: DT_REG,
+    });
     entries
 }
 
@@ -1492,7 +1612,45 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
             .map(|_| proc_io_content().into_bytes())
             .ok_or(FsError::NotFound),
         ProcNode::PidNsMnt(pid) => lookup_process(pid)
-            .map(|process| format!("mnt:[{}]\n", process.mount_namespace_id.0).into_bytes())
+            .map(|process| {
+                let info = namespace_info_for_process(process, ProcNamespaceKind::Mnt);
+                format!(
+                    "{}:[{}]\n",
+                    proc_namespace_kind_name(info.kind),
+                    proc_namespace_stat_ino(info.kind, info.id)
+                )
+                .into_bytes()
+            })
+            .ok_or(FsError::NotFound),
+        ProcNode::PidNsPid(pid) => namespace_info_for_pid(pid, ProcNamespaceKind::Pid)
+            .map(|info| {
+                format!(
+                    "{}:[{}]\n",
+                    proc_namespace_kind_name(info.kind),
+                    proc_namespace_stat_ino(info.kind, info.id)
+                )
+                .into_bytes()
+            })
+            .ok_or(FsError::NotFound),
+        ProcNode::PidNsUser(pid) => namespace_info_for_pid(pid, ProcNamespaceKind::User)
+            .map(|info| {
+                format!(
+                    "{}:[{}]\n",
+                    proc_namespace_kind_name(info.kind),
+                    proc_namespace_stat_ino(info.kind, info.id)
+                )
+                .into_bytes()
+            })
+            .ok_or(FsError::NotFound),
+        ProcNode::PidNsUts(pid) => namespace_info_for_pid(pid, ProcNamespaceKind::Uts)
+            .map(|info| {
+                format!(
+                    "{}:[{}]\n",
+                    proc_namespace_kind_name(info.kind),
+                    proc_namespace_stat_ino(info.kind, info.id)
+                )
+                .into_bytes()
+            })
             .ok_or(FsError::NotFound),
         ProcNode::PidTaskTidStat(pid, local_tid) => task_stat_content(pid, local_tid),
         ProcNode::PidTaskTidComm(pid, local_tid) => {
@@ -1739,6 +1897,18 @@ impl FileSystemBackend for ProcFs {
                     pid_file_ino(pid, PID_NS_MNT_OFFSET),
                     FsNodeKind::RegularFile,
                 )),
+                "pid" => Ok((
+                    pid_file_ino(pid, PID_NS_PID_OFFSET),
+                    FsNodeKind::RegularFile,
+                )),
+                "user" => Ok((
+                    pid_file_ino(pid, PID_NS_USER_OFFSET),
+                    FsNodeKind::RegularFile,
+                )),
+                "uts" => Ok((
+                    pid_file_ino(pid, PID_NS_UTS_OFFSET),
+                    FsNodeKind::RegularFile,
+                )),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::PidTaskDir(pid) => match component {
@@ -1876,7 +2046,21 @@ impl FileSystemBackend for ProcFs {
             _ => FileStat::with_mode(S_IFREG | 0o444),
         };
         stat.dev = 0x70726f63;
-        stat.ino = ino as u64;
+        stat.ino = match node {
+            ProcNode::PidNsMnt(pid) => namespace_info_for_pid(pid, ProcNamespaceKind::Mnt)
+                .map(|info| proc_namespace_stat_ino(info.kind, info.id))
+                .ok_or(FsError::NotFound)?,
+            ProcNode::PidNsPid(pid) => namespace_info_for_pid(pid, ProcNamespaceKind::Pid)
+                .map(|info| proc_namespace_stat_ino(info.kind, info.id))
+                .ok_or(FsError::NotFound)?,
+            ProcNode::PidNsUser(pid) => namespace_info_for_pid(pid, ProcNamespaceKind::User)
+                .map(|info| proc_namespace_stat_ino(info.kind, info.id))
+                .ok_or(FsError::NotFound)?,
+            ProcNode::PidNsUts(pid) => namespace_info_for_pid(pid, ProcNamespaceKind::Uts)
+                .map(|info| proc_namespace_stat_ino(info.kind, info.id))
+                .ok_or(FsError::NotFound)?,
+            _ => ino as u64,
+        };
         stat.nlink = if node_kind(node) == FsNodeKind::Directory {
             2
         } else {

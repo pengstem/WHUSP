@@ -111,6 +111,10 @@ fn pipe2_open_flags(flags: u32) -> SysResult<OpenFlags> {
     Ok(OpenFlags::from_bits_truncate(flags))
 }
 
+/// Checks that the whole Linux `int pipefd[2]` output buffer is writable.
+///
+/// This happens before fd allocation so an invalid user pointer cannot leave
+/// pipe ends installed in the process table.
 fn validate_pipefd(token: usize, pipefd: *mut i32) -> SysResult<()> {
     translated_byte_buffer_checked(
         token,
@@ -121,6 +125,7 @@ fn validate_pipefd(token: usize, pipefd: *mut i32) -> SysResult<()> {
     .map(|_| ())
 }
 
+/// Writes the Linux `int pipefd[2]` result through checked user buffers.
 fn write_pipefd_pair(token: usize, pipefd: *mut i32, fds: [i32; 2]) -> SysResult<()> {
     let mut bytes = [0u8; size_of::<[i32; 2]>()];
     let fd_size = size_of::<i32>();
