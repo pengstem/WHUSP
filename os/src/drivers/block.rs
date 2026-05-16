@@ -1,8 +1,9 @@
-use crate::DEV_NON_BLOCKING_ACCESS;
 use crate::board::{BlockDeviceConfig, BlockDeviceImpl};
-use crate::drivers::virtio::{VirtioHal, VirtioTransport, mmio_transport};
+use crate::drivers::block_cache;
+use crate::drivers::virtio::{mmio_transport, VirtioHal, VirtioTransport};
 use crate::sync::{Condvar, UPIntrFreeCell};
 use crate::task::schedule;
+use crate::DEV_NON_BLOCKING_ACCESS;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -20,6 +21,12 @@ pub struct VirtIOBlock {
 
 impl VirtIOBlock {
     pub fn read_block(&self, block_id: usize, buf: &mut [u8]) {
+        block_cache::read_with_cache(self.cache_key(), block_id, buf, |block_id, buf| {
+            self.read_block_uncached(block_id, buf);
+        });
+    }
+
+    fn read_block_uncached(&self, block_id: usize, buf: &mut [u8]) {
         let nb = *DEV_NON_BLOCKING_ACCESS.exclusive_access();
         if nb {
             let mut req = BlkReq::default();
@@ -49,6 +56,12 @@ impl VirtIOBlock {
     }
 
     pub fn write_block(&self, block_id: usize, buf: &[u8]) {
+        block_cache::write_with_cache(self.cache_key(), block_id, buf, |block_id, buf| {
+            self.write_block_uncached(block_id, buf);
+        });
+    }
+
+    fn write_block_uncached(&self, block_id: usize, buf: &[u8]) {
         let nb = *DEV_NON_BLOCKING_ACCESS.exclusive_access();
         if nb {
             let mut req = BlkReq::default();
@@ -102,6 +115,10 @@ impl VirtIOBlock {
     }
 
     pub fn base_addr(&self) -> usize {
+        self.base_addr
+    }
+
+    fn cache_key(&self) -> usize {
         self.base_addr
     }
 
