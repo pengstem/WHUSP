@@ -1,15 +1,15 @@
 use super::address::page_align_up;
-use super::area::{MmapInfo, ShmAreaInfo};
+use super::area::{ExecSegmentInfo, MmapInfo, ShmAreaInfo};
 use super::page_table::PTEFlags;
+use super::{frame_alloc, frame_ref_count, VirtPageNum};
 use super::{
     FrameTracker, MapArea, MapPermission, MapType, MemorySet, MmapFlush, PageTableEntry,
     PhysPageNum, VPNRange, VirtAddr,
 };
-use super::{VirtPageNum, frame_alloc, frame_ref_count};
 use crate::arch::mm as arch_mm;
 use crate::config::{PAGE_SIZE, USER_MMAP_BASE, USER_MMAP_LIMIT};
 use crate::fs::File;
-use crate::mm::page_cache::{PAGE_CACHE, PageCacheId, PageCacheKey};
+use crate::mm::page_cache::{PageCacheId, PageCacheKey, PAGE_CACHE};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -56,8 +56,11 @@ enum GrowDownMmapFault {
 pub struct MmapFaultPage {
     vpn: VirtPageNum,
     file_offset: usize,
+    dst_offset: usize,
     read_len: usize,
     backing_file: Option<Arc<dyn File + Send + Sync>>,
+    exec_fault: bool,
+    zero_fill_len: usize,
 }
 
 impl MmapFaultPage {
@@ -67,11 +70,20 @@ impl MmapFaultPage {
     /// must revalidate the VMA and install it through `MemorySet`.
     pub fn build_frame(&self) -> Option<FrameTracker> {
         let frame = frame_alloc()?;
+        let mut read_len = 0usize;
         if let Some(file) = &self.backing_file {
             if self.read_len > 0 {
-                let dst = &mut frame.ppn.get_bytes_array()[..self.read_len];
-                file.read_at(self.file_offset, dst);
+                let end = self.dst_offset.checked_add(self.read_len)?;
+                let dst = frame.ppn.get_bytes_array().get_mut(self.dst_offset..end)?;
+                read_len = file.read_at(self.file_offset, dst);
             }
+        }
+        if self.exec_fault {
+            super::elf_loader::record_exec_lazy_fault(
+                read_len,
+                self.zero_fill_len
+                    .saturating_add(self.read_len.saturating_sub(read_len)),
+            );
         }
         Some(frame)
     }
@@ -518,6 +530,7 @@ impl MemorySet {
             backing_file,
             page_cache_id,
             page_cache_pages: BTreeMap::new(),
+            exec_segment: None,
         });
         apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
         self.areas.push(area);
@@ -591,10 +604,48 @@ impl MemorySet {
             backing_file,
             page_cache_id,
             page_cache_pages: BTreeMap::new(),
+            exec_segment: None,
         });
         apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
         self.areas.push(area);
         Some((start, flushes))
+    }
+
+    pub(super) fn map_exec_segment_area(
+        &mut self,
+        start: usize,
+        len: usize,
+        permission: MapPermission,
+        backing_file: Arc<dyn File + Send + Sync>,
+        backing_file_size: usize,
+        map_file_offset: usize,
+        exec_segment: ExecSegmentInfo,
+    ) -> Option<usize> {
+        if start % PAGE_SIZE != 0 || len == 0 {
+            return None;
+        }
+        let map_len = checked_page_align_up(len)?;
+        let end = start.checked_add(map_len)?;
+        if self.range_overlaps(start, end) {
+            return None;
+        }
+
+        let mut area = MapArea::new(start.into(), end.into(), MapType::Framed, permission);
+        area.mmap_info = Some(MmapInfo {
+            shared: false,
+            writable: permission.contains(MapPermission::W),
+            grow_down: false,
+            reported_perm: permission,
+            len,
+            file_offset: map_file_offset,
+            file_size: backing_file_size,
+            backing_file: Some(backing_file),
+            page_cache_id: None,
+            page_cache_pages: BTreeMap::new(),
+            exec_segment: Some(exec_segment),
+        });
+        self.areas.push(area);
+        Some(start)
     }
 
     pub fn attach_shm_area(
@@ -711,6 +762,18 @@ impl MemorySet {
             .as_ref()
             .expect("mmap fault area must carry mmap metadata");
         let area_offset = (vpn.0 - area.vpn_range.get_start().0) * PAGE_SIZE;
+        if let Some(exec_segment) = &info.exec_segment {
+            let fault = exec_segment_fault(exec_segment, area_offset)?;
+            return Some(MmapFaultResult::Page(MmapFaultPage {
+                vpn,
+                file_offset: fault.file_offset,
+                dst_offset: fault.dst_offset,
+                read_len: fault.read_len,
+                backing_file: info.backing_file.clone(),
+                exec_fault: true,
+                zero_fill_len: fault.zero_fill_len,
+            }));
+        }
         let file_offset = info.file_offset.checked_add(area_offset)?;
         // UNFINISHED: Linux raises SIGBUS for accesses to file-backed mmap
         // pages wholly beyond the backing object's end. The current contest
@@ -739,8 +802,11 @@ impl MemorySet {
         Some(MmapFaultResult::Page(MmapFaultPage {
             vpn,
             file_offset,
+            dst_offset: 0,
             read_len,
             backing_file: info.backing_file.clone(),
+            exec_fault: false,
+            zero_fill_len: 0,
         }))
     }
 
@@ -1245,6 +1311,37 @@ impl MemorySet {
 fn checked_page_align_up(addr: usize) -> Option<usize> {
     addr.checked_add(PAGE_SIZE - 1)
         .map(|addr| addr & !(PAGE_SIZE - 1))
+}
+
+struct ExecSegmentFault {
+    file_offset: usize,
+    dst_offset: usize,
+    read_len: usize,
+    zero_fill_len: usize,
+}
+
+fn exec_segment_fault(info: &ExecSegmentInfo, area_offset: usize) -> Option<ExecSegmentFault> {
+    let page_end = area_offset.checked_add(PAGE_SIZE)?;
+    let segment_start = info.page_offset;
+    let segment_mem_end = segment_start.checked_add(info.mem_size)?;
+    let segment_file_end = segment_start.checked_add(info.file_size)?;
+    let mem_start = area_offset.max(segment_start);
+    let mem_end = page_end.min(segment_mem_end);
+    let mem_len = mem_end.saturating_sub(mem_start);
+    let file_start = mem_start.min(segment_file_end);
+    let file_end = mem_end.min(segment_file_end);
+
+    let read_len = file_end.saturating_sub(file_start);
+    let dst_offset = file_start.saturating_sub(area_offset);
+    let file_offset = info
+        .file_offset
+        .checked_add(file_start.saturating_sub(segment_start))?;
+    Some(ExecSegmentFault {
+        file_offset,
+        dst_offset,
+        read_len,
+        zero_fill_len: mem_len.saturating_sub(read_len),
+    })
 }
 
 fn checked_page_range(start: usize, len: usize) -> Option<(VirtPageNum, VirtPageNum)> {

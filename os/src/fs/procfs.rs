@@ -6,7 +6,7 @@ use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
 use super::{FileStat, FileTimestamp, S_IFDIR, S_IFLNK, S_IFREG};
 use crate::config::PAGE_SIZE;
 use crate::drivers::block_cache;
-use crate::mm::frame_stats;
+use crate::mm::{exec_load_stats_content, frame_stats};
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::keyring;
 use crate::syscall::{
@@ -62,6 +62,7 @@ const INOTIFY_MAX_USER_INSTANCES_INO: u32 = 36;
 const INOTIFY_MAX_USER_WATCHES_INO: u32 = 37;
 const BLOCK_CACHE_STATS_INO: u32 = 38;
 const DENTRY_CACHE_STATS_INO: u32 = 39;
+const EXEC_LOAD_STATS_INO: u32 = 40;
 const PID_DIR_BASE: u32 = 100;
 const PID_FILE_BASE: u32 = 10_000;
 const PID_FILE_STRIDE: u32 = 32;
@@ -171,6 +172,7 @@ enum ProcNode {
     InotifyMaxUserWatches,
     BlockCacheStats,
     DentryCacheStats,
+    ExecLoadStats,
     Domainname,
     Tainted,
     PidDir(usize),
@@ -420,6 +422,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         INOTIFY_MAX_USER_WATCHES_INO => Some(ProcNode::InotifyMaxUserWatches),
         BLOCK_CACHE_STATS_INO => Some(ProcNode::BlockCacheStats),
         DENTRY_CACHE_STATS_INO => Some(ProcNode::DentryCacheStats),
+        EXEC_LOAD_STATS_INO => Some(ProcNode::ExecLoadStats),
         ino if ino >= PID_FDINFO_ENTRY_BASE => {
             let rel = ino - PID_FDINFO_ENTRY_BASE;
             let pid = (rel / PID_FD_ENTRY_STRIDE) as usize;
@@ -836,6 +839,11 @@ fn sys_kernel_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: DENTRY_CACHE_STATS_INO,
         name: "dentry_cache".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: EXEC_LOAD_STATS_INO,
+        name: "exec_loader".into(),
         dtype: DT_REG,
     });
     entries
@@ -1592,6 +1600,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::InotifyMaxUserWatches => Ok(inotify_max_user_watches_content().into_bytes()),
         ProcNode::BlockCacheStats => Ok(block_cache::stats_content().into_bytes()),
         ProcNode::DentryCacheStats => Ok(dentry_cache::stats_content().into_bytes()),
+        ProcNode::ExecLoadStats => Ok(exec_load_stats_content().into_bytes()),
         ProcNode::LeaseBreakTime => Ok(lease_break_time_content().into_bytes()),
         ProcNode::NetIpv4ConfLoTag => Ok(net_ipv4_conf_lo_tag_content().into_bytes()),
         ProcNode::NetIpv4ConfDefaultTag => Ok(net_ipv4_conf_default_tag_content().into_bytes()),
@@ -1802,6 +1811,7 @@ impl FileSystemBackend for ProcFs {
                 "tainted" => Ok((TAINTED_INO, FsNodeKind::RegularFile)),
                 "block_cache" => Ok((BLOCK_CACHE_STATS_INO, FsNodeKind::RegularFile)),
                 "dentry_cache" => Ok((DENTRY_CACHE_STATS_INO, FsNodeKind::RegularFile)),
+                "exec_loader" => Ok((EXEC_LOAD_STATS_INO, FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::SysKernelKeysDir => match component {

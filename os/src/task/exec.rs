@@ -1,13 +1,14 @@
 use super::{
-    SigAltStack, SignalAction, current_task, prepare_exec_thread_group,
-    process::{ProcessControlBlock, comm_from_cmdline, empty_process_pkey_rights},
+    current_task, prepare_exec_thread_group,
+    process::{comm_from_cmdline, empty_process_pkey_rights, ProcessControlBlock},
+    SigAltStack, SignalAction,
 };
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
-use crate::fs::{VfsNodeId, track_regular_file_executable, untrack_regular_file_executable};
-use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet};
+use crate::fs::{track_regular_file_executable, untrack_regular_file_executable, File, VfsNodeId};
+use crate::mm::{ElfLoadInfo, MemorySet, KERNEL_SPACE};
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{copy_to_user, write_user_value};
-use crate::trap::{TrapContext, trap_handler};
+use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -253,7 +254,9 @@ impl ProcessControlBlock {
     pub fn exec(
         self: &Arc<Self>,
         elf: &xmas_elf::ElfFile<'_>,
-        interpreter: Option<&xmas_elf::ElfFile<'_>>,
+        executable_file: Arc<dyn File + Send + Sync>,
+        executable_file_size: usize,
+        interpreter: Option<(&xmas_elf::ElfFile<'_>, Arc<dyn File + Send + Sync>, usize)>,
         args: Vec<String>,
         envs: Vec<String>,
         executable_node: Option<VfsNodeId>,
@@ -271,7 +274,8 @@ impl ProcessControlBlock {
             phent,
             phnum,
             interp_base,
-        } = MemorySet::from_elf(elf, interpreter);
+        } = MemorySet::from_elf_lazy(elf, executable_file, executable_file_size, interpreter)
+            .ok_or(SysError::ENOEXEC)?;
         let stack_info = ExecStackInfo {
             at_entry: program_entry,
             phdr,

@@ -4,7 +4,7 @@ use crate::fs::{
     regular_file_node_is_open_writable, stat_in, File, FileStat, FsNodeKind, OpenFlags,
     PathContext, VfsNodeId, S_IFLNK, S_IFMT, S_IFREG,
 };
-use crate::mm::elf_required_interpreter_path;
+use crate::mm::record_exec_metadata_read;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::fs::permissions::{check_execute_permission, AccessSubject};
 use crate::syscall::fs::{fanotify_notify_open_exec_at, path_context_from};
@@ -13,12 +13,24 @@ use crate::task::{current_process, current_user_token};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
+use core::convert::TryInto;
+use core::ffi::CStr;
 use core::str;
+use xmas_elf::program::Type;
 
 const ELF_MAGIC: &[u8] = b"\x7fELF";
 const SHEBANG_MAGIC: &[u8] = b"#!";
 const SHEBANG_RECURSION_LIMIT: usize = 4;
+const EXEC_PROBE_BYTES: usize = 4096;
+const EXEC_ELF_HEADER_BYTES: usize = 64;
+const EXEC_METADATA_MAX_BYTES: usize = 128 * 1024;
+const ELFCLASS64: u8 = 2;
+const ELFDATA2LSB: u8 = 1;
+const ELF64_DYNAMIC_ENTRY_SIZE: usize = 16;
+const DT_NULL: i64 = 0;
+const DT_NEEDED: i64 = 1;
 fn contest_library_path_env(root: &str) -> &'static str {
     match root {
         "/musl" => "LD_LIBRARY_PATH=/musl/lib:/glibc/lib:/lib",
@@ -41,6 +53,31 @@ struct ScriptInterpreter {
 struct ExecStringBudget {
     bytes: usize,
     count: usize,
+}
+
+struct ExecImageSource {
+    data: Vec<u8>,
+    file: Arc<dyn File + Send + Sync>,
+    file_size: usize,
+}
+
+impl ExecImageSource {
+    fn elf(&self) -> SysResult<xmas_elf::ElfFile<'_>> {
+        xmas_elf::ElfFile::new(self.data.as_slice()).map_err(|_| SysError::ENOEXEC)
+    }
+
+    fn read_exact_at(&self, offset: usize, len: usize) -> SysResult<Vec<u8>> {
+        let end = offset.checked_add(len).ok_or(SysError::ENOEXEC)?;
+        if end > self.file_size {
+            return Err(SysError::ENOEXEC);
+        }
+        let mut data = vec![0u8; len];
+        let read_len = self.file.read_at(offset, data.as_mut_slice());
+        if read_len != len {
+            return Err(SysError::ENOEXEC);
+        }
+        Ok(data)
+    }
 }
 
 impl ExecStringBudget {
@@ -312,27 +349,113 @@ fn interpreter_candidates(
     candidates
 }
 
+fn read_u16_le(data: &[u8], offset: usize) -> SysResult<usize> {
+    let bytes: [u8; 2] = data
+        .get(offset..offset + 2)
+        .ok_or(SysError::ENOEXEC)?
+        .try_into()
+        .map_err(|_| SysError::ENOEXEC)?;
+    Ok(u16::from_le_bytes(bytes) as usize)
+}
+
+fn read_u64_le(data: &[u8], offset: usize) -> SysResult<usize> {
+    let bytes: [u8; 8] = data
+        .get(offset..offset + 8)
+        .ok_or(SysError::ENOEXEC)?
+        .try_into()
+        .map_err(|_| SysError::ENOEXEC)?;
+    usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| SysError::ENOEXEC)
+}
+
+fn read_i64_le(data: &[u8], offset: usize) -> SysResult<i64> {
+    let bytes: [u8; 8] = data
+        .get(offset..offset + 8)
+        .ok_or(SysError::ENOEXEC)?
+        .try_into()
+        .map_err(|_| SysError::ENOEXEC)?;
+    Ok(i64::from_le_bytes(bytes))
+}
+
+fn elf_metadata_len(probe: &[u8], file_size: usize) -> SysResult<(usize, usize)> {
+    if probe.len() < EXEC_ELF_HEADER_BYTES {
+        return Err(SysError::ENOEXEC);
+    }
+    if probe.get(4).copied() != Some(ELFCLASS64) || probe.get(5).copied() != Some(ELFDATA2LSB) {
+        return Err(SysError::ENOEXEC);
+    }
+    let ph_offset = read_u64_le(probe, 32)?;
+    let ph_entry_size = read_u16_le(probe, 54)?;
+    let ph_count = read_u16_le(probe, 56)?;
+    if ph_entry_size != core::mem::size_of::<xmas_elf::program::ProgramHeader64>() {
+        return Err(SysError::ENOEXEC);
+    }
+    let phdr_bytes = ph_entry_size
+        .checked_mul(ph_count)
+        .ok_or(SysError::ENOEXEC)?;
+    let metadata_len = ph_offset.checked_add(phdr_bytes).ok_or(SysError::ENOEXEC)?;
+    if metadata_len < EXEC_ELF_HEADER_BYTES
+        || metadata_len > file_size
+        || metadata_len > EXEC_METADATA_MAX_BYTES
+    {
+        return Err(SysError::ENOEXEC);
+    }
+    Ok((metadata_len, phdr_bytes))
+}
+
+fn read_file_prefix(file: &Arc<dyn File + Send + Sync>, file_size: usize) -> Vec<u8> {
+    let len = file_size.min(EXEC_PROBE_BYTES);
+    let mut data = vec![0u8; len];
+    let read_len = file.read_at(0, data.as_mut_slice());
+    data.truncate(read_len);
+    data
+}
+
+fn read_exec_source_from_file(file: Arc<dyn File + Send + Sync>) -> SysResult<ExecImageSource> {
+    let file_size = file.stat()?.size as usize;
+    let probe = read_file_prefix(&file, file_size);
+    if !probe.starts_with(ELF_MAGIC) {
+        return Ok(ExecImageSource {
+            data: probe,
+            file,
+            file_size,
+        });
+    }
+
+    let (metadata_len, phdr_bytes) = elf_metadata_len(probe.as_slice(), file_size)?;
+    let mut metadata = vec![0u8; metadata_len];
+    let read_len = file.read_at(0, metadata.as_mut_slice());
+    if read_len != metadata_len {
+        return Err(SysError::ENOEXEC);
+    }
+    record_exec_metadata_read(EXEC_ELF_HEADER_BYTES, phdr_bytes);
+    Ok(ExecImageSource {
+        data: metadata,
+        file,
+        file_size,
+    })
+}
+
 fn read_exec_file_in(
     context: PathContext,
     path: &str,
     follow_final_symlink: bool,
-) -> SysResult<Vec<u8>> {
+) -> SysResult<ExecImageSource> {
     check_exec_file_in(context.clone(), path, follow_final_symlink)?;
     let event_path = normalize_path_at_root(context.root_path(), context.cwd_path(), path);
     let app_file = open_file_in(context, path, OpenFlags::RDONLY)?;
     if let Some(event_path) = event_path.as_deref() {
         fanotify_notify_open_exec_at(&app_file, event_path);
     }
-    read_all_file(app_file)
+    read_exec_source_from_file(app_file)
 }
 
-fn read_exec_file_direct(path: &str) -> SysResult<Vec<u8>> {
+fn read_exec_file_direct(path: &str) -> SysResult<ExecImageSource> {
     read_exec_file_in(current_process().path_snapshot().context, path, true)
 }
 
-fn read_exec_open_file(file: Arc<dyn File + Send + Sync>) -> SysResult<Vec<u8>> {
+fn read_exec_open_file(file: Arc<dyn File + Send + Sync>) -> SysResult<ExecImageSource> {
     check_exec_open_file(&file)?;
-    read_all_file(file)
+    read_exec_source_from_file(file)
 }
 
 fn lmbench_all_redirect() -> &'static str {
@@ -377,7 +500,7 @@ fn exec_compat_script_redirect(
     None
 }
 
-fn read_exec_file(path: &str) -> SysResult<Vec<u8>> {
+fn read_exec_file(path: &str) -> SysResult<ExecImageSource> {
     match read_exec_file_direct(path) {
         Ok(data) => Ok(data),
         Err(err) => {
@@ -390,15 +513,7 @@ fn read_exec_file(path: &str) -> SysResult<Vec<u8>> {
     }
 }
 
-fn read_all_file(file: Arc<dyn File + Send + Sync>) -> SysResult<Vec<u8>> {
-    let mut data = Vec::new();
-    data.resize(file.stat()?.size as usize, 0);
-    let len = file.read_at(0, data.as_mut_slice());
-    data.truncate(len);
-    Ok(data)
-}
-
-fn read_elf_interpreter(path: &str) -> SysResult<Vec<u8>> {
+fn read_elf_interpreter(path: &str) -> SysResult<ExecImageSource> {
     const REDIRECTS: &[(&str, &str)] = &[
         // CONTEXT: libc-test's musl dynamic binary names the soft-float
         // interpreter as a symlink to libc.so. Official test sources state
@@ -439,6 +554,68 @@ fn append_script_args(
     args.push(script_path);
     args.extend(original_args.into_iter().skip(1));
     args
+}
+
+fn dynamic_segment_has_needed(
+    source: &ExecImageSource,
+    offset: usize,
+    len: usize,
+) -> SysResult<bool> {
+    if len == 0 {
+        return Ok(false);
+    }
+    let data = source.read_exact_at(offset, len)?;
+    let mut cursor = 0usize;
+    while cursor + ELF64_DYNAMIC_ENTRY_SIZE <= data.len() {
+        let tag = read_i64_le(data.as_slice(), cursor)?;
+        if tag == DT_NULL {
+            return Ok(false);
+        }
+        if tag == DT_NEEDED {
+            return Ok(true);
+        }
+        cursor += ELF64_DYNAMIC_ENTRY_SIZE;
+    }
+    Ok(false)
+}
+
+fn elf_required_interpreter_path_from_source(
+    elf: &xmas_elf::ElfFile<'_>,
+    source: &ExecImageSource,
+) -> SysResult<Option<String>> {
+    let mut interpreter_path = None;
+    let mut needs_interpreter = false;
+    for i in 0..elf.header.pt2.ph_count() {
+        let ph = elf.program_header(i).map_err(|_| SysError::ENOEXEC)?;
+        match ph.get_type().map_err(|_| SysError::ENOEXEC)? {
+            Type::Interp => {
+                let offset = ph.offset() as usize;
+                let len = ph.file_size() as usize;
+                let bytes = source.read_exact_at(offset, len)?;
+                let path = CStr::from_bytes_until_nul(bytes.as_slice())
+                    .map_err(|_| SysError::ENOEXEC)?
+                    .to_str()
+                    .map_err(|_| SysError::ENOEXEC)?;
+                interpreter_path = Some(path.to_string());
+            }
+            Type::Dynamic => {
+                needs_interpreter |= dynamic_segment_has_needed(
+                    source,
+                    ph.offset() as usize,
+                    ph.file_size() as usize,
+                )?;
+            }
+            _ => {}
+        }
+        if interpreter_path.is_some() && needs_interpreter {
+            break;
+        }
+    }
+    Ok(if needs_interpreter {
+        interpreter_path
+    } else {
+        None
+    })
 }
 
 fn exec_script(
@@ -487,30 +664,52 @@ fn exec_loaded_program(
     args: Vec<String>,
     envs: Vec<String>,
     depth: usize,
-    data: Vec<u8>,
+    source: ExecImageSource,
     executable_node: Option<VfsNodeId>,
 ) -> SysResult {
-    if data.starts_with(ELF_MAGIC) {
-        let elf = xmas_elf::ElfFile::new(data.as_slice()).map_err(|_| SysError::ENOEXEC)?;
+    if source.data.starts_with(ELF_MAGIC) {
+        let elf = source.elf()?;
         let mut envs = envs;
         // CONTEXT: Some contest basic binaries are PIE and carry PT_INTERP but
         // have no DT_NEEDED entries. They ran as directly-entered self-contained
         // test programs before dynamic linker support; keep that compatibility
         // path while using PT_INTERP for binaries that actually need DSOs.
-        let interpreter_path = elf_required_interpreter_path(&elf);
-        if let Some(root) = interpreter_path.and_then(libc_test_root_from_interpreter) {
+        let interpreter_path = elf_required_interpreter_path_from_source(&elf, &source)?;
+        if let Some(root) = interpreter_path
+            .as_deref()
+            .and_then(libc_test_root_from_interpreter)
+        {
             // CONTEXT: LTP may copy a dynamically linked libc-root helper into
             // a temporary mountpoint and exec it with a minimal custom envp.
             // The interpreter still identifies the libc family, so preserve the
             // custom envp and add only the library search path the loader needs.
             push_missing_library_path(&mut envs, root);
         }
-        let interpreter_data = interpreter_path.map(read_elf_interpreter).transpose()?;
-        let interpreter_elf = interpreter_data
+        let interpreter_source = interpreter_path
             .as_ref()
-            .map(|data| xmas_elf::ElfFile::new(data.as_slice()).map_err(|_| SysError::ENOEXEC))
+            .map(|path| read_elf_interpreter(path.as_str()))
             .transpose()?;
-        current_process().exec(&elf, interpreter_elf.as_ref(), args, envs, executable_node)?;
+        let interpreter_elf = interpreter_source
+            .as_ref()
+            .map(ExecImageSource::elf)
+            .transpose()?;
+        let interpreter = match (interpreter_elf.as_ref(), interpreter_source.as_ref()) {
+            (Some(interpreter_elf), Some(interpreter_source)) => Some((
+                interpreter_elf,
+                interpreter_source.file.clone(),
+                interpreter_source.file_size,
+            )),
+            _ => None,
+        };
+        current_process().exec(
+            &elf,
+            source.file.clone(),
+            source.file_size,
+            interpreter,
+            args,
+            envs,
+            executable_node,
+        )?;
         // CONTEXT: Linux execve starts a new image instead of returning to the
         // old program. For PT_INTERP ELFs, the kernel enters the dynamic linker
         // while auxv still describes the original executable.
@@ -518,13 +717,13 @@ fn exec_loaded_program(
     }
 
     if let Some((target, next_args)) =
-        exec_compat_script_redirect(path.as_str(), data.as_slice(), args.clone())
+        exec_compat_script_redirect(path.as_str(), source.data.as_slice(), args.clone())
     {
         let target_data = read_exec_file(target.as_str())?;
         return exec_loaded_program(target, next_args, envs, depth + 1, target_data, None);
     }
 
-    let interpreter = match parse_shebang(data.as_slice())? {
+    let interpreter = match parse_shebang(source.data.as_slice())? {
         Some(interp) => interp,
         None => ScriptInterpreter {
             path: String::from("/bin/sh"),

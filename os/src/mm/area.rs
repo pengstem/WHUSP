@@ -6,7 +6,7 @@ use super::{
 use crate::arch::mm as arch_mm;
 use crate::config::PAGE_SIZE;
 use crate::fs::File;
-use crate::mm::page_cache::{PAGE_CACHE, PageCacheId, PageCacheKey};
+use crate::mm::page_cache::{PageCacheId, PageCacheKey, PAGE_CACHE};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -50,6 +50,15 @@ pub(super) struct MmapInfo {
     pub(super) backing_file: Option<Arc<dyn File + Send + Sync>>,
     pub(super) page_cache_id: Option<PageCacheId>,
     pub(super) page_cache_pages: BTreeMap<VirtPageNum, PageCacheKey>,
+    pub(super) exec_segment: Option<ExecSegmentInfo>,
+}
+
+#[derive(Clone)]
+pub(super) struct ExecSegmentInfo {
+    pub(super) page_offset: usize,
+    pub(super) file_offset: usize,
+    pub(super) file_size: usize,
+    pub(super) mem_size: usize,
 }
 
 #[derive(Clone)]
@@ -84,6 +93,10 @@ impl ShmAreaInfo {
 
 impl MmapInfo {
     fn split_off(&mut self, offset: usize, at: VirtPageNum) -> Self {
+        let right_exec_segment = self
+            .exec_segment
+            .as_mut()
+            .map(|info| info.split_off(offset));
         let right = Self {
             shared: self.shared,
             writable: self.writable,
@@ -95,8 +108,28 @@ impl MmapInfo {
             backing_file: self.backing_file.clone(),
             page_cache_id: self.page_cache_id,
             page_cache_pages: self.page_cache_pages.split_off(&at),
+            exec_segment: right_exec_segment,
         };
         self.len = self.len.min(offset);
+        right
+    }
+}
+
+impl ExecSegmentInfo {
+    fn split_off(&mut self, offset: usize) -> Self {
+        let consumed_mem = offset.saturating_sub(self.page_offset).min(self.mem_size);
+        let consumed_file = offset.saturating_sub(self.page_offset).min(self.file_size);
+        let right = Self {
+            page_offset: self.page_offset.saturating_sub(offset),
+            file_offset: self.file_offset.saturating_add(consumed_file),
+            file_size: self.file_size.saturating_sub(consumed_file),
+            mem_size: self.mem_size.saturating_sub(consumed_mem),
+        };
+
+        let left_mem = offset.saturating_sub(self.page_offset).min(self.mem_size);
+        let left_file = offset.saturating_sub(self.page_offset).min(self.file_size);
+        self.mem_size = left_mem;
+        self.file_size = left_file;
         right
     }
 }
