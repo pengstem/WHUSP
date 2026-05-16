@@ -1,8 +1,8 @@
 use super::super::errno::{SysError, SysResult};
 use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{
-    PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, read_user_value,
-    translated_byte_buffer_checked,
+    copy_to_user, read_user_c_string, read_user_value, translated_byte_buffer_checked,
+    UserBufferAccess, PATH_MAX,
 };
 use super::fanotify::{
     fanotify_notify_create, fanotify_notify_delete, fanotify_notify_modify, fanotify_notify_move,
@@ -13,25 +13,26 @@ use super::inotify::{
     inotify_notify_attrib, inotify_notify_create, inotify_notify_delete, inotify_notify_modify,
     inotify_notify_move, inotify_notify_open, inotify_notify_open_at,
 };
+use super::permissions::{check_access_mode, AccessSubject};
 use super::stat::resolve_stat_from;
 use super::uapi::{
     AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
-    F_OK, R_OK, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, UTIME_NOW, UTIME_OMIT,
-    VALID_ACCESS_MODE, VALID_FACCESSAT_FLAGS, VALID_FACCESSAT2_FLAGS, VALID_LINKAT_FLAGS,
+    F_OK, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, R_OK, UTIME_NOW, UTIME_OMIT,
+    VALID_ACCESS_MODE, VALID_FACCESSAT2_FLAGS, VALID_FACCESSAT_FLAGS, VALID_LINKAT_FLAGS,
     VALID_RENAME_FLAGS, VALID_UTIMENSAT_FLAGS, W_OK, X_OK,
 };
 use crate::fs::{
-    FS_APPEND_FL, FS_IMMUTABLE_FL, File, FileCreateAttrs, FileStat, FileTimestamp, FsError,
-    FsNodeKind, MountId, OpenFlags, PathContext, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT,
-    S_IFREG, S_IFSOCK, WorkingDir, chown_in, create_node_in, link_file_in, link_open_file_in,
-    lookup_dir_with_stat_in, lookup_dir_with_stat_path_in, lookup_path_in, mkdir_in,
-    mount_is_read_only, normalize_path_at_root, open_devfs_child, open_devfs_input_child,
-    open_devfs_misc_child, open_devfs_net_child, open_devfs_pts_child, open_file_in,
-    open_file_in_with_attrs, open_static_path, open_tmpfile_in_with_attrs, path_inside_root,
-    rename_in, rmdir_in, symlink_in, truncate_in, unlink_file_in,
+    chown_in, create_node_in, link_file_in, link_open_file_in, lookup_dir_with_stat_in,
+    lookup_dir_with_stat_path_in, lookup_path_in, mkdir_in, normalize_path_at_root,
+    open_devfs_child, open_devfs_input_child, open_devfs_misc_child, open_devfs_net_child,
+    open_devfs_pts_child, open_file_in, open_file_in_with_attrs, open_static_path,
+    open_tmpfile_in_with_attrs, path_inside_root, rename_in, rmdir_in, symlink_in, truncate_in,
+    unlink_file_in, File, FileCreateAttrs, FileTimestamp, FsError, FsNodeKind, OpenFlags,
+    PathContext, WorkingDir, FS_APPEND_FL, FS_IMMUTABLE_FL, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
+    S_IFMT, S_IFREG, S_IFSOCK,
 };
 use crate::mm::UserBuffer;
-use crate::task::{CAP_SYS_CHROOT, PathSnapshot, current_process, current_user_token};
+use crate::task::{current_process, current_user_token, PathSnapshot, CAP_SYS_CHROOT};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -107,57 +108,6 @@ fn visible_working_dir_path(snapshot: &PathSnapshot) -> SysResult<String> {
     )
 }
 
-#[derive(Clone, Copy)]
-struct AccessSubject<'a> {
-    uid: u32,
-    gid: u32,
-    groups: &'a [u32],
-}
-
-impl AccessSubject<'_> {
-    fn is_root(self) -> bool {
-        self.uid == 0
-    }
-
-    fn in_group(self, gid: u32) -> bool {
-        self.gid == gid || self.groups.iter().any(|group| *group == gid)
-    }
-}
-
-fn check_access_mode(stat: &FileStat, mode: i32, subject: AccessSubject<'_>) -> SysResult<()> {
-    if mode == F_OK {
-        return Ok(());
-    }
-
-    if mode & W_OK != 0 && mount_is_read_only(MountId(stat.dev as usize)) {
-        return Err(SysError::EROFS);
-    }
-
-    // UNFINISHED: Linux also folds capabilities, ACLs, immutable/append-only
-    // inode flags, noexec mounts, and ETXTBSY into access checks. This kernel
-    // models the common DAC mode-bit path and treats uid 0 as capability-like.
-    if subject.is_root() {
-        if mode & X_OK != 0 && stat.mode & S_IFREG == S_IFREG && stat.mode & 0o111 == 0 {
-            return Err(SysError::EACCES);
-        }
-        return Ok(());
-    }
-
-    let requested = mode as u32 & 0o7;
-    let granted = if subject.uid == stat.uid {
-        (stat.mode >> 6) & 0o7
-    } else if subject.in_group(stat.gid) {
-        (stat.mode >> 3) & 0o7
-    } else {
-        stat.mode & 0o7
-    };
-
-    if granted & requested != requested {
-        return Err(SysError::EACCES);
-    }
-    Ok(())
-}
-
 fn check_access_path_prefixes_from(
     snapshot: &PathSnapshot,
     dirfd: isize,
@@ -218,7 +168,7 @@ fn check_open_existing_access_from(
     // CONTEXT: Linux gates O_NOATIME on file ownership or CAP_FOWNER. This
     // kernel's capabilities are still process-wide and not recalculated across
     // setuid transitions, so uid 0 is the current CAP_FOWNER-equivalent check.
-    if flags.contains(OpenFlags::NOATIME) && subject.uid != stat.uid && !subject.is_root() {
+    if flags.contains(OpenFlags::NOATIME) && subject.uid() != stat.uid && !subject.is_root() {
         return Err(SysError::EPERM);
     }
 
@@ -242,11 +192,7 @@ pub(super) fn check_current_access_path_prefixes_from(
     path: &str,
 ) -> SysResult<()> {
     let credentials = current_process().credentials();
-    let subject = AccessSubject {
-        uid: credentials.fsuid,
-        gid: credentials.fsgid,
-        groups: &credentials.groups,
-    };
+    let subject = AccessSubject::from_fs_credentials(&credentials);
     check_access_path_prefixes_from(snapshot, dirfd, path, subject)
 }
 
@@ -471,11 +417,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> SysRe
         );
     let process = current_process();
     let credentials = process.credentials();
-    let subject = AccessSubject {
-        uid: credentials.fsuid,
-        gid: credentials.fsgid,
-        groups: &credentials.groups,
-    };
+    let subject = AccessSubject::from_fs_credentials(&credentials);
     check_access_path_prefixes_from(&snapshot, dirfd, path.as_str(), subject)?;
     check_open_existing_access_from(&snapshot, dirfd, path.as_str(), flags, subject)?;
     let create_attrs = Some(FileCreateAttrs {
@@ -522,11 +464,7 @@ pub fn sys_truncate(path: *const u8, len: usize) -> SysResult {
     }
 
     let credentials = current_process().credentials();
-    let subject = AccessSubject {
-        uid: credentials.fsuid,
-        gid: credentials.fsgid,
-        groups: &credentials.groups,
-    };
+    let subject = AccessSubject::from_fs_credentials(&credentials);
     let snapshot = current_process().path_snapshot();
     check_access_path_prefixes_from(&snapshot, AT_FDCWD, path.as_str(), subject)?;
     let stat = resolve_stat_from(&snapshot, AT_FDCWD, path.as_str(), true)?;
@@ -562,17 +500,9 @@ fn do_faccessat(
 
     let credentials = current_process().credentials();
     let subject = if use_effective_ids {
-        AccessSubject {
-            uid: credentials.euid,
-            gid: credentials.egid,
-            groups: &credentials.groups,
-        }
+        AccessSubject::from_effective_credentials(&credentials)
     } else {
-        AccessSubject {
-            uid: credentials.ruid,
-            gid: credentials.rgid,
-            groups: &credentials.groups,
-        }
+        AccessSubject::from_real_credentials(&credentials)
     };
     let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
     let snapshot = current_process().path_snapshot();
@@ -664,11 +594,7 @@ pub fn sys_chdir(path: *const u8) -> SysResult {
     let path = read_user_c_string(token, path, PATH_MAX)?;
     let snapshot = process.path_snapshot();
     let credentials = process.credentials();
-    let subject = AccessSubject {
-        uid: credentials.fsuid,
-        gid: credentials.fsgid,
-        groups: &credentials.groups,
-    };
+    let subject = AccessSubject::from_fs_credentials(&credentials);
     check_access_path_prefixes_from(&snapshot, AT_FDCWD, path.as_str(), subject)?;
     let (next_cwd, stat, next_path) =
         lookup_dir_with_stat_path_in(snapshot.context.clone(), path.as_str())?;
@@ -686,11 +612,7 @@ pub fn sys_chroot(path: *const u8) -> SysResult {
     }
 
     let credentials = process.credentials();
-    let subject = AccessSubject {
-        uid: credentials.fsuid,
-        gid: credentials.fsgid,
-        groups: &credentials.groups,
-    };
+    let subject = AccessSubject::from_fs_credentials(&credentials);
     let snapshot = process.path_snapshot();
     check_access_path_prefixes_from(&snapshot, AT_FDCWD, path.as_str(), subject)?;
     let (next_root, stat) = lookup_dir_with_stat_in(snapshot.context.clone(), path.as_str())?;
@@ -733,11 +655,7 @@ pub fn sys_fchdir(fd: usize) -> SysResult {
     };
     let process = current_process();
     let credentials = process.credentials();
-    let subject = AccessSubject {
-        uid: credentials.fsuid,
-        gid: credentials.fsgid,
-        groups: &credentials.groups,
-    };
+    let subject = AccessSubject::from_fs_credentials(&credentials);
     check_access_mode(&file.stat()?, X_OK, subject)?;
     process.set_working_dir(next_cwd, String::from(next_path));
     Ok(0)

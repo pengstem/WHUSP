@@ -1,21 +1,21 @@
 use super::dirent::{
-    DT_BLK, DT_CHR, DT_DIR, LINUX_DIRENT64_ALIGN, LINUX_DIRENT64_HEADER_SIZE, RawDirEntry,
-    write_dir_entries,
+    write_dir_entries, RawDirEntry, DT_BLK, DT_CHR, DT_DIR, LINUX_DIRENT64_ALIGN,
+    LINUX_DIRENT64_HEADER_SIZE,
 };
 use super::mount::MountId;
 use super::path::WorkingDir;
 use super::status_flags::StatusFlagsCell;
 use super::vfs::{FileSystemBackend, FileSystemStat, FsNodeKind, VfsNodeId};
 use super::{
-    File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFBLK, S_IFCHR, S_IFDIR,
-    SeekWhence, console_tty_poll, console_tty_read,
+    console_tty_poll, console_tty_read, File, FileStat, FsError, FsResult, OpenFlags, PollEvents,
+    SeekWhence, S_IFBLK, S_IFCHR, S_IFDIR,
 };
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
-    TaskControlBlock, block_current_task_no_schedule, current_has_unmasked_signal, schedule,
-    wakeup_task,
+    block_current_task_no_schedule, current_has_unmasked_signal, schedule, wakeup_task,
+    TaskControlBlock,
 };
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -1220,10 +1220,14 @@ fn write_loop0_at(offset: usize, buf: &[u8]) -> usize {
     if offset == 0 && !buf.is_empty() {
         super::mount::reset_ext_scratch_mount("/dev/loop0");
     }
+    let size = loop0_size() as usize;
+    if offset < size {
+        return buf.len().min(size - offset);
+    }
     // CONTEXT: BusyBox mkfs.ext2 uses full_write(), which retries forever if a
-    // block-device write returns 0. Since this scratch loop device intentionally
-    // discards mkfs data, report the whole buffer as accepted instead of
-    // exposing an EOF-style short write.
+    // block-device write returns 0. Writes that start before the visible loop
+    // capacity still report a Linux-like short count for LOOP_SET_CAPACITY
+    // tests; only EOF-only scratch writes are accepted to keep mkfs setup moving.
     buf.len()
 }
 

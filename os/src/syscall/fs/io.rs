@@ -1,23 +1,84 @@
 use crate::config::PAGE_SIZE;
-use crate::fs::{File, FileStat, OpenFlags, PollEvents, S_IFDIR, S_IFMT, S_IFREG, SeekWhence};
+use crate::fs::{File, FileStat, OpenFlags, PollEvents, SeekWhence, S_IFDIR, S_IFMT, S_IFREG};
 use crate::mm::UserBuffer;
-use crate::task::{FdTableEntry, SignalFlags, current_add_signal, current_user_token};
+use crate::task::{current_add_signal, current_user_token, FdTableEntry, SignalFlags};
 use alloc::{vec, vec::Vec};
 use core::ptr::read_volatile;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    UserBufferAccess, read_user_array_item, read_user_value, translated_byte_buffer_checked,
-    translated_byte_buffer_checked_with_mmap_fault, write_user_value,
+    read_user_array_item, read_user_value, translated_byte_buffer_checked,
+    translated_byte_buffer_checked_with_mmap_fault, write_user_value, UserBufferAccess,
 };
 use super::fanotify::{fanotify_notify_access, fanotify_notify_modify};
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::inotify::{inotify_notify_access, inotify_notify_modify};
-use super::uapi::{IOV_MAX, LinuxIovec};
+use super::uapi::{LinuxIovec, IOV_MAX};
 
 struct UserIovecs {
     entries: Vec<LinuxIovec>,
     total_len: usize,
+}
+
+struct UserIovecChunk {
+    len: usize,
+    buffers: Vec<&'static mut [u8]>,
+}
+
+struct UserIovecCursor {
+    token: usize,
+    entries: Vec<LinuxIovec>,
+    index: usize,
+    access: UserBufferAccess,
+}
+
+impl UserIovecCursor {
+    fn new(token: usize, iovecs: UserIovecs, access: UserBufferAccess) -> Self {
+        Self {
+            token,
+            entries: iovecs.entries,
+            index: 0,
+            access,
+        }
+    }
+
+    fn validate_all(&self) -> SysResult<()> {
+        for iovec in self.entries.iter() {
+            if iovec.len == 0 {
+                continue;
+            }
+            translated_byte_buffer_checked_with_mmap_fault(
+                self.token,
+                iovec.base as *const u8,
+                iovec.len,
+                self.access,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn next_chunk(&mut self) -> Option<SysResult<UserIovecChunk>> {
+        while self.index < self.entries.len() {
+            let iovec = self.entries[self.index];
+            self.index += 1;
+            if iovec.len == 0 {
+                continue;
+            }
+            return Some(
+                translated_byte_buffer_checked_with_mmap_fault(
+                    self.token,
+                    iovec.base as *const u8,
+                    iovec.len,
+                    self.access,
+                )
+                .map(|buffers| UserIovecChunk {
+                    len: iovec.len,
+                    buffers,
+                }),
+            );
+        }
+        None
+    }
 }
 
 /// Reads a Linux iovec array and validates the aggregate byte count.
@@ -673,30 +734,12 @@ pub fn sys_preadv(
     }
     ensure_positioned_target(file.as_ref())?;
 
-    for iovec in iovecs.entries.iter() {
-        if iovec.len == 0 {
-            continue;
-        }
-        translated_byte_buffer_checked_with_mmap_fault(
-            token,
-            iovec.base as *const u8,
-            iovec.len,
-            UserBufferAccess::Write,
-        )?;
-    }
+    let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Write);
+    cursor.validate_all()?;
 
     let mut total_read = 0usize;
-    for iovec in iovecs.entries {
-        if iovec.len == 0 {
-            continue;
-        }
-        let buffers = translated_byte_buffer_checked_with_mmap_fault(
-            token,
-            iovec.base as *const u8,
-            iovec.len,
-            UserBufferAccess::Write,
-        )?;
-        for slice in buffers {
+    while let Some(chunk) = cursor.next_chunk() {
+        for slice in chunk?.buffers {
             let read = file.read_at(offset, slice);
             total_read += read;
             offset = offset.checked_add(read).ok_or(SysError::EINVAL)?;
@@ -740,27 +783,11 @@ pub fn sys_pwritev(
     if entry.status_flags().contains(OpenFlags::APPEND) {
         offset = file.stat()?.size as usize;
     }
+    let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Read);
     let mut total_written = 0usize;
-    for iovec in iovecs.entries {
-        if iovec.len == 0 {
-            continue;
-        }
-        if iovec.base == 0 {
-            return if total_written > 0 {
-                fanotify_notify_modify(&file, total_written);
-                inotify_notify_modify(&file, total_written);
-                Ok(total_written as isize)
-            } else {
-                Err(SysError::EFAULT)
-            };
-        }
-        let buffers = match translated_byte_buffer_checked_with_mmap_fault(
-            token,
-            iovec.base as *const u8,
-            iovec.len,
-            UserBufferAccess::Read,
-        ) {
-            Ok(buffers) => buffers,
+    while let Some(chunk) = cursor.next_chunk() {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
             Err(_) if total_written > 0 => {
                 fanotify_notify_modify(&file, total_written);
                 inotify_notify_modify(&file, total_written);
@@ -768,11 +795,11 @@ pub fn sys_pwritev(
             }
             Err(err) => return Err(err),
         };
-        if let Err(err) = file.check_write_at(offset, iovec.len) {
-            fault_in_read_buffers(&buffers);
+        if let Err(err) = file.check_write_at(offset, chunk.len) {
+            fault_in_read_buffers(&chunk.buffers);
             return Err(err.into());
         }
-        for slice in buffers {
+        for slice in chunk.buffers {
             let written = file.write_at(offset, slice);
             total_written += written;
             offset = offset.checked_add(written).ok_or(SysError::EINVAL)?;
@@ -863,18 +890,11 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
         entry.status_flags().contains(OpenFlags::APPEND),
     )?;
 
+    let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Read);
     let mut total_written = 0usize;
-    for iovec in iovecs.entries {
-        if iovec.len == 0 {
-            continue;
-        }
-        let buffers = match translated_byte_buffer_checked_with_mmap_fault(
-            token,
-            iovec.base as *const u8,
-            iovec.len,
-            UserBufferAccess::Read,
-        ) {
-            Ok(buffers) => buffers,
+    while let Some(chunk) = cursor.next_chunk() {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
             Err(_) if total_written > 0 => {
                 fanotify_notify_modify(&file, total_written);
                 inotify_notify_modify(&file, total_written);
@@ -882,9 +902,10 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
             }
             Err(err) => return Err(err),
         };
-        let written = write_with_status_flags(&entry, UserBuffer::new(buffers));
+        let chunk_len = chunk.len;
+        let written = write_with_status_flags(&entry, UserBuffer::new(chunk.buffers));
         total_written += written;
-        if written < iovec.len {
+        if written < chunk_len {
             break;
         }
     }
@@ -917,32 +938,16 @@ pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult 
     let entry = get_fd_entry_by_fd(fd)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLIN)?;
 
-    for iovec in iovecs.entries.iter() {
-        if iovec.len == 0 {
-            continue;
-        }
-        translated_byte_buffer_checked_with_mmap_fault(
-            token,
-            iovec.base as *const u8,
-            iovec.len,
-            UserBufferAccess::Write,
-        )?;
-    }
+    let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Write);
+    cursor.validate_all()?;
 
     let mut total_read = 0usize;
-    for iovec in iovecs.entries {
-        if iovec.len == 0 {
-            continue;
-        }
-        let buffers = translated_byte_buffer_checked_with_mmap_fault(
-            token,
-            iovec.base as *const u8,
-            iovec.len,
-            UserBufferAccess::Write,
-        )?;
-        let read = file.read(UserBuffer::new(buffers));
+    while let Some(chunk) = cursor.next_chunk() {
+        let chunk = chunk?;
+        let chunk_len = chunk.len;
+        let read = file.read(UserBuffer::new(chunk.buffers));
         total_read += read;
-        if read < iovec.len {
+        if read < chunk_len {
             break;
         }
     }

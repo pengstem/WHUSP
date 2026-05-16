@@ -9,6 +9,7 @@ mod inotify;
 mod io;
 mod mount;
 mod path;
+pub(crate) mod permissions;
 mod poll;
 mod stat;
 mod tty;
@@ -32,7 +33,7 @@ pub(crate) use fd_lock::{
 };
 pub use file_handle::sys_name_to_handle_at;
 pub(crate) use inotify::{
-    INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES, inotify_fdinfo,
+    inotify_fdinfo, INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES,
 };
 pub use inotify::{sys_inotify_add_watch, sys_inotify_init1, sys_inotify_rm_watch};
 pub use io::{

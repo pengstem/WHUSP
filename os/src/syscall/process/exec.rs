@@ -1,12 +1,14 @@
+use crate::config::USER_STACK_SIZE;
 use crate::fs::{
-    File, FileStat, FsNodeKind, OpenFlags, PathContext, S_IFLNK, S_IFMT, S_IFREG, VfsNodeId,
     lookup_path_in, normalize_path_at_root, open_file_in, regular_file_is_open_writable_in,
-    regular_file_node_is_open_writable, stat_in,
+    regular_file_node_is_open_writable, stat_in, File, FileStat, FsNodeKind, OpenFlags,
+    PathContext, VfsNodeId, S_IFLNK, S_IFMT, S_IFREG,
 };
 use crate::mm::elf_required_interpreter_path;
 use crate::syscall::errno::{SysError, SysResult};
+use crate::syscall::fs::permissions::{check_execute_permission, AccessSubject};
 use crate::syscall::fs::{fanotify_notify_open_exec_at, path_context_from};
-use crate::syscall::user_ptr::{PATH_MAX, read_user_c_string, read_user_usize};
+use crate::syscall::user_ptr::{read_user_c_string, read_user_usize, PATH_MAX};
 use crate::task::{current_process, current_user_token};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -28,13 +30,43 @@ const AT_FDCWD: isize = -100;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_EMPTY_PATH: usize = 0x1000;
 const VALID_EXECVEAT_FLAGS: usize = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
+const EXEC_ARG_ENV_MAX_BYTES: usize = USER_STACK_SIZE;
+const EXEC_ARG_ENV_MAX_COUNT: usize = 4096;
 
 struct ScriptInterpreter {
     path: String,
     optional_arg: Option<String>,
 }
 
-fn translated_string_array(token: usize, mut ptr: *const usize) -> SysResult<Vec<String>> {
+struct ExecStringBudget {
+    bytes: usize,
+    count: usize,
+}
+
+impl ExecStringBudget {
+    fn new() -> Self {
+        Self { bytes: 0, count: 0 }
+    }
+
+    fn charge(&mut self, string_len: usize) -> SysResult<()> {
+        self.count = self.count.checked_add(1).ok_or(SysError::E2BIG)?;
+        if self.count > EXEC_ARG_ENV_MAX_COUNT {
+            return Err(SysError::E2BIG);
+        }
+        let bytes = string_len.checked_add(1).ok_or(SysError::E2BIG)?;
+        self.bytes = self.bytes.checked_add(bytes).ok_or(SysError::E2BIG)?;
+        if self.bytes > EXEC_ARG_ENV_MAX_BYTES {
+            return Err(SysError::E2BIG);
+        }
+        Ok(())
+    }
+}
+
+fn read_exec_string_array(
+    token: usize,
+    mut ptr: *const usize,
+    budget: &mut ExecStringBudget,
+) -> SysResult<Vec<String>> {
     if ptr.is_null() {
         return Ok(Vec::new());
     }
@@ -44,16 +76,30 @@ fn translated_string_array(token: usize, mut ptr: *const usize) -> SysResult<Vec
         if string_ptr == 0 {
             break;
         }
-        strings.push(read_user_c_string(
-            token,
-            string_ptr as *const u8,
-            PATH_MAX,
-        )?);
+        let string = read_user_c_string(token, string_ptr as *const u8, PATH_MAX)?;
+        // UNFINISHED: Linux derives exec argument limits from ARG_MAX,
+        // MAX_ARG_STRLEN, and RLIMIT_STACK. This contest kernel bounds the
+        // copied argv+envp payload to the mapped user-stack window so malformed
+        // callers cannot allocate unbounded kernel memory before stack layout
+        // returns E2BIG.
+        budget.charge(string.len())?;
+        strings.push(string);
         unsafe {
             ptr = ptr.add(1);
         }
     }
     Ok(strings)
+}
+
+fn read_exec_args_envs(
+    token: usize,
+    args: *const usize,
+    envs: *const usize,
+) -> SysResult<(Vec<String>, Vec<String>)> {
+    let mut budget = ExecStringBudget::new();
+    let args_vec = read_exec_string_array(token, args, &mut budget)?;
+    let envs_vec = read_exec_string_array(token, envs, &mut budget)?;
+    Ok((args_vec, envs_vec))
 }
 
 fn is_space_or_tab(byte: u8) -> bool {
@@ -167,24 +213,6 @@ fn push_missing_library_path(envs: &mut Vec<String>, root: &str) {
     }
 }
 
-fn has_execute_permission(stat: &FileStat) -> bool {
-    let credentials = current_process().credentials();
-    if credentials.fsuid == 0 {
-        return stat.mode & 0o111 != 0;
-    }
-
-    let granted = if credentials.fsuid == stat.uid {
-        (stat.mode >> 6) & 0o7
-    } else if credentials.fsgid == stat.gid
-        || credentials.groups.iter().any(|group| *group == stat.gid)
-    {
-        (stat.mode >> 3) & 0o7
-    } else {
-        stat.mode & 0o7
-    };
-    granted & 0o1 != 0
-}
-
 fn check_exec_stat(stat: &FileStat) -> SysResult<()> {
     if stat.mode & S_IFMT != S_IFREG {
         return Err(SysError::EACCES);
@@ -193,10 +221,8 @@ fn check_exec_stat(stat: &FileStat) -> SysResult<()> {
     // UNFINISHED: Linux also folds path-prefix search permissions, ACLs,
     // capabilities, and noexec mounts into exec permission checks. The current
     // check covers the regular-file DAC and text-busy paths exercised here.
-    if !has_execute_permission(stat) {
-        return Err(SysError::EACCES);
-    }
-    Ok(())
+    let credentials = current_process().credentials();
+    check_execute_permission(stat, AccessSubject::from_fs_credentials(&credentials))
 }
 
 fn check_exec_file_in(
@@ -577,8 +603,7 @@ fn normalize_exec_envs(path: &str, mut envs: Vec<String>) -> Vec<String> {
 pub fn sys_execve(path: *const u8, args: *const usize, envs: *const usize) -> SysResult {
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
-    let args_vec = translated_string_array(token, args)?;
-    let envs_vec = translated_string_array(token, envs)?;
+    let (args_vec, envs_vec) = read_exec_args_envs(token, args, envs)?;
     exec_path(path, args_vec, envs_vec)
 }
 
@@ -609,8 +634,7 @@ pub fn sys_execveat(
 
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
-    let args_vec = translated_string_array(token, args)?;
-    let envs_vec = translated_string_array(token, envs)?;
+    let (args_vec, envs_vec) = read_exec_args_envs(token, args, envs)?;
 
     if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
