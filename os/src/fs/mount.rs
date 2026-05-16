@@ -6,7 +6,7 @@ use super::fat::FatMount;
 use super::overlayfs::OverlayFs;
 use super::path::WorkingDir;
 use super::procfs::ProcFs;
-use super::tmpfs::{TmpFs, EXT234_SUPER_MAGIC};
+use super::tmpfs::{EXT234_SUPER_MAGIC, TmpFs};
 use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult, VfsNodeId};
 use crate::drivers::block::BLOCK_DEVICES;
 use crate::sync::{SleepMutex, UPIntrFreeCell};
@@ -181,11 +181,7 @@ impl MountTarget {
 }
 
 fn mount_options(read_only: bool) -> &'static str {
-    if read_only {
-        "ro"
-    } else {
-        "rw"
-    }
+    if read_only { "ro" } else { "rw" }
 }
 
 fn clear_dentry_cache_on_mount_change<T>(result: Result<T, MountError>) -> Result<T, MountError> {

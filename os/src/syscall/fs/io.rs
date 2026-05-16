@@ -1,19 +1,19 @@
 use crate::config::PAGE_SIZE;
-use crate::fs::{File, FileStat, OpenFlags, PollEvents, SeekWhence, S_IFDIR, S_IFMT, S_IFREG};
+use crate::fs::{File, FileStat, OpenFlags, PollEvents, S_IFDIR, S_IFMT, S_IFREG, SeekWhence};
 use crate::mm::UserBuffer;
-use crate::task::{current_add_signal, current_user_token, FdTableEntry, SignalFlags};
+use crate::task::{FdTableEntry, SignalFlags, current_add_signal, current_user_token};
 use alloc::{vec, vec::Vec};
 use core::ptr::read_volatile;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    read_user_array_item, read_user_value, translated_byte_buffer_checked,
-    translated_byte_buffer_checked_with_mmap_fault, write_user_value, UserBufferAccess,
+    UserBufferAccess, read_user_array_item, read_user_value, translated_byte_buffer_checked,
+    translated_byte_buffer_checked_with_mmap_fault, write_user_value,
 };
 use super::fanotify::{fanotify_notify_access, fanotify_notify_modify};
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::inotify::{inotify_notify_access, inotify_notify_modify};
-use super::uapi::{LinuxIovec, IOV_MAX};
+use super::uapi::{IOV_MAX, LinuxIovec};
 
 struct UserIovecs {
     entries: Vec<LinuxIovec>,
@@ -687,16 +687,19 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> SysRes
 
 pub fn sys_pwrite64(fd: usize, buf: *const u8, len: usize, offset: usize) -> SysResult {
     let mut offset = checked_position_offset(offset)?;
-    if len > 0 && buf.is_null() {
-        return Err(SysError::EFAULT);
-    }
-    let token = current_user_token();
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
     ensure_positioned_target(file.as_ref())?;
     if !file.writable() {
         return Err(SysError::EBADF);
     }
+    if len == 0 {
+        return Ok(0);
+    }
+    if buf.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    let token = current_user_token();
     if entry.status_flags().contains(OpenFlags::APPEND) {
         offset = file.stat()?.size as usize;
     }

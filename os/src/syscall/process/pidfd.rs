@@ -5,8 +5,8 @@ use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::install_file_fd;
 use crate::syscall::user_ptr::read_user_value;
 use crate::task::{
-    Credentials, ProcessControlBlock, SignalFlags, SignalInfo, current_process, current_user_token,
-    pid2process, queue_signal_to_task, wakeup_task,
+    Credentials, FdTableEntry, ProcessControlBlock, SignalFlags, SignalInfo, current_process,
+    current_user_token, pid2process, queue_signal_to_task, wakeup_task,
 };
 use alloc::format;
 use alloc::string::String;
@@ -55,8 +55,20 @@ fn install_pidfd_with_flags(pid: usize, open_flags: OpenFlags) -> SysResult<usiz
     install_file_fd(Arc::new(PidFdFile::new(pid)), open_flags, None).map(|fd| fd as usize)
 }
 
-pub(super) fn install_pidfd_for_current_process(pid: usize) -> SysResult<usize> {
-    install_pidfd_with_flags(pid, OpenFlags::CLOEXEC)
+pub(super) fn reserve_pidfd_for_current_process() -> SysResult<usize> {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    inner.alloc_fd_from(0).ok_or(SysError::EMFILE)
+}
+
+pub(super) fn install_reserved_pidfd_for_current_process(fd: usize, pid: usize) {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let previous = inner.set_fd_entry(
+        fd,
+        FdTableEntry::from_file(Arc::new(PidFdFile::new(pid)), OpenFlags::CLOEXEC),
+    );
+    debug_assert!(previous.is_none());
 }
 
 pub(crate) fn install_pidfd_for_fanotify(pid: usize) -> SysResult<usize> {

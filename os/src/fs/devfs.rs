@@ -1,21 +1,21 @@
 use super::dirent::{
-    write_dir_entries, RawDirEntry, DT_BLK, DT_CHR, DT_DIR, LINUX_DIRENT64_ALIGN,
-    LINUX_DIRENT64_HEADER_SIZE,
+    DT_BLK, DT_CHR, DT_DIR, LINUX_DIRENT64_ALIGN, LINUX_DIRENT64_HEADER_SIZE, RawDirEntry,
+    write_dir_entries,
 };
 use super::mount::MountId;
 use super::path::WorkingDir;
 use super::status_flags::StatusFlagsCell;
 use super::vfs::{FileSystemBackend, FileSystemStat, FsNodeKind, VfsNodeId};
 use super::{
-    console_tty_poll, console_tty_read, File, FileStat, FsError, FsResult, OpenFlags, PollEvents,
-    SeekWhence, S_IFBLK, S_IFCHR, S_IFDIR,
+    File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFBLK, S_IFCHR, S_IFDIR,
+    SeekWhence, console_tty_poll, console_tty_read,
 };
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
-    block_current_task_no_schedule, current_has_unmasked_signal, schedule, wakeup_task,
-    TaskControlBlock,
+    TaskControlBlock, block_current_task_no_schedule, current_has_unmasked_signal, schedule,
+    wakeup_task,
 };
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -71,6 +71,7 @@ struct LoopDeviceState {
     flags: u32,
     read_ahead: usize,
     block_size: usize,
+    size: u64,
     size_limit: u64,
 }
 
@@ -82,6 +83,7 @@ impl LoopDeviceState {
             flags: 0,
             read_ahead: LOOP_DEVICE_DEFAULT_READ_AHEAD,
             block_size: LOOP_DEVICE_BLOCK_SIZE_DEFAULT,
+            size: LOOP_DEVICE_SIZE_FALLBACK,
             size_limit: 0,
         }
     }
@@ -92,6 +94,14 @@ impl LoopDeviceState {
 
     fn read_only(&self) -> bool {
         self.flags & LOOP_FLAG_READ_ONLY != 0
+    }
+
+    fn visible_size(&self) -> u64 {
+        if self.size_limit == 0 {
+            self.size
+        } else {
+            self.size.min(self.size_limit)
+        }
     }
 
     fn set_flag(&mut self, flag: u32, enabled: bool) {
@@ -1181,17 +1191,7 @@ fn loop0_backend() -> FsResult<Arc<dyn File + Send + Sync>> {
 }
 
 fn loop0_size() -> u64 {
-    let (backend, size_limit) =
-        LOOP0_STATE.exclusive_session(|state| (state.backend.clone(), state.size_limit));
-    let size = backend
-        .and_then(|file| file.stat().ok())
-        .map(|stat| stat.size)
-        .unwrap_or(LOOP_DEVICE_SIZE_FALLBACK);
-    if size_limit == 0 {
-        size
-    } else {
-        size.min(size_limit)
-    }
+    LOOP0_STATE.exclusive_session(|state| state.visible_size())
 }
 
 fn read_loop0_at(offset: usize, buf: &mut [u8]) -> usize {
@@ -1221,14 +1221,16 @@ fn write_loop0_at(offset: usize, buf: &[u8]) -> usize {
         super::mount::reset_ext_scratch_mount("/dev/loop0");
     }
     let size = loop0_size() as usize;
-    if offset < size {
-        return buf.len().min(size - offset);
-    }
-    // CONTEXT: BusyBox mkfs.ext2 uses full_write(), which retries forever if a
-    // block-device write returns 0. Writes that start before the visible loop
-    // capacity still report a Linux-like short count for LOOP_SET_CAPACITY
-    // tests; only EOF-only scratch writes are accepted to keep mkfs setup moving.
-    buf.len()
+    let write_size = if offset < size {
+        buf.len().min(size - offset)
+    } else {
+        // CONTEXT: BusyBox mkfs.ext2 uses full_write(), which retries forever if a
+        // block-device write returns 0. Writes that start before the visible loop
+        // capacity still report a Linux-like short count for LOOP_SET_CAPACITY
+        // tests; only EOF-only scratch writes are accepted to keep mkfs setup moving.
+        buf.len()
+    };
+    write_size
 }
 
 fn read_loop0(offset: &UPIntrFreeCell<usize>, mut user_buf: UserBuffer) -> usize {
@@ -1424,11 +1426,13 @@ pub(crate) fn attach_loop_device(
     if id != 0 {
         return Err(FsError::NoDeviceOrAddress);
     }
+    let size = backend.stat().map(|stat| stat.size)?;
     super::mount::reset_ext_scratch_mount("/dev/loop0");
     LOOP0_STATE.exclusive_session(|state| {
         state.reset();
         state.backend = Some(backend);
         state.backing_path = backing_path;
+        state.size = size;
         state.set_flag(LOOP_FLAG_READ_ONLY, read_only);
     });
     Ok(())
@@ -1455,6 +1459,18 @@ pub(crate) fn loop_device_size(id: usize) -> FsResult<u64> {
         return Err(FsError::NoDeviceOrAddress);
     }
     Ok(loop0_size())
+}
+
+pub(crate) fn loop_device_refresh_size(id: usize) -> FsResult<u64> {
+    if id != 0 {
+        return Err(FsError::NoDeviceOrAddress);
+    }
+    let backend = loop0_backend()?;
+    let size = backend.stat().map(|stat| stat.size)?;
+    Ok(LOOP0_STATE.exclusive_session(|state| {
+        state.size = size;
+        state.visible_size()
+    }))
 }
 
 pub(crate) fn loop_device_flags(id: usize) -> FsResult<u32> {
@@ -1511,7 +1527,7 @@ pub(crate) fn loop_device_change_fd(
     if id != 0 || !loop_device_is_attached(id) || !loop_device_is_read_only(id) {
         return Err(FsError::InvalidInput);
     }
-    let old_size = loop0_size();
+    let old_size = LOOP0_STATE.exclusive_session(|state| state.size);
     let new_size = backend.stat().map(|stat| stat.size)?;
     if new_size != old_size {
         return Err(FsError::InvalidInput);
@@ -1519,6 +1535,7 @@ pub(crate) fn loop_device_change_fd(
     LOOP0_STATE.exclusive_session(|state| {
         state.backend = Some(backend);
         state.backing_path = backing_path;
+        state.size = new_size;
     });
     Ok(())
 }

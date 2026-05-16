@@ -809,7 +809,7 @@ fn handle_loop_ioctl(loop_id: usize, request: usize, argp: usize) -> SysResult {
             Ok(0)
         }
         LOOP_SET_CAPACITY => {
-            crate::fs::loop_device_size(loop_id)?;
+            crate::fs::loop_device_refresh_size(loop_id)?;
             Ok(0)
         }
         LOOP_SET_DIRECT_IO => {

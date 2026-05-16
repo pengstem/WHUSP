@@ -543,6 +543,7 @@ fn exit_current(exit_code: i32, group_exit: bool) {
         }
         release_record_locks_for_process(pid);
         release_flock_locks_for_closed_fd_table(&fd_table);
+        process.release_vfork_parent();
 
         // Move orphaned children under the nearest live subreaper, or init.
         let reaper = nearest_child_reaper(parent.clone());

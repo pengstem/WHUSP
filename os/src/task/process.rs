@@ -1,7 +1,7 @@
 use super::id::RecycleAllocator;
 use super::{
     FD_LIMIT, FdTableEntry, PidHandle, SIGNAL_INFO_SLOTS, SignalAction, TaskControlBlock,
-    TaskStatus,
+    TaskStatus, wakeup_task,
 };
 use crate::config::USER_STACK_SIZE;
 use crate::fs::{MountNamespaceId, PathContext, ROOT_MOUNT_NAMESPACE, VfsNodeId, WorkingDir};
@@ -560,6 +560,7 @@ pub struct ProcessControlBlockInner {
     pub signal_actions: [SignalAction; SIGNAL_INFO_SLOTS],
     pub cpu_times: ProcessCpuTimes,
     pub(crate) timers: ProcessTimers,
+    pub(crate) vfork_parent: Option<Arc<TaskControlBlock>>,
     pub(crate) pid_namespace_id: usize,
     pub(crate) pid_namespace_parent_id: Option<usize>,
     pub(crate) user_namespace_id: usize,
@@ -763,6 +764,21 @@ impl ProcessControlBlock {
             .parent
             .as_ref()
             .and_then(Weak::upgrade)
+    }
+
+    pub(crate) fn main_task(&self) -> Arc<TaskControlBlock> {
+        self.inner_exclusive_access().get_task(0)
+    }
+
+    pub(crate) fn begin_vfork(&self, parent_task: Arc<TaskControlBlock>) {
+        self.inner_exclusive_access().vfork_parent = Some(parent_task);
+    }
+
+    pub(crate) fn release_vfork_parent(&self) {
+        let parent_task = self.inner_exclusive_access().vfork_parent.take();
+        if let Some(parent_task) = parent_task {
+            wakeup_task(parent_task);
+        }
     }
 
     pub fn getppid(&self) -> usize {

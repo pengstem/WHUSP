@@ -2,13 +2,14 @@ use crate::fs::{VfsNodeId, assign_pid_to_cgroup, clone_mount_namespace};
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{read_user_value, write_user_value, write_user_value_in_memory_set};
 use crate::task::{
-    CloneArgs, CloneFlags, ProcessControlBlock, add_task, clone_current_thread, current_process,
-    current_user_token, suspend_current_and_run_next,
+    CloneArgs, CloneFlags, ProcessControlBlock, add_task, block_current_task_no_schedule,
+    clone_current_thread, current_process, current_task, current_user_token, schedule,
+    suspend_current_and_run_next,
 };
 use alloc::sync::Arc;
 use core::mem::size_of;
 
-use super::pidfd::install_pidfd_for_current_process;
+use super::pidfd::{install_reserved_pidfd_for_current_process, reserve_pidfd_for_current_process};
 
 const CLONE_ARGS_MIN_SIZE: usize = 64;
 const CLONE_PIDFD: u64 = 0x0000_1000;
@@ -194,6 +195,11 @@ fn sys_clone_process_inner(
     pidfd: Option<*mut i32>,
     cgroup: Option<VfsNodeId>,
 ) -> SysResult {
+    let vfork_parent = if args.flags.contains(CloneFlags::CLONE_VFORK) {
+        Some(current_task().ok_or(SysError::ESRCH)?)
+    } else {
+        None
+    };
     let current_process = current_process();
     let child_parent = if args.flags.contains(CloneFlags::CLONE_PARENT) {
         current_process.parent_process().ok_or(SysError::EINVAL)?
@@ -206,9 +212,16 @@ fn sys_clone_process_inner(
         current_process.mount_namespace_id()
     };
     let new_process = current_process
-        .fork(child_parent, mount_namespace_id, args.exit_signal)
+        .fork(
+            Arc::clone(&child_parent),
+            mount_namespace_id,
+            args.exit_signal,
+        )
         .ok_or(SysError::ENOMEM)?;
     let new_pid = new_process.getpid();
+    if let Some(parent_task) = vfork_parent {
+        new_process.begin_vfork(parent_task);
+    }
     if args.flags.contains(CloneFlags::CLONE_NEWPID) {
         // CONTEXT: LTP ioctl_ns checks only the init process of a newly
         // cloned PID namespace. Track a lightweight namespace identity so
@@ -222,12 +235,16 @@ fn sys_clone_process_inner(
         new_process.enter_new_user_namespace(new_pid);
     }
     new_process.configure_cloned_main_task(args);
-    if let Some(pidfd) = pidfd {
-        let fd = install_pidfd_for_current_process(new_pid)?;
-        write_user_value(current_user_token(), pidfd, &(fd as i32))?;
-    }
+    let reserved_pidfd = if pidfd.is_some() {
+        Some(reserve_pidfd_for_current_process()?)
+    } else {
+        None
+    };
     if let Some(cgroup) = cgroup {
         assign_pid_to_cgroup(cgroup, new_pid)?;
+    }
+    if let (Some(pidfd), Some(fd)) = (pidfd, reserved_pidfd) {
+        write_user_value(current_user_token(), pidfd, &(fd as i32))?;
     }
 
     if args.flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
@@ -242,6 +259,18 @@ fn sys_clone_process_inner(
     }
     if args.flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
         write_user_value_to_process(&new_process, args.ctid as *mut i32, &(new_pid as i32))?;
+    }
+    if let Some(fd) = reserved_pidfd {
+        install_reserved_pidfd_for_current_process(fd, new_pid);
+    }
+    let child_task = new_process.main_task();
+    new_process.publish_fork_child(&child_parent);
+    if args.flags.contains(CloneFlags::CLONE_VFORK) {
+        let (_blocked_parent, parent_cx_ptr) = block_current_task_no_schedule();
+        add_task(child_task);
+        schedule(parent_cx_ptr);
+    } else {
+        add_task(child_task);
     }
     Ok(new_pid as isize)
 }

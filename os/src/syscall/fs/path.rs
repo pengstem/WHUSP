@@ -1,8 +1,8 @@
 use super::super::errno::{SysError, SysResult};
 use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{
-    copy_to_user, read_user_c_string, read_user_value, translated_byte_buffer_checked,
-    UserBufferAccess, PATH_MAX,
+    PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, read_user_value,
+    translated_byte_buffer_checked,
 };
 use super::fanotify::{
     fanotify_notify_create, fanotify_notify_delete, fanotify_notify_modify, fanotify_notify_move,
@@ -13,26 +13,26 @@ use super::inotify::{
     inotify_notify_attrib, inotify_notify_create, inotify_notify_delete, inotify_notify_modify,
     inotify_notify_move, inotify_notify_open, inotify_notify_open_at,
 };
-use super::permissions::{check_access_mode, AccessSubject};
+use super::permissions::{AccessSubject, check_access_mode};
 use super::stat::resolve_stat_from;
 use super::uapi::{
     AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
-    F_OK, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, R_OK, UTIME_NOW, UTIME_OMIT,
-    VALID_ACCESS_MODE, VALID_FACCESSAT2_FLAGS, VALID_FACCESSAT_FLAGS, VALID_LINKAT_FLAGS,
+    F_OK, R_OK, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, UTIME_NOW, UTIME_OMIT,
+    VALID_ACCESS_MODE, VALID_FACCESSAT_FLAGS, VALID_FACCESSAT2_FLAGS, VALID_LINKAT_FLAGS,
     VALID_RENAME_FLAGS, VALID_UTIMENSAT_FLAGS, W_OK, X_OK,
 };
 use crate::fs::{
-    chown_in, create_node_in, link_file_in, link_open_file_in, lookup_dir_with_stat_in,
+    FS_APPEND_FL, FS_IMMUTABLE_FL, File, FileCreateAttrs, FileTimestamp, FsError, FsNodeKind,
+    OpenFlags, PathContext, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK,
+    WorkingDir, chown_in, create_node_in, link_file_in, link_open_file_in, lookup_dir_with_stat_in,
     lookup_dir_with_stat_path_in, lookup_path_in, mkdir_in, normalize_path_at_root,
     open_devfs_child, open_devfs_input_child, open_devfs_misc_child, open_devfs_net_child,
     open_devfs_pts_child, open_file_in, open_file_in_with_attrs, open_static_path,
     open_tmpfile_in_with_attrs, path_inside_root, rename_in, rmdir_in, symlink_in, truncate_in,
-    unlink_file_in, File, FileCreateAttrs, FileTimestamp, FsError, FsNodeKind, OpenFlags,
-    PathContext, WorkingDir, FS_APPEND_FL, FS_IMMUTABLE_FL, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
-    S_IFMT, S_IFREG, S_IFSOCK,
+    unlink_file_in,
 };
 use crate::mm::UserBuffer;
-use crate::task::{current_process, current_user_token, PathSnapshot, CAP_SYS_CHROOT};
+use crate::task::{CAP_SYS_CHROOT, PathSnapshot, current_process, current_user_token};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};

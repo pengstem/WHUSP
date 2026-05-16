@@ -123,6 +123,7 @@ impl ProcessControlBlock {
                     signal_actions: [SignalAction::default(); super::SIGNAL_INFO_SLOTS],
                     cpu_times: ProcessCpuTimes::default(),
                     timers: ProcessTimers::default(),
+                    vfork_parent: None,
                     pid_namespace_id: 1,
                     pid_namespace_parent_id: None,
                     user_namespace_id: 1,
@@ -178,10 +179,24 @@ impl ProcessControlBlock {
         process
     }
 
-    /// Forks a single-threaded process and installs the child in PID lookup.
+    /// Publishes a forked child after clone-time setup has succeeded.
+    pub fn publish_fork_child(self: &Arc<Self>, child_parent: &Arc<Self>) {
+        let executable_node = self.inner_exclusive_access().executable_node;
+        if let Some(node) = executable_node {
+            track_regular_file_executable(node);
+        }
+        child_parent
+            .inner_exclusive_access()
+            .children
+            .push(Arc::clone(self));
+        insert_into_pid2process(self.getpid(), Arc::clone(self));
+    }
+
+    /// Forks a single-threaded process without making the child runnable.
     ///
     /// The parent process lock is released before creating the child task so
-    /// task construction and scheduler insertion cannot re-enter the parent.
+    /// task construction cannot re-enter the parent. The caller publishes the
+    /// child and makes it runnable after clone-specific metadata is installed.
     pub fn fork(
         self: &Arc<Self>,
         child_parent: Arc<Self>,
@@ -268,6 +283,7 @@ impl ProcessControlBlock {
                     signal_actions,
                     cpu_times: ProcessCpuTimes::default(),
                     timers: ProcessTimers::default(),
+                    vfork_parent: None,
                     pid_namespace_id,
                     pid_namespace_parent_id,
                     user_namespace_id,
@@ -277,14 +293,6 @@ impl ProcessControlBlock {
                 })
             },
         });
-        if let Some(node) = executable_node {
-            track_regular_file_executable(node);
-        }
-        child_parent
-            .inner_exclusive_access()
-            .children
-            .push(Arc::clone(&child));
-
         let task = Arc::new(TaskControlBlock::new(
             Arc::clone(&child),
             ustack_base,
@@ -313,8 +321,6 @@ impl ProcessControlBlock {
             task_inner.sched_reset_on_fork = false;
         }
         drop(task_inner);
-        insert_into_pid2process(child.getpid(), Arc::clone(&child));
-        add_task(task);
         Some(child)
     }
 }

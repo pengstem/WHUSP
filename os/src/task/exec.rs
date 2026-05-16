@@ -1,14 +1,13 @@
 use super::{
-    current_task, prepare_exec_thread_group,
-    process::{comm_from_cmdline, empty_process_pkey_rights, ProcessControlBlock},
-    SigAltStack, SignalAction,
+    SigAltStack, SignalAction, current_task, prepare_exec_thread_group,
+    process::{ProcessControlBlock, comm_from_cmdline, empty_process_pkey_rights},
 };
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
-use crate::fs::{track_regular_file_executable, untrack_regular_file_executable, File, VfsNodeId};
-use crate::mm::{ElfLoadInfo, MemorySet, KERNEL_SPACE};
+use crate::fs::{File, VfsNodeId, track_regular_file_executable, untrack_regular_file_executable};
+use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet};
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{copy_to_user, write_user_value};
-use crate::trap::{trap_handler, TrapContext};
+use crate::trap::{TrapContext, trap_handler};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -350,6 +349,8 @@ impl ProcessControlBlock {
             trap_handler as usize,
         );
         *task_inner.get_trap_cx() = trap_cx;
+        drop(task_inner);
+        self.release_vfork_parent();
         Ok(())
     }
 }

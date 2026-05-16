@@ -1,9 +1,9 @@
+use crate::DEV_NON_BLOCKING_ACCESS;
 use crate::board::{BlockDeviceConfig, BlockDeviceImpl};
 use crate::drivers::block_cache;
-use crate::drivers::virtio::{mmio_transport, VirtioHal, VirtioTransport};
+use crate::drivers::virtio::{VirtioHal, VirtioTransport, mmio_transport};
 use crate::sync::{Condvar, UPIntrFreeCell};
 use crate::task::schedule;
-use crate::DEV_NON_BLOCKING_ACCESS;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;

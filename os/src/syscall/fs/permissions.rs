@@ -1,4 +1,4 @@
-use crate::fs::{mount_is_read_only, FileStat, MountId, S_IFMT, S_IFREG};
+use crate::fs::{FileStat, MountId, S_IFMT, S_IFREG, mount_is_read_only};
 use crate::syscall::errno::{SysError, SysResult};
 use crate::task::Credentials;
 
