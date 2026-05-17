@@ -2,9 +2,9 @@ use crate::fs::{VfsNodeId, assign_pid_to_cgroup, clone_mount_namespace};
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{read_user_value, write_user_value, write_user_value_in_memory_set};
 use crate::task::{
-    CloneArgs, CloneFlags, ProcessControlBlock, add_task, block_current_task_no_schedule,
-    clone_current_thread, current_process, current_task, current_user_token, schedule,
-    suspend_current_and_run_next,
+    CloneArgs, CloneFlags, ProcessControlBlock, TaskControlBlock, add_task,
+    block_current_task_no_schedule, clone_current_thread, current_process, current_task,
+    current_user_token, schedule, suspend_current_and_run_next,
 };
 use alloc::sync::Arc;
 use core::mem::size_of;
@@ -266,13 +266,31 @@ fn sys_clone_process_inner(
     let child_task = new_process.main_task();
     new_process.publish_fork_child(&child_parent);
     if args.flags.contains(CloneFlags::CLONE_VFORK) {
-        let (_blocked_parent, parent_cx_ptr) = block_current_task_no_schedule();
-        add_task(child_task);
-        schedule(parent_cx_ptr);
+        wait_for_vfork_child(&new_process, child_task);
     } else {
         add_task(child_task);
     }
     Ok(new_pid as isize)
+}
+
+fn wait_for_vfork_child(
+    child_process: &Arc<ProcessControlBlock>,
+    child_task: Arc<TaskControlBlock>,
+) {
+    let mut pending_child_task = Some(child_task);
+    loop {
+        // CONTEXT: Generic Blocked tasks can be woken by signal delivery. A
+        // vfork parent must still wait for the child to exec or exit, so every
+        // wake is treated as a hint and the explicit completion flag is checked.
+        let (_blocked_parent, parent_cx_ptr) = block_current_task_no_schedule();
+        if let Some(child_task) = pending_child_task.take() {
+            add_task(child_task);
+        }
+        schedule(parent_cx_ptr);
+        if !child_process.vfork_in_progress() {
+            break;
+        }
+    }
 }
 
 fn is_vm_vfork_process_clone(args: CloneArgs) -> bool {

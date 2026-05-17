@@ -124,6 +124,20 @@ impl TaskControlBlock {
         alloc_user_res: bool,
     ) -> Self {
         let res = TaskUserRes::new(Arc::clone(&process), ustack_base, alloc_user_res);
+        Self::from_user_res(process, res)
+    }
+
+    pub fn new_with_supplied_stack(
+        process: Arc<ProcessControlBlock>,
+        ustack_base: usize,
+        alloc_user_res: bool,
+    ) -> Self {
+        let res =
+            TaskUserRes::new_with_supplied_stack(Arc::clone(&process), ustack_base, alloc_user_res);
+        Self::from_user_res(process, res)
+    }
+
+    fn from_user_res(process: Arc<ProcessControlBlock>, res: TaskUserRes) -> Self {
         let tid = res.tid;
         let trap_cx_ppn = res.trap_cx_ppn();
         let kstack = kstack_alloc();

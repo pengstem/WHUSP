@@ -131,6 +131,7 @@ pub struct TaskUserRes {
     pub tid: usize,
     pub ustack_base: usize,
     pub process: Weak<ProcessControlBlock>,
+    user_stack_allocated: bool,
 }
 
 const USER_STACK_INITIAL_SIZE: usize = USER_STACK_SIZE;
@@ -159,10 +160,11 @@ impl TaskUserRes {
         alloc_user_res: bool,
     ) -> Self {
         let tid = process.inner_exclusive_access().alloc_tid();
-        let task_user_res = Self {
+        let mut task_user_res = Self {
             tid,
             ustack_base,
             process: Arc::downgrade(&process),
+            user_stack_allocated: true,
         };
         if alloc_user_res {
             task_user_res.alloc_user_res();
@@ -170,21 +172,50 @@ impl TaskUserRes {
         task_user_res
     }
 
-    pub fn alloc_user_res(&self) {
+    pub fn new_with_supplied_stack(
+        process: Arc<ProcessControlBlock>,
+        ustack_base: usize,
+        alloc_user_res: bool,
+    ) -> Self {
+        let tid = process.inner_exclusive_access().alloc_tid();
+        let mut task_user_res = Self {
+            tid,
+            ustack_base,
+            process: Arc::downgrade(&process),
+            user_stack_allocated: false,
+        };
+        if alloc_user_res {
+            task_user_res.alloc_user_res_without_stack();
+        }
+        task_user_res
+    }
+
+    pub fn alloc_user_res(&mut self) {
+        self.alloc_user_res_inner(true);
+    }
+
+    pub fn alloc_user_res_without_stack(&mut self) {
+        self.alloc_user_res_inner(false);
+    }
+
+    fn alloc_user_res_inner(&mut self, allocate_user_stack: bool) {
         let process = self.process.upgrade().unwrap();
         let mut process_inner = process.inner_exclusive_access();
-        // alloc user stack
-        // UNFINISHED: Linux user stacks grow on demand up to the rlimit. This
-        // kernel does not have a general stack-growth fault path yet, so map
-        // the bounded contest stack eagerly while preserving virtual stack
-        // spacing between threads.
-        let ustack_bottom = ustack_mapped_bottom_from_tid(self.ustack_base, self.tid);
-        let ustack_top = ustack_bottom_from_tid(self.ustack_base, self.tid) + USER_STACK_SIZE;
-        process_inner.memory_set.insert_framed_area(
-            ustack_bottom.into(),
-            ustack_top.into(),
-            MapPermission::R | MapPermission::W | MapPermission::U,
-        );
+        self.user_stack_allocated = allocate_user_stack;
+        if allocate_user_stack {
+            // alloc user stack
+            // UNFINISHED: Linux user stacks grow on demand up to the rlimit. This
+            // kernel does not have a general stack-growth fault path yet, so map
+            // the bounded contest stack eagerly while preserving virtual stack
+            // spacing between threads.
+            let ustack_bottom = ustack_mapped_bottom_from_tid(self.ustack_base, self.tid);
+            let ustack_top = ustack_bottom_from_tid(self.ustack_base, self.tid) + USER_STACK_SIZE;
+            process_inner.memory_set.insert_framed_area(
+                ustack_bottom.into(),
+                ustack_top.into(),
+                MapPermission::R | MapPermission::W | MapPermission::U,
+            );
+        }
         // alloc trap_cx
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
@@ -200,11 +231,13 @@ impl TaskUserRes {
         let process = self.process.upgrade().unwrap();
         let mut process_inner = process.inner_exclusive_access();
         // dealloc ustack manually
-        let ustack_bottom_va: VirtAddr =
-            ustack_mapped_bottom_from_tid(self.ustack_base, self.tid).into();
-        process_inner
-            .memory_set
-            .remove_area_with_start_vpn(ustack_bottom_va.into());
+        if self.user_stack_allocated {
+            let ustack_bottom_va: VirtAddr =
+                ustack_mapped_bottom_from_tid(self.ustack_base, self.tid).into();
+            process_inner
+                .memory_set
+                .remove_area_with_start_vpn(ustack_bottom_va.into());
+        }
         // dealloc trap_cx manually
         let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_tid(self.tid).into();
         process_inner

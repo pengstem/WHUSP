@@ -774,6 +774,10 @@ impl ProcessControlBlock {
         self.inner_exclusive_access().vfork_parent = Some(parent_task);
     }
 
+    pub(crate) fn vfork_in_progress(&self) -> bool {
+        self.inner_exclusive_access().vfork_parent.is_some()
+    }
+
     pub(crate) fn release_vfork_parent(&self) {
         let parent_task = self.inner_exclusive_access().vfork_parent.take();
         if let Some(parent_task) = parent_task {

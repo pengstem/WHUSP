@@ -105,7 +105,18 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     let parent_seccomp_mode = parent_inner.seccomp_mode;
     let parent_seccomp_filter = parent_inner.seccomp_filter.clone();
     drop(parent_inner);
-    let new_task = Arc::new(TaskControlBlock::new(process, ustack_base, true));
+    // CONTEXT: pthread_create() supplies a userspace child stack to clone().
+    // In that case the kernel still needs a per-thread TrapContext, but must
+    // not also map the contest default 4 MiB user stack for every pthread.
+    let new_task = if args.stack == 0 {
+        Arc::new(TaskControlBlock::new(process, ustack_base, true))
+    } else {
+        Arc::new(TaskControlBlock::new_with_supplied_stack(
+            process,
+            ustack_base,
+            true,
+        ))
+    };
     let mut new_task_inner = new_task.inner_exclusive_access();
     let new_ustack_top = new_task_inner
         .res

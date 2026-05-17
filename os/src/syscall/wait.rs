@@ -1,9 +1,9 @@
 use crate::mm::MemorySet;
 use crate::syscall::user_ptr::write_user_value_in_memory_set;
 use crate::task::{
-    ProcessControlBlock, SIGCHLD, SignalInfo, block_current_and_run_next,
-    current_has_nonrestartable_signal, current_process, remove_from_pid2process,
-    signal_child_status, signal_wait_status,
+    ProcessControlBlock, SIGCHLD, SignalInfo, block_current_task_no_schedule, current_process,
+    remove_from_pid2process, schedule, signal_child_status, signal_wait_status,
+    task_has_wait_interrupt_signal, wakeup_task,
 };
 use alloc::sync::Arc;
 
@@ -190,18 +190,26 @@ pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsag
         if options & WNOHANG != 0 {
             return Ok(0);
         }
+        // CONTEXT: LTP's heartbeat uses SIGUSR1 through musl signal(2), which
+        // installs SA_RESTART. Keep that heartbeat from aborting the harness,
+        // but return to trap delivery for timeout handlers and fatal signals.
+        // UNFINISHED: Linux can run restartable handlers and transparently
+        // restart wait4(); this kernel only preserves the SIGUSR1 heartbeat.
+        // CONTEXT: Mark the task blocked before releasing the parent child-list
+        // lock. Otherwise a timer tick can run the exiting child between the
+        // zombie scan and the sleep transition, causing the child's wakeup to be
+        // lost and the parent to sleep forever.
+        let (task, task_cx_ptr) = block_current_task_no_schedule();
         drop(inner);
+        let interrupted = task_has_wait_interrupt_signal(&task, &process);
+        if interrupted {
+            wakeup_task(task);
+        }
         drop(process);
-        // CONTEXT: LTP's heartbeat uses signal(2), which installs SA_RESTART
-        // on musl. Returning EINTR for that SIGUSR1 makes the harness abandon
-        // its test child and remove the temporary chroot directory underneath it.
-        // UNFINISHED: Linux still runs the user handler before transparently
-        // restarting wait4(); this kernel only suppresses EINTR for restartable
-        // handlers and delivers the pending handler when wait4() returns.
-        if current_has_nonrestartable_signal() {
+        schedule(task_cx_ptr);
+        if interrupted {
             return Err(SysError::EINTR);
         }
-        block_current_and_run_next();
     }
 }
 
@@ -292,11 +300,18 @@ pub fn sys_waitid(
             write_rusage(&mut inner.memory_set, rusage)?;
             return Ok(0);
         }
+        // See sys_wait4(): the blocked state must be published before dropping
+        // the child-list lock so exit-time wakeups cannot be missed.
+        let (task, task_cx_ptr) = block_current_task_no_schedule();
         drop(inner);
+        let interrupted = task_has_wait_interrupt_signal(&task, &process);
+        if interrupted {
+            wakeup_task(task);
+        }
         drop(process);
-        if current_has_nonrestartable_signal() {
+        schedule(task_cx_ptr);
+        if interrupted {
             return Err(SysError::EINTR);
         }
-        block_current_and_run_next();
     }
 }

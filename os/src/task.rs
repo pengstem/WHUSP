@@ -557,14 +557,8 @@ fn exit_current(exit_code: i32, group_exit: bool) {
         drop(fd_table);
 
         if let Some(parent) = parent {
-            let parent_task = {
-                let parent_inner = parent.inner_exclusive_access();
-                parent_inner
-                    .tasks
-                    .first()
-                    .and_then(|task| task.as_ref().map(Arc::clone))
-            };
-            if let Some(parent_task) = parent_task {
+            let parent_tasks = parent.tasks_snapshot();
+            if let Some(parent_task) = parent_tasks.first() {
                 if let Some(signal) = SignalFlags::from_signum(exit_signal) {
                     if !signal.is_empty() {
                         queue_signal_to_task(
@@ -574,6 +568,8 @@ fn exit_current(exit_code: i32, group_exit: bool) {
                         );
                     }
                 }
+            }
+            for parent_task in parent_tasks {
                 let is_blocked =
                     parent_task.inner_exclusive_access().task_status == TaskStatus::Blocked;
                 if is_blocked {
@@ -668,13 +664,11 @@ pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
     ))
 }
 
-fn current_has_deliverable_signal_matching(predicate: impl Fn(SignalAction) -> bool) -> bool {
-    let Some(task) = current_task() else {
-        return false;
-    };
-    let Some(process) = task.process.upgrade() else {
-        return false;
-    };
+fn task_has_deliverable_signal_matching(
+    task: &Arc<TaskControlBlock>,
+    process: &Arc<ProcessControlBlock>,
+    predicate: impl Fn(SignalAction) -> bool,
+) -> bool {
     let pending = {
         let task_inner = task.inner_exclusive_access();
         SignalFlags::from_bits_retain(
@@ -703,6 +697,16 @@ fn current_has_deliverable_signal_matching(predicate: impl Fn(SignalAction) -> b
     false
 }
 
+fn current_has_deliverable_signal_matching(predicate: impl Fn(SignalAction) -> bool) -> bool {
+    let Some(task) = current_task() else {
+        return false;
+    };
+    let Some(process) = task.process.upgrade() else {
+        return false;
+    };
+    task_has_deliverable_signal_matching(&task, &process, predicate)
+}
+
 pub fn current_has_deliverable_signal() -> bool {
     current_has_deliverable_signal_matching(|_| true)
 }
@@ -714,6 +718,14 @@ pub fn current_has_interrupting_signal() -> bool {
     let Some(process) = task.process.upgrade() else {
         return false;
     };
+    task_has_interrupting_signal_matching(&task, &process, |_, _| true)
+}
+
+fn task_has_interrupting_signal_matching(
+    task: &Arc<TaskControlBlock>,
+    process: &Arc<ProcessControlBlock>,
+    user_handler_interrupts: impl Fn(SignalFlags, SignalAction) -> bool,
+) -> bool {
     let pending = {
         let inner = task.inner_exclusive_access();
         SignalFlags::from_bits_retain(inner.pending_signals.bits() & !inner.signal_mask.bits())
@@ -730,7 +742,9 @@ pub fn current_has_interrupting_signal() -> bool {
             continue;
         }
         if action.has_user_handler() {
-            if crate::arch::signal::can_deliver_user_signal(signum) {
+            if crate::arch::signal::can_deliver_user_signal(signum)
+                && user_handler_interrupts(signal, action)
+            {
                 return true;
             }
             continue;
@@ -749,8 +763,38 @@ pub fn current_has_unmasked_signal() -> bool {
     })
 }
 
-pub fn current_has_nonrestartable_signal() -> bool {
-    current_has_deliverable_signal_matching(|action| action.flags & SA_RESTART == 0)
+pub(crate) fn task_has_wait_interrupt_signal(
+    task: &Arc<TaskControlBlock>,
+    process: &Arc<ProcessControlBlock>,
+) -> bool {
+    let interrupted = task_has_interrupting_signal_matching(task, process, |signal, action| {
+        // CONTEXT: LTP uses SIGUSR1 as a musl signal(2) heartbeat, which sets
+        // SA_RESTART. Let wait* keep sleeping for that compatibility signal,
+        // but return to trap delivery for timeout handlers and fatal defaults.
+        !(signal == SignalFlags::SIGUSR1 && action.flags & SA_RESTART != 0)
+    });
+    if interrupted {
+        clear_restartable_wait_heartbeat(task, process);
+    }
+    interrupted
+}
+
+fn clear_restartable_wait_heartbeat(
+    task: &Arc<TaskControlBlock>,
+    process: &Arc<ProcessControlBlock>,
+) {
+    let signum = SignalFlags::SIGUSR1.bits().trailing_zeros() as usize;
+    let action = process.inner_exclusive_access().signal_actions[signum];
+    if !action.has_user_handler() || action.flags & SA_RESTART == 0 {
+        return;
+    }
+    let mut task_inner = task.inner_exclusive_access();
+    let unmasked = SignalFlags::from_bits_retain(
+        task_inner.pending_signals.bits() & !task_inner.signal_mask.bits(),
+    );
+    if unmasked.contains(SignalFlags::SIGUSR1) {
+        task_inner.clear_pending(signum as u32);
+    }
 }
 
 pub fn current_add_signal(signal: SignalFlags) {
