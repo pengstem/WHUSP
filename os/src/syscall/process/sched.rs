@@ -4,9 +4,11 @@ use crate::{
         uapi::LinuxTimeSpec,
         user_ptr::{read_user_value_with_mmap_fault, write_user_value_with_mmap_fault},
     },
-    task::{TaskControlBlock, current_task, current_user_token, processes_snapshot},
+    task::{
+        TaskControlBlock, current_process, current_task, current_user_token, processes_snapshot,
+    },
 };
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec, vec::Vec};
 use core::mem::size_of;
 
 const SCHED_OTHER: i32 = 0;
@@ -20,6 +22,11 @@ const RT_PRIORITY_MIN: isize = 1;
 const RT_PRIORITY_MAX: isize = 99;
 const RR_INTERVAL_NSEC: isize = 100_000_000;
 const AFFINITY_MASK_BYTES: usize = size_of::<usize>();
+const PRIO_PROCESS: i32 = 0;
+const PRIO_PGRP: i32 = 1;
+const PRIO_USER: i32 = 2;
+const NICE_MIN: i8 = -20;
+const NICE_MAX: i8 = 19;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -56,6 +63,89 @@ fn sched_priority_bounds(policy: i32) -> SysResult<(isize, isize)> {
         SCHED_OTHER | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => Ok((0, 0)),
         _ => Err(SysError::EINVAL),
     }
+}
+
+fn clamp_nice(prio: i32) -> i8 {
+    prio.clamp(NICE_MIN as i32, NICE_MAX as i32) as i8
+}
+
+fn linux_raw_priority_from_nice(nice: i8) -> isize {
+    20 - nice as isize
+}
+
+fn task_nice(task: &TaskControlBlock) -> i8 {
+    task.inner_exclusive_access().nice
+}
+
+fn target_tasks_for_priority(which: i32, who: isize) -> SysResult<Vec<Arc<TaskControlBlock>>> {
+    if who < 0 {
+        return Err(SysError::ESRCH);
+    }
+    match which {
+        PRIO_PROCESS => {
+            let task = if who == 0 {
+                current_task().ok_or(SysError::ESRCH)?
+            } else {
+                task_with_linux_tid(who as usize).ok_or(SysError::ESRCH)?
+            };
+            Ok(vec![task])
+        }
+        PRIO_PGRP => {
+            let pgid = if who == 0 {
+                current_process().process_group_id()
+            } else {
+                who as usize
+            };
+            let tasks = processes_snapshot()
+                .into_iter()
+                .filter(|process| process.process_group_id() == pgid)
+                .flat_map(|process| process.tasks_snapshot())
+                .collect::<Vec<_>>();
+            if tasks.is_empty() {
+                Err(SysError::ESRCH)
+            } else {
+                Ok(tasks)
+            }
+        }
+        PRIO_USER => {
+            let uid = if who == 0 {
+                current_process().credentials().ruid
+            } else {
+                who as u32
+            };
+            let tasks = processes_snapshot()
+                .into_iter()
+                .filter(|process| {
+                    let credentials = process.credentials();
+                    credentials.ruid == uid || credentials.euid == uid
+                })
+                .flat_map(|process| process.tasks_snapshot())
+                .collect::<Vec<_>>();
+            if tasks.is_empty() {
+                Err(SysError::ESRCH)
+            } else {
+                Ok(tasks)
+            }
+        }
+        _ => Err(SysError::EINVAL),
+    }
+}
+
+fn ensure_can_set_task_nice(task: &TaskControlBlock, new_nice: i8) -> SysResult<()> {
+    let caller = current_process().credentials();
+    let target_process = task.process.upgrade().ok_or(SysError::ESRCH)?;
+    let target = target_process.credentials();
+    let privileged = caller.euid == 0;
+
+    if !privileged && caller.euid != target.ruid && caller.euid != target.euid {
+        return Err(SysError::EPERM);
+    }
+
+    if !privileged && new_nice < task_nice(task) {
+        return Err(SysError::EACCES);
+    }
+
+    Ok(())
 }
 
 fn split_settable_policy(policy: i32) -> SysResult<(i32, bool)> {
@@ -194,5 +284,33 @@ pub fn sys_sched_rr_get_interval(pid: isize, interval: *mut LinuxTimeSpec) -> Sy
         tv_nsec: RR_INTERVAL_NSEC,
     };
     write_user_value_with_mmap_fault(current_user_token(), interval, &rr_interval)?;
+    Ok(0)
+}
+
+pub fn sys_getpriority(which: i32, who: isize) -> SysResult {
+    let targets = target_tasks_for_priority(which, who)?;
+    let best_nice = targets
+        .iter()
+        .map(|task| task_nice(task))
+        .min()
+        .ok_or(SysError::ESRCH)?;
+
+    // CONTEXT: Linux's raw getpriority syscall returns 40..1 so negative nice
+    // values cannot be confused with -errno. libc translates this back to
+    // user-visible nice values in the -20..19 range.
+    Ok(linux_raw_priority_from_nice(best_nice))
+}
+
+pub fn sys_setpriority(which: i32, who: isize, prio: i32) -> SysResult {
+    let new_nice = clamp_nice(prio);
+    let targets = target_tasks_for_priority(which, who)?;
+
+    for task in &targets {
+        ensure_can_set_task_nice(task, new_nice)?;
+    }
+    for task in targets {
+        task.inner_exclusive_access().nice = new_nice;
+    }
+
     Ok(0)
 }

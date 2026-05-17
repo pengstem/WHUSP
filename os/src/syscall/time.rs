@@ -1,12 +1,14 @@
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
-    ProcessCpuTimesSnapshot, block_current_and_run_next, current_has_deliverable_signal,
-    current_process, current_task, current_user_token,
+    ProcessCpuTimesSnapshot, TaskControlBlock, block_current_and_run_next,
+    current_has_deliverable_signal, current_process, current_task, current_user_token, pid2process,
+    processes_snapshot,
 };
 use crate::timer::{
     add_posix_timer, add_real_timer, add_timer, get_time_clock_ticks, get_time_ms, get_time_us,
     monotonic_time_nanos, set_wall_time_nanos, us_to_clock_ticks, wall_time_nanos,
 };
+use alloc::sync::Arc;
 use lazy_static::*;
 
 use super::errno::{SysError, SysResult};
@@ -23,6 +25,11 @@ const CLOCK_MONOTONIC_COARSE: i32 = 6;
 const CLOCK_BOOTTIME: i32 = 7;
 const CLOCK_REALTIME_ALARM: i32 = 8;
 const CLOCK_BOOTTIME_ALARM: i32 = 9;
+const CPUCLOCK_PROF: i32 = 0;
+const CPUCLOCK_VIRT: i32 = 1;
+const CPUCLOCK_SCHED: i32 = 2;
+const CPUCLOCK_CLOCK_MASK: i32 = 3;
+const CPUCLOCK_PERTHREAD_MASK: i32 = 4;
 const TIMER_ABSTIME: u32 = 1;
 const NSEC_PER_SEC: isize = 1_000_000_000;
 const NSEC_PER_MSEC: usize = 1_000_000;
@@ -705,6 +712,46 @@ fn process_cpu_timespec() -> LinuxTimeSpec {
     us_to_timespec(times.user_us.saturating_add(times.system_us))
 }
 
+fn task_with_linux_tid(tid: usize) -> Option<Arc<TaskControlBlock>> {
+    processes_snapshot()
+        .into_iter()
+        .flat_map(|process| process.tasks_snapshot())
+        .find(|task| task.linux_tid() == tid)
+}
+
+fn cpu_clock_target_id(clock_id: i32) -> SysResult<(bool, usize)> {
+    if clock_id >= 0 {
+        return Err(SysError::EINVAL);
+    }
+    match clock_id & CPUCLOCK_CLOCK_MASK {
+        CPUCLOCK_PROF | CPUCLOCK_VIRT | CPUCLOCK_SCHED => {}
+        _ => return Err(SysError::EINVAL),
+    }
+    let id = !(clock_id >> 3);
+    if id < 0 {
+        return Err(SysError::EINVAL);
+    }
+    Ok((clock_id & CPUCLOCK_PERTHREAD_MASK != 0, id as usize))
+}
+
+fn dynamic_cpu_clock_timespec(clock_id: i32) -> SysResult<LinuxTimeSpec> {
+    let (per_thread, id) = cpu_clock_target_id(clock_id)?;
+    if per_thread {
+        let task = task_with_linux_tid(id).ok_or(SysError::EINVAL)?;
+        Ok(us_to_timespec(task.cpu_time_us()))
+    } else {
+        let process = if id == 0 {
+            current_process()
+        } else {
+            pid2process(id).ok_or(SysError::EINVAL)?
+        };
+        let times = process.cpu_times_snapshot();
+        Ok(us_to_timespec(
+            times.user_us.saturating_add(times.system_us),
+        ))
+    }
+}
+
 fn remaining_until_timespec(expire_ms: usize) -> LinuxTimeSpec {
     let remaining_ms = expire_ms.saturating_sub(get_time_ms());
     let remaining_nanos = (remaining_ms as u64).saturating_mul(NSEC_PER_MSEC as u64);
@@ -747,6 +794,11 @@ pub fn sys_nanosleep(req: *const LinuxTimeSpec, rem: *mut LinuxTimeSpec) -> SysR
 pub fn sys_clock_gettime(clock_id: i32, tp: *mut LinuxTimeSpec) -> SysResult {
     if tp.is_null() {
         return Err(SysError::EFAULT);
+    }
+    if clock_id < 0 {
+        let timespec = dynamic_cpu_clock_timespec(clock_id)?;
+        write_user_value(current_user_token(), tp, &timespec)?;
+        return Ok(0);
     }
     let clock = ClockKind::from_raw(clock_id)?;
     let timespec = match clock {

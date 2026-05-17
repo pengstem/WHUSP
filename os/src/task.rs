@@ -62,24 +62,38 @@ pub use signal::{SI_TKILL, SIGRT_1, SIGRTMIN};
 pub(crate) use signal::{flags_to_linux_sigset, linux_sigset_to_flags};
 pub use task::{DEFAULT_TIMER_SLACK_NS, SeccompSockFilter, TaskControlBlock, TaskStatus};
 
-fn with_current_process(process_fn: impl FnOnce(&ProcessControlBlock)) {
-    if let Some(task) = current_task() {
-        if let Some(process) = task.process.upgrade() {
-            process_fn(&process);
-        }
+fn with_current_task_and_process(
+    task_fn: impl FnOnce(&TaskControlBlock),
+    process_fn: impl FnOnce(&ProcessControlBlock),
+) {
+    let Some(task) = current_task() else {
+        return;
+    };
+    task_fn(&task);
+    if let Some(process) = task.process.upgrade() {
+        process_fn(&process);
     }
 }
 
 pub fn account_current_user_time_until(now_us: usize) {
-    with_current_process(|process| process.account_user_time_until(now_us));
+    with_current_task_and_process(
+        |task| task.account_user_time_until(now_us),
+        |process| process.account_user_time_until(now_us),
+    );
 }
 
 pub fn account_current_system_time_until(now_us: usize) {
-    with_current_process(|process| process.account_system_time_until(now_us));
+    with_current_task_and_process(
+        |task| task.account_system_time_until(now_us),
+        |process| process.account_system_time_until(now_us),
+    );
 }
 
 fn try_account_current_system_time_until(now_us: usize) {
-    with_current_process(|process| process.try_account_system_time_until(now_us));
+    with_current_task_and_process(
+        |task| task.try_account_system_time_until(now_us),
+        |process| process.try_account_system_time_until(now_us),
+    );
 }
 
 pub fn account_current_system_time() {
@@ -91,11 +105,17 @@ fn try_account_current_system_time() {
 }
 
 pub fn mark_current_user_time_entry(now_us: usize) {
-    with_current_process(|process| process.mark_user_time_entry(now_us));
+    with_current_task_and_process(
+        |task| task.mark_user_time_entry(now_us),
+        |process| process.mark_user_time_entry(now_us),
+    );
 }
 
 pub fn mark_current_kernel_time_entry(now_us: usize) {
-    with_current_process(|process| process.mark_kernel_time_entry(now_us));
+    with_current_task_and_process(
+        |task| task.mark_kernel_time_entry(now_us),
+        |process| process.mark_kernel_time_entry(now_us),
+    );
 }
 
 pub fn suspend_current_and_run_next() {

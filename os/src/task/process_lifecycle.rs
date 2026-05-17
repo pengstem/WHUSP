@@ -249,6 +249,7 @@ impl ProcessControlBlock {
         let parent_sched_policy = parent_task_inner.sched_policy;
         let parent_sched_priority = parent_task_inner.sched_priority;
         let parent_sched_reset_on_fork = parent_task_inner.sched_reset_on_fork;
+        let parent_nice = parent_task_inner.nice;
         let parent_timer_slack_ns = parent_task_inner.timer_slack_ns;
         let parent_seccomp_mode = parent_task_inner.seccomp_mode;
         let parent_seccomp_filter = parent_task_inner.seccomp_filter.clone();
@@ -322,10 +323,12 @@ impl ProcessControlBlock {
             task_inner.sched_policy = 0;
             task_inner.sched_priority = 0;
             task_inner.sched_reset_on_fork = false;
+            task_inner.nice = parent_nice.max(0);
         } else {
             task_inner.sched_policy = parent_sched_policy;
             task_inner.sched_priority = parent_sched_priority;
             task_inner.sched_reset_on_fork = false;
+            task_inner.nice = parent_nice;
         }
         drop(task_inner);
         Some(child)

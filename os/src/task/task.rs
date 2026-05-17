@@ -15,6 +15,46 @@ use alloc::{
 
 pub const DEFAULT_TIMER_SLACK_NS: usize = 50_000;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TaskCpuTimes {
+    user_us: usize,
+    system_us: usize,
+    last_user_enter_us: Option<usize>,
+    last_kernel_enter_us: Option<usize>,
+}
+
+impl TaskCpuTimes {
+    pub fn mark_user_entry(&mut self, now_us: usize) {
+        self.last_user_enter_us = Some(now_us);
+        self.last_kernel_enter_us = None;
+    }
+
+    pub fn mark_kernel_entry(&mut self, now_us: usize) {
+        self.last_kernel_enter_us = Some(now_us);
+        self.last_user_enter_us = None;
+    }
+
+    pub fn account_user_until(&mut self, now_us: usize) {
+        if let Some(start_us) = self.last_user_enter_us.take() {
+            self.user_us = self.user_us.saturating_add(now_us.saturating_sub(start_us));
+        }
+        self.last_kernel_enter_us = Some(now_us);
+    }
+
+    pub fn account_system_until(&mut self, now_us: usize) {
+        if let Some(start_us) = self.last_kernel_enter_us.take() {
+            self.system_us = self
+                .system_us
+                .saturating_add(now_us.saturating_sub(start_us));
+        }
+        self.last_kernel_enter_us = Some(now_us);
+    }
+
+    pub fn total_us(&self) -> usize {
+        self.user_us.saturating_add(self.system_us)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct SeccompSockFilter {
     pub code: u16,
@@ -88,6 +128,8 @@ pub struct TaskControlBlockInner {
     pub sched_policy: i32,
     pub sched_priority: i32,
     pub sched_reset_on_fork: bool,
+    pub nice: i8,
+    pub cpu_times: TaskCpuTimes,
     pub timer_slack_ns: usize,
     pub default_timer_slack_ns: usize,
     pub seccomp_mode: u8,
@@ -165,6 +207,8 @@ impl TaskControlBlock {
                     sched_policy: 0,
                     sched_priority: 0,
                     sched_reset_on_fork: false,
+                    nice: 0,
+                    cpu_times: TaskCpuTimes::default(),
                     timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
                     default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
                     seccomp_mode: 0,
@@ -175,6 +219,42 @@ impl TaskControlBlock {
                 })
             },
         }
+    }
+}
+
+impl TaskControlBlock {
+    pub fn mark_user_time_entry(&self, now_us: usize) {
+        self.inner_exclusive_access()
+            .cpu_times
+            .mark_user_entry(now_us);
+    }
+
+    pub fn mark_kernel_time_entry(&self, now_us: usize) {
+        self.inner_exclusive_access()
+            .cpu_times
+            .mark_kernel_entry(now_us);
+    }
+
+    pub fn account_user_time_until(&self, now_us: usize) {
+        self.inner_exclusive_access()
+            .cpu_times
+            .account_user_until(now_us);
+    }
+
+    pub fn account_system_time_until(&self, now_us: usize) {
+        self.inner_exclusive_access()
+            .cpu_times
+            .account_system_until(now_us);
+    }
+
+    pub fn try_account_system_time_until(&self, now_us: usize) {
+        if let Some(mut inner) = self.inner.try_exclusive_access() {
+            inner.cpu_times.account_system_until(now_us);
+        }
+    }
+
+    pub fn cpu_time_us(&self) -> usize {
+        self.inner_exclusive_access().cpu_times.total_us()
     }
 }
 

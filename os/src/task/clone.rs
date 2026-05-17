@@ -101,6 +101,7 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     let parent_sched_policy = parent_inner.sched_policy;
     let parent_sched_priority = parent_inner.sched_priority;
     let parent_sched_reset_on_fork = parent_inner.sched_reset_on_fork;
+    let parent_nice = parent_inner.nice;
     let parent_timer_slack_ns = parent_inner.timer_slack_ns;
     let parent_seccomp_mode = parent_inner.seccomp_mode;
     let parent_seccomp_filter = parent_inner.seccomp_filter.clone();
@@ -130,6 +131,7 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     new_task_inner.sched_policy = parent_sched_policy;
     new_task_inner.sched_priority = parent_sched_priority;
     new_task_inner.sched_reset_on_fork = parent_sched_reset_on_fork;
+    new_task_inner.nice = parent_nice;
     new_task_inner.timer_slack_ns = parent_timer_slack_ns;
     new_task_inner.default_timer_slack_ns = parent_timer_slack_ns;
     new_task_inner.seccomp_mode = parent_seccomp_mode;

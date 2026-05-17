@@ -25,8 +25,8 @@ pub(crate) use pidfd::{install_pidfd_for_fanotify, pidfd_fdinfo};
 pub use pidfd::{sys_pidfd_open, sys_pidfd_send_signal};
 pub use resource::{sys_getrlimit, sys_prlimit64, sys_setrlimit};
 pub use sched::{
-    sys_sched_get_priority_max, sys_sched_get_priority_min, sys_sched_getaffinity,
+    sys_getpriority, sys_sched_get_priority_max, sys_sched_get_priority_min, sys_sched_getaffinity,
     sys_sched_getparam, sys_sched_getscheduler, sys_sched_rr_get_interval, sys_sched_setaffinity,
-    sys_sched_setparam, sys_sched_setscheduler,
+    sys_sched_setparam, sys_sched_setscheduler, sys_setpriority,
 };
 pub use system::{LinuxUtsName, sys_getrandom, sys_personality, sys_reboot, sys_syslog, sys_uname};

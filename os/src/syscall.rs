@@ -106,6 +106,8 @@ const SYSCALL_RT_SIGACTION: usize = 134;
 const SYSCALL_RT_SIGPROCMASK: usize = 135;
 const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
 const SYSCALL_RT_SIGRETURN: usize = 139;
+const SYSCALL_SETPRIORITY: usize = 140;
+const SYSCALL_GETPRIORITY: usize = 141;
 const SYSCALL_REBOOT: usize = 142;
 const SYSCALL_SETREGID: usize = 143;
 const SYSCALL_SETGID: usize = 144;
@@ -698,6 +700,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3],
         ),
         SYSCALL_RT_SIGRETURN => sys_rt_sigreturn(),
+        SYSCALL_SETPRIORITY => sys_setpriority(args[0] as i32, args[1] as isize, args[2] as i32),
+        SYSCALL_GETPRIORITY => sys_getpriority(args[0] as i32, args[1] as isize),
         SYSCALL_REBOOT => sys_reboot(args[0], args[1], args[2], args[3]),
         SYSCALL_SETREGID => sys_setregid(args[0] as i32, args[1] as i32),
         SYSCALL_SETGID => sys_setgid(args[0] as u32),
