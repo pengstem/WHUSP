@@ -18,6 +18,7 @@ const WALL: i32 = 0x40000000;
 
 const P_ALL: i32 = 0;
 const P_PID: i32 = 1;
+const P_PGID: i32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -120,8 +121,21 @@ fn wait4_child_matches(child: &Arc<ProcessControlBlock>, pid: isize, caller_pgid
     }
 }
 
-fn waitid_child_matches(child_pid: usize, idtype: i32, id: i32) -> bool {
-    idtype == P_ALL || (idtype == P_PID && child_pid == id as usize)
+fn waitid_child_matches(
+    child: &Arc<ProcessControlBlock>,
+    idtype: i32,
+    id: i32,
+    caller_pgid: usize,
+) -> bool {
+    match idtype {
+        P_ALL => true,
+        P_PID => child.getpid() == id as usize,
+        P_PGID => {
+            let pgid = if id == 0 { caller_pgid } else { id as usize };
+            child.process_group_id() == pgid
+        }
+        _ => false,
+    }
 }
 
 fn write_rusage(memory_set: &mut MemorySet, rusage: *mut RUsage) -> SysResult<()> {
@@ -232,26 +246,30 @@ pub fn sys_waitid(
     {
         return Err(SysError::EINVAL);
     }
-    if idtype != P_ALL && idtype != P_PID {
+    if idtype != P_ALL && idtype != P_PID && idtype != P_PGID {
         return Err(SysError::ECHILD);
     }
     if idtype == P_PID && id <= 0 {
         return Err(SysError::EINVAL);
     }
+    if idtype == P_PGID && id < 0 {
+        return Err(SysError::EINVAL);
+    }
 
     loop {
         let process = current_process();
+        let caller_pgid = process.process_group_id();
         let mut inner = process.inner_exclusive_access();
         if !inner
             .children
             .iter()
-            .any(|child| waitid_child_matches(child.getpid(), idtype, id))
+            .any(|child| waitid_child_matches(child, idtype, id, caller_pgid))
         {
             return Err(SysError::ECHILD);
         }
 
         let zombie = inner.children.iter().enumerate().find(|(_, child)| {
-            waitid_child_matches(child.getpid(), idtype, id)
+            waitid_child_matches(child, idtype, id, caller_pgid)
                 && child.inner_exclusive_access().is_zombie
         });
         if let Some((idx, child)) = zombie {
