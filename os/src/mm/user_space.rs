@@ -305,6 +305,10 @@ impl MemorySet {
         Some(memory_set)
     }
 
+    /// Materializes lazy MAP_SHARED anonymous pages before fork.
+    ///
+    /// Parent and child must keep the same physical frames after fork; leaving
+    /// this VMA lazy would let each side fault in a different frame later.
     fn ensure_shared_anonymous_mmap_resident(&mut self, area_idx: usize) -> bool {
         let area = &self.areas[area_idx];
         let shared_anonymous = area.mmap_info.as_ref().is_some_and(|info| {

@@ -230,7 +230,15 @@ pub fn trap_from_kernel(_trap_cx: &TrapContext) {
         Trap::Interrupt(Interrupt::Timer) => {
             ticlr::clear_timer_interrupt();
             set_next_trigger();
-            check_timer();
+            // CONTEXT: A kernel-mode timer interrupt can arrive while the
+            // interrupted code holds non-IRQ-safe locks such as the global
+            // heap allocator. `check_timer()` may drop timer events, queue
+            // signals, and wake tasks, all of which can allocate/free memory;
+            // only do that work from the idle loop, where no task kernel code
+            // was interrupted and sleeping tasks still need timer wakeups.
+            if current_task().is_none() {
+                check_timer();
+            }
         }
         other => {
             panic!(

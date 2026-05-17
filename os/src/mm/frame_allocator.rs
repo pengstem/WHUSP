@@ -159,7 +159,8 @@ impl StackFrameAllocator {
 
 type FrameAllocatorImpl = StackFrameAllocator;
 
-// TODO: Could use core::sync::LazyLock try to replace it
+// The allocator is initialized after DTB memory discovery; UPIntrFreeCell keeps
+// frame metadata updates atomic with interrupts masked on this uniprocessor.
 lazy_static! {
     pub static ref FRAME_ALLOCATOR: UPIntrFreeCell<FrameAllocatorImpl> =
         unsafe { UPIntrFreeCell::new(FrameAllocatorImpl::new()) };
@@ -182,6 +183,10 @@ pub fn frame_alloc() -> Option<FrameTracker> {
         .map(FrameTracker::new)
 }
 
+/// Allocates a contiguous fresh page run for device DMA queues.
+///
+/// This path intentionally does not satisfy requests from recycled single
+/// pages; callers such as VirtIO pass the first physical address to hardware.
 pub fn frame_alloc_more(num: usize) -> Option<Vec<FrameTracker>> {
     FRAME_ALLOCATOR
         .exclusive_access()

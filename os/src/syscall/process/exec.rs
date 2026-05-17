@@ -22,7 +22,11 @@ use xmas_elf::program::Type;
 
 const ELF_MAGIC: &[u8] = b"\x7fELF";
 const SHEBANG_MAGIC: &[u8] = b"#!";
+// Script recursion is externally visible through ELOOP; keep this guard close
+// to Linux's bounded nested-interpreter behavior.
 const SHEBANG_RECURSION_LIMIT: usize = 4;
+// The first read is capped at one page. ELF metadata beyond it is fetched only
+// after the header proves a bounded program-header span.
 const EXEC_PROBE_BYTES: usize = 4096;
 const EXEC_ELF_HEADER_BYTES: usize = 64;
 const EXEC_METADATA_MAX_BYTES: usize = 128 * 1024;
@@ -42,6 +46,8 @@ const AT_FDCWD: isize = -100;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_EMPTY_PATH: usize = 0x1000;
 const VALID_EXECVEAT_FLAGS: usize = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
+// UNFINISHED: Linux derives these limits from ARG_MAX, MAX_ARG_STRLEN, and
+// RLIMIT_STACK. This contest bound follows the mapped initial user stack.
 const EXEC_ARG_ENV_MAX_BYTES: usize = USER_STACK_SIZE;
 const EXEC_ARG_ENV_MAX_COUNT: usize = 4096;
 

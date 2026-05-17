@@ -81,7 +81,10 @@ impl PageTable {
             frames: vec![frame],
         })
     }
-    /// Temporarily used to get arguments from user space.
+    /// Builds a non-owning view over an existing page-table token.
+    ///
+    /// `frames` stays empty so dropping this wrapper never frees page-table
+    /// pages; syscall copy helpers use it only to translate user addresses.
     pub fn from_token(satp: usize) -> Self {
         Self {
             root_ppn: PhysPageNum::from(arch_mm::page_table_root_ppn(satp)),

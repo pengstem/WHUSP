@@ -22,6 +22,8 @@ pub fn mmio_transport(base_addr: usize, size: usize) -> VirtioTransport {
 }
 
 lazy_static! {
+    // DMA queue frames stay owned here until virtio dealloc; returning them to
+    // the general allocator earlier would leave device-visible memory aliased.
     static ref QUEUE_FRAMES: UPIntrFreeCell<Vec<FrameTracker>> =
         unsafe { UPIntrFreeCell::new(Vec::new()) };
 }
@@ -31,6 +33,8 @@ pub struct VirtioHal;
 unsafe impl Hal for VirtioHal {
     fn dma_alloc(pages: usize, _direction: BufferDirection) -> (VirtioPhysAddr, NonNull<u8>) {
         let mut trackers = frame_alloc_more(pages).expect("failed to allocate virtio DMA frames");
+        // frame_alloc_more returns a contiguous run; the virtio HAL ABI passes
+        // only the base physical address for the whole DMA allocation.
         let ppn_base = trackers
             .iter()
             .map(|tracker| tracker.ppn)

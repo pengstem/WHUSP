@@ -70,7 +70,8 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
         board::plic_base(),
     );
 
-    // TODO: we could remove these devices
+    // CONTEXT: Headless contest QEMU may omit these optional devices, but
+    // smoke checks key on the unavailable-device log lines below.
     if board::gpu_device().is_some() {
         info!("KERN: init gpu");
     } else {

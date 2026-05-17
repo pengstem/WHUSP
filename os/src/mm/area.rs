@@ -155,6 +155,10 @@ impl MapArea {
         }
     }
 
+    /// Clones VMA metadata without transferring resident-frame ownership.
+    ///
+    /// Fork repopulates data frames, page-cache references, and SHM mappings
+    /// afterward according to each area's COW or shared-backend rules.
     pub(super) fn from_another(another: &MapArea) -> Self {
         let mut mmap_info = another.mmap_info.clone();
         if let Some(info) = &mut mmap_info {

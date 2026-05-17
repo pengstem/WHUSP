@@ -1,4 +1,5 @@
-// TODO: all hard-coded, well some of them need tuning i believe
+// Static contest layout limits. Changing these affects loader stack layout,
+// mmap placement, trampoline/trap-context spacing, and address-space tests.
 pub const USER_STACK_SIZE: usize = 4096 * 1024;
 pub const USER_HEAP_SIZE: usize = 0x20_0000;
 pub const USER_MMAP_BASE: usize = 0x6000_0000;

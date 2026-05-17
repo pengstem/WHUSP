@@ -135,10 +135,14 @@ pub struct TaskUserRes {
 
 const USER_STACK_INITIAL_SIZE: usize = USER_STACK_SIZE;
 
+// TrapContext slots grow downward below the trampoline; the RISC-V restore path
+// uses this per-tid virtual address when returning to user mode.
 fn trap_cx_bottom_from_tid(tid: usize) -> usize {
     TRAP_CONTEXT_BASE - tid * PAGE_SIZE
 }
 
+// Per-thread stack windows keep one unmapped guard page between neighboring
+// user stacks by spacing bases with PAGE_SIZE + USER_STACK_SIZE.
 fn ustack_bottom_from_tid(ustack_base: usize, tid: usize) -> usize {
     ustack_base + tid * (PAGE_SIZE + USER_STACK_SIZE)
 }

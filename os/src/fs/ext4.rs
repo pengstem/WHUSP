@@ -394,7 +394,8 @@ impl FileSystemBackend for Ext4Mount {
                 LINUX_DIRENT64_ALIGN,
             );
 
-            // TODO:a classic performance loss?
+            // Linux getdents64 returns EINVAL when one record cannot fit; after
+            // at least one record, returning a short buffer preserves the next offset.
             if d_reclen > buf.len().saturating_sub(written) {
                 if written == 0 {
                     return Err(FsError::InvalidInput);
