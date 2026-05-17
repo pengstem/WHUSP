@@ -147,6 +147,49 @@ fn check_access_path_prefixes_from(
     Ok(())
 }
 
+fn parent_path_for_leaf(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return ".";
+    }
+    match trimmed.rfind('/') {
+        Some(0) => "/",
+        Some(index) => &trimmed[..index],
+        None => ".",
+    }
+}
+
+fn check_unlink_file_access(
+    snapshot: &PathSnapshot,
+    dirfd: isize,
+    context: PathContext,
+    path: &str,
+    subject: AccessSubject<'_>,
+) -> SysResult<()> {
+    if path.is_empty() {
+        return Err(SysError::ENOENT);
+    }
+
+    check_access_path_prefixes_from(snapshot, dirfd, path, subject)?;
+    let parent_path = parent_path_for_leaf(path);
+    let parent_stat = resolve_stat_from(snapshot, dirfd, parent_path, true)?;
+    if parent_stat.mode & S_IFMT != S_IFDIR {
+        return Err(SysError::ENOTDIR);
+    }
+    check_access_mode(&parent_stat, W_OK | X_OK, subject)?;
+
+    let file = open_file_in(context, path, OpenFlags::PATH | OpenFlags::NOFOLLOW)?;
+    let flags = match file.inode_flags() {
+        Ok(flags) => flags,
+        Err(FsError::Unsupported) => 0,
+        Err(error) => return Err(error.into()),
+    };
+    if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
+        return Err(SysError::EPERM);
+    }
+    Ok(())
+}
+
 fn check_open_existing_access_from(
     snapshot: &PathSnapshot,
     dirfd: isize,
@@ -745,6 +788,9 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> SysResult {
     if flags & AT_REMOVEDIR != 0 {
         rmdir_in(context, path.as_str())?;
     } else {
+        let credentials = current_process().credentials();
+        let subject = AccessSubject::from_fs_credentials(&credentials);
+        check_unlink_file_access(&snapshot, dirfd, context.clone(), path.as_str(), subject)?;
         unlink_file_in(context, path.as_str())?;
     }
     if let Some(file) = notify_file {
