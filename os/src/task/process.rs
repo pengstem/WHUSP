@@ -108,15 +108,15 @@ pub struct ProcessResourceLimits {
 
 impl ProcessResourceLimits {
     pub fn new() -> Self {
-        // UNFINISHED: Except RLIMIT_NOFILE and the mlock-visible
-        // RLIMIT_MEMLOCK subset, these limits are currently stored for
-        // getrlimit/setrlimit compatibility but are not enforced by the
-        // memory, scheduler, signal, or fork paths yet.
+        // UNFINISHED: Except RLIMIT_NOFILE, the mlock-visible
+        // RLIMIT_MEMLOCK subset, and the RLIMIT_CORE signal-status bit,
+        // these limits are currently stored for getrlimit/setrlimit
+        // compatibility but are not enforced by the memory, scheduler, or
+        // fork paths yet.
         let mut limits = [RLimit::infinity(); RLIMIT_COUNT];
         limits[RLimitResource::Stack.index()] =
             RLimit::soft_with_hard(USER_STACK_SIZE, RLIM_INFINITY);
         limits[RLimitResource::NoFile.index()] = RLimit::fixed(FD_LIMIT);
-        limits[RLimitResource::Core.index()] = RLimit::fixed(0);
         Self { limits }
     }
 

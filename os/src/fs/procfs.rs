@@ -64,6 +64,7 @@ const INOTIFY_MAX_USER_WATCHES_INO: u32 = 37;
 const BLOCK_CACHE_STATS_INO: u32 = 38;
 const DENTRY_CACHE_STATS_INO: u32 = 39;
 const EXEC_LOAD_STATS_INO: u32 = 40;
+const CORE_PATTERN_INO: u32 = 41;
 const PID_DIR_BASE: u32 = 100;
 const PID_FILE_BASE: u32 = 10_000;
 const PID_FILE_STRIDE: u32 = 32;
@@ -165,6 +166,7 @@ enum ProcNode {
     KeysGcDelay,
     KeysMaxkeys,
     KeysMaxbytes,
+    CorePattern,
     DropCaches,
     VfsCachePressure,
     FanotifyMaxQueuedEvents,
@@ -415,6 +417,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         KEYS_GC_DELAY_INO => Some(ProcNode::KeysGcDelay),
         KEYS_MAXKEYS_INO => Some(ProcNode::KeysMaxkeys),
         KEYS_MAXBYTES_INO => Some(ProcNode::KeysMaxbytes),
+        CORE_PATTERN_INO => Some(ProcNode::CorePattern),
         DROP_CACHES_INO => Some(ProcNode::DropCaches),
         VFS_CACHE_PRESSURE_INO => Some(ProcNode::VfsCachePressure),
         FANOTIFY_MAX_QUEUED_EVENTS_INO => Some(ProcNode::FanotifyMaxQueuedEvents),
@@ -815,6 +818,11 @@ fn sys_kernel_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: PID_MAX_INO,
         name: "pid_max".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: CORE_PATTERN_INO,
+        name: "core_pattern".into(),
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
@@ -1593,6 +1601,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::KeysGcDelay => Ok(keyring::key_gc_delay_content().into_bytes()),
         ProcNode::KeysMaxkeys => Ok(keyring::key_maxkeys_content().into_bytes()),
         ProcNode::KeysMaxbytes => Ok(keyring::key_maxbytes_content().into_bytes()),
+        ProcNode::CorePattern => Ok(b"core\n".to_vec()),
         ProcNode::PipeMaxSize => Ok(pipe_max_size_content().into_bytes()),
         ProcNode::PipeUserPagesSoft => Ok(pipe_user_pages_soft_content().into_bytes()),
         ProcNode::FanotifyMaxQueuedEvents => Ok(fanotify_max_queued_events_content().into_bytes()),
@@ -1807,6 +1816,7 @@ impl FileSystemBackend for ProcFs {
                 "." => Ok((SYS_KERNEL_DIR_INO, FsNodeKind::Directory)),
                 ".." => Ok((SYS_DIR_INO, FsNodeKind::Directory)),
                 "pid_max" => Ok((PID_MAX_INO, FsNodeKind::RegularFile)),
+                "core_pattern" => Ok((CORE_PATTERN_INO, FsNodeKind::RegularFile)),
                 "keys" => Ok((SYS_KERNEL_KEYS_DIR_INO, FsNodeKind::Directory)),
                 "domainname" => Ok((DOMAINNAME_INO, FsNodeKind::RegularFile)),
                 "tainted" => Ok((TAINTED_INO, FsNodeKind::RegularFile)),
