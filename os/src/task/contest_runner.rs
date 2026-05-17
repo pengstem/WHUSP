@@ -2,7 +2,7 @@ use alloc::{format, string::String};
 
 // CONTEXT: The judge-facing runner emits libc-suffixed marker groups. Keep
 // both roots here even when a specific script has a per-libc exception below.
-const TEST_LIBCS: &[&str] = &["/glibc"];
+const TEST_LIBCS: &[&str] = &["/glibc", "/musl"];
 const LA_MUSL_COMPAT_PRELOAD: &str = "/opt/oscomp-support/lib/liboscomp-musl-compat.so";
 // CONTEXT: Search the manifests that contain the current whitelist, ordered by
 // duplicate-resolution priority. Keep syscalls before smoketest aliases while
@@ -38,12 +38,12 @@ const ALL_TESTS: &[&str] = &[
 // CONTEXT: current submit-safe default runs the groups with stable local score
 // signal; skipped groups above still get marker pairs instead of disappearing.
 const TEST_SCRIPTS: &[&str] = &[
-    // "basic_testcode.sh",
-    // "busybox_testcode.sh",
-    // "lua_testcode.sh",
-    // "libctest_testcode.sh",
-    // "ltp_testcode.sh",
-    // "iozone_testcode.sh",
+    "basic_testcode.sh",
+    "busybox_testcode.sh",
+    "lua_testcode.sh",
+    "libctest_testcode.sh",
+    "ltp_testcode.sh",
+    "iozone_testcode.sh",
     "iperf_testcode.sh",
     "libcbench_testcode.sh",
     "netperf_testcode.sh",
