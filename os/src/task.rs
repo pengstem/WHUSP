@@ -52,10 +52,10 @@ pub use processor::{
     run_tasks, schedule, take_current_task,
 };
 pub use signal::{
-    DefaultSignalAction, MINSIGSTKSZ, SA_RESTART, SIGCHLD, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP,
-    SS_DISABLE, SS_ONSTACK, SigAltStack, SignalAction, SignalFlags, SignalInfo,
-    default_signal_action, default_signal_error, default_signal_exit_code, signal_child_status,
-    signal_wait_status,
+    CLD_CONTINUED, CLD_STOPPED, DefaultSignalAction, MINSIGSTKSZ, SA_RESTART, SIGCHLD, SIGCONT,
+    SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SS_DISABLE, SS_ONSTACK, SigAltStack, SignalAction,
+    SignalFlags, SignalInfo, default_signal_action, default_signal_error, default_signal_exit_code,
+    signal_child_status, signal_wait_status,
 };
 #[cfg(target_arch = "riscv64")]
 pub use signal::{SI_TKILL, SIGRT_1, SIGRTMIN};
@@ -373,6 +373,7 @@ pub(crate) fn queue_signal_to_task(
     if signal.is_empty() {
         return;
     }
+    record_job_control_wait_state(&task, signal);
     {
         let mut task_inner = task.inner_exclusive_access();
         task_inner.pending_signals |= signal;
@@ -380,7 +381,64 @@ pub(crate) fn queue_signal_to_task(
             *slot = Some(info);
         }
     }
-    wakeup_task(task);
+    if signal_should_wake_target(&task, signal) {
+        wakeup_task(task);
+    }
+}
+
+fn signal_should_wake_target(task: &Arc<TaskControlBlock>, signal: SignalFlags) -> bool {
+    let mut non_job_control = signal;
+    non_job_control.remove(SignalFlags::SIGSTOP);
+    non_job_control.remove(SignalFlags::SIGCONT);
+    if !non_job_control.is_empty() {
+        return true;
+    }
+    let Some(process) = task.process.upgrade() else {
+        return false;
+    };
+    let process_inner = process.inner_exclusive_access();
+    // CONTEXT: Full Linux job control would wake a task that is actually
+    // stopped by SIGCONT. This kernel only records stop/continue waitid
+    // events, so waking a normal futex/pipe sleeper here turns checkpoints
+    // into spurious EINTR. A user SIGCONT handler still needs delivery.
+    process_inner.signal_actions[SIGCONT as usize].has_user_handler()
+}
+
+fn record_job_control_wait_state(task: &Arc<TaskControlBlock>, signal: SignalFlags) {
+    let Some(process) = task.process.upgrade() else {
+        return;
+    };
+    let mut changed = false;
+    {
+        let mut process_inner = process.inner_exclusive_access();
+        if signal.contains(SignalFlags::SIGSTOP) {
+            // UNFINISHED: This records the Linux-visible waitid stop event but
+            // does not yet implement full job-control task suspension.
+            process_inner.wait_stop_status = Some(SIGSTOP as i32);
+            changed = true;
+        }
+        if signal.contains(SignalFlags::SIGCONT) {
+            // UNFINISHED: This records the waitid continued event; full
+            // process-group job control and terminal stop semantics are not modeled.
+            process_inner.wait_continued = true;
+            changed = true;
+        }
+    }
+    if changed {
+        wake_parent_waiters(&process);
+    }
+}
+
+fn wake_parent_waiters(process: &Arc<ProcessControlBlock>) {
+    let Some(parent) = process.parent_process() else {
+        return;
+    };
+    for parent_task in parent.tasks_snapshot() {
+        let is_blocked = parent_task.inner_exclusive_access().task_status == TaskStatus::Blocked;
+        if is_blocked {
+            wakeup_task(parent_task);
+        }
+    }
 }
 
 pub(crate) fn current_process_group_id() -> Option<usize> {

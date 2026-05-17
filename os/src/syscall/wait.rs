@@ -1,9 +1,9 @@
 use crate::mm::MemorySet;
 use crate::syscall::user_ptr::write_user_value_in_memory_set;
 use crate::task::{
-    ProcessControlBlock, SIGCHLD, SignalInfo, block_current_task_no_schedule, current_process,
-    remove_from_pid2process, schedule, signal_child_status, signal_wait_status,
-    task_has_wait_interrupt_signal, wakeup_task,
+    CLD_CONTINUED, CLD_STOPPED, ProcessControlBlock, SIGCHLD, SIGCONT, SignalInfo,
+    block_current_task_no_schedule, current_process, remove_from_pid2process, schedule,
+    signal_child_status, signal_wait_status, task_has_wait_interrupt_signal, wakeup_task,
 };
 use alloc::sync::Arc;
 
@@ -145,6 +145,29 @@ fn write_rusage(memory_set: &mut MemorySet, rusage: *mut RUsage) -> SysResult<()
     Ok(())
 }
 
+fn write_waitid_siginfo(
+    memory_set: &mut MemorySet,
+    infop: *mut LinuxSigInfo,
+    child_pid: usize,
+    si_code: i32,
+    si_status: i32,
+) -> SysResult<()> {
+    if !infop.is_null() {
+        write_user_value_in_memory_set(
+            memory_set,
+            infop,
+            &LinuxSigInfo {
+                si_signo: SIGCHLD as i32,
+                si_code,
+                si_pid: child_pid as i32,
+                si_status,
+                ..LinuxSigInfo::default()
+            },
+        )?;
+    }
+    Ok(())
+}
+
 /// Waits for and reaps a matching child process using Linux wait4 status rules.
 ///
 /// Reaping removes the child from both PID lookup and the parent's child list;
@@ -242,7 +265,7 @@ pub fn sys_waitid(
 ) -> SysResult {
     if options < 0
         || options & !(WNOHANG | WEXITED | WNOWAIT | WUNTRACED | WCONTINUED) != 0
-        || options & WEXITED == 0
+        || options & (WEXITED | WUNTRACED | WCONTINUED) == 0
     {
         return Err(SysError::EINVAL);
     }
@@ -268,6 +291,69 @@ pub fn sys_waitid(
             return Err(SysError::ECHILD);
         }
 
+        if options & WUNTRACED != 0 {
+            let stopped = inner.children.iter().find_map(|child| {
+                if !waitid_child_matches(child, idtype, id, caller_pgid) {
+                    return None;
+                }
+                let child_inner = child.inner_exclusive_access();
+                child_inner
+                    .wait_stop_status
+                    .map(|status| (child.getpid(), status))
+            });
+            if let Some((child_pid, stop_status)) = stopped {
+                write_waitid_siginfo(
+                    &mut inner.memory_set,
+                    infop,
+                    child_pid,
+                    CLD_STOPPED,
+                    stop_status,
+                )?;
+                write_rusage(&mut inner.memory_set, rusage)?;
+                if options & WNOWAIT == 0
+                    && let Some(child) = inner
+                        .children
+                        .iter()
+                        .find(|child| child.getpid() == child_pid)
+                {
+                    child.inner_exclusive_access().wait_stop_status = None;
+                }
+                return Ok(0);
+            }
+        }
+
+        if options & WCONTINUED != 0 {
+            let continued = inner.children.iter().find_map(|child| {
+                if !waitid_child_matches(child, idtype, id, caller_pgid) {
+                    return None;
+                }
+                if child.inner_exclusive_access().wait_continued {
+                    Some(child.getpid())
+                } else {
+                    None
+                }
+            });
+            if let Some(child_pid) = continued {
+                write_waitid_siginfo(
+                    &mut inner.memory_set,
+                    infop,
+                    child_pid,
+                    CLD_CONTINUED,
+                    SIGCONT as i32,
+                )?;
+                write_rusage(&mut inner.memory_set, rusage)?;
+                if options & WNOWAIT == 0
+                    && let Some(child) = inner
+                        .children
+                        .iter()
+                        .find(|child| child.getpid() == child_pid)
+                {
+                    child.inner_exclusive_access().wait_continued = false;
+                }
+                return Ok(0);
+            }
+        }
+
         let zombie = inner.children.iter().enumerate().find(|(_, child)| {
             waitid_child_matches(child, idtype, id, caller_pgid)
                 && child.inner_exclusive_access().is_zombie
@@ -282,19 +368,7 @@ pub fn sys_waitid(
                 )
             };
             let (si_code, si_status) = waitid_code_and_status(exit_code);
-            if !infop.is_null() {
-                write_user_value_in_memory_set(
-                    &mut inner.memory_set,
-                    infop,
-                    &LinuxSigInfo {
-                        si_signo: SIGCHLD as i32,
-                        si_code,
-                        si_pid: child_pid as i32,
-                        si_status,
-                        ..LinuxSigInfo::default()
-                    },
-                )?;
-            }
+            write_waitid_siginfo(&mut inner.memory_set, infop, child_pid, si_code, si_status)?;
             write_rusage(&mut inner.memory_set, rusage)?;
 
             if options & WNOWAIT == 0 {

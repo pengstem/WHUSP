@@ -548,6 +548,8 @@ pub struct ProcessControlBlockInner {
     pub(crate) no_new_privs: bool,
     pub(crate) thp_disabled: bool,
     pub(crate) personality: u32,
+    pub(crate) wait_stop_status: Option<i32>,
+    pub(crate) wait_continued: bool,
     // UNFINISHED: Linux kernel credentials are per-thread, while POSIX
     // user-space expects process-wide synchronization. This first contest
     // compatibility model keeps credentials on the PCB and shares them across
