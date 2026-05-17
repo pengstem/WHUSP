@@ -98,6 +98,8 @@ pub enum SeekWhence {
     Set,
     Current,
     End,
+    Data,
+    Hole,
 }
 
 impl FileTimestamp {

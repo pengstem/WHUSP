@@ -1,7 +1,10 @@
 use crate::config::PAGE_SIZE;
 use crate::fs::{File, FileStat, OpenFlags, PollEvents, S_IFDIR, S_IFMT, S_IFREG, SeekWhence};
 use crate::mm::UserBuffer;
-use crate::task::{FdTableEntry, SignalFlags, current_add_signal, current_user_token};
+use crate::task::{
+    FdTableEntry, RLimitResource, SignalFlags, current_add_signal, current_process,
+    current_user_token,
+};
 use alloc::{vec, vec::Vec};
 use core::ptr::read_volatile;
 
@@ -30,6 +33,27 @@ struct UserIovecCursor {
     entries: Vec<LinuxIovec>,
     index: usize,
     access: UserBufferAccess,
+}
+
+fn truncate_user_buffers(
+    buffers: Vec<&'static mut [u8]>,
+    mut limit: usize,
+) -> Vec<&'static mut [u8]> {
+    let mut truncated = Vec::new();
+    for buffer in buffers {
+        if limit == 0 {
+            break;
+        }
+        if buffer.len() <= limit {
+            limit -= buffer.len();
+            truncated.push(buffer);
+        } else {
+            let (head, _) = buffer.split_at_mut(limit);
+            truncated.push(head);
+            break;
+        }
+    }
+    truncated
 }
 
 impl UserIovecCursor {
@@ -120,6 +144,74 @@ fn write_with_status_flags(entry: &FdTableEntry, buf: UserBuffer) -> usize {
     }
 }
 
+fn current_file_size_limit() -> usize {
+    current_process()
+        .inner_exclusive_access()
+        .resource_limits
+        .get(RLimitResource::FSize)
+        .rlim_cur
+}
+
+fn queue_file_size_limit_signal() {
+    current_add_signal(SignalFlags::SIGXFSZ);
+}
+
+fn allowed_write_len_at(
+    file: &(dyn File + Send + Sync),
+    offset: usize,
+    requested_len: usize,
+) -> SysResult<usize> {
+    if requested_len == 0 {
+        return Ok(0);
+    }
+    let stat = file.stat()?;
+    if stat.mode & S_IFMT != S_IFREG {
+        return Ok(requested_len);
+    }
+    let limit = current_file_size_limit();
+    if limit == usize::MAX {
+        return Ok(requested_len);
+    }
+    let write_end = offset.checked_add(requested_len).ok_or(SysError::EFBIG)?;
+    let current_size = usize::try_from(stat.size).map_err(|_| SysError::EFBIG)?;
+    let permitted_end = current_size.max(limit);
+    if write_end <= permitted_end {
+        return Ok(requested_len);
+    }
+    if offset >= permitted_end {
+        queue_file_size_limit_signal();
+        return Err(SysError::EFBIG);
+    }
+    Ok(permitted_end - offset)
+}
+
+fn allowed_write_len_for_entry(entry: &FdTableEntry, requested_len: usize) -> SysResult<usize> {
+    let file = entry.file();
+    let stat = file.stat()?;
+    if stat.mode & S_IFMT != S_IFREG {
+        return Ok(requested_len);
+    }
+    let offset = if entry.status_flags().contains(OpenFlags::APPEND) {
+        usize::try_from(stat.size).map_err(|_| SysError::EFBIG)?
+    } else {
+        file.seek(0, SeekWhence::Current)?
+    };
+    allowed_write_len_at(file.as_ref(), offset, requested_len)
+}
+
+fn check_file_size_limit_for_len(file: &(dyn File + Send + Sync), len: usize) -> SysResult<()> {
+    let stat = file.stat()?;
+    if stat.mode & S_IFMT != S_IFREG {
+        return Ok(());
+    }
+    let current_size = usize::try_from(stat.size).map_err(|_| SysError::EFBIG)?;
+    if len <= current_size || len <= current_file_size_limit() {
+        return Ok(());
+    }
+    queue_file_size_limit_signal();
+    Err(SysError::EFBIG)
+}
+
 fn checked_write_result(requested: usize, written: usize) -> SysResult {
     if requested > 0 && written == 0 {
         // CONTEXT: A no-progress non-empty write makes libc/BusyBox retry loops
@@ -199,10 +291,13 @@ pub fn sys_lseek(fd: usize, offset: i64, whence: usize) -> SysResult {
         0 => SeekWhence::Set,
         1 => SeekWhence::Current,
         2 => SeekWhence::End,
-        // UNFINISHED: Linux SEEK_DATA and SEEK_HOLE are not implemented yet.
-        // They require sparse-file data/hole discovery in the filesystem layer.
+        3 => SeekWhence::Data,
+        4 => SeekWhence::Hole,
         _ => return Err(SysError::EINVAL),
     };
+    if matches!(whence, SeekWhence::Data | SeekWhence::Hole) && offset < 0 {
+        return Err(SysError::EINVAL);
+    }
     let file = get_file_by_fd(fd)?;
     let new_offset = file.seek(offset, whence)?;
     if new_offset > isize::MAX as usize {
@@ -225,6 +320,7 @@ pub fn sys_ftruncate(fd: usize, len: usize) -> SysResult {
     if file.stat()?.mode & S_IFREG != S_IFREG {
         return Err(SysError::EINVAL);
     }
+    check_file_size_limit_for_len(file.as_ref(), len)?;
     file.check_set_len(len)?;
     file.set_len(len)?;
     Ok(0)
@@ -291,6 +387,7 @@ pub fn sys_fallocate(fd: usize, mode: u32, offset: usize, len: usize) -> SysResu
 
     let keep_size = mode & FALLOC_FL_KEEP_SIZE != 0;
     if !keep_size && end as u64 > file.stat()?.size {
+        check_file_size_limit_for_len(file.as_ref(), end)?;
         file.check_set_len(end)?;
         file.set_len(end)?;
     }
@@ -703,8 +800,9 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, len: usize, offset: usize) -> Sys
     if entry.status_flags().contains(OpenFlags::APPEND) {
         offset = file.stat()?.size as usize;
     }
-    let buffers = translated_byte_buffer_checked(token, buf, len, UserBufferAccess::Read)?;
-    if let Err(err) = file.check_write_at(offset, len) {
+    let allowed_len = allowed_write_len_at(file.as_ref(), offset, len)?;
+    let buffers = translated_byte_buffer_checked(token, buf, allowed_len, UserBufferAccess::Read)?;
+    if let Err(err) = file.check_write_at(offset, allowed_len) {
         fault_in_read_buffers(&buffers);
         return Err(err.into());
     }
@@ -721,7 +819,7 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, len: usize, offset: usize) -> Sys
     }
     fanotify_notify_modify(&file, total_written);
     inotify_notify_modify(&file, total_written);
-    checked_write_result(len, total_written)
+    checked_write_result(allowed_len, total_written)
 }
 
 pub fn sys_preadv(
@@ -798,7 +896,9 @@ pub fn sys_pwritev(
     if entry.status_flags().contains(OpenFlags::APPEND) {
         offset = file.stat()?.size as usize;
     }
-    let requested_len = iovecs.total_len;
+    let allowed_len = allowed_write_len_at(file.as_ref(), offset, iovecs.total_len)?;
+    let requested_len = allowed_len;
+    let mut remaining_len = allowed_len;
     let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Read);
     let mut total_written = 0usize;
     while let Some(chunk) = cursor.next_chunk() {
@@ -811,19 +911,25 @@ pub fn sys_pwritev(
             }
             Err(err) => return Err(err),
         };
-        if let Err(err) = file.check_write_at(offset, chunk.len) {
-            fault_in_read_buffers(&chunk.buffers);
+        let chunk_len = chunk.len.min(remaining_len);
+        let buffers = truncate_user_buffers(chunk.buffers, chunk_len);
+        if let Err(err) = file.check_write_at(offset, chunk_len) {
+            fault_in_read_buffers(&buffers);
             return Err(err.into());
         }
-        for slice in chunk.buffers {
+        for slice in buffers {
             let written = file.write_at(offset, slice);
             total_written += written;
+            remaining_len = remaining_len.saturating_sub(written);
             offset = offset.checked_add(written).ok_or(SysError::EINVAL)?;
             if written < slice.len() {
                 fanotify_notify_modify(&file, total_written);
                 inotify_notify_modify(&file, total_written);
                 return checked_write_result(requested_len, total_written);
             }
+        }
+        if remaining_len == 0 {
+            break;
         }
     }
     fanotify_notify_modify(&file, total_written);
@@ -860,21 +966,29 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
     }
     check_pipe_write_peer(&entry, len > 0)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
-    file.check_write(len, entry.status_flags().contains(OpenFlags::APPEND))?;
+    let allowed_len = allowed_write_len_for_entry(&entry, len)?;
+    file.check_write(
+        allowed_len,
+        entry.status_flags().contains(OpenFlags::APPEND),
+    )?;
     if file.write_ignores_user_buffer() {
         // CONTEXT: AF_ALG hash request writes in the current contest subset do
         // not consume payload bytes; skipping the copy keeps af_alg04 from
         // spending most of its time fault-checking data that is discarded.
-        fanotify_notify_modify(&file, len);
-        inotify_notify_modify(&file, len);
-        return Ok(len as isize);
+        fanotify_notify_modify(&file, allowed_len);
+        inotify_notify_modify(&file, allowed_len);
+        return Ok(allowed_len as isize);
     }
-    let buffers =
-        translated_byte_buffer_checked_with_mmap_fault(token, buf, len, UserBufferAccess::Read)?;
+    let buffers = translated_byte_buffer_checked_with_mmap_fault(
+        token,
+        buf,
+        allowed_len,
+        UserBufferAccess::Read,
+    )?;
     let written = write_with_status_flags(&entry, UserBuffer::new(buffers));
     fanotify_notify_modify(&file, written);
     inotify_notify_modify(&file, written);
-    checked_write_result(len, written)
+    checked_write_result(allowed_len, written)
 }
 
 pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult {
@@ -901,12 +1015,14 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
     }
     check_pipe_write_peer(&entry, has_data)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
+    let allowed_len = allowed_write_len_for_entry(&entry, iovecs.total_len)?;
     file.check_write(
-        iovecs.total_len,
+        allowed_len,
         entry.status_flags().contains(OpenFlags::APPEND),
     )?;
 
-    let requested_len = iovecs.total_len;
+    let requested_len = allowed_len;
+    let mut remaining_len = allowed_len;
     let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Read);
     let mut total_written = 0usize;
     while let Some(chunk) = cursor.next_chunk() {
@@ -919,10 +1035,15 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
             }
             Err(err) => return Err(err),
         };
-        let chunk_len = chunk.len;
-        let written = write_with_status_flags(&entry, UserBuffer::new(chunk.buffers));
+        let chunk_len = chunk.len.min(remaining_len);
+        let buffers = truncate_user_buffers(chunk.buffers, chunk_len);
+        let written = write_with_status_flags(&entry, UserBuffer::new(buffers));
         total_written += written;
+        remaining_len = remaining_len.saturating_sub(written);
         if written < chunk_len {
+            break;
+        }
+        if remaining_len == 0 {
             break;
         }
     }

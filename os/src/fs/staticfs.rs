@@ -396,6 +396,28 @@ impl File for StaticFile {
             super::SeekWhence::Set => 0,
             super::SeekWhence::Current => *self.offset.exclusive_access() as i64,
             super::SeekWhence::End => len as i64,
+            super::SeekWhence::Data => {
+                if offset < 0 {
+                    return Err(FsError::InvalidInput);
+                }
+                let offset = offset as usize;
+                if offset >= len {
+                    return Err(FsError::NoDeviceOrAddress);
+                }
+                *self.offset.exclusive_access() = offset;
+                return Ok(offset);
+            }
+            super::SeekWhence::Hole => {
+                if offset < 0 {
+                    return Err(FsError::InvalidInput);
+                }
+                let offset = offset as usize;
+                if offset > len {
+                    return Err(FsError::NoDeviceOrAddress);
+                }
+                *self.offset.exclusive_access() = len;
+                return Ok(len);
+            }
         };
         let next = base.checked_add(offset).ok_or(FsError::InvalidInput)?;
         if next < 0 {

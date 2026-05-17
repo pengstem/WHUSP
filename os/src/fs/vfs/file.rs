@@ -29,6 +29,7 @@ const VFS_WRITE_CHUNK_SIZE: usize = 64 * 1024;
 const MODE_PERMISSIONS_MASK: u32 = 0o7777;
 const MODE_SETGID: u32 = 0o2000;
 const TMPFILE_CREATE_ATTEMPTS: usize = 64;
+const SEEK_SCAN_MIN_BLOCK_SIZE: usize = 1;
 // Synthetic mountpoint entries live in a high offset range so they cannot
 // collide with real backend dirent offsets returned by the filesystem.
 const SYNTHETIC_DIRENT_OFFSET_BASE: u64 = 1 << 60;
@@ -274,6 +275,60 @@ impl VfsFile {
             let _ = with_mount(self.node.mount_id, |mount| {
                 mount.set_times(self.node.ino, Some(atime), None, ctime)
             });
+        }
+    }
+
+    fn seek_data_or_hole(&self, offset: usize, seek_hole: bool) -> FsResult<usize> {
+        if self.kind != FsNodeKind::RegularFile {
+            return Err(FsError::IllegalSeek);
+        }
+        // UNFINISHED: This generic fallback infers sparse data/hole ranges
+        // from nonzero bytes in filesystem-sized blocks instead of querying
+        // backend extent allocation, so allocated zero-filled blocks may be
+        // reported as holes.
+        let stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))
+            .ok_or(FsError::Io)??;
+        let size = stat.size as usize;
+        if offset > size {
+            return Err(FsError::NoDeviceOrAddress);
+        }
+        if offset == size {
+            return if seek_hole {
+                Ok(size)
+            } else {
+                Err(FsError::NoDeviceOrAddress)
+            };
+        }
+
+        let block_size = (stat.blksize as usize).max(SEEK_SCAN_MIN_BLOCK_SIZE);
+        let mut buf = vec![0u8; block_size];
+        let mut block_start = offset / block_size * block_size;
+        let mut result = offset;
+
+        while block_start < size {
+            let block_end = block_start.saturating_add(block_size).min(size);
+            let valid_len = block_end - block_start;
+            buf[..valid_len].fill(0);
+            let read_len = with_mount(self.node.mount_id, |mount| {
+                mount.read_at(self.node.ino, &mut buf[..valid_len], block_start as u64)
+            })
+            .ok_or(FsError::Io)?;
+            if read_len < valid_len {
+                buf[read_len..valid_len].fill(0);
+            }
+            let is_data = buf[..valid_len].iter().any(|byte| *byte != 0);
+            if seek_hole != is_data {
+                return Ok(result.min(size));
+            }
+
+            block_start = block_start.saturating_add(block_size);
+            result = block_start;
+        }
+
+        if seek_hole {
+            Ok(size)
+        } else {
+            Err(FsError::NoDeviceOrAddress)
         }
     }
 
@@ -798,6 +853,14 @@ impl File for VfsFile {
                 let stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))
                     .ok_or(FsError::Io)??;
                 stat.size as i128
+            }
+            SeekWhence::Data | SeekWhence::Hole => {
+                if offset < 0 {
+                    return Err(FsError::InvalidInput);
+                }
+                let next = self.seek_data_or_hole(offset as usize, whence == SeekWhence::Hole)?;
+                *current = next;
+                return Ok(next);
             }
         };
         let new_offset = base

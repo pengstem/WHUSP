@@ -1274,6 +1274,7 @@ fn seek_loop0(
         SeekWhence::Set => 0i128,
         SeekWhence::Current => *current as i128,
         SeekWhence::End => loop0_size() as i128,
+        SeekWhence::Data | SeekWhence::Hole => return Err(FsError::InvalidInput),
     };
     let new_offset = base
         .checked_add(offset as i128)
@@ -2390,6 +2391,9 @@ impl File for DevFsFile {
             return seek_loop0(&self.offset, offset, whence);
         }
         if matches!(self.node, DevNode::Null | DevNode::Zero | DevNode::Full) {
+            if matches!(whence, SeekWhence::Data | SeekWhence::Hole) {
+                return Err(FsError::InvalidInput);
+            }
             return Ok(seek_null_like(&self.offset));
         }
         Err(FsError::IllegalSeek)

@@ -266,6 +266,28 @@ impl File for MemfdFile {
             SeekWhence::Set => 0i128,
             SeekWhence::Current => *current as i128,
             SeekWhence::End => size as i128,
+            SeekWhence::Data => {
+                if offset < 0 {
+                    return Err(FsError::InvalidInput);
+                }
+                let offset = offset as usize;
+                if offset >= size {
+                    return Err(FsError::NoDeviceOrAddress);
+                }
+                *current = offset;
+                return Ok(*current);
+            }
+            SeekWhence::Hole => {
+                if offset < 0 {
+                    return Err(FsError::InvalidInput);
+                }
+                let offset = offset as usize;
+                if offset > size {
+                    return Err(FsError::NoDeviceOrAddress);
+                }
+                *current = size;
+                return Ok(*current);
+            }
         };
         let next = base + offset as i128;
         if next < 0 || next > usize::MAX as i128 {
