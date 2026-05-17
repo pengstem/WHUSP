@@ -66,6 +66,7 @@ const SYSCALL_TIMERFD_CREATE: usize = 85;
 const SYSCALL_UTIMENSAT: usize = 88;
 const SYSCALL_CAPGET: usize = 90;
 const SYSCALL_CAPSET: usize = 91;
+const SYSCALL_PERSONALITY: usize = 92;
 const SYSCALL_EXIT: usize = 93;
 const SYSCALL_EXIT_GROUP: usize = 94;
 const SYSCALL_WAITID: usize = 95;
@@ -576,6 +577,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[0] as *mut LinuxCapUserHeader,
             args[1] as *const LinuxCapUserData,
         ),
+        SYSCALL_PERSONALITY => sys_personality(args[0]),
         SYSCALL_STATX => sys_statx(
             args[0] as isize,
             args[1] as *const u8,

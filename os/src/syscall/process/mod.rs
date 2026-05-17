@@ -29,4 +29,4 @@ pub use sched::{
     sys_sched_getparam, sys_sched_getscheduler, sys_sched_rr_get_interval, sys_sched_setaffinity,
     sys_sched_setparam, sys_sched_setscheduler,
 };
-pub use system::{LinuxUtsName, sys_getrandom, sys_reboot, sys_syslog, sys_uname};
+pub use system::{LinuxUtsName, sys_getrandom, sys_personality, sys_reboot, sys_syslog, sys_uname};

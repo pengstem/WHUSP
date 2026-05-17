@@ -114,6 +114,7 @@ impl ProcessControlBlock {
                     is_child_subreaper: false,
                     no_new_privs: false,
                     thp_disabled: false,
+                    personality: 0,
                     credentials: Credentials::root(),
                     resource_limits: ProcessResourceLimits::new(),
                     process_keyring: None,
@@ -222,6 +223,7 @@ impl ProcessControlBlock {
         let securebits = parent.securebits;
         let no_new_privs = parent.no_new_privs;
         let thp_disabled = parent.thp_disabled;
+        let personality = parent.personality;
         let membarrier_private_expedited_registered =
             parent.membarrier_private_expedited_registered;
         let pid_namespace_id = parent.pid_namespace_id;
@@ -274,6 +276,7 @@ impl ProcessControlBlock {
                     is_child_subreaper: false,
                     no_new_privs,
                     thp_disabled,
+                    personality,
                     credentials,
                     resource_limits,
                     process_keyring: None,

@@ -23,6 +23,11 @@ const GETRANDOM_CHUNK: usize = 64;
 const SYSLOG_ACTION_READ_ALL: usize = 3;
 const SYSLOG_ACTION_SIZE_BUFFER: usize = 10;
 const SYSLOG_BUF_SIZE: usize = 4096;
+const PERSONALITY_QUERY: usize = 0xffff_ffff;
+const PER_LINUX: u32 = 0;
+const PER_MASK: u32 = 0xff;
+const UNAME26: u32 = 0x0020_000;
+const UNAME26_RELEASE: &str = "2.6.60";
 
 static SYSLOG_FAKE_MSG: &[u8] = b"<5>[    0.000000] Linux version 5.10.0 (whusp@oscomp)\n";
 
@@ -55,6 +60,14 @@ impl LinuxUtsName {
             machine: Self::field(machine_name()),
             domainname: Self::field("(none)"),
         }
+    }
+
+    fn current_for_personality(personality: u32) -> Self {
+        let mut uts = Self::current();
+        if personality & UNAME26 != 0 {
+            uts.release = Self::field(UNAME26_RELEASE);
+        }
+        uts
     }
 }
 
@@ -110,10 +123,30 @@ pub fn sys_reboot(magic: usize, magic2: usize, op: usize, _arg: usize) -> SysRes
 }
 
 pub fn sys_uname(name: *mut LinuxUtsName) -> SysResult {
-    // UNFINISHED: UTS namespaces, sethostname/setdomainname, and Linux
-    // personality-based uname release overrides are not implemented.
-    write_user_value(current_user_token(), name, &LinuxUtsName::current())?;
+    // UNFINISHED: UTS namespaces and sethostname/setdomainname are not
+    // implemented. The personality support below is limited to the UNAME26
+    // release override needed by Linux compatibility tests.
+    let uts = LinuxUtsName::current_for_personality(current_process().personality());
+    write_user_value(current_user_token(), name, &uts)?;
     Ok(0)
+}
+
+pub fn sys_personality(persona: usize) -> SysResult {
+    let old = current_process().personality();
+    if persona == PERSONALITY_QUERY {
+        return Ok(old as isize);
+    }
+
+    let persona = persona as u32;
+    // CONTEXT: Most execution-domain flags have no effect in this kernel. For
+    // now accept only PER_LINUX plus UNAME26, which is the ABI surface needed by
+    // uname04 and avoids pretending to support broader personality emulation.
+    if persona & !(PER_MASK | UNAME26) != 0 || persona & PER_MASK != PER_LINUX {
+        return Err(SysError::EINVAL);
+    }
+
+    current_process().set_personality(persona);
+    Ok(old as isize)
 }
 
 pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> SysResult {

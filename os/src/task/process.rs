@@ -547,6 +547,7 @@ pub struct ProcessControlBlockInner {
     pub(crate) is_child_subreaper: bool,
     pub(crate) no_new_privs: bool,
     pub(crate) thp_disabled: bool,
+    pub(crate) personality: u32,
     // UNFINISHED: Linux kernel credentials are per-thread, while POSIX
     // user-space expects process-wide synchronization. This first contest
     // compatibility model keeps credentials on the PCB and shares them across
@@ -956,6 +957,14 @@ impl ProcessControlBlock {
         let previous = inner.umask;
         inner.umask = mask & 0o777;
         previous
+    }
+
+    pub fn personality(&self) -> u32 {
+        self.inner_exclusive_access().personality
+    }
+
+    pub fn set_personality(&self, personality: u32) {
+        self.inner_exclusive_access().personality = personality;
     }
 
     pub fn replace_supplementary_groups(&self, groups: Vec<u32>) {
