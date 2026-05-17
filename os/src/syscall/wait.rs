@@ -139,8 +139,10 @@ pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsag
     if options < 0 || options & !(WNOHANG | WUNTRACED | WCONTINUED | WALL) != 0 {
         return Err(SysError::EINVAL);
     }
-    if pid == isize::MIN {
-        return Err(SysError::EINVAL);
+    if pid == i32::MIN as isize {
+        // CONTEXT: Linux rejects INT_MIN before treating negative pid values as
+        // process-group selectors because abs(INT_MIN) cannot be represented.
+        return Err(SysError::ESRCH);
     }
 
     loop {
