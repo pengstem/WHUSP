@@ -38,7 +38,10 @@ const F_SETPIPE_SZ: usize = 1031;
 const F_GETPIPE_SZ: usize = 1032;
 const F_ADD_SEALS: usize = 1033;
 const F_GET_SEALS: usize = 1034;
-const VALID_PIPE2_FLAGS: u32 = OpenFlags::NONBLOCK.bits() | OpenFlags::CLOEXEC.bits();
+// UNFINISHED: O_DIRECT is accepted as an observable pipe status flag, but
+// packet-mode read/write semantics are still regular byte-stream pipe behavior.
+const VALID_PIPE2_FLAGS: u32 =
+    OpenFlags::NONBLOCK.bits() | OpenFlags::CLOEXEC.bits() | OpenFlags::DIRECT.bits();
 const VALID_DUP3_FLAGS: u32 = OpenFlags::CLOEXEC.bits();
 const MAX_PIPE_SIZE_ARG: usize = 1 << 31;
 const MFD_CLOEXEC: u32 = 0x0001;
@@ -104,8 +107,7 @@ pub(crate) fn close_detached_fd_entry(entry: FdTableEntry) {
 
 fn pipe2_open_flags(flags: u32) -> SysResult<OpenFlags> {
     if flags & !VALID_PIPE2_FLAGS != 0 {
-        // UNFINISHED: pipe2 currently supports only O_NONBLOCK and O_CLOEXEC;
-        // Linux O_DIRECT packet mode and notification pipes are not implemented.
+        // UNFINISHED: Linux notification pipes are not implemented.
         return Err(SysError::EINVAL);
     }
     Ok(OpenFlags::from_bits_truncate(flags))

@@ -1,7 +1,7 @@
 use super::dentry_cache;
 use super::dirent::{DT_DIR, DT_LNK, DT_REG, RawDirEntry, write_dir_entries};
 use super::mount;
-use super::pipe::{PIPE_MAX_CAPACITY, PIPE_MIN_CAPACITY};
+use super::pipe::{PIPE_DEFAULT_CAPACITY, PIPE_MAX_CAPACITY, PIPE_MIN_CAPACITY};
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
 use super::{FileStat, FileTimestamp, S_IFDIR, S_IFLNK, S_IFREG};
 use crate::config::PAGE_SIZE;
@@ -97,7 +97,11 @@ const PID_TASK_TID_MASK: u32 = (1 << PID_TASK_PID_SHIFT) - 1;
 const PID_TASK_MAX_PID: usize = 1 << (30 - PID_TASK_PID_SHIFT);
 const PID_TASK_MAX_LOCAL_TID: usize = 1 << PID_TASK_PID_SHIFT;
 const DEFAULT_PID_MAX: usize = 4_194_304;
-const DEFAULT_PIPE_USER_PAGES_SOFT: usize = 1;
+// CONTEXT: Linux defaults this sysctl to 16384 pages, but this kernel does not
+// account pipe pages per user and still has a smaller fd-table ceiling. Expose
+// one default pipe worth of pages so pipe-limit tests exercise real pipe
+// behavior instead of deriving a zero-pipe workload.
+const DEFAULT_PIPE_USER_PAGES_SOFT: usize = PIPE_DEFAULT_CAPACITY / PAGE_SIZE;
 const DEFAULT_LEASE_BREAK_TIME: usize = 45;
 const DEFAULT_NET_IPV4_CONF_TAG: isize = 0;
 const PROC_MEMINFO_OBSERVED_CACHE_KB: usize = 64 * 1024;
