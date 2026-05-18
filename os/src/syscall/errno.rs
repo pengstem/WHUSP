@@ -57,6 +57,7 @@ pub enum SysError {
     ENOTCONN = 107,
     ECONNREFUSED = 111,
     ETIMEDOUT = 110,
+    ESTALE = 116,
     EDQUOT = 122,
     ENOKEY = 126,
 }

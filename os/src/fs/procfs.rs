@@ -65,6 +65,7 @@ const BLOCK_CACHE_STATS_INO: u32 = 38;
 const DENTRY_CACHE_STATS_INO: u32 = 39;
 const EXEC_LOAD_STATS_INO: u32 = 40;
 const CORE_PATTERN_INO: u32 = 41;
+const VERSION_INO: u32 = 42;
 const PID_DIR_BASE: u32 = 100;
 const PID_FILE_BASE: u32 = 10_000;
 const PID_FILE_STRIDE: u32 = 32;
@@ -85,6 +86,7 @@ const PID_TIMERSLACK_OFFSET: u32 = 13;
 const PID_NS_PID_OFFSET: u32 = 14;
 const PID_NS_USER_OFFSET: u32 = 15;
 const PID_NS_UTS_OFFSET: u32 = 16;
+const PID_EXE_OFFSET: u32 = 17;
 const PID_FD_ENTRY_BASE: u32 = 1_000_000;
 const PID_FDINFO_ENTRY_BASE: u32 = 2_000_000;
 const PID_FD_ENTRY_STRIDE: u32 = 4096;
@@ -180,6 +182,7 @@ enum ProcNode {
     BlockCacheStats,
     DentryCacheStats,
     ExecLoadStats,
+    Version,
     Domainname,
     Tainted,
     PidDir(usize),
@@ -187,6 +190,7 @@ enum ProcNode {
     PidStatus(usize),
     PidComm(usize),
     PidCmdline(usize),
+    PidExe(usize),
     PidTimerslack(usize),
     PidFdDir(usize),
     PidFdEntry(usize, usize),
@@ -431,6 +435,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         BLOCK_CACHE_STATS_INO => Some(ProcNode::BlockCacheStats),
         DENTRY_CACHE_STATS_INO => Some(ProcNode::DentryCacheStats),
         EXEC_LOAD_STATS_INO => Some(ProcNode::ExecLoadStats),
+        VERSION_INO => Some(ProcNode::Version),
         ino if ino >= PID_FDINFO_ENTRY_BASE => {
             let rel = ino - PID_FDINFO_ENTRY_BASE;
             let pid = (rel / PID_FD_ENTRY_STRIDE) as usize;
@@ -478,6 +483,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
                 PID_NS_PID_OFFSET => Some(ProcNode::PidNsPid(pid)),
                 PID_NS_USER_OFFSET => Some(ProcNode::PidNsUser(pid)),
                 PID_NS_UTS_OFFSET => Some(ProcNode::PidNsUts(pid)),
+                PID_EXE_OFFSET => Some(ProcNode::PidExe(pid)),
                 _ => None,
             }
         }
@@ -510,7 +516,7 @@ fn node_kind(node: ProcNode) -> FsNodeKind {
         | ProcNode::PidNsDir(_)
         | ProcNode::PidTaskDir(_)
         | ProcNode::PidTaskTidDir(_, _) => FsNodeKind::Directory,
-        ProcNode::PidFdEntry(_, _) => FsNodeKind::Symlink,
+        ProcNode::PidExe(_) | ProcNode::PidFdEntry(_, _) => FsNodeKind::Symlink,
         _ => FsNodeKind::RegularFile,
     }
 }
@@ -555,6 +561,11 @@ fn root_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: CPUINFO_INO,
         name: "cpuinfo".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: VERSION_INO,
+        name: "version".into(),
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
@@ -923,6 +934,11 @@ fn pid_entries(pid: usize) -> Vec<RawDirEntry> {
         ino: pid_file_ino(pid, PID_CMDLINE_OFFSET),
         name: "cmdline".into(),
         dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_EXE_OFFSET),
+        name: "exe".into(),
+        dtype: DT_LNK,
     });
     entries.push(RawDirEntry {
         ino: pid_file_ino(pid, PID_FD_DIR_OFFSET),
@@ -1601,6 +1617,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::Meminfo => Ok(meminfo_content().into_bytes()),
         ProcNode::Uptime => Ok(uptime_content().into_bytes()),
         ProcNode::Cpuinfo => Ok(cpuinfo_content().into_bytes()),
+        ProcNode::Version => Ok(b"Linux version 6.8.0-whusp (oskernel2026)\n".to_vec()),
         ProcNode::PidMax => Ok(pid_max_content().into_bytes()),
         ProcNode::KeysGcDelay => Ok(keyring::key_gc_delay_content().into_bytes()),
         ProcNode::KeysMaxkeys => Ok(keyring::key_maxkeys_content().into_bytes()),
@@ -1639,7 +1656,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::PidTimerslack(pid) => lookup_process(pid)
             .map(pid_timerslack_content)
             .ok_or(FsError::NotFound),
-        ProcNode::PidFdEntry(_, _) => Err(FsError::InvalidInput),
+        ProcNode::PidExe(_) | ProcNode::PidFdEntry(_, _) => Err(FsError::InvalidInput),
         ProcNode::PidFdInfoEntry(pid, fd) => pid_fdinfo_content(pid, fd).map(String::into_bytes),
         ProcNode::PidMaps(pid) => pid2process(pid)
             .map(|process| process.proc_maps_content().into_bytes())
@@ -1757,6 +1774,7 @@ impl FileSystemBackend for ProcFs {
                 "meminfo" => Ok((MEMINFO_INO, FsNodeKind::RegularFile)),
                 "uptime" => Ok((UPTIME_INO, FsNodeKind::RegularFile)),
                 "cpuinfo" => Ok((CPUINFO_INO, FsNodeKind::RegularFile)),
+                "version" => Ok((VERSION_INO, FsNodeKind::RegularFile)),
                 "sys" => Ok((SYS_DIR_INO, FsNodeKind::Directory)),
                 "self" => {
                     let pid = crate::task::current_process().getpid();
@@ -1878,6 +1896,7 @@ impl FileSystemBackend for ProcFs {
                     pid_file_ino(pid, PID_CMDLINE_OFFSET),
                     FsNodeKind::RegularFile,
                 )),
+                "exe" => Ok((pid_file_ino(pid, PID_EXE_OFFSET), FsNodeKind::Symlink)),
                 "fd" => Ok((pid_file_ino(pid, PID_FD_DIR_OFFSET), FsNodeKind::Directory)),
                 "fdinfo" => Ok((
                     pid_file_ino(pid, PID_FDINFO_DIR_OFFSET),
@@ -2074,7 +2093,9 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::PidNsDir(_)
             | ProcNode::PidTaskDir(_)
             | ProcNode::PidTaskTidDir(_, _) => FileStat::with_mode(S_IFDIR | 0o555),
-            ProcNode::PidFdEntry(_, _) => FileStat::with_mode(S_IFLNK | 0o777),
+            ProcNode::PidExe(_) | ProcNode::PidFdEntry(_, _) => {
+                FileStat::with_mode(S_IFLNK | 0o777)
+            }
             ProcNode::PidMax
             | ProcNode::KeysGcDelay
             | ProcNode::KeysMaxkeys
@@ -2117,23 +2138,28 @@ impl FileSystemBackend for ProcFs {
     }
 
     fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
-        let ProcNode::PidFdEntry(pid, fd) = decode_node(ino).ok_or(FsError::NotFound)? else {
-            return Err(FsError::InvalidInput);
-        };
-        let process = pid2process(pid).ok_or(FsError::NotFound)?;
-        let target = {
-            let inner = process.inner_exclusive_access();
-            let entry = inner
-                .fd_table
-                .get(fd)
-                .and_then(Option::as_ref)
-                .ok_or(FsError::NotFound)?;
-            let file = entry.file();
-            entry
-                .dir_path()
-                .map(String::from)
-                .or_else(|| file.proc_fd_target())
-                .unwrap_or_else(|| format!("/proc/{pid}/fd/{fd} (deleted)"))
+        let node = decode_node(ino).ok_or(FsError::NotFound)?;
+        let target = match node {
+            ProcNode::PidExe(pid) => {
+                lookup_process(pid).ok_or(FsError::NotFound)?;
+                format!("/proc/{pid}/cmdline")
+            }
+            ProcNode::PidFdEntry(pid, fd) => {
+                let process = pid2process(pid).ok_or(FsError::NotFound)?;
+                let inner = process.inner_exclusive_access();
+                let entry = inner
+                    .fd_table
+                    .get(fd)
+                    .and_then(Option::as_ref)
+                    .ok_or(FsError::NotFound)?;
+                let file = entry.file();
+                entry
+                    .dir_path()
+                    .map(String::from)
+                    .or_else(|| file.proc_fd_target())
+                    .unwrap_or_else(|| format!("/proc/{pid}/fd/{fd} (deleted)"))
+            }
+            _ => return Err(FsError::InvalidInput),
         };
         let len = target.len().min(buf.len());
         buf[..len].copy_from_slice(&target.as_bytes()[..len]);

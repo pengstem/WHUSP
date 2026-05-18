@@ -181,6 +181,7 @@ const SYSCALL_PRLIMIT64: usize = 261;
 const SYSCALL_FANOTIFY_INIT: usize = 262;
 const SYSCALL_FANOTIFY_MARK: usize = 263;
 const SYSCALL_NAME_TO_HANDLE_AT: usize = 264;
+const SYSCALL_OPEN_BY_HANDLE_AT: usize = 265;
 const SYSCALL_CLOCK_ADJTIME: usize = 266;
 const SYSCALL_SYNCFS: usize = 267;
 const SYSCALL_SETNS: usize = 268;
@@ -208,6 +209,7 @@ const SYSCALL_FSMOUNT: usize = 432;
 const SYSCALL_FSPICK: usize = 433;
 const SYSCALL_PIDFD_OPEN: usize = 434;
 const SYSCALL_CLONE3: usize = 435;
+const SYSCALL_OPENAT2: usize = 437;
 const SYSCALL_FACCESSAT2: usize = 439;
 const SYSCALL_EPOLL_PWAIT2: usize = 441;
 const SYSCALL_MEMFD_SECRET: usize = 447;
@@ -476,6 +478,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[1] as *const u8,
             args[2] as u32,
             args[3] as u32,
+        ),
+        SYSCALL_OPENAT2 => sys_openat2(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
         ),
         SYSCALL_CLOSE => sys_close(args[0]),
         SYSCALL_PIPE2 => sys_pipe2(args[0] as *mut i32, args[1] as u32),
@@ -815,6 +823,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *mut i32,
             args[4] as i32,
         ),
+        SYSCALL_OPEN_BY_HANDLE_AT => {
+            sys_open_by_handle_at(args[0] as isize, args[1] as *const u8, args[2] as u32)
+        }
         SYSCALL_PERF_EVENT_OPEN => sys_perf_event_open(
             args[0] as *const u8,
             args[1] as isize,

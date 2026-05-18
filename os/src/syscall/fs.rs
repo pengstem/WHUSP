@@ -31,7 +31,7 @@ pub use fd_compat::{
 pub(crate) use fd_lock::{
     release_flock_locks_for_closed_fd_table, release_record_locks_for_process,
 };
-pub use file_handle::sys_name_to_handle_at;
+pub use file_handle::{sys_name_to_handle_at, sys_open_by_handle_at};
 pub(crate) use inotify::{
     INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES, inotify_fdinfo,
 };
@@ -48,8 +48,8 @@ pub use mount::{
 pub(crate) use path::path_context_from;
 pub use path::{
     sys_chdir, sys_chroot, sys_faccessat, sys_faccessat2, sys_fchdir, sys_getcwd, sys_getdents64,
-    sys_linkat, sys_mkdirat, sys_mknodat, sys_openat, sys_readlinkat, sys_renameat2, sys_symlinkat,
-    sys_truncate, sys_umask, sys_unlinkat, sys_utimensat,
+    sys_linkat, sys_mkdirat, sys_mknodat, sys_openat, sys_openat2, sys_readlinkat, sys_renameat2,
+    sys_symlinkat, sys_truncate, sys_umask, sys_unlinkat, sys_utimensat,
 };
 pub use poll::{sys_ppoll, sys_pselect6};
 pub use stat::{

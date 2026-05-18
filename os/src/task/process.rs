@@ -585,6 +585,11 @@ impl ProcessControlBlockInner {
             .min(FD_LIMIT)
     }
 
+    /// Finds the next fd number without installing an entry.
+    ///
+    /// Callers that need rollback-safe publication must keep the allocation and
+    /// final `set_fd_entry` ordering explicit; this helper does not reserve the
+    /// slot in the table.
     pub fn alloc_fd_from(&mut self, lower_bound: usize) -> Option<usize> {
         let limit = self.nofile_limit();
         if lower_bound >= limit {
@@ -773,6 +778,8 @@ impl ProcessControlBlock {
         self.inner_exclusive_access().get_task(0)
     }
 
+    /// Records the task that must be released when a CLONE_VFORK child execs
+    /// or exits.
     pub(crate) fn begin_vfork(&self, parent_task: Arc<TaskControlBlock>) {
         self.inner_exclusive_access().vfork_parent = Some(parent_task);
     }
@@ -781,6 +788,10 @@ impl ProcessControlBlock {
         self.inner_exclusive_access().vfork_parent.is_some()
     }
 
+    /// Wakes the saved CLONE_VFORK parent exactly once.
+    ///
+    /// The parent task is stored on the child PCB because either execve() or
+    /// process exit can complete the vfork critical section.
     pub(crate) fn release_vfork_parent(&self) {
         let parent_task = self.inner_exclusive_access().vfork_parent.take();
         if let Some(parent_task) = parent_task {

@@ -368,6 +368,9 @@ pub(crate) fn prepare_exec_thread_group(
     process_token: usize,
     process_id: usize,
 ) -> SysResult<Arc<TaskControlBlock>> {
+    // Linux execve() is thread-group destructive: sibling threads disappear
+    // and a non-leader caller becomes the new leader for the preserved PID.
+    // Return the task whose TaskUserRes and TrapContext will be rebuilt.
     let current_tid = current.inner_exclusive_access().tid;
     let thread_count = process.inner_exclusive_access().thread_count();
     if thread_count <= 1 {
@@ -647,6 +650,9 @@ fn exit_current(exit_code: i32, group_exit: bool) {
                     }
                 }
             }
+            // Signal delivery and wait wakeups are separate contracts. The
+            // exit signal targets the parent leader, while every blocked parent
+            // task may be sleeping in wait4()/waitid() and needs a wake hint.
             for parent_task in parent_tasks {
                 let is_blocked =
                     parent_task.inner_exclusive_access().task_status == TaskStatus::Blocked;

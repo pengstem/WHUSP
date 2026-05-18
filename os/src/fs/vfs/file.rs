@@ -9,7 +9,10 @@ use super::super::mount::{
 use super::super::named_fifo::open_named_fifo;
 use super::super::path::{PathContext, WorkingDir};
 use super::super::status_flags::StatusFlagsCell;
-use super::super::{FS_APPEND_FL, FS_IMMUTABLE_FL, File, FileStat, FileTimestamp, SeekWhence};
+use super::super::{
+    FS_APPEND_FL, FS_IMMUTABLE_FL, File, FileStat, FileTimestamp, S_IFBLK, S_IFCHR, S_IFDIR,
+    S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, SeekWhence,
+};
 use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
 use crate::mm::{UserBuffer, page_cache::PageCacheId};
@@ -620,6 +623,64 @@ pub(crate) fn open_file_in_with_attrs(
     }
     open_vfs_file_impl(context, name, flags, create_attrs)
         .map(|file| file as Arc<dyn File + Send + Sync>)
+}
+
+fn node_kind_from_mode(mode: u32) -> FsNodeKind {
+    match mode & S_IFMT {
+        S_IFDIR => FsNodeKind::Directory,
+        S_IFREG => FsNodeKind::RegularFile,
+        S_IFLNK => FsNodeKind::Symlink,
+        S_IFIFO => FsNodeKind::Fifo,
+        S_IFCHR => FsNodeKind::CharacterDevice,
+        S_IFBLK => FsNodeKind::BlockDevice,
+        S_IFSOCK => FsNodeKind::Socket,
+        _ => FsNodeKind::Other,
+    }
+}
+
+pub(crate) fn open_file_handle_node(
+    node: VfsNodeId,
+    flags: OpenFlags,
+    namespace_id: MountNamespaceId,
+) -> FsResult<Arc<dyn File + Send + Sync>> {
+    if mount_is_devfs(node.mount_id) {
+        return devfs::open_inode(node.mount_id, node.ino, flags);
+    }
+
+    let stat =
+        with_mount(node.mount_id, |mount| mount.stat(node.ino)).ok_or(FsError::NotFound)??;
+    let kind = node_kind_from_mode(stat.mode);
+    if flags.contains(OpenFlags::DIRECTORY) && kind != FsNodeKind::Directory {
+        return Err(FsError::NotDir);
+    }
+    if kind == FsNodeKind::Directory && !flags.can_open_directory() {
+        return Err(FsError::IsDir);
+    }
+    if kind == FsNodeKind::Symlink && !flags.contains(OpenFlags::PATH) {
+        return Err(FsError::Loop);
+    }
+    if kind == FsNodeKind::Fifo {
+        return open_named_fifo(node, OpenFlags::file_status_flags(flags));
+    }
+
+    let (readable, writable) = flags.read_write();
+    if kind == FsNodeKind::RegularFile && writable && regular_file_node_is_executable(node) {
+        return Err(FsError::TextBusy);
+    }
+    if kind == FsNodeKind::RegularFile && flags.contains(OpenFlags::TRUNC) && writable {
+        ensure_mount_writable(node.mount_id)?;
+        with_mount(node.mount_id, |mount| mount.set_len(node.ino, 0)).ok_or(FsError::Io)??;
+    }
+
+    Ok(Arc::new(VfsFile::new(
+        VfsPath::new(node, kind),
+        None,
+        readable,
+        writable,
+        OpenFlags::file_status_flags(flags),
+        namespace_id,
+        false,
+    )?))
 }
 
 pub(crate) fn link_open_file_in(

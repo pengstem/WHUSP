@@ -36,6 +36,10 @@ pub struct LinuxCloneArgs {
     cgroup: u64,
 }
 
+/// Decodes the architecture-specific raw clone argument order.
+///
+/// RISC-V passes TLS before child_tid in args 4/5, while the LoongArch syscall
+/// ABI used by the contest libc passes child_tid before TLS.
 fn clone_tls_and_ctid_args(raw_arg4: usize, raw_arg5: usize) -> (usize, usize) {
     #[cfg(target_arch = "loongarch64")]
     {
@@ -186,6 +190,9 @@ fn write_user_value_to_process<T: Copy>(
     ptr: *mut T,
     value: &T,
 ) -> SysResult<()> {
+    // Write clone metadata into the child address space before it can run.
+    // Parent and child do not necessarily share VM, so current_user_token()
+    // would target the wrong memory set for CLONE_CHILD_SETTID.
     let mut inner = process.inner_exclusive_access();
     write_user_value_in_memory_set(&mut inner.memory_set, ptr, value)
 }
@@ -329,6 +336,9 @@ fn sys_clone_vm_helper(args: CloneArgs, synthetic_newnet: bool) -> SysResult {
     let linux_tid = cloned.linux_tid;
     {
         let mut task_inner = cloned.task.inner_exclusive_access();
+        // CONTEXT: CLONE_VM process-compatibility children have no separate
+        // PCB. Mark them so exit_group(), getpid(), and procfs namespace probes
+        // expose the child-like Linux surface without killing the parent.
         task_inner.clone_vm_process_helper = true;
         task_inner.synthetic_newnet = synthetic_newnet;
     }

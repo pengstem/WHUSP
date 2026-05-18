@@ -29,6 +29,9 @@ impl VirtIOBlock {
     fn read_block_uncached(&self, block_id: usize, buf: &mut [u8]) {
         let nb = *DEV_NON_BLOCKING_ACCESS.exclusive_access();
         if nb {
+            // The nonblocking virtio API borrows req/buf/resp until
+            // complete_read_blocks(); this task's kernel stack stays live
+            // while schedule() switches to another task.
             let mut req = BlkReq::default();
             let mut resp = BlkResp::default();
             let mut token = 0;
@@ -64,6 +67,8 @@ impl VirtIOBlock {
     fn write_block_uncached(&self, block_id: usize, buf: &[u8]) {
         let nb = *DEV_NON_BLOCKING_ACCESS.exclusive_access();
         if nb {
+            // Same lifetime contract as the read path: the request objects
+            // must remain in this blocked task frame until completion.
             let mut req = BlkReq::default();
             let mut resp = BlkResp::default();
             let mut token = 0;
@@ -146,6 +151,8 @@ impl VirtIOBlock {
         let channels = virtio_blk.virt_queue_size();
         let virtio_blk = unsafe { UPIntrFreeCell::new(virtio_blk) };
         let mut condvars = BTreeMap::new();
+        // Nonblocking tokens are virtqueue descriptor-head indexes, so the
+        // wait-channel count follows virt_queue_size(), not disk capacity.
         for i in 0..channels {
             let condvar = Condvar::new();
             condvars.insert(i, condvar);

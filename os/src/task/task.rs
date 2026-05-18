@@ -134,7 +134,11 @@ pub struct TaskControlBlockInner {
     pub default_timer_slack_ns: usize,
     pub seccomp_mode: u8,
     pub seccomp_filter: Option<Vec<SeccompSockFilter>>,
+    // Same-PCB helper used for CLONE_VM process compatibility paths; it should
+    // exit like a child helper, not terminate the whole parent thread group.
     pub clone_vm_process_helper: bool,
+    // Exposes a temporary new-net namespace view for CLONE_VM helper tasks that
+    // exist only to satisfy namespace probes while sharing the parent PCB.
     pub synthetic_newnet: bool,
     pub(crate) thread_keyring: Option<i32>,
 }
