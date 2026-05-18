@@ -60,6 +60,65 @@ const VALID_OPENAT2_RESOLVE_FLAGS: u64 = RESOLVE_NO_XDEV
     | RESOLVE_CACHED;
 const OPENAT2_MODE_MASK: u64 = 0o7777;
 
+pub(crate) struct EmptyAtPath {
+    file: Arc<dyn File + Send + Sync>,
+    dir_path: Option<String>,
+}
+
+impl EmptyAtPath {
+    pub(crate) fn file(&self) -> Arc<dyn File + Send + Sync> {
+        Arc::clone(&self.file)
+    }
+
+    pub(crate) fn into_parts(self) -> (Arc<dyn File + Send + Sync>, Option<String>) {
+        (self.file, self.dir_path)
+    }
+
+    pub(crate) fn working_dir(&self) -> SysResult<WorkingDir> {
+        self.file.working_dir().ok_or(SysError::ENOTDIR)
+    }
+
+    pub(crate) fn dir_path_or_fd(&self, dirfd: isize) -> String {
+        self.dir_path
+            .clone()
+            .unwrap_or_else(|| alloc::format!("<fd:{dirfd}>"))
+    }
+}
+
+pub(crate) enum AtPath<'a> {
+    Path(&'a str),
+    Empty(EmptyAtPath),
+}
+
+pub(crate) fn resolve_at_path<'a>(
+    snapshot: &PathSnapshot,
+    dirfd: isize,
+    path: &'a str,
+    allow_empty_path: bool,
+) -> SysResult<AtPath<'a>> {
+    if !path.is_empty() {
+        return Ok(AtPath::Path(path));
+    }
+    if !allow_empty_path {
+        return Err(SysError::ENOENT);
+    }
+    if dirfd == AT_FDCWD {
+        let file = open_file_in(snapshot.context.clone(), ".", OpenFlags::PATH)?;
+        return Ok(AtPath::Empty(EmptyAtPath {
+            file,
+            dir_path: Some(snapshot.cwd_path.clone()),
+        }));
+    }
+    if dirfd < 0 {
+        return Err(SysError::EBADF);
+    }
+    let entry = get_fd_entry_by_fd(dirfd as usize)?;
+    Ok(AtPath::Empty(EmptyAtPath {
+        file: entry.file(),
+        dir_path: entry.dir_path().map(String::from),
+    }))
+}
+
 fn dirfd_context_from(snapshot: &PathSnapshot, dirfd: isize) -> SysResult<(WorkingDir, String)> {
     if dirfd == AT_FDCWD {
         return Ok((snapshot.context.cwd(), snapshot.cwd_path.clone()));
@@ -747,19 +806,12 @@ pub fn sys_utimensat(
     let token = current_user_token();
     let path = read_user_c_string(token, pathname, PATH_MAX)?;
     let snapshot = current_process().path_snapshot();
-    if path.is_empty() {
-        if flags & AT_EMPTY_PATH == 0 {
-            return Err(SysError::ENOENT);
-        }
-        if dirfd == AT_FDCWD {
-            let file = open_file_in(snapshot.context, ".", OpenFlags::PATH)?;
+    match resolve_at_path(&snapshot, dirfd, path.as_str(), flags & AT_EMPTY_PATH != 0)? {
+        AtPath::Empty(empty) => {
+            let (file, _) = empty.into_parts();
             return apply_utimensat_to_file(file, times, now);
         }
-        if dirfd < 0 {
-            return Err(SysError::EBADF);
-        }
-        let file = get_file_by_fd(dirfd as usize)?;
-        return apply_utimensat_to_file(file, times, now);
+        AtPath::Path(_) => {}
     }
 
     let open_flags = if flags & AT_SYMLINK_NOFOLLOW != 0 {

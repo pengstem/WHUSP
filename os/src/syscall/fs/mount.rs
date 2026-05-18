@@ -11,10 +11,11 @@ use alloc::string::String;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{PATH_MAX, read_user_c_string};
-use super::fd::{get_fd_entry_by_fd, get_file_by_fd, install_file_fd};
+use super::fd::{get_file_by_fd, install_file_fd};
 use super::inotify::inotify_notify_unmount;
 use super::path::{
-    check_current_access_path_prefixes_from, normalize_path_from, path_context_from,
+    AtPath, check_current_access_path_prefixes_from, normalize_path_from, path_context_from,
+    resolve_at_path,
 };
 use super::uapi::{AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW};
 
@@ -167,79 +168,45 @@ fn install_open_tree_path_fd(
     open_flags: OpenFlags,
 ) -> SysResult {
     let snapshot = current_process().path_snapshot();
-    if path.is_empty() {
-        if flags & AT_EMPTY_PATH as u32 == 0 {
-            return Err(SysError::ENOENT);
+    match resolve_at_path(&snapshot, dirfd, path, flags & AT_EMPTY_PATH as u32 != 0)? {
+        AtPath::Empty(empty) => {
+            let (file, dir_path) = empty.into_parts();
+            return install_file_fd(file, open_flags, dir_path);
         }
-        if dirfd == AT_FDCWD {
-            let file = open_file_in(snapshot.context.clone(), ".", OpenFlags::PATH)?;
-            return install_file_fd(file, open_flags, Some(snapshot.cwd_path));
+        AtPath::Path(path) => {
+            check_current_access_path_prefixes_from(&snapshot, dirfd, path)?;
+            let dir_path = normalize_path_from(&snapshot, dirfd, path).ok();
+            let file = open_file_in(path_context_from(&snapshot, dirfd, path)?, path, open_flags)?;
+            install_file_fd(file, open_flags, dir_path)
         }
-        if dirfd < 0 {
-            return Err(SysError::EBADF);
-        }
-        let entry = get_fd_entry_by_fd(dirfd as usize)?;
-        return install_file_fd(entry.file(), open_flags, entry.dir_path().map(String::from));
     }
-
-    check_current_access_path_prefixes_from(&snapshot, dirfd, path)?;
-    let dir_path = normalize_path_from(&snapshot, dirfd, path).ok();
-    let file = open_file_in(path_context_from(&snapshot, dirfd, path)?, path, open_flags)?;
-    install_file_fd(file, open_flags, dir_path)
 }
 
 fn open_tree_source_dir(dirfd: isize, path: &str, flags: u32) -> SysResult<(WorkingDir, String)> {
     let snapshot = current_process().path_snapshot();
-    if path.is_empty() {
-        if flags & AT_EMPTY_PATH as u32 == 0 {
-            return Err(SysError::ENOENT);
+    match resolve_at_path(&snapshot, dirfd, path, flags & AT_EMPTY_PATH as u32 != 0)? {
+        AtPath::Empty(empty) => Ok((empty.working_dir()?, empty.dir_path_or_fd(dirfd))),
+        AtPath::Path(path) => {
+            check_current_access_path_prefixes_from(&snapshot, dirfd, path)?;
+            let context = path_context_from(&snapshot, dirfd, path)?;
+            let source = lookup_existing_dir_in(context, path)?;
+            let source_path = normalize_path_from(&snapshot, dirfd, path)?;
+            Ok((source, source_path))
         }
-        if dirfd == AT_FDCWD {
-            return Ok((snapshot.context.cwd(), snapshot.cwd_path));
-        }
-        if dirfd < 0 {
-            return Err(SysError::EBADF);
-        }
-        let entry = get_fd_entry_by_fd(dirfd as usize)?;
-        let source = entry.file().working_dir().ok_or(SysError::ENOTDIR)?;
-        let source_path = entry
-            .dir_path()
-            .map(String::from)
-            .unwrap_or_else(|| alloc::format!("<fd:{dirfd}>"));
-        return Ok((source, source_path));
     }
-
-    check_current_access_path_prefixes_from(&snapshot, dirfd, path)?;
-    let context = path_context_from(&snapshot, dirfd, path)?;
-    let source = lookup_existing_dir_in(context, path)?;
-    let source_path = normalize_path_from(&snapshot, dirfd, path)?;
-    Ok((source, source_path))
 }
 
 fn move_mount_target(dirfd: isize, path: &str, flags: u32) -> SysResult<(WorkingDir, String)> {
     let snapshot = current_process().path_snapshot();
-    if path.is_empty() {
-        if flags & MOVE_MOUNT_T_EMPTY_PATH == 0 {
-            return Err(SysError::ENOENT);
+    match resolve_at_path(&snapshot, dirfd, path, flags & MOVE_MOUNT_T_EMPTY_PATH != 0)? {
+        AtPath::Empty(empty) => Ok((empty.working_dir()?, empty.dir_path_or_fd(dirfd))),
+        AtPath::Path(path) => {
+            let context = path_context_from(&snapshot, dirfd, path)?;
+            let target = lookup_mount_target_dir_in(context, path)?;
+            let target_path = normalize_path_from(&snapshot, dirfd, path)?;
+            Ok((target, target_path))
         }
-        if dirfd == AT_FDCWD {
-            return Ok((snapshot.context.cwd(), snapshot.cwd_path));
-        }
-        if dirfd < 0 {
-            return Err(SysError::EBADF);
-        }
-        let entry = get_fd_entry_by_fd(dirfd as usize)?;
-        let target = entry.file().working_dir().ok_or(SysError::ENOTDIR)?;
-        let target_path = entry
-            .dir_path()
-            .map(String::from)
-            .unwrap_or_else(|| alloc::format!("<fd:{dirfd}>"));
-        return Ok((target, target_path));
     }
-    let context = path_context_from(&snapshot, dirfd, path)?;
-    let target = lookup_mount_target_dir_in(context, path)?;
-    let target_path = normalize_path_from(&snapshot, dirfd, path)?;
-    Ok((target, target_path))
 }
 
 fn supported_fs_context(fs_name: &str) -> bool {

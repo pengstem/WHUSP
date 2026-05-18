@@ -16,7 +16,9 @@ use super::super::user_ptr::{
 use super::fanotify::fanotify_notify_attrib;
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::inotify::inotify_notify_attrib;
-use super::path::{check_current_access_path_prefixes_from, path_context_from};
+use super::path::{
+    AtPath, check_current_access_path_prefixes_from, path_context_from, resolve_at_path,
+};
 use super::uapi::{
     AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, LinuxKstat, LinuxStatfs, LinuxStatx,
     STATX_RESERVED, VALID_FCHOWNAT_FLAGS, VALID_FSTATAT_FLAGS, VALID_STATX_FLAGS,
@@ -73,25 +75,16 @@ fn reject_proc_self_fd_o_path(path: &str) -> SysResult<()> {
     Ok(())
 }
 
-fn stat_by_dirfd_from(snapshot: &PathSnapshot, dirfd: isize) -> SysResult<FileStat> {
-    if dirfd == AT_FDCWD {
-        return Ok(stat_in(snapshot.context.clone(), ".", true)?);
-    }
-    if dirfd < 0 {
-        return Err(SysError::EBADF);
-    }
-    Ok(get_file_by_fd(dirfd as usize)?.stat()?)
-}
-
 pub(super) fn resolve_stat_from(
     snapshot: &PathSnapshot,
     dirfd: isize,
     path: &str,
     follow_final_symlink: bool,
 ) -> SysResult<FileStat> {
-    if path.is_empty() {
-        return stat_by_dirfd_from(snapshot, dirfd);
-    }
+    let path = match resolve_at_path(snapshot, dirfd, path, true)? {
+        AtPath::Empty(empty) => return Ok(empty.file().stat()?),
+        AtPath::Path(path) => path,
+    };
     let is_absolute = path.starts_with('/');
     if !is_absolute && dirfd != AT_FDCWD && dirfd >= 0 {
         let file = get_file_by_fd(dirfd as usize)?;

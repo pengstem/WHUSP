@@ -3,7 +3,7 @@ use super::super::user_ptr::{
     PATH_MAX, copy_to_user, read_user_c_string, read_user_value, write_user_value,
 };
 use super::fd::{get_file_by_fd, install_file_fd};
-use super::path::{open_flags_from_user_bits, path_context_from};
+use super::path::{AtPath, open_flags_from_user_bits, path_context_from, resolve_at_path};
 use super::uapi::{AT_EMPTY_PATH, AT_FDCWD};
 use crate::fs::{FsError, MountId, VfsNodeId, lookup_path_in, open_file_handle_node};
 use crate::task::{current_process, current_user_token};
@@ -51,25 +51,14 @@ pub(crate) fn write_file_handle_record(record: &mut [u8], node: VfsNodeId) {
 
 fn resolve_handle_node(dirfd: isize, path: &str, flags: i32) -> SysResult<VfsNodeId> {
     let follow_final_symlink = flags & NAME_TO_HANDLE_AT_SYMLINK_FOLLOW != 0;
-    if path.is_empty() {
-        if flags & AT_EMPTY_PATH == 0 {
-            return Err(SysError::ENOENT);
-        }
-        if dirfd == AT_FDCWD {
-            let snapshot = current_process().path_snapshot();
-            let context = path_context_from(&snapshot, AT_FDCWD, ".")?;
-            return Ok(lookup_path_in(context, ".", follow_final_symlink)?.node);
-        }
-        if dirfd < 0 {
-            return Err(SysError::EBADF);
-        }
-        let file = get_file_by_fd(dirfd as usize)?;
-        return file.vfs_node_id().ok_or(SysError::EBADF);
-    }
-
     let snapshot = current_process().path_snapshot();
-    let context = path_context_from(&snapshot, dirfd, path)?;
-    Ok(lookup_path_in(context, path, follow_final_symlink)?.node)
+    match resolve_at_path(&snapshot, dirfd, path, flags & AT_EMPTY_PATH != 0)? {
+        AtPath::Empty(empty) => empty.file().vfs_node_id().ok_or(SysError::EBADF),
+        AtPath::Path(path) => {
+            let context = path_context_from(&snapshot, dirfd, path)?;
+            Ok(lookup_path_in(context, path, follow_final_symlink)?.node)
+        }
+    }
 }
 
 pub fn sys_name_to_handle_at(
