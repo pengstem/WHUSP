@@ -300,9 +300,7 @@ fn seccomp_filter_allows(filter: &[SeccompSockFilter], syscall_id: usize) -> boo
 fn seccomp_signal_for_syscall(syscall_id: usize) -> Option<SignalFlags> {
     const SECCOMP_MODE_STRICT: u8 = 1;
     const SECCOMP_MODE_FILTER: u8 = 2;
-    let Some(task) = current_task() else {
-        return None;
-    };
+    let task = current_task()?;
     let inner = task.inner_exclusive_access();
     match inner.seccomp_mode {
         SECCOMP_MODE_STRICT => (!matches!(

@@ -104,11 +104,11 @@ pub fn sys_ppoll(
             write_user_pollfds(token, fds, &pollfds)?;
             return Ok(ready as isize);
         }
-        if let Some(deadline_ms) = deadline_ms {
-            if get_time_ms() >= deadline_ms {
-                write_user_pollfds(token, fds, &pollfds)?;
-                return Ok(0);
-            }
+        if let Some(deadline_ms) = deadline_ms
+            && get_time_ms() >= deadline_ms
+        {
+            write_user_pollfds(token, fds, &pollfds)?;
+            return Ok(0);
         }
         if current_has_interrupting_signal() {
             return Err(SysError::EINTR);
@@ -205,9 +205,9 @@ pub fn sys_pselect6(
     let word_count = fdset_words(nfds);
 
     loop {
-        let mut read_output = Vec::from_iter(core::iter::repeat(0usize).take(word_count));
-        let mut write_output = Vec::from_iter(core::iter::repeat(0usize).take(word_count));
-        let mut except_output = Vec::from_iter(core::iter::repeat(0usize).take(word_count));
+        let mut read_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
+        let mut write_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
+        let mut except_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
 
         let ready = scan_fdset(
             nfds,

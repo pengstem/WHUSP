@@ -88,7 +88,7 @@ impl OverlayFs {
         real: VfsNodeId,
         f: impl FnOnce(&mut dyn FileSystemBackend, u32) -> V,
     ) -> FsResult<V> {
-        with_mount(real.mount_id, |mount| f(mount, real.ino)).ok_or_else(|| {
+        with_mount(real.mount_id, |mount| f(mount, real.ino)).ok_or({
             if ino == OVERLAY_ROOT_INO {
                 FsError::Io
             } else {

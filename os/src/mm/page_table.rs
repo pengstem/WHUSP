@@ -132,7 +132,7 @@ impl PageTable {
         let pte = self
             .find_pte_create(vpn)
             .expect("map requires intermediate page-table allocation to succeed");
-        assert!(pte.bits == 0, "vpn {:?} is mapped before mapping", vpn);
+        assert!(pte.bits == 0, "vpn {vpn:?} is mapped before mapping");
         let leaf_flags = PTEFlags::R | PTEFlags::W | PTEFlags::X;
         let flags = if flags.intersects(leaf_flags) {
             flags | PTEFlags::V
@@ -164,8 +164,7 @@ impl PageTable {
             .expect("unmap requires an existing page-table path");
         assert!(
             pte.is_valid() || pte.bits != 0,
-            "vpn {:?} is invalid before unmapping",
-            vpn
+            "vpn {vpn:?} is invalid before unmapping"
         );
         *pte = PageTableEntry::empty();
     }

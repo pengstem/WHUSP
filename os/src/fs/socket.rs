@@ -356,6 +356,10 @@ impl LocalSocketInner {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "socket connection state is clearer when local and peer metadata stay explicit"
+    )]
     fn connected(
         domain: SocketDomain,
         kind: SocketKind,
@@ -918,10 +922,10 @@ impl LocalSocket {
             }
             inner.peer_socket.as_ref().and_then(Weak::upgrade)
         };
-        if matches!(how, SHUT_WR | SHUT_RDWR) {
-            if let Some(peer) = peer {
-                peer.exclusive_access().peer_write_shutdown = true;
-            }
+        if matches!(how, SHUT_WR | SHUT_RDWR)
+            && let Some(peer) = peer
+        {
+            peer.exclusive_access().peer_write_shutdown = true;
         }
         Ok(0)
     }

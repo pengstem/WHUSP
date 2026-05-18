@@ -639,16 +639,15 @@ fn exit_current(exit_code: i32, group_exit: bool) {
 
         if let Some(parent) = parent {
             let parent_tasks = parent.tasks_snapshot();
-            if let Some(parent_task) = parent_tasks.first() {
-                if let Some(signal) = SignalFlags::from_signum(exit_signal) {
-                    if !signal.is_empty() {
-                        queue_signal_to_task(
-                            Arc::clone(&parent_task),
-                            signal,
-                            SignalInfo::child_exit(exit_signal as i32, pid as i32, exit_code),
-                        );
-                    }
-                }
+            if let Some(parent_task) = parent_tasks.first()
+                && let Some(signal) = SignalFlags::from_signum(exit_signal)
+                && !signal.is_empty()
+            {
+                queue_signal_to_task(
+                    Arc::clone(parent_task),
+                    signal,
+                    SignalInfo::child_exit(exit_signal as i32, pid as i32, exit_code),
+                );
             }
             // Signal delivery and wait wakeups are separate contracts. The
             // exit signal targets the parent leader, while every blocked parent

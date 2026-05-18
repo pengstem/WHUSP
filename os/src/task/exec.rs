@@ -255,6 +255,10 @@ impl ProcessControlBlock {
     /// argv/envp from userspace. This function owns the process image switch:
     /// memory set replacement, close-on-exec cleanup, signal reset, task resource
     /// rebuild, and initial trap context construction.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "exec receives already-resolved image resources and user vectors at the commit point"
+    )]
     pub fn exec(
         self: &Arc<Self>,
         elf: &xmas_elf::ElfFile<'_>,

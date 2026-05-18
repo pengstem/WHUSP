@@ -402,13 +402,14 @@ fn open_vfs_file_impl(
                 if flags.contains(OpenFlags::DIRECTORY) {
                     return Err(FsError::NotDir);
                 }
-                if path.kind == FsNodeKind::Symlink {
-                    if flags.contains(OpenFlags::NOFOLLOW) && !flags.contains(OpenFlags::PATH) {
-                        return Err(FsError::Loop);
-                    }
-                    // CONTEXT: readlinkat("", fd) needs an O_PATH|O_NOFOLLOW fd
-                    // that refers to the symlink itself; full O_PATH semantics are
-                    // intentionally deferred.
+                // CONTEXT: readlinkat("", fd) needs an O_PATH|O_NOFOLLOW fd
+                // that refers to the symlink itself; full O_PATH semantics are
+                // intentionally deferred.
+                if path.kind == FsNodeKind::Symlink
+                    && flags.contains(OpenFlags::NOFOLLOW)
+                    && !flags.contains(OpenFlags::PATH)
+                {
+                    return Err(FsError::Loop);
                 }
                 let (readable, writable) = flags.read_write();
                 if path.kind == FsNodeKind::RegularFile

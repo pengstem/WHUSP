@@ -334,6 +334,10 @@ impl FanotifyGroup {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "fanotify mark matching depends on explicit event, target, and reporting metadata"
+    )]
     fn event_bits_for_mark(
         mark: &FanotifyMark,
         mask: u64,
@@ -363,6 +367,10 @@ impl FanotifyGroup {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "queued fanotify events carry separate identity, source, and naming fields"
+    )]
     fn enqueue_event(
         &self,
         inner: &mut FanotifyInner,
@@ -436,6 +444,10 @@ impl FanotifyGroup {
         true
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "fanotify publication preserves the Linux event metadata at one boundary"
+    )]
     fn publish(
         &self,
         node: VfsNodeId,
@@ -952,15 +964,13 @@ fn validate_mark_args(group: &FanotifyGroup, flags: u32, mask: u64) -> Result<()
         if mask == 0 || mask & UNSUPPORTED_PERMISSION_EVENTS != 0 || mask & !KNOWN_MARK_MASK != 0 {
             return Err(SysError::EINVAL);
         }
-        if mask & (SUPPORTED_DIRENT_MARK_EVENTS | SUPPORTED_SELF_MARK_EVENTS) != 0 {
-            if group.init_flags & (FAN_REPORT_FID | FAN_REPORT_DIR_FID) == 0 {
-                return Err(SysError::EINVAL);
-            }
+        if mask & (SUPPORTED_DIRENT_MARK_EVENTS | SUPPORTED_SELF_MARK_EVENTS) != 0
+            && group.init_flags & (FAN_REPORT_FID | FAN_REPORT_DIR_FID) == 0
+        {
+            return Err(SysError::EINVAL);
         }
-        if mask & SUPPORTED_DIRENT_MARK_EVENTS != 0 {
-            if flags & FAN_MARK_MOUNT != 0 {
-                return Err(SysError::EINVAL);
-            }
+        if mask & SUPPORTED_DIRENT_MARK_EVENTS != 0 && flags & FAN_MARK_MOUNT != 0 {
+            return Err(SysError::EINVAL);
         }
         if mask & FAN_RENAME != 0 && group.init_flags & FAN_REPORT_NAME == 0 {
             return Err(SysError::EINVAL);

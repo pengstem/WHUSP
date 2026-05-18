@@ -16,6 +16,9 @@ pub const RLIM_INFINITY: usize = usize::MAX;
 const RLIMIT_COUNT: usize = RLimitResource::RtTime as usize + 1;
 pub(crate) const PROCESS_PKEY_COUNT: usize = 16;
 pub(crate) type ProcessPKeyRights = [Option<usize>; PROCESS_PKEY_COUNT];
+type TimerRearm = Option<(usize, u64)>;
+type RealTimerExpiry = (Arc<TaskControlBlock>, TimerRearm);
+type PosixTimerExpiry = (Arc<TaskControlBlock>, u32, TimerRearm);
 
 pub(crate) fn empty_process_pkey_rights() -> ProcessPKeyRights {
     [None; PROCESS_PKEY_COUNT]
@@ -993,7 +996,7 @@ impl ProcessControlBlock {
         &self,
         generation: u64,
         now_us: usize,
-    ) -> Option<(Arc<TaskControlBlock>, Option<(usize, u64)>)> {
+    ) -> Option<RealTimerExpiry> {
         let mut inner = self.inner_exclusive_access();
         if inner.timers.real.generation != generation
             || !inner.timers.real.is_armed()
@@ -1080,7 +1083,7 @@ impl ProcessControlBlock {
         timer_id: usize,
         generation: u64,
         now_us: usize,
-    ) -> Option<(Arc<TaskControlBlock>, u32, Option<(usize, u64)>)> {
+    ) -> Option<PosixTimerExpiry> {
         let mut inner = self.inner_exclusive_access();
         let timer = inner.timers.posix.get_mut(timer_id)?.as_mut()?;
         if timer.generation != generation || !timer.is_armed() || timer.next_expire_us > now_us {

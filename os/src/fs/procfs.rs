@@ -1,3 +1,8 @@
+#![expect(
+    clippy::vec_init_then_push,
+    reason = "procfs directory builders keep entries in display order with conditional additions"
+)]
+
 use super::dentry_cache;
 use super::dirent::{DT_DIR, DT_LNK, DT_REG, RawDirEntry, write_dir_entries};
 use super::mount;
@@ -462,9 +467,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
             let rel = ino - PID_FILE_BASE;
             let pid = (rel / PID_FILE_STRIDE) as usize;
             let offset = rel % PID_FILE_STRIDE;
-            if lookup_process(pid).is_none() {
-                return None;
-            }
+            lookup_process(pid)?;
             match offset {
                 PID_STAT_OFFSET => Some(ProcNode::PidStat(pid)),
                 PID_STATUS_OFFSET => Some(ProcNode::PidStatus(pid)),

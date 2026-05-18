@@ -259,15 +259,15 @@ impl TmpfsInode {
             } else {
                 None
             };
-            if extent_start < start {
-                if let Some(left) = left {
-                    self.sparse_data.insert(extent_start, left);
-                }
+            if extent_start < start
+                && let Some(left) = left
+            {
+                self.sparse_data.insert(extent_start, left);
             }
-            if extent_end > end {
-                if let Some(right) = right {
-                    self.sparse_data.insert(end, right);
-                }
+            if extent_end > end
+                && let Some(right) = right
+            {
+                self.sparse_data.insert(end, right);
             }
         }
     }
@@ -461,11 +461,11 @@ impl TmpFs {
             // until the last file reference is closed. This tmpfs currently
             // delays deletion only for non-directory inodes needed by
             // mkstemp/unlink/fstat style file workloads.
-            if parent_ino != ino {
-                if let Some(parent) = self.inodes.get_mut(&parent_ino) {
-                    parent.nlink = parent.nlink.saturating_sub(1);
-                    parent.touch();
-                }
+            if parent_ino != ino
+                && let Some(parent) = self.inodes.get_mut(&parent_ino)
+            {
+                parent.nlink = parent.nlink.saturating_sub(1);
+                parent.touch();
             }
             self.inodes.remove(&ino);
             return;
@@ -643,21 +643,21 @@ impl FileSystemBackend for TmpFs {
         };
         {
             let dst_parent = self.ensure_dir(dst_dir)?;
-            if let Some(existing_ino) = dst_parent.children.get(dst_name).copied() {
-                if existing_ino != src_ino {
-                    let existing = self.inode(existing_ino)?;
-                    if existing.kind == FsNodeKind::Directory && !existing.children.is_empty() {
-                        return Err(FsError::NotEmpty);
-                    }
+            if let Some(existing_ino) = dst_parent.children.get(dst_name).copied()
+                && existing_ino != src_ino
+            {
+                let existing = self.inode(existing_ino)?;
+                if existing.kind == FsNodeKind::Directory && !existing.children.is_empty() {
+                    return Err(FsError::NotEmpty);
                 }
             }
         }
 
         let replaced = self.inode_mut(dst_dir)?.children.remove(dst_name);
-        if let Some(replaced_ino) = replaced {
-            if replaced_ino != src_ino {
-                self.drop_inode_link(replaced_ino);
-            }
+        if let Some(replaced_ino) = replaced
+            && replaced_ino != src_ino
+        {
+            self.drop_inode_link(replaced_ino);
         }
         self.inode_mut(src_dir)?.children.remove(src_name);
         self.inode_mut(dst_dir)?
@@ -824,10 +824,10 @@ impl FileSystemBackend for TmpFs {
             out[..inline_len].copy_from_slice(&inode.data[start..start + inline_len]);
         }
         inode.copy_sparse_to(offset, out);
-        if len > 0 {
-            if let Ok(inode) = self.inode_mut(ino) {
-                inode.atime = FileTimestamp::now();
-            }
+        if len > 0
+            && let Ok(inode) = self.inode_mut(ino)
+        {
+            inode.atime = FileTimestamp::now();
         }
         len
     }

@@ -962,8 +962,8 @@ fn nanos_to_rtc_time(nanos: u64) -> LinuxRtcTime {
         31,
     ];
     let mut tm_yday = (d as i32) - 1;
-    for i in 0..(m as usize - 1) {
-        tm_yday += month_days[i];
+    for days in month_days.iter().take(m as usize - 1) {
+        tm_yday += days;
     }
 
     LinuxRtcTime {

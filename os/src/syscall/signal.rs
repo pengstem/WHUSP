@@ -360,10 +360,10 @@ pub fn sys_rt_sigtimedwait(
             return Err(SysError::EINTR);
         }
 
-        if let Some(deadline_ms) = deadline_ms {
-            if get_time_ms() >= deadline_ms {
-                return Err(SysError::EAGAIN);
-            }
+        if let Some(deadline_ms) = deadline_ms
+            && get_time_ms() >= deadline_ms
+        {
+            return Err(SysError::EAGAIN);
         }
 
         // UNFINISHED: A real Linux implementation sleeps interruptibly and is

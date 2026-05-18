@@ -91,10 +91,10 @@ pub(crate) fn translated_byte_buffer_checked_with_fault(
                     return Err(SysError::EFAULT);
                 }
                 pte = page_table.translate(vpn).ok_or(SysError::EFAULT)?;
-            } else if let Some(fault_handler) = fault_handler {
-                if fault_handler(start, access) {
-                    pte = page_table.translate(vpn).ok_or(SysError::EFAULT)?;
-                }
+            } else if let Some(fault_handler) = fault_handler
+                && fault_handler(start, access)
+            {
+                pte = page_table.translate(vpn).ok_or(SysError::EFAULT)?;
             }
             if !user_pte_allows(pte, access, reject_zero_ppn) {
                 return Err(SysError::EFAULT);

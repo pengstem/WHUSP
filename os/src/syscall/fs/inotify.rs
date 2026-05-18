@@ -258,6 +258,10 @@ impl InotifyGroup {
         user_buf.copy_from_slice(data.as_slice())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "inotify publication keeps watch target and event fields explicit"
+    )]
     fn publish(
         &self,
         node: VfsNodeId,

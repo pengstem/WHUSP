@@ -71,12 +71,12 @@ impl MmapFaultPage {
     pub fn build_frame(&self) -> Option<FrameTracker> {
         let frame = frame_alloc()?;
         let mut read_len = 0usize;
-        if let Some(file) = &self.backing_file {
-            if self.read_len > 0 {
-                let end = self.dst_offset.checked_add(self.read_len)?;
-                let dst = frame.ppn.get_bytes_array().get_mut(self.dst_offset..end)?;
-                read_len = file.read_at(self.file_offset, dst);
-            }
+        if let Some(file) = &self.backing_file
+            && self.read_len > 0
+        {
+            let end = self.dst_offset.checked_add(self.read_len)?;
+            let dst = frame.ppn.get_bytes_array().get_mut(self.dst_offset..end)?;
+            read_len = file.read_at(self.file_offset, dst);
         }
         if self.exec_fault {
             super::elf_loader::record_exec_lazy_fault(
@@ -201,17 +201,14 @@ impl MemorySet {
                     let frame = if cow_resident || can_share_resident {
                         FrameTracker::from_retained(src_pte.ppn())
                     } else {
-                        frame_alloc().map(|frame| {
-                            frame
-                                .ppn
-                                .get_bytes_array()
-                                .copy_from_slice(src_pte.ppn().get_bytes_array());
-                            frame
-                        })
+                        let frame = frame_alloc()?;
+                        frame
+                            .ppn
+                            .get_bytes_array()
+                            .copy_from_slice(src_pte.ppn().get_bytes_array());
+                        Some(frame)
                     };
-                    let Some(frame) = frame else {
-                        return None;
-                    };
+                    let frame = frame?;
                     let pte_flags = if cow_resident {
                         cow_flags_from_pte(src_pte)
                     } else {
@@ -248,12 +245,8 @@ impl MemorySet {
                 let area_idx = memory_set.areas.len() - 1;
                 let resident_vpns: Vec<_> = area.data_frames.keys().copied().collect();
                 for vpn in resident_vpns {
-                    let Some(src_pte) = user_space.page_table.translate(vpn) else {
-                        return None;
-                    };
-                    let Some(frame) = FrameTracker::from_retained(src_pte.ppn()) else {
-                        return None;
-                    };
+                    let src_pte = user_space.page_table.translate(vpn)?;
+                    let frame = FrameTracker::from_retained(src_pte.ppn())?;
                     let pte_flags = cow_flags_from_pte(src_pte);
                     let page_table = &mut memory_set.page_table;
                     let dst_area = &mut memory_set.areas[area_idx];
@@ -270,12 +263,8 @@ impl MemorySet {
                     return None;
                 }
                 for vpn in area.vpn_range {
-                    let Some(src_ppn) = user_space.translate(vpn).map(|pte| pte.ppn()) else {
-                        return None;
-                    };
-                    let Some(dst_ppn) = memory_set.translate(vpn).map(|pte| pte.ppn()) else {
-                        return None;
-                    };
+                    let src_ppn = user_space.translate(vpn).map(|pte| pte.ppn())?;
+                    let dst_ppn = memory_set.translate(vpn).map(|pte| pte.ppn())?;
                     dst_ppn
                         .get_bytes_array()
                         .copy_from_slice(src_ppn.get_bytes_array());
@@ -288,9 +277,7 @@ impl MemorySet {
                     let Some(src_pte) = user_space.translate(vpn) else {
                         continue;
                     };
-                    let Some(frame) = FrameTracker::from_retained(src_pte.ppn()) else {
-                        return None;
-                    };
+                    let frame = FrameTracker::from_retained(src_pte.ppn())?;
                     let page_table = &mut memory_set.page_table;
                     let dst_area = &mut memory_set.areas[area_idx];
                     if !dst_area.map_existing_frame(page_table, vpn, frame) {
@@ -506,6 +493,10 @@ impl MemorySet {
     /// No user pages are allocated here unless mlock-future state requests
     /// later fault accounting; regular mmap contents are populated lazily by
     /// the page-fault path.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mmap metadata mirrors syscall arguments and VMA attributes at the mapping boundary"
+    )]
     pub fn mmap_area(
         &mut self,
         len: usize,
@@ -546,6 +537,10 @@ impl MemorySet {
     ///
     /// Any removed MAP_SHARED pages are returned as deferred flush records so
     /// the caller can write them back after releasing the memory-set lock.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "fixed mmap needs the same explicit VMA metadata plus replacement range"
+    )]
     pub fn mmap_fixed_area(
         &mut self,
         start: usize,
@@ -615,6 +610,10 @@ impl MemorySet {
         Some((start, flushes))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "ELF segment mapping keeps loader-provided segment metadata explicit"
+    )]
     pub(super) fn map_exec_segment_area(
         &mut self,
         start: usize,
@@ -791,17 +790,16 @@ impl MemorySet {
             0
         };
         if let (Some(page_cache_id), Some(backing_file)) = (info.page_cache_id, &info.backing_file)
+            && let Some(key) = PageCacheKey::from_file_offset(page_cache_id, file_offset)
         {
-            if let Some(key) = PageCacheKey::from_file_offset(page_cache_id, file_offset) {
-                return Some(MmapFaultResult::PageCache(MmapPageCacheFault {
-                    vpn,
-                    key,
-                    file_offset,
-                    read_len,
-                    file_size_at_load: info.file_size,
-                    backing_file: backing_file.clone(),
-                }));
-            }
+            return Some(MmapFaultResult::PageCache(MmapPageCacheFault {
+                vpn,
+                key,
+                file_offset,
+                read_len,
+                file_size_at_load: info.file_size,
+                backing_file: backing_file.clone(),
+            }));
         }
         Some(MmapFaultResult::Page(MmapFaultPage {
             vpn,
@@ -860,12 +858,8 @@ impl MemorySet {
         if len == 0 || start % PAGE_SIZE != 0 {
             return None;
         }
-        let Some(map_len) = checked_page_align_up(len) else {
-            return None;
-        };
-        let Some(end) = start.checked_add(map_len) else {
-            return None;
-        };
+        let map_len = checked_page_align_up(len)?;
+        let end = start.checked_add(map_len)?;
         let start_vpn = VirtAddr::from(start).floor();
         let end_vpn = VirtAddr::from(end).floor();
 
@@ -1382,7 +1376,7 @@ fn apply_mlock_flags(area: &mut MapArea, locked: bool, on_fault: bool) {
 }
 
 fn normalized_mmap_hint(hint: usize) -> usize {
-    if hint < USER_MMAP_BASE || hint >= USER_MMAP_LIMIT {
+    if !(USER_MMAP_BASE..USER_MMAP_LIMIT).contains(&hint) {
         USER_MMAP_BASE
     } else {
         page_align_up(hint)

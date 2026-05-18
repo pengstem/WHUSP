@@ -225,7 +225,7 @@ fn open_backend(
                 )
             })
             .map_err(|err| {
-                warn!("ext4 open failed: {:?}", err);
+                warn!("ext4 open failed: {err:?}");
                 MountError::InvalidFilesystem
             }),
     }
@@ -646,12 +646,12 @@ fn copy_bind_propagation_from_source(event: &mut DynamicMount, source: &DynamicM
     // slave of the source peer group when the destination parent is not
     // shared. This preserves multi-level slave chains such as fs_bind21's
     // dir1 -> dir2 -> dir3 -> dir4 setup.
-    if source.master_group.is_some() {
-        if let Some(source_group) = source.peer_group {
-            event.propagation = MountPropagation::Slave;
-            event.peer_group = None;
-            event.master_group = Some(source_group);
-        }
+    if source.master_group.is_some()
+        && let Some(source_group) = source.peer_group
+    {
+        event.propagation = MountPropagation::Slave;
+        event.peer_group = None;
+        event.master_group = Some(source_group);
     }
 }
 
@@ -968,10 +968,10 @@ fn propagate_unmount_event(mounts: &mut Vec<DynamicMount>, event: &DynamicMount)
             .cloned()
             .collect();
         for peer in &peers {
-            if peer.master_group == Some(group) {
-                if let Some(peer_group) = peer.peer_group {
-                    queue_group_once(&mut queue, peer_group);
-                }
+            if peer.master_group == Some(group)
+                && let Some(peer_group) = peer.peer_group
+            {
+                queue_group_once(&mut queue, peer_group);
             }
         }
         for peer in peers {
@@ -1174,7 +1174,7 @@ pub(crate) fn mount_fat_device_at(
         )
     };
     let fat_mount = FatMount::open(device, partition).map_err(|err| {
-        warn!("fat open failed: {:?}", err);
+        warn!("fat open failed: {err:?}");
         MountError::InvalidFilesystem
     })?;
     mount_new_fs_at(
@@ -1549,8 +1549,8 @@ pub(crate) fn mount_bind_at(
                         })
                         .and_then(|mount| mount.peer_group)
                         .or(root.peer_group);
-                } else if copied_child_group.is_some() {
-                    if let Some(parent) = mounts
+                } else if copied_child_group.is_some()
+                    && let Some(parent) = mounts
                         .iter()
                         .filter(|mount| {
                             mount.namespace_id == namespace_id
@@ -1562,10 +1562,9 @@ pub(crate) fn mount_bind_at(
                                 .is_some()
                         })
                         .max_by_key(|mount| mount.target_path.len())
-                    {
-                        cloned.propagation_parent_path = parent.target_path.clone();
-                        cloned.propagation_parent_group = parent.peer_group;
-                    }
+                {
+                    cloned.propagation_parent_path = parent.target_path.clone();
+                    cloned.propagation_parent_group = parent.peer_group;
                 }
                 if let Some(group) = copied_child_group {
                     cloned.propagation = MountPropagation::Shared;
