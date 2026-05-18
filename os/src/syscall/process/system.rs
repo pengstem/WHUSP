@@ -26,7 +26,7 @@ const SYSLOG_BUF_SIZE: usize = 4096;
 const PERSONALITY_QUERY: usize = 0xffff_ffff;
 const PER_LINUX: u32 = 0;
 const PER_MASK: u32 = 0xff;
-const UNAME26: u32 = 0x0020_000;
+const UNAME26: u32 = 0x0002_0000;
 const UNAME26_RELEASE: &str = "2.6.60";
 
 static SYSLOG_FAKE_MSG: &[u8] = b"<5>[    0.000000] Linux version 5.10.0 (whusp@oscomp)\n";

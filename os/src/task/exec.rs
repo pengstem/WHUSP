@@ -30,12 +30,17 @@ const AT_SECURE: usize = 23;
 const AT_RANDOM: usize = 25;
 
 #[cfg(target_arch = "riscv64")]
-const ELF_HWCAP: usize = (1 << ('I' as usize - 'A' as usize))
-    | (1 << ('M' as usize - 'A' as usize))
-    | (1 << ('A' as usize - 'A' as usize))
-    | (1 << ('F' as usize - 'A' as usize))
-    | (1 << ('D' as usize - 'A' as usize))
-    | (1 << ('C' as usize - 'A' as usize));
+const fn riscv_hwcap(letter: u8) -> usize {
+    1usize << (letter - b'A')
+}
+
+#[cfg(target_arch = "riscv64")]
+const ELF_HWCAP: usize = riscv_hwcap(b'I')
+    | riscv_hwcap(b'M')
+    | riscv_hwcap(b'A')
+    | riscv_hwcap(b'F')
+    | riscv_hwcap(b'D')
+    | riscv_hwcap(b'C');
 #[cfg(not(target_arch = "riscv64"))]
 const ELF_HWCAP: usize = 0;
 

@@ -1,6 +1,6 @@
-///! Ref: https://www.lammertbies.nl/comm/info/serial-uart
-///! Ref: ns16550a datasheet: https://datasheetspdf.com/pdf-file/605590/NationalSemiconductor/NS16550A/1
-///! Ref: ns16450 datasheet: https://datasheetspdf.com/pdf-file/1311818/NationalSemiconductor/NS16450/1
+//! Ref: https://www.lammertbies.nl/comm/info/serial-uart
+//! Ref: ns16550a datasheet: https://datasheetspdf.com/pdf-file/605590/NationalSemiconductor/NS16550A/1
+//! Ref: ns16450 datasheet: https://datasheetspdf.com/pdf-file/1311818/NationalSemiconductor/NS16450/1
 use crate::board::CharDeviceImpl;
 use crate::sync::{Condvar, UPIntrFreeCell};
 #[cfg(not(target_arch = "loongarch64"))]

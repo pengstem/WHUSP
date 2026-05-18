@@ -204,9 +204,8 @@ pub(crate) fn lookup_existing_dir_in(context: PathContext, name: &str) -> FsResu
 }
 
 pub(crate) fn mkdir_in(context: PathContext, name: &str, mode: u32) -> FsResult {
-    match final_component(name) {
-        Some("." | ".." | "/") => return Err(FsError::AlreadyExists),
-        _ => {}
+    if let Some("." | ".." | "/") = final_component(name) {
+        return Err(FsError::AlreadyExists);
     }
     let target = resolve_create_parent_in(context.clone(), trimmed_nonroot_path(name))?;
     ensure_create_target_absent(&context, &target, false)?;
@@ -438,9 +437,8 @@ pub(crate) fn rename_in(
 
 pub(crate) fn unlink_file_in(context: PathContext, name: &str) -> FsResult {
     let trailing_slash = has_trailing_slash(name);
-    match final_component(name) {
-        Some("." | ".." | "/") => return Err(FsError::IsDir),
-        _ => {}
+    if let Some("." | ".." | "/") = final_component(name) {
+        return Err(FsError::IsDir);
     }
     let target = resolve_create_parent_in(context.clone(), trimmed_nonroot_path(name))?;
     let Some((_, kind, is_synthetic)) = lookup_create_target(&context, &target)? else {

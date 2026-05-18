@@ -134,10 +134,7 @@ pub(crate) struct FileCreateAttrs {
 
 impl FileCreateAttrs {
     fn can_keep_setgid(&self, gid: u32) -> bool {
-        self.euid == 0
-            || self.egid == gid
-            || self.fsgid == gid
-            || self.groups.iter().any(|group| *group == gid)
+        self.euid == 0 || self.egid == gid || self.fsgid == gid || self.groups.contains(&gid)
     }
 }
 

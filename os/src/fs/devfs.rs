@@ -1221,7 +1221,7 @@ fn write_loop0_at(offset: usize, buf: &[u8]) -> usize {
         super::mount::reset_ext_scratch_mount("/dev/loop0");
     }
     let size = loop0_size() as usize;
-    let write_size = if offset < size {
+    if offset < size {
         buf.len().min(size - offset)
     } else {
         // CONTEXT: BusyBox mkfs.ext2 uses full_write(), which retries forever if a
@@ -1229,8 +1229,7 @@ fn write_loop0_at(offset: usize, buf: &[u8]) -> usize {
         // capacity still report a Linux-like short count for LOOP_SET_CAPACITY
         // tests; only EOF-only scratch writes are accepted to keep mkfs setup moving.
         buf.len()
-    };
-    write_size
+    }
 }
 
 fn read_loop0(offset: &UPIntrFreeCell<usize>, mut user_buf: UserBuffer) -> usize {
@@ -2462,10 +2461,10 @@ impl File for DevFsFile {
         let mut offset = self.offset.exclusive_access();
         if self.node == DevNode::Pts {
             let entries = pts_dir_entries();
-            return copy_dynamic_dirents(entries.as_slice(), &mut *offset, user_buf);
+            return copy_dynamic_dirents(entries.as_slice(), &mut offset, user_buf);
         }
         let entries = dir_entries(self.node).ok_or(FsError::NotDir)?;
-        copy_dirents(entries, &mut *offset, user_buf)
+        copy_dirents(entries, &mut offset, user_buf)
     }
 
     fn is_tty(&self) -> bool {

@@ -5,6 +5,10 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(isize)]
 #[allow(dead_code)]
+#[expect(
+    clippy::upper_case_acronyms,
+    reason = "Linux errno names intentionally keep their ABI spelling"
+)]
 pub enum SysError {
     EPERM = 1,
     ENOENT = 2,

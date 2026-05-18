@@ -675,7 +675,7 @@ pub fn sys_mount(
             let block_source = parse_virtio_block_source(source.as_str())?;
             match mount_fat_device_at(
                 namespace_id,
-                target_dir.clone(),
+                target_dir,
                 block_source.device_index,
                 block_source.partition_index,
                 target_path.as_str(),
@@ -702,7 +702,7 @@ pub fn sys_mount(
             let options = if data.is_null() {
                 String::new()
             } else {
-                read_user_c_string(token, data as *const u8, PATH_MAX)?
+                read_user_c_string(token, data, PATH_MAX)?
             };
             let lower =
                 overlay_option_value(options.as_str(), "lowerdir=").ok_or(SysError::EINVAL)?;

@@ -412,6 +412,6 @@ pub(crate) use vfs::{
     track_regular_file_executable, truncate_in, untrack_regular_file_executable,
 };
 
-pub(self) fn align_up(value: usize, align: usize) -> usize {
+fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }

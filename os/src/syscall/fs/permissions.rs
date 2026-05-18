@@ -45,7 +45,7 @@ impl<'a> AccessSubject<'a> {
     }
 
     fn in_group(self, gid: u32) -> bool {
-        self.gid == gid || self.groups.iter().any(|group| *group == gid)
+        self.gid == gid || self.groups.contains(&gid)
     }
 }
 

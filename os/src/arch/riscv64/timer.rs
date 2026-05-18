@@ -111,15 +111,13 @@ impl PartialEq for TimerCondVar {
 impl Eq for TimerCondVar {}
 impl PartialOrd for TimerCondVar {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        let a = -(self.expire_ms as isize);
-        let b = -(other.expire_ms as isize);
-        Some(a.cmp(&b))
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for TimerCondVar {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap()
+        other.expire_ms.cmp(&self.expire_ms)
     }
 }
 

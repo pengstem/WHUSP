@@ -107,7 +107,7 @@ impl VfsCursor {
         }
     }
 
-    fn as_path(self) -> VfsPath {
+    fn into_path(self) -> VfsPath {
         VfsPath::with_visible_path(self.node, self.kind, self.path)
     }
 
@@ -359,7 +359,7 @@ pub(crate) fn resolve_existing_in(
     path: &str,
     mode: LookupMode,
 ) -> FsResult<VfsPath> {
-    let resolved = resolve_path_inner(context, path, mode)?.as_path();
+    let resolved = resolve_path_inner(context, path, mode)?.into_path();
     if path.ends_with('/') && resolved.kind != FsNodeKind::Directory {
         return Err(FsError::NotDir);
     }

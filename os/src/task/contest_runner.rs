@@ -78,7 +78,7 @@ enum LtpCaseFilter {
 }
 
 pub(super) fn build_runner_command() -> String {
-    if INTERACTIVE_SHELL || TEST_SCRIPTS.is_empty() {
+    if INTERACTIVE_SHELL || string_slice_is_empty(TEST_SCRIPTS) {
         return "/musl/busybox mkdir -p /tmp/bin && /musl/busybox --install -s /tmp/bin; export PATH=/tmp/bin:/musl:/glibc:$PATH && cd /musl && exec /musl/busybox sh".into();
     }
     let mut command = String::new();
@@ -256,7 +256,7 @@ fn append_ltp_case_loop(command: &mut String) {
 
 fn append_ltp_manifest_whitelist_case_loop(command: &mut String) {
     let case_names = super::ltp_whitelist::LTP_CASE_WHITELIST;
-    if case_names.is_empty() {
+    if string_slice_is_empty(case_names) {
         command.push_str(":; ");
         return;
     }
@@ -355,10 +355,7 @@ fn ltp_case_filter() -> LtpCaseFilter {
         }
         Some(option) if option.starts_with("cases:") => {
             let case_names = &option["cases:".len()..];
-            if case_names
-                .split(',')
-                .all(|case_name| is_ltp_case_name(case_name))
-            {
+            if case_names.split(',').all(is_ltp_case_name) {
                 LtpCaseFilter::ExactSet(case_names)
             } else {
                 LtpCaseFilter::Invalid
@@ -374,10 +371,11 @@ fn ltp_case_filter() -> LtpCaseFilter {
         }
         Some(option) if option.starts_with("range:") => {
             let range = &option["range:".len()..];
-            if let Some((start, end)) = range.split_once(',') {
-                if is_ltp_case_boundary(start) && is_ltp_case_boundary(end) {
-                    return LtpCaseFilter::Range(start, end);
-                }
+            if let Some((start, end)) = range.split_once(',')
+                && is_ltp_case_boundary(start)
+                && is_ltp_case_boundary(end)
+            {
+                return LtpCaseFilter::Range(start, end);
             }
             LtpCaseFilter::Invalid
         }
@@ -394,7 +392,7 @@ fn ltp_case_filter() -> LtpCaseFilter {
 
 fn append_ltp_whitelist_filter(command: &mut String) {
     let case_names = super::ltp_whitelist::LTP_CASE_WHITELIST;
-    if case_names.is_empty() {
+    if string_slice_is_empty(case_names) {
         command.push_str("continue; ");
         return;
     }
@@ -444,6 +442,10 @@ fn append_ltp_string_slice_words(command: &mut String, words: &[&str]) {
         first = false;
         command.push_str(word);
     }
+}
+
+fn string_slice_is_empty(words: &[&str]) -> bool {
+    words.is_empty()
 }
 
 fn is_ltp_case_boundary(name: &str) -> bool {

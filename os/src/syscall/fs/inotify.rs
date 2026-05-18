@@ -487,12 +487,12 @@ fn wake_waiters(waiters: VecDeque<Arc<TaskControlBlock>>) {
 }
 
 fn node_is_unlinked(node: VfsNodeId) -> bool {
-    INOTIFY_UNLINKED_NODES.exclusive_session(|nodes| nodes.iter().any(|stored| *stored == node))
+    INOTIFY_UNLINKED_NODES.exclusive_session(|nodes| nodes.contains(&node))
 }
 
 fn mark_node_unlinked(node: VfsNodeId) {
     INOTIFY_UNLINKED_NODES.exclusive_session(|nodes| {
-        if !nodes.iter().any(|stored| *stored == node) {
+        if !nodes.contains(&node) {
             nodes.push(node);
         }
     });

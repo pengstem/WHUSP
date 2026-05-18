@@ -22,6 +22,7 @@ use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
+use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use lazy_static::lazy_static;
@@ -728,8 +729,7 @@ fn append_report_fid_info(
     };
     let raw_len = FANOTIFY_FID_INFO_BASE_LEN + WHUSP_FILE_HANDLE_BYTES + name_len;
     let len = align_to_eight(raw_len);
-    let mut info = Vec::new();
-    info.resize(len, 0);
+    let mut info = vec![0; len];
     info[0] = if init_flags & FAN_REPORT_NAME != 0 {
         FAN_EVENT_INFO_TYPE_DFID_NAME
     } else if init_flags & FAN_REPORT_DIR_FID != 0 {
@@ -756,8 +756,7 @@ fn append_report_fid_info(
         return;
     };
     let len = align_to_eight(FANOTIFY_FID_INFO_BASE_LEN + WHUSP_FILE_HANDLE_BYTES);
-    let mut info = Vec::new();
-    info.resize(len, 0);
+    let mut info = vec![0; len];
     info[0] = FAN_EVENT_INFO_TYPE_FID;
     info[1] = 0;
     info[2..4].copy_from_slice(&(len as u16).to_ne_bytes());

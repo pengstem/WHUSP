@@ -253,7 +253,7 @@ pub fn default_signal_action(signum: usize) -> Option<DefaultSignalAction> {
         9 => Some(Terminate),
         17 | 23 | 28 => Some(Ignore),
         18 => Some(Continue),
-        19 | 20 | 21 | 22 => Some(Stop),
+        19..=22 => Some(Stop),
         SIGRTMIN..=SIGRTMAX => Some(Terminate),
         _ => None,
     }

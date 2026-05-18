@@ -298,7 +298,7 @@ fn fcntl_set_lease(fd: usize, arg: usize) -> SysResult {
         // Full Linux lease breaking, SIGIO notification, and open/truncate
         // blocking are still not implemented.
         0 if entry.file().writable() => Err(SysError::EAGAIN),
-        0 | 1 | 2 => Ok(0),
+        0..=2 => Ok(0),
         _ => Err(SysError::EINVAL),
     }
 }

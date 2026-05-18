@@ -207,13 +207,13 @@ impl RecordLockTable {
     ) -> Vec<PosixLock> {
         self.locks
             .iter()
-            .cloned()
             .filter(|lock| {
                 lock.key == key
                     && !lock.owner.same_owner(owner)
                     && lock_conflicts(lock.l_type, requested_type)
                     && ranges_overlap(lock.start, lock.end, start, end)
             })
+            .cloned()
             .collect()
     }
 

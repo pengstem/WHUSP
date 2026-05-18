@@ -175,7 +175,7 @@ fn prepare_mode_change(stat: FileStat, mode: u32) -> SysResult<u32> {
         && credentials.euid != 0
         && credentials.egid != stat.gid
         && credentials.fsgid != stat.gid
-        && !credentials.groups.iter().any(|group| *group == stat.gid)
+        && !credentials.groups.contains(&stat.gid)
     {
         mode &= !MODE_SETGID;
     }
@@ -195,7 +195,7 @@ fn ensure_can_change_owner(stat: FileStat, uid: Option<u32>, gid: Option<u32>) -
         && let Some(group) = gid
         && (group == credentials.egid
             || group == credentials.fsgid
-            || credentials.groups.iter().any(|member| *member == group))
+            || credentials.groups.contains(&group))
     {
         return Ok(());
     }

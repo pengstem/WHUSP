@@ -45,8 +45,13 @@ impl<T> UPSafeCellRaw<T> {
             inner: UnsafeCell::new(value),
         }
     }
-    pub fn get_mut(&self) -> &mut T {
-        unsafe { &mut (*self.inner.get()) }
+    fn with_mut<F, V>(&self, f: F) -> V
+    where
+        F: FnOnce(&mut T) -> V,
+    {
+        // SAFETY: this raw cell is used only for the interrupt-masking
+        // recursion counter on the current uniprocessor kernel path.
+        unsafe { f(&mut *self.inner.get()) }
     }
 }
 
@@ -103,16 +108,16 @@ impl<T> UPIntrFreeCell<T> {
 
     /// Panic if the data has been borrowed.
     pub fn exclusive_access(&self) -> UPIntrRefMut<'_, T> {
-        INTR_MASKING_INFO.get_mut().enter();
+        INTR_MASKING_INFO.with_mut(IntrMaskingInfo::enter);
         UPIntrRefMut(Some(self.inner.borrow_mut()))
     }
 
     pub fn try_exclusive_access(&self) -> Option<UPIntrRefMut<'_, T>> {
-        INTR_MASKING_INFO.get_mut().enter();
+        INTR_MASKING_INFO.with_mut(IntrMaskingInfo::enter);
         match self.inner.try_borrow_mut() {
             Ok(inner) => Some(UPIntrRefMut(Some(inner))),
             Err(_) => {
-                INTR_MASKING_INFO.get_mut().exit();
+                INTR_MASKING_INFO.with_mut(IntrMaskingInfo::exit);
                 None
             }
         }
@@ -130,7 +135,7 @@ impl<T> UPIntrFreeCell<T> {
 impl<'a, T> Drop for UPIntrRefMut<'a, T> {
     fn drop(&mut self) {
         self.0 = None;
-        INTR_MASKING_INFO.get_mut().exit();
+        INTR_MASKING_INFO.with_mut(IntrMaskingInfo::exit);
     }
 }
 

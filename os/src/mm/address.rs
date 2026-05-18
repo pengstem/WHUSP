@@ -3,7 +3,7 @@ use crate::arch::mm as arch_mm;
 use crate::config::{PAGE_SIZE, PAGE_SIZE_BITS};
 use core::fmt::{self, Debug, Formatter};
 
-/// Definitions
+// Definitions
 #[repr(C)]
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub struct PhysAddr(pub usize);
@@ -20,8 +20,7 @@ pub struct PhysPageNum(pub usize);
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub struct VirtPageNum(pub usize);
 
-/// Debugging
-
+// Debugging
 impl Debug for VirtAddr {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_fmt(format_args!("VA:{:#x}", self.0))
@@ -43,10 +42,9 @@ impl Debug for PhysPageNum {
     }
 }
 
-/// T: {PhysAddr, VirtAddr, PhysPageNum, VirtPageNum}
-/// T -> usize: T.0
-/// usize -> T: usize.into()
-
+// T: {PhysAddr, VirtAddr, PhysPageNum, VirtPageNum}
+// T -> usize: T.0
+// usize -> T: usize.into()
 impl From<usize> for PhysAddr {
     fn from(v: usize) -> Self {
         Self(arch_mm::canonicalize_phys_addr(v))

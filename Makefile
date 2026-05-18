@@ -14,7 +14,14 @@ TEST_DISK_LA ?= $(CURDIR)/sdcard-la.img
 CONTEST_AUX_DISK ?= $(CURDIR)/disk.img
 CONTEST_AUX_DISK_LA ?= $(CURDIR)/disk-la.img
 
-all: kernel-rv kernel-la
+all: validation
+
+validation:
+	@$(MAKE) --no-print-directory fmt
+	@$(MAKE) --no-print-directory kernel-rv
+	@$(MAKE) --no-print-directory kernel-la
+
+validate: validation
 
 kernel-rv:
 	@$(MAKE) --no-print-directory -C os ARCH=riscv64 MODE=$(MODE) kernel
@@ -37,4 +44,4 @@ clean:
 	@$(MAKE) --no-print-directory -C os clean
 	@rm -f kernel-rv kernel-la disk.img disk-la.img
 
-.PHONY: all kernel-rv kernel-la run-rv run-la fmt clean
+.PHONY: all validation validate kernel-rv kernel-la run-rv run-la fmt clean
