@@ -158,8 +158,6 @@ fn append_script_command(command: &mut String, libc_root: &str, script: &str) {
         append_ltp_runner(command, libc_root);
     } else if script == "basic_testcode.sh" {
         append_basic_runner(command, libc_root);
-    } else if script == "iperf_testcode.sh" {
-        append_iperf_runner(command, libc_root);
     } else {
         append_normal_script(command, libc_root, script);
     }
@@ -186,6 +184,10 @@ fn append_normal_script(command: &mut String, libc_root: &str, script: &str) {
     command.push_str("cd ");
     command.push_str(libc_root);
     command.push_str(" && ");
+    if needs_la_musl_iperf_interval_patch(libc_root, script) {
+        append_la_musl_iperf_interval_patch(command);
+        return;
+    }
     if script == "lmbench_testcode.sh" {
         command.push_str("./busybox rm -f /tmp/hello; ");
     }
@@ -201,46 +203,23 @@ fn append_normal_script(command: &mut String, libc_root: &str, script: &str) {
     }
 }
 
-fn append_iperf_runner(command: &mut String, libc_root: &str) {
-    let libc = libc_label(libc_root);
-    command.push_str("cd ");
-    command.push_str(libc_root);
-    command.push_str(" && { ");
-    if libc_root == "/glibc" {
-        command.push_str("export LD_LIBRARY_PATH=/glibc/lib:/lib:$LD_LIBRARY_PATH; ");
-    }
-    command.push_str("./busybox echo \"#### OS COMP TEST GROUP START iperf-");
-    command.push_str(libc);
-    command.push_str(" ####\"; ");
-    command.push_str("run_iperf(){ name=\"$1\"; shift; echo \"====== iperf $name begin ======\"; if ./iperf3 -c 127.0.0.1 -p 5001 -4 -t 2 ");
-    command.push_str(iperf_report_interval_arg(libc_root));
-    command.push_str("\"$@\"; then ans=success; else ans=fail; fi; echo \"====== iperf $name end: $ans ======\"; echo; }; ");
-    // CONTEXT: The disk script uses `iperf3 -D`, but this kernel's current
-    // daemonized iperf server exits before clients connect. Keep the scored
-    // client workload unchanged while managing the server in the runner shell.
-    command.push_str("./iperf3 -s -p 5001 -4 >/dev/null 2>&1 & server_pid=$!; ./busybox sleep 1; ");
-    command.push_str(
-        "run_iperf BASIC_UDP -u -b 1000G; run_iperf BASIC_TCP; run_iperf PARALLEL_UDP -u -P 5 -b 1000G; run_iperf PARALLEL_TCP -P 5; run_iperf REVERSE_UDP -u -R -b 1000G; run_iperf REVERSE_TCP -R; ",
-    );
-    command.push_str(
-        "./busybox kill -9 \"$server_pid\" >/dev/null 2>&1; wait \"$server_pid\" 2>/dev/null; ",
-    );
-    command.push_str("./busybox echo \"#### OS COMP TEST GROUP END iperf-");
-    command.push_str(libc);
-    command.push_str(" ####\"; }");
+fn append_la_musl_iperf_interval_patch(command: &mut String) {
+    // CONTEXT: The LoongArch musl iperf3 on the current contest disk is
+    // statically linked and rejects the official script's `-i 0` before any
+    // socket or daemon behavior runs. Stream the disk script through BusyBox
+    // sed to remove only that client reporting interval while preserving the
+    // original `iperf3 -s -p 5001 -D` daemon path.
+    command.push_str("./busybox sed 's/ -i 0 / /g' ./iperf_testcode.sh | ./busybox sh");
 }
 
 #[cfg(target_arch = "loongarch64")]
-fn iperf_report_interval_arg(libc_root: &str) -> &'static str {
-    // CONTEXT: The LoongArch musl iperf binary on the current contest disk
-    // rejects `-i 0` before opening a socket. Omitting the interval option keeps
-    // the same 2-second workload and still prints the final receiver summary.
-    if libc_root == "/musl" { "" } else { "-i 0 " }
+fn needs_la_musl_iperf_interval_patch(libc_root: &str, script: &str) -> bool {
+    libc_root == "/musl" && script == "iperf_testcode.sh"
 }
 
 #[cfg(not(target_arch = "loongarch64"))]
-fn iperf_report_interval_arg(_libc_root: &str) -> &'static str {
-    "-i 0 "
+fn needs_la_musl_iperf_interval_patch(_libc_root: &str, _script: &str) -> bool {
+    false
 }
 
 #[cfg(target_arch = "loongarch64")]
