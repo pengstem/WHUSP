@@ -268,6 +268,7 @@ impl ProcessControlBlock {
         interpreter: Option<(&xmas_elf::ElfFile<'_>, Arc<dyn File + Send + Sync>, usize)>,
         args: Vec<String>,
         envs: Vec<String>,
+        executable_path: String,
         executable_node: Option<VfsNodeId>,
     ) -> SysResult<()> {
         let current = current_task().ok_or(SysError::ESRCH)?;
@@ -307,6 +308,7 @@ impl ProcessControlBlock {
             inner.memory_set = memory_set;
             inner.pkey_rights = empty_process_pkey_rights();
             let previous = core::mem::replace(&mut inner.executable_node, executable_node);
+            inner.executable_path = executable_path;
             inner.cmdline = args.clone();
             inner.comm = comm_from_cmdline(&args);
             inner.timers.clear_posix_after_exec();

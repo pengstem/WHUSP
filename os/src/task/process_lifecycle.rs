@@ -62,7 +62,13 @@ impl ProcessControlBlock {
         inner.memory_set.token()
     }
 
-    pub fn new_with_args(elf_data: &[u8], args: Vec<String>, envs: Vec<String>) -> Arc<Self> {
+    pub fn new_with_args(
+        elf_data: &[u8],
+        executable_path: String,
+        executable_node: Option<crate::fs::VfsNodeId>,
+        args: Vec<String>,
+        envs: Vec<String>,
+    ) -> Arc<Self> {
         let ElfLoadInfo {
             memory_set,
             ustack_base,
@@ -84,7 +90,8 @@ impl ProcessControlBlock {
                 UPIntrFreeCell::new(ProcessControlBlockInner {
                     is_zombie: false,
                     memory_set,
-                    executable_node: None,
+                    executable_node,
+                    executable_path,
                     fs: ProcessFsContext::root(),
                     cmdline: args.clone(),
                     pgid: pid,
@@ -235,6 +242,7 @@ impl ProcessControlBlock {
         let user_namespace_parent_id = parent.user_namespace_parent_id;
         let fs = parent.fs.forked(mount_namespace_id);
         let executable_node = parent.executable_node;
+        let executable_path = parent.executable_path.clone();
         let cmdline = parent.cmdline.clone();
         let pgid = parent.pgid;
         let signal_actions = parent.signal_actions;
@@ -264,6 +272,7 @@ impl ProcessControlBlock {
                     is_zombie: false,
                     memory_set,
                     executable_node,
+                    executable_path,
                     fs,
                     cmdline,
                     pgid,

@@ -1,4 +1,4 @@
-use crate::fs::{OpenFlags, open_file};
+use crate::fs::{File, OpenFlags, VfsNodeId, open_file};
 use alloc::{string::String, vec, vec::Vec};
 
 const BUSYBOX_PATH: &str = "/musl/busybox";
@@ -7,6 +7,7 @@ const BUSYBOX_COMMAND_FLAG: &str = "-c";
 
 pub(super) struct KernelInitProc {
     pub(super) path: String,
+    pub(super) executable_node: Option<VfsNodeId>,
     pub(super) data: Vec<u8>,
     pub(super) argv: Vec<String>,
     pub(super) envp: Vec<String>,
@@ -19,6 +20,7 @@ pub(super) fn load() -> Option<KernelInitProc> {
     let inode = open_file(BUSYBOX_PATH, OpenFlags::RDONLY).ok()?;
     Some(KernelInitProc {
         path: BUSYBOX_PATH.into(),
+        executable_node: inode.vfs_node_id(),
         data: inode.read_all(),
         argv: vec![
             BUSYBOX_PATH.into(),

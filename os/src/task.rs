@@ -697,7 +697,13 @@ lazy_static! {
     pub static ref INITPROC: Arc<ProcessControlBlock> = {
         let init = initproc::load().expect("kernel initproc /musl/busybox not found");
         info!("loading initproc from {}", init.path);
-        ProcessControlBlock::new_with_args(init.data.as_slice(), init.argv, init.envp)
+        ProcessControlBlock::new_with_args(
+            init.data.as_slice(),
+            init.path,
+            init.executable_node,
+            init.argv,
+            init.envp,
+        )
     };
 }
 

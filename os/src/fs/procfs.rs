@@ -9,6 +9,7 @@ use super::mount;
 use super::pipe::{PIPE_DEFAULT_CAPACITY, PIPE_MAX_CAPACITY, PIPE_MIN_CAPACITY};
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
 use super::{FileStat, FileTimestamp, S_IFDIR, S_IFLNK, S_IFREG};
+use super::{PathContext, lookup_path_in};
 use crate::config::PAGE_SIZE;
 use crate::drivers::block_cache;
 use crate::mm::{exec_load_stats_content, frame_stats};
@@ -1612,6 +1613,19 @@ fn pid_cmdline_content(process: ProcessProcSnapshot) -> Vec<u8> {
     output
 }
 
+fn pid_exe_target(process: ProcessProcSnapshot) -> FsResult<String> {
+    let executable_node = process.executable_node.ok_or(FsError::NotFound)?;
+    let mut target = process.executable_path;
+    let still_names_executable = matches!(
+        lookup_path_in(PathContext::global_root(), target.as_str(), true),
+        Ok(path) if path.node == executable_node
+    );
+    if !still_names_executable {
+        target.push_str(" (deleted)");
+    }
+    Ok(target)
+}
+
 fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
     match node {
         ProcNode::Mounts => Ok(mounts_content().into_bytes()),
@@ -2143,10 +2157,7 @@ impl FileSystemBackend for ProcFs {
     fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
         let node = decode_node(ino).ok_or(FsError::NotFound)?;
         let target = match node {
-            ProcNode::PidExe(pid) => {
-                lookup_process(pid).ok_or(FsError::NotFound)?;
-                format!("/proc/{pid}/cmdline")
-            }
+            ProcNode::PidExe(pid) => pid_exe_target(lookup_process(pid).ok_or(FsError::NotFound)?)?,
             ProcNode::PidFdEntry(pid, fd) => {
                 let process = pid2process(pid).ok_or(FsError::NotFound)?;
                 let inner = process.inner_exclusive_access();

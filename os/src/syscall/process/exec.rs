@@ -459,6 +459,16 @@ fn read_exec_file_direct(path: &str) -> SysResult<ExecImageSource> {
     read_exec_file_in(current_process().path_snapshot().context, path, true)
 }
 
+fn normalized_exec_path_in(context: &PathContext, path: &str) -> String {
+    normalize_path_at_root(context.root_path(), context.cwd_path(), path)
+        .unwrap_or_else(|| String::from(path))
+}
+
+fn normalized_current_exec_path(path: &str) -> String {
+    let context = current_process().path_snapshot().context;
+    normalized_exec_path_in(&context, path)
+}
+
 fn read_exec_open_file(file: Arc<dyn File + Send + Sync>) -> SysResult<ExecImageSource> {
     check_exec_open_file(&file)?;
     read_exec_source_from_file(file)
@@ -641,9 +651,11 @@ fn exec_script(
         let Ok(interpreter_data) = read_exec_file(interpreter_path.as_str()) else {
             continue;
         };
+        let executable_path = normalized_current_exec_path(interpreter_path.as_str());
         let next_args = append_script_args(candidate_args, script_path, args);
         return exec_loaded_program(
             interpreter_path,
+            executable_path,
             next_args,
             envs,
             depth + 1,
@@ -670,12 +682,15 @@ fn shell_path_redirect(path: &str, envs: &[String]) -> Option<String> {
 
 fn exec_loaded_program(
     path: String,
+    executable_path: String,
     args: Vec<String>,
     envs: Vec<String>,
     depth: usize,
     source: ExecImageSource,
     executable_node: Option<VfsNodeId>,
 ) -> SysResult {
+    let executable_path = source.file.proc_fd_target().unwrap_or(executable_path);
+    let executable_node = source.file.vfs_node_id().or(executable_node);
     if source.data.starts_with(ELF_MAGIC) {
         let elf = source.elf()?;
         let mut envs = envs;
@@ -717,6 +732,7 @@ fn exec_loaded_program(
             interpreter,
             args,
             envs,
+            executable_path,
             executable_node,
         )?;
         // CONTEXT: Linux execve starts a new image instead of returning to the
@@ -729,7 +745,16 @@ fn exec_loaded_program(
         exec_compat_script_redirect(path.as_str(), source.data.as_slice(), args.clone())
     {
         let target_data = read_exec_file(target.as_str())?;
-        return exec_loaded_program(target, next_args, envs, depth + 1, target_data, None);
+        let executable_path = normalized_current_exec_path(target.as_str());
+        return exec_loaded_program(
+            target,
+            executable_path,
+            next_args,
+            envs,
+            depth + 1,
+            target_data,
+            None,
+        );
     }
 
     let interpreter = match parse_shebang(source.data.as_slice())? {
@@ -746,13 +771,11 @@ fn exec_path(path: String, args: Vec<String>, envs: Vec<String>) -> SysResult {
     let args = normalize_exec_args(args);
     let envs = normalize_exec_envs(path.as_str(), envs);
     let path = shell_path_redirect(path.as_str(), envs.as_slice()).unwrap_or(path);
-    let executable_node = executable_node_in(
-        current_process().path_snapshot().context,
-        path.as_str(),
-        true,
-    );
+    let context = current_process().path_snapshot().context;
+    let executable_node = executable_node_in(context.clone(), path.as_str(), true);
+    let executable_path = normalized_exec_path_in(&context, path.as_str());
     let data = read_exec_file(path.as_str())?;
-    exec_loaded_program(path, args, envs, 0, data, executable_node)
+    exec_loaded_program(path, executable_path, args, envs, 0, data, executable_node)
 }
 
 fn exec_path_in(
@@ -764,9 +787,10 @@ fn exec_path_in(
 ) -> SysResult {
     let args = normalize_exec_args(args);
     let envs = normalize_exec_envs(path.as_str(), envs);
+    let executable_path = normalized_exec_path_in(&context, path.as_str());
     let executable_node = executable_node_in(context.clone(), path.as_str(), follow_final_symlink);
     let data = read_exec_file_in(context, path.as_str(), follow_final_symlink)?;
-    exec_loaded_program(path, args, envs, 0, data, executable_node)
+    exec_loaded_program(path, executable_path, args, envs, 0, data, executable_node)
 }
 
 fn exec_open_file(
@@ -783,7 +807,15 @@ fn exec_open_file(
     // style script name and has close-on-exec interpreter edge cases. The LTP
     // coverage reached here uses ELF payloads, so this path currently reuses
     // the ordinary script loader without full fd-backed script semantics.
-    exec_loaded_program(display_path, args, envs, 0, data, executable_node)
+    exec_loaded_program(
+        display_path.clone(),
+        display_path,
+        args,
+        envs,
+        0,
+        data,
+        executable_node,
+    )
 }
 
 fn normalize_exec_args(mut args: Vec<String>) -> Vec<String> {
