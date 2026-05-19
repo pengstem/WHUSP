@@ -1,14 +1,14 @@
 use super::address::page_align_up;
 use super::area::ExecSegmentInfo;
 use super::{MapArea, MapPermission, MapType, MemorySet, VirtAddr};
-use crate::config::{DL_INTERP_OFFSET, PAGE_SIZE, USER_HEAP_SIZE, USER_MMAP_BASE};
+use crate::config::{DL_INTERP_OFFSET, PAGE_SIZE, USER_HEAP_SIZE, USER_MMAP_BASE, USER_STACK_SIZE};
 use crate::fs::File;
 use crate::sync::UPIntrFreeCell;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use lazy_static::*;
-use xmas_elf::program::Type;
+use xmas_elf::{header, program::Type};
 
 pub struct ElfLoadInfo {
     pub memory_set: MemorySet,
@@ -103,6 +103,22 @@ fn phdr_address(elf: &xmas_elf::ElfFile<'_>) -> usize {
         }
     }
     phdr
+}
+
+fn main_load_bias(elf: &xmas_elf::ElfFile<'_>) -> usize {
+    if elf.header.pt2.type_().as_type() == header::Type::SharedObject {
+        USER_MMAP_BASE
+    } else {
+        0
+    }
+}
+
+fn bias_nonzero_addr(load_bias: usize, addr: usize) -> usize {
+    if addr == 0 { 0 } else { load_bias + addr }
+}
+
+fn initial_mmap_next(user_stack_base: usize) -> usize {
+    page_align_up(user_stack_base + USER_STACK_SIZE + PAGE_SIZE).max(USER_MMAP_BASE)
 }
 
 fn map_elf_load_segments(
@@ -260,9 +276,10 @@ impl MemorySet {
         assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
         let ph_count = elf_header.pt2.ph_count();
         let ph_entry_size = elf_header.pt2.ph_entry_size();
-        let phdr = phdr_address(elf);
-        let max_end_va = map_elf_load_segments(&mut memory_set, elf, 0);
-        let program_entry = elf.header.pt2.entry_point() as usize;
+        let load_bias = main_load_bias(elf);
+        let phdr = bias_nonzero_addr(load_bias, phdr_address(elf));
+        let max_end_va = map_elf_load_segments(&mut memory_set, elf, load_bias);
+        let program_entry = load_bias + elf.header.pt2.entry_point() as usize;
         let mut entry_point = program_entry;
         let mut interp_base = 0usize;
         if let Some(interpreter) = interpreter {
@@ -280,7 +297,6 @@ impl MemorySet {
         memory_set.brk = heap_base;
         memory_set.brk_limit = brk_limit;
         memory_set.brk_mapped_end = heap_base;
-        memory_set.mmap_next = USER_MMAP_BASE;
         memory_set.push(
             MapArea::new(
                 heap_base.into(),
@@ -291,6 +307,7 @@ impl MemorySet {
             None,
         );
         let user_stack_base = brk_limit + PAGE_SIZE;
+        memory_set.mmap_next = initial_mmap_next(user_stack_base);
         ElfLoadInfo {
             memory_set,
             ustack_base: user_stack_base,
@@ -317,10 +334,16 @@ impl MemorySet {
         }
         let ph_count = elf_header.pt2.ph_count();
         let ph_entry_size = elf_header.pt2.ph_entry_size();
-        let phdr = phdr_address_checked(elf)?;
-        let max_end_va =
-            map_elf_load_segments_lazy(&mut memory_set, elf, backing_file, backing_file_size, 0)?;
-        let program_entry = elf.header.pt2.entry_point() as usize;
+        let load_bias = main_load_bias(elf);
+        let phdr = bias_nonzero_addr(load_bias, phdr_address_checked(elf)?);
+        let max_end_va = map_elf_load_segments_lazy(
+            &mut memory_set,
+            elf,
+            backing_file,
+            backing_file_size,
+            load_bias,
+        )?;
+        let program_entry = load_bias + elf.header.pt2.entry_point() as usize;
         let mut entry_point = program_entry;
         let mut interp_base = 0usize;
         if let Some((interpreter, interpreter_file, interpreter_file_size)) = interpreter {
@@ -340,7 +363,6 @@ impl MemorySet {
         memory_set.brk = heap_base;
         memory_set.brk_limit = brk_limit;
         memory_set.brk_mapped_end = heap_base;
-        memory_set.mmap_next = USER_MMAP_BASE;
         memory_set.push(
             MapArea::new(
                 heap_base.into(),
@@ -351,6 +373,7 @@ impl MemorySet {
             None,
         );
         let user_stack_base = brk_limit + PAGE_SIZE;
+        memory_set.mmap_next = initial_mmap_next(user_stack_base);
         Some(ElfLoadInfo {
             memory_set,
             ustack_base: user_stack_base,
