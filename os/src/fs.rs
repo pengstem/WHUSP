@@ -51,8 +51,12 @@ pub const S_IFREG: u32 = 0o100000;
 pub const S_IFLNK: u32 = 0o120000;
 pub const S_IFSOCK: u32 = 0o140000;
 pub const S_IFMT: u32 = 0o170000;
+pub const FS_COMPR_FL: u32 = 0x0000_0004;
 pub const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
 pub const FS_APPEND_FL: u32 = 0x0000_0020;
+pub const FS_NODUMP_FL: u32 = 0x0000_0040;
+pub const FS_STATX_COMMON_ATTR_FLAGS: u32 = FS_IMMUTABLE_FL | FS_APPEND_FL | FS_NODUMP_FL;
+pub const FS_STATX_ATTR_FLAGS: u32 = FS_COMPR_FL | FS_STATX_COMMON_ATTR_FLAGS;
 
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +80,8 @@ pub struct FileStat {
     pub uid: u32,
     pub gid: u32,
     pub rdev: u64,
+    pub inode_flags: u32,
+    pub inode_flags_supported: u32,
     pub size: u64,
     pub blksize: u32,
     pub blocks: u64,

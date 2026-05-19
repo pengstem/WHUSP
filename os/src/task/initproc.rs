@@ -13,6 +13,9 @@ pub(super) struct KernelInitProc {
 }
 
 pub(super) fn load() -> Option<KernelInitProc> {
+    // CONTEXT: The submit path is kernel-owned: load BusyBox from the mounted
+    // contest disk and run the generated test command through `sh -c`, without
+    // depending on user/Cargo initproc binaries.
     let inode = open_file(BUSYBOX_PATH, OpenFlags::RDONLY).ok()?;
     Some(KernelInitProc {
         path: BUSYBOX_PATH.into(),

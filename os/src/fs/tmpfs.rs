@@ -3,7 +3,8 @@ use super::dirent::{
 };
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
 use super::{
-    FileStat, FileTimestamp, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK,
+    FS_STATX_ATTR_FLAGS, FS_STATX_COMMON_ATTR_FLAGS, FileStat, FileTimestamp, S_IFBLK, S_IFCHR,
+    S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK,
 };
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -162,6 +163,7 @@ struct TmpfsInode {
     uid: u32,
     gid: u32,
     nlink: u32,
+    rdev: u64,
     flags: u32,
     open_count: usize,
     pending_delete: bool,
@@ -182,7 +184,7 @@ pub(super) struct TmpFs {
 }
 
 impl TmpfsInode {
-    fn new(kind: FsNodeKind, mode: u32, parent_ino: u32) -> Self {
+    fn new(kind: FsNodeKind, mode: u32, parent_ino: u32, rdev: u64) -> Self {
         let now = FileTimestamp::now();
         let nlink = if kind == FsNodeKind::Directory { 2 } else { 1 };
         Self {
@@ -191,6 +193,7 @@ impl TmpfsInode {
             uid: 0,
             gid: 0,
             nlink,
+            rdev,
             flags: 0,
             open_count: 0,
             pending_delete: false,
@@ -368,7 +371,7 @@ impl TmpFs {
         let mut inodes = BTreeMap::new();
         inodes.insert(
             ROOT_INO,
-            TmpfsInode::new(FsNodeKind::Directory, S_IFDIR | 0o1777, ROOT_INO),
+            TmpfsInode::new(FsNodeKind::Directory, S_IFDIR | 0o1777, ROOT_INO, 0),
         );
         Self {
             inodes,
@@ -381,6 +384,14 @@ impl TmpFs {
         let ino = self.next_ino;
         self.next_ino += 1;
         ino
+    }
+
+    fn statx_supported_inode_flags(&self) -> u32 {
+        if self.statfs_magic == EXT234_SUPER_MAGIC {
+            FS_STATX_ATTR_FLAGS
+        } else {
+            FS_STATX_COMMON_ATTR_FLAGS
+        }
     }
 
     fn inode(&self, ino: u32) -> FsResult<&TmpfsInode> {
@@ -405,6 +416,7 @@ impl TmpFs {
         name: &str,
         kind: FsNodeKind,
         mode: u32,
+        rdev: u64,
     ) -> FsResult<u32> {
         if name.is_empty() || name == "." || name == ".." {
             return Err(FsError::InvalidInput);
@@ -417,7 +429,7 @@ impl TmpFs {
         }
 
         let ino = self.alloc_ino();
-        let mut inode = TmpfsInode::new(kind, mode, parent_ino);
+        let mut inode = TmpfsInode::new(kind, mode, parent_ino, rdev);
         if kind == FsNodeKind::Directory {
             self.inode_mut(parent_ino)?.nlink += 1;
         }
@@ -559,6 +571,7 @@ impl FileSystemBackend for TmpFs {
             leaf_name,
             FsNodeKind::RegularFile,
             S_IFREG | 0o666,
+            0,
         )
     }
 
@@ -568,7 +581,7 @@ impl FileSystemBackend for TmpFs {
         leaf_name: &str,
         kind: FsNodeKind,
         mode: u32,
-        _rdev: u64,
+        rdev: u64,
     ) -> FsResult<u32> {
         let file_type = match kind {
             FsNodeKind::RegularFile => S_IFREG,
@@ -578,7 +591,13 @@ impl FileSystemBackend for TmpFs {
             FsNodeKind::Socket => S_IFSOCK,
             _ => return Err(FsError::InvalidInput),
         };
-        self.create_node(parent_ino, leaf_name, kind, file_type | (mode & 0o7777))
+        self.create_node(
+            parent_ino,
+            leaf_name,
+            kind,
+            file_type | (mode & 0o7777),
+            rdev,
+        )
     }
 
     fn create_dir(&mut self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32> {
@@ -587,6 +606,7 @@ impl FileSystemBackend for TmpFs {
             leaf_name,
             FsNodeKind::Directory,
             S_IFDIR | (mode & 0o7777),
+            0,
         )
     }
 
@@ -612,7 +632,13 @@ impl FileSystemBackend for TmpFs {
     }
 
     fn symlink(&mut self, parent_ino: u32, leaf_name: &str, target: &[u8]) -> FsResult {
-        let ino = self.create_node(parent_ino, leaf_name, FsNodeKind::Symlink, S_IFLNK | 0o777)?;
+        let ino = self.create_node(
+            parent_ino,
+            leaf_name,
+            FsNodeKind::Symlink,
+            S_IFLNK | 0o777,
+            0,
+        )?;
         let inode = self.inode_mut(ino)?;
         inode.data.extend_from_slice(target);
         inode.size = target.len() as u64;
@@ -734,6 +760,9 @@ impl FileSystemBackend for TmpFs {
             nlink: inode.nlink,
             uid: inode.uid,
             gid: inode.gid,
+            rdev: inode.rdev,
+            inode_flags: inode.flags,
+            inode_flags_supported: self.statx_supported_inode_flags(),
             size,
             blocks,
             blksize: super::DEFAULT_BLOCK_SIZE,

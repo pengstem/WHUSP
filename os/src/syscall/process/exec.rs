@@ -658,6 +658,9 @@ fn exec_script(
 fn shell_path_redirect(path: &str, envs: &[String]) -> Option<String> {
     match path {
         "/bin/sh" | "/bin/bash" => {
+            // CONTEXT: Official-style test disks do not materialize root-level
+            // shell paths; direct execs inherit the active libc family through
+            // envp and run that root's BusyBox shell applet instead.
             let root = libc_test_root_from_envs(envs).unwrap_or("/musl");
             Some(format!("{root}/busybox"))
         }

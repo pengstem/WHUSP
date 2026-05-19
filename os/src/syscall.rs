@@ -1,3 +1,6 @@
+// Linux generic syscall numbers used by both contest RISC-V and LoongArch
+// ABIs. Keep this table aligned with the userspace libc headers, not with
+// local implementation order.
 const SYSCALL_SETXATTR: usize = 5;
 const SYSCALL_LSETXATTR: usize = 6;
 const SYSCALL_FSETXATTR: usize = 7;

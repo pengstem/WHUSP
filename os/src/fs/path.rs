@@ -3,12 +3,22 @@ use super::mount::{
 };
 use alloc::string::String;
 
+/// Numeric cwd/root anchor used by VFS lookup inside one mounted backend.
+///
+/// Keep this paired with `PathContext` string snapshots: `WorkingDir` is the
+/// lookup identity, while cwd/root strings feed Linux-visible path ABIs such as
+/// getcwd and procfs links.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WorkingDir {
     mount_id: MountId,
     ino: u32,
 }
 
+/// Per-process pathname view used by dirfd, cwd, chroot, and mount namespaces.
+///
+/// `root`/`cwd` are authoritative for VFS lookup; `root_path`/`cwd_path` are
+/// the user-visible normalized paths that must be updated by chdir/chroot-style
+/// operations in the same step.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PathContext {
     root: WorkingDir,

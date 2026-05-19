@@ -30,6 +30,9 @@ pub fn page_table_root_ppn(token: usize) -> usize {
 }
 
 pub fn activate_page_table(token: usize) {
+    // CONTEXT: The current LA64 port installs one MemorySet root into both
+    // PGDL and PGDH. Splitting low/high roots requires auditing trap.S, the
+    // refill entry, and direct-map address translation together.
     write_page_table_roots(token, token);
     flush_tlb_all();
 }

@@ -1,4 +1,6 @@
-use crate::fs::FileStat;
+use crate::fs::{
+    FS_APPEND_FL, FS_COMPR_FL, FS_IMMUTABLE_FL, FS_NODUMP_FL, FS_STATX_ATTR_FLAGS, FileStat,
+};
 
 pub(super) const AT_FDCWD: isize = -100;
 pub(super) const AT_REMOVEDIR: u32 = 0x200;
@@ -51,6 +53,11 @@ pub(super) const STATX_BASIC_STATS: u32 = STATX_TYPE
     | STATX_SIZE
     | STATX_BLOCKS;
 pub(super) const STATX_RESERVED: u32 = 0x8000_0000;
+
+const STATX_ATTR_COMPRESSED: u64 = 0x0000_0004;
+const STATX_ATTR_IMMUTABLE: u64 = 0x0000_0010;
+const STATX_ATTR_APPEND: u64 = 0x0000_0020;
+const STATX_ATTR_NODUMP: u64 = 0x0000_0040;
 
 // Linux UIO_MAXIOV: reject larger vectors before copying the user iovec array.
 pub(super) const IOV_MAX: usize = 1024;
@@ -167,6 +174,23 @@ fn linux_visible_dev(dev: u64) -> u64 {
     }
 }
 
+fn statx_attr_from_inode_flags(flags: u32) -> u64 {
+    let mut attr = 0;
+    if flags & FS_COMPR_FL != 0 {
+        attr |= STATX_ATTR_COMPRESSED;
+    }
+    if flags & FS_IMMUTABLE_FL != 0 {
+        attr |= STATX_ATTR_IMMUTABLE;
+    }
+    if flags & FS_APPEND_FL != 0 {
+        attr |= STATX_ATTR_APPEND;
+    }
+    if flags & FS_NODUMP_FL != 0 {
+        attr |= STATX_ATTR_NODUMP;
+    }
+    attr
+}
+
 impl LinuxStatxTimestamp {
     fn new(sec: u64, nsec: u32) -> Self {
         Self {
@@ -227,15 +251,17 @@ impl From<crate::fs::FileSystemStat> for LinuxStatfs {
 
 /// Converts this kernel's inode snapshot into Linux `struct statx` layout.
 ///
-/// Birth time and attribute masks are reported as zero because the current VFS
-/// metadata model does not preserve those fields yet.
+/// Birth time is reported as zero because the current VFS metadata model does
+/// not preserve it yet.
 impl From<FileStat> for LinuxStatx {
     fn from(stat: FileStat) -> Self {
         let dev = linux_visible_dev(stat.dev);
+        let supported_flags = stat.inode_flags_supported & FS_STATX_ATTR_FLAGS;
+        let active_flags = stat.inode_flags & supported_flags;
         Self {
             stx_mask: STATX_BASIC_STATS,
             stx_blksize: stat.blksize,
-            stx_attributes: 0,
+            stx_attributes: statx_attr_from_inode_flags(active_flags),
             stx_nlink: stat.nlink,
             stx_uid: stat.uid,
             stx_gid: stat.gid,
@@ -244,7 +270,7 @@ impl From<FileStat> for LinuxStatx {
             stx_ino: stat.ino,
             stx_size: stat.size,
             stx_blocks: stat.blocks,
-            stx_attributes_mask: 0,
+            stx_attributes_mask: statx_attr_from_inode_flags(supported_flags),
             stx_atime: LinuxStatxTimestamp::new(stat.atime_sec, stat.atime_nsec),
             stx_btime: LinuxStatxTimestamp::default(),
             stx_ctime: LinuxStatxTimestamp::new(stat.ctime_sec, stat.ctime_nsec),

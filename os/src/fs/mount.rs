@@ -136,6 +136,9 @@ pub fn init_mounts() {
         return;
     }
 
+    // CONTEXT: QEMU x0 is the contest root/test disk and becomes mount id 0.
+    // Extra block devices keep their index-based mount slots for explicit
+    // dynamic mounts; do not collapse discovery to a single global block disk.
     let primary_device = BLOCK_DEVICES
         .first()
         .expect("DTB is missing a block device")

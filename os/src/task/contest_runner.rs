@@ -105,6 +105,9 @@ pub(super) fn build_runner_command() -> String {
             append_script_command(&mut command, libc_root, script);
         }
     }
+    // CONTEXT: The runner is responsible for guest-side completion. Flush and
+    // power off after all marker groups so scoring does not depend on the host
+    // QEMU timeout or external process cleanup.
     command.push_str("; cd /musl && ./busybox sync; ./busybox reboot -f");
     command
 }

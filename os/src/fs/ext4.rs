@@ -3,7 +3,7 @@ use super::dirent::{
     LINUX_DIRENT64_HEADER_SIZE,
 };
 use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult};
-use super::{FileStat, FileTimestamp};
+use super::{FS_STATX_ATTR_FLAGS, FileStat, FileTimestamp};
 use crate::drivers::block::VirtIOBlock;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
@@ -117,6 +117,7 @@ pub(super) struct Ext4Mount {
     fs: KernelExt4Fs,
     open_inodes: BTreeMap<u32, usize>,
     pending_unlinks: BTreeSet<u32>,
+    runtime_special_rdevs: BTreeMap<u32, u64>,
 }
 
 unsafe impl Send for Ext4Mount {}
@@ -128,6 +129,7 @@ impl Ext4Mount {
             fs: KernelExt4Fs::new(KernelDisk { dev: device }, EXT4_CONFIG)?,
             open_inodes: BTreeMap::new(),
             pending_unlinks: BTreeSet::new(),
+            runtime_special_rdevs: BTreeMap::new(),
         })
     }
 }
@@ -185,7 +187,7 @@ impl FileSystemBackend for Ext4Mount {
         leaf_name: &str,
         kind: FsNodeKind,
         mode: u32,
-        _rdev: u64,
+        rdev: u64,
     ) -> FsResult<u32> {
         let inode_type = match kind {
             FsNodeKind::RegularFile => InodeType::RegularFile,
@@ -195,12 +197,18 @@ impl FileSystemBackend for Ext4Mount {
             FsNodeKind::Socket => InodeType::Socket,
             _ => return Err(FsError::InvalidInput),
         };
-        // UNFINISHED: The vendored lwext4 wrapper can create special inode
-        // types, but it does not yet expose storing device major/minor payloads
-        // for character/block devices. open11 only needs the node to open.
-        self.fs
+        let ino = self
+            .fs
             .create(parent_ino, leaf_name, inode_type, mode)
-            .map_err(map_ext4_error)
+            .map_err(map_ext4_error)?;
+        if matches!(kind, FsNodeKind::CharacterDevice | FsNodeKind::BlockDevice) {
+            // UNFINISHED: The vendored lwext4 wrapper can create special inode
+            // types, but it does not yet expose persistent device major/minor
+            // payloads. Keep runtime-created rdevs for stat/statx until the
+            // wrapper can read/write the on-disk special inode fields.
+            self.runtime_special_rdevs.insert(ino, rdev);
+        }
+        Ok(ino)
     }
 
     fn create_dir(&mut self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32> {
@@ -249,6 +257,10 @@ impl FileSystemBackend for Ext4Mount {
             self.fs
                 .unlink(parent_ino, leaf_name)
                 .map_err(map_ext4_error)?;
+            let mut attr = lwext4_rust::FileAttr::default();
+            if self.fs.get_attr(child_ino, &mut attr).is_err() {
+                self.runtime_special_rdevs.remove(&child_ino);
+            }
             None
         };
         if let Some(ino) = deferred {
@@ -339,6 +351,7 @@ impl FileSystemBackend for Ext4Mount {
         self.open_inodes.remove(&ino);
         if self.pending_unlinks.remove(&ino) {
             self.fs.free_unlinked_inode(ino).map_err(map_ext4_error)?;
+            self.runtime_special_rdevs.remove(&ino);
         }
         Ok(())
     }
@@ -346,6 +359,7 @@ impl FileSystemBackend for Ext4Mount {
     fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
         let mut attr = lwext4_rust::FileAttr::default();
         self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
+        let inode_flags = self.fs.inode_flags(ino).map_err(map_ext4_error)?;
         Ok(FileStat {
             dev: attr.device,
             ino: attr.ino as u64,
@@ -353,7 +367,9 @@ impl FileSystemBackend for Ext4Mount {
             nlink: attr.nlink as u32,
             uid: attr.uid,
             gid: attr.gid,
-            rdev: 0,
+            rdev: self.runtime_special_rdevs.get(&ino).copied().unwrap_or(0),
+            inode_flags,
+            inode_flags_supported: FS_STATX_ATTR_FLAGS,
             size: attr.size,
             blksize: attr.block_size as u32,
             blocks: attr.blocks,
