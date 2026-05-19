@@ -42,6 +42,7 @@ const VALID_ACCEPT4_FLAGS: i32 = SOCK_NONBLOCK | SOCK_CLOEXEC;
 const IPPROTO_IP: i32 = 0;
 const IPPROTO_TCP: i32 = 6;
 const IPPROTO_UDP: i32 = 17;
+const IPPROTO_IPV6: i32 = 41;
 const IPPROTO_SCTP: i32 = 132;
 const IPPROTO_UDPLITE: i32 = 136;
 const SOL_SOCKET: i32 = 1;
@@ -60,6 +61,7 @@ const SO_RCVTIMEO_NEW: i32 = 66;
 const SO_SNDTIMEO_NEW: i32 = 67;
 const TCP_NODELAY: i32 = 1;
 const TCP_MAXSEG: i32 = 2;
+const IPV6_V6ONLY: i32 = 26;
 const MCAST_JOIN_GROUP: i32 = 42;
 const MCAST_LEAVE_GROUP: i32 = 45;
 const SHUT_RD: i32 = 0;
@@ -928,6 +930,7 @@ impl LocalSocket {
             (SOL_SOCKET, SO_REUSEADDR) => Ok(inner.reuse_addr as i32),
             (IPPROTO_TCP, TCP_NODELAY) if inner.kind == SocketKind::Stream => Ok(1),
             (IPPROTO_TCP, TCP_MAXSEG) if inner.kind == SocketKind::Stream => Ok(1460),
+            (IPPROTO_IPV6, IPV6_V6ONLY) if inner.domain == SocketDomain::Inet6 => Ok(0),
             // CONTEXT: netperf/libc probe several socket options whose exact
             // transport effects are irrelevant for the in-kernel loopback queue.
             (
@@ -2115,12 +2118,16 @@ pub fn sys_setsockopt(fd: usize, level: i32, name: i32, val: usize, len: u32) ->
                 socket.set_buffer_size(name, read_i32_option(token, val, len)?.max(1));
             }
             (IPPROTO_TCP, TCP_NODELAY)
+            | (IPPROTO_IPV6, IPV6_V6ONLY)
             | (
                 SOL_SOCKET,
                 SO_DONTROUTE | SO_KEEPALIVE | SO_LINGER | SO_RCVTIMEO_OLD | SO_SNDTIMEO_OLD,
             )
             | (SOL_SOCKET, SO_RCVTIMEO_NEW | SO_SNDTIMEO_NEW) => {
-                // CONTEXT: accepted as a no-op for libc/netperf compatibility.
+                // CONTEXT: accepted as a no-op for libc/netperf/iperf
+                // compatibility. The in-kernel loopback table is keyed by port
+                // and already accepts the contest's IPv4 clients for an AF_INET6
+                // listener, so IPV6_V6ONLY has no routing effect here.
                 if val != 0 && len > 0 {
                     translated_byte_buffer_checked(
                         token,
