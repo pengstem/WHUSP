@@ -1,6 +1,7 @@
 use super::{
     SigAltStack, SignalAction, current_task, prepare_exec_thread_group,
     process::{ProcessControlBlock, comm_from_cmdline, empty_process_pkey_rights},
+    ptrace_note_exec_current,
 };
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::{File, VfsNodeId, track_regular_file_executable, untrack_regular_file_executable};
@@ -360,6 +361,7 @@ impl ProcessControlBlock {
         *task_inner.get_trap_cx() = trap_cx;
         drop(task_inner);
         self.release_vfork_parent();
+        ptrace_note_exec_current();
         Ok(())
     }
 }

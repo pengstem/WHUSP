@@ -4,6 +4,7 @@ pub const SIGNAL_INFO_SLOTS: usize = 65;
 
 pub const SI_USER: i32 = 0;
 pub const SI_TKILL: i32 = -6;
+pub const SIGTRAP: u32 = 5;
 pub const SIGKILL: u32 = 9;
 pub const SIGCHLD: u32 = 17;
 pub const SIGCONT: u32 = 18;

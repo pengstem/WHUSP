@@ -2,8 +2,9 @@ use crate::mm::MemorySet;
 use crate::syscall::user_ptr::write_user_value_in_memory_set;
 use crate::task::{
     CLD_CONTINUED, CLD_STOPPED, ProcessControlBlock, SIGCHLD, SIGCONT, SignalInfo,
-    block_current_task_no_schedule, current_process, remove_from_pid2process, schedule,
-    signal_child_status, signal_wait_status, task_has_wait_interrupt_signal, wakeup_task,
+    block_current_task_no_schedule, current_process, pid2process, ptrace_take_wait_status,
+    remove_from_pid2process, schedule, signal_child_status, signal_wait_status,
+    task_has_wait_interrupt_signal, wakeup_task,
 };
 use alloc::sync::Arc;
 
@@ -51,18 +52,18 @@ pub struct RUsage {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LinuxSigInfo {
-    si_signo: i32,
-    si_errno: i32,
-    si_code: i32,
-    si_trapno: i32,
-    si_pid: i32,
-    si_uid: u32,
-    si_status: i32,
-    si_utime: u32,
-    si_stime: u32,
-    si_value: u64,
-    pad: [u32; 20],
-    align: [u64; 0],
+    pub(crate) si_signo: i32,
+    pub(crate) si_errno: i32,
+    pub(crate) si_code: i32,
+    pub(crate) si_trapno: i32,
+    pub(crate) si_pid: i32,
+    pub(crate) si_uid: u32,
+    pub(crate) si_status: i32,
+    pub(crate) si_utime: u32,
+    pub(crate) si_stime: u32,
+    pub(crate) si_value: u64,
+    pub(crate) pad: [u32; 20],
+    pub(crate) align: [u64; 0],
 }
 
 impl From<SignalInfo> for LinuxSigInfo {
@@ -145,6 +146,15 @@ fn write_rusage(memory_set: &mut MemorySet, rusage: *mut RUsage) -> SysResult<()
     Ok(())
 }
 
+fn ptrace_wait4_target(pid: isize, waiter_pid: usize) -> Option<(usize, i32)> {
+    if pid <= 0 {
+        return None;
+    }
+    let tracee = pid2process(pid as usize)?;
+    let status = ptrace_take_wait_status(&tracee, waiter_pid, false)?;
+    Some((tracee.getpid(), status))
+}
+
 fn write_waitid_siginfo(
     memory_set: &mut MemorySet,
     infop: *mut LinuxSigInfo,
@@ -184,6 +194,7 @@ pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsag
 
     loop {
         let process = current_process();
+        let waiter_pid = process.getpid();
         let caller_pgid = process.process_group_id();
         let mut inner = process.inner_exclusive_access();
         if !inner
@@ -191,7 +202,29 @@ pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsag
             .iter()
             .any(|child| wait4_child_matches(child, pid, caller_pgid))
         {
+            if let Some((tracee_pid, status)) = ptrace_wait4_target(pid, waiter_pid) {
+                if !wstatus.is_null() {
+                    write_user_value_in_memory_set(&mut inner.memory_set, wstatus, &status)?;
+                }
+                write_rusage(&mut inner.memory_set, rusage)?;
+                return Ok(tracee_pid as isize);
+            }
             return Err(SysError::ECHILD);
+        }
+
+        let stopped = inner.children.iter().find_map(|child| {
+            if !wait4_child_matches(child, pid, caller_pgid) {
+                return None;
+            }
+            ptrace_take_wait_status(child, waiter_pid, options & WUNTRACED != 0)
+                .map(|status| (child.getpid(), status))
+        });
+        if let Some((found_pid, status)) = stopped {
+            if !wstatus.is_null() {
+                write_user_value_in_memory_set(&mut inner.memory_set, wstatus, &status)?;
+            }
+            write_rusage(&mut inner.memory_set, rusage)?;
+            return Ok(found_pid as isize);
         }
 
         let zombie = inner.children.iter().enumerate().find(|(_, child)| {

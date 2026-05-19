@@ -4,6 +4,7 @@ mod id;
 mod identity;
 mod namespace;
 mod pidfd;
+mod ptrace;
 mod resource;
 mod sched;
 mod system;
@@ -23,6 +24,7 @@ pub use identity::{
 pub use namespace::sys_setns;
 pub(crate) use pidfd::{install_pidfd_for_fanotify, pidfd_fdinfo};
 pub use pidfd::{sys_pidfd_open, sys_pidfd_send_signal};
+pub use ptrace::sys_ptrace;
 pub use resource::{sys_getrlimit, sys_prlimit64, sys_setrlimit};
 pub use sched::{
     sys_getpriority, sys_sched_get_priority_max, sys_sched_get_priority_min, sys_sched_getaffinity,

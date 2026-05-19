@@ -10,6 +10,7 @@ mod manager;
 mod process;
 mod process_lifecycle;
 mod processor;
+mod ptrace;
 mod signal;
 #[allow(clippy::module_inception)]
 mod task;
@@ -33,6 +34,7 @@ pub use process::{ProcessControlBlock, ProcessCpuTimesSnapshot};
 pub(crate) const CAP_IPC_LOCK: usize = process::CapabilitySets::CAP_IPC_LOCK;
 pub(crate) const CAP_SETPCAP: usize = process::CapabilitySets::CAP_SETPCAP;
 pub(crate) const CAP_SYS_CHROOT: usize = process::CapabilitySets::CAP_SYS_CHROOT;
+pub(crate) const CAP_SYS_PTRACE: usize = process::CapabilitySets::CAP_SYS_PTRACE;
 pub(crate) const CAP_SYS_ADMIN: usize = process::CapabilitySets::CAP_SYS_ADMIN;
 pub(crate) const CAP_SYS_RESOURCE: usize = process::CapabilitySets::CAP_SYS_RESOURCE;
 
@@ -51,11 +53,16 @@ pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_user_token,
     run_tasks, schedule, take_current_task,
 };
+pub(crate) use ptrace::{
+    ptrace_attach_process, ptrace_kill_process, ptrace_note_exec_current, ptrace_resume_process,
+    ptrace_stop_current_if_needed, ptrace_take_wait_status, ptrace_traceme_current,
+    ptrace_validate_tracee,
+};
 pub use signal::{
     CLD_CONTINUED, CLD_STOPPED, DefaultSignalAction, MINSIGSTKSZ, SA_RESTART, SIGCHLD, SIGCONT,
-    SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SS_DISABLE, SS_ONSTACK, SigAltStack, SignalAction,
-    SignalFlags, SignalInfo, default_signal_action, default_signal_error, default_signal_exit_code,
-    signal_child_status, signal_wait_status,
+    SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SIGTRAP, SS_DISABLE, SS_ONSTACK, SigAltStack,
+    SignalAction, SignalFlags, SignalInfo, default_signal_action, default_signal_error,
+    default_signal_exit_code, signal_child_status, signal_wait_status,
 };
 #[cfg(target_arch = "riscv64")]
 pub use signal::{SI_TKILL, SIGRT_1, SIGRTMIN};

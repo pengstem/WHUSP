@@ -126,6 +126,9 @@ pub fn trap_handler() -> ! {
             );
         }
     }
+    if crate::task::ptrace_stop_current_if_needed() {
+        interrupted_pc = current_trap_cx().era;
+    }
     if crate::arch::signal::deliver_pending_signal(interrupted_pc) {
         trap_return();
     }

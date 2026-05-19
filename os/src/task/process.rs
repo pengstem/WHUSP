@@ -159,6 +159,7 @@ impl CapabilitySets {
     pub const CAP_SETPCAP: usize = 8;
     pub const CAP_IPC_LOCK: usize = 14;
     pub const CAP_SYS_CHROOT: usize = 18;
+    pub const CAP_SYS_PTRACE: usize = 19;
     pub const CAP_SYS_ADMIN: usize = 21;
     pub const CAP_SYS_RESOURCE: usize = 24;
     pub const CAP_LAST_CAP: usize = 40;
@@ -509,6 +510,14 @@ impl ProcessPosixTimer {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PtraceState {
+    pub(crate) tracer_pid: Option<usize>,
+    pub(crate) stopped: bool,
+    pub(crate) stop_signal: Option<u32>,
+    pub(crate) wait_stop_status: Option<i32>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ProcessTimers {
     pub(crate) real: ProcessRealTimer,
@@ -553,6 +562,7 @@ pub struct ProcessControlBlockInner {
     pub(crate) personality: u32,
     pub(crate) wait_stop_status: Option<i32>,
     pub(crate) wait_continued: bool,
+    pub(crate) ptrace: PtraceState,
     // UNFINISHED: Linux kernel credentials are per-thread, while POSIX
     // user-space expects process-wide synchronization. This first contest
     // compatibility model keeps credentials on the PCB and shares them across
