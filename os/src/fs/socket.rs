@@ -275,7 +275,7 @@ struct AfAlgSendParams {
 struct LoopbackState {
     next_ephemeral: u16,
     tcp_listeners: BTreeMap<u16, Weak<UPIntrFreeCell<LocalSocketInner>>>,
-    udp_bound: BTreeMap<u16, Weak<UPIntrFreeCell<LocalSocketInner>>>,
+    udp_bound: BTreeMap<u16, Vec<Weak<UPIntrFreeCell<LocalSocketInner>>>>,
     unix_bound: BTreeMap<UnixAddress, Weak<UPIntrFreeCell<LocalSocketInner>>>,
 }
 
@@ -306,7 +306,10 @@ impl LoopbackState {
     fn prune(&mut self) {
         self.tcp_listeners
             .retain(|_, socket| socket.strong_count() > 0);
-        self.udp_bound.retain(|_, socket| socket.strong_count() > 0);
+        self.udp_bound.retain(|_, sockets| {
+            sockets.retain(|socket| socket.strong_count() > 0);
+            !sockets.is_empty()
+        });
         self.unix_bound
             .retain(|_, socket| socket.strong_count() > 0);
     }
@@ -440,12 +443,19 @@ impl LocalSocket {
                 }
             }
             SocketKind::Datagram => {
-                if loopback.udp_bound.contains_key(&endpoint.port) && !inner.reuse_addr {
+                if loopback
+                    .udp_bound
+                    .get(&endpoint.port)
+                    .is_some_and(|sockets| !sockets.is_empty())
+                    && !inner.reuse_addr
+                {
                     return Err(SysError::EADDRINUSE);
                 }
                 loopback
                     .udp_bound
-                    .insert(endpoint.port, Arc::downgrade(&self.inner));
+                    .entry(endpoint.port)
+                    .or_default()
+                    .push(Arc::downgrade(&self.inner));
             }
         }
         inner.local = Some(endpoint);
@@ -485,7 +495,9 @@ impl LocalSocket {
             SocketKind::Datagram => {
                 loopback
                     .udp_bound
-                    .insert(endpoint.port, Arc::downgrade(&self.inner));
+                    .entry(endpoint.port)
+                    .or_default()
+                    .push(Arc::downgrade(&self.inner));
             }
         }
         inner.local = Some(endpoint);
@@ -515,7 +527,9 @@ impl LocalSocket {
         if kind == SocketKind::Datagram {
             loopback
                 .udp_bound
-                .insert(endpoint.port, Arc::downgrade(&self.inner));
+                .entry(endpoint.port)
+                .or_default()
+                .push(Arc::downgrade(&self.inner));
         }
         self.inner.exclusive_access().local = Some(endpoint);
         Ok(endpoint)
@@ -743,11 +757,28 @@ impl LocalSocket {
                 .ok_or(SysError::EDESTADDRREQ)?,
         };
         let local_unix = self.inner.exclusive_access().unix_local.clone();
-        let target = {
+        let candidates = {
             let mut loopback = LOOPBACK.exclusive_access();
             loopback.prune();
-            loopback.udp_bound.get(&remote.port).and_then(Weak::upgrade)
+            loopback
+                .udp_bound
+                .get(&remote.port)
+                .map(|sockets| sockets.iter().filter_map(Weak::upgrade).collect::<Vec<_>>())
+                .unwrap_or_default()
         };
+        let mut fallback = None;
+        let mut target = None;
+        for candidate in candidates {
+            let peer = { candidate.exclusive_access().peer };
+            if peer == Some(local) {
+                target = Some(candidate);
+                break;
+            }
+            if peer.is_none() && fallback.is_none() {
+                fallback = Some(candidate);
+            }
+        }
+        let target = target.or(fallback);
         if let Some(target) = target {
             let mut target = target.exclusive_access();
             let queued_bytes: usize = target
@@ -957,7 +988,19 @@ impl Drop for LocalSocket {
                 }
                 SocketKind::Stream => {}
                 SocketKind::Datagram => {
-                    loopback.udp_bound.remove(&local.port);
+                    let self_weak = Arc::downgrade(&self.inner);
+                    let remove_empty =
+                        if let Some(sockets) = loopback.udp_bound.get_mut(&local.port) {
+                            sockets.retain(|socket| {
+                                socket.strong_count() > 0 && !Weak::ptr_eq(socket, &self_weak)
+                            });
+                            sockets.is_empty()
+                        } else {
+                            false
+                        };
+                    if remove_empty {
+                        loopback.udp_bound.remove(&local.port);
+                    }
                 }
             }
             if domain == SocketDomain::Unix
