@@ -72,6 +72,20 @@ pub fn trap_handler() -> ! {
     match scause.cause() {
         Trap::Exception(Exception::UserEnvCall) => {
             let syscall_pc = current_trap_cx().sepc;
+            let (syscall_nr, syscall_args, syscall_sp) = {
+                let cx = current_trap_cx();
+                (
+                    cx.x[17],
+                    [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]],
+                    cx.x[2],
+                )
+            };
+            crate::task::ptrace_syscall_enter_stop_current(
+                syscall_nr,
+                syscall_args,
+                syscall_pc,
+                syscall_sp,
+            );
             // jump to next instruction anyway
             let mut cx = current_trap_cx();
             cx.sepc += 4;
@@ -92,11 +106,20 @@ pub fn trap_handler() -> ! {
             // for restartable handlers.
             interrupted_pc = cx.sepc;
             cx.x[10] = result as usize;
+            let syscall_exit_pc = cx.sepc;
+            let syscall_exit_sp = cx.x[2];
             let syscall_pc_if_interrupted = if result == -(SysError::EINTR as isize) {
                 Some(syscall_pc)
             } else {
                 None
             };
+            if crate::task::ptrace_syscall_exit_stop_current(
+                result,
+                syscall_exit_pc,
+                syscall_exit_sp,
+            ) {
+                interrupted_pc = current_trap_cx().sepc;
+            }
             if crate::task::ptrace_stop_current_if_needed() {
                 interrupted_pc = current_trap_cx().sepc;
             }

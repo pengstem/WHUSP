@@ -55,7 +55,8 @@ pub use processor::{
 };
 pub(crate) use ptrace::{
     ptrace_attach_process, ptrace_kill_process, ptrace_note_exec_current, ptrace_resume_process,
-    ptrace_stop_current_if_needed, ptrace_take_wait_status, ptrace_traceme_current,
+    ptrace_stop_current_if_needed, ptrace_syscall_enter_stop_current,
+    ptrace_syscall_exit_stop_current, ptrace_take_wait_status, ptrace_traceme_current,
     ptrace_validate_tracee,
 };
 pub use signal::{

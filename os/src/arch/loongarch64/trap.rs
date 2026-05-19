@@ -77,6 +77,21 @@ pub fn trap_handler() -> ! {
     let mut interrupted_pc = trap_pc;
     match estat.cause() {
         Trap::Exception(Exception::Syscall) => {
+            let syscall_pc = current_trap_cx().era;
+            let (syscall_nr, syscall_args, syscall_sp) = {
+                let cx = current_trap_cx();
+                (
+                    cx.x[11],
+                    [cx.x[4], cx.x[5], cx.x[6], cx.x[7], cx.x[8], cx.x[9]],
+                    cx.x[3],
+                )
+            };
+            crate::task::ptrace_syscall_enter_stop_current(
+                syscall_nr,
+                syscall_args,
+                syscall_pc,
+                syscall_sp,
+            );
             let mut cx = current_trap_cx();
             cx.era += 4;
             enable_supervisor_interrupt();
@@ -87,6 +102,15 @@ pub fn trap_handler() -> ! {
             cx = current_trap_cx();
             interrupted_pc = cx.era;
             cx.x[4] = result as usize;
+            let syscall_exit_pc = cx.era;
+            let syscall_exit_sp = cx.x[3];
+            if crate::task::ptrace_syscall_exit_stop_current(
+                result,
+                syscall_exit_pc,
+                syscall_exit_sp,
+            ) {
+                interrupted_pc = current_trap_cx().era;
+            }
         }
         Trap::Exception(Exception::StorePageFault)
         | Trap::Exception(Exception::PageModifyFault) => {

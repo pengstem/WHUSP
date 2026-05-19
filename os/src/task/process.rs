@@ -513,11 +513,25 @@ impl ProcessPosixTimer {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PtraceSyscallStop {
+    pub(crate) op: u8,
+    pub(crate) nr: usize,
+    pub(crate) args: [usize; 6],
+    pub(crate) rval: isize,
+    pub(crate) is_error: bool,
+    pub(crate) instruction_pointer: usize,
+    pub(crate) stack_pointer: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PtraceState {
     pub(crate) tracer_pid: Option<usize>,
     pub(crate) stopped: bool,
     pub(crate) stop_signal: Option<u32>,
     pub(crate) wait_stop_status: Option<i32>,
+    pub(crate) options: usize,
+    pub(crate) syscall_trace: bool,
+    pub(crate) syscall_stop: Option<PtraceSyscallStop>,
 }
 
 #[derive(Debug, Default)]

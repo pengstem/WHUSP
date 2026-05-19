@@ -7,6 +7,9 @@ use crate::syscall::errno::{SysError, SysResult};
 use alloc::sync::Arc;
 
 const STOPPED_WAIT_LOW_BITS: i32 = 0x7f;
+const PTRACE_O_TRACESYSGOOD: usize = 1;
+pub(crate) const PTRACE_SYSCALL_INFO_ENTRY: u8 = 1;
+pub(crate) const PTRACE_SYSCALL_INFO_EXIT: u8 = 2;
 
 fn stopped_wait_status(signum: i32) -> i32 {
     (signum << 8) | STOPPED_WAIT_LOW_BITS
@@ -42,6 +45,9 @@ pub(crate) fn ptrace_traceme_current() -> SysResult {
         return Err(SysError::EPERM);
     }
     inner.ptrace.tracer_pid = Some(tracer_pid);
+    inner.ptrace.options = 0;
+    inner.ptrace.syscall_trace = false;
+    inner.ptrace.syscall_stop = None;
     Ok(0)
 }
 
@@ -82,6 +88,9 @@ pub(crate) fn ptrace_attach_process(
         inner.ptrace.stopped = true;
         inner.ptrace.stop_signal = Some(super::SIGSTOP);
         inner.ptrace.wait_stop_status = Some(super::SIGSTOP as i32);
+        inner.ptrace.options = 0;
+        inner.ptrace.syscall_trace = false;
+        inner.ptrace.syscall_stop = None;
     }
     remove_ready_tasks_of_process(tracee.getpid());
     {
@@ -99,8 +108,15 @@ pub(crate) fn ptrace_resume_process(
     tracer_pid: usize,
     signum: u32,
     detach: bool,
+    syscall_trace: bool,
 ) -> SysResult {
     let signal = if signum == 0 {
+        None
+    } else if signum == SIGTRAP || signum == (SIGTRAP | 0x80) {
+        // CONTEXT: strace may pass the reported stop signal back into a
+        // restart request. Linux ignores signal injection for synthetic exec
+        // and syscall ptrace stops, so do not turn those SIGTRAP stops into a
+        // fatal signal for the tracee.
         None
     } else if signum as usize >= SIGNAL_INFO_SLOTS {
         return Err(SysError::EIO);
@@ -113,8 +129,11 @@ pub(crate) fn ptrace_resume_process(
         inner.ptrace.stopped = false;
         inner.ptrace.stop_signal = None;
         inner.ptrace.wait_stop_status = None;
+        inner.ptrace.syscall_stop = None;
+        inner.ptrace.syscall_trace = syscall_trace && !detach;
         if detach {
             inner.ptrace.tracer_pid = None;
+            inner.ptrace.options = 0;
         }
     }
     if let Some(signal) = signal
@@ -140,6 +159,8 @@ pub(crate) fn ptrace_kill_process(
         inner.ptrace.stopped = false;
         inner.ptrace.stop_signal = None;
         inner.ptrace.wait_stop_status = None;
+        inner.ptrace.syscall_trace = false;
+        inner.ptrace.syscall_stop = None;
     }
     queue_signal_to_task(
         Arc::clone(&task),
@@ -198,8 +219,85 @@ fn take_ptrace_stop_signal() -> Option<usize> {
         process_inner.ptrace.stopped = true;
         process_inner.ptrace.stop_signal = Some(signum);
         process_inner.ptrace.wait_stop_status = Some(signum as i32);
+        process_inner.ptrace.syscall_stop = None;
     }
     Some(tracer_pid)
+}
+
+fn ptrace_syscall_stop_current(
+    op: u8,
+    nr: usize,
+    args: [usize; 6],
+    rval: isize,
+    instruction_pointer: usize,
+    stack_pointer: usize,
+) -> bool {
+    let Some(_task) = current_task() else {
+        return false;
+    };
+    let process = current_process();
+    let tracer_pid = {
+        let mut inner = process.inner_exclusive_access();
+        let Some(tracer_pid) = inner.ptrace.tracer_pid else {
+            return false;
+        };
+        if !inner.ptrace.syscall_trace {
+            return false;
+        }
+        let stop_signal = if inner.ptrace.options & PTRACE_O_TRACESYSGOOD != 0 {
+            SIGTRAP | 0x80
+        } else {
+            SIGTRAP
+        };
+        inner.ptrace.stopped = true;
+        inner.ptrace.stop_signal = Some(stop_signal);
+        inner.ptrace.wait_stop_status = Some(stop_signal as i32);
+        inner.ptrace.syscall_stop = Some(super::process::PtraceSyscallStop {
+            op,
+            nr,
+            args,
+            rval,
+            is_error: rval < 0,
+            instruction_pointer,
+            stack_pointer,
+        });
+        tracer_pid
+    };
+    let (_task, task_cx_ptr) = block_current_task_no_schedule();
+    wake_waiters_for_pid(tracer_pid);
+    schedule(task_cx_ptr);
+    true
+}
+
+pub(crate) fn ptrace_syscall_enter_stop_current(
+    nr: usize,
+    args: [usize; 6],
+    instruction_pointer: usize,
+    stack_pointer: usize,
+) -> bool {
+    ptrace_syscall_stop_current(
+        PTRACE_SYSCALL_INFO_ENTRY,
+        nr,
+        args,
+        0,
+        instruction_pointer,
+        stack_pointer,
+    )
+}
+
+pub(crate) fn ptrace_syscall_exit_stop_current(
+    rval: isize,
+    instruction_pointer: usize,
+    stack_pointer: usize,
+) -> bool {
+    ptrace_syscall_stop_current(
+        PTRACE_SYSCALL_INFO_EXIT,
+        0,
+        [0; 6],
+        rval,
+        instruction_pointer,
+        stack_pointer,
+    )
 }
 
 pub(crate) fn ptrace_stop_current_if_needed() -> bool {
