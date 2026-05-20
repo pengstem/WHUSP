@@ -12,7 +12,7 @@ use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{
     UserBufferAccess, copy_to_user, read_user_array_item, read_user_value,
-    translated_byte_buffer_checked, write_user_value,
+    read_user_value_with_mmap_fault, translated_byte_buffer_checked, write_user_value,
 };
 use crate::syscall::{close_detached_fd_entry, install_file_fd};
 use crate::task::{
@@ -1442,20 +1442,20 @@ fn read_socket_address(token: usize, ptr: usize, len: u32) -> SysResult<SocketAd
     if (len as usize) < size_of::<u16>() {
         return Err(SysError::EINVAL);
     }
-    let family = read_user_value(token, ptr as *const u16)? as i32;
+    let family = read_user_value_with_mmap_fault(token, ptr as *const u16)? as i32;
     match family {
         AF_INET => {
             if (len as usize) < size_of::<LinuxSockAddrIn>() {
                 return Err(SysError::EINVAL);
             }
-            let addr = read_user_value(token, ptr as *const LinuxSockAddrIn)?;
+            let addr = read_user_value_with_mmap_fault(token, ptr as *const LinuxSockAddrIn)?;
             Ok(SocketAddress::Inet(sockaddr_to_endpoint(addr)))
         }
         AF_INET6 => {
             if (len as usize) < size_of::<LinuxSockAddrIn6>() {
                 return Err(SysError::EINVAL);
             }
-            let addr = read_user_value(token, ptr as *const LinuxSockAddrIn6)?;
+            let addr = read_user_value_with_mmap_fault(token, ptr as *const LinuxSockAddrIn6)?;
             Ok(SocketAddress::Inet6(sockaddr_in6_to_endpoint(addr)?))
         }
         AF_UNIX => Ok(SocketAddress::Unix(read_unix_sockaddr(token, ptr, len)?)),
