@@ -1,10 +1,11 @@
 use crate::config::PAGE_SIZE;
 use crate::fs::{
-    LinuxTermio, LinuxTermios, LinuxWinsize, ProcNamespaceInfo, ProcNamespaceKind,
+    LinuxTermio, LinuxTermios, LinuxTermios2, LinuxWinsize, ProcNamespaceInfo, ProcNamespaceKind,
     apply_console_tty_termio, console_tty_available_bytes, console_tty_foreground_pgid,
-    console_tty_termio, console_tty_termios, console_tty_winsize, proc_namespace_info_from_path,
-    proc_namespace_kind_name, proc_namespace_stat_ino, set_console_tty_foreground_pgid,
-    set_console_tty_termios, set_console_tty_winsize,
+    console_tty_termio, console_tty_termios, console_tty_termios2, console_tty_winsize,
+    proc_namespace_info_from_path, proc_namespace_kind_name, proc_namespace_stat_ino,
+    set_console_tty_foreground_pgid, set_console_tty_termios, set_console_tty_termios2,
+    set_console_tty_winsize,
 };
 use crate::mm::UserBuffer;
 use crate::task::current_user_token;
@@ -84,6 +85,10 @@ const TIOCNOTTY: usize = 0x5422;
 const TIOCSETD: usize = 0x5423;
 const TIOCGETD: usize = 0x5424;
 const TCSBRKP: usize = 0x5425;
+const TCGETS2: usize = 0x802c_542a;
+const TCSETS2: usize = 0x402c_542b;
+const TCSETSW2: usize = 0x402c_542c;
+const TCSETSF2: usize = 0x402c_542d;
 const TIOCVHANGUP: usize = 0x5437;
 const TIOCGPTN: usize = 0x8004_5430;
 const TIOCSPTLCK: usize = 0x4004_5431;
@@ -379,11 +384,23 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
             write_user_value(token, argp as *mut LinuxTermios, &termios)?;
             Ok(0)
         }
+        TCGETS2 => {
+            let termios = console_tty_termios2();
+            write_user_value(token, argp as *mut LinuxTermios2, &termios)?;
+            Ok(0)
+        }
         TCSETS | TCSETSW | TCSETSF => {
             let termios = read_user_value(token, argp as *const LinuxTermios)?;
             // CONTEXT: Linux differentiates drain/flush behavior across TCSETS*, but for the
             // contest shell path we only need the termios state to round-trip and persist.
             set_console_tty_termios(termios);
+            Ok(0)
+        }
+        TCSETS2 | TCSETSW2 | TCSETSF2 => {
+            let termios = read_user_value(token, argp as *const LinuxTermios2)?;
+            // CONTEXT: Linux differentiates drain/flush behavior across TCSETS2*, but for the
+            // contest shell path we only need the termios state to round-trip and persist.
+            set_console_tty_termios2(termios);
             Ok(0)
         }
         TCGETA => {

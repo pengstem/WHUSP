@@ -62,6 +62,19 @@ pub(crate) struct LinuxTermios {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
+pub(crate) struct LinuxTermios2 {
+    pub(crate) c_iflag: u32,
+    pub(crate) c_oflag: u32,
+    pub(crate) c_cflag: u32,
+    pub(crate) c_lflag: u32,
+    pub(crate) c_line: u8,
+    pub(crate) c_cc: [u8; 19],
+    pub(crate) c_ispeed: u32,
+    pub(crate) c_ospeed: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct LinuxTermio {
     pub(crate) c_iflag: u16,
     pub(crate) c_oflag: u16,
@@ -202,12 +215,37 @@ pub(crate) fn console_tty_termios() -> LinuxTermios {
         .exclusive_session(|state| state.settings.termios)
 }
 
+pub(crate) fn console_tty_termios2() -> LinuxTermios2 {
+    let termios = console_tty_termios();
+    LinuxTermios2 {
+        c_iflag: termios.c_iflag,
+        c_oflag: termios.c_oflag,
+        c_cflag: termios.c_cflag,
+        c_lflag: termios.c_lflag,
+        c_line: termios.c_line,
+        c_cc: termios.c_cc,
+        c_ispeed: 38400,
+        c_ospeed: 38400,
+    }
+}
+
 pub(crate) fn set_console_tty_termios(termios: LinuxTermios) {
     CONSOLE_TTY.state.exclusive_session(|state| {
         state.settings.termios = termios;
         state.line_buf.clear();
         state.read_buf.clear();
         state.pending_eof = false;
+    });
+}
+
+pub(crate) fn set_console_tty_termios2(termios: LinuxTermios2) {
+    set_console_tty_termios(LinuxTermios {
+        c_iflag: termios.c_iflag,
+        c_oflag: termios.c_oflag,
+        c_cflag: termios.c_cflag,
+        c_lflag: termios.c_lflag,
+        c_line: termios.c_line,
+        c_cc: termios.c_cc,
     });
 }
 

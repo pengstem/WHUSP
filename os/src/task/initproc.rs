@@ -28,6 +28,9 @@ pub(super) fn load() -> Option<KernelInitProc> {
             BUSYBOX_COMMAND_FLAG.into(),
             super::contest_runner::build_runner_command(),
         ],
-        envp: vec!["PATH=/:/bin:/sbin:/usr/bin:/usr/local/bin".into()],
+        envp: vec![
+            "PATH=/:/bin:/sbin:/usr/bin:/usr/local/bin".into(),
+            "TERM=vt220".into(),
+        ],
     })
 }

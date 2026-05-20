@@ -33,10 +33,11 @@ pub(crate) use anonfd::make_anonymous_fd;
 #[cfg(target_arch = "riscv64")]
 pub(crate) use console_tty::console_tty_drain_uart;
 pub(crate) use console_tty::{
-    LinuxTermio, LinuxTermios, LinuxWinsize, apply_console_tty_termio, console_tty_available_bytes,
-    console_tty_foreground_pgid, console_tty_poll, console_tty_read, console_tty_termio,
-    console_tty_termios, console_tty_winsize, set_console_tty_foreground_pgid,
-    set_console_tty_termios, set_console_tty_winsize,
+    LinuxTermio, LinuxTermios, LinuxTermios2, LinuxWinsize, apply_console_tty_termio,
+    console_tty_available_bytes, console_tty_foreground_pgid, console_tty_poll, console_tty_read,
+    console_tty_termio, console_tty_termios, console_tty_termios2, console_tty_winsize,
+    set_console_tty_foreground_pgid, set_console_tty_termios, set_console_tty_termios2,
+    set_console_tty_winsize,
 };
 pub(crate) use eventfd::make_eventfd;
 pub(crate) use mount_fd::{DetachedMountFile, FsContextFile, FsContextStateError};
