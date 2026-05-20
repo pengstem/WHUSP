@@ -72,8 +72,10 @@ const DENTRY_CACHE_STATS_INO: u32 = 39;
 const EXEC_LOAD_STATS_INO: u32 = 40;
 const CORE_PATTERN_INO: u32 = 41;
 const VERSION_INO: u32 = 42;
+// CONTEXT: Dynamic /proc inode ranges must stay disjoint even after long test
+// runs allocate five-digit PIDs; LTP probes /proc/<ppid>/stat during waits.
 const PID_DIR_BASE: u32 = 100;
-const PID_FILE_BASE: u32 = 10_000;
+const PID_FILE_BASE: u32 = 10_000_000;
 const PID_FILE_STRIDE: u32 = 32;
 const PID_STAT_OFFSET: u32 = 0;
 const PID_STATUS_OFFSET: u32 = 1;
@@ -93,8 +95,8 @@ const PID_NS_PID_OFFSET: u32 = 14;
 const PID_NS_USER_OFFSET: u32 = 15;
 const PID_NS_UTS_OFFSET: u32 = 16;
 const PID_EXE_OFFSET: u32 = 17;
-const PID_FD_ENTRY_BASE: u32 = 1_000_000;
-const PID_FDINFO_ENTRY_BASE: u32 = 2_000_000;
+const PID_FD_ENTRY_BASE: u32 = 1_000_000_000;
+const PID_FDINFO_ENTRY_BASE: u32 = 2_000_000_000;
 const PID_FD_ENTRY_STRIDE: u32 = 4096;
 const PID_TASK_INO_TAG_MASK: u32 = 0xC000_0000;
 const PID_TASK_TID_COMM_TAG: u32 = 0x4000_0000;
