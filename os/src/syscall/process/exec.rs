@@ -36,6 +36,9 @@ const ELF64_DYNAMIC_ENTRY_SIZE: usize = 16;
 const DT_NULL: i64 = 0;
 const DT_NEEDED: i64 = 1;
 fn contest_library_path_env(root: &str) -> &'static str {
+    // CONTEXT: This only supplies shared-library search paths for contest disk
+    // layouts. ELF interpreter path aliases are handled separately in
+    // `read_elf_interpreter()` and must not be hidden through LD_LIBRARY_PATH.
     match root {
         "/musl" => "LD_LIBRARY_PATH=/musl/lib:/glibc/lib:/lib",
         "/glibc" => "LD_LIBRARY_PATH=/glibc/lib:/musl/lib:/lib",
@@ -433,6 +436,10 @@ fn read_exec_source_from_file(file: Arc<dyn File + Send + Sync>) -> SysResult<Ex
     if read_len != metadata_len {
         return Err(SysError::ENOEXEC);
     }
+    // CONTEXT: The ELF loader consumes only the bounded header/program-header
+    // window here. Segment contents are faulted or copied later, so changing
+    // this into a whole-file read would alter exec memory pressure and E2BIG/
+    // ENOEXEC boundaries visible to tests.
     record_exec_metadata_read(EXEC_ELF_HEADER_BYTES, phdr_bytes);
     Ok(ExecImageSource {
         data: metadata,

@@ -344,6 +344,9 @@ pub(crate) fn clone_mount_namespace(source_namespace_id: MountNamespaceId) -> Mo
 }
 
 fn ensure_mount_open(mount_id: MountId) -> Result<(), MountError> {
+    // CONTEXT: Extra virtio block devices reserve mount ids by DTB order during
+    // init but are opened lazily. This keeps the x0 root disk stable while
+    // allowing explicit `/dev/vdX` mounts to activate x1/x2 only when used.
     {
         let mounts = MOUNTS.lock();
         let Some(mount) = mounts.get(mount_id.0) else {
@@ -450,6 +453,10 @@ pub(super) fn synthetic_children_for_dir(
     parent: VfsNodeId,
     parent_path: &str,
 ) -> Vec<SyntheticDirEntry> {
+    // CONTEXT: Mounts placed on a path whose backing directory does not exist
+    // still need a visible direct child in getdents64(). Only direct synthetic
+    // children are reported here; deeper paths stay hidden until their parent
+    // is resolved.
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         let mut entries = Vec::new();
         for mount in mounts.iter().rev() {

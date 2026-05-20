@@ -141,6 +141,9 @@ fn waitid_child_matches(
 
 fn write_rusage(memory_set: &mut MemorySet, rusage: *mut RUsage) -> SysResult<()> {
     if !rusage.is_null() {
+        // UNFINISHED: Linux fills child resource usage here. This kernel only
+        // accounts waited-child CPU time internally for times(2), so wait4()
+        // and waitid() still expose a zeroed rusage structure.
         write_user_value_in_memory_set(memory_set, rusage, &RUsage::default())?;
     }
     Ok(())

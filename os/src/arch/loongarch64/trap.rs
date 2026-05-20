@@ -55,6 +55,9 @@ fn tlb_init() {
     unsafe extern "C" {
         safe fn __tlb_refill();
     }
+    // CONTEXT: These CSR fields describe the three-level 4 KiB page-table
+    // layout produced by `PageTable`. The refill assembly depends on this
+    // exact walker geometry before user traps can resolve TLB misses.
     tlbidx::set_ps(PS_4K);
     stlbps::set_ps(PS_4K);
     tlbrehi::set_ps(PS_4K);

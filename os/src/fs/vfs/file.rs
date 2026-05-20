@@ -350,6 +350,14 @@ impl VfsFile {
         let entries: Vec<RawDirEntry> =
             synthetic_children_for_dir(self.namespace_id, self.node, parent_path)
                 .into_iter()
+                .filter(|entry| {
+                    !with_mount(self.node.mount_id, |mount| {
+                        mount
+                            .lookup_component_from(self.node.ino, entry.name.as_str())
+                            .is_ok()
+                    })
+                    .unwrap_or(false)
+                })
                 .map(|entry| RawDirEntry {
                     ino: entry.ino,
                     name: entry.name,

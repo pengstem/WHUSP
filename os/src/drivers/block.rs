@@ -128,6 +128,9 @@ impl VirtIOBlock {
     }
 
     fn signal_next_completed(&self, blk: &mut VirtIOBlk<VirtioHal, VirtioTransport>) {
+        // CONTEXT: Completion is serialized through the virtqueue used ring.
+        // Wake only the descriptor head reported by the device; unrelated
+        // sleepers must stay blocked until their own token reaches used.
         if let Some(token) = blk.peek_used() {
             self.condvars.get(&token).unwrap().signal();
         }
