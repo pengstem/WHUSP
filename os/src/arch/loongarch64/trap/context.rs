@@ -7,6 +7,10 @@ pub struct TrapContext {
     pub kernel_satp: usize,
     pub kernel_sp: usize,
     pub trap_handler: usize,
+    pub f: [u64; 32],
+    pub fcc: u64,
+    pub fcsr: u32,
+    pub _fpu_reserved: u32,
 }
 
 impl TrapContext {
@@ -36,6 +40,10 @@ impl TrapContext {
             kernel_satp,
             kernel_sp,
             trap_handler,
+            f: [0; 32],
+            fcc: 0,
+            fcsr: 0,
+            _fpu_reserved: 0,
         };
         cx.set_sp(sp);
         cx

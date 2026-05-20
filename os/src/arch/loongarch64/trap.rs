@@ -16,13 +16,16 @@ use loongArch64::register::{
     ecfg::LineBasedInterrupt,
     eentry,
     estat::{self, Exception, Interrupt, Trap},
-    stlbps, ticlr, tlbidx, tlbrehi, tlbrentry,
+    euen, stlbps, ticlr, tlbidx, tlbrehi, tlbrentry,
 };
 use loongArch64::register::{pwch, pwcl};
 
 global_asm!(include_str!("trap/trap.S"));
 
 pub fn init() {
+    // CONTEXT: The LoongArch contest userland is built with the lp64d ABI.
+    // Keep the FP unit enabled and save its state at user trap boundaries.
+    euen::set_fpe(true);
     tlb_init();
     set_kernel_trap_entry();
 }

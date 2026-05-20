@@ -9,6 +9,8 @@
     .equ LA_CSR_PGDH, 0x1a
     .equ LA_CSR_PGD, 0x1b
     .equ LA_CSR_TLBRSAVE, 0x8b
+    .equ FCC_OFFSET, 69
+    .equ FCSR_OFFSET, 70
 
     .macro SAVE_REGS
         st.d    $ra, $sp,  1*8
@@ -87,6 +89,68 @@
         ld.d    $sp, $sp,  3*8
     .endm
 
+    .macro SAVE_FP n
+        fst.d   $f\n, $sp, (37+\n)*8
+    .endm
+
+    .macro LOAD_FP n
+        fld.d   $f\n, $sp, (37+\n)*8
+    .endm
+
+    .macro SAVE_FP_REGS
+        .set n, 0
+        .rept 32
+            SAVE_FP %n
+            .set n, n+1
+        .endr
+        movcf2gr    $t0, $fcc0
+        move        $t1, $t0
+        movcf2gr    $t0, $fcc1
+        bstrins.d   $t1, $t0, 15, 8
+        movcf2gr    $t0, $fcc2
+        bstrins.d   $t1, $t0, 23, 16
+        movcf2gr    $t0, $fcc3
+        bstrins.d   $t1, $t0, 31, 24
+        movcf2gr    $t0, $fcc4
+        bstrins.d   $t1, $t0, 39, 32
+        movcf2gr    $t0, $fcc5
+        bstrins.d   $t1, $t0, 47, 40
+        movcf2gr    $t0, $fcc6
+        bstrins.d   $t1, $t0, 55, 48
+        movcf2gr    $t0, $fcc7
+        bstrins.d   $t1, $t0, 63, 56
+        st.d        $t1, $sp, FCC_OFFSET*8
+        movfcsr2gr  $t0, $fcsr0
+        st.w        $t0, $sp, FCSR_OFFSET*8
+    .endm
+
+    .macro LOAD_FP_REGS
+        .set n, 0
+        .rept 32
+            LOAD_FP %n
+            .set n, n+1
+        .endr
+        ld.d        $t0, $sp, FCC_OFFSET*8
+        bstrpick.d  $t1, $t0, 7, 0
+        movgr2cf    $fcc0, $t1
+        bstrpick.d  $t1, $t0, 15, 8
+        movgr2cf    $fcc1, $t1
+        bstrpick.d  $t1, $t0, 23, 16
+        movgr2cf    $fcc2, $t1
+        bstrpick.d  $t1, $t0, 31, 24
+        movgr2cf    $fcc3, $t1
+        bstrpick.d  $t1, $t0, 39, 32
+        movgr2cf    $fcc4, $t1
+        bstrpick.d  $t1, $t0, 47, 40
+        movgr2cf    $fcc5, $t1
+        bstrpick.d  $t1, $t0, 55, 48
+        movgr2cf    $fcc6, $t1
+        bstrpick.d  $t1, $t0, 63, 56
+        movgr2cf    $fcc7, $t1
+        ld.w        $t0, $sp, FCSR_OFFSET*8
+        movgr2fcsr  $fcsr0, $t0
+    .endm
+
     .section .text.trampoline
     .globl __trap_vector_base
     .globl __restore
@@ -110,6 +174,7 @@ __trap_vector_base:
 1:
     csrrd   $sp, KSAVE_CTX
     SAVE_REGS
+    SAVE_FP_REGS
     ld.d    $t0, $sp, 34*8
     # csrwr writes the old CSR value back to its source register.
     move    $t1, $t0
@@ -131,6 +196,7 @@ __restore:
     dbar    0
     invtlb  0x00, $r0, $r0
     csrrd   $sp, KSAVE_CTX
+    LOAD_FP_REGS
     LOAD_REGS
     ertn
 
