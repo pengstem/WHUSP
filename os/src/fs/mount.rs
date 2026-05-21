@@ -373,7 +373,7 @@ fn ensure_mount_open(mount_id: MountId) -> Result<(), MountError> {
     Ok(())
 }
 
-pub(super) fn root_ino_for(mount_id: MountId) -> Option<u32> {
+pub(crate) fn root_ino_for(mount_id: MountId) -> Option<u32> {
     with_mount(mount_id, |mount| mount.root_ino())
 }
 

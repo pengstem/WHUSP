@@ -1,5 +1,6 @@
 use crate::fs::{
     FS_APPEND_FL, FS_COMPR_FL, FS_IMMUTABLE_FL, FS_NODUMP_FL, FS_STATX_ATTR_FLAGS, FileStat,
+    MountId, root_ino_for,
 };
 
 pub(super) const AT_FDCWD: isize = -100;
@@ -58,6 +59,7 @@ const STATX_ATTR_COMPRESSED: u64 = 0x0000_0004;
 const STATX_ATTR_IMMUTABLE: u64 = 0x0000_0010;
 const STATX_ATTR_APPEND: u64 = 0x0000_0020;
 const STATX_ATTR_NODUMP: u64 = 0x0000_0040;
+const STATX_ATTR_MOUNT_ROOT: u64 = 0x0000_2000;
 
 // Linux UIO_MAXIOV: reject larger vectors before copying the user iovec array.
 pub(super) const IOV_MAX: usize = 1024;
@@ -191,6 +193,15 @@ fn statx_attr_from_inode_flags(flags: u32) -> u64 {
     attr
 }
 
+fn statx_mount_root_attr(stat: FileStat) -> u64 {
+    if root_ino_for(MountId(stat.dev as usize)).is_some_and(|root_ino| stat.ino == root_ino as u64)
+    {
+        STATX_ATTR_MOUNT_ROOT
+    } else {
+        0
+    }
+}
+
 impl LinuxStatxTimestamp {
     fn new(sec: u64, nsec: u32) -> Self {
         Self {
@@ -258,10 +269,12 @@ impl From<FileStat> for LinuxStatx {
         let dev = linux_visible_dev(stat.dev);
         let supported_flags = stat.inode_flags_supported & FS_STATX_ATTR_FLAGS;
         let active_flags = stat.inode_flags & supported_flags;
+        let supported_attrs = statx_attr_from_inode_flags(supported_flags) | STATX_ATTR_MOUNT_ROOT;
+        let active_attrs = statx_attr_from_inode_flags(active_flags) | statx_mount_root_attr(stat);
         Self {
             stx_mask: STATX_BASIC_STATS,
             stx_blksize: stat.blksize,
-            stx_attributes: statx_attr_from_inode_flags(active_flags),
+            stx_attributes: active_attrs,
             stx_nlink: stat.nlink,
             stx_uid: stat.uid,
             stx_gid: stat.gid,
@@ -270,7 +283,7 @@ impl From<FileStat> for LinuxStatx {
             stx_ino: stat.ino,
             stx_size: stat.size,
             stx_blocks: stat.blocks,
-            stx_attributes_mask: statx_attr_from_inode_flags(supported_flags),
+            stx_attributes_mask: supported_attrs,
             stx_atime: LinuxStatxTimestamp::new(stat.atime_sec, stat.atime_nsec),
             stx_btime: LinuxStatxTimestamp::default(),
             stx_ctime: LinuxStatxTimestamp::new(stat.ctime_sec, stat.ctime_nsec),
