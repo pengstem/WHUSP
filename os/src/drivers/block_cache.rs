@@ -112,16 +112,26 @@ impl BlockCache {
         self.trim_to_capacity();
     }
 
-    fn invalidate_after_write(&mut self) {
+    fn update_after_write(&mut self, key: BlockCacheKey, data: [u8; BLOCK_CACHE_LINE_SIZE]) {
+        if !self.enabled || self.capacity == 0 {
+            return;
+        }
+        self.lines.insert(key, BlockCacheLine::new(data));
+        self.stats.write_update += 1;
+        self.touch(key);
+        self.trim_to_capacity();
+    }
+
+    fn invalidate_key_after_write(&mut self, key: BlockCacheKey) {
         if !self.enabled {
             return;
         }
-        if self.lines.is_empty() {
-            return;
+        if self.lines.remove(&key).is_some() {
+            self.stats.write_invalidate += 1;
         }
-        self.stats.write_invalidate += self.lines.len();
-        self.lines.clear();
-        self.lru.clear();
+        if let Some(index) = self.lru.iter().position(|cached| *cached == key) {
+            self.lru.remove(index);
+        }
     }
 
     fn record_device_read_submit(&mut self) {
@@ -161,8 +171,16 @@ fn cache_insert_read(device_key: usize, block_id: usize, data: [u8; BLOCK_CACHE_
     BLOCK_CACHE.exclusive_access().insert_read(key, data);
 }
 
-fn cache_invalidate_after_write() {
-    BLOCK_CACHE.exclusive_access().invalidate_after_write();
+fn cache_update_after_write(device_key: usize, block_id: usize, data: [u8; BLOCK_CACHE_LINE_SIZE]) {
+    let key = BlockCacheKey::new(device_key, block_id);
+    BLOCK_CACHE.exclusive_access().update_after_write(key, data);
+}
+
+fn cache_invalidate_key_after_write(device_key: usize, block_id: usize) {
+    let key = BlockCacheKey::new(device_key, block_id);
+    BLOCK_CACHE
+        .exclusive_access()
+        .invalidate_key_after_write(key);
 }
 
 fn record_device_read_submit() {
@@ -205,7 +223,7 @@ pub(crate) fn read_with_cache<F>(
 }
 
 pub(crate) fn write_with_cache<F>(
-    _device_key: usize,
+    device_key: usize,
     block_id: usize,
     buf: &[u8],
     mut write_uncached: F,
@@ -218,12 +236,14 @@ pub(crate) fn write_with_cache<F>(
             record_bypass_unaligned();
             record_device_write_submit();
             write_uncached(current_block, chunk);
-            cache_invalidate_after_write();
+            cache_invalidate_key_after_write(device_key, current_block);
             continue;
         }
         record_device_write_submit();
         write_uncached(current_block, chunk);
-        cache_invalidate_after_write();
+        let mut line = [0u8; BLOCK_CACHE_LINE_SIZE];
+        line.copy_from_slice(chunk);
+        cache_update_after_write(device_key, current_block, line);
     }
 }
 
