@@ -1,6 +1,6 @@
 use crate::fs::{
     FS_APPEND_FL, FS_COMPR_FL, FS_IMMUTABLE_FL, FS_NODUMP_FL, FS_STATX_ATTR_FLAGS, FileStat,
-    MountId, root_ino_for,
+    MountId, S_IFBLK, S_IFMT, root_ino_for,
 };
 
 pub(super) const AT_FDCWD: isize = -100;
@@ -54,6 +54,7 @@ pub(super) const STATX_BASIC_STATS: u32 = STATX_TYPE
     | STATX_SIZE
     | STATX_BLOCKS;
 const STATX_MNT_ID: u32 = 0x0000_1000;
+const STATX_DIOALIGN: u32 = 0x0000_2000;
 pub(super) const STATX_RESERVED: u32 = 0x8000_0000;
 
 const STATX_ATTR_COMPRESSED: u64 = 0x0000_0004;
@@ -155,7 +156,9 @@ pub struct LinuxStatx {
     stx_dev_major: u32,
     stx_dev_minor: u32,
     stx_mnt_id: u64,
-    __spare2: [u64; 13],
+    stx_dio_mem_align: u32,
+    stx_dio_offset_align: u32,
+    __spare2: [u64; 12],
 }
 
 fn linux_dev_major(dev: u64) -> u32 {
@@ -201,6 +204,15 @@ fn statx_mount_root_attr(stat: FileStat) -> u64 {
         STATX_ATTR_MOUNT_ROOT
     } else {
         0
+    }
+}
+
+fn statx_dioalign(stat: FileStat) -> (u32, u32, u32) {
+    if stat.mode & S_IFMT == S_IFBLK {
+        let align = stat.blksize.max(512);
+        (STATX_DIOALIGN, align, align)
+    } else {
+        (0, 0, 0)
     }
 }
 
@@ -273,8 +285,9 @@ impl From<FileStat> for LinuxStatx {
         let active_flags = stat.inode_flags & supported_flags;
         let supported_attrs = statx_attr_from_inode_flags(supported_flags) | STATX_ATTR_MOUNT_ROOT;
         let active_attrs = statx_attr_from_inode_flags(active_flags) | statx_mount_root_attr(stat);
+        let (dio_mask, dio_mem_align, dio_offset_align) = statx_dioalign(stat);
         Self {
-            stx_mask: STATX_BASIC_STATS | STATX_MNT_ID,
+            stx_mask: STATX_BASIC_STATS | STATX_MNT_ID | dio_mask,
             stx_blksize: stat.blksize,
             stx_attributes: active_attrs,
             stx_nlink: stat.nlink,
@@ -295,7 +308,9 @@ impl From<FileStat> for LinuxStatx {
             stx_dev_major: linux_dev_major(dev),
             stx_dev_minor: linux_dev_minor(dev),
             stx_mnt_id: stat.dev,
-            __spare2: [0; 13],
+            stx_dio_mem_align: dio_mem_align,
+            stx_dio_offset_align: dio_offset_align,
+            __spare2: [0; 12],
         }
     }
 }

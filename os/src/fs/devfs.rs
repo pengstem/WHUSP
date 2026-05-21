@@ -1572,6 +1572,8 @@ pub(crate) fn loop_device_sysfs_content(path: &str) -> Option<Vec<u8>> {
             let size_limit = LOOP0_STATE.exclusive_session(|state| state.size_limit);
             format!("{size_limit}\n")
         }
+        "/sys/block/loop0/queue/logical_block_size" => "4096\n".into(),
+        "/sys/block/loop0/queue/dma_alignment" => "4095\n".into(),
         _ => return None,
     };
     Some(content.into_bytes())

@@ -83,6 +83,9 @@ enum StaticNode {
     SysLoopBackingFile,
     SysLoopDirectIo,
     SysLoopSizeLimit,
+    SysLoopQueueDir,
+    SysLoopLogicalBlockSize,
+    SysLoopDmaAlignment,
     SysDevBlockTmpfsUevent,
     #[cfg(target_arch = "loongarch64")]
     OptDir,
@@ -122,6 +125,7 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
         "/sys/block" | "/sys/block/" => Some(StaticNode::SysBlockDir),
         "/sys/block/loop0" | "/sys/block/loop0/" => Some(StaticNode::SysLoop0Dir),
         "/sys/block/loop0/loop" | "/sys/block/loop0/loop/" => Some(StaticNode::SysLoopInnerDir),
+        "/sys/block/loop0/queue" | "/sys/block/loop0/queue/" => Some(StaticNode::SysLoopQueueDir),
         "/sys/dev" | "/sys/dev/" => Some(StaticNode::SysDevDir),
         "/sys/dev/block" | "/sys/dev/block/" => Some(StaticNode::SysDevBlockDir),
         "/sys/dev/block/254:0" | "/sys/dev/block/254:0/" => Some(StaticNode::SysDevBlockTmpfsDir),
@@ -151,6 +155,8 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
         "/sys/block/loop0/loop/backing_file" => Some(StaticNode::SysLoopBackingFile),
         "/sys/block/loop0/loop/dio" => Some(StaticNode::SysLoopDirectIo),
         "/sys/block/loop0/loop/sizelimit" => Some(StaticNode::SysLoopSizeLimit),
+        "/sys/block/loop0/queue/logical_block_size" => Some(StaticNode::SysLoopLogicalBlockSize),
+        "/sys/block/loop0/queue/dma_alignment" => Some(StaticNode::SysLoopDmaAlignment),
         "/sys/dev/block/254:0/uevent" => Some(StaticNode::SysDevBlockTmpfsUevent),
         #[cfg(target_arch = "loongarch64")]
         "/opt" | "/opt/" => Some(StaticNode::OptDir),
@@ -198,6 +204,12 @@ fn content(node: StaticNode) -> Option<Vec<u8>> {
         StaticNode::SysLoopSizeLimit => {
             super::devfs::loop_device_sysfs_content("/sys/block/loop0/loop/sizelimit")
         }
+        StaticNode::SysLoopLogicalBlockSize => {
+            super::devfs::loop_device_sysfs_content("/sys/block/loop0/queue/logical_block_size")
+        }
+        StaticNode::SysLoopDmaAlignment => {
+            super::devfs::loop_device_sysfs_content("/sys/block/loop0/queue/dma_alignment")
+        }
         StaticNode::SysDevBlockTmpfsUevent => Some(SYS_DEV_BLOCK_TMPFS_UEVENT.to_vec()),
         StaticNode::EtcDir
         | StaticNode::LibDir
@@ -207,6 +219,7 @@ fn content(node: StaticNode) -> Option<Vec<u8>> {
         | StaticNode::SysBlockDir
         | StaticNode::SysLoop0Dir
         | StaticNode::SysLoopInnerDir
+        | StaticNode::SysLoopQueueDir
         | StaticNode::SysDevDir
         | StaticNode::SysDevBlockDir
         | StaticNode::SysDevBlockTmpfsDir
@@ -233,6 +246,7 @@ fn is_dir(node: StaticNode) -> bool {
         | StaticNode::SysBlockDir
         | StaticNode::SysLoop0Dir
         | StaticNode::SysLoopInnerDir
+        | StaticNode::SysLoopQueueDir
         | StaticNode::SysDevDir
         | StaticNode::SysDevBlockDir
         | StaticNode::SysDevBlockTmpfsDir
@@ -269,6 +283,7 @@ fn stat_node(node: StaticNode) -> FileStat {
         StaticNode::SysBlockDir => 28,
         StaticNode::SysLoop0Dir => 29,
         StaticNode::SysLoopInnerDir => 30,
+        StaticNode::SysLoopQueueDir => 39,
         StaticNode::SysDevDir => 31,
         StaticNode::SysDevBlockDir => 32,
         StaticNode::SysDevicesDir => 33,
@@ -294,6 +309,8 @@ fn stat_node(node: StaticNode) -> FileStat {
         StaticNode::SysLoopBackingFile => 21,
         StaticNode::SysLoopDirectIo => 22,
         StaticNode::SysLoopSizeLimit => 23,
+        StaticNode::SysLoopLogicalBlockSize => 40,
+        StaticNode::SysLoopDmaAlignment => 41,
         StaticNode::SysDevBlockTmpfsUevent => 38,
         #[cfg(target_arch = "loongarch64")]
         StaticNode::OptDir => 8,
