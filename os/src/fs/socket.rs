@@ -12,7 +12,8 @@ use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{
     UserBufferAccess, copy_to_user, read_user_array_item, read_user_value,
-    read_user_value_with_mmap_fault, translated_byte_buffer_checked, write_user_value,
+    read_user_value_with_mmap_fault, translated_byte_buffer_checked,
+    translated_byte_buffer_checked_with_mmap_fault, write_user_value,
 };
 use crate::syscall::{close_detached_fd_entry, install_file_fd};
 use crate::task::{
@@ -1640,9 +1641,12 @@ fn lookup_unix_endpoint(address: &UnixAddress) -> SysResult<InetEndpoint> {
 
 fn copy_user_to_vec(token: usize, ptr: usize, len: usize) -> SysResult<Vec<u8>> {
     let mut data = Vec::with_capacity(len);
-    for slice in
-        translated_byte_buffer_checked(token, ptr as *const u8, len, UserBufferAccess::Read)?
-    {
+    for slice in translated_byte_buffer_checked_with_mmap_fault(
+        token,
+        ptr as *const u8,
+        len,
+        UserBufferAccess::Read,
+    )? {
         data.extend_from_slice(slice);
     }
     Ok(data)
