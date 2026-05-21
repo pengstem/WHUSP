@@ -783,6 +783,35 @@ impl LocalSocket {
 
     fn send_datagram(&self, data: &[u8], remote: Option<SocketAddress>) -> SysResult<usize> {
         let local = self.ensure_bound(SocketKind::Datagram)?;
+        let local_unix = self.inner.exclusive_access().unix_local.clone();
+        if remote.is_none()
+            && let Some(peer) = self
+                .inner
+                .exclusive_access()
+                .peer_socket
+                .as_ref()
+                .and_then(Weak::upgrade)
+        {
+            let mut peer = peer.exclusive_access();
+            if peer.read_shutdown {
+                return Err(SysError::EPIPE);
+            }
+            let queued_bytes: usize = peer
+                .datagram_rx
+                .iter()
+                .map(|packet| packet.data.len())
+                .sum();
+            let capacity = (peer.rcvbuf as usize).max(1);
+            if queued_bytes.saturating_add(data.len()) > capacity {
+                return Err(SysError::EAGAIN);
+            }
+            peer.datagram_rx.push_back(Datagram {
+                data: data.to_vec(),
+                from: local,
+                from_unix: local_unix,
+            });
+            return Ok(data.len());
+        }
         let remote = match remote {
             Some(remote) => self.resolve_remote_address(remote)?.0,
             None => self
@@ -791,7 +820,6 @@ impl LocalSocket {
                 .peer
                 .ok_or(SysError::EDESTADDRREQ)?,
         };
-        let local_unix = self.inner.exclusive_access().unix_local.clone();
         let candidates = {
             let mut loopback = LOOPBACK.exclusive_access();
             loopback.prune();
@@ -1379,6 +1407,22 @@ impl File for LocalSocket {
                         if peer.stream_rx.len() < (peer.rcvbuf as usize).max(1) {
                             ready |= PollEvents::POLLOUT;
                         }
+                    }
+                }
+                SocketKind::Datagram => {
+                    let writable = if let Some(peer) = peer.as_ref().and_then(Weak::upgrade) {
+                        let peer = peer.exclusive_access();
+                        let queued_bytes: usize = peer
+                            .datagram_rx
+                            .iter()
+                            .map(|packet| packet.data.len())
+                            .sum();
+                        queued_bytes < (peer.rcvbuf as usize).max(1)
+                    } else {
+                        true
+                    };
+                    if writable {
+                        ready |= PollEvents::POLLOUT;
                     }
                 }
                 _ => ready |= PollEvents::POLLOUT,

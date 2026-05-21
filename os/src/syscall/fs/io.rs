@@ -689,6 +689,7 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut i64, count: usize)
             break;
         }
         let want = buffer.len().min(permitted);
+        ensure_nonblocking_ready(&out_entry, PollEvents::POLLOUT)?;
         let read = if let Some(input_offset) = explicit_offset {
             in_file.read_at(input_offset, &mut buffer[..want])
         } else {
@@ -698,7 +699,6 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut i64, count: usize)
             break;
         }
 
-        ensure_nonblocking_ready(&out_entry, PollEvents::POLLOUT)?;
         let written = write_with_status_flags(&out_entry, kernel_user_buffer(&mut buffer[..read]));
         if written == 0 {
             checked_write_result_for_entry(&out_entry, read, written)?;
