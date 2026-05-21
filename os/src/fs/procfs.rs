@@ -95,6 +95,7 @@ const PID_NS_PID_OFFSET: u32 = 14;
 const PID_NS_USER_OFFSET: u32 = 15;
 const PID_NS_UTS_OFFSET: u32 = 16;
 const PID_EXE_OFFSET: u32 = 17;
+const PID_MOUNTINFO_OFFSET: u32 = 18;
 const PID_FD_ENTRY_BASE: u32 = 1_000_000_000;
 const PID_FDINFO_ENTRY_BASE: u32 = 2_000_000_000;
 const PID_FD_ENTRY_STRIDE: u32 = 4096;
@@ -207,6 +208,7 @@ enum ProcNode {
     PidMaps(usize),
     PidSmaps(usize),
     PidMounts(usize),
+    PidMountinfo(usize),
     PidIo(usize),
     PidNsDir(usize),
     PidNsMnt(usize),
@@ -482,6 +484,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
                 PID_TASK_DIR_OFFSET => Some(ProcNode::PidTaskDir(pid)),
                 PID_SMAPS_OFFSET => Some(ProcNode::PidSmaps(pid)),
                 PID_MOUNTS_OFFSET => Some(ProcNode::PidMounts(pid)),
+                PID_MOUNTINFO_OFFSET => Some(ProcNode::PidMountinfo(pid)),
                 PID_IO_OFFSET => Some(ProcNode::PidIo(pid)),
                 PID_FDINFO_DIR_OFFSET => Some(ProcNode::PidFdInfoDir(pid)),
                 PID_COMM_OFFSET => Some(ProcNode::PidComm(pid)),
@@ -972,6 +975,11 @@ fn pid_entries(pid: usize) -> Vec<RawDirEntry> {
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_MOUNTINFO_OFFSET),
+        name: "mountinfo".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
         ino: pid_file_ino(pid, PID_IO_OFFSET),
         name: "io".into(),
         dtype: DT_REG,
@@ -1164,6 +1172,41 @@ fn mounts_content() -> String {
     output
 }
 
+fn linux_dev_major(dev: u64) -> u32 {
+    (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)) as u32
+}
+
+fn linux_dev_minor(dev: u64) -> u32 {
+    ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32
+}
+
+fn linux_visible_dev(dev: u64) -> u64 {
+    if linux_dev_major(dev) == 0 {
+        (254u64 & 0xfff) << 8
+    } else {
+        dev
+    }
+}
+
+fn mountinfo_content() -> String {
+    let mut output = String::new();
+    let namespace_id = crate::task::current_process().mount_namespace_id();
+    for mount in mount::list_mounts(namespace_id) {
+        let dev = linux_visible_dev(mount.id.0 as u64);
+        output.push_str(&format!(
+            "{} 0 {}:{} / {} rw - {} {} {}\n",
+            mount.id.0,
+            linux_dev_major(dev),
+            linux_dev_minor(dev),
+            mount.target,
+            mount.fs_type,
+            mount.source,
+            mount.options
+        ));
+    }
+    output
+}
+
 fn filesystems_content() -> &'static str {
     // CONTEXT: fsopen(2) points userspace at /proc/filesystems to discover
     // valid fs names. ext2/ext3 are scratch-mount compatibility names backed by
@@ -1319,8 +1362,9 @@ fn pid_fdinfo_content(pid: usize, fd: usize) -> FsResult<String> {
     // This metadata-only subset reports enough mark/ignored_mask fields for
     // LTP fanotify09/fanotify10 to distinguish groups with and without ignore
     // marks; inode and device numbers are still placeholders.
+    let mnt_id = file.vfs_mount_id().map(|mount_id| mount_id.0).unwrap_or(0);
     Ok(format!(
-        "pos:\t0\nflags:\t{flags:o}\nmnt_id:\t0\n{fanotify_info}{inotify_info}"
+        "pos:\t0\nflags:\t{flags:o}\nmnt_id:\t{mnt_id}\n{fanotify_info}{inotify_info}"
     ))
 }
 
@@ -1686,6 +1730,9 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::PidMounts(pid) => lookup_process(pid)
             .map(|_| mounts_content().into_bytes())
             .ok_or(FsError::NotFound),
+        ProcNode::PidMountinfo(pid) => lookup_process(pid)
+            .map(|_| mountinfo_content().into_bytes())
+            .ok_or(FsError::NotFound),
         ProcNode::PidIo(pid) => lookup_process(pid)
             .map(|_| proc_io_content().into_bytes())
             .ok_or(FsError::NotFound),
@@ -1925,6 +1972,10 @@ impl FileSystemBackend for ProcFs {
                 "smaps" => Ok((pid_file_ino(pid, PID_SMAPS_OFFSET), FsNodeKind::RegularFile)),
                 "mounts" => Ok((
                     pid_file_ino(pid, PID_MOUNTS_OFFSET),
+                    FsNodeKind::RegularFile,
+                )),
+                "mountinfo" => Ok((
+                    pid_file_ino(pid, PID_MOUNTINFO_OFFSET),
                     FsNodeKind::RegularFile,
                 )),
                 "io" => Ok((pid_file_ino(pid, PID_IO_OFFSET), FsNodeKind::RegularFile)),

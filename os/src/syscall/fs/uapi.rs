@@ -53,6 +53,7 @@ pub(super) const STATX_BASIC_STATS: u32 = STATX_TYPE
     | STATX_INO
     | STATX_SIZE
     | STATX_BLOCKS;
+const STATX_MNT_ID: u32 = 0x0000_1000;
 pub(super) const STATX_RESERVED: u32 = 0x8000_0000;
 
 const STATX_ATTR_COMPRESSED: u64 = 0x0000_0004;
@@ -153,7 +154,8 @@ pub struct LinuxStatx {
     stx_rdev_minor: u32,
     stx_dev_major: u32,
     stx_dev_minor: u32,
-    __spare2: [u64; 14],
+    stx_mnt_id: u64,
+    __spare2: [u64; 13],
 }
 
 fn linux_dev_major(dev: u64) -> u32 {
@@ -272,7 +274,7 @@ impl From<FileStat> for LinuxStatx {
         let supported_attrs = statx_attr_from_inode_flags(supported_flags) | STATX_ATTR_MOUNT_ROOT;
         let active_attrs = statx_attr_from_inode_flags(active_flags) | statx_mount_root_attr(stat);
         Self {
-            stx_mask: STATX_BASIC_STATS,
+            stx_mask: STATX_BASIC_STATS | STATX_MNT_ID,
             stx_blksize: stat.blksize,
             stx_attributes: active_attrs,
             stx_nlink: stat.nlink,
@@ -292,7 +294,8 @@ impl From<FileStat> for LinuxStatx {
             stx_rdev_minor: linux_dev_minor(stat.rdev),
             stx_dev_major: linux_dev_major(dev),
             stx_dev_minor: linux_dev_minor(dev),
-            __spare2: [0; 14],
+            stx_mnt_id: stat.dev,
+            __spare2: [0; 13],
         }
     }
 }

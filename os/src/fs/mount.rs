@@ -87,6 +87,7 @@ pub(crate) enum MountError {
 
 #[derive(Clone, Debug)]
 pub(crate) struct MountInfo {
+    pub(crate) id: MountId,
     pub(crate) source: String,
     pub(crate) target: String,
     pub(crate) fs_type: &'static str,
@@ -2176,6 +2177,7 @@ pub(crate) fn list_mounts(namespace_id: MountNamespaceId) -> Vec<MountInfo> {
     let mut infos = Vec::new();
     if let Some((source, fs_type, options)) = mount_metadata(primary_mount_id()) {
         infos.push(MountInfo {
+            id: primary_mount_id(),
             source,
             target: "/".into(),
             fs_type,
@@ -2203,6 +2205,7 @@ pub(crate) fn list_mounts(namespace_id: MountNamespaceId) -> Vec<MountInfo> {
         }
         if let Some((source, fs_type, options)) = mount_metadata(mount.source_mount_id) {
             infos.push(MountInfo {
+                id: mount.source_mount_id,
                 source,
                 target: mount.target_path.clone(),
                 fs_type,
