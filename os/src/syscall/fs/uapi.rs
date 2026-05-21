@@ -1,6 +1,6 @@
 use crate::fs::{
     FS_APPEND_FL, FS_COMPR_FL, FS_ENCRYPT_FL, FS_IMMUTABLE_FL, FS_NODUMP_FL, FS_STATX_ATTR_FLAGS,
-    FS_VERITY_FL, FileStat, MountId, S_IFBLK, S_IFMT, root_ino_for,
+    FS_VERITY_FL, FileStat, MountId, S_IFBLK, S_IFMT, S_IFREG, root_ino_for, statfs_for_mount,
 };
 
 pub(super) const AT_FDCWD: isize = -100;
@@ -65,6 +65,7 @@ const STATX_ATTR_NODUMP: u64 = 0x0000_0040;
 const STATX_ATTR_ENCRYPTED: u64 = 0x0000_0800;
 const STATX_ATTR_VERITY: u64 = 0x0010_0000;
 const STATX_ATTR_MOUNT_ROOT: u64 = 0x0000_2000;
+const EXT_SUPER_MAGIC: i64 = 0xEF53;
 
 // Linux UIO_MAXIOV: reject larger vectors before copying the user iovec array.
 pub(super) const IOV_MAX: usize = 1024;
@@ -218,6 +219,12 @@ fn statx_mount_root_attr(stat: FileStat) -> u64 {
 
 fn statx_dioalign(stat: FileStat) -> (u32, u32, u32) {
     if stat.mode & S_IFMT == S_IFBLK {
+        let align = stat.blksize.max(512);
+        (STATX_DIOALIGN, align, align)
+    } else if stat.mode & S_IFMT == S_IFREG
+        && statfs_for_mount(MountId(stat.dev as usize))
+            .is_some_and(|fs_stat| fs_stat.magic == EXT_SUPER_MAGIC)
+    {
         let align = stat.blksize.max(512);
         (STATX_DIOALIGN, align, align)
     } else {

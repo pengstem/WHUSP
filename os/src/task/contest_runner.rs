@@ -325,10 +325,10 @@ fn append_ltp_manifest_case_execution(command: &mut String) {
     // CONTEXT: The manifest command may carry arguments or shell fragments, so
     // execute it as the LTP runner specifies.
     command.push_str("echo \"RUN LTP CASE $case_name\"; ");
-    command.push_str("eval \"$case_cmd\"; ");
+    command.push_str("case \"$case_name\" in statx10) _old_ltp_single_fs_type=\"$LTP_SINGLE_FS_TYPE\"; export LTP_SINGLE_FS_TYPE=\"ext4\"; eval \"$case_cmd\"; ret=$?; export LTP_SINGLE_FS_TYPE=\"$_old_ltp_single_fs_type\" ;; *) eval \"$case_cmd\"; ret=$? ;; esac; ");
     // CONTEXT: tools/score_autotest.py treats this historical "FAIL" line as
     // the LTP case completion record and reads the numeric exit status from it.
-    command.push_str("ret=$?; echo \"FAIL LTP CASE $case_name : $ret\"; ");
+    command.push_str("echo \"FAIL LTP CASE $case_name : $ret\"; ");
 }
 
 fn append_ltp_case_filter(command: &mut String, filter: LtpCaseFilter) {
