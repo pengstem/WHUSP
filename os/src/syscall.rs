@@ -56,6 +56,7 @@ const SYSCALL_PREAD64: usize = 67;
 const SYSCALL_PWRITE64: usize = 68;
 const SYSCALL_PREADV: usize = 69;
 const SYSCALL_PWRITEV: usize = 70;
+const SYSCALL_SENDFILE: usize = 71;
 const SYSCALL_PSELECT6: usize = 72;
 const SYSCALL_PPOLL: usize = 73;
 const SYSCALL_SIGNALFD4: usize = 74;
@@ -511,6 +512,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3],
             args[4],
         ),
+        SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut i64, args[3]),
         SYSCALL_PWRITEV2 => sys_pwritev2(
             args[0],
             args[1] as *const LinuxIovec,

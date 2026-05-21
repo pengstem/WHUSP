@@ -6,6 +6,7 @@ use crate::task::{
     current_user_token,
 };
 use alloc::{vec, vec::Vec};
+use core::mem::size_of;
 use core::ptr::read_volatile;
 
 use super::super::errno::{SysError, SysResult};
@@ -615,6 +616,7 @@ const SPLICE_F_MORE: u32 = 0x04;
 const SPLICE_F_GIFT: u32 = 0x08;
 const SPLICE_KNOWN_FLAGS: u32 = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
 const SPLICE_COPY_CHUNK: usize = 4096;
+const SENDFILE_COPY_CHUNK: usize = PAGE_SIZE;
 
 // UNFINISHED: Linux splice can move pipe pages without copying and has deeper
 // file-type-specific wakeup semantics. This contest compatibility path copies
@@ -622,6 +624,100 @@ const SPLICE_COPY_CHUNK: usize = 4096;
 // behavior needed by current LTP splice cases.
 fn kernel_user_buffer(buf: &mut [u8]) -> UserBuffer {
     UserBuffer::from_kernel_slice_for_sync_io(buf)
+}
+
+fn read_sendfile_offset(token: usize, ptr: *mut i64) -> SysResult<Option<usize>> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    translated_byte_buffer_checked_with_mmap_fault(
+        token,
+        ptr.cast_const().cast::<u8>(),
+        size_of::<i64>(),
+        UserBufferAccess::Write,
+    )?;
+    let offset = read_user_value(token, ptr.cast_const())?;
+    if offset < 0 {
+        return Err(SysError::EINVAL);
+    }
+    Ok(Some(checked_position_offset(offset as usize)?))
+}
+
+fn write_sendfile_offset(token: usize, ptr: *mut i64, offset: Option<usize>) -> SysResult<()> {
+    if let Some(offset) = offset {
+        write_user_value(token, ptr, &(offset as i64))?;
+    }
+    Ok(())
+}
+
+fn ensure_sendfile_input(file: &(dyn File + Send + Sync)) -> SysResult<()> {
+    if !file.readable() {
+        return Err(SysError::EBADF);
+    }
+    if file.stat()?.mode & S_IFMT != S_IFREG {
+        return Err(SysError::EINVAL);
+    }
+    Ok(())
+}
+
+pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut i64, count: usize) -> SysResult {
+    let token = current_user_token();
+    let mut explicit_offset = read_sendfile_offset(token, offset)?;
+    let in_entry = get_fd_entry_by_fd(in_fd)?;
+    let out_entry = get_fd_entry_by_fd(out_fd)?;
+    let in_file = in_entry.file();
+    let out_file = out_entry.file();
+
+    ensure_sendfile_input(in_file.as_ref())?;
+    if !out_file.writable() {
+        return Err(SysError::EBADF);
+    }
+    if out_entry.status_flags().contains(OpenFlags::APPEND) {
+        return Err(SysError::EINVAL);
+    }
+    if count == 0 {
+        write_sendfile_offset(token, offset, explicit_offset)?;
+        return Ok(0);
+    }
+
+    let mut copied = 0usize;
+    let mut buffer = vec![0u8; count.min(SENDFILE_COPY_CHUNK)];
+    while copied < count {
+        let remaining = count - copied;
+        let permitted = allowed_write_len_for_entry(&out_entry, remaining)?;
+        if permitted == 0 {
+            break;
+        }
+        let want = buffer.len().min(permitted);
+        let read = if let Some(input_offset) = explicit_offset {
+            in_file.read_at(input_offset, &mut buffer[..want])
+        } else {
+            in_file.read(kernel_user_buffer(&mut buffer[..want]))
+        };
+        if read == 0 {
+            break;
+        }
+
+        ensure_nonblocking_ready(&out_entry, PollEvents::POLLOUT)?;
+        let written = write_with_status_flags(&out_entry, kernel_user_buffer(&mut buffer[..read]));
+        if written == 0 {
+            checked_write_result_for_entry(&out_entry, read, written)?;
+            break;
+        }
+
+        copied = copied.checked_add(written).ok_or(SysError::EOVERFLOW)?;
+        if let Some(input_offset) = explicit_offset.as_mut() {
+            *input_offset = input_offset
+                .checked_add(written)
+                .ok_or(SysError::EOVERFLOW)?;
+        }
+        if written < read {
+            break;
+        }
+    }
+
+    write_sendfile_offset(token, offset, explicit_offset)?;
+    Ok(copied as isize)
 }
 
 fn read_splice_offset(token: usize, ptr: *mut i64, is_pipe: bool) -> SysResult<Option<i64>> {
