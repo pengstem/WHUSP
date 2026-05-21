@@ -1,6 +1,6 @@
 use crate::fs::{
-    FS_APPEND_FL, FS_COMPR_FL, FS_IMMUTABLE_FL, FS_NODUMP_FL, FS_STATX_ATTR_FLAGS, FileStat,
-    MountId, S_IFBLK, S_IFMT, root_ino_for,
+    FS_APPEND_FL, FS_COMPR_FL, FS_ENCRYPT_FL, FS_IMMUTABLE_FL, FS_NODUMP_FL, FS_STATX_ATTR_FLAGS,
+    FileStat, MountId, S_IFBLK, S_IFMT, root_ino_for,
 };
 
 pub(super) const AT_FDCWD: isize = -100;
@@ -62,6 +62,7 @@ const STATX_ATTR_COMPRESSED: u64 = 0x0000_0004;
 const STATX_ATTR_IMMUTABLE: u64 = 0x0000_0010;
 const STATX_ATTR_APPEND: u64 = 0x0000_0020;
 const STATX_ATTR_NODUMP: u64 = 0x0000_0040;
+const STATX_ATTR_ENCRYPTED: u64 = 0x0000_0800;
 const STATX_ATTR_MOUNT_ROOT: u64 = 0x0000_2000;
 
 // Linux UIO_MAXIOV: reject larger vectors before copying the user iovec array.
@@ -195,6 +196,9 @@ fn statx_attr_from_inode_flags(flags: u32) -> u64 {
     }
     if flags & FS_NODUMP_FL != 0 {
         attr |= STATX_ATTR_NODUMP;
+    }
+    if flags & FS_ENCRYPT_FL != 0 {
+        attr |= STATX_ATTR_ENCRYPTED;
     }
     attr
 }

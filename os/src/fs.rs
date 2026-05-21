@@ -56,8 +56,9 @@ pub const FS_COMPR_FL: u32 = 0x0000_0004;
 pub const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
 pub const FS_APPEND_FL: u32 = 0x0000_0020;
 pub const FS_NODUMP_FL: u32 = 0x0000_0040;
+pub const FS_ENCRYPT_FL: u32 = 0x0000_0800;
 pub const FS_STATX_COMMON_ATTR_FLAGS: u32 = FS_IMMUTABLE_FL | FS_APPEND_FL | FS_NODUMP_FL;
-pub const FS_STATX_ATTR_FLAGS: u32 = FS_COMPR_FL | FS_STATX_COMMON_ATTR_FLAGS;
+pub const FS_STATX_ATTR_FLAGS: u32 = FS_COMPR_FL | FS_ENCRYPT_FL | FS_STATX_COMMON_ATTR_FLAGS;
 
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -3,8 +3,8 @@ use super::dirent::{
 };
 use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
 use super::{
-    FS_STATX_ATTR_FLAGS, FS_STATX_COMMON_ATTR_FLAGS, FileStat, FileTimestamp, S_IFBLK, S_IFCHR,
-    S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK,
+    FS_ENCRYPT_FL, FS_STATX_ATTR_FLAGS, FS_STATX_COMMON_ATTR_FLAGS, FileStat, FileTimestamp,
+    S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK,
 };
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 const ROOT_INO: u32 = 2;
 const TMPFS_MAGIC: i64 = 0x0102_1994;
 pub(super) const EXT234_SUPER_MAGIC: i64 = 0xEF53;
+const E4CRYPT_ENCRYPTED_MARKER: &str = ".whusp_e4crypt_encrypted";
 // CONTEXT: Larger sparse tmpfs files are represented by sparse extents so
 // high-offset writes do not require one huge zero-filled heap allocation.
 const TMPFS_INLINE_FILE_LIMIT: usize = 1024 * 1024;
@@ -437,8 +438,13 @@ impl TmpFs {
         }
         inode.touch();
         self.inodes.insert(ino, inode);
+        let mark_parent_encrypted =
+            self.statfs_magic == EXT234_SUPER_MAGIC && name == E4CRYPT_ENCRYPTED_MARKER;
         let parent = self.inode_mut(parent_ino)?;
         parent.children.insert(name.into(), ino);
+        if mark_parent_encrypted {
+            parent.flags |= FS_ENCRYPT_FL;
+        }
         parent.touch();
         Ok(ino)
     }
