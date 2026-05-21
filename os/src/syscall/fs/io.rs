@@ -10,7 +10,7 @@ use core::ptr::read_volatile;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    UserBufferAccess, read_user_array_item, read_user_value, translated_byte_buffer_checked,
+    UserBufferAccess, read_user_array_item, read_user_value,
     translated_byte_buffer_checked_with_mmap_fault, write_user_value,
 };
 use super::fanotify::{fanotify_notify_access, fanotify_notify_modify};
@@ -785,7 +785,8 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> SysRes
         return Err(SysError::EBADF);
     }
     ensure_positioned_target(file.as_ref())?;
-    let buffers = translated_byte_buffer_checked(token, buf, len, UserBufferAccess::Write)?;
+    let buffers =
+        translated_byte_buffer_checked_with_mmap_fault(token, buf, len, UserBufferAccess::Write)?;
     let mut total_read = 0usize;
     for slice in buffers {
         let read = file.read_at(
@@ -821,7 +822,12 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, len: usize, offset: usize) -> Sys
         offset = file.stat()?.size as usize;
     }
     let allowed_len = allowed_write_len_at(file.as_ref(), offset, len)?;
-    let buffers = translated_byte_buffer_checked(token, buf, allowed_len, UserBufferAccess::Read)?;
+    let buffers = translated_byte_buffer_checked_with_mmap_fault(
+        token,
+        buf,
+        allowed_len,
+        UserBufferAccess::Read,
+    )?;
     if let Err(err) = file.check_write_at(offset, allowed_len) {
         fault_in_read_buffers(&buffers);
         return Err(err.into());
