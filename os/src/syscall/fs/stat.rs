@@ -145,6 +145,9 @@ pub fn sys_newfstatat(
     }
     let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
     let snapshot = current_process().path_snapshot();
+    if !path.is_empty() {
+        check_current_access_path_prefixes_from(&snapshot, dirfd, path.as_str())?;
+    }
     write_stat_result(
         token,
         statbuf,
@@ -596,6 +599,7 @@ pub fn sys_statfs(pathname: *const u8, statfsbuf: *mut LinuxStatfs) -> SysResult
         return Err(SysError::ENOENT);
     }
     let snapshot = current_process().path_snapshot();
+    check_current_access_path_prefixes_from(&snapshot, AT_FDCWD, path.as_str())?;
     let stat = resolve_stat_from(&snapshot, AT_FDCWD, path.as_str(), true)?;
     let fs_stat = statfs_for_mount(MountId(stat.dev as usize)).ok_or(SysError::ENOSYS)?;
     write_user_value(token, statfsbuf, &LinuxStatfs::from(fs_stat))?;
@@ -649,6 +653,9 @@ pub fn sys_statx(
     }
     let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
     let snapshot = current_process().path_snapshot();
+    if !path.is_empty() {
+        check_current_access_path_prefixes_from(&snapshot, dirfd, path.as_str())?;
+    }
     write_stat_result(
         token,
         statxbuf,
