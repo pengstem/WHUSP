@@ -669,10 +669,7 @@ fn sleep_until_clock(backend: ClockBackend, request: LinuxTimeSpec) -> SysResult
     if deadline_nanos <= now_nanos {
         return Ok(0);
     }
-    let duration_ms = nanos_to_ms_ceil(deadline_nanos - now_nanos)?;
-    let expire_ms = get_time_ms()
-        .checked_add(duration_ms)
-        .ok_or(SysError::EINVAL)?;
+    let expire_ms = relative_timeout_deadline_ms_from_nanos(deadline_nanos - now_nanos)?;
     sleep_until_ms(expire_ms)
 }
 

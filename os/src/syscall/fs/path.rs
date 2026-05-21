@@ -525,6 +525,10 @@ fn do_openat(dirfd: isize, path: &str, flags: OpenFlags, mode: u32) -> SysResult
         && snapshot.context.is_global_root()
         && let Some(file) = open_static_path(path, flags)?
     {
+        // CONTEXT: Static proc/dev compatibility files are keyed by the
+        // normalized process-global path before the dynamic VFS lookup. Do not
+        // route this through cwd-relative lookup or chrooted processes could
+        // observe host-global pseudo files by accident.
         return install_file_fd(file, flags, None);
     }
     if path.starts_with('/')

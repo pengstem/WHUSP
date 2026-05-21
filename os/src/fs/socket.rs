@@ -16,8 +16,8 @@ use crate::syscall::user_ptr::{
 };
 use crate::syscall::{close_detached_fd_entry, install_file_fd};
 use crate::task::{
-    FdTableEntry, current_has_unmasked_signal, current_process, current_user_token,
-    suspend_current_and_run_next,
+    FdTableEntry, SignalFlags, current_add_signal, current_has_unmasked_signal, current_process,
+    current_user_token, suspend_current_and_run_next,
 };
 use crate::timer::get_time_ms;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -717,18 +717,27 @@ impl LocalSocket {
     fn send_stream(&self, data: &[u8]) -> SysResult<usize> {
         let mut written = 0usize;
         while written < data.len() {
-            let peer = {
+            let (connected, peer) = {
                 let inner = self.inner.exclusive_access();
                 if inner.write_shutdown {
                     return Err(SysError::EPIPE);
                 }
-                inner
-                    .peer_socket
-                    .as_ref()
-                    .and_then(Weak::upgrade)
-                    .ok_or(SysError::ENOTCONN)?
+                (
+                    inner.peer.is_some() || inner.unix_peer.is_some(),
+                    inner.peer_socket.as_ref().and_then(Weak::upgrade),
+                )
+            };
+            let Some(peer) = peer else {
+                return Err(if connected {
+                    SysError::EPIPE
+                } else {
+                    SysError::ENOTCONN
+                });
             };
             let mut peer_inner = peer.exclusive_access();
+            if peer_inner.read_shutdown {
+                return Err(SysError::EPIPE);
+            }
             let capacity = (peer_inner.rcvbuf as usize).max(1);
             let available = capacity.saturating_sub(peer_inner.stream_rx.len());
             if available == 0 {
@@ -746,6 +755,29 @@ impl LocalSocket {
             written += chunk_len;
         }
         Ok(written)
+    }
+
+    fn stream_write_peer_closed(&self) -> bool {
+        let (kind, listening, write_shutdown, connected, peer) = {
+            let inner = self.inner.exclusive_access();
+            (
+                inner.kind,
+                inner.listening,
+                inner.write_shutdown,
+                inner.peer.is_some() || inner.unix_peer.is_some(),
+                inner.peer_socket.as_ref().and_then(Weak::upgrade),
+            )
+        };
+        if kind != SocketKind::Stream || listening {
+            return false;
+        }
+        if write_shutdown {
+            return true;
+        }
+        match peer {
+            Some(peer) => peer.exclusive_access().read_shutdown,
+            None => connected,
+        }
     }
 
     fn send_datagram(&self, data: &[u8], remote: Option<SocketAddress>) -> SysResult<usize> {
@@ -1301,6 +1333,9 @@ impl File for LocalSocket {
     fn write(&self, buf: UserBuffer) -> usize {
         let data = buf.to_vec();
         self.send_bytes(&data, None).unwrap_or_default()
+    }
+    fn socket_write_peer_closed(&self) -> bool {
+        self.stream_write_peer_closed()
     }
 
     fn poll(&self, events: PollEvents) -> PollEvents {
@@ -2067,7 +2102,14 @@ pub fn sys_sendto(
     } else {
         Some(read_socket_address(token, addr, addrlen)?)
     };
-    with_socket(fd, |socket| Ok(socket.send_bytes(&data, remote)? as isize))
+    with_socket(fd, |socket| match socket.send_bytes(&data, remote) {
+        Ok(written) => Ok(written as isize),
+        Err(SysError::EPIPE) => {
+            current_add_signal(SignalFlags::SIGPIPE);
+            Err(SysError::EPIPE)
+        }
+        Err(err) => Err(err),
+    })
 }
 
 pub fn sys_recvfrom(

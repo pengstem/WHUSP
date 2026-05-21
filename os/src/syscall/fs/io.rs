@@ -67,6 +67,9 @@ impl UserIovecCursor {
     }
 
     fn validate_all(&self) -> SysResult<()> {
+        // CONTEXT: readv/preadv validate every destination iovec before
+        // reading so an early filesystem read cannot partially modify user
+        // memory before a later bad iovec reports EFAULT.
         for iovec in self.entries.iter() {
             if iovec.len == 0 {
                 continue;
@@ -221,6 +224,23 @@ fn checked_write_result(requested: usize, written: usize) -> SysResult {
         Err(SysError::EIO)
     } else {
         Ok(written as isize)
+    }
+}
+
+fn checked_write_result_for_entry(
+    entry: &FdTableEntry,
+    requested: usize,
+    written: usize,
+) -> SysResult {
+    let file = entry.file();
+    if requested > 0
+        && written == 0
+        && (file.pipe_readers_closed() || file.socket_write_peer_closed())
+    {
+        current_add_signal(SignalFlags::SIGPIPE);
+        Err(SysError::EPIPE)
+    } else {
+        checked_write_result(requested, written)
     }
 }
 
@@ -988,7 +1008,7 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
     let written = write_with_status_flags(&entry, UserBuffer::new(buffers));
     fanotify_notify_modify(&file, written);
     inotify_notify_modify(&file, written);
-    checked_write_result(allowed_len, written)
+    checked_write_result_for_entry(&entry, allowed_len, written)
 }
 
 pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult {
@@ -1049,7 +1069,7 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
     }
     fanotify_notify_modify(&file, total_written);
     inotify_notify_modify(&file, total_written);
-    checked_write_result(requested_len, total_written)
+    checked_write_result_for_entry(&entry, requested_len, total_written)
 }
 
 pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult {

@@ -1,6 +1,6 @@
 use super::{
     TaskControlBlock, TaskStatus, block_current_task_no_schedule, current_has_deliverable_signal,
-    current_process, current_task, current_user_token, schedule, wakeup_task,
+    current_process, current_task, current_user_token, schedule, wakeup_front_task, wakeup_task,
 };
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
@@ -380,7 +380,10 @@ fn futex_wake_for_process(
 fn wake_futex_tasks(tasks: Vec<Arc<TaskControlBlock>>) -> usize {
     let mut woken = 0;
     for task in tasks {
-        if wakeup_task(task) {
+        // CONTEXT: Futex wakeups are synchronization handoffs. Under
+        // hackbench-style load, placing the waiter at the tail can delay
+        // pthread_join/condvar completion far beyond the timed RT workload.
+        if wakeup_front_task(task) {
             woken += 1;
         }
     }

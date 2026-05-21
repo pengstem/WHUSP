@@ -222,6 +222,9 @@ impl ProcessControlBlock {
         );
         let memory_set = MemorySet::from_existed_user(&mut parent.memory_set)?;
         let pid = pid_alloc();
+        // CONTEXT: fork copies descriptor slots and per-fd CLOEXEC flags, but
+        // each `FdTableEntry` keeps sharing the same open file description
+        // through `Arc<dyn File>`, matching Linux offset/status-flag sharing.
         let new_fd_table = parent.fd_table.clone();
         let umask = parent.umask;
         let credentials = parent.credentials.clone();

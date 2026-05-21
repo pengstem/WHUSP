@@ -324,6 +324,10 @@ fn pipe_wait_interrupted() -> bool {
 
 impl Drop for Pipe {
     fn drop(&mut self) {
+        // CONTEXT: Dropping the write end wakes readers so EOF becomes
+        // observable; dropping the read end wakes writers so EPIPE/SIGPIPE
+        // can be produced by the syscall layer. Wake after releasing the ring
+        // lock because the scheduler may inspect the same pipe state.
         let (readers, writers) = {
             let mut ring_buffer = self.buffer.exclusive_access();
             let readers = if self.writable {

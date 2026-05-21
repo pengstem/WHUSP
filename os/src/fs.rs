@@ -294,6 +294,9 @@ pub trait File: Send + Sync {
     fn pipe_readers_closed(&self) -> bool {
         false
     }
+    fn socket_write_peer_closed(&self) -> bool {
+        false
+    }
     fn is_tty(&self) -> bool {
         false
     }

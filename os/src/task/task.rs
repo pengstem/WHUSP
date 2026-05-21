@@ -14,6 +14,8 @@ use alloc::{
 };
 
 pub const DEFAULT_TIMER_SLACK_NS: usize = 50_000;
+const SCHED_FIFO: i32 = 1;
+const SCHED_RR: i32 = 2;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TaskCpuTimes {
@@ -106,6 +108,14 @@ impl TaskControlBlock {
     pub fn set_robust_list_head(&self, head: usize) {
         self.inner_exclusive_access().robust_list_head = head;
     }
+
+    pub(crate) fn realtime_priority(&self) -> i32 {
+        let inner = self.inner_exclusive_access();
+        match inner.sched_policy {
+            SCHED_FIFO | SCHED_RR if inner.sched_priority > 0 => inner.sched_priority,
+            _ => 0,
+        }
+    }
 }
 
 pub struct TaskControlBlockInner {
@@ -117,6 +127,9 @@ pub struct TaskControlBlockInner {
     // Linux-visible sleep state for cooperative wait loops that stay runnable.
     pub proc_sleeping: bool,
     pub exit_code: Option<i32>,
+    // Main tasks derive their Linux TID from the process PID. Pthreads and
+    // CLONE_VM helper tasks own a separate PidHandle so futex, tgkill, and
+    // robust-list paths never expose the internal task-slot index as a TID.
     pub linux_tid: Option<PidHandle>,
     pub clear_child_tid: Option<usize>,
     pub robust_list_head: usize,

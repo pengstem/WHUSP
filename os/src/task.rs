@@ -47,6 +47,7 @@ pub(crate) use manager::list_process_snapshots;
 pub(crate) use manager::processes_snapshot;
 pub(crate) use manager::remove_ready_tasks_of_process;
 pub use manager::{add_task, pid2process, remove_from_pid2process, wakeup_task};
+pub(crate) use manager::{wakeup_front_task, wakeup_timer_task};
 #[cfg(target_arch = "riscv64")]
 pub use processor::current_trap_cx_user_va;
 pub use processor::{

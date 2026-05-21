@@ -6,7 +6,7 @@ use crate::sbi::set_timer;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
     ProcessControlBlock, SignalFlags, SignalInfo, TaskControlBlock, queue_signal_to_task,
-    wakeup_task,
+    wakeup_timer_task,
 };
 use alloc::collections::BinaryHeap;
 use alloc::sync::{Arc, Weak};
@@ -14,6 +14,10 @@ use lazy_static::*;
 use loongArch64::time::Time;
 
 pub const TICKS_PER_SEC: usize = 100;
+// CONTEXT: Keep Linux-visible clock ticks at 100 Hz, but drive scheduler
+// timer interrupts at 1 kHz so 1 ms clock_nanosleep workloads can wake on
+// time instead of waiting for the next 10 ms accounting tick.
+const TIMER_INTERRUPTS_PER_SEC: usize = 1000;
 const MSEC_PER_SEC: usize = 1000;
 const USEC_PER_SEC: usize = 1_000_000;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
@@ -71,7 +75,7 @@ pub fn get_time_clock_ticks() -> usize {
 }
 
 pub fn set_next_trigger() {
-    set_timer(get_time() + clock_freq() / TICKS_PER_SEC);
+    set_timer(get_time() + clock_freq() / TIMER_INTERRUPTS_PER_SEC);
 }
 
 pub struct TimerCondVar {
@@ -260,7 +264,7 @@ pub fn check_timer() {
     TIMERS.exclusive_session(|timers| {
         while let Some(timer) = timers.peek() {
             if timer.expire_ms <= current_ms {
-                wakeup_task(Arc::clone(&timer.task));
+                wakeup_timer_task(Arc::clone(&timer.task));
                 timers.pop();
             } else {
                 break;

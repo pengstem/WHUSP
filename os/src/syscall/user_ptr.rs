@@ -168,6 +168,9 @@ pub(crate) fn read_user_c_string(
                 if byte == 0 {
                     return Ok(string);
                 }
+                // UNFINISHED: Linux pathnames are byte strings except for NUL.
+                // This syscall layer stores them as Rust `String`, so
+                // non-ASCII pathname bytes are not preserved byte-for-byte yet.
                 string.push(byte as char);
             }
         }

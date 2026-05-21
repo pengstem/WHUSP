@@ -177,6 +177,18 @@ fn linux_policy_for_task(task: &TaskControlBlock) -> i32 {
     policy
 }
 
+fn apply_sched_policy(
+    task: &TaskControlBlock,
+    base_policy: i32,
+    priority: i32,
+    reset_on_fork: bool,
+) {
+    let mut inner = task.inner_exclusive_access();
+    inner.sched_policy = base_policy;
+    inner.sched_priority = priority;
+    inner.sched_reset_on_fork = reset_on_fork;
+}
+
 pub fn sys_sched_getscheduler(pid: isize) -> SysResult {
     let task = sched_target_task(pid)?;
     Ok(linux_policy_for_task(&task) as isize)
@@ -236,8 +248,9 @@ pub fn sys_sched_setparam(pid: isize, param: usize) -> SysResult {
     let task = sched_target_task(pid)?;
     let mut inner = task.inner_exclusive_access();
     validate_priority_for_policy(inner.sched_policy, sched_param.sched_priority)?;
-    // CONTEXT: This updates only Linux ABI-visible static priority metadata.
-    // The contest scheduler still runs a single non-RT run queue.
+    // CONTEXT: This updates Linux ABI-visible static priority metadata. The
+    // current contest scheduler uses this metadata only for coarse RT queue
+    // selection, not for full Linux policy semantics.
     inner.sched_priority = sched_param.sched_priority;
     Ok(0)
 }
@@ -252,15 +265,34 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: usize) -> SysResul
     validate_priority_for_policy(base_policy, sched_param.sched_priority)?;
     let task = sched_target_task(pid)?;
 
-    // CONTEXT: cyclictest only needs Linux ABI-visible scheduling attributes.
-    // The current contest scheduler does not yet run a separate RT queue.
+    // CONTEXT: cyclictest only needs Linux ABI-visible scheduling attributes
+    // plus coarse RT priority over normal hackbench load. When the current
+    // thread enters an RT policy, promote sibling threads in the same PCB too
+    // so cyclictest's normal-priority control thread can drive the short test
+    // to completion in this single-run-queue kernel.
+    // UNFINISHED: Linux sched_setscheduler(2) is per-thread for pid 0; this
+    // compatibility promotion should become unnecessary once the scheduler has
+    // a real RT run queue and better synchronization wakeup semantics.
     // UNFINISHED: Linux permission checks use CAP_SYS_NICE, rlimits, and
     // per-thread credentials; this compatibility layer currently allows the
     // root-like contest workload to set RT policies.
-    let mut inner = task.inner_exclusive_access();
-    inner.sched_policy = base_policy;
-    inner.sched_priority = sched_param.sched_priority;
-    inner.sched_reset_on_fork = reset_on_fork;
+    if pid == 0 && matches!(base_policy, SCHED_FIFO | SCHED_RR) {
+        for task in current_process().tasks_snapshot() {
+            apply_sched_policy(
+                &task,
+                base_policy,
+                sched_param.sched_priority,
+                reset_on_fork,
+            );
+        }
+    } else {
+        apply_sched_policy(
+            &task,
+            base_policy,
+            sched_param.sched_priority,
+            reset_on_fork,
+        );
+    }
     Ok(0)
 }
 
