@@ -412,7 +412,7 @@ fn copy_c_string_to_user(ptr: *mut u8, buf_len: usize, string: &str) -> SysResul
     bytes.extend_from_slice(string.as_bytes());
     bytes.push(0);
     copy_to_user(current_user_token(), ptr, &bytes)?;
-    Ok(ptr as isize)
+    Ok(total_len as isize)
 }
 
 fn readlink_file_to_user(
