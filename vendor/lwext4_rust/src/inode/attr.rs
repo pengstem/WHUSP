@@ -32,6 +32,8 @@ pub struct FileAttr {
 
     /// Time of last access
     pub atime: Duration,
+    /// Time of file creation
+    pub btime: Duration,
     /// Time of last modification
     pub mtime: Duration,
     /// Time of last status change
@@ -159,6 +161,7 @@ impl<Hal: SystemHal> InodeRef<Hal> {
 
         let inode = self.raw_inode();
         attr.atime = decode_time(inode.access_time, inode.atime_extra);
+        attr.btime = decode_time(inode.crtime, inode.crtime_extra);
         attr.mtime = decode_time(inode.modification_time, inode.mtime_extra);
         attr.ctime = decode_time(inode.change_inode_time, inode.ctime_extra);
     }

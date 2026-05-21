@@ -42,6 +42,7 @@ pub(super) const STATX_CTIME: u32 = 0x0080;
 pub(super) const STATX_INO: u32 = 0x0100;
 pub(super) const STATX_SIZE: u32 = 0x0200;
 pub(super) const STATX_BLOCKS: u32 = 0x0400;
+pub(super) const STATX_BTIME: u32 = 0x0800;
 pub(super) const STATX_BASIC_STATS: u32 = STATX_TYPE
     | STATX_MODE
     | STATX_NLINK
@@ -276,8 +277,6 @@ impl From<crate::fs::FileSystemStat> for LinuxStatfs {
 
 /// Converts this kernel's inode snapshot into Linux `struct statx` layout.
 ///
-/// Birth time is reported as zero because the current VFS metadata model does
-/// not preserve it yet.
 impl From<FileStat> for LinuxStatx {
     fn from(stat: FileStat) -> Self {
         let dev = linux_visible_dev(stat.dev);
@@ -286,8 +285,13 @@ impl From<FileStat> for LinuxStatx {
         let supported_attrs = statx_attr_from_inode_flags(supported_flags) | STATX_ATTR_MOUNT_ROOT;
         let active_attrs = statx_attr_from_inode_flags(active_flags) | statx_mount_root_attr(stat);
         let (dio_mask, dio_mem_align, dio_offset_align) = statx_dioalign(stat);
+        let btime_mask = if stat.btime_sec != 0 || stat.btime_nsec != 0 {
+            STATX_BTIME
+        } else {
+            0
+        };
         Self {
-            stx_mask: STATX_BASIC_STATS | STATX_MNT_ID | dio_mask,
+            stx_mask: STATX_BASIC_STATS | STATX_MNT_ID | dio_mask | btime_mask,
             stx_blksize: stat.blksize,
             stx_attributes: active_attrs,
             stx_nlink: stat.nlink,
@@ -300,7 +304,7 @@ impl From<FileStat> for LinuxStatx {
             stx_blocks: stat.blocks,
             stx_attributes_mask: supported_attrs,
             stx_atime: LinuxStatxTimestamp::new(stat.atime_sec, stat.atime_nsec),
-            stx_btime: LinuxStatxTimestamp::default(),
+            stx_btime: LinuxStatxTimestamp::new(stat.btime_sec, stat.btime_nsec),
             stx_ctime: LinuxStatxTimestamp::new(stat.ctime_sec, stat.ctime_nsec),
             stx_mtime: LinuxStatxTimestamp::new(stat.mtime_sec, stat.mtime_nsec),
             stx_rdev_major: linux_dev_major(stat.rdev),

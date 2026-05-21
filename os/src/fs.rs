@@ -88,6 +88,8 @@ pub struct FileStat {
     pub blocks: u64,
     pub atime_sec: u64,
     pub atime_nsec: u32,
+    pub btime_sec: u64,
+    pub btime_nsec: u32,
     pub mtime_sec: u64,
     pub mtime_nsec: u32,
     pub ctime_sec: u64,

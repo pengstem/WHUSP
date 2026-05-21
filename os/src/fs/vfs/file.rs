@@ -832,6 +832,7 @@ impl File for VfsFile {
         if self.kind == FsNodeKind::Directory {
             return 0;
         }
+        let requested_len = buf.len();
         let noatime_snapshot = self.noatime_snapshot();
         let mut offset = self.offset.lock();
         let mut total_read_size = 0usize;
@@ -847,7 +848,7 @@ impl File for VfsFile {
             total_read_size += read_size;
         }
         drop(offset);
-        if total_read_size > 0 {
+        if requested_len > 0 {
             self.restore_noatime(noatime_snapshot);
         }
         total_read_size
@@ -877,7 +878,7 @@ impl File for VfsFile {
             mount.read_at(self.node.ino, buf, offset as u64)
         })
         .expect("filesystem mount is missing");
-        if read_size > 0 {
+        if !buf.is_empty() {
             self.restore_noatime(noatime_snapshot);
         }
         read_size

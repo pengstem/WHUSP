@@ -173,6 +173,7 @@ struct TmpfsInode {
     children: BTreeMap<String, u32>,
     parent_ino: u32,
     atime: FileTimestamp,
+    btime: FileTimestamp,
     ctime: FileTimestamp,
     mtime: FileTimestamp,
 }
@@ -203,6 +204,7 @@ impl TmpfsInode {
             children: BTreeMap::new(),
             parent_ino,
             atime: now,
+            btime: now,
             ctime: now,
             mtime: now,
         }
@@ -768,6 +770,8 @@ impl FileSystemBackend for TmpFs {
             blksize: super::DEFAULT_BLOCK_SIZE,
             atime_sec: inode.atime.sec,
             atime_nsec: inode.atime.nsec,
+            btime_sec: inode.btime.sec,
+            btime_nsec: inode.btime.nsec,
             mtime_sec: inode.mtime.sec,
             mtime_nsec: inode.mtime.nsec,
             ctime_sec: inode.ctime.sec,
@@ -835,11 +839,14 @@ impl FileSystemBackend for TmpFs {
     }
 
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
-        let Ok(inode) = self.inode(ino) else {
+        let Ok(inode) = self.inode_mut(ino) else {
             return 0;
         };
         if inode.kind == FsNodeKind::Directory {
             return 0;
+        }
+        if !buf.is_empty() {
+            inode.atime = FileTimestamp::now();
         }
         if offset >= inode.size {
             return 0;
@@ -853,11 +860,6 @@ impl FileSystemBackend for TmpFs {
             out[..inline_len].copy_from_slice(&inode.data[start..start + inline_len]);
         }
         inode.copy_sparse_to(offset, out);
-        if len > 0
-            && let Ok(inode) = self.inode_mut(ino)
-        {
-            inode.atime = FileTimestamp::now();
-        }
         len
     }
 

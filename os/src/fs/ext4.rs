@@ -375,6 +375,8 @@ impl FileSystemBackend for Ext4Mount {
             blocks: attr.blocks,
             atime_sec: attr.atime.as_secs(),
             atime_nsec: attr.atime.subsec_nanos(),
+            btime_sec: attr.btime.as_secs(),
+            btime_nsec: attr.btime.subsec_nanos(),
             mtime_sec: attr.mtime.as_secs(),
             mtime_nsec: attr.mtime.subsec_nanos(),
             ctime_sec: attr.ctime.as_secs(),
