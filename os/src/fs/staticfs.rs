@@ -43,6 +43,7 @@ const SYS_INPUT0_NAME: &[u8] = b"virtual-device-ltp\n";
 const PROC_RANDOM_ENTROPY_AVAIL: &[u8] = b"256\n";
 const MODULES_LOOP_DEP: &[u8] = b"kernel/drivers/block/loop.ko:\n";
 const MODULES_LOOP_BUILTIN: &[u8] = b"kernel/drivers/block/loop.ko\n";
+const MODULES_CONFIG: &[u8] = b"CONFIG_FS_VERITY=y\n";
 const SYS_DEV_BLOCK_TMPFS_UEVENT: &[u8] = b"DEVNAME=loop0\n";
 #[cfg(target_arch = "loongarch64")]
 const LA_MUSL_COMPAT_SO: &[u8] =
@@ -73,6 +74,7 @@ enum StaticNode {
     Protocols,
     ModulesDep,
     ModulesBuiltin,
+    ModulesConfig,
     ProcBusInputDevices,
     SysInput0Name,
     ProcRandomEntropyAvail,
@@ -145,6 +147,7 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
         "/etc/protocols" => Some(StaticNode::Protocols),
         "/lib/modules/6.8.0-whusp/modules.dep" => Some(StaticNode::ModulesDep),
         "/lib/modules/6.8.0-whusp/modules.builtin" => Some(StaticNode::ModulesBuiltin),
+        "/lib/modules/6.8.0-whusp/config" => Some(StaticNode::ModulesConfig),
         "/proc/bus/input/devices" => Some(StaticNode::ProcBusInputDevices),
         "/proc/sys/kernel/random/entropy_avail" => Some(StaticNode::ProcRandomEntropyAvail),
         "/sys/devices/virtual/input/input0/name" => Some(StaticNode::SysInput0Name),
@@ -182,6 +185,7 @@ fn content(node: StaticNode) -> Option<Vec<u8>> {
         StaticNode::Protocols => Some(ETC_PROTOCOLS.to_vec()),
         StaticNode::ModulesDep => Some(MODULES_LOOP_DEP.to_vec()),
         StaticNode::ModulesBuiltin => Some(MODULES_LOOP_BUILTIN.to_vec()),
+        StaticNode::ModulesConfig => Some(MODULES_CONFIG.to_vec()),
         StaticNode::ProcBusInputDevices => Some(PROC_BUS_INPUT_DEVICES.to_vec()),
         StaticNode::SysInput0Name => Some(SYS_INPUT0_NAME.to_vec()),
         StaticNode::ProcRandomEntropyAvail => Some(PROC_RANDOM_ENTROPY_AVAIL.to_vec()),
@@ -299,6 +303,7 @@ fn stat_node(node: StaticNode) -> FileStat {
         StaticNode::Protocols => 7,
         StaticNode::ModulesDep => 15,
         StaticNode::ModulesBuiltin => 16,
+        StaticNode::ModulesConfig => 42,
         StaticNode::ProcBusInputDevices => 12,
         StaticNode::SysInput0Name => 13,
         StaticNode::ProcRandomEntropyAvail => 14,

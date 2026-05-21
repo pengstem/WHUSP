@@ -1,11 +1,11 @@
 use crate::config::PAGE_SIZE;
 use crate::fs::{
-    LinuxTermio, LinuxTermios, LinuxTermios2, LinuxWinsize, ProcNamespaceInfo, ProcNamespaceKind,
-    apply_console_tty_termio, console_tty_available_bytes, console_tty_foreground_pgid,
-    console_tty_termio, console_tty_termios, console_tty_termios2, console_tty_winsize,
-    proc_namespace_info_from_path, proc_namespace_kind_name, proc_namespace_stat_ino,
-    set_console_tty_foreground_pgid, set_console_tty_termios, set_console_tty_termios2,
-    set_console_tty_winsize,
+    FS_VERITY_FL, LinuxTermio, LinuxTermios, LinuxTermios2, LinuxWinsize, ProcNamespaceInfo,
+    ProcNamespaceKind, apply_console_tty_termio, console_tty_available_bytes,
+    console_tty_foreground_pgid, console_tty_termio, console_tty_termios, console_tty_termios2,
+    console_tty_winsize, proc_namespace_info_from_path, proc_namespace_kind_name,
+    proc_namespace_stat_ino, set_console_tty_foreground_pgid, set_console_tty_termios,
+    set_console_tty_termios2, set_console_tty_winsize,
 };
 use crate::mm::UserBuffer;
 use crate::task::current_user_token;
@@ -60,6 +60,7 @@ const FS_IOC_GETFLAGS: usize = 0x8008_6601;
 const FS_IOC_SETFLAGS: usize = 0x4008_6602;
 const FS_IOC32_GETFLAGS: usize = 0x8004_6601;
 const FS_IOC32_SETFLAGS: usize = 0x4004_6602;
+const FS_IOC_ENABLE_VERITY: usize = 0x4080_6685;
 const NS_GET_USERNS: usize = 0xb701;
 const NS_GET_PARENT: usize = 0xb702;
 const NS_GET_NSTYPE: usize = 0xb703;
@@ -367,6 +368,11 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
         FS_IOC_SETFLAGS | FS_IOC32_SETFLAGS => {
             let token = current_user_token();
             let flags = read_user_value(token, argp as *const i32)? as u32;
+            file.set_inode_flags(flags).map_err(fs_flag_ioctl_error)?;
+            return Ok(0);
+        }
+        FS_IOC_ENABLE_VERITY => {
+            let flags = file.inode_flags().map_err(fs_flag_ioctl_error)? | FS_VERITY_FL;
             file.set_inode_flags(flags).map_err(fs_flag_ioctl_error)?;
             return Ok(0);
         }
