@@ -117,6 +117,8 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(Vec::new()) };
     static ref EXT_SCRATCH_MOUNTS: SleepMutex<Vec<(String, &'static str, Arc<MountedFs>)>> =
         SleepMutex::new(Vec::new());
+    static ref NFS_COMPAT_MOUNTS: SleepMutex<Vec<(MountNamespaceId, String, String)>> =
+        SleepMutex::new(Vec::new());
 }
 
 static NEXT_MOUNT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -1593,6 +1595,47 @@ pub(crate) fn mount_bind_at(
     }))
 }
 
+pub(crate) fn mount_nfs_compat_at(
+    namespace_id: MountNamespaceId,
+    source: WorkingDir,
+    target: WorkingDir,
+    source_path: &str,
+    target_path: &str,
+) -> Result<(), MountError> {
+    mount_bind_at(
+        namespace_id,
+        source,
+        target,
+        source_path,
+        target_path,
+        false,
+    )?;
+    NFS_COMPAT_MOUNTS.lock().push((
+        namespace_id,
+        resolve_mount_path(VfsNodeId::new(target.mount_id(), target.ino()), target_path),
+        resolve_mount_path(VfsNodeId::new(source.mount_id(), source.ino()), source_path),
+    ));
+    Ok(())
+}
+
+pub(crate) fn nfs_compat_source_path(
+    namespace_id: MountNamespaceId,
+    client_path: &str,
+) -> Option<String> {
+    NFS_COMPAT_MOUNTS
+        .lock()
+        .iter()
+        .filter(|(mount_namespace, target_path, _)| {
+            *mount_namespace == namespace_id
+                && path_suffix(target_path.as_str(), client_path).is_some()
+        })
+        .max_by_key(|(_, target_path, _)| target_path.len())
+        .and_then(|(_, target_path, source_path)| {
+            path_suffix(target_path.as_str(), client_path)
+                .map(|suffix| join_mount_path(source_path.as_str(), suffix.as_str()))
+        })
+}
+
 pub(crate) fn move_mount_at(
     namespace_id: MountNamespaceId,
     source: WorkingDir,
@@ -1933,6 +1976,12 @@ pub(crate) fn unmount_at(
     if let Some(source_mount_id) = source_to_release {
         release_dynamic_mount_source_if_unused(source_mount_id);
     }
+    NFS_COMPAT_MOUNTS
+        .lock()
+        .retain(|(mount_namespace, mount_target_path, _)| {
+            !(*mount_namespace == namespace_id
+                && path_suffix(target_path, mount_target_path.as_str()).is_some())
+        });
     dentry_cache::clear_all();
     Ok(())
 }

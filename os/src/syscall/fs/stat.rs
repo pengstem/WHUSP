@@ -1,9 +1,9 @@
 use crate::fs::{
     FileStat, FileSystemStat, FsNodeKind, MountId, OpenFlags, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
     S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, VfsNodeId, chmod_in, chown_in, lookup_path_in,
-    mount_is_read_only, open_file_in, stat_devfs_child, stat_devfs_input_child,
-    stat_devfs_misc_child, stat_devfs_net_child, stat_devfs_pts_child, stat_in, stat_static_path,
-    statfs_for_mount,
+    mount_is_read_only, nfs_compat_source_path, open_file_in, stat_devfs_child,
+    stat_devfs_input_child, stat_devfs_misc_child, stat_devfs_net_child, stat_devfs_pts_child,
+    stat_in, stat_static_path, statfs_for_mount,
 };
 use crate::sync::SleepMutex;
 use crate::task::{PathSnapshot, current_process, current_user_token};
@@ -17,11 +17,13 @@ use super::fanotify::fanotify_notify_attrib;
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::inotify::inotify_notify_attrib;
 use super::path::{
-    AtPath, check_current_access_path_prefixes_from, path_context_from, resolve_at_path,
+    AtPath, check_current_access_path_prefixes_from, normalize_path_from, path_context_from,
+    resolve_at_path,
 };
 use super::uapi::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, LinuxKstat, LinuxStatfs, LinuxStatx,
-    STATX_RESERVED, VALID_FCHOWNAT_FLAGS, VALID_FSTATAT_FLAGS, VALID_STATX_FLAGS,
+    AT_EMPTY_PATH, AT_FDCWD, AT_STATX_DONT_SYNC, AT_STATX_FORCE_SYNC, AT_SYMLINK_NOFOLLOW,
+    LinuxKstat, LinuxStatfs, LinuxStatx, STATX_RESERVED, VALID_FCHOWNAT_FLAGS, VALID_FSTATAT_FLAGS,
+    VALID_STATX_FLAGS,
 };
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -40,6 +42,8 @@ const PIPEFS_MAGIC: i64 = 0x5049_5045;
 
 lazy_static! {
     static ref XATTRS: SleepMutex<BTreeMap<(VfsNodeId, String), Vec<u8>>> =
+        SleepMutex::new(BTreeMap::new());
+    static ref NFS_STATX_CACHE: SleepMutex<BTreeMap<(crate::fs::MountNamespaceId, String), FileStat>> =
         SleepMutex::new(BTreeMap::new());
 }
 
@@ -656,9 +660,38 @@ pub fn sys_statx(
     if !path.is_empty() {
         check_current_access_path_prefixes_from(&snapshot, dirfd, path.as_str())?;
     }
-    write_stat_result(
-        token,
-        statxbuf,
-        resolve_stat_from(&snapshot, dirfd, path.as_str(), follow_final_symlink)?,
-    )
+    let stat = resolve_statx_stat(&snapshot, dirfd, path.as_str(), flags, follow_final_symlink)?;
+    write_stat_result(token, statxbuf, stat)
+}
+
+fn resolve_statx_stat(
+    snapshot: &PathSnapshot,
+    dirfd: isize,
+    path: &str,
+    flags: i32,
+    follow_final_symlink: bool,
+) -> SysResult<FileStat> {
+    if !path.is_empty()
+        && flags & (AT_STATX_FORCE_SYNC | AT_STATX_DONT_SYNC) != 0
+        && let Ok(client_path) = normalize_path_from(snapshot, dirfd, path)
+        && let Some(source_path) =
+            nfs_compat_source_path(snapshot.context.namespace_id(), client_path.as_str())
+    {
+        let cache_key = (snapshot.context.namespace_id(), client_path);
+        if flags & AT_STATX_DONT_SYNC != 0
+            && let Some(stat) = NFS_STATX_CACHE.lock().get(&cache_key).copied()
+        {
+            return Ok(stat);
+        }
+        let stat = resolve_stat_from(
+            snapshot,
+            AT_FDCWD,
+            source_path.as_str(),
+            follow_final_symlink,
+        )?;
+        NFS_STATX_CACHE.lock().insert(cache_key, stat);
+        return Ok(stat);
+    }
+
+    resolve_stat_from(snapshot, dirfd, path, follow_final_symlink)
 }

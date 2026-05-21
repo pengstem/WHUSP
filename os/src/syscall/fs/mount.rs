@@ -2,9 +2,9 @@ use crate::fs::{
     DetachedMountFile, FsContextFile, FsContextStateError, MountError, MountPropagation, OpenFlags,
     WorkingDir, lookup_existing_dir_in, lookup_mount_target_dir_in, loop_device_is_attached,
     loop_device_is_read_only, mount_bind_at, mount_block_device_at, mount_cgroup2_at,
-    mount_ext_scratch_at, mount_fat_device_at, mount_overlay_compat_at, mount_tmpfs_at,
-    mounted_source_at, move_mount_at, normalize_path_at_root, open_file_in, remount_at,
-    set_mount_propagation_at, unmount_at,
+    mount_ext_scratch_at, mount_fat_device_at, mount_nfs_compat_at, mount_overlay_compat_at,
+    mount_tmpfs_at, mounted_source_at, move_mount_at, normalize_path_at_root, open_file_in,
+    remount_at, set_mount_propagation_at, unmount_at,
 };
 use crate::task::{CAP_SYS_ADMIN, current_process, current_user_token};
 use alloc::string::String;
@@ -682,6 +682,26 @@ pub fn sys_mount(
                 target_dir,
                 lower_dir,
                 upper_dir,
+                target_path.as_str(),
+            )
+            .map_err(mount_error_to_errno)?;
+        }
+        "nfs" => {
+            let source = read_user_c_string(token, source, PATH_MAX)?;
+            let server_path = source.strip_prefix(':').ok_or(SysError::EINVAL)?;
+            let source_path = normalize_path_at_root(
+                snapshot.root_path.as_str(),
+                snapshot.cwd_path.as_str(),
+                server_path,
+            )
+            .ok_or(SysError::ENOENT)?;
+            let source_dir =
+                lookup_existing_dir_in(snapshot.context.clone(), source_path.as_str())?;
+            mount_nfs_compat_at(
+                namespace_id,
+                source_dir,
+                target_dir,
+                source_path.as_str(),
                 target_path.as_str(),
             )
             .map_err(mount_error_to_errno)?;
