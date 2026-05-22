@@ -47,6 +47,15 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) pipe_write_chunk_copy_bytes: usize,
     pub(crate) pipe_reader_sleeps: usize,
     pub(crate) pipe_writer_sleeps: usize,
+    pub(crate) copy_file_range_calls: usize,
+    pub(crate) copy_file_range_chunks: usize,
+    pub(crate) copy_file_range_bytes: usize,
+    pub(crate) sendfile_calls: usize,
+    pub(crate) sendfile_chunks: usize,
+    pub(crate) sendfile_bytes: usize,
+    pub(crate) splice_calls: usize,
+    pub(crate) splice_chunks: usize,
+    pub(crate) splice_bytes: usize,
 }
 
 static SCHEDULER_FETCH_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -97,6 +106,16 @@ static PIPE_READ_CHUNK_COPY_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PIPE_WRITE_CHUNK_COPY_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PIPE_READER_SLEEPS: AtomicUsize = AtomicUsize::new(0);
 static PIPE_WRITER_SLEEPS: AtomicUsize = AtomicUsize::new(0);
+
+static COPY_FILE_RANGE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static COPY_FILE_RANGE_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+static COPY_FILE_RANGE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static SENDFILE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SENDFILE_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+static SENDFILE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static SPLICE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SPLICE_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+static SPLICE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 fn update_max(cell: &AtomicUsize, value: usize) {
     let mut current = cell.load(Ordering::Relaxed);
@@ -224,6 +243,33 @@ pub(crate) fn record_pipe_writer_sleep() {
     PIPE_WRITER_SLEEPS.fetch_add(1, Ordering::Relaxed);
 }
 
+pub(crate) fn record_copy_file_range_call() {
+    COPY_FILE_RANGE_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_copy_file_range_chunk(bytes: usize) {
+    COPY_FILE_RANGE_CHUNKS.fetch_add(1, Ordering::Relaxed);
+    COPY_FILE_RANGE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+pub(crate) fn record_sendfile_call() {
+    SENDFILE_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_sendfile_chunk(bytes: usize) {
+    SENDFILE_CHUNKS.fetch_add(1, Ordering::Relaxed);
+    SENDFILE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+pub(crate) fn record_splice_call() {
+    SPLICE_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_splice_chunk(bytes: usize) {
+    SPLICE_CHUNKS.fetch_add(1, Ordering::Relaxed);
+    SPLICE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
 pub(crate) fn snapshot() -> KernelPerfSnapshot {
     KernelPerfSnapshot {
         scheduler_fetch_calls: SCHEDULER_FETCH_CALLS.load(Ordering::Relaxed),
@@ -269,6 +315,15 @@ pub(crate) fn snapshot() -> KernelPerfSnapshot {
         pipe_write_chunk_copy_bytes: PIPE_WRITE_CHUNK_COPY_BYTES.load(Ordering::Relaxed),
         pipe_reader_sleeps: PIPE_READER_SLEEPS.load(Ordering::Relaxed),
         pipe_writer_sleeps: PIPE_WRITER_SLEEPS.load(Ordering::Relaxed),
+        copy_file_range_calls: COPY_FILE_RANGE_CALLS.load(Ordering::Relaxed),
+        copy_file_range_chunks: COPY_FILE_RANGE_CHUNKS.load(Ordering::Relaxed),
+        copy_file_range_bytes: COPY_FILE_RANGE_BYTES.load(Ordering::Relaxed),
+        sendfile_calls: SENDFILE_CALLS.load(Ordering::Relaxed),
+        sendfile_chunks: SENDFILE_CHUNKS.load(Ordering::Relaxed),
+        sendfile_bytes: SENDFILE_BYTES.load(Ordering::Relaxed),
+        splice_calls: SPLICE_CALLS.load(Ordering::Relaxed),
+        splice_chunks: SPLICE_CHUNKS.load(Ordering::Relaxed),
+        splice_bytes: SPLICE_BYTES.load(Ordering::Relaxed),
     }
 }
 
@@ -317,7 +372,16 @@ pub(crate) fn stats_content() -> String {
          pipe_read_chunk_copy_bytes {}\n\
          pipe_write_chunk_copy_bytes {}\n\
          pipe_reader_sleeps {}\n\
-         pipe_writer_sleeps {}\n",
+         pipe_writer_sleeps {}\n\
+         copy_file_range_calls {}\n\
+         copy_file_range_chunks {}\n\
+         copy_file_range_bytes {}\n\
+         sendfile_calls {}\n\
+         sendfile_chunks {}\n\
+         sendfile_bytes {}\n\
+         splice_calls {}\n\
+         splice_chunks {}\n\
+         splice_bytes {}\n",
         stats.scheduler_fetch_calls,
         stats.scheduler_scanned_tasks,
         stats.scheduler_pruned_exited_tasks,
@@ -361,5 +425,14 @@ pub(crate) fn stats_content() -> String {
         stats.pipe_write_chunk_copy_bytes,
         stats.pipe_reader_sleeps,
         stats.pipe_writer_sleeps,
+        stats.copy_file_range_calls,
+        stats.copy_file_range_chunks,
+        stats.copy_file_range_bytes,
+        stats.sendfile_calls,
+        stats.sendfile_chunks,
+        stats.sendfile_bytes,
+        stats.splice_calls,
+        stats.splice_chunks,
+        stats.splice_bytes,
     )
 }

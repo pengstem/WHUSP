@@ -571,6 +571,7 @@ pub fn sys_copy_file_range(
         out_file.check_write(len, false)?;
     }
 
+    crate::perf::record_copy_file_range_call();
     let mut copied = 0usize;
     let mut buffer = vec![0u8; len.min(COPY_FILE_RANGE_CHUNK)];
     while copied < len {
@@ -593,6 +594,7 @@ pub fn sys_copy_file_range(
             break;
         }
 
+        crate::perf::record_copy_file_range_chunk(written);
         copied = copied.checked_add(written).ok_or(SysError::EOVERFLOW)?;
         if in_offset_arg.is_some() {
             in_offset = in_offset.checked_add(written).ok_or(SysError::EOVERFLOW)?;
@@ -680,6 +682,7 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut i64, count: usize)
         return Ok(0);
     }
 
+    crate::perf::record_sendfile_call();
     let mut copied = 0usize;
     let mut buffer = vec![0u8; count.min(SENDFILE_COPY_CHUNK)];
     while copied < count {
@@ -705,6 +708,7 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut i64, count: usize)
             break;
         }
 
+        crate::perf::record_sendfile_chunk(written);
         copied = copied.checked_add(written).ok_or(SysError::EOVERFLOW)?;
         if let Some(input_offset) = explicit_offset.as_mut() {
             *input_offset = input_offset
@@ -816,6 +820,18 @@ pub fn sys_splice(
 
     let mut in_offset = read_splice_offset(token, off_in, in_is_pipe)?;
     let mut out_offset = read_splice_offset(token, off_out, out_is_pipe)?;
+    crate::perf::record_splice_call();
+    if in_is_pipe && out_is_pipe && in_file.pipe_occupied().unwrap_or(0) > 0 {
+        check_pipe_write_peer(&out_entry, true)?;
+        ensure_nonblocking_ready(&in_entry, PollEvents::POLLIN)?;
+        ensure_nonblocking_ready(&out_entry, PollEvents::POLLOUT)?;
+        if let Some(moved) = in_file.splice_pipe_to_pipe(out_file.as_ref(), len)? {
+            if moved > 0 {
+                crate::perf::record_splice_chunk(moved);
+            }
+            return Ok(moved as isize);
+        }
+    }
     let mut copied = 0usize;
     let mut buffer = vec![0u8; len.min(SPLICE_COPY_CHUNK)];
 
@@ -829,6 +845,7 @@ pub fn sys_splice(
         if written == 0 {
             break;
         }
+        crate::perf::record_splice_chunk(written);
         copied += written;
         if let Some(offset) = in_offset.as_mut() {
             *offset += read as i64;

@@ -1,5 +1,5 @@
 use super::status_flags::StatusFlagsCell;
-use super::{File, FileStat, FsResult, OpenFlags, PollEvents, S_IFIFO};
+use super::{File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFIFO};
 use crate::config::PAGE_SIZE;
 use crate::fs::pipe_max_size;
 use crate::mm::UserBuffer;
@@ -136,6 +136,35 @@ impl Pipe {
             }
         }
     }
+
+    fn splice_pipe_to_pipe(&self, out: &Pipe, len: usize) -> FsResult<usize> {
+        if !self.readable || !out.writable {
+            return Err(FsError::InvalidInput);
+        }
+        if Arc::ptr_eq(&self.buffer, &out.buffer) {
+            return Err(FsError::InvalidInput);
+        }
+
+        let (writer, reader, moved) = {
+            let mut in_buffer = self.buffer.exclusive_access();
+            let mut out_buffer = out.buffer.exclusive_access();
+            let moved = in_buffer.transfer_to(&mut out_buffer, len);
+            let writer = if moved > 0 {
+                in_buffer.wake_writer()
+            } else {
+                None
+            };
+            let reader = if moved > 0 {
+                out_buffer.wake_reader()
+            } else {
+                None
+            };
+            (writer, reader, moved)
+        };
+        wake_task(writer);
+        wake_task(reader);
+        Ok(moved)
+    }
 }
 
 pub(super) const PIPE_MIN_CAPACITY: usize = PAGE_SIZE;
@@ -220,6 +249,61 @@ impl PipeRingBuffer {
             RingBufferStatus::Normal
         };
         len
+    }
+    fn transfer_to(&mut self, out: &mut PipeRingBuffer, len: usize) -> usize {
+        let mut remaining = len.min(self.available_read()).min(out.available_write());
+        let mut moved = 0usize;
+        while remaining > 0 {
+            let read_len = self.contiguous_read_len();
+            let write_len = out.contiguous_write_len();
+            let chunk_len = remaining.min(read_len).min(write_len);
+            if chunk_len == 0 {
+                break;
+            }
+            out.arr[out.tail..out.tail + chunk_len]
+                .copy_from_slice(&self.arr[self.head..self.head + chunk_len]);
+            self.advance_head(chunk_len);
+            out.advance_tail(chunk_len);
+            moved += chunk_len;
+            remaining -= chunk_len;
+        }
+        moved
+    }
+    fn contiguous_read_len(&self) -> usize {
+        let available = self.available_read();
+        if available == 0 {
+            0
+        } else if self.tail > self.head {
+            self.tail - self.head
+        } else {
+            self.capacity() - self.head
+        }
+    }
+    fn contiguous_write_len(&self) -> usize {
+        let available = self.available_write();
+        if available == 0 {
+            0
+        } else if self.tail >= self.head {
+            (self.capacity() - self.tail).min(available)
+        } else {
+            (self.head - self.tail).min(available)
+        }
+    }
+    fn advance_head(&mut self, len: usize) {
+        self.head = (self.head + len) % self.capacity();
+        self.status = if self.head == self.tail {
+            RingBufferStatus::Empty
+        } else {
+            RingBufferStatus::Normal
+        };
+    }
+    fn advance_tail(&mut self, len: usize) {
+        self.tail = (self.tail + len) % self.capacity();
+        self.status = if self.tail == self.head {
+            RingBufferStatus::Full
+        } else {
+            RingBufferStatus::Normal
+        };
     }
     pub fn available_read(&self) -> usize {
         if self.status == RingBufferStatus::Empty {
@@ -405,6 +489,16 @@ impl File for Pipe {
     }
     fn pipe_readers_closed(&self) -> bool {
         self.writable && self.buffer.exclusive_access().all_read_ends_closed()
+    }
+    fn splice_pipe_to_pipe(
+        &self,
+        out: &(dyn File + Send + Sync),
+        len: usize,
+    ) -> FsResult<Option<usize>> {
+        let Some(out) = out.as_any().downcast_ref::<Pipe>() else {
+            return Ok(None);
+        };
+        self.splice_pipe_to_pipe(out, len).map(Some)
     }
     fn poll(&self, events: PollEvents) -> PollEvents {
         let ring_buffer = self.buffer.exclusive_access();

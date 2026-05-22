@@ -299,6 +299,13 @@ pub trait File: Send + Sync {
     fn pipe_readers_closed(&self) -> bool {
         false
     }
+    fn splice_pipe_to_pipe(
+        &self,
+        _out: &(dyn File + Send + Sync),
+        _len: usize,
+    ) -> FsResult<Option<usize>> {
+        Ok(None)
+    }
     fn socket_write_peer_closed(&self) -> bool {
         false
     }
