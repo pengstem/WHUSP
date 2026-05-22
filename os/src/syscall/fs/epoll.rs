@@ -1,11 +1,13 @@
 use crate::fs::{File, FileStat, OpenFlags, PollEvents, S_IFDIR, S_IFMT};
 use crate::mm::UserBuffer;
+use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
     SignalFlags, current_has_interrupting_signal, current_task, current_user_token,
     linux_sigset_to_flags, suspend_current_and_run_next,
 };
 use crate::timer::get_time_us;
+use alloc::collections::{BTreeMap, btree_map::Entry};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -45,7 +47,6 @@ struct LinuxEpollEvent {
 
 #[derive(Clone)]
 struct EpollInterest {
-    fd: usize,
     file: Arc<dyn File + Send + Sync>,
     event: LinuxEpollEvent,
     last_ready: u32,
@@ -95,20 +96,22 @@ impl Drop for TemporarySignalMask {
 }
 
 pub struct EpollFile {
-    interests: UPIntrFreeCell<Vec<EpollInterest>>,
+    interests: UPIntrFreeCell<BTreeMap<usize, EpollInterest>>,
 }
 
 impl EpollFile {
     fn new() -> Self {
         Self {
-            interests: unsafe { UPIntrFreeCell::new(Vec::new()) },
+            interests: unsafe { UPIntrFreeCell::new(BTreeMap::new()) },
         }
     }
 
     fn scan_ready(&self, maxevents: usize) -> Vec<LinuxEpollEvent> {
         self.interests.exclusive_session(|interests| {
             let mut ready_events = Vec::new();
-            for interest in interests.iter_mut() {
+            let mut visits = 0usize;
+            for interest in interests.values_mut() {
+                visits += 1;
                 if ready_events.len() >= maxevents || interest.disabled {
                     continue;
                 }
@@ -133,6 +136,7 @@ impl EpollFile {
                     data: interest.event.data,
                 });
             }
+            perf::record_epoll_scan(visits, ready_events.len());
             ready_events
         })
     }
@@ -283,7 +287,7 @@ fn epoll_children(file: &Arc<dyn File + Send + Sync>) -> Vec<Arc<dyn File + Send
     epoll_file_from(file).map_or_else(Vec::new, |epoll| {
         epoll.interests.exclusive_session(|interests| {
             interests
-                .iter()
+                .values()
                 .map(|entry| Arc::clone(&entry.file))
                 .collect()
         })
@@ -378,36 +382,41 @@ pub fn sys_epoll_ctl(epfd_raw: usize, op: i32, fd_raw: usize, event: *const u8) 
             let event = read_epoll_event(token, event)?;
             validate_epoll_target(&epoll_file, &target_file)?;
             epoll.interests.exclusive_session(|interests| {
-                if interests.iter().any(|entry| entry.fd == fd_raw) {
-                    return Err(SysError::EEXIST);
-                }
-                interests.push(EpollInterest {
-                    fd: fd_raw,
-                    file: target_file,
-                    event,
-                    last_ready: 0,
-                    disabled: false,
-                });
-                Ok(0)
+                let result = match interests.entry(fd_raw) {
+                    Entry::Occupied(_) => Err(SysError::EEXIST),
+                    Entry::Vacant(slot) => {
+                        slot.insert(EpollInterest {
+                            file: target_file,
+                            event,
+                            last_ready: 0,
+                            disabled: false,
+                        });
+                        Ok(0)
+                    }
+                };
+                perf::record_epoll_ctl(0, 1, interests.len());
+                result
             })
         }
         EPOLL_CTL_DEL => epoll.interests.exclusive_session(|interests| {
-            let Some(index) = interests.iter().position(|entry| entry.fd == fd_raw) else {
-                return Err(SysError::ENOENT);
-            };
-            interests.remove(index);
-            Ok(0)
+            let result = interests.remove(&fd_raw).map(|_| 0).ok_or(SysError::ENOENT);
+            perf::record_epoll_ctl(0, 1, interests.len());
+            result
         }),
         EPOLL_CTL_MOD => {
             let event = read_epoll_event(token, event)?;
             epoll.interests.exclusive_session(|interests| {
-                let Some(interest) = interests.iter_mut().find(|entry| entry.fd == fd_raw) else {
-                    return Err(SysError::ENOENT);
+                let result = match interests.get_mut(&fd_raw) {
+                    Some(interest) => {
+                        interest.event = event;
+                        interest.last_ready = 0;
+                        interest.disabled = false;
+                        Ok(0)
+                    }
+                    None => Err(SysError::ENOENT),
                 };
-                interest.event = event;
-                interest.last_ready = 0;
-                interest.disabled = false;
-                Ok(0)
+                perf::record_epoll_ctl(0, 1, interests.len());
+                result
             })
         }
         _ => Err(SysError::EINVAL),

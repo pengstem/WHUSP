@@ -18,6 +18,13 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) fd_table_len_max: usize,
     pub(crate) fd_install_calls: usize,
     pub(crate) fd_take_calls: usize,
+    pub(crate) epoll_ctl_calls: usize,
+    pub(crate) epoll_ctl_linear_probes: usize,
+    pub(crate) epoll_ctl_tree_lookups: usize,
+    pub(crate) epoll_interest_count_max: usize,
+    pub(crate) epoll_full_scans: usize,
+    pub(crate) epoll_scan_interest_visits: usize,
+    pub(crate) epoll_ready_events: usize,
     pub(crate) pipe_read_calls: usize,
     pub(crate) pipe_write_calls: usize,
     pub(crate) pipe_read_bytes: usize,
@@ -45,6 +52,14 @@ static FD_ALLOC_EXPANDED_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static FD_TABLE_LEN_MAX: AtomicUsize = AtomicUsize::new(0);
 static FD_INSTALL_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FD_TAKE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+static EPOLL_CTL_CALLS: AtomicUsize = AtomicUsize::new(0);
+static EPOLL_CTL_LINEAR_PROBES: AtomicUsize = AtomicUsize::new(0);
+static EPOLL_CTL_TREE_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+static EPOLL_INTEREST_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
+static EPOLL_FULL_SCANS: AtomicUsize = AtomicUsize::new(0);
+static EPOLL_SCAN_INTEREST_VISITS: AtomicUsize = AtomicUsize::new(0);
+static EPOLL_READY_EVENTS: AtomicUsize = AtomicUsize::new(0);
 
 static PIPE_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
 static PIPE_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -111,6 +126,19 @@ pub(crate) fn record_fd_take() {
     FD_TAKE_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
+pub(crate) fn record_epoll_ctl(linear_probes: usize, tree_lookups: usize, interest_count: usize) {
+    EPOLL_CTL_CALLS.fetch_add(1, Ordering::Relaxed);
+    EPOLL_CTL_LINEAR_PROBES.fetch_add(linear_probes, Ordering::Relaxed);
+    EPOLL_CTL_TREE_LOOKUPS.fetch_add(tree_lookups, Ordering::Relaxed);
+    update_max(&EPOLL_INTEREST_COUNT_MAX, interest_count);
+}
+
+pub(crate) fn record_epoll_scan(interest_visits: usize, ready_events: usize) {
+    EPOLL_FULL_SCANS.fetch_add(1, Ordering::Relaxed);
+    EPOLL_SCAN_INTEREST_VISITS.fetch_add(interest_visits, Ordering::Relaxed);
+    EPOLL_READY_EVENTS.fetch_add(ready_events, Ordering::Relaxed);
+}
+
 pub(crate) fn record_pipe_read_call() {
     PIPE_READ_CALLS.fetch_add(1, Ordering::Relaxed);
 }
@@ -153,6 +181,13 @@ pub(crate) fn snapshot() -> KernelPerfSnapshot {
         fd_table_len_max: FD_TABLE_LEN_MAX.load(Ordering::Relaxed),
         fd_install_calls: FD_INSTALL_CALLS.load(Ordering::Relaxed),
         fd_take_calls: FD_TAKE_CALLS.load(Ordering::Relaxed),
+        epoll_ctl_calls: EPOLL_CTL_CALLS.load(Ordering::Relaxed),
+        epoll_ctl_linear_probes: EPOLL_CTL_LINEAR_PROBES.load(Ordering::Relaxed),
+        epoll_ctl_tree_lookups: EPOLL_CTL_TREE_LOOKUPS.load(Ordering::Relaxed),
+        epoll_interest_count_max: EPOLL_INTEREST_COUNT_MAX.load(Ordering::Relaxed),
+        epoll_full_scans: EPOLL_FULL_SCANS.load(Ordering::Relaxed),
+        epoll_scan_interest_visits: EPOLL_SCAN_INTEREST_VISITS.load(Ordering::Relaxed),
+        epoll_ready_events: EPOLL_READY_EVENTS.load(Ordering::Relaxed),
         pipe_read_calls: PIPE_READ_CALLS.load(Ordering::Relaxed),
         pipe_write_calls: PIPE_WRITE_CALLS.load(Ordering::Relaxed),
         pipe_read_bytes: PIPE_READ_BYTES.load(Ordering::Relaxed),
@@ -183,6 +218,13 @@ pub(crate) fn stats_content() -> String {
          fd_table_len_max {}\n\
          fd_install_calls {}\n\
          fd_take_calls {}\n\
+         epoll_ctl_calls {}\n\
+         epoll_ctl_linear_probes {}\n\
+         epoll_ctl_tree_lookups {}\n\
+         epoll_interest_count_max {}\n\
+         epoll_full_scans {}\n\
+         epoll_scan_interest_visits {}\n\
+         epoll_ready_events {}\n\
          pipe_read_calls {}\n\
          pipe_write_calls {}\n\
          pipe_read_bytes {}\n\
@@ -207,6 +249,13 @@ pub(crate) fn stats_content() -> String {
         stats.fd_table_len_max,
         stats.fd_install_calls,
         stats.fd_take_calls,
+        stats.epoll_ctl_calls,
+        stats.epoll_ctl_linear_probes,
+        stats.epoll_ctl_tree_lookups,
+        stats.epoll_interest_count_max,
+        stats.epoll_full_scans,
+        stats.epoll_scan_interest_visits,
+        stats.epoll_ready_events,
         stats.pipe_read_calls,
         stats.pipe_write_calls,
         stats.pipe_read_bytes,
