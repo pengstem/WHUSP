@@ -1393,6 +1393,8 @@ fn oskernel_perf_content() -> String {
          block_cache_device_read_submit {}\n\
          block_cache_device_write_submit {}\n\
          block_cache_bypass_unaligned {}\n\
+         block_cache_lru_touch {}\n\
+         block_cache_lru_scan_slots {}\n\
          dentry_cache_enabled {}\n\
          dentry_cache_entries {}\n\
          dentry_cache_capacity {}\n\
@@ -1405,6 +1407,8 @@ fn oskernel_perf_content() -> String {
          dentry_cache_invalidate_parent {}\n\
          dentry_cache_invalidate_all {}\n\
          dentry_cache_evict {}\n\
+         dentry_cache_lru_touch {}\n\
+         dentry_cache_lru_scan_slots {}\n\
          {}",
         perf::stats_content(),
         frame_total,
@@ -1421,6 +1425,8 @@ fn oskernel_perf_content() -> String {
         block.device_read_submit,
         block.device_write_submit,
         block.bypass_unaligned,
+        block.lru_touch,
+        block.lru_scan_slots,
         dentry.enabled as usize,
         dentry.entries,
         dentry.capacity,
@@ -1433,6 +1439,8 @@ fn oskernel_perf_content() -> String {
         dentry.invalidate_parent,
         dentry.invalidate_all,
         dentry.evict,
+        dentry.lru_touch,
+        dentry.lru_scan_slots,
         exec_load_stats_content(),
     )
 }

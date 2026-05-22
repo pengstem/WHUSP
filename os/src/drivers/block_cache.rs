@@ -1,6 +1,6 @@
 use crate::sync::UPIntrFreeCell;
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
 use lazy_static::*;
@@ -25,12 +25,19 @@ impl BlockCacheKey {
 
 struct BlockCacheLine {
     data: [u8; BLOCK_CACHE_LINE_SIZE],
+    lru_stamp: usize,
 }
 
 impl BlockCacheLine {
-    fn new(data: [u8; BLOCK_CACHE_LINE_SIZE]) -> Self {
-        Self { data }
+    fn new(data: [u8; BLOCK_CACHE_LINE_SIZE], lru_stamp: usize) -> Self {
+        Self { data, lru_stamp }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct BlockCacheLruEntry {
+    stamp: usize,
+    key: BlockCacheKey,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -46,13 +53,16 @@ pub(crate) struct BlockCacheStats {
     pub(crate) device_read_submit: usize,
     pub(crate) device_write_submit: usize,
     pub(crate) bypass_unaligned: usize,
+    pub(crate) lru_touch: usize,
+    pub(crate) lru_scan_slots: usize,
 }
 
 struct BlockCache {
     enabled: bool,
     capacity: usize,
     lines: BTreeMap<BlockCacheKey, BlockCacheLine>,
-    lru: VecDeque<BlockCacheKey>,
+    lru: BTreeSet<BlockCacheLruEntry>,
+    lru_clock: usize,
     stats: BlockCacheStats,
 }
 
@@ -62,7 +72,8 @@ impl BlockCache {
             enabled: true,
             capacity,
             lines: BTreeMap::new(),
-            lru: VecDeque::new(),
+            lru: BTreeSet::new(),
+            lru_clock: 0,
             stats: BlockCacheStats {
                 enabled: true,
                 capacity,
@@ -71,19 +82,24 @@ impl BlockCache {
         }
     }
 
-    fn touch(&mut self, key: BlockCacheKey) {
-        if let Some(index) = self.lru.iter().position(|cached| *cached == key) {
-            self.lru.remove(index);
+    fn touch(&mut self, key: BlockCacheKey, old_stamp: Option<usize>) -> usize {
+        self.stats.lru_touch += 1;
+        if let Some(stamp) = old_stamp {
+            self.lru.remove(&BlockCacheLruEntry { stamp, key });
         }
-        self.lru.push_back(key);
+        self.lru_clock = self.lru_clock.wrapping_add(1);
+        let stamp = self.lru_clock;
+        self.lru.insert(BlockCacheLruEntry { stamp, key });
+        stamp
     }
 
     fn trim_to_capacity(&mut self) {
         while self.lines.len() > self.capacity {
-            let Some(victim) = self.lru.pop_front() else {
+            let Some(victim) = self.lru.iter().next().copied() else {
                 break;
             };
-            if self.lines.remove(&victim).is_some() {
+            self.lru.remove(&victim);
+            if self.lines.remove(&victim.key).is_some() {
                 self.stats.evict += 1;
             }
         }
@@ -98,8 +114,12 @@ impl BlockCache {
             return false;
         };
         buf.copy_from_slice(&line.data);
+        let old_stamp = line.lru_stamp;
         self.stats.read_hit += 1;
-        self.touch(key);
+        let stamp = self.touch(key, Some(old_stamp));
+        if let Some(line) = self.lines.get_mut(&key) {
+            line.lru_stamp = stamp;
+        }
         true
     }
 
@@ -107,8 +127,9 @@ impl BlockCache {
         if !self.enabled || self.capacity == 0 {
             return;
         }
-        self.lines.insert(key, BlockCacheLine::new(data));
-        self.touch(key);
+        let old_stamp = self.lines.get(&key).map(|line| line.lru_stamp);
+        let stamp = self.touch(key, old_stamp);
+        self.lines.insert(key, BlockCacheLine::new(data, stamp));
         self.trim_to_capacity();
     }
 
@@ -116,9 +137,10 @@ impl BlockCache {
         if !self.enabled || self.capacity == 0 {
             return;
         }
-        self.lines.insert(key, BlockCacheLine::new(data));
+        let old_stamp = self.lines.get(&key).map(|line| line.lru_stamp);
+        let stamp = self.touch(key, old_stamp);
+        self.lines.insert(key, BlockCacheLine::new(data, stamp));
         self.stats.write_update += 1;
-        self.touch(key);
         self.trim_to_capacity();
     }
 
@@ -126,11 +148,12 @@ impl BlockCache {
         if !self.enabled {
             return;
         }
-        if self.lines.remove(&key).is_some() {
+        if let Some(line) = self.lines.remove(&key) {
+            self.lru.remove(&BlockCacheLruEntry {
+                stamp: line.lru_stamp,
+                key,
+            });
             self.stats.write_invalidate += 1;
-        }
-        if let Some(index) = self.lru.iter().position(|cached| *cached == key) {
-            self.lru.remove(index);
         }
     }
 
@@ -254,7 +277,7 @@ pub(crate) fn stats_snapshot() -> BlockCacheStats {
 pub(crate) fn stats_content() -> String {
     let stats = stats_snapshot();
     format!(
-        "enabled {}\nentries {}\ncapacity {}\nread_hit {}\nread_miss {}\nwrite_update {}\nwrite_invalidate {}\nevict {}\ndevice_read_submit {}\ndevice_write_submit {}\nbypass_unaligned {}\n",
+        "enabled {}\nentries {}\ncapacity {}\nread_hit {}\nread_miss {}\nwrite_update {}\nwrite_invalidate {}\nevict {}\ndevice_read_submit {}\ndevice_write_submit {}\nbypass_unaligned {}\nlru_touch {}\nlru_scan_slots {}\n",
         stats.enabled as usize,
         stats.entries,
         stats.capacity,
@@ -266,5 +289,7 @@ pub(crate) fn stats_content() -> String {
         stats.device_read_submit,
         stats.device_write_submit,
         stats.bypass_unaligned,
+        stats.lru_touch,
+        stats.lru_scan_slots,
     )
 }

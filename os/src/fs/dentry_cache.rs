@@ -1,7 +1,7 @@
 use super::mount::MountNamespaceId;
 use super::vfs::{FsNodeKind, VfsNodeId};
 use crate::sync::UPIntrFreeCell;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use lazy_static::*;
@@ -31,9 +31,11 @@ enum DentryCacheValue {
         node: VfsNodeId,
         kind: FsNodeKind,
         parent_generation: usize,
+        lru_stamp: usize,
     },
     Negative {
         parent_generation: usize,
+        lru_stamp: usize,
     },
 }
 
@@ -43,9 +45,45 @@ impl DentryCacheValue {
             Self::Positive {
                 parent_generation, ..
             }
-            | Self::Negative { parent_generation } => parent_generation,
+            | Self::Negative {
+                parent_generation, ..
+            } => parent_generation,
         }
     }
+
+    fn lru_stamp(self) -> usize {
+        match self {
+            Self::Positive { lru_stamp, .. } | Self::Negative { lru_stamp, .. } => lru_stamp,
+        }
+    }
+
+    fn with_lru_stamp(self, lru_stamp: usize) -> Self {
+        match self {
+            Self::Positive {
+                node,
+                kind,
+                parent_generation,
+                ..
+            } => Self::Positive {
+                node,
+                kind,
+                parent_generation,
+                lru_stamp,
+            },
+            Self::Negative {
+                parent_generation, ..
+            } => Self::Negative {
+                parent_generation,
+                lru_stamp,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DentryCacheLruEntry {
+    stamp: usize,
+    key: DentryCacheKey,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +106,8 @@ pub(crate) struct DentryCacheStats {
     pub(crate) invalidate_parent: usize,
     pub(crate) invalidate_all: usize,
     pub(crate) evict: usize,
+    pub(crate) lru_touch: usize,
+    pub(crate) lru_scan_slots: usize,
 }
 
 struct DentryCache {
@@ -75,7 +115,8 @@ struct DentryCache {
     capacity: usize,
     entries: BTreeMap<DentryCacheKey, DentryCacheValue>,
     parent_generations: BTreeMap<VfsNodeId, usize>,
-    lru: VecDeque<DentryCacheKey>,
+    lru: BTreeSet<DentryCacheLruEntry>,
+    lru_clock: usize,
     stats: DentryCacheStats,
 }
 
@@ -86,7 +127,8 @@ impl DentryCache {
             capacity,
             entries: BTreeMap::new(),
             parent_generations: BTreeMap::new(),
-            lru: VecDeque::new(),
+            lru: BTreeSet::new(),
+            lru_clock: 0,
             stats: DentryCacheStats {
                 enabled: true,
                 capacity,
@@ -99,19 +141,27 @@ impl DentryCache {
         self.parent_generations.get(&parent).copied().unwrap_or(0)
     }
 
-    fn touch(&mut self, key: DentryCacheKey) {
-        if let Some(index) = self.lru.iter().position(|cached| *cached == key) {
-            self.lru.remove(index);
+    fn touch(&mut self, key: DentryCacheKey, old_stamp: Option<usize>) -> usize {
+        self.stats.lru_touch += 1;
+        if let Some(stamp) = old_stamp {
+            self.lru.remove(&DentryCacheLruEntry {
+                stamp,
+                key: key.clone(),
+            });
         }
-        self.lru.push_back(key);
+        self.lru_clock = self.lru_clock.wrapping_add(1);
+        let stamp = self.lru_clock;
+        self.lru.insert(DentryCacheLruEntry { stamp, key });
+        stamp
     }
 
     fn trim_to_capacity(&mut self) {
         while self.entries.len() > self.capacity {
-            let Some(victim) = self.lru.pop_front() else {
+            let Some(victim) = self.lru.iter().next().cloned() else {
                 break;
             };
-            if self.entries.remove(&victim).is_some() {
+            self.lru.remove(&victim);
+            if self.entries.remove(&victim.key).is_some() {
                 self.stats.evict += 1;
             }
         }
@@ -133,10 +183,15 @@ impl DentryCache {
         };
         if value.parent_generation() != self.parent_generation(parent) {
             self.entries.remove(&key);
+            self.lru.remove(&DentryCacheLruEntry {
+                stamp: value.lru_stamp(),
+                key,
+            });
             self.stats.revalidate_fail += 1;
             return None;
         }
-        self.touch(key);
+        let stamp = self.touch(key.clone(), Some(value.lru_stamp()));
+        self.entries.insert(key, value.with_lru_stamp(stamp));
         match value {
             DentryCacheValue::Positive { node, kind, .. } => {
                 self.stats.positive_hit += 1;
@@ -165,9 +220,11 @@ impl DentryCache {
             node,
             kind,
             parent_generation: self.parent_generation(parent),
+            lru_stamp: 0,
         };
-        self.entries.insert(key.clone(), value);
-        self.touch(key);
+        let old_stamp = self.entries.get(&key).map(|value| value.lru_stamp());
+        let stamp = self.touch(key.clone(), old_stamp);
+        self.entries.insert(key, value.with_lru_stamp(stamp));
         self.stats.insert_positive += 1;
         self.trim_to_capacity();
     }
@@ -184,9 +241,11 @@ impl DentryCache {
         let key = DentryCacheKey::new(namespace_id, parent, component);
         let value = DentryCacheValue::Negative {
             parent_generation: self.parent_generation(parent),
+            lru_stamp: 0,
         };
-        self.entries.insert(key.clone(), value);
-        self.touch(key);
+        let old_stamp = self.entries.get(&key).map(|value| value.lru_stamp());
+        let stamp = self.touch(key.clone(), old_stamp);
+        self.entries.insert(key, value.with_lru_stamp(stamp));
         self.stats.insert_negative += 1;
         self.trim_to_capacity();
     }
@@ -199,7 +258,7 @@ impl DentryCache {
         self.parent_generations.insert(parent, generation);
         let before = self.entries.len();
         self.entries.retain(|key, _| key.parent != parent);
-        self.lru.retain(|key| key.parent != parent);
+        self.lru.retain(|entry| entry.key.parent != parent);
         self.stats.invalidate_parent += before.saturating_sub(self.entries.len());
     }
 
@@ -270,7 +329,7 @@ pub(crate) fn stats_snapshot() -> DentryCacheStats {
 pub(crate) fn stats_content() -> String {
     let stats = stats_snapshot();
     format!(
-        "enabled {}\nentries {}\ncapacity {}\npositive_hit {}\nnegative_hit {}\nmiss {}\nrevalidate_fail {}\ninsert_positive {}\ninsert_negative {}\ninvalidate_parent {}\ninvalidate_all {}\nevict {}\n",
+        "enabled {}\nentries {}\ncapacity {}\npositive_hit {}\nnegative_hit {}\nmiss {}\nrevalidate_fail {}\ninsert_positive {}\ninsert_negative {}\ninvalidate_parent {}\ninvalidate_all {}\nevict {}\nlru_touch {}\nlru_scan_slots {}\n",
         stats.enabled as usize,
         stats.entries,
         stats.capacity,
@@ -283,5 +342,7 @@ pub(crate) fn stats_content() -> String {
         stats.invalidate_parent,
         stats.invalidate_all,
         stats.evict,
+        stats.lru_touch,
+        stats.lru_scan_slots,
     )
 }
