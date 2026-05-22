@@ -1,9 +1,10 @@
 use crate::config::PAGE_SIZE;
-use crate::mm::shm::ShmError;
+use crate::mm::shm::{ShmCaller, ShmCreateContext, ShmError, ShmSegmentStat, ShmSetAttrs};
 use crate::mm::{MapPermission, MemoryProtectError, MmapFlush};
-use crate::syscall::user_ptr::copy_to_user;
+use crate::syscall::user_ptr::{copy_to_user, read_user_value, write_user_value};
 use crate::task::{
-    CAP_IPC_LOCK, PROCESS_PKEY_COUNT, RLimitResource, current_process, current_user_token,
+    CAP_IPC_LOCK, CAP_IPC_OWNER, CAP_SYS_ADMIN, PROCESS_PKEY_COUNT, RLimitResource,
+    current_process, current_user_token,
 };
 use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
@@ -65,6 +66,57 @@ const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: i32 = 1 << 4;
 const MEMBARRIER_SUPPORTED_CMDS: isize =
     (MEMBARRIER_CMD_PRIVATE_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED) as isize;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxIpc64Perm {
+    key: i32,
+    uid: u32,
+    gid: u32,
+    cuid: u32,
+    cgid: u32,
+    mode: u32,
+    seq: u16,
+    pad2: u16,
+    unused1: usize,
+    unused2: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxShmid64Ds {
+    shm_perm: LinuxIpc64Perm,
+    shm_segsz: usize,
+    shm_atime: i64,
+    shm_dtime: i64,
+    shm_ctime: i64,
+    shm_cpid: i32,
+    shm_lpid: i32,
+    shm_nattch: usize,
+    unused4: usize,
+    unused5: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxShminfo {
+    shmmax: usize,
+    shmmin: usize,
+    shmmni: usize,
+    shmseg: usize,
+    shmall: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxShmInfo {
+    used_ids: i32,
+    shm_tot: usize,
+    shm_rss: usize,
+    shm_swp: usize,
+    swap_attempts: usize,
+    swap_successes: usize,
+}
+
 pub fn sys_brk(addr: usize) -> SysResult {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
@@ -72,7 +124,15 @@ pub fn sys_brk(addr: usize) -> SysResult {
 }
 
 pub fn sys_shmget(key: isize, size: usize, shmflg: i32) -> SysResult {
-    crate::mm::shm::shmget_segment(key, size, shmflg, current_process().getpid())
+    let process = current_process();
+    let credentials = process.credentials();
+    let caller = shm_caller_from(process.getpid(), &credentials);
+    let context = ShmCreateContext {
+        pid: process.getpid(),
+        uid: credentials.euid,
+        gid: credentials.egid,
+    };
+    crate::mm::shm::shmget_segment(key, size, shmflg, context, &caller)
         .map(|shmid| shmid as isize)
         .map_err(shm_error_to_sys_error)
 }
@@ -103,15 +163,85 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> SysResult {
     }
 }
 
-pub fn sys_shmctl(shmid: usize, cmd: i32, _buf: usize) -> SysResult {
+pub fn sys_shmctl(shmid: usize, cmd: i32, buf: usize) -> SysResult {
+    let process = current_process();
+    let credentials = process.credentials();
+    let caller = shm_caller_from(process.getpid(), &credentials);
     match cmd {
         crate::mm::shm::IPC_RMID => {
-            crate::mm::shm::mark_segment_for_delete(shmid, current_process().getpid())
+            crate::mm::shm::mark_segment_for_delete(shmid, &caller)
                 .map_err(shm_error_to_sys_error)?;
             Ok(0)
         }
-        // UNFINISHED: IPC_STAT, IPC_SET, IPC_INFO, SHM_STAT, SHM_INFO, and
-        // SHM_LOCK/UNLOCK need Linux-compatible shmid_ds/ucred handling.
+        crate::mm::shm::IPC_STAT => {
+            let stat =
+                crate::mm::shm::stat_segment(shmid, &caller).map_err(shm_error_to_sys_error)?;
+            write_shmid_ds(buf, stat)?;
+            Ok(0)
+        }
+        crate::mm::shm::IPC_SET => {
+            let ds: LinuxShmid64Ds =
+                read_user_value(current_user_token(), buf as *const LinuxShmid64Ds)?;
+            crate::mm::shm::set_segment_attrs(
+                shmid,
+                ShmSetAttrs {
+                    uid: ds.shm_perm.uid,
+                    gid: ds.shm_perm.gid,
+                    mode: ds.shm_perm.mode,
+                },
+                &caller,
+            )
+            .map_err(shm_error_to_sys_error)?;
+            Ok(0)
+        }
+        crate::mm::shm::IPC_INFO => {
+            write_user_value(
+                current_user_token(),
+                buf as *mut LinuxShminfo,
+                &LinuxShminfo {
+                    shmmax: crate::mm::shm::SHM_MAX,
+                    shmmin: 1,
+                    shmmni: crate::mm::shm::SHMMNI,
+                    shmseg: crate::mm::shm::SHMMNI,
+                    shmall: crate::mm::shm::SHMALL,
+                },
+            )?;
+            Ok(crate::mm::shm::highest_index() as isize)
+        }
+        crate::mm::shm::SHM_INFO => {
+            let info = crate::mm::shm::usage_info();
+            write_user_value(
+                current_user_token(),
+                buf as *mut LinuxShmInfo,
+                &LinuxShmInfo {
+                    used_ids: info.used_ids.try_into().unwrap_or(i32::MAX),
+                    shm_tot: info.total_pages,
+                    shm_rss: info.resident_pages,
+                    shm_swp: info.swapped_pages,
+                    swap_attempts: 0,
+                    swap_successes: 0,
+                },
+            )?;
+            Ok(info.highest_index as isize)
+        }
+        crate::mm::shm::SHM_STAT | crate::mm::shm::SHM_STAT_ANY => {
+            let skip_permission = cmd == crate::mm::shm::SHM_STAT_ANY;
+            let (real_shmid, stat) =
+                crate::mm::shm::stat_segment_by_index(shmid, &caller, skip_permission)
+                    .map_err(shm_error_to_sys_error)?;
+            write_shmid_ds(buf, stat)?;
+            Ok(real_shmid as isize)
+        }
+        crate::mm::shm::SHM_LOCK => {
+            crate::mm::shm::set_segment_locked(shmid, true, &caller)
+                .map_err(shm_error_to_sys_error)?;
+            Ok(0)
+        }
+        crate::mm::shm::SHM_UNLOCK => {
+            crate::mm::shm::set_segment_locked(shmid, false, &caller)
+                .map_err(shm_error_to_sys_error)?;
+            Ok(0)
+        }
         _ => Err(SysError::EINVAL),
     }
 }
@@ -615,5 +745,54 @@ fn shm_error_to_sys_error(error: ShmError) -> SysError {
         ShmError::Exists => SysError::EEXIST,
         ShmError::Invalid => SysError::EINVAL,
         ShmError::NoMem => SysError::ENOMEM,
+        ShmError::AccessDenied => SysError::EACCES,
+        ShmError::NotPermitted => SysError::EPERM,
     }
+}
+
+fn shm_caller_from<'a>(pid: usize, credentials: &'a crate::task::Credentials) -> ShmCaller<'a> {
+    ShmCaller {
+        pid,
+        euid: credentials.euid,
+        egid: credentials.egid,
+        groups: &credentials.groups,
+        can_override_read: credentials.euid == 0
+            && credentials
+                .capabilities
+                .has_effective(CAP_IPC_OWNER)
+                .unwrap_or(false),
+        can_override_owner: credentials.euid == 0
+            && credentials
+                .capabilities
+                .has_effective(CAP_SYS_ADMIN)
+                .unwrap_or(false),
+        can_lock_ipc: credentials.euid == 0
+            && credentials
+                .capabilities
+                .has_effective(CAP_IPC_LOCK)
+                .unwrap_or(false),
+    }
+}
+
+fn write_shmid_ds(buf: usize, stat: ShmSegmentStat) -> SysResult<()> {
+    let ds = LinuxShmid64Ds {
+        shm_perm: LinuxIpc64Perm {
+            key: stat.key.try_into().unwrap_or(i32::MAX),
+            uid: stat.uid,
+            gid: stat.gid,
+            cuid: stat.cuid,
+            cgid: stat.cgid,
+            mode: stat.mode,
+            ..LinuxIpc64Perm::default()
+        },
+        shm_segsz: stat.size,
+        shm_atime: stat.atime,
+        shm_dtime: stat.dtime,
+        shm_ctime: stat.ctime,
+        shm_cpid: stat.cpid,
+        shm_lpid: stat.lpid,
+        shm_nattch: stat.nattch,
+        ..LinuxShmid64Ds::default()
+    };
+    write_user_value(current_user_token(), buf as *mut LinuxShmid64Ds, &ds)
 }

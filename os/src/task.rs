@@ -32,6 +32,7 @@ pub(crate) use process::{
 };
 pub use process::{ProcessControlBlock, ProcessCpuTimesSnapshot};
 pub(crate) const CAP_IPC_LOCK: usize = process::CapabilitySets::CAP_IPC_LOCK;
+pub(crate) const CAP_IPC_OWNER: usize = process::CapabilitySets::CAP_IPC_OWNER;
 pub(crate) const CAP_SETPCAP: usize = process::CapabilitySets::CAP_SETPCAP;
 pub(crate) const CAP_SYS_CHROOT: usize = process::CapabilitySets::CAP_SYS_CHROOT;
 pub(crate) const CAP_SYS_PTRACE: usize = process::CapabilitySets::CAP_SYS_PTRACE;

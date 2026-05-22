@@ -72,6 +72,11 @@ const DENTRY_CACHE_STATS_INO: u32 = 39;
 const EXEC_LOAD_STATS_INO: u32 = 40;
 const CORE_PATTERN_INO: u32 = 41;
 const VERSION_INO: u32 = 42;
+const SYSVIPC_DIR_INO: u32 = 43;
+const SYSVIPC_SHM_INO: u32 = 44;
+const SHMMAX_INO: u32 = 45;
+const SHMMNI_INO: u32 = 46;
+const SHMALL_INO: u32 = 47;
 // CONTEXT: Dynamic /proc inode ranges must stay disjoint even after long test
 // runs allocate five-digit PIDs; LTP probes /proc/<ppid>/stat during waits.
 const PID_DIR_BASE: u32 = 100;
@@ -172,7 +177,11 @@ enum ProcNode {
     SysNetIpv4ConfLoDir,
     SysNetIpv4ConfDefaultDir,
     SysVmDir,
+    SysVipcDir,
     PidMax,
+    ShmMax,
+    ShmMni,
+    ShmAll,
     PipeMaxSize,
     PipeUserPagesSoft,
     LeaseBreakTime,
@@ -192,6 +201,7 @@ enum ProcNode {
     DentryCacheStats,
     ExecLoadStats,
     Version,
+    SysVipcShm,
     Domainname,
     Tainted,
     PidDir(usize),
@@ -430,6 +440,11 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         SYS_NET_IPV4_CONF_LO_DIR_INO => Some(ProcNode::SysNetIpv4ConfLoDir),
         SYS_NET_IPV4_CONF_DEFAULT_DIR_INO => Some(ProcNode::SysNetIpv4ConfDefaultDir),
         SYS_VM_DIR_INO => Some(ProcNode::SysVmDir),
+        SYSVIPC_DIR_INO => Some(ProcNode::SysVipcDir),
+        SYSVIPC_SHM_INO => Some(ProcNode::SysVipcShm),
+        SHMMAX_INO => Some(ProcNode::ShmMax),
+        SHMMNI_INO => Some(ProcNode::ShmMni),
+        SHMALL_INO => Some(ProcNode::ShmAll),
         SYS_NET_IPV4_CONF_LO_TAG_INO => Some(ProcNode::NetIpv4ConfLoTag),
         SYS_NET_IPV4_CONF_DEFAULT_TAG_INO => Some(ProcNode::NetIpv4ConfDefaultTag),
         KEYS_GC_DELAY_INO => Some(ProcNode::KeysGcDelay),
@@ -519,6 +534,7 @@ fn node_kind(node: ProcNode) -> FsNodeKind {
         | ProcNode::SysNetIpv4ConfLoDir
         | ProcNode::SysNetIpv4ConfDefaultDir
         | ProcNode::SysVmDir
+        | ProcNode::SysVipcDir
         | ProcNode::PidDir(_)
         | ProcNode::PidFdDir(_)
         | ProcNode::PidFdInfoDir(_)
@@ -582,6 +598,11 @@ fn root_entries() -> Vec<RawDirEntry> {
         name: "sys".into(),
         dtype: DT_DIR,
     });
+    entries.push(RawDirEntry {
+        ino: SYSVIPC_DIR_INO,
+        name: "sysvipc".into(),
+        dtype: DT_DIR,
+    });
     for process in list_process_snapshots() {
         entries.push(RawDirEntry {
             ino: pid_dir_ino(process.pid),
@@ -623,6 +644,26 @@ fn sys_entries() -> Vec<RawDirEntry> {
         ino: SYS_VM_DIR_INO,
         name: "vm".into(),
         dtype: DT_DIR,
+    });
+    entries
+}
+
+fn sysvipc_entries() -> Vec<RawDirEntry> {
+    let mut entries = Vec::new();
+    entries.push(RawDirEntry {
+        ino: SYSVIPC_DIR_INO,
+        name: ".".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: ROOT_INO,
+        name: "..".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYSVIPC_SHM_INO,
+        name: "shm".into(),
+        dtype: DT_REG,
     });
     entries
 }
@@ -842,6 +883,21 @@ fn sys_kernel_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: PID_MAX_INO,
         name: "pid_max".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: SHMMAX_INO,
+        name: "shmmax".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: SHMMNI_INO,
+        name: "shmmni".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: SHMALL_INO,
+        name: "shmall".into(),
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
@@ -1682,6 +1738,10 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::Cpuinfo => Ok(cpuinfo_content().into_bytes()),
         ProcNode::Version => Ok(b"Linux version 6.8.0-whusp (oskernel2026)\n".to_vec()),
         ProcNode::PidMax => Ok(pid_max_content().into_bytes()),
+        ProcNode::ShmMax => Ok(format!("{}\n", crate::mm::shm::SHM_MAX).into_bytes()),
+        ProcNode::ShmMni => Ok(format!("{}\n", crate::mm::shm::SHMMNI).into_bytes()),
+        ProcNode::ShmAll => Ok(format!("{}\n", crate::mm::shm::SHMALL).into_bytes()),
+        ProcNode::SysVipcShm => Ok(crate::mm::shm::proc_sysvipc_shm_content().into_bytes()),
         ProcNode::KeysGcDelay => Ok(keyring::key_gc_delay_content().into_bytes()),
         ProcNode::KeysMaxkeys => Ok(keyring::key_maxkeys_content().into_bytes()),
         ProcNode::KeysMaxbytes => Ok(keyring::key_maxbytes_content().into_bytes()),
@@ -1797,6 +1857,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         | ProcNode::SysNetIpv4ConfLoDir
         | ProcNode::SysNetIpv4ConfDefaultDir
         | ProcNode::SysVmDir
+        | ProcNode::SysVipcDir
         | ProcNode::PidDir(_)
         | ProcNode::PidFdDir(_)
         | ProcNode::PidFdInfoDir(_)
@@ -1842,6 +1903,7 @@ impl FileSystemBackend for ProcFs {
                 "cpuinfo" => Ok((CPUINFO_INO, FsNodeKind::RegularFile)),
                 "version" => Ok((VERSION_INO, FsNodeKind::RegularFile)),
                 "sys" => Ok((SYS_DIR_INO, FsNodeKind::Directory)),
+                "sysvipc" => Ok((SYSVIPC_DIR_INO, FsNodeKind::Directory)),
                 "self" => {
                     let pid = crate::task::current_process().getpid();
                     Ok((pid_dir_ino(pid), FsNodeKind::Directory))
@@ -1905,6 +1967,9 @@ impl FileSystemBackend for ProcFs {
                 ".." => Ok((SYS_DIR_INO, FsNodeKind::Directory)),
                 "pid_max" => Ok((PID_MAX_INO, FsNodeKind::RegularFile)),
                 "core_pattern" => Ok((CORE_PATTERN_INO, FsNodeKind::RegularFile)),
+                "shmmax" => Ok((SHMMAX_INO, FsNodeKind::RegularFile)),
+                "shmmni" => Ok((SHMMNI_INO, FsNodeKind::RegularFile)),
+                "shmall" => Ok((SHMALL_INO, FsNodeKind::RegularFile)),
                 "keys" => Ok((SYS_KERNEL_KEYS_DIR_INO, FsNodeKind::Directory)),
                 "domainname" => Ok((DOMAINNAME_INO, FsNodeKind::RegularFile)),
                 "tainted" => Ok((TAINTED_INO, FsNodeKind::RegularFile)),
@@ -1919,6 +1984,12 @@ impl FileSystemBackend for ProcFs {
                 "gc_delay" => Ok((KEYS_GC_DELAY_INO, FsNodeKind::RegularFile)),
                 "maxkeys" => Ok((KEYS_MAXKEYS_INO, FsNodeKind::RegularFile)),
                 "maxbytes" => Ok((KEYS_MAXBYTES_INO, FsNodeKind::RegularFile)),
+                _ => Err(FsError::NotFound),
+            },
+            ProcNode::SysVipcDir => match component {
+                "." => Ok((SYSVIPC_DIR_INO, FsNodeKind::Directory)),
+                ".." => Ok((ROOT_INO, FsNodeKind::Directory)),
+                "shm" => Ok((SYSVIPC_SHM_INO, FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::SysFsDir => match component {
@@ -2157,6 +2228,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::SysNetIpv4ConfLoDir
             | ProcNode::SysNetIpv4ConfDefaultDir
             | ProcNode::SysVmDir
+            | ProcNode::SysVipcDir
             | ProcNode::PidDir(_)
             | ProcNode::PidFdDir(_)
             | ProcNode::PidFdInfoDir(_)
@@ -2167,6 +2239,9 @@ impl FileSystemBackend for ProcFs {
                 FileStat::with_mode(S_IFLNK | 0o777)
             }
             ProcNode::PidMax
+            | ProcNode::ShmMax
+            | ProcNode::ShmMni
+            | ProcNode::ShmAll
             | ProcNode::KeysGcDelay
             | ProcNode::KeysMaxkeys
             | ProcNode::KeysMaxbytes
@@ -2270,6 +2345,7 @@ impl FileSystemBackend for ProcFs {
         match decode_node(ino).ok_or(FsError::NotFound)? {
             ProcNode::Root => write_dir_entries(&root_entries(), offset, buf),
             ProcNode::SysDir => write_dir_entries(&sys_entries(), offset, buf),
+            ProcNode::SysVipcDir => write_dir_entries(&sysvipc_entries(), offset, buf),
             ProcNode::SysKernelDir => write_dir_entries(&sys_kernel_entries(), offset, buf),
             ProcNode::SysKernelKeysDir => {
                 write_dir_entries(&sys_kernel_keys_entries(), offset, buf)

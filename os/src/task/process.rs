@@ -158,6 +158,7 @@ pub struct CapabilitySets {
 impl CapabilitySets {
     pub const CAP_SETPCAP: usize = 8;
     pub const CAP_IPC_LOCK: usize = 14;
+    pub const CAP_IPC_OWNER: usize = 15;
     pub const CAP_SYS_CHROOT: usize = 18;
     pub const CAP_SYS_PTRACE: usize = 19;
     pub const CAP_SYS_ADMIN: usize = 21;
