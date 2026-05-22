@@ -598,6 +598,35 @@ pub fn sys_mincore(addr: usize, len: usize, vec: *mut u8) -> SysResult {
     Ok(0)
 }
 
+pub fn sys_remap_file_pages(
+    addr: usize,
+    size: usize,
+    prot: i32,
+    _pgoff: usize,
+    _flags: i32,
+) -> SysResult {
+    // CONTEXT: Linux deprecated remap_file_pages() and replaced it with
+    // in-kernel emulation. This kernel does not model nonlinear mappings; it
+    // exposes the syscall so compatibility probes do not see ENOSYS, reports
+    // success while a SysV SHM mapping is still current, and returns Linux's
+    // documented EINVAL once the mapping becomes stale.
+    if size == 0 {
+        return Ok(0);
+    }
+    if prot != 0 {
+        return Err(SysError::EINVAL);
+    }
+    let shmid = current_process()
+        .inner_exclusive_access()
+        .memory_set
+        .shm_segment_id_for_range(addr, size)
+        .ok_or(SysError::EINVAL)?;
+    if !crate::mm::shm::segment_remap_available(shmid).unwrap_or(false) {
+        return Err(SysError::EINVAL);
+    }
+    Ok(0)
+}
+
 pub fn sys_msync(addr: usize, len: usize, flags: i32) -> SysResult {
     if addr % PAGE_SIZE != 0 {
         return Err(SysError::EINVAL);

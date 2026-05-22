@@ -179,6 +179,7 @@ const SYSCALL_MUNLOCK: usize = 229;
 const SYSCALL_MLOCKALL: usize = 230;
 const SYSCALL_MUNLOCKALL: usize = 231;
 const SYSCALL_MINCORE: usize = 232;
+const SYSCALL_REMAP_FILE_PAGES: usize = 234;
 const SYSCALL_PERF_EVENT_OPEN: usize = 241;
 const SYSCALL_ACCEPT4: usize = 242;
 const SYSCALL_WAIT4: usize = 260;
@@ -781,6 +782,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MLOCKALL => sys_mlockall(args[0]),
         SYSCALL_MUNLOCKALL => sys_munlockall(),
         SYSCALL_MINCORE => sys_mincore(args[0], args[1], args[2] as *mut u8),
+        SYSCALL_REMAP_FILE_PAGES => {
+            sys_remap_file_pages(args[0], args[1], args[2] as i32, args[3], args[4] as i32)
+        }
         SYSCALL_PKEY_MPROTECT => sys_pkey_mprotect(args[0], args[1], args[2], args[3] as isize),
         SYSCALL_PKEY_ALLOC => sys_pkey_alloc(args[0], args[1]),
         SYSCALL_PKEY_FREE => sys_pkey_free(args[0] as isize),

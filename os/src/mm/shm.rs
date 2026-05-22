@@ -362,12 +362,12 @@ impl ShmManager {
         }
         segment.marked_for_delete = true;
         segment.last_pid = caller.pid;
+        let key = segment.key;
+        if key != IPC_PRIVATE {
+            self.keyed_segments.remove(&key);
+        }
         if segment.attach_count == 0 {
-            let key = segment.key;
             self.segments.remove(&shmid);
-            if key != IPC_PRIVATE {
-                self.keyed_segments.remove(&key);
-            }
         }
         Ok(())
     }
@@ -509,6 +509,18 @@ pub(crate) fn attached_segment_pages(shmid: usize) -> Option<Vec<ShmPageMapping>
 
 pub(crate) fn detach_segment(shmid: usize, pid: usize) -> Result<(), ShmError> {
     SHM_MANAGER.exclusive_access().detach(shmid, pid)
+}
+
+pub(crate) fn segment_remap_available(shmid: usize) -> Option<bool> {
+    let manager = SHM_MANAGER.exclusive_access();
+    let segment = manager.segments.get(&shmid)?;
+    if segment.marked_for_delete {
+        return Some(false);
+    }
+    if segment.key == IPC_PRIVATE {
+        return Some(true);
+    }
+    Some(manager.keyed_segments.get(&segment.key).copied() == Some(shmid))
 }
 
 pub(crate) fn mark_segment_for_delete(

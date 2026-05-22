@@ -706,6 +706,23 @@ impl MemorySet {
         Some(())
     }
 
+    pub fn shm_segment_id_for_range(&self, start: usize, len: usize) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        let end = start.checked_add(len - 1)?;
+        let start_vpn = VirtAddr::from(start).floor();
+        let end_vpn = VirtAddr::from(end).floor();
+        self.areas
+            .iter()
+            .find(|area| {
+                area.is_shm()
+                    && area.vpn_range.get_start() <= start_vpn
+                    && end_vpn < area.vpn_range.get_end()
+            })
+            .and_then(MapArea::shm_segment_id)
+    }
+
     /// Resolves a user mmap fault into either an already-handled fault or work
     /// that must be completed without holding `MemorySet` mutably.
     ///
