@@ -1,4 +1,5 @@
 use super::{ProcessControlBlock, ProcessProcSnapshot, TaskControlBlock, TaskStatus};
+use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
@@ -23,6 +24,7 @@ impl TaskManager {
         self.ready_queue.push_front(task);
     }
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
+        let queue_len = self.ready_queue.len();
         // CONTEXT: Linux-visible SCHED_FIFO/RR metadata is enough for
         // cyclictest only if awakened RT tasks can run ahead of normal load.
         // UNFINISHED: This is not a full Linux RT scheduler; equal-priority RT
@@ -30,12 +32,16 @@ impl TaskManager {
         let mut best_idx = None;
         let mut best_rt_priority = 0;
         let mut idx = 0;
+        let mut scanned = 0;
+        let mut pruned_exited = 0;
         while idx < self.ready_queue.len() {
             let task = &self.ready_queue[idx];
             if task.inner_exclusive_access().task_status == TaskStatus::Exited {
                 self.ready_queue.remove(idx);
+                pruned_exited += 1;
                 continue;
             }
+            scanned += 1;
             let rt_priority = task.realtime_priority();
             if best_idx.is_none() || rt_priority > best_rt_priority {
                 best_idx = Some(idx);
@@ -43,6 +49,7 @@ impl TaskManager {
             }
             idx += 1;
         }
+        perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
         best_idx.and_then(|idx| self.ready_queue.remove(idx))
     }
     pub fn remove_process_tasks(&mut self, process_id: usize) {
@@ -75,6 +82,7 @@ fn wakeup_task_with_placement(task: Arc<TaskControlBlock>, front: bool) -> bool 
         } else {
             add_task(task);
         }
+        perf::record_task_wakeup(front);
         true
     } else {
         false

@@ -3,6 +3,7 @@ use super::{File, FileStat, FsResult, OpenFlags, PollEvents, S_IFIFO};
 use crate::config::PAGE_SIZE;
 use crate::fs::pipe_max_size;
 use crate::mm::UserBuffer;
+use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
@@ -45,6 +46,7 @@ impl Pipe {
         if want_to_read == 0 {
             return 0;
         }
+        perf::record_pipe_read_call();
         loop {
             let mut ring_buffer = self.buffer.exclusive_access();
             let loop_read = ring_buffer.available_read().min(want_to_read);
@@ -55,6 +57,7 @@ impl Pipe {
                 if pipe_wait_interrupted() {
                     return 0;
                 }
+                perf::record_pipe_reader_sleep();
                 let task_cx_ptr = ring_buffer.sleep_reader();
                 drop(ring_buffer);
                 schedule(task_cx_ptr);
@@ -71,6 +74,7 @@ impl Pipe {
                 }
                 copied += len;
             }
+            perf::record_pipe_read_copy(copied);
             let writer = ring_buffer.wake_writer();
             drop(ring_buffer);
             wake_task(writer);
@@ -84,6 +88,7 @@ impl Pipe {
         if want_to_write == 0 {
             return 0;
         }
+        perf::record_pipe_write_call();
         let mut already_write = 0usize;
         loop {
             let mut ring_buffer = self.buffer.exclusive_access();
@@ -101,6 +106,7 @@ impl Pipe {
                 if pipe_wait_interrupted() {
                     return already_write;
                 }
+                perf::record_pipe_writer_sleep();
                 let task_cx_ptr = ring_buffer.sleep_writer();
                 drop(ring_buffer);
                 schedule(task_cx_ptr);
@@ -127,6 +133,7 @@ impl Pipe {
                 }
                 skipped += buffer.len();
             }
+            perf::record_pipe_write_copy(written);
             already_write += written;
             let reader = ring_buffer.wake_reader();
             drop(ring_buffer);

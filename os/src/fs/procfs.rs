@@ -13,6 +13,7 @@ use super::{PathContext, lookup_path_in};
 use crate::config::PAGE_SIZE;
 use crate::drivers::block_cache;
 use crate::mm::{exec_load_stats_content, frame_stats};
+use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::keyring;
 use crate::syscall::{
@@ -77,6 +78,8 @@ const SYSVIPC_SHM_INO: u32 = 44;
 const SHMMAX_INO: u32 = 45;
 const SHMMNI_INO: u32 = 46;
 const SHMALL_INO: u32 = 47;
+const OSKERNEL_DIR_INO: u32 = 48;
+const OSKERNEL_PERF_INO: u32 = 49;
 // CONTEXT: Dynamic /proc inode ranges must stay disjoint even after long test
 // runs allocate five-digit PIDs; LTP probes /proc/<ppid>/stat during waits.
 const PID_DIR_BASE: u32 = 100;
@@ -201,6 +204,8 @@ enum ProcNode {
     DentryCacheStats,
     ExecLoadStats,
     Version,
+    OsKernelDir,
+    OsKernelPerf,
     SysVipcShm,
     Domainname,
     Tainted,
@@ -461,6 +466,8 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         DENTRY_CACHE_STATS_INO => Some(ProcNode::DentryCacheStats),
         EXEC_LOAD_STATS_INO => Some(ProcNode::ExecLoadStats),
         VERSION_INO => Some(ProcNode::Version),
+        OSKERNEL_DIR_INO => Some(ProcNode::OsKernelDir),
+        OSKERNEL_PERF_INO => Some(ProcNode::OsKernelPerf),
         ino if ino >= PID_FDINFO_ENTRY_BASE => {
             let rel = ino - PID_FDINFO_ENTRY_BASE;
             let pid = (rel / PID_FD_ENTRY_STRIDE) as usize;
@@ -533,6 +540,7 @@ fn node_kind(node: ProcNode) -> FsNodeKind {
         | ProcNode::SysNetIpv4ConfDir
         | ProcNode::SysNetIpv4ConfLoDir
         | ProcNode::SysNetIpv4ConfDefaultDir
+        | ProcNode::OsKernelDir
         | ProcNode::SysVmDir
         | ProcNode::SysVipcDir
         | ProcNode::PidDir(_)
@@ -603,6 +611,11 @@ fn root_entries() -> Vec<RawDirEntry> {
         name: "sysvipc".into(),
         dtype: DT_DIR,
     });
+    entries.push(RawDirEntry {
+        ino: OSKERNEL_DIR_INO,
+        name: "oskernel".into(),
+        dtype: DT_DIR,
+    });
     for process in list_process_snapshots() {
         entries.push(RawDirEntry {
             ino: pid_dir_ino(process.pid),
@@ -610,6 +623,26 @@ fn root_entries() -> Vec<RawDirEntry> {
             dtype: DT_DIR,
         });
     }
+    entries
+}
+
+fn oskernel_entries() -> Vec<RawDirEntry> {
+    let mut entries = Vec::new();
+    entries.push(RawDirEntry {
+        ino: OSKERNEL_DIR_INO,
+        name: ".".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: ROOT_INO,
+        name: "..".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: OSKERNEL_PERF_INO,
+        name: "perf".into(),
+        dtype: DT_REG,
+    });
     entries
 }
 
@@ -1339,6 +1372,71 @@ fn proc_io_content() -> String {
     )
 }
 
+fn oskernel_perf_content() -> String {
+    let (frame_total, frame_free) = frame_stats();
+    let block = block_cache::stats_snapshot();
+    let dentry = dentry_cache::stats_snapshot();
+    let page_cache_entries = crate::mm::page_cache::PAGE_CACHE.exclusive_access().len();
+    format!(
+        "{}\
+         frame_total {}\n\
+         frame_free {}\n\
+         page_cache_entries {}\n\
+         block_cache_enabled {}\n\
+         block_cache_entries {}\n\
+         block_cache_capacity {}\n\
+         block_cache_read_hit {}\n\
+         block_cache_read_miss {}\n\
+         block_cache_write_update {}\n\
+         block_cache_write_invalidate {}\n\
+         block_cache_evict {}\n\
+         block_cache_device_read_submit {}\n\
+         block_cache_device_write_submit {}\n\
+         block_cache_bypass_unaligned {}\n\
+         dentry_cache_enabled {}\n\
+         dentry_cache_entries {}\n\
+         dentry_cache_capacity {}\n\
+         dentry_cache_positive_hit {}\n\
+         dentry_cache_negative_hit {}\n\
+         dentry_cache_miss {}\n\
+         dentry_cache_revalidate_fail {}\n\
+         dentry_cache_insert_positive {}\n\
+         dentry_cache_insert_negative {}\n\
+         dentry_cache_invalidate_parent {}\n\
+         dentry_cache_invalidate_all {}\n\
+         dentry_cache_evict {}\n\
+         {}",
+        perf::stats_content(),
+        frame_total,
+        frame_free,
+        page_cache_entries,
+        block.enabled as usize,
+        block.entries,
+        block.capacity,
+        block.read_hit,
+        block.read_miss,
+        block.write_update,
+        block.write_invalidate,
+        block.evict,
+        block.device_read_submit,
+        block.device_write_submit,
+        block.bypass_unaligned,
+        dentry.enabled as usize,
+        dentry.entries,
+        dentry.capacity,
+        dentry.positive_hit,
+        dentry.negative_hit,
+        dentry.miss,
+        dentry.revalidate_fail,
+        dentry.insert_positive,
+        dentry.insert_negative,
+        dentry.invalidate_parent,
+        dentry.invalidate_all,
+        dentry.evict,
+        exec_load_stats_content(),
+    )
+}
+
 fn pid_max_content() -> String {
     // CONTEXT: LTP uses this procfs knob only to choose an unused PID for
     // negative syscall tests. The allocator is much smaller than Linux's
@@ -1737,6 +1835,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::Uptime => Ok(uptime_content().into_bytes()),
         ProcNode::Cpuinfo => Ok(cpuinfo_content().into_bytes()),
         ProcNode::Version => Ok(b"Linux version 6.8.0-whusp (oskernel2026)\n".to_vec()),
+        ProcNode::OsKernelPerf => Ok(oskernel_perf_content().into_bytes()),
         ProcNode::PidMax => Ok(pid_max_content().into_bytes()),
         ProcNode::ShmMax => Ok(format!("{}\n", crate::mm::shm::SHM_MAX).into_bytes()),
         ProcNode::ShmMni => Ok(format!("{}\n", crate::mm::shm::SHMMNI).into_bytes()),
@@ -1856,6 +1955,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         | ProcNode::SysNetIpv4ConfDir
         | ProcNode::SysNetIpv4ConfLoDir
         | ProcNode::SysNetIpv4ConfDefaultDir
+        | ProcNode::OsKernelDir
         | ProcNode::SysVmDir
         | ProcNode::SysVipcDir
         | ProcNode::PidDir(_)
@@ -1904,6 +2004,7 @@ impl FileSystemBackend for ProcFs {
                 "version" => Ok((VERSION_INO, FsNodeKind::RegularFile)),
                 "sys" => Ok((SYS_DIR_INO, FsNodeKind::Directory)),
                 "sysvipc" => Ok((SYSVIPC_DIR_INO, FsNodeKind::Directory)),
+                "oskernel" => Ok((OSKERNEL_DIR_INO, FsNodeKind::Directory)),
                 "self" => {
                     let pid = crate::task::current_process().getpid();
                     Ok((pid_dir_ino(pid), FsNodeKind::Directory))
@@ -1922,6 +2023,12 @@ impl FileSystemBackend for ProcFs {
                 "fs" => Ok((SYS_FS_DIR_INO, FsNodeKind::Directory)),
                 "net" => Ok((SYS_NET_DIR_INO, FsNodeKind::Directory)),
                 "vm" => Ok((SYS_VM_DIR_INO, FsNodeKind::Directory)),
+                _ => Err(FsError::NotFound),
+            },
+            ProcNode::OsKernelDir => match component {
+                "." => Ok((OSKERNEL_DIR_INO, FsNodeKind::Directory)),
+                ".." => Ok((ROOT_INO, FsNodeKind::Directory)),
+                "perf" => Ok((OSKERNEL_PERF_INO, FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::SysVmDir => match component {
@@ -2227,6 +2334,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::SysNetIpv4ConfDir
             | ProcNode::SysNetIpv4ConfLoDir
             | ProcNode::SysNetIpv4ConfDefaultDir
+            | ProcNode::OsKernelDir
             | ProcNode::SysVmDir
             | ProcNode::SysVipcDir
             | ProcNode::PidDir(_)
@@ -2344,6 +2452,7 @@ impl FileSystemBackend for ProcFs {
     fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
         match decode_node(ino).ok_or(FsError::NotFound)? {
             ProcNode::Root => write_dir_entries(&root_entries(), offset, buf),
+            ProcNode::OsKernelDir => write_dir_entries(&oskernel_entries(), offset, buf),
             ProcNode::SysDir => write_dir_entries(&sys_entries(), offset, buf),
             ProcNode::SysVipcDir => write_dir_entries(&sysvipc_entries(), offset, buf),
             ProcNode::SysKernelDir => write_dir_entries(&sys_kernel_entries(), offset, buf),

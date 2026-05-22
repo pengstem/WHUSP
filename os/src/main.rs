@@ -19,6 +19,7 @@ mod fs;
 mod lang_items;
 mod logging;
 mod mm;
+mod perf;
 mod sync;
 mod syscall;
 mod task;

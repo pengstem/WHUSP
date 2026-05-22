@@ -6,6 +6,7 @@ use super::{
 use crate::config::USER_STACK_SIZE;
 use crate::fs::{MountNamespaceId, PathContext, ROOT_MOUNT_NAMESPACE, VfsNodeId, WorkingDir};
 use crate::mm::MemorySet;
+use crate::perf;
 use crate::sync::{UPIntrFreeCell, UPIntrRefMut};
 use alloc::format;
 use alloc::string::String;
@@ -624,22 +625,30 @@ impl ProcessControlBlockInner {
     pub fn alloc_fd_from(&mut self, lower_bound: usize) -> Option<usize> {
         let limit = self.nofile_limit();
         if lower_bound >= limit {
+            perf::record_fd_alloc(0, 0, self.fd_table.len(), false);
             return None;
         }
-        if let Some(fd) =
-            (lower_bound..self.fd_table.len().min(limit)).find(|fd| self.fd_table[*fd].is_none())
-        {
-            Some(fd)
-        } else {
-            let fd = self.fd_table.len().max(lower_bound);
-            if fd >= limit {
-                return None;
+        let search_end = self.fd_table.len().min(limit);
+        let mut probed_slots = 0usize;
+        for fd in lower_bound..search_end {
+            probed_slots += 1;
+            if self.fd_table[fd].is_none() {
+                perf::record_fd_alloc(probed_slots, 0, self.fd_table.len(), true);
+                return Some(fd);
             }
-            while self.fd_table.len() <= fd {
-                self.fd_table.push(None);
-            }
-            Some(fd)
         }
+        let fd = self.fd_table.len().max(lower_bound);
+        if fd >= limit {
+            perf::record_fd_alloc(probed_slots, 0, self.fd_table.len(), false);
+            return None;
+        }
+        let old_len = self.fd_table.len();
+        while self.fd_table.len() <= fd {
+            self.fd_table.push(None);
+        }
+        let expanded_slots = self.fd_table.len().saturating_sub(old_len);
+        perf::record_fd_alloc(probed_slots, expanded_slots, self.fd_table.len(), true);
+        Some(fd)
     }
 
     pub fn fd_entry(&self, fd: usize) -> Option<FdTableEntry> {
@@ -654,7 +663,11 @@ impl ProcessControlBlockInner {
     /// The returned entry must be closed or dropped after releasing
     /// `ProcessControlBlockInner` so file cleanup cannot re-enter this lock.
     pub fn take_fd_entry(&mut self, fd: usize) -> Option<FdTableEntry> {
-        self.fd_table.get_mut(fd)?.take()
+        let entry = self.fd_table.get_mut(fd)?.take();
+        if entry.is_some() {
+            perf::record_fd_take();
+        }
+        entry
     }
 
     /// Installs an fd entry at an already validated descriptor number.
@@ -666,7 +679,9 @@ impl ProcessControlBlockInner {
         while self.fd_table.len() <= fd {
             self.fd_table.push(None);
         }
-        self.fd_table[fd].replace(entry)
+        let previous = self.fd_table[fd].replace(entry);
+        perf::record_fd_install(self.fd_table.len());
+        previous
     }
 
     pub fn alloc_tid(&mut self) -> usize {
