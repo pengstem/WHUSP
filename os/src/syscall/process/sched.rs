@@ -449,12 +449,21 @@ pub fn sys_sched_rr_get_interval(pid: isize, interval: *mut LinuxTimeSpec) -> Sy
     if interval.is_null() {
         return Err(SysError::EFAULT);
     }
-    let _task = sched_target_task(pid)?;
+    let task = sched_target_task(pid)?;
+    let sched_policy = task.inner_exclusive_access().sched_policy;
     // CONTEXT: The kernel does not yet run a separate SCHED_RR queue. Report
-    // Linux's default 100 ms quantum for ABI compatibility.
-    let rr_interval = LinuxTimeSpec {
-        tv_sec: 0,
-        tv_nsec: RR_INTERVAL_NSEC,
+    // Linux's default 100 ms quantum for RR tasks and a zero interval for
+    // non-RR policies such as SCHED_FIFO.
+    let rr_interval = if sched_policy == SCHED_RR {
+        LinuxTimeSpec {
+            tv_sec: 0,
+            tv_nsec: RR_INTERVAL_NSEC,
+        }
+    } else {
+        LinuxTimeSpec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        }
     };
     write_user_value_with_mmap_fault(current_user_token(), interval, &rr_interval)?;
     Ok(0)
