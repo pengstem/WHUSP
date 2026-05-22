@@ -23,6 +23,8 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) pipe_write_bytes: usize,
     pub(crate) pipe_read_byte_copy_bytes: usize,
     pub(crate) pipe_write_byte_copy_bytes: usize,
+    pub(crate) pipe_read_chunk_copy_bytes: usize,
+    pub(crate) pipe_write_chunk_copy_bytes: usize,
     pub(crate) pipe_reader_sleeps: usize,
     pub(crate) pipe_writer_sleeps: usize,
 }
@@ -48,6 +50,8 @@ static PIPE_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PIPE_WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PIPE_READ_BYTE_COPY_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PIPE_WRITE_BYTE_COPY_BYTES: AtomicUsize = AtomicUsize::new(0);
+static PIPE_READ_CHUNK_COPY_BYTES: AtomicUsize = AtomicUsize::new(0);
+static PIPE_WRITE_CHUNK_COPY_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PIPE_READER_SLEEPS: AtomicUsize = AtomicUsize::new(0);
 static PIPE_WRITER_SLEEPS: AtomicUsize = AtomicUsize::new(0);
 
@@ -109,14 +113,14 @@ pub(crate) fn record_pipe_write_call() {
     PIPE_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn record_pipe_read_copy(bytes: usize) {
+pub(crate) fn record_pipe_read_chunk_copy(bytes: usize) {
     PIPE_READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
-    PIPE_READ_BYTE_COPY_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    PIPE_READ_CHUNK_COPY_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
 
-pub(crate) fn record_pipe_write_copy(bytes: usize) {
+pub(crate) fn record_pipe_write_chunk_copy(bytes: usize) {
     PIPE_WRITE_BYTES.fetch_add(bytes, Ordering::Relaxed);
-    PIPE_WRITE_BYTE_COPY_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    PIPE_WRITE_CHUNK_COPY_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
 
 pub(crate) fn record_pipe_reader_sleep() {
@@ -148,6 +152,8 @@ pub(crate) fn snapshot() -> KernelPerfSnapshot {
         pipe_write_bytes: PIPE_WRITE_BYTES.load(Ordering::Relaxed),
         pipe_read_byte_copy_bytes: PIPE_READ_BYTE_COPY_BYTES.load(Ordering::Relaxed),
         pipe_write_byte_copy_bytes: PIPE_WRITE_BYTE_COPY_BYTES.load(Ordering::Relaxed),
+        pipe_read_chunk_copy_bytes: PIPE_READ_CHUNK_COPY_BYTES.load(Ordering::Relaxed),
+        pipe_write_chunk_copy_bytes: PIPE_WRITE_CHUNK_COPY_BYTES.load(Ordering::Relaxed),
         pipe_reader_sleeps: PIPE_READER_SLEEPS.load(Ordering::Relaxed),
         pipe_writer_sleeps: PIPE_WRITER_SLEEPS.load(Ordering::Relaxed),
     }
@@ -175,6 +181,8 @@ pub(crate) fn stats_content() -> String {
          pipe_write_bytes {}\n\
          pipe_read_byte_copy_bytes {}\n\
          pipe_write_byte_copy_bytes {}\n\
+         pipe_read_chunk_copy_bytes {}\n\
+         pipe_write_chunk_copy_bytes {}\n\
          pipe_reader_sleeps {}\n\
          pipe_writer_sleeps {}\n",
         stats.scheduler_fetch_calls,
@@ -196,6 +204,8 @@ pub(crate) fn stats_content() -> String {
         stats.pipe_write_bytes,
         stats.pipe_read_byte_copy_bytes,
         stats.pipe_write_byte_copy_bytes,
+        stats.pipe_read_chunk_copy_bytes,
+        stats.pipe_write_chunk_copy_bytes,
         stats.pipe_reader_sleeps,
         stats.pipe_writer_sleeps,
     )

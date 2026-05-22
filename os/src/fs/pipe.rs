@@ -69,12 +69,9 @@ impl Pipe {
                     break;
                 }
                 let len = buffer.len().min(loop_read - copied);
-                for byte in &mut buffer[..len] {
-                    *byte = ring_buffer.read_byte();
-                }
-                copied += len;
+                copied += ring_buffer.read_into(&mut buffer[..len]);
             }
-            perf::record_pipe_read_copy(copied);
+            perf::record_pipe_read_chunk_copy(copied);
             let writer = ring_buffer.wake_writer();
             drop(ring_buffer);
             wake_task(writer);
@@ -121,19 +118,15 @@ impl Pipe {
                     continue;
                 }
                 let offset = already_write.saturating_sub(skipped);
-                for &byte in &buffer[offset..] {
-                    if written == write_len {
-                        break;
-                    }
-                    ring_buffer.write_byte(byte);
-                    written += 1;
-                }
+                let source = &buffer[offset..];
+                let len = source.len().min(write_len - written);
+                written += ring_buffer.write_from(&source[..len]);
                 if written == write_len {
                     break;
                 }
                 skipped += buffer.len();
             }
-            perf::record_pipe_write_copy(written);
+            perf::record_pipe_write_chunk_copy(written);
             already_write += written;
             let reader = ring_buffer.wake_reader();
             drop(ring_buffer);
@@ -190,22 +183,43 @@ impl PipeRingBuffer {
     pub fn set_write_end(&mut self, write_end: &Arc<Pipe>) {
         self.write_end = Some(Arc::downgrade(write_end));
     }
-    pub fn write_byte(&mut self, byte: u8) {
-        self.status = RingBufferStatus::Normal;
-        self.arr[self.tail] = byte;
-        self.tail = (self.tail + 1) % self.capacity();
-        if self.tail == self.head {
-            self.status = RingBufferStatus::Full;
+    fn write_from(&mut self, src: &[u8]) -> usize {
+        let len = src.len().min(self.available_write());
+        if len == 0 {
+            return 0;
         }
+        let first_len = len.min(self.capacity() - self.tail);
+        self.arr[self.tail..self.tail + first_len].copy_from_slice(&src[..first_len]);
+        let second_len = len - first_len;
+        if second_len > 0 {
+            self.arr[..second_len].copy_from_slice(&src[first_len..len]);
+        }
+        self.tail = (self.tail + len) % self.capacity();
+        self.status = if self.tail == self.head {
+            RingBufferStatus::Full
+        } else {
+            RingBufferStatus::Normal
+        };
+        len
     }
-    pub fn read_byte(&mut self) -> u8 {
-        self.status = RingBufferStatus::Normal;
-        let c = self.arr[self.head];
-        self.head = (self.head + 1) % self.capacity();
-        if self.head == self.tail {
-            self.status = RingBufferStatus::Empty;
+    fn read_into(&mut self, dst: &mut [u8]) -> usize {
+        let len = dst.len().min(self.available_read());
+        if len == 0 {
+            return 0;
         }
-        c
+        let first_len = len.min(self.capacity() - self.head);
+        dst[..first_len].copy_from_slice(&self.arr[self.head..self.head + first_len]);
+        let second_len = len - first_len;
+        if second_len > 0 {
+            dst[first_len..len].copy_from_slice(&self.arr[..second_len]);
+        }
+        self.head = (self.head + len) % self.capacity();
+        self.status = if self.head == self.tail {
+            RingBufferStatus::Empty
+        } else {
+            RingBufferStatus::Normal
+        };
+        len
     }
     pub fn available_read(&self) -> usize {
         if self.status == RingBufferStatus::Empty {
