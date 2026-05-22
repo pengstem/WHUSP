@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 
 pub const RLIM_INFINITY: usize = usize::MAX;
 const RLIMIT_COUNT: usize = RLimitResource::RtTime as usize + 1;
+const FD_BITMAP_WORD_BITS: usize = usize::BITS as usize;
 pub(crate) const PROCESS_PKEY_COUNT: usize = 16;
 pub(crate) type ProcessPKeyRights = [Option<usize>; PROCESS_PKEY_COUNT];
 type TimerRearm = Option<(usize, u64)>;
@@ -570,6 +571,8 @@ pub struct ProcessControlBlockInner {
     pub children: Vec<Arc<ProcessControlBlock>>,
     pub exit_code: i32,
     pub fd_table: Vec<Option<FdTableEntry>>,
+    pub(crate) fd_open_bits: Vec<usize>,
+    pub(crate) next_fd_hint: usize,
     pub umask: u32,
     pub(crate) comm: String,
     pub(crate) pdeath_signal: u32,
@@ -604,6 +607,40 @@ pub struct ProcessControlBlockInner {
     pub task_res_allocator: RecycleAllocator,
 }
 
+fn fd_bitmap_word_count(slot_count: usize) -> usize {
+    if slot_count == 0 {
+        0
+    } else {
+        (slot_count - 1) / FD_BITMAP_WORD_BITS + 1
+    }
+}
+
+fn fd_bit_position(fd: usize) -> (usize, usize) {
+    (
+        fd / FD_BITMAP_WORD_BITS,
+        1usize << (fd % FD_BITMAP_WORD_BITS),
+    )
+}
+
+pub(crate) fn fd_allocation_state_from_table(
+    fd_table: &[Option<FdTableEntry>],
+) -> (Vec<usize>, usize) {
+    let mut fd_open_bits = Vec::new();
+    fd_open_bits.resize(fd_bitmap_word_count(fd_table.len()), 0);
+    let mut next_fd_hint = fd_table.len();
+
+    for (fd, entry) in fd_table.iter().enumerate() {
+        if entry.is_some() {
+            let (word, bit) = fd_bit_position(fd);
+            fd_open_bits[word] |= bit;
+        } else if next_fd_hint == fd_table.len() {
+            next_fd_hint = fd;
+        }
+    }
+
+    (fd_open_bits, next_fd_hint)
+}
+
 impl ProcessControlBlockInner {
     #[allow(unused)]
     pub fn get_user_token(&self) -> usize {
@@ -628,26 +665,30 @@ impl ProcessControlBlockInner {
             perf::record_fd_alloc(0, 0, self.fd_table.len(), false);
             return None;
         }
+        let search_start = lower_bound.max(self.next_fd_hint);
         let search_end = self.fd_table.len().min(limit);
-        let mut probed_slots = 0usize;
-        for fd in lower_bound..search_end {
-            probed_slots += 1;
-            if self.fd_table[fd].is_none() {
-                perf::record_fd_alloc(probed_slots, 0, self.fd_table.len(), true);
-                return Some(fd);
-            }
+        let mut bitmap_word_probes = 0usize;
+        if let Some(fd) =
+            self.find_free_fd_in_bitmap(search_start, search_end, &mut bitmap_word_probes)
+        {
+            perf::record_fd_bitmap_word_probes(bitmap_word_probes);
+            perf::record_fd_alloc(0, 0, self.fd_table.len(), true);
+            return Some(fd);
         }
-        let fd = self.fd_table.len().max(lower_bound);
+        let fd = self.fd_table.len().max(search_start);
         if fd >= limit {
-            perf::record_fd_alloc(probed_slots, 0, self.fd_table.len(), false);
+            perf::record_fd_bitmap_word_probes(bitmap_word_probes);
+            perf::record_fd_alloc(0, 0, self.fd_table.len(), false);
             return None;
         }
         let old_len = self.fd_table.len();
         while self.fd_table.len() <= fd {
             self.fd_table.push(None);
         }
+        self.ensure_fd_bitmap_covers(fd);
         let expanded_slots = self.fd_table.len().saturating_sub(old_len);
-        perf::record_fd_alloc(probed_slots, expanded_slots, self.fd_table.len(), true);
+        perf::record_fd_bitmap_word_probes(bitmap_word_probes);
+        perf::record_fd_alloc(0, expanded_slots, self.fd_table.len(), true);
         Some(fd)
     }
 
@@ -665,6 +706,7 @@ impl ProcessControlBlockInner {
     pub fn take_fd_entry(&mut self, fd: usize) -> Option<FdTableEntry> {
         let entry = self.fd_table.get_mut(fd)?.take();
         if entry.is_some() {
+            self.clear_fd_open_bit(fd);
             perf::record_fd_take();
         }
         entry
@@ -680,8 +722,103 @@ impl ProcessControlBlockInner {
             self.fd_table.push(None);
         }
         let previous = self.fd_table[fd].replace(entry);
+        self.set_fd_open_bit(fd);
         perf::record_fd_install(self.fd_table.len());
         previous
+    }
+
+    pub(crate) fn close_on_exec_fd_entries(&mut self) {
+        for fd in 0..self.fd_table.len() {
+            let should_close = self.fd_table[fd]
+                .as_ref()
+                .map(|entry| entry.close_on_exec())
+                .unwrap_or(false);
+            if should_close {
+                self.fd_table[fd] = None;
+                self.clear_fd_open_bit(fd);
+            }
+        }
+    }
+
+    fn ensure_fd_bitmap_covers(&mut self, fd: usize) {
+        let word_count = fd_bitmap_word_count(fd + 1);
+        while self.fd_open_bits.len() < word_count {
+            self.fd_open_bits.push(0);
+        }
+    }
+
+    fn fd_open_bit_is_set(&self, fd: usize) -> bool {
+        let (word, bit) = fd_bit_position(fd);
+        self.fd_open_bits
+            .get(word)
+            .map(|bits| bits & bit != 0)
+            .unwrap_or(false)
+    }
+
+    fn set_fd_open_bit(&mut self, fd: usize) {
+        self.ensure_fd_bitmap_covers(fd);
+        let (word, bit) = fd_bit_position(fd);
+        self.fd_open_bits[word] |= bit;
+        if self.next_fd_hint == fd {
+            let mut next = fd + 1;
+            while next < self.fd_table.len() && self.fd_open_bit_is_set(next) {
+                next += 1;
+            }
+            self.next_fd_hint = next;
+        }
+    }
+
+    fn clear_fd_open_bit(&mut self, fd: usize) {
+        let (word, bit) = fd_bit_position(fd);
+        if let Some(bits) = self.fd_open_bits.get_mut(word) {
+            *bits &= !bit;
+        }
+        if fd < self.next_fd_hint {
+            self.next_fd_hint = fd;
+        }
+    }
+
+    fn find_free_fd_in_bitmap(
+        &self,
+        lower_bound: usize,
+        search_end: usize,
+        bitmap_word_probes: &mut usize,
+    ) -> Option<usize> {
+        if lower_bound >= search_end {
+            return None;
+        }
+
+        let mut word_index = lower_bound / FD_BITMAP_WORD_BITS;
+        while word_index * FD_BITMAP_WORD_BITS < search_end {
+            *bitmap_word_probes += 1;
+            let word_start = word_index * FD_BITMAP_WORD_BITS;
+            let word_end = (word_start + FD_BITMAP_WORD_BITS).min(search_end);
+            let used_bits = *self.fd_open_bits.get(word_index).unwrap_or(&0);
+            let before_lower_bound = lower_bound.saturating_sub(word_start);
+            let low_mask = if before_lower_bound == 0 {
+                0
+            } else {
+                (1usize << before_lower_bound) - 1
+            };
+            let valid_bits = word_end - word_start;
+            let high_mask = if valid_bits == FD_BITMAP_WORD_BITS {
+                0
+            } else {
+                !((1usize << valid_bits) - 1)
+            };
+            let unavailable = used_bits | low_mask | high_mask;
+
+            if unavailable != usize::MAX {
+                let fd = word_start + (!unavailable).trailing_zeros() as usize;
+                debug_assert!(fd >= lower_bound);
+                debug_assert!(fd < search_end);
+                debug_assert!(self.fd_table.get(fd).map_or(true, Option::is_none));
+                return Some(fd);
+            }
+            word_index += 1;
+        }
+
+        None
     }
 
     pub fn alloc_tid(&mut self) -> usize {

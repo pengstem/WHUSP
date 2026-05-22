@@ -317,15 +317,7 @@ impl ProcessControlBlock {
                     *action = SignalAction::default();
                 }
             }
-            for fd in inner.fd_table.iter_mut() {
-                if fd
-                    .as_ref()
-                    .map(|entry| entry.close_on_exec())
-                    .unwrap_or(false)
-                {
-                    *fd = None;
-                }
-            }
+            inner.close_on_exec_fd_entries();
             previous
         };
         if let Some(node) = previous_executable_node {

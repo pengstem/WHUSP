@@ -13,6 +13,7 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) fd_alloc_calls: usize,
     pub(crate) fd_alloc_failures: usize,
     pub(crate) fd_alloc_probe_slots: usize,
+    pub(crate) fd_alloc_bitmap_word_probes: usize,
     pub(crate) fd_alloc_expanded_slots: usize,
     pub(crate) fd_table_len_max: usize,
     pub(crate) fd_install_calls: usize,
@@ -39,6 +40,7 @@ static WAKEUP_BACK_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
 static FD_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FD_ALLOC_FAILURES: AtomicUsize = AtomicUsize::new(0);
 static FD_ALLOC_PROBE_SLOTS: AtomicUsize = AtomicUsize::new(0);
+static FD_ALLOC_BITMAP_WORD_PROBES: AtomicUsize = AtomicUsize::new(0);
 static FD_ALLOC_EXPANDED_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static FD_TABLE_LEN_MAX: AtomicUsize = AtomicUsize::new(0);
 static FD_INSTALL_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -96,6 +98,10 @@ pub(crate) fn record_fd_alloc(
     update_max(&FD_TABLE_LEN_MAX, table_len);
 }
 
+pub(crate) fn record_fd_bitmap_word_probes(words: usize) {
+    FD_ALLOC_BITMAP_WORD_PROBES.fetch_add(words, Ordering::Relaxed);
+}
+
 pub(crate) fn record_fd_install(table_len: usize) {
     FD_INSTALL_CALLS.fetch_add(1, Ordering::Relaxed);
     update_max(&FD_TABLE_LEN_MAX, table_len);
@@ -142,6 +148,7 @@ pub(crate) fn snapshot() -> KernelPerfSnapshot {
         fd_alloc_calls: FD_ALLOC_CALLS.load(Ordering::Relaxed),
         fd_alloc_failures: FD_ALLOC_FAILURES.load(Ordering::Relaxed),
         fd_alloc_probe_slots: FD_ALLOC_PROBE_SLOTS.load(Ordering::Relaxed),
+        fd_alloc_bitmap_word_probes: FD_ALLOC_BITMAP_WORD_PROBES.load(Ordering::Relaxed),
         fd_alloc_expanded_slots: FD_ALLOC_EXPANDED_SLOTS.load(Ordering::Relaxed),
         fd_table_len_max: FD_TABLE_LEN_MAX.load(Ordering::Relaxed),
         fd_install_calls: FD_INSTALL_CALLS.load(Ordering::Relaxed),
@@ -171,6 +178,7 @@ pub(crate) fn stats_content() -> String {
          fd_alloc_calls {}\n\
          fd_alloc_failures {}\n\
          fd_alloc_probe_slots {}\n\
+         fd_alloc_bitmap_word_probes {}\n\
          fd_alloc_expanded_slots {}\n\
          fd_table_len_max {}\n\
          fd_install_calls {}\n\
@@ -194,6 +202,7 @@ pub(crate) fn stats_content() -> String {
         stats.fd_alloc_calls,
         stats.fd_alloc_failures,
         stats.fd_alloc_probe_slots,
+        stats.fd_alloc_bitmap_word_probes,
         stats.fd_alloc_expanded_slots,
         stats.fd_table_len_max,
         stats.fd_install_calls,

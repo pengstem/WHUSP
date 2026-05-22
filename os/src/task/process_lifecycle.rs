@@ -4,6 +4,7 @@ use super::manager::insert_into_pid2process;
 use super::process::{
     Credentials, ProcessControlBlock, ProcessControlBlockInner, ProcessCpuTimes, ProcessFsContext,
     ProcessResourceLimits, ProcessTimers, comm_from_cmdline, empty_process_pkey_rights,
+    fd_allocation_state_from_table,
 };
 use super::{
     CloneArgs, CloneFlags, FdTableEntry, SIGCHLD, SignalAction, TaskControlBlock, add_task,
@@ -84,6 +85,21 @@ impl ProcessControlBlock {
         };
         let pid_handle = pid_alloc();
         let pid = pid_handle.0;
+        let fd_table = vec![
+            Some(FdTableEntry::from_file(
+                Arc::new(Stdin::new()),
+                OpenFlags::RDONLY,
+            )),
+            Some(FdTableEntry::from_file(
+                Arc::new(Stdout::new()),
+                OpenFlags::WRONLY,
+            )),
+            Some(FdTableEntry::from_file(
+                Arc::new(Stdout::new()),
+                OpenFlags::WRONLY,
+            )),
+        ];
+        let (fd_open_bits, next_fd_hint) = fd_allocation_state_from_table(&fd_table);
         let process = Arc::new(Self {
             pid: pid_handle,
             inner: unsafe {
@@ -99,20 +115,9 @@ impl ProcessControlBlock {
                     parent: None,
                     children: Vec::new(),
                     exit_code: 0,
-                    fd_table: vec![
-                        Some(FdTableEntry::from_file(
-                            Arc::new(Stdin::new()),
-                            OpenFlags::RDONLY,
-                        )),
-                        Some(FdTableEntry::from_file(
-                            Arc::new(Stdout::new()),
-                            OpenFlags::WRONLY,
-                        )),
-                        Some(FdTableEntry::from_file(
-                            Arc::new(Stdout::new()),
-                            OpenFlags::WRONLY,
-                        )),
-                    ],
+                    fd_table,
+                    fd_open_bits,
+                    next_fd_hint,
                     umask: 0,
                     comm: comm_from_cmdline(&args),
                     pdeath_signal: 0,
@@ -226,6 +231,7 @@ impl ProcessControlBlock {
         // each `FdTableEntry` keeps sharing the same open file description
         // through `Arc<dyn File>`, matching Linux offset/status-flag sharing.
         let new_fd_table = parent.fd_table.clone();
+        let (fd_open_bits, next_fd_hint) = fd_allocation_state_from_table(&new_fd_table);
         let umask = parent.umask;
         let credentials = parent.credentials.clone();
         let resource_limits = parent.resource_limits;
@@ -287,6 +293,8 @@ impl ProcessControlBlock {
                     children: Vec::new(),
                     exit_code: 0,
                     fd_table: new_fd_table,
+                    fd_open_bits,
+                    next_fd_hint,
                     umask,
                     comm,
                     pdeath_signal: 0,
