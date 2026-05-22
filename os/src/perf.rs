@@ -8,6 +8,7 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) scheduler_scanned_tasks: usize,
     pub(crate) scheduler_pruned_exited_tasks: usize,
     pub(crate) scheduler_ready_queue_len_max: usize,
+    pub(crate) scheduler_rt_priority_probes: usize,
     pub(crate) wakeup_front_successes: usize,
     pub(crate) wakeup_back_successes: usize,
     pub(crate) fd_alloc_calls: usize,
@@ -75,6 +76,7 @@ static SCHEDULER_FETCH_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER_SCANNED_TASKS: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER_PRUNED_EXITED_TASKS: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER_READY_QUEUE_LEN_MAX: AtomicUsize = AtomicUsize::new(0);
+static SCHEDULER_RT_PRIORITY_PROBES: AtomicUsize = AtomicUsize::new(0);
 static WAKEUP_FRONT_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
 static WAKEUP_BACK_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
 
@@ -160,6 +162,10 @@ pub(crate) fn record_scheduler_fetch(queue_len: usize, scanned: usize, pruned_ex
     SCHEDULER_SCANNED_TASKS.fetch_add(scanned, Ordering::Relaxed);
     SCHEDULER_PRUNED_EXITED_TASKS.fetch_add(pruned_exited, Ordering::Relaxed);
     update_max(&SCHEDULER_READY_QUEUE_LEN_MAX, queue_len);
+}
+
+pub(crate) fn record_scheduler_rt_priority_probes(probes: usize) {
+    SCHEDULER_RT_PRIORITY_PROBES.fetch_add(probes, Ordering::Relaxed);
 }
 
 pub(crate) fn record_task_wakeup(front: bool) {
@@ -342,6 +348,7 @@ pub(crate) fn snapshot() -> KernelPerfSnapshot {
         scheduler_scanned_tasks: SCHEDULER_SCANNED_TASKS.load(Ordering::Relaxed),
         scheduler_pruned_exited_tasks: SCHEDULER_PRUNED_EXITED_TASKS.load(Ordering::Relaxed),
         scheduler_ready_queue_len_max: SCHEDULER_READY_QUEUE_LEN_MAX.load(Ordering::Relaxed),
+        scheduler_rt_priority_probes: SCHEDULER_RT_PRIORITY_PROBES.load(Ordering::Relaxed),
         wakeup_front_successes: WAKEUP_FRONT_SUCCESSES.load(Ordering::Relaxed),
         wakeup_back_successes: WAKEUP_BACK_SUCCESSES.load(Ordering::Relaxed),
         fd_alloc_calls: FD_ALLOC_CALLS.load(Ordering::Relaxed),
@@ -415,6 +422,7 @@ pub(crate) fn stats_content() -> String {
          scheduler_scanned_tasks {}\n\
          scheduler_pruned_exited_tasks {}\n\
          scheduler_ready_queue_len_max {}\n\
+         scheduler_rt_priority_probes {}\n\
          wakeup_front_successes {}\n\
          wakeup_back_successes {}\n\
          fd_alloc_calls {}\n\
@@ -480,6 +488,7 @@ pub(crate) fn stats_content() -> String {
         stats.scheduler_scanned_tasks,
         stats.scheduler_pruned_exited_tasks,
         stats.scheduler_ready_queue_len_max,
+        stats.scheduler_rt_priority_probes,
         stats.wakeup_front_successes,
         stats.wakeup_back_successes,
         stats.fd_alloc_calls,

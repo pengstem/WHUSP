@@ -12,6 +12,7 @@ const RT_QUEUE_COUNT: usize = RT_PRIORITY_MAX + 1;
 pub struct TaskManager {
     normal_queue: VecDeque<Arc<TaskControlBlock>>,
     rt_queues: Vec<VecDeque<Arc<TaskControlBlock>>>,
+    rt_ready_bitmap: u128,
 }
 
 /// A FIFO scheduler with separate realtime priority buckets.
@@ -20,6 +21,7 @@ impl TaskManager {
         Self {
             normal_queue: VecDeque::new(),
             rt_queues: (0..RT_QUEUE_COUNT).map(|_| VecDeque::new()).collect(),
+            rt_ready_bitmap: 0,
         }
     }
 
@@ -29,6 +31,10 @@ impl TaskManager {
 
     fn ready_len(&self) -> usize {
         self.normal_queue.len() + self.rt_queues.iter().map(VecDeque::len).sum::<usize>()
+    }
+
+    fn rt_priority_bit(priority: usize) -> u128 {
+        1u128 << priority
     }
 
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
@@ -42,6 +48,7 @@ impl TaskManager {
     fn enqueue(&mut self, task: Arc<TaskControlBlock>, front: bool) {
         let rt_priority = Self::rt_priority(&task);
         let queue = if rt_priority > 0 {
+            self.rt_ready_bitmap |= Self::rt_priority_bit(rt_priority);
             &mut self.rt_queues[rt_priority]
         } else {
             &mut self.normal_queue
@@ -53,10 +60,18 @@ impl TaskManager {
         }
     }
 
+    fn clear_rt_priority_if_empty(&mut self, priority: usize) {
+        if priority > 0 && self.rt_queues[priority].is_empty() {
+            self.rt_ready_bitmap &= !Self::rt_priority_bit(priority);
+        }
+    }
+
     fn highest_rt_priority(&self) -> Option<usize> {
-        (1..=RT_PRIORITY_MAX)
-            .rev()
-            .find(|&priority| !self.rt_queues[priority].is_empty())
+        perf::record_scheduler_rt_priority_probes(1);
+        if self.rt_ready_bitmap == 0 {
+            return None;
+        }
+        Some((u128::BITS - 1 - self.rt_ready_bitmap.leading_zeros()) as usize)
     }
 
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
@@ -67,8 +82,10 @@ impl TaskManager {
         'select: loop {
             while let Some(priority) = self.highest_rt_priority() {
                 let Some(task) = self.rt_queues[priority].pop_front() else {
+                    self.clear_rt_priority_if_empty(priority);
                     continue;
                 };
+                self.clear_rt_priority_if_empty(priority);
                 if task.inner_exclusive_access().task_status == TaskStatus::Exited {
                     pruned_exited += 1;
                     continue;
@@ -114,15 +131,29 @@ impl TaskManager {
                     .is_none_or(|process| process.getpid() != process_id)
             });
         }
+        self.rebuild_rt_ready_bitmap();
+    }
+
+    fn rebuild_rt_ready_bitmap(&mut self) {
+        self.rt_ready_bitmap = 0;
+        for priority in 1..=RT_PRIORITY_MAX {
+            if !self.rt_queues[priority].is_empty() {
+                self.rt_ready_bitmap |= Self::rt_priority_bit(priority);
+            }
+        }
     }
 
     fn remove_ready_task(&mut self, task: &Arc<TaskControlBlock>) -> bool {
         if remove_task_from_queue(&mut self.normal_queue, task) {
             return true;
         }
-        self.rt_queues
-            .iter_mut()
-            .any(|queue| remove_task_from_queue(queue, task))
+        for priority in 1..=RT_PRIORITY_MAX {
+            if remove_task_from_queue(&mut self.rt_queues[priority], task) {
+                self.clear_rt_priority_if_empty(priority);
+                return true;
+            }
+        }
+        false
     }
 
     pub fn reprioritize_ready_task(&mut self, task: Arc<TaskControlBlock>) {
