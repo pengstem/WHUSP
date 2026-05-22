@@ -6,6 +6,7 @@ use crate::{
     },
     task::{
         TaskControlBlock, current_process, current_task, current_user_token, processes_snapshot,
+        reprioritize_ready_task,
     },
 };
 use alloc::{sync::Arc, vec, vec::Vec};
@@ -250,28 +251,34 @@ fn linux_policy_for_task(task: &TaskControlBlock) -> i32 {
 }
 
 fn apply_sched_policy(
-    task: &TaskControlBlock,
+    task: &Arc<TaskControlBlock>,
     base_policy: i32,
     priority: i32,
     reset_on_fork: bool,
 ) {
-    let mut inner = task.inner_exclusive_access();
-    inner.sched_policy = base_policy;
-    inner.sched_priority = priority;
-    inner.sched_reset_on_fork = reset_on_fork;
+    {
+        let mut inner = task.inner_exclusive_access();
+        inner.sched_policy = base_policy;
+        inner.sched_priority = priority;
+        inner.sched_reset_on_fork = reset_on_fork;
+    }
+    reprioritize_ready_task(Arc::clone(task));
 }
 
-fn apply_sched_attr(task: &TaskControlBlock, attr: LinuxSchedAttr) {
-    let mut inner = task.inner_exclusive_access();
-    inner.sched_policy = attr.sched_policy as i32;
-    inner.sched_priority = attr.sched_priority as i32;
-    inner.sched_reset_on_fork = attr.sched_flags & SCHED_FLAG_RESET_ON_FORK != 0;
-    inner.sched_deadline_runtime = attr.sched_runtime;
-    inner.sched_deadline_deadline = attr.sched_deadline;
-    inner.sched_deadline_period = attr.sched_period;
-    if matches!(inner.sched_policy, SCHED_OTHER | SCHED_BATCH) {
-        inner.nice = clamp_nice(attr.sched_nice);
+fn apply_sched_attr(task: &Arc<TaskControlBlock>, attr: LinuxSchedAttr) {
+    {
+        let mut inner = task.inner_exclusive_access();
+        inner.sched_policy = attr.sched_policy as i32;
+        inner.sched_priority = attr.sched_priority as i32;
+        inner.sched_reset_on_fork = attr.sched_flags & SCHED_FLAG_RESET_ON_FORK != 0;
+        inner.sched_deadline_runtime = attr.sched_runtime;
+        inner.sched_deadline_deadline = attr.sched_deadline;
+        inner.sched_deadline_period = attr.sched_period;
+        if matches!(inner.sched_policy, SCHED_OTHER | SCHED_BATCH) {
+            inner.nice = clamp_nice(attr.sched_nice);
+        }
     }
+    reprioritize_ready_task(Arc::clone(task));
 }
 
 fn sched_attr_for_task(task: &TaskControlBlock) -> LinuxSchedAttr {
@@ -360,6 +367,7 @@ pub fn sys_sched_setparam(pid: isize, param: usize) -> SysResult {
     // current contest scheduler uses this metadata only for coarse RT queue
     // selection, not for full Linux policy semantics.
     task.inner_exclusive_access().sched_priority = sched_param.sched_priority;
+    reprioritize_ready_task(task);
     Ok(0)
 }
 

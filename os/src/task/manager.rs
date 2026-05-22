@@ -6,59 +6,147 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use lazy_static::*;
 
+const RT_PRIORITY_MAX: usize = 99;
+const RT_QUEUE_COUNT: usize = RT_PRIORITY_MAX + 1;
+
 pub struct TaskManager {
-    ready_queue: VecDeque<Arc<TaskControlBlock>>,
+    normal_queue: VecDeque<Arc<TaskControlBlock>>,
+    rt_queues: Vec<VecDeque<Arc<TaskControlBlock>>>,
 }
 
-/// A simple FIFO scheduler.
+/// A FIFO scheduler with separate realtime priority buckets.
 impl TaskManager {
     pub fn new() -> Self {
         Self {
-            ready_queue: VecDeque::new(),
+            normal_queue: VecDeque::new(),
+            rt_queues: (0..RT_QUEUE_COUNT).map(|_| VecDeque::new()).collect(),
         }
     }
+
+    fn rt_priority(task: &TaskControlBlock) -> usize {
+        task.realtime_priority().clamp(0, RT_PRIORITY_MAX as i32) as usize
+    }
+
+    fn ready_len(&self) -> usize {
+        self.normal_queue.len() + self.rt_queues.iter().map(VecDeque::len).sum::<usize>()
+    }
+
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
-        self.ready_queue.push_back(task);
+        self.enqueue(task, false);
     }
+
     pub fn add_front(&mut self, task: Arc<TaskControlBlock>) {
-        self.ready_queue.push_front(task);
+        self.enqueue(task, true);
     }
+
+    fn enqueue(&mut self, task: Arc<TaskControlBlock>, front: bool) {
+        let rt_priority = Self::rt_priority(&task);
+        let queue = if rt_priority > 0 {
+            &mut self.rt_queues[rt_priority]
+        } else {
+            &mut self.normal_queue
+        };
+        if front {
+            queue.push_front(task);
+        } else {
+            queue.push_back(task);
+        }
+    }
+
+    fn highest_rt_priority(&self) -> Option<usize> {
+        (1..=RT_PRIORITY_MAX)
+            .rev()
+            .find(|&priority| !self.rt_queues[priority].is_empty())
+    }
+
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        let queue_len = self.ready_queue.len();
-        // CONTEXT: Linux-visible SCHED_FIFO/RR metadata is enough for
-        // cyclictest only if awakened RT tasks can run ahead of normal load.
-        // UNFINISHED: This is not a full Linux RT scheduler; equal-priority RT
-        // tasks and all normal tasks still keep this queue's FIFO order.
-        let mut best_idx = None;
-        let mut best_rt_priority = 0;
-        let mut idx = 0;
+        let queue_len = self.ready_len();
         let mut scanned = 0;
         let mut pruned_exited = 0;
-        while idx < self.ready_queue.len() {
-            let task = &self.ready_queue[idx];
-            if task.inner_exclusive_access().task_status == TaskStatus::Exited {
-                self.ready_queue.remove(idx);
-                pruned_exited += 1;
-                continue;
+
+        'select: loop {
+            while let Some(priority) = self.highest_rt_priority() {
+                let Some(task) = self.rt_queues[priority].pop_front() else {
+                    continue;
+                };
+                if task.inner_exclusive_access().task_status == TaskStatus::Exited {
+                    pruned_exited += 1;
+                    continue;
+                }
+                scanned += 1;
+                let current_priority = Self::rt_priority(&task);
+                if current_priority == priority {
+                    perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
+                    return Some(task);
+                }
+                self.enqueue(task, false);
             }
-            scanned += 1;
-            let rt_priority = task.realtime_priority();
-            if best_idx.is_none() || rt_priority > best_rt_priority {
-                best_idx = Some(idx);
-                best_rt_priority = rt_priority;
+
+            while let Some(task) = self.normal_queue.pop_front() {
+                if task.inner_exclusive_access().task_status == TaskStatus::Exited {
+                    pruned_exited += 1;
+                    continue;
+                }
+                scanned += 1;
+                if Self::rt_priority(&task) > 0 {
+                    self.enqueue(task, false);
+                    continue 'select;
+                }
+                perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
+                return Some(task);
             }
-            idx += 1;
+
+            perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
+            return None;
         }
-        perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
-        best_idx.and_then(|idx| self.ready_queue.remove(idx))
     }
+
     pub fn remove_process_tasks(&mut self, process_id: usize) {
-        self.ready_queue.retain(|task| {
+        self.normal_queue.retain(|task| {
             task.process
                 .upgrade()
                 .is_none_or(|process| process.getpid() != process_id)
         });
+        for queue in &mut self.rt_queues {
+            queue.retain(|task| {
+                task.process
+                    .upgrade()
+                    .is_none_or(|process| process.getpid() != process_id)
+            });
+        }
     }
+
+    fn remove_ready_task(&mut self, task: &Arc<TaskControlBlock>) -> bool {
+        if remove_task_from_queue(&mut self.normal_queue, task) {
+            return true;
+        }
+        self.rt_queues
+            .iter_mut()
+            .any(|queue| remove_task_from_queue(queue, task))
+    }
+
+    pub fn reprioritize_ready_task(&mut self, task: Arc<TaskControlBlock>) {
+        if task.inner_exclusive_access().task_status != TaskStatus::Ready {
+            return;
+        }
+        if self.remove_ready_task(&task) {
+            self.enqueue(task, false);
+        }
+    }
+}
+
+fn remove_task_from_queue(
+    queue: &mut VecDeque<Arc<TaskControlBlock>>,
+    task: &Arc<TaskControlBlock>,
+) -> bool {
+    let Some(index) = queue
+        .iter()
+        .position(|candidate| Arc::ptr_eq(candidate, task))
+    else {
+        return false;
+    };
+    queue.remove(index);
+    true
 }
 
 lazy_static! {
@@ -112,6 +200,12 @@ pub(crate) fn remove_ready_tasks_of_process(process_id: usize) {
     TASK_MANAGER
         .exclusive_access()
         .remove_process_tasks(process_id);
+}
+
+pub(crate) fn reprioritize_ready_task(task: Arc<TaskControlBlock>) {
+    TASK_MANAGER
+        .exclusive_access()
+        .reprioritize_ready_task(task);
 }
 
 pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
