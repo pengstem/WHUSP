@@ -165,6 +165,34 @@ fn ensure_can_set_task_nice(task: &TaskControlBlock, new_nice: i8) -> SysResult<
     Ok(())
 }
 
+fn current_has_scheduler_privilege() -> bool {
+    current_process().credentials().is_root()
+}
+
+fn current_euid_matches_task(task: &TaskControlBlock) -> SysResult<bool> {
+    let caller = current_process().credentials();
+    let target_process = task.process.upgrade().ok_or(SysError::ESRCH)?;
+    let target = target_process.credentials();
+    Ok(caller.euid == target.ruid || caller.euid == target.euid)
+}
+
+fn policy_change_requires_privilege(policy: i32) -> bool {
+    matches!(policy, SCHED_FIFO | SCHED_RR | SCHED_DEADLINE)
+}
+
+fn ensure_can_change_task_sched(
+    task: &TaskControlBlock,
+    requires_privilege: bool,
+) -> SysResult<()> {
+    if current_has_scheduler_privilege() {
+        return Ok(());
+    }
+    if requires_privilege || !current_euid_matches_task(task)? {
+        return Err(SysError::EPERM);
+    }
+    Ok(())
+}
+
 fn split_settable_policy(policy: i32) -> SysResult<(i32, bool)> {
     let reset_on_fork = policy & SCHED_RESET_ON_FORK != 0;
     let base_policy = policy & !SCHED_RESET_ON_FORK;
@@ -302,12 +330,13 @@ pub fn sys_sched_setaffinity(pid: isize, cpusetsize: usize, mask: usize) -> SysR
     if cpusetsize < AFFINITY_MASK_BYTES {
         return Err(SysError::EINVAL);
     }
-    let _task = sched_target_task(pid)?;
+    let task = sched_target_task(pid)?;
     let affinity_mask =
         read_user_value_with_mmap_fault(current_user_token(), mask as *const usize)?;
     if affinity_mask & 1 == 0 {
         return Err(SysError::EINVAL);
     }
+    ensure_can_change_task_sched(&task, false)?;
     // CONTEXT: The current contest runtime has only CPU 0 available to user
     // space. Accept masks that include CPU 0 for ABI compatibility, but do
     // not perform migration or persist a broader cpuset model yet.
@@ -321,12 +350,16 @@ pub fn sys_sched_setparam(pid: isize, param: usize) -> SysResult {
     let sched_param =
         read_user_value_with_mmap_fault(current_user_token(), param as *const LinuxSchedParam)?;
     let task = sched_target_task(pid)?;
-    let mut inner = task.inner_exclusive_access();
-    validate_priority_for_policy(inner.sched_policy, sched_param.sched_priority)?;
+    let requires_privilege = {
+        let inner = task.inner_exclusive_access();
+        validate_priority_for_policy(inner.sched_policy, sched_param.sched_priority)?;
+        policy_change_requires_privilege(inner.sched_policy)
+    };
+    ensure_can_change_task_sched(&task, requires_privilege)?;
     // CONTEXT: This updates Linux ABI-visible static priority metadata. The
     // current contest scheduler uses this metadata only for coarse RT queue
     // selection, not for full Linux policy semantics.
-    inner.sched_priority = sched_param.sched_priority;
+    task.inner_exclusive_access().sched_priority = sched_param.sched_priority;
     Ok(0)
 }
 
@@ -339,6 +372,7 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: usize) -> SysResul
         read_user_value_with_mmap_fault(current_user_token(), param as *const LinuxSchedParam)?;
     validate_priority_for_policy(base_policy, sched_param.sched_priority)?;
     let task = sched_target_task(pid)?;
+    ensure_can_change_task_sched(&task, policy_change_requires_privilege(base_policy))?;
 
     // CONTEXT: cyclictest only needs Linux ABI-visible scheduling attributes
     // plus coarse RT priority over normal hackbench load. When the current
@@ -348,9 +382,8 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: usize) -> SysResul
     // UNFINISHED: Linux sched_setscheduler(2) is per-thread for pid 0; this
     // compatibility promotion should become unnecessary once the scheduler has
     // a real RT run queue and better synchronization wakeup semantics.
-    // UNFINISHED: Linux permission checks use CAP_SYS_NICE, rlimits, and
-    // per-thread credentials; this compatibility layer currently allows the
-    // root-like contest workload to set RT policies.
+    // UNFINISHED: Linux also considers CAP_SYS_NICE and rlimits. This kernel
+    // currently models scheduler privilege with root euid only.
     if pid == 0 && matches!(base_policy, SCHED_FIFO | SCHED_RR) {
         for task in current_process().tasks_snapshot() {
             apply_sched_policy(
@@ -387,6 +420,10 @@ pub fn sys_sched_setattr(pid: isize, attr: usize, flags: u32) -> SysResult {
         read_user_value_with_mmap_fault(current_user_token(), attr as *const LinuxSchedAttr)?;
     validate_sched_attr(sched_attr)?;
     let task = sched_target_task(pid)?;
+    ensure_can_change_task_sched(
+        &task,
+        policy_change_requires_privilege(sched_attr.sched_policy as i32),
+    )?;
     // CONTEXT: SCHED_DEADLINE admission control and bandwidth enforcement are
     // not modeled by this contest scheduler yet. The Linux-visible attributes
     // are stored so LTP and libc callers can observe the requested policy.
