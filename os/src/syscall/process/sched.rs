@@ -34,6 +34,23 @@ struct LinuxSchedParam {
     sched_priority: i32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxSchedAttr {
+    size: u32,
+    sched_policy: u32,
+    sched_flags: u64,
+    sched_nice: i32,
+    sched_priority: u32,
+    sched_runtime: u64,
+    sched_deadline: u64,
+    sched_period: u64,
+}
+
+const LINUX_SCHED_ATTR_SIZE: u32 = size_of::<LinuxSchedAttr>() as u32;
+const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
+const SCHED_ATTR_SUPPORTED_FLAGS: u64 = SCHED_FLAG_RESET_ON_FORK;
+
 fn task_with_linux_tid(tid: usize) -> Option<Arc<TaskControlBlock>> {
     for process in processes_snapshot() {
         if let Some(task) = process
@@ -168,6 +185,33 @@ fn validate_priority_for_policy(policy: i32, priority: i32) -> SysResult<()> {
     Ok(())
 }
 
+fn validate_deadline_params(attr: LinuxSchedAttr) -> SysResult<()> {
+    if attr.sched_runtime == 0
+        || attr.sched_deadline == 0
+        || attr.sched_period == 0
+        || attr.sched_runtime > attr.sched_deadline
+        || attr.sched_deadline > attr.sched_period
+    {
+        return Err(SysError::EINVAL);
+    }
+    Ok(())
+}
+
+fn validate_sched_attr(attr: LinuxSchedAttr) -> SysResult<()> {
+    if attr.size < LINUX_SCHED_ATTR_SIZE {
+        return Err(SysError::EINVAL);
+    }
+    if attr.sched_flags & !SCHED_ATTR_SUPPORTED_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+    let policy = attr.sched_policy as i32;
+    validate_priority_for_policy(policy, attr.sched_priority as i32)?;
+    if policy == SCHED_DEADLINE {
+        validate_deadline_params(attr)?;
+    }
+    Ok(())
+}
+
 fn linux_policy_for_task(task: &TaskControlBlock) -> i32 {
     let inner = task.inner_exclusive_access();
     let mut policy = inner.sched_policy;
@@ -187,6 +231,37 @@ fn apply_sched_policy(
     inner.sched_policy = base_policy;
     inner.sched_priority = priority;
     inner.sched_reset_on_fork = reset_on_fork;
+}
+
+fn apply_sched_attr(task: &TaskControlBlock, attr: LinuxSchedAttr) {
+    let mut inner = task.inner_exclusive_access();
+    inner.sched_policy = attr.sched_policy as i32;
+    inner.sched_priority = attr.sched_priority as i32;
+    inner.sched_reset_on_fork = attr.sched_flags & SCHED_FLAG_RESET_ON_FORK != 0;
+    inner.sched_deadline_runtime = attr.sched_runtime;
+    inner.sched_deadline_deadline = attr.sched_deadline;
+    inner.sched_deadline_period = attr.sched_period;
+    if matches!(inner.sched_policy, SCHED_OTHER | SCHED_BATCH) {
+        inner.nice = clamp_nice(attr.sched_nice);
+    }
+}
+
+fn sched_attr_for_task(task: &TaskControlBlock) -> LinuxSchedAttr {
+    let inner = task.inner_exclusive_access();
+    LinuxSchedAttr {
+        size: LINUX_SCHED_ATTR_SIZE,
+        sched_policy: inner.sched_policy as u32,
+        sched_flags: if inner.sched_reset_on_fork {
+            SCHED_FLAG_RESET_ON_FORK
+        } else {
+            0
+        },
+        sched_nice: inner.nice as i32,
+        sched_priority: inner.sched_priority as u32,
+        sched_runtime: inner.sched_deadline_runtime,
+        sched_deadline: inner.sched_deadline_deadline,
+        sched_period: inner.sched_deadline_period,
+    }
 }
 
 pub fn sys_sched_getscheduler(pid: isize) -> SysResult {
@@ -302,6 +377,35 @@ pub fn sys_sched_get_priority_max(policy: i32) -> SysResult {
 
 pub fn sys_sched_get_priority_min(policy: i32) -> SysResult {
     Ok(sched_priority_bounds(policy)?.0)
+}
+
+pub fn sys_sched_setattr(pid: isize, attr: usize, flags: u32) -> SysResult {
+    if pid < 0 || attr == 0 || flags != 0 {
+        return Err(SysError::EINVAL);
+    }
+    let sched_attr =
+        read_user_value_with_mmap_fault(current_user_token(), attr as *const LinuxSchedAttr)?;
+    validate_sched_attr(sched_attr)?;
+    let task = sched_target_task(pid)?;
+    // CONTEXT: SCHED_DEADLINE admission control and bandwidth enforcement are
+    // not modeled by this contest scheduler yet. The Linux-visible attributes
+    // are stored so LTP and libc callers can observe the requested policy.
+    apply_sched_attr(&task, sched_attr);
+    Ok(0)
+}
+
+pub fn sys_sched_getattr(pid: isize, attr: usize, size: usize, flags: u32) -> SysResult {
+    if pid < 0 || attr == 0 || flags != 0 || size < LINUX_SCHED_ATTR_SIZE as usize {
+        return Err(SysError::EINVAL);
+    }
+    let task = sched_target_task(pid)?;
+    let sched_attr = sched_attr_for_task(&task);
+    write_user_value_with_mmap_fault(
+        current_user_token(),
+        attr as *mut LinuxSchedAttr,
+        &sched_attr,
+    )?;
+    Ok(0)
 }
 
 pub fn sys_sched_rr_get_interval(pid: isize, interval: *mut LinuxTimeSpec) -> SysResult {

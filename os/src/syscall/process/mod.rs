@@ -28,7 +28,8 @@ pub use ptrace::sys_ptrace;
 pub use resource::{sys_getrlimit, sys_prlimit64, sys_setrlimit};
 pub use sched::{
     sys_getpriority, sys_sched_get_priority_max, sys_sched_get_priority_min, sys_sched_getaffinity,
-    sys_sched_getparam, sys_sched_getscheduler, sys_sched_rr_get_interval, sys_sched_setaffinity,
-    sys_sched_setparam, sys_sched_setscheduler, sys_setpriority,
+    sys_sched_getattr, sys_sched_getparam, sys_sched_getscheduler, sys_sched_rr_get_interval,
+    sys_sched_setaffinity, sys_sched_setattr, sys_sched_setparam, sys_sched_setscheduler,
+    sys_setpriority,
 };
 pub use system::{LinuxUtsName, sys_getrandom, sys_personality, sys_reboot, sys_syslog, sys_uname};

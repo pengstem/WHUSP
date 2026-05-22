@@ -191,6 +191,8 @@ const SYSCALL_OPEN_BY_HANDLE_AT: usize = 265;
 const SYSCALL_CLOCK_ADJTIME: usize = 266;
 const SYSCALL_SYNCFS: usize = 267;
 const SYSCALL_SETNS: usize = 268;
+const SYSCALL_SCHED_SETATTR: usize = 274;
+const SYSCALL_SCHED_GETATTR: usize = 275;
 const SYSCALL_RENAMEAT2: usize = 276;
 const SYSCALL_GETRANDOM: usize = 278;
 const SYSCALL_MEMFD_CREATE: usize = 279;
@@ -685,6 +687,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SCHED_GET_PRIORITY_MIN => sys_sched_get_priority_min(args[0] as i32),
         SYSCALL_SCHED_RR_GET_INTERVAL => {
             sys_sched_rr_get_interval(args[0] as isize, args[1] as *mut LinuxTimeSpec)
+        }
+        SYSCALL_SCHED_SETATTR => sys_sched_setattr(args[0] as isize, args[1], args[2] as u32),
+        SYSCALL_SCHED_GETATTR => {
+            sys_sched_getattr(args[0] as isize, args[1], args[2], args[3] as u32)
         }
         SYSCALL_KILL => sys_kill(args[0] as isize, args[1] as u32),
         SYSCALL_TKILL => sys_tkill(args[0] as isize, args[1] as u32),

@@ -261,6 +261,9 @@ impl ProcessControlBlock {
         let parent_sched_policy = parent_task_inner.sched_policy;
         let parent_sched_priority = parent_task_inner.sched_priority;
         let parent_sched_reset_on_fork = parent_task_inner.sched_reset_on_fork;
+        let parent_sched_deadline_runtime = parent_task_inner.sched_deadline_runtime;
+        let parent_sched_deadline_deadline = parent_task_inner.sched_deadline_deadline;
+        let parent_sched_deadline_period = parent_task_inner.sched_deadline_period;
         let parent_nice = parent_task_inner.nice;
         let parent_timer_slack_ns = parent_task_inner.timer_slack_ns;
         let parent_seccomp_mode = parent_task_inner.seccomp_mode;
@@ -337,11 +340,17 @@ impl ProcessControlBlock {
             task_inner.sched_policy = 0;
             task_inner.sched_priority = 0;
             task_inner.sched_reset_on_fork = false;
+            task_inner.sched_deadline_runtime = 0;
+            task_inner.sched_deadline_deadline = 0;
+            task_inner.sched_deadline_period = 0;
             task_inner.nice = parent_nice.max(0);
         } else {
             task_inner.sched_policy = parent_sched_policy;
             task_inner.sched_priority = parent_sched_priority;
             task_inner.sched_reset_on_fork = false;
+            task_inner.sched_deadline_runtime = parent_sched_deadline_runtime;
+            task_inner.sched_deadline_deadline = parent_sched_deadline_deadline;
+            task_inner.sched_deadline_period = parent_sched_deadline_period;
             task_inner.nice = parent_nice;
         }
         drop(task_inner);
