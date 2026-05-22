@@ -25,6 +25,8 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) epoll_full_scans: usize,
     pub(crate) epoll_scan_interest_visits: usize,
     pub(crate) epoll_ready_events: usize,
+    pub(crate) epoll_backoff_sleeps: usize,
+    pub(crate) epoll_backoff_us: usize,
     pub(crate) pipe_read_calls: usize,
     pub(crate) pipe_write_calls: usize,
     pub(crate) pipe_read_bytes: usize,
@@ -60,6 +62,8 @@ static EPOLL_INTEREST_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
 static EPOLL_FULL_SCANS: AtomicUsize = AtomicUsize::new(0);
 static EPOLL_SCAN_INTEREST_VISITS: AtomicUsize = AtomicUsize::new(0);
 static EPOLL_READY_EVENTS: AtomicUsize = AtomicUsize::new(0);
+static EPOLL_BACKOFF_SLEEPS: AtomicUsize = AtomicUsize::new(0);
+static EPOLL_BACKOFF_US: AtomicUsize = AtomicUsize::new(0);
 
 static PIPE_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
 static PIPE_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -139,6 +143,11 @@ pub(crate) fn record_epoll_scan(interest_visits: usize, ready_events: usize) {
     EPOLL_READY_EVENTS.fetch_add(ready_events, Ordering::Relaxed);
 }
 
+pub(crate) fn record_epoll_backoff_sleep(duration_us: usize) {
+    EPOLL_BACKOFF_SLEEPS.fetch_add(1, Ordering::Relaxed);
+    EPOLL_BACKOFF_US.fetch_add(duration_us, Ordering::Relaxed);
+}
+
 pub(crate) fn record_pipe_read_call() {
     PIPE_READ_CALLS.fetch_add(1, Ordering::Relaxed);
 }
@@ -188,6 +197,8 @@ pub(crate) fn snapshot() -> KernelPerfSnapshot {
         epoll_full_scans: EPOLL_FULL_SCANS.load(Ordering::Relaxed),
         epoll_scan_interest_visits: EPOLL_SCAN_INTEREST_VISITS.load(Ordering::Relaxed),
         epoll_ready_events: EPOLL_READY_EVENTS.load(Ordering::Relaxed),
+        epoll_backoff_sleeps: EPOLL_BACKOFF_SLEEPS.load(Ordering::Relaxed),
+        epoll_backoff_us: EPOLL_BACKOFF_US.load(Ordering::Relaxed),
         pipe_read_calls: PIPE_READ_CALLS.load(Ordering::Relaxed),
         pipe_write_calls: PIPE_WRITE_CALLS.load(Ordering::Relaxed),
         pipe_read_bytes: PIPE_READ_BYTES.load(Ordering::Relaxed),
@@ -225,6 +236,8 @@ pub(crate) fn stats_content() -> String {
          epoll_full_scans {}\n\
          epoll_scan_interest_visits {}\n\
          epoll_ready_events {}\n\
+         epoll_backoff_sleeps {}\n\
+         epoll_backoff_us {}\n\
          pipe_read_calls {}\n\
          pipe_write_calls {}\n\
          pipe_read_bytes {}\n\
@@ -256,6 +269,8 @@ pub(crate) fn stats_content() -> String {
         stats.epoll_full_scans,
         stats.epoll_scan_interest_visits,
         stats.epoll_ready_events,
+        stats.epoll_backoff_sleeps,
+        stats.epoll_backoff_us,
         stats.pipe_read_calls,
         stats.pipe_write_calls,
         stats.pipe_read_bytes,

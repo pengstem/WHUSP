@@ -3,10 +3,10 @@ use crate::mm::UserBuffer;
 use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
-    SignalFlags, current_has_interrupting_signal, current_task, current_user_token,
-    linux_sigset_to_flags, suspend_current_and_run_next,
+    SignalFlags, block_current_task_no_schedule, current_has_interrupting_signal, current_task,
+    current_user_token, linux_sigset_to_flags, schedule,
 };
-use crate::timer::get_time_us;
+use crate::timer::{add_timer, get_time_us};
 use alloc::collections::{BTreeMap, btree_map::Entry};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -37,6 +37,7 @@ const EPOLL_CLOEXEC: u32 = OpenFlags::CLOEXEC.bits();
 const EPOLL_EVENT_SIZE: usize = 16;
 const EPOLL_EVENT_DATA_OFFSET: usize = 8;
 const EPOLL_MAX_NEST_DEPTH: usize = 5;
+const EPOLL_POLL_BACKOFF_US: usize = 1_000;
 const LINUX_RT_SIGSET_SIZE: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -463,6 +464,27 @@ fn deadline_from_timeout_timespec(
     deadline_from_timeout_us(nanos_to_us_ceil(timespec_to_nanos(timeout)?)?)
 }
 
+fn sleep_until_next_epoll_probe(deadline_us: Option<usize>) -> SysResult {
+    let now_us = get_time_us();
+    if deadline_us.is_some_and(|deadline_us| now_us >= deadline_us) {
+        return Ok(0);
+    }
+    if current_has_interrupting_signal() {
+        return Err(SysError::EINTR);
+    }
+
+    let target_us = now_us.saturating_add(EPOLL_POLL_BACKOFF_US);
+    let target_us = deadline_us.map_or(target_us, |deadline_us| deadline_us.min(target_us));
+    let sleep_us = target_us.saturating_sub(now_us);
+    let expire_ms = target_us.div_ceil(1_000);
+    current_task().ok_or(SysError::ESRCH)?;
+    let (task, task_cx_ptr) = block_current_task_no_schedule();
+    add_timer(expire_ms, task);
+    perf::record_epoll_backoff_sleep(sleep_us);
+    schedule(task_cx_ptr);
+    Ok(0)
+}
+
 fn sys_epoll_wait_until(
     epfd_raw: usize,
     events: *mut u8,
@@ -501,7 +523,7 @@ fn sys_epoll_wait_until(
         if current_has_interrupting_signal() {
             return Err(SysError::EINTR);
         }
-        suspend_current_and_run_next();
+        sleep_until_next_epoll_probe(deadline_us)?;
     }
 }
 
