@@ -9,7 +9,7 @@ use super::{VirtPageNum, frame_alloc, frame_ref_count};
 use crate::arch::mm as arch_mm;
 use crate::config::{PAGE_SIZE, USER_MMAP_BASE, USER_MMAP_LIMIT};
 use crate::fs::File;
-use crate::mm::page_cache::{PAGE_CACHE, PageCacheId, PageCacheKey};
+use crate::mm::page_cache::{PAGE_CACHE, PAGE_CACHE_SOFT_MAX_PAGES, PageCacheId, PageCacheKey};
 use crate::perf;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -97,6 +97,7 @@ pub struct MmapPageCacheFault {
     read_len: usize,
     file_size_at_load: usize,
     backing_file: Arc<dyn File + Send + Sync>,
+    exec_fault: bool,
 }
 
 impl MmapPageCacheFault {
@@ -113,18 +114,38 @@ impl MmapPageCacheFault {
             let mut cache = PAGE_CACHE.exclusive_access();
             cache.get_and_inc_ref(self.key)
         } {
+            if self.exec_fault {
+                super::elf_loader::record_exec_lazy_page_cache_fault(true, 0);
+            }
             return Some(ppn);
         }
 
         let frame = frame_alloc()?;
+        let mut read_len = 0usize;
         if self.read_len > 0 {
             let dst = &mut frame.ppn.get_bytes_array()[..self.read_len];
-            self.backing_file.read_at(self.file_offset, dst);
+            read_len = self.backing_file.read_at(self.file_offset, dst);
         }
 
         let mut cache = PAGE_CACHE.exclusive_access();
-        Some(cache.insert_loaded_page_and_inc_ref(self.key, frame, self.file_size_at_load))
+        let ppn = cache.insert_loaded_page_and_inc_ref(self.key, frame, self.file_size_at_load);
+        if self.exec_fault {
+            super::elf_loader::record_exec_lazy_page_cache_fault(false, read_len);
+        }
+        Some(ppn)
     }
+}
+
+fn exec_fault_can_use_page_cache(info: &MmapInfo, fault: &ExecSegmentFault) -> bool {
+    !info.writable
+        && fault.dst_offset == 0
+        && fault.read_len == PAGE_SIZE
+        && fault.zero_fill_len == 0
+}
+
+fn page_cache_has_page_or_capacity(key: PageCacheKey) -> bool {
+    let cache = PAGE_CACHE.exclusive_access();
+    cache.contains(key) || cache.len() < PAGE_CACHE_SOFT_MAX_PAGES
 }
 
 fn area_is_private_user_writable(area: &MapArea) -> bool {
@@ -623,6 +644,7 @@ impl MemorySet {
         backing_file: Arc<dyn File + Send + Sync>,
         backing_file_size: usize,
         map_file_offset: usize,
+        page_cache_id: Option<PageCacheId>,
         exec_segment: ExecSegmentInfo,
     ) -> Option<usize> {
         if start % PAGE_SIZE != 0 || len == 0 {
@@ -644,7 +666,7 @@ impl MemorySet {
             file_offset: map_file_offset,
             file_size: backing_file_size,
             backing_file: Some(backing_file),
-            page_cache_id: None,
+            page_cache_id,
             page_cache_pages: BTreeMap::new(),
             exec_segment: Some(exec_segment),
         });
@@ -785,6 +807,22 @@ impl MemorySet {
         let area_offset = (vpn.0 - area.vpn_range.get_start().0) * PAGE_SIZE;
         if let Some(exec_segment) = &info.exec_segment {
             let fault = exec_segment_fault(exec_segment, area_offset)?;
+            if let (Some(page_cache_id), Some(backing_file)) =
+                (info.page_cache_id, &info.backing_file)
+                && exec_fault_can_use_page_cache(info, &fault)
+                && let Some(key) = PageCacheKey::from_file_offset(page_cache_id, fault.file_offset)
+                && page_cache_has_page_or_capacity(key)
+            {
+                return Some(MmapFaultResult::PageCache(MmapPageCacheFault {
+                    vpn,
+                    key,
+                    file_offset: fault.file_offset,
+                    read_len: fault.read_len,
+                    file_size_at_load: info.file_size,
+                    backing_file: backing_file.clone(),
+                    exec_fault: true,
+                }));
+            }
             return Some(MmapFaultResult::Page(MmapFaultPage {
                 vpn,
                 file_offset: fault.file_offset,
@@ -817,6 +855,7 @@ impl MemorySet {
                 read_len,
                 file_size_at_load: info.file_size,
                 backing_file: backing_file.clone(),
+                exec_fault: false,
             }));
         }
         Some(MmapFaultResult::Page(MmapFaultPage {

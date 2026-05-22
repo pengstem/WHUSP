@@ -211,6 +211,55 @@ impl MapArea {
         Some(right)
     }
 
+    fn materialize_page_cache_pages(
+        &mut self,
+        page_table: &mut PageTable,
+        pte_flags: PTEFlags,
+        keep_clean_cache_pages: bool,
+    ) -> bool {
+        let pages: Vec<_> = self
+            .mmap_info
+            .as_ref()
+            .map(|info| {
+                info.page_cache_pages
+                    .iter()
+                    .map(|(vpn, key)| (*vpn, *key))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for (vpn, key) in pages {
+            if self.data_frames.contains_key(&vpn) {
+                continue;
+            }
+            let Some(pte) = page_table.translate(vpn) else {
+                continue;
+            };
+            let Some(frame) = frame_alloc() else {
+                return false;
+            };
+            frame
+                .ppn
+                .get_bytes_array()
+                .copy_from_slice(pte.ppn().get_bytes_array());
+            if !page_table.replace_leaf(vpn, frame.ppn, pte_flags) {
+                return false;
+            }
+            self.data_frames.insert(vpn, frame);
+            if let Some(info) = self.mmap_info.as_mut() {
+                info.page_cache_pages.remove(&vpn);
+            }
+            let mut cache = PAGE_CACHE.exclusive_access();
+            if keep_clean_cache_pages {
+                cache.dec_ref(key);
+            } else {
+                let _ = cache.dec_ref_and_take_if_unused(key);
+            }
+        }
+
+        true
+    }
+
     pub(super) fn remap_permission(
         &mut self,
         page_table: &mut PageTable,
@@ -219,6 +268,17 @@ impl MapArea {
     ) -> bool {
         let pte_flags = PTEFlags::from_bits_truncate(permission.bits() as usize);
         if self.is_mmap() {
+            let materialize_exec_cache_for_write = self.mmap_info.as_ref().is_some_and(|info| {
+                info.exec_segment.is_some()
+                    && !info.shared
+                    && permission.contains(MapPermission::W)
+                    && !info.page_cache_pages.is_empty()
+            });
+            if materialize_exec_cache_for_write
+                && !self.materialize_page_cache_pages(page_table, pte_flags, true)
+            {
+                return false;
+            }
             for vpn in self.data_frames.keys().copied() {
                 let flags = remap_flags_preserving_cow(page_table, vpn, pte_flags);
                 if !page_table.remap_flags(vpn, flags) {
@@ -409,6 +469,7 @@ impl MapArea {
         self.data_frames.clear();
 
         if let Some(info) = self.mmap_info.as_mut() {
+            let keep_clean_cache_pages = info.exec_segment.is_some() && !info.writable;
             let cache_vpns: Vec<_> = info.page_cache_pages.keys().copied().collect();
             let cache_keys: Vec<_> = info.page_cache_pages.values().copied().collect();
             for vpn in cache_vpns {
@@ -418,7 +479,11 @@ impl MapArea {
             }
             let mut cache = PAGE_CACHE.exclusive_access();
             for key in cache_keys {
-                let _ = cache.dec_ref_and_take_if_unused(key);
+                if keep_clean_cache_pages {
+                    cache.dec_ref(key);
+                } else {
+                    let _ = cache.dec_ref_and_take_if_unused(key);
+                }
             }
             info.page_cache_pages.clear();
         }
@@ -579,14 +644,18 @@ impl MapArea {
         }
 
         if let Some(info) = self.mmap_info.as_mut() {
+            let keep_clean_cache_pages = info.exec_segment.is_some() && !info.writable;
             let page_cache_pages = core::mem::take(&mut info.page_cache_pages);
             for (vpn, key) in page_cache_pages {
                 if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
                     page_table.unmap(vpn);
                 }
-                let _ = PAGE_CACHE
-                    .exclusive_access()
-                    .dec_ref_and_take_if_unused(key);
+                let mut cache = PAGE_CACHE.exclusive_access();
+                if keep_clean_cache_pages {
+                    cache.dec_ref(key);
+                } else {
+                    let _ = cache.dec_ref_and_take_if_unused(key);
+                }
             }
         }
 

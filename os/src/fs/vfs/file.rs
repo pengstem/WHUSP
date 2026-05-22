@@ -18,7 +18,7 @@ use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
 use crate::config::PAGE_SIZE;
 use crate::mm::{
     UserBuffer, frame_alloc,
-    page_cache::{PAGE_CACHE, PageCacheId, PageCacheKey},
+    page_cache::{PAGE_CACHE, PAGE_CACHE_SOFT_MAX_PAGES, PageCacheId, PageCacheKey},
 };
 use crate::perf;
 use crate::sync::SleepMutex;
@@ -35,7 +35,6 @@ use lazy_static::lazy_static;
 // buffers still progress in order without monopolizing one mount backend.
 const VFS_WRITE_CHUNK_SIZE: usize = 64 * 1024;
 const VFS_READ_CACHE_MAX_FILE_SIZE: usize = 1024 * 1024;
-const VFS_READ_CACHE_MAX_PAGES: usize = 4096;
 const MODE_PERMISSIONS_MASK: u32 = 0o7777;
 const MODE_SETGID: u32 = 0o2000;
 const TMPFILE_CREATE_ATTEMPTS: usize = 64;
@@ -452,7 +451,7 @@ impl VfsFile {
             }
 
             perf::record_vfs_read_cache_miss();
-            if PAGE_CACHE.exclusive_access().len() >= VFS_READ_CACHE_MAX_PAGES {
+            if PAGE_CACHE.exclusive_access().len() >= PAGE_CACHE_SOFT_MAX_PAGES {
                 let read_size = with_mount(self.node.mount_id, |mount| {
                     mount.read_at(
                         self.node.ino,

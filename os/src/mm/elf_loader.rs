@@ -28,6 +28,10 @@ pub struct ExecLoadStats {
     pub eager_segment_bytes_read: usize,
     pub lazy_segment_faults: usize,
     pub lazy_segment_bytes_read: usize,
+    pub lazy_page_cache_faults: usize,
+    pub lazy_page_cache_hits: usize,
+    pub lazy_page_cache_misses: usize,
+    pub lazy_page_cache_bytes_read: usize,
     pub zero_fill_bytes: usize,
     pub lazy_segment_vmas: usize,
 }
@@ -60,6 +64,20 @@ pub(super) fn record_exec_lazy_fault(bytes_read: usize, zero_fill_bytes: usize) 
     stats.zero_fill_bytes = stats.zero_fill_bytes.saturating_add(zero_fill_bytes);
 }
 
+pub(super) fn record_exec_lazy_page_cache_fault(hit: bool, bytes_read: usize) {
+    let mut stats = EXEC_LOAD_STATS.exclusive_access();
+    stats.lazy_segment_faults = stats.lazy_segment_faults.saturating_add(1);
+    stats.lazy_segment_bytes_read = stats.lazy_segment_bytes_read.saturating_add(bytes_read);
+    stats.lazy_page_cache_faults = stats.lazy_page_cache_faults.saturating_add(1);
+    if hit {
+        stats.lazy_page_cache_hits = stats.lazy_page_cache_hits.saturating_add(1);
+    } else {
+        stats.lazy_page_cache_misses = stats.lazy_page_cache_misses.saturating_add(1);
+        stats.lazy_page_cache_bytes_read =
+            stats.lazy_page_cache_bytes_read.saturating_add(bytes_read);
+    }
+}
+
 pub(crate) fn exec_load_stats_snapshot() -> ExecLoadStats {
     *EXEC_LOAD_STATS.exclusive_access()
 }
@@ -73,6 +91,10 @@ pub(crate) fn exec_load_stats_content() -> String {
          exec_lazy_segment_vmas {}\n\
          exec_lazy_segment_faults {}\n\
          exec_lazy_segment_bytes_read {}\n\
+         exec_lazy_page_cache_faults {}\n\
+         exec_lazy_page_cache_hits {}\n\
+         exec_lazy_page_cache_misses {}\n\
+         exec_lazy_page_cache_bytes_read {}\n\
          exec_zero_fill_bytes {}\n",
         stats.elf_header_bytes_read,
         stats.phdr_bytes_read,
@@ -80,6 +102,10 @@ pub(crate) fn exec_load_stats_content() -> String {
         stats.lazy_segment_vmas,
         stats.lazy_segment_faults,
         stats.lazy_segment_bytes_read,
+        stats.lazy_page_cache_faults,
+        stats.lazy_page_cache_hits,
+        stats.lazy_page_cache_misses,
+        stats.lazy_page_cache_bytes_read,
         stats.zero_fill_bytes
     )
 }
@@ -250,13 +276,18 @@ fn map_elf_load_segments_lazy(
             file_size: ph.file_size() as usize,
             mem_size,
         };
+        let map_perm = map_permission_from_ph_flags(ph);
+        let page_cache_id = (!map_perm.contains(MapPermission::W))
+            .then(|| backing_file.page_cache_id())
+            .flatten();
         memory_set.map_exec_segment_area(
             map_start,
             map_len,
-            map_permission_from_ph_flags(ph),
+            map_perm,
             backing_file.clone(),
             backing_file_size,
             map_file_offset,
+            page_cache_id,
             exec_segment,
         )?;
         record_exec_lazy_segment_vma();

@@ -8,6 +8,8 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use lazy_static::*;
 
+pub(crate) const PAGE_CACHE_SOFT_MAX_PAGES: usize = 4096;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct PageCacheId {
     pub(crate) mount_id: MountId,
