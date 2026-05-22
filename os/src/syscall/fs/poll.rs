@@ -1,9 +1,10 @@
 use crate::fs::PollEvents;
+use crate::perf;
 use crate::task::{
     block_current_task_no_schedule, current_has_interrupting_signal, current_task,
-    current_user_token, schedule, suspend_current_and_run_next,
+    current_user_token, schedule,
 };
-use crate::timer::get_time_ms;
+use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -16,6 +17,7 @@ use super::uapi::{LinuxPollFd, PPOLL_MAX_NFDS};
 
 const SELECT_MAX_NFDS: usize = 1024;
 const FD_SET_WORD_BITS: usize = usize::BITS as usize;
+const POLL_WAIT_BACKOFF_MS: usize = 1;
 
 struct ProcSleepGuard {
     task: Arc<crate::task::TaskControlBlock>,
@@ -35,9 +37,23 @@ impl Drop for ProcSleepGuard {
     }
 }
 
-fn suspend_poll_waiter() -> SysResult {
+fn sleep_until_next_poll_probe(deadline_ms: Option<usize>) -> SysResult {
+    let now_ms = get_time_ms();
+    if deadline_ms.is_some_and(|deadline_ms| now_ms >= deadline_ms) {
+        return Ok(0);
+    }
+    if current_has_interrupting_signal() {
+        return Err(SysError::EINTR);
+    }
+
+    let target_ms = now_ms.saturating_add(POLL_WAIT_BACKOFF_MS);
+    let target_ms = deadline_ms.map_or(target_ms, |deadline_ms| deadline_ms.min(target_ms));
+    let sleep_ms = target_ms.saturating_sub(now_ms);
     let _sleep_guard = ProcSleepGuard::new()?;
-    suspend_current_and_run_next();
+    let (task, task_cx_ptr) = block_current_task_no_schedule();
+    add_timer(target_ms, task);
+    perf::record_poll_backoff_sleep(sleep_ms);
+    schedule(task_cx_ptr);
     Ok(0)
 }
 
@@ -133,6 +149,7 @@ pub fn sys_ppoll(
 
     loop {
         let ready = scan_pollfds(&mut pollfds);
+        perf::record_poll_scan(pollfds.len(), ready);
         if ready > 0 {
             write_user_pollfds(token, fds, &pollfds)?;
             return Ok(ready as isize);
@@ -149,7 +166,7 @@ pub fn sys_ppoll(
         if pollfds.is_empty() && deadline_ms.is_none() {
             block_signal_only_waiter()?;
         } else {
-            suspend_poll_waiter()?;
+            sleep_until_next_poll_probe(deadline_ms)?;
         }
     }
 }
@@ -246,6 +263,9 @@ pub fn sys_pselect6(
         let mut write_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
         let mut except_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
 
+        let fdset_visits = nfds * usize::from(read_input.is_some())
+            + nfds * usize::from(write_input.is_some())
+            + nfds * usize::from(except_input.is_some());
         let ready = scan_fdset(
             nfds,
             read_input.as_deref(),
@@ -262,6 +282,7 @@ pub fn sys_pselect6(
             &mut except_output,
             PollEvents::POLLPRI,
         )?;
+        perf::record_poll_scan(fdset_visits, ready);
 
         if ready > 0 || deadline_ms.is_some_and(|deadline_ms| get_time_ms() >= deadline_ms) {
             write_user_fdset(token, readfds, &read_output)?;
@@ -279,7 +300,7 @@ pub fn sys_pselect6(
         {
             block_signal_only_waiter()?;
         } else {
-            suspend_poll_waiter()?;
+            sleep_until_next_poll_probe(deadline_ms)?;
         }
     }
 }

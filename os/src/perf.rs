@@ -27,6 +27,11 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) epoll_ready_events: usize,
     pub(crate) epoll_backoff_sleeps: usize,
     pub(crate) epoll_backoff_us: usize,
+    pub(crate) poll_wait_scans: usize,
+    pub(crate) poll_wait_fd_visits: usize,
+    pub(crate) poll_wait_ready_events: usize,
+    pub(crate) poll_backoff_sleeps: usize,
+    pub(crate) poll_backoff_ms: usize,
     pub(crate) vfs_read_cache_hits: usize,
     pub(crate) vfs_read_cache_misses: usize,
     pub(crate) vfs_read_cache_bytes: usize,
@@ -69,6 +74,12 @@ static EPOLL_SCAN_INTEREST_VISITS: AtomicUsize = AtomicUsize::new(0);
 static EPOLL_READY_EVENTS: AtomicUsize = AtomicUsize::new(0);
 static EPOLL_BACKOFF_SLEEPS: AtomicUsize = AtomicUsize::new(0);
 static EPOLL_BACKOFF_US: AtomicUsize = AtomicUsize::new(0);
+
+static POLL_WAIT_SCANS: AtomicUsize = AtomicUsize::new(0);
+static POLL_WAIT_FD_VISITS: AtomicUsize = AtomicUsize::new(0);
+static POLL_WAIT_READY_EVENTS: AtomicUsize = AtomicUsize::new(0);
+static POLL_BACKOFF_SLEEPS: AtomicUsize = AtomicUsize::new(0);
+static POLL_BACKOFF_MS: AtomicUsize = AtomicUsize::new(0);
 
 static VFS_READ_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
 static VFS_READ_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
@@ -159,6 +170,17 @@ pub(crate) fn record_epoll_backoff_sleep(duration_us: usize) {
     EPOLL_BACKOFF_US.fetch_add(duration_us, Ordering::Relaxed);
 }
 
+pub(crate) fn record_poll_scan(fd_visits: usize, ready_events: usize) {
+    POLL_WAIT_SCANS.fetch_add(1, Ordering::Relaxed);
+    POLL_WAIT_FD_VISITS.fetch_add(fd_visits, Ordering::Relaxed);
+    POLL_WAIT_READY_EVENTS.fetch_add(ready_events, Ordering::Relaxed);
+}
+
+pub(crate) fn record_poll_backoff_sleep(duration_ms: usize) {
+    POLL_BACKOFF_SLEEPS.fetch_add(1, Ordering::Relaxed);
+    POLL_BACKOFF_MS.fetch_add(duration_ms, Ordering::Relaxed);
+}
+
 pub(crate) fn record_vfs_read_cache_hit(bytes: usize) {
     VFS_READ_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
     VFS_READ_CACHE_BYTES.fetch_add(bytes, Ordering::Relaxed);
@@ -227,6 +249,11 @@ pub(crate) fn snapshot() -> KernelPerfSnapshot {
         epoll_ready_events: EPOLL_READY_EVENTS.load(Ordering::Relaxed),
         epoll_backoff_sleeps: EPOLL_BACKOFF_SLEEPS.load(Ordering::Relaxed),
         epoll_backoff_us: EPOLL_BACKOFF_US.load(Ordering::Relaxed),
+        poll_wait_scans: POLL_WAIT_SCANS.load(Ordering::Relaxed),
+        poll_wait_fd_visits: POLL_WAIT_FD_VISITS.load(Ordering::Relaxed),
+        poll_wait_ready_events: POLL_WAIT_READY_EVENTS.load(Ordering::Relaxed),
+        poll_backoff_sleeps: POLL_BACKOFF_SLEEPS.load(Ordering::Relaxed),
+        poll_backoff_ms: POLL_BACKOFF_MS.load(Ordering::Relaxed),
         vfs_read_cache_hits: VFS_READ_CACHE_HITS.load(Ordering::Relaxed),
         vfs_read_cache_misses: VFS_READ_CACHE_MISSES.load(Ordering::Relaxed),
         vfs_read_cache_bytes: VFS_READ_CACHE_BYTES.load(Ordering::Relaxed),
@@ -271,6 +298,11 @@ pub(crate) fn stats_content() -> String {
          epoll_ready_events {}\n\
          epoll_backoff_sleeps {}\n\
          epoll_backoff_us {}\n\
+         poll_wait_scans {}\n\
+         poll_wait_fd_visits {}\n\
+         poll_wait_ready_events {}\n\
+         poll_backoff_sleeps {}\n\
+         poll_backoff_ms {}\n\
          vfs_read_cache_hits {}\n\
          vfs_read_cache_misses {}\n\
          vfs_read_cache_bytes {}\n\
@@ -309,6 +341,11 @@ pub(crate) fn stats_content() -> String {
         stats.epoll_ready_events,
         stats.epoll_backoff_sleeps,
         stats.epoll_backoff_us,
+        stats.poll_wait_scans,
+        stats.poll_wait_fd_visits,
+        stats.poll_wait_ready_events,
+        stats.poll_backoff_sleeps,
+        stats.poll_backoff_ms,
         stats.vfs_read_cache_hits,
         stats.vfs_read_cache_misses,
         stats.vfs_read_cache_bytes,
