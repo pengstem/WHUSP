@@ -192,8 +192,7 @@ impl MemorySet {
                 if !crate::mm::shm::retain_attached_segment(shmid, 0) {
                     continue;
                 }
-                memory_set.areas.push(new_area);
-                let area_idx = memory_set.areas.len() - 1;
+                let area_idx = memory_set.insert_area_sorted(new_area);
                 let shm_pages = crate::mm::shm::attached_segment_pages(shmid).unwrap_or_default();
                 for (vpn, page_index) in area.shm_page_mappings() {
                     let Some(mapping) = shm_pages
@@ -209,8 +208,7 @@ impl MemorySet {
                     }
                 }
             } else if area.is_mmap() {
-                memory_set.areas.push(new_area);
-                let area_idx = memory_set.areas.len() - 1;
+                let area_idx = memory_set.insert_area_sorted(new_area);
                 let cow_resident = area_is_private_user_writable(area);
                 let can_share_resident = area.mmap_info.as_ref().is_some_and(|info| info.shared)
                     || !area.map_perm.contains(MapPermission::W)
@@ -263,8 +261,7 @@ impl MemorySet {
                     }
                 }
             } else if area_is_private_user_writable(area) {
-                memory_set.areas.push(new_area);
-                let area_idx = memory_set.areas.len() - 1;
+                let area_idx = memory_set.insert_area_sorted(new_area);
                 let resident_vpns: Vec<_> = area.data_frames.keys().copied().collect();
                 for vpn in resident_vpns {
                     let src_pte = user_space.page_table.translate(vpn)?;
@@ -292,8 +289,7 @@ impl MemorySet {
                         .copy_from_slice(src_ppn.get_bytes_array());
                 }
             } else {
-                memory_set.areas.push(new_area);
-                let area_idx = memory_set.areas.len() - 1;
+                let area_idx = memory_set.insert_area_sorted(new_area);
                 let resident_vpns: Vec<_> = area.data_frames.keys().copied().collect();
                 for vpn in resident_vpns {
                     let Some(src_pte) = user_space.translate(vpn) else {
@@ -352,11 +348,7 @@ impl MemorySet {
         if !pte.is_valid() || pte.writable() || !pte.cow() {
             return false;
         }
-        let Some(area_idx) = self
-            .areas
-            .iter()
-            .position(|area| area.vpn_range.get_start() <= vpn && vpn < area.vpn_range.get_end())
-        else {
+        let Some(area_idx) = self.find_area_idx_containing(vpn) else {
             return false;
         };
         if !self.areas[area_idx].map_perm.contains(MapPermission::W)
@@ -428,7 +420,7 @@ impl MemorySet {
                 if !heap_area.map(&mut self.page_table) {
                     return self.brk;
                 }
-                self.areas.push(heap_area);
+                self.insert_area_sorted(heap_area);
                 self.brk = addr;
                 self.brk_mapped_end = new_mapped_end;
                 return self.brk;
@@ -448,7 +440,7 @@ impl MemorySet {
                 if !heap_area.map(&mut self.page_table) {
                     return self.brk;
                 }
-                self.areas.push(heap_area);
+                self.insert_area_sorted(heap_area);
                 self.brk = addr;
                 self.brk_mapped_end = new_mapped_end;
                 return self.brk;
@@ -550,7 +542,7 @@ impl MemorySet {
             exec_segment: None,
         });
         apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
-        self.areas.push(area);
+        self.insert_area_sorted(area);
         self.mmap_next = next_mmap_hint(end);
         Some(start)
     }
@@ -628,7 +620,7 @@ impl MemorySet {
             exec_segment: None,
         });
         apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
-        self.areas.push(area);
+        self.insert_area_sorted(area);
         Some((start, flushes))
     }
 
@@ -670,7 +662,7 @@ impl MemorySet {
             page_cache_pages: BTreeMap::new(),
             exec_segment: Some(exec_segment),
         });
-        self.areas.push(area);
+        self.insert_area_sorted(area);
         Some(start)
     }
 
@@ -710,7 +702,7 @@ impl MemorySet {
                 return None;
             }
         }
-        self.areas.push(area);
+        self.insert_area_sorted(area);
         self.mmap_next = next_mmap_hint(end);
         Some(start)
     }
@@ -736,12 +728,10 @@ impl MemorySet {
         let end = start.checked_add(len - 1)?;
         let start_vpn = VirtAddr::from(start).floor();
         let end_vpn = VirtAddr::from(end).floor();
-        self.areas
-            .iter()
-            .find(|area| {
-                area.is_shm()
-                    && area.vpn_range.get_start() <= start_vpn
-                    && end_vpn < area.vpn_range.get_end()
+        self.find_area_idx_containing(start_vpn)
+            .and_then(|idx| {
+                let area = &self.areas[idx];
+                (area.is_shm() && end_vpn < area.vpn_range.get_end()).then_some(area)
             })
             .and_then(MapArea::shm_segment_id)
     }
@@ -757,10 +747,9 @@ impl MemorySet {
         access: MmapFaultAccess,
     ) -> Option<MmapFaultResult> {
         let vpn = VirtAddr::from(addr).floor();
-        let area_idx = match self.areas.iter().position(|area| {
-            area.is_mmap() && area.vpn_range.get_start() <= vpn && vpn < area.vpn_range.get_end()
-        }) {
-            Some(idx) => idx,
+        let area_idx = match self.find_area_idx_containing(vpn) {
+            Some(idx) if self.areas[idx].is_mmap() => idx,
+            Some(_) => return None,
             None => match self.grow_down_mmap_area_for_fault(vpn, access) {
                 Some(GrowDownMmapFault::Grown(idx)) => idx,
                 Some(GrowDownMmapFault::GuardBlocked) => {
@@ -874,13 +863,12 @@ impl MemorySet {
     /// The VMA is looked up again because the caller may have dropped process
     /// memory state while allocating or reading the backing file.
     pub fn install_mmap_fault_page(&mut self, page: MmapFaultPage, frame: FrameTracker) -> bool {
-        let Some(idx) = self.areas.iter().position(|area| {
-            area.is_mmap()
-                && area.vpn_range.get_start() <= page.vpn
-                && page.vpn < area.vpn_range.get_end()
-        }) else {
+        let Some(idx) = self.find_area_idx_containing(page.vpn) else {
             return false;
         };
+        if !self.areas[idx].is_mmap() {
+            return false;
+        }
         let page_table = &mut self.page_table;
         let area = &mut self.areas[idx];
         area.map_existing_frame(page_table, page.vpn, frame)
@@ -895,13 +883,12 @@ impl MemorySet {
         page: MmapPageCacheFault,
         ppn: PhysPageNum,
     ) -> bool {
-        let Some(idx) = self.areas.iter().position(|area| {
-            area.is_mmap()
-                && area.vpn_range.get_start() <= page.vpn
-                && page.vpn < area.vpn_range.get_end()
-        }) else {
+        let Some(idx) = self.find_area_idx_containing(page.vpn) else {
             return false;
         };
+        if !self.areas[idx].is_mmap() {
+            return false;
+        }
         let page_table = &mut self.page_table;
         let area = &mut self.areas[idx];
         area.map_page_cache_frame(page_table, page.vpn, ppn, page.key)
@@ -1252,53 +1239,66 @@ impl MemorySet {
                 perf::record_mmap_hole_search(0, gap_checks, area_visits, vma_count);
                 return None;
             }
-            gap_checks += 1;
-            let mut next_cursor = cursor;
-            for area in &self.areas {
+            let cursor_vpn = VirtAddr::from(cursor).floor();
+            let mut idx = self.area_insert_index(cursor_vpn);
+            if idx > 0 {
                 area_visits += 1;
-                let area_start = usize::from(VirtAddr::from(area.vpn_range.get_start()));
-                let area_end = usize::from(VirtAddr::from(area.vpn_range.get_end()));
-                if area_start < end && area_end > cursor && area_end > next_cursor {
-                    next_cursor = area_end;
+                let prev_end = usize::from(VirtAddr::from(self.areas[idx - 1].vpn_range.get_end()));
+                if prev_end > cursor {
+                    cursor = page_align_up(prev_end);
+                    continue;
                 }
             }
-            if next_cursor == cursor {
+            while idx < self.areas.len() {
+                area_visits += 1;
+                let area_end = usize::from(VirtAddr::from(self.areas[idx].vpn_range.get_end()));
+                if area_end > cursor {
+                    break;
+                }
+                idx += 1;
+            }
+            gap_checks += 1;
+            if idx >= self.areas.len() {
                 perf::record_mmap_hole_search(0, gap_checks, area_visits, vma_count);
                 return Some(cursor);
             }
-            cursor = page_align_up(next_cursor);
+            let area = &self.areas[idx];
+            let area_start = usize::from(VirtAddr::from(area.vpn_range.get_start()));
+            let area_end = usize::from(VirtAddr::from(area.vpn_range.get_end()));
+            if area_start >= limit {
+                perf::record_mmap_hole_search(0, gap_checks, area_visits, vma_count);
+                return Some(cursor);
+            }
+            if end <= area_start {
+                perf::record_mmap_hole_search(0, gap_checks, area_visits, vma_count);
+                return Some(cursor);
+            }
+            cursor = page_align_up(area_end);
         }
     }
 
     fn range_overlaps(&self, start: usize, end: usize) -> bool {
+        if start >= end {
+            return false;
+        }
         let start_vpn = VirtAddr::from(start).floor();
         let end_vpn = VirtAddr::from(end).floor();
-        self.areas.iter().any(|area| {
-            let area_start = area.vpn_range.get_start();
-            let area_end = area.vpn_range.get_end();
-            start_vpn < area_end && end_vpn > area_start
-        })
+        let idx = self.area_insert_index(start_vpn);
+        if idx > 0 && self.areas[idx - 1].vpn_range.get_end() > start_vpn {
+            return true;
+        }
+        idx < self.areas.len()
+            && self.areas[idx].vpn_range.get_start() < end_vpn
+            && self.areas[idx].vpn_range.get_end() > start_vpn
     }
 
     fn range_is_mapped_vpn(&self, start: super::VirtPageNum, end: super::VirtPageNum) -> bool {
         let mut cursor = start;
         while cursor < end {
-            let Some(area_end) = self
-                .areas
-                .iter()
-                .filter_map(|area| {
-                    let area_start = area.vpn_range.get_start();
-                    let area_end = area.vpn_range.get_end();
-                    if area_start <= cursor && cursor < area_end {
-                        Some(area_end)
-                    } else {
-                        None
-                    }
-                })
-                .max()
-            else {
+            let Some(idx) = self.find_area_idx_containing(cursor) else {
                 return false;
             };
+            let area_end = self.areas[idx].vpn_range.get_end();
             if area_end <= cursor {
                 return false;
             }
@@ -1308,13 +1308,14 @@ impl MemorySet {
     }
 
     fn split_area_at(&mut self, at: super::VirtPageNum) {
-        let Some(idx) = self.areas.iter().position(|area| {
-            let area_start = area.vpn_range.get_start();
-            let area_end = area.vpn_range.get_end();
-            area_start < at && at < area_end
-        }) else {
+        let Some(idx) = self.find_area_idx_containing(at) else {
             return;
         };
+        let area_start = self.areas[idx].vpn_range.get_start();
+        let area_end = self.areas[idx].vpn_range.get_end();
+        if !(area_start < at && at < area_end) {
+            return;
+        }
         if let Some(right) = self.areas[idx].split_off(at) {
             self.areas.insert(idx + 1, right);
         }
@@ -1346,22 +1347,17 @@ impl MemorySet {
         vpn: super::VirtPageNum,
         access: MmapFaultAccess,
     ) -> Option<GrowDownMmapFault> {
-        let area_idx = self.areas.iter().position(|area| {
-            let Some(info) = &area.mmap_info else {
-                return false;
-            };
-            let Some(next_vpn) = vpn.0.checked_add(1) else {
-                return false;
-            };
-            // UNFINISHED: Linux also checks the faulting stack pointer,
-            // RLIMIT_STACK, and more VMA flags. This handles the contest
-            // pthread/LTP path by growing anonymous MAP_GROWSDOWN VMAs one
-            // page at a time.
-            info.grow_down
-                && info.backing_file.is_none()
-                && access.is_allowed_by(area.map_perm)
-                && area.vpn_range.get_start().0 == next_vpn
-        })?;
+        let next_vpn = VirtPageNum(vpn.0.checked_add(1)?);
+        let area_idx = self.find_area_idx_by_start(next_vpn)?;
+        let area = &self.areas[area_idx];
+        let info = area.mmap_info.as_ref()?;
+        // UNFINISHED: Linux also checks the faulting stack pointer,
+        // RLIMIT_STACK, and more VMA flags. This handles the contest
+        // pthread/LTP path by growing anonymous MAP_GROWSDOWN VMAs one
+        // page at a time.
+        if !info.grow_down || info.backing_file.is_some() || !access.is_allowed_by(area.map_perm) {
+            return None;
+        }
 
         if !self.grow_down_guard_gap_is_clear(vpn, area_idx) {
             return Some(GrowDownMmapFault::GuardBlocked);

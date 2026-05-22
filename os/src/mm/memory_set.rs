@@ -3,6 +3,7 @@ use super::{
     page_table::PTEFlags,
 };
 use crate::arch::mm as arch_mm;
+use crate::perf;
 use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,12 +76,8 @@ impl MemorySet {
         );
     }
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
-        if let Some((idx, area)) = self
-            .areas
-            .iter_mut()
-            .enumerate()
-            .find(|(_, area)| area.vpn_range.get_start() == start_vpn)
-        {
+        if let Some(idx) = self.find_area_idx_by_start(start_vpn) {
+            let area = &mut self.areas[idx];
             if area.is_mmap() || area.is_shm() {
                 area.unmap_resident(&mut self.page_table);
             } else {
@@ -108,8 +105,56 @@ impl MemorySet {
         if let Some(data) = data {
             map_area.copy_data(&self.page_table, data, data_offset);
         }
-        self.areas.push(map_area);
+        self.insert_area_sorted(map_area);
         true
+    }
+
+    pub(super) fn insert_area_sorted(&mut self, map_area: MapArea) -> usize {
+        let idx = self.area_insert_index(map_area.vpn_range.get_start());
+        self.areas.insert(idx, map_area);
+        idx
+    }
+
+    pub(super) fn area_insert_index(&self, start_vpn: VirtPageNum) -> usize {
+        let mut low = 0usize;
+        let mut high = self.areas.len();
+        while low < high {
+            let mid = (low + high) / 2;
+            if self.areas[mid].vpn_range.get_start() < start_vpn {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        low
+    }
+
+    pub(super) fn find_area_idx_by_start(&self, start_vpn: VirtPageNum) -> Option<usize> {
+        let idx = self.area_insert_index(start_vpn);
+        (idx < self.areas.len() && self.areas[idx].vpn_range.get_start() == start_vpn)
+            .then_some(idx)
+    }
+
+    pub(super) fn find_area_idx_containing(&self, vpn: VirtPageNum) -> Option<usize> {
+        let mut low = 0usize;
+        let mut high = self.areas.len();
+        let mut probes = 0usize;
+        while low < high {
+            let mid = (low + high) / 2;
+            probes += 1;
+            if self.areas[mid].vpn_range.get_start() <= vpn {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        let idx = low.checked_sub(1);
+        let hit = idx.is_some_and(|idx| {
+            probes += 1;
+            vpn < self.areas[idx].vpn_range.get_end()
+        });
+        perf::record_vma_lookup(probes, hit);
+        hit.then(|| idx.expect("hit requires predecessor area"))
     }
     pub fn activate(&self) {
         arch_mm::activate_page_table(self.page_table.token());

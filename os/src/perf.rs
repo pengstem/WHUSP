@@ -62,6 +62,9 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) mmap_hole_gap_checks: usize,
     pub(crate) mmap_hole_area_visits: usize,
     pub(crate) mmap_vma_count_max: usize,
+    pub(crate) vma_lookup_calls: usize,
+    pub(crate) vma_lookup_hits: usize,
+    pub(crate) vma_lookup_area_probes: usize,
     pub(crate) futex_cleanup_calls: usize,
     pub(crate) futex_cleanup_direct_hits: usize,
     pub(crate) futex_cleanup_already_unqueued: usize,
@@ -137,6 +140,9 @@ static MMAP_HOLE_PAGE_PROBES: AtomicUsize = AtomicUsize::new(0);
 static MMAP_HOLE_GAP_CHECKS: AtomicUsize = AtomicUsize::new(0);
 static MMAP_HOLE_AREA_VISITS: AtomicUsize = AtomicUsize::new(0);
 static MMAP_VMA_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
+static VMA_LOOKUP_CALLS: AtomicUsize = AtomicUsize::new(0);
+static VMA_LOOKUP_HITS: AtomicUsize = AtomicUsize::new(0);
+static VMA_LOOKUP_AREA_PROBES: AtomicUsize = AtomicUsize::new(0);
 
 static FUTEX_CLEANUP_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FUTEX_CLEANUP_DIRECT_HITS: AtomicUsize = AtomicUsize::new(0);
@@ -317,6 +323,14 @@ pub(crate) fn record_mmap_hole_search(
     update_max(&MMAP_VMA_COUNT_MAX, vma_count);
 }
 
+pub(crate) fn record_vma_lookup(area_probes: usize, hit: bool) {
+    VMA_LOOKUP_CALLS.fetch_add(1, Ordering::Relaxed);
+    VMA_LOOKUP_AREA_PROBES.fetch_add(area_probes, Ordering::Relaxed);
+    if hit {
+        VMA_LOOKUP_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn record_futex_cleanup(
     direct_hit: bool,
     already_unqueued: bool,
@@ -402,6 +416,9 @@ pub(crate) fn snapshot() -> KernelPerfSnapshot {
         mmap_hole_gap_checks: MMAP_HOLE_GAP_CHECKS.load(Ordering::Relaxed),
         mmap_hole_area_visits: MMAP_HOLE_AREA_VISITS.load(Ordering::Relaxed),
         mmap_vma_count_max: MMAP_VMA_COUNT_MAX.load(Ordering::Relaxed),
+        vma_lookup_calls: VMA_LOOKUP_CALLS.load(Ordering::Relaxed),
+        vma_lookup_hits: VMA_LOOKUP_HITS.load(Ordering::Relaxed),
+        vma_lookup_area_probes: VMA_LOOKUP_AREA_PROBES.load(Ordering::Relaxed),
         futex_cleanup_calls: FUTEX_CLEANUP_CALLS.load(Ordering::Relaxed),
         futex_cleanup_direct_hits: FUTEX_CLEANUP_DIRECT_HITS.load(Ordering::Relaxed),
         futex_cleanup_already_unqueued: FUTEX_CLEANUP_ALREADY_UNQUEUED.load(Ordering::Relaxed),
@@ -476,6 +493,9 @@ pub(crate) fn stats_content() -> String {
          mmap_hole_gap_checks {}\n\
          mmap_hole_area_visits {}\n\
          mmap_vma_count_max {}\n\
+         vma_lookup_calls {}\n\
+         vma_lookup_hits {}\n\
+         vma_lookup_area_probes {}\n\
          futex_cleanup_calls {}\n\
          futex_cleanup_direct_hits {}\n\
          futex_cleanup_already_unqueued {}\n\
@@ -542,6 +562,9 @@ pub(crate) fn stats_content() -> String {
         stats.mmap_hole_gap_checks,
         stats.mmap_hole_area_visits,
         stats.mmap_vma_count_max,
+        stats.vma_lookup_calls,
+        stats.vma_lookup_hits,
+        stats.vma_lookup_area_probes,
         stats.futex_cleanup_calls,
         stats.futex_cleanup_direct_hits,
         stats.futex_cleanup_already_unqueued,
