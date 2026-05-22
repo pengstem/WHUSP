@@ -56,6 +56,11 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) splice_calls: usize,
     pub(crate) splice_chunks: usize,
     pub(crate) splice_bytes: usize,
+    pub(crate) mmap_hole_searches: usize,
+    pub(crate) mmap_hole_page_probes: usize,
+    pub(crate) mmap_hole_gap_checks: usize,
+    pub(crate) mmap_hole_area_visits: usize,
+    pub(crate) mmap_vma_count_max: usize,
 }
 
 static SCHEDULER_FETCH_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -116,6 +121,12 @@ static SENDFILE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static SPLICE_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SPLICE_CHUNKS: AtomicUsize = AtomicUsize::new(0);
 static SPLICE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+static MMAP_HOLE_SEARCHES: AtomicUsize = AtomicUsize::new(0);
+static MMAP_HOLE_PAGE_PROBES: AtomicUsize = AtomicUsize::new(0);
+static MMAP_HOLE_GAP_CHECKS: AtomicUsize = AtomicUsize::new(0);
+static MMAP_HOLE_AREA_VISITS: AtomicUsize = AtomicUsize::new(0);
+static MMAP_VMA_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
 
 fn update_max(cell: &AtomicUsize, value: usize) {
     let mut current = cell.load(Ordering::Relaxed);
@@ -270,6 +281,19 @@ pub(crate) fn record_splice_chunk(bytes: usize) {
     SPLICE_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
 
+pub(crate) fn record_mmap_hole_search(
+    page_probes: usize,
+    gap_checks: usize,
+    area_visits: usize,
+    vma_count: usize,
+) {
+    MMAP_HOLE_SEARCHES.fetch_add(1, Ordering::Relaxed);
+    MMAP_HOLE_PAGE_PROBES.fetch_add(page_probes, Ordering::Relaxed);
+    MMAP_HOLE_GAP_CHECKS.fetch_add(gap_checks, Ordering::Relaxed);
+    MMAP_HOLE_AREA_VISITS.fetch_add(area_visits, Ordering::Relaxed);
+    update_max(&MMAP_VMA_COUNT_MAX, vma_count);
+}
+
 pub(crate) fn snapshot() -> KernelPerfSnapshot {
     KernelPerfSnapshot {
         scheduler_fetch_calls: SCHEDULER_FETCH_CALLS.load(Ordering::Relaxed),
@@ -324,6 +348,11 @@ pub(crate) fn snapshot() -> KernelPerfSnapshot {
         splice_calls: SPLICE_CALLS.load(Ordering::Relaxed),
         splice_chunks: SPLICE_CHUNKS.load(Ordering::Relaxed),
         splice_bytes: SPLICE_BYTES.load(Ordering::Relaxed),
+        mmap_hole_searches: MMAP_HOLE_SEARCHES.load(Ordering::Relaxed),
+        mmap_hole_page_probes: MMAP_HOLE_PAGE_PROBES.load(Ordering::Relaxed),
+        mmap_hole_gap_checks: MMAP_HOLE_GAP_CHECKS.load(Ordering::Relaxed),
+        mmap_hole_area_visits: MMAP_HOLE_AREA_VISITS.load(Ordering::Relaxed),
+        mmap_vma_count_max: MMAP_VMA_COUNT_MAX.load(Ordering::Relaxed),
     }
 }
 
@@ -381,7 +410,12 @@ pub(crate) fn stats_content() -> String {
          sendfile_bytes {}\n\
          splice_calls {}\n\
          splice_chunks {}\n\
-         splice_bytes {}\n",
+         splice_bytes {}\n\
+         mmap_hole_searches {}\n\
+         mmap_hole_page_probes {}\n\
+         mmap_hole_gap_checks {}\n\
+         mmap_hole_area_visits {}\n\
+         mmap_vma_count_max {}\n",
         stats.scheduler_fetch_calls,
         stats.scheduler_scanned_tasks,
         stats.scheduler_pruned_exited_tasks,
@@ -434,5 +468,10 @@ pub(crate) fn stats_content() -> String {
         stats.splice_calls,
         stats.splice_chunks,
         stats.splice_bytes,
+        stats.mmap_hole_searches,
+        stats.mmap_hole_page_probes,
+        stats.mmap_hole_gap_checks,
+        stats.mmap_hole_area_visits,
+        stats.mmap_vma_count_max,
     )
 }

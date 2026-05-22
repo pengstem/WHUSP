@@ -10,6 +10,7 @@ use crate::arch::mm as arch_mm;
 use crate::config::{PAGE_SIZE, USER_MMAP_BASE, USER_MMAP_LIMIT};
 use crate::fs::File;
 use crate::mm::page_cache::{PAGE_CACHE, PageCacheId, PageCacheKey};
+use crate::perf;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -1194,20 +1195,40 @@ impl MemorySet {
     }
 
     fn find_mmap_hole(&self, start: usize, limit: usize, len: usize) -> Option<usize> {
-        if start >= limit {
+        let mut gap_checks = 0;
+        let mut area_visits = 0;
+        let vma_count = self.areas.len();
+
+        if start >= limit || len == 0 {
+            perf::record_mmap_hole_search(0, gap_checks, area_visits, vma_count);
             return None;
         }
         let mut cursor = page_align_up(start);
-        while let Some(end) = cursor.checked_add(len) {
+        loop {
+            let Some(end) = cursor.checked_add(len) else {
+                perf::record_mmap_hole_search(0, gap_checks, area_visits, vma_count);
+                return None;
+            };
             if end > limit {
-                break;
+                perf::record_mmap_hole_search(0, gap_checks, area_visits, vma_count);
+                return None;
             }
-            if !self.range_overlaps(cursor, end) {
+            gap_checks += 1;
+            let mut next_cursor = cursor;
+            for area in &self.areas {
+                area_visits += 1;
+                let area_start = usize::from(VirtAddr::from(area.vpn_range.get_start()));
+                let area_end = usize::from(VirtAddr::from(area.vpn_range.get_end()));
+                if area_start < end && area_end > cursor && area_end > next_cursor {
+                    next_cursor = area_end;
+                }
+            }
+            if next_cursor == cursor {
+                perf::record_mmap_hole_search(0, gap_checks, area_visits, vma_count);
                 return Some(cursor);
             }
-            cursor = cursor.checked_add(PAGE_SIZE)?;
+            cursor = page_align_up(next_cursor);
         }
-        None
     }
 
     fn range_overlaps(&self, start: usize, end: usize) -> bool {
