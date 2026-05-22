@@ -2,6 +2,7 @@ use super::{
     TaskControlBlock, TaskStatus, block_current_task_no_schedule, current_has_deliverable_signal,
     current_process, current_task, current_user_token, schedule, wakeup_front_task, wakeup_task,
 };
+use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::time::{
@@ -70,16 +71,23 @@ struct FutexWaiter {
 /// woken after the queue has been updated.
 struct FutexManager {
     waiters: BTreeMap<FutexKey, VecDeque<FutexWaiter>>,
+    waiter_keys: BTreeMap<usize, FutexKey>,
 }
 
 impl FutexManager {
     fn new() -> Self {
         Self {
             waiters: BTreeMap::new(),
+            waiter_keys: BTreeMap::new(),
         }
     }
 
+    fn waiter_id(task: &Arc<TaskControlBlock>) -> usize {
+        Arc::as_ptr(task) as usize
+    }
+
     fn remove_waiter(&mut self, key: FutexKey, task: &Arc<TaskControlBlock>) -> bool {
+        let waiter_id = Self::waiter_id(task);
         let removed = {
             let Some(queue) = self.waiters.get_mut(&key) else {
                 return false;
@@ -89,17 +97,23 @@ impl FutexManager {
             old_len != queue.len()
         };
         self.remove_empty_queue(key);
+        if removed {
+            self.waiter_keys.remove(&waiter_id);
+        }
         removed
     }
 
-    fn remove_waiter_any(&mut self, task: &Arc<TaskControlBlock>) -> bool {
-        let mut removed = false;
-        self.waiters.retain(|_, queue| {
-            let old_len = queue.len();
-            queue.retain(|waiter| !Arc::ptr_eq(&waiter.task, task));
-            removed |= old_len != queue.len();
-            !queue.is_empty()
-        });
+    fn remove_waiter_for_task(&mut self, task: &Arc<TaskControlBlock>) -> bool {
+        let waiter_id = Self::waiter_id(task);
+        let Some(key) = self.waiter_keys.get(&waiter_id).copied() else {
+            perf::record_futex_cleanup(false, true, 0, 0);
+            return false;
+        };
+        let removed = self.remove_waiter(key, task);
+        perf::record_futex_cleanup(removed, !removed, 0, 0);
+        if !removed {
+            self.waiter_keys.remove(&waiter_id);
+        }
         removed
     }
 
@@ -110,35 +124,47 @@ impl FutexManager {
     /// deadlock wake paths.
     fn block_current_on(&mut self, key: FutexKey, bitset: u32) -> *mut super::TaskContext {
         let (task, task_cx_ptr) = block_current_task_no_schedule();
-        self.waiters
-            .entry(key)
-            .or_default()
-            .push_back(FutexWaiter { task, bitset });
+        self.waiters.entry(key).or_default().push_back(FutexWaiter {
+            task: Arc::clone(&task),
+            bitset,
+        });
+        self.waiter_keys.insert(Self::waiter_id(&task), key);
+        self.record_state();
         task_cx_ptr
     }
 
     fn wake(&mut self, key: FutexKey, limit: usize, bitset: u32) -> Vec<Arc<TaskControlBlock>> {
-        let Some(queue) = self.waiters.get_mut(&key) else {
-            return Vec::new();
+        let mut removed_waiters = Vec::new();
+        let tasks = {
+            let Some(queue) = self.waiters.get_mut(&key) else {
+                return Vec::new();
+            };
+            let mut tasks = Vec::new();
+            let mut kept = VecDeque::new();
+            while let Some(waiter) = queue.pop_front() {
+                if !waiter.is_blocked() {
+                    removed_waiters.push(Self::waiter_id(&waiter.task));
+                    continue;
+                }
+                if waiter.bitset & bitset != 0 && tasks.len() < limit {
+                    removed_waiters.push(Self::waiter_id(&waiter.task));
+                    tasks.push(waiter.task);
+                } else {
+                    kept.push_back(waiter);
+                }
+            }
+            *queue = kept;
+            tasks
         };
-        let mut tasks = Vec::new();
-        let mut kept = VecDeque::new();
-        while let Some(waiter) = queue.pop_front() {
-            if !waiter.is_blocked() {
-                continue;
-            }
-            if waiter.bitset & bitset != 0 && tasks.len() < limit {
-                tasks.push(waiter.task);
-            } else {
-                kept.push_back(waiter);
-            }
+        for waiter_id in removed_waiters {
+            self.waiter_keys.remove(&waiter_id);
         }
-        *queue = kept;
         self.remove_empty_queue(key);
         tasks
     }
 
     fn wake_one(&mut self, key: FutexKey) -> (Option<Arc<TaskControlBlock>>, bool) {
+        let mut removed_waiters = Vec::new();
         let task = {
             let Some(queue) = self.waiters.get_mut(&key) else {
                 return (None, false);
@@ -146,12 +172,18 @@ impl FutexManager {
             let mut selected = None;
             while let Some(waiter) = queue.pop_front() {
                 if waiter.is_blocked() {
+                    removed_waiters.push(Self::waiter_id(&waiter.task));
                     selected = Some(waiter.task);
                     break;
+                } else {
+                    removed_waiters.push(Self::waiter_id(&waiter.task));
                 }
             }
             selected
         };
+        for waiter_id in removed_waiters {
+            self.waiter_keys.remove(&waiter_id);
+        }
         self.remove_empty_queue(key);
         let has_waiters = self.has_waiters(key);
         (task, has_waiters)
@@ -170,29 +202,44 @@ impl FutexManager {
         wake_limit: usize,
         requeue_limit: usize,
     ) -> (Vec<Arc<TaskControlBlock>>, usize) {
-        let Some(queue) = self.waiters.get_mut(&source) else {
-            return (Vec::new(), 0);
+        let mut removed_waiters = Vec::new();
+        let mut moved_waiters = Vec::new();
+        let (tasks, moved) = {
+            let Some(queue) = self.waiters.get_mut(&source) else {
+                return (Vec::new(), 0);
+            };
+            let mut tasks = Vec::new();
+            let mut moved = VecDeque::new();
+            let mut kept = VecDeque::new();
+            while let Some(waiter) = queue.pop_front() {
+                if !waiter.is_blocked() {
+                    removed_waiters.push(Self::waiter_id(&waiter.task));
+                    continue;
+                }
+                if tasks.len() < wake_limit {
+                    removed_waiters.push(Self::waiter_id(&waiter.task));
+                    tasks.push(waiter.task);
+                } else if moved.len() < requeue_limit {
+                    moved_waiters.push(Self::waiter_id(&waiter.task));
+                    moved.push_back(waiter);
+                } else {
+                    kept.push_back(waiter);
+                }
+            }
+            *queue = kept;
+            (tasks, moved)
         };
-        let mut tasks = Vec::new();
-        let mut moved = VecDeque::new();
-        let mut kept = VecDeque::new();
-        while let Some(waiter) = queue.pop_front() {
-            if !waiter.is_blocked() {
-                continue;
-            }
-            if tasks.len() < wake_limit {
-                tasks.push(waiter.task);
-            } else if moved.len() < requeue_limit {
-                moved.push_back(waiter);
-            } else {
-                kept.push_back(waiter);
-            }
+        for waiter_id in removed_waiters {
+            self.waiter_keys.remove(&waiter_id);
         }
-        *queue = kept;
+        for waiter_id in moved_waiters {
+            self.waiter_keys.insert(waiter_id, target);
+        }
         self.remove_empty_queue(source);
         let moved_len = moved.len();
         if moved_len > 0 {
             self.waiters.entry(target).or_default().extend(moved);
+            self.record_state();
         }
         (tasks, moved_len)
     }
@@ -212,12 +259,26 @@ impl FutexManager {
             });
             !queue.is_empty()
         });
+        self.rebuild_waiter_keys();
     }
 
     fn remove_empty_queue(&mut self, key: FutexKey) {
         if matches!(self.waiters.get(&key), Some(queue) if queue.is_empty()) {
             self.waiters.remove(&key);
         }
+    }
+
+    fn rebuild_waiter_keys(&mut self) {
+        self.waiter_keys.clear();
+        for (key, queue) in &self.waiters {
+            for waiter in queue {
+                self.waiter_keys.insert(Self::waiter_id(&waiter.task), *key);
+            }
+        }
+    }
+
+    fn record_state(&self) {
+        perf::record_futex_manager_state(self.waiters.len(), self.waiter_keys.len());
     }
 }
 
@@ -342,7 +403,7 @@ fn futex_wait(
     schedule(task_cx_ptr);
 
     let mut manager = FUTEX_MANAGER.exclusive_access();
-    let still_waiting = manager.remove_waiter(key, &task) || manager.remove_waiter_any(&task);
+    let still_waiting = manager.remove_waiter_for_task(&task);
     if futex_timeout_expired(timeout_ms) {
         if still_waiting {
             return Err(SysError::ETIMEDOUT);
@@ -462,10 +523,7 @@ fn futex_lock_pi(addr: usize, private: bool, timeout_ms: Option<usize>) -> SysRe
     schedule(task_cx_ptr);
 
     let mut manager = FUTEX_MANAGER.exclusive_access();
-    // CONTEXT: This manager has one queue map for classic and PI futex waiters.
-    // A plain requeue by source key can still move this task, so keep the
-    // any-key cleanup fallback until PI waiters are represented separately.
-    let still_waiting = manager.remove_waiter(key, &task) || manager.remove_waiter_any(&task);
+    let still_waiting = manager.remove_waiter_for_task(&task);
     drop(manager);
     if futex_timeout_expired(timeout_ms) {
         if still_waiting {

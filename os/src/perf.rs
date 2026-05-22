@@ -61,6 +61,14 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) mmap_hole_gap_checks: usize,
     pub(crate) mmap_hole_area_visits: usize,
     pub(crate) mmap_vma_count_max: usize,
+    pub(crate) futex_cleanup_calls: usize,
+    pub(crate) futex_cleanup_direct_hits: usize,
+    pub(crate) futex_cleanup_already_unqueued: usize,
+    pub(crate) futex_cleanup_fallback_scans: usize,
+    pub(crate) futex_cleanup_fallback_queue_visits: usize,
+    pub(crate) futex_cleanup_fallback_waiter_visits: usize,
+    pub(crate) futex_queue_count_max: usize,
+    pub(crate) futex_waiter_count_max: usize,
 }
 
 static SCHEDULER_FETCH_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -127,6 +135,15 @@ static MMAP_HOLE_PAGE_PROBES: AtomicUsize = AtomicUsize::new(0);
 static MMAP_HOLE_GAP_CHECKS: AtomicUsize = AtomicUsize::new(0);
 static MMAP_HOLE_AREA_VISITS: AtomicUsize = AtomicUsize::new(0);
 static MMAP_VMA_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
+
+static FUTEX_CLEANUP_CALLS: AtomicUsize = AtomicUsize::new(0);
+static FUTEX_CLEANUP_DIRECT_HITS: AtomicUsize = AtomicUsize::new(0);
+static FUTEX_CLEANUP_ALREADY_UNQUEUED: AtomicUsize = AtomicUsize::new(0);
+static FUTEX_CLEANUP_FALLBACK_SCANS: AtomicUsize = AtomicUsize::new(0);
+static FUTEX_CLEANUP_FALLBACK_QUEUE_VISITS: AtomicUsize = AtomicUsize::new(0);
+static FUTEX_CLEANUP_FALLBACK_WAITER_VISITS: AtomicUsize = AtomicUsize::new(0);
+static FUTEX_QUEUE_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
+static FUTEX_WAITER_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
 
 fn update_max(cell: &AtomicUsize, value: usize) {
     let mut current = cell.load(Ordering::Relaxed);
@@ -294,6 +311,31 @@ pub(crate) fn record_mmap_hole_search(
     update_max(&MMAP_VMA_COUNT_MAX, vma_count);
 }
 
+pub(crate) fn record_futex_cleanup(
+    direct_hit: bool,
+    already_unqueued: bool,
+    fallback_queue_visits: usize,
+    fallback_waiter_visits: usize,
+) {
+    FUTEX_CLEANUP_CALLS.fetch_add(1, Ordering::Relaxed);
+    if direct_hit {
+        FUTEX_CLEANUP_DIRECT_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    if already_unqueued {
+        FUTEX_CLEANUP_ALREADY_UNQUEUED.fetch_add(1, Ordering::Relaxed);
+    }
+    if fallback_queue_visits > 0 || fallback_waiter_visits > 0 {
+        FUTEX_CLEANUP_FALLBACK_SCANS.fetch_add(1, Ordering::Relaxed);
+        FUTEX_CLEANUP_FALLBACK_QUEUE_VISITS.fetch_add(fallback_queue_visits, Ordering::Relaxed);
+        FUTEX_CLEANUP_FALLBACK_WAITER_VISITS.fetch_add(fallback_waiter_visits, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_futex_manager_state(queue_count: usize, waiter_count: usize) {
+    update_max(&FUTEX_QUEUE_COUNT_MAX, queue_count);
+    update_max(&FUTEX_WAITER_COUNT_MAX, waiter_count);
+}
+
 pub(crate) fn snapshot() -> KernelPerfSnapshot {
     KernelPerfSnapshot {
         scheduler_fetch_calls: SCHEDULER_FETCH_CALLS.load(Ordering::Relaxed),
@@ -353,6 +395,16 @@ pub(crate) fn snapshot() -> KernelPerfSnapshot {
         mmap_hole_gap_checks: MMAP_HOLE_GAP_CHECKS.load(Ordering::Relaxed),
         mmap_hole_area_visits: MMAP_HOLE_AREA_VISITS.load(Ordering::Relaxed),
         mmap_vma_count_max: MMAP_VMA_COUNT_MAX.load(Ordering::Relaxed),
+        futex_cleanup_calls: FUTEX_CLEANUP_CALLS.load(Ordering::Relaxed),
+        futex_cleanup_direct_hits: FUTEX_CLEANUP_DIRECT_HITS.load(Ordering::Relaxed),
+        futex_cleanup_already_unqueued: FUTEX_CLEANUP_ALREADY_UNQUEUED.load(Ordering::Relaxed),
+        futex_cleanup_fallback_scans: FUTEX_CLEANUP_FALLBACK_SCANS.load(Ordering::Relaxed),
+        futex_cleanup_fallback_queue_visits: FUTEX_CLEANUP_FALLBACK_QUEUE_VISITS
+            .load(Ordering::Relaxed),
+        futex_cleanup_fallback_waiter_visits: FUTEX_CLEANUP_FALLBACK_WAITER_VISITS
+            .load(Ordering::Relaxed),
+        futex_queue_count_max: FUTEX_QUEUE_COUNT_MAX.load(Ordering::Relaxed),
+        futex_waiter_count_max: FUTEX_WAITER_COUNT_MAX.load(Ordering::Relaxed),
     }
 }
 
@@ -415,7 +467,15 @@ pub(crate) fn stats_content() -> String {
          mmap_hole_page_probes {}\n\
          mmap_hole_gap_checks {}\n\
          mmap_hole_area_visits {}\n\
-         mmap_vma_count_max {}\n",
+         mmap_vma_count_max {}\n\
+         futex_cleanup_calls {}\n\
+         futex_cleanup_direct_hits {}\n\
+         futex_cleanup_already_unqueued {}\n\
+         futex_cleanup_fallback_scans {}\n\
+         futex_cleanup_fallback_queue_visits {}\n\
+         futex_cleanup_fallback_waiter_visits {}\n\
+         futex_queue_count_max {}\n\
+         futex_waiter_count_max {}\n",
         stats.scheduler_fetch_calls,
         stats.scheduler_scanned_tasks,
         stats.scheduler_pruned_exited_tasks,
@@ -473,5 +533,13 @@ pub(crate) fn stats_content() -> String {
         stats.mmap_hole_gap_checks,
         stats.mmap_hole_area_visits,
         stats.mmap_vma_count_max,
+        stats.futex_cleanup_calls,
+        stats.futex_cleanup_direct_hits,
+        stats.futex_cleanup_already_unqueued,
+        stats.futex_cleanup_fallback_scans,
+        stats.futex_cleanup_fallback_queue_visits,
+        stats.futex_cleanup_fallback_waiter_visits,
+        stats.futex_queue_count_max,
+        stats.futex_waiter_count_max,
     )
 }
