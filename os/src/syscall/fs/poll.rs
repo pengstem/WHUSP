@@ -1,8 +1,10 @@
 use crate::fs::PollEvents;
 use crate::task::{
-    current_has_interrupting_signal, current_user_token, suspend_current_and_run_next,
+    block_current_task_no_schedule, current_has_interrupting_signal, current_task,
+    current_user_token, schedule, suspend_current_and_run_next,
 };
 use crate::timer::get_time_ms;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::super::errno::{SysError, SysResult};
@@ -14,6 +16,37 @@ use super::uapi::{LinuxPollFd, PPOLL_MAX_NFDS};
 
 const SELECT_MAX_NFDS: usize = 1024;
 const FD_SET_WORD_BITS: usize = usize::BITS as usize;
+
+struct ProcSleepGuard {
+    task: Arc<crate::task::TaskControlBlock>,
+}
+
+impl ProcSleepGuard {
+    fn new() -> SysResult<Self> {
+        let task = current_task().ok_or(SysError::ESRCH)?;
+        task.inner_exclusive_access().proc_sleeping = true;
+        Ok(Self { task })
+    }
+}
+
+impl Drop for ProcSleepGuard {
+    fn drop(&mut self) {
+        self.task.inner_exclusive_access().proc_sleeping = false;
+    }
+}
+
+fn suspend_poll_waiter() -> SysResult {
+    let _sleep_guard = ProcSleepGuard::new()?;
+    suspend_current_and_run_next();
+    Ok(0)
+}
+
+fn block_signal_only_waiter() -> SysResult {
+    let (blocked_task, task_cx_ptr) = block_current_task_no_schedule();
+    drop(blocked_task);
+    schedule(task_cx_ptr);
+    Ok(0)
+}
 
 fn read_user_pollfds(
     token: usize,
@@ -113,7 +146,11 @@ pub fn sys_ppoll(
         if current_has_interrupting_signal() {
             return Err(SysError::EINTR);
         }
-        suspend_current_and_run_next();
+        if pollfds.is_empty() && deadline_ms.is_none() {
+            block_signal_only_waiter()?;
+        } else {
+            suspend_poll_waiter()?;
+        }
     }
 }
 
@@ -235,6 +272,14 @@ pub fn sys_pselect6(
         if current_has_interrupting_signal() {
             return Err(SysError::EINTR);
         }
-        suspend_current_and_run_next();
+        if read_input.is_none()
+            && write_input.is_none()
+            && except_input.is_none()
+            && deadline_ms.is_none()
+        {
+            block_signal_only_waiter()?;
+        } else {
+            suspend_poll_waiter()?;
+        }
     }
 }

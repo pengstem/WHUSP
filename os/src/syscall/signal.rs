@@ -1,9 +1,9 @@
 use crate::task::{
     MINSIGSTKSZ, ProcessControlBlock, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SS_DISABLE, SS_ONSTACK,
     SigAltStack, SignalAction, SignalFlags, SignalInfo, TaskControlBlock,
-    current_has_interrupting_signal, current_process, current_task, current_trap_cx,
-    current_user_token, flags_to_linux_sigset, linux_sigset_to_flags, pid2process,
-    processes_snapshot, queue_signal_to_task, suspend_current_and_run_next,
+    block_current_task_no_schedule, current_has_interrupting_signal, current_process, current_task,
+    current_trap_cx, current_user_token, flags_to_linux_sigset, linux_sigset_to_flags, pid2process,
+    processes_snapshot, queue_signal_to_task, schedule,
 };
 use crate::timer::get_time_ms;
 use alloc::sync::Arc;
@@ -327,10 +327,9 @@ pub fn sys_rt_sigsuspend(mask: *const u8, sigsetsize: usize) -> SysResult {
             task.inner_exclusive_access().sigsuspend_restore_mask = Some(old_mask);
             return Err(SysError::EINTR);
         }
-        // UNFINISHED: Linux rt_sigsuspend sleeps interruptibly until signal
-        // delivery; this kernel still uses cooperative polling instead of a
-        // signal wait queue.
-        suspend_current_and_run_next();
+        let (blocked_task, task_cx_ptr) = block_current_task_no_schedule();
+        drop(blocked_task);
+        schedule(task_cx_ptr);
     }
 }
 
