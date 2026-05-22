@@ -148,6 +148,47 @@ impl PageCache {
         Some(page.ppn().get_bytes_array()[..len].to_vec())
     }
 
+    /// Returns data from a page that was cached only for ordinary read(2).
+    ///
+    /// MAP_SHARED mmap pages keep a nonzero refcount while mapped and have
+    /// separate dirty/writeback rules, so the ordinary read cache avoids using
+    /// those pages until the broader page-cache coherency model is unified.
+    pub(crate) fn copy_read_cache_page_data(
+        &self,
+        key: PageCacheKey,
+        page_offset: usize,
+        len: usize,
+        dst: &mut [u8],
+    ) -> Option<usize> {
+        let page = self.pages.get(&key)?;
+        if page.ref_count != 0 || page.dirty || page_offset >= PAGE_SIZE {
+            return None;
+        }
+        let len = len.min(PAGE_SIZE - page_offset).min(dst.len());
+        dst[..len].copy_from_slice(&page.ppn().get_bytes_array()[page_offset..page_offset + len]);
+        Some(len)
+    }
+
+    /// Inserts a clean unpinned page for ordinary read(2) reuse.
+    pub(crate) fn insert_read_cache_page(
+        &mut self,
+        key: PageCacheKey,
+        frame: FrameTracker,
+        file_size_at_load: usize,
+    ) {
+        self.pages
+            .entry(key)
+            .or_insert_with(|| PageCachePage::new(frame, key, file_size_at_load));
+    }
+
+    /// Drops clean unpinned ordinary-read pages for one file.
+    pub(crate) fn invalidate_clean_unreferenced(&mut self, id: PageCacheId) -> usize {
+        let before = self.pages.len();
+        self.pages
+            .retain(|key, page| key.id != id || page.ref_count != 0 || page.dirty);
+        before.saturating_sub(self.pages.len())
+    }
+
     /// Marks a shared mmap page dirty after the first write fault.
     pub(crate) fn mark_dirty(&mut self, key: PageCacheKey) -> bool {
         let Some(page) = self.pages.get_mut(&key) else {

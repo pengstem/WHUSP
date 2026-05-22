@@ -3,7 +3,8 @@ use super::mount::{mounted_root_for_any_path, with_mount};
 use super::path::{PathContext, WorkingDir};
 use super::vfs::{
     FsError, FsNodeKind, FsResult, LookupMode, VfsCreateTarget, VfsNodeId,
-    resolve_create_parent_in, resolve_existing_in, resolve_mount_target_in,
+    invalidate_regular_file_read_cache, resolve_create_parent_in, resolve_existing_in,
+    resolve_mount_target_in,
 };
 use bitflags::*;
 use lwext4_rust::ffi::EXT4_ROOT_INO;
@@ -382,7 +383,7 @@ pub(crate) fn rename_in(
         return Err(FsError::Busy);
     }
 
-    match lookup_create_target(&new_context, &new_target)? {
+    let replaced_target = match lookup_create_target(&new_context, &new_target)? {
         Some((new_node, new_kind, new_is_synthetic)) => {
             if new_has_trailing_slash && new_kind != FsNodeKind::Directory {
                 return Err(FsError::NotDir);
@@ -404,13 +405,15 @@ pub(crate) fn rename_in(
             if old_kind != FsNodeKind::Directory && new_kind == FsNodeKind::Directory {
                 return Err(FsError::IsDir);
             }
+            Some((new_node, new_kind))
         }
         None => {
             if new_has_trailing_slash {
                 return Err(FsError::NotFound);
             }
+            None
         }
-    }
+    };
 
     if old_is_synthetic {
         return Err(FsError::Busy);
@@ -432,6 +435,9 @@ pub(crate) fn rename_in(
     if new_target.parent != old_target.parent {
         dentry_cache::invalidate_parent(new_target.parent);
     }
+    if let Some((node, kind)) = replaced_target {
+        invalidate_regular_file_read_cache(node, kind);
+    }
     Ok(())
 }
 
@@ -441,7 +447,7 @@ pub(crate) fn unlink_file_in(context: PathContext, name: &str) -> FsResult {
         return Err(FsError::IsDir);
     }
     let target = resolve_create_parent_in(context.clone(), trimmed_nonroot_path(name))?;
-    let Some((_, kind, is_synthetic)) = lookup_create_target(&context, &target)? else {
+    let Some((node, kind, is_synthetic)) = lookup_create_target(&context, &target)? else {
         return Err(FsError::NotFound);
     };
     if trailing_slash && kind != FsNodeKind::Directory {
@@ -458,6 +464,7 @@ pub(crate) fn unlink_file_in(context: PathContext, name: &str) -> FsResult {
     })
     .ok_or(FsError::Io)??;
     dentry_cache::invalidate_parent(target.parent);
+    invalidate_regular_file_read_cache(node, kind);
     Ok(())
 }
 

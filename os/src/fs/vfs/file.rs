@@ -15,7 +15,12 @@ use super::super::{
 };
 use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
-use crate::mm::{UserBuffer, page_cache::PageCacheId};
+use crate::config::PAGE_SIZE;
+use crate::mm::{
+    UserBuffer, frame_alloc,
+    page_cache::{PAGE_CACHE, PageCacheId, PageCacheKey},
+};
+use crate::perf;
 use crate::sync::SleepMutex;
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -29,6 +34,8 @@ use lazy_static::lazy_static;
 // Bound each backend write while a shared file offset lock is held; large user
 // buffers still progress in order without monopolizing one mount backend.
 const VFS_WRITE_CHUNK_SIZE: usize = 64 * 1024;
+const VFS_READ_CACHE_MAX_FILE_SIZE: usize = 1024 * 1024;
+const VFS_READ_CACHE_MAX_PAGES: usize = 4096;
 const MODE_PERMISSIONS_MASK: u32 = 0o7777;
 const MODE_SETGID: u32 = 0o2000;
 const TMPFILE_CREATE_ATTEMPTS: usize = 64;
@@ -74,6 +81,25 @@ fn ensure_mount_writable(mount_id: MountId) -> FsResult {
         Err(FsError::ReadOnly)
     } else {
         Ok(())
+    }
+}
+
+fn page_cache_id_for_node(node: VfsNodeId, kind: FsNodeKind) -> Option<PageCacheId> {
+    if kind != FsNodeKind::RegularFile || !mount_supports_page_cache(node.mount_id) {
+        return None;
+    }
+    Some(PageCacheId::new(node.mount_id, node.ino))
+}
+
+pub(crate) fn invalidate_regular_file_read_cache(node: VfsNodeId, kind: FsNodeKind) {
+    let Some(id) = page_cache_id_for_node(node, kind) else {
+        return;
+    };
+    let removed = PAGE_CACHE
+        .exclusive_access()
+        .invalidate_clean_unreferenced(id);
+    if removed > 0 {
+        perf::record_vfs_read_cache_invalidation(removed);
     }
 }
 
@@ -177,7 +203,7 @@ impl VfsFile {
         let visible_path = path.visible_path;
         with_mount(node.mount_id, |mount| mount.retain_inode(node.ino)).ok_or(FsError::Io)??;
         track_writable_regular_open(node, kind, writable);
-        Ok(Self {
+        let file = Self {
             node,
             parent,
             kind,
@@ -188,7 +214,11 @@ impl VfsFile {
             writable,
             status_flags: StatusFlagsCell::new(status_flags),
             suppress_fanotify,
-        })
+        };
+        if writable {
+            invalidate_regular_file_read_cache(node, kind);
+        }
+        Ok(file)
     }
 
     pub(crate) fn read_all(&self) -> Vec<u8> {
@@ -236,6 +266,7 @@ impl VfsFile {
     }
 
     fn write_at_chunks(&self, offset: usize, buf: &[u8]) -> usize {
+        invalidate_regular_file_read_cache(self.node, self.kind);
         let mut total_write_size = 0usize;
         for chunk in buf.chunks(VFS_WRITE_CHUNK_SIZE) {
             let Some(chunk_offset) = offset.checked_add(total_write_size) else {
@@ -372,6 +403,109 @@ impl VfsFile {
         )?;
         Ok((read_size, SYNTHETIC_DIRENT_OFFSET_BASE + next_entry_offset))
     }
+
+    fn read_cache_id_for_size(&self, file_size: usize) -> Option<PageCacheId> {
+        if self.writable
+            || file_size > VFS_READ_CACHE_MAX_FILE_SIZE
+            || regular_file_node_is_open_writable(self.node)
+        {
+            return None;
+        }
+        page_cache_id_for_node(self.node, self.kind)
+    }
+
+    fn read_regular_cached_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        if buf.is_empty() {
+            return Some(0);
+        }
+        let stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))?.ok()?;
+        let file_size = stat.size as usize;
+        let id = self.read_cache_id_for_size(file_size)?;
+        let mut total_read_size = 0usize;
+
+        while total_read_size < buf.len() {
+            let file_offset = offset.checked_add(total_read_size)?;
+            if file_offset >= file_size {
+                break;
+            }
+            let page_start = file_offset / PAGE_SIZE * PAGE_SIZE;
+            let page_offset = file_offset - page_start;
+            let valid_len = PAGE_SIZE.min(file_size - page_start);
+            if page_offset >= valid_len {
+                break;
+            }
+            let copy_len = (buf.len() - total_read_size).min(valid_len - page_offset);
+            let key = PageCacheKey {
+                id,
+                page_index: page_start / PAGE_SIZE,
+            };
+
+            if let Some(read_size) = PAGE_CACHE.exclusive_access().copy_read_cache_page_data(
+                key,
+                page_offset,
+                copy_len,
+                &mut buf[total_read_size..total_read_size + copy_len],
+            ) {
+                total_read_size += read_size;
+                perf::record_vfs_read_cache_hit(read_size);
+                continue;
+            }
+
+            perf::record_vfs_read_cache_miss();
+            if PAGE_CACHE.exclusive_access().len() >= VFS_READ_CACHE_MAX_PAGES {
+                let read_size = with_mount(self.node.mount_id, |mount| {
+                    mount.read_at(
+                        self.node.ino,
+                        &mut buf[total_read_size..],
+                        file_offset as u64,
+                    )
+                })
+                .expect("filesystem mount is missing");
+                perf::record_vfs_read_cache_backend_read();
+                total_read_size += read_size;
+                break;
+            }
+            let Some(frame) = frame_alloc() else {
+                let read_size = with_mount(self.node.mount_id, |mount| {
+                    mount.read_at(
+                        self.node.ino,
+                        &mut buf[total_read_size..],
+                        file_offset as u64,
+                    )
+                })
+                .expect("filesystem mount is missing");
+                perf::record_vfs_read_cache_backend_read();
+                total_read_size += read_size;
+                break;
+            };
+
+            let read_len = {
+                let dst = &mut frame.ppn.get_bytes_array()[..valid_len];
+                with_mount(self.node.mount_id, |mount| {
+                    mount.read_at(self.node.ino, dst, page_start as u64)
+                })
+                .expect("filesystem mount is missing")
+            };
+            perf::record_vfs_read_cache_backend_read();
+            if read_len == 0 || page_offset >= read_len {
+                break;
+            }
+            let copy_len = copy_len.min(read_len - page_offset);
+            buf[total_read_size..total_read_size + copy_len]
+                .copy_from_slice(&frame.ppn.get_bytes_array()[page_offset..page_offset + copy_len]);
+            if read_len == valid_len {
+                PAGE_CACHE
+                    .exclusive_access()
+                    .insert_read_cache_page(key, frame, file_size);
+            }
+            total_read_size += copy_len;
+            if read_len < valid_len {
+                break;
+            }
+        }
+
+        Some(total_read_size)
+    }
 }
 
 fn parent_hint_for_open(context: &PathContext, name: &str) -> Option<VfsNodeId> {
@@ -428,6 +562,7 @@ fn open_vfs_file_impl(
                 }
                 if flags.contains(OpenFlags::TRUNC) && flags.writable_target() {
                     ensure_mount_writable(path.node.mount_id)?;
+                    invalidate_regular_file_read_cache(path.node, path.kind);
                     with_mount(path.node.mount_id, |mount| mount.set_len(path.node.ino, 0))
                         .ok_or(FsError::Io)??;
                 }
@@ -675,6 +810,7 @@ pub(crate) fn open_file_handle_node(
     }
     if kind == FsNodeKind::RegularFile && flags.contains(OpenFlags::TRUNC) && writable {
         ensure_mount_writable(node.mount_id)?;
+        invalidate_regular_file_read_cache(node, kind);
         with_mount(node.mount_id, |mount| mount.set_len(node.ino, 0)).ok_or(FsError::Io)??;
     }
 
@@ -809,6 +945,7 @@ pub(crate) fn truncate_in(context: PathContext, name: &str, len: usize) -> FsRes
         return Err(FsError::InvalidInput);
     }
     ensure_mount_writable(path.node.mount_id)?;
+    invalidate_regular_file_read_cache(path.node, path.kind);
     with_mount(path.node.mount_id, |mount| {
         mount.set_len(path.node.ino, len as u64)
     })
@@ -837,10 +974,14 @@ impl File for VfsFile {
         let mut offset = self.offset.lock();
         let mut total_read_size = 0usize;
         for slice in buf.buffers.iter_mut() {
-            let read_size = with_mount(self.node.mount_id, |mount| {
-                mount.read_at(self.node.ino, slice, *offset as u64)
-            })
-            .expect("filesystem mount is missing");
+            let read_size = self
+                .read_regular_cached_at(*offset, slice)
+                .unwrap_or_else(|| {
+                    with_mount(self.node.mount_id, |mount| {
+                        mount.read_at(self.node.ino, slice, *offset as u64)
+                    })
+                    .expect("filesystem mount is missing")
+                });
             if read_size == 0 {
                 break;
             }
@@ -874,10 +1015,12 @@ impl File for VfsFile {
             return 0;
         }
         let noatime_snapshot = self.noatime_snapshot();
-        let read_size = with_mount(self.node.mount_id, |mount| {
-            mount.read_at(self.node.ino, buf, offset as u64)
-        })
-        .expect("filesystem mount is missing");
+        let read_size = self.read_regular_cached_at(offset, buf).unwrap_or_else(|| {
+            with_mount(self.node.mount_id, |mount| {
+                mount.read_at(self.node.ino, buf, offset as u64)
+            })
+            .expect("filesystem mount is missing")
+        });
         if !buf.is_empty() {
             self.restore_noatime(noatime_snapshot);
         }
@@ -899,6 +1042,7 @@ impl File for VfsFile {
             return Err(FsError::PermissionDenied);
         }
         self.check_set_len(len)?;
+        invalidate_regular_file_read_cache(self.node, self.kind);
         with_mount(self.node.mount_id, |mount| {
             mount.set_len(self.node.ino, len as u64)
         })
@@ -1088,10 +1232,7 @@ impl File for VfsFile {
     }
 
     fn page_cache_id(&self) -> Option<PageCacheId> {
-        if self.kind != FsNodeKind::RegularFile || !mount_supports_page_cache(self.node.mount_id) {
-            return None;
-        }
-        Some(PageCacheId::new(self.node.mount_id, self.node.ino))
+        page_cache_id_for_node(self.node, self.kind)
     }
 
     fn status_flags(&self) -> OpenFlags {
