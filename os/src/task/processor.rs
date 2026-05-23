@@ -54,6 +54,10 @@ pub fn run_tasks() {
             super::reap_exited_tasks();
         } else {
             drop(processor);
+            #[cfg(target_arch = "loongarch64")]
+            // CONTEXT: LA UART IRQ dispatch is not wired yet. Poll the console
+            // while idle so stdin poll/select waiters can be woken by typed data.
+            crate::fs::console_tty_drain_uart();
             hart::enable_interrupt_and_wait();
         }
     }

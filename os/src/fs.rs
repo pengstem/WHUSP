@@ -37,7 +37,6 @@ use core::{
 };
 
 pub(crate) use anonfd::make_anonymous_fd;
-#[cfg(target_arch = "riscv64")]
 pub(crate) use console_tty::console_tty_drain_uart;
 pub(crate) use console_tty::{
     LinuxTermio, LinuxTermios, LinuxTermios2, LinuxWinsize, apply_console_tty_termio,

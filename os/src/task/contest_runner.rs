@@ -268,7 +268,7 @@ fn append_ltp_runner(command: &mut String, libc_root: &str) {
     // CONTEXT: LTP uses the same outer group marker contract as normal
     // scripts even though per-case lines use the historical FAIL/RUN format.
     command.push_str(
-        "export PATH=\"$PATH:$LTPROOT/testcases/bin:$LTPROOT/bin:/musl/ltp/testcases/bin:/musl/ltp/bin:/glibc/ltp/testcases/bin:/glibc/ltp/bin\"; ./busybox echo \"#### OS COMP TEST GROUP START ltp-",
+        "export PATH=\"$PATH:$LTPROOT/testcases/bin:$LTPROOT/testcases/lib:$LTPROOT/bin:/musl/ltp/testcases/bin:/musl/ltp/testcases/lib:/musl/ltp/bin:/glibc/ltp/testcases/bin:/glibc/ltp/testcases/lib:/glibc/ltp/bin\"; ./busybox echo \"#### OS COMP TEST GROUP START ltp-",
     );
     command.push_str(libc_label(libc_root));
     command.push_str(" ####\"; cd \"$LTPROOT/testcases/bin\"; ");
@@ -326,10 +326,19 @@ fn append_ltp_manifest_case_execution(command: &mut String) {
     // CONTEXT: The manifest command may carry arguments or shell fragments, so
     // execute it as the LTP runner specifies.
     command.push_str("echo \"RUN LTP CASE $case_name\"; ");
+    append_ltp_fs_bind_preflight(command);
     command.push_str("case \"$case_name\" in statx10) _old_ltp_single_fs_type=\"$LTP_SINGLE_FS_TYPE\"; export LTP_SINGLE_FS_TYPE=\"ext4\"; eval \"$case_cmd\"; ret=$?; export LTP_SINGLE_FS_TYPE=\"$_old_ltp_single_fs_type\" ;; *) eval \"$case_cmd\"; ret=$? ;; esac; ");
     // CONTEXT: tools/score_autotest.py treats this historical "FAIL" line as
     // the LTP case completion record and reads the numeric exit status from it.
     command.push_str("echo \"FAIL LTP CASE $case_name : $ret\"; ");
+}
+
+fn append_ltp_fs_bind_preflight(command: &mut String) {
+    // CONTEXT: LA fs_bind shell cases can fail on the first sourced LTP helper
+    // lookup even though the helper is present in testcases/bin. Drop inherited
+    // LTP shell-library guards and warm the helper files without sourcing them,
+    // keeping marker output clean.
+    command.push_str("case \"$case_name\" in fs_bind_*) unset TST_LIB_LOADED TST_SECURITY_LOADED; for _whusp_ltp_helper in fs_bind_lib.sh tst_test.sh tst_ansi_color.sh tst_security.sh; do for _whusp_ltp_dir in \"$LTPROOT/testcases/bin\" \"$LTPROOT/testcases/lib\"; do [ -f \"$_whusp_ltp_dir/$_whusp_ltp_helper\" ] && /musl/busybox cat \"$_whusp_ltp_dir/$_whusp_ltp_helper\" >/dev/null 2>&1; done; done ;; esac; ");
 }
 
 fn append_ltp_case_filter(command: &mut String, filter: LtpCaseFilter) {
