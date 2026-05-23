@@ -3,13 +3,13 @@
 pub mod bus;
 
 use self::bus::{
-    ConfigurationAccess, DeviceFunction, DeviceFunctionInfo, PCI_CAP_ID_VNDR, PciError, PciRoot,
+    ConfigurationAccess, DeviceFunction, DeviceFunctionInfo, PciError, PciRoot, PCI_CAP_ID_VNDR,
 };
 use super::{DeviceStatus, DeviceType, Transport};
 use crate::{
-    Error,
     hal::{Hal, PhysAddr},
     transport::InterruptStatus,
+    Error,
 };
 use core::{
     mem::{align_of, size_of},
@@ -17,10 +17,23 @@ use core::{
     ptr::NonNull,
 };
 use safe_mmio::{
-    UniqueMmioPointer, field, field_shared,
+    field, field_shared,
     fields::{ReadOnly, ReadPure, ReadPureWrite, WriteOnly},
+    UniqueMmioPointer,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
+
+#[cfg(target_arch = "loongarch64")]
+#[inline]
+fn dma_sync_barrier() {
+    unsafe {
+        core::arch::asm!("dbar 0", options(nostack, preserves_flags));
+    }
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+#[inline]
+fn dma_sync_barrier() {}
 
 /// The PCI vendor ID for VirtIO devices.
 pub const VIRTIO_VENDOR_ID: u16 = 0x1af4;
@@ -252,7 +265,9 @@ impl Transport for PciTransport {
 
         let offset_bytes = usize::from(queue_notify_off) * self.notify_off_multiplier as usize;
         let index = offset_bytes / size_of::<u16>();
+        dma_sync_barrier();
         self.notify_region.get(index).unwrap().write(queue);
+        dma_sync_barrier();
     }
 
     fn get_status(&self) -> DeviceStatus {
@@ -262,6 +277,7 @@ impl Transport for PciTransport {
 
     fn set_status(&mut self, status: DeviceStatus) {
         field!(self.common_cfg, device_status).write(status.bits() as u8);
+        dma_sync_barrier();
     }
 
     fn set_guest_page_size(&mut self, _guest_page_size: u32) {

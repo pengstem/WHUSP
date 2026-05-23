@@ -11,7 +11,7 @@ mod owning;
 pub use self::owning::OwningQueue;
 use crate::hal::{BufferDirection, Dma, Hal, PhysAddr};
 use crate::transport::Transport;
-use crate::{Error, PAGE_SIZE, Result, align_up, pages};
+use crate::{align_up, pages, Error, Result, PAGE_SIZE};
 #[cfg(feature = "alloc")]
 use alloc::boxed::Box;
 use bitflags::bitflags;
@@ -23,8 +23,20 @@ use core::mem::{size_of, take};
 #[cfg(test)]
 use core::ptr;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU16, Ordering, fence};
+use core::sync::atomic::{fence, AtomicU16, Ordering};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
+
+#[cfg(target_arch = "loongarch64")]
+#[inline]
+fn dma_sync_barrier() {
+    unsafe {
+        core::arch::asm!("dbar 0", options(nostack, preserves_flags));
+    }
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+#[inline]
+fn dma_sync_barrier() {}
 
 /// The mechanism for bulk data transport on virtio devices.
 ///
@@ -198,6 +210,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
 
         // Write barrier so that device sees changes to descriptor table and available ring before
         // change to available index.
+        dma_sync_barrier();
         fence(Ordering::SeqCst);
 
         // increase head of avail ring
@@ -320,6 +333,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
 
         // Notify the queue.
         if self.should_notify() {
+            dma_sync_barrier();
             transport.notify(self.queue_idx);
         }
 
@@ -380,6 +394,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
     pub fn can_pop(&self) -> bool {
         // SAFETY: `self.used` points to a valid, aligned, initialised, dereferenceable, readable
         // instance of `UsedRing`.
+        dma_sync_barrier();
         self.last_used_idx != unsafe { (*self.used.as_ptr()).idx.load(Ordering::Acquire) }
     }
 
@@ -528,6 +543,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         let len;
         // SAFETY: `self.used` points to a valid, aligned, initialised, dereferenceable, readable
         // instance of `UsedRing`.
+        dma_sync_barrier();
         unsafe {
             index = (*self.used.as_ptr()).ring[last_used_slot as usize].id as u16;
             len = (*self.used.as_ptr()).ring[last_used_slot as usize].len;
@@ -999,9 +1015,9 @@ mod tests {
         device::common::Feature,
         hal::fake::FakeHal,
         transport::{
-            DeviceType,
             fake::{FakeTransport, QueueStatus, State},
-            mmio::{MODERN_VERSION, MmioTransport, VirtIOHeader},
+            mmio::{MmioTransport, VirtIOHeader, MODERN_VERSION},
+            DeviceType,
         },
     };
     use safe_mmio::UniqueMmioPointer;
