@@ -65,6 +65,11 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) vma_lookup_calls: usize,
     pub(crate) vma_lookup_hits: usize,
     pub(crate) vma_lookup_area_probes: usize,
+    pub(crate) user_c_string_calls: usize,
+    pub(crate) user_c_string_page_chunks: usize,
+    pub(crate) user_c_string_scanned_bytes: usize,
+    pub(crate) user_c_string_ascii_fast_bytes: usize,
+    pub(crate) user_c_string_fallback_bytes: usize,
     pub(crate) futex_cleanup_calls: usize,
     pub(crate) futex_cleanup_direct_hits: usize,
     pub(crate) futex_cleanup_already_unqueued: usize,
@@ -143,6 +148,11 @@ static MMAP_VMA_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
 static VMA_LOOKUP_CALLS: AtomicUsize = AtomicUsize::new(0);
 static VMA_LOOKUP_HITS: AtomicUsize = AtomicUsize::new(0);
 static VMA_LOOKUP_AREA_PROBES: AtomicUsize = AtomicUsize::new(0);
+static USER_C_STRING_CALLS: AtomicUsize = AtomicUsize::new(0);
+static USER_C_STRING_PAGE_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+static USER_C_STRING_SCANNED_BYTES: AtomicUsize = AtomicUsize::new(0);
+static USER_C_STRING_ASCII_FAST_BYTES: AtomicUsize = AtomicUsize::new(0);
+static USER_C_STRING_FALLBACK_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 static FUTEX_CLEANUP_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FUTEX_CLEANUP_DIRECT_HITS: AtomicUsize = AtomicUsize::new(0);
@@ -331,6 +341,20 @@ pub(crate) fn record_vma_lookup(area_probes: usize, hit: bool) {
     }
 }
 
+pub(crate) fn record_user_c_string_call() {
+    USER_C_STRING_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_user_c_string_chunk(scanned_bytes: usize, copied_bytes: usize, ascii: bool) {
+    USER_C_STRING_PAGE_CHUNKS.fetch_add(1, Ordering::Relaxed);
+    USER_C_STRING_SCANNED_BYTES.fetch_add(scanned_bytes, Ordering::Relaxed);
+    if ascii {
+        USER_C_STRING_ASCII_FAST_BYTES.fetch_add(copied_bytes, Ordering::Relaxed);
+    } else {
+        USER_C_STRING_FALLBACK_BYTES.fetch_add(copied_bytes, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn record_futex_cleanup(
     direct_hit: bool,
     already_unqueued: bool,
@@ -419,6 +443,11 @@ pub(crate) fn snapshot() -> KernelPerfSnapshot {
         vma_lookup_calls: VMA_LOOKUP_CALLS.load(Ordering::Relaxed),
         vma_lookup_hits: VMA_LOOKUP_HITS.load(Ordering::Relaxed),
         vma_lookup_area_probes: VMA_LOOKUP_AREA_PROBES.load(Ordering::Relaxed),
+        user_c_string_calls: USER_C_STRING_CALLS.load(Ordering::Relaxed),
+        user_c_string_page_chunks: USER_C_STRING_PAGE_CHUNKS.load(Ordering::Relaxed),
+        user_c_string_scanned_bytes: USER_C_STRING_SCANNED_BYTES.load(Ordering::Relaxed),
+        user_c_string_ascii_fast_bytes: USER_C_STRING_ASCII_FAST_BYTES.load(Ordering::Relaxed),
+        user_c_string_fallback_bytes: USER_C_STRING_FALLBACK_BYTES.load(Ordering::Relaxed),
         futex_cleanup_calls: FUTEX_CLEANUP_CALLS.load(Ordering::Relaxed),
         futex_cleanup_direct_hits: FUTEX_CLEANUP_DIRECT_HITS.load(Ordering::Relaxed),
         futex_cleanup_already_unqueued: FUTEX_CLEANUP_ALREADY_UNQUEUED.load(Ordering::Relaxed),
@@ -496,6 +525,11 @@ pub(crate) fn stats_content() -> String {
          vma_lookup_calls {}\n\
          vma_lookup_hits {}\n\
          vma_lookup_area_probes {}\n\
+         user_c_string_calls {}\n\
+         user_c_string_page_chunks {}\n\
+         user_c_string_scanned_bytes {}\n\
+         user_c_string_ascii_fast_bytes {}\n\
+         user_c_string_fallback_bytes {}\n\
          futex_cleanup_calls {}\n\
          futex_cleanup_direct_hits {}\n\
          futex_cleanup_already_unqueued {}\n\
@@ -565,6 +599,11 @@ pub(crate) fn stats_content() -> String {
         stats.vma_lookup_calls,
         stats.vma_lookup_hits,
         stats.vma_lookup_area_probes,
+        stats.user_c_string_calls,
+        stats.user_c_string_page_chunks,
+        stats.user_c_string_scanned_bytes,
+        stats.user_c_string_ascii_fast_bytes,
+        stats.user_c_string_fallback_bytes,
         stats.futex_cleanup_calls,
         stats.futex_cleanup_direct_hits,
         stats.futex_cleanup_already_unqueued,

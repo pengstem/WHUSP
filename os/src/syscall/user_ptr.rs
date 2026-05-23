@@ -1,4 +1,5 @@
 use crate::mm::{MemorySet, MmapFaultAccess, PageTable, StepByOne, VirtAddr};
+use crate::perf;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::{MaybeUninit, size_of};
@@ -152,6 +153,7 @@ pub(crate) fn read_user_c_string(
 
     let mut string = String::with_capacity(64);
     let mut offset = 0usize;
+    perf::record_user_c_string_call();
     while offset < max_len {
         let addr = (ptr as usize).checked_add(offset).ok_or(SysError::EFAULT)?;
         let page_remaining = crate::config::PAGE_SIZE - (addr & (crate::config::PAGE_SIZE - 1));
@@ -164,19 +166,46 @@ pub(crate) fn read_user_c_string(
             Some(mmap_user_fault),
         )?;
         for buffer in &buffers {
-            for &byte in buffer.iter() {
-                if byte == 0 {
-                    return Ok(string);
-                }
-                // UNFINISHED: Linux pathnames are byte strings except for NUL.
-                // This syscall layer stores them as Rust `String`, so
-                // non-ASCII pathname bytes are not preserved byte-for-byte yet.
-                string.push(byte as char);
+            let (text_len, found_nul, is_ascii) = scan_c_string_chunk(buffer);
+            let text = &buffer[..text_len];
+            perf::record_user_c_string_chunk(text_len + usize::from(found_nul), text_len, is_ascii);
+            append_user_string_bytes(&mut string, text, is_ascii);
+            if found_nul {
+                return Ok(string);
             }
         }
         offset += chunk_len;
     }
     Err(SysError::ENAMETOOLONG)
+}
+
+fn scan_c_string_chunk(buffer: &[u8]) -> (usize, bool, bool) {
+    let mut is_ascii = true;
+    for (idx, &byte) in buffer.iter().enumerate() {
+        if byte == 0 {
+            return (idx, true, is_ascii);
+        }
+        is_ascii &= byte.is_ascii();
+    }
+    (buffer.len(), false, is_ascii)
+}
+
+fn append_user_string_bytes(string: &mut String, bytes: &[u8], is_ascii: bool) {
+    if bytes.is_empty() {
+        return;
+    }
+    if is_ascii {
+        // ASCII bytes are always valid UTF-8, so this preserves the existing
+        // byte-to-char behavior while appending the common pathname case in bulk.
+        string.push_str(unsafe { core::str::from_utf8_unchecked(bytes) });
+        return;
+    }
+    for &byte in bytes {
+        // UNFINISHED: Linux pathnames are byte strings except for NUL. This
+        // syscall layer stores them as Rust `String`, so non-ASCII pathname
+        // bytes are not preserved byte-for-byte yet.
+        string.push(byte as char);
+    }
 }
 
 pub(crate) fn read_user_usize(token: usize, addr: usize) -> SysResult<usize> {
