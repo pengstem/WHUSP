@@ -1,5 +1,7 @@
 use super::status_flags::StatusFlagsCell;
-use super::{File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFIFO};
+use super::{
+    File, FileStat, FsError, FsResult, OpenFlags, PollEvents, PollWaitQueue, PollWaiter, S_IFIFO,
+};
 use crate::config::PAGE_SIZE;
 use crate::fs::pipe_max_size;
 use crate::mm::UserBuffer;
@@ -73,8 +75,10 @@ impl Pipe {
             }
             perf::record_pipe_read_chunk_copy(copied);
             let writer = ring_buffer.wake_writer();
+            let poll_writers = ring_buffer.wake_write_poll_waiters();
             drop(ring_buffer);
             wake_task(writer);
+            PollWaiter::wake_all(poll_writers);
             return copied;
         }
     }
@@ -129,8 +133,10 @@ impl Pipe {
             perf::record_pipe_write_chunk_copy(written);
             already_write += written;
             let reader = ring_buffer.wake_reader();
+            let poll_readers = ring_buffer.wake_read_poll_waiters();
             drop(ring_buffer);
             wake_task(reader);
+            PollWaiter::wake_all(poll_readers);
             if already_write == want_to_write {
                 return want_to_write;
             }
@@ -145,7 +151,7 @@ impl Pipe {
             return Err(FsError::InvalidInput);
         }
 
-        let (writer, reader, moved) = {
+        let (writer, reader, poll_writers, poll_readers, moved) = {
             let mut in_buffer = self.buffer.exclusive_access();
             let mut out_buffer = out.buffer.exclusive_access();
             let moved = in_buffer.transfer_to(&mut out_buffer, len);
@@ -159,10 +165,22 @@ impl Pipe {
             } else {
                 None
             };
-            (writer, reader, moved)
+            let poll_writers = if moved > 0 {
+                in_buffer.wake_write_poll_waiters()
+            } else {
+                Vec::new()
+            };
+            let poll_readers = if moved > 0 {
+                out_buffer.wake_read_poll_waiters()
+            } else {
+                Vec::new()
+            };
+            (writer, reader, poll_writers, poll_readers, moved)
         };
         wake_task(writer);
         wake_task(reader);
+        PollWaiter::wake_all(poll_writers);
+        PollWaiter::wake_all(poll_readers);
         Ok(moved)
     }
 }
@@ -187,6 +205,8 @@ pub struct PipeRingBuffer {
     write_end: Option<Weak<Pipe>>,
     read_wait_queue: VecDeque<Arc<TaskControlBlock>>,
     write_wait_queue: VecDeque<Arc<TaskControlBlock>>,
+    read_poll_wait_queue: PollWaitQueue,
+    write_poll_wait_queue: PollWaitQueue,
 }
 
 impl PipeRingBuffer {
@@ -201,6 +221,8 @@ impl PipeRingBuffer {
             write_end: None,
             read_wait_queue: VecDeque::new(),
             write_wait_queue: VecDeque::new(),
+            read_poll_wait_queue: PollWaitQueue::new(),
+            write_poll_wait_queue: PollWaitQueue::new(),
         }
     }
     fn capacity(&self) -> usize {
@@ -387,6 +409,18 @@ impl PipeRingBuffer {
     fn wake_all_writers(&mut self) -> VecDeque<Arc<TaskControlBlock>> {
         core::mem::take(&mut self.write_wait_queue)
     }
+    fn register_read_poll_waiter(&mut self, waiter: &Arc<PollWaiter>) {
+        self.read_poll_wait_queue.register(waiter);
+    }
+    fn register_write_poll_waiter(&mut self, waiter: &Arc<PollWaiter>) {
+        self.write_poll_wait_queue.register(waiter);
+    }
+    fn wake_read_poll_waiters(&mut self) -> Vec<Arc<PollWaiter>> {
+        self.read_poll_wait_queue.drain()
+    }
+    fn wake_write_poll_waiters(&mut self) -> Vec<Arc<PollWaiter>> {
+        self.write_poll_wait_queue.drain()
+    }
 }
 
 /// Return (read_end, write_end)
@@ -433,7 +467,7 @@ impl Drop for Pipe {
         // observable; dropping the read end wakes writers so EPIPE/SIGPIPE
         // can be produced by the syscall layer. Wake after releasing the ring
         // lock because the scheduler may inspect the same pipe state.
-        let (readers, writers) = {
+        let (readers, writers, poll_readers, poll_writers) = {
             let mut ring_buffer = self.buffer.exclusive_access();
             let readers = if self.writable {
                 ring_buffer.wake_all_readers()
@@ -445,10 +479,22 @@ impl Drop for Pipe {
             } else {
                 VecDeque::new()
             };
-            (readers, writers)
+            let poll_readers = if self.writable {
+                ring_buffer.wake_read_poll_waiters()
+            } else {
+                Vec::new()
+            };
+            let poll_writers = if self.readable {
+                ring_buffer.wake_write_poll_waiters()
+            } else {
+                Vec::new()
+            };
+            (readers, writers, poll_readers, poll_writers)
         };
         wake_tasks(readers);
         wake_tasks(writers);
+        PollWaiter::wake_all(poll_readers);
+        PollWaiter::wake_all(poll_writers);
     }
 }
 
@@ -501,7 +547,18 @@ impl File for Pipe {
         self.splice_pipe_to_pipe(out, len).map(Some)
     }
     fn poll(&self, events: PollEvents) -> PollEvents {
-        let ring_buffer = self.buffer.exclusive_access();
+        self.poll_with_wait(events, None)
+    }
+    fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
+        let mut ring_buffer = self.buffer.exclusive_access();
+        if let Some(waiter) = waiter {
+            if self.readable && events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI) {
+                ring_buffer.register_read_poll_waiter(waiter);
+            }
+            if self.writable && events.contains(PollEvents::POLLOUT) {
+                ring_buffer.register_write_poll_waiter(waiter);
+            }
+        }
         let mut ready = PollEvents::empty();
         if self.readable {
             let has_data = ring_buffer.available_read() > 0;

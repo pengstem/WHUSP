@@ -303,6 +303,8 @@ impl ProcessControlBlock {
         let stack_layout = plan_user_stack(expected_user_stack_top, &args, &envs, &stack_info)?;
         let new_token = memory_set.token();
 
+        // From this point on, user stack writes must target `new_token`; the old
+        // process token may already describe the pre-exec image.
         let previous_executable_node = {
             let mut inner = self.inner_exclusive_access();
             inner.memory_set = memory_set;

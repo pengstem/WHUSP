@@ -342,6 +342,9 @@ pub(crate) fn copy_to_user_in_memory_set(
     ptr: *mut u8,
     src: &[u8],
 ) -> SysResult<()> {
+    // Used for child or freshly exec'd address spaces, not necessarily the
+    // current task. Resolve COW against the supplied MemorySet before translating
+    // through its token.
     resolve_cow_write_range_in_memory_set(memory_set, ptr, src.len())?;
     let buffers = translated_byte_buffer_checked(
         memory_set.token(),

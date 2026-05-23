@@ -4,8 +4,8 @@ use super::fd::{get_file_by_fd, install_file_fd};
 use super::path::path_context_from;
 use super::uapi::AT_FDCWD;
 use crate::fs::{
-    File, FileStat, FsError, FsNodeKind, MountId, OpenFlags, PathContext, PollEvents, S_IFIFO,
-    VfsNodeId, lookup_path_in, overlay_real_node,
+    File, FileStat, FsError, FsNodeKind, MountId, OpenFlags, PathContext, PollEvents,
+    PollWaitQueue, PollWaiter, S_IFIFO, VfsNodeId, lookup_path_in, overlay_real_node,
 };
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
@@ -103,6 +103,7 @@ struct InotifyInner {
     events: VecDeque<InotifyEvent>,
     overflow_queued: bool,
     read_waiters: VecDeque<Arc<TaskControlBlock>>,
+    poll_waiters: PollWaitQueue,
 }
 
 struct InotifyGroup {
@@ -160,6 +161,7 @@ impl InotifyGroup {
                     events: VecDeque::new(),
                     overflow_queued: false,
                     read_waiters: VecDeque::new(),
+                    poll_waiters: PollWaitQueue::new(),
                 })
             },
         });
@@ -195,25 +197,24 @@ impl InotifyGroup {
     }
 
     fn remove_watch(&self, wd: i32, emit_ignored: bool) -> SysResult {
-        let waiters = self.inner.exclusive_session(|inner| {
+        let (waiters, poll_waiters) = self.inner.exclusive_session(|inner| {
             let Some(index) = inner.watches.iter().position(|watch| watch.wd == wd) else {
                 return Err(SysError::EINVAL);
             };
             inner.watches.remove(index);
             if emit_ignored {
                 enqueue_event_locked(inner, InotifyEvent::new(wd, IN_IGNORED, 0, None));
-                Ok(core::mem::take(&mut inner.read_waiters))
+                Ok((
+                    core::mem::take(&mut inner.read_waiters),
+                    inner.poll_waiters.drain(),
+                ))
             } else {
-                Ok(VecDeque::new())
+                Ok((VecDeque::new(), Vec::new()))
             }
         })?;
         wake_waiters(waiters);
+        PollWaiter::wake_all(poll_waiters);
         Ok(0)
-    }
-
-    fn has_events(&self) -> bool {
-        self.inner
-            .exclusive_session(|inner| !inner.events.is_empty())
     }
 
     fn read_events(&self, mut user_buf: UserBuffer, nonblocking: bool) -> usize {
@@ -272,7 +273,7 @@ impl InotifyGroup {
         name: Option<&str>,
         include_direct: bool,
     ) {
-        let waiters = self.inner.exclusive_session(|inner| {
+        let (waiters, poll_waiters) = self.inner.exclusive_session(|inner| {
             let mut emitted = false;
             let real_node = overlay_real_node(node);
             let real_parent = parent.and_then(overlay_real_node);
@@ -317,16 +318,20 @@ impl InotifyGroup {
                 }
             }
             if emitted {
-                core::mem::take(&mut inner.read_waiters)
+                (
+                    core::mem::take(&mut inner.read_waiters),
+                    inner.poll_waiters.drain(),
+                )
             } else {
-                VecDeque::new()
+                (VecDeque::new(), Vec::new())
             }
         });
         wake_waiters(waiters);
+        PollWaiter::wake_all(poll_waiters);
     }
 
     fn remove_matching_watches(&self, node: VfsNodeId, emit_unmount: bool) {
-        let waiters = self.inner.exclusive_session(|inner| {
+        let (waiters, poll_waiters) = self.inner.exclusive_session(|inner| {
             let real_node = overlay_real_node(node);
             let targets: Vec<_> = inner
                 .watches
@@ -347,16 +352,20 @@ impl InotifyGroup {
                 }
             }
             if emitted {
-                core::mem::take(&mut inner.read_waiters)
+                (
+                    core::mem::take(&mut inner.read_waiters),
+                    inner.poll_waiters.drain(),
+                )
             } else {
-                VecDeque::new()
+                (VecDeque::new(), Vec::new())
             }
         });
         wake_waiters(waiters);
+        PollWaiter::wake_all(poll_waiters);
     }
 
     fn remove_watches_on_mount(&self, mount: MountId) {
-        let waiters = self.inner.exclusive_session(|inner| {
+        let (waiters, poll_waiters) = self.inner.exclusive_session(|inner| {
             let targets: Vec<_> = inner
                 .watches
                 .iter()
@@ -372,12 +381,16 @@ impl InotifyGroup {
                 }
             }
             if emitted {
-                core::mem::take(&mut inner.read_waiters)
+                (
+                    core::mem::take(&mut inner.read_waiters),
+                    inner.poll_waiters.drain(),
+                )
             } else {
-                VecDeque::new()
+                (VecDeque::new(), Vec::new())
             }
         });
         wake_waiters(waiters);
+        PollWaiter::wake_all(poll_waiters);
     }
 
     fn fdinfo(&self) -> String {
@@ -429,11 +442,24 @@ impl File for InotifyFile {
     }
 
     fn poll(&self, events: PollEvents) -> PollEvents {
-        let mut ready = PollEvents::empty();
-        if events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI) && self.group.has_events() {
-            ready |= PollEvents::POLLIN;
-        }
-        ready
+        self.poll_with_wait(events, None)
+    }
+
+    fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
+        self.group.inner.exclusive_session(|inner| {
+            if let Some(waiter) = waiter
+                && events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI)
+            {
+                inner.poll_waiters.register(waiter);
+            }
+            let mut ready = PollEvents::empty();
+            if events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI)
+                && !inner.events.is_empty()
+            {
+                ready |= PollEvents::POLLIN;
+            }
+            ready
+        })
     }
 
     fn stat(&self) -> Result<FileStat, FsError> {

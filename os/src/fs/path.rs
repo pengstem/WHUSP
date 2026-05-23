@@ -190,6 +190,8 @@ pub(crate) fn normalize_path_at_root(
     cwd_path: &str,
     path: &str,
 ) -> Option<alloc::string::String> {
+    // This is a string-level Linux chroot/cwd view. Symlink traversal and mount
+    // overlay resolution stay in the VFS lookup layer.
     if path.starts_with('/') {
         normalize_path_above_floor(root_path, path, root_path)
     } else if path_inside_root(root_path, cwd_path).is_some() {

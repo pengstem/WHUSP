@@ -157,6 +157,8 @@ fn validate_clone3_args(args: LinuxCloneArgs, token: usize) -> SysResult<()> {
         return Err(SysError::EINVAL);
     }
     if args.flags & CLONE_PIDFD != 0 {
+        // Probe the pidfd result pointer before allocating or publishing the child.
+        // The real fd value is written after reservation succeeds.
         write_user_value(token, args.pidfd as *mut i32, &-1)?;
     }
     Ok(())

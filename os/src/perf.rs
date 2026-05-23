@@ -245,11 +245,6 @@ pub(crate) fn record_poll_scan(fd_visits: usize, ready_events: usize) {
     POLL_WAIT_READY_EVENTS.fetch_add(ready_events, Ordering::Relaxed);
 }
 
-pub(crate) fn record_poll_backoff_sleep(duration_ms: usize) {
-    POLL_BACKOFF_SLEEPS.fetch_add(1, Ordering::Relaxed);
-    POLL_BACKOFF_MS.fetch_add(duration_ms, Ordering::Relaxed);
-}
-
 pub(crate) fn record_vfs_read_cache_hit(bytes: usize) {
     VFS_READ_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
     VFS_READ_CACHE_BYTES.fetch_add(bytes, Ordering::Relaxed);

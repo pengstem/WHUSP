@@ -2,7 +2,7 @@ use super::inode::OpenFlags;
 use super::pipe::{Pipe, default_pipe_capacity_for_current_process, make_pipe};
 use super::status_flags::StatusFlagsCell;
 use super::vfs::{FsError, FsResult, VfsNodeId};
-use super::{File, FileStat, PollEvents, S_IFIFO};
+use super::{File, FileStat, PollEvents, PollWaiter, S_IFIFO};
 use crate::mm::UserBuffer;
 use crate::sync::SleepMutex;
 use alloc::collections::BTreeMap;
@@ -123,15 +123,19 @@ impl File for NamedFifoFile {
     }
 
     fn poll(&self, events: PollEvents) -> PollEvents {
+        self.poll_with_wait(events, None)
+    }
+
+    fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
         let mut ready = PollEvents::empty();
         if let Some(read_end) = &self.read_end {
-            ready |= read_end.poll(events);
+            ready |= read_end.poll_with_wait(events, waiter);
             if self.peer_writers_closed() {
                 ready |= PollEvents::POLLHUP;
             }
         }
         if let Some(write_end) = &self.write_end {
-            ready |= write_end.poll(events);
+            ready |= write_end.poll_with_wait(events, waiter);
             if self.peer_readers_closed() {
                 ready |= PollEvents::POLLOUT | PollEvents::POLLERR;
             }

@@ -1,6 +1,7 @@
 use super::status_flags::StatusFlagsCell;
 use super::{
-    File, FileStat, FsResult, OpenFlags, PollEvents, S_IFCHR, console_tty_poll, console_tty_read,
+    File, FileStat, FsResult, OpenFlags, PollEvents, PollWaiter, S_IFCHR, console_tty_poll,
+    console_tty_poll_with_wait, console_tty_read,
 };
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::UserBuffer;
@@ -48,6 +49,13 @@ impl File for Stdin {
     }
     fn poll(&self, events: PollEvents) -> PollEvents {
         console_tty_poll(events)
+    }
+    fn poll_with_wait(
+        &self,
+        events: PollEvents,
+        waiter: Option<&alloc::sync::Arc<PollWaiter>>,
+    ) -> PollEvents {
+        console_tty_poll_with_wait(events, waiter)
     }
     fn stat(&self) -> FsResult<FileStat> {
         Ok(FileStat::with_mode(S_IFCHR | 0o666))

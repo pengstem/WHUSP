@@ -9,8 +9,8 @@ use super::file_handle::{
 use super::path::path_context_from;
 use super::uapi::AT_FDCWD;
 use crate::fs::{
-    File, FsNodeKind, MountId, OpenFlags, PathContext, PollEvents, VfsNodeId, lookup_path_in,
-    normalize_path_at_root, overlay_real_node,
+    File, FsNodeKind, MountId, OpenFlags, PathContext, PollEvents, PollWaitQueue, PollWaiter,
+    VfsNodeId, lookup_path_in, normalize_path_at_root, overlay_real_node,
 };
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
@@ -232,6 +232,7 @@ struct FanotifyInner {
     marks: Vec<FanotifyMark>,
     events: VecDeque<FanotifyEvent>,
     read_waiters: VecDeque<Arc<TaskControlBlock>>,
+    poll_waiters: PollWaitQueue,
     overflow_queued: bool,
 }
 
@@ -261,6 +262,7 @@ impl FanotifyGroup {
                     marks: Vec::new(),
                     events: VecDeque::new(),
                     read_waiters: VecDeque::new(),
+                    poll_waiters: PollWaitQueue::new(),
                     overflow_queued: false,
                 })
             },
@@ -461,7 +463,7 @@ impl FanotifyGroup {
         child_fid_node: Option<VfsNodeId>,
         source: Option<&Arc<dyn File + Send + Sync>>,
     ) {
-        let read_waiters = self.inner.exclusive_session(|inner| {
+        let (read_waiters, poll_waiters) = self.inner.exclusive_session(|inner| {
             let mut emitted = 0u64;
             let mut ignored = 0u64;
             let real_node = overlay_real_node(node);
@@ -574,22 +576,21 @@ impl FanotifyGroup {
                         None
                     },
                 ) {
-                    core::mem::take(&mut inner.read_waiters)
+                    (
+                        core::mem::take(&mut inner.read_waiters),
+                        inner.poll_waiters.drain(),
+                    )
                 } else {
-                    VecDeque::new()
+                    (VecDeque::new(), Vec::new())
                 }
             } else {
-                VecDeque::new()
+                (VecDeque::new(), Vec::new())
             }
         });
         for task in read_waiters {
             let _ = wakeup_task(task);
         }
-    }
-
-    fn has_events(&self) -> bool {
-        self.inner
-            .exclusive_session(|inner| !inner.events.is_empty())
+        PollWaiter::wake_all(poll_waiters);
     }
 
     fn event_record_len(&self, event: &FanotifyEvent) -> usize {
@@ -822,14 +823,27 @@ impl File for FanotifyGroupFile {
     }
 
     fn poll(&self, events: PollEvents) -> PollEvents {
-        let mut ready = PollEvents::empty();
-        if events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI) && self.group.has_events() {
-            ready |= PollEvents::POLLIN;
-        }
-        if events.contains(PollEvents::POLLOUT) {
-            ready |= PollEvents::POLLOUT;
-        }
-        ready
+        self.poll_with_wait(events, None)
+    }
+
+    fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
+        self.group.inner.exclusive_session(|inner| {
+            if let Some(waiter) = waiter
+                && events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI)
+            {
+                inner.poll_waiters.register(waiter);
+            }
+            let mut ready = PollEvents::empty();
+            if events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI)
+                && !inner.events.is_empty()
+            {
+                ready |= PollEvents::POLLIN;
+            }
+            if events.contains(PollEvents::POLLOUT) {
+                ready |= PollEvents::POLLOUT;
+            }
+            ready
+        })
     }
 
     fn status_flags(&self) -> OpenFlags {

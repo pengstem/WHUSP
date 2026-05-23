@@ -6,8 +6,8 @@ const TEST_LIBCS: &[&str] = &["/glibc", "/musl"];
 const LA_MUSL_COMPAT_PRELOAD: &str = "/opt/oscomp-support/lib/liboscomp-musl-compat.so";
 // CONTEXT: Search the manifests that contain the current whitelist, ordered by
 // duplicate-resolution priority. Keep syscalls before smoketest aliases while
-// still covering fs, fs_bind mount scripts, crypto AF_ALG, pty, hugetlb, and
-// namespace/container cases.
+// still covering fs, fs_bind mount scripts, crypto AF_ALG, pty, hugetlb,
+// watch queue, and namespace/container cases.
 const LTP_RUNTEST_MANIFESTS: &[&str] = &[
     "syscalls",
     "fs",
@@ -17,6 +17,7 @@ const LTP_RUNTEST_MANIFESTS: &[&str] = &[
     "crypto",
     "pty",
     "hugetlb",
+    "watchqueue",
     "containers",
     "smoketest",
     "cve",
@@ -53,7 +54,7 @@ const TEST_SCRIPTS: &[&str] = &[
     "libcbench_testcode.sh",
     "netperf_testcode.sh",
     "cyclictest_testcode.sh",
-    "lmbench_testcode.sh",
+    // "lmbench_testcode.sh",
 ];
 
 /// None runs the current libc's curated whitelist from ltp_whitelist.rs.

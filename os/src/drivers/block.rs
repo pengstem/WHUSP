@@ -54,7 +54,15 @@ impl VirtIOBlock {
             self.virtio_blk
                 .exclusive_access()
                 .read_blocks(block_id, buf)
-                .expect("Error when reading VirtIOBlk");
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "Error when reading VirtIOBlk: block_id={}, blocks={}, capacity_blocks={}, err={:?}",
+                        block_id,
+                        buf.len() / 512,
+                        self.capacity_blocks,
+                        err
+                    )
+                });
         }
     }
 

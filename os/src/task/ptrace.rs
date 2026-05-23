@@ -263,6 +263,8 @@ fn ptrace_syscall_stop_current(
         });
         tracer_pid
     };
+    // CONTEXT: Publish the ptrace stop before blocking this task. wait4()
+    // consumes the stored stop state after the tracer is woken.
     let (_task, task_cx_ptr) = block_current_task_no_schedule();
     wake_waiters_for_pid(tracer_pid);
     schedule(task_cx_ptr);

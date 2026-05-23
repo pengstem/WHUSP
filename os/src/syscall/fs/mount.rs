@@ -88,6 +88,9 @@ struct VirtioBlockSource {
     partition_index: Option<usize>,
 }
 
+// Linux-visible `/dev/vd*` names map onto DTB discovery order: `/dev/vda` is
+// contest x0, `/dev/vdb` is x1 if attached. Partition suffixes are 1-based MBR
+// slots and are interpreted by the filesystem mount layer.
 fn parse_virtio_block_source(source: &str) -> SysResult<VirtioBlockSource> {
     let Some(suffix) = source.strip_prefix("/dev/vd") else {
         return Err(SysError::ENODEV);

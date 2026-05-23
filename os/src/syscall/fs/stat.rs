@@ -671,6 +671,9 @@ fn resolve_statx_stat(
     flags: i32,
     follow_final_symlink: bool,
 ) -> SysResult<FileStat> {
+    // CONTEXT: Linux AT_STATX_FORCE_SYNC / AT_STATX_DONT_SYNC are cache
+    // coherency hints. Local contest filesystems resolve stat synchronously;
+    // only the NFS compatibility mount has a visible stat cache.
     if !path.is_empty()
         && flags & (AT_STATX_FORCE_SYNC | AT_STATX_DONT_SYNC) != 0
         && let Ok(client_path) = normalize_path_from(snapshot, dirfd, path)

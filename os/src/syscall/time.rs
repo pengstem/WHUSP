@@ -1,8 +1,8 @@
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
-    ProcessCpuTimesSnapshot, TaskControlBlock, block_current_and_run_next,
-    current_has_deliverable_signal, current_process, current_task, current_user_token, pid2process,
-    processes_snapshot,
+    ProcessCpuTimesSnapshot, TaskControlBlock, block_current_task_no_schedule,
+    current_has_deliverable_signal, current_process, current_user_token, pid2process,
+    processes_snapshot, schedule,
 };
 use crate::timer::{
     add_posix_timer, add_real_timer, add_timer, get_time_clock_ticks, get_time_ms, get_time_us,
@@ -654,9 +654,9 @@ fn sleep_until_ms(expire_ms: usize) -> SysResult {
     if current_has_deliverable_signal() {
         return Err(SysError::EINTR);
     }
-    let task = current_task().expect("sleep syscall must run with a current task");
+    let (task, task_cx_ptr) = block_current_task_no_schedule();
     add_timer(expire_ms, task);
-    block_current_and_run_next();
+    schedule(task_cx_ptr);
     if get_time_ms() < expire_ms && current_has_deliverable_signal() {
         return Err(SysError::EINTR);
     }

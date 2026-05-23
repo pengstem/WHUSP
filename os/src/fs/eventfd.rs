@@ -1,5 +1,7 @@
 use super::status_flags::StatusFlagsCell;
-use super::{File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFIFO};
+use super::{
+    File, FileStat, FsError, FsResult, OpenFlags, PollEvents, PollWaitQueue, PollWaiter, S_IFIFO,
+};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{current_has_unmasked_signal, suspend_current_and_run_next};
@@ -12,6 +14,8 @@ const EVENTFD_COUNTER_MAX: u64 = u64::MAX - 1;
 struct EventFdInner {
     counter: u64,
     semaphore: bool,
+    read_poll_waiters: PollWaitQueue,
+    write_poll_waiters: PollWaitQueue,
 }
 
 pub struct EventFd {
@@ -26,6 +30,8 @@ impl EventFd {
                 UPIntrFreeCell::new(EventFdInner {
                     counter: initval,
                     semaphore,
+                    read_poll_waiters: PollWaitQueue::new(),
+                    write_poll_waiters: PollWaitQueue::new(),
                 })
             },
             status_flags: StatusFlagsCell::new(OpenFlags::empty()),
@@ -52,20 +58,21 @@ impl File for EventFd {
         }
 
         loop {
-            let value = {
+            let (value, poll_writers) = {
                 let mut inner = self.inner.exclusive_access();
                 if inner.counter == 0 {
-                    0
+                    (0, alloc::vec::Vec::new())
                 } else if inner.semaphore {
                     inner.counter -= 1;
-                    1
+                    (1, inner.write_poll_waiters.drain())
                 } else {
                     let value = inner.counter;
                     inner.counter = 0;
-                    value
+                    (value, inner.write_poll_waiters.drain())
                 }
             };
             if value != 0 {
+                PollWaiter::wake_all(poll_writers);
                 return buf.copy_from_slice(&value.to_ne_bytes());
             }
             if self.status_flags().contains(OpenFlags::NONBLOCK) || current_has_unmasked_signal() {
@@ -86,16 +93,22 @@ impl File for EventFd {
         }
 
         loop {
-            let wrote = {
+            let (wrote, poll_readers) = {
                 let mut inner = self.inner.exclusive_access();
                 if value <= EVENTFD_COUNTER_MAX.saturating_sub(inner.counter) {
                     inner.counter += value;
-                    true
+                    let poll_readers = if value == 0 {
+                        alloc::vec::Vec::new()
+                    } else {
+                        inner.read_poll_waiters.drain()
+                    };
+                    (true, poll_readers)
                 } else {
-                    false
+                    (false, alloc::vec::Vec::new())
                 }
             };
             if wrote {
+                PollWaiter::wake_all(poll_readers);
                 return size_of::<u64>();
             }
             if self.status_flags().contains(OpenFlags::NONBLOCK) || current_has_unmasked_signal() {
@@ -106,7 +119,20 @@ impl File for EventFd {
     }
 
     fn poll(&self, events: PollEvents) -> PollEvents {
-        let counter = self.inner.exclusive_access().counter;
+        self.poll_with_wait(events, None)
+    }
+
+    fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
+        let mut inner = self.inner.exclusive_access();
+        if let Some(waiter) = waiter {
+            if events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI) {
+                inner.read_poll_waiters.register(waiter);
+            }
+            if events.contains(PollEvents::POLLOUT) {
+                inner.write_poll_waiters.register(waiter);
+            }
+        }
+        let counter = inner.counter;
         let mut ready = PollEvents::empty();
         if events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI) && counter > 0 {
             ready |= PollEvents::POLLIN;

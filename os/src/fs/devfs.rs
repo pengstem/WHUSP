@@ -7,8 +7,8 @@ use super::path::WorkingDir;
 use super::status_flags::StatusFlagsCell;
 use super::vfs::{FileSystemBackend, FileSystemStat, FsNodeKind, VfsNodeId};
 use super::{
-    File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFBLK, S_IFCHR, S_IFDIR,
-    SeekWhence, console_tty_poll, console_tty_read,
+    File, FileStat, FsError, FsResult, OpenFlags, PollEvents, PollWaitQueue, PollWaiter, S_IFBLK,
+    S_IFCHR, S_IFDIR, SeekWhence, console_tty_poll, console_tty_poll_with_wait, console_tty_read,
 };
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::UserBuffer;
@@ -384,6 +384,7 @@ impl InputEventFile {
 struct InputClient {
     events: VecDeque<LinuxInputEvent>,
     read_wait_queue: VecDeque<Arc<TaskControlBlock>>,
+    read_poll_wait_queue: PollWaitQueue,
     grabbed: bool,
     closed: bool,
 }
@@ -393,6 +394,7 @@ impl InputClient {
         Self {
             events: VecDeque::new(),
             read_wait_queue: VecDeque::new(),
+            read_poll_wait_queue: PollWaitQueue::new(),
             grabbed: false,
             closed: false,
         }
@@ -402,12 +404,18 @@ impl InputClient {
         self.events.len() * INPUT_EVENT_SIZE
     }
 
-    fn push_event(&mut self, event: LinuxInputEvent) -> VecDeque<Arc<TaskControlBlock>> {
+    fn push_event(
+        &mut self,
+        event: LinuxInputEvent,
+    ) -> (VecDeque<Arc<TaskControlBlock>>, Vec<Arc<PollWaiter>>) {
         if self.events.len() >= INPUT_EVENT_QUEUE_CAPACITY {
             self.events.pop_front();
         }
         self.events.push_back(event);
-        core::mem::take(&mut self.read_wait_queue)
+        (
+            core::mem::take(&mut self.read_wait_queue),
+            self.read_poll_wait_queue.drain(),
+        )
     }
 
     fn sleep_reader(&mut self) -> *mut crate::task::TaskContext {
@@ -491,6 +499,8 @@ struct PtyBuffer {
     data: VecDeque<u8>,
     read_wait_queue: VecDeque<Arc<TaskControlBlock>>,
     write_wait_queue: VecDeque<Arc<TaskControlBlock>>,
+    read_poll_wait_queue: PollWaitQueue,
+    write_poll_wait_queue: PollWaitQueue,
 }
 
 impl PtyBuffer {
@@ -499,6 +509,8 @@ impl PtyBuffer {
             data: VecDeque::new(),
             read_wait_queue: VecDeque::new(),
             write_wait_queue: VecDeque::new(),
+            read_poll_wait_queue: PollWaitQueue::new(),
+            write_poll_wait_queue: PollWaitQueue::new(),
         }
     }
 
@@ -546,6 +558,22 @@ impl PtyBuffer {
 
     fn wake_all_writers(&mut self) -> VecDeque<Arc<TaskControlBlock>> {
         core::mem::take(&mut self.write_wait_queue)
+    }
+
+    fn register_read_poll_waiter(&mut self, waiter: &Arc<PollWaiter>) {
+        self.read_poll_wait_queue.register(waiter);
+    }
+
+    fn register_write_poll_waiter(&mut self, waiter: &Arc<PollWaiter>) {
+        self.write_poll_wait_queue.register(waiter);
+    }
+
+    fn wake_read_poll_waiters(&mut self) -> Vec<Arc<PollWaiter>> {
+        self.read_poll_wait_queue.drain()
+    }
+
+    fn wake_write_poll_waiters(&mut self) -> Vec<Arc<PollWaiter>> {
+        self.write_poll_wait_queue.drain()
     }
 }
 
@@ -1791,7 +1819,7 @@ fn read_input_mice(flags: OpenFlags, mut user_buf: UserBuffer) -> usize {
 }
 
 fn emit_input_event(event: LinuxInputEvent) {
-    let readers = {
+    let (readers, poll_readers) = {
         let state = INPUT_STATE.exclusive_access();
         if !state.device_created {
             return;
@@ -1801,16 +1829,20 @@ fn emit_input_event(event: LinuxInputEvent) {
             !client.closed && client.grabbed
         });
         let mut readers = VecDeque::new();
+        let mut poll_readers = Vec::new();
         for client in &state.clients {
             let mut client = client.exclusive_access();
             if client.closed || (grabbed && !client.grabbed) {
                 continue;
             }
-            readers.append(&mut client.push_event(event));
+            let (mut client_readers, client_poll_readers) = client.push_event(event);
+            readers.append(&mut client_readers);
+            poll_readers.extend(client_poll_readers);
         }
-        readers
+        (readers, poll_readers)
     };
     wake_tasks(readers);
+    PollWaiter::wake_all(poll_readers);
 }
 
 fn emit_mice_packet(buttons: u8) {
@@ -1936,8 +1968,10 @@ fn read_pty(
             copied += len;
         }
         let writer = inner.input_buffer_mut(endpoint).wake_writer();
+        let poll_writers = inner.input_buffer_mut(endpoint).wake_write_poll_waiters();
         drop(inner);
         wake_task(writer);
+        PollWaiter::wake_all(poll_writers);
         return copied;
     }
 }
@@ -1996,8 +2030,10 @@ fn write_pty(
 
         already_written += written;
         let reader = inner.output_buffer_mut(endpoint).wake_reader();
+        let poll_readers = inner.output_buffer_mut(endpoint).wake_read_poll_waiters();
         drop(inner);
         wake_task(reader);
+        PollWaiter::wake_all(poll_readers);
         if already_written == want_to_write {
             return already_written;
         }
@@ -2401,10 +2437,22 @@ impl File for DevFsFile {
     }
 
     fn poll(&self, events: PollEvents) -> PollEvents {
+        self.poll_with_wait(events, None)
+    }
+
+    fn poll_with_wait(
+        &self,
+        events: PollEvents,
+        waiter: Option<&alloc::sync::Arc<PollWaiter>>,
+    ) -> PollEvents {
         match self.node {
             DevNode::Tty | DevNode::TtyS0 | DevNode::Tty8 | DevNode::Tty9 => {
                 let mut ready = PollEvents::empty();
-                ready |= console_tty_poll(events);
+                ready |= if waiter.is_some() {
+                    console_tty_poll_with_wait(events, waiter)
+                } else {
+                    console_tty_poll(events)
+                };
                 if events.contains(PollEvents::POLLOUT) && self.writable {
                     ready |= PollEvents::POLLOUT;
                 }
@@ -2585,9 +2633,19 @@ impl File for InputEventFile {
     }
 
     fn poll(&self, events: PollEvents) -> PollEvents {
+        self.poll_with_wait(events, None)
+    }
+
+    fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
         let mut ready = PollEvents::empty();
+        let mut client = self.client.exclusive_access();
+        if let Some(waiter) = waiter
+            && events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI)
+        {
+            client.read_poll_wait_queue.register(waiter);
+        }
         if events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI)
-            && self.client.exclusive_access().available_read() > 0
+            && client.available_read() > 0
         {
             ready |= PollEvents::POLLIN;
         }
@@ -2621,25 +2679,43 @@ impl Drop for InputEventFile {
 
 impl Drop for PtyFile {
     fn drop(&mut self) {
-        let (readers, writers, remove) = {
+        let (readers, writers, poll_readers, poll_writers, remove) = {
             let mut pair = self.pair.exclusive_access();
             match self.endpoint {
                 PtyEndpoint::Master => {
                     pair.master_open = pair.master_open.saturating_sub(1);
                     let readers = pair.master_to_slave.wake_all_readers();
                     let writers = pair.slave_to_master.wake_all_writers();
-                    (readers, writers, pair.is_closed())
+                    let poll_readers = pair.master_to_slave.wake_read_poll_waiters();
+                    let poll_writers = pair.slave_to_master.wake_write_poll_waiters();
+                    (
+                        readers,
+                        writers,
+                        poll_readers,
+                        poll_writers,
+                        pair.is_closed(),
+                    )
                 }
                 PtyEndpoint::Slave => {
                     pair.slave_open = pair.slave_open.saturating_sub(1);
                     let readers = pair.slave_to_master.wake_all_readers();
                     let writers = pair.master_to_slave.wake_all_writers();
-                    (readers, writers, pair.is_closed())
+                    let poll_readers = pair.slave_to_master.wake_read_poll_waiters();
+                    let poll_writers = pair.master_to_slave.wake_write_poll_waiters();
+                    (
+                        readers,
+                        writers,
+                        poll_readers,
+                        poll_writers,
+                        pair.is_closed(),
+                    )
                 }
             }
         };
         wake_tasks(readers);
         wake_tasks(writers);
+        PollWaiter::wake_all(poll_readers);
+        PollWaiter::wake_all(poll_writers);
         if remove {
             let id = self.id() as usize;
             PTY_TABLE.exclusive_session(|table| table.remove_if_same(id, &self.pair));
@@ -2669,7 +2745,21 @@ impl File for PtyFile {
     }
 
     fn poll(&self, events: PollEvents) -> PollEvents {
-        let pair = self.pair.exclusive_access();
+        self.poll_with_wait(events, None)
+    }
+
+    fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
+        let mut pair = self.pair.exclusive_access();
+        if let Some(waiter) = waiter {
+            if self.readable && events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI) {
+                pair.input_buffer_mut(self.endpoint)
+                    .register_read_poll_waiter(waiter);
+            }
+            if self.writable && events.contains(PollEvents::POLLOUT) {
+                pair.output_buffer_mut(self.endpoint)
+                    .register_write_poll_waiter(waiter);
+            }
+        }
         let mut ready = PollEvents::empty();
         if self.readable {
             let has_data = pair.input_buffer(self.endpoint).available_read() > 0;

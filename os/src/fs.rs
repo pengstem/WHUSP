@@ -24,20 +24,27 @@ mod tmpfs;
 mod vfs;
 
 use crate::mm::{UserBuffer, page_cache::PageCacheId};
-use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::{
+    collections::VecDeque,
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use bitflags::bitflags;
-use core::any::Any;
+use core::{
+    any::Any,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 pub(crate) use anonfd::make_anonymous_fd;
 #[cfg(target_arch = "riscv64")]
 pub(crate) use console_tty::console_tty_drain_uart;
 pub(crate) use console_tty::{
     LinuxTermio, LinuxTermios, LinuxTermios2, LinuxWinsize, apply_console_tty_termio,
-    console_tty_available_bytes, console_tty_foreground_pgid, console_tty_poll, console_tty_read,
-    console_tty_termio, console_tty_termios, console_tty_termios2, console_tty_winsize,
-    set_console_tty_foreground_pgid, set_console_tty_termios, set_console_tty_termios2,
-    set_console_tty_winsize,
+    console_tty_available_bytes, console_tty_foreground_pgid, console_tty_poll,
+    console_tty_poll_with_wait, console_tty_read, console_tty_termio, console_tty_termios,
+    console_tty_termios2, console_tty_winsize, set_console_tty_foreground_pgid,
+    set_console_tty_termios, set_console_tty_termios2, set_console_tty_winsize,
 };
 pub(crate) use eventfd::make_eventfd;
 pub(crate) use mount_fd::{DetachedMountFile, FsContextFile, FsContextStateError};
@@ -72,6 +79,70 @@ bitflags! {
         const POLLHUP = 0x0010;
         const POLLNVAL = 0x0020;
         const POLLRDHUP = 0x2000;
+    }
+}
+
+pub struct PollWaiter {
+    task: Arc<crate::task::TaskControlBlock>,
+    triggered: AtomicBool,
+}
+
+impl PollWaiter {
+    pub fn new(task: Arc<crate::task::TaskControlBlock>) -> Arc<Self> {
+        Arc::new(Self {
+            task,
+            triggered: AtomicBool::new(false),
+        })
+    }
+
+    pub fn was_triggered(&self) -> bool {
+        self.triggered.load(Ordering::Acquire)
+    }
+
+    pub fn task_matches(&self, task: &Arc<crate::task::TaskControlBlock>) -> bool {
+        Arc::ptr_eq(&self.task, task)
+    }
+
+    pub fn wake(&self) -> bool {
+        self.triggered.store(true, Ordering::Release);
+        crate::task::wakeup_task(Arc::clone(&self.task))
+    }
+
+    pub fn wake_all(waiters: Vec<Arc<Self>>) {
+        for waiter in waiters {
+            waiter.wake();
+        }
+    }
+}
+
+pub struct PollWaitQueue {
+    waiters: VecDeque<Weak<PollWaiter>>,
+}
+
+impl PollWaitQueue {
+    pub fn new() -> Self {
+        Self {
+            waiters: VecDeque::new(),
+        }
+    }
+
+    pub fn register(&mut self, waiter: &Arc<PollWaiter>) {
+        self.waiters.retain(|waiter| waiter.strong_count() > 0);
+        self.waiters.push_back(Arc::downgrade(waiter));
+    }
+
+    pub fn drain(&mut self) -> Vec<Arc<PollWaiter>> {
+        let waiters = core::mem::take(&mut self.waiters);
+        waiters
+            .into_iter()
+            .filter_map(|waiter| waiter.upgrade())
+            .collect()
+    }
+}
+
+impl Default for PollWaitQueue {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -169,6 +240,9 @@ pub trait File: Send + Sync {
             ready |= PollEvents::POLLOUT;
         }
         ready
+    }
+    fn poll_with_wait(&self, events: PollEvents, _waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
+        self.poll(events)
     }
     /// Anonymous fds without filesystem metadata report an empty stat block.
     fn stat(&self) -> FsResult<FileStat> {

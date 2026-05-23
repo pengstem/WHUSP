@@ -1,4 +1,5 @@
-use crate::fs::PollEvents;
+use crate::arch::interrupt;
+use crate::fs::{PollEvents, PollWaiter};
 use crate::perf;
 use crate::task::{
     block_current_task_no_schedule, current_has_interrupting_signal, current_task,
@@ -17,7 +18,6 @@ use super::uapi::{LinuxPollFd, PPOLL_MAX_NFDS};
 
 const SELECT_MAX_NFDS: usize = 1024;
 const FD_SET_WORD_BITS: usize = usize::BITS as usize;
-const POLL_WAIT_BACKOFF_MS: usize = 1;
 
 struct ProcSleepGuard {
     task: Arc<crate::task::TaskControlBlock>,
@@ -37,7 +37,10 @@ impl Drop for ProcSleepGuard {
     }
 }
 
-fn sleep_until_next_poll_probe(deadline_ms: Option<usize>) -> SysResult {
+fn sleep_until_poll_event(waiter: &Arc<PollWaiter>, deadline_ms: Option<usize>) -> SysResult {
+    if waiter.was_triggered() {
+        return Ok(0);
+    }
     let now_ms = get_time_ms();
     if deadline_ms.is_some_and(|deadline_ms| now_ms >= deadline_ms) {
         return Ok(0);
@@ -46,13 +49,23 @@ fn sleep_until_next_poll_probe(deadline_ms: Option<usize>) -> SysResult {
         return Err(SysError::EINTR);
     }
 
-    let target_ms = now_ms.saturating_add(POLL_WAIT_BACKOFF_MS);
-    let target_ms = deadline_ms.map_or(target_ms, |deadline_ms| deadline_ms.min(target_ms));
-    let sleep_ms = target_ms.saturating_sub(now_ms);
     let _sleep_guard = ProcSleepGuard::new()?;
+    let interrupts_enabled = interrupt::supervisor_interrupt_enabled();
+    interrupt::disable_supervisor_interrupt();
+    if waiter.was_triggered() {
+        if interrupts_enabled {
+            interrupt::enable_supervisor_interrupt();
+        }
+        return Ok(0);
+    }
     let (task, task_cx_ptr) = block_current_task_no_schedule();
-    add_timer(target_ms, task);
-    perf::record_poll_backoff_sleep(sleep_ms);
+    debug_assert!(waiter.task_matches(&task));
+    if let Some(deadline_ms) = deadline_ms {
+        add_timer(deadline_ms, task);
+    }
+    if interrupts_enabled {
+        interrupt::enable_supervisor_interrupt();
+    }
     schedule(task_cx_ptr);
     Ok(0)
 }
@@ -101,7 +114,7 @@ fn poll_events_to_user(events: PollEvents) -> i16 {
     events.bits() as i16
 }
 
-fn scan_pollfds(pollfds: &mut [LinuxPollFd]) -> usize {
+fn scan_pollfds(pollfds: &mut [LinuxPollFd], waiter: Option<&Arc<PollWaiter>>) -> usize {
     let mut ready = 0usize;
     for pollfd in pollfds.iter_mut() {
         pollfd.revents = 0;
@@ -112,7 +125,7 @@ fn scan_pollfds(pollfds: &mut [LinuxPollFd]) -> usize {
         let events = poll_events_from_user(pollfd.events);
         match get_file_by_fd(pollfd.fd as usize) {
             Ok(file) => {
-                let revents = file.poll(events);
+                let revents = file.poll_with_wait(events, waiter);
                 pollfd.revents = poll_events_to_user(revents);
                 if !revents.is_empty() {
                     ready += 1;
@@ -148,7 +161,8 @@ pub fn sys_ppoll(
     let deadline_ms = relative_timeout_deadline_ms(token, timeout)?;
 
     loop {
-        let ready = scan_pollfds(&mut pollfds);
+        let waiter = PollWaiter::new(current_task().ok_or(SysError::ESRCH)?);
+        let ready = scan_pollfds(&mut pollfds, Some(&waiter));
         perf::record_poll_scan(pollfds.len(), ready);
         if ready > 0 {
             write_user_pollfds(token, fds, &pollfds)?;
@@ -166,7 +180,7 @@ pub fn sys_ppoll(
         if pollfds.is_empty() && deadline_ms.is_none() {
             block_signal_only_waiter()?;
         } else {
-            sleep_until_next_poll_probe(deadline_ms)?;
+            sleep_until_poll_event(&waiter, deadline_ms)?;
         }
     }
 }
@@ -218,6 +232,7 @@ fn scan_fdset(
     input: Option<&[usize]>,
     output: &mut [usize],
     events: PollEvents,
+    waiter: Option<&Arc<PollWaiter>>,
 ) -> SysResult<usize> {
     let Some(input) = input else {
         return Ok(0);
@@ -228,7 +243,7 @@ fn scan_fdset(
             continue;
         }
         let file = get_file_by_fd(fd)?;
-        if file.poll(events).intersects(events) {
+        if file.poll_with_wait(events, waiter).intersects(events) {
             fd_set(output, fd);
             ready += 1;
         }
@@ -259,6 +274,7 @@ pub fn sys_pselect6(
     let word_count = fdset_words(nfds);
 
     loop {
+        let waiter = PollWaiter::new(current_task().ok_or(SysError::ESRCH)?);
         let mut read_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
         let mut write_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
         let mut except_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
@@ -271,16 +287,19 @@ pub fn sys_pselect6(
             read_input.as_deref(),
             &mut read_output,
             PollEvents::POLLIN | PollEvents::POLLHUP | PollEvents::POLLRDHUP,
+            Some(&waiter),
         )? + scan_fdset(
             nfds,
             write_input.as_deref(),
             &mut write_output,
             PollEvents::POLLOUT,
+            Some(&waiter),
         )? + scan_fdset(
             nfds,
             except_input.as_deref(),
             &mut except_output,
             PollEvents::POLLPRI,
+            Some(&waiter),
         )?;
         perf::record_poll_scan(fdset_visits, ready);
 
@@ -300,7 +319,7 @@ pub fn sys_pselect6(
         {
             block_signal_only_waiter()?;
         } else {
-            sleep_until_next_poll_probe(deadline_ms)?;
+            sleep_until_poll_event(&waiter, deadline_ms)?;
         }
     }
 }

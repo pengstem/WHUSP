@@ -1,4 +1,4 @@
-use super::PollEvents;
+use super::{PollEvents, PollWaitQueue, PollWaiter};
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::UserBuffer;
 use crate::sync::{Condvar, UPIntrFreeCell};
@@ -194,12 +194,14 @@ impl ConsoleTtyState {
 struct ConsoleTty {
     state: UPIntrFreeCell<ConsoleTtyState>,
     read_waiters: Condvar,
+    poll_waiters: UPIntrFreeCell<PollWaitQueue>,
 }
 
 lazy_static! {
     static ref CONSOLE_TTY: ConsoleTty = ConsoleTty {
         state: unsafe { UPIntrFreeCell::new(ConsoleTtyState::new()) },
         read_waiters: Condvar::new(),
+        poll_waiters: unsafe { UPIntrFreeCell::new(PollWaitQueue::new()) },
     };
 }
 
@@ -300,12 +302,24 @@ pub(crate) fn console_tty_available_bytes() -> usize {
 }
 
 pub(crate) fn console_tty_poll(events: PollEvents) -> PollEvents {
+    console_tty_poll_with_wait(events, None)
+}
+
+pub(crate) fn console_tty_poll_with_wait(
+    events: PollEvents,
+    waiter: Option<&alloc::sync::Arc<PollWaiter>>,
+) -> PollEvents {
     if !events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI) {
         return PollEvents::empty();
     }
     CONSOLE_TTY
         .state
         .exclusive_session(|state| state.ensure_foreground_pgid(current_process_group_id()));
+    if let Some(waiter) = waiter {
+        CONSOLE_TTY
+            .poll_waiters
+            .exclusive_session(|waiters| waiters.register(waiter));
+    }
     console_tty_drain_uart();
     let readable = CONSOLE_TTY
         .state
@@ -363,7 +377,11 @@ pub(crate) fn console_tty_drain_uart() {
         should_signal |= action.wake_readers;
     }
     if should_signal {
+        let poll_waiters = CONSOLE_TTY
+            .poll_waiters
+            .exclusive_session(|waiters| waiters.drain());
         CONSOLE_TTY.read_waiters.signal();
+        PollWaiter::wake_all(poll_waiters);
     }
 }
 
