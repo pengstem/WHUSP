@@ -1,4 +1,5 @@
-use crate::fs::{File, FileStat, OpenFlags, PollEvents, S_IFDIR, S_IFMT};
+use crate::arch::interrupt;
+use crate::fs::{File, FileStat, OpenFlags, PollEvents, PollWaiter, S_IFDIR, S_IFMT};
 use crate::mm::UserBuffer;
 use crate::perf;
 use crate::sync::UPIntrFreeCell;
@@ -54,6 +55,12 @@ struct EpollInterest {
     disabled: bool,
 }
 
+struct EpollScanResult {
+    ready_events: Vec<LinuxEpollEvent>,
+    waiter_registrations: usize,
+    fallback_needed: bool,
+}
+
 struct ProcSleepGuard {
     task: Arc<crate::task::TaskControlBlock>,
 }
@@ -107,25 +114,43 @@ impl EpollFile {
         }
     }
 
-    fn scan_ready(&self, maxevents: usize) -> Vec<LinuxEpollEvent> {
+    fn scan_ready_with_waiter(
+        &self,
+        maxevents: usize,
+        waiter: Option<&Arc<PollWaiter>>,
+    ) -> EpollScanResult {
         self.interests.exclusive_session(|interests| {
             let mut ready_events = Vec::new();
             let mut visits = 0usize;
+            let mut fallback_needed = false;
             for interest in interests.values_mut() {
                 visits += 1;
                 if ready_events.len() >= maxevents || interest.disabled {
                     continue;
                 }
                 let requested = epoll_to_poll_events(interest.event.events);
-                let ready = poll_events_to_epoll(interest.file.poll(requested))
-                    & epoll_readiness_mask(interest.event.events);
+                let registrations_before = waiter.map_or(0, |waiter| waiter.registration_count());
+                let poll_ready = match waiter {
+                    Some(waiter) => interest.file.poll_with_wait(requested, Some(waiter)),
+                    None => interest.file.poll(requested),
+                };
+                let registered =
+                    waiter.is_some_and(|waiter| waiter.registration_count() > registrations_before);
+                let ready =
+                    poll_events_to_epoll(poll_ready) & epoll_readiness_mask(interest.event.events);
                 if ready == 0 {
                     if interest.event.events & EPOLLET != 0 {
                         interest.last_ready = 0;
                     }
+                    if waiter.is_some() && !registered {
+                        fallback_needed = true;
+                    }
                     continue;
                 }
                 if interest.event.events & EPOLLET != 0 && ready == interest.last_ready {
+                    if waiter.is_some() && !registered {
+                        fallback_needed = true;
+                    }
                     continue;
                 }
                 interest.last_ready = ready;
@@ -138,7 +163,11 @@ impl EpollFile {
                 });
             }
             perf::record_epoll_scan(visits, ready_events.len());
-            ready_events
+            EpollScanResult {
+                ready_events,
+                waiter_registrations: waiter.map_or(0, |waiter| waiter.registration_count()),
+                fallback_needed,
+            }
         })
     }
 }
@@ -485,6 +514,38 @@ fn sleep_until_next_epoll_probe(deadline_us: Option<usize>) -> SysResult {
     Ok(0)
 }
 
+fn sleep_until_epoll_event(waiter: &Arc<PollWaiter>, deadline_us: Option<usize>) -> SysResult {
+    if waiter.was_triggered() {
+        return Ok(0);
+    }
+    if deadline_us.is_some_and(|deadline_us| get_time_us() >= deadline_us) {
+        return Ok(0);
+    }
+    if current_has_interrupting_signal() {
+        return Err(SysError::EINTR);
+    }
+
+    let interrupts_enabled = interrupt::supervisor_interrupt_enabled();
+    interrupt::disable_supervisor_interrupt();
+    if waiter.was_triggered() {
+        if interrupts_enabled {
+            interrupt::enable_supervisor_interrupt();
+        }
+        return Ok(0);
+    }
+    let (task, task_cx_ptr) = block_current_task_no_schedule();
+    debug_assert!(waiter.task_matches(&task));
+    if let Some(deadline_us) = deadline_us {
+        add_timer(deadline_us.div_ceil(1_000), task);
+    }
+    if interrupts_enabled {
+        interrupt::enable_supervisor_interrupt();
+    }
+    perf::record_epoll_waiter_sleep();
+    schedule(task_cx_ptr);
+    Ok(0)
+}
+
 fn sys_epoll_wait_until(
     epfd_raw: usize,
     events: *mut u8,
@@ -510,12 +571,16 @@ fn sys_epoll_wait_until(
     let _proc_sleep = ProcSleepGuard::new()?;
 
     loop {
-        let ready = epoll.scan_ready(maxevents);
-        if !ready.is_empty() {
-            for (index, event) in ready.iter().enumerate() {
+        let waiter = PollWaiter::new(current_task().ok_or(SysError::ESRCH)?);
+        let scan = epoll.scan_ready_with_waiter(maxevents, Some(&waiter));
+        if scan.waiter_registrations > 0 {
+            perf::record_epoll_waiter_registrations(scan.waiter_registrations);
+        }
+        if !scan.ready_events.is_empty() {
+            for (index, event) in scan.ready_events.iter().enumerate() {
                 write_epoll_event(token, events, index, *event)?;
             }
-            return Ok(ready.len() as isize);
+            return Ok(scan.ready_events.len() as isize);
         }
         if deadline_us.is_some_and(|deadline_us| get_time_us() >= deadline_us) {
             return Ok(0);
@@ -523,7 +588,11 @@ fn sys_epoll_wait_until(
         if current_has_interrupting_signal() {
             return Err(SysError::EINTR);
         }
-        sleep_until_next_epoll_probe(deadline_us)?;
+        if scan.waiter_registrations > 0 && !scan.fallback_needed {
+            sleep_until_epoll_event(&waiter, deadline_us)?;
+        } else {
+            sleep_until_next_epoll_probe(deadline_us)?;
+        }
     }
 }
 

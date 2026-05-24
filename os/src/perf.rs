@@ -28,6 +28,8 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) epoll_ready_events: usize,
     pub(crate) epoll_backoff_sleeps: usize,
     pub(crate) epoll_backoff_us: usize,
+    pub(crate) epoll_waiter_registrations: usize,
+    pub(crate) epoll_waiter_sleeps: usize,
     pub(crate) poll_wait_scans: usize,
     pub(crate) poll_wait_fd_visits: usize,
     pub(crate) poll_wait_ready_events: usize,
@@ -106,6 +108,8 @@ static EPOLL_SCAN_INTEREST_VISITS: AtomicUsize = AtomicUsize::new(0);
 static EPOLL_READY_EVENTS: AtomicUsize = AtomicUsize::new(0);
 static EPOLL_BACKOFF_SLEEPS: AtomicUsize = AtomicUsize::new(0);
 static EPOLL_BACKOFF_US: AtomicUsize = AtomicUsize::new(0);
+static EPOLL_WAITER_REGISTRATIONS: AtomicUsize = AtomicUsize::new(0);
+static EPOLL_WAITER_SLEEPS: AtomicUsize = AtomicUsize::new(0);
 
 static POLL_WAIT_SCANS: AtomicUsize = AtomicUsize::new(0);
 static POLL_WAIT_FD_VISITS: AtomicUsize = AtomicUsize::new(0);
@@ -237,6 +241,14 @@ pub(crate) fn record_epoll_scan(interest_visits: usize, ready_events: usize) {
 pub(crate) fn record_epoll_backoff_sleep(duration_us: usize) {
     EPOLL_BACKOFF_SLEEPS.fetch_add(1, Ordering::Relaxed);
     EPOLL_BACKOFF_US.fetch_add(duration_us, Ordering::Relaxed);
+}
+
+pub(crate) fn record_epoll_waiter_registrations(count: usize) {
+    EPOLL_WAITER_REGISTRATIONS.fetch_add(count, Ordering::Relaxed);
+}
+
+pub(crate) fn record_epoll_waiter_sleep() {
+    EPOLL_WAITER_SLEEPS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn record_poll_scan(fd_visits: usize, ready_events: usize) {
@@ -401,6 +413,8 @@ pub(crate) fn snapshot() -> KernelPerfSnapshot {
         epoll_ready_events: EPOLL_READY_EVENTS.load(Ordering::Relaxed),
         epoll_backoff_sleeps: EPOLL_BACKOFF_SLEEPS.load(Ordering::Relaxed),
         epoll_backoff_us: EPOLL_BACKOFF_US.load(Ordering::Relaxed),
+        epoll_waiter_registrations: EPOLL_WAITER_REGISTRATIONS.load(Ordering::Relaxed),
+        epoll_waiter_sleeps: EPOLL_WAITER_SLEEPS.load(Ordering::Relaxed),
         poll_wait_scans: POLL_WAIT_SCANS.load(Ordering::Relaxed),
         poll_wait_fd_visits: POLL_WAIT_FD_VISITS.load(Ordering::Relaxed),
         poll_wait_ready_events: POLL_WAIT_READY_EVENTS.load(Ordering::Relaxed),
@@ -483,6 +497,8 @@ pub(crate) fn stats_content() -> String {
          epoll_ready_events {}\n\
          epoll_backoff_sleeps {}\n\
          epoll_backoff_us {}\n\
+         epoll_waiter_registrations {}\n\
+         epoll_waiter_sleeps {}\n\
          poll_wait_scans {}\n\
          poll_wait_fd_visits {}\n\
          poll_wait_ready_events {}\n\
@@ -557,6 +573,8 @@ pub(crate) fn stats_content() -> String {
         stats.epoll_ready_events,
         stats.epoll_backoff_sleeps,
         stats.epoll_backoff_us,
+        stats.epoll_waiter_registrations,
+        stats.epoll_waiter_sleeps,
         stats.poll_wait_scans,
         stats.poll_wait_fd_visits,
         stats.poll_wait_ready_events,

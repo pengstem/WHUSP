@@ -33,7 +33,7 @@ use alloc::{
 use bitflags::bitflags;
 use core::{
     any::Any,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 pub(crate) use anonfd::make_anonymous_fd;
@@ -84,6 +84,7 @@ bitflags! {
 pub struct PollWaiter {
     task: Arc<crate::task::TaskControlBlock>,
     triggered: AtomicBool,
+    registrations: AtomicUsize,
 }
 
 impl PollWaiter {
@@ -91,6 +92,7 @@ impl PollWaiter {
         Arc::new(Self {
             task,
             triggered: AtomicBool::new(false),
+            registrations: AtomicUsize::new(0),
         })
     }
 
@@ -100,6 +102,14 @@ impl PollWaiter {
 
     pub fn task_matches(&self, task: &Arc<crate::task::TaskControlBlock>) -> bool {
         Arc::ptr_eq(&self.task, task)
+    }
+
+    pub fn registration_count(&self) -> usize {
+        self.registrations.load(Ordering::Acquire)
+    }
+
+    fn record_registration(&self) {
+        self.registrations.fetch_add(1, Ordering::Release);
     }
 
     pub fn wake(&self) -> bool {
@@ -127,6 +137,7 @@ impl PollWaitQueue {
 
     pub fn register(&mut self, waiter: &Arc<PollWaiter>) {
         self.waiters.retain(|waiter| waiter.strong_count() > 0);
+        waiter.record_registration();
         self.waiters.push_back(Arc::downgrade(waiter));
     }
 
