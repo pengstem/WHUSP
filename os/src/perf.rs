@@ -83,6 +83,8 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) futex_cleanup_fallback_waiter_visits: usize,
     pub(crate) futex_queue_count_max: usize,
     pub(crate) futex_waiter_count_max: usize,
+    pub(crate) futex_bucket_queue_count_max: usize,
+    pub(crate) futex_bucket_waiter_count_max: usize,
 }
 
 static SCHEDULER_FETCH_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -172,6 +174,8 @@ static FUTEX_CLEANUP_FALLBACK_QUEUE_VISITS: AtomicUsize = AtomicUsize::new(0);
 static FUTEX_CLEANUP_FALLBACK_WAITER_VISITS: AtomicUsize = AtomicUsize::new(0);
 static FUTEX_QUEUE_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
 static FUTEX_WAITER_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
+static FUTEX_BUCKET_QUEUE_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
+static FUTEX_BUCKET_WAITER_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
 
 fn update_max(cell: &AtomicUsize, value: usize) {
     let mut current = cell.load(Ordering::Relaxed);
@@ -397,9 +401,16 @@ pub(crate) fn record_futex_cleanup(
     }
 }
 
-pub(crate) fn record_futex_manager_state(queue_count: usize, waiter_count: usize) {
+pub(crate) fn record_futex_manager_state(
+    queue_count: usize,
+    waiter_count: usize,
+    bucket_queue_count: usize,
+    bucket_waiter_count: usize,
+) {
     update_max(&FUTEX_QUEUE_COUNT_MAX, queue_count);
     update_max(&FUTEX_WAITER_COUNT_MAX, waiter_count);
+    update_max(&FUTEX_BUCKET_QUEUE_COUNT_MAX, bucket_queue_count);
+    update_max(&FUTEX_BUCKET_WAITER_COUNT_MAX, bucket_waiter_count);
 }
 
 pub(crate) fn snapshot() -> KernelPerfSnapshot {
@@ -485,6 +496,8 @@ pub(crate) fn snapshot() -> KernelPerfSnapshot {
             .load(Ordering::Relaxed),
         futex_queue_count_max: FUTEX_QUEUE_COUNT_MAX.load(Ordering::Relaxed),
         futex_waiter_count_max: FUTEX_WAITER_COUNT_MAX.load(Ordering::Relaxed),
+        futex_bucket_queue_count_max: FUTEX_BUCKET_QUEUE_COUNT_MAX.load(Ordering::Relaxed),
+        futex_bucket_waiter_count_max: FUTEX_BUCKET_WAITER_COUNT_MAX.load(Ordering::Relaxed),
     }
 }
 
@@ -569,7 +582,9 @@ pub(crate) fn stats_content() -> String {
          futex_cleanup_fallback_queue_visits {}\n\
          futex_cleanup_fallback_waiter_visits {}\n\
          futex_queue_count_max {}\n\
-         futex_waiter_count_max {}\n",
+         futex_waiter_count_max {}\n\
+         futex_bucket_queue_count_max {}\n\
+         futex_bucket_waiter_count_max {}\n",
         stats.scheduler_fetch_calls,
         stats.scheduler_scanned_tasks,
         stats.scheduler_pruned_exited_tasks,
@@ -649,5 +664,7 @@ pub(crate) fn stats_content() -> String {
         stats.futex_cleanup_fallback_waiter_visits,
         stats.futex_queue_count_max,
         stats.futex_waiter_count_max,
+        stats.futex_bucket_queue_count_max,
+        stats.futex_bucket_waiter_count_max,
     )
 }

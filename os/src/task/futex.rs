@@ -38,6 +38,7 @@ const FUTEX_WAITERS: u32 = 0x8000_0000;
 const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
 const FUTEX_TID_MASK: u32 = !(FUTEX_WAITERS | FUTEX_OWNER_DIED);
 const ROBUST_LIST_LIMIT: usize = 2048;
+const FUTEX_BUCKET_COUNT: usize = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -64,21 +65,47 @@ struct FutexWaiter {
     bitset: u32,
 }
 
+struct FutexBucket {
+    waiters: BTreeMap<FutexKey, VecDeque<FutexWaiter>>,
+    waiter_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct FutexWaiterLocation {
+    bucket: usize,
+    key: FutexKey,
+}
+
 /// Process-scoped futex wait queues keyed by futex word address.
 ///
 /// Callers enqueue the already-blocked current task while holding this manager,
 /// then drop the lock before scheduling away. Wake paths return task Arcs to be
 /// woken after the queue has been updated.
 struct FutexManager {
-    waiters: BTreeMap<FutexKey, VecDeque<FutexWaiter>>,
-    waiter_keys: BTreeMap<usize, FutexKey>,
+    buckets: Vec<FutexBucket>,
+    waiter_keys: BTreeMap<usize, FutexWaiterLocation>,
+    queue_count: usize,
+}
+
+impl FutexBucket {
+    fn new() -> Self {
+        Self {
+            waiters: BTreeMap::new(),
+            waiter_count: 0,
+        }
+    }
 }
 
 impl FutexManager {
     fn new() -> Self {
+        let mut buckets = Vec::new();
+        while buckets.len() < FUTEX_BUCKET_COUNT {
+            buckets.push(FutexBucket::new());
+        }
         Self {
-            waiters: BTreeMap::new(),
+            buckets,
             waiter_keys: BTreeMap::new(),
+            queue_count: 0,
         }
     }
 
@@ -86,17 +113,33 @@ impl FutexManager {
         Arc::as_ptr(task) as usize
     }
 
-    fn remove_waiter(&mut self, key: FutexKey, task: &Arc<TaskControlBlock>) -> bool {
+    fn bucket_index(key: FutexKey) -> usize {
+        ((key.addr >> 2) ^ key.process_id) & (FUTEX_BUCKET_COUNT - 1)
+    }
+
+    fn remove_waiter(
+        &mut self,
+        location: FutexWaiterLocation,
+        task: &Arc<TaskControlBlock>,
+    ) -> bool {
+        let key = location.key;
+        let bucket_index = location.bucket;
+        debug_assert_eq!(bucket_index, Self::bucket_index(key));
         let waiter_id = Self::waiter_id(task);
         let removed = {
-            let Some(queue) = self.waiters.get_mut(&key) else {
+            let bucket = &mut self.buckets[bucket_index];
+            let Some(queue) = bucket.waiters.get_mut(&key) else {
                 return false;
             };
             let old_len = queue.len();
             queue.retain(|waiter| !Arc::ptr_eq(&waiter.task, task));
-            old_len != queue.len()
+            let removed_count = old_len - queue.len();
+            if removed_count > 0 {
+                bucket.waiter_count = bucket.waiter_count.saturating_sub(removed_count);
+            }
+            removed_count != 0
         };
-        self.remove_empty_queue(key);
+        self.remove_empty_queue(bucket_index, key);
         if removed {
             self.waiter_keys.remove(&waiter_id);
         }
@@ -105,11 +148,11 @@ impl FutexManager {
 
     fn remove_waiter_for_task(&mut self, task: &Arc<TaskControlBlock>) -> bool {
         let waiter_id = Self::waiter_id(task);
-        let Some(key) = self.waiter_keys.get(&waiter_id).copied() else {
+        let Some(location) = self.waiter_keys.get(&waiter_id).copied() else {
             perf::record_futex_cleanup(false, true, 0, 0);
             return false;
         };
-        let removed = self.remove_waiter(key, task);
+        let removed = self.remove_waiter(location, task);
         perf::record_futex_cleanup(removed, !removed, 0, 0);
         if !removed {
             self.waiter_keys.remove(&waiter_id);
@@ -123,22 +166,42 @@ impl FutexManager {
     /// releasing `FUTEX_MANAGER`; scheduling while holding the queue lock can
     /// deadlock wake paths.
     fn block_current_on(&mut self, key: FutexKey, bitset: u32) -> *mut super::TaskContext {
+        let bucket_index = Self::bucket_index(key);
         let (task, task_cx_ptr) = block_current_task_no_schedule();
-        self.waiters.entry(key).or_default().push_back(FutexWaiter {
-            task: Arc::clone(&task),
-            bitset,
-        });
-        self.waiter_keys.insert(Self::waiter_id(&task), key);
-        self.record_state();
+        let created_queue = {
+            let bucket = &mut self.buckets[bucket_index];
+            let queue = bucket.waiters.entry(key).or_default();
+            let created_queue = queue.is_empty();
+            queue.push_back(FutexWaiter {
+                task: Arc::clone(&task),
+                bitset,
+            });
+            bucket.waiter_count += 1;
+            created_queue
+        };
+        if created_queue {
+            self.queue_count += 1;
+        }
+        self.waiter_keys.insert(
+            Self::waiter_id(&task),
+            FutexWaiterLocation {
+                bucket: bucket_index,
+                key,
+            },
+        );
+        self.record_state_for_bucket(bucket_index);
         task_cx_ptr
     }
 
     fn wake(&mut self, key: FutexKey, limit: usize, bitset: u32) -> Vec<Arc<TaskControlBlock>> {
+        let bucket_index = Self::bucket_index(key);
         let mut removed_waiters = Vec::new();
         let tasks = {
-            let Some(queue) = self.waiters.get_mut(&key) else {
+            let bucket = &mut self.buckets[bucket_index];
+            let Some(queue) = bucket.waiters.get_mut(&key) else {
                 return Vec::new();
             };
+            let old_len = queue.len();
             let mut tasks = Vec::new();
             let mut kept = VecDeque::new();
             while let Some(waiter) = queue.pop_front() {
@@ -154,19 +217,25 @@ impl FutexManager {
                 }
             }
             *queue = kept;
+            let removed_count = old_len - queue.len();
+            if removed_count > 0 {
+                bucket.waiter_count = bucket.waiter_count.saturating_sub(removed_count);
+            }
             tasks
         };
         for waiter_id in removed_waiters {
             self.waiter_keys.remove(&waiter_id);
         }
-        self.remove_empty_queue(key);
+        self.remove_empty_queue(bucket_index, key);
         tasks
     }
 
     fn wake_one(&mut self, key: FutexKey) -> (Option<Arc<TaskControlBlock>>, bool) {
+        let bucket_index = Self::bucket_index(key);
         let mut removed_waiters = Vec::new();
         let task = {
-            let Some(queue) = self.waiters.get_mut(&key) else {
+            let bucket = &mut self.buckets[bucket_index];
+            let Some(queue) = bucket.waiters.get_mut(&key) else {
                 return (None, false);
             };
             let mut selected = None;
@@ -179,18 +248,23 @@ impl FutexManager {
                     removed_waiters.push(Self::waiter_id(&waiter.task));
                 }
             }
+            let removed_count = removed_waiters.len();
+            if removed_count > 0 {
+                bucket.waiter_count = bucket.waiter_count.saturating_sub(removed_count);
+            }
             selected
         };
         for waiter_id in removed_waiters {
             self.waiter_keys.remove(&waiter_id);
         }
-        self.remove_empty_queue(key);
+        self.remove_empty_queue(bucket_index, key);
         let has_waiters = self.has_waiters(key);
         (task, has_waiters)
     }
 
     fn has_waiters(&self, key: FutexKey) -> bool {
-        self.waiters
+        self.buckets[Self::bucket_index(key)]
+            .waiters
             .get(&key)
             .is_some_and(|queue| queue.iter().any(FutexWaiter::is_blocked))
     }
@@ -202,12 +276,16 @@ impl FutexManager {
         wake_limit: usize,
         requeue_limit: usize,
     ) -> (Vec<Arc<TaskControlBlock>>, usize) {
+        let source_bucket_index = Self::bucket_index(source);
+        let target_bucket_index = Self::bucket_index(target);
         let mut removed_waiters = Vec::new();
         let mut moved_waiters = Vec::new();
         let (tasks, moved) = {
-            let Some(queue) = self.waiters.get_mut(&source) else {
+            let bucket = &mut self.buckets[source_bucket_index];
+            let Some(queue) = bucket.waiters.get_mut(&source) else {
                 return (Vec::new(), 0);
             };
+            let old_len = queue.len();
             let mut tasks = Vec::new();
             let mut moved = VecDeque::new();
             let mut kept = VecDeque::new();
@@ -227,58 +305,102 @@ impl FutexManager {
                 }
             }
             *queue = kept;
+            let removed_count = old_len - queue.len();
+            if removed_count > 0 {
+                bucket.waiter_count = bucket.waiter_count.saturating_sub(removed_count);
+            }
             (tasks, moved)
         };
         for waiter_id in removed_waiters {
             self.waiter_keys.remove(&waiter_id);
         }
         for waiter_id in moved_waiters {
-            self.waiter_keys.insert(waiter_id, target);
+            self.waiter_keys.insert(
+                waiter_id,
+                FutexWaiterLocation {
+                    bucket: target_bucket_index,
+                    key: target,
+                },
+            );
         }
-        self.remove_empty_queue(source);
+        self.remove_empty_queue(source_bucket_index, source);
         let moved_len = moved.len();
         if moved_len > 0 {
-            self.waiters.entry(target).or_default().extend(moved);
-            self.record_state();
+            let created_queue = {
+                let bucket = &mut self.buckets[target_bucket_index];
+                let queue = bucket.waiters.entry(target).or_default();
+                let created_queue = queue.is_empty();
+                queue.extend(moved);
+                bucket.waiter_count += moved_len;
+                created_queue
+            };
+            if created_queue {
+                self.queue_count += 1;
+            }
+            self.record_state_for_bucket(target_bucket_index);
         }
         (tasks, moved_len)
     }
 
     fn remove_process(&mut self, process_id: usize) {
-        self.waiters.retain(|key, queue| {
-            if key.process_id == process_id {
-                return false;
-            }
-            queue.retain(|waiter| {
-                waiter.is_blocked()
-                    && waiter
-                        .task
-                        .process
-                        .upgrade()
-                        .is_some_and(|process| process.getpid() != process_id)
+        let mut queue_count = 0usize;
+        for bucket in &mut self.buckets {
+            let mut waiter_count = 0usize;
+            bucket.waiters.retain(|key, queue| {
+                if key.process_id == process_id {
+                    return false;
+                }
+                queue.retain(|waiter| {
+                    waiter.is_blocked()
+                        && waiter
+                            .task
+                            .process
+                            .upgrade()
+                            .is_some_and(|process| process.getpid() != process_id)
+                });
+                waiter_count += queue.len();
+                !queue.is_empty()
             });
-            !queue.is_empty()
-        });
+            queue_count += bucket.waiters.len();
+            bucket.waiter_count = waiter_count;
+        }
+        self.queue_count = queue_count;
         self.rebuild_waiter_keys();
     }
 
-    fn remove_empty_queue(&mut self, key: FutexKey) {
-        if matches!(self.waiters.get(&key), Some(queue) if queue.is_empty()) {
-            self.waiters.remove(&key);
+    fn remove_empty_queue(&mut self, bucket_index: usize, key: FutexKey) {
+        let bucket = &mut self.buckets[bucket_index];
+        if matches!(bucket.waiters.get(&key), Some(queue) if queue.is_empty()) {
+            bucket.waiters.remove(&key);
+            self.queue_count = self.queue_count.saturating_sub(1);
         }
     }
 
     fn rebuild_waiter_keys(&mut self) {
         self.waiter_keys.clear();
-        for (key, queue) in &self.waiters {
-            for waiter in queue {
-                self.waiter_keys.insert(Self::waiter_id(&waiter.task), *key);
+        for (bucket_index, bucket) in self.buckets.iter().enumerate() {
+            for (key, queue) in &bucket.waiters {
+                for waiter in queue {
+                    self.waiter_keys.insert(
+                        Self::waiter_id(&waiter.task),
+                        FutexWaiterLocation {
+                            bucket: bucket_index,
+                            key: *key,
+                        },
+                    );
+                }
             }
         }
     }
 
-    fn record_state(&self) {
-        perf::record_futex_manager_state(self.waiters.len(), self.waiter_keys.len());
+    fn record_state_for_bucket(&self, bucket_index: usize) {
+        let bucket = &self.buckets[bucket_index];
+        perf::record_futex_manager_state(
+            self.queue_count,
+            self.waiter_keys.len(),
+            bucket.waiters.len(),
+            bucket.waiter_count,
+        );
     }
 }
 
