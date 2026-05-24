@@ -264,12 +264,15 @@ pub fn sys_pselect6(
     let except_input = read_user_fdset(token, exceptfds, nfds)?;
     let deadline_ms = relative_timeout_deadline_ms(token, timeout)?;
     let word_count = fdset_words(nfds);
+    let mut read_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
+    let mut write_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
+    let mut except_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
 
     loop {
         let waiter = PollWaiter::new(current_task().ok_or(SysError::ESRCH)?);
-        let mut read_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
-        let mut write_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
-        let mut except_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
+        read_output.fill(0);
+        write_output.fill(0);
+        except_output.fill(0);
 
         let fdset_visits = nfds * usize::from(read_input.is_some())
             + nfds * usize::from(write_input.is_some())
