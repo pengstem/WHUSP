@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use super::super::errno::{SysError, SysResult};
 use super::super::time::relative_timeout_deadline_ms;
 use super::super::uapi::LinuxTimeSpec;
-use super::super::user_ptr::{read_user_array_item, write_user_array_item};
+use super::super::user_ptr::{read_user_array, write_user_array};
 use super::fd::get_file_by_fd;
 use super::uapi::{LinuxPollFd, PPOLL_MAX_NFDS};
 
@@ -92,17 +92,11 @@ fn read_user_pollfds(
         return Err(SysError::EINVAL);
     }
 
-    let mut pollfds = Vec::with_capacity(nfds);
-    for index in 0..nfds {
-        pollfds.push(read_user_array_item(token, fds, index)?);
-    }
-    Ok(pollfds)
+    read_user_array(token, fds, nfds)
 }
 
 fn write_user_pollfds(token: usize, fds: *mut LinuxPollFd, pollfds: &[LinuxPollFd]) -> SysResult {
-    for (index, pollfd) in pollfds.iter().enumerate() {
-        write_user_array_item(token, fds, index, pollfd)?;
-    }
+    write_user_array(token, fds, pollfds)?;
     Ok(0)
 }
 
@@ -194,20 +188,18 @@ fn read_user_fdset(token: usize, ptr: usize, nfds: usize) -> SysResult<Option<Ve
         return Ok(None);
     }
     let word_count = fdset_words(nfds);
-    let mut words = Vec::with_capacity(word_count);
-    for index in 0..word_count {
-        words.push(read_user_array_item(token, ptr as *const usize, index)?);
-    }
-    Ok(Some(words))
+    Ok(Some(read_user_array(
+        token,
+        ptr as *const usize,
+        word_count,
+    )?))
 }
 
 fn write_user_fdset(token: usize, ptr: usize, words: &[usize]) -> SysResult {
     if ptr == 0 {
         return Ok(0);
     }
-    for (index, word) in words.iter().enumerate() {
-        write_user_array_item(token, ptr as *mut usize, index, word)?;
-    }
+    write_user_array(token, ptr as *mut usize, words)?;
     Ok(0)
 }
 

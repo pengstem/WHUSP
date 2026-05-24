@@ -278,27 +278,64 @@ pub(crate) fn read_user_array_item<T: Copy>(
     )
 }
 
-/// Writes one plain ABI value into a user array after checked index arithmetic.
-pub(crate) fn write_user_array_item<T: Copy>(
+/// Copies a plain ABI array from user memory in one checked user-copy window.
+pub(crate) fn read_user_array<T: Copy>(
     token: usize,
-    ptr: *mut T,
-    index: usize,
-    value: &T,
-) -> SysResult<()> {
-    write_user_value_with_site(
+    ptr: *const T,
+    count: usize,
+) -> SysResult<Vec<T>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err(SysError::EFAULT);
+    }
+
+    let byte_len = user_array_byte_len::<T>(count)?;
+    let mut values = Vec::<MaybeUninit<T>>::with_capacity(count);
+    let bytes =
+        unsafe { core::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), byte_len) };
+    perf::record_usercopy_site(perf::UsercopySite::ReadArrayItem, byte_len);
+    copy_from_user(token, ptr.cast::<u8>(), bytes, None)?;
+
+    unsafe {
+        values.set_len(count);
+        let ptr = values.as_mut_ptr().cast::<T>();
+        let len = values.len();
+        let capacity = values.capacity();
+        core::mem::forget(values);
+        Ok(Vec::from_raw_parts(ptr, len, capacity))
+    }
+}
+
+/// Copies a plain ABI array into user memory in one checked user-copy window.
+pub(crate) fn write_user_array<T: Copy>(token: usize, ptr: *mut T, values: &[T]) -> SysResult<()> {
+    if values.is_empty() {
+        return Ok(());
+    }
+    if ptr.is_null() {
+        return Err(SysError::EFAULT);
+    }
+
+    let byte_len = user_array_byte_len::<T>(values.len())?;
+    let bytes = unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), byte_len) };
+    copy_to_user_with_site(
         token,
-        user_array_item_addr(ptr, index)? as *mut T,
-        value,
+        ptr.cast::<u8>(),
+        bytes,
         None,
         perf::UsercopySite::WriteArrayItem,
     )
 }
 
 fn user_array_item_addr<T>(ptr: *const T, index: usize) -> SysResult<usize> {
-    let entry_size = size_of::<T>();
     (ptr as usize)
-        .checked_add(index.checked_mul(entry_size).ok_or(SysError::EFAULT)?)
+        .checked_add(user_array_byte_len::<T>(index)?)
         .ok_or(SysError::EFAULT)
+}
+
+fn user_array_byte_len<T>(count: usize) -> SysResult<usize> {
+    count.checked_mul(size_of::<T>()).ok_or(SysError::EFAULT)
 }
 
 fn copy_from_user(
