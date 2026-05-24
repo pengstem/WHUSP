@@ -5,6 +5,7 @@ use super::{
 use crate::arch::mm as arch_mm;
 use crate::perf;
 use alloc::vec::Vec;
+use core::cell::Cell;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MemoryMapEntry {
@@ -24,6 +25,7 @@ pub struct MemorySet {
     // CONTEXT: contest address spaces have a small VMA count today. Keep the
     // VMA list simple until measured mmap pressure justifies an interval tree.
     pub(super) areas: Vec<MapArea>,
+    last_area_idx_containing: Cell<Option<usize>>,
     pub(super) brk_base: usize,
     pub(super) brk: usize,
     pub(super) brk_limit: usize,
@@ -38,6 +40,7 @@ impl MemorySet {
         Self {
             page_table: PageTable::new(),
             areas: Vec::new(),
+            last_area_idx_containing: Cell::new(None),
             brk_base: 0,
             brk: 0,
             brk_limit: 0,
@@ -51,6 +54,7 @@ impl MemorySet {
         Some(Self {
             page_table: PageTable::try_new()?,
             areas: Vec::new(),
+            last_area_idx_containing: Cell::new(None),
             brk_base: 0,
             brk: 0,
             brk_limit: 0,
@@ -84,6 +88,7 @@ impl MemorySet {
                 area.unmap(&mut self.page_table);
             }
             self.areas.remove(idx);
+            self.last_area_idx_containing.set(None);
         }
     }
     /// Add a new MapArea into this MemorySet.
@@ -112,6 +117,7 @@ impl MemorySet {
     pub(super) fn insert_area_sorted(&mut self, map_area: MapArea) -> usize {
         let idx = self.area_insert_index(map_area.vpn_range.get_start());
         self.areas.insert(idx, map_area);
+        self.last_area_idx_containing.set(None);
         idx
     }
 
@@ -136,6 +142,15 @@ impl MemorySet {
     }
 
     pub(super) fn find_area_idx_containing(&self, vpn: VirtPageNum) -> Option<usize> {
+        if let Some(idx) = self.last_area_idx_containing.get() {
+            if let Some(area) = self.areas.get(idx) {
+                if area.vpn_range.get_start() <= vpn && vpn < area.vpn_range.get_end() {
+                    perf::record_vma_lookup(1, true);
+                    return Some(idx);
+                }
+            }
+        }
+
         let mut low = 0usize;
         let mut high = self.areas.len();
         let mut probes = 0usize;
@@ -153,8 +168,10 @@ impl MemorySet {
             probes += 1;
             vpn < self.areas[idx].vpn_range.get_end()
         });
+        let result = hit.then(|| idx.expect("hit requires predecessor area"));
+        self.last_area_idx_containing.set(result);
         perf::record_vma_lookup(probes, hit);
-        hit.then(|| idx.expect("hit requires predecessor area"))
+        result
     }
     pub fn activate(&self) {
         arch_mm::activate_page_table(self.page_table.token());
@@ -178,6 +195,7 @@ impl MemorySet {
             }
         }
         self.areas.clear();
+        self.last_area_idx_containing.set(None);
         flushes
     }
 
