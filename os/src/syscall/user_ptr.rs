@@ -6,6 +6,8 @@ use core::mem::{MaybeUninit, size_of};
 
 use super::errno::{SysError, SysResult};
 
+const USER_COPY_SAME_PAGE_FAST_MAX: usize = 64;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UserBufferAccess {
     Read,
@@ -73,34 +75,7 @@ pub(crate) fn translated_byte_buffer_checked_with_fault(
     while start < end {
         let start_va = VirtAddr::from(start);
         let mut vpn = start_va.floor();
-        let mut pte = match page_table.translate(vpn) {
-            Some(pte) => pte,
-            None => {
-                let Some(fault_handler) = fault_handler else {
-                    return Err(SysError::EFAULT);
-                };
-                if !fault_handler(start, access) {
-                    return Err(SysError::EFAULT);
-                }
-                page_table.translate(vpn).ok_or(SysError::EFAULT)?
-            }
-        };
-        let reject_zero_ppn = fault_handler.is_some();
-        if !user_pte_allows(pte, access, reject_zero_ppn) {
-            if access == UserBufferAccess::Write && pte.cow() && !pte.writable() {
-                if !resolve_current_cow_page(token, start) {
-                    return Err(SysError::EFAULT);
-                }
-                pte = page_table.translate(vpn).ok_or(SysError::EFAULT)?;
-            } else if let Some(fault_handler) = fault_handler
-                && fault_handler(start, access)
-            {
-                pte = page_table.translate(vpn).ok_or(SysError::EFAULT)?;
-            }
-            if !user_pte_allows(pte, access, reject_zero_ppn) {
-                return Err(SysError::EFAULT);
-            }
-        }
+        let pte = checked_user_pte(&page_table, token, start, access, fault_handler)?;
         let ppn = pte.ppn();
         vpn.step();
         let mut end_va: VirtAddr = vpn.into();
@@ -113,6 +88,74 @@ pub(crate) fn translated_byte_buffer_checked_with_fault(
         start = end_va.into();
     }
     Ok(buffers)
+}
+
+fn checked_user_pte(
+    page_table: &PageTable,
+    token: usize,
+    addr: usize,
+    access: UserBufferAccess,
+    fault_handler: Option<UserFaultHandler>,
+) -> SysResult<crate::mm::PageTableEntry> {
+    let vpn = VirtAddr::from(addr).floor();
+    let mut pte = match page_table.translate(vpn) {
+        Some(pte) => pte,
+        None => {
+            let Some(fault_handler) = fault_handler else {
+                return Err(SysError::EFAULT);
+            };
+            if !fault_handler(addr, access) {
+                return Err(SysError::EFAULT);
+            }
+            page_table.translate(vpn).ok_or(SysError::EFAULT)?
+        }
+    };
+    let reject_zero_ppn = fault_handler.is_some();
+    if !user_pte_allows(pte, access, reject_zero_ppn) {
+        if access == UserBufferAccess::Write && pte.cow() && !pte.writable() {
+            if !resolve_current_cow_page(token, addr) {
+                return Err(SysError::EFAULT);
+            }
+            pte = page_table.translate(vpn).ok_or(SysError::EFAULT)?;
+        } else if let Some(fault_handler) = fault_handler
+            && fault_handler(addr, access)
+        {
+            pte = page_table.translate(vpn).ok_or(SysError::EFAULT)?;
+        }
+        if !user_pte_allows(pte, access, reject_zero_ppn) {
+            return Err(SysError::EFAULT);
+        }
+    }
+    Ok(pte)
+}
+
+fn try_same_page_user_slice(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    access: UserBufferAccess,
+    fault_handler: Option<UserFaultHandler>,
+) -> Option<SysResult<&'static mut [u8]>> {
+    if len == 0 || len > USER_COPY_SAME_PAGE_FAST_MAX {
+        return None;
+    }
+    let start = ptr as usize;
+    let end = match start.checked_add(len) {
+        Some(end) => end,
+        None => return Some(Err(SysError::EFAULT)),
+    };
+    let start_va = VirtAddr::from(start);
+    if start_va.floor() != VirtAddr::from(end - 1).floor() {
+        return None;
+    }
+
+    let page_table = PageTable::from_token(token);
+    let pte = match checked_user_pte(&page_table, token, start, access, fault_handler) {
+        Ok(pte) => pte,
+        Err(err) => return Some(Err(err)),
+    };
+    let offset = start_va.page_offset();
+    Some(Ok(&mut pte.ppn().get_bytes_array()[offset..offset + len]))
 }
 
 fn resolve_current_cow_page(token: usize, addr: usize) -> bool {
@@ -209,20 +252,7 @@ fn append_user_string_bytes(string: &mut String, bytes: &[u8], is_ascii: bool) {
 }
 
 pub(crate) fn read_user_usize(token: usize, addr: usize) -> SysResult<usize> {
-    let mut bytes = [0u8; size_of::<usize>()];
-    let buffers = translated_byte_buffer_checked(
-        token,
-        addr as *const u8,
-        bytes.len(),
-        UserBufferAccess::Read,
-    )?;
-    let mut copied = 0usize;
-    for buffer in buffers.iter() {
-        let next = copied + buffer.len();
-        bytes[copied..next].copy_from_slice(buffer);
-        copied = next;
-    }
-    Ok(usize::from_ne_bytes(bytes))
+    read_user_value(token, addr as *const usize)
 }
 
 /// Copies one plain ABI value from a user array after checked index arithmetic.
@@ -261,6 +291,17 @@ fn copy_from_user(
     dst: &mut [u8],
     fault_handler: Option<UserFaultHandler>,
 ) -> SysResult<()> {
+    if dst.is_empty() {
+        return Ok(());
+    }
+    if let Some(buffer) =
+        try_same_page_user_slice(token, ptr, dst.len(), UserBufferAccess::Read, fault_handler)
+    {
+        let buffer = buffer?;
+        dst.copy_from_slice(buffer);
+        perf::record_usercopy_same_page_fast(perf::UsercopyAccess::Read, dst.len());
+        return Ok(());
+    }
     let buffers = translated_byte_buffer_checked_with_fault(
         token,
         ptr,
@@ -268,6 +309,7 @@ fn copy_from_user(
         UserBufferAccess::Read,
         fault_handler,
     )?;
+    perf::record_usercopy_slow_path(buffers.len());
     let mut copied = 0usize;
     for buffer in buffers.iter() {
         let next = copied + buffer.len();
@@ -326,6 +368,21 @@ pub(crate) fn copy_to_user_with_fault(
     src: &[u8],
     fault_handler: Option<UserFaultHandler>,
 ) -> SysResult<()> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    if let Some(buffer) = try_same_page_user_slice(
+        token,
+        ptr.cast_const(),
+        src.len(),
+        UserBufferAccess::Write,
+        fault_handler,
+    ) {
+        let buffer = buffer?;
+        buffer.copy_from_slice(src);
+        perf::record_usercopy_same_page_fast(perf::UsercopyAccess::Write, src.len());
+        return Ok(());
+    }
     let buffers = translated_byte_buffer_checked_with_fault(
         token,
         ptr.cast_const(),
@@ -333,6 +390,7 @@ pub(crate) fn copy_to_user_with_fault(
         UserBufferAccess::Write,
         fault_handler,
     )?;
+    perf::record_usercopy_slow_path(buffers.len());
     copy_to_user_buffers(buffers, src);
     Ok(())
 }

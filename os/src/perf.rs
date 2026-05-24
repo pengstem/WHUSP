@@ -75,6 +75,11 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) user_c_string_scanned_bytes: usize,
     pub(crate) user_c_string_ascii_fast_bytes: usize,
     pub(crate) user_c_string_fallback_bytes: usize,
+    pub(crate) usercopy_same_page_read_hits: usize,
+    pub(crate) usercopy_same_page_write_hits: usize,
+    pub(crate) usercopy_same_page_fast_bytes: usize,
+    pub(crate) usercopy_slow_paths: usize,
+    pub(crate) usercopy_slow_pages: usize,
     pub(crate) futex_cleanup_calls: usize,
     pub(crate) futex_cleanup_direct_hits: usize,
     pub(crate) futex_cleanup_already_unqueued: usize,
@@ -165,6 +170,11 @@ static USER_C_STRING_PAGE_CHUNKS: AtomicUsize = AtomicUsize::new(0);
 static USER_C_STRING_SCANNED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static USER_C_STRING_ASCII_FAST_BYTES: AtomicUsize = AtomicUsize::new(0);
 static USER_C_STRING_FALLBACK_BYTES: AtomicUsize = AtomicUsize::new(0);
+static USERCOPY_SAME_PAGE_READ_HITS: AtomicUsize = AtomicUsize::new(0);
+static USERCOPY_SAME_PAGE_WRITE_HITS: AtomicUsize = AtomicUsize::new(0);
+static USERCOPY_SAME_PAGE_FAST_BYTES: AtomicUsize = AtomicUsize::new(0);
+static USERCOPY_SLOW_PATHS: AtomicUsize = AtomicUsize::new(0);
+static USERCOPY_SLOW_PAGES: AtomicUsize = AtomicUsize::new(0);
 
 static FUTEX_CLEANUP_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FUTEX_CLEANUP_DIRECT_HITS: AtomicUsize = AtomicUsize::new(0);
@@ -381,6 +391,25 @@ pub(crate) fn record_user_c_string_chunk(scanned_bytes: usize, copied_bytes: usi
     }
 }
 
+pub(crate) fn record_usercopy_same_page_fast(access: UsercopyAccess, bytes: usize) {
+    match access {
+        UsercopyAccess::Read => USERCOPY_SAME_PAGE_READ_HITS.fetch_add(1, Ordering::Relaxed),
+        UsercopyAccess::Write => USERCOPY_SAME_PAGE_WRITE_HITS.fetch_add(1, Ordering::Relaxed),
+    };
+    USERCOPY_SAME_PAGE_FAST_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+pub(crate) fn record_usercopy_slow_path(page_count: usize) {
+    USERCOPY_SLOW_PATHS.fetch_add(1, Ordering::Relaxed);
+    USERCOPY_SLOW_PAGES.fetch_add(page_count, Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum UsercopyAccess {
+    Read,
+    Write,
+}
+
 pub(crate) fn record_futex_cleanup(
     direct_hit: bool,
     already_unqueued: bool,
@@ -486,6 +515,11 @@ pub(crate) fn snapshot() -> KernelPerfSnapshot {
         user_c_string_scanned_bytes: USER_C_STRING_SCANNED_BYTES.load(Ordering::Relaxed),
         user_c_string_ascii_fast_bytes: USER_C_STRING_ASCII_FAST_BYTES.load(Ordering::Relaxed),
         user_c_string_fallback_bytes: USER_C_STRING_FALLBACK_BYTES.load(Ordering::Relaxed),
+        usercopy_same_page_read_hits: USERCOPY_SAME_PAGE_READ_HITS.load(Ordering::Relaxed),
+        usercopy_same_page_write_hits: USERCOPY_SAME_PAGE_WRITE_HITS.load(Ordering::Relaxed),
+        usercopy_same_page_fast_bytes: USERCOPY_SAME_PAGE_FAST_BYTES.load(Ordering::Relaxed),
+        usercopy_slow_paths: USERCOPY_SLOW_PATHS.load(Ordering::Relaxed),
+        usercopy_slow_pages: USERCOPY_SLOW_PAGES.load(Ordering::Relaxed),
         futex_cleanup_calls: FUTEX_CLEANUP_CALLS.load(Ordering::Relaxed),
         futex_cleanup_direct_hits: FUTEX_CLEANUP_DIRECT_HITS.load(Ordering::Relaxed),
         futex_cleanup_already_unqueued: FUTEX_CLEANUP_ALREADY_UNQUEUED.load(Ordering::Relaxed),
@@ -575,6 +609,11 @@ pub(crate) fn stats_content() -> String {
          user_c_string_scanned_bytes {}\n\
          user_c_string_ascii_fast_bytes {}\n\
          user_c_string_fallback_bytes {}\n\
+         usercopy_same_page_read_hits {}\n\
+         usercopy_same_page_write_hits {}\n\
+         usercopy_same_page_fast_bytes {}\n\
+         usercopy_slow_paths {}\n\
+         usercopy_slow_pages {}\n\
          futex_cleanup_calls {}\n\
          futex_cleanup_direct_hits {}\n\
          futex_cleanup_already_unqueued {}\n\
@@ -656,6 +695,11 @@ pub(crate) fn stats_content() -> String {
         stats.user_c_string_scanned_bytes,
         stats.user_c_string_ascii_fast_bytes,
         stats.user_c_string_fallback_bytes,
+        stats.usercopy_same_page_read_hits,
+        stats.usercopy_same_page_write_hits,
+        stats.usercopy_same_page_fast_bytes,
+        stats.usercopy_slow_paths,
+        stats.usercopy_slow_pages,
         stats.futex_cleanup_calls,
         stats.futex_cleanup_direct_hits,
         stats.futex_cleanup_already_unqueued,
