@@ -507,9 +507,9 @@ fn same_copy_file_range_file(
 }
 
 // UNFINISHED: Linux copy_file_range can delegate to filesystem-specific
-// acceleration and Linux 5.19+ may support cross-filesystem copies. This path
-// provides the current contest-visible regular-file semantics by copying
-// through kernel memory and returning EXDEV across different mounts.
+// acceleration. This path provides the current contest-visible regular-file
+// semantics by copying through kernel memory, including cross-mount regular
+// files when the generic VFS operations can service both sides.
 pub fn sys_copy_file_range(
     fd_in: usize,
     off_in: *mut i64,
@@ -542,13 +542,12 @@ pub fn sys_copy_file_range(
     if out_entry.status_flags().contains(OpenFlags::APPEND) {
         return Err(SysError::EBADF);
     }
+    if super::is_active_swap_file(out_stat) {
+        return Err(SysError::ETXTBSY);
+    }
     if len == 0 {
         return Ok(0);
     }
-    if in_stat.dev != out_stat.dev {
-        return Err(SysError::EXDEV);
-    }
-
     let mut in_offset = match in_offset_arg {
         Some(offset) => offset,
         None => current_copy_file_range_offset(in_file.as_ref())?,

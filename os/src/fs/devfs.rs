@@ -26,6 +26,7 @@ use lazy_static::lazy_static;
 
 const DEVFS_DEV: u64 = 0x646576;
 const DEVFS_MAGIC: i64 = 0x0102_1994;
+const LOOP_DEVICE_COUNT: usize = 2;
 const LOOP_DEVICE_SIZE_FALLBACK: u64 = 300 * 1024 * 1024;
 const LOOP_DEVICE_BLOCK_SIZE_DEFAULT: usize = 512;
 const LOOP_DEVICE_DEFAULT_READ_AHEAD: usize = 128;
@@ -58,6 +59,8 @@ const INPUT_DEFAULT_REP_PERIOD_MS: i32 = 33;
 
 lazy_static! {
     static ref LOOP0_STATE: UPIntrFreeCell<LoopDeviceState> =
+        unsafe { UPIntrFreeCell::new(LoopDeviceState::new()) };
+    static ref LOOP1_STATE: UPIntrFreeCell<LoopDeviceState> =
         unsafe { UPIntrFreeCell::new(LoopDeviceState::new()) };
     static ref PTY_TABLE: UPIntrFreeCell<PtyTable> =
         unsafe { UPIntrFreeCell::new(PtyTable::new()) };
@@ -131,6 +134,7 @@ enum DevNode {
     Rtc,
     LoopControl,
     Loop0,
+    Loop1,
     Input,
     UInput,
     InputEvent0,
@@ -158,6 +162,7 @@ impl DevNode {
             Self::Rtc => 14,
             Self::LoopControl => 15,
             Self::Loop0 => 16,
+            Self::Loop1 => 23,
             Self::Input => 17,
             Self::UInput => 18,
             Self::InputEvent0 => 19,
@@ -183,6 +188,7 @@ impl DevNode {
             Self::Rtc => linux_makedev(253, 0),
             Self::LoopControl => linux_makedev(10, 237),
             Self::Loop0 => linux_makedev(7, 0),
+            Self::Loop1 => linux_makedev(7, 1),
             Self::UInput => linux_makedev(10, 223),
             Self::InputEvent0 => linux_makedev(13, 64),
             Self::InputMice => linux_makedev(13, 63),
@@ -692,7 +698,7 @@ struct DevDirEntry {
     dtype: u8,
 }
 
-const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 21] = [
+const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 22] = [
     DevDirEntry {
         node: DevNode::Root,
         name: b".",
@@ -794,6 +800,11 @@ const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 21] = [
         dtype: DT_BLK,
     },
     DevDirEntry {
+        node: DevNode::Loop1,
+        name: b"loop1",
+        dtype: DT_BLK,
+    },
+    DevDirEntry {
         node: DevNode::Misc,
         name: b"misc",
         dtype: DT_DIR,
@@ -888,6 +899,7 @@ fn node_from_ino(ino: u32) -> Option<DevNode> {
         14 => Some(DevNode::Rtc),
         15 => Some(DevNode::LoopControl),
         16 => Some(DevNode::Loop0),
+        23 => Some(DevNode::Loop1),
         17 => Some(DevNode::Input),
         18 => Some(DevNode::UInput),
         19 => Some(DevNode::InputEvent0),
@@ -933,6 +945,7 @@ fn lookup_child(parent: DevNode, path: &str) -> Option<DevNode> {
             "rtc" | "rtc0" => Some(DevNode::Rtc),
             "loop-control" => Some(DevNode::LoopControl),
             "loop0" => Some(DevNode::Loop0),
+            "loop1" => Some(DevNode::Loop1),
             _ => None,
         },
         DevNode::Misc => match path {
@@ -1181,7 +1194,7 @@ fn stat_node(node: DevNode) -> FileStat {
         DevNode::Root | DevNode::Misc | DevNode::Pts | DevNode::Input | DevNode::Net => {
             S_IFDIR | 0o755
         }
-        DevNode::Loop0 => S_IFBLK | 0o666,
+        DevNode::Loop0 | DevNode::Loop1 => S_IFBLK | 0o666,
         DevNode::PtMx => S_IFCHR | 0o666,
         _ => S_IFCHR | 0o666,
     };
@@ -1212,21 +1225,40 @@ fn stat_pty_slave(id: usize) -> Option<FileStat> {
     Some(stat)
 }
 
-fn loop0_backend() -> FsResult<Arc<dyn File + Send + Sync>> {
-    LOOP0_STATE
+fn loop_state(id: usize) -> Option<&'static UPIntrFreeCell<LoopDeviceState>> {
+    match id {
+        0 => Some(&LOOP0_STATE),
+        1 => Some(&LOOP1_STATE),
+        _ => None,
+    }
+}
+
+fn loop_node_id(node: DevNode) -> Option<usize> {
+    match node {
+        DevNode::Loop0 => Some(0),
+        DevNode::Loop1 => Some(1),
+        _ => None,
+    }
+}
+
+fn loop_device_backend(id: usize) -> FsResult<Arc<dyn File + Send + Sync>> {
+    loop_state(id)
+        .ok_or(FsError::NoDeviceOrAddress)?
         .exclusive_session(|state| state.backend.clone())
         .ok_or(FsError::NoDeviceOrAddress)
 }
 
-fn loop0_size() -> u64 {
-    LOOP0_STATE.exclusive_session(|state| state.visible_size())
+fn loop_device_visible_size(id: usize) -> FsResult<u64> {
+    Ok(loop_state(id)
+        .ok_or(FsError::NoDeviceOrAddress)?
+        .exclusive_session(|state| state.visible_size()))
 }
 
-fn read_loop0_at(offset: usize, buf: &mut [u8]) -> usize {
-    if loop0_backend().is_err() {
+fn read_loop_device_at(id: usize, offset: usize, buf: &mut [u8]) -> usize {
+    if loop_device_backend(id).is_err() {
         return 0;
     }
-    let size = loop0_size() as usize;
+    let size = loop_device_visible_size(id).unwrap_or(0) as usize;
     if offset >= size {
         return 0;
     }
@@ -1235,20 +1267,20 @@ fn read_loop0_at(offset: usize, buf: &mut [u8]) -> usize {
     read_size
 }
 
-fn write_loop0_at(offset: usize, buf: &[u8]) -> usize {
-    if loop0_backend().is_err() {
+fn write_loop_device_at(id: usize, offset: usize, buf: &[u8]) -> usize {
+    if loop_device_backend(id).is_err() {
         return 0;
     }
-    if loop_device_is_read_only(0) {
+    if loop_device_is_read_only(id) {
         return 0;
     }
-    // CONTEXT: /dev/loop0 is currently a lightweight LTP scratch device.
+    // CONTEXT: /dev/loopN is currently a lightweight LTP scratch device.
     // mkfs output is not consumed by mount(), which routes loop sources to
     // tmpfs until the kernel has a real loop-backed block mount.
     if offset == 0 && !buf.is_empty() {
-        super::mount::reset_ext_scratch_mount("/dev/loop0");
+        super::mount::reset_ext_scratch_mount(format!("/dev/loop{}", id).as_str());
     }
-    let size = loop0_size() as usize;
+    let size = loop_device_visible_size(id).unwrap_or(0) as usize;
     if offset < size {
         buf.len().min(size - offset)
     } else {
@@ -1260,11 +1292,11 @@ fn write_loop0_at(offset: usize, buf: &[u8]) -> usize {
     }
 }
 
-fn read_loop0(offset: &UPIntrFreeCell<usize>, mut user_buf: UserBuffer) -> usize {
+fn read_loop_device(id: usize, offset: &UPIntrFreeCell<usize>, mut user_buf: UserBuffer) -> usize {
     let mut current = offset.exclusive_access();
     let mut total = 0usize;
     for slice in user_buf.buffers.iter_mut() {
-        let read_size = read_loop0_at(*current, slice);
+        let read_size = read_loop_device_at(id, *current, slice);
         if read_size == 0 {
             break;
         }
@@ -1274,11 +1306,11 @@ fn read_loop0(offset: &UPIntrFreeCell<usize>, mut user_buf: UserBuffer) -> usize
     total
 }
 
-fn write_loop0(offset: &UPIntrFreeCell<usize>, user_buf: UserBuffer) -> usize {
+fn write_loop_device(id: usize, offset: &UPIntrFreeCell<usize>, user_buf: UserBuffer) -> usize {
     let mut current = offset.exclusive_access();
     let mut total = 0usize;
     for slice in user_buf.buffers.iter() {
-        let write_size = write_loop0_at(*current, slice);
+        let write_size = write_loop_device_at(id, *current, slice);
         if write_size == 0 {
             break;
         }
@@ -1291,7 +1323,8 @@ fn write_loop0(offset: &UPIntrFreeCell<usize>, user_buf: UserBuffer) -> usize {
     total
 }
 
-fn seek_loop0(
+fn seek_loop_device(
+    id: usize,
     offset_cell: &UPIntrFreeCell<usize>,
     offset: i64,
     whence: SeekWhence,
@@ -1300,7 +1333,7 @@ fn seek_loop0(
     let base = match whence {
         SeekWhence::Set => 0i128,
         SeekWhence::Current => *current as i128,
-        SeekWhence::End => loop0_size() as i128,
+        SeekWhence::End => loop_device_visible_size(id)? as i128,
         SeekWhence::Data | SeekWhence::Hole => return Err(FsError::InvalidInput),
     };
     let new_offset = base
@@ -1329,7 +1362,7 @@ pub(crate) fn is_devfs_loop_control(file: &(dyn File + Send + Sync)) -> bool {
 pub(crate) fn devfs_loop_device_id(file: &(dyn File + Send + Sync)) -> Option<usize> {
     file.as_any()
         .downcast_ref::<DevFsFile>()
-        .and_then(|file| (file.node == DevNode::Loop0).then_some(0))
+        .and_then(|file| loop_node_id(file.node))
 }
 
 pub(crate) fn is_devfs_uinput(file: &(dyn File + Send + Sync)) -> bool {
@@ -1407,41 +1440,47 @@ pub(crate) fn devfs_input_event_set_grabbed(
 }
 
 pub(crate) fn find_free_loop_device() -> FsResult<usize> {
-    if LOOP0_STATE.exclusive_session(|state| state.backend.is_none()) {
-        Ok(0)
-    } else {
-        Err(FsError::NoDeviceOrAddress)
+    for id in 0..LOOP_DEVICE_COUNT {
+        if loop_state(id)
+            .is_some_and(|state| state.exclusive_session(|state| state.backend.is_none()))
+        {
+            return Ok(id);
+        }
     }
+    Err(FsError::NoDeviceOrAddress)
 }
 
 pub(crate) fn loop_device_is_attached(id: usize) -> bool {
-    id == 0 && LOOP0_STATE.exclusive_session(|state| state.backend.is_some())
+    loop_state(id).is_some_and(|state| state.exclusive_session(|state| state.backend.is_some()))
 }
 
 pub(crate) fn loop_device_is_read_only(id: usize) -> bool {
-    id == 0 && LOOP0_STATE.exclusive_session(|state| state.read_only())
+    loop_state(id).is_some_and(|state| state.exclusive_session(|state| state.read_only()))
 }
 
 pub(crate) fn loop_device_set_read_only(id: usize, read_only: bool) -> FsResult {
-    if id != 0 || !loop_device_is_attached(id) {
+    let state = loop_state(id).ok_or(FsError::NoDeviceOrAddress)?;
+    if !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    LOOP0_STATE.exclusive_session(|state| state.set_flag(LOOP_FLAG_READ_ONLY, read_only));
+    state.exclusive_session(|state| state.set_flag(LOOP_FLAG_READ_ONLY, read_only));
     Ok(())
 }
 
 pub(crate) fn loop_device_read_ahead(id: usize) -> FsResult<usize> {
-    if id != 0 || !loop_device_is_attached(id) {
+    let state = loop_state(id).ok_or(FsError::NoDeviceOrAddress)?;
+    if !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    Ok(LOOP0_STATE.exclusive_session(|state| state.read_ahead))
+    Ok(state.exclusive_session(|state| state.read_ahead))
 }
 
 pub(crate) fn loop_device_set_read_ahead(id: usize, read_ahead: usize) -> FsResult {
-    if id != 0 || !loop_device_is_attached(id) {
+    let state = loop_state(id).ok_or(FsError::NoDeviceOrAddress)?;
+    if !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    LOOP0_STATE.exclusive_session(|state| state.read_ahead = read_ahead);
+    state.exclusive_session(|state| state.read_ahead = read_ahead);
     Ok(())
 }
 
@@ -1451,12 +1490,10 @@ pub(crate) fn attach_loop_device(
     read_only: bool,
     backing_path: Option<String>,
 ) -> FsResult {
-    if id != 0 {
-        return Err(FsError::NoDeviceOrAddress);
-    }
+    let state = loop_state(id).ok_or(FsError::NoDeviceOrAddress)?;
     let size = backend.stat().map(|stat| stat.size)?;
-    super::mount::reset_ext_scratch_mount("/dev/loop0");
-    LOOP0_STATE.exclusive_session(|state| {
+    super::mount::reset_ext_scratch_mount(format!("/dev/loop{}", id).as_str());
+    state.exclusive_session(|state| {
         state.reset();
         state.backend = Some(backend);
         state.backing_path = backing_path;
@@ -1467,10 +1504,8 @@ pub(crate) fn attach_loop_device(
 }
 
 pub(crate) fn detach_loop_device(id: usize) -> FsResult {
-    if id != 0 {
-        return Err(FsError::NoDeviceOrAddress);
-    }
-    LOOP0_STATE
+    loop_state(id)
+        .ok_or(FsError::NoDeviceOrAddress)?
         .exclusive_session(|state| {
             let backend = state.backend.take();
             if backend.is_some() {
@@ -1483,43 +1518,44 @@ pub(crate) fn detach_loop_device(id: usize) -> FsResult {
 }
 
 pub(crate) fn loop_device_size(id: usize) -> FsResult<u64> {
-    if id != 0 || !loop_device_is_attached(id) {
+    if !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    Ok(loop0_size())
+    loop_device_visible_size(id)
 }
 
 pub(crate) fn loop_device_refresh_size(id: usize) -> FsResult<u64> {
-    if id != 0 {
-        return Err(FsError::NoDeviceOrAddress);
-    }
-    let backend = loop0_backend()?;
+    let state = loop_state(id).ok_or(FsError::NoDeviceOrAddress)?;
+    let backend = loop_device_backend(id)?;
     let size = backend.stat().map(|stat| stat.size)?;
-    Ok(LOOP0_STATE.exclusive_session(|state| {
+    Ok(state.exclusive_session(|state| {
         state.size = size;
         state.visible_size()
     }))
 }
 
 pub(crate) fn loop_device_flags(id: usize) -> FsResult<u32> {
-    if id != 0 || !loop_device_is_attached(id) {
+    let state = loop_state(id).ok_or(FsError::NoDeviceOrAddress)?;
+    if !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    Ok(LOOP0_STATE.exclusive_session(|state| state.flags))
+    Ok(state.exclusive_session(|state| state.flags))
 }
 
 pub(crate) fn loop_device_size_limit(id: usize) -> FsResult<u64> {
-    if id != 0 || !loop_device_is_attached(id) {
+    let state = loop_state(id).ok_or(FsError::NoDeviceOrAddress)?;
+    if !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    Ok(LOOP0_STATE.exclusive_session(|state| state.size_limit))
+    Ok(state.exclusive_session(|state| state.size_limit))
 }
 
 pub(crate) fn loop_device_set_status(id: usize, flags: u32, size_limit: Option<u64>) -> FsResult {
-    if id != 0 || !loop_device_is_attached(id) {
+    let state = loop_state(id).ok_or(FsError::NoDeviceOrAddress)?;
+    if !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    LOOP0_STATE.exclusive_session(|state| {
+    state.exclusive_session(|state| {
         state.set_flag(LOOP_FLAG_AUTOCLEAR, flags & LOOP_FLAG_AUTOCLEAR != 0);
         if flags & LOOP_FLAG_PARTSCAN != 0 {
             state.set_flag(LOOP_FLAG_PARTSCAN, true);
@@ -1532,18 +1568,18 @@ pub(crate) fn loop_device_set_status(id: usize, flags: u32, size_limit: Option<u
 }
 
 pub(crate) fn loop_device_set_direct_io(id: usize, enabled: bool) -> FsResult {
-    if id != 0 || !loop_device_is_attached(id) {
+    let state = loop_state(id).ok_or(FsError::NoDeviceOrAddress)?;
+    if !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    LOOP0_STATE.exclusive_session(|state| state.set_flag(LOOP_FLAG_DIRECT_IO, enabled));
+    state.exclusive_session(|state| state.set_flag(LOOP_FLAG_DIRECT_IO, enabled));
     Ok(())
 }
 
 pub(crate) fn loop_device_set_block_size(id: usize, block_size: usize) -> FsResult {
-    if id != 0 {
-        return Err(FsError::NoDeviceOrAddress);
-    }
-    LOOP0_STATE.exclusive_session(|state| state.block_size = block_size);
+    loop_state(id)
+        .ok_or(FsError::NoDeviceOrAddress)?
+        .exclusive_session(|state| state.block_size = block_size);
     Ok(())
 }
 
@@ -1552,15 +1588,16 @@ pub(crate) fn loop_device_change_fd(
     backend: Arc<dyn File + Send + Sync>,
     backing_path: Option<String>,
 ) -> FsResult {
-    if id != 0 || !loop_device_is_attached(id) || !loop_device_is_read_only(id) {
+    let state = loop_state(id).ok_or(FsError::InvalidInput)?;
+    if !loop_device_is_attached(id) || !loop_device_is_read_only(id) {
         return Err(FsError::InvalidInput);
     }
-    let old_size = LOOP0_STATE.exclusive_session(|state| state.size);
+    let old_size = state.exclusive_session(|state| state.size);
     let new_size = backend.stat().map(|stat| stat.size)?;
     if new_size != old_size {
         return Err(FsError::InvalidInput);
     }
-    LOOP0_STATE.exclusive_session(|state| {
+    state.exclusive_session(|state| {
         state.backend = Some(backend);
         state.backing_path = backing_path;
         state.size = new_size;
@@ -1570,7 +1607,7 @@ pub(crate) fn loop_device_change_fd(
 
 pub(crate) fn loop_device_sysfs_content(path: &str) -> Option<Vec<u8>> {
     let content = match path {
-        "/sys/block/loop0/size" => format!("{}\n", loop0_size() / 512),
+        "/sys/block/loop0/size" => format!("{}\n", loop_device_visible_size(0).ok()? / 512),
         "/sys/block/loop0/ro" => {
             let read_only = if loop_device_is_read_only(0) { 1 } else { 0 };
             format!("{read_only}\n")
@@ -2361,7 +2398,9 @@ impl File for DevFsFile {
             DevNode::Zero | DevNode::Full => read_zero(user_buf),
             DevNode::Random | DevNode::Urandom => read_random(user_buf),
             DevNode::Tty | DevNode::TtyS0 | DevNode::Tty8 | DevNode::Tty9 => read_console(user_buf),
-            DevNode::Loop0 => read_loop0(&self.offset, user_buf),
+            DevNode::Loop0 | DevNode::Loop1 => {
+                read_loop_device(loop_node_id(self.node).unwrap(), &self.offset, user_buf)
+            }
             DevNode::UInput => 0,
             DevNode::InputEvent0 => 0,
             DevNode::InputMice => read_input_mice(self.status_flags.get(), user_buf),
@@ -2384,31 +2423,33 @@ impl File for DevFsFile {
             DevNode::Tty | DevNode::TtyS0 | DevNode::Tty8 | DevNode::Tty9 => {
                 write_console(user_buf)
             }
-            DevNode::Loop0 => write_loop0(&self.offset, user_buf),
+            DevNode::Loop0 | DevNode::Loop1 => {
+                write_loop_device(loop_node_id(self.node).unwrap(), &self.offset, user_buf)
+            }
             DevNode::UInput | DevNode::InputEvent0 | DevNode::InputMice | DevNode::Tun => 0,
         }
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
-        if self.node == DevNode::Loop0 {
-            return read_loop0_at(offset, buf);
+        if let Some(loop_id) = loop_node_id(self.node) {
+            return read_loop_device_at(loop_id, offset, buf);
         }
         0
     }
 
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
-        if self.node == DevNode::Loop0 {
-            return write_loop0_at(offset, buf);
+        if let Some(loop_id) = loop_node_id(self.node) {
+            return write_loop_device_at(loop_id, offset, buf);
         }
         0
     }
 
     fn check_write(&self, _len: usize, _append: bool) -> FsResult {
-        if self.node == DevNode::Loop0 {
-            if !loop_device_is_attached(0) {
+        if let Some(loop_id) = loop_node_id(self.node) {
+            if !loop_device_is_attached(loop_id) {
                 return Err(FsError::NoDeviceOrAddress);
             }
-            if loop_device_is_read_only(0) {
+            if loop_device_is_read_only(loop_id) {
                 return Err(FsError::PermissionDenied);
             }
         }
@@ -2416,11 +2457,11 @@ impl File for DevFsFile {
     }
 
     fn check_write_at(&self, _offset: usize, _len: usize) -> FsResult {
-        if self.node == DevNode::Loop0 {
-            if !loop_device_is_attached(0) {
+        if let Some(loop_id) = loop_node_id(self.node) {
+            if !loop_device_is_attached(loop_id) {
                 return Err(FsError::NoDeviceOrAddress);
             }
-            if loop_device_is_read_only(0) {
+            if loop_device_is_read_only(loop_id) {
                 return Err(FsError::PermissionDenied);
             }
         }
@@ -2428,8 +2469,8 @@ impl File for DevFsFile {
     }
 
     fn seek(&self, offset: i64, whence: SeekWhence) -> FsResult<usize> {
-        if self.node == DevNode::Loop0 {
-            return seek_loop0(&self.offset, offset, whence);
+        if let Some(loop_id) = loop_node_id(self.node) {
+            return seek_loop_device(loop_id, &self.offset, offset, whence);
         }
         if matches!(self.node, DevNode::Null | DevNode::Zero | DevNode::Full) {
             if matches!(whence, SeekWhence::Data | SeekWhence::Hole) {
@@ -2561,14 +2602,18 @@ impl File for DevFsFile {
     }
 
     fn supports_splice_read(&self) -> bool {
-        self.readable && matches!(self.node, DevNode::Zero | DevNode::Full | DevNode::Loop0)
+        self.readable
+            && matches!(
+                self.node,
+                DevNode::Zero | DevNode::Full | DevNode::Loop0 | DevNode::Loop1
+            )
     }
 
     fn supports_splice_write(&self) -> bool {
         self.writable
             && matches!(
                 self.node,
-                DevNode::Null | DevNode::Zero | DevNode::Full | DevNode::Loop0
+                DevNode::Null | DevNode::Zero | DevNode::Full | DevNode::Loop0 | DevNode::Loop1
             )
     }
 }

@@ -333,6 +333,16 @@ impl TmpfsInode {
     }
 
     fn write_zero_range(&mut self, offset: u64, end: u64) {
+        if end <= TMPFS_INLINE_FILE_LIMIT as u64 {
+            let inline_end = end as usize;
+            if self.data.len() < inline_end {
+                self.data.resize(inline_end, 0);
+            }
+            let start = offset as usize;
+            self.data[start..inline_end].fill(0);
+            self.remove_sparse_range(offset, end);
+            return;
+        }
         if offset < self.data.len() as u64 {
             let start = offset as usize;
             let inline_end = end.min(self.data.len() as u64) as usize;
@@ -563,9 +573,9 @@ impl FileSystemBackend for TmpFs {
         super::vfs::FileSystemStat {
             magic: self.statfs_magic,
             block_size: 4096,
-            blocks: 0,
-            free_blocks: 0,
-            available_blocks: 0,
+            blocks: 4096,
+            free_blocks: 4096,
+            available_blocks: 4096,
             files: 1024,
             free_files: 1024,
             max_name_len: 255,
