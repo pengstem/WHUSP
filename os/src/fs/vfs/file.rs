@@ -18,7 +18,7 @@ use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
 use crate::config::PAGE_SIZE;
 use crate::mm::{
     UserBuffer, frame_alloc,
-    page_cache::{PAGE_CACHE, PAGE_CACHE_SOFT_MAX_PAGES, PageCacheId, PageCacheKey},
+    page_cache::{PAGE_CACHE, PageCacheId, PageCacheKey},
 };
 use crate::perf;
 use crate::sync::SleepMutex;
@@ -451,19 +451,6 @@ impl VfsFile {
             }
 
             perf::record_vfs_read_cache_miss();
-            if PAGE_CACHE.exclusive_access().len() >= PAGE_CACHE_SOFT_MAX_PAGES {
-                let read_size = with_mount(self.node.mount_id, |mount| {
-                    mount.read_at(
-                        self.node.ino,
-                        &mut buf[total_read_size..],
-                        file_offset as u64,
-                    )
-                })
-                .expect("filesystem mount is missing");
-                perf::record_vfs_read_cache_backend_read();
-                total_read_size += read_size;
-                break;
-            }
             let Some(frame) = frame_alloc() else {
                 let read_size = with_mount(self.node.mount_id, |mount| {
                     mount.read_at(
@@ -493,9 +480,12 @@ impl VfsFile {
             buf[total_read_size..total_read_size + copy_len]
                 .copy_from_slice(&frame.ppn.get_bytes_array()[page_offset..page_offset + copy_len]);
             if read_len == valid_len {
-                PAGE_CACHE
+                let evicted = PAGE_CACHE
                     .exclusive_access()
                     .insert_read_cache_page(key, frame, file_size);
+                if evicted > 0 {
+                    perf::record_page_cache_clean_eviction(evicted);
+                }
             }
             total_read_size += copy_len;
             if read_len < valid_len {

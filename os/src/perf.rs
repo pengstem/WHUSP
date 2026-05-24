@@ -40,6 +40,7 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) vfs_read_cache_bytes: usize,
     pub(crate) vfs_read_cache_backend_reads: usize,
     pub(crate) vfs_read_cache_invalidated_pages: usize,
+    pub(crate) page_cache_clean_evictions: usize,
     pub(crate) pipe_read_calls: usize,
     pub(crate) pipe_write_calls: usize,
     pub(crate) pipe_read_bytes: usize,
@@ -122,6 +123,7 @@ static VFS_READ_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
 static VFS_READ_CACHE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static VFS_READ_CACHE_BACKEND_READS: AtomicUsize = AtomicUsize::new(0);
 static VFS_READ_CACHE_INVALIDATED_PAGES: AtomicUsize = AtomicUsize::new(0);
+static PAGE_CACHE_CLEAN_EVICTIONS: AtomicUsize = AtomicUsize::new(0);
 
 static PIPE_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
 static PIPE_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -272,6 +274,10 @@ pub(crate) fn record_vfs_read_cache_backend_read() {
 
 pub(crate) fn record_vfs_read_cache_invalidation(pages: usize) {
     VFS_READ_CACHE_INVALIDATED_PAGES.fetch_add(pages, Ordering::Relaxed);
+}
+
+pub(crate) fn record_page_cache_clean_eviction(pages: usize) {
+    PAGE_CACHE_CLEAN_EVICTIONS.fetch_add(pages, Ordering::Relaxed);
 }
 
 pub(crate) fn record_pipe_read_call() {
@@ -425,6 +431,7 @@ pub(crate) fn snapshot() -> KernelPerfSnapshot {
         vfs_read_cache_bytes: VFS_READ_CACHE_BYTES.load(Ordering::Relaxed),
         vfs_read_cache_backend_reads: VFS_READ_CACHE_BACKEND_READS.load(Ordering::Relaxed),
         vfs_read_cache_invalidated_pages: VFS_READ_CACHE_INVALIDATED_PAGES.load(Ordering::Relaxed),
+        page_cache_clean_evictions: PAGE_CACHE_CLEAN_EVICTIONS.load(Ordering::Relaxed),
         pipe_read_calls: PIPE_READ_CALLS.load(Ordering::Relaxed),
         pipe_write_calls: PIPE_WRITE_CALLS.load(Ordering::Relaxed),
         pipe_read_bytes: PIPE_READ_BYTES.load(Ordering::Relaxed),
@@ -509,6 +516,7 @@ pub(crate) fn stats_content() -> String {
          vfs_read_cache_bytes {}\n\
          vfs_read_cache_backend_reads {}\n\
          vfs_read_cache_invalidated_pages {}\n\
+         page_cache_clean_evictions {}\n\
          pipe_read_calls {}\n\
          pipe_write_calls {}\n\
          pipe_read_bytes {}\n\
@@ -585,6 +593,7 @@ pub(crate) fn stats_content() -> String {
         stats.vfs_read_cache_bytes,
         stats.vfs_read_cache_backend_reads,
         stats.vfs_read_cache_invalidated_pages,
+        stats.page_cache_clean_evictions,
         stats.pipe_read_calls,
         stats.pipe_write_calls,
         stats.pipe_read_bytes,
