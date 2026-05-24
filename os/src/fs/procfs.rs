@@ -128,6 +128,7 @@ const PROC_NS_MNT_INO_BASE: u64 = 0x7000_0000;
 const PROC_NS_PID_INO_BASE: u64 = 0x7100_0000;
 const PROC_NS_USER_INO_BASE: u64 = 0x7200_0000;
 const PROC_NS_UTS_INO_BASE: u64 = 0x7300_0000;
+const PROC_NS_INO_RANGE: u64 = 0x0100_0000;
 const ROOT_UTS_NAMESPACE_ID: usize = 1;
 
 static PROC_PID_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_PID_MAX);
@@ -352,6 +353,25 @@ pub(crate) fn proc_namespace_stat_ino(kind: ProcNamespaceKind, id: usize) -> u64
         ProcNamespaceKind::Uts => PROC_NS_UTS_INO_BASE,
     };
     base + id as u64
+}
+
+pub(crate) fn proc_namespace_info_from_stat_ino(ino: u64) -> Option<ProcNamespaceInfo> {
+    let (kind, base) = if (PROC_NS_MNT_INO_BASE..PROC_NS_PID_INO_BASE).contains(&ino) {
+        (ProcNamespaceKind::Mnt, PROC_NS_MNT_INO_BASE)
+    } else if (PROC_NS_PID_INO_BASE..PROC_NS_USER_INO_BASE).contains(&ino) {
+        (ProcNamespaceKind::Pid, PROC_NS_PID_INO_BASE)
+    } else if (PROC_NS_USER_INO_BASE..PROC_NS_UTS_INO_BASE).contains(&ino) {
+        (ProcNamespaceKind::User, PROC_NS_USER_INO_BASE)
+    } else if (PROC_NS_UTS_INO_BASE..PROC_NS_UTS_INO_BASE + PROC_NS_INO_RANGE).contains(&ino) {
+        (ProcNamespaceKind::Uts, PROC_NS_UTS_INO_BASE)
+    } else {
+        return None;
+    };
+    Some(ProcNamespaceInfo {
+        kind,
+        id: (ino - base) as usize,
+        parent_id: None,
+    })
 }
 
 pub(crate) fn proc_namespace_kind_name(kind: ProcNamespaceKind) -> &'static str {

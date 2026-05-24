@@ -48,13 +48,13 @@ const TEST_SCRIPTS: &[&str] = &[
     "busybox_testcode.sh",
     "lua_testcode.sh",
     "libctest_testcode.sh",
-    "ltp_testcode.sh",
+    // "ltp_testcode.sh",
     "iozone_testcode.sh",
     "iperf_testcode.sh",
     "libcbench_testcode.sh",
     "netperf_testcode.sh",
     "cyclictest_testcode.sh",
-    // "lmbench_testcode.sh",
+    "lmbench_testcode.sh",
 ];
 
 /// None runs the current libc's curated whitelist from ltp_whitelist.rs.

@@ -1,27 +1,37 @@
-use crate::task::{current_process, pid2process};
+use crate::fs::{
+    MountNamespaceId, ProcNamespaceInfo, ProcNamespaceKind, proc_namespace_info_from_path,
+    proc_namespace_info_from_stat_ino,
+};
+use crate::task::{FdTableEntry, current_process};
 
 use super::super::errno::{SysError, SysResult};
 
 const CLONE_NEWNS: usize = 1 << 17;
-const PID_FILE_BASE: u64 = 10_000;
-const PID_FILE_STRIDE: u64 = 16;
-const PID_NS_MNT_OFFSET: u64 = 6;
 
-fn mount_namespace_pid_from_proc_path(path: &str) -> Option<usize> {
-    let proc_index = path.find("/proc/")?;
-    let rest = &path[proc_index + "/proc/".len()..];
-    let pid_end = rest.find('/')?;
-    let pid = rest[..pid_end].parse().ok()?;
-    (&rest[pid_end..] == "/ns/mnt").then_some(pid)
+fn mount_namespace_id_from_info(info: ProcNamespaceInfo) -> Option<MountNamespaceId> {
+    (info.kind == ProcNamespaceKind::Mnt).then_some(MountNamespaceId(info.id))
 }
 
-fn mount_namespace_pid_from_proc_stat(entry: &crate::task::FdTableEntry) -> Option<usize> {
+fn mount_namespace_id_from_proc_path(path: &str) -> Option<MountNamespaceId> {
+    proc_namespace_info_from_path(path).and_then(mount_namespace_id_from_info)
+}
+
+fn mount_namespace_id_from_proc_stat(entry: &FdTableEntry) -> Option<MountNamespaceId> {
     let stat = entry.file().stat().ok()?;
-    if stat.ino < PID_FILE_BASE {
-        return None;
-    }
-    let rel = stat.ino - PID_FILE_BASE;
-    (rel % PID_FILE_STRIDE == PID_NS_MNT_OFFSET).then_some((rel / PID_FILE_STRIDE) as usize)
+    proc_namespace_info_from_stat_ino(stat.ino).and_then(mount_namespace_id_from_info)
+}
+
+fn mount_namespace_id_from_fd(entry: &FdTableEntry) -> Option<MountNamespaceId> {
+    entry
+        .dir_path()
+        .and_then(mount_namespace_id_from_proc_path)
+        .or_else(|| {
+            entry
+                .file()
+                .proc_fd_target()
+                .and_then(|path| mount_namespace_id_from_proc_path(path.as_str()))
+        })
+        .or_else(|| mount_namespace_id_from_proc_stat(entry))
 }
 
 pub fn sys_setns(fd: usize, nstype: usize) -> SysResult {
@@ -38,12 +48,7 @@ pub fn sys_setns(fd: usize, nstype: usize) -> SysResult {
             .cloned()
             .ok_or(SysError::EBADF)?
     };
-    let target_pid = entry
-        .dir_path()
-        .and_then(mount_namespace_pid_from_proc_path)
-        .or_else(|| mount_namespace_pid_from_proc_stat(&entry))
-        .ok_or(SysError::EINVAL)?;
-    let target_process = pid2process(target_pid).ok_or(SysError::ESRCH)?;
-    current_process().set_mount_namespace_id(target_process.mount_namespace_id());
+    let target_namespace = mount_namespace_id_from_fd(&entry).ok_or(SysError::EINVAL)?;
+    current_process().set_mount_namespace_id(target_namespace);
     Ok(0)
 }
