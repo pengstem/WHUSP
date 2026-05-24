@@ -138,6 +138,10 @@ fn scan_pollfds(pollfds: &mut [LinuxPollFd], waiter: Option<&Arc<PollWaiter>>) -
     ready
 }
 
+fn poll_deadline_expired(deadline_ms: Option<usize>) -> bool {
+    deadline_ms.is_some_and(|deadline_ms| get_time_ms() >= deadline_ms)
+}
+
 pub fn sys_ppoll(
     fds: *mut LinuxPollFd,
     nfds: usize,
@@ -153,18 +157,16 @@ pub fn sys_ppoll(
     let token = current_user_token();
     let mut pollfds = read_user_pollfds(token, fds.cast_const(), nfds)?;
     let deadline_ms = relative_timeout_deadline_ms(token, timeout)?;
+    let task = current_task().ok_or(SysError::ESRCH)?;
 
     loop {
-        let waiter = PollWaiter::new(current_task().ok_or(SysError::ESRCH)?);
-        let ready = scan_pollfds(&mut pollfds, Some(&waiter));
+        let ready = scan_pollfds(&mut pollfds, None);
         perf::record_poll_scan(pollfds.len(), ready);
         if ready > 0 {
             write_user_pollfds(token, fds, &pollfds)?;
             return Ok(ready as isize);
         }
-        if let Some(deadline_ms) = deadline_ms
-            && get_time_ms() >= deadline_ms
-        {
+        if poll_deadline_expired(deadline_ms) {
             write_user_pollfds(token, fds, &pollfds)?;
             return Ok(0);
         }
@@ -174,6 +176,20 @@ pub fn sys_ppoll(
         if pollfds.is_empty() && deadline_ms.is_none() {
             block_signal_only_waiter()?;
         } else {
+            let waiter = PollWaiter::new(Arc::clone(&task));
+            let ready = scan_pollfds(&mut pollfds, Some(&waiter));
+            perf::record_poll_scan(pollfds.len(), ready);
+            if ready > 0 {
+                write_user_pollfds(token, fds, &pollfds)?;
+                return Ok(ready as isize);
+            }
+            if poll_deadline_expired(deadline_ms) {
+                write_user_pollfds(token, fds, &pollfds)?;
+                return Ok(0);
+            }
+            if current_has_interrupting_signal() {
+                return Err(SysError::EINTR);
+            }
             sleep_until_poll_event(&waiter, deadline_ms)?;
         }
     }
@@ -243,6 +259,36 @@ fn scan_fdset(
     Ok(ready)
 }
 
+fn scan_pselect_fdsets(
+    nfds: usize,
+    read_input: Option<&[usize]>,
+    write_input: Option<&[usize]>,
+    except_input: Option<&[usize]>,
+    read_output: &mut [usize],
+    write_output: &mut [usize],
+    except_output: &mut [usize],
+    waiter: Option<&Arc<PollWaiter>>,
+) -> SysResult<usize> {
+    read_output.fill(0);
+    write_output.fill(0);
+    except_output.fill(0);
+
+    Ok(scan_fdset(
+        nfds,
+        read_input,
+        read_output,
+        PollEvents::POLLIN | PollEvents::POLLHUP | PollEvents::POLLRDHUP,
+        waiter,
+    )? + scan_fdset(nfds, write_input, write_output, PollEvents::POLLOUT, waiter)?
+        + scan_fdset(
+            nfds,
+            except_input,
+            except_output,
+            PollEvents::POLLPRI,
+            waiter,
+        )?)
+}
+
 pub fn sys_pselect6(
     nfds: usize,
     readfds: usize,
@@ -267,38 +313,25 @@ pub fn sys_pselect6(
     let mut read_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
     let mut write_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
     let mut except_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
+    let task = current_task().ok_or(SysError::ESRCH)?;
+    let fdset_visits = nfds * usize::from(read_input.is_some())
+        + nfds * usize::from(write_input.is_some())
+        + nfds * usize::from(except_input.is_some());
 
     loop {
-        let waiter = PollWaiter::new(current_task().ok_or(SysError::ESRCH)?);
-        read_output.fill(0);
-        write_output.fill(0);
-        except_output.fill(0);
-
-        let fdset_visits = nfds * usize::from(read_input.is_some())
-            + nfds * usize::from(write_input.is_some())
-            + nfds * usize::from(except_input.is_some());
-        let ready = scan_fdset(
+        let ready = scan_pselect_fdsets(
             nfds,
             read_input.as_deref(),
-            &mut read_output,
-            PollEvents::POLLIN | PollEvents::POLLHUP | PollEvents::POLLRDHUP,
-            Some(&waiter),
-        )? + scan_fdset(
-            nfds,
             write_input.as_deref(),
-            &mut write_output,
-            PollEvents::POLLOUT,
-            Some(&waiter),
-        )? + scan_fdset(
-            nfds,
             except_input.as_deref(),
+            &mut read_output,
+            &mut write_output,
             &mut except_output,
-            PollEvents::POLLPRI,
-            Some(&waiter),
+            None,
         )?;
         perf::record_poll_scan(fdset_visits, ready);
 
-        if ready > 0 || deadline_ms.is_some_and(|deadline_ms| get_time_ms() >= deadline_ms) {
+        if ready > 0 || poll_deadline_expired(deadline_ms) {
             write_user_fdset(token, readfds, &read_output)?;
             write_user_fdset(token, writefds, &write_output)?;
             write_user_fdset(token, exceptfds, &except_output)?;
@@ -314,6 +347,28 @@ pub fn sys_pselect6(
         {
             block_signal_only_waiter()?;
         } else {
+            let waiter = PollWaiter::new(Arc::clone(&task));
+            let ready = scan_pselect_fdsets(
+                nfds,
+                read_input.as_deref(),
+                write_input.as_deref(),
+                except_input.as_deref(),
+                &mut read_output,
+                &mut write_output,
+                &mut except_output,
+                Some(&waiter),
+            )?;
+            perf::record_poll_scan(fdset_visits, ready);
+
+            if ready > 0 || poll_deadline_expired(deadline_ms) {
+                write_user_fdset(token, readfds, &read_output)?;
+                write_user_fdset(token, writefds, &write_output)?;
+                write_user_fdset(token, exceptfds, &except_output)?;
+                return Ok(ready as isize);
+            }
+            if current_has_interrupting_signal() {
+                return Err(SysError::EINTR);
+            }
             sleep_until_poll_event(&waiter, deadline_ms)?;
         }
     }
