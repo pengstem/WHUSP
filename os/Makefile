@@ -1,5 +1,6 @@
 ARCH ?= riscv64
 MODE ?= release
+PERF_COUNTERS ?= 0
 CARGO_HOME ?= $(abspath ../vendor)
 export CARGO_HOME
 CARGO_CONFIG_DIR ?= dotcargo
@@ -15,6 +16,7 @@ $(error unsupported ARCH: $(ARCH))
 endif
 
 MODE_ARG := $(if $(filter release,$(MODE)),--release)
+PERF_FEATURE_ARG := $(if $(filter 1 yes true on,$(PERF_COUNTERS)),--features perf-counters)
 MEM ?= 1G
 SMP ?= 1
 TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
@@ -31,7 +33,7 @@ prepare-cargo-config:
 
 kernel:
 	@$(MAKE) --no-print-directory prepare-cargo-config
-	@cargo build $(MODE_ARG) --target $(TARGET)
+	@cargo build $(MODE_ARG) --target $(TARGET) $(PERF_FEATURE_ARG)
 
 run: kernel
 	@$(MAKE) --no-print-directory run-inner

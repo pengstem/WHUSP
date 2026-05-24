@@ -252,7 +252,12 @@ fn append_user_string_bytes(string: &mut String, bytes: &[u8], is_ascii: bool) {
 }
 
 pub(crate) fn read_user_usize(token: usize, addr: usize) -> SysResult<usize> {
-    read_user_value(token, addr as *const usize)
+    read_user_value_with_site(
+        token,
+        addr as *const usize,
+        None,
+        perf::UsercopySite::ReadUsize,
+    )
 }
 
 /// Copies one plain ABI value from a user array after checked index arithmetic.
@@ -265,7 +270,12 @@ pub(crate) fn read_user_array_item<T: Copy>(
     ptr: *const T,
     index: usize,
 ) -> SysResult<T> {
-    read_user_value(token, user_array_item_addr(ptr, index)? as *const T)
+    read_user_value_with_site(
+        token,
+        user_array_item_addr(ptr, index)? as *const T,
+        None,
+        perf::UsercopySite::ReadArrayItem,
+    )
 }
 
 /// Writes one plain ABI value into a user array after checked index arithmetic.
@@ -275,7 +285,13 @@ pub(crate) fn write_user_array_item<T: Copy>(
     index: usize,
     value: &T,
 ) -> SysResult<()> {
-    write_user_value(token, user_array_item_addr(ptr, index)? as *mut T, value)
+    write_user_value_with_site(
+        token,
+        user_array_item_addr(ptr, index)? as *mut T,
+        value,
+        None,
+        perf::UsercopySite::WriteArrayItem,
+    )
 }
 
 fn user_array_item_addr<T>(ptr: *const T, index: usize) -> SysResult<usize> {
@@ -359,15 +375,17 @@ fn resolve_cow_write_range_in_memory_set(
 
 /// Copies kernel bytes into a user buffer after validating write permission.
 pub(crate) fn copy_to_user(token: usize, ptr: *mut u8, src: &[u8]) -> SysResult<()> {
-    copy_to_user_with_fault(token, ptr, src, None)
+    copy_to_user_with_site(token, ptr, src, None, perf::UsercopySite::CopyToUser)
 }
 
-pub(crate) fn copy_to_user_with_fault(
+fn copy_to_user_with_site(
     token: usize,
     ptr: *mut u8,
     src: &[u8],
     fault_handler: Option<UserFaultHandler>,
+    site: perf::UsercopySite,
 ) -> SysResult<()> {
+    perf::record_usercopy_site(site, src.len());
     if src.is_empty() {
         return Ok(());
     }
@@ -400,6 +418,7 @@ pub(crate) fn copy_to_user_in_memory_set(
     ptr: *mut u8,
     src: &[u8],
 ) -> SysResult<()> {
+    perf::record_usercopy_site(perf::UsercopySite::CopyToUserInMemorySet, src.len());
     // Used for child or freshly exec'd address spaces, not necessarily the
     // current task. Resolve COW against the supplied MemorySet before translating
     // through its token.
@@ -419,14 +438,19 @@ pub(crate) fn copy_to_user_in_memory_set(
 /// The value is copied through bytes rather than dereferenced directly, so this
 /// is safe for unaligned user ABI structs as long as `T: Copy`.
 pub(crate) fn read_user_value<T: Copy>(token: usize, ptr: *const T) -> SysResult<T> {
-    read_user_value_with_fault(token, ptr, None)
+    read_user_value_with_site(token, ptr, None, perf::UsercopySite::ReadValue)
 }
 
 pub(crate) fn read_user_value_with_mmap_fault<T: Copy>(
     token: usize,
     ptr: *const T,
 ) -> SysResult<T> {
-    read_user_value_with_fault(token, ptr, Some(mmap_user_fault))
+    read_user_value_with_site(
+        token,
+        ptr,
+        Some(mmap_user_fault),
+        perf::UsercopySite::ReadValue,
+    )
 }
 
 pub(crate) fn read_user_value_with_fault<T: Copy>(
@@ -434,16 +458,26 @@ pub(crate) fn read_user_value_with_fault<T: Copy>(
     ptr: *const T,
     fault_handler: Option<UserFaultHandler>,
 ) -> SysResult<T> {
+    read_user_value_with_site(token, ptr, fault_handler, perf::UsercopySite::ReadValue)
+}
+
+fn read_user_value_with_site<T: Copy>(
+    token: usize,
+    ptr: *const T,
+    fault_handler: Option<UserFaultHandler>,
+    site: perf::UsercopySite,
+) -> SysResult<T> {
     let mut value = MaybeUninit::<T>::uninit();
     let bytes =
         unsafe { core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size_of::<T>()) };
+    perf::record_usercopy_site(site, bytes.len());
     copy_from_user(token, ptr.cast::<u8>(), bytes, fault_handler)?;
     Ok(unsafe { value.assume_init() })
 }
 
 /// Writes one plain ABI value into user memory after checking access rights.
 pub(crate) fn write_user_value<T: Copy>(token: usize, ptr: *mut T, value: &T) -> SysResult<()> {
-    write_user_value_with_fault(token, ptr, value, None)
+    write_user_value_with_site(token, ptr, value, None, perf::UsercopySite::WriteValue)
 }
 
 pub(crate) fn write_user_value_in_memory_set<T: Copy>(
@@ -461,7 +495,13 @@ pub(crate) fn write_user_value_with_mmap_fault<T: Copy>(
     ptr: *mut T,
     value: &T,
 ) -> SysResult<()> {
-    write_user_value_with_fault(token, ptr, value, Some(mmap_user_fault))
+    write_user_value_with_site(
+        token,
+        ptr,
+        value,
+        Some(mmap_user_fault),
+        perf::UsercopySite::WriteValue,
+    )
 }
 
 pub(crate) fn write_user_value_with_fault<T: Copy>(
@@ -470,7 +510,23 @@ pub(crate) fn write_user_value_with_fault<T: Copy>(
     value: &T,
     fault_handler: Option<UserFaultHandler>,
 ) -> SysResult<()> {
+    write_user_value_with_site(
+        token,
+        ptr,
+        value,
+        fault_handler,
+        perf::UsercopySite::WriteValue,
+    )
+}
+
+fn write_user_value_with_site<T: Copy>(
+    token: usize,
+    ptr: *mut T,
+    value: &T,
+    fault_handler: Option<UserFaultHandler>,
+    site: perf::UsercopySite,
+) -> SysResult<()> {
     let bytes =
         unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
-    copy_to_user_with_fault(token, ptr.cast::<u8>(), bytes, fault_handler)
+    copy_to_user_with_site(token, ptr.cast::<u8>(), bytes, fault_handler, site)
 }

@@ -1,4 +1,5 @@
 MODE ?= release
+PERF_COUNTERS ?= 0
 CARGO_HOME ?= $(CURDIR)/vendor
 export CARGO_HOME
 
@@ -24,18 +25,18 @@ validation:
 validate: validation
 
 kernel-rv:
-	@$(MAKE) --no-print-directory -C os ARCH=riscv64 MODE=$(MODE) kernel
+	@$(MAKE) --no-print-directory -C os ARCH=riscv64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) kernel
 	@cp -f $(KERNEL_RV_SRC) kernel-rv
 
 kernel-la:
-	@$(MAKE) --no-print-directory -C os ARCH=loongarch64 MODE=$(MODE) kernel
+	@$(MAKE) --no-print-directory -C os ARCH=loongarch64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) kernel
 	@cp -f $(KERNEL_LA_SRC) kernel-la
 
 run-rv: kernel-rv
-	@$(MAKE) --no-print-directory -C os ARCH=riscv64 MODE=$(MODE) run-inner PRIMARY_DISK="$(TEST_DISK)"
+	@$(MAKE) --no-print-directory -C os ARCH=riscv64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) run-inner PRIMARY_DISK="$(TEST_DISK)"
 
 run-la: kernel-la
-	@$(MAKE) --no-print-directory -C os ARCH=loongarch64 MODE=$(MODE) run-inner PRIMARY_DISK="$(TEST_DISK_LA)"
+	@$(MAKE) --no-print-directory -C os ARCH=loongarch64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) run-inner PRIMARY_DISK="$(TEST_DISK_LA)"
 fmt:
 	@$(MAKE) --no-print-directory -C os fmt
 	@cd vendor/lwext4_rust && cargo fmt
