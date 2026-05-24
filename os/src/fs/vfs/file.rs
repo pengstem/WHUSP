@@ -35,6 +35,7 @@ use lazy_static::lazy_static;
 // buffers still progress in order without monopolizing one mount backend.
 const VFS_WRITE_CHUNK_SIZE: usize = 64 * 1024;
 const VFS_READ_CACHE_MAX_FILE_SIZE: usize = 1024 * 1024;
+const VFS_READ_CACHE_READAHEAD_PAGES: usize = 8;
 const MODE_PERMISSIONS_MASK: u32 = 0o7777;
 const MODE_SETGID: u32 = 0o2000;
 const TMPFILE_CREATE_ATTEMPTS: usize = 64;
@@ -451,42 +452,80 @@ impl VfsFile {
             }
 
             perf::record_vfs_read_cache_miss();
-            let Some(frame) = frame_alloc() else {
-                let read_size = with_mount(self.node.mount_id, |mount| {
-                    mount.read_at(
-                        self.node.ino,
-                        &mut buf[total_read_size..],
-                        file_offset as u64,
-                    )
-                })
-                .expect("filesystem mount is missing");
-                perf::record_vfs_read_cache_backend_read();
-                total_read_size += read_size;
-                break;
+            let max_readahead_pages =
+                ((file_size - page_start).div_ceil(PAGE_SIZE)).min(VFS_READ_CACHE_READAHEAD_PAGES);
+            let readahead_pages = {
+                let cache = PAGE_CACHE.exclusive_access();
+                let mut pages = 1usize;
+                while pages < max_readahead_pages {
+                    let next_key = PageCacheKey {
+                        id,
+                        page_index: key.page_index + pages,
+                    };
+                    if cache.contains(next_key) {
+                        break;
+                    }
+                    pages += 1;
+                }
+                pages
             };
+            let read_limit = (readahead_pages * PAGE_SIZE).min(file_size - page_start);
+            let mut read_buf = vec![0u8; read_limit];
 
-            let read_len = {
-                let dst = &mut frame.ppn.get_bytes_array()[..valid_len];
-                with_mount(self.node.mount_id, |mount| {
-                    mount.read_at(self.node.ino, dst, page_start as u64)
-                })
-                .expect("filesystem mount is missing")
-            };
+            let read_len = with_mount(self.node.mount_id, |mount| {
+                mount.read_at(self.node.ino, read_buf.as_mut_slice(), page_start as u64)
+            })
+            .expect("filesystem mount is missing");
             perf::record_vfs_read_cache_backend_read();
             if read_len == 0 || page_offset >= read_len {
                 break;
             }
-            let copy_len = copy_len.min(read_len - page_offset);
-            buf[total_read_size..total_read_size + copy_len]
-                .copy_from_slice(&frame.ppn.get_bytes_array()[page_offset..page_offset + copy_len]);
-            if read_len == valid_len {
-                let evicted = PAGE_CACHE
-                    .exclusive_access()
-                    .insert_read_cache_page(key, frame, file_size);
+
+            let mut pages_to_cache = Vec::new();
+            for page_delta in 0..readahead_pages {
+                let batch_offset = page_delta * PAGE_SIZE;
+                if batch_offset >= read_len {
+                    break;
+                }
+                let page_file_offset = page_start + batch_offset;
+                let page_valid_len = PAGE_SIZE.min(file_size - page_file_offset);
+                let page_read_len = (read_len - batch_offset).min(page_valid_len);
+                if page_read_len != page_valid_len {
+                    break;
+                }
+                let Some(frame) = frame_alloc() else {
+                    continue;
+                };
+                frame.ppn.get_bytes_array()[..page_valid_len]
+                    .copy_from_slice(&read_buf[batch_offset..batch_offset + page_valid_len]);
+                pages_to_cache.push((
+                    PageCacheKey {
+                        id,
+                        page_index: key.page_index + page_delta,
+                    },
+                    frame,
+                ));
+            }
+
+            if !pages_to_cache.is_empty() {
+                let readahead_cached_pages = pages_to_cache.len().saturating_sub(1);
+                let mut evicted = 0usize;
+                let mut cache = PAGE_CACHE.exclusive_access();
+                for (cache_key, frame) in pages_to_cache {
+                    evicted += cache.insert_read_cache_page(cache_key, frame, file_size);
+                }
+                drop(cache);
                 if evicted > 0 {
                     perf::record_page_cache_clean_eviction(evicted);
                 }
+                if readahead_cached_pages > 0 {
+                    perf::record_vfs_read_cache_readahead(readahead_cached_pages);
+                }
             }
+
+            let copy_len = copy_len.min(read_len - page_offset);
+            buf[total_read_size..total_read_size + copy_len]
+                .copy_from_slice(&read_buf[page_offset..page_offset + copy_len]);
             total_read_size += copy_len;
             if read_len < valid_len {
                 break;

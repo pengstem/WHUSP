@@ -62,6 +62,10 @@ enum StaticNode {
     SysDevDir,
     SysDevBlockDir,
     SysDevBlockTmpfsDir,
+    SysClassDir,
+    SysClassBlockDir,
+    SysClassLoop0Dir,
+    SysClassLoop0BdiDir,
     SysDevicesDir,
     SysDevicesVirtualDir,
     SysDevicesVirtualInputDir,
@@ -88,6 +92,7 @@ enum StaticNode {
     SysLoopQueueDir,
     SysLoopLogicalBlockSize,
     SysLoopDmaAlignment,
+    SysLoopReadAheadKb,
     SysDevBlockTmpfsUevent,
     #[cfg(target_arch = "loongarch64")]
     OptDir,
@@ -131,6 +136,12 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
         "/sys/dev" | "/sys/dev/" => Some(StaticNode::SysDevDir),
         "/sys/dev/block" | "/sys/dev/block/" => Some(StaticNode::SysDevBlockDir),
         "/sys/dev/block/254:0" | "/sys/dev/block/254:0/" => Some(StaticNode::SysDevBlockTmpfsDir),
+        "/sys/class" | "/sys/class/" => Some(StaticNode::SysClassDir),
+        "/sys/class/block" | "/sys/class/block/" => Some(StaticNode::SysClassBlockDir),
+        "/sys/class/block/loop0" | "/sys/class/block/loop0/" => Some(StaticNode::SysClassLoop0Dir),
+        "/sys/class/block/loop0/bdi" | "/sys/class/block/loop0/bdi/" => {
+            Some(StaticNode::SysClassLoop0BdiDir)
+        }
         "/sys/devices" | "/sys/devices/" => Some(StaticNode::SysDevicesDir),
         "/sys/devices/virtual" | "/sys/devices/virtual/" => Some(StaticNode::SysDevicesVirtualDir),
         "/sys/devices/virtual/input" | "/sys/devices/virtual/input/" => {
@@ -160,6 +171,7 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
         "/sys/block/loop0/loop/sizelimit" => Some(StaticNode::SysLoopSizeLimit),
         "/sys/block/loop0/queue/logical_block_size" => Some(StaticNode::SysLoopLogicalBlockSize),
         "/sys/block/loop0/queue/dma_alignment" => Some(StaticNode::SysLoopDmaAlignment),
+        "/sys/class/block/loop0/bdi/read_ahead_kb" => Some(StaticNode::SysLoopReadAheadKb),
         "/sys/dev/block/254:0/uevent" => Some(StaticNode::SysDevBlockTmpfsUevent),
         #[cfg(target_arch = "loongarch64")]
         "/opt" | "/opt/" => Some(StaticNode::OptDir),
@@ -214,6 +226,9 @@ fn content(node: StaticNode) -> Option<Vec<u8>> {
         StaticNode::SysLoopDmaAlignment => {
             super::devfs::loop_device_sysfs_content("/sys/block/loop0/queue/dma_alignment")
         }
+        StaticNode::SysLoopReadAheadKb => {
+            super::devfs::loop_device_sysfs_content("/sys/class/block/loop0/bdi/read_ahead_kb")
+        }
         StaticNode::SysDevBlockTmpfsUevent => Some(SYS_DEV_BLOCK_TMPFS_UEVENT.to_vec()),
         StaticNode::EtcDir
         | StaticNode::LibDir
@@ -227,6 +242,10 @@ fn content(node: StaticNode) -> Option<Vec<u8>> {
         | StaticNode::SysDevDir
         | StaticNode::SysDevBlockDir
         | StaticNode::SysDevBlockTmpfsDir
+        | StaticNode::SysClassDir
+        | StaticNode::SysClassBlockDir
+        | StaticNode::SysClassLoop0Dir
+        | StaticNode::SysClassLoop0BdiDir
         | StaticNode::SysDevicesDir
         | StaticNode::SysDevicesVirtualDir
         | StaticNode::SysDevicesVirtualInputDir
@@ -254,6 +273,10 @@ fn is_dir(node: StaticNode) -> bool {
         | StaticNode::SysDevDir
         | StaticNode::SysDevBlockDir
         | StaticNode::SysDevBlockTmpfsDir
+        | StaticNode::SysClassDir
+        | StaticNode::SysClassBlockDir
+        | StaticNode::SysClassLoop0Dir
+        | StaticNode::SysClassLoop0BdiDir
         | StaticNode::SysDevicesDir
         | StaticNode::SysDevicesVirtualDir
         | StaticNode::SysDevicesVirtualInputDir
@@ -316,6 +339,11 @@ fn stat_node(node: StaticNode) -> FileStat {
         StaticNode::SysLoopSizeLimit => 23,
         StaticNode::SysLoopLogicalBlockSize => 40,
         StaticNode::SysLoopDmaAlignment => 41,
+        StaticNode::SysClassDir => 43,
+        StaticNode::SysClassBlockDir => 44,
+        StaticNode::SysClassLoop0Dir => 45,
+        StaticNode::SysClassLoop0BdiDir => 46,
+        StaticNode::SysLoopReadAheadKb => 47,
         StaticNode::SysDevBlockTmpfsUevent => 38,
         #[cfg(target_arch = "loongarch64")]
         StaticNode::OptDir => 8,
@@ -352,7 +380,9 @@ pub(crate) fn open_path(
     if is_dir(node) {
         return Err(FsError::IsDir);
     }
-    if flags.writable_target() || flags.contains(OpenFlags::TRUNC) {
+    if (flags.writable_target() || flags.contains(OpenFlags::TRUNC))
+        && node != StaticNode::SysLoopReadAheadKb
+    {
         return Err(FsError::PermissionDenied);
     }
     // CONTEXT: glibc's NSS/protocol lookup probes these files during netperf
@@ -372,7 +402,7 @@ impl File for StaticFile {
     }
 
     fn writable(&self) -> bool {
-        false
+        self.node == StaticNode::SysLoopReadAheadKb
     }
 
     fn read(&self, mut user_buf: UserBuffer) -> usize {
@@ -386,8 +416,21 @@ impl File for StaticFile {
         copied
     }
 
-    fn write(&self, _user_buf: UserBuffer) -> usize {
-        0
+    fn write(&self, user_buf: UserBuffer) -> usize {
+        if self.node != StaticNode::SysLoopReadAheadKb {
+            return 0;
+        }
+        let data = user_buf.to_vec();
+        let Ok(text) = core::str::from_utf8(&data) else {
+            return 0;
+        };
+        let Ok(read_ahead_kb) = text.trim().parse::<usize>() else {
+            return 0;
+        };
+        if super::devfs::loop_device_set_read_ahead(0, read_ahead_kb).is_err() {
+            return 0;
+        }
+        data.len()
     }
 
     fn poll(&self, events: PollEvents) -> PollEvents {

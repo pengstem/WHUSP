@@ -1602,6 +1602,10 @@ pub(crate) fn loop_device_sysfs_content(path: &str) -> Option<Vec<u8>> {
         }
         "/sys/block/loop0/queue/logical_block_size" => "4096\n".into(),
         "/sys/block/loop0/queue/dma_alignment" => "4095\n".into(),
+        "/sys/class/block/loop0/bdi/read_ahead_kb" => {
+            let read_ahead = loop_device_read_ahead(0).ok()?;
+            format!("{read_ahead}\n")
+        }
         _ => return None,
     };
     Some(content.into_bytes())

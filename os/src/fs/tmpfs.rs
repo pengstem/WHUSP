@@ -44,12 +44,23 @@ impl TmpfsSparseExtent {
         if pattern.is_empty() {
             return 0;
         }
-        for index in 0..buf.len() {
-            if buf[index] != pattern[(pattern_offset + index) % pattern.len()] {
-                return index;
+        let mut matched = 0usize;
+        while matched < buf.len() {
+            let pattern_index = (pattern_offset + matched) % pattern.len();
+            let chunk_len = (pattern.len() - pattern_index).min(buf.len() - matched);
+            let expected = &pattern[pattern_index..pattern_index + chunk_len];
+            let actual = &buf[matched..matched + chunk_len];
+            if expected == actual {
+                matched += chunk_len;
+                continue;
+            }
+            for index in 0..chunk_len {
+                if actual[index] != expected[index] {
+                    return matched + index;
+                }
             }
         }
-        buf.len()
+        matched
     }
 
     fn rotated_pattern(pattern: &[u8], offset: usize, len: usize) -> Option<Vec<u8>> {
@@ -102,8 +113,13 @@ impl TmpfsSparseExtent {
                 if pattern.is_empty() {
                     return;
                 }
-                for index in 0..copy_len {
-                    buf[dst_start + index] = pattern[(src_start + index) % pattern.len()];
+                let mut copied = 0usize;
+                while copied < copy_len {
+                    let pattern_index = (src_start + copied) % pattern.len();
+                    let chunk_len = (pattern.len() - pattern_index).min(copy_len - copied);
+                    buf[dst_start + copied..dst_start + copied + chunk_len]
+                        .copy_from_slice(&pattern[pattern_index..pattern_index + chunk_len]);
+                    copied += chunk_len;
                 }
             }
         }
