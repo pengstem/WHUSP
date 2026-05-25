@@ -1198,7 +1198,7 @@ impl File for VfsFile {
         .ok_or(FsError::Io)?
     }
 
-    fn check_write(&self, _len: usize, append: bool) -> FsResult {
+    fn check_write(&self, len: usize, append: bool) -> FsResult {
         ensure_mount_writable(self.node.mount_id)?;
         let flags = self.inode_flags_or_empty()?;
         if flags & FS_IMMUTABLE_FL != 0 {
@@ -1207,25 +1207,41 @@ impl File for VfsFile {
         if flags & FS_APPEND_FL != 0 && !append {
             return Err(FsError::PermissionDenied);
         }
-        Ok(())
+        let offset = if append {
+            with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))
+                .ok_or(FsError::Io)??
+                .size
+        } else {
+            *self.offset.lock() as u64
+        };
+        with_mount(self.node.mount_id, |mount| {
+            mount.check_write_at(self.node.ino, offset, len)
+        })
+        .ok_or(FsError::Io)?
     }
 
-    fn check_write_at(&self, _offset: usize, _len: usize) -> FsResult {
+    fn check_write_at(&self, offset: usize, len: usize) -> FsResult {
         ensure_mount_writable(self.node.mount_id)?;
         let flags = self.inode_flags_or_empty()?;
         if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
             return Err(FsError::PermissionDenied);
         }
-        Ok(())
+        with_mount(self.node.mount_id, |mount| {
+            mount.check_write_at(self.node.ino, offset as u64, len)
+        })
+        .ok_or(FsError::Io)?
     }
 
-    fn check_set_len(&self, _len: usize) -> FsResult {
+    fn check_set_len(&self, len: usize) -> FsResult {
         ensure_mount_writable(self.node.mount_id)?;
         let flags = self.inode_flags_or_empty()?;
         if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
             return Err(FsError::PermissionDenied);
         }
-        Ok(())
+        with_mount(self.node.mount_id, |mount| {
+            mount.check_set_len(self.node.ino, len as u64)
+        })
+        .ok_or(FsError::Io)?
     }
 
     fn working_dir(&self) -> Option<WorkingDir> {

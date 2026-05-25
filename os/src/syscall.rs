@@ -165,6 +165,7 @@ const SYSCALL_RECVMSG: usize = 212;
 const SYSCALL_READAHEAD: usize = 213;
 const SYSCALL_BRK: usize = 214;
 const SYSCALL_MUNMAP: usize = 215;
+const SYSCALL_MREMAP: usize = 216;
 const SYSCALL_ADD_KEY: usize = 217;
 const SYSCALL_REQUEST_KEY: usize = 218;
 const SYSCALL_KEYCTL: usize = 219;
@@ -772,6 +773,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SHMDT => sys_shmdt(args[0]),
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
+        SYSCALL_MREMAP => sys_mremap(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_ADD_KEY => sys_add_key(
             args[0] as *const u8,
             args[1] as *const u8,

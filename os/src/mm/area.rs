@@ -310,6 +310,21 @@ impl MapArea {
         true
     }
 
+    pub(super) fn write_protect_shared_mmap_pages(&mut self, page_table: &mut PageTable) {
+        let Some(info) = self.mmap_info.as_ref() else {
+            return;
+        };
+        if !info.shared || !info.writable || info.backing_file.is_none() {
+            return;
+        }
+
+        let mut pte_flags = PTEFlags::from_bits_truncate(self.map_perm.bits() as usize);
+        pte_flags.remove(PTEFlags::W);
+        for vpn in info.page_cache_pages.keys().copied() {
+            let _ = page_table.remap_flags(vpn, pte_flags);
+        }
+    }
+
     pub(super) fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) -> bool {
         let ppn: PhysPageNum = match self.map_type {
             MapType::Identical => {

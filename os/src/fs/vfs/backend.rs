@@ -77,6 +77,12 @@ pub(crate) trait FileSystemBackend: Send {
     fn symlink(&mut self, parent_ino: u32, leaf_name: &str, target: &[u8]) -> FsResult;
     fn unlink(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult;
     fn rename(&mut self, src_dir: u32, src_name: &str, dst_dir: u32, dst_name: &str) -> FsResult;
+    fn check_write_at(&mut self, _ino: u32, _offset: u64, _len: usize) -> FsResult {
+        Ok(())
+    }
+    fn check_set_len(&mut self, _ino: u32, _len: u64) -> FsResult {
+        Ok(())
+    }
     fn set_len(&mut self, ino: u32, len: u64) -> FsResult;
     fn sync(&mut self, _ino: u32, _data_only: bool) -> FsResult {
         Ok(())

@@ -25,7 +25,7 @@ pub struct MemorySet {
     // CONTEXT: contest address spaces have a small VMA count today. Keep the
     // VMA list simple until measured mmap pressure justifies an interval tree.
     pub(super) areas: Vec<MapArea>,
-    last_area_idx_containing: Cell<Option<usize>>,
+    pub(super) last_area_idx_containing: Cell<Option<usize>>,
     pub(super) brk_base: usize,
     pub(super) brk: usize,
     pub(super) brk_limit: usize,

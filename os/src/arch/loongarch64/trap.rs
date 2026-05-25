@@ -197,10 +197,11 @@ pub(crate) fn handle_mmap_page_fault(addr: usize, access: MmapFaultAccess) -> bo
             force_default_sigsegv_current();
             false
         }
+        MmapFaultResult::FatalSigbus => {
+            current_add_signal(SignalFlags::SIGBUS);
+            true
+        }
         MmapFaultResult::Page(page) => {
-            // UNFINISHED: Linux reports SIGBUS for some file-backed mmap faults,
-            // such as pages wholly beyond the backing object; this kernel still
-            // collapses mmap fault failures into SIGSEGV.
             let Some(frame) = page.build_frame() else {
                 return false;
             };
@@ -208,9 +209,6 @@ pub(crate) fn handle_mmap_page_fault(addr: usize, access: MmapFaultAccess) -> bo
             inner.memory_set.install_mmap_fault_page(page, frame)
         }
         MmapFaultResult::PageCache(page) => {
-            // UNFINISHED: Linux reports SIGBUS for some file-backed mmap faults,
-            // such as pages wholly beyond the backing object; this kernel still
-            // collapses mmap fault failures into SIGSEGV.
             let Some(ppn) = page.resolve_ppn() else {
                 return false;
             };

@@ -22,6 +22,7 @@ const MAP_PRIVATE: usize = 0x02;
 const MAP_SHARED_VALIDATE: usize = 0x03;
 const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
+const MAP_FIXED_NOREPLACE: usize = 0x100000;
 const MAP_DENYWRITE: usize = 0x0800;
 const MAP_EXECUTABLE: usize = 0x1000;
 const MAP_GROWSDOWN: usize = 0x100;
@@ -31,13 +32,14 @@ const MAP_STACK: usize = 0x20000;
 const MAP_LOCKED: usize = 0x2000;
 // CONTEXT: Linux keeps MAP_DENYWRITE/MAP_EXECUTABLE as ignored legacy flags,
 // and musl/glibc may pass MAP_NORESERVE or MAP_STACK as advisory flags. The
-// current VM has no reservation accounting, eager MAP_POPULATE prefaulting, or
-// stack VMA metadata, so accepting them as no-ops is enough for loader, pthread,
-// and LTP mmap compatibility.
+// current VM has no reservation accounting or stack VMA metadata, so accepting
+// those advisory flags as no-ops is enough for loader, pthread, and LTP mmap
+// compatibility. MAP_POPULATE is handled by prefaulting after VMA creation.
 const MAP_SUPPORTED: usize = MAP_SHARED
     | MAP_PRIVATE
     | MAP_FIXED
     | MAP_ANONYMOUS
+    | MAP_FIXED_NOREPLACE
     | MAP_DENYWRITE
     | MAP_EXECUTABLE
     | MAP_GROWSDOWN
@@ -50,6 +52,9 @@ const MS_ASYNC: i32 = 0x1;
 const MS_INVALIDATE: i32 = 0x2;
 const MS_SYNC: i32 = 0x4;
 const MS_SUPPORTED: i32 = MS_ASYNC | MS_INVALIDATE | MS_SYNC;
+const MREMAP_MAYMOVE: usize = 0x1;
+const MREMAP_FIXED: usize = 0x2;
+const MREMAP_SUPPORTED: usize = MREMAP_MAYMOVE | MREMAP_FIXED;
 
 const MLOCK_ONFAULT: usize = 0x1;
 const MCL_CURRENT: usize = 0x1;
@@ -294,8 +299,10 @@ fn sys_mmap_impl(
 
     let shared = map_type == MAP_SHARED;
     let anonymous = flags & MAP_ANONYMOUS != 0;
-    let fixed = flags & MAP_FIXED != 0;
+    let no_replace = flags & MAP_FIXED_NOREPLACE != 0;
+    let fixed = flags & MAP_FIXED != 0 || no_replace;
     let grow_down = flags & MAP_GROWSDOWN != 0;
+    let populate = flags & MAP_POPULATE != 0;
     let writable = prot & PROT_WRITE != 0;
     let hardware_permission = prot_to_map_permission(prot);
     // CONTEXT: writable mappings need hardware read permission on current
@@ -346,6 +353,11 @@ fn sys_mmap_impl(
     let mut inner = process.inner_exclusive_access();
 
     if fixed {
+        let map_len = page_align_len(len)?;
+        let end = addr.checked_add(map_len).ok_or(SysError::ENOMEM)?;
+        if no_replace && inner.memory_set.range_overlaps(addr, end) {
+            return Err(SysError::EEXIST);
+        }
         let (mapped_addr, flushes) = inner
             .memory_set
             .mmap_fixed_area(
@@ -362,6 +374,9 @@ fn sys_mmap_impl(
                 page_cache_id,
             )
             .ok_or(SysError::ENOMEM)?;
+        if populate && !inner.memory_set.prefault_mmap_range(mapped_addr, len) {
+            return Err(SysError::ENOMEM);
+        }
         drop(inner);
         if let Some(file) = writable_shared_file {
             file.inc_writable_shared_mmap();
@@ -385,6 +400,9 @@ fn sys_mmap_impl(
             page_cache_id,
         )
         .ok_or(SysError::ENOMEM)?;
+    if populate && !inner.memory_set.prefault_mmap_range(mapped_addr, len) {
+        return Err(SysError::ENOMEM);
+    }
     drop(inner);
     if let Some(file) = writable_shared_file {
         file.inc_writable_shared_mmap();
@@ -493,6 +511,40 @@ pub fn sys_munmap(addr: usize, len: usize) -> SysResult {
     };
     write_back_mmap_flushes(flushes);
     Ok(0)
+}
+
+pub fn sys_mremap(
+    old_addr: usize,
+    old_size: usize,
+    new_size: usize,
+    flags: usize,
+    new_addr: usize,
+) -> SysResult {
+    if old_addr % PAGE_SIZE != 0 || old_size == 0 || new_size == 0 {
+        return Err(SysError::EINVAL);
+    }
+    if flags & !MREMAP_SUPPORTED != 0 {
+        return Err(SysError::EINVAL);
+    }
+    let may_move = flags & MREMAP_MAYMOVE != 0;
+    let fixed = flags & MREMAP_FIXED != 0;
+    if fixed {
+        // UNFINISHED: MREMAP_FIXED relocation is not implemented; the current
+        // mmap16 scoring path only needs non-fixed in-place growth.
+        if !may_move || new_addr % PAGE_SIZE != 0 {
+            return Err(SysError::EINVAL);
+        }
+        return Err(SysError::ENOMEM);
+    }
+
+    let process = current_process();
+    let (mapped_addr, flushes) = process
+        .inner_exclusive_access()
+        .memory_set
+        .mremap_area(old_addr, old_size, new_size, may_move)
+        .ok_or(SysError::ENOMEM)?;
+    write_back_mmap_flushes(flushes);
+    Ok(mapped_addr as isize)
 }
 
 // UNFINISHED: The kernel still has no swap or page-reclaim path, so these
@@ -711,6 +763,15 @@ fn write_back_mmap_flushes(flushes: Vec<MmapFlush>) {
     for flush in flushes {
         flush.write_back();
     }
+}
+
+fn page_align_len(len: usize) -> Result<usize, SysError> {
+    if len == 0 {
+        return Err(SysError::EINVAL);
+    }
+    len.checked_add(PAGE_SIZE - 1)
+        .map(|len| len & !(PAGE_SIZE - 1))
+        .ok_or(SysError::ENOMEM)
 }
 
 fn prot_with_pkey_access_rights(prot: usize, access_rights: usize) -> usize {

@@ -69,6 +69,11 @@ struct MountedFs {
     backend: SleepMutex<Box<dyn FileSystemBackend>>,
 }
 
+// CONTEXT: Loop-backed ext scratch mounts are tmpfs compatibility mounts until
+// real loop block mounts exist. Keep their visible capacity bounded so LTP
+// filesystem-full cases such as mmap16 can observe ENOSPC instead of spinning.
+const EXT_SCRATCH_TMPFS_QUOTA_BYTES: u64 = 10 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BackendKind {
     Ext4,
@@ -1796,7 +1801,10 @@ pub(crate) fn mount_ext_scratch_at(
             mounted.clone()
         } else {
             let mounted = MountedFs::new(
-                Box::new(TmpFs::new_with_statfs_magic(EXT234_SUPER_MAGIC)),
+                Box::new(TmpFs::new_with_statfs_magic_and_quota(
+                    EXT234_SUPER_MAGIC,
+                    Some(EXT_SCRATCH_TMPFS_QUOTA_BYTES),
+                )),
                 source.into(),
                 fs_type,
                 options,

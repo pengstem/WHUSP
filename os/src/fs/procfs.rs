@@ -12,7 +12,7 @@ use super::{FileStat, FileTimestamp, S_IFDIR, S_IFLNK, S_IFREG};
 use super::{PathContext, lookup_path_in};
 use crate::config::PAGE_SIZE;
 use crate::drivers::block_cache;
-use crate::mm::{exec_load_stats_content, frame_stats};
+use crate::mm::{VirtAddr, exec_load_stats_content, frame_stats};
 use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::keyring;
@@ -104,6 +104,7 @@ const PID_NS_USER_OFFSET: u32 = 15;
 const PID_NS_UTS_OFFSET: u32 = 16;
 const PID_EXE_OFFSET: u32 = 17;
 const PID_MOUNTINFO_OFFSET: u32 = 18;
+const PID_PAGEMAP_OFFSET: u32 = 19;
 const PID_FD_ENTRY_BASE: u32 = 1_000_000_000;
 const PID_FDINFO_ENTRY_BASE: u32 = 2_000_000_000;
 const PID_FD_ENTRY_STRIDE: u32 = 4096;
@@ -225,6 +226,7 @@ enum ProcNode {
     PidSmaps(usize),
     PidMounts(usize),
     PidMountinfo(usize),
+    PidPagemap(usize),
     PidIo(usize),
     PidNsDir(usize),
     PidNsMnt(usize),
@@ -527,6 +529,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
                 PID_SMAPS_OFFSET => Some(ProcNode::PidSmaps(pid)),
                 PID_MOUNTS_OFFSET => Some(ProcNode::PidMounts(pid)),
                 PID_MOUNTINFO_OFFSET => Some(ProcNode::PidMountinfo(pid)),
+                PID_PAGEMAP_OFFSET => Some(ProcNode::PidPagemap(pid)),
                 PID_IO_OFFSET => Some(ProcNode::PidIo(pid)),
                 PID_FDINFO_DIR_OFFSET => Some(ProcNode::PidFdInfoDir(pid)),
                 PID_COMM_OFFSET => Some(ProcNode::PidComm(pid)),
@@ -1089,6 +1092,11 @@ fn pid_entries(pid: usize) -> Vec<RawDirEntry> {
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_PAGEMAP_OFFSET),
+        name: "pagemap".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
         ino: pid_file_ino(pid, PID_IO_OFFSET),
         name: "io".into(),
         dtype: DT_REG,
@@ -1390,6 +1398,27 @@ fn proc_io_content() -> String {
          write_bytes: 0\n\
          cancelled_write_bytes: 0\n"
     )
+}
+
+fn pid_pagemap_read(pid: usize, buf: &mut [u8], offset: usize) -> usize {
+    let Some(process) = pid2process(pid) else {
+        return 0;
+    };
+    let inner = process.inner_exclusive_access();
+    for (idx, byte) in buf.iter_mut().enumerate() {
+        let file_offset = offset.saturating_add(idx);
+        let page_index = file_offset / core::mem::size_of::<u64>();
+        let entry_byte = file_offset % core::mem::size_of::<u64>();
+        let entry = page_index
+            .checked_mul(PAGE_SIZE)
+            .map(|addr| VirtAddr::from(addr).floor())
+            .and_then(|vpn| inner.memory_set.translate(vpn))
+            .filter(|pte| pte.bits != 0 && pte.ppn().0 != 0)
+            .map(|_| 1u64 << 63)
+            .unwrap_or(0);
+        *byte = entry.to_ne_bytes()[entry_byte];
+    }
+    buf.len()
 }
 
 fn oskernel_perf_content() -> String {
@@ -1920,6 +1949,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::PidMountinfo(pid) => lookup_process(pid)
             .map(|_| mountinfo_content().into_bytes())
             .ok_or(FsError::NotFound),
+        ProcNode::PidPagemap(_) => Err(FsError::InvalidInput),
         ProcNode::PidIo(pid) => lookup_process(pid)
             .map(|_| proc_io_content().into_bytes())
             .ok_or(FsError::NotFound),
@@ -2182,6 +2212,10 @@ impl FileSystemBackend for ProcFs {
                 )),
                 "mountinfo" => Ok((
                     pid_file_ino(pid, PID_MOUNTINFO_OFFSET),
+                    FsNodeKind::RegularFile,
+                )),
+                "pagemap" => Ok((
+                    pid_file_ino(pid, PID_PAGEMAP_OFFSET),
                     FsNodeKind::RegularFile,
                 )),
                 "io" => Ok((pid_file_ino(pid, PID_IO_OFFSET), FsNodeKind::RegularFile)),
@@ -2448,6 +2482,9 @@ impl FileSystemBackend for ProcFs {
         let Some(node) = decode_node(ino) else {
             return 0;
         };
+        if let ProcNode::PidPagemap(pid) = node {
+            return pid_pagemap_read(pid, buf, offset as usize);
+        }
         let Ok(content) = node_content(node) else {
             return 0;
         };

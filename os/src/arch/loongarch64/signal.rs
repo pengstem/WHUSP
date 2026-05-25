@@ -16,6 +16,7 @@ const SIGNAL_FRAME_MAGIC: usize = 0x574c_4153_4947_4652;
 const SIGNAL_STACK_ALIGN: usize = 16;
 const SA_NODEFER: usize = 0x4000_0000;
 const SIGINT: usize = 2;
+const SIGBUS: usize = 7;
 const SIGUSR1: usize = 10;
 const SIGSEGV: usize = 11;
 const SIGUSR2: usize = 12;
@@ -29,7 +30,7 @@ const RT_SIGRETURN_TRAMPOLINE: [u32; 2] = [0x0382_2c0b, 0x002b_0000];
 pub fn can_deliver_user_signal(_signum: usize) -> bool {
     matches!(
         _signum,
-        SIGINT | SIGUSR1 | SIGSEGV | SIGUSR2 | SIGPIPE | SIGALRM | SIGTERM | SIGCANCEL
+        SIGINT | SIGBUS | SIGUSR1 | SIGSEGV | SIGUSR2 | SIGPIPE | SIGALRM | SIGTERM | SIGCANCEL
     ) || _signum == SIGCHLD as usize
 }
 
@@ -191,11 +192,12 @@ fn take_pending_user_signal() -> Option<PendingUserSignal> {
                 // UNFINISHED: Full Linux signal delivery must support every
                 // user-installed handler. This stage deliberately limits
                 // LoongArch signal frames to libc-test sigreturn's SIGINT,
-                // parent/child rendezvous SIGUSR1, mmap/mprotect SIGSEGV
-                // handlers, pipe SIGPIPE handlers, ITIMER_REAL's SIGALRM,
-                // user cleanup SIGTERM handlers, musl's pthread cancellation
-                // signal, and BusyBox shell SIGCHLD wakeups while the generic
-                // signal ABI is still being validated.
+                // parent/child rendezvous SIGUSR1, mmap/mprotect SIGSEGV and
+                // file-backed mmap SIGBUS handlers, pipe SIGPIPE handlers,
+                // ITIMER_REAL's SIGALRM, user cleanup SIGTERM handlers, musl's
+                // pthread cancellation signal, and BusyBox shell SIGCHLD
+                // wakeups while the generic signal ABI is still being
+                // validated.
                 continue;
             }
             selected = Some((signum, signal));

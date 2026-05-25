@@ -8,7 +8,7 @@ use super::{
 use super::{VirtPageNum, frame_alloc, frame_ref_count};
 use crate::arch::mm as arch_mm;
 use crate::config::{PAGE_SIZE, USER_MMAP_BASE, USER_MMAP_LIMIT};
-use crate::fs::File;
+use crate::fs::{File, FsError};
 use crate::mm::page_cache::{PAGE_CACHE, PAGE_CACHE_SOFT_MAX_PAGES, PageCacheId, PageCacheKey};
 use crate::perf;
 use alloc::collections::BTreeMap;
@@ -47,6 +47,7 @@ pub enum MmapFaultResult {
     Page(MmapFaultPage),
     PageCache(MmapPageCacheFault),
     FatalSigsegv,
+    FatalSigbus,
 }
 
 enum GrowDownMmapFault {
@@ -134,6 +135,37 @@ impl MmapPageCacheFault {
         }
         Some(ppn)
     }
+}
+
+fn mmap_fault_hits_file_hole(area: &MapArea, info: &MmapInfo, addr: usize) -> bool {
+    if info.backing_file.is_none() || info.exec_segment.is_some() {
+        return false;
+    }
+    let area_start = usize::from(VirtAddr::from(area.vpn_range.get_start()));
+    let Some(area_offset) = addr.checked_sub(area_start) else {
+        return true;
+    };
+    let page_area_offset = area_offset / PAGE_SIZE * PAGE_SIZE;
+    info.file_offset
+        .checked_add(page_area_offset)
+        .is_none_or(|file_offset| file_offset >= info.file_size)
+}
+
+fn mmap_shared_write_hits_enospc(area: &MapArea, info: &MmapInfo, addr: usize) -> bool {
+    if !info.shared || !info.writable {
+        return false;
+    }
+    let Some(file) = &info.backing_file else {
+        return false;
+    };
+    let area_start = usize::from(VirtAddr::from(area.vpn_range.get_start()));
+    let Some(area_offset) = addr.checked_sub(area_start) else {
+        return true;
+    };
+    let Some(file_offset) = info.file_offset.checked_add(area_offset) else {
+        return true;
+    };
+    matches!(file.check_write_at(file_offset, 1), Err(FsError::NoSpace))
 }
 
 fn exec_fault_can_use_page_cache(info: &MmapInfo, fault: &ExecSegmentFault) -> bool {
@@ -764,13 +796,22 @@ impl MemorySet {
         }
         if let Some(pte) = self.translate(vpn).filter(|pte| pte.bits != 0) {
             if access == MmapFaultAccess::Write && !pte.writable() {
-                let key = area.mmap_info.as_ref().and_then(|info| {
+                let Some(info) = area.mmap_info.as_ref() else {
+                    return None;
+                };
+                if mmap_fault_hits_file_hole(area, info, addr) {
+                    return Some(MmapFaultResult::FatalSigbus);
+                }
+                if mmap_shared_write_hits_enospc(area, info, addr) {
+                    return Some(MmapFaultResult::FatalSigbus);
+                }
+                let key = {
                     if info.shared && info.writable {
                         info.page_cache_pages.get(&vpn).copied()
                     } else {
                         None
                     }
-                })?;
+                }?;
                 if !PAGE_CACHE.exclusive_access().mark_dirty(key) {
                     return None;
                 }
@@ -793,6 +834,12 @@ impl MemorySet {
             .mmap_info
             .as_ref()
             .expect("mmap fault area must carry mmap metadata");
+        if mmap_fault_hits_file_hole(area, info, addr) {
+            return Some(MmapFaultResult::FatalSigbus);
+        }
+        if access == MmapFaultAccess::Write && mmap_shared_write_hits_enospc(area, info, addr) {
+            return Some(MmapFaultResult::FatalSigbus);
+        }
         let area_offset = (vpn.0 - area.vpn_range.get_start().0) * PAGE_SIZE;
         if let Some(exec_segment) = &info.exec_segment {
             let fault = exec_segment_fault(exec_segment, area_offset)?;
@@ -1120,6 +1167,71 @@ impl MemorySet {
         Some(vec)
     }
 
+    pub fn prefault_mmap_range(&mut self, start: usize, len: usize) -> bool {
+        let Some((start_vpn, end_vpn)) = checked_page_range(start, len) else {
+            return false;
+        };
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if !self.ensure_vpn_resident_for_mlock(vpn) {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn mremap_area(
+        &mut self,
+        old_addr: usize,
+        old_len: usize,
+        new_len: usize,
+        may_move: bool,
+    ) -> Option<(usize, Vec<MmapFlush>)> {
+        if old_addr % PAGE_SIZE != 0 || old_len == 0 || new_len == 0 {
+            return None;
+        }
+        let old_map_len = checked_page_align_up(old_len)?;
+        let new_map_len = checked_page_align_up(new_len)?;
+        let old_end = old_addr.checked_add(old_map_len)?;
+        let new_end = old_addr.checked_add(new_map_len)?;
+        let old_start_vpn = VirtAddr::from(old_addr).floor();
+        let old_end_vpn = VirtAddr::from(old_end).floor();
+
+        if !self.range_is_mapped_vpn(old_start_vpn, old_end_vpn) {
+            return None;
+        }
+        if new_map_len == old_map_len {
+            return Some((old_addr, Vec::new()));
+        }
+        if new_map_len < old_map_len {
+            let tail = old_addr.checked_add(new_map_len)?;
+            let flushes = self.munmap_area(tail, old_map_len - new_map_len)?;
+            return Some((old_addr, flushes));
+        }
+        if self.range_overlaps(old_end, new_end) {
+            if may_move {
+                // UNFINISHED: MREMAP_MAYMOVE relocation is not implemented yet;
+                // current LTP mmap16 only needs in-place growth into a free gap.
+            }
+            return None;
+        }
+
+        self.split_area_at(old_start_vpn);
+        self.split_area_at(old_end_vpn);
+        let idx = self.find_area_idx_by_start(old_start_vpn)?;
+        if self.areas[idx].vpn_range.get_end() != old_end_vpn {
+            return None;
+        }
+        let new_end_vpn = VirtAddr::from(new_end).floor();
+        self.areas[idx].vpn_range = VPNRange::new(old_start_vpn, new_end_vpn);
+        if let Some(info) = self.areas[idx].mmap_info.as_mut() {
+            info.len = new_len;
+        }
+        self.areas[idx].write_protect_shared_mmap_pages(&mut self.page_table);
+        self.last_area_idx_containing.set(None);
+        arch_mm::flush_tlb_all();
+        Some((old_addr, Vec::new()))
+    }
+
     fn unlocked_pages_in_range(&self, start: super::VirtPageNum, end: super::VirtPageNum) -> usize {
         let mut pages = 0;
         for vpn in VPNRange::new(start, end) {
@@ -1173,7 +1285,7 @@ impl MemorySet {
         };
         match fault {
             MmapFaultResult::Handled => true,
-            MmapFaultResult::FatalSigsegv => false,
+            MmapFaultResult::FatalSigsegv | MmapFaultResult::FatalSigbus => false,
             MmapFaultResult::Page(page) => {
                 let Some(frame) = page.build_frame() else {
                     return false;
@@ -1277,7 +1389,7 @@ impl MemorySet {
         }
     }
 
-    fn range_overlaps(&self, start: usize, end: usize) -> bool {
+    pub(crate) fn range_overlaps(&self, start: usize, end: usize) -> bool {
         if start >= end {
             return false;
         }

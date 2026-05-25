@@ -199,6 +199,7 @@ pub(super) struct TmpFs {
     inodes: BTreeMap<u32, TmpfsInode>,
     next_ino: u32,
     statfs_magic: i64,
+    logical_quota_bytes: Option<u64>,
 }
 
 impl TmpfsInode {
@@ -240,6 +241,15 @@ impl TmpfsInode {
                 .values()
                 .map(TmpfsSparseExtent::allocated_len)
                 .sum::<usize>()
+    }
+
+    fn allocated_logical_len(&self) -> u64 {
+        self.data.len() as u64
+            + self
+                .sparse_data
+                .values()
+                .map(|extent| extent.len() as u64)
+                .sum::<u64>()
     }
 
     fn clear_payload(&mut self) {
@@ -389,6 +399,27 @@ impl TmpfsInode {
         }
         true
     }
+
+    fn allocated_bytes_in_range(&self, start: u64, end: u64) -> u64 {
+        if start >= end {
+            return 0;
+        }
+        let inline_end = (self.data.len() as u64).min(end);
+        let mut allocated = inline_end.saturating_sub(start);
+        for (&extent_start, extent) in self.sparse_data.range(..end) {
+            let extent_end = extent_start.saturating_add(extent.len() as u64);
+            if extent_end <= start {
+                continue;
+            }
+            allocated = allocated.saturating_add(extent_end.min(end) - extent_start.max(start));
+        }
+        allocated
+    }
+
+    fn write_allocated_growth(&self, start: u64, end: u64) -> u64 {
+        end.saturating_sub(start)
+            .saturating_sub(self.allocated_bytes_in_range(start, end))
+    }
 }
 
 impl TmpFs {
@@ -397,6 +428,13 @@ impl TmpFs {
     }
 
     pub(super) fn new_with_statfs_magic(statfs_magic: i64) -> Self {
+        Self::new_with_statfs_magic_and_quota(statfs_magic, None)
+    }
+
+    pub(super) fn new_with_statfs_magic_and_quota(
+        statfs_magic: i64,
+        logical_quota_bytes: Option<u64>,
+    ) -> Self {
         let mut inodes = BTreeMap::new();
         inodes.insert(
             ROOT_INO,
@@ -406,6 +444,7 @@ impl TmpFs {
             inodes,
             next_ino: ROOT_INO + 1,
             statfs_magic,
+            logical_quota_bytes,
         }
     }
 
@@ -421,6 +460,64 @@ impl TmpFs {
         } else {
             FS_STATX_COMMON_ATTR_FLAGS
         }
+    }
+
+    fn allocated_logical_len(&self) -> u64 {
+        self.inodes
+            .values()
+            .filter(|inode| inode.kind == FsNodeKind::RegularFile)
+            .map(TmpfsInode::allocated_logical_len)
+            .sum()
+    }
+
+    fn write_fits_quota(&self, ino: u32, offset: u64, len: usize) -> FsResult {
+        let Some(quota) = self.logical_quota_bytes else {
+            return Ok(());
+        };
+        let Some(end) = offset.checked_add(len as u64) else {
+            return Err(FsError::InvalidInput);
+        };
+        let inode = self.inode(ino)?;
+        if inode.kind != FsNodeKind::RegularFile {
+            return Ok(());
+        }
+        let used = self.allocated_logical_len();
+        let growth = inode.write_allocated_growth(offset, end);
+        if used.saturating_add(growth) > quota {
+            Err(FsError::NoSpace)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn quota_limited_write_len(&self, ino: u32, offset: u64, len: usize) -> usize {
+        let Some(quota) = self.logical_quota_bytes else {
+            return len;
+        };
+        let Ok(inode) = self.inode(ino) else {
+            return 0;
+        };
+        if inode.kind != FsNodeKind::RegularFile {
+            return 0;
+        }
+        let mut used = self.allocated_logical_len();
+        let mut accepted = 0usize;
+        while accepted < len {
+            let Some(pos) = offset.checked_add(accepted as u64) else {
+                break;
+            };
+            let next = len.min(accepted.saturating_add(4096));
+            let Some(next_pos) = offset.checked_add(next as u64) else {
+                break;
+            };
+            let growth = inode.write_allocated_growth(pos, next_pos);
+            if used.saturating_add(growth) > quota {
+                break;
+            }
+            used = used.saturating_add(growth);
+            accepted = next;
+        }
+        accepted
     }
 
     fn inode(&self, ino: u32) -> FsResult<&TmpfsInode> {
@@ -570,12 +667,20 @@ impl FileSystemBackend for TmpFs {
     }
 
     fn statfs(&mut self) -> super::vfs::FileSystemStat {
+        let block_size = 4096;
+        let (blocks, free_blocks) = if let Some(quota) = self.logical_quota_bytes {
+            let blocks = quota.div_ceil(block_size);
+            let used = self.allocated_logical_len().div_ceil(block_size);
+            (blocks, blocks.saturating_sub(used))
+        } else {
+            (4096, 4096)
+        };
         super::vfs::FileSystemStat {
             magic: self.statfs_magic,
-            block_size: 4096,
-            blocks: 4096,
-            free_blocks: 4096,
-            available_blocks: 4096,
+            block_size,
+            blocks,
+            free_blocks,
+            available_blocks: free_blocks,
             files: 1024,
             free_files: 1024,
             max_name_len: 255,
@@ -732,6 +837,14 @@ impl FileSystemBackend for TmpFs {
         Ok(())
     }
 
+    fn check_write_at(&mut self, ino: u32, offset: u64, len: usize) -> FsResult {
+        self.write_fits_quota(ino, offset, len)
+    }
+
+    fn check_set_len(&mut self, ino: u32, _len: u64) -> FsResult {
+        self.inode(ino).map(|_| ())
+    }
+
     fn set_len(&mut self, ino: u32, len: u64) -> FsResult {
         let inode = self.inode_mut(ino)?;
         if inode.kind == FsNodeKind::Directory {
@@ -746,8 +859,6 @@ impl FileSystemBackend for TmpFs {
             } else if inode.data.len() as u64 > len {
                 inode.data.truncate(len as usize);
             }
-        } else if len as usize <= TMPFS_INLINE_FILE_LIMIT {
-            inode.data.resize(len as usize, 0);
         } else if inode.data.len() as u64 > len {
             inode.data.truncate(len as usize);
         }
@@ -896,15 +1007,20 @@ impl FileSystemBackend for TmpFs {
     }
 
     fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize {
+        let write_len = self.quota_limited_write_len(ino, offset, buf.len());
+        if write_len == 0 && !buf.is_empty() {
+            return 0;
+        }
+        let buf = &buf[..write_len];
+        let Some(end) = offset.checked_add(buf.len() as u64) else {
+            return 0;
+        };
         let Ok(inode) = self.inode_mut(ino) else {
             return 0;
         };
         if inode.kind != FsNodeKind::RegularFile {
             return 0;
         }
-        let Some(end) = offset.checked_add(buf.len() as u64) else {
-            return 0;
-        };
         if buf.iter().all(|byte| *byte == 0) {
             if offset >= TMPFS_INLINE_FILE_LIMIT as u64 {
                 // CONTEXT: user writes can be split at page boundaries. Keeping a
