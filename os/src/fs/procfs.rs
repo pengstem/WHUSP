@@ -23,6 +23,7 @@ use crate::syscall::{
 };
 use crate::task::{
     ProcessProcSnapshot, TaskControlBlock, TaskStatus, list_process_snapshots, pid2process,
+    processes_snapshot,
 };
 use crate::timer::{get_time_us, us_to_clock_ticks};
 use alloc::format;
@@ -80,6 +81,8 @@ const SHMMNI_INO: u32 = 46;
 const SHMALL_INO: u32 = 47;
 const OSKERNEL_DIR_INO: u32 = 48;
 const OSKERNEL_PERF_INO: u32 = 49;
+const CONFIG_GZ_INO: u32 = 50;
+const PROC_SELF_INO: u32 = 51;
 // CONTEXT: Dynamic /proc inode ranges must stay disjoint even after long test
 // runs allocate five-digit PIDs; LTP probes /proc/<ppid>/stat during waits.
 const PID_DIR_BASE: u32 = 100;
@@ -131,6 +134,11 @@ const PROC_NS_USER_INO_BASE: u64 = 0x7200_0000;
 const PROC_NS_UTS_INO_BASE: u64 = 0x7300_0000;
 const PROC_NS_INO_RANGE: u64 = 0x0100_0000;
 const ROOT_UTS_NAMESPACE_ID: usize = 1;
+const PROC_CONFIG_GZ: &[u8] = &[
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x73, 0xf6, 0xf7, 0x73, 0xf3, 0x74,
+    0x8f, 0x0f, 0xf0, 0x74, 0x89, 0xf7, 0x0b, 0xb6, 0xad, 0xe4, 0x02, 0x00, 0x8c, 0x69, 0x6e, 0xfd,
+    0x10, 0x00, 0x00, 0x00,
+];
 
 static PROC_PID_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_PID_MAX);
 static PROC_PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(PIPE_MAX_CAPACITY);
@@ -208,6 +216,8 @@ enum ProcNode {
     Version,
     OsKernelDir,
     OsKernelPerf,
+    ConfigGz,
+    SelfSymlink,
     SysVipcShm,
     Domainname,
     Tainted,
@@ -490,6 +500,8 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         VERSION_INO => Some(ProcNode::Version),
         OSKERNEL_DIR_INO => Some(ProcNode::OsKernelDir),
         OSKERNEL_PERF_INO => Some(ProcNode::OsKernelPerf),
+        CONFIG_GZ_INO => Some(ProcNode::ConfigGz),
+        PROC_SELF_INO => Some(ProcNode::SelfSymlink),
         ino if ino >= PID_FDINFO_ENTRY_BASE => {
             let rel = ino - PID_FDINFO_ENTRY_BASE;
             let pid = (rel / PID_FD_ENTRY_STRIDE) as usize;
@@ -572,7 +584,9 @@ fn node_kind(node: ProcNode) -> FsNodeKind {
         | ProcNode::PidNsDir(_)
         | ProcNode::PidTaskDir(_)
         | ProcNode::PidTaskTidDir(_, _) => FsNodeKind::Directory,
-        ProcNode::PidExe(_) | ProcNode::PidFdEntry(_, _) => FsNodeKind::Symlink,
+        ProcNode::SelfSymlink | ProcNode::PidExe(_) | ProcNode::PidFdEntry(_, _) => {
+            FsNodeKind::Symlink
+        }
         _ => FsNodeKind::RegularFile,
     }
 }
@@ -623,6 +637,16 @@ fn root_entries() -> Vec<RawDirEntry> {
         ino: VERSION_INO,
         name: "version".into(),
         dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: CONFIG_GZ_INO,
+        name: "config.gz".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: PROC_SELF_INO,
+        name: "self".into(),
+        dtype: DT_LNK,
     });
     entries.push(RawDirEntry {
         ino: SYS_DIR_INO,
@@ -1894,6 +1918,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::Uptime => Ok(uptime_content().into_bytes()),
         ProcNode::Cpuinfo => Ok(cpuinfo_content().into_bytes()),
         ProcNode::Version => Ok(b"Linux version 6.8.0-whusp (oskernel2026)\n".to_vec()),
+        ProcNode::ConfigGz => Ok(PROC_CONFIG_GZ.to_vec()),
         ProcNode::OsKernelPerf => Ok(oskernel_perf_content().into_bytes()),
         ProcNode::PidMax => Ok(pid_max_content().into_bytes()),
         ProcNode::ShmMax => Ok(format!("{}\n", crate::mm::shm::SHM_MAX).into_bytes()),
@@ -1937,7 +1962,9 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::PidTimerslack(pid) => lookup_process(pid)
             .map(pid_timerslack_content)
             .ok_or(FsError::NotFound),
-        ProcNode::PidExe(_) | ProcNode::PidFdEntry(_, _) => Err(FsError::InvalidInput),
+        ProcNode::SelfSymlink | ProcNode::PidExe(_) | ProcNode::PidFdEntry(_, _) => {
+            Err(FsError::InvalidInput)
+        }
         ProcNode::PidFdInfoEntry(pid, fd) => pid_fdinfo_content(pid, fd).map(String::into_bytes),
         ProcNode::PidMaps(pid) => pid2process(pid)
             .map(|process| process.proc_maps_content().into_bytes())
@@ -2062,17 +2089,20 @@ impl FileSystemBackend for ProcFs {
                 "uptime" => Ok((UPTIME_INO, FsNodeKind::RegularFile)),
                 "cpuinfo" => Ok((CPUINFO_INO, FsNodeKind::RegularFile)),
                 "version" => Ok((VERSION_INO, FsNodeKind::RegularFile)),
+                "config.gz" => Ok((CONFIG_GZ_INO, FsNodeKind::RegularFile)),
                 "sys" => Ok((SYS_DIR_INO, FsNodeKind::Directory)),
                 "sysvipc" => Ok((SYSVIPC_DIR_INO, FsNodeKind::Directory)),
                 "oskernel" => Ok((OSKERNEL_DIR_INO, FsNodeKind::Directory)),
-                "self" => {
-                    let pid = crate::task::current_process().getpid();
-                    Ok((pid_dir_ino(pid), FsNodeKind::Directory))
-                }
+                "self" => Ok((PROC_SELF_INO, FsNodeKind::Symlink)),
                 _ => {
-                    let pid = parse_pid(component).ok_or(FsError::NotFound)?;
-                    lookup_process(pid)
-                        .map(|_| (pid_dir_ino(pid), FsNodeKind::Directory))
+                    let visible_pid = parse_pid(component).ok_or(FsError::NotFound)?;
+                    let namespace = crate::task::current_process().pid_namespace();
+                    processes_snapshot()
+                        .into_iter()
+                        .find(|process| {
+                            process.pid_visible_from_namespace(namespace) == Some(visible_pid)
+                        })
+                        .map(|process| (pid_dir_ino(process.getpid()), FsNodeKind::Directory))
                         .ok_or(FsError::NotFound)
                 }
             },
@@ -2407,7 +2437,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::PidNsDir(_)
             | ProcNode::PidTaskDir(_)
             | ProcNode::PidTaskTidDir(_, _) => FileStat::with_mode(S_IFDIR | 0o555),
-            ProcNode::PidExe(_) | ProcNode::PidFdEntry(_, _) => {
+            ProcNode::SelfSymlink | ProcNode::PidExe(_) | ProcNode::PidFdEntry(_, _) => {
                 FileStat::with_mode(S_IFLNK | 0o777)
             }
             ProcNode::PidMax
@@ -2457,6 +2487,7 @@ impl FileSystemBackend for ProcFs {
     fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
         let node = decode_node(ino).ok_or(FsError::NotFound)?;
         let target = match node {
+            ProcNode::SelfSymlink => crate::task::current_process().visible_pid().to_string(),
             ProcNode::PidExe(pid) => pid_exe_target(lookup_process(pid).ok_or(FsError::NotFound)?)?,
             ProcNode::PidFdEntry(pid, fd) => {
                 let process = pid2process(pid).ok_or(FsError::NotFound)?;

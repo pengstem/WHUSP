@@ -42,10 +42,27 @@ pub fn sys_gettid() -> isize {
 }
 
 pub fn sys_getppid() -> isize {
-    // UNFINISHED: PID namespace parent translation and child subreapers are
-    // not modeled yet, so
-    // this returns the single-namespace parent recorded in the PCB.
     current_process().getppid() as isize
+}
+
+fn process_from_visible_pid(
+    caller: &Arc<ProcessControlBlock>,
+    pid: usize,
+) -> Option<Arc<ProcessControlBlock>> {
+    let namespace = caller.pid_namespace();
+    processes_snapshot()
+        .into_iter()
+        .find(|process| process.pid_visible_from_namespace(namespace) == Some(pid))
+}
+
+fn visible_process_group_id(
+    target: &Arc<ProcessControlBlock>,
+    caller: &Arc<ProcessControlBlock>,
+) -> usize {
+    let namespace = caller.pid_namespace();
+    pid2process(target.process_group_id())
+        .and_then(|leader| leader.pid_visible_from_namespace(namespace))
+        .unwrap_or(0)
 }
 
 pub fn sys_setpgid(pid: isize, pgid: isize) -> SysResult {
@@ -59,14 +76,16 @@ pub fn sys_setpgid(pid: isize, pgid: isize) -> SysResult {
         pid as usize
     };
     let target = if target_pid == current.getpid() {
-        current
+        Arc::clone(&current)
     } else {
-        pid2process(target_pid).ok_or(SysError::ESRCH)?
+        process_from_visible_pid(&current, target_pid).ok_or(SysError::ESRCH)?
     };
     let new_pgid = if pgid == 0 {
         target.getpid()
     } else {
-        pgid as usize
+        process_from_visible_pid(&current, pgid as usize)
+            .map(|process| process.getpid())
+            .unwrap_or(pgid as usize)
     };
     // UNFINISHED: Linux setpgid enforces sessions, exec-time constraints, and
     // parent/child relationship checks. This compatibility layer exists first
@@ -81,11 +100,27 @@ pub fn sys_getpgid(pid: isize) -> SysResult {
     }
     let current = current_process();
     let target = if pid == 0 || pid as usize == current.getpid() {
-        current
+        Arc::clone(&current)
     } else {
-        pid2process(pid as usize).ok_or(SysError::ESRCH)?
+        process_from_visible_pid(&current, pid as usize).ok_or(SysError::ESRCH)?
     };
-    Ok(target.process_group_id() as isize)
+    Ok(visible_process_group_id(&target, &current) as isize)
+}
+
+pub fn sys_getsid(pid: isize) -> SysResult {
+    if pid < 0 {
+        return Err(SysError::EINVAL);
+    }
+    let current = current_process();
+    let target = if pid == 0 || pid as usize == current.getpid() {
+        Arc::clone(&current)
+    } else {
+        process_from_visible_pid(&current, pid as usize).ok_or(SysError::ESRCH)?
+    };
+    // UNFINISHED: A distinct session ID is not modeled yet. The existing
+    // process-group leader value gives the Linux-visible PID namespace behavior
+    // needed by getsid()/setsid() tests.
+    Ok(visible_process_group_id(&target, &current) as isize)
 }
 
 pub fn sys_setsid() -> SysResult {
@@ -101,7 +136,7 @@ pub fn sys_setsid() -> SysResult {
     // controlling-terminal state. Setting PGID to PID provides the Linux-visible
     // process-group effect needed by libc daemonization and LTP compatibility.
     current.set_process_group_id(pid);
-    Ok(pid as isize)
+    Ok(current.visible_pid() as isize)
 }
 
 pub fn sys_set_tid_address(tidptr: usize) -> SysResult {
@@ -149,38 +184,80 @@ fn queue_signal_to_process(
     }
 }
 
-fn kill_targets(pid: isize) -> SysResult<Vec<Arc<ProcessControlBlock>>> {
+fn kill_targets(
+    pid: isize,
+    caller: &Arc<ProcessControlBlock>,
+) -> SysResult<Vec<Arc<ProcessControlBlock>>> {
+    let caller_namespace = caller.pid_namespace();
     if pid > 0 {
         return Ok(alloc::vec![
-            pid2process(pid as usize).ok_or(SysError::ESRCH)?
+            processes_snapshot()
+                .into_iter()
+                .find(|process| {
+                    process.pid_visible_from_namespace(caller_namespace) == Some(pid as usize)
+                })
+                .ok_or(SysError::ESRCH)?
         ]);
     }
     if pid == 0 {
         let pgid = current_process().process_group_id();
         return Ok(processes_snapshot()
             .into_iter()
-            .filter(|process| process.process_group_id() == pgid)
+            .filter(|process| {
+                process.process_group_id() == pgid
+                    && process
+                        .pid_visible_from_namespace(caller_namespace)
+                        .is_some()
+            })
             .collect());
     }
     if pid == -1 {
+        let caller_pid = caller.getpid();
         return Ok(processes_snapshot()
             .into_iter()
-            .filter(|process| process.getpid() != 1)
+            .filter(|process| {
+                let visible_pid = process.pid_visible_from_namespace(caller_namespace);
+                visible_pid.is_some() && visible_pid != Some(1) && process.getpid() != caller_pid
+            })
             .collect());
     }
     let pgid = pid.checked_neg().ok_or(SysError::EINVAL)? as usize;
     Ok(processes_snapshot()
         .into_iter()
-        .filter(|process| process.process_group_id() == pgid)
+        .filter(|process| {
+            process.process_group_id() == pgid
+                && process
+                    .pid_visible_from_namespace(caller_namespace)
+                    .is_some()
+        })
         .collect())
+}
+
+fn signal_sender_pid_for_target(
+    sender: &Arc<ProcessControlBlock>,
+    target: &Arc<ProcessControlBlock>,
+) -> i32 {
+    sender
+        .pid_visible_from_namespace(target.pid_namespace())
+        .unwrap_or(0) as i32
+}
+
+fn signal_ignored_by_namespace_init(
+    sender: &Arc<ProcessControlBlock>,
+    target: &Arc<ProcessControlBlock>,
+    signal: SignalFlags,
+) -> bool {
+    let sender_namespace = sender.pid_namespace();
+    target.pid_namespace().id == sender_namespace.id
+        && target.pid_visible_from_namespace(sender_namespace) == Some(1)
+        && signal.check_error().is_some()
 }
 
 pub fn sys_kill(pid: isize, signal: u32) -> SysResult {
     let flag = SignalFlags::from_signum(signal).ok_or(SysError::EINVAL)?;
     let current = current_process();
-    let sender_pid = current.getpid() as i32;
     let sender_credentials = current.credentials();
-    let targets = kill_targets(pid)?;
+    let targets = kill_targets(pid, &current)?;
     if targets.is_empty() {
         return Err(SysError::ESRCH);
     }
@@ -192,6 +269,10 @@ pub fn sys_kill(pid: isize, signal: u32) -> SysResult {
             continue;
         }
         permitted = true;
+        if signal_ignored_by_namespace_init(&current, &process, flag) {
+            continue;
+        }
+        let sender_pid = signal_sender_pid_for_target(&current, &process);
         queue_signal_to_process(&process, flag, SignalInfo::user(signal as i32, sender_pid));
     }
 

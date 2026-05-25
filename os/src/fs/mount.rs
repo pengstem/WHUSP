@@ -1203,6 +1203,26 @@ pub(crate) fn mount_fat_device_at(
     )
 }
 
+pub(crate) fn mount_proc_at(
+    namespace_id: MountNamespaceId,
+    target: WorkingDir,
+    target_path: &str,
+    read_only: bool,
+) -> Result<MountId, MountError> {
+    let options = if read_only { "ro" } else { "rw" };
+    mount_new_fs_at(
+        namespace_id,
+        target,
+        MountedFs::new(
+            Box::new(ProcFs::new()),
+            String::from("proc"),
+            "proc",
+            options,
+        ),
+        target_path,
+    )
+}
+
 fn mount_new_fs_at(
     namespace_id: MountNamespaceId,
     target: WorkingDir,

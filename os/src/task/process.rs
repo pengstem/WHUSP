@@ -328,6 +328,7 @@ pub(crate) struct ProcessProcSnapshot {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProcessNamespace {
     pub(crate) id: usize,
+    pub(crate) parent_id: Option<usize>,
 }
 
 fn proc_task_state(status: TaskStatus, proc_sleeping: bool) -> char {
@@ -900,6 +901,7 @@ impl ProcessControlBlock {
         let inner = self.inner_exclusive_access();
         ProcessNamespace {
             id: inner.pid_namespace_id,
+            parent_id: inner.pid_namespace_parent_id,
         }
     }
 
@@ -907,6 +909,7 @@ impl ProcessControlBlock {
         let inner = self.inner_exclusive_access();
         ProcessNamespace {
             id: inner.user_namespace_id,
+            parent_id: inner.user_namespace_parent_id,
         }
     }
 
@@ -923,14 +926,25 @@ impl ProcessControlBlock {
     }
 
     pub(crate) fn visible_pid(&self) -> usize {
-        if self
-            .inner_exclusive_access()
-            .pid_namespace_parent_id
-            .is_some()
-        {
-            1
+        self.pid_visible_from_namespace(self.pid_namespace())
+            .unwrap_or(self.pid.0)
+    }
+
+    pub(crate) fn pid_visible_from_namespace(&self, namespace: ProcessNamespace) -> Option<usize> {
+        let inner = self.inner_exclusive_access();
+        if namespace.parent_id.is_none() {
+            return Some(self.pid.0);
+        }
+        if inner.pid_namespace_id == namespace.id {
+            if inner.pid_namespace_parent_id.is_some() && self.pid.0 == inner.pid_namespace_id {
+                Some(1)
+            } else {
+                Some(self.pid.0)
+            }
+        } else if inner.pid_namespace_parent_id == Some(namespace.id) {
+            Some(self.pid.0)
         } else {
-            self.pid.0
+            None
         }
     }
 
@@ -1004,7 +1018,10 @@ impl ProcessControlBlock {
     }
 
     pub fn getppid(&self) -> usize {
-        self.parent_process().map_or(0, |parent| parent.getpid())
+        let namespace = self.pid_namespace();
+        self.parent_process()
+            .and_then(|parent| parent.pid_visible_from_namespace(namespace))
+            .unwrap_or(0)
     }
 
     pub fn process_group_id(&self) -> usize {

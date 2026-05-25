@@ -127,6 +127,7 @@ const SYSCALL_SETFSGID: usize = 152;
 const SYSCALL_TIMES: usize = 153;
 const SYSCALL_SETPGID: usize = 154;
 const SYSCALL_GETPGID: usize = 155;
+const SYSCALL_GETSID: usize = 156;
 const SYSCALL_SETSID: usize = 157;
 const SYSCALL_GETGROUPS: usize = 158;
 const SYSCALL_SETGROUPS: usize = 159;
@@ -750,6 +751,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_TIMES => sys_times(args[0] as *mut LinuxTms),
         SYSCALL_SETPGID => sys_setpgid(args[0] as isize, args[1] as isize),
         SYSCALL_GETPGID => sys_getpgid(args[0] as isize),
+        SYSCALL_GETSID => sys_getsid(args[0] as isize),
         SYSCALL_SETSID => sys_setsid(),
         SYSCALL_GETGROUPS => sys_getgroups(args[0], args[1] as *mut u32),
         SYSCALL_SETGROUPS => sys_setgroups(args[0], args[1] as *const u32),
