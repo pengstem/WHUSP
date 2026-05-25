@@ -374,7 +374,11 @@ fn sys_mmap_impl(
                 page_cache_id,
             )
             .ok_or(SysError::ENOMEM)?;
-        if populate && !inner.memory_set.prefault_mmap_range(mapped_addr, len) {
+        // CONTEXT: mlockall(MCL_FUTURE) without MCL_ONFAULT makes future
+        // mappings resident on Linux. Prefaulting here also keeps large
+        // memset-heavy LTP probes from taking one page-fault trap per page.
+        let prefault = populate || inner.memory_set.future_mlock_prefaults();
+        if prefault && !inner.memory_set.prefault_mmap_range(mapped_addr, len) {
             return Err(SysError::ENOMEM);
         }
         drop(inner);
@@ -400,7 +404,11 @@ fn sys_mmap_impl(
             page_cache_id,
         )
         .ok_or(SysError::ENOMEM)?;
-    if populate && !inner.memory_set.prefault_mmap_range(mapped_addr, len) {
+    // CONTEXT: mlockall(MCL_FUTURE) without MCL_ONFAULT makes future mappings
+    // resident on Linux. Prefaulting here also keeps large memset-heavy LTP
+    // probes from taking one page-fault trap per page.
+    let prefault = populate || inner.memory_set.future_mlock_prefaults();
+    if prefault && !inner.memory_set.prefault_mmap_range(mapped_addr, len) {
         return Err(SysError::ENOMEM);
     }
     drop(inner);

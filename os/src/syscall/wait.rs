@@ -1,10 +1,10 @@
 use crate::mm::MemorySet;
-use crate::syscall::user_ptr::write_user_value_in_memory_set;
+use crate::syscall::user_ptr::{write_user_value, write_user_value_in_memory_set};
 use crate::task::{
     CLD_CONTINUED, CLD_STOPPED, ProcessControlBlock, SIGCHLD, SIGCONT, SignalInfo,
-    block_current_task_no_schedule, current_process, pid2process, ptrace_take_wait_status,
-    remove_from_pid2process, schedule, signal_child_status, signal_wait_status,
-    task_has_wait_interrupt_signal, wakeup_task,
+    block_current_task_no_schedule, current_process, current_task, current_user_token, pid2process,
+    ptrace_take_wait_status, remove_from_pid2process, schedule, signal_child_status,
+    signal_wait_status, task_has_wait_interrupt_signal, wakeup_task,
 };
 use alloc::sync::Arc;
 
@@ -20,6 +20,10 @@ const WALL: i32 = 0x40000000;
 const P_ALL: i32 = 0;
 const P_PID: i32 = 1;
 const P_PGID: i32 = 2;
+const RUSAGE_CHILDREN: i32 = -1;
+const RUSAGE_SELF: i32 = 0;
+const RUSAGE_THREAD: i32 = 1;
+const USEC_PER_SEC: usize = 1_000_000;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -147,6 +151,59 @@ fn write_rusage(memory_set: &mut MemorySet, rusage: *mut RUsage) -> SysResult<()
         write_user_value_in_memory_set(memory_set, rusage, &RUsage::default())?;
     }
     Ok(())
+}
+
+fn usize_to_isize_saturating(value: usize) -> isize {
+    value.min(isize::MAX as usize) as isize
+}
+
+fn timeval_from_us(us: usize) -> TimeVal {
+    TimeVal {
+        sec: usize_to_isize_saturating(us / USEC_PER_SEC),
+        usec: usize_to_isize_saturating(us % USEC_PER_SEC),
+    }
+}
+
+fn process_self_rusage() -> RUsage {
+    let times = current_process().cpu_times_snapshot();
+    RUsage {
+        utime: timeval_from_us(times.user_us),
+        stime: timeval_from_us(times.system_us),
+        maxrss: usize_to_isize_saturating(times.self_maxrss_kb),
+        ..RUsage::default()
+    }
+}
+
+fn process_children_rusage() -> RUsage {
+    let times = current_process().cpu_times_snapshot();
+    RUsage {
+        utime: timeval_from_us(times.children_user_us),
+        stime: timeval_from_us(times.children_system_us),
+        maxrss: usize_to_isize_saturating(times.children_maxrss_kb),
+        ..RUsage::default()
+    }
+}
+
+fn current_thread_rusage() -> RUsage {
+    let thread_cpu_us = current_task().map_or(0, |task| task.cpu_time_us());
+    let mut usage = process_self_rusage();
+    // UNFINISHED: Per-thread accounting currently records combined CPU time,
+    // so RUSAGE_THREAD exposes it as user time until scheduler-grade user vs.
+    // system attribution is available.
+    usage.utime = timeval_from_us(thread_cpu_us);
+    usage.stime = TimeVal::default();
+    usage
+}
+
+pub fn sys_getrusage(who: i32, usage: *mut RUsage) -> SysResult {
+    let rusage = match who {
+        RUSAGE_SELF => process_self_rusage(),
+        RUSAGE_CHILDREN => process_children_rusage(),
+        RUSAGE_THREAD => current_thread_rusage(),
+        _ => return Err(SysError::EINVAL),
+    };
+    write_user_value(current_user_token(), usage, &rusage)?;
+    Ok(0)
 }
 
 fn ptrace_wait4_target(pid: isize, waiter_pid: usize) -> Option<(usize, i32)> {

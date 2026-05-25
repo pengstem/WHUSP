@@ -586,6 +586,8 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             process_inner.is_zombie = true;
             // record exit code of main process
             process_inner.exit_code = exit_code;
+            let resident_kb = process_inner.memory_set.resident_bytes() / 1024;
+            process_inner.cpu_times.record_resident_kb(resident_kb);
             let parent = process_inner.parent.as_ref().and_then(|p| p.upgrade());
             let exit_signal = process_inner.exit_signal;
             let children = core::mem::take(&mut process_inner.children);
@@ -639,24 +641,34 @@ fn exit_current(exit_code: i32, group_exit: bool) {
 
         if let Some(parent) = parent {
             let parent_tasks = parent.tasks_snapshot();
-            if let Some(parent_task) = parent_tasks.first()
-                && let Some(signal) = SignalFlags::from_signum(exit_signal)
-                && !signal.is_empty()
-            {
-                queue_signal_to_task(
-                    Arc::clone(parent_task),
-                    signal,
-                    SignalInfo::child_exit(exit_signal as i32, pid as i32, exit_code),
-                );
-            }
-            // Signal delivery and wait wakeups are separate contracts. The
-            // exit signal targets the parent leader, while every blocked parent
-            // task may be sleeping in wait4()/waitid() and needs a wake hint.
-            for parent_task in parent_tasks {
-                let is_blocked =
-                    parent_task.inner_exclusive_access().task_status == TaskStatus::Blocked;
-                if is_blocked {
-                    wakeup_task(parent_task);
+            let sigchld_ignored = exit_signal == SIGCHLD
+                && parent.inner_exclusive_access().signal_actions[SIGCHLD as usize].is_ignore();
+            if sigchld_ignored {
+                parent
+                    .inner_exclusive_access()
+                    .children
+                    .retain(|child| child.getpid() != pid);
+                remove_from_pid2process(pid);
+            } else {
+                if let Some(parent_task) = parent_tasks.first()
+                    && let Some(signal) = SignalFlags::from_signum(exit_signal)
+                    && !signal.is_empty()
+                {
+                    queue_signal_to_task(
+                        Arc::clone(parent_task),
+                        signal,
+                        SignalInfo::child_exit(exit_signal as i32, pid as i32, exit_code),
+                    );
+                }
+                // Signal delivery and wait wakeups are separate contracts. The
+                // exit signal targets the parent leader, while every blocked parent
+                // task may be sleeping in wait4()/waitid() and needs a wake hint.
+                for parent_task in parent_tasks {
+                    let is_blocked =
+                        parent_task.inner_exclusive_access().task_status == TaskStatus::Blocked;
+                    if is_blocked {
+                        wakeup_task(parent_task);
+                    }
                 }
             }
         }

@@ -225,6 +225,9 @@ impl ProcessControlBlock {
             1,
             "fork currently requires a single-threaded parent"
         );
+        let parent_resident_kb = parent.memory_set.resident_bytes() / 1024;
+        parent.cpu_times.record_resident_kb(parent_resident_kb);
+        let inherited_self_maxrss_kb = parent.cpu_times.snapshot().self_maxrss_kb;
         let memory_set = MemorySet::from_existed_user(&mut parent.memory_set)?;
         let pid = pid_alloc();
         // CONTEXT: fork copies descriptor slots and per-fd CLOEXEC flags, but
@@ -314,7 +317,9 @@ impl ProcessControlBlock {
                     pkey_rights,
                     membarrier_private_expedited_registered,
                     signal_actions,
-                    cpu_times: ProcessCpuTimes::default(),
+                    cpu_times: ProcessCpuTimes::with_inherited_self_maxrss(
+                        inherited_self_maxrss_kb,
+                    ),
                     timers: ProcessTimers::default(),
                     vfork_parent: None,
                     pid_namespace_id,

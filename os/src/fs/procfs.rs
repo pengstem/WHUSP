@@ -1821,8 +1821,9 @@ fn pid_status_content(process: ProcessProcSnapshot) -> String {
          PPid:\t{}\n\
          Uid:\t{}\t{}\t{}\t{}\n\
          Gid:\t{}\t{}\t{}\t{}\n\
-         VmRSS:\t0 kB\n\
+         VmRSS:\t{} kB\n\
          VmLck:\t{} kB\n\
+         VmSwap:\t0 kB\n\
          CapInh:\t{:016x}\n\
          CapPrm:\t{:016x}\n\
          CapEff:\t{:016x}\n\
@@ -1842,6 +1843,7 @@ fn pid_status_content(process: ProcessProcSnapshot) -> String {
         cred.egid,
         cred.sgid,
         cred.fsgid,
+        process.resident_kb,
         process.locked_kb,
         capability_hex(cred.capabilities.inheritable),
         capability_hex(cred.capabilities.permitted),

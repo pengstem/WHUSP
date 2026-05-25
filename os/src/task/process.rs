@@ -146,6 +146,8 @@ pub struct ProcessCpuTimesSnapshot {
     pub system_us: usize,
     pub children_user_us: usize,
     pub children_system_us: usize,
+    pub self_maxrss_kb: usize,
+    pub children_maxrss_kb: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -317,6 +319,7 @@ pub(crate) struct ProcessProcSnapshot {
     pub(crate) pid_namespace_parent_id: Option<usize>,
     pub(crate) user_namespace_id: usize,
     pub(crate) user_namespace_parent_id: Option<usize>,
+    pub(crate) resident_kb: usize,
     pub(crate) locked_kb: usize,
     pub(crate) no_new_privs: bool,
     pub(crate) timer_slack_ns: usize,
@@ -411,11 +414,20 @@ pub struct ProcessCpuTimes {
     system_us: usize,
     children_user_us: usize,
     children_system_us: usize,
+    self_maxrss_kb: usize,
+    children_maxrss_kb: usize,
     last_user_enter_us: Option<usize>,
     last_kernel_enter_us: Option<usize>,
 }
 
 impl ProcessCpuTimes {
+    pub fn with_inherited_self_maxrss(self_maxrss_kb: usize) -> Self {
+        Self {
+            self_maxrss_kb,
+            ..Self::default()
+        }
+    }
+
     pub fn mark_user_entry(&mut self, now_us: usize) {
         self.last_user_enter_us = Some(now_us);
         self.last_kernel_enter_us = None;
@@ -451,6 +463,13 @@ impl ProcessCpuTimes {
             .children_system_us
             .saturating_add(child.system_us)
             .saturating_add(child.children_system_us);
+        self.children_maxrss_kb = self
+            .children_maxrss_kb
+            .max(child.self_maxrss_kb.max(child.children_maxrss_kb));
+    }
+
+    pub fn record_resident_kb(&mut self, resident_kb: usize) {
+        self.self_maxrss_kb = self.self_maxrss_kb.max(resident_kb);
     }
 
     pub fn snapshot(&self) -> ProcessCpuTimesSnapshot {
@@ -459,6 +478,8 @@ impl ProcessCpuTimes {
             system_us: self.system_us,
             children_user_us: self.children_user_us,
             children_system_us: self.children_system_us,
+            self_maxrss_kb: self.self_maxrss_kb,
+            children_maxrss_kb: self.children_maxrss_kb,
         }
     }
 }
@@ -995,7 +1016,7 @@ impl ProcessControlBlock {
     }
 
     pub(crate) fn proc_snapshot(&self) -> ProcessProcSnapshot {
-        let inner = self.inner_exclusive_access();
+        let mut inner = self.inner_exclusive_access();
         let leader_status = inner
             .tasks
             .first()
@@ -1032,6 +1053,8 @@ impl ProcessControlBlock {
             .and_then(|task| task.as_ref())
             .map(|task| task.inner_exclusive_access().timer_slack_ns)
             .unwrap_or(crate::task::DEFAULT_TIMER_SLACK_NS);
+        let resident_kb = inner.memory_set.resident_bytes() / 1024;
+        inner.cpu_times.record_resident_kb(resident_kb);
         ProcessProcSnapshot {
             pid: self.pid.0,
             ppid: inner
@@ -1053,6 +1076,7 @@ impl ProcessControlBlock {
             pid_namespace_parent_id: inner.pid_namespace_parent_id,
             user_namespace_id: inner.user_namespace_id,
             user_namespace_parent_id: inner.user_namespace_parent_id,
+            resident_kb,
             locked_kb: inner.memory_set.locked_bytes() / 1024,
             no_new_privs: inner.no_new_privs,
             timer_slack_ns,
@@ -1139,7 +1163,10 @@ impl ProcessControlBlock {
     }
 
     pub fn cpu_times_snapshot(&self) -> ProcessCpuTimesSnapshot {
-        self.inner_exclusive_access().cpu_times.snapshot()
+        let mut inner = self.inner_exclusive_access();
+        let resident_kb = inner.memory_set.resident_bytes() / 1024;
+        inner.cpu_times.record_resident_kb(resident_kb);
+        inner.cpu_times.snapshot()
     }
 
     pub fn credentials(&self) -> Credentials {

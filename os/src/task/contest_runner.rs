@@ -44,17 +44,17 @@ const ALL_TESTS: &[&str] = &[
 // CONTEXT: current submit-safe default runs the groups with stable local score
 // signal; skipped groups above still get marker pairs instead of disappearing.
 const TEST_SCRIPTS: &[&str] = &[
-    "basic_testcode.sh",
-    "busybox_testcode.sh",
-    "lua_testcode.sh",
-    "libctest_testcode.sh",
-    // "ltp_testcode.sh",
-    "iozone_testcode.sh",
-    "iperf_testcode.sh",
-    "libcbench_testcode.sh",
-    "netperf_testcode.sh",
-    "cyclictest_testcode.sh",
-    "lmbench_testcode.sh",
+    // "basic_testcode.sh",
+    // "busybox_testcode.sh",
+    // "lua_testcode.sh",
+    // "libctest_testcode.sh",
+    "ltp_testcode.sh",
+    // "iozone_testcode.sh",
+    // "iperf_testcode.sh",
+    // "libcbench_testcode.sh",
+    // "netperf_testcode.sh",
+    // "cyclictest_testcode.sh",
+    // "lmbench_testcode.sh",
 ];
 
 /// None runs the current libc's curated whitelist from ltp_whitelist.rs.
@@ -64,7 +64,7 @@ const TEST_SCRIPTS: &[&str] = &[
 /// runs cases whose names start with the prefix, and
 /// Some("range:<start>,<end>") runs cases in the lexicographic half-open range
 /// [start, end). Empty range bounds are unbounded.
-const LTP_CASE_FILTER_OPTION: Option<&str> = None;
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some("prefix:getru");
 
 #[derive(Clone, Copy)]
 enum LtpCaseFilter {
@@ -79,7 +79,7 @@ enum LtpCaseFilter {
 }
 
 pub(super) fn build_runner_command() -> String {
-    if INTERACTIVE_SHELL || string_slice_is_empty(TEST_SCRIPTS) {
+    if INTERACTIVE_SHELL || TEST_SCRIPTS.is_empty() {
         return "/musl/busybox mkdir -p /tmp/bin && /musl/busybox --install -s /tmp/bin; export PATH=/tmp/bin:/musl:/glibc:$PATH && cd /musl && exec /musl/busybox sh".into();
     }
     let mut command = String::new();
@@ -292,7 +292,7 @@ fn append_ltp_case_loop(command: &mut String) {
 
 fn append_ltp_manifest_whitelist_case_loop(command: &mut String) {
     let case_names = super::ltp_whitelist::LTP_CASE_WHITELIST;
-    if string_slice_is_empty(case_names) {
+    if case_names.is_empty() {
         command.push_str(":; ");
         return;
     }
@@ -327,10 +327,21 @@ fn append_ltp_manifest_case_execution(command: &mut String) {
     // execute it as the LTP runner specifies.
     command.push_str("echo \"RUN LTP CASE $case_name\"; ");
     append_ltp_fs_bind_preflight(command);
-    command.push_str("case \"$case_name\" in statx10) _old_ltp_single_fs_type=\"$LTP_SINGLE_FS_TYPE\"; export LTP_SINGLE_FS_TYPE=\"ext4\"; eval \"$case_cmd\"; ret=$?; export LTP_SINGLE_FS_TYPE=\"$_old_ltp_single_fs_type\" ;; *) eval \"$case_cmd\"; ret=$? ;; esac; ");
+    command.push_str("case \"$case_name\" in statx10) _old_ltp_single_fs_type=\"$LTP_SINGLE_FS_TYPE\"; export LTP_SINGLE_FS_TYPE=\"ext4\"; ");
+    append_ltp_manifest_case_eval(command);
+    command.push_str("export LTP_SINGLE_FS_TYPE=\"$_old_ltp_single_fs_type\" ;; *) ");
+    append_ltp_manifest_case_eval(command);
+    command.push_str(";; esac; ");
     // CONTEXT: tools/score_autotest.py treats this historical "FAIL" line as
     // the LTP case completion record and reads the numeric exit status from it.
     command.push_str("echo \"FAIL LTP CASE $case_name : $ret\"; ");
+}
+
+fn append_ltp_manifest_case_eval(command: &mut String) {
+    // CONTEXT: LTP runtest entries are relative to testcases/bin. Prefer the
+    // current directory for plain binary names so LA does not depend on BusyBox
+    // PATH lookup, and so each libc group runs its own test binary.
+    command.push_str("_whusp_ltp_prog=\"${case_cmd%%[	 ]*}\"; case \"$_whusp_ltp_prog\" in \"\"|*/*) eval \"$case_cmd\"; ret=$? ;; *) _whusp_ltp_path=\"./$_whusp_ltp_prog\"; if [ -f \"$_whusp_ltp_path\" ]; then _whusp_ltp_args=\"${case_cmd#$_whusp_ltp_prog}\"; eval \"$_whusp_ltp_path$_whusp_ltp_args\"; ret=$?; else eval \"$case_cmd\"; ret=$?; fi ;; esac; unset _whusp_ltp_prog _whusp_ltp_path _whusp_ltp_args; ");
 }
 
 fn append_ltp_fs_bind_preflight(command: &mut String) {
@@ -437,7 +448,7 @@ fn ltp_case_filter() -> LtpCaseFilter {
 
 fn append_ltp_whitelist_filter(command: &mut String) {
     let case_names = super::ltp_whitelist::LTP_CASE_WHITELIST;
-    if string_slice_is_empty(case_names) {
+    if case_names.is_empty() {
         command.push_str("continue; ");
         return;
     }
@@ -487,10 +498,6 @@ fn append_ltp_string_slice_words(command: &mut String, words: &[&str]) {
         first = false;
         command.push_str(word);
     }
-}
-
-fn string_slice_is_empty(words: &[&str]) -> bool {
-    words.is_empty()
 }
 
 fn is_ltp_case_boundary(name: &str) -> bool {

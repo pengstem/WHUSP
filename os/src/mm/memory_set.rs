@@ -227,6 +227,13 @@ impl MemorySet {
         entries.sort_by_key(|entry| entry.start);
         entries
     }
+
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.areas
+            .iter()
+            .map(|area| area.resident_bytes(&self.page_table))
+            .sum()
+    }
 }
 
 impl Drop for MemorySet {

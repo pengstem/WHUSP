@@ -1139,6 +1139,10 @@ impl MemorySet {
         self.mlock_future_on_fault = on_fault;
     }
 
+    pub fn future_mlock_prefaults(&self) -> bool {
+        self.mlock_future && !self.mlock_future_on_fault
+    }
+
     pub fn munlock_all(&mut self) {
         for area in &mut self.areas {
             area.locked = false;
