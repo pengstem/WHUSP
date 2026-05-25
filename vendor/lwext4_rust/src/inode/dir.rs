@@ -109,6 +109,18 @@ impl RawDirEntry {
     pub fn set_ino(&mut self, ino: u32) {
         self.inner.inode = u32::to_le(ino);
     }
+    pub fn set_inode_type(&mut self, inode_type: InodeType) {
+        self.inner.in_.inode_type = match inode_type {
+            InodeType::Fifo => EXT4_DE_FIFO,
+            InodeType::CharacterDevice => EXT4_DE_CHRDEV,
+            InodeType::Directory => EXT4_DE_DIR,
+            InodeType::BlockDevice => EXT4_DE_BLKDEV,
+            InodeType::RegularFile => EXT4_DE_REG_FILE,
+            InodeType::Symlink => EXT4_DE_SYMLINK,
+            InodeType::Socket => EXT4_DE_SOCK,
+            InodeType::Unknown => EXT4_DE_UNKNOWN,
+        } as _;
+    }
 
     pub fn len(&self) -> u16 {
         u16::from_le(self.inner.entry_len)
@@ -171,6 +183,12 @@ impl DirEntry<'_> {
     }
     pub fn raw_entry_mut(&mut self) -> &mut RawDirEntry {
         self.inner
+    }
+    pub fn set_ino_and_type(&mut self, ino: u32, inode_type: InodeType) {
+        self.inner.set_ino(ino);
+        if revision_tuple(self.sb) >= (0, 5) {
+            self.inner.set_inode_type(inode_type);
+        }
     }
 }
 

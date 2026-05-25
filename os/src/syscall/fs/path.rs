@@ -28,8 +28,8 @@ use crate::fs::{
     lookup_dir_with_stat_path_in, lookup_path_in, mkdir_in, normalize_path_at_root,
     open_devfs_child, open_devfs_input_child, open_devfs_misc_child, open_devfs_net_child,
     open_devfs_pts_child, open_file_in, open_file_in_with_attrs, open_static_path,
-    open_tmpfile_in_with_attrs, path_inside_root, rename_in, rmdir_in, symlink_in, truncate_in,
-    unlink_file_in,
+    open_tmpfile_in_with_attrs, path_inside_root, rename_exchange_in, rename_in, rmdir_in,
+    symlink_in, truncate_in, unlink_file_in,
 };
 use crate::mm::UserBuffer;
 use crate::task::{CAP_SYS_CHROOT, PathSnapshot, current_process, current_user_token};
@@ -1099,9 +1099,7 @@ pub fn sys_renameat2(
     if flags & !VALID_RENAME_FLAGS != 0 {
         return Err(SysError::EINVAL);
     }
-    if flags & RENAME_EXCHANGE != 0 {
-        // UNFINISHED: Linux RENAME_EXCHANGE atomically swaps two existing pathnames.
-        // The current EXT4/VFS wrapper only supports one-way rename.
+    if flags & RENAME_EXCHANGE != 0 && flags & (RENAME_NOREPLACE | RENAME_WHITEOUT) != 0 {
         return Err(SysError::EINVAL);
     }
     if flags & RENAME_WHITEOUT != 0 {
@@ -1116,6 +1114,10 @@ pub fn sys_renameat2(
     let snapshot = current_process().path_snapshot();
     let old_context = path_context_from(&snapshot, olddirfd, oldpath.as_str())?;
     let new_context = path_context_from(&snapshot, newdirfd, newpath.as_str())?;
+    if flags & RENAME_EXCHANGE != 0 {
+        rename_exchange_in(old_context, oldpath.as_str(), new_context, newpath.as_str())?;
+        return Ok(0);
+    }
     let old_notify_file = open_file_in(old_context.clone(), oldpath.as_str(), OpenFlags::PATH).ok();
     rename_in(
         old_context,

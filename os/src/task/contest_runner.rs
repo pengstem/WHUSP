@@ -21,6 +21,7 @@ const LTP_RUNTEST_MANIFESTS: &[&str] = &[
     "containers",
     "smoketest",
     "cve",
+    "mm",
 ];
 
 const INTERACTIVE_SHELL: bool = false;
@@ -64,7 +65,7 @@ const TEST_SCRIPTS: &[&str] = &[
 /// runs cases whose names start with the prefix, and
 /// Some("range:<start>,<end>") runs cases in the lexicographic half-open range
 /// [start, end). Empty range bounds are unbounded.
-const LTP_CASE_FILTER_OPTION: Option<&str> = Some("prefix:getru");
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some("prefix:pidns");
 
 #[derive(Clone, Copy)]
 enum LtpCaseFilter {

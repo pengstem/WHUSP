@@ -837,6 +837,67 @@ impl FileSystemBackend for TmpFs {
         Ok(())
     }
 
+    fn exchange(&mut self, src_dir: u32, src_name: &str, dst_dir: u32, dst_name: &str) -> FsResult {
+        if src_name.is_empty()
+            || dst_name.is_empty()
+            || src_name == "."
+            || src_name == ".."
+            || dst_name == "."
+            || dst_name == ".."
+        {
+            return Err(FsError::InvalidInput);
+        }
+
+        let src_ino = {
+            let src_parent = self.ensure_dir(src_dir)?;
+            *src_parent.children.get(src_name).ok_or(FsError::NotFound)?
+        };
+        let dst_ino = {
+            let dst_parent = self.ensure_dir(dst_dir)?;
+            *dst_parent.children.get(dst_name).ok_or(FsError::NotFound)?
+        };
+        if src_ino == dst_ino {
+            return Ok(());
+        }
+
+        let src_kind = self.inode(src_ino)?.kind;
+        let dst_kind = self.inode(dst_ino)?.kind;
+        if src_dir == dst_dir {
+            let parent = self.inode_mut(src_dir)?;
+            parent.children.insert(src_name.into(), dst_ino);
+            parent.children.insert(dst_name.into(), src_ino);
+            parent.touch();
+        } else {
+            self.inode_mut(src_dir)?
+                .children
+                .insert(src_name.into(), dst_ino);
+            self.inode_mut(dst_dir)?
+                .children
+                .insert(dst_name.into(), src_ino);
+            if src_kind == FsNodeKind::Directory && dst_kind != FsNodeKind::Directory {
+                self.inode_mut(src_dir)?.nlink = self.inode(src_dir)?.nlink.saturating_sub(1);
+                self.inode_mut(dst_dir)?.nlink += 1;
+            } else if src_kind != FsNodeKind::Directory && dst_kind == FsNodeKind::Directory {
+                self.inode_mut(src_dir)?.nlink += 1;
+                self.inode_mut(dst_dir)?.nlink = self.inode(dst_dir)?.nlink.saturating_sub(1);
+            }
+            self.inode_mut(src_dir)?.touch();
+            self.inode_mut(dst_dir)?.touch();
+        }
+
+        if src_kind == FsNodeKind::Directory {
+            let inode = self.inode_mut(src_ino)?;
+            inode.parent_ino = dst_dir;
+            inode.touch();
+        }
+        if dst_kind == FsNodeKind::Directory {
+            let inode = self.inode_mut(dst_ino)?;
+            inode.parent_ino = src_dir;
+            inode.touch();
+        }
+        Ok(())
+    }
+
     fn check_write_at(&mut self, ino: u32, offset: u64, len: usize) -> FsResult {
         self.write_fits_quota(ino, offset, len)
     }

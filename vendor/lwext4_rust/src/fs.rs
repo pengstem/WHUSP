@@ -225,6 +225,67 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         Ok(())
     }
 
+    pub fn exchange(
+        &mut self,
+        src_dir: u32,
+        src_name: &str,
+        dst_dir: u32,
+        dst_name: &str,
+    ) -> Ext4Result {
+        let mut src_dir_ref = self.inode_ref(src_dir)?;
+        let mut dst_dir_ref = self.inode_ref(dst_dir)?;
+        let mut src_lookup = self.clone_ref(&src_dir_ref).lookup(src_name)?;
+        let mut dst_lookup = self.clone_ref(&dst_dir_ref).lookup(dst_name)?;
+        let mut src_entry = src_lookup.entry();
+        let mut dst_entry = dst_lookup.entry();
+        let src_ino = src_entry.ino();
+        let dst_ino = dst_entry.ino();
+        if src_ino == dst_ino {
+            return Ok(());
+        }
+
+        let src_ref = self.inode_ref(src_ino)?;
+        let dst_ref = self.inode_ref(dst_ino)?;
+        let src_type = src_ref.inode_type();
+        let dst_type = dst_ref.inode_type();
+        let src_is_dir = src_ref.is_dir();
+        let dst_is_dir = dst_ref.is_dir();
+        let mut src_parent_lookup = if src_is_dir {
+            Some(self.clone_ref(&src_ref).lookup("..")?)
+        } else {
+            None
+        };
+        let mut dst_parent_lookup = if dst_is_dir {
+            Some(self.clone_ref(&dst_ref).lookup("..")?)
+        } else {
+            None
+        };
+
+        src_entry.set_ino_and_type(dst_ino, dst_type);
+        dst_entry.set_ino_and_type(src_ino, src_type);
+        if let Some(parent_lookup) = src_parent_lookup.as_mut() {
+            parent_lookup.entry().raw_entry_mut().set_ino(dst_dir);
+        }
+        if let Some(parent_lookup) = dst_parent_lookup.as_mut() {
+            parent_lookup.entry().raw_entry_mut().set_ino(src_dir);
+        }
+        if src_dir != dst_dir {
+            match (src_is_dir, dst_is_dir) {
+                (true, false) => {
+                    src_dir_ref.dec_nlink();
+                    dst_dir_ref.inc_nlink();
+                }
+                (false, true) => {
+                    src_dir_ref.inc_nlink();
+                    dst_dir_ref.dec_nlink();
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn link(&mut self, dir: u32, name: &str, child: u32) -> Ext4Result {
         let mut child_ref = self.inode_ref(child)?;
         if child_ref.is_dir() {

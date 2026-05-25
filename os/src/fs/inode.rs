@@ -441,6 +441,76 @@ pub(crate) fn rename_in(
     Ok(())
 }
 
+pub(crate) fn rename_exchange_in(
+    old_context: PathContext,
+    old_name: &str,
+    new_context: PathContext,
+    new_name: &str,
+) -> FsResult {
+    validate_rename_path(old_name)?;
+    validate_rename_path(new_name)?;
+
+    let old_has_trailing_slash = has_trailing_slash(old_name);
+    let new_has_trailing_slash = has_trailing_slash(new_name);
+    let old_target = resolve_create_parent_in(old_context.clone(), trimmed_nonroot_path(old_name))?;
+    let new_target = resolve_create_parent_in(new_context.clone(), trimmed_nonroot_path(new_name))?;
+    if old_target.parent.mount_id != new_target.parent.mount_id {
+        return Err(FsError::CrossDevice);
+    }
+
+    let Some((old_node, old_kind, old_is_synthetic)) =
+        lookup_create_target(&old_context, &old_target)?
+    else {
+        return Err(FsError::NotFound);
+    };
+    let Some((new_node, new_kind, new_is_synthetic)) =
+        lookup_create_target(&new_context, &new_target)?
+    else {
+        return Err(FsError::NotFound);
+    };
+    if old_has_trailing_slash && old_kind != FsNodeKind::Directory {
+        return Err(FsError::NotDir);
+    }
+    if new_has_trailing_slash && new_kind != FsNodeKind::Directory {
+        return Err(FsError::NotDir);
+    }
+    if old_node == new_node {
+        return Ok(());
+    }
+    if old_node.ino == EXT4_ROOT_INO
+        || new_node.ino == EXT4_ROOT_INO
+        || old_is_synthetic
+        || new_is_synthetic
+        || mounted_root_for_any_path(old_context.namespace_id(), old_node).is_some()
+        || mounted_root_for_any_path(new_context.namespace_id(), new_node).is_some()
+    {
+        return Err(FsError::Busy);
+    }
+    if old_kind == FsNodeKind::Directory && is_descendant_or_self(new_target.parent, old_node)? {
+        return Err(FsError::InvalidInput);
+    }
+    if new_kind == FsNodeKind::Directory && is_descendant_or_self(old_target.parent, new_node)? {
+        return Err(FsError::InvalidInput);
+    }
+
+    with_mount(old_target.parent.mount_id, |mount| {
+        mount.exchange(
+            old_target.parent.ino,
+            old_target.leaf_name,
+            new_target.parent.ino,
+            new_target.leaf_name,
+        )
+    })
+    .ok_or(FsError::Io)??;
+    dentry_cache::invalidate_parent(old_target.parent);
+    if new_target.parent != old_target.parent {
+        dentry_cache::invalidate_parent(new_target.parent);
+    }
+    invalidate_regular_file_read_cache(old_node, old_kind);
+    invalidate_regular_file_read_cache(new_node, new_kind);
+    Ok(())
+}
+
 pub(crate) fn unlink_file_in(context: PathContext, name: &str) -> FsResult {
     let trailing_slash = has_trailing_slash(name);
     if let Some("." | ".." | "/") = final_component(name) {

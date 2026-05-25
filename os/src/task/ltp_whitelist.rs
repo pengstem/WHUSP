@@ -344,7 +344,6 @@ pub(super) const LTP_CASE_WHITELIST: &[&str] = &[
     "mmap12",
     "mmap13",
     "mmap15",
-    "mmap16",
     "mmap17",
     "mmap18",
     "mmap19",

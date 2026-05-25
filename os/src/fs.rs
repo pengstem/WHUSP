@@ -487,7 +487,7 @@ pub(crate) use devfs::{
 pub use inode::OpenFlags;
 pub(crate) use inode::{
     create_node_in, link_file_in, lookup_existing_dir_in, lookup_mount_target_dir_in, mkdir_in,
-    rename_in, rmdir_in, symlink_in, unlink_file_in,
+    rename_exchange_in, rename_in, rmdir_in, symlink_in, unlink_file_in,
 };
 pub(crate) use memfd::make_memfd;
 pub(crate) use mount::{
