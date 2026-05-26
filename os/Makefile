@@ -22,10 +22,13 @@ SMP ?= 1
 TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 KERNEL_ELF := $(TARGET_DIR)/$(TARGET)/$(MODE)/os
 PRIMARY_DISK ?= $(DEFAULT_DISK)
-# CONTEXT: retained for explicit experiments only; current QEMU commands below
-# do not attach x1, so submission-style runs stay x0-only.
 AUX_DISK ?=
 COMMA := ,
+ifeq ($(ARCH),riscv64)
+AUX_DISK_ARGS := $(if $(AUX_DISK),-drive file=$(AUX_DISK)$(COMMA)if=none$(COMMA)format=raw$(COMMA)id=x1 -device virtio-blk-device$(COMMA)drive=x1$(COMMA)bus=virtio-mmio-bus.1)
+else ifeq ($(ARCH),loongarch64)
+AUX_DISK_ARGS := $(if $(AUX_DISK),-drive file=$(AUX_DISK)$(COMMA)if=none$(COMMA)format=raw$(COMMA)id=x1 -device virtio-blk-pci$(COMMA)drive=x1)
+endif
 
 prepare-cargo-config:
 	@rm -rf .cargo
@@ -50,13 +53,17 @@ run-inner:
 ifeq ($(ARCH),riscv64)
 	@qemu-system-riscv64 -machine virt -kernel $(KERNEL_ELF) -m $(MEM) -nographic -smp $(SMP) -bios default \
 		-drive file=$(PRIMARY_DISK),if=none,format=raw,id=x0 \
-		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 -no-reboot \
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		$(AUX_DISK_ARGS) \
+		-no-reboot \
 		-device virtio-net-device,netdev=net -netdev user,id=net \
 		-rtc base=utc
 else ifeq ($(ARCH),loongarch64)
 	@qemu-system-loongarch64 -kernel $(KERNEL_ELF) -m $(MEM) -nographic -smp $(SMP) \
 		-drive file=$(PRIMARY_DISK),if=none,format=raw,id=x0 \
-		-device virtio-blk-pci,drive=x0 -no-reboot \
+		-device virtio-blk-pci,drive=x0 \
+		$(AUX_DISK_ARGS) \
+		-no-reboot \
 		-device virtio-net-pci,netdev=net0 \
 		-netdev user,id=net0 \
 		-rtc base=utc 

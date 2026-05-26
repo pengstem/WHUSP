@@ -14,6 +14,7 @@ use virtio_drivers::device::blk::{BlkReq, BlkResp, VirtIOBlk};
 pub struct VirtIOBlock {
     virtio_blk: UPIntrFreeCell<VirtIOBlk<VirtioHal, VirtioTransport>>,
     base_addr: usize,
+    cache_key: usize,
     irq: usize,
     capacity_blocks: usize,
     condvars: BTreeMap<u16, Condvar>,
@@ -132,7 +133,7 @@ impl VirtIOBlock {
     }
 
     fn cache_key(&self) -> usize {
-        self.base_addr
+        self.cache_key
     }
 
     fn signal_next_completed(&self, blk: &mut VirtIOBlk<VirtioHal, VirtioTransport>) {
@@ -145,17 +146,24 @@ impl VirtIOBlock {
     }
 
     pub fn new(device: BlockDeviceConfig) -> Self {
-        let (transport, base_addr, irq) = match device {
+        let (transport, base_addr, cache_key, irq) = match device {
             BlockDeviceConfig::Mmio(device) => (
                 mmio_transport(device.base, device.size),
                 device.base,
+                device.base,
                 device.irq,
             ),
-            BlockDeviceConfig::Pci(device) => (
-                crate::board::pci_transport(device).into(),
-                device.ecam_base,
-                device.irq,
-            ),
+            BlockDeviceConfig::Pci(device) => {
+                let bdf_key = ((device.bus as usize) << 16)
+                    | ((device.device as usize) << 8)
+                    | device.function as usize;
+                (
+                    crate::board::pci_transport(device).into(),
+                    device.ecam_base,
+                    device.ecam_base.wrapping_add(bdf_key),
+                    device.irq,
+                )
+            }
         };
         let virtio_blk = VirtIOBlk::<VirtioHal, _>::new(transport).unwrap();
         let capacity_blocks = virtio_blk.capacity() as usize;
@@ -171,6 +179,7 @@ impl VirtIOBlock {
         Self {
             virtio_blk,
             base_addr,
+            cache_key,
             irq,
             capacity_blocks,
             condvars,

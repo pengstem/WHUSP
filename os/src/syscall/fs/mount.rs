@@ -638,6 +638,12 @@ pub fn sys_mount(
                 if !loop_device_is_attached(loop_id) {
                     return Err(SysError::ENODEV);
                 }
+                // CONTEXT: LTP may format a loop device as FAT only to obtain
+                // scratch directory semantics for the syscall under test.
+                // Until loop-backed FAT mounts exist, tmpfs keeps those setup
+                // steps writable without pretending the loop block data is used.
+                // UNFINISHED: real loop-backed FAT/VFAT mounting is not
+                // implemented; only virtio partition FAT mounts reach fatfs.
                 mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
                     .map_err(mount_error_to_errno)?;
                 return Ok(0);
@@ -652,6 +658,10 @@ pub fn sys_mount(
             ) {
                 Ok(_) => {}
                 Err(_) => {
+                    // CONTEXT: Some contest/LTP setup paths care that a mount
+                    // point becomes usable more than they care about the FAT
+                    // backing store. Fall back to tmpfs for invalid FAT sources
+                    // so later syscall probes can continue to run.
                     mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
                         .map_err(mount_error_to_errno)?;
                 }

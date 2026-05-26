@@ -32,6 +32,9 @@ struct FatBlockDevice {
 pub(super) struct FatMount {
     fs: KernelFatFs,
     next_ino: u32,
+    // CONTEXT: FAT directory entries do not carry stable Unix inode numbers.
+    // This adapter assigns mount-local pseudo-inodes from normalized paths so
+    // VFS handles can address entries after lookup within one boot.
     path_to_ino: BTreeMap<String, u32>,
     ino_to_path: BTreeMap<u32, String>,
     ino_to_kind: BTreeMap<u32, FsNodeKind>,
@@ -439,6 +442,8 @@ impl FileSystemBackend for FatMount {
             self.path_to_ino.insert(dst_path.clone(), ino);
             self.ino_to_path.insert(ino, dst_path);
         }
+        // UNFINISHED: Renaming a populated directory does not remap cached
+        // descendant pseudo-inodes yet; later lookups rebuild entries by path.
         Ok(())
     }
 

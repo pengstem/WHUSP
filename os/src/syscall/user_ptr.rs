@@ -159,6 +159,9 @@ fn try_same_page_user_slice(
 }
 
 fn resolve_current_cow_page(token: usize, addr: usize) -> bool {
+    // CONTEXT: COW fault resolution may take the current process memory lock
+    // and update its page table. Cross-process writers such as ptrace must use
+    // memory-set aware copy helpers instead of this current-token fast path.
     if token != crate::task::current_user_token() {
         return false;
     }

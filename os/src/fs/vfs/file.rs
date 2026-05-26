@@ -47,6 +47,10 @@ const SYNTHETIC_DIRENT_OFFSET_BASE: u64 = 1 << 60;
 static TMPFILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 lazy_static! {
+    // CONTEXT: These counters approximate Linux's open-writer vs executable
+    // exclusion for ETXTBSY without adding per-inode objects to every backend.
+    // They are keyed by VfsNodeId, so callers must update them only at VfsFile
+    // open/drop and exec image lifetime boundaries.
     static ref WRITABLE_REGULAR_OPEN_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =
         SleepMutex::new(BTreeMap::new());
     static ref EXECUTABLE_REGULAR_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =

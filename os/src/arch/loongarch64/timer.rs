@@ -38,6 +38,9 @@ pub fn monotonic_time_nanos() -> u64 {
 
 pub fn init_wall_clock() {
     // UNFINISHED: LoongArch RTC discovery not yet implemented
+    // CONTEXT: Until platform RTC probing seeds EPOCH_OFFSET_NS, wall-clock
+    // syscalls use monotonic time with a zero epoch offset or a value supplied
+    // later through set_wall_time_nanos().
     let _ = &EPOCH_OFFSET_NS;
 }
 

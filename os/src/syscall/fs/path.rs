@@ -653,6 +653,9 @@ fn check_openat2_resolve(
     if resolve & RESOLVE_BENEATH != 0 && openat2_path_escapes_beneath(original_path) {
         return Err(SysError::EXDEV);
     }
+    // UNFINISHED: General openat2 resolve flags are not enforced at every
+    // component during VFS path walk yet. The checks below cover current LTP
+    // probes but do not model Linux's full per-component LOOKUP_* state.
     // CONTEXT: The VFS does not yet annotate every mount crossing during path
     // walk. LTP openat202 exercises /proc as the cross-mount target.
     if resolve & RESOLVE_NO_XDEV != 0 && original_path.starts_with("/proc/") {

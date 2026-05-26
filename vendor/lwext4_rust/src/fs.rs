@@ -82,10 +82,10 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
 
     fn inode_ref(&mut self, ino: u32) -> Ext4Result<InodeRef<Hal>> {
         unsafe {
-            let mut result = InodeRef::new(mem::zeroed());
-            ext4_fs_get_inode_ref(self.inner.as_mut(), ino, result.inner.as_mut())
+            let mut result = mem::zeroed();
+            ext4_fs_get_inode_ref(self.inner.as_mut(), ino, &mut result)
                 .context("ext4_fs_get_inode_ref")?;
-            Ok(result)
+            Ok(InodeRef::new(result))
         }
     }
     fn clone_ref(&mut self, inode: &InodeRef<Hal>) -> InodeRef<Hal> {
@@ -113,9 +113,10 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
                 InodeType::Socket => EXT4_DE_SOCK,
                 InodeType::Unknown => EXT4_DE_UNKNOWN,
             };
-            let mut result = InodeRef::new(mem::zeroed());
-            ext4_fs_alloc_inode(self.inner.as_mut(), result.inner.as_mut(), ty as _)
+            let mut result = mem::zeroed();
+            ext4_fs_alloc_inode(self.inner.as_mut(), &mut result, ty as _)
                 .context("ext4_fs_get_inode_ref")?;
+            let mut result = InodeRef::new(result);
             ext4_fs_inode_blocks_init(self.inner.as_mut(), result.inner.as_mut());
             Ok(result)
         }

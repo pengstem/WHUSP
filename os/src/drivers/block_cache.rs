@@ -180,6 +180,9 @@ impl BlockCache {
 }
 
 lazy_static! {
+    // CONTEXT: The block cache is write-through and stores only clean 512-byte
+    // lines. Full-sector writes update cached lines after device submission;
+    // partial writes invalidate so later reads cannot observe stale sectors.
     static ref BLOCK_CACHE: UPIntrFreeCell<BlockCache> =
         unsafe { UPIntrFreeCell::new(BlockCache::new(DEFAULT_BLOCK_CACHE_CAPACITY)) };
 }

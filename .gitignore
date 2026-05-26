@@ -18,6 +18,7 @@ pushall.sh
 *.img
 kernel-rv
 kernel-la
+contest-case-commands/
 
 develop-guide/
 AGENTS.md
