@@ -145,6 +145,10 @@ const SYSCALL_GETEUID: usize = 175;
 const SYSCALL_GETGID: usize = 176;
 const SYSCALL_GETEGID: usize = 177;
 const SYSCALL_GETTID: usize = 178;
+const SYSCALL_SEMGET: usize = 190;
+const SYSCALL_SEMCTL: usize = 191;
+const SYSCALL_SEMTIMEDOP: usize = 192;
+const SYSCALL_SEMOP: usize = 193;
 const SYSCALL_SHMGET: usize = 194;
 const SYSCALL_SHMCTL: usize = 195;
 const SYSCALL_SHMAT: usize = 196;
@@ -234,6 +238,7 @@ pub(crate) mod keyring;
 mod memory;
 mod net;
 mod process;
+pub(crate) mod sem;
 mod signal;
 pub(crate) mod time;
 pub(crate) mod uapi;
@@ -248,6 +253,7 @@ use keyring::*;
 use memory::*;
 use net::*;
 use process::*;
+use sem::*;
 use signal::*;
 use time::*;
 use uapi::LinuxTimeSpec;
@@ -771,6 +777,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETGID => Ok(sys_getgid()),
         SYSCALL_GETEGID => Ok(sys_getegid()),
         SYSCALL_GETTID => Ok(sys_gettid()),
+        SYSCALL_SEMGET => sys_semget(args[0] as isize, args[1], args[2] as i32),
+        SYSCALL_SEMCTL => sys_semctl(args[0], args[1], args[2] as i32, args[3]),
+        SYSCALL_SEMTIMEDOP => {
+            sys_semtimedop(args[0], args[1] as *const _, args[2], args[3] as *const _)
+        }
+        SYSCALL_SEMOP => sys_semop(args[0], args[1] as *const _, args[2]),
         SYSCALL_SHMGET => sys_shmget(args[0] as isize, args[1], args[2] as i32),
         SYSCALL_SHMCTL => sys_shmctl(args[0], args[1] as i32, args[2]),
         SYSCALL_SHMAT => sys_shmat(args[0], args[1], args[2] as i32),

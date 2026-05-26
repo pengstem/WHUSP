@@ -76,14 +76,15 @@ const CORE_PATTERN_INO: u32 = 41;
 const VERSION_INO: u32 = 42;
 const SYSVIPC_DIR_INO: u32 = 43;
 const SYSVIPC_SHM_INO: u32 = 44;
-const SHMMAX_INO: u32 = 45;
-const SHMMNI_INO: u32 = 46;
-const SHMALL_INO: u32 = 47;
-const OSKERNEL_DIR_INO: u32 = 48;
-const OSKERNEL_PERF_INO: u32 = 49;
-const CONFIG_GZ_INO: u32 = 50;
-const PROC_SELF_INO: u32 = 51;
-const SHM_NEXT_ID_INO: u32 = 52;
+const SYSVIPC_SEM_INO: u32 = 45;
+const SHMMAX_INO: u32 = 46;
+const SHMMNI_INO: u32 = 47;
+const SHMALL_INO: u32 = 48;
+const OSKERNEL_DIR_INO: u32 = 49;
+const OSKERNEL_PERF_INO: u32 = 50;
+const CONFIG_GZ_INO: u32 = 51;
+const PROC_SELF_INO: u32 = 52;
+const SHM_NEXT_ID_INO: u32 = 53;
 // CONTEXT: Dynamic /proc inode ranges must stay disjoint even after long test
 // runs allocate five-digit PIDs; LTP probes /proc/<ppid>/stat during waits.
 const PID_DIR_BASE: u32 = 100;
@@ -222,6 +223,7 @@ enum ProcNode {
     ConfigGz,
     SelfSymlink,
     SysVipcShm,
+    SysVipcSem,
     Domainname,
     Tainted,
     PidDir(usize),
@@ -482,6 +484,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         SYS_VM_DIR_INO => Some(ProcNode::SysVmDir),
         SYSVIPC_DIR_INO => Some(ProcNode::SysVipcDir),
         SYSVIPC_SHM_INO => Some(ProcNode::SysVipcShm),
+        SYSVIPC_SEM_INO => Some(ProcNode::SysVipcSem),
         SHMMAX_INO => Some(ProcNode::ShmMax),
         SHMMNI_INO => Some(ProcNode::ShmMni),
         SHMALL_INO => Some(ProcNode::ShmAll),
@@ -747,6 +750,11 @@ fn sysvipc_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: SYSVIPC_SHM_INO,
         name: "shm".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: SYSVIPC_SEM_INO,
+        name: "sem".into(),
         dtype: DT_REG,
     });
     entries
@@ -1972,6 +1980,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
             Ok(format!("{}\n", crate::mm::shm::current_shm_next_id()).into_bytes())
         }
         ProcNode::SysVipcShm => Ok(crate::mm::shm::proc_sysvipc_shm_content().into_bytes()),
+        ProcNode::SysVipcSem => Ok(crate::syscall::sem::proc_sysvipc_sem_content().into_bytes()),
         ProcNode::KeysGcDelay => Ok(keyring::key_gc_delay_content().into_bytes()),
         ProcNode::KeysMaxkeys => Ok(keyring::key_maxkeys_content().into_bytes()),
         ProcNode::KeysMaxbytes => Ok(keyring::key_maxbytes_content().into_bytes()),
@@ -2235,6 +2244,7 @@ impl FileSystemBackend for ProcFs {
                 "." => Ok((SYSVIPC_DIR_INO, FsNodeKind::Directory)),
                 ".." => Ok((ROOT_INO, FsNodeKind::Directory)),
                 "shm" => Ok((SYSVIPC_SHM_INO, FsNodeKind::RegularFile)),
+                "sem" => Ok((SYSVIPC_SEM_INO, FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::SysFsDir => match component {
