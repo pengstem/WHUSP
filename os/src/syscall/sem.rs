@@ -1,4 +1,5 @@
 use super::errno::{SysError, SysResult};
+use super::time::relative_timeout_deadline_ms;
 use super::uapi::LinuxTimeSpec;
 use super::user_ptr::{read_user_array, read_user_value, write_user_array, write_user_value};
 use crate::sync::UPIntrFreeCell;
@@ -575,12 +576,14 @@ impl SemManager {
         Ok(task_cx_ptr)
     }
 
-    fn remove_waiter_for_task(&mut self, task: &Arc<TaskControlBlock>) {
+    fn remove_waiter_for_task(&mut self, task: &Arc<TaskControlBlock>) -> bool {
+        let mut removed = false;
         for set in self.sets.values_mut() {
             let mut idx = 0;
             while idx < set.waiters.len() {
                 if Arc::ptr_eq(&set.waiters[idx].task, task) {
                     let waiter = set.waiters.remove(idx);
+                    removed = true;
                     if let Some(value) = set.values.get_mut(waiter.sem_num) {
                         match waiter.kind {
                             SemWaitKind::NonZero => value.ncnt = value.ncnt.saturating_sub(1),
@@ -592,6 +595,7 @@ impl SemManager {
                 }
             }
         }
+        removed
     }
 
     fn usage_info(&self) -> SemUsageInfo {
@@ -633,6 +637,10 @@ impl SemManager {
             ));
         }
         output
+    }
+
+    fn sysctl_sem_content(&self) -> String {
+        format!("{SEMMSL}\t{SEMMNS}\t{SEMOPM}\t{SEMMNI}\n")
     }
 }
 
@@ -804,12 +812,13 @@ pub(super) fn sys_semtimedop(
     }
     let token = current_user_token();
     let ops = read_user_array(token, sops, nsops)?;
-    if !timeout.is_null() {
-        let _ = read_user_value(token, timeout)?;
-    }
+    let timeout_deadline_ms = relative_timeout_deadline_ms(token, timeout)?;
     let process = current_process();
     let caller = sem_caller_from(process.getpid(), &process.credentials());
     loop {
+        if timeout_deadline_ms.is_some_and(|deadline| get_time_ms() >= deadline) {
+            return Err(SysError::EAGAIN);
+        }
         match try_or_block_semop(semid, &ops, &caller)? {
             SemOpAttempt::Done => return Ok(0),
             SemOpAttempt::Blocked(task_cx_ptr) => schedule(task_cx_ptr),
@@ -817,12 +826,21 @@ pub(super) fn sys_semtimedop(
         let Some(task) = current_task() else {
             return Err(SysError::EINTR);
         };
-        SEM_MANAGER.exclusive_access().remove_waiter_for_task(&task);
+        let mut manager = SEM_MANAGER.exclusive_access();
+        let still_waiting = manager.remove_waiter_for_task(&task);
+        let set_exists = manager.sets.contains_key(&semid);
+        drop(manager);
+        if !set_exists {
+            return Err(SysError::EIDRM);
+        }
         if let Some((exit_code, _message)) = check_signals_of_current() {
             exit_current_group_and_run_next(exit_code);
         }
         if current_has_deliverable_signal() {
             return Err(SysError::EINTR);
+        }
+        if still_waiting && timeout_deadline_ms.is_some_and(|deadline| get_time_ms() >= deadline) {
+            return Err(SysError::EAGAIN);
         }
     }
 }
@@ -883,6 +901,10 @@ fn base_seminfo() -> LinuxSeminfo {
 
 pub(crate) fn proc_sysvipc_sem_content() -> String {
     SEM_MANAGER.exclusive_access().proc_sysvipc_sem_content()
+}
+
+pub(crate) fn sysctl_sem_content() -> String {
+    SEM_MANAGER.exclusive_access().sysctl_sem_content()
 }
 
 fn sem_caller_from(pid: usize, credentials: &crate::task::Credentials) -> SemCaller {

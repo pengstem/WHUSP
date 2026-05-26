@@ -90,6 +90,7 @@ const MSGMNI_INO: u32 = 55;
 const MSGMAX_INO: u32 = 56;
 const MSGMNB_INO: u32 = 57;
 const MSG_NEXT_ID_INO: u32 = 58;
+const SEM_SYSCTL_INO: u32 = 59;
 // CONTEXT: Dynamic /proc inode ranges must stay disjoint even after long test
 // runs allocate five-digit PIDs; LTP probes /proc/<ppid>/stat during waits.
 const PID_DIR_BASE: u32 = 100;
@@ -204,6 +205,7 @@ enum ProcNode {
     ShmMni,
     ShmAll,
     ShmNextId,
+    SemSysctl,
     PipeMaxSize,
     PipeUserPagesSoft,
     LeaseBreakTime,
@@ -500,6 +502,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         SHMMNI_INO => Some(ProcNode::ShmMni),
         SHMALL_INO => Some(ProcNode::ShmAll),
         SHM_NEXT_ID_INO => Some(ProcNode::ShmNextId),
+        SEM_SYSCTL_INO => Some(ProcNode::SemSysctl),
         MSGMNI_INO => Some(ProcNode::MsgMni),
         MSGMAX_INO => Some(ProcNode::MsgMax),
         MSGMNB_INO => Some(ProcNode::MsgMnb),
@@ -1015,6 +1018,11 @@ fn sys_kernel_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: SHM_NEXT_ID_INO,
         name: "shm_next_id".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: SEM_SYSCTL_INO,
+        name: "sem".into(),
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
@@ -2054,6 +2062,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::ShmNextId => {
             Ok(format!("{}\n", crate::mm::shm::current_shm_next_id()).into_bytes())
         }
+        ProcNode::SemSysctl => Ok(crate::syscall::sem::sysctl_sem_content().into_bytes()),
         ProcNode::SysVipcShm => Ok(crate::mm::shm::proc_sysvipc_shm_content().into_bytes()),
         ProcNode::SysVipcSem => Ok(crate::syscall::sem::proc_sysvipc_sem_content().into_bytes()),
         ProcNode::SysVipcMsg => Ok(crate::syscall::msg::proc_sysvipc_msg_content().into_bytes()),
@@ -2306,6 +2315,7 @@ impl FileSystemBackend for ProcFs {
                 "shmmni" => Ok((SHMMNI_INO, FsNodeKind::RegularFile)),
                 "shmall" => Ok((SHMALL_INO, FsNodeKind::RegularFile)),
                 "shm_next_id" => Ok((SHM_NEXT_ID_INO, FsNodeKind::RegularFile)),
+                "sem" => Ok((SEM_SYSCTL_INO, FsNodeKind::RegularFile)),
                 "msgmni" => Ok((MSGMNI_INO, FsNodeKind::RegularFile)),
                 "msgmax" => Ok((MSGMAX_INO, FsNodeKind::RegularFile)),
                 "msgmnb" => Ok((MSGMNB_INO, FsNodeKind::RegularFile)),
