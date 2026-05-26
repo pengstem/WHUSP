@@ -1,5 +1,7 @@
 use alloc::{format, string::String};
 
+const LTP_CASE_WHITELIST_TEXT: &str = include_str!("ltp_whitelist.txt");
+
 // CONTEXT: The judge-facing runner emits libc-suffixed marker groups. Keep
 // both roots here even when a disk script has a per-libc exception.
 const TEST_LIBCS: &[&str] = &["/glibc", "/musl"];
@@ -8,6 +10,7 @@ const TEST_LIBCS: &[&str] = &["/glibc", "/musl"];
 // for whitelist export and runtime filter scans.
 const LTP_RUNTEST_MANIFESTS: &[&str] = &[
     "syscalls",
+    "syscalls-ipc",
     "fs",
     "input",
     "net.ipv6_lib",
@@ -20,10 +23,15 @@ const LTP_RUNTEST_MANIFESTS: &[&str] = &[
     "smoketest",
     "cve",
     "mm",
+    "fs_readonly",
 ];
 
 const INTERACTIVE_SHELL: bool = false;
 const SCRIPT_DISK_ENTRY: &str = "/x1/entry.sh";
+#[cfg(feature = "perf-counters")]
+const PERF_COUNTER_DUMP_COMMAND: &str = "; echo '#### KERNEL PERF START ####'; /musl/busybox cat /proc/oskernel/perf; echo '#### KERNEL PERF END ####'";
+#[cfg(not(feature = "perf-counters"))]
+const PERF_COUNTER_DUMP_COMMAND: &str = "";
 
 // CONTEXT: `ALL_TESTS` is the marker universe. Disabled groups still emit
 // START/END pairs from the script disk so scorer logs stay aligned.
@@ -68,7 +76,7 @@ const TEST_SCRIPTS: &[&str] = &[
 // CONTEXT: Non-None filters are development slices. They narrow LTP case
 // execution while leaving outer group markers intact, so always check this
 // constant before treating a score log as submission-wide evidence.
-const LTP_CASE_FILTER_OPTION: Option<&str> = Some("prefix:fchown");
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some("prefix:semctl");
 
 #[cfg(target_arch = "riscv64")]
 const RUNNER_ARCH: &str = "rv";
@@ -110,7 +118,7 @@ pub(super) fn build_runner_command() -> String {
     append_export(
         &mut command,
         "WHUSP_LTP_WHITELIST_LEN",
-        format!("{}", super::ltp_whitelist::ltp_case_whitelist_len()).as_str(),
+        format!("{}", ltp_case_whitelist_len()).as_str(),
     );
     command.push_str("; if [ -f ");
     command.push_str(SCRIPT_DISK_ENTRY);
@@ -118,7 +126,9 @@ pub(super) fn build_runner_command() -> String {
     command.push_str(SCRIPT_DISK_ENTRY);
     command.push_str("; else echo 'contest script disk entry missing: ");
     command.push_str(SCRIPT_DISK_ENTRY);
-    command.push_str("'; fi; cd /musl && ./busybox sync; ./busybox reboot -f");
+    command.push_str("'; fi");
+    command.push_str(PERF_COUNTER_DUMP_COMMAND);
+    command.push_str("; cd /musl && ./busybox sync; ./busybox reboot -f");
     command
 }
 
@@ -131,6 +141,16 @@ fn ltp_filter_option_value() -> &'static str {
         Some(option) => option,
         None => "None",
     }
+}
+
+fn ltp_case_whitelist_len() -> usize {
+    LTP_CASE_WHITELIST_TEXT
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('#')
+        })
+        .count()
 }
 
 fn append_export(command: &mut String, key: &str, value: &str) {

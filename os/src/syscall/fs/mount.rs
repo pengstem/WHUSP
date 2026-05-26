@@ -600,6 +600,7 @@ pub fn sys_mount(
                     namespace_id,
                     target_dir,
                     source.as_str(),
+                    loop_id,
                     ext_fs_type,
                     target_path.as_str(),
                     read_only,

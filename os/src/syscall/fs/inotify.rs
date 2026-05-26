@@ -8,12 +8,14 @@ use crate::fs::{
     PollWaitQueue, PollWaiter, S_IFIFO, VfsNodeId, lookup_path_in, overlay_real_node,
 };
 use crate::mm::UserBuffer;
+use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
     TaskControlBlock, block_current_task_no_schedule, current_has_interrupting_signal,
     current_process, current_user_token, schedule, wakeup_task,
 };
-use alloc::collections::VecDeque;
+use alloc::collections::btree_map::Entry;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -75,10 +77,10 @@ static NEXT_MOVE_COOKIE: AtomicU32 = AtomicU32::new(1);
 lazy_static! {
     static ref INOTIFY_GROUPS: UPIntrFreeCell<Vec<Weak<InotifyGroup>>> =
         unsafe { UPIntrFreeCell::new(Vec::new()) };
-    static ref INOTIFY_NODE_NAMES: UPIntrFreeCell<Vec<(VfsNodeId, String)>> =
-        unsafe { UPIntrFreeCell::new(Vec::new()) };
-    static ref INOTIFY_UNLINKED_NODES: UPIntrFreeCell<Vec<VfsNodeId>> =
-        unsafe { UPIntrFreeCell::new(Vec::new()) };
+    static ref INOTIFY_NODE_NAMES: UPIntrFreeCell<BTreeMap<VfsNodeId, String>> =
+        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+    static ref INOTIFY_UNLINKED_NODES: UPIntrFreeCell<BTreeSet<VfsNodeId>> =
+        unsafe { UPIntrFreeCell::new(BTreeSet::new()) };
 }
 
 #[derive(Clone)]
@@ -516,20 +518,38 @@ fn wake_waiters(waiters: VecDeque<Arc<TaskControlBlock>>) {
     }
 }
 
+fn live_inotify_groups() -> Vec<Arc<InotifyGroup>> {
+    perf::record_inotify_live_group_scan();
+    INOTIFY_GROUPS.exclusive_session(|groups| {
+        groups.retain(|weak| weak.strong_count() > 0);
+        groups.iter().filter_map(Weak::upgrade).collect()
+    })
+}
+
+fn has_live_inotify_groups() -> bool {
+    perf::record_inotify_live_group_scan();
+    INOTIFY_GROUPS.exclusive_session(|groups| {
+        groups.retain(|weak| weak.strong_count() > 0);
+        !groups.is_empty()
+    })
+}
+
 fn node_is_unlinked(node: VfsNodeId) -> bool {
     INOTIFY_UNLINKED_NODES.exclusive_session(|nodes| nodes.contains(&node))
 }
 
 fn mark_node_unlinked(node: VfsNodeId) {
+    perf::record_inotify_unlinked_node_update();
     INOTIFY_UNLINKED_NODES.exclusive_session(|nodes| {
-        if !nodes.contains(&node) {
-            nodes.push(node);
-        }
+        nodes.insert(node);
     });
 }
 
 fn clear_node_unlinked(node: VfsNodeId) {
-    INOTIFY_UNLINKED_NODES.exclusive_session(|nodes| nodes.retain(|stored| *stored != node));
+    perf::record_inotify_unlinked_node_update();
+    INOTIFY_UNLINKED_NODES.exclusive_session(|nodes| {
+        nodes.remove(&node);
+    });
 }
 
 fn event_reports_isdir(event_mask: u32) -> bool {
@@ -547,26 +567,21 @@ fn remember_node_name(node: VfsNodeId, path: &str) {
     let Some(name) = path_basename(path) else {
         return;
     };
-    INOTIFY_NODE_NAMES.exclusive_session(|names| {
-        if let Some((_, stored)) = names
-            .iter_mut()
-            .find(|(stored_node, _)| *stored_node == node)
-        {
+    perf::record_inotify_node_name_remember();
+    INOTIFY_NODE_NAMES.exclusive_session(|names| match names.entry(node) {
+        Entry::Occupied(mut entry) => {
+            let stored = entry.get_mut();
             stored.clear();
             stored.push_str(name);
-        } else {
-            names.push((node, String::from(name)));
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(String::from(name));
         }
     });
 }
 
 fn remembered_node_name(node: VfsNodeId) -> Option<String> {
-    INOTIFY_NODE_NAMES.exclusive_session(|names| {
-        names
-            .iter()
-            .find(|(stored_node, _)| *stored_node == node)
-            .map(|(_, name)| name.clone())
-    })
+    INOTIFY_NODE_NAMES.exclusive_session(|names| names.get(&node).cloned())
 }
 
 fn next_move_cookie() -> u32 {
@@ -605,6 +620,11 @@ fn publish_file_event(
     };
     let parent = file.vfs_parent_node_id();
     let is_dir = file.working_dir().is_some();
+    let live_groups = live_inotify_groups();
+    if live_groups.is_empty() {
+        perf::record_inotify_no_live_group_fast_path();
+        return;
+    }
     if let Some(path) = event_path {
         remember_node_name(node, path);
     }
@@ -613,13 +633,9 @@ fn publish_file_event(
         .map(String::from)
         .or_else(|| remembered_node_name(node));
 
-    INOTIFY_GROUPS.exclusive_session(|groups| {
-        groups.retain(|weak| weak.strong_count() > 0);
-        let live_groups: Vec<_> = groups.iter().filter_map(Weak::upgrade).collect();
-        for group in live_groups {
-            group.publish(node, parent, event_mask, is_dir, 0, name.as_deref(), true);
-        }
-    });
+    for group in live_groups {
+        group.publish(node, parent, event_mask, is_dir, 0, name.as_deref(), true);
+    }
 }
 
 fn publish_child_event(
@@ -635,24 +651,25 @@ fn publish_child_event(
         return;
     };
     let is_dir = file.working_dir().is_some();
+    let live_groups = live_inotify_groups();
+    if live_groups.is_empty() {
+        perf::record_inotify_no_live_group_fast_path();
+        return;
+    }
     remember_node_name(node, path);
     let name = path_basename(path).map(String::from);
 
-    INOTIFY_GROUPS.exclusive_session(|groups| {
-        groups.retain(|weak| weak.strong_count() > 0);
-        let live_groups: Vec<_> = groups.iter().filter_map(Weak::upgrade).collect();
-        for group in live_groups {
-            group.publish(
-                node,
-                Some(parent),
-                event_mask,
-                is_dir,
-                cookie,
-                name.as_deref(),
-                false,
-            );
-        }
-    });
+    for group in live_groups {
+        group.publish(
+            node,
+            Some(parent),
+            event_mask,
+            is_dir,
+            cookie,
+            name.as_deref(),
+            false,
+        );
+    }
 }
 
 fn publish_self_event(file: &Arc<dyn File + Send + Sync>, event_mask: u32) {
@@ -661,13 +678,9 @@ fn publish_self_event(file: &Arc<dyn File + Send + Sync>, event_mask: u32) {
     };
     let is_dir = file.working_dir().is_some();
 
-    INOTIFY_GROUPS.exclusive_session(|groups| {
-        groups.retain(|weak| weak.strong_count() > 0);
-        let live_groups: Vec<_> = groups.iter().filter_map(Weak::upgrade).collect();
-        for group in live_groups {
-            group.publish(node, None, event_mask, is_dir, 0, None, true);
-        }
-    });
+    for group in live_inotify_groups() {
+        group.publish(node, None, event_mask, is_dir, 0, None, true);
+    }
 }
 
 pub(super) fn inotify_notify_open(file: &Arc<dyn File + Send + Sync>) {
@@ -716,6 +729,10 @@ pub(super) fn inotify_notify_close(file: &Arc<dyn File + Send + Sync>, writable:
 }
 
 pub(super) fn inotify_notify_create(file: &Arc<dyn File + Send + Sync>, path: &str) {
+    if !has_live_inotify_groups() {
+        perf::record_inotify_no_live_group_fast_path();
+        return;
+    }
     if let Some(node) = file.vfs_node_id() {
         clear_node_unlinked(node);
     }
@@ -723,6 +740,10 @@ pub(super) fn inotify_notify_create(file: &Arc<dyn File + Send + Sync>, path: &s
 }
 
 pub(super) fn inotify_notify_delete(file: &Arc<dyn File + Send + Sync>, path: &str) {
+    if !has_live_inotify_groups() {
+        perf::record_inotify_no_live_group_fast_path();
+        return;
+    }
     if let Some(node) = file.vfs_node_id() {
         mark_node_unlinked(node);
     }

@@ -7,6 +7,10 @@ la_image_path="${CONTEST_SCRIPT_DISK_LA:-$repo_root/disk-la.img}"
 image_size="${CONTEST_SCRIPT_DISK_SIZE:-64M}"
 script_dir="${CONTEST_SCRIPT_DIR:-$repo_root/contest-case-commands}"
 tmp_image="${image_path}.tmp"
+lock_path="${CONTEST_SCRIPT_LOCK:-/tmp/whusp-build-contest-disk.lock}"
+
+exec 9>"$lock_path"
+flock 9
 
 python3 "$repo_root/scripts/export_contest_case_scripts.py" \
     --out-dir "$script_dir" \

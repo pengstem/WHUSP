@@ -19,6 +19,7 @@ const E4CRYPT_ENCRYPTED_MARKER: &str = ".whusp_e4crypt_encrypted";
 const TMPFS_INLINE_FILE_LIMIT: usize = 1024 * 1024;
 const TMPFS_SPARSE_EXTENT_LIMIT: usize = 64 * 1024;
 const TMPFS_ALLOCATED_PAYLOAD_LIMIT: usize = 64 * 1024 * 1024;
+const EXT_SCRATCH_SYNC_BYTES: u64 = 64 * 1024 * 1024;
 
 enum TmpfsSparseExtent {
     Bytes(Vec<u8>),
@@ -200,6 +201,7 @@ pub(super) struct TmpFs {
     next_ino: u32,
     statfs_magic: i64,
     logical_quota_bytes: Option<u64>,
+    synthetic_sync_loop_device: Option<usize>,
 }
 
 impl TmpfsInode {
@@ -435,6 +437,26 @@ impl TmpFs {
         statfs_magic: i64,
         logical_quota_bytes: Option<u64>,
     ) -> Self {
+        Self::new_with_statfs_magic_quota_and_synthetic_sync(
+            statfs_magic,
+            logical_quota_bytes,
+            None,
+        )
+    }
+
+    pub(super) fn new_ext_scratch(loop_id: usize, logical_quota_bytes: Option<u64>) -> Self {
+        Self::new_with_statfs_magic_quota_and_synthetic_sync(
+            EXT234_SUPER_MAGIC,
+            logical_quota_bytes,
+            Some(loop_id),
+        )
+    }
+
+    fn new_with_statfs_magic_quota_and_synthetic_sync(
+        statfs_magic: i64,
+        logical_quota_bytes: Option<u64>,
+        synthetic_sync_loop_device: Option<usize>,
+    ) -> Self {
         let mut inodes = BTreeMap::new();
         inodes.insert(
             ROOT_INO,
@@ -445,6 +467,7 @@ impl TmpFs {
             next_ino: ROOT_INO + 1,
             statfs_magic,
             logical_quota_bytes,
+            synthetic_sync_loop_device,
         }
     }
 
@@ -928,6 +951,13 @@ impl FileSystemBackend for TmpFs {
         }
         inode.size = len;
         inode.touch();
+        Ok(())
+    }
+
+    fn sync(&mut self, _ino: u32, _data_only: bool) -> FsResult {
+        if let Some(loop_id) = self.synthetic_sync_loop_device {
+            let _ = super::devfs::loop_device_note_synthetic_write(loop_id, EXT_SCRATCH_SYNC_BYTES);
+        }
         Ok(())
     }
 

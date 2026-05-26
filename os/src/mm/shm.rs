@@ -5,11 +5,13 @@ use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use lazy_static::*;
 
 pub(crate) const IPC_PRIVATE: isize = 0;
 pub(crate) const IPC_CREAT: i32 = 0o1000;
 pub(crate) const IPC_EXCL: i32 = 0o2000;
+pub(crate) const SHM_HUGETLB: i32 = 0o4000;
 pub(crate) const IPC_RMID: i32 = 0;
 pub(crate) const IPC_SET: i32 = 1;
 pub(crate) const IPC_STAT: i32 = 2;
@@ -36,6 +38,7 @@ pub(crate) enum ShmError {
     Exists,
     Invalid,
     NoMem,
+    NoSpace,
     AccessDenied,
     NotPermitted,
 }
@@ -244,8 +247,19 @@ impl ShmManager {
     }
 
     fn alloc_id(&mut self) -> usize {
+        if let Some(id) = requested_next_id() {
+            if !self.segments.contains_key(&id) {
+                return id;
+            }
+        }
+        while self.segments.contains_key(&self.next_id) {
+            self.next_id += 1;
+        }
         let id = self.next_id;
         self.next_id += 1;
+        while self.segments.contains_key(&self.next_id) {
+            self.next_id += 1;
+        }
         id
     }
 
@@ -256,13 +270,17 @@ impl ShmManager {
         mode: u32,
         context: ShmCreateContext,
     ) -> Result<usize, ShmError> {
-        if !(SHM_MIN..=SHM_MAX).contains(&size) {
+        if !(SHM_MIN..=current_shmmax()).contains(&size) {
             return Err(ShmError::Invalid);
         }
-        if self.segments.len() >= SHMMNI {
-            return Err(ShmError::NoMem);
+        if self.segments.len() >= current_shmmni() {
+            return Err(ShmError::NoSpace);
         }
         let aligned_len = align_up(size).ok_or(ShmError::Invalid)?;
+        let page_count = aligned_len / PAGE_SIZE;
+        if self.usage_info().total_pages.saturating_add(page_count) > current_shmall() {
+            return Err(ShmError::NoSpace);
+        }
         let shmid = self.alloc_id();
         let segment =
             ShmSegment::new(key, size, aligned_len, mode, context).ok_or(ShmError::NoMem)?;
@@ -270,6 +288,7 @@ impl ShmManager {
         if key != IPC_PRIVATE {
             self.keyed_segments.insert(key, shmid);
         }
+        reset_next_id();
         Ok(shmid)
     }
 
@@ -285,6 +304,9 @@ impl ShmManager {
         let flags = shmflg & !0o777;
         // UNFINISHED: huge-page flags and Linux's full key lookup rules are
         // not modeled; the contest path uses ordinary pages.
+        if flags & SHM_HUGETLB != 0 {
+            return Err(ShmError::Invalid);
+        }
         if key == IPC_PRIVATE {
             return self.create_segment(key, size, mode, context);
         }
@@ -481,6 +503,64 @@ impl ShmManager {
 lazy_static! {
     static ref SHM_MANAGER: UPIntrFreeCell<ShmManager> =
         unsafe { UPIntrFreeCell::new(ShmManager::new()) };
+}
+
+static SHM_MAX_LIMIT: AtomicUsize = AtomicUsize::new(SHM_MAX);
+static SHMMNI_LIMIT: AtomicUsize = AtomicUsize::new(SHMMNI);
+static SHMALL_LIMIT: AtomicUsize = AtomicUsize::new(SHMALL);
+static SHM_NEXT_ID: AtomicIsize = AtomicIsize::new(-1);
+
+pub(crate) fn current_shmmax() -> usize {
+    SHM_MAX_LIMIT.load(Ordering::Relaxed)
+}
+
+pub(crate) fn current_shmmni() -> usize {
+    SHMMNI_LIMIT.load(Ordering::Relaxed)
+}
+
+pub(crate) fn current_shmall() -> usize {
+    SHMALL_LIMIT.load(Ordering::Relaxed)
+}
+
+pub(crate) fn current_shm_next_id() -> isize {
+    SHM_NEXT_ID.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_shmmax(value: usize) -> bool {
+    if value < SHM_MIN {
+        return false;
+    }
+    SHM_MAX_LIMIT.store(value, Ordering::Relaxed);
+    true
+}
+
+pub(crate) fn set_shmmni(value: usize) -> bool {
+    if value == 0 {
+        return false;
+    }
+    SHMMNI_LIMIT.store(value, Ordering::Relaxed);
+    true
+}
+
+pub(crate) fn set_shmall(value: usize) -> bool {
+    SHMALL_LIMIT.store(value, Ordering::Relaxed);
+    true
+}
+
+pub(crate) fn set_shm_next_id(value: isize) -> bool {
+    if value < -1 {
+        return false;
+    }
+    SHM_NEXT_ID.store(value, Ordering::Relaxed);
+    true
+}
+
+fn requested_next_id() -> Option<usize> {
+    SHM_NEXT_ID.load(Ordering::Relaxed).try_into().ok()
+}
+
+fn reset_next_id() {
+    SHM_NEXT_ID.store(-1, Ordering::Relaxed);
 }
 
 pub(crate) fn shmget_segment(

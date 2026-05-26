@@ -204,11 +204,11 @@ pub fn sys_shmctl(shmid: usize, cmd: i32, buf: usize) -> SysResult {
                 current_user_token(),
                 buf as *mut LinuxShminfo,
                 &LinuxShminfo {
-                    shmmax: crate::mm::shm::SHM_MAX,
+                    shmmax: crate::mm::shm::current_shmmax(),
                     shmmin: 1,
-                    shmmni: crate::mm::shm::SHMMNI,
-                    shmseg: crate::mm::shm::SHMMNI,
-                    shmall: crate::mm::shm::SHMALL,
+                    shmmni: crate::mm::shm::current_shmmni(),
+                    shmseg: crate::mm::shm::current_shmmni(),
+                    shmall: crate::mm::shm::current_shmall(),
                 },
             )?;
             Ok(crate::mm::shm::highest_index() as isize)
@@ -843,6 +843,7 @@ fn shm_error_to_sys_error(error: ShmError) -> SysError {
         ShmError::Exists => SysError::EEXIST,
         ShmError::Invalid => SysError::EINVAL,
         ShmError::NoMem => SysError::ENOMEM,
+        ShmError::NoSpace => SysError::ENOSPC,
         ShmError::AccessDenied => SysError::EACCES,
         ShmError::NotPermitted => SysError::EPERM,
     }

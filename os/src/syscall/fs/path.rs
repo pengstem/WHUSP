@@ -22,14 +22,14 @@ use super::uapi::{
     VALID_RENAME_FLAGS, VALID_UTIMENSAT_FLAGS, W_OK, X_OK,
 };
 use crate::fs::{
-    FS_APPEND_FL, FS_IMMUTABLE_FL, File, FileCreateAttrs, FileTimestamp, FsError, FsNodeKind,
-    OpenFlags, PathContext, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
-    WorkingDir, chown_in, create_node_in, link_file_in, link_open_file_in, lookup_dir_with_stat_in,
-    lookup_dir_with_stat_path_in, lookup_path_in, mkdir_in, normalize_path_at_root,
-    open_devfs_child, open_devfs_input_child, open_devfs_misc_child, open_devfs_net_child,
-    open_devfs_pts_child, open_file_in, open_file_in_with_attrs, open_static_path,
-    open_tmpfile_in_with_attrs, path_inside_root, rename_exchange_in, rename_in, rmdir_in,
-    symlink_in, truncate_in, unlink_file_in,
+    FS_APPEND_FL, FS_IMMUTABLE_FL, File, FileCreateAttrs, FileStat, FileTimestamp, FsError,
+    FsNodeKind, OpenFlags, PathContext, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT,
+    S_IFREG, S_IFSOCK, WorkingDir, chown_in, create_node_in, link_file_in, link_open_file_in,
+    lookup_dir_with_stat_in, lookup_dir_with_stat_path_in, lookup_path_in, mkdir_in,
+    normalize_path_at_root, open_devfs_child, open_devfs_input_child, open_devfs_misc_child,
+    open_devfs_net_child, open_devfs_pts_child, open_file_in, open_file_in_with_attrs,
+    open_static_path, open_tmpfile_in_with_attrs, path_inside_root, rename_exchange_in, rename_in,
+    rmdir_in, symlink_in, truncate_in, unlink_file_in,
 };
 use crate::mm::UserBuffer;
 use crate::task::{CAP_SYS_CHROOT, PathSnapshot, current_process, current_user_token};
@@ -59,6 +59,7 @@ const VALID_OPENAT2_RESOLVE_FLAGS: u64 = RESOLVE_NO_XDEV
     | RESOLVE_IN_ROOT
     | RESOLVE_CACHED;
 const OPENAT2_MODE_MASK: u64 = 0o7777;
+const MODE_STICKY: u32 = 0o1000;
 
 pub(crate) struct EmptyAtPath {
     file: Arc<dyn File + Send + Sync>,
@@ -268,6 +269,70 @@ fn check_unlink_file_access(
     };
     if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
         return Err(SysError::EPERM);
+    }
+    Ok(())
+}
+
+fn check_sticky_rename_access(
+    parent_stat: &FileStat,
+    target_stat: &FileStat,
+    subject: AccessSubject<'_>,
+) -> SysResult<()> {
+    if parent_stat.mode & MODE_STICKY == 0 || subject.is_root() {
+        return Ok(());
+    }
+    if subject.uid() == parent_stat.uid || subject.uid() == target_stat.uid {
+        return Ok(());
+    }
+    Err(SysError::EPERM)
+}
+
+fn resolve_optional_rename_target_stat(
+    snapshot: &PathSnapshot,
+    dirfd: isize,
+    path: &str,
+) -> SysResult<Option<FileStat>> {
+    match resolve_stat_from(snapshot, dirfd, path, false) {
+        Ok(stat) => Ok(Some(stat)),
+        Err(SysError::ENOENT) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn check_rename_access(
+    snapshot: &PathSnapshot,
+    olddirfd: isize,
+    oldpath: &str,
+    newdirfd: isize,
+    newpath: &str,
+    subject: AccessSubject<'_>,
+) -> SysResult<()> {
+    if oldpath.is_empty() || newpath.is_empty() {
+        return Err(SysError::ENOENT);
+    }
+
+    check_access_path_prefixes_from(snapshot, olddirfd, oldpath, subject)?;
+    check_access_path_prefixes_from(snapshot, newdirfd, newpath, subject)?;
+
+    let old_parent_path = parent_path_for_leaf(oldpath);
+    let old_parent_stat = resolve_stat_from(snapshot, olddirfd, old_parent_path, true)?;
+    if old_parent_stat.mode & S_IFMT != S_IFDIR {
+        return Err(SysError::ENOTDIR);
+    }
+    check_access_mode(&old_parent_stat, W_OK | X_OK, subject)?;
+
+    let old_stat = resolve_stat_from(snapshot, olddirfd, oldpath, false)?;
+    check_sticky_rename_access(&old_parent_stat, &old_stat, subject)?;
+
+    let new_parent_path = parent_path_for_leaf(newpath);
+    let new_parent_stat = resolve_stat_from(snapshot, newdirfd, new_parent_path, true)?;
+    if new_parent_stat.mode & S_IFMT != S_IFDIR {
+        return Err(SysError::ENOTDIR);
+    }
+    check_access_mode(&new_parent_stat, W_OK | X_OK, subject)?;
+
+    if let Some(new_stat) = resolve_optional_rename_target_stat(snapshot, newdirfd, newpath)? {
+        check_sticky_rename_access(&new_parent_stat, &new_stat, subject)?;
     }
     Ok(())
 }
@@ -1117,6 +1182,16 @@ pub fn sys_renameat2(
     let snapshot = current_process().path_snapshot();
     let old_context = path_context_from(&snapshot, olddirfd, oldpath.as_str())?;
     let new_context = path_context_from(&snapshot, newdirfd, newpath.as_str())?;
+    let credentials = current_process().credentials();
+    let subject = AccessSubject::from_fs_credentials(&credentials);
+    check_rename_access(
+        &snapshot,
+        olddirfd,
+        oldpath.as_str(),
+        newdirfd,
+        newpath.as_str(),
+        subject,
+    )?;
     if flags & RENAME_EXCHANGE != 0 {
         rename_exchange_in(old_context, oldpath.as_str(), new_context, newpath.as_str())?;
         return Ok(0);

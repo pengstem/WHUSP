@@ -91,6 +91,14 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) usercopy_copy_to_user_bytes: usize,
     pub(crate) usercopy_copy_to_user_in_memory_set_calls: usize,
     pub(crate) usercopy_copy_to_user_in_memory_set_bytes: usize,
+    pub(crate) inotify_no_live_group_fast_paths: usize,
+    pub(crate) inotify_live_group_scans: usize,
+    pub(crate) inotify_node_name_remember_calls: usize,
+    pub(crate) inotify_unlinked_node_updates: usize,
+    pub(crate) fanotify_no_live_group_fast_paths: usize,
+    pub(crate) fanotify_live_group_scans: usize,
+    pub(crate) fanotify_node_name_remember_calls: usize,
+    pub(crate) fanotify_node_name_lookup_calls: usize,
     pub(crate) futex_cleanup_calls: usize,
     pub(crate) futex_cleanup_direct_hits: usize,
     pub(crate) futex_cleanup_already_unqueued: usize,
@@ -207,6 +215,15 @@ mod enabled {
     static USERCOPY_COPY_TO_USER_BYTES: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_COPY_TO_USER_IN_MEMORY_SET_CALLS: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_COPY_TO_USER_IN_MEMORY_SET_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    static INOTIFY_NO_LIVE_GROUP_FAST_PATHS: AtomicUsize = AtomicUsize::new(0);
+    static INOTIFY_LIVE_GROUP_SCANS: AtomicUsize = AtomicUsize::new(0);
+    static INOTIFY_NODE_NAME_REMEMBER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static INOTIFY_UNLINKED_NODE_UPDATES: AtomicUsize = AtomicUsize::new(0);
+    static FANOTIFY_NO_LIVE_GROUP_FAST_PATHS: AtomicUsize = AtomicUsize::new(0);
+    static FANOTIFY_LIVE_GROUP_SCANS: AtomicUsize = AtomicUsize::new(0);
+    static FANOTIFY_NODE_NAME_REMEMBER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static FANOTIFY_NODE_NAME_LOOKUP_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     static FUTEX_CLEANUP_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FUTEX_CLEANUP_DIRECT_HITS: AtomicUsize = AtomicUsize::new(0);
@@ -469,6 +486,38 @@ mod enabled {
         total_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_inotify_no_live_group_fast_path() {
+        INOTIFY_NO_LIVE_GROUP_FAST_PATHS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_inotify_live_group_scan() {
+        INOTIFY_LIVE_GROUP_SCANS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_inotify_node_name_remember() {
+        INOTIFY_NODE_NAME_REMEMBER_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_inotify_unlinked_node_update() {
+        INOTIFY_UNLINKED_NODE_UPDATES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_fanotify_no_live_group_fast_path() {
+        FANOTIFY_NO_LIVE_GROUP_FAST_PATHS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_fanotify_live_group_scan() {
+        FANOTIFY_LIVE_GROUP_SCANS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_fanotify_node_name_remember() {
+        FANOTIFY_NODE_NAME_REMEMBER_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_fanotify_node_name_lookup() {
+        FANOTIFY_NODE_NAME_LOOKUP_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
     #[derive(Clone, Copy)]
     pub(crate) enum UsercopyAccess {
         Read,
@@ -617,6 +666,19 @@ mod enabled {
                 .load(Ordering::Relaxed),
             usercopy_copy_to_user_in_memory_set_bytes: USERCOPY_COPY_TO_USER_IN_MEMORY_SET_BYTES
                 .load(Ordering::Relaxed),
+            inotify_no_live_group_fast_paths: INOTIFY_NO_LIVE_GROUP_FAST_PATHS
+                .load(Ordering::Relaxed),
+            inotify_live_group_scans: INOTIFY_LIVE_GROUP_SCANS.load(Ordering::Relaxed),
+            inotify_node_name_remember_calls: INOTIFY_NODE_NAME_REMEMBER_CALLS
+                .load(Ordering::Relaxed),
+            inotify_unlinked_node_updates: INOTIFY_UNLINKED_NODE_UPDATES.load(Ordering::Relaxed),
+            fanotify_no_live_group_fast_paths: FANOTIFY_NO_LIVE_GROUP_FAST_PATHS
+                .load(Ordering::Relaxed),
+            fanotify_live_group_scans: FANOTIFY_LIVE_GROUP_SCANS.load(Ordering::Relaxed),
+            fanotify_node_name_remember_calls: FANOTIFY_NODE_NAME_REMEMBER_CALLS
+                .load(Ordering::Relaxed),
+            fanotify_node_name_lookup_calls: FANOTIFY_NODE_NAME_LOOKUP_CALLS
+                .load(Ordering::Relaxed),
             futex_cleanup_calls: FUTEX_CLEANUP_CALLS.load(Ordering::Relaxed),
             futex_cleanup_direct_hits: FUTEX_CLEANUP_DIRECT_HITS.load(Ordering::Relaxed),
             futex_cleanup_already_unqueued: FUTEX_CLEANUP_ALREADY_UNQUEUED.load(Ordering::Relaxed),
@@ -726,6 +788,14 @@ mod enabled {
          usercopy_copy_to_user_bytes {}\n\
          usercopy_copy_to_user_in_memory_set_calls {}\n\
          usercopy_copy_to_user_in_memory_set_bytes {}\n\
+         inotify_no_live_group_fast_paths {}\n\
+         inotify_live_group_scans {}\n\
+         inotify_node_name_remember_calls {}\n\
+         inotify_unlinked_node_updates {}\n\
+         fanotify_no_live_group_fast_paths {}\n\
+         fanotify_live_group_scans {}\n\
+         fanotify_node_name_remember_calls {}\n\
+         fanotify_node_name_lookup_calls {}\n\
          futex_cleanup_calls {}\n\
          futex_cleanup_direct_hits {}\n\
          futex_cleanup_already_unqueued {}\n\
@@ -826,6 +896,14 @@ mod enabled {
             stats.usercopy_copy_to_user_bytes,
             stats.usercopy_copy_to_user_in_memory_set_calls,
             stats.usercopy_copy_to_user_in_memory_set_bytes,
+            stats.inotify_no_live_group_fast_paths,
+            stats.inotify_live_group_scans,
+            stats.inotify_node_name_remember_calls,
+            stats.inotify_unlinked_node_updates,
+            stats.fanotify_no_live_group_fast_paths,
+            stats.fanotify_live_group_scans,
+            stats.fanotify_node_name_remember_calls,
+            stats.fanotify_node_name_lookup_calls,
             stats.futex_cleanup_calls,
             stats.futex_cleanup_direct_hits,
             stats.futex_cleanup_already_unqueued,
@@ -1005,6 +1083,30 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_usercopy_site(_site: UsercopySite, _bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_inotify_no_live_group_fast_path() {}
+
+    #[inline(always)]
+    pub(crate) fn record_inotify_live_group_scan() {}
+
+    #[inline(always)]
+    pub(crate) fn record_inotify_node_name_remember() {}
+
+    #[inline(always)]
+    pub(crate) fn record_inotify_unlinked_node_update() {}
+
+    #[inline(always)]
+    pub(crate) fn record_fanotify_no_live_group_fast_path() {}
+
+    #[inline(always)]
+    pub(crate) fn record_fanotify_live_group_scan() {}
+
+    #[inline(always)]
+    pub(crate) fn record_fanotify_node_name_remember() {}
+
+    #[inline(always)]
+    pub(crate) fn record_fanotify_node_name_lookup() {}
 
     #[inline(always)]
     pub(crate) fn record_futex_cleanup(

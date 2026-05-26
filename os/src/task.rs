@@ -5,7 +5,6 @@ mod fd;
 pub(crate) mod futex;
 mod id;
 mod initproc;
-mod ltp_whitelist;
 mod manager;
 mod process;
 mod process_lifecycle;

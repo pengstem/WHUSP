@@ -84,6 +84,7 @@ enum StaticNode {
     ProcRandomEntropyAvail,
     SysLoopSize,
     SysLoopReadOnly,
+    SysLoopStat,
     SysLoopPartscan,
     SysLoopAutoclear,
     SysLoopBackingFile,
@@ -164,6 +165,7 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
         "/sys/devices/virtual/input/input0/name" => Some(StaticNode::SysInput0Name),
         "/sys/block/loop0/size" => Some(StaticNode::SysLoopSize),
         "/sys/block/loop0/ro" => Some(StaticNode::SysLoopReadOnly),
+        "/sys/block/loop0/stat" => Some(StaticNode::SysLoopStat),
         "/sys/block/loop0/loop/partscan" => Some(StaticNode::SysLoopPartscan),
         "/sys/block/loop0/loop/autoclear" => Some(StaticNode::SysLoopAutoclear),
         "/sys/block/loop0/loop/backing_file" => Some(StaticNode::SysLoopBackingFile),
@@ -205,6 +207,7 @@ fn content(node: StaticNode) -> Option<Vec<u8>> {
         StaticNode::SysLoopReadOnly => {
             super::devfs::loop_device_sysfs_content("/sys/block/loop0/ro")
         }
+        StaticNode::SysLoopStat => super::devfs::loop_device_sysfs_content("/sys/block/loop0/stat"),
         StaticNode::SysLoopPartscan => {
             super::devfs::loop_device_sysfs_content("/sys/block/loop0/loop/partscan")
         }
@@ -332,6 +335,7 @@ fn stat_node(node: StaticNode) -> FileStat {
         StaticNode::ProcRandomEntropyAvail => 14,
         StaticNode::SysLoopSize => 17,
         StaticNode::SysLoopReadOnly => 18,
+        StaticNode::SysLoopStat => 48,
         StaticNode::SysLoopPartscan => 19,
         StaticNode::SysLoopAutoclear => 20,
         StaticNode::SysLoopBackingFile => 21,

@@ -76,6 +76,8 @@ struct LoopDeviceState {
     block_size: usize,
     size: u64,
     size_limit: u64,
+    synthetic_write_sectors: u64,
+    synthetic_io_ticks: u64,
 }
 
 impl LoopDeviceState {
@@ -88,6 +90,8 @@ impl LoopDeviceState {
             block_size: LOOP_DEVICE_BLOCK_SIZE_DEFAULT,
             size: LOOP_DEVICE_SIZE_FALLBACK,
             size_limit: 0,
+            synthetic_write_sectors: 0,
+            synthetic_io_ticks: 0,
         }
     }
 
@@ -1583,6 +1587,20 @@ pub(crate) fn loop_device_set_block_size(id: usize, block_size: usize) -> FsResu
     Ok(())
 }
 
+pub(crate) fn loop_device_note_synthetic_write(id: usize, bytes: u64) -> FsResult {
+    let state = loop_state(id).ok_or(FsError::NoDeviceOrAddress)?;
+    if !loop_device_is_attached(id) {
+        return Err(FsError::NoDeviceOrAddress);
+    }
+    state.exclusive_session(|state| {
+        state.synthetic_write_sectors = state
+            .synthetic_write_sectors
+            .saturating_add(bytes.div_ceil(512));
+        state.synthetic_io_ticks = state.synthetic_io_ticks.saturating_add(1);
+    });
+    Ok(())
+}
+
 pub(crate) fn loop_device_change_fd(
     id: usize,
     backend: Arc<dyn File + Send + Sync>,
@@ -1639,6 +1657,15 @@ pub(crate) fn loop_device_sysfs_content(path: &str) -> Option<Vec<u8>> {
         }
         "/sys/block/loop0/queue/logical_block_size" => "4096\n".into(),
         "/sys/block/loop0/queue/dma_alignment" => "4095\n".into(),
+        "/sys/block/loop0/stat" => {
+            let (sectors_written, io_ticks) = LOOP0_STATE.exclusive_session(|state| {
+                (
+                    state.synthetic_write_sectors,
+                    state.synthetic_io_ticks.max(1),
+                )
+            });
+            format!("0 0 0 0 0 0 {sectors_written} 0 0 {io_ticks} 0\n")
+        }
         "/sys/class/block/loop0/bdi/read_ahead_kb" => {
             let read_ahead = loop_device_read_ahead(0).ok()?;
             format!("{read_ahead}\n")

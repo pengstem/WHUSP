@@ -13,12 +13,14 @@ use crate::fs::{
     VfsNodeId, lookup_path_in, normalize_path_at_root, overlay_real_node,
 };
 use crate::mm::UserBuffer;
+use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
     TaskControlBlock, block_current_task_no_schedule, current_has_interrupting_signal,
     current_process, current_task, current_user_token, schedule, wakeup_task,
 };
-use alloc::collections::VecDeque;
+use alloc::collections::btree_map::Entry;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -139,8 +141,8 @@ const UNSUPPORTED_PERMISSION_EVENTS: u64 = FAN_OPEN_PERM | FAN_ACCESS_PERM | FAN
 lazy_static! {
     static ref FANOTIFY_GROUPS: UPIntrFreeCell<Vec<Weak<FanotifyGroup>>> =
         unsafe { UPIntrFreeCell::new(Vec::new()) };
-    static ref FANOTIFY_NODE_NAMES: UPIntrFreeCell<Vec<(VfsNodeId, String)>> =
-        unsafe { UPIntrFreeCell::new(Vec::new()) };
+    static ref FANOTIFY_NODE_NAMES: UPIntrFreeCell<BTreeMap<VfsNodeId, String>> =
+        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -1098,6 +1100,14 @@ pub fn sys_fanotify_mark(
     )
 }
 
+fn live_fanotify_groups() -> Vec<Arc<FanotifyGroup>> {
+    perf::record_fanotify_live_group_scan();
+    FANOTIFY_GROUPS.exclusive_session(|groups| {
+        groups.retain(|weak| weak.strong_count() > 0);
+        groups.iter().filter_map(Weak::upgrade).collect()
+    })
+}
+
 fn fanotify_notify_file_at(
     file: &Arc<dyn File + Send + Sync>,
     event_mask: u64,
@@ -1117,6 +1127,11 @@ fn fanotify_notify_file_at(
     };
     let parent = file.vfs_parent_node_id();
     let is_dir = file.working_dir().is_some();
+    let live_groups = live_fanotify_groups();
+    if live_groups.is_empty() {
+        perf::record_fanotify_no_live_group_fast_path();
+        return;
+    }
     if let Some(path) = event_path {
         remember_node_name(node, path);
     }
@@ -1125,24 +1140,20 @@ fn fanotify_notify_file_at(
         .map(String::from)
         .or_else(|| remembered_node_name(node));
 
-    FANOTIFY_GROUPS.exclusive_session(|groups| {
-        groups.retain(|weak| weak.strong_count() > 0);
-        let live_groups: Vec<_> = groups.iter().filter_map(Weak::upgrade).collect();
-        for group in live_groups {
-            group.publish(
-                node,
-                parent,
-                mount,
-                event_mask,
-                is_dir,
-                event_path,
-                event_name.as_deref(),
-                None,
-                Some(node),
-                Some(file),
-            );
-        }
-    });
+    for group in live_groups {
+        group.publish(
+            node,
+            parent,
+            mount,
+            event_mask,
+            is_dir,
+            event_path,
+            event_name.as_deref(),
+            None,
+            Some(node),
+            Some(file),
+        );
+    }
 }
 
 fn fanotify_notify_dirent_event(
@@ -1160,27 +1171,28 @@ fn fanotify_notify_dirent_event(
         return;
     };
     let is_dir = file.working_dir().is_some();
+    let live_groups = live_fanotify_groups();
+    if live_groups.is_empty() {
+        perf::record_fanotify_no_live_group_fast_path();
+        return;
+    }
     remember_node_name(child_node, event_path);
     let event_name = path_basename(event_path).map(String::from);
 
-    FANOTIFY_GROUPS.exclusive_session(|groups| {
-        groups.retain(|weak| weak.strong_count() > 0);
-        let live_groups: Vec<_> = groups.iter().filter_map(Weak::upgrade).collect();
-        for group in live_groups {
-            group.publish(
-                parent_node,
-                None,
-                mount,
-                event_mask,
-                is_dir,
-                Some(event_path),
-                event_name.as_deref(),
-                Some(parent_node),
-                Some(child_node),
-                None,
-            );
-        }
-    });
+    for group in live_groups {
+        group.publish(
+            parent_node,
+            None,
+            mount,
+            event_mask,
+            is_dir,
+            Some(event_path),
+            event_name.as_deref(),
+            Some(parent_node),
+            Some(child_node),
+            None,
+        );
+    }
 }
 
 fn fanotify_notify_self_event(
@@ -1196,27 +1208,28 @@ fn fanotify_notify_self_event(
     };
     let parent = file.vfs_parent_node_id();
     let is_dir = file.working_dir().is_some();
+    let live_groups = live_fanotify_groups();
+    if live_groups.is_empty() {
+        perf::record_fanotify_no_live_group_fast_path();
+        return;
+    }
     remember_node_name(node, event_path);
     let event_name = is_dir.then_some(".");
 
-    FANOTIFY_GROUPS.exclusive_session(|groups| {
-        groups.retain(|weak| weak.strong_count() > 0);
-        let live_groups: Vec<_> = groups.iter().filter_map(Weak::upgrade).collect();
-        for group in live_groups {
-            group.publish(
-                node,
-                parent,
-                mount,
-                event_mask,
-                is_dir,
-                Some(event_path),
-                event_name,
-                Some(node),
-                None,
-                None,
-            );
-        }
-    });
+    for group in live_groups {
+        group.publish(
+            node,
+            parent,
+            mount,
+            event_mask,
+            is_dir,
+            Some(event_path),
+            event_name,
+            Some(node),
+            None,
+            None,
+        );
+    }
 }
 
 fn path_basename(path: &str) -> Option<&str> {
@@ -1230,26 +1243,22 @@ fn remember_node_name(node: VfsNodeId, path: &str) {
     let Some(name) = path_basename(path) else {
         return;
     };
-    FANOTIFY_NODE_NAMES.exclusive_session(|names| {
-        if let Some((_, stored)) = names
-            .iter_mut()
-            .find(|(stored_node, _)| *stored_node == node)
-        {
+    perf::record_fanotify_node_name_remember();
+    FANOTIFY_NODE_NAMES.exclusive_session(|names| match names.entry(node) {
+        Entry::Occupied(mut entry) => {
+            let stored = entry.get_mut();
             stored.clear();
             stored.push_str(name);
-        } else {
-            names.push((node, String::from(name)));
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(String::from(name));
         }
     });
 }
 
 fn remembered_node_name(node: VfsNodeId) -> Option<String> {
-    FANOTIFY_NODE_NAMES.exclusive_session(|names| {
-        names
-            .iter()
-            .find(|(stored_node, _)| *stored_node == node)
-            .map(|(_, name)| name.clone())
-    })
+    perf::record_fanotify_node_name_lookup();
+    FANOTIFY_NODE_NAMES.exclusive_session(|names| names.get(&node).cloned())
 }
 
 pub(super) fn fanotify_notify_file(file: &Arc<dyn File + Send + Sync>, event_mask: u64) {
