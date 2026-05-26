@@ -145,6 +145,10 @@ const SYSCALL_GETEUID: usize = 175;
 const SYSCALL_GETGID: usize = 176;
 const SYSCALL_GETEGID: usize = 177;
 const SYSCALL_GETTID: usize = 178;
+const SYSCALL_MSGGET: usize = 186;
+const SYSCALL_MSGCTL: usize = 187;
+const SYSCALL_MSGRCV: usize = 188;
+const SYSCALL_MSGSND: usize = 189;
 const SYSCALL_SEMGET: usize = 190;
 const SYSCALL_SEMCTL: usize = 191;
 const SYSCALL_SEMTIMEDOP: usize = 192;
@@ -236,6 +240,7 @@ mod fs;
 mod futex;
 pub(crate) mod keyring;
 mod memory;
+pub(crate) mod msg;
 mod net;
 mod process;
 pub(crate) mod sem;
@@ -251,6 +256,7 @@ use fs::*;
 use futex::*;
 use keyring::*;
 use memory::*;
+use msg::*;
 use net::*;
 use process::*;
 use sem::*;
@@ -777,6 +783,16 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETGID => Ok(sys_getgid()),
         SYSCALL_GETEGID => Ok(sys_getegid()),
         SYSCALL_GETTID => Ok(sys_gettid()),
+        SYSCALL_MSGGET => sys_msgget(args[0] as isize, args[1] as i32),
+        SYSCALL_MSGCTL => sys_msgctl(args[0], args[1] as i32, args[2]),
+        SYSCALL_MSGRCV => sys_msgrcv(
+            args[0],
+            args[1] as *mut u8,
+            args[2],
+            args[3] as isize,
+            args[4] as i32,
+        ),
+        SYSCALL_MSGSND => sys_msgsnd(args[0], args[1] as *const u8, args[2], args[3] as i32),
         SYSCALL_SEMGET => sys_semget(args[0] as isize, args[1], args[2] as i32),
         SYSCALL_SEMCTL => sys_semctl(args[0], args[1], args[2] as i32, args[3]),
         SYSCALL_SEMTIMEDOP => {

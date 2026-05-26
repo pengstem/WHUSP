@@ -77,14 +77,19 @@ const VERSION_INO: u32 = 42;
 const SYSVIPC_DIR_INO: u32 = 43;
 const SYSVIPC_SHM_INO: u32 = 44;
 const SYSVIPC_SEM_INO: u32 = 45;
-const SHMMAX_INO: u32 = 46;
-const SHMMNI_INO: u32 = 47;
-const SHMALL_INO: u32 = 48;
-const OSKERNEL_DIR_INO: u32 = 49;
-const OSKERNEL_PERF_INO: u32 = 50;
-const CONFIG_GZ_INO: u32 = 51;
-const PROC_SELF_INO: u32 = 52;
-const SHM_NEXT_ID_INO: u32 = 53;
+const SYSVIPC_MSG_INO: u32 = 46;
+const SHMMAX_INO: u32 = 47;
+const SHMMNI_INO: u32 = 48;
+const SHMALL_INO: u32 = 49;
+const OSKERNEL_DIR_INO: u32 = 50;
+const OSKERNEL_PERF_INO: u32 = 51;
+const CONFIG_GZ_INO: u32 = 52;
+const PROC_SELF_INO: u32 = 53;
+const SHM_NEXT_ID_INO: u32 = 54;
+const MSGMNI_INO: u32 = 55;
+const MSGMAX_INO: u32 = 56;
+const MSGMNB_INO: u32 = 57;
+const MSG_NEXT_ID_INO: u32 = 58;
 // CONTEXT: Dynamic /proc inode ranges must stay disjoint even after long test
 // runs allocate five-digit PIDs; LTP probes /proc/<ppid>/stat during waits.
 const PID_DIR_BASE: u32 = 100;
@@ -224,6 +229,11 @@ enum ProcNode {
     SelfSymlink,
     SysVipcShm,
     SysVipcSem,
+    SysVipcMsg,
+    MsgMni,
+    MsgMax,
+    MsgMnb,
+    MsgNextId,
     Domainname,
     Tainted,
     PidDir(usize),
@@ -485,10 +495,15 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         SYSVIPC_DIR_INO => Some(ProcNode::SysVipcDir),
         SYSVIPC_SHM_INO => Some(ProcNode::SysVipcShm),
         SYSVIPC_SEM_INO => Some(ProcNode::SysVipcSem),
+        SYSVIPC_MSG_INO => Some(ProcNode::SysVipcMsg),
         SHMMAX_INO => Some(ProcNode::ShmMax),
         SHMMNI_INO => Some(ProcNode::ShmMni),
         SHMALL_INO => Some(ProcNode::ShmAll),
         SHM_NEXT_ID_INO => Some(ProcNode::ShmNextId),
+        MSGMNI_INO => Some(ProcNode::MsgMni),
+        MSGMAX_INO => Some(ProcNode::MsgMax),
+        MSGMNB_INO => Some(ProcNode::MsgMnb),
+        MSG_NEXT_ID_INO => Some(ProcNode::MsgNextId),
         SYS_NET_IPV4_CONF_LO_TAG_INO => Some(ProcNode::NetIpv4ConfLoTag),
         SYS_NET_IPV4_CONF_DEFAULT_TAG_INO => Some(ProcNode::NetIpv4ConfDefaultTag),
         KEYS_GC_DELAY_INO => Some(ProcNode::KeysGcDelay),
@@ -757,6 +772,11 @@ fn sysvipc_entries() -> Vec<RawDirEntry> {
         name: "sem".into(),
         dtype: DT_REG,
     });
+    entries.push(RawDirEntry {
+        ino: SYSVIPC_MSG_INO,
+        name: "msg".into(),
+        dtype: DT_REG,
+    });
     entries
 }
 
@@ -995,6 +1015,26 @@ fn sys_kernel_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: SHM_NEXT_ID_INO,
         name: "shm_next_id".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: MSGMNI_INO,
+        name: "msgmni".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: MSGMAX_INO,
+        name: "msgmax".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: MSGMNB_INO,
+        name: "msgmnb".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: MSG_NEXT_ID_INO,
+        name: "msg_next_id".into(),
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
@@ -1678,6 +1718,41 @@ fn write_shm_next_id(buf: &[u8], offset: u64) -> usize {
     buf.len()
 }
 
+fn write_msg_usize_sysctl(buf: &[u8], offset: u64, setter: impl FnOnce(usize) -> bool) -> usize {
+    if offset != 0 {
+        return 0;
+    }
+    let Ok(text) = core::str::from_utf8(buf) else {
+        return 0;
+    };
+    let Ok(value) = text.trim().parse::<usize>() else {
+        return 0;
+    };
+    // CONTEXT: LTP saves/restores System V message sysctls and derives
+    // stress sizes from them. The message queue subsystem reads these stored
+    // limits; broader namespace-specific sysctl behavior is deferred.
+    if !setter(value) {
+        return 0;
+    }
+    buf.len()
+}
+
+fn write_msg_next_id(buf: &[u8], offset: u64) -> usize {
+    if offset != 0 {
+        return 0;
+    }
+    let Ok(text) = core::str::from_utf8(buf) else {
+        return 0;
+    };
+    let Ok(value) = text.trim().parse::<isize>() else {
+        return 0;
+    };
+    if !crate::syscall::msg::set_msg_next_id(value) {
+        return 0;
+    }
+    buf.len()
+}
+
 fn write_pipe_max_size(buf: &[u8], offset: u64) -> usize {
     if offset != 0 {
         return 0;
@@ -1981,6 +2056,13 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         }
         ProcNode::SysVipcShm => Ok(crate::mm::shm::proc_sysvipc_shm_content().into_bytes()),
         ProcNode::SysVipcSem => Ok(crate::syscall::sem::proc_sysvipc_sem_content().into_bytes()),
+        ProcNode::SysVipcMsg => Ok(crate::syscall::msg::proc_sysvipc_msg_content().into_bytes()),
+        ProcNode::MsgMni => Ok(format!("{}\n", crate::syscall::msg::current_msgmni()).into_bytes()),
+        ProcNode::MsgMax => Ok(format!("{}\n", crate::syscall::msg::current_msgmax()).into_bytes()),
+        ProcNode::MsgMnb => Ok(format!("{}\n", crate::syscall::msg::current_msgmnb()).into_bytes()),
+        ProcNode::MsgNextId => {
+            Ok(format!("{}\n", crate::syscall::msg::current_msg_next_id()).into_bytes())
+        }
         ProcNode::KeysGcDelay => Ok(keyring::key_gc_delay_content().into_bytes()),
         ProcNode::KeysMaxkeys => Ok(keyring::key_maxkeys_content().into_bytes()),
         ProcNode::KeysMaxbytes => Ok(keyring::key_maxbytes_content().into_bytes()),
@@ -2224,6 +2306,10 @@ impl FileSystemBackend for ProcFs {
                 "shmmni" => Ok((SHMMNI_INO, FsNodeKind::RegularFile)),
                 "shmall" => Ok((SHMALL_INO, FsNodeKind::RegularFile)),
                 "shm_next_id" => Ok((SHM_NEXT_ID_INO, FsNodeKind::RegularFile)),
+                "msgmni" => Ok((MSGMNI_INO, FsNodeKind::RegularFile)),
+                "msgmax" => Ok((MSGMAX_INO, FsNodeKind::RegularFile)),
+                "msgmnb" => Ok((MSGMNB_INO, FsNodeKind::RegularFile)),
+                "msg_next_id" => Ok((MSG_NEXT_ID_INO, FsNodeKind::RegularFile)),
                 "keys" => Ok((SYS_KERNEL_KEYS_DIR_INO, FsNodeKind::Directory)),
                 "domainname" => Ok((DOMAINNAME_INO, FsNodeKind::RegularFile)),
                 "tainted" => Ok((TAINTED_INO, FsNodeKind::RegularFile)),
@@ -2245,6 +2331,7 @@ impl FileSystemBackend for ProcFs {
                 ".." => Ok((ROOT_INO, FsNodeKind::Directory)),
                 "shm" => Ok((SYSVIPC_SHM_INO, FsNodeKind::RegularFile)),
                 "sem" => Ok((SYSVIPC_SEM_INO, FsNodeKind::RegularFile)),
+                "msg" => Ok((SYSVIPC_MSG_INO, FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::SysFsDir => match component {
@@ -2450,6 +2537,10 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::ShmMni
             | ProcNode::ShmAll
             | ProcNode::ShmNextId
+            | ProcNode::MsgMni
+            | ProcNode::MsgMax
+            | ProcNode::MsgMnb
+            | ProcNode::MsgNextId
             | ProcNode::KeysGcDelay
             | ProcNode::KeysMaxkeys
             | ProcNode::KeysMaxbytes
@@ -2507,6 +2598,10 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::ShmMni
             | ProcNode::ShmAll
             | ProcNode::ShmNextId
+            | ProcNode::MsgMni
+            | ProcNode::MsgMax
+            | ProcNode::MsgMnb
+            | ProcNode::MsgNextId
             | ProcNode::KeysGcDelay
             | ProcNode::KeysMaxkeys
             | ProcNode::KeysMaxbytes
@@ -2603,6 +2698,16 @@ impl FileSystemBackend for ProcFs {
                 write_shm_usize_sysctl(buf, offset, crate::mm::shm::set_shmall)
             }
             Some(ProcNode::ShmNextId) => write_shm_next_id(buf, offset),
+            Some(ProcNode::MsgMni) => {
+                write_msg_usize_sysctl(buf, offset, crate::syscall::msg::set_msgmni)
+            }
+            Some(ProcNode::MsgMax) => {
+                write_msg_usize_sysctl(buf, offset, crate::syscall::msg::set_msgmax)
+            }
+            Some(ProcNode::MsgMnb) => {
+                write_msg_usize_sysctl(buf, offset, crate::syscall::msg::set_msgmnb)
+            }
+            Some(ProcNode::MsgNextId) => write_msg_next_id(buf, offset),
             Some(ProcNode::KeysGcDelay) => keyring::write_key_gc_delay(buf, offset),
             Some(ProcNode::KeysMaxkeys) => keyring::write_key_maxkeys(buf, offset),
             Some(ProcNode::KeysMaxbytes) => keyring::write_key_maxbytes(buf, offset),
