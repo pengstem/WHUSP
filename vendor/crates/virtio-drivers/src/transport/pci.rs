@@ -251,6 +251,12 @@ impl Transport for PciTransport {
         field!(self.common_cfg, driver_feature).write(driver_features as u32);
         field!(self.common_cfg, driver_feature_select).write(1);
         field!(self.common_cfg, driver_feature).write((driver_features >> 32) as u32);
+        #[cfg(target_arch = "loongarch64")]
+        {
+            dma_sync_barrier();
+            let _ = field_shared!(self.common_cfg, driver_feature_select).read();
+            dma_sync_barrier();
+        }
     }
 
     fn max_queue_size(&mut self, queue: u16) -> u32 {
@@ -277,6 +283,13 @@ impl Transport for PciTransport {
 
     fn set_status(&mut self, status: DeviceStatus) {
         field!(self.common_cfg, device_status).write(status.bits() as u8);
+        #[cfg(target_arch = "loongarch64")]
+        {
+            dma_sync_barrier();
+            let _ = field_shared!(self.common_cfg, device_status).read();
+            dma_sync_barrier();
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
         dma_sync_barrier();
     }
 
@@ -302,6 +315,12 @@ impl Transport for PciTransport {
         field!(self.common_cfg, queue_driver).write(driver_area);
         field!(self.common_cfg, queue_device).write(device_area);
         field!(self.common_cfg, queue_enable).write(1);
+        #[cfg(target_arch = "loongarch64")]
+        {
+            dma_sync_barrier();
+            let _ = field_shared!(self.common_cfg, queue_enable).read();
+            dma_sync_barrier();
+        }
     }
 
     fn queue_unset(&mut self, _queue: u16) {

@@ -135,7 +135,12 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             // SAFETY: `desc` is properly aligned, dereferenceable, initialised,
             // and the device won't access the descriptors for the duration of this unsafe block.
             unsafe {
-                (*desc.as_ptr())[i as usize].next = i + 1;
+                #[cfg(target_arch = "loongarch64")]
+                core::ptr::addr_of_mut!((*desc.as_ptr())[i as usize].next).write_volatile(i + 1);
+                #[cfg(not(target_arch = "loongarch64"))]
+                {
+                    (*desc.as_ptr())[i as usize].next = i + 1;
+                }
             }
         }
 
@@ -205,7 +210,13 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         let avail_slot = self.avail_idx & (SIZE as u16 - 1);
         // SAFETY: `self.avail` is properly aligned, dereferenceable and initialised.
         unsafe {
-            (*self.avail.as_ptr()).ring[avail_slot as usize] = head;
+            #[cfg(target_arch = "loongarch64")]
+            core::ptr::addr_of_mut!((*self.avail.as_ptr()).ring[avail_slot as usize])
+                .write_volatile(head);
+            #[cfg(not(target_arch = "loongarch64"))]
+            {
+                (*self.avail.as_ptr()).ring[avail_slot as usize] = head;
+            }
         }
 
         // Write barrier so that device sees changes to descriptor table and available ring before
@@ -386,7 +397,13 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         // SAFETY: `self.desc` is properly aligned, dereferenceable and initialised, and nothing
         // else reads or writes the descriptor during this block.
         unsafe {
-            (*self.desc.as_ptr())[index] = self.desc_shadow[index].clone();
+            #[cfg(target_arch = "loongarch64")]
+            core::ptr::addr_of_mut!((*self.desc.as_ptr())[index])
+                .write_volatile(self.desc_shadow[index].clone());
+            #[cfg(not(target_arch = "loongarch64"))]
+            {
+                (*self.desc.as_ptr())[index] = self.desc_shadow[index].clone();
+            }
         }
     }
 
