@@ -24,6 +24,7 @@ DEFAULT_OUT_DIR = REPO_ROOT / "contest-case-commands"
 MARKER_FILE = ".generated-by-export-contest-case-scripts"
 ARCHES = ("rv", "la")
 LA_MUSL_COMPAT_PRELOAD = "/opt/oscomp-support/lib/liboscomp-musl-compat.so"
+DEBUG_VERSION = "la-sigill-block-probe-20260527"
 
 
 @dataclass(frozen=True)
@@ -234,6 +235,73 @@ whusp_setup_runtime_environment() {
     export PATH=/tmp/bin:/musl:/glibc:$PATH
 }
 
+whusp_debug_run() {
+    _whusp_debug_label="$1"
+    shift
+    echo "#### WHUSP DEBUG CMD START $_whusp_debug_label ####"
+    "$@"
+    _whusp_debug_ret=$?
+    echo "WHUSP_DEBUG_CMD_RET $_whusp_debug_label $_whusp_debug_ret"
+    echo "#### WHUSP DEBUG CMD END $_whusp_debug_label ####"
+    unset _whusp_debug_label _whusp_debug_ret
+    return 0
+}
+
+whusp_debug_ltp_probe() {
+    _whusp_debug_libc="$1"
+    _whusp_debug_case="$2"
+    _whusp_debug_bin="$_whusp_debug_libc/ltp/testcases/bin/$_whusp_debug_case"
+    echo "#### WHUSP DEBUG LTP PROBE START $_whusp_debug_libc $_whusp_debug_case ####"
+    if [ -f "$_whusp_debug_bin" ]; then
+        (
+            whusp_setup_runtime_environment
+            LIBC_ROOT="$_whusp_debug_libc"
+            whusp_setup_ltp_environment
+            "./$_whusp_debug_case"
+        )
+        _whusp_debug_ret=$?
+    else
+        echo "WHUSP_DEBUG_LTP_PROBE_MISSING $_whusp_debug_bin"
+        _whusp_debug_ret=127
+    fi
+    echo "WHUSP_DEBUG_LTP_PROBE_RET $_whusp_debug_libc $_whusp_debug_case $_whusp_debug_ret"
+    echo "#### WHUSP DEBUG LTP PROBE END $_whusp_debug_libc $_whusp_debug_case ####"
+    unset _whusp_debug_libc _whusp_debug_case _whusp_debug_bin _whusp_debug_ret
+    return 0
+}
+
+whusp_debug_prelude() {
+    whusp_setup_runtime_environment
+    echo "#### WHUSP DEBUG START __WHUSP_DEBUG_VERSION__ ####"
+    echo "WHUSP_DEBUG_VERSION=__WHUSP_DEBUG_VERSION__"
+    echo "WHUSP_DEBUG_ARCH=${WHUSP_ARCH:-unset}"
+    echo "WHUSP_DEBUG_TEST_SCRIPTS=${WHUSP_TEST_SCRIPTS:-unset}"
+    echo "WHUSP_DEBUG_TEST_LIBCS=${WHUSP_TEST_LIBCS:-unset}"
+    echo "WHUSP_DEBUG_LTP_FILTER=${WHUSP_LTP_FILTER_OPTION:-unset}"
+    echo "WHUSP_DEBUG_LTP_WHITELIST_LEN=${WHUSP_LTP_WHITELIST_LEN:-unset}"
+    echo "WHUSP_DEBUG_SCRIPT_DIR=${script_dir:-unset}"
+    whusp_debug_run ls_x1 /musl/busybox ls -la /x1
+    whusp_debug_run cksum_entry /musl/busybox cksum /x1/entry.sh
+    whusp_debug_run cksum_common /musl/busybox cksum /x1/common.sh
+    whusp_debug_run ls_ltp_glibc_pathconf01 /musl/busybox ls -l /glibc/ltp/testcases/bin/pathconf01
+    whusp_debug_run ls_ltp_glibc_writev01 /musl/busybox ls -l /glibc/ltp/testcases/bin/writev01
+    whusp_debug_run ls_ltp_musl_pathconf01 /musl/busybox ls -l /musl/ltp/testcases/bin/pathconf01
+    whusp_debug_run proc_cpuinfo /musl/busybox cat /proc/cpuinfo
+    whusp_debug_run proc_mounts /musl/busybox cat /proc/mounts
+    whusp_debug_run proc_block_cache_before /musl/busybox cat /proc/block_cache
+    case "${WHUSP_ARCH:-rv}" in
+        la)
+            whusp_debug_ltp_probe /glibc pathconf01
+            whusp_debug_ltp_probe /musl pathconf01
+            whusp_debug_run proc_block_cache_after_probe /musl/busybox cat /proc/block_cache
+            ;;
+        *)
+            echo "WHUSP_DEBUG_LTP_PROBE_SKIPPED arch=${WHUSP_ARCH:-rv}"
+            ;;
+    esac
+    echo "#### WHUSP DEBUG END __WHUSP_DEBUG_VERSION__ ####"
+}
+
 whusp_setup_ltp_environment() {
     : "${LIBC_ROOT:=/musl}"
     export LTPROOT="$LIBC_ROOT/ltp"
@@ -407,7 +475,9 @@ whusp_ltp_run_manifest_filter() {
     return "$status"
 }
 """
-    return script.replace("__LTP_MANIFEST_WORDS__", manifest_words)
+    return script.replace("__LTP_MANIFEST_WORDS__", manifest_words).replace(
+        "__WHUSP_DEBUG_VERSION__", DEBUG_VERSION
+    )
 
 
 def source_common(relative_common: str) -> str:
@@ -625,6 +695,7 @@ def entry_script(all_tests: list[str], test_scripts: list[str], libc_roots: list
         '    */*) script_dir="${0%/*}" ;;',
         '    *) script_dir="." ;;',
         "esac",
+        '. "$script_dir/common.sh"',
         "",
         f'WHUSP_TEST_SCRIPTS="${{WHUSP_TEST_SCRIPTS:-{default_test_scripts}}}"',
         f'WHUSP_TEST_LIBCS="${{WHUSP_TEST_LIBCS:-{default_test_libcs}}}"',
@@ -632,6 +703,8 @@ def entry_script(all_tests: list[str], test_scripts: list[str], libc_roots: list
         '    la|loongarch64) WHUSP_ARCH="la" ;;',
         '    *) WHUSP_ARCH="rv" ;;',
         "esac",
+        "",
+        "whusp_debug_prelude",
         "",
         "whusp_script_enabled() {",
         '    case " $WHUSP_TEST_SCRIPTS " in',
