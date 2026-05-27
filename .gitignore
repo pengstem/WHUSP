@@ -5,16 +5,13 @@
 .vscode/
 
 **/target/
+**/__pycache__/
 
 os/src/link_app.S
 os/src/linker.ld
 os/.cargo
 os/.cargo/
-os/last-*
-os/.gdb_history
-os/virt.out
 tools/
-pushall.sh
 *.img
 kernel-rv
 kernel-la

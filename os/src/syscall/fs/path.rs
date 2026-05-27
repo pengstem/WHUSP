@@ -91,6 +91,10 @@ pub(crate) enum AtPath<'a> {
     Empty(EmptyAtPath),
 }
 
+/// Resolves Linux empty-path handling before normal pathname lookup.
+///
+/// With AT_EMPTY_PATH the target is the object named by dirfd, not a synthetic
+/// string path. Callers that need VFS identity should keep the returned file.
 pub(crate) fn resolve_at_path<'a>(
     snapshot: &PathSnapshot,
     dirfd: isize,
@@ -120,6 +124,10 @@ pub(crate) fn resolve_at_path<'a>(
     }))
 }
 
+/// Converts an open directory fd into the cwd anchor used for relative lookup.
+///
+/// `WorkingDir` carries VFS identity; `cwd_path` is only the normalized string
+/// snapshot needed for procfs links, getcwd, and later relative normalization.
 fn dirfd_context_from(snapshot: &PathSnapshot, dirfd: isize) -> SysResult<(WorkingDir, String)> {
     if dirfd == AT_FDCWD {
         return Ok((snapshot.context.cwd(), snapshot.cwd_path.clone()));

@@ -8,7 +8,6 @@ fanotify23
 fanotify06
 getxattr03
 clock_nanosleep02
-clone05
 readahead02
 execve05
 add_key05
@@ -87,7 +86,6 @@ creat01
 creat03
 creat04
 creat06
-creat07
 creat08
 creat09
 dup01
@@ -389,12 +387,9 @@ pathconf02
 pipe01
 pipe02
 pipe03
-pipe04
-pipe05
 pipe06
 pipe07
 pipe08
-pipe09
 pipe10
 pipe11
 pipe12

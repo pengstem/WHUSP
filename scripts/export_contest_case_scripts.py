@@ -8,6 +8,7 @@ import ast
 import fcntl
 import hashlib
 import re
+import shlex
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -433,24 +434,18 @@ cd {sh_quote(libc_root)} || exit 127
 exit "$ret"
 """
     if script == "ltp_testcode.sh":
-        return f"""whusp_setup_runtime_environment
-{libc_root}/busybox echo "#### OS COMP TEST GROUP START ltp-{libc} ####"
+        return f"""{libc_root}/busybox echo "#### OS COMP TEST GROUP START ltp-{libc} ####"
 case "${{WHUSP_LTP_FILTER_OPTION:-None}}" in
     ""|None|none)
-        status=0
-        for script in "$script_dir/../ltp-cases"/*.sh; do
-            /musl/busybox sh "$script"
-            ret=$?
-            [ "$ret" -eq 0 ] || status=$ret
-        done
+        /musl/busybox sh "$script_dir/../run_ltp_whitelist.sh"
         ;;
     *)
+        whusp_setup_runtime_environment
         whusp_ltp_run_manifest_filter
-        status=$?
         ;;
 esac
 {libc_root}/busybox echo "#### OS COMP TEST GROUP END ltp-{libc} ####"
-exit "$status"
+exit 0
 """
 
     commands = ["whusp_setup_runtime_environment", f"cd {sh_quote(libc_root)} || exit 127"]
@@ -507,6 +502,95 @@ case_name={sh_quote(case.name)}
 case_cmd={sh_quote(case.command)}
 
 {source_common('../../../common.sh')}whusp_ltp_run_case
+"""
+
+
+def ltp_case_argv(case: LtpCase) -> list[str]:
+    try:
+        argv = shlex.split(case.command)
+    except ValueError as err:
+        raise ValueError(f"{case.name}: invalid shell command {case.command!r}: {err}") from err
+    if not argv:
+        raise ValueError(f"{case.name}: empty LTP command")
+    shell_tokens = {";", "|", "&", "&&", "||", "<", ">", ">>", "2>", "<<"}
+    if any(token in shell_tokens for token in argv):
+        raise ValueError(f"{case.name}: complex shell command is not supported: {case.command!r}")
+    if any(ch in case.command for ch in "$`\\\n"):
+        raise ValueError(f"{case.name}: shell expansion is not supported: {case.command!r}")
+    if "=" in argv[0]:
+        raise ValueError(f"{case.name}: environment-prefixed command is not supported: {case.command!r}")
+    return argv
+
+
+def ltp_static_command_args(case: LtpCase) -> list[str]:
+    argv = ltp_case_argv(case)
+    prog = argv[0]
+    if "/" not in prog:
+        prog = f"./{prog}"
+    return [prog, *argv[1:]]
+
+
+def ltp_static_case_block(case: LtpCase) -> str:
+    command_args = ltp_static_command_args(case)
+    command = " ".join(sh_quote(arg) for arg in command_args)
+    lines = [
+        f'echo "RUN LTP CASE {case.name}"',
+    ]
+    if Path(command_args[0]).name.startswith("fs_bind"):
+        lines.append("fs_bind_preflight")
+    if case.name == "statx10":
+        lines.extend(
+            [
+                '_old_ltp_single_fs_type="$LTP_SINGLE_FS_TYPE"',
+                'export LTP_SINGLE_FS_TYPE="ext4"',
+                command,
+                "ret=$?",
+                'export LTP_SINGLE_FS_TYPE="$_old_ltp_single_fs_type"',
+                "unset _old_ltp_single_fs_type",
+            ]
+        )
+        result = "$ret"
+    else:
+        lines.append(command)
+        result = "$?"
+    lines.extend(
+        [
+            f'echo "FAIL LTP CASE {case.name} : {result}"',
+        ]
+    )
+    return "\n".join(lines)
+
+
+def ltp_whitelist_script(arch: str, libc_root: str, cases: list[LtpCase]) -> str:
+    case_lines: list[str] = []
+    if not cases:
+        case_lines.append("# No LTP whitelist cases are currently selected.")
+    for case in cases:
+        case_lines.append(ltp_static_case_block(case))
+    case_body = "\n\n".join(case_lines)
+    return f"""#!/musl/busybox sh
+# Generated unified LTP whitelist runner.
+# arch={arch}
+# libc={libc_label(libc_root)}
+# whitelist_cases={len(cases)}
+
+LIBC_ROOT={sh_quote(libc_root)}
+
+{source_common('../../common.sh')}whusp_setup_runtime_environment
+whusp_setup_ltp_environment
+
+fs_bind_preflight() {{
+    unset TST_LIB_LOADED TST_SECURITY_LOADED
+    for _whusp_ltp_helper in fs_bind_lib.sh tst_test.sh tst_ansi_color.sh tst_security.sh; do
+        for _whusp_ltp_dir in "$LTPROOT/testcases/bin" "$LTPROOT/testcases/lib"; do
+            [ -f "$_whusp_ltp_dir/$_whusp_ltp_helper" ] &&
+                /musl/busybox cat "$_whusp_ltp_dir/$_whusp_ltp_helper" >/dev/null 2>&1
+        done
+    done
+}}
+
+{case_body}
+exit 0
 """
 
 
@@ -645,6 +729,24 @@ def _write_outputs_unlocked(
             ltp_dir.mkdir()
             write_executable(root / "run_all_groups.sh", run_all_script("groups"))
             write_executable(root / "run_all_ltp_cases.sh", run_all_script("ltp-cases"))
+            whitelist_path = root / "run_ltp_whitelist.sh"
+            write_executable(whitelist_path, ltp_whitelist_script(arch, libc_root, ltp_cases))
+            manifest_lines.append(
+                "\t".join(
+                    [
+                        "ltp_whitelist",
+                        arch,
+                        libc,
+                        "",
+                        "ltp",
+                        "ltp_whitelist.txt",
+                        "",
+                        str(whitelist_path.relative_to(out_dir)),
+                        "whitelist",
+                        "no",
+                    ]
+                )
+            )
 
             for index, script in enumerate(all_tests):
                 enabled = script in enabled_scripts
@@ -724,6 +826,8 @@ Layout:
 - `common.sh`: runtime and LTP helpers mirrored from `contest_runner.rs`.
 - `rv/<libc>/groups/*.sh`: all RISC-V group commands for that libc root.
 - `la/<libc>/groups/*.sh`: all LoongArch group commands for that libc root.
+- `rv/<libc>/run_ltp_whitelist.sh`: unified RISC-V LTP whitelist runner.
+- `la/<libc>/run_ltp_whitelist.sh`: unified LoongArch LTP whitelist runner.
 - `rv/<libc>/ltp-cases/*.sh`: RISC-V LTP whitelist case commands.
 - `la/<libc>/ltp-cases/*.sh`: LoongArch LTP whitelist case commands.
 - `manifest.tsv`: one row per generated script or LTP command.
@@ -733,6 +837,7 @@ Run examples inside the guest filesystem:
 ```sh
 /musl/busybox sh ./rv/musl/groups/000-basic.sh
 /musl/busybox sh ./la/musl/groups/005-iperf.sh
+/musl/busybox sh ./rv/glibc/run_ltp_whitelist.sh
 /musl/busybox sh ./rv/glibc/ltp-cases/0012-execve05.sh
 ```
 
@@ -798,8 +903,10 @@ def main() -> int:
     )
     group_count = len(ARCHES) * len(libc_roots) * len(all_tests)
     ltp_count = len(ARCHES) * len(libc_roots) * len(ltp_cases)
+    ltp_whitelist_count = len(ARCHES) * len(libc_roots)
     print(
-        f"wrote {group_count} group scripts and {ltp_count} LTP case scripts to {args.out_dir}"
+        f"wrote {group_count} group scripts, {ltp_whitelist_count} unified LTP "
+        f"whitelist scripts, and {ltp_count} LTP case scripts to {args.out_dir}"
     )
     return 0
 

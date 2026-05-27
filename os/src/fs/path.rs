@@ -156,6 +156,10 @@ fn build_path(segments: &[&str]) -> alloc::string::String {
     }
 }
 
+/// Normalizes a path without allowing `..` to escape `floor_path`.
+///
+/// This maintains the string snapshot used by cwd/chroot-visible ABIs. It does
+/// not perform symlink expansion or mount traversal; those belong to VFS lookup.
 fn normalize_path_above_floor(
     base_path: &str,
     path: &str,
@@ -202,6 +206,9 @@ pub(crate) fn normalize_path_at_root(
 }
 
 pub(crate) fn path_inside_root(root_path: &str, path: &str) -> Option<alloc::string::String> {
+    // The returned string is the process-visible path. A path outside the
+    // current root intentionally returns None so callers can report Linux's
+    // "(unreachable)" style cwd prefix where appropriate.
     if root_path == "/" {
         return Some(alloc::string::String::from(path));
     }

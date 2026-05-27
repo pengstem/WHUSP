@@ -12,12 +12,16 @@ use crate::task::{
 use crate::trap::TrapContext;
 use core::mem::{offset_of, size_of};
 
+// Guard word checked by rt_sigreturn so a corrupted or mismatched userspace
+// signal frame is rejected before restoring TrapContext state.
 const SIGNAL_FRAME_MAGIC: usize = 0x5753_4947_4652_414d;
 const SIGNAL_STACK_ALIGN: usize = 16;
 const SA_NODEFER: usize = 0x4000_0000;
 const SA_ONSTACK: usize = 0x0800_0000;
 const SA_RESTORER: usize = 0x0400_0000;
 const SA_RESETHAND: usize = 0x8000_0000;
+// `addi a7, zero, __NR_rt_sigreturn; ecall`, written into the user frame when
+// no libc-provided restorer is available.
 const RT_SIGRETURN_TRAMPOLINE: [u32; 2] = [0x08b0_0893, 0x0000_0073];
 const LINUX_SIGSET_BYTES: usize = 128;
 

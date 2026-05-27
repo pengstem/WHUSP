@@ -25,6 +25,8 @@ pub struct MemorySet {
     // CONTEXT: contest address spaces have a small VMA count today. Keep the
     // VMA list simple until measured mmap pressure justifies an interval tree.
     pub(super) areas: Vec<MapArea>,
+    // Cached hit for repeated fault/copy probes. Any area insertion, removal,
+    // or full recycle must clear it because `areas` is stored as a sorted Vec.
     pub(super) last_area_idx_containing: Cell<Option<usize>>,
     pub(super) brk_base: usize,
     pub(super) brk: usize,
@@ -115,6 +117,8 @@ impl MemorySet {
     }
 
     pub(super) fn insert_area_sorted(&mut self, map_area: MapArea) -> usize {
+        // The binary-search lookup below depends on this sorted-by-start
+        // invariant. Use this helper instead of pushing directly into areas.
         let idx = self.area_insert_index(map_area.vpn_range.get_start());
         self.areas.insert(idx, map_area);
         self.last_area_idx_containing.set(None);

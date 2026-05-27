@@ -27,6 +27,9 @@ const LTP_RUNTEST_MANIFESTS: &[&str] = &[
 ];
 
 const INTERACTIVE_SHELL: bool = false;
+// Script-disk handoff point. The kernel assembles only the environment and the
+// final shutdown command; marker emission and per-suite shell logic live in
+// this mounted entry script.
 const SCRIPT_DISK_ENTRY: &str = "/x1/entry.sh";
 #[cfg(feature = "perf-counters")]
 const PERF_COUNTER_DUMP_COMMAND: &str = "; echo '#### KERNEL PERF START ####'; /musl/busybox cat /proc/oskernel/perf; echo '#### KERNEL PERF END ####'";
@@ -157,6 +160,8 @@ fn append_export(command: &mut String, key: &str, value: &str) {
     if !command.is_empty() {
         command.push_str("; ");
     }
+    // Values include manifest lists, filters, and whitespace-separated script
+    // names, so every runner export must pass through shell_quote().
     command.push_str("export ");
     command.push_str(key);
     command.push('=');
