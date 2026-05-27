@@ -70,9 +70,9 @@ struct MountedFs {
 }
 
 // CONTEXT: Loop-backed ext scratch mounts are tmpfs compatibility mounts until
-// real loop block mounts exist. Keep their visible capacity bounded so LTP
-// filesystem-full cases such as mmap16 can observe ENOSPC instead of spinning.
-const EXT_SCRATCH_TMPFS_QUOTA_BYTES: u64 = 64 * 1024 * 1024;
+// real loop block mounts exist. Keep their visible capacity bounded, but large
+// enough for LTP overlay tests that write distinct 64 MiB base and upper files.
+const EXT_SCRATCH_TMPFS_QUOTA_BYTES: u64 = 192 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BackendKind {

@@ -104,9 +104,10 @@ const SUPPORTED_INIT_FLAGS: u32 = FAN_CLOEXEC
     | FAN_REPORT_TID
     | FAN_REPORT_FID
     | FAN_REPORT_DIR_FID
-    | FAN_REPORT_NAME;
+    | FAN_REPORT_NAME
+    | FAN_REPORT_TARGET_FID;
 const FILE_HANDLE_REPORT_FLAGS: u32 = FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME;
-const UNSUPPORTED_REPORT_FLAGS: u32 = FAN_REPORT_FD_ERROR | FAN_REPORT_MNT | FAN_REPORT_TARGET_FID;
+const UNSUPPORTED_REPORT_FLAGS: u32 = FAN_REPORT_FD_ERROR | FAN_REPORT_MNT;
 const KNOWN_MARK_FLAGS: u32 = FAN_MARK_ADD
     | FAN_MARK_REMOVE
     | FAN_MARK_DONT_FOLLOW
@@ -228,6 +229,7 @@ struct FanotifyEvent {
     child_fid_node: Option<VfsNodeId>,
     source: Option<Arc<dyn File + Send + Sync>>,
     name: Option<String>,
+    fid_info_type: u8,
 }
 
 struct FanotifyInner {
@@ -360,6 +362,12 @@ impl FanotifyGroup {
         {
             return 0;
         }
+        if event_mask & SUPPORTED_SELF_MARK_EVENTS != 0
+            && let FanotifyMarkTarget::Inode(marked) = &mark.target
+            && *marked != node
+        {
+            return 0;
+        }
         let event_bits = event_mask & mask & SUPPORTED_MARK_EVENTS;
         if event_bits == 0 {
             return 0;
@@ -384,6 +392,7 @@ impl FanotifyGroup {
         child_fid_node: Option<VfsNodeId>,
         source: Option<Arc<dyn File + Send + Sync>>,
         name: Option<&str>,
+        fid_info_type: u8,
     ) -> bool {
         // CONTEXT: fanotify readers must tolerate that events may or may not be
         // merged. Keep ordinary coalescing O(1), but let close events merge
@@ -395,7 +404,9 @@ impl FanotifyGroup {
                 | FAN_MOVED_FROM
                 | FAN_MOVED_TO
                 | FAN_CREATE
-                | FAN_DELETE)
+                | FAN_DELETE
+                | FAN_DELETE_SELF
+                | FAN_MOVE_SELF)
             != 0
             || name.is_none();
         let existing = if merge_past_tail {
@@ -405,6 +416,7 @@ impl FanotifyGroup {
                     && event.fid_node == fid_node
                     && event.child_fid_node == child_fid_node
                     && event.name.as_deref() == name
+                    && event.fid_info_type == fid_info_type
             })
         } else {
             inner.events.back_mut().filter(|event| {
@@ -413,6 +425,7 @@ impl FanotifyGroup {
                     && event.fid_node == fid_node
                     && event.child_fid_node == child_fid_node
                     && event.name.as_deref() == name
+                    && event.fid_info_type == fid_info_type
             })
         };
         if let Some(existing) = existing {
@@ -431,6 +444,7 @@ impl FanotifyGroup {
                     child_fid_node: None,
                     source: None,
                     name: None,
+                    fid_info_type: FAN_EVENT_INFO_TYPE_FID,
                 });
                 inner.overflow_queued = true;
                 return true;
@@ -444,6 +458,7 @@ impl FanotifyGroup {
             child_fid_node,
             source,
             name: name.map(String::from),
+            fid_info_type,
         });
         true
     }
@@ -546,14 +561,42 @@ impl FanotifyGroup {
                 }
             }
             emitted &= !ignored;
+            if event_mask & SUPPORTED_SELF_MARK_EVENTS != 0
+                && !is_dir
+                && self.init_flags & FAN_REPORT_FID == 0
+            {
+                emitted &= !SUPPORTED_SELF_MARK_EVENTS;
+            }
             if emitted != 0 {
+                let is_dirent_event = event_mask & SUPPORTED_DIRENT_MARK_EVENTS != 0;
+                let is_self_event = event_mask & SUPPORTED_SELF_MARK_EVENTS != 0;
+                let is_non_dir_child_event = !is_dir && !is_self_event && child_fid_node.is_some();
                 let report_node = if self.init_flags & FAN_REPORT_DIR_FID != 0
-                    && !is_dir
-                    && child_fid_node.is_some()
+                    && is_non_dir_child_event
+                    && !is_dirent_event
                 {
                     parent.unwrap_or(report_node)
                 } else {
                     report_node
+                };
+                let child_fid_node = if is_dirent_event {
+                    child_fid_node.filter(|_| self.init_flags & FAN_REPORT_TARGET_FID != 0)
+                } else if is_non_dir_child_event {
+                    child_fid_node.filter(|_| {
+                        self.init_flags & (FAN_REPORT_FID | FAN_REPORT_DIR_FID)
+                            == (FAN_REPORT_FID | FAN_REPORT_DIR_FID)
+                    })
+                } else {
+                    None
+                };
+                let fid_info_type = if is_self_event && !is_dir {
+                    FAN_EVENT_INFO_TYPE_FID
+                } else if self.init_flags & FAN_REPORT_NAME != 0 && event_name.is_some() {
+                    FAN_EVENT_INFO_TYPE_DFID_NAME
+                } else if self.init_flags & FAN_REPORT_DIR_FID != 0 {
+                    FAN_EVENT_INFO_TYPE_DFID
+                } else {
+                    FAN_EVENT_INFO_TYPE_FID
                 };
                 let current_pid = current_process().getpid() as i32;
                 let pid = if self.unprivileged && current_pid != self.owner_pid {
@@ -577,6 +620,7 @@ impl FanotifyGroup {
                     } else {
                         None
                     },
+                    fid_info_type,
                 ) {
                     (
                         core::mem::take(&mut inner.read_waiters),
@@ -608,6 +652,7 @@ impl FanotifyGroup {
                     event.fid_node,
                     event.child_fid_node,
                     event.name.as_deref(),
+                    event.fid_info_type,
                 )
             } else {
                 0
@@ -678,6 +723,7 @@ impl FanotifyGroup {
                     event.fid_node,
                     event.child_fid_node,
                     event.name.as_deref(),
+                    event.fid_info_type,
                 );
             }
             if self.init_flags & FAN_REPORT_PIDFD != 0 {
@@ -709,11 +755,12 @@ fn report_fid_info_len(
     fid_node: Option<VfsNodeId>,
     child_fid_node: Option<VfsNodeId>,
     name: Option<&str>,
+    fid_info_type: u8,
 ) -> usize {
     if fid_node.is_none() {
         return 0;
     }
-    let name_len = if init_flags & FAN_REPORT_NAME != 0 {
+    let name_len = if fid_info_type == FAN_EVENT_INFO_TYPE_DFID_NAME {
         name.map(|name| name.len() + 1).unwrap_or(0)
     } else {
         0
@@ -733,11 +780,12 @@ fn append_report_fid_info(
     fid_node: Option<VfsNodeId>,
     child_fid_node: Option<VfsNodeId>,
     name: Option<&str>,
+    fid_info_type: u8,
 ) {
     let Some(fid_node) = fid_node else {
         return;
     };
-    let name_len = if init_flags & FAN_REPORT_NAME != 0 {
+    let name_len = if fid_info_type == FAN_EVENT_INFO_TYPE_DFID_NAME {
         name.map(|name| name.len() + 1).unwrap_or(0)
     } else {
         0
@@ -745,20 +793,14 @@ fn append_report_fid_info(
     let raw_len = FANOTIFY_FID_INFO_BASE_LEN + WHUSP_FILE_HANDLE_BYTES + name_len;
     let len = align_to_eight(raw_len);
     let mut info = vec![0; len];
-    info[0] = if init_flags & FAN_REPORT_NAME != 0 {
-        FAN_EVENT_INFO_TYPE_DFID_NAME
-    } else if init_flags & FAN_REPORT_DIR_FID != 0 {
-        FAN_EVENT_INFO_TYPE_DFID
-    } else {
-        FAN_EVENT_INFO_TYPE_FID
-    };
+    info[0] = fid_info_type;
     info[1] = 0;
     info[2..4].copy_from_slice(&(len as u16).to_ne_bytes());
     let fsid = file_handle_fsid(fid_node);
     info[4..8].copy_from_slice(&fsid[0].to_ne_bytes());
     info[8..12].copy_from_slice(&fsid[1].to_ne_bytes());
     write_file_handle_record(&mut info[12..12 + WHUSP_FILE_HANDLE_RECORD_LEN], fid_node);
-    if let Some(name) = name.filter(|_| init_flags & FAN_REPORT_NAME != 0) {
+    if let Some(name) = name.filter(|_| fid_info_type == FAN_EVENT_INFO_TYPE_DFID_NAME) {
         let name_offset = FANOTIFY_FID_INFO_BASE_LEN + WHUSP_FILE_HANDLE_BYTES;
         info[name_offset..name_offset + name.len()].copy_from_slice(name.as_bytes());
     }
@@ -1135,10 +1177,14 @@ fn fanotify_notify_file_at(
     if let Some(path) = event_path {
         remember_node_name(node, path);
     }
-    let event_name = event_path
-        .and_then(path_basename)
-        .map(String::from)
-        .or_else(|| remembered_node_name(node));
+    let event_name = if is_dir {
+        Some(String::from("."))
+    } else {
+        event_path
+            .and_then(path_basename)
+            .map(String::from)
+            .or_else(|| remembered_node_name(node))
+    };
 
     for group in live_groups {
         group.publish(
