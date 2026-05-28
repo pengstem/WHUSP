@@ -39,8 +39,9 @@ pub(crate) use inotify::{
 pub use inotify::{sys_inotify_add_watch, sys_inotify_init1, sys_inotify_rm_watch};
 pub use io::{
     sys_copy_file_range, sys_fadvise64, sys_fallocate, sys_fsync, sys_ftruncate, sys_lseek,
-    sys_pread64, sys_preadv, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read, sys_readahead,
-    sys_readv, sys_sendfile, sys_splice, sys_sync, sys_syncfs, sys_write, sys_writev,
+    sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read,
+    sys_readahead, sys_readv, sys_sendfile, sys_splice, sys_sync, sys_syncfs, sys_write,
+    sys_writev,
 };
 pub use mount::{
     sys_fsconfig, sys_fsmount, sys_fsopen, sys_fspick, sys_mount, sys_move_mount, sys_open_tree,

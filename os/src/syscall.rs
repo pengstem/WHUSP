@@ -215,6 +215,7 @@ const SYSCALL_USERFAULTFD: usize = 282;
 const SYSCALL_MEMBARRIER: usize = 283;
 const SYSCALL_MLOCK2: usize = 284;
 const SYSCALL_COPY_FILE_RANGE: usize = 285;
+const SYSCALL_PREADV2: usize = 286;
 const SYSCALL_PWRITEV2: usize = 287;
 const SYSCALL_PKEY_MPROTECT: usize = 288;
 const SYSCALL_PKEY_ALLOC: usize = 289;
@@ -534,6 +535,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4],
         ),
         SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut i64, args[3]),
+        SYSCALL_PREADV2 => sys_preadv2(
+            args[0],
+            args[1] as *const LinuxIovec,
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+        ),
         SYSCALL_PWRITEV2 => sys_pwritev2(
             args[0],
             args[1] as *const LinuxIovec,

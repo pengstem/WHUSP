@@ -69,9 +69,10 @@ A modern monolithic kernel written in Rust, dual-targeting **RISC-V 64** and **L
 
 ```bash
 docker run --rm -it \
-    --user "$(id -u):$(id -g)" -e HOME=/tmp \
+    -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
     -v "$PWD":/kernel -w /kernel --privileged \
-    zhouzhouyi/os-contest:20260104 bash
+    zhouzhouyi/os-contest:20260104 \
+    bash -lc 'chmod o+x /root && exec setpriv --reuid "$HOST_UID" --regid "$HOST_GID" --clear-groups env HOME=/tmp RUSTUP_HOME=/root/.rustup PATH="$PATH" bash'
 ```
 
 ### Build

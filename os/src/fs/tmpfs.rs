@@ -16,7 +16,10 @@ pub(super) const EXT234_SUPER_MAGIC: i64 = 0xEF53;
 const E4CRYPT_ENCRYPTED_MARKER: &str = ".whusp_e4crypt_encrypted";
 // CONTEXT: Larger sparse tmpfs files are represented by sparse extents so
 // high-offset writes do not require one huge zero-filled heap allocation.
-const TMPFS_INLINE_FILE_LIMIT: usize = 1024 * 1024;
+const TMPFS_DEFAULT_INLINE_FILE_LIMIT: usize = 1024 * 1024;
+// CONTEXT: LTP ext scratch mounts can create hundreds of small repeated-data
+// files. Make those mounts sparse from byte zero so they do not exhaust heap.
+const EXT_SCRATCH_INLINE_FILE_LIMIT: usize = 0;
 const TMPFS_SPARSE_EXTENT_LIMIT: usize = 64 * 1024;
 const TMPFS_ALLOCATED_PAYLOAD_LIMIT: usize = 64 * 1024 * 1024;
 const EXT_SCRATCH_SYNC_BYTES: u64 = 64 * 1024 * 1024;
@@ -38,6 +41,20 @@ impl TmpfsSparseExtent {
         match self {
             Self::Bytes(data) => data.len(),
             Self::Repeated { pattern, .. } => pattern.len(),
+        }
+    }
+
+    fn repeated_byte(buf: &[u8]) -> Option<Self> {
+        let (&first, rest) = buf.split_first()?;
+        if rest.iter().all(|byte| *byte == first) {
+            let mut pattern = Vec::new();
+            pattern.push(first);
+            Some(Self::Repeated {
+                pattern,
+                len: buf.len(),
+            })
+        } else {
+            None
         }
     }
 
@@ -201,6 +218,7 @@ pub(super) struct TmpFs {
     next_ino: u32,
     statfs_magic: i64,
     logical_quota_bytes: Option<u64>,
+    inline_file_limit: usize,
     synthetic_sync_loop_device: Option<usize>,
 }
 
@@ -344,8 +362,8 @@ impl TmpfsInode {
         }
     }
 
-    fn write_zero_range(&mut self, offset: u64, end: u64) {
-        if end <= TMPFS_INLINE_FILE_LIMIT as u64 {
+    fn write_zero_range(&mut self, offset: u64, end: u64, inline_file_limit: usize) {
+        if end <= inline_file_limit as u64 {
             let inline_end = end as usize;
             if self.data.len() < inline_end {
                 self.data.resize(inline_end, 0);
@@ -385,6 +403,12 @@ impl TmpfsInode {
             }
 
             let copy_len = buf.len().min(TMPFS_SPARSE_EXTENT_LIMIT);
+            if let Some(extent) = TmpfsSparseExtent::repeated_byte(&buf[..copy_len]) {
+                self.sparse_data.insert(offset, extent);
+                offset += copy_len as u64;
+                buf = &buf[copy_len..];
+                continue;
+            }
             if self.allocated_payload_len().saturating_add(copy_len) > TMPFS_ALLOCATED_PAYLOAD_LIMIT
             {
                 return false;
@@ -440,6 +464,7 @@ impl TmpFs {
         Self::new_with_statfs_magic_quota_and_synthetic_sync(
             statfs_magic,
             logical_quota_bytes,
+            TMPFS_DEFAULT_INLINE_FILE_LIMIT,
             None,
         )
     }
@@ -448,6 +473,7 @@ impl TmpFs {
         Self::new_with_statfs_magic_quota_and_synthetic_sync(
             EXT234_SUPER_MAGIC,
             logical_quota_bytes,
+            EXT_SCRATCH_INLINE_FILE_LIMIT,
             Some(loop_id),
         )
     }
@@ -455,6 +481,7 @@ impl TmpFs {
     fn new_with_statfs_magic_quota_and_synthetic_sync(
         statfs_magic: i64,
         logical_quota_bytes: Option<u64>,
+        inline_file_limit: usize,
         synthetic_sync_loop_device: Option<usize>,
     ) -> Self {
         let mut inodes = BTreeMap::new();
@@ -467,6 +494,7 @@ impl TmpFs {
             next_ino: ROOT_INO + 1,
             statfs_magic,
             logical_quota_bytes,
+            inline_file_limit,
             synthetic_sync_loop_device,
         }
     }
@@ -930,6 +958,7 @@ impl FileSystemBackend for TmpFs {
     }
 
     fn set_len(&mut self, ino: u32, len: u64) -> FsResult {
+        let inline_file_limit = self.inline_file_limit;
         let inode = self.inode_mut(ino)?;
         if inode.kind == FsNodeKind::Directory {
             return Err(FsError::IsDir);
@@ -938,7 +967,7 @@ impl FileSystemBackend for TmpFs {
             inode.clear_payload();
         } else if len < inode.size {
             inode.truncate_sparse_to(len);
-            if len as usize <= TMPFS_INLINE_FILE_LIMIT {
+            if len as usize <= inline_file_limit {
                 inode.data.resize(len as usize, 0);
             } else if inode.data.len() as u64 > len {
                 inode.data.truncate(len as usize);
@@ -1106,6 +1135,7 @@ impl FileSystemBackend for TmpFs {
         let Some(end) = offset.checked_add(buf.len() as u64) else {
             return 0;
         };
+        let inline_file_limit = self.inline_file_limit;
         let Ok(inode) = self.inode_mut(ino) else {
             return 0;
         };
@@ -1113,7 +1143,7 @@ impl FileSystemBackend for TmpFs {
             return 0;
         }
         if buf.iter().all(|byte| *byte == 0) {
-            if offset >= TMPFS_INLINE_FILE_LIMIT as u64 {
+            if offset >= inline_file_limit as u64 {
                 // CONTEXT: user writes can be split at page boundaries. Keeping a
                 // zero tail contiguous lets repeated-page payloads compress.
                 if let Some(appended) = inode.append_sparse_tail(offset, buf) {
@@ -1122,7 +1152,7 @@ impl FileSystemBackend for TmpFs {
                     }
                     if appended < buf.len() {
                         let zero_start = offset + appended as u64;
-                        inode.write_zero_range(zero_start, end);
+                        inode.write_zero_range(zero_start, end, inline_file_limit);
                     }
                     if end > inode.size {
                         inode.size = end;
@@ -1131,7 +1161,7 @@ impl FileSystemBackend for TmpFs {
                     return buf.len();
                 }
             }
-            inode.write_zero_range(offset, end);
+            inode.write_zero_range(offset, end, inline_file_limit);
             if end > inode.size {
                 inode.size = end;
             }
@@ -1141,9 +1171,9 @@ impl FileSystemBackend for TmpFs {
 
         let mut sparse_offset = offset;
         let mut sparse_buf = buf;
-        if offset < TMPFS_INLINE_FILE_LIMIT as u64 {
+        if offset < inline_file_limit as u64 {
             let start = offset as usize;
-            let inline_end = end.min(TMPFS_INLINE_FILE_LIMIT as u64) as usize;
+            let inline_end = end.min(inline_file_limit as u64) as usize;
             if inline_end > inode.data.len() {
                 let extra = inline_end - inode.data.len();
                 if inode.allocated_payload_len().saturating_add(extra)
