@@ -1,6 +1,11 @@
 // Linux generic syscall numbers used by both contest RISC-V and LoongArch
 // ABIs. Keep this table aligned with the userspace libc headers, not with
 // local implementation order.
+const SYSCALL_IO_SETUP: usize = 0;
+const SYSCALL_IO_DESTROY: usize = 1;
+const SYSCALL_IO_SUBMIT: usize = 2;
+const SYSCALL_IO_CANCEL: usize = 3;
+const SYSCALL_IO_GETEVENTS: usize = 4;
 const SYSCALL_SETXATTR: usize = 5;
 const SYSCALL_LSETXATTR: usize = 6;
 const SYSCALL_FSETXATTR: usize = 7;
@@ -221,8 +226,11 @@ const SYSCALL_PKEY_MPROTECT: usize = 288;
 const SYSCALL_PKEY_ALLOC: usize = 289;
 const SYSCALL_PKEY_FREE: usize = 290;
 const SYSCALL_STATX: usize = 291;
+const SYSCALL_IO_PGETEVENTS: usize = 292;
 const SYSCALL_PIDFD_SEND_SIGNAL: usize = 424;
 const SYSCALL_IO_URING_SETUP: usize = 425;
+const SYSCALL_IO_URING_ENTER: usize = 426;
+const SYSCALL_IO_URING_REGISTER: usize = 427;
 const SYSCALL_OPEN_TREE: usize = 428;
 const SYSCALL_MOVE_MOUNT: usize = 429;
 const SYSCALL_FSOPEN: usize = 430;
@@ -236,6 +244,7 @@ const SYSCALL_FACCESSAT2: usize = 439;
 const SYSCALL_EPOLL_PWAIT2: usize = 441;
 const SYSCALL_MEMFD_SECRET: usize = 447;
 
+mod aio;
 pub(crate) mod errno;
 mod fs;
 mod futex;
@@ -252,6 +261,7 @@ pub(crate) mod user_ptr;
 mod wait;
 
 use crate::task::{RLimit, SeccompSockFilter, SignalFlags, current_add_signal, current_task};
+use aio::*;
 use errno::{SysError, ret};
 use fs::*;
 use futex::*;
@@ -266,6 +276,7 @@ use time::*;
 use uapi::LinuxTimeSpec;
 use wait::*;
 
+pub(crate) use aio::aio_max_nr_content;
 pub(crate) use fs::{
     INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES,
     close_detached_fd_entry, fanotify_evict_evictable_marks, fanotify_fdinfo,
@@ -365,6 +376,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     }
 
     ret(match syscall_id {
+        SYSCALL_IO_SETUP => sys_io_setup(args[0], args[1] as *mut usize),
+        SYSCALL_IO_DESTROY => sys_io_destroy(args[0]),
+        SYSCALL_IO_SUBMIT => sys_io_submit(args[0], args[1] as isize, args[2] as *const _),
+        SYSCALL_IO_CANCEL => sys_io_cancel(args[0], args[1] as *const _, args[2] as *mut _),
+        SYSCALL_IO_GETEVENTS => sys_io_getevents(
+            args[0],
+            args[1] as isize,
+            args[2] as isize,
+            args[3] as *mut _,
+            args[4] as *const u8,
+        ),
         SYSCALL_SETXATTR => sys_setxattr(
             args[0] as *const u8,
             args[1] as *const u8,
@@ -650,6 +672,24 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FSMOUNT => sys_fsmount(args[0] as isize, args[1] as u32, args[2] as u32),
         SYSCALL_FSPICK => sys_fspick(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_IO_URING_SETUP => sys_io_uring_setup(args[0] as u32, args[1] as *mut u8),
+        SYSCALL_IO_URING_ENTER => sys_io_uring_enter(
+            args[0],
+            args[1] as u32,
+            args[2] as u32,
+            args[3] as u32,
+            args[4],
+        ),
+        SYSCALL_IO_URING_REGISTER => {
+            sys_io_uring_register(args[0], args[1] as u32, args[2], args[3] as u32)
+        }
+        SYSCALL_IO_PGETEVENTS => sys_io_pgetevents(
+            args[0],
+            args[1] as isize,
+            args[2] as isize,
+            args[3] as *mut _,
+            args[4] as *const u8,
+            args[5] as *const u8,
+        ),
         SYSCALL_WAITID => sys_waitid(
             args[0] as i32,
             args[1] as i32,

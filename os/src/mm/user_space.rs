@@ -656,6 +656,49 @@ impl MemorySet {
         Some((start, flushes))
     }
 
+    pub fn mmap_shared_frames_area(
+        &mut self,
+        len: usize,
+        permission: MapPermission,
+        reported_permission: MapPermission,
+        backing_file: Arc<dyn File + Send + Sync>,
+        pages: &[crate::mm::shm::ShmPageMapping],
+    ) -> Option<usize> {
+        let map_len = checked_page_align_up(len)?;
+        let start = self.alloc_mmap_range(map_len)?;
+        let end = start.checked_add(map_len)?;
+        let start_vpn = VirtAddr::from(start).floor();
+        let mut area = MapArea::new(start.into(), end.into(), MapType::Framed, permission);
+        area.mmap_info = Some(MmapInfo {
+            shared: true,
+            writable: permission.contains(MapPermission::W),
+            grow_down: false,
+            reported_perm: reported_permission,
+            len,
+            file_offset: 0,
+            file_size: len,
+            backing_file: Some(backing_file),
+            page_cache_id: None,
+            page_cache_pages: BTreeMap::new(),
+            exec_segment: None,
+        });
+        apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
+        for mapping in pages {
+            if mapping.page_index >= map_len / PAGE_SIZE {
+                continue;
+            }
+            let vpn = VirtPageNum(start_vpn.0 + mapping.page_index);
+            let frame = FrameTracker::from_retained(mapping.ppn)?;
+            if !area.map_existing_frame(&mut self.page_table, vpn, frame) {
+                area.unmap_resident(&mut self.page_table);
+                return None;
+            }
+        }
+        self.insert_area_sorted(area);
+        self.mmap_next = next_mmap_hint(end);
+        Some(start)
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "ELF segment mapping keeps loader-provided segment metadata explicit"

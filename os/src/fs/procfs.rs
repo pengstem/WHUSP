@@ -92,6 +92,7 @@ const MSGMNB_INO: u32 = 57;
 const MSG_NEXT_ID_INO: u32 = 58;
 const SEM_SYSCTL_INO: u32 = 59;
 const PRINTK_INO: u32 = 60;
+const AIO_MAX_NR_INO: u32 = 61;
 // CONTEXT: Dynamic /proc inode ranges must stay disjoint even after long test
 // runs allocate five-digit PIDs; LTP probes /proc/<ppid>/stat during waits.
 const PID_DIR_BASE: u32 = 100;
@@ -146,8 +147,8 @@ const ROOT_UTS_NAMESPACE_ID: usize = 1;
 const PROC_CONFIG_GZ: &[u8] = &[
     0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x73, 0xf6, 0xf7, 0x73, 0xf3, 0x74,
     0x8f, 0x0f, 0xf0, 0x74, 0x89, 0xf7, 0x0b, 0xb6, 0xad, 0xe4, 0x72, 0x86, 0xf0, 0x9d, 0x3d, 0x5c,
-    0x9d, 0xbd, 0x03, 0xfc, 0x3d, 0xfd, 0x42, 0xe2, 0x83, 0x5c, 0x83, 0x43, 0xfc, 0x83, 0x5c, 0x81,
-    0x72, 0x00, 0x6b, 0x61, 0x34, 0x95, 0x2c, 0x00, 0x00, 0x00,
+    0x9d, 0xbd, 0x03, 0xfc, 0x3d, 0xfd, 0x42, 0xe2, 0x83, 0x5c, 0x83, 0x43, 0xfc, 0x83, 0x5c, 0x11,
+    0x72, 0x8e, 0x9e, 0xfe, 0x40, 0x0e, 0x00, 0xcf, 0xf9, 0x5d, 0x5b, 0x39, 0x00, 0x00, 0x00,
 ];
 
 static PROC_PID_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_PID_MAX);
@@ -238,6 +239,7 @@ enum ProcNode {
     MsgMax,
     MsgMnb,
     MsgNextId,
+    AioMaxNr,
     Domainname,
     Tainted,
     PidDir(usize),
@@ -510,6 +512,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         MSGMAX_INO => Some(ProcNode::MsgMax),
         MSGMNB_INO => Some(ProcNode::MsgMnb),
         MSG_NEXT_ID_INO => Some(ProcNode::MsgNextId),
+        AIO_MAX_NR_INO => Some(ProcNode::AioMaxNr),
         SYS_NET_IPV4_CONF_LO_TAG_INO => Some(ProcNode::NetIpv4ConfLoTag),
         SYS_NET_IPV4_CONF_DEFAULT_TAG_INO => Some(ProcNode::NetIpv4ConfDefaultTag),
         KEYS_GC_DELAY_INO => Some(ProcNode::KeysGcDelay),
@@ -921,6 +924,11 @@ fn sys_fs_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: LEASE_BREAK_TIME_INO,
         name: "lease-break-time".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: AIO_MAX_NR_INO,
+        name: "aio-max-nr".into(),
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
@@ -2081,6 +2089,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::MsgNextId => {
             Ok(format!("{}\n", crate::syscall::msg::current_msg_next_id()).into_bytes())
         }
+        ProcNode::AioMaxNr => Ok(crate::syscall::aio_max_nr_content().as_bytes().to_vec()),
         ProcNode::KeysGcDelay => Ok(keyring::key_gc_delay_content().into_bytes()),
         ProcNode::KeysMaxkeys => Ok(keyring::key_maxkeys_content().into_bytes()),
         ProcNode::KeysMaxbytes => Ok(keyring::key_maxbytes_content().into_bytes()),
@@ -2360,6 +2369,7 @@ impl FileSystemBackend for ProcFs {
                 "pipe-max-size" => Ok((PIPE_MAX_SIZE_INO, FsNodeKind::RegularFile)),
                 "pipe-user-pages-soft" => Ok((PIPE_USER_PAGES_SOFT_INO, FsNodeKind::RegularFile)),
                 "lease-break-time" => Ok((LEASE_BREAK_TIME_INO, FsNodeKind::RegularFile)),
+                "aio-max-nr" => Ok((AIO_MAX_NR_INO, FsNodeKind::RegularFile)),
                 "fanotify" => Ok((SYS_FS_FANOTIFY_DIR_INO, FsNodeKind::Directory)),
                 "inotify" => Ok((SYS_FS_INOTIFY_DIR_INO, FsNodeKind::Directory)),
                 _ => Err(FsError::NotFound),

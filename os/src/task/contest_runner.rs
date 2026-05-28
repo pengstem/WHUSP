@@ -79,7 +79,7 @@ const TEST_SCRIPTS: &[&str] = &[
 // CONTEXT: Non-None filters are development slices. They narrow LTP case
 // execution while leaving outer group markers intact, so always check this
 // constant before treating a score log as submission-wide evidence.
-const LTP_CASE_FILTER_OPTION: Option<&str> = Some("prefix:ftrun");
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some("prefix:kcmp");
 
 #[cfg(target_arch = "riscv64")]
 const RUNNER_ARCH: &str = "rv";

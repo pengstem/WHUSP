@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
 
 use super::errno::{SysError, SysResult};
-use super::fs::get_file_by_fd;
+use super::fs::{get_file_by_fd, io_uring_mmap_region};
 
 const PROT_READ: usize = 0x1;
 const PROT_WRITE: usize = 0x2;
@@ -335,6 +335,24 @@ fn sys_mmap_impl(
         }
         if shared && writable && !file.writable() {
             return Err(SysError::EACCES);
+        }
+        if let Some((pages, max_size)) = io_uring_mmap_region(&file, offset) {
+            if !shared || fixed || len == 0 || len > max_size {
+                return Err(SysError::EINVAL);
+            }
+            let process = current_process();
+            let mut inner = process.inner_exclusive_access();
+            let mapped_addr = inner
+                .memory_set
+                .mmap_shared_frames_area(
+                    len,
+                    hardware_permission,
+                    reported_permission,
+                    file,
+                    &pages,
+                )
+                .ok_or(SysError::ENOMEM)?;
+            return Ok(mapped_addr);
         }
         if shared && writable && file.blocks_shared_writable_mmap() {
             return Err(SysError::EPERM);
