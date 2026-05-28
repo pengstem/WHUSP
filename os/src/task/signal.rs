@@ -23,10 +23,15 @@ pub const SS_ONSTACK: i32 = 1;
 pub const SS_DISABLE: i32 = 2;
 pub const MINSIGSTKSZ: usize = 2048;
 
+/// Converts the Linux sigset ABI bitmap into the internal signum-indexed set.
+///
+/// Linux bit 0 represents signal 1, while `SignalFlags` reserves bit N for
+/// signum N. Keep the shift paired with `flags_to_linux_sigset()`.
 pub(crate) fn linux_sigset_to_flags(raw: u64) -> SignalFlags {
     SignalFlags::from_bits_retain((raw as u128) << 1)
 }
 
+/// Converts the internal signum-indexed signal set back to Linux sigset bits.
 pub(crate) fn flags_to_linux_sigset(flags: SignalFlags) -> u64 {
     (flags.bits() >> 1) as u64
 }

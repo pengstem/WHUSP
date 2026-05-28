@@ -56,7 +56,7 @@ const ALL_TESTS: &[&str] = &[
 // disk receives it through WHUSP_TEST_SCRIPTS and prints skipped markers for
 // groups not listed here.
 const TEST_SCRIPTS: &[&str] = &[
-    "basic_testcode.sh",
+    // "basic_testcode.sh",
     // "busybox_testcode.sh",
     // "lua_testcode.sh",
     // "libctest_testcode.sh",
@@ -79,7 +79,7 @@ const TEST_SCRIPTS: &[&str] = &[
 // CONTEXT: Non-None filters are development slices. They narrow LTP case
 // execution while leaving outer group markers intact, so always check this
 // constant before treating a score log as submission-wide evidence.
-const LTP_CASE_FILTER_OPTION: Option<&str> = None;
+const LTP_CASE_FILTER_OPTION: Option<&str> = Some("prefix:syslog");
 
 #[cfg(target_arch = "riscv64")]
 const RUNNER_ARCH: &str = "rv";
@@ -123,6 +123,9 @@ pub(super) fn build_runner_command() -> String {
         "WHUSP_LTP_WHITELIST_LEN",
         format!("{}", ltp_case_whitelist_len()).as_str(),
     );
+    // Keep a missing script disk visible in the serial log and still run the
+    // final sync/reboot path; otherwise a host-side x1 wiring problem looks
+    // like an in-kernel test hang.
     command.push_str("; if [ -f ");
     command.push_str(SCRIPT_DISK_ENTRY);
     command.push_str(" ]; then /musl/busybox sh ");

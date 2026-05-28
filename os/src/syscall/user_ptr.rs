@@ -136,6 +136,9 @@ fn try_same_page_user_slice(
     access: UserBufferAccess,
     fault_handler: Option<UserFaultHandler>,
 ) -> Option<SysResult<&'static mut [u8]>> {
+    // This is only an allocation-saving fast path for short ABI scalars. It
+    // still goes through checked_user_pte(), so permission, COW, and optional
+    // mmap-fault behavior match the multi-page copy path.
     if len == 0 || len > USER_COPY_SAME_PAGE_FAST_MAX {
         return None;
     }

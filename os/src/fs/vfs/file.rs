@@ -205,6 +205,8 @@ impl VfsFile {
         let node = path.node;
         let kind = path.kind;
         let visible_path = path.visible_path;
+        // An open file description pins its backend inode even if the path is
+        // later unlinked. Keep this retain paired with Drop's release path.
         with_mount(node.mount_id, |mount| mount.retain_inode(node.ino)).ok_or(FsError::Io)??;
         track_writable_regular_open(node, kind, writable);
         let file = Self {
@@ -1135,6 +1137,9 @@ impl File for VfsFile {
             })
             .ok_or(FsError::Io)??;
             if read_size == 0 {
+                // Synthetic mountpoint dirents are appended after backend EOF
+                // and resume from a disjoint high offset range, so real
+                // filesystem offsets never collide with VFS overlay entries.
                 self.read_synthetic_dirent64(0, &mut kernel_buf)?
             } else {
                 (read_size, next_offset)

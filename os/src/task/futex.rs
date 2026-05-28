@@ -432,6 +432,9 @@ fn futex_key_for_process(addr: usize, private: bool, process_id: usize) -> Futex
 }
 
 fn validate_futex_addr(addr: usize) -> SysResult {
+    // Linux futex operations address a naturally aligned 32-bit user word.
+    // Reject unaligned addresses before any user access so EINVAL is not
+    // hidden behind a later EFAULT from the copy helper.
     if addr % core::mem::size_of::<u32>() != 0 {
         return Err(SysError::EINVAL);
     }

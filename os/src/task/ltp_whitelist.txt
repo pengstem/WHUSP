@@ -83,6 +83,8 @@ chmod01
 fanotify19
 bind04
 mmap04
+syslog11
+syslog12
 semctl01
 stat01_64
 access04

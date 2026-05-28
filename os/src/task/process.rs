@@ -881,6 +881,9 @@ impl ProcessControlBlock {
     }
 
     pub(crate) fn path_snapshot(&self) -> PathSnapshot {
+        // Snapshot lookup identity and visible path strings under the PCB lock,
+        // then let syscall path code release it before touching fd tables or
+        // VFS backends.
         let inner = self.inner.exclusive_access();
         PathSnapshot {
             context: inner.fs.path_context(),

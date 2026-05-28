@@ -69,7 +69,8 @@
 
 ```bash
 docker run --rm -it \
-    -v $PWD:/kernel -w /kernel --privileged \
+    --user "$(id -u):$(id -g)" -e HOME=/tmp \
+    -v "$PWD":/kernel -w /kernel --privileged \
     zhouzhouyi/os-contest:20260104 bash
 ```
 

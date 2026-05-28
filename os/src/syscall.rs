@@ -272,6 +272,7 @@ pub(crate) use fs::{
     release_flock_locks_for_closed_fd_table, release_record_locks_for_process,
 };
 pub(crate) use process::pidfd_fdinfo;
+pub(crate) use process::{proc_sys_kernel_printk_content, write_proc_sys_kernel_printk};
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 pub(crate) use wait::LinuxSigInfo;
 

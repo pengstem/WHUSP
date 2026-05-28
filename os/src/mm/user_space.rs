@@ -1433,6 +1433,10 @@ impl MemorySet {
             return;
         }
         if let Some(right) = self.areas[idx].split_off(at) {
+            // Insert the right half immediately after the left half to preserve
+            // the sorted VMA invariant used by find_area_idx_containing().
+            // The cached index is range-checked before reuse, so a stale hit
+            // after splitting can only degrade to a normal binary search.
             self.areas.insert(idx + 1, right);
         }
     }

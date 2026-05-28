@@ -91,6 +91,7 @@ const MSGMAX_INO: u32 = 56;
 const MSGMNB_INO: u32 = 57;
 const MSG_NEXT_ID_INO: u32 = 58;
 const SEM_SYSCTL_INO: u32 = 59;
+const PRINTK_INO: u32 = 60;
 // CONTEXT: Dynamic /proc inode ranges must stay disjoint even after long test
 // runs allocate five-digit PIDs; LTP probes /proc/<ppid>/stat during waits.
 const PID_DIR_BASE: u32 = 100;
@@ -206,6 +207,7 @@ enum ProcNode {
     ShmAll,
     ShmNextId,
     SemSysctl,
+    Printk,
     PipeMaxSize,
     PipeUserPagesSoft,
     LeaseBreakTime,
@@ -503,6 +505,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         SHMALL_INO => Some(ProcNode::ShmAll),
         SHM_NEXT_ID_INO => Some(ProcNode::ShmNextId),
         SEM_SYSCTL_INO => Some(ProcNode::SemSysctl),
+        PRINTK_INO => Some(ProcNode::Printk),
         MSGMNI_INO => Some(ProcNode::MsgMni),
         MSGMAX_INO => Some(ProcNode::MsgMax),
         MSGMNB_INO => Some(ProcNode::MsgMnb),
@@ -1023,6 +1026,11 @@ fn sys_kernel_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: SEM_SYSCTL_INO,
         name: "sem".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: PRINTK_INO,
+        name: "printk".into(),
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
@@ -2063,6 +2071,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
             Ok(format!("{}\n", crate::mm::shm::current_shm_next_id()).into_bytes())
         }
         ProcNode::SemSysctl => Ok(crate::syscall::sem::sysctl_sem_content().into_bytes()),
+        ProcNode::Printk => Ok(crate::syscall::proc_sys_kernel_printk_content().into_bytes()),
         ProcNode::SysVipcShm => Ok(crate::mm::shm::proc_sysvipc_shm_content().into_bytes()),
         ProcNode::SysVipcSem => Ok(crate::syscall::sem::proc_sysvipc_sem_content().into_bytes()),
         ProcNode::SysVipcMsg => Ok(crate::syscall::msg::proc_sysvipc_msg_content().into_bytes()),
@@ -2316,6 +2325,7 @@ impl FileSystemBackend for ProcFs {
                 "shmall" => Ok((SHMALL_INO, FsNodeKind::RegularFile)),
                 "shm_next_id" => Ok((SHM_NEXT_ID_INO, FsNodeKind::RegularFile)),
                 "sem" => Ok((SEM_SYSCTL_INO, FsNodeKind::RegularFile)),
+                "printk" => Ok((PRINTK_INO, FsNodeKind::RegularFile)),
                 "msgmni" => Ok((MSGMNI_INO, FsNodeKind::RegularFile)),
                 "msgmax" => Ok((MSGMAX_INO, FsNodeKind::RegularFile)),
                 "msgmnb" => Ok((MSGMNB_INO, FsNodeKind::RegularFile)),
@@ -2551,6 +2561,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::MsgMax
             | ProcNode::MsgMnb
             | ProcNode::MsgNextId
+            | ProcNode::Printk
             | ProcNode::KeysGcDelay
             | ProcNode::KeysMaxkeys
             | ProcNode::KeysMaxbytes
@@ -2612,6 +2623,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::MsgMax
             | ProcNode::MsgMnb
             | ProcNode::MsgNextId
+            | ProcNode::Printk
             | ProcNode::KeysGcDelay
             | ProcNode::KeysMaxkeys
             | ProcNode::KeysMaxbytes
@@ -2718,6 +2730,7 @@ impl FileSystemBackend for ProcFs {
                 write_msg_usize_sysctl(buf, offset, crate::syscall::msg::set_msgmnb)
             }
             Some(ProcNode::MsgNextId) => write_msg_next_id(buf, offset),
+            Some(ProcNode::Printk) => crate::syscall::write_proc_sys_kernel_printk(buf, offset),
             Some(ProcNode::KeysGcDelay) => keyring::write_key_gc_delay(buf, offset),
             Some(ProcNode::KeysMaxkeys) => keyring::write_key_maxkeys(buf, offset),
             Some(ProcNode::KeysMaxbytes) => keyring::write_key_maxbytes(buf, offset),
