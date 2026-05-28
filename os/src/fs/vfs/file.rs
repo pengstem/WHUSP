@@ -1083,6 +1083,55 @@ impl File for VfsFile {
         .ok_or(FsError::Io)?
     }
 
+    fn allocate_range(&self, offset: usize, len: usize, keep_size: bool) -> FsResult {
+        if self.kind != FsNodeKind::RegularFile {
+            return Err(FsError::InvalidInput);
+        }
+        if !self.writable {
+            return Err(FsError::PermissionDenied);
+        }
+        self.check_write_at(offset, len)?;
+        invalidate_regular_file_read_cache(self.node, self.kind);
+        with_mount(self.node.mount_id, |mount| {
+            mount.allocate_range(self.node.ino, offset as u64, len as u64, keep_size)
+        })
+        .ok_or(FsError::Io)?
+    }
+
+    fn zero_range(&self, offset: usize, len: usize, keep_size: bool) -> FsResult {
+        if self.kind != FsNodeKind::RegularFile {
+            return Err(FsError::InvalidInput);
+        }
+        if !self.writable {
+            return Err(FsError::PermissionDenied);
+        }
+        self.check_write_at(offset, len)?;
+        invalidate_regular_file_read_cache(self.node, self.kind);
+        with_mount(self.node.mount_id, |mount| {
+            mount.zero_range(self.node.ino, offset as u64, len as u64, keep_size)
+        })
+        .ok_or(FsError::Io)?
+    }
+
+    fn punch_hole(&self, offset: usize, len: usize) -> FsResult {
+        if self.kind != FsNodeKind::RegularFile {
+            return Err(FsError::InvalidInput);
+        }
+        if !self.writable {
+            return Err(FsError::PermissionDenied);
+        }
+        ensure_mount_writable(self.node.mount_id)?;
+        let flags = self.inode_flags_or_empty()?;
+        if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
+            return Err(FsError::PermissionDenied);
+        }
+        invalidate_regular_file_read_cache(self.node, self.kind);
+        with_mount(self.node.mount_id, |mount| {
+            mount.punch_hole(self.node.ino, offset as u64, len as u64)
+        })
+        .ok_or(FsError::Io)?
+    }
+
     fn sync(&self, data_only: bool) -> FsResult {
         with_mount(self.node.mount_id, |mount| {
             mount.sync(self.node.ino, data_only)

@@ -93,6 +93,22 @@ pub(crate) trait FileSystemBackend: Send {
         Ok(())
     }
     fn set_len(&mut self, ino: u32, len: u64) -> FsResult;
+    fn allocate_range(&mut self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
+        let end = offset.checked_add(len).ok_or(FsError::InvalidInput)?;
+        if !keep_size {
+            let stat = self.stat(ino)?;
+            if end > stat.size {
+                self.set_len(ino, end)?;
+            }
+        }
+        Ok(())
+    }
+    fn zero_range(&mut self, _ino: u32, _offset: u64, _len: u64, _keep_size: bool) -> FsResult {
+        Err(FsError::Unsupported)
+    }
+    fn punch_hole(&mut self, _ino: u32, _offset: u64, _len: u64) -> FsResult {
+        Err(FsError::Unsupported)
+    }
     fn sync(&mut self, _ino: u32, _data_only: bool) -> FsResult {
         Ok(())
     }

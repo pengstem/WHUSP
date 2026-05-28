@@ -269,6 +269,104 @@ pub trait File: Send + Sync {
     fn set_len(&self, _len: usize) -> FsResult {
         Err(FsError::Unsupported)
     }
+    fn allocate_range(&self, offset: usize, len: usize, keep_size: bool) -> FsResult {
+        let end = offset.checked_add(len).ok_or(FsError::InvalidInput)?;
+        let current_size = usize::try_from(self.stat()?.size).map_err(|_| FsError::InvalidInput)?;
+        if !keep_size && end > current_size {
+            self.check_set_len(end)?;
+            self.set_len(end)?;
+        }
+        Ok(())
+    }
+    fn zero_range(&self, _offset: usize, _len: usize, _keep_size: bool) -> FsResult {
+        Err(FsError::Unsupported)
+    }
+    fn punch_hole(&self, _offset: usize, _len: usize) -> FsResult {
+        Err(FsError::Unsupported)
+    }
+    fn collapse_range(&self, offset: usize, len: usize) -> FsResult {
+        if !self.writable() {
+            return Err(FsError::PermissionDenied);
+        }
+        let stat = self.stat()?;
+        if stat.mode & S_IFMT != S_IFREG {
+            return Err(FsError::InvalidInput);
+        }
+        let size = usize::try_from(stat.size).map_err(|_| FsError::InvalidInput)?;
+        let end = offset.checked_add(len).ok_or(FsError::InvalidInput)?;
+        if end >= size {
+            return Err(FsError::InvalidInput);
+        }
+        let new_size = size - len;
+        self.check_set_len(new_size)?;
+
+        let mut buffer = Vec::new();
+        if buffer.try_reserve(64 * 1024).is_err() {
+            return Err(FsError::NoSpace);
+        }
+        buffer.resize(64 * 1024, 0);
+
+        let mut read_offset = end;
+        let mut write_offset = offset;
+        while read_offset < size {
+            let want = buffer.len().min(size - read_offset);
+            buffer[..want].fill(0);
+            let read_len = self.read_at(read_offset, &mut buffer[..want]);
+            if read_len == 0 {
+                return Err(FsError::Io);
+            }
+            let written = self.write_at(write_offset, &buffer[..read_len]);
+            if written != read_len {
+                return Err(FsError::Io);
+            }
+            read_offset += read_len;
+            write_offset += read_len;
+        }
+
+        self.set_len(new_size)
+    }
+    fn insert_range(&self, offset: usize, len: usize) -> FsResult {
+        if !self.writable() {
+            return Err(FsError::PermissionDenied);
+        }
+        let stat = self.stat()?;
+        if stat.mode & S_IFMT != S_IFREG {
+            return Err(FsError::InvalidInput);
+        }
+        let size = usize::try_from(stat.size).map_err(|_| FsError::InvalidInput)?;
+        if offset >= size {
+            return Err(FsError::InvalidInput);
+        }
+        let new_size = size.checked_add(len).ok_or(FsError::InvalidInput)?;
+        self.check_set_len(new_size)?;
+        self.punch_hole(offset, 0)?;
+        self.set_len(new_size)?;
+
+        let mut buffer = Vec::new();
+        if buffer.try_reserve(64 * 1024).is_err() {
+            return Err(FsError::NoSpace);
+        }
+        buffer.resize(64 * 1024, 0);
+
+        let mut remaining = size - offset;
+        while remaining > 0 {
+            let chunk_len = buffer.len().min(remaining);
+            let read_offset = offset + remaining - chunk_len;
+            let write_offset = read_offset + len;
+            buffer[..chunk_len].fill(0);
+            let read_len = self.read_at(read_offset, &mut buffer[..chunk_len]);
+            if read_len != chunk_len {
+                return Err(FsError::Io);
+            }
+            let written = self.write_at(write_offset, &buffer[..read_len]);
+            if written != read_len {
+                return Err(FsError::Io);
+            }
+            remaining -= chunk_len;
+        }
+
+        self.punch_hole(offset, len)
+    }
     /// Preflight write hooks default to success; constrained files override.
     fn check_write(&self, _len: usize, _append: bool) -> FsResult {
         Ok(())

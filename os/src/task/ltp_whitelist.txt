@@ -628,6 +628,10 @@ rename04
 sendfile08
 pipe15
 pipe06
+fallocate03
+fallocate04
+fallocate05
+fallocate06
 sem_nstest_none
 getxattr03
 sendfile06_64

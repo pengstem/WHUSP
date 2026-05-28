@@ -47,15 +47,19 @@ impl TmpfsSparseExtent {
     fn repeated_byte(buf: &[u8]) -> Option<Self> {
         let (&first, rest) = buf.split_first()?;
         if rest.iter().all(|byte| *byte == first) {
-            let mut pattern = Vec::new();
-            pattern.push(first);
-            Some(Self::Repeated {
-                pattern,
-                len: buf.len(),
-            })
+            Self::repeated_value(first, buf.len())
         } else {
             None
         }
+    }
+
+    fn repeated_value(value: u8, len: usize) -> Option<Self> {
+        if len == 0 {
+            return None;
+        }
+        let mut pattern = Vec::new();
+        pattern.push(value);
+        Some(Self::Repeated { pattern, len })
     }
 
     fn matching_pattern_prefix(pattern: &[u8], pattern_offset: usize, buf: &[u8]) -> usize {
@@ -362,14 +366,105 @@ impl TmpfsInode {
         }
     }
 
-    fn write_zero_range(&mut self, offset: u64, end: u64, inline_file_limit: usize) {
+    fn insert_zero_extent(&mut self, offset: u64, end: u64) {
+        if offset >= end {
+            return;
+        }
+        let len = (end - offset) as usize;
+        if let Some(extent) = TmpfsSparseExtent::repeated_value(0, len) {
+            self.sparse_data.insert(offset, extent);
+        }
+    }
+
+    fn reserve_zero_range(&mut self, offset: u64, end: u64, inline_file_limit: usize) -> bool {
+        if offset >= end {
+            return true;
+        }
+        if offset < inline_file_limit as u64 {
+            let inline_end = end.min(inline_file_limit as u64) as usize;
+            if self.data.len() < inline_end {
+                let extra = inline_end - self.data.len();
+                if self.allocated_payload_len().saturating_add(extra)
+                    > TMPFS_ALLOCATED_PAYLOAD_LIMIT
+                    || self.data.try_reserve(extra).is_err()
+                {
+                    return false;
+                }
+                self.data.resize(inline_end, 0);
+            }
+        }
+
+        let sparse_start = offset.max(inline_file_limit as u64);
+        if sparse_start >= end {
+            return true;
+        }
+        let mut allocated = Vec::new();
+        for (&extent_start, extent) in self.sparse_data.range(..end) {
+            let extent_end = extent_start.saturating_add(extent.len() as u64);
+            if extent_end > sparse_start {
+                allocated.push((extent_start.max(sparse_start), extent_end.min(end)));
+            }
+        }
+
+        let mut cursor = sparse_start;
+        for (allocated_start, allocated_end) in allocated {
+            if cursor < allocated_start {
+                self.insert_zero_extent(cursor, allocated_start);
+            }
+            cursor = cursor.max(allocated_end);
+        }
+        if cursor < end {
+            self.insert_zero_extent(cursor, end);
+        }
+        true
+    }
+
+    fn write_zero_range(&mut self, offset: u64, end: u64, inline_file_limit: usize) -> bool {
         if end <= inline_file_limit as u64 {
             let inline_end = end as usize;
             if self.data.len() < inline_end {
+                let extra = inline_end - self.data.len();
+                if self.allocated_payload_len().saturating_add(extra)
+                    > TMPFS_ALLOCATED_PAYLOAD_LIMIT
+                    || self.data.try_reserve(extra).is_err()
+                {
+                    return false;
+                }
                 self.data.resize(inline_end, 0);
             }
             let start = offset as usize;
             self.data[start..inline_end].fill(0);
+            self.remove_sparse_range(offset, end);
+            return true;
+        }
+        if offset < inline_file_limit as u64 {
+            let inline_end = end.min(inline_file_limit as u64) as usize;
+            if self.data.len() < inline_end {
+                let extra = inline_end - self.data.len();
+                if self.allocated_payload_len().saturating_add(extra)
+                    > TMPFS_ALLOCATED_PAYLOAD_LIMIT
+                    || self.data.try_reserve(extra).is_err()
+                {
+                    return false;
+                }
+                self.data.resize(inline_end, 0);
+            }
+            let start = offset as usize;
+            self.data[start..inline_end].fill(0);
+        }
+        self.remove_sparse_range(offset, end);
+        let sparse_start = offset.max(inline_file_limit as u64);
+        self.insert_zero_extent(sparse_start, end);
+        true
+    }
+
+    fn punch_hole_range(&mut self, offset: u64, end: u64, inline_file_limit: usize) {
+        if end <= inline_file_limit as u64 {
+            let inline_end = end.min(self.data.len() as u64) as usize;
+            let start = offset.min(self.data.len() as u64) as usize;
+            if start < inline_end {
+                self.data[start..inline_end].fill(0);
+            }
             self.remove_sparse_range(offset, end);
             return;
         }
@@ -983,6 +1078,56 @@ impl FileSystemBackend for TmpFs {
         Ok(())
     }
 
+    fn allocate_range(&mut self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
+        let end = offset.checked_add(len).ok_or(FsError::InvalidInput)?;
+        let len = usize::try_from(len).map_err(|_| FsError::InvalidInput)?;
+        self.write_fits_quota(ino, offset, len)?;
+        let inline_file_limit = self.inline_file_limit;
+        let inode = self.inode_mut(ino)?;
+        if inode.kind != FsNodeKind::RegularFile {
+            return Err(FsError::InvalidInput);
+        }
+        if !inode.reserve_zero_range(offset, end, inline_file_limit) {
+            return Err(FsError::NoSpace);
+        }
+        if !keep_size && end > inode.size {
+            inode.size = end;
+        }
+        inode.touch();
+        Ok(())
+    }
+
+    fn zero_range(&mut self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
+        let end = offset.checked_add(len).ok_or(FsError::InvalidInput)?;
+        let len = usize::try_from(len).map_err(|_| FsError::InvalidInput)?;
+        self.write_fits_quota(ino, offset, len)?;
+        let inline_file_limit = self.inline_file_limit;
+        let inode = self.inode_mut(ino)?;
+        if inode.kind != FsNodeKind::RegularFile {
+            return Err(FsError::InvalidInput);
+        }
+        if !inode.write_zero_range(offset, end, inline_file_limit) {
+            return Err(FsError::NoSpace);
+        }
+        if !keep_size && end > inode.size {
+            inode.size = end;
+        }
+        inode.touch();
+        Ok(())
+    }
+
+    fn punch_hole(&mut self, ino: u32, offset: u64, len: u64) -> FsResult {
+        let end = offset.checked_add(len).ok_or(FsError::InvalidInput)?;
+        let inline_file_limit = self.inline_file_limit;
+        let inode = self.inode_mut(ino)?;
+        if inode.kind != FsNodeKind::RegularFile {
+            return Err(FsError::InvalidInput);
+        }
+        inode.punch_hole_range(offset, end, inline_file_limit);
+        inode.touch();
+        Ok(())
+    }
+
     fn sync(&mut self, _ino: u32, _data_only: bool) -> FsResult {
         if let Some(loop_id) = self.synthetic_sync_loop_device {
             let _ = super::devfs::loop_device_note_synthetic_write(loop_id, EXT_SCRATCH_SYNC_BYTES);
@@ -1017,7 +1162,7 @@ impl FileSystemBackend for TmpFs {
         let blocks = match inode.kind {
             FsNodeKind::Directory => size.div_ceil(512),
             FsNodeKind::Symlink => 0,
-            _ => (inode.allocated_payload_len() as u64).div_ceil(512),
+            _ => inode.allocated_logical_len().div_ceil(512),
         };
         Ok(FileStat {
             ino: ino as u64,
@@ -1152,7 +1297,9 @@ impl FileSystemBackend for TmpFs {
                     }
                     if appended < buf.len() {
                         let zero_start = offset + appended as u64;
-                        inode.write_zero_range(zero_start, end, inline_file_limit);
+                        if !inode.write_zero_range(zero_start, end, inline_file_limit) {
+                            return 0;
+                        }
                     }
                     if end > inode.size {
                         inode.size = end;
@@ -1161,7 +1308,9 @@ impl FileSystemBackend for TmpFs {
                     return buf.len();
                 }
             }
-            inode.write_zero_range(offset, end, inline_file_limit);
+            if !inode.write_zero_range(offset, end, inline_file_limit) {
+                return 0;
+            }
             if end > inode.size {
                 inode.size = end;
             }
