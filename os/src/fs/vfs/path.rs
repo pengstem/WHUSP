@@ -33,8 +33,12 @@ pub(crate) enum VfsOpenTarget<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LookupMode {
+    // Normal open/stat-style lookup: follow final symlinks and mounted roots.
     FollowFinal,
+    // lstat/readlink/O_NOFOLLOW-style lookup: keep a final symlink as the node.
     NoFollowFinal,
+    // mount/umount target lookup: follow the final symlink but stop before a
+    // final mounted root so callers operate on the covered directory itself.
     MountTarget,
 }
 

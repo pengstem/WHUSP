@@ -38,6 +38,9 @@ pub(crate) enum MountPropagation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum MountTarget {
     Node(VfsNodeId),
+    // Synthetic paths make compatibility mounts visible even when no backing
+    // directory exists on the covered filesystem; getdents64 exposes only the
+    // direct child until lookup resolves the synthetic mount root.
     SyntheticPath { parent: VfsNodeId, path: String },
 }
 

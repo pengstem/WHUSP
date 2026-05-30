@@ -29,7 +29,7 @@ use crate::fs::{
     normalize_path_at_root, open_devfs_child, open_devfs_input_child, open_devfs_misc_child,
     open_devfs_net_child, open_devfs_pts_child, open_file_in, open_file_in_with_attrs,
     open_static_path, open_tmpfile_in_with_attrs, path_inside_root, rename_exchange_in, rename_in,
-    rmdir_in, symlink_in, truncate_in, unlink_file_in,
+    rmdir_in, stat_static_path, symlink_in, truncate_in, unlink_file_in,
 };
 use crate::mm::UserBuffer;
 use crate::task::{CAP_SYS_CHROOT, PathSnapshot, current_process, current_user_token};
@@ -595,13 +595,13 @@ fn do_openat(dirfd: isize, path: &str, flags: OpenFlags, mode: u32) -> SysResult
     }
     let dir_path = openat_dir_path(&snapshot, dirfd, path)?;
     if let Some(path) = dir_path.as_deref()
-        && snapshot.context.is_global_root()
         && let Some(file) = open_static_path(path, flags)?
     {
         // CONTEXT: Static proc/dev compatibility files are keyed by the
-        // normalized process-global path before the dynamic VFS lookup. Do not
-        // route this through cwd-relative lookup or chrooted processes could
-        // observe host-global pseudo files by accident.
+        // normalized process-global path before the dynamic VFS lookup. A
+        // chrooted process sees only aliases explicitly registered under its
+        // normalized root path, such as the libc-local module metadata used by
+        // BusyBox modprobe.
         return install_file_fd(file, flags, None);
     }
     if path.starts_with('/')
@@ -919,6 +919,15 @@ pub fn sys_chdir(path: *const u8) -> SysResult {
     let credentials = process.credentials();
     let subject = AccessSubject::from_fs_credentials(&credentials);
     check_access_path_prefixes_from(&snapshot, AT_FDCWD, path.as_str(), subject)?;
+    if snapshot.context.is_global_root()
+        && let Some(next_path) = process_global_path_for(&snapshot, path.as_str())
+        && let Some(stat) = stat_static_path(next_path.as_str())
+        && stat.mode & S_IFDIR == S_IFDIR
+    {
+        check_access_mode(&stat, X_OK, subject)?;
+        process.set_working_dir(snapshot.context.root(), next_path);
+        return Ok(0);
+    }
     let (next_cwd, stat, next_path) =
         lookup_dir_with_stat_path_in(snapshot.context.clone(), path.as_str())?;
     check_access_mode(&stat, X_OK, subject)?;

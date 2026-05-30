@@ -385,6 +385,14 @@ fork06
 fork07
 fork08
 fork10
+keyctl01
+keyctl03
+keyctl04
+keyctl05
+keyctl06
+keyctl07
+keyctl08
+keyctl09
 fork11
 getrlimit02
 waitid04

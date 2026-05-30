@@ -4,7 +4,7 @@ use crate::syscall::user_ptr::{read_user_value, write_user_value, write_user_val
 use crate::task::{
     CloneArgs, CloneFlags, ProcessControlBlock, TaskControlBlock, add_task,
     block_current_task_no_schedule, clone_current_thread, current_process, current_task,
-    current_user_token, schedule, suspend_current_and_run_next,
+    current_user_token, reap_exited_tasks, schedule, suspend_current_and_run_next,
 };
 use alloc::sync::Arc;
 use core::mem::size_of;
@@ -333,6 +333,7 @@ fn sys_clone_vm_newnet(args: CloneArgs) -> SysResult {
 }
 
 fn sys_clone_vm_helper(args: CloneArgs, synthetic_newnet: bool) -> SysResult {
+    reap_exited_tasks();
     let process = current_process();
     let cloned = clone_current_thread(args);
     let linux_tid = cloned.linux_tid;
@@ -372,6 +373,7 @@ fn sys_clone_vm_helper(args: CloneArgs, synthetic_newnet: bool) -> SysResult {
 }
 
 fn sys_clone_thread(args: CloneArgs) -> SysResult {
+    reap_exited_tasks();
     let process = current_process();
     let cloned = clone_current_thread(args);
     let process_token = process.attach_task(Arc::clone(&cloned.task));

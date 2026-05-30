@@ -15,6 +15,9 @@ bitflags! {
         const G = 1 << 5;
         const A = 1 << 6;
         const D = 1 << 7;
+        // Abstract software COW marker. `arch::mm` maps it to an
+        // architecture-safe PTE bit; do not treat this value as a portable
+        // hardware encoding outside this flag set.
         const COW = 1 << 8;
     }
 }

@@ -277,6 +277,9 @@ impl ProcessControlBlock {
         let parent_timer_slack_ns = parent_task_inner.timer_slack_ns;
         let parent_seccomp_mode = parent_task_inner.seccomp_mode;
         let parent_seccomp_filter = parent_task_inner.seccomp_filter.clone();
+        // Snapshot task-local inheritance before releasing the parent lock; the
+        // child task is built after this point and must not re-enter the parent
+        // TCB just to recover fork-time scheduling or signal state.
         drop(parent_task_inner);
         drop(parent);
 

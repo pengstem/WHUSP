@@ -1,7 +1,10 @@
+use super::dirent::{DT_DIR, DT_REG, RawDirEntry, write_dir_entries};
 use super::{File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFDIR, S_IFREG};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
+use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 
@@ -41,9 +44,16 @@ const PROC_BUS_INPUT_DEVICES: &[u8] =
     b"I: Bus=0003 Vendor=0001 Product=0001 Version=0001\nN: Name=\"virtual-device-ltp\"\n";
 const SYS_INPUT0_NAME: &[u8] = b"virtual-device-ltp\n";
 const PROC_RANDOM_ENTROPY_AVAIL: &[u8] = b"256\n";
-const MODULES_LOOP_DEP: &[u8] = b"kernel/drivers/block/loop.ko:\n";
-const MODULES_LOOP_BUILTIN: &[u8] = b"kernel/drivers/block/loop.ko\n";
-const MODULES_CONFIG: &[u8] = b"CONFIG_FS_VERITY=y\n";
+const MODULES_LOOP_DEP: &[u8] =
+    b"kernel/drivers/block/loop.ko:\nkernel/net/dns_resolver/dns_resolver.ko:\n";
+const MODULES_LOOP_BUILTIN: &[u8] =
+    b"kernel/drivers/block/loop.ko\nkernel/net/dns_resolver/dns_resolver.ko\n";
+const MODULES_ALIAS: &[u8] = b"";
+const MODULES_ORDER: &[u8] = b"kernel/net/dns_resolver/dns_resolver.ko\n";
+const MODULES_SYMBOLS: &[u8] = b"";
+const MODULES_CONFIG: &[u8] =
+    b"CONFIG_FS_VERITY=y\nCONFIG_USER_DECRYPTED_DATA=y\nCONFIG_PREEMPT_RT=y\n";
+const DNS_RESOLVER_KO: &[u8] = b"WHUSP built-in dns_resolver module placeholder\n";
 const SYS_DEV_BLOCK_TMPFS_UEVENT: &[u8] = b"DEVNAME=loop0\n";
 #[cfg(target_arch = "loongarch64")]
 const LA_MUSL_COMPAT_SO: &[u8] =
@@ -55,6 +65,9 @@ enum StaticNode {
     LibDir,
     LibModulesDir,
     LibModulesReleaseDir,
+    LibModulesKernelDir,
+    LibModulesKernelNetDir,
+    LibModulesKernelNetDnsResolverDir,
     SysDir,
     SysBlockDir,
     SysLoop0Dir,
@@ -78,7 +91,11 @@ enum StaticNode {
     Protocols,
     ModulesDep,
     ModulesBuiltin,
+    ModulesAlias,
+    ModulesOrder,
+    ModulesSymbols,
     ModulesConfig,
+    DnsResolverKo,
     ProcBusInputDevices,
     SysInput0Name,
     ProcRandomEntropyAvail,
@@ -107,14 +124,16 @@ enum StaticNode {
 
 pub struct StaticFile {
     node: StaticNode,
+    path: &'static str,
     offset: UPIntrFreeCell<usize>,
     status_flags: UPIntrFreeCell<OpenFlags>,
 }
 
 impl StaticFile {
-    fn new(node: StaticNode, flags: OpenFlags) -> Arc<Self> {
+    fn new(node: StaticNode, path: &'static str, flags: OpenFlags) -> Arc<Self> {
         Arc::new(Self {
             node,
+            path,
             offset: unsafe { UPIntrFreeCell::new(0) },
             status_flags: unsafe { UPIntrFreeCell::new(OpenFlags::file_status_flags(flags)) },
         })
@@ -128,6 +147,38 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
         "/lib/modules" | "/lib/modules/" => Some(StaticNode::LibModulesDir),
         "/lib/modules/6.8.0-whusp" | "/lib/modules/6.8.0-whusp/" => {
             Some(StaticNode::LibModulesReleaseDir)
+        }
+        "/kernel"
+        | "/glibc/kernel"
+        | "/musl/kernel"
+        | "/kernel/"
+        | "/glibc/kernel/"
+        | "/musl/kernel/"
+        | "/lib/modules/kernel"
+        | "/lib/modules/kernel/"
+        | "/lib/modules/6.8.0-whusp/kernel"
+        | "/lib/modules/6.8.0-whusp/kernel/" => Some(StaticNode::LibModulesKernelDir),
+        "/kernel/net"
+        | "/glibc/kernel/net"
+        | "/musl/kernel/net"
+        | "/kernel/net/"
+        | "/glibc/kernel/net/"
+        | "/musl/kernel/net/"
+        | "/lib/modules/kernel/net"
+        | "/lib/modules/kernel/net/"
+        | "/lib/modules/6.8.0-whusp/kernel/net"
+        | "/lib/modules/6.8.0-whusp/kernel/net/" => Some(StaticNode::LibModulesKernelNetDir),
+        "/kernel/net/dns_resolver"
+        | "/glibc/kernel/net/dns_resolver"
+        | "/musl/kernel/net/dns_resolver"
+        | "/kernel/net/dns_resolver/"
+        | "/glibc/kernel/net/dns_resolver/"
+        | "/musl/kernel/net/dns_resolver/"
+        | "/lib/modules/kernel/net/dns_resolver"
+        | "/lib/modules/kernel/net/dns_resolver/"
+        | "/lib/modules/6.8.0-whusp/kernel/net/dns_resolver"
+        | "/lib/modules/6.8.0-whusp/kernel/net/dns_resolver/" => {
+            Some(StaticNode::LibModulesKernelNetDnsResolverDir)
         }
         "/sys" | "/sys/" => Some(StaticNode::SysDir),
         "/sys/block" | "/sys/block/" => Some(StaticNode::SysBlockDir),
@@ -157,9 +208,43 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
         "/etc/hosts" => Some(StaticNode::Hosts),
         "/etc/resolv.conf" => Some(StaticNode::ResolvConf),
         "/etc/protocols" => Some(StaticNode::Protocols),
-        "/lib/modules/6.8.0-whusp/modules.dep" => Some(StaticNode::ModulesDep),
-        "/lib/modules/6.8.0-whusp/modules.builtin" => Some(StaticNode::ModulesBuiltin),
-        "/lib/modules/6.8.0-whusp/config" => Some(StaticNode::ModulesConfig),
+        "/modules.dep"
+        | "/glibc/modules.dep"
+        | "/musl/modules.dep"
+        | "/lib/modules/modules.dep"
+        | "/lib/modules/6.8.0-whusp/modules.dep" => Some(StaticNode::ModulesDep),
+        "/modules.builtin"
+        | "/glibc/modules.builtin"
+        | "/musl/modules.builtin"
+        | "/lib/modules/modules.builtin"
+        | "/lib/modules/6.8.0-whusp/modules.builtin" => Some(StaticNode::ModulesBuiltin),
+        "/modules.alias"
+        | "/glibc/modules.alias"
+        | "/musl/modules.alias"
+        | "/lib/modules/modules.alias"
+        | "/lib/modules/6.8.0-whusp/modules.alias" => Some(StaticNode::ModulesAlias),
+        "/modules.order"
+        | "/glibc/modules.order"
+        | "/musl/modules.order"
+        | "/lib/modules/modules.order"
+        | "/lib/modules/6.8.0-whusp/modules.order" => Some(StaticNode::ModulesOrder),
+        "/modules.symbols"
+        | "/glibc/modules.symbols"
+        | "/musl/modules.symbols"
+        | "/lib/modules/modules.symbols"
+        | "/lib/modules/6.8.0-whusp/modules.symbols" => Some(StaticNode::ModulesSymbols),
+        "/config"
+        | "/glibc/config"
+        | "/musl/config"
+        | "/lib/modules/config"
+        | "/lib/modules/6.8.0-whusp/config" => Some(StaticNode::ModulesConfig),
+        "/kernel/net/dns_resolver/dns_resolver.ko"
+        | "/glibc/kernel/net/dns_resolver/dns_resolver.ko"
+        | "/musl/kernel/net/dns_resolver/dns_resolver.ko"
+        | "/lib/modules/kernel/net/dns_resolver/dns_resolver.ko"
+        | "/lib/modules/6.8.0-whusp/kernel/net/dns_resolver/dns_resolver.ko" => {
+            Some(StaticNode::DnsResolverKo)
+        }
         "/proc/bus/input/devices" => Some(StaticNode::ProcBusInputDevices),
         "/proc/sys/kernel/random/entropy_avail" => Some(StaticNode::ProcRandomEntropyAvail),
         "/sys/devices/virtual/input/input0/name" => Some(StaticNode::SysInput0Name),
@@ -189,6 +274,74 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
     }
 }
 
+fn canonical_path(node: StaticNode) -> &'static str {
+    match node {
+        StaticNode::EtcDir => "/etc",
+        StaticNode::LibDir => "/lib",
+        StaticNode::LibModulesDir => "/lib/modules",
+        StaticNode::LibModulesReleaseDir => "/lib/modules/6.8.0-whusp",
+        StaticNode::LibModulesKernelDir => "/lib/modules/6.8.0-whusp/kernel",
+        StaticNode::LibModulesKernelNetDir => "/lib/modules/6.8.0-whusp/kernel/net",
+        StaticNode::LibModulesKernelNetDnsResolverDir => {
+            "/lib/modules/6.8.0-whusp/kernel/net/dns_resolver"
+        }
+        StaticNode::SysDir => "/sys",
+        StaticNode::SysBlockDir => "/sys/block",
+        StaticNode::SysLoop0Dir => "/sys/block/loop0",
+        StaticNode::SysLoopInnerDir => "/sys/block/loop0/loop",
+        StaticNode::SysLoopQueueDir => "/sys/block/loop0/queue",
+        StaticNode::SysDevDir => "/sys/dev",
+        StaticNode::SysDevBlockDir => "/sys/dev/block",
+        StaticNode::SysDevBlockTmpfsDir => "/sys/dev/block/254:0",
+        StaticNode::SysClassDir => "/sys/class",
+        StaticNode::SysClassBlockDir => "/sys/class/block",
+        StaticNode::SysClassLoop0Dir => "/sys/class/block/loop0",
+        StaticNode::SysClassLoop0BdiDir => "/sys/class/block/loop0/bdi",
+        StaticNode::SysDevicesDir => "/sys/devices",
+        StaticNode::SysDevicesVirtualDir => "/sys/devices/virtual",
+        StaticNode::SysDevicesVirtualInputDir => "/sys/devices/virtual/input",
+        StaticNode::SysInput0Dir => "/sys/devices/virtual/input/input0",
+        StaticNode::NsswitchConf => "/etc/nsswitch.conf",
+        StaticNode::Passwd => "/etc/passwd",
+        StaticNode::Group => "/etc/group",
+        StaticNode::Hosts => "/etc/hosts",
+        StaticNode::ResolvConf => "/etc/resolv.conf",
+        StaticNode::Protocols => "/etc/protocols",
+        StaticNode::ModulesDep => "/lib/modules/6.8.0-whusp/modules.dep",
+        StaticNode::ModulesBuiltin => "/lib/modules/6.8.0-whusp/modules.builtin",
+        StaticNode::ModulesAlias => "/lib/modules/6.8.0-whusp/modules.alias",
+        StaticNode::ModulesOrder => "/lib/modules/6.8.0-whusp/modules.order",
+        StaticNode::ModulesSymbols => "/lib/modules/6.8.0-whusp/modules.symbols",
+        StaticNode::ModulesConfig => "/lib/modules/6.8.0-whusp/config",
+        StaticNode::DnsResolverKo => {
+            "/lib/modules/6.8.0-whusp/kernel/net/dns_resolver/dns_resolver.ko"
+        }
+        StaticNode::ProcBusInputDevices => "/proc/bus/input/devices",
+        StaticNode::SysInput0Name => "/sys/devices/virtual/input/input0/name",
+        StaticNode::ProcRandomEntropyAvail => "/proc/sys/kernel/random/entropy_avail",
+        StaticNode::SysLoopSize => "/sys/block/loop0/size",
+        StaticNode::SysLoopReadOnly => "/sys/block/loop0/ro",
+        StaticNode::SysLoopStat => "/sys/block/loop0/stat",
+        StaticNode::SysLoopPartscan => "/sys/block/loop0/loop/partscan",
+        StaticNode::SysLoopAutoclear => "/sys/block/loop0/loop/autoclear",
+        StaticNode::SysLoopBackingFile => "/sys/block/loop0/loop/backing_file",
+        StaticNode::SysLoopDirectIo => "/sys/block/loop0/loop/dio",
+        StaticNode::SysLoopSizeLimit => "/sys/block/loop0/loop/sizelimit",
+        StaticNode::SysLoopLogicalBlockSize => "/sys/block/loop0/queue/logical_block_size",
+        StaticNode::SysLoopDmaAlignment => "/sys/block/loop0/queue/dma_alignment",
+        StaticNode::SysLoopReadAheadKb => "/sys/class/block/loop0/bdi/read_ahead_kb",
+        StaticNode::SysDevBlockTmpfsUevent => "/sys/dev/block/254:0/uevent",
+        #[cfg(target_arch = "loongarch64")]
+        StaticNode::OptDir => "/opt",
+        #[cfg(target_arch = "loongarch64")]
+        StaticNode::OptOscompSupportDir => "/opt/oscomp-support",
+        #[cfg(target_arch = "loongarch64")]
+        StaticNode::OptOscompSupportLibDir => "/opt/oscomp-support/lib",
+        #[cfg(target_arch = "loongarch64")]
+        StaticNode::LaMuslCompatSo => "/opt/oscomp-support/lib/liboscomp-musl-compat.so",
+    }
+}
+
 fn content(node: StaticNode) -> Option<Vec<u8>> {
     match node {
         StaticNode::NsswitchConf => Some(ETC_NSSWITCH_CONF.to_vec()),
@@ -199,7 +352,11 @@ fn content(node: StaticNode) -> Option<Vec<u8>> {
         StaticNode::Protocols => Some(ETC_PROTOCOLS.to_vec()),
         StaticNode::ModulesDep => Some(MODULES_LOOP_DEP.to_vec()),
         StaticNode::ModulesBuiltin => Some(MODULES_LOOP_BUILTIN.to_vec()),
+        StaticNode::ModulesAlias => Some(MODULES_ALIAS.to_vec()),
+        StaticNode::ModulesOrder => Some(MODULES_ORDER.to_vec()),
+        StaticNode::ModulesSymbols => Some(MODULES_SYMBOLS.to_vec()),
         StaticNode::ModulesConfig => Some(MODULES_CONFIG.to_vec()),
+        StaticNode::DnsResolverKo => Some(DNS_RESOLVER_KO.to_vec()),
         StaticNode::ProcBusInputDevices => Some(PROC_BUS_INPUT_DEVICES.to_vec()),
         StaticNode::SysInput0Name => Some(SYS_INPUT0_NAME.to_vec()),
         StaticNode::ProcRandomEntropyAvail => Some(PROC_RANDOM_ENTROPY_AVAIL.to_vec()),
@@ -237,6 +394,9 @@ fn content(node: StaticNode) -> Option<Vec<u8>> {
         | StaticNode::LibDir
         | StaticNode::LibModulesDir
         | StaticNode::LibModulesReleaseDir
+        | StaticNode::LibModulesKernelDir
+        | StaticNode::LibModulesKernelNetDir
+        | StaticNode::LibModulesKernelNetDnsResolverDir
         | StaticNode::SysDir
         | StaticNode::SysBlockDir
         | StaticNode::SysLoop0Dir
@@ -268,6 +428,9 @@ fn is_dir(node: StaticNode) -> bool {
         | StaticNode::LibDir
         | StaticNode::LibModulesDir
         | StaticNode::LibModulesReleaseDir
+        | StaticNode::LibModulesKernelDir
+        | StaticNode::LibModulesKernelNetDir
+        | StaticNode::LibModulesKernelNetDnsResolverDir
         | StaticNode::SysDir
         | StaticNode::SysBlockDir
         | StaticNode::SysLoop0Dir
@@ -309,6 +472,9 @@ fn stat_node(node: StaticNode) -> FileStat {
         StaticNode::LibDir => 24,
         StaticNode::LibModulesDir => 25,
         StaticNode::LibModulesReleaseDir => 26,
+        StaticNode::LibModulesKernelDir => 49,
+        StaticNode::LibModulesKernelNetDir => 50,
+        StaticNode::LibModulesKernelNetDnsResolverDir => 51,
         StaticNode::SysDir => 27,
         StaticNode::SysBlockDir => 28,
         StaticNode::SysLoop0Dir => 29,
@@ -329,7 +495,11 @@ fn stat_node(node: StaticNode) -> FileStat {
         StaticNode::Protocols => 7,
         StaticNode::ModulesDep => 15,
         StaticNode::ModulesBuiltin => 16,
+        StaticNode::ModulesAlias => 52,
+        StaticNode::ModulesOrder => 53,
+        StaticNode::ModulesSymbols => 54,
         StaticNode::ModulesConfig => 42,
+        StaticNode::DnsResolverKo => 55,
         StaticNode::ProcBusInputDevices => 12,
         StaticNode::SysInput0Name => 13,
         StaticNode::ProcRandomEntropyAvail => 14,
@@ -382,6 +552,9 @@ pub(crate) fn open_path(
         return Ok(None);
     };
     if is_dir(node) {
+        if flags.can_open_directory() {
+            return Ok(Some(StaticFile::new(node, canonical_path(node), flags)));
+        }
         return Err(FsError::IsDir);
     }
     if (flags.writable_target() || flags.contains(OpenFlags::TRUNC))
@@ -393,7 +566,93 @@ pub(crate) fn open_path(
     // loopback startup. The contest image does not require mutable `/etc`
     // state, so a tiny read-only snapshot keeps libc on the files backend
     // instead of the currently unsupported DNS/NSS path.
-    Ok(Some(StaticFile::new(node, flags)))
+    Ok(Some(StaticFile::new(node, canonical_path(node), flags)))
+}
+
+fn dir_entry(node: StaticNode, name: &str, dtype: u8) -> RawDirEntry {
+    RawDirEntry {
+        ino: stat_node(node).ino as u32,
+        name: String::from(name),
+        dtype,
+    }
+}
+
+fn dir_entries(node: StaticNode) -> Option<Vec<RawDirEntry>> {
+    let mut entries = Vec::new();
+    match node {
+        StaticNode::LibModulesDir => {
+            entries.push(dir_entry(StaticNode::LibModulesDir, ".", DT_DIR));
+            entries.push(dir_entry(StaticNode::LibDir, "..", DT_DIR));
+            entries.push(dir_entry(StaticNode::ModulesDep, "modules.dep", DT_REG));
+            entries.push(dir_entry(
+                StaticNode::ModulesBuiltin,
+                "modules.builtin",
+                DT_REG,
+            ));
+            entries.push(dir_entry(StaticNode::ModulesAlias, "modules.alias", DT_REG));
+            entries.push(dir_entry(StaticNode::ModulesOrder, "modules.order", DT_REG));
+            entries.push(dir_entry(
+                StaticNode::ModulesSymbols,
+                "modules.symbols",
+                DT_REG,
+            ));
+            entries.push(dir_entry(StaticNode::ModulesConfig, "config", DT_REG));
+            entries.push(dir_entry(StaticNode::LibModulesKernelDir, "kernel", DT_DIR));
+            entries.push(dir_entry(
+                StaticNode::LibModulesReleaseDir,
+                "6.8.0-whusp",
+                DT_DIR,
+            ));
+        }
+        StaticNode::LibModulesReleaseDir => {
+            entries.push(dir_entry(StaticNode::LibModulesReleaseDir, ".", DT_DIR));
+            entries.push(dir_entry(StaticNode::LibModulesDir, "..", DT_DIR));
+            entries.push(dir_entry(StaticNode::ModulesDep, "modules.dep", DT_REG));
+            entries.push(dir_entry(
+                StaticNode::ModulesBuiltin,
+                "modules.builtin",
+                DT_REG,
+            ));
+            entries.push(dir_entry(StaticNode::ModulesAlias, "modules.alias", DT_REG));
+            entries.push(dir_entry(StaticNode::ModulesOrder, "modules.order", DT_REG));
+            entries.push(dir_entry(
+                StaticNode::ModulesSymbols,
+                "modules.symbols",
+                DT_REG,
+            ));
+            entries.push(dir_entry(StaticNode::ModulesConfig, "config", DT_REG));
+            entries.push(dir_entry(StaticNode::LibModulesKernelDir, "kernel", DT_DIR));
+        }
+        StaticNode::LibModulesKernelDir => {
+            entries.push(dir_entry(StaticNode::LibModulesKernelDir, ".", DT_DIR));
+            entries.push(dir_entry(StaticNode::LibModulesReleaseDir, "..", DT_DIR));
+            entries.push(dir_entry(StaticNode::LibModulesKernelNetDir, "net", DT_DIR));
+        }
+        StaticNode::LibModulesKernelNetDir => {
+            entries.push(dir_entry(StaticNode::LibModulesKernelNetDir, ".", DT_DIR));
+            entries.push(dir_entry(StaticNode::LibModulesKernelDir, "..", DT_DIR));
+            entries.push(dir_entry(
+                StaticNode::LibModulesKernelNetDnsResolverDir,
+                "dns_resolver",
+                DT_DIR,
+            ));
+        }
+        StaticNode::LibModulesKernelNetDnsResolverDir => {
+            entries.push(dir_entry(
+                StaticNode::LibModulesKernelNetDnsResolverDir,
+                ".",
+                DT_DIR,
+            ));
+            entries.push(dir_entry(StaticNode::LibModulesKernelNetDir, "..", DT_DIR));
+            entries.push(dir_entry(
+                StaticNode::DnsResolverKo,
+                "dns_resolver.ko",
+                DT_REG,
+            ));
+        }
+        _ => return None,
+    }
+    Some(entries)
 }
 
 impl File for StaticFile {
@@ -502,5 +761,43 @@ impl File for StaticFile {
 
     fn set_status_flags(&self, flags: OpenFlags) {
         *self.status_flags.exclusive_access() = flags;
+    }
+
+    fn read_dirent64(&self, user_buf: UserBuffer) -> FsResult<isize> {
+        let Some(entries) = dir_entries(self.node) else {
+            return Err(FsError::NotDir);
+        };
+        let mut kernel_buf = vec![0u8; user_buf.len()];
+        let mut offset = self.offset.exclusive_access();
+        let (written, next_offset) = write_dir_entries(&entries, *offset as u64, &mut kernel_buf)?;
+        *offset = next_offset as usize;
+        if written == 0 {
+            return Ok(0);
+        }
+        for (idx, byte_ref) in user_buf.into_iter().take(written).enumerate() {
+            unsafe {
+                *byte_ref = kernel_buf[idx];
+            }
+        }
+        Ok(written as isize)
+    }
+
+    fn working_dir(&self) -> Option<super::path::WorkingDir> {
+        if !is_dir(self.node) {
+            return None;
+        }
+        // CONTEXT: Static compatibility directories are not backed by a VFS
+        // mount, but openat() only needs a directory anchor to preserve the
+        // normalized static path kept in the fd table.
+        Some(
+            crate::task::current_process()
+                .path_snapshot()
+                .context
+                .root(),
+        )
+    }
+
+    fn proc_fd_target(&self) -> Option<String> {
+        Some(String::from(self.path))
     }
 }

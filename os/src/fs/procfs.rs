@@ -60,6 +60,8 @@ const SYS_KERNEL_KEYS_DIR_INO: u32 = 24;
 const KEYS_GC_DELAY_INO: u32 = 25;
 const KEYS_MAXKEYS_INO: u32 = 26;
 const KEYS_MAXBYTES_INO: u32 = 27;
+const KEYS_ROOT_MAXKEYS_INO: u32 = 62;
+const KEYS_ROOT_MAXBYTES_INO: u32 = 63;
 const SYS_VM_DIR_INO: u32 = 28;
 const DROP_CACHES_INO: u32 = 29;
 const VFS_CACHE_PRESSURE_INO: u32 = 31;
@@ -145,10 +147,12 @@ const PROC_NS_UTS_INO_BASE: u64 = 0x7300_0000;
 const PROC_NS_INO_RANGE: u64 = 0x0100_0000;
 const ROOT_UTS_NAMESPACE_ID: usize = 1;
 const PROC_CONFIG_GZ: &[u8] = &[
-    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x73, 0xf6, 0xf7, 0x73, 0xf3, 0x74,
-    0x8f, 0x0f, 0xf0, 0x74, 0x89, 0xf7, 0x0b, 0xb6, 0xad, 0xe4, 0x72, 0x86, 0xf0, 0x9d, 0x3d, 0x5c,
-    0x9d, 0xbd, 0x03, 0xfc, 0x3d, 0xfd, 0x42, 0xe2, 0x83, 0x5c, 0x83, 0x43, 0xfc, 0x83, 0x5c, 0x11,
-    0x72, 0x8e, 0x9e, 0xfe, 0x40, 0x0e, 0x00, 0xcf, 0xf9, 0x5d, 0x5b, 0x39, 0x00, 0x00, 0x00,
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x45, 0x8c, 0x31, 0x0e, 0x80, 0x40,
+    0x08, 0x04, 0x7b, 0xff, 0x64, 0x71, 0x81, 0x55, 0x89, 0xf1, 0x20, 0x80, 0x85, 0x15, 0xef, 0xf0,
+    0xf7, 0x5e, 0x62, 0x71, 0xe5, 0xcc, 0x24, 0x43, 0xda, 0x37, 0xd9, 0xcb, 0x84, 0xab, 0xc7, 0xfa,
+    0x2e, 0xf4, 0x33, 0x1d, 0xa0, 0xd3, 0x54, 0x7a, 0x96, 0x23, 0x52, 0x1d, 0xb3, 0x35, 0xd1, 0x09,
+    0x77, 0xc0, 0x8b, 0x41, 0xfe, 0x58, 0x82, 0x8b, 0x5b, 0xb6, 0x19, 0xcd, 0x81, 0xcb, 0xc6, 0x22,
+    0x87, 0xfb, 0x00, 0x56, 0x11, 0x40, 0xde, 0x6a, 0x00, 0x00, 0x00,
 ];
 
 static PROC_PID_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_PID_MAX);
@@ -217,6 +221,8 @@ enum ProcNode {
     KeysGcDelay,
     KeysMaxkeys,
     KeysMaxbytes,
+    KeysRootMaxkeys,
+    KeysRootMaxbytes,
     CorePattern,
     DropCaches,
     VfsCachePressure,
@@ -518,6 +524,8 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         KEYS_GC_DELAY_INO => Some(ProcNode::KeysGcDelay),
         KEYS_MAXKEYS_INO => Some(ProcNode::KeysMaxkeys),
         KEYS_MAXBYTES_INO => Some(ProcNode::KeysMaxbytes),
+        KEYS_ROOT_MAXKEYS_INO => Some(ProcNode::KeysRootMaxkeys),
+        KEYS_ROOT_MAXBYTES_INO => Some(ProcNode::KeysRootMaxbytes),
         CORE_PATTERN_INO => Some(ProcNode::CorePattern),
         DROP_CACHES_INO => Some(ProcNode::DropCaches),
         VFS_CACHE_PRESSURE_INO => Some(ProcNode::VfsCachePressure),
@@ -1124,6 +1132,16 @@ fn sys_kernel_keys_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: KEYS_MAXBYTES_INO,
         name: "maxbytes".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: KEYS_ROOT_MAXKEYS_INO,
+        name: "root_maxkeys".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: KEYS_ROOT_MAXBYTES_INO,
+        name: "root_maxbytes".into(),
         dtype: DT_REG,
     });
     entries
@@ -2093,6 +2111,8 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::KeysGcDelay => Ok(keyring::key_gc_delay_content().into_bytes()),
         ProcNode::KeysMaxkeys => Ok(keyring::key_maxkeys_content().into_bytes()),
         ProcNode::KeysMaxbytes => Ok(keyring::key_maxbytes_content().into_bytes()),
+        ProcNode::KeysRootMaxkeys => Ok(keyring::root_key_maxkeys_content().into_bytes()),
+        ProcNode::KeysRootMaxbytes => Ok(keyring::root_key_maxbytes_content().into_bytes()),
         ProcNode::CorePattern => Ok(b"core\n".to_vec()),
         ProcNode::PipeMaxSize => Ok(pipe_max_size_content().into_bytes()),
         ProcNode::PipeUserPagesSoft => Ok(pipe_user_pages_soft_content().into_bytes()),
@@ -2353,6 +2373,8 @@ impl FileSystemBackend for ProcFs {
                 "gc_delay" => Ok((KEYS_GC_DELAY_INO, FsNodeKind::RegularFile)),
                 "maxkeys" => Ok((KEYS_MAXKEYS_INO, FsNodeKind::RegularFile)),
                 "maxbytes" => Ok((KEYS_MAXBYTES_INO, FsNodeKind::RegularFile)),
+                "root_maxkeys" => Ok((KEYS_ROOT_MAXKEYS_INO, FsNodeKind::RegularFile)),
+                "root_maxbytes" => Ok((KEYS_ROOT_MAXBYTES_INO, FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::SysVipcDir => match component {
@@ -2575,6 +2597,8 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::KeysGcDelay
             | ProcNode::KeysMaxkeys
             | ProcNode::KeysMaxbytes
+            | ProcNode::KeysRootMaxkeys
+            | ProcNode::KeysRootMaxbytes
             | ProcNode::PipeMaxSize
             | ProcNode::LeaseBreakTime
             | ProcNode::InotifyMaxUserInstances
@@ -2637,6 +2661,8 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::KeysGcDelay
             | ProcNode::KeysMaxkeys
             | ProcNode::KeysMaxbytes
+            | ProcNode::KeysRootMaxkeys
+            | ProcNode::KeysRootMaxbytes
             | ProcNode::PipeMaxSize
             | ProcNode::LeaseBreakTime
             | ProcNode::InotifyMaxUserInstances
@@ -2744,6 +2770,8 @@ impl FileSystemBackend for ProcFs {
             Some(ProcNode::KeysGcDelay) => keyring::write_key_gc_delay(buf, offset),
             Some(ProcNode::KeysMaxkeys) => keyring::write_key_maxkeys(buf, offset),
             Some(ProcNode::KeysMaxbytes) => keyring::write_key_maxbytes(buf, offset),
+            Some(ProcNode::KeysRootMaxkeys) => keyring::write_root_key_maxkeys(buf, offset),
+            Some(ProcNode::KeysRootMaxbytes) => keyring::write_root_key_maxbytes(buf, offset),
             Some(ProcNode::PipeMaxSize) => write_pipe_max_size(buf, offset),
             Some(ProcNode::LeaseBreakTime) => write_lease_break_time(buf, offset),
             Some(ProcNode::InotifyMaxUserInstances) => {

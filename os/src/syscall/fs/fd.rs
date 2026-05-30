@@ -69,10 +69,10 @@ pub(crate) fn install_file_fd(
     flags: OpenFlags,
     dir_path: Option<String>,
 ) -> SysResult {
+    let dir_path = file.working_dir().and(dir_path);
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-    let dir_path = file.working_dir().and(dir_path);
     let previous = inner.set_fd_entry(
         fd,
         FdTableEntry::from_file_with_dir_path(file, flags, dir_path),

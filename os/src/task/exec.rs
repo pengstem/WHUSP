@@ -300,6 +300,8 @@ impl ProcessControlBlock {
         let expected_user_stack_top = ustack_base
             .checked_add(USER_STACK_SIZE)
             .ok_or(SysError::E2BIG)?;
+        // Plan the user stack before committing the new memory set. Argument
+        // overflow should fail with E2BIG while the old image is still intact.
         let stack_layout = plan_user_stack(expected_user_stack_top, &args, &envs, &stack_info)?;
         let new_token = memory_set.token();
 

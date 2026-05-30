@@ -107,9 +107,8 @@ pub(super) fn resolve_stat_from(
             return stat.ok_or(SysError::ENOENT);
         }
     }
-    if is_absolute
-        && snapshot.context.is_global_root()
-        && let Some(stat) = stat_static_path(path)
+    if let Ok(global_path) = normalize_path_from(snapshot, dirfd, path)
+        && let Some(stat) = stat_static_path(global_path.as_str())
     {
         return Ok(stat);
     }

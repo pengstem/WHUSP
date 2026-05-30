@@ -86,6 +86,8 @@ const SYSCALL_GET_ROBUST_LIST: usize = 100;
 const SYSCALL_NANOSLEEP: usize = 101;
 const SYSCALL_GETITIMER: usize = 102;
 const SYSCALL_SETITIMER: usize = 103;
+const SYSCALL_INIT_MODULE: usize = 105;
+const SYSCALL_DELETE_MODULE: usize = 106;
 const SYSCALL_TIMER_CREATE: usize = 107;
 const SYSCALL_TIMER_GETTIME: usize = 108;
 const SYSCALL_TIMER_GETOVERRUN: usize = 109;
@@ -209,6 +211,7 @@ const SYSCALL_OPEN_BY_HANDLE_AT: usize = 265;
 const SYSCALL_CLOCK_ADJTIME: usize = 266;
 const SYSCALL_SYNCFS: usize = 267;
 const SYSCALL_SETNS: usize = 268;
+const SYSCALL_FINIT_MODULE: usize = 273;
 const SYSCALL_SCHED_SETATTR: usize = 274;
 const SYSCALL_SCHED_GETATTR: usize = 275;
 const SYSCALL_RENAMEAT2: usize = 276;
@@ -249,6 +252,7 @@ pub(crate) mod errno;
 mod fs;
 mod futex;
 pub(crate) mod keyring;
+mod kmodule;
 mod memory;
 pub(crate) mod msg;
 mod net;
@@ -266,6 +270,7 @@ use errno::{SysError, ret};
 use fs::*;
 use futex::*;
 use keyring::*;
+use kmodule::*;
 use memory::*;
 use msg::*;
 use net::*;
@@ -630,6 +635,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SYNC => sys_sync(),
         SYSCALL_FSYNC => sys_fsync(args[0]),
         SYSCALL_SYNCFS => sys_syncfs(args[0]),
+        SYSCALL_INIT_MODULE => sys_init_module(args[0] as *const u8, args[1], args[2] as *const u8),
+        SYSCALL_DELETE_MODULE => sys_delete_module(args[0] as *const u8, args[1] as u32),
         SYSCALL_TIMERFD_CREATE => sys_timerfd_create(args[0] as i32, args[1] as u32),
         SYSCALL_UTIMENSAT => sys_utimensat(
             args[0] as isize,
@@ -938,6 +945,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_CLOCK_ADJTIME => sys_clock_adjtime(args[0] as i32, args[1] as *mut LinuxTimex),
         SYSCALL_SETNS => sys_setns(args[0], args[1]),
+        SYSCALL_FINIT_MODULE => sys_finit_module(args[0], args[1] as *const u8, args[2] as u32),
         SYSCALL_SOCKET => sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),
         SYSCALL_SOCKETPAIR => {
             sys_socketpair(args[0] as i32, args[1] as i32, args[2] as i32, args[3])
