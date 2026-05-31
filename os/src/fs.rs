@@ -521,6 +521,9 @@ pub trait File: Send + Sync {
     fn is_dev_full(&self) -> bool {
         false
     }
+    fn is_eventfd(&self) -> bool {
+        false
+    }
     fn is_memfd(&self) -> bool {
         false
     }

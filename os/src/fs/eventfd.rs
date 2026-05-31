@@ -170,6 +170,10 @@ impl File for EventFd {
     fn set_status_flags(&self, flags: OpenFlags) {
         self.status_flags.set(flags);
     }
+
+    fn is_eventfd(&self) -> bool {
+        true
+    }
 }
 
 pub(crate) fn make_eventfd(initval: u64, semaphore: bool) -> Arc<dyn File + Send + Sync> {

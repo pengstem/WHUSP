@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    UserBufferAccess, read_user_array_item, read_user_value,
+    UserBufferAccess, read_user_array_item, read_user_value, read_user_value_with_mmap_fault,
     translated_byte_buffer_checked_with_mmap_fault, write_user_value,
 };
 use super::fanotify::{fanotify_notify_access, fanotify_notify_modify};
@@ -258,6 +258,23 @@ fn check_pipe_write_peer(entry: &FdTableEntry, has_data: bool) -> SysResult<()> 
         return Err(SysError::EPIPE);
     }
     Ok(())
+}
+
+fn precheck_eventfd_write_value(
+    file: &(dyn File + Send + Sync),
+    token: usize,
+    buf: *const u8,
+) -> SysResult<()> {
+    if !file.is_eventfd() {
+        return Ok(());
+    }
+
+    let value = read_user_value_with_mmap_fault(token, buf.cast::<u64>())?;
+    if value == u64::MAX {
+        Err(SysError::EINVAL)
+    } else {
+        Ok(())
+    }
 }
 
 fn checked_position_offset(offset: usize) -> SysResult<usize> {
@@ -1187,12 +1204,24 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
         return Err(SysError::ENOSPC);
     }
     check_pipe_write_peer(&entry, len > 0)?;
-    ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
-    let allowed_len = allowed_write_len_for_entry(&entry, len)?;
-    file.check_write(
-        allowed_len,
-        entry.status_flags().contains(OpenFlags::APPEND),
-    )?;
+    let allowed_len = if file.is_eventfd() {
+        let allowed_len = allowed_write_len_for_entry(&entry, len)?;
+        file.check_write(
+            allowed_len,
+            entry.status_flags().contains(OpenFlags::APPEND),
+        )?;
+        precheck_eventfd_write_value(file.as_ref(), token, buf)?;
+        ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
+        allowed_len
+    } else {
+        ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
+        let allowed_len = allowed_write_len_for_entry(&entry, len)?;
+        file.check_write(
+            allowed_len,
+            entry.status_flags().contains(OpenFlags::APPEND),
+        )?;
+        allowed_len
+    };
     if file.write_ignores_user_buffer() {
         // CONTEXT: AF_ALG hash request writes in the current contest subset do
         // not consume payload bytes; skipping the copy keeps af_alg04 from
