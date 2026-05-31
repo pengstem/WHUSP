@@ -96,7 +96,7 @@ pub fn sys_setpgid(pid: isize, pgid: isize) -> SysResult {
 
 pub fn sys_getpgid(pid: isize) -> SysResult {
     if pid < 0 {
-        return Err(SysError::EINVAL);
+        return Err(SysError::ESRCH);
     }
     let current = current_process();
     let target = if pid == 0 || pid as usize == current.getpid() {
