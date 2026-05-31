@@ -51,6 +51,7 @@ const SYSCALL_FCHOWN: usize = 55;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
 const SYSCALL_PIPE2: usize = 59;
+const SYSCALL_QUOTACTL: usize = 60;
 const SYSCALL_GETDENTS64: usize = 61;
 const SYSCALL_LSEEK: usize = 62;
 const SYSCALL_READ: usize = 63;
@@ -245,6 +246,7 @@ const SYSCALL_CLONE3: usize = 435;
 const SYSCALL_OPENAT2: usize = 437;
 const SYSCALL_FACCESSAT2: usize = 439;
 const SYSCALL_EPOLL_PWAIT2: usize = 441;
+const SYSCALL_QUOTACTL_FD: usize = 443;
 const SYSCALL_MEMFD_SECRET: usize = 447;
 
 mod aio;
@@ -539,6 +541,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_CLOSE => sys_close(args[0]),
         SYSCALL_PIPE2 => sys_pipe2(args[0] as *mut i32, args[1] as u32),
+        SYSCALL_QUOTACTL => sys_quotactl(
+            args[0] as i32,
+            args[1] as *const u8,
+            args[2] as u32,
+            args[3],
+        ),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_LSEEK => sys_lseek(args[0], args[1] as i64, args[2]),
         SYSCALL_READV => sys_readv(args[0], args[1] as *const LinuxIovec, args[2]),
@@ -689,6 +697,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_IO_URING_REGISTER => {
             sys_io_uring_register(args[0], args[1] as u32, args[2], args[3] as u32)
         }
+        SYSCALL_QUOTACTL_FD => sys_quotactl_fd(args[0], args[1] as i32, args[2] as u32, args[3]),
         SYSCALL_IO_PGETEVENTS => sys_io_pgetevents(
             args[0],
             args[1] as isize,

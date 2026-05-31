@@ -231,6 +231,9 @@ whusp_setup_runtime_environment() {
     /musl/busybox rm -f /tmp/bin/e4crypt
     /musl/busybox printf '#!/musl/busybox sh\\nif [ "$1" = "add_key" ] && [ -n "$2" ]; then /musl/busybox touch "$2/.whusp_e4crypt_encrypted"; exit $?; fi\\nexit 1\\n' > /tmp/bin/e4crypt
     /musl/busybox chmod +x /tmp/bin/e4crypt
+    /musl/busybox rm -f /tmp/bin/quotacheck
+    /musl/busybox printf '#!/musl/busybox sh\\nfor arg in "$@"; do mountpoint="$arg"; done\\n[ -n "$mountpoint" ] || exit 1\\n/musl/busybox touch "$mountpoint/aquota.user" "$mountpoint/aquota.group"\\nexit $?\\n' > /tmp/bin/quotacheck
+    /musl/busybox chmod +x /tmp/bin/quotacheck
     export PATH=/tmp/bin:/musl:/glibc:$PATH
 }
 

@@ -45,9 +45,9 @@ const PROC_BUS_INPUT_DEVICES: &[u8] =
 const SYS_INPUT0_NAME: &[u8] = b"virtual-device-ltp\n";
 const PROC_RANDOM_ENTROPY_AVAIL: &[u8] = b"256\n";
 const MODULES_LOOP_DEP: &[u8] =
-    b"kernel/drivers/block/loop.ko:\nkernel/net/dns_resolver/dns_resolver.ko:\n";
+    b"kernel/drivers/block/loop.ko:\nkernel/fs/quota/quota_v2.ko:\nkernel/net/dns_resolver/dns_resolver.ko:\n";
 const MODULES_LOOP_BUILTIN: &[u8] =
-    b"kernel/drivers/block/loop.ko\nkernel/net/dns_resolver/dns_resolver.ko\n";
+    b"kernel/drivers/block/loop.ko\nkernel/fs/quota/quota_v2.ko\nkernel/net/dns_resolver/dns_resolver.ko\n";
 const MODULES_ALIAS: &[u8] = b"";
 const MODULES_ORDER: &[u8] = b"kernel/net/dns_resolver/dns_resolver.ko\n";
 const MODULES_SYMBOLS: &[u8] = b"";

@@ -369,26 +369,28 @@ impl ShmManager {
             let key = segment.key;
             self.segments.remove(&shmid);
             if key != IPC_PRIVATE {
-                self.keyed_segments.remove(&key);
+                self.remove_key_if_current(key, shmid);
             }
         }
         Ok(())
     }
 
     fn mark_for_delete(&mut self, shmid: usize, caller: &ShmCaller<'_>) -> Result<(), ShmError> {
-        let Some(segment) = self.segments.get_mut(&shmid) else {
-            return Err(ShmError::Invalid);
+        let (key, attach_count) = {
+            let Some(segment) = self.segments.get_mut(&shmid) else {
+                return Err(ShmError::Invalid);
+            };
+            if !segment.is_owner_or_creator(caller) {
+                return Err(ShmError::NotPermitted);
+            }
+            segment.marked_for_delete = true;
+            segment.last_pid = caller.pid;
+            (segment.key, segment.attach_count)
         };
-        if !segment.is_owner_or_creator(caller) {
-            return Err(ShmError::NotPermitted);
-        }
-        segment.marked_for_delete = true;
-        segment.last_pid = caller.pid;
-        let key = segment.key;
         if key != IPC_PRIVATE {
-            self.keyed_segments.remove(&key);
+            self.remove_key_if_current(key, shmid);
         }
-        if segment.attach_count == 0 {
+        if attach_count == 0 {
             self.segments.remove(&shmid);
         }
         Ok(())
@@ -468,6 +470,12 @@ impl ShmManager {
 
     fn highest_index(&self) -> usize {
         self.segments.keys().next_back().copied().unwrap_or(0)
+    }
+
+    fn remove_key_if_current(&mut self, key: isize, shmid: usize) {
+        if self.keyed_segments.get(&key).copied() == Some(shmid) {
+            self.keyed_segments.remove(&key);
+        }
     }
 
     fn proc_sysvipc_shm_content(&self) -> String {

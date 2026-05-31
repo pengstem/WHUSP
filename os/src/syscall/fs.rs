@@ -11,6 +11,7 @@ mod mount;
 mod path;
 pub(crate) mod permissions;
 mod poll;
+mod quota;
 mod stat;
 mod swap;
 mod tty;
@@ -55,6 +56,7 @@ pub use path::{
     sys_symlinkat, sys_truncate, sys_umask, sys_unlinkat, sys_utimensat,
 };
 pub use poll::{sys_ppoll, sys_pselect6};
+pub use quota::{sys_quotactl, sys_quotactl_fd};
 pub use stat::{
     sys_fchmod, sys_fchmodat, sys_fchown, sys_fchownat, sys_fgetxattr, sys_fremovexattr,
     sys_fsetxattr, sys_fstat, sys_fstatfs, sys_getxattr, sys_lgetxattr, sys_lremovexattr,
