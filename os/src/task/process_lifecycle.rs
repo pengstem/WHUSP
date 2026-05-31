@@ -134,6 +134,7 @@ impl ProcessControlBlock {
                     resource_limits: ProcessResourceLimits::new(),
                     process_keyring: None,
                     session_keyring: None,
+                    reqkey_default: 0,
                     pkey_rights: empty_process_pkey_rights(),
                     membarrier_private_expedited_registered: false,
                     signal_actions: [SignalAction::default(); super::SIGNAL_INFO_SLOTS],
@@ -239,6 +240,7 @@ impl ProcessControlBlock {
         let credentials = parent.credentials.clone();
         let resource_limits = parent.resource_limits;
         let session_keyring = parent.session_keyring;
+        let reqkey_default = parent.reqkey_default;
         let pkey_rights = parent.pkey_rights;
         let comm = parent.comm.clone();
         let dumpable = parent.dumpable;
@@ -317,6 +319,7 @@ impl ProcessControlBlock {
                     resource_limits,
                     process_keyring: None,
                     session_keyring,
+                    reqkey_default,
                     pkey_rights,
                     membarrier_private_expedited_registered,
                     signal_actions,

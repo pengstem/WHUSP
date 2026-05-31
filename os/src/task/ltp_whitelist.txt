@@ -209,6 +209,10 @@ stat03_64
 semget02
 waitid06
 msgsnd02
+request_key01
+request_key02
+request_key04
+request_key05
 ioctl_loop06
 fcntl29_64
 dup07

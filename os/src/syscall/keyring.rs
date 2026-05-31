@@ -1,5 +1,6 @@
 use crate::sync::UPIntrFreeCell;
 use crate::task::{current_process, current_task, current_user_token};
+use crate::timer::get_time_ms;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
@@ -28,6 +29,7 @@ const KEYCTL_CLEAR: usize = 7;
 const KEYCTL_UNLINK: usize = 9;
 const KEYCTL_READ: usize = 11;
 const KEYCTL_SET_REQKEY_KEYRING: usize = 14;
+const KEYCTL_SET_TIMEOUT: usize = 15;
 const KEYCTL_INVALIDATE: usize = 21;
 
 const KEY_REQKEY_DEFL_DEFAULT: usize = 0;
@@ -37,6 +39,7 @@ const KEY_REQKEY_DEFL_SESSION_KEYRING: usize = 3;
 const KEY_REQKEY_DEFL_USER_KEYRING: usize = 4;
 const KEY_REQKEY_DEFL_USER_SESSION_KEYRING: usize = 5;
 
+const KEY_POS_WRITE: u32 = 0x0400_0000;
 const DEFAULT_KEY_PERM: u32 = 0x3f01_0000;
 
 const USER_KEY_MAX_PAYLOAD: usize = 32_767;
@@ -76,8 +79,8 @@ impl KeyKind {
             "logon" => Some(Self::Logon),
             "big_key" => Some(Self::BigKey),
             "encrypted" => Some(Self::Encrypted),
-            "asymmetric" | "dns_resolver" | "cifs.idmap" | "cifs.spnego" | "pkcs7_test"
-            | "rxrpc" | "rxrpc_s" => Some(Self::ParserOnly),
+            "asymmetric" | "trusted" | "dns_resolver" | "cifs.idmap" | "cifs.spnego"
+            | "pkcs7_test" | "rxrpc" | "rxrpc_s" => Some(Self::ParserOnly),
             _ => None,
         }
     }
@@ -122,8 +125,9 @@ impl KeyKind {
             Self::ParserOnly => {
                 // UNFINISHED: These key types are metadata-only stand-ins for
                 // Linux key types that have payload preparsers but no update
-                // method. Real asymmetric, DNS resolver, CIFS/SPNEGO, PKCS#7,
-                // and RxRPC parsing is not implemented in this contest subset.
+                // method. Real asymmetric, trusted, DNS resolver, CIFS/SPNEGO,
+                // PKCS#7, and RxRPC parsing is not implemented in this
+                // contest subset.
                 Ok(())
             }
         }
@@ -138,6 +142,8 @@ struct KeyEntry {
     payload_len: usize,
     perm: u32,
     negative: bool,
+    revoked: bool,
+    expires_at_ms: Option<usize>,
     quota_bytes: usize,
     quota_charged: bool,
 }
@@ -158,6 +164,8 @@ impl KeyEntry {
             payload_len,
             perm: DEFAULT_KEY_PERM,
             negative: false,
+            revoked: false,
+            expires_at_ms: None,
             quota_bytes,
             quota_charged,
         }
@@ -172,9 +180,27 @@ impl KeyEntry {
             payload_len: 0,
             perm: DEFAULT_KEY_PERM,
             negative: true,
+            revoked: false,
+            expires_at_ms: None,
             quota_bytes: 0,
             quota_charged: false,
         }
+    }
+
+    fn access_error(&self) -> Option<SysError> {
+        if self.revoked {
+            return Some(SysError::EKEYREVOKED);
+        }
+        if self
+            .expires_at_ms
+            .is_some_and(|expires_at_ms| get_time_ms() >= expires_at_ms)
+        {
+            return Some(SysError::EKEYEXPIRED);
+        }
+        if self.negative {
+            return Some(SysError::ENOKEY);
+        }
+        None
     }
 }
 
@@ -256,6 +282,9 @@ impl KeyManager {
 
     fn ensure_keyring(&self, serial: i32) -> SysResult {
         let entry = self.keys.get(&serial).ok_or(SysError::ENOKEY)?;
+        if let Some(err) = entry.access_error() {
+            return Err(err);
+        }
         if !entry.negative && entry.kind == KeyKind::Keyring {
             Ok(0)
         } else {
@@ -265,11 +294,10 @@ impl KeyManager {
 
     fn ensure_key(&self, serial: i32) -> SysResult {
         let entry = self.keys.get(&serial).ok_or(SysError::ENOKEY)?;
-        if entry.negative {
-            Err(SysError::ENOKEY)
-        } else {
-            Ok(0)
+        if let Some(err) = entry.access_error() {
+            return Err(err);
         }
+        Ok(0)
     }
 
     fn find_in_keyring(
@@ -346,8 +374,7 @@ impl KeyManager {
             if self
                 .keys
                 .get(&serial)
-                .map(|entry| entry.negative)
-                .unwrap_or(false)
+                .is_some_and(|entry| entry.access_error().is_some())
             {
                 let replacement = KeyEntry::new(kind, description, owner_uid, payload_len);
                 self.reserve_quota(&replacement)?;
@@ -374,6 +401,11 @@ impl KeyManager {
     ) -> SysResult<i32> {
         for keyring in keyrings {
             if let Some(serial) = self.find_in_keyring(*keyring, kind, description)? {
+                if let Some(entry) = self.keys.get(&serial)
+                    && let Some(err) = entry.access_error()
+                {
+                    return Err(err);
+                }
                 return Ok(serial);
             }
         }
@@ -398,7 +430,68 @@ impl KeyManager {
         Ok(serial)
     }
 
+    fn release_quota_values(&mut self, owner_uid: u32, quota_bytes: usize) {
+        if let Some(quota) = self.user_quotas.get_mut(&owner_uid) {
+            quota.keys = quota.keys.saturating_sub(1);
+            quota.bytes = quota.bytes.saturating_sub(quota_bytes);
+        }
+    }
+
     fn revoke_key(&mut self, serial: i32) -> SysResult {
+        let quota_to_release = {
+            let entry = self.keys.get_mut(&serial).ok_or(SysError::ENOKEY)?;
+            if entry.negative {
+                return Err(SysError::ENOKEY);
+            }
+            if entry.revoked {
+                return Err(SysError::EKEYREVOKED);
+            }
+            if entry
+                .expires_at_ms
+                .is_some_and(|expires_at_ms| get_time_ms() >= expires_at_ms)
+            {
+                return Err(SysError::EKEYEXPIRED);
+            }
+            entry.revoked = true;
+            entry.expires_at_ms = None;
+            if entry.quota_charged {
+                entry.quota_charged = false;
+                Some((entry.owner_uid, entry.quota_bytes))
+            } else {
+                None
+            }
+        };
+        if let Some((owner_uid, quota_bytes)) = quota_to_release {
+            self.release_quota_values(owner_uid, quota_bytes);
+        }
+        Ok(0)
+    }
+
+    fn keyring_has_write_permission(&self, serial: i32) -> SysResult<bool> {
+        let entry = self.keys.get(&serial).ok_or(SysError::ENOKEY)?;
+        if let Some(err) = entry.access_error() {
+            return Err(err);
+        }
+        if entry.kind != KeyKind::Keyring {
+            return Err(SysError::ENOTDIR);
+        }
+        Ok(entry.perm & KEY_POS_WRITE != 0)
+    }
+
+    fn set_timeout(&mut self, serial: i32, timeout_sec: usize) -> SysResult {
+        let entry = self.keys.get_mut(&serial).ok_or(SysError::ENOKEY)?;
+        if let Some(err) = entry.access_error() {
+            return Err(err);
+        }
+        entry.expires_at_ms = if timeout_sec == 0 {
+            None
+        } else {
+            Some(get_time_ms().saturating_add(timeout_sec.saturating_mul(1000)))
+        };
+        Ok(0)
+    }
+
+    fn remove_key(&mut self, serial: i32) -> SysResult {
         let entry = self.keys.remove(&serial).ok_or(SysError::ENOKEY)?;
         if entry.negative {
             return Err(SysError::ENOKEY);
@@ -454,8 +547,8 @@ impl KeyManager {
 
     fn set_perm(&mut self, serial: i32, perm: u32) -> SysResult {
         let entry = self.keys.get_mut(&serial).ok_or(SysError::ENOKEY)?;
-        if entry.negative {
-            return Err(SysError::ENOKEY);
+        if let Some(err) = entry.access_error() {
+            return Err(err);
         }
         entry.perm = perm;
         Ok(0)
@@ -463,8 +556,11 @@ impl KeyManager {
 
     fn update_key(&mut self, serial: i32, payload_len: usize) -> SysResult {
         let entry = self.keys.get_mut(&serial).ok_or(SysError::ENOKEY)?;
-        if entry.negative {
-            return Err(SysError::ENOKEY);
+        if let Some(err) = entry.access_error() {
+            return Err(err);
+        }
+        if entry.perm & KEY_POS_WRITE == 0 {
+            return Err(SysError::EACCES);
         }
         match entry.kind {
             KeyKind::User | KeyKind::Logon | KeyKind::BigKey | KeyKind::Encrypted => {
@@ -477,8 +573,8 @@ impl KeyManager {
 
     fn read_key(&self, serial: i32, buf_len: usize) -> SysResult<(usize, Vec<u8>)> {
         let entry = self.keys.get(&serial).ok_or(SysError::ENOKEY)?;
-        if entry.negative {
-            return Err(SysError::ENOKEY);
+        if let Some(err) = entry.access_error() {
+            return Err(err);
         }
         if entry.kind == KeyKind::Keyring {
             let full_len = entry.links.len() * core::mem::size_of::<i32>();
@@ -533,6 +629,18 @@ fn key_maxbytes() -> usize {
 
 fn current_owner_uid() -> u32 {
     current_process().credentials().fsuid
+}
+
+fn current_reqkey_default() -> usize {
+    current_process().inner_exclusive_access().reqkey_default
+}
+
+fn set_current_reqkey_default(new_default: usize) -> usize {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let old_default = inner.reqkey_default;
+    inner.reqkey_default = new_default;
+    old_default
 }
 
 fn validate_payload(payload: *const u8, len: usize) -> SysResult {
@@ -681,6 +789,48 @@ fn resolve_key_id(id: i32, create_special: bool) -> SysResult<i32> {
     }
 }
 
+fn resolve_default_reqkey_destination() -> SysResult<Option<i32>> {
+    if let Some(task) = current_task()
+        && let Some(serial) = task.inner_exclusive_access().thread_keyring
+    {
+        return Ok(Some(serial));
+    }
+    let process = current_process();
+    {
+        let inner = process.inner_exclusive_access();
+        if let Some(serial) = inner.process_keyring {
+            return Ok(Some(serial));
+        }
+        if let Some(serial) = inner.session_keyring {
+            return Ok(Some(serial));
+        }
+    }
+    ensure_user_keyring(true, true).map(Some)
+}
+
+fn resolve_reqkey_destination(dest_keyring_id: i32) -> SysResult<Option<i32>> {
+    if dest_keyring_id != 0 {
+        return resolve_keyring_id(dest_keyring_id, true).map(Some);
+    }
+    match current_reqkey_default() {
+        KEY_REQKEY_DEFL_DEFAULT => resolve_default_reqkey_destination(),
+        KEY_REQKEY_DEFL_THREAD_KEYRING => {
+            resolve_keyring_id(KEY_SPEC_THREAD_KEYRING, true).map(Some)
+        }
+        KEY_REQKEY_DEFL_PROCESS_KEYRING => {
+            resolve_keyring_id(KEY_SPEC_PROCESS_KEYRING, true).map(Some)
+        }
+        KEY_REQKEY_DEFL_SESSION_KEYRING => {
+            resolve_keyring_id(KEY_SPEC_SESSION_KEYRING, true).map(Some)
+        }
+        KEY_REQKEY_DEFL_USER_KEYRING => resolve_keyring_id(KEY_SPEC_USER_KEYRING, true).map(Some),
+        KEY_REQKEY_DEFL_USER_SESSION_KEYRING => {
+            resolve_keyring_id(KEY_SPEC_USER_SESSION_KEYRING, true).map(Some)
+        }
+        _ => Err(SysError::EINVAL),
+    }
+}
+
 fn optional_current_keyrings() -> Vec<i32> {
     let mut keyrings = Vec::new();
     if let Some(task) = current_task()
@@ -738,7 +888,7 @@ pub fn sys_add_key(
 pub fn sys_request_key(
     type_ptr: *const u8,
     description_ptr: *const u8,
-    _callout_info: *const u8,
+    callout_info: *const u8,
     dest_keyring_id: i32,
 ) -> SysResult {
     let kind = read_key_kind(type_ptr)?;
@@ -750,8 +900,14 @@ pub fn sys_request_key(
     let serial = match found {
         Ok(serial) => serial,
         Err(SysError::ENOKEY) => {
-            if !_callout_info.is_null() && dest_keyring_id != 0 {
-                let dest = resolve_keyring_id(dest_keyring_id, true)?;
+            if !callout_info.is_null()
+                && let Some(dest) = resolve_reqkey_destination(dest_keyring_id)?
+            {
+                let writable = KEY_MANAGER
+                    .exclusive_session(|manager| manager.keyring_has_write_permission(dest))?;
+                if !writable {
+                    return Err(SysError::EACCES);
+                }
                 let _ = KEY_MANAGER.exclusive_session(|manager| {
                     manager.create_negative_key(kind, description, current_owner_uid(), dest)
                 })?;
@@ -762,11 +918,16 @@ pub fn sys_request_key(
     };
     if dest_keyring_id != 0 {
         let dest = resolve_keyring_id(dest_keyring_id, true)?;
+        let writable =
+            KEY_MANAGER.exclusive_session(|manager| manager.keyring_has_write_permission(dest))?;
+        if !writable {
+            return Err(SysError::EACCES);
+        }
         KEY_MANAGER.exclusive_session(|manager| manager.link_key(dest, serial))?;
     }
     // UNFINISHED: Linux request_key() can invoke /sbin/request-key upcalls and
-    // create negative keys. This contest subset only searches existing visible
-    // keyrings and returns ENOKEY when no key is already present.
+    // instantiate keys. This contest subset records failed upcalls as negative
+    // keys but does not run the userspace /sbin/request-key helper.
     Ok(serial as isize)
 }
 
@@ -801,14 +962,24 @@ pub fn sys_keyctl(
             KEY_MANAGER.exclusive_session(|manager| manager.update_key(serial, arg4))?;
             Ok(0)
         }
-        KEYCTL_REVOKE | KEYCTL_INVALIDATE => {
+        KEYCTL_REVOKE => {
             let serial = resolve_key_id(arg2 as i32, false)?;
             KEY_MANAGER.exclusive_session(|manager| manager.revoke_key(serial))?;
+            Ok(0)
+        }
+        KEYCTL_INVALIDATE => {
+            let serial = resolve_key_id(arg2 as i32, false)?;
+            KEY_MANAGER.exclusive_session(|manager| manager.remove_key(serial))?;
             Ok(0)
         }
         KEYCTL_SETPERM => {
             let serial = resolve_key_id(arg2 as i32, false)?;
             KEY_MANAGER.exclusive_session(|manager| manager.set_perm(serial, arg3 as u32))?;
+            Ok(0)
+        }
+        KEYCTL_SET_TIMEOUT => {
+            let serial = resolve_key_id(arg2 as i32, false)?;
+            KEY_MANAGER.exclusive_session(|manager| manager.set_timeout(serial, arg3))?;
             Ok(0)
         }
         KEYCTL_CLEAR => {
@@ -841,14 +1012,17 @@ pub fn sys_keyctl(
             | KEY_REQKEY_DEFL_PROCESS_KEYRING
             | KEY_REQKEY_DEFL_SESSION_KEYRING
             | KEY_REQKEY_DEFL_USER_KEYRING
-            | KEY_REQKEY_DEFL_USER_SESSION_KEYRING => Ok(0),
+            | KEY_REQKEY_DEFL_USER_SESSION_KEYRING => {
+                let old_default = set_current_reqkey_default(arg2);
+                Ok(old_default as isize)
+            }
             _ => Err(SysError::EINVAL),
         },
         _ => {
             // UNFINISHED: The full Linux keyctl() command surface includes
-            // link/search, timeout, watch queues, and complete request-key
-            // policy. The implemented operations cover the current LTP keyctl
-            // regression subset without modeling the full Linux key service.
+            // link/search, watch queues, and complete request-key policy. The
+            // implemented operations cover the current LTP keyctl regression
+            // subset without modeling the full Linux key service.
             Err(SysError::ENOTSUP)
         }
     }

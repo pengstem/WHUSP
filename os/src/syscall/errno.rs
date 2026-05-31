@@ -66,6 +66,8 @@ pub enum SysError {
     ESTALE = 116,
     EDQUOT = 122,
     ENOKEY = 126,
+    EKEYEXPIRED = 127,
+    EKEYREVOKED = 128,
 }
 
 pub type SysResult<T = isize> = Result<T, SysError>;

@@ -615,6 +615,7 @@ pub struct ProcessControlBlockInner {
     pub resource_limits: ProcessResourceLimits,
     pub(crate) process_keyring: Option<i32>,
     pub(crate) session_keyring: Option<i32>,
+    pub(crate) reqkey_default: usize,
     pub(crate) pkey_rights: ProcessPKeyRights,
     pub membarrier_private_expedited_registered: bool,
     pub signal_actions: [SignalAction; SIGNAL_INFO_SLOTS],
