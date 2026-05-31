@@ -130,6 +130,7 @@ enum DevNode {
     Full,
     Random,
     Urandom,
+    Kmsg,
     Tty,
     TtyS0,
     Tty8,
@@ -158,6 +159,7 @@ impl DevNode {
             Self::Full => 6,
             Self::Random => 7,
             Self::Urandom => 8,
+            Self::Kmsg => 24,
             Self::Tty => 9,
             Self::TtyS0 => 10,
             Self::Tty8 => 11,
@@ -184,6 +186,7 @@ impl DevNode {
             Self::Full => linux_makedev(1, 7),
             Self::Random => linux_makedev(1, 8),
             Self::Urandom => linux_makedev(1, 9),
+            Self::Kmsg => linux_makedev(1, 11),
             Self::Tty => linux_makedev(5, 0),
             Self::TtyS0 => linux_makedev(4, 64),
             Self::Tty8 => linux_makedev(4, 8),
@@ -702,7 +705,7 @@ struct DevDirEntry {
     dtype: u8,
 }
 
-const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 22] = [
+const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 23] = [
     DevDirEntry {
         node: DevNode::Root,
         name: b".",
@@ -736,6 +739,11 @@ const ROOT_DEV_DIR_ENTRIES: [DevDirEntry; 22] = [
     DevDirEntry {
         node: DevNode::Urandom,
         name: b"urandom",
+        dtype: DT_CHR,
+    },
+    DevDirEntry {
+        node: DevNode::Kmsg,
+        name: b"kmsg",
         dtype: DT_CHR,
     },
     DevDirEntry {
@@ -895,6 +903,7 @@ fn node_from_ino(ino: u32) -> Option<DevNode> {
         6 => Some(DevNode::Full),
         7 => Some(DevNode::Random),
         8 => Some(DevNode::Urandom),
+        24 => Some(DevNode::Kmsg),
         9 => Some(DevNode::Tty),
         10 => Some(DevNode::TtyS0),
         11 => Some(DevNode::Tty8),
@@ -938,6 +947,7 @@ fn lookup_child(parent: DevNode, path: &str) -> Option<DevNode> {
             "full" => Some(DevNode::Full),
             "random" => Some(DevNode::Random),
             "urandom" => Some(DevNode::Urandom),
+            "kmsg" => Some(DevNode::Kmsg),
             "tty" => Some(DevNode::Tty),
             "ttyS0" => Some(DevNode::TtyS0),
             "tty8" => Some(DevNode::Tty8),
@@ -2420,6 +2430,7 @@ impl File for DevFsFile {
             | DevNode::Pts
             | DevNode::Null
             | DevNode::Rtc
+            | DevNode::Kmsg
             | DevNode::PtMx
             | DevNode::LoopControl => 0,
             DevNode::Zero | DevNode::Full => read_zero(user_buf),
@@ -2446,7 +2457,9 @@ impl File for DevFsFile {
             | DevNode::Full
             | DevNode::PtMx
             | DevNode::LoopControl => 0,
-            DevNode::Null | DevNode::Zero | DevNode::Random | DevNode::Urandom => user_buf.len(),
+            DevNode::Null | DevNode::Zero | DevNode::Random | DevNode::Urandom | DevNode::Kmsg => {
+                user_buf.len()
+            }
             DevNode::Tty | DevNode::TtyS0 | DevNode::Tty8 | DevNode::Tty9 => {
                 write_console(user_buf)
             }
@@ -2467,6 +2480,9 @@ impl File for DevFsFile {
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
         if let Some(loop_id) = loop_node_id(self.node) {
             return write_loop_device_at(loop_id, offset, buf);
+        }
+        if self.node == DevNode::Kmsg {
+            return buf.len();
         }
         0
     }

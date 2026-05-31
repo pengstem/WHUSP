@@ -1,8 +1,8 @@
 use crate::sbi::shutdown;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{copy_to_user, write_user_value};
-use crate::task::{current_process, current_user_token};
-use crate::timer::get_time_clock_ticks;
+use crate::task::{current_process, current_user_token, processes_snapshot};
+use crate::timer::{get_time_clock_ticks, get_time_us};
 use alloc::format;
 use alloc::string::String;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -58,6 +58,24 @@ pub struct LinuxUtsName {
     version: [u8; UTS_FIELD_LEN],
     machine: [u8; UTS_FIELD_LEN],
     domainname: [u8; UTS_FIELD_LEN],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxSysInfo {
+    uptime: isize,
+    loads: [usize; 3],
+    totalram: usize,
+    freeram: usize,
+    sharedram: usize,
+    bufferram: usize,
+    totalswap: usize,
+    freeswap: usize,
+    procs: u16,
+    pad: u16,
+    totalhigh: usize,
+    freehigh: usize,
+    mem_unit: u32,
 }
 
 impl LinuxUtsName {
@@ -146,6 +164,21 @@ pub fn sys_uname(name: *mut LinuxUtsName) -> SysResult {
     // release override needed by Linux compatibility tests.
     let uts = LinuxUtsName::current_for_personality(current_process().personality());
     write_user_value(current_user_token(), name, &uts)?;
+    Ok(0)
+}
+
+pub fn sys_sysinfo(info: *mut LinuxSysInfo) -> SysResult {
+    let value = LinuxSysInfo {
+        uptime: (get_time_us() / 1_000_000) as isize,
+        totalram: 1024 * 1024 * 1024,
+        freeram: 900 * 1024 * 1024,
+        totalswap: 2 * 1024 * 1024 * 1024,
+        freeswap: 2 * 1024 * 1024 * 1024,
+        procs: processes_snapshot().len().min(u16::MAX as usize) as u16,
+        mem_unit: 1,
+        ..LinuxSysInfo::default()
+    };
+    write_user_value(current_user_token(), info, &value)?;
     Ok(0)
 }
 

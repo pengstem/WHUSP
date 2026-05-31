@@ -16,12 +16,12 @@ mod task;
 
 use self::id::TaskUserRes;
 use crate::arch::__switch;
-use crate::fs::untrack_regular_file_executable;
+use crate::fs::{OpenFlags, PathContext, open_file_in, untrack_regular_file_executable};
 use crate::sbi::shutdown;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::{release_flock_locks_for_closed_fd_table, release_record_locks_for_process};
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::*;
 use log::info;
@@ -71,6 +71,9 @@ pub use signal::{
 pub use signal::{SI_TKILL, SIGRT_1, SIGRTMIN};
 pub(crate) use signal::{flags_to_linux_sigset, linux_sigset_to_flags};
 pub use task::{DEFAULT_TIMER_SLACK_NS, SeccompSockFilter, TaskControlBlock, TaskStatus};
+
+const CORE_DUMP_STATUS_BIT: i32 = 0x80;
+const CORE_DUMP_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 fn with_current_task_and_process(
     task_fn: impl FnOnce(&TaskControlBlock),
@@ -525,6 +528,21 @@ fn nearest_child_reaper(parent: Option<Arc<ProcessControlBlock>>) -> Arc<Process
     INITPROC.clone()
 }
 
+fn signal_status_has_core_dump(exit_code: i32) -> bool {
+    exit_code < 0 && ((-exit_code) & CORE_DUMP_STATUS_BIT) != 0
+}
+
+fn write_core_dump(context: PathContext, path: String, bytes: Vec<u8>) {
+    let Ok(file) = open_file_in(
+        context,
+        path.as_str(),
+        OpenFlags::CREATE | OpenFlags::WRONLY | OpenFlags::TRUNC,
+    ) else {
+        return;
+    };
+    let _ = file.write_at(0, bytes.as_slice());
+}
+
 fn exit_current(exit_code: i32, group_exit: bool) {
     account_current_system_time();
     let current = current_task().expect("exit_current requires a current task");
@@ -579,7 +597,18 @@ fn exit_current(exit_code: i32, group_exit: bool) {
         terminate_sibling_threads(&process, tid, process_token, process_id, exit_code);
         remove_ready_tasks_of_process(pid);
         futex::remove_process_futex_waiters(pid);
-        let (parent, children, fd_table, flushes, executable_node, exit_signal, process_keyring) = {
+        let core_context =
+            signal_status_has_core_dump(exit_code).then(|| process.path_snapshot().context);
+        let (
+            parent,
+            children,
+            fd_table,
+            flushes,
+            executable_node,
+            exit_signal,
+            process_keyring,
+            core_dump,
+        ) = {
             let mut process_inner = process.inner_exclusive_access();
             // mark this process as a zombie process
             process_inner.is_zombie = true;
@@ -590,6 +619,15 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             let parent = process_inner.parent.as_ref().and_then(|p| p.upgrade());
             let exit_signal = process_inner.exit_signal;
             let children = core::mem::take(&mut process_inner.children);
+            let core_dump = core_context.map(|context| {
+                (
+                    context,
+                    crate::fs::core_pattern_for_pid(pid),
+                    process_inner
+                        .memory_set
+                        .core_dump_bytes(CORE_DUMP_MAX_BYTES),
+                )
+            });
             // deallocate other data in user space i.e. program code/data section
             let flushes = process_inner.memory_set.recycle_data_pages();
             let executable_node = process_inner.executable_node.take();
@@ -611,9 +649,13 @@ fn exit_current(exit_code: i32, group_exit: bool) {
                 executable_node,
                 exit_signal,
                 process_keyring,
+                core_dump,
             )
         };
 
+        if let Some((context, path, bytes)) = core_dump {
+            write_core_dump(context, path, bytes);
+        }
         if let Some(keyring) = process_keyring {
             crate::syscall::keyring::release_keyring_tree(keyring);
         }

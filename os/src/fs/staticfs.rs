@@ -45,14 +45,14 @@ const PROC_BUS_INPUT_DEVICES: &[u8] =
 const SYS_INPUT0_NAME: &[u8] = b"virtual-device-ltp\n";
 const PROC_RANDOM_ENTROPY_AVAIL: &[u8] = b"256\n";
 const MODULES_LOOP_DEP: &[u8] =
-    b"kernel/drivers/block/loop.ko:\nkernel/fs/quota/quota_v2.ko:\nkernel/net/dns_resolver/dns_resolver.ko:\n";
+    b"kernel/drivers/block/loop.ko:\nkernel/drivers/memory/hwpoison_inject.ko:\nkernel/fs/quota/quota_v2.ko:\nkernel/net/dns_resolver/dns_resolver.ko:\n";
 const MODULES_LOOP_BUILTIN: &[u8] =
-    b"kernel/drivers/block/loop.ko\nkernel/fs/quota/quota_v2.ko\nkernel/net/dns_resolver/dns_resolver.ko\n";
+    b"kernel/drivers/block/loop.ko\nkernel/drivers/memory/hwpoison_inject.ko\nkernel/fs/quota/quota_v2.ko\nkernel/net/dns_resolver/dns_resolver.ko\n";
 const MODULES_ALIAS: &[u8] = b"";
 const MODULES_ORDER: &[u8] = b"kernel/net/dns_resolver/dns_resolver.ko\n";
 const MODULES_SYMBOLS: &[u8] = b"";
 const MODULES_CONFIG: &[u8] =
-    b"CONFIG_FS_VERITY=y\nCONFIG_USER_DECRYPTED_DATA=y\nCONFIG_PREEMPT_RT=y\n";
+    b"CONFIG_FS_VERITY=y\nCONFIG_USER_DECRYPTED_DATA=y\nCONFIG_PREEMPT_RT=y\nCONFIG_MEMORY_FAILURE=y\nCONFIG_HWPOISON_INJECT=y\n";
 const DNS_RESOLVER_KO: &[u8] = b"WHUSP built-in dns_resolver module placeholder\n";
 const SYS_DEV_BLOCK_TMPFS_UEVENT: &[u8] = b"DEVNAME=loop0\n";
 #[cfg(target_arch = "loongarch64")]

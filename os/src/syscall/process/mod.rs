@@ -32,5 +32,8 @@ pub use sched::{
     sys_sched_setaffinity, sys_sched_setattr, sys_sched_setparam, sys_sched_setscheduler,
     sys_setpriority,
 };
-pub use system::{LinuxUtsName, sys_getrandom, sys_personality, sys_reboot, sys_syslog, sys_uname};
+pub use system::{
+    LinuxSysInfo, LinuxUtsName, sys_getrandom, sys_personality, sys_reboot, sys_sysinfo,
+    sys_syslog, sys_uname,
+};
 pub(crate) use system::{proc_sys_kernel_printk_content, write_proc_sys_kernel_printk};

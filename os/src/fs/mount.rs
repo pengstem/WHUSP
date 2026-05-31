@@ -1866,6 +1866,22 @@ pub(crate) fn mount_cgroup2_at(
     )
 }
 
+pub(crate) fn mount_cgroup_memory_at(
+    namespace_id: MountNamespaceId,
+    target: WorkingDir,
+    target_path: &str,
+    read_only: bool,
+) -> Result<MountId, MountError> {
+    mount_pseudo_fs_at_with_options(
+        namespace_id,
+        target,
+        Box::new(CgroupFs::new_v1_memory()),
+        "cgroup",
+        target_path,
+        mount_options(read_only),
+    )
+}
+
 pub(crate) fn assign_pid_to_cgroup(node: VfsNodeId, pid: usize) -> FsResult {
     with_mount(node.mount_id, |mount| {
         mount.assign_cgroup_pid(node.ino, pid)
@@ -2195,6 +2211,31 @@ fn mount_kernel_pseudo_filesystems() {
             }
         }
         Err(err) => warn!("failed to mount devfs at /dev: {err:?}"),
+    }
+
+    let Some(sys_dir) = ensure_primary_dir("sys", 0o755) else {
+        return;
+    };
+    let Some(sys_fs_dir) = ensure_primary_child_dir(sys_dir, "fs", 0o755, "/sys/fs") else {
+        return;
+    };
+    let Some(cgroup_dir) = ensure_primary_child_dir(sys_fs_dir, "cgroup", 0o755, "/sys/fs/cgroup")
+    else {
+        return;
+    };
+    let Some(memory_dir) =
+        ensure_primary_child_dir(cgroup_dir, "memory", 0o755, "/sys/fs/cgroup/memory")
+    else {
+        return;
+    };
+    match mount_cgroup_memory_at(
+        ROOT_MOUNT_NAMESPACE,
+        memory_dir,
+        "/sys/fs/cgroup/memory",
+        false,
+    ) {
+        Ok(_) => info!("filesystem mounted from cgroup memory at /sys/fs/cgroup/memory"),
+        Err(err) => warn!("failed to mount cgroup memory at /sys/fs/cgroup/memory: {err:?}"),
     }
 }
 

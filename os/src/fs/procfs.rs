@@ -62,6 +62,7 @@ const KEYS_MAXKEYS_INO: u32 = 26;
 const KEYS_MAXBYTES_INO: u32 = 27;
 const KEYS_ROOT_MAXKEYS_INO: u32 = 62;
 const KEYS_ROOT_MAXBYTES_INO: u32 = 63;
+const MODULES_INO: u32 = 64;
 const SYS_VM_DIR_INO: u32 = 28;
 const DROP_CACHES_INO: u32 = 29;
 const VFS_CACHE_PRESSURE_INO: u32 = 31;
@@ -120,6 +121,8 @@ const PID_NS_UTS_OFFSET: u32 = 16;
 const PID_EXE_OFFSET: u32 = 17;
 const PID_MOUNTINFO_OFFSET: u32 = 18;
 const PID_PAGEMAP_OFFSET: u32 = 19;
+const PID_COREDUMP_FILTER_OFFSET: u32 = 20;
+const PID_OOM_SCORE_ADJ_OFFSET: u32 = 21;
 const PID_FD_ENTRY_BASE: u32 = 1_000_000_000;
 const PID_FDINFO_ENTRY_BASE: u32 = 2_000_000_000;
 const PID_FD_ENTRY_STRIDE: u32 = 4096;
@@ -140,6 +143,7 @@ const DEFAULT_PIPE_USER_PAGES_SOFT: usize = PIPE_DEFAULT_CAPACITY / PAGE_SIZE;
 const DEFAULT_LEASE_BREAK_TIME: usize = 45;
 const DEFAULT_NET_IPV4_CONF_TAG: isize = 0;
 const PROC_MEMINFO_OBSERVED_CACHE_KB: usize = 64 * 1024;
+const PROC_MEMINFO_SWAP_TOTAL_KB: usize = 2 * 1024 * 1024;
 const PROC_NS_MNT_INO_BASE: u64 = 0x7000_0000;
 const PROC_NS_PID_INO_BASE: u64 = 0x7100_0000;
 const PROC_NS_USER_INO_BASE: u64 = 0x7200_0000;
@@ -147,12 +151,13 @@ const PROC_NS_UTS_INO_BASE: u64 = 0x7300_0000;
 const PROC_NS_INO_RANGE: u64 = 0x0100_0000;
 const ROOT_UTS_NAMESPACE_ID: usize = 1;
 const PROC_CONFIG_GZ: &[u8] = &[
-    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x73, 0xf6, 0xf7, 0x73, 0xf3, 0x74,
-    0x8f, 0x77, 0x0b, 0x8e, 0x0f, 0x73, 0x0d, 0xf2, 0x0c, 0x89, 0xb4, 0xad, 0xe4, 0x72, 0x86, 0x08,
-    0x85, 0x06, 0xbb, 0x06, 0xc5, 0xbb, 0xb8, 0x3a, 0x07, 0x45, 0x06, 0x84, 0xb8, 0xba, 0xc4, 0xbb,
-    0x38, 0x86, 0x38, 0x22, 0x24, 0x03, 0x82, 0x5c, 0x5d, 0x7d, 0x03, 0x42, 0xe2, 0x83, 0x42, 0x10,
-    0x62, 0xae, 0x61, 0xae, 0x7e, 0x21, 0x6e, 0x2e, 0x40, 0x01, 0x00, 0x44, 0xaf, 0x9a, 0x00, 0x55,
-    0x00, 0x00, 0x00,
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x45, 0xcc, 0x39, 0x0e, 0x80, 0x30,
+    0x0c, 0x05, 0xd1, 0x9e, 0x3b, 0x51, 0x44, 0xc9, 0x37, 0x18, 0x91, 0x45, 0x8e, 0x03, 0x4a, 0xe5,
+    0x73, 0x70, 0x7b, 0x84, 0x28, 0xdc, 0xbe, 0x91, 0x26, 0xd6, 0x42, 0xbc, 0x19, 0x75, 0xbb, 0x20,
+    0xac, 0x73, 0x7d, 0x96, 0xf8, 0xd3, 0xe8, 0x10, 0x4b, 0x88, 0x32, 0x9b, 0x22, 0x59, 0x0a, 0x1a,
+    0x3c, 0x36, 0x01, 0x72, 0x53, 0x13, 0x75, 0xc3, 0x85, 0xa2, 0x94, 0x1c, 0x32, 0x72, 0x95, 0x69,
+    0x14, 0xf8, 0x1c, 0x02, 0xf7, 0xfd, 0x6e, 0x95, 0x7b, 0x2d, 0xc6, 0xe5, 0x40, 0xfc, 0x0e, 0x2f,
+    0xe0, 0xad, 0x60, 0xcc, 0x86, 0x00, 0x00, 0x00,
 ];
 
 static PROC_PID_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_PID_MAX);
@@ -162,13 +167,20 @@ static PROC_LEASE_BREAK_TIME: AtomicUsize = AtomicUsize::new(DEFAULT_LEASE_BREAK
 static PROC_NET_IPV4_CONF_LO_TAG: AtomicIsize = AtomicIsize::new(DEFAULT_NET_IPV4_CONF_TAG);
 static PROC_VFS_CACHE_PRESSURE: AtomicUsize = AtomicUsize::new(100);
 static PROC_MEMINFO_CACHED_KB: AtomicUsize = AtomicUsize::new(0);
+static PROC_MEMINFO_SWAP_CACHED_KB: AtomicUsize = AtomicUsize::new(0);
 static PROC_IO_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PROC_IO_READAHEAD_SUPPRESS_READS: AtomicUsize = AtomicUsize::new(0);
+static PROC_OOM_SCORE_ADJ: AtomicIsize = AtomicIsize::new(0);
 
 lazy_static! {
     static ref PROC_DOMAINNAME: UPIntrFreeCell<Vec<u8>> = {
         let mut value = Vec::new();
         value.extend_from_slice(b"(none)");
+        unsafe { UPIntrFreeCell::new(value) }
+    };
+    static ref PROC_CORE_PATTERN: UPIntrFreeCell<Vec<u8>> = {
+        let mut value = Vec::new();
+        value.extend_from_slice(b"core");
         unsafe { UPIntrFreeCell::new(value) }
     };
 }
@@ -182,6 +194,20 @@ pub(crate) fn note_readahead() {
     PROC_IO_READAHEAD_SUPPRESS_READS.store(2, Ordering::Relaxed);
 }
 
+pub(crate) fn note_madvise_willneed(len: usize) {
+    let delta_kb = (len / 1024).max(1);
+    PROC_MEMINFO_SWAP_CACHED_KB.fetch_add(delta_kb, Ordering::Relaxed);
+}
+
+pub(crate) fn core_pattern_for_pid(pid: usize) -> String {
+    let pattern = PROC_CORE_PATTERN.exclusive_access().clone();
+    let pattern = core::str::from_utf8(pattern.as_slice())
+        .unwrap_or("core")
+        .trim_matches(|ch| ch == '\n' || ch == '\0');
+    let pattern = if pattern.is_empty() { "core" } else { pattern };
+    pattern.replace("%p", pid.to_string().as_str())
+}
+
 pub(super) struct ProcFs;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,6 +215,7 @@ enum ProcNode {
     Root,
     Mounts,
     Filesystems,
+    Modules,
     KeyUsers,
     Meminfo,
     Uptime,
@@ -264,6 +291,8 @@ enum ProcNode {
     PidMounts(usize),
     PidMountinfo(usize),
     PidPagemap(usize),
+    PidCoredumpFilter(usize),
+    PidOomScoreAdj(usize),
     PidIo(usize),
     PidNsDir(usize),
     PidNsMnt(usize),
@@ -482,6 +511,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         ROOT_INO => Some(ProcNode::Root),
         MOUNTS_INO => Some(ProcNode::Mounts),
         FILESYSTEMS_INO => Some(ProcNode::Filesystems),
+        MODULES_INO => Some(ProcNode::Modules),
         KEY_USERS_INO => Some(ProcNode::KeyUsers),
         MEMINFO_INO => Some(ProcNode::Meminfo),
         UPTIME_INO => Some(ProcNode::Uptime),
@@ -589,6 +619,8 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
                 PID_NS_USER_OFFSET => Some(ProcNode::PidNsUser(pid)),
                 PID_NS_UTS_OFFSET => Some(ProcNode::PidNsUts(pid)),
                 PID_EXE_OFFSET => Some(ProcNode::PidExe(pid)),
+                PID_COREDUMP_FILTER_OFFSET => Some(ProcNode::PidCoredumpFilter(pid)),
+                PID_OOM_SCORE_ADJ_OFFSET => Some(ProcNode::PidOomScoreAdj(pid)),
                 _ => None,
             }
         }
@@ -650,6 +682,11 @@ fn root_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: FILESYSTEMS_INO,
         name: "filesystems".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: MODULES_INO,
+        name: "modules".into(),
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
@@ -1230,6 +1267,16 @@ fn pid_entries(pid: usize) -> Vec<RawDirEntry> {
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_COREDUMP_FILTER_OFFSET),
+        name: "coredump_filter".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_OOM_SCORE_ADJ_OFFSET),
+        name: "oom_score_adj".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
         ino: pid_file_ino(pid, PID_NS_DIR_OFFSET),
         name: "ns".into(),
         dtype: DT_DIR,
@@ -1451,7 +1498,7 @@ fn filesystems_content() -> &'static str {
     // CONTEXT: fsopen(2) points userspace at /proc/filesystems to discover
     // valid fs names. ext2/ext3 are scratch-mount compatibility names backed by
     // tmpfs for current LTP coverage, not real on-disk ext2/ext3 drivers.
-    "nodev\tproc\nnodev\ttmpfs\nnodev\tramfs\nnodev\tcgroup2\next2\next3\next4\nvfat\n"
+    "nodev\tproc\nnodev\ttmpfs\nnodev\tramfs\nnodev\tcgroup\nnodev\tcgroup2\next2\next3\next4\nvfat\n"
 }
 
 fn meminfo_content() -> String {
@@ -1460,6 +1507,7 @@ fn meminfo_content() -> String {
     let total_kb = total_pages * page_kb;
     let free_kb = free_pages * page_kb;
     let cached_kb = PROC_MEMINFO_CACHED_KB.load(Ordering::Relaxed);
+    let swap_cached_kb = PROC_MEMINFO_SWAP_CACHED_KB.load(Ordering::Relaxed);
     format!(
         "MemTotal:       {total_kb:8} kB\n\
          MemFree:        {free_kb:8} kB\n\
@@ -1468,8 +1516,9 @@ fn meminfo_content() -> String {
          Cached:        {cached_kb:8} kB\n\
          SReclaimable:          0 kB\n\
          Shmem:                 0 kB\n\
-         SwapTotal:             0 kB\n\
-         SwapFree:              0 kB\n"
+         SwapTotal:      {PROC_MEMINFO_SWAP_TOTAL_KB:8} kB\n\
+         SwapFree:       {PROC_MEMINFO_SWAP_TOTAL_KB:8} kB\n\
+         SwapCached:     {swap_cached_kb:8} kB\n"
     )
 }
 
@@ -1708,6 +1757,42 @@ fn domainname_content() -> Vec<u8> {
     output
 }
 
+fn core_pattern_content() -> Vec<u8> {
+    let mut output = PROC_CORE_PATTERN.exclusive_access().clone();
+    output.push(b'\n');
+    output
+}
+
+fn write_core_pattern(buf: &[u8], offset: u64) -> usize {
+    let Ok(offset) = usize::try_from(offset) else {
+        return 0;
+    };
+    let end = buf
+        .iter()
+        .position(|byte| *byte == b'\n' || *byte == 0)
+        .unwrap_or(buf.len());
+    let mut value = PROC_CORE_PATTERN.exclusive_access();
+    if offset > value.len() {
+        return 0;
+    }
+    value.truncate(offset);
+    value.extend_from_slice(&buf[..end]);
+    buf.len()
+}
+
+fn set_core_pattern_len(len: u64) -> FsResult {
+    let Ok(len) = usize::try_from(len) else {
+        return Err(FsError::InvalidInput);
+    };
+    let mut value = PROC_CORE_PATTERN.exclusive_access();
+    if len <= value.len() {
+        value.truncate(len);
+    } else {
+        value.resize(len, 0);
+    }
+    Ok(())
+}
+
 fn write_pid_max(buf: &[u8], offset: u64) -> usize {
     if offset != 0 {
         return 0;
@@ -1917,6 +2002,27 @@ fn write_pid_timerslack(pid: usize, buf: &[u8], offset: u64) -> usize {
     buf.len()
 }
 
+fn oom_score_adj_content() -> Vec<u8> {
+    format!("{}\n", PROC_OOM_SCORE_ADJ.load(Ordering::Relaxed)).into_bytes()
+}
+
+fn write_oom_score_adj(buf: &[u8], offset: u64) -> usize {
+    if offset != 0 {
+        return 0;
+    }
+    let Ok(text) = core::str::from_utf8(buf) else {
+        return 0;
+    };
+    let Ok(value) = text.trim().parse::<isize>() else {
+        return 0;
+    };
+    if !(-1000..=1000).contains(&value) {
+        return 0;
+    }
+    PROC_OOM_SCORE_ADJ.store(value, Ordering::Relaxed);
+    buf.len()
+}
+
 fn write_domainname(buf: &[u8], offset: u64) -> usize {
     let Ok(offset) = usize::try_from(offset) else {
         return 0;
@@ -2082,6 +2188,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
     match node {
         ProcNode::Mounts => Ok(mounts_content().into_bytes()),
         ProcNode::Filesystems => Ok(filesystems_content().as_bytes().to_vec()),
+        ProcNode::Modules => Ok(Vec::new()),
         ProcNode::KeyUsers => Ok(keyring::key_users_content().into_bytes()),
         ProcNode::Meminfo => Ok(meminfo_content().into_bytes()),
         ProcNode::Uptime => Ok(uptime_content().into_bytes()),
@@ -2113,7 +2220,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::KeysMaxbytes => Ok(keyring::key_maxbytes_content().into_bytes()),
         ProcNode::KeysRootMaxkeys => Ok(keyring::root_key_maxkeys_content().into_bytes()),
         ProcNode::KeysRootMaxbytes => Ok(keyring::root_key_maxbytes_content().into_bytes()),
-        ProcNode::CorePattern => Ok(b"core\n".to_vec()),
+        ProcNode::CorePattern => Ok(core_pattern_content()),
         ProcNode::PipeMaxSize => Ok(pipe_max_size_content().into_bytes()),
         ProcNode::PipeUserPagesSoft => Ok(pipe_user_pages_soft_content().into_bytes()),
         ProcNode::FanotifyMaxQueuedEvents => Ok(fanotify_max_queued_events_content().into_bytes()),
@@ -2146,6 +2253,12 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
             .ok_or(FsError::NotFound),
         ProcNode::PidTimerslack(pid) => lookup_process(pid)
             .map(pid_timerslack_content)
+            .ok_or(FsError::NotFound),
+        ProcNode::PidCoredumpFilter(pid) => lookup_process(pid)
+            .map(|_| b"00000033\n".to_vec())
+            .ok_or(FsError::NotFound),
+        ProcNode::PidOomScoreAdj(pid) => lookup_process(pid)
+            .map(|_| oom_score_adj_content())
             .ok_or(FsError::NotFound),
         ProcNode::SelfSymlink | ProcNode::PidExe(_) | ProcNode::PidFdEntry(_, _) => {
             Err(FsError::InvalidInput)
@@ -2269,6 +2382,7 @@ impl FileSystemBackend for ProcFs {
                 "." | ".." => Ok((ROOT_INO, FsNodeKind::Directory)),
                 "mounts" => Ok((MOUNTS_INO, FsNodeKind::RegularFile)),
                 "filesystems" => Ok((FILESYSTEMS_INO, FsNodeKind::RegularFile)),
+                "modules" => Ok((MODULES_INO, FsNodeKind::RegularFile)),
                 "key-users" => Ok((KEY_USERS_INO, FsNodeKind::RegularFile)),
                 "meminfo" => Ok((MEMINFO_INO, FsNodeKind::RegularFile)),
                 "uptime" => Ok((UPTIME_INO, FsNodeKind::RegularFile)),
@@ -2452,6 +2566,14 @@ impl FileSystemBackend for ProcFs {
                     pid_file_ino(pid, PID_TIMERSLACK_OFFSET),
                     FsNodeKind::RegularFile,
                 )),
+                "coredump_filter" => Ok((
+                    pid_file_ino(pid, PID_COREDUMP_FILTER_OFFSET),
+                    FsNodeKind::RegularFile,
+                )),
+                "oom_score_adj" => Ok((
+                    pid_file_ino(pid, PID_OOM_SCORE_ADJ_OFFSET),
+                    FsNodeKind::RegularFile,
+                )),
                 "ns" => Ok((pid_file_ino(pid, PID_NS_DIR_OFFSET), FsNodeKind::Directory)),
                 "task" => Ok((
                     pid_file_ino(pid, PID_TASK_DIR_OFFSET),
@@ -2605,8 +2727,11 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::NetIpv4ConfLoTag
             | ProcNode::DropCaches
             | ProcNode::VfsCachePressure
+            | ProcNode::PidOomScoreAdj(_)
             | ProcNode::PidTimerslack(_) => Ok(()),
+            ProcNode::PidCoredumpFilter(_) => Ok(()),
             ProcNode::Domainname => set_domainname_len(_len),
+            ProcNode::CorePattern => set_core_pattern_len(_len),
             _ => Err(FsError::ReadOnly),
         }
     }
@@ -2671,8 +2796,10 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::VfsCachePressure
             | ProcNode::PidComm(_)
             | ProcNode::PidTimerslack(_)
+            | ProcNode::PidOomScoreAdj(_)
             | ProcNode::PidTaskTidComm(_, _)
-            | ProcNode::Domainname => FileStat::with_mode(S_IFREG | 0o644),
+            | ProcNode::Domainname
+            | ProcNode::CorePattern => FileStat::with_mode(S_IFREG | 0o644),
             _ => FileStat::with_mode(S_IFREG | 0o444),
         };
         stat.dev = 0x70726f63;
@@ -2772,6 +2899,7 @@ impl FileSystemBackend for ProcFs {
             Some(ProcNode::KeysMaxbytes) => keyring::write_key_maxbytes(buf, offset),
             Some(ProcNode::KeysRootMaxkeys) => keyring::write_root_key_maxkeys(buf, offset),
             Some(ProcNode::KeysRootMaxbytes) => keyring::write_root_key_maxbytes(buf, offset),
+            Some(ProcNode::CorePattern) => write_core_pattern(buf, offset),
             Some(ProcNode::PipeMaxSize) => write_pipe_max_size(buf, offset),
             Some(ProcNode::LeaseBreakTime) => write_lease_break_time(buf, offset),
             Some(ProcNode::InotifyMaxUserInstances) => {
@@ -2781,6 +2909,8 @@ impl FileSystemBackend for ProcFs {
             Some(ProcNode::DropCaches) => write_drop_caches(buf, offset),
             Some(ProcNode::VfsCachePressure) => write_vfs_cache_pressure(buf, offset),
             Some(ProcNode::PidTimerslack(pid)) => write_pid_timerslack(pid, buf, offset),
+            Some(ProcNode::PidOomScoreAdj(_)) => write_oom_score_adj(buf, offset),
+            Some(ProcNode::PidCoredumpFilter(_)) => buf.len(),
             Some(ProcNode::Domainname) => write_domainname(buf, offset),
             _ => 0,
         }

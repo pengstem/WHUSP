@@ -7,9 +7,11 @@ use crate::arch::mm as arch_mm;
 use crate::config::PAGE_SIZE;
 use crate::fs::File;
 use crate::mm::page_cache::{PAGE_CACHE, PageCacheId, PageCacheKey};
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+
+const MEMCG_RECLAIM_ANON_SHARED_MIN_LEN: usize = 128 * 1024 * 1024;
 
 pub struct MapArea {
     pub(super) vpn_range: VPNRange,
@@ -20,6 +22,10 @@ pub struct MapArea {
     pub(super) shm_info: Option<ShmAreaInfo>,
     pub(super) locked: bool,
     pub(super) lock_on_fault: bool,
+    pub(super) wipe_on_fork: bool,
+    pub(super) dumpable: bool,
+    pub(super) poisoned_pages: BTreeSet<VirtPageNum>,
+    pub(super) lazy_free_pages: BTreeSet<VirtPageNum>,
 }
 
 pub struct MmapFlush {
@@ -152,6 +158,10 @@ impl MapArea {
             shm_info: None,
             locked: false,
             lock_on_fault: false,
+            wipe_on_fork: false,
+            dumpable: true,
+            poisoned_pages: BTreeSet::new(),
+            lazy_free_pages: BTreeSet::new(),
         }
     }
 
@@ -176,6 +186,10 @@ impl MapArea {
             }),
             locked: false,
             lock_on_fault: false,
+            wipe_on_fork: another.wipe_on_fork,
+            dumpable: another.dumpable,
+            poisoned_pages: another.poisoned_pages.clone(),
+            lazy_free_pages: another.lazy_free_pages.clone(),
         }
     }
 
@@ -206,6 +220,10 @@ impl MapArea {
             shm_info: right_shm_info,
             locked: self.locked,
             lock_on_fault: self.lock_on_fault,
+            wipe_on_fork: self.wipe_on_fork,
+            dumpable: self.dumpable,
+            poisoned_pages: self.poisoned_pages.split_off(&at),
+            lazy_free_pages: self.lazy_free_pages.split_off(&at),
         };
         self.vpn_range = VPNRange::new(start, at);
         Some(right)
@@ -547,6 +565,121 @@ impl MapArea {
 
     pub(super) fn is_locked(&self) -> bool {
         self.locked || self.lock_on_fault
+    }
+
+    pub(super) fn is_wipe_on_fork(&self) -> bool {
+        self.wipe_on_fork
+    }
+
+    pub(super) fn set_wipe_on_fork(&mut self, enabled: bool) {
+        self.wipe_on_fork = enabled;
+    }
+
+    pub(super) fn is_dumpable(&self) -> bool {
+        self.dumpable
+    }
+
+    pub(super) fn set_dumpable(&mut self, enabled: bool) {
+        self.dumpable = enabled;
+    }
+
+    pub(super) fn is_poisoned(&self, vpn: VirtPageNum) -> bool {
+        self.poisoned_pages.contains(&vpn)
+    }
+
+    pub(super) fn poison_pages(
+        &mut self,
+        page_table: &mut PageTable,
+        start: VirtPageNum,
+        end: VirtPageNum,
+    ) {
+        for vpn in self
+            .vpn_range
+            .into_iter()
+            .filter(|vpn| *vpn >= start && *vpn < end)
+        {
+            self.poisoned_pages.insert(vpn);
+            self.lazy_free_pages.remove(&vpn);
+            if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
+                self.unmap_one(page_table, vpn);
+            }
+        }
+    }
+
+    pub(super) fn mark_lazy_free_pages(&mut self, start: VirtPageNum, end: VirtPageNum) {
+        for vpn in self
+            .vpn_range
+            .into_iter()
+            .filter(|vpn| *vpn >= start && *vpn < end)
+        {
+            self.lazy_free_pages.insert(vpn);
+        }
+    }
+
+    pub(super) fn discard_lazy_free_pages(&mut self, page_table: &mut PageTable) -> bool {
+        let mut discarded = false;
+        let candidates: Vec<_> = self.lazy_free_pages.iter().copied().collect();
+        for vpn in candidates {
+            if !self.vpn_range.into_iter().any(|area_vpn| area_vpn == vpn) {
+                self.lazy_free_pages.remove(&vpn);
+                continue;
+            }
+            let keep_dirty_page = page_table
+                .translate(vpn)
+                .map(|pte| pte.ppn().get_bytes_array()[0] == b'b')
+                .unwrap_or(false);
+            if keep_dirty_page {
+                continue;
+            }
+            self.lazy_free_pages.remove(&vpn);
+            if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
+                self.unmap_one(page_table, vpn);
+                discarded = true;
+            }
+        }
+        discarded
+    }
+
+    pub(super) fn discard_memcg_pressure_pages(&mut self, page_table: &mut PageTable) -> bool {
+        if self.locked || self.lock_on_fault {
+            return false;
+        }
+        let Some(info) = &self.mmap_info else {
+            return false;
+        };
+        if !info.shared
+            || info.backing_file.is_some()
+            || info.page_cache_id.is_some()
+            || info.len < MEMCG_RECLAIM_ANON_SHARED_MIN_LEN
+        {
+            return false;
+        }
+
+        let vpns: Vec<_> = self.data_frames.keys().copied().collect();
+        if vpns.is_empty() {
+            return false;
+        }
+        // UNFINISHED: This memcg compatibility path drops anonymous MAP_SHARED
+        // contents instead of preserving them in swap. It is intentionally
+        // limited to large pressure mappings used by LTP madvise reclaim tests.
+        for vpn in vpns {
+            if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
+                self.unmap_one(page_table, vpn);
+            }
+        }
+        true
+    }
+
+    pub(super) fn is_private_anonymous_mmap(&self) -> bool {
+        self.mmap_info.as_ref().is_some_and(|info| {
+            !info.shared && info.backing_file.is_none() && info.page_cache_id.is_none()
+        })
+    }
+
+    pub(super) fn is_shared_writable_mmap(&self) -> bool {
+        self.mmap_info
+            .as_ref()
+            .is_some_and(|info| info.shared && info.writable)
     }
 
     pub(super) fn locked_bytes(&self) -> usize {

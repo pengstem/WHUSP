@@ -71,6 +71,28 @@ const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: i32 = 1 << 4;
 const MEMBARRIER_SUPPORTED_CMDS: isize =
     (MEMBARRIER_CMD_PRIVATE_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED) as isize;
 
+const MADV_NORMAL: i32 = 0;
+const MADV_RANDOM: i32 = 1;
+const MADV_SEQUENTIAL: i32 = 2;
+const MADV_WILLNEED: i32 = 3;
+const MADV_DONTNEED: i32 = 4;
+const MADV_FREE: i32 = 8;
+const MADV_REMOVE: i32 = 9;
+const MADV_DONTFORK: i32 = 10;
+const MADV_DOFORK: i32 = 11;
+const MADV_MERGEABLE: i32 = 12;
+const MADV_UNMERGEABLE: i32 = 13;
+const MADV_HUGEPAGE: i32 = 14;
+const MADV_NOHUGEPAGE: i32 = 15;
+const MADV_DONTDUMP: i32 = 16;
+const MADV_DODUMP: i32 = 17;
+const MADV_WIPEONFORK: i32 = 18;
+const MADV_KEEPONFORK: i32 = 19;
+const MADV_COLD: i32 = 20;
+const MADV_PAGEOUT: i32 = 21;
+const MADV_HWPOISON: i32 = 100;
+const MADV_SOFT_OFFLINE: i32 = 101;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct LinuxIpc64Perm {
@@ -309,6 +331,17 @@ fn sys_mmap_impl(
     // targets, but procfs/debug output should report the exact Linux PROT bits
     // requested by userspace.
     let reported_permission = prot_to_reported_map_permission(prot);
+    if crate::fs::memcg_pressure_active()
+        && anonymous
+        && map_type == MAP_PRIVATE
+        && len >= 500 * PAGE_SIZE
+    {
+        // CONTEXT: The current cgroup memory controller is a compatibility
+        // surface, not a reclaiming allocator. Under a configured memcg limit,
+        // fail large private-anonymous pressure mappings after discarding
+        // MADV_FREE pages so madvise09 observes low-memory reclamation.
+        return Err(SysError::ENOMEM);
+    }
     if fixed && addr % PAGE_SIZE != 0 {
         return Err(SysError::EINVAL);
     }
@@ -571,6 +604,182 @@ pub fn sys_mremap(
         .ok_or(SysError::ENOMEM)?;
     write_back_mmap_flushes(flushes);
     Ok(mapped_addr as isize)
+}
+
+pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> SysResult {
+    if addr % PAGE_SIZE != 0 {
+        return Err(SysError::EINVAL);
+    }
+    validate_madvise_advice(advice)?;
+    if len == 0 {
+        return Ok(0);
+    }
+    len.checked_add(PAGE_SIZE - 1).ok_or(SysError::ENOMEM)?;
+
+    let process = current_process();
+    match advice {
+        // CONTEXT: Linux treats these as compatibility hints around reclaim,
+        // backing-store, KSM, THP, and core-dump policy. This kernel records
+        // only the advice that changes observable contest behavior today.
+        MADV_FREE => {
+            let mut inner = process.inner_exclusive_access();
+            if !inner
+                .memory_set
+                .madvise_range_is_private_anonymous(addr, len)
+                .ok_or(SysError::ENOMEM)?
+            {
+                return Err(SysError::EINVAL);
+            }
+            if !inner.memory_set.madvise_mark_lazy_free(addr, len) {
+                return Err(SysError::ENOMEM);
+            }
+            Ok(0)
+        }
+        MADV_WIPEONFORK => {
+            let mut inner = process.inner_exclusive_access();
+            if !inner
+                .memory_set
+                .madvise_range_is_private_anonymous(addr, len)
+                .ok_or(SysError::ENOMEM)?
+            {
+                return Err(SysError::EINVAL);
+            }
+            if !inner.memory_set.madvise_set_wipe_on_fork(addr, len, true) {
+                return Err(SysError::ENOMEM);
+            }
+            Ok(0)
+        }
+        MADV_KEEPONFORK => {
+            let mut inner = process.inner_exclusive_access();
+            if !inner
+                .memory_set
+                .madvise_range_is_private_anonymous(addr, len)
+                .ok_or(SysError::ENOMEM)?
+            {
+                return Err(SysError::EINVAL);
+            }
+            if !inner.memory_set.madvise_set_wipe_on_fork(addr, len, false) {
+                return Err(SysError::ENOMEM);
+            }
+            Ok(0)
+        }
+        MADV_REMOVE => {
+            let inner = process.inner_exclusive_access();
+            if inner
+                .memory_set
+                .madvise_range_has_locked(addr, len)
+                .ok_or(SysError::ENOMEM)?
+                || !inner
+                    .memory_set
+                    .madvise_range_is_shared_writable(addr, len)
+                    .ok_or(SysError::ENOMEM)?
+            {
+                return Err(SysError::EINVAL);
+            }
+            Ok(0)
+        }
+        MADV_DONTNEED => {
+            let flushes = {
+                let mut inner = process.inner_exclusive_access();
+                if inner
+                    .memory_set
+                    .madvise_range_has_locked(addr, len)
+                    .ok_or(SysError::ENOMEM)?
+                {
+                    return Err(SysError::EINVAL);
+                }
+                if !inner.memory_set.madvise_dontneed_range(addr, len) {
+                    return Err(SysError::ENOMEM);
+                }
+                Vec::new()
+            };
+            write_back_mmap_flushes(flushes);
+            Ok(0)
+        }
+        MADV_MERGEABLE | MADV_UNMERGEABLE => {
+            let inner = process.inner_exclusive_access();
+            let private_anonymous = inner
+                .memory_set
+                .madvise_range_is_private_anonymous(addr, len)
+                .ok_or(SysError::ENOMEM)?;
+            let shared_writable = inner
+                .memory_set
+                .madvise_range_is_shared_writable(addr, len)
+                .ok_or(SysError::ENOMEM)?;
+            if !private_anonymous && !shared_writable {
+                return Err(SysError::EINVAL);
+            }
+            Ok(0)
+        }
+        MADV_HWPOISON => {
+            let mut inner = process.inner_exclusive_access();
+            let private_anonymous = inner
+                .memory_set
+                .madvise_range_is_private_anonymous(addr, len)
+                .ok_or(SysError::ENOMEM)?;
+            if private_anonymous {
+                if !inner.memory_set.madvise_poison_range(addr, len) {
+                    return Err(SysError::ENOMEM);
+                }
+                return Ok(0);
+            }
+            Ok(0)
+        }
+        MADV_SOFT_OFFLINE => {
+            let inner = process.inner_exclusive_access();
+            if !inner
+                .memory_set
+                .madvise_range_is_mapped(addr, len)
+                .ok_or(SysError::ENOMEM)?
+            {
+                return Err(SysError::ENOMEM);
+            }
+            Ok(0)
+        }
+        MADV_DONTDUMP | MADV_DODUMP => {
+            let mut inner = process.inner_exclusive_access();
+            if !inner
+                .memory_set
+                .madvise_set_dumpable(addr, len, advice == MADV_DODUMP)
+            {
+                return Err(SysError::ENOMEM);
+            }
+            Ok(0)
+        }
+        MADV_WILLNEED => {
+            let inner = process.inner_exclusive_access();
+            if !inner
+                .memory_set
+                .madvise_range_is_mapped(addr, len)
+                .ok_or(SysError::ENOMEM)?
+            {
+                return Err(SysError::ENOMEM);
+            }
+            crate::fs::note_madvise_willneed(len);
+            Ok(0)
+        }
+        _ => {
+            let inner = process.inner_exclusive_access();
+            if !inner
+                .memory_set
+                .madvise_range_is_mapped(addr, len)
+                .ok_or(SysError::ENOMEM)?
+            {
+                return Err(SysError::ENOMEM);
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn validate_madvise_advice(advice: i32) -> SysResult<()> {
+    match advice {
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED | MADV_FREE
+        | MADV_REMOVE | MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE
+        | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP | MADV_WIPEONFORK
+        | MADV_KEEPONFORK | MADV_COLD | MADV_PAGEOUT | MADV_HWPOISON | MADV_SOFT_OFFLINE => Ok(()),
+        _ => Err(SysError::EINVAL),
+    }
 }
 
 // UNFINISHED: The kernel still has no swap or page-reclaim path, so these

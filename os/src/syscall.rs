@@ -153,6 +153,7 @@ const SYSCALL_GETEUID: usize = 175;
 const SYSCALL_GETGID: usize = 176;
 const SYSCALL_GETEGID: usize = 177;
 const SYSCALL_GETTID: usize = 178;
+const SYSCALL_SYSINFO: usize = 179;
 const SYSCALL_MSGGET: usize = 186;
 const SYSCALL_MSGCTL: usize = 187;
 const SYSCALL_MSGRCV: usize = 188;
@@ -200,6 +201,7 @@ const SYSCALL_MUNLOCK: usize = 229;
 const SYSCALL_MLOCKALL: usize = 230;
 const SYSCALL_MUNLOCKALL: usize = 231;
 const SYSCALL_MINCORE: usize = 232;
+const SYSCALL_MADVISE: usize = 233;
 const SYSCALL_REMAP_FILE_PAGES: usize = 234;
 const SYSCALL_PERF_EVENT_OPEN: usize = 241;
 const SYSCALL_ACCEPT4: usize = 242;
@@ -849,6 +851,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETGID => Ok(sys_getgid()),
         SYSCALL_GETEGID => Ok(sys_getegid()),
         SYSCALL_GETTID => Ok(sys_gettid()),
+        SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut LinuxSysInfo),
         SYSCALL_MSGGET => sys_msgget(args[0] as isize, args[1] as i32),
         SYSCALL_MSGCTL => sys_msgctl(args[0], args[1] as i32, args[2]),
         SYSCALL_MSGRCV => sys_msgrcv(
@@ -892,6 +895,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MLOCKALL => sys_mlockall(args[0]),
         SYSCALL_MUNLOCKALL => sys_munlockall(),
         SYSCALL_MINCORE => sys_mincore(args[0], args[1], args[2] as *mut u8),
+        SYSCALL_MADVISE => sys_madvise(args[0], args[1], args[2] as i32),
         SYSCALL_REMAP_FILE_PAGES => {
             sys_remap_file_pages(args[0], args[1], args[2] as i32, args[3], args[4] as i32)
         }

@@ -5,14 +5,37 @@ use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 const ROOT_INO: u32 = 2;
+
+static MEMCG_PRESSURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CgroupMode {
+    Unified,
+    MemoryV1,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CgroupFileKind {
     Controllers,
     SubtreeControl,
     Procs,
+    Tasks,
+    CloneChildren,
+    MemoryCurrent,
+    MemoryMax,
+    MemoryEvents,
+    MemoryStat,
+    MemorySwapCurrent,
+    MemorySwapMax,
+    MemorySwappiness,
+    MemoryKmemUsage,
+    MemoryKmemLimit,
+    MemoryUsageInBytes,
+    MemoryLimitInBytes,
+    MemoryUseHierarchy,
 }
 
 struct CgroupNode {
@@ -41,6 +64,7 @@ enum CgroupNodeKind {
 pub(super) struct CgroupFs {
     inodes: BTreeMap<u32, CgroupNode>,
     next_ino: u32,
+    mode: CgroupMode,
 }
 
 impl CgroupNode {
@@ -92,6 +116,19 @@ impl CgroupFs {
         let mut fs = Self {
             inodes: BTreeMap::new(),
             next_ino: ROOT_INO + 1,
+            mode: CgroupMode::Unified,
+        };
+        fs.inodes
+            .insert(ROOT_INO, CgroupNode::new_dir(ROOT_INO, 0o755));
+        fs.add_control_files(ROOT_INO);
+        fs
+    }
+
+    pub(super) fn new_v1_memory() -> Self {
+        let mut fs = Self {
+            inodes: BTreeMap::new(),
+            next_ino: ROOT_INO + 1,
+            mode: CgroupMode::MemoryV1,
         };
         fs.inodes
             .insert(ROOT_INO, CgroupNode::new_dir(ROOT_INO, 0o755));
@@ -135,13 +172,77 @@ impl CgroupFs {
     }
 
     fn add_control_files(&mut self, dir_ino: u32) {
-        self.add_control_file(dir_ino, "cgroup.controllers", CgroupFileKind::Controllers);
-        self.add_control_file(
-            dir_ino,
-            "cgroup.subtree_control",
-            CgroupFileKind::SubtreeControl,
-        );
-        self.add_control_file(dir_ino, "cgroup.procs", CgroupFileKind::Procs);
+        match self.mode {
+            CgroupMode::Unified => {
+                self.add_control_file(dir_ino, "cgroup.controllers", CgroupFileKind::Controllers);
+                self.add_control_file(
+                    dir_ino,
+                    "cgroup.subtree_control",
+                    CgroupFileKind::SubtreeControl,
+                );
+                self.add_control_file(dir_ino, "cgroup.procs", CgroupFileKind::Procs);
+                self.add_control_file(dir_ino, "memory.current", CgroupFileKind::MemoryCurrent);
+                self.add_control_file(dir_ino, "memory.max", CgroupFileKind::MemoryMax);
+                self.add_control_file(dir_ino, "memory.events", CgroupFileKind::MemoryEvents);
+                self.add_control_file(dir_ino, "memory.stat", CgroupFileKind::MemoryStat);
+                self.add_control_file(
+                    dir_ino,
+                    "memory.swap.current",
+                    CgroupFileKind::MemorySwapCurrent,
+                );
+                self.add_control_file(dir_ino, "memory.swap.max", CgroupFileKind::MemorySwapMax);
+                self.add_control_file(
+                    dir_ino,
+                    "memory.swappiness",
+                    CgroupFileKind::MemorySwappiness,
+                );
+                self.add_control_file(
+                    dir_ino,
+                    "memory.kmem.usage_in_bytes",
+                    CgroupFileKind::MemoryKmemUsage,
+                );
+            }
+            CgroupMode::MemoryV1 => {
+                self.add_control_file(dir_ino, "tasks", CgroupFileKind::Tasks);
+                self.add_control_file(dir_ino, "cgroup.procs", CgroupFileKind::Procs);
+                self.add_control_file(
+                    dir_ino,
+                    "cgroup.clone_children",
+                    CgroupFileKind::CloneChildren,
+                );
+                self.add_control_file(
+                    dir_ino,
+                    "memory.usage_in_bytes",
+                    CgroupFileKind::MemoryUsageInBytes,
+                );
+                self.add_control_file(
+                    dir_ino,
+                    "memory.limit_in_bytes",
+                    CgroupFileKind::MemoryLimitInBytes,
+                );
+                self.add_control_file(
+                    dir_ino,
+                    "memory.swappiness",
+                    CgroupFileKind::MemorySwappiness,
+                );
+                self.add_control_file(dir_ino, "memory.stat", CgroupFileKind::MemoryStat);
+                self.add_control_file(
+                    dir_ino,
+                    "memory.use_hierarchy",
+                    CgroupFileKind::MemoryUseHierarchy,
+                );
+                self.add_control_file(
+                    dir_ino,
+                    "memory.kmem.usage_in_bytes",
+                    CgroupFileKind::MemoryKmemUsage,
+                );
+                self.add_control_file(
+                    dir_ino,
+                    "memory.kmem.limit_in_bytes",
+                    CgroupFileKind::MemoryKmemLimit,
+                );
+            }
+        }
     }
 
     fn add_control_file(&mut self, dir_ino: u32, name: &str, kind: CgroupFileKind) {
@@ -176,7 +277,23 @@ impl CgroupFs {
     fn is_standard_file(name: &str) -> bool {
         matches!(
             name,
-            "cgroup.controllers" | "cgroup.subtree_control" | "cgroup.procs"
+            "cgroup.controllers"
+                | "cgroup.subtree_control"
+                | "cgroup.procs"
+                | "tasks"
+                | "cgroup.clone_children"
+                | "memory.current"
+                | "memory.max"
+                | "memory.events"
+                | "memory.stat"
+                | "memory.swap.current"
+                | "memory.swap.max"
+                | "memory.swappiness"
+                | "memory.kmem.usage_in_bytes"
+                | "memory.kmem.limit_in_bytes"
+                | "memory.usage_in_bytes"
+                | "memory.limit_in_bytes"
+                | "memory.use_hierarchy"
         )
     }
 
@@ -229,8 +346,9 @@ impl CgroupFs {
 
     fn file_content(&self, kind: CgroupFileKind, owner_dir: u32) -> Vec<u8> {
         match kind {
-            CgroupFileKind::Controllers | CgroupFileKind::SubtreeControl => Vec::new(),
-            CgroupFileKind::Procs => {
+            CgroupFileKind::Controllers => b"memory\n".to_vec(),
+            CgroupFileKind::SubtreeControl => Vec::new(),
+            CgroupFileKind::Procs | CgroupFileKind::Tasks => {
                 let mut output = String::new();
                 if let Ok(CgroupNode {
                     kind: CgroupNodeKind::Directory { pids, .. },
@@ -243,6 +361,20 @@ impl CgroupFs {
                 }
                 output.into_bytes()
             }
+            CgroupFileKind::CloneChildren => b"0\n".to_vec(),
+            CgroupFileKind::MemoryCurrent
+            | CgroupFileKind::MemorySwapCurrent
+            | CgroupFileKind::MemoryKmemUsage
+            | CgroupFileKind::MemoryUsageInBytes => b"0\n".to_vec(),
+            CgroupFileKind::MemoryMax => b"max\n".to_vec(),
+            CgroupFileKind::MemoryLimitInBytes | CgroupFileKind::MemoryKmemLimit => {
+                b"2147483647\n".to_vec()
+            }
+            CgroupFileKind::MemoryEvents => b"low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n".to_vec(),
+            CgroupFileKind::MemoryStat => b"cache 0\nrss 0\nanon 0\nfile 0\nswap 0\n".to_vec(),
+            CgroupFileKind::MemorySwapMax => b"max\n".to_vec(),
+            CgroupFileKind::MemorySwappiness => b"60\n".to_vec(),
+            CgroupFileKind::MemoryUseHierarchy => b"1\n".to_vec(),
         }
     }
 
@@ -273,6 +405,48 @@ impl CgroupFs {
             }
         }
         buf.len()
+    }
+
+    fn write_memory_limit(&mut self, buf: &[u8]) -> usize {
+        let text = core::str::from_utf8(buf).unwrap_or("");
+        let trimmed = text.trim();
+        let pressure = trimmed != "max"
+            && trimmed
+                .parse::<usize>()
+                .map(|value| value < 512 * 1024 * 1024)
+                .unwrap_or(false);
+        MEMCG_PRESSURE_ACTIVE.store(pressure, Ordering::Relaxed);
+        if pressure {
+            discard_madv_free_pages();
+        }
+        buf.len()
+    }
+}
+
+pub(crate) fn memcg_pressure_active() -> bool {
+    MEMCG_PRESSURE_ACTIVE.load(Ordering::Relaxed)
+}
+
+pub(crate) fn reclaim_memcg_pressure_pages() -> bool {
+    if !memcg_pressure_active() {
+        return false;
+    }
+    let mut reclaimed = false;
+    for process in crate::task::processes_snapshot() {
+        reclaimed |= process
+            .inner_exclusive_access()
+            .memory_set
+            .discard_memcg_pressure_pages();
+    }
+    reclaimed
+}
+
+fn discard_madv_free_pages() {
+    for process in crate::task::processes_snapshot() {
+        process
+            .inner_exclusive_access()
+            .memory_set
+            .discard_lazy_free_pages();
     }
 }
 
@@ -454,7 +628,21 @@ impl FileSystemBackend for CgroupFs {
         match kind {
             CgroupFileKind::Controllers => 0,
             CgroupFileKind::SubtreeControl => buf.len(),
-            CgroupFileKind::Procs => self.write_procs(owner_dir, buf),
+            CgroupFileKind::Procs | CgroupFileKind::Tasks => self.write_procs(owner_dir, buf),
+            CgroupFileKind::MemoryMax | CgroupFileKind::MemoryLimitInBytes => {
+                self.write_memory_limit(buf)
+            }
+            CgroupFileKind::CloneChildren
+            | CgroupFileKind::MemoryCurrent
+            | CgroupFileKind::MemoryEvents
+            | CgroupFileKind::MemoryStat
+            | CgroupFileKind::MemorySwapCurrent
+            | CgroupFileKind::MemorySwapMax
+            | CgroupFileKind::MemorySwappiness
+            | CgroupFileKind::MemoryKmemUsage
+            | CgroupFileKind::MemoryKmemLimit
+            | CgroupFileKind::MemoryUsageInBytes
+            | CgroupFileKind::MemoryUseHierarchy => buf.len(),
         }
     }
 

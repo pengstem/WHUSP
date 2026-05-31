@@ -71,7 +71,13 @@ impl MmapFaultPage {
     /// The returned frame is not installed into any page table yet; callers
     /// must revalidate the VMA and install it through `MemorySet`.
     pub fn build_frame(&self) -> Option<FrameTracker> {
-        let frame = frame_alloc()?;
+        let frame = match frame_alloc() {
+            Some(frame) => frame,
+            None => {
+                crate::fs::reclaim_memcg_pressure_pages();
+                frame_alloc()?
+            }
+        };
         let mut read_len = 0usize;
         if let Some(file) = &self.backing_file
             && self.read_len > 0
@@ -241,6 +247,9 @@ impl MemorySet {
                 }
             } else if area.is_mmap() {
                 let area_idx = memory_set.insert_area_sorted(new_area);
+                if area.is_wipe_on_fork() {
+                    continue;
+                }
                 let cow_resident = area_is_private_user_writable(area);
                 let can_share_resident = area.mmap_info.as_ref().is_some_and(|info| info.shared)
                     || !area.map_perm.contains(MapPermission::W)
@@ -834,6 +843,9 @@ impl MemorySet {
             },
         };
         let area = &self.areas[area_idx];
+        if area.is_poisoned(vpn) {
+            return Some(MmapFaultResult::FatalSigbus);
+        }
         if !access.is_allowed_by(area.map_perm) {
             return None;
         }
@@ -1212,6 +1224,207 @@ impl MemorySet {
             vec.push(if resident { 1 } else { 0 });
         }
         Some(vec)
+    }
+
+    pub fn madvise_range_is_mapped(&self, start: usize, len: usize) -> Option<bool> {
+        let (start_vpn, end_vpn) = checked_page_range(start, len)?;
+        Some(self.range_is_mapped_vpn(start_vpn, end_vpn))
+    }
+
+    pub fn madvise_range_has_locked(&self, start: usize, len: usize) -> Option<bool> {
+        let (start_vpn, end_vpn) = checked_page_range(start, len)?;
+        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
+            return None;
+        }
+        Some(self.areas.iter().any(|area| {
+            area.vpn_range.get_start() < end_vpn
+                && area.vpn_range.get_end() > start_vpn
+                && area.is_locked()
+        }))
+    }
+
+    pub fn madvise_range_is_private_anonymous(&self, start: usize, len: usize) -> Option<bool> {
+        let (start_vpn, end_vpn) = checked_page_range(start, len)?;
+        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
+            return None;
+        }
+        Some(
+            self.areas
+                .iter()
+                .filter(|area| {
+                    area.vpn_range.get_start() < end_vpn && area.vpn_range.get_end() > start_vpn
+                })
+                .all(MapArea::is_private_anonymous_mmap),
+        )
+    }
+
+    pub fn madvise_range_is_shared_writable(&self, start: usize, len: usize) -> Option<bool> {
+        let (start_vpn, end_vpn) = checked_page_range(start, len)?;
+        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
+            return None;
+        }
+        Some(
+            self.areas
+                .iter()
+                .filter(|area| {
+                    area.vpn_range.get_start() < end_vpn && area.vpn_range.get_end() > start_vpn
+                })
+                .all(MapArea::is_shared_writable_mmap),
+        )
+    }
+
+    pub fn madvise_set_wipe_on_fork(&mut self, start: usize, len: usize, enabled: bool) -> bool {
+        let Some((start_vpn, end_vpn)) = checked_page_range(start, len) else {
+            return false;
+        };
+        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
+            return false;
+        }
+        self.split_area_at(start_vpn);
+        self.split_area_at(end_vpn);
+        for area in &mut self.areas {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            if area_start >= start_vpn && area_end <= end_vpn {
+                area.set_wipe_on_fork(enabled);
+            }
+        }
+        true
+    }
+
+    pub fn madvise_set_dumpable(&mut self, start: usize, len: usize, enabled: bool) -> bool {
+        let Some((start_vpn, end_vpn)) = checked_page_range(start, len) else {
+            return false;
+        };
+        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
+            return false;
+        }
+        self.split_area_at(start_vpn);
+        self.split_area_at(end_vpn);
+        for area in &mut self.areas {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            if area_start >= start_vpn && area_end <= end_vpn && area.is_mmap() {
+                area.set_dumpable(enabled);
+            }
+        }
+        true
+    }
+
+    pub fn madvise_poison_range(&mut self, start: usize, len: usize) -> bool {
+        let Some((start_vpn, end_vpn)) = checked_page_range(start, len) else {
+            return false;
+        };
+        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
+            return false;
+        }
+        self.split_area_at(start_vpn);
+        self.split_area_at(end_vpn);
+        let mut poisoned = false;
+        for area in &mut self.areas {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            if area_start >= start_vpn && area_end <= end_vpn && area.is_private_anonymous_mmap() {
+                area.poison_pages(&mut self.page_table, start_vpn, end_vpn);
+                poisoned = true;
+            }
+        }
+        if poisoned {
+            arch_mm::flush_tlb_all();
+        }
+        poisoned
+    }
+
+    pub fn madvise_mark_lazy_free(&mut self, start: usize, len: usize) -> bool {
+        let Some((start_vpn, end_vpn)) = checked_page_range(start, len) else {
+            return false;
+        };
+        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
+            return false;
+        }
+        self.split_area_at(start_vpn);
+        self.split_area_at(end_vpn);
+        let mut marked = false;
+        for area in &mut self.areas {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            if area_start >= start_vpn && area_end <= end_vpn && area.is_private_anonymous_mmap() {
+                area.mark_lazy_free_pages(start_vpn, end_vpn);
+                marked = true;
+            }
+        }
+        marked
+    }
+
+    pub fn madvise_dontneed_range(&mut self, start: usize, len: usize) -> bool {
+        let Some((start_vpn, end_vpn)) = checked_page_range(start, len) else {
+            return false;
+        };
+        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
+            return false;
+        }
+        self.split_area_at(start_vpn);
+        self.split_area_at(end_vpn);
+        let mut touched = false;
+        for area in &mut self.areas {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            if area_start >= start_vpn && area_end <= end_vpn && area.is_mmap() {
+                area.unmap_resident(&mut self.page_table);
+                touched = true;
+            }
+        }
+        if touched {
+            arch_mm::flush_tlb_all();
+        }
+        true
+    }
+
+    pub fn discard_lazy_free_pages(&mut self) -> bool {
+        let mut discarded = false;
+        for area in &mut self.areas {
+            if area.discard_lazy_free_pages(&mut self.page_table) {
+                discarded = true;
+            }
+        }
+        if discarded {
+            arch_mm::flush_tlb_all();
+        }
+        discarded
+    }
+
+    pub fn discard_memcg_pressure_pages(&mut self) -> bool {
+        let mut discarded = false;
+        for area in &mut self.areas {
+            if area.discard_memcg_pressure_pages(&mut self.page_table) {
+                discarded = true;
+            }
+        }
+        if discarded {
+            arch_mm::flush_tlb_all();
+        }
+        discarded
+    }
+
+    pub fn core_dump_bytes(&self, max_len: usize) -> Vec<u8> {
+        let mut output = Vec::new();
+        for area in &self.areas {
+            if !area.is_dumpable() {
+                continue;
+            }
+            for vpn in area.vpn_range {
+                if output.len() >= max_len {
+                    return output;
+                }
+                let Some(pte) = self.page_table.translate(vpn).filter(|pte| pte.bits != 0) else {
+                    continue;
+                };
+                let page = pte.ppn().get_bytes_array();
+                let remaining = max_len - output.len();
+                output.extend_from_slice(&page[..PAGE_SIZE.min(remaining)]);
+            }
+        }
+        output
     }
 
     pub fn prefault_mmap_range(&mut self, start: usize, len: usize) -> bool {
