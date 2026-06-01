@@ -23,13 +23,14 @@ use super::uapi::{
 };
 use crate::fs::{
     FS_APPEND_FL, FS_IMMUTABLE_FL, File, FileCreateAttrs, FileStat, FileTimestamp, FsError,
-    FsNodeKind, OpenFlags, PathContext, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT,
-    S_IFREG, S_IFSOCK, WorkingDir, chown_in, create_node_in, link_file_in, link_open_file_in,
-    lookup_dir_with_stat_in, lookup_dir_with_stat_path_in, lookup_path_in, mkdir_in,
-    normalize_path_at_root, open_devfs_child, open_devfs_input_child, open_devfs_misc_child,
-    open_devfs_net_child, open_devfs_pts_child, open_file_in, open_file_in_with_attrs,
-    open_static_path, open_tmpfile_in_with_attrs, path_inside_root, rename_exchange_in, rename_in,
-    rmdir_in, stat_static_path, symlink_in, truncate_in, unlink_file_in,
+    FsNodeKind, MountId, OpenFlags, PathContext, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK,
+    S_IFMT, S_IFREG, S_IFSOCK, WorkingDir, chown_in, create_node_in, link_file_in,
+    link_open_file_in, lookup_dir_with_stat_in, lookup_dir_with_stat_path_in, lookup_path_in,
+    mkdir_in, mount_is_read_only, normalize_path_at_root, open_devfs_child, open_devfs_input_child,
+    open_devfs_misc_child, open_devfs_net_child, open_devfs_pts_child, open_file_in,
+    open_file_in_with_attrs, open_static_path, open_tmpfile_in_with_attrs, path_inside_root,
+    rename_exchange_in, rename_in, rmdir_in, stat_static_path, symlink_in, truncate_in,
+    unlink_file_in,
 };
 use crate::mm::UserBuffer;
 use crate::task::{CAP_SYS_CHROOT, PathSnapshot, current_process, current_user_token};
@@ -458,6 +459,21 @@ fn apply_utimensat_to_file(
     times: UtimensatTimes,
     ctime: FileTimestamp,
 ) -> SysResult {
+    let stat = file.stat()?;
+    if mount_is_read_only(MountId(stat.dev as usize)) {
+        return Err(SysError::EROFS);
+    }
+
+    let credentials = current_process().credentials();
+    let subject = AccessSubject::from_fs_credentials(&credentials);
+    if subject.uid() != stat.uid && !subject.is_root() {
+        if times.both_now {
+            check_access_mode(&stat, W_OK, subject)?;
+        } else {
+            return Err(SysError::EPERM);
+        }
+    }
+
     let flags = match file.inode_flags() {
         Ok(flags) => flags,
         Err(FsError::Unsupported) => 0,
