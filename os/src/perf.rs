@@ -49,6 +49,9 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) dev_zero_read_bytes: usize,
     pub(crate) dev_zero_read_byte_writes: usize,
     pub(crate) dev_zero_read_fill_bytes: usize,
+    pub(crate) tlb_flush_all_calls: usize,
+    pub(crate) tlb_flush_range_calls: usize,
+    pub(crate) tlb_flush_range_pages: usize,
     pub(crate) pipe_read_calls: usize,
     pub(crate) pipe_write_calls: usize,
     pub(crate) pipe_read_bytes: usize,
@@ -179,6 +182,9 @@ mod enabled {
     static DEV_ZERO_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
     static DEV_ZERO_READ_BYTE_WRITES: AtomicUsize = AtomicUsize::new(0);
     static DEV_ZERO_READ_FILL_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static TLB_FLUSH_ALL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static TLB_FLUSH_RANGE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static TLB_FLUSH_RANGE_PAGES: AtomicUsize = AtomicUsize::new(0);
 
     static PIPE_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PIPE_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -396,6 +402,15 @@ mod enabled {
         DEV_ZERO_READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
         DEV_ZERO_READ_BYTE_WRITES.fetch_add(byte_writes, Ordering::Relaxed);
         DEV_ZERO_READ_FILL_BYTES.fetch_add(fill_bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_tlb_flush_all() {
+        TLB_FLUSH_ALL_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_tlb_flush_range(pages: usize) {
+        TLB_FLUSH_RANGE_CALLS.fetch_add(1, Ordering::Relaxed);
+        TLB_FLUSH_RANGE_PAGES.fetch_add(pages, Ordering::Relaxed);
     }
 
     pub(crate) fn record_pipe_read_call() {
@@ -663,6 +678,9 @@ mod enabled {
             dev_zero_read_bytes: DEV_ZERO_READ_BYTES.load(Ordering::Relaxed),
             dev_zero_read_byte_writes: DEV_ZERO_READ_BYTE_WRITES.load(Ordering::Relaxed),
             dev_zero_read_fill_bytes: DEV_ZERO_READ_FILL_BYTES.load(Ordering::Relaxed),
+            tlb_flush_all_calls: TLB_FLUSH_ALL_CALLS.load(Ordering::Relaxed),
+            tlb_flush_range_calls: TLB_FLUSH_RANGE_CALLS.load(Ordering::Relaxed),
+            tlb_flush_range_pages: TLB_FLUSH_RANGE_PAGES.load(Ordering::Relaxed),
             pipe_read_calls: PIPE_READ_CALLS.load(Ordering::Relaxed),
             pipe_write_calls: PIPE_WRITE_CALLS.load(Ordering::Relaxed),
             pipe_read_bytes: PIPE_READ_BYTES.load(Ordering::Relaxed),
@@ -798,6 +816,9 @@ mod enabled {
          dev_zero_read_bytes {}\n\
          dev_zero_read_byte_writes {}\n\
          dev_zero_read_fill_bytes {}\n\
+         tlb_flush_all_calls {}\n\
+         tlb_flush_range_calls {}\n\
+         tlb_flush_range_pages {}\n\
          pipe_read_calls {}\n\
          pipe_write_calls {}\n\
          pipe_read_bytes {}\n\
@@ -915,6 +936,9 @@ mod enabled {
             stats.dev_zero_read_bytes,
             stats.dev_zero_read_byte_writes,
             stats.dev_zero_read_fill_bytes,
+            stats.tlb_flush_all_calls,
+            stats.tlb_flush_range_calls,
+            stats.tlb_flush_range_pages,
             stats.pipe_read_calls,
             stats.pipe_write_calls,
             stats.pipe_read_bytes,
@@ -1097,6 +1121,12 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_dev_zero_read(_bytes: usize, _byte_writes: usize, _fill_bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_tlb_flush_all() {}
+
+    #[inline(always)]
+    pub(crate) fn record_tlb_flush_range(_pages: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_pipe_read_call() {}

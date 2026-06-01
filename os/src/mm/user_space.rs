@@ -18,6 +18,23 @@ use alloc::vec::Vec;
 // Leave unmapped space below MAP_GROWSDOWN expansion so a stack-like VMA does
 // not grow into an adjacent mapping when handling one-page-at-a-time faults.
 const STACK_GUARD_GAP_PAGES: usize = 256;
+const TLB_RANGE_FULL_FLUSH_THRESHOLD: usize = 64;
+
+fn flush_tlb_vpn_range(start_vpn: VirtPageNum, end_vpn: VirtPageNum) {
+    let pages = end_vpn.0.saturating_sub(start_vpn.0);
+    if pages == 0 {
+        return;
+    }
+    if pages > TLB_RANGE_FULL_FLUSH_THRESHOLD {
+        perf::record_tlb_flush_all();
+        arch_mm::flush_tlb_all();
+        return;
+    }
+    perf::record_tlb_flush_range(pages);
+    for vpn in VPNRange::new(start_vpn, end_vpn) {
+        arch_mm::flush_tlb_page(usize::from(VirtAddr::from(vpn)));
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryProtectError {
@@ -1056,7 +1073,7 @@ impl MemorySet {
             }
         }
         if unmapped {
-            arch_mm::flush_tlb_all();
+            flush_tlb_vpn_range(start_vpn, end_vpn);
         }
         Some(flushes)
     }
@@ -1131,7 +1148,7 @@ impl MemorySet {
         if !touched {
             return Err(MemoryProtectError::Unmapped);
         }
-        arch_mm::flush_tlb_all();
+        flush_tlb_vpn_range(start_vpn, end_vpn);
         Ok(())
     }
 
