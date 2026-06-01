@@ -11,6 +11,7 @@ use super::{
 };
 use crate::config::PAGE_SIZE;
 use crate::mm::UserBuffer;
+use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{
@@ -20,8 +21,9 @@ use crate::syscall::user_ptr::{
 };
 use crate::syscall::{close_detached_fd_entry, install_file_fd};
 use crate::task::{
-    FdTableEntry, SignalFlags, current_add_signal, current_has_unmasked_signal, current_process,
-    current_user_token, suspend_current_and_run_next,
+    FdTableEntry, SignalFlags, TaskControlBlock, block_current_task_no_schedule,
+    current_add_signal, current_has_unmasked_signal, current_process, current_task,
+    current_user_token, schedule, suspend_current_and_run_next, wakeup_task,
 };
 use crate::timer::get_time_ms;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -468,6 +470,8 @@ struct LocalSocketInner {
     accept_queue: VecDeque<Arc<UPIntrFreeCell<LocalSocketInner>>>,
     stream_rx: VecDeque<u8>,
     datagram_rx: VecDeque<Datagram>,
+    read_wait_queue: VecDeque<Arc<TaskControlBlock>>,
+    write_wait_queue: VecDeque<Arc<TaskControlBlock>>,
     read_poll_waiters: PollWaitQueue,
     write_poll_waiters: PollWaitQueue,
     listening: bool,
@@ -618,6 +622,8 @@ impl LocalSocketInner {
             accept_queue: VecDeque::new(),
             stream_rx: VecDeque::new(),
             datagram_rx: VecDeque::new(),
+            read_wait_queue: VecDeque::new(),
+            write_wait_queue: VecDeque::new(),
             read_poll_waiters: PollWaitQueue::new(),
             write_poll_waiters: PollWaitQueue::new(),
             listening: false,
@@ -658,6 +664,79 @@ impl LocalSocketInner {
         inner.write_shutdown = shutdown.write;
         inner.peer_write_shutdown = shutdown.peer_write;
         inner
+    }
+
+    fn sleep_reader(&mut self) -> *mut crate::task::TaskContext {
+        let (task, task_cx_ptr) = block_current_task_no_schedule();
+        self.read_wait_queue.push_back(task);
+        task_cx_ptr
+    }
+
+    fn sleep_writer(&mut self) -> *mut crate::task::TaskContext {
+        let (task, task_cx_ptr) = block_current_task_no_schedule();
+        self.write_wait_queue.push_back(task);
+        task_cx_ptr
+    }
+
+    fn wake_reader(&mut self) -> Option<Arc<TaskControlBlock>> {
+        self.read_wait_queue.pop_front()
+    }
+
+    fn wake_writer(&mut self) -> Option<Arc<TaskControlBlock>> {
+        self.write_wait_queue.pop_front()
+    }
+
+    fn wake_all_readers(&mut self) -> VecDeque<Arc<TaskControlBlock>> {
+        core::mem::take(&mut self.read_wait_queue)
+    }
+
+    fn wake_all_writers(&mut self) -> VecDeque<Arc<TaskControlBlock>> {
+        core::mem::take(&mut self.write_wait_queue)
+    }
+
+    fn remove_reader(&mut self, task: &Arc<TaskControlBlock>) {
+        remove_socket_waiter(&mut self.read_wait_queue, task);
+    }
+
+    fn remove_writer(&mut self, task: &Arc<TaskControlBlock>) {
+        remove_socket_waiter(&mut self.write_wait_queue, task);
+    }
+}
+
+fn remove_socket_waiter(queue: &mut VecDeque<Arc<TaskControlBlock>>, task: &Arc<TaskControlBlock>) {
+    if let Some(index) = queue
+        .iter()
+        .position(|candidate| Arc::ptr_eq(candidate, task))
+    {
+        queue.remove(index);
+    }
+}
+
+fn wake_local_socket_reader(task: Option<Arc<TaskControlBlock>>) {
+    if let Some(task) = task
+        && wakeup_task(task)
+    {
+        perf::record_local_socket_reader_wakeup();
+    }
+}
+
+fn wake_local_socket_writer(task: Option<Arc<TaskControlBlock>>) {
+    if let Some(task) = task
+        && wakeup_task(task)
+    {
+        perf::record_local_socket_writer_wakeup();
+    }
+}
+
+fn wake_local_socket_readers(tasks: VecDeque<Arc<TaskControlBlock>>) {
+    for task in tasks {
+        wake_local_socket_reader(Some(task));
+    }
+}
+
+fn wake_local_socket_writers(tasks: VecDeque<Arc<TaskControlBlock>>) {
+    for task in tasks {
+        wake_local_socket_writer(Some(task));
     }
 }
 
@@ -1018,6 +1097,7 @@ impl LocalSocket {
     }
 
     fn send_stream(&self, data: &[u8]) -> SysResult<usize> {
+        perf::record_local_socket_write_call();
         let mut written = 0usize;
         while written < data.len() {
             let (connected, peer) = {
@@ -1044,11 +1124,16 @@ impl LocalSocket {
             let capacity = (peer_inner.rcvbuf as usize).max(1);
             let available = capacity.saturating_sub(peer_inner.stream_rx.len());
             if available == 0 {
-                drop(peer_inner);
                 if current_has_unmasked_signal() {
+                    if let Some(task) = current_task() {
+                        peer_inner.remove_writer(&task);
+                    }
                     return Err(SysError::EINTR);
                 }
-                suspend_current_and_run_next();
+                perf::record_local_socket_writer_sleep();
+                let task_cx_ptr = peer_inner.sleep_writer();
+                drop(peer_inner);
+                schedule(task_cx_ptr);
                 continue;
             }
             let chunk_len = available.min(data.len() - written);
@@ -1056,8 +1141,10 @@ impl LocalSocket {
                 .stream_rx
                 .extend(data[written..written + chunk_len].iter().copied());
             written += chunk_len;
+            let reader = peer_inner.wake_reader();
             let read_waiters = peer_inner.read_poll_waiters.drain();
             drop(peer_inner);
+            wake_local_socket_reader(reader);
             PollWaiter::wake_all(read_waiters);
         }
         Ok(written)
@@ -1208,6 +1295,7 @@ impl LocalSocket {
     }
 
     fn recv_stream(&self, buf: UserBuffer, nonblock: bool) -> SysResult<usize> {
+        perf::record_local_socket_read_call();
         let mut buf = buf;
         let want = buf.len();
         loop {
@@ -1222,8 +1310,10 @@ impl LocalSocket {
                     buf.copy_from_slice(&data[..len])
                 };
                 inner.stream_rx.drain(..copied);
+                let writer = inner.wake_writer();
                 let peer = inner.peer_socket.as_ref().and_then(Weak::upgrade);
                 drop(inner);
+                wake_local_socket_writer(writer);
                 if let Some(peer) = peer {
                     let write_waiters = drain_socket_write_poll_waiters(&peer);
                     PollWaiter::wake_all(write_waiters);
@@ -1233,14 +1323,19 @@ impl LocalSocket {
             if inner.peer_write_shutdown {
                 return Ok(0);
             }
-            drop(inner);
             if nonblock {
                 return Err(SysError::EAGAIN);
             }
             if current_has_unmasked_signal() {
+                if let Some(task) = current_task() {
+                    inner.remove_reader(&task);
+                }
                 return Err(SysError::EINTR);
             }
-            suspend_current_and_run_next();
+            perf::record_local_socket_reader_sleep();
+            let task_cx_ptr = inner.sleep_reader();
+            drop(inner);
+            schedule(task_cx_ptr);
         }
     }
 
@@ -1434,7 +1529,7 @@ impl LocalSocket {
         if !matches!(how, SHUT_RD | SHUT_WR | SHUT_RDWR) {
             return Err(SysError::EINVAL);
         }
-        let (peer, read_waiters, write_waiters) = {
+        let (peer, readers, writers, read_waiters, write_waiters) = {
             let mut inner = self.inner.exclusive_access();
             if matches!(how, SHUT_RD | SHUT_RDWR) {
                 inner.read_shutdown = true;
@@ -1444,20 +1539,25 @@ impl LocalSocket {
             }
             (
                 inner.peer_socket.as_ref().and_then(Weak::upgrade),
+                inner.wake_all_readers(),
+                inner.wake_all_writers(),
                 inner.read_poll_waiters.drain(),
                 inner.write_poll_waiters.drain(),
             )
         };
+        wake_local_socket_readers(readers);
+        wake_local_socket_writers(writers);
         PollWaiter::wake_all(read_waiters);
         PollWaiter::wake_all(write_waiters);
         if matches!(how, SHUT_WR | SHUT_RDWR)
             && let Some(peer) = peer
         {
-            let read_waiters = {
+            let (readers, read_waiters) = {
                 let mut peer = peer.exclusive_access();
                 peer.peer_write_shutdown = true;
-                peer.read_poll_waiters.drain()
+                (peer.wake_all_readers(), peer.read_poll_waiters.drain())
             };
+            wake_local_socket_readers(readers);
             PollWaiter::wake_all(read_waiters);
         }
         Ok(0)
@@ -1466,7 +1566,18 @@ impl LocalSocket {
 
 impl Drop for LocalSocket {
     fn drop(&mut self) {
-        let (domain, kind, local, unix_local, listening, peer, read_waiters, write_waiters) = {
+        let (
+            domain,
+            kind,
+            local,
+            unix_local,
+            listening,
+            peer,
+            readers,
+            writers,
+            read_waiters,
+            write_waiters,
+        ) = {
             let mut inner = self.inner.exclusive_access();
             inner.read_shutdown = true;
             inner.write_shutdown = true;
@@ -1477,18 +1588,23 @@ impl Drop for LocalSocket {
                 inner.unix_local.clone(),
                 inner.listening,
                 inner.peer_socket.as_ref().and_then(Weak::upgrade),
+                inner.wake_all_readers(),
+                inner.wake_all_writers(),
                 inner.read_poll_waiters.drain(),
                 inner.write_poll_waiters.drain(),
             )
         };
+        wake_local_socket_readers(readers);
+        wake_local_socket_writers(writers);
         PollWaiter::wake_all(read_waiters);
         PollWaiter::wake_all(write_waiters);
         if let Some(peer) = peer {
-            let read_waiters = {
+            let (readers, read_waiters) = {
                 let mut peer = peer.exclusive_access();
                 peer.peer_write_shutdown = true;
-                peer.read_poll_waiters.drain()
+                (peer.wake_all_readers(), peer.read_poll_waiters.drain())
             };
+            wake_local_socket_readers(readers);
             PollWaiter::wake_all(read_waiters);
         }
         if let Some(local) = local {

@@ -64,6 +64,14 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) eventfd_writer_sleeps: usize,
     pub(crate) eventfd_reader_wakeups: usize,
     pub(crate) eventfd_writer_wakeups: usize,
+    pub(crate) local_socket_read_calls: usize,
+    pub(crate) local_socket_write_calls: usize,
+    pub(crate) local_socket_read_block_yields: usize,
+    pub(crate) local_socket_write_block_yields: usize,
+    pub(crate) local_socket_reader_sleeps: usize,
+    pub(crate) local_socket_writer_sleeps: usize,
+    pub(crate) local_socket_reader_wakeups: usize,
+    pub(crate) local_socket_writer_wakeups: usize,
     pub(crate) pipe_read_calls: usize,
     pub(crate) pipe_write_calls: usize,
     pub(crate) pipe_read_bytes: usize,
@@ -209,6 +217,14 @@ mod enabled {
     static EVENTFD_WRITER_SLEEPS: AtomicUsize = AtomicUsize::new(0);
     static EVENTFD_READER_WAKEUPS: AtomicUsize = AtomicUsize::new(0);
     static EVENTFD_WRITER_WAKEUPS: AtomicUsize = AtomicUsize::new(0);
+    static LOCAL_SOCKET_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static LOCAL_SOCKET_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static LOCAL_SOCKET_READ_BLOCK_YIELDS: AtomicUsize = AtomicUsize::new(0);
+    static LOCAL_SOCKET_WRITE_BLOCK_YIELDS: AtomicUsize = AtomicUsize::new(0);
+    static LOCAL_SOCKET_READER_SLEEPS: AtomicUsize = AtomicUsize::new(0);
+    static LOCAL_SOCKET_WRITER_SLEEPS: AtomicUsize = AtomicUsize::new(0);
+    static LOCAL_SOCKET_READER_WAKEUPS: AtomicUsize = AtomicUsize::new(0);
+    static LOCAL_SOCKET_WRITER_WAKEUPS: AtomicUsize = AtomicUsize::new(0);
 
     static PIPE_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PIPE_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -472,6 +488,30 @@ mod enabled {
 
     pub(crate) fn record_eventfd_writer_wakeup() {
         EVENTFD_WRITER_WAKEUPS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_local_socket_read_call() {
+        LOCAL_SOCKET_READ_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_local_socket_write_call() {
+        LOCAL_SOCKET_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_local_socket_reader_sleep() {
+        LOCAL_SOCKET_READER_SLEEPS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_local_socket_writer_sleep() {
+        LOCAL_SOCKET_WRITER_SLEEPS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_local_socket_reader_wakeup() {
+        LOCAL_SOCKET_READER_WAKEUPS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_local_socket_writer_wakeup() {
+        LOCAL_SOCKET_WRITER_WAKEUPS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_pipe_read_call() {
@@ -755,6 +795,15 @@ mod enabled {
             eventfd_writer_sleeps: EVENTFD_WRITER_SLEEPS.load(Ordering::Relaxed),
             eventfd_reader_wakeups: EVENTFD_READER_WAKEUPS.load(Ordering::Relaxed),
             eventfd_writer_wakeups: EVENTFD_WRITER_WAKEUPS.load(Ordering::Relaxed),
+            local_socket_read_calls: LOCAL_SOCKET_READ_CALLS.load(Ordering::Relaxed),
+            local_socket_write_calls: LOCAL_SOCKET_WRITE_CALLS.load(Ordering::Relaxed),
+            local_socket_read_block_yields: LOCAL_SOCKET_READ_BLOCK_YIELDS.load(Ordering::Relaxed),
+            local_socket_write_block_yields: LOCAL_SOCKET_WRITE_BLOCK_YIELDS
+                .load(Ordering::Relaxed),
+            local_socket_reader_sleeps: LOCAL_SOCKET_READER_SLEEPS.load(Ordering::Relaxed),
+            local_socket_writer_sleeps: LOCAL_SOCKET_WRITER_SLEEPS.load(Ordering::Relaxed),
+            local_socket_reader_wakeups: LOCAL_SOCKET_READER_WAKEUPS.load(Ordering::Relaxed),
+            local_socket_writer_wakeups: LOCAL_SOCKET_WRITER_WAKEUPS.load(Ordering::Relaxed),
             pipe_read_calls: PIPE_READ_CALLS.load(Ordering::Relaxed),
             pipe_write_calls: PIPE_WRITE_CALLS.load(Ordering::Relaxed),
             pipe_read_bytes: PIPE_READ_BYTES.load(Ordering::Relaxed),
@@ -905,6 +954,14 @@ mod enabled {
          eventfd_writer_sleeps {}\n\
          eventfd_reader_wakeups {}\n\
          eventfd_writer_wakeups {}\n\
+         local_socket_read_calls {}\n\
+         local_socket_write_calls {}\n\
+         local_socket_read_block_yields {}\n\
+         local_socket_write_block_yields {}\n\
+         local_socket_reader_sleeps {}\n\
+         local_socket_writer_sleeps {}\n\
+         local_socket_reader_wakeups {}\n\
+         local_socket_writer_wakeups {}\n\
          pipe_read_calls {}\n\
          pipe_write_calls {}\n\
          pipe_read_bytes {}\n\
@@ -1037,6 +1094,14 @@ mod enabled {
             stats.eventfd_writer_sleeps,
             stats.eventfd_reader_wakeups,
             stats.eventfd_writer_wakeups,
+            stats.local_socket_read_calls,
+            stats.local_socket_write_calls,
+            stats.local_socket_read_block_yields,
+            stats.local_socket_write_block_yields,
+            stats.local_socket_reader_sleeps,
+            stats.local_socket_writer_sleeps,
+            stats.local_socket_reader_wakeups,
+            stats.local_socket_writer_wakeups,
             stats.pipe_read_calls,
             stats.pipe_write_calls,
             stats.pipe_read_bytes,
@@ -1252,6 +1317,24 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_eventfd_writer_wakeup() {}
+
+    #[inline(always)]
+    pub(crate) fn record_local_socket_read_call() {}
+
+    #[inline(always)]
+    pub(crate) fn record_local_socket_write_call() {}
+
+    #[inline(always)]
+    pub(crate) fn record_local_socket_reader_sleep() {}
+
+    #[inline(always)]
+    pub(crate) fn record_local_socket_writer_sleep() {}
+
+    #[inline(always)]
+    pub(crate) fn record_local_socket_reader_wakeup() {}
+
+    #[inline(always)]
+    pub(crate) fn record_local_socket_writer_wakeup() {}
 
     #[inline(always)]
     pub(crate) fn record_pipe_read_call() {}
