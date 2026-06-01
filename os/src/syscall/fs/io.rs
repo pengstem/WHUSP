@@ -1386,6 +1386,9 @@ pub fn sys_readahead(fd: usize, _offset: usize, _count: usize) -> SysResult {
     if entry.status_flags().contains(OpenFlags::PATH) || !file.readable() {
         return Err(SysError::EBADF);
     }
+    if file.is_io_uring() {
+        return Err(SysError::EINVAL);
+    }
     match file.stat()?.mode & S_IFMT {
         S_IFREG => {
             crate::fs::procfs_note_readahead();

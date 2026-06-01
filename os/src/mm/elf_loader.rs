@@ -277,19 +277,12 @@ fn map_elf_load_segments_lazy(
             mem_size,
         };
         let map_perm = map_permission_from_ph_flags(ph);
-        let la_executable_segment =
-            cfg!(target_arch = "loongarch64") && map_perm.contains(MapPermission::X);
-        let page_cache_id = if la_executable_segment {
-            // CONTEXT: LA currently has a layout-sensitive stale-instruction
-            // fetch when reusing shared executable page-cache frames under the
-            // contest BusyBox workload. Keep only executable LA faults private;
-            // non-executable read-only pages and RISC-V still use page-cache.
-            None
-        } else {
-            (!map_perm.contains(MapPermission::W))
-                .then(|| backing_file.page_cache_id())
-                .flatten()
-        };
+        // CONTEXT: LoongArch executable page-cache reuse depends on the fault
+        // path syncing a cached frame before it is published as executable.
+        // Writable segments stay private because they may need COW or zero-fill.
+        let page_cache_id = (!map_perm.contains(MapPermission::W))
+            .then(|| backing_file.page_cache_id())
+            .flatten();
         memory_set.map_exec_segment_area(
             map_start,
             map_len,

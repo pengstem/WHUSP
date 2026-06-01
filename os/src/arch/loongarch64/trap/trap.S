@@ -195,7 +195,6 @@ __restore:
     csrwr   $t2, LA_CSR_PGDH
     dbar    0
     invtlb  0x00, $r0, $r0
-    ibar    0
     csrrd   $sp, KSAVE_CTX
     LOAD_FP_REGS
     LOAD_REGS

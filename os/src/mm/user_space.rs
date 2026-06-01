@@ -112,15 +112,29 @@ impl MmapPageCacheFault {
         self.key
     }
 
+    pub fn is_exec_fault(&self) -> bool {
+        self.exec_fault
+    }
+
     /// Resolves the shared page-cache frame for a file-backed MAP_SHARED fault.
     ///
     /// This may allocate a new frame and read the backing file when the page is
     /// not already cached. A successful return owns one page-cache reference.
     pub fn resolve_ppn(&self) -> Option<PhysPageNum> {
-        if let Some(ppn) = {
+        let cached_ppn = {
             let mut cache = PAGE_CACHE.exclusive_access();
-            cache.get_and_inc_ref(self.key)
-        } {
+            if let Some(ppn) = cache.get_and_inc_ref(self.key) {
+                if self.exec_fault && !cache.ensure_exec_icache_synced(self.key) {
+                    cache.dec_ref(self.key);
+                    None
+                } else {
+                    Some(ppn)
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(ppn) = cached_ppn {
             if self.exec_fault {
                 super::elf_loader::record_exec_lazy_page_cache_fault(true, 0);
             }
@@ -136,6 +150,10 @@ impl MmapPageCacheFault {
 
         let mut cache = PAGE_CACHE.exclusive_access();
         let ppn = cache.insert_loaded_page_and_inc_ref(self.key, frame, self.file_size_at_load);
+        if self.exec_fault && !cache.ensure_exec_icache_synced(self.key) {
+            cache.dec_ref(self.key);
+            return None;
+        }
         if self.exec_fault {
             super::elf_loader::record_exec_lazy_page_cache_fault(false, read_len);
         }
@@ -259,21 +277,23 @@ impl MemorySet {
                     || cow_resident;
                 let resident_vpns: Vec<_> = area.data_frames.keys().copied().collect();
                 for vpn in resident_vpns {
-                    let Some(src_pte) = user_space.page_table.translate(vpn) else {
+                    let Some(src_frame) = area.data_frames.get(&vpn) else {
                         continue;
                     };
+                    let src_ppn = src_frame.ppn;
                     let frame = if cow_resident || can_share_resident {
-                        FrameTracker::from_retained(src_pte.ppn())
+                        FrameTracker::from_retained(src_ppn)
                     } else {
                         let frame = frame_alloc()?;
                         frame
                             .ppn
                             .get_bytes_array()
-                            .copy_from_slice(src_pte.ppn().get_bytes_array());
+                            .copy_from_slice(src_ppn.get_bytes_array());
                         Some(frame)
                     };
                     let frame = frame?;
                     let pte_flags = if cow_resident {
+                        let src_pte = user_space.page_table.translate(vpn)?;
                         cow_flags_from_pte(src_pte)
                     } else {
                         PTEFlags::from_bits_truncate(area.map_perm.bits() as usize)
@@ -996,7 +1016,12 @@ impl MemorySet {
         }
         let page_table = &mut self.page_table;
         let area = &mut self.areas[idx];
-        area.map_page_cache_frame(page_table, page.vpn, ppn, page.key)
+        let exec_fault = page.is_exec_fault();
+        let installed = area.map_page_cache_frame(page_table, page.vpn, ppn, page.key);
+        if installed && exec_fault {
+            arch_mm::publish_pte_barrier();
+        }
+        installed
     }
 
     /// Unmaps complete mmap VMAs covered by the page-aligned range.

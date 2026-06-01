@@ -430,6 +430,18 @@ impl File for IoUringFile {
         0
     }
 
+    fn is_io_uring(&self) -> bool {
+        true
+    }
+
+    fn supports_splice_read(&self) -> bool {
+        false
+    }
+
+    fn supports_splice_write(&self) -> bool {
+        false
+    }
+
     fn stat(&self) -> crate::fs::FsResult<FileStat> {
         Ok(FileStat {
             mode: S_IFREG | 0o600,

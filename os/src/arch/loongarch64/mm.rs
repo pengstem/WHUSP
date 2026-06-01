@@ -64,6 +64,18 @@ pub fn flush_tlb_page(va: usize) {
     }
 }
 
+pub fn publish_pte_barrier() {
+    unsafe {
+        asm!("dbar 0");
+    }
+}
+
+pub fn instruction_barrier() {
+    unsafe {
+        asm!("ibar 0");
+    }
+}
+
 pub fn canonicalize_phys_addr(addr: usize) -> usize {
     virt_to_phys(addr) & ((1usize << PA_WIDTH) - 1)
 }
@@ -105,7 +117,7 @@ pub fn pte_new_bits(ppn: usize, flags: crate::mm::page_table::PTEFlags) -> usize
     let leaf_flags = crate::mm::page_table::PTEFlags::R
         | crate::mm::page_table::PTEFlags::W
         | crate::mm::page_table::PTEFlags::X;
-    if !flags.intersects(leaf_flags) {
+    if !flags.intersects(leaf_flags) && !flags.contains(crate::mm::page_table::PTEFlags::U) {
         return pa;
     }
 

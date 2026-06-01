@@ -33,6 +33,10 @@ pub fn flush_tlb_page(va: usize) {
     }
 }
 
+pub fn publish_pte_barrier() {}
+
+pub fn instruction_barrier() {}
+
 pub fn canonicalize_phys_addr(addr: usize) -> usize {
     addr & ((1usize << PA_WIDTH) - 1)
 }

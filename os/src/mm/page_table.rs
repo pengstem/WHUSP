@@ -187,6 +187,20 @@ impl PageTable {
         *pte = PageTableEntry::new(pte.ppn(), flags);
         true
     }
+    pub fn clear_leaf(&mut self, vpn: VirtPageNum) -> bool {
+        let Some(pte) = self.find_pte(vpn) else {
+            return false;
+        };
+        *pte = PageTableEntry::empty();
+        true
+    }
+    pub fn clear_leaf_create_path(&mut self, vpn: VirtPageNum) -> bool {
+        let Some(pte) = self.find_pte_create(vpn) else {
+            return false;
+        };
+        *pte = PageTableEntry::empty();
+        true
+    }
     pub fn mark_cow_readonly(&mut self, vpn: VirtPageNum) -> bool {
         let Some(pte) = self.find_pte(vpn) else {
             return false;

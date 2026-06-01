@@ -285,6 +285,8 @@ impl MapArea {
         reported_permission: MapPermission,
     ) -> bool {
         let pte_flags = PTEFlags::from_bits_truncate(permission.bits() as usize);
+        let has_leaf_permission =
+            permission.intersects(MapPermission::R | MapPermission::W | MapPermission::X);
         if self.is_mmap() {
             let materialize_exec_cache_for_write = self.mmap_info.as_ref().is_some_and(|info| {
                 info.exec_segment.is_some()
@@ -297,9 +299,14 @@ impl MapArea {
             {
                 return false;
             }
-            for vpn in self.data_frames.keys().copied() {
-                let flags = remap_flags_preserving_cow(page_table, vpn, pte_flags);
-                if !page_table.remap_flags(vpn, flags) {
+            for (vpn, frame) in &self.data_frames {
+                if !remap_resident_frame(
+                    page_table,
+                    *vpn,
+                    frame.ppn,
+                    pte_flags,
+                    has_leaf_permission,
+                ) {
                     return false;
                 }
             }
@@ -317,9 +324,14 @@ impl MapArea {
                 }
             }
         } else {
-            for vpn in self.vpn_range {
-                let flags = remap_flags_preserving_cow(page_table, vpn, pte_flags);
-                if !page_table.remap_flags(vpn, flags) {
+            for (vpn, frame) in &self.data_frames {
+                if !remap_resident_frame(
+                    page_table,
+                    *vpn,
+                    frame.ppn,
+                    pte_flags,
+                    has_leaf_permission,
+                ) {
                     return false;
                 }
             }
@@ -417,12 +429,27 @@ impl MapArea {
         pte_flags: PTEFlags,
     ) -> bool {
         if self.data_frames.contains_key(&vpn) {
+            if !pte_flags.intersects(PTEFlags::R | PTEFlags::W | PTEFlags::X) {
+                return page_table.clear_leaf_create_path(vpn);
+            }
             return true;
         }
         if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
+            if !pte_flags.intersects(PTEFlags::R | PTEFlags::W | PTEFlags::X) {
+                if !page_table.clear_leaf_create_path(vpn) {
+                    return false;
+                }
+            }
             return true;
         }
         let ppn = frame.ppn;
+        if !pte_flags.intersects(PTEFlags::R | PTEFlags::W | PTEFlags::X) {
+            if !page_table.clear_leaf_create_path(vpn) {
+                return false;
+            }
+            self.data_frames.insert(vpn, frame);
+            return true;
+        }
         if !page_table.try_map(vpn, ppn, pte_flags) {
             return false;
         }
@@ -836,6 +863,24 @@ fn remap_flags_preserving_cow(
         flags.insert(PTEFlags::COW);
     }
     flags
+}
+
+fn remap_resident_frame(
+    page_table: &mut PageTable,
+    vpn: VirtPageNum,
+    ppn: PhysPageNum,
+    pte_flags: PTEFlags,
+    has_leaf_permission: bool,
+) -> bool {
+    if !has_leaf_permission {
+        return page_table.clear_leaf(vpn);
+    }
+    let flags = remap_flags_preserving_cow(page_table, vpn, pte_flags);
+    if page_table.translate(vpn).is_some_and(|pte| pte.bits == 0) {
+        page_table.try_map(vpn, ppn, flags)
+    } else {
+        page_table.remap_flags(vpn, flags)
+    }
 }
 
 fn mmap_writeback_len(info: &MmapInfo, area_offset: usize) -> Option<usize> {

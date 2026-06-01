@@ -525,6 +525,9 @@ pub trait File: Send + Sync {
     fn is_eventfd(&self) -> bool {
         false
     }
+    fn is_io_uring(&self) -> bool {
+        false
+    }
     fn is_memfd(&self) -> bool {
         false
     }

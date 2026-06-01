@@ -55,6 +55,7 @@ pub(crate) struct PageCachePage {
     pub(crate) file_size_at_load: usize,
     pub(crate) dirty: bool,
     pub(crate) ref_count: usize,
+    exec_icache_synced: bool,
     lru_stamp: usize,
 }
 
@@ -66,6 +67,7 @@ impl PageCachePage {
             file_size_at_load,
             dirty: false,
             ref_count: 0,
+            exec_icache_synced: false,
             lru_stamp: 0,
         }
     }
@@ -106,6 +108,19 @@ impl PageCache {
 
     pub(crate) fn contains(&self, key: PageCacheKey) -> bool {
         self.pages.contains_key(&key)
+    }
+
+    pub(crate) fn ensure_exec_icache_synced(&mut self, key: PageCacheKey) -> bool {
+        let Some(page) = self.pages.get_mut(&key) else {
+            return false;
+        };
+        if page.exec_icache_synced {
+            return true;
+        }
+        crate::arch::mm::publish_pte_barrier();
+        crate::arch::mm::instruction_barrier();
+        page.exec_icache_synced = true;
+        true
     }
 
     fn touch(&mut self, key: PageCacheKey, old_stamp: Option<usize>) -> usize {
@@ -296,6 +311,7 @@ impl PageCache {
             return false;
         };
         page.dirty = true;
+        page.exec_icache_synced = false;
         true
     }
 
