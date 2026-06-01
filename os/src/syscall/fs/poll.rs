@@ -51,6 +51,9 @@ fn sleep_until_poll_event(waiter: &Arc<PollWaiter>, deadline_ms: Option<usize>) 
 
     let _sleep_guard = ProcSleepGuard::new()?;
     let interrupts_enabled = interrupt::supervisor_interrupt_enabled();
+    // CONTEXT: Registering the waiter and blocking must be atomic with respect
+    // to IRQ wakeups. Recheck after disabling interrupts so a device/timer wake
+    // cannot be lost between scan_pollfds() and schedule().
     interrupt::disable_supervisor_interrupt();
     if waiter.was_triggered() {
         if interrupts_enabled {

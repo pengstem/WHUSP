@@ -596,9 +596,10 @@ pub(crate) use mount::{
     MountError, MountId, MountNamespaceId, MountPropagation, ROOT_MOUNT_NAMESPACE,
     assign_pid_to_cgroup, clone_mount_namespace, mount_bind_at, mount_block_device_at,
     mount_cgroup_memory_at, mount_cgroup2_at, mount_ext_scratch_at, mount_fat_device_at,
-    mount_is_read_only, mount_nfs_compat_at, mount_overlay_compat_at, mount_proc_at,
-    mount_tmpfs_at, mounted_source_at, move_mount_at, nfs_compat_source_path, overlay_real_node,
-    remount_at, root_ino_for, set_mount_propagation_at, shutdown_all_mounts, statfs_for_mount,
+    mount_is_noexec, mount_is_read_only, mount_nfs_compat_at, mount_overlay_compat_at,
+    mount_proc_at, mount_stat_flags_from_linux_mount_flags, mount_tmpfs_at, mounted_source_at,
+    move_mount_at, nfs_compat_source_path, overlay_real_node, remount_at, root_ino_for,
+    set_mount_propagation_at, set_mount_stat_flags, shutdown_all_mounts, statfs_for_mount,
     sync_all_mounts, unmount_at,
 };
 pub(crate) use path::{PathContext, WorkingDir, normalize_path_at_root, path_inside_root};

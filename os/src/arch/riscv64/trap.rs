@@ -222,6 +222,9 @@ pub(crate) fn handle_mmap_page_fault(addr: usize, access: MmapFaultAccess) -> bo
             false
         }
         MmapFaultResult::FatalSigbus => {
+            // CONTEXT: The access reached a mapped mmap VMA but violated its
+            // backing-object rules. Queue SIGBUS and report the fault handled so
+            // the outer page-fault path does not also add SIGSEGV.
             current_add_signal(SignalFlags::SIGBUS);
             true
         }

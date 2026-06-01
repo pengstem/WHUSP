@@ -172,6 +172,9 @@ fn allowed_write_len_at(
     offset: usize,
     requested_len: usize,
 ) -> SysResult<usize> {
+    // CONTEXT: RLIMIT_FSIZE is enforced at the resulting file-size boundary.
+    // Writes that start below the permitted end may be shortened; writes that
+    // start at or beyond it report EFBIG and queue SIGXFSZ.
     if requested_len == 0 {
         return Ok(0);
     }
@@ -211,6 +214,8 @@ fn allowed_write_len_for_entry(entry: &FdTableEntry, requested_len: usize) -> Sy
 }
 
 fn check_file_size_limit_for_len(file: &(dyn File + Send + Sync), len: usize) -> SysResult<()> {
+    // CONTEXT: ftruncate/fallocate length changes do not have a user-buffer
+    // partial-write path, so they validate the whole requested size up front.
     let stat = file.stat()?;
     if stat.mode & S_IFMT != S_IFREG {
         return Ok(());

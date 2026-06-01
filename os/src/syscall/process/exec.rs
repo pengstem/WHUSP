@@ -1,8 +1,8 @@
 use crate::config::USER_STACK_SIZE;
 use crate::fs::{
-    File, FileStat, FsNodeKind, OpenFlags, PathContext, S_IFLNK, S_IFMT, S_IFREG, VfsNodeId,
-    lookup_path_in, normalize_path_at_root, open_file_in, regular_file_is_open_writable_in,
-    regular_file_node_is_open_writable, stat_in,
+    File, FileStat, FsNodeKind, MountId, OpenFlags, PathContext, S_IFLNK, S_IFMT, S_IFREG,
+    VfsNodeId, lookup_path_in, mount_is_noexec, normalize_path_at_root, open_file_in,
+    regular_file_is_open_writable_in, regular_file_node_is_open_writable, stat_in,
 };
 use crate::mm::record_exec_metadata_read;
 use crate::syscall::errno::{SysError, SysResult};
@@ -263,10 +263,14 @@ fn check_exec_stat(stat: &FileStat) -> SysResult<()> {
     if stat.mode & S_IFMT != S_IFREG {
         return Err(SysError::EACCES);
     }
+    if mount_is_noexec(MountId(stat.dev as usize)) {
+        return Err(SysError::EACCES);
+    }
 
     // UNFINISHED: Linux also folds path-prefix search permissions, ACLs,
-    // capabilities, and noexec mounts into exec permission checks. The current
-    // check covers the regular-file DAC and text-busy paths exercised here.
+    // capabilities, and file capabilities into exec permission checks. The
+    // current check covers mount noexec, regular-file DAC, and text-busy paths
+    // exercised here.
     let credentials = current_process().credentials();
     check_execute_permission(stat, AccessSubject::from_fs_credentials(&credentials))
 }

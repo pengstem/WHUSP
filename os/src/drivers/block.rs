@@ -154,6 +154,9 @@ impl VirtIOBlock {
                 device.irq,
             ),
             BlockDeviceConfig::Pci(device) => {
+                // CONTEXT: PCI block devices can share the same ECAM window.
+                // Include BDF in the cache key so separate disks never alias in
+                // the block cache.
                 let bdf_key = ((device.bus as usize) << 16)
                     | ((device.device as usize) << 8)
                     | device.function as usize;

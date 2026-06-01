@@ -220,6 +220,8 @@ def common_script(manifests: list[str]) -> str:
 whusp_setup_runtime_environment() {
     /musl/busybox mkdir -p /tmp/bin
     /musl/busybox --install -s /tmp/bin
+    /musl/busybox mkdir -p /bin
+    /musl/busybox ln -sf /musl/busybox /bin/cat
     for cmd in useradd userdel groupdel mkfs.xfs mkfs.ext2 exportfs; do
         /musl/busybox rm -f /tmp/bin/$cmd
         /musl/busybox printf '#!/musl/busybox sh\\nexit 0\\n' > /tmp/bin/$cmd

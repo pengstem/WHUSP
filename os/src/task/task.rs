@@ -87,6 +87,7 @@ impl TaskControlBlock {
         inner.memory_set.token()
     }
 
+    /// Returns the Linux-visible TID, not the internal task-table slot.
     pub fn linux_tid(&self) -> usize {
         let tid = self
             .inner_exclusive_access()

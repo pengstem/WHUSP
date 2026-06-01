@@ -1,10 +1,12 @@
 use crate::fs::{
-    DetachedMountFile, FsContextFile, FsContextStateError, MountError, MountPropagation, OpenFlags,
-    WorkingDir, lookup_existing_dir_in, lookup_mount_target_dir_in, loop_device_is_attached,
-    loop_device_is_read_only, mount_bind_at, mount_block_device_at, mount_cgroup_memory_at,
-    mount_cgroup2_at, mount_ext_scratch_at, mount_fat_device_at, mount_nfs_compat_at,
-    mount_overlay_compat_at, mount_proc_at, mount_tmpfs_at, mounted_source_at, move_mount_at,
-    normalize_path_at_root, open_file_in, remount_at, set_mount_propagation_at, unmount_at,
+    DetachedMountFile, FsContextFile, FsContextStateError, FsNodeKind, MountError, MountId,
+    MountPropagation, OpenFlags, WorkingDir, lookup_existing_dir_in, lookup_mount_target_dir_in,
+    lookup_path_in, loop_device_is_attached, loop_device_is_read_only, mount_bind_at,
+    mount_block_device_at, mount_cgroup_memory_at, mount_cgroup2_at, mount_ext_scratch_at,
+    mount_fat_device_at, mount_nfs_compat_at, mount_overlay_compat_at, mount_proc_at,
+    mount_stat_flags_from_linux_mount_flags, mount_tmpfs_at, mounted_source_at, move_mount_at,
+    normalize_path_at_root, open_file_in, remount_at, set_mount_propagation_at,
+    set_mount_stat_flags, unmount_at,
 };
 use crate::task::{CAP_SYS_ADMIN, current_process, current_user_token};
 use alloc::string::String;
@@ -129,6 +131,18 @@ fn mount_error_to_errno(error: MountError) -> SysError {
         MountError::TargetBusy | MountError::StaticRoot => SysError::EBUSY,
         MountError::TargetNotMounted => SysError::EINVAL,
     }
+}
+
+fn apply_mount_stat_flags(mount_id: MountId, flags: usize) -> SysResult {
+    set_mount_stat_flags(mount_id, mount_stat_flags_from_linux_mount_flags(flags))
+        .map_err(mount_error_to_errno)
+        .map(|_| 0)
+}
+
+fn source_node_kind(snapshot: &crate::task::PathSnapshot, source: &str) -> Option<FsNodeKind> {
+    lookup_path_in(snapshot.context.clone(), source, true)
+        .ok()
+        .map(|path| path.kind)
 }
 
 fn fs_context_error_to_errno(error: FsContextStateError) -> SysError {
@@ -478,6 +492,7 @@ pub fn sys_mount(
     let token = current_user_token();
     let target = read_user_c_string(token, target, PATH_MAX)?;
     let read_only = flags & MS_RDONLY != 0;
+    require_sys_admin()?;
     let process = current_process();
     let snapshot = process.path_snapshot();
     let namespace_id = snapshot.context.namespace_id();
@@ -571,12 +586,23 @@ pub fn sys_mount(
     }
 
     if flags & MS_REMOUNT != 0 {
-        remount_at(namespace_id, target_dir, read_only).map_err(mount_error_to_errno)?;
+        remount_at(
+            namespace_id,
+            target_dir,
+            mount_stat_flags_from_linux_mount_flags(flags),
+        )
+        .map_err(mount_error_to_errno)?;
         return Ok(0);
+    }
+    if fstype.is_null() {
+        return Err(SysError::EINVAL);
     }
     let fstype = read_user_c_string(token, fstype, PATH_MAX)?;
     match fstype.as_str() {
         "ext2" | "ext3" | "ext4" => {
+            if source.is_null() {
+                return Err(SysError::EINVAL);
+            }
             let source = read_user_c_string(token, source, PATH_MAX)?;
             let ext_fs_type = match fstype.as_str() {
                 "ext2" => "ext2",
@@ -605,8 +631,17 @@ pub fn sys_mount(
                     target_path.as_str(),
                     read_only,
                 )
-                .map_err(mount_error_to_errno)?;
+                .map_err(mount_error_to_errno)
+                .and_then(|mount_id| {
+                    apply_mount_stat_flags(MountId(mount_id.0), flags).map(|_| mount_id)
+                })?;
                 return Ok(0);
+            }
+            if matches!(
+                source_node_kind(&snapshot, source.as_str()),
+                Some(FsNodeKind::CharacterDevice)
+            ) {
+                return Err(SysError::ENOTBLK);
             }
             if fstype.as_str() != "ext4" {
                 // CONTEXT: LTP probes kernel filesystem support with
@@ -632,8 +667,12 @@ pub fn sys_mount(
                 target_path.as_str(),
             )
             .map_err(mount_error_to_errno)?;
+            apply_mount_stat_flags(MountId(block_source.device_index), flags)?;
         }
         "vfat" | "fat32" | "fat" => {
+            if source.is_null() {
+                return Err(SysError::EINVAL);
+            }
             let source = read_user_c_string(token, source, PATH_MAX)?;
             if let Some(loop_id) = parse_loop_block_source(source.as_str()) {
                 if !loop_device_is_attached(loop_id) {
@@ -645,8 +684,10 @@ pub fn sys_mount(
                 // steps writable without pretending the loop block data is used.
                 // UNFINISHED: real loop-backed FAT/VFAT mounting is not
                 // implemented; only virtio partition FAT mounts reach fatfs.
-                mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
-                    .map_err(mount_error_to_errno)?;
+                let mount_id =
+                    mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
+                        .map_err(mount_error_to_errno)?;
+                apply_mount_stat_flags(mount_id, flags)?;
                 return Ok(0);
             }
             let block_source = parse_virtio_block_source(source.as_str())?;
@@ -657,38 +698,49 @@ pub fn sys_mount(
                 block_source.partition_index,
                 target_path.as_str(),
             ) {
-                Ok(_) => {}
+                Ok(mount_id) => {
+                    apply_mount_stat_flags(mount_id, flags)?;
+                }
                 Err(_) => {
                     // CONTEXT: Some contest/LTP setup paths care that a mount
                     // point becomes usable more than they care about the FAT
                     // backing store. Fall back to tmpfs for invalid FAT sources
                     // so later syscall probes can continue to run.
-                    mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
-                        .map_err(mount_error_to_errno)?;
+                    let mount_id =
+                        mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
+                            .map_err(mount_error_to_errno)?;
+                    apply_mount_stat_flags(mount_id, flags)?;
                 }
             }
         }
         "tmpfs" | "ramfs" => {
-            mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
-                .map_err(mount_error_to_errno)?;
+            let mount_id =
+                mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
+                    .map_err(mount_error_to_errno)?;
+            apply_mount_stat_flags(mount_id, flags)?;
         }
         "proc" => {
-            mount_proc_at(namespace_id, target_dir, target_path.as_str(), read_only)
+            let mount_id = mount_proc_at(namespace_id, target_dir, target_path.as_str(), read_only)
                 .map_err(mount_error_to_errno)?;
+            apply_mount_stat_flags(mount_id, flags)?;
         }
         "cgroup2" => {
             // CONTEXT: LTP clone3 coverage needs a writable cgroup v2
             // hierarchy with cgroup.procs. Resource controllers are not
             // modeled; the cgroup2 backend only tracks process membership.
-            mount_cgroup2_at(namespace_id, target_dir, target_path.as_str(), read_only)
-                .map_err(mount_error_to_errno)?;
+            let mount_id =
+                mount_cgroup2_at(namespace_id, target_dir, target_path.as_str(), read_only)
+                    .map_err(mount_error_to_errno)?;
+            apply_mount_stat_flags(mount_id, flags)?;
         }
         "cgroup" => {
             // CONTEXT: Legacy LTP memory-controller tests still probe the
             // cgroup v1 memory mount. The backend only models membership and
             // memory-pressure knobs needed by those tests.
-            mount_cgroup_memory_at(namespace_id, target_dir, target_path.as_str(), read_only)
-                .map_err(mount_error_to_errno)?;
+            let mount_id =
+                mount_cgroup_memory_at(namespace_id, target_dir, target_path.as_str(), read_only)
+                    .map_err(mount_error_to_errno)?;
+            apply_mount_stat_flags(mount_id, flags)?;
         }
         "overlay" => {
             let options = if data.is_null() {
@@ -709,9 +761,13 @@ pub fn sys_mount(
                 upper_dir,
                 target_path.as_str(),
             )
-            .map_err(mount_error_to_errno)?;
+            .map_err(mount_error_to_errno)
+            .and_then(|mount_id| apply_mount_stat_flags(mount_id, flags).map(|_| mount_id))?;
         }
         "nfs" => {
+            if source.is_null() {
+                return Err(SysError::EINVAL);
+            }
             let source = read_user_c_string(token, source, PATH_MAX)?;
             let server_path = source.strip_prefix(':').ok_or(SysError::EINVAL)?;
             let source_path = normalize_path_at_root(
@@ -731,12 +787,15 @@ pub fn sys_mount(
             )
             .map_err(mount_error_to_errno)?;
         }
+        "error" => return Err(SysError::ENODEV),
         _ => {
             // CONTEXT: Several BusyBox/LTP setup paths mount scratch or pseudo
             // filesystems by name before using only directory semantics. Keep a
             // tmpfs-backed compatibility mount for unknown non-overlay types.
-            mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
-                .map_err(mount_error_to_errno)?;
+            let mount_id =
+                mount_tmpfs_at(namespace_id, target_dir, target_path.as_str(), read_only)
+                    .map_err(mount_error_to_errno)?;
+            apply_mount_stat_flags(mount_id, flags)?;
         }
     }
     Ok(0)

@@ -7,7 +7,10 @@ use super::overlayfs::OverlayFs;
 use super::path::WorkingDir;
 use super::procfs::ProcFs;
 use super::tmpfs::{EXT234_SUPER_MAGIC, TmpFs};
-use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult, VfsNodeId};
+use super::vfs::{
+    FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult, VfsNodeId,
+    mount_has_writable_regular_open,
+};
 use crate::drivers::block::BLOCK_DEVICES;
 use crate::sync::{SleepMutex, UPIntrFreeCell};
 use crate::task::any_process_references_mount;
@@ -69,6 +72,7 @@ struct MountedFs {
     source: String,
     fs_type: &'static str,
     options: SleepMutex<&'static str>,
+    stat_flags: SleepMutex<u64>,
     backend: SleepMutex<Box<dyn FileSystemBackend>>,
 }
 
@@ -179,8 +183,15 @@ impl MountedFs {
             source,
             fs_type,
             options: SleepMutex::new(options),
+            stat_flags: SleepMutex::new(mount_flags_from_options(options)),
             backend: SleepMutex::new(backend),
         })
+    }
+
+    fn set_stat_flags(&self, flags: u64) {
+        let flags = normalize_mount_stat_flags(flags);
+        *self.stat_flags.lock() = flags;
+        *self.options.lock() = mount_options_from_flags(flags);
     }
 }
 
@@ -194,8 +205,67 @@ impl MountTarget {
     }
 }
 
+const MOUNT_STAT_RDONLY: u64 = 0x0001;
+const MOUNT_STAT_NOSUID: u64 = 0x0002;
+const MOUNT_STAT_NODEV: u64 = 0x0004;
+const MOUNT_STAT_NOEXEC: u64 = 0x0008;
+const MOUNT_STAT_VALID: u64 = 0x0020;
+const MOUNT_STAT_NOATIME: u64 = 0x0400;
+const MOUNT_STAT_NODIRATIME: u64 = 0x0800;
+const MOUNT_STAT_NOSYMFOLLOW: u64 = 0x2000;
+
+const LINUX_MS_RDONLY: usize = 1;
+const LINUX_MS_NOSUID: usize = 1 << 1;
+const LINUX_MS_NODEV: usize = 1 << 2;
+const LINUX_MS_NOEXEC: usize = 1 << 3;
+const LINUX_MS_NOSYMFOLLOW: usize = 1 << 8;
+const LINUX_MS_NOATIME: usize = 1 << 10;
+const LINUX_MS_NODIRATIME: usize = 1 << 11;
+
+fn normalize_mount_stat_flags(flags: u64) -> u64 {
+    flags | MOUNT_STAT_VALID
+}
+
+fn mount_flags_from_options(options: &str) -> u64 {
+    let mut flags = MOUNT_STAT_VALID;
+    if options.split(',').any(|option| option == "ro") {
+        flags |= MOUNT_STAT_RDONLY;
+    }
+    flags
+}
+
+pub(crate) fn mount_stat_flags_from_linux_mount_flags(flags: usize) -> u64 {
+    let mut stat_flags = MOUNT_STAT_VALID;
+    if flags & LINUX_MS_RDONLY != 0 {
+        stat_flags |= MOUNT_STAT_RDONLY;
+    }
+    if flags & LINUX_MS_NOSUID != 0 {
+        stat_flags |= MOUNT_STAT_NOSUID;
+    }
+    if flags & LINUX_MS_NODEV != 0 {
+        stat_flags |= MOUNT_STAT_NODEV;
+    }
+    if flags & LINUX_MS_NOEXEC != 0 {
+        stat_flags |= MOUNT_STAT_NOEXEC;
+    }
+    if flags & LINUX_MS_NOSYMFOLLOW != 0 {
+        stat_flags |= MOUNT_STAT_NOSYMFOLLOW;
+    }
+    if flags & LINUX_MS_NOATIME != 0 {
+        stat_flags |= MOUNT_STAT_NOATIME;
+    }
+    if flags & LINUX_MS_NODIRATIME != 0 {
+        stat_flags |= MOUNT_STAT_NODIRATIME;
+    }
+    stat_flags
+}
+
 fn mount_options(read_only: bool) -> &'static str {
     if read_only { "ro" } else { "rw" }
+}
+
+fn mount_options_from_flags(flags: u64) -> &'static str {
+    mount_options(flags & MOUNT_STAT_RDONLY != 0)
 }
 
 fn clear_dentry_cache_on_mount_change<T>(result: Result<T, MountError>) -> Result<T, MountError> {
@@ -1005,7 +1075,9 @@ fn propagate_unmount_event(mounts: &mut Vec<DynamicMount>, event: &DynamicMount)
             // propagated root that is also its propagation parent. Unmounting
             // the copied child must not peel that parent stack layer; rbind35
             // expects the parent layer to remain for a later umount.
-            if target_path == event.propagation_parent_path {
+            if peer.namespace_id == event.namespace_id
+                && target_path == event.propagation_parent_path
+            {
                 continue;
             }
             mounts.retain(|mount| {
@@ -1821,7 +1893,7 @@ pub(crate) fn mount_ext_scratch_at(
                     existing_source == source && *existing_fs_type == fs_type
                 })
         {
-            *mounted.options.lock() = options;
+            mounted.set_stat_flags(mount_flags_from_options(options));
             mounted.clone()
         } else {
             let mounted = MountedFs::new(
@@ -1957,7 +2029,7 @@ pub(crate) fn mounted_source_at(
     )
 }
 
-fn set_mount_options(mount_id: MountId, options: &'static str) -> Result<(), MountError> {
+pub(crate) fn set_mount_stat_flags(mount_id: MountId, flags: u64) -> Result<(), MountError> {
     let mounted = {
         let mounts = MOUNTS.lock();
         mounts
@@ -1965,14 +2037,22 @@ fn set_mount_options(mount_id: MountId, options: &'static str) -> Result<(), Mou
             .and_then(|mount| mount.as_ref().cloned())
     }
     .ok_or(MountError::TargetNotMounted)?;
-    *mounted.options.lock() = options;
+    let flags = normalize_mount_stat_flags(flags);
+    let current_flags = *mounted.stat_flags.lock();
+    if flags & MOUNT_STAT_RDONLY != 0
+        && current_flags & MOUNT_STAT_RDONLY == 0
+        && mount_has_writable_regular_open(mount_id)
+    {
+        return Err(MountError::TargetBusy);
+    }
+    mounted.set_stat_flags(flags);
     Ok(())
 }
 
 pub(crate) fn remount_at(
     namespace_id: MountNamespaceId,
     target: WorkingDir,
-    read_only: bool,
+    flags: u64,
 ) -> Result<(), MountError> {
     let target = VfsNodeId::new(target.mount_id(), target.ino());
     let mount_id = dynamic_mount_at(namespace_id, target)
@@ -1982,7 +2062,7 @@ pub(crate) fn remount_at(
                 .then_some(target.mount_id)
         })
         .ok_or(MountError::TargetNotMounted)?;
-    set_mount_options(mount_id, mount_options(read_only))
+    set_mount_stat_flags(mount_id, flags)
 }
 
 pub(crate) fn unmount_at(
@@ -2256,7 +2336,7 @@ pub fn list_root_apps() -> Vec<String> {
     with_mount(primary_mount_id(), |mount| mount.list_root_names()).unwrap_or_default()
 }
 
-fn mount_metadata(mount_id: MountId) -> Option<(String, &'static str, &'static str)> {
+fn mount_metadata(mount_id: MountId) -> Option<(String, &'static str, &'static str, u64)> {
     let mounted = {
         let mounts = MOUNTS.lock();
         mounts
@@ -2264,25 +2344,46 @@ fn mount_metadata(mount_id: MountId) -> Option<(String, &'static str, &'static s
             .and_then(|mount| mount.as_ref().cloned())
     }?;
     let options = *mounted.options.lock();
-    Some((mounted.source.clone(), mounted.fs_type, options))
+    let stat_flags = *mounted.stat_flags.lock();
+    Some((mounted.source.clone(), mounted.fs_type, options, stat_flags))
 }
 
 pub(super) fn mount_supports_page_cache(mount_id: MountId) -> bool {
     mount_metadata(mount_id)
-        .is_some_and(|(_, fs_type, _)| matches!(fs_type, "ext4" | "vfat" | "tmpfs"))
+        .is_some_and(|(_, fs_type, _, _)| matches!(fs_type, "ext4" | "vfat" | "tmpfs"))
 }
 
 pub(super) fn mount_supports_dentry_cache(mount_id: MountId) -> bool {
     mount_metadata(mount_id)
-        .is_some_and(|(_, fs_type, _)| matches!(fs_type, "ext4" | "vfat" | "tmpfs"))
+        .is_some_and(|(_, fs_type, _, _)| matches!(fs_type, "ext4" | "vfat" | "tmpfs"))
 }
 
 pub(crate) fn mount_is_read_only(mount_id: MountId) -> bool {
-    mount_metadata(mount_id).is_some_and(|(_, _, options)| options == "ro")
+    mount_metadata(mount_id).is_some_and(|(_, _, _, flags)| flags & MOUNT_STAT_RDONLY != 0)
+}
+
+pub(crate) fn mount_is_nodev(mount_id: MountId) -> bool {
+    mount_metadata(mount_id).is_some_and(|(_, _, _, flags)| flags & MOUNT_STAT_NODEV != 0)
+}
+
+pub(crate) fn mount_is_noexec(mount_id: MountId) -> bool {
+    mount_metadata(mount_id).is_some_and(|(_, _, _, flags)| flags & MOUNT_STAT_NOEXEC != 0)
+}
+
+pub(crate) fn mount_is_noatime(mount_id: MountId) -> bool {
+    mount_metadata(mount_id).is_some_and(|(_, _, _, flags)| flags & MOUNT_STAT_NOATIME != 0)
+}
+
+pub(crate) fn mount_is_nodiratime(mount_id: MountId) -> bool {
+    mount_metadata(mount_id).is_some_and(|(_, _, _, flags)| flags & MOUNT_STAT_NODIRATIME != 0)
+}
+
+pub(crate) fn mount_is_nosymfollow(mount_id: MountId) -> bool {
+    mount_metadata(mount_id).is_some_and(|(_, _, _, flags)| flags & MOUNT_STAT_NOSYMFOLLOW != 0)
 }
 
 pub(super) fn mount_is_devfs(mount_id: MountId) -> bool {
-    mount_metadata(mount_id).is_some_and(|(_, fs_type, _)| fs_type == "devfs")
+    mount_metadata(mount_id).is_some_and(|(_, fs_type, _, _)| fs_type == "devfs")
 }
 
 fn resolve_mount_path(target: VfsNodeId, hint: &str) -> String {
@@ -2297,7 +2398,7 @@ fn resolve_mount_path(target: VfsNodeId, hint: &str) -> String {
 
 pub(crate) fn list_mounts(namespace_id: MountNamespaceId) -> Vec<MountInfo> {
     let mut infos = Vec::new();
-    if let Some((source, fs_type, options)) = mount_metadata(primary_mount_id()) {
+    if let Some((source, fs_type, options, _)) = mount_metadata(primary_mount_id()) {
         infos.push(MountInfo {
             id: primary_mount_id(),
             source,
@@ -2325,7 +2426,7 @@ pub(crate) fn list_mounts(namespace_id: MountNamespaceId) -> Vec<MountInfo> {
         {
             continue;
         }
-        if let Some((source, fs_type, options)) = mount_metadata(mount.source_mount_id) {
+        if let Some((source, fs_type, options, _)) = mount_metadata(mount.source_mount_id) {
             infos.push(MountInfo {
                 id: mount.source_mount_id,
                 source,
@@ -2339,7 +2440,12 @@ pub(crate) fn list_mounts(namespace_id: MountNamespaceId) -> Vec<MountInfo> {
 }
 
 pub(crate) fn statfs_for_mount(mount_id: MountId) -> Option<FileSystemStat> {
-    with_mount(mount_id, |backend| backend.statfs())
+    let flags = mount_metadata(mount_id).map(|(_, _, _, flags)| flags)?;
+    with_mount(mount_id, |backend| {
+        let mut stat = backend.statfs();
+        stat.flags |= flags;
+        stat
+    })
 }
 
 pub(crate) fn sync_all_mounts() {

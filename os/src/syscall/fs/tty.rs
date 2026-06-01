@@ -38,6 +38,8 @@ const BLKSSZGET: usize = 0x1268;
 const BLKGETSIZE64: usize = 0x8008_1272;
 const RNDGETENTCNT: usize = 0x8004_5200;
 const TUNGETFEATURES: usize = 0x8004_54cf;
+const SIOCSIFFLAGS: usize = 0x8914;
+const SIOCSIFMTU: usize = 0x8922;
 const EVIOCGVERSION: usize = 0x8004_4501;
 const EVIOCGID: usize = 0x8008_4502;
 const EVIOCGREP: usize = 0x8008_4503;
@@ -351,6 +353,12 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
         } as i32;
         let token = current_user_token();
         write_user_value(token, argp as *mut i32, &unread)?;
+        return Ok(0);
+    }
+
+    if file.is_socket() && matches!(request, SIOCSIFFLAGS | SIOCSIFMTU) {
+        let token = current_user_token();
+        let _ = read_user_value(token, argp as *const u8)?;
         return Ok(0);
     }
 

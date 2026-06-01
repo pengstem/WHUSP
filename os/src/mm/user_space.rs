@@ -158,6 +158,9 @@ fn mmap_fault_hits_file_hole(area: &MapArea, info: &MmapInfo, addr: usize) -> bo
 }
 
 fn mmap_shared_write_hits_enospc(area: &MapArea, info: &MmapInfo, addr: usize) -> bool {
+    // CONTEXT: A MAP_SHARED write fault must fail as SIGBUS when the backing
+    // file cannot accept a byte at the faulting offset. Check before granting
+    // PTE write permission so a later store cannot dirty an unflushable page.
     if !info.shared || !info.writable {
         return false;
     }

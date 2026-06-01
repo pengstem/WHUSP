@@ -63,6 +63,8 @@ const KEYS_MAXBYTES_INO: u32 = 27;
 const KEYS_ROOT_MAXKEYS_INO: u32 = 62;
 const KEYS_ROOT_MAXBYTES_INO: u32 = 63;
 const MODULES_INO: u32 = 64;
+const SYS_USER_DIR_INO: u32 = 65;
+const MAX_USER_NAMESPACES_INO: u32 = 66;
 const SYS_VM_DIR_INO: u32 = 28;
 const DROP_CACHES_INO: u32 = 29;
 const VFS_CACHE_PRESSURE_INO: u32 = 31;
@@ -123,6 +125,9 @@ const PID_MOUNTINFO_OFFSET: u32 = 18;
 const PID_PAGEMAP_OFFSET: u32 = 19;
 const PID_COREDUMP_FILTER_OFFSET: u32 = 20;
 const PID_OOM_SCORE_ADJ_OFFSET: u32 = 21;
+const PID_SETGROUPS_OFFSET: u32 = 22;
+const PID_UID_MAP_OFFSET: u32 = 23;
+const PID_GID_MAP_OFFSET: u32 = 24;
 const PID_FD_ENTRY_BASE: u32 = 1_000_000_000;
 const PID_FDINFO_ENTRY_BASE: u32 = 2_000_000_000;
 const PID_FD_ENTRY_STRIDE: u32 = 4096;
@@ -151,13 +156,15 @@ const PROC_NS_UTS_INO_BASE: u64 = 0x7300_0000;
 const PROC_NS_INO_RANGE: u64 = 0x0100_0000;
 const ROOT_UTS_NAMESPACE_ID: usize = 1;
 const PROC_CONFIG_GZ: &[u8] = &[
-    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x45, 0xcc, 0x39, 0x0e, 0x80, 0x30,
-    0x0c, 0x05, 0xd1, 0x9e, 0x3b, 0x51, 0x44, 0xc9, 0x37, 0x18, 0x91, 0x45, 0x8e, 0x03, 0x4a, 0xe5,
-    0x73, 0x70, 0x7b, 0x84, 0x28, 0xdc, 0xbe, 0x91, 0x26, 0xd6, 0x42, 0xbc, 0x19, 0x75, 0xbb, 0x20,
-    0xac, 0x73, 0x7d, 0x96, 0xf8, 0xd3, 0xe8, 0x10, 0x4b, 0x88, 0x32, 0x9b, 0x22, 0x59, 0x0a, 0x1a,
-    0x3c, 0x36, 0x01, 0x72, 0x53, 0x13, 0x75, 0xc3, 0x85, 0xa2, 0x94, 0x1c, 0x32, 0x72, 0x95, 0x69,
-    0x14, 0xf8, 0x1c, 0x02, 0xf7, 0xfd, 0x6e, 0x95, 0x7b, 0x2d, 0xc6, 0xe5, 0x40, 0xfc, 0x0e, 0x2f,
-    0xe0, 0xad, 0x60, 0xcc, 0x86, 0x00, 0x00, 0x00,
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x5d, 0xcd, 0x41, 0x0e, 0xc2, 0x30,
+    0x0c, 0x04, 0xc0, 0x3b, 0x7f, 0xe2, 0x10, 0x25, 0x9b, 0xd6, 0xa8, 0x71, 0x22, 0x67, 0x5b, 0xc8,
+    0xc9, 0xef, 0xe0, 0xf7, 0x54, 0x02, 0x29, 0xa8, 0x47, 0x8f, 0xd7, 0xeb, 0x58, 0x35, 0xcb, 0xe2,
+    0xb9, 0xfb, 0x01, 0x13, 0x8e, 0xfb, 0xfb, 0x16, 0xbf, 0xb4, 0x77, 0x98, 0x27, 0x44, 0x1b, 0x8d,
+    0x48, 0x9e, 0x02, 0xc3, 0x5c, 0x36, 0x03, 0x4a, 0xa3, 0x1b, 0xa7, 0xe1, 0x80, 0x32, 0xa7, 0x09,
+    0x05, 0xa5, 0xda, 0xf0, 0x1c, 0x64, 0xdb, 0x0d, 0xd3, 0xd7, 0x67, 0xab, 0xd2, 0xab, 0xba, 0xe8,
+    0x03, 0x91, 0x97, 0x97, 0xda, 0x27, 0x28, 0x78, 0x9d, 0xb3, 0x6c, 0x3c, 0x53, 0x2f, 0x7a, 0x09,
+    0x8c, 0xab, 0x77, 0x06, 0xfe, 0x75, 0x4b, 0x73, 0xcd, 0xce, 0x60, 0xcb, 0x79, 0x6a, 0xf8, 0xf5,
+    0x7f, 0x00, 0x43, 0xe9, 0xb7, 0x8d, 0xe6, 0x00, 0x00, 0x00,
 ];
 
 static PROC_PID_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_PID_MAX);
@@ -223,6 +230,7 @@ enum ProcNode {
     SysDir,
     SysKernelDir,
     SysKernelKeysDir,
+    SysUserDir,
     SysFsDir,
     SysFsFanotifyDir,
     SysFsInotifyDir,
@@ -250,6 +258,7 @@ enum ProcNode {
     KeysMaxbytes,
     KeysRootMaxkeys,
     KeysRootMaxbytes,
+    MaxUserNamespaces,
     CorePattern,
     DropCaches,
     VfsCachePressure,
@@ -293,6 +302,9 @@ enum ProcNode {
     PidPagemap(usize),
     PidCoredumpFilter(usize),
     PidOomScoreAdj(usize),
+    PidSetgroups(usize),
+    PidUidMap(usize),
+    PidGidMap(usize),
     PidIo(usize),
     PidNsDir(usize),
     PidNsMnt(usize),
@@ -519,6 +531,8 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         SYS_DIR_INO => Some(ProcNode::SysDir),
         SYS_KERNEL_DIR_INO => Some(ProcNode::SysKernelDir),
         SYS_KERNEL_KEYS_DIR_INO => Some(ProcNode::SysKernelKeysDir),
+        SYS_USER_DIR_INO => Some(ProcNode::SysUserDir),
+        MAX_USER_NAMESPACES_INO => Some(ProcNode::MaxUserNamespaces),
         PID_MAX_INO => Some(ProcNode::PidMax),
         SYS_FS_DIR_INO => Some(ProcNode::SysFsDir),
         SYS_FS_FANOTIFY_DIR_INO => Some(ProcNode::SysFsFanotifyDir),
@@ -621,6 +635,9 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
                 PID_EXE_OFFSET => Some(ProcNode::PidExe(pid)),
                 PID_COREDUMP_FILTER_OFFSET => Some(ProcNode::PidCoredumpFilter(pid)),
                 PID_OOM_SCORE_ADJ_OFFSET => Some(ProcNode::PidOomScoreAdj(pid)),
+                PID_SETGROUPS_OFFSET => Some(ProcNode::PidSetgroups(pid)),
+                PID_UID_MAP_OFFSET => Some(ProcNode::PidUidMap(pid)),
+                PID_GID_MAP_OFFSET => Some(ProcNode::PidGidMap(pid)),
                 _ => None,
             }
         }
@@ -638,6 +655,7 @@ fn node_kind(node: ProcNode) -> FsNodeKind {
         | ProcNode::SysDir
         | ProcNode::SysKernelDir
         | ProcNode::SysKernelKeysDir
+        | ProcNode::SysUserDir
         | ProcNode::SysFsDir
         | ProcNode::SysFsFanotifyDir
         | ProcNode::SysFsInotifyDir
@@ -799,6 +817,11 @@ fn sys_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: SYS_VM_DIR_INO,
         name: "vm".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_USER_DIR_INO,
+        name: "user".into(),
         dtype: DT_DIR,
     });
     entries
@@ -1184,6 +1207,26 @@ fn sys_kernel_keys_entries() -> Vec<RawDirEntry> {
     entries
 }
 
+fn sys_user_entries() -> Vec<RawDirEntry> {
+    let mut entries = Vec::new();
+    entries.push(RawDirEntry {
+        ino: SYS_USER_DIR_INO,
+        name: ".".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: SYS_DIR_INO,
+        name: "..".into(),
+        dtype: DT_DIR,
+    });
+    entries.push(RawDirEntry {
+        ino: MAX_USER_NAMESPACES_INO,
+        name: "max_user_namespaces".into(),
+        dtype: DT_REG,
+    });
+    entries
+}
+
 fn pid_entries(pid: usize) -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -1274,6 +1317,21 @@ fn pid_entries(pid: usize) -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: pid_file_ino(pid, PID_OOM_SCORE_ADJ_OFFSET),
         name: "oom_score_adj".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_SETGROUPS_OFFSET),
+        name: "setgroups".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_UID_MAP_OFFSET),
+        name: "uid_map".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: pid_file_ino(pid, PID_GID_MAP_OFFSET),
+        name: "gid_map".into(),
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
@@ -2220,6 +2278,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::KeysMaxbytes => Ok(keyring::key_maxbytes_content().into_bytes()),
         ProcNode::KeysRootMaxkeys => Ok(keyring::root_key_maxkeys_content().into_bytes()),
         ProcNode::KeysRootMaxbytes => Ok(keyring::root_key_maxbytes_content().into_bytes()),
+        ProcNode::MaxUserNamespaces => Ok(b"1024\n".to_vec()),
         ProcNode::CorePattern => Ok(core_pattern_content()),
         ProcNode::PipeMaxSize => Ok(pipe_max_size_content().into_bytes()),
         ProcNode::PipeUserPagesSoft => Ok(pipe_user_pages_soft_content().into_bytes()),
@@ -2259,6 +2318,15 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
             .ok_or(FsError::NotFound),
         ProcNode::PidOomScoreAdj(pid) => lookup_process(pid)
             .map(|_| oom_score_adj_content())
+            .ok_or(FsError::NotFound),
+        ProcNode::PidSetgroups(pid) => lookup_process(pid)
+            .map(|_| b"allow\n".to_vec())
+            .ok_or(FsError::NotFound),
+        ProcNode::PidUidMap(pid) => lookup_process(pid)
+            .map(|process| format!("0 {} 1\n", process.credentials.ruid).into_bytes())
+            .ok_or(FsError::NotFound),
+        ProcNode::PidGidMap(pid) => lookup_process(pid)
+            .map(|process| format!("0 {} 1\n", process.credentials.rgid).into_bytes())
             .ok_or(FsError::NotFound),
         ProcNode::SelfSymlink | ProcNode::PidExe(_) | ProcNode::PidFdEntry(_, _) => {
             Err(FsError::InvalidInput)
@@ -2332,6 +2400,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         | ProcNode::SysDir
         | ProcNode::SysKernelDir
         | ProcNode::SysKernelKeysDir
+        | ProcNode::SysUserDir
         | ProcNode::SysFsDir
         | ProcNode::SysFsFanotifyDir
         | ProcNode::SysFsInotifyDir
@@ -2412,6 +2481,13 @@ impl FileSystemBackend for ProcFs {
                 "fs" => Ok((SYS_FS_DIR_INO, FsNodeKind::Directory)),
                 "net" => Ok((SYS_NET_DIR_INO, FsNodeKind::Directory)),
                 "vm" => Ok((SYS_VM_DIR_INO, FsNodeKind::Directory)),
+                "user" => Ok((SYS_USER_DIR_INO, FsNodeKind::Directory)),
+                _ => Err(FsError::NotFound),
+            },
+            ProcNode::SysUserDir => match component {
+                "." => Ok((SYS_USER_DIR_INO, FsNodeKind::Directory)),
+                ".." => Ok((SYS_DIR_INO, FsNodeKind::Directory)),
+                "max_user_namespaces" => Ok((MAX_USER_NAMESPACES_INO, FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::OsKernelDir => match component {
@@ -2574,6 +2650,18 @@ impl FileSystemBackend for ProcFs {
                     pid_file_ino(pid, PID_OOM_SCORE_ADJ_OFFSET),
                     FsNodeKind::RegularFile,
                 )),
+                "setgroups" => Ok((
+                    pid_file_ino(pid, PID_SETGROUPS_OFFSET),
+                    FsNodeKind::RegularFile,
+                )),
+                "uid_map" => Ok((
+                    pid_file_ino(pid, PID_UID_MAP_OFFSET),
+                    FsNodeKind::RegularFile,
+                )),
+                "gid_map" => Ok((
+                    pid_file_ino(pid, PID_GID_MAP_OFFSET),
+                    FsNodeKind::RegularFile,
+                )),
                 "ns" => Ok((pid_file_ino(pid, PID_NS_DIR_OFFSET), FsNodeKind::Directory)),
                 "task" => Ok((
                     pid_file_ino(pid, PID_TASK_DIR_OFFSET),
@@ -2721,6 +2809,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::KeysMaxbytes
             | ProcNode::KeysRootMaxkeys
             | ProcNode::KeysRootMaxbytes
+            | ProcNode::MaxUserNamespaces
             | ProcNode::PipeMaxSize
             | ProcNode::LeaseBreakTime
             | ProcNode::InotifyMaxUserInstances
@@ -2728,7 +2817,10 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::DropCaches
             | ProcNode::VfsCachePressure
             | ProcNode::PidOomScoreAdj(_)
-            | ProcNode::PidTimerslack(_) => Ok(()),
+            | ProcNode::PidTimerslack(_)
+            | ProcNode::PidSetgroups(_)
+            | ProcNode::PidUidMap(_)
+            | ProcNode::PidGidMap(_) => Ok(()),
             ProcNode::PidCoredumpFilter(_) => Ok(()),
             ProcNode::Domainname => set_domainname_len(_len),
             ProcNode::CorePattern => set_core_pattern_len(_len),
@@ -2753,6 +2845,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::SysDir
             | ProcNode::SysKernelDir
             | ProcNode::SysKernelKeysDir
+            | ProcNode::SysUserDir
             | ProcNode::SysFsDir
             | ProcNode::SysFsFanotifyDir
             | ProcNode::SysFsInotifyDir
@@ -2788,6 +2881,7 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::KeysMaxbytes
             | ProcNode::KeysRootMaxkeys
             | ProcNode::KeysRootMaxbytes
+            | ProcNode::MaxUserNamespaces
             | ProcNode::PipeMaxSize
             | ProcNode::LeaseBreakTime
             | ProcNode::InotifyMaxUserInstances
@@ -2797,6 +2891,9 @@ impl FileSystemBackend for ProcFs {
             | ProcNode::PidComm(_)
             | ProcNode::PidTimerslack(_)
             | ProcNode::PidOomScoreAdj(_)
+            | ProcNode::PidSetgroups(_)
+            | ProcNode::PidUidMap(_)
+            | ProcNode::PidGidMap(_)
             | ProcNode::PidTaskTidComm(_, _)
             | ProcNode::Domainname
             | ProcNode::CorePattern => FileStat::with_mode(S_IFREG | 0o644),
@@ -2899,6 +2996,7 @@ impl FileSystemBackend for ProcFs {
             Some(ProcNode::KeysMaxbytes) => keyring::write_key_maxbytes(buf, offset),
             Some(ProcNode::KeysRootMaxkeys) => keyring::write_root_key_maxkeys(buf, offset),
             Some(ProcNode::KeysRootMaxbytes) => keyring::write_root_key_maxbytes(buf, offset),
+            Some(ProcNode::MaxUserNamespaces) => buf.len(),
             Some(ProcNode::CorePattern) => write_core_pattern(buf, offset),
             Some(ProcNode::PipeMaxSize) => write_pipe_max_size(buf, offset),
             Some(ProcNode::LeaseBreakTime) => write_lease_break_time(buf, offset),
@@ -2911,6 +3009,9 @@ impl FileSystemBackend for ProcFs {
             Some(ProcNode::PidTimerslack(pid)) => write_pid_timerslack(pid, buf, offset),
             Some(ProcNode::PidOomScoreAdj(_)) => write_oom_score_adj(buf, offset),
             Some(ProcNode::PidCoredumpFilter(_)) => buf.len(),
+            Some(ProcNode::PidSetgroups(_))
+            | Some(ProcNode::PidUidMap(_))
+            | Some(ProcNode::PidGidMap(_)) => buf.len(),
             Some(ProcNode::Domainname) => write_domainname(buf, offset),
             _ => 0,
         }
@@ -2926,6 +3027,7 @@ impl FileSystemBackend for ProcFs {
             ProcNode::SysKernelKeysDir => {
                 write_dir_entries(&sys_kernel_keys_entries(), offset, buf)
             }
+            ProcNode::SysUserDir => write_dir_entries(&sys_user_entries(), offset, buf),
             ProcNode::SysFsDir => write_dir_entries(&sys_fs_entries(), offset, buf),
             ProcNode::SysFsFanotifyDir => {
                 write_dir_entries(&sys_fs_fanotify_entries(), offset, buf)

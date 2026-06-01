@@ -10,6 +10,8 @@ use core::convert::TryInto;
 use core::mem::size_of;
 
 const EVENTFD_COUNTER_MAX: u64 = u64::MAX - 1;
+// CONTEXT: eventfd reserves u64::MAX as an invalid write payload, so the
+// counter is bounded by u64::MAX - 1 and POLLOUT means another valid write can fit.
 
 struct EventFdInner {
     counter: u64,

@@ -3,7 +3,8 @@ use super::super::devfs;
 use super::super::dirent::{DT_DIR, RawDirEntry, write_dir_entries_with_offset_base};
 use super::super::inode::{OpenFlags, link_node_in};
 use super::super::mount::{
-    MountId, MountNamespaceId, mount_is_devfs, mount_is_read_only, mount_supports_page_cache,
+    MountId, MountNamespaceId, mount_is_devfs, mount_is_noatime, mount_is_nodev,
+    mount_is_nodiratime, mount_is_nosymfollow, mount_is_read_only, mount_supports_page_cache,
     release_inode_from_drop, synthetic_children_for_dir, with_mount,
 };
 use super::super::named_fifo::open_named_fifo;
@@ -88,6 +89,39 @@ fn ensure_mount_writable(mount_id: MountId) -> FsResult {
     }
 }
 
+fn ensure_special_file_open_allowed(
+    mount_id: MountId,
+    kind: FsNodeKind,
+    flags: OpenFlags,
+) -> FsResult {
+    if !flags.contains(OpenFlags::PATH)
+        && mount_is_nodev(mount_id)
+        && matches!(kind, FsNodeKind::CharacterDevice | FsNodeKind::BlockDevice)
+    {
+        Err(FsError::AccessDenied)
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_nosymfollow_final_symlink(
+    context: PathContext,
+    name: &str,
+    flags: OpenFlags,
+) -> FsResult {
+    if flags.contains(OpenFlags::NOFOLLOW) || flags.contains(OpenFlags::PATH) {
+        return Ok(());
+    }
+    let Ok(path) = vfs_path::resolve_existing_in(context, name, LookupMode::NoFollowFinal) else {
+        return Ok(());
+    };
+    if path.kind == FsNodeKind::Symlink && mount_is_nosymfollow(path.node.mount_id) {
+        Err(FsError::Loop)
+    } else {
+        Ok(())
+    }
+}
+
 fn page_cache_id_for_node(node: VfsNodeId, kind: FsNodeKind) -> Option<PageCacheId> {
     if kind != FsNodeKind::RegularFile || !mount_supports_page_cache(node.mount_id) {
         return None;
@@ -122,6 +156,13 @@ pub(crate) fn regular_file_node_is_open_writable(node: VfsNodeId) -> bool {
         .copied()
         .unwrap_or(0)
         > 0
+}
+
+pub(crate) fn mount_has_writable_regular_open(mount_id: MountId) -> bool {
+    WRITABLE_REGULAR_OPEN_COUNTS
+        .lock()
+        .keys()
+        .any(|node| node.mount_id == mount_id)
 }
 
 pub(crate) fn track_regular_file_executable(node: VfsNodeId) {
@@ -291,7 +332,9 @@ impl VfsFile {
     }
 
     fn noatime_snapshot(&self) -> Option<(FileTimestamp, FileTimestamp)> {
-        if !self.status_flags.get().contains(OpenFlags::NOATIME) {
+        if !self.status_flags.get().contains(OpenFlags::NOATIME)
+            && !mount_is_noatime(self.node.mount_id)
+        {
             return None;
         }
         let stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))?.ok()?;
@@ -313,6 +356,23 @@ impl VfsFile {
                 mount.set_times(self.node.ino, Some(atime), None, ctime)
             });
         }
+    }
+
+    fn touch_directory_atime(&self) {
+        if mount_is_noatime(self.node.mount_id) || mount_is_nodiratime(self.node.mount_id) {
+            return;
+        }
+        let Some(Ok(stat)) = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))
+        else {
+            return;
+        };
+        let ctime = FileTimestamp {
+            sec: stat.ctime_sec,
+            nsec: stat.ctime_nsec,
+        };
+        let _ = with_mount(self.node.mount_id, |mount| {
+            mount.set_times(self.node.ino, Some(FileTimestamp::now()), None, ctime)
+        });
     }
 
     fn seek_data_or_hole(&self, offset: usize, seek_hole: bool) -> FsResult<usize> {
@@ -557,6 +617,7 @@ fn open_vfs_file_impl(
     let namespace_id = context.namespace_id();
     let parent_hint = parent_hint_for_open(&context, name);
     let follow_final_symlink = !flags.contains(OpenFlags::NOFOLLOW);
+    reject_nosymfollow_final_symlink(context.clone(), name, flags)?;
     let resolved = vfs_path::resolve_open_in(
         context,
         name,
@@ -587,6 +648,7 @@ fn open_vfs_file_impl(
                 {
                     return Err(FsError::Loop);
                 }
+                ensure_special_file_open_allowed(path.node.mount_id, path.kind, flags)?;
                 let (readable, writable) = flags.read_write();
                 if path.kind == FsNodeKind::RegularFile
                     && writable
@@ -837,6 +899,7 @@ pub(crate) fn open_file_handle_node(
     if kind == FsNodeKind::Fifo {
         return open_named_fifo(node, OpenFlags::file_status_flags(flags));
     }
+    ensure_special_file_open_allowed(node.mount_id, kind, flags)?;
 
     let (readable, writable) = flags.read_write();
     if kind == FsNodeKind::RegularFile && writable && regular_file_node_is_executable(node) {
@@ -1197,6 +1260,7 @@ impl File for VfsFile {
         if read_size == 0 {
             return Ok(0);
         }
+        self.touch_directory_atime();
         let mut user_buf = user_buf;
         let copied = user_buf.copy_from_slice(&kernel_buf[..read_size]);
         debug_assert_eq!(copied, read_size);

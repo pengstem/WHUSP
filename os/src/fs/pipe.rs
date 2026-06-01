@@ -151,6 +151,9 @@ impl Pipe {
             return Err(FsError::InvalidInput);
         }
 
+        // CONTEXT: Hold both ring locks only while moving bytes and collecting
+        // wake targets. Scheduler and poll wakeups run after the locks are
+        // dropped, matching the read/write paths' lock boundary.
         let (writer, reader, poll_writers, poll_readers, moved) = {
             let mut in_buffer = self.buffer.exclusive_access();
             let mut out_buffer = out.buffer.exclusive_access();

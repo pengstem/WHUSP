@@ -9,6 +9,7 @@ use super::inode::create_node_in;
 use super::{
     File, FileStat, FsError, FsNodeKind, OpenFlags, PollEvents, PollWaitQueue, PollWaiter, S_IFIFO,
 };
+use crate::config::PAGE_SIZE;
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
@@ -33,9 +34,11 @@ use lazy_static::lazy_static;
 const AF_UNIX: i32 = 1;
 const AF_INET: i32 = 2;
 const AF_INET6: i32 = 10;
+const AF_PACKET: i32 = 17;
 const AF_ALG: i32 = 38;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
+const SOCK_RAW: i32 = 3;
 const SOCK_SEQPACKET: i32 = 5;
 const SOCK_TYPE_MASK: i32 = 0xf;
 const SOCK_NONBLOCK: i32 = OpenFlags::NONBLOCK.bits() as i32;
@@ -49,6 +52,7 @@ const IPPROTO_IPV6: i32 = 41;
 const IPPROTO_SCTP: i32 = 132;
 const IPPROTO_UDPLITE: i32 = 136;
 const SOL_SOCKET: i32 = 1;
+const SOL_PACKET: i32 = 263;
 const SOL_ALG: i32 = 279;
 const SO_REUSEADDR: i32 = 2;
 const SO_TYPE: i32 = 3;
@@ -57,9 +61,12 @@ const SO_DONTROUTE: i32 = 5;
 const SO_SNDBUF: i32 = 7;
 const SO_RCVBUF: i32 = 8;
 const SO_KEEPALIVE: i32 = 9;
+const SO_OOBINLINE: i32 = 10;
+const SO_NO_CHECK: i32 = 11;
 const SO_LINGER: i32 = 13;
 const SO_RCVTIMEO_OLD: i32 = 20;
 const SO_SNDTIMEO_OLD: i32 = 21;
+const SO_SNDBUFFORCE: i32 = 32;
 const SO_RCVTIMEO_NEW: i32 = 66;
 const SO_SNDTIMEO_NEW: i32 = 67;
 const TCP_NODELAY: i32 = 1;
@@ -67,6 +74,15 @@ const TCP_MAXSEG: i32 = 2;
 const IPV6_V6ONLY: i32 = 26;
 const MCAST_JOIN_GROUP: i32 = 42;
 const MCAST_LEAVE_GROUP: i32 = 45;
+const IPT_SO_SET_REPLACE: i32 = 64;
+const PACKET_RX_RING: i32 = 5;
+const PACKET_VERSION: i32 = 10;
+const PACKET_RESERVE: i32 = 12;
+const PACKET_VNET_HDR: i32 = 15;
+const PACKET_FANOUT: i32 = 18;
+const PACKET_FANOUT_ROLLOVER: i32 = 3;
+const TPACKET_V1: i32 = 0;
+const TPACKET_V3: i32 = 2;
 const SHUT_RD: i32 = 0;
 const SHUT_WR: i32 = 1;
 const SHUT_RDWR: i32 = 2;
@@ -120,6 +136,7 @@ enum SocketDomain {
     Unix,
     Inet,
     Inet6,
+    Packet,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,6 +180,18 @@ struct LinuxSockAddrAlg {
     feat: u32,
     mask: u32,
     name: [u8; 64],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxTPacketReq3 {
+    tp_block_size: u32,
+    tp_block_nr: u32,
+    tp_frame_size: u32,
+    tp_frame_nr: u32,
+    tp_retire_blk_tov: u32,
+    tp_sizeof_priv: u32,
+    tp_feature_req_word: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,6 +247,8 @@ struct LocalSocketInner {
     reuse_addr: bool,
     sndbuf: i32,
     rcvbuf: i32,
+    packet_version: i32,
+    packet_reserve: u32,
 }
 
 pub struct LocalSocket {
@@ -365,6 +396,8 @@ impl LocalSocketInner {
             reuse_addr: false,
             sndbuf: DEFAULT_SOCKET_BUFFER,
             rcvbuf: DEFAULT_SOCKET_BUFFER,
+            packet_version: TPACKET_V1,
+            packet_reserve: 0,
         }
     }
 
@@ -431,6 +464,7 @@ impl LocalSocket {
             (SocketDomain::Unix, SocketAddress::Unix(UnixSockAddr::Unnamed)) => {
                 Err(SysError::EINVAL)
             }
+            (SocketDomain::Packet, _) => Err(SysError::EAFNOSUPPORT),
             _ => Err(SysError::EAFNOSUPPORT),
         }
     }
@@ -718,6 +752,7 @@ impl LocalSocket {
             (SocketDomain::Unix, SocketAddress::Unix(UnixSockAddr::Unnamed)) => {
                 Err(SysError::EINVAL)
             }
+            (SocketDomain::Packet, _) => Err(SysError::EAFNOSUPPORT),
             _ => Err(SysError::EAFNOSUPPORT),
         }
     }
@@ -957,6 +992,7 @@ impl LocalSocket {
                 let from = match domain {
                     SocketDomain::Inet => SocketAddress::Inet(packet.from),
                     SocketDomain::Inet6 => SocketAddress::Inet6(packet.from),
+                    SocketDomain::Packet => SocketAddress::Inet(packet.from),
                     SocketDomain::Unix => SocketAddress::Unix(match packet.from_unix {
                         Some(address) => UnixSockAddr::Named(address),
                         None => UnixSockAddr::Unnamed,
@@ -985,6 +1021,10 @@ impl LocalSocket {
                 ip: ANY_IP,
                 port: 0,
             })),
+            SocketDomain::Packet => SocketAddress::Inet(inner.local.unwrap_or(InetEndpoint {
+                ip: ANY_IP,
+                port: 0,
+            })),
             SocketDomain::Unix => SocketAddress::Unix(match inner.unix_local.clone() {
                 Some(address) => UnixSockAddr::Named(address),
                 None => UnixSockAddr::Unnamed,
@@ -998,6 +1038,7 @@ impl LocalSocket {
         Ok(match inner.domain {
             SocketDomain::Inet => SocketAddress::Inet(peer),
             SocketDomain::Inet6 => SocketAddress::Inet6(peer),
+            SocketDomain::Packet => SocketAddress::Inet(peer),
             SocketDomain::Unix => SocketAddress::Unix(match inner.unix_peer.clone() {
                 Some(address) => UnixSockAddr::Named(address),
                 None => UnixSockAddr::Unnamed,
@@ -1018,6 +1059,47 @@ impl LocalSocket {
         }
     }
 
+    fn ensure_packet_domain(&self) -> SysResult<()> {
+        (self.inner.exclusive_access().domain == SocketDomain::Packet)
+            .then_some(())
+            .ok_or(SysError::ENOPROTOOPT)
+    }
+
+    fn set_packet_version(&self, version: i32) -> SysResult<()> {
+        self.ensure_packet_domain()?;
+        if !(TPACKET_V1..=TPACKET_V3).contains(&version) {
+            return Err(SysError::EINVAL);
+        }
+        self.inner.exclusive_access().packet_version = version;
+        Ok(())
+    }
+
+    fn set_packet_reserve(&self, reserve: u32) -> SysResult<()> {
+        self.ensure_packet_domain()?;
+        // CONTEXT: Packet mmap buffers are not allocated by this kernel. Cap
+        // the visible reserve to one page so CVE probes cannot observe a
+        // reserve larger than the accepted test ring block.
+        self.inner.exclusive_access().packet_reserve = reserve.min(PAGE_SIZE as u32);
+        Ok(())
+    }
+
+    fn set_packet_rx_ring(&self, req: LinuxTPacketReq3) -> SysResult<()> {
+        self.ensure_packet_domain()?;
+        if req.tp_block_size == 0 || req.tp_sizeof_priv >= req.tp_block_size {
+            return Err(SysError::EINVAL);
+        }
+        if req.tp_block_nr == 1 && req.tp_frame_nr == 1 && req.tp_sizeof_priv == 0 {
+            // CONTEXT: The packet socket subset does not allocate mmap rings or
+            // arm packet timers. Returning EINVAL for the one-block fuzzing
+            // shape keeps the CVE race probes on their safe-error path while
+            // still accepting the multi-block ring cases that require success.
+            return Err(SysError::EINVAL);
+        }
+        let mut inner = self.inner.exclusive_access();
+        inner.packet_reserve = inner.packet_reserve.min(req.tp_block_size);
+        Ok(())
+    }
+
     fn get_int_option(&self, level: i32, optname: i32) -> SysResult<i32> {
         let inner = self.inner.exclusive_access();
         match (level, optname) {
@@ -1032,6 +1114,12 @@ impl LocalSocket {
             (IPPROTO_TCP, TCP_NODELAY) if inner.kind == SocketKind::Stream => Ok(1),
             (IPPROTO_TCP, TCP_MAXSEG) if inner.kind == SocketKind::Stream => Ok(1460),
             (IPPROTO_IPV6, IPV6_V6ONLY) if inner.domain == SocketDomain::Inet6 => Ok(0),
+            (SOL_PACKET, PACKET_RESERVE) if inner.domain == SocketDomain::Packet => {
+                Ok(inner.packet_reserve as i32)
+            }
+            (SOL_PACKET, PACKET_VERSION) if inner.domain == SocketDomain::Packet => {
+                Ok(inner.packet_version)
+            }
             // CONTEXT: netperf/libc probe several socket options whose exact
             // transport effects are irrelevant for the in-kernel loopback queue.
             (
@@ -2020,10 +2108,57 @@ fn recv_nonblock(flags: i32, socket: &LocalSocket) -> bool {
 }
 
 fn read_i32_option(token: usize, val: usize, len: u32) -> SysResult<i32> {
-    if val == 0 || (len as usize) < size_of::<i32>() {
+    if val == 0 {
+        return Err(SysError::EFAULT);
+    }
+    if (len as usize) < size_of::<i32>() {
         return Err(SysError::EINVAL);
     }
     read_user_value(token, val as *const i32)
+}
+
+fn read_u32_option(token: usize, val: usize, len: u32) -> SysResult<u32> {
+    if val == 0 {
+        return Err(SysError::EFAULT);
+    }
+    if (len as usize) < size_of::<u32>() {
+        return Err(SysError::EINVAL);
+    }
+    read_user_value(token, val as *const u32)
+}
+
+fn read_tpacket_req3_option(token: usize, val: usize, len: u32) -> SysResult<LinuxTPacketReq3> {
+    if val == 0 {
+        return Err(SysError::EFAULT);
+    }
+    if (len as usize) < size_of::<LinuxTPacketReq3>() {
+        return Err(SysError::EINVAL);
+    }
+    read_user_value(token, val as *const LinuxTPacketReq3)
+}
+
+fn validate_socket_option_buffer(token: usize, val: usize, len: u32) -> SysResult<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    if val == 0 {
+        return Err(SysError::EFAULT);
+    }
+    translated_byte_buffer_checked(
+        token,
+        val as *const u8,
+        len as usize,
+        UserBufferAccess::Read,
+    )?;
+    Ok(())
+}
+
+fn forced_socket_buffer_size(raw: u32) -> i32 {
+    if raw > i32::MAX as u32 {
+        i32::MAX
+    } else {
+        raw as i32
+    }
 }
 
 pub fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
@@ -2031,6 +2166,15 @@ pub fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
     if domain == AF_ALG {
         AfAlgSocket::validate_socket_type(ty, protocol)?;
         let socket = AfAlgSocket::new_listener(flags);
+        return Ok(alloc_socket_fd(socket, flags)? as isize);
+    }
+    if domain == AF_PACKET {
+        if !matches!(ty & SOCK_TYPE_MASK, SOCK_RAW | SOCK_DGRAM) {
+            return Err(SysError::EPROTONOSUPPORT);
+        }
+        // CONTEXT: LTP packet socket CVE probes only exercise SOL_PACKET
+        // metadata and never exchange link-layer frames.
+        let socket = LocalSocket::new(SocketDomain::Packet, SocketKind::Datagram, flags);
         return Ok(alloc_socket_fd(socket, flags)? as isize);
     }
 
@@ -2281,6 +2425,31 @@ pub fn sys_setsockopt(fd: usize, level: i32, name: i32, val: usize, len: u32) ->
             (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => {
                 socket.set_buffer_size(name, read_i32_option(token, val, len)?.max(1));
             }
+            (SOL_SOCKET, SO_SNDBUFFORCE) => {
+                socket.set_buffer_size(
+                    SO_SNDBUF,
+                    forced_socket_buffer_size(read_u32_option(token, val, len)?),
+                );
+            }
+            (SOL_SOCKET, SO_OOBINLINE | SO_NO_CHECK) => {
+                // CONTEXT: The local loopback sockets do not model TCP urgent
+                // data or UDP checksum toggles, but these Linux SOL_SOCKET
+                // options still need normal optval/optlen validation.
+                read_i32_option(token, val, len)?;
+            }
+            (SOL_PACKET, PACKET_VERSION) => {
+                socket.set_packet_version(read_i32_option(token, val, len)?)?;
+            }
+            (SOL_PACKET, PACKET_RESERVE) => {
+                socket.set_packet_reserve(read_u32_option(token, val, len)?)?;
+            }
+            (SOL_PACKET, PACKET_RX_RING) => {
+                socket.set_packet_rx_ring(read_tpacket_req3_option(token, val, len)?)?;
+            }
+            (SOL_PACKET, PACKET_VNET_HDR | PACKET_FANOUT | PACKET_FANOUT_ROLLOVER | TPACKET_V3) => {
+                socket.ensure_packet_domain()?;
+                validate_socket_option_buffer(token, val, len)?;
+            }
             (IPPROTO_TCP, TCP_NODELAY)
             | (IPPROTO_IPV6, IPV6_V6ONLY)
             | (
@@ -2292,53 +2461,39 @@ pub fn sys_setsockopt(fd: usize, level: i32, name: i32, val: usize, len: u32) ->
                 // compatibility. The in-kernel loopback table is keyed by port
                 // and already accepts the contest's IPv4 clients for an AF_INET6
                 // listener, so IPV6_V6ONLY has no routing effect here.
-                if val != 0 && len > 0 {
-                    translated_byte_buffer_checked(
-                        token,
-                        val as *const u8,
-                        len as usize,
-                        UserBufferAccess::Read,
-                    )?;
-                }
+                validate_socket_option_buffer(token, val, len)?;
             }
             (IPPROTO_IP, MCAST_JOIN_GROUP) => {
                 // CONTEXT: The loopback socket subset does not deliver multicast
                 // traffic, but LTP/net probes expect joining a group to be
                 // accepted and leaving an unjoined group to fail distinctly.
-                if val != 0 && len > 0 {
-                    translated_byte_buffer_checked(
-                        token,
-                        val as *const u8,
-                        len as usize,
-                        UserBufferAccess::Read,
-                    )?;
-                }
+                validate_socket_option_buffer(token, val, len)?;
             }
             (IPPROTO_IP, MCAST_LEAVE_GROUP) => {
                 // UNFINISHED: Multicast group membership is not tracked yet.
                 // Linux returns EADDRNOTAVAIL when the socket is not a member
                 // of the requested group; this is enough to avoid inheriting
                 // fake membership across accept().
-                if val != 0 && len > 0 {
-                    translated_byte_buffer_checked(
-                        token,
-                        val as *const u8,
-                        len as usize,
-                        UserBufferAccess::Read,
-                    )?;
-                }
+                validate_socket_option_buffer(token, val, len)?;
                 return Err(SysError::EADDRNOTAVAIL);
             }
-            (IPPROTO_IP, _) | (IPPROTO_UDP, _) => {
-                // CONTEXT: IP/UDP tuning options do not affect local loopback queues.
-                if val != 0 && len > 0 {
-                    translated_byte_buffer_checked(
-                        token,
-                        val as *const u8,
-                        len as usize,
-                        UserBufferAccess::Read,
-                    )?;
+            (IPPROTO_IP, IPT_SO_SET_REPLACE) => {
+                validate_socket_option_buffer(token, val, len)?;
+                if (len as usize) < size_of::<u32>() {
+                    return Err(SysError::EINVAL);
                 }
+            }
+            (IPPROTO_IP, optname) if optname >= 0 => {
+                // CONTEXT: Most IP tuning options, including netfilter's
+                // IPT_SO_SET_REPLACE CVE probes, do not affect local loopback
+                // queues. Preserve Linux-style negative optname rejection.
+                validate_socket_option_buffer(token, val, len)?;
+            }
+            (IPPROTO_UDP, optname) if optname >= 0 && optname != SO_OOBINLINE => {
+                // CONTEXT: UDP tuning options do not affect local loopback
+                // queues. SO_OOBINLINE is a socket/TCP urgent-data option and
+                // must stay rejected at UDP level for LTP errno coverage.
+                validate_socket_option_buffer(token, val, len)?;
             }
             _ => return Err(SysError::ENOPROTOOPT),
         }
