@@ -67,8 +67,8 @@ elseif (ARCH STREQUAL "loongarch64")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mabi=lp64d")
 endif()
 
-set(CMAKE_C_FLAGS "-fPIC -fno-builtin -ffreestanding -fno-omit-frame-pointer ${CMAKE_C_FLAGS}")
-set(CMAKE_CXX_FLAGS "-fPIC -nostdinc -fno-builtin -ffreestanding -fno-omit-frame-pointer ${CMAKE_CXX_FLAGS}")
+set(CMAKE_C_FLAGS "-fPIC -fno-builtin -fno-stack-protector -U_FORTIFY_SOURCE -ffreestanding -fno-omit-frame-pointer ${CMAKE_C_FLAGS}")
+set(CMAKE_CXX_FLAGS "-fPIC -nostdinc -fno-builtin -fno-stack-protector -U_FORTIFY_SOURCE -ffreestanding -fno-omit-frame-pointer ${CMAKE_CXX_FLAGS}")
 
 if (APPLE)
     set(CMAKE_EXE_LINKER_FLAGS "-dead_strip" CACHE INTERNAL "exe link flags")
