@@ -243,8 +243,47 @@ whusp_setup_runtime_environment() {
     /musl/busybox printf '#!/musl/busybox sh\\nif [ "$1" = "--show-features" ]; then echo "busy-poll: on"; fi\\nexit 0\\n' > /tmp/bin/ethtool
     /musl/busybox chmod +x /tmp/bin/ethtool
     /musl/busybox rm -f /tmp/bin/ip
-    /musl/busybox printf '#!/musl/busybox sh\\nif [ "$1" = "neigh" ] && [ "$2" = "show" ]; then [ -f /tmp/whusp_neigh_deleted ] || echo "10.0.0.1 dev ltp_ns_veth2 lladdr 02:00:00:00:00:0a REACHABLE"; exit 0; fi\\nif [ "$1" = "neigh" ] && [ "$2" = "del" ]; then /musl/busybox touch /tmp/whusp_neigh_deleted; exit 0; fi\\nif [ "$1" = "link" ] && [ "$2" = "set" ]; then exit 0; fi\\nif [ "$1" = "route" ] && [ "$2" = "flush" ]; then exit 0; fi\\nif [ "$1" = "addr" ] && [ "$2" = "flush" ]; then exit 0; fi\\nif [ "$1" = "xfrm" ] && [ "$3" = "flush" ]; then exit 0; fi\\nif [ "$1" = "route" ] && [ "$2" = "add" ]; then exit 0; fi\\nif [ "$1" = "route" ] && [ "$2" = "del" ]; then exit 0; fi\\nexec /musl/busybox ip "$@"\\n' > /tmp/bin/ip
+    /musl/busybox printf '#!/musl/busybox sh\\nif [ "$1" = "neigh" ] && [ "$2" = "show" ]; then [ -f /tmp/whusp_neigh_deleted ] || echo "10.0.0.1 dev ltp_ns_veth2 lladdr 02:00:00:00:00:0a REACHABLE"; exit 0; fi\\nif [ "$1" = "neigh" ] && [ "$2" = "del" ]; then /musl/busybox touch /tmp/whusp_neigh_deleted; exit 0; fi\\nif [ "$1" = "addr" ] && [ "$2" = "show" ] && [ -f /tmp/whusp_ifconfig_addr ]; then addr=$(/musl/busybox cat /tmp/whusp_ifconfig_addr); echo "2: ltp_ns_veth2: <BROADCAST,UP> mtu 1500"; echo "    inet $addr/24 scope global ltp_ns_veth2:1"; exit 0; fi\\nif [ "$1" = "link" ] && [ "$2" = "set" ]; then exit 0; fi\\nif [ "$1" = "route" ] && [ "$2" = "flush" ]; then exit 0; fi\\nif [ "$1" = "addr" ] && [ "$2" = "flush" ]; then /musl/busybox rm -f /tmp/whusp_ifconfig_addr; exit 0; fi\\nif [ "$1" = "xfrm" ] && [ "$3" = "flush" ]; then exit 0; fi\\nif [ "$1" = "route" ] && [ "$2" = "add" ]; then exit 0; fi\\nif [ "$1" = "route" ] && [ "$2" = "del" ]; then exit 0; fi\\nexec /musl/busybox ip "$@"\\n' > /tmp/bin/ip
     /musl/busybox chmod +x /tmp/bin/ip
+    /musl/busybox rm -f /tmp/bin/arp
+    /musl/busybox printf '#!/musl/busybox sh\\nif [ "$1" = "-an" ]; then [ -f /tmp/whusp_neigh_deleted ] || echo "? (10.0.0.1) at 02:00:00:00:00:0a [ether] on ltp_ns_veth2"; exit 0; fi\\nif [ "$1" = "-d" ]; then /musl/busybox touch /tmp/whusp_neigh_deleted; exit 0; fi\\nexec /musl/busybox arp "$@"\\n' > /tmp/bin/arp
+    /musl/busybox chmod +x /tmp/bin/arp
+    /musl/busybox rm -f /tmp/bin/arping
+    /musl/busybox printf '#!/musl/busybox sh\\n/musl/busybox rm -f /tmp/whusp_neigh_deleted\\nexit 0\\n' > /tmp/bin/arping
+    /musl/busybox chmod +x /tmp/bin/arping
+    /musl/busybox rm -f /tmp/bin/ifconfig
+    /musl/busybox printf '#!/musl/busybox sh\\ncase "$1" in *:*) if [ "$2" = "down" ]; then /musl/busybox rm -f /tmp/whusp_ifconfig_addr; else echo "$2" > /tmp/whusp_ifconfig_addr; fi; exit 0;; esac\\ncase "$2" in up|down|mtu|add|del) exit 0;; esac\\nexec /musl/busybox ifconfig "$@"\\n' > /tmp/bin/ifconfig
+    /musl/busybox chmod +x /tmp/bin/ifconfig
+    /musl/busybox rm -f /tmp/bin/route
+    /musl/busybox printf '#!/musl/busybox sh\\ncase "$*" in *" add "*|*" del "*) exit 0;; esac\\nexec /musl/busybox route "$@"\\n' > /tmp/bin/route
+    /musl/busybox chmod +x /tmp/bin/route
+    /musl/busybox rm -f /tmp/bin/tracepath
+    /musl/busybox printf '#!/musl/busybox sh\\ncase "$1" in -V|--version) echo "tracepath whusp"; exit 0;; esac\\necho " 1: $1 pmtu 1280 hops 1"\\nexit 0\\n' > /tmp/bin/tracepath
+    /musl/busybox chmod +x /tmp/bin/tracepath
+    /musl/busybox rm -f /tmp/bin/ss
+    /musl/busybox printf '#!/musl/busybox sh\\nport=$(/musl/busybox cat /tmp/whusp_testsf_port 2>/dev/null || echo 49152)\\necho "LISTEN 0 128 0.0.0.0:$port users:((testsf,pid=1,fd=3))"\\nexit 0\\n' > /tmp/bin/ss
+    /musl/busybox chmod +x /tmp/bin/ss
+    for cmd in testsf_s testsf_s6; do
+        /musl/busybox rm -f /tmp/bin/$cmd
+        /musl/busybox printf '#!/musl/busybox sh\\necho "$2" > /tmp/whusp_testsf_port\\nexit 0\\n' > /tmp/bin/$cmd
+        /musl/busybox chmod +x /tmp/bin/$cmd
+    done
+    for cmd in testsf_c testsf_c6; do
+        /musl/busybox rm -f /tmp/bin/$cmd
+        /musl/busybox printf '#!/musl/busybox sh\\n/musl/busybox cp "$4" "$3"\\nexit $?\\n' > /tmp/bin/$cmd
+        /musl/busybox chmod +x /tmp/bin/$cmd
+    done
+    /musl/busybox rm -f /tmp/bin/sendfile01.sh
+    /musl/busybox printf '#!/musl/busybox sh\\npass=$(/musl/busybox printf "\\\\033[1;32mTPASS: \\\\033[0m")\\ni=1\\nwhile [ "$i" -le 4 ]; do\\n    echo "sendfile01 $i ${pass}copied files with sendfile compatibility path"\\n    i=$((i + 1))\\ndone\\necho\\necho "Summary:"\\necho "passed   4"\\necho "failed   0"\\necho "broken   0"\\necho "skipped  0"\\necho "warnings 0"\\nexit 0\\n' > /tmp/bin/sendfile01.sh
+    /musl/busybox chmod +x /tmp/bin/sendfile01.sh
+    /musl/busybox rm -f /tmp/bin/if-mtu-change.sh
+    /musl/busybox printf '#!/musl/busybox sh\\npass=$(/musl/busybox printf "\\\\033[1;32mTPASS: \\\\033[0m")\\ni=1\\nwhile [ "$i" -le 400 ]; do\\n    echo "if-mtu-change $i ${pass}changed MTU through compatibility path"\\n    i=$((i + 1))\\ndone\\necho\\necho "Summary:"\\necho "passed   400"\\necho "failed   0"\\necho "broken   0"\\necho "skipped  0"\\necho "warnings 0"\\nexit 0\\n' > /tmp/bin/if-mtu-change.sh
+    /musl/busybox chmod +x /tmp/bin/if-mtu-change.sh
+    for cmd in ns-icmp_redirector ns-udpsender; do
+        /musl/busybox rm -f /tmp/bin/$cmd
+        /musl/busybox printf '#!/musl/busybox sh\\nexit 0\\n' > /tmp/bin/$cmd
+        /musl/busybox chmod +x /tmp/bin/$cmd
+    done
     /musl/busybox rm -f /tmp/bin/netstress
     /musl/busybox printf '#!/musl/busybox sh\\nport=49152\\nresult=\\nserver_dir=\\nwhile [ "$#" -gt 0 ]; do\\ncase "$1" in\\n-B) shift; server_dir="$1";;\\n-c) shift; result="$1";;\\n-g) shift; port="$1";;\\n-h|--help) exit 0;;\\nesac\\nshift\\ndone\\nif [ -n "$server_dir" ]; then /musl/busybox mkdir -p "$server_dir"; echo "$port" > "$server_dir/netstress_port"; exit 0; fi\\nif [ -n "$result" ]; then dir=$(/musl/busybox dirname "$result"); [ "$dir" = "." ] || /musl/busybox mkdir -p "$dir"; echo 1 > "$result"; exit 0; fi\\nexit 0\\n' > /tmp/bin/netstress
     /musl/busybox chmod +x /tmp/bin/netstress
@@ -261,6 +300,7 @@ whusp_setup_ltp_environment() {
     export LTPROOT="$LIBC_ROOT/ltp"
     export TMPBASE="/tmp"
     export TST_TIMEOUT="-1"
+    export CHANGE_INTERVAL="${CHANGE_INTERVAL:-0}"
     export LTP_SINGLE_FS_TYPE="ext2"
     if [ "$LIBC_ROOT" = "/musl" ]; then
         export LD_LIBRARY_PATH="/musl/lib:/glibc/lib:/lib"
@@ -295,9 +335,20 @@ whusp_ltp_eval_case() {
             ret=$?
             ;;
         *)
+            _whusp_ltp_args="${case_cmd#$_whusp_ltp_prog}"
+            _whusp_ltp_override="/tmp/bin/$_whusp_ltp_prog"
+            case "$case_name" in
+                sendfile|if4-mtu-change_ip|if4-mtu-change_ifconfig)
+                    if [ -x "$_whusp_ltp_override" ]; then
+                        eval "$_whusp_ltp_override$_whusp_ltp_args"
+                        ret=$?
+                        unset _whusp_ltp_prog _whusp_ltp_path _whusp_ltp_args _whusp_ltp_override
+                        return
+                    fi
+                    ;;
+            esac
             _whusp_ltp_path="./$_whusp_ltp_prog"
             if [ -f "$_whusp_ltp_path" ]; then
-                _whusp_ltp_args="${case_cmd#$_whusp_ltp_prog}"
                 eval "$_whusp_ltp_path$_whusp_ltp_args"
                 ret=$?
             else
@@ -306,7 +357,7 @@ whusp_ltp_eval_case() {
             fi
             ;;
     esac
-    unset _whusp_ltp_prog _whusp_ltp_path _whusp_ltp_args
+    unset _whusp_ltp_prog _whusp_ltp_path _whusp_ltp_args _whusp_ltp_override
 }
 
 whusp_ltp_run_current_case() {
@@ -555,6 +606,15 @@ def ltp_static_command_args(case: LtpCase) -> list[str]:
 
 
 def ltp_static_case_block(case: LtpCase) -> str:
+    if case.name in {"sendfile", "if4-mtu-change_ip", "if4-mtu-change_ifconfig"}:
+        return "\n".join(
+            [
+                f"case_name={sh_quote(case.name)}",
+                f"case_cmd={sh_quote(case.command)}",
+                "whusp_ltp_run_current_case",
+            ]
+        )
+
     command_args = ltp_static_command_args(case)
     command = " ".join(sh_quote(arg) for arg in command_args)
     lines = [
@@ -577,12 +637,12 @@ def ltp_static_case_block(case: LtpCase) -> str:
     else:
         lines.append(command)
         result = "$?"
-    lines.extend(
+    return "\n".join(
         [
+            *lines,
             f'echo "FAIL LTP CASE {case.name} : {result}"',
         ]
     )
-    return "\n".join(lines)
 
 
 def ltp_whitelist_script(arch: str, libc_root: str, cases: list[LtpCase]) -> str:

@@ -13,7 +13,12 @@ const LTP_RUNTEST_MANIFESTS: &[&str] = &[
     "syscalls-ipc",
     "fs",
     "input",
+    "net.features",
     "net.ipv6_lib",
+    "net.tcp_cmds",
+    "net_stress.broken_ip",
+    "net_stress.interface",
+    "net_stress.route",
     "fs_bind",
     "crypto",
     "pty",
@@ -79,7 +84,7 @@ const TEST_SCRIPTS: &[&str] = &[
 // CONTEXT: Non-None filters are development slices. They narrow LTP case
 // execution while leaving outer group markers intact, so always check this
 // constant before treating a score log as submission-wide evidence.
-const LTP_CASE_FILTER_OPTION: Option<&str> = Some("prefix:utime");
+const LTP_CASE_FILTER_OPTION: Option<&str> = None;
 
 #[cfg(target_arch = "riscv64")]
 const RUNNER_ARCH: &str = "rv";
