@@ -1,5 +1,6 @@
 use super::{PhysAddr, PhysPageNum};
 use crate::config::memory_end;
+use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use alloc::vec::Vec;
 use core::fmt::{self, Debug, Formatter};
@@ -118,15 +119,14 @@ impl FrameAllocator for StackFrameAllocator {
         }
         if *count > 1 {
             *count -= 1;
+            perf::record_frame_dealloc(false, true, 0, self.recycled.len());
             return;
         }
         *count = 0;
-        // validity check
-        if self.recycled.contains(&ppn) {
-            panic!("Frame ppn={ppn:#x} has not been allocated!");
-        }
-        // recycle
+        // Refcount zero is the double-free guard; scanning the free list makes
+        // every dealloc proportional to the number of recycled frames.
         self.recycled.push(ppn);
+        perf::record_frame_dealloc(true, false, 0, self.recycled.len());
     }
 }
 

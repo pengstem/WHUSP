@@ -40,6 +40,11 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) vfs_read_cache_readahead_batches: usize,
     pub(crate) vfs_read_cache_readahead_pages: usize,
     pub(crate) page_cache_clean_evictions: usize,
+    pub(crate) frame_dealloc_calls: usize,
+    pub(crate) frame_dealloc_released: usize,
+    pub(crate) frame_dealloc_refcount_drops: usize,
+    pub(crate) frame_dealloc_recycled_scan_slots: usize,
+    pub(crate) frame_dealloc_recycled_len_max: usize,
     pub(crate) pipe_read_calls: usize,
     pub(crate) pipe_write_calls: usize,
     pub(crate) pipe_read_bytes: usize,
@@ -161,6 +166,11 @@ mod enabled {
     static VFS_READ_CACHE_READAHEAD_BATCHES: AtomicUsize = AtomicUsize::new(0);
     static VFS_READ_CACHE_READAHEAD_PAGES: AtomicUsize = AtomicUsize::new(0);
     static PAGE_CACHE_CLEAN_EVICTIONS: AtomicUsize = AtomicUsize::new(0);
+    static FRAME_DEALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static FRAME_DEALLOC_RELEASED: AtomicUsize = AtomicUsize::new(0);
+    static FRAME_DEALLOC_REFCOUNT_DROPS: AtomicUsize = AtomicUsize::new(0);
+    static FRAME_DEALLOC_RECYCLED_SCAN_SLOTS: AtomicUsize = AtomicUsize::new(0);
+    static FRAME_DEALLOC_RECYCLED_LEN_MAX: AtomicUsize = AtomicUsize::new(0);
 
     static PIPE_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PIPE_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -354,6 +364,23 @@ mod enabled {
 
     pub(crate) fn record_page_cache_clean_eviction(pages: usize) {
         PAGE_CACHE_CLEAN_EVICTIONS.fetch_add(pages, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_frame_dealloc(
+        released: bool,
+        refcount_drop: bool,
+        recycled_scan_slots: usize,
+        recycled_len: usize,
+    ) {
+        FRAME_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+        if released {
+            FRAME_DEALLOC_RELEASED.fetch_add(1, Ordering::Relaxed);
+        }
+        if refcount_drop {
+            FRAME_DEALLOC_REFCOUNT_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+        FRAME_DEALLOC_RECYCLED_SCAN_SLOTS.fetch_add(recycled_scan_slots, Ordering::Relaxed);
+        update_max(&FRAME_DEALLOC_RECYCLED_LEN_MAX, recycled_len);
     }
 
     pub(crate) fn record_pipe_read_call() {
@@ -611,6 +638,12 @@ mod enabled {
                 .load(Ordering::Relaxed),
             vfs_read_cache_readahead_pages: VFS_READ_CACHE_READAHEAD_PAGES.load(Ordering::Relaxed),
             page_cache_clean_evictions: PAGE_CACHE_CLEAN_EVICTIONS.load(Ordering::Relaxed),
+            frame_dealloc_calls: FRAME_DEALLOC_CALLS.load(Ordering::Relaxed),
+            frame_dealloc_released: FRAME_DEALLOC_RELEASED.load(Ordering::Relaxed),
+            frame_dealloc_refcount_drops: FRAME_DEALLOC_REFCOUNT_DROPS.load(Ordering::Relaxed),
+            frame_dealloc_recycled_scan_slots: FRAME_DEALLOC_RECYCLED_SCAN_SLOTS
+                .load(Ordering::Relaxed),
+            frame_dealloc_recycled_len_max: FRAME_DEALLOC_RECYCLED_LEN_MAX.load(Ordering::Relaxed),
             pipe_read_calls: PIPE_READ_CALLS.load(Ordering::Relaxed),
             pipe_write_calls: PIPE_WRITE_CALLS.load(Ordering::Relaxed),
             pipe_read_bytes: PIPE_READ_BYTES.load(Ordering::Relaxed),
@@ -737,6 +770,11 @@ mod enabled {
          vfs_read_cache_readahead_batches {}\n\
          vfs_read_cache_readahead_pages {}\n\
          page_cache_clean_evictions {}\n\
+         frame_dealloc_calls {}\n\
+         frame_dealloc_released {}\n\
+         frame_dealloc_refcount_drops {}\n\
+         frame_dealloc_recycled_scan_slots {}\n\
+         frame_dealloc_recycled_len_max {}\n\
          pipe_read_calls {}\n\
          pipe_write_calls {}\n\
          pipe_read_bytes {}\n\
@@ -845,6 +883,11 @@ mod enabled {
             stats.vfs_read_cache_readahead_batches,
             stats.vfs_read_cache_readahead_pages,
             stats.page_cache_clean_evictions,
+            stats.frame_dealloc_calls,
+            stats.frame_dealloc_released,
+            stats.frame_dealloc_refcount_drops,
+            stats.frame_dealloc_recycled_scan_slots,
+            stats.frame_dealloc_recycled_len_max,
             stats.pipe_read_calls,
             stats.pipe_write_calls,
             stats.pipe_read_bytes,
@@ -1015,6 +1058,15 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_page_cache_clean_eviction(_pages: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_frame_dealloc(
+        _released: bool,
+        _refcount_drop: bool,
+        _recycled_scan_slots: usize,
+        _recycled_len: usize,
+    ) {
+    }
 
     #[inline(always)]
     pub(crate) fn record_pipe_read_call() {}
