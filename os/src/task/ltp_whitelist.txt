@@ -343,6 +343,14 @@ fstatfs01_64
 fstatfs02
 fstatfs02_64
 write02
+fchmod01
+fchmod02
+fchmod03
+fchmod04
+fchmod05
+fchmod06
+fchmodat01
+fchmodat02
 dup207
 pidns30
 open09
@@ -355,6 +363,10 @@ ptrace03
 sendfile02
 dup01
 fcntl27_64
+flistxattr01
+flistxattr02
+flistxattr03
+fdatasync03
 readlink01
 alarm03
 setsockopt01
@@ -418,6 +430,9 @@ ioctl_loop04
 chdir04
 rename13
 mmap09
+mknod01
+mknod02
+mknod09
 bind03
 pwritev03_64
 epoll_pwait04

@@ -931,6 +931,16 @@ pub fn sys_fsync(fd: usize) -> SysResult {
     Ok(0)
 }
 
+pub fn sys_fdatasync(fd: usize) -> SysResult {
+    let file = get_file_by_fd(fd)?;
+    let mode = file.stat()?.mode;
+    if mode & S_IFMT != S_IFREG {
+        return Err(SysError::EINVAL);
+    }
+    file.sync(true)?;
+    Ok(0)
+}
+
 pub fn sys_sync() -> SysResult {
     crate::fs::sync_all_mounts();
     Ok(0)

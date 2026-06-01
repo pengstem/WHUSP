@@ -10,8 +10,8 @@ use crate::task::{PathSnapshot, current_process, current_user_token};
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, translated_byte_buffer_checked,
-    write_user_value,
+    PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string,
+    translated_byte_buffer_checked_with_mmap_fault, write_user_value,
 };
 use super::fanotify::fanotify_notify_attrib;
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
@@ -36,6 +36,7 @@ const MODE_SETGID: u32 = 0o2000;
 const MODE_GROUP_EXEC: u32 = 0o0010;
 const XATTR_NAME_MAX: usize = 255;
 const XATTR_SIZE_MAX: usize = 64 * 1024;
+const XATTR_LIST_MAX: usize = 64 * 1024;
 const XATTR_CREATE: u32 = 1;
 const XATTR_REPLACE: u32 = 2;
 const PIPEFS_MAGIC: i64 = 0x5049_5045;
@@ -394,7 +395,8 @@ fn read_xattr_value(token: usize, value: *const u8, size: usize) -> SysResult<Ve
     if value.is_null() {
         return Err(SysError::EFAULT);
     }
-    let buffers = translated_byte_buffer_checked(token, value, size, UserBufferAccess::Read)?;
+    let buffers =
+        translated_byte_buffer_checked_with_mmap_fault(token, value, size, UserBufferAccess::Read)?;
     let mut bytes = Vec::with_capacity(size);
     for buffer in buffers {
         bytes.extend_from_slice(buffer);
@@ -474,6 +476,64 @@ fn xattr_get(target: XattrTarget, name: &str, value: *mut u8, size: usize) -> Sy
     }
     copy_to_user(token, value, stored)?;
     Ok(stored.len() as isize)
+}
+
+fn copy_xattr_list_to_user(token: usize, list: *mut u8, bytes: &[u8]) -> SysResult {
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    let buffers = translated_byte_buffer_checked_with_mmap_fault(
+        token,
+        list.cast_const(),
+        bytes.len(),
+        UserBufferAccess::Write,
+    )?;
+    let mut copied = 0usize;
+    for buffer in buffers {
+        let remaining = bytes.len() - copied;
+        let count = buffer.len().min(remaining);
+        buffer[..count].copy_from_slice(&bytes[copied..copied + count]);
+        copied += count;
+        if copied == bytes.len() {
+            break;
+        }
+    }
+    Ok(0)
+}
+
+fn xattr_list_bytes(target: XattrTarget) -> SysResult<Vec<u8>> {
+    let attrs = XATTRS.lock();
+    let mut list = Vec::new();
+    for ((node, name), _) in attrs.iter() {
+        if *node != target.node {
+            continue;
+        }
+        if name.starts_with("user.") && !xattr_user_namespace_allowed(target.kind) {
+            continue;
+        }
+        let entry_len = name.len().checked_add(1).ok_or(SysError::E2BIG)?;
+        if list.len().checked_add(entry_len).ok_or(SysError::E2BIG)? > XATTR_LIST_MAX {
+            return Err(SysError::E2BIG);
+        }
+        list.extend_from_slice(name.as_bytes());
+        list.push(0);
+    }
+    Ok(list)
+}
+
+fn xattr_list(target: XattrTarget, list: *mut u8, size: usize) -> SysResult {
+    let bytes = xattr_list_bytes(target)?;
+    if size == 0 {
+        return Ok(bytes.len() as isize);
+    }
+    if list.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    if size < bytes.len() {
+        return Err(SysError::ERANGE);
+    }
+    copy_xattr_list_to_user(current_user_token(), list, bytes.as_slice())?;
+    Ok(bytes.len() as isize)
 }
 
 fn xattr_set(target: XattrTarget, name: &str, value: Vec<u8>, flags: u32) -> SysResult {
@@ -569,6 +629,21 @@ pub fn sys_fgetxattr(fd: usize, name: *const u8, value: *mut u8, size: usize) ->
     let name = read_xattr_name(token, name)?;
     let target = xattr_target_from_fd(fd)?;
     xattr_get(target, name.as_str(), value, size)
+}
+
+pub fn sys_listxattr(path: *const u8, list: *mut u8, size: usize) -> SysResult {
+    let target = xattr_target_from_path(path, true)?;
+    xattr_list(target, list, size)
+}
+
+pub fn sys_llistxattr(path: *const u8, list: *mut u8, size: usize) -> SysResult {
+    let target = xattr_target_from_path(path, false)?;
+    xattr_list(target, list, size)
+}
+
+pub fn sys_flistxattr(fd: usize, list: *mut u8, size: usize) -> SysResult {
+    let target = xattr_target_from_fd(fd)?;
+    xattr_list(target, list, size)
 }
 
 pub fn sys_removexattr(path: *const u8, name: *const u8) -> SysResult {

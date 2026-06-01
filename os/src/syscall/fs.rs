@@ -40,9 +40,9 @@ pub(crate) use inotify::{
 };
 pub use inotify::{sys_inotify_add_watch, sys_inotify_init1, sys_inotify_rm_watch};
 pub use io::{
-    sys_copy_file_range, sys_fadvise64, sys_fallocate, sys_fsync, sys_ftruncate, sys_lseek,
-    sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read,
-    sys_readahead, sys_readv, sys_sendfile, sys_splice, sys_sync, sys_syncfs, sys_write,
+    sys_copy_file_range, sys_fadvise64, sys_fallocate, sys_fdatasync, sys_fsync, sys_ftruncate,
+    sys_lseek, sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2,
+    sys_read, sys_readahead, sys_readv, sys_sendfile, sys_splice, sys_sync, sys_syncfs, sys_write,
     sys_writev,
 };
 pub use mount::{
@@ -58,9 +58,10 @@ pub use path::{
 pub use poll::{sys_ppoll, sys_pselect6};
 pub use quota::{sys_quotactl, sys_quotactl_fd};
 pub use stat::{
-    sys_fchmod, sys_fchmodat, sys_fchown, sys_fchownat, sys_fgetxattr, sys_fremovexattr,
-    sys_fsetxattr, sys_fstat, sys_fstatfs, sys_getxattr, sys_lgetxattr, sys_lremovexattr,
-    sys_lsetxattr, sys_newfstatat, sys_removexattr, sys_setxattr, sys_statfs, sys_statx,
+    sys_fchmod, sys_fchmodat, sys_fchown, sys_fchownat, sys_fgetxattr, sys_flistxattr,
+    sys_fremovexattr, sys_fsetxattr, sys_fstat, sys_fstatfs, sys_getxattr, sys_lgetxattr,
+    sys_listxattr, sys_llistxattr, sys_lremovexattr, sys_lsetxattr, sys_newfstatat,
+    sys_removexattr, sys_setxattr, sys_statfs, sys_statx,
 };
 pub(crate) use swap::is_active_swap_file;
 pub use swap::{sys_swapoff, sys_swapon};

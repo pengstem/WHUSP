@@ -12,6 +12,9 @@ const SYSCALL_FSETXATTR: usize = 7;
 const SYSCALL_GETXATTR: usize = 8;
 const SYSCALL_LGETXATTR: usize = 9;
 const SYSCALL_FGETXATTR: usize = 10;
+const SYSCALL_LISTXATTR: usize = 11;
+const SYSCALL_LLISTXATTR: usize = 12;
+const SYSCALL_FLISTXATTR: usize = 13;
 const SYSCALL_REMOVEXATTR: usize = 14;
 const SYSCALL_LREMOVEXATTR: usize = 15;
 const SYSCALL_FREMOVEXATTR: usize = 16;
@@ -72,6 +75,7 @@ const SYSCALL_NEWFSTATAT: usize = 79;
 const SYSCALL_FSTAT: usize = 80;
 const SYSCALL_SYNC: usize = 81;
 const SYSCALL_FSYNC: usize = 82;
+const SYSCALL_FDATASYNC: usize = 83;
 const SYSCALL_TIMERFD_CREATE: usize = 85;
 const SYSCALL_UTIMENSAT: usize = 88;
 const SYSCALL_CAPGET: usize = 90;
@@ -433,6 +437,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FGETXATTR => {
             sys_fgetxattr(args[0], args[1] as *const u8, args[2] as *mut u8, args[3])
         }
+        SYSCALL_LISTXATTR => sys_listxattr(args[0] as *const u8, args[1] as *mut u8, args[2]),
+        SYSCALL_LLISTXATTR => sys_llistxattr(args[0] as *const u8, args[1] as *mut u8, args[2]),
+        SYSCALL_FLISTXATTR => sys_flistxattr(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_REMOVEXATTR => sys_removexattr(args[0] as *const u8, args[1] as *const u8),
         SYSCALL_LREMOVEXATTR => sys_lremovexattr(args[0] as *const u8, args[1] as *const u8),
         SYSCALL_FREMOVEXATTR => sys_fremovexattr(args[0], args[1] as *const u8),
@@ -645,6 +652,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut LinuxKstat),
         SYSCALL_SYNC => sys_sync(),
         SYSCALL_FSYNC => sys_fsync(args[0]),
+        SYSCALL_FDATASYNC => sys_fdatasync(args[0]),
         SYSCALL_SYNCFS => sys_syncfs(args[0]),
         SYSCALL_INIT_MODULE => sys_init_module(args[0] as *const u8, args[1], args[2] as *const u8),
         SYSCALL_DELETE_MODULE => sys_delete_module(args[0] as *const u8, args[1] as u32),
