@@ -12,6 +12,7 @@ use crate::task::current_user_token;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{copy_to_user, read_user_value, write_user_value};
@@ -124,8 +125,6 @@ const RANDOM_ENTROPY_AVAIL: i32 = 256;
 const IFNAMSIZ: usize = 16;
 const IFREQ_DATA_LEN: usize = 24;
 const IFREQ_SIZE: usize = IFNAMSIZ + IFREQ_DATA_LEN;
-const LOOPBACK_IF_INDEX: i32 = 1;
-const LOOPBACK_IF_FLAGS: i16 = 0x1 | 0x8 | 0x40;
 const LO_FLAGS_READ_ONLY: u32 = 1;
 const LO_FLAGS_AUTOCLEAR: u32 = 4;
 const LO_FLAGS_PARTSCAN: u32 = 8;
@@ -134,6 +133,7 @@ const CLONE_NEWNS_VALUE: isize = 0x0002_0000;
 const CLONE_NEWUTS_VALUE: isize = 0x0400_0000;
 const CLONE_NEWUSER_VALUE: isize = 0x1000_0000;
 const CLONE_NEWPID_VALUE: isize = 0x2000_0000;
+const CLONE_NEWNET_VALUE: isize = 0x4000_0000;
 const TUN_SUPPORTED_FEATURES: u32 =
     0x0001 | 0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0100 | 0x1000 | 0x2000 | 0x4000;
 
@@ -549,6 +549,7 @@ fn namespace_type_value(kind: ProcNamespaceKind) -> isize {
         ProcNamespaceKind::Pid => CLONE_NEWPID_VALUE,
         ProcNamespaceKind::User => CLONE_NEWUSER_VALUE,
         ProcNamespaceKind::Uts => CLONE_NEWUTS_VALUE,
+        ProcNamespaceKind::Net => CLONE_NEWNET_VALUE,
     }
 }
 
@@ -587,7 +588,9 @@ fn handle_namespace_parent_ioctl(info: ProcNamespaceInfo) -> SysResult {
                 parent_id: None,
             })
         }
-        ProcNamespaceKind::Mnt | ProcNamespaceKind::Uts => Err(SysError::EINVAL),
+        ProcNamespaceKind::Mnt | ProcNamespaceKind::Uts | ProcNamespaceKind::Net => {
+            Err(SysError::EINVAL)
+        }
     }
 }
 
@@ -960,10 +963,12 @@ struct LinuxIfConf {
     ifc_buf: usize,
 }
 
-fn loopback_ifreq() -> LinuxIfReq {
+fn netdev_ifreq(name: &str, index: i32) -> LinuxIfReq {
     let mut req = LinuxIfReq::default();
-    req.ifr_name[..2].copy_from_slice(b"lo");
-    set_ifreq_i32(&mut req, LOOPBACK_IF_INDEX);
+    let bytes = name.as_bytes();
+    let copied = bytes.len().min(IFNAMSIZ.saturating_sub(1));
+    req.ifr_name[..copied].copy_from_slice(&bytes[..copied]);
+    set_ifreq_i32(&mut req, index);
     req
 }
 
@@ -998,42 +1003,45 @@ fn handle_socket_if_ioctl(request: usize, argp: usize) -> SysResult {
     match request {
         SIOCGIFINDEX => {
             let mut req = read_user_value(token, argp as *const LinuxIfReq)?;
-            if ifreq_name(&req) != b"lo" {
-                return Err(SysError::ENODEV);
-            }
-            set_ifreq_i32(&mut req, LOOPBACK_IF_INDEX);
+            let index =
+                crate::fs::socket::netdev_if_index(ifreq_name(&req)).ok_or(SysError::ENODEV)?;
+            set_ifreq_i32(&mut req, index);
             write_user_value(token, argp as *mut LinuxIfReq, &req)?;
             Ok(0)
         }
         SIOCGIFNAME => {
             let mut req = read_user_value(token, argp as *const LinuxIfReq)?;
-            if ifreq_i32(&req) != LOOPBACK_IF_INDEX {
-                return Err(SysError::ENXIO);
-            }
+            let name = crate::fs::socket::netdev_if_name(ifreq_i32(&req)).ok_or(SysError::ENXIO)?;
+            let name = name.as_bytes();
             req.ifr_name = [0; IFNAMSIZ];
-            req.ifr_name[..2].copy_from_slice(b"lo");
+            let copied = name.len().min(IFNAMSIZ.saturating_sub(1));
+            req.ifr_name[..copied].copy_from_slice(&name[..copied]);
             write_user_value(token, argp as *mut LinuxIfReq, &req)?;
             Ok(0)
         }
         SIOCGIFFLAGS => {
             let mut req = read_user_value(token, argp as *const LinuxIfReq)?;
-            if ifreq_name(&req) != b"lo" {
-                return Err(SysError::ENODEV);
-            }
-            set_ifreq_i16(&mut req, LOOPBACK_IF_FLAGS);
+            let flags =
+                crate::fs::socket::netdev_if_flags(ifreq_name(&req)).ok_or(SysError::ENODEV)?;
+            set_ifreq_i16(&mut req, flags);
             write_user_value(token, argp as *mut LinuxIfReq, &req)?;
             Ok(0)
         }
         SIOCGIFCONF => {
             let mut conf = read_user_value(token, argp as *const LinuxIfConf)?;
-            if conf.ifc_buf != 0 && conf.ifc_len as usize >= IFREQ_SIZE {
-                let req = loopback_ifreq();
-                let mut bytes = [0u8; IFREQ_SIZE];
-                bytes[..IFNAMSIZ].copy_from_slice(&req.ifr_name);
-                bytes[IFNAMSIZ..].copy_from_slice(&req.ifr_data);
-                copy_to_user(token, conf.ifc_buf as *mut u8, &bytes)?;
+            let ifaces = crate::fs::socket::netdev_ifconf();
+            let total_len = ifaces.len() * IFREQ_SIZE;
+            if conf.ifc_buf != 0 && conf.ifc_len > 0 {
+                let mut bytes = Vec::new();
+                for (name, index) in ifaces {
+                    let req = netdev_ifreq(name.as_str(), index);
+                    bytes.extend_from_slice(&req.ifr_name);
+                    bytes.extend_from_slice(&req.ifr_data);
+                }
+                let copy_len = (conf.ifc_len as usize).min(bytes.len());
+                copy_to_user(token, conf.ifc_buf as *mut u8, &bytes[..copy_len])?;
             }
-            conf.ifc_len = IFREQ_SIZE as i32;
+            conf.ifc_len = total_len as i32;
             write_user_value(token, argp as *mut LinuxIfConf, &conf)?;
             Ok(0)
         }

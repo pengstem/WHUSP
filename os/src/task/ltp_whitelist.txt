@@ -257,6 +257,15 @@ getpriority01
 getpriority02
 request_key04
 request_key05
+in6_01
+in6_02
+getaddrinfo_01
+bind_noport01
+netstat
+ping01
+broken_ip4-version
+if4-updown_ip
+ipneigh01_ip
 ioctl_loop06
 fcntl29_64
 dup07

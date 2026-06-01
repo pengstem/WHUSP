@@ -149,13 +149,13 @@ pub fn sys_ppoll(
     fds: *mut LinuxPollFd,
     nfds: usize,
     timeout: *const LinuxTimeSpec,
-    sigmask: *const u8,
+    _sigmask: *const u8,
     _sigsetsize: usize,
 ) -> SysResult {
     // UNFINISHED: ppoll currently ignores per-call signal-mask installation.
-    if !sigmask.is_null() {
-        return Err(SysError::ENOSYS);
-    }
+    // CONTEXT: musl implements pause() through ppoll() with a non-null mask on
+    // RISC-V. Accepting the mask as a no-op lets LTP namespace helper daemons
+    // sleep until killed instead of exiting immediately with ENOSYS.
 
     let token = current_user_token();
     let mut pollfds = read_user_pollfds(token, fds.cast_const(), nfds)?;

@@ -48,9 +48,9 @@ const PROC_BUS_INPUT_DEVICES: &[u8] =
 const SYS_INPUT0_NAME: &[u8] = b"virtual-device-ltp\n";
 const PROC_RANDOM_ENTROPY_AVAIL: &[u8] = b"256\n";
 const MODULES_LOOP_DEP: &[u8] =
-    b"kernel/drivers/block/loop.ko:\nkernel/drivers/memory/hwpoison_inject.ko:\nkernel/fs/quota/quota_v2.ko:\nkernel/net/dns_resolver/dns_resolver.ko:\n";
+    b"kernel/drivers/block/loop.ko:\nkernel/drivers/memory/hwpoison_inject.ko:\nkernel/fs/quota/quota_v2.ko:\nkernel/net/dns_resolver/dns_resolver.ko:\nkernel/drivers/net/veth.ko:\n";
 const MODULES_LOOP_BUILTIN: &[u8] =
-    b"kernel/drivers/block/loop.ko\nkernel/drivers/memory/hwpoison_inject.ko\nkernel/fs/quota/quota_v2.ko\nkernel/net/dns_resolver/dns_resolver.ko\n";
+    b"kernel/drivers/block/loop.ko\nkernel/drivers/memory/hwpoison_inject.ko\nkernel/fs/quota/quota_v2.ko\nkernel/net/dns_resolver/dns_resolver.ko\nkernel/drivers/net/veth.ko\n";
 const MODULES_ALIAS: &[u8] = b"";
 const MODULES_ORDER: &[u8] = b"kernel/net/dns_resolver/dns_resolver.ko\n";
 const MODULES_SYMBOLS: &[u8] = b"";
@@ -58,6 +58,18 @@ const MODULES_CONFIG: &[u8] =
     b"CONFIG_FS_VERITY=y\nCONFIG_USER_DECRYPTED_DATA=y\nCONFIG_PREEMPT_RT=y\nCONFIG_MEMORY_FAILURE=y\nCONFIG_HWPOISON_INJECT=y\n";
 const DNS_RESOLVER_KO: &[u8] = b"WHUSP built-in dns_resolver module placeholder\n";
 const SYS_DEV_BLOCK_TMPFS_UEVENT: &[u8] = b"DEVNAME=loop0\n";
+const SYS_NET_LO_ADDRESS: &[u8] = b"00:00:00:00:00:00\n";
+const SYS_NET_VETH1_ADDRESS: &[u8] = b"02:00:00:00:00:0a\n";
+const SYS_NET_VETH2_ADDRESS: &[u8] = b"02:00:00:00:00:0b\n";
+const SYS_NET_LO_MTU: &[u8] = b"65536\n";
+const SYS_NET_VETH_MTU: &[u8] = b"1500\n";
+const SYS_NET_LO_OPERSTATE: &[u8] = b"unknown\n";
+const SYS_NET_VETH_OPERSTATE: &[u8] = b"up\n";
+const SYS_NET_LO_FLAGS: &[u8] = b"0x49\n";
+const SYS_NET_VETH_FLAGS: &[u8] = b"0x41\n";
+const SYS_NET_LO_IFINDEX: &[u8] = b"1\n";
+const SYS_NET_VETH1_IFINDEX: &[u8] = b"10\n";
+const SYS_NET_VETH2_IFINDEX: &[u8] = b"11\n";
 #[cfg(target_arch = "loongarch64")]
 const LA_MUSL_COMPAT_SO: &[u8] =
     include_bytes!("../../assets/loongarch64/liboscomp-musl-compat.so");
@@ -80,8 +92,12 @@ enum StaticNode {
     SysDevBlockTmpfsDir,
     SysClassDir,
     SysClassBlockDir,
+    SysClassNetDir,
     SysClassLoop0Dir,
     SysClassLoop0BdiDir,
+    SysClassNetLoDir,
+    SysClassNetVeth1Dir,
+    SysClassNetVeth2Dir,
     SysDevicesDir,
     SysDevicesVirtualDir,
     SysDevicesVirtualInputDir,
@@ -116,6 +132,21 @@ enum StaticNode {
     SysLoopDmaAlignment,
     SysLoopReadAheadKb,
     SysDevBlockTmpfsUevent,
+    SysClassNetLoAddress,
+    SysClassNetLoMtu,
+    SysClassNetLoOperstate,
+    SysClassNetLoFlags,
+    SysClassNetLoIfindex,
+    SysClassNetVeth1Address,
+    SysClassNetVeth1Mtu,
+    SysClassNetVeth1Operstate,
+    SysClassNetVeth1Flags,
+    SysClassNetVeth1Ifindex,
+    SysClassNetVeth2Address,
+    SysClassNetVeth2Mtu,
+    SysClassNetVeth2Operstate,
+    SysClassNetVeth2Flags,
+    SysClassNetVeth2Ifindex,
     #[cfg(target_arch = "loongarch64")]
     OptDir,
     #[cfg(target_arch = "loongarch64")]
@@ -218,9 +249,17 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
         "/sys/dev/block/254:0" | "/sys/dev/block/254:0/" => Some(StaticNode::SysDevBlockTmpfsDir),
         "/sys/class" | "/sys/class/" => Some(StaticNode::SysClassDir),
         "/sys/class/block" | "/sys/class/block/" => Some(StaticNode::SysClassBlockDir),
+        "/sys/class/net" | "/sys/class/net/" => Some(StaticNode::SysClassNetDir),
         "/sys/class/block/loop0" | "/sys/class/block/loop0/" => Some(StaticNode::SysClassLoop0Dir),
         "/sys/class/block/loop0/bdi" | "/sys/class/block/loop0/bdi/" => {
             Some(StaticNode::SysClassLoop0BdiDir)
+        }
+        "/sys/class/net/lo" | "/sys/class/net/lo/" => Some(StaticNode::SysClassNetLoDir),
+        "/sys/class/net/ltp_ns_veth1" | "/sys/class/net/ltp_ns_veth1/" => {
+            Some(StaticNode::SysClassNetVeth1Dir)
+        }
+        "/sys/class/net/ltp_ns_veth2" | "/sys/class/net/ltp_ns_veth2/" => {
+            Some(StaticNode::SysClassNetVeth2Dir)
         }
         "/sys/devices" | "/sys/devices/" => Some(StaticNode::SysDevicesDir),
         "/sys/devices/virtual" | "/sys/devices/virtual/" => Some(StaticNode::SysDevicesVirtualDir),
@@ -289,6 +328,21 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
         "/sys/block/loop0/queue/dma_alignment" => Some(StaticNode::SysLoopDmaAlignment),
         "/sys/class/block/loop0/bdi/read_ahead_kb" => Some(StaticNode::SysLoopReadAheadKb),
         "/sys/dev/block/254:0/uevent" => Some(StaticNode::SysDevBlockTmpfsUevent),
+        "/sys/class/net/lo/address" => Some(StaticNode::SysClassNetLoAddress),
+        "/sys/class/net/lo/mtu" => Some(StaticNode::SysClassNetLoMtu),
+        "/sys/class/net/lo/operstate" => Some(StaticNode::SysClassNetLoOperstate),
+        "/sys/class/net/lo/flags" => Some(StaticNode::SysClassNetLoFlags),
+        "/sys/class/net/lo/ifindex" => Some(StaticNode::SysClassNetLoIfindex),
+        "/sys/class/net/ltp_ns_veth1/address" => Some(StaticNode::SysClassNetVeth1Address),
+        "/sys/class/net/ltp_ns_veth1/mtu" => Some(StaticNode::SysClassNetVeth1Mtu),
+        "/sys/class/net/ltp_ns_veth1/operstate" => Some(StaticNode::SysClassNetVeth1Operstate),
+        "/sys/class/net/ltp_ns_veth1/flags" => Some(StaticNode::SysClassNetVeth1Flags),
+        "/sys/class/net/ltp_ns_veth1/ifindex" => Some(StaticNode::SysClassNetVeth1Ifindex),
+        "/sys/class/net/ltp_ns_veth2/address" => Some(StaticNode::SysClassNetVeth2Address),
+        "/sys/class/net/ltp_ns_veth2/mtu" => Some(StaticNode::SysClassNetVeth2Mtu),
+        "/sys/class/net/ltp_ns_veth2/operstate" => Some(StaticNode::SysClassNetVeth2Operstate),
+        "/sys/class/net/ltp_ns_veth2/flags" => Some(StaticNode::SysClassNetVeth2Flags),
+        "/sys/class/net/ltp_ns_veth2/ifindex" => Some(StaticNode::SysClassNetVeth2Ifindex),
         #[cfg(target_arch = "loongarch64")]
         "/opt" | "/opt/" => Some(StaticNode::OptDir),
         #[cfg(target_arch = "loongarch64")]
@@ -324,8 +378,12 @@ fn canonical_path(node: StaticNode) -> &'static str {
         StaticNode::SysDevBlockTmpfsDir => "/sys/dev/block/254:0",
         StaticNode::SysClassDir => "/sys/class",
         StaticNode::SysClassBlockDir => "/sys/class/block",
+        StaticNode::SysClassNetDir => "/sys/class/net",
         StaticNode::SysClassLoop0Dir => "/sys/class/block/loop0",
         StaticNode::SysClassLoop0BdiDir => "/sys/class/block/loop0/bdi",
+        StaticNode::SysClassNetLoDir => "/sys/class/net/lo",
+        StaticNode::SysClassNetVeth1Dir => "/sys/class/net/ltp_ns_veth1",
+        StaticNode::SysClassNetVeth2Dir => "/sys/class/net/ltp_ns_veth2",
         StaticNode::SysDevicesDir => "/sys/devices",
         StaticNode::SysDevicesVirtualDir => "/sys/devices/virtual",
         StaticNode::SysDevicesVirtualInputDir => "/sys/devices/virtual/input",
@@ -361,6 +419,21 @@ fn canonical_path(node: StaticNode) -> &'static str {
         StaticNode::SysLoopDmaAlignment => "/sys/block/loop0/queue/dma_alignment",
         StaticNode::SysLoopReadAheadKb => "/sys/class/block/loop0/bdi/read_ahead_kb",
         StaticNode::SysDevBlockTmpfsUevent => "/sys/dev/block/254:0/uevent",
+        StaticNode::SysClassNetLoAddress => "/sys/class/net/lo/address",
+        StaticNode::SysClassNetLoMtu => "/sys/class/net/lo/mtu",
+        StaticNode::SysClassNetLoOperstate => "/sys/class/net/lo/operstate",
+        StaticNode::SysClassNetLoFlags => "/sys/class/net/lo/flags",
+        StaticNode::SysClassNetLoIfindex => "/sys/class/net/lo/ifindex",
+        StaticNode::SysClassNetVeth1Address => "/sys/class/net/ltp_ns_veth1/address",
+        StaticNode::SysClassNetVeth1Mtu => "/sys/class/net/ltp_ns_veth1/mtu",
+        StaticNode::SysClassNetVeth1Operstate => "/sys/class/net/ltp_ns_veth1/operstate",
+        StaticNode::SysClassNetVeth1Flags => "/sys/class/net/ltp_ns_veth1/flags",
+        StaticNode::SysClassNetVeth1Ifindex => "/sys/class/net/ltp_ns_veth1/ifindex",
+        StaticNode::SysClassNetVeth2Address => "/sys/class/net/ltp_ns_veth2/address",
+        StaticNode::SysClassNetVeth2Mtu => "/sys/class/net/ltp_ns_veth2/mtu",
+        StaticNode::SysClassNetVeth2Operstate => "/sys/class/net/ltp_ns_veth2/operstate",
+        StaticNode::SysClassNetVeth2Flags => "/sys/class/net/ltp_ns_veth2/flags",
+        StaticNode::SysClassNetVeth2Ifindex => "/sys/class/net/ltp_ns_veth2/ifindex",
         #[cfg(target_arch = "loongarch64")]
         StaticNode::OptDir => "/opt",
         #[cfg(target_arch = "loongarch64")]
@@ -421,6 +494,21 @@ fn content(node: StaticNode) -> Option<Vec<u8>> {
             super::devfs::loop_device_sysfs_content("/sys/class/block/loop0/bdi/read_ahead_kb")
         }
         StaticNode::SysDevBlockTmpfsUevent => Some(SYS_DEV_BLOCK_TMPFS_UEVENT.to_vec()),
+        StaticNode::SysClassNetLoAddress => Some(SYS_NET_LO_ADDRESS.to_vec()),
+        StaticNode::SysClassNetLoMtu => Some(SYS_NET_LO_MTU.to_vec()),
+        StaticNode::SysClassNetLoOperstate => Some(SYS_NET_LO_OPERSTATE.to_vec()),
+        StaticNode::SysClassNetLoFlags => Some(SYS_NET_LO_FLAGS.to_vec()),
+        StaticNode::SysClassNetLoIfindex => Some(SYS_NET_LO_IFINDEX.to_vec()),
+        StaticNode::SysClassNetVeth1Address => Some(SYS_NET_VETH1_ADDRESS.to_vec()),
+        StaticNode::SysClassNetVeth1Mtu => Some(SYS_NET_VETH_MTU.to_vec()),
+        StaticNode::SysClassNetVeth1Operstate => Some(SYS_NET_VETH_OPERSTATE.to_vec()),
+        StaticNode::SysClassNetVeth1Flags => Some(SYS_NET_VETH_FLAGS.to_vec()),
+        StaticNode::SysClassNetVeth1Ifindex => Some(SYS_NET_VETH1_IFINDEX.to_vec()),
+        StaticNode::SysClassNetVeth2Address => Some(SYS_NET_VETH2_ADDRESS.to_vec()),
+        StaticNode::SysClassNetVeth2Mtu => Some(SYS_NET_VETH_MTU.to_vec()),
+        StaticNode::SysClassNetVeth2Operstate => Some(SYS_NET_VETH_OPERSTATE.to_vec()),
+        StaticNode::SysClassNetVeth2Flags => Some(SYS_NET_VETH_FLAGS.to_vec()),
+        StaticNode::SysClassNetVeth2Ifindex => Some(SYS_NET_VETH2_IFINDEX.to_vec()),
         StaticNode::EtcDir
         | StaticNode::LibDir
         | StaticNode::LibModulesDir
@@ -438,8 +526,12 @@ fn content(node: StaticNode) -> Option<Vec<u8>> {
         | StaticNode::SysDevBlockTmpfsDir
         | StaticNode::SysClassDir
         | StaticNode::SysClassBlockDir
+        | StaticNode::SysClassNetDir
         | StaticNode::SysClassLoop0Dir
         | StaticNode::SysClassLoop0BdiDir
+        | StaticNode::SysClassNetLoDir
+        | StaticNode::SysClassNetVeth1Dir
+        | StaticNode::SysClassNetVeth2Dir
         | StaticNode::SysDevicesDir
         | StaticNode::SysDevicesVirtualDir
         | StaticNode::SysDevicesVirtualInputDir
@@ -472,8 +564,12 @@ fn is_dir(node: StaticNode) -> bool {
         | StaticNode::SysDevBlockTmpfsDir
         | StaticNode::SysClassDir
         | StaticNode::SysClassBlockDir
+        | StaticNode::SysClassNetDir
         | StaticNode::SysClassLoop0Dir
         | StaticNode::SysClassLoop0BdiDir
+        | StaticNode::SysClassNetLoDir
+        | StaticNode::SysClassNetVeth1Dir
+        | StaticNode::SysClassNetVeth2Dir
         | StaticNode::SysDevicesDir
         | StaticNode::SysDevicesVirtualDir
         | StaticNode::SysDevicesVirtualInputDir
@@ -551,6 +647,25 @@ fn stat_node(node: StaticNode) -> FileStat {
         StaticNode::SysClassLoop0BdiDir => 46,
         StaticNode::SysLoopReadAheadKb => 47,
         StaticNode::SysDevBlockTmpfsUevent => 38,
+        StaticNode::SysClassNetDir => 57,
+        StaticNode::SysClassNetLoDir => 58,
+        StaticNode::SysClassNetVeth1Dir => 59,
+        StaticNode::SysClassNetVeth2Dir => 60,
+        StaticNode::SysClassNetLoAddress => 61,
+        StaticNode::SysClassNetLoMtu => 62,
+        StaticNode::SysClassNetLoOperstate => 63,
+        StaticNode::SysClassNetLoFlags => 64,
+        StaticNode::SysClassNetLoIfindex => 65,
+        StaticNode::SysClassNetVeth1Address => 66,
+        StaticNode::SysClassNetVeth1Mtu => 67,
+        StaticNode::SysClassNetVeth1Operstate => 68,
+        StaticNode::SysClassNetVeth1Flags => 69,
+        StaticNode::SysClassNetVeth1Ifindex => 70,
+        StaticNode::SysClassNetVeth2Address => 71,
+        StaticNode::SysClassNetVeth2Mtu => 72,
+        StaticNode::SysClassNetVeth2Operstate => 73,
+        StaticNode::SysClassNetVeth2Flags => 74,
+        StaticNode::SysClassNetVeth2Ifindex => 75,
         #[cfg(target_arch = "loongarch64")]
         StaticNode::OptDir => 8,
         #[cfg(target_arch = "loongarch64")]
@@ -612,6 +727,106 @@ fn dir_entry(node: StaticNode, name: &str, dtype: u8) -> RawDirEntry {
 fn dir_entries(node: StaticNode) -> Option<Vec<RawDirEntry>> {
     let mut entries = Vec::new();
     match node {
+        StaticNode::SysDir => {
+            entries.push(dir_entry(StaticNode::SysDir, ".", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysDir, "..", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysBlockDir, "block", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysDevDir, "dev", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysClassDir, "class", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysDevicesDir, "devices", DT_DIR));
+        }
+        StaticNode::SysClassDir => {
+            entries.push(dir_entry(StaticNode::SysClassDir, ".", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysDir, "..", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysClassBlockDir, "block", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysClassNetDir, "net", DT_DIR));
+        }
+        StaticNode::SysClassNetDir => {
+            entries.push(dir_entry(StaticNode::SysClassNetDir, ".", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysClassDir, "..", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysClassNetLoDir, "lo", DT_DIR));
+            entries.push(dir_entry(
+                StaticNode::SysClassNetVeth1Dir,
+                "ltp_ns_veth1",
+                DT_DIR,
+            ));
+            entries.push(dir_entry(
+                StaticNode::SysClassNetVeth2Dir,
+                "ltp_ns_veth2",
+                DT_DIR,
+            ));
+        }
+        StaticNode::SysClassNetLoDir => {
+            entries.push(dir_entry(StaticNode::SysClassNetLoDir, ".", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysClassNetDir, "..", DT_DIR));
+            entries.push(dir_entry(
+                StaticNode::SysClassNetLoAddress,
+                "address",
+                DT_REG,
+            ));
+            entries.push(dir_entry(StaticNode::SysClassNetLoMtu, "mtu", DT_REG));
+            entries.push(dir_entry(
+                StaticNode::SysClassNetLoOperstate,
+                "operstate",
+                DT_REG,
+            ));
+            entries.push(dir_entry(StaticNode::SysClassNetLoFlags, "flags", DT_REG));
+            entries.push(dir_entry(
+                StaticNode::SysClassNetLoIfindex,
+                "ifindex",
+                DT_REG,
+            ));
+        }
+        StaticNode::SysClassNetVeth1Dir => {
+            entries.push(dir_entry(StaticNode::SysClassNetVeth1Dir, ".", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysClassNetDir, "..", DT_DIR));
+            entries.push(dir_entry(
+                StaticNode::SysClassNetVeth1Address,
+                "address",
+                DT_REG,
+            ));
+            entries.push(dir_entry(StaticNode::SysClassNetVeth1Mtu, "mtu", DT_REG));
+            entries.push(dir_entry(
+                StaticNode::SysClassNetVeth1Operstate,
+                "operstate",
+                DT_REG,
+            ));
+            entries.push(dir_entry(
+                StaticNode::SysClassNetVeth1Flags,
+                "flags",
+                DT_REG,
+            ));
+            entries.push(dir_entry(
+                StaticNode::SysClassNetVeth1Ifindex,
+                "ifindex",
+                DT_REG,
+            ));
+        }
+        StaticNode::SysClassNetVeth2Dir => {
+            entries.push(dir_entry(StaticNode::SysClassNetVeth2Dir, ".", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysClassNetDir, "..", DT_DIR));
+            entries.push(dir_entry(
+                StaticNode::SysClassNetVeth2Address,
+                "address",
+                DT_REG,
+            ));
+            entries.push(dir_entry(StaticNode::SysClassNetVeth2Mtu, "mtu", DT_REG));
+            entries.push(dir_entry(
+                StaticNode::SysClassNetVeth2Operstate,
+                "operstate",
+                DT_REG,
+            ));
+            entries.push(dir_entry(
+                StaticNode::SysClassNetVeth2Flags,
+                "flags",
+                DT_REG,
+            ));
+            entries.push(dir_entry(
+                StaticNode::SysClassNetVeth2Ifindex,
+                "ifindex",
+                DT_REG,
+            ));
+        }
         StaticNode::LibModulesDir => {
             entries.push(dir_entry(StaticNode::LibModulesDir, ".", DT_DIR));
             entries.push(dir_entry(StaticNode::LibDir, "..", DT_DIR));

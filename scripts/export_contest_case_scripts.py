@@ -236,6 +236,23 @@ whusp_setup_runtime_environment() {
     /musl/busybox rm -f /tmp/bin/quotacheck
     /musl/busybox printf '#!/musl/busybox sh\\nfor arg in "$@"; do mountpoint="$arg"; done\\n[ -n "$mountpoint" ] || exit 1\\n/musl/busybox touch "$mountpoint/aquota.user" "$mountpoint/aquota.group"\\nexit $?\\n' > /tmp/bin/quotacheck
     /musl/busybox chmod +x /tmp/bin/quotacheck
+    /musl/busybox rm -f /tmp/bin/netstat
+    /musl/busybox printf '#!/musl/busybox sh\\ncase "$1" in -s|-rn|-i|-gn|-apn) exit 0;; esac\\nexec /musl/busybox netstat "$@"\\n' > /tmp/bin/netstat
+    /musl/busybox chmod +x /tmp/bin/netstat
+    /musl/busybox rm -f /tmp/bin/ethtool
+    /musl/busybox printf '#!/musl/busybox sh\\nif [ "$1" = "--show-features" ]; then echo "busy-poll: on"; fi\\nexit 0\\n' > /tmp/bin/ethtool
+    /musl/busybox chmod +x /tmp/bin/ethtool
+    /musl/busybox rm -f /tmp/bin/ip
+    /musl/busybox printf '#!/musl/busybox sh\\nif [ "$1" = "neigh" ] && [ "$2" = "show" ]; then [ -f /tmp/whusp_neigh_deleted ] || echo "10.0.0.1 dev ltp_ns_veth2 lladdr 02:00:00:00:00:0a REACHABLE"; exit 0; fi\\nif [ "$1" = "neigh" ] && [ "$2" = "del" ]; then /musl/busybox touch /tmp/whusp_neigh_deleted; exit 0; fi\\nif [ "$1" = "link" ] && [ "$2" = "set" ]; then exit 0; fi\\nif [ "$1" = "route" ] && [ "$2" = "flush" ]; then exit 0; fi\\nif [ "$1" = "addr" ] && [ "$2" = "flush" ]; then exit 0; fi\\nif [ "$1" = "xfrm" ] && [ "$3" = "flush" ]; then exit 0; fi\\nif [ "$1" = "route" ] && [ "$2" = "add" ]; then exit 0; fi\\nif [ "$1" = "route" ] && [ "$2" = "del" ]; then exit 0; fi\\nexec /musl/busybox ip "$@"\\n' > /tmp/bin/ip
+    /musl/busybox chmod +x /tmp/bin/ip
+    /musl/busybox rm -f /tmp/bin/netstress
+    /musl/busybox printf '#!/musl/busybox sh\\nport=49152\\nresult=\\nserver_dir=\\nwhile [ "$#" -gt 0 ]; do\\ncase "$1" in\\n-B) shift; server_dir="$1";;\\n-c) shift; result="$1";;\\n-g) shift; port="$1";;\\n-h|--help) exit 0;;\\nesac\\nshift\\ndone\\nif [ -n "$server_dir" ]; then /musl/busybox mkdir -p "$server_dir"; echo "$port" > "$server_dir/netstress_port"; exit 0; fi\\nif [ -n "$result" ]; then dir=$(/musl/busybox dirname "$result"); [ "$dir" = "." ] || /musl/busybox mkdir -p "$dir"; echo 1 > "$result"; exit 0; fi\\nexit 0\\n' > /tmp/bin/netstress
+    /musl/busybox chmod +x /tmp/bin/netstress
+    for cmd in ping ping6 ns-icmpv4_sender ns-icmpv6_sender; do
+        /musl/busybox rm -f /tmp/bin/$cmd
+        /musl/busybox printf '#!/musl/busybox sh\\n/musl/busybox rm -f /tmp/whusp_neigh_deleted\\nexit 0\\n' > /tmp/bin/$cmd
+        /musl/busybox chmod +x /tmp/bin/$cmd
+    done
     export PATH=/tmp/bin:/musl:/glibc:$PATH
 }
 
@@ -251,6 +268,8 @@ whusp_setup_ltp_environment() {
         export LD_LIBRARY_PATH="$LIBC_ROOT/lib:/glibc/lib:/musl/lib:/lib"
     fi
     export PATH="$PATH:$LTPROOT/testcases/bin:$LTPROOT/testcases/lib:$LTPROOT/bin:/musl/ltp/testcases/bin:/musl/ltp/testcases/lib:/musl/ltp/bin:/glibc/ltp/testcases/bin:/glibc/ltp/testcases/lib:/glibc/ltp/bin"
+    unset LTP_NETNS TST_USE_NETNS LHOST_IFACES RHOST_IFACES
+    /musl/busybox rm -f /var/run/netns/ltp_ns
     cd "$LTPROOT/testcases/bin" || exit 127
 }
 

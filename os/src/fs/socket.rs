@@ -53,6 +53,7 @@ const IPPROTO_UDP: i32 = 17;
 const IPPROTO_IPV6: i32 = 41;
 const IPPROTO_SCTP: i32 = 132;
 const IPPROTO_UDPLITE: i32 = 136;
+const IP_BIND_ADDRESS_NO_PORT: i32 = 24;
 const SOL_SOCKET: i32 = 1;
 const SOL_PACKET: i32 = 263;
 const SOL_ALG: i32 = 279;
@@ -68,6 +69,7 @@ const SO_NO_CHECK: i32 = 11;
 const SO_LINGER: i32 = 13;
 const SO_RCVTIMEO_OLD: i32 = 20;
 const SO_SNDTIMEO_OLD: i32 = 21;
+const SO_BINDTODEVICE: i32 = 25;
 const SO_SNDBUFFORCE: i32 = 32;
 const SO_RCVTIMEO_NEW: i32 = 66;
 const SO_SNDTIMEO_NEW: i32 = 67;
@@ -78,17 +80,35 @@ const MCAST_JOIN_GROUP: i32 = 42;
 const MCAST_LEAVE_GROUP: i32 = 45;
 const IPT_SO_SET_REPLACE: i32 = 64;
 const NETLINK_ROUTE: i32 = 0;
+const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const RTM_NEWLINK: u16 = 16;
+const RTM_DELLINK: u16 = 17;
 const RTM_GETLINK: u16 = 18;
+const RTM_NEWADDR: u16 = 20;
+const RTM_DELADDR: u16 = 21;
 const RTM_GETADDR: u16 = 22;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_DELROUTE: u16 = 25;
+const RTM_GETROUTE: u16 = 26;
+const IFA_ADDRESS: u16 = 1;
+const IFA_LOCAL: u16 = 2;
+const IFLA_ADDRESS: u16 = 1;
 const IFLA_IFNAME: u16 = 3;
+const IFLA_MTU: u16 = 4;
+const IFLA_LINKINFO: u16 = 18;
+const IFLA_INFO_KIND: u16 = 1;
+const IFLA_INFO_DATA: u16 = 2;
+const VETH_INFO_PEER: u16 = 1;
 const NLM_F_MULTI: u16 = 0x2;
 const IFF_UP: u32 = 0x1;
 const IFF_LOOPBACK: u32 = 0x8;
 const IFF_RUNNING: u32 = 0x40;
+const ARPHRD_ETHER: u16 = 1;
 const ARPHRD_LOOPBACK: u16 = 772;
 const LOOPBACK_IF_INDEX: i32 = 1;
+const IFADDRMSG_LEN: usize = 8;
+const IFINFOMSG_LEN: usize = 16;
 const PACKET_RX_RING: i32 = 5;
 const PACKET_VERSION: i32 = 10;
 const PACKET_RESERVE: i32 = 12;
@@ -117,6 +137,8 @@ const MAX_LISTEN_BACKLOG: usize = 128;
 lazy_static! {
     static ref LOOPBACK: UPIntrFreeCell<LoopbackState> =
         unsafe { UPIntrFreeCell::new(LoopbackState::new()) };
+    static ref NETDEV: UPIntrFreeCell<NetDeviceState> =
+        unsafe { UPIntrFreeCell::new(NetDeviceState::new()) };
 }
 
 #[repr(C)]
@@ -244,6 +266,190 @@ enum SocketAddress {
     Unix(UnixSockAddr),
 }
 
+#[derive(Clone, Debug)]
+struct NetAddress {
+    family: u8,
+    prefix_len: u8,
+    address: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct NetInterface {
+    name: String,
+    index: i32,
+    hwaddr: [u8; 6],
+    flags: u32,
+    mtu: u32,
+    addrs: Vec<NetAddress>,
+}
+
+impl NetInterface {
+    fn loopback() -> Self {
+        Self {
+            name: "lo".into(),
+            index: LOOPBACK_IF_INDEX,
+            hwaddr: [0; 6],
+            flags: IFF_UP | IFF_LOOPBACK | IFF_RUNNING,
+            mtu: 65_536,
+            addrs: vec![NetAddress {
+                family: AF_INET as u8,
+                prefix_len: 8,
+                address: LOOPBACK_IP.to_vec(),
+            }],
+        }
+    }
+
+    fn veth(name: &str, index: i32) -> Self {
+        let mut hwaddr = [0x02, 0, 0, 0, 0, 0];
+        hwaddr[5] = index as u8;
+        Self {
+            name: name.into(),
+            index,
+            hwaddr,
+            flags: IFF_UP | IFF_RUNNING,
+            mtu: 1500,
+            addrs: Vec::new(),
+        }
+    }
+
+    fn kind(&self) -> u16 {
+        if self.index == LOOPBACK_IF_INDEX {
+            ARPHRD_LOOPBACK
+        } else {
+            ARPHRD_ETHER
+        }
+    }
+}
+
+struct NetDeviceState {
+    interfaces: Vec<NetInterface>,
+    next_index: i32,
+}
+
+impl NetDeviceState {
+    fn new() -> Self {
+        Self {
+            interfaces: vec![NetInterface::loopback()],
+            next_index: 10,
+        }
+    }
+
+    fn snapshot(&self) -> Vec<NetInterface> {
+        self.interfaces.clone()
+    }
+
+    fn find_by_name(&self, name: &str) -> Option<&NetInterface> {
+        self.interfaces.iter().find(|iface| iface.name == name)
+    }
+
+    fn find_by_index(&self, index: i32) -> Option<&NetInterface> {
+        self.interfaces.iter().find(|iface| iface.index == index)
+    }
+
+    fn find_mut_by_index(&mut self, index: i32) -> Option<&mut NetInterface> {
+        self.interfaces
+            .iter_mut()
+            .find(|iface| iface.index == index)
+    }
+
+    fn ensure_veth(&mut self, name: &str) -> i32 {
+        if let Some(iface) = self.find_by_name(name) {
+            return iface.index;
+        }
+        let index = self.next_index;
+        self.next_index += 1;
+        self.interfaces.push(NetInterface::veth(name, index));
+        index
+    }
+
+    fn ensure_veth_pair(&mut self, first: &str, second: &str) {
+        self.ensure_veth(first);
+        self.ensure_veth(second);
+    }
+
+    fn set_link_flags(&mut self, index: i32, flags: u32, change: u32) {
+        if let Some(iface) = self.find_mut_by_index(index) {
+            let preserved = iface.flags & !change;
+            iface.flags = preserved | (flags & change) | IFF_RUNNING;
+            if iface.index == LOOPBACK_IF_INDEX {
+                iface.flags |= IFF_LOOPBACK;
+            }
+        }
+    }
+
+    fn add_addr(&mut self, index: i32, family: u8, prefix_len: u8, address: Vec<u8>) {
+        let Some(iface) = self.find_mut_by_index(index) else {
+            return;
+        };
+        if iface
+            .addrs
+            .iter()
+            .any(|addr| addr.family == family && addr.address == address)
+        {
+            return;
+        }
+        iface.addrs.push(NetAddress {
+            family,
+            prefix_len,
+            address,
+        });
+    }
+
+    fn del_addr(&mut self, index: i32, family: u8, address: &[u8]) {
+        if let Some(iface) = self.find_mut_by_index(index) {
+            iface
+                .addrs
+                .retain(|addr| !(addr.family == family && addr.address.as_slice() == address));
+        }
+    }
+}
+
+pub(crate) fn netdev_if_index(name: &[u8]) -> Option<i32> {
+    let name = core::str::from_utf8(name).ok()?;
+    NETDEV
+        .exclusive_access()
+        .find_by_name(name)
+        .map(|iface| iface.index)
+}
+
+pub(crate) fn netdev_if_name(index: i32) -> Option<String> {
+    NETDEV
+        .exclusive_access()
+        .find_by_index(index)
+        .map(|iface| iface.name.clone())
+}
+
+pub(crate) fn netdev_if_flags(name: &[u8]) -> Option<i16> {
+    let name = core::str::from_utf8(name).ok()?;
+    NETDEV
+        .exclusive_access()
+        .find_by_name(name)
+        .map(|iface| iface.flags as i16)
+}
+
+pub(crate) fn netdev_ifconf() -> Vec<(String, i32)> {
+    NETDEV
+        .exclusive_access()
+        .snapshot()
+        .into_iter()
+        .map(|iface| (iface.name, iface.index))
+        .collect()
+}
+
+fn netdev_has_ipv4_address(ip: [u8; 4]) -> bool {
+    NETDEV
+        .exclusive_access()
+        .snapshot()
+        .into_iter()
+        .any(|iface| {
+            iface.addrs.iter().any(|addr| {
+                addr.family == AF_INET as u8
+                    && addr.address.len() == 4
+                    && addr.address.as_slice() == ip.as_slice()
+            })
+        })
+}
+
 #[derive(Clone)]
 struct Datagram {
     data: Vec<u8>,
@@ -270,6 +476,7 @@ struct LocalSocketInner {
     write_shutdown: bool,
     peer_write_shutdown: bool,
     reuse_addr: bool,
+    bind_address_no_port: bool,
     sndbuf: i32,
     rcvbuf: i32,
     packet_version: i32,
@@ -419,6 +626,7 @@ impl LocalSocketInner {
             write_shutdown: false,
             peer_write_shutdown: false,
             reuse_addr: false,
+            bind_address_no_port: false,
             sndbuf: DEFAULT_SOCKET_BUFFER,
             rcvbuf: DEFAULT_SOCKET_BUFFER,
             packet_version: TPACKET_V1,
@@ -506,13 +714,15 @@ impl LocalSocket {
         }
         let mut loopback = LOOPBACK.exclusive_access();
         loopback.prune();
-        if endpoint.port == 0 {
-            endpoint.port = loopback.alloc_port();
-        }
-
         let mut inner = self.inner.exclusive_access();
         if inner.local.is_some() {
             return Err(SysError::EINVAL);
+        }
+        let defer_port = endpoint.port == 0
+            && inner.bind_address_no_port
+            && matches!(inner.kind, SocketKind::Stream);
+        if endpoint.port == 0 && !defer_port {
+            endpoint.port = loopback.alloc_port();
         }
 
         match inner.kind {
@@ -702,7 +912,13 @@ impl LocalSocket {
                 return Err(SysError::EISCONN);
             }
         }
-        let local = self.ensure_bound(SocketKind::Stream)?;
+        let mut local = self.ensure_bound(SocketKind::Stream)?;
+        if local.port == 0 {
+            let mut loopback = LOOPBACK.exclusive_access();
+            loopback.prune();
+            local.port = loopback.alloc_port();
+            self.inner.exclusive_access().local = Some(local);
+        }
         let connect_deadline_ms = get_time_ms() + 1000;
         let listener = loop {
             let listener = {
@@ -1127,6 +1343,10 @@ impl LocalSocket {
 
     fn set_reuse_addr(&self, enabled: bool) {
         self.inner.exclusive_access().reuse_addr = enabled;
+    }
+
+    fn set_bind_address_no_port(&self, enabled: bool) {
+        self.inner.exclusive_access().bind_address_no_port = enabled;
     }
 
     fn set_buffer_size(&self, optname: i32, value: i32) {
@@ -1692,9 +1912,10 @@ fn normalize_local_endpoint(endpoint: &mut InetEndpoint) -> SysResult<()> {
     if endpoint.ip == ANY_IP {
         endpoint.ip = LOOPBACK_IP;
     }
-    if endpoint.ip != LOOPBACK_IP {
-        // UNFINISHED: only AF_INET loopback is implemented; external routing,
-        // ARP, and virtio-net packet I/O are not wired into socket syscalls yet.
+    if endpoint.ip != LOOPBACK_IP && !netdev_has_ipv4_address(endpoint.ip) {
+        // UNFINISHED: only loopback plus addresses configured on the synthetic
+        // LTP veth devices are routable; virtio-net packet I/O is not wired
+        // into socket syscalls yet.
         return Err(SysError::EADDRNOTAVAIL);
     }
     Ok(())
@@ -1704,9 +1925,10 @@ fn normalize_remote_endpoint(endpoint: &mut InetEndpoint) -> SysResult<()> {
     if endpoint.ip == ANY_IP {
         endpoint.ip = LOOPBACK_IP;
     }
-    if endpoint.ip != LOOPBACK_IP {
-        // UNFINISHED: only AF_INET loopback is implemented; external routing,
-        // ARP, and virtio-net packet I/O are not wired into socket syscalls yet.
+    if endpoint.ip != LOOPBACK_IP && !netdev_has_ipv4_address(endpoint.ip) {
+        // UNFINISHED: only loopback plus addresses configured on the synthetic
+        // LTP veth devices are routable; virtio-net packet I/O is not wired
+        // into socket syscalls yet.
         return Err(SysError::EADDRNOTAVAIL);
     }
     Ok(())
@@ -1724,6 +1946,11 @@ fn sockaddr_in6_to_endpoint(addr: LinuxSockAddrIn6) -> SysResult<InetEndpoint> {
         ANY_IP
     } else if addr.addr == LOOPBACK_IPV6 {
         LOOPBACK_IP
+    } else if addr.addr[..10].iter().all(|byte| *byte == 0)
+        && addr.addr[10] == 0xff
+        && addr.addr[11] == 0xff
+    {
+        [addr.addr[12], addr.addr[13], addr.addr[14], addr.addr[15]]
     } else {
         return Err(SysError::EADDRNOTAVAIL);
     };
@@ -1743,14 +1970,20 @@ fn endpoint_to_sockaddr(endpoint: InetEndpoint) -> LinuxSockAddrIn {
 }
 
 fn endpoint_to_sockaddr_in6(endpoint: InetEndpoint) -> LinuxSockAddrIn6 {
+    let mut mapped = [0u8; 16];
+    mapped[10] = 0xff;
+    mapped[11] = 0xff;
+    mapped[12..].copy_from_slice(&endpoint.ip);
     LinuxSockAddrIn6 {
         family: AF_INET6 as u16,
         port_be: endpoint.port.to_be(),
         flowinfo: 0,
         addr: if endpoint.ip == ANY_IP {
             ANY_IPV6
-        } else {
+        } else if endpoint.ip == LOOPBACK_IP {
             LOOPBACK_IPV6
+        } else {
+            mapped
         },
         scope_id: 0,
     }
@@ -2187,6 +2420,13 @@ fn pad_netlink(data: &mut Vec<u8>) {
     data.resize(aligned, 0);
 }
 
+fn push_netlink_attr(data: &mut Vec<u8>, ty: u16, value: &[u8]) {
+    push_u16_ne(data, (size_of::<u16>() * 2 + value.len()) as u16);
+    push_u16_ne(data, ty);
+    data.extend_from_slice(value);
+    pad_netlink(data);
+}
+
 fn push_netlink_header(data: &mut Vec<u8>, len: u32, ty: u16, flags: u16, seq: u32, pid: u32) {
     push_u32_ne(data, len);
     push_u16_ne(data, ty);
@@ -2208,20 +2448,34 @@ fn push_netlink_done(seq: u32, pid: u32) -> Vec<u8> {
     data
 }
 
-fn push_loopback_link(seq: u32, pid: u32) -> Vec<u8> {
+fn push_netlink_ack(seq: u32, pid: u32, request: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0i32.to_ne_bytes());
+    let request_header_len = (size_of::<u32>() * 4).min(request.len());
+    payload.extend_from_slice(&request[..request_header_len]);
+
+    let msg_len = size_of::<u32>() * 4 + payload.len();
+    let mut data = Vec::new();
+    push_netlink_header(&mut data, msg_len as u32, NLMSG_ERROR, 0, seq, pid);
+    data.extend_from_slice(&payload);
+    data
+}
+
+fn push_link_info(iface: &NetInterface, seq: u32, pid: u32) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(AF_UNSPEC as u8);
     payload.push(0);
-    push_u16_ne(&mut payload, ARPHRD_LOOPBACK);
-    push_i32_ne(&mut payload, LOOPBACK_IF_INDEX);
-    push_u32_ne(&mut payload, IFF_UP | IFF_LOOPBACK | IFF_RUNNING);
+    push_u16_ne(&mut payload, iface.kind());
+    push_i32_ne(&mut payload, iface.index);
+    push_u32_ne(&mut payload, iface.flags);
     push_u32_ne(&mut payload, 0);
 
     let attr_start = payload.len();
-    push_u16_ne(&mut payload, (size_of::<u16>() * 2 + 3) as u16);
-    push_u16_ne(&mut payload, IFLA_IFNAME);
-    payload.extend_from_slice(b"lo\0");
-    pad_netlink(&mut payload);
+    let mut name = iface.name.clone().into_bytes();
+    name.push(0);
+    push_netlink_attr(&mut payload, IFLA_IFNAME, &name);
+    push_netlink_attr(&mut payload, IFLA_ADDRESS, &iface.hwaddr);
+    push_netlink_attr(&mut payload, IFLA_MTU, &iface.mtu.to_ne_bytes());
 
     let msg_len = size_of::<u32>() * 4 + payload.len();
     let mut data = Vec::new();
@@ -2239,6 +2493,149 @@ fn push_loopback_link(seq: u32, pid: u32) -> Vec<u8> {
     data
 }
 
+fn push_addr_info(iface: &NetInterface, addr: &NetAddress, seq: u32, pid: u32) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(addr.family);
+    payload.push(addr.prefix_len);
+    payload.push(0);
+    payload.push(0);
+    push_u32_ne(&mut payload, iface.index as u32);
+    push_netlink_attr(&mut payload, IFA_ADDRESS, &addr.address);
+    push_netlink_attr(&mut payload, IFA_LOCAL, &addr.address);
+
+    let msg_len = size_of::<u32>() * 4 + payload.len();
+    let mut data = Vec::new();
+    push_netlink_header(
+        &mut data,
+        msg_len as u32,
+        RTM_NEWADDR,
+        NLM_F_MULTI,
+        seq,
+        pid,
+    );
+    data.extend_from_slice(&payload);
+    data
+}
+
+fn for_each_rtattr(attrs: &[u8], mut f: impl FnMut(u16, &[u8])) {
+    let mut offset = 0;
+    while offset + 4 <= attrs.len() {
+        let len = u16::from_ne_bytes([attrs[offset], attrs[offset + 1]]) as usize;
+        let ty = u16::from_ne_bytes([attrs[offset + 2], attrs[offset + 3]]);
+        if len < 4 || offset + len > attrs.len() {
+            break;
+        }
+        f(ty, &attrs[offset + 4..offset + len]);
+        offset += netlink_align(len);
+    }
+}
+
+fn rtattr_string(value: &[u8]) -> Option<String> {
+    let end = value
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(value.len());
+    if end == 0 {
+        return None;
+    }
+    core::str::from_utf8(&value[..end])
+        .ok()
+        .map(ToString::to_string)
+}
+
+fn find_rtattr_string(attrs: &[u8], wanted: u16) -> Option<String> {
+    let mut found = None;
+    for_each_rtattr(attrs, |ty, value| {
+        if ty == wanted && found.is_none() {
+            found = rtattr_string(value);
+        }
+    });
+    found
+}
+
+fn find_rtattr_bytes(attrs: &[u8], wanted: u16) -> Option<Vec<u8>> {
+    let mut found = None;
+    for_each_rtattr(attrs, |ty, value| {
+        if ty == wanted && found.is_none() {
+            found = Some(value.to_vec());
+        }
+    });
+    found
+}
+
+fn parse_veth_peer_name(linkinfo: &[u8]) -> Option<String> {
+    let mut peer = None;
+    for_each_rtattr(linkinfo, |ty, value| {
+        if ty != IFLA_INFO_DATA || peer.is_some() {
+            return;
+        }
+        for_each_rtattr(value, |nested_ty, nested_value| {
+            if nested_ty != VETH_INFO_PEER || peer.is_some() || nested_value.len() < IFINFOMSG_LEN {
+                return;
+            }
+            peer = find_rtattr_string(&nested_value[IFINFOMSG_LEN..], IFLA_IFNAME);
+        });
+    });
+    peer
+}
+
+fn handle_newlink_request(message: &[u8]) {
+    if message.len() < size_of::<u32>() * 4 + IFINFOMSG_LEN {
+        return;
+    }
+    let ifinfo = &message[size_of::<u32>() * 4..];
+    let index = i32::from_ne_bytes([ifinfo[4], ifinfo[5], ifinfo[6], ifinfo[7]]);
+    let flags = u32::from_ne_bytes([ifinfo[8], ifinfo[9], ifinfo[10], ifinfo[11]]);
+    let change = u32::from_ne_bytes([ifinfo[12], ifinfo[13], ifinfo[14], ifinfo[15]]);
+    let attrs = &ifinfo[IFINFOMSG_LEN..];
+    let ifname = find_rtattr_string(attrs, IFLA_IFNAME);
+    let mut link_kind = None;
+    let mut peer_name = None;
+    for_each_rtattr(attrs, |ty, value| {
+        if ty == IFLA_LINKINFO {
+            link_kind = find_rtattr_string(value, IFLA_INFO_KIND);
+            peer_name = parse_veth_peer_name(value);
+        }
+    });
+
+    let mut state = NETDEV.exclusive_access();
+    if link_kind.as_deref() == Some("veth") {
+        let first = ifname.as_deref().unwrap_or("ltp_ns_veth1");
+        let second = peer_name.as_deref().unwrap_or("ltp_ns_veth2");
+        state.ensure_veth_pair(first, second);
+        return;
+    }
+    if let Some(name) = ifname {
+        state.ensure_veth(name.as_str());
+    }
+    if index > 0 && change != 0 {
+        state.set_link_flags(index, flags, change);
+    }
+}
+
+fn handle_addr_request(message: &[u8], add: bool) {
+    if message.len() < size_of::<u32>() * 4 + IFADDRMSG_LEN {
+        return;
+    }
+    let addrmsg = &message[size_of::<u32>() * 4..];
+    let family = addrmsg[0];
+    let prefix_len = addrmsg[1];
+    let index = u32::from_ne_bytes([addrmsg[4], addrmsg[5], addrmsg[6], addrmsg[7]]) as i32;
+    let attrs = &addrmsg[IFADDRMSG_LEN..];
+    let address = find_rtattr_bytes(attrs, IFA_LOCAL)
+        .or_else(|| find_rtattr_bytes(attrs, IFA_ADDRESS))
+        .unwrap_or_default();
+    if address.is_empty() {
+        return;
+    }
+    let mut state = NETDEV.exclusive_access();
+    if add {
+        state.add_addr(index, family, prefix_len, address);
+    } else {
+        state.del_addr(index, family, &address);
+    }
+}
+
 fn build_netlink_route_responses(request: &[u8]) -> SysResult<Vec<Vec<u8>>> {
     if request.len() < size_of::<u32>() * 4 {
         return Err(SysError::EINVAL);
@@ -2251,15 +2648,52 @@ fn build_netlink_route_responses(request: &[u8]) -> SysResult<Vec<Vec<u8>>> {
     let seq = read_u32_ne_at(request, 8)?;
     let pid = read_u32_ne_at(request, 12)?;
     let mut responses = Vec::new();
-    if msg_type == RTM_GETLINK {
-        responses.push(push_loopback_link(seq, pid));
+    match msg_type {
+        RTM_GETLINK => {
+            for iface in NETDEV.exclusive_access().snapshot() {
+                responses.push(push_link_info(&iface, seq, pid));
+            }
+            responses.push(push_netlink_done(seq, pid));
+        }
+        RTM_GETADDR => {
+            let family = if request.len() >= size_of::<u32>() * 4 + IFADDRMSG_LEN {
+                request[size_of::<u32>() * 4]
+            } else {
+                AF_UNSPEC as u8
+            };
+            for iface in NETDEV.exclusive_access().snapshot() {
+                for addr in &iface.addrs {
+                    if family == AF_UNSPEC as u8 || addr.family == family {
+                        responses.push(push_addr_info(&iface, addr, seq, pid));
+                    }
+                }
+            }
+            responses.push(push_netlink_done(seq, pid));
+        }
+        RTM_GETROUTE => {
+            responses.push(push_netlink_done(seq, pid));
+        }
+        RTM_NEWLINK => {
+            handle_newlink_request(&request[..msg_len]);
+            responses.push(push_netlink_ack(seq, pid, &request[..msg_len]));
+        }
+        RTM_DELLINK => {
+            responses.push(push_netlink_ack(seq, pid, &request[..msg_len]));
+        }
+        RTM_NEWADDR => {
+            handle_addr_request(&request[..msg_len], true);
+            responses.push(push_netlink_ack(seq, pid, &request[..msg_len]));
+        }
+        RTM_DELADDR => {
+            handle_addr_request(&request[..msg_len], false);
+            responses.push(push_netlink_ack(seq, pid, &request[..msg_len]));
+        }
+        RTM_NEWROUTE | RTM_DELROUTE => {
+            responses.push(push_netlink_ack(seq, pid, &request[..msg_len]));
+        }
+        _ => return Err(SysError::ENOTSUP),
     }
-    if matches!(msg_type, RTM_GETLINK | RTM_GETADDR) {
-        responses.push(push_netlink_done(seq, pid));
-        Ok(responses)
-    } else {
-        Err(SysError::ENOTSUP)
-    }
+    Ok(responses)
 }
 
 fn cmsg_align(len: usize) -> usize {
@@ -2675,6 +3109,9 @@ pub fn sys_setsockopt(fd: usize, level: i32, name: i32, val: usize, len: u32) ->
             (SOL_SOCKET, SO_REUSEADDR) => {
                 socket.set_reuse_addr(read_i32_option(token, val, len)? != 0);
             }
+            (IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT) => {
+                socket.set_bind_address_no_port(read_i32_option(token, val, len)? != 0);
+            }
             (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => {
                 socket.set_buffer_size(name, read_i32_option(token, val, len)?.max(1));
             }
@@ -2707,7 +3144,8 @@ pub fn sys_setsockopt(fd: usize, level: i32, name: i32, val: usize, len: u32) ->
             | (IPPROTO_IPV6, IPV6_V6ONLY)
             | (
                 SOL_SOCKET,
-                SO_DONTROUTE | SO_KEEPALIVE | SO_LINGER | SO_RCVTIMEO_OLD | SO_SNDTIMEO_OLD,
+                SO_DONTROUTE | SO_KEEPALIVE | SO_LINGER | SO_RCVTIMEO_OLD | SO_SNDTIMEO_OLD
+                | SO_BINDTODEVICE,
             )
             | (SOL_SOCKET, SO_RCVTIMEO_NEW | SO_SNDTIMEO_NEW) => {
                 // CONTEXT: accepted as a no-op for libc/netperf/iperf

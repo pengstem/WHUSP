@@ -18,30 +18,24 @@ fn mount_namespace_id_from_info(info: ProcNamespaceInfo) -> Option<MountNamespac
     (info.kind == ProcNamespaceKind::Mnt).then_some(MountNamespaceId(info.id))
 }
 
-fn mount_namespace_id_from_proc_path(path: &str) -> Option<MountNamespaceId> {
-    proc_namespace_info_from_path(path).and_then(mount_namespace_id_from_info)
-}
-
-fn mount_namespace_id_from_proc_stat(entry: &FdTableEntry) -> Option<MountNamespaceId> {
-    let stat = entry.file().stat().ok()?;
-    proc_namespace_info_from_stat_ino(stat.ino).and_then(mount_namespace_id_from_info)
-}
-
-fn mount_namespace_id_from_fd(entry: &FdTableEntry) -> Option<MountNamespaceId> {
+fn namespace_info_from_fd(entry: &FdTableEntry) -> Option<ProcNamespaceInfo> {
     entry
         .dir_path()
-        .and_then(mount_namespace_id_from_proc_path)
+        .and_then(proc_namespace_info_from_path)
         .or_else(|| {
             entry
                 .file()
                 .proc_fd_target()
-                .and_then(|path| mount_namespace_id_from_proc_path(path.as_str()))
+                .and_then(|path| proc_namespace_info_from_path(path.as_str()))
         })
-        .or_else(|| mount_namespace_id_from_proc_stat(entry))
+        .or_else(|| {
+            let stat = entry.file().stat().ok()?;
+            proc_namespace_info_from_stat_ino(stat.ino)
+        })
 }
 
 pub fn sys_setns(fd: usize, nstype: usize) -> SysResult {
-    if nstype != 0 && nstype != CLONE_NEWNS {
+    if nstype != 0 && nstype != CLONE_NEWNS && nstype != CLONE_NEWNET {
         return Err(SysError::EINVAL);
     }
     let entry = {
@@ -54,8 +48,25 @@ pub fn sys_setns(fd: usize, nstype: usize) -> SysResult {
             .cloned()
             .ok_or(SysError::EBADF)?
     };
-    let target_namespace = mount_namespace_id_from_fd(&entry).ok_or(SysError::EINVAL)?;
-    current_process().set_mount_namespace_id(target_namespace);
+    let info = namespace_info_from_fd(&entry).ok_or(SysError::EINVAL)?;
+    match info.kind {
+        ProcNamespaceKind::Mnt => {
+            if nstype != 0 && nstype != CLONE_NEWNS {
+                return Err(SysError::EINVAL);
+            }
+            let target_namespace = mount_namespace_id_from_info(info).ok_or(SysError::EINVAL)?;
+            current_process().set_mount_namespace_id(target_namespace);
+        }
+        ProcNamespaceKind::Net => {
+            if nstype != 0 && nstype != CLONE_NEWNET {
+                return Err(SysError::EINVAL);
+            }
+            // UNFINISHED: Network namespace state is currently global. LTP net
+            // setup needs setns(/proc/<pid>/ns/net) to succeed before running
+            // helper commands against the synthetic veth devices.
+        }
+        _ => return Err(SysError::EINVAL),
+    }
     Ok(0)
 }
 
