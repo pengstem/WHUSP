@@ -301,6 +301,10 @@ impl VfsFile {
             *offset = stat.size as usize;
         }
         let mut total_write_size = 0usize;
+        perf::record_vfs_write_user_buffer(buf.buffers.len());
+        if self.kind == FsNodeKind::RegularFile && buf.buffers.len() > 1 {
+            return self.write_coalesced_user_buffer(&mut offset, &buf);
+        }
         for slice in buf.buffers.iter() {
             let write_size = self.write_at_chunks(*offset, slice);
             *offset = offset.checked_add(write_size).unwrap_or(usize::MAX);
@@ -312,6 +316,41 @@ impl VfsFile {
         total_write_size
     }
 
+    fn write_coalesced_user_buffer(&self, offset: &mut usize, buf: &UserBuffer) -> usize {
+        let mut total_write_size = 0usize;
+        let mut bounce = Vec::with_capacity(VFS_WRITE_CHUNK_SIZE);
+        for slice in &buf.buffers {
+            let mut remaining: &[u8] = &slice[..];
+            while !remaining.is_empty() {
+                let available = VFS_WRITE_CHUNK_SIZE - bounce.len();
+                let take = available.min(remaining.len());
+                bounce.extend_from_slice(&remaining[..take]);
+                remaining = &remaining[take..];
+                if bounce.len() < VFS_WRITE_CHUNK_SIZE {
+                    continue;
+                }
+                let write_size = self.flush_coalesced_write(offset, &bounce);
+                total_write_size = total_write_size.saturating_add(write_size);
+                if write_size < bounce.len() {
+                    return total_write_size;
+                }
+                bounce.clear();
+            }
+        }
+        if !bounce.is_empty() {
+            let write_size = self.flush_coalesced_write(offset, &bounce);
+            total_write_size = total_write_size.saturating_add(write_size);
+        }
+        total_write_size
+    }
+
+    fn flush_coalesced_write(&self, offset: &mut usize, chunk: &[u8]) -> usize {
+        perf::record_vfs_write_coalesced(chunk.len());
+        let write_size = self.write_at_chunks(*offset, chunk);
+        *offset = offset.checked_add(write_size).unwrap_or(usize::MAX);
+        write_size
+    }
+
     fn write_at_chunks(&self, offset: usize, buf: &[u8]) -> usize {
         invalidate_regular_file_read_cache(self.node, self.kind);
         let mut total_write_size = 0usize;
@@ -319,6 +358,7 @@ impl VfsFile {
             let Some(chunk_offset) = offset.checked_add(total_write_size) else {
                 break;
             };
+            perf::record_vfs_write_backend(chunk.len());
             let write_size = with_mount(self.node.mount_id, |mount| {
                 mount.write_at(self.node.ino, chunk, chunk_offset as u64)
             })

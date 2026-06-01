@@ -47,6 +47,12 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) vfs_read_cache_invalidated_pages: usize,
     pub(crate) vfs_read_cache_readahead_batches: usize,
     pub(crate) vfs_read_cache_readahead_pages: usize,
+    pub(crate) vfs_write_user_buffer_calls: usize,
+    pub(crate) vfs_write_user_buffer_slices: usize,
+    pub(crate) vfs_write_backend_calls: usize,
+    pub(crate) vfs_write_backend_bytes: usize,
+    pub(crate) vfs_write_coalesced_calls: usize,
+    pub(crate) vfs_write_coalesced_bytes: usize,
     pub(crate) page_cache_clean_evictions: usize,
     pub(crate) frame_dealloc_calls: usize,
     pub(crate) frame_dealloc_released: usize,
@@ -208,6 +214,12 @@ mod enabled {
     static VFS_READ_CACHE_INVALIDATED_PAGES: AtomicUsize = AtomicUsize::new(0);
     static VFS_READ_CACHE_READAHEAD_BATCHES: AtomicUsize = AtomicUsize::new(0);
     static VFS_READ_CACHE_READAHEAD_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static VFS_WRITE_USER_BUFFER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static VFS_WRITE_USER_BUFFER_SLICES: AtomicUsize = AtomicUsize::new(0);
+    static VFS_WRITE_BACKEND_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static VFS_WRITE_BACKEND_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static VFS_WRITE_COALESCED_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static VFS_WRITE_COALESCED_BYTES: AtomicUsize = AtomicUsize::new(0);
     static PAGE_CACHE_CLEAN_EVICTIONS: AtomicUsize = AtomicUsize::new(0);
     static FRAME_DEALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FRAME_DEALLOC_RELEASED: AtomicUsize = AtomicUsize::new(0);
@@ -458,6 +470,21 @@ mod enabled {
     pub(crate) fn record_vfs_read_cache_readahead(pages: usize) {
         VFS_READ_CACHE_READAHEAD_BATCHES.fetch_add(1, Ordering::Relaxed);
         VFS_READ_CACHE_READAHEAD_PAGES.fetch_add(pages, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_vfs_write_user_buffer(slices: usize) {
+        VFS_WRITE_USER_BUFFER_CALLS.fetch_add(1, Ordering::Relaxed);
+        VFS_WRITE_USER_BUFFER_SLICES.fetch_add(slices, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_vfs_write_backend(bytes: usize) {
+        VFS_WRITE_BACKEND_CALLS.fetch_add(1, Ordering::Relaxed);
+        VFS_WRITE_BACKEND_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_vfs_write_coalesced(bytes: usize) {
+        VFS_WRITE_COALESCED_CALLS.fetch_add(1, Ordering::Relaxed);
+        VFS_WRITE_COALESCED_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub(crate) fn record_page_cache_clean_eviction(pages: usize) {
@@ -822,6 +849,12 @@ mod enabled {
             vfs_read_cache_readahead_batches: VFS_READ_CACHE_READAHEAD_BATCHES
                 .load(Ordering::Relaxed),
             vfs_read_cache_readahead_pages: VFS_READ_CACHE_READAHEAD_PAGES.load(Ordering::Relaxed),
+            vfs_write_user_buffer_calls: VFS_WRITE_USER_BUFFER_CALLS.load(Ordering::Relaxed),
+            vfs_write_user_buffer_slices: VFS_WRITE_USER_BUFFER_SLICES.load(Ordering::Relaxed),
+            vfs_write_backend_calls: VFS_WRITE_BACKEND_CALLS.load(Ordering::Relaxed),
+            vfs_write_backend_bytes: VFS_WRITE_BACKEND_BYTES.load(Ordering::Relaxed),
+            vfs_write_coalesced_calls: VFS_WRITE_COALESCED_CALLS.load(Ordering::Relaxed),
+            vfs_write_coalesced_bytes: VFS_WRITE_COALESCED_BYTES.load(Ordering::Relaxed),
             page_cache_clean_evictions: PAGE_CACHE_CLEAN_EVICTIONS.load(Ordering::Relaxed),
             frame_dealloc_calls: FRAME_DEALLOC_CALLS.load(Ordering::Relaxed),
             frame_dealloc_released: FRAME_DEALLOC_RELEASED.load(Ordering::Relaxed),
@@ -991,6 +1024,12 @@ mod enabled {
          vfs_read_cache_invalidated_pages {}\n\
          vfs_read_cache_readahead_batches {}\n\
          vfs_read_cache_readahead_pages {}\n\
+         vfs_write_user_buffer_calls {}\n\
+         vfs_write_user_buffer_slices {}\n\
+         vfs_write_backend_calls {}\n\
+         vfs_write_backend_bytes {}\n\
+         vfs_write_coalesced_calls {}\n\
+         vfs_write_coalesced_bytes {}\n\
          page_cache_clean_evictions {}\n\
          frame_dealloc_calls {}\n\
          frame_dealloc_released {}\n\
@@ -1139,6 +1178,12 @@ mod enabled {
             stats.vfs_read_cache_invalidated_pages,
             stats.vfs_read_cache_readahead_batches,
             stats.vfs_read_cache_readahead_pages,
+            stats.vfs_write_user_buffer_calls,
+            stats.vfs_write_user_buffer_slices,
+            stats.vfs_write_backend_calls,
+            stats.vfs_write_backend_bytes,
+            stats.vfs_write_coalesced_calls,
+            stats.vfs_write_coalesced_bytes,
             stats.page_cache_clean_evictions,
             stats.frame_dealloc_calls,
             stats.frame_dealloc_released,
@@ -1360,6 +1405,15 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_vfs_read_cache_readahead(_pages: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_vfs_write_user_buffer(_slices: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_vfs_write_backend(_bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_vfs_write_coalesced(_bytes: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_page_cache_clean_eviction(_pages: usize) {}
