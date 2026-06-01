@@ -66,6 +66,7 @@ struct DynamicMount {
     peer_group: Option<usize>,
     master_group: Option<usize>,
     uncloned_subtree_suffixes: Vec<String>,
+    expires_on_next_umount: bool,
 }
 
 struct MountedFs {
@@ -95,6 +96,7 @@ pub(crate) enum MountError {
     TargetBusy,
     TargetNotMounted,
     StaticRoot,
+    ExpirePending,
 }
 
 #[derive(Clone, Debug)]
@@ -469,14 +471,17 @@ pub(super) fn mounted_root_for(
 ) -> Option<VfsNodeId> {
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         mounts
-            .iter()
+            .iter_mut()
             .rev()
             .find(|mount| {
                 mount.namespace_id == namespace_id
                     && mount.target.is_node(target)
                     && mount.target_path == target_path
             })
-            .map(|mount| mount.source_root)
+            .map(|mount| {
+                mount.expires_on_next_umount = false;
+                mount.source_root
+            })
     })
 }
 
@@ -1201,6 +1206,7 @@ pub(crate) fn mount_block_device_at(
             peer_group: None,
             master_group: None,
             uncloned_subtree_suffixes: Vec::new(),
+            expires_on_next_umount: false,
         };
         initialize_propagation_from_parent(&mut event, propagation_parent.as_ref());
         mounts.push(event.clone());
@@ -1366,6 +1372,7 @@ fn mount_new_fs_on_target(
             peer_group: None,
             master_group: None,
             uncloned_subtree_suffixes: Vec::new(),
+            expires_on_next_umount: false,
         };
         initialize_propagation_from_parent(&mut event, propagation_parent.as_ref());
         mounts.push(event.clone());
@@ -1448,6 +1455,7 @@ fn mount_pseudo_fs_on_target(
             peer_group: None,
             master_group: None,
             uncloned_subtree_suffixes: Vec::new(),
+            expires_on_next_umount: false,
         };
         initialize_propagation_from_parent(&mut event, propagation_parent.as_ref());
         mounts.push(event.clone());
@@ -1523,6 +1531,7 @@ pub(crate) fn mount_detached_fs_at(
             peer_group: None,
             master_group: None,
             uncloned_subtree_suffixes: Vec::new(),
+            expires_on_next_umount: false,
         };
         initialize_propagation_from_parent(&mut event, propagation_parent.as_ref());
         mounts.push(event.clone());
@@ -1601,6 +1610,7 @@ pub(crate) fn mount_bind_at(
             peer_group: None,
             master_group: None,
             uncloned_subtree_suffixes: unbindable_child_suffixes.clone(),
+            expires_on_next_umount: false,
         };
         if let Some(source_mount) = source_mount.as_ref() {
             copy_bind_propagation_from_source(&mut event, source_mount);
@@ -2069,6 +2079,8 @@ pub(crate) fn unmount_at(
     namespace_id: MountNamespaceId,
     target: WorkingDir,
     target_path: &str,
+    detach: bool,
+    expire: bool,
 ) -> Result<(), MountError> {
     let target = VfsNodeId::new(target.mount_id(), target.ino());
     let target_is_root =
@@ -2087,8 +2099,12 @@ pub(crate) fn unmount_at(
             })
         };
         let index = index.ok_or(MountError::TargetNotMounted)?;
+        if expire && !mounts[index].expires_on_next_umount {
+            mounts[index].expires_on_next_umount = true;
+            return Err(MountError::ExpirePending);
+        }
         let source_mount_id = mounts[index].source_mount_id;
-        if !mounts[index].is_bind && any_process_references_mount(source_mount_id) {
+        if !detach && !mounts[index].is_bind && any_process_references_mount(source_mount_id) {
             return Err(MountError::TargetBusy);
         }
         let event = mounts.remove(index);

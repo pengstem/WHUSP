@@ -327,6 +327,8 @@ getegid02
 getegid02_16
 geteuid01
 geteuid02
+brk01
+brk02
 getitimer01
 getitimer02
 getdents01
@@ -374,6 +376,10 @@ sched_setparam03
 open07
 waitid01
 waitid07
+umount01
+umount02
+umount03
+umount2_02
 getcwd01
 move_mount02
 rename01

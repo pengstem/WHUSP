@@ -34,6 +34,11 @@ const MS_SHARED: usize = 1 << 20;
 const MS_PROPAGATION_MASK: usize = MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED;
 // Linux accepts MS_REC/MS_SILENT with propagation changes; other extras are rejected.
 const MS_PROPAGATION_ALLOWED_EXTRAS: usize = MS_REC | MS_SILENT;
+const MNT_FORCE: i32 = 1;
+const MNT_DETACH: i32 = 2;
+const MNT_EXPIRE: i32 = 4;
+const UMOUNT_NOFOLLOW: i32 = 8;
+const VALID_UMOUNT_FLAGS: i32 = MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW;
 const OPEN_TREE_CLONE: u32 = 0x1;
 const OPEN_TREE_CLOEXEC: u32 = OpenFlags::CLOEXEC.bits();
 const AT_RECURSIVE: u32 = 0x8000; // open_tree recursive clone flag, not in older libc headers.
@@ -130,6 +135,7 @@ fn mount_error_to_errno(error: MountError) -> SysError {
         MountError::InvalidTarget => SysError::ENOENT,
         MountError::TargetBusy | MountError::StaticRoot => SysError::EBUSY,
         MountError::TargetNotMounted => SysError::EINVAL,
+        MountError::ExpirePending => SysError::EAGAIN,
     }
 }
 
@@ -808,11 +814,26 @@ fn overlay_option_value<'a>(options: &'a str, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
-pub fn sys_umount2(target: *const u8, _flags: i32) -> SysResult {
+pub fn sys_umount2(target: *const u8, flags: i32) -> SysResult {
+    require_sys_admin()?;
+    if flags & !VALID_UMOUNT_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+    if flags & MNT_EXPIRE != 0 && flags & (MNT_FORCE | MNT_DETACH) != 0 {
+        return Err(SysError::EINVAL);
+    }
+    // UNFINISHED: MNT_FORCE is accepted but does not force-close remote or
+    // busy filesystems because this kernel does not model those backends yet.
     let token = current_user_token();
     let target = read_user_c_string(token, target, PATH_MAX)?;
     let process = current_process();
     let snapshot = process.path_snapshot();
+    if flags & UMOUNT_NOFOLLOW != 0
+        && lookup_path_in(snapshot.context.clone(), target.as_str(), false)?.kind
+            == FsNodeKind::Symlink
+    {
+        return Err(SysError::EINVAL);
+    }
     let target_dir = lookup_mount_target_dir_in(snapshot.context.clone(), target.as_str())?;
     let target_path = normalize_path_at_root(
         snapshot.root_path.as_str(),
@@ -825,6 +846,8 @@ pub fn sys_umount2(target: *const u8, _flags: i32) -> SysResult {
         snapshot.context.namespace_id(),
         target_dir,
         target_path.as_str(),
+        flags & MNT_DETACH != 0,
+        flags & MNT_EXPIRE != 0,
     )
     .map_err(mount_error_to_errno)?;
     if let Some(mount) = mounted_source {
