@@ -6,7 +6,7 @@ use crate::syscall::syscall;
 use crate::task::{
     SignalAction, SignalFlags, account_current_system_time_until, account_current_user_time_until,
     check_signals_of_current, current_add_signal, current_process, current_task, current_trap_cx,
-    current_user_token, exit_current_group_and_run_next, mark_current_user_time_entry,
+    current_trap_return_context, exit_current_group_and_run_next, mark_current_user_time_entry,
     suspend_current_and_run_next,
 };
 use crate::timer::{check_timer, get_time_us, set_next_trigger};
@@ -83,7 +83,7 @@ pub fn trap_handler() -> ! {
     let mut interrupted_pc = trap_pc;
     match estat.cause() {
         Trap::Exception(Exception::Syscall) => {
-            let syscall_pc = current_trap_cx().era;
+            let syscall_pc = trap_pc;
             let (syscall_nr, syscall_args, syscall_sp) = {
                 let cx = current_trap_cx();
                 (
@@ -98,14 +98,10 @@ pub fn trap_handler() -> ! {
                 syscall_pc,
                 syscall_sp,
             );
-            let mut cx = current_trap_cx();
-            cx.era += 4;
+            current_trap_cx().era += 4;
             enable_supervisor_interrupt();
-            let result = syscall(
-                cx.x[11],
-                [cx.x[4], cx.x[5], cx.x[6], cx.x[7], cx.x[8], cx.x[9]],
-            );
-            cx = current_trap_cx();
+            let result = syscall(syscall_nr, syscall_args);
+            let cx = current_trap_cx();
             interrupted_pc = cx.era;
             cx.x[4] = result as usize;
             let syscall_exit_pc = cx.era;
@@ -248,8 +244,7 @@ pub fn trap_return() -> ! {
     mark_current_user_time_entry(now_us);
     disable_supervisor_interrupt();
     set_kernel_trap_entry();
-    let trap_cx = current_trap_cx() as *mut TrapContext as usize;
-    let user_token = current_user_token();
+    let (trap_cx, user_token) = current_trap_return_context();
     unsafe extern "C" {
         unsafe fn __restore(trap_cx: usize, user_token: usize) -> !;
     }

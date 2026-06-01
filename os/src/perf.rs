@@ -8,6 +8,14 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) scheduler_rt_priority_probes: usize,
     pub(crate) wakeup_front_successes: usize,
     pub(crate) wakeup_back_successes: usize,
+    pub(crate) syscall_dispatch_calls: usize,
+    pub(crate) syscall_identity_fast_paths: usize,
+    pub(crate) task_current_calls: usize,
+    pub(crate) task_current_process_calls: usize,
+    pub(crate) task_current_user_token_calls: usize,
+    pub(crate) task_current_trap_cx_calls: usize,
+    pub(crate) task_current_trap_cx_user_va_calls: usize,
+    pub(crate) task_current_trap_return_context_calls: usize,
     pub(crate) fd_alloc_calls: usize,
     pub(crate) fd_alloc_failures: usize,
     pub(crate) fd_alloc_probe_slots: usize,
@@ -157,6 +165,14 @@ mod enabled {
     static SCHEDULER_RT_PRIORITY_PROBES: AtomicUsize = AtomicUsize::new(0);
     static WAKEUP_FRONT_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
     static WAKEUP_BACK_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
+    static SYSCALL_DISPATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SYSCALL_IDENTITY_FAST_PATHS: AtomicUsize = AtomicUsize::new(0);
+    static TASK_CURRENT_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static TASK_CURRENT_PROCESS_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static TASK_CURRENT_USER_TOKEN_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static TASK_CURRENT_TRAP_CX_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static TASK_CURRENT_TRAP_CX_USER_VA_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static TASK_CURRENT_TRAP_RETURN_CONTEXT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     static FD_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FD_ALLOC_FAILURES: AtomicUsize = AtomicUsize::new(0);
@@ -328,6 +344,34 @@ mod enabled {
             &WAKEUP_BACK_SUCCESSES
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_syscall_dispatch_call() {
+        SYSCALL_DISPATCH_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_syscall_identity_fast_path() {
+        SYSCALL_IDENTITY_FAST_PATHS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_task_current_call() {
+        TASK_CURRENT_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_task_current_process_call() {
+        TASK_CURRENT_PROCESS_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_task_current_user_token_call() {
+        TASK_CURRENT_USER_TOKEN_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_task_current_trap_cx_call() {
+        TASK_CURRENT_TRAP_CX_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_task_current_trap_return_context_call() {
+        TASK_CURRENT_TRAP_RETURN_CONTEXT_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_fd_alloc(
@@ -735,6 +779,16 @@ mod enabled {
             scheduler_rt_priority_probes: SCHEDULER_RT_PRIORITY_PROBES.load(Ordering::Relaxed),
             wakeup_front_successes: WAKEUP_FRONT_SUCCESSES.load(Ordering::Relaxed),
             wakeup_back_successes: WAKEUP_BACK_SUCCESSES.load(Ordering::Relaxed),
+            syscall_dispatch_calls: SYSCALL_DISPATCH_CALLS.load(Ordering::Relaxed),
+            syscall_identity_fast_paths: SYSCALL_IDENTITY_FAST_PATHS.load(Ordering::Relaxed),
+            task_current_calls: TASK_CURRENT_CALLS.load(Ordering::Relaxed),
+            task_current_process_calls: TASK_CURRENT_PROCESS_CALLS.load(Ordering::Relaxed),
+            task_current_user_token_calls: TASK_CURRENT_USER_TOKEN_CALLS.load(Ordering::Relaxed),
+            task_current_trap_cx_calls: TASK_CURRENT_TRAP_CX_CALLS.load(Ordering::Relaxed),
+            task_current_trap_cx_user_va_calls: TASK_CURRENT_TRAP_CX_USER_VA_CALLS
+                .load(Ordering::Relaxed),
+            task_current_trap_return_context_calls: TASK_CURRENT_TRAP_RETURN_CONTEXT_CALLS
+                .load(Ordering::Relaxed),
             fd_alloc_calls: FD_ALLOC_CALLS.load(Ordering::Relaxed),
             fd_alloc_failures: FD_ALLOC_FAILURES.load(Ordering::Relaxed),
             fd_alloc_probe_slots: FD_ALLOC_PROBE_SLOTS.load(Ordering::Relaxed),
@@ -898,6 +952,14 @@ mod enabled {
          scheduler_rt_priority_probes {}\n\
          wakeup_front_successes {}\n\
          wakeup_back_successes {}\n\
+         syscall_dispatch_calls {}\n\
+         syscall_identity_fast_paths {}\n\
+         task_current_calls {}\n\
+         task_current_process_calls {}\n\
+         task_current_user_token_calls {}\n\
+         task_current_trap_cx_calls {}\n\
+         task_current_trap_cx_user_va_calls {}\n\
+         task_current_trap_return_context_calls {}\n\
          fd_alloc_calls {}\n\
          fd_alloc_failures {}\n\
          fd_alloc_probe_slots {}\n\
@@ -1038,6 +1100,14 @@ mod enabled {
             stats.scheduler_rt_priority_probes,
             stats.wakeup_front_successes,
             stats.wakeup_back_successes,
+            stats.syscall_dispatch_calls,
+            stats.syscall_identity_fast_paths,
+            stats.task_current_calls,
+            stats.task_current_process_calls,
+            stats.task_current_user_token_calls,
+            stats.task_current_trap_cx_calls,
+            stats.task_current_trap_cx_user_va_calls,
+            stats.task_current_trap_return_context_calls,
             stats.fd_alloc_calls,
             stats.fd_alloc_failures,
             stats.fd_alloc_probe_slots,
@@ -1213,6 +1283,27 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_task_wakeup(_front: bool) {}
+
+    #[inline(always)]
+    pub(crate) fn record_syscall_dispatch_call() {}
+
+    #[inline(always)]
+    pub(crate) fn record_syscall_identity_fast_path() {}
+
+    #[inline(always)]
+    pub(crate) fn record_task_current_call() {}
+
+    #[inline(always)]
+    pub(crate) fn record_task_current_process_call() {}
+
+    #[inline(always)]
+    pub(crate) fn record_task_current_user_token_call() {}
+
+    #[inline(always)]
+    pub(crate) fn record_task_current_trap_cx_call() {}
+
+    #[inline(always)]
+    pub(crate) fn record_task_current_trap_return_context_call() {}
 
     #[inline(always)]
     pub(crate) fn record_fd_alloc(

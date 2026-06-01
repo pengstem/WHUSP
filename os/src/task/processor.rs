@@ -2,6 +2,7 @@ use super::__switch;
 use super::{ProcessControlBlock, TaskContext, TaskControlBlock};
 use super::{TaskStatus, fetch_task};
 use crate::arch::hart;
+use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
@@ -68,10 +69,12 @@ pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
 }
 
 pub fn current_task() -> Option<Arc<TaskControlBlock>> {
+    perf::record_task_current_call();
     PROCESSOR.exclusive_access().current()
 }
 
 pub fn current_process() -> Arc<ProcessControlBlock> {
+    perf::record_task_current_process_call();
     current_task()
         .expect("current_process requires a running task")
         .process
@@ -80,11 +83,13 @@ pub fn current_process() -> Arc<ProcessControlBlock> {
 }
 
 pub fn current_user_token() -> usize {
+    perf::record_task_current_user_token_call();
     let task = current_task().expect("current_user_token requires a running task");
     task.get_user_token()
 }
 
 pub fn current_trap_cx() -> &'static mut TrapContext {
+    perf::record_task_current_trap_cx_call();
     current_task()
         .expect("current_trap_cx requires a running task")
         .inner_exclusive_access()
@@ -92,14 +97,24 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 }
 
 #[cfg(target_arch = "riscv64")]
-pub fn current_trap_cx_user_va() -> usize {
-    current_task()
-        .expect("current_trap_cx_user_va requires a running task")
+pub fn current_trap_return_context() -> (usize, usize) {
+    perf::record_task_current_trap_return_context_call();
+    let task = current_task().expect("current_trap_return_context requires a running task");
+    let trap_cx_user_va = task
         .inner_exclusive_access()
         .res
         .as_ref()
         .expect("current user task must own TaskUserRes")
-        .trap_cx_user_va()
+        .trap_cx_user_va();
+    (trap_cx_user_va, task.get_user_token())
+}
+
+#[cfg(target_arch = "loongarch64")]
+pub fn current_trap_return_context() -> (usize, usize) {
+    perf::record_task_current_trap_return_context_call();
+    let task = current_task().expect("current_trap_return_context requires a running task");
+    let trap_cx = task.inner_exclusive_access().get_trap_cx() as *mut TrapContext as usize;
+    (trap_cx, task.get_user_token())
 }
 
 pub fn current_kstack_top() -> usize {

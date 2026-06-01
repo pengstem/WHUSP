@@ -232,10 +232,12 @@ fn ptrace_syscall_stop_current(
     instruction_pointer: usize,
     stack_pointer: usize,
 ) -> bool {
-    let Some(_task) = current_task() else {
+    let Some(task) = current_task() else {
         return false;
     };
-    let process = current_process();
+    let Some(process) = task.process.upgrade() else {
+        return false;
+    };
     let tracer_pid = {
         let mut inner = process.inner_exclusive_access();
         let Some(tracer_pid) = inner.ptrace.tracer_pid else {

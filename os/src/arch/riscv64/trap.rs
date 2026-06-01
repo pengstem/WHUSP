@@ -6,8 +6,8 @@ use crate::syscall::{errno::SysError, syscall};
 use crate::task::{
     SignalAction, SignalFlags, account_current_system_time_until, account_current_user_time_until,
     check_signals_of_current, current_add_signal, current_process, current_task, current_trap_cx,
-    current_trap_cx_user_va, current_user_token, exit_current_group_and_run_next,
-    mark_current_user_time_entry, suspend_current_and_run_next,
+    current_trap_return_context, exit_current_group_and_run_next, mark_current_user_time_entry,
+    suspend_current_and_run_next,
 };
 use crate::timer::{check_timer, get_time_us, set_next_trigger};
 use core::arch::{asm, global_asm};
@@ -71,7 +71,7 @@ pub fn trap_handler() -> ! {
     // println!("into {:?}", scause.cause());
     match scause.cause() {
         Trap::Exception(Exception::UserEnvCall) => {
-            let syscall_pc = current_trap_cx().sepc;
+            let syscall_pc = trap_pc;
             let (syscall_nr, syscall_args, syscall_sp) = {
                 let cx = current_trap_cx();
                 (
@@ -87,18 +87,14 @@ pub fn trap_handler() -> ! {
                 syscall_sp,
             );
             // jump to next instruction anyway
-            let mut cx = current_trap_cx();
-            cx.sepc += 4;
+            current_trap_cx().sepc += 4;
 
             enable_supervisor_interrupt();
 
             // get system call return value
-            let result = syscall(
-                cx.x[17],
-                [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]],
-            );
+            let result = syscall(syscall_nr, syscall_args);
             // cx is changed during sys_execve, so we have to call it again
-            cx = current_trap_cx();
+            let cx = current_trap_cx();
             // UNFINISHED: Full SA_RESTART is not modeled yet. Most interrupted
             // syscalls such as futex, nanosleep, clock_nanosleep, ppoll, and
             // pselect6 currently return EINTR after rt_sigreturn instead of
@@ -275,8 +271,7 @@ pub fn trap_return() -> ! {
     mark_current_user_time_entry(now_us);
     disable_supervisor_interrupt();
     set_user_trap_entry();
-    let trap_cx_user_va = current_trap_cx_user_va();
-    let user_satp = current_user_token();
+    let (trap_cx_user_va, user_satp) = current_trap_return_context();
     unsafe extern "C" {
         unsafe fn __alltraps();
         unsafe fn __restore();

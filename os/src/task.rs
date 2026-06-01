@@ -49,11 +49,9 @@ pub(crate) use manager::remove_ready_tasks_of_process;
 pub(crate) use manager::reprioritize_ready_task;
 pub use manager::{add_task, pid2process, remove_from_pid2process, wakeup_task};
 pub(crate) use manager::{wakeup_front_task, wakeup_timer_task};
-#[cfg(target_arch = "riscv64")]
-pub use processor::current_trap_cx_user_va;
 pub use processor::{
-    current_kstack_top, current_process, current_task, current_trap_cx, current_user_token,
-    run_tasks, schedule, take_current_task,
+    current_kstack_top, current_process, current_task, current_trap_cx,
+    current_trap_return_context, current_user_token, run_tasks, schedule, take_current_task,
 };
 pub(crate) use ptrace::{
     ptrace_attach_process, ptrace_kill_process, ptrace_note_exec_current, ptrace_resume_process,

@@ -273,7 +273,10 @@ pub(crate) mod uapi;
 pub(crate) mod user_ptr;
 mod wait;
 
-use crate::task::{RLimit, SeccompSockFilter, SignalFlags, current_add_signal, current_task};
+use crate::perf;
+use crate::task::{
+    RLimit, SeccompSockFilter, SignalFlags, TaskControlBlock, current_add_signal, current_task,
+};
 use aio::*;
 use errno::{SysError, ret};
 use fs::*;
@@ -349,10 +352,9 @@ fn seccomp_filter_allows(filter: &[SeccompSockFilter], syscall_id: usize) -> boo
     false
 }
 
-fn seccomp_signal_for_syscall(syscall_id: usize) -> Option<SignalFlags> {
+fn seccomp_signal_for_syscall(task: &TaskControlBlock, syscall_id: usize) -> Option<SignalFlags> {
     const SECCOMP_MODE_STRICT: u8 = 1;
     const SECCOMP_MODE_FILTER: u8 = 2;
-    let task = current_task()?;
     let inner = task.inner_exclusive_access();
     match inner.seccomp_mode {
         SECCOMP_MODE_STRICT => (!matches!(
@@ -375,11 +377,38 @@ fn seccomp_signal_for_syscall(syscall_id: usize) -> Option<SignalFlags> {
     }
 }
 
+fn syscall_identity_fast_path(task: &TaskControlBlock, syscall_id: usize) -> Option<isize> {
+    let value = match syscall_id {
+        SYSCALL_GETTID => task.linux_tid() as isize,
+        SYSCALL_GETPID | SYSCALL_GETPPID | SYSCALL_GETUID | SYSCALL_GETEUID | SYSCALL_GETGID
+        | SYSCALL_GETEGID => {
+            let process = task
+                .process
+                .upgrade()
+                .expect("current task process must outlive the task");
+            match syscall_id {
+                SYSCALL_GETPID => process.visible_pid() as isize,
+                SYSCALL_GETPPID => process.getppid() as isize,
+                SYSCALL_GETUID => process.credentials().ruid as isize,
+                SYSCALL_GETEUID => process.credentials().euid as isize,
+                SYSCALL_GETGID => process.credentials().rgid as isize,
+                SYSCALL_GETEGID => process.credentials().egid as isize,
+                _ => unreachable!(),
+            }
+        }
+        _ => return None,
+    };
+    perf::record_syscall_identity_fast_path();
+    Some(value)
+}
+
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
+    perf::record_syscall_dispatch_call();
     if syscall_id == SYSCALL_EXIT {
         sys_exit(args[0] as i32);
     }
-    if let Some(signal) = seccomp_signal_for_syscall(syscall_id) {
+    let current = current_task().expect("syscall requires a running task");
+    if let Some(signal) = seccomp_signal_for_syscall(&current, syscall_id) {
         // UNFINISHED: Filter mode supports only a small classic-BPF subset.
         // Unsupported or denied filter paths fail closed with SIGSYS.
         current_add_signal(signal);
@@ -387,6 +416,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     }
     if syscall_id == SYSCALL_EXIT_GROUP {
         sys_exit_group(args[0] as i32);
+    }
+    if let Some(value) = syscall_identity_fast_path(&current, syscall_id) {
+        return value;
     }
 
     ret(match syscall_id {
