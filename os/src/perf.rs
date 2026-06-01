@@ -52,6 +52,10 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) tlb_flush_all_calls: usize,
     pub(crate) tlb_flush_range_calls: usize,
     pub(crate) tlb_flush_range_pages: usize,
+    pub(crate) mount_metadata_calls: usize,
+    pub(crate) mount_metadata_source_clone_bytes: usize,
+    pub(crate) mount_fast_stat_flags_calls: usize,
+    pub(crate) mount_fast_fs_type_calls: usize,
     pub(crate) pipe_read_calls: usize,
     pub(crate) pipe_write_calls: usize,
     pub(crate) pipe_read_bytes: usize,
@@ -185,6 +189,10 @@ mod enabled {
     static TLB_FLUSH_ALL_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TLB_FLUSH_RANGE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TLB_FLUSH_RANGE_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static MOUNT_METADATA_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static MOUNT_METADATA_SOURCE_CLONE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static MOUNT_FAST_STAT_FLAGS_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static MOUNT_FAST_FS_TYPE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     static PIPE_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PIPE_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -411,6 +419,19 @@ mod enabled {
     pub(crate) fn record_tlb_flush_range(pages: usize) {
         TLB_FLUSH_RANGE_CALLS.fetch_add(1, Ordering::Relaxed);
         TLB_FLUSH_RANGE_PAGES.fetch_add(pages, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_mount_metadata(source_len: usize) {
+        MOUNT_METADATA_CALLS.fetch_add(1, Ordering::Relaxed);
+        MOUNT_METADATA_SOURCE_CLONE_BYTES.fetch_add(source_len, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_mount_fast_stat_flags() {
+        MOUNT_FAST_STAT_FLAGS_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_mount_fast_fs_type() {
+        MOUNT_FAST_FS_TYPE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_pipe_read_call() {
@@ -681,6 +702,11 @@ mod enabled {
             tlb_flush_all_calls: TLB_FLUSH_ALL_CALLS.load(Ordering::Relaxed),
             tlb_flush_range_calls: TLB_FLUSH_RANGE_CALLS.load(Ordering::Relaxed),
             tlb_flush_range_pages: TLB_FLUSH_RANGE_PAGES.load(Ordering::Relaxed),
+            mount_metadata_calls: MOUNT_METADATA_CALLS.load(Ordering::Relaxed),
+            mount_metadata_source_clone_bytes: MOUNT_METADATA_SOURCE_CLONE_BYTES
+                .load(Ordering::Relaxed),
+            mount_fast_stat_flags_calls: MOUNT_FAST_STAT_FLAGS_CALLS.load(Ordering::Relaxed),
+            mount_fast_fs_type_calls: MOUNT_FAST_FS_TYPE_CALLS.load(Ordering::Relaxed),
             pipe_read_calls: PIPE_READ_CALLS.load(Ordering::Relaxed),
             pipe_write_calls: PIPE_WRITE_CALLS.load(Ordering::Relaxed),
             pipe_read_bytes: PIPE_READ_BYTES.load(Ordering::Relaxed),
@@ -819,6 +845,10 @@ mod enabled {
          tlb_flush_all_calls {}\n\
          tlb_flush_range_calls {}\n\
          tlb_flush_range_pages {}\n\
+         mount_metadata_calls {}\n\
+         mount_metadata_source_clone_bytes {}\n\
+         mount_fast_stat_flags_calls {}\n\
+         mount_fast_fs_type_calls {}\n\
          pipe_read_calls {}\n\
          pipe_write_calls {}\n\
          pipe_read_bytes {}\n\
@@ -939,6 +969,10 @@ mod enabled {
             stats.tlb_flush_all_calls,
             stats.tlb_flush_range_calls,
             stats.tlb_flush_range_pages,
+            stats.mount_metadata_calls,
+            stats.mount_metadata_source_clone_bytes,
+            stats.mount_fast_stat_flags_calls,
+            stats.mount_fast_fs_type_calls,
             stats.pipe_read_calls,
             stats.pipe_write_calls,
             stats.pipe_read_bytes,
@@ -1127,6 +1161,15 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_tlb_flush_range(_pages: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_mount_metadata(_source_len: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_mount_fast_stat_flags() {}
+
+    #[inline(always)]
+    pub(crate) fn record_mount_fast_fs_type() {}
 
     #[inline(always)]
     pub(crate) fn record_pipe_read_call() {}

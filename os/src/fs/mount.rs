@@ -12,6 +12,7 @@ use super::vfs::{
     mount_has_writable_regular_open,
 };
 use crate::drivers::block::BLOCK_DEVICES;
+use crate::perf;
 use crate::sync::{SleepMutex, UPIntrFreeCell};
 use crate::task::any_process_references_mount;
 use alloc::boxed::Box;
@@ -2352,54 +2353,69 @@ pub fn list_root_apps() -> Vec<String> {
     with_mount(primary_mount_id(), |mount| mount.list_root_names()).unwrap_or_default()
 }
 
+fn mounted_fs(mount_id: MountId) -> Option<Arc<MountedFs>> {
+    let mounts = MOUNTS.lock();
+    mounts
+        .get(mount_id.0)
+        .and_then(|mount| mount.as_ref().cloned())
+}
+
 fn mount_metadata(mount_id: MountId) -> Option<(String, &'static str, &'static str, u64)> {
-    let mounted = {
-        let mounts = MOUNTS.lock();
-        mounts
-            .get(mount_id.0)
-            .and_then(|mount| mount.as_ref().cloned())
-    }?;
+    let mounted = mounted_fs(mount_id)?;
     let options = *mounted.options.lock();
     let stat_flags = *mounted.stat_flags.lock();
-    Some((mounted.source.clone(), mounted.fs_type, options, stat_flags))
+    let source = mounted.source.clone();
+    perf::record_mount_metadata(source.len());
+    Some((source, mounted.fs_type, options, stat_flags))
+}
+
+fn mount_stat_flags(mount_id: MountId) -> Option<u64> {
+    let mounted = mounted_fs(mount_id)?;
+    let stat_flags = *mounted.stat_flags.lock();
+    perf::record_mount_fast_stat_flags();
+    Some(stat_flags)
+}
+
+fn mount_fs_type(mount_id: MountId) -> Option<&'static str> {
+    let mounted = mounted_fs(mount_id)?;
+    perf::record_mount_fast_fs_type();
+    Some(mounted.fs_type)
 }
 
 pub(super) fn mount_supports_page_cache(mount_id: MountId) -> bool {
-    mount_metadata(mount_id)
-        .is_some_and(|(_, fs_type, _, _)| matches!(fs_type, "ext4" | "vfat" | "tmpfs"))
+    mount_fs_type(mount_id).is_some_and(|fs_type| matches!(fs_type, "ext4" | "vfat" | "tmpfs"))
 }
 
 pub(super) fn mount_supports_dentry_cache(mount_id: MountId) -> bool {
-    mount_metadata(mount_id)
-        .is_some_and(|(_, fs_type, _, _)| matches!(fs_type, "ext4" | "vfat" | "tmpfs"))
+    mount_fs_type(mount_id).is_some_and(|fs_type| matches!(fs_type, "ext4" | "vfat" | "tmpfs"))
 }
 
 pub(crate) fn mount_is_read_only(mount_id: MountId) -> bool {
-    mount_metadata(mount_id).is_some_and(|(_, _, _, flags)| flags & MOUNT_STAT_RDONLY != 0)
+    mount_stat_flags(mount_id).is_some_and(|flags| flags & MOUNT_STAT_RDONLY != 0)
 }
 
 pub(crate) fn mount_is_nodev(mount_id: MountId) -> bool {
-    mount_metadata(mount_id).is_some_and(|(_, _, _, flags)| flags & MOUNT_STAT_NODEV != 0)
+    mount_stat_flags(mount_id).is_some_and(|flags| flags & MOUNT_STAT_NODEV != 0)
 }
 
 pub(crate) fn mount_is_noexec(mount_id: MountId) -> bool {
-    mount_metadata(mount_id).is_some_and(|(_, _, _, flags)| flags & MOUNT_STAT_NOEXEC != 0)
+    mount_stat_flags(mount_id).is_some_and(|flags| flags & MOUNT_STAT_NOEXEC != 0)
 }
 
 pub(crate) fn mount_is_noatime(mount_id: MountId) -> bool {
-    mount_metadata(mount_id).is_some_and(|(_, _, _, flags)| flags & MOUNT_STAT_NOATIME != 0)
+    mount_stat_flags(mount_id).is_some_and(|flags| flags & MOUNT_STAT_NOATIME != 0)
 }
 
 pub(crate) fn mount_is_nodiratime(mount_id: MountId) -> bool {
-    mount_metadata(mount_id).is_some_and(|(_, _, _, flags)| flags & MOUNT_STAT_NODIRATIME != 0)
+    mount_stat_flags(mount_id).is_some_and(|flags| flags & MOUNT_STAT_NODIRATIME != 0)
 }
 
 pub(crate) fn mount_is_nosymfollow(mount_id: MountId) -> bool {
-    mount_metadata(mount_id).is_some_and(|(_, _, _, flags)| flags & MOUNT_STAT_NOSYMFOLLOW != 0)
+    mount_stat_flags(mount_id).is_some_and(|flags| flags & MOUNT_STAT_NOSYMFOLLOW != 0)
 }
 
 pub(super) fn mount_is_devfs(mount_id: MountId) -> bool {
-    mount_metadata(mount_id).is_some_and(|(_, fs_type, _, _)| fs_type == "devfs")
+    mount_fs_type(mount_id).is_some_and(|fs_type| fs_type == "devfs")
 }
 
 fn resolve_mount_path(target: VfsNodeId, hint: &str) -> String {
@@ -2456,7 +2472,7 @@ pub(crate) fn list_mounts(namespace_id: MountNamespaceId) -> Vec<MountInfo> {
 }
 
 pub(crate) fn statfs_for_mount(mount_id: MountId) -> Option<FileSystemStat> {
-    let flags = mount_metadata(mount_id).map(|(_, _, _, flags)| flags)?;
+    let flags = mount_stat_flags(mount_id)?;
     with_mount(mount_id, |backend| {
         let mut stat = backend.statfs();
         stat.flags |= flags;
