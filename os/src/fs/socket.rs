@@ -31,9 +31,11 @@ use alloc::{vec, vec::Vec};
 use core::mem::size_of;
 use lazy_static::lazy_static;
 
+const AF_UNSPEC: i32 = 0;
 const AF_UNIX: i32 = 1;
 const AF_INET: i32 = 2;
 const AF_INET6: i32 = 10;
+const AF_NETLINK: i32 = 16;
 const AF_PACKET: i32 = 17;
 const AF_ALG: i32 = 38;
 const SOCK_STREAM: i32 = 1;
@@ -75,6 +77,18 @@ const IPV6_V6ONLY: i32 = 26;
 const MCAST_JOIN_GROUP: i32 = 42;
 const MCAST_LEAVE_GROUP: i32 = 45;
 const IPT_SO_SET_REPLACE: i32 = 64;
+const NETLINK_ROUTE: i32 = 0;
+const NLMSG_DONE: u16 = 3;
+const RTM_NEWLINK: u16 = 16;
+const RTM_GETLINK: u16 = 18;
+const RTM_GETADDR: u16 = 22;
+const IFLA_IFNAME: u16 = 3;
+const NLM_F_MULTI: u16 = 0x2;
+const IFF_UP: u32 = 0x1;
+const IFF_LOOPBACK: u32 = 0x8;
+const IFF_RUNNING: u32 = 0x40;
+const ARPHRD_LOOPBACK: u16 = 772;
+const LOOPBACK_IF_INDEX: i32 = 1;
 const PACKET_RX_RING: i32 = 5;
 const PACKET_VERSION: i32 = 10;
 const PACKET_RESERVE: i32 = 12;
@@ -131,11 +145,21 @@ struct LinuxSockAddrUn {
     path: [u8; 108],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxSockAddrNl {
+    family: u16,
+    pad: u16,
+    pid: u32,
+    groups: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SocketDomain {
     Unix,
     Inet,
     Inet6,
+    Netlink,
     Packet,
 }
 
@@ -216,6 +240,7 @@ enum UnixSockAddr {
 enum SocketAddress {
     Inet(InetEndpoint),
     Inet6(InetEndpoint),
+    Netlink,
     Unix(UnixSockAddr),
 }
 
@@ -453,6 +478,10 @@ impl LocalSocket {
         self.inner.exclusive_access().kind
     }
 
+    fn domain(&self) -> SocketDomain {
+        self.inner.exclusive_access().domain
+    }
+
     fn bind_address(&self, address: SocketAddress) -> SysResult {
         let domain = self.inner.exclusive_access().domain;
         match (domain, address) {
@@ -464,6 +493,7 @@ impl LocalSocket {
             (SocketDomain::Unix, SocketAddress::Unix(UnixSockAddr::Unnamed)) => {
                 Err(SysError::EINVAL)
             }
+            (SocketDomain::Netlink, SocketAddress::Netlink) => Ok(0),
             (SocketDomain::Packet, _) => Err(SysError::EAFNOSUPPORT),
             _ => Err(SysError::EAFNOSUPPORT),
         }
@@ -752,6 +782,13 @@ impl LocalSocket {
             (SocketDomain::Unix, SocketAddress::Unix(UnixSockAddr::Unnamed)) => {
                 Err(SysError::EINVAL)
             }
+            (SocketDomain::Netlink, SocketAddress::Netlink) => Ok((
+                InetEndpoint {
+                    ip: ANY_IP,
+                    port: 0,
+                },
+                None,
+            )),
             (SocketDomain::Packet, _) => Err(SysError::EAFNOSUPPORT),
             _ => Err(SysError::EAFNOSUPPORT),
         }
@@ -834,6 +871,9 @@ impl LocalSocket {
     }
 
     fn send_datagram(&self, data: &[u8], remote: Option<SocketAddress>) -> SysResult<usize> {
+        if self.inner.exclusive_access().domain == SocketDomain::Netlink {
+            return self.send_netlink_route(data);
+        }
         let local = self.ensure_bound(SocketKind::Datagram)?;
         let local_unix = self.inner.exclusive_access().unix_local.clone();
         if remote.is_none()
@@ -920,6 +960,26 @@ impl LocalSocket {
         Ok(data.len())
     }
 
+    fn send_netlink_route(&self, request: &[u8]) -> SysResult<usize> {
+        let responses = build_netlink_route_responses(request)?;
+        let read_waiters = {
+            let mut inner = self.inner.exclusive_access();
+            for data in responses {
+                inner.datagram_rx.push_back(Datagram {
+                    data,
+                    from: InetEndpoint {
+                        ip: ANY_IP,
+                        port: 0,
+                    },
+                    from_unix: None,
+                });
+            }
+            inner.read_poll_waiters.drain()
+        };
+        PollWaiter::wake_all(read_waiters);
+        Ok(request.len())
+    }
+
     fn recv_bytes(
         &self,
         buf: UserBuffer,
@@ -993,12 +1053,29 @@ impl LocalSocket {
                     SocketDomain::Inet => SocketAddress::Inet(packet.from),
                     SocketDomain::Inet6 => SocketAddress::Inet6(packet.from),
                     SocketDomain::Packet => SocketAddress::Inet(packet.from),
+                    SocketDomain::Netlink => SocketAddress::Netlink,
                     SocketDomain::Unix => SocketAddress::Unix(match packet.from_unix {
                         Some(address) => UnixSockAddr::Named(address),
                         None => UnixSockAddr::Unnamed,
                     }),
                 };
                 return Ok((copied, Some(from)));
+            }
+            if nonblock {
+                return Err(SysError::EAGAIN);
+            }
+            if current_has_unmasked_signal() {
+                return Err(SysError::EINTR);
+            }
+            suspend_current_and_run_next();
+        }
+    }
+
+    fn recv_raw_datagram(&self, nonblock: bool) -> SysResult<Vec<u8>> {
+        loop {
+            let packet = self.inner.exclusive_access().datagram_rx.pop_front();
+            if let Some(packet) = packet {
+                return Ok(packet.data);
             }
             if nonblock {
                 return Err(SysError::EAGAIN);
@@ -1021,6 +1098,7 @@ impl LocalSocket {
                 ip: ANY_IP,
                 port: 0,
             })),
+            SocketDomain::Netlink => SocketAddress::Netlink,
             SocketDomain::Packet => SocketAddress::Inet(inner.local.unwrap_or(InetEndpoint {
                 ip: ANY_IP,
                 port: 0,
@@ -1038,6 +1116,7 @@ impl LocalSocket {
         Ok(match inner.domain {
             SocketDomain::Inet => SocketAddress::Inet(peer),
             SocketDomain::Inet6 => SocketAddress::Inet6(peer),
+            SocketDomain::Netlink => SocketAddress::Netlink,
             SocketDomain::Packet => SocketAddress::Inet(peer),
             SocketDomain::Unix => SocketAddress::Unix(match inner.unix_peer.clone() {
                 Some(address) => UnixSockAddr::Named(address),
@@ -1701,6 +1780,12 @@ fn read_socket_address(token: usize, ptr: usize, len: u32) -> SysResult<SocketAd
             Ok(SocketAddress::Inet6(sockaddr_in6_to_endpoint(addr)?))
         }
         AF_UNIX => Ok(SocketAddress::Unix(read_unix_sockaddr(token, ptr, len)?)),
+        AF_NETLINK => {
+            if (len as usize) < size_of::<LinuxSockAddrNl>() {
+                return Err(SysError::EINVAL);
+            }
+            Ok(SocketAddress::Netlink)
+        }
         _ => Err(SysError::EAFNOSUPPORT),
     }
 }
@@ -1760,6 +1845,22 @@ fn write_socket_address(
                 &endpoint_to_sockaddr_in6(endpoint),
             )?;
             write_user_value(token, len_ptr, &(size_of::<LinuxSockAddrIn6>() as u32))?;
+        }
+        SocketAddress::Netlink => {
+            if (len as usize) < size_of::<LinuxSockAddrNl>() {
+                return Err(SysError::EINVAL);
+            }
+            write_user_value(
+                token,
+                addr as *mut LinuxSockAddrNl,
+                &LinuxSockAddrNl {
+                    family: AF_NETLINK as u16,
+                    pad: 0,
+                    pid: 0,
+                    groups: 0,
+                },
+            )?;
+            write_user_value(token, len_ptr, &(size_of::<LinuxSockAddrNl>() as u32))?;
         }
         SocketAddress::Unix(unix_addr) => {
             write_unix_sockaddr(token, addr, len_ptr, len as usize, unix_addr)?;
@@ -1878,6 +1979,33 @@ fn read_msg_iovecs(token: usize, iov: usize, iovlen: usize) -> SysResult<Vec<u8>
         data.extend_from_slice(&copy_user_to_vec(token, entry.base, entry.len)?);
     }
     Ok(data)
+}
+
+fn copy_to_msg_iovecs(token: usize, iov: usize, iovlen: usize, data: &[u8]) -> SysResult<usize> {
+    if iovlen == 0 {
+        return Ok(0);
+    }
+    if iov == 0 || iovlen > 1024 {
+        return Err(SysError::EINVAL);
+    }
+    let mut written = 0usize;
+    for index in 0..iovlen {
+        if written == data.len() {
+            break;
+        }
+        let entry = read_user_array_item(token, iov as *const LinuxIovec, index)?;
+        if entry.len == 0 {
+            continue;
+        }
+        let copy_len = entry.len.min(data.len() - written);
+        copy_to_user(
+            token,
+            entry.base as *mut u8,
+            &data[written..written + copy_len],
+        )?;
+        written += copy_len;
+    }
+    Ok(written)
 }
 
 trait VecLenChecked {
@@ -2017,6 +2145,121 @@ fn read_u32_ne(bytes: &[u8]) -> u32 {
     let mut raw = [0u8; size_of::<u32>()];
     raw.copy_from_slice(&bytes[..size_of::<u32>()]);
     u32::from_ne_bytes(raw)
+}
+
+fn read_u16_ne_at(bytes: &[u8], offset: usize) -> SysResult<u16> {
+    if bytes.len() < offset + size_of::<u16>() {
+        return Err(SysError::EINVAL);
+    }
+    Ok(u16::from_ne_bytes([bytes[offset], bytes[offset + 1]]))
+}
+
+fn read_u32_ne_at(bytes: &[u8], offset: usize) -> SysResult<u32> {
+    if bytes.len() < offset + size_of::<u32>() {
+        return Err(SysError::EINVAL);
+    }
+    Ok(u32::from_ne_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ]))
+}
+
+fn push_u16_ne(data: &mut Vec<u8>, value: u16) {
+    data.extend_from_slice(&value.to_ne_bytes());
+}
+
+fn push_i32_ne(data: &mut Vec<u8>, value: i32) {
+    data.extend_from_slice(&value.to_ne_bytes());
+}
+
+fn push_u32_ne(data: &mut Vec<u8>, value: u32) {
+    data.extend_from_slice(&value.to_ne_bytes());
+}
+
+fn netlink_align(len: usize) -> usize {
+    (len + 3) & !3
+}
+
+fn pad_netlink(data: &mut Vec<u8>) {
+    let aligned = netlink_align(data.len());
+    data.resize(aligned, 0);
+}
+
+fn push_netlink_header(data: &mut Vec<u8>, len: u32, ty: u16, flags: u16, seq: u32, pid: u32) {
+    push_u32_ne(data, len);
+    push_u16_ne(data, ty);
+    push_u16_ne(data, flags);
+    push_u32_ne(data, seq);
+    push_u32_ne(data, pid);
+}
+
+fn push_netlink_done(seq: u32, pid: u32) -> Vec<u8> {
+    let mut data = Vec::new();
+    push_netlink_header(
+        &mut data,
+        size_of::<u32>() as u32 * 4,
+        NLMSG_DONE,
+        NLM_F_MULTI,
+        seq,
+        pid,
+    );
+    data
+}
+
+fn push_loopback_link(seq: u32, pid: u32) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(AF_UNSPEC as u8);
+    payload.push(0);
+    push_u16_ne(&mut payload, ARPHRD_LOOPBACK);
+    push_i32_ne(&mut payload, LOOPBACK_IF_INDEX);
+    push_u32_ne(&mut payload, IFF_UP | IFF_LOOPBACK | IFF_RUNNING);
+    push_u32_ne(&mut payload, 0);
+
+    let attr_start = payload.len();
+    push_u16_ne(&mut payload, (size_of::<u16>() * 2 + 3) as u16);
+    push_u16_ne(&mut payload, IFLA_IFNAME);
+    payload.extend_from_slice(b"lo\0");
+    pad_netlink(&mut payload);
+
+    let msg_len = size_of::<u32>() * 4 + payload.len();
+    let mut data = Vec::new();
+    push_netlink_header(
+        &mut data,
+        msg_len as u32,
+        RTM_NEWLINK,
+        NLM_F_MULTI,
+        seq,
+        pid,
+    );
+    data.extend_from_slice(&payload);
+    debug_assert_eq!(data.len(), msg_len);
+    debug_assert!(payload.len() > attr_start);
+    data
+}
+
+fn build_netlink_route_responses(request: &[u8]) -> SysResult<Vec<Vec<u8>>> {
+    if request.len() < size_of::<u32>() * 4 {
+        return Err(SysError::EINVAL);
+    }
+    let msg_len = read_u32_ne_at(request, 0)? as usize;
+    if msg_len < size_of::<u32>() * 4 || msg_len > request.len() {
+        return Err(SysError::EINVAL);
+    }
+    let msg_type = read_u16_ne_at(request, 4)?;
+    let seq = read_u32_ne_at(request, 8)?;
+    let pid = read_u32_ne_at(request, 12)?;
+    let mut responses = Vec::new();
+    if msg_type == RTM_GETLINK {
+        responses.push(push_loopback_link(seq, pid));
+    }
+    if matches!(msg_type, RTM_GETLINK | RTM_GETADDR) {
+        responses.push(push_netlink_done(seq, pid));
+        Ok(responses)
+    } else {
+        Err(SysError::ENOTSUP)
+    }
 }
 
 fn cmsg_align(len: usize) -> usize {
@@ -2166,6 +2409,16 @@ pub fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
     if domain == AF_ALG {
         AfAlgSocket::validate_socket_type(ty, protocol)?;
         let socket = AfAlgSocket::new_listener(flags);
+        return Ok(alloc_socket_fd(socket, flags)? as isize);
+    }
+    if domain == AF_NETLINK {
+        if !matches!(ty & SOCK_TYPE_MASK, SOCK_RAW | SOCK_DGRAM) {
+            return Err(SysError::EPROTONOSUPPORT);
+        }
+        if protocol != NETLINK_ROUTE {
+            return Err(SysError::EPROTONOSUPPORT);
+        }
+        let socket = LocalSocket::new(SocketDomain::Netlink, SocketKind::Datagram, flags);
         return Ok(alloc_socket_fd(socket, flags)? as isize);
     }
     if domain == AF_PACKET {
@@ -2532,12 +2785,45 @@ pub fn sys_sendmsg(fd: usize, msg: usize, _flags: i32) -> SysResult {
         let msg = read_user_value(token, msg as *const LinuxMsghdr)?;
         return Ok(socket.send_msg(msg)? as isize);
     }
+    if let Some(socket) = file.as_any().downcast_ref::<LocalSocket>()
+        && socket.domain() == SocketDomain::Netlink
+    {
+        let token = current_user_token();
+        let msg = read_user_value(token, msg as *const LinuxMsghdr)?;
+        let data = read_msg_iovecs(token, msg.msg_iov, msg.msg_iovlen)?;
+        return Ok(socket.send_bytes(&data, None)? as isize);
+    }
     // UNFINISHED: scatter/gather socket messages and control messages are not
     // implemented for the local loopback socket subset.
     Err(SysError::ENOSYS)
 }
 
-pub fn sys_recvmsg(_fd: usize, _msg: usize, _flags: i32) -> SysResult {
+pub fn sys_recvmsg(fd: usize, msg: usize, flags: i32) -> SysResult {
+    let file = file_from_fd(fd)?;
+    if let Some(socket) = file.as_any().downcast_ref::<LocalSocket>()
+        && socket.domain() == SocketDomain::Netlink
+    {
+        let token = current_user_token();
+        let mut msg_value = read_user_value(token, msg as *const LinuxMsghdr)?;
+        let data = socket.recv_raw_datagram(recv_nonblock(flags, socket))?;
+        let copied = copy_to_msg_iovecs(token, msg_value.msg_iov, msg_value.msg_iovlen, &data)?;
+        if msg_value.msg_name != 0 && msg_value.msg_namelen as usize >= size_of::<LinuxSockAddrNl>()
+        {
+            write_user_value(
+                token,
+                msg_value.msg_name as *mut LinuxSockAddrNl,
+                &LinuxSockAddrNl {
+                    family: AF_NETLINK as u16,
+                    pad: 0,
+                    pid: 0,
+                    groups: 0,
+                },
+            )?;
+            msg_value.msg_namelen = size_of::<LinuxSockAddrNl>() as u32;
+        }
+        write_user_value(token, msg as *mut LinuxMsghdr, &msg_value)?;
+        return Ok(copied as isize);
+    }
     // UNFINISHED: scatter/gather socket messages and control messages are not
     // implemented for the local loopback socket subset.
     Err(SysError::ENOSYS)

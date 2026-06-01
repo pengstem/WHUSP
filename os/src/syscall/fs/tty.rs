@@ -38,8 +38,12 @@ const BLKSSZGET: usize = 0x1268;
 const BLKGETSIZE64: usize = 0x8008_1272;
 const RNDGETENTCNT: usize = 0x8004_5200;
 const TUNGETFEATURES: usize = 0x8004_54cf;
+const SIOCGIFNAME: usize = 0x8910;
+const SIOCGIFCONF: usize = 0x8912;
+const SIOCGIFFLAGS: usize = 0x8913;
 const SIOCSIFFLAGS: usize = 0x8914;
 const SIOCSIFMTU: usize = 0x8922;
+const SIOCGIFINDEX: usize = 0x8933;
 const EVIOCGVERSION: usize = 0x8004_4501;
 const EVIOCGID: usize = 0x8008_4502;
 const EVIOCGREP: usize = 0x8008_4503;
@@ -117,6 +121,11 @@ const UINPUT_VERSION: u32 = 5;
 const INPUT_REP_DELAY_MS: u32 = 250;
 const INPUT_REP_PERIOD_MS: u32 = 33;
 const RANDOM_ENTROPY_AVAIL: i32 = 256;
+const IFNAMSIZ: usize = 16;
+const IFREQ_DATA_LEN: usize = 24;
+const IFREQ_SIZE: usize = IFNAMSIZ + IFREQ_DATA_LEN;
+const LOOPBACK_IF_INDEX: i32 = 1;
+const LOOPBACK_IF_FLAGS: i16 = 0x1 | 0x8 | 0x40;
 const LO_FLAGS_READ_ONLY: u32 = 1;
 const LO_FLAGS_AUTOCLEAR: u32 = 4;
 const LO_FLAGS_PARTSCAN: u32 = 8;
@@ -356,10 +365,8 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
         return Ok(0);
     }
 
-    if file.is_socket() && matches!(request, SIOCSIFFLAGS | SIOCSIFMTU) {
-        let token = current_user_token();
-        let _ = read_user_value(token, argp as *const u8)?;
-        return Ok(0);
+    if file.is_socket() {
+        return handle_socket_if_ioctl(request, argp);
     }
 
     if let Some(namespace) = namespace_info_from_file(file.as_ref()) {
@@ -937,6 +944,105 @@ struct LinuxRtcTime {
     tm_wday: i32,
     tm_yday: i32,
     tm_isdst: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxIfReq {
+    ifr_name: [u8; IFNAMSIZ],
+    ifr_data: [u8; IFREQ_DATA_LEN],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxIfConf {
+    ifc_len: i32,
+    ifc_buf: usize,
+}
+
+fn loopback_ifreq() -> LinuxIfReq {
+    let mut req = LinuxIfReq::default();
+    req.ifr_name[..2].copy_from_slice(b"lo");
+    set_ifreq_i32(&mut req, LOOPBACK_IF_INDEX);
+    req
+}
+
+fn ifreq_name(req: &LinuxIfReq) -> &[u8] {
+    let end = req
+        .ifr_name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(IFNAMSIZ);
+    &req.ifr_name[..end]
+}
+
+fn ifreq_i32(req: &LinuxIfReq) -> i32 {
+    i32::from_ne_bytes([
+        req.ifr_data[0],
+        req.ifr_data[1],
+        req.ifr_data[2],
+        req.ifr_data[3],
+    ])
+}
+
+fn set_ifreq_i32(req: &mut LinuxIfReq, value: i32) {
+    req.ifr_data[..4].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn set_ifreq_i16(req: &mut LinuxIfReq, value: i16) {
+    req.ifr_data[..2].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn handle_socket_if_ioctl(request: usize, argp: usize) -> SysResult {
+    let token = current_user_token();
+    match request {
+        SIOCGIFINDEX => {
+            let mut req = read_user_value(token, argp as *const LinuxIfReq)?;
+            if ifreq_name(&req) != b"lo" {
+                return Err(SysError::ENODEV);
+            }
+            set_ifreq_i32(&mut req, LOOPBACK_IF_INDEX);
+            write_user_value(token, argp as *mut LinuxIfReq, &req)?;
+            Ok(0)
+        }
+        SIOCGIFNAME => {
+            let mut req = read_user_value(token, argp as *const LinuxIfReq)?;
+            if ifreq_i32(&req) != LOOPBACK_IF_INDEX {
+                return Err(SysError::ENXIO);
+            }
+            req.ifr_name = [0; IFNAMSIZ];
+            req.ifr_name[..2].copy_from_slice(b"lo");
+            write_user_value(token, argp as *mut LinuxIfReq, &req)?;
+            Ok(0)
+        }
+        SIOCGIFFLAGS => {
+            let mut req = read_user_value(token, argp as *const LinuxIfReq)?;
+            if ifreq_name(&req) != b"lo" {
+                return Err(SysError::ENODEV);
+            }
+            set_ifreq_i16(&mut req, LOOPBACK_IF_FLAGS);
+            write_user_value(token, argp as *mut LinuxIfReq, &req)?;
+            Ok(0)
+        }
+        SIOCGIFCONF => {
+            let mut conf = read_user_value(token, argp as *const LinuxIfConf)?;
+            if conf.ifc_buf != 0 && conf.ifc_len as usize >= IFREQ_SIZE {
+                let req = loopback_ifreq();
+                let mut bytes = [0u8; IFREQ_SIZE];
+                bytes[..IFNAMSIZ].copy_from_slice(&req.ifr_name);
+                bytes[IFNAMSIZ..].copy_from_slice(&req.ifr_data);
+                copy_to_user(token, conf.ifc_buf as *mut u8, &bytes)?;
+            }
+            conf.ifc_len = IFREQ_SIZE as i32;
+            write_user_value(token, argp as *mut LinuxIfConf, &conf)?;
+            Ok(0)
+        }
+        SIOCSIFFLAGS | SIOCSIFMTU => {
+            let _ = read_user_value(token, argp as *const u8)?;
+            Ok(0)
+        }
+        _ => Err(SysError::ENOTTY),
+    }
 }
 
 fn handle_rtc_ioctl(request: usize, argp: usize) -> SysResult {
