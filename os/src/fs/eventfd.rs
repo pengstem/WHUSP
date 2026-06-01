@@ -3,8 +3,13 @@ use super::{
     File, FileStat, FsError, FsResult, OpenFlags, PollEvents, PollWaitQueue, PollWaiter, S_IFIFO,
 };
 use crate::mm::UserBuffer;
+use crate::perf;
 use crate::sync::UPIntrFreeCell;
-use crate::task::{current_has_unmasked_signal, suspend_current_and_run_next};
+use crate::task::{
+    TaskControlBlock, block_current_task_no_schedule, current_has_unmasked_signal, current_task,
+    schedule, wakeup_task,
+};
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::convert::TryInto;
 use core::mem::size_of;
@@ -16,6 +21,8 @@ const EVENTFD_COUNTER_MAX: u64 = u64::MAX - 1;
 struct EventFdInner {
     counter: u64,
     semaphore: bool,
+    read_wait_queue: VecDeque<Arc<TaskControlBlock>>,
+    write_wait_queue: VecDeque<Arc<TaskControlBlock>>,
     read_poll_waiters: PollWaitQueue,
     write_poll_waiters: PollWaitQueue,
 }
@@ -32,12 +39,69 @@ impl EventFd {
                 UPIntrFreeCell::new(EventFdInner {
                     counter: initval,
                     semaphore,
+                    read_wait_queue: VecDeque::new(),
+                    write_wait_queue: VecDeque::new(),
                     read_poll_waiters: PollWaitQueue::new(),
                     write_poll_waiters: PollWaitQueue::new(),
                 })
             },
             status_flags: StatusFlagsCell::new(OpenFlags::empty()),
         }
+    }
+}
+
+impl EventFdInner {
+    fn sleep_reader(&mut self) -> *mut crate::task::TaskContext {
+        let (task, task_cx_ptr) = block_current_task_no_schedule();
+        self.read_wait_queue.push_back(task);
+        task_cx_ptr
+    }
+
+    fn sleep_writer(&mut self) -> *mut crate::task::TaskContext {
+        let (task, task_cx_ptr) = block_current_task_no_schedule();
+        self.write_wait_queue.push_back(task);
+        task_cx_ptr
+    }
+
+    fn wake_reader(&mut self) -> Option<Arc<TaskControlBlock>> {
+        self.read_wait_queue.pop_front()
+    }
+
+    fn wake_writer(&mut self) -> Option<Arc<TaskControlBlock>> {
+        self.write_wait_queue.pop_front()
+    }
+
+    fn remove_reader(&mut self, task: &Arc<TaskControlBlock>) {
+        remove_waiter(&mut self.read_wait_queue, task);
+    }
+
+    fn remove_writer(&mut self, task: &Arc<TaskControlBlock>) {
+        remove_waiter(&mut self.write_wait_queue, task);
+    }
+}
+
+fn remove_waiter(queue: &mut VecDeque<Arc<TaskControlBlock>>, task: &Arc<TaskControlBlock>) {
+    if let Some(index) = queue
+        .iter()
+        .position(|candidate| Arc::ptr_eq(candidate, task))
+    {
+        queue.remove(index);
+    }
+}
+
+fn wake_eventfd_reader(task: Option<Arc<TaskControlBlock>>) {
+    if let Some(task) = task
+        && wakeup_task(task)
+    {
+        perf::record_eventfd_reader_wakeup();
+    }
+}
+
+fn wake_eventfd_writer(task: Option<Arc<TaskControlBlock>>) {
+    if let Some(task) = task
+        && wakeup_task(task)
+    {
+        perf::record_eventfd_writer_wakeup();
     }
 }
 
@@ -58,29 +122,39 @@ impl File for EventFd {
         if buf.len() < size_of::<u64>() {
             return 0;
         }
+        perf::record_eventfd_read_call();
 
         loop {
-            let (value, poll_writers) = {
-                let mut inner = self.inner.exclusive_access();
-                if inner.counter == 0 {
-                    (0, alloc::vec::Vec::new())
-                } else if inner.semaphore {
-                    inner.counter -= 1;
-                    (1, inner.write_poll_waiters.drain())
-                } else {
-                    let value = inner.counter;
-                    inner.counter = 0;
-                    (value, inner.write_poll_waiters.drain())
+            let mut inner = self.inner.exclusive_access();
+            let (value, writer, poll_writers) = if inner.counter == 0 {
+                if self.status_flags().contains(OpenFlags::NONBLOCK) {
+                    return 0;
                 }
+                if current_has_unmasked_signal() {
+                    if let Some(task) = current_task() {
+                        inner.remove_reader(&task);
+                    }
+                    return 0;
+                }
+                perf::record_eventfd_reader_sleep();
+                let task_cx_ptr = inner.sleep_reader();
+                drop(inner);
+                schedule(task_cx_ptr);
+                continue;
+            } else if inner.semaphore {
+                inner.counter -= 1;
+                (1, inner.wake_writer(), inner.write_poll_waiters.drain())
+            } else {
+                let value = inner.counter;
+                inner.counter = 0;
+                (value, inner.wake_writer(), inner.write_poll_waiters.drain())
             };
+            drop(inner);
             if value != 0 {
+                wake_eventfd_writer(writer);
                 PollWaiter::wake_all(poll_writers);
                 return buf.copy_from_slice(&value.to_ne_bytes());
             }
-            if self.status_flags().contains(OpenFlags::NONBLOCK) || current_has_unmasked_signal() {
-                return 0;
-            }
-            suspend_current_and_run_next();
         }
     }
 
@@ -88,6 +162,7 @@ impl File for EventFd {
         if buf.len() < size_of::<u64>() {
             return 0;
         }
+        perf::record_eventfd_write_call();
         let data = buf.to_vec();
         let value = u64::from_ne_bytes(data[..size_of::<u64>()].try_into().unwrap());
         if value == u64::MAX {
@@ -95,28 +170,35 @@ impl File for EventFd {
         }
 
         loop {
-            let (wrote, poll_readers) = {
-                let mut inner = self.inner.exclusive_access();
+            let mut inner = self.inner.exclusive_access();
+            let (reader, poll_readers) =
                 if value <= EVENTFD_COUNTER_MAX.saturating_sub(inner.counter) {
                     inner.counter += value;
-                    let poll_readers = if value == 0 {
-                        alloc::vec::Vec::new()
+                    if value == 0 {
+                        (None, alloc::vec::Vec::new())
                     } else {
-                        inner.read_poll_waiters.drain()
-                    };
-                    (true, poll_readers)
+                        (inner.wake_reader(), inner.read_poll_waiters.drain())
+                    }
                 } else {
-                    (false, alloc::vec::Vec::new())
-                }
-            };
-            if wrote {
-                PollWaiter::wake_all(poll_readers);
-                return size_of::<u64>();
-            }
-            if self.status_flags().contains(OpenFlags::NONBLOCK) || current_has_unmasked_signal() {
-                return 0;
-            }
-            suspend_current_and_run_next();
+                    if self.status_flags().contains(OpenFlags::NONBLOCK) {
+                        return 0;
+                    }
+                    if current_has_unmasked_signal() {
+                        if let Some(task) = current_task() {
+                            inner.remove_writer(&task);
+                        }
+                        return 0;
+                    }
+                    perf::record_eventfd_writer_sleep();
+                    let task_cx_ptr = inner.sleep_writer();
+                    drop(inner);
+                    schedule(task_cx_ptr);
+                    continue;
+                };
+            drop(inner);
+            wake_eventfd_reader(reader);
+            PollWaiter::wake_all(poll_readers);
+            return size_of::<u64>();
         }
     }
 

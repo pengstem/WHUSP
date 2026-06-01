@@ -56,6 +56,14 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) mount_metadata_source_clone_bytes: usize,
     pub(crate) mount_fast_stat_flags_calls: usize,
     pub(crate) mount_fast_fs_type_calls: usize,
+    pub(crate) eventfd_read_calls: usize,
+    pub(crate) eventfd_write_calls: usize,
+    pub(crate) eventfd_read_block_yields: usize,
+    pub(crate) eventfd_write_block_yields: usize,
+    pub(crate) eventfd_reader_sleeps: usize,
+    pub(crate) eventfd_writer_sleeps: usize,
+    pub(crate) eventfd_reader_wakeups: usize,
+    pub(crate) eventfd_writer_wakeups: usize,
     pub(crate) pipe_read_calls: usize,
     pub(crate) pipe_write_calls: usize,
     pub(crate) pipe_read_bytes: usize,
@@ -193,6 +201,14 @@ mod enabled {
     static MOUNT_METADATA_SOURCE_CLONE_BYTES: AtomicUsize = AtomicUsize::new(0);
     static MOUNT_FAST_STAT_FLAGS_CALLS: AtomicUsize = AtomicUsize::new(0);
     static MOUNT_FAST_FS_TYPE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EVENTFD_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EVENTFD_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EVENTFD_READ_BLOCK_YIELDS: AtomicUsize = AtomicUsize::new(0);
+    static EVENTFD_WRITE_BLOCK_YIELDS: AtomicUsize = AtomicUsize::new(0);
+    static EVENTFD_READER_SLEEPS: AtomicUsize = AtomicUsize::new(0);
+    static EVENTFD_WRITER_SLEEPS: AtomicUsize = AtomicUsize::new(0);
+    static EVENTFD_READER_WAKEUPS: AtomicUsize = AtomicUsize::new(0);
+    static EVENTFD_WRITER_WAKEUPS: AtomicUsize = AtomicUsize::new(0);
 
     static PIPE_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PIPE_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -432,6 +448,30 @@ mod enabled {
 
     pub(crate) fn record_mount_fast_fs_type() {
         MOUNT_FAST_FS_TYPE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_eventfd_read_call() {
+        EVENTFD_READ_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_eventfd_write_call() {
+        EVENTFD_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_eventfd_reader_sleep() {
+        EVENTFD_READER_SLEEPS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_eventfd_writer_sleep() {
+        EVENTFD_WRITER_SLEEPS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_eventfd_reader_wakeup() {
+        EVENTFD_READER_WAKEUPS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_eventfd_writer_wakeup() {
+        EVENTFD_WRITER_WAKEUPS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_pipe_read_call() {
@@ -707,6 +747,14 @@ mod enabled {
                 .load(Ordering::Relaxed),
             mount_fast_stat_flags_calls: MOUNT_FAST_STAT_FLAGS_CALLS.load(Ordering::Relaxed),
             mount_fast_fs_type_calls: MOUNT_FAST_FS_TYPE_CALLS.load(Ordering::Relaxed),
+            eventfd_read_calls: EVENTFD_READ_CALLS.load(Ordering::Relaxed),
+            eventfd_write_calls: EVENTFD_WRITE_CALLS.load(Ordering::Relaxed),
+            eventfd_read_block_yields: EVENTFD_READ_BLOCK_YIELDS.load(Ordering::Relaxed),
+            eventfd_write_block_yields: EVENTFD_WRITE_BLOCK_YIELDS.load(Ordering::Relaxed),
+            eventfd_reader_sleeps: EVENTFD_READER_SLEEPS.load(Ordering::Relaxed),
+            eventfd_writer_sleeps: EVENTFD_WRITER_SLEEPS.load(Ordering::Relaxed),
+            eventfd_reader_wakeups: EVENTFD_READER_WAKEUPS.load(Ordering::Relaxed),
+            eventfd_writer_wakeups: EVENTFD_WRITER_WAKEUPS.load(Ordering::Relaxed),
             pipe_read_calls: PIPE_READ_CALLS.load(Ordering::Relaxed),
             pipe_write_calls: PIPE_WRITE_CALLS.load(Ordering::Relaxed),
             pipe_read_bytes: PIPE_READ_BYTES.load(Ordering::Relaxed),
@@ -849,6 +897,14 @@ mod enabled {
          mount_metadata_source_clone_bytes {}\n\
          mount_fast_stat_flags_calls {}\n\
          mount_fast_fs_type_calls {}\n\
+         eventfd_read_calls {}\n\
+         eventfd_write_calls {}\n\
+         eventfd_read_block_yields {}\n\
+         eventfd_write_block_yields {}\n\
+         eventfd_reader_sleeps {}\n\
+         eventfd_writer_sleeps {}\n\
+         eventfd_reader_wakeups {}\n\
+         eventfd_writer_wakeups {}\n\
          pipe_read_calls {}\n\
          pipe_write_calls {}\n\
          pipe_read_bytes {}\n\
@@ -973,6 +1029,14 @@ mod enabled {
             stats.mount_metadata_source_clone_bytes,
             stats.mount_fast_stat_flags_calls,
             stats.mount_fast_fs_type_calls,
+            stats.eventfd_read_calls,
+            stats.eventfd_write_calls,
+            stats.eventfd_read_block_yields,
+            stats.eventfd_write_block_yields,
+            stats.eventfd_reader_sleeps,
+            stats.eventfd_writer_sleeps,
+            stats.eventfd_reader_wakeups,
+            stats.eventfd_writer_wakeups,
             stats.pipe_read_calls,
             stats.pipe_write_calls,
             stats.pipe_read_bytes,
@@ -1170,6 +1234,24 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_mount_fast_fs_type() {}
+
+    #[inline(always)]
+    pub(crate) fn record_eventfd_read_call() {}
+
+    #[inline(always)]
+    pub(crate) fn record_eventfd_write_call() {}
+
+    #[inline(always)]
+    pub(crate) fn record_eventfd_reader_sleep() {}
+
+    #[inline(always)]
+    pub(crate) fn record_eventfd_writer_sleep() {}
+
+    #[inline(always)]
+    pub(crate) fn record_eventfd_reader_wakeup() {}
+
+    #[inline(always)]
+    pub(crate) fn record_eventfd_writer_wakeup() {}
 
     #[inline(always)]
     pub(crate) fn record_pipe_read_call() {}
