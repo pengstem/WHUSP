@@ -12,6 +12,7 @@ use super::{
 };
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::UserBuffer;
+use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
     TaskControlBlock, block_current_task_no_schedule, current_has_unmasked_signal, schedule,
@@ -1746,13 +1747,12 @@ fn write_console(user_buf: UserBuffer) -> usize {
     len
 }
 
-fn read_zero(user_buf: UserBuffer) -> usize {
+fn read_zero(mut user_buf: UserBuffer) -> usize {
     let len = user_buf.len();
-    for byte_ref in user_buf {
-        unsafe {
-            byte_ref.write_volatile(0);
-        }
+    for buffer in user_buf.buffers.iter_mut() {
+        buffer.fill(0);
     }
+    perf::record_dev_zero_read(len, 0, len);
     len
 }
 

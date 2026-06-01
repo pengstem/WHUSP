@@ -45,6 +45,10 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) frame_dealloc_refcount_drops: usize,
     pub(crate) frame_dealloc_recycled_scan_slots: usize,
     pub(crate) frame_dealloc_recycled_len_max: usize,
+    pub(crate) dev_zero_read_calls: usize,
+    pub(crate) dev_zero_read_bytes: usize,
+    pub(crate) dev_zero_read_byte_writes: usize,
+    pub(crate) dev_zero_read_fill_bytes: usize,
     pub(crate) pipe_read_calls: usize,
     pub(crate) pipe_write_calls: usize,
     pub(crate) pipe_read_bytes: usize,
@@ -171,6 +175,10 @@ mod enabled {
     static FRAME_DEALLOC_REFCOUNT_DROPS: AtomicUsize = AtomicUsize::new(0);
     static FRAME_DEALLOC_RECYCLED_SCAN_SLOTS: AtomicUsize = AtomicUsize::new(0);
     static FRAME_DEALLOC_RECYCLED_LEN_MAX: AtomicUsize = AtomicUsize::new(0);
+    static DEV_ZERO_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DEV_ZERO_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static DEV_ZERO_READ_BYTE_WRITES: AtomicUsize = AtomicUsize::new(0);
+    static DEV_ZERO_READ_FILL_BYTES: AtomicUsize = AtomicUsize::new(0);
 
     static PIPE_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PIPE_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -381,6 +389,13 @@ mod enabled {
         }
         FRAME_DEALLOC_RECYCLED_SCAN_SLOTS.fetch_add(recycled_scan_slots, Ordering::Relaxed);
         update_max(&FRAME_DEALLOC_RECYCLED_LEN_MAX, recycled_len);
+    }
+
+    pub(crate) fn record_dev_zero_read(bytes: usize, byte_writes: usize, fill_bytes: usize) {
+        DEV_ZERO_READ_CALLS.fetch_add(1, Ordering::Relaxed);
+        DEV_ZERO_READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        DEV_ZERO_READ_BYTE_WRITES.fetch_add(byte_writes, Ordering::Relaxed);
+        DEV_ZERO_READ_FILL_BYTES.fetch_add(fill_bytes, Ordering::Relaxed);
     }
 
     pub(crate) fn record_pipe_read_call() {
@@ -644,6 +659,10 @@ mod enabled {
             frame_dealloc_recycled_scan_slots: FRAME_DEALLOC_RECYCLED_SCAN_SLOTS
                 .load(Ordering::Relaxed),
             frame_dealloc_recycled_len_max: FRAME_DEALLOC_RECYCLED_LEN_MAX.load(Ordering::Relaxed),
+            dev_zero_read_calls: DEV_ZERO_READ_CALLS.load(Ordering::Relaxed),
+            dev_zero_read_bytes: DEV_ZERO_READ_BYTES.load(Ordering::Relaxed),
+            dev_zero_read_byte_writes: DEV_ZERO_READ_BYTE_WRITES.load(Ordering::Relaxed),
+            dev_zero_read_fill_bytes: DEV_ZERO_READ_FILL_BYTES.load(Ordering::Relaxed),
             pipe_read_calls: PIPE_READ_CALLS.load(Ordering::Relaxed),
             pipe_write_calls: PIPE_WRITE_CALLS.load(Ordering::Relaxed),
             pipe_read_bytes: PIPE_READ_BYTES.load(Ordering::Relaxed),
@@ -775,6 +794,10 @@ mod enabled {
          frame_dealloc_refcount_drops {}\n\
          frame_dealloc_recycled_scan_slots {}\n\
          frame_dealloc_recycled_len_max {}\n\
+         dev_zero_read_calls {}\n\
+         dev_zero_read_bytes {}\n\
+         dev_zero_read_byte_writes {}\n\
+         dev_zero_read_fill_bytes {}\n\
          pipe_read_calls {}\n\
          pipe_write_calls {}\n\
          pipe_read_bytes {}\n\
@@ -888,6 +911,10 @@ mod enabled {
             stats.frame_dealloc_refcount_drops,
             stats.frame_dealloc_recycled_scan_slots,
             stats.frame_dealloc_recycled_len_max,
+            stats.dev_zero_read_calls,
+            stats.dev_zero_read_bytes,
+            stats.dev_zero_read_byte_writes,
+            stats.dev_zero_read_fill_bytes,
             stats.pipe_read_calls,
             stats.pipe_write_calls,
             stats.pipe_read_bytes,
@@ -1067,6 +1094,9 @@ mod disabled {
         _recycled_len: usize,
     ) {
     }
+
+    #[inline(always)]
+    pub(crate) fn record_dev_zero_read(_bytes: usize, _byte_writes: usize, _fill_bytes: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_pipe_read_call() {}
