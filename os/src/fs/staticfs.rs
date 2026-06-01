@@ -7,6 +7,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
+use lazy_static::lazy_static;
 
 const ETC_NSSWITCH_CONF: &[u8] =
     b"passwd: files\ngroup: files\nhosts: files\nprotocols: files\nservices: files\nnetworks: files\n";
@@ -38,6 +39,8 @@ ltp_add_key05_7:x:10007:\n\
 ltp_add_key05_8:x:10008:\n\
 ltp_add_key05_9:x:10009:\n";
 const ETC_HOSTS: &[u8] = b"127.0.0.1 localhost localhost.localdomain\n";
+const ETC_SERVICES: &[u8] = b"echo 7/tcp\n\
+echo 7/udp\n";
 const ETC_RESOLV_CONF: &[u8] = b"";
 const ETC_PROTOCOLS: &[u8] = b"ip 0 IP\ntcp 6 TCP\nudp 17 UDP\n";
 const PROC_BUS_INPUT_DEVICES: &[u8] =
@@ -87,6 +90,7 @@ enum StaticNode {
     Passwd,
     Group,
     Hosts,
+    Services,
     ResolvConf,
     Protocols,
     ModulesDep,
@@ -129,14 +133,38 @@ pub struct StaticFile {
     status_flags: UPIntrFreeCell<OpenFlags>,
 }
 
+lazy_static! {
+    static ref HOSTS_CONTENT: UPIntrFreeCell<Vec<u8>> = {
+        let mut value = Vec::new();
+        value.extend_from_slice(ETC_HOSTS);
+        unsafe { UPIntrFreeCell::new(value) }
+    };
+}
+
 impl StaticFile {
     fn new(node: StaticNode, path: &'static str, flags: OpenFlags) -> Arc<Self> {
+        let offset = initial_offset(node, flags);
         Arc::new(Self {
             node,
             path,
-            offset: unsafe { UPIntrFreeCell::new(0) },
+            offset: unsafe { UPIntrFreeCell::new(offset) },
             status_flags: unsafe { UPIntrFreeCell::new(OpenFlags::file_status_flags(flags)) },
         })
+    }
+}
+
+fn initial_offset(node: StaticNode, flags: OpenFlags) -> usize {
+    if node != StaticNode::Hosts {
+        return 0;
+    }
+    let mut hosts = HOSTS_CONTENT.exclusive_access();
+    if flags.contains(OpenFlags::TRUNC) {
+        hosts.clear();
+    }
+    if flags.contains(OpenFlags::APPEND) {
+        hosts.len()
+    } else {
+        0
     }
 }
 
@@ -206,6 +234,7 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
         "/etc/passwd" => Some(StaticNode::Passwd),
         "/etc/group" => Some(StaticNode::Group),
         "/etc/hosts" => Some(StaticNode::Hosts),
+        "/etc/services" => Some(StaticNode::Services),
         "/etc/resolv.conf" => Some(StaticNode::ResolvConf),
         "/etc/protocols" => Some(StaticNode::Protocols),
         "/modules.dep"
@@ -305,6 +334,7 @@ fn canonical_path(node: StaticNode) -> &'static str {
         StaticNode::Passwd => "/etc/passwd",
         StaticNode::Group => "/etc/group",
         StaticNode::Hosts => "/etc/hosts",
+        StaticNode::Services => "/etc/services",
         StaticNode::ResolvConf => "/etc/resolv.conf",
         StaticNode::Protocols => "/etc/protocols",
         StaticNode::ModulesDep => "/lib/modules/6.8.0-whusp/modules.dep",
@@ -347,7 +377,8 @@ fn content(node: StaticNode) -> Option<Vec<u8>> {
         StaticNode::NsswitchConf => Some(ETC_NSSWITCH_CONF.to_vec()),
         StaticNode::Passwd => Some(ETC_PASSWD.to_vec()),
         StaticNode::Group => Some(ETC_GROUP.to_vec()),
-        StaticNode::Hosts => Some(ETC_HOSTS.to_vec()),
+        StaticNode::Hosts => Some(HOSTS_CONTENT.exclusive_access().clone()),
+        StaticNode::Services => Some(ETC_SERVICES.to_vec()),
         StaticNode::ResolvConf => Some(ETC_RESOLV_CONF.to_vec()),
         StaticNode::Protocols => Some(ETC_PROTOCOLS.to_vec()),
         StaticNode::ModulesDep => Some(MODULES_LOOP_DEP.to_vec()),
@@ -491,6 +522,7 @@ fn stat_node(node: StaticNode) -> FileStat {
         StaticNode::Passwd => 3,
         StaticNode::Group => 4,
         StaticNode::Hosts => 5,
+        StaticNode::Services => 56,
         StaticNode::ResolvConf => 6,
         StaticNode::Protocols => 7,
         StaticNode::ModulesDep => 15,
@@ -558,7 +590,7 @@ pub(crate) fn open_path(
         return Err(FsError::IsDir);
     }
     if (flags.writable_target() || flags.contains(OpenFlags::TRUNC))
-        && node != StaticNode::SysLoopReadAheadKb
+        && !matches!(node, StaticNode::SysLoopReadAheadKb | StaticNode::Hosts)
     {
         return Err(FsError::PermissionDenied);
     }
@@ -665,7 +697,10 @@ impl File for StaticFile {
     }
 
     fn writable(&self) -> bool {
-        self.node == StaticNode::SysLoopReadAheadKb
+        matches!(
+            self.node,
+            StaticNode::SysLoopReadAheadKb | StaticNode::Hosts
+        )
     }
 
     fn read(&self, mut user_buf: UserBuffer) -> usize {
@@ -680,6 +715,24 @@ impl File for StaticFile {
     }
 
     fn write(&self, user_buf: UserBuffer) -> usize {
+        if self.node == StaticNode::Hosts {
+            let data = user_buf.to_vec();
+            let mut hosts = HOSTS_CONTENT.exclusive_access();
+            let mut offset = self.offset.exclusive_access();
+            if self.status_flags().contains(OpenFlags::APPEND) {
+                *offset = hosts.len();
+            }
+            if *offset > hosts.len() {
+                hosts.resize(*offset, 0);
+            }
+            let end = (*offset).saturating_add(data.len());
+            if end > hosts.len() {
+                hosts.resize(end, 0);
+            }
+            hosts[*offset..end].copy_from_slice(&data);
+            *offset = end;
+            return data.len();
+        }
         if self.node != StaticNode::SysLoopReadAheadKb {
             return 0;
         }
