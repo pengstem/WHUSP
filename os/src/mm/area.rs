@@ -806,15 +806,8 @@ impl MapArea {
     }
 
     /// Tears down resident mmap pages and releases page-cache references.
-    ///
-    /// Returned flush records are currently empty by design; see the
-    /// `UNFINISHED` note below for the missing implicit MAP_SHARED writeback.
     pub(super) fn take_mmap_flushes(&mut self, page_table: &mut PageTable) -> Vec<MmapFlush> {
-        // UNFINISHED: Linux eventually writes dirty MAP_SHARED pages back on
-        // munmap/exit. This kernel currently makes msync() the explicit
-        // writeback boundary for file-backed mmap. Implicit writeback of large
-        // stress mappings exhausts lwext4/kernel heap before the contest runner
-        // can continue to the next case.
+        let flushes = self.collect_mmap_flushes(page_table);
         let data_frames = core::mem::take(&mut self.data_frames);
         for (vpn, _frame) in data_frames {
             if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
@@ -838,7 +831,7 @@ impl MapArea {
             }
         }
 
-        Vec::new()
+        flushes
     }
 
     /// Releases file-level accounting owned by this mmap VMA.
