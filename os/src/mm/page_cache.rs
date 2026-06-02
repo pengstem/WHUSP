@@ -289,13 +289,18 @@ impl PageCache {
 
     /// Drops clean unpinned ordinary-read pages for one file.
     pub(crate) fn invalidate_clean_unreferenced(&mut self, id: PageCacheId) -> (usize, usize) {
-        let scanned = self.pages.len();
+        let start = PageCacheKey { id, page_index: 0 };
+        let end = PageCacheKey {
+            id,
+            page_index: usize::MAX,
+        };
+        let mut scanned = 0usize;
         let victims: Vec<_> = self
             .pages
-            .iter()
+            .range(start..=end)
             .filter_map(|(key, page)| {
-                (key.id == id && page.ref_count == 0 && !page.dirty)
-                    .then_some((*key, page.lru_stamp))
+                scanned += 1;
+                (page.ref_count == 0 && !page.dirty).then_some((*key, page.lru_stamp))
             })
             .collect();
         let removed = victims.len();
