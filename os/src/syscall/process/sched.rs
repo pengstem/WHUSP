@@ -6,7 +6,7 @@ use crate::{
     },
     task::{
         TaskControlBlock, current_process, current_task, current_user_token, processes_snapshot,
-        reprioritize_ready_task,
+        reprioritize_ready_task, task_with_linux_tid,
     },
 };
 use alloc::{sync::Arc, vec, vec::Vec};
@@ -51,19 +51,6 @@ struct LinuxSchedAttr {
 const LINUX_SCHED_ATTR_SIZE: u32 = size_of::<LinuxSchedAttr>() as u32;
 const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
 const SCHED_ATTR_SUPPORTED_FLAGS: u64 = SCHED_FLAG_RESET_ON_FORK;
-
-fn task_with_linux_tid(tid: usize) -> Option<Arc<TaskControlBlock>> {
-    for process in processes_snapshot() {
-        if let Some(task) = process
-            .tasks_snapshot()
-            .into_iter()
-            .find(|task| task.linux_tid() == tid)
-        {
-            return Some(task);
-        }
-    }
-    None
-}
 
 fn sched_target_task(pid: isize) -> SysResult<Arc<TaskControlBlock>> {
     if pid < 0 {

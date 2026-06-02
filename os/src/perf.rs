@@ -16,6 +16,12 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) task_current_trap_cx_calls: usize,
     pub(crate) task_current_trap_cx_user_va_calls: usize,
     pub(crate) task_current_trap_return_context_calls: usize,
+    pub(crate) tid_lookup_calls: usize,
+    pub(crate) tid_lookup_process_visits: usize,
+    pub(crate) tid_lookup_task_visits: usize,
+    pub(crate) tid_lookup_hits: usize,
+    pub(crate) tid_lookup_index_hits: usize,
+    pub(crate) tid_lookup_stale_index_entries: usize,
     pub(crate) fd_alloc_calls: usize,
     pub(crate) fd_alloc_failures: usize,
     pub(crate) fd_alloc_probe_slots: usize,
@@ -195,6 +201,12 @@ mod enabled {
     static TASK_CURRENT_TRAP_CX_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TASK_CURRENT_TRAP_CX_USER_VA_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TASK_CURRENT_TRAP_RETURN_CONTEXT_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static TID_LOOKUP_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static TID_LOOKUP_PROCESS_VISITS: AtomicUsize = AtomicUsize::new(0);
+    static TID_LOOKUP_TASK_VISITS: AtomicUsize = AtomicUsize::new(0);
+    static TID_LOOKUP_HITS: AtomicUsize = AtomicUsize::new(0);
+    static TID_LOOKUP_INDEX_HITS: AtomicUsize = AtomicUsize::new(0);
+    static TID_LOOKUP_STALE_INDEX_ENTRIES: AtomicUsize = AtomicUsize::new(0);
 
     static FD_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FD_ALLOC_FAILURES: AtomicUsize = AtomicUsize::new(0);
@@ -654,6 +666,27 @@ mod enabled {
         LOCAL_SOCKET_WRITER_WAKEUPS.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_tid_lookup(
+        process_visits: usize,
+        task_visits: usize,
+        hit: bool,
+        index_hit: bool,
+        stale_index_entry: bool,
+    ) {
+        TID_LOOKUP_CALLS.fetch_add(1, Ordering::Relaxed);
+        TID_LOOKUP_PROCESS_VISITS.fetch_add(process_visits, Ordering::Relaxed);
+        TID_LOOKUP_TASK_VISITS.fetch_add(task_visits, Ordering::Relaxed);
+        if hit {
+            TID_LOOKUP_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+        if index_hit {
+            TID_LOOKUP_INDEX_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+        if stale_index_entry {
+            TID_LOOKUP_STALE_INDEX_ENTRIES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn record_pipe_read_call() {
         PIPE_READ_CALLS.fetch_add(1, Ordering::Relaxed);
     }
@@ -885,6 +918,12 @@ mod enabled {
                 .load(Ordering::Relaxed),
             task_current_trap_return_context_calls: TASK_CURRENT_TRAP_RETURN_CONTEXT_CALLS
                 .load(Ordering::Relaxed),
+            tid_lookup_calls: TID_LOOKUP_CALLS.load(Ordering::Relaxed),
+            tid_lookup_process_visits: TID_LOOKUP_PROCESS_VISITS.load(Ordering::Relaxed),
+            tid_lookup_task_visits: TID_LOOKUP_TASK_VISITS.load(Ordering::Relaxed),
+            tid_lookup_hits: TID_LOOKUP_HITS.load(Ordering::Relaxed),
+            tid_lookup_index_hits: TID_LOOKUP_INDEX_HITS.load(Ordering::Relaxed),
+            tid_lookup_stale_index_entries: TID_LOOKUP_STALE_INDEX_ENTRIES.load(Ordering::Relaxed),
             fd_alloc_calls: FD_ALLOC_CALLS.load(Ordering::Relaxed),
             fd_alloc_failures: FD_ALLOC_FAILURES.load(Ordering::Relaxed),
             fd_alloc_probe_slots: FD_ALLOC_PROBE_SLOTS.load(Ordering::Relaxed),
@@ -1078,6 +1117,12 @@ mod enabled {
          task_current_trap_cx_calls {}\n\
          task_current_trap_cx_user_va_calls {}\n\
          task_current_trap_return_context_calls {}\n\
+         tid_lookup_calls {}\n\
+         tid_lookup_process_visits {}\n\
+         tid_lookup_task_visits {}\n\
+         tid_lookup_hits {}\n\
+         tid_lookup_index_hits {}\n\
+         tid_lookup_stale_index_entries {}\n\
          fd_alloc_calls {}\n\
          fd_alloc_failures {}\n\
          fd_alloc_probe_slots {}\n\
@@ -1248,6 +1293,12 @@ mod enabled {
             stats.task_current_trap_cx_calls,
             stats.task_current_trap_cx_user_va_calls,
             stats.task_current_trap_return_context_calls,
+            stats.tid_lookup_calls,
+            stats.tid_lookup_process_visits,
+            stats.tid_lookup_task_visits,
+            stats.tid_lookup_hits,
+            stats.tid_lookup_index_hits,
+            stats.tid_lookup_stale_index_entries,
             stats.fd_alloc_calls,
             stats.fd_alloc_failures,
             stats.fd_alloc_probe_slots,
@@ -1466,6 +1517,16 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_task_current_trap_return_context_call() {}
+
+    #[inline(always)]
+    pub(crate) fn record_tid_lookup(
+        _process_visits: usize,
+        _task_visits: usize,
+        _hit: bool,
+        _index_hit: bool,
+        _stale_index_entry: bool,
+    ) {
+    }
 
     #[inline(always)]
     pub(crate) fn record_fd_alloc(

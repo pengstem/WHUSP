@@ -1,9 +1,9 @@
 use crate::task::{
-    MINSIGSTKSZ, ProcessControlBlock, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SS_DISABLE, SS_ONSTACK,
-    SigAltStack, SignalAction, SignalFlags, SignalInfo, TaskControlBlock,
-    block_current_task_no_schedule, current_has_interrupting_signal, current_process, current_task,
-    current_trap_cx, current_user_token, flags_to_linux_sigset, linux_sigset_to_flags, pid2process,
-    processes_snapshot, queue_signal_to_task, schedule,
+    MINSIGSTKSZ, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SS_DISABLE, SS_ONSTACK, SigAltStack,
+    SignalAction, SignalFlags, SignalInfo, TaskControlBlock, block_current_task_no_schedule,
+    current_has_interrupting_signal, current_process, current_task, current_trap_cx,
+    current_user_token, flags_to_linux_sigset, linux_sigset_to_flags, queue_signal_to_task,
+    schedule, task_with_linux_tid,
 };
 use crate::timer::get_time_ms;
 use alloc::sync::Arc;
@@ -168,25 +168,16 @@ fn validate_action_signum(signum: u32) -> SysResult<usize> {
     Ok(signum as usize)
 }
 
-fn task_with_tid(process: &ProcessControlBlock, tid: usize) -> Option<Arc<TaskControlBlock>> {
-    process
-        .tasks_snapshot()
-        .into_iter()
-        .find(|task| task.linux_tid() == tid)
-}
-
 fn find_task_by_linux_tid(tid: usize) -> Option<(usize, Arc<TaskControlBlock>)> {
-    for process in processes_snapshot() {
-        if let Some(task) = task_with_tid(&process, tid) {
-            return Some((process.getpid(), task));
-        }
-    }
-    None
+    let task = task_with_linux_tid(tid)?;
+    let process = task.process.upgrade()?;
+    Some((process.getpid(), task))
 }
 
 fn find_task_in_process_by_linux_tid(tgid: usize, tid: usize) -> Option<Arc<TaskControlBlock>> {
-    let process = pid2process(tgid)?;
-    task_with_tid(&process, tid)
+    let task = task_with_linux_tid(tid)?;
+    let process = task.process.upgrade()?;
+    (process.getpid() == tgid).then_some(task)
 }
 
 pub fn sys_tkill(tid: isize, signum: u32) -> SysResult {

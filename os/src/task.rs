@@ -25,7 +25,7 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::*;
 use log::info;
-use manager::fetch_task;
+use manager::{fetch_task, register_task_linux_tid, unregister_task_linux_tid};
 pub(crate) use process::{
     Credentials, PROCESS_PKEY_COUNT, PathSnapshot, ProcessProcSnapshot, RLimit, RLimitResource,
 };
@@ -47,6 +47,7 @@ pub(crate) use manager::list_process_snapshots;
 pub(crate) use manager::processes_snapshot;
 pub(crate) use manager::remove_ready_tasks_of_process;
 pub(crate) use manager::reprioritize_ready_task;
+pub(crate) use manager::task_with_linux_tid;
 pub use manager::{add_task, pid2process, remove_from_pid2process, wakeup_task};
 pub(crate) use manager::{wakeup_front_task, wakeup_timer_task};
 pub use processor::{
@@ -208,6 +209,7 @@ fn terminate_sibling_threads(
     let mut robust_tasks = Vec::new();
     let mut exited_threads = Vec::new();
     let mut released_thread_keyrings = Vec::new();
+    let mut exited_linux_tids = Vec::new();
     {
         let mut process_inner = process.inner_exclusive_access();
         for (tid, task_slot) in process_inner.tasks.iter_mut().enumerate() {
@@ -217,6 +219,7 @@ fn terminate_sibling_threads(
             let Some(task) = task_slot.as_ref().map(Arc::clone) else {
                 continue;
             };
+            exited_linux_tids.push(task.linux_tid());
             let mut task_inner = task.inner_exclusive_access();
             task_inner.task_status = TaskStatus::Exited;
             task_inner.exit_code = Some(exit_code);
@@ -238,6 +241,9 @@ fn terminate_sibling_threads(
         }
     }
 
+    for linux_tid in exited_linux_tids {
+        unregister_task_linux_tid(linux_tid);
+    }
     for task in robust_tasks {
         futex::exit_robust_list(&task, process_token, process_id);
     }
@@ -276,6 +282,8 @@ fn rebind_non_leader_for_exec(
     let mut robust_tasks = Vec::new();
     let mut exited_threads = Vec::new();
     let mut released_thread_keyrings = Vec::new();
+    let mut exited_linux_tids = Vec::new();
+    let mut old_current_linux_tid = None;
     {
         let mut process_inner = process.inner_exclusive_access();
         let current_slot_matches = process_inner
@@ -302,10 +310,12 @@ fn rebind_non_leader_for_exec(
                 continue;
             };
             if Arc::ptr_eq(&task, current) {
+                old_current_linux_tid = Some(task.linux_tid());
                 *task_slot = None;
                 continue;
             }
 
+            exited_linux_tids.push(task.linux_tid());
             let mut task_inner = task.inner_exclusive_access();
             task_inner.task_status = TaskStatus::Exited;
             task_inner.exit_code = Some(0);
@@ -344,6 +354,13 @@ fn rebind_non_leader_for_exec(
         }
     }
 
+    for linux_tid in exited_linux_tids {
+        unregister_task_linux_tid(linux_tid);
+    }
+    if let Some(linux_tid) = old_current_linux_tid {
+        unregister_task_linux_tid(linux_tid);
+    }
+    register_task_linux_tid(current);
     for task in robust_tasks {
         futex::exit_robust_list(&task, process_token, process_id);
     }
@@ -550,14 +567,21 @@ fn exit_current(exit_code: i32, group_exit: bool) {
         .expect("current task process must outlive the task");
     let process_token = process.inner_exclusive_access().get_user_token();
     let process_id = process.getpid();
-    let (tid, clear_child_tid, thread_keyring) = {
+    let (tid, linux_tid, clear_child_tid, thread_keyring) = {
         let mut task_inner = current.inner_exclusive_access();
+        let linux_tid = task_inner
+            .linux_tid
+            .as_ref()
+            .map(|handle| handle.0)
+            .unwrap_or(process_id);
         (
             task_inner.tid,
+            linux_tid,
             task_inner.clear_child_tid.take(),
             task_inner.thread_keyring.take(),
         )
     };
+    unregister_task_linux_tid(linux_tid);
     futex::exit_robust_list(&current, process_token, process_id);
     if let Some(clear_child_tid) = clear_child_tid {
         futex::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);

@@ -1,14 +1,12 @@
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
-    ProcessCpuTimesSnapshot, TaskControlBlock, block_current_task_no_schedule,
-    current_has_deliverable_signal, current_process, current_user_token, pid2process,
-    processes_snapshot, schedule,
+    ProcessCpuTimesSnapshot, block_current_task_no_schedule, current_has_deliverable_signal,
+    current_process, current_user_token, pid2process, schedule, task_with_linux_tid,
 };
 use crate::timer::{
     add_posix_timer, add_real_timer, add_timer, get_time_clock_ticks, get_time_ms, get_time_us,
     monotonic_time_nanos, set_wall_time_nanos, us_to_clock_ticks, wall_time_nanos,
 };
-use alloc::sync::Arc;
 use lazy_static::*;
 
 use super::errno::{SysError, SysResult};
@@ -707,13 +705,6 @@ fn clock_getres_resolution(clock_id: i32) -> SysResult<LinuxTimeSpec> {
 fn process_cpu_timespec() -> LinuxTimeSpec {
     let times = current_process().cpu_times_snapshot();
     us_to_timespec(times.user_us.saturating_add(times.system_us))
-}
-
-fn task_with_linux_tid(tid: usize) -> Option<Arc<TaskControlBlock>> {
-    processes_snapshot()
-        .into_iter()
-        .flat_map(|process| process.tasks_snapshot())
-        .find(|task| task.linux_tid() == tid)
 }
 
 fn cpu_clock_target_id(clock_id: i32) -> SysResult<(bool, usize)> {

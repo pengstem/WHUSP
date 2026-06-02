@@ -1,6 +1,6 @@
 use super::exec::{ExecStackInfo, init_user_stack};
 use super::id::RecycleAllocator;
-use super::manager::insert_into_pid2process;
+use super::manager::{insert_into_pid2process, register_task_linux_tid};
 use super::process::{
     Credentials, ProcessControlBlock, ProcessControlBlockInner, ProcessCpuTimes, ProcessFsContext,
     ProcessResourceLimits, ProcessTimers, comm_from_cmdline, empty_process_pkey_rights,
@@ -35,8 +35,11 @@ impl ProcessControlBlock {
         while inner.tasks.len() < tid + 1 {
             inner.tasks.push(None);
         }
-        inner.tasks[tid] = Some(task);
-        inner.memory_set.token()
+        inner.tasks[tid] = Some(Arc::clone(&task));
+        let token = inner.memory_set.token();
+        drop(inner);
+        register_task_linux_tid(&task);
+        token
     }
 
     /// Configures the cloned main task after fork-style process creation.
