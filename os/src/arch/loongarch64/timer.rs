@@ -89,7 +89,7 @@ pub fn set_next_trigger() {
 
 pub struct TimerCondVar {
     pub expire_ms: usize,
-    pub task: Arc<TaskControlBlock>,
+    pub task: Weak<TaskControlBlock>,
 }
 
 pub struct RealTimerEvent {
@@ -185,7 +185,10 @@ lazy_static! {
 
 pub fn add_timer(expire_ms: usize, task: Arc<TaskControlBlock>) {
     let mut timers = TIMERS.exclusive_access();
-    timers.push(TimerCondVar { expire_ms, task });
+    timers.push(TimerCondVar {
+        expire_ms,
+        task: Arc::downgrade(&task),
+    });
 }
 
 pub fn add_real_timer(expire_us: usize, generation: u64, process: Arc<ProcessControlBlock>) {
@@ -273,8 +276,10 @@ pub fn check_timer() {
     TIMERS.exclusive_session(|timers| {
         while let Some(timer) = timers.peek() {
             if timer.expire_ms <= current_ms {
-                wakeup_timer_task(Arc::clone(&timer.task));
-                timers.pop();
+                let timer = timers.pop().unwrap();
+                if let Some(task) = timer.task.upgrade() {
+                    wakeup_timer_task(task);
+                }
             } else {
                 break;
             }
