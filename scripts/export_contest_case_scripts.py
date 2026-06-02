@@ -273,9 +273,6 @@ whusp_setup_runtime_environment() {
         /musl/busybox printf '#!/musl/busybox sh\\n/musl/busybox cp "$4" "$3"\\nexit $?\\n' > /tmp/bin/$cmd
         /musl/busybox chmod +x /tmp/bin/$cmd
     done
-    /musl/busybox rm -f /tmp/bin/sendfile01.sh
-    /musl/busybox printf '#!/musl/busybox sh\\npass=$(/musl/busybox printf "\\\\033[1;32mTPASS: \\\\033[0m")\\ni=1\\nwhile [ "$i" -le 4 ]; do\\n    echo "sendfile01 $i ${pass}copied files with sendfile compatibility path"\\n    i=$((i + 1))\\ndone\\necho\\necho "Summary:"\\necho "passed   4"\\necho "failed   0"\\necho "broken   0"\\necho "skipped  0"\\necho "warnings 0"\\nexit 0\\n' > /tmp/bin/sendfile01.sh
-    /musl/busybox chmod +x /tmp/bin/sendfile01.sh
     for cmd in ns-icmp_redirector ns-udpsender; do
         /musl/busybox rm -f /tmp/bin/$cmd
         /musl/busybox printf '#!/musl/busybox sh\\nexit 0\\n' > /tmp/bin/$cmd
@@ -334,16 +331,6 @@ whusp_ltp_eval_case() {
         *)
             _whusp_ltp_args="${case_cmd#$_whusp_ltp_prog}"
             _whusp_ltp_override="/tmp/bin/$_whusp_ltp_prog"
-            case "$case_name" in
-                sendfile)
-                    if [ -x "$_whusp_ltp_override" ]; then
-                        eval "$_whusp_ltp_override$_whusp_ltp_args"
-                        ret=$?
-                        unset _whusp_ltp_prog _whusp_ltp_path _whusp_ltp_args _whusp_ltp_override
-                        return
-                    fi
-                    ;;
-            esac
             _whusp_ltp_path="./$_whusp_ltp_prog"
             if [ -f "$_whusp_ltp_path" ]; then
                 eval "$_whusp_ltp_path$_whusp_ltp_args"
@@ -603,15 +590,6 @@ def ltp_static_command_args(case: LtpCase) -> list[str]:
 
 
 def ltp_static_case_block(case: LtpCase) -> str:
-    if case.name in {"sendfile"}:
-        return "\n".join(
-            [
-                f"case_name={sh_quote(case.name)}",
-                f"case_cmd={sh_quote(case.command)}",
-                "whusp_ltp_run_current_case",
-            ]
-        )
-
     command_args = ltp_static_command_args(case)
     command = " ".join(sh_quote(arg) for arg in command_args)
     lines = [
