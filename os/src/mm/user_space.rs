@@ -67,6 +67,30 @@ pub enum MmapFaultResult {
     FatalSigbus,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum FutexSharedKey {
+    File {
+        id: PageCacheId,
+        offset: usize,
+    },
+    VfsNode {
+        node: crate::fs::VfsNodeId,
+        offset: usize,
+    },
+    FileObject {
+        object: usize,
+        offset: usize,
+    },
+    Shm {
+        shmid: usize,
+        offset: usize,
+    },
+    AnonymousPage {
+        ppn: usize,
+        offset: usize,
+    },
+}
+
 enum GrowDownMmapFault {
     Grown(usize),
     GuardBlocked,
@@ -865,6 +889,49 @@ impl MemorySet {
                 (area.is_shm() && end_vpn < area.vpn_range.get_end()).then_some(area)
             })
             .and_then(MapArea::shm_segment_id)
+    }
+
+    pub(crate) fn futex_shared_key(&self, addr: usize) -> Option<FutexSharedKey> {
+        let vpn = VirtAddr::from(addr).floor();
+        let idx = self.find_area_idx_containing(vpn)?;
+        let area = &self.areas[idx];
+        let area_start = usize::from(VirtAddr::from(area.vpn_range.get_start()));
+        let area_offset = addr.checked_sub(area_start)?;
+        if let Some(info) = &area.mmap_info
+            && info.shared
+        {
+            if let Some(id) = info.page_cache_id {
+                return Some(FutexSharedKey::File {
+                    id,
+                    offset: info.file_offset.checked_add(area_offset)?,
+                });
+            }
+            if let Some(file) = &info.backing_file {
+                let offset = info.file_offset.checked_add(area_offset)?;
+                if let Some(node) = file.vfs_node_id() {
+                    return Some(FutexSharedKey::VfsNode { node, offset });
+                }
+                return Some(FutexSharedKey::FileObject {
+                    object: Arc::as_ptr(file) as *const () as usize,
+                    offset,
+                });
+            }
+            if info.backing_file.is_none()
+                && let Some(pte) = self.page_table.translate(vpn).filter(|pte| pte.bits != 0)
+            {
+                return Some(FutexSharedKey::AnonymousPage {
+                    ppn: pte.ppn().0,
+                    offset: addr & (PAGE_SIZE - 1),
+                });
+            }
+        }
+        if let Some(info) = &area.shm_info {
+            return Some(FutexSharedKey::Shm {
+                shmid: info.shmid,
+                offset: info.offset.checked_add(area_offset)?,
+            });
+        }
+        None
     }
 
     /// Resolves a user mmap fault into either an already-handled fault or work

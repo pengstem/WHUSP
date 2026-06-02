@@ -195,6 +195,9 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) futex_cleanup_fallback_scans: usize,
     pub(crate) futex_cleanup_fallback_queue_visits: usize,
     pub(crate) futex_cleanup_fallback_waiter_visits: usize,
+    pub(crate) futex_wake_calls: usize,
+    pub(crate) futex_wake_key_hits: usize,
+    pub(crate) futex_wake_tasks: usize,
     pub(crate) futex_queue_count_max: usize,
     pub(crate) futex_waiter_count_max: usize,
     pub(crate) futex_bucket_queue_count_max: usize,
@@ -411,6 +414,9 @@ mod enabled {
     static FUTEX_CLEANUP_FALLBACK_SCANS: AtomicUsize = AtomicUsize::new(0);
     static FUTEX_CLEANUP_FALLBACK_QUEUE_VISITS: AtomicUsize = AtomicUsize::new(0);
     static FUTEX_CLEANUP_FALLBACK_WAITER_VISITS: AtomicUsize = AtomicUsize::new(0);
+    static FUTEX_WAKE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static FUTEX_WAKE_KEY_HITS: AtomicUsize = AtomicUsize::new(0);
+    static FUTEX_WAKE_TASKS: AtomicUsize = AtomicUsize::new(0);
     static FUTEX_QUEUE_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
     static FUTEX_WAITER_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
     static FUTEX_BUCKET_QUEUE_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
@@ -998,6 +1004,14 @@ mod enabled {
         }
     }
 
+    pub(crate) fn record_futex_wake(key_hit: bool, tasks: usize) {
+        FUTEX_WAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+        if key_hit {
+            FUTEX_WAKE_KEY_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+        FUTEX_WAKE_TASKS.fetch_add(tasks, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_futex_manager_state(
         queue_count: usize,
         waiter_count: usize,
@@ -1227,6 +1241,9 @@ mod enabled {
                 .load(Ordering::Relaxed),
             futex_cleanup_fallback_waiter_visits: FUTEX_CLEANUP_FALLBACK_WAITER_VISITS
                 .load(Ordering::Relaxed),
+            futex_wake_calls: FUTEX_WAKE_CALLS.load(Ordering::Relaxed),
+            futex_wake_key_hits: FUTEX_WAKE_KEY_HITS.load(Ordering::Relaxed),
+            futex_wake_tasks: FUTEX_WAKE_TASKS.load(Ordering::Relaxed),
             futex_queue_count_max: FUTEX_QUEUE_COUNT_MAX.load(Ordering::Relaxed),
             futex_waiter_count_max: FUTEX_WAITER_COUNT_MAX.load(Ordering::Relaxed),
             futex_bucket_queue_count_max: FUTEX_BUCKET_QUEUE_COUNT_MAX.load(Ordering::Relaxed),
@@ -1432,6 +1449,9 @@ mod enabled {
          futex_cleanup_fallback_scans {}\n\
          futex_cleanup_fallback_queue_visits {}\n\
          futex_cleanup_fallback_waiter_visits {}\n\
+         futex_wake_calls {}\n\
+         futex_wake_key_hits {}\n\
+         futex_wake_tasks {}\n\
          futex_queue_count_max {}\n\
          futex_waiter_count_max {}\n\
          futex_bucket_queue_count_max {}\n\
@@ -1630,6 +1650,9 @@ mod enabled {
             stats.futex_cleanup_fallback_scans,
             stats.futex_cleanup_fallback_queue_visits,
             stats.futex_cleanup_fallback_waiter_visits,
+            stats.futex_wake_calls,
+            stats.futex_wake_key_hits,
+            stats.futex_wake_tasks,
             stats.futex_queue_count_max,
             stats.futex_waiter_count_max,
             stats.futex_bucket_queue_count_max,
@@ -2004,6 +2027,9 @@ mod disabled {
         _fallback_waiter_visits: usize,
     ) {
     }
+
+    #[inline(always)]
+    pub(crate) fn record_futex_wake(_key_hit: bool, _tasks: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_futex_manager_state(

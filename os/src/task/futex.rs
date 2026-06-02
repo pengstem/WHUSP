@@ -2,6 +2,7 @@ use super::{
     TaskControlBlock, TaskStatus, block_current_task_no_schedule, current_has_deliverable_signal,
     current_process, current_task, current_user_token, schedule, wakeup_front_task, wakeup_task,
 };
+use crate::mm::FutexSharedKey;
 use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
@@ -55,9 +56,10 @@ struct LinuxRobustList {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct FutexKey {
-    process_id: usize,
-    addr: usize,
+enum FutexKey {
+    Private { process_id: usize, addr: usize },
+    Shared(FutexSharedKey),
+    SharedVirtual { addr: usize },
 }
 
 struct FutexWaiter {
@@ -76,6 +78,13 @@ struct FutexWaiterLocation {
     key: FutexKey,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FutexWaitCleanup {
+    Woken,
+    StillQueued,
+    AlreadyUnqueued,
+}
+
 /// Process-scoped futex wait queues keyed by futex word address.
 ///
 /// Callers enqueue the already-blocked current task while holding this manager,
@@ -84,6 +93,7 @@ struct FutexWaiterLocation {
 struct FutexManager {
     buckets: Vec<FutexBucket>,
     waiter_keys: BTreeMap<usize, FutexWaiterLocation>,
+    wake_results: BTreeMap<(usize, usize), FutexWaitCleanup>,
     queue_count: usize,
 }
 
@@ -105,6 +115,7 @@ impl FutexManager {
         Self {
             buckets,
             waiter_keys: BTreeMap::new(),
+            wake_results: BTreeMap::new(),
             queue_count: 0,
         }
     }
@@ -113,8 +124,38 @@ impl FutexManager {
         Arc::as_ptr(task) as usize
     }
 
+    fn waiter_result_id(task: &Arc<TaskControlBlock>) -> (usize, usize) {
+        (Self::waiter_id(task), task.linux_tid())
+    }
+
     fn bucket_index(key: FutexKey) -> usize {
-        ((key.addr >> 2) ^ key.process_id) & (FUTEX_BUCKET_COUNT - 1)
+        let hash = match key {
+            FutexKey::Private { process_id, addr } => (addr >> 2) ^ process_id,
+            FutexKey::Shared(FutexSharedKey::File { id, offset }) => {
+                (offset >> 2) ^ id.mount_id.0.rotate_left(5) ^ (id.ino as usize)
+            }
+            FutexKey::Shared(FutexSharedKey::VfsNode { node, offset }) => {
+                (offset >> 2) ^ node.mount_id.0.rotate_left(5) ^ (node.ino as usize)
+            }
+            FutexKey::Shared(FutexSharedKey::FileObject { object, offset }) => {
+                (offset >> 2) ^ object.rotate_left(11)
+            }
+            FutexKey::Shared(FutexSharedKey::Shm { shmid, offset }) => {
+                (offset >> 2) ^ shmid.rotate_left(7)
+            }
+            FutexKey::Shared(FutexSharedKey::AnonymousPage { ppn, offset }) => {
+                (offset >> 2) ^ ppn.rotate_left(3)
+            }
+            FutexKey::SharedVirtual { addr } => addr >> 2,
+        };
+        hash & (FUTEX_BUCKET_COUNT - 1)
+    }
+
+    fn private_process_id(key: FutexKey) -> Option<usize> {
+        match key {
+            FutexKey::Private { process_id, .. } => Some(process_id),
+            FutexKey::Shared(_) | FutexKey::SharedVirtual { .. } => None,
+        }
     }
 
     fn remove_waiter(
@@ -146,18 +187,26 @@ impl FutexManager {
         removed
     }
 
-    fn remove_waiter_for_task(&mut self, task: &Arc<TaskControlBlock>) -> bool {
+    fn remove_waiter_for_task(&mut self, task: &Arc<TaskControlBlock>) -> FutexWaitCleanup {
         let waiter_id = Self::waiter_id(task);
+        if let Some(result) = self.wake_results.remove(&Self::waiter_result_id(task)) {
+            perf::record_futex_cleanup(true, false, 0, 0);
+            return result;
+        }
         let Some(location) = self.waiter_keys.get(&waiter_id).copied() else {
             perf::record_futex_cleanup(false, true, 0, 0);
-            return false;
+            return FutexWaitCleanup::AlreadyUnqueued;
         };
         let removed = self.remove_waiter(location, task);
         perf::record_futex_cleanup(removed, !removed, 0, 0);
         if !removed {
             self.waiter_keys.remove(&waiter_id);
         }
-        removed
+        if removed {
+            FutexWaitCleanup::StillQueued
+        } else {
+            FutexWaitCleanup::AlreadyUnqueued
+        }
     }
 
     /// Blocks the current task and enqueues it on `key`.
@@ -195,10 +244,12 @@ impl FutexManager {
 
     fn wake(&mut self, key: FutexKey, limit: usize, bitset: u32) -> Vec<Arc<TaskControlBlock>> {
         let bucket_index = Self::bucket_index(key);
-        let mut removed_waiters = Vec::new();
+        let mut stale_waiters = Vec::new();
+        let mut woken_waiters = Vec::new();
         let tasks = {
             let bucket = &mut self.buckets[bucket_index];
             let Some(queue) = bucket.waiters.get_mut(&key) else {
+                perf::record_futex_wake(false, 0);
                 return Vec::new();
             };
             let old_len = queue.len();
@@ -206,11 +257,14 @@ impl FutexManager {
             let mut kept = VecDeque::new();
             while let Some(waiter) = queue.pop_front() {
                 if !waiter.is_blocked() {
-                    removed_waiters.push(Self::waiter_id(&waiter.task));
+                    stale_waiters.push(Self::waiter_id(&waiter.task));
                     continue;
                 }
                 if waiter.bitset & bitset != 0 && tasks.len() < limit {
-                    removed_waiters.push(Self::waiter_id(&waiter.task));
+                    woken_waiters.push((
+                        Self::waiter_id(&waiter.task),
+                        Self::waiter_result_id(&waiter.task),
+                    ));
                     tasks.push(waiter.task);
                 } else {
                     kept.push_back(waiter);
@@ -223,42 +277,57 @@ impl FutexManager {
             }
             tasks
         };
-        for waiter_id in removed_waiters {
+        for waiter_id in stale_waiters {
             self.waiter_keys.remove(&waiter_id);
         }
+        for (waiter_id, result_id) in woken_waiters {
+            self.waiter_keys.remove(&waiter_id);
+            self.wake_results.insert(result_id, FutexWaitCleanup::Woken);
+        }
         self.remove_empty_queue(bucket_index, key);
+        perf::record_futex_wake(true, tasks.len());
         tasks
     }
 
     fn wake_one(&mut self, key: FutexKey) -> (Option<Arc<TaskControlBlock>>, bool) {
         let bucket_index = Self::bucket_index(key);
-        let mut removed_waiters = Vec::new();
+        let mut stale_waiters = Vec::new();
+        let mut woken_waiter = None;
         let task = {
             let bucket = &mut self.buckets[bucket_index];
             let Some(queue) = bucket.waiters.get_mut(&key) else {
+                perf::record_futex_wake(false, 0);
                 return (None, false);
             };
             let mut selected = None;
             while let Some(waiter) = queue.pop_front() {
                 if waiter.is_blocked() {
-                    removed_waiters.push(Self::waiter_id(&waiter.task));
+                    woken_waiter = Some((
+                        Self::waiter_id(&waiter.task),
+                        Self::waiter_result_id(&waiter.task),
+                    ));
                     selected = Some(waiter.task);
                     break;
                 } else {
-                    removed_waiters.push(Self::waiter_id(&waiter.task));
+                    stale_waiters.push(Self::waiter_id(&waiter.task));
                 }
             }
-            let removed_count = removed_waiters.len();
+            let removed_count = stale_waiters.len() + usize::from(woken_waiter.is_some());
             if removed_count > 0 {
                 bucket.waiter_count = bucket.waiter_count.saturating_sub(removed_count);
             }
             selected
         };
-        for waiter_id in removed_waiters {
+        for waiter_id in stale_waiters {
             self.waiter_keys.remove(&waiter_id);
+        }
+        if let Some((waiter_id, result_id)) = woken_waiter {
+            self.waiter_keys.remove(&waiter_id);
+            self.wake_results.insert(result_id, FutexWaitCleanup::Woken);
         }
         self.remove_empty_queue(bucket_index, key);
         let has_waiters = self.has_waiters(key);
+        perf::record_futex_wake(true, usize::from(task.is_some()));
         (task, has_waiters)
     }
 
@@ -278,7 +347,8 @@ impl FutexManager {
     ) -> (Vec<Arc<TaskControlBlock>>, usize) {
         let source_bucket_index = Self::bucket_index(source);
         let target_bucket_index = Self::bucket_index(target);
-        let mut removed_waiters = Vec::new();
+        let mut stale_waiters = Vec::new();
+        let mut woken_waiters = Vec::new();
         let mut moved_waiters = Vec::new();
         let (tasks, moved) = {
             let bucket = &mut self.buckets[source_bucket_index];
@@ -291,11 +361,14 @@ impl FutexManager {
             let mut kept = VecDeque::new();
             while let Some(waiter) = queue.pop_front() {
                 if !waiter.is_blocked() {
-                    removed_waiters.push(Self::waiter_id(&waiter.task));
+                    stale_waiters.push(Self::waiter_id(&waiter.task));
                     continue;
                 }
                 if tasks.len() < wake_limit {
-                    removed_waiters.push(Self::waiter_id(&waiter.task));
+                    woken_waiters.push((
+                        Self::waiter_id(&waiter.task),
+                        Self::waiter_result_id(&waiter.task),
+                    ));
                     tasks.push(waiter.task);
                 } else if moved.len() < requeue_limit {
                     moved_waiters.push(Self::waiter_id(&waiter.task));
@@ -311,8 +384,12 @@ impl FutexManager {
             }
             (tasks, moved)
         };
-        for waiter_id in removed_waiters {
+        for waiter_id in stale_waiters {
             self.waiter_keys.remove(&waiter_id);
+        }
+        for (waiter_id, result_id) in woken_waiters {
+            self.waiter_keys.remove(&waiter_id);
+            self.wake_results.insert(result_id, FutexWaitCleanup::Woken);
         }
         for waiter_id in moved_waiters {
             self.waiter_keys.insert(
@@ -339,6 +416,7 @@ impl FutexManager {
             }
             self.record_state_for_bucket(target_bucket_index);
         }
+        perf::record_futex_wake(true, tasks.len());
         (tasks, moved_len)
     }
 
@@ -347,7 +425,7 @@ impl FutexManager {
         for bucket in &mut self.buckets {
             let mut waiter_count = 0usize;
             bucket.waiters.retain(|key, queue| {
-                if key.process_id == process_id {
+                if Self::private_process_id(*key) == Some(process_id) {
                     return false;
                 }
                 queue.retain(|waiter| {
@@ -415,19 +493,27 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(FutexManager::new()) };
 }
 
-fn futex_key(addr: usize, private: bool) -> FutexKey {
-    // UNFINISHED: Shared futex keys should be derived from the backing physical
-    // object so unrelated processes can synchronize through shared mappings.
-    // libctest and musl pthread paths exercised here use process-private
-    // futexes, so virtual-address keys are sufficient for this compatibility
-    // subset.
-    futex_key_for_process(addr, private, current_process().getpid())
+fn futex_key(addr: usize, private: bool) -> SysResult<FutexKey> {
+    let process = current_process();
+    if private {
+        return Ok(FutexKey::Private {
+            process_id: process.getpid(),
+            addr,
+        });
+    }
+    let inner = process.inner_exclusive_access();
+    Ok(inner
+        .memory_set
+        .futex_shared_key(addr)
+        .map(FutexKey::Shared)
+        .unwrap_or(FutexKey::SharedVirtual { addr }))
 }
 
 fn futex_key_for_process(addr: usize, private: bool, process_id: usize) -> FutexKey {
-    FutexKey {
-        process_id: if private { process_id } else { 0 },
-        addr,
+    if private {
+        FutexKey::Private { process_id, addr }
+    } else {
+        FutexKey::SharedVirtual { addr }
     }
 }
 
@@ -505,7 +591,7 @@ fn futex_wait(
     timeout_ms: Option<usize>,
     bitset: u32,
 ) -> SysResult {
-    let key = futex_key(addr, private);
+    let key = futex_key(addr, private)?;
     let task = current_task().expect("futex wait must run with a current task");
 
     let task_cx_ptr = {
@@ -531,9 +617,9 @@ fn futex_wait(
     schedule(task_cx_ptr);
 
     let mut manager = FUTEX_MANAGER.exclusive_access();
-    let still_waiting = manager.remove_waiter_for_task(&task);
+    let cleanup = manager.remove_waiter_for_task(&task);
     if futex_timeout_expired(timeout_ms) {
-        if still_waiting {
+        if cleanup == FutexWaitCleanup::StillQueued {
             return Err(SysError::ETIMEDOUT);
         }
         if current_has_deliverable_signal() {
@@ -544,14 +630,16 @@ fn futex_wait(
     if current_has_deliverable_signal() {
         return Err(SysError::EINTR);
     }
-    if still_waiting {
+    if cleanup == FutexWaitCleanup::StillQueued {
         return Err(SysError::EINTR);
     }
     Ok(0)
 }
 
-fn futex_wake(addr: usize, private: bool, limit: usize, bitset: u32) -> usize {
-    futex_wake_for_process(addr, private, current_process().getpid(), limit, bitset)
+fn futex_wake(addr: usize, private: bool, limit: usize, bitset: u32) -> SysResult<usize> {
+    let key = futex_key(addr, private)?;
+    let tasks = FUTEX_MANAGER.exclusive_access().wake(key, limit, bitset);
+    Ok(wake_futex_tasks(tasks))
 }
 
 fn futex_wake_for_process(
@@ -623,7 +711,7 @@ fn try_acquire_pi_word(addr: usize, tid: u32) -> SysResult<bool> {
 }
 
 fn futex_lock_pi(addr: usize, private: bool, timeout_ms: Option<usize>) -> SysResult {
-    let key = futex_key(addr, private);
+    let key = futex_key(addr, private)?;
     let tid = current_linux_tid_u32()?;
     let task = current_task().expect("PI futex lock must run with a current task");
 
@@ -651,10 +739,10 @@ fn futex_lock_pi(addr: usize, private: bool, timeout_ms: Option<usize>) -> SysRe
     schedule(task_cx_ptr);
 
     let mut manager = FUTEX_MANAGER.exclusive_access();
-    let still_waiting = manager.remove_waiter_for_task(&task);
+    let cleanup = manager.remove_waiter_for_task(&task);
     drop(manager);
     if futex_timeout_expired(timeout_ms) {
-        if still_waiting {
+        if cleanup == FutexWaitCleanup::StillQueued {
             clear_pi_waiters_bit_if_idle(addr, key)?;
             return Err(SysError::ETIMEDOUT);
         }
@@ -667,7 +755,7 @@ fn futex_lock_pi(addr: usize, private: bool, timeout_ms: Option<usize>) -> SysRe
         clear_pi_waiters_bit_if_idle(addr, key)?;
         return Err(SysError::EINTR);
     }
-    if still_waiting {
+    if cleanup == FutexWaitCleanup::StillQueued {
         clear_pi_waiters_bit_if_idle(addr, key)?;
         return Err(SysError::EINTR);
     }
@@ -675,7 +763,7 @@ fn futex_lock_pi(addr: usize, private: bool, timeout_ms: Option<usize>) -> SysRe
 }
 
 fn futex_unlock_pi(addr: usize, private: bool) -> SysResult {
-    let key = futex_key(addr, private);
+    let key = futex_key(addr, private)?;
     let tid = current_linux_tid_u32()?;
     let word = read_futex_word(addr)?;
     if word & FUTEX_TID_MASK != tid {
@@ -805,8 +893,8 @@ fn futex_requeue(
     count_requeued: bool,
 ) -> SysResult<usize> {
     validate_futex_addr(addr2)?;
-    let source = futex_key(addr, private);
-    let target = futex_key(addr2, private);
+    let source = futex_key(addr, private)?;
+    let target = futex_key(addr2, private)?;
     if source == target {
         return Err(SysError::EINVAL);
     }
@@ -930,9 +1018,9 @@ pub(crate) fn sys_futex(
             private,
             futex_count(val as usize)?,
             FUTEX_BITSET_MATCH_ANY,
-        ) as isize),
+        )? as isize),
         FUTEX_WAKE_BITSET => {
-            Ok(futex_wake(addr, private, futex_count(val as usize)?, val3) as isize)
+            Ok(futex_wake(addr, private, futex_count(val as usize)?, val3)? as isize)
         }
         FUTEX_LOCK_PI => futex_lock_pi(
             addr,
