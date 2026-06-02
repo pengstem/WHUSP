@@ -97,6 +97,12 @@ pub(crate) struct DirtyWritebackStats {
     pub(crate) flush_calls: usize,
     pub(crate) flushed_pages: usize,
     pub(crate) flushed_bytes: usize,
+    pub(crate) dirty_pages_peak: usize,
+    pub(crate) dirty_bytes_peak: usize,
+    pub(crate) pressure_flushes: usize,
+    pub(crate) pressure_flushed_pages: usize,
+    pub(crate) pressure_flushed_bytes: usize,
+    pub(crate) pressure_flush_failures: usize,
 }
 
 #[derive(Debug)]
@@ -108,6 +114,11 @@ struct DirtyWritebackCounters {
     flush_calls: usize,
     flushed_pages: usize,
     flushed_bytes: usize,
+    dirty_pages_peak: usize,
+    pressure_flushes: usize,
+    pressure_flushed_pages: usize,
+    pressure_flushed_bytes: usize,
+    pressure_flush_failures: usize,
 }
 
 impl DirtyWritebackCounters {
@@ -120,8 +131,26 @@ impl DirtyWritebackCounters {
             flush_calls: 0,
             flushed_pages: 0,
             flushed_bytes: 0,
+            dirty_pages_peak: 0,
+            pressure_flushes: 0,
+            pressure_flushed_pages: 0,
+            pressure_flushed_bytes: 0,
+            pressure_flush_failures: 0,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirtyCacheWriteResult {
+    Cached(usize),
+    NeedsPressureFlush,
+    Fallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirtyFlushReason {
+    Explicit,
+    Pressure,
 }
 
 fn record_dirty_cache_write(pages: usize, bytes: usize) {
@@ -136,11 +165,29 @@ fn record_dirty_cache_fallback() {
     counters.fallback_writes = counters.fallback_writes.saturating_add(1);
 }
 
-fn record_dirty_cache_flush(pages: usize, bytes: usize) {
+fn record_dirty_cache_peak(dirty_pages: usize) {
+    let mut counters = DIRTY_WRITEBACK_COUNTERS.lock();
+    counters.dirty_pages_peak = counters.dirty_pages_peak.max(dirty_pages);
+}
+
+fn record_dirty_cache_flush(reason: DirtyFlushReason, pages: usize, bytes: usize) {
     let mut counters = DIRTY_WRITEBACK_COUNTERS.lock();
     counters.flush_calls = counters.flush_calls.saturating_add(1);
     counters.flushed_pages = counters.flushed_pages.saturating_add(pages);
     counters.flushed_bytes = counters.flushed_bytes.saturating_add(bytes);
+    if reason == DirtyFlushReason::Pressure {
+        counters.pressure_flushes = counters.pressure_flushes.saturating_add(1);
+        counters.pressure_flushed_pages = counters.pressure_flushed_pages.saturating_add(pages);
+        counters.pressure_flushed_bytes = counters.pressure_flushed_bytes.saturating_add(bytes);
+    }
+}
+
+fn record_dirty_cache_flush_failure(reason: DirtyFlushReason) {
+    if reason != DirtyFlushReason::Pressure {
+        return;
+    }
+    let mut counters = DIRTY_WRITEBACK_COUNTERS.lock();
+    counters.pressure_flush_failures = counters.pressure_flush_failures.saturating_add(1);
 }
 
 pub(crate) fn dirty_writeback_stats_snapshot() -> DirtyWritebackStats {
@@ -159,6 +206,12 @@ pub(crate) fn dirty_writeback_stats_snapshot() -> DirtyWritebackStats {
         flush_calls: counters.flush_calls,
         flushed_pages: counters.flushed_pages,
         flushed_bytes: counters.flushed_bytes,
+        dirty_pages_peak: counters.dirty_pages_peak,
+        dirty_bytes_peak: counters.dirty_pages_peak.saturating_mul(PAGE_SIZE),
+        pressure_flushes: counters.pressure_flushes,
+        pressure_flushed_pages: counters.pressure_flushed_pages,
+        pressure_flushed_bytes: counters.pressure_flushed_bytes,
+        pressure_flush_failures: counters.pressure_flush_failures,
     }
 }
 
@@ -212,47 +265,12 @@ fn can_cache_dirty_write(
         && mount_supports_dirty_writeback(mount_id)
 }
 
-fn cache_dirty_regular_write(node: VfsNodeId, offset: usize, buf: &[u8]) -> Option<usize> {
-    if buf.is_empty() {
-        return Some(0);
-    }
-    let stat = with_mount(node.mount_id, |mount| mount.stat(node.ino))?.ok()?;
-    let base_size = stat.size as usize;
-    let logical_size = dirty_logical_size(node).unwrap_or(base_size);
-    let end = offset.checked_add(buf.len())?;
-    if offset > logical_size {
-        return None;
-    }
-
-    let page_start = offset / PAGE_SIZE;
-    let page_count = buf.len() / PAGE_SIZE;
-    let needs_pin = {
-        let dirty = DIRTY_REGULAR_FILES.lock();
-        let existing_pages = dirty
-            .get(&node)
-            .map(|cache| {
-                (0..page_count)
-                    .filter(|page_offset| cache.pages.contains_key(&(page_start + page_offset)))
-                    .count()
-            })
-            .unwrap_or(0);
-        let dirty_pages = dirty.values().map(|cache| cache.pages.len()).sum::<usize>();
-        let new_pages = page_count.saturating_sub(existing_pages);
-        if dirty_pages.saturating_add(new_pages) > VFS_DIRTY_WRITEBACK_MAX_PAGES {
-            return None;
-        }
-        !dirty.contains_key(&node)
-    };
-    let retained_pin = if needs_pin {
-        with_mount(node.mount_id, |mount| mount.retain_inode(node.ino))?.ok()?;
-        true
-    } else {
-        false
-    };
-
-    let timestamp = FileTimestamp::now();
-    let mut release_extra_pin = false;
-    let mut dirty = DIRTY_REGULAR_FILES.lock();
+fn dirty_write_page_pressure(
+    dirty: &BTreeMap<VfsNodeId, DirtyFileCache>,
+    node: VfsNodeId,
+    page_start: usize,
+    page_count: usize,
+) -> (usize, usize) {
     let existing_pages = dirty
         .get(&node)
         .map(|cache| {
@@ -262,13 +280,56 @@ fn cache_dirty_regular_write(node: VfsNodeId, offset: usize, buf: &[u8]) -> Opti
         })
         .unwrap_or(0);
     let dirty_pages = dirty.values().map(|cache| cache.pages.len()).sum::<usize>();
-    let new_pages = page_count.saturating_sub(existing_pages);
+    (dirty_pages, page_count.saturating_sub(existing_pages))
+}
+
+fn cache_dirty_regular_write(node: VfsNodeId, offset: usize, buf: &[u8]) -> DirtyCacheWriteResult {
+    if buf.is_empty() {
+        return DirtyCacheWriteResult::Cached(0);
+    }
+    let stat = match with_mount(node.mount_id, |mount| mount.stat(node.ino)) {
+        Some(Ok(stat)) => stat,
+        _ => return DirtyCacheWriteResult::Fallback,
+    };
+    let base_size = stat.size as usize;
+    let logical_size = dirty_logical_size(node).unwrap_or(base_size);
+    let Some(end) = offset.checked_add(buf.len()) else {
+        return DirtyCacheWriteResult::Fallback;
+    };
+    if offset > logical_size {
+        return DirtyCacheWriteResult::Fallback;
+    }
+
+    let page_start = offset / PAGE_SIZE;
+    let page_count = buf.len() / PAGE_SIZE;
+    let needs_pin = {
+        let dirty = DIRTY_REGULAR_FILES.lock();
+        let (dirty_pages, new_pages) =
+            dirty_write_page_pressure(&dirty, node, page_start, page_count);
+        if dirty_pages.saturating_add(new_pages) > VFS_DIRTY_WRITEBACK_MAX_PAGES {
+            return DirtyCacheWriteResult::NeedsPressureFlush;
+        }
+        !dirty.contains_key(&node)
+    };
+    let retained_pin = if needs_pin {
+        match with_mount(node.mount_id, |mount| mount.retain_inode(node.ino)) {
+            Some(Ok(())) => true,
+            _ => return DirtyCacheWriteResult::Fallback,
+        }
+    } else {
+        false
+    };
+
+    let timestamp = FileTimestamp::now();
+    let mut release_extra_pin = false;
+    let mut dirty = DIRTY_REGULAR_FILES.lock();
+    let (dirty_pages, new_pages) = dirty_write_page_pressure(&dirty, node, page_start, page_count);
     if dirty_pages.saturating_add(new_pages) > VFS_DIRTY_WRITEBACK_MAX_PAGES {
         drop(dirty);
         if retained_pin {
             release_inode_from_drop(node.mount_id, node.ino);
         }
-        return None;
+        return DirtyCacheWriteResult::NeedsPressureFlush;
     }
     if retained_pin && dirty.contains_key(&node) {
         release_extra_pin = true;
@@ -285,13 +346,15 @@ fn cache_dirty_regular_write(node: VfsNodeId, offset: usize, buf: &[u8]) -> Opti
         page.extend_from_slice(chunk);
         cache.pages.insert(page_index, page);
     }
+    let current_dirty_pages = dirty.values().map(|cache| cache.pages.len()).sum::<usize>();
     drop(dirty);
     if release_extra_pin {
         release_inode_from_drop(node.mount_id, node.ino);
     }
 
     record_dirty_cache_write(buf.len() / PAGE_SIZE, buf.len());
-    Some(buf.len())
+    record_dirty_cache_peak(current_dirty_pages);
+    DirtyCacheWriteResult::Cached(buf.len())
 }
 
 fn overlay_dirty_regular_read(node: VfsNodeId, offset: usize, buf: &mut [u8]) -> Option<usize> {
@@ -409,7 +472,7 @@ fn restore_dirty_writeback(node: VfsNodeId, batch: DirtyWritebackBatch) {
     }
 }
 
-pub(crate) fn flush_dirty_regular_file(node: VfsNodeId) -> FsResult {
+fn flush_dirty_regular_file_for_reason(node: VfsNodeId, reason: DirtyFlushReason) -> FsResult {
     let Some(batch) = collect_dirty_writeback(node) else {
         return Ok(());
     };
@@ -437,11 +500,16 @@ pub(crate) fn flush_dirty_regular_file(node: VfsNodeId) -> FsResult {
     }
     if result.is_err() {
         restore_dirty_writeback(node, batch);
+        record_dirty_cache_flush_failure(reason);
         return result;
     }
-    record_dirty_cache_flush(pages, bytes);
+    record_dirty_cache_flush(reason, pages, bytes);
     release_inode_from_drop(node.mount_id, node.ino);
     Ok(())
+}
+
+pub(crate) fn flush_dirty_regular_file(node: VfsNodeId) -> FsResult {
+    flush_dirty_regular_file_for_reason(node, DirtyFlushReason::Explicit)
 }
 
 pub(crate) fn flush_dirty_regular_files_on_mount(mount_id: MountId) -> FsResult {
@@ -456,6 +524,20 @@ pub(crate) fn flush_dirty_regular_files_on_mount(mount_id: MountId) -> FsResult 
     let mut result = Ok(());
     for node in nodes {
         if let Err(err) = flush_dirty_regular_file(node) {
+            result = result.and(Err(err));
+        }
+    }
+    result
+}
+
+fn flush_dirty_regular_files_for_pressure() -> FsResult {
+    let nodes = {
+        let dirty = DIRTY_REGULAR_FILES.lock();
+        dirty.keys().copied().collect::<Vec<_>>()
+    };
+    let mut result = Ok(());
+    for node in nodes {
+        if let Err(err) = flush_dirty_regular_file_for_reason(node, DirtyFlushReason::Pressure) {
             result = result.and(Err(err));
         }
     }
@@ -775,13 +857,26 @@ impl VfsFile {
                 chunk.len(),
                 self.status_flags.get(),
             ) {
-                if let Some(write_size) = cache_dirty_regular_write(self.node, chunk_offset, chunk)
-                {
-                    total_write_size = total_write_size.saturating_add(write_size);
-                    if write_size < chunk.len() {
-                        break;
+                let mut pressure_retried = false;
+                loop {
+                    match cache_dirty_regular_write(self.node, chunk_offset, chunk) {
+                        DirtyCacheWriteResult::Cached(write_size) => {
+                            total_write_size = total_write_size.saturating_add(write_size);
+                            if write_size < chunk.len() {
+                                break;
+                            }
+                            cached_dirty = true;
+                            break;
+                        }
+                        DirtyCacheWriteResult::NeedsPressureFlush if !pressure_retried => {
+                            if flush_dirty_regular_files_for_pressure().is_err() {
+                                break;
+                            }
+                            pressure_retried = true;
+                        }
+                        DirtyCacheWriteResult::NeedsPressureFlush
+                        | DirtyCacheWriteResult::Fallback => break,
                     }
-                    cached_dirty = true;
                 }
             }
             if cached_dirty {

@@ -1735,6 +1735,12 @@ fn oskernel_perf_content() -> String {
          vfs_dirty_writeback_flush_calls {}\n\
          vfs_dirty_writeback_flushed_pages {}\n\
          vfs_dirty_writeback_flushed_bytes {}\n\
+         vfs_dirty_writeback_dirty_pages_peak {}\n\
+         vfs_dirty_writeback_dirty_bytes_peak {}\n\
+         vfs_dirty_writeback_pressure_flushes {}\n\
+         vfs_dirty_writeback_pressure_flushed_pages {}\n\
+         vfs_dirty_writeback_pressure_flushed_bytes {}\n\
+         vfs_dirty_writeback_pressure_flush_failures {}\n\
          block_cache_enabled {}\n\
          block_cache_entries {}\n\
          block_cache_capacity {}\n\
@@ -1783,6 +1789,12 @@ fn oskernel_perf_content() -> String {
         dirty_writeback.flush_calls,
         dirty_writeback.flushed_pages,
         dirty_writeback.flushed_bytes,
+        dirty_writeback.dirty_pages_peak,
+        dirty_writeback.dirty_bytes_peak,
+        dirty_writeback.pressure_flushes,
+        dirty_writeback.pressure_flushed_pages,
+        dirty_writeback.pressure_flushed_bytes,
+        dirty_writeback.pressure_flush_failures,
         block.enabled as usize,
         block.entries,
         block.capacity,
