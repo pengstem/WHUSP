@@ -2399,6 +2399,10 @@ pub(super) fn mount_supports_page_cache(mount_id: MountId) -> bool {
     mount_fs_type(mount_id).is_some_and(|fs_type| matches!(fs_type, "ext4" | "vfat" | "tmpfs"))
 }
 
+pub(super) fn mount_supports_dirty_writeback(mount_id: MountId) -> bool {
+    mount_fs_type(mount_id).is_some_and(|fs_type| fs_type == "ext4")
+}
+
 pub(super) fn mount_supports_dentry_cache(mount_id: MountId) -> bool {
     mount_fs_type(mount_id).is_some_and(|fs_type| matches!(fs_type, "ext4" | "vfat" | "tmpfs"))
 }
@@ -2493,7 +2497,7 @@ pub(crate) fn statfs_for_mount(mount_id: MountId) -> Option<FileSystemStat> {
     })
 }
 
-pub(crate) fn sync_all_mounts() {
+pub(crate) fn sync_all_mounts() -> FsResult {
     let mount_ids = {
         let mounts = MOUNTS.lock();
         mounts
@@ -2503,15 +2507,24 @@ pub(crate) fn sync_all_mounts() {
             .collect::<Vec<_>>()
     };
 
+    let mut result = Ok(());
     for mount_id in mount_ids {
-        let _ = with_mount(mount_id, |backend| {
+        if let Err(err) = super::vfs::flush_dirty_regular_files_on_mount(mount_id) {
+            result = result.and(Err(err));
+        }
+        match with_mount(mount_id, |backend| {
             let root_ino = backend.root_ino();
             backend.sync(root_ino, false)
-        });
+        }) {
+            Some(Ok(())) => {}
+            Some(Err(err)) => result = result.and(Err(err)),
+            None => result = result.and(Err(FsError::Io)),
+        }
     }
+    result
 }
 
-pub(crate) fn shutdown_all_mounts() {
+pub(crate) fn shutdown_all_mounts() -> FsResult {
     let mount_ids = {
         let mounts = MOUNTS.lock();
         mounts
@@ -2521,7 +2534,16 @@ pub(crate) fn shutdown_all_mounts() {
             .collect::<Vec<_>>()
     };
 
+    let mut result = Ok(());
     for mount_id in mount_ids {
-        let _ = with_mount(mount_id, |backend| backend.shutdown());
+        if let Err(err) = super::vfs::flush_dirty_regular_files_on_mount(mount_id) {
+            result = result.and(Err(err));
+        }
+        match with_mount(mount_id, |backend| backend.shutdown()) {
+            Some(Ok(())) => {}
+            Some(Err(err)) => result = result.and(Err(err)),
+            None => result = result.and(Err(FsError::Io)),
+        }
     }
+    result
 }

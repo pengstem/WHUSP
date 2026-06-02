@@ -6,6 +6,7 @@ use crate::timer::{get_time_clock_ticks, get_time_us};
 use alloc::format;
 use alloc::string::String;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use log::warn;
 
 const UTS_FIELD_LEN: usize = 65;
 const LINUX_REBOOT_MAGIC1: u32 = 0xfee1_dead;
@@ -149,7 +150,9 @@ pub fn sys_reboot(magic: usize, magic2: usize, op: usize, _arg: usize) -> SysRes
             // mounted backends so lwext4 can mark superblocks clean after
             // user space has issued sync(2); normal sync(2) remains a plain
             // writeback operation while the filesystem is still mounted.
-            crate::fs::shutdown_all_mounts();
+            if let Err(err) = crate::fs::shutdown_all_mounts() {
+                warn!("shutdown_all_mounts failed: {err:?}");
+            }
             shutdown(false)
         }
         // UNFINISHED: RESTART2, KEXEC, and SW_SUSPEND require reboot strings,

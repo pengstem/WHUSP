@@ -1719,11 +1719,22 @@ fn oskernel_perf_content() -> String {
     let block = block_cache::stats_snapshot();
     let dentry = dentry_cache::stats_snapshot();
     let page_cache_entries = crate::mm::page_cache::PAGE_CACHE.exclusive_access().len();
+    let dirty_writeback = crate::fs::vfs::dirty_writeback_stats_snapshot();
     format!(
         "{}\
          frame_total {}\n\
          frame_free {}\n\
          page_cache_entries {}\n\
+         vfs_dirty_writeback_dirty_files {}\n\
+         vfs_dirty_writeback_dirty_pages {}\n\
+         vfs_dirty_writeback_dirty_bytes {}\n\
+         vfs_dirty_writeback_cached_writes {}\n\
+         vfs_dirty_writeback_cached_pages {}\n\
+         vfs_dirty_writeback_cached_bytes {}\n\
+         vfs_dirty_writeback_fallback_writes {}\n\
+         vfs_dirty_writeback_flush_calls {}\n\
+         vfs_dirty_writeback_flushed_pages {}\n\
+         vfs_dirty_writeback_flushed_bytes {}\n\
          block_cache_enabled {}\n\
          block_cache_entries {}\n\
          block_cache_capacity {}\n\
@@ -1762,6 +1773,16 @@ fn oskernel_perf_content() -> String {
         frame_total,
         frame_free,
         page_cache_entries,
+        dirty_writeback.dirty_files,
+        dirty_writeback.dirty_pages,
+        dirty_writeback.dirty_bytes,
+        dirty_writeback.cached_writes,
+        dirty_writeback.cached_pages,
+        dirty_writeback.cached_bytes,
+        dirty_writeback.fallback_writes,
+        dirty_writeback.flush_calls,
+        dirty_writeback.flushed_pages,
+        dirty_writeback.flushed_bytes,
         block.enabled as usize,
         block.entries,
         block.capacity,

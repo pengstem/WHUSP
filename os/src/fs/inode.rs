@@ -3,8 +3,8 @@ use super::mount::{mounted_root_for_any_path, with_mount};
 use super::path::{PathContext, WorkingDir};
 use super::vfs::{
     FsError, FsNodeKind, FsResult, LookupMode, VfsCreateTarget, VfsNodeId,
-    invalidate_regular_file_read_cache, resolve_create_parent_in, resolve_existing_in,
-    resolve_mount_target_in,
+    flush_dirty_regular_file, invalidate_regular_file_read_cache, resolve_create_parent_in,
+    resolve_existing_in, resolve_mount_target_in,
 };
 use bitflags::*;
 use lwext4_rust::ffi::EXT4_ROOT_INO;
@@ -422,6 +422,10 @@ pub(crate) fn rename_in(
         return Err(FsError::InvalidInput);
     }
 
+    flush_dirty_regular_file(old_node)?;
+    if let Some((node, _kind)) = replaced_target {
+        flush_dirty_regular_file(node)?;
+    }
     with_mount(old_target.parent.mount_id, |mount| {
         mount.rename(
             old_target.parent.ino,
@@ -493,6 +497,8 @@ pub(crate) fn rename_exchange_in(
         return Err(FsError::InvalidInput);
     }
 
+    flush_dirty_regular_file(old_node)?;
+    flush_dirty_regular_file(new_node)?;
     with_mount(old_target.parent.mount_id, |mount| {
         mount.exchange(
             old_target.parent.ino,
@@ -529,6 +535,7 @@ pub(crate) fn unlink_file_in(context: PathContext, name: &str) -> FsResult {
     if is_synthetic {
         return Err(FsError::Busy);
     }
+    flush_dirty_regular_file(node)?;
     with_mount(target.parent.mount_id, |mount| {
         mount.unlink(target.parent.ino, target.leaf_name)
     })

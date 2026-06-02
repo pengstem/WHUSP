@@ -620,10 +620,11 @@ pub(crate) use vfs::VfsNodeId;
 pub(crate) use vfs::open_file;
 pub(crate) use vfs::{
     FileCreateAttrs, FileSystemStat, FsError, FsNodeKind, FsResult, chmod_in, chown_in,
-    link_open_file_in, lookup_dir_with_stat_in, lookup_dir_with_stat_path_in, lookup_path_in,
-    open_file_handle_node, open_file_in, open_file_in_with_attrs, open_tmpfile_in_with_attrs,
-    regular_file_is_open_writable_in, regular_file_node_is_open_writable, stat_in,
-    track_regular_file_executable, truncate_in, untrack_regular_file_executable,
+    flush_dirty_regular_files_on_mount, link_open_file_in, lookup_dir_with_stat_in,
+    lookup_dir_with_stat_path_in, lookup_path_in, open_file_handle_node, open_file_in,
+    open_file_in_with_attrs, open_tmpfile_in_with_attrs, regular_file_is_open_writable_in,
+    regular_file_node_is_open_writable, stat_in, track_regular_file_executable, truncate_in,
+    untrack_regular_file_executable,
 };
 
 fn align_up(value: usize, align: usize) -> usize {
