@@ -61,6 +61,8 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) vfs_read_cache_bytes: usize,
     pub(crate) vfs_read_cache_backend_reads: usize,
     pub(crate) vfs_read_cache_invalidated_pages: usize,
+    pub(crate) vfs_read_cache_invalidation_calls: usize,
+    pub(crate) vfs_read_cache_invalidation_scan_pages: usize,
     pub(crate) vfs_read_cache_readahead_batches: usize,
     pub(crate) vfs_read_cache_readahead_pages: usize,
     pub(crate) vfs_read_all_calls: usize,
@@ -260,6 +262,8 @@ mod enabled {
     static VFS_READ_CACHE_BYTES: AtomicUsize = AtomicUsize::new(0);
     static VFS_READ_CACHE_BACKEND_READS: AtomicUsize = AtomicUsize::new(0);
     static VFS_READ_CACHE_INVALIDATED_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static VFS_READ_CACHE_INVALIDATION_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static VFS_READ_CACHE_INVALIDATION_SCAN_PAGES: AtomicUsize = AtomicUsize::new(0);
     static VFS_READ_CACHE_READAHEAD_BATCHES: AtomicUsize = AtomicUsize::new(0);
     static VFS_READ_CACHE_READAHEAD_PAGES: AtomicUsize = AtomicUsize::new(0);
     static VFS_READ_ALL_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -544,8 +548,10 @@ mod enabled {
         VFS_READ_CACHE_BACKEND_READS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_read_cache_invalidation(pages: usize) {
+    pub(crate) fn record_vfs_read_cache_invalidation(pages: usize, scanned_pages: usize) {
+        VFS_READ_CACHE_INVALIDATION_CALLS.fetch_add(1, Ordering::Relaxed);
         VFS_READ_CACHE_INVALIDATED_PAGES.fetch_add(pages, Ordering::Relaxed);
+        VFS_READ_CACHE_INVALIDATION_SCAN_PAGES.fetch_add(scanned_pages, Ordering::Relaxed);
     }
 
     pub(crate) fn record_vfs_read_cache_readahead(pages: usize) {
@@ -1017,6 +1023,10 @@ mod enabled {
             vfs_read_cache_backend_reads: VFS_READ_CACHE_BACKEND_READS.load(Ordering::Relaxed),
             vfs_read_cache_invalidated_pages: VFS_READ_CACHE_INVALIDATED_PAGES
                 .load(Ordering::Relaxed),
+            vfs_read_cache_invalidation_calls: VFS_READ_CACHE_INVALIDATION_CALLS
+                .load(Ordering::Relaxed),
+            vfs_read_cache_invalidation_scan_pages: VFS_READ_CACHE_INVALIDATION_SCAN_PAGES
+                .load(Ordering::Relaxed),
             vfs_read_cache_readahead_batches: VFS_READ_CACHE_READAHEAD_BATCHES
                 .load(Ordering::Relaxed),
             vfs_read_cache_readahead_pages: VFS_READ_CACHE_READAHEAD_PAGES.load(Ordering::Relaxed),
@@ -1225,6 +1235,8 @@ mod enabled {
          vfs_read_cache_bytes {}\n\
          vfs_read_cache_backend_reads {}\n\
          vfs_read_cache_invalidated_pages {}\n\
+         vfs_read_cache_invalidation_calls {}\n\
+         vfs_read_cache_invalidation_scan_pages {}\n\
          vfs_read_cache_readahead_batches {}\n\
          vfs_read_cache_readahead_pages {}\n\
          vfs_read_all_calls {}\n\
@@ -1411,6 +1423,8 @@ mod enabled {
             stats.vfs_read_cache_bytes,
             stats.vfs_read_cache_backend_reads,
             stats.vfs_read_cache_invalidated_pages,
+            stats.vfs_read_cache_invalidation_calls,
+            stats.vfs_read_cache_invalidation_scan_pages,
             stats.vfs_read_cache_readahead_batches,
             stats.vfs_read_cache_readahead_pages,
             stats.vfs_read_all_calls,
@@ -1684,7 +1698,7 @@ mod disabled {
     pub(crate) fn record_vfs_read_cache_backend_read() {}
 
     #[inline(always)]
-    pub(crate) fn record_vfs_read_cache_invalidation(_pages: usize) {}
+    pub(crate) fn record_vfs_read_cache_invalidation(_pages: usize, _scanned_pages: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_vfs_read_cache_readahead(_pages: usize) {}

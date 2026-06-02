@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    UserBufferAccess, read_user_array_item, read_user_value, read_user_value_with_mmap_fault,
+    UserBufferAccess, read_user_array, read_user_value, read_user_value_with_mmap_fault,
     translated_byte_buffer_checked_with_mmap_fault, write_user_value,
 };
 use super::fanotify::{fanotify_notify_access, fanotify_notify_modify};
@@ -40,6 +40,8 @@ struct UserIovecCursor {
 const RWF_HIPRI: usize = 0x0000_0001;
 const RWF_NOWAIT: usize = 0x0000_0008;
 const PREADV2_SUPPORTED_FLAGS: usize = RWF_HIPRI | RWF_NOWAIT;
+const PREADV_COALESCE_CHUNK_SIZE: usize = 64 * 1024;
+const WRITEV_COALESCE_CHUNK_SIZE: usize = 64 * 1024;
 
 static PREADV2_NOWAIT_COMPAT_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -121,15 +123,13 @@ impl UserIovecCursor {
 /// Length overflow and counts beyond Linux `SSIZE_MAX` are reported as
 /// `EINVAL`, preserving the visible readv/writev-family ABI boundary.
 fn read_user_iovecs(token: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult<UserIovecs> {
-    let mut entries = Vec::with_capacity(iovcnt);
+    let entries = read_user_array(token, iov, iovcnt)?;
     let mut total_len = 0usize;
-    for index in 0..iovcnt {
-        let iovec = read_user_array_item(token, iov, index)?;
+    for iovec in entries.iter() {
         total_len = total_len.checked_add(iovec.len).ok_or(SysError::EINVAL)?;
         if total_len > isize::MAX as usize {
             return Err(SysError::EINVAL);
         }
-        entries.push(iovec);
     }
     Ok(UserIovecs { entries, total_len })
 }
@@ -153,6 +153,255 @@ fn write_with_status_flags(entry: &FdTableEntry, buf: UserBuffer) -> usize {
     } else {
         file.write(buf)
     }
+}
+
+fn flush_writev_bounce(
+    entry: &FdTableEntry,
+    bounce: &mut Vec<u8>,
+    total_written: &mut usize,
+) -> bool {
+    if bounce.is_empty() {
+        return false;
+    }
+    let intended_len = bounce.len();
+    let written = write_with_status_flags(entry, kernel_user_buffer(bounce.as_mut_slice()));
+    *total_written = total_written.saturating_add(written);
+    bounce.clear();
+    written < intended_len
+}
+
+fn writev_regular_file_coalesced(
+    entry: &FdTableEntry,
+    mut cursor: UserIovecCursor,
+    mut remaining_len: usize,
+) -> SysResult<usize> {
+    let mut total_written = 0usize;
+    let mut bounce = Vec::with_capacity(WRITEV_COALESCE_CHUNK_SIZE);
+    while let Some(chunk) = cursor.next_chunk() {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                let had_queued_write = !bounce.is_empty();
+                if had_queued_write {
+                    flush_writev_bounce(entry, &mut bounce, &mut total_written);
+                }
+                return if total_written > 0 || had_queued_write {
+                    Ok(total_written)
+                } else {
+                    Err(err)
+                };
+            }
+        };
+        let chunk_len = chunk.len.min(remaining_len);
+        let buffers = truncate_user_buffers(chunk.buffers, chunk_len);
+        for slice in buffers {
+            let mut remaining = &slice[..];
+            while !remaining.is_empty() {
+                let available = WRITEV_COALESCE_CHUNK_SIZE - bounce.len();
+                let take = available.min(remaining.len());
+                bounce.extend_from_slice(&remaining[..take]);
+                remaining = &remaining[take..];
+                remaining_len = remaining_len.saturating_sub(take);
+                if bounce.len() < WRITEV_COALESCE_CHUNK_SIZE {
+                    continue;
+                }
+                if flush_writev_bounce(entry, &mut bounce, &mut total_written) {
+                    return Ok(total_written);
+                }
+            }
+        }
+        if remaining_len == 0 {
+            break;
+        }
+    }
+    if !bounce.is_empty() {
+        flush_writev_bounce(entry, &mut bounce, &mut total_written);
+    }
+    Ok(total_written)
+}
+
+fn flush_pwritev_bounce(
+    file: &(dyn File + Send + Sync),
+    offset: &mut usize,
+    bounce: &mut Vec<u8>,
+    total_written: &mut usize,
+) -> SysResult<bool> {
+    if bounce.is_empty() {
+        return Ok(false);
+    }
+    let intended_len = bounce.len();
+    file.check_write_at(*offset, intended_len)
+        .map_err(SysError::from)?;
+    let written = file.write_at(*offset, bounce.as_slice());
+    *total_written = total_written.saturating_add(written);
+    *offset = offset.checked_add(written).ok_or(SysError::EINVAL)?;
+    bounce.clear();
+    Ok(written < intended_len)
+}
+
+fn pwritev_regular_file_coalesced(
+    file: &(dyn File + Send + Sync),
+    mut cursor: UserIovecCursor,
+    mut offset: usize,
+    mut remaining_len: usize,
+) -> SysResult<usize> {
+    let mut total_written = 0usize;
+    let mut bounce = Vec::with_capacity(WRITEV_COALESCE_CHUNK_SIZE);
+    while let Some(chunk) = cursor.next_chunk() {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                let had_queued_write = !bounce.is_empty();
+                if had_queued_write {
+                    if let Err(flush_err) =
+                        flush_pwritev_bounce(file, &mut offset, &mut bounce, &mut total_written)
+                    {
+                        return if total_written > 0 {
+                            Ok(total_written)
+                        } else {
+                            Err(flush_err)
+                        };
+                    }
+                }
+                return if total_written > 0 || had_queued_write {
+                    Ok(total_written)
+                } else {
+                    Err(err)
+                };
+            }
+        };
+        let chunk_len = chunk.len.min(remaining_len);
+        let buffers = truncate_user_buffers(chunk.buffers, chunk_len);
+        for slice in buffers {
+            let mut remaining = &slice[..];
+            while !remaining.is_empty() {
+                let available = WRITEV_COALESCE_CHUNK_SIZE - bounce.len();
+                let take = available.min(remaining.len());
+                bounce.extend_from_slice(&remaining[..take]);
+                remaining = &remaining[take..];
+                remaining_len = remaining_len.saturating_sub(take);
+                if bounce.len() < WRITEV_COALESCE_CHUNK_SIZE {
+                    continue;
+                }
+                if flush_pwritev_bounce(file, &mut offset, &mut bounce, &mut total_written)? {
+                    return Ok(total_written);
+                }
+            }
+        }
+        if remaining_len == 0 {
+            break;
+        }
+    }
+    if !bounce.is_empty() {
+        flush_pwritev_bounce(file, &mut offset, &mut bounce, &mut total_written)?;
+    }
+    Ok(total_written)
+}
+
+fn collect_iovec_buffers(
+    mut cursor: UserIovecCursor,
+    mut remaining_len: usize,
+) -> SysResult<Vec<&'static mut [u8]>> {
+    let mut buffers = Vec::new();
+    while let Some(chunk) = cursor.next_chunk() {
+        let chunk = chunk?;
+        let chunk_len = chunk.len.min(remaining_len);
+        buffers.extend(truncate_user_buffers(chunk.buffers, chunk_len));
+        remaining_len = remaining_len.saturating_sub(chunk_len);
+        if remaining_len == 0 {
+            break;
+        }
+    }
+    Ok(buffers)
+}
+
+fn iovec_buffer_chunk_len(
+    buffers: &[&'static mut [u8]],
+    mut index: usize,
+    mut offset: usize,
+    mut limit: usize,
+) -> usize {
+    let mut len = 0usize;
+    while limit > 0 && index < buffers.len() {
+        let buffer_len = buffers[index].len();
+        if offset >= buffer_len {
+            index += 1;
+            offset = 0;
+            continue;
+        }
+        let take = (buffer_len - offset).min(limit);
+        len += take;
+        limit -= take;
+        index += 1;
+        offset = 0;
+    }
+    len
+}
+
+fn copy_into_iovec_buffers(
+    buffers: &mut [&'static mut [u8]],
+    index: &mut usize,
+    offset: &mut usize,
+    src: &[u8],
+) -> usize {
+    let mut copied = 0usize;
+    while copied < src.len() && *index < buffers.len() {
+        let buffer = &mut buffers[*index];
+        if *offset >= buffer.len() {
+            *index += 1;
+            *offset = 0;
+            continue;
+        }
+        let take = (buffer.len() - *offset).min(src.len() - copied);
+        buffer[*offset..*offset + take].copy_from_slice(&src[copied..copied + take]);
+        copied += take;
+        *offset += take;
+        if *offset == buffer.len() {
+            *index += 1;
+            *offset = 0;
+        }
+    }
+    copied
+}
+
+fn preadv_regular_file_coalesced(
+    file: &(dyn File + Send + Sync),
+    cursor: UserIovecCursor,
+    mut offset: usize,
+    requested_len: usize,
+) -> SysResult<usize> {
+    let mut buffers = collect_iovec_buffers(cursor, requested_len)?;
+    let mut bounce = vec![0u8; PREADV_COALESCE_CHUNK_SIZE];
+    let mut buffer_index = 0usize;
+    let mut buffer_offset = 0usize;
+    let mut total_read = 0usize;
+    loop {
+        let read_limit = iovec_buffer_chunk_len(
+            buffers.as_slice(),
+            buffer_index,
+            buffer_offset,
+            PREADV_COALESCE_CHUNK_SIZE,
+        );
+        if read_limit == 0 {
+            break;
+        }
+        let read_size = file.read_at(offset, &mut bounce[..read_limit]);
+        if read_size == 0 {
+            break;
+        }
+        let copied = copy_into_iovec_buffers(
+            buffers.as_mut_slice(),
+            &mut buffer_index,
+            &mut buffer_offset,
+            &bounce[..read_size],
+        );
+        offset = offset.checked_add(copied).ok_or(SysError::EINVAL)?;
+        total_read = total_read.saturating_add(copied);
+        if copied < read_size || read_size < read_limit {
+            break;
+        }
+    }
+    Ok(total_read)
 }
 
 fn current_file_size_limit() -> usize {
@@ -1045,6 +1294,7 @@ pub fn sys_preadv(
     let mut offset = checked_position_offset_pair(pos_l, pos_h)?;
     let token = current_user_token();
     let iovecs = read_user_iovecs(token, iov, iovcnt)?;
+    let requested_len = iovecs.total_len;
     let file = get_file_by_fd(fd)?;
     ensure_positioned_target(file.as_ref())?;
     if !file.readable() {
@@ -1053,6 +1303,13 @@ pub fn sys_preadv(
 
     let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Write);
     cursor.validate_all()?;
+    if iovcnt > 1 {
+        let total_read =
+            preadv_regular_file_coalesced(file.as_ref(), cursor, offset, requested_len)?;
+        fanotify_notify_access(&file, total_read);
+        inotify_notify_access(&file, total_read);
+        return Ok(total_read as isize);
+    }
 
     let mut total_read = 0usize;
     while let Some(chunk) = cursor.next_chunk() {
@@ -1152,6 +1409,15 @@ pub fn sys_pwritev(
     }
     let allowed_len = allowed_write_len_at(file.as_ref(), offset, iovecs.total_len)?;
     let requested_len = allowed_len;
+    if iovcnt > 1 {
+        let cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Read);
+        let total_written =
+            pwritev_regular_file_coalesced(file.as_ref(), cursor, offset, allowed_len)?;
+        fanotify_notify_modify(&file, total_written);
+        inotify_notify_modify(&file, total_written);
+        return checked_write_result(requested_len, total_written);
+    }
+
     let mut remaining_len = allowed_len;
     let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Read);
     let mut total_written = 0usize;
@@ -1288,6 +1554,14 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
     )?;
 
     let requested_len = allowed_len;
+    if iovcnt > 1 && file.stat()?.mode & S_IFMT == S_IFREG {
+        let cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Read);
+        let total_written = writev_regular_file_coalesced(&entry, cursor, allowed_len)?;
+        fanotify_notify_modify(&file, total_written);
+        inotify_notify_modify(&file, total_written);
+        return checked_write_result_for_entry(&entry, requested_len, total_written);
+    }
+
     let mut remaining_len = allowed_len;
     let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Read);
     let mut total_written = 0usize;
@@ -1331,19 +1605,28 @@ pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult 
 
     let token = current_user_token();
     let iovecs = read_user_iovecs(token, iov, iovcnt)?;
+    let requested_len = iovecs.total_len;
     let file = get_file_by_fd(fd)?;
-    if file.stat()?.mode & S_IFMT == S_IFDIR {
+    let mode = file.stat()?.mode;
+    if mode & S_IFMT == S_IFDIR {
         return Err(SysError::EISDIR);
     }
     if !file.readable() {
         return Err(SysError::EBADF);
     }
-    file.check_read(iovecs.total_len)?;
+    file.check_read(requested_len)?;
     let entry = get_fd_entry_by_fd(fd)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLIN)?;
 
     let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Write);
     cursor.validate_all()?;
+    if iovcnt > 1 && mode & S_IFMT == S_IFREG {
+        let buffers = collect_iovec_buffers(cursor, requested_len)?;
+        let total_read = file.read(UserBuffer::new(buffers));
+        fanotify_notify_access(&file, total_read);
+        inotify_notify_access(&file, total_read);
+        return Ok(total_read as isize);
+    }
 
     let mut total_read = 0usize;
     while let Some(chunk) = cursor.next_chunk() {

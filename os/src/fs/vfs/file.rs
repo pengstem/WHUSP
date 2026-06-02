@@ -135,12 +135,10 @@ pub(crate) fn invalidate_regular_file_read_cache(node: VfsNodeId, kind: FsNodeKi
     let Some(id) = page_cache_id_for_node(node, kind) else {
         return;
     };
-    let removed = PAGE_CACHE
+    let (removed, scanned) = PAGE_CACHE
         .exclusive_access()
         .invalidate_clean_unreferenced(id);
-    if removed > 0 {
-        perf::record_vfs_read_cache_invalidation(removed);
-    }
+    perf::record_vfs_read_cache_invalidation(removed, scanned);
 }
 
 pub(crate) fn regular_file_is_open_writable_in(context: PathContext, name: &str) -> FsResult<bool> {
@@ -272,9 +270,6 @@ impl VfsFile {
             status_flags: StatusFlagsCell::new(status_flags),
             suppress_fanotify,
         };
-        if writable {
-            invalidate_regular_file_read_cache(node, kind);
-        }
         Ok(file)
     }
 
@@ -313,6 +308,9 @@ impl VfsFile {
             *offset = stat.size as usize;
         }
         *self.read_snapshot.lock() = None;
+        if buf.len() > 0 {
+            invalidate_regular_file_read_cache(self.node, self.kind);
+        }
         let mut total_write_size = 0usize;
         perf::record_vfs_write_user_buffer(buf.buffers.len());
         if self.kind == FsNodeKind::RegularFile && buf.buffers.len() > 1 {
@@ -365,7 +363,6 @@ impl VfsFile {
     }
 
     fn write_at_chunks(&self, offset: usize, buf: &[u8]) -> usize {
-        invalidate_regular_file_read_cache(self.node, self.kind);
         let mut total_write_size = 0usize;
         for chunk in buf.chunks(VFS_WRITE_CHUNK_SIZE) {
             let Some(chunk_offset) = offset.checked_add(total_write_size) else {
@@ -1336,6 +1333,9 @@ impl File for VfsFile {
             return 0;
         }
         *self.read_snapshot.lock() = None;
+        if !buf.is_empty() {
+            invalidate_regular_file_read_cache(self.node, self.kind);
+        }
         self.write_at_chunks(offset, buf)
     }
 

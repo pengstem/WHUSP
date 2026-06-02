@@ -288,7 +288,8 @@ impl PageCache {
     }
 
     /// Drops clean unpinned ordinary-read pages for one file.
-    pub(crate) fn invalidate_clean_unreferenced(&mut self, id: PageCacheId) -> usize {
+    pub(crate) fn invalidate_clean_unreferenced(&mut self, id: PageCacheId) -> (usize, usize) {
+        let scanned = self.pages.len();
         let victims: Vec<_> = self
             .pages
             .iter()
@@ -302,7 +303,7 @@ impl PageCache {
             self.pages.remove(&key);
             self.lru.remove(&PageCacheLruEntry { stamp, key });
         }
-        removed
+        (removed, scanned)
     }
 
     /// Marks a shared mmap page dirty after the first write fault.
