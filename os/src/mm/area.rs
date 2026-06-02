@@ -590,6 +590,10 @@ impl MapArea {
         self.shm_info.is_some()
     }
 
+    pub(super) fn is_executable(&self) -> bool {
+        self.map_perm.contains(MapPermission::X)
+    }
+
     pub(super) fn is_locked(&self) -> bool {
         self.locked || self.lock_on_fault
     }

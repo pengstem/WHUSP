@@ -187,6 +187,8 @@ fn make_trampoline_page_executable(trampoline_ptr: usize) -> bool {
         return false;
     }
     crate::arch::mm::flush_tlb_page(trampoline_ptr);
+    crate::arch::mm::publish_pte_barrier();
+    crate::arch::mm::instruction_barrier();
     true
 }
 

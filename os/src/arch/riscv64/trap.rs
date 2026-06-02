@@ -282,9 +282,14 @@ pub fn trap_return() -> ! {
     }
     let restore_va = __restore as usize - __alltraps as usize + TRAMPOLINE;
     //println!("before return");
+    if crate::arch::mm::should_fence_i_on_trap_return() {
+        crate::perf::record_riscv_return_fence_i_call();
+        unsafe {
+            asm!("fence.i");
+        }
+    }
     unsafe {
         asm!(
-            "fence.i",
             "jr {restore_va}",
             restore_va = in(reg) restore_va,
             in("a0") trap_cx_user_va,

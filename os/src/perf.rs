@@ -18,6 +18,8 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) task_current_trap_return_context_calls: usize,
     pub(crate) time_nanos_to_timespec_calls: usize,
     pub(crate) time_direct_timespec_calls: usize,
+    pub(crate) riscv_return_fence_i_calls: usize,
+    pub(crate) arch_instruction_barrier_calls: usize,
     pub(crate) tid_lookup_calls: usize,
     pub(crate) tid_lookup_process_visits: usize,
     pub(crate) tid_lookup_task_visits: usize,
@@ -211,6 +213,8 @@ mod enabled {
     static TASK_CURRENT_TRAP_RETURN_CONTEXT_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TIME_NANOS_TO_TIMESPEC_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TIME_DIRECT_TIMESPEC_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static RISCV_RETURN_FENCE_I_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static ARCH_INSTRUCTION_BARRIER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TID_LOOKUP_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TID_LOOKUP_PROCESS_VISITS: AtomicUsize = AtomicUsize::new(0);
     static TID_LOOKUP_TASK_VISITS: AtomicUsize = AtomicUsize::new(0);
@@ -452,6 +456,15 @@ mod enabled {
 
     pub(crate) fn record_time_direct_timespec_call() {
         TIME_DIRECT_TIMESPEC_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_riscv_return_fence_i_call() {
+        RISCV_RETURN_FENCE_I_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_arch_instruction_barrier_call() {
+        ARCH_INSTRUCTION_BARRIER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_fd_alloc(
@@ -959,6 +972,8 @@ mod enabled {
                 .load(Ordering::Relaxed),
             time_nanos_to_timespec_calls: TIME_NANOS_TO_TIMESPEC_CALLS.load(Ordering::Relaxed),
             time_direct_timespec_calls: TIME_DIRECT_TIMESPEC_CALLS.load(Ordering::Relaxed),
+            riscv_return_fence_i_calls: RISCV_RETURN_FENCE_I_CALLS.load(Ordering::Relaxed),
+            arch_instruction_barrier_calls: ARCH_INSTRUCTION_BARRIER_CALLS.load(Ordering::Relaxed),
             tid_lookup_calls: TID_LOOKUP_CALLS.load(Ordering::Relaxed),
             tid_lookup_process_visits: TID_LOOKUP_PROCESS_VISITS.load(Ordering::Relaxed),
             tid_lookup_task_visits: TID_LOOKUP_TASK_VISITS.load(Ordering::Relaxed),
@@ -1167,6 +1182,8 @@ mod enabled {
          task_current_trap_return_context_calls {}\n\
          time_nanos_to_timespec_calls {}\n\
          time_direct_timespec_calls {}\n\
+         riscv_return_fence_i_calls {}\n\
+         arch_instruction_barrier_calls {}\n\
          tid_lookup_calls {}\n\
          tid_lookup_process_visits {}\n\
          tid_lookup_task_visits {}\n\
@@ -1351,6 +1368,8 @@ mod enabled {
             stats.task_current_trap_return_context_calls,
             stats.time_nanos_to_timespec_calls,
             stats.time_direct_timespec_calls,
+            stats.riscv_return_fence_i_calls,
+            stats.arch_instruction_barrier_calls,
             stats.tid_lookup_calls,
             stats.tid_lookup_process_visits,
             stats.tid_lookup_task_visits,
@@ -1587,6 +1606,13 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_time_direct_timespec_call() {}
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn record_riscv_return_fence_i_call() {}
+
+    #[inline(always)]
+    pub(crate) fn record_arch_instruction_barrier_call() {}
 
     #[inline(always)]
     pub(crate) fn record_tid_lookup(

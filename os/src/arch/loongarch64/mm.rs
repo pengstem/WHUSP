@@ -71,6 +71,7 @@ pub fn publish_pte_barrier() {
 }
 
 pub fn instruction_barrier() {
+    crate::perf::record_arch_instruction_barrier_call();
     unsafe {
         asm!("ibar 0");
     }

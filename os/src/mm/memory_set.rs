@@ -111,6 +111,10 @@ impl MemorySet {
         }
         if let Some(data) = data {
             map_area.copy_data(&self.page_table, data, data_offset);
+            if map_area.is_executable() {
+                arch_mm::publish_pte_barrier();
+                arch_mm::instruction_barrier();
+            }
         }
         self.insert_area_sorted(map_area);
         true

@@ -35,7 +35,16 @@ pub fn flush_tlb_page(va: usize) {
 
 pub fn publish_pte_barrier() {}
 
-pub fn instruction_barrier() {}
+pub fn instruction_barrier() {
+    crate::perf::record_arch_instruction_barrier_call();
+    unsafe {
+        asm!("fence.i");
+    }
+}
+
+pub fn should_fence_i_on_trap_return() -> bool {
+    false
+}
 
 pub fn canonicalize_phys_addr(addr: usize) -> usize {
     addr & ((1usize << PA_WIDTH) - 1)
