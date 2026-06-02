@@ -1729,7 +1729,9 @@ fn oskernel_perf_content() -> String {
          block_cache_capacity {}\n\
          block_cache_read_hit {}\n\
          block_cache_read_miss {}\n\
+         block_cache_read_fill_sessions {}\n\
          block_cache_write_update {}\n\
+         block_cache_write_update_sessions {}\n\
          block_cache_write_invalidate {}\n\
          block_cache_evict {}\n\
          block_cache_device_read_submit {}\n\
@@ -1765,7 +1767,9 @@ fn oskernel_perf_content() -> String {
         block.capacity,
         block.read_hit,
         block.read_miss,
+        block.read_fill_sessions,
         block.write_update,
+        block.write_update_sessions,
         block.write_invalidate,
         block.evict,
         block.device_read_submit,

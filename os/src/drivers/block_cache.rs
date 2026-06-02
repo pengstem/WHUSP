@@ -47,7 +47,9 @@ pub(crate) struct BlockCacheStats {
     pub(crate) capacity: usize,
     pub(crate) read_hit: usize,
     pub(crate) read_miss: usize,
+    pub(crate) read_fill_sessions: usize,
     pub(crate) write_update: usize,
+    pub(crate) write_update_sessions: usize,
     pub(crate) write_invalidate: usize,
     pub(crate) evict: usize,
     pub(crate) device_read_submit: usize,
@@ -156,6 +158,21 @@ impl BlockCache {
         self.trim_to_capacity();
     }
 
+    fn insert_read_run(&mut self, device_key: usize, block_id: usize, data: &[u8]) {
+        if !self.enabled || self.capacity == 0 {
+            return;
+        }
+        self.stats.read_fill_sessions += 1;
+        for (offset, chunk) in data.chunks(BLOCK_CACHE_LINE_SIZE).enumerate() {
+            if chunk.len() != BLOCK_CACHE_LINE_SIZE {
+                break;
+            }
+            let mut line = [0u8; BLOCK_CACHE_LINE_SIZE];
+            line.copy_from_slice(chunk);
+            self.insert_read(BlockCacheKey::new(device_key, block_id + offset), line);
+        }
+    }
+
     fn update_after_write(&mut self, key: BlockCacheKey, data: [u8; BLOCK_CACHE_LINE_SIZE]) {
         if !self.enabled || self.capacity == 0 {
             return;
@@ -165,6 +182,21 @@ impl BlockCache {
         self.lines.insert(key, BlockCacheLine::new(data, stamp));
         self.stats.write_update += 1;
         self.trim_to_capacity();
+    }
+
+    fn update_after_write_run(&mut self, device_key: usize, block_id: usize, data: &[u8]) {
+        if !self.enabled || self.capacity == 0 {
+            return;
+        }
+        self.stats.write_update_sessions += 1;
+        for (offset, chunk) in data.chunks(BLOCK_CACHE_LINE_SIZE).enumerate() {
+            if chunk.len() != BLOCK_CACHE_LINE_SIZE {
+                break;
+            }
+            let mut line = [0u8; BLOCK_CACHE_LINE_SIZE];
+            line.copy_from_slice(chunk);
+            self.update_after_write(BlockCacheKey::new(device_key, block_id + offset), line);
+        }
     }
 
     fn invalidate_key_after_write(&mut self, key: BlockCacheKey) {
@@ -225,14 +257,16 @@ fn cache_read_or_miss_run(
         .read_or_miss_run(device_key, block_id, max_blocks, first_buf)
 }
 
-fn cache_insert_read(device_key: usize, block_id: usize, data: [u8; BLOCK_CACHE_LINE_SIZE]) {
-    let key = BlockCacheKey::new(device_key, block_id);
-    BLOCK_CACHE.exclusive_access().insert_read(key, data);
+fn cache_insert_read_run(device_key: usize, block_id: usize, data: &[u8]) {
+    BLOCK_CACHE
+        .exclusive_access()
+        .insert_read_run(device_key, block_id, data);
 }
 
-fn cache_update_after_write(device_key: usize, block_id: usize, data: [u8; BLOCK_CACHE_LINE_SIZE]) {
-    let key = BlockCacheKey::new(device_key, block_id);
-    BLOCK_CACHE.exclusive_access().update_after_write(key, data);
+fn cache_update_after_write_run(device_key: usize, block_id: usize, data: &[u8]) {
+    BLOCK_CACHE
+        .exclusive_access()
+        .update_after_write_run(device_key, block_id, data);
 }
 
 fn cache_invalidate_key_after_write(device_key: usize, block_id: usize) {
@@ -296,11 +330,7 @@ pub(crate) fn read_with_cache<F>(
                 let end = start + blocks * BLOCK_CACHE_LINE_SIZE;
                 record_device_read_submit(blocks);
                 read_uncached(block_id + index, &mut buf[start..end]);
-                for (offset, chunk) in buf[start..end].chunks(BLOCK_CACHE_LINE_SIZE).enumerate() {
-                    let mut line = [0u8; BLOCK_CACHE_LINE_SIZE];
-                    line.copy_from_slice(chunk);
-                    cache_insert_read(device_key, block_id + index + offset, line);
-                }
+                cache_insert_read_run(device_key, block_id + index, &buf[start..end]);
                 index += blocks;
             }
         }
@@ -331,11 +361,7 @@ pub(crate) fn write_with_cache<F>(
         let end = start + blocks * BLOCK_CACHE_LINE_SIZE;
         record_device_write_submit(blocks);
         write_uncached(block_id + index, &buf[start..end]);
-        for (offset, chunk) in buf[start..end].chunks(BLOCK_CACHE_LINE_SIZE).enumerate() {
-            let mut line = [0u8; BLOCK_CACHE_LINE_SIZE];
-            line.copy_from_slice(chunk);
-            cache_update_after_write(device_key, block_id + index + offset, line);
-        }
+        cache_update_after_write_run(device_key, block_id + index, &buf[start..end]);
         index += blocks;
     }
 
@@ -355,13 +381,15 @@ pub(crate) fn stats_snapshot() -> BlockCacheStats {
 pub(crate) fn stats_content() -> String {
     let stats = stats_snapshot();
     format!(
-        "enabled {}\nentries {}\ncapacity {}\nread_hit {}\nread_miss {}\nwrite_update {}\nwrite_invalidate {}\nevict {}\ndevice_read_submit {}\ndevice_read_blocks {}\ndevice_read_max_blocks {}\ndevice_write_submit {}\ndevice_write_blocks {}\ndevice_write_max_blocks {}\nbypass_unaligned {}\nlru_touch {}\nlru_scan_slots {}\n",
+        "enabled {}\nentries {}\ncapacity {}\nread_hit {}\nread_miss {}\nread_fill_sessions {}\nwrite_update {}\nwrite_update_sessions {}\nwrite_invalidate {}\nevict {}\ndevice_read_submit {}\ndevice_read_blocks {}\ndevice_read_max_blocks {}\ndevice_write_submit {}\ndevice_write_blocks {}\ndevice_write_max_blocks {}\nbypass_unaligned {}\nlru_touch {}\nlru_scan_slots {}\n",
         stats.enabled as usize,
         stats.entries,
         stats.capacity,
         stats.read_hit,
         stats.read_miss,
+        stats.read_fill_sessions,
         stats.write_update,
+        stats.write_update_sessions,
         stats.write_invalidate,
         stats.evict,
         stats.device_read_submit,
