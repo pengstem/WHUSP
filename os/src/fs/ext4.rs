@@ -36,22 +36,18 @@ pub(super) struct KernelDisk {
 
 impl Ext4BlockDevice for KernelDisk {
     fn write_blocks(&mut self, block_id: u64, buf: &[u8]) -> Ext4Result<usize> {
-        for (index, block) in buf.chunks(EXT4_DEV_BSIZE).enumerate() {
-            if block.len() != EXT4_DEV_BSIZE {
-                return Err(Ext4Error::new(EIO as _, "unaligned block write"));
-            }
-            self.dev.write_block(block_id as usize + index, block);
+        if buf.len() % EXT4_DEV_BSIZE != 0 {
+            return Err(Ext4Error::new(EIO as _, "unaligned block write"));
         }
+        self.dev.write_blocks(block_id as usize, buf);
         Ok(buf.len())
     }
 
     fn read_blocks(&mut self, block_id: u64, buf: &mut [u8]) -> Ext4Result<usize> {
-        for (index, block) in buf.chunks_mut(EXT4_DEV_BSIZE).enumerate() {
-            if block.len() != EXT4_DEV_BSIZE {
-                return Err(Ext4Error::new(EIO as _, "unaligned block read"));
-            }
-            self.dev.read_block(block_id as usize + index, block);
+        if buf.len() % EXT4_DEV_BSIZE != 0 {
+            return Err(Ext4Error::new(EIO as _, "unaligned block read"));
         }
+        self.dev.read_blocks(block_id as usize, buf);
         Ok(buf.len())
     }
 

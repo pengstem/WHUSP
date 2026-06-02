@@ -1,5 +1,5 @@
+use crate::config::PAGE_SIZE;
 use crate::sync::UPIntrFreeCell;
-use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
@@ -51,7 +51,11 @@ pub(crate) struct BlockCacheStats {
     pub(crate) write_invalidate: usize,
     pub(crate) evict: usize,
     pub(crate) device_read_submit: usize,
+    pub(crate) device_read_blocks: usize,
+    pub(crate) device_read_max_blocks: usize,
     pub(crate) device_write_submit: usize,
+    pub(crate) device_write_blocks: usize,
+    pub(crate) device_write_max_blocks: usize,
     pub(crate) bypass_unaligned: usize,
     pub(crate) lru_touch: usize,
     pub(crate) lru_scan_slots: usize,
@@ -105,22 +109,41 @@ impl BlockCache {
         }
     }
 
-    fn try_read(&mut self, key: BlockCacheKey, buf: &mut [u8]) -> bool {
+    fn read_or_miss_run(
+        &mut self,
+        device_key: usize,
+        block_id: usize,
+        max_blocks: usize,
+        first_buf: &mut [u8],
+    ) -> Option<usize> {
+        debug_assert_eq!(first_buf.len(), BLOCK_CACHE_LINE_SIZE);
+        debug_assert!(max_blocks > 0);
         if !self.enabled {
-            return false;
+            return Some(max_blocks);
         }
-        let Some(line) = self.lines.get(&key) else {
+        let key = BlockCacheKey::new(device_key, block_id);
+        if let Some(line) = self.lines.get(&key) {
+            first_buf.copy_from_slice(&line.data);
+            let old_stamp = line.lru_stamp;
+            self.stats.read_hit += 1;
+            let stamp = self.touch(key, Some(old_stamp));
+            if let Some(line) = self.lines.get_mut(&key) {
+                line.lru_stamp = stamp;
+            }
+            return None;
+        }
+
+        self.stats.read_miss += 1;
+        let mut blocks = 1;
+        while blocks < max_blocks {
+            let key = BlockCacheKey::new(device_key, block_id + blocks);
+            if self.lines.contains_key(&key) {
+                break;
+            }
             self.stats.read_miss += 1;
-            return false;
-        };
-        buf.copy_from_slice(&line.data);
-        let old_stamp = line.lru_stamp;
-        self.stats.read_hit += 1;
-        let stamp = self.touch(key, Some(old_stamp));
-        if let Some(line) = self.lines.get_mut(&key) {
-            line.lru_stamp = stamp;
+            blocks += 1;
         }
-        true
+        Some(blocks)
     }
 
     fn insert_read(&mut self, key: BlockCacheKey, data: [u8; BLOCK_CACHE_LINE_SIZE]) {
@@ -157,12 +180,16 @@ impl BlockCache {
         }
     }
 
-    fn record_device_read_submit(&mut self) {
+    fn record_device_read_submit(&mut self, blocks: usize) {
         self.stats.device_read_submit += 1;
+        self.stats.device_read_blocks += blocks;
+        self.stats.device_read_max_blocks = self.stats.device_read_max_blocks.max(blocks);
     }
 
-    fn record_device_write_submit(&mut self) {
+    fn record_device_write_submit(&mut self, blocks: usize) {
         self.stats.device_write_submit += 1;
+        self.stats.device_write_blocks += blocks;
+        self.stats.device_write_max_blocks = self.stats.device_write_max_blocks.max(blocks);
     }
 
     fn record_bypass_unaligned(&mut self) {
@@ -187,9 +214,15 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(BlockCache::new(DEFAULT_BLOCK_CACHE_CAPACITY)) };
 }
 
-fn cache_try_read(device_key: usize, block_id: usize, buf: &mut [u8]) -> bool {
-    let key = BlockCacheKey::new(device_key, block_id);
-    BLOCK_CACHE.exclusive_access().try_read(key, buf)
+fn cache_read_or_miss_run(
+    device_key: usize,
+    block_id: usize,
+    max_blocks: usize,
+    first_buf: &mut [u8],
+) -> Option<usize> {
+    BLOCK_CACHE
+        .exclusive_access()
+        .read_or_miss_run(device_key, block_id, max_blocks, first_buf)
 }
 
 fn cache_insert_read(device_key: usize, block_id: usize, data: [u8; BLOCK_CACHE_LINE_SIZE]) {
@@ -209,16 +242,31 @@ fn cache_invalidate_key_after_write(device_key: usize, block_id: usize) {
         .invalidate_key_after_write(key);
 }
 
-fn record_device_read_submit() {
-    BLOCK_CACHE.exclusive_access().record_device_read_submit();
+fn record_device_read_submit(blocks: usize) {
+    BLOCK_CACHE
+        .exclusive_access()
+        .record_device_read_submit(blocks);
 }
 
-fn record_device_write_submit() {
-    BLOCK_CACHE.exclusive_access().record_device_write_submit();
+fn record_device_write_submit(blocks: usize) {
+    BLOCK_CACHE
+        .exclusive_access()
+        .record_device_write_submit(blocks);
 }
 
 fn record_bypass_unaligned() {
     BLOCK_CACHE.exclusive_access().record_bypass_unaligned();
+}
+
+fn page_bounded_full_blocks(buf: &[u8], max_blocks: usize) -> usize {
+    if max_blocks == 0 {
+        return 0;
+    }
+    let page_offset = (buf.as_ptr() as usize) & (PAGE_SIZE - 1);
+    let page_remaining = PAGE_SIZE - page_offset;
+    (page_remaining / BLOCK_CACHE_LINE_SIZE)
+        .max(1)
+        .min(max_blocks)
 }
 
 pub(crate) fn read_with_cache<F>(
@@ -229,22 +277,40 @@ pub(crate) fn read_with_cache<F>(
 ) where
     F: FnMut(usize, &mut [u8]),
 {
-    for (index, chunk) in buf.chunks_mut(BLOCK_CACHE_LINE_SIZE).enumerate() {
-        let current_block = block_id + index;
-        if chunk.len() != BLOCK_CACHE_LINE_SIZE {
-            record_bypass_unaligned();
-            record_device_read_submit();
-            read_uncached(current_block, chunk);
-            continue;
+    let full_blocks = buf.len() / BLOCK_CACHE_LINE_SIZE;
+    let full_bytes = full_blocks * BLOCK_CACHE_LINE_SIZE;
+    let mut index = 0;
+    while index < full_blocks {
+        let start = index * BLOCK_CACHE_LINE_SIZE;
+        let max_blocks = page_bounded_full_blocks(&buf[start..full_bytes], full_blocks - index);
+        match cache_read_or_miss_run(
+            device_key,
+            block_id + index,
+            max_blocks,
+            &mut buf[start..start + BLOCK_CACHE_LINE_SIZE],
+        ) {
+            None => {
+                index += 1;
+            }
+            Some(blocks) => {
+                let end = start + blocks * BLOCK_CACHE_LINE_SIZE;
+                record_device_read_submit(blocks);
+                read_uncached(block_id + index, &mut buf[start..end]);
+                for (offset, chunk) in buf[start..end].chunks(BLOCK_CACHE_LINE_SIZE).enumerate() {
+                    let mut line = [0u8; BLOCK_CACHE_LINE_SIZE];
+                    line.copy_from_slice(chunk);
+                    cache_insert_read(device_key, block_id + index + offset, line);
+                }
+                index += blocks;
+            }
         }
-        if cache_try_read(device_key, current_block, chunk) {
-            continue;
-        }
-        let mut line = Box::new([0u8; BLOCK_CACHE_LINE_SIZE]);
-        record_device_read_submit();
-        read_uncached(current_block, line.as_mut());
-        chunk.copy_from_slice(line.as_ref());
-        cache_insert_read(device_key, current_block, *line);
+    }
+
+    let tail = &mut buf[full_bytes..];
+    if !tail.is_empty() {
+        record_bypass_unaligned();
+        record_device_read_submit(1);
+        read_uncached(block_id + full_blocks, tail);
     }
 }
 
@@ -256,20 +322,29 @@ pub(crate) fn write_with_cache<F>(
 ) where
     F: FnMut(usize, &[u8]),
 {
-    for (index, chunk) in buf.chunks(BLOCK_CACHE_LINE_SIZE).enumerate() {
-        let current_block = block_id + index;
-        if chunk.len() != BLOCK_CACHE_LINE_SIZE {
-            record_bypass_unaligned();
-            record_device_write_submit();
-            write_uncached(current_block, chunk);
-            cache_invalidate_key_after_write(device_key, current_block);
-            continue;
+    let full_blocks = buf.len() / BLOCK_CACHE_LINE_SIZE;
+    let full_bytes = full_blocks * BLOCK_CACHE_LINE_SIZE;
+    let mut index = 0;
+    while index < full_blocks {
+        let start = index * BLOCK_CACHE_LINE_SIZE;
+        let blocks = page_bounded_full_blocks(&buf[start..full_bytes], full_blocks - index);
+        let end = start + blocks * BLOCK_CACHE_LINE_SIZE;
+        record_device_write_submit(blocks);
+        write_uncached(block_id + index, &buf[start..end]);
+        for (offset, chunk) in buf[start..end].chunks(BLOCK_CACHE_LINE_SIZE).enumerate() {
+            let mut line = [0u8; BLOCK_CACHE_LINE_SIZE];
+            line.copy_from_slice(chunk);
+            cache_update_after_write(device_key, block_id + index + offset, line);
         }
-        record_device_write_submit();
-        write_uncached(current_block, chunk);
-        let mut line = [0u8; BLOCK_CACHE_LINE_SIZE];
-        line.copy_from_slice(chunk);
-        cache_update_after_write(device_key, current_block, line);
+        index += blocks;
+    }
+
+    let tail = &buf[full_bytes..];
+    if !tail.is_empty() {
+        record_bypass_unaligned();
+        record_device_write_submit(1);
+        write_uncached(block_id + full_blocks, tail);
+        cache_invalidate_key_after_write(device_key, block_id + full_blocks);
     }
 }
 
@@ -280,7 +355,7 @@ pub(crate) fn stats_snapshot() -> BlockCacheStats {
 pub(crate) fn stats_content() -> String {
     let stats = stats_snapshot();
     format!(
-        "enabled {}\nentries {}\ncapacity {}\nread_hit {}\nread_miss {}\nwrite_update {}\nwrite_invalidate {}\nevict {}\ndevice_read_submit {}\ndevice_write_submit {}\nbypass_unaligned {}\nlru_touch {}\nlru_scan_slots {}\n",
+        "enabled {}\nentries {}\ncapacity {}\nread_hit {}\nread_miss {}\nwrite_update {}\nwrite_invalidate {}\nevict {}\ndevice_read_submit {}\ndevice_read_blocks {}\ndevice_read_max_blocks {}\ndevice_write_submit {}\ndevice_write_blocks {}\ndevice_write_max_blocks {}\nbypass_unaligned {}\nlru_touch {}\nlru_scan_slots {}\n",
         stats.enabled as usize,
         stats.entries,
         stats.capacity,
@@ -290,7 +365,11 @@ pub(crate) fn stats_content() -> String {
         stats.write_invalidate,
         stats.evict,
         stats.device_read_submit,
+        stats.device_read_blocks,
+        stats.device_read_max_blocks,
         stats.device_write_submit,
+        stats.device_write_blocks,
+        stats.device_write_max_blocks,
         stats.bypass_unaligned,
         stats.lru_touch,
         stats.lru_scan_slots,

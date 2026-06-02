@@ -1733,7 +1733,11 @@ fn oskernel_perf_content() -> String {
          block_cache_write_invalidate {}\n\
          block_cache_evict {}\n\
          block_cache_device_read_submit {}\n\
+         block_cache_device_read_blocks {}\n\
+         block_cache_device_read_max_blocks {}\n\
          block_cache_device_write_submit {}\n\
+         block_cache_device_write_blocks {}\n\
+         block_cache_device_write_max_blocks {}\n\
          block_cache_bypass_unaligned {}\n\
          block_cache_lru_touch {}\n\
          block_cache_lru_scan_slots {}\n\
@@ -1765,7 +1769,11 @@ fn oskernel_perf_content() -> String {
         block.write_invalidate,
         block.evict,
         block.device_read_submit,
+        block.device_read_blocks,
+        block.device_read_max_blocks,
         block.device_write_submit,
+        block.device_write_blocks,
+        block.device_write_max_blocks,
         block.bypass_unaligned,
         block.lru_touch,
         block.lru_scan_slots,

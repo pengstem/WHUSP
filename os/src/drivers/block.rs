@@ -22,12 +22,16 @@ pub struct VirtIOBlock {
 
 impl VirtIOBlock {
     pub fn read_block(&self, block_id: usize, buf: &mut [u8]) {
+        self.read_blocks(block_id, buf);
+    }
+
+    pub fn read_blocks(&self, block_id: usize, buf: &mut [u8]) {
         block_cache::read_with_cache(self.cache_key(), block_id, buf, |block_id, buf| {
-            self.read_block_uncached(block_id, buf);
+            self.read_blocks_uncached(block_id, buf);
         });
     }
 
-    fn read_block_uncached(&self, block_id: usize, buf: &mut [u8]) {
+    fn read_blocks_uncached(&self, block_id: usize, buf: &mut [u8]) {
         let nb = *DEV_NON_BLOCKING_ACCESS.exclusive_access();
         if nb {
             // The nonblocking virtio API borrows req/buf/resp until completion.
@@ -68,12 +72,16 @@ impl VirtIOBlock {
     }
 
     pub fn write_block(&self, block_id: usize, buf: &[u8]) {
+        self.write_blocks(block_id, buf);
+    }
+
+    pub fn write_blocks(&self, block_id: usize, buf: &[u8]) {
         block_cache::write_with_cache(self.cache_key(), block_id, buf, |block_id, buf| {
-            self.write_block_uncached(block_id, buf);
+            self.write_blocks_uncached(block_id, buf);
         });
     }
 
-    fn write_block_uncached(&self, block_id: usize, buf: &[u8]) {
+    fn write_blocks_uncached(&self, block_id: usize, buf: &[u8]) {
         let nb = *DEV_NON_BLOCKING_ACCESS.exclusive_access();
         if nb {
             // Same lifetime contract as the read path: req/buf/resp remain
