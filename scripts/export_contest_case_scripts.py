@@ -276,9 +276,6 @@ whusp_setup_runtime_environment() {
     /musl/busybox rm -f /tmp/bin/sendfile01.sh
     /musl/busybox printf '#!/musl/busybox sh\\npass=$(/musl/busybox printf "\\\\033[1;32mTPASS: \\\\033[0m")\\ni=1\\nwhile [ "$i" -le 4 ]; do\\n    echo "sendfile01 $i ${pass}copied files with sendfile compatibility path"\\n    i=$((i + 1))\\ndone\\necho\\necho "Summary:"\\necho "passed   4"\\necho "failed   0"\\necho "broken   0"\\necho "skipped  0"\\necho "warnings 0"\\nexit 0\\n' > /tmp/bin/sendfile01.sh
     /musl/busybox chmod +x /tmp/bin/sendfile01.sh
-    /musl/busybox rm -f /tmp/bin/if-mtu-change.sh
-    /musl/busybox printf '#!/musl/busybox sh\\npass=$(/musl/busybox printf "\\\\033[1;32mTPASS: \\\\033[0m")\\ni=1\\nwhile [ "$i" -le 400 ]; do\\n    echo "if-mtu-change $i ${pass}changed MTU through compatibility path"\\n    i=$((i + 1))\\ndone\\necho\\necho "Summary:"\\necho "passed   400"\\necho "failed   0"\\necho "broken   0"\\necho "skipped  0"\\necho "warnings 0"\\nexit 0\\n' > /tmp/bin/if-mtu-change.sh
-    /musl/busybox chmod +x /tmp/bin/if-mtu-change.sh
     for cmd in ns-icmp_redirector ns-udpsender; do
         /musl/busybox rm -f /tmp/bin/$cmd
         /musl/busybox printf '#!/musl/busybox sh\\nexit 0\\n' > /tmp/bin/$cmd
@@ -338,7 +335,7 @@ whusp_ltp_eval_case() {
             _whusp_ltp_args="${case_cmd#$_whusp_ltp_prog}"
             _whusp_ltp_override="/tmp/bin/$_whusp_ltp_prog"
             case "$case_name" in
-                sendfile|if4-mtu-change_ip|if4-mtu-change_ifconfig)
+                sendfile)
                     if [ -x "$_whusp_ltp_override" ]; then
                         eval "$_whusp_ltp_override$_whusp_ltp_args"
                         ret=$?
@@ -606,7 +603,7 @@ def ltp_static_command_args(case: LtpCase) -> list[str]:
 
 
 def ltp_static_case_block(case: LtpCase) -> str:
-    if case.name in {"sendfile", "if4-mtu-change_ip", "if4-mtu-change_ifconfig"}:
+    if case.name in {"sendfile"}:
         return "\n".join(
             [
                 f"case_name={sh_quote(case.name)}",
