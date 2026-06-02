@@ -1717,6 +1717,7 @@ fn pid_pagemap_read(pid: usize, buf: &mut [u8], offset: usize) -> usize {
 fn oskernel_perf_content() -> String {
     let (frame_total, frame_free) = frame_stats();
     let block = block_cache::stats_snapshot();
+    let block_io = crate::drivers::block::block_io_stats_snapshot();
     let dentry = dentry_cache::stats_snapshot();
     let page_cache_entries = crate::mm::page_cache::PAGE_CACHE.exclusive_access().len();
     let dirty_writeback = crate::fs::vfs::dirty_writeback_stats_snapshot();
@@ -1760,6 +1761,24 @@ fn oskernel_perf_content() -> String {
          block_cache_bypass_unaligned {}\n\
          block_cache_lru_touch {}\n\
          block_cache_lru_scan_slots {}\n\
+         block_io_nonblocking_requested {}\n\
+         block_io_nb_read_submits {}\n\
+         block_io_nb_write_submits {}\n\
+         block_io_nb_read_waits {}\n\
+         block_io_nb_write_waits {}\n\
+         block_io_nb_read_completions {}\n\
+         block_io_nb_write_completions {}\n\
+         block_io_fallback_sync_reads {}\n\
+         block_io_fallback_sync_writes {}\n\
+         block_io_fallback_unsafe_reads {}\n\
+         block_io_fallback_unsafe_writes {}\n\
+         block_io_fallback_no_ready_reads {}\n\
+         block_io_fallback_no_ready_writes {}\n\
+         block_io_sync_read_submits {}\n\
+         block_io_sync_write_submits {}\n\
+         block_io_irq_acks {}\n\
+         block_io_completion_signals {}\n\
+         block_io_completion_wakeups {}\n\
          dentry_cache_enabled {}\n\
          dentry_cache_entries {}\n\
          dentry_cache_capacity {}\n\
@@ -1814,6 +1833,24 @@ fn oskernel_perf_content() -> String {
         block.bypass_unaligned,
         block.lru_touch,
         block.lru_scan_slots,
+        block_io.nonblocking_requested,
+        block_io.nb_read_submits,
+        block_io.nb_write_submits,
+        block_io.nb_read_waits,
+        block_io.nb_write_waits,
+        block_io.nb_read_completions,
+        block_io.nb_write_completions,
+        block_io.fallback_sync_reads,
+        block_io.fallback_sync_writes,
+        block_io.fallback_unsafe_reads,
+        block_io.fallback_unsafe_writes,
+        block_io.fallback_no_ready_reads,
+        block_io.fallback_no_ready_writes,
+        block_io.sync_read_submits,
+        block_io.sync_write_submits,
+        block_io.irq_acks,
+        block_io.completion_signals,
+        block_io.completion_wakeups,
         dentry.enabled as usize,
         dentry.entries,
         dentry.capacity,

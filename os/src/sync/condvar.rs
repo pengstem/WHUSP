@@ -21,10 +21,13 @@ impl Condvar {
         }
     }
 
-    pub fn signal(&self) {
+    pub fn signal(&self) -> bool {
         let mut inner = self.inner.exclusive_access();
         if let Some(task) = inner.wait_queue.pop_front() {
             wakeup_task(task);
+            true
+        } else {
+            false
         }
     }
 

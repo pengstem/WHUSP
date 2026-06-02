@@ -287,6 +287,10 @@ pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     TASK_MANAGER.exclusive_access().fetch()
 }
 
+pub(crate) fn has_ready_task() -> bool {
+    TASK_MANAGER.exclusive_access().ready_len() > 0
+}
+
 pub(crate) fn remove_ready_tasks_of_process(process_id: usize) {
     TASK_MANAGER
         .exclusive_access()

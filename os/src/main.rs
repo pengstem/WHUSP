@@ -100,11 +100,10 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     fs::init();
     fs::list_apps();
     task::add_initproc();
-    // CONTEXT: Keep contest block I/O synchronous by default. Runtime DSO
-    // loading can fault in file-backed pages after init, and the current
-    // nonblocking VirtIO/Condvar path can leave that read asleep until the
-    // test harness kills the process.
-    *DEV_NON_BLOCKING_ACCESS.exclusive_access() = false;
+    // CONTEXT: RISC-V VirtIO block IRQs are wired, so task-context I/O can use
+    // the nonblocking path. The driver still falls back to sync I/O when a read
+    // happens from an unsafe context such as interrupt-disabled lazy fault-in.
+    *DEV_NON_BLOCKING_ACCESS.exclusive_access() = cfg!(target_arch = "riscv64");
     task::run_tasks();
     panic!("Unreachable in rust_main!");
 }

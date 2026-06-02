@@ -43,6 +43,7 @@ pub use clone::{CloneArgs, CloneFlags, clone_current_thread};
 pub(crate) use fd::{FD_LIMIT, FdFlags, FdTableEntry};
 pub use id::{IDLE_PID, KernelStack, PidHandle, kstack_alloc, pid_alloc};
 pub(crate) use manager::any_process_references_mount;
+pub(crate) use manager::has_ready_task;
 pub(crate) use manager::list_process_snapshots;
 pub(crate) use manager::processes_snapshot;
 pub(crate) use manager::remove_ready_tasks_of_process;
