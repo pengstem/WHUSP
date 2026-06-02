@@ -5,11 +5,12 @@ use crate::syscall::user_ptr::{
 };
 use crate::syscall::{LinuxSigInfo, errno::SysError, errno::SysResult};
 use crate::task::{
-    SIGCHLD, SIGNAL_INFO_SLOTS, SignalAction, SignalFlags, SignalInfo, current_add_signal,
-    current_process, current_task, current_trap_cx, current_user_token, flags_to_linux_sigset,
-    linux_sigset_to_flags,
+    ProcessControlBlock, SIGCHLD, SIGNAL_INFO_SLOTS, SignalAction, SignalFlags, SignalInfo,
+    TaskControlBlock, current_add_signal, current_process, current_task, current_trap_cx,
+    current_user_token, flags_to_linux_sigset, linux_sigset_to_flags, trap_cx_of_task,
 };
 use crate::trap::TrapContext;
+use alloc::sync::Arc;
 use core::mem::{offset_of, size_of};
 
 const SIGNAL_FRAME_MAGIC: usize = 0x574c_4153_4947_4652;
@@ -162,19 +163,17 @@ fn signal_mmap_fault(addr: usize, access: UserBufferAccess) -> bool {
     handle_mmap_page_fault(addr, access)
 }
 
-fn remove_pending_signal(signum: usize, signal: SignalFlags) {
-    let Some(task) = current_task() else {
-        return;
-    };
+fn remove_pending_signal_for_task(task: &TaskControlBlock, signum: usize, signal: SignalFlags) {
     let mut task_inner = task.inner_exclusive_access();
     if task_inner.pending_signals.contains(signal) {
         task_inner.clear_pending(signum as u32);
     }
 }
 
-fn take_pending_user_signal() -> Option<PendingUserSignal> {
-    let task = current_task()?;
-    let process = current_process();
+fn take_pending_user_signal_for_task(
+    task: &Arc<TaskControlBlock>,
+    process: &Arc<ProcessControlBlock>,
+) -> Option<PendingUserSignal> {
     let (signum, signal) = {
         let task_inner = task.inner_exclusive_access();
         let unmasked_bits = task_inner.pending_signals.bits() & !task_inner.signal_mask.bits();
@@ -208,7 +207,7 @@ fn take_pending_user_signal() -> Option<PendingUserSignal> {
 
     let action = process.inner_exclusive_access().signal_actions[signum];
     if action.is_ignore() {
-        remove_pending_signal(signum, signal);
+        remove_pending_signal_for_task(task, signum, signal);
         return None;
     }
     if !action.has_user_handler() {
@@ -242,11 +241,15 @@ fn take_pending_user_signal() -> Option<PendingUserSignal> {
     })
 }
 
-pub fn deliver_pending_signal(interrupted_pc: usize) -> bool {
-    let Some(delivery) = take_pending_user_signal() else {
+pub fn deliver_pending_signal(
+    task: &Arc<TaskControlBlock>,
+    process: &Arc<ProcessControlBlock>,
+    interrupted_pc: usize,
+) -> bool {
+    let Some(delivery) = take_pending_user_signal_for_task(task, process) else {
         return false;
     };
-    let saved_context = *current_trap_cx();
+    let saved_context = *trap_cx_of_task(task);
     let user_sp = saved_context.x[3];
     let frame_sp = (user_sp - size_of::<LoongArchSignalFrame>()) & !(SIGNAL_STACK_ALIGN - 1);
     let frame = LoongArchSignalFrame {
@@ -256,7 +259,7 @@ pub fn deliver_pending_signal(interrupted_pc: usize) -> bool {
         siginfo: LinuxSigInfo::from(delivery.info),
         ucontext: LinuxUContextCompat::new(interrupted_pc, saved_context, delivery.old_mask),
     };
-    let token = current_user_token();
+    let token = task.get_user_token();
     if write_user_value_with_fault(
         token,
         frame_sp as *mut LoongArchSignalFrame,
@@ -277,7 +280,7 @@ pub fn deliver_pending_signal(interrupted_pc: usize) -> bool {
         return false;
     }
 
-    let trap_cx = current_trap_cx();
+    let trap_cx = trap_cx_of_task(task);
     trap_cx.x = saved_context.x;
     trap_cx.era = delivery.action.handler;
     trap_cx.set_sp(frame_sp);

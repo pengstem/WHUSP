@@ -185,9 +185,10 @@ pub(crate) fn ptrace_note_exec_current() {
     }
 }
 
-fn take_ptrace_stop_signal() -> Option<usize> {
-    let task = current_task()?;
-    let process = current_process();
+fn take_ptrace_stop_signal_for_task(
+    task: &Arc<TaskControlBlock>,
+    process: &Arc<ProcessControlBlock>,
+) -> Option<usize> {
     let tracer_pid = process.inner_exclusive_access().ptrace.tracer_pid?;
     let (signum, signal) = {
         let task_inner = task.inner_exclusive_access();
@@ -224,7 +225,8 @@ fn take_ptrace_stop_signal() -> Option<usize> {
     Some(tracer_pid)
 }
 
-fn ptrace_syscall_stop_current(
+fn ptrace_syscall_stop_for_task(
+    process: &Arc<ProcessControlBlock>,
     op: u8,
     nr: usize,
     args: [usize; 6],
@@ -232,12 +234,6 @@ fn ptrace_syscall_stop_current(
     instruction_pointer: usize,
     stack_pointer: usize,
 ) -> bool {
-    let Some(task) = current_task() else {
-        return false;
-    };
-    let Some(process) = task.process.upgrade() else {
-        return false;
-    };
     let tracer_pid = {
         let mut inner = process.inner_exclusive_access();
         let Some(tracer_pid) = inner.ptrace.tracer_pid else {
@@ -273,13 +269,15 @@ fn ptrace_syscall_stop_current(
     true
 }
 
-pub(crate) fn ptrace_syscall_enter_stop_current(
+pub(crate) fn ptrace_syscall_enter_stop_for_task(
+    process: &Arc<ProcessControlBlock>,
     nr: usize,
     args: [usize; 6],
     instruction_pointer: usize,
     stack_pointer: usize,
 ) -> bool {
-    ptrace_syscall_stop_current(
+    ptrace_syscall_stop_for_task(
+        process,
         PTRACE_SYSCALL_INFO_ENTRY,
         nr,
         args,
@@ -289,12 +287,14 @@ pub(crate) fn ptrace_syscall_enter_stop_current(
     )
 }
 
-pub(crate) fn ptrace_syscall_exit_stop_current(
+pub(crate) fn ptrace_syscall_exit_stop_for_task(
+    process: &Arc<ProcessControlBlock>,
     rval: isize,
     instruction_pointer: usize,
     stack_pointer: usize,
 ) -> bool {
-    ptrace_syscall_stop_current(
+    ptrace_syscall_stop_for_task(
+        process,
         PTRACE_SYSCALL_INFO_EXIT,
         0,
         [0; 6],
@@ -304,8 +304,11 @@ pub(crate) fn ptrace_syscall_exit_stop_current(
     )
 }
 
-pub(crate) fn ptrace_stop_current_if_needed() -> bool {
-    let Some(tracer_pid) = take_ptrace_stop_signal() else {
+pub(crate) fn ptrace_stop_task_if_needed(
+    task: &Arc<TaskControlBlock>,
+    process: &Arc<ProcessControlBlock>,
+) -> bool {
+    let Some(tracer_pid) = take_ptrace_stop_signal_for_task(task, process) else {
         return false;
     };
     let (_task, task_cx_ptr) = block_current_task_no_schedule();

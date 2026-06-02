@@ -75,11 +75,8 @@ pub fn current_task() -> Option<Arc<TaskControlBlock>> {
 
 pub fn current_process() -> Arc<ProcessControlBlock> {
     perf::record_task_current_process_call();
-    current_task()
-        .expect("current_process requires a running task")
-        .process
-        .upgrade()
-        .expect("current task process must outlive the task")
+    let task = current_task().expect("current_process requires a running task");
+    process_of_task(&task)
 }
 
 pub fn current_user_token() -> usize {
@@ -90,10 +87,18 @@ pub fn current_user_token() -> usize {
 
 pub fn current_trap_cx() -> &'static mut TrapContext {
     perf::record_task_current_trap_cx_call();
-    current_task()
-        .expect("current_trap_cx requires a running task")
-        .inner_exclusive_access()
-        .get_trap_cx()
+    let task = current_task().expect("current_trap_cx requires a running task");
+    trap_cx_of_task(&task)
+}
+
+pub fn process_of_task(task: &TaskControlBlock) -> Arc<ProcessControlBlock> {
+    task.process
+        .upgrade()
+        .expect("current task process must outlive the task")
+}
+
+pub fn trap_cx_of_task(task: &TaskControlBlock) -> &'static mut TrapContext {
+    task.inner_exclusive_access().get_trap_cx()
 }
 
 fn account_trap_return_for_task(

@@ -85,6 +85,7 @@ impl DirtyFileCache {
     }
 }
 
+#[cfg(feature = "perf-counters")]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DirtyWritebackStats {
     pub(crate) dirty_files: usize,
@@ -190,6 +191,7 @@ fn record_dirty_cache_flush_failure(reason: DirtyFlushReason) {
     counters.pressure_flush_failures = counters.pressure_flush_failures.saturating_add(1);
 }
 
+#[cfg(feature = "perf-counters")]
 pub(crate) fn dirty_writeback_stats_snapshot() -> DirtyWritebackStats {
     let dirty = DIRTY_REGULAR_FILES.lock();
     let counters = DIRTY_WRITEBACK_COUNTERS.lock();

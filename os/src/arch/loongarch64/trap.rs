@@ -2,14 +2,15 @@ mod context;
 
 use crate::config::TRAMPOLINE;
 use crate::mm::{MmapFaultAccess, MmapFaultResult};
-use crate::syscall::syscall;
+use crate::syscall::{syscall_is_exit, syscall_is_exit_group, syscall_with_current_task};
 use crate::task::{
-    SignalAction, SignalFlags, account_current_user_time_until, check_signals_of_current,
-    current_add_signal, current_process, current_task, current_trap_cx,
-    current_trap_return_context_after_accounting, exit_current_group_and_run_next,
-    suspend_current_and_run_next,
+    SignalAction, SignalFlags, account_task_user_time_until, check_signals_of_task,
+    current_add_signal, current_process, current_task,
+    current_trap_return_context_after_accounting, exit_current_group_and_run_next, process_of_task,
+    suspend_current_and_run_next, trap_cx_of_task,
 };
 use crate::timer::{check_timer, get_time_us, set_next_trigger};
+use alloc::sync::Arc;
 use core::arch::global_asm;
 use loongArch64::register::{
     badv, ecfg,
@@ -76,12 +77,14 @@ fn tlb_init() {
 
 #[unsafe(no_mangle)]
 pub fn trap_handler() -> ! {
-    account_current_user_time_until(get_time_us());
+    let mut task = current_task().expect("trap_handler requires a running task");
+    let mut process = process_of_task(&task);
+    account_task_user_time_until(&task, &process, get_time_us());
     let estat = estat::read();
     let badv = badv::read().vaddr();
     let is_syscall = matches!(estat.cause(), Trap::Exception(Exception::Syscall));
     let (trap_pc, syscall_entry) = {
-        let cx = current_trap_cx();
+        let cx = trap_cx_of_task(&task);
         let syscall_entry = if is_syscall {
             // Snapshot the contest LoongArch syscall ABI registers before
             // ptrace stops or syscall handlers can mutate TrapContext.
@@ -101,26 +104,41 @@ pub fn trap_handler() -> ! {
             let syscall_pc = trap_pc;
             let (syscall_nr, syscall_args, syscall_sp) =
                 syscall_entry.expect("syscall entry snapshot must exist for Syscall");
-            crate::task::ptrace_syscall_enter_stop_current(
+            crate::task::ptrace_syscall_enter_stop_for_task(
+                &process,
                 syscall_nr,
                 syscall_args,
                 syscall_pc,
                 syscall_sp,
             );
-            current_trap_cx().era += 4;
+            trap_cx_of_task(&task).era += 4;
             enable_supervisor_interrupt();
-            let result = syscall(syscall_nr, syscall_args);
-            let cx = current_trap_cx();
+            if syscall_is_exit(syscall_nr) {
+                drop(process);
+                let _ = syscall_with_current_task(task, syscall_nr, syscall_args);
+                unreachable!("exit syscall returned");
+            }
+            let result = if syscall_is_exit_group(syscall_nr) {
+                drop(process);
+                let result = syscall_with_current_task(task, syscall_nr, syscall_args);
+                task = current_task().expect("seccomp-blocked exit_group requires a running task");
+                process = process_of_task(&task);
+                result
+            } else {
+                syscall_with_current_task(Arc::clone(&task), syscall_nr, syscall_args)
+            };
+            let cx = trap_cx_of_task(&task);
             interrupted_pc = cx.era;
             cx.x[4] = result as usize;
             let syscall_exit_pc = cx.era;
             let syscall_exit_sp = cx.x[3];
-            if crate::task::ptrace_syscall_exit_stop_current(
+            if crate::task::ptrace_syscall_exit_stop_for_task(
+                &process,
                 result,
                 syscall_exit_pc,
                 syscall_exit_sp,
             ) {
-                interrupted_pc = current_trap_cx().era;
+                interrupted_pc = trap_cx_of_task(&task).era;
             }
         }
         Trap::Exception(Exception::StorePageFault)
@@ -161,13 +179,15 @@ pub fn trap_handler() -> ! {
             );
         }
     }
-    if crate::task::ptrace_stop_current_if_needed() {
-        interrupted_pc = current_trap_cx().era;
+    if crate::task::ptrace_stop_task_if_needed(&task, &process) {
+        interrupted_pc = trap_cx_of_task(&task).era;
     }
-    if crate::arch::signal::deliver_pending_signal(interrupted_pc) {
+    if crate::arch::signal::deliver_pending_signal(&task, &process, interrupted_pc) {
         trap_return();
     }
-    if let Some((errno, _msg)) = check_signals_of_current() {
+    if let Some((errno, _msg)) = check_signals_of_task(&task, &process) {
+        drop(process);
+        drop(task);
         exit_current_group_and_run_next(errno);
     }
     trap_return();

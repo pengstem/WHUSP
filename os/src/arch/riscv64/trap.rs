@@ -2,14 +2,17 @@ mod context;
 
 use crate::config::TRAMPOLINE;
 use crate::mm::{MmapFaultAccess, MmapFaultResult};
-use crate::syscall::{errno::SysError, syscall};
+use crate::syscall::{
+    errno::SysError, syscall_is_exit, syscall_is_exit_group, syscall_with_current_task,
+};
 use crate::task::{
-    SignalAction, SignalFlags, account_current_user_time_until, check_signals_of_current,
-    current_add_signal, current_process, current_task, current_trap_cx,
-    current_trap_return_context_after_accounting, exit_current_group_and_run_next,
-    suspend_current_and_run_next,
+    SignalAction, SignalFlags, account_task_user_time_until, check_signals_of_task,
+    current_add_signal, current_process, current_task,
+    current_trap_return_context_after_accounting, exit_current_group_and_run_next, process_of_task,
+    suspend_current_and_run_next, trap_cx_of_task,
 };
 use crate::timer::{check_timer, get_time_us, set_next_trigger};
+use alloc::sync::Arc;
 use core::arch::{asm, global_asm};
 use riscv::register::{
     mtvec::TrapMode,
@@ -62,12 +65,14 @@ fn disable_supervisor_interrupt() {
 #[unsafe(no_mangle)]
 pub fn trap_handler() -> ! {
     set_kernel_trap_entry();
-    account_current_user_time_until(get_time_us());
+    let mut task = current_task().expect("trap_handler requires a running task");
+    let mut process = process_of_task(&task);
+    account_task_user_time_until(&task, &process, get_time_us());
     let scause = scause::read();
     let stval = stval::read();
     let is_user_ecall = matches!(scause.cause(), Trap::Exception(Exception::UserEnvCall));
     let (trap_pc, syscall_entry) = {
-        let cx = current_trap_cx();
+        let cx = trap_cx_of_task(&task);
         let syscall_entry = if is_user_ecall {
             // Snapshot the Linux RISC-V syscall ABI registers before ptrace
             // stops or syscall handlers can mutate TrapContext.
@@ -89,21 +94,35 @@ pub fn trap_handler() -> ! {
             let syscall_pc = trap_pc;
             let (syscall_nr, syscall_args, syscall_sp) =
                 syscall_entry.expect("syscall entry snapshot must exist for UserEnvCall");
-            crate::task::ptrace_syscall_enter_stop_current(
+            crate::task::ptrace_syscall_enter_stop_for_task(
+                &process,
                 syscall_nr,
                 syscall_args,
                 syscall_pc,
                 syscall_sp,
             );
             // jump to next instruction anyway
-            current_trap_cx().sepc += 4;
+            trap_cx_of_task(&task).sepc += 4;
 
             enable_supervisor_interrupt();
 
             // get system call return value
-            let result = syscall(syscall_nr, syscall_args);
+            if syscall_is_exit(syscall_nr) {
+                drop(process);
+                let _ = syscall_with_current_task(task, syscall_nr, syscall_args);
+                unreachable!("exit syscall returned");
+            }
+            let result = if syscall_is_exit_group(syscall_nr) {
+                drop(process);
+                let result = syscall_with_current_task(task, syscall_nr, syscall_args);
+                task = current_task().expect("seccomp-blocked exit_group requires a running task");
+                process = process_of_task(&task);
+                result
+            } else {
+                syscall_with_current_task(Arc::clone(&task), syscall_nr, syscall_args)
+            };
             // cx is changed during sys_execve, so we have to call it again
-            let cx = current_trap_cx();
+            let cx = trap_cx_of_task(&task);
             // UNFINISHED: Full SA_RESTART is not modeled yet. Most interrupted
             // syscalls such as futex, nanosleep, clock_nanosleep, ppoll, and
             // pselect6 currently return EINTR after rt_sigreturn instead of
@@ -118,17 +137,20 @@ pub fn trap_handler() -> ! {
             } else {
                 None
             };
-            if crate::task::ptrace_syscall_exit_stop_current(
+            if crate::task::ptrace_syscall_exit_stop_for_task(
+                &process,
                 result,
                 syscall_exit_pc,
                 syscall_exit_sp,
             ) {
-                interrupted_pc = current_trap_cx().sepc;
+                interrupted_pc = trap_cx_of_task(&task).sepc;
             }
-            if crate::task::ptrace_stop_current_if_needed() {
-                interrupted_pc = current_trap_cx().sepc;
+            if crate::task::ptrace_stop_task_if_needed(&task, &process) {
+                interrupted_pc = trap_cx_of_task(&task).sepc;
             }
             if crate::arch::signal::deliver_pending_signal(
+                &task,
+                &process,
                 interrupted_pc,
                 syscall_pc_if_interrupted,
             ) {
@@ -183,15 +205,17 @@ pub fn trap_handler() -> ! {
             );
         }
     }
-    if !signal_delivery_attempted && crate::task::ptrace_stop_current_if_needed() {
-        interrupted_pc = current_trap_cx().sepc;
+    if !signal_delivery_attempted && crate::task::ptrace_stop_task_if_needed(&task, &process) {
+        interrupted_pc = trap_cx_of_task(&task).sepc;
     }
     if !signal_delivery_attempted
-        && crate::arch::signal::deliver_pending_signal(interrupted_pc, None)
+        && crate::arch::signal::deliver_pending_signal(&task, &process, interrupted_pc, None)
     {
         trap_return();
     }
-    if let Some((errno, _msg)) = check_signals_of_current() {
+    if let Some((errno, _msg)) = check_signals_of_task(&task, &process) {
+        drop(process);
+        drop(task);
         exit_current_group_and_run_next(errno);
     }
     trap_return();

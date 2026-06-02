@@ -275,9 +275,10 @@ mod wait;
 
 use crate::perf;
 use crate::task::{
-    RLimit, SeccompSockFilter, SignalFlags, TaskControlBlock, current_add_signal, current_task,
+    RLimit, SeccompSockFilter, SignalFlags, SignalInfo, TaskControlBlock, queue_signal_to_task,
 };
 use aio::*;
+use alloc::sync::Arc;
 use errno::{SysError, ret};
 use fs::*;
 use futex::*;
@@ -402,16 +403,29 @@ fn syscall_identity_fast_path(task: &TaskControlBlock, syscall_id: usize) -> Opt
     Some(value)
 }
 
-pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
+pub fn syscall_is_exit(syscall_id: usize) -> bool {
+    syscall_id == SYSCALL_EXIT
+}
+
+pub fn syscall_is_exit_group(syscall_id: usize) -> bool {
+    syscall_id == SYSCALL_EXIT_GROUP
+}
+
+pub fn syscall_with_current_task(
+    current: Arc<TaskControlBlock>,
+    syscall_id: usize,
+    args: [usize; 6],
+) -> isize {
     perf::record_syscall_dispatch_call();
     if syscall_id == SYSCALL_EXIT {
+        drop(current);
         sys_exit(args[0] as i32);
     }
-    let current = current_task().expect("syscall requires a running task");
     if let Some(signal) = seccomp_signal_for_syscall(&current, syscall_id) {
         // UNFINISHED: Filter mode supports only a small classic-BPF subset.
         // Unsupported or denied filter paths fail closed with SIGSYS.
-        current_add_signal(signal);
+        let signum = signal.bits().trailing_zeros() as i32;
+        queue_signal_to_task(Arc::clone(&current), signal, SignalInfo::user(signum, 0));
         return 0;
     }
     if syscall_id == SYSCALL_EXIT_GROUP {

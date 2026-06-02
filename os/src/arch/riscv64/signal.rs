@@ -5,11 +5,13 @@ use crate::syscall::user_ptr::{
 };
 use crate::syscall::{LinuxSigInfo, errno::SysError, errno::SysResult};
 use crate::task::{
-    SI_TKILL, SIGKILL, SIGNAL_INFO_SLOTS, SIGRT_1, SIGRTMIN, SIGSTOP, SS_DISABLE, SignalAction,
-    SignalFlags, SignalInfo, current_add_signal, current_process, current_task, current_trap_cx,
-    current_user_token, flags_to_linux_sigset, linux_sigset_to_flags,
+    ProcessControlBlock, SI_TKILL, SIGKILL, SIGNAL_INFO_SLOTS, SIGRT_1, SIGRTMIN, SIGSTOP,
+    SS_DISABLE, SignalAction, SignalFlags, SignalInfo, TaskControlBlock, current_add_signal,
+    current_process, current_task, current_trap_cx, current_user_token, flags_to_linux_sigset,
+    linux_sigset_to_flags, trap_cx_of_task,
 };
 use crate::trap::TrapContext;
+use alloc::sync::Arc;
 use core::mem::{offset_of, size_of};
 
 // Guard word checked by rt_sigreturn so a corrupted or mismatched userspace
@@ -42,19 +44,7 @@ struct LinuxStackT {
 }
 
 impl LinuxStackT {
-    fn disabled() -> Self {
-        Self {
-            sp: 0,
-            flags: 2,
-            pad: 0,
-            size: 0,
-        }
-    }
-
-    fn current(current_sp: usize) -> Self {
-        let Some(task) = current_task() else {
-            return Self::disabled();
-        };
+    fn for_task(task: &TaskControlBlock, current_sp: usize) -> Self {
         let stack = task.inner_exclusive_access().sigaltstack;
         Self {
             sp: stack.sp,
@@ -125,17 +115,6 @@ struct RiscvUContext {
 }
 
 impl RiscvUContext {
-    fn new(interrupted_pc: usize, saved_context: TrapContext, old_mask: SignalFlags) -> Self {
-        Self {
-            flags: 0,
-            link: 0,
-            stack: LinuxStackT::current(saved_context.x[2]),
-            sigmask: flags_to_linux_sigset(old_mask),
-            sigmask_padding: [0; LINUX_SIGSET_BYTES - size_of::<u64>()],
-            mcontext: RiscvMContext::new(interrupted_pc, saved_context),
-        }
-    }
-
     fn restored_signal_mask(self) -> SignalFlags {
         let mut mask = linux_sigset_to_flags(self.sigmask);
         mask.remove(SignalFlags::SIGKILL);
@@ -200,19 +179,17 @@ fn signal_mmap_fault(addr: usize, access: UserBufferAccess) -> bool {
     handle_mmap_page_fault(addr, access)
 }
 
-fn remove_pending_signal(signum: usize, signal: SignalFlags) {
-    let Some(task) = current_task() else {
-        return;
-    };
+fn remove_pending_signal_for_task(task: &TaskControlBlock, signum: usize, signal: SignalFlags) {
     let mut task_inner = task.inner_exclusive_access();
     if task_inner.pending_signals.contains(signal) {
         task_inner.clear_pending(signum as u32);
     }
 }
 
-fn take_pending_user_signal() -> Option<PendingUserSignal> {
-    let task = current_task()?;
-    let process = current_process();
+fn take_pending_user_signal_for_task(
+    task: &Arc<TaskControlBlock>,
+    process: &Arc<ProcessControlBlock>,
+) -> Option<PendingUserSignal> {
     let (signum, signal) = {
         let task_inner = task.inner_exclusive_access();
         let unmasked_bits = task_inner.pending_signals.bits() & !task_inner.signal_mask.bits();
@@ -244,7 +221,7 @@ fn take_pending_user_signal() -> Option<PendingUserSignal> {
         action
     };
     if action.is_ignore() {
-        remove_pending_signal(signum, signal);
+        remove_pending_signal_for_task(task, signum, signal);
         return None;
     }
     if !action.has_user_handler() {
@@ -279,25 +256,34 @@ fn take_pending_user_signal() -> Option<PendingUserSignal> {
 }
 
 pub fn deliver_pending_signal(
+    task: &Arc<TaskControlBlock>,
+    process: &Arc<ProcessControlBlock>,
     interrupted_pc: usize,
     syscall_pc_if_interrupted: Option<usize>,
 ) -> bool {
-    let Some(delivery) = take_pending_user_signal() else {
+    let Some(delivery) = take_pending_user_signal_for_task(task, process) else {
         return false;
     };
-    let saved_context = *current_trap_cx();
+    let saved_context = *trap_cx_of_task(task);
     let interrupted_pc =
         interrupted_pc_for_delivery(interrupted_pc, syscall_pc_if_interrupted, &delivery);
     let user_sp = signal_frame_stack_top(delivery.action, saved_context.x[2]);
     let frame_sp = (user_sp - size_of::<RiscvSignalFrame>()) & !(SIGNAL_STACK_ALIGN - 1);
     let frame = RiscvSignalFrame {
         siginfo: LinuxSigInfo::from(delivery.info),
-        ucontext: RiscvUContext::new(interrupted_pc, saved_context, delivery.old_mask),
+        ucontext: RiscvUContext {
+            flags: 0,
+            link: 0,
+            stack: LinuxStackT::for_task(task, saved_context.x[2]),
+            sigmask: flags_to_linux_sigset(delivery.old_mask),
+            sigmask_padding: [0; LINUX_SIGSET_BYTES - size_of::<u64>()],
+            mcontext: RiscvMContext::new(interrupted_pc, saved_context),
+        },
         magic: SIGNAL_FRAME_MAGIC,
         saved_context,
         trampoline: RT_SIGRETURN_TRAMPOLINE,
     };
-    let token = current_user_token();
+    let token = task.get_user_token();
     if write_user_value_with_fault(
         token,
         frame_sp as *mut RiscvSignalFrame,
@@ -327,7 +313,7 @@ pub fn deliver_pending_signal(
         return false;
     }
 
-    let trap_cx = current_trap_cx();
+    let trap_cx = trap_cx_of_task(task);
     trap_cx.x = saved_context.x;
     trap_cx.sepc = delivery.action.handler;
     trap_cx.set_sp(frame_sp);

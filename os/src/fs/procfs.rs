@@ -1714,6 +1714,12 @@ fn pid_pagemap_read(pid: usize, buf: &mut [u8], offset: usize) -> usize {
     buf.len()
 }
 
+#[cfg(not(feature = "perf-counters"))]
+fn oskernel_perf_content() -> String {
+    perf::stats_content()
+}
+
+#[cfg(feature = "perf-counters")]
 fn oskernel_perf_content() -> String {
     let (frame_total, frame_free) = frame_stats();
     let block = block_cache::stats_snapshot();

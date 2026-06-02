@@ -12,6 +12,7 @@ use lazy_static::*;
 use log::info;
 use virtio_drivers::device::blk::{BlkReq, BlkResp, VirtIOBlk};
 
+#[cfg(feature = "perf-counters")]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct BlockIoStats {
     pub(crate) nonblocking_requested: usize,
@@ -48,6 +49,7 @@ static BLOCK_IO_FALLBACK_NO_READY_READS: AtomicUsize = AtomicUsize::new(0);
 static BLOCK_IO_FALLBACK_NO_READY_WRITES: AtomicUsize = AtomicUsize::new(0);
 static BLOCK_IO_SYNC_READ_SUBMITS: AtomicUsize = AtomicUsize::new(0);
 static BLOCK_IO_SYNC_WRITE_SUBMITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(target_arch = "riscv64", feature = "perf-counters"))]
 static BLOCK_IO_IRQ_ACKS: AtomicUsize = AtomicUsize::new(0);
 static BLOCK_IO_COMPLETION_SIGNALS: AtomicUsize = AtomicUsize::new(0);
 static BLOCK_IO_COMPLETION_WAKEUPS: AtomicUsize = AtomicUsize::new(0);
@@ -316,6 +318,7 @@ pub fn block_device(index: usize) -> Option<Arc<BlockDeviceImpl>> {
     BLOCK_DEVICES.get(index).cloned()
 }
 
+#[cfg(feature = "perf-counters")]
 pub(crate) fn block_io_stats_snapshot() -> BlockIoStats {
     BlockIoStats {
         nonblocking_requested: block_io_nonblocking_requested() as usize,

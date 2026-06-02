@@ -54,13 +54,13 @@ pub use manager::{add_task, pid2process, remove_from_pid2process, wakeup_task};
 pub(crate) use manager::{wakeup_front_task, wakeup_timer_task};
 pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx,
-    current_trap_return_context_after_accounting, current_user_token, run_tasks, schedule,
-    take_current_task,
+    current_trap_return_context_after_accounting, current_user_token, process_of_task, run_tasks,
+    schedule, take_current_task, trap_cx_of_task,
 };
 pub(crate) use ptrace::{
     ptrace_attach_process, ptrace_kill_process, ptrace_note_exec_current, ptrace_resume_process,
-    ptrace_stop_current_if_needed, ptrace_syscall_enter_stop_current,
-    ptrace_syscall_exit_stop_current, ptrace_take_wait_status, ptrace_traceme_current,
+    ptrace_stop_task_if_needed, ptrace_syscall_enter_stop_for_task,
+    ptrace_syscall_exit_stop_for_task, ptrace_take_wait_status, ptrace_traceme_current,
     ptrace_validate_tracee,
 };
 pub use signal::{
@@ -90,11 +90,13 @@ fn with_current_task_and_process(
     }
 }
 
-pub fn account_current_user_time_until(now_us: usize) {
-    with_current_task_and_process(
-        |task| task.account_user_time_until(now_us),
-        |process| process.account_user_time_until(now_us),
-    );
+pub fn account_task_user_time_until(
+    task: &TaskControlBlock,
+    process: &ProcessControlBlock,
+    now_us: usize,
+) {
+    task.account_user_time_until(now_us);
+    process.account_user_time_until(now_us);
 }
 
 pub fn account_current_system_time_until(now_us: usize) {
@@ -775,9 +777,10 @@ pub fn add_initproc() {
     let _initproc = INITPROC.clone();
 }
 
-pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
-    let task = current_task()?;
-    let process = task.process.upgrade()?;
+pub fn check_signals_of_task(
+    task: &Arc<TaskControlBlock>,
+    process: &Arc<ProcessControlBlock>,
+) -> Option<(i32, &'static str)> {
     let pending = {
         let task_inner = task.inner_exclusive_access();
         // CONTEXT: bitflags `!` truncates to named flags unless the flag type
@@ -808,7 +811,7 @@ pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
     if action.is_ignore()
         || (default_signal_action(signum) == Some(DefaultSignalAction::Ignore)
             && !action.has_user_handler())
-        || (Arc::ptr_eq(&process, &INITPROC) && !action.has_user_handler())
+        || (Arc::ptr_eq(process, &INITPROC) && !action.has_user_handler())
     {
         let mut task_inner = task.inner_exclusive_access();
         task_inner.clear_pending(signum as u32);
@@ -822,6 +825,12 @@ pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
         default_signal_exit_code(signum, core_limit).unwrap_or(exit_code),
         message,
     ))
+}
+
+pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
+    let task = current_task()?;
+    let process = task.process.upgrade()?;
+    check_signals_of_task(&task, &process)
 }
 
 fn task_has_deliverable_signal_matching(
