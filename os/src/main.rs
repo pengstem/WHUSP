@@ -23,6 +23,7 @@ mod perf;
 mod sync;
 mod syscall;
 mod task;
+mod vdso;
 
 pub(crate) use arch::{board, sbi, timer, trap};
 

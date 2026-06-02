@@ -81,6 +81,27 @@ impl MemorySet {
             None,
         );
     }
+    #[cfg(target_arch = "riscv64")]
+    pub(crate) fn map_vdso_image(&mut self, start_va: usize, image: &[u8]) -> bool {
+        let Some(end_va) = start_va.checked_add(image.len()) else {
+            return false;
+        };
+        if image.is_empty()
+            || image.len() % crate::config::PAGE_SIZE != 0
+            || self.range_overlaps(start_va, end_va)
+        {
+            return false;
+        }
+        self.push(
+            MapArea::new(
+                start_va.into(),
+                end_va.into(),
+                MapType::Framed,
+                MapPermission::R | MapPermission::X | MapPermission::U,
+            ),
+            Some(image),
+        )
+    }
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some(idx) = self.find_area_idx_by_start(start_vpn) {
             let area = &mut self.areas[idx];

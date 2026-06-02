@@ -30,6 +30,7 @@ const AT_HWCAP: usize = 16;
 const AT_CLKTCK: usize = 17;
 const AT_SECURE: usize = 23;
 const AT_RANDOM: usize = 25;
+const AT_SYSINFO_EHDR: usize = 33;
 
 #[cfg(target_arch = "riscv64")]
 const fn riscv_hwcap(letter: u8) -> usize {
@@ -56,6 +57,7 @@ pub(super) struct ExecStackInfo {
     pub(super) euid: u32,
     pub(super) gid: u32,
     pub(super) egid: u32,
+    pub(super) sysinfo_ehdr: usize,
 }
 
 fn align_down(value: usize, align: usize) -> usize {
@@ -71,7 +73,7 @@ struct ExecStackLayout {
     random_addr: usize,
     arg_ptrs: Vec<usize>,
     env_ptrs: Vec<usize>,
-    auxv: [(usize, usize); 15],
+    auxv: Vec<(usize, usize)>,
 }
 
 fn stack_low(stack_top: usize) -> SysResult<usize> {
@@ -144,23 +146,25 @@ fn plan_user_stack(
     string_sp = checked_stack_sub(string_sp, 16, stack_low)?;
     let random_addr = string_sp;
 
-    let auxv = [
-        (AT_PHDR, stack_info.phdr),
-        (AT_PHENT, stack_info.phent),
-        (AT_PHNUM, stack_info.phnum),
-        (AT_PAGESZ, PAGE_SIZE),
-        (AT_ENTRY, stack_info.at_entry),
-        (AT_BASE, stack_info.interp_base),
-        (AT_FLAGS, 0),
-        (AT_UID, stack_info.uid as usize),
-        (AT_EUID, stack_info.euid as usize),
-        (AT_GID, stack_info.gid as usize),
-        (AT_EGID, stack_info.egid as usize),
-        (AT_HWCAP, ELF_HWCAP),
-        (AT_CLKTCK, 100),
-        (AT_SECURE, 0),
-        (AT_RANDOM, random_addr),
-    ];
+    let mut auxv = Vec::with_capacity(16);
+    auxv.push((AT_PHDR, stack_info.phdr));
+    auxv.push((AT_PHENT, stack_info.phent));
+    auxv.push((AT_PHNUM, stack_info.phnum));
+    auxv.push((AT_PAGESZ, PAGE_SIZE));
+    auxv.push((AT_ENTRY, stack_info.at_entry));
+    auxv.push((AT_BASE, stack_info.interp_base));
+    auxv.push((AT_FLAGS, 0));
+    auxv.push((AT_UID, stack_info.uid as usize));
+    auxv.push((AT_EUID, stack_info.euid as usize));
+    auxv.push((AT_GID, stack_info.gid as usize));
+    auxv.push((AT_EGID, stack_info.egid as usize));
+    auxv.push((AT_HWCAP, ELF_HWCAP));
+    auxv.push((AT_CLKTCK, 100));
+    auxv.push((AT_SECURE, 0));
+    auxv.push((AT_RANDOM, random_addr));
+    if stack_info.sysinfo_ehdr != 0 {
+        auxv.push((AT_SYSINFO_EHDR, stack_info.sysinfo_ehdr));
+    }
 
     let word = core::mem::size_of::<usize>();
     let table_size = checked_table_size(arg_ptrs.len(), env_ptrs.len(), auxv.len())?;
@@ -348,6 +352,7 @@ impl ProcessControlBlock {
             phent,
             phnum,
             interp_base,
+            sysinfo_ehdr,
         } = MemorySet::from_elf_lazy(elf, executable_file, executable_file_size, interpreter)
             .ok_or(SysError::ENOEXEC)?;
         let stack_info = ExecStackInfo {
@@ -360,6 +365,7 @@ impl ProcessControlBlock {
             euid: self.credentials().euid,
             gid: self.credentials().rgid,
             egid: self.credentials().egid,
+            sysinfo_ehdr,
         };
         let expected_user_stack_top = ustack_base
             .checked_add(USER_STACK_SIZE)

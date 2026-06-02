@@ -19,6 +19,7 @@ pub struct ElfLoadInfo {
     pub phent: usize,
     pub phnum: usize,
     pub interp_base: usize,
+    pub sysinfo_ehdr: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -342,6 +343,7 @@ impl MemorySet {
         );
         let user_stack_base = brk_limit + PAGE_SIZE;
         memory_set.mmap_next = initial_mmap_next(user_stack_base);
+        let sysinfo_ehdr = crate::vdso::map_into(&mut memory_set).unwrap_or(0);
         ElfLoadInfo {
             memory_set,
             ustack_base: user_stack_base,
@@ -351,6 +353,7 @@ impl MemorySet {
             phent: ph_entry_size as usize,
             phnum: ph_count as usize,
             interp_base,
+            sysinfo_ehdr,
         }
     }
 
@@ -408,6 +411,7 @@ impl MemorySet {
         );
         let user_stack_base = brk_limit + PAGE_SIZE;
         memory_set.mmap_next = initial_mmap_next(user_stack_base);
+        let sysinfo_ehdr = crate::vdso::map_into(&mut memory_set).unwrap_or(0);
         Some(ElfLoadInfo {
             memory_set,
             ustack_base: user_stack_base,
@@ -417,6 +421,7 @@ impl MemorySet {
             phent: ph_entry_size as usize,
             phnum: ph_count as usize,
             interp_base,
+            sysinfo_ehdr,
         })
     }
 }

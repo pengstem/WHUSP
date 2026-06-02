@@ -82,6 +82,7 @@ impl ProcessControlBlock {
             phent,
             phnum,
             interp_base,
+            sysinfo_ehdr,
         } = {
             let elf = xmas_elf::ElfFile::new(elf_data).expect("init ELF image must be valid");
             MemorySet::from_elf(&elf, None)
@@ -178,6 +179,7 @@ impl ProcessControlBlock {
             euid: 0,
             gid: 0,
             egid: 0,
+            sysinfo_ehdr,
         };
         let (stack_top, _, _) = init_user_stack(process_token, user_sp, &args, &envs, &stack_info)
             .expect("init process stack arguments must fit");
