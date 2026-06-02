@@ -6,8 +6,9 @@ use super::{
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::{File, VfsNodeId, track_regular_file_executable, untrack_regular_file_executable};
 use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet};
+use crate::perf;
 use crate::syscall::errno::{SysError, SysResult};
-use crate::syscall::user_ptr::{copy_to_user, write_user_value};
+use crate::syscall::user_ptr::copy_to_user;
 use crate::trap::{TrapContext, trap_handler};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -62,6 +63,7 @@ fn align_down(value: usize, align: usize) -> usize {
 }
 
 struct ExecStackLayout {
+    stack_top: usize,
     user_sp: usize,
     argv_base: usize,
     envp_base: usize,
@@ -170,6 +172,7 @@ fn plan_user_stack(
     let auxv_base = envp_base + (env_ptrs.len() + 1) * word;
 
     Ok(ExecStackLayout {
+        stack_top,
         user_sp,
         argv_base,
         envp_base,
@@ -181,21 +184,48 @@ fn plan_user_stack(
     })
 }
 
-fn write_user_byte(token: usize, addr: usize, value: u8) -> SysResult<()> {
-    copy_to_user(token, addr as *mut u8, &[value])
+fn stack_offset(layout: &ExecStackLayout, addr: usize, len: usize) -> SysResult<usize> {
+    let offset = addr.checked_sub(layout.user_sp).ok_or(SysError::EFAULT)?;
+    let end = offset.checked_add(len).ok_or(SysError::EFAULT)?;
+    let stack_len = layout
+        .stack_top
+        .checked_sub(layout.user_sp)
+        .ok_or(SysError::EFAULT)?;
+    if end > stack_len {
+        return Err(SysError::EFAULT);
+    }
+    Ok(offset)
 }
 
-fn write_user_usize(token: usize, addr: usize, value: usize) -> SysResult<()> {
-    write_user_value(token, addr as *mut usize, &value)
+fn write_stack_bytes(
+    buffer: &mut [u8],
+    layout: &ExecStackLayout,
+    addr: usize,
+    bytes: &[u8],
+) -> SysResult<()> {
+    let offset = stack_offset(layout, addr, bytes.len())?;
+    buffer[offset..offset + bytes.len()].copy_from_slice(bytes);
+    Ok(())
 }
 
-fn write_user_bytes(token: usize, addr: usize, bytes: &[u8]) -> SysResult<()> {
-    copy_to_user(token, addr as *mut u8, bytes)
+fn write_stack_usize(
+    buffer: &mut [u8],
+    layout: &ExecStackLayout,
+    addr: usize,
+    value: usize,
+) -> SysResult<()> {
+    write_stack_bytes(buffer, layout, addr, &value.to_ne_bytes())
 }
 
-fn write_user_string(token: usize, addr: usize, string: &str) -> SysResult<()> {
-    write_user_bytes(token, addr, string.as_bytes())?;
-    write_user_byte(token, addr + string.len(), 0)
+fn write_stack_string(
+    buffer: &mut [u8],
+    layout: &ExecStackLayout,
+    addr: usize,
+    string: &str,
+) -> SysResult<()> {
+    write_stack_bytes(buffer, layout, addr, string.as_bytes())?;
+    let nul_addr = addr.checked_add(string.len()).ok_or(SysError::EFAULT)?;
+    write_stack_bytes(buffer, layout, nul_addr, &[0])
 }
 
 fn write_user_stack(
@@ -204,36 +234,70 @@ fn write_user_stack(
     args: &[String],
     envs: &[String],
 ) -> SysResult<()> {
+    let stack_len = layout
+        .stack_top
+        .checked_sub(layout.user_sp)
+        .ok_or(SysError::EFAULT)?;
+    let mut stack = Vec::new();
+    stack.resize(stack_len, 0);
+
     for (addr, string) in layout.env_ptrs.iter().zip(envs.iter()) {
-        write_user_string(token, *addr, string.as_str())?;
+        write_stack_string(stack.as_mut_slice(), layout, *addr, string.as_str())?;
     }
     for (addr, string) in layout.arg_ptrs.iter().zip(args.iter()) {
-        write_user_string(token, *addr, string.as_str())?;
+        write_stack_string(stack.as_mut_slice(), layout, *addr, string.as_str())?;
     }
 
-    write_user_bytes(token, layout.random_addr, &[0u8; 16])?;
+    write_stack_bytes(stack.as_mut_slice(), layout, layout.random_addr, &[0u8; 16])?;
 
     let word = core::mem::size_of::<usize>();
-    write_user_usize(token, layout.user_sp, layout.arg_ptrs.len())?;
+    write_stack_usize(
+        stack.as_mut_slice(),
+        layout,
+        layout.user_sp,
+        layout.arg_ptrs.len(),
+    )?;
     for (i, ptr) in layout.arg_ptrs.iter().enumerate() {
-        write_user_usize(token, layout.argv_base + i * word, *ptr)?;
+        write_stack_usize(
+            stack.as_mut_slice(),
+            layout,
+            layout.argv_base + i * word,
+            *ptr,
+        )?;
     }
-    write_user_usize(token, layout.argv_base + layout.arg_ptrs.len() * word, 0)?;
+    write_stack_usize(
+        stack.as_mut_slice(),
+        layout,
+        layout.argv_base + layout.arg_ptrs.len() * word,
+        0,
+    )?;
 
     for (i, ptr) in layout.env_ptrs.iter().enumerate() {
-        write_user_usize(token, layout.envp_base + i * word, *ptr)?;
+        write_stack_usize(
+            stack.as_mut_slice(),
+            layout,
+            layout.envp_base + i * word,
+            *ptr,
+        )?;
     }
-    write_user_usize(token, layout.envp_base + layout.env_ptrs.len() * word, 0)?;
+    write_stack_usize(
+        stack.as_mut_slice(),
+        layout,
+        layout.envp_base + layout.env_ptrs.len() * word,
+        0,
+    )?;
 
     for (i, (key, value)) in layout.auxv.iter().enumerate() {
         let entry = layout.auxv_base + i * 2 * word;
-        write_user_usize(token, entry, *key)?;
-        write_user_usize(token, entry + word, *value)?;
+        write_stack_usize(stack.as_mut_slice(), layout, entry, *key)?;
+        write_stack_usize(stack.as_mut_slice(), layout, entry + word, *value)?;
     }
     let null_entry = layout.auxv_base + layout.auxv.len() * 2 * word;
-    write_user_usize(token, null_entry, AT_NULL)?;
-    write_user_usize(token, null_entry + word, 0)?;
+    write_stack_usize(stack.as_mut_slice(), layout, null_entry, AT_NULL)?;
+    write_stack_usize(stack.as_mut_slice(), layout, null_entry + word, 0)?;
 
+    copy_to_user(token, layout.user_sp as *mut u8, stack.as_slice())?;
+    perf::record_exec_stack_copy(stack.len());
     Ok(())
 }
 

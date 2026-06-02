@@ -22,6 +22,8 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) tid_lookup_hits: usize,
     pub(crate) tid_lookup_index_hits: usize,
     pub(crate) tid_lookup_stale_index_entries: usize,
+    pub(crate) exec_stack_copy_calls: usize,
+    pub(crate) exec_stack_copy_bytes: usize,
     pub(crate) fd_alloc_calls: usize,
     pub(crate) fd_alloc_failures: usize,
     pub(crate) fd_alloc_probe_slots: usize,
@@ -207,6 +209,8 @@ mod enabled {
     static TID_LOOKUP_HITS: AtomicUsize = AtomicUsize::new(0);
     static TID_LOOKUP_INDEX_HITS: AtomicUsize = AtomicUsize::new(0);
     static TID_LOOKUP_STALE_INDEX_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+    static EXEC_STACK_COPY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXEC_STACK_COPY_BYTES: AtomicUsize = AtomicUsize::new(0);
 
     static FD_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FD_ALLOC_FAILURES: AtomicUsize = AtomicUsize::new(0);
@@ -687,6 +691,11 @@ mod enabled {
         }
     }
 
+    pub(crate) fn record_exec_stack_copy(bytes: usize) {
+        EXEC_STACK_COPY_CALLS.fetch_add(1, Ordering::Relaxed);
+        EXEC_STACK_COPY_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_pipe_read_call() {
         PIPE_READ_CALLS.fetch_add(1, Ordering::Relaxed);
     }
@@ -924,6 +933,8 @@ mod enabled {
             tid_lookup_hits: TID_LOOKUP_HITS.load(Ordering::Relaxed),
             tid_lookup_index_hits: TID_LOOKUP_INDEX_HITS.load(Ordering::Relaxed),
             tid_lookup_stale_index_entries: TID_LOOKUP_STALE_INDEX_ENTRIES.load(Ordering::Relaxed),
+            exec_stack_copy_calls: EXEC_STACK_COPY_CALLS.load(Ordering::Relaxed),
+            exec_stack_copy_bytes: EXEC_STACK_COPY_BYTES.load(Ordering::Relaxed),
             fd_alloc_calls: FD_ALLOC_CALLS.load(Ordering::Relaxed),
             fd_alloc_failures: FD_ALLOC_FAILURES.load(Ordering::Relaxed),
             fd_alloc_probe_slots: FD_ALLOC_PROBE_SLOTS.load(Ordering::Relaxed),
@@ -1123,6 +1134,8 @@ mod enabled {
          tid_lookup_hits {}\n\
          tid_lookup_index_hits {}\n\
          tid_lookup_stale_index_entries {}\n\
+         exec_stack_copy_calls {}\n\
+         exec_stack_copy_bytes {}\n\
          fd_alloc_calls {}\n\
          fd_alloc_failures {}\n\
          fd_alloc_probe_slots {}\n\
@@ -1299,6 +1312,8 @@ mod enabled {
             stats.tid_lookup_hits,
             stats.tid_lookup_index_hits,
             stats.tid_lookup_stale_index_entries,
+            stats.exec_stack_copy_calls,
+            stats.exec_stack_copy_bytes,
             stats.fd_alloc_calls,
             stats.fd_alloc_failures,
             stats.fd_alloc_probe_slots,
@@ -1527,6 +1542,9 @@ mod disabled {
         _stale_index_entry: bool,
     ) {
     }
+
+    #[inline(always)]
+    pub(crate) fn record_exec_stack_copy(_bytes: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_fd_alloc(
