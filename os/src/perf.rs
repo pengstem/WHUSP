@@ -51,6 +51,11 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) vfs_read_all_backend_reads: usize,
     pub(crate) vfs_read_all_bytes: usize,
     pub(crate) vfs_read_all_max_chunk: usize,
+    pub(crate) vfs_read_backend_calls: usize,
+    pub(crate) vfs_read_backend_bytes: usize,
+    pub(crate) vfs_read_backend_max_chunk: usize,
+    pub(crate) vfs_read_coalesced_calls: usize,
+    pub(crate) vfs_read_coalesced_bytes: usize,
     pub(crate) vfs_write_user_buffer_calls: usize,
     pub(crate) vfs_write_user_buffer_slices: usize,
     pub(crate) vfs_write_backend_calls: usize,
@@ -222,6 +227,11 @@ mod enabled {
     static VFS_READ_ALL_BACKEND_READS: AtomicUsize = AtomicUsize::new(0);
     static VFS_READ_ALL_BYTES: AtomicUsize = AtomicUsize::new(0);
     static VFS_READ_ALL_MAX_CHUNK: AtomicUsize = AtomicUsize::new(0);
+    static VFS_READ_BACKEND_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static VFS_READ_BACKEND_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static VFS_READ_BACKEND_MAX_CHUNK: AtomicUsize = AtomicUsize::new(0);
+    static VFS_READ_COALESCED_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static VFS_READ_COALESCED_BYTES: AtomicUsize = AtomicUsize::new(0);
     static VFS_WRITE_USER_BUFFER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static VFS_WRITE_USER_BUFFER_SLICES: AtomicUsize = AtomicUsize::new(0);
     static VFS_WRITE_BACKEND_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -488,6 +498,17 @@ mod enabled {
         VFS_READ_ALL_BACKEND_READS.fetch_add(1, Ordering::Relaxed);
         VFS_READ_ALL_BYTES.fetch_add(bytes, Ordering::Relaxed);
         update_max(&VFS_READ_ALL_MAX_CHUNK, bytes);
+    }
+
+    pub(crate) fn record_vfs_read_backend(bytes: usize) {
+        VFS_READ_BACKEND_CALLS.fetch_add(1, Ordering::Relaxed);
+        VFS_READ_BACKEND_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        update_max(&VFS_READ_BACKEND_MAX_CHUNK, bytes);
+    }
+
+    pub(crate) fn record_vfs_read_coalesced(bytes: usize) {
+        VFS_READ_COALESCED_CALLS.fetch_add(1, Ordering::Relaxed);
+        VFS_READ_COALESCED_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub(crate) fn record_vfs_write_user_buffer(slices: usize) {
@@ -871,6 +892,11 @@ mod enabled {
             vfs_read_all_backend_reads: VFS_READ_ALL_BACKEND_READS.load(Ordering::Relaxed),
             vfs_read_all_bytes: VFS_READ_ALL_BYTES.load(Ordering::Relaxed),
             vfs_read_all_max_chunk: VFS_READ_ALL_MAX_CHUNK.load(Ordering::Relaxed),
+            vfs_read_backend_calls: VFS_READ_BACKEND_CALLS.load(Ordering::Relaxed),
+            vfs_read_backend_bytes: VFS_READ_BACKEND_BYTES.load(Ordering::Relaxed),
+            vfs_read_backend_max_chunk: VFS_READ_BACKEND_MAX_CHUNK.load(Ordering::Relaxed),
+            vfs_read_coalesced_calls: VFS_READ_COALESCED_CALLS.load(Ordering::Relaxed),
+            vfs_read_coalesced_bytes: VFS_READ_COALESCED_BYTES.load(Ordering::Relaxed),
             vfs_write_user_buffer_calls: VFS_WRITE_USER_BUFFER_CALLS.load(Ordering::Relaxed),
             vfs_write_user_buffer_slices: VFS_WRITE_USER_BUFFER_SLICES.load(Ordering::Relaxed),
             vfs_write_backend_calls: VFS_WRITE_BACKEND_CALLS.load(Ordering::Relaxed),
@@ -1050,6 +1076,11 @@ mod enabled {
          vfs_read_all_backend_reads {}\n\
          vfs_read_all_bytes {}\n\
          vfs_read_all_max_chunk {}\n\
+         vfs_read_backend_calls {}\n\
+         vfs_read_backend_bytes {}\n\
+         vfs_read_backend_max_chunk {}\n\
+         vfs_read_coalesced_calls {}\n\
+         vfs_read_coalesced_bytes {}\n\
          vfs_write_user_buffer_calls {}\n\
          vfs_write_user_buffer_slices {}\n\
          vfs_write_backend_calls {}\n\
@@ -1208,6 +1239,11 @@ mod enabled {
             stats.vfs_read_all_backend_reads,
             stats.vfs_read_all_bytes,
             stats.vfs_read_all_max_chunk,
+            stats.vfs_read_backend_calls,
+            stats.vfs_read_backend_bytes,
+            stats.vfs_read_backend_max_chunk,
+            stats.vfs_read_coalesced_calls,
+            stats.vfs_read_coalesced_bytes,
             stats.vfs_write_user_buffer_calls,
             stats.vfs_write_user_buffer_slices,
             stats.vfs_write_backend_calls,
@@ -1441,6 +1477,12 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_vfs_read_all_backend_read(_bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_vfs_read_backend(_bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_vfs_read_coalesced(_bytes: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_vfs_write_user_buffer(_slices: usize) {}

@@ -35,6 +35,7 @@ use lazy_static::lazy_static;
 // Bound each backend write while a shared file offset lock is held; large user
 // buffers still progress in order without monopolizing one mount backend.
 const VFS_WRITE_CHUNK_SIZE: usize = 64 * 1024;
+const VFS_READ_CHUNK_SIZE: usize = 64 * 1024;
 const VFS_READ_ALL_CHUNK_SIZE: usize = 64 * 1024;
 const VFS_READ_CACHE_MAX_FILE_SIZE: usize = 1024 * 1024;
 const VFS_READ_CACHE_READAHEAD_PAGES: usize = 8;
@@ -374,6 +375,66 @@ impl VfsFile {
         total_write_size
     }
 
+    fn read_backend_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let read_size = with_mount(self.node.mount_id, |mount| {
+            mount.read_at(self.node.ino, buf, offset as u64)
+        })
+        .expect("filesystem mount is missing");
+        perf::record_vfs_read_backend(read_size);
+        read_size
+    }
+
+    fn read_coalesced_user_buffer(
+        &self,
+        offset: &mut usize,
+        buf: &mut UserBuffer,
+    ) -> Option<usize> {
+        if self.kind != FsNodeKind::RegularFile
+            || buf.buffers.len() <= 1
+            || buf.len() <= VFS_READ_CACHE_MAX_FILE_SIZE
+        {
+            return None;
+        }
+        let stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))?.ok()?;
+        let file_size = stat.size as usize;
+        if self.read_cache_id_for_size(file_size).is_some() {
+            return None;
+        }
+
+        let mut bounce = vec![0u8; VFS_READ_CHUNK_SIZE];
+        let mut buffer_index = 0usize;
+        let mut buffer_offset = 0usize;
+        let mut total_read_size = 0usize;
+        loop {
+            let read_limit = user_buffer_chunk_len(
+                buf.buffers.as_slice(),
+                buffer_index,
+                buffer_offset,
+                VFS_READ_CHUNK_SIZE,
+            );
+            if read_limit == 0 {
+                break;
+            }
+            let read_size = self.read_backend_at(*offset, &mut bounce[..read_limit]);
+            if read_size == 0 {
+                break;
+            }
+            perf::record_vfs_read_coalesced(read_size);
+            let copied = copy_into_user_buffer(
+                buf.buffers.as_mut_slice(),
+                &mut buffer_index,
+                &mut buffer_offset,
+                &bounce[..read_size],
+            );
+            *offset = offset.checked_add(copied).unwrap_or(usize::MAX);
+            total_read_size = total_read_size.saturating_add(copied);
+            if copied < read_size || read_size < read_limit {
+                break;
+            }
+        }
+        Some(total_read_size)
+    }
+
     fn noatime_snapshot(&self) -> Option<(FileTimestamp, FileTimestamp)> {
         if !self.status_flags.get().contains(OpenFlags::NOATIME)
             && !mount_is_noatime(self.node.mount_id)
@@ -643,6 +704,52 @@ impl VfsFile {
 
         Some(total_read_size)
     }
+}
+
+fn user_buffer_chunk_len(
+    buffers: &[&'static mut [u8]],
+    mut buffer_index: usize,
+    mut buffer_offset: usize,
+    limit: usize,
+) -> usize {
+    let mut len = 0usize;
+    while buffer_index < buffers.len() && len < limit {
+        let buffer_len = buffers[buffer_index].len();
+        if buffer_offset >= buffer_len {
+            buffer_index += 1;
+            buffer_offset = 0;
+            continue;
+        }
+        let take = (limit - len).min(buffer_len - buffer_offset);
+        len += take;
+        buffer_index += 1;
+        buffer_offset = 0;
+    }
+    len
+}
+
+fn copy_into_user_buffer(
+    buffers: &mut [&'static mut [u8]],
+    buffer_index: &mut usize,
+    buffer_offset: &mut usize,
+    src: &[u8],
+) -> usize {
+    let mut copied = 0usize;
+    while copied < src.len() {
+        while *buffer_index < buffers.len() && *buffer_offset >= buffers[*buffer_index].len() {
+            *buffer_index += 1;
+            *buffer_offset = 0;
+        }
+        if *buffer_index >= buffers.len() {
+            break;
+        }
+        let dst = &mut buffers[*buffer_index][*buffer_offset..];
+        let take = dst.len().min(src.len() - copied);
+        dst[..take].copy_from_slice(&src[copied..copied + take]);
+        copied += take;
+        *buffer_offset += take;
+    }
+    copied
 }
 
 fn parent_hint_for_open(context: &PathContext, name: &str) -> Option<VfsNodeId> {
@@ -1113,20 +1220,19 @@ impl File for VfsFile {
         let noatime_snapshot = self.noatime_snapshot();
         let mut offset = self.offset.lock();
         let mut total_read_size = 0usize;
-        for slice in buf.buffers.iter_mut() {
-            let read_size = self
-                .read_regular_cached_at(*offset, slice)
-                .unwrap_or_else(|| {
-                    with_mount(self.node.mount_id, |mount| {
-                        mount.read_at(self.node.ino, slice, *offset as u64)
-                    })
-                    .expect("filesystem mount is missing")
-                });
-            if read_size == 0 {
-                break;
+        if let Some(read_size) = self.read_coalesced_user_buffer(&mut offset, &mut buf) {
+            total_read_size = read_size;
+        } else {
+            for slice in buf.buffers.iter_mut() {
+                let read_size = self
+                    .read_regular_cached_at(*offset, slice)
+                    .unwrap_or_else(|| self.read_backend_at(*offset, slice));
+                if read_size == 0 {
+                    break;
+                }
+                *offset += read_size;
+                total_read_size += read_size;
             }
-            *offset += read_size;
-            total_read_size += read_size;
         }
         drop(offset);
         if requested_len > 0 {
