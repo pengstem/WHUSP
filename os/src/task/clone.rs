@@ -105,6 +105,7 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     let parent_sched_deadline_deadline = parent_inner.sched_deadline_deadline;
     let parent_sched_deadline_period = parent_inner.sched_deadline_period;
     let parent_nice = parent_inner.nice;
+    let parent_sched_vruntime = parent_inner.sched_vruntime;
     let parent_timer_slack_ns = parent_inner.timer_slack_ns;
     let parent_seccomp_mode = parent_inner.seccomp_mode;
     let parent_seccomp_filter = parent_inner.seccomp_filter.clone();
@@ -138,6 +139,7 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     new_task_inner.sched_deadline_deadline = parent_sched_deadline_deadline;
     new_task_inner.sched_deadline_period = parent_sched_deadline_period;
     new_task_inner.nice = parent_nice;
+    new_task_inner.sched_vruntime = parent_sched_vruntime;
     new_task_inner.timer_slack_ns = parent_timer_slack_ns;
     new_task_inner.default_timer_slack_ns = parent_timer_slack_ns;
     new_task_inner.seccomp_mode = parent_seccomp_mode;

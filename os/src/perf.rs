@@ -26,6 +26,8 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) exec_stack_copy_bytes: usize,
     pub(crate) wait_child_scan_passes: usize,
     pub(crate) wait_child_scan_slots: usize,
+    pub(crate) scheduler_normal_requeue_calls: usize,
+    pub(crate) scheduler_normal_vruntime_delta: usize,
     pub(crate) fd_alloc_calls: usize,
     pub(crate) fd_alloc_failures: usize,
     pub(crate) fd_alloc_probe_slots: usize,
@@ -215,6 +217,8 @@ mod enabled {
     static EXEC_STACK_COPY_BYTES: AtomicUsize = AtomicUsize::new(0);
     static WAIT_CHILD_SCAN_PASSES: AtomicUsize = AtomicUsize::new(0);
     static WAIT_CHILD_SCAN_SLOTS: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_NORMAL_REQUEUE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_NORMAL_VRUNTIME_DELTA: AtomicUsize = AtomicUsize::new(0);
 
     static FD_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FD_ALLOC_FAILURES: AtomicUsize = AtomicUsize::new(0);
@@ -705,6 +709,11 @@ mod enabled {
         WAIT_CHILD_SCAN_SLOTS.fetch_add(child_slots, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_scheduler_normal_requeue(vruntime_delta: usize) {
+        SCHEDULER_NORMAL_REQUEUE_CALLS.fetch_add(1, Ordering::Relaxed);
+        SCHEDULER_NORMAL_VRUNTIME_DELTA.fetch_add(vruntime_delta, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_pipe_read_call() {
         PIPE_READ_CALLS.fetch_add(1, Ordering::Relaxed);
     }
@@ -946,6 +955,9 @@ mod enabled {
             exec_stack_copy_bytes: EXEC_STACK_COPY_BYTES.load(Ordering::Relaxed),
             wait_child_scan_passes: WAIT_CHILD_SCAN_PASSES.load(Ordering::Relaxed),
             wait_child_scan_slots: WAIT_CHILD_SCAN_SLOTS.load(Ordering::Relaxed),
+            scheduler_normal_requeue_calls: SCHEDULER_NORMAL_REQUEUE_CALLS.load(Ordering::Relaxed),
+            scheduler_normal_vruntime_delta: SCHEDULER_NORMAL_VRUNTIME_DELTA
+                .load(Ordering::Relaxed),
             fd_alloc_calls: FD_ALLOC_CALLS.load(Ordering::Relaxed),
             fd_alloc_failures: FD_ALLOC_FAILURES.load(Ordering::Relaxed),
             fd_alloc_probe_slots: FD_ALLOC_PROBE_SLOTS.load(Ordering::Relaxed),
@@ -1149,6 +1161,8 @@ mod enabled {
          exec_stack_copy_bytes {}\n\
          wait_child_scan_passes {}\n\
          wait_child_scan_slots {}\n\
+         scheduler_normal_requeue_calls {}\n\
+         scheduler_normal_vruntime_delta {}\n\
          fd_alloc_calls {}\n\
          fd_alloc_failures {}\n\
          fd_alloc_probe_slots {}\n\
@@ -1329,6 +1343,8 @@ mod enabled {
             stats.exec_stack_copy_bytes,
             stats.wait_child_scan_passes,
             stats.wait_child_scan_slots,
+            stats.scheduler_normal_requeue_calls,
+            stats.scheduler_normal_vruntime_delta,
             stats.fd_alloc_calls,
             stats.fd_alloc_failures,
             stats.fd_alloc_probe_slots,
@@ -1563,6 +1579,9 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_wait_child_scan(_child_slots: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_scheduler_normal_requeue(_vruntime_delta: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_fd_alloc(

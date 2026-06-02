@@ -279,6 +279,7 @@ impl ProcessControlBlock {
         let parent_sched_deadline_deadline = parent_task_inner.sched_deadline_deadline;
         let parent_sched_deadline_period = parent_task_inner.sched_deadline_period;
         let parent_nice = parent_task_inner.nice;
+        let parent_sched_vruntime = parent_task_inner.sched_vruntime;
         let parent_timer_slack_ns = parent_task_inner.timer_slack_ns;
         let parent_seccomp_mode = parent_task_inner.seccomp_mode;
         let parent_seccomp_filter = parent_task_inner.seccomp_filter.clone();
@@ -366,6 +367,7 @@ impl ProcessControlBlock {
             task_inner.sched_deadline_deadline = 0;
             task_inner.sched_deadline_period = 0;
             task_inner.nice = parent_nice.max(0);
+            task_inner.sched_vruntime = parent_sched_vruntime;
         } else {
             task_inner.sched_policy = parent_sched_policy;
             task_inner.sched_priority = parent_sched_priority;
@@ -374,6 +376,7 @@ impl ProcessControlBlock {
             task_inner.sched_deadline_deadline = parent_sched_deadline_deadline;
             task_inner.sched_deadline_period = parent_sched_deadline_period;
             task_inner.nice = parent_nice;
+            task_inner.sched_vruntime = parent_sched_vruntime;
         }
         drop(task_inner);
         Some(child)

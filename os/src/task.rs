@@ -47,6 +47,7 @@ pub(crate) use manager::list_process_snapshots;
 pub(crate) use manager::processes_snapshot;
 pub(crate) use manager::remove_ready_tasks_of_process;
 pub(crate) use manager::reprioritize_ready_task;
+pub(crate) use manager::requeue_task_after_run;
 pub(crate) use manager::task_with_linux_tid;
 pub use manager::{add_task, pid2process, remove_from_pid2process, wakeup_task};
 pub(crate) use manager::{wakeup_front_task, wakeup_timer_task};
@@ -144,7 +145,7 @@ pub fn suspend_current_and_run_next() {
     // ---- release current TCB
 
     // push back to ready queue.
-    add_task(task);
+    requeue_task_after_run(task);
     // jump to scheduling cycle
     schedule(task_cx_ptr);
 }

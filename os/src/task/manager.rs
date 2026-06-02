@@ -8,9 +8,20 @@ use lazy_static::*;
 
 const RT_PRIORITY_MAX: usize = 99;
 const RT_QUEUE_COUNT: usize = RT_PRIORITY_MAX + 1;
+const NICE_0_LOAD: u64 = 1024;
+const SCHED_VRUNTIME_UNIT: u64 = NICE_0_LOAD * NICE_0_LOAD;
+const NICE_TO_WEIGHT: [u64; 40] = [
+    88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904,
+    3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, 110, 87,
+    70, 56, 45, 36, 29, 23, 18, 15,
+];
+
+type NormalQueueKey = (u64, u64);
 
 pub struct TaskManager {
-    normal_queue: VecDeque<Arc<TaskControlBlock>>,
+    normal_queue: BTreeMap<NormalQueueKey, Arc<TaskControlBlock>>,
+    normal_enqueue_seq: u64,
+    normal_min_vruntime: u64,
     rt_queues: Vec<VecDeque<Arc<TaskControlBlock>>>,
     rt_ready_bitmap: u128,
 }
@@ -19,7 +30,9 @@ pub struct TaskManager {
 impl TaskManager {
     pub fn new() -> Self {
         Self {
-            normal_queue: VecDeque::new(),
+            normal_queue: BTreeMap::new(),
+            normal_enqueue_seq: 0,
+            normal_min_vruntime: 0,
             rt_queues: (0..RT_QUEUE_COUNT).map(|_| VecDeque::new()).collect(),
             rt_ready_bitmap: 0,
         }
@@ -33,11 +46,30 @@ impl TaskManager {
         self.normal_queue.len() + self.rt_queues.iter().map(VecDeque::len).sum::<usize>()
     }
 
+    fn nice_weight(nice: i8) -> u64 {
+        let index = (nice.clamp(-20, 19) as i32 + 20) as usize;
+        NICE_TO_WEIGHT[index]
+    }
+
+    fn vruntime_delta(task: &TaskControlBlock) -> u64 {
+        let weight = Self::nice_weight(task.nice_value());
+        SCHED_VRUNTIME_UNIT.div_ceil(weight).max(1)
+    }
+
     fn rt_priority_bit(priority: usize) -> u128 {
         1u128 << priority
     }
 
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
+        self.enqueue(task, false);
+    }
+
+    pub fn requeue_after_run(&mut self, task: Arc<TaskControlBlock>) {
+        if Self::rt_priority(&task) == 0 {
+            let delta = Self::vruntime_delta(&task);
+            task.add_sched_vruntime(delta);
+            perf::record_scheduler_normal_requeue(delta as usize);
+        }
         self.enqueue(task, false);
     }
 
@@ -47,16 +79,23 @@ impl TaskManager {
 
     fn enqueue(&mut self, task: Arc<TaskControlBlock>, front: bool) {
         let rt_priority = Self::rt_priority(&task);
-        let queue = if rt_priority > 0 {
+        if rt_priority > 0 {
             self.rt_ready_bitmap |= Self::rt_priority_bit(rt_priority);
-            &mut self.rt_queues[rt_priority]
+            let queue = &mut self.rt_queues[rt_priority];
+            if front {
+                queue.push_front(task);
+            } else {
+                queue.push_back(task);
+            }
         } else {
-            &mut self.normal_queue
-        };
-        if front {
-            queue.push_front(task);
-        } else {
-            queue.push_back(task);
+            let vruntime = if front {
+                self.normal_min_vruntime.saturating_sub(1)
+            } else {
+                task.floor_sched_vruntime(self.normal_min_vruntime)
+            };
+            self.normal_enqueue_seq = self.normal_enqueue_seq.wrapping_add(1);
+            self.normal_queue
+                .insert((vruntime, self.normal_enqueue_seq), task);
         }
     }
 
@@ -99,7 +138,8 @@ impl TaskManager {
                 self.enqueue(task, false);
             }
 
-            while let Some(task) = self.normal_queue.pop_front() {
+            while let Some((key, task)) = self.normal_queue.pop_first() {
+                self.normal_min_vruntime = self.normal_min_vruntime.max(key.0);
                 if task.inner_exclusive_access().task_status == TaskStatus::Exited {
                     pruned_exited += 1;
                     continue;
@@ -119,7 +159,7 @@ impl TaskManager {
     }
 
     pub fn remove_process_tasks(&mut self, process_id: usize) {
-        self.normal_queue.retain(|task| {
+        self.normal_queue.retain(|_, task| {
             task.process
                 .upgrade()
                 .is_none_or(|process| process.getpid() != process_id)
@@ -144,7 +184,7 @@ impl TaskManager {
     }
 
     fn remove_ready_task(&mut self, task: &Arc<TaskControlBlock>) -> bool {
-        if remove_task_from_queue(&mut self.normal_queue, task) {
+        if remove_task_from_normal_queue(&mut self.normal_queue, task) {
             return true;
         }
         for priority in 1..=RT_PRIORITY_MAX {
@@ -164,6 +204,20 @@ impl TaskManager {
             self.enqueue(task, false);
         }
     }
+}
+
+fn remove_task_from_normal_queue(
+    queue: &mut BTreeMap<NormalQueueKey, Arc<TaskControlBlock>>,
+    task: &Arc<TaskControlBlock>,
+) -> bool {
+    let key = queue
+        .iter()
+        .find_map(|(key, candidate)| Arc::ptr_eq(candidate, task).then_some(*key));
+    let Some(key) = key else {
+        return false;
+    };
+    queue.remove(&key);
+    true
 }
 
 fn remove_task_from_queue(
@@ -191,6 +245,10 @@ lazy_static! {
 
 pub fn add_task(task: Arc<TaskControlBlock>) {
     TASK_MANAGER.exclusive_access().add(task);
+}
+
+pub(crate) fn requeue_task_after_run(task: Arc<TaskControlBlock>) {
+    TASK_MANAGER.exclusive_access().requeue_after_run(task);
 }
 
 fn wakeup_task_with_placement(task: Arc<TaskControlBlock>, front: bool) -> bool {

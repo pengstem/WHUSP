@@ -117,6 +117,24 @@ impl TaskControlBlock {
             _ => 0,
         }
     }
+
+    pub(crate) fn nice_value(&self) -> i8 {
+        self.inner_exclusive_access().nice
+    }
+
+    pub(crate) fn floor_sched_vruntime(&self, min_vruntime: u64) -> u64 {
+        let mut inner = self.inner_exclusive_access();
+        if inner.sched_vruntime < min_vruntime {
+            inner.sched_vruntime = min_vruntime;
+        }
+        inner.sched_vruntime
+    }
+
+    pub(crate) fn add_sched_vruntime(&self, delta: u64) -> u64 {
+        let mut inner = self.inner_exclusive_access();
+        inner.sched_vruntime = inner.sched_vruntime.saturating_add(delta);
+        inner.sched_vruntime
+    }
 }
 
 pub struct TaskControlBlockInner {
@@ -146,6 +164,7 @@ pub struct TaskControlBlockInner {
     pub sched_deadline_deadline: u64,
     pub sched_deadline_period: u64,
     pub nice: i8,
+    pub sched_vruntime: u64,
     pub cpu_times: TaskCpuTimes,
     pub timer_slack_ns: usize,
     pub default_timer_slack_ns: usize,
@@ -232,6 +251,7 @@ impl TaskControlBlock {
                     sched_deadline_deadline: 0,
                     sched_deadline_period: 0,
                     nice: 0,
+                    sched_vruntime: 0,
                     cpu_times: TaskCpuTimes::default(),
                     timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
                     default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
