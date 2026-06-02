@@ -190,11 +190,14 @@ __restore:
     ld.d    $t0, $a0, 34*8
     move    $t1, $a1
     move    $t2, $t0
+    move    $t3, $a2
     csrwr   $a0, KSAVE_CTX
     csrwr   $t1, LA_CSR_PGDL
     csrwr   $t2, LA_CSR_PGDH
+    beqz    $t3, 2f
     dbar    0
     invtlb  0x00, $r0, $r0
+2:
     csrrd   $sp, KSAVE_CTX
     LOAD_FP_REGS
     LOAD_REGS

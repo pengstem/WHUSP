@@ -1,4 +1,5 @@
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub const VIRT_ADDR_START: usize = 0x9000_0000_0000_0000;
 const DIRECT_MAP_MASK: usize = 0xf000_0000_0000_0000;
@@ -20,6 +21,9 @@ const LA_PTE_W: usize = 1 << 8;
 const LA_PTE_COW: usize = 1 << 58;
 const LA_PTE_NR: usize = 1 << 61;
 const LA_PTE_NX: usize = 1 << 62;
+
+static LAST_RETURN_USER_TOKEN: AtomicUsize = AtomicUsize::new(0);
+static RETURN_TLB_DIRTY: AtomicBool = AtomicBool::new(true);
 
 pub fn page_table_token(root_ppn: usize) -> usize {
     root_ppn << crate::config::PAGE_SIZE_BITS
@@ -52,6 +56,7 @@ fn write_page_table_roots(pgdl_token: usize, pgdh_token: usize) {
 }
 
 pub fn flush_tlb_all() {
+    mark_return_tlb_dirty();
     unsafe {
         asm!("dbar 0", "invtlb 0x00, $r0, $r0");
     }
@@ -59,9 +64,20 @@ pub fn flush_tlb_all() {
 
 #[allow(dead_code)]
 pub fn flush_tlb_page(va: usize) {
+    mark_return_tlb_dirty();
     unsafe {
         asm!("dbar 0", "invtlb 0x05, $r0, {va}", va = in(reg) va);
     }
+}
+
+pub fn should_flush_tlb_on_return(user_token: usize) -> bool {
+    let previous = LAST_RETURN_USER_TOKEN.swap(user_token, Ordering::Relaxed);
+    let dirty = RETURN_TLB_DIRTY.swap(false, Ordering::Relaxed);
+    previous != user_token || dirty
+}
+
+fn mark_return_tlb_dirty() {
+    RETURN_TLB_DIRTY.store(true, Ordering::Relaxed);
 }
 
 pub fn publish_pte_barrier() {

@@ -19,6 +19,7 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) time_nanos_to_timespec_calls: usize,
     pub(crate) time_direct_timespec_calls: usize,
     pub(crate) riscv_return_fence_i_calls: usize,
+    pub(crate) la_return_invtlb_calls: usize,
     pub(crate) arch_instruction_barrier_calls: usize,
     pub(crate) tid_lookup_calls: usize,
     pub(crate) tid_lookup_process_visits: usize,
@@ -219,6 +220,7 @@ mod enabled {
     static TIME_NANOS_TO_TIMESPEC_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TIME_DIRECT_TIMESPEC_CALLS: AtomicUsize = AtomicUsize::new(0);
     static RISCV_RETURN_FENCE_I_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static LA_RETURN_INVTLB_CALLS: AtomicUsize = AtomicUsize::new(0);
     static ARCH_INSTRUCTION_BARRIER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TID_LOOKUP_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TID_LOOKUP_PROCESS_VISITS: AtomicUsize = AtomicUsize::new(0);
@@ -471,6 +473,11 @@ mod enabled {
     #[allow(dead_code)]
     pub(crate) fn record_riscv_return_fence_i_call() {
         RISCV_RETURN_FENCE_I_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_la_return_invtlb_call() {
+        LA_RETURN_INVTLB_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_arch_instruction_barrier_call() {
@@ -992,6 +999,7 @@ mod enabled {
             time_nanos_to_timespec_calls: TIME_NANOS_TO_TIMESPEC_CALLS.load(Ordering::Relaxed),
             time_direct_timespec_calls: TIME_DIRECT_TIMESPEC_CALLS.load(Ordering::Relaxed),
             riscv_return_fence_i_calls: RISCV_RETURN_FENCE_I_CALLS.load(Ordering::Relaxed),
+            la_return_invtlb_calls: LA_RETURN_INVTLB_CALLS.load(Ordering::Relaxed),
             arch_instruction_barrier_calls: ARCH_INSTRUCTION_BARRIER_CALLS.load(Ordering::Relaxed),
             tid_lookup_calls: TID_LOOKUP_CALLS.load(Ordering::Relaxed),
             tid_lookup_process_visits: TID_LOOKUP_PROCESS_VISITS.load(Ordering::Relaxed),
@@ -1209,6 +1217,7 @@ mod enabled {
          time_nanos_to_timespec_calls {}\n\
          time_direct_timespec_calls {}\n\
          riscv_return_fence_i_calls {}\n\
+         la_return_invtlb_calls {}\n\
          arch_instruction_barrier_calls {}\n\
          tid_lookup_calls {}\n\
          tid_lookup_process_visits {}\n\
@@ -1400,6 +1409,7 @@ mod enabled {
             stats.time_nanos_to_timespec_calls,
             stats.time_direct_timespec_calls,
             stats.riscv_return_fence_i_calls,
+            stats.la_return_invtlb_calls,
             stats.arch_instruction_barrier_calls,
             stats.tid_lookup_calls,
             stats.tid_lookup_process_visits,
@@ -1646,6 +1656,10 @@ mod disabled {
     #[inline(always)]
     #[allow(dead_code)]
     pub(crate) fn record_riscv_return_fence_i_call() {}
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn record_la_return_invtlb_call() {}
 
     #[inline(always)]
     pub(crate) fn record_arch_instruction_barrier_call() {}

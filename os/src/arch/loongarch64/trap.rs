@@ -272,12 +272,16 @@ fn force_default_sigsegv_current() {
 pub fn trap_return() -> ! {
     let now_us = get_time_us();
     let (trap_cx, user_token) = current_trap_return_context_after_accounting(now_us);
+    let flush_tlb = crate::arch::mm::should_flush_tlb_on_return(user_token);
+    if flush_tlb {
+        crate::perf::record_la_return_invtlb_call();
+    }
     disable_supervisor_interrupt();
     set_kernel_trap_entry();
     unsafe extern "C" {
-        unsafe fn __restore(trap_cx: usize, user_token: usize) -> !;
+        unsafe fn __restore(trap_cx: usize, user_token: usize, flush_tlb: usize) -> !;
     }
-    unsafe { __restore(trap_cx, user_token) }
+    unsafe { __restore(trap_cx, user_token, flush_tlb as usize) }
 }
 
 #[unsafe(no_mangle)]
