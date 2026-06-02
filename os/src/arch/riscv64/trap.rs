@@ -65,23 +65,30 @@ pub fn trap_handler() -> ! {
     account_current_user_time_until(get_time_us());
     let scause = scause::read();
     let stval = stval::read();
-    let trap_pc = current_trap_cx().sepc;
+    let is_user_ecall = matches!(scause.cause(), Trap::Exception(Exception::UserEnvCall));
+    let (trap_pc, syscall_entry) = {
+        let cx = current_trap_cx();
+        let syscall_entry = if is_user_ecall {
+            // Snapshot the Linux RISC-V syscall ABI registers before ptrace
+            // stops or syscall handlers can mutate TrapContext.
+            Some((
+                cx.x[17],
+                [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]],
+                cx.x[2],
+            ))
+        } else {
+            None
+        };
+        (cx.sepc, syscall_entry)
+    };
     let mut interrupted_pc = trap_pc;
     let mut signal_delivery_attempted = false;
     // println!("into {:?}", scause.cause());
     match scause.cause() {
         Trap::Exception(Exception::UserEnvCall) => {
             let syscall_pc = trap_pc;
-            let (syscall_nr, syscall_args, syscall_sp) = {
-                let cx = current_trap_cx();
-                // Snapshot the Linux RISC-V syscall ABI registers before
-                // ptrace stops or syscall handlers can mutate TrapContext.
-                (
-                    cx.x[17],
-                    [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]],
-                    cx.x[2],
-                )
-            };
+            let (syscall_nr, syscall_args, syscall_sp) =
+                syscall_entry.expect("syscall entry snapshot must exist for UserEnvCall");
             crate::task::ptrace_syscall_enter_stop_current(
                 syscall_nr,
                 syscall_args,

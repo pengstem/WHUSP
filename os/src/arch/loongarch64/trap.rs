@@ -79,21 +79,28 @@ pub fn trap_handler() -> ! {
     account_current_user_time_until(get_time_us());
     let estat = estat::read();
     let badv = badv::read().vaddr();
-    let trap_pc = current_trap_cx().era;
+    let is_syscall = matches!(estat.cause(), Trap::Exception(Exception::Syscall));
+    let (trap_pc, syscall_entry) = {
+        let cx = current_trap_cx();
+        let syscall_entry = if is_syscall {
+            // Snapshot the contest LoongArch syscall ABI registers before
+            // ptrace stops or syscall handlers can mutate TrapContext.
+            Some((
+                cx.x[11],
+                [cx.x[4], cx.x[5], cx.x[6], cx.x[7], cx.x[8], cx.x[9]],
+                cx.x[3],
+            ))
+        } else {
+            None
+        };
+        (cx.era, syscall_entry)
+    };
     let mut interrupted_pc = trap_pc;
     match estat.cause() {
         Trap::Exception(Exception::Syscall) => {
             let syscall_pc = trap_pc;
-            let (syscall_nr, syscall_args, syscall_sp) = {
-                let cx = current_trap_cx();
-                // Snapshot the contest LoongArch syscall ABI registers before
-                // ptrace stops or syscall handlers can mutate TrapContext.
-                (
-                    cx.x[11],
-                    [cx.x[4], cx.x[5], cx.x[6], cx.x[7], cx.x[8], cx.x[9]],
-                    cx.x[3],
-                )
-            };
+            let (syscall_nr, syscall_args, syscall_sp) =
+                syscall_entry.expect("syscall entry snapshot must exist for Syscall");
             crate::task::ptrace_syscall_enter_stop_current(
                 syscall_nr,
                 syscall_args,
