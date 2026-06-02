@@ -3,26 +3,44 @@ use super::vfs::{FsNodeKind, VfsNodeId};
 use crate::sync::UPIntrFreeCell;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
+use alloc::vec::Vec;
 use lazy_static::*;
 
 const DEFAULT_DENTRY_CACHE_CAPACITY: usize = 4096;
+const DENTRY_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const DENTRY_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct DentryCacheKey {
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DentryCacheBucketKey {
     namespace_id: MountNamespaceId,
     parent: VfsNodeId,
-    component: String,
+    component_hash: u64,
 }
 
-impl DentryCacheKey {
+impl DentryCacheBucketKey {
     fn new(namespace_id: MountNamespaceId, parent: VfsNodeId, component: &str) -> Self {
         Self {
             namespace_id,
             parent,
-            component: component.to_string(),
+            component_hash: hash_component(component),
         }
     }
+}
+
+fn hash_component(component: &str) -> u64 {
+    let mut hash = DENTRY_HASH_OFFSET;
+    for byte in component.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(DENTRY_HASH_PRIME);
+    }
+    hash
+}
+
+#[derive(Clone, Debug)]
+struct DentryCacheEntry {
+    component: String,
+    value: DentryCacheValue,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -80,10 +98,10 @@ impl DentryCacheValue {
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct DentryCacheLruEntry {
     stamp: usize,
-    key: DentryCacheKey,
+    bucket: DentryCacheBucketKey,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,12 +126,17 @@ pub(crate) struct DentryCacheStats {
     pub(crate) evict: usize,
     pub(crate) lru_touch: usize,
     pub(crate) lru_scan_slots: usize,
+    #[cfg(feature = "perf-counters")]
+    pub(crate) key_allocs: usize,
+    #[cfg(feature = "perf-counters")]
+    pub(crate) collision_scans: usize,
 }
 
 struct DentryCache {
     enabled: bool,
     capacity: usize,
-    entries: BTreeMap<DentryCacheKey, DentryCacheValue>,
+    entries: BTreeMap<DentryCacheBucketKey, Vec<DentryCacheEntry>>,
+    entry_count: usize,
     parent_generations: BTreeMap<VfsNodeId, usize>,
     lru: BTreeSet<DentryCacheLruEntry>,
     lru_clock: usize,
@@ -126,6 +149,7 @@ impl DentryCache {
             enabled: true,
             capacity,
             entries: BTreeMap::new(),
+            entry_count: 0,
             parent_generations: BTreeMap::new(),
             lru: BTreeSet::new(),
             lru_clock: 0,
@@ -141,27 +165,116 @@ impl DentryCache {
         self.parent_generations.get(&parent).copied().unwrap_or(0)
     }
 
-    fn touch(&mut self, key: DentryCacheKey, old_stamp: Option<usize>) -> usize {
+    #[cfg(feature = "perf-counters")]
+    fn record_key_alloc(&mut self) {
+        self.stats.key_allocs += 1;
+    }
+
+    #[cfg(not(feature = "perf-counters"))]
+    #[inline(always)]
+    fn record_key_alloc(&mut self) {}
+
+    #[cfg(feature = "perf-counters")]
+    fn record_collision_scans(&mut self, scans: usize) {
+        self.stats.collision_scans += scans;
+    }
+
+    #[cfg(not(feature = "perf-counters"))]
+    #[inline(always)]
+    fn record_collision_scans(&mut self, _scans: usize) {}
+
+    fn find_entry_index(&mut self, bucket: DentryCacheBucketKey, component: &str) -> Option<usize> {
+        let (index, extra_scans) = {
+            let Some(entries) = self.entries.get(&bucket) else {
+                return None;
+            };
+            let mut extra_scans = 0;
+            let mut found = None;
+            for (index, entry) in entries.iter().enumerate() {
+                if index > 0 {
+                    extra_scans += 1;
+                }
+                if entry.component == component {
+                    found = Some(index);
+                    break;
+                }
+            }
+            (found, extra_scans)
+        };
+        self.record_collision_scans(extra_scans);
+        index
+    }
+
+    fn touch(&mut self, bucket: DentryCacheBucketKey, old_stamp: Option<usize>) -> usize {
         self.stats.lru_touch += 1;
         if let Some(stamp) = old_stamp {
-            self.lru.remove(&DentryCacheLruEntry {
-                stamp,
-                key: key.clone(),
-            });
+            let old_lru_entry = DentryCacheLruEntry { stamp, bucket };
+            self.lru.remove(&old_lru_entry);
         }
         self.lru_clock = self.lru_clock.wrapping_add(1);
         let stamp = self.lru_clock;
-        self.lru.insert(DentryCacheLruEntry { stamp, key });
+        self.lru.insert(DentryCacheLruEntry { stamp, bucket });
         stamp
     }
 
+    fn remove_entry_at(
+        &mut self,
+        bucket: DentryCacheBucketKey,
+        index: usize,
+        lru_stamp: usize,
+    ) -> bool {
+        let mut remove_bucket = false;
+        let removed = if let Some(entries) = self.entries.get_mut(&bucket) {
+            if index >= entries.len() {
+                false
+            } else {
+                entries.swap_remove(index);
+                self.entry_count = self.entry_count.saturating_sub(1);
+                remove_bucket = entries.is_empty();
+                true
+            }
+        } else {
+            false
+        };
+        if remove_bucket {
+            self.entries.remove(&bucket);
+        }
+        if removed {
+            self.lru.remove(&DentryCacheLruEntry {
+                stamp: lru_stamp,
+                bucket,
+            });
+        }
+        removed
+    }
+
     fn trim_to_capacity(&mut self) {
-        while self.entries.len() > self.capacity {
-            let Some(victim) = self.lru.iter().next().cloned() else {
+        while self.entry_count > self.capacity {
+            let Some(victim) = self.lru.iter().next().copied() else {
                 break;
             };
             self.lru.remove(&victim);
-            if self.entries.remove(&victim.key).is_some() {
+            let mut remove_bucket = false;
+            let removed = if let Some(entries) = self.entries.get_mut(&victim.bucket) {
+                self.stats.lru_scan_slots += entries.len();
+                if let Some(index) = entries
+                    .iter()
+                    .position(|entry| entry.value.lru_stamp() == victim.stamp)
+                {
+                    entries.swap_remove(index);
+                    self.entry_count = self.entry_count.saturating_sub(1);
+                    remove_bucket = entries.is_empty();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if remove_bucket {
+                self.entries.remove(&victim.bucket);
+            }
+            if removed {
                 self.stats.evict += 1;
             }
         }
@@ -176,22 +289,33 @@ impl DentryCache {
         if !self.enabled {
             return None;
         }
-        let key = DentryCacheKey::new(namespace_id, parent, component);
-        let Some(value) = self.entries.get(&key).copied() else {
+        let bucket = DentryCacheBucketKey::new(namespace_id, parent, component);
+        let Some(index) = self.find_entry_index(bucket, component) else {
+            self.stats.miss += 1;
+            return None;
+        };
+        let Some(value) = self
+            .entries
+            .get(&bucket)
+            .and_then(|entries| entries.get(index))
+            .map(|entry| entry.value)
+        else {
             self.stats.miss += 1;
             return None;
         };
         if value.parent_generation() != self.parent_generation(parent) {
-            self.entries.remove(&key);
-            self.lru.remove(&DentryCacheLruEntry {
-                stamp: value.lru_stamp(),
-                key,
-            });
+            self.remove_entry_at(bucket, index, value.lru_stamp());
             self.stats.revalidate_fail += 1;
             return None;
         }
-        let stamp = self.touch(key.clone(), Some(value.lru_stamp()));
-        self.entries.insert(key, value.with_lru_stamp(stamp));
+        let stamp = self.touch(bucket, Some(value.lru_stamp()));
+        if let Some(entry) = self
+            .entries
+            .get_mut(&bucket)
+            .and_then(|entries| entries.get_mut(index))
+        {
+            entry.value = value.with_lru_stamp(stamp);
+        }
         match value {
             DentryCacheValue::Positive { node, kind, .. } => {
                 self.stats.positive_hit += 1;
@@ -215,16 +339,39 @@ impl DentryCache {
         if !self.enabled || self.capacity == 0 {
             return;
         }
-        let key = DentryCacheKey::new(namespace_id, parent, component);
+        let bucket = DentryCacheBucketKey::new(namespace_id, parent, component);
         let value = DentryCacheValue::Positive {
             node,
             kind,
             parent_generation: self.parent_generation(parent),
             lru_stamp: 0,
         };
-        let old_stamp = self.entries.get(&key).map(|value| value.lru_stamp());
-        let stamp = self.touch(key.clone(), old_stamp);
-        self.entries.insert(key, value.with_lru_stamp(stamp));
+        if let Some(index) = self.find_entry_index(bucket, component) {
+            let old_stamp = self
+                .entries
+                .get(&bucket)
+                .and_then(|entries| entries.get(index))
+                .map(|entry| entry.value.lru_stamp());
+            let stamp = self.touch(bucket, old_stamp);
+            if let Some(entry) = self
+                .entries
+                .get_mut(&bucket)
+                .and_then(|entries| entries.get_mut(index))
+            {
+                entry.value = value.with_lru_stamp(stamp);
+            }
+        } else {
+            self.record_key_alloc();
+            let stamp = self.touch(bucket, None);
+            self.entries
+                .entry(bucket)
+                .or_default()
+                .push(DentryCacheEntry {
+                    component: String::from(component),
+                    value: value.with_lru_stamp(stamp),
+                });
+            self.entry_count += 1;
+        }
         self.stats.insert_positive += 1;
         self.trim_to_capacity();
     }
@@ -238,14 +385,37 @@ impl DentryCache {
         if !self.enabled || self.capacity == 0 {
             return;
         }
-        let key = DentryCacheKey::new(namespace_id, parent, component);
+        let bucket = DentryCacheBucketKey::new(namespace_id, parent, component);
         let value = DentryCacheValue::Negative {
             parent_generation: self.parent_generation(parent),
             lru_stamp: 0,
         };
-        let old_stamp = self.entries.get(&key).map(|value| value.lru_stamp());
-        let stamp = self.touch(key.clone(), old_stamp);
-        self.entries.insert(key, value.with_lru_stamp(stamp));
+        if let Some(index) = self.find_entry_index(bucket, component) {
+            let old_stamp = self
+                .entries
+                .get(&bucket)
+                .and_then(|entries| entries.get(index))
+                .map(|entry| entry.value.lru_stamp());
+            let stamp = self.touch(bucket, old_stamp);
+            if let Some(entry) = self
+                .entries
+                .get_mut(&bucket)
+                .and_then(|entries| entries.get_mut(index))
+            {
+                entry.value = value.with_lru_stamp(stamp);
+            }
+        } else {
+            self.record_key_alloc();
+            let stamp = self.touch(bucket, None);
+            self.entries
+                .entry(bucket)
+                .or_default()
+                .push(DentryCacheEntry {
+                    component: String::from(component),
+                    value: value.with_lru_stamp(stamp),
+                });
+            self.entry_count += 1;
+        }
         self.stats.insert_negative += 1;
         self.trim_to_capacity();
     }
@@ -256,25 +426,27 @@ impl DentryCache {
         }
         let generation = self.parent_generation(parent).wrapping_add(1);
         self.parent_generations.insert(parent, generation);
-        let before = self.entries.len();
-        self.entries.retain(|key, _| key.parent != parent);
-        self.lru.retain(|entry| entry.key.parent != parent);
-        self.stats.invalidate_parent += before.saturating_sub(self.entries.len());
+        let before = self.entry_count;
+        self.entries.retain(|bucket, _| bucket.parent != parent);
+        self.entry_count = self.entries.values().map(Vec::len).sum();
+        self.lru.retain(|entry| entry.bucket.parent != parent);
+        self.stats.invalidate_parent += before.saturating_sub(self.entry_count);
     }
 
     fn clear_all(&mut self) {
-        if !self.enabled || self.entries.is_empty() {
+        if !self.enabled || self.entry_count == 0 {
             return;
         }
-        self.stats.invalidate_all += self.entries.len();
+        self.stats.invalidate_all += self.entry_count;
         self.entries.clear();
+        self.entry_count = 0;
         self.lru.clear();
     }
 
     fn stats_snapshot(&self) -> DentryCacheStats {
         DentryCacheStats {
             enabled: self.enabled,
-            entries: self.entries.len(),
+            entries: self.entry_count,
             capacity: self.capacity,
             ..self.stats
         }

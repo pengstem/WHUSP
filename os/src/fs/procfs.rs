@@ -1812,6 +1812,8 @@ fn oskernel_perf_content() -> String {
          dentry_cache_evict {}\n\
          dentry_cache_lru_touch {}\n\
          dentry_cache_lru_scan_slots {}\n\
+         dentry_cache_key_allocs {}\n\
+         dentry_cache_collision_scans {}\n\
          {}",
         perf::stats_content(),
         frame_total,
@@ -1897,6 +1899,8 @@ fn oskernel_perf_content() -> String {
         dentry.evict,
         dentry.lru_touch,
         dentry.lru_scan_slots,
+        dentry.key_allocs,
+        dentry.collision_scans,
         exec_load_stats_content(),
     )
 }
