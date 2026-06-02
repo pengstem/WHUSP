@@ -54,11 +54,14 @@ pub fn wall_time_nanos() -> u64 {
     monotonic_time_nanos().wrapping_add(EPOCH_OFFSET_NS.load(core::sync::atomic::Ordering::Relaxed))
 }
 
+pub fn wall_time_offset_nanos() -> u64 {
+    EPOCH_OFFSET_NS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn set_wall_time_nanos(wall_nanos: u64) {
-    EPOCH_OFFSET_NS.store(
-        wall_nanos.wrapping_sub(monotonic_time_nanos()),
-        core::sync::atomic::Ordering::Relaxed,
-    );
+    let offset = wall_nanos.wrapping_sub(monotonic_time_nanos());
+    EPOCH_OFFSET_NS.store(offset, core::sync::atomic::Ordering::Relaxed);
+    crate::vdso::refresh_wall_time_offset(offset);
 }
 
 pub fn get_time() -> usize {

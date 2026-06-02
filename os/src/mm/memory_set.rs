@@ -81,7 +81,7 @@ impl MemorySet {
             None,
         );
     }
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     pub(crate) fn map_vdso_image(&mut self, start_va: usize, image: &[u8]) -> bool {
         let Some(end_va) = start_va.checked_add(image.len()) else {
             return false;
@@ -103,7 +103,7 @@ impl MemorySet {
         )
     }
 
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     pub(crate) fn patch_vdso_u64(&mut self, start_va: usize, offset: usize, value: u64) -> bool {
         let Some(va) = start_va.checked_add(offset) else {
             return false;
