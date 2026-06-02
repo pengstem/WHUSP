@@ -23,9 +23,9 @@ use crate::syscall::{close_detached_fd_entry, install_file_fd};
 use crate::task::{
     FdTableEntry, SignalFlags, TaskControlBlock, block_current_task_no_schedule,
     current_add_signal, current_has_unmasked_signal, current_process, current_task,
-    current_user_token, schedule, suspend_current_and_run_next, wakeup_task,
+    current_user_token, schedule, wakeup_task,
 };
-use crate::timer::get_time_ms;
+use crate::timer::{add_timer, get_time_ms};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
@@ -549,6 +549,7 @@ struct AfAlgSendParams {
 struct LoopbackState {
     next_ephemeral: u16,
     tcp_listeners: BTreeMap<u16, Weak<UPIntrFreeCell<LocalSocketInner>>>,
+    tcp_connect_waiters: BTreeMap<u16, VecDeque<Arc<TaskControlBlock>>>,
     udp_bound: BTreeMap<u16, Vec<Weak<UPIntrFreeCell<LocalSocketInner>>>>,
     unix_bound: BTreeMap<UnixAddress, Weak<UPIntrFreeCell<LocalSocketInner>>>,
 }
@@ -558,6 +559,7 @@ impl LoopbackState {
         Self {
             next_ephemeral: 49152,
             tcp_listeners: BTreeMap::new(),
+            tcp_connect_waiters: BTreeMap::new(),
             udp_bound: BTreeMap::new(),
             unix_bound: BTreeMap::new(),
         }
@@ -709,6 +711,31 @@ fn remove_socket_waiter(queue: &mut VecDeque<Arc<TaskControlBlock>>, task: &Arc<
         .position(|candidate| Arc::ptr_eq(candidate, task))
     {
         queue.remove(index);
+    }
+}
+
+fn sleep_tcp_connect_waiter(port: u16, deadline_ms: usize) -> *mut crate::task::TaskContext {
+    let (task, task_cx_ptr) = block_current_task_no_schedule();
+    LOOPBACK
+        .exclusive_access()
+        .tcp_connect_waiters
+        .entry(port)
+        .or_default()
+        .push_back(Arc::clone(&task));
+    add_timer(deadline_ms, task);
+    task_cx_ptr
+}
+
+fn remove_tcp_connect_waiter(port: u16, task: &Arc<TaskControlBlock>) {
+    let mut loopback = LOOPBACK.exclusive_access();
+    let remove_empty = if let Some(waiters) = loopback.tcp_connect_waiters.get_mut(&port) {
+        remove_socket_waiter(waiters, task);
+        waiters.is_empty()
+    } else {
+        false
+    };
+    if remove_empty {
+        loopback.tcp_connect_waiters.remove(&port);
     }
 }
 
@@ -906,14 +933,22 @@ impl LocalSocket {
     fn listen(&self, backlog: i32) -> SysResult {
         let backlog = backlog.clamp(1, MAX_LISTEN_BACKLOG as i32) as usize;
         let local = self.ensure_bound(SocketKind::Stream)?;
-        let mut loopback = LOOPBACK.exclusive_access();
-        loopback.prune();
-        loopback
-            .tcp_listeners
-            .insert(local.port, Arc::downgrade(&self.inner));
+        let connect_waiters = {
+            let mut loopback = LOOPBACK.exclusive_access();
+            loopback.prune();
+            loopback
+                .tcp_listeners
+                .insert(local.port, Arc::downgrade(&self.inner));
+            loopback
+                .tcp_connect_waiters
+                .remove(&local.port)
+                .unwrap_or_default()
+        };
         let mut inner = self.inner.exclusive_access();
         inner.listening = true;
         inner.listen_backlog = backlog;
+        drop(inner);
+        wake_local_socket_writers(connect_waiters);
         Ok(0)
     }
 
@@ -942,6 +977,9 @@ impl LocalSocket {
                 return Err(SysError::EAGAIN);
             }
             if current_has_unmasked_signal() {
+                if let Some(task) = current_task() {
+                    self.inner.exclusive_access().remove_reader(&task);
+                }
                 let peer = InetEndpoint {
                     ip: LOOPBACK_IP,
                     port: 0,
@@ -966,7 +1004,12 @@ impl LocalSocket {
                     OpenFlags::RDWR,
                 ));
             }
-            suspend_current_and_run_next();
+            let task_cx_ptr = {
+                let mut inner = self.inner.exclusive_access();
+                perf::record_local_socket_reader_sleep();
+                inner.sleep_reader()
+            };
+            schedule(task_cx_ptr);
         }
     }
 
@@ -1011,11 +1054,20 @@ impl LocalSocket {
                 break listener;
             }
             if get_time_ms() >= connect_deadline_ms {
+                if let Some(task) = current_task() {
+                    remove_tcp_connect_waiter(remote.port, &task);
+                }
                 return Err(SysError::ECONNREFUSED);
             }
-            // CONTEXT: The contest script backgrounds netserver and immediately
-            // launches netperf. Yield briefly so the server can reach listen().
-            suspend_current_and_run_next();
+            if current_has_unmasked_signal() {
+                if let Some(task) = current_task() {
+                    remove_tcp_connect_waiter(remote.port, &task);
+                }
+                return Err(SysError::EINTR);
+            }
+            perf::record_local_socket_writer_sleep();
+            let task_cx_ptr = sleep_tcp_connect_waiter(remote.port, connect_deadline_ms);
+            schedule(task_cx_ptr);
         };
         let listener_unix_local = listener.exclusive_access().unix_local.clone();
         let (domain, client_unix_local) = {
@@ -1048,11 +1100,12 @@ impl LocalSocket {
             client.unix_peer = unix_peer;
             client.peer_socket = Some(Arc::downgrade(&server_inner));
         }
-        let read_waiters = {
+        let (reader, read_waiters) = {
             let mut listener = listener.exclusive_access();
             listener.accept_queue.push_back(server_inner);
-            listener.read_poll_waiters.drain()
+            (listener.wake_reader(), listener.read_poll_waiters.drain())
         };
+        wake_local_socket_reader(reader);
         PollWaiter::wake_all(read_waiters);
         Ok(0)
     }
@@ -1089,14 +1142,19 @@ impl LocalSocket {
         }
     }
 
-    fn send_bytes(&self, data: &[u8], remote: Option<SocketAddress>) -> SysResult<usize> {
+    fn send_bytes(
+        &self,
+        data: &[u8],
+        remote: Option<SocketAddress>,
+        nonblock: bool,
+    ) -> SysResult<usize> {
         match self.kind() {
-            SocketKind::Stream => self.send_stream(data),
-            SocketKind::Datagram => self.send_datagram(data, remote),
+            SocketKind::Stream => self.send_stream(data, nonblock),
+            SocketKind::Datagram => self.send_datagram(data, remote, nonblock),
         }
     }
 
-    fn send_stream(&self, data: &[u8]) -> SysResult<usize> {
+    fn send_stream(&self, data: &[u8], nonblock: bool) -> SysResult<usize> {
         perf::record_local_socket_write_call();
         let mut written = 0usize;
         while written < data.len() {
@@ -1124,6 +1182,9 @@ impl LocalSocket {
             let capacity = (peer_inner.rcvbuf as usize).max(1);
             let available = capacity.saturating_sub(peer_inner.stream_rx.len());
             if available == 0 {
+                if nonblock {
+                    return Err(SysError::EAGAIN);
+                }
                 if current_has_unmasked_signal() {
                     if let Some(task) = current_task() {
                         peer_inner.remove_writer(&task);
@@ -1173,42 +1234,66 @@ impl LocalSocket {
         }
     }
 
-    fn send_datagram(&self, data: &[u8], remote: Option<SocketAddress>) -> SysResult<usize> {
+    fn send_datagram(
+        &self,
+        data: &[u8],
+        remote: Option<SocketAddress>,
+        nonblock: bool,
+    ) -> SysResult<usize> {
+        perf::record_local_socket_write_call();
         if self.inner.exclusive_access().domain == SocketDomain::Netlink {
             return self.send_netlink_route(data);
         }
         let local = self.ensure_bound(SocketKind::Datagram)?;
         let local_unix = self.inner.exclusive_access().unix_local.clone();
-        if remote.is_none()
-            && let Some(peer) = self
-                .inner
+        let connected_peer = if remote.is_none() {
+            self.inner
                 .exclusive_access()
                 .peer_socket
                 .as_ref()
                 .and_then(Weak::upgrade)
-        {
-            let mut peer = peer.exclusive_access();
-            if peer.read_shutdown {
-                return Err(SysError::EPIPE);
+        } else {
+            None
+        };
+        if let Some(peer) = connected_peer {
+            loop {
+                let mut peer = peer.exclusive_access();
+                if peer.read_shutdown {
+                    return Err(SysError::EPIPE);
+                }
+                let queued_bytes: usize = peer
+                    .datagram_rx
+                    .iter()
+                    .map(|packet| packet.data.len())
+                    .sum();
+                let capacity = (peer.rcvbuf as usize).max(1);
+                if queued_bytes.saturating_add(data.len()) <= capacity {
+                    peer.datagram_rx.push_back(Datagram {
+                        data: data.to_vec(),
+                        from: local,
+                        from_unix: local_unix,
+                    });
+                    let reader = peer.wake_reader();
+                    let read_waiters = peer.read_poll_waiters.drain();
+                    drop(peer);
+                    wake_local_socket_reader(reader);
+                    PollWaiter::wake_all(read_waiters);
+                    return Ok(data.len());
+                }
+                if nonblock {
+                    return Err(SysError::EAGAIN);
+                }
+                if current_has_unmasked_signal() {
+                    if let Some(task) = current_task() {
+                        peer.remove_writer(&task);
+                    }
+                    return Err(SysError::EINTR);
+                }
+                perf::record_local_socket_writer_sleep();
+                let task_cx_ptr = peer.sleep_writer();
+                drop(peer);
+                schedule(task_cx_ptr);
             }
-            let queued_bytes: usize = peer
-                .datagram_rx
-                .iter()
-                .map(|packet| packet.data.len())
-                .sum();
-            let capacity = (peer.rcvbuf as usize).max(1);
-            if queued_bytes.saturating_add(data.len()) > capacity {
-                return Err(SysError::EAGAIN);
-            }
-            peer.datagram_rx.push_back(Datagram {
-                data: data.to_vec(),
-                from: local,
-                from_unix: local_unix,
-            });
-            let read_waiters = peer.read_poll_waiters.drain();
-            drop(peer);
-            PollWaiter::wake_all(read_waiters);
-            return Ok(data.len());
         }
         let remote = match remote {
             Some(remote) => self.resolve_remote_address(remote)?.0,
@@ -1242,7 +1327,6 @@ impl LocalSocket {
         let target = target.or(fallback);
         if let Some(target) = target {
             let mut target = target.exclusive_access();
-            let mut read_waiters = Vec::new();
             let queued_bytes: usize = target
                 .datagram_rx
                 .iter()
@@ -1255,10 +1339,17 @@ impl LocalSocket {
                     from: local,
                     from_unix: local_unix,
                 });
-                read_waiters = target.read_poll_waiters.drain();
+                let reader = target.wake_reader();
+                let read_waiters = target.read_poll_waiters.drain();
+                drop(target);
+                wake_local_socket_reader(reader);
+                PollWaiter::wake_all(read_waiters);
+                return Ok(data.len());
             }
             drop(target);
-            PollWaiter::wake_all(read_waiters);
+            if nonblock {
+                return Err(SysError::EAGAIN);
+            }
         }
         Ok(data.len())
     }
@@ -1345,21 +1436,31 @@ impl LocalSocket {
         nonblock: bool,
     ) -> SysResult<(usize, Option<SocketAddress>)> {
         loop {
-            let (packet, peer) = {
+            let (packet, peer, writer, write_waiters, domain) = {
                 let mut inner = self.inner.exclusive_access();
-                (
-                    inner.datagram_rx.pop_front(),
-                    inner.peer_socket.as_ref().and_then(Weak::upgrade),
-                )
+                let peer = inner.peer_socket.as_ref().and_then(Weak::upgrade);
+                let peer_is_self = peer
+                    .as_ref()
+                    .is_some_and(|peer| Arc::ptr_eq(peer, &self.inner));
+                let write_waiters = if peer_is_self {
+                    inner.write_poll_waiters.drain()
+                } else {
+                    Vec::new()
+                };
+                let peer = if peer_is_self { None } else { peer };
+                let packet = inner.datagram_rx.pop_front();
+                let writer = inner.wake_writer();
+                (packet, peer, writer, write_waiters, inner.domain)
             };
             if let Some(packet) = packet {
+                wake_local_socket_writer(writer);
+                PollWaiter::wake_all(write_waiters);
                 if let Some(peer) = peer {
                     let write_waiters = drain_socket_write_poll_waiters(&peer);
                     PollWaiter::wake_all(write_waiters);
                 }
                 let mut buf = buf;
                 let copied = buf.copy_from_slice(&packet.data);
-                let domain = self.inner.exclusive_access().domain;
                 let from = match domain {
                     SocketDomain::Inet => SocketAddress::Inet(packet.from),
                     SocketDomain::Inet6 => SocketAddress::Inet6(packet.from),
@@ -1376,25 +1477,50 @@ impl LocalSocket {
                 return Err(SysError::EAGAIN);
             }
             if current_has_unmasked_signal() {
+                if let Some(task) = current_task() {
+                    self.inner.exclusive_access().remove_reader(&task);
+                }
                 return Err(SysError::EINTR);
             }
-            suspend_current_and_run_next();
+            let task_cx_ptr = {
+                let mut inner = self.inner.exclusive_access();
+                perf::record_local_socket_reader_sleep();
+                inner.sleep_reader()
+            };
+            schedule(task_cx_ptr);
         }
     }
 
     fn recv_raw_datagram(&self, nonblock: bool) -> SysResult<Vec<u8>> {
         loop {
-            let packet = self.inner.exclusive_access().datagram_rx.pop_front();
+            let (packet, writer, write_waiters) = {
+                let mut inner = self.inner.exclusive_access();
+                (
+                    inner.datagram_rx.pop_front(),
+                    inner.wake_writer(),
+                    inner.write_poll_waiters.drain(),
+                )
+            };
             if let Some(packet) = packet {
+                wake_local_socket_writer(writer);
+                PollWaiter::wake_all(write_waiters);
                 return Ok(packet.data);
             }
             if nonblock {
                 return Err(SysError::EAGAIN);
             }
             if current_has_unmasked_signal() {
+                if let Some(task) = current_task() {
+                    self.inner.exclusive_access().remove_reader(&task);
+                }
                 return Err(SysError::EINTR);
             }
-            suspend_current_and_run_next();
+            let task_cx_ptr = {
+                let mut inner = self.inner.exclusive_access();
+                perf::record_local_socket_reader_sleep();
+                inner.sleep_reader()
+            };
+            schedule(task_cx_ptr);
         }
     }
 
@@ -1924,7 +2050,7 @@ impl File for LocalSocket {
 
     fn write(&self, buf: UserBuffer) -> usize {
         let data = buf.to_vec();
-        self.send_bytes(&data, None).unwrap_or_default()
+        self.send_bytes(&data, None, false).unwrap_or_default()
     }
     fn socket_write_peer_closed(&self) -> bool {
         self.stream_write_peer_closed()
@@ -3160,7 +3286,7 @@ pub fn sys_sendto(
     fd: usize,
     buf: usize,
     len: usize,
-    _flags: i32,
+    flags: i32,
     addr: usize,
     addrlen: u32,
 ) -> SysResult {
@@ -3171,13 +3297,15 @@ pub fn sys_sendto(
     } else {
         Some(read_socket_address(token, addr, addrlen)?)
     };
-    with_socket(fd, |socket| match socket.send_bytes(&data, remote) {
-        Ok(written) => Ok(written as isize),
-        Err(SysError::EPIPE) => {
-            current_add_signal(SignalFlags::SIGPIPE);
-            Err(SysError::EPIPE)
+    with_socket(fd, |socket| {
+        match socket.send_bytes(&data, remote, recv_nonblock(flags, socket)) {
+            Ok(written) => Ok(written as isize),
+            Err(SysError::EPIPE) => {
+                current_add_signal(SignalFlags::SIGPIPE);
+                Err(SysError::EPIPE)
+            }
+            Err(err) => Err(err),
         }
-        Err(err) => Err(err),
     })
 }
 
@@ -3345,7 +3473,7 @@ pub fn sys_sendmsg(fd: usize, msg: usize, _flags: i32) -> SysResult {
         let token = current_user_token();
         let msg = read_user_value(token, msg as *const LinuxMsghdr)?;
         let data = read_msg_iovecs(token, msg.msg_iov, msg.msg_iovlen)?;
-        return Ok(socket.send_bytes(&data, None)? as isize);
+        return Ok(socket.send_bytes(&data, None, false)? as isize);
     }
     // UNFINISHED: scatter/gather socket messages and control messages are not
     // implemented for the local loopback socket subset.
