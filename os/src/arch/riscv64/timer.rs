@@ -24,12 +24,18 @@ const NSEC_PER_SEC: u64 = 1_000_000_000;
 
 static EPOCH_OFFSET_NS: AtomicU64 = AtomicU64::new(0);
 
-fn get_time_nanos() -> u64 {
+pub fn monotonic_time_sec_nsec() -> (u64, u32) {
     let ticks = time::read() as u64;
     let freq = clock_freq() as u64;
     let secs = ticks / freq;
     let rem_ticks = ticks % freq;
-    secs * NSEC_PER_SEC + rem_ticks * NSEC_PER_SEC / freq
+    let nsecs = (rem_ticks * NSEC_PER_SEC / freq) as u32;
+    (secs, nsecs)
+}
+
+fn get_time_nanos() -> u64 {
+    let (secs, nsecs) = monotonic_time_sec_nsec();
+    secs * NSEC_PER_SEC + nsecs as u64
 }
 
 pub fn monotonic_time_nanos() -> u64 {

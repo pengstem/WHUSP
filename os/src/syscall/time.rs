@@ -1,3 +1,4 @@
+use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
     ProcessCpuTimesSnapshot, block_current_task_no_schedule, current_has_deliverable_signal,
@@ -5,7 +6,8 @@ use crate::task::{
 };
 use crate::timer::{
     add_posix_timer, add_real_timer, add_timer, get_time_clock_ticks, get_time_ms, get_time_us,
-    monotonic_time_nanos, set_wall_time_nanos, us_to_clock_ticks, wall_time_nanos,
+    monotonic_time_nanos, monotonic_time_sec_nsec, set_wall_time_nanos, us_to_clock_ticks,
+    wall_time_nanos,
 };
 use lazy_static::*;
 
@@ -672,9 +674,19 @@ fn sleep_until_clock(backend: ClockBackend, request: LinuxTimeSpec) -> SysResult
 }
 
 fn nanos_to_timespec(nanos: u64) -> LinuxTimeSpec {
+    perf::record_time_nanos_to_timespec_call();
     LinuxTimeSpec {
         tv_sec: (nanos / (NSEC_PER_SEC as u64)) as isize,
         tv_nsec: (nanos % (NSEC_PER_SEC as u64)) as isize,
+    }
+}
+
+fn monotonic_timespec() -> LinuxTimeSpec {
+    perf::record_time_direct_timespec_call();
+    let (sec, nsec) = monotonic_time_sec_nsec();
+    LinuxTimeSpec {
+        tv_sec: sec as isize,
+        tv_nsec: nsec as isize,
     }
 }
 
@@ -783,21 +795,25 @@ pub fn sys_clock_gettime(clock_id: i32, tp: *mut LinuxTimeSpec) -> SysResult {
     if tp.is_null() {
         return Err(SysError::EFAULT);
     }
-    if clock_id < 0 {
-        let timespec = dynamic_cpu_clock_timespec(clock_id)?;
-        write_user_value(current_user_token(), tp, &timespec)?;
-        return Ok(0);
-    }
-    let clock = ClockKind::from_raw(clock_id)?;
-    let timespec = match clock {
-        ClockKind::ProcessCpu => process_cpu_timespec(),
-        ClockKind::ThreadCpu => {
-            // UNFINISHED: Thread CPU time currently reuses process-wide
-            // trap-boundary accounting because per-thread CPU accounting is
-            // not represented separately in the task model yet.
-            process_cpu_timespec()
+    let timespec = if clock_id < 0 {
+        dynamic_cpu_clock_timespec(clock_id)?
+    } else {
+        match clock_id {
+            CLOCK_PROCESS_CPUTIME_ID => process_cpu_timespec(),
+            CLOCK_THREAD_CPUTIME_ID => {
+                // UNFINISHED: Thread CPU time currently reuses process-wide
+                // trap-boundary accounting because per-thread CPU accounting is
+                // not represented separately in the task model yet.
+                process_cpu_timespec()
+            }
+            CLOCK_REALTIME | CLOCK_REALTIME_COARSE => {
+                nanos_to_timespec(current_clock_nanos(ClockBackend::Wall))
+            }
+            CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
+                monotonic_timespec()
+            }
+            _ => return Err(SysError::EINVAL),
         }
-        _ => nanos_to_timespec(current_clock_nanos(clock.gettime_backend()?)),
     };
     write_user_value(current_user_token(), tp, &timespec)?;
     Ok(0)
