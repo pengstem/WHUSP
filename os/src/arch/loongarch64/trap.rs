@@ -86,6 +86,8 @@ pub fn trap_handler() -> ! {
             let syscall_pc = trap_pc;
             let (syscall_nr, syscall_args, syscall_sp) = {
                 let cx = current_trap_cx();
+                // Snapshot the contest LoongArch syscall ABI registers before
+                // ptrace stops or syscall handlers can mutate TrapContext.
                 (
                     cx.x[11],
                     [cx.x[4], cx.x[5], cx.x[6], cx.x[7], cx.x[8], cx.x[9]],
@@ -167,6 +169,8 @@ pub fn trap_handler() -> ! {
 pub(crate) fn handle_user_page_fault(addr: usize, access: MmapFaultAccess) -> bool {
     if access == MmapFaultAccess::Write {
         let process = current_process();
+        // Private COW pages are resolved before mmap faults so forked heap and
+        // anonymous mappings preserve copy-on-write semantics.
         if process
             .inner_exclusive_access()
             .memory_set

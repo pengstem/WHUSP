@@ -38,6 +38,8 @@ const MNT_FORCE: i32 = 1;
 const MNT_DETACH: i32 = 2;
 const MNT_EXPIRE: i32 = 4;
 const UMOUNT_NOFOLLOW: i32 = 8;
+// Keep this mask aligned with the flag-specific checks in sys_umount2(); LTP
+// covers both invalid bits and invalid MNT_EXPIRE combinations.
 const VALID_UMOUNT_FLAGS: i32 = MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW;
 const OPEN_TREE_CLONE: u32 = 0x1;
 const OPEN_TREE_CLOEXEC: u32 = OpenFlags::CLOEXEC.bits();
@@ -828,6 +830,8 @@ pub fn sys_umount2(target: *const u8, flags: i32) -> SysResult {
     let target = read_user_c_string(token, target, PATH_MAX)?;
     let process = current_process();
     let snapshot = process.path_snapshot();
+    // Check the final component before resolving it as a mount target so a
+    // symlink target fails with EINVAL instead of following into a mount.
     if flags & UMOUNT_NOFOLLOW != 0
         && lookup_path_in(snapshot.context.clone(), target.as_str(), false)?.kind
             == FsNodeKind::Symlink

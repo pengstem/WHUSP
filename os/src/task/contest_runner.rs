@@ -97,6 +97,9 @@ pub(super) fn build_runner_command() -> String {
     }
 
     let mut command = String::new();
+    // These exports are the ABI between the kernel-built command line and the
+    // mounted script disk. Rename them only together with `/x1/entry.sh` and
+    // the host-side scorer expectations.
     append_export(&mut command, "WHUSP_ARCH", RUNNER_ARCH);
     append_export(
         &mut command,

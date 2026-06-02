@@ -74,6 +74,8 @@ pub fn trap_handler() -> ! {
             let syscall_pc = trap_pc;
             let (syscall_nr, syscall_args, syscall_sp) = {
                 let cx = current_trap_cx();
+                // Snapshot the Linux RISC-V syscall ABI registers before
+                // ptrace stops or syscall handlers can mutate TrapContext.
                 (
                     cx.x[17],
                     [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]],
@@ -191,6 +193,8 @@ pub fn trap_handler() -> ! {
 pub(crate) fn handle_user_page_fault(addr: usize, access: MmapFaultAccess) -> bool {
     if access == MmapFaultAccess::Write {
         let process = current_process();
+        // Private COW pages are resolved before mmap faults so forked heap and
+        // anonymous mappings preserve copy-on-write semantics.
         if process
             .inner_exclusive_access()
             .memory_set

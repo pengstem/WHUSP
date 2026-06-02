@@ -148,6 +148,9 @@ fn validate_clone3_args(args: LinuxCloneArgs, token: usize) -> SysResult<()> {
         return Err(SysError::EINVAL);
     }
     if args.set_tid != 0 || args.set_tid_size != 0 {
+        // UNFINISHED: Linux clone3 can request specific PIDs through set_tid
+        // arrays across PID namespaces. This kernel allocates Linux-visible
+        // PIDs/TIDs internally and does not support caller-selected IDs.
         return Err(SysError::EINVAL);
     }
     if args.exit_signal >= SIGNAL_INFO_SLOTS {
@@ -270,6 +273,9 @@ fn sys_clone_process_inner(
         write_user_value_to_process(&new_process, args.ctid as *mut i32, &(new_pid as i32))?;
     }
     if let Some(fd) = reserved_pidfd {
+        // The fd number is reserved before publication and installed only
+        // after clone metadata writes have succeeded, so a requested pidfd does
+        // not expose a partially initialized child.
         install_reserved_pidfd_for_current_process(fd, new_pid);
     }
     let child_task = new_process.main_task();

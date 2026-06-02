@@ -510,6 +510,9 @@ fn futex_wait(
 
     let task_cx_ptr = {
         let mut manager = FUTEX_MANAGER.exclusive_access();
+        // Value check and enqueue are one critical section: a wake that runs
+        // after the user word changes must either see the queued waiter or the
+        // waiter must return EAGAIN before sleeping.
         if read_futex_word(addr)? != expected {
             return Err(SysError::EAGAIN);
         }
@@ -781,6 +784,8 @@ pub(crate) fn clear_child_tid_and_wake(token: usize, process_id: usize, addr: us
     if addr == 0 {
         return;
     }
+    // Called during task exit while the dying task's address space is still
+    // available; after the zero store, wake joiners on the futex word.
     if write_user_value(token, addr as *mut i32, &0).is_err() {
         return;
     }

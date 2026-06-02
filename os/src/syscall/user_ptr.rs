@@ -97,6 +97,9 @@ fn checked_user_pte(
     access: UserBufferAccess,
     fault_handler: Option<UserFaultHandler>,
 ) -> SysResult<crate::mm::PageTableEntry> {
+    // Passing a fault handler means the copy is allowed to mutate the current
+    // process mappings by resolving lazy mmap/COW faults. Cross-address-space
+    // copies should use the explicit MemorySet helpers instead.
     let vpn = VirtAddr::from(addr).floor();
     let mut pte = match page_table.translate(vpn) {
         Some(pte) => pte,
@@ -113,6 +116,8 @@ fn checked_user_pte(
     let reject_zero_ppn = fault_handler.is_some();
     if !user_pte_allows(pte, access, reject_zero_ppn) {
         if access == UserBufferAccess::Write && pte.cow() && !pte.writable() {
+            // COW resolution precedes the generic mmap hook so fork-private
+            // pages become writable instead of being reported as EFAULT.
             if !resolve_current_cow_page(token, addr) {
                 return Err(SysError::EFAULT);
             }
@@ -464,7 +469,7 @@ pub(crate) fn copy_to_user_in_memory_set(
     perf::record_usercopy_site(perf::UsercopySite::CopyToUserInMemorySet, src.len());
     // Used for child or freshly exec'd address spaces, not necessarily the
     // current task. Resolve COW against the supplied MemorySet before translating
-    // through its token.
+    // through its token, and do not invoke the current-task mmap fault handler.
     resolve_cow_write_range_in_memory_set(memory_set, ptr, src.len())?;
     let buffers = translated_byte_buffer_checked(
         memory_set.token(),

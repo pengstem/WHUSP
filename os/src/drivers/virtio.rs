@@ -67,6 +67,8 @@ unsafe impl Hal for VirtioHal {
     }
 
     unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> VirtioPhysAddr {
+        // Virtio buffers are kernel virtual addresses. Translate through the
+        // kernel page table instead of assuming direct virtual=physical layout.
         virt_to_phys(buffer.as_ptr() as *mut u8 as usize) as VirtioPhysAddr
     }
 

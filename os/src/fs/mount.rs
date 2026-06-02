@@ -50,8 +50,14 @@ enum MountTarget {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DynamicMount {
+    // The namespace-local overlay entry. Backend ownership stays in MOUNTS via
+    // source_mount_id; cloning a namespace clones these records, not disks.
     namespace_id: MountNamespaceId,
+    // `target` is VFS lookup identity, while `target_path` is the normalized
+    // Linux-visible path needed for propagation and /proc mountinfo output.
     target: MountTarget,
+    // Parent of the covered directory, used to implement `..` from a mounted
+    // root without teaching every backend about mount overlays.
     covered_parent: VfsNodeId,
     source_mount_id: MountId,
     source_root: VfsNodeId,
@@ -63,10 +69,14 @@ struct DynamicMount {
     event_id: usize,
     propagation_parent_path: String,
     propagation_parent_group: Option<usize>,
+    // Private/shared/slave/unbindable state is tracked on overlay records so
+    // mount propagation can be handled without duplicating backend instances.
     propagation: MountPropagation,
     peer_group: Option<usize>,
     master_group: Option<usize>,
     uncloned_subtree_suffixes: Vec<String>,
+    // MNT_EXPIRE is stateful: the first umount marks this bit and returns
+    // EAGAIN; the next matching umount is allowed to remove the mount.
     expires_on_next_umount: bool,
 }
 
@@ -413,6 +423,9 @@ pub(super) fn mount_exists(mount_id: MountId) -> bool {
 pub(crate) fn clone_mount_namespace(source_namespace_id: MountNamespaceId) -> MountNamespaceId {
     let namespace_id = MountNamespaceId(NEXT_MOUNT_NAMESPACE_ID.fetch_add(1, Ordering::SeqCst));
     DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        // Namespace cloning duplicates only the overlay graph. MountedFs
+        // backends and open files remain shared unless a later mount event
+        // installs a different source in the child namespace.
         let cloned_mounts: Vec<_> = mounts
             .iter()
             .filter(|mount| mount.namespace_id == source_namespace_id)
