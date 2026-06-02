@@ -1,12 +1,17 @@
 use crate::config::PAGE_SIZE;
 use crate::sync::UPIntrFreeCell;
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 use lazy_static::*;
 
 pub(crate) const BLOCK_CACHE_LINE_SIZE: usize = 512;
 const DEFAULT_BLOCK_CACHE_CAPACITY: usize = 1024;
+const READ_CACHE_LINE_BLOCKS: usize = PAGE_SIZE / BLOCK_CACHE_LINE_SIZE;
+const READ_CACHE_LINE_SIZE: usize = READ_CACHE_LINE_BLOCKS * BLOCK_CACHE_LINE_SIZE;
+const DEFAULT_READ_CACHE_CAPACITY: usize = 2048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct BlockCacheKey {
@@ -35,9 +40,41 @@ impl BlockCacheLine {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ReadCacheKey {
+    device_key: usize,
+    line_block_id: usize,
+}
+
+impl ReadCacheKey {
+    fn new(device_key: usize, line_block_id: usize) -> Self {
+        Self {
+            device_key,
+            line_block_id,
+        }
+    }
+}
+
+struct ReadCacheLine {
+    data: Box<[u8]>,
+    lru_stamp: usize,
+}
+
+impl ReadCacheLine {
+    fn new(data: Box<[u8]>, lru_stamp: usize) -> Self {
+        Self { data, lru_stamp }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct BlockCacheLruEntry {
     stamp: usize,
     key: BlockCacheKey,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ReadCacheLruEntry {
+    stamp: usize,
+    key: ReadCacheKey,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -45,6 +82,15 @@ pub(crate) struct BlockCacheStats {
     pub(crate) enabled: bool,
     pub(crate) entries: usize,
     pub(crate) capacity: usize,
+    pub(crate) read4k_entries: usize,
+    pub(crate) read4k_capacity: usize,
+    pub(crate) read4k_hit: usize,
+    pub(crate) read4k_miss: usize,
+    pub(crate) read4k_fill: usize,
+    pub(crate) read4k_evict: usize,
+    pub(crate) read4k_invalidate: usize,
+    pub(crate) read4k_fallback: usize,
+    pub(crate) read4k_lru_touch: usize,
     pub(crate) read_hit: usize,
     pub(crate) read_miss: usize,
     pub(crate) read_fill_sessions: usize,
@@ -69,6 +115,10 @@ struct BlockCache {
     lines: BTreeMap<BlockCacheKey, BlockCacheLine>,
     lru: BTreeSet<BlockCacheLruEntry>,
     lru_clock: usize,
+    read_capacity: usize,
+    read_lines: BTreeMap<ReadCacheKey, ReadCacheLine>,
+    read_lru: BTreeSet<ReadCacheLruEntry>,
+    read_lru_clock: usize,
     stats: BlockCacheStats,
 }
 
@@ -80,9 +130,14 @@ impl BlockCache {
             lines: BTreeMap::new(),
             lru: BTreeSet::new(),
             lru_clock: 0,
+            read_capacity: DEFAULT_READ_CACHE_CAPACITY,
+            read_lines: BTreeMap::new(),
+            read_lru: BTreeSet::new(),
+            read_lru_clock: 0,
             stats: BlockCacheStats {
                 enabled: true,
                 capacity,
+                read4k_capacity: DEFAULT_READ_CACHE_CAPACITY,
                 ..BlockCacheStats::default()
             },
         }
@@ -99,6 +154,17 @@ impl BlockCache {
         stamp
     }
 
+    fn touch_read4k(&mut self, key: ReadCacheKey, old_stamp: Option<usize>) -> usize {
+        self.stats.read4k_lru_touch += 1;
+        if let Some(stamp) = old_stamp {
+            self.read_lru.remove(&ReadCacheLruEntry { stamp, key });
+        }
+        self.read_lru_clock = self.read_lru_clock.wrapping_add(1);
+        let stamp = self.read_lru_clock;
+        self.read_lru.insert(ReadCacheLruEntry { stamp, key });
+        stamp
+    }
+
     fn trim_to_capacity(&mut self) {
         while self.lines.len() > self.capacity {
             let Some(victim) = self.lru.iter().next().copied() else {
@@ -109,6 +175,89 @@ impl BlockCache {
                 self.stats.evict += 1;
             }
         }
+    }
+
+    fn trim_read4k_to_capacity(&mut self) {
+        while self.read_lines.len() > self.read_capacity {
+            let Some(victim) = self.read_lru.iter().next().copied() else {
+                break;
+            };
+            self.read_lru.remove(&victim);
+            if self.read_lines.remove(&victim.key).is_some() {
+                self.stats.read4k_evict += 1;
+            }
+        }
+    }
+
+    fn read4k_or_miss(&mut self, device_key: usize, block_id: usize, buf: &mut [u8]) -> bool {
+        debug_assert_eq!(buf.len(), READ_CACHE_LINE_SIZE);
+        if !self.enabled || self.read_capacity == 0 {
+            return false;
+        }
+        let key = ReadCacheKey::new(device_key, block_id);
+        if let Some(line) = self.read_lines.get(&key) {
+            debug_assert_eq!(line.data.len(), READ_CACHE_LINE_SIZE);
+            buf.copy_from_slice(line.data.as_ref());
+            let old_stamp = line.lru_stamp;
+            self.stats.read4k_hit += 1;
+            let stamp = self.touch_read4k(key, Some(old_stamp));
+            if let Some(line) = self.read_lines.get_mut(&key) {
+                line.lru_stamp = stamp;
+            }
+            return true;
+        }
+        self.stats.read4k_miss += 1;
+        false
+    }
+
+    fn insert_read4k(&mut self, device_key: usize, block_id: usize, data: &[u8]) {
+        debug_assert_eq!(data.len(), READ_CACHE_LINE_SIZE);
+        if !self.enabled || self.read_capacity == 0 {
+            return;
+        }
+        let key = ReadCacheKey::new(device_key, block_id);
+        let old_stamp = self.read_lines.get(&key).map(|line| line.lru_stamp);
+        let stamp = self.touch_read4k(key, old_stamp);
+        self.read_lines.insert(
+            key,
+            ReadCacheLine::new(data.to_vec().into_boxed_slice(), stamp),
+        );
+        self.stats.read4k_fill += 1;
+        self.trim_read4k_to_capacity();
+    }
+
+    fn invalidate_read4k_range(&mut self, device_key: usize, block_id: usize, blocks: usize) {
+        if !self.enabled || blocks == 0 {
+            return;
+        }
+        let end_block = block_id.saturating_add(blocks);
+        let victims: Vec<ReadCacheKey> = self
+            .read_lines
+            .keys()
+            .copied()
+            .filter(|key| {
+                key.device_key == device_key
+                    && ranges_overlap(
+                        key.line_block_id,
+                        key.line_block_id.saturating_add(READ_CACHE_LINE_BLOCKS),
+                        block_id,
+                        end_block,
+                    )
+            })
+            .collect();
+        for key in victims {
+            if let Some(line) = self.read_lines.remove(&key) {
+                self.read_lru.remove(&ReadCacheLruEntry {
+                    stamp: line.lru_stamp,
+                    key,
+                });
+                self.stats.read4k_invalidate += 1;
+            }
+        }
+    }
+
+    fn record_read4k_fallback(&mut self) {
+        self.stats.read4k_fallback += 1;
     }
 
     fn read_or_miss_run(
@@ -233,6 +382,8 @@ impl BlockCache {
             enabled: self.enabled,
             entries: self.lines.len(),
             capacity: self.capacity,
+            read4k_entries: self.read_lines.len(),
+            read4k_capacity: self.read_capacity,
             ..self.stats
         }
     }
@@ -257,6 +408,18 @@ fn cache_read_or_miss_run(
         .read_or_miss_run(device_key, block_id, max_blocks, first_buf)
 }
 
+fn cache_read4k_or_miss(device_key: usize, block_id: usize, buf: &mut [u8]) -> bool {
+    BLOCK_CACHE
+        .exclusive_access()
+        .read4k_or_miss(device_key, block_id, buf)
+}
+
+fn cache_insert_read4k(device_key: usize, block_id: usize, data: &[u8]) {
+    BLOCK_CACHE
+        .exclusive_access()
+        .insert_read4k(device_key, block_id, data);
+}
+
 fn cache_insert_read_run(device_key: usize, block_id: usize, data: &[u8]) {
     BLOCK_CACHE
         .exclusive_access()
@@ -267,6 +430,12 @@ fn cache_update_after_write_run(device_key: usize, block_id: usize, data: &[u8])
     BLOCK_CACHE
         .exclusive_access()
         .update_after_write_run(device_key, block_id, data);
+}
+
+fn cache_invalidate_read4k_range(device_key: usize, block_id: usize, blocks: usize) {
+    BLOCK_CACHE
+        .exclusive_access()
+        .invalidate_read4k_range(device_key, block_id, blocks);
 }
 
 fn cache_invalidate_key_after_write(device_key: usize, block_id: usize) {
@@ -292,6 +461,10 @@ fn record_bypass_unaligned() {
     BLOCK_CACHE.exclusive_access().record_bypass_unaligned();
 }
 
+fn record_read4k_fallback() {
+    BLOCK_CACHE.exclusive_access().record_read4k_fallback();
+}
+
 fn page_bounded_full_blocks(buf: &[u8], max_blocks: usize) -> usize {
     if max_blocks == 0 {
         return 0;
@@ -301,6 +474,15 @@ fn page_bounded_full_blocks(buf: &[u8], max_blocks: usize) -> usize {
     (page_remaining / BLOCK_CACHE_LINE_SIZE)
         .max(1)
         .min(max_blocks)
+}
+
+fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
+fn can_use_read4k(_block_id: usize, buf: &[u8], remaining_blocks: usize) -> bool {
+    remaining_blocks >= READ_CACHE_LINE_BLOCKS
+        && page_bounded_full_blocks(buf, remaining_blocks) >= READ_CACHE_LINE_BLOCKS
 }
 
 pub(crate) fn read_with_cache<F>(
@@ -316,6 +498,21 @@ pub(crate) fn read_with_cache<F>(
     let mut index = 0;
     while index < full_blocks {
         let start = index * BLOCK_CACHE_LINE_SIZE;
+        if can_use_read4k(
+            block_id + index,
+            &buf[start..full_bytes],
+            full_blocks - index,
+        ) {
+            let end = start + READ_CACHE_LINE_SIZE;
+            if !cache_read4k_or_miss(device_key, block_id + index, &mut buf[start..end]) {
+                record_device_read_submit(READ_CACHE_LINE_BLOCKS);
+                read_uncached(block_id + index, &mut buf[start..end]);
+                cache_insert_read4k(device_key, block_id + index, &buf[start..end]);
+            }
+            index += READ_CACHE_LINE_BLOCKS;
+            continue;
+        }
+        record_read4k_fallback();
         let max_blocks = page_bounded_full_blocks(&buf[start..full_bytes], full_blocks - index);
         match cache_read_or_miss_run(
             device_key,
@@ -361,6 +558,7 @@ pub(crate) fn write_with_cache<F>(
         let end = start + blocks * BLOCK_CACHE_LINE_SIZE;
         record_device_write_submit(blocks);
         write_uncached(block_id + index, &buf[start..end]);
+        cache_invalidate_read4k_range(device_key, block_id + index, blocks);
         cache_update_after_write_run(device_key, block_id + index, &buf[start..end]);
         index += blocks;
     }
@@ -370,6 +568,7 @@ pub(crate) fn write_with_cache<F>(
         record_bypass_unaligned();
         record_device_write_submit(1);
         write_uncached(block_id + full_blocks, tail);
+        cache_invalidate_read4k_range(device_key, block_id + full_blocks, 1);
         cache_invalidate_key_after_write(device_key, block_id + full_blocks);
     }
 }
@@ -381,10 +580,19 @@ pub(crate) fn stats_snapshot() -> BlockCacheStats {
 pub(crate) fn stats_content() -> String {
     let stats = stats_snapshot();
     format!(
-        "enabled {}\nentries {}\ncapacity {}\nread_hit {}\nread_miss {}\nread_fill_sessions {}\nwrite_update {}\nwrite_update_sessions {}\nwrite_invalidate {}\nevict {}\ndevice_read_submit {}\ndevice_read_blocks {}\ndevice_read_max_blocks {}\ndevice_write_submit {}\ndevice_write_blocks {}\ndevice_write_max_blocks {}\nbypass_unaligned {}\nlru_touch {}\nlru_scan_slots {}\n",
+        "enabled {}\nentries {}\ncapacity {}\nread4k_entries {}\nread4k_capacity {}\nread4k_hit {}\nread4k_miss {}\nread4k_fill {}\nread4k_evict {}\nread4k_invalidate {}\nread4k_fallback {}\nread4k_lru_touch {}\nread_hit {}\nread_miss {}\nread_fill_sessions {}\nwrite_update {}\nwrite_update_sessions {}\nwrite_invalidate {}\nevict {}\ndevice_read_submit {}\ndevice_read_blocks {}\ndevice_read_max_blocks {}\ndevice_write_submit {}\ndevice_write_blocks {}\ndevice_write_max_blocks {}\nbypass_unaligned {}\nlru_touch {}\nlru_scan_slots {}\n",
         stats.enabled as usize,
         stats.entries,
         stats.capacity,
+        stats.read4k_entries,
+        stats.read4k_capacity,
+        stats.read4k_hit,
+        stats.read4k_miss,
+        stats.read4k_fill,
+        stats.read4k_evict,
+        stats.read4k_invalidate,
+        stats.read4k_fallback,
+        stats.read4k_lru_touch,
         stats.read_hit,
         stats.read_miss,
         stats.read_fill_sessions,

@@ -1745,6 +1745,15 @@ fn oskernel_perf_content() -> String {
          block_cache_enabled {}\n\
          block_cache_entries {}\n\
          block_cache_capacity {}\n\
+         block_cache_read4k_entries {}\n\
+         block_cache_read4k_capacity {}\n\
+         block_cache_read4k_hit {}\n\
+         block_cache_read4k_miss {}\n\
+         block_cache_read4k_fill {}\n\
+         block_cache_read4k_evict {}\n\
+         block_cache_read4k_invalidate {}\n\
+         block_cache_read4k_fallback {}\n\
+         block_cache_read4k_lru_touch {}\n\
          block_cache_read_hit {}\n\
          block_cache_read_miss {}\n\
          block_cache_read_fill_sessions {}\n\
@@ -1817,6 +1826,15 @@ fn oskernel_perf_content() -> String {
         block.enabled as usize,
         block.entries,
         block.capacity,
+        block.read4k_entries,
+        block.read4k_capacity,
+        block.read4k_hit,
+        block.read4k_miss,
+        block.read4k_fill,
+        block.read4k_evict,
+        block.read4k_invalidate,
+        block.read4k_fallback,
+        block.read4k_lru_touch,
         block.read_hit,
         block.read_miss,
         block.read_fill_sessions,
