@@ -154,6 +154,9 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) vma_lookup_calls: usize,
     pub(crate) vma_lookup_hits: usize,
     pub(crate) vma_lookup_area_probes: usize,
+    pub(crate) vma_range_scans: usize,
+    pub(crate) vma_range_area_visits: usize,
+    pub(crate) vma_range_index_skips: usize,
     pub(crate) user_c_string_calls: usize,
     pub(crate) user_c_string_page_chunks: usize,
     pub(crate) user_c_string_scanned_bytes: usize,
@@ -365,6 +368,9 @@ mod enabled {
     static VMA_LOOKUP_CALLS: AtomicUsize = AtomicUsize::new(0);
     static VMA_LOOKUP_HITS: AtomicUsize = AtomicUsize::new(0);
     static VMA_LOOKUP_AREA_PROBES: AtomicUsize = AtomicUsize::new(0);
+    static VMA_RANGE_SCANS: AtomicUsize = AtomicUsize::new(0);
+    static VMA_RANGE_AREA_VISITS: AtomicUsize = AtomicUsize::new(0);
+    static VMA_RANGE_INDEX_SKIPS: AtomicUsize = AtomicUsize::new(0);
     static USER_C_STRING_CALLS: AtomicUsize = AtomicUsize::new(0);
     static USER_C_STRING_PAGE_CHUNKS: AtomicUsize = AtomicUsize::new(0);
     static USER_C_STRING_SCANNED_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -860,6 +866,12 @@ mod enabled {
         }
     }
 
+    pub(crate) fn record_vma_range_scan(area_visits: usize, index_skips: usize) {
+        VMA_RANGE_SCANS.fetch_add(1, Ordering::Relaxed);
+        VMA_RANGE_AREA_VISITS.fetch_add(area_visits, Ordering::Relaxed);
+        VMA_RANGE_INDEX_SKIPS.fetch_add(index_skips, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_user_c_string_call() {
         USER_C_STRING_CALLS.fetch_add(1, Ordering::Relaxed);
     }
@@ -1163,6 +1175,9 @@ mod enabled {
             vma_lookup_calls: VMA_LOOKUP_CALLS.load(Ordering::Relaxed),
             vma_lookup_hits: VMA_LOOKUP_HITS.load(Ordering::Relaxed),
             vma_lookup_area_probes: VMA_LOOKUP_AREA_PROBES.load(Ordering::Relaxed),
+            vma_range_scans: VMA_RANGE_SCANS.load(Ordering::Relaxed),
+            vma_range_area_visits: VMA_RANGE_AREA_VISITS.load(Ordering::Relaxed),
+            vma_range_index_skips: VMA_RANGE_INDEX_SKIPS.load(Ordering::Relaxed),
             user_c_string_calls: USER_C_STRING_CALLS.load(Ordering::Relaxed),
             user_c_string_page_chunks: USER_C_STRING_PAGE_CHUNKS.load(Ordering::Relaxed),
             user_c_string_scanned_bytes: USER_C_STRING_SCANNED_BYTES.load(Ordering::Relaxed),
@@ -1376,6 +1391,9 @@ mod enabled {
          vma_lookup_calls {}\n\
          vma_lookup_hits {}\n\
          vma_lookup_area_probes {}\n\
+         vma_range_scans {}\n\
+         vma_range_area_visits {}\n\
+         vma_range_index_skips {}\n\
          user_c_string_calls {}\n\
          user_c_string_page_chunks {}\n\
          user_c_string_scanned_bytes {}\n\
@@ -1571,6 +1589,9 @@ mod enabled {
             stats.vma_lookup_calls,
             stats.vma_lookup_hits,
             stats.vma_lookup_area_probes,
+            stats.vma_range_scans,
+            stats.vma_range_area_visits,
+            stats.vma_range_index_skips,
             stats.user_c_string_calls,
             stats.user_c_string_page_chunks,
             stats.user_c_string_scanned_bytes,
@@ -1927,6 +1948,9 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_vma_lookup(_area_probes: usize, _hit: bool) {}
+
+    #[inline(always)]
+    pub(crate) fn record_vma_range_scan(_area_visits: usize, _index_skips: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_user_c_string_call() {}

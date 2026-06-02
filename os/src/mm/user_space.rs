@@ -663,9 +663,15 @@ impl MemorySet {
 
         let mut flushes = Vec::new();
         let mut unmapped = false;
-        let mut idx = 0;
+        let mut idx = self.first_area_idx_ending_after(start_vpn);
+        let index_skips = idx;
+        let mut area_visits = 0usize;
         while idx < self.areas.len() {
             let area_start = self.areas[idx].vpn_range.get_start();
+            if area_start >= end_vpn {
+                break;
+            }
+            area_visits += 1;
             let area_end = self.areas[idx].vpn_range.get_end();
             if area_start < end_vpn && area_end > start_vpn {
                 let mut area = self.areas.remove(idx);
@@ -682,6 +688,7 @@ impl MemorySet {
                 idx += 1;
             }
         }
+        perf::record_vma_range_scan(area_visits, index_skips);
         if unmapped {
             arch_mm::flush_tlb_all();
         }
@@ -1059,9 +1066,15 @@ impl MemorySet {
 
         let mut flushes = Vec::new();
         let mut unmapped = false;
-        let mut idx = 0;
+        let mut idx = self.first_area_idx_ending_after(start_vpn);
+        let index_skips = idx;
+        let mut area_visits = 0usize;
         while idx < self.areas.len() {
             let area_start = self.areas[idx].vpn_range.get_start();
+            if area_start >= end_vpn {
+                break;
+            }
+            area_visits += 1;
             let area_end = self.areas[idx].vpn_range.get_end();
             if self.areas[idx].is_mmap() && area_start >= start_vpn && area_end <= end_vpn {
                 let mut area = self.areas.remove(idx);
@@ -1072,6 +1085,7 @@ impl MemorySet {
                 idx += 1;
             }
         }
+        perf::record_vma_range_scan(area_visits, index_skips);
         if unmapped {
             flush_tlb_vpn_range(start_vpn, end_vpn);
         }
@@ -1095,13 +1109,17 @@ impl MemorySet {
         }
 
         let mut flushes = Vec::new();
-        for area in &self.areas {
+        let (start_idx, end_idx) = self.overlap_area_idx_bounds(start_vpn, end_vpn);
+        let mut area_visits = 0usize;
+        for area in &self.areas[start_idx..end_idx] {
+            area_visits += 1;
             let area_start = area.vpn_range.get_start();
             let area_end = area.vpn_range.get_end();
             if area.is_mmap() && area_start < end_vpn && area_end > start_vpn {
                 flushes.extend(area.collect_mmap_flushes(&self.page_table));
             }
         }
+        perf::record_vma_range_scan(area_visits, start_idx);
         Some(flushes)
     }
 
@@ -1135,7 +1153,10 @@ impl MemorySet {
         self.split_area_at(end_vpn);
 
         let mut touched = false;
-        for area in &mut self.areas {
+        let (start_idx, end_idx) = self.overlap_area_idx_bounds(start_vpn, end_vpn);
+        let mut area_visits = 0usize;
+        for area in &mut self.areas[start_idx..end_idx] {
+            area_visits += 1;
             let area_start = area.vpn_range.get_start();
             let area_end = area.vpn_range.get_end();
             if area_start >= start_vpn && area_end <= end_vpn {
@@ -1145,6 +1166,7 @@ impl MemorySet {
                 touched = true;
             }
         }
+        perf::record_vma_range_scan(area_visits, start_idx);
         if !touched {
             return Err(MemoryProtectError::Unmapped);
         }
@@ -1711,17 +1733,42 @@ impl MemorySet {
 
     fn range_is_mapped_vpn(&self, start: super::VirtPageNum, end: super::VirtPageNum) -> bool {
         let mut cursor = start;
+        let mut idx = self.first_area_idx_ending_after(start);
         while cursor < end {
-            let Some(idx) = self.find_area_idx_containing(cursor) else {
+            let Some(area) = self.areas.get(idx) else {
                 return false;
             };
-            let area_end = self.areas[idx].vpn_range.get_end();
-            if area_end <= cursor {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            if area_start > cursor || area_end <= cursor {
                 return false;
             }
             cursor = area_end.min(end);
+            idx += 1;
         }
         true
+    }
+
+    fn first_area_idx_ending_after(&self, start: super::VirtPageNum) -> usize {
+        let idx = self.area_insert_index(start);
+        if idx > 0 && self.areas[idx - 1].vpn_range.get_end() > start {
+            idx - 1
+        } else {
+            idx
+        }
+    }
+
+    fn overlap_area_idx_bounds(
+        &self,
+        start: super::VirtPageNum,
+        end: super::VirtPageNum,
+    ) -> (usize, usize) {
+        if start >= end {
+            return (0, 0);
+        }
+        let start_idx = self.first_area_idx_ending_after(start);
+        let end_idx = self.area_insert_index(end);
+        (start_idx.min(end_idx), end_idx)
     }
 
     fn split_area_at(&mut self, at: super::VirtPageNum) {
@@ -1743,24 +1790,32 @@ impl MemorySet {
     }
 
     fn can_mprotect_write(&self, start: super::VirtPageNum, end: super::VirtPageNum) -> bool {
-        self.areas
-            .iter()
-            .filter(|area| {
-                let area_start = area.vpn_range.get_start();
-                let area_end = area.vpn_range.get_end();
-                area_start < end && area_end > start
-            })
-            .all(|area| {
-                let Some(info) = &area.mmap_info else {
-                    return true;
-                };
-                if !info.shared {
-                    return true;
-                }
-                info.backing_file
-                    .as_ref()
-                    .is_none_or(|file| file.writable() && !file.blocks_shared_writable_mmap())
-            })
+        let (start_idx, end_idx) = self.overlap_area_idx_bounds(start, end);
+        let mut area_visits = 0usize;
+        for area in &self.areas[start_idx..end_idx] {
+            area_visits += 1;
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            if !(area_start < end && area_end > start) {
+                continue;
+            }
+            let Some(info) = &area.mmap_info else {
+                continue;
+            };
+            if !info.shared {
+                continue;
+            }
+            if info
+                .backing_file
+                .as_ref()
+                .is_some_and(|file| !file.writable() || file.blocks_shared_writable_mmap())
+            {
+                perf::record_vma_range_scan(area_visits, start_idx);
+                return false;
+            }
+        }
+        perf::record_vma_range_scan(area_visits, start_idx);
+        true
     }
 
     fn grow_down_mmap_area_for_fault(
