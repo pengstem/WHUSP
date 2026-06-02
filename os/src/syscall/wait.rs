@@ -1,9 +1,10 @@
 use crate::mm::MemorySet;
+use crate::perf;
 use crate::syscall::user_ptr::{write_user_value, write_user_value_in_memory_set};
 use crate::task::{
-    CLD_CONTINUED, CLD_STOPPED, ProcessControlBlock, SIGCHLD, SIGCONT, SignalInfo,
-    block_current_task_no_schedule, current_process, current_task, current_user_token, pid2process,
-    ptrace_take_wait_status, remove_from_pid2process, schedule, signal_child_status,
+    CLD_CONTINUED, CLD_STOPPED, ProcessControlBlock, ProcessCpuTimesSnapshot, SIGCHLD, SIGCONT,
+    SignalInfo, block_current_task_no_schedule, current_process, current_task, current_user_token,
+    pid2process, ptrace_take_wait_status, remove_from_pid2process, schedule, signal_child_status,
     signal_wait_status, task_has_wait_interrupt_signal, wakeup_task,
 };
 use alloc::sync::Arc;
@@ -238,6 +239,105 @@ fn write_waitid_siginfo(
     Ok(())
 }
 
+struct WaitZombie {
+    idx: usize,
+    pid: usize,
+    exit_code: i32,
+    child_times: ProcessCpuTimesSnapshot,
+}
+
+struct Wait4ChildScan {
+    matched: bool,
+    stopped: Option<(usize, i32)>,
+    zombie: Option<WaitZombie>,
+}
+
+fn scan_wait4_children(
+    children: &[Arc<ProcessControlBlock>],
+    pid: isize,
+    caller_pgid: usize,
+    waiter_pid: usize,
+    include_untraced: bool,
+) -> Wait4ChildScan {
+    perf::record_wait_child_scan(children.len());
+    let mut scan = Wait4ChildScan {
+        matched: false,
+        stopped: None,
+        zombie: None,
+    };
+    for (idx, child) in children.iter().enumerate() {
+        if !wait4_child_matches(child, pid, caller_pgid) {
+            continue;
+        }
+        scan.matched = true;
+        if scan.stopped.is_none()
+            && let Some(status) = ptrace_take_wait_status(child, waiter_pid, include_untraced)
+        {
+            scan.stopped = Some((child.getpid(), status));
+        }
+        if scan.zombie.is_none() {
+            let child_inner = child.inner_exclusive_access();
+            if child_inner.is_zombie {
+                scan.zombie = Some(WaitZombie {
+                    idx,
+                    pid: child.getpid(),
+                    exit_code: child_inner.exit_code,
+                    child_times: child_inner.cpu_times.snapshot(),
+                });
+            }
+        }
+    }
+    scan
+}
+
+struct WaitidChildScan {
+    matched: bool,
+    stopped: Option<(usize, usize, i32)>,
+    continued: Option<(usize, usize)>,
+    zombie: Option<WaitZombie>,
+}
+
+fn scan_waitid_children(
+    children: &[Arc<ProcessControlBlock>],
+    idtype: i32,
+    id: i32,
+    caller_pgid: usize,
+    options: i32,
+) -> WaitidChildScan {
+    perf::record_wait_child_scan(children.len());
+    let mut scan = WaitidChildScan {
+        matched: false,
+        stopped: None,
+        continued: None,
+        zombie: None,
+    };
+    for (idx, child) in children.iter().enumerate() {
+        if !waitid_child_matches(child, idtype, id, caller_pgid) {
+            continue;
+        }
+        scan.matched = true;
+        let child_inner = child.inner_exclusive_access();
+        if scan.stopped.is_none()
+            && options & WUNTRACED != 0
+            && let Some(status) = child_inner.wait_stop_status
+        {
+            scan.stopped = Some((idx, child.getpid(), status));
+        }
+        if scan.continued.is_none() && options & WCONTINUED != 0 && child_inner.wait_continued {
+            scan.continued = Some((idx, child.getpid()));
+        }
+        if scan.zombie.is_none() && options & WEXITED != 0 && child_inner.is_zombie {
+            scan.zombie = Some(WaitZombie {
+                idx,
+                pid: child.getpid(),
+                exit_code: child_inner.exit_code,
+                child_times: child_inner.cpu_times.snapshot(),
+            });
+        }
+    }
+    scan
+}
+
 /// Waits for and reaps a matching child process using Linux wait4 status rules.
 ///
 /// Reaping removes the child from both PID lookup and the parent's child list;
@@ -257,11 +357,14 @@ pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsag
         let waiter_pid = process.getpid();
         let caller_pgid = process.process_group_id();
         let mut inner = process.inner_exclusive_access();
-        if !inner
-            .children
-            .iter()
-            .any(|child| wait4_child_matches(child, pid, caller_pgid))
-        {
+        let scan = scan_wait4_children(
+            &inner.children,
+            pid,
+            caller_pgid,
+            waiter_pid,
+            options & WUNTRACED != 0,
+        );
+        if !scan.matched {
             if let Some((tracee_pid, status)) = ptrace_wait4_target(pid, waiter_pid) {
                 if !wstatus.is_null() {
                     write_user_value_in_memory_set(&mut inner.memory_set, wstatus, &status)?;
@@ -272,14 +375,7 @@ pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsag
             return Err(SysError::ECHILD);
         }
 
-        let stopped = inner.children.iter().find_map(|child| {
-            if !wait4_child_matches(child, pid, caller_pgid) {
-                return None;
-            }
-            ptrace_take_wait_status(child, waiter_pid, options & WUNTRACED != 0)
-                .map(|status| (child.getpid(), status))
-        });
-        if let Some((found_pid, status)) = stopped {
+        if let Some((found_pid, status)) = scan.stopped {
             if !wstatus.is_null() {
                 write_user_value_in_memory_set(&mut inner.memory_set, wstatus, &status)?;
             }
@@ -287,36 +383,25 @@ pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsag
             return Ok(found_pid as isize);
         }
 
-        let zombie = inner.children.iter().enumerate().find(|(_, child)| {
-            wait4_child_matches(child, pid, caller_pgid) && child.inner_exclusive_access().is_zombie
-        });
-        if let Some((idx, child)) = zombie {
-            let (found_pid, exit_code, child_times) = {
-                let child_inner = child.inner_exclusive_access();
-                (
-                    child.getpid(),
-                    child_inner.exit_code,
-                    child_inner.cpu_times.snapshot(),
-                )
-            };
+        if let Some(zombie) = scan.zombie {
             if !wstatus.is_null() {
                 write_user_value_in_memory_set(
                     &mut inner.memory_set,
                     wstatus,
-                    &wait_status(exit_code),
+                    &wait_status(zombie.exit_code),
                 )?;
             }
             write_rusage(&mut inner.memory_set, rusage)?;
-            inner.cpu_times.add_waited_child(child_times);
+            inner.cpu_times.add_waited_child(zombie.child_times);
 
             // CONTEXT: Linux keeps a zombie PID visible until the parent reaps it.
             // Remove the process from PID lookup only at the wait/reap boundary.
-            remove_from_pid2process(found_pid);
+            remove_from_pid2process(zombie.pid);
             // CONTEXT: Reaping completes when the child is removed from both
             // PID lookup and the parent's child list. Other internal kernel
             // references must not turn a successful wait into a panic.
-            drop(inner.children.remove(idx));
-            return Ok(found_pid as isize);
+            drop(inner.children.remove(zombie.idx));
+            return Ok(zombie.pid as isize);
         }
 
         if options & WNOHANG != 0 {
@@ -376,102 +461,58 @@ pub fn sys_waitid(
         let process = current_process();
         let caller_pgid = process.process_group_id();
         let mut inner = process.inner_exclusive_access();
-        if !inner
-            .children
-            .iter()
-            .any(|child| waitid_child_matches(child, idtype, id, caller_pgid))
-        {
+        let scan = scan_waitid_children(&inner.children, idtype, id, caller_pgid, options);
+        if !scan.matched {
             return Err(SysError::ECHILD);
         }
 
-        if options & WUNTRACED != 0 {
-            let stopped = inner.children.iter().find_map(|child| {
-                if !waitid_child_matches(child, idtype, id, caller_pgid) {
-                    return None;
-                }
-                let child_inner = child.inner_exclusive_access();
-                child_inner
-                    .wait_stop_status
-                    .map(|status| (child.getpid(), status))
-            });
-            if let Some((child_pid, stop_status)) = stopped {
-                write_waitid_siginfo(
-                    &mut inner.memory_set,
-                    infop,
-                    child_pid,
-                    CLD_STOPPED,
-                    stop_status,
-                )?;
-                write_rusage(&mut inner.memory_set, rusage)?;
-                if options & WNOWAIT == 0
-                    && let Some(child) = inner
-                        .children
-                        .iter()
-                        .find(|child| child.getpid() == child_pid)
-                {
-                    child.inner_exclusive_access().wait_stop_status = None;
-                }
-                return Ok(0);
+        if let Some((idx, child_pid, stop_status)) = scan.stopped {
+            write_waitid_siginfo(
+                &mut inner.memory_set,
+                infop,
+                child_pid,
+                CLD_STOPPED,
+                stop_status,
+            )?;
+            write_rusage(&mut inner.memory_set, rusage)?;
+            if options & WNOWAIT == 0
+                && let Some(child) = inner.children.get(idx)
+            {
+                child.inner_exclusive_access().wait_stop_status = None;
             }
+            return Ok(0);
         }
 
-        if options & WCONTINUED != 0 {
-            let continued = inner.children.iter().find_map(|child| {
-                if !waitid_child_matches(child, idtype, id, caller_pgid) {
-                    return None;
-                }
-                if child.inner_exclusive_access().wait_continued {
-                    Some(child.getpid())
-                } else {
-                    None
-                }
-            });
-            if let Some(child_pid) = continued {
-                write_waitid_siginfo(
-                    &mut inner.memory_set,
-                    infop,
-                    child_pid,
-                    CLD_CONTINUED,
-                    SIGCONT as i32,
-                )?;
-                write_rusage(&mut inner.memory_set, rusage)?;
-                if options & WNOWAIT == 0
-                    && let Some(child) = inner
-                        .children
-                        .iter()
-                        .find(|child| child.getpid() == child_pid)
-                {
-                    child.inner_exclusive_access().wait_continued = false;
-                }
-                return Ok(0);
+        if let Some((idx, child_pid)) = scan.continued {
+            write_waitid_siginfo(
+                &mut inner.memory_set,
+                infop,
+                child_pid,
+                CLD_CONTINUED,
+                SIGCONT as i32,
+            )?;
+            write_rusage(&mut inner.memory_set, rusage)?;
+            if options & WNOWAIT == 0
+                && let Some(child) = inner.children.get(idx)
+            {
+                child.inner_exclusive_access().wait_continued = false;
             }
+            return Ok(0);
         }
 
-        let zombie = inner.children.iter().enumerate().find(|(_, child)| {
-            waitid_child_matches(child, idtype, id, caller_pgid)
-                && child.inner_exclusive_access().is_zombie
-        });
-        if let Some((idx, child)) = zombie {
-            let (child_pid, exit_code, child_times) = {
-                let child_inner = child.inner_exclusive_access();
-                (
-                    child.getpid(),
-                    child_inner.exit_code,
-                    child_inner.cpu_times.snapshot(),
-                )
-            };
-            let (si_code, si_status) = waitid_code_and_status(exit_code);
-            write_waitid_siginfo(&mut inner.memory_set, infop, child_pid, si_code, si_status)?;
+        if let Some(zombie) = scan.zombie {
+            let (si_code, si_status) = waitid_code_and_status(zombie.exit_code);
+            write_waitid_siginfo(&mut inner.memory_set, infop, zombie.pid, si_code, si_status)?;
             write_rusage(&mut inner.memory_set, rusage)?;
 
             if options & WNOWAIT == 0 {
-                inner.cpu_times.add_waited_child(child_times);
+                inner.cpu_times.add_waited_child(zombie.child_times);
                 // CONTEXT: WNOWAIT observes the zombie without reaping it; only
                 // the actual reap removes the PID from process lookup.
-                remove_from_pid2process(child_pid);
+                remove_from_pid2process(zombie.pid);
                 // CONTEXT: See sys_wait4(); waitid reaping has the same
                 // user-visible boundary and must not assert on Arc ownership.
-                drop(inner.children.remove(idx));
+                drop(inner.children.remove(zombie.idx));
             }
             return Ok(0);
         }

@@ -24,6 +24,8 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) tid_lookup_stale_index_entries: usize,
     pub(crate) exec_stack_copy_calls: usize,
     pub(crate) exec_stack_copy_bytes: usize,
+    pub(crate) wait_child_scan_passes: usize,
+    pub(crate) wait_child_scan_slots: usize,
     pub(crate) fd_alloc_calls: usize,
     pub(crate) fd_alloc_failures: usize,
     pub(crate) fd_alloc_probe_slots: usize,
@@ -211,6 +213,8 @@ mod enabled {
     static TID_LOOKUP_STALE_INDEX_ENTRIES: AtomicUsize = AtomicUsize::new(0);
     static EXEC_STACK_COPY_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EXEC_STACK_COPY_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static WAIT_CHILD_SCAN_PASSES: AtomicUsize = AtomicUsize::new(0);
+    static WAIT_CHILD_SCAN_SLOTS: AtomicUsize = AtomicUsize::new(0);
 
     static FD_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FD_ALLOC_FAILURES: AtomicUsize = AtomicUsize::new(0);
@@ -696,6 +700,11 @@ mod enabled {
         EXEC_STACK_COPY_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_wait_child_scan(child_slots: usize) {
+        WAIT_CHILD_SCAN_PASSES.fetch_add(1, Ordering::Relaxed);
+        WAIT_CHILD_SCAN_SLOTS.fetch_add(child_slots, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_pipe_read_call() {
         PIPE_READ_CALLS.fetch_add(1, Ordering::Relaxed);
     }
@@ -935,6 +944,8 @@ mod enabled {
             tid_lookup_stale_index_entries: TID_LOOKUP_STALE_INDEX_ENTRIES.load(Ordering::Relaxed),
             exec_stack_copy_calls: EXEC_STACK_COPY_CALLS.load(Ordering::Relaxed),
             exec_stack_copy_bytes: EXEC_STACK_COPY_BYTES.load(Ordering::Relaxed),
+            wait_child_scan_passes: WAIT_CHILD_SCAN_PASSES.load(Ordering::Relaxed),
+            wait_child_scan_slots: WAIT_CHILD_SCAN_SLOTS.load(Ordering::Relaxed),
             fd_alloc_calls: FD_ALLOC_CALLS.load(Ordering::Relaxed),
             fd_alloc_failures: FD_ALLOC_FAILURES.load(Ordering::Relaxed),
             fd_alloc_probe_slots: FD_ALLOC_PROBE_SLOTS.load(Ordering::Relaxed),
@@ -1136,6 +1147,8 @@ mod enabled {
          tid_lookup_stale_index_entries {}\n\
          exec_stack_copy_calls {}\n\
          exec_stack_copy_bytes {}\n\
+         wait_child_scan_passes {}\n\
+         wait_child_scan_slots {}\n\
          fd_alloc_calls {}\n\
          fd_alloc_failures {}\n\
          fd_alloc_probe_slots {}\n\
@@ -1314,6 +1327,8 @@ mod enabled {
             stats.tid_lookup_stale_index_entries,
             stats.exec_stack_copy_calls,
             stats.exec_stack_copy_bytes,
+            stats.wait_child_scan_passes,
+            stats.wait_child_scan_slots,
             stats.fd_alloc_calls,
             stats.fd_alloc_failures,
             stats.fd_alloc_probe_slots,
@@ -1545,6 +1560,9 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_exec_stack_copy(_bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_wait_child_scan(_child_slots: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_fd_alloc(
