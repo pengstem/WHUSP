@@ -11,7 +11,7 @@ pub struct TrapContext {
     pub trap_handler: usize,
     pub f: [u64; 32],
     pub fcsr: u32,
-    pub _fpu_reserved: u32,
+    pub fpu_state_valid: u32,
 }
 
 impl TrapContext {
@@ -25,10 +25,10 @@ impl TrapContext {
         self.x[10] = a0;
     }
 
-    fn app_init_sstatus() -> Sstatus {
+    fn user_sstatus_with_fs(fs: FS) -> Sstatus {
         let original_fs = sstatus::read().fs();
         unsafe {
-            sstatus::set_fs(FS::Initial);
+            sstatus::set_fs(fs);
         }
         let mut sstatus = sstatus::read();
         unsafe {
@@ -37,6 +37,28 @@ impl TrapContext {
         // set CPU privilege to User after trapping back
         sstatus.set_spp(SPP::User);
         sstatus
+    }
+
+    fn app_init_sstatus() -> Sstatus {
+        Self::user_sstatus_with_fs(FS::Off)
+    }
+
+    pub fn user_fp_is_off(&self) -> bool {
+        self.sstatus.fs() == FS::Off
+    }
+
+    pub fn user_fp_is_dirty(&self) -> bool {
+        self.sstatus.fs() == FS::Dirty
+    }
+
+    pub fn mark_user_fp_active(&mut self) {
+        self.sstatus = Self::user_sstatus_with_fs(FS::Dirty);
+        self.fpu_state_valid = 1;
+    }
+
+    pub fn mark_user_fp_disabled(&mut self) {
+        self.sstatus = Self::user_sstatus_with_fs(FS::Off);
+        self.fpu_state_valid = 1;
     }
 
     pub fn app_init_context(
@@ -55,7 +77,7 @@ impl TrapContext {
             trap_handler,
             f: [0; 32],
             fcsr: 0,
-            _fpu_reserved: 0,
+            fpu_state_valid: 0,
         };
         cx.set_sp(sp);
         cx

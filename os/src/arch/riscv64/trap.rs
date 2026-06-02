@@ -6,8 +6,8 @@ use crate::syscall::{
     errno::SysError, syscall_is_exit, syscall_is_exit_group, syscall_with_current_task,
 };
 use crate::task::{
-    SignalAction, SignalFlags, account_task_user_time_until, check_signals_of_task,
-    current_add_signal, current_process, current_task,
+    SignalAction, SignalFlags, TaskControlBlock, account_task_user_time_until,
+    check_signals_of_task, current_add_signal, current_process, current_task,
     current_trap_return_context_after_accounting, exit_current_group_and_run_next, process_of_task,
     suspend_current_and_run_next, trap_cx_of_task,
 };
@@ -71,8 +71,13 @@ pub fn trap_handler() -> ! {
     let scause = scause::read();
     let stval = stval::read();
     let is_user_ecall = matches!(scause.cause(), Trap::Exception(Exception::UserEnvCall));
-    let (trap_pc, syscall_entry) = {
+    let (trap_pc, syscall_entry, user_fp_was_off) = {
         let cx = trap_cx_of_task(&task);
+        let user_fp_was_off = cx.user_fp_is_off();
+        if cx.user_fp_is_dirty() {
+            crate::perf::record_rv_user_fp_save_call();
+            cx.mark_user_fp_disabled();
+        }
         let syscall_entry = if is_user_ecall {
             // Snapshot the Linux RISC-V syscall ABI registers before ptrace
             // stops or syscall handlers can mutate TrapContext.
@@ -84,7 +89,7 @@ pub fn trap_handler() -> ! {
         } else {
             None
         };
-        (cx.sepc, syscall_entry)
+        (cx.sepc, syscall_entry, user_fp_was_off)
     };
     let mut interrupted_pc = trap_pc;
     let mut signal_delivery_attempted = false;
@@ -187,6 +192,10 @@ pub fn trap_handler() -> ! {
             current_add_signal(SignalFlags::SIGSEGV);
         }
         Trap::Exception(Exception::IllegalInstruction) => {
+            if user_fp_was_off {
+                init_lazy_fp_for_task(&task);
+                trap_return();
+            }
             current_add_signal(SignalFlags::SIGILL);
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
@@ -219,6 +228,15 @@ pub fn trap_handler() -> ! {
         exit_current_group_and_run_next(errno);
     }
     trap_return();
+}
+
+fn init_lazy_fp_for_task(task: &Arc<TaskControlBlock>) {
+    let cx = trap_cx_of_task(task);
+    if !cx.user_fp_is_off() {
+        return;
+    }
+    cx.mark_user_fp_active();
+    crate::perf::record_rv_user_fp_lazy_init_trap();
 }
 
 pub(crate) fn handle_user_page_fault(addr: usize, access: MmapFaultAccess) -> bool {
@@ -302,7 +320,12 @@ fn force_default_sigsegv_current() {
 /// finally, jump to new addr of __restore asm function
 pub fn trap_return() -> ! {
     let now_us = get_time_us();
+    let task = current_task().expect("trap_return requires a running task");
+    let restore_fp = trap_cx_of_task(&task).user_fp_is_dirty();
     let (trap_cx_user_va, user_satp) = current_trap_return_context_after_accounting(now_us);
+    if restore_fp {
+        crate::perf::record_rv_user_fp_restore_call();
+    }
     disable_supervisor_interrupt();
     set_user_trap_entry();
     unsafe extern "C" {
@@ -323,6 +346,7 @@ pub fn trap_return() -> ! {
             restore_va = in(reg) restore_va,
             in("a0") trap_cx_user_va,
             in("a1") user_satp,
+            in("a2") restore_fp as usize,
             options(noreturn)
         );
     }

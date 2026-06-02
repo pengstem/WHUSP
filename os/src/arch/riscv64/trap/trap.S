@@ -45,6 +45,10 @@ __alltraps:
     sd t2, 2*8(sp)
     # CONTEXT: User FP state lives in TrapContext in this kernel; switch.S only
     # carries kernel scheduling state. Temporarily enable FS while copying it.
+    li t2, SSTATUS_FS_MASK
+    and t2, t0, t2
+    li t1, SSTATUS_FS_DIRTY
+    bne t2, t1, 1f
     li t2, SSTATUS_FS_DIRTY
     csrs sstatus, t2
     .set n, 0
@@ -56,6 +60,7 @@ __alltraps:
     sw t2, FCSR_OFFSET*8(sp)
     li t2, SSTATUS_FS_MASK
     csrc sstatus, t2
+1:
     # load kernel_satp into t0
     ld t0, 34*8(sp)
     # load trap_handler into t1
@@ -69,7 +74,7 @@ __alltraps:
     jr t1
 
 __restore:
-    # a0: *TrapContext in user space(Constant); a1: user space token
+    # a0: *TrapContext in user space(Constant); a1: user space token; a2: restore FP
     # switch to user space
     csrw satp, a1
     sfence.vma
@@ -79,10 +84,11 @@ __restore:
     # restore sstatus/sepc
     ld t0, 32*8(sp)
     ld t1, 33*8(sp)
+    csrw sepc, t1
+    beqz a2, 1f
     li t2, SSTATUS_FS_DIRTY
     or t2, t0, t2
     csrw sstatus, t2
-    csrw sepc, t1
     .set n, 0
     .rept 32
         LOAD_FP %n
@@ -90,6 +96,7 @@ __restore:
     .endr
     lw t2, FCSR_OFFSET*8(sp)
     fscsr t2
+1:
     csrw sstatus, t0
     # restore general purpose registers except x0/sp
     ld x1, 1*8(sp)

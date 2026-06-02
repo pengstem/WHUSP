@@ -20,6 +20,9 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) time_direct_timespec_calls: usize,
     pub(crate) riscv_return_fence_i_calls: usize,
     pub(crate) la_return_invtlb_calls: usize,
+    pub(crate) rv_user_fp_save_calls: usize,
+    pub(crate) rv_user_fp_restore_calls: usize,
+    pub(crate) rv_user_fp_lazy_init_traps: usize,
     pub(crate) arch_instruction_barrier_calls: usize,
     pub(crate) tid_lookup_calls: usize,
     pub(crate) tid_lookup_process_visits: usize,
@@ -221,6 +224,9 @@ mod enabled {
     static TIME_DIRECT_TIMESPEC_CALLS: AtomicUsize = AtomicUsize::new(0);
     static RISCV_RETURN_FENCE_I_CALLS: AtomicUsize = AtomicUsize::new(0);
     static LA_RETURN_INVTLB_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static RV_USER_FP_SAVE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static RV_USER_FP_RESTORE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static RV_USER_FP_LAZY_INIT_TRAPS: AtomicUsize = AtomicUsize::new(0);
     static ARCH_INSTRUCTION_BARRIER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TID_LOOKUP_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TID_LOOKUP_PROCESS_VISITS: AtomicUsize = AtomicUsize::new(0);
@@ -478,6 +484,21 @@ mod enabled {
     #[allow(dead_code)]
     pub(crate) fn record_la_return_invtlb_call() {
         LA_RETURN_INVTLB_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_rv_user_fp_save_call() {
+        RV_USER_FP_SAVE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_rv_user_fp_restore_call() {
+        RV_USER_FP_RESTORE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_rv_user_fp_lazy_init_trap() {
+        RV_USER_FP_LAZY_INIT_TRAPS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_arch_instruction_barrier_call() {
@@ -1000,6 +1021,9 @@ mod enabled {
             time_direct_timespec_calls: TIME_DIRECT_TIMESPEC_CALLS.load(Ordering::Relaxed),
             riscv_return_fence_i_calls: RISCV_RETURN_FENCE_I_CALLS.load(Ordering::Relaxed),
             la_return_invtlb_calls: LA_RETURN_INVTLB_CALLS.load(Ordering::Relaxed),
+            rv_user_fp_save_calls: RV_USER_FP_SAVE_CALLS.load(Ordering::Relaxed),
+            rv_user_fp_restore_calls: RV_USER_FP_RESTORE_CALLS.load(Ordering::Relaxed),
+            rv_user_fp_lazy_init_traps: RV_USER_FP_LAZY_INIT_TRAPS.load(Ordering::Relaxed),
             arch_instruction_barrier_calls: ARCH_INSTRUCTION_BARRIER_CALLS.load(Ordering::Relaxed),
             tid_lookup_calls: TID_LOOKUP_CALLS.load(Ordering::Relaxed),
             tid_lookup_process_visits: TID_LOOKUP_PROCESS_VISITS.load(Ordering::Relaxed),
@@ -1218,6 +1242,9 @@ mod enabled {
          time_direct_timespec_calls {}\n\
          riscv_return_fence_i_calls {}\n\
          la_return_invtlb_calls {}\n\
+         rv_user_fp_save_calls {}\n\
+         rv_user_fp_restore_calls {}\n\
+         rv_user_fp_lazy_init_traps {}\n\
          arch_instruction_barrier_calls {}\n\
          tid_lookup_calls {}\n\
          tid_lookup_process_visits {}\n\
@@ -1410,6 +1437,9 @@ mod enabled {
             stats.time_direct_timespec_calls,
             stats.riscv_return_fence_i_calls,
             stats.la_return_invtlb_calls,
+            stats.rv_user_fp_save_calls,
+            stats.rv_user_fp_restore_calls,
+            stats.rv_user_fp_lazy_init_traps,
             stats.arch_instruction_barrier_calls,
             stats.tid_lookup_calls,
             stats.tid_lookup_process_visits,
@@ -1660,6 +1690,18 @@ mod disabled {
     #[inline(always)]
     #[allow(dead_code)]
     pub(crate) fn record_la_return_invtlb_call() {}
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn record_rv_user_fp_save_call() {}
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn record_rv_user_fp_restore_call() {}
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn record_rv_user_fp_lazy_init_trap() {}
 
     #[inline(always)]
     pub(crate) fn record_arch_instruction_barrier_call() {}
