@@ -5,6 +5,7 @@ use super::super::mount::{
 use super::super::path::PathContext;
 use super::super::{dentry_cache, dentry_cache::DentryLookupResult};
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId};
+use crate::perf;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -57,6 +58,21 @@ struct VfsCursor {
     node: VfsNodeId,
     kind: FsNodeKind,
     path: String,
+}
+
+#[derive(Clone, Debug)]
+enum PathComponent<'a> {
+    Borrowed(&'a str),
+    Owned(String),
+}
+
+impl PathComponent<'_> {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Borrowed(component) => component,
+            Self::Owned(component) => component.as_str(),
+        }
+    }
 }
 
 impl VfsPath {
@@ -263,11 +279,24 @@ fn start_cursor(context: &PathContext, path: &str) -> VfsCursor {
     }
 }
 
-fn path_components(path: &str) -> Vec<String> {
-    path.split('/')
+fn borrowed_path_components(path: &str) -> Vec<PathComponent<'_>> {
+    let components: Vec<PathComponent<'_>> = path
+        .split('/')
         .filter(|component| !component.is_empty() && *component != ".")
-        .map(String::from)
-        .collect()
+        .map(PathComponent::Borrowed)
+        .collect();
+    perf::record_vfs_path_components(components.len(), 0);
+    components
+}
+
+fn owned_path_components<'a>(path: &str) -> Vec<PathComponent<'a>> {
+    let components: Vec<PathComponent<'a>> = path
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .map(|component| PathComponent::Owned(String::from(component)))
+        .collect();
+    perf::record_vfs_path_components(components.len(), components.len());
+    components
 }
 
 fn read_symlink_target(cursor: VfsCursor) -> FsResult<String> {
@@ -288,7 +317,7 @@ fn resolve_path_inner(context: PathContext, path: &str, mode: LookupMode) -> FsR
         return Err(FsError::NotFound);
     }
     let mut cursor = start_cursor(&context, path);
-    let mut components = path_components(path);
+    let mut components = borrowed_path_components(path);
     let mut index = 0usize;
     let mut symlink_follows = 0usize;
 
@@ -310,7 +339,7 @@ fn resolve_path_inner(context: PathContext, path: &str, mode: LookupMode) -> FsR
                 symlink_follows += 1;
 
                 let target = read_symlink_target(cursor)?;
-                let mut next_components = path_components(target.as_str());
+                let mut next_components = owned_path_components(target.as_str());
                 next_components.extend(components[index + 1..].iter().cloned());
                 components = next_components;
                 index = 0;
