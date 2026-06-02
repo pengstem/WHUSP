@@ -167,6 +167,12 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) usercopy_same_page_fast_bytes: usize,
     pub(crate) usercopy_slow_paths: usize,
     pub(crate) usercopy_slow_pages: usize,
+    pub(crate) usercopy_checked_range_calls: usize,
+    pub(crate) usercopy_checked_range_pages: usize,
+    pub(crate) usercopy_checked_range_bytes: usize,
+    pub(crate) usercopy_range_reuse_hits: usize,
+    pub(crate) usercopy_range_reuse_pages: usize,
+    pub(crate) usercopy_range_reuse_bytes: usize,
     pub(crate) usercopy_read_value_calls: usize,
     pub(crate) usercopy_read_value_bytes: usize,
     pub(crate) usercopy_read_usize_calls: usize,
@@ -384,6 +390,12 @@ mod enabled {
     static USERCOPY_SAME_PAGE_FAST_BYTES: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_SLOW_PATHS: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_SLOW_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static USERCOPY_CHECKED_RANGE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static USERCOPY_CHECKED_RANGE_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static USERCOPY_CHECKED_RANGE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static USERCOPY_RANGE_REUSE_HITS: AtomicUsize = AtomicUsize::new(0);
+    static USERCOPY_RANGE_REUSE_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static USERCOPY_RANGE_REUSE_BYTES: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_READ_VALUE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_READ_VALUE_BYTES: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_READ_USIZE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -909,6 +921,18 @@ mod enabled {
         USERCOPY_SLOW_PAGES.fetch_add(page_count, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_usercopy_checked_range(pages: usize, bytes: usize) {
+        USERCOPY_CHECKED_RANGE_CALLS.fetch_add(1, Ordering::Relaxed);
+        USERCOPY_CHECKED_RANGE_PAGES.fetch_add(pages, Ordering::Relaxed);
+        USERCOPY_CHECKED_RANGE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_usercopy_range_reuse(chunks: usize, pages: usize, bytes: usize) {
+        USERCOPY_RANGE_REUSE_HITS.fetch_add(chunks, Ordering::Relaxed);
+        USERCOPY_RANGE_REUSE_PAGES.fetch_add(pages, Ordering::Relaxed);
+        USERCOPY_RANGE_REUSE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_usercopy_site(site: UsercopySite, bytes: usize) {
         let (calls, total_bytes) = match site {
             UsercopySite::ReadValue => (&USERCOPY_READ_VALUE_CALLS, &USERCOPY_READ_VALUE_BYTES),
@@ -1202,6 +1226,12 @@ mod enabled {
             usercopy_same_page_fast_bytes: USERCOPY_SAME_PAGE_FAST_BYTES.load(Ordering::Relaxed),
             usercopy_slow_paths: USERCOPY_SLOW_PATHS.load(Ordering::Relaxed),
             usercopy_slow_pages: USERCOPY_SLOW_PAGES.load(Ordering::Relaxed),
+            usercopy_checked_range_calls: USERCOPY_CHECKED_RANGE_CALLS.load(Ordering::Relaxed),
+            usercopy_checked_range_pages: USERCOPY_CHECKED_RANGE_PAGES.load(Ordering::Relaxed),
+            usercopy_checked_range_bytes: USERCOPY_CHECKED_RANGE_BYTES.load(Ordering::Relaxed),
+            usercopy_range_reuse_hits: USERCOPY_RANGE_REUSE_HITS.load(Ordering::Relaxed),
+            usercopy_range_reuse_pages: USERCOPY_RANGE_REUSE_PAGES.load(Ordering::Relaxed),
+            usercopy_range_reuse_bytes: USERCOPY_RANGE_REUSE_BYTES.load(Ordering::Relaxed),
             usercopy_read_value_calls: USERCOPY_READ_VALUE_CALLS.load(Ordering::Relaxed),
             usercopy_read_value_bytes: USERCOPY_READ_VALUE_BYTES.load(Ordering::Relaxed),
             usercopy_read_usize_calls: USERCOPY_READ_USIZE_CALLS.load(Ordering::Relaxed),
@@ -1421,6 +1451,12 @@ mod enabled {
          usercopy_same_page_fast_bytes {}\n\
          usercopy_slow_paths {}\n\
          usercopy_slow_pages {}\n\
+         usercopy_checked_range_calls {}\n\
+         usercopy_checked_range_pages {}\n\
+         usercopy_checked_range_bytes {}\n\
+         usercopy_range_reuse_hits {}\n\
+         usercopy_range_reuse_pages {}\n\
+         usercopy_range_reuse_bytes {}\n\
          usercopy_read_value_calls {}\n\
          usercopy_read_value_bytes {}\n\
          usercopy_read_usize_calls {}\n\
@@ -1622,6 +1658,12 @@ mod enabled {
             stats.usercopy_same_page_fast_bytes,
             stats.usercopy_slow_paths,
             stats.usercopy_slow_pages,
+            stats.usercopy_checked_range_calls,
+            stats.usercopy_checked_range_pages,
+            stats.usercopy_checked_range_bytes,
+            stats.usercopy_range_reuse_hits,
+            stats.usercopy_range_reuse_pages,
+            stats.usercopy_range_reuse_bytes,
             stats.usercopy_read_value_calls,
             stats.usercopy_read_value_bytes,
             stats.usercopy_read_usize_calls,
@@ -1991,6 +2033,12 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_usercopy_slow_path(_page_count: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_usercopy_checked_range(_pages: usize, _bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_usercopy_range_reuse(_chunks: usize, _pages: usize, _bytes: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_usercopy_site(_site: UsercopySite, _bytes: usize) {}

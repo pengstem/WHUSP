@@ -87,6 +87,7 @@ pub(crate) fn translated_byte_buffer_checked_with_fault(
         }
         start = end_va.into();
     }
+    perf::record_usercopy_checked_range(buffers.len(), len);
     Ok(buffers)
 }
 

@@ -1,6 +1,7 @@
 use crate::config::PAGE_SIZE;
 use crate::fs::{File, FileStat, OpenFlags, PollEvents, S_IFDIR, S_IFMT, S_IFREG, SeekWhence};
 use crate::mm::UserBuffer;
+use crate::perf;
 use crate::task::{
     FdTableEntry, RLimitResource, SignalFlags, current_add_signal, current_process,
     current_user_token,
@@ -35,6 +36,7 @@ struct UserIovecCursor {
     entries: Vec<LinuxIovec>,
     index: usize,
     access: UserBufferAccess,
+    prepared_chunks: Option<Vec<Option<UserIovecChunk>>>,
 }
 
 const RWF_HIPRI: usize = 0x0000_0001;
@@ -42,6 +44,7 @@ const RWF_NOWAIT: usize = 0x0000_0008;
 const PREADV2_SUPPORTED_FLAGS: usize = RWF_HIPRI | RWF_NOWAIT;
 const PREADV_COALESCE_CHUNK_SIZE: usize = 64 * 1024;
 const WRITEV_COALESCE_CHUNK_SIZE: usize = 64 * 1024;
+const USER_IOVEC_RANGE_REUSE: bool = true;
 
 static PREADV2_NOWAIT_COMPAT_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -73,28 +76,59 @@ impl UserIovecCursor {
             entries: iovecs.entries,
             index: 0,
             access,
+            prepared_chunks: None,
         }
     }
 
-    fn validate_all(&self) -> SysResult<()> {
+    fn validate_all(&mut self, prepare_for_reuse: bool) -> SysResult<()> {
         // CONTEXT: readv/preadv validate every destination iovec before
         // reading so an early filesystem read cannot partially modify user
         // memory before a later bad iovec reports EFAULT.
+        let mut prepared_chunks = Vec::new();
+        let mut prepared_pages = 0usize;
+        let mut prepared_bytes = 0usize;
         for iovec in self.entries.iter() {
             if iovec.len == 0 {
                 continue;
             }
-            translated_byte_buffer_checked_with_mmap_fault(
+            let buffers = translated_byte_buffer_checked_with_mmap_fault(
                 self.token,
                 iovec.base as *const u8,
                 iovec.len,
                 self.access,
             )?;
+            if prepare_for_reuse {
+                prepared_pages = prepared_pages.saturating_add(buffers.len());
+                prepared_bytes = prepared_bytes.saturating_add(iovec.len);
+                prepared_chunks.push(Some(UserIovecChunk {
+                    len: iovec.len,
+                    buffers,
+                }));
+            }
+        }
+        if prepare_for_reuse {
+            perf::record_usercopy_range_reuse(
+                prepared_chunks.len(),
+                prepared_pages,
+                prepared_bytes,
+            );
+            self.index = 0;
+            self.prepared_chunks = Some(prepared_chunks);
         }
         Ok(())
     }
 
     fn next_chunk(&mut self) -> Option<SysResult<UserIovecChunk>> {
+        if let Some(chunks) = self.prepared_chunks.as_mut() {
+            while self.index < chunks.len() {
+                let chunk = chunks[self.index].take();
+                self.index += 1;
+                if let Some(chunk) = chunk {
+                    return Some(Ok(chunk));
+                }
+            }
+            return None;
+        }
         while self.index < self.entries.len() {
             let iovec = self.entries[self.index];
             self.index += 1;
@@ -1305,7 +1339,7 @@ pub fn sys_preadv(
     }
 
     let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Write);
-    cursor.validate_all()?;
+    cursor.validate_all(USER_IOVEC_RANGE_REUSE)?;
     if iovcnt > 1 {
         let total_read =
             preadv_regular_file_coalesced(file.as_ref(), cursor, offset, requested_len)?;
@@ -1622,8 +1656,9 @@ pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult 
     ensure_nonblocking_ready(&entry, PollEvents::POLLIN)?;
 
     let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Write);
-    cursor.validate_all()?;
-    if iovcnt > 1 && mode & S_IFMT == S_IFREG {
+    let reuse_checked_range = USER_IOVEC_RANGE_REUSE && iovcnt > 1 && mode & S_IFMT == S_IFREG;
+    cursor.validate_all(reuse_checked_range)?;
+    if reuse_checked_range {
         let buffers = collect_iovec_buffers(cursor, requested_len)?;
         let total_read = file.read(UserBuffer::new(buffers));
         fanotify_notify_access(&file, total_read);
