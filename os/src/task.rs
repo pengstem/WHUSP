@@ -25,7 +25,9 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::*;
 use log::info;
-use manager::{fetch_task, register_task_linux_tid, unregister_task_linux_tid};
+use manager::{
+    charge_task_after_run, fetch_task, register_task_linux_tid, unregister_task_linux_tid,
+};
 pub(crate) use process::{
     Credentials, PROCESS_PKEY_COUNT, PathSnapshot, ProcessProcSnapshot, RLimit, RLimitResource,
 };
@@ -162,6 +164,7 @@ pub fn block_current_task_no_schedule() -> (Arc<TaskControlBlock>, *mut TaskCont
     // to aborting the kernel while the task is about to block.
     try_account_current_system_time();
     let task = take_current_task().expect("block_current_task_no_schedule requires a current task");
+    charge_task_after_run(&task);
     let mut task_inner = task.inner_exclusive_access();
     task_inner.task_status = TaskStatus::Blocked;
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;

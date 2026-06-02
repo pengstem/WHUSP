@@ -46,6 +46,7 @@ pub fn run_tasks() {
                 task_inner.task_status = TaskStatus::Running;
                 &task_inner.task_cx as *const TaskContext
             });
+            task.mark_sched_run_start(crate::timer::get_time_us());
             processor.current = Some(task);
             // release processor manually
             drop(processor);

@@ -9,7 +9,6 @@ use lazy_static::*;
 const RT_PRIORITY_MAX: usize = 99;
 const RT_QUEUE_COUNT: usize = RT_PRIORITY_MAX + 1;
 const NICE_0_LOAD: u64 = 1024;
-const SCHED_VRUNTIME_UNIT: u64 = NICE_0_LOAD * NICE_0_LOAD;
 const NICE_TO_WEIGHT: [u64; 40] = [
     88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904,
     3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, 110, 87,
@@ -51,9 +50,20 @@ impl TaskManager {
         NICE_TO_WEIGHT[index]
     }
 
-    fn vruntime_delta(task: &TaskControlBlock) -> u64 {
+    fn vruntime_delta_for_runtime(task: &TaskControlBlock, runtime_us: usize) -> u64 {
         let weight = Self::nice_weight(task.nice_value());
-        SCHED_VRUNTIME_UNIT.div_ceil(weight).max(1)
+        let weighted_runtime = (runtime_us as u64).max(1).saturating_mul(NICE_0_LOAD);
+        weighted_runtime.div_ceil(weight).max(1)
+    }
+
+    fn charge_normal_runtime(task: &TaskControlBlock) {
+        if Self::rt_priority(task) != 0 {
+            return;
+        }
+        let runtime_us = task.take_sched_runtime_us(crate::timer::get_time_us());
+        let delta = Self::vruntime_delta_for_runtime(task, runtime_us);
+        task.add_sched_vruntime(delta);
+        perf::record_scheduler_normal_requeue(delta as usize);
     }
 
     fn rt_priority_bit(priority: usize) -> u128 {
@@ -65,11 +75,7 @@ impl TaskManager {
     }
 
     pub fn requeue_after_run(&mut self, task: Arc<TaskControlBlock>) {
-        if Self::rt_priority(&task) == 0 {
-            let delta = Self::vruntime_delta(&task);
-            task.add_sched_vruntime(delta);
-            perf::record_scheduler_normal_requeue(delta as usize);
-        }
+        Self::charge_normal_runtime(&task);
         self.enqueue(task, false);
     }
 
@@ -249,6 +255,10 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
 
 pub(crate) fn requeue_task_after_run(task: Arc<TaskControlBlock>) {
     TASK_MANAGER.exclusive_access().requeue_after_run(task);
+}
+
+pub(crate) fn charge_task_after_run(task: &TaskControlBlock) {
+    TaskManager::charge_normal_runtime(task);
 }
 
 fn wakeup_task_with_placement(task: Arc<TaskControlBlock>, front: bool) -> bool {

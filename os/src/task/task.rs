@@ -135,6 +135,17 @@ impl TaskControlBlock {
         inner.sched_vruntime = inner.sched_vruntime.saturating_add(delta);
         inner.sched_vruntime
     }
+
+    pub(crate) fn mark_sched_run_start(&self, now_us: usize) {
+        self.inner_exclusive_access().sched_run_start_us = Some(now_us);
+    }
+
+    pub(crate) fn take_sched_runtime_us(&self, now_us: usize) -> usize {
+        self.inner_exclusive_access()
+            .sched_run_start_us
+            .take()
+            .map_or(0, |start_us| now_us.saturating_sub(start_us))
+    }
 }
 
 pub struct TaskControlBlockInner {
@@ -165,6 +176,7 @@ pub struct TaskControlBlockInner {
     pub sched_deadline_period: u64,
     pub nice: i8,
     pub sched_vruntime: u64,
+    pub sched_run_start_us: Option<usize>,
     pub cpu_times: TaskCpuTimes,
     pub timer_slack_ns: usize,
     pub default_timer_slack_ns: usize,
@@ -252,6 +264,7 @@ impl TaskControlBlock {
                     sched_deadline_period: 0,
                     nice: 0,
                     sched_vruntime: 0,
+                    sched_run_start_us: None,
                     cpu_times: TaskCpuTimes::default(),
                     timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
                     default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
