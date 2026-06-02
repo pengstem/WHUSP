@@ -4,9 +4,9 @@ use crate::config::TRAMPOLINE;
 use crate::mm::{MmapFaultAccess, MmapFaultResult};
 use crate::syscall::{errno::SysError, syscall};
 use crate::task::{
-    SignalAction, SignalFlags, account_current_system_time_until, account_current_user_time_until,
-    check_signals_of_current, current_add_signal, current_process, current_task, current_trap_cx,
-    current_trap_return_context, exit_current_group_and_run_next, mark_current_user_time_entry,
+    SignalAction, SignalFlags, account_current_user_time_until, check_signals_of_current,
+    current_add_signal, current_process, current_task, current_trap_cx,
+    current_trap_return_context_after_accounting, exit_current_group_and_run_next,
     suspend_current_and_run_next,
 };
 use crate::timer::{check_timer, get_time_us, set_next_trigger};
@@ -271,11 +271,9 @@ fn force_default_sigsegv_current() {
 /// finally, jump to new addr of __restore asm function
 pub fn trap_return() -> ! {
     let now_us = get_time_us();
-    account_current_system_time_until(now_us);
-    mark_current_user_time_entry(now_us);
+    let (trap_cx_user_va, user_satp) = current_trap_return_context_after_accounting(now_us);
     disable_supervisor_interrupt();
     set_user_trap_entry();
-    let (trap_cx_user_va, user_satp) = current_trap_return_context();
     unsafe extern "C" {
         unsafe fn __alltraps();
         unsafe fn __restore();

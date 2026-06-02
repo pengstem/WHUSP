@@ -53,7 +53,8 @@ pub use manager::{add_task, pid2process, remove_from_pid2process, wakeup_task};
 pub(crate) use manager::{wakeup_front_task, wakeup_timer_task};
 pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx,
-    current_trap_return_context, current_user_token, run_tasks, schedule, take_current_task,
+    current_trap_return_context_after_accounting, current_user_token, run_tasks, schedule,
+    take_current_task,
 };
 pub(crate) use ptrace::{
     ptrace_attach_process, ptrace_kill_process, ptrace_note_exec_current, ptrace_resume_process,
@@ -115,13 +116,6 @@ pub fn account_current_system_time() {
 
 fn try_account_current_system_time() {
     try_account_current_system_time_until(crate::timer::get_time_us());
-}
-
-pub fn mark_current_user_time_entry(now_us: usize) {
-    with_current_task_and_process(
-        |task| task.mark_user_time_entry(now_us),
-        |process| process.mark_user_time_entry(now_us),
-    );
 }
 
 pub fn mark_current_kernel_time_entry(now_us: usize) {

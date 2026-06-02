@@ -96,25 +96,48 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
         .get_trap_cx()
 }
 
+fn account_trap_return_for_task(
+    task: &TaskControlBlock,
+    process: &ProcessControlBlock,
+    now_us: usize,
+) {
+    task.account_system_time_until(now_us);
+    process.account_system_time_until(now_us);
+    task.mark_user_time_entry(now_us);
+    process.mark_user_time_entry(now_us);
+}
+
 #[cfg(target_arch = "riscv64")]
-pub fn current_trap_return_context() -> (usize, usize) {
+pub fn current_trap_return_context_after_accounting(now_us: usize) -> (usize, usize) {
     perf::record_task_current_trap_return_context_call();
     let task = current_task().expect("current_trap_return_context requires a running task");
+    let process = task
+        .process
+        .upgrade()
+        .expect("current task process must outlive the task");
+    account_trap_return_for_task(&task, &process, now_us);
     let trap_cx_user_va = task
         .inner_exclusive_access()
         .res
         .as_ref()
         .expect("current user task must own TaskUserRes")
         .trap_cx_user_va();
-    (trap_cx_user_va, task.get_user_token())
+    let user_token = process.inner_exclusive_access().memory_set.token();
+    (trap_cx_user_va, user_token)
 }
 
 #[cfg(target_arch = "loongarch64")]
-pub fn current_trap_return_context() -> (usize, usize) {
+pub fn current_trap_return_context_after_accounting(now_us: usize) -> (usize, usize) {
     perf::record_task_current_trap_return_context_call();
     let task = current_task().expect("current_trap_return_context requires a running task");
+    let process = task
+        .process
+        .upgrade()
+        .expect("current task process must outlive the task");
+    account_trap_return_for_task(&task, &process, now_us);
     let trap_cx = task.inner_exclusive_access().get_trap_cx() as *mut TrapContext as usize;
-    (trap_cx, task.get_user_token())
+    let user_token = process.inner_exclusive_access().memory_set.token();
+    (trap_cx, user_token)
 }
 
 pub fn current_kstack_top() -> usize {
