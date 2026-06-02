@@ -102,6 +102,32 @@ impl MemorySet {
             Some(image),
         )
     }
+
+    #[cfg(target_arch = "riscv64")]
+    pub(crate) fn patch_vdso_u64(&mut self, start_va: usize, offset: usize, value: u64) -> bool {
+        let Some(va) = start_va.checked_add(offset) else {
+            return false;
+        };
+        let Some(end) = va.checked_add(core::mem::size_of::<u64>()) else {
+            return false;
+        };
+        if end > start_va.saturating_add(crate::config::PAGE_SIZE) {
+            return false;
+        }
+        let va = VirtAddr::from(va);
+        let Some(pte) = self.page_table.translate(va.floor()) else {
+            return false;
+        };
+        let flags = pte.flags();
+        if !flags.contains(PTEFlags::R | PTEFlags::X | PTEFlags::U) || flags.contains(PTEFlags::W) {
+            return false;
+        }
+        let page_offset = va.page_offset();
+        let bytes = pte.ppn().get_bytes_array();
+        bytes[page_offset..page_offset + core::mem::size_of::<u64>()]
+            .copy_from_slice(&value.to_le_bytes());
+        true
+    }
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some(idx) = self.find_area_idx_by_start(start_vpn) {
             let area = &mut self.areas[idx];

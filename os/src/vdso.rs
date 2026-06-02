@@ -38,11 +38,17 @@ mod arch {
         .section .rodata.vdso_clock,"a"
         .globl __whusp_vdso_clock_gettime_start
         .globl __whusp_vdso_clock_freq
+        .globl __whusp_vdso_wall_offset_ns
         .globl __whusp_vdso_clock_gettime_end
         .balign 4
 __whusp_vdso_clock_gettime_start:
         .option push
         .option arch, +m
+        li t5, 0
+        li t0, 0
+        beq a0, t0, 0f
+        li t0, 5
+        beq a0, t0, 0f
         li t0, 1
         beq a0, t0, 1f
         li t0, 4
@@ -53,6 +59,8 @@ __whusp_vdso_clock_gettime_start:
         beq a0, t0, 1f
         li a0, -38
         ret
+0:
+        li t5, 1
 1:
         rdtime t0
 .Lwhusp_vdso_freq_pcrel:
@@ -65,6 +73,17 @@ __whusp_vdso_clock_gettime_start:
         li t4, 1000000000
         mul t3, t3, t4
         divu t3, t3, t1
+        beqz t5, 3f
+.Lwhusp_vdso_wall_offset_pcrel:
+        auipc t6, %pcrel_hi(__whusp_vdso_wall_offset_ns)
+        addi t6, t6, %pcrel_lo(.Lwhusp_vdso_wall_offset_pcrel)
+        ld t6, 0(t6)
+        mul t5, t2, t4
+        add t5, t5, t3
+        add t5, t5, t6
+        divu t2, t5, t4
+        remu t3, t5, t4
+3:
         sd t2, 0(a1)
         sd t3, 8(a1)
         li a0, 0
@@ -75,6 +94,8 @@ __whusp_vdso_clock_gettime_start:
         .balign 8
 __whusp_vdso_clock_freq:
         .quad 0
+__whusp_vdso_wall_offset_ns:
+        .quad 0
         .option pop
 __whusp_vdso_clock_gettime_end:
         "#
@@ -83,6 +104,7 @@ __whusp_vdso_clock_gettime_end:
     unsafe extern "C" {
         static __whusp_vdso_clock_gettime_start: u8;
         static __whusp_vdso_clock_freq: u8;
+        static __whusp_vdso_wall_offset_ns: u8;
         static __whusp_vdso_clock_gettime_end: u8;
     }
 
@@ -113,7 +135,7 @@ __whusp_vdso_clock_gettime_end:
         let clock_name_off = 1usize;
         let version_name_off = clock_name_off + CLOCK_SYMBOL.len() + 1;
         let strtab_size = version_name_off + LINUX_4_15.len() + 1;
-        let code_off = align_up(strtab_off + strtab_size, 16);
+        let code_off = code_image_offset();
         if code_off.checked_add(code.len())? > PAGE_SIZE {
             return None;
         }
@@ -175,6 +197,12 @@ __whusp_vdso_clock_gettime_end:
         image[code_off..code_off + code.len()].copy_from_slice(code);
         let freq_offset = code_off.checked_add(freq_offset_in_code)?;
         write_u64(&mut image, freq_offset, crate::config::clock_freq() as u64);
+        let wall_offset = code_off.checked_add(wall_offset_in_code()?)?;
+        write_u64(
+            &mut image,
+            wall_offset,
+            crate::timer::wall_time_offset_nanos(),
+        );
         Some(image)
     }
 
@@ -192,6 +220,52 @@ __whusp_vdso_clock_gettime_end:
             let freq = &__whusp_vdso_clock_freq as *const u8 as usize;
             freq.checked_sub(start)
         }
+    }
+
+    pub(super) fn refresh_wall_time_offset(offset_ns: u64) {
+        for process in crate::task::processes_snapshot() {
+            let mut inner = process.inner_exclusive_access();
+            let _ = patch_wall_time_offset(&mut inner.memory_set, offset_ns);
+        }
+    }
+
+    fn patch_wall_time_offset(memory_set: &mut MemorySet, offset_ns: u64) -> bool {
+        let Some(offset_in_code) = wall_offset_in_code() else {
+            return false;
+        };
+        let Some(offset) = code_image_offset().checked_add(offset_in_code) else {
+            return false;
+        };
+        memory_set.patch_vdso_u64(VDSO_BASE, offset, offset_ns)
+    }
+
+    fn wall_offset_in_code() -> Option<usize> {
+        unsafe {
+            let start = &__whusp_vdso_clock_gettime_start as *const u8 as usize;
+            let wall_offset = &__whusp_vdso_wall_offset_ns as *const u8 as usize;
+            wall_offset.checked_sub(start)
+        }
+    }
+
+    fn code_image_offset() -> usize {
+        let phoff = 64usize;
+        let phentsize = 56usize;
+        let phnum = 2usize;
+        let dynamic_off = align_up(phoff + phentsize * phnum, 8);
+        let dynamic_count = 9usize;
+        let dynamic_size = dynamic_count * 16;
+        let hash_off = align_up(dynamic_off + dynamic_size, 8);
+        let hash_size = 5 * 4;
+        let symtab_off = align_up(hash_off + hash_size, 8);
+        let symtab_size = 2 * 24;
+        let versym_off = align_up(symtab_off + symtab_size, 2);
+        let verdef_off = align_up(versym_off + 2 * 2, 4);
+        let verdef_size = 20 + 8;
+        let strtab_off = verdef_off + verdef_size;
+        let clock_name_off = 1usize;
+        let version_name_off = clock_name_off + CLOCK_SYMBOL.len() + 1;
+        let strtab_size = version_name_off + LINUX_4_15.len() + 1;
+        align_up(strtab_off + strtab_size, 16)
     }
 
     fn align_up(value: usize, align: usize) -> usize {
@@ -315,4 +389,9 @@ mod arch {
 
 pub(crate) fn map_into(memory_set: &mut MemorySet) -> Option<usize> {
     arch::map_into(memory_set)
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn refresh_wall_time_offset(offset_ns: u64) {
+    arch::refresh_wall_time_offset(offset_ns);
 }
