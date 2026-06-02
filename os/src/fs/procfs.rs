@@ -2536,6 +2536,12 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
     }
 }
 
+fn snapshot_node_content(node: ProcNode) -> FsResult<Vec<u8>> {
+    let content = node_content(node)?;
+    perf::record_procfs_content_build(content.len());
+    Ok(content)
+}
+
 impl FileSystemBackend for ProcFs {
     fn root_ino(&self) -> u32 {
         ROOT_INO
@@ -3085,6 +3091,20 @@ impl FileSystemBackend for ProcFs {
         Ok(len)
     }
 
+    fn supports_read_snapshot(&mut self, ino: u32) -> bool {
+        decode_node(ino).is_some_and(|node| {
+            node_kind(node) == FsNodeKind::RegularFile && !matches!(node, ProcNode::PidPagemap(_))
+        })
+    }
+
+    fn read_snapshot(&mut self, ino: u32) -> Option<FsResult<Vec<u8>>> {
+        let node = decode_node(ino)?;
+        if matches!(node, ProcNode::PidPagemap(_)) {
+            return None;
+        }
+        Some(snapshot_node_content(node))
+    }
+
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
         let Some(node) = decode_node(ino) else {
             return 0;
@@ -3092,7 +3112,7 @@ impl FileSystemBackend for ProcFs {
         if let ProcNode::PidPagemap(pid) = node {
             return pid_pagemap_read(pid, buf, offset as usize);
         }
-        let Ok(content) = node_content(node) else {
+        let Ok(content) = snapshot_node_content(node) else {
             return 0;
         };
         let start = (offset as usize).min(content.len());

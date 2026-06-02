@@ -229,6 +229,8 @@ pub(crate) struct VfsFile {
     namespace_id: MountNamespaceId,
     visible_path: Option<String>,
     offset: SleepMutex<usize>,
+    read_snapshot: SleepMutex<Option<Vec<u8>>>,
+    read_snapshot_supported: bool,
     readable: bool,
     writable: bool,
     status_flags: StatusFlagsCell,
@@ -251,6 +253,10 @@ impl VfsFile {
         // An open file description pins its backend inode even if the path is
         // later unlinked. Keep this retain paired with Drop's release path.
         with_mount(node.mount_id, |mount| mount.retain_inode(node.ino)).ok_or(FsError::Io)??;
+        let read_snapshot_supported = with_mount(node.mount_id, |mount| {
+            mount.supports_read_snapshot(node.ino)
+        })
+        .unwrap_or(false);
         track_writable_regular_open(node, kind, writable);
         let file = Self {
             node,
@@ -259,6 +265,8 @@ impl VfsFile {
             namespace_id,
             visible_path,
             offset: SleepMutex::new(0),
+            read_snapshot: SleepMutex::new(None),
+            read_snapshot_supported,
             readable,
             writable,
             status_flags: StatusFlagsCell::new(status_flags),
@@ -304,6 +312,7 @@ impl VfsFile {
             };
             *offset = stat.size as usize;
         }
+        *self.read_snapshot.lock() = None;
         let mut total_write_size = 0usize;
         perf::record_vfs_write_user_buffer(buf.buffers.len());
         if self.kind == FsNodeKind::RegularFile && buf.buffers.len() > 1 {
@@ -382,6 +391,54 @@ impl VfsFile {
         .expect("filesystem mount is missing");
         perf::record_vfs_read_backend(read_size);
         read_size
+    }
+
+    fn read_snapshot_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        if !self.read_snapshot_supported {
+            return None;
+        }
+        let mut snapshot = self.read_snapshot.lock();
+        if offset == 0 {
+            *snapshot = None;
+        }
+        if snapshot.is_none() {
+            let content = match with_mount(self.node.mount_id, |mount| {
+                mount.read_snapshot(self.node.ino)
+            })? {
+                Some(Ok(content)) => content,
+                Some(Err(_)) => return Some(0),
+                None => return None,
+            };
+            *snapshot = Some(content);
+        }
+
+        let content = snapshot.as_ref()?;
+        let start = offset.min(content.len());
+        let len = buf.len().min(content.len() - start);
+        buf[..len].copy_from_slice(&content[start..start + len]);
+        if len > 0 {
+            perf::record_procfs_snapshot_hit(len);
+        }
+        Some(len)
+    }
+
+    fn read_snapshot_user_buffer(&self, offset: &mut usize, buf: &mut UserBuffer) -> Option<usize> {
+        if !self.read_snapshot_supported {
+            return None;
+        }
+        let mut total_read_size = 0usize;
+        for slice in buf.buffers.iter_mut() {
+            let read_size = self.read_snapshot_at(*offset, slice)?;
+            if read_size == 0 {
+                break;
+            }
+            *offset = offset.checked_add(read_size).unwrap_or(usize::MAX);
+            total_read_size = total_read_size.saturating_add(read_size);
+            if read_size < slice.len() {
+                break;
+            }
+        }
+        Some(total_read_size)
     }
 
     fn read_coalesced_user_buffer(
@@ -1220,12 +1277,15 @@ impl File for VfsFile {
         let noatime_snapshot = self.noatime_snapshot();
         let mut offset = self.offset.lock();
         let mut total_read_size = 0usize;
-        if let Some(read_size) = self.read_coalesced_user_buffer(&mut offset, &mut buf) {
+        if let Some(read_size) = self.read_snapshot_user_buffer(&mut offset, &mut buf) {
+            total_read_size = read_size;
+        } else if let Some(read_size) = self.read_coalesced_user_buffer(&mut offset, &mut buf) {
             total_read_size = read_size;
         } else {
             for slice in buf.buffers.iter_mut() {
                 let read_size = self
-                    .read_regular_cached_at(*offset, slice)
+                    .read_snapshot_at(*offset, slice)
+                    .or_else(|| self.read_regular_cached_at(*offset, slice))
                     .unwrap_or_else(|| self.read_backend_at(*offset, slice));
                 if read_size == 0 {
                     break;
@@ -1261,12 +1321,10 @@ impl File for VfsFile {
             return 0;
         }
         let noatime_snapshot = self.noatime_snapshot();
-        let read_size = self.read_regular_cached_at(offset, buf).unwrap_or_else(|| {
-            with_mount(self.node.mount_id, |mount| {
-                mount.read_at(self.node.ino, buf, offset as u64)
-            })
-            .expect("filesystem mount is missing")
-        });
+        let read_size = self
+            .read_snapshot_at(offset, buf)
+            .or_else(|| self.read_regular_cached_at(offset, buf))
+            .unwrap_or_else(|| self.read_backend_at(offset, buf));
         if !buf.is_empty() {
             self.restore_noatime(noatime_snapshot);
         }
@@ -1277,6 +1335,7 @@ impl File for VfsFile {
         if self.kind == FsNodeKind::Directory {
             return 0;
         }
+        *self.read_snapshot.lock() = None;
         self.write_at_chunks(offset, buf)
     }
 

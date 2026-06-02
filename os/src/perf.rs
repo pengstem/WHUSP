@@ -59,6 +59,10 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) vfs_path_component_scans: usize,
     pub(crate) vfs_path_components: usize,
     pub(crate) vfs_path_component_allocs: usize,
+    pub(crate) procfs_content_builds: usize,
+    pub(crate) procfs_content_bytes: usize,
+    pub(crate) procfs_snapshot_hits: usize,
+    pub(crate) procfs_snapshot_hit_bytes: usize,
     pub(crate) vfs_write_user_buffer_calls: usize,
     pub(crate) vfs_write_user_buffer_slices: usize,
     pub(crate) vfs_write_backend_calls: usize,
@@ -238,6 +242,10 @@ mod enabled {
     static VFS_PATH_COMPONENT_SCANS: AtomicUsize = AtomicUsize::new(0);
     static VFS_PATH_COMPONENTS: AtomicUsize = AtomicUsize::new(0);
     static VFS_PATH_COMPONENT_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+    static PROCFS_CONTENT_BUILDS: AtomicUsize = AtomicUsize::new(0);
+    static PROCFS_CONTENT_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static PROCFS_SNAPSHOT_HITS: AtomicUsize = AtomicUsize::new(0);
+    static PROCFS_SNAPSHOT_HIT_BYTES: AtomicUsize = AtomicUsize::new(0);
     static VFS_WRITE_USER_BUFFER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static VFS_WRITE_USER_BUFFER_SLICES: AtomicUsize = AtomicUsize::new(0);
     static VFS_WRITE_BACKEND_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -521,6 +529,16 @@ mod enabled {
         VFS_PATH_COMPONENT_SCANS.fetch_add(1, Ordering::Relaxed);
         VFS_PATH_COMPONENTS.fetch_add(components, Ordering::Relaxed);
         VFS_PATH_COMPONENT_ALLOCS.fetch_add(allocations, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_procfs_content_build(bytes: usize) {
+        PROCFS_CONTENT_BUILDS.fetch_add(1, Ordering::Relaxed);
+        PROCFS_CONTENT_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_procfs_snapshot_hit(bytes: usize) {
+        PROCFS_SNAPSHOT_HITS.fetch_add(1, Ordering::Relaxed);
+        PROCFS_SNAPSHOT_HIT_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub(crate) fn record_vfs_write_user_buffer(slices: usize) {
@@ -912,6 +930,10 @@ mod enabled {
             vfs_path_component_scans: VFS_PATH_COMPONENT_SCANS.load(Ordering::Relaxed),
             vfs_path_components: VFS_PATH_COMPONENTS.load(Ordering::Relaxed),
             vfs_path_component_allocs: VFS_PATH_COMPONENT_ALLOCS.load(Ordering::Relaxed),
+            procfs_content_builds: PROCFS_CONTENT_BUILDS.load(Ordering::Relaxed),
+            procfs_content_bytes: PROCFS_CONTENT_BYTES.load(Ordering::Relaxed),
+            procfs_snapshot_hits: PROCFS_SNAPSHOT_HITS.load(Ordering::Relaxed),
+            procfs_snapshot_hit_bytes: PROCFS_SNAPSHOT_HIT_BYTES.load(Ordering::Relaxed),
             vfs_write_user_buffer_calls: VFS_WRITE_USER_BUFFER_CALLS.load(Ordering::Relaxed),
             vfs_write_user_buffer_slices: VFS_WRITE_USER_BUFFER_SLICES.load(Ordering::Relaxed),
             vfs_write_backend_calls: VFS_WRITE_BACKEND_CALLS.load(Ordering::Relaxed),
@@ -1099,6 +1121,10 @@ mod enabled {
          vfs_path_component_scans {}\n\
          vfs_path_components {}\n\
          vfs_path_component_allocs {}\n\
+         procfs_content_builds {}\n\
+         procfs_content_bytes {}\n\
+         procfs_snapshot_hits {}\n\
+         procfs_snapshot_hit_bytes {}\n\
          vfs_write_user_buffer_calls {}\n\
          vfs_write_user_buffer_slices {}\n\
          vfs_write_backend_calls {}\n\
@@ -1265,6 +1291,10 @@ mod enabled {
             stats.vfs_path_component_scans,
             stats.vfs_path_components,
             stats.vfs_path_component_allocs,
+            stats.procfs_content_builds,
+            stats.procfs_content_bytes,
+            stats.procfs_snapshot_hits,
+            stats.procfs_snapshot_hit_bytes,
             stats.vfs_write_user_buffer_calls,
             stats.vfs_write_user_buffer_slices,
             stats.vfs_write_backend_calls,
@@ -1507,6 +1537,12 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_vfs_path_components(_components: usize, _allocations: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_procfs_content_build(_bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_procfs_snapshot_hit(_bytes: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_vfs_write_user_buffer(_slices: usize) {}

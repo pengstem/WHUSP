@@ -148,6 +148,12 @@ pub(crate) trait FileSystemBackend: Send {
     }
     fn stat(&mut self, ino: u32) -> FsResult<FileStat>;
     fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize>;
+    fn supports_read_snapshot(&mut self, _ino: u32) -> bool {
+        false
+    }
+    fn read_snapshot(&mut self, _ino: u32) -> Option<FsResult<Vec<u8>>> {
+        None
+    }
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize;
     fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize;
     fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)>;
