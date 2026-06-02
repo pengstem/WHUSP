@@ -35,6 +35,7 @@ use lazy_static::lazy_static;
 // Bound each backend write while a shared file offset lock is held; large user
 // buffers still progress in order without monopolizing one mount backend.
 const VFS_WRITE_CHUNK_SIZE: usize = 64 * 1024;
+const VFS_READ_ALL_CHUNK_SIZE: usize = 64 * 1024;
 const VFS_READ_CACHE_MAX_FILE_SIZE: usize = 1024 * 1024;
 const VFS_READ_CACHE_READAHEAD_PAGES: usize = 8;
 const MODE_PERMISSIONS_MASK: u32 = 0o7777;
@@ -270,8 +271,9 @@ impl VfsFile {
 
     pub(crate) fn read_all(&self) -> Vec<u8> {
         let mut offset = self.offset.lock();
-        let mut buffer = [0u8; 4096];
+        let mut buffer = vec![0u8; VFS_READ_ALL_CHUNK_SIZE];
         let mut data = Vec::new();
+        perf::record_vfs_read_all_call();
         loop {
             let len = with_mount(self.node.mount_id, |mount| {
                 mount.read_at(self.node.ino, &mut buffer, *offset as u64)
@@ -280,6 +282,7 @@ impl VfsFile {
             if len == 0 {
                 break;
             }
+            perf::record_vfs_read_all_backend_read(len);
             *offset += len;
             data.extend_from_slice(&buffer[..len]);
         }
