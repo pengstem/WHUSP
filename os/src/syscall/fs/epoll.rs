@@ -114,6 +114,32 @@ impl EpollFile {
         }
     }
 
+    fn collect_ready_sources(&self, maxevents: usize, sources: &[usize]) -> Vec<LinuxEpollEvent> {
+        self.interests.exclusive_session(|interests| {
+            let mut ready_events = Vec::new();
+            let mut visits = 0usize;
+            for fd in sources.iter().copied() {
+                if ready_events.len() >= maxevents {
+                    break;
+                }
+                let Some(interest) = interests.get_mut(&fd) else {
+                    continue;
+                };
+                if interest.disabled {
+                    continue;
+                }
+                visits += 1;
+                let requested = epoll_to_poll_events(interest.event.events);
+                let poll_ready = interest.file.poll(requested);
+                if let Some(event) = epoll_ready_event_from_poll(interest, poll_ready, true) {
+                    ready_events.push(event);
+                }
+            }
+            perf::record_epoll_ready_list(visits, ready_events.len());
+            ready_events
+        })
+    }
+
     fn scan_ready_with_waiter(
         &self,
         maxevents: usize,
@@ -123,7 +149,7 @@ impl EpollFile {
             let mut ready_events = Vec::new();
             let mut visits = 0usize;
             let mut fallback_needed = false;
-            for interest in interests.values_mut() {
+            for (&fd, interest) in interests.iter_mut() {
                 visits += 1;
                 if ready_events.len() >= maxevents || interest.disabled {
                     continue;
@@ -131,36 +157,19 @@ impl EpollFile {
                 let requested = epoll_to_poll_events(interest.event.events);
                 let registrations_before = waiter.map_or(0, |waiter| waiter.registration_count());
                 let poll_ready = match waiter {
-                    Some(waiter) => interest.file.poll_with_wait(requested, Some(waiter)),
+                    Some(waiter) => {
+                        let _source = waiter.registration_source_guard(fd);
+                        interest.file.poll_with_wait(requested, Some(waiter))
+                    }
                     None => interest.file.poll(requested),
                 };
                 let registered =
                     waiter.is_some_and(|waiter| waiter.registration_count() > registrations_before);
-                let ready =
-                    poll_events_to_epoll(poll_ready) & epoll_readiness_mask(interest.event.events);
-                if ready == 0 {
-                    if interest.event.events & EPOLLET != 0 {
-                        interest.last_ready = 0;
-                    }
-                    if waiter.is_some() && !registered {
-                        fallback_needed = true;
-                    }
-                    continue;
+                if let Some(event) = epoll_ready_event_from_poll(interest, poll_ready, false) {
+                    ready_events.push(event);
+                } else if waiter.is_some() && !registered {
+                    fallback_needed = true;
                 }
-                if interest.event.events & EPOLLET != 0 && ready == interest.last_ready {
-                    if waiter.is_some() && !registered {
-                        fallback_needed = true;
-                    }
-                    continue;
-                }
-                interest.last_ready = ready;
-                if interest.event.events & EPOLLONESHOT != 0 {
-                    interest.disabled = true;
-                }
-                ready_events.push(LinuxEpollEvent {
-                    events: ready,
-                    data: interest.event.data,
-                });
             }
             perf::record_epoll_scan(visits, ready_events.len());
             EpollScanResult {
@@ -170,6 +179,31 @@ impl EpollFile {
             }
         })
     }
+}
+
+fn epoll_ready_event_from_poll(
+    interest: &mut EpollInterest,
+    poll_ready: PollEvents,
+    source_wake: bool,
+) -> Option<LinuxEpollEvent> {
+    let ready = poll_events_to_epoll(poll_ready) & epoll_readiness_mask(interest.event.events);
+    if ready == 0 {
+        if interest.event.events & EPOLLET != 0 {
+            interest.last_ready = 0;
+        }
+        return None;
+    }
+    if interest.event.events & EPOLLET != 0 && ready == interest.last_ready && !source_wake {
+        return None;
+    }
+    interest.last_ready = ready;
+    if interest.event.events & EPOLLONESHOT != 0 {
+        interest.disabled = true;
+    }
+    Some(LinuxEpollEvent {
+        events: ready,
+        data: interest.event.data,
+    })
 }
 
 impl File for EpollFile {
@@ -569,8 +603,20 @@ fn sys_epoll_wait_until(
     // epoll waiters on every monitored file. Keep the task runnable while
     // exposing Linux's sleeping state through /proc for LTP synchronizers.
     let _proc_sleep = ProcSleepGuard::new()?;
+    let mut ready_sources = Vec::new();
 
     loop {
+        if !ready_sources.is_empty() {
+            let ready_events = epoll.collect_ready_sources(maxevents, &ready_sources);
+            ready_sources.clear();
+            if !ready_events.is_empty() {
+                for (index, event) in ready_events.iter().enumerate() {
+                    write_epoll_event(token, events, index, *event)?;
+                }
+                return Ok(ready_events.len() as isize);
+            }
+        }
+
         let waiter = PollWaiter::new(current_task().ok_or(SysError::ESRCH)?);
         let scan = epoll.scan_ready_with_waiter(maxevents, Some(&waiter));
         if scan.waiter_registrations > 0 {
@@ -590,8 +636,12 @@ fn sys_epoll_wait_until(
         }
         if scan.waiter_registrations > 0 && !scan.fallback_needed {
             sleep_until_epoll_event(&waiter, deadline_us)?;
+            ready_sources = waiter.drain_ready_sources();
         } else {
             sleep_until_next_epoll_probe(deadline_us)?;
+            if scan.waiter_registrations > 0 {
+                ready_sources = waiter.drain_ready_sources();
+            }
         }
     }
 }

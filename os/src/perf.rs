@@ -47,6 +47,9 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) epoll_full_scans: usize,
     pub(crate) epoll_scan_interest_visits: usize,
     pub(crate) epoll_ready_events: usize,
+    pub(crate) epoll_ready_list_checks: usize,
+    pub(crate) epoll_ready_list_source_visits: usize,
+    pub(crate) epoll_ready_list_hits: usize,
     pub(crate) epoll_backoff_sleeps: usize,
     pub(crate) epoll_backoff_us: usize,
     pub(crate) epoll_waiter_registrations: usize,
@@ -246,6 +249,9 @@ mod enabled {
     static EPOLL_FULL_SCANS: AtomicUsize = AtomicUsize::new(0);
     static EPOLL_SCAN_INTEREST_VISITS: AtomicUsize = AtomicUsize::new(0);
     static EPOLL_READY_EVENTS: AtomicUsize = AtomicUsize::new(0);
+    static EPOLL_READY_LIST_CHECKS: AtomicUsize = AtomicUsize::new(0);
+    static EPOLL_READY_LIST_SOURCE_VISITS: AtomicUsize = AtomicUsize::new(0);
+    static EPOLL_READY_LIST_HITS: AtomicUsize = AtomicUsize::new(0);
     static EPOLL_BACKOFF_SLEEPS: AtomicUsize = AtomicUsize::new(0);
     static EPOLL_BACKOFF_US: AtomicUsize = AtomicUsize::new(0);
     static EPOLL_WAITER_REGISTRATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -513,6 +519,13 @@ mod enabled {
     pub(crate) fn record_epoll_scan(interest_visits: usize, ready_events: usize) {
         EPOLL_FULL_SCANS.fetch_add(1, Ordering::Relaxed);
         EPOLL_SCAN_INTEREST_VISITS.fetch_add(interest_visits, Ordering::Relaxed);
+        EPOLL_READY_EVENTS.fetch_add(ready_events, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_epoll_ready_list(source_visits: usize, ready_events: usize) {
+        EPOLL_READY_LIST_CHECKS.fetch_add(1, Ordering::Relaxed);
+        EPOLL_READY_LIST_SOURCE_VISITS.fetch_add(source_visits, Ordering::Relaxed);
+        EPOLL_READY_LIST_HITS.fetch_add(ready_events, Ordering::Relaxed);
         EPOLL_READY_EVENTS.fetch_add(ready_events, Ordering::Relaxed);
     }
 
@@ -1008,6 +1021,9 @@ mod enabled {
             epoll_full_scans: EPOLL_FULL_SCANS.load(Ordering::Relaxed),
             epoll_scan_interest_visits: EPOLL_SCAN_INTEREST_VISITS.load(Ordering::Relaxed),
             epoll_ready_events: EPOLL_READY_EVENTS.load(Ordering::Relaxed),
+            epoll_ready_list_checks: EPOLL_READY_LIST_CHECKS.load(Ordering::Relaxed),
+            epoll_ready_list_source_visits: EPOLL_READY_LIST_SOURCE_VISITS.load(Ordering::Relaxed),
+            epoll_ready_list_hits: EPOLL_READY_LIST_HITS.load(Ordering::Relaxed),
             epoll_backoff_sleeps: EPOLL_BACKOFF_SLEEPS.load(Ordering::Relaxed),
             epoll_backoff_us: EPOLL_BACKOFF_US.load(Ordering::Relaxed),
             epoll_waiter_registrations: EPOLL_WAITER_REGISTRATIONS.load(Ordering::Relaxed),
@@ -1221,6 +1237,9 @@ mod enabled {
          epoll_full_scans {}\n\
          epoll_scan_interest_visits {}\n\
          epoll_ready_events {}\n\
+         epoll_ready_list_checks {}\n\
+         epoll_ready_list_source_visits {}\n\
+         epoll_ready_list_hits {}\n\
          epoll_backoff_sleeps {}\n\
          epoll_backoff_us {}\n\
          epoll_waiter_registrations {}\n\
@@ -1409,6 +1428,9 @@ mod enabled {
             stats.epoll_full_scans,
             stats.epoll_scan_interest_visits,
             stats.epoll_ready_events,
+            stats.epoll_ready_list_checks,
+            stats.epoll_ready_list_source_visits,
+            stats.epoll_ready_list_hits,
             stats.epoll_backoff_sleeps,
             stats.epoll_backoff_us,
             stats.epoll_waiter_registrations,
@@ -1675,6 +1697,9 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_epoll_scan(_interest_visits: usize, _ready_events: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_epoll_ready_list(_source_visits: usize, _ready_events: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_epoll_backoff_sleep(_duration_us: usize) {}

@@ -24,8 +24,9 @@ mod tmpfs;
 mod vfs;
 
 use crate::mm::{UserBuffer, page_cache::PageCacheId};
+use crate::sync::UPIntrFreeCell;
 use alloc::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
@@ -82,10 +83,44 @@ bitflags! {
     }
 }
 
+const POLL_WAIT_NO_SOURCE: usize = usize::MAX;
+
+struct PollWaiterReadySources {
+    pending: VecDeque<usize>,
+    present: BTreeSet<usize>,
+}
+
+impl PollWaiterReadySources {
+    fn new() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            present: BTreeSet::new(),
+        }
+    }
+
+    fn push(&mut self, source: usize) {
+        if self.present.insert(source) {
+            self.pending.push_back(source);
+        }
+    }
+
+    fn drain(&mut self) -> Vec<usize> {
+        self.present.clear();
+        self.pending.drain(..).collect()
+    }
+}
+
 pub struct PollWaiter {
     task: Arc<crate::task::TaskControlBlock>,
     triggered: AtomicBool,
     registrations: AtomicUsize,
+    registration_source: AtomicUsize,
+    ready_sources: UPIntrFreeCell<PollWaiterReadySources>,
+}
+
+pub struct PollRegistrationSourceGuard<'a> {
+    waiter: &'a PollWaiter,
+    previous: usize,
 }
 
 impl PollWaiter {
@@ -94,6 +129,8 @@ impl PollWaiter {
             task,
             triggered: AtomicBool::new(false),
             registrations: AtomicUsize::new(0),
+            registration_source: AtomicUsize::new(POLL_WAIT_NO_SOURCE),
+            ready_sources: unsafe { UPIntrFreeCell::new(PollWaiterReadySources::new()) },
         })
     }
 
@@ -113,6 +150,30 @@ impl PollWaiter {
         self.registrations.fetch_add(1, Ordering::Release);
     }
 
+    pub fn registration_source_guard(&self, source: usize) -> PollRegistrationSourceGuard<'_> {
+        debug_assert_ne!(source, POLL_WAIT_NO_SOURCE);
+        let previous = self.registration_source.swap(source, Ordering::AcqRel);
+        PollRegistrationSourceGuard {
+            waiter: self,
+            previous,
+        }
+    }
+
+    fn registration_source(&self) -> Option<usize> {
+        let source = self.registration_source.load(Ordering::Acquire);
+        (source != POLL_WAIT_NO_SOURCE).then_some(source)
+    }
+
+    fn record_ready_source(&self, source: usize) {
+        self.ready_sources
+            .exclusive_session(|sources| sources.push(source));
+    }
+
+    pub fn drain_ready_sources(&self) -> Vec<usize> {
+        self.ready_sources
+            .exclusive_session(PollWaiterReadySources::drain)
+    }
+
     pub fn wake(&self) -> bool {
         self.triggered.store(true, Ordering::Release);
         crate::task::wakeup_task(Arc::clone(&self.task))
@@ -125,8 +186,21 @@ impl PollWaiter {
     }
 }
 
+impl Drop for PollRegistrationSourceGuard<'_> {
+    fn drop(&mut self) {
+        self.waiter
+            .registration_source
+            .store(self.previous, Ordering::Release);
+    }
+}
+
+struct PollWaitRegistration {
+    waiter: Weak<PollWaiter>,
+    source: Option<usize>,
+}
+
 pub struct PollWaitQueue {
-    waiters: VecDeque<Weak<PollWaiter>>,
+    waiters: VecDeque<PollWaitRegistration>,
 }
 
 impl PollWaitQueue {
@@ -137,16 +211,26 @@ impl PollWaitQueue {
     }
 
     pub fn register(&mut self, waiter: &Arc<PollWaiter>) {
-        self.waiters.retain(|waiter| waiter.strong_count() > 0);
+        self.waiters
+            .retain(|registration| registration.waiter.strong_count() > 0);
         waiter.record_registration();
-        self.waiters.push_back(Arc::downgrade(waiter));
+        self.waiters.push_back(PollWaitRegistration {
+            waiter: Arc::downgrade(waiter),
+            source: waiter.registration_source(),
+        });
     }
 
     pub fn drain(&mut self) -> Vec<Arc<PollWaiter>> {
         let waiters = core::mem::take(&mut self.waiters);
         waiters
             .into_iter()
-            .filter_map(|waiter| waiter.upgrade())
+            .filter_map(|registration| {
+                let waiter = registration.waiter.upgrade()?;
+                if let Some(source) = registration.source {
+                    waiter.record_ready_source(source);
+                }
+                Some(waiter)
+            })
             .collect()
     }
 }
