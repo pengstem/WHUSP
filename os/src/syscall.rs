@@ -415,6 +415,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         return 0;
     }
     if syscall_id == SYSCALL_EXIT_GROUP {
+        drop(current);
         sys_exit_group(args[0] as i32);
     }
     if let Some(value) = syscall_identity_fast_path(&current, syscall_id) {
