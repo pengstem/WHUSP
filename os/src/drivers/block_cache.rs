@@ -91,6 +91,9 @@ pub(crate) struct BlockCacheStats {
     pub(crate) read4k_invalidate: usize,
     pub(crate) read4k_fallback: usize,
     pub(crate) read4k_lru_touch: usize,
+    pub(crate) write4k_update: usize,
+    pub(crate) write4k_fallback: usize,
+    pub(crate) write4k_legacy_invalidate: usize,
     pub(crate) read_hit: usize,
     pub(crate) read_miss: usize,
     pub(crate) read_fill_sessions: usize,
@@ -226,23 +229,42 @@ impl BlockCache {
         self.trim_read4k_to_capacity();
     }
 
+    fn update_after_write4k(&mut self, device_key: usize, block_id: usize, data: &[u8]) {
+        debug_assert_eq!(data.len(), READ_CACHE_LINE_SIZE);
+        if !self.enabled || self.read_capacity == 0 {
+            return;
+        }
+        let key = ReadCacheKey::new(device_key, block_id);
+        let old_stamp = self.read_lines.get(&key).map(|line| line.lru_stamp);
+        let stamp = self.touch_read4k(key, old_stamp);
+        self.read_lines.insert(
+            key,
+            ReadCacheLine::new(data.to_vec().into_boxed_slice(), stamp),
+        );
+        self.stats.write4k_update += 1;
+        self.trim_read4k_to_capacity();
+    }
+
     fn invalidate_read4k_range(&mut self, device_key: usize, block_id: usize, blocks: usize) {
         if !self.enabled || blocks == 0 {
             return;
         }
         let end_block = block_id.saturating_add(blocks);
+        let first_overlapping_line = block_id.saturating_sub(READ_CACHE_LINE_BLOCKS - 1);
         let victims: Vec<ReadCacheKey> = self
             .read_lines
-            .keys()
-            .copied()
+            .range(
+                ReadCacheKey::new(device_key, first_overlapping_line)
+                    ..ReadCacheKey::new(device_key, end_block),
+            )
+            .map(|(key, _line)| *key)
             .filter(|key| {
-                key.device_key == device_key
-                    && ranges_overlap(
-                        key.line_block_id,
-                        key.line_block_id.saturating_add(READ_CACHE_LINE_BLOCKS),
-                        block_id,
-                        end_block,
-                    )
+                ranges_overlap(
+                    key.line_block_id,
+                    key.line_block_id.saturating_add(READ_CACHE_LINE_BLOCKS),
+                    block_id,
+                    end_block,
+                )
             })
             .collect();
         for key in victims {
@@ -256,8 +278,34 @@ impl BlockCache {
         }
     }
 
+    fn invalidate_legacy_range_after_write(
+        &mut self,
+        device_key: usize,
+        block_id: usize,
+        blocks: usize,
+    ) {
+        if !self.enabled || blocks == 0 {
+            return;
+        }
+        for offset in 0..blocks {
+            let key = BlockCacheKey::new(device_key, block_id + offset);
+            if let Some(line) = self.lines.remove(&key) {
+                self.lru.remove(&BlockCacheLruEntry {
+                    stamp: line.lru_stamp,
+                    key,
+                });
+                self.stats.write_invalidate += 1;
+                self.stats.write4k_legacy_invalidate += 1;
+            }
+        }
+    }
+
     fn record_read4k_fallback(&mut self) {
         self.stats.read4k_fallback += 1;
+    }
+
+    fn record_write4k_fallback(&mut self) {
+        self.stats.write4k_fallback += 1;
     }
 
     fn read_or_miss_run(
@@ -420,6 +468,12 @@ fn cache_insert_read4k(device_key: usize, block_id: usize, data: &[u8]) {
         .insert_read4k(device_key, block_id, data);
 }
 
+fn cache_update_after_write4k(device_key: usize, block_id: usize, data: &[u8]) {
+    BLOCK_CACHE
+        .exclusive_access()
+        .update_after_write4k(device_key, block_id, data);
+}
+
 fn cache_insert_read_run(device_key: usize, block_id: usize, data: &[u8]) {
     BLOCK_CACHE
         .exclusive_access()
@@ -436,6 +490,12 @@ fn cache_invalidate_read4k_range(device_key: usize, block_id: usize, blocks: usi
     BLOCK_CACHE
         .exclusive_access()
         .invalidate_read4k_range(device_key, block_id, blocks);
+}
+
+fn cache_invalidate_legacy_range_after_write(device_key: usize, block_id: usize, blocks: usize) {
+    BLOCK_CACHE
+        .exclusive_access()
+        .invalidate_legacy_range_after_write(device_key, block_id, blocks);
 }
 
 fn cache_invalidate_key_after_write(device_key: usize, block_id: usize) {
@@ -465,6 +525,10 @@ fn record_read4k_fallback() {
     BLOCK_CACHE.exclusive_access().record_read4k_fallback();
 }
 
+fn record_write4k_fallback() {
+    BLOCK_CACHE.exclusive_access().record_write4k_fallback();
+}
+
 fn page_bounded_full_blocks(buf: &[u8], max_blocks: usize) -> usize {
     if max_blocks == 0 {
         return 0;
@@ -481,6 +545,11 @@ fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) ->
 }
 
 fn can_use_read4k(_block_id: usize, buf: &[u8], remaining_blocks: usize) -> bool {
+    remaining_blocks >= READ_CACHE_LINE_BLOCKS
+        && page_bounded_full_blocks(buf, remaining_blocks) >= READ_CACHE_LINE_BLOCKS
+}
+
+fn can_use_write4k(buf: &[u8], remaining_blocks: usize) -> bool {
     remaining_blocks >= READ_CACHE_LINE_BLOCKS
         && page_bounded_full_blocks(buf, remaining_blocks) >= READ_CACHE_LINE_BLOCKS
 }
@@ -554,6 +623,21 @@ pub(crate) fn write_with_cache<F>(
     let mut index = 0;
     while index < full_blocks {
         let start = index * BLOCK_CACHE_LINE_SIZE;
+        if can_use_write4k(&buf[start..full_bytes], full_blocks - index) {
+            let end = start + READ_CACHE_LINE_SIZE;
+            record_device_write_submit(READ_CACHE_LINE_BLOCKS);
+            write_uncached(block_id + index, &buf[start..end]);
+            cache_invalidate_read4k_range(device_key, block_id + index, READ_CACHE_LINE_BLOCKS);
+            cache_invalidate_legacy_range_after_write(
+                device_key,
+                block_id + index,
+                READ_CACHE_LINE_BLOCKS,
+            );
+            cache_update_after_write4k(device_key, block_id + index, &buf[start..end]);
+            index += READ_CACHE_LINE_BLOCKS;
+            continue;
+        }
+        record_write4k_fallback();
         let blocks = page_bounded_full_blocks(&buf[start..full_bytes], full_blocks - index);
         let end = start + blocks * BLOCK_CACHE_LINE_SIZE;
         record_device_write_submit(blocks);
@@ -566,6 +650,7 @@ pub(crate) fn write_with_cache<F>(
     let tail = &buf[full_bytes..];
     if !tail.is_empty() {
         record_bypass_unaligned();
+        record_write4k_fallback();
         record_device_write_submit(1);
         write_uncached(block_id + full_blocks, tail);
         cache_invalidate_read4k_range(device_key, block_id + full_blocks, 1);
@@ -580,7 +665,7 @@ pub(crate) fn stats_snapshot() -> BlockCacheStats {
 pub(crate) fn stats_content() -> String {
     let stats = stats_snapshot();
     format!(
-        "enabled {}\nentries {}\ncapacity {}\nread4k_entries {}\nread4k_capacity {}\nread4k_hit {}\nread4k_miss {}\nread4k_fill {}\nread4k_evict {}\nread4k_invalidate {}\nread4k_fallback {}\nread4k_lru_touch {}\nread_hit {}\nread_miss {}\nread_fill_sessions {}\nwrite_update {}\nwrite_update_sessions {}\nwrite_invalidate {}\nevict {}\ndevice_read_submit {}\ndevice_read_blocks {}\ndevice_read_max_blocks {}\ndevice_write_submit {}\ndevice_write_blocks {}\ndevice_write_max_blocks {}\nbypass_unaligned {}\nlru_touch {}\nlru_scan_slots {}\n",
+        "enabled {}\nentries {}\ncapacity {}\nread4k_entries {}\nread4k_capacity {}\nread4k_hit {}\nread4k_miss {}\nread4k_fill {}\nread4k_evict {}\nread4k_invalidate {}\nread4k_fallback {}\nread4k_lru_touch {}\nwrite4k_update {}\nwrite4k_fallback {}\nwrite4k_legacy_invalidate {}\nread_hit {}\nread_miss {}\nread_fill_sessions {}\nwrite_update {}\nwrite_update_sessions {}\nwrite_invalidate {}\nevict {}\ndevice_read_submit {}\ndevice_read_blocks {}\ndevice_read_max_blocks {}\ndevice_write_submit {}\ndevice_write_blocks {}\ndevice_write_max_blocks {}\nbypass_unaligned {}\nlru_touch {}\nlru_scan_slots {}\n",
         stats.enabled as usize,
         stats.entries,
         stats.capacity,
@@ -593,6 +678,9 @@ pub(crate) fn stats_content() -> String {
         stats.read4k_invalidate,
         stats.read4k_fallback,
         stats.read4k_lru_touch,
+        stats.write4k_update,
+        stats.write4k_fallback,
+        stats.write4k_legacy_invalidate,
         stats.read_hit,
         stats.read_miss,
         stats.read_fill_sessions,

@@ -1754,6 +1754,9 @@ fn oskernel_perf_content() -> String {
          block_cache_read4k_invalidate {}\n\
          block_cache_read4k_fallback {}\n\
          block_cache_read4k_lru_touch {}\n\
+         block_cache_write4k_update {}\n\
+         block_cache_write4k_fallback {}\n\
+         block_cache_write4k_legacy_invalidate {}\n\
          block_cache_read_hit {}\n\
          block_cache_read_miss {}\n\
          block_cache_read_fill_sessions {}\n\
@@ -1835,6 +1838,9 @@ fn oskernel_perf_content() -> String {
         block.read4k_invalidate,
         block.read4k_fallback,
         block.read4k_lru_touch,
+        block.write4k_update,
+        block.write4k_fallback,
+        block.write4k_legacy_invalidate,
         block.read_hit,
         block.read_miss,
         block.read_fill_sessions,
