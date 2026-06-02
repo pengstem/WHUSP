@@ -1743,6 +1743,7 @@ fn oskernel_perf_content() -> String {
          vfs_dirty_writeback_pressure_flushed_bytes {}\n\
          vfs_dirty_writeback_pressure_flush_failures {}\n\
          block_cache_enabled {}\n\
+         block_cache_metrics_enabled {}\n\
          block_cache_entries {}\n\
          block_cache_capacity {}\n\
          block_cache_read4k_entries {}\n\
@@ -1827,6 +1828,7 @@ fn oskernel_perf_content() -> String {
         dirty_writeback.pressure_flushed_bytes,
         dirty_writeback.pressure_flush_failures,
         block.enabled as usize,
+        block.metrics_enabled as usize,
         block.entries,
         block.capacity,
         block.read4k_entries,

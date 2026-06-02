@@ -13,6 +13,23 @@ const READ_CACHE_LINE_BLOCKS: usize = PAGE_SIZE / BLOCK_CACHE_LINE_SIZE;
 const READ_CACHE_LINE_SIZE: usize = READ_CACHE_LINE_BLOCKS * BLOCK_CACHE_LINE_SIZE;
 const DEFAULT_READ_CACHE_CAPACITY: usize = 2048;
 
+#[cfg(feature = "perf-counters")]
+macro_rules! record_cache_stat {
+    ($($body:tt)*) => {
+        $($body)*
+    };
+}
+
+#[cfg(not(feature = "perf-counters"))]
+macro_rules! record_cache_stat {
+    ($($body:tt)*) => {};
+}
+
+#[inline(always)]
+fn metrics_enabled() -> bool {
+    cfg!(feature = "perf-counters")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct BlockCacheKey {
     device_key: usize,
@@ -80,6 +97,7 @@ struct ReadCacheLruEntry {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct BlockCacheStats {
     pub(crate) enabled: bool,
+    pub(crate) metrics_enabled: bool,
     pub(crate) entries: usize,
     pub(crate) capacity: usize,
     pub(crate) read4k_entries: usize,
@@ -147,7 +165,9 @@ impl BlockCache {
     }
 
     fn touch(&mut self, key: BlockCacheKey, old_stamp: Option<usize>) -> usize {
-        self.stats.lru_touch += 1;
+        record_cache_stat! {
+            self.stats.lru_touch += 1;
+        }
         if let Some(stamp) = old_stamp {
             self.lru.remove(&BlockCacheLruEntry { stamp, key });
         }
@@ -158,7 +178,9 @@ impl BlockCache {
     }
 
     fn touch_read4k(&mut self, key: ReadCacheKey, old_stamp: Option<usize>) -> usize {
-        self.stats.read4k_lru_touch += 1;
+        record_cache_stat! {
+            self.stats.read4k_lru_touch += 1;
+        }
         if let Some(stamp) = old_stamp {
             self.read_lru.remove(&ReadCacheLruEntry { stamp, key });
         }
@@ -175,7 +197,9 @@ impl BlockCache {
             };
             self.lru.remove(&victim);
             if self.lines.remove(&victim.key).is_some() {
-                self.stats.evict += 1;
+                record_cache_stat! {
+                    self.stats.evict += 1;
+                }
             }
         }
     }
@@ -187,7 +211,9 @@ impl BlockCache {
             };
             self.read_lru.remove(&victim);
             if self.read_lines.remove(&victim.key).is_some() {
-                self.stats.read4k_evict += 1;
+                record_cache_stat! {
+                    self.stats.read4k_evict += 1;
+                }
             }
         }
     }
@@ -202,14 +228,18 @@ impl BlockCache {
             debug_assert_eq!(line.data.len(), READ_CACHE_LINE_SIZE);
             buf.copy_from_slice(line.data.as_ref());
             let old_stamp = line.lru_stamp;
-            self.stats.read4k_hit += 1;
+            record_cache_stat! {
+                self.stats.read4k_hit += 1;
+            }
             let stamp = self.touch_read4k(key, Some(old_stamp));
             if let Some(line) = self.read_lines.get_mut(&key) {
                 line.lru_stamp = stamp;
             }
             return true;
         }
-        self.stats.read4k_miss += 1;
+        record_cache_stat! {
+            self.stats.read4k_miss += 1;
+        }
         false
     }
 
@@ -225,7 +255,9 @@ impl BlockCache {
             key,
             ReadCacheLine::new(data.to_vec().into_boxed_slice(), stamp),
         );
-        self.stats.read4k_fill += 1;
+        record_cache_stat! {
+            self.stats.read4k_fill += 1;
+        }
         self.trim_read4k_to_capacity();
     }
 
@@ -241,7 +273,9 @@ impl BlockCache {
             key,
             ReadCacheLine::new(data.to_vec().into_boxed_slice(), stamp),
         );
-        self.stats.write4k_update += 1;
+        record_cache_stat! {
+            self.stats.write4k_update += 1;
+        }
         self.trim_read4k_to_capacity();
     }
 
@@ -273,7 +307,9 @@ impl BlockCache {
                     stamp: line.lru_stamp,
                     key,
                 });
-                self.stats.read4k_invalidate += 1;
+                record_cache_stat! {
+                    self.stats.read4k_invalidate += 1;
+                }
             }
         }
     }
@@ -294,18 +330,26 @@ impl BlockCache {
                     stamp: line.lru_stamp,
                     key,
                 });
-                self.stats.write_invalidate += 1;
-                self.stats.write4k_legacy_invalidate += 1;
+                record_cache_stat! {
+                    self.stats.write_invalidate += 1;
+                    self.stats.write4k_legacy_invalidate += 1;
+                }
             }
         }
     }
 
+    #[cfg(feature = "perf-counters")]
     fn record_read4k_fallback(&mut self) {
-        self.stats.read4k_fallback += 1;
+        record_cache_stat! {
+            self.stats.read4k_fallback += 1;
+        }
     }
 
+    #[cfg(feature = "perf-counters")]
     fn record_write4k_fallback(&mut self) {
-        self.stats.write4k_fallback += 1;
+        record_cache_stat! {
+            self.stats.write4k_fallback += 1;
+        }
     }
 
     fn read_or_miss_run(
@@ -324,7 +368,9 @@ impl BlockCache {
         if let Some(line) = self.lines.get(&key) {
             first_buf.copy_from_slice(&line.data);
             let old_stamp = line.lru_stamp;
-            self.stats.read_hit += 1;
+            record_cache_stat! {
+                self.stats.read_hit += 1;
+            }
             let stamp = self.touch(key, Some(old_stamp));
             if let Some(line) = self.lines.get_mut(&key) {
                 line.lru_stamp = stamp;
@@ -332,14 +378,18 @@ impl BlockCache {
             return None;
         }
 
-        self.stats.read_miss += 1;
+        record_cache_stat! {
+            self.stats.read_miss += 1;
+        }
         let mut blocks = 1;
         while blocks < max_blocks {
             let key = BlockCacheKey::new(device_key, block_id + blocks);
             if self.lines.contains_key(&key) {
                 break;
             }
-            self.stats.read_miss += 1;
+            record_cache_stat! {
+                self.stats.read_miss += 1;
+            }
             blocks += 1;
         }
         Some(blocks)
@@ -359,7 +409,9 @@ impl BlockCache {
         if !self.enabled || self.capacity == 0 {
             return;
         }
-        self.stats.read_fill_sessions += 1;
+        record_cache_stat! {
+            self.stats.read_fill_sessions += 1;
+        }
         for (offset, chunk) in data.chunks(BLOCK_CACHE_LINE_SIZE).enumerate() {
             if chunk.len() != BLOCK_CACHE_LINE_SIZE {
                 break;
@@ -377,7 +429,9 @@ impl BlockCache {
         let old_stamp = self.lines.get(&key).map(|line| line.lru_stamp);
         let stamp = self.touch(key, old_stamp);
         self.lines.insert(key, BlockCacheLine::new(data, stamp));
-        self.stats.write_update += 1;
+        record_cache_stat! {
+            self.stats.write_update += 1;
+        }
         self.trim_to_capacity();
     }
 
@@ -385,7 +439,9 @@ impl BlockCache {
         if !self.enabled || self.capacity == 0 {
             return;
         }
-        self.stats.write_update_sessions += 1;
+        record_cache_stat! {
+            self.stats.write_update_sessions += 1;
+        }
         for (offset, chunk) in data.chunks(BLOCK_CACHE_LINE_SIZE).enumerate() {
             if chunk.len() != BLOCK_CACHE_LINE_SIZE {
                 break;
@@ -405,29 +461,41 @@ impl BlockCache {
                 stamp: line.lru_stamp,
                 key,
             });
-            self.stats.write_invalidate += 1;
+            record_cache_stat! {
+                self.stats.write_invalidate += 1;
+            }
         }
     }
 
+    #[cfg(feature = "perf-counters")]
     fn record_device_read_submit(&mut self, blocks: usize) {
-        self.stats.device_read_submit += 1;
-        self.stats.device_read_blocks += blocks;
-        self.stats.device_read_max_blocks = self.stats.device_read_max_blocks.max(blocks);
+        record_cache_stat! {
+            self.stats.device_read_submit += 1;
+            self.stats.device_read_blocks += blocks;
+            self.stats.device_read_max_blocks = self.stats.device_read_max_blocks.max(blocks);
+        }
     }
 
+    #[cfg(feature = "perf-counters")]
     fn record_device_write_submit(&mut self, blocks: usize) {
-        self.stats.device_write_submit += 1;
-        self.stats.device_write_blocks += blocks;
-        self.stats.device_write_max_blocks = self.stats.device_write_max_blocks.max(blocks);
+        record_cache_stat! {
+            self.stats.device_write_submit += 1;
+            self.stats.device_write_blocks += blocks;
+            self.stats.device_write_max_blocks = self.stats.device_write_max_blocks.max(blocks);
+        }
     }
 
+    #[cfg(feature = "perf-counters")]
     fn record_bypass_unaligned(&mut self) {
-        self.stats.bypass_unaligned += 1;
+        record_cache_stat! {
+            self.stats.bypass_unaligned += 1;
+        }
     }
 
     fn stats_snapshot(&self) -> BlockCacheStats {
         BlockCacheStats {
             enabled: self.enabled,
+            metrics_enabled: metrics_enabled(),
             entries: self.lines.len(),
             capacity: self.capacity,
             read4k_entries: self.read_lines.len(),
@@ -505,29 +573,54 @@ fn cache_invalidate_key_after_write(device_key: usize, block_id: usize) {
         .invalidate_key_after_write(key);
 }
 
+#[cfg(feature = "perf-counters")]
 fn record_device_read_submit(blocks: usize) {
     BLOCK_CACHE
         .exclusive_access()
         .record_device_read_submit(blocks);
 }
 
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_device_read_submit(_blocks: usize) {}
+
+#[cfg(feature = "perf-counters")]
 fn record_device_write_submit(blocks: usize) {
     BLOCK_CACHE
         .exclusive_access()
         .record_device_write_submit(blocks);
 }
 
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_device_write_submit(_blocks: usize) {}
+
+#[cfg(feature = "perf-counters")]
 fn record_bypass_unaligned() {
     BLOCK_CACHE.exclusive_access().record_bypass_unaligned();
 }
 
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_bypass_unaligned() {}
+
+#[cfg(feature = "perf-counters")]
 fn record_read4k_fallback() {
     BLOCK_CACHE.exclusive_access().record_read4k_fallback();
 }
 
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_read4k_fallback() {}
+
+#[cfg(feature = "perf-counters")]
 fn record_write4k_fallback() {
     BLOCK_CACHE.exclusive_access().record_write4k_fallback();
 }
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_write4k_fallback() {}
 
 fn page_bounded_full_blocks(buf: &[u8], max_blocks: usize) -> usize {
     if max_blocks == 0 {
@@ -665,8 +758,9 @@ pub(crate) fn stats_snapshot() -> BlockCacheStats {
 pub(crate) fn stats_content() -> String {
     let stats = stats_snapshot();
     format!(
-        "enabled {}\nentries {}\ncapacity {}\nread4k_entries {}\nread4k_capacity {}\nread4k_hit {}\nread4k_miss {}\nread4k_fill {}\nread4k_evict {}\nread4k_invalidate {}\nread4k_fallback {}\nread4k_lru_touch {}\nwrite4k_update {}\nwrite4k_fallback {}\nwrite4k_legacy_invalidate {}\nread_hit {}\nread_miss {}\nread_fill_sessions {}\nwrite_update {}\nwrite_update_sessions {}\nwrite_invalidate {}\nevict {}\ndevice_read_submit {}\ndevice_read_blocks {}\ndevice_read_max_blocks {}\ndevice_write_submit {}\ndevice_write_blocks {}\ndevice_write_max_blocks {}\nbypass_unaligned {}\nlru_touch {}\nlru_scan_slots {}\n",
+        "enabled {}\nmetrics_enabled {}\nentries {}\ncapacity {}\nread4k_entries {}\nread4k_capacity {}\nread4k_hit {}\nread4k_miss {}\nread4k_fill {}\nread4k_evict {}\nread4k_invalidate {}\nread4k_fallback {}\nread4k_lru_touch {}\nwrite4k_update {}\nwrite4k_fallback {}\nwrite4k_legacy_invalidate {}\nread_hit {}\nread_miss {}\nread_fill_sessions {}\nwrite_update {}\nwrite_update_sessions {}\nwrite_invalidate {}\nevict {}\ndevice_read_submit {}\ndevice_read_blocks {}\ndevice_read_max_blocks {}\ndevice_write_submit {}\ndevice_write_blocks {}\ndevice_write_max_blocks {}\nbypass_unaligned {}\nlru_touch {}\nlru_scan_slots {}\n",
         stats.enabled as usize,
+        stats.metrics_enabled as usize,
         stats.entries,
         stats.capacity,
         stats.read4k_entries,
