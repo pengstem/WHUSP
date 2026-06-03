@@ -240,6 +240,9 @@ fn write_waitid_siginfo(
 }
 
 struct WaitZombie {
+    // Index into the caller's locked children slice. It is valid only until
+    // the parent PCB lock is released, so reap paths must remove the child
+    // before dropping that lock.
     idx: usize,
     pid: usize,
     exit_code: i32,
@@ -259,6 +262,9 @@ fn scan_wait4_children(
     waiter_pid: usize,
     include_untraced: bool,
 ) -> Wait4ChildScan {
+    // Keep stop and zombie discovery in one parent-child-list pass. Ptrace
+    // stop status is observable without reaping, while the zombie record
+    // carries the removal index for the later wait4 reap boundary.
     perf::record_wait_child_scan(children.len());
     let mut scan = Wait4ChildScan {
         matched: false,
@@ -304,6 +310,9 @@ fn scan_waitid_children(
     caller_pgid: usize,
     options: i32,
 ) -> WaitidChildScan {
+    // waitid distinguishes stopped, continued, and exited observations. Record
+    // only the first matching state of each kind so WNOWAIT can observe without
+    // consuming the wrong child-list entry.
     perf::record_wait_child_scan(children.len());
     let mut scan = WaitidChildScan {
         matched: false,

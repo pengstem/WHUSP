@@ -17,6 +17,8 @@ impl IntrTargetPriority {
 
 impl PLIC {
     fn priority_ptr(&self, intr_source_id: usize) -> *mut u32 {
+        // QEMU virt exposes interrupt source ids in the SiFive PLIC priority
+        // table range used here; source id 0 is reserved by the PLIC spec.
         assert!(intr_source_id > 0 && intr_source_id <= 132);
         (self.base_addr + intr_source_id * 4) as *mut u32
     }
@@ -32,6 +34,8 @@ impl PLIC {
     ) -> (*mut u32, usize) {
         let id = Self::hart_id_with_priority(hart_id, target_priority);
         let (reg_id, reg_shift) = (intr_source_id / 32, intr_source_id % 32);
+        // Enable registers are indexed by PLIC context, then by 32-source
+        // words. The returned shift is the source bit within that word.
         (
             (self.base_addr + 0x2000 + 0x80 * id + 0x4 * reg_id) as *mut u32,
             reg_shift,
@@ -43,6 +47,8 @@ impl PLIC {
         target_priority: IntrTargetPriority,
     ) -> *mut u32 {
         let id = Self::hart_id_with_priority(hart_id, target_priority);
+        // Each PLIC context owns a threshold register at the start of its
+        // 0x1000-byte context window.
         (self.base_addr + 0x20_0000 + 0x1000 * id) as *mut u32
     }
     fn claim_comp_ptr_of_hart_with_priority(
@@ -51,6 +57,8 @@ impl PLIC {
         target_priority: IntrTargetPriority,
     ) -> *mut u32 {
         let id = Self::hart_id_with_priority(hart_id, target_priority);
+        // Claim and completion share the same context register. Reads claim an
+        // interrupt id; writes of that id complete it back to the PLIC.
         (self.base_addr + 0x20_0004 + 0x1000 * id) as *mut u32
     }
     pub unsafe fn new(base_addr: usize) -> Self {

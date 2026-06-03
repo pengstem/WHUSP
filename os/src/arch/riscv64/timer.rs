@@ -47,6 +47,9 @@ pub fn init_wall_clock() {
     if base == 0 {
         return;
     }
+    // Goldfish RTC exposes a stable wall-clock seed, while the scheduler and
+    // timer heaps continue to run on monotonic ticks. Store only the offset so
+    // CLOCK_REALTIME can move without changing monotonic deadlines.
     // Goldfish-RTC: TIME_LOW at +0x00, TIME_HIGH at +0x04 (nanoseconds since epoch)
     let time_low = unsafe { core::ptr::read_volatile(base as *const u32) } as u64;
     let time_high = unsafe { core::ptr::read_volatile((base + 0x04) as *const u32) } as u64;
@@ -239,6 +242,9 @@ fn check_real_timers(current_us: usize) {
         let Some(process) = event.process.upgrade() else {
             continue;
         };
+        // setitimer() can rearm or disarm a timer while an older heap entry
+        // remains queued. The per-process generation check discards those
+        // stale entries before any signal is delivered.
         let Some((task, next_timer)) = process.expire_real_timer(event.generation, current_us)
         else {
             continue;
@@ -265,6 +271,8 @@ fn check_posix_timers(current_us: usize) {
         let Some(process) = event.process.upgrade() else {
             continue;
         };
+        // POSIX timer ids can be deleted and reused; the generation snapshot
+        // in each heap event protects the new timer from an old expiration.
         let Some((task, signal, next_timer)) =
             process.expire_posix_timer(event.timer_id, event.generation, current_us)
         else {

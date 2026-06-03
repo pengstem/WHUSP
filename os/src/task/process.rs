@@ -152,6 +152,9 @@ pub struct ProcessCpuTimesSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilitySets {
+    // Linux capability syscalls expose two u32 words for v2/v3 headers. Keep
+    // the storage in that ABI shape so capget/capset can copy fields without
+    // re-encoding every call.
     pub effective: [u32; 2],
     pub permitted: [u32; 2],
     pub inheritable: [u32; 2],
@@ -489,6 +492,8 @@ impl ProcessCpuTimes {
 pub(crate) struct ProcessRealTimer {
     pub(crate) interval_us: usize,
     pub(crate) next_expire_us: usize,
+    // Incremented on every set; timer heaps carry a snapshot so stale events
+    // left behind by rearming or disarming are ignored at interrupt time.
     pub(crate) generation: u64,
 }
 
@@ -512,6 +517,8 @@ pub(crate) struct ProcessPosixTimer {
     pub(crate) signal: u32,
     pub(crate) interval_us: usize,
     pub(crate) next_expire_us: usize,
+    // Mirrors ProcessRealTimer::generation for POSIX timer ids, where delete
+    // and settime can leave older heap events pending after the slot changes.
     pub(crate) generation: u64,
 }
 

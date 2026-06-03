@@ -3,10 +3,13 @@ use super::area::ExecSegmentInfo;
 use super::{MapArea, MapPermission, MapType, MemorySet, VirtAddr};
 use crate::config::{DL_INTERP_OFFSET, PAGE_SIZE, USER_HEAP_SIZE, USER_MMAP_BASE, USER_STACK_SIZE};
 use crate::fs::File;
+#[cfg(feature = "perf-counters")]
 use crate::sync::UPIntrFreeCell;
+#[cfg(feature = "perf-counters")]
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+#[cfg(feature = "perf-counters")]
 use lazy_static::*;
 use xmas_elf::{header, program::Type};
 
@@ -23,6 +26,7 @@ pub struct ElfLoadInfo {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
 pub struct ExecLoadStats {
     pub elf_header_bytes_read: usize,
     pub phdr_bytes_read: usize,
@@ -37,27 +41,44 @@ pub struct ExecLoadStats {
     pub lazy_segment_vmas: usize,
 }
 
+#[cfg(feature = "perf-counters")]
 lazy_static! {
     static ref EXEC_LOAD_STATS: UPIntrFreeCell<ExecLoadStats> =
         unsafe { UPIntrFreeCell::new(ExecLoadStats::default()) };
 }
 
+#[cfg(feature = "perf-counters")]
 pub(crate) fn record_exec_metadata_read(header_bytes: usize, phdr_bytes: usize) {
     let mut stats = EXEC_LOAD_STATS.exclusive_access();
     stats.elf_header_bytes_read = stats.elf_header_bytes_read.saturating_add(header_bytes);
     stats.phdr_bytes_read = stats.phdr_bytes_read.saturating_add(phdr_bytes);
 }
 
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+pub(crate) fn record_exec_metadata_read(_header_bytes: usize, _phdr_bytes: usize) {}
+
+#[cfg(feature = "perf-counters")]
 fn record_exec_eager_segment_bytes_read(bytes: usize) {
     let mut stats = EXEC_LOAD_STATS.exclusive_access();
     stats.eager_segment_bytes_read = stats.eager_segment_bytes_read.saturating_add(bytes);
 }
 
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_exec_eager_segment_bytes_read(_bytes: usize) {}
+
+#[cfg(feature = "perf-counters")]
 fn record_exec_lazy_segment_vma() {
     let mut stats = EXEC_LOAD_STATS.exclusive_access();
     stats.lazy_segment_vmas = stats.lazy_segment_vmas.saturating_add(1);
 }
 
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_exec_lazy_segment_vma() {}
+
+#[cfg(feature = "perf-counters")]
 pub(super) fn record_exec_lazy_fault(bytes_read: usize, zero_fill_bytes: usize) {
     let mut stats = EXEC_LOAD_STATS.exclusive_access();
     stats.lazy_segment_faults = stats.lazy_segment_faults.saturating_add(1);
@@ -65,6 +86,11 @@ pub(super) fn record_exec_lazy_fault(bytes_read: usize, zero_fill_bytes: usize) 
     stats.zero_fill_bytes = stats.zero_fill_bytes.saturating_add(zero_fill_bytes);
 }
 
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+pub(super) fn record_exec_lazy_fault(_bytes_read: usize, _zero_fill_bytes: usize) {}
+
+#[cfg(feature = "perf-counters")]
 pub(super) fn record_exec_lazy_page_cache_fault(hit: bool, bytes_read: usize) {
     let mut stats = EXEC_LOAD_STATS.exclusive_access();
     stats.lazy_segment_faults = stats.lazy_segment_faults.saturating_add(1);
@@ -79,10 +105,22 @@ pub(super) fn record_exec_lazy_page_cache_fault(hit: bool, bytes_read: usize) {
     }
 }
 
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+pub(super) fn record_exec_lazy_page_cache_fault(_hit: bool, _bytes_read: usize) {}
+
+#[cfg(feature = "perf-counters")]
 pub(crate) fn exec_load_stats_snapshot() -> ExecLoadStats {
     *EXEC_LOAD_STATS.exclusive_access()
 }
 
+#[cfg(not(feature = "perf-counters"))]
+#[allow(dead_code)]
+pub(crate) fn exec_load_stats_snapshot() -> ExecLoadStats {
+    ExecLoadStats::default()
+}
+
+#[cfg(feature = "perf-counters")]
 pub(crate) fn exec_load_stats_content() -> String {
     let stats = exec_load_stats_snapshot();
     format!(
@@ -109,6 +147,11 @@ pub(crate) fn exec_load_stats_content() -> String {
         stats.lazy_page_cache_bytes_read,
         stats.zero_fill_bytes
     )
+}
+
+#[cfg(not(feature = "perf-counters"))]
+pub(crate) fn exec_load_stats_content() -> String {
+    String::from("exec_load_stats_enabled 0\n")
 }
 
 fn phdr_address(elf: &xmas_elf::ElfFile<'_>) -> usize {

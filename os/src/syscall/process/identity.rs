@@ -114,6 +114,9 @@ fn capability_target_process(pid: i32) -> Result<Arc<crate::task::ProcessControl
     let current_task = current_task().ok_or(SysError::ESRCH)?;
     let current = current_process();
     let pid = pid as usize;
+    // Linux capget/capset address threads through the pid field. This kernel
+    // stores credentials on the PCB, so the caller's Linux-visible TID aliases
+    // the current process while other live ids resolve through PID lookup.
     if pid == 0 || pid == current.getpid() || pid == current_task.linux_tid() {
         return Ok(current);
     }
@@ -278,6 +281,9 @@ fn read_seccomp_filter(token: usize, ptr: usize) -> SysResult<Vec<SeccompSockFil
             token,
             (fprog.filter as *const LinuxSockFilter).wrapping_add(index),
         )?;
+        // The syscall dispatcher evaluates only validated classic-BPF records
+        // copied here. Keep offset 0 tied to seccomp_data.nr; other offsets
+        // would require modeling the full seccomp_data ABI.
         if !matches!(filter.code, BPF_LD_W_ABS | BPF_JMP_JEQ_K | BPF_RET_K) {
             return Err(SysError::EINVAL);
         }

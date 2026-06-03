@@ -7,7 +7,8 @@ use crate::task::schedule;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "perf-counters")]
+use core::sync::atomic::Ordering;
 use lazy_static::*;
 use log::info;
 use virtio_drivers::device::blk::{BlkReq, BlkResp, VirtIOBlk};
@@ -35,24 +36,33 @@ pub(crate) struct BlockIoStats {
     pub(crate) completion_wakeups: usize,
 }
 
-static BLOCK_IO_NB_READ_SUBMITS: AtomicUsize = AtomicUsize::new(0);
-static BLOCK_IO_NB_WRITE_SUBMITS: AtomicUsize = AtomicUsize::new(0);
-static BLOCK_IO_NB_READ_WAITS: AtomicUsize = AtomicUsize::new(0);
-static BLOCK_IO_NB_WRITE_WAITS: AtomicUsize = AtomicUsize::new(0);
-static BLOCK_IO_NB_READ_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
-static BLOCK_IO_NB_WRITE_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
-static BLOCK_IO_FALLBACK_SYNC_READS: AtomicUsize = AtomicUsize::new(0);
-static BLOCK_IO_FALLBACK_SYNC_WRITES: AtomicUsize = AtomicUsize::new(0);
-static BLOCK_IO_FALLBACK_UNSAFE_READS: AtomicUsize = AtomicUsize::new(0);
-static BLOCK_IO_FALLBACK_UNSAFE_WRITES: AtomicUsize = AtomicUsize::new(0);
-static BLOCK_IO_FALLBACK_NO_READY_READS: AtomicUsize = AtomicUsize::new(0);
-static BLOCK_IO_FALLBACK_NO_READY_WRITES: AtomicUsize = AtomicUsize::new(0);
-static BLOCK_IO_SYNC_READ_SUBMITS: AtomicUsize = AtomicUsize::new(0);
-static BLOCK_IO_SYNC_WRITE_SUBMITS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(any(target_arch = "riscv64", feature = "perf-counters"))]
-static BLOCK_IO_IRQ_ACKS: AtomicUsize = AtomicUsize::new(0);
-static BLOCK_IO_COMPLETION_SIGNALS: AtomicUsize = AtomicUsize::new(0);
-static BLOCK_IO_COMPLETION_WAKEUPS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "perf-counters")]
+mod block_io_perf {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(super) static NB_READ_SUBMITS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static NB_WRITE_SUBMITS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static NB_READ_WAITS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static NB_WRITE_WAITS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static NB_READ_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static NB_WRITE_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static FALLBACK_SYNC_READS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static FALLBACK_SYNC_WRITES: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static FALLBACK_UNSAFE_READS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static FALLBACK_UNSAFE_WRITES: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static FALLBACK_NO_READY_READS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static FALLBACK_NO_READY_WRITES: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static SYNC_READ_SUBMITS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static SYNC_WRITE_SUBMITS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static IRQ_ACKS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static COMPLETION_SIGNALS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static COMPLETION_WAKEUPS: AtomicUsize = AtomicUsize::new(0);
+
+    #[inline(always)]
+    pub(super) fn inc(counter: &AtomicUsize) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlockIoPath {
@@ -87,11 +97,11 @@ impl VirtIOBlock {
             BlockIoPath::Nonblocking => self.read_blocks_nonblocking_uncached(block_id, buf),
             BlockIoPath::Sync => self.read_blocks_sync_uncached(block_id, buf),
             BlockIoPath::FallbackUnsafe => {
-                record_fallback_read(&BLOCK_IO_FALLBACK_UNSAFE_READS);
+                record_fallback_unsafe_read();
                 self.read_blocks_sync_uncached(block_id, buf);
             }
             BlockIoPath::FallbackNoReady => {
-                record_fallback_read(&BLOCK_IO_FALLBACK_NO_READY_READS);
+                record_fallback_no_ready_read();
                 self.read_blocks_sync_uncached(block_id, buf);
             }
         }
@@ -104,13 +114,13 @@ impl VirtIOBlock {
         let mut req = BlkReq::default();
         let mut resp = BlkResp::default();
         let mut token = 0;
-        BLOCK_IO_NB_READ_SUBMITS.fetch_add(1, Ordering::Relaxed);
+        record_nb_read_submit();
         let task_cx_ptr = self.virtio_blk.exclusive_session(|blk| {
             token = unsafe {
                 blk.read_blocks_nb(block_id, &mut req, buf, &mut resp)
                     .unwrap()
             };
-            BLOCK_IO_NB_READ_WAITS.fetch_add(1, Ordering::Relaxed);
+            record_nb_read_wait();
             self.condvars.get(&token).unwrap().wait_no_sched()
         });
         schedule(task_cx_ptr);
@@ -119,13 +129,13 @@ impl VirtIOBlock {
                 blk.complete_read_blocks(token, &req, buf, &mut resp)
                     .expect("Error when reading VirtIOBlk");
             }
-            BLOCK_IO_NB_READ_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+            record_nb_read_completion();
             self.signal_next_completed(blk);
         });
     }
 
     fn read_blocks_sync_uncached(&self, block_id: usize, buf: &mut [u8]) {
-        BLOCK_IO_SYNC_READ_SUBMITS.fetch_add(1, Ordering::Relaxed);
+        record_sync_read_submit();
         self.virtio_blk
             .exclusive_access()
             .read_blocks(block_id, buf)
@@ -155,11 +165,11 @@ impl VirtIOBlock {
             BlockIoPath::Nonblocking => self.write_blocks_nonblocking_uncached(block_id, buf),
             BlockIoPath::Sync => self.write_blocks_sync_uncached(block_id, buf),
             BlockIoPath::FallbackUnsafe => {
-                record_fallback_write(&BLOCK_IO_FALLBACK_UNSAFE_WRITES);
+                record_fallback_unsafe_write();
                 self.write_blocks_sync_uncached(block_id, buf);
             }
             BlockIoPath::FallbackNoReady => {
-                record_fallback_write(&BLOCK_IO_FALLBACK_NO_READY_WRITES);
+                record_fallback_no_ready_write();
                 self.write_blocks_sync_uncached(block_id, buf);
             }
         }
@@ -171,13 +181,13 @@ impl VirtIOBlock {
         let mut req = BlkReq::default();
         let mut resp = BlkResp::default();
         let mut token = 0;
-        BLOCK_IO_NB_WRITE_SUBMITS.fetch_add(1, Ordering::Relaxed);
+        record_nb_write_submit();
         let task_cx_ptr = self.virtio_blk.exclusive_session(|blk| {
             token = unsafe {
                 blk.write_blocks_nb(block_id, &mut req, buf, &mut resp)
                     .unwrap()
             };
-            BLOCK_IO_NB_WRITE_WAITS.fetch_add(1, Ordering::Relaxed);
+            record_nb_write_wait();
             self.condvars.get(&token).unwrap().wait_no_sched()
         });
         schedule(task_cx_ptr);
@@ -186,13 +196,13 @@ impl VirtIOBlock {
                 blk.complete_write_blocks(token, &req, buf, &mut resp)
                     .expect("Error when writing VirtIOBlk");
             }
-            BLOCK_IO_NB_WRITE_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+            record_nb_write_completion();
             self.signal_next_completed(blk);
         });
     }
 
     fn write_blocks_sync_uncached(&self, block_id: usize, buf: &[u8]) {
-        BLOCK_IO_SYNC_WRITE_SUBMITS.fetch_add(1, Ordering::Relaxed);
+        record_sync_write_submit();
         self.virtio_blk
             .exclusive_access()
             .write_blocks(block_id, buf)
@@ -211,7 +221,7 @@ impl VirtIOBlock {
     pub fn handle_irq(&self) {
         self.virtio_blk.exclusive_session(|blk| {
             let _ = blk.ack_interrupt();
-            BLOCK_IO_IRQ_ACKS.fetch_add(1, Ordering::Relaxed);
+            record_irq_ack();
             self.signal_next_completed(blk);
         });
     }
@@ -237,9 +247,9 @@ impl VirtIOBlock {
         // Wake only the descriptor head reported by the device; unrelated
         // sleepers must stay blocked until their own token reaches used.
         if let Some(token) = blk.peek_used() {
-            BLOCK_IO_COMPLETION_SIGNALS.fetch_add(1, Ordering::Relaxed);
+            record_completion_signal();
             if self.condvars.get(&token).unwrap().signal() {
-                BLOCK_IO_COMPLETION_WAKEUPS.fetch_add(1, Ordering::Relaxed);
+                record_completion_wakeup();
             }
         }
     }
@@ -320,25 +330,31 @@ pub fn block_device(index: usize) -> Option<Arc<BlockDeviceImpl>> {
 
 #[cfg(feature = "perf-counters")]
 pub(crate) fn block_io_stats_snapshot() -> BlockIoStats {
+    use block_io_perf::{
+        COMPLETION_SIGNALS, COMPLETION_WAKEUPS, FALLBACK_NO_READY_READS, FALLBACK_NO_READY_WRITES,
+        FALLBACK_SYNC_READS, FALLBACK_SYNC_WRITES, FALLBACK_UNSAFE_READS, FALLBACK_UNSAFE_WRITES,
+        IRQ_ACKS, NB_READ_COMPLETIONS, NB_READ_SUBMITS, NB_READ_WAITS, NB_WRITE_COMPLETIONS,
+        NB_WRITE_SUBMITS, NB_WRITE_WAITS, SYNC_READ_SUBMITS, SYNC_WRITE_SUBMITS,
+    };
     BlockIoStats {
         nonblocking_requested: block_io_nonblocking_requested() as usize,
-        nb_read_submits: BLOCK_IO_NB_READ_SUBMITS.load(Ordering::Relaxed),
-        nb_write_submits: BLOCK_IO_NB_WRITE_SUBMITS.load(Ordering::Relaxed),
-        nb_read_waits: BLOCK_IO_NB_READ_WAITS.load(Ordering::Relaxed),
-        nb_write_waits: BLOCK_IO_NB_WRITE_WAITS.load(Ordering::Relaxed),
-        nb_read_completions: BLOCK_IO_NB_READ_COMPLETIONS.load(Ordering::Relaxed),
-        nb_write_completions: BLOCK_IO_NB_WRITE_COMPLETIONS.load(Ordering::Relaxed),
-        fallback_sync_reads: BLOCK_IO_FALLBACK_SYNC_READS.load(Ordering::Relaxed),
-        fallback_sync_writes: BLOCK_IO_FALLBACK_SYNC_WRITES.load(Ordering::Relaxed),
-        fallback_unsafe_reads: BLOCK_IO_FALLBACK_UNSAFE_READS.load(Ordering::Relaxed),
-        fallback_unsafe_writes: BLOCK_IO_FALLBACK_UNSAFE_WRITES.load(Ordering::Relaxed),
-        fallback_no_ready_reads: BLOCK_IO_FALLBACK_NO_READY_READS.load(Ordering::Relaxed),
-        fallback_no_ready_writes: BLOCK_IO_FALLBACK_NO_READY_WRITES.load(Ordering::Relaxed),
-        sync_read_submits: BLOCK_IO_SYNC_READ_SUBMITS.load(Ordering::Relaxed),
-        sync_write_submits: BLOCK_IO_SYNC_WRITE_SUBMITS.load(Ordering::Relaxed),
-        irq_acks: BLOCK_IO_IRQ_ACKS.load(Ordering::Relaxed),
-        completion_signals: BLOCK_IO_COMPLETION_SIGNALS.load(Ordering::Relaxed),
-        completion_wakeups: BLOCK_IO_COMPLETION_WAKEUPS.load(Ordering::Relaxed),
+        nb_read_submits: NB_READ_SUBMITS.load(Ordering::Relaxed),
+        nb_write_submits: NB_WRITE_SUBMITS.load(Ordering::Relaxed),
+        nb_read_waits: NB_READ_WAITS.load(Ordering::Relaxed),
+        nb_write_waits: NB_WRITE_WAITS.load(Ordering::Relaxed),
+        nb_read_completions: NB_READ_COMPLETIONS.load(Ordering::Relaxed),
+        nb_write_completions: NB_WRITE_COMPLETIONS.load(Ordering::Relaxed),
+        fallback_sync_reads: FALLBACK_SYNC_READS.load(Ordering::Relaxed),
+        fallback_sync_writes: FALLBACK_SYNC_WRITES.load(Ordering::Relaxed),
+        fallback_unsafe_reads: FALLBACK_UNSAFE_READS.load(Ordering::Relaxed),
+        fallback_unsafe_writes: FALLBACK_UNSAFE_WRITES.load(Ordering::Relaxed),
+        fallback_no_ready_reads: FALLBACK_NO_READY_READS.load(Ordering::Relaxed),
+        fallback_no_ready_writes: FALLBACK_NO_READY_WRITES.load(Ordering::Relaxed),
+        sync_read_submits: SYNC_READ_SUBMITS.load(Ordering::Relaxed),
+        sync_write_submits: SYNC_WRITE_SUBMITS.load(Ordering::Relaxed),
+        irq_acks: IRQ_ACKS.load(Ordering::Relaxed),
+        completion_signals: COMPLETION_SIGNALS.load(Ordering::Relaxed),
+        completion_wakeups: COMPLETION_WAKEUPS.load(Ordering::Relaxed),
     }
 }
 
@@ -371,15 +387,159 @@ fn can_sleep_for_nonblocking_block_io() -> bool {
     }
 }
 
-fn record_fallback_read(reason_counter: &AtomicUsize) {
-    BLOCK_IO_FALLBACK_SYNC_READS.fetch_add(1, Ordering::Relaxed);
-    reason_counter.fetch_add(1, Ordering::Relaxed);
+#[cfg(feature = "perf-counters")]
+#[inline(always)]
+fn record_nb_read_submit() {
+    block_io_perf::inc(&block_io_perf::NB_READ_SUBMITS);
 }
 
-fn record_fallback_write(reason_counter: &AtomicUsize) {
-    BLOCK_IO_FALLBACK_SYNC_WRITES.fetch_add(1, Ordering::Relaxed);
-    reason_counter.fetch_add(1, Ordering::Relaxed);
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_nb_read_submit() {}
+
+#[cfg(feature = "perf-counters")]
+#[inline(always)]
+fn record_nb_write_submit() {
+    block_io_perf::inc(&block_io_perf::NB_WRITE_SUBMITS);
 }
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_nb_write_submit() {}
+
+#[cfg(feature = "perf-counters")]
+#[inline(always)]
+fn record_nb_read_wait() {
+    block_io_perf::inc(&block_io_perf::NB_READ_WAITS);
+}
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_nb_read_wait() {}
+
+#[cfg(feature = "perf-counters")]
+#[inline(always)]
+fn record_nb_write_wait() {
+    block_io_perf::inc(&block_io_perf::NB_WRITE_WAITS);
+}
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_nb_write_wait() {}
+
+#[cfg(feature = "perf-counters")]
+#[inline(always)]
+fn record_nb_read_completion() {
+    block_io_perf::inc(&block_io_perf::NB_READ_COMPLETIONS);
+}
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_nb_read_completion() {}
+
+#[cfg(feature = "perf-counters")]
+#[inline(always)]
+fn record_nb_write_completion() {
+    block_io_perf::inc(&block_io_perf::NB_WRITE_COMPLETIONS);
+}
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_nb_write_completion() {}
+
+#[cfg(feature = "perf-counters")]
+#[inline(always)]
+fn record_sync_read_submit() {
+    block_io_perf::inc(&block_io_perf::SYNC_READ_SUBMITS);
+}
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_sync_read_submit() {}
+
+#[cfg(feature = "perf-counters")]
+#[inline(always)]
+fn record_sync_write_submit() {
+    block_io_perf::inc(&block_io_perf::SYNC_WRITE_SUBMITS);
+}
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_sync_write_submit() {}
+
+#[cfg(feature = "perf-counters")]
+#[inline(always)]
+fn record_fallback_unsafe_read() {
+    block_io_perf::inc(&block_io_perf::FALLBACK_SYNC_READS);
+    block_io_perf::inc(&block_io_perf::FALLBACK_UNSAFE_READS);
+}
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_fallback_unsafe_read() {}
+
+#[cfg(feature = "perf-counters")]
+#[inline(always)]
+fn record_fallback_no_ready_read() {
+    block_io_perf::inc(&block_io_perf::FALLBACK_SYNC_READS);
+    block_io_perf::inc(&block_io_perf::FALLBACK_NO_READY_READS);
+}
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_fallback_no_ready_read() {}
+
+#[cfg(feature = "perf-counters")]
+#[inline(always)]
+fn record_fallback_unsafe_write() {
+    block_io_perf::inc(&block_io_perf::FALLBACK_SYNC_WRITES);
+    block_io_perf::inc(&block_io_perf::FALLBACK_UNSAFE_WRITES);
+}
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_fallback_unsafe_write() {}
+
+#[cfg(feature = "perf-counters")]
+#[inline(always)]
+fn record_fallback_no_ready_write() {
+    block_io_perf::inc(&block_io_perf::FALLBACK_SYNC_WRITES);
+    block_io_perf::inc(&block_io_perf::FALLBACK_NO_READY_WRITES);
+}
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_fallback_no_ready_write() {}
+
+#[cfg(all(target_arch = "riscv64", feature = "perf-counters"))]
+#[inline(always)]
+fn record_irq_ack() {
+    block_io_perf::inc(&block_io_perf::IRQ_ACKS);
+}
+
+#[cfg(all(target_arch = "riscv64", not(feature = "perf-counters")))]
+#[inline(always)]
+fn record_irq_ack() {}
+
+#[cfg(feature = "perf-counters")]
+#[inline(always)]
+fn record_completion_signal() {
+    block_io_perf::inc(&block_io_perf::COMPLETION_SIGNALS);
+}
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_completion_signal() {}
+
+#[cfg(feature = "perf-counters")]
+#[inline(always)]
+fn record_completion_wakeup() {
+    block_io_perf::inc(&block_io_perf::COMPLETION_WAKEUPS);
+}
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_completion_wakeup() {}
 
 #[allow(dead_code)]
 pub fn block_count() -> usize {

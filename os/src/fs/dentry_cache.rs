@@ -11,6 +11,18 @@ const DEFAULT_DENTRY_CACHE_CAPACITY: usize = 4096;
 const DENTRY_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const DENTRY_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 
+#[cfg(feature = "perf-counters")]
+macro_rules! record_dentry_stat {
+    ($($body:tt)*) => {
+        $($body)*
+    };
+}
+
+#[cfg(not(feature = "perf-counters"))]
+macro_rules! record_dentry_stat {
+    ($($body:tt)*) => {};
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct DentryCacheBucketKey {
     namespace_id: MountNamespaceId,
@@ -206,7 +218,9 @@ impl DentryCache {
     }
 
     fn touch(&mut self, bucket: DentryCacheBucketKey, old_stamp: Option<usize>) -> usize {
-        self.stats.lru_touch += 1;
+        record_dentry_stat! {
+            self.stats.lru_touch += 1;
+        }
         if let Some(stamp) = old_stamp {
             let old_lru_entry = DentryCacheLruEntry { stamp, bucket };
             self.lru.remove(&old_lru_entry);
@@ -256,7 +270,9 @@ impl DentryCache {
             self.lru.remove(&victim);
             let mut remove_bucket = false;
             let removed = if let Some(entries) = self.entries.get_mut(&victim.bucket) {
-                self.stats.lru_scan_slots += entries.len();
+                record_dentry_stat! {
+                    self.stats.lru_scan_slots += entries.len();
+                }
                 if let Some(index) = entries
                     .iter()
                     .position(|entry| entry.value.lru_stamp() == victim.stamp)
@@ -275,7 +291,9 @@ impl DentryCache {
                 self.entries.remove(&victim.bucket);
             }
             if removed {
-                self.stats.evict += 1;
+                record_dentry_stat! {
+                    self.stats.evict += 1;
+                }
             }
         }
     }
@@ -291,7 +309,9 @@ impl DentryCache {
         }
         let bucket = DentryCacheBucketKey::new(namespace_id, parent, component);
         let Some(index) = self.find_entry_index(bucket, component) else {
-            self.stats.miss += 1;
+            record_dentry_stat! {
+                self.stats.miss += 1;
+            }
             return None;
         };
         let Some(value) = self
@@ -300,12 +320,16 @@ impl DentryCache {
             .and_then(|entries| entries.get(index))
             .map(|entry| entry.value)
         else {
-            self.stats.miss += 1;
+            record_dentry_stat! {
+                self.stats.miss += 1;
+            }
             return None;
         };
         if value.parent_generation() != self.parent_generation(parent) {
             self.remove_entry_at(bucket, index, value.lru_stamp());
-            self.stats.revalidate_fail += 1;
+            record_dentry_stat! {
+                self.stats.revalidate_fail += 1;
+            }
             return None;
         }
         let stamp = self.touch(bucket, Some(value.lru_stamp()));
@@ -318,11 +342,15 @@ impl DentryCache {
         }
         match value {
             DentryCacheValue::Positive { node, kind, .. } => {
-                self.stats.positive_hit += 1;
+                record_dentry_stat! {
+                    self.stats.positive_hit += 1;
+                }
                 Some(DentryLookupResult::Positive { node, kind })
             }
             DentryCacheValue::Negative { .. } => {
-                self.stats.negative_hit += 1;
+                record_dentry_stat! {
+                    self.stats.negative_hit += 1;
+                }
                 Some(DentryLookupResult::Negative)
             }
         }
@@ -372,7 +400,9 @@ impl DentryCache {
                 });
             self.entry_count += 1;
         }
-        self.stats.insert_positive += 1;
+        record_dentry_stat! {
+            self.stats.insert_positive += 1;
+        }
         self.trim_to_capacity();
     }
 
@@ -416,7 +446,9 @@ impl DentryCache {
                 });
             self.entry_count += 1;
         }
-        self.stats.insert_negative += 1;
+        record_dentry_stat! {
+            self.stats.insert_negative += 1;
+        }
         self.trim_to_capacity();
     }
 
@@ -426,18 +458,23 @@ impl DentryCache {
         }
         let generation = self.parent_generation(parent).wrapping_add(1);
         self.parent_generations.insert(parent, generation);
+        #[cfg(feature = "perf-counters")]
         let before = self.entry_count;
         self.entries.retain(|bucket, _| bucket.parent != parent);
         self.entry_count = self.entries.values().map(Vec::len).sum();
         self.lru.retain(|entry| entry.bucket.parent != parent);
-        self.stats.invalidate_parent += before.saturating_sub(self.entry_count);
+        record_dentry_stat! {
+            self.stats.invalidate_parent += before.saturating_sub(self.entry_count);
+        }
     }
 
     fn clear_all(&mut self) {
         if !self.enabled || self.entry_count == 0 {
             return;
         }
-        self.stats.invalidate_all += self.entry_count;
+        record_dentry_stat! {
+            self.stats.invalidate_all += self.entry_count;
+        }
         self.entries.clear();
         self.entry_count = 0;
         self.lru.clear();

@@ -62,6 +62,10 @@ lazy_static! {
         SleepMutex::new(BTreeMap::new());
     static ref DIRTY_REGULAR_FILES: SleepMutex<BTreeMap<VfsNodeId, DirtyFileCache>> =
         SleepMutex::new(BTreeMap::new());
+}
+
+#[cfg(feature = "perf-counters")]
+lazy_static! {
     static ref DIRTY_WRITEBACK_COUNTERS: SleepMutex<DirtyWritebackCounters> =
         SleepMutex::new(DirtyWritebackCounters::new());
 }
@@ -106,6 +110,7 @@ pub(crate) struct DirtyWritebackStats {
     pub(crate) pressure_flush_failures: usize,
 }
 
+#[cfg(feature = "perf-counters")]
 #[derive(Debug)]
 struct DirtyWritebackCounters {
     cached_writes: usize,
@@ -122,6 +127,7 @@ struct DirtyWritebackCounters {
     pressure_flush_failures: usize,
 }
 
+#[cfg(feature = "perf-counters")]
 impl DirtyWritebackCounters {
     const fn new() -> Self {
         Self {
@@ -154,6 +160,7 @@ enum DirtyFlushReason {
     Pressure,
 }
 
+#[cfg(feature = "perf-counters")]
 fn record_dirty_cache_write(pages: usize, bytes: usize) {
     let mut counters = DIRTY_WRITEBACK_COUNTERS.lock();
     counters.cached_writes = counters.cached_writes.saturating_add(1);
@@ -161,16 +168,31 @@ fn record_dirty_cache_write(pages: usize, bytes: usize) {
     counters.cached_bytes = counters.cached_bytes.saturating_add(bytes);
 }
 
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_dirty_cache_write(_pages: usize, _bytes: usize) {}
+
+#[cfg(feature = "perf-counters")]
 fn record_dirty_cache_fallback() {
     let mut counters = DIRTY_WRITEBACK_COUNTERS.lock();
     counters.fallback_writes = counters.fallback_writes.saturating_add(1);
 }
 
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_dirty_cache_fallback() {}
+
+#[cfg(feature = "perf-counters")]
 fn record_dirty_cache_peak(dirty_pages: usize) {
     let mut counters = DIRTY_WRITEBACK_COUNTERS.lock();
     counters.dirty_pages_peak = counters.dirty_pages_peak.max(dirty_pages);
 }
 
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_dirty_cache_peak(_dirty_pages: usize) {}
+
+#[cfg(feature = "perf-counters")]
 fn record_dirty_cache_flush(reason: DirtyFlushReason, pages: usize, bytes: usize) {
     let mut counters = DIRTY_WRITEBACK_COUNTERS.lock();
     counters.flush_calls = counters.flush_calls.saturating_add(1);
@@ -183,6 +205,11 @@ fn record_dirty_cache_flush(reason: DirtyFlushReason, pages: usize, bytes: usize
     }
 }
 
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_dirty_cache_flush(_reason: DirtyFlushReason, _pages: usize, _bytes: usize) {}
+
+#[cfg(feature = "perf-counters")]
 fn record_dirty_cache_flush_failure(reason: DirtyFlushReason) {
     if reason != DirtyFlushReason::Pressure {
         return;
@@ -190,6 +217,10 @@ fn record_dirty_cache_flush_failure(reason: DirtyFlushReason) {
     let mut counters = DIRTY_WRITEBACK_COUNTERS.lock();
     counters.pressure_flush_failures = counters.pressure_flush_failures.saturating_add(1);
 }
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_dirty_cache_flush_failure(_reason: DirtyFlushReason) {}
 
 #[cfg(feature = "perf-counters")]
 pub(crate) fn dirty_writeback_stats_snapshot() -> DirtyWritebackStats {

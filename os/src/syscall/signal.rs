@@ -22,6 +22,9 @@ const SIG_SETMASK: usize = 2;
 const LINUX_SS_AUTODISARM: i32 = 1 << 31;
 
 fn read_signal_set(token: usize, set: *const u8, sigsetsize: usize) -> SysResult<SignalFlags> {
+    // Linux rt-signal syscalls pass one 64-bit sigset on these ABIs. SIGKILL
+    // and SIGSTOP are never blockable, so strip them at the syscall boundary
+    // before the mask reaches TaskControlBlockInner.
     if sigsetsize != LINUX_RT_SIGSET_SIZE {
         return Err(SysError::EINVAL);
     }
@@ -315,6 +318,9 @@ pub fn sys_rt_sigsuspend(mask: *const u8, sigsetsize: usize) -> SysResult {
 
     loop {
         if current_has_interrupting_signal() {
+            // Signal delivery restores this saved mask when it builds the
+            // user signal frame. Restoring here would let the handler run
+            // under the wrong mask after sigsuspend returns EINTR.
             task.inner_exclusive_access().sigsuspend_restore_mask = Some(old_mask);
             return Err(SysError::EINTR);
         }

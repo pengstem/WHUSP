@@ -9,6 +9,11 @@ use alloc::vec::Vec;
 use core::any::Any;
 use lazy_static::lazy_static;
 
+// CONTEXT: Staticfs is a small compatibility overlay for libc, BusyBox, and
+// LTP probes that expect selected `/etc`, `/sys`, `/proc`, and module paths.
+// It is not a general writable sysfs/procfs/module implementation; keep
+// lookup_absolute(), stat_node(), and dir_entries() synchronized when adding
+// or removing nodes.
 const ETC_NSSWITCH_CONF: &[u8] =
     b"passwd: files\ngroup: files\nhosts: files\nprotocols: files\nservices: files\nnetworks: files\n";
 const ETC_PASSWD: &[u8] = b"root:x:0:0:root:/root:/bin/sh\n\
@@ -709,6 +714,9 @@ pub(crate) fn open_path(
     {
         return Err(FsError::PermissionDenied);
     }
+    // /etc/hosts and loop read_ahead_kb are the only mutable staticfs nodes
+    // because LTP/netperf setup scripts write them as knobs. Other static
+    // files are read-only compatibility facts.
     // CONTEXT: glibc's NSS/protocol lookup probes these files during netperf
     // loopback startup. The contest image does not require mutable `/etc`
     // state, so a tiny read-only snapshot keeps libc on the files backend
