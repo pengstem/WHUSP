@@ -61,17 +61,17 @@ const ALL_TESTS: &[&str] = &[
 // disk receives it through WHUSP_TEST_SCRIPTS and prints skipped markers for
 // groups not listed here.
 const TEST_SCRIPTS: &[&str] = &[
-    // "basic_testcode.sh",
-    // "busybox_testcode.sh",
-    // "lua_testcode.sh",
-    // "libctest_testcode.sh",
-    "ltp_testcode.sh",
-    // "iozone_testcode.sh",
-    // "iperf_testcode.sh",
-    // "libcbench_testcode.sh",
-    // "netperf_testcode.sh",
-    // "cyclictest_testcode.sh",
-    // "lmbench_testcode.sh",
+    "basic_testcode.sh",
+    "busybox_testcode.sh",
+    "lua_testcode.sh",
+    "libctest_testcode.sh",
+    // "ltp_testcode.sh",
+    "iozone_testcode.sh",
+    "iperf_testcode.sh",
+    "libcbench_testcode.sh",
+    "netperf_testcode.sh",
+    "cyclictest_testcode.sh",
+    "lmbench_testcode.sh",
 ];
 
 /// None runs the current libc's curated whitelist from ltp_whitelist.txt.

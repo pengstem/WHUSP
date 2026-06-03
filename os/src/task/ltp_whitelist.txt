@@ -1,6 +1,4 @@
 pathconf01
-if4-mtu-change_ifconfig
-if4-mtu-change_ip
 openat201
 msgrcv07
 getrlimit03
@@ -474,7 +472,6 @@ fork04
 setfsuid01
 setfsuid02
 setfsuid03
-fork06
 fork07
 fork08
 fork10
@@ -806,13 +803,3 @@ semget05
 statx10
 copy_file_range01
 shmget03
-epoll_pwait03
-clock_nanosleep02
-epoll_wait02
-alarm07
-copy_file_range03
-alarm06
-readahead02
-waitpid10
-semop04
-clock_settime03

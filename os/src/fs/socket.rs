@@ -129,6 +129,8 @@ const ALG_SET_OP: i32 = 3;
 const ALG_SET_AEAD_ASSOCLEN: i32 = 4;
 const ALG_OP_DECRYPT: u32 = 0;
 const ALG_OP_ENCRYPT: u32 = 1;
+const ADDRCONFIG_IF_INDEX: i32 = 2;
+const ADDRCONFIG_IP: [u8; 4] = [10, 0, 2, 15];
 const LOOPBACK_IP: [u8; 4] = [127, 0, 0, 1];
 const ANY_IP: [u8; 4] = [0, 0, 0, 0];
 const LOOPBACK_IPV6: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
@@ -301,6 +303,24 @@ impl NetInterface {
         }
     }
 
+    fn addrconfig_eth0() -> Self {
+        // CONTEXT: glibc netperf uses getaddrinfo(AI_ADDRCONFIG) even for
+        // 127.0.0.1. Linux ignores pure loopback addresses for that check, so
+        // expose one synthetic non-loopback IPv4 address through netlink.
+        Self {
+            name: "eth0".into(),
+            index: ADDRCONFIG_IF_INDEX,
+            hwaddr: [0x02, 0, 0, 0, 0, ADDRCONFIG_IF_INDEX as u8],
+            flags: IFF_UP | IFF_RUNNING,
+            mtu: 1500,
+            addrs: vec![NetAddress {
+                family: AF_INET as u8,
+                prefix_len: 24,
+                address: ADDRCONFIG_IP.to_vec(),
+            }],
+        }
+    }
+
     fn veth(name: &str, index: i32) -> Self {
         let mut hwaddr = [0x02, 0, 0, 0, 0, 0];
         hwaddr[5] = index as u8;
@@ -331,7 +351,7 @@ struct NetDeviceState {
 impl NetDeviceState {
     fn new() -> Self {
         Self {
-            interfaces: vec![NetInterface::loopback()],
+            interfaces: vec![NetInterface::loopback(), NetInterface::addrconfig_eth0()],
             next_index: 10,
         }
     }

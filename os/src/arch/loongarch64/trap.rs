@@ -183,13 +183,18 @@ pub fn trap_handler() -> ! {
         interrupted_pc = trap_cx_of_task(&task).era;
     }
     if crate::arch::signal::deliver_pending_signal(&task, &process, interrupted_pc) {
+        drop(process);
+        drop(task);
         trap_return();
     }
     if let Some((errno, _msg)) = check_signals_of_task(&task, &process) {
         drop(process);
         drop(task);
         exit_current_group_and_run_next(errno);
+        unreachable!("signal-forced exit returned");
     }
+    drop(process);
+    drop(task);
     trap_return();
 }
 

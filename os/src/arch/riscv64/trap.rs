@@ -159,6 +159,8 @@ pub fn trap_handler() -> ! {
                 interrupted_pc,
                 syscall_pc_if_interrupted,
             ) {
+                drop(process);
+                drop(task);
                 trap_return();
             }
             signal_delivery_attempted = true;
@@ -194,6 +196,8 @@ pub fn trap_handler() -> ! {
         Trap::Exception(Exception::IllegalInstruction) => {
             if user_fp_was_off {
                 init_lazy_fp_for_task(&task);
+                drop(process);
+                drop(task);
                 trap_return();
             }
             current_add_signal(SignalFlags::SIGILL);
@@ -220,13 +224,18 @@ pub fn trap_handler() -> ! {
     if !signal_delivery_attempted
         && crate::arch::signal::deliver_pending_signal(&task, &process, interrupted_pc, None)
     {
+        drop(process);
+        drop(task);
         trap_return();
     }
     if let Some((errno, _msg)) = check_signals_of_task(&task, &process) {
         drop(process);
         drop(task);
         exit_current_group_and_run_next(errno);
+        unreachable!("signal-forced exit returned");
     }
+    drop(process);
+    drop(task);
     trap_return();
 }
 
@@ -320,8 +329,10 @@ fn force_default_sigsegv_current() {
 /// finally, jump to new addr of __restore asm function
 pub fn trap_return() -> ! {
     let now_us = get_time_us();
-    let task = current_task().expect("trap_return requires a running task");
-    let restore_fp = trap_cx_of_task(&task).user_fp_is_dirty();
+    let restore_fp = {
+        let task = current_task().expect("trap_return requires a running task");
+        trap_cx_of_task(&task).user_fp_is_dirty()
+    };
     let (trap_cx_user_va, user_satp) = current_trap_return_context_after_accounting(now_us);
     if restore_fp {
         crate::perf::record_rv_user_fp_restore_call();
