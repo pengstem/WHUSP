@@ -5,6 +5,7 @@ use super::dirent::{
 use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult};
 use super::{FS_STATX_ATTR_FLAGS, FileStat, FileTimestamp};
 use crate::drivers::block::VirtIOBlock;
+use crate::perf;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -405,36 +406,45 @@ impl FileSystemBackend for Ext4Mount {
         let mut written = 0usize;
         let mut next_offset = offset;
 
-        while let Some(entry) = reader.current() {
-            let d_ino = entry.ino() as u64;
-            let d_type = into_linux_dtype(entry.inode_type());
-            let name = entry.name().to_vec();
-            let d_reclen = align_up(
-                LINUX_DIRENT64_HEADER_SIZE + name.len() + 1,
-                LINUX_DIRENT64_ALIGN,
-            );
+        loop {
+            let (entry_start, d_reclen) = {
+                let Some(entry) = reader.current() else {
+                    break;
+                };
+                let d_ino = entry.ino() as u64;
+                let d_type = into_linux_dtype(entry.inode_type());
+                let name = entry.name();
+                perf::record_ext4_dirent_name(name.len(), false);
+                let d_reclen = align_up(
+                    LINUX_DIRENT64_HEADER_SIZE + name.len() + 1,
+                    LINUX_DIRENT64_ALIGN,
+                );
 
-            // Linux getdents64 returns EINVAL when one record cannot fit; after
-            // at least one record, returning a short buffer preserves the next offset.
-            if d_reclen > buf.len().saturating_sub(written) {
-                if written == 0 {
-                    return Err(FsError::InvalidInput);
+                // Linux getdents64 returns EINVAL when one record cannot fit; after
+                // at least one record, returning a short buffer preserves the next offset.
+                if d_reclen > buf.len().saturating_sub(written) {
+                    if written == 0 {
+                        return Err(FsError::InvalidInput);
+                    }
+                    break;
                 }
-                break;
-            }
+
+                let entry_start = written;
+                let entry_buf = &mut buf[entry_start..entry_start + d_reclen];
+                entry_buf.fill(0);
+                entry_buf[0..8].copy_from_slice(&d_ino.to_ne_bytes());
+                entry_buf[16..18].copy_from_slice(&(d_reclen as u16).to_ne_bytes());
+                entry_buf[18] = d_type;
+                entry_buf[LINUX_DIRENT64_HEADER_SIZE..LINUX_DIRENT64_HEADER_SIZE + name.len()]
+                    .copy_from_slice(name);
+
+                (entry_start, d_reclen)
+            };
 
             reader.step().map_err(map_ext4_error)?;
             next_offset = reader.offset();
-
-            let entry_buf = &mut buf[written..written + d_reclen];
-            entry_buf.fill(0);
-            entry_buf[0..8].copy_from_slice(&d_ino.to_ne_bytes());
-            entry_buf[8..16].copy_from_slice(&(next_offset as i64).to_ne_bytes());
-            entry_buf[16..18].copy_from_slice(&(d_reclen as u16).to_ne_bytes());
-            entry_buf[18] = d_type;
-            entry_buf[LINUX_DIRENT64_HEADER_SIZE..LINUX_DIRENT64_HEADER_SIZE + name.len()]
-                .copy_from_slice(&name);
-
+            buf[entry_start + 8..entry_start + 16]
+                .copy_from_slice(&(next_offset as i64).to_ne_bytes());
             written += d_reclen;
         }
 

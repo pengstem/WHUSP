@@ -97,6 +97,10 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) vfs_dirent_scratch_bytes: usize,
     pub(crate) vfs_dirent_returned_bytes: usize,
     pub(crate) vfs_dirent_max_scratch_bytes: usize,
+    pub(crate) ext4_dirent_entries: usize,
+    pub(crate) ext4_dirent_name_bytes: usize,
+    pub(crate) ext4_dirent_name_allocs: usize,
+    pub(crate) ext4_dirent_name_alloc_bytes: usize,
     pub(crate) procfs_content_builds: usize,
     pub(crate) procfs_content_bytes: usize,
     pub(crate) procfs_snapshot_hits: usize,
@@ -343,6 +347,10 @@ mod enabled {
     static VFS_DIRENT_SCRATCH_BYTES: AtomicUsize = AtomicUsize::new(0);
     static VFS_DIRENT_RETURNED_BYTES: AtomicUsize = AtomicUsize::new(0);
     static VFS_DIRENT_MAX_SCRATCH_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_DIRENT_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_DIRENT_NAME_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_DIRENT_NAME_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_DIRENT_NAME_ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
     static PROCFS_CONTENT_BUILDS: AtomicUsize = AtomicUsize::new(0);
     static PROCFS_CONTENT_BYTES: AtomicUsize = AtomicUsize::new(0);
     static PROCFS_SNAPSHOT_HITS: AtomicUsize = AtomicUsize::new(0);
@@ -742,6 +750,15 @@ mod enabled {
         VFS_DIRENT_SCRATCH_BYTES.fetch_add(scratch_bytes, Ordering::Relaxed);
         VFS_DIRENT_RETURNED_BYTES.fetch_add(returned_bytes, Ordering::Relaxed);
         update_max(&VFS_DIRENT_MAX_SCRATCH_BYTES, scratch_bytes);
+    }
+
+    pub(crate) fn record_ext4_dirent_name(name_len: usize, allocated: bool) {
+        EXT4_DIRENT_ENTRIES.fetch_add(1, Ordering::Relaxed);
+        EXT4_DIRENT_NAME_BYTES.fetch_add(name_len, Ordering::Relaxed);
+        if allocated {
+            EXT4_DIRENT_NAME_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            EXT4_DIRENT_NAME_ALLOC_BYTES.fetch_add(name_len, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn record_procfs_content_build(bytes: usize) {
@@ -1284,6 +1301,10 @@ mod enabled {
             vfs_dirent_scratch_bytes: VFS_DIRENT_SCRATCH_BYTES.load(Ordering::Relaxed),
             vfs_dirent_returned_bytes: VFS_DIRENT_RETURNED_BYTES.load(Ordering::Relaxed),
             vfs_dirent_max_scratch_bytes: VFS_DIRENT_MAX_SCRATCH_BYTES.load(Ordering::Relaxed),
+            ext4_dirent_entries: EXT4_DIRENT_ENTRIES.load(Ordering::Relaxed),
+            ext4_dirent_name_bytes: EXT4_DIRENT_NAME_BYTES.load(Ordering::Relaxed),
+            ext4_dirent_name_allocs: EXT4_DIRENT_NAME_ALLOCS.load(Ordering::Relaxed),
+            ext4_dirent_name_alloc_bytes: EXT4_DIRENT_NAME_ALLOC_BYTES.load(Ordering::Relaxed),
             procfs_content_builds: PROCFS_CONTENT_BUILDS.load(Ordering::Relaxed),
             procfs_content_bytes: PROCFS_CONTENT_BYTES.load(Ordering::Relaxed),
             procfs_snapshot_hits: PROCFS_SNAPSHOT_HITS.load(Ordering::Relaxed),
@@ -1543,6 +1564,10 @@ mod enabled {
          vfs_dirent_scratch_bytes {}\n\
          vfs_dirent_returned_bytes {}\n\
          vfs_dirent_max_scratch_bytes {}\n\
+         ext4_dirent_entries {}\n\
+         ext4_dirent_name_bytes {}\n\
+         ext4_dirent_name_allocs {}\n\
+         ext4_dirent_name_alloc_bytes {}\n\
          procfs_content_builds {}\n\
          procfs_content_bytes {}\n\
          procfs_snapshot_hits {}\n\
@@ -1776,6 +1801,10 @@ mod enabled {
             stats.vfs_dirent_scratch_bytes,
             stats.vfs_dirent_returned_bytes,
             stats.vfs_dirent_max_scratch_bytes,
+            stats.ext4_dirent_entries,
+            stats.ext4_dirent_name_bytes,
+            stats.ext4_dirent_name_allocs,
+            stats.ext4_dirent_name_alloc_bytes,
             stats.procfs_content_builds,
             stats.procfs_content_bytes,
             stats.procfs_snapshot_hits,
@@ -2127,6 +2156,9 @@ mod disabled {
         _returned_bytes: usize,
     ) {
     }
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_dirent_name(_name_len: usize, _allocated: bool) {}
 
     #[inline(always)]
     pub(crate) fn record_procfs_content_build(_bytes: usize) {}
