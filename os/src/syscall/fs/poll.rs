@@ -1,5 +1,5 @@
 use crate::arch::interrupt;
-use crate::fs::{PollEvents, PollWaiter};
+use crate::fs::{File, PollEvents, PollWaiter};
 use crate::perf;
 use crate::task::{
     block_current_task_no_schedule, current_has_interrupting_signal, current_task,
@@ -18,6 +18,14 @@ use super::uapi::{LinuxPollFd, PPOLL_MAX_NFDS};
 
 const SELECT_MAX_NFDS: usize = 1024;
 const FD_SET_WORD_BITS: usize = usize::BITS as usize;
+
+type PollFile = Arc<dyn File + Send + Sync>;
+
+#[derive(Clone)]
+enum PollFileSlot {
+    File(PollFile),
+    Error(SysError),
+}
 
 struct ProcSleepGuard {
     task: Arc<crate::task::TaskControlBlock>,
@@ -111,28 +119,53 @@ fn poll_events_to_user(events: PollEvents) -> i16 {
     events.bits() as i16
 }
 
-fn scan_pollfds(pollfds: &mut [LinuxPollFd], waiter: Option<&Arc<PollWaiter>>) -> usize {
+fn poll_get_file_by_fd(fd: usize) -> SysResult<PollFile> {
+    perf::record_poll_fd_table_lookup();
+    get_file_by_fd(fd)
+}
+
+fn snapshot_pollfds(pollfds: &[LinuxPollFd]) -> Vec<Option<PollFileSlot>> {
+    pollfds
+        .iter()
+        .map(|pollfd| {
+            if pollfd.fd < 0 {
+                None
+            } else {
+                Some(match poll_get_file_by_fd(pollfd.fd as usize) {
+                    Ok(file) => PollFileSlot::File(file),
+                    Err(err) => PollFileSlot::Error(err),
+                })
+            }
+        })
+        .collect()
+}
+
+fn scan_pollfds(
+    pollfds: &mut [LinuxPollFd],
+    files: &[Option<PollFileSlot>],
+    waiter: Option<&Arc<PollWaiter>>,
+) -> usize {
     let mut ready = 0usize;
-    for pollfd in pollfds.iter_mut() {
+    for (pollfd, file_slot) in pollfds.iter_mut().zip(files.iter()) {
         pollfd.revents = 0;
         if pollfd.fd < 0 {
             continue;
         }
 
         let events = poll_events_from_user(pollfd.events);
-        match get_file_by_fd(pollfd.fd as usize) {
-            Ok(file) => {
+        match file_slot {
+            Some(PollFileSlot::File(file)) => {
                 let revents = file.poll_with_wait(events, waiter);
                 pollfd.revents = poll_events_to_user(revents);
                 if !revents.is_empty() {
                     ready += 1;
                 }
             }
-            Err(SysError::EBADF) => {
+            Some(PollFileSlot::Error(SysError::EBADF)) => {
                 pollfd.revents = poll_events_to_user(PollEvents::POLLNVAL);
                 ready += 1;
             }
-            Err(_) => {
+            Some(PollFileSlot::Error(_)) | None => {
                 pollfd.revents = poll_events_to_user(PollEvents::POLLERR);
                 ready += 1;
             }
@@ -159,11 +192,12 @@ pub fn sys_ppoll(
 
     let token = current_user_token();
     let mut pollfds = read_user_pollfds(token, fds.cast_const(), nfds)?;
+    let poll_files = snapshot_pollfds(&pollfds);
     let deadline_ms = relative_timeout_deadline_ms(token, timeout)?;
     let task = current_task().ok_or(SysError::ESRCH)?;
 
     loop {
-        let ready = scan_pollfds(&mut pollfds, None);
+        let ready = scan_pollfds(&mut pollfds, &poll_files, None);
         perf::record_poll_scan(pollfds.len(), ready);
         if ready > 0 {
             write_user_pollfds(token, fds, &pollfds)?;
@@ -180,7 +214,7 @@ pub fn sys_ppoll(
             block_signal_only_waiter()?;
         } else {
             let waiter = PollWaiter::new(Arc::clone(&task));
-            let ready = scan_pollfds(&mut pollfds, Some(&waiter));
+            let ready = scan_pollfds(&mut pollfds, &poll_files, Some(&waiter));
             perf::record_poll_scan(pollfds.len(), ready);
             if ready > 0 {
                 write_user_pollfds(token, fds, &pollfds)?;
@@ -222,14 +256,6 @@ fn write_user_fdset(token: usize, ptr: usize, words: &[usize]) -> SysResult {
     Ok(0)
 }
 
-fn fd_is_set(words: &[usize], fd: usize) -> bool {
-    let word = fd / FD_SET_WORD_BITS;
-    let bit = fd % FD_SET_WORD_BITS;
-    words
-        .get(word)
-        .is_some_and(|word| word & (1usize << bit) != 0)
-}
-
 fn fd_set(words: &mut [usize], fd: usize) {
     let word = fd / FD_SET_WORD_BITS;
     let bit = fd % FD_SET_WORD_BITS;
@@ -238,27 +264,100 @@ fn fd_set(words: &mut [usize], fd: usize) {
     }
 }
 
+fn for_each_set_fd<F>(nfds: usize, input: Option<&[usize]>, mut f: F) -> SysResult<usize>
+where
+    F: FnMut(usize) -> SysResult,
+{
+    let Some(input) = input else {
+        return Ok(0);
+    };
+    let word_count = fdset_words(nfds);
+    let mut visits = 0usize;
+    for word_index in 0..word_count {
+        let Some(mut word) = input.get(word_index).copied() else {
+            break;
+        };
+        let first_fd = word_index * FD_SET_WORD_BITS;
+        if first_fd + FD_SET_WORD_BITS > nfds {
+            let valid_bits = nfds - first_fd;
+            if valid_bits < FD_SET_WORD_BITS {
+                word &= (1usize << valid_bits) - 1;
+            }
+        }
+        while word != 0 {
+            let bit = word.trailing_zeros() as usize;
+            let fd = first_fd + bit;
+            if fd >= nfds {
+                break;
+            }
+            f(fd)?;
+            visits += 1;
+            word &= word - 1;
+        }
+    }
+    Ok(visits)
+}
+
+fn snapshot_select_fdsets(
+    nfds: usize,
+    read_input: Option<&[usize]>,
+    write_input: Option<&[usize]>,
+    except_input: Option<&[usize]>,
+) -> SysResult<Vec<Option<PollFileSlot>>> {
+    let mut files: Vec<Option<PollFileSlot>> =
+        Vec::from_iter(core::iter::repeat_with(|| None).take(nfds));
+    for_each_set_fd(nfds, read_input, |fd| {
+        if files[fd].is_none() {
+            files[fd] = Some(match poll_get_file_by_fd(fd) {
+                Ok(file) => PollFileSlot::File(file),
+                Err(err) => PollFileSlot::Error(err),
+            });
+        }
+        Ok(0)
+    })?;
+    for_each_set_fd(nfds, write_input, |fd| {
+        if files[fd].is_none() {
+            files[fd] = Some(match poll_get_file_by_fd(fd) {
+                Ok(file) => PollFileSlot::File(file),
+                Err(err) => PollFileSlot::Error(err),
+            });
+        }
+        Ok(0)
+    })?;
+    for_each_set_fd(nfds, except_input, |fd| {
+        if files[fd].is_none() {
+            files[fd] = Some(match poll_get_file_by_fd(fd) {
+                Ok(file) => PollFileSlot::File(file),
+                Err(err) => PollFileSlot::Error(err),
+            });
+        }
+        Ok(0)
+    })?;
+    Ok(files)
+}
+
 fn scan_fdset(
     nfds: usize,
     input: Option<&[usize]>,
     output: &mut [usize],
     events: PollEvents,
+    files: &[Option<PollFileSlot>],
     waiter: Option<&Arc<PollWaiter>>,
 ) -> SysResult<usize> {
-    let Some(input) = input else {
-        return Ok(0);
-    };
     let mut ready = 0usize;
-    for fd in 0..nfds {
-        if !fd_is_set(input, fd) {
-            continue;
+    for_each_set_fd(nfds, input, |fd| {
+        match files.get(fd).and_then(Option::as_ref) {
+            Some(PollFileSlot::File(file)) => {
+                if file.poll_with_wait(events, waiter).intersects(events) {
+                    fd_set(output, fd);
+                    ready += 1;
+                }
+                Ok(0)
+            }
+            Some(PollFileSlot::Error(err)) => Err(*err),
+            None => Err(SysError::EBADF),
         }
-        let file = get_file_by_fd(fd)?;
-        if file.poll_with_wait(events, waiter).intersects(events) {
-            fd_set(output, fd);
-            ready += 1;
-        }
-    }
+    })?;
     Ok(ready)
 }
 
@@ -270,6 +369,7 @@ fn scan_pselect_fdsets(
     read_output: &mut [usize],
     write_output: &mut [usize],
     except_output: &mut [usize],
+    files: &[Option<PollFileSlot>],
     waiter: Option<&Arc<PollWaiter>>,
 ) -> SysResult<usize> {
     read_output.fill(0);
@@ -281,15 +381,23 @@ fn scan_pselect_fdsets(
         read_input,
         read_output,
         PollEvents::POLLIN | PollEvents::POLLHUP | PollEvents::POLLRDHUP,
+        files,
         waiter,
-    )? + scan_fdset(nfds, write_input, write_output, PollEvents::POLLOUT, waiter)?
-        + scan_fdset(
-            nfds,
-            except_input,
-            except_output,
-            PollEvents::POLLPRI,
-            waiter,
-        )?)
+    )? + scan_fdset(
+        nfds,
+        write_input,
+        write_output,
+        PollEvents::POLLOUT,
+        files,
+        waiter,
+    )? + scan_fdset(
+        nfds,
+        except_input,
+        except_output,
+        PollEvents::POLLPRI,
+        files,
+        waiter,
+    )?)
 }
 
 pub fn sys_pselect6(
@@ -311,6 +419,12 @@ pub fn sys_pselect6(
     let read_input = read_user_fdset(token, readfds, nfds)?;
     let write_input = read_user_fdset(token, writefds, nfds)?;
     let except_input = read_user_fdset(token, exceptfds, nfds)?;
+    let select_files = snapshot_select_fdsets(
+        nfds,
+        read_input.as_deref(),
+        write_input.as_deref(),
+        except_input.as_deref(),
+    )?;
     let deadline_ms = relative_timeout_deadline_ms(token, timeout)?;
     let word_count = fdset_words(nfds);
     let mut read_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
@@ -330,6 +444,7 @@ pub fn sys_pselect6(
             &mut read_output,
             &mut write_output,
             &mut except_output,
+            &select_files,
             None,
         )?;
         perf::record_poll_scan(fdset_visits, ready);
@@ -359,6 +474,7 @@ pub fn sys_pselect6(
                 &mut read_output,
                 &mut write_output,
                 &mut except_output,
+                &select_files,
                 Some(&waiter),
             )?;
             perf::record_poll_scan(fdset_visits, ready);

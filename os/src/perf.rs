@@ -64,6 +64,7 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) poll_wait_ready_events: usize,
     pub(crate) poll_backoff_sleeps: usize,
     pub(crate) poll_backoff_ms: usize,
+    pub(crate) poll_fd_table_lookups: usize,
     pub(crate) vfs_read_cache_hits: usize,
     pub(crate) vfs_read_cache_misses: usize,
     pub(crate) vfs_read_cache_bytes: usize,
@@ -300,6 +301,7 @@ mod enabled {
     static POLL_WAIT_READY_EVENTS: AtomicUsize = AtomicUsize::new(0);
     static POLL_BACKOFF_SLEEPS: AtomicUsize = AtomicUsize::new(0);
     static POLL_BACKOFF_MS: AtomicUsize = AtomicUsize::new(0);
+    static POLL_FD_TABLE_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
 
     static VFS_READ_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
     static VFS_READ_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
@@ -636,6 +638,10 @@ mod enabled {
         POLL_WAIT_SCANS.fetch_add(1, Ordering::Relaxed);
         POLL_WAIT_FD_VISITS.fetch_add(fd_visits, Ordering::Relaxed);
         POLL_WAIT_READY_EVENTS.fetch_add(ready_events, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_poll_fd_table_lookup() {
+        POLL_FD_TABLE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_vfs_read_cache_hit(bytes: usize) {
@@ -1203,6 +1209,7 @@ mod enabled {
             poll_wait_ready_events: POLL_WAIT_READY_EVENTS.load(Ordering::Relaxed),
             poll_backoff_sleeps: POLL_BACKOFF_SLEEPS.load(Ordering::Relaxed),
             poll_backoff_ms: POLL_BACKOFF_MS.load(Ordering::Relaxed),
+            poll_fd_table_lookups: POLL_FD_TABLE_LOOKUPS.load(Ordering::Relaxed),
             vfs_read_cache_hits: VFS_READ_CACHE_HITS.load(Ordering::Relaxed),
             vfs_read_cache_misses: VFS_READ_CACHE_MISSES.load(Ordering::Relaxed),
             vfs_read_cache_bytes: VFS_READ_CACHE_BYTES.load(Ordering::Relaxed),
@@ -1458,6 +1465,7 @@ mod enabled {
          poll_wait_ready_events {}\n\
          poll_backoff_sleeps {}\n\
          poll_backoff_ms {}\n\
+         poll_fd_table_lookups {}\n\
          vfs_read_cache_hits {}\n\
          vfs_read_cache_misses {}\n\
          vfs_read_cache_bytes {}\n\
@@ -1682,6 +1690,7 @@ mod enabled {
             stats.poll_wait_ready_events,
             stats.poll_backoff_sleeps,
             stats.poll_backoff_ms,
+            stats.poll_fd_table_lookups,
             stats.vfs_read_cache_hits,
             stats.vfs_read_cache_misses,
             stats.vfs_read_cache_bytes,
@@ -2001,6 +2010,9 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_poll_scan(_fd_visits: usize, _ready_events: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_poll_fd_table_lookup() {}
 
     #[inline(always)]
     pub(crate) fn record_vfs_read_cache_hit(_bytes: usize) {}
