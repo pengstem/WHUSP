@@ -1198,14 +1198,19 @@ impl VfsFile {
     }
 
     fn read_cache_id_for_size(&self, file_size: usize) -> Option<PageCacheId> {
-        if self.writable
-            || file_size > VFS_READ_CACHE_MAX_FILE_SIZE
-            || regular_file_node_is_open_writable(self.node)
-            || dirty_regular_file_has_pages(self.node)
-        {
+        if file_size > VFS_READ_CACHE_MAX_FILE_SIZE {
+            perf::record_vfs_read_cache_skip_too_large();
             return None;
         }
-        page_cache_id_for_node(self.node, self.kind)
+        if dirty_regular_file_has_pages(self.node) {
+            perf::record_vfs_read_cache_skip_dirty_pages();
+            return None;
+        }
+        let id = page_cache_id_for_node(self.node, self.kind);
+        if id.is_some() {
+            perf::record_vfs_read_cache_eligible();
+        }
+        id
     }
 
     fn read_regular_cached_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {

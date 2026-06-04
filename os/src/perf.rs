@@ -72,6 +72,9 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) vfs_read_cache_invalidation_scan_pages: usize,
     pub(crate) vfs_read_cache_readahead_batches: usize,
     pub(crate) vfs_read_cache_readahead_pages: usize,
+    pub(crate) vfs_read_cache_eligible_calls: usize,
+    pub(crate) vfs_read_cache_skip_too_large: usize,
+    pub(crate) vfs_read_cache_skip_dirty_pages: usize,
     pub(crate) vfs_read_all_calls: usize,
     pub(crate) vfs_read_all_backend_reads: usize,
     pub(crate) vfs_read_all_bytes: usize,
@@ -296,6 +299,9 @@ mod enabled {
     static VFS_READ_CACHE_INVALIDATION_SCAN_PAGES: AtomicUsize = AtomicUsize::new(0);
     static VFS_READ_CACHE_READAHEAD_BATCHES: AtomicUsize = AtomicUsize::new(0);
     static VFS_READ_CACHE_READAHEAD_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static VFS_READ_CACHE_ELIGIBLE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static VFS_READ_CACHE_SKIP_TOO_LARGE: AtomicUsize = AtomicUsize::new(0);
+    static VFS_READ_CACHE_SKIP_DIRTY_PAGES: AtomicUsize = AtomicUsize::new(0);
     static VFS_READ_ALL_CALLS: AtomicUsize = AtomicUsize::new(0);
     static VFS_READ_ALL_BACKEND_READS: AtomicUsize = AtomicUsize::new(0);
     static VFS_READ_ALL_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -630,6 +636,18 @@ mod enabled {
     pub(crate) fn record_vfs_read_cache_readahead(pages: usize) {
         VFS_READ_CACHE_READAHEAD_BATCHES.fetch_add(1, Ordering::Relaxed);
         VFS_READ_CACHE_READAHEAD_PAGES.fetch_add(pages, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_vfs_read_cache_eligible() {
+        VFS_READ_CACHE_ELIGIBLE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_vfs_read_cache_skip_too_large() {
+        VFS_READ_CACHE_SKIP_TOO_LARGE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_vfs_read_cache_skip_dirty_pages() {
+        VFS_READ_CACHE_SKIP_DIRTY_PAGES.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_vfs_read_all_call() {
@@ -1146,6 +1164,10 @@ mod enabled {
             vfs_read_cache_readahead_batches: VFS_READ_CACHE_READAHEAD_BATCHES
                 .load(Ordering::Relaxed),
             vfs_read_cache_readahead_pages: VFS_READ_CACHE_READAHEAD_PAGES.load(Ordering::Relaxed),
+            vfs_read_cache_eligible_calls: VFS_READ_CACHE_ELIGIBLE_CALLS.load(Ordering::Relaxed),
+            vfs_read_cache_skip_too_large: VFS_READ_CACHE_SKIP_TOO_LARGE.load(Ordering::Relaxed),
+            vfs_read_cache_skip_dirty_pages: VFS_READ_CACHE_SKIP_DIRTY_PAGES
+                .load(Ordering::Relaxed),
             vfs_read_all_calls: VFS_READ_ALL_CALLS.load(Ordering::Relaxed),
             vfs_read_all_backend_reads: VFS_READ_ALL_BACKEND_READS.load(Ordering::Relaxed),
             vfs_read_all_bytes: VFS_READ_ALL_BYTES.load(Ordering::Relaxed),
@@ -1378,6 +1400,9 @@ mod enabled {
          vfs_read_cache_invalidation_scan_pages {}\n\
          vfs_read_cache_readahead_batches {}\n\
          vfs_read_cache_readahead_pages {}\n\
+         vfs_read_cache_eligible_calls {}\n\
+         vfs_read_cache_skip_too_large {}\n\
+         vfs_read_cache_skip_dirty_pages {}\n\
          vfs_read_all_calls {}\n\
          vfs_read_all_backend_reads {}\n\
          vfs_read_all_bytes {}\n\
@@ -1589,6 +1614,9 @@ mod enabled {
             stats.vfs_read_cache_invalidation_scan_pages,
             stats.vfs_read_cache_readahead_batches,
             stats.vfs_read_cache_readahead_pages,
+            stats.vfs_read_cache_eligible_calls,
+            stats.vfs_read_cache_skip_too_large,
+            stats.vfs_read_cache_skip_dirty_pages,
             stats.vfs_read_all_calls,
             stats.vfs_read_all_backend_reads,
             stats.vfs_read_all_bytes,
@@ -1899,6 +1927,15 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_vfs_read_cache_readahead(_pages: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_vfs_read_cache_eligible() {}
+
+    #[inline(always)]
+    pub(crate) fn record_vfs_read_cache_skip_too_large() {}
+
+    #[inline(always)]
+    pub(crate) fn record_vfs_read_cache_skip_dirty_pages() {}
 
     #[inline(always)]
     pub(crate) fn record_vfs_read_all_call() {}
