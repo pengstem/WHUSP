@@ -820,7 +820,8 @@ pub fn sys_fadvise64(fd: usize, offset: i64, len: i64, advice: i32) -> SysResult
     Ok(0)
 }
 
-const COPY_FILE_RANGE_CHUNK: usize = PAGE_SIZE;
+const GENERIC_BULK_COPY_CHUNK: usize = 64 * 1024;
+const COPY_FILE_RANGE_CHUNK: usize = GENERIC_BULK_COPY_CHUNK;
 
 fn ensure_copy_file_range_target(file: &(dyn File + Send + Sync)) -> SysResult<FileStat> {
     let stat = file.stat()?;
@@ -1000,8 +1001,8 @@ const SPLICE_F_NONBLOCK: u32 = 0x02;
 const SPLICE_F_MORE: u32 = 0x04;
 const SPLICE_F_GIFT: u32 = 0x08;
 const SPLICE_KNOWN_FLAGS: u32 = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
-const SPLICE_COPY_CHUNK: usize = 4096;
-const SENDFILE_COPY_CHUNK: usize = PAGE_SIZE;
+const SPLICE_COPY_CHUNK: usize = GENERIC_BULK_COPY_CHUNK;
+const SENDFILE_COPY_CHUNK: usize = GENERIC_BULK_COPY_CHUNK;
 
 // UNFINISHED: Linux splice can move pipe pages without copying and has deeper
 // file-type-specific wakeup semantics. This contest compatibility path copies
@@ -1141,7 +1142,11 @@ fn read_for_splice(entry: &FdTableEntry, offset: Option<i64>, buf: &mut [u8]) ->
     }
 }
 
-fn write_for_splice(entry: &FdTableEntry, offset: Option<i64>, data: &[u8]) -> SysResult<usize> {
+fn write_for_splice(
+    entry: &FdTableEntry,
+    offset: Option<i64>,
+    data: &mut [u8],
+) -> SysResult<usize> {
     let file = entry.file();
     if file.is_dev_full() && !data.is_empty() {
         return Err(SysError::ENOSPC);
@@ -1151,11 +1156,7 @@ fn write_for_splice(entry: &FdTableEntry, offset: Option<i64>, data: &[u8]) -> S
     } else {
         check_pipe_write_peer(entry, !data.is_empty())?;
         ensure_nonblocking_ready(entry, PollEvents::POLLOUT)?;
-        let mut owned = data.to_vec();
-        Ok(write_with_status_flags(
-            entry,
-            kernel_user_buffer(&mut owned),
-        ))
+        Ok(write_with_status_flags(entry, kernel_user_buffer(data)))
     }
 }
 
@@ -1224,7 +1225,7 @@ pub fn sys_splice(
         if read == 0 {
             break;
         }
-        let written = write_for_splice(&out_entry, out_offset, &buffer[..read])?;
+        let written = write_for_splice(&out_entry, out_offset, &mut buffer[..read])?;
         if written == 0 {
             break;
         }
