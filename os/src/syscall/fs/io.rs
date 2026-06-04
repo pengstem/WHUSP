@@ -332,6 +332,51 @@ fn pwritev_regular_file_coalesced(
     Ok(total_written)
 }
 
+fn pwritev_can_use_direct_page_slices(
+    iovecs: &UserIovecs,
+    offset: usize,
+    allowed_len: usize,
+) -> bool {
+    allowed_len == iovecs.total_len
+        && allowed_len <= WRITEV_COALESCE_CHUNK_SIZE
+        && offset % PAGE_SIZE == 0
+        && iovecs.entries.iter().all(|iovec| {
+            iovec.len == 0 || (iovec.base % PAGE_SIZE == 0 && iovec.len % PAGE_SIZE == 0)
+        })
+}
+
+fn pwritev_regular_file_direct_page_slices(
+    file: &(dyn File + Send + Sync),
+    mut cursor: UserIovecCursor,
+    offset: usize,
+    mut remaining_len: usize,
+) -> SysResult<usize> {
+    let mut buffers = Vec::new();
+    let mut pending_len = 0usize;
+    while let Some(chunk) = cursor.next_chunk() {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) if pending_len > 0 => {
+                let written = file
+                    .write_at_aligned_user_buffer(offset, UserBuffer::new(buffers))
+                    .map_err(SysError::from)?;
+                return Ok(written);
+            }
+            Err(err) => return Err(err),
+        };
+        let chunk_len = chunk.len.min(remaining_len);
+        let chunk_buffers = truncate_user_buffers(chunk.buffers, chunk_len);
+        buffers.extend(chunk_buffers);
+        pending_len = pending_len.saturating_add(chunk_len);
+        remaining_len = remaining_len.saturating_sub(chunk_len);
+        if remaining_len == 0 {
+            break;
+        }
+    }
+    file.write_at_aligned_user_buffer(offset, UserBuffer::new(buffers))
+        .map_err(SysError::from)
+}
+
 fn collect_iovec_buffers(
     mut cursor: UserIovecCursor,
     mut remaining_len: usize,
@@ -1447,9 +1492,15 @@ pub fn sys_pwritev(
     let allowed_len = allowed_write_len_at(file.as_ref(), offset, iovecs.total_len)?;
     let requested_len = allowed_len;
     if iovcnt > 1 {
+        let use_direct_page_slices =
+            pwritev_can_use_direct_page_slices(&iovecs, offset, allowed_len)
+                && file.supports_aligned_user_buffer_write_at(offset, allowed_len);
         let cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Read);
-        let total_written =
-            pwritev_regular_file_coalesced(file.as_ref(), cursor, offset, allowed_len)?;
+        let total_written = if use_direct_page_slices {
+            pwritev_regular_file_direct_page_slices(file.as_ref(), cursor, offset, allowed_len)?
+        } else {
+            pwritev_regular_file_coalesced(file.as_ref(), cursor, offset, allowed_len)?
+        };
         fanotify_notify_modify(&file, total_written);
         inotify_notify_modify(&file, total_written);
         return checked_write_result(requested_len, total_written);

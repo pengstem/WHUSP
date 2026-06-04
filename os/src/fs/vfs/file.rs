@@ -390,6 +390,91 @@ fn cache_dirty_regular_write(node: VfsNodeId, offset: usize, buf: &[u8]) -> Dirt
     DirtyCacheWriteResult::Cached(buf.len())
 }
 
+fn cache_dirty_regular_user_buffer_write(
+    node: VfsNodeId,
+    offset: usize,
+    buf: &UserBuffer,
+) -> DirtyCacheWriteResult {
+    let len = buf.len();
+    if len == 0 {
+        return DirtyCacheWriteResult::Cached(0);
+    }
+    if buf.buffers.iter().any(|slice| slice.len() % PAGE_SIZE != 0) {
+        return DirtyCacheWriteResult::Fallback;
+    }
+    let stat = match with_mount(node.mount_id, |mount| mount.stat(node.ino)) {
+        Some(Ok(stat)) => stat,
+        _ => return DirtyCacheWriteResult::Fallback,
+    };
+    let base_size = stat.size as usize;
+    let logical_size = dirty_logical_size(node).unwrap_or(base_size);
+    let Some(end) = offset.checked_add(len) else {
+        return DirtyCacheWriteResult::Fallback;
+    };
+    if offset > logical_size {
+        return DirtyCacheWriteResult::Fallback;
+    }
+
+    let page_start = offset / PAGE_SIZE;
+    let page_count = len / PAGE_SIZE;
+    let needs_pin = {
+        let dirty = DIRTY_REGULAR_FILES.lock();
+        let (dirty_pages, new_pages) =
+            dirty_write_page_pressure(&dirty, node, page_start, page_count);
+        if dirty_pages.saturating_add(new_pages) > VFS_DIRTY_WRITEBACK_MAX_PAGES {
+            return DirtyCacheWriteResult::NeedsPressureFlush;
+        }
+        !dirty.contains_key(&node)
+    };
+    let retained_pin = if needs_pin {
+        match with_mount(node.mount_id, |mount| mount.retain_inode(node.ino)) {
+            Some(Ok(())) => true,
+            _ => return DirtyCacheWriteResult::Fallback,
+        }
+    } else {
+        false
+    };
+
+    let timestamp = FileTimestamp::now();
+    let mut release_extra_pin = false;
+    let mut dirty = DIRTY_REGULAR_FILES.lock();
+    let (dirty_pages, new_pages) = dirty_write_page_pressure(&dirty, node, page_start, page_count);
+    if dirty_pages.saturating_add(new_pages) > VFS_DIRTY_WRITEBACK_MAX_PAGES {
+        drop(dirty);
+        if retained_pin {
+            release_inode_from_drop(node.mount_id, node.ino);
+        }
+        return DirtyCacheWriteResult::NeedsPressureFlush;
+    }
+    if retained_pin && dirty.contains_key(&node) {
+        release_extra_pin = true;
+    }
+    let cache = dirty
+        .entry(node)
+        .or_insert_with(|| DirtyFileCache::new(logical_size, timestamp));
+    cache.logical_size = cache.logical_size.max(end);
+    cache.mtime = timestamp;
+    cache.ctime = timestamp;
+    let mut page_index = page_start;
+    for source in buf.buffers.iter() {
+        for chunk in source.chunks(PAGE_SIZE) {
+            let mut page = Vec::with_capacity(PAGE_SIZE);
+            page.extend_from_slice(chunk);
+            cache.pages.insert(page_index, page);
+            page_index += 1;
+        }
+    }
+    let current_dirty_pages = dirty.values().map(|cache| cache.pages.len()).sum::<usize>();
+    drop(dirty);
+    if release_extra_pin {
+        release_inode_from_drop(node.mount_id, node.ino);
+    }
+
+    record_dirty_cache_write(page_count, len);
+    record_dirty_cache_peak(current_dirty_pages);
+    DirtyCacheWriteResult::Cached(len)
+}
+
 fn overlay_dirty_regular_read(node: VfsNodeId, offset: usize, buf: &mut [u8]) -> Option<usize> {
     if buf.is_empty() {
         return Some(0);
@@ -1936,6 +2021,39 @@ impl File for VfsFile {
             invalidate_regular_file_read_cache(self.node, self.kind);
         }
         self.write_at_chunks(offset, buf)
+    }
+
+    fn supports_aligned_user_buffer_write_at(&self, offset: usize, len: usize) -> bool {
+        can_cache_dirty_write(
+            self.kind,
+            self.node.mount_id,
+            offset,
+            len,
+            self.status_flags.get(),
+        )
+    }
+
+    fn write_at_aligned_user_buffer(&self, offset: usize, buf: UserBuffer) -> FsResult<usize> {
+        let len = buf.len();
+        if !self.supports_aligned_user_buffer_write_at(offset, len) {
+            return Err(FsError::Unsupported);
+        }
+        self.check_write_at(offset, len)?;
+        *self.read_snapshot.lock() = None;
+        invalidate_regular_file_read_cache(self.node, self.kind);
+        let mut pressure_retried = false;
+        loop {
+            match cache_dirty_regular_user_buffer_write(self.node, offset, &buf) {
+                DirtyCacheWriteResult::Cached(write_size) => return Ok(write_size),
+                DirtyCacheWriteResult::NeedsPressureFlush if !pressure_retried => {
+                    flush_dirty_regular_files_for_pressure()?;
+                    pressure_retried = true;
+                }
+                DirtyCacheWriteResult::NeedsPressureFlush | DirtyCacheWriteResult::Fallback => {
+                    return Err(FsError::Io);
+                }
+            }
+        }
     }
 
     fn set_len(&self, len: usize) -> FsResult {

@@ -351,6 +351,12 @@ pub trait File: Send + Sync {
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
     }
+    fn supports_aligned_user_buffer_write_at(&self, _offset: usize, _len: usize) -> bool {
+        false
+    }
+    fn write_at_aligned_user_buffer(&self, _offset: usize, _buf: UserBuffer) -> FsResult<usize> {
+        Err(FsError::Unsupported)
+    }
     fn set_len(&self, _len: usize) -> FsResult {
         Err(FsError::Unsupported)
     }
