@@ -10,7 +10,7 @@ use super::{
     File, FileStat, FsError, FsResult, OpenFlags, PollEvents, PollWaitQueue, PollWaiter, S_IFBLK,
     S_IFCHR, S_IFDIR, SeekWhence, console_tty_poll, console_tty_poll_with_wait, console_tty_read,
 };
-use crate::drivers::chardev::{CharDevice, UART};
+use crate::drivers::chardev::UART;
 use crate::mm::UserBuffer;
 use crate::perf;
 use crate::sync::UPIntrFreeCell;
@@ -1739,9 +1739,7 @@ fn read_console(user_buf: UserBuffer) -> usize {
 
 fn write_console(user_buf: UserBuffer) -> usize {
     let len = user_buf.len();
-    for buffer in user_buf.buffers.iter() {
-        UART.write_bytes(buffer);
-    }
+    UART.write_byte_slices(user_buf.buffers.iter().map(|buffer| &(**buffer)[..]));
     len
 }
 

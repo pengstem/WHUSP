@@ -3,7 +3,7 @@ use super::{
     File, FileStat, FsResult, OpenFlags, PollEvents, PollWaiter, S_IFCHR, console_tty_poll,
     console_tty_poll_with_wait, console_tty_read,
 };
-use crate::drivers::chardev::{CharDevice, UART};
+use crate::drivers::chardev::UART;
 use crate::mm::UserBuffer;
 
 pub struct Stdin {
@@ -87,9 +87,7 @@ impl File for Stdout {
     }
     fn write(&self, user_buf: UserBuffer) -> usize {
         let len = user_buf.len();
-        for buffer in user_buf.buffers.iter() {
-            UART.write_bytes(buffer);
-        }
+        UART.write_byte_slices(user_buf.buffers.iter().map(|buffer| &(**buffer)[..]));
         len
     }
     fn poll(&self, events: PollEvents) -> PollEvents {

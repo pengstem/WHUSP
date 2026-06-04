@@ -175,6 +175,20 @@ impl NS16550a {
             condvar: Condvar::new(),
         }
     }
+
+    pub fn write_byte_slices<'a, I>(&self, byte_slices: I)
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let mut inner = self.inner.exclusive_access();
+        let mut total_bytes = 0usize;
+        for bytes in byte_slices {
+            total_bytes = total_bytes.saturating_add(bytes.len());
+            inner.ns16550a.write_bytes(bytes);
+        }
+        drop(inner);
+        crate::perf::record_uart_write(total_bytes);
+    }
 }
 
 impl CharDevice for NS16550a {
@@ -219,10 +233,12 @@ impl CharDevice for NS16550a {
         !inner.read_buffer.is_empty()
     }
     fn write(&self, ch: u8) {
+        crate::perf::record_uart_write(1);
         let mut inner = self.inner.exclusive_access();
         inner.ns16550a.write(ch);
     }
     fn write_bytes(&self, bytes: &[u8]) {
+        crate::perf::record_uart_write(bytes.len());
         let mut inner = self.inner.exclusive_access();
         inner.ns16550a.write_bytes(bytes);
     }
