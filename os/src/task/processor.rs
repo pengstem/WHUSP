@@ -76,20 +76,34 @@ pub fn current_task() -> Option<Arc<TaskControlBlock>> {
 
 pub fn current_process() -> Arc<ProcessControlBlock> {
     perf::record_task_current_process_call();
-    let task = current_task().expect("current_process requires a running task");
-    process_of_task(&task)
+    PROCESSOR
+        .exclusive_access()
+        .current
+        .as_ref()
+        .map(|task| process_of_task(task))
+        .expect("current_process requires a running task")
 }
 
 pub fn current_user_token() -> usize {
     perf::record_task_current_user_token_call();
-    let task = current_task().expect("current_user_token requires a running task");
-    task.get_user_token()
+    let process = PROCESSOR
+        .exclusive_access()
+        .current
+        .as_ref()
+        .map(|task| process_of_task(task))
+        .expect("current_user_token requires a running task");
+    process.inner_exclusive_access().memory_set.token()
 }
 
 pub fn current_trap_cx() -> &'static mut TrapContext {
     perf::record_task_current_trap_cx_call();
-    let task = current_task().expect("current_trap_cx requires a running task");
-    trap_cx_of_task(&task)
+    let trap_cx_ppn = PROCESSOR
+        .exclusive_access()
+        .current
+        .as_ref()
+        .map(|task| task.inner_exclusive_access().trap_cx_ppn)
+        .expect("current_trap_cx requires a running task");
+    trap_cx_ppn.get_mut()
 }
 
 pub fn process_of_task(task: &TaskControlBlock) -> Arc<ProcessControlBlock> {
@@ -114,14 +128,13 @@ fn account_trap_return_for_task(
 }
 
 #[cfg(target_arch = "riscv64")]
-pub fn current_trap_return_context_after_accounting(now_us: usize) -> (usize, usize) {
+pub fn trap_return_context_after_accounting_for_task(
+    task: &TaskControlBlock,
+    process: &ProcessControlBlock,
+    now_us: usize,
+) -> (usize, usize) {
     perf::record_task_current_trap_return_context_call();
-    let task = current_task().expect("current_trap_return_context requires a running task");
-    let process = task
-        .process
-        .upgrade()
-        .expect("current task process must outlive the task");
-    account_trap_return_for_task(&task, &process, now_us);
+    account_trap_return_for_task(task, process, now_us);
     let trap_cx_user_va = task
         .inner_exclusive_access()
         .res
@@ -133,25 +146,24 @@ pub fn current_trap_return_context_after_accounting(now_us: usize) -> (usize, us
 }
 
 #[cfg(target_arch = "loongarch64")]
-pub fn current_trap_return_context_after_accounting(now_us: usize) -> (usize, usize) {
+pub fn trap_return_context_after_accounting_for_task(
+    task: &TaskControlBlock,
+    process: &ProcessControlBlock,
+    now_us: usize,
+) -> (usize, usize) {
     perf::record_task_current_trap_return_context_call();
-    let task = current_task().expect("current_trap_return_context requires a running task");
-    let process = task
-        .process
-        .upgrade()
-        .expect("current task process must outlive the task");
-    account_trap_return_for_task(&task, &process, now_us);
+    account_trap_return_for_task(task, process, now_us);
     let trap_cx = task.inner_exclusive_access().get_trap_cx() as *mut TrapContext as usize;
     let user_token = process.inner_exclusive_access().memory_set.token();
     (trap_cx, user_token)
 }
 
 pub fn current_kstack_top() -> usize {
-    if let Some(task) = current_task() {
-        task.kstack.get_top()
-    } else {
-        hart::boot_stack_top()
-    }
+    PROCESSOR
+        .exclusive_access()
+        .current
+        .as_ref()
+        .map_or_else(hart::boot_stack_top, |task| task.kstack.get_top())
 }
 
 pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {

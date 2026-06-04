@@ -8,8 +8,8 @@ use crate::syscall::{
 use crate::task::{
     SignalAction, SignalFlags, TaskControlBlock, account_task_user_time_until,
     check_signals_of_task, current_add_signal, current_process, current_task,
-    current_trap_return_context_after_accounting, exit_current_group_and_run_next, process_of_task,
-    suspend_current_and_run_next, timer_tick_should_preempt, trap_cx_of_task,
+    exit_current_group_and_run_next, process_of_task, suspend_current_and_run_next,
+    timer_tick_should_preempt, trap_cx_of_task, trap_return_context_after_accounting_for_task,
 };
 use crate::timer::{check_timer, get_time_us, set_next_trigger};
 use alloc::sync::Arc;
@@ -159,9 +159,7 @@ pub fn trap_handler() -> ! {
                 interrupted_pc,
                 syscall_pc_if_interrupted,
             ) {
-                drop(process);
-                drop(task);
-                trap_return();
+                trap_return_for_task(task, process);
             }
             signal_delivery_attempted = true;
         }
@@ -196,9 +194,7 @@ pub fn trap_handler() -> ! {
         Trap::Exception(Exception::IllegalInstruction) => {
             if user_fp_was_off {
                 init_lazy_fp_for_task(&task);
-                drop(process);
-                drop(task);
-                trap_return();
+                trap_return_for_task(task, process);
             }
             current_add_signal(SignalFlags::SIGILL);
         }
@@ -226,9 +222,7 @@ pub fn trap_handler() -> ! {
     if !signal_delivery_attempted
         && crate::arch::signal::deliver_pending_signal(&task, &process, interrupted_pc, None)
     {
-        drop(process);
-        drop(task);
-        trap_return();
+        trap_return_for_task(task, process);
     }
     if let Some((errno, _msg)) = check_signals_of_task(&task, &process) {
         drop(process);
@@ -236,9 +230,7 @@ pub fn trap_handler() -> ! {
         exit_current_group_and_run_next(errno);
         unreachable!("signal-forced exit returned");
     }
-    drop(process);
-    drop(task);
-    trap_return();
+    trap_return_for_task(task, process);
 }
 
 fn init_lazy_fp_for_task(task: &Arc<TaskControlBlock>) {
@@ -330,15 +322,24 @@ fn force_default_sigsegv_current() {
 /// set the reg a0 = trap_cx_ptr, reg a1 = phy addr of usr page table,
 /// finally, jump to new addr of __restore asm function
 pub fn trap_return() -> ! {
+    let task = current_task().expect("trap_return requires a running task");
+    let process = process_of_task(&task);
+    trap_return_for_task(task, process)
+}
+
+fn trap_return_for_task(
+    task: Arc<TaskControlBlock>,
+    process: Arc<crate::task::ProcessControlBlock>,
+) -> ! {
     let now_us = get_time_us();
-    let restore_fp = {
-        let task = current_task().expect("trap_return requires a running task");
-        trap_cx_of_task(&task).user_fp_is_dirty()
-    };
-    let (trap_cx_user_va, user_satp) = current_trap_return_context_after_accounting(now_us);
+    let restore_fp = trap_cx_of_task(&task).user_fp_is_dirty();
+    let (trap_cx_user_va, user_satp) =
+        trap_return_context_after_accounting_for_task(&task, &process, now_us);
     if restore_fp {
         crate::perf::record_rv_user_fp_restore_call();
     }
+    drop(process);
+    drop(task);
     disable_supervisor_interrupt();
     set_user_trap_entry();
     unsafe extern "C" {

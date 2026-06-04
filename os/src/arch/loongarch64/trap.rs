@@ -4,10 +4,10 @@ use crate::config::TRAMPOLINE;
 use crate::mm::{MmapFaultAccess, MmapFaultResult};
 use crate::syscall::{syscall_is_exit, syscall_is_exit_group, syscall_with_current_task};
 use crate::task::{
-    SignalAction, SignalFlags, account_task_user_time_until, check_signals_of_task,
-    current_add_signal, current_process, current_task,
-    current_trap_return_context_after_accounting, exit_current_group_and_run_next, process_of_task,
-    suspend_current_and_run_next, timer_tick_should_preempt, trap_cx_of_task,
+    SignalAction, SignalFlags, TaskControlBlock, account_task_user_time_until,
+    check_signals_of_task, current_add_signal, current_process, current_task,
+    exit_current_group_and_run_next, process_of_task, suspend_current_and_run_next,
+    timer_tick_should_preempt, trap_cx_of_task, trap_return_context_after_accounting_for_task,
 };
 use crate::timer::{check_timer, get_time_us, set_next_trigger};
 use alloc::sync::Arc;
@@ -212,9 +212,7 @@ pub fn trap_handler() -> ! {
         interrupted_pc = trap_cx_of_task(&task).era;
     }
     if crate::arch::signal::deliver_pending_signal(&task, &process, interrupted_pc) {
-        drop(process);
-        drop(task);
-        trap_return();
+        trap_return_for_task(task, process);
     }
     if let Some((errno, _msg)) = check_signals_of_task(&task, &process) {
         drop(process);
@@ -222,9 +220,7 @@ pub fn trap_handler() -> ! {
         exit_current_group_and_run_next(errno);
         unreachable!("signal-forced exit returned");
     }
-    drop(process);
-    drop(task);
-    trap_return();
+    trap_return_for_task(task, process);
 }
 
 pub(crate) fn handle_user_page_fault(addr: usize, access: MmapFaultAccess) -> bool {
@@ -304,12 +300,24 @@ fn force_default_sigsegv_current() {
 
 #[unsafe(no_mangle)]
 pub fn trap_return() -> ! {
+    let task = current_task().expect("trap_return requires a running task");
+    let process = process_of_task(&task);
+    trap_return_for_task(task, process)
+}
+
+fn trap_return_for_task(
+    task: Arc<TaskControlBlock>,
+    process: Arc<crate::task::ProcessControlBlock>,
+) -> ! {
     let now_us = get_time_us();
-    let (trap_cx, user_token) = current_trap_return_context_after_accounting(now_us);
+    let (trap_cx, user_token) =
+        trap_return_context_after_accounting_for_task(&task, &process, now_us);
     let flush_tlb = crate::arch::mm::should_flush_tlb_on_return(user_token);
     if flush_tlb {
         crate::perf::record_la_return_invtlb_call();
     }
+    drop(process);
+    drop(task);
     disable_supervisor_interrupt();
     set_kernel_trap_entry();
     unsafe extern "C" {
