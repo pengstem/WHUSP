@@ -18,7 +18,7 @@ use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
 use crate::config::PAGE_SIZE;
 use crate::mm::{
-    UserBuffer, frame_alloc,
+    UserBuffer, frame_alloc, frame_alloc_uninit,
     page_cache::{PAGE_CACHE, PageCacheId, PageCacheKey},
 };
 use crate::perf;
@@ -1287,7 +1287,12 @@ impl VfsFile {
                 if page_read_len != page_valid_len {
                     break;
                 }
-                let Some(frame) = frame_alloc() else {
+                let frame = if page_valid_len == PAGE_SIZE {
+                    frame_alloc_uninit()
+                } else {
+                    frame_alloc()
+                };
+                let Some(frame) = frame else {
                     continue;
                 };
                 frame.ppn.get_bytes_array()[..page_valid_len]

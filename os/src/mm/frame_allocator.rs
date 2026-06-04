@@ -11,9 +11,14 @@ pub struct FrameTracker {
 }
 
 impl FrameTracker {
-    pub fn new(ppn: PhysPageNum) -> Self {
-        // page cleaning
+    pub fn new_zeroed(ppn: PhysPageNum) -> Self {
         ppn.get_bytes_array().fill(0);
+        perf::record_frame_alloc(true);
+        Self { ppn }
+    }
+
+    pub fn new_uninit(ppn: PhysPageNum) -> Self {
+        perf::record_frame_alloc(false);
         Self { ppn }
     }
 
@@ -178,7 +183,14 @@ pub fn frame_alloc() -> Option<FrameTracker> {
     FRAME_ALLOCATOR
         .exclusive_access()
         .alloc()
-        .map(FrameTracker::new)
+        .map(FrameTracker::new_zeroed)
+}
+
+pub fn frame_alloc_uninit() -> Option<FrameTracker> {
+    FRAME_ALLOCATOR
+        .exclusive_access()
+        .alloc()
+        .map(FrameTracker::new_uninit)
 }
 
 /// Allocates a contiguous fresh page run for device DMA queues.
@@ -189,7 +201,7 @@ pub fn frame_alloc_more(num: usize) -> Option<Vec<FrameTracker>> {
     FRAME_ALLOCATOR
         .exclusive_access()
         .alloc_more(num)
-        .map(|x| x.iter().map(|&t| FrameTracker::new(t)).collect())
+        .map(|x| x.into_iter().map(FrameTracker::new_zeroed).collect())
 }
 
 pub fn frame_dealloc(ppn: PhysPageNum) {

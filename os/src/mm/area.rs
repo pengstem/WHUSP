@@ -1,8 +1,8 @@
-use super::frame_alloc;
 use super::page_table::PTEFlags;
 use super::{
     FrameTracker, PageTable, PhysAddr, PhysPageNum, StepByOne, VPNRange, VirtAddr, VirtPageNum,
 };
+use super::{frame_alloc, frame_alloc_uninit};
 use crate::arch::mm as arch_mm;
 use crate::config::PAGE_SIZE;
 use crate::fs::File;
@@ -253,7 +253,7 @@ impl MapArea {
             let Some(pte) = page_table.translate(vpn) else {
                 continue;
             };
-            let Some(frame) = frame_alloc() else {
+            let Some(frame) = frame_alloc_uninit() else {
                 return false;
             };
             frame

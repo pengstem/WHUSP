@@ -16,7 +16,7 @@ pub use area::{MapArea, MapPermission, MapType, MmapFlush};
 pub use elf_loader::ElfLoadInfo;
 pub(crate) use elf_loader::{exec_load_stats_content, record_exec_metadata_read};
 pub use frame_allocator::{
-    FrameTracker, frame_alloc, frame_alloc_more, frame_ref_count, frame_stats,
+    FrameTracker, frame_alloc, frame_alloc_more, frame_alloc_uninit, frame_ref_count, frame_stats,
 };
 pub use kernel_space::{KERNEL_SPACE, kernel_token};
 pub use memory_set::MemorySet;

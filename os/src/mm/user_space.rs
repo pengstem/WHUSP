@@ -5,7 +5,7 @@ use super::{
     FrameTracker, MapArea, MapPermission, MapType, MemorySet, MmapFlush, PageTableEntry,
     PhysPageNum, VPNRange, VirtAddr,
 };
-use super::{VirtPageNum, frame_alloc, frame_ref_count};
+use super::{VirtPageNum, frame_alloc, frame_alloc_uninit, frame_ref_count};
 use crate::arch::mm as arch_mm;
 use crate::config::{PAGE_SIZE, USER_MMAP_BASE, USER_MMAP_LIMIT};
 use crate::fs::{File, FsError};
@@ -112,11 +112,22 @@ impl MmapFaultPage {
     /// The returned frame is not installed into any page table yet; callers
     /// must revalidate the VMA and install it through `MemorySet`.
     pub fn build_frame(&self) -> Option<FrameTracker> {
-        let frame = match frame_alloc() {
+        let full_file_overwrite = self.backing_file.is_some()
+            && self.dst_offset == 0
+            && self.read_len == PAGE_SIZE
+            && self.zero_fill_len == 0;
+        let alloc_frame = || {
+            if full_file_overwrite {
+                frame_alloc_uninit()
+            } else {
+                frame_alloc()
+            }
+        };
+        let frame = match alloc_frame() {
             Some(frame) => frame,
             None => {
                 crate::fs::reclaim_memcg_pressure_pages();
-                frame_alloc()?
+                alloc_frame()?
             }
         };
         let mut read_len = 0usize;
@@ -126,6 +137,9 @@ impl MmapFaultPage {
             let end = self.dst_offset.checked_add(self.read_len)?;
             let dst = frame.ppn.get_bytes_array().get_mut(self.dst_offset..end)?;
             read_len = file.read_at(self.file_offset, dst);
+        }
+        if full_file_overwrite && read_len < PAGE_SIZE {
+            frame.ppn.get_bytes_array()[read_len..].fill(0);
         }
         if self.exec_fault {
             super::elf_loader::record_exec_lazy_fault(
@@ -182,11 +196,19 @@ impl MmapPageCacheFault {
             return Some(ppn);
         }
 
-        let frame = frame_alloc()?;
+        let full_file_overwrite = self.read_len == PAGE_SIZE;
+        let frame = if full_file_overwrite {
+            frame_alloc_uninit()?
+        } else {
+            frame_alloc()?
+        };
         let mut read_len = 0usize;
         if self.read_len > 0 {
             let dst = &mut frame.ppn.get_bytes_array()[..self.read_len];
             read_len = self.backing_file.read_at(self.file_offset, dst);
+        }
+        if full_file_overwrite && read_len < PAGE_SIZE {
+            frame.ppn.get_bytes_array()[read_len..].fill(0);
         }
 
         let mut cache = PAGE_CACHE.exclusive_access();
@@ -325,7 +347,7 @@ impl MemorySet {
                     let frame = if cow_resident || can_share_resident {
                         FrameTracker::from_retained(src_ppn)
                     } else {
-                        let frame = frame_alloc()?;
+                        let frame = frame_alloc_uninit()?;
                         frame
                             .ppn
                             .get_bytes_array()
@@ -473,7 +495,7 @@ impl MemorySet {
             return true;
         }
 
-        let Some(frame) = frame_alloc() else {
+        let Some(frame) = frame_alloc_uninit() else {
             return false;
         };
         frame

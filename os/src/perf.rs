@@ -95,6 +95,10 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) vfs_write_coalesced_calls: usize,
     pub(crate) vfs_write_coalesced_bytes: usize,
     pub(crate) page_cache_clean_evictions: usize,
+    pub(crate) frame_alloc_zeroed_calls: usize,
+    pub(crate) frame_alloc_zeroed_bytes: usize,
+    pub(crate) frame_alloc_uninit_calls: usize,
+    pub(crate) frame_alloc_uninit_saved_bytes: usize,
     pub(crate) frame_dealloc_calls: usize,
     pub(crate) frame_dealloc_released: usize,
     pub(crate) frame_dealloc_refcount_drops: usize,
@@ -315,6 +319,10 @@ mod enabled {
     static VFS_WRITE_COALESCED_CALLS: AtomicUsize = AtomicUsize::new(0);
     static VFS_WRITE_COALESCED_BYTES: AtomicUsize = AtomicUsize::new(0);
     static PAGE_CACHE_CLEAN_EVICTIONS: AtomicUsize = AtomicUsize::new(0);
+    static FRAME_ALLOC_ZEROED_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static FRAME_ALLOC_ZEROED_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static FRAME_ALLOC_UNINIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static FRAME_ALLOC_UNINIT_SAVED_BYTES: AtomicUsize = AtomicUsize::new(0);
     static FRAME_DEALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FRAME_DEALLOC_RELEASED: AtomicUsize = AtomicUsize::new(0);
     static FRAME_DEALLOC_REFCOUNT_DROPS: AtomicUsize = AtomicUsize::new(0);
@@ -678,6 +686,16 @@ mod enabled {
 
     pub(crate) fn record_page_cache_clean_eviction(pages: usize) {
         PAGE_CACHE_CLEAN_EVICTIONS.fetch_add(pages, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_frame_alloc(zeroed: bool) {
+        if zeroed {
+            FRAME_ALLOC_ZEROED_CALLS.fetch_add(1, Ordering::Relaxed);
+            FRAME_ALLOC_ZEROED_BYTES.fetch_add(crate::config::PAGE_SIZE, Ordering::Relaxed);
+        } else {
+            FRAME_ALLOC_UNINIT_CALLS.fetch_add(1, Ordering::Relaxed);
+            FRAME_ALLOC_UNINIT_SAVED_BYTES.fetch_add(crate::config::PAGE_SIZE, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn record_frame_dealloc(
@@ -1151,6 +1169,10 @@ mod enabled {
             vfs_write_coalesced_calls: VFS_WRITE_COALESCED_CALLS.load(Ordering::Relaxed),
             vfs_write_coalesced_bytes: VFS_WRITE_COALESCED_BYTES.load(Ordering::Relaxed),
             page_cache_clean_evictions: PAGE_CACHE_CLEAN_EVICTIONS.load(Ordering::Relaxed),
+            frame_alloc_zeroed_calls: FRAME_ALLOC_ZEROED_CALLS.load(Ordering::Relaxed),
+            frame_alloc_zeroed_bytes: FRAME_ALLOC_ZEROED_BYTES.load(Ordering::Relaxed),
+            frame_alloc_uninit_calls: FRAME_ALLOC_UNINIT_CALLS.load(Ordering::Relaxed),
+            frame_alloc_uninit_saved_bytes: FRAME_ALLOC_UNINIT_SAVED_BYTES.load(Ordering::Relaxed),
             frame_dealloc_calls: FRAME_DEALLOC_CALLS.load(Ordering::Relaxed),
             frame_dealloc_released: FRAME_DEALLOC_RELEASED.load(Ordering::Relaxed),
             frame_dealloc_refcount_drops: FRAME_DEALLOC_REFCOUNT_DROPS.load(Ordering::Relaxed),
@@ -1379,6 +1401,10 @@ mod enabled {
          vfs_write_coalesced_calls {}\n\
          vfs_write_coalesced_bytes {}\n\
          page_cache_clean_evictions {}\n\
+         frame_alloc_zeroed_calls {}\n\
+         frame_alloc_zeroed_bytes {}\n\
+         frame_alloc_uninit_calls {}\n\
+         frame_alloc_uninit_saved_bytes {}\n\
          frame_dealloc_calls {}\n\
          frame_dealloc_released {}\n\
          frame_dealloc_refcount_drops {}\n\
@@ -1586,6 +1612,10 @@ mod enabled {
             stats.vfs_write_coalesced_calls,
             stats.vfs_write_coalesced_bytes,
             stats.page_cache_clean_evictions,
+            stats.frame_alloc_zeroed_calls,
+            stats.frame_alloc_zeroed_bytes,
+            stats.frame_alloc_uninit_calls,
+            stats.frame_alloc_uninit_saved_bytes,
             stats.frame_dealloc_calls,
             stats.frame_dealloc_released,
             stats.frame_dealloc_refcount_drops,
@@ -1902,6 +1932,9 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_page_cache_clean_eviction(_pages: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_frame_alloc(_zeroed: bool) {}
 
     #[inline(always)]
     pub(crate) fn record_frame_dealloc(
