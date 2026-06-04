@@ -8,6 +8,8 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use lazy_static::*;
 
+// Soft cap for ordinary read(2) cache pages. MAP_SHARED mmap pages are pinned
+// and dirty-tracked separately, so this cap must not evict them.
 pub(crate) const PAGE_CACHE_SOFT_MAX_PAGES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -52,8 +54,12 @@ impl PageCacheKey {
 pub(crate) struct PageCachePage {
     pub(crate) frame: FrameTracker,
     pub(crate) key: PageCacheKey,
+    // Size observed when this page was loaded; callers pass the mmap snapshot
+    // that already bounded fault-time EOF reads before insertion.
     pub(crate) file_size_at_load: usize,
+    // Dirty pages belong to MAP_SHARED writeback and are not soft-LRU victims.
     pub(crate) dirty: bool,
+    // Active page-table mappings, not Arc references. Nonzero pins the frame.
     pub(crate) ref_count: usize,
     exec_icache_synced: bool,
     lru_stamp: usize,

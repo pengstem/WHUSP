@@ -12,6 +12,7 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
 
 static mut HEAP_SPACE: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
 
+/// what the hack did this init do
 pub fn init_heap() {
     unsafe {
         HEAP_ALLOCATOR

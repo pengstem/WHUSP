@@ -18,7 +18,11 @@ virtio-drivers = "0.13.0"
 lwext4_rust = { path = "../vendor/lwext4_rust", default-features = false }
 log = "0.4"
 fdt = "0.1.5"
-fatfs = { path = "../vendor/crates/fatfs", default-features = false, features = ["alloc", "lfn", "unicode"] }
+fatfs = { path = "../vendor/crates/fatfs", default-features = false, features = [
+  "alloc",
+  "lfn",
+  "unicode",
+] }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 riscv = { git = "https://github.com/rcore-os/riscv", features = ["inline-asm"] }
@@ -28,7 +32,12 @@ sbi-rt = { version = "0.0.3", features = ["legacy"] }
 loongArch64 = { path = "../vendor/crates/loongArch64" }
 
 [profile.release]
-debug = true
+# debug = true
+lto = true
+codegen-units = 1
+# opt-level = "z"
+panic = "abort"
+strip = true
 
 [[bin]]
 name = "os"

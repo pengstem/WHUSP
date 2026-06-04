@@ -8,6 +8,8 @@ use alloc::vec::Vec;
 use lazy_static::*;
 
 const DEFAULT_DENTRY_CACHE_CAPACITY: usize = 4096;
+// FNV-1a 64-bit constants. The full component string stays in each bucket, so
+// hash collisions only add a short linear scan and never create false hits.
 const DENTRY_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const DENTRY_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -57,6 +59,8 @@ struct DentryCacheEntry {
 
 #[derive(Clone, Copy, Debug)]
 enum DentryCacheValue {
+    // Parent generation is the coherency contract: create/unlink/rename bump
+    // the parent and make both positive and negative child entries stale.
     Positive {
         node: VfsNodeId,
         kind: FsNodeKind,

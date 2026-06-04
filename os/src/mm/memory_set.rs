@@ -197,13 +197,13 @@ impl MemorySet {
     }
 
     pub(super) fn find_area_idx_containing(&self, vpn: VirtPageNum) -> Option<usize> {
-        if let Some(idx) = self.last_area_idx_containing.get() {
-            if let Some(area) = self.areas.get(idx) {
-                if area.vpn_range.get_start() <= vpn && vpn < area.vpn_range.get_end() {
-                    perf::record_vma_lookup(1, true);
-                    return Some(idx);
-                }
-            }
+        if let Some(idx) = self.last_area_idx_containing.get()
+            && let Some(area) = self.areas.get(idx)
+            && area.vpn_range.get_start() <= vpn
+            && vpn < area.vpn_range.get_end()
+        {
+            perf::record_vma_lookup(1, true);
+            return Some(idx);
         }
 
         let mut low = 0usize;

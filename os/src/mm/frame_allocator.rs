@@ -163,6 +163,7 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(FrameAllocatorImpl::new()) };
 }
 
+/// what the hell
 pub fn init_frame_allocator() {
     unsafe extern "C" {
         safe fn ekernel();

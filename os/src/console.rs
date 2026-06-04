@@ -6,9 +6,7 @@ struct Stdout;
 
 impl Write for Stdout {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for c in s.chars() {
-            UART.write(c as u8);
-        }
+        UART.write_bytes(s.as_bytes());
         Ok(())
     }
 }

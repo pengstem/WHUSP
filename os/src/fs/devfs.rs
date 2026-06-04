@@ -1740,9 +1740,7 @@ fn read_console(user_buf: UserBuffer) -> usize {
 fn write_console(user_buf: UserBuffer) -> usize {
     let len = user_buf.len();
     for buffer in user_buf.buffers.iter() {
-        for byte in buffer.iter() {
-            UART.write(*byte);
-        }
+        UART.write_bytes(buffer);
     }
     len
 }

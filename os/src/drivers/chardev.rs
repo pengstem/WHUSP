@@ -25,6 +25,11 @@ pub trait CharDevice {
     #[allow(dead_code)]
     fn has_input(&self) -> bool;
     fn write(&self, ch: u8);
+    fn write_bytes(&self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write(byte);
+        }
+    }
     #[cfg(target_arch = "riscv64")]
     fn handle_irq(&self);
 }
@@ -37,8 +42,10 @@ lazy_static! {
 const RBR: usize = 0;
 const THR: usize = 0;
 const IER_REG: usize = 1;
+const FCR_REG: usize = 2;
 const MCR_REG: usize = 4;
 const LSR_REG: usize = 5;
+const UART_TX_FIFO_DEPTH: usize = 16;
 
 bitflags! {
     /// InterruptEnableRegister
@@ -62,6 +69,14 @@ bitflags! {
         const REQUEST_TO_SEND = 1 << 1;
         const AUX_OUTPUT1 = 1 << 2;
         const AUX_OUTPUT2 = 1 << 3;
+    }
+
+    /// FIFOControlRegister
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FCR: u8 {
+        const FIFO_ENABLE = 1 << 0;
+        const CLEAR_RX_FIFO = 1 << 1;
+        const CLEAR_TX_FIFO = 1 << 2;
     }
 }
 
@@ -90,6 +105,8 @@ impl NS16550aRaw {
         mcr |= MCR::REQUEST_TO_SEND;
         mcr |= MCR::AUX_OUTPUT2;
         self.write_reg(MCR_REG, mcr.bits());
+        let fcr = FCR::FIFO_ENABLE | FCR::CLEAR_RX_FIFO | FCR::CLEAR_TX_FIFO;
+        self.write_reg(FCR_REG, fcr.bits());
         let ier = IER::RX_AVAILABLE;
         self.write_reg(IER_REG, ier.bits());
     }
@@ -104,10 +121,25 @@ impl NS16550aRaw {
     }
 
     pub fn write(&mut self, ch: u8) {
+        self.write_bytes(core::slice::from_ref(&ch));
+    }
+
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            self.wait_tx_ready();
+            let end = (offset + UART_TX_FIFO_DEPTH).min(bytes.len());
+            for &byte in &bytes[offset..end] {
+                self.write_reg(THR, byte);
+            }
+            offset = end;
+        }
+    }
+
+    fn wait_tx_ready(&self) {
         loop {
             let lsr = LSR::from_bits_truncate(self.read_reg(LSR_REG));
             if lsr.contains(LSR::THR_EMPTY) {
-                self.write_reg(THR, ch);
                 break;
             }
         }
@@ -193,6 +225,10 @@ impl CharDevice for NS16550a {
     fn write(&self, ch: u8) {
         let mut inner = self.inner.exclusive_access();
         inner.ns16550a.write(ch);
+    }
+    fn write_bytes(&self, bytes: &[u8]) {
+        let mut inner = self.inner.exclusive_access();
+        inner.ns16550a.write_bytes(bytes);
     }
     #[cfg(target_arch = "riscv64")]
     fn handle_irq(&self) {

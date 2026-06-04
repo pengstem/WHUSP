@@ -626,6 +626,9 @@ fn page_bounded_full_blocks(buf: &[u8], max_blocks: usize) -> usize {
     if max_blocks == 0 {
         return 0;
     }
+    // VirtioHal::share() translates the first byte of each slice. Keep each
+    // cached submission inside one kernel page so DMA never assumes adjacent
+    // virtual pages are physically contiguous.
     let page_offset = (buf.as_ptr() as usize) & (PAGE_SIZE - 1);
     let page_remaining = PAGE_SIZE - page_offset;
     (page_remaining / BLOCK_CACHE_LINE_SIZE)

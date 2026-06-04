@@ -12,6 +12,9 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
 
+// The fd-backed mount API can receive many fsconfig entries before fsmount().
+// Cap the stored compatibility metadata so an unmounted context cannot grow
+// unbounded kernel state.
 const FSCONFIG_LEGACY_BUFFER_LIMIT: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +34,7 @@ struct FsContextState {
     fs_type: String,
     source: Option<String>,
     config_len: usize,
+    // FSCONFIG_CMD_CREATE gates fsmount(); mounted makes the context one-shot.
     created: bool,
     mounted: bool,
 }

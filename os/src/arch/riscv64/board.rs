@@ -236,6 +236,8 @@ fn virtio_device_type(device: IrqDevice) -> Option<DeviceType> {
         .map(|transport| transport.device_type())
 }
 
+/// what the fuck did this init do?
+///
 pub fn init_from_dtb(dtb_addr: usize) {
     let fdt = unsafe { Fdt::from_ptr(dtb_addr as *const u8) }
         .unwrap_or_else(|err| panic!("failed to parse DTB at {:#x}: {:?}", dtb_addr, err));

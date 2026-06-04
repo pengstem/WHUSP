@@ -48,13 +48,13 @@ const ALL_TESTS: &[&str] = &[
     "busybox_testcode.sh",
     "lua_testcode.sh",
     "libctest_testcode.sh",
+    "ltp_testcode.sh",
     "iozone_testcode.sh",
     "iperf_testcode.sh",
     "libcbench_testcode.sh",
     "lmbench_testcode.sh",
-    "netperf_testcode.sh",
     "cyclictest_testcode.sh",
-    "ltp_testcode.sh",
+    "netperf_testcode.sh",
 ];
 
 // CONTEXT: This remains the kernel-owned default group selection. The script

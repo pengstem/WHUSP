@@ -19,6 +19,8 @@ struct MemfdInner {
     ino: u64,
     data: Vec<u8>,
     seals: u32,
+    // Active writable MAP_SHARED mappings block F_SEAL_WRITE, matching the
+    // Linux rule that sealing cannot race with already writable shared views.
     writable_shared_mmaps: usize,
 }
 

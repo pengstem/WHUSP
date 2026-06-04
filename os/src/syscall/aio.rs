@@ -175,6 +175,9 @@ pub fn sys_io_getevents(
         return Err(SysError::EFAULT);
     }
 
+    // UNFINISHED: Linux io_getevents() can sleep until min_nr events arrive or
+    // the timeout expires. This compatibility path returns only completions
+    // already queued by sys_io_submit().
     let token = current_user_token();
     let ready = AIO_MANAGER
         .exclusive_access()
@@ -223,6 +226,10 @@ pub fn sys_io_submit(ctx: usize, nr: isize, iocbpp: *const *const LinuxIocb) -> 
     for index in 0..nr as usize {
         let iocb_ptr = read_user_array_item(token, iocbpp, index)?;
         let iocb = read_user_value::<LinuxIocb>(token, iocb_ptr)?;
+        // UNFINISHED: Linux AIO performs the requested pread/pwrite against
+        // aio_buf. This contest subset validates the IOCB and queues a
+        // successful completion with the requested byte count, but it does not
+        // copy file data.
         let event = LinuxIoEvent {
             data: iocb.aio_data,
             obj: iocb_ptr as u64,

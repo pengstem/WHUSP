@@ -9,6 +9,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 const ROOT_INO: u32 = 2;
 
+// CONTEXT: LTP memcg stressors need writable memory limit knobs to exercise
+// reclaim paths; this compatibility backend turns those writes into one global
+// pressure signal rather than maintaining a full cgroup hierarchy.
+// UNFINISHED: Linux accounts and reclaims memory per cgroup. This kernel only
+// discards process-wide MADV_FREE pages when a low memcg limit is written.
 static MEMCG_PRESSURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
