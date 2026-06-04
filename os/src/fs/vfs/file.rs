@@ -2085,6 +2085,59 @@ impl File for VfsFile {
         }
     }
 
+    fn supports_aligned_user_buffer_write(&self, len: usize, append: bool) -> bool {
+        let offset = self.offset.lock();
+        let write_offset = if append {
+            let Ok(stat) = self.stat() else {
+                return false;
+            };
+            stat_logical_size(self.node, stat.size) as usize
+        } else {
+            *offset
+        };
+        self.supports_aligned_user_buffer_write_at(write_offset, len)
+    }
+
+    fn write_aligned_user_buffer(&self, buf: UserBuffer, append: bool) -> FsResult<usize> {
+        let len = buf.len();
+        let mut offset = self.offset.lock();
+        if append {
+            let stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))
+                .ok_or(FsError::Io)??;
+            *offset = stat_logical_size(self.node, stat.size) as usize;
+        }
+        let write_offset = *offset;
+        if !self.supports_aligned_user_buffer_write_at(write_offset, len) {
+            return Err(FsError::Unsupported);
+        }
+        self.check_write_at(write_offset, len)?;
+        *self.read_snapshot.lock() = None;
+        self.invalidate_read_cache();
+        let mut pressure_retried = false;
+        let mut offset_advanced = false;
+        let write_size = loop {
+            match cache_dirty_regular_user_buffer_write(self.node, write_offset, &buf) {
+                DirtyCacheWriteResult::Cached(write_size) => break write_size,
+                DirtyCacheWriteResult::NeedsPressureFlush if !pressure_retried => {
+                    if flush_dirty_regular_files_for_pressure().is_ok() {
+                        pressure_retried = true;
+                        continue;
+                    }
+                    offset_advanced = true;
+                    break self.write_coalesced_user_buffer(&mut offset, &buf);
+                }
+                DirtyCacheWriteResult::NeedsPressureFlush | DirtyCacheWriteResult::Fallback => {
+                    offset_advanced = true;
+                    break self.write_coalesced_user_buffer(&mut offset, &buf);
+                }
+            }
+        };
+        if !offset_advanced {
+            *offset = (*offset).checked_add(write_size).unwrap_or(usize::MAX);
+        }
+        Ok(write_size)
+    }
+
     fn set_len(&self, len: usize) -> FsResult {
         if self.kind != FsNodeKind::RegularFile {
             return Err(FsError::InvalidInput);

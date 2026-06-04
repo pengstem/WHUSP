@@ -198,6 +198,7 @@ fn flush_writev_bounce(
         return false;
     }
     let intended_len = bounce.len();
+    crate::perf::record_writev_regular_bounce(intended_len);
     let written = write_with_status_flags(entry, kernel_user_buffer(bounce.as_mut_slice()));
     *total_written = total_written.saturating_add(written);
     bounce.clear();
@@ -332,17 +333,24 @@ fn pwritev_regular_file_coalesced(
     Ok(total_written)
 }
 
+fn user_iovecs_can_use_direct_page_slices(iovecs: &UserIovecs, allowed_len: usize) -> bool {
+    allowed_len == iovecs.total_len
+        && allowed_len <= WRITEV_COALESCE_CHUNK_SIZE
+        && iovecs.entries.iter().all(|iovec| {
+            iovec.len == 0 || (iovec.base % PAGE_SIZE == 0 && iovec.len % PAGE_SIZE == 0)
+        })
+}
+
 fn pwritev_can_use_direct_page_slices(
     iovecs: &UserIovecs,
     offset: usize,
     allowed_len: usize,
 ) -> bool {
-    allowed_len == iovecs.total_len
-        && allowed_len <= WRITEV_COALESCE_CHUNK_SIZE
-        && offset % PAGE_SIZE == 0
-        && iovecs.entries.iter().all(|iovec| {
-            iovec.len == 0 || (iovec.base % PAGE_SIZE == 0 && iovec.len % PAGE_SIZE == 0)
-        })
+    offset % PAGE_SIZE == 0 && user_iovecs_can_use_direct_page_slices(iovecs, allowed_len)
+}
+
+fn writev_can_use_direct_page_slices(iovecs: &UserIovecs, allowed_len: usize) -> bool {
+    user_iovecs_can_use_direct_page_slices(iovecs, allowed_len)
 }
 
 fn pwritev_regular_file_direct_page_slices(
@@ -375,6 +383,42 @@ fn pwritev_regular_file_direct_page_slices(
     }
     file.write_at_aligned_user_buffer(offset, UserBuffer::new(buffers))
         .map_err(SysError::from)
+}
+
+fn writev_regular_file_direct_page_slices(
+    file: &(dyn File + Send + Sync),
+    mut cursor: UserIovecCursor,
+    mut remaining_len: usize,
+    append: bool,
+) -> SysResult<usize> {
+    let mut buffers = Vec::new();
+    let mut pending_len = 0usize;
+    while let Some(chunk) = cursor.next_chunk() {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) if pending_len > 0 => {
+                let written = file
+                    .write_aligned_user_buffer(UserBuffer::new(buffers), append)
+                    .map_err(SysError::from)?;
+                perf::record_writev_regular_direct_user_buffer(written);
+                return Ok(written);
+            }
+            Err(err) => return Err(err),
+        };
+        let chunk_len = chunk.len.min(remaining_len);
+        let chunk_buffers = truncate_user_buffers(chunk.buffers, chunk_len);
+        buffers.extend(chunk_buffers);
+        pending_len = pending_len.saturating_add(chunk_len);
+        remaining_len = remaining_len.saturating_sub(chunk_len);
+        if remaining_len == 0 {
+            break;
+        }
+    }
+    let written = file
+        .write_aligned_user_buffer(UserBuffer::new(buffers), append)
+        .map_err(SysError::from)?;
+    perf::record_writev_regular_direct_user_buffer(written);
+    Ok(written)
 }
 
 fn collect_iovec_buffers(
@@ -1644,8 +1688,15 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
 
     let requested_len = allowed_len;
     if iovcnt > 1 && file.stat()?.mode & S_IFMT == S_IFREG {
+        let append = entry.status_flags().contains(OpenFlags::APPEND);
+        let use_direct_page_slices = writev_can_use_direct_page_slices(&iovecs, allowed_len)
+            && file.supports_aligned_user_buffer_write(allowed_len, append);
         let cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Read);
-        let total_written = writev_regular_file_coalesced(&entry, cursor, allowed_len)?;
+        let total_written = if use_direct_page_slices {
+            writev_regular_file_direct_page_slices(file.as_ref(), cursor, allowed_len, append)?
+        } else {
+            writev_regular_file_coalesced(&entry, cursor, allowed_len)?
+        };
         fanotify_notify_modify(&file, total_written);
         inotify_notify_modify(&file, total_written);
         return checked_write_result_for_entry(&entry, requested_len, total_written);
