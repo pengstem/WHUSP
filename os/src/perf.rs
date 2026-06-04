@@ -89,6 +89,9 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) vfs_path_component_scans: usize,
     pub(crate) vfs_path_components: usize,
     pub(crate) vfs_path_component_allocs: usize,
+    pub(crate) vfs_visible_path_updates: usize,
+    pub(crate) vfs_visible_path_allocs: usize,
+    pub(crate) vfs_parent_cursor_clones: usize,
     pub(crate) procfs_content_builds: usize,
     pub(crate) procfs_content_bytes: usize,
     pub(crate) procfs_snapshot_hits: usize,
@@ -327,6 +330,9 @@ mod enabled {
     static VFS_PATH_COMPONENT_SCANS: AtomicUsize = AtomicUsize::new(0);
     static VFS_PATH_COMPONENTS: AtomicUsize = AtomicUsize::new(0);
     static VFS_PATH_COMPONENT_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+    static VFS_VISIBLE_PATH_UPDATES: AtomicUsize = AtomicUsize::new(0);
+    static VFS_VISIBLE_PATH_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+    static VFS_PARENT_CURSOR_CLONES: AtomicUsize = AtomicUsize::new(0);
     static PROCFS_CONTENT_BUILDS: AtomicUsize = AtomicUsize::new(0);
     static PROCFS_CONTENT_BYTES: AtomicUsize = AtomicUsize::new(0);
     static PROCFS_SNAPSHOT_HITS: AtomicUsize = AtomicUsize::new(0);
@@ -705,6 +711,15 @@ mod enabled {
         VFS_PATH_COMPONENT_SCANS.fetch_add(1, Ordering::Relaxed);
         VFS_PATH_COMPONENTS.fetch_add(components, Ordering::Relaxed);
         VFS_PATH_COMPONENT_ALLOCS.fetch_add(allocations, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_vfs_visible_path_update(allocations: usize) {
+        VFS_VISIBLE_PATH_UPDATES.fetch_add(1, Ordering::Relaxed);
+        VFS_VISIBLE_PATH_ALLOCS.fetch_add(allocations, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_vfs_visible_path_allocation() {
+        VFS_VISIBLE_PATH_ALLOCS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_procfs_content_build(bytes: usize) {
@@ -1239,6 +1254,9 @@ mod enabled {
             vfs_path_component_scans: VFS_PATH_COMPONENT_SCANS.load(Ordering::Relaxed),
             vfs_path_components: VFS_PATH_COMPONENTS.load(Ordering::Relaxed),
             vfs_path_component_allocs: VFS_PATH_COMPONENT_ALLOCS.load(Ordering::Relaxed),
+            vfs_visible_path_updates: VFS_VISIBLE_PATH_UPDATES.load(Ordering::Relaxed),
+            vfs_visible_path_allocs: VFS_VISIBLE_PATH_ALLOCS.load(Ordering::Relaxed),
+            vfs_parent_cursor_clones: VFS_PARENT_CURSOR_CLONES.load(Ordering::Relaxed),
             procfs_content_builds: PROCFS_CONTENT_BUILDS.load(Ordering::Relaxed),
             procfs_content_bytes: PROCFS_CONTENT_BYTES.load(Ordering::Relaxed),
             procfs_snapshot_hits: PROCFS_SNAPSHOT_HITS.load(Ordering::Relaxed),
@@ -1490,6 +1508,9 @@ mod enabled {
          vfs_path_component_scans {}\n\
          vfs_path_components {}\n\
          vfs_path_component_allocs {}\n\
+         vfs_visible_path_updates {}\n\
+         vfs_visible_path_allocs {}\n\
+         vfs_parent_cursor_clones {}\n\
          procfs_content_builds {}\n\
          procfs_content_bytes {}\n\
          procfs_snapshot_hits {}\n\
@@ -1715,6 +1736,9 @@ mod enabled {
             stats.vfs_path_component_scans,
             stats.vfs_path_components,
             stats.vfs_path_component_allocs,
+            stats.vfs_visible_path_updates,
+            stats.vfs_visible_path_allocs,
+            stats.vfs_parent_cursor_clones,
             stats.procfs_content_builds,
             stats.procfs_content_bytes,
             stats.procfs_snapshot_hits,
@@ -2052,6 +2076,12 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_vfs_path_components(_components: usize, _allocations: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_vfs_visible_path_update(_allocations: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_vfs_visible_path_allocation() {}
 
     #[inline(always)]
     pub(crate) fn record_procfs_content_build(_bytes: usize) {}

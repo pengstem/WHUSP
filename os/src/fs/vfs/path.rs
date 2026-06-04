@@ -60,6 +60,14 @@ struct VfsCursor {
     path: String,
 }
 
+#[derive(Debug)]
+struct VfsChildLookup {
+    cursor: VfsCursor,
+    parent_node: VfsNodeId,
+    parent_kind: FsNodeKind,
+    parent_path_len: usize,
+}
+
 #[derive(Clone, Debug)]
 enum PathComponent<'a> {
     Borrowed(&'a str),
@@ -136,6 +144,17 @@ impl VfsCursor {
     }
 }
 
+impl VfsChildLookup {
+    fn into_parent(mut self) -> VfsCursor {
+        self.cursor.path.truncate(self.parent_path_len);
+        VfsCursor {
+            node: self.parent_node,
+            kind: self.parent_kind,
+            path: self.cursor.path,
+        }
+    }
+}
+
 fn follow_mounted_root(context: &PathContext, cursor: VfsCursor) -> VfsCursor {
     if cursor.kind != FsNodeKind::Directory {
         return cursor;
@@ -152,6 +171,7 @@ fn follow_mounted_root(context: &PathContext, cursor: VfsCursor) -> VfsCursor {
 }
 
 fn join_visible_path(base: &str, component: &str) -> String {
+    perf::record_vfs_visible_path_update(1);
     if base == "/" {
         alloc::format!("/{component}")
     } else {
@@ -159,7 +179,41 @@ fn join_visible_path(base: &str, component: &str) -> String {
     }
 }
 
+fn reserve_visible_path(path: &mut String, additional: usize) {
+    if path.capacity().saturating_sub(path.len()) < additional {
+        perf::record_vfs_visible_path_allocation();
+        path.reserve(additional);
+    }
+}
+
+fn reserve_visible_path_for_lookup(cursor: &mut VfsCursor, path: &str) {
+    reserve_visible_path(&mut cursor.path, path.len().saturating_add(1));
+}
+
+fn push_visible_path_component(path: &mut String, component: &str) {
+    perf::record_vfs_visible_path_update(0);
+    let slash_len = usize::from(path.as_str() != "/");
+    reserve_visible_path(path, slash_len + component.len());
+    if path.as_str() != "/" {
+        path.push('/');
+    }
+    path.push_str(component);
+}
+
+fn truncate_visible_path_parent(path: &mut String) {
+    perf::record_vfs_visible_path_update(0);
+    if path.as_str() == "/" {
+        return;
+    }
+    let parent_len = match path.rfind('/') {
+        Some(0) | None => 1,
+        Some(index) => index,
+    };
+    path.truncate(parent_len);
+}
+
 fn parent_visible_path(path: &str) -> String {
+    perf::record_vfs_visible_path_update(1);
     if path == "/" {
         return String::from("/");
     }
@@ -171,9 +225,9 @@ fn parent_visible_path(path: &str) -> String {
 
 fn lookup_child_raw(
     context: &PathContext,
-    cursor: VfsCursor,
+    mut cursor: VfsCursor,
     component: &str,
-) -> FsResult<VfsCursor> {
+) -> FsResult<VfsChildLookup> {
     if cursor.kind != FsNodeKind::Directory {
         return Err(FsError::NotDir);
     }
@@ -181,33 +235,42 @@ fn lookup_child_raw(
         return Err(FsError::NameTooLong);
     }
 
-    let child_path = if component == ".." {
-        parent_visible_path(cursor.path.as_str())
+    let parent_node = cursor.node;
+    let parent_kind = cursor.kind;
+    let parent_path_len = cursor.path.len();
+    if component == ".." {
+        truncate_visible_path_parent(&mut cursor.path);
     } else {
-        join_visible_path(cursor.path.as_str(), component)
+        push_visible_path_component(&mut cursor.path, component);
     };
     if component != ".."
         && let Some(node) = mounted_root_for_synthetic_child(
             context.namespace_id(),
-            cursor.node,
-            child_path.as_str(),
+            parent_node,
+            cursor.path.as_str(),
         )
     {
-        return Ok(VfsCursor {
-            node,
-            kind: FsNodeKind::Directory,
-            path: child_path,
+        cursor.node = node;
+        cursor.kind = FsNodeKind::Directory;
+        return Ok(VfsChildLookup {
+            cursor,
+            parent_node,
+            parent_kind,
+            parent_path_len,
         });
     }
 
-    let cacheable = component != ".." && mount_supports_dentry_cache(cursor.node.mount_id);
+    let cacheable = component != ".." && mount_supports_dentry_cache(parent_node.mount_id);
     if cacheable {
-        match dentry_cache::lookup(context.namespace_id(), cursor.node, component) {
+        match dentry_cache::lookup(context.namespace_id(), parent_node, component) {
             Some(DentryLookupResult::Positive { node, kind }) => {
-                return Ok(VfsCursor {
-                    node,
-                    kind,
-                    path: child_path,
+                cursor.node = node;
+                cursor.kind = kind;
+                return Ok(VfsChildLookup {
+                    cursor,
+                    parent_node,
+                    parent_kind,
+                    parent_path_len,
                 });
             }
             Some(DentryLookupResult::Negative) => return Err(FsError::NotFound),
@@ -215,28 +278,31 @@ fn lookup_child_raw(
         }
     }
 
-    let result = with_mount(cursor.node.mount_id, |mount| {
-        mount.lookup_component_from(cursor.node.ino, component)
+    let result = with_mount(parent_node.mount_id, |mount| {
+        mount.lookup_component_from(parent_node.ino, component)
     })
     .ok_or(FsError::Io)?;
     let (ino, kind) = match result {
         Ok(found) => found,
         Err(FsError::NotFound) => {
             if cacheable {
-                dentry_cache::insert_negative(context.namespace_id(), cursor.node, component);
+                dentry_cache::insert_negative(context.namespace_id(), parent_node, component);
             }
             return Err(FsError::NotFound);
         }
         Err(err) => return Err(err),
     };
-    let node = VfsNodeId::new(cursor.node.mount_id, ino);
+    let node = VfsNodeId::new(parent_node.mount_id, ino);
     if cacheable {
-        dentry_cache::insert_positive(context.namespace_id(), cursor.node, component, node, kind);
+        dentry_cache::insert_positive(context.namespace_id(), parent_node, component, node, kind);
     }
-    Ok(VfsCursor {
-        node,
-        kind,
-        path: child_path,
+    cursor.node = node;
+    cursor.kind = kind;
+    Ok(VfsChildLookup {
+        cursor,
+        parent_node,
+        parent_kind,
+        parent_path_len,
     })
 }
 
@@ -260,7 +326,7 @@ fn lookup_parent(context: &PathContext, cursor: VfsCursor) -> FsResult<VfsCursor
         // back to `/` for that orphaned case.
         return Ok(VfsCursor::root(context));
     }
-    lookup_child_raw(context, cursor, "..")
+    lookup_child_raw(context, cursor, "..").map(|child| child.cursor)
 }
 
 fn lookup_parent_in_context(cursor: VfsCursor, context: &PathContext) -> FsResult<VfsCursor> {
@@ -299,7 +365,7 @@ fn owned_path_components<'a>(path: &str) -> Vec<PathComponent<'a>> {
     components
 }
 
-fn read_symlink_target(cursor: VfsCursor) -> FsResult<String> {
+fn read_symlink_target(cursor: &VfsCursor) -> FsResult<String> {
     let mut buffer = vec![0u8; SYMLINK_TARGET_MAX + 1];
     let len = with_mount(cursor.node.mount_id, |mount| {
         mount.readlink(cursor.node.ino, &mut buffer)
@@ -317,6 +383,7 @@ fn resolve_path_inner(context: PathContext, path: &str, mode: LookupMode) -> FsR
         return Err(FsError::NotFound);
     }
     let mut cursor = start_cursor(&context, path);
+    reserve_visible_path_for_lookup(&mut cursor, path);
     let mut components = borrowed_path_components(path);
     let mut index = 0usize;
     let mut symlink_follows = 0usize;
@@ -330,15 +397,16 @@ fn resolve_path_inner(context: PathContext, path: &str, mode: LookupMode) -> FsR
         if component == ".." {
             cursor = lookup_parent_in_context(cursor, &context)?;
         } else {
-            let parent = cursor.clone();
-            cursor = lookup_child_raw(&context, cursor, component)?;
-            if cursor.kind == FsNodeKind::Symlink && (!is_final || mode.follow_final_symlink()) {
+            let child = lookup_child_raw(&context, cursor, component)?;
+            if child.cursor.kind == FsNodeKind::Symlink
+                && (!is_final || mode.follow_final_symlink())
+            {
                 if symlink_follows == MAX_SYMLINK_FOLLOWS {
                     return Err(FsError::Loop);
                 }
                 symlink_follows += 1;
 
-                let target = read_symlink_target(cursor)?;
+                let target = read_symlink_target(&child.cursor)?;
                 let mut next_components = owned_path_components(target.as_str());
                 next_components.extend(components[index + 1..].iter().cloned());
                 components = next_components;
@@ -346,12 +414,15 @@ fn resolve_path_inner(context: PathContext, path: &str, mode: LookupMode) -> FsR
                 cursor = if target.starts_with('/') {
                     VfsCursor::root(&context)
                 } else {
-                    parent
+                    child.into_parent()
                 };
+                reserve_visible_path_for_lookup(&mut cursor, target.as_str());
                 if mode.follow_final_mount() && components.is_empty() {
                     cursor = follow_mounted_root(&context, cursor);
                 }
                 continue;
+            } else {
+                cursor = child.cursor;
             }
         }
         if mode.follow_final_mount() || !is_final {
