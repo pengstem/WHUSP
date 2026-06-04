@@ -1,5 +1,6 @@
 use super::errno::{SysError, SysResult};
 use super::user_ptr::{copy_to_user, read_user_array, read_user_value, write_user_value};
+use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::task::check_signals_of_current;
 use crate::task::{
@@ -137,6 +138,7 @@ struct MsgQueue {
     rtime: i64,
     ctime: i64,
     qbytes: usize,
+    cbytes: usize,
     lspid: i32,
     lrpid: i32,
     messages: Vec<Message>,
@@ -191,6 +193,7 @@ impl MsgQueue {
             rtime: 0,
             ctime: now_sec(),
             qbytes: current_msgmnb(),
+            cbytes: 0,
             lspid: 0,
             lrpid: 0,
             messages: Vec::new(),
@@ -227,7 +230,8 @@ impl MsgQueue {
     }
 
     fn current_bytes(&self) -> usize {
-        self.messages.iter().map(|message| message.text.len()).sum()
+        perf::record_sysv_msg_current_bytes(0);
+        self.cbytes
     }
 
     fn has_capacity_for(&self, len: usize) -> bool {
@@ -414,12 +418,14 @@ impl MsgManager {
         if !queue.can_write(caller) {
             return Err(MsgError::AccessDenied);
         }
-        if !queue.has_capacity_for(message.text.len()) {
+        let message_len = message.text.len();
+        if !queue.has_capacity_for(message_len) {
             if flags & IPC_NOWAIT != 0 {
                 return Err(MsgError::WouldBlock);
             }
             return Err(MsgError::WouldBlock);
         }
+        queue.cbytes = queue.cbytes.saturating_add(message_len);
         queue.messages.push(message);
         queue.lspid = pid_to_i32(caller.pid);
         queue.stime = now_sec();
@@ -460,6 +466,7 @@ impl MsgManager {
             return Err(MsgError::TooBig);
         }
         if !copy_mode {
+            queue.cbytes = queue.cbytes.saturating_sub(message.text.len());
             queue.messages.remove(index);
             queue.lrpid = pid_to_i32(caller.pid);
             queue.rtime = now_sec();
@@ -492,7 +499,7 @@ impl MsgManager {
         MsgUsageInfo {
             used_ids: self.queues.len(),
             total_messages: self.queues.values().map(|queue| queue.messages.len()).sum(),
-            total_bytes: self.queues.values().map(MsgQueue::current_bytes).sum(),
+            total_bytes: self.queues.values().map(|queue| queue.cbytes).sum(),
             highest_index: self.highest_index(),
         }
     }
