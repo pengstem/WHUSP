@@ -26,6 +26,7 @@ pub struct TaskManager {
     normal_min_vruntime: u64,
     rt_queues: Vec<VecDeque<Arc<TaskControlBlock>>>,
     rt_ready_bitmap: u128,
+    ready_count: usize,
 }
 
 /// A FIFO scheduler with separate realtime priority buckets.
@@ -37,6 +38,7 @@ impl TaskManager {
             normal_min_vruntime: 0,
             rt_queues: (0..RT_QUEUE_COUNT).map(|_| VecDeque::new()).collect(),
             rt_ready_bitmap: 0,
+            ready_count: 0,
         }
     }
 
@@ -45,7 +47,7 @@ impl TaskManager {
     }
 
     fn ready_len(&self) -> usize {
-        self.normal_queue.len() + self.rt_queues.iter().map(VecDeque::len).sum::<usize>()
+        self.ready_count
     }
 
     fn nice_weight(nice: i8) -> u64 {
@@ -121,6 +123,7 @@ impl TaskManager {
             } else {
                 queue.push_back(task);
             }
+            self.ready_count += 1;
         } else {
             let vruntime = if front {
                 self.normal_min_vruntime.saturating_sub(1)
@@ -128,9 +131,19 @@ impl TaskManager {
                 task.floor_sched_vruntime(self.normal_min_vruntime)
             };
             self.normal_enqueue_seq = self.normal_enqueue_seq.wrapping_add(1);
-            self.normal_queue
+            let old_task = self
+                .normal_queue
                 .insert((vruntime, self.normal_enqueue_seq), task);
+            debug_assert!(old_task.is_none());
+            if old_task.is_none() {
+                self.ready_count += 1;
+            }
         }
+    }
+
+    fn decrement_ready_count(&mut self) {
+        debug_assert!(self.ready_count > 0);
+        self.ready_count = self.ready_count.saturating_sub(1);
     }
 
     fn clear_rt_priority_if_empty(&mut self, priority: usize) {
@@ -158,6 +171,7 @@ impl TaskManager {
                     self.clear_rt_priority_if_empty(priority);
                     continue;
                 };
+                self.decrement_ready_count();
                 self.clear_rt_priority_if_empty(priority);
                 if task.inner_exclusive_access().task_status == TaskStatus::Exited {
                     pruned_exited += 1;
@@ -173,6 +187,7 @@ impl TaskManager {
             }
 
             while let Some((key, task)) = self.normal_queue.pop_first() {
+                self.decrement_ready_count();
                 self.normal_min_vruntime = self.normal_min_vruntime.max(key.0);
                 if task.inner_exclusive_access().task_status == TaskStatus::Exited {
                     pruned_exited += 1;
@@ -259,13 +274,15 @@ impl TaskManager {
                     .is_none_or(|process| process.getpid() != process_id)
             });
         }
-        self.rebuild_rt_ready_bitmap();
+        self.rebuild_ready_metadata();
     }
 
-    fn rebuild_rt_ready_bitmap(&mut self) {
+    fn rebuild_ready_metadata(&mut self) {
         self.rt_ready_bitmap = 0;
-        for priority in 1..=RT_PRIORITY_MAX {
-            if !self.rt_queues[priority].is_empty() {
+        self.ready_count = self.normal_queue.len();
+        for (priority, queue) in self.rt_queues.iter().enumerate() {
+            self.ready_count += queue.len();
+            if priority > 0 && !queue.is_empty() {
                 self.rt_ready_bitmap |= Self::rt_priority_bit(priority);
             }
         }
@@ -273,10 +290,12 @@ impl TaskManager {
 
     fn remove_ready_task(&mut self, task: &Arc<TaskControlBlock>) -> bool {
         if remove_task_from_normal_queue(&mut self.normal_queue, task) {
+            self.decrement_ready_count();
             return true;
         }
         for priority in 1..=RT_PRIORITY_MAX {
             if remove_task_from_queue(&mut self.rt_queues[priority], task) {
+                self.decrement_ready_count();
                 self.clear_rt_priority_if_empty(priority);
                 return true;
             }
