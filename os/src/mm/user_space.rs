@@ -20,20 +20,28 @@ use alloc::vec::Vec;
 const STACK_GUARD_GAP_PAGES: usize = 256;
 const TLB_RANGE_FULL_FLUSH_THRESHOLD: usize = 64;
 
+fn flush_tlb_all_recorded() {
+    perf::record_tlb_flush_all();
+    arch_mm::flush_tlb_all();
+}
+
 fn flush_tlb_vpn_range(start_vpn: VirtPageNum, end_vpn: VirtPageNum) {
     let pages = end_vpn.0.saturating_sub(start_vpn.0);
     if pages == 0 {
         return;
     }
     if pages > TLB_RANGE_FULL_FLUSH_THRESHOLD {
-        perf::record_tlb_flush_all();
-        arch_mm::flush_tlb_all();
+        flush_tlb_all_recorded();
         return;
     }
     perf::record_tlb_flush_range(pages);
     for vpn in VPNRange::new(start_vpn, end_vpn) {
         arch_mm::flush_tlb_page(usize::from(VirtAddr::from(vpn)));
     }
+}
+
+fn flush_tlb_vpn(vpn: VirtPageNum) {
+    flush_tlb_vpn_range(vpn, VirtPageNum(vpn.0 + 1));
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -432,7 +440,7 @@ impl MemorySet {
             }
         }
         if parent_needs_tlb_flush {
-            arch_mm::flush_tlb_all();
+            flush_tlb_all_recorded();
         }
         Some(memory_set)
     }
@@ -774,7 +782,7 @@ impl MemorySet {
         }
         perf::record_vma_range_scan(area_visits, index_skips);
         if unmapped {
-            arch_mm::flush_tlb_all();
+            flush_tlb_vpn_range(start_vpn, end_vpn);
         }
 
         let mut area = MapArea::new(start.into(), end.into(), MapType::Framed, permission);
@@ -1050,7 +1058,7 @@ impl MemorySet {
                 if !self.page_table.remap_flags(vpn, pte_flags) {
                     return None;
                 }
-                arch_mm::flush_tlb_all();
+                flush_tlb_vpn(vpn);
             }
             return Some(MmapFaultResult::Handled);
         }
@@ -1524,7 +1532,7 @@ impl MemorySet {
             }
         }
         if poisoned {
-            arch_mm::flush_tlb_all();
+            flush_tlb_all_recorded();
         }
         poisoned
     }
@@ -1569,7 +1577,7 @@ impl MemorySet {
             }
         }
         if touched {
-            arch_mm::flush_tlb_all();
+            flush_tlb_vpn_range(start_vpn, end_vpn);
         }
         true
     }
@@ -1582,7 +1590,7 @@ impl MemorySet {
             }
         }
         if discarded {
-            arch_mm::flush_tlb_all();
+            flush_tlb_all_recorded();
         }
         discarded
     }
@@ -1595,7 +1603,7 @@ impl MemorySet {
             }
         }
         if discarded {
-            arch_mm::flush_tlb_all();
+            flush_tlb_all_recorded();
         }
         discarded
     }
@@ -1682,7 +1690,7 @@ impl MemorySet {
         }
         self.areas[idx].write_protect_shared_mmap_pages(&mut self.page_table);
         self.last_area_idx_containing.set(None);
-        arch_mm::flush_tlb_all();
+        flush_tlb_all_recorded();
         Some((old_addr, Vec::new()))
     }
 
