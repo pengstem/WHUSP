@@ -787,6 +787,41 @@ fn wake_local_socket_writers(tasks: VecDeque<Arc<TaskControlBlock>>) {
     }
 }
 
+fn copy_stream_slices_to_user_buffer(
+    buf: &mut UserBuffer,
+    first: &[u8],
+    second: &[u8],
+    limit: usize,
+) -> usize {
+    let source_len = first.len().saturating_add(second.len()).min(limit);
+    let mut copied = 0usize;
+
+    for dst in buf.buffers.iter_mut() {
+        let mut dst_offset = 0usize;
+        while dst_offset < dst.len() && copied < source_len {
+            let (src, src_offset) = if copied < first.len() {
+                (first, copied)
+            } else {
+                (second, copied - first.len())
+            };
+            if src_offset >= src.len() {
+                break;
+            }
+            let take = (dst.len() - dst_offset)
+                .min(src.len() - src_offset)
+                .min(source_len - copied);
+            dst[dst_offset..dst_offset + take].copy_from_slice(&src[src_offset..src_offset + take]);
+            dst_offset += take;
+            copied += take;
+        }
+        if copied == source_len {
+            break;
+        }
+    }
+
+    copied
+}
+
 fn drain_socket_write_poll_waiters(
     socket: &Arc<UPIntrFreeCell<LocalSocketInner>>,
 ) -> Vec<Arc<PollWaiter>> {
@@ -1496,9 +1531,10 @@ impl LocalSocket {
             }
             if !inner.stream_rx.is_empty() {
                 let copied = {
-                    let data = inner.stream_rx.make_contiguous();
-                    let len = data.len().min(want);
-                    buf.copy_from_slice(&data[..len])
+                    let (first, second) = inner.stream_rx.as_slices();
+                    let copied = copy_stream_slices_to_user_buffer(&mut buf, first, second, want);
+                    perf::record_local_socket_stream_recv(0, copied);
+                    copied
                 };
                 inner.stream_rx.drain(..copied);
                 let writer = inner.wake_writer();
