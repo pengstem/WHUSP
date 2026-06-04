@@ -99,6 +99,10 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) vfs_write_coalesced_calls: usize,
     pub(crate) vfs_write_coalesced_bytes: usize,
     pub(crate) page_cache_clean_evictions: usize,
+    pub(crate) tmpfs_allocated_payload_len_calls: usize,
+    pub(crate) tmpfs_allocated_payload_sparse_extents: usize,
+    pub(crate) tmpfs_allocated_logical_len_calls: usize,
+    pub(crate) tmpfs_allocated_logical_sparse_extents: usize,
     pub(crate) frame_alloc_zeroed_calls: usize,
     pub(crate) frame_alloc_zeroed_bytes: usize,
     pub(crate) frame_alloc_uninit_calls: usize,
@@ -332,6 +336,10 @@ mod enabled {
     static VFS_WRITE_COALESCED_CALLS: AtomicUsize = AtomicUsize::new(0);
     static VFS_WRITE_COALESCED_BYTES: AtomicUsize = AtomicUsize::new(0);
     static PAGE_CACHE_CLEAN_EVICTIONS: AtomicUsize = AtomicUsize::new(0);
+    static TMPFS_ALLOCATED_PAYLOAD_LEN_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static TMPFS_ALLOCATED_PAYLOAD_SPARSE_EXTENTS: AtomicUsize = AtomicUsize::new(0);
+    static TMPFS_ALLOCATED_LOGICAL_LEN_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static TMPFS_ALLOCATED_LOGICAL_SPARSE_EXTENTS: AtomicUsize = AtomicUsize::new(0);
     static FRAME_ALLOC_ZEROED_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FRAME_ALLOC_ZEROED_BYTES: AtomicUsize = AtomicUsize::new(0);
     static FRAME_ALLOC_UNINIT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -720,6 +728,16 @@ mod enabled {
 
     pub(crate) fn record_page_cache_clean_eviction(pages: usize) {
         PAGE_CACHE_CLEAN_EVICTIONS.fetch_add(pages, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_tmpfs_allocated_payload_len(sparse_extents: usize) {
+        TMPFS_ALLOCATED_PAYLOAD_LEN_CALLS.fetch_add(1, Ordering::Relaxed);
+        TMPFS_ALLOCATED_PAYLOAD_SPARSE_EXTENTS.fetch_add(sparse_extents, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_tmpfs_allocated_logical_len(sparse_extents: usize) {
+        TMPFS_ALLOCATED_LOGICAL_LEN_CALLS.fetch_add(1, Ordering::Relaxed);
+        TMPFS_ALLOCATED_LOGICAL_SPARSE_EXTENTS.fetch_add(sparse_extents, Ordering::Relaxed);
     }
 
     pub(crate) fn record_frame_alloc(zeroed: bool) {
@@ -1225,6 +1243,14 @@ mod enabled {
             vfs_write_coalesced_calls: VFS_WRITE_COALESCED_CALLS.load(Ordering::Relaxed),
             vfs_write_coalesced_bytes: VFS_WRITE_COALESCED_BYTES.load(Ordering::Relaxed),
             page_cache_clean_evictions: PAGE_CACHE_CLEAN_EVICTIONS.load(Ordering::Relaxed),
+            tmpfs_allocated_payload_len_calls: TMPFS_ALLOCATED_PAYLOAD_LEN_CALLS
+                .load(Ordering::Relaxed),
+            tmpfs_allocated_payload_sparse_extents: TMPFS_ALLOCATED_PAYLOAD_SPARSE_EXTENTS
+                .load(Ordering::Relaxed),
+            tmpfs_allocated_logical_len_calls: TMPFS_ALLOCATED_LOGICAL_LEN_CALLS
+                .load(Ordering::Relaxed),
+            tmpfs_allocated_logical_sparse_extents: TMPFS_ALLOCATED_LOGICAL_SPARSE_EXTENTS
+                .load(Ordering::Relaxed),
             frame_alloc_zeroed_calls: FRAME_ALLOC_ZEROED_CALLS.load(Ordering::Relaxed),
             frame_alloc_zeroed_bytes: FRAME_ALLOC_ZEROED_BYTES.load(Ordering::Relaxed),
             frame_alloc_uninit_calls: FRAME_ALLOC_UNINIT_CALLS.load(Ordering::Relaxed),
@@ -1467,6 +1493,10 @@ mod enabled {
          vfs_write_coalesced_calls {}\n\
          vfs_write_coalesced_bytes {}\n\
          page_cache_clean_evictions {}\n\
+         tmpfs_allocated_payload_len_calls {}\n\
+         tmpfs_allocated_payload_sparse_extents {}\n\
+         tmpfs_allocated_logical_len_calls {}\n\
+         tmpfs_allocated_logical_sparse_extents {}\n\
          frame_alloc_zeroed_calls {}\n\
          frame_alloc_zeroed_bytes {}\n\
          frame_alloc_uninit_calls {}\n\
@@ -1687,6 +1717,10 @@ mod enabled {
             stats.vfs_write_coalesced_calls,
             stats.vfs_write_coalesced_bytes,
             stats.page_cache_clean_evictions,
+            stats.tmpfs_allocated_payload_len_calls,
+            stats.tmpfs_allocated_payload_sparse_extents,
+            stats.tmpfs_allocated_logical_len_calls,
+            stats.tmpfs_allocated_logical_sparse_extents,
             stats.frame_alloc_zeroed_calls,
             stats.frame_alloc_zeroed_bytes,
             stats.frame_alloc_uninit_calls,
@@ -2024,6 +2058,12 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_page_cache_clean_eviction(_pages: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_tmpfs_allocated_payload_len(_sparse_extents: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_tmpfs_allocated_logical_len(_sparse_extents: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_frame_alloc(_zeroed: bool) {}

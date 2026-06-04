@@ -209,6 +209,8 @@ struct TmpfsInode {
     size: u64,
     data: Vec<u8>,
     sparse_data: BTreeMap<u64, TmpfsSparseExtent>,
+    allocated_payload_len: usize,
+    allocated_logical_len: u64,
     children: BTreeMap<String, u32>,
     parent_ino: u32,
     atime: FileTimestamp,
@@ -243,6 +245,8 @@ impl TmpfsInode {
             size: 0,
             data: Vec::new(),
             sparse_data: BTreeMap::new(),
+            allocated_payload_len: 0,
+            allocated_logical_len: 0,
             children: BTreeMap::new(),
             parent_ino,
             atime: now,
@@ -259,27 +263,76 @@ impl TmpfsInode {
     }
 
     fn allocated_payload_len(&self) -> usize {
-        self.data.len()
-            + self
-                .sparse_data
-                .values()
-                .map(TmpfsSparseExtent::allocated_len)
-                .sum::<usize>()
+        crate::perf::record_tmpfs_allocated_payload_len(0);
+        self.allocated_payload_len
     }
 
     fn allocated_logical_len(&self) -> u64 {
-        self.data.len() as u64
-            + self
-                .sparse_data
-                .values()
-                .map(|extent| extent.len() as u64)
-                .sum::<u64>()
+        crate::perf::record_tmpfs_allocated_logical_len(0);
+        self.allocated_logical_len
+    }
+
+    fn account_inline_len_change(&mut self, old_len: usize) {
+        let new_len = self.data.len();
+        if new_len >= old_len {
+            let delta = new_len - old_len;
+            self.allocated_payload_len = self.allocated_payload_len.saturating_add(delta);
+            self.allocated_logical_len = self.allocated_logical_len.saturating_add(delta as u64);
+        } else {
+            let delta = old_len - new_len;
+            self.allocated_payload_len = self.allocated_payload_len.saturating_sub(delta);
+            self.allocated_logical_len = self.allocated_logical_len.saturating_sub(delta as u64);
+        }
+    }
+
+    fn subtract_sparse_accounting(&mut self, extent: &TmpfsSparseExtent) {
+        self.allocated_payload_len = self
+            .allocated_payload_len
+            .saturating_sub(extent.allocated_len());
+        self.allocated_logical_len = self
+            .allocated_logical_len
+            .saturating_sub(extent.len() as u64);
+    }
+
+    fn insert_sparse_extent(&mut self, offset: u64, extent: TmpfsSparseExtent) {
+        let payload_len = extent.allocated_len();
+        let logical_len = extent.len() as u64;
+        if let Some(old) = self.sparse_data.insert(offset, extent) {
+            self.subtract_sparse_accounting(&old);
+        }
+        self.allocated_payload_len = self.allocated_payload_len.saturating_add(payload_len);
+        self.allocated_logical_len = self.allocated_logical_len.saturating_add(logical_len);
+    }
+
+    fn remove_sparse_extent(&mut self, offset: u64) -> Option<TmpfsSparseExtent> {
+        let extent = self.sparse_data.remove(&offset)?;
+        self.subtract_sparse_accounting(&extent);
+        Some(extent)
+    }
+
+    fn account_sparse_extent_change(
+        &mut self,
+        old_payload_len: usize,
+        old_logical_len: usize,
+        new_payload_len: usize,
+        new_logical_len: usize,
+    ) {
+        self.allocated_payload_len = self
+            .allocated_payload_len
+            .saturating_sub(old_payload_len)
+            .saturating_add(new_payload_len);
+        self.allocated_logical_len = self
+            .allocated_logical_len
+            .saturating_sub(old_logical_len as u64)
+            .saturating_add(new_logical_len as u64);
     }
 
     fn clear_payload(&mut self) {
         self.data.clear();
         self.data.shrink_to_fit();
         self.sparse_data.clear();
+        self.allocated_payload_len = 0;
+        self.allocated_logical_len = 0;
     }
 
     fn remove_sparse_range(&mut self, start: u64, end: u64) {
@@ -300,7 +353,7 @@ impl TmpfsInode {
             .collect();
 
         for extent_start in overlapping {
-            let Some(extent) = self.sparse_data.remove(&extent_start) else {
+            let Some(extent) = self.remove_sparse_extent(extent_start) else {
                 continue;
             };
             let extent_end = extent_start.saturating_add(extent.len() as u64);
@@ -318,12 +371,12 @@ impl TmpfsInode {
             if extent_start < start
                 && let Some(left) = left
             {
-                self.sparse_data.insert(extent_start, left);
+                self.insert_sparse_extent(extent_start, left);
             }
             if extent_end > end
                 && let Some(right) = right
             {
-                self.sparse_data.insert(end, right);
+                self.insert_sparse_extent(end, right);
             }
         }
     }
@@ -343,13 +396,13 @@ impl TmpfsInode {
             .collect();
 
         for extent_start in affected {
-            let Some(mut extent) = self.sparse_data.remove(&extent_start) else {
+            let Some(mut extent) = self.remove_sparse_extent(extent_start) else {
                 continue;
             };
             if extent_start < len {
                 extent.truncate_to((len - extent_start) as usize);
                 if extent.len() > 0 {
-                    self.sparse_data.insert(extent_start, extent);
+                    self.insert_sparse_extent(extent_start, extent);
                 }
             }
         }
@@ -372,7 +425,7 @@ impl TmpfsInode {
         }
         let len = (end - offset) as usize;
         if let Some(extent) = TmpfsSparseExtent::repeated_value(0, len) {
-            self.sparse_data.insert(offset, extent);
+            self.insert_sparse_extent(offset, extent);
         }
     }
 
@@ -390,7 +443,9 @@ impl TmpfsInode {
                 {
                     return false;
                 }
+                let old_len = self.data.len();
                 self.data.resize(inline_end, 0);
+                self.account_inline_len_change(old_len);
             }
         }
 
@@ -430,7 +485,9 @@ impl TmpfsInode {
                 {
                     return false;
                 }
+                let old_len = self.data.len();
                 self.data.resize(inline_end, 0);
+                self.account_inline_len_change(old_len);
             }
             let start = offset as usize;
             self.data[start..inline_end].fill(0);
@@ -447,7 +504,9 @@ impl TmpfsInode {
                 {
                     return false;
                 }
+                let old_len = self.data.len();
                 self.data.resize(inline_end, 0);
+                self.account_inline_len_change(old_len);
             }
             let start = offset as usize;
             self.data[start..inline_end].fill(0);
@@ -478,12 +537,30 @@ impl TmpfsInode {
 
     fn append_sparse_tail(&mut self, offset: u64, buf: &[u8]) -> Option<usize> {
         let allocated_payload_len = self.allocated_payload_len();
-        let (&extent_start, extent) = self.sparse_data.range_mut(..=offset).next_back()?;
-        let extent_end = extent_start.saturating_add(extent.len() as u64);
-        if extent_end != offset {
-            return None;
-        }
-        extent.try_append(buf, allocated_payload_len)
+        let (old_payload_len, old_logical_len, new_payload_len, new_logical_len, appended) = {
+            let (&extent_start, extent) = self.sparse_data.range_mut(..=offset).next_back()?;
+            let extent_end = extent_start.saturating_add(extent.len() as u64);
+            if extent_end != offset {
+                return None;
+            }
+            let old_payload_len = extent.allocated_len();
+            let old_logical_len = extent.len();
+            let appended = extent.try_append(buf, allocated_payload_len)?;
+            (
+                old_payload_len,
+                old_logical_len,
+                extent.allocated_len(),
+                extent.len(),
+                appended,
+            )
+        };
+        self.account_sparse_extent_change(
+            old_payload_len,
+            old_logical_len,
+            new_payload_len,
+            new_logical_len,
+        );
+        Some(appended)
     }
 
     fn write_sparse_data(&mut self, mut offset: u64, mut buf: &[u8]) -> bool {
@@ -499,7 +576,7 @@ impl TmpfsInode {
 
             let copy_len = buf.len().min(TMPFS_SPARSE_EXTENT_LIMIT);
             if let Some(extent) = TmpfsSparseExtent::repeated_byte(&buf[..copy_len]) {
-                self.sparse_data.insert(offset, extent);
+                self.insert_sparse_extent(offset, extent);
                 offset += copy_len as u64;
                 buf = &buf[copy_len..];
                 continue;
@@ -513,8 +590,7 @@ impl TmpfsInode {
                 return false;
             }
             data.extend_from_slice(&buf[..copy_len]);
-            self.sparse_data
-                .insert(offset, TmpfsSparseExtent::Bytes(data));
+            self.insert_sparse_extent(offset, TmpfsSparseExtent::Bytes(data));
             offset += copy_len as u64;
             buf = &buf[copy_len..];
         }
@@ -1063,12 +1139,18 @@ impl FileSystemBackend for TmpFs {
         } else if len < inode.size {
             inode.truncate_sparse_to(len);
             if len as usize <= inline_file_limit {
+                let old_len = inode.data.len();
                 inode.data.resize(len as usize, 0);
+                inode.account_inline_len_change(old_len);
             } else if inode.data.len() as u64 > len {
+                let old_len = inode.data.len();
                 inode.data.truncate(len as usize);
+                inode.account_inline_len_change(old_len);
             }
         } else if inode.data.len() as u64 > len {
+            let old_len = inode.data.len();
             inode.data.truncate(len as usize);
+            inode.account_inline_len_change(old_len);
         }
         if inode.allocated_payload_len() > TMPFS_ALLOCATED_PAYLOAD_LIMIT {
             return Err(FsError::NoSpace);
@@ -1331,7 +1413,9 @@ impl FileSystemBackend for TmpFs {
                 {
                     return 0;
                 }
+                let old_len = inode.data.len();
                 inode.data.resize(inline_end, 0);
+                inode.account_inline_len_change(old_len);
             }
             let inline_len = inline_end - start;
             inode.data[start..inline_end].copy_from_slice(&buf[..inline_len]);
