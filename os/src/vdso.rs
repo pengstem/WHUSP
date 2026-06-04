@@ -30,6 +30,7 @@ mod arch {
     const STT_FUNC: u8 = 2;
     const CLOCK_SYMBOL: &[u8] = b"__vdso_clock_gettime";
     const GETTIMEOFDAY_SYMBOL: &[u8] = b"__vdso_gettimeofday";
+    const CLOCK_GETRES_SYMBOL: &[u8] = b"__vdso_clock_getres";
     const LINUX_4_15: &[u8] = b"LINUX_4.15";
 
     global_asm!(
@@ -41,6 +42,8 @@ mod arch {
         .globl __whusp_vdso_clock_gettime_end
         .globl __whusp_vdso_gettimeofday_start
         .globl __whusp_vdso_gettimeofday_end
+        .globl __whusp_vdso_clock_getres_start
+        .globl __whusp_vdso_clock_getres_end
         .balign 4
 __whusp_vdso_clock_gettime_start:
         .option push
@@ -140,6 +143,39 @@ __whusp_vdso_gettimeofday_start:
         ret
         .option pop
 __whusp_vdso_gettimeofday_end:
+        .balign 4
+__whusp_vdso_clock_getres_start:
+        li t0, 0
+        beq a0, t0, 8f
+        li t0, 1
+        beq a0, t0, 8f
+        li t0, 2
+        beq a0, t0, 8f
+        li t0, 3
+        beq a0, t0, 8f
+        li t0, 4
+        beq a0, t0, 8f
+        li t0, 5
+        beq a0, t0, 8f
+        li t0, 6
+        beq a0, t0, 8f
+        li t0, 7
+        beq a0, t0, 8f
+        li t0, 8
+        beq a0, t0, 8f
+        li t0, 9
+        beq a0, t0, 8f
+        li a0, -38
+        ret
+8:
+        beqz a1, 9f
+        sd zero, 0(a1)
+        li t0, 1
+        sd t0, 8(a1)
+9:
+        li a0, 0
+        ret
+__whusp_vdso_clock_getres_end:
         "#
     );
 
@@ -150,6 +186,8 @@ __whusp_vdso_gettimeofday_end:
         static __whusp_vdso_clock_gettime_end: u8;
         static __whusp_vdso_gettimeofday_start: u8;
         static __whusp_vdso_gettimeofday_end: u8;
+        static __whusp_vdso_clock_getres_start: u8;
+        static __whusp_vdso_clock_getres_end: u8;
     }
 
     pub(super) fn map_into(memory_set: &mut MemorySet) -> Option<usize> {
@@ -164,6 +202,8 @@ __whusp_vdso_gettimeofday_end:
         let clock_size = clock_code_size()?;
         let gettimeofday_offset = gettimeofday_code_offset()?;
         let gettimeofday_size = gettimeofday_code_size()?;
+        let clock_getres_offset = clock_getres_code_offset()?;
+        let clock_getres_size = clock_getres_code_size()?;
         let freq_offset_in_code = clock_freq_offset()?;
         let phoff = 64usize;
         let phentsize = 56usize;
@@ -172,16 +212,17 @@ __whusp_vdso_gettimeofday_end:
         let dynamic_count = 9usize;
         let dynamic_size = dynamic_count * 16;
         let hash_off = align_up(dynamic_off + dynamic_size, 8);
-        let hash_size = 6 * 4;
+        let hash_size = 7 * 4;
         let symtab_off = align_up(hash_off + hash_size, 8);
-        let symtab_size = 3 * 24;
+        let symtab_size = 4 * 24;
         let versym_off = align_up(symtab_off + symtab_size, 2);
-        let verdef_off = align_up(versym_off + 3 * 2, 4);
+        let verdef_off = align_up(versym_off + 4 * 2, 4);
         let verdef_size = 20 + 8;
         let strtab_off = verdef_off + verdef_size;
         let clock_name_off = 1usize;
         let gettimeofday_name_off = clock_name_off + CLOCK_SYMBOL.len() + 1;
-        let version_name_off = gettimeofday_name_off + GETTIMEOFDAY_SYMBOL.len() + 1;
+        let clock_getres_name_off = gettimeofday_name_off + GETTIMEOFDAY_SYMBOL.len() + 1;
+        let version_name_off = clock_getres_name_off + CLOCK_GETRES_SYMBOL.len() + 1;
         let strtab_size = version_name_off + LINUX_4_15.len() + 1;
         let code_off = code_image_offset();
         if code_off.checked_add(code.len())? > PAGE_SIZE {
@@ -243,9 +284,17 @@ __whusp_vdso_gettimeofday_end:
             code_off + gettimeofday_offset,
             gettimeofday_size,
         );
+        write_symbol(
+            &mut image,
+            symtab_off + 72,
+            clock_getres_name_off,
+            code_off + clock_getres_offset,
+            clock_getres_size,
+        );
         write_u16(&mut image, versym_off, 0);
         write_u16(&mut image, versym_off + 2, 2);
         write_u16(&mut image, versym_off + 4, 2);
+        write_u16(&mut image, versym_off + 6, 2);
         write_version_def(&mut image, verdef_off, version_name_off);
         image[strtab_off] = 0;
         copy_cstr(&mut image, strtab_off + clock_name_off, CLOCK_SYMBOL);
@@ -253,6 +302,11 @@ __whusp_vdso_gettimeofday_end:
             &mut image,
             strtab_off + gettimeofday_name_off,
             GETTIMEOFDAY_SYMBOL,
+        );
+        copy_cstr(
+            &mut image,
+            strtab_off + clock_getres_name_off,
+            CLOCK_GETRES_SYMBOL,
         );
         copy_cstr(&mut image, strtab_off + version_name_off, LINUX_4_15);
         image[code_off..code_off + code.len()].copy_from_slice(code);
@@ -270,7 +324,7 @@ __whusp_vdso_gettimeofday_end:
     fn vdso_code() -> &'static [u8] {
         unsafe {
             let start = &__whusp_vdso_clock_gettime_start as *const u8 as usize;
-            let end = &__whusp_vdso_gettimeofday_end as *const u8 as usize;
+            let end = &__whusp_vdso_clock_getres_end as *const u8 as usize;
             core::slice::from_raw_parts(start as *const u8, end - start)
         }
     }
@@ -295,6 +349,22 @@ __whusp_vdso_gettimeofday_end:
         unsafe {
             let start = &__whusp_vdso_gettimeofday_start as *const u8 as usize;
             let end = &__whusp_vdso_gettimeofday_end as *const u8 as usize;
+            end.checked_sub(start)
+        }
+    }
+
+    fn clock_getres_code_offset() -> Option<usize> {
+        unsafe {
+            let start = &__whusp_vdso_clock_gettime_start as *const u8 as usize;
+            let clock_getres = &__whusp_vdso_clock_getres_start as *const u8 as usize;
+            clock_getres.checked_sub(start)
+        }
+    }
+
+    fn clock_getres_code_size() -> Option<usize> {
+        unsafe {
+            let start = &__whusp_vdso_clock_getres_start as *const u8 as usize;
+            let end = &__whusp_vdso_clock_getres_end as *const u8 as usize;
             end.checked_sub(start)
         }
     }
@@ -340,16 +410,17 @@ __whusp_vdso_gettimeofday_end:
         let dynamic_count = 9usize;
         let dynamic_size = dynamic_count * 16;
         let hash_off = align_up(dynamic_off + dynamic_size, 8);
-        let hash_size = 6 * 4;
+        let hash_size = 7 * 4;
         let symtab_off = align_up(hash_off + hash_size, 8);
-        let symtab_size = 3 * 24;
+        let symtab_size = 4 * 24;
         let versym_off = align_up(symtab_off + symtab_size, 2);
-        let verdef_off = align_up(versym_off + 3 * 2, 4);
+        let verdef_off = align_up(versym_off + 4 * 2, 4);
         let verdef_size = 20 + 8;
         let strtab_off = verdef_off + verdef_size;
         let clock_name_off = 1usize;
         let gettimeofday_name_off = clock_name_off + CLOCK_SYMBOL.len() + 1;
-        let version_name_off = gettimeofday_name_off + GETTIMEOFDAY_SYMBOL.len() + 1;
+        let clock_getres_name_off = gettimeofday_name_off + GETTIMEOFDAY_SYMBOL.len() + 1;
+        let version_name_off = clock_getres_name_off + CLOCK_GETRES_SYMBOL.len() + 1;
         let strtab_size = version_name_off + LINUX_4_15.len() + 1;
         align_up(strtab_off + strtab_size, 16)
     }
@@ -406,11 +477,12 @@ __whusp_vdso_gettimeofday_end:
 
     fn write_sysv_hash(image: &mut [u8], off: usize) {
         write_u32(image, off, 1);
-        write_u32(image, off + 4, 3);
+        write_u32(image, off + 4, 4);
         write_u32(image, off + 8, 1);
         write_u32(image, off + 12, 0);
         write_u32(image, off + 16, 2);
-        write_u32(image, off + 20, 0);
+        write_u32(image, off + 20, 3);
+        write_u32(image, off + 24, 0);
     }
 
     fn write_symbol(image: &mut [u8], off: usize, name: usize, value: usize, size: usize) {
@@ -491,6 +563,7 @@ mod arch {
     const STT_FUNC: u8 = 2;
     const CLOCK_SYMBOL: &[u8] = b"__vdso_clock_gettime";
     const GETTIMEOFDAY_SYMBOL: &[u8] = b"__vdso_gettimeofday";
+    const CLOCK_GETRES_SYMBOL: &[u8] = b"__vdso_clock_getres";
     const LINUX_5_10: &[u8] = b"LINUX_5.10";
 
     global_asm!(
@@ -502,6 +575,8 @@ mod arch {
         .globl __whusp_la_vdso_clock_gettime_end
         .globl __whusp_la_vdso_gettimeofday_start
         .globl __whusp_la_vdso_gettimeofday_end
+        .globl __whusp_la_vdso_clock_getres_start
+        .globl __whusp_la_vdso_clock_getres_end
         .balign 4
 __whusp_la_vdso_clock_gettime_start:
         li.w    $t5, 0
@@ -589,6 +664,39 @@ __whusp_la_vdso_gettimeofday_start:
         addi.d  $sp, $sp, 48
         jr      $ra
 __whusp_la_vdso_gettimeofday_end:
+        .balign 4
+__whusp_la_vdso_clock_getres_start:
+        li.w    $t0, 0
+        beq     $a0, $t0, 8f
+        li.w    $t0, 1
+        beq     $a0, $t0, 8f
+        li.w    $t0, 2
+        beq     $a0, $t0, 8f
+        li.w    $t0, 3
+        beq     $a0, $t0, 8f
+        li.w    $t0, 4
+        beq     $a0, $t0, 8f
+        li.w    $t0, 5
+        beq     $a0, $t0, 8f
+        li.w    $t0, 6
+        beq     $a0, $t0, 8f
+        li.w    $t0, 7
+        beq     $a0, $t0, 8f
+        li.w    $t0, 8
+        beq     $a0, $t0, 8f
+        li.w    $t0, 9
+        beq     $a0, $t0, 8f
+        li.w    $a0, -38
+        jr      $ra
+8:
+        beqz    $a1, 9f
+        st.d    $zero, $a1, 0
+        li.w    $t0, 1
+        st.d    $t0, $a1, 8
+9:
+        li.w    $a0, 0
+        jr      $ra
+__whusp_la_vdso_clock_getres_end:
         "#
     );
 
@@ -599,6 +707,8 @@ __whusp_la_vdso_gettimeofday_end:
         static __whusp_la_vdso_clock_gettime_end: u8;
         static __whusp_la_vdso_gettimeofday_start: u8;
         static __whusp_la_vdso_gettimeofday_end: u8;
+        static __whusp_la_vdso_clock_getres_start: u8;
+        static __whusp_la_vdso_clock_getres_end: u8;
     }
 
     pub(super) fn map_into(memory_set: &mut MemorySet) -> Option<usize> {
@@ -613,6 +723,8 @@ __whusp_la_vdso_gettimeofday_end:
         let clock_size = clock_code_size()?;
         let gettimeofday_offset = gettimeofday_code_offset()?;
         let gettimeofday_size = gettimeofday_code_size()?;
+        let clock_getres_offset = clock_getres_code_offset()?;
+        let clock_getres_size = clock_getres_code_size()?;
         let freq_offset_in_code = clock_freq_offset()?;
         let phoff = 64usize;
         let phentsize = 56usize;
@@ -621,16 +733,17 @@ __whusp_la_vdso_gettimeofday_end:
         let dynamic_count = 9usize;
         let dynamic_size = dynamic_count * 16;
         let hash_off = align_up(dynamic_off + dynamic_size, 8);
-        let hash_size = 6 * 4;
+        let hash_size = 7 * 4;
         let symtab_off = align_up(hash_off + hash_size, 8);
-        let symtab_size = 3 * 24;
+        let symtab_size = 4 * 24;
         let versym_off = align_up(symtab_off + symtab_size, 2);
-        let verdef_off = align_up(versym_off + 3 * 2, 4);
+        let verdef_off = align_up(versym_off + 4 * 2, 4);
         let verdef_size = 20 + 8;
         let strtab_off = verdef_off + verdef_size;
         let clock_name_off = 1usize;
         let gettimeofday_name_off = clock_name_off + CLOCK_SYMBOL.len() + 1;
-        let version_name_off = gettimeofday_name_off + GETTIMEOFDAY_SYMBOL.len() + 1;
+        let clock_getres_name_off = gettimeofday_name_off + GETTIMEOFDAY_SYMBOL.len() + 1;
+        let version_name_off = clock_getres_name_off + CLOCK_GETRES_SYMBOL.len() + 1;
         let strtab_size = version_name_off + LINUX_5_10.len() + 1;
         let code_off = code_image_offset();
         if code_off.checked_add(code.len())? > PAGE_SIZE {
@@ -692,9 +805,17 @@ __whusp_la_vdso_gettimeofday_end:
             code_off + gettimeofday_offset,
             gettimeofday_size,
         );
+        write_symbol(
+            &mut image,
+            symtab_off + 72,
+            clock_getres_name_off,
+            code_off + clock_getres_offset,
+            clock_getres_size,
+        );
         write_u16(&mut image, versym_off, 0);
         write_u16(&mut image, versym_off + 2, 2);
         write_u16(&mut image, versym_off + 4, 2);
+        write_u16(&mut image, versym_off + 6, 2);
         write_version_def(&mut image, verdef_off, version_name_off);
         image[strtab_off] = 0;
         copy_cstr(&mut image, strtab_off + clock_name_off, CLOCK_SYMBOL);
@@ -702,6 +823,11 @@ __whusp_la_vdso_gettimeofday_end:
             &mut image,
             strtab_off + gettimeofday_name_off,
             GETTIMEOFDAY_SYMBOL,
+        );
+        copy_cstr(
+            &mut image,
+            strtab_off + clock_getres_name_off,
+            CLOCK_GETRES_SYMBOL,
         );
         copy_cstr(&mut image, strtab_off + version_name_off, LINUX_5_10);
         image[code_off..code_off + code.len()].copy_from_slice(code);
@@ -719,7 +845,7 @@ __whusp_la_vdso_gettimeofday_end:
     fn vdso_code() -> &'static [u8] {
         unsafe {
             let start = &__whusp_la_vdso_clock_gettime_start as *const u8 as usize;
-            let end = &__whusp_la_vdso_gettimeofday_end as *const u8 as usize;
+            let end = &__whusp_la_vdso_clock_getres_end as *const u8 as usize;
             core::slice::from_raw_parts(start as *const u8, end - start)
         }
     }
@@ -744,6 +870,22 @@ __whusp_la_vdso_gettimeofday_end:
         unsafe {
             let start = &__whusp_la_vdso_gettimeofday_start as *const u8 as usize;
             let end = &__whusp_la_vdso_gettimeofday_end as *const u8 as usize;
+            end.checked_sub(start)
+        }
+    }
+
+    fn clock_getres_code_offset() -> Option<usize> {
+        unsafe {
+            let start = &__whusp_la_vdso_clock_gettime_start as *const u8 as usize;
+            let clock_getres = &__whusp_la_vdso_clock_getres_start as *const u8 as usize;
+            clock_getres.checked_sub(start)
+        }
+    }
+
+    fn clock_getres_code_size() -> Option<usize> {
+        unsafe {
+            let start = &__whusp_la_vdso_clock_getres_start as *const u8 as usize;
+            let end = &__whusp_la_vdso_clock_getres_end as *const u8 as usize;
             end.checked_sub(start)
         }
     }
@@ -789,16 +931,17 @@ __whusp_la_vdso_gettimeofday_end:
         let dynamic_count = 9usize;
         let dynamic_size = dynamic_count * 16;
         let hash_off = align_up(dynamic_off + dynamic_size, 8);
-        let hash_size = 6 * 4;
+        let hash_size = 7 * 4;
         let symtab_off = align_up(hash_off + hash_size, 8);
-        let symtab_size = 3 * 24;
+        let symtab_size = 4 * 24;
         let versym_off = align_up(symtab_off + symtab_size, 2);
-        let verdef_off = align_up(versym_off + 3 * 2, 4);
+        let verdef_off = align_up(versym_off + 4 * 2, 4);
         let verdef_size = 20 + 8;
         let strtab_off = verdef_off + verdef_size;
         let clock_name_off = 1usize;
         let gettimeofday_name_off = clock_name_off + CLOCK_SYMBOL.len() + 1;
-        let version_name_off = gettimeofday_name_off + GETTIMEOFDAY_SYMBOL.len() + 1;
+        let clock_getres_name_off = gettimeofday_name_off + GETTIMEOFDAY_SYMBOL.len() + 1;
+        let version_name_off = clock_getres_name_off + CLOCK_GETRES_SYMBOL.len() + 1;
         let strtab_size = version_name_off + LINUX_5_10.len() + 1;
         align_up(strtab_off + strtab_size, 16)
     }
@@ -855,11 +998,12 @@ __whusp_la_vdso_gettimeofday_end:
 
     fn write_sysv_hash(image: &mut [u8], off: usize) {
         write_u32(image, off, 1);
-        write_u32(image, off + 4, 3);
+        write_u32(image, off + 4, 4);
         write_u32(image, off + 8, 1);
         write_u32(image, off + 12, 0);
         write_u32(image, off + 16, 2);
-        write_u32(image, off + 20, 0);
+        write_u32(image, off + 20, 3);
+        write_u32(image, off + 24, 0);
     }
 
     fn write_symbol(image: &mut [u8], off: usize, name: usize, value: usize, size: usize) {
