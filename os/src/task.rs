@@ -74,6 +74,7 @@ pub use signal::{
 #[cfg(target_arch = "riscv64")]
 pub use signal::{SI_TKILL, SIGRT_1, SIGRTMIN};
 pub(crate) use signal::{flags_to_linux_sigset, linux_sigset_to_flags};
+pub(crate) use task::SCHED_RR_INTERVAL_US;
 pub use task::{DEFAULT_TIMER_SLACK_NS, SeccompSockFilter, TaskControlBlock, TaskStatus};
 
 const CORE_DUMP_STATUS_BIT: i32 = 0x80;
@@ -128,6 +129,10 @@ pub fn mark_current_kernel_time_entry(now_us: usize) {
         |task| task.mark_kernel_time_entry(now_us),
         |process| process.mark_kernel_time_entry(now_us),
     );
+}
+
+pub fn timer_tick_should_preempt(current: &Arc<TaskControlBlock>) -> bool {
+    manager::should_preempt_current_on_tick(current)
 }
 
 pub fn suspend_current_and_run_next() {

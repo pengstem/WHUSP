@@ -14,6 +14,7 @@ use alloc::{
 };
 
 pub const DEFAULT_TIMER_SLACK_NS: usize = 50_000;
+pub(crate) const SCHED_RR_INTERVAL_US: usize = 100_000;
 const SCHED_FIFO: i32 = 1;
 const SCHED_RR: i32 = 2;
 
@@ -116,6 +117,11 @@ impl TaskControlBlock {
             SCHED_FIFO | SCHED_RR if inner.sched_priority > 0 => inner.sched_priority,
             _ => 0,
         }
+    }
+
+    pub(crate) fn is_realtime_round_robin(&self) -> bool {
+        let inner = self.inner_exclusive_access();
+        inner.sched_policy == SCHED_RR && inner.sched_priority > 0
     }
 
     pub(crate) fn nice_value(&self) -> i8 {

@@ -5,8 +5,8 @@ use crate::{
         user_ptr::{read_user_value_with_mmap_fault, write_user_value_with_mmap_fault},
     },
     task::{
-        TaskControlBlock, current_process, current_task, current_user_token, processes_snapshot,
-        reprioritize_ready_task, task_with_linux_tid,
+        SCHED_RR_INTERVAL_US, TaskControlBlock, current_process, current_task, current_user_token,
+        processes_snapshot, reprioritize_ready_task, task_with_linux_tid,
     },
 };
 use alloc::{sync::Arc, vec, vec::Vec};
@@ -21,7 +21,6 @@ const SCHED_DEADLINE: i32 = 6;
 const SCHED_RESET_ON_FORK: i32 = 0x4000_0000;
 const RT_PRIORITY_MIN: isize = 1;
 const RT_PRIORITY_MAX: isize = 99;
-const RR_INTERVAL_NSEC: isize = 100_000_000;
 const AFFINITY_MASK_BYTES: usize = size_of::<usize>();
 const PRIO_PROCESS: i32 = 0;
 const PRIO_PGRP: i32 = 1;
@@ -452,7 +451,7 @@ pub fn sys_sched_rr_get_interval(pid: isize, interval: *mut LinuxTimeSpec) -> Sy
     let rr_interval = if sched_policy == SCHED_RR {
         LinuxTimeSpec {
             tv_sec: 0,
-            tv_nsec: RR_INTERVAL_NSEC,
+            tv_nsec: (SCHED_RR_INTERVAL_US * 1_000) as isize,
         }
     } else {
         LinuxTimeSpec {

@@ -9,7 +9,7 @@ use crate::task::{
     SignalAction, SignalFlags, TaskControlBlock, account_task_user_time_until,
     check_signals_of_task, current_add_signal, current_process, current_task,
     current_trap_return_context_after_accounting, exit_current_group_and_run_next, process_of_task,
-    suspend_current_and_run_next, trap_cx_of_task,
+    suspend_current_and_run_next, timer_tick_should_preempt, trap_cx_of_task,
 };
 use crate::timer::{check_timer, get_time_us, set_next_trigger};
 use alloc::sync::Arc;
@@ -205,7 +205,9 @@ pub fn trap_handler() -> ! {
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             set_next_trigger();
             check_timer();
-            suspend_current_and_run_next();
+            if timer_tick_should_preempt(&task) {
+                suspend_current_and_run_next();
+            }
         }
         Trap::Interrupt(Interrupt::SupervisorExternal) => {
             crate::board::irq_handler();

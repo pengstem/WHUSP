@@ -1,4 +1,6 @@
-use super::{ProcessControlBlock, ProcessProcSnapshot, TaskControlBlock, TaskStatus};
+use super::{
+    ProcessControlBlock, ProcessProcSnapshot, SCHED_RR_INTERVAL_US, TaskControlBlock, TaskStatus,
+};
 use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -9,6 +11,7 @@ use lazy_static::*;
 const RT_PRIORITY_MAX: usize = 99;
 const RT_QUEUE_COUNT: usize = RT_PRIORITY_MAX + 1;
 const NICE_0_LOAD: u64 = 1024;
+const NORMAL_PREEMPT_GRANULARITY_US: u64 = 1_000;
 const NICE_TO_WEIGHT: [u64; 40] = [
     88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904,
     3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, 110, 87,
@@ -50,10 +53,14 @@ impl TaskManager {
         NICE_TO_WEIGHT[index]
     }
 
-    fn vruntime_delta_for_runtime(task: &TaskControlBlock, runtime_us: usize) -> u64 {
-        let weight = Self::nice_weight(task.nice_value());
+    fn vruntime_delta_for_nice(nice: i8, runtime_us: usize) -> u64 {
+        let weight = Self::nice_weight(nice);
         let weighted_runtime = (runtime_us as u64).max(1).saturating_mul(NICE_0_LOAD);
         weighted_runtime.div_ceil(weight).max(1)
+    }
+
+    fn vruntime_delta_for_runtime(task: &TaskControlBlock, runtime_us: usize) -> u64 {
+        Self::vruntime_delta_for_nice(task.nice_value(), runtime_us)
     }
 
     fn charge_normal_runtime(task: &TaskControlBlock) {
@@ -64,6 +71,27 @@ impl TaskManager {
         let delta = Self::vruntime_delta_for_runtime(task, runtime_us);
         task.add_sched_vruntime(delta);
         perf::record_scheduler_normal_requeue(delta as usize);
+    }
+
+    fn task_is_exited(task: &TaskControlBlock) -> bool {
+        task.inner_exclusive_access().task_status == TaskStatus::Exited
+    }
+
+    fn ready_rt_priority(task: &TaskControlBlock) -> Option<usize> {
+        if Self::task_is_exited(task) {
+            return None;
+        }
+        let priority = Self::rt_priority(task);
+        (priority > 0).then_some(priority)
+    }
+
+    fn current_run_time_us(current: &TaskControlBlock) -> usize {
+        current
+            .inner_exclusive_access()
+            .sched_run_start_us
+            .map_or(0, |start_us| {
+                crate::timer::get_time_us().saturating_sub(start_us)
+            })
     }
 
     fn rt_priority_bit(priority: usize) -> u128 {
@@ -164,6 +192,60 @@ impl TaskManager {
         }
     }
 
+    pub fn should_preempt_current_on_tick(&self, current: &Arc<TaskControlBlock>) -> bool {
+        let current_rt_priority = Self::rt_priority(current);
+
+        for priority in (current_rt_priority + 1..=RT_PRIORITY_MAX).rev() {
+            if self.rt_ready_bitmap & Self::rt_priority_bit(priority) == 0 {
+                continue;
+            }
+            if self.rt_queues[priority].iter().any(|task| {
+                !Arc::ptr_eq(task, current)
+                    && Self::ready_rt_priority(task)
+                        .is_some_and(|task_priority| task_priority == priority)
+            }) {
+                return true;
+            }
+        }
+        if current_rt_priority > 0 {
+            let runtime_us = Self::current_run_time_us(current);
+            if current.is_realtime_round_robin()
+                && runtime_us >= SCHED_RR_INTERVAL_US
+                && self.rt_queues[current_rt_priority].iter().any(|task| {
+                    !Arc::ptr_eq(task, current)
+                        && Self::ready_rt_priority(task)
+                            .is_some_and(|task_priority| task_priority == current_rt_priority)
+                })
+            {
+                return true;
+            }
+            return false;
+        }
+
+        let Some(best_normal_key) = self.normal_queue.iter().find_map(|(key, task)| {
+            if Self::task_is_exited(task) || Self::rt_priority(task) > 0 {
+                None
+            } else {
+                Some(*key)
+            }
+        }) else {
+            return false;
+        };
+
+        let (sched_vruntime, nice) = {
+            let inner = current.inner_exclusive_access();
+            (inner.sched_vruntime, inner.nice)
+        };
+        let runtime_us = Self::current_run_time_us(current);
+        let current_base_vruntime = sched_vruntime.max(self.normal_min_vruntime);
+        let current_projected_vruntime =
+            current_base_vruntime.saturating_add(Self::vruntime_delta_for_nice(nice, runtime_us));
+        current_projected_vruntime
+            > best_normal_key
+                .0
+                .saturating_add(NORMAL_PREEMPT_GRANULARITY_US)
+    }
+
     pub fn remove_process_tasks(&mut self, process_id: usize) {
         self.normal_queue.retain(|_, task| {
             task.process
@@ -259,6 +341,12 @@ pub(crate) fn requeue_task_after_run(task: Arc<TaskControlBlock>) {
 
 pub(crate) fn charge_task_after_run(task: &TaskControlBlock) {
     TaskManager::charge_normal_runtime(task);
+}
+
+pub(crate) fn should_preempt_current_on_tick(current: &Arc<TaskControlBlock>) -> bool {
+    TASK_MANAGER
+        .exclusive_access()
+        .should_preempt_current_on_tick(current)
 }
 
 fn wakeup_task_with_placement(task: Arc<TaskControlBlock>, front: bool) -> bool {
