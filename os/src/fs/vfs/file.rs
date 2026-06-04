@@ -284,7 +284,7 @@ fn stat_logical_size(node: VfsNodeId, stat_size: u64) -> u64 {
 
 fn can_cache_dirty_write(
     kind: FsNodeKind,
-    mount_id: MountId,
+    supports_dirty_writeback: bool,
     offset: usize,
     len: usize,
     status_flags: OpenFlags,
@@ -295,7 +295,7 @@ fn can_cache_dirty_write(
         && offset % PAGE_SIZE == 0
         && len % PAGE_SIZE == 0
         && !status_flags.intersects(OpenFlags::DIRECT | OpenFlags::DSYNC | OpenFlags::SYNC)
-        && mount_supports_dirty_writeback(mount_id)
+        && supports_dirty_writeback
 }
 
 fn dirty_write_page_pressure(
@@ -726,11 +726,19 @@ fn reject_nosymfollow_final_symlink(
     }
 }
 
-fn page_cache_id_for_node(node: VfsNodeId, kind: FsNodeKind) -> Option<PageCacheId> {
-    if kind != FsNodeKind::RegularFile || !mount_supports_page_cache(node.mount_id) {
+fn page_cache_id_for_node_with_support(
+    node: VfsNodeId,
+    kind: FsNodeKind,
+    supports_page_cache: bool,
+) -> Option<PageCacheId> {
+    if kind != FsNodeKind::RegularFile || !supports_page_cache {
         return None;
     }
     Some(PageCacheId::new(node.mount_id, node.ino))
+}
+
+fn page_cache_id_for_node(node: VfsNodeId, kind: FsNodeKind) -> Option<PageCacheId> {
+    page_cache_id_for_node_with_support(node, kind, mount_supports_page_cache(node.mount_id))
 }
 
 pub(crate) fn invalidate_regular_file_read_cache(node: VfsNodeId, kind: FsNodeKind) {
@@ -831,6 +839,8 @@ pub(crate) struct VfsFile {
     offset: SleepMutex<usize>,
     read_snapshot: SleepMutex<Option<Vec<u8>>>,
     read_snapshot_supported: bool,
+    supports_page_cache: bool,
+    supports_dirty_writeback: bool,
     readable: bool,
     writable: bool,
     status_flags: StatusFlagsCell,
@@ -857,6 +867,8 @@ impl VfsFile {
             mount.supports_read_snapshot(node.ino)
         })
         .unwrap_or(false);
+        let supports_page_cache = mount_supports_page_cache(node.mount_id);
+        let supports_dirty_writeback = mount_supports_dirty_writeback(node.mount_id);
         track_writable_regular_open(node, kind, writable);
         let file = Self {
             node,
@@ -867,6 +879,8 @@ impl VfsFile {
             offset: SleepMutex::new(0),
             read_snapshot: SleepMutex::new(None),
             read_snapshot_supported,
+            supports_page_cache,
+            supports_dirty_writeback,
             readable,
             writable,
             status_flags: StatusFlagsCell::new(status_flags),
@@ -908,7 +922,7 @@ impl VfsFile {
         }
         *self.read_snapshot.lock() = None;
         if buf.len() > 0 {
-            invalidate_regular_file_read_cache(self.node, self.kind);
+            self.invalidate_read_cache();
         }
         let mut total_write_size = 0usize;
         perf::record_vfs_write_user_buffer(buf.buffers.len());
@@ -970,7 +984,7 @@ impl VfsFile {
             let mut cached_dirty = false;
             if can_cache_dirty_write(
                 self.kind,
-                self.node.mount_id,
+                self.supports_dirty_writeback,
                 chunk_offset,
                 chunk.len(),
                 self.status_flags.get(),
@@ -1184,6 +1198,20 @@ impl VfsFile {
         });
     }
 
+    fn cached_page_cache_id(&self) -> Option<PageCacheId> {
+        page_cache_id_for_node_with_support(self.node, self.kind, self.supports_page_cache)
+    }
+
+    fn invalidate_read_cache(&self) {
+        let Some(id) = self.cached_page_cache_id() else {
+            return;
+        };
+        let (removed, scanned) = PAGE_CACHE
+            .exclusive_access()
+            .invalidate_clean_unreferenced(id);
+        perf::record_vfs_read_cache_invalidation(removed, scanned);
+    }
+
     fn seek_data_or_hole(&self, offset: usize, seek_hole: bool) -> FsResult<usize> {
         if self.kind != FsNodeKind::RegularFile {
             return Err(FsError::IllegalSeek);
@@ -1291,7 +1319,7 @@ impl VfsFile {
             perf::record_vfs_read_cache_skip_dirty_pages();
             return None;
         }
-        let id = page_cache_id_for_node(self.node, self.kind);
+        let id = self.cached_page_cache_id();
         if id.is_some() {
             perf::record_vfs_read_cache_eligible();
         }
@@ -2018,7 +2046,7 @@ impl File for VfsFile {
         }
         *self.read_snapshot.lock() = None;
         if !buf.is_empty() {
-            invalidate_regular_file_read_cache(self.node, self.kind);
+            self.invalidate_read_cache();
         }
         self.write_at_chunks(offset, buf)
     }
@@ -2026,7 +2054,7 @@ impl File for VfsFile {
     fn supports_aligned_user_buffer_write_at(&self, offset: usize, len: usize) -> bool {
         can_cache_dirty_write(
             self.kind,
-            self.node.mount_id,
+            self.supports_dirty_writeback,
             offset,
             len,
             self.status_flags.get(),
@@ -2040,7 +2068,7 @@ impl File for VfsFile {
         }
         self.check_write_at(offset, len)?;
         *self.read_snapshot.lock() = None;
-        invalidate_regular_file_read_cache(self.node, self.kind);
+        self.invalidate_read_cache();
         let mut pressure_retried = false;
         loop {
             match cache_dirty_regular_user_buffer_write(self.node, offset, &buf) {
@@ -2065,7 +2093,7 @@ impl File for VfsFile {
         }
         self.check_set_len(len)?;
         flush_dirty_regular_file(self.node)?;
-        invalidate_regular_file_read_cache(self.node, self.kind);
+        self.invalidate_read_cache();
         with_mount(self.node.mount_id, |mount| {
             mount.set_len(self.node.ino, len as u64)
         })
@@ -2081,7 +2109,7 @@ impl File for VfsFile {
         }
         self.check_write_at(offset, len)?;
         flush_dirty_regular_file(self.node)?;
-        invalidate_regular_file_read_cache(self.node, self.kind);
+        self.invalidate_read_cache();
         with_mount(self.node.mount_id, |mount| {
             mount.allocate_range(self.node.ino, offset as u64, len as u64, keep_size)
         })
@@ -2097,7 +2125,7 @@ impl File for VfsFile {
         }
         self.check_write_at(offset, len)?;
         flush_dirty_regular_file(self.node)?;
-        invalidate_regular_file_read_cache(self.node, self.kind);
+        self.invalidate_read_cache();
         with_mount(self.node.mount_id, |mount| {
             mount.zero_range(self.node.ino, offset as u64, len as u64, keep_size)
         })
@@ -2117,7 +2145,7 @@ impl File for VfsFile {
             return Err(FsError::PermissionDenied);
         }
         flush_dirty_regular_file(self.node)?;
-        invalidate_regular_file_read_cache(self.node, self.kind);
+        self.invalidate_read_cache();
         with_mount(self.node.mount_id, |mount| {
             mount.punch_hole(self.node.ino, offset as u64, len as u64)
         })
@@ -2329,7 +2357,7 @@ impl File for VfsFile {
     }
 
     fn page_cache_id(&self) -> Option<PageCacheId> {
-        page_cache_id_for_node(self.node, self.kind)
+        page_cache_id_for_node_with_support(self.node, self.kind, self.supports_page_cache)
     }
 
     fn status_flags(&self) -> OpenFlags {
