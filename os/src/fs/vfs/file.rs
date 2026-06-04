@@ -37,6 +37,7 @@ use lazy_static::lazy_static;
 const VFS_WRITE_CHUNK_SIZE: usize = 64 * 1024;
 const VFS_READ_CHUNK_SIZE: usize = 64 * 1024;
 const VFS_READ_ALL_CHUNK_SIZE: usize = 64 * 1024;
+const VFS_DIRENT_SCRATCH_MAX: usize = 4 * 1024;
 const VFS_READ_CACHE_MAX_FILE_SIZE: usize = 1024 * 1024;
 const VFS_READ_CACHE_READAHEAD_PAGES: usize = VFS_READ_CHUNK_SIZE / PAGE_SIZE;
 const VFS_DIRTY_WRITEBACK_MAX_WRITE_SIZE: usize = 64 * 1024;
@@ -2194,7 +2195,8 @@ impl File for VfsFile {
             return Err(FsError::NotDir);
         }
         let mut offset = self.offset.lock();
-        let mut kernel_buf = vec![0u8; user_buf.len()];
+        let user_buf_len = user_buf.len();
+        let mut kernel_buf = vec![0u8; user_buf_len.min(VFS_DIRENT_SCRATCH_MAX)];
         let current_offset = *offset as u64;
         let (read_size, next_offset) = if current_offset >= SYNTHETIC_DIRENT_OFFSET_BASE {
             self.read_synthetic_dirent64(
@@ -2215,6 +2217,7 @@ impl File for VfsFile {
                 (read_size, next_offset)
             }
         };
+        perf::record_vfs_dirent_read(user_buf_len, kernel_buf.len(), read_size);
         if read_size == 0 {
             return Ok(0);
         }

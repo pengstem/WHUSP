@@ -92,6 +92,11 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) vfs_visible_path_updates: usize,
     pub(crate) vfs_visible_path_allocs: usize,
     pub(crate) vfs_parent_cursor_clones: usize,
+    pub(crate) vfs_dirent_read_calls: usize,
+    pub(crate) vfs_dirent_user_buffer_bytes: usize,
+    pub(crate) vfs_dirent_scratch_bytes: usize,
+    pub(crate) vfs_dirent_returned_bytes: usize,
+    pub(crate) vfs_dirent_max_scratch_bytes: usize,
     pub(crate) procfs_content_builds: usize,
     pub(crate) procfs_content_bytes: usize,
     pub(crate) procfs_snapshot_hits: usize,
@@ -333,6 +338,11 @@ mod enabled {
     static VFS_VISIBLE_PATH_UPDATES: AtomicUsize = AtomicUsize::new(0);
     static VFS_VISIBLE_PATH_ALLOCS: AtomicUsize = AtomicUsize::new(0);
     static VFS_PARENT_CURSOR_CLONES: AtomicUsize = AtomicUsize::new(0);
+    static VFS_DIRENT_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static VFS_DIRENT_USER_BUFFER_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static VFS_DIRENT_SCRATCH_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static VFS_DIRENT_RETURNED_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static VFS_DIRENT_MAX_SCRATCH_BYTES: AtomicUsize = AtomicUsize::new(0);
     static PROCFS_CONTENT_BUILDS: AtomicUsize = AtomicUsize::new(0);
     static PROCFS_CONTENT_BYTES: AtomicUsize = AtomicUsize::new(0);
     static PROCFS_SNAPSHOT_HITS: AtomicUsize = AtomicUsize::new(0);
@@ -720,6 +730,18 @@ mod enabled {
 
     pub(crate) fn record_vfs_visible_path_allocation() {
         VFS_VISIBLE_PATH_ALLOCS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_vfs_dirent_read(
+        user_buffer_bytes: usize,
+        scratch_bytes: usize,
+        returned_bytes: usize,
+    ) {
+        VFS_DIRENT_READ_CALLS.fetch_add(1, Ordering::Relaxed);
+        VFS_DIRENT_USER_BUFFER_BYTES.fetch_add(user_buffer_bytes, Ordering::Relaxed);
+        VFS_DIRENT_SCRATCH_BYTES.fetch_add(scratch_bytes, Ordering::Relaxed);
+        VFS_DIRENT_RETURNED_BYTES.fetch_add(returned_bytes, Ordering::Relaxed);
+        update_max(&VFS_DIRENT_MAX_SCRATCH_BYTES, scratch_bytes);
     }
 
     pub(crate) fn record_procfs_content_build(bytes: usize) {
@@ -1257,6 +1279,11 @@ mod enabled {
             vfs_visible_path_updates: VFS_VISIBLE_PATH_UPDATES.load(Ordering::Relaxed),
             vfs_visible_path_allocs: VFS_VISIBLE_PATH_ALLOCS.load(Ordering::Relaxed),
             vfs_parent_cursor_clones: VFS_PARENT_CURSOR_CLONES.load(Ordering::Relaxed),
+            vfs_dirent_read_calls: VFS_DIRENT_READ_CALLS.load(Ordering::Relaxed),
+            vfs_dirent_user_buffer_bytes: VFS_DIRENT_USER_BUFFER_BYTES.load(Ordering::Relaxed),
+            vfs_dirent_scratch_bytes: VFS_DIRENT_SCRATCH_BYTES.load(Ordering::Relaxed),
+            vfs_dirent_returned_bytes: VFS_DIRENT_RETURNED_BYTES.load(Ordering::Relaxed),
+            vfs_dirent_max_scratch_bytes: VFS_DIRENT_MAX_SCRATCH_BYTES.load(Ordering::Relaxed),
             procfs_content_builds: PROCFS_CONTENT_BUILDS.load(Ordering::Relaxed),
             procfs_content_bytes: PROCFS_CONTENT_BYTES.load(Ordering::Relaxed),
             procfs_snapshot_hits: PROCFS_SNAPSHOT_HITS.load(Ordering::Relaxed),
@@ -1511,6 +1538,11 @@ mod enabled {
          vfs_visible_path_updates {}\n\
          vfs_visible_path_allocs {}\n\
          vfs_parent_cursor_clones {}\n\
+         vfs_dirent_read_calls {}\n\
+         vfs_dirent_user_buffer_bytes {}\n\
+         vfs_dirent_scratch_bytes {}\n\
+         vfs_dirent_returned_bytes {}\n\
+         vfs_dirent_max_scratch_bytes {}\n\
          procfs_content_builds {}\n\
          procfs_content_bytes {}\n\
          procfs_snapshot_hits {}\n\
@@ -1739,6 +1771,11 @@ mod enabled {
             stats.vfs_visible_path_updates,
             stats.vfs_visible_path_allocs,
             stats.vfs_parent_cursor_clones,
+            stats.vfs_dirent_read_calls,
+            stats.vfs_dirent_user_buffer_bytes,
+            stats.vfs_dirent_scratch_bytes,
+            stats.vfs_dirent_returned_bytes,
+            stats.vfs_dirent_max_scratch_bytes,
             stats.procfs_content_builds,
             stats.procfs_content_bytes,
             stats.procfs_snapshot_hits,
@@ -2082,6 +2119,14 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_vfs_visible_path_allocation() {}
+
+    #[inline(always)]
+    pub(crate) fn record_vfs_dirent_read(
+        _user_buffer_bytes: usize,
+        _scratch_bytes: usize,
+        _returned_bytes: usize,
+    ) {
+    }
 
     #[inline(always)]
     pub(crate) fn record_procfs_content_build(_bytes: usize) {}
