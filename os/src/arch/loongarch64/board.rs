@@ -77,6 +77,7 @@ struct BoardConfig {
     // in-kernel net stack consumes it today.
     #[allow(dead_code)]
     net: Option<IrqDevice>,
+    rtc_base: usize,
     mmio_regions: [MmioRange; MMIO_REGION_CAPACITY],
     mmio_region_count: usize,
 }
@@ -101,6 +102,7 @@ impl BoardConfig {
             keyboard: None,
             mouse: None,
             net: None,
+            rtc_base: 0,
             mmio_regions: [MmioRange { base: 0, size: 0 }; MMIO_REGION_CAPACITY],
             mmio_region_count: 0,
         }
@@ -425,6 +427,12 @@ pub fn init_from_dtb(dtb_addr: usize) {
         push_mmio_region(&mut config, ecam);
     }
 
+    if let Some(rtc_node) = fdt.find_compatible(&["loongson,ls7a-rtc"]) {
+        let rtc_range = first_reg(rtc_node, "LS7A RTC");
+        config.rtc_base = rtc_range.base;
+        push_mmio_region(&mut config, rtc_range);
+    }
+
     assert_ne!(config.block_count, 0, "DTB is missing virtio block device");
     assert_ne!(config.uart.base, 0, "DTB is missing uart base");
 
@@ -450,6 +458,10 @@ pub fn uart_base() -> usize {
     } else {
         phys_to_virt(EARLY_UART_BASE)
     }
+}
+
+pub fn rtc_base() -> usize {
+    board_config().rtc_base
 }
 
 // CONTEXT: LA external-IRQ wiring is not implemented (no LA equivalent of the

@@ -21,8 +21,26 @@ const TIMER_INTERRUPTS_PER_SEC: usize = 1000;
 const MSEC_PER_SEC: usize = 1000;
 const USEC_PER_SEC: usize = 1_000_000;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
+const NSEC_PER_TENTH_SEC: u64 = 100_000_000;
+
+const LS7A_TOY_READ0: usize = 0x2c;
+const LS7A_TOY_READ1: usize = 0x30;
+const LS7A_RTC_CTRL: usize = 0x40;
+const LS7A_RTC_CTRL_OSC_ENABLE: u32 = 1 << 8;
+const LS7A_RTC_CTRL_TOY_ENABLE: u32 = 1 << 11;
 
 static EPOCH_OFFSET_NS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+struct LoongsonToyTime {
+    year_since_1900: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    tenth_second: u32,
+}
 
 pub fn monotonic_time_sec_nsec() -> (u64, u32) {
     let ticks = Time::read() as u64;
@@ -43,11 +61,15 @@ pub fn monotonic_time_nanos() -> u64 {
 }
 
 pub fn init_wall_clock() {
-    // UNFINISHED: LoongArch RTC discovery not yet implemented
-    // CONTEXT: Until platform RTC probing seeds EPOCH_OFFSET_NS, wall-clock
-    // syscalls use monotonic time with a zero epoch offset or a value supplied
-    // later through set_wall_time_nanos().
-    let _ = &EPOCH_OFFSET_NS;
+    let base = crate::board::rtc_base();
+    if base == 0 {
+        return;
+    }
+    let Some(rtc_nanos) = read_ls7a_toy_time(base).and_then(LoongsonToyTime::to_unix_nanos) else {
+        return;
+    };
+    let offset = rtc_nanos.wrapping_sub(monotonic_time_nanos());
+    EPOCH_OFFSET_NS.store(offset, core::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn wall_time_nanos() -> u64 {
@@ -62,6 +84,109 @@ pub fn set_wall_time_nanos(wall_nanos: u64) {
     let offset = wall_nanos.wrapping_sub(monotonic_time_nanos());
     EPOCH_OFFSET_NS.store(offset, core::sync::atomic::Ordering::Relaxed);
     crate::vdso::refresh_wall_time_offset(offset);
+}
+
+fn read_ls7a_toy_time(base: usize) -> Option<LoongsonToyTime> {
+    let ctrl = read_mmio_u32(base + LS7A_RTC_CTRL);
+    write_mmio_u32(
+        base + LS7A_RTC_CTRL,
+        ctrl | LS7A_RTC_CTRL_OSC_ENABLE | LS7A_RTC_CTRL_TOY_ENABLE,
+    );
+
+    // CONTEXT: QEMU's LS7A RTC follows the Linux driver layout: TOY_READ0
+    // carries month/day/time fields and TOY_READ1 carries `tm_year`.
+    let year_before = read_mmio_u32(base + LS7A_TOY_READ1);
+    let mut low = read_mmio_u32(base + LS7A_TOY_READ0);
+    let mut year = read_mmio_u32(base + LS7A_TOY_READ1);
+    if year_before != year {
+        low = read_mmio_u32(base + LS7A_TOY_READ0);
+        year = read_mmio_u32(base + LS7A_TOY_READ1);
+    }
+
+    LoongsonToyTime {
+        year_since_1900: year,
+        month: (low >> 26) & 0x3f,
+        day: (low >> 21) & 0x1f,
+        hour: (low >> 16) & 0x1f,
+        minute: (low >> 10) & 0x3f,
+        second: (low >> 4) & 0x3f,
+        tenth_second: low & 0x0f,
+    }
+    .valid()
+}
+
+fn read_mmio_u32(addr: usize) -> u32 {
+    unsafe { core::ptr::read_volatile(addr as *const u32) }
+}
+
+fn write_mmio_u32(addr: usize, value: u32) {
+    unsafe {
+        core::ptr::write_volatile(addr as *mut u32, value);
+    }
+}
+
+impl LoongsonToyTime {
+    fn valid(self) -> Option<Self> {
+        let year = self.year_since_1900.checked_add(1900)?;
+        if year < 1970
+            || !(1..=12).contains(&self.month)
+            || self.day == 0
+            || self.day > days_in_month(year, self.month)
+            || self.hour > 23
+            || self.minute > 59
+            || self.second > 59
+            || self.tenth_second > 9
+        {
+            return None;
+        }
+        Some(self)
+    }
+
+    fn to_unix_nanos(self) -> Option<u64> {
+        let year = self.year_since_1900.checked_add(1900)?;
+        let days = days_from_civil(year as i64, self.month, self.day);
+        if days < 0 {
+            return None;
+        }
+        let seconds = (days as u64)
+            .saturating_mul(86_400)
+            .saturating_add((self.hour as u64) * 3_600)
+            .saturating_add((self.minute as u64) * 60)
+            .saturating_add(self.second as u64);
+        Some(
+            seconds
+                .saturating_mul(NSEC_PER_SEC)
+                .saturating_add((self.tenth_second as u64) * NSEC_PER_TENTH_SEC),
+        )
+    }
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: u32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let adjusted_year = year - if month <= 2 { 1 } else { 0 };
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let month_prime = (if month > 2 { month - 3 } else { month + 9 }) as i64;
+    let day_of_year = (153 * month_prime + 2) / 5 + day as i64 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 pub fn get_time() -> usize {
