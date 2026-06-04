@@ -1155,6 +1155,11 @@ fn fanotify_notify_file_at(
     event_mask: u64,
     event_path: Option<&str>,
 ) {
+    let live_groups = live_fanotify_groups();
+    if live_groups.is_empty() {
+        perf::record_fanotify_no_live_group_fast_path();
+        return;
+    }
     if file.suppresses_fanotify() {
         return;
     }
@@ -1169,11 +1174,6 @@ fn fanotify_notify_file_at(
     };
     let parent = file.vfs_parent_node_id();
     let is_dir = file.working_dir().is_some();
-    let live_groups = live_fanotify_groups();
-    if live_groups.is_empty() {
-        perf::record_fanotify_no_live_group_fast_path();
-        return;
-    }
     if let Some(path) = event_path {
         remember_node_name(node, path);
     }

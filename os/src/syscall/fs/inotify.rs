@@ -615,16 +615,16 @@ fn publish_file_event(
     event_mask: u32,
     event_path: Option<&str>,
 ) {
-    let Some(node) = file.vfs_node_id() else {
-        return;
-    };
-    let parent = file.vfs_parent_node_id();
-    let is_dir = file.working_dir().is_some();
     let live_groups = live_inotify_groups();
     if live_groups.is_empty() {
         perf::record_inotify_no_live_group_fast_path();
         return;
     }
+    let Some(node) = file.vfs_node_id() else {
+        return;
+    };
+    let parent = file.vfs_parent_node_id();
+    let is_dir = file.working_dir().is_some();
     if let Some(path) = event_path {
         remember_node_name(node, path);
     }
@@ -644,6 +644,11 @@ fn publish_child_event(
     path: &str,
     cookie: u32,
 ) {
+    let live_groups = live_inotify_groups();
+    if live_groups.is_empty() {
+        perf::record_inotify_no_live_group_fast_path();
+        return;
+    }
     let Some(node) = file.vfs_node_id() else {
         return;
     };
@@ -651,11 +656,6 @@ fn publish_child_event(
         return;
     };
     let is_dir = file.working_dir().is_some();
-    let live_groups = live_inotify_groups();
-    if live_groups.is_empty() {
-        perf::record_inotify_no_live_group_fast_path();
-        return;
-    }
     remember_node_name(node, path);
     let name = path_basename(path).map(String::from);
 
@@ -673,12 +673,17 @@ fn publish_child_event(
 }
 
 fn publish_self_event(file: &Arc<dyn File + Send + Sync>, event_mask: u32) {
+    let live_groups = live_inotify_groups();
+    if live_groups.is_empty() {
+        perf::record_inotify_no_live_group_fast_path();
+        return;
+    }
     let Some(node) = file.vfs_node_id() else {
         return;
     };
     let is_dir = file.working_dir().is_some();
 
-    for group in live_inotify_groups() {
+    for group in live_groups {
         group.publish(node, None, event_mask, is_dir, 0, None, true);
     }
 }
