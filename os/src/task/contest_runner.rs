@@ -1,13 +1,14 @@
-use alloc::{format, string::String};
+use alloc::string::String;
 
-const LTP_CASE_WHITELIST_TEXT: &str = include_str!("ltp_whitelist.txt");
-
-// CONTEXT: The judge-facing runner emits libc-suffixed marker groups. Keep
-// both roots here even when a disk script has a per-libc exception.
+// CONTEXT: The script-disk exporter reads these plan constants and bakes the
+// run/skip sequence into `/x1/entry.sh`. The kernel runtime only selects the
+// architecture and invokes that generated entry point.
+#[allow(dead_code)]
 const TEST_LIBCS: &[&str] = &["/glibc", "/musl"];
 // CONTEXT: Search the manifests that contain the current whitelist, ordered by
 // duplicate-resolution priority. The generated script disk uses this same list
 // for whitelist export and runtime filter scans.
+#[allow(dead_code)]
 const LTP_RUNTEST_MANIFESTS: &[&str] = &[
     "syscalls",
     "syscalls-ipc",
@@ -41,8 +42,9 @@ const PERF_COUNTER_DUMP_COMMAND: &str = "; echo '#### KERNEL PERF START ####'; /
 #[cfg(not(feature = "perf-counters"))]
 const PERF_COUNTER_DUMP_COMMAND: &str = "";
 
-// CONTEXT: `ALL_TESTS` is the marker universe. Disabled groups still emit
-// START/END pairs from the script disk so scorer logs stay aligned.
+// CONTEXT: `ALL_TESTS` is the marker universe baked into the generated script
+// disk. Disabled groups still emit START/END pairs so scorer logs stay aligned.
+#[allow(dead_code)]
 const ALL_TESTS: &[&str] = &[
     "basic_testcode.sh",
     "busybox_testcode.sh",
@@ -57,9 +59,9 @@ const ALL_TESTS: &[&str] = &[
     "netperf_testcode.sh",
 ];
 
-// CONTEXT: This remains the kernel-owned default group selection. The script
-// disk receives it through WHUSP_TEST_SCRIPTS and prints skipped markers for
-// groups not listed here.
+// CONTEXT: This remains the source of truth for script-disk generation. The
+// generated entry script hardcodes the resulting run/skip sequence instead of
+// rechecking the list before every group at runtime.
 const TEST_SCRIPTS: &[&str] = &[
     "basic_testcode.sh",
     "busybox_testcode.sh",
@@ -82,8 +84,10 @@ const TEST_SCRIPTS: &[&str] = &[
 /// Some("range:<start>,<end>") runs cases in the lexicographic half-open range
 /// [start, end). Empty range bounds are unbounded.
 // CONTEXT: Non-None filters are development slices. They narrow LTP case
-// execution while leaving outer group markers intact, so always check this
-// constant before treating a score log as submission-wide evidence.
+// execution in the generated script disk while leaving outer group markers
+// intact, so always check this constant before treating a score log as
+// submission-wide evidence.
+#[allow(dead_code)]
 const LTP_CASE_FILTER_OPTION: Option<&str> = None;
 
 #[cfg(target_arch = "riscv64")]
@@ -97,40 +101,9 @@ pub(super) fn build_runner_command() -> String {
     }
 
     let mut command = String::new();
-    // These exports are the ABI between the kernel-built command line and the
-    // mounted script disk. Rename them only together with `/x1/entry.sh` and
-    // the host-side scorer expectations.
+    // Keep the runtime ABI narrow: test selection, libc order, LTP manifests,
+    // and filters are consumed by the host-side script exporter.
     append_export(&mut command, "WHUSP_ARCH", RUNNER_ARCH);
-    append_export(
-        &mut command,
-        "WHUSP_ALL_TESTS",
-        joined_words(ALL_TESTS).as_str(),
-    );
-    append_export(
-        &mut command,
-        "WHUSP_TEST_SCRIPTS",
-        joined_words(TEST_SCRIPTS).as_str(),
-    );
-    append_export(
-        &mut command,
-        "WHUSP_TEST_LIBCS",
-        joined_words(TEST_LIBCS).as_str(),
-    );
-    append_export(
-        &mut command,
-        "WHUSP_LTP_MANIFESTS",
-        joined_words(LTP_RUNTEST_MANIFESTS).as_str(),
-    );
-    append_export(
-        &mut command,
-        "WHUSP_LTP_FILTER_OPTION",
-        ltp_filter_option_value(),
-    );
-    append_export(
-        &mut command,
-        "WHUSP_LTP_WHITELIST_LEN",
-        format!("{}", ltp_case_whitelist_len()).as_str(),
-    );
     // Keep a missing script disk visible in the serial log and still run the
     // final sync/reboot path; otherwise a host-side x1 wiring problem looks
     // like an in-kernel test hang.
@@ -150,44 +123,16 @@ fn interactive_shell_command() -> String {
     "/musl/busybox mkdir -p /tmp/bin && /musl/busybox --install -s /tmp/bin; export PATH=/tmp/bin:/musl:/glibc:$PATH && cd /musl && exec /musl/busybox sh".into()
 }
 
-fn ltp_filter_option_value() -> &'static str {
-    match LTP_CASE_FILTER_OPTION {
-        Some(option) => option,
-        None => "None",
-    }
-}
-
-fn ltp_case_whitelist_len() -> usize {
-    LTP_CASE_WHITELIST_TEXT
-        .lines()
-        .filter(|line| {
-            let line = line.trim();
-            !line.is_empty() && !line.starts_with('#')
-        })
-        .count()
-}
-
 fn append_export(command: &mut String, key: &str, value: &str) {
     if !command.is_empty() {
         command.push_str("; ");
     }
-    // Values include manifest lists, filters, and whitespace-separated script
-    // names, so every runner export must pass through shell_quote().
+    // Keep quoting centralized so future runtime exports cannot accidentally
+    // introduce shell syntax through the kernel-built command line.
     command.push_str("export ");
     command.push_str(key);
     command.push('=');
     command.push_str(shell_quote(value).as_str());
-}
-
-fn joined_words(words: &[&str]) -> String {
-    let mut output = String::new();
-    for word in words {
-        if !output.is_empty() {
-            output.push(' ');
-        }
-        output.push_str(word);
-    }
-    output
 }
 
 fn shell_quote(value: &str) -> String {

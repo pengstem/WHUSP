@@ -105,6 +105,16 @@ def rust_const_value(source: str, const_name: str) -> str:
     return " ".join(match.group(1).split())
 
 
+def rust_option_string_value(source: str, const_name: str) -> str:
+    expression = rust_const_value(source, const_name)
+    if expression == "None":
+        return "None"
+    match = re.fullmatch(r'Some\("((?:\\.|[^"\\])*)"\)', expression)
+    if not match:
+        raise ValueError(f"unsupported Rust string option {const_name}: {expression}")
+    return rust_string(match.group(1))
+
+
 def iter_manifest_entries(path: Path):
     for line_no, raw in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
         line = raw.strip()
@@ -212,82 +222,145 @@ def acquire_output_lock(path: Path):
     return lock_file
 
 
+def shell_script(body: str) -> str:
+    return "#!/musl/busybox sh\n" + body
+
+
+def static_shim_scripts() -> dict[str, str]:
+    shims: dict[str, str] = {}
+
+    noop = shell_script("exit 0\n")
+    for cmd in ("useradd", "userdel", "groupdel", "mkfs.xfs", "mkfs.ext2", "exportfs"):
+        shims[cmd] = noop
+    for cmd in ("ns-icmp_redirector", "ns-udpsender"):
+        shims[cmd] = noop
+
+    shims["mkfs.ext4"] = shell_script(
+        'if [ "$1" = "-V" ]; then echo "mke2fs 1.46.5"; exit 0; fi\n'
+        "exit 0\n"
+    )
+    shims["e4crypt"] = shell_script(
+        'if [ "$1" = "add_key" ] && [ -n "$2" ]; then '
+        '/musl/busybox touch "$2/.whusp_e4crypt_encrypted"; exit $?; fi\n'
+        "exit 1\n"
+    )
+    shims["quotacheck"] = shell_script(
+        'for arg in "$@"; do mountpoint="$arg"; done\n'
+        '[ -n "$mountpoint" ] || exit 1\n'
+        '/musl/busybox touch "$mountpoint/aquota.user" "$mountpoint/aquota.group"\n'
+        "exit $?\n"
+    )
+    shims["netstat"] = shell_script(
+        'case "$1" in -s|-rn|-i|-gn|-apn) exit 0;; esac\n'
+        'exec /musl/busybox netstat "$@"\n'
+    )
+    shims["ethtool"] = shell_script(
+        'if [ "$1" = "--show-features" ]; then echo "busy-poll: on"; fi\n'
+        "exit 0\n"
+    )
+    shims["ip"] = shell_script(
+        'if [ "$1" = "neigh" ] && [ "$2" = "show" ]; then '
+        '[ -f /tmp/whusp_neigh_deleted ] || echo "10.0.0.1 dev ltp_ns_veth2 lladdr 02:00:00:00:00:0a REACHABLE"; exit 0; fi\n'
+        'if [ "$1" = "neigh" ] && [ "$2" = "del" ]; then '
+        "/musl/busybox touch /tmp/whusp_neigh_deleted; exit 0; fi\n"
+        'if [ "$1" = "addr" ] && [ "$2" = "show" ] && [ -f /tmp/whusp_ifconfig_addr ]; then '
+        'addr=$(/musl/busybox cat /tmp/whusp_ifconfig_addr); echo "2: ltp_ns_veth2: <BROADCAST,UP> mtu 1500"; '
+        'echo "    inet $addr/24 scope global ltp_ns_veth2:1"; exit 0; fi\n'
+        'if [ "$1" = "link" ] && [ "$2" = "set" ]; then exit 0; fi\n'
+        'if [ "$1" = "route" ] && [ "$2" = "flush" ]; then exit 0; fi\n'
+        'if [ "$1" = "addr" ] && [ "$2" = "flush" ]; then '
+        "/musl/busybox rm -f /tmp/whusp_ifconfig_addr; exit 0; fi\n"
+        'if [ "$1" = "xfrm" ] && [ "$3" = "flush" ]; then exit 0; fi\n'
+        'if [ "$1" = "route" ] && [ "$2" = "add" ]; then exit 0; fi\n'
+        'if [ "$1" = "route" ] && [ "$2" = "del" ]; then exit 0; fi\n'
+        'exec /musl/busybox ip "$@"\n'
+    )
+    shims["arp"] = shell_script(
+        'if [ "$1" = "-an" ]; then '
+        '[ -f /tmp/whusp_neigh_deleted ] || echo "? (10.0.0.1) at 02:00:00:00:00:0a [ether] on ltp_ns_veth2"; exit 0; fi\n'
+        'if [ "$1" = "-d" ]; then /musl/busybox touch /tmp/whusp_neigh_deleted; exit 0; fi\n'
+        'exec /musl/busybox arp "$@"\n'
+    )
+    shims["arping"] = shell_script(
+        "/musl/busybox rm -f /tmp/whusp_neigh_deleted\n"
+        "exit 0\n"
+    )
+    shims["ifconfig"] = shell_script(
+        'case "$1" in *:*) if [ "$2" = "down" ]; then /musl/busybox rm -f /tmp/whusp_ifconfig_addr; '
+        'else echo "$2" > /tmp/whusp_ifconfig_addr; fi; exit 0;; esac\n'
+        'case "$2" in up|down|mtu|add|del) exit 0;; esac\n'
+        'exec /musl/busybox ifconfig "$@"\n'
+    )
+    shims["route"] = shell_script(
+        'case "$*" in *" add "*|*" del "*) exit 0;; esac\n'
+        'exec /musl/busybox route "$@"\n'
+    )
+    shims["tracepath"] = shell_script(
+        'case "$1" in -V|--version) echo "tracepath whusp"; exit 0;; esac\n'
+        'echo " 1: $1 pmtu 1280 hops 1"\n'
+        "exit 0\n"
+    )
+    shims["ss"] = shell_script(
+        "port=$(/musl/busybox cat /tmp/whusp_testsf_port 2>/dev/null || echo 49152)\n"
+        'echo "LISTEN 0 128 0.0.0.0:$port users:((testsf,pid=1,fd=3))"\n'
+        "exit 0\n"
+    )
+
+    for cmd in ("testsf_s", "testsf_s6"):
+        shims[cmd] = shell_script(
+            'echo "$2" > /tmp/whusp_testsf_port\n'
+            "exit 0\n"
+        )
+    for cmd in ("testsf_c", "testsf_c6"):
+        shims[cmd] = shell_script(
+            '/musl/busybox cp "$4" "$3"\n'
+            "exit $?\n"
+        )
+
+    shims["netstress"] = shell_script(
+        "port=49152\n"
+        "result=\n"
+        "server_dir=\n"
+        'while [ "$#" -gt 0 ]; do\n'
+        'case "$1" in\n'
+        '-B) shift; server_dir="$1";;\n'
+        '-c) shift; result="$1";;\n'
+        '-g) shift; port="$1";;\n'
+        "-h|--help) exit 0;;\n"
+        "esac\n"
+        "shift\n"
+        "done\n"
+        'if [ -n "$server_dir" ]; then /musl/busybox mkdir -p "$server_dir"; echo "$port" > "$server_dir/netstress_port"; exit 0; fi\n'
+        'if [ -n "$result" ]; then dir=$(/musl/busybox dirname "$result"); [ "$dir" = "." ] || /musl/busybox mkdir -p "$dir"; echo 1 > "$result"; exit 0; fi\n'
+        "exit 0\n"
+    )
+    for cmd in ("ping", "ping6", "ns-icmpv4_sender", "ns-icmpv6_sender"):
+        shims[cmd] = shell_script(
+            "/musl/busybox rm -f /tmp/whusp_neigh_deleted\n"
+            "exit 0\n"
+        )
+
+    return shims
+
+
+def write_static_shims(out_dir: Path) -> None:
+    bin_dir = out_dir / "bin"
+    bin_dir.mkdir()
+    for name, script in static_shim_scripts().items():
+        write_executable(bin_dir / name, script)
+
+
+def common_root_relative(relative_common: str) -> str:
+    parent = Path(relative_common).parent
+    if str(parent) == ".":
+        return "."
+    return parent.as_posix()
+
+
 def common_script(manifests: list[str]) -> str:
     manifest_words = " ".join(manifests)
     script = """#!/musl/busybox sh
 # Common guest-side helpers exported from os/src/task/contest_runner.rs.
-
-whusp_setup_runtime_environment() {
-    /musl/busybox mkdir -p /tmp/bin
-    /musl/busybox --install -s /tmp/bin
-    /musl/busybox mkdir -p /bin
-    /musl/busybox ln -sf /musl/busybox /bin/cat
-    for cmd in useradd userdel groupdel mkfs.xfs mkfs.ext2 exportfs; do
-        /musl/busybox rm -f /tmp/bin/$cmd
-        /musl/busybox printf '#!/musl/busybox sh\\nexit 0\\n' > /tmp/bin/$cmd
-        /musl/busybox chmod +x /tmp/bin/$cmd
-    done
-    /musl/busybox rm -f /tmp/bin/mkfs.ext4
-    /musl/busybox printf '#!/musl/busybox sh\\nif [ "$1" = "-V" ]; then echo "mke2fs 1.46.5"; exit 0; fi\\nexit 0\\n' > /tmp/bin/mkfs.ext4
-    /musl/busybox chmod +x /tmp/bin/mkfs.ext4
-    /musl/busybox rm -f /tmp/bin/e4crypt
-    /musl/busybox printf '#!/musl/busybox sh\\nif [ "$1" = "add_key" ] && [ -n "$2" ]; then /musl/busybox touch "$2/.whusp_e4crypt_encrypted"; exit $?; fi\\nexit 1\\n' > /tmp/bin/e4crypt
-    /musl/busybox chmod +x /tmp/bin/e4crypt
-    /musl/busybox rm -f /tmp/bin/quotacheck
-    /musl/busybox printf '#!/musl/busybox sh\\nfor arg in "$@"; do mountpoint="$arg"; done\\n[ -n "$mountpoint" ] || exit 1\\n/musl/busybox touch "$mountpoint/aquota.user" "$mountpoint/aquota.group"\\nexit $?\\n' > /tmp/bin/quotacheck
-    /musl/busybox chmod +x /tmp/bin/quotacheck
-    /musl/busybox rm -f /tmp/bin/netstat
-    /musl/busybox printf '#!/musl/busybox sh\\ncase "$1" in -s|-rn|-i|-gn|-apn) exit 0;; esac\\nexec /musl/busybox netstat "$@"\\n' > /tmp/bin/netstat
-    /musl/busybox chmod +x /tmp/bin/netstat
-    /musl/busybox rm -f /tmp/bin/ethtool
-    /musl/busybox printf '#!/musl/busybox sh\\nif [ "$1" = "--show-features" ]; then echo "busy-poll: on"; fi\\nexit 0\\n' > /tmp/bin/ethtool
-    /musl/busybox chmod +x /tmp/bin/ethtool
-    /musl/busybox rm -f /tmp/bin/ip
-    /musl/busybox printf '#!/musl/busybox sh\\nif [ "$1" = "neigh" ] && [ "$2" = "show" ]; then [ -f /tmp/whusp_neigh_deleted ] || echo "10.0.0.1 dev ltp_ns_veth2 lladdr 02:00:00:00:00:0a REACHABLE"; exit 0; fi\\nif [ "$1" = "neigh" ] && [ "$2" = "del" ]; then /musl/busybox touch /tmp/whusp_neigh_deleted; exit 0; fi\\nif [ "$1" = "addr" ] && [ "$2" = "show" ] && [ -f /tmp/whusp_ifconfig_addr ]; then addr=$(/musl/busybox cat /tmp/whusp_ifconfig_addr); echo "2: ltp_ns_veth2: <BROADCAST,UP> mtu 1500"; echo "    inet $addr/24 scope global ltp_ns_veth2:1"; exit 0; fi\\nif [ "$1" = "link" ] && [ "$2" = "set" ]; then exit 0; fi\\nif [ "$1" = "route" ] && [ "$2" = "flush" ]; then exit 0; fi\\nif [ "$1" = "addr" ] && [ "$2" = "flush" ]; then /musl/busybox rm -f /tmp/whusp_ifconfig_addr; exit 0; fi\\nif [ "$1" = "xfrm" ] && [ "$3" = "flush" ]; then exit 0; fi\\nif [ "$1" = "route" ] && [ "$2" = "add" ]; then exit 0; fi\\nif [ "$1" = "route" ] && [ "$2" = "del" ]; then exit 0; fi\\nexec /musl/busybox ip "$@"\\n' > /tmp/bin/ip
-    /musl/busybox chmod +x /tmp/bin/ip
-    /musl/busybox rm -f /tmp/bin/arp
-    /musl/busybox printf '#!/musl/busybox sh\\nif [ "$1" = "-an" ]; then [ -f /tmp/whusp_neigh_deleted ] || echo "? (10.0.0.1) at 02:00:00:00:00:0a [ether] on ltp_ns_veth2"; exit 0; fi\\nif [ "$1" = "-d" ]; then /musl/busybox touch /tmp/whusp_neigh_deleted; exit 0; fi\\nexec /musl/busybox arp "$@"\\n' > /tmp/bin/arp
-    /musl/busybox chmod +x /tmp/bin/arp
-    /musl/busybox rm -f /tmp/bin/arping
-    /musl/busybox printf '#!/musl/busybox sh\\n/musl/busybox rm -f /tmp/whusp_neigh_deleted\\nexit 0\\n' > /tmp/bin/arping
-    /musl/busybox chmod +x /tmp/bin/arping
-    /musl/busybox rm -f /tmp/bin/ifconfig
-    /musl/busybox printf '#!/musl/busybox sh\\ncase "$1" in *:*) if [ "$2" = "down" ]; then /musl/busybox rm -f /tmp/whusp_ifconfig_addr; else echo "$2" > /tmp/whusp_ifconfig_addr; fi; exit 0;; esac\\ncase "$2" in up|down|mtu|add|del) exit 0;; esac\\nexec /musl/busybox ifconfig "$@"\\n' > /tmp/bin/ifconfig
-    /musl/busybox chmod +x /tmp/bin/ifconfig
-    /musl/busybox rm -f /tmp/bin/route
-    /musl/busybox printf '#!/musl/busybox sh\\ncase "$*" in *" add "*|*" del "*) exit 0;; esac\\nexec /musl/busybox route "$@"\\n' > /tmp/bin/route
-    /musl/busybox chmod +x /tmp/bin/route
-    /musl/busybox rm -f /tmp/bin/tracepath
-    /musl/busybox printf '#!/musl/busybox sh\\ncase "$1" in -V|--version) echo "tracepath whusp"; exit 0;; esac\\necho " 1: $1 pmtu 1280 hops 1"\\nexit 0\\n' > /tmp/bin/tracepath
-    /musl/busybox chmod +x /tmp/bin/tracepath
-    /musl/busybox rm -f /tmp/bin/ss
-    /musl/busybox printf '#!/musl/busybox sh\\nport=$(/musl/busybox cat /tmp/whusp_testsf_port 2>/dev/null || echo 49152)\\necho "LISTEN 0 128 0.0.0.0:$port users:((testsf,pid=1,fd=3))"\\nexit 0\\n' > /tmp/bin/ss
-    /musl/busybox chmod +x /tmp/bin/ss
-    for cmd in testsf_s testsf_s6; do
-        /musl/busybox rm -f /tmp/bin/$cmd
-        /musl/busybox printf '#!/musl/busybox sh\\necho "$2" > /tmp/whusp_testsf_port\\nexit 0\\n' > /tmp/bin/$cmd
-        /musl/busybox chmod +x /tmp/bin/$cmd
-    done
-    for cmd in testsf_c testsf_c6; do
-        /musl/busybox rm -f /tmp/bin/$cmd
-        /musl/busybox printf '#!/musl/busybox sh\\n/musl/busybox cp "$4" "$3"\\nexit $?\\n' > /tmp/bin/$cmd
-        /musl/busybox chmod +x /tmp/bin/$cmd
-    done
-    for cmd in ns-icmp_redirector ns-udpsender; do
-        /musl/busybox rm -f /tmp/bin/$cmd
-        /musl/busybox printf '#!/musl/busybox sh\\nexit 0\\n' > /tmp/bin/$cmd
-        /musl/busybox chmod +x /tmp/bin/$cmd
-    done
-    /musl/busybox rm -f /tmp/bin/netstress
-    /musl/busybox printf '#!/musl/busybox sh\\nport=49152\\nresult=\\nserver_dir=\\nwhile [ "$#" -gt 0 ]; do\\ncase "$1" in\\n-B) shift; server_dir="$1";;\\n-c) shift; result="$1";;\\n-g) shift; port="$1";;\\n-h|--help) exit 0;;\\nesac\\nshift\\ndone\\nif [ -n "$server_dir" ]; then /musl/busybox mkdir -p "$server_dir"; echo "$port" > "$server_dir/netstress_port"; exit 0; fi\\nif [ -n "$result" ]; then dir=$(/musl/busybox dirname "$result"); [ "$dir" = "." ] || /musl/busybox mkdir -p "$dir"; echo 1 > "$result"; exit 0; fi\\nexit 0\\n' > /tmp/bin/netstress
-    /musl/busybox chmod +x /tmp/bin/netstress
-    for cmd in ping ping6 ns-icmpv4_sender ns-icmpv6_sender; do
-        /musl/busybox rm -f /tmp/bin/$cmd
-        /musl/busybox printf '#!/musl/busybox sh\\n/musl/busybox rm -f /tmp/whusp_neigh_deleted\\nexit 0\\n' > /tmp/bin/$cmd
-        /musl/busybox chmod +x /tmp/bin/$cmd
-    done
-    export PATH=/tmp/bin:/musl:/glibc:$PATH
-}
 
 whusp_setup_ltp_environment() {
     : "${LIBC_ROOT:=/musl}"
@@ -365,7 +438,6 @@ whusp_ltp_run_current_case() {
 }
 
 whusp_ltp_run_case() {
-    whusp_setup_runtime_environment
     whusp_setup_ltp_environment
     whusp_ltp_run_current_case
     exit "$ret"
@@ -470,20 +542,21 @@ whusp_ltp_run_manifest_filter() {
 
 
 def source_common(relative_common: str) -> str:
+    root_relative = common_root_relative(relative_common)
     return f"""case "$0" in
     */*) script_dir="${{0%/*}}" ;;
     *) script_dir="." ;;
 esac
+WHUSP_SCRIPT_ROOT="$script_dir/{root_relative}"
 . "$script_dir/{relative_common}"
 """
 
 
-def group_body(arch: str, libc_root: str, script: str) -> str:
+def group_body(arch: str, libc_root: str, script: str, active_filter: str) -> str:
     group = test_name(script)
     libc = libc_label(libc_root)
     if script == "basic_testcode.sh":
-        return f"""whusp_setup_runtime_environment
-cd {sh_quote(libc_root)} || exit 127
+        return f"""cd {sh_quote(libc_root)} || exit 127
 ./busybox echo "#### OS COMP TEST GROUP START basic-{libc} ####"
 cd {sh_quote(libc_root + "/basic")} || exit 127
 ../busybox sh ./run-all.sh
@@ -493,21 +566,23 @@ cd {sh_quote(libc_root)} || exit 127
 exit "$ret"
 """
     if script == "ltp_testcode.sh":
+        if active_filter in ("", "None", "none"):
+            run_ltp = '/musl/busybox sh "$script_dir/../run_ltp_whitelist.sh"'
+        else:
+            run_ltp = "\n".join(
+                [
+                    f"WHUSP_LTP_FILTER_OPTION={sh_quote(active_filter)}",
+                    "export WHUSP_LTP_FILTER_OPTION",
+                    "whusp_ltp_run_manifest_filter",
+                ]
+            )
         return f"""{libc_root}/busybox echo "#### OS COMP TEST GROUP START ltp-{libc} ####"
-case "${{WHUSP_LTP_FILTER_OPTION:-None}}" in
-    ""|None|none)
-        /musl/busybox sh "$script_dir/../run_ltp_whitelist.sh"
-        ;;
-    *)
-        whusp_setup_runtime_environment
-        whusp_ltp_run_manifest_filter
-        ;;
-esac
+{run_ltp}
 {libc_root}/busybox echo "#### OS COMP TEST GROUP END ltp-{libc} ####"
 exit 0
 """
 
-    commands = ["whusp_setup_runtime_environment", f"cd {sh_quote(libc_root)} || exit 127"]
+    commands = [f"cd {sh_quote(libc_root)} || exit 127"]
     if arch == "la" and libc_root == "/musl" and script == "iperf_testcode.sh":
         commands.append("./busybox sed 's/ -i 0 / /g' ./iperf_testcode.sh | ./busybox sh")
     else:
@@ -534,6 +609,7 @@ def group_script(
     index: int,
     enabled: bool,
     runner_skipped: bool,
+    active_filter: str,
 ) -> str:
     return f"""#!/musl/busybox sh
 # Generated from os/src/task/contest_runner.rs.
@@ -544,7 +620,7 @@ def group_script(
 # current_runner_enabled={'yes' if enabled else 'no'}
 # current_runner_skips_this_libc={'yes' if runner_skipped else 'no'}
 
-{source_common('../../../common.sh')}{group_body(arch, libc_root, script)}"""
+{source_common('../../../common.sh')}{group_body(arch, libc_root, script, active_filter)}"""
 
 
 def ltp_case_script(arch: str, libc_root: str, case: LtpCase) -> str:
@@ -635,8 +711,7 @@ def ltp_whitelist_script(arch: str, libc_root: str, cases: list[LtpCase]) -> str
 
 LIBC_ROOT={sh_quote(libc_root)}
 
-{source_common('../../common.sh')}whusp_setup_runtime_environment
-whusp_setup_ltp_environment
+{source_common('../../common.sh')}whusp_setup_ltp_environment
 
 fs_bind_preflight() {{
     unset TST_LIB_LOADED TST_SECURITY_LOADED
@@ -673,9 +748,15 @@ exit "$status"
 """
 
 
+def append_skip_group_marker(lines: list[str], group: str, libc: str) -> None:
+    start = sh_quote(f"#### OS COMP TEST GROUP START {group}-{libc} ####")
+    end = sh_quote(f"#### OS COMP TEST GROUP END {group}-{libc} ####")
+    lines.append(f"echo {start}")
+    lines.append(f"echo {end}")
+
+
 def entry_script(all_tests: list[str], test_scripts: list[str], libc_roots: list[str]) -> str:
-    default_test_scripts = " ".join(test_scripts)
-    default_test_libcs = " ".join(libc_roots)
+    enabled_scripts = set(test_scripts)
     lines = [
         "#!/musl/busybox sh",
         "# Entry point for the generated contest script disk.",
@@ -684,77 +765,35 @@ def entry_script(all_tests: list[str], test_scripts: list[str], libc_roots: list
         '    */*) script_dir="${0%/*}" ;;',
         '    *) script_dir="." ;;',
         "esac",
+        'WHUSP_SCRIPT_ROOT="$script_dir"',
+        'export PATH="$WHUSP_SCRIPT_ROOT/bin:/tmp/bin:/musl:/glibc:$PATH"',
+        "/musl/busybox mkdir -p /tmp/bin /bin",
+        "/musl/busybox --install -s /tmp/bin",
+        "/musl/busybox ln -sf /musl/busybox /bin/cat",
         '. "$script_dir/common.sh"',
         "",
-        f'WHUSP_TEST_SCRIPTS="${{WHUSP_TEST_SCRIPTS:-{default_test_scripts}}}"',
-        f'WHUSP_TEST_LIBCS="${{WHUSP_TEST_LIBCS:-{default_test_libcs}}}"',
         'case "${WHUSP_ARCH:-rv}" in',
         '    la|loongarch64) WHUSP_ARCH="la" ;;',
         '    *) WHUSP_ARCH="rv" ;;',
         "esac",
-        "",
-        "whusp_script_enabled() {",
-        '    case " $WHUSP_TEST_SCRIPTS " in',
-        '        *" $1 "*) return 0 ;;',
-        "        *) return 1 ;;",
-        "    esac",
-        "}",
-        "",
-        "whusp_libc_label() {",
-        '    case "$1" in',
-        '        /musl) echo "musl" ;;',
-        '        /glibc) echo "glibc" ;;',
-        '        *) echo "unknown" ;;',
-        "    esac",
-        "}",
-        "",
-        "whusp_skip_group() {",
-        '    group="$1"',
-        '    libc="$(whusp_libc_label "$2")"',
-        '    echo "#### OS COMP TEST GROUP START $group-$libc ####"',
-        '    echo "#### OS COMP TEST GROUP END $group-$libc ####"',
-        "}",
-        "",
-        "whusp_run_group() {",
-        '    libc="$(whusp_libc_label "$2")"',
-        '    /musl/busybox sh "$script_dir/$WHUSP_ARCH/$libc/groups/$1"',
-        "}",
         "",
     ]
 
     for index, script in enumerate(all_tests):
         name = test_name(script)
         filename = group_filename(index, script)
-        lines.extend(
-            [
-                f"if whusp_script_enabled {script}; then",
-            ]
-        )
-        if script == "libctest_testcode.sh":
-            lines.extend(
-                [
-                    "    whusp_skip_group libctest /glibc",
-                    f"    whusp_run_group {filename} /musl",
-                ]
-            )
+        if script in enabled_scripts:
+            if script == "libctest_testcode.sh":
+                append_skip_group_marker(lines, "libctest", "glibc")
+                lines.append(f'/musl/busybox sh "$script_dir/$WHUSP_ARCH/musl/groups/{filename}"')
+            else:
+                for libc_root in libc_roots:
+                    libc = libc_label(libc_root)
+                    lines.append(f'/musl/busybox sh "$script_dir/$WHUSP_ARCH/{libc}/groups/{filename}"')
         else:
-            lines.extend(
-                [
-                    "    for libc_root in $WHUSP_TEST_LIBCS; do",
-                    f"        whusp_run_group {filename} \"$libc_root\"",
-                    "    done",
-                ]
-            )
-        lines.extend(
-            [
-                "else",
-                "    for libc_root in $WHUSP_TEST_LIBCS; do",
-                f"        whusp_skip_group {name} \"$libc_root\"",
-                "    done",
-                "fi",
-                "",
-            ]
-        )
+            for libc_root in libc_roots:
+                append_skip_group_marker(lines, name, libc_label(libc_root))
+        lines.append("")
     lines.append("exit 0")
     return "\n".join(lines) + "\n"
 
@@ -772,6 +811,7 @@ def _write_outputs_unlocked(
     force: bool,
 ) -> None:
     prepare_out_dir(out_dir, force)
+    write_static_shims(out_dir)
     write_executable(out_dir / "common.sh", common_script(manifests))
     write_executable(out_dir / "entry.sh", entry_script(all_tests, test_scripts, libc_roots))
     manifest_lines = [
@@ -814,7 +854,15 @@ def _write_outputs_unlocked(
                 path = group_dir / group_filename(index, script)
                 write_executable(
                     path,
-                    group_script(arch, libc_root, script, index, enabled, runner_skipped),
+                    group_script(
+                        arch,
+                        libc_root,
+                        script,
+                        index,
+                        enabled,
+                        runner_skipped,
+                        active_filter,
+                    ),
                 )
                 manifest_lines.append(
                     "\t".join(
@@ -883,7 +931,8 @@ Current runner metadata:
 Layout:
 
 - `entry.sh`: script-disk entry point used by the kernel init command.
-- `common.sh`: runtime and LTP helpers mirrored from `contest_runner.rs`.
+- `common.sh`: lightweight runtime and LTP helpers mirrored from `contest_runner.rs`.
+- `bin/`: static guest-side command shims used before BusyBox applets in PATH.
 - `rv/<libc>/groups/*.sh`: all RISC-V group commands for that libc root.
 - `la/<libc>/groups/*.sh`: all LoongArch group commands for that libc root.
 - `rv/<libc>/run_ltp_whitelist.sh`: unified RISC-V LTP whitelist runner.
@@ -946,7 +995,7 @@ def main() -> int:
     libc_roots = rust_string_array(runner_source, "TEST_LIBCS")
     manifests = rust_string_array(runner_source, "LTP_RUNTEST_MANIFESTS")
     whitelist = text_list(whitelist_source, str(WHITELIST_PATH.relative_to(REPO_ROOT)))
-    active_filter = rust_const_value(runner_source, "LTP_CASE_FILTER_OPTION")
+    active_filter = rust_option_string_value(runner_source, "LTP_CASE_FILTER_OPTION")
     interactive_shell = rust_const_value(runner_source, "INTERACTIVE_SHELL")
     ltp_cases = resolve_ltp_cases(manifests, whitelist, args.runtest_dir)
     write_outputs(
