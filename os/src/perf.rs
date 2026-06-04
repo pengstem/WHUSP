@@ -172,6 +172,9 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) usercopy_same_page_read_hits: usize,
     pub(crate) usercopy_same_page_write_hits: usize,
     pub(crate) usercopy_same_page_fast_bytes: usize,
+    pub(crate) usercopy_leaf_pte_cache_hits: usize,
+    pub(crate) usercopy_leaf_pte_cache_misses: usize,
+    pub(crate) usercopy_leaf_pte_cache_invalidations: usize,
     pub(crate) usercopy_slow_paths: usize,
     pub(crate) usercopy_slow_pages: usize,
     pub(crate) usercopy_checked_range_calls: usize,
@@ -402,6 +405,9 @@ mod enabled {
     static USERCOPY_SAME_PAGE_READ_HITS: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_SAME_PAGE_WRITE_HITS: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_SAME_PAGE_FAST_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static USERCOPY_LEAF_PTE_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+    static USERCOPY_LEAF_PTE_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
+    static USERCOPY_LEAF_PTE_CACHE_INVALIDATIONS: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_SLOW_PATHS: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_SLOW_PAGES: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_CHECKED_RANGE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -952,6 +958,18 @@ mod enabled {
         USERCOPY_SAME_PAGE_FAST_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_usercopy_leaf_pte_cache_hit() {
+        USERCOPY_LEAF_PTE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_usercopy_leaf_pte_cache_miss() {
+        USERCOPY_LEAF_PTE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_usercopy_leaf_pte_cache_invalidation() {
+        USERCOPY_LEAF_PTE_CACHE_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_usercopy_slow_path(page_count: usize) {
         USERCOPY_SLOW_PATHS.fetch_add(1, Ordering::Relaxed);
         USERCOPY_SLOW_PAGES.fetch_add(page_count, Ordering::Relaxed);
@@ -1268,6 +1286,10 @@ mod enabled {
             usercopy_same_page_read_hits: USERCOPY_SAME_PAGE_READ_HITS.load(Ordering::Relaxed),
             usercopy_same_page_write_hits: USERCOPY_SAME_PAGE_WRITE_HITS.load(Ordering::Relaxed),
             usercopy_same_page_fast_bytes: USERCOPY_SAME_PAGE_FAST_BYTES.load(Ordering::Relaxed),
+            usercopy_leaf_pte_cache_hits: USERCOPY_LEAF_PTE_CACHE_HITS.load(Ordering::Relaxed),
+            usercopy_leaf_pte_cache_misses: USERCOPY_LEAF_PTE_CACHE_MISSES.load(Ordering::Relaxed),
+            usercopy_leaf_pte_cache_invalidations: USERCOPY_LEAF_PTE_CACHE_INVALIDATIONS
+                .load(Ordering::Relaxed),
             usercopy_slow_paths: USERCOPY_SLOW_PATHS.load(Ordering::Relaxed),
             usercopy_slow_pages: USERCOPY_SLOW_PAGES.load(Ordering::Relaxed),
             usercopy_checked_range_calls: USERCOPY_CHECKED_RANGE_CALLS.load(Ordering::Relaxed),
@@ -1500,6 +1522,9 @@ mod enabled {
          usercopy_same_page_read_hits {}\n\
          usercopy_same_page_write_hits {}\n\
          usercopy_same_page_fast_bytes {}\n\
+         usercopy_leaf_pte_cache_hits {}\n\
+         usercopy_leaf_pte_cache_misses {}\n\
+         usercopy_leaf_pte_cache_invalidations {}\n\
          usercopy_slow_paths {}\n\
          usercopy_slow_pages {}\n\
          usercopy_checked_range_calls {}\n\
@@ -1714,6 +1739,9 @@ mod enabled {
             stats.usercopy_same_page_read_hits,
             stats.usercopy_same_page_write_hits,
             stats.usercopy_same_page_fast_bytes,
+            stats.usercopy_leaf_pte_cache_hits,
+            stats.usercopy_leaf_pte_cache_misses,
+            stats.usercopy_leaf_pte_cache_invalidations,
             stats.usercopy_slow_paths,
             stats.usercopy_slow_pages,
             stats.usercopy_checked_range_calls,
@@ -2100,6 +2128,15 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_usercopy_same_page_fast(_access: UsercopyAccess, _bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_usercopy_leaf_pte_cache_hit() {}
+
+    #[inline(always)]
+    pub(crate) fn record_usercopy_leaf_pte_cache_miss() {}
+
+    #[inline(always)]
+    pub(crate) fn record_usercopy_leaf_pte_cache_invalidation() {}
 
     #[inline(always)]
     pub(crate) fn record_usercopy_slow_path(_page_count: usize) {}

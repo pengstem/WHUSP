@@ -7,6 +7,7 @@ use core::mem::{MaybeUninit, size_of};
 use super::errno::{SysError, SysResult};
 
 const USER_COPY_SAME_PAGE_FAST_MAX: usize = 64;
+const USER_COPY_LEAF_PTE_CACHE: bool = true;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UserBufferAccess {
@@ -75,7 +76,7 @@ pub(crate) fn translated_byte_buffer_checked_with_fault(
     while start < end {
         let start_va = VirtAddr::from(start);
         let mut vpn = start_va.floor();
-        let pte = checked_user_pte(&page_table, token, start, access, fault_handler)?;
+        let pte = checked_user_pte(&page_table, token, start, access, fault_handler, false)?;
         let ppn = pte.ppn();
         vpn.step();
         let mut end_va: VirtAddr = vpn.into();
@@ -97,12 +98,20 @@ fn checked_user_pte(
     addr: usize,
     access: UserBufferAccess,
     fault_handler: Option<UserFaultHandler>,
+    use_leaf_cache: bool,
 ) -> SysResult<crate::mm::PageTableEntry> {
     // Passing a fault handler means the copy is allowed to mutate the current
     // process mappings by resolving lazy mmap/COW faults. Cross-address-space
     // copies should use the explicit MemorySet helpers instead.
     let vpn = VirtAddr::from(addr).floor();
-    let mut pte = match page_table.translate(vpn) {
+    let translate = |page_table: &PageTable| {
+        if use_leaf_cache {
+            page_table.translate_cached_user_leaf(token, vpn)
+        } else {
+            page_table.translate(vpn)
+        }
+    };
+    let mut pte = match translate(page_table) {
         Some(pte) => pte,
         None => {
             let Some(fault_handler) = fault_handler else {
@@ -111,7 +120,7 @@ fn checked_user_pte(
             if !fault_handler(addr, access) {
                 return Err(SysError::EFAULT);
             }
-            page_table.translate(vpn).ok_or(SysError::EFAULT)?
+            translate(page_table).ok_or(SysError::EFAULT)?
         }
     };
     let reject_zero_ppn = fault_handler.is_some();
@@ -122,11 +131,11 @@ fn checked_user_pte(
             if !resolve_current_cow_page(token, addr) {
                 return Err(SysError::EFAULT);
             }
-            pte = page_table.translate(vpn).ok_or(SysError::EFAULT)?;
+            pte = translate(page_table).ok_or(SysError::EFAULT)?;
         } else if let Some(fault_handler) = fault_handler
             && fault_handler(addr, access)
         {
-            pte = page_table.translate(vpn).ok_or(SysError::EFAULT)?;
+            pte = translate(page_table).ok_or(SysError::EFAULT)?;
         }
         if !user_pte_allows(pte, access, reject_zero_ppn) {
             return Err(SysError::EFAULT);
@@ -159,7 +168,14 @@ fn try_same_page_user_slice(
     }
 
     let page_table = PageTable::from_token(token);
-    let pte = match checked_user_pte(&page_table, token, start, access, fault_handler) {
+    let pte = match checked_user_pte(
+        &page_table,
+        token,
+        start,
+        access,
+        fault_handler,
+        USER_COPY_LEAF_PTE_CACHE,
+    ) {
         Ok(pte) => pte,
         Err(err) => return Some(Err(err)),
     };

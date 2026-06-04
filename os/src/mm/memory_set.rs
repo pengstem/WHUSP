@@ -229,6 +229,7 @@ impl MemorySet {
         result
     }
     pub fn activate(&self) {
+        super::page_table::invalidate_user_leaf_pte_cache();
         arch_mm::activate_page_table(self.page_table.token());
     }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
