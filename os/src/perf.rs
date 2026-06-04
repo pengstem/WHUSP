@@ -158,6 +158,9 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) local_socket_writer_sleeps: usize,
     pub(crate) local_socket_reader_wakeups: usize,
     pub(crate) local_socket_writer_wakeups: usize,
+    pub(crate) local_socket_write_user_buffer_bytes: usize,
+    pub(crate) local_socket_write_to_vec_bytes: usize,
+    pub(crate) local_socket_stream_direct_bytes: usize,
     pub(crate) pipe_read_calls: usize,
     pub(crate) pipe_write_calls: usize,
     pub(crate) pipe_read_bytes: usize,
@@ -412,6 +415,9 @@ mod enabled {
     static LOCAL_SOCKET_WRITER_SLEEPS: AtomicUsize = AtomicUsize::new(0);
     static LOCAL_SOCKET_READER_WAKEUPS: AtomicUsize = AtomicUsize::new(0);
     static LOCAL_SOCKET_WRITER_WAKEUPS: AtomicUsize = AtomicUsize::new(0);
+    static LOCAL_SOCKET_WRITE_USER_BUFFER_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static LOCAL_SOCKET_WRITE_TO_VEC_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static LOCAL_SOCKET_STREAM_DIRECT_BYTES: AtomicUsize = AtomicUsize::new(0);
 
     static PIPE_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PIPE_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -924,6 +930,16 @@ mod enabled {
         LOCAL_SOCKET_WRITER_WAKEUPS.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_local_socket_write_user_buffer(
+        bytes: usize,
+        to_vec_bytes: usize,
+        stream_direct_bytes: usize,
+    ) {
+        LOCAL_SOCKET_WRITE_USER_BUFFER_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        LOCAL_SOCKET_WRITE_TO_VEC_BYTES.fetch_add(to_vec_bytes, Ordering::Relaxed);
+        LOCAL_SOCKET_STREAM_DIRECT_BYTES.fetch_add(stream_direct_bytes, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_tid_lookup(
         process_visits: usize,
         task_visits: usize,
@@ -1384,6 +1400,12 @@ mod enabled {
             local_socket_writer_sleeps: LOCAL_SOCKET_WRITER_SLEEPS.load(Ordering::Relaxed),
             local_socket_reader_wakeups: LOCAL_SOCKET_READER_WAKEUPS.load(Ordering::Relaxed),
             local_socket_writer_wakeups: LOCAL_SOCKET_WRITER_WAKEUPS.load(Ordering::Relaxed),
+            local_socket_write_user_buffer_bytes: LOCAL_SOCKET_WRITE_USER_BUFFER_BYTES
+                .load(Ordering::Relaxed),
+            local_socket_write_to_vec_bytes: LOCAL_SOCKET_WRITE_TO_VEC_BYTES
+                .load(Ordering::Relaxed),
+            local_socket_stream_direct_bytes: LOCAL_SOCKET_STREAM_DIRECT_BYTES
+                .load(Ordering::Relaxed),
             pipe_read_calls: PIPE_READ_CALLS.load(Ordering::Relaxed),
             pipe_write_calls: PIPE_WRITE_CALLS.load(Ordering::Relaxed),
             pipe_read_bytes: PIPE_READ_BYTES.load(Ordering::Relaxed),
@@ -1644,6 +1666,9 @@ mod enabled {
          local_socket_writer_sleeps {}\n\
          local_socket_reader_wakeups {}\n\
          local_socket_writer_wakeups {}\n\
+         local_socket_write_user_buffer_bytes {}\n\
+         local_socket_write_to_vec_bytes {}\n\
+         local_socket_stream_direct_bytes {}\n\
          pipe_read_calls {}\n\
          pipe_write_calls {}\n\
          pipe_read_bytes {}\n\
@@ -1885,6 +1910,9 @@ mod enabled {
             stats.local_socket_writer_sleeps,
             stats.local_socket_reader_wakeups,
             stats.local_socket_writer_wakeups,
+            stats.local_socket_write_user_buffer_bytes,
+            stats.local_socket_write_to_vec_bytes,
+            stats.local_socket_stream_direct_bytes,
             stats.pipe_read_calls,
             stats.pipe_write_calls,
             stats.pipe_read_bytes,
@@ -2287,6 +2315,14 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_local_socket_writer_wakeup() {}
+
+    #[inline(always)]
+    pub(crate) fn record_local_socket_write_user_buffer(
+        _bytes: usize,
+        _to_vec_bytes: usize,
+        _stream_direct_bytes: usize,
+    ) {
+    }
 
     #[inline(always)]
     pub(crate) fn record_pipe_read_call() {}

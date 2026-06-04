@@ -1231,6 +1231,86 @@ impl LocalSocket {
         Ok(written)
     }
 
+    fn send_stream_user_buffer(&self, buf: UserBuffer, nonblock: bool) -> SysResult<usize> {
+        perf::record_local_socket_write_call();
+        let buffers = buf.buffers;
+        let total_len = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
+        let mut written = 0usize;
+        let mut buffer_index = 0usize;
+        let mut buffer_offset = 0usize;
+
+        while written < total_len {
+            let (connected, peer) = {
+                let inner = self.inner.exclusive_access();
+                if inner.write_shutdown {
+                    return Err(SysError::EPIPE);
+                }
+                (
+                    inner.peer.is_some() || inner.unix_peer.is_some(),
+                    inner.peer_socket.as_ref().and_then(Weak::upgrade),
+                )
+            };
+            let Some(peer) = peer else {
+                return Err(if connected {
+                    SysError::EPIPE
+                } else {
+                    SysError::ENOTCONN
+                });
+            };
+            let mut peer_inner = peer.exclusive_access();
+            if peer_inner.read_shutdown {
+                return Err(SysError::EPIPE);
+            }
+            let capacity = (peer_inner.rcvbuf as usize).max(1);
+            let available = capacity.saturating_sub(peer_inner.stream_rx.len());
+            if available == 0 {
+                if nonblock {
+                    return Err(SysError::EAGAIN);
+                }
+                if current_has_unmasked_signal() {
+                    if let Some(task) = current_task() {
+                        peer_inner.remove_writer(&task);
+                    }
+                    return Err(SysError::EINTR);
+                }
+                perf::record_local_socket_writer_sleep();
+                let task_cx_ptr = peer_inner.sleep_writer();
+                drop(peer_inner);
+                schedule(task_cx_ptr);
+                continue;
+            }
+
+            let mut chunk_remaining = available.min(total_len - written);
+            while chunk_remaining > 0 && buffer_index < buffers.len() {
+                let buffer = &buffers[buffer_index];
+                if buffer_offset >= buffer.len() {
+                    buffer_index += 1;
+                    buffer_offset = 0;
+                    continue;
+                }
+                let take = (buffer.len() - buffer_offset).min(chunk_remaining);
+                peer_inner
+                    .stream_rx
+                    .extend(buffer[buffer_offset..buffer_offset + take].iter().copied());
+                buffer_offset += take;
+                written += take;
+                chunk_remaining -= take;
+                if buffer_offset == buffer.len() {
+                    buffer_index += 1;
+                    buffer_offset = 0;
+                }
+            }
+
+            let reader = peer_inner.wake_reader();
+            let read_waiters = peer_inner.read_poll_waiters.drain();
+            drop(peer_inner);
+            wake_local_socket_reader(reader);
+            PollWaiter::wake_all(read_waiters);
+        }
+
+        Ok(written)
+    }
+
     fn stream_write_peer_closed(&self) -> bool {
         let (kind, listening, write_shutdown, connected, peer) = {
             let inner = self.inner.exclusive_access();
@@ -2069,8 +2149,19 @@ impl File for LocalSocket {
     }
 
     fn write(&self, buf: UserBuffer) -> usize {
-        let data = buf.to_vec();
-        self.send_bytes(&data, None, false).unwrap_or_default()
+        let len = buf.len();
+        match self.kind() {
+            SocketKind::Stream => {
+                let written = self.send_stream_user_buffer(buf, false).unwrap_or_default();
+                perf::record_local_socket_write_user_buffer(len, 0, written);
+                written
+            }
+            SocketKind::Datagram => {
+                let data = buf.to_vec();
+                perf::record_local_socket_write_user_buffer(len, data.len(), 0);
+                self.send_datagram(&data, None, false).unwrap_or_default()
+            }
+        }
     }
     fn socket_write_peer_closed(&self) -> bool {
         self.stream_write_peer_closed()
