@@ -129,6 +129,10 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) dev_zero_read_bytes: usize,
     pub(crate) dev_zero_read_byte_writes: usize,
     pub(crate) dev_zero_read_fill_bytes: usize,
+    pub(crate) dev_random_read_calls: usize,
+    pub(crate) dev_random_read_bytes: usize,
+    pub(crate) dev_random_byte_writes: usize,
+    pub(crate) dev_random_word_fill_bytes: usize,
     pub(crate) uart_write_lock_calls: usize,
     pub(crate) uart_write_bytes: usize,
     pub(crate) tlb_flush_all_calls: usize,
@@ -379,6 +383,10 @@ mod enabled {
     static DEV_ZERO_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
     static DEV_ZERO_READ_BYTE_WRITES: AtomicUsize = AtomicUsize::new(0);
     static DEV_ZERO_READ_FILL_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static DEV_RANDOM_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DEV_RANDOM_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static DEV_RANDOM_BYTE_WRITES: AtomicUsize = AtomicUsize::new(0);
+    static DEV_RANDOM_WORD_FILL_BYTES: AtomicUsize = AtomicUsize::new(0);
     static UART_WRITE_LOCK_CALLS: AtomicUsize = AtomicUsize::new(0);
     static UART_WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
     static TLB_FLUSH_ALL_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -832,6 +840,13 @@ mod enabled {
         DEV_ZERO_READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
         DEV_ZERO_READ_BYTE_WRITES.fetch_add(byte_writes, Ordering::Relaxed);
         DEV_ZERO_READ_FILL_BYTES.fetch_add(fill_bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_dev_random_read(bytes: usize, byte_writes: usize, word_fill_bytes: usize) {
+        DEV_RANDOM_READ_CALLS.fetch_add(1, Ordering::Relaxed);
+        DEV_RANDOM_READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        DEV_RANDOM_BYTE_WRITES.fetch_add(byte_writes, Ordering::Relaxed);
+        DEV_RANDOM_WORD_FILL_BYTES.fetch_add(word_fill_bytes, Ordering::Relaxed);
     }
 
     pub(crate) fn record_uart_write(bytes: usize) {
@@ -1338,6 +1353,10 @@ mod enabled {
             dev_zero_read_bytes: DEV_ZERO_READ_BYTES.load(Ordering::Relaxed),
             dev_zero_read_byte_writes: DEV_ZERO_READ_BYTE_WRITES.load(Ordering::Relaxed),
             dev_zero_read_fill_bytes: DEV_ZERO_READ_FILL_BYTES.load(Ordering::Relaxed),
+            dev_random_read_calls: DEV_RANDOM_READ_CALLS.load(Ordering::Relaxed),
+            dev_random_read_bytes: DEV_RANDOM_READ_BYTES.load(Ordering::Relaxed),
+            dev_random_byte_writes: DEV_RANDOM_BYTE_WRITES.load(Ordering::Relaxed),
+            dev_random_word_fill_bytes: DEV_RANDOM_WORD_FILL_BYTES.load(Ordering::Relaxed),
             uart_write_lock_calls: UART_WRITE_LOCK_CALLS.load(Ordering::Relaxed),
             uart_write_bytes: UART_WRITE_BYTES.load(Ordering::Relaxed),
             tlb_flush_all_calls: TLB_FLUSH_ALL_CALLS.load(Ordering::Relaxed),
@@ -1596,6 +1615,10 @@ mod enabled {
          dev_zero_read_bytes {}\n\
          dev_zero_read_byte_writes {}\n\
          dev_zero_read_fill_bytes {}\n\
+         dev_random_read_calls {}\n\
+         dev_random_read_bytes {}\n\
+         dev_random_byte_writes {}\n\
+         dev_random_word_fill_bytes {}\n\
          uart_write_lock_calls {}\n\
          uart_write_bytes {}\n\
          tlb_flush_all_calls {}\n\
@@ -1833,6 +1856,10 @@ mod enabled {
             stats.dev_zero_read_bytes,
             stats.dev_zero_read_byte_writes,
             stats.dev_zero_read_fill_bytes,
+            stats.dev_random_read_calls,
+            stats.dev_random_read_bytes,
+            stats.dev_random_byte_writes,
+            stats.dev_random_word_fill_bytes,
             stats.uart_write_lock_calls,
             stats.uart_write_bytes,
             stats.tlb_flush_all_calls,
@@ -2198,6 +2225,14 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_dev_zero_read(_bytes: usize, _byte_writes: usize, _fill_bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_dev_random_read(
+        _bytes: usize,
+        _byte_writes: usize,
+        _word_fill_bytes: usize,
+    ) {
+    }
 
     #[inline(always)]
     pub(crate) fn record_uart_write(_bytes: usize) {}
