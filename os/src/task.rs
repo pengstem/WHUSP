@@ -852,6 +852,11 @@ fn task_has_deliverable_signal_matching(
             task_inner.pending_signals.bits() & !task_inner.signal_mask.bits(),
         )
     };
+    if pending.is_empty() {
+        return false;
+    }
+    crate::perf::record_signal_action_table_lock_call();
+    let process_inner = process.inner_exclusive_access();
     for signum in 1..SIGNAL_INFO_SLOTS {
         let Some(signal) = SignalFlags::from_signum(signum as u32) else {
             continue;
@@ -859,7 +864,7 @@ fn task_has_deliverable_signal_matching(
         if !pending.contains(signal) {
             continue;
         }
-        let action = process.inner_exclusive_access().signal_actions[signum];
+        let action = process_inner.signal_actions[signum];
         if action.is_ignore() || !action.has_user_handler() {
             continue;
         }
@@ -907,6 +912,11 @@ fn task_has_interrupting_signal_matching(
         let inner = task.inner_exclusive_access();
         SignalFlags::from_bits_retain(inner.pending_signals.bits() & !inner.signal_mask.bits())
     };
+    if pending.is_empty() {
+        return false;
+    }
+    crate::perf::record_signal_action_table_lock_call();
+    let process_inner = process.inner_exclusive_access();
     for signum in 1..SIGNAL_INFO_SLOTS {
         let Some(signal) = SignalFlags::from_signum(signum as u32) else {
             continue;
@@ -914,7 +924,7 @@ fn task_has_interrupting_signal_matching(
         if !pending.contains(signal) {
             continue;
         }
-        let action = process.inner_exclusive_access().signal_actions[signum];
+        let action = process_inner.signal_actions[signum];
         if action.is_ignore() {
             continue;
         }

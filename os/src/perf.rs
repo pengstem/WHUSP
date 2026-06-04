@@ -16,6 +16,7 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) task_current_trap_cx_calls: usize,
     pub(crate) task_current_trap_cx_user_va_calls: usize,
     pub(crate) task_current_trap_return_context_calls: usize,
+    pub(crate) signal_action_table_lock_calls: usize,
     pub(crate) time_nanos_to_timespec_calls: usize,
     pub(crate) time_direct_timespec_calls: usize,
     pub(crate) riscv_return_fence_i_calls: usize,
@@ -242,6 +243,7 @@ mod enabled {
     static TASK_CURRENT_TRAP_CX_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TASK_CURRENT_TRAP_CX_USER_VA_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TASK_CURRENT_TRAP_RETURN_CONTEXT_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SIGNAL_ACTION_TABLE_LOCK_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TIME_NANOS_TO_TIMESPEC_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TIME_DIRECT_TIMESPEC_CALLS: AtomicUsize = AtomicUsize::new(0);
     static RISCV_RETURN_FENCE_I_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -510,6 +512,10 @@ mod enabled {
 
     pub(crate) fn record_task_current_trap_return_context_call() {
         TASK_CURRENT_TRAP_RETURN_CONTEXT_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_signal_action_table_lock_call() {
+        SIGNAL_ACTION_TABLE_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_time_nanos_to_timespec_call() {
@@ -1121,6 +1127,7 @@ mod enabled {
                 .load(Ordering::Relaxed),
             task_current_trap_return_context_calls: TASK_CURRENT_TRAP_RETURN_CONTEXT_CALLS
                 .load(Ordering::Relaxed),
+            signal_action_table_lock_calls: SIGNAL_ACTION_TABLE_LOCK_CALLS.load(Ordering::Relaxed),
             time_nanos_to_timespec_calls: TIME_NANOS_TO_TIMESPEC_CALLS.load(Ordering::Relaxed),
             time_direct_timespec_calls: TIME_DIRECT_TIMESPEC_CALLS.load(Ordering::Relaxed),
             riscv_return_fence_i_calls: RISCV_RETURN_FENCE_I_CALLS.load(Ordering::Relaxed),
@@ -1366,6 +1373,7 @@ mod enabled {
          task_current_trap_cx_calls {}\n\
          task_current_trap_cx_user_va_calls {}\n\
          task_current_trap_return_context_calls {}\n\
+         signal_action_table_lock_calls {}\n\
          time_nanos_to_timespec_calls {}\n\
          time_direct_timespec_calls {}\n\
          riscv_return_fence_i_calls {}\n\
@@ -1583,6 +1591,7 @@ mod enabled {
             stats.task_current_trap_cx_calls,
             stats.task_current_trap_cx_user_va_calls,
             stats.task_current_trap_return_context_calls,
+            stats.signal_action_table_lock_calls,
             stats.time_nanos_to_timespec_calls,
             stats.time_direct_timespec_calls,
             stats.riscv_return_fence_i_calls,
@@ -1848,6 +1857,9 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_task_current_trap_return_context_call() {}
+
+    #[inline(always)]
+    pub(crate) fn record_signal_action_table_lock_call() {}
 
     #[inline(always)]
     pub(crate) fn record_time_nanos_to_timespec_call() {}
