@@ -1808,6 +1808,9 @@ fn oskernel_perf_content() -> String {
          dentry_cache_insert_positive {}\n\
          dentry_cache_insert_negative {}\n\
          dentry_cache_invalidate_parent {}\n\
+         dentry_cache_invalidate_parent_calls {}\n\
+         dentry_cache_invalidate_parent_entry_scans {}\n\
+         dentry_cache_invalidate_parent_lru_scans {}\n\
          dentry_cache_invalidate_all {}\n\
          dentry_cache_evict {}\n\
          dentry_cache_lru_touch {}\n\
@@ -1895,6 +1898,9 @@ fn oskernel_perf_content() -> String {
         dentry.insert_positive,
         dentry.insert_negative,
         dentry.invalidate_parent,
+        dentry.invalidate_parent_calls,
+        dentry.invalidate_parent_entry_scans,
+        dentry.invalidate_parent_lru_scans,
         dentry.invalidate_all,
         dentry.evict,
         dentry.lru_touch,

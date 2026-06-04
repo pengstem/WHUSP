@@ -138,6 +138,9 @@ pub(crate) struct DentryCacheStats {
     pub(crate) insert_positive: usize,
     pub(crate) insert_negative: usize,
     pub(crate) invalidate_parent: usize,
+    pub(crate) invalidate_parent_calls: usize,
+    pub(crate) invalidate_parent_entry_scans: usize,
+    pub(crate) invalidate_parent_lru_scans: usize,
     pub(crate) invalidate_all: usize,
     pub(crate) evict: usize,
     pub(crate) lru_touch: usize,
@@ -462,13 +465,8 @@ impl DentryCache {
         }
         let generation = self.parent_generation(parent).wrapping_add(1);
         self.parent_generations.insert(parent, generation);
-        #[cfg(feature = "perf-counters")]
-        let before = self.entry_count;
-        self.entries.retain(|bucket, _| bucket.parent != parent);
-        self.entry_count = self.entries.values().map(Vec::len).sum();
-        self.lru.retain(|entry| entry.bucket.parent != parent);
         record_dentry_stat! {
-            self.stats.invalidate_parent += before.saturating_sub(self.entry_count);
+            self.stats.invalidate_parent_calls += 1;
         }
     }
 
@@ -542,7 +540,7 @@ pub(crate) fn stats_snapshot() -> DentryCacheStats {
 pub(crate) fn stats_content() -> String {
     let stats = stats_snapshot();
     format!(
-        "enabled {}\nentries {}\ncapacity {}\npositive_hit {}\nnegative_hit {}\nmiss {}\nrevalidate_fail {}\ninsert_positive {}\ninsert_negative {}\ninvalidate_parent {}\ninvalidate_all {}\nevict {}\nlru_touch {}\nlru_scan_slots {}\n",
+        "enabled {}\nentries {}\ncapacity {}\npositive_hit {}\nnegative_hit {}\nmiss {}\nrevalidate_fail {}\ninsert_positive {}\ninsert_negative {}\ninvalidate_parent {}\ninvalidate_parent_calls {}\ninvalidate_parent_entry_scans {}\ninvalidate_parent_lru_scans {}\ninvalidate_all {}\nevict {}\nlru_touch {}\nlru_scan_slots {}\n",
         stats.enabled as usize,
         stats.entries,
         stats.capacity,
@@ -553,6 +551,9 @@ pub(crate) fn stats_content() -> String {
         stats.insert_positive,
         stats.insert_negative,
         stats.invalidate_parent,
+        stats.invalidate_parent_calls,
+        stats.invalidate_parent_entry_scans,
+        stats.invalidate_parent_lru_scans,
         stats.invalidate_all,
         stats.evict,
         stats.lru_touch,
