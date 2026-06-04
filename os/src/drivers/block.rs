@@ -217,7 +217,7 @@ impl VirtIOBlock {
             });
     }
 
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     pub fn handle_irq(&self) {
         self.virtio_blk.exclusive_session(|blk| {
             let _ = blk.ack_interrupt();
@@ -376,12 +376,12 @@ fn choose_block_io_path() -> BlockIoPath {
 }
 
 fn can_sleep_for_nonblocking_block_io() -> bool {
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     {
         crate::arch::interrupt::supervisor_interrupt_enabled()
             && crate::task::current_task().is_some()
     }
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
     {
         false
     }
@@ -511,13 +511,19 @@ fn record_fallback_no_ready_write() {
 #[inline(always)]
 fn record_fallback_no_ready_write() {}
 
-#[cfg(all(target_arch = "riscv64", feature = "perf-counters"))]
+#[cfg(all(
+    any(target_arch = "riscv64", target_arch = "loongarch64"),
+    feature = "perf-counters"
+))]
 #[inline(always)]
 fn record_irq_ack() {
     block_io_perf::inc(&block_io_perf::IRQ_ACKS);
 }
 
-#[cfg(all(target_arch = "riscv64", not(feature = "perf-counters")))]
+#[cfg(all(
+    any(target_arch = "riscv64", target_arch = "loongarch64"),
+    not(feature = "perf-counters")
+))]
 #[inline(always)]
 fn record_irq_ack() {}
 
@@ -546,7 +552,7 @@ pub fn block_count() -> usize {
     BLOCK_DEVICES.len()
 }
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 pub fn handle_irq(irq: usize) -> bool {
     if let Some(device) = BLOCK_DEVICES.iter().find(|device| device.irq() == irq) {
         device.handle_irq();

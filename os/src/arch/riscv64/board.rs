@@ -385,6 +385,10 @@ pub fn block_devices() -> &'static [BlockDeviceConfig] {
     &config.blocks[..config.block_count]
 }
 
+pub fn block_irq_available() -> bool {
+    true
+}
+
 pub fn pci_transport(_device: PciDevice) -> virtio_drivers::transport::pci::PciTransport {
     unreachable!("RISC-V QEMU uses virtio-mmio block devices")
 }

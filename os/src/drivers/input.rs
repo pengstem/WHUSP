@@ -6,20 +6,15 @@ use core::any::Any;
 use virtio_drivers::device::input::VirtIOInput;
 
 struct VirtIOInputInner {
-    // CONTEXT: only `handle_irq` reads this; on LA the IRQ path is gated out so
-    // the transport is held purely for RAII. Drop here is what releases the
-    // virtio queues.
-    #[allow(dead_code)]
     virtio_input: VirtIOInput<VirtioHal, VirtioTransport>,
 }
 
 struct VirtIOInputWrapper {
-    #[allow(dead_code)]
     inner: UPIntrFreeCell<VirtIOInputInner>,
 }
 
 pub trait InputDevice: Send + Sync + Any {
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     fn handle_irq(&self);
 }
 
@@ -46,7 +41,7 @@ impl VirtIOInputWrapper {
 }
 
 impl InputDevice for VirtIOInputWrapper {
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     fn handle_irq(&self) {
         self.inner.exclusive_session(|inner| {
             inner.virtio_input.ack_interrupt();

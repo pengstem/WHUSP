@@ -5,6 +5,7 @@ pub mod board;
 mod context_switch;
 pub mod hart;
 pub mod interrupt;
+pub mod irq;
 pub mod mm;
 pub mod sbi;
 pub mod signal;

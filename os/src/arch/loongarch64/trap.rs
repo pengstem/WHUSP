@@ -40,8 +40,23 @@ fn set_kernel_trap_entry() {
 }
 
 pub fn enable_timer_interrupt() {
-    let interrupts = LineBasedInterrupt::TIMER;
-    ecfg::set_lie(interrupts);
+    ecfg::set_lie(ecfg::read().lie() | LineBasedInterrupt::TIMER);
+}
+
+pub fn enable_external_interrupt() {
+    // CONTEXT: QEMU LoongArch virt routes external device interrupts through
+    // EIOINTC. Different references number the CPU input by DTB cell or CSR
+    // bit, so enable all hardware interrupt lines and let EIOINTC/PCH PIC
+    // filter actual device vectors.
+    let interrupts = LineBasedInterrupt::HWI0
+        | LineBasedInterrupt::HWI1
+        | LineBasedInterrupt::HWI2
+        | LineBasedInterrupt::HWI3
+        | LineBasedInterrupt::HWI4
+        | LineBasedInterrupt::HWI5
+        | LineBasedInterrupt::HWI6
+        | LineBasedInterrupt::HWI7;
+    ecfg::set_lie(ecfg::read().lie() | interrupts);
 }
 
 fn enable_supervisor_interrupt() {
@@ -171,6 +186,18 @@ pub fn trap_handler() -> ! {
             set_next_trigger();
             check_timer();
             suspend_current_and_run_next();
+        }
+        Trap::Interrupt(
+            Interrupt::HWI0
+            | Interrupt::HWI1
+            | Interrupt::HWI2
+            | Interrupt::HWI3
+            | Interrupt::HWI4
+            | Interrupt::HWI5
+            | Interrupt::HWI6
+            | Interrupt::HWI7,
+        ) => {
+            crate::board::irq_handler();
         }
         other => {
             panic!(
@@ -306,6 +333,18 @@ pub fn trap_from_kernel(_trap_cx: &TrapContext) {
             if current_task().is_none() {
                 check_timer();
             }
+        }
+        Trap::Interrupt(
+            Interrupt::HWI0
+            | Interrupt::HWI1
+            | Interrupt::HWI2
+            | Interrupt::HWI3
+            | Interrupt::HWI4
+            | Interrupt::HWI5
+            | Interrupt::HWI6
+            | Interrupt::HWI7,
+        ) => {
+            crate::board::irq_handler();
         }
         other => {
             panic!(

@@ -100,10 +100,11 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     fs::init();
     fs::list_apps();
     task::add_initproc();
-    // CONTEXT: RISC-V VirtIO block IRQs are wired, so task-context I/O can use
-    // the nonblocking path. The driver still falls back to sync I/O when a read
-    // happens from an unsafe context such as interrupt-disabled lazy fault-in.
-    *DEV_NON_BLOCKING_ACCESS.exclusive_access() = cfg!(target_arch = "riscv64");
+    // CONTEXT: Task-context block I/O can use the nonblocking path only after
+    // the active architecture has wired device IRQ completion. The driver still
+    // falls back to sync I/O when a read happens from an unsafe context such as
+    // interrupt-disabled lazy fault-in.
+    *DEV_NON_BLOCKING_ACCESS.exclusive_access() = board::block_irq_available();
     task::run_tasks();
     panic!("Unreachable in rust_main!");
 }

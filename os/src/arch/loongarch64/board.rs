@@ -1,5 +1,8 @@
-use crate::arch::loongarch64::mm::phys_to_virt;
+use crate::arch::loongarch64::{irq, mm::phys_to_virt};
+use crate::drivers::chardev::{CharDevice, UART};
+use crate::drivers::{KEYBOARD_DEVICE, MOUSE_DEVICE};
 use core::cell::UnsafeCell;
+use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, Ordering};
 use fdt::{Fdt, node::FdtNode};
 use log::{info, warn};
@@ -19,6 +22,12 @@ const FALLBACK_CLOCK_FREQ: usize = 100_000_000;
 const FALLBACK_PCI_ECAM_BASE: usize = 0x2000_0000;
 const FALLBACK_PCI_MEM_BASE: usize = 0x4000_0000;
 const FALLBACK_PCI_MEM_SIZE: usize = 0x4000_0000;
+const PCI_INTX_PIN_A: usize = 1;
+const PCI_INTERRUPT_MAP_ENTRY_CELLS: usize = 7;
+const PCI_INTERRUPT_MAP_CHILD_CELLS: usize = 4;
+const PCI_INTERRUPT_MAP_PARENT_IRQ_CELL: usize = 5;
+const FALLBACK_PCI_INTX_BASE: usize = 0x10;
+const FALLBACK_PCI_INTX_COUNT: usize = 4;
 
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
 pub type CharDeviceImpl = crate::drivers::chardev::NS16550a;
@@ -68,6 +77,9 @@ struct BoardConfig {
     clock_freq: usize,
     memory_end: usize,
     uart: IrqDevice,
+    eiointc_base: usize,
+    eiointc_irq: usize,
+    pch_pic: MmioRange,
     blocks: [BlockDeviceConfig; BLOCK_DEVICE_CAPACITY],
     block_count: usize,
     gpu: Option<IrqDevice>,
@@ -92,6 +104,9 @@ impl BoardConfig {
                 size: 0,
                 irq: 0,
             },
+            eiointc_base: 0,
+            eiointc_irq: 0,
+            pch_pic: MmioRange { base: 0, size: 0 },
             blocks: [BlockDeviceConfig::Mmio(IrqDevice {
                 base: 0,
                 size: 0,
@@ -209,18 +224,38 @@ fn first_reg(node: FdtNode<'_, '_>, context: &str) -> MmioRange {
     }
 }
 
+fn first_physical_reg(node: FdtNode<'_, '_>, context: &str) -> MmioRange {
+    let region = node
+        .reg()
+        .and_then(|mut regions| regions.next())
+        .unwrap_or_else(|| panic!("{} node is missing a usable reg property", context));
+
+    MmioRange {
+        base: region.starting_address as usize,
+        size: region
+            .size
+            .unwrap_or_else(|| panic!("{} node reg is missing size", context)),
+    }
+}
+
 fn irq_device(node: FdtNode<'_, '_>, context: &str) -> IrqDevice {
     let range = first_reg(node, context);
-    let irq = node
-        .interrupts()
-        .and_then(|mut interrupts| interrupts.next())
-        .unwrap_or(0);
+    let irq = first_irq(node, context);
 
     IrqDevice {
         base: range.base,
         size: range.size,
         irq,
     }
+}
+
+fn first_irq(node: FdtNode<'_, '_>, context: &str) -> usize {
+    node.property("interrupts")
+        .and_then(|property| property.value.get(0..4))
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_be_bytes)
+        .map(|irq| irq as usize)
+        .unwrap_or_else(|| panic!("{} node is missing an interrupts property", context))
 }
 
 fn push_mmio_region(config: &mut BoardConfig, range: MmioRange) {
@@ -296,6 +331,57 @@ fn pci_mem_range_from_dtb(pci_node: FdtNode<'_, '_>) -> Option<(usize, usize)> {
     (best_size != 0).then_some((best_start, best_size))
 }
 
+fn read_be_u32(value: &[u8], cell: usize) -> Option<u32> {
+    let start = cell.checked_mul(4)?;
+    let bytes = value.get(start..start + 4)?;
+    Some(u32::from_be_bytes(bytes.try_into().ok()?))
+}
+
+fn pci_child_interrupt_cells(device_function: DeviceFunction, pin: usize) -> [u32; 4] {
+    let phys_hi = ((device_function.bus as u32) << 16)
+        | ((device_function.device as u32) << 11)
+        | ((device_function.function as u32) << 8);
+    [phys_hi, 0, 0, pin as u32]
+}
+
+fn pci_intx_irq_from_map(
+    pci_node: FdtNode<'_, '_>,
+    device_function: DeviceFunction,
+    pin: usize,
+) -> Option<usize> {
+    let map = pci_node.property("interrupt-map")?;
+    let mask = pci_node.property("interrupt-map-mask")?;
+    let child = pci_child_interrupt_cells(device_function, pin);
+    let mask_cells = [
+        read_be_u32(mask.value, 0)?,
+        read_be_u32(mask.value, 1)?,
+        read_be_u32(mask.value, 2)?,
+        read_be_u32(mask.value, 3)?,
+    ];
+
+    for entry in map
+        .value
+        .chunks_exact(PCI_INTERRUPT_MAP_ENTRY_CELLS * size_of::<u32>())
+    {
+        let mut matches = true;
+        for i in 0..PCI_INTERRUPT_MAP_CHILD_CELLS {
+            let entry_cell = read_be_u32(entry, i)?;
+            if (child[i] & mask_cells[i]) != (entry_cell & mask_cells[i]) {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            return read_be_u32(entry, PCI_INTERRUPT_MAP_PARENT_IRQ_CELL).map(|irq| irq as usize);
+        }
+    }
+    None
+}
+
+fn fallback_pci_intx_irq(device_function: DeviceFunction) -> usize {
+    FALLBACK_PCI_INTX_BASE + (device_function.device as usize % FALLBACK_PCI_INTX_COUNT)
+}
+
 fn allocate_pci_bars(
     root: &mut PciRoot<MmioCam<'static>>,
     device_function: DeviceFunction,
@@ -356,6 +442,18 @@ fn discover_pci_blocks(config: &mut BoardConfig, pci_node: FdtNode<'_, '_>) {
         };
         allocate_pci_bars(&mut root, device_function, &mut allocator);
         if virtio_type == DeviceType::Block {
+            let irq = pci_intx_irq_from_map(pci_node, device_function, PCI_INTX_PIN_A)
+                .unwrap_or_else(|| {
+                    let irq = fallback_pci_intx_irq(device_function);
+                    warn!(
+                        "PCI interrupt-map missing BDF {}:{:02x}.{} INTA; using QEMU fallback irq {}",
+                        device_function.bus,
+                        device_function.device,
+                        device_function.function,
+                        irq
+                    );
+                    irq
+                });
             push_block_device(
                 config,
                 BlockDeviceConfig::Pci(PciDevice {
@@ -365,7 +463,7 @@ fn discover_pci_blocks(config: &mut BoardConfig, pci_node: FdtNode<'_, '_>) {
                     bus: device_function.bus,
                     device: device_function.device,
                     function: device_function.function,
-                    irq: 0,
+                    irq,
                 }),
             );
         }
@@ -416,6 +514,19 @@ pub fn init_from_dtb(dtb_addr: usize) {
     };
     push_mmio_region(&mut config, uart_range);
 
+    let eiointc_node = fdt
+        .find_compatible(&["loongson,ls2k2000-eiointc"])
+        .unwrap_or_else(|| panic!("DTB is missing LoongArch EIOINTC"));
+    config.eiointc_base = first_physical_reg(eiointc_node, "EIOINTC").base;
+    config.eiointc_irq = first_irq(eiointc_node, "EIOINTC");
+
+    let pch_pic_node = fdt
+        .find_compatible(&["loongson,pch-pic-1.0"])
+        .unwrap_or_else(|| panic!("DTB is missing LoongArch PCH PIC"));
+    let pch_pic = first_reg(pch_pic_node, "PCH PIC");
+    config.pch_pic = pch_pic;
+    push_mmio_region(&mut config, pch_pic);
+
     if let Some(pci_node) = fdt.find_compatible(&["pci-host-ecam-generic"]) {
         discover_pci_blocks(&mut config, pci_node);
     } else {
@@ -435,6 +546,8 @@ pub fn init_from_dtb(dtb_addr: usize) {
 
     assert_ne!(config.block_count, 0, "DTB is missing virtio block device");
     assert_ne!(config.uart.base, 0, "DTB is missing uart base");
+    assert_ne!(config.eiointc_base, 0, "DTB is missing EIOINTC base");
+    assert_ne!(config.pch_pic.base, 0, "DTB is missing PCH PIC base");
 
     BOARD_CONFIG.init(config);
 }
@@ -464,10 +577,6 @@ pub fn rtc_base() -> usize {
     board_config().rtc_base
 }
 
-// CONTEXT: LA external-IRQ wiring is not implemented (no LA equivalent of the
-// RV PLIC dispatch yet); `uart_irq`/`keyboard_irq`/`mouse_irq`/`net_device`/
-// `irq_handler` mirror the RV64 board API for when LA IRQ support is added.
-#[allow(dead_code)]
 pub fn uart_irq() -> usize {
     board_config().uart.irq
 }
@@ -479,6 +588,19 @@ pub fn plic_base() -> usize {
 pub fn block_devices() -> &'static [BlockDeviceConfig] {
     let config = board_config();
     &config.blocks[..config.block_count]
+}
+
+pub fn external_irq_available() -> bool {
+    let config = board_config();
+    config.eiointc_base != 0 && config.pch_pic.base != 0
+}
+
+pub fn block_irq_available() -> bool {
+    external_irq_available()
+        && block_devices().iter().any(|device| match device {
+            BlockDeviceConfig::Mmio(device) => device.irq != 0,
+            BlockDeviceConfig::Pci(device) => device.irq != 0,
+        })
 }
 
 pub fn gpu_device() -> Option<IrqDevice> {
@@ -519,11 +641,75 @@ pub fn pci_transport(device: PciDevice) -> PciTransport {
         .expect("failed to create virtio PCI transport")
 }
 
-pub fn device_init(_hart_id: usize) {
-    info!("KERN: LoongArch external IRQ setup deferred; block I/O uses polling");
+fn enable_external_irq(eiointc: irq::Eiointc, pch_pic: irq::PchPic, irq: usize) {
+    eiointc.enable(irq);
+    pch_pic.enable(irq);
 }
 
-#[allow(dead_code)]
+pub fn device_init(_hart_id: usize) {
+    let config = board_config();
+    let eiointc = irq::Eiointc::new(config.eiointc_base);
+    let pch_pic = irq::PchPic::new(config.pch_pic.base);
+    eiointc.init();
+    pch_pic.init();
+
+    let uart_irq = uart_irq();
+    enable_external_irq(eiointc, pch_pic, uart_irq);
+    for block in block_devices() {
+        let irq = match block {
+            BlockDeviceConfig::Mmio(device) => device.irq,
+            BlockDeviceConfig::Pci(device) => device.irq,
+        };
+        if irq != 0 {
+            enable_external_irq(eiointc, pch_pic, irq);
+        }
+    }
+
+    crate::trap::enable_external_interrupt();
+    info!(
+        "KERN: LoongArch external IRQ ready: eiointc={:#x}, cpu_irq={}, pch_pic={:#x}, uart_irq={}, block_irq_ready={}",
+        config.eiointc_base,
+        config.eiointc_irq,
+        config.pch_pic.base,
+        uart_irq,
+        block_irq_available(),
+    );
+}
+
 pub fn irq_handler() {
-    warn!("unexpected LoongArch external IRQ");
+    let config = board_config();
+    let eiointc = irq::Eiointc::new(config.eiointc_base);
+    let Some(intr_src_id) = eiointc.claim() else {
+        warn!("spurious LoongArch external IRQ");
+        return;
+    };
+
+    let uart_irq = uart_irq();
+    let keyboard_irq = keyboard_irq();
+    let mouse_irq = mouse_irq();
+    let handled = if intr_src_id == uart_irq {
+        UART.handle_irq();
+        true
+    } else if keyboard_irq == Some(intr_src_id) {
+        if let Some(device) = KEYBOARD_DEVICE.as_ref() {
+            device.handle_irq();
+            true
+        } else {
+            false
+        }
+    } else if mouse_irq == Some(intr_src_id) {
+        if let Some(device) = MOUSE_DEVICE.as_ref() {
+            device.handle_irq();
+            true
+        } else {
+            false
+        }
+    } else {
+        crate::drivers::block::handle_irq(intr_src_id)
+    };
+
+    if !handled {
+        warn!("unhandled LoongArch external IRQ {}", intr_src_id);
+    }
+    eiointc.complete(intr_src_id);
 }

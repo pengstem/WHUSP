@@ -3,7 +3,6 @@
 //! Ref: ns16450 datasheet: https://datasheetspdf.com/pdf-file/1311818/NationalSemiconductor/NS16450/1
 use crate::board::CharDeviceImpl;
 use crate::sync::{Condvar, UPIntrFreeCell};
-#[cfg(not(target_arch = "loongarch64"))]
 use crate::task::schedule;
 #[cfg(target_arch = "loongarch64")]
 use crate::task::suspend_current_and_run_next;
@@ -30,7 +29,7 @@ pub trait CharDevice {
             self.write(byte);
         }
     }
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     fn handle_irq(&self);
 }
 
@@ -161,9 +160,6 @@ impl NS16550aInner {
 
 pub struct NS16550a {
     inner: UPIntrFreeCell<NS16550aInner>,
-    // CONTEXT: signaled from the RV IRQ path; LA polls instead of taking
-    // external UART interrupts, so the field stays allocated but unread there.
-    #[allow(dead_code)]
     condvar: Condvar,
 }
 
@@ -197,18 +193,18 @@ impl CharDevice for NS16550a {
             } else {
                 #[cfg(target_arch = "loongarch64")]
                 {
-                    // CONTEXT: LoongArch external UART IRQ routing is not wired yet, so
-                    // blocking on the condvar would sleep forever. Poll until IRQ arrives.
-                    drop(inner);
-                    suspend_current_and_run_next();
-                    continue;
+                    if !crate::board::external_irq_available() {
+                        // CONTEXT: Early LA bring-up can run without external
+                        // IRQ routing; keep the old polling fallback so a
+                        // missing controller path does not sleep forever.
+                        drop(inner);
+                        suspend_current_and_run_next();
+                        continue;
+                    }
                 }
-                #[cfg(not(target_arch = "loongarch64"))]
-                {
-                    let task_cx_ptr = self.condvar.wait_no_sched();
-                    drop(inner);
-                    schedule(task_cx_ptr);
-                }
+                let task_cx_ptr = self.condvar.wait_no_sched();
+                drop(inner);
+                schedule(task_cx_ptr);
             }
         }
     }
@@ -230,7 +226,7 @@ impl CharDevice for NS16550a {
         let mut inner = self.inner.exclusive_access();
         inner.ns16550a.write_bytes(bytes);
     }
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     fn handle_irq(&self) {
         let mut count = 0;
         self.inner.exclusive_session(|inner| {
