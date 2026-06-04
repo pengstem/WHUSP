@@ -255,6 +255,13 @@ pub(crate) fn handle_user_page_fault(addr: usize, access: MmapFaultAccess) -> bo
             return true;
         }
     }
+    if current_process()
+        .inner_exclusive_access()
+        .memory_set
+        .resolve_lazy_framed_page_fault(addr, access)
+    {
+        return true;
+    }
     handle_mmap_page_fault(addr, access)
 }
 

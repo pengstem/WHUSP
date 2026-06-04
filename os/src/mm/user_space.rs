@@ -514,6 +514,48 @@ impl MemorySet {
         true
     }
 
+    pub fn resolve_lazy_framed_page_fault(&mut self, addr: usize, access: MmapFaultAccess) -> bool {
+        let vpn = VirtAddr::from(addr).floor();
+        let heap_start_vpn = VirtAddr::from(self.brk_base).floor();
+        let heap_end_vpn = VirtAddr::from(self.brk_mapped_end).floor();
+        if vpn < heap_start_vpn || vpn >= heap_end_vpn {
+            return false;
+        }
+
+        let Some(area_idx) = self.find_area_idx_containing(vpn) else {
+            return false;
+        };
+        let area = &self.areas[area_idx];
+        if area.is_mmap()
+            || area.is_shm()
+            || area.map_type != MapType::Framed
+            || !access.is_allowed_by(area.map_perm)
+        {
+            return false;
+        }
+        if self
+            .page_table
+            .translate(vpn)
+            .is_some_and(|pte| pte.bits != 0)
+        {
+            return true;
+        }
+        if area.data_frames.contains_key(&vpn) {
+            return false;
+        }
+
+        let Some(frame) = frame_alloc() else {
+            return false;
+        };
+        let page_table = &mut self.page_table;
+        let area = &mut self.areas[area_idx];
+        if !area.map_existing_frame(page_table, vpn, frame) {
+            return false;
+        }
+        perf::record_brk_lazy_fault_page();
+        true
+    }
+
     pub fn set_program_break(&mut self, addr: usize) -> usize {
         if addr == 0 {
             return self.brk;
@@ -527,6 +569,7 @@ impl MemorySet {
         let heap_start_vpn = VirtAddr::from(self.brk_base).floor();
         let old_end_vpn = VirtAddr::from(old_mapped_end).floor();
         let new_end_vpn = VirtAddr::from(new_mapped_end).floor();
+        let grow_pages = new_end_vpn.0.saturating_sub(old_end_vpn.0);
 
         if new_mapped_end > old_mapped_end {
             if self.range_overlaps(old_mapped_end, new_mapped_end) {
@@ -548,38 +591,31 @@ impl MemorySet {
                     return self.brk;
                 }
                 self.insert_area_sorted(heap_area);
+                perf::record_brk_grow(grow_pages);
+                perf::record_brk_eager_mapped(grow_pages);
                 self.brk = addr;
                 self.brk_mapped_end = new_mapped_end;
                 return self.brk;
             }
             let Some(area_idx) = self.find_brk_extension_area(heap_start_vpn, old_end_vpn) else {
-                let mut heap_area = MapArea::new(
+                let heap_area = MapArea::new(
                     old_mapped_end.into(),
                     new_mapped_end.into(),
                     MapType::Framed,
                     MapPermission::R | MapPermission::W | MapPermission::U,
                 );
-                apply_mlock_flags(
-                    &mut heap_area,
-                    self.mlock_future,
-                    self.mlock_future_on_fault,
-                );
-                if !heap_area.map(&mut self.page_table) {
-                    return self.brk;
-                }
                 self.insert_area_sorted(heap_area);
+                perf::record_brk_grow(grow_pages);
+                perf::record_brk_lazy_extended(grow_pages);
                 self.brk = addr;
                 self.brk_mapped_end = new_mapped_end;
                 return self.brk;
             };
             let heap_area = &mut self.areas[area_idx];
-            for vpn in VPNRange::new(old_end_vpn, new_end_vpn) {
-                if !heap_area.map_one(&mut self.page_table, vpn) {
-                    return self.brk;
-                }
-            }
             let area_start = heap_area.vpn_range.get_start();
             heap_area.vpn_range = VPNRange::new(area_start, new_end_vpn);
+            perf::record_brk_grow(grow_pages);
+            perf::record_brk_lazy_extended(grow_pages);
         } else if new_mapped_end < old_mapped_end {
             self.shrink_brk_areas(heap_start_vpn, new_end_vpn, old_end_vpn);
         }
@@ -622,7 +658,7 @@ impl MemorySet {
                 && area_end <= old_end_vpn
             {
                 let mut area = self.areas.remove(idx);
-                area.unmap(&mut self.page_table);
+                area.unmap_resident(&mut self.page_table);
             } else {
                 idx += 1;
             }
@@ -726,6 +762,8 @@ impl MemorySet {
                     flushes.extend(area.take_mmap_flushes(&mut self.page_table));
                     area.release_mmap_refs();
                 } else if area.is_shm() {
+                    area.unmap_resident(&mut self.page_table);
+                } else if area.map_type == MapType::Framed {
                     area.unmap_resident(&mut self.page_table);
                 } else {
                     area.unmap(&mut self.page_table);

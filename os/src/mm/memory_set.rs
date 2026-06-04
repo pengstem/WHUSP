@@ -133,6 +133,8 @@ impl MemorySet {
             let area = &mut self.areas[idx];
             if area.is_mmap() || area.is_shm() {
                 area.unmap_resident(&mut self.page_table);
+            } else if area.map_type == MapType::Framed {
+                area.unmap_resident(&mut self.page_table);
             } else {
                 area.unmap(&mut self.page_table);
             }
@@ -245,6 +247,8 @@ impl MemorySet {
                 flushes.extend(area.take_mmap_flushes(&mut self.page_table));
                 area.release_mmap_refs();
             } else if area.is_shm() {
+                area.unmap_resident(&mut self.page_table);
+            } else if area.map_type == MapType::Framed {
                 area.unmap_resident(&mut self.page_table);
             } else {
                 area.unmap(&mut self.page_table);

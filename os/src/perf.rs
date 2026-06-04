@@ -116,6 +116,11 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) tmpfs_allocated_payload_sparse_extents: usize,
     pub(crate) tmpfs_allocated_logical_len_calls: usize,
     pub(crate) tmpfs_allocated_logical_sparse_extents: usize,
+    pub(crate) brk_grow_calls: usize,
+    pub(crate) brk_grow_pages: usize,
+    pub(crate) brk_eager_mapped_pages: usize,
+    pub(crate) brk_lazy_extended_pages: usize,
+    pub(crate) brk_lazy_fault_pages: usize,
     pub(crate) frame_alloc_zeroed_calls: usize,
     pub(crate) frame_alloc_zeroed_bytes: usize,
     pub(crate) frame_alloc_uninit_calls: usize,
@@ -375,6 +380,11 @@ mod enabled {
     static TMPFS_ALLOCATED_PAYLOAD_SPARSE_EXTENTS: AtomicUsize = AtomicUsize::new(0);
     static TMPFS_ALLOCATED_LOGICAL_LEN_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TMPFS_ALLOCATED_LOGICAL_SPARSE_EXTENTS: AtomicUsize = AtomicUsize::new(0);
+    static BRK_GROW_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static BRK_GROW_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static BRK_EAGER_MAPPED_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static BRK_LAZY_EXTENDED_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static BRK_LAZY_FAULT_PAGES: AtomicUsize = AtomicUsize::new(0);
     static FRAME_ALLOC_ZEROED_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FRAME_ALLOC_ZEROED_BYTES: AtomicUsize = AtomicUsize::new(0);
     static FRAME_ALLOC_UNINIT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -816,6 +826,23 @@ mod enabled {
     pub(crate) fn record_tmpfs_allocated_logical_len(sparse_extents: usize) {
         TMPFS_ALLOCATED_LOGICAL_LEN_CALLS.fetch_add(1, Ordering::Relaxed);
         TMPFS_ALLOCATED_LOGICAL_SPARSE_EXTENTS.fetch_add(sparse_extents, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_brk_grow(pages: usize) {
+        BRK_GROW_CALLS.fetch_add(1, Ordering::Relaxed);
+        BRK_GROW_PAGES.fetch_add(pages, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_brk_eager_mapped(pages: usize) {
+        BRK_EAGER_MAPPED_PAGES.fetch_add(pages, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_brk_lazy_extended(pages: usize) {
+        BRK_LAZY_EXTENDED_PAGES.fetch_add(pages, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_brk_lazy_fault_page() {
+        BRK_LAZY_FAULT_PAGES.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_frame_alloc(zeroed: bool) {
@@ -1364,6 +1391,11 @@ mod enabled {
                 .load(Ordering::Relaxed),
             tmpfs_allocated_logical_sparse_extents: TMPFS_ALLOCATED_LOGICAL_SPARSE_EXTENTS
                 .load(Ordering::Relaxed),
+            brk_grow_calls: BRK_GROW_CALLS.load(Ordering::Relaxed),
+            brk_grow_pages: BRK_GROW_PAGES.load(Ordering::Relaxed),
+            brk_eager_mapped_pages: BRK_EAGER_MAPPED_PAGES.load(Ordering::Relaxed),
+            brk_lazy_extended_pages: BRK_LAZY_EXTENDED_PAGES.load(Ordering::Relaxed),
+            brk_lazy_fault_pages: BRK_LAZY_FAULT_PAGES.load(Ordering::Relaxed),
             frame_alloc_zeroed_calls: FRAME_ALLOC_ZEROED_CALLS.load(Ordering::Relaxed),
             frame_alloc_zeroed_bytes: FRAME_ALLOC_ZEROED_BYTES.load(Ordering::Relaxed),
             frame_alloc_uninit_calls: FRAME_ALLOC_UNINIT_CALLS.load(Ordering::Relaxed),
@@ -1637,6 +1669,11 @@ mod enabled {
          tmpfs_allocated_payload_sparse_extents {}\n\
          tmpfs_allocated_logical_len_calls {}\n\
          tmpfs_allocated_logical_sparse_extents {}\n\
+         brk_grow_calls {}\n\
+         brk_grow_pages {}\n\
+         brk_eager_mapped_pages {}\n\
+         brk_lazy_extended_pages {}\n\
+         brk_lazy_fault_pages {}\n\
          frame_alloc_zeroed_calls {}\n\
          frame_alloc_zeroed_bytes {}\n\
          frame_alloc_uninit_calls {}\n\
@@ -1883,6 +1920,11 @@ mod enabled {
             stats.tmpfs_allocated_payload_sparse_extents,
             stats.tmpfs_allocated_logical_len_calls,
             stats.tmpfs_allocated_logical_sparse_extents,
+            stats.brk_grow_calls,
+            stats.brk_grow_pages,
+            stats.brk_eager_mapped_pages,
+            stats.brk_lazy_extended_pages,
+            stats.brk_lazy_fault_pages,
             stats.frame_alloc_zeroed_calls,
             stats.frame_alloc_zeroed_bytes,
             stats.frame_alloc_uninit_calls,
@@ -2255,6 +2297,18 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_tmpfs_allocated_logical_len(_sparse_extents: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_brk_grow(_pages: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_brk_eager_mapped(_pages: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_brk_lazy_extended(_pages: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_brk_lazy_fault_page() {}
 
     #[inline(always)]
     pub(crate) fn record_frame_alloc(_zeroed: bool) {}
