@@ -29,6 +29,41 @@ fn mmap_user_fault(addr: usize, access: UserBufferAccess) -> bool {
     crate::arch::trap::handle_user_page_fault(addr, access)
 }
 
+fn lazy_framed_user_fault(addr: usize, access: UserBufferAccess) -> bool {
+    let access = match access {
+        UserBufferAccess::Read => MmapFaultAccess::Read,
+        UserBufferAccess::Write => MmapFaultAccess::Write,
+    };
+    let process = crate::task::current_process();
+    process
+        .inner_exclusive_access()
+        .memory_set
+        .resolve_lazy_framed_page_fault(addr, access)
+}
+
+fn effective_user_fault_handler(
+    token: usize,
+    fault_handler: Option<UserFaultHandler>,
+) -> Option<UserFaultHandler> {
+    if fault_handler.is_some() {
+        return fault_handler;
+    }
+    let Some(task) = crate::task::current_task() else {
+        return None;
+    };
+    let Some(process) = task.process.upgrade() else {
+        return None;
+    };
+    let Some(inner) = process.try_inner_exclusive_access() else {
+        return None;
+    };
+    if inner.memory_set.token() == token {
+        Some(lazy_framed_user_fault)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn translated_byte_buffer_checked(
     token: usize,
     ptr: *const u8,
@@ -69,6 +104,10 @@ pub(crate) fn translated_byte_buffer_checked_with_fault(
     if len == 0 {
         return Ok(Vec::new());
     }
+    // CONTEXT: brk growth is VMA-reserved and materialized lazily. Default
+    // current-process syscall copies should fault those framed pages in, while
+    // full mmap fault handling remains opt-in through the explicit mmap helper.
+    let fault_handler = effective_user_fault_handler(token, fault_handler);
     let mut start = ptr as usize;
     let end = start.checked_add(len).ok_or(SysError::EFAULT)?;
     let page_table = PageTable::from_token(token);
@@ -167,6 +206,7 @@ fn try_same_page_user_slice(
         return None;
     }
 
+    let fault_handler = effective_user_fault_handler(token, fault_handler);
     let page_table = PageTable::from_token(token);
     let pte = match checked_user_pte(
         &page_table,

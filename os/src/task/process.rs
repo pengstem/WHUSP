@@ -890,6 +890,10 @@ impl ProcessControlBlock {
         self.inner.exclusive_access()
     }
 
+    pub fn try_inner_exclusive_access(&self) -> Option<UPIntrRefMut<'_, ProcessControlBlockInner>> {
+        self.inner.try_exclusive_access()
+    }
+
     pub(crate) fn path_snapshot(&self) -> PathSnapshot {
         // Snapshot lookup identity and visible path strings under the PCB lock,
         // then let syscall path code release it before touching fd tables or
