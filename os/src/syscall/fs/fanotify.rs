@@ -368,6 +368,9 @@ impl FanotifyGroup {
         {
             return 0;
         }
+        if is_dir && mask & FAN_ONDIR == 0 {
+            return 0;
+        }
         let event_bits = event_mask & mask & SUPPORTED_MARK_EVENTS;
         if event_bits == 0 {
             return 0;
