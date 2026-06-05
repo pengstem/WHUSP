@@ -487,6 +487,8 @@ pub(crate) fn copy_to_user_in_memory_set(
     // Used for child or freshly exec'd address spaces, not necessarily the
     // current task. Resolve COW against the supplied MemorySet before translating
     // through its token, and do not invoke the current-task mmap fault handler.
+    // Exec and fork setup rely on this to keep user-stack writes scoped to the
+    // address space being constructed.
     resolve_cow_write_range_in_memory_set(memory_set, ptr, src.len())?;
     let buffers = translated_byte_buffer_checked(
         memory_set.token(),

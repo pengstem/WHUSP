@@ -688,7 +688,9 @@ impl ProcessControlBlockInner {
     ///
     /// Callers that need rollback-safe publication must keep the allocation and
     /// final `set_fd_entry` ordering explicit; this helper does not reserve the
-    /// slot in the table.
+    /// slot in the table. The bitmap is only a mirror of `fd_table`; updates
+    /// must stay paired with install/take paths so `RLIMIT_NOFILE` searches do
+    /// not observe stale open descriptors.
     pub fn alloc_fd_from(&mut self, lower_bound: usize) -> Option<usize> {
         let limit = self.nofile_limit();
         if lower_bound >= limit {

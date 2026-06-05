@@ -135,7 +135,9 @@ const LOOPBACK_IP: [u8; 4] = [127, 0, 0, 1];
 const ANY_IP: [u8; 4] = [0, 0, 0, 0];
 const LOOPBACK_IPV6: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 const ANY_IPV6: [u8; 16] = [0; 16];
-const DEFAULT_SOCKET_BUFFER: i32 = 64 * 1024;
+// CONTEXT: iperf's default TCP block is 128 KiB. A 256 KiB local loopback
+// queue avoids artificial sender sleeps while staying near Linux-like defaults.
+const DEFAULT_SOCKET_BUFFER: i32 = 256 * 1024;
 const MAX_LISTEN_BACKLOG: usize = 128;
 
 lazy_static! {
@@ -490,6 +492,7 @@ struct LocalSocketInner {
     accept_queue: VecDeque<Arc<UPIntrFreeCell<LocalSocketInner>>>,
     stream_rx: VecDeque<u8>,
     datagram_rx: VecDeque<Datagram>,
+    datagram_rx_bytes: usize,
     read_wait_queue: VecDeque<Arc<TaskControlBlock>>,
     write_wait_queue: VecDeque<Arc<TaskControlBlock>>,
     read_poll_waiters: PollWaitQueue,
@@ -644,6 +647,7 @@ impl LocalSocketInner {
             accept_queue: VecDeque::new(),
             stream_rx: VecDeque::new(),
             datagram_rx: VecDeque::new(),
+            datagram_rx_bytes: 0,
             read_wait_queue: VecDeque::new(),
             write_wait_queue: VecDeque::new(),
             read_poll_waiters: PollWaitQueue::new(),
@@ -722,6 +726,22 @@ impl LocalSocketInner {
 
     fn remove_writer(&mut self, task: &Arc<TaskControlBlock>) {
         remove_socket_waiter(&mut self.write_wait_queue, task);
+    }
+
+    fn can_enqueue_datagram(&self, len: usize) -> bool {
+        let capacity = (self.rcvbuf as usize).max(1);
+        self.datagram_rx_bytes.saturating_add(len) <= capacity
+    }
+
+    fn enqueue_datagram(&mut self, packet: Datagram) {
+        self.datagram_rx_bytes = self.datagram_rx_bytes.saturating_add(packet.data.len());
+        self.datagram_rx.push_back(packet);
+    }
+
+    fn pop_datagram(&mut self) -> Option<Datagram> {
+        let packet = self.datagram_rx.pop_front()?;
+        self.datagram_rx_bytes = self.datagram_rx_bytes.saturating_sub(packet.data.len());
+        Some(packet)
     }
 }
 
@@ -1199,12 +1219,12 @@ impl LocalSocket {
 
     fn send_bytes(
         &self,
-        data: &[u8],
+        data: Vec<u8>,
         remote: Option<SocketAddress>,
         nonblock: bool,
     ) -> SysResult<usize> {
         match self.kind() {
-            SocketKind::Stream => self.send_stream(data, nonblock),
+            SocketKind::Stream => self.send_stream(&data, nonblock),
             SocketKind::Datagram => self.send_datagram(data, remote, nonblock),
         }
     }
@@ -1371,13 +1391,13 @@ impl LocalSocket {
 
     fn send_datagram(
         &self,
-        data: &[u8],
+        data: Vec<u8>,
         remote: Option<SocketAddress>,
         nonblock: bool,
     ) -> SysResult<usize> {
         perf::record_local_socket_write_call();
         if self.inner.exclusive_access().domain == SocketDomain::Netlink {
-            return self.send_netlink_route(data);
+            return self.send_netlink_route(&data);
         }
         let local = self.ensure_bound(SocketKind::Datagram)?;
         let local_unix = self.inner.exclusive_access().unix_local.clone();
@@ -1391,20 +1411,15 @@ impl LocalSocket {
             None
         };
         if let Some(peer) = connected_peer {
+            let data_len = data.len();
             loop {
                 let mut peer = peer.exclusive_access();
                 if peer.read_shutdown {
                     return Err(SysError::EPIPE);
                 }
-                let queued_bytes: usize = peer
-                    .datagram_rx
-                    .iter()
-                    .map(|packet| packet.data.len())
-                    .sum();
-                let capacity = (peer.rcvbuf as usize).max(1);
-                if queued_bytes.saturating_add(data.len()) <= capacity {
-                    peer.datagram_rx.push_back(Datagram {
-                        data: data.to_vec(),
+                if peer.can_enqueue_datagram(data_len) {
+                    peer.enqueue_datagram(Datagram {
+                        data,
                         from: local,
                         from_unix: local_unix,
                     });
@@ -1413,7 +1428,7 @@ impl LocalSocket {
                     drop(peer);
                     wake_local_socket_reader(reader);
                     PollWaiter::wake_all(read_waiters);
-                    return Ok(data.len());
+                    return Ok(data_len);
                 }
                 if nonblock {
                     return Err(SysError::EAGAIN);
@@ -1462,15 +1477,10 @@ impl LocalSocket {
         let target = target.or(fallback);
         if let Some(target) = target {
             let mut target = target.exclusive_access();
-            let queued_bytes: usize = target
-                .datagram_rx
-                .iter()
-                .map(|packet| packet.data.len())
-                .sum();
-            let capacity = (target.rcvbuf as usize).max(1);
-            if queued_bytes.saturating_add(data.len()) <= capacity {
-                target.datagram_rx.push_back(Datagram {
-                    data: data.to_vec(),
+            let data_len = data.len();
+            if target.can_enqueue_datagram(data_len) {
+                target.enqueue_datagram(Datagram {
+                    data,
                     from: local,
                     from_unix: local_unix,
                 });
@@ -1479,7 +1489,7 @@ impl LocalSocket {
                 drop(target);
                 wake_local_socket_reader(reader);
                 PollWaiter::wake_all(read_waiters);
-                return Ok(data.len());
+                return Ok(data_len);
             }
             drop(target);
             if nonblock {
@@ -1494,7 +1504,7 @@ impl LocalSocket {
         let read_waiters = {
             let mut inner = self.inner.exclusive_access();
             for data in responses {
-                inner.datagram_rx.push_back(Datagram {
+                inner.enqueue_datagram(Datagram {
                     data,
                     from: InetEndpoint {
                         ip: ANY_IP,
@@ -1584,7 +1594,7 @@ impl LocalSocket {
                     Vec::new()
                 };
                 let peer = if peer_is_self { None } else { peer };
-                let packet = inner.datagram_rx.pop_front();
+                let packet = inner.pop_datagram();
                 let writer = inner.wake_writer();
                 (packet, peer, writer, write_waiters, inner.domain)
             };
@@ -1632,7 +1642,7 @@ impl LocalSocket {
             let (packet, writer, write_waiters) = {
                 let mut inner = self.inner.exclusive_access();
                 (
-                    inner.datagram_rx.pop_front(),
+                    inner.pop_datagram(),
                     inner.wake_writer(),
                     inner.write_poll_waiters.drain(),
                 )
@@ -2195,7 +2205,7 @@ impl File for LocalSocket {
             SocketKind::Datagram => {
                 let data = buf.to_vec();
                 perf::record_local_socket_write_user_buffer(len, data.len(), 0);
-                self.send_datagram(&data, None, false).unwrap_or_default()
+                self.send_datagram(data, None, false).unwrap_or_default()
             }
         }
     }
@@ -2262,12 +2272,7 @@ impl File for LocalSocket {
                 SocketKind::Datagram => {
                     let writable = if let Some(peer) = peer.as_ref().and_then(Weak::upgrade) {
                         let peer = peer.exclusive_access();
-                        let queued_bytes: usize = peer
-                            .datagram_rx
-                            .iter()
-                            .map(|packet| packet.data.len())
-                            .sum();
-                        queued_bytes < (peer.rcvbuf as usize).max(1)
+                        peer.datagram_rx_bytes < (peer.rcvbuf as usize).max(1)
                     } else {
                         true
                     };
@@ -3445,7 +3450,7 @@ pub fn sys_sendto(
         Some(read_socket_address(token, addr, addrlen)?)
     };
     with_socket(fd, |socket| {
-        match socket.send_bytes(&data, remote, recv_nonblock(flags, socket)) {
+        match socket.send_bytes(data, remote, recv_nonblock(flags, socket)) {
             Ok(written) => Ok(written as isize),
             Err(SysError::EPIPE) => {
                 current_add_signal(SignalFlags::SIGPIPE);
@@ -3620,7 +3625,7 @@ pub fn sys_sendmsg(fd: usize, msg: usize, _flags: i32) -> SysResult {
         let token = current_user_token();
         let msg = read_user_value(token, msg as *const LinuxMsghdr)?;
         let data = read_msg_iovecs(token, msg.msg_iov, msg.msg_iovlen)?;
-        return Ok(socket.send_bytes(&data, None, false)? as isize);
+        return Ok(socket.send_bytes(data, None, false)? as isize);
     }
     // UNFINISHED: scatter/gather socket messages and control messages are not
     // implemented for the local loopback socket subset.
