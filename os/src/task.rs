@@ -598,15 +598,12 @@ fn exit_current(exit_code: i32, group_exit: bool) {
     current.inner_exclusive_access().res = None;
 
     let process_exit = group_exit || tid == 0;
-    let exited_thread = if tid == 0 {
-        None
-    } else {
+    if tid != 0 {
         let mut process_inner = process.inner_exclusive_access();
         if tid < process_inner.tasks.len() {
             process_inner.tasks[tid] = None;
         }
-        Some(Arc::clone(&current))
-    };
+    }
     if process_exit {
         let pid = process.getpid();
         if pid == IDLE_PID || Arc::ptr_eq(&process, &INITPROC) {
@@ -747,9 +744,10 @@ fn exit_current(exit_code: i32, group_exit: bool) {
     task_inner.exit_code = Some(exit_code);
     task_inner.task_status = TaskStatus::Exited;
     drop(task_inner);
-    if let Some(task) = exited_thread {
-        queue_exited_task(task);
-    }
+    // Keep the exiting task's kernel stack mapped until after the scheduler has
+    // switched to a different stack.  This also covers auto-reaped process exits
+    // where dropping the PCB below can otherwise release the main task here.
+    queue_exited_task(Arc::clone(&task));
     drop(current);
     drop(task);
     drop(process);
