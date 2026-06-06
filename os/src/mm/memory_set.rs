@@ -104,6 +104,10 @@ impl MemorySet {
     }
 
     #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+    /// Patches fixed data inside the mapped vDSO image without making it writable.
+    ///
+    /// The write goes through the backing physical page, so callers must keep
+    /// the user mapping R/X/U-only and restrict this to kernel-owned vDSO data.
     pub(crate) fn patch_vdso_u64(&mut self, start_va: usize, offset: usize, value: u64) -> bool {
         let Some(va) = start_va.checked_add(offset) else {
             return false;

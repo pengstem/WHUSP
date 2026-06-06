@@ -402,6 +402,9 @@ impl ProcessControlBlock {
         }
 
         let mut task_inner = task.inner_exclusive_access();
+        // UNFINISHED: Linux also notifies robust-futex waiters when the owner
+        // thread execve()s. This path currently clears the per-thread robust
+        // list for the new image without walking the old list.
         task_inner.robust_list_head = 0;
         task_inner.sigsuspend_restore_mask = None;
         task_inner.sigaltstack = SigAltStack::disabled();

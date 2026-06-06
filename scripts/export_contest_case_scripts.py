@@ -589,6 +589,11 @@ exit 0
         if script == "lmbench_testcode.sh":
             commands.append("export ENOUGH=10000 TIMING_O=0 LOOP_O=0")
             commands.append("./busybox rm -f /tmp/hello")
+            commands.append("./busybox cat > ./hello <<'WHUSP_LMBENCH_HELLO'")
+            commands.append(f"#!{libc_root}/lmbench_all hello")
+            commands.append("WHUSP_LMBENCH_HELLO")
+            commands.append("./busybox chmod +x ./hello")
+            commands.append("./busybox cp ./hello /tmp/hello")
         prefix = ""
         if arch == "la" and libc_root == "/musl" and script == "cyclictest_testcode.sh":
             prefix = f"LD_PRELOAD={LA_MUSL_COMPAT_PRELOAD} "

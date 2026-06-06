@@ -1,14 +1,14 @@
 use crate::config::USER_STACK_SIZE;
 use crate::fs::{
-    File, FileStat, FsNodeKind, MountId, OpenFlags, PathContext, S_IFLNK, S_IFMT, S_IFREG,
-    VfsNodeId, lookup_path_in, mount_is_noexec, normalize_path_at_root, open_file_in,
-    regular_file_is_open_writable_in, regular_file_node_is_open_writable, stat_in,
+    lookup_path_in, mount_is_noexec, normalize_path_at_root, open_file_in,
+    regular_file_is_open_writable_in, regular_file_node_is_open_writable, stat_in, File, FileStat,
+    FsNodeKind, MountId, OpenFlags, PathContext, VfsNodeId, S_IFLNK, S_IFMT, S_IFREG,
 };
 use crate::mm::record_exec_metadata_read;
 use crate::syscall::errno::{SysError, SysResult};
-use crate::syscall::fs::permissions::{AccessSubject, check_execute_permission};
+use crate::syscall::fs::permissions::{check_execute_permission, AccessSubject};
 use crate::syscall::fs::{fanotify_notify_open_exec_at, path_context_from};
-use crate::syscall::user_ptr::{PATH_MAX, read_user_c_string, read_user_usize};
+use crate::syscall::user_ptr::{read_user_c_string, read_user_usize, PATH_MAX};
 use crate::task::{current_process, current_user_token};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -466,18 +466,9 @@ fn read_exec_file_in(
     read_exec_source_from_file(app_file)
 }
 
-fn read_exec_file_direct(path: &str) -> SysResult<ExecImageSource> {
-    read_exec_file_in(current_process().path_snapshot().context, path, true)
-}
-
 fn normalized_exec_path_in(context: &PathContext, path: &str) -> String {
     normalize_path_at_root(context.root_path(), context.cwd_path(), path)
         .unwrap_or_else(|| String::from(path))
-}
-
-fn normalized_current_exec_path(path: &str) -> String {
-    let context = current_process().path_snapshot().context;
-    normalized_exec_path_in(&context, path)
 }
 
 fn read_exec_open_file(file: Arc<dyn File + Send + Sync>) -> SysResult<ExecImageSource> {
@@ -485,59 +476,8 @@ fn read_exec_open_file(file: Arc<dyn File + Send + Sync>) -> SysResult<ExecImage
     read_exec_source_from_file(file)
 }
 
-fn lmbench_all_redirect() -> &'static str {
-    let snapshot = current_process().path_snapshot();
-    if snapshot.cwd_path.starts_with("/glibc") {
-        "/glibc/lmbench_all"
-    } else {
-        "/musl/lmbench_all"
-    }
-}
-
-fn exec_compat_redirect(path: &str) -> Option<&'static str> {
-    match path {
-        // CONTEXT: The official lmbench wrapper `hello` may contain this
-        // build-host absolute path. Redirect it to the libc-local test binary
-        // so `lat_proc shell` measures shell+exec instead of console errors.
-        "/code/lmbench_src/bin/build/lmbench_all" => Some(lmbench_all_redirect()),
-        _ => None,
-    }
-}
-
-fn lmbench_hello_wrapper_args(args: Vec<String>) -> (String, Vec<String>) {
-    let target = String::from(lmbench_all_redirect());
-    let mut next_args = Vec::new();
-    next_args.push(target.clone());
-    next_args.push(String::from("hello"));
-    next_args.extend(args.into_iter().skip(1));
-    (target, next_args)
-}
-
-fn exec_compat_script_redirect(
-    path: &str,
-    data: &[u8],
-    args: Vec<String>,
-) -> Option<(String, Vec<String>)> {
-    if path == "/tmp/hello" && data.starts_with(b"/code/lmbench_src/bin/build/lmbench_all hello") {
-        // CONTEXT: lmbench's generated `hello` wrapper is a no-shebang shell
-        // fragment. Run the intended `lmbench_all hello` payload directly so
-        // `lat_proc shell` does not measure an extra ENOEXEC shell fallback.
-        return Some(lmbench_hello_wrapper_args(args));
-    }
-    None
-}
-
 fn read_exec_file(path: &str) -> SysResult<ExecImageSource> {
-    match read_exec_file_direct(path) {
-        Ok(data) => Ok(data),
-        Err(err) => {
-            if let Some(target) = exec_compat_redirect(path) {
-                read_exec_file_direct(target).or(Err(err))
-            } else {
-                Err(err)
-            }
-        }
-    }
+    read_exec_file_in(current_process().path_snapshot().context, path, true)
 }
 
 fn read_elf_interpreter(path: &str) -> SysResult<ExecImageSource> {
@@ -567,10 +507,10 @@ fn read_elf_interpreter(path: &str) -> SysResult<ExecImageSource> {
 
     for (alias, target) in REDIRECTS {
         if path == *alias {
-            return read_exec_file_direct(target).or_else(|_| read_exec_file_direct(path));
+            return read_exec_file(target).or_else(|_| read_exec_file(path));
         }
     }
-    read_exec_file_direct(path)
+    read_exec_file(path)
 }
 
 fn append_script_args(
@@ -662,7 +602,8 @@ fn exec_script(
         let Ok(interpreter_data) = read_exec_file(interpreter_path.as_str()) else {
             continue;
         };
-        let executable_path = normalized_current_exec_path(interpreter_path.as_str());
+        let context = current_process().path_snapshot().context;
+        let executable_path = normalized_exec_path_in(&context, interpreter_path.as_str());
         let next_args = append_script_args(candidate_args, script_path, args);
         return exec_loaded_program(
             interpreter_path,
@@ -750,22 +691,6 @@ fn exec_loaded_program(
         // old program. For PT_INTERP ELFs, the kernel enters the dynamic linker
         // while auxv still describes the original executable.
         return Ok(0);
-    }
-
-    if let Some((target, next_args)) =
-        exec_compat_script_redirect(path.as_str(), source.data.as_slice(), args.clone())
-    {
-        let target_data = read_exec_file(target.as_str())?;
-        let executable_path = normalized_current_exec_path(target.as_str());
-        return exec_loaded_program(
-            target,
-            executable_path,
-            next_args,
-            envs,
-            depth + 1,
-            target_data,
-            None,
-        );
     }
 
     let interpreter = match parse_shebang(source.data.as_slice())? {

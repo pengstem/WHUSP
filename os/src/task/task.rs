@@ -167,7 +167,12 @@ pub struct TaskControlBlockInner {
     // CLONE_VM helper tasks own a separate PidHandle so futex, tgkill, and
     // robust-list paths never expose the internal task-slot index as a TID.
     pub linux_tid: Option<PidHandle>,
+    // Linux clear_child_tid user address from set_tid_address()/clone().
+    // Exit cleanup writes 0 through this task's address space and wakes one
+    // futex waiter, so this must track the Linux-visible thread lifecycle.
     pub clear_child_tid: Option<usize>,
+    // Per-thread robust-list head from set_robust_list(); robust futex cleanup
+    // must pair this pointer with linux_tid(), not the internal task slot.
     pub robust_list_head: usize,
     pub pending_signals: SignalFlags,
     pub signal_infos: Vec<Option<SignalInfo>>,

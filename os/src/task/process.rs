@@ -354,6 +354,9 @@ pub(crate) struct PathSnapshot {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessFsContext {
+    // `WorkingDir` is the VFS anchor; the parallel string is the Linux-visible
+    // path snapshot used by getcwd/procfs and relative-path reconstruction.
+    // Keep each pair synchronized when chdir/chroot/fchdir updates either side.
     root: WorkingDir,
     root_path: String,
     cwd: WorkingDir,
