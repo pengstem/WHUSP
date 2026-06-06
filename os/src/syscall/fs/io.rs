@@ -1460,10 +1460,6 @@ fn preadv2_uses_current_offset(pos_l: usize, _pos_h: usize) -> bool {
     pos_l == usize::MAX
 }
 
-fn preadv2_nowait_iovcnt(iovcnt: usize) -> usize {
-    if iovcnt > 1 { 1 } else { iovcnt }
-}
-
 fn sys_preadv2_nowait(
     fd: usize,
     iov: *const LinuxIovec,
@@ -1478,7 +1474,7 @@ fn sys_preadv2_nowait(
     if attempt % 8 == 0 {
         return Err(SysError::EAGAIN);
     }
-    let iovcnt = preadv2_nowait_iovcnt(iovcnt);
+    let iovcnt = iovcnt.min(1);
     if preadv2_uses_current_offset(pos_l, pos_h) {
         sys_readv(fd, iov, iovcnt)
     } else {

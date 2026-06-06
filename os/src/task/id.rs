@@ -113,6 +113,10 @@ impl KernelStack {
         let (_, kernel_stack_top) = kernel_stack_position(self.0);
         kernel_stack_top
     }
+
+    pub fn bounds(&self) -> (usize, usize) {
+        kernel_stack_position(self.0)
+    }
 }
 
 pub struct TaskUserRes {

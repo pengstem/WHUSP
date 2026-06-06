@@ -158,12 +158,12 @@ pub fn trap_return_context_after_accounting_for_task(
     (trap_cx, user_token)
 }
 
-pub fn current_kstack_top() -> usize {
+pub fn current_kstack_bounds() -> (usize, usize) {
     PROCESSOR
         .exclusive_access()
         .current
         .as_ref()
-        .map_or_else(hart::boot_stack_top, |task| task.kstack.get_top())
+        .map_or_else(hart::boot_stack_bounds, |task| task.kstack.bounds())
 }
 
 pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {

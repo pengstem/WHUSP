@@ -55,7 +55,7 @@ pub(crate) use manager::task_with_linux_tid;
 pub use manager::{add_task, pid2process, remove_from_pid2process, wakeup_task};
 pub(crate) use manager::{wakeup_front_task, wakeup_timer_task};
 pub use processor::{
-    current_kstack_top, current_process, current_task, current_trap_cx, current_user_token,
+    current_kstack_bounds, current_process, current_task, current_trap_cx, current_user_token,
     process_of_task, run_tasks, schedule, take_current_task, trap_cx_of_task,
     trap_return_context_after_accounting_for_task,
 };

@@ -273,12 +273,9 @@ pub(crate) fn mount_stat_flags_from_linux_mount_flags(flags: usize) -> u64 {
     stat_flags
 }
 
-fn mount_options(read_only: bool) -> &'static str {
-    if read_only { "ro" } else { "rw" }
-}
-
 fn mount_options_from_flags(flags: u64) -> &'static str {
-    mount_options(flags & MOUNT_STAT_RDONLY != 0)
+    let read_only = flags & MOUNT_STAT_RDONLY != 0;
+    if read_only { "ro" } else { "rw" }
 }
 
 fn clear_dentry_cache_on_mount_change<T>(result: Result<T, MountError>) -> Result<T, MountError> {
@@ -1486,7 +1483,7 @@ pub(crate) fn create_detached_tmpfs_mount(
         Box::new(TmpFs::new()),
         source,
         "tmpfs",
-        mount_options(read_only),
+        if read_only { "ro" } else { "rw" },
     ));
     let root_ino = root_ino_for(mount_id).ok_or(MountError::SourceMissing)?;
     Ok(WorkingDir::new(mount_id, root_ino))
@@ -1873,7 +1870,7 @@ pub(crate) fn mount_tmpfs_at(
         Box::new(TmpFs::new()),
         "tmpfs",
         target_path,
-        mount_options(read_only),
+        if read_only { "ro" } else { "rw" },
     )
 }
 
@@ -1907,7 +1904,7 @@ pub(crate) fn mount_ext_scratch_at(
     target_path: &str,
     read_only: bool,
 ) -> Result<MountId, MountError> {
-    let options = mount_options(read_only);
+    let options = if read_only { "ro" } else { "rw" };
     let mounted = {
         let mut scratch_mounts = EXT_SCRATCH_MOUNTS.lock();
         if let Some((_, _, mounted)) =
@@ -1958,7 +1955,7 @@ pub(crate) fn mount_cgroup2_at(
         Box::new(CgroupFs::new()),
         "cgroup2",
         target_path,
-        mount_options(read_only),
+        if read_only { "ro" } else { "rw" },
     )
 }
 
@@ -1974,7 +1971,7 @@ pub(crate) fn mount_cgroup_memory_at(
         Box::new(CgroupFs::new_v1_memory()),
         "cgroup",
         target_path,
-        mount_options(read_only),
+        if read_only { "ro" } else { "rw" },
     )
 }
 
