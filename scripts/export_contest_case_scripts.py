@@ -24,9 +24,79 @@ DEFAULT_OUT_DIR = REPO_ROOT / "contest-case-commands"
 MARKER_FILE = ".generated-by-export-contest-case-scripts"
 ARCHES = ("rv", "la")
 LA_MUSL_COMPAT_PRELOAD = "/opt/oscomp-support/lib/liboscomp-musl-compat.so"
+LA_MUSL_COMPAT_ASSET = (
+    REPO_ROOT / "os" / "assets" / "loongarch64" / "liboscomp-musl-compat.so"
+)
 RV_MUSL_SPLICE07_SYSCALL_PRELOAD_BASENAME = "libwhusp-rv-musl-splice07-syscall.so"
 RV_MUSL_SPLICE07_SYSCALL_PRELOAD_ASSET = (
     REPO_ROOT / "os" / "assets" / "riscv64" / RV_MUSL_SPLICE07_SYSCALL_PRELOAD_BASENAME
+)
+STATIC_COMPAT_ROOT = "support-root"
+
+ETC_SUPPORT_FILES = {
+    "etc/nsswitch.conf": b"passwd: files\ngroup: files\nhosts: files\nprotocols: files\nservices: files\nnetworks: files\n",
+    "etc/passwd": b"root:x:0:0:root:/root:/bin/sh\n"
+    b"nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+    b"ltp_add_key05_0:x:10000:10000:LTP add_key05 user:/tmp:/bin/sh\n"
+    b"ltp_add_key05_1:x:10001:10001:LTP add_key05 user:/tmp:/bin/sh\n"
+    b"ltp_add_key05_2:x:10002:10002:LTP add_key05 user:/tmp:/bin/sh\n"
+    b"ltp_add_key05_3:x:10003:10003:LTP add_key05 user:/tmp:/bin/sh\n"
+    b"ltp_add_key05_4:x:10004:10004:LTP add_key05 user:/tmp:/bin/sh\n"
+    b"ltp_add_key05_5:x:10005:10005:LTP add_key05 user:/tmp:/bin/sh\n"
+    b"ltp_add_key05_6:x:10006:10006:LTP add_key05 user:/tmp:/bin/sh\n"
+    b"ltp_add_key05_7:x:10007:10007:LTP add_key05 user:/tmp:/bin/sh\n"
+    b"ltp_add_key05_8:x:10008:10008:LTP add_key05 user:/tmp:/bin/sh\n"
+    b"ltp_add_key05_9:x:10009:10009:LTP add_key05 user:/tmp:/bin/sh\n",
+    "etc/group": b"root:x:0:\n"
+    b"daemon:x:1:\n"
+    b"users:x:100:\n"
+    b"nobody:x:65534:\n"
+    b"nogroup:x:65534:\n"
+    b"ltp_add_key05_0:x:10000:\n"
+    b"ltp_add_key05_1:x:10001:\n"
+    b"ltp_add_key05_2:x:10002:\n"
+    b"ltp_add_key05_3:x:10003:\n"
+    b"ltp_add_key05_4:x:10004:\n"
+    b"ltp_add_key05_5:x:10005:\n"
+    b"ltp_add_key05_6:x:10006:\n"
+    b"ltp_add_key05_7:x:10007:\n"
+    b"ltp_add_key05_8:x:10008:\n"
+    b"ltp_add_key05_9:x:10009:\n",
+    "etc/hosts": b"127.0.0.1 localhost localhost.localdomain\n",
+    "etc/services": b"echo 7/tcp\necho 7/udp\n",
+    "etc/resolv.conf": b"",
+    "etc/protocols": b"ip 0 IP\ntcp 6 TCP\nudp 17 UDP\n",
+}
+
+MODULE_SUPPORT_FILES = {
+    "modules.dep": b"kernel/drivers/block/loop.ko:\n"
+    b"kernel/drivers/memory/hwpoison_inject.ko:\n"
+    b"kernel/fs/quota/quota_v2.ko:\n"
+    b"kernel/net/dns_resolver/dns_resolver.ko:\n"
+    b"kernel/drivers/net/veth.ko:\n",
+    "modules.builtin": b"kernel/drivers/block/loop.ko\n"
+    b"kernel/drivers/memory/hwpoison_inject.ko\n"
+    b"kernel/fs/quota/quota_v2.ko\n"
+    b"kernel/net/dns_resolver/dns_resolver.ko\n"
+    b"kernel/drivers/net/veth.ko\n",
+    "modules.alias": b"",
+    "modules.order": b"kernel/net/dns_resolver/dns_resolver.ko\n",
+    "modules.symbols": b"",
+    "config": b"CONFIG_FS_VERITY=y\n"
+    b"CONFIG_USER_DECRYPTED_DATA=y\n"
+    b"CONFIG_PREEMPT_RT=y\n"
+    b"CONFIG_MEMORY_FAILURE=y\n"
+    b"CONFIG_HWPOISON_INJECT=y\n",
+}
+
+DNS_RESOLVER_KO = b"WHUSP built-in dns_resolver module placeholder\n"
+MODULE_METADATA_PREFIXES = ("", "glibc", "musl", "lib/modules", "lib/modules/6.8.0-whusp")
+MODULE_KERNEL_PREFIXES = (
+    "kernel",
+    "glibc/kernel",
+    "musl/kernel",
+    "lib/modules/kernel",
+    "lib/modules/6.8.0-whusp/kernel",
 )
 
 
@@ -361,6 +431,62 @@ def write_support_libs(out_dir: Path) -> None:
         RV_MUSL_SPLICE07_SYSCALL_PRELOAD_ASSET,
         lib_dir / RV_MUSL_SPLICE07_SYSCALL_PRELOAD_BASENAME,
     )
+
+
+def static_compat_files() -> dict[str, bytes]:
+    files = dict(ETC_SUPPORT_FILES)
+    for prefix in MODULE_METADATA_PREFIXES:
+        for name, content in MODULE_SUPPORT_FILES.items():
+            files[str(Path(prefix) / name) if prefix else name] = content
+    for prefix in MODULE_KERNEL_PREFIXES:
+        files[str(Path(prefix) / "net" / "dns_resolver" / "dns_resolver.ko")] = DNS_RESOLVER_KO
+    return files
+
+
+def write_static_compat_support_root(out_dir: Path) -> list[str]:
+    support_root = out_dir / STATIC_COMPAT_ROOT
+    files = static_compat_files()
+    relative_files = sorted(files)
+    for relative in relative_files:
+        path = support_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(files[relative])
+        path.chmod(0o644)
+
+    compat_so = support_root / "opt" / "oscomp-support" / "lib" / "liboscomp-musl-compat.so"
+    compat_so.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(LA_MUSL_COMPAT_ASSET, compat_so)
+    compat_so.chmod(0o755)
+    relative_files.append("opt/oscomp-support/lib/liboscomp-musl-compat.so")
+    return sorted(relative_files)
+
+
+def static_compat_install_lines(relative_files: list[str]) -> list[str]:
+    lines = [
+        "# Install ordinary compatibility files from the script disk onto the writable root FS.",
+        f'_whusp_static_root="$WHUSP_SCRIPT_ROOT/{STATIC_COMPAT_ROOT}"',
+        'if [ -d "$_whusp_static_root" ]; then',
+    ]
+    seen_parents: set[str] = set()
+    for relative in relative_files:
+        parent = "/" + str(Path(relative).parent)
+        if parent == "/.":
+            parent = "/"
+        if parent != "/" and parent not in seen_parents:
+            lines.append(f"    /musl/busybox mkdir -p {sh_quote(parent)}")
+            seen_parents.add(parent)
+        destination = "/" + relative
+        lines.append(
+            f'    /musl/busybox cp -f "$_whusp_static_root/{relative}" {sh_quote(destination)} || exit $?'
+        )
+    lines.extend(
+        [
+            "fi",
+            "unset _whusp_static_root",
+            "",
+        ]
+    )
+    return lines
 
 
 def common_root_relative(relative_common: str) -> str:
@@ -819,7 +945,12 @@ def append_skip_group_marker(lines: list[str], group: str, libc: str) -> None:
     lines.append(f"echo {end}")
 
 
-def entry_script(all_tests: list[str], test_scripts: list[str], libc_roots: list[str]) -> str:
+def entry_script(
+    all_tests: list[str],
+    test_scripts: list[str],
+    libc_roots: list[str],
+    static_compat_relative_files: list[str],
+) -> str:
     enabled_scripts = set(test_scripts)
     lines = [
         "#!/musl/busybox sh",
@@ -846,6 +977,7 @@ def entry_script(all_tests: list[str], test_scripts: list[str], libc_roots: list
         "esac",
         "",
     ]
+    lines.extend(static_compat_install_lines(static_compat_relative_files))
 
     for index, script in enumerate(all_tests):
         name = test_name(script)
@@ -881,8 +1013,12 @@ def _write_outputs_unlocked(
     prepare_out_dir(out_dir, force)
     write_static_shims(out_dir)
     write_support_libs(out_dir)
+    static_compat_relative_files = write_static_compat_support_root(out_dir)
     write_executable(out_dir / "common.sh", common_script(manifests))
-    write_executable(out_dir / "entry.sh", entry_script(all_tests, test_scripts, libc_roots))
+    write_executable(
+        out_dir / "entry.sh",
+        entry_script(all_tests, test_scripts, libc_roots, static_compat_relative_files),
+    )
     manifest_lines = [
         "kind\tarch\tlibc\tindex\tgroup_or_case\tsource\tline\tcommand\tcurrent_runner_enabled\tcurrent_runner_skips_this_libc"
     ]

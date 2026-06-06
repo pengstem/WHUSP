@@ -1,14 +1,14 @@
 use crate::config::USER_STACK_SIZE;
 use crate::fs::{
-    lookup_path_in, mount_is_noexec, normalize_path_at_root, open_file_in,
-    regular_file_is_open_writable_in, regular_file_node_is_open_writable, stat_in, File, FileStat,
-    FsNodeKind, MountId, OpenFlags, PathContext, VfsNodeId, S_IFLNK, S_IFMT, S_IFREG,
+    File, FileStat, FsNodeKind, MountId, OpenFlags, PathContext, S_IFLNK, S_IFMT, S_IFREG,
+    VfsNodeId, lookup_path_in, mount_is_noexec, normalize_path_at_root, open_file_in,
+    regular_file_is_open_writable_in, regular_file_node_is_open_writable, stat_in,
 };
 use crate::mm::record_exec_metadata_read;
 use crate::syscall::errno::{SysError, SysResult};
-use crate::syscall::fs::permissions::{check_execute_permission, AccessSubject};
+use crate::syscall::fs::permissions::{AccessSubject, check_execute_permission};
 use crate::syscall::fs::{fanotify_notify_open_exec_at, path_context_from};
-use crate::syscall::user_ptr::{read_user_c_string, read_user_usize, PATH_MAX};
+use crate::syscall::user_ptr::{PATH_MAX, read_user_c_string, read_user_usize};
 use crate::task::{current_process, current_user_token};
 use alloc::format;
 use alloc::string::{String, ToString};
