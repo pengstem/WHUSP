@@ -24,6 +24,10 @@ DEFAULT_OUT_DIR = REPO_ROOT / "contest-case-commands"
 MARKER_FILE = ".generated-by-export-contest-case-scripts"
 ARCHES = ("rv", "la")
 LA_MUSL_COMPAT_PRELOAD = "/opt/oscomp-support/lib/liboscomp-musl-compat.so"
+RV_MUSL_SPLICE07_SYSCALL_PRELOAD_BASENAME = "libwhusp-rv-musl-splice07-syscall.so"
+RV_MUSL_SPLICE07_SYSCALL_PRELOAD_ASSET = (
+    REPO_ROOT / "os" / "assets" / "riscv64" / RV_MUSL_SPLICE07_SYSCALL_PRELOAD_BASENAME
+)
 
 
 @dataclass(frozen=True)
@@ -350,6 +354,15 @@ def write_static_shims(out_dir: Path) -> None:
         write_executable(bin_dir / name, script)
 
 
+def write_support_libs(out_dir: Path) -> None:
+    lib_dir = out_dir / "lib"
+    lib_dir.mkdir()
+    shutil.copy2(
+        RV_MUSL_SPLICE07_SYSCALL_PRELOAD_ASSET,
+        lib_dir / RV_MUSL_SPLICE07_SYSCALL_PRELOAD_BASENAME,
+    )
+
+
 def common_root_relative(relative_common: str) -> str:
     parent = Path(relative_common).parent
     if str(parent) == ".":
@@ -421,6 +434,27 @@ whusp_ltp_run_current_case() {
     echo "RUN LTP CASE $case_name"
     whusp_ltp_fs_bind_preflight
     case "$case_name" in
+        splice07)
+            if [ "${WHUSP_ARCH:-rv}" = "rv" ] && [ "$LIBC_ROOT" = "/musl" ]; then
+                _old_ld_preload_set=0
+                if [ "${LD_PRELOAD+x}" = x ]; then
+                    _old_ld_preload="$LD_PRELOAD"
+                    _old_ld_preload_set=1
+                fi
+                export LD_PRELOAD="$WHUSP_SCRIPT_ROOT/lib/__RV_MUSL_SPLICE07_SYSCALL_PRELOAD_BASENAME__${LD_PRELOAD:+:$LD_PRELOAD}"
+                whusp_ltp_eval_case
+                _whusp_ltp_ret="$ret"
+                if [ "$_old_ld_preload_set" -eq 1 ]; then
+                    export LD_PRELOAD="$_old_ld_preload"
+                else
+                    unset LD_PRELOAD
+                fi
+                ret="$_whusp_ltp_ret"
+                unset _old_ld_preload _old_ld_preload_set _whusp_ltp_ret
+            else
+                whusp_ltp_eval_case
+            fi
+            ;;
         statx10)
             _old_ltp_single_fs_type="$LTP_SINGLE_FS_TYPE"
             export LTP_SINGLE_FS_TYPE="ext4"
@@ -538,7 +572,13 @@ whusp_ltp_run_manifest_filter() {
     return "$status"
 }
 """
-    return script.replace("__LTP_MANIFEST_WORDS__", manifest_words)
+    return (
+        script.replace("__LTP_MANIFEST_WORDS__", manifest_words)
+        .replace(
+            "__RV_MUSL_SPLICE07_SYSCALL_PRELOAD_BASENAME__",
+            RV_MUSL_SPLICE07_SYSCALL_PRELOAD_BASENAME,
+        )
+    )
 
 
 def source_common(relative_common: str) -> str:
@@ -625,6 +665,9 @@ def group_script(
 # current_runner_enabled={'yes' if enabled else 'no'}
 # current_runner_skips_this_libc={'yes' if runner_skipped else 'no'}
 
+WHUSP_ARCH={sh_quote(arch)}
+export WHUSP_ARCH
+
 {source_common('../../../common.sh')}{group_body(arch, libc_root, script, active_filter)}"""
 
 
@@ -638,6 +681,8 @@ def ltp_case_script(arch: str, libc_root: str, case: LtpCase) -> str:
 # runtest_command={case.command}
 
 LIBC_ROOT={sh_quote(libc_root)}
+WHUSP_ARCH={sh_quote(arch)}
+export WHUSP_ARCH
 case_name={sh_quote(case.name)}
 case_cmd={sh_quote(case.command)}
 
@@ -670,9 +715,21 @@ def ltp_static_command_args(case: LtpCase) -> list[str]:
     return [prog, *argv[1:]]
 
 
-def ltp_static_case_block(case: LtpCase) -> str:
+def ltp_static_command(arch: str, libc_root: str, case: LtpCase, command: str) -> str:
+    if arch == "rv" and libc_root == "/musl" and case.name == "splice07":
+        preload = f"$WHUSP_SCRIPT_ROOT/lib/{RV_MUSL_SPLICE07_SYSCALL_PRELOAD_BASENAME}"
+        return f'LD_PRELOAD="{preload}${{LD_PRELOAD:+:$LD_PRELOAD}}" {command}'
+    return command
+
+
+def ltp_static_case_block(arch: str, libc_root: str, case: LtpCase) -> str:
     command_args = ltp_static_command_args(case)
-    command = " ".join(sh_quote(arg) for arg in command_args)
+    command = ltp_static_command(
+        arch,
+        libc_root,
+        case,
+        " ".join(sh_quote(arg) for arg in command_args),
+    )
     lines = [
         f'echo "RUN LTP CASE {case.name}"',
     ]
@@ -706,7 +763,7 @@ def ltp_whitelist_script(arch: str, libc_root: str, cases: list[LtpCase]) -> str
     if not cases:
         case_lines.append("# No LTP whitelist cases are currently selected.")
     for case in cases:
-        case_lines.append(ltp_static_case_block(case))
+        case_lines.append(ltp_static_case_block(arch, libc_root, case))
     case_body = "\n\n".join(case_lines)
     return f"""#!/musl/busybox sh
 # Generated unified LTP whitelist runner.
@@ -715,6 +772,8 @@ def ltp_whitelist_script(arch: str, libc_root: str, cases: list[LtpCase]) -> str
 # whitelist_cases={len(cases)}
 
 LIBC_ROOT={sh_quote(libc_root)}
+WHUSP_ARCH={sh_quote(arch)}
+export WHUSP_ARCH
 
 {source_common('../../common.sh')}whusp_setup_ltp_environment
 
@@ -821,6 +880,7 @@ def _write_outputs_unlocked(
 ) -> None:
     prepare_out_dir(out_dir, force)
     write_static_shims(out_dir)
+    write_support_libs(out_dir)
     write_executable(out_dir / "common.sh", common_script(manifests))
     write_executable(out_dir / "entry.sh", entry_script(all_tests, test_scripts, libc_roots))
     manifest_lines = [

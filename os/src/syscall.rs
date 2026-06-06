@@ -306,25 +306,6 @@ pub(crate) use process::{proc_sys_kernel_printk_content, write_proc_sys_kernel_p
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 pub(crate) use wait::LinuxSigInfo;
 
-#[cfg(target_arch = "riscv64")]
-fn is_rv_splice07_legacy_memfd_secret_probe(syscall_id: usize, args: &[usize; 6]) -> bool {
-    if syscall_id != usize::MAX || args[0] != 0 {
-        return false;
-    }
-
-    let process = crate::task::current_process();
-    let inner = process.inner_exclusive_access();
-    // CONTEXT: The current RV sdcard image has stale splice07 binaries that
-    // encode __NR_memfd_secret as __LTP__NR_INVALID_SYSCALL (-1). LA binaries
-    // and current headers use syscall 447, so keep this alias process-local.
-    inner.cmdline.first().and_then(|arg| arg.rsplit('/').next()) == Some("splice07")
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn is_rv_splice07_legacy_memfd_secret_probe(_syscall_id: usize, _args: &[usize; 6]) -> bool {
-    false
-}
-
 fn seccomp_filter_allows(filter: &[SeccompSockFilter], syscall_id: usize) -> bool {
     const BPF_LD_W_ABS: u16 = 0x20;
     const BPF_JMP_JEQ_K: u16 = 0x15;
@@ -1051,7 +1032,6 @@ pub fn syscall_with_current_task(
         SYSCALL_SHUTDOWN => sys_shutdown(args[0], args[1] as i32),
         SYSCALL_SENDMSG => sys_sendmsg(args[0], args[1], args[2] as i32),
         SYSCALL_RECVMSG => sys_recvmsg(args[0], args[1], args[2] as i32),
-        _ if is_rv_splice07_legacy_memfd_secret_probe(syscall_id, &args) => sys_memfd_secret(0),
         _ => Err(SysError::ENOSYS),
     })
 }
