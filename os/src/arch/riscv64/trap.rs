@@ -1,5 +1,6 @@
 mod context;
 
+use crate::arch::interrupt::{disable_supervisor_interrupt, enable_supervisor_interrupt};
 use crate::config::TRAMPOLINE;
 use crate::mm::{MmapFaultAccess, MmapFaultResult};
 use crate::syscall::{
@@ -17,7 +18,7 @@ use core::arch::{asm, global_asm};
 use riscv::register::{
     mtvec::TrapMode,
     scause::{self, Exception, Interrupt, Trap},
-    sie, sscratch, sstatus, stval, stvec,
+    sie, sscratch, stval, stvec,
 };
 
 global_asm!(include_str!("trap/trap.S"));
@@ -47,18 +48,6 @@ fn set_user_trap_entry() {
 pub fn enable_timer_interrupt() {
     unsafe {
         sie::set_stimer();
-    }
-}
-
-fn enable_supervisor_interrupt() {
-    unsafe {
-        sstatus::set_sie();
-    }
-}
-
-fn disable_supervisor_interrupt() {
-    unsafe {
-        sstatus::clear_sie();
     }
 }
 

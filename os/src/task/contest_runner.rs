@@ -1,37 +1,5 @@
 use alloc::string::String;
 
-// CONTEXT: The script-disk exporter reads these plan constants and bakes the
-// run/skip sequence into `/x1/entry.sh`. The kernel runtime only selects the
-// architecture and invokes that generated entry point.
-#[allow(dead_code)]
-const TEST_LIBCS: &[&str] = &["/glibc", "/musl"];
-// CONTEXT: Search the manifests that contain the current whitelist, ordered by
-// duplicate-resolution priority. The generated script disk uses this same list
-// for whitelist export and runtime filter scans.
-#[allow(dead_code)]
-const LTP_RUNTEST_MANIFESTS: &[&str] = &[
-    "syscalls",
-    "syscalls-ipc",
-    "fs",
-    "input",
-    "net.features",
-    "net.ipv6_lib",
-    "net.tcp_cmds",
-    "net_stress.broken_ip",
-    "net_stress.interface",
-    "net_stress.route",
-    "fs_bind",
-    "crypto",
-    "pty",
-    "hugetlb",
-    "watchqueue",
-    "containers",
-    "smoketest",
-    "cve",
-    "mm",
-    "fs_readonly",
-];
-
 const INTERACTIVE_SHELL: bool = false;
 // Script-disk handoff point. The kernel assembles only the environment and the
 // final shutdown command; marker emission and per-suite shell logic live in
@@ -42,61 +10,13 @@ const PERF_COUNTER_DUMP_COMMAND: &str = "; echo '#### KERNEL PERF START ####'; /
 #[cfg(not(feature = "perf-counters"))]
 const PERF_COUNTER_DUMP_COMMAND: &str = "";
 
-// CONTEXT: `ALL_TESTS` is the marker universe baked into the generated script
-// disk. Disabled groups still emit START/END pairs so scorer logs stay aligned.
-#[allow(dead_code)]
-const ALL_TESTS: &[&str] = &[
-    "basic_testcode.sh",
-    "busybox_testcode.sh",
-    "lua_testcode.sh",
-    "libctest_testcode.sh",
-    "ltp_testcode.sh",
-    "iozone_testcode.sh",
-    "iperf_testcode.sh",
-    "libcbench_testcode.sh",
-    "lmbench_testcode.sh",
-    "cyclictest_testcode.sh",
-    "netperf_testcode.sh",
-];
-
-// CONTEXT: This remains the source of truth for script-disk generation. The
-// generated entry script hardcodes the resulting run/skip sequence instead of
-// rechecking the list before every group at runtime.
-const TEST_SCRIPTS: &[&str] = &[
-    "basic_testcode.sh",
-    "busybox_testcode.sh",
-    "lua_testcode.sh",
-    "libctest_testcode.sh",
-    // "ltp_testcode.sh",
-    "iozone_testcode.sh",
-    "iperf_testcode.sh",
-    "libcbench_testcode.sh",
-    "netperf_testcode.sh",
-    "cyclictest_testcode.sh",
-    "lmbench_testcode.sh",
-];
-
-/// None runs the current libc's curated whitelist from ltp_whitelist.txt.
-/// Some("a")..Some("z") narrows by leading letter, Some("long") runs names
-/// outside the ASCII alphabet, Some("case:<name>") runs one exact LTP case,
-/// Some("cases:<a>,<b>") runs selected exact LTP cases, Some("prefix:<name>")
-/// runs cases whose names start with the prefix, and
-/// Some("range:<start>,<end>") runs cases in the lexicographic half-open range
-/// [start, end). Empty range bounds are unbounded.
-// CONTEXT: Non-None filters are development slices. They narrow LTP case
-// execution in the generated script disk while leaving outer group markers
-// intact, so always check this constant before treating a score log as
-// submission-wide evidence.
-#[allow(dead_code)]
-const LTP_CASE_FILTER_OPTION: Option<&str> = None;
-
 #[cfg(target_arch = "riscv64")]
 const RUNNER_ARCH: &str = "rv";
 #[cfg(target_arch = "loongarch64")]
 const RUNNER_ARCH: &str = "la";
 
 pub(super) fn build_runner_command() -> String {
-    if INTERACTIVE_SHELL || TEST_SCRIPTS.is_empty() {
+    if INTERACTIVE_SHELL {
         return interactive_shell_command();
     }
 

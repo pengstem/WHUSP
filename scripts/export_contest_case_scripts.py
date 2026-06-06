@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import fcntl
 import hashlib
 import re
@@ -32,6 +31,62 @@ RV_MUSL_SPLICE07_SYSCALL_PRELOAD_ASSET = (
     REPO_ROOT / "os" / "assets" / "riscv64" / RV_MUSL_SPLICE07_SYSCALL_PRELOAD_BASENAME
 )
 STATIC_COMPAT_ROOT = "support-root"
+
+# Host-side script disk generation plan. These values are consumed before the
+# disk is built, so they deliberately stay outside the kernel runtime source.
+TEST_LIBCS = ("/glibc", "/musl")
+LTP_RUNTEST_MANIFESTS = (
+    "syscalls",
+    "syscalls-ipc",
+    "fs",
+    "input",
+    "net.features",
+    "net.ipv6_lib",
+    "net.tcp_cmds",
+    "net_stress.broken_ip",
+    "net_stress.interface",
+    "net_stress.route",
+    "fs_bind",
+    "crypto",
+    "pty",
+    "hugetlb",
+    "watchqueue",
+    "containers",
+    "smoketest",
+    "cve",
+    "mm",
+    "fs_readonly",
+)
+ALL_TESTS = (
+    "basic_testcode.sh",
+    "busybox_testcode.sh",
+    "lua_testcode.sh",
+    "libctest_testcode.sh",
+    "ltp_testcode.sh",
+    "iozone_testcode.sh",
+    "iperf_testcode.sh",
+    "libcbench_testcode.sh",
+    "lmbench_testcode.sh",
+    "cyclictest_testcode.sh",
+    "netperf_testcode.sh",
+)
+TEST_SCRIPTS = (
+    "basic_testcode.sh",
+    "busybox_testcode.sh",
+    "lua_testcode.sh",
+    "libctest_testcode.sh",
+    # "ltp_testcode.sh",
+    "iozone_testcode.sh",
+    "iperf_testcode.sh",
+    "libcbench_testcode.sh",
+    "netperf_testcode.sh",
+    "cyclictest_testcode.sh",
+    "lmbench_testcode.sh",
+)
+# None runs the curated whitelist. Non-None filters are development slices:
+# "a".."z", "long", "case:<name>", "cases:<a>,<b>", "prefix:<name>", or
+# "range:<start>,<end>" with lexicographic half-open range bounds.
+LTP_CASE_FILTER_OPTION: str | None = None
 
 ETC_SUPPORT_FILES = {
     "etc/nsswitch.conf": b"passwd: files\ngroup: files\nhosts: files\nprotocols: files\nservices: files\nnetworks: files\n",
@@ -90,7 +145,13 @@ MODULE_SUPPORT_FILES = {
 }
 
 DNS_RESOLVER_KO = b"WHUSP built-in dns_resolver module placeholder\n"
-MODULE_METADATA_PREFIXES = ("", "glibc", "musl", "lib/modules", "lib/modules/6.8.0-whusp")
+MODULE_METADATA_PREFIXES = (
+    "",
+    "glibc",
+    "musl",
+    "lib/modules",
+    "lib/modules/6.8.0-whusp",
+)
 MODULE_KERNEL_PREFIXES = (
     "kernel",
     "glibc/kernel",
@@ -140,22 +201,6 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def rust_string(value: str) -> str:
-    return ast.literal_eval(f'"{value}"')
-
-
-def rust_string_array(source: str, const_name: str) -> list[str]:
-    match = re.search(
-        rf"const\s+{re.escape(const_name)}\s*:\s*&\[\s*&str\s*\]\s*=\s*&\[(.*?)\];",
-        source,
-        re.DOTALL,
-    )
-    if not match:
-        raise ValueError(f"could not find Rust string array {const_name}")
-    block = re.sub(r"//.*", "", match.group(1))
-    return [rust_string(item) for item in re.findall(r'"((?:\\.|[^"\\])*)"', block)]
-
-
 def text_list(source: str, source_name: str) -> list[str]:
     items: list[str] = []
     for line_no, raw in enumerate(source.splitlines(), 1):
@@ -163,7 +208,9 @@ def text_list(source: str, source_name: str) -> list[str]:
         if not line:
             continue
         if any(ch.isspace() for ch in line):
-            raise ValueError(f"{source_name}:{line_no}: whitespace is not allowed in case names")
+            raise ValueError(
+                f"{source_name}:{line_no}: whitespace is not allowed in case names"
+            )
         items.append(line)
     return items
 
@@ -179,18 +226,10 @@ def rust_const_value(source: str, const_name: str) -> str:
     return " ".join(match.group(1).split())
 
 
-def rust_option_string_value(source: str, const_name: str) -> str:
-    expression = rust_const_value(source, const_name)
-    if expression == "None":
-        return "None"
-    match = re.fullmatch(r'Some\("((?:\\.|[^"\\])*)"\)', expression)
-    if not match:
-        raise ValueError(f"unsupported Rust string option {const_name}: {expression}")
-    return rust_string(match.group(1))
-
-
 def iter_manifest_entries(path: Path):
-    for line_no, raw in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+    for line_no, raw in enumerate(
+        path.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+    ):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -205,9 +244,13 @@ def resolve_ltp_cases(
     whitelist: list[str],
     runtest_dir: Path,
 ) -> list[LtpCase]:
-    duplicate_whitelist = sorted({name for name in whitelist if whitelist.count(name) > 1})
+    duplicate_whitelist = sorted(
+        {name for name in whitelist if whitelist.count(name) > 1}
+    )
     if duplicate_whitelist:
-        raise ValueError("duplicate whitelist entries: " + ", ".join(duplicate_whitelist))
+        raise ValueError(
+            "duplicate whitelist entries: " + ", ".join(duplicate_whitelist)
+        )
 
     order = {name: index for index, name in enumerate(whitelist)}
     selected: list[tuple[int, int, str, str, str, int]] = []
@@ -220,7 +263,9 @@ def resolve_ltp_cases(
             if case_name not in order:
                 continue
             seq += 1
-            selected.append((order[case_name], seq, case_name, case_cmd, manifest, line_no))
+            selected.append(
+                (order[case_name], seq, case_name, case_cmd, manifest, line_no)
+            )
 
     selected.sort()
     cases: list[LtpCase] = []
@@ -276,7 +321,9 @@ def prepare_out_dir(path: Path, force: bool) -> None:
         if not force:
             raise FileExistsError(f"{path} already exists; pass --force to replace it")
         if not marker.exists():
-            raise FileExistsError(f"{path} does not look generated; refusing to replace it")
+            raise FileExistsError(
+                f"{path} does not look generated; refusing to replace it"
+            )
         shutil.rmtree(path)
     path.mkdir(parents=True)
     (path / MARKER_FILE).write_text(
@@ -310,8 +357,7 @@ def static_shim_scripts() -> dict[str, str]:
         shims[cmd] = noop
 
     shims["mkfs.ext4"] = shell_script(
-        'if [ "$1" = "-V" ]; then echo "mke2fs 1.46.5"; exit 0; fi\n'
-        "exit 0\n"
+        'if [ "$1" = "-V" ]; then echo "mke2fs 1.46.5"; exit 0; fi\nexit 0\n'
     )
     shims["e4crypt"] = shell_script(
         'if [ "$1" = "add_key" ] && [ -n "$2" ]; then '
@@ -329,8 +375,7 @@ def static_shim_scripts() -> dict[str, str]:
         'exec /musl/busybox netstat "$@"\n'
     )
     shims["ethtool"] = shell_script(
-        'if [ "$1" = "--show-features" ]; then echo "busy-poll: on"; fi\n'
-        "exit 0\n"
+        'if [ "$1" = "--show-features" ]; then echo "busy-poll: on"; fi\nexit 0\n'
     )
     shims["ip"] = shell_script(
         'if [ "$1" = "neigh" ] && [ "$2" = "show" ]; then '
@@ -356,8 +401,7 @@ def static_shim_scripts() -> dict[str, str]:
         'exec /musl/busybox arp "$@"\n'
     )
     shims["arping"] = shell_script(
-        "/musl/busybox rm -f /tmp/whusp_neigh_deleted\n"
-        "exit 0\n"
+        "/musl/busybox rm -f /tmp/whusp_neigh_deleted\nexit 0\n"
     )
     shims["ifconfig"] = shell_script(
         'case "$1" in *:*) if [ "$2" = "down" ]; then /musl/busybox rm -f /tmp/whusp_ifconfig_addr; '
@@ -381,15 +425,9 @@ def static_shim_scripts() -> dict[str, str]:
     )
 
     for cmd in ("testsf_s", "testsf_s6"):
-        shims[cmd] = shell_script(
-            'echo "$2" > /tmp/whusp_testsf_port\n'
-            "exit 0\n"
-        )
+        shims[cmd] = shell_script('echo "$2" > /tmp/whusp_testsf_port\nexit 0\n')
     for cmd in ("testsf_c", "testsf_c6"):
-        shims[cmd] = shell_script(
-            '/musl/busybox cp "$4" "$3"\n'
-            "exit $?\n"
-        )
+        shims[cmd] = shell_script('/musl/busybox cp "$4" "$3"\nexit $?\n')
 
     shims["netstress"] = shell_script(
         "port=49152\n"
@@ -410,8 +448,7 @@ def static_shim_scripts() -> dict[str, str]:
     )
     for cmd in ("ping", "ping6", "ns-icmpv4_sender", "ns-icmpv6_sender"):
         shims[cmd] = shell_script(
-            "/musl/busybox rm -f /tmp/whusp_neigh_deleted\n"
-            "exit 0\n"
+            "/musl/busybox rm -f /tmp/whusp_neigh_deleted\nexit 0\n"
         )
 
     return shims
@@ -439,7 +476,9 @@ def static_compat_files() -> dict[str, bytes]:
         for name, content in MODULE_SUPPORT_FILES.items():
             files[str(Path(prefix) / name) if prefix else name] = content
     for prefix in MODULE_KERNEL_PREFIXES:
-        files[str(Path(prefix) / "net" / "dns_resolver" / "dns_resolver.ko")] = DNS_RESOLVER_KO
+        files[str(Path(prefix) / "net" / "dns_resolver" / "dns_resolver.ko")] = (
+            DNS_RESOLVER_KO
+        )
     return files
 
 
@@ -453,7 +492,9 @@ def write_static_compat_support_root(out_dir: Path) -> list[str]:
         path.write_bytes(files[relative])
         path.chmod(0o644)
 
-    compat_so = support_root / "opt" / "oscomp-support" / "lib" / "liboscomp-musl-compat.so"
+    compat_so = (
+        support_root / "opt" / "oscomp-support" / "lib" / "liboscomp-musl-compat.so"
+    )
     compat_so.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(LA_MUSL_COMPAT_ASSET, compat_so)
     compat_so.chmod(0o755)
@@ -499,7 +540,7 @@ def common_root_relative(relative_common: str) -> str:
 def common_script(manifests: list[str]) -> str:
     manifest_words = " ".join(manifests)
     script = """#!/musl/busybox sh
-# Common guest-side helpers exported from os/src/task/contest_runner.rs.
+# Common guest-side helpers generated by export_contest_case_scripts.py.
 
 whusp_setup_ltp_environment() {
     : "${LIBC_ROOT:=/musl}"
@@ -698,12 +739,9 @@ whusp_ltp_run_manifest_filter() {
     return "$status"
 }
 """
-    return (
-        script.replace("__LTP_MANIFEST_WORDS__", manifest_words)
-        .replace(
-            "__RV_MUSL_SPLICE07_SYSCALL_PRELOAD_BASENAME__",
-            RV_MUSL_SPLICE07_SYSCALL_PRELOAD_BASENAME,
-        )
+    return script.replace("__LTP_MANIFEST_WORDS__", manifest_words).replace(
+        "__RV_MUSL_SPLICE07_SYSCALL_PRELOAD_BASENAME__",
+        RV_MUSL_SPLICE07_SYSCALL_PRELOAD_BASENAME,
     )
 
 
@@ -750,7 +788,9 @@ exit 0
 
     commands = [f"cd {sh_quote(libc_root)} || exit 127"]
     if arch == "la" and libc_root == "/musl" and script == "iperf_testcode.sh":
-        commands.append("./busybox sed 's/ -i 0 / /g' ./iperf_testcode.sh | ./busybox sh")
+        commands.append(
+            "./busybox sed 's/ -i 0 / /g' ./iperf_testcode.sh | ./busybox sh"
+        )
     else:
         if script == "lmbench_testcode.sh":
             commands.append("export ENOUGH=10000 TIMING_O=0 LOOP_O=0")
@@ -765,7 +805,7 @@ exit 0
             prefix = f"LD_PRELOAD={LA_MUSL_COMPAT_PRELOAD} "
         commands.append(f"{prefix}./busybox sh ./{script}")
         if script == "lmbench_testcode.sh":
-            commands.append('ret=$?')
+            commands.append("ret=$?")
             commands.append("./busybox rm -f /tmp/hello")
             commands.append('exit "$ret"')
             return "\n".join(commands) + "\n"
@@ -783,18 +823,18 @@ def group_script(
     active_filter: str,
 ) -> str:
     return f"""#!/musl/busybox sh
-# Generated from os/src/task/contest_runner.rs.
+# Generated by export_contest_case_scripts.py.
 # arch={arch}
 # libc={libc_label(libc_root)}
 # group={test_name(script)}
 # source_script={script}
-# current_runner_enabled={'yes' if enabled else 'no'}
-# current_runner_skips_this_libc={'yes' if runner_skipped else 'no'}
+# current_plan_enabled={"yes" if enabled else "no"}
+# current_plan_skips_this_libc={"yes" if runner_skipped else "no"}
 
 WHUSP_ARCH={sh_quote(arch)}
 export WHUSP_ARCH
 
-{source_common('../../../common.sh')}{group_body(arch, libc_root, script, active_filter)}"""
+{source_common("../../../common.sh")}{group_body(arch, libc_root, script, active_filter)}"""
 
 
 def ltp_case_script(arch: str, libc_root: str, case: LtpCase) -> str:
@@ -812,7 +852,7 @@ export WHUSP_ARCH
 case_name={sh_quote(case.name)}
 case_cmd={sh_quote(case.command)}
 
-{source_common('../../../common.sh')}whusp_ltp_run_case
+{source_common("../../../common.sh")}whusp_ltp_run_case
 """
 
 
@@ -820,16 +860,24 @@ def ltp_case_argv(case: LtpCase) -> list[str]:
     try:
         argv = shlex.split(case.command)
     except ValueError as err:
-        raise ValueError(f"{case.name}: invalid shell command {case.command!r}: {err}") from err
+        raise ValueError(
+            f"{case.name}: invalid shell command {case.command!r}: {err}"
+        ) from err
     if not argv:
         raise ValueError(f"{case.name}: empty LTP command")
     shell_tokens = {";", "|", "&", "&&", "||", "<", ">", ">>", "2>", "<<"}
     if any(token in shell_tokens for token in argv):
-        raise ValueError(f"{case.name}: complex shell command is not supported: {case.command!r}")
+        raise ValueError(
+            f"{case.name}: complex shell command is not supported: {case.command!r}"
+        )
     if any(ch in case.command for ch in "$`\\\n"):
-        raise ValueError(f"{case.name}: shell expansion is not supported: {case.command!r}")
+        raise ValueError(
+            f"{case.name}: shell expansion is not supported: {case.command!r}"
+        )
     if "=" in argv[0]:
-        raise ValueError(f"{case.name}: environment-prefixed command is not supported: {case.command!r}")
+        raise ValueError(
+            f"{case.name}: environment-prefixed command is not supported: {case.command!r}"
+        )
     return argv
 
 
@@ -901,7 +949,7 @@ LIBC_ROOT={sh_quote(libc_root)}
 WHUSP_ARCH={sh_quote(arch)}
 export WHUSP_ARCH
 
-{source_common('../../common.sh')}whusp_setup_ltp_environment
+{source_common("../../common.sh")}whusp_setup_ltp_environment
 
 fs_bind_preflight() {{
     unset TST_LIB_LOADED TST_SECURITY_LOADED
@@ -985,11 +1033,15 @@ def entry_script(
         if script in enabled_scripts:
             if script == "libctest_testcode.sh":
                 append_skip_group_marker(lines, "libctest", "glibc")
-                lines.append(f'/musl/busybox sh "$script_dir/$WHUSP_ARCH/musl/groups/{filename}"')
+                lines.append(
+                    f'/musl/busybox sh "$script_dir/$WHUSP_ARCH/musl/groups/{filename}"'
+                )
             else:
                 for libc_root in libc_roots:
                     libc = libc_label(libc_root)
-                    lines.append(f'/musl/busybox sh "$script_dir/$WHUSP_ARCH/{libc}/groups/{filename}"')
+                    lines.append(
+                        f'/musl/busybox sh "$script_dir/$WHUSP_ARCH/{libc}/groups/{filename}"'
+                    )
         else:
             for libc_root in libc_roots:
                 append_skip_group_marker(lines, name, libc_label(libc_root))
@@ -1020,7 +1072,7 @@ def _write_outputs_unlocked(
         entry_script(all_tests, test_scripts, libc_roots, static_compat_relative_files),
     )
     manifest_lines = [
-        "kind\tarch\tlibc\tindex\tgroup_or_case\tsource\tline\tcommand\tcurrent_runner_enabled\tcurrent_runner_skips_this_libc"
+        "kind\tarch\tlibc\tindex\tgroup_or_case\tsource\tline\tcommand\tcurrent_plan_enabled\tcurrent_plan_skips_this_libc"
     ]
     enabled_scripts = set(test_scripts)
 
@@ -1035,7 +1087,9 @@ def _write_outputs_unlocked(
             write_executable(root / "run_all_groups.sh", run_all_script("groups"))
             write_executable(root / "run_all_ltp_cases.sh", run_all_script("ltp-cases"))
             whitelist_path = root / "run_ltp_whitelist.sh"
-            write_executable(whitelist_path, ltp_whitelist_script(arch, libc_root, ltp_cases))
+            write_executable(
+                whitelist_path, ltp_whitelist_script(arch, libc_root, ltp_cases)
+            )
             manifest_lines.append(
                 "\t".join(
                     [
@@ -1055,7 +1109,11 @@ def _write_outputs_unlocked(
 
             for index, script in enumerate(all_tests):
                 enabled = script in enabled_scripts
-                runner_skipped = enabled and script == "libctest_testcode.sh" and libc_root == "/glibc"
+                runner_skipped = (
+                    enabled
+                    and script == "libctest_testcode.sh"
+                    and libc_root == "/glibc"
+                )
                 path = group_dir / group_filename(index, script)
                 write_executable(
                     path,
@@ -1106,8 +1164,12 @@ def _write_outputs_unlocked(
                     )
                 )
 
-    (out_dir / "manifest.tsv").write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
-    (out_dir / "ltp_manifest_order.txt").write_text("\n".join(manifests) + "\n", encoding="utf-8")
+    (out_dir / "manifest.tsv").write_text(
+        "\n".join(manifest_lines) + "\n", encoding="utf-8"
+    )
+    (out_dir / "ltp_manifest_order.txt").write_text(
+        "\n".join(manifests) + "\n", encoding="utf-8"
+    )
     try:
         runtest_display = str(runtest_dir.resolve().relative_to(REPO_ROOT))
     except ValueError:
@@ -1117,26 +1179,27 @@ def _write_outputs_unlocked(
 
 Generated from:
 
+- `scripts/export_contest_case_scripts.py`
 - `os/src/task/contest_runner.rs`
 - `os/src/task/ltp_whitelist.txt`
 - `{runtest_display}`
 
 This directory exports the guest-side commands for every contest test group in
 `ALL_TESTS`, plus every current LTP whitelist case. It is a script view of the
-runner command construction, not a new source of truth.
+script-disk generation plan and runner command construction.
 
-Current runner metadata:
+Current metadata:
 
 - `INTERACTIVE_SHELL = {interactive_shell}`
-- `TEST_LIBCS = {', '.join(libc_label(root) for root in libc_roots)}`
-- `TEST_SCRIPTS = {', '.join(test_scripts) if test_scripts else '(empty)'}`
+- `TEST_LIBCS = {", ".join(libc_label(root) for root in libc_roots)}`
+- `TEST_SCRIPTS = {", ".join(test_scripts) if test_scripts else "(empty)"}`
 - `LTP_CASE_FILTER_OPTION = {active_filter}`
 - LTP whitelist cases exported: {len(ltp_cases)}
 
 Layout:
 
 - `entry.sh`: script-disk entry point used by the kernel init command.
-- `common.sh`: lightweight runtime and LTP helpers mirrored from `contest_runner.rs`.
+- `common.sh`: lightweight runtime and LTP helpers generated by the exporter.
 - `bin/`: static guest-side command shims used before BusyBox applets in PATH.
 - `rv/<libc>/groups/*.sh`: all RISC-V group commands for that libc root.
 - `la/<libc>/groups/*.sh`: all LoongArch group commands for that libc root.
@@ -1155,7 +1218,7 @@ Run examples inside the guest filesystem:
 /musl/busybox sh ./rv/glibc/ltp-cases/0012-execve05.sh
 ```
 
-Regenerate after changing the runner or whitelist:
+Regenerate after changing the exporter plan, kernel runner handoff, or whitelist:
 
 ```sh
 python3 scripts/export_contest_case_scripts.py --force
@@ -1195,12 +1258,12 @@ def main() -> int:
     args = parse_args()
     runner_source = read_text(RUNNER_PATH)
     whitelist_source = read_text(WHITELIST_PATH)
-    all_tests = rust_string_array(runner_source, "ALL_TESTS")
-    test_scripts = rust_string_array(runner_source, "TEST_SCRIPTS")
-    libc_roots = rust_string_array(runner_source, "TEST_LIBCS")
-    manifests = rust_string_array(runner_source, "LTP_RUNTEST_MANIFESTS")
+    all_tests = list(ALL_TESTS)
+    test_scripts = list(TEST_SCRIPTS)
+    libc_roots = list(TEST_LIBCS)
+    manifests = list(LTP_RUNTEST_MANIFESTS)
     whitelist = text_list(whitelist_source, str(WHITELIST_PATH.relative_to(REPO_ROOT)))
-    active_filter = rust_option_string_value(runner_source, "LTP_CASE_FILTER_OPTION")
+    active_filter = LTP_CASE_FILTER_OPTION or "None"
     interactive_shell = rust_const_value(runner_source, "INTERACTIVE_SHELL")
     ltp_cases = resolve_ltp_cases(manifests, whitelist, args.runtest_dir)
     write_outputs(

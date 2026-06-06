@@ -1,5 +1,6 @@
 mod context;
 
+use crate::arch::interrupt::{disable_supervisor_interrupt, enable_supervisor_interrupt};
 use crate::config::TRAMPOLINE;
 use crate::mm::{MmapFaultAccess, MmapFaultResult};
 use crate::syscall::{syscall_is_exit, syscall_is_exit_group, syscall_with_current_task};
@@ -57,14 +58,6 @@ pub fn enable_external_interrupt() {
         | LineBasedInterrupt::HWI6
         | LineBasedInterrupt::HWI7;
     ecfg::set_lie(ecfg::read().lie() | interrupts);
-}
-
-fn enable_supervisor_interrupt() {
-    crate::arch::interrupt::enable_supervisor_interrupt();
-}
-
-fn disable_supervisor_interrupt() {
-    crate::arch::interrupt::disable_supervisor_interrupt();
 }
 
 const PS_4K: usize = 0x0c;
