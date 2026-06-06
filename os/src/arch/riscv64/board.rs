@@ -413,13 +413,6 @@ pub fn mouse_irq() -> Option<usize> {
     board_config().mouse.map(|device| device.irq)
 }
 
-// CONTEXT: virtio-net device is discovered from the DTB but no in-kernel net
-// stack consumes it yet (see CLAUDE.md "Things that surprise people").
-#[allow(dead_code)]
-pub fn net_device() -> Option<IrqDevice> {
-    board_config().net
-}
-
 pub fn rtc_base() -> usize {
     board_config().rtc_base
 }

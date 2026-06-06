@@ -62,7 +62,6 @@ pub fn flush_tlb_all() {
     }
 }
 
-#[allow(dead_code)]
 pub fn flush_tlb_page(va: usize) {
     mark_return_tlb_dirty();
     unsafe {

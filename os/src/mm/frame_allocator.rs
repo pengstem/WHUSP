@@ -219,38 +219,3 @@ pub fn frame_ref_count(ppn: PhysPageNum) -> Option<usize> {
 pub fn frame_stats() -> (usize, usize) {
     FRAME_ALLOCATOR.exclusive_access().stats()
 }
-
-#[allow(unused)]
-pub fn frame_allocator_test() {
-    let mut v: Vec<FrameTracker> = Vec::new();
-    for i in 0..5 {
-        let frame = frame_alloc().unwrap();
-        println!("{:?}", frame);
-        v.push(frame);
-    }
-    v.clear();
-    for i in 0..5 {
-        let frame = frame_alloc().unwrap();
-        println!("{:?}", frame);
-        v.push(frame);
-    }
-    drop(v);
-    println!("frame_allocator_test passed!");
-}
-
-#[allow(unused)]
-pub fn frame_allocator_alloc_more_test() {
-    let mut v: Vec<FrameTracker> = Vec::new();
-    let frames = frame_alloc_more(5).unwrap();
-    for frame in &frames {
-        println!("{:?}", frame);
-    }
-    v.extend(frames);
-    v.clear();
-    let frames = frame_alloc_more(5).unwrap();
-    for frame in &frames {
-        println!("{:?}", frame);
-    }
-    drop(v);
-    println!("frame_allocator_test passed!");
-}

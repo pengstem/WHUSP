@@ -165,19 +165,6 @@ fn board_config() -> &'static BoardConfig {
     BOARD_CONFIG.get()
 }
 
-// CONTEXT: DTB compatible-string matcher reserved for future LA device probes;
-// the LA path currently uses direct name lookups.
-#[allow(dead_code)]
-fn compatible_contains(node: FdtNode<'_, '_>, compatibles: &[&str]) -> bool {
-    node.compatible()
-        .map(|node_compatibles| {
-            node_compatibles
-                .all()
-                .any(|name| compatibles.contains(&name))
-        })
-        .unwrap_or(false)
-}
-
 fn property_str<'a>(node: FdtNode<'_, 'a>, name: &str) -> Option<&'a str> {
     node.property(name)
         .and_then(|property| core::str::from_utf8(property.value).ok())
@@ -611,7 +598,6 @@ pub fn keyboard_device() -> Option<IrqDevice> {
     board_config().keyboard
 }
 
-#[allow(dead_code)]
 pub fn keyboard_irq() -> Option<usize> {
     board_config().keyboard.map(|device| device.irq)
 }
@@ -620,14 +606,8 @@ pub fn mouse_device() -> Option<IrqDevice> {
     board_config().mouse
 }
 
-#[allow(dead_code)]
 pub fn mouse_irq() -> Option<usize> {
     board_config().mouse.map(|device| device.irq)
-}
-
-#[allow(dead_code)]
-pub fn net_device() -> Option<IrqDevice> {
-    board_config().net
 }
 
 pub fn pci_transport(device: PciDevice) -> PciTransport {

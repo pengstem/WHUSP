@@ -164,21 +164,6 @@ impl PageTable {
         }
         result
     }
-    #[allow(unused)]
-    pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
-        let pte = self
-            .find_pte_create(vpn)
-            .expect("map requires intermediate page-table allocation to succeed");
-        assert!(pte.bits == 0, "vpn {vpn:?} is mapped before mapping");
-        let leaf_flags = PTEFlags::R | PTEFlags::W | PTEFlags::X;
-        let flags = if flags.intersects(leaf_flags) {
-            flags | PTEFlags::V
-        } else {
-            flags
-        };
-        *pte = PageTableEntry::new(ppn, flags);
-        invalidate_user_leaf_pte_cache();
-    }
     pub fn try_map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
         let Some(pte) = self.find_pte_create(vpn) else {
             return false;

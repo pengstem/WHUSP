@@ -675,7 +675,6 @@ pub(crate) fn fd_allocation_state_from_table(
 }
 
 impl ProcessControlBlockInner {
-    #[allow(unused)]
     pub fn get_user_token(&self) -> usize {
         self.memory_set.token()
     }

@@ -109,18 +109,6 @@ impl Drop for KernelStack {
 }
 
 impl KernelStack {
-    #[allow(unused)]
-    pub fn push_on_top<T>(&self, value: T) -> *mut T
-    where
-        T: Sized,
-    {
-        let kernel_stack_top = self.get_top();
-        let ptr_mut = (kernel_stack_top - core::mem::size_of::<T>()) as *mut T;
-        unsafe {
-            *ptr_mut = value;
-        }
-        ptr_mut
-    }
     pub fn get_top(&self) -> usize {
         let (_, kernel_stack_top) = kernel_stack_position(self.0);
         kernel_stack_top
@@ -243,16 +231,6 @@ impl TaskUserRes {
         process_inner
             .memory_set
             .remove_area_with_start_vpn(trap_cx_bottom_va.into());
-    }
-
-    #[allow(unused)]
-    pub fn alloc_tid(&mut self) {
-        self.tid = self
-            .process
-            .upgrade()
-            .unwrap()
-            .inner_exclusive_access()
-            .alloc_tid();
     }
 
     pub fn dealloc_tid(&self) {

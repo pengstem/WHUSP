@@ -70,10 +70,6 @@ impl PLIC {
             self.priority_ptr(intr_source_id).write_volatile(priority);
         }
     }
-    #[allow(unused)]
-    pub fn get_priority(&mut self, intr_source_id: usize) -> u32 {
-        unsafe { self.priority_ptr(intr_source_id).read_volatile() & 7 }
-    }
     pub fn enable(
         &mut self,
         hart_id: usize,
@@ -83,18 +79,6 @@ impl PLIC {
         let (reg_ptr, shift) = self.enable_ptr(hart_id, target_priority, intr_source_id);
         unsafe {
             reg_ptr.write_volatile(reg_ptr.read_volatile() | 1 << shift);
-        }
-    }
-    #[allow(unused)]
-    pub fn disable(
-        &mut self,
-        hart_id: usize,
-        target_priority: IntrTargetPriority,
-        intr_source_id: usize,
-    ) {
-        let (reg_ptr, shift) = self.enable_ptr(hart_id, target_priority, intr_source_id);
-        unsafe {
-            reg_ptr.write_volatile(reg_ptr.read_volatile() & (!(1u32 << shift)));
         }
     }
     pub fn set_threshold(
@@ -108,11 +92,6 @@ impl PLIC {
         unsafe {
             threshold_ptr.write_volatile(threshold);
         }
-    }
-    #[allow(unused)]
-    pub fn get_threshold(&mut self, hart_id: usize, target_priority: IntrTargetPriority) -> u32 {
-        let threshold_ptr = self.threshold_ptr_of_hart_with_priority(hart_id, target_priority);
-        unsafe { threshold_ptr.read_volatile() & 7 }
     }
     pub fn claim(&mut self, hart_id: usize, target_priority: IntrTargetPriority) -> u32 {
         let claim_comp_ptr = self.claim_comp_ptr_of_hart_with_priority(hart_id, target_priority);

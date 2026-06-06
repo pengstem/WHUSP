@@ -60,13 +60,6 @@ impl Eiointc {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn disable(self, irq: usize) {
-        let (offset, bit) = split_eiointc_bit(irq);
-        let addr = self.base + EIOINTC_ENABLE_OFFSET + offset;
-        iocsr_write_d(addr, iocsr_read_d(addr) & !bit);
-    }
-
     pub fn claim(self) -> Option<usize> {
         for i in 0..(EIOINTC_VEC_COUNT / 64) {
             let flags = iocsr_read_d(self.base + EIOINTC_ISR_OFFSET + i * 8);
@@ -111,13 +104,6 @@ impl PchPic {
         let mask_addr = PCH_PIC_MASK_OFFSET + offset;
         self.write_word(mask_addr, self.read_word(mask_addr) & !bit);
         self.write_byte(PCH_PIC_HTVEC_OFFSET + irq, irq as u8);
-    }
-
-    #[allow(dead_code)]
-    pub fn disable(self, irq: usize) {
-        let (offset, bit) = split_pch_pic_bit(irq);
-        let mask_addr = PCH_PIC_MASK_OFFSET + offset;
-        self.write_word(mask_addr, self.read_word(mask_addr) | bit);
     }
 
     fn read_word(self, offset: usize) -> u32 {

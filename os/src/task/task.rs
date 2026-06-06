@@ -215,11 +215,6 @@ impl TaskControlBlockInner {
             *slot = None;
         }
     }
-
-    #[allow(unused)]
-    fn get_status(&self) -> TaskStatus {
-        self.task_status
-    }
 }
 
 impl TaskControlBlock {
