@@ -42,10 +42,6 @@ pub fn instruction_barrier() {
     }
 }
 
-pub fn should_fence_i_on_trap_return() -> bool {
-    false
-}
-
 pub fn canonicalize_phys_addr(addr: usize) -> usize {
     addr & ((1usize << PA_WIDTH) - 1)
 }
@@ -68,14 +64,6 @@ pub fn sign_extend_virt_addr(addr: usize) -> usize {
     } else {
         addr
     }
-}
-
-pub fn phys_to_virt(addr: usize) -> usize {
-    addr
-}
-
-pub fn virt_to_phys(addr: usize) -> usize {
-    addr
 }
 
 pub fn pte_new_bits(ppn: usize, flags: crate::mm::page_table::PTEFlags) -> usize {

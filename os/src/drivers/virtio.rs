@@ -41,7 +41,7 @@ unsafe impl Hal for VirtioHal {
             .min()
             .expect("virtio DMA allocation returned no frames");
         let pa: PhysAddr = ppn_base.into();
-        let ptr = NonNull::new(crate::arch::mm::phys_to_virt(pa.0) as *mut u8).unwrap();
+        let ptr = NonNull::new({ pa.0 } as *mut u8).unwrap();
         QUEUE_FRAMES.exclusive_access().append(&mut trackers);
         (pa.0 as VirtioPhysAddr, ptr)
     }
@@ -63,7 +63,7 @@ unsafe impl Hal for VirtioHal {
     }
 
     unsafe fn mmio_phys_to_virt(paddr: VirtioPhysAddr, _size: usize) -> NonNull<u8> {
-        NonNull::new(crate::arch::mm::phys_to_virt(paddr as usize) as *mut u8).unwrap()
+        NonNull::new({ paddr as usize } as *mut u8).unwrap()
     }
 
     unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> VirtioPhysAddr {

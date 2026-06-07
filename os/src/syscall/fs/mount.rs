@@ -235,6 +235,9 @@ fn move_mount_target(dirfd: isize, path: &str, flags: u32) -> SysResult<(Working
 }
 
 fn supported_fs_context(fs_name: &str) -> bool {
+    // CONTEXT: fsopen(2) accepts filesystem names needed by LTP's new-mount
+    // API probes. The later fsmount()/mount() path decides whether that name
+    // becomes a real backend or a tmpfs-backed compatibility mount.
     matches!(
         fs_name,
         "ext2"
@@ -504,6 +507,9 @@ pub fn sys_mount(
     let process = current_process();
     let snapshot = process.path_snapshot();
     let namespace_id = snapshot.context.namespace_id();
+    // Mount changes need both identities: `target_dir` anchors the VFS overlay,
+    // while `target_path` is the Linux-visible record used by /proc/mounts,
+    // propagation bookkeeping, and later unmount/move lookups.
     let target_dir = lookup_mount_target_dir_in(snapshot.context.clone(), target.as_str())?;
     let target_path = normalize_path_at_root(
         snapshot.root_path.as_str(),

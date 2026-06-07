@@ -5,6 +5,8 @@ const INTERACTIVE_SHELL: bool = false;
 // final shutdown command; marker emission and per-suite shell logic live in
 // this mounted entry script.
 const SCRIPT_DISK_ENTRY: &str = "/x1/entry.sh";
+// Exact perf marker strings are parsed by host log tooling. Keep them outside
+// per-suite OS COMP group regions so perf output cannot split a judged group.
 #[cfg(feature = "perf-counters")]
 const PERF_COUNTER_DUMP_COMMAND: &str = "; echo '#### KERNEL PERF START ####'; /musl/busybox cat /proc/oskernel/perf; echo '#### KERNEL PERF END ####'";
 #[cfg(not(feature = "perf-counters"))]

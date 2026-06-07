@@ -3,7 +3,6 @@ use super::{
     FrameTracker, PageTable, PhysAddr, PhysPageNum, StepByOne, VPNRange, VirtAddr, VirtPageNum,
 };
 use super::{frame_alloc, frame_alloc_uninit};
-use crate::arch::mm as arch_mm;
 use crate::config::PAGE_SIZE;
 use crate::fs::File;
 use crate::mm::page_cache::{PAGE_CACHE, PageCacheId, PageCacheKey};
@@ -359,7 +358,7 @@ impl MapArea {
         let ppn: PhysPageNum = match self.map_type {
             MapType::Identical => {
                 let va: VirtAddr = vpn.into();
-                PhysAddr::from(arch_mm::virt_to_phys(usize::from(va))).floor()
+                PhysAddr::from(usize::from(va)).floor()
             }
             MapType::Framed => {
                 let Some(frame) = frame_alloc() else {

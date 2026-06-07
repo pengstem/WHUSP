@@ -344,12 +344,6 @@ fn trap_return_for_task(
     }
     let restore_va = __restore as usize - __alltraps as usize + TRAMPOLINE;
     //println!("before return");
-    if crate::arch::mm::should_fence_i_on_trap_return() {
-        crate::perf::record_riscv_return_fence_i_call();
-        unsafe {
-            asm!("fence.i");
-        }
-    }
     unsafe {
         asm!(
             "jr {restore_va}",

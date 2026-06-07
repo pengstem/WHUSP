@@ -54,6 +54,9 @@ fn effective_user_fault_handler(
     let Some(process) = task.process.upgrade() else {
         return None;
     };
+    // Default lazy-framed faults are safe only for the current process token.
+    // Child or foreign address spaces must use explicit MemorySet copy helpers
+    // so user-stack setup and ptrace writes do not fault the wrong process.
     let Some(inner) = process.try_inner_exclusive_access() else {
         return None;
     };

@@ -218,6 +218,9 @@ fn libc_test_root(cwd_path: &str, script_path: &str) -> Option<&'static str> {
 }
 
 fn libc_test_root_from_envs(envs: &[String]) -> Option<&'static str> {
+    // Contest helper scripts can exec `/tmp` files whose pathname no longer
+    // reveals `/musl` or `/glibc`. Use inherited environment only to choose the
+    // BusyBox shebang fallback root; ELF interpreter aliases stay separate.
     for env in envs {
         if let Some(root) = env.strip_prefix("LTPROOT=") {
             if is_path_under(root, "/musl") {

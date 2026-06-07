@@ -196,8 +196,9 @@ pub struct TaskControlBlockInner {
     // Same-PCB helper used for CLONE_VM process compatibility paths; it should
     // exit like a child helper, not terminate the whole parent thread group.
     pub clone_vm_process_helper: bool,
-    // Exposes a temporary new-net namespace view for CLONE_VM helper tasks that
-    // exist only to satisfy namespace probes while sharing the parent PCB.
+    // Exposes a synthetic new-net namespace view for CLONE_VM helper tasks.
+    // The helper shares the parent PCB, so namespace-visible state that must
+    // differ for LTP probes belongs on the task, not the process.
     pub synthetic_newnet: bool,
     pub(crate) thread_keyring: Option<i32>,
 }
