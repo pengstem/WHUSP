@@ -9,12 +9,6 @@ pub enum IntrTargetPriority {
     Supervisor = 1,
 }
 
-impl IntrTargetPriority {
-    pub fn supported_number() -> usize {
-        2
-    }
-}
-
 impl PLIC {
     fn priority_ptr(&self, intr_source_id: usize) -> *mut u32 {
         // QEMU virt exposes interrupt source ids in the SiFive PLIC priority
@@ -23,8 +17,7 @@ impl PLIC {
         (self.base_addr + intr_source_id * 4) as *mut u32
     }
     fn hart_id_with_priority(hart_id: usize, target_priority: IntrTargetPriority) -> usize {
-        let priority_num = IntrTargetPriority::supported_number();
-        hart_id * priority_num + target_priority as usize
+        hart_id * 2 + target_priority as usize
     }
     fn enable_ptr(
         &self,

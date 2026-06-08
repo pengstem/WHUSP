@@ -352,6 +352,9 @@ fn scan_waitid_children(
 /// Reaping removes the child from both PID lookup and the parent's child list;
 /// `WNOHANG` observes the current state without blocking.
 pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsage) -> SysResult {
+    // CONTEXT: __WALL is accepted for ptrace/LTP compatibility. This process
+    // model stores waitable children in one process child list, so there is no
+    // separate thread-vs-process wait domain for the flag to widen.
     if options < 0 || options & !(WNOHANG | WUNTRACED | WCONTINUED | WALL) != 0 {
         return Err(SysError::EINVAL);
     }

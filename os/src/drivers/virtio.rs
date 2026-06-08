@@ -82,8 +82,3 @@ fn virt_to_phys(vaddr: usize) -> usize {
         .unwrap()
         .0
 }
-
-#[allow(unused)]
-fn phys_to_virt(paddr: VirtioPhysAddr) -> usize {
-    paddr as usize
-}

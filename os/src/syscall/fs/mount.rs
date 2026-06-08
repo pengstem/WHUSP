@@ -461,6 +461,9 @@ pub fn sys_fsmount(fd: isize, flags: u32, mount_attrs: u32) -> SysResult {
     // UNFINISHED: MOUNT_ATTR_NOSUID, NODEV, NOEXEC, and atime policy flags are
     // not enforced by the current VFS permission and timestamp paths.
     let spec = context.prepare_mount().map_err(fs_context_error_to_errno)?;
+    // CONTEXT: fd-based fsmount() currently returns a detached tmpfs
+    // compatibility mount regardless of the requested fs type; sys_mount()
+    // still owns real block-backed backend selection.
     let _fs_type = spec.fs_type;
     let detached = DetachedMountFile::new_tmpfs(spec.source, mount_attrs & MOUNT_ATTR_RDONLY != 0)
         .map_err(mount_error_to_errno)?;

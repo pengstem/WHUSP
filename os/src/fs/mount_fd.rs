@@ -35,6 +35,7 @@ struct FsContextState {
     source: Option<String>,
     config_len: usize,
     // FSCONFIG_CMD_CREATE gates fsmount(); mounted makes the context one-shot.
+    // A single fsopen fd must not publish multiple detached mounts.
     created: bool,
     mounted: bool,
 }
@@ -55,6 +56,8 @@ struct DetachedMountState {
     source: WorkingDir,
     source_path: String,
     kind: DetachedMountKind,
+    // move_mount() attaches a detached mount fd at most once. Keep this under
+    // the file-local SleepMutex so racing attach attempts cannot both publish.
     attached: bool,
 }
 
@@ -118,6 +121,8 @@ impl FsContextFile {
         if inner.mounted {
             return Err(FsContextStateError::AlreadyMounted);
         }
+        // Consume the context before handing out the spec so repeated
+        // fsmount() calls cannot clone one fsopen context into multiple mount fds.
         inner.mounted = true;
         Ok(FsContextMountSpec {
             fs_type: inner.fs_type.clone(),

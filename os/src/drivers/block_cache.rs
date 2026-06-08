@@ -25,11 +25,6 @@ macro_rules! record_cache_stat {
     ($($body:tt)*) => {};
 }
 
-#[inline(always)]
-fn metrics_enabled() -> bool {
-    cfg!(feature = "perf-counters")
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct BlockCacheKey {
     device_key: usize,
@@ -495,7 +490,7 @@ impl BlockCache {
     fn stats_snapshot(&self) -> BlockCacheStats {
         BlockCacheStats {
             enabled: self.enabled,
-            metrics_enabled: metrics_enabled(),
+            metrics_enabled: cfg!(feature = "perf-counters"),
             entries: self.lines.len(),
             capacity: self.capacity,
             read4k_entries: self.read_lines.len(),

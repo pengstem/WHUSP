@@ -323,11 +323,6 @@ lazy_static! {
         .clone();
 }
 
-#[allow(dead_code)]
-pub fn block_device(index: usize) -> Option<Arc<BlockDeviceImpl>> {
-    BLOCK_DEVICES.get(index).cloned()
-}
-
 #[cfg(feature = "perf-counters")]
 pub(crate) fn block_io_stats_snapshot() -> BlockIoStats {
     use block_io_perf::{
@@ -547,12 +542,6 @@ fn record_completion_wakeup() {
 #[inline(always)]
 fn record_completion_wakeup() {}
 
-#[allow(dead_code)]
-pub fn block_count() -> usize {
-    BLOCK_DEVICES.len()
-}
-
-#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 pub fn handle_irq(irq: usize) -> bool {
     if let Some(device) = BLOCK_DEVICES.iter().find(|device| device.irq() == irq) {
         device.handle_irq();
@@ -560,20 +549,4 @@ pub fn handle_irq(irq: usize) -> bool {
     } else {
         false
     }
-}
-
-#[allow(unused)]
-pub fn block_device_test() {
-    let block_device = BLOCK_DEVICE.clone();
-    let mut write_buffer = [0u8; 512];
-    let mut read_buffer = [0u8; 512];
-    for i in 0..512 {
-        for byte in write_buffer.iter_mut() {
-            *byte = i as u8;
-        }
-        block_device.write_block(i as usize, &write_buffer);
-        block_device.read_block(i as usize, &mut read_buffer);
-        assert_eq!(write_buffer, read_buffer);
-    }
-    println!("block device test passed!");
 }
