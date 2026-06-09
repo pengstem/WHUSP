@@ -159,6 +159,8 @@ fn plan_user_stack(
     auxv.push((AT_GID, stack_info.gid as usize));
     auxv.push((AT_EGID, stack_info.egid as usize));
     auxv.push((AT_HWCAP, ELF_HWCAP));
+    // Keep this in sync with TICKS_PER_SEC so libc converts times(2) clock
+    // ticks using the same Linux USER_HZ value the kernel reports.
     auxv.push((AT_CLKTCK, 100));
     auxv.push((AT_SECURE, 0));
     auxv.push((AT_RANDOM, random_addr));

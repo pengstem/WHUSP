@@ -135,9 +135,7 @@ impl MemorySet {
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some(idx) = self.find_area_idx_by_start(start_vpn) {
             let area = &mut self.areas[idx];
-            if area.is_mmap() || area.is_shm() {
-                area.unmap_resident(&mut self.page_table);
-            } else if area.map_type == MapType::Framed {
+            if area.is_mmap() || area.is_shm() || area.map_type == MapType::Framed {
                 area.unmap_resident(&mut self.page_table);
             } else {
                 area.unmap(&mut self.page_table);
@@ -247,13 +245,9 @@ impl MemorySet {
     pub fn recycle_data_pages(&mut self) -> Vec<MmapFlush> {
         let mut flushes = Vec::new();
         for area in &mut self.areas {
-            if area.is_mmap() {
+            if area.is_mmap() || area.is_shm() || area.map_type == MapType::Framed {
                 flushes.extend(area.take_mmap_flushes(&mut self.page_table));
                 area.release_mmap_refs();
-            } else if area.is_shm() {
-                area.unmap_resident(&mut self.page_table);
-            } else if area.map_type == MapType::Framed {
-                area.unmap_resident(&mut self.page_table);
             } else {
                 area.unmap(&mut self.page_table);
             }

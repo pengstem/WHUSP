@@ -105,6 +105,7 @@ impl VirtAddr {
     }
 }
 
+/// return page end, the last part of it clears the lower bits
 pub(crate) fn page_align_up(addr: usize) -> usize {
     (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
@@ -163,20 +164,26 @@ impl VirtPageNum {
 
 impl PhysAddr {
     pub fn get_ref<T>(&self) -> &'static T {
-        unsafe { ({ self.0 } as *const T).as_ref().unwrap() }
+        unsafe {
+            (arch_mm::phys_to_virt(self.0) as *const T)
+                .as_ref()
+                .unwrap()
+        }
     }
     pub fn get_mut<T>(&self) -> &'static mut T {
-        unsafe { ({ self.0 } as *mut T).as_mut().unwrap() }
+        unsafe { (arch_mm::phys_to_virt(self.0) as *mut T).as_mut().unwrap() }
     }
 }
 impl PhysPageNum {
     pub fn get_pte_array(&self) -> &'static mut [PageTableEntry] {
         let pa: PhysAddr = (*self).into();
-        unsafe { core::slice::from_raw_parts_mut({ pa.0 } as *mut PageTableEntry, 512) }
+        unsafe {
+            core::slice::from_raw_parts_mut(arch_mm::phys_to_virt(pa.0) as *mut PageTableEntry, 512)
+        }
     }
     pub fn get_bytes_array(&self) -> &'static mut [u8] {
         let pa: PhysAddr = (*self).into();
-        unsafe { core::slice::from_raw_parts_mut({ pa.0 } as *mut u8, 4096) }
+        unsafe { core::slice::from_raw_parts_mut(arch_mm::phys_to_virt(pa.0) as *mut u8, 4096) }
     }
     pub fn get_mut<T>(&self) -> &'static mut T {
         let pa: PhysAddr = (*self).into();

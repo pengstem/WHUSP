@@ -361,6 +361,9 @@ fn choose_block_io_path() -> BlockIoPath {
     if !block_io_nonblocking_requested() {
         return BlockIoPath::Sync;
     }
+    // Nonblocking virtio waits may schedule only from task context with
+    // supervisor interrupts enabled and another ready task to run. Otherwise
+    // use synchronous I/O so boot and IRQ-sensitive paths never sleep here.
     if !can_sleep_for_nonblocking_block_io() {
         return BlockIoPath::FallbackUnsafe;
     }

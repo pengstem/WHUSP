@@ -113,11 +113,7 @@ pub fn sign_extend_virt_addr(addr: usize) -> usize {
 }
 
 pub fn phys_to_virt(addr: usize) -> usize {
-    if addr & DIRECT_MAP_MASK == 0 {
-        addr | VIRT_ADDR_START
-    } else {
-        addr
-    }
+    addr | VIRT_ADDR_START
 }
 
 pub fn virt_to_phys(addr: usize) -> usize {

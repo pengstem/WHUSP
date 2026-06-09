@@ -580,9 +580,6 @@ impl MemorySet {
         let grow_pages = new_end_vpn.0.saturating_sub(old_end_vpn.0);
 
         if new_mapped_end > old_mapped_end {
-            if self.range_overlaps(old_mapped_end, new_mapped_end) {
-                return self.brk;
-            }
             if self.mlock_future {
                 let mut heap_area = MapArea::new(
                     old_mapped_end.into(),
@@ -606,6 +603,7 @@ impl MemorySet {
                 return self.brk;
             }
             let Some(area_idx) = self.find_brk_extension_area(heap_start_vpn, old_end_vpn) else {
+                // going this way if it is the first time brk was invoked
                 let heap_area = MapArea::new(
                     old_mapped_end.into(),
                     new_mapped_end.into(),
@@ -639,10 +637,7 @@ impl MemorySet {
         old_end_vpn: super::VirtPageNum,
     ) -> Option<usize> {
         self.areas.iter().position(|area| {
-            !area.is_mmap()
-                && !area.is_shm()
-                && area.vpn_range.get_start() >= heap_start_vpn
-                && area.vpn_range.get_end() == old_end_vpn
+            area.vpn_range.get_start() >= heap_start_vpn && area.vpn_range.get_end() == old_end_vpn
         })
     }
 

@@ -66,6 +66,11 @@ impl ProcessControlBlock {
         inner.memory_set.token()
     }
 
+    /// Creates PID 1 from an already loaded kernel-selected ELF image.
+    ///
+    /// This path publishes the initial runnable task directly. Normal user
+    /// exec must go through the execve syscall path so permissions, shebang,
+    /// PT_INTERP, and close-on-exec rules are applied before image commit.
     pub fn new_with_args(
         elf_data: &[u8],
         executable_path: String,

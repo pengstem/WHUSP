@@ -309,6 +309,9 @@ fn sys_mmap_impl(
         return Err(SysError::EINVAL);
     }
     if flags & MAP_SHARED_VALIDATE == MAP_SHARED_VALIDATE {
+        // UNFINISHED: Linux MAP_SHARED_VALIDATE behaves like MAP_SHARED while
+        // rejecting unknown flags and enabling MAP_SYNC-style validation. This
+        // kernel does not implement that validation mode yet.
         return Err(SysError::ENOTSUP);
     }
     if flags & !MAP_SUPPORTED != 0 {

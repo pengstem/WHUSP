@@ -75,7 +75,7 @@ TEST_SCRIPTS = (
     "busybox_testcode.sh",
     "lua_testcode.sh",
     "libctest_testcode.sh",
-    # "ltp_testcode.sh",
+    "ltp_testcode.sh",
     "iozone_testcode.sh",
     "iperf_testcode.sh",
     "libcbench_testcode.sh",

@@ -66,6 +66,10 @@ pub fn sign_extend_virt_addr(addr: usize) -> usize {
     }
 }
 
+pub fn phys_to_virt(addr: usize) -> usize {
+    addr
+}
+
 pub fn pte_new_bits(ppn: usize, flags: crate::mm::page_table::PTEFlags) -> usize {
     ppn << 10 | flags.bits()
 }

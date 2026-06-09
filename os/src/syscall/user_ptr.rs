@@ -6,6 +6,9 @@ use core::mem::{MaybeUninit, size_of};
 
 use super::errno::{SysError, SysResult};
 
+// These knobs affect only allocation/cache behavior for small ABI values. The
+// fast path still goes through checked_user_pte(), so permissions, COW, and
+// optional fault-in semantics must match the multi-page copy path.
 const USER_COPY_SAME_PAGE_FAST_MAX: usize = 64;
 const USER_COPY_LEAF_PTE_CACHE: bool = true;
 

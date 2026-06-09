@@ -17,6 +17,11 @@ const RUNNER_ARCH: &str = "rv";
 #[cfg(target_arch = "loongarch64")]
 const RUNNER_ARCH: &str = "la";
 
+/// Builds the PID 1 shell command used by the contest boot path.
+///
+/// The kernel owns only late runtime facts such as architecture, perf trailer,
+/// and final shutdown. Test selection and exact OS COMP group markers belong
+/// to the generated script disk entry.
 pub(super) fn build_runner_command() -> String {
     if INTERACTIVE_SHELL {
         return interactive_shell_command();

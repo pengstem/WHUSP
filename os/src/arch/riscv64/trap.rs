@@ -100,7 +100,10 @@ pub fn trap_handler() -> ! {
 
             enable_supervisor_interrupt();
 
-            // get system call return value
+            // Exit handlers tear down task/process state and may remove this
+            // process from global lookup tables. Release the trap-local Arc
+            // before entering them so cleanup and reap paths do not observe a
+            // process kept alive only by this handler frame.
             if syscall_is_exit(syscall_nr) {
                 drop(process);
                 let _ = syscall_with_current_task(task, syscall_nr, syscall_args);

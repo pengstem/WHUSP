@@ -227,6 +227,8 @@ const MOUNT_STAT_NOATIME: u64 = 0x0400;
 const MOUNT_STAT_NODIRATIME: u64 = 0x0800;
 const MOUNT_STAT_NOSYMFOLLOW: u64 = 0x2000;
 
+// Linux mount(2) input flags accepted by this VFS layer. They are translated
+// into the statfs/mountinfo view above, not into per-open file status flags.
 const LINUX_MS_RDONLY: usize = 1;
 const LINUX_MS_NOSUID: usize = 1 << 1;
 const LINUX_MS_NODEV: usize = 1 << 2;
@@ -285,6 +287,9 @@ fn clear_dentry_cache_on_mount_change<T>(result: Result<T, MountError>) -> Resul
     result
 }
 
+// Device source names are Linux-visible through /proc/mounts and mount(2)
+// parsing. Preserve DTB order as /dev/vda, /dev/vdb, ... so x0 remains the
+// contest root disk and later devices can be mounted explicitly.
 fn block_source_name(device_index: usize) -> String {
     if device_index < 26 {
         format!("/dev/vd{}", (b'a' + device_index as u8) as char)
