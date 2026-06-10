@@ -432,16 +432,21 @@ pub(crate) fn processes_snapshot() -> Vec<Arc<ProcessControlBlock>> {
 
 pub(crate) fn task_with_linux_tid(tid: usize) -> Option<Arc<TaskControlBlock>> {
     let mut stale_index_entry = false;
-    {
-        let mut map = LINUX_TID2TASK.exclusive_access();
-        if let Some(task_ref) = map.get(&tid) {
-            if let Some(task) = task_ref.upgrade()
-                && task.linux_tid() == tid
-                && task.inner_exclusive_access().task_status != TaskStatus::Exited
-            {
-                perf::record_tid_lookup(0, 0, true, true, false);
-                return Some(task);
-            }
+
+    let indexed_task = {
+        let map = LINUX_TID2TASK.exclusive_access();
+        map.get(&tid).cloned()
+    };
+    if let Some(task_ref) = indexed_task {
+        if let Some(task) = task_ref.upgrade()
+            && task.linux_tid() == tid
+            && task.inner_exclusive_access().task_status != TaskStatus::Exited
+        {
+            perf::record_tid_lookup(0, 0, true, true, false);
+            return Some(task);
+        }
+        {
+            let mut map = LINUX_TID2TASK.exclusive_access();
             map.remove(&tid);
             stale_index_entry = true;
         }
