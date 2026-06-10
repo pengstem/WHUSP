@@ -968,12 +968,14 @@ pub(crate) fn syscall_with_context(
         SYSCALL_PKEY_FREE => sys_pkey_free(args[0] as isize),
         SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_CLONE3 => sys_clone3(args[0] as *const LinuxCloneArgs, args[1]),
-        SYSCALL_EXECVE => sys_execve(
+        SYSCALL_EXECVE => sys_execve_ctx(
+            ctx,
             args[0] as *const u8,
             args[1] as *const usize,
             args[2] as *const usize,
         ),
-        SYSCALL_EXECVEAT => sys_execveat(
+        SYSCALL_EXECVEAT => sys_execveat_ctx(
+            ctx,
             args[0] as isize,
             args[1] as *const u8,
             args[2] as *const usize,

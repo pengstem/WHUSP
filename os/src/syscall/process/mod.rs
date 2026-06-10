@@ -10,7 +10,7 @@ mod sched;
 mod system;
 
 pub use clone::{LinuxCloneArgs, sys_clone, sys_clone3};
-pub use exec::{sys_execve, sys_execveat};
+pub use exec::{sys_execve_ctx, sys_execveat_ctx};
 pub use id::{
     sys_exit, sys_exit_group, sys_getpgid_ctx, sys_getpid, sys_getppid, sys_getsid_ctx, sys_gettid,
     sys_kill, sys_sched_yield, sys_set_tid_address_ctx, sys_setpgid_ctx, sys_setsid,

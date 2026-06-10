@@ -497,6 +497,7 @@ fn append_user_string_bytes(string: &mut String, bytes: &[u8], is_ascii: bool) {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn read_user_usize(token: usize, addr: usize) -> SysResult<usize> {
     read_user_value_with_site(
         token,

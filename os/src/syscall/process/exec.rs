@@ -5,10 +5,13 @@ use crate::fs::{
     regular_file_is_open_writable_in, regular_file_node_is_open_writable, stat_in,
 };
 use crate::mm::record_exec_metadata_read;
+use crate::syscall::SyscallContext;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::fs::permissions::{AccessSubject, check_execute_permission};
 use crate::syscall::fs::{fanotify_notify_open_exec_at, path_context_from};
-use crate::syscall::user_ptr::{PATH_MAX, read_user_c_string, read_user_usize};
+use crate::syscall::user_ptr::{
+    PATH_MAX, read_user_c_string, read_user_c_string_ctx, read_user_usize, read_user_usize_ctx,
+};
 use crate::task::{current_process, current_user_token};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -108,6 +111,7 @@ impl ExecStringBudget {
     }
 }
 
+#[allow(dead_code)]
 fn read_exec_string_array(
     token: usize,
     mut ptr: *const usize,
@@ -137,6 +141,36 @@ fn read_exec_string_array(
     Ok(strings)
 }
 
+fn read_exec_string_array_ctx(
+    ctx: &SyscallContext,
+    mut ptr: *const usize,
+    budget: &mut ExecStringBudget,
+) -> SysResult<Vec<String>> {
+    if ptr.is_null() {
+        return Ok(Vec::new());
+    }
+    let mut strings = Vec::new();
+    loop {
+        let string_ptr = read_user_usize_ctx(ctx, ptr as usize)?;
+        if string_ptr == 0 {
+            break;
+        }
+        let string = read_user_c_string_ctx(ctx, string_ptr as *const u8, PATH_MAX)?;
+        // UNFINISHED: Linux derives exec argument limits from ARG_MAX,
+        // MAX_ARG_STRLEN, and RLIMIT_STACK. This contest kernel bounds the
+        // copied argv+envp payload to the mapped user-stack window so malformed
+        // callers cannot allocate unbounded kernel memory before stack layout
+        // returns E2BIG.
+        budget.charge(string.len())?;
+        strings.push(string);
+        unsafe {
+            ptr = ptr.add(1);
+        }
+    }
+    Ok(strings)
+}
+
+#[allow(dead_code)]
 fn read_exec_args_envs(
     token: usize,
     args: *const usize,
@@ -145,6 +179,17 @@ fn read_exec_args_envs(
     let mut budget = ExecStringBudget::new();
     let args_vec = read_exec_string_array(token, args, &mut budget)?;
     let envs_vec = read_exec_string_array(token, envs, &mut budget)?;
+    Ok((args_vec, envs_vec))
+}
+
+fn read_exec_args_envs_ctx(
+    ctx: &SyscallContext,
+    args: *const usize,
+    envs: *const usize,
+) -> SysResult<(Vec<String>, Vec<String>)> {
+    let mut budget = ExecStringBudget::new();
+    let args_vec = read_exec_string_array_ctx(ctx, args, &mut budget)?;
+    let envs_vec = read_exec_string_array_ctx(ctx, envs, &mut budget)?;
     Ok((args_vec, envs_vec))
 }
 
@@ -779,10 +824,22 @@ fn normalize_exec_envs(path: &str, mut envs: Vec<String>) -> Vec<String> {
     envs
 }
 
+#[allow(dead_code)]
 pub fn sys_execve(path: *const u8, args: *const usize, envs: *const usize) -> SysResult {
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
     let (args_vec, envs_vec) = read_exec_args_envs(token, args, envs)?;
+    exec_path(path, args_vec, envs_vec)
+}
+
+pub fn sys_execve_ctx(
+    ctx: &SyscallContext,
+    path: *const u8,
+    args: *const usize,
+    envs: *const usize,
+) -> SysResult {
+    let path = read_user_c_string_ctx(ctx, path, PATH_MAX)?;
+    let (args_vec, envs_vec) = read_exec_args_envs_ctx(ctx, args, envs)?;
     exec_path(path, args_vec, envs_vec)
 }
 
@@ -800,6 +857,7 @@ fn file_by_fd(fd: isize) -> SysResult<Arc<dyn File + Send + Sync>> {
         .ok_or(SysError::EBADF)
 }
 
+#[allow(dead_code)]
 pub fn sys_execveat(
     dirfd: isize,
     path: *const u8,
@@ -814,6 +872,43 @@ pub fn sys_execveat(
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
     let (args_vec, envs_vec) = read_exec_args_envs(token, args, envs)?;
+
+    if path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(SysError::ENOENT);
+        }
+        if dirfd == AT_FDCWD {
+            let file = open_file_in(
+                current_process().path_snapshot().context,
+                ".",
+                OpenFlags::PATH,
+            )?;
+            return exec_open_file(String::from("."), file, args_vec, envs_vec);
+        }
+        let file = file_by_fd(dirfd)?;
+        return exec_open_file(format!("/dev/fd/{dirfd}"), file, args_vec, envs_vec);
+    }
+
+    let snapshot = current_process().path_snapshot();
+    let context = path_context_from(&snapshot, dirfd, path.as_str())?;
+    let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
+    exec_path_in(context, path, follow_final_symlink, args_vec, envs_vec)
+}
+
+pub fn sys_execveat_ctx(
+    ctx: &SyscallContext,
+    dirfd: isize,
+    path: *const u8,
+    args: *const usize,
+    envs: *const usize,
+    flags: usize,
+) -> SysResult {
+    if flags & !VALID_EXECVEAT_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+
+    let path = read_user_c_string_ctx(ctx, path, PATH_MAX)?;
+    let (args_vec, envs_vec) = read_exec_args_envs_ctx(ctx, args, envs)?;
 
     if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
