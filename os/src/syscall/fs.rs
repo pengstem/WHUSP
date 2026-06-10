@@ -42,8 +42,8 @@ pub use inotify::{sys_inotify_add_watch, sys_inotify_init1, sys_inotify_rm_watch
 pub use io::{
     sys_copy_file_range, sys_fadvise64, sys_fallocate, sys_fdatasync, sys_fsync, sys_ftruncate,
     sys_lseek, sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2,
-    sys_read, sys_readahead, sys_readv, sys_sendfile, sys_splice, sys_sync, sys_syncfs, sys_write,
-    sys_writev,
+    sys_read_ctx, sys_readahead, sys_readv_ctx, sys_sendfile, sys_splice, sys_sync, sys_syncfs,
+    sys_write_ctx, sys_writev_ctx,
 };
 pub use mount::{
     sys_fsconfig, sys_fsmount, sys_fsopen, sys_fspick, sys_mount, sys_move_mount, sys_open_tree,
@@ -51,16 +51,17 @@ pub use mount::{
 };
 pub(crate) use path::path_context_from;
 pub use path::{
-    sys_chdir, sys_chroot, sys_faccessat, sys_faccessat2, sys_fchdir, sys_getcwd, sys_getdents64,
-    sys_linkat, sys_mkdirat, sys_mknodat, sys_openat, sys_openat2, sys_readlinkat, sys_renameat2,
-    sys_symlinkat, sys_truncate, sys_umask, sys_unlinkat, sys_utimensat,
+    sys_chdir, sys_chroot, sys_faccessat, sys_faccessat2, sys_fchdir, sys_getcwd_ctx,
+    sys_getdents64, sys_linkat, sys_mkdirat, sys_mknodat, sys_openat_ctx, sys_openat2,
+    sys_readlinkat, sys_renameat2, sys_symlinkat, sys_truncate, sys_umask, sys_unlinkat,
+    sys_utimensat,
 };
 pub use poll::{sys_ppoll, sys_pselect6};
 pub use quota::{sys_quotactl, sys_quotactl_fd};
 pub use stat::{
     sys_fchmod, sys_fchmodat, sys_fchown, sys_fchownat, sys_fgetxattr, sys_flistxattr,
-    sys_fremovexattr, sys_fsetxattr, sys_fstat, sys_fstatfs, sys_getxattr, sys_lgetxattr,
-    sys_listxattr, sys_llistxattr, sys_lremovexattr, sys_lsetxattr, sys_newfstatat,
+    sys_fremovexattr, sys_fsetxattr, sys_fstat_ctx, sys_fstatfs, sys_getxattr, sys_lgetxattr,
+    sys_listxattr, sys_llistxattr, sys_lremovexattr, sys_lsetxattr, sys_newfstatat_ctx,
     sys_removexattr, sys_setxattr, sys_statfs, sys_statx,
 };
 pub(crate) use swap::is_active_swap_file;

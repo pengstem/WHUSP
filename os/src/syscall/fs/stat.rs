@@ -8,17 +8,18 @@ use crate::fs::{
 use crate::sync::SleepMutex;
 use crate::task::{PathSnapshot, current_process, current_user_token};
 
+use super::super::SyscallContext;
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string,
-    translated_byte_buffer_checked_with_mmap_fault, write_user_value,
+    PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, read_user_c_string_ctx,
+    translated_byte_buffer_checked_with_mmap_fault, write_user_value, write_user_value_ctx,
 };
 use super::fanotify::fanotify_notify_attrib;
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
 use super::inotify::inotify_notify_attrib;
 use super::path::{
-    AtPath, check_current_access_path_prefixes_from, normalize_path_from, path_context_from,
-    resolve_at_path,
+    AtPath, check_access_path_prefixes_for_process, check_current_access_path_prefixes_from,
+    normalize_path_from, path_context_from, resolve_at_path,
 };
 use super::uapi::{
     AT_EMPTY_PATH, AT_FDCWD, AT_STATX_DONT_SYNC, AT_STATX_FORCE_SYNC, AT_SYMLINK_NOFOLLOW,
@@ -60,6 +61,15 @@ fn write_stat_result<T: From<FileStat> + Copy>(
     stat: FileStat,
 ) -> SysResult {
     write_user_value(token, buf, &stat.into())?;
+    Ok(0)
+}
+
+fn write_stat_result_ctx<T: From<FileStat> + Copy>(
+    ctx: &SyscallContext,
+    buf: *mut T,
+    stat: FileStat,
+) -> SysResult {
+    write_user_value_ctx(ctx, buf, &stat.into())?;
     Ok(0)
 }
 
@@ -120,6 +130,7 @@ pub(super) fn resolve_stat_from(
     )?)
 }
 
+#[allow(dead_code)]
 pub fn sys_fstat(fd: usize, statbuf: *mut LinuxKstat) -> SysResult {
     if statbuf.is_null() {
         return Err(SysError::EFAULT);
@@ -129,6 +140,15 @@ pub fn sys_fstat(fd: usize, statbuf: *mut LinuxKstat) -> SysResult {
     write_stat_result(token, statbuf, file.stat()?)
 }
 
+pub fn sys_fstat_ctx(ctx: &SyscallContext, fd: usize, statbuf: *mut LinuxKstat) -> SysResult {
+    if statbuf.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    let file = get_file_by_fd(fd)?;
+    write_stat_result_ctx(ctx, statbuf, file.stat()?)
+}
+
+#[allow(dead_code)]
 pub fn sys_newfstatat(
     dirfd: isize,
     pathname: *const u8,
@@ -154,6 +174,36 @@ pub fn sys_newfstatat(
     }
     write_stat_result(
         token,
+        statbuf,
+        resolve_stat_from(&snapshot, dirfd, path.as_str(), follow_final_symlink)?,
+    )
+}
+
+pub fn sys_newfstatat_ctx(
+    ctx: &SyscallContext,
+    dirfd: isize,
+    pathname: *const u8,
+    statbuf: *mut LinuxKstat,
+    flags: i32,
+) -> SysResult {
+    if statbuf.is_null() || pathname.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    if flags & !VALID_FSTATAT_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+
+    let path = read_user_c_string_ctx(ctx, pathname, PATH_MAX)?;
+    if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
+        return Err(SysError::ENOENT);
+    }
+    let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let snapshot = ctx.process().path_snapshot();
+    if !path.is_empty() {
+        check_access_path_prefixes_for_process(ctx.process(), &snapshot, dirfd, path.as_str())?;
+    }
+    write_stat_result_ctx(
+        ctx,
         statbuf,
         resolve_stat_from(&snapshot, dirfd, path.as_str(), follow_final_symlink)?,
     )

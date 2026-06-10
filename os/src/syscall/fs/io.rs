@@ -2,9 +2,10 @@ use crate::config::PAGE_SIZE;
 use crate::fs::{File, FileStat, OpenFlags, PollEvents, S_IFDIR, S_IFMT, S_IFREG, SeekWhence};
 use crate::mm::UserBuffer;
 use crate::perf;
+use crate::syscall::SyscallContext;
 use crate::task::{
-    FdTableEntry, RLimitResource, SignalFlags, current_add_signal, current_process,
-    current_user_token,
+    FdTableEntry, ProcessControlBlock, RLimitResource, SignalFlags, current_add_signal,
+    current_process, current_user_token,
 };
 use alloc::{vec, vec::Vec};
 use core::mem::size_of;
@@ -13,8 +14,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    UserBufferAccess, read_user_array, read_user_value, read_user_value_with_mmap_fault,
-    translated_byte_buffer_checked_with_mmap_fault, write_user_value,
+    UserBufferAccess, read_user_array, read_user_array_ctx, read_user_value,
+    read_user_value_with_mmap_fault, translated_byte_buffer_checked_with_mmap_fault,
+    write_user_value,
 };
 use super::fanotify::{fanotify_notify_access, fanotify_notify_modify};
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
@@ -158,6 +160,22 @@ impl UserIovecCursor {
 /// `EINVAL`, preserving the visible readv/writev-family ABI boundary.
 fn read_user_iovecs(token: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult<UserIovecs> {
     let entries = read_user_array(token, iov, iovcnt)?;
+    let mut total_len = 0usize;
+    for iovec in entries.iter() {
+        total_len = total_len.checked_add(iovec.len).ok_or(SysError::EINVAL)?;
+        if total_len > isize::MAX as usize {
+            return Err(SysError::EINVAL);
+        }
+    }
+    Ok(UserIovecs { entries, total_len })
+}
+
+fn read_user_iovecs_ctx(
+    ctx: &SyscallContext,
+    iov: *const LinuxIovec,
+    iovcnt: usize,
+) -> SysResult<UserIovecs> {
+    let entries = read_user_array_ctx(ctx, iov, iovcnt)?;
     let mut total_len = 0usize;
     for iovec in entries.iter() {
         total_len = total_len.checked_add(iovec.len).ok_or(SysError::EINVAL)?;
@@ -535,6 +553,14 @@ fn current_file_size_limit() -> usize {
         .rlim_cur
 }
 
+fn file_size_limit_for_process(process: &ProcessControlBlock) -> usize {
+    process
+        .inner_exclusive_access()
+        .resource_limits
+        .get(RLimitResource::FSize)
+        .rlim_cur
+}
+
 fn queue_file_size_limit_signal() {
     current_add_signal(SignalFlags::SIGXFSZ);
 }
@@ -543,6 +569,15 @@ fn allowed_write_len_at(
     file: &(dyn File + Send + Sync),
     offset: usize,
     requested_len: usize,
+) -> SysResult<usize> {
+    allowed_write_len_at_with_limit(file, offset, requested_len, current_file_size_limit())
+}
+
+fn allowed_write_len_at_with_limit(
+    file: &(dyn File + Send + Sync),
+    offset: usize,
+    requested_len: usize,
+    limit: usize,
 ) -> SysResult<usize> {
     // CONTEXT: RLIMIT_FSIZE is enforced at the resulting file-size boundary.
     // Writes that start below the permitted end may be shortened; writes that
@@ -554,7 +589,6 @@ fn allowed_write_len_at(
     if stat.mode & S_IFMT != S_IFREG {
         return Ok(requested_len);
     }
-    let limit = current_file_size_limit();
     if limit == usize::MAX {
         return Ok(requested_len);
     }
@@ -572,6 +606,26 @@ fn allowed_write_len_at(
 }
 
 fn allowed_write_len_for_entry(entry: &FdTableEntry, requested_len: usize) -> SysResult<usize> {
+    allowed_write_len_for_entry_with_limit(entry, requested_len, current_file_size_limit())
+}
+
+fn allowed_write_len_for_entry_for_process(
+    process: &ProcessControlBlock,
+    entry: &FdTableEntry,
+    requested_len: usize,
+) -> SysResult<usize> {
+    allowed_write_len_for_entry_with_limit(
+        entry,
+        requested_len,
+        file_size_limit_for_process(process),
+    )
+}
+
+fn allowed_write_len_for_entry_with_limit(
+    entry: &FdTableEntry,
+    requested_len: usize,
+    limit: usize,
+) -> SysResult<usize> {
     let file = entry.file();
     let stat = file.stat()?;
     if stat.mode & S_IFMT != S_IFREG {
@@ -582,7 +636,7 @@ fn allowed_write_len_for_entry(entry: &FdTableEntry, requested_len: usize) -> Sy
     } else {
         file.seek(0, SeekWhence::Current)?
     };
-    allowed_write_len_at(file.as_ref(), offset, requested_len)
+    allowed_write_len_at_with_limit(file.as_ref(), offset, requested_len, limit)
 }
 
 fn check_file_size_limit_for_len(file: &(dyn File + Send + Sync), len: usize) -> SysResult<()> {
@@ -1603,8 +1657,24 @@ pub fn sys_pwritev2(
     sys_pwritev(fd, iov, iovcnt, pos_l, pos_h)
 }
 
+#[allow(dead_code)]
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
     let token = current_user_token();
+    let process = current_process();
+    sys_write_with_process(&process, token, fd, buf, len)
+}
+
+pub fn sys_write_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize) -> SysResult {
+    sys_write_with_process(ctx.process(), ctx.user_token(), fd, buf, len)
+}
+
+fn sys_write_with_process(
+    process: &ProcessControlBlock,
+    token: usize,
+    fd: usize,
+    buf: *const u8,
+    len: usize,
+) -> SysResult {
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
     if !file.writable() {
@@ -1615,7 +1685,7 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
     }
     check_pipe_write_peer(&entry, len > 0)?;
     let allowed_len = if file.is_eventfd() {
-        let allowed_len = allowed_write_len_for_entry(&entry, len)?;
+        let allowed_len = allowed_write_len_for_entry_for_process(process, &entry, len)?;
         file.check_write(
             allowed_len,
             entry.status_flags().contains(OpenFlags::APPEND),
@@ -1625,7 +1695,7 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
         allowed_len
     } else {
         ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
-        let allowed_len = allowed_write_len_for_entry(&entry, len)?;
+        let allowed_len = allowed_write_len_for_entry_for_process(process, &entry, len)?;
         file.check_write(
             allowed_len,
             entry.status_flags().contains(OpenFlags::APPEND),
@@ -1653,8 +1723,31 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
 }
 
 pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult {
+    let token = current_user_token();
+    let process = current_process();
+    sys_writev_with_process(&process, token, fd, iov, iovcnt)
+}
+
+pub fn sys_writev_ctx(
+    ctx: &SyscallContext,
+    fd: usize,
+    iov: *const LinuxIovec,
+    iovcnt: usize,
+) -> SysResult {
+    let iovecs = validate_user_iovecs_arg_ctx(ctx, iov, iovcnt)?;
+    sys_writev_with_iovecs(ctx.process(), ctx.user_token(), fd, iovecs, iovcnt)
+}
+
+fn validate_user_iovecs_arg(
+    token: usize,
+    iov: *const LinuxIovec,
+    iovcnt: usize,
+) -> SysResult<UserIovecs> {
     if iovcnt == 0 {
-        return Ok(0);
+        return Ok(UserIovecs {
+            entries: Vec::new(),
+            total_len: 0,
+        });
     }
     if iovcnt > IOV_MAX {
         return Err(SysError::EINVAL);
@@ -1663,8 +1756,51 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
         return Err(SysError::EFAULT);
     }
 
-    let token = current_user_token();
-    let iovecs = read_user_iovecs(token, iov, iovcnt)?;
+    read_user_iovecs(token, iov, iovcnt)
+}
+
+fn validate_user_iovecs_arg_ctx(
+    ctx: &SyscallContext,
+    iov: *const LinuxIovec,
+    iovcnt: usize,
+) -> SysResult<UserIovecs> {
+    if iovcnt == 0 {
+        return Ok(UserIovecs {
+            entries: Vec::new(),
+            total_len: 0,
+        });
+    }
+    if iovcnt > IOV_MAX {
+        return Err(SysError::EINVAL);
+    }
+    if iov.is_null() {
+        return Err(SysError::EFAULT);
+    }
+
+    read_user_iovecs_ctx(ctx, iov, iovcnt)
+}
+
+fn sys_writev_with_process(
+    process: &ProcessControlBlock,
+    token: usize,
+    fd: usize,
+    iov: *const LinuxIovec,
+    iovcnt: usize,
+) -> SysResult {
+    let iovecs = validate_user_iovecs_arg(token, iov, iovcnt)?;
+    sys_writev_with_iovecs(process, token, fd, iovecs, iovcnt)
+}
+
+fn sys_writev_with_iovecs(
+    process: &ProcessControlBlock,
+    token: usize,
+    fd: usize,
+    iovecs: UserIovecs,
+    iovcnt: usize,
+) -> SysResult {
+    if iovcnt == 0 {
+        return Ok(0);
+    }
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
     if !file.writable() {
@@ -1676,7 +1812,7 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
     }
     check_pipe_write_peer(&entry, has_data)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
-    let allowed_len = allowed_write_len_for_entry(&entry, iovecs.total_len)?;
+    let allowed_len = allowed_write_len_for_entry_for_process(process, &entry, iovecs.total_len)?;
     file.check_write(
         allowed_len,
         entry.status_flags().contains(OpenFlags::APPEND),
@@ -1729,18 +1865,25 @@ pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult
 }
 
 pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult {
+    let token = current_user_token();
+    let iovecs = validate_user_iovecs_arg(token, iov, iovcnt)?;
+    sys_readv_with_iovecs(token, fd, iovecs, iovcnt)
+}
+
+pub fn sys_readv_ctx(
+    ctx: &SyscallContext,
+    fd: usize,
+    iov: *const LinuxIovec,
+    iovcnt: usize,
+) -> SysResult {
+    let iovecs = validate_user_iovecs_arg_ctx(ctx, iov, iovcnt)?;
+    sys_readv_with_iovecs(ctx.user_token(), fd, iovecs, iovcnt)
+}
+
+fn sys_readv_with_iovecs(token: usize, fd: usize, iovecs: UserIovecs, iovcnt: usize) -> SysResult {
     if iovcnt == 0 {
         return Ok(0);
     }
-    if iovcnt > IOV_MAX {
-        return Err(SysError::EINVAL);
-    }
-    if iov.is_null() {
-        return Err(SysError::EFAULT);
-    }
-
-    let token = current_user_token();
-    let iovecs = read_user_iovecs(token, iov, iovcnt)?;
     let requested_len = iovecs.total_len;
     let file = get_file_by_fd(fd)?;
     let mode = file.stat()?.mode;
@@ -1780,8 +1923,17 @@ pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult 
     Ok(total_read as isize)
 }
 
+#[allow(dead_code)]
 pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> SysResult {
     let token = current_user_token();
+    sys_read_with_token(token, fd, buf, len)
+}
+
+pub fn sys_read_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize) -> SysResult {
+    sys_read_with_token(ctx.user_token(), fd, buf, len)
+}
+
+fn sys_read_with_token(token: usize, fd: usize, buf: *const u8, len: usize) -> SysResult {
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
     if file.stat()?.mode & S_IFMT == S_IFDIR {

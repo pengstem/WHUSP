@@ -257,6 +257,7 @@ const SYSCALL_QUOTACTL_FD: usize = 443;
 const SYSCALL_MEMFD_SECRET: usize = 447;
 
 mod aio;
+mod context;
 pub(crate) mod errno;
 mod fs;
 mod futex;
@@ -275,7 +276,8 @@ mod wait;
 
 use crate::perf;
 use crate::task::{
-    RLimit, SeccompSockFilter, SignalFlags, SignalInfo, TaskControlBlock, queue_signal_to_task,
+    RLimit, SeccompSockFilter, SignalFlags, SignalInfo, TaskControlBlock, process_of_task,
+    queue_signal_to_task,
 };
 use aio::*;
 use alloc::sync::Arc;
@@ -295,6 +297,7 @@ use uapi::LinuxTimeSpec;
 use wait::*;
 
 pub(crate) use aio::aio_max_nr_content;
+pub(crate) use context::SyscallContext;
 pub(crate) use fs::{
     INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES,
     close_detached_fd_entry, fanotify_evict_evictable_marks, fanotify_fdinfo,
@@ -417,7 +420,17 @@ pub fn syscall_with_current_task(
         return value;
     }
 
-    ret(match syscall_id {
+    let process = process_of_task(&current);
+    let ctx = SyscallContext::new(current, process);
+    ret(syscall_with_context(&ctx, syscall_id, args))
+}
+
+pub(crate) fn syscall_with_context(
+    ctx: &SyscallContext,
+    syscall_id: usize,
+    args: [usize; 6],
+) -> Result<isize, SysError> {
+    match syscall_id {
         SYSCALL_IO_SETUP => sys_io_setup(args[0], args[1] as *mut usize),
         SYSCALL_IO_DESTROY => sys_io_destroy(args[0]),
         SYSCALL_IO_SUBMIT => sys_io_submit(args[0], args[1] as isize, args[2] as *const _),
@@ -472,7 +485,7 @@ pub fn syscall_with_current_task(
         SYSCALL_LREMOVEXATTR => sys_lremovexattr(args[0] as *const u8, args[1] as *const u8),
         SYSCALL_FREMOVEXATTR => sys_fremovexattr(args[0], args[1] as *const u8),
         SYSCALL_EVENTFD2 => sys_eventfd2(args[0] as u32, args[1] as u32),
-        SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
+        SYSCALL_GETCWD => sys_getcwd_ctx(ctx, args[0] as *mut u8, args[1]),
         SYSCALL_EPOLL_CREATE1 => sys_epoll_create1(args[0] as u32),
         SYSCALL_EPOLL_CTL => sys_epoll_ctl(args[0], args[1] as i32, args[2], args[3] as *const u8),
         SYSCALL_EPOLL_PWAIT => sys_epoll_pwait(
@@ -565,7 +578,8 @@ pub fn syscall_with_current_task(
             args[4] as i32,
         ),
         SYSCALL_FCHOWN => sys_fchown(args[0], args[1] as u32, args[2] as u32),
-        SYSCALL_OPENAT => sys_openat(
+        SYSCALL_OPENAT => sys_openat_ctx(
+            ctx,
             args[0] as isize,
             args[1] as *const u8,
             args[2] as u32,
@@ -587,10 +601,10 @@ pub fn syscall_with_current_task(
         ),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_LSEEK => sys_lseek(args[0], args[1] as i64, args[2]),
-        SYSCALL_READV => sys_readv(args[0], args[1] as *const LinuxIovec, args[2]),
-        SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),
-        SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
-        SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const LinuxIovec, args[2]),
+        SYSCALL_READV => sys_readv_ctx(ctx, args[0], args[1] as *const LinuxIovec, args[2]),
+        SYSCALL_READ => sys_read_ctx(ctx, args[0], args[1] as *const u8, args[2]),
+        SYSCALL_WRITE => sys_write_ctx(ctx, args[0], args[1] as *const u8, args[2]),
+        SYSCALL_WRITEV => sys_writev_ctx(ctx, args[0], args[1] as *const LinuxIovec, args[2]),
         SYSCALL_PREAD64 => sys_pread64(args[0], args[1] as *mut u8, args[2], args[3]),
         SYSCALL_PWRITE64 => sys_pwrite64(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_PREADV => sys_preadv(
@@ -671,13 +685,14 @@ pub fn syscall_with_current_task(
             args[2] as *mut u8,
             args[3],
         ),
-        SYSCALL_NEWFSTATAT => sys_newfstatat(
+        SYSCALL_NEWFSTATAT => sys_newfstatat_ctx(
+            ctx,
             args[0] as isize,
             args[1] as *const u8,
             args[2] as *mut LinuxKstat,
             args[3] as i32,
         ),
-        SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut LinuxKstat),
+        SYSCALL_FSTAT => sys_fstat_ctx(ctx, args[0], args[1] as *mut LinuxKstat),
         SYSCALL_SYNC => sys_sync(),
         SYSCALL_FSYNC => sys_fsync(args[0]),
         SYSCALL_FDATASYNC => sys_fdatasync(args[0]),
@@ -1033,5 +1048,5 @@ pub fn syscall_with_current_task(
         SYSCALL_SENDMSG => sys_sendmsg(args[0], args[1], args[2] as i32),
         SYSCALL_RECVMSG => sys_recvmsg(args[0], args[1], args[2] as i32),
         _ => Err(SysError::ENOSYS),
-    })
+    }
 }

@@ -1,8 +1,9 @@
+use super::super::SyscallContext;
 use super::super::errno::{SysError, SysResult};
 use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{
-    PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, read_user_value,
-    translated_byte_buffer_checked,
+    PATH_MAX, UserBufferAccess, copy_to_user, copy_to_user_ctx, read_user_c_string,
+    read_user_c_string_ctx, read_user_value, translated_byte_buffer_checked,
 };
 use super::fanotify::{
     fanotify_notify_create, fanotify_notify_delete, fanotify_notify_modify, fanotify_notify_move,
@@ -33,7 +34,9 @@ use crate::fs::{
     unlink_file_in,
 };
 use crate::mm::UserBuffer;
-use crate::task::{CAP_SYS_CHROOT, PathSnapshot, current_process, current_user_token};
+use crate::task::{
+    CAP_SYS_CHROOT, PathSnapshot, ProcessControlBlock, current_process, current_user_token,
+};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -395,6 +398,17 @@ pub(super) fn check_current_access_path_prefixes_from(
     check_access_path_prefixes_from(snapshot, dirfd, path, subject)
 }
 
+pub(super) fn check_access_path_prefixes_for_process(
+    process: &ProcessControlBlock,
+    snapshot: &PathSnapshot,
+    dirfd: isize,
+    path: &str,
+) -> SysResult<()> {
+    let credentials = process.credentials();
+    let subject = AccessSubject::from_fs_credentials(&credentials);
+    check_access_path_prefixes_from(snapshot, dirfd, path, subject)
+}
+
 fn parse_utimensat_time(
     time: LinuxTimeSpec,
     now: FileTimestamp,
@@ -492,7 +506,12 @@ fn apply_utimensat_to_file(
     Ok(0)
 }
 
-fn copy_c_string_to_user(ptr: *mut u8, buf_len: usize, string: &str) -> SysResult {
+fn copy_c_string_to_user_ctx(
+    ctx: &SyscallContext,
+    ptr: *mut u8,
+    buf_len: usize,
+    string: &str,
+) -> SysResult {
     let total_len = string.len() + 1;
     if buf_len < total_len {
         return Err(SysError::ERANGE);
@@ -500,7 +519,7 @@ fn copy_c_string_to_user(ptr: *mut u8, buf_len: usize, string: &str) -> SysResul
     let mut bytes = Vec::with_capacity(total_len);
     bytes.extend_from_slice(string.as_bytes());
     bytes.push(0);
-    copy_to_user(current_user_token(), ptr, &bytes)?;
+    copy_to_user_ctx(ctx, ptr, &bytes)?;
     Ok(total_len as isize)
 }
 
@@ -605,7 +624,18 @@ pub(super) fn open_flags_from_user_bits(flags: u32) -> SysResult<OpenFlags> {
 }
 
 fn do_openat(dirfd: isize, path: &str, flags: OpenFlags, mode: u32) -> SysResult {
-    let snapshot = current_process().path_snapshot();
+    let process = current_process();
+    do_openat_for_process(&process, dirfd, path, flags, mode)
+}
+
+fn do_openat_for_process(
+    process: &ProcessControlBlock,
+    dirfd: isize,
+    path: &str,
+    flags: OpenFlags,
+    mode: u32,
+) -> SysResult {
+    let snapshot = process.path_snapshot();
     if let Some(file) = open_devfs_child_from_dirfd(dirfd, path, flags)? {
         return install_file_fd(file, flags, None);
     }
@@ -631,7 +661,6 @@ fn do_openat(dirfd: isize, path: &str, flags: OpenFlags, mode: u32) -> SysResult
             lookup_path_in(context.clone(), path, !flags.contains(OpenFlags::NOFOLLOW),),
             Err(FsError::NotFound)
         );
-    let process = current_process();
     let credentials = process.credentials();
     let subject = AccessSubject::from_fs_credentials(&credentials);
     check_access_path_prefixes_from(&snapshot, dirfd, path, subject)?;
@@ -668,11 +697,24 @@ fn do_openat(dirfd: isize, path: &str, flags: OpenFlags, mode: u32) -> SysResult
     Ok(fd)
 }
 
+#[allow(dead_code)]
 pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> SysResult {
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
     let flags = open_flags_from_user_bits(flags)?;
     do_openat(dirfd, path.as_str(), flags, mode)
+}
+
+pub fn sys_openat_ctx(
+    ctx: &SyscallContext,
+    dirfd: isize,
+    path: *const u8,
+    flags: u32,
+    mode: u32,
+) -> SysResult {
+    let path = read_user_c_string_ctx(ctx, path, PATH_MAX)?;
+    let flags = open_flags_from_user_bits(flags)?;
+    do_openat_for_process(ctx.process(), dirfd, path.as_str(), flags, mode)
 }
 
 fn read_open_how_extra_zeros(token: usize, how: *const u8, size: usize) -> SysResult<()> {
@@ -1009,10 +1051,25 @@ pub fn sys_fchdir(fd: usize) -> SysResult {
     Ok(0)
 }
 
+#[allow(dead_code)]
 pub fn sys_getcwd(buf: *mut u8, size: usize) -> SysResult {
     let snapshot = current_process().path_snapshot();
     let cwd_path = visible_working_dir_path(&snapshot)?;
-    copy_c_string_to_user(buf, size, cwd_path.as_str())
+    let total_len = cwd_path.len() + 1;
+    if size < total_len {
+        return Err(SysError::ERANGE);
+    }
+    let mut bytes = Vec::with_capacity(total_len);
+    bytes.extend_from_slice(cwd_path.as_bytes());
+    bytes.push(0);
+    copy_to_user(current_user_token(), buf, &bytes)?;
+    Ok(total_len as isize)
+}
+
+pub fn sys_getcwd_ctx(ctx: &SyscallContext, buf: *mut u8, size: usize) -> SysResult {
+    let snapshot = ctx.process().path_snapshot();
+    let cwd_path = visible_working_dir_path(&snapshot)?;
+    copy_c_string_to_user_ctx(ctx, buf, size, cwd_path.as_str())
 }
 
 pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> SysResult {
