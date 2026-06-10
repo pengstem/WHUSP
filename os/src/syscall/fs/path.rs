@@ -2,9 +2,8 @@ use super::super::SyscallContext;
 use super::super::errno::{SysError, SysResult};
 use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{
-    PATH_MAX, UserBufferAccess, copy_to_user, copy_to_user_ctx, read_user_c_string,
-    read_user_c_string_ctx, read_user_value, read_user_value_ctx, translated_byte_buffer_checked,
-    translated_byte_buffer_checked_ctx,
+    PATH_MAX, UserBufferAccess, copy_to_user_ctx, read_user_c_string, read_user_c_string_ctx,
+    read_user_value, read_user_value_ctx, translated_byte_buffer_checked_ctx,
 };
 use super::fanotify::{
     fanotify_notify_create, fanotify_notify_delete, fanotify_notify_modify, fanotify_notify_move,
@@ -524,21 +523,6 @@ fn copy_c_string_to_user_ctx(
     Ok(total_len as isize)
 }
 
-fn readlink_file_to_user(
-    file: Arc<dyn File + Send + Sync>,
-    buf: *mut u8,
-    bufsiz: usize,
-) -> SysResult {
-    // UNFINISHED: double-buffers through a kernel-side allocation; ideally
-    // the VFS readlink would accept a UserBuffer to write into user pages
-    // directly and avoid the extra copy.
-    let mut kernel_buf = vec![0u8; PATH_MAX];
-    let read_len = file.readlink(&mut kernel_buf)?;
-    let copy_len = read_len.min(bufsiz);
-    copy_to_user(current_user_token(), buf, &kernel_buf[..copy_len])?;
-    Ok(copy_len as isize)
-}
-
 fn readlink_file_to_user_ctx(
     ctx: &SyscallContext,
     file: Arc<dyn File + Send + Sync>,
@@ -640,11 +624,6 @@ pub(super) fn open_flags_from_user_bits(flags: u32) -> SysResult<OpenFlags> {
     Ok(flags)
 }
 
-fn do_openat(dirfd: isize, path: &str, flags: OpenFlags, mode: u32) -> SysResult {
-    let process = current_process();
-    do_openat_for_process(&process, dirfd, path, flags, mode)
-}
-
 fn do_openat_for_process(
     process: &ProcessControlBlock,
     dirfd: isize,
@@ -714,14 +693,6 @@ fn do_openat_for_process(
     Ok(fd)
 }
 
-#[allow(dead_code)]
-pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> SysResult {
-    let token = current_user_token();
-    let path = read_user_c_string(token, path, PATH_MAX)?;
-    let flags = open_flags_from_user_bits(flags)?;
-    do_openat(dirfd, path.as_str(), flags, mode)
-}
-
 pub fn sys_openat_ctx(
     ctx: &SyscallContext,
     dirfd: isize,
@@ -732,29 +703,6 @@ pub fn sys_openat_ctx(
     let path = read_user_c_string_ctx(ctx, path, PATH_MAX)?;
     let flags = open_flags_from_user_bits(flags)?;
     do_openat_for_process(ctx.process(), dirfd, path.as_str(), flags, mode)
-}
-
-fn read_open_how_extra_zeros(token: usize, how: *const u8, size: usize) -> SysResult<()> {
-    let known_size = size_of::<LinuxOpenHow>();
-    if size <= known_size {
-        return Ok(());
-    }
-    let extra_ptr = (how as usize)
-        .checked_add(known_size)
-        .ok_or(SysError::EFAULT)? as *const u8;
-    let buffers = translated_byte_buffer_checked(
-        token,
-        extra_ptr,
-        size - known_size,
-        UserBufferAccess::Read,
-    )?;
-    if buffers
-        .iter()
-        .any(|buffer| buffer.iter().any(|&byte| byte != 0))
-    {
-        return Err(SysError::E2BIG);
-    }
-    Ok(())
 }
 
 fn read_open_how_extra_zeros_ctx(
@@ -850,19 +798,6 @@ fn check_openat2_resolve(
         return Err(SysError::ELOOP);
     }
     Ok(())
-}
-
-#[allow(dead_code)]
-pub fn sys_openat2(dirfd: isize, path: *const u8, how: *const u8, size: usize) -> SysResult {
-    if size < size_of::<LinuxOpenHow>() {
-        return Err(SysError::EINVAL);
-    }
-    let token = current_user_token();
-    let path = read_user_c_string(token, path, PATH_MAX)?;
-    let how_value = read_user_value(token, how.cast::<LinuxOpenHow>())?;
-    read_open_how_extra_zeros(token, how, size)?;
-    let process = current_process();
-    do_openat2_for_process(&process, dirfd, path.as_str(), how_value)
 }
 
 pub fn sys_openat2_ctx(
@@ -1128,21 +1063,6 @@ pub fn sys_fchdir(fd: usize) -> SysResult {
     Ok(0)
 }
 
-#[allow(dead_code)]
-pub fn sys_getcwd(buf: *mut u8, size: usize) -> SysResult {
-    let snapshot = current_process().path_snapshot();
-    let cwd_path = visible_working_dir_path(&snapshot)?;
-    let total_len = cwd_path.len() + 1;
-    if size < total_len {
-        return Err(SysError::ERANGE);
-    }
-    let mut bytes = Vec::with_capacity(total_len);
-    bytes.extend_from_slice(cwd_path.as_bytes());
-    bytes.push(0);
-    copy_to_user(current_user_token(), buf, &bytes)?;
-    Ok(total_len as isize)
-}
-
 pub fn sys_getcwd_ctx(ctx: &SyscallContext, buf: *mut u8, size: usize) -> SysResult {
     let snapshot = ctx.process().path_snapshot();
     let cwd_path = visible_working_dir_path(&snapshot)?;
@@ -1297,34 +1217,6 @@ pub fn sys_symlinkat(target: *const u8, newdirfd: isize, linkpath: *const u8) ->
     Ok(0)
 }
 
-#[allow(dead_code)]
-pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize) -> SysResult {
-    if bufsiz == 0 {
-        return Err(SysError::EINVAL);
-    }
-
-    let token = current_user_token();
-    let path = read_user_c_string(token, path, PATH_MAX)?;
-    let snapshot = current_process().path_snapshot();
-    let file = if path.is_empty() {
-        if dirfd == AT_FDCWD {
-            return Err(SysError::ENOENT);
-        }
-        if dirfd < 0 {
-            return Err(SysError::EBADF);
-        }
-        get_file_by_fd(dirfd as usize)?
-    } else {
-        check_current_access_path_prefixes_from(&snapshot, dirfd, path.as_str())?;
-        open_file_in(
-            path_context_from(&snapshot, dirfd, path.as_str())?,
-            path.as_str(),
-            OpenFlags::PATH | OpenFlags::NOFOLLOW,
-        )?
-    };
-    readlink_file_to_user(file, buf, bufsiz)
-}
-
 pub fn sys_readlinkat_ctx(
     ctx: &SyscallContext,
     dirfd: isize,
@@ -1411,18 +1303,6 @@ pub fn sys_renameat2(
         inotify_notify_move(&old_file, oldpath.as_str(), &new_file, newpath.as_str());
     }
     Ok(0)
-}
-
-#[allow(dead_code)]
-pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> SysResult {
-    if len == 0 {
-        return Err(SysError::EINVAL);
-    }
-    let token = current_user_token();
-    let buffers =
-        translated_byte_buffer_checked(token, buf.cast_const(), len, UserBufferAccess::Write)?;
-    let file = get_file_by_fd(fd)?;
-    Ok(file.read_dirent64(UserBuffer::new(buffers))?)
 }
 
 pub fn sys_getdents64_ctx(ctx: &SyscallContext, fd: usize, buf: *mut u8, len: usize) -> SysResult {

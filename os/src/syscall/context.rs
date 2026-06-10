@@ -2,7 +2,6 @@ use crate::task::{ProcessControlBlock, TaskControlBlock};
 use alloc::sync::Arc;
 
 pub(crate) struct SyscallContext {
-    #[allow(dead_code)]
     task: Arc<TaskControlBlock>,
     process: Arc<ProcessControlBlock>,
     user_token: usize,
@@ -18,7 +17,6 @@ impl SyscallContext {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn task(&self) -> &Arc<TaskControlBlock> {
         &self.task
     }

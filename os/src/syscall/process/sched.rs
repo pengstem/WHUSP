@@ -345,20 +345,6 @@ pub fn sys_sched_getparam(pid: isize, param: usize) -> SysResult {
     Ok(0)
 }
 
-#[allow(dead_code)]
-pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: usize) -> SysResult {
-    if cpusetsize < AFFINITY_MASK_BYTES {
-        return Err(SysError::EINVAL);
-    }
-    let _task = sched_target_task(pid)?;
-    // CONTEXT: The current contest runtime exposes a single runnable hart to
-    // user space and does not model Linux cpusets/cgroups yet, so every task
-    // reports an affinity mask containing CPU 0 only.
-    let affinity_mask = 1usize;
-    write_user_value_with_mmap_fault(current_user_token(), mask as *mut usize, &affinity_mask)?;
-    Ok(AFFINITY_MASK_BYTES as isize)
-}
-
 pub fn sys_sched_getaffinity_ctx(
     ctx: &SyscallContext,
     pid: isize,
@@ -375,24 +361,6 @@ pub fn sys_sched_getaffinity_ctx(
     let affinity_mask = 1usize;
     write_user_value_with_mmap_fault_ctx(ctx, mask as *mut usize, &affinity_mask)?;
     Ok(AFFINITY_MASK_BYTES as isize)
-}
-
-#[allow(dead_code)]
-pub fn sys_sched_setaffinity(pid: isize, cpusetsize: usize, mask: usize) -> SysResult {
-    if cpusetsize < AFFINITY_MASK_BYTES {
-        return Err(SysError::EINVAL);
-    }
-    let task = sched_target_task(pid)?;
-    let affinity_mask =
-        read_user_value_with_mmap_fault(current_user_token(), mask as *const usize)?;
-    if affinity_mask & 1 == 0 {
-        return Err(SysError::EINVAL);
-    }
-    ensure_can_change_task_sched(&task, false)?;
-    // CONTEXT: The current contest runtime has only CPU 0 available to user
-    // space. Accept masks that include CPU 0 for ABI compatibility, but do
-    // not perform migration or persist a broader cpuset model yet.
-    Ok(0)
 }
 
 pub fn sys_sched_setaffinity_ctx(

@@ -12,7 +12,7 @@ use super::super::SyscallContext;
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
     PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, read_user_c_string_ctx,
-    translated_byte_buffer_checked_with_mmap_fault, write_user_value, write_user_value_ctx,
+    translated_byte_buffer_checked_with_mmap_fault, write_user_value_ctx,
 };
 use super::fanotify::fanotify_notify_attrib;
 use super::fd::{get_fd_entry_by_fd, get_fd_entry_by_fd_for_process, get_file_by_fd};
@@ -53,15 +53,6 @@ lazy_static! {
 struct XattrTarget {
     node: VfsNodeId,
     kind: FsNodeKind,
-}
-
-fn write_stat_result<T: From<FileStat> + Copy>(
-    token: usize,
-    buf: *mut T,
-    stat: FileStat,
-) -> SysResult {
-    write_user_value(token, buf, &stat.into())?;
-    Ok(0)
 }
 
 fn write_stat_result_ctx<T: From<FileStat> + Copy>(
@@ -130,53 +121,12 @@ pub(super) fn resolve_stat_from(
     )?)
 }
 
-#[allow(dead_code)]
-pub fn sys_fstat(fd: usize, statbuf: *mut LinuxKstat) -> SysResult {
-    if statbuf.is_null() {
-        return Err(SysError::EFAULT);
-    }
-    let token = current_user_token();
-    let file = get_file_by_fd(fd)?;
-    write_stat_result(token, statbuf, file.stat()?)
-}
-
 pub fn sys_fstat_ctx(ctx: &SyscallContext, fd: usize, statbuf: *mut LinuxKstat) -> SysResult {
     if statbuf.is_null() {
         return Err(SysError::EFAULT);
     }
     let file = get_file_by_fd(fd)?;
     write_stat_result_ctx(ctx, statbuf, file.stat()?)
-}
-
-#[allow(dead_code)]
-pub fn sys_newfstatat(
-    dirfd: isize,
-    pathname: *const u8,
-    statbuf: *mut LinuxKstat,
-    flags: i32,
-) -> SysResult {
-    if statbuf.is_null() || pathname.is_null() {
-        return Err(SysError::EFAULT);
-    }
-    if flags & !VALID_FSTATAT_FLAGS != 0 {
-        return Err(SysError::EINVAL);
-    }
-
-    let token = current_user_token();
-    let path = read_user_c_string(token, pathname, PATH_MAX)?;
-    if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
-        return Err(SysError::ENOENT);
-    }
-    let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
-    let snapshot = current_process().path_snapshot();
-    if !path.is_empty() {
-        check_current_access_path_prefixes_from(&snapshot, dirfd, path.as_str())?;
-    }
-    write_stat_result(
-        token,
-        statbuf,
-        resolve_stat_from(&snapshot, dirfd, path.as_str(), follow_final_symlink)?,
-    )
 }
 
 pub fn sys_newfstatat_ctx(
@@ -717,24 +667,6 @@ pub fn sys_fremovexattr(fd: usize, name: *const u8) -> SysResult {
     xattr_remove(target, name.as_str())
 }
 
-#[allow(dead_code)]
-pub fn sys_statfs(pathname: *const u8, statfsbuf: *mut LinuxStatfs) -> SysResult {
-    if statfsbuf.is_null() || pathname.is_null() {
-        return Err(SysError::EFAULT);
-    }
-    let token = current_user_token();
-    let path = read_user_c_string(token, pathname, PATH_MAX)?;
-    if path.is_empty() {
-        return Err(SysError::ENOENT);
-    }
-    let snapshot = current_process().path_snapshot();
-    check_current_access_path_prefixes_from(&snapshot, AT_FDCWD, path.as_str())?;
-    let stat = resolve_stat_from(&snapshot, AT_FDCWD, path.as_str(), true)?;
-    let fs_stat = statfs_for_mount(MountId(stat.dev as usize)).ok_or(SysError::ENOSYS)?;
-    write_user_value(token, statfsbuf, &LinuxStatfs::from(fs_stat))?;
-    Ok(0)
-}
-
 pub fn sys_statfs_ctx(
     ctx: &SyscallContext,
     pathname: *const u8,
@@ -752,16 +684,6 @@ pub fn sys_statfs_ctx(
     let stat = resolve_stat_from(&snapshot, AT_FDCWD, path.as_str(), true)?;
     let fs_stat = statfs_for_mount(MountId(stat.dev as usize)).ok_or(SysError::ENOSYS)?;
     write_user_value_ctx(ctx, statfsbuf, &LinuxStatfs::from(fs_stat))?;
-    Ok(0)
-}
-
-#[allow(dead_code)]
-pub fn sys_fstatfs(fd: usize, statfsbuf: *mut LinuxStatfs) -> SysResult {
-    let entry = get_fd_entry_by_fd(fd)?;
-    let stat = entry.file().stat()?;
-    let fs_stat = statfs_for_mount(MountId(stat.dev as usize)).unwrap_or_else(anonymous_fd_statfs);
-    let token = current_user_token();
-    write_user_value(token, statfsbuf, &LinuxStatfs::from(fs_stat))?;
     Ok(0)
 }
 
@@ -788,35 +710,6 @@ fn anonymous_fd_statfs() -> FileSystemStat {
         max_name_len: 255,
         flags: 0,
     }
-}
-
-#[allow(dead_code)]
-pub fn sys_statx(
-    dirfd: isize,
-    pathname: *const u8,
-    flags: i32,
-    mask: u32,
-    statxbuf: *mut LinuxStatx,
-) -> SysResult {
-    if statxbuf.is_null() || pathname.is_null() {
-        return Err(SysError::EFAULT);
-    }
-    if flags & !VALID_STATX_FLAGS != 0 || mask & STATX_RESERVED != 0 {
-        return Err(SysError::EINVAL);
-    }
-
-    let token = current_user_token();
-    let path = read_user_c_string(token, pathname, PATH_MAX)?;
-    if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
-        return Err(SysError::ENOENT);
-    }
-    let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
-    let snapshot = current_process().path_snapshot();
-    if !path.is_empty() {
-        check_current_access_path_prefixes_from(&snapshot, dirfd, path.as_str())?;
-    }
-    let stat = resolve_statx_stat(&snapshot, dirfd, path.as_str(), flags, follow_final_symlink)?;
-    write_stat_result(token, statxbuf, stat)
 }
 
 pub fn sys_statx_ctx(

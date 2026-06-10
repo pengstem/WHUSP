@@ -1,12 +1,9 @@
 use crate::syscall::SyscallContext;
 use crate::syscall::errno::{SysError, SysResult};
-use crate::syscall::user_ptr::{
-    copy_to_user, copy_to_user_ctx, read_user_value, read_user_value_ctx, write_user_value,
-    write_user_value_ctx,
-};
+use crate::syscall::user_ptr::{copy_to_user_ctx, read_user_value_ctx, write_user_value_ctx};
 use crate::task::{
     CAP_SETPCAP, CAP_SYS_ADMIN, ProcessControlBlock, SeccompSockFilter, SignalFlags,
-    TaskControlBlock, current_process, current_task, current_user_token, pid2process,
+    TaskControlBlock, current_process, pid2process,
 };
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -111,13 +108,6 @@ fn linux_capability_u32s(version: u32) -> Option<usize> {
     }
 }
 
-#[allow(dead_code)]
-fn current_syscall_context() -> SysResult<SyscallContext> {
-    let task = current_task().ok_or(SysError::ESRCH)?;
-    let process = current_process();
-    Ok(SyscallContext::new(task, process))
-}
-
 fn capability_target_process_from(
     current_task: &TaskControlBlock,
     current: &Arc<ProcessControlBlock>,
@@ -136,51 +126,11 @@ fn capability_target_process_from(
     pid2process(pid).ok_or(SysError::ESRCH)
 }
 
-#[allow(dead_code)]
-fn capability_target_process(pid: i32) -> Result<Arc<ProcessControlBlock>, SysError> {
-    let current_task = current_task().ok_or(SysError::ESRCH)?;
-    let current = current_process();
-    capability_target_process_from(&current_task, &current, pid)
-}
-
 fn capability_target_process_ctx(
     ctx: &SyscallContext,
     pid: i32,
 ) -> Result<Arc<ProcessControlBlock>, SysError> {
     capability_target_process_from(ctx.task(), ctx.process(), pid)
-}
-
-#[allow(dead_code)]
-pub fn sys_capget(hdrp: *mut LinuxCapUserHeader, datap: *mut LinuxCapUserData) -> SysResult {
-    if hdrp.is_null() {
-        return Err(SysError::EFAULT);
-    }
-    let token = current_user_token();
-    let mut header = read_user_value(token, hdrp.cast_const())?;
-    let Some(u32s) = linux_capability_u32s(header.version) else {
-        header.version = LINUX_CAPABILITY_VERSION_3;
-        write_user_value(token, hdrp, &header)?;
-        return Err(SysError::EINVAL);
-    };
-    let target = capability_target_process(header.pid)?;
-    if datap.is_null() {
-        return Ok(0);
-    }
-
-    // UNFINISHED: This is a compatibility capability model. It stores the raw
-    // effective/permitted/inheritable/bounding bitsets that LTP exercises, but
-    // does not implement Linux user namespaces, securebits, ambient caps, file
-    // capabilities, or capability recalculation across execve/setuid files.
-    let capabilities = target.credentials().capabilities;
-    for index in 0..u32s {
-        let data = LinuxCapUserData {
-            effective: capabilities.effective[index],
-            permitted: capabilities.permitted[index],
-            inheritable: capabilities.inheritable[index],
-        };
-        write_user_value(token, datap.wrapping_add(index), &data)?;
-    }
-    Ok(0)
 }
 
 pub fn sys_capget_ctx(
@@ -225,81 +175,6 @@ fn capability_data_subset(
     field: impl Fn(&LinuxCapUserData) -> u32,
 ) -> bool {
     (0..u32s).all(|index| field(&data[index]) & !allowed(index) == 0)
-}
-
-#[allow(dead_code)]
-pub fn sys_capset(hdrp: *mut LinuxCapUserHeader, datap: *const LinuxCapUserData) -> SysResult {
-    if hdrp.is_null() {
-        return Err(SysError::EFAULT);
-    }
-    let token = current_user_token();
-    let mut header = read_user_value(token, hdrp.cast_const())?;
-    let Some(u32s) = linux_capability_u32s(header.version) else {
-        header.version = LINUX_CAPABILITY_VERSION_3;
-        write_user_value(token, hdrp, &header)?;
-        return Err(SysError::EINVAL);
-    };
-    let current_task = current_task().ok_or(SysError::ESRCH)?;
-    let current = current_process();
-    if header.pid < 0 {
-        return Err(SysError::EINVAL);
-    }
-    let target_pid = header.pid as usize;
-    if target_pid != 0 && target_pid != current.getpid() && target_pid != current_task.linux_tid() {
-        return Err(SysError::EPERM);
-    }
-    if datap.is_null() {
-        return Err(SysError::EFAULT);
-    }
-
-    let mut data = [LinuxCapUserData::default(); LINUX_CAPABILITY_U32S_2];
-    for (index, slot) in data.iter_mut().enumerate().take(u32s) {
-        *slot = read_user_value(token, datap.wrapping_add(index))?;
-    }
-    current.mutate_credentials(|credentials| {
-        let old = credentials.capabilities.clone();
-        if !capability_data_subset(
-            &data,
-            u32s,
-            |index| data[index].permitted,
-            |item| item.effective,
-        ) {
-            return Err(SysError::EPERM);
-        }
-        if !capability_data_subset(
-            &data,
-            u32s,
-            |index| old.permitted[index],
-            |item| item.permitted,
-        ) {
-            return Err(SysError::EPERM);
-        }
-        if !capability_data_subset(
-            &data,
-            u32s,
-            |index| old.bounding[index],
-            |item| item.inheritable,
-        ) {
-            return Err(SysError::EPERM);
-        }
-        if !capability_data_subset(
-            &data,
-            u32s,
-            |index| old.inheritable[index] | old.permitted[index],
-            |item| item.inheritable,
-        ) {
-            return Err(SysError::EPERM);
-        }
-        for (index, item) in data.iter().enumerate().take(u32s) {
-            credentials.capabilities.effective[index] = item.effective;
-            credentials.capabilities.permitted[index] = item.permitted;
-            credentials.capabilities.inheritable[index] = item.inheritable;
-        }
-        credentials
-            .capabilities
-            .clamp_ambient_to_permitted_inheritable();
-        Ok(0)
-    })
 }
 
 pub fn sys_capset_ctx(
@@ -386,17 +261,6 @@ fn require_no_extra_args(args: &[usize]) -> SysResult<()> {
     }
 }
 
-#[allow(dead_code)]
-fn read_prctl_name(token: usize, ptr: usize) -> SysResult<String> {
-    let raw = read_user_value::<[u8; PR_NAME_LEN]>(token, ptr as *const [u8; PR_NAME_LEN])?;
-    let len = raw
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(PR_NAME_LEN - 1)
-        .min(PR_NAME_LEN - 1);
-    Ok(raw[..len].iter().map(|byte| *byte as char).collect())
-}
-
 fn read_prctl_name_ctx(ctx: &SyscallContext, ptr: usize) -> SysResult<String> {
     let raw = read_user_value_ctx::<[u8; PR_NAME_LEN]>(ctx, ptr as *const [u8; PR_NAME_LEN])?;
     let len = raw
@@ -405,15 +269,6 @@ fn read_prctl_name_ctx(ctx: &SyscallContext, ptr: usize) -> SysResult<String> {
         .unwrap_or(PR_NAME_LEN - 1)
         .min(PR_NAME_LEN - 1);
     Ok(raw[..len].iter().map(|byte| *byte as char).collect())
-}
-
-#[allow(dead_code)]
-fn write_prctl_name(token: usize, ptr: usize, name: &str) -> SysResult<()> {
-    let mut raw = [0u8; PR_NAME_LEN];
-    let bytes = name.as_bytes();
-    let len = bytes.len().min(PR_NAME_LEN - 1);
-    raw[..len].copy_from_slice(&bytes[..len]);
-    copy_to_user(token, ptr as *mut u8, &raw)
 }
 
 fn write_prctl_name_ctx(ctx: &SyscallContext, ptr: usize, name: &str) -> SysResult<()> {
@@ -426,43 +281,6 @@ fn write_prctl_name_ctx(ctx: &SyscallContext, ptr: usize, name: &str) -> SysResu
 
 fn securebits_block_ambient_raise(securebits: u32) -> bool {
     securebits & SECBIT_NO_CAP_AMBIENT_RAISE != 0 || securebits == 6
-}
-
-#[allow(dead_code)]
-fn read_seccomp_filter(token: usize, ptr: usize) -> SysResult<Vec<SeccompSockFilter>> {
-    let fprog = read_user_value::<LinuxSockFprog>(token, ptr as *const LinuxSockFprog)?;
-    let len = fprog.len as usize;
-    if len == 0 || len > SECCOMP_FILTER_MAX_INSNS || fprog.filter == 0 {
-        return Err(SysError::EINVAL);
-    }
-
-    let mut filters = Vec::new();
-    for index in 0..len {
-        let filter = read_user_value::<LinuxSockFilter>(
-            token,
-            (fprog.filter as *const LinuxSockFilter).wrapping_add(index),
-        )?;
-        // The syscall dispatcher evaluates only validated classic-BPF records
-        // copied here. Keep offset 0 tied to seccomp_data.nr; other offsets
-        // would require modeling the full seccomp_data ABI.
-        if !matches!(filter.code, BPF_LD_W_ABS | BPF_JMP_JEQ_K | BPF_RET_K) {
-            return Err(SysError::EINVAL);
-        }
-        if filter.code == BPF_LD_W_ABS && filter.k != 0 {
-            return Err(SysError::EINVAL);
-        }
-        filters.push(SeccompSockFilter {
-            code: filter.code,
-            jt: filter.jt,
-            jf: filter.jf,
-            k: filter.k,
-        });
-    }
-    if filters.iter().any(|filter| filter.code == BPF_RET_K) {
-        Ok(filters)
-    } else {
-        Err(SysError::EINVAL)
-    }
 }
 
 fn read_seccomp_filter_ctx(ctx: &SyscallContext, ptr: usize) -> SysResult<Vec<SeccompSockFilter>> {
@@ -499,12 +317,6 @@ fn read_seccomp_filter_ctx(ctx: &SyscallContext, ptr: usize) -> SysResult<Vec<Se
     } else {
         Err(SysError::EINVAL)
     }
-}
-
-#[allow(dead_code)]
-pub fn sys_prctl(option: usize, arg2: usize, arg3: usize, arg4: usize, arg5: usize) -> SysResult {
-    let ctx = current_syscall_context()?;
-    sys_prctl_ctx(&ctx, option, arg2, arg3, arg4, arg5)
 }
 
 pub fn sys_prctl_ctx(
@@ -687,12 +499,6 @@ pub fn sys_prctl_ctx(
     }
 }
 
-#[allow(dead_code)]
-fn sys_prctl_cap_ambient(command: usize, cap: usize, arg4: usize, arg5: usize) -> SysResult {
-    let ctx = current_syscall_context()?;
-    sys_prctl_cap_ambient_ctx(&ctx, command, cap, arg4, arg5)
-}
-
 fn sys_prctl_cap_ambient_ctx(
     ctx: &SyscallContext,
     command: usize,
@@ -745,25 +551,6 @@ fn sys_prctl_cap_ambient_ctx(
     }
 }
 
-#[allow(dead_code)]
-pub fn sys_getgroups(size: usize, list: *mut u32) -> SysResult {
-    let groups = current_process().credentials().groups;
-    if size == 0 {
-        return Ok(groups.len() as isize);
-    }
-    if size < groups.len() {
-        return Err(SysError::EINVAL);
-    }
-    if list.is_null() {
-        return Err(SysError::EFAULT);
-    }
-    let token = current_user_token();
-    for (index, group) in groups.iter().enumerate() {
-        write_user_value(token, list.wrapping_add(index), group)?;
-    }
-    Ok(groups.len() as isize)
-}
-
 pub fn sys_getgroups_ctx(ctx: &SyscallContext, size: usize, list: *mut u32) -> SysResult {
     let groups = ctx.process().credentials().groups;
     if size == 0 {
@@ -779,28 +566,6 @@ pub fn sys_getgroups_ctx(ctx: &SyscallContext, size: usize, list: *mut u32) -> S
         write_user_value_ctx(ctx, list.wrapping_add(index), group)?;
     }
     Ok(groups.len() as isize)
-}
-
-#[allow(dead_code)]
-pub fn sys_setgroups(size: usize, list: *const u32) -> SysResult {
-    if size > NGROUPS_MAX {
-        return Err(SysError::EINVAL);
-    }
-    if current_process().credentials().euid != 0 {
-        // UNFINISHED: Linux checks CAP_SETGID in the caller's user namespace.
-        // This kernel only has root-equivalent credentials for now.
-        return Err(SysError::EPERM);
-    }
-    if size > 0 && list.is_null() {
-        return Err(SysError::EFAULT);
-    }
-    let token = current_user_token();
-    let mut groups = Vec::new();
-    for index in 0..size {
-        groups.push(read_user_value(token, list.wrapping_add(index))?);
-    }
-    current_process().replace_supplementary_groups(groups);
-    Ok(0)
 }
 
 pub fn sys_setgroups_ctx(ctx: &SyscallContext, size: usize, list: *const u32) -> SysResult {
@@ -994,22 +759,6 @@ pub fn sys_setresgid(rgid: i32, egid: i32, sgid: i32) -> SysResult {
     })
 }
 
-#[allow(dead_code)]
-pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> SysResult {
-    let credentials = current_process().credentials();
-    let token = current_user_token();
-    if !ruid.is_null() {
-        write_user_value(token, ruid, &credentials.ruid)?;
-    }
-    if !euid.is_null() {
-        write_user_value(token, euid, &credentials.euid)?;
-    }
-    if !suid.is_null() {
-        write_user_value(token, suid, &credentials.suid)?;
-    }
-    Ok(0)
-}
-
 pub fn sys_getresuid_ctx(
     ctx: &SyscallContext,
     ruid: *mut u32,
@@ -1025,22 +774,6 @@ pub fn sys_getresuid_ctx(
     }
     if !suid.is_null() {
         write_user_value_ctx(ctx, suid, &credentials.suid)?;
-    }
-    Ok(0)
-}
-
-#[allow(dead_code)]
-pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> SysResult {
-    let credentials = current_process().credentials();
-    let token = current_user_token();
-    if !rgid.is_null() {
-        write_user_value(token, rgid, &credentials.rgid)?;
-    }
-    if !egid.is_null() {
-        write_user_value(token, egid, &credentials.egid)?;
-    }
-    if !sgid.is_null() {
-        write_user_value(token, sgid, &credentials.sgid)?;
     }
     Ok(0)
 }

@@ -348,15 +348,6 @@ fn scan_waitid_children(
     scan
 }
 
-/// Waits for and reaps a matching child process using Linux wait4 status rules.
-///
-/// Reaping removes the child from both PID lookup and the parent's child list;
-/// `WNOHANG` observes the current state without blocking.
-#[allow(dead_code)]
-pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsage) -> SysResult {
-    sys_wait4_for_process(current_process(), pid, wstatus, options, rusage)
-}
-
 pub fn sys_wait4_ctx(
     ctx: &SyscallContext,
     pid: isize,
@@ -542,8 +533,8 @@ pub fn sys_waitid(
                 // CONTEXT: WNOWAIT observes the zombie without reaping it; only
                 // the actual reap removes the PID from process lookup.
                 remove_from_pid2process(zombie.pid);
-                // CONTEXT: See sys_wait4(); waitid reaping has the same
-                // user-visible boundary and must not assert on Arc ownership.
+                // CONTEXT: waitid reaping has the same user-visible boundary
+                // as wait4 and must not assert on Arc ownership.
                 drop(inner.children.remove(zombie.idx));
             }
             return Ok(0);
@@ -560,8 +551,8 @@ pub fn sys_waitid(
             write_rusage(&mut inner.memory_set, rusage)?;
             return Ok(0);
         }
-        // See sys_wait4(): the blocked state must be published before dropping
-        // the child-list lock so exit-time wakeups cannot be missed.
+        // The blocked state must be published before dropping the child-list
+        // lock so exit-time wakeups cannot be missed.
         let (task, task_cx_ptr) = block_current_task_no_schedule();
         drop(inner);
         let interrupted = task_has_wait_interrupt_signal(&task, &process);

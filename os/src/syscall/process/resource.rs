@@ -1,25 +1,8 @@
 use crate::syscall::SyscallContext;
 use crate::syscall::errno::{SysError, SysResult};
-use crate::syscall::user_ptr::{
-    read_user_value, read_user_value_ctx, write_user_value, write_user_value_ctx,
-};
-use crate::task::{
-    CAP_SYS_RESOURCE, ProcessControlBlock, RLimit, RLimitResource, current_process,
-    current_user_token, pid2process,
-};
+use crate::syscall::user_ptr::{read_user_value_ctx, write_user_value_ctx};
+use crate::task::{CAP_SYS_RESOURCE, ProcessControlBlock, RLimit, RLimitResource, pid2process};
 use alloc::sync::Arc;
-
-#[allow(dead_code)]
-fn rlimit_target_process(pid: usize) -> SysResult<Arc<ProcessControlBlock>> {
-    if pid == 0 {
-        Ok(current_process())
-    } else {
-        // UNFINISHED: Linux prlimit64 checks real/effective/saved UIDs and
-        // CAP_SYS_RESOURCE before operating on another process. This kernel
-        // does not model credentials yet, so a live PID is accepted.
-        pid2process(pid).ok_or(SysError::ESRCH)
-    }
-}
 
 fn rlimit_target_process_ctx(
     ctx: &SyscallContext,
@@ -50,42 +33,6 @@ fn validate_new_rlimit(
         return Err(SysError::EPERM);
     }
     Ok(())
-}
-
-#[allow(dead_code)]
-pub fn sys_prlimit64(
-    pid: usize,
-    resource: i32,
-    new_limit: *const RLimit,
-    old_limit: *mut RLimit,
-) -> SysResult {
-    let resource = RLimitResource::from_raw(resource).ok_or(SysError::EINVAL)?;
-    let token = current_user_token();
-    let new_limit = if new_limit.is_null() {
-        None
-    } else {
-        Some(read_user_value(token, new_limit)?)
-    };
-    let credentials = current_process().credentials();
-    let can_raise_hard_limit = credentials.euid == 0
-        && credentials
-            .capabilities
-            .has_effective(CAP_SYS_RESOURCE)
-            .unwrap_or(false);
-    let process = rlimit_target_process(pid)?;
-    let mut inner = process.inner_exclusive_access();
-    let current = inner.resource_limits.get(resource);
-
-    if let Some(new_limit) = new_limit {
-        validate_new_rlimit(current, new_limit, can_raise_hard_limit)?;
-    }
-    if !old_limit.is_null() {
-        write_user_value(token, old_limit, &current)?;
-    }
-    if let Some(new_limit) = new_limit {
-        inner.resource_limits.set(resource, new_limit);
-    }
-    Ok(0)
 }
 
 pub fn sys_prlimit64_ctx(
@@ -123,27 +70,11 @@ pub fn sys_prlimit64_ctx(
     Ok(0)
 }
 
-#[allow(dead_code)]
-pub fn sys_getrlimit(resource: i32, old_limit: *mut RLimit) -> SysResult {
-    if old_limit.is_null() {
-        return Err(SysError::EFAULT);
-    }
-    sys_prlimit64(0, resource, core::ptr::null(), old_limit)
-}
-
 pub fn sys_getrlimit_ctx(ctx: &SyscallContext, resource: i32, old_limit: *mut RLimit) -> SysResult {
     if old_limit.is_null() {
         return Err(SysError::EFAULT);
     }
     sys_prlimit64_ctx(ctx, 0, resource, core::ptr::null(), old_limit)
-}
-
-#[allow(dead_code)]
-pub fn sys_setrlimit(resource: i32, new_limit: *const RLimit) -> SysResult {
-    if new_limit.is_null() {
-        return Err(SysError::EFAULT);
-    }
-    sys_prlimit64(0, resource, new_limit, core::ptr::null_mut())
 }
 
 pub fn sys_setrlimit_ctx(

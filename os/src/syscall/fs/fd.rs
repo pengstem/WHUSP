@@ -1,7 +1,6 @@
 use crate::config::PAGE_SIZE;
 use crate::fs::{
-    File, OpenFlags, default_pipe_capacity_for_current_process, default_pipe_capacity_for_process,
-    make_memfd, make_pipe, pipe_max_size,
+    File, OpenFlags, default_pipe_capacity_for_process, make_memfd, make_pipe, pipe_max_size,
 };
 use crate::syscall::SyscallContext;
 use crate::task::{
@@ -13,8 +12,7 @@ use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
-    UserBufferAccess, read_user_c_string, translated_byte_buffer_checked,
-    translated_byte_buffer_checked_ctx,
+    UserBufferAccess, read_user_c_string, translated_byte_buffer_checked_ctx,
 };
 use super::fanotify::fanotify_notify_close;
 use super::fd_lock::{
@@ -131,20 +129,6 @@ fn pipe2_open_flags(flags: u32) -> SysResult<OpenFlags> {
     Ok(OpenFlags::from_bits_truncate(flags))
 }
 
-/// Checks that the whole Linux `int pipefd[2]` output buffer is writable.
-///
-/// This happens before fd allocation so an invalid user pointer cannot leave
-/// pipe ends installed in the process table.
-fn validate_pipefd(token: usize, pipefd: *mut i32) -> SysResult<()> {
-    translated_byte_buffer_checked(
-        token,
-        pipefd as *const u8,
-        size_of::<[i32; 2]>(),
-        UserBufferAccess::Write,
-    )
-    .map(|_| ())
-}
-
 fn validate_pipefd_ctx(ctx: &SyscallContext, pipefd: *mut i32) -> SysResult<()> {
     translated_byte_buffer_checked_ctx(
         ctx,
@@ -153,27 +137,6 @@ fn validate_pipefd_ctx(ctx: &SyscallContext, pipefd: *mut i32) -> SysResult<()> 
         UserBufferAccess::Write,
     )
     .map(|_| ())
-}
-
-/// Writes the Linux `int pipefd[2]` result through checked user buffers.
-fn write_pipefd_pair(token: usize, pipefd: *mut i32, fds: [i32; 2]) -> SysResult<()> {
-    let mut bytes = [0u8; size_of::<[i32; 2]>()];
-    let fd_size = size_of::<i32>();
-    bytes[..fd_size].copy_from_slice(&fds[0].to_ne_bytes());
-    bytes[fd_size..].copy_from_slice(&fds[1].to_ne_bytes());
-
-    let mut copied = 0usize;
-    for buffer in translated_byte_buffer_checked(
-        token,
-        pipefd as *const u8,
-        bytes.len(),
-        UserBufferAccess::Write,
-    )? {
-        let next = copied + buffer.len();
-        buffer.copy_from_slice(&bytes[copied..next]);
-        copied = next;
-    }
-    Ok(())
 }
 
 fn write_pipefd_pair_ctx(ctx: &SyscallContext, pipefd: *mut i32, fds: [i32; 2]) -> SysResult<()> {
@@ -194,59 +157,6 @@ fn write_pipefd_pair_ctx(ctx: &SyscallContext, pipefd: *mut i32, fds: [i32; 2]) 
         copied = next;
     }
     Ok(())
-}
-
-#[allow(dead_code)]
-pub fn sys_pipe2(pipefd: *mut i32, flags: u32) -> SysResult {
-    let pipe_flags = pipe2_open_flags(flags)?;
-    let token = current_user_token();
-    validate_pipefd(token, pipefd)?;
-    let pipe_capacity = default_pipe_capacity_for_current_process();
-
-    let process = current_process();
-    let (pipe_read, pipe_write) = make_pipe(pipe_capacity);
-    let mut cleanup_entry = None;
-    // CONTEXT: pipe2 has two rollback shapes. If the write end cannot be
-    // allocated, only the read fd may have been installed under the current
-    // lock. If copying the fd pair to user memory fails later, both fds have
-    // already been published and must be removed with close cleanup after
-    // dropping the process lock.
-    let fds = {
-        let mut inner = process.inner_exclusive_access();
-        let read_fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-        let previous = inner.set_fd_entry(
-            read_fd,
-            FdTableEntry::from_file(pipe_read, OpenFlags::RDONLY | pipe_flags),
-        );
-        debug_assert!(previous.is_none());
-        if let Some(write_fd) = inner.alloc_fd_from(0) {
-            let previous = inner.set_fd_entry(
-                write_fd,
-                FdTableEntry::from_file(pipe_write, OpenFlags::WRONLY | pipe_flags),
-            );
-            debug_assert!(previous.is_none());
-            Ok([read_fd, write_fd])
-        } else {
-            cleanup_entry = inner.take_fd_entry(read_fd);
-            Err(SysError::EMFILE)
-        }
-    };
-    if let Some(entry) = cleanup_entry {
-        close_detached_fd_entry(entry);
-    }
-    let fds = fds?;
-
-    if let Err(err) = write_pipefd_pair(token, pipefd, [fds[0] as i32, fds[1] as i32]) {
-        let entries = {
-            let mut inner = process.inner_exclusive_access();
-            [inner.take_fd_entry(fds[0]), inner.take_fd_entry(fds[1])]
-        };
-        for entry in entries.into_iter().flatten() {
-            close_detached_fd_entry(entry);
-        }
-        return Err(err);
-    }
-    Ok(0)
 }
 
 pub fn sys_pipe2_ctx(ctx: &SyscallContext, pipefd: *mut i32, flags: u32) -> SysResult {
@@ -334,11 +244,6 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> SysResult {
         close_detached_fd_entry(entry);
     }
     Ok(new_fd as isize)
-}
-
-fn fcntl_dup(fd: usize, lower_bound: usize, fd_flags: FdFlags) -> SysResult {
-    let process = current_process();
-    fcntl_dup_for_process(&process, fd, lower_bound, fd_flags)
 }
 
 fn fcntl_dup_for_process(
@@ -440,50 +345,6 @@ pub fn sys_memfd_create(name: *const u8, flags: u32) -> SysResult {
     let previous = inner.set_fd_entry(fd, FdTableEntry::from_file(file, open_flags));
     debug_assert!(previous.is_none());
     Ok(fd as isize)
-}
-
-#[allow(dead_code)]
-pub fn sys_fcntl(fd: usize, op: usize, arg: usize) -> SysResult {
-    match op {
-        F_DUPFD => fcntl_dup(fd, arg, FdFlags::empty()),
-        F_DUPFD_CLOEXEC => fcntl_dup(fd, arg, FdFlags::CLOEXEC),
-        F_GETFD => Ok(get_fd_entry_by_fd(fd)?.fd_flags().bits() as isize),
-        F_SETFD => {
-            let process = current_process();
-            let mut inner = process.inner_exclusive_access();
-            let entry = inner
-                .fd_table
-                .get_mut(fd)
-                .and_then(|entry| entry.as_mut())
-                .ok_or(SysError::EBADF)?;
-            entry.set_fd_flags(FdFlags::from_bits_truncate(
-                (arg as u32) & FdFlags::CLOEXEC.bits(),
-            ));
-            Ok(0)
-        }
-        F_GETFL => Ok(get_fd_entry_by_fd(fd)?.status_flags().bits() as isize),
-        F_SETFL => {
-            let entry = get_fd_entry_by_fd(fd)?;
-            let status = entry.status_flags();
-            // UNFINISHED: O_DIRECT is recorded for fcntl compatibility, but direct-I/O
-            // alignment and cache-bypass semantics are not enforced by the filesystem layer.
-            entry.set_status_flags(status.with_fcntl_status_flags(arg as u32));
-            Ok(0)
-        }
-        F_GETLK => fcntl_getlk(get_fd_entry_by_fd(fd)?, arg as *mut _),
-        F_SETLK => fcntl_setlk(get_fd_entry_by_fd(fd)?, arg as *const _),
-        F_SETLKW => fcntl_setlkw(get_fd_entry_by_fd(fd)?, arg as *const _),
-        F_OFD_GETLK => fcntl_ofd_getlk(get_fd_entry_by_fd(fd)?, arg as *mut _),
-        F_OFD_SETLK => fcntl_ofd_setlk(get_fd_entry_by_fd(fd)?, arg as *const _),
-        F_OFD_SETLKW => fcntl_ofd_setlkw(get_fd_entry_by_fd(fd)?, arg as *const _),
-        F_SETLEASE => fcntl_set_lease(fd, arg),
-        F_GETLEASE => fcntl_get_lease(fd),
-        F_GETPIPE_SZ => fcntl_get_pipe_size(fd),
-        F_SETPIPE_SZ => fcntl_set_pipe_size(fd, arg),
-        F_ADD_SEALS => fcntl_add_seals(fd, arg as u32),
-        F_GET_SEALS => fcntl_get_seals(fd),
-        _ => Err(SysError::EINVAL),
-    }
 }
 
 pub fn sys_fcntl_ctx(ctx: &SyscallContext, fd: usize, op: usize, arg: usize) -> SysResult {

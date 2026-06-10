@@ -1657,13 +1657,6 @@ pub fn sys_pwritev2(
     sys_pwritev(fd, iov, iovcnt, pos_l, pos_h)
 }
 
-#[allow(dead_code)]
-pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> SysResult {
-    let token = current_user_token();
-    let process = current_process();
-    sys_write_with_process(&process, token, fd, buf, len)
-}
-
 pub fn sys_write_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize) -> SysResult {
     sys_write_with_process(ctx.process(), ctx.user_token(), fd, buf, len)
 }
@@ -1921,12 +1914,6 @@ fn sys_readv_with_iovecs(token: usize, fd: usize, iovecs: UserIovecs, iovcnt: us
     fanotify_notify_access(&file, total_read);
     inotify_notify_access(&file, total_read);
     Ok(total_read as isize)
-}
-
-#[allow(dead_code)]
-pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> SysResult {
-    let token = current_user_token();
-    sys_read_with_token(token, fd, buf, len)
 }
 
 pub fn sys_read_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize) -> SysResult {

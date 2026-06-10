@@ -178,7 +178,6 @@ pub(crate) fn translated_byte_buffer_checked(
     translated_byte_buffer_checked_with_fault(token, ptr, len, access, None)
 }
 
-#[allow(dead_code)]
 pub(crate) fn translated_byte_buffer_checked_ctx(
     ctx: &SyscallContext,
     ptr: *const u8,
@@ -497,17 +496,6 @@ fn append_user_string_bytes(string: &mut String, bytes: &[u8], is_ascii: bool) {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn read_user_usize(token: usize, addr: usize) -> SysResult<usize> {
-    read_user_value_with_site(
-        token,
-        addr as *const usize,
-        None,
-        perf::UsercopySite::ReadUsize,
-    )
-}
-
-#[allow(dead_code)]
 pub(crate) fn read_user_usize_ctx(ctx: &SyscallContext, addr: usize) -> SysResult<usize> {
     read_user_value_with_site_ctx(
         ctx,
@@ -529,20 +517,6 @@ pub(crate) fn read_user_array_item<T: Copy>(
 ) -> SysResult<T> {
     read_user_value_with_site(
         token,
-        user_array_item_addr(ptr, index)? as *const T,
-        None,
-        perf::UsercopySite::ReadArrayItem,
-    )
-}
-
-#[allow(dead_code)]
-pub(crate) fn read_user_array_item_ctx<T: Copy>(
-    ctx: &SyscallContext,
-    ptr: *const T,
-    index: usize,
-) -> SysResult<T> {
-    read_user_value_with_site_ctx(
-        ctx,
         user_array_item_addr(ptr, index)? as *const T,
         None,
         perf::UsercopySite::ReadArrayItem,
@@ -621,30 +595,6 @@ pub(crate) fn write_user_array<T: Copy>(token: usize, ptr: *mut T, values: &[T])
     let bytes = unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), byte_len) };
     copy_to_user_with_site(
         token,
-        ptr.cast::<u8>(),
-        bytes,
-        None,
-        perf::UsercopySite::WriteArrayItem,
-    )
-}
-
-#[allow(dead_code)]
-pub(crate) fn write_user_array_ctx<T: Copy>(
-    ctx: &SyscallContext,
-    ptr: *mut T,
-    values: &[T],
-) -> SysResult<()> {
-    if values.is_empty() {
-        return Ok(());
-    }
-    if ptr.is_null() {
-        return Err(SysError::EFAULT);
-    }
-
-    let byte_len = user_array_byte_len::<T>(values.len())?;
-    let bytes = unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), byte_len) };
-    copy_to_user_with_site_ctx(
-        ctx,
         ptr.cast::<u8>(),
         bytes,
         None,
@@ -852,7 +802,6 @@ pub(crate) fn read_user_value<T: Copy>(token: usize, ptr: *const T) -> SysResult
     read_user_value_with_site(token, ptr, None, perf::UsercopySite::ReadValue)
 }
 
-#[allow(dead_code)]
 pub(crate) fn read_user_value_ctx<T: Copy>(ctx: &SyscallContext, ptr: *const T) -> SysResult<T> {
     read_user_value_with_site_ctx(ctx, ptr, None, perf::UsercopySite::ReadValue)
 }
@@ -869,7 +818,6 @@ pub(crate) fn read_user_value_with_mmap_fault<T: Copy>(
     )
 }
 
-#[allow(dead_code)]
 pub(crate) fn read_user_value_with_mmap_fault_ctx<T: Copy>(
     ctx: &SyscallContext,
     ptr: *const T,
@@ -890,15 +838,6 @@ pub(crate) fn read_user_value_with_fault<T: Copy>(
     read_user_value_with_site(token, ptr, fault_handler, perf::UsercopySite::ReadValue)
 }
 
-#[allow(dead_code)]
-pub(crate) fn read_user_value_with_fault_ctx<T: Copy>(
-    ctx: &SyscallContext,
-    ptr: *const T,
-    fault_handler: Option<UserFaultHandler>,
-) -> SysResult<T> {
-    read_user_value_with_site_ctx(ctx, ptr, fault_handler, perf::UsercopySite::ReadValue)
-}
-
 fn read_user_value_with_site<T: Copy>(
     token: usize,
     ptr: *const T,
@@ -913,7 +852,6 @@ fn read_user_value_with_site<T: Copy>(
     Ok(unsafe { value.assume_init() })
 }
 
-#[allow(dead_code)]
 fn read_user_value_with_site_ctx<T: Copy>(
     ctx: &SyscallContext,
     ptr: *const T,
@@ -965,7 +903,6 @@ pub(crate) fn write_user_value_with_mmap_fault<T: Copy>(
     )
 }
 
-#[allow(dead_code)]
 pub(crate) fn write_user_value_with_mmap_fault_ctx<T: Copy>(
     ctx: &SyscallContext,
     ptr: *mut T,
@@ -988,22 +925,6 @@ pub(crate) fn write_user_value_with_fault<T: Copy>(
 ) -> SysResult<()> {
     write_user_value_with_site(
         token,
-        ptr,
-        value,
-        fault_handler,
-        perf::UsercopySite::WriteValue,
-    )
-}
-
-#[allow(dead_code)]
-pub(crate) fn write_user_value_with_fault_ctx<T: Copy>(
-    ctx: &SyscallContext,
-    ptr: *mut T,
-    value: &T,
-    fault_handler: Option<UserFaultHandler>,
-) -> SysResult<()> {
-    write_user_value_with_site_ctx(
-        ctx,
         ptr,
         value,
         fault_handler,
