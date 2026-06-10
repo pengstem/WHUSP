@@ -434,10 +434,10 @@ impl MapArea {
             return true;
         }
         if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
-            if !pte_flags.intersects(PTEFlags::R | PTEFlags::W | PTEFlags::X) {
-                if !page_table.clear_leaf_create_path(vpn) {
-                    return false;
-                }
+            if !pte_flags.intersects(PTEFlags::R | PTEFlags::W | PTEFlags::X)
+                && !page_table.clear_leaf_create_path(vpn)
+            {
+                return false;
             }
             return true;
         }

@@ -143,6 +143,9 @@ fn read_exec_args_envs_ctx(
     args: *const usize,
     envs: *const usize,
 ) -> SysResult<(Vec<String>, Vec<String>)> {
+    // Copy argv/envp while the caller's old address space is still active.
+    // After ProcessControlBlock::exec() commits, these user pointers are no
+    // longer meaningful.
     let mut budget = ExecStringBudget::new();
     let args_vec = read_exec_string_array_ctx(ctx, args, &mut budget)?;
     let envs_vec = read_exec_string_array_ctx(ctx, envs, &mut budget)?;
@@ -645,6 +648,8 @@ fn exec_loaded_program(
     source: ExecImageSource,
     executable_node: Option<VfsNodeId>,
 ) -> SysResult {
+    // The open file remains the executable authority; a proc-fd target only
+    // supplies the Linux-visible path later exposed through procfs metadata.
     let executable_path = source.file.proc_fd_target().unwrap_or(executable_path);
     let executable_node = source.file.vfs_node_id().or(executable_node);
     if source.data.starts_with(ELF_MAGIC) {

@@ -181,7 +181,6 @@ impl PageTable {
         invalidate_user_leaf_pte_cache();
         true
     }
-    #[allow(unused)]
     pub fn unmap(&mut self, vpn: VirtPageNum) {
         let pte = self
             .find_pte(vpn)

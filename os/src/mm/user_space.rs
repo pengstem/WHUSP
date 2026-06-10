@@ -523,12 +523,11 @@ impl MemorySet {
     }
 
     pub fn resolve_lazy_framed_page_fault(&mut self, addr: usize, access: MmapFaultAccess) -> bool {
-        let vpn = VirtAddr::from(addr).floor();
-        let heap_start_vpn = VirtAddr::from(self.brk_base).floor();
-        let heap_end_vpn = VirtAddr::from(self.brk_mapped_end).floor();
-        if vpn < heap_start_vpn || vpn >= heap_end_vpn {
+        if addr < self.brk_base || addr >= self.brk_mapped_end {
             return false;
         }
+
+        let vpn = VirtAddr::from(addr).floor();
 
         let Some(area_idx) = self.find_area_idx_containing(vpn) else {
             return false;
@@ -764,9 +763,7 @@ impl MemorySet {
                 if area.is_mmap() {
                     flushes.extend(area.take_mmap_flushes(&mut self.page_table));
                     area.release_mmap_refs();
-                } else if area.is_shm() {
-                    area.unmap_resident(&mut self.page_table);
-                } else if area.map_type == MapType::Framed {
+                } else if area.is_shm() || area.map_type == MapType::Framed {
                     area.unmap_resident(&mut self.page_table);
                 } else {
                     area.unmap(&mut self.page_table);

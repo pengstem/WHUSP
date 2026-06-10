@@ -46,6 +46,8 @@ const RWF_NOWAIT: usize = 0x0000_0008;
 const PREADV2_SUPPORTED_FLAGS: usize = RWF_HIPRI | RWF_NOWAIT;
 const PREADV_COALESCE_CHUNK_SIZE: usize = 64 * 1024;
 const WRITEV_COALESCE_CHUNK_SIZE: usize = 64 * 1024;
+// CONTEXT: Prepared iovec ranges are syscall-local snapshots of user mappings;
+// do not cache these translated slices beyond the current readv/writev call.
 const USER_IOVEC_RANGE_REUSE: bool = true;
 
 static PREADV2_NOWAIT_COMPAT_COUNTER: AtomicUsize = AtomicUsize::new(0);

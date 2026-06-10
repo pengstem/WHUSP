@@ -1,5 +1,7 @@
 use alloc::string::String;
 
+// CONTEXT: Keep submission boots on the generated script disk path. Turning
+// this on bypasses OS COMP group markers and is only for local serial debugging.
 const INTERACTIVE_SHELL: bool = false;
 // Script-disk handoff point. The kernel assembles only the environment and the
 // final shutdown command; marker emission and per-suite shell logic live in

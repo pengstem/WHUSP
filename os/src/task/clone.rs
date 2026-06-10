@@ -128,6 +128,8 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
         .as_ref()
         .expect("new cloned user task must have TaskUserRes")
         .ustack_top();
+    // Linux-visible TID is separate from the process-local task slot; futex,
+    // signal delivery, and procfs lookups use this allocated id.
     let linux_tid = pid_alloc();
     let new_linux_tid = linux_tid.0;
     new_task_inner.linux_tid = Some(linux_tid);

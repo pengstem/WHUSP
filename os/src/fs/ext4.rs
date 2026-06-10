@@ -337,6 +337,8 @@ impl FileSystemBackend for Ext4Mount {
     }
 
     fn retain_inode(&mut self, ino: u32) -> FsResult {
+        // VfsFile open lifetime pins the inode after unlink. The backend checks
+        // existence here so stale VfsNodeId values do not create open counts.
         let mut attr = lwext4_rust::FileAttr::default();
         self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
         *self.open_inodes.entry(ino).or_insert(0) += 1;
@@ -351,6 +353,8 @@ impl FileSystemBackend for Ext4Mount {
             *open_count -= 1;
             return Ok(());
         }
+        // The final open reference is the point where an unlinked-but-open
+        // inode can be physically freed from the ext4 backend.
         self.open_inodes.remove(&ino);
         if self.pending_unlinks.remove(&ino) {
             self.fs.free_unlinked_inode(ino).map_err(map_ext4_error)?;

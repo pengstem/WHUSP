@@ -546,6 +546,8 @@ fn record_completion_wakeup() {
 fn record_completion_wakeup() {}
 
 pub fn handle_irq(irq: usize) -> bool {
+    // Dispatch across every discovered block device, not just x0. Extra disks
+    // can back explicit `/dev/vdX` mounts and have independent virtio IRQs.
     if let Some(device) = BLOCK_DEVICES.iter().find(|device| device.irq() == irq) {
         device.handle_irq();
         true
