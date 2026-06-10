@@ -1,8 +1,12 @@
 use crate::{
     syscall::{
+        SyscallContext,
         errno::{SysError, SysResult},
         uapi::LinuxTimeSpec,
-        user_ptr::{read_user_value_with_mmap_fault, write_user_value_with_mmap_fault},
+        user_ptr::{
+            read_user_value_with_mmap_fault, read_user_value_with_mmap_fault_ctx,
+            write_user_value_with_mmap_fault, write_user_value_with_mmap_fault_ctx,
+        },
     },
     task::{
         SCHED_RR_INTERVAL_US, TaskControlBlock, current_process, current_task, current_user_token,
@@ -57,6 +61,16 @@ fn sched_target_task(pid: isize) -> SysResult<Arc<TaskControlBlock>> {
     }
     if pid == 0 {
         return current_task().ok_or(SysError::ESRCH);
+    }
+    task_with_linux_tid(pid as usize).ok_or(SysError::ESRCH)
+}
+
+fn sched_target_task_ctx(ctx: &SyscallContext, pid: isize) -> SysResult<Arc<TaskControlBlock>> {
+    if pid < 0 {
+        return Err(SysError::EINVAL);
+    }
+    if pid == 0 {
+        return Ok(Arc::clone(ctx.task()));
     }
     task_with_linux_tid(pid as usize).ok_or(SysError::ESRCH)
 }
@@ -163,6 +177,17 @@ fn current_euid_matches_task(task: &TaskControlBlock) -> SysResult<bool> {
     Ok(caller.euid == target.ruid || caller.euid == target.euid)
 }
 
+fn ctx_has_scheduler_privilege(ctx: &SyscallContext) -> bool {
+    ctx.process().credentials().is_root()
+}
+
+fn ctx_euid_matches_task(ctx: &SyscallContext, task: &TaskControlBlock) -> SysResult<bool> {
+    let caller = ctx.process().credentials();
+    let target_process = task.process.upgrade().ok_or(SysError::ESRCH)?;
+    let target = target_process.credentials();
+    Ok(caller.euid == target.ruid || caller.euid == target.euid)
+}
+
 fn policy_change_requires_privilege(policy: i32) -> bool {
     matches!(policy, SCHED_FIFO | SCHED_RR | SCHED_DEADLINE)
 }
@@ -175,6 +200,20 @@ fn ensure_can_change_task_sched(
         return Ok(());
     }
     if requires_privilege || !current_euid_matches_task(task)? {
+        return Err(SysError::EPERM);
+    }
+    Ok(())
+}
+
+fn ensure_can_change_task_sched_ctx(
+    ctx: &SyscallContext,
+    task: &TaskControlBlock,
+    requires_privilege: bool,
+) -> SysResult<()> {
+    if ctx_has_scheduler_privilege(ctx) {
+        return Ok(());
+    }
+    if requires_privilege || !ctx_euid_matches_task(ctx, task)? {
         return Err(SysError::EPERM);
     }
     Ok(())
@@ -306,6 +345,7 @@ pub fn sys_sched_getparam(pid: isize, param: usize) -> SysResult {
     Ok(0)
 }
 
+#[allow(dead_code)]
 pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: usize) -> SysResult {
     if cpusetsize < AFFINITY_MASK_BYTES {
         return Err(SysError::EINVAL);
@@ -319,6 +359,25 @@ pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: usize) -> SysR
     Ok(AFFINITY_MASK_BYTES as isize)
 }
 
+pub fn sys_sched_getaffinity_ctx(
+    ctx: &SyscallContext,
+    pid: isize,
+    cpusetsize: usize,
+    mask: usize,
+) -> SysResult {
+    if cpusetsize < AFFINITY_MASK_BYTES {
+        return Err(SysError::EINVAL);
+    }
+    let _task = sched_target_task_ctx(ctx, pid)?;
+    // CONTEXT: The current contest runtime exposes a single runnable hart to
+    // user space and does not model Linux cpusets/cgroups yet, so every task
+    // reports an affinity mask containing CPU 0 only.
+    let affinity_mask = 1usize;
+    write_user_value_with_mmap_fault_ctx(ctx, mask as *mut usize, &affinity_mask)?;
+    Ok(AFFINITY_MASK_BYTES as isize)
+}
+
+#[allow(dead_code)]
 pub fn sys_sched_setaffinity(pid: isize, cpusetsize: usize, mask: usize) -> SysResult {
     if cpusetsize < AFFINITY_MASK_BYTES {
         return Err(SysError::EINVAL);
@@ -330,6 +389,27 @@ pub fn sys_sched_setaffinity(pid: isize, cpusetsize: usize, mask: usize) -> SysR
         return Err(SysError::EINVAL);
     }
     ensure_can_change_task_sched(&task, false)?;
+    // CONTEXT: The current contest runtime has only CPU 0 available to user
+    // space. Accept masks that include CPU 0 for ABI compatibility, but do
+    // not perform migration or persist a broader cpuset model yet.
+    Ok(0)
+}
+
+pub fn sys_sched_setaffinity_ctx(
+    ctx: &SyscallContext,
+    pid: isize,
+    cpusetsize: usize,
+    mask: usize,
+) -> SysResult {
+    if cpusetsize < AFFINITY_MASK_BYTES {
+        return Err(SysError::EINVAL);
+    }
+    let task = sched_target_task_ctx(ctx, pid)?;
+    let affinity_mask = read_user_value_with_mmap_fault_ctx(ctx, mask as *const usize)?;
+    if affinity_mask & 1 == 0 {
+        return Err(SysError::EINVAL);
+    }
+    ensure_can_change_task_sched_ctx(ctx, &task, false)?;
     // CONTEXT: The current contest runtime has only CPU 0 available to user
     // space. Accept masks that include CPU 0 for ABI compatibility, but do
     // not perform migration or persist a broader cpuset model yet.

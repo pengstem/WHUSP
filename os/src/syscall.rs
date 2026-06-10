@@ -708,11 +708,13 @@ pub(crate) fn syscall_with_context(
             args[2] as *const LinuxTimeSpec,
             args[3] as i32,
         ),
-        SYSCALL_CAPGET => sys_capget(
+        SYSCALL_CAPGET => sys_capget_ctx(
+            ctx,
             args[0] as *mut LinuxCapUserHeader,
             args[1] as *mut LinuxCapUserData,
         ),
-        SYSCALL_CAPSET => sys_capset(
+        SYSCALL_CAPSET => sys_capset_ctx(
+            ctx,
             args[0] as *mut LinuxCapUserHeader,
             args[1] as *const LinuxCapUserData,
         ),
@@ -770,7 +772,7 @@ pub(crate) fn syscall_with_context(
             args[3] as i32,
             args[4] as *mut RUsage,
         ),
-        SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0]),
+        SYSCALL_SET_TID_ADDRESS => sys_set_tid_address_ctx(ctx, args[0]),
         SYSCALL_UNSHARE => sys_unshare(args[0]),
         SYSCALL_FUTEX => sys_futex(
             args[0] as *mut u32,
@@ -823,8 +825,12 @@ pub(crate) fn syscall_with_context(
         }
         SYSCALL_SCHED_GETSCHEDULER => sys_sched_getscheduler(args[0] as isize),
         SYSCALL_SCHED_GETPARAM => sys_sched_getparam(args[0] as isize, args[1]),
-        SYSCALL_SCHED_SETAFFINITY => sys_sched_setaffinity(args[0] as isize, args[1], args[2]),
-        SYSCALL_SCHED_GETAFFINITY => sys_sched_getaffinity(args[0] as isize, args[1], args[2]),
+        SYSCALL_SCHED_SETAFFINITY => {
+            sys_sched_setaffinity_ctx(ctx, args[0] as isize, args[1], args[2])
+        }
+        SYSCALL_SCHED_GETAFFINITY => {
+            sys_sched_getaffinity_ctx(ctx, args[0] as isize, args[1], args[2])
+        }
         SYSCALL_SCHED_YIELD => Ok(sys_sched_yield()),
         SYSCALL_SCHED_GET_PRIORITY_MAX => sys_sched_get_priority_max(args[0] as i32),
         SYSCALL_SCHED_GET_PRIORITY_MIN => sys_sched_get_priority_min(args[0] as i32),
@@ -871,13 +877,15 @@ pub(crate) fn syscall_with_context(
         SYSCALL_SETREUID => sys_setreuid(args[0] as i32, args[1] as i32),
         SYSCALL_SETUID => sys_setuid(args[0] as u32),
         SYSCALL_SETRESUID => sys_setresuid(args[0] as i32, args[1] as i32, args[2] as i32),
-        SYSCALL_GETRESUID => sys_getresuid(
+        SYSCALL_GETRESUID => sys_getresuid_ctx(
+            ctx,
             args[0] as *mut u32,
             args[1] as *mut u32,
             args[2] as *mut u32,
         ),
         SYSCALL_SETRESGID => sys_setresgid(args[0] as i32, args[1] as i32, args[2] as i32),
-        SYSCALL_GETRESGID => sys_getresgid(
+        SYSCALL_GETRESGID => sys_getresgid_ctx(
+            ctx,
             args[0] as *mut u32,
             args[1] as *mut u32,
             args[2] as *mut u32,
@@ -885,18 +893,18 @@ pub(crate) fn syscall_with_context(
         SYSCALL_SETFSUID => sys_setfsuid(args[0] as i32),
         SYSCALL_SETFSGID => sys_setfsgid(args[0] as i32),
         SYSCALL_TIMES => sys_times(args[0] as *mut LinuxTms),
-        SYSCALL_SETPGID => sys_setpgid(args[0] as isize, args[1] as isize),
-        SYSCALL_GETPGID => sys_getpgid(args[0] as isize),
-        SYSCALL_GETSID => sys_getsid(args[0] as isize),
+        SYSCALL_SETPGID => sys_setpgid_ctx(ctx, args[0] as isize, args[1] as isize),
+        SYSCALL_GETPGID => sys_getpgid_ctx(ctx, args[0] as isize),
+        SYSCALL_GETSID => sys_getsid_ctx(ctx, args[0] as isize),
         SYSCALL_SETSID => sys_setsid(),
-        SYSCALL_GETGROUPS => sys_getgroups(args[0], args[1] as *mut u32),
-        SYSCALL_SETGROUPS => sys_setgroups(args[0], args[1] as *const u32),
+        SYSCALL_GETGROUPS => sys_getgroups_ctx(ctx, args[0], args[1] as *mut u32),
+        SYSCALL_SETGROUPS => sys_setgroups_ctx(ctx, args[0], args[1] as *const u32),
         SYSCALL_UNAME => sys_uname_ctx(ctx, args[0] as *mut LinuxUtsName),
-        SYSCALL_GETRLIMIT => sys_getrlimit(args[0] as i32, args[1] as *mut RLimit),
-        SYSCALL_SETRLIMIT => sys_setrlimit(args[0] as i32, args[1] as *const RLimit),
+        SYSCALL_GETRLIMIT => sys_getrlimit_ctx(ctx, args[0] as i32, args[1] as *mut RLimit),
+        SYSCALL_SETRLIMIT => sys_setrlimit_ctx(ctx, args[0] as i32, args[1] as *const RLimit),
         SYSCALL_GETRUSAGE => sys_getrusage(args[0] as i32, args[1] as *mut RUsage),
         SYSCALL_UMASK => sys_umask(args[0] as u32),
-        SYSCALL_PRCTL => sys_prctl(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_PRCTL => sys_prctl_ctx(ctx, args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_GETTIMEOFDAY => {
             sys_gettimeofday(args[0] as *mut LinuxTimeVal, args[1] as *mut LinuxTimezone)
         }
@@ -981,7 +989,8 @@ pub(crate) fn syscall_with_context(
             args[2] as i32,
             args[3] as *mut RUsage,
         ),
-        SYSCALL_PRLIMIT64 => sys_prlimit64(
+        SYSCALL_PRLIMIT64 => sys_prlimit64_ctx(
+            ctx,
             args[0],
             args[1] as i32,
             args[2] as *const RLimit,

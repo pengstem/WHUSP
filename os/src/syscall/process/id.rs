@@ -1,3 +1,4 @@
+use crate::syscall::SyscallContext;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::task::{
     Credentials, ProcessControlBlock, SignalFlags, SignalInfo, current_process, current_task,
@@ -65,6 +66,7 @@ fn visible_process_group_id(
         .unwrap_or(0)
 }
 
+#[allow(dead_code)]
 pub fn sys_setpgid(pid: isize, pgid: isize) -> SysResult {
     if pid < 0 || pgid < 0 {
         return Err(SysError::EINVAL);
@@ -94,6 +96,36 @@ pub fn sys_setpgid(pid: isize, pgid: isize) -> SysResult {
     Ok(0)
 }
 
+pub fn sys_setpgid_ctx(ctx: &SyscallContext, pid: isize, pgid: isize) -> SysResult {
+    if pid < 0 || pgid < 0 {
+        return Err(SysError::EINVAL);
+    }
+    let current = ctx.process();
+    let target_pid = if pid == 0 {
+        current.getpid()
+    } else {
+        pid as usize
+    };
+    let target = if target_pid == current.getpid() {
+        Arc::clone(current)
+    } else {
+        process_from_visible_pid(current, target_pid).ok_or(SysError::ESRCH)?
+    };
+    let new_pgid = if pgid == 0 {
+        target.getpid()
+    } else {
+        process_from_visible_pid(current, pgid as usize)
+            .map(|process| process.getpid())
+            .unwrap_or(pgid as usize)
+    };
+    // UNFINISHED: Linux setpgid enforces sessions, exec-time constraints, and
+    // parent/child relationship checks. This compatibility layer exists first
+    // to satisfy libc/LTP harness calls such as setpgid(0, 0).
+    target.set_process_group_id(new_pgid);
+    Ok(0)
+}
+
+#[allow(dead_code)]
 pub fn sys_getpgid(pid: isize) -> SysResult {
     if pid < 0 {
         return Err(SysError::ESRCH);
@@ -107,6 +139,20 @@ pub fn sys_getpgid(pid: isize) -> SysResult {
     Ok(visible_process_group_id(&target, &current) as isize)
 }
 
+pub fn sys_getpgid_ctx(ctx: &SyscallContext, pid: isize) -> SysResult {
+    if pid < 0 {
+        return Err(SysError::ESRCH);
+    }
+    let current = ctx.process();
+    let target = if pid == 0 || pid as usize == current.getpid() {
+        Arc::clone(current)
+    } else {
+        process_from_visible_pid(current, pid as usize).ok_or(SysError::ESRCH)?
+    };
+    Ok(visible_process_group_id(&target, current) as isize)
+}
+
+#[allow(dead_code)]
 pub fn sys_getsid(pid: isize) -> SysResult {
     if pid < 0 {
         return Err(SysError::EINVAL);
@@ -121,6 +167,22 @@ pub fn sys_getsid(pid: isize) -> SysResult {
     // process-group leader value gives the Linux-visible PID namespace behavior
     // needed by getsid()/setsid() tests.
     Ok(visible_process_group_id(&target, &current) as isize)
+}
+
+pub fn sys_getsid_ctx(ctx: &SyscallContext, pid: isize) -> SysResult {
+    if pid < 0 {
+        return Err(SysError::EINVAL);
+    }
+    let current = ctx.process();
+    let target = if pid == 0 || pid as usize == current.getpid() {
+        Arc::clone(current)
+    } else {
+        process_from_visible_pid(current, pid as usize).ok_or(SysError::ESRCH)?
+    };
+    // UNFINISHED: A distinct session ID is not modeled yet. The existing
+    // process-group leader value gives the Linux-visible PID namespace behavior
+    // needed by getsid()/setsid() tests.
+    Ok(visible_process_group_id(&target, current) as isize)
 }
 
 pub fn sys_setsid() -> SysResult {
@@ -139,10 +201,18 @@ pub fn sys_setsid() -> SysResult {
     Ok(current.visible_pid() as isize)
 }
 
+#[allow(dead_code)]
 pub fn sys_set_tid_address(tidptr: usize) -> SysResult {
     let task = current_task().expect("set_tid_address requires a current task");
     let tid = task.linux_tid();
     task.inner_exclusive_access().clear_child_tid = if tidptr == 0 { None } else { Some(tidptr) };
+    Ok(tid as isize)
+}
+
+pub fn sys_set_tid_address_ctx(ctx: &SyscallContext, tidptr: usize) -> SysResult {
+    let tid = ctx.task().linux_tid();
+    ctx.task().inner_exclusive_access().clear_child_tid =
+        if tidptr == 0 { None } else { Some(tidptr) };
     Ok(tid as isize)
 }
 
