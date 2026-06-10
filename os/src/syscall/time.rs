@@ -1,5 +1,6 @@
 use crate::perf;
 use crate::sync::UPIntrFreeCell;
+use crate::syscall::SyscallContext;
 use crate::task::{
     ProcessCpuTimesSnapshot, block_current_task_no_schedule, current_has_deliverable_signal,
     current_process, current_user_token, pid2process, schedule, task_with_linux_tid,
@@ -13,7 +14,7 @@ use lazy_static::*;
 
 use super::errno::{SysError, SysResult};
 use super::uapi::LinuxTimeSpec;
-use super::user_ptr::{read_user_value, write_user_value};
+use super::user_ptr::{read_user_value, write_user_value, write_user_value_ctx};
 
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
@@ -626,6 +627,7 @@ pub fn sys_timer_delete(timerid: i32) -> SysResult {
     Ok(0)
 }
 
+#[allow(dead_code)]
 pub fn sys_gettimeofday(tv: *mut LinuxTimeVal, tz: *mut LinuxTimezone) -> SysResult {
     let token = current_user_token();
     if !tv.is_null() {
@@ -639,10 +641,35 @@ pub fn sys_gettimeofday(tv: *mut LinuxTimeVal, tz: *mut LinuxTimezone) -> SysRes
     Ok(0)
 }
 
+pub fn sys_gettimeofday_ctx(
+    ctx: &SyscallContext,
+    tv: *mut LinuxTimeVal,
+    tz: *mut LinuxTimezone,
+) -> SysResult {
+    if !tv.is_null() {
+        write_user_value_ctx(ctx, tv, &wall_timeval())?;
+    }
+    if !tz.is_null() {
+        // CONTEXT: Linux keeps the timezone argument only for legacy callers.
+        // This kernel has no timezone state, so report UTC-compatible zeroes.
+        write_user_value_ctx(ctx, tz, &LinuxTimezone::default())?;
+    }
+    Ok(0)
+}
+
+#[allow(dead_code)]
 pub fn sys_times(tms: *mut LinuxTms) -> SysResult {
     if !tms.is_null() {
         let linux_tms = LinuxTms::from_cpu_times(current_process().cpu_times_snapshot());
         write_user_value(current_user_token(), tms, &linux_tms)?;
+    }
+    Ok(clock_ticks_to_isize(get_time_clock_ticks()))
+}
+
+pub fn sys_times_ctx(ctx: &SyscallContext, tms: *mut LinuxTms) -> SysResult {
+    if !tms.is_null() {
+        let linux_tms = LinuxTms::from_cpu_times(ctx.process().cpu_times_snapshot());
+        write_user_value_ctx(ctx, tms, &linux_tms)?;
     }
     Ok(clock_ticks_to_isize(get_time_clock_ticks()))
 }
@@ -714,8 +741,18 @@ fn clock_getres_resolution(clock_id: i32) -> SysResult<LinuxTimeSpec> {
     }
 }
 
+#[allow(dead_code)]
 fn process_cpu_timespec() -> LinuxTimeSpec {
     let times = current_process().cpu_times_snapshot();
+    process_cpu_timespec_from_times(times)
+}
+
+fn process_cpu_timespec_from_times(times: ProcessCpuTimesSnapshot) -> LinuxTimeSpec {
+    us_to_timespec(times.user_us.saturating_add(times.system_us))
+}
+
+fn process_cpu_timespec_ctx(ctx: &SyscallContext) -> LinuxTimeSpec {
+    let times = ctx.process().cpu_times_snapshot();
     us_to_timespec(times.user_us.saturating_add(times.system_us))
 }
 
@@ -734,6 +771,7 @@ fn cpu_clock_target_id(clock_id: i32) -> SysResult<(bool, usize)> {
     Ok((clock_id & CPUCLOCK_PERTHREAD_MASK != 0, id as usize))
 }
 
+#[allow(dead_code)]
 fn dynamic_cpu_clock_timespec(clock_id: i32) -> SysResult<LinuxTimeSpec> {
     let (per_thread, id) = cpu_clock_target_id(clock_id)?;
     if per_thread {
@@ -749,6 +787,23 @@ fn dynamic_cpu_clock_timespec(clock_id: i32) -> SysResult<LinuxTimeSpec> {
         Ok(us_to_timespec(
             times.user_us.saturating_add(times.system_us),
         ))
+    }
+}
+
+fn dynamic_cpu_clock_timespec_ctx(ctx: &SyscallContext, clock_id: i32) -> SysResult<LinuxTimeSpec> {
+    let (per_thread, id) = cpu_clock_target_id(clock_id)?;
+    if per_thread {
+        let task = task_with_linux_tid(id).ok_or(SysError::EINVAL)?;
+        Ok(us_to_timespec(task.cpu_time_us()))
+    } else {
+        let times = if id == 0 {
+            ctx.process().cpu_times_snapshot()
+        } else {
+            pid2process(id)
+                .ok_or(SysError::EINVAL)?
+                .cpu_times_snapshot()
+        };
+        Ok(process_cpu_timespec_from_times(times))
     }
 }
 
@@ -791,6 +846,7 @@ pub fn sys_nanosleep(req: *const LinuxTimeSpec, rem: *mut LinuxTimeSpec) -> SysR
     }
 }
 
+#[allow(dead_code)]
 pub fn sys_clock_gettime(clock_id: i32, tp: *mut LinuxTimeSpec) -> SysResult {
     if tp.is_null() {
         return Err(SysError::EFAULT);
@@ -819,6 +875,38 @@ pub fn sys_clock_gettime(clock_id: i32, tp: *mut LinuxTimeSpec) -> SysResult {
     Ok(0)
 }
 
+pub fn sys_clock_gettime_ctx(
+    ctx: &SyscallContext,
+    clock_id: i32,
+    tp: *mut LinuxTimeSpec,
+) -> SysResult {
+    if tp.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    let timespec = if clock_id < 0 {
+        dynamic_cpu_clock_timespec_ctx(ctx, clock_id)?
+    } else {
+        match clock_id {
+            CLOCK_PROCESS_CPUTIME_ID => process_cpu_timespec_ctx(ctx),
+            CLOCK_THREAD_CPUTIME_ID => {
+                // UNFINISHED: Thread CPU time currently reuses process-wide
+                // trap-boundary accounting because per-thread CPU accounting is
+                // not represented separately in the task model yet.
+                process_cpu_timespec_ctx(ctx)
+            }
+            CLOCK_REALTIME | CLOCK_REALTIME_COARSE => {
+                nanos_to_timespec(current_clock_nanos(ClockBackend::Wall))
+            }
+            CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
+                monotonic_timespec()
+            }
+            _ => return Err(SysError::EINVAL),
+        }
+    };
+    write_user_value_ctx(ctx, tp, &timespec)?;
+    Ok(0)
+}
+
 pub fn sys_clock_settime(clock_id: i32, tp: *const LinuxTimeSpec) -> SysResult {
     if clock_id != CLOCK_REALTIME {
         return Err(SysError::EINVAL);
@@ -835,10 +923,23 @@ pub fn sys_clock_settime(clock_id: i32, tp: *const LinuxTimeSpec) -> SysResult {
     Ok(0)
 }
 
+#[allow(dead_code)]
 pub fn sys_clock_getres(clock_id: i32, res: *mut LinuxTimeSpec) -> SysResult {
     let resolution = clock_getres_resolution(clock_id)?;
     if !res.is_null() {
         write_user_value(current_user_token(), res, &resolution)?;
+    }
+    Ok(0)
+}
+
+pub fn sys_clock_getres_ctx(
+    ctx: &SyscallContext,
+    clock_id: i32,
+    res: *mut LinuxTimeSpec,
+) -> SysResult {
+    let resolution = clock_getres_resolution(clock_id)?;
+    if !res.is_null() {
+        write_user_value_ctx(ctx, res, &resolution)?;
     }
     Ok(0)
 }

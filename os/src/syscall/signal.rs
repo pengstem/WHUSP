@@ -9,10 +9,13 @@ use crate::timer::get_time_ms;
 use alloc::sync::Arc;
 use core::mem::size_of;
 
+use super::SyscallContext;
 use super::errno::{SysError, SysResult};
 use super::time::relative_timeout_deadline_ms;
 use super::uapi::LinuxTimeSpec;
-use super::user_ptr::{read_user_value, write_user_value};
+use super::user_ptr::{
+    read_user_value, read_user_value_ctx, write_user_value, write_user_value_ctx,
+};
 use super::wait::LinuxSigInfo;
 
 const LINUX_RT_SIGSET_SIZE: usize = 8;
@@ -32,6 +35,27 @@ fn read_signal_set(token: usize, set: *const u8, sigsetsize: usize) -> SysResult
         return Err(SysError::EFAULT);
     }
     let raw_set = read_user_value(token, set.cast::<u64>())?;
+    let mut flags = linux_sigset_to_flags(raw_set);
+    flags.remove(SignalFlags::SIGKILL);
+    flags.remove(SignalFlags::SIGSTOP);
+    Ok(flags)
+}
+
+fn read_signal_set_ctx(
+    ctx: &SyscallContext,
+    set: *const u8,
+    sigsetsize: usize,
+) -> SysResult<SignalFlags> {
+    // Linux rt-signal syscalls pass one 64-bit sigset on these ABIs. SIGKILL
+    // and SIGSTOP are never blockable, so strip them at the syscall boundary
+    // before the mask reaches TaskControlBlockInner.
+    if sigsetsize != LINUX_RT_SIGSET_SIZE {
+        return Err(SysError::EINVAL);
+    }
+    if (set as usize) < size_of::<u64>() {
+        return Err(SysError::EFAULT);
+    }
+    let raw_set = read_user_value_ctx(ctx, set.cast::<u64>())?;
     let mut flags = linux_sigset_to_flags(raw_set);
     flags.remove(SignalFlags::SIGKILL);
     flags.remove(SignalFlags::SIGSTOP);
@@ -210,6 +234,7 @@ pub fn sys_tgkill(tgid: isize, tid: isize, signum: u32) -> SysResult {
     Ok(0)
 }
 
+#[allow(dead_code)]
 pub fn sys_rt_sigaction(
     signum: u32,
     action: *const u8,
@@ -247,6 +272,44 @@ pub fn sys_rt_sigaction(
     Ok(0)
 }
 
+pub fn sys_rt_sigaction_ctx(
+    ctx: &SyscallContext,
+    signum: u32,
+    action: *const u8,
+    old_action: *mut u8,
+    sigsetsize: usize,
+) -> SysResult {
+    if sigsetsize != LINUX_RT_SIGSET_SIZE {
+        return Err(SysError::EINVAL);
+    }
+    let signal_index = validate_action_signum(signum)?;
+    if !action.is_null() && (signum == SIGKILL || signum == SIGSTOP) {
+        return Err(SysError::EINVAL);
+    }
+
+    let new_action = if action.is_null() {
+        None
+    } else {
+        Some(signal_action_from_linux(read_user_value_ctx(
+            ctx,
+            action.cast::<LinuxKernelSigAction>(),
+        )?))
+    };
+    let process = ctx.process();
+    let old = process.inner_exclusive_access().signal_actions[signal_index];
+    // CONTEXT: user memory writes can fault, so release the process lock before
+    // copying out the old action and reacquire it only when installing the new one.
+    if !old_action.is_null() {
+        let old = LinuxKernelSigAction::from(old);
+        write_user_value_ctx(ctx, old_action.cast::<LinuxKernelSigAction>(), &old)?;
+    }
+    if let Some(new_action) = new_action {
+        process.inner_exclusive_access().signal_actions[signal_index] = new_action;
+    }
+    Ok(0)
+}
+
+#[allow(dead_code)]
 pub fn sys_rt_sigprocmask(
     how: usize,
     set: *const u8,
@@ -282,6 +345,42 @@ pub fn sys_rt_sigprocmask(
     Ok(0)
 }
 
+pub fn sys_rt_sigprocmask_ctx(
+    ctx: &SyscallContext,
+    how: usize,
+    set: *const u8,
+    old_set: *mut u8,
+    sigsetsize: usize,
+) -> SysResult {
+    if sigsetsize != LINUX_RT_SIGSET_SIZE {
+        return Err(SysError::EINVAL);
+    }
+    let new_set = if set.is_null() {
+        None
+    } else {
+        Some(read_signal_set_ctx(ctx, set, sigsetsize)?)
+    };
+    let task = ctx.task();
+    let old_mask = task.inner_exclusive_access().signal_mask;
+    // CONTEXT: user memory writes can fault, so release the task lock before
+    // copying out the old mask and reacquire it only when installing the new one.
+    if !old_set.is_null() {
+        let old_raw = flags_to_linux_sigset(old_mask);
+        write_user_value_ctx(ctx, old_set.cast::<u64>(), &old_raw)?;
+    }
+    if let Some(new_set) = new_set {
+        let mut task_inner = task.inner_exclusive_access();
+        match how {
+            SIG_BLOCK => task_inner.signal_mask |= new_set,
+            SIG_UNBLOCK => task_inner.signal_mask.remove(new_set),
+            SIG_SETMASK => task_inner.signal_mask = new_set,
+            _ => return Err(SysError::EINVAL),
+        }
+    }
+    Ok(0)
+}
+
+#[allow(dead_code)]
 pub fn sys_sigaltstack(new_stack: *const u8, old_stack: *mut u8) -> SysResult {
     let token = current_user_token();
     let task = current_task().ok_or(SysError::ESRCH)?;
@@ -299,6 +398,32 @@ pub fn sys_sigaltstack(new_stack: *const u8, old_stack: *mut u8) -> SysResult {
             return Err(SysError::EPERM);
         }
         let new_raw = read_user_value(token, new_stack.cast::<LinuxStackT>())?;
+        let new = new_raw.into_altstack()?;
+        task.inner_exclusive_access().sigaltstack = new;
+    }
+    Ok(0)
+}
+
+pub fn sys_sigaltstack_ctx(
+    ctx: &SyscallContext,
+    new_stack: *const u8,
+    old_stack: *mut u8,
+) -> SysResult {
+    let task = ctx.task();
+    #[cfg(target_arch = "riscv64")]
+    let current_sp = current_trap_cx().x[2];
+    #[cfg(target_arch = "loongarch64")]
+    let current_sp = current_trap_cx().x[3];
+    let old = task.inner_exclusive_access().sigaltstack;
+    if !old_stack.is_null() {
+        let old_raw = LinuxStackT::from_altstack(old, current_sp);
+        write_user_value_ctx(ctx, old_stack.cast::<LinuxStackT>(), &old_raw)?;
+    }
+    if !new_stack.is_null() {
+        if old.contains(current_sp) {
+            return Err(SysError::EPERM);
+        }
+        let new_raw = read_user_value_ctx(ctx, new_stack.cast::<LinuxStackT>())?;
         let new = new_raw.into_altstack()?;
         task.inner_exclusive_access().sigaltstack = new;
     }

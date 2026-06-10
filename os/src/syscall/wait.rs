@@ -1,5 +1,6 @@
 use crate::mm::MemorySet;
 use crate::perf;
+use crate::syscall::SyscallContext;
 use crate::syscall::user_ptr::{write_user_value, write_user_value_in_memory_set};
 use crate::task::{
     CLD_CONTINUED, CLD_STOPPED, ProcessControlBlock, ProcessCpuTimesSnapshot, SIGCHLD, SIGCONT,
@@ -351,7 +352,28 @@ fn scan_waitid_children(
 ///
 /// Reaping removes the child from both PID lookup and the parent's child list;
 /// `WNOHANG` observes the current state without blocking.
+#[allow(dead_code)]
 pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsage) -> SysResult {
+    sys_wait4_for_process(current_process(), pid, wstatus, options, rusage)
+}
+
+pub fn sys_wait4_ctx(
+    ctx: &SyscallContext,
+    pid: isize,
+    wstatus: *mut i32,
+    options: i32,
+    rusage: *mut RUsage,
+) -> SysResult {
+    sys_wait4_for_process(ctx.process().clone(), pid, wstatus, options, rusage)
+}
+
+fn sys_wait4_for_process(
+    process: Arc<ProcessControlBlock>,
+    pid: isize,
+    wstatus: *mut i32,
+    options: i32,
+    rusage: *mut RUsage,
+) -> SysResult {
     // CONTEXT: __WALL is accepted for ptrace/LTP compatibility. This process
     // model stores waitable children in one process child list, so there is no
     // separate thread-vs-process wait domain for the flag to widen.
@@ -365,7 +387,6 @@ pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsag
     }
 
     loop {
-        let process = current_process();
         let waiter_pid = process.getpid();
         let caller_pgid = process.process_group_id();
         let mut inner = process.inner_exclusive_access();
@@ -434,7 +455,6 @@ pub fn sys_wait4(pid: isize, wstatus: *mut i32, options: i32, rusage: *mut RUsag
         if interrupted {
             wakeup_task(task);
         }
-        drop(process);
         schedule(task_cx_ptr);
         if interrupted {
             return Err(SysError::EINTR);

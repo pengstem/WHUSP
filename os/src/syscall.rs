@@ -809,8 +809,12 @@ pub(crate) fn syscall_with_context(
         ),
         SYSCALL_TIMER_DELETE => sys_timer_delete(args[0] as i32),
         SYSCALL_CLOCK_SETTIME => sys_clock_settime(args[0] as i32, args[1] as *const LinuxTimeSpec),
-        SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as i32, args[1] as *mut LinuxTimeSpec),
-        SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0] as i32, args[1] as *mut LinuxTimeSpec),
+        SYSCALL_CLOCK_GETTIME => {
+            sys_clock_gettime_ctx(ctx, args[0] as i32, args[1] as *mut LinuxTimeSpec)
+        }
+        SYSCALL_CLOCK_GETRES => {
+            sys_clock_getres_ctx(ctx, args[0] as i32, args[1] as *mut LinuxTimeSpec)
+        }
         SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(
             args[0] as i32,
             args[1] as u32,
@@ -851,17 +855,22 @@ pub(crate) fn syscall_with_context(
             args[3] as u32,
         ),
         SYSCALL_PIDFD_OPEN => sys_pidfd_open(args[0], args[1] as u32),
-        SYSCALL_SIGALTSTACK => sys_sigaltstack(args[0] as *const u8, args[1] as *mut u8),
+        SYSCALL_SIGALTSTACK => sys_sigaltstack_ctx(ctx, args[0] as *const u8, args[1] as *mut u8),
         SYSCALL_RT_SIGSUSPEND => sys_rt_sigsuspend(args[0] as *const u8, args[1]),
-        SYSCALL_RT_SIGACTION => sys_rt_sigaction(
+        SYSCALL_RT_SIGACTION => sys_rt_sigaction_ctx(
+            ctx,
             args[0] as u32,
             args[1] as *const u8,
             args[2] as *mut u8,
             args[3],
         ),
-        SYSCALL_RT_SIGPROCMASK => {
-            sys_rt_sigprocmask(args[0], args[1] as *const u8, args[2] as *mut u8, args[3])
-        }
+        SYSCALL_RT_SIGPROCMASK => sys_rt_sigprocmask_ctx(
+            ctx,
+            args[0],
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+        ),
         SYSCALL_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(
             args[0] as *const u8,
             args[1] as *mut LinuxSigInfo,
@@ -892,7 +901,7 @@ pub(crate) fn syscall_with_context(
         ),
         SYSCALL_SETFSUID => sys_setfsuid(args[0] as i32),
         SYSCALL_SETFSGID => sys_setfsgid(args[0] as i32),
-        SYSCALL_TIMES => sys_times(args[0] as *mut LinuxTms),
+        SYSCALL_TIMES => sys_times_ctx(ctx, args[0] as *mut LinuxTms),
         SYSCALL_SETPGID => sys_setpgid_ctx(ctx, args[0] as isize, args[1] as isize),
         SYSCALL_GETPGID => sys_getpgid_ctx(ctx, args[0] as isize),
         SYSCALL_GETSID => sys_getsid_ctx(ctx, args[0] as isize),
@@ -905,9 +914,11 @@ pub(crate) fn syscall_with_context(
         SYSCALL_GETRUSAGE => sys_getrusage(args[0] as i32, args[1] as *mut RUsage),
         SYSCALL_UMASK => sys_umask(args[0] as u32),
         SYSCALL_PRCTL => sys_prctl_ctx(ctx, args[0], args[1], args[2], args[3], args[4]),
-        SYSCALL_GETTIMEOFDAY => {
-            sys_gettimeofday(args[0] as *mut LinuxTimeVal, args[1] as *mut LinuxTimezone)
-        }
+        SYSCALL_GETTIMEOFDAY => sys_gettimeofday_ctx(
+            ctx,
+            args[0] as *mut LinuxTimeVal,
+            args[1] as *mut LinuxTimezone,
+        ),
         SYSCALL_GETPID => Ok(sys_getpid()),
         SYSCALL_GETPPID => Ok(sys_getppid()),
         SYSCALL_GETUID => Ok(sys_getuid()),
@@ -985,7 +996,8 @@ pub(crate) fn syscall_with_context(
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2] as i32),
         SYSCALL_MLOCK2 => sys_mlock2(args[0], args[1], args[2]),
-        SYSCALL_WAIT4 => sys_wait4(
+        SYSCALL_WAIT4 => sys_wait4_ctx(
+            ctx,
             args[0] as isize,
             args[1] as *mut i32,
             args[2] as i32,
