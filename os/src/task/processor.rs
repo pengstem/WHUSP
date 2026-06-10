@@ -10,6 +10,8 @@ use lazy_static::*;
 
 pub struct Processor {
     current: Option<Arc<TaskControlBlock>>,
+    current_process: Option<Arc<ProcessControlBlock>>,
+    current_user_token: usize,
     idle_task_cx: TaskContext,
 }
 
@@ -17,6 +19,8 @@ impl Processor {
     pub fn new() -> Self {
         Self {
             current: None,
+            current_process: None,
+            current_user_token: 0,
             idle_task_cx: TaskContext::zero_init(),
         }
     }
@@ -24,10 +28,33 @@ impl Processor {
         &mut self.idle_task_cx as *mut _
     }
     pub fn take_current(&mut self) -> Option<Arc<TaskControlBlock>> {
+        self.current_process = None;
+        self.current_user_token = 0;
         self.current.take()
+    }
+    pub fn set_current(&mut self, task: Arc<TaskControlBlock>) {
+        let process = process_of_task(&task);
+        let user_token = process.inner_exclusive_access().memory_set.token();
+        self.current = Some(task);
+        self.current_process = Some(process);
+        self.current_user_token = user_token;
     }
     pub fn current(&self) -> Option<Arc<TaskControlBlock>> {
         self.current.as_ref().map(Arc::clone)
+    }
+    pub fn current_process(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.current_process.as_ref().map(Arc::clone)
+    }
+    pub fn current_user_token(&self) -> Option<usize> {
+        self.current_process
+            .as_ref()
+            .map(|_| self.current_user_token)
+    }
+    pub fn refresh_current_user_token(&mut self) -> Option<usize> {
+        let process = self.current_process.as_ref()?;
+        let token = process.inner_exclusive_access().memory_set.token();
+        self.current_user_token = token;
+        Some(token)
     }
 }
 
@@ -47,7 +74,7 @@ pub fn run_tasks() {
                 &task_inner.task_cx as *const TaskContext
             });
             task.mark_sched_run_start(crate::timer::get_time_us());
-            processor.current = Some(task);
+            processor.set_current(task);
             // release processor manually
             drop(processor);
             unsafe {
@@ -78,21 +105,23 @@ pub fn current_process() -> Arc<ProcessControlBlock> {
     perf::record_task_current_process_call();
     PROCESSOR
         .exclusive_access()
-        .current
-        .as_ref()
-        .map(|task| process_of_task(task))
+        .current_process()
         .expect("current_process requires a running task")
 }
 
 pub fn current_user_token() -> usize {
     perf::record_task_current_user_token_call();
-    let process = PROCESSOR
+    PROCESSOR
         .exclusive_access()
-        .current
-        .as_ref()
-        .map(|task| process_of_task(task))
-        .expect("current_user_token requires a running task");
-    process.inner_exclusive_access().memory_set.token()
+        .current_user_token()
+        .expect("current_user_token requires a running task")
+}
+
+pub fn refresh_current_user_token() {
+    PROCESSOR
+        .exclusive_access()
+        .refresh_current_user_token()
+        .expect("refresh_current_user_token requires a running task");
 }
 
 pub fn current_trap_cx() -> &'static mut TrapContext {
