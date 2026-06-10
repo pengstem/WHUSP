@@ -307,14 +307,13 @@ impl DentryCache {
 
     fn lookup(
         &mut self,
-        namespace_id: MountNamespaceId,
+        bucket: DentryCacheBucketKey,
         parent: VfsNodeId,
         component: &str,
     ) -> Option<DentryLookupResult> {
         if !self.enabled {
             return None;
         }
-        let bucket = DentryCacheBucketKey::new(namespace_id, parent, component);
         let Some(index) = self.find_entry_index(bucket, component) else {
             record_dentry_stat! {
                 self.stats.miss += 1;
@@ -365,7 +364,7 @@ impl DentryCache {
 
     fn insert_positive(
         &mut self,
-        namespace_id: MountNamespaceId,
+        bucket: DentryCacheBucketKey,
         parent: VfsNodeId,
         component: &str,
         node: VfsNodeId,
@@ -374,7 +373,6 @@ impl DentryCache {
         if !self.enabled || self.capacity == 0 {
             return;
         }
-        let bucket = DentryCacheBucketKey::new(namespace_id, parent, component);
         let value = DentryCacheValue::Positive {
             node,
             kind,
@@ -415,14 +413,13 @@ impl DentryCache {
 
     fn insert_negative(
         &mut self,
-        namespace_id: MountNamespaceId,
+        bucket: DentryCacheBucketKey,
         parent: VfsNodeId,
         component: &str,
     ) {
         if !self.enabled || self.capacity == 0 {
             return;
         }
-        let bucket = DentryCacheBucketKey::new(namespace_id, parent, component);
         let value = DentryCacheValue::Negative {
             parent_generation: self.parent_generation(parent),
             lru_stamp: 0,
@@ -502,9 +499,10 @@ pub(crate) fn lookup(
     parent: VfsNodeId,
     component: &str,
 ) -> Option<DentryLookupResult> {
+    let bucket = DentryCacheBucketKey::new(namespace_id, parent, component);
     DENTRY_CACHE
         .exclusive_access()
-        .lookup(namespace_id, parent, component)
+        .lookup(bucket, parent, component)
 }
 
 pub(crate) fn insert_positive(
@@ -514,15 +512,17 @@ pub(crate) fn insert_positive(
     node: VfsNodeId,
     kind: FsNodeKind,
 ) {
+    let bucket = DentryCacheBucketKey::new(namespace_id, parent, component);
     DENTRY_CACHE
         .exclusive_access()
-        .insert_positive(namespace_id, parent, component, node, kind);
+        .insert_positive(bucket, parent, component, node, kind);
 }
 
 pub(crate) fn insert_negative(namespace_id: MountNamespaceId, parent: VfsNodeId, component: &str) {
+    let bucket = DentryCacheBucketKey::new(namespace_id, parent, component);
     DENTRY_CACHE
         .exclusive_access()
-        .insert_negative(namespace_id, parent, component);
+        .insert_negative(bucket, parent, component);
 }
 
 pub(crate) fn invalidate_parent(parent: VfsNodeId) {
