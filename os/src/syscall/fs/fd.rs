@@ -1,9 +1,12 @@
 use crate::config::PAGE_SIZE;
 use crate::fs::{
-    File, OpenFlags, default_pipe_capacity_for_current_process, make_memfd, make_pipe,
-    pipe_max_size,
+    File, OpenFlags, default_pipe_capacity_for_current_process, default_pipe_capacity_for_process,
+    make_memfd, make_pipe, pipe_max_size,
 };
-use crate::task::{FdFlags, FdTableEntry, current_process, current_user_token};
+use crate::syscall::SyscallContext;
+use crate::task::{
+    FdFlags, FdTableEntry, ProcessControlBlock, current_process, current_user_token,
+};
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::mem::size_of;
@@ -11,6 +14,7 @@ use core::mem::size_of;
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
     UserBufferAccess, read_user_c_string, translated_byte_buffer_checked,
+    translated_byte_buffer_checked_ctx,
 };
 use super::fanotify::fanotify_notify_close;
 use super::fd_lock::{
@@ -51,12 +55,26 @@ const MEMFD_NAME_MAX: usize = 249;
 
 pub(super) fn get_fd_entry_by_fd(fd: usize) -> SysResult<FdTableEntry> {
     let process = current_process();
+    get_fd_entry_by_fd_for_process(&process, fd)
+}
+
+pub(super) fn get_fd_entry_by_fd_for_process(
+    process: &ProcessControlBlock,
+    fd: usize,
+) -> SysResult<FdTableEntry> {
     let inner = process.inner_exclusive_access();
     inner.fd_entry(fd).ok_or(SysError::EBADF)
 }
 
 pub(crate) fn get_file_by_fd(fd: usize) -> SysResult<Arc<dyn File + Send + Sync>> {
     Ok(get_fd_entry_by_fd(fd)?.file())
+}
+
+pub(crate) fn get_file_by_fd_for_process(
+    process: &ProcessControlBlock,
+    fd: usize,
+) -> SysResult<Arc<dyn File + Send + Sync>> {
+    Ok(get_fd_entry_by_fd_for_process(process, fd)?.file())
 }
 
 /// Installs a file into the current process fd table and returns the new fd.
@@ -127,6 +145,16 @@ fn validate_pipefd(token: usize, pipefd: *mut i32) -> SysResult<()> {
     .map(|_| ())
 }
 
+fn validate_pipefd_ctx(ctx: &SyscallContext, pipefd: *mut i32) -> SysResult<()> {
+    translated_byte_buffer_checked_ctx(
+        ctx,
+        pipefd as *const u8,
+        size_of::<[i32; 2]>(),
+        UserBufferAccess::Write,
+    )
+    .map(|_| ())
+}
+
 /// Writes the Linux `int pipefd[2]` result through checked user buffers.
 fn write_pipefd_pair(token: usize, pipefd: *mut i32, fds: [i32; 2]) -> SysResult<()> {
     let mut bytes = [0u8; size_of::<[i32; 2]>()];
@@ -148,6 +176,27 @@ fn write_pipefd_pair(token: usize, pipefd: *mut i32, fds: [i32; 2]) -> SysResult
     Ok(())
 }
 
+fn write_pipefd_pair_ctx(ctx: &SyscallContext, pipefd: *mut i32, fds: [i32; 2]) -> SysResult<()> {
+    let mut bytes = [0u8; size_of::<[i32; 2]>()];
+    let fd_size = size_of::<i32>();
+    bytes[..fd_size].copy_from_slice(&fds[0].to_ne_bytes());
+    bytes[fd_size..].copy_from_slice(&fds[1].to_ne_bytes());
+
+    let mut copied = 0usize;
+    for buffer in translated_byte_buffer_checked_ctx(
+        ctx,
+        pipefd as *const u8,
+        bytes.len(),
+        UserBufferAccess::Write,
+    )? {
+        let next = copied + buffer.len();
+        buffer.copy_from_slice(&bytes[copied..next]);
+        copied = next;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
 pub fn sys_pipe2(pipefd: *mut i32, flags: u32) -> SysResult {
     let pipe_flags = pipe2_open_flags(flags)?;
     let token = current_user_token();
@@ -188,6 +237,52 @@ pub fn sys_pipe2(pipefd: *mut i32, flags: u32) -> SysResult {
     let fds = fds?;
 
     if let Err(err) = write_pipefd_pair(token, pipefd, [fds[0] as i32, fds[1] as i32]) {
+        let entries = {
+            let mut inner = process.inner_exclusive_access();
+            [inner.take_fd_entry(fds[0]), inner.take_fd_entry(fds[1])]
+        };
+        for entry in entries.into_iter().flatten() {
+            close_detached_fd_entry(entry);
+        }
+        return Err(err);
+    }
+    Ok(0)
+}
+
+pub fn sys_pipe2_ctx(ctx: &SyscallContext, pipefd: *mut i32, flags: u32) -> SysResult {
+    let pipe_flags = pipe2_open_flags(flags)?;
+    validate_pipefd_ctx(ctx, pipefd)?;
+    let pipe_capacity = default_pipe_capacity_for_process(ctx.process());
+
+    let process = ctx.process();
+    let (pipe_read, pipe_write) = make_pipe(pipe_capacity);
+    let mut cleanup_entry = None;
+    let fds = {
+        let mut inner = process.inner_exclusive_access();
+        let read_fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
+        let previous = inner.set_fd_entry(
+            read_fd,
+            FdTableEntry::from_file(pipe_read, OpenFlags::RDONLY | pipe_flags),
+        );
+        debug_assert!(previous.is_none());
+        if let Some(write_fd) = inner.alloc_fd_from(0) {
+            let previous = inner.set_fd_entry(
+                write_fd,
+                FdTableEntry::from_file(pipe_write, OpenFlags::WRONLY | pipe_flags),
+            );
+            debug_assert!(previous.is_none());
+            Ok([read_fd, write_fd])
+        } else {
+            cleanup_entry = inner.take_fd_entry(read_fd);
+            Err(SysError::EMFILE)
+        }
+    };
+    if let Some(entry) = cleanup_entry {
+        close_detached_fd_entry(entry);
+    }
+    let fds = fds?;
+
+    if let Err(err) = write_pipefd_pair_ctx(ctx, pipefd, [fds[0] as i32, fds[1] as i32]) {
         let entries = {
             let mut inner = process.inner_exclusive_access();
             [inner.take_fd_entry(fds[0]), inner.take_fd_entry(fds[1])]
@@ -243,6 +338,15 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> SysResult {
 
 fn fcntl_dup(fd: usize, lower_bound: usize, fd_flags: FdFlags) -> SysResult {
     let process = current_process();
+    fcntl_dup_for_process(&process, fd, lower_bound, fd_flags)
+}
+
+fn fcntl_dup_for_process(
+    process: &ProcessControlBlock,
+    fd: usize,
+    lower_bound: usize,
+    fd_flags: FdFlags,
+) -> SysResult {
     let mut inner = process.inner_exclusive_access();
     if lower_bound >= inner.nofile_limit() {
         return Err(SysError::EINVAL);
@@ -338,6 +442,7 @@ pub fn sys_memfd_create(name: *const u8, flags: u32) -> SysResult {
     Ok(fd as isize)
 }
 
+#[allow(dead_code)]
 pub fn sys_fcntl(fd: usize, op: usize, arg: usize) -> SysResult {
     match op {
         F_DUPFD => fcntl_dup(fd, arg, FdFlags::empty()),
@@ -365,6 +470,55 @@ pub fn sys_fcntl(fd: usize, op: usize, arg: usize) -> SysResult {
             entry.set_status_flags(status.with_fcntl_status_flags(arg as u32));
             Ok(0)
         }
+        F_GETLK => fcntl_getlk(get_fd_entry_by_fd(fd)?, arg as *mut _),
+        F_SETLK => fcntl_setlk(get_fd_entry_by_fd(fd)?, arg as *const _),
+        F_SETLKW => fcntl_setlkw(get_fd_entry_by_fd(fd)?, arg as *const _),
+        F_OFD_GETLK => fcntl_ofd_getlk(get_fd_entry_by_fd(fd)?, arg as *mut _),
+        F_OFD_SETLK => fcntl_ofd_setlk(get_fd_entry_by_fd(fd)?, arg as *const _),
+        F_OFD_SETLKW => fcntl_ofd_setlkw(get_fd_entry_by_fd(fd)?, arg as *const _),
+        F_SETLEASE => fcntl_set_lease(fd, arg),
+        F_GETLEASE => fcntl_get_lease(fd),
+        F_GETPIPE_SZ => fcntl_get_pipe_size(fd),
+        F_SETPIPE_SZ => fcntl_set_pipe_size(fd, arg),
+        F_ADD_SEALS => fcntl_add_seals(fd, arg as u32),
+        F_GET_SEALS => fcntl_get_seals(fd),
+        _ => Err(SysError::EINVAL),
+    }
+}
+
+pub fn sys_fcntl_ctx(ctx: &SyscallContext, fd: usize, op: usize, arg: usize) -> SysResult {
+    match op {
+        F_DUPFD => fcntl_dup_for_process(ctx.process(), fd, arg, FdFlags::empty()),
+        F_DUPFD_CLOEXEC => fcntl_dup_for_process(ctx.process(), fd, arg, FdFlags::CLOEXEC),
+        F_GETFD => Ok(get_fd_entry_by_fd_for_process(ctx.process(), fd)?
+            .fd_flags()
+            .bits() as isize),
+        F_SETFD => {
+            let mut inner = ctx.process().inner_exclusive_access();
+            let entry = inner
+                .fd_table
+                .get_mut(fd)
+                .and_then(|entry| entry.as_mut())
+                .ok_or(SysError::EBADF)?;
+            entry.set_fd_flags(FdFlags::from_bits_truncate(
+                (arg as u32) & FdFlags::CLOEXEC.bits(),
+            ));
+            Ok(0)
+        }
+        F_GETFL => Ok(get_fd_entry_by_fd_for_process(ctx.process(), fd)?
+            .status_flags()
+            .bits() as isize),
+        F_SETFL => {
+            let entry = get_fd_entry_by_fd_for_process(ctx.process(), fd)?;
+            let status = entry.status_flags();
+            // UNFINISHED: O_DIRECT is recorded for fcntl compatibility, but direct-I/O
+            // alignment and cache-bypass semantics are not enforced by the filesystem layer.
+            entry.set_status_flags(status.with_fcntl_status_flags(arg as u32));
+            Ok(0)
+        }
+        // CONTEXT: POSIX/OFD lock operations may block and their user-pointer
+        // helpers still live in fd_lock.rs. Keep those on the old wrappers
+        // until the blocking lock path gets a dedicated ctx audit.
         F_GETLK => fcntl_getlk(get_fd_entry_by_fd(fd)?, arg as *mut _),
         F_SETLK => fcntl_setlk(get_fd_entry_by_fd(fd)?, arg as *const _),
         F_SETLKW => fcntl_setlkw(get_fd_entry_by_fd(fd)?, arg as *const _),

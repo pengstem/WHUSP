@@ -13,8 +13,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::task::{
-    TaskControlBlock, block_current_task_no_schedule, current_has_unmasked_signal, current_process,
-    schedule, wakeup_task,
+    ProcessControlBlock, TaskControlBlock, block_current_task_no_schedule,
+    current_has_unmasked_signal, current_process, schedule, wakeup_task,
 };
 
 pub struct Pipe {
@@ -429,7 +429,16 @@ impl PipeRingBuffer {
 /// Return (read_end, write_end)
 pub(crate) fn default_pipe_capacity_for_current_process() -> usize {
     let credentials = current_process().credentials();
-    if credentials.is_root() {
+    default_pipe_capacity_for_credentials_root(credentials.is_root())
+}
+
+pub(crate) fn default_pipe_capacity_for_process(process: &ProcessControlBlock) -> usize {
+    let credentials = process.credentials();
+    default_pipe_capacity_for_credentials_root(credentials.is_root())
+}
+
+fn default_pipe_capacity_for_credentials_root(is_root: bool) -> usize {
+    if is_root {
         PIPE_DEFAULT_CAPACITY
     } else {
         PIPE_DEFAULT_CAPACITY.min(pipe_max_size())

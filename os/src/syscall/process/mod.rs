@@ -33,7 +33,7 @@ pub use sched::{
     sys_setpriority,
 };
 pub use system::{
-    LinuxSysInfo, LinuxUtsName, sys_getrandom, sys_personality, sys_reboot, sys_sysinfo,
-    sys_syslog, sys_uname,
+    LinuxSysInfo, LinuxUtsName, sys_getrandom_ctx, sys_personality, sys_reboot, sys_sysinfo_ctx,
+    sys_syslog, sys_uname_ctx,
 };
 pub(crate) use system::{proc_sys_kernel_printk_content, write_proc_sys_kernel_printk};

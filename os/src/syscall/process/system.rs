@@ -1,6 +1,9 @@
 use crate::sbi::shutdown;
+use crate::syscall::SyscallContext;
 use crate::syscall::errno::{SysError, SysResult};
-use crate::syscall::user_ptr::{copy_to_user, write_user_value};
+use crate::syscall::user_ptr::{
+    copy_to_user, copy_to_user_ctx, write_user_value, write_user_value_ctx,
+};
 use crate::task::{current_process, current_user_token, processes_snapshot};
 use crate::timer::{get_time_clock_ticks, get_time_us};
 use alloc::format;
@@ -161,6 +164,7 @@ pub fn sys_reboot(magic: usize, magic2: usize, op: usize, _arg: usize) -> SysRes
     }
 }
 
+#[allow(dead_code)]
 pub fn sys_uname(name: *mut LinuxUtsName) -> SysResult {
     // UNFINISHED: UTS namespaces and sethostname/setdomainname are not
     // implemented. The personality support below is limited to the UNAME26
@@ -170,6 +174,16 @@ pub fn sys_uname(name: *mut LinuxUtsName) -> SysResult {
     Ok(0)
 }
 
+pub fn sys_uname_ctx(ctx: &SyscallContext, name: *mut LinuxUtsName) -> SysResult {
+    // UNFINISHED: UTS namespaces and sethostname/setdomainname are not
+    // implemented. The personality support below is limited to the UNAME26
+    // release override needed by Linux compatibility tests.
+    let uts = LinuxUtsName::current_for_personality(ctx.process().personality());
+    write_user_value_ctx(ctx, name, &uts)?;
+    Ok(0)
+}
+
+#[allow(dead_code)]
 pub fn sys_sysinfo(info: *mut LinuxSysInfo) -> SysResult {
     let value = LinuxSysInfo {
         uptime: (get_time_us() / 1_000_000) as isize,
@@ -182,6 +196,21 @@ pub fn sys_sysinfo(info: *mut LinuxSysInfo) -> SysResult {
         ..LinuxSysInfo::default()
     };
     write_user_value(current_user_token(), info, &value)?;
+    Ok(0)
+}
+
+pub fn sys_sysinfo_ctx(ctx: &SyscallContext, info: *mut LinuxSysInfo) -> SysResult {
+    let value = LinuxSysInfo {
+        uptime: (get_time_us() / 1_000_000) as isize,
+        totalram: 1024 * 1024 * 1024,
+        freeram: 900 * 1024 * 1024,
+        totalswap: 2 * 1024 * 1024 * 1024,
+        freeswap: 2 * 1024 * 1024 * 1024,
+        procs: processes_snapshot().len().min(u16::MAX as usize) as u16,
+        mem_unit: 1,
+        ..LinuxSysInfo::default()
+    };
+    write_user_value_ctx(ctx, info, &value)?;
     Ok(0)
 }
 
@@ -203,6 +232,7 @@ pub fn sys_personality(persona: usize) -> SysResult {
     Ok(old as isize)
 }
 
+#[allow(dead_code)]
 pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> SysResult {
     if flags & !GRND_SUPPORTED != 0 {
         return Err(SysError::EINVAL);
@@ -235,6 +265,42 @@ pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> SysResult {
             *byte = (state >> 32) as u8;
         }
         copy_to_user(token, buf.wrapping_add(offset), &chunk[..chunk_len])?;
+        offset += chunk_len;
+    }
+    Ok(len as isize)
+}
+
+pub fn sys_getrandom_ctx(ctx: &SyscallContext, buf: *mut u8, len: usize, flags: u32) -> SysResult {
+    if flags & !GRND_SUPPORTED != 0 {
+        return Err(SysError::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    if len > isize::MAX as usize {
+        return Err(SysError::EINVAL);
+    }
+
+    // CONTEXT: The contest kernel has no cryptographic entropy pool yet. Use a
+    // deterministic per-call generator, matching the existing /dev/urandom
+    // compatibility role well enough for libc seeding and getentropy-style
+    // small reads.
+    let mut state = (get_time_clock_ticks() as u64)
+        ^ ((ctx.process().getpid() as u64) << 32)
+        ^ (buf as usize as u64)
+        ^ (len as u64)
+        ^ (flags as u64);
+    let mut offset = 0usize;
+    while offset < len {
+        let chunk_len = (len - offset).min(GETRANDOM_CHUNK);
+        let mut chunk = [0u8; GETRANDOM_CHUNK];
+        for byte in &mut chunk[..chunk_len] {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(0x9e37_79b9_7f4a_7c15);
+            *byte = (state >> 32) as u8;
+        }
+        copy_to_user_ctx(ctx, buf.wrapping_add(offset), &chunk[..chunk_len])?;
         offset += chunk_len;
     }
     Ok(len as isize)

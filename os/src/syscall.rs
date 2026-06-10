@@ -506,7 +506,7 @@ pub(crate) fn syscall_with_context(
         ),
         SYSCALL_DUP => sys_dup(args[0]),
         SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2] as u32),
-        SYSCALL_FCNTL => sys_fcntl(args[0], args[1], args[2]),
+        SYSCALL_FCNTL => sys_fcntl_ctx(ctx, args[0], args[1], args[2]),
         SYSCALL_INOTIFY_INIT1 => sys_inotify_init1(args[0] as u32),
         SYSCALL_INOTIFY_ADD_WATCH => {
             sys_inotify_add_watch(args[0], args[1] as *const u8, args[2] as u32)
@@ -539,7 +539,7 @@ pub(crate) fn syscall_with_context(
             args[3] as *const u8,
             args[4] as u32,
         ),
-        SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2] as u32),
+        SYSCALL_GETRANDOM => sys_getrandom_ctx(ctx, args[0] as *mut u8, args[1], args[2] as u32),
         SYSCALL_MEMFD_CREATE => sys_memfd_create(args[0] as *const u8, args[1] as u32),
         SYSCALL_MEMFD_SECRET => sys_memfd_secret(args[0] as u32),
         SYSCALL_BPF => sys_bpf(args[0] as u32, args[1] as *const u8, args[2] as u32),
@@ -553,8 +553,8 @@ pub(crate) fn syscall_with_context(
             args[3],
             args[4] as *const u8,
         ),
-        SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut LinuxStatfs),
-        SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut LinuxStatfs),
+        SYSCALL_STATFS => sys_statfs_ctx(ctx, args[0] as *const u8, args[1] as *mut LinuxStatfs),
+        SYSCALL_FSTATFS => sys_fstatfs_ctx(ctx, args[0], args[1] as *mut LinuxStatfs),
         SYSCALL_TRUNCATE => sys_truncate(args[0] as *const u8, args[1]),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1]),
         SYSCALL_FALLOCATE => sys_fallocate(args[0], args[1] as u32, args[2], args[3]),
@@ -585,21 +585,22 @@ pub(crate) fn syscall_with_context(
             args[2] as u32,
             args[3] as u32,
         ),
-        SYSCALL_OPENAT2 => sys_openat2(
+        SYSCALL_OPENAT2 => sys_openat2_ctx(
+            ctx,
             args[0] as isize,
             args[1] as *const u8,
             args[2] as *const u8,
             args[3],
         ),
         SYSCALL_CLOSE => sys_close(args[0]),
-        SYSCALL_PIPE2 => sys_pipe2(args[0] as *mut i32, args[1] as u32),
+        SYSCALL_PIPE2 => sys_pipe2_ctx(ctx, args[0] as *mut i32, args[1] as u32),
         SYSCALL_QUOTACTL => sys_quotactl(
             args[0] as i32,
             args[1] as *const u8,
             args[2] as u32,
             args[3],
         ),
-        SYSCALL_GETDENTS64 => sys_getdents64(args[0], args[1] as *mut u8, args[2]),
+        SYSCALL_GETDENTS64 => sys_getdents64_ctx(ctx, args[0], args[1] as *mut u8, args[2]),
         SYSCALL_LSEEK => sys_lseek(args[0], args[1] as i64, args[2]),
         SYSCALL_READV => sys_readv_ctx(ctx, args[0], args[1] as *const LinuxIovec, args[2]),
         SYSCALL_READ => sys_read_ctx(ctx, args[0], args[1] as *const u8, args[2]),
@@ -679,7 +680,8 @@ pub(crate) fn syscall_with_context(
             args[2],
             args[3] as u32,
         ),
-        SYSCALL_READLINKAT => sys_readlinkat(
+        SYSCALL_READLINKAT => sys_readlinkat_ctx(
+            ctx,
             args[0] as isize,
             args[1] as *const u8,
             args[2] as *mut u8,
@@ -715,7 +717,8 @@ pub(crate) fn syscall_with_context(
             args[1] as *const LinuxCapUserData,
         ),
         SYSCALL_PERSONALITY => sys_personality(args[0]),
-        SYSCALL_STATX => sys_statx(
+        SYSCALL_STATX => sys_statx_ctx(
+            ctx,
             args[0] as isize,
             args[1] as *const u8,
             args[2] as i32,
@@ -888,7 +891,7 @@ pub(crate) fn syscall_with_context(
         SYSCALL_SETSID => sys_setsid(),
         SYSCALL_GETGROUPS => sys_getgroups(args[0], args[1] as *mut u32),
         SYSCALL_SETGROUPS => sys_setgroups(args[0], args[1] as *const u32),
-        SYSCALL_UNAME => sys_uname(args[0] as *mut LinuxUtsName),
+        SYSCALL_UNAME => sys_uname_ctx(ctx, args[0] as *mut LinuxUtsName),
         SYSCALL_GETRLIMIT => sys_getrlimit(args[0] as i32, args[1] as *mut RLimit),
         SYSCALL_SETRLIMIT => sys_setrlimit(args[0] as i32, args[1] as *const RLimit),
         SYSCALL_GETRUSAGE => sys_getrusage(args[0] as i32, args[1] as *mut RUsage),
@@ -904,7 +907,7 @@ pub(crate) fn syscall_with_context(
         SYSCALL_GETGID => Ok(sys_getgid()),
         SYSCALL_GETEGID => Ok(sys_getegid()),
         SYSCALL_GETTID => Ok(sys_gettid()),
-        SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut LinuxSysInfo),
+        SYSCALL_SYSINFO => sys_sysinfo_ctx(ctx, args[0] as *mut LinuxSysInfo),
         SYSCALL_MSGGET => sys_msgget(args[0] as isize, args[1] as i32),
         SYSCALL_MSGCTL => sys_msgctl(args[0], args[1] as i32, args[2]),
         SYSCALL_MSGRCV => sys_msgrcv(

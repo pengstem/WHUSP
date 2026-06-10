@@ -3,13 +3,14 @@ use super::super::errno::{SysError, SysResult};
 use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{
     PATH_MAX, UserBufferAccess, copy_to_user, copy_to_user_ctx, read_user_c_string,
-    read_user_c_string_ctx, read_user_value, translated_byte_buffer_checked,
+    read_user_c_string_ctx, read_user_value, read_user_value_ctx, translated_byte_buffer_checked,
+    translated_byte_buffer_checked_ctx,
 };
 use super::fanotify::{
     fanotify_notify_create, fanotify_notify_delete, fanotify_notify_modify, fanotify_notify_move,
     fanotify_notify_open, fanotify_notify_open_at,
 };
-use super::fd::{get_fd_entry_by_fd, get_file_by_fd, install_file_fd};
+use super::fd::{get_fd_entry_by_fd, get_file_by_fd, get_file_by_fd_for_process, install_file_fd};
 use super::inotify::{
     inotify_notify_attrib, inotify_notify_create, inotify_notify_delete, inotify_notify_modify,
     inotify_notify_move, inotify_notify_open, inotify_notify_open_at,
@@ -538,6 +539,22 @@ fn readlink_file_to_user(
     Ok(copy_len as isize)
 }
 
+fn readlink_file_to_user_ctx(
+    ctx: &SyscallContext,
+    file: Arc<dyn File + Send + Sync>,
+    buf: *mut u8,
+    bufsiz: usize,
+) -> SysResult {
+    // UNFINISHED: double-buffers through a kernel-side allocation; ideally
+    // the VFS readlink would accept a UserBuffer to write into user pages
+    // directly and avoid the extra copy.
+    let mut kernel_buf = vec![0u8; PATH_MAX];
+    let read_len = file.readlink(&mut kernel_buf)?;
+    let copy_len = read_len.min(bufsiz);
+    copy_to_user_ctx(ctx, buf, &kernel_buf[..copy_len])?;
+    Ok(copy_len as isize)
+}
+
 fn openat_dir_path(snapshot: &PathSnapshot, dirfd: isize, path: &str) -> SysResult<Option<String>> {
     if path.starts_with('/') {
         return Ok(process_global_path_for(snapshot, path));
@@ -740,6 +757,33 @@ fn read_open_how_extra_zeros(token: usize, how: *const u8, size: usize) -> SysRe
     Ok(())
 }
 
+fn read_open_how_extra_zeros_ctx(
+    ctx: &SyscallContext,
+    how: *const u8,
+    size: usize,
+) -> SysResult<()> {
+    let known_size = size_of::<LinuxOpenHow>();
+    if size <= known_size {
+        return Ok(());
+    }
+    let extra_ptr = (how as usize)
+        .checked_add(known_size)
+        .ok_or(SysError::EFAULT)? as *const u8;
+    let buffers = translated_byte_buffer_checked_ctx(
+        ctx,
+        extra_ptr,
+        size - known_size,
+        UserBufferAccess::Read,
+    )?;
+    if buffers
+        .iter()
+        .any(|buffer| buffer.iter().any(|&byte| byte != 0))
+    {
+        return Err(SysError::E2BIG);
+    }
+    Ok(())
+}
+
 fn openat2_path_escapes_beneath(path: &str) -> bool {
     if path.starts_with('/') {
         return true;
@@ -808,6 +852,7 @@ fn check_openat2_resolve(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn sys_openat2(dirfd: isize, path: *const u8, how: *const u8, size: usize) -> SysResult {
     if size < size_of::<LinuxOpenHow>() {
         return Err(SysError::EINVAL);
@@ -816,6 +861,32 @@ pub fn sys_openat2(dirfd: isize, path: *const u8, how: *const u8, size: usize) -
     let path = read_user_c_string(token, path, PATH_MAX)?;
     let how_value = read_user_value(token, how.cast::<LinuxOpenHow>())?;
     read_open_how_extra_zeros(token, how, size)?;
+    let process = current_process();
+    do_openat2_for_process(&process, dirfd, path.as_str(), how_value)
+}
+
+pub fn sys_openat2_ctx(
+    ctx: &SyscallContext,
+    dirfd: isize,
+    path: *const u8,
+    how: *const u8,
+    size: usize,
+) -> SysResult {
+    if size < size_of::<LinuxOpenHow>() {
+        return Err(SysError::EINVAL);
+    }
+    let path = read_user_c_string_ctx(ctx, path, PATH_MAX)?;
+    let how_value = read_user_value_ctx(ctx, how.cast::<LinuxOpenHow>())?;
+    read_open_how_extra_zeros_ctx(ctx, how, size)?;
+    do_openat2_for_process(ctx.process(), dirfd, path.as_str(), how_value)
+}
+
+fn do_openat2_for_process(
+    process: &ProcessControlBlock,
+    dirfd: isize,
+    path: &str,
+    how_value: LinuxOpenHow,
+) -> SysResult {
     if how_value.flags > u32::MAX as u64
         || how_value.mode & !OPENAT2_MODE_MASK != 0
         || how_value.resolve & !VALID_OPENAT2_RESOLVE_FLAGS != 0
@@ -828,16 +899,22 @@ pub fn sys_openat2(dirfd: isize, path: *const u8, how: *const u8, size: usize) -
         return Err(SysError::EINVAL);
     }
 
-    let adjusted_path = openat2_adjusted_path(path.as_str(), how_value.resolve);
-    let snapshot = current_process().path_snapshot();
+    let adjusted_path = openat2_adjusted_path(path, how_value.resolve);
+    let snapshot = process.path_snapshot();
     check_openat2_resolve(
         &snapshot,
         dirfd,
-        path.as_str(),
+        path,
         adjusted_path.as_str(),
         how_value.resolve,
     )?;
-    do_openat(dirfd, adjusted_path.as_str(), flags, how_value.mode as u32)
+    do_openat_for_process(
+        process,
+        dirfd,
+        adjusted_path.as_str(),
+        flags,
+        how_value.mode as u32,
+    )
 }
 
 pub fn sys_truncate(path: *const u8, len: usize) -> SysResult {
@@ -1220,6 +1297,7 @@ pub fn sys_symlinkat(target: *const u8, newdirfd: isize, linkpath: *const u8) ->
     Ok(0)
 }
 
+#[allow(dead_code)]
 pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize) -> SysResult {
     if bufsiz == 0 {
         return Err(SysError::EINVAL);
@@ -1245,6 +1323,38 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize
         )?
     };
     readlink_file_to_user(file, buf, bufsiz)
+}
+
+pub fn sys_readlinkat_ctx(
+    ctx: &SyscallContext,
+    dirfd: isize,
+    path: *const u8,
+    buf: *mut u8,
+    bufsiz: usize,
+) -> SysResult {
+    if bufsiz == 0 {
+        return Err(SysError::EINVAL);
+    }
+
+    let path = read_user_c_string_ctx(ctx, path, PATH_MAX)?;
+    let snapshot = ctx.process().path_snapshot();
+    let file = if path.is_empty() {
+        if dirfd == AT_FDCWD {
+            return Err(SysError::ENOENT);
+        }
+        if dirfd < 0 {
+            return Err(SysError::EBADF);
+        }
+        get_file_by_fd_for_process(ctx.process(), dirfd as usize)?
+    } else {
+        check_access_path_prefixes_for_process(ctx.process(), &snapshot, dirfd, path.as_str())?;
+        open_file_in(
+            path_context_from(&snapshot, dirfd, path.as_str())?,
+            path.as_str(),
+            OpenFlags::PATH | OpenFlags::NOFOLLOW,
+        )?
+    };
+    readlink_file_to_user_ctx(ctx, file, buf, bufsiz)
 }
 
 pub fn sys_renameat2(
@@ -1303,6 +1413,7 @@ pub fn sys_renameat2(
     Ok(0)
 }
 
+#[allow(dead_code)]
 pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> SysResult {
     if len == 0 {
         return Err(SysError::EINVAL);
@@ -1311,5 +1422,15 @@ pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> SysResult {
     let buffers =
         translated_byte_buffer_checked(token, buf.cast_const(), len, UserBufferAccess::Write)?;
     let file = get_file_by_fd(fd)?;
+    Ok(file.read_dirent64(UserBuffer::new(buffers))?)
+}
+
+pub fn sys_getdents64_ctx(ctx: &SyscallContext, fd: usize, buf: *mut u8, len: usize) -> SysResult {
+    if len == 0 {
+        return Err(SysError::EINVAL);
+    }
+    let buffers =
+        translated_byte_buffer_checked_ctx(ctx, buf.cast_const(), len, UserBufferAccess::Write)?;
+    let file = get_file_by_fd_for_process(ctx.process(), fd)?;
     Ok(file.read_dirent64(UserBuffer::new(buffers))?)
 }

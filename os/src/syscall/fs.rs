@@ -25,7 +25,9 @@ pub(crate) use fanotify::{
 };
 pub use fanotify::{sys_fanotify_init, sys_fanotify_mark};
 pub(crate) use fd::{close_detached_fd_entry, get_file_by_fd, install_file_fd};
-pub use fd::{sys_close, sys_dup, sys_dup3, sys_fcntl, sys_flock, sys_memfd_create, sys_pipe2};
+pub use fd::{
+    sys_close, sys_dup, sys_dup3, sys_fcntl_ctx, sys_flock, sys_memfd_create, sys_pipe2_ctx,
+};
 pub(crate) use fd_compat::io_uring_mmap_region;
 pub use fd_compat::{
     sys_bpf, sys_io_uring_enter, sys_io_uring_register, sys_io_uring_setup, sys_memfd_secret,
@@ -52,17 +54,17 @@ pub use mount::{
 pub(crate) use path::path_context_from;
 pub use path::{
     sys_chdir, sys_chroot, sys_faccessat, sys_faccessat2, sys_fchdir, sys_getcwd_ctx,
-    sys_getdents64, sys_linkat, sys_mkdirat, sys_mknodat, sys_openat_ctx, sys_openat2,
-    sys_readlinkat, sys_renameat2, sys_symlinkat, sys_truncate, sys_umask, sys_unlinkat,
+    sys_getdents64_ctx, sys_linkat, sys_mkdirat, sys_mknodat, sys_openat_ctx, sys_openat2_ctx,
+    sys_readlinkat_ctx, sys_renameat2, sys_symlinkat, sys_truncate, sys_umask, sys_unlinkat,
     sys_utimensat,
 };
 pub use poll::{sys_ppoll, sys_pselect6};
 pub use quota::{sys_quotactl, sys_quotactl_fd};
 pub use stat::{
     sys_fchmod, sys_fchmodat, sys_fchown, sys_fchownat, sys_fgetxattr, sys_flistxattr,
-    sys_fremovexattr, sys_fsetxattr, sys_fstat_ctx, sys_fstatfs, sys_getxattr, sys_lgetxattr,
+    sys_fremovexattr, sys_fsetxattr, sys_fstat_ctx, sys_fstatfs_ctx, sys_getxattr, sys_lgetxattr,
     sys_listxattr, sys_llistxattr, sys_lremovexattr, sys_lsetxattr, sys_newfstatat_ctx,
-    sys_removexattr, sys_setxattr, sys_statfs, sys_statx,
+    sys_removexattr, sys_setxattr, sys_statfs_ctx, sys_statx_ctx,
 };
 pub(crate) use swap::is_active_swap_file;
 pub use swap::{sys_swapoff, sys_swapon};

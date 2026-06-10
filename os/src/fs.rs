@@ -702,8 +702,10 @@ pub(crate) use mount::{
     sync_all_mounts, unmount_at,
 };
 pub(crate) use path::{PathContext, WorkingDir, normalize_path_at_root, path_inside_root};
-pub(crate) use pipe::default_pipe_capacity_for_current_process;
 pub use pipe::make_pipe;
+pub(crate) use pipe::{
+    default_pipe_capacity_for_current_process, default_pipe_capacity_for_process,
+};
 pub(crate) use procfs::{
     ProcNamespaceInfo, ProcNamespaceKind, core_pattern_for_pid, note_madvise_willneed,
     proc_namespace_info_from_path, proc_namespace_info_from_stat_ino, proc_namespace_kind_name,
