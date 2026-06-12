@@ -1,3 +1,19 @@
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub(crate) enum ProfilePoint {
+    SyscallDispatch = 0,
+    SysRead,
+    SysWrite,
+    VfsLookup,
+    Ext4Read,
+    PageFault,
+    SchedulerFetch,
+}
+
+#[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
+const PROFILE_POINT_COUNT: usize = 7;
+
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
 pub(crate) struct KernelPerfSnapshot {
@@ -262,9 +278,10 @@ pub(crate) struct KernelPerfSnapshot {
 
 #[cfg(feature = "perf-counters")]
 mod enabled {
-    use super::KernelPerfSnapshot;
+    use super::{KernelPerfSnapshot, PROFILE_POINT_COUNT, ProfilePoint};
     use alloc::format;
     use alloc::string::String;
+    use core::fmt::Write;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     static SCHEDULER_FETCH_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -534,6 +551,34 @@ mod enabled {
     static FUTEX_BUCKET_QUEUE_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
     static FUTEX_BUCKET_WAITER_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
 
+    struct TimeStat {
+        name: &'static str,
+        calls: AtomicUsize,
+        total_ticks: AtomicUsize,
+        max_ticks: AtomicUsize,
+    }
+
+    impl TimeStat {
+        const fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                calls: AtomicUsize::new(0),
+                total_ticks: AtomicUsize::new(0),
+                max_ticks: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    static TIME_STATS: [TimeStat; PROFILE_POINT_COUNT] = [
+        TimeStat::new("syscall_dispatch"),
+        TimeStat::new("sys_read"),
+        TimeStat::new("sys_write"),
+        TimeStat::new("vfs_lookup"),
+        TimeStat::new("ext4_read"),
+        TimeStat::new("page_fault"),
+        TimeStat::new("scheduler_fetch"),
+    ];
+
     fn update_max(cell: &AtomicUsize, value: usize) {
         let mut current = cell.load(Ordering::Relaxed);
         while value > current {
@@ -541,6 +586,88 @@ mod enabled {
                 Ok(_) => break,
                 Err(next) => current = next,
             }
+        }
+    }
+
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) struct ScopeTimer {
+        point: ProfilePoint,
+        start_ticks: usize,
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub(crate) fn time_scope(point: ProfilePoint) -> ScopeTimer {
+        ScopeTimer {
+            point,
+            start_ticks: crate::timer::get_time(),
+        }
+    }
+
+    impl Drop for ScopeTimer {
+        #[inline(always)]
+        fn drop(&mut self) {
+            let elapsed_ticks = crate::timer::get_time().wrapping_sub(self.start_ticks);
+            record_time(self.point, elapsed_ticks);
+        }
+    }
+
+    fn record_time(point: ProfilePoint, elapsed_ticks: usize) {
+        let stat = &TIME_STATS[point as usize];
+        stat.calls.fetch_add(1, Ordering::Relaxed);
+        stat.total_ticks.fetch_add(elapsed_ticks, Ordering::Relaxed);
+        update_max(&stat.max_ticks, elapsed_ticks);
+    }
+
+    const USEC_PER_SEC: u128 = 1_000_000;
+    const NSEC_PER_SEC: u128 = 1_000_000_000;
+
+    fn ticks_to_us(ticks: usize) -> u128 {
+        let freq = crate::config::clock_freq() as u128;
+        if freq == 0 {
+            return 0;
+        }
+        (ticks as u128) * USEC_PER_SEC / freq
+    }
+
+    fn ticks_to_ns(ticks: usize) -> u128 {
+        let freq = crate::config::clock_freq() as u128;
+        if freq == 0 {
+            return 0;
+        }
+        (ticks as u128) * NSEC_PER_SEC / freq
+    }
+
+    fn append_timing_stats(content: &mut String) {
+        content.push_str("kperf_timing_enabled 1\n");
+        for stat in &TIME_STATS {
+            let calls = stat.calls.load(Ordering::Relaxed);
+            let total_ticks = stat.total_ticks.load(Ordering::Relaxed);
+            let max_ticks = stat.max_ticks.load(Ordering::Relaxed);
+            let avg_ns = if calls == 0 {
+                0
+            } else {
+                ticks_to_ns(total_ticks) / calls as u128
+            };
+            let _ = write!(
+                content,
+                "profile_{}_calls {}\n\
+                 profile_{}_total_ticks {}\n\
+                 profile_{}_total_us {}\n\
+                 profile_{}_avg_ns {}\n\
+                 profile_{}_max_us {}\n",
+                stat.name,
+                calls,
+                stat.name,
+                total_ticks,
+                stat.name,
+                ticks_to_us(total_ticks),
+                stat.name,
+                avg_ns,
+                stat.name,
+                ticks_to_us(max_ticks),
+            );
         }
     }
 
@@ -1588,7 +1715,7 @@ mod enabled {
 
     pub(crate) fn stats_content() -> String {
         let stats = snapshot();
-        format!(
+        let mut content = format!(
             "perf_counters_enabled 1\n\
          scheduler_fetch_calls {}\n\
          scheduler_scanned_tasks {}\n\
@@ -2104,7 +2231,9 @@ mod enabled {
             stats.futex_waiter_count_max,
             stats.futex_bucket_queue_count_max,
             stats.futex_bucket_waiter_count_max,
-        )
+        );
+        append_timing_stats(&mut content);
+        content
     }
 }
 
@@ -2113,7 +2242,7 @@ pub(crate) use enabled::*;
 
 #[cfg(not(feature = "perf-counters"))]
 mod disabled {
-    use super::KernelPerfSnapshot;
+    use super::{KernelPerfSnapshot, ProfilePoint};
     use alloc::string::String;
 
     #[derive(Clone, Copy)]
@@ -2131,6 +2260,16 @@ mod disabled {
         WriteArrayItem,
         CopyToUser,
         CopyToUserInMemorySet,
+    }
+
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) struct ScopeTimer;
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub(crate) fn time_scope(_point: ProfilePoint) -> ScopeTimer {
+        ScopeTimer
     }
 
     #[inline(always)]
