@@ -165,16 +165,11 @@ impl PageCache {
 
     /// Returns a cached frame and pins it for one additional mapping.
     pub(crate) fn get_and_inc_ref(&mut self, key: PageCacheKey) -> Option<PhysPageNum> {
-        let (old_stamp, ppn) = {
-            let page = self.pages.get_mut(&key)?;
-            page.ref_count += 1;
-            (page.lru_stamp, page.ppn())
-        };
-        let stamp = self.touch(key, Some(old_stamp));
-        if let Some(page) = self.pages.get_mut(&key) {
-            page.lru_stamp = stamp;
-        }
-        Some(ppn)
+        // PERF: Mapped pages are pinned out of the clean-unpinned LRU victim
+        // set, so mmap fault hits should not rewrite LRU metadata per fault.
+        let page = self.pages.get_mut(&key)?;
+        page.ref_count += 1;
+        Some(page.ppn())
     }
 
     /// Inserts a freshly loaded file page or reuses an existing one.
@@ -188,13 +183,7 @@ impl PageCache {
     ) -> PhysPageNum {
         if let Some(page) = self.pages.get_mut(&key) {
             page.ref_count += 1;
-            let old_stamp = page.lru_stamp;
-            let ppn = page.ppn();
-            let stamp = self.touch(key, Some(old_stamp));
-            if let Some(page) = self.pages.get_mut(&key) {
-                page.lru_stamp = stamp;
-            }
-            return ppn;
+            return page.ppn();
         }
         let mut page = PageCachePage::new(frame, key, file_size_at_load);
         page.ref_count = 1;
