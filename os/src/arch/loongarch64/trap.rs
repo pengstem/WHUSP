@@ -236,17 +236,14 @@ pub(crate) fn handle_user_page_fault(addr: usize, access: MmapFaultAccess) -> bo
             return true;
         }
     }
-    {
-        let _lazy_scope = perf::time_scope(perf::ProfilePoint::PageFaultLazyFramed);
-        if current_process()
-            .inner_exclusive_access()
-            .memory_set
-            .resolve_lazy_framed_page_fault(addr, access)
-        {
-            return true;
-        }
+    if handle_mmap_page_fault(addr, access) {
+        return true;
     }
-    handle_mmap_page_fault(addr, access)
+    let _lazy_scope = perf::time_scope(perf::ProfilePoint::PageFaultLazyFramed);
+    current_process()
+        .inner_exclusive_access()
+        .memory_set
+        .resolve_lazy_framed_page_fault(addr, access)
 }
 
 pub(crate) fn handle_mmap_page_fault(addr: usize, access: MmapFaultAccess) -> bool {
