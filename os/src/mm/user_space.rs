@@ -144,6 +144,7 @@ impl MmapFaultPage {
         {
             let end = self.dst_offset.checked_add(self.read_len)?;
             let dst = frame.ppn.get_bytes_array().get_mut(self.dst_offset..end)?;
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::MmapFaultRead);
             read_len = file.read_at(self.file_offset, dst);
         }
         if full_file_overwrite && read_len < PAGE_SIZE {
@@ -213,6 +214,7 @@ impl MmapPageCacheFault {
         let mut read_len = 0usize;
         if self.read_len > 0 {
             let dst = &mut frame.ppn.get_bytes_array()[..self.read_len];
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::MmapPageCacheFill);
             read_len = self.backing_file.read_at(self.file_offset, dst);
         }
         if full_file_overwrite && read_len < PAGE_SIZE {

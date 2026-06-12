@@ -896,7 +896,11 @@ impl VfsFile {
         let mut data = Vec::new();
         perf::record_vfs_read_all_call();
         loop {
-            let len = self.read_backend_at(*offset, &mut buffer);
+            let len = self.read_backend_at_profiled(
+                *offset,
+                &mut buffer,
+                perf::ProfilePoint::VfsReadAllBackend,
+            );
             if len == 0 {
                 break;
             }
@@ -1035,7 +1039,13 @@ impl VfsFile {
         total_write_size
     }
 
-    fn read_backend_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+    fn read_backend_at_profiled(
+        &self,
+        offset: usize,
+        buf: &mut [u8],
+        point: perf::ProfilePoint,
+    ) -> usize {
+        let _profile_scope = perf::time_scope(point);
         let Some(read_size) = with_mount(self.node.mount_id, |mount| {
             mount.read_at(self.node.ino, buf, offset as u64)
         }) else {
@@ -1054,6 +1064,10 @@ impl VfsFile {
             };
         perf::record_vfs_read_backend(read_size);
         read_size
+    }
+
+    fn read_backend_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        self.read_backend_at_profiled(offset, buf, perf::ProfilePoint::VfsReadBackend)
     }
 
     fn read_snapshot_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
@@ -1135,7 +1149,11 @@ impl VfsFile {
             if read_limit == 0 {
                 break;
             }
-            let read_size = self.read_backend_at(*offset, &mut bounce[..read_limit]);
+            let read_size = self.read_backend_at_profiled(
+                *offset,
+                &mut bounce[..read_limit],
+                perf::ProfilePoint::VfsReadCoalescedBackend,
+            );
             if read_size == 0 {
                 break;
             }
@@ -1247,6 +1265,7 @@ impl VfsFile {
             let block_end = block_start.saturating_add(block_size).min(size);
             let valid_len = block_end - block_start;
             buf[..valid_len].fill(0);
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsSeekScanRead);
             let read_len = with_mount(self.node.mount_id, |mount| {
                 mount.read_at(self.node.ino, &mut buf[..valid_len], block_start as u64)
             })
@@ -1385,6 +1404,7 @@ impl VfsFile {
             let read_limit = (readahead_pages * PAGE_SIZE).min(file_size - page_start);
             let mut read_buf = vec![0u8; read_limit];
 
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsReadCacheFill);
             let read_len = with_mount(self.node.mount_id, |mount| {
                 mount.read_at(self.node.ino, read_buf.as_mut_slice(), page_start as u64)
             })

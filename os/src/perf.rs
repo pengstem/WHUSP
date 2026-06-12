@@ -9,10 +9,17 @@ pub(crate) enum ProfilePoint {
     Ext4Read,
     PageFault,
     SchedulerFetch,
+    VfsReadBackend,
+    VfsReadAllBackend,
+    VfsReadCoalescedBackend,
+    VfsReadCacheFill,
+    VfsSeekScanRead,
+    MmapFaultRead,
+    MmapPageCacheFill,
 }
 
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
-const PROFILE_POINT_COUNT: usize = 7;
+const PROFILE_POINT_COUNT: usize = 14;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
@@ -577,6 +584,13 @@ mod enabled {
         TimeStat::new("ext4_read"),
         TimeStat::new("page_fault"),
         TimeStat::new("scheduler_fetch"),
+        TimeStat::new("vfs_read_backend"),
+        TimeStat::new("vfs_read_all_backend"),
+        TimeStat::new("vfs_read_coalesced_backend"),
+        TimeStat::new("vfs_read_cache_fill"),
+        TimeStat::new("vfs_seek_scan_read"),
+        TimeStat::new("mmap_fault_read"),
+        TimeStat::new("mmap_page_cache_fill"),
     ];
 
     fn update_max(cell: &AtomicUsize, value: usize) {
