@@ -1070,6 +1070,15 @@ impl VfsFile {
         self.read_backend_at_profiled(offset, buf, perf::ProfilePoint::VfsReadBackend)
     }
 
+    fn read_backend_at_preserve_noatime(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let noatime_snapshot = self.noatime_snapshot();
+        let read_size = self.read_backend_at(offset, buf);
+        if !buf.is_empty() {
+            self.restore_noatime(noatime_snapshot);
+        }
+        read_size
+    }
+
     fn read_snapshot_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
         if !self.read_snapshot_supported {
             return None;
@@ -1129,7 +1138,7 @@ impl VfsFile {
         {
             return None;
         }
-        let stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))?.ok()?;
+        let stat = with_mount(self.node.mount_id, |mount| mount.stat_basic(self.node.ino))?.ok()?;
         let file_size = stat.size as usize;
         if self.read_cache_id_for_size(file_size).is_some() {
             return None;
@@ -1149,11 +1158,13 @@ impl VfsFile {
             if read_limit == 0 {
                 break;
             }
+            let noatime_snapshot = self.noatime_snapshot();
             let read_size = self.read_backend_at_profiled(
                 *offset,
                 &mut bounce[..read_limit],
                 perf::ProfilePoint::VfsReadCoalescedBackend,
             );
+            self.restore_noatime(noatime_snapshot);
             if read_size == 0 {
                 break;
             }
@@ -1179,7 +1190,7 @@ impl VfsFile {
         {
             return None;
         }
-        let stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))?.ok()?;
+        let stat = with_mount(self.node.mount_id, |mount| mount.stat_basic(self.node.ino))?.ok()?;
         Some((
             FileTimestamp {
                 sec: stat.atime_sec,
@@ -1350,23 +1361,19 @@ impl VfsFile {
         if buf.is_empty() {
             return Some(0);
         }
-        let stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))?.ok()?;
-        let file_size = stat.size as usize;
-        let id = self.read_cache_id_for_size(file_size)?;
+        if dirty_regular_file_has_pages(self.node) {
+            perf::record_vfs_read_cache_skip_dirty_pages();
+            return None;
+        }
+        let id = self.cached_page_cache_id()?;
+        let mut cached_file_size = None;
         let mut total_read_size = 0usize;
 
         while total_read_size < buf.len() {
             let file_offset = offset.checked_add(total_read_size)?;
-            if file_offset >= file_size {
-                break;
-            }
             let page_start = file_offset / PAGE_SIZE * PAGE_SIZE;
             let page_offset = file_offset - page_start;
-            let valid_len = PAGE_SIZE.min(file_size - page_start);
-            if page_offset >= valid_len {
-                break;
-            }
-            let copy_len = (buf.len() - total_read_size).min(valid_len - page_offset);
+            let copy_len = (buf.len() - total_read_size).min(PAGE_SIZE - page_offset);
             let key = PageCacheKey {
                 id,
                 page_index: page_start / PAGE_SIZE,
@@ -1378,11 +1385,34 @@ impl VfsFile {
                 copy_len,
                 &mut buf[total_read_size..total_read_size + copy_len],
             ) {
+                if read_size == 0 {
+                    break;
+                }
                 total_read_size += read_size;
                 perf::record_vfs_read_cache_hit(read_size);
                 continue;
             }
 
+            let file_size = match cached_file_size {
+                Some(file_size) => file_size,
+                None => {
+                    let stat =
+                        with_mount(self.node.mount_id, |mount| mount.stat_basic(self.node.ino))?
+                            .ok()?;
+                    let file_size = stat.size as usize;
+                    self.read_cache_id_for_size(file_size)?;
+                    cached_file_size = Some(file_size);
+                    file_size
+                }
+            };
+            if file_offset >= file_size {
+                break;
+            }
+            let valid_len = PAGE_SIZE.min(file_size - page_start);
+            if page_offset >= valid_len {
+                break;
+            }
+            let copy_len = (buf.len() - total_read_size).min(valid_len - page_offset);
             perf::record_vfs_read_cache_miss();
             let max_readahead_pages =
                 ((file_size - page_start).div_ceil(PAGE_SIZE)).min(VFS_READ_CACHE_READAHEAD_PAGES);
@@ -1404,11 +1434,13 @@ impl VfsFile {
             let read_limit = (readahead_pages * PAGE_SIZE).min(file_size - page_start);
             let mut read_buf = vec![0u8; read_limit];
 
+            let noatime_snapshot = self.noatime_snapshot();
             let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsReadCacheFill);
             let read_len = with_mount(self.node.mount_id, |mount| {
                 mount.read_at(self.node.ino, read_buf.as_mut_slice(), page_start as u64)
             })
             .expect("filesystem mount is missing");
+            self.restore_noatime(noatime_snapshot);
             perf::record_vfs_read_cache_backend_read();
             if read_len == 0 || page_offset >= read_len {
                 break;
@@ -2021,8 +2053,6 @@ impl File for VfsFile {
         if self.kind == FsNodeKind::Directory {
             return 0;
         }
-        let requested_len = buf.len();
-        let noatime_snapshot = self.noatime_snapshot();
         let mut offset = self.offset.lock();
         let mut total_read_size = 0usize;
         let has_dirty_pages = dirty_regular_file_has_pages(self.node);
@@ -2040,7 +2070,7 @@ impl File for VfsFile {
                     self.read_snapshot_at(*offset, slice)
                 })
                 .or_else(|| self.read_regular_cached_at(*offset, slice))
-                .unwrap_or_else(|| self.read_backend_at(*offset, slice));
+                .unwrap_or_else(|| self.read_backend_at_preserve_noatime(*offset, slice));
                 if read_size == 0 {
                     break;
                 }
@@ -2049,9 +2079,6 @@ impl File for VfsFile {
             }
         }
         drop(offset);
-        if requested_len > 0 {
-            self.restore_noatime(noatime_snapshot);
-        }
         total_read_size
     }
 
@@ -2077,7 +2104,6 @@ impl File for VfsFile {
         if self.kind == FsNodeKind::Directory {
             return 0;
         }
-        let noatime_snapshot = self.noatime_snapshot();
         let has_dirty_pages = dirty_regular_file_has_pages(self.node);
         let read_size = (if has_dirty_pages {
             None
@@ -2085,10 +2111,7 @@ impl File for VfsFile {
             self.read_snapshot_at(offset, buf)
         })
         .or_else(|| self.read_regular_cached_at(offset, buf))
-        .unwrap_or_else(|| self.read_backend_at(offset, buf));
-        if !buf.is_empty() {
-            self.restore_noatime(noatime_snapshot);
-        }
+        .unwrap_or_else(|| self.read_backend_at_preserve_noatime(offset, buf));
         read_size
     }
 

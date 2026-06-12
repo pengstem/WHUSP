@@ -278,7 +278,17 @@ impl PageCache {
             if page.ref_count != 0 || page.dirty || page_offset >= PAGE_SIZE {
                 return None;
             }
-            let len = len.min(PAGE_SIZE - page_offset).min(dst.len());
+            let page_valid_len = page
+                .file_size_at_load
+                .saturating_sub(key.file_offset())
+                .min(PAGE_SIZE);
+            if page_offset >= page_valid_len {
+                return Some(0);
+            }
+            let len = len
+                .min(page_valid_len - page_offset)
+                .min(PAGE_SIZE - page_offset)
+                .min(dst.len());
             dst[..len]
                 .copy_from_slice(&page.ppn().get_bytes_array()[page_offset..page_offset + len]);
             (page.lru_stamp, len)
