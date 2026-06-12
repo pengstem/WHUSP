@@ -81,6 +81,15 @@ impl PageCachePage {
     pub(crate) fn ppn(&self) -> PhysPageNum {
         self.frame.ppn
     }
+
+    fn ensure_exec_icache_synced(&mut self) {
+        if self.exec_icache_synced {
+            return;
+        }
+        crate::arch::mm::publish_pte_barrier();
+        crate::arch::mm::instruction_barrier();
+        self.exec_icache_synced = true;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -114,19 +123,6 @@ impl PageCache {
 
     pub(crate) fn contains(&self, key: PageCacheKey) -> bool {
         self.pages.contains_key(&key)
-    }
-
-    pub(crate) fn ensure_exec_icache_synced(&mut self, key: PageCacheKey) -> bool {
-        let Some(page) = self.pages.get_mut(&key) else {
-            return false;
-        };
-        if page.exec_icache_synced {
-            return true;
-        }
-        crate::arch::mm::publish_pte_barrier();
-        crate::arch::mm::instruction_barrier();
-        page.exec_icache_synced = true;
-        true
     }
 
     fn touch(&mut self, key: PageCacheKey, old_stamp: Option<usize>) -> usize {
@@ -172,6 +168,21 @@ impl PageCache {
         Some(page.ppn())
     }
 
+    pub(crate) fn get_and_inc_ref_for_mmap(
+        &mut self,
+        key: PageCacheKey,
+        exec_fault: bool,
+    ) -> Option<PhysPageNum> {
+        // PERF: mmap exec faults are mostly page-cache hits. Fold the icache
+        // sync check into the same tree lookup used to pin the cached frame.
+        let page = self.pages.get_mut(&key)?;
+        page.ref_count += 1;
+        if exec_fault {
+            page.ensure_exec_icache_synced();
+        }
+        Some(page.ppn())
+    }
+
     /// Inserts a freshly loaded file page or reuses an existing one.
     ///
     /// The returned PPN is pinned for the caller's mapping in both cases.
@@ -187,6 +198,31 @@ impl PageCache {
         }
         let mut page = PageCachePage::new(frame, key, file_size_at_load);
         page.ref_count = 1;
+        let ppn = page.ppn();
+        page.lru_stamp = self.touch(key, None);
+        self.pages.insert(key, page);
+        ppn
+    }
+
+    pub(crate) fn insert_loaded_page_and_inc_ref_for_mmap(
+        &mut self,
+        key: PageCacheKey,
+        frame: FrameTracker,
+        file_size_at_load: usize,
+        exec_fault: bool,
+    ) -> PhysPageNum {
+        if let Some(page) = self.pages.get_mut(&key) {
+            page.ref_count += 1;
+            if exec_fault {
+                page.ensure_exec_icache_synced();
+            }
+            return page.ppn();
+        }
+        let mut page = PageCachePage::new(frame, key, file_size_at_load);
+        page.ref_count = 1;
+        if exec_fault {
+            page.ensure_exec_icache_synced();
+        }
         let ppn = page.ppn();
         page.lru_stamp = self.touch(key, None);
         self.pages.insert(key, page);

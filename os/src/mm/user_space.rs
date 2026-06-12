@@ -115,18 +115,32 @@ pub struct MmapFaultPage {
 }
 
 impl MmapFaultPage {
+    fn file_zero_bytes_needed(&self, read_len: usize) -> Option<usize> {
+        if self.backing_file.is_none() {
+            return Some(0);
+        }
+        if self.read_len == 0 {
+            return Some(PAGE_SIZE);
+        }
+        let read_len = read_len.min(self.read_len);
+        let read_end = self.dst_offset.checked_add(read_len)?;
+        (read_end <= PAGE_SIZE).then_some(self.dst_offset + (PAGE_SIZE - read_end))
+    }
+
     /// Allocates and optionally fills the private frame for a mmap fault.
     ///
     /// The returned frame is not installed into any page table yet; callers
     /// must revalidate the VMA and install it through `MemorySet`.
     pub fn build_frame(&self) -> Option<FrameTracker> {
+        let file_backed = self.backing_file.is_some();
+        let file_fill = file_backed && self.read_len > 0;
         let full_file_overwrite = self.backing_file.is_some()
             && self.dst_offset == 0
             && self.read_len == PAGE_SIZE
             && self.zero_fill_len == 0;
         let alloc_frame = || {
             let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocMmapPrivate);
-            if full_file_overwrite {
+            if file_fill {
                 frame_alloc_uninit()
             } else {
                 frame_alloc()
@@ -146,11 +160,25 @@ impl MmapFaultPage {
             let end = self.dst_offset.checked_add(self.read_len)?;
             let dst = frame.ppn.get_bytes_array().get_mut(self.dst_offset..end)?;
             let _profile_scope = perf::time_scope(perf::ProfilePoint::MmapFaultRead);
-            read_len = file.read_at(self.file_offset, dst);
+            read_len = file.read_at(self.file_offset, dst).min(self.read_len);
         }
-        if full_file_overwrite && read_len < PAGE_SIZE {
-            frame.ppn.get_bytes_array()[read_len..].fill(0);
+        if file_fill {
+            let read_end = self.dst_offset.checked_add(read_len)?;
+            let bytes = frame.ppn.get_bytes_array();
+            if self.dst_offset > 0 {
+                bytes[..self.dst_offset].fill(0);
+            }
+            if read_end < PAGE_SIZE {
+                bytes[read_end..].fill(0);
+            }
         }
+        perf::record_mmap_private_fault(
+            file_backed,
+            full_file_overwrite,
+            self.read_len,
+            read_len,
+            self.file_zero_bytes_needed(read_len)?,
+        );
         if self.exec_fault {
             super::elf_loader::record_exec_lazy_fault(
                 read_len,
@@ -188,16 +216,7 @@ impl MmapPageCacheFault {
     pub fn resolve_ppn(&self) -> Option<PhysPageNum> {
         let cached_ppn = {
             let mut cache = PAGE_CACHE.exclusive_access();
-            if let Some(ppn) = cache.get_and_inc_ref(self.key) {
-                if self.exec_fault && !cache.ensure_exec_icache_synced(self.key) {
-                    cache.dec_ref(self.key);
-                    None
-                } else {
-                    Some(ppn)
-                }
-            } else {
-                None
-            }
+            cache.get_and_inc_ref_for_mmap(self.key, self.exec_fault)
         };
         if let Some(ppn) = cached_ppn {
             if self.exec_fault {
@@ -206,9 +225,9 @@ impl MmapPageCacheFault {
             return Some(ppn);
         }
 
-        let full_file_overwrite = self.read_len == PAGE_SIZE;
+        let file_fill = self.read_len > 0;
         let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocMmapPageCache);
-        let frame = if full_file_overwrite {
+        let frame = if file_fill {
             frame_alloc_uninit()?
         } else {
             frame_alloc()?
@@ -217,18 +236,22 @@ impl MmapPageCacheFault {
         if self.read_len > 0 {
             let dst = &mut frame.ppn.get_bytes_array()[..self.read_len];
             let _profile_scope = perf::time_scope(perf::ProfilePoint::MmapPageCacheFill);
-            read_len = self.backing_file.read_at(self.file_offset, dst);
+            read_len = self
+                .backing_file
+                .read_at(self.file_offset, dst)
+                .min(self.read_len);
         }
-        if full_file_overwrite && read_len < PAGE_SIZE {
+        if file_fill && read_len < PAGE_SIZE {
             frame.ppn.get_bytes_array()[read_len..].fill(0);
         }
 
         let mut cache = PAGE_CACHE.exclusive_access();
-        let ppn = cache.insert_loaded_page_and_inc_ref(self.key, frame, self.file_size_at_load);
-        if self.exec_fault && !cache.ensure_exec_icache_synced(self.key) {
-            cache.dec_ref(self.key);
-            return None;
-        }
+        let ppn = cache.insert_loaded_page_and_inc_ref_for_mmap(
+            self.key,
+            frame,
+            self.file_size_at_load,
+            self.exec_fault,
+        );
         if self.exec_fault {
             super::elf_loader::record_exec_lazy_page_cache_fault(false, read_len);
         }

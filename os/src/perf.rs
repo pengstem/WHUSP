@@ -187,6 +187,15 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) frame_alloc_zeroed_bytes: usize,
     pub(crate) frame_alloc_uninit_calls: usize,
     pub(crate) frame_alloc_uninit_saved_bytes: usize,
+    pub(crate) mmap_private_faults: usize,
+    pub(crate) mmap_private_anon_faults: usize,
+    pub(crate) mmap_private_file_faults: usize,
+    pub(crate) mmap_private_full_file_pages: usize,
+    pub(crate) mmap_private_partial_file_pages: usize,
+    pub(crate) mmap_private_zero_file_pages: usize,
+    pub(crate) mmap_private_read_request_bytes: usize,
+    pub(crate) mmap_private_read_bytes: usize,
+    pub(crate) mmap_private_file_zero_bytes_needed: usize,
     pub(crate) frame_dealloc_calls: usize,
     pub(crate) frame_dealloc_released: usize,
     pub(crate) frame_dealloc_refcount_drops: usize,
@@ -458,6 +467,15 @@ mod enabled {
     static FRAME_ALLOC_ZEROED_BYTES: AtomicUsize = AtomicUsize::new(0);
     static FRAME_ALLOC_UNINIT_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FRAME_ALLOC_UNINIT_SAVED_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static MMAP_PRIVATE_FAULTS: AtomicUsize = AtomicUsize::new(0);
+    static MMAP_PRIVATE_ANON_FAULTS: AtomicUsize = AtomicUsize::new(0);
+    static MMAP_PRIVATE_FILE_FAULTS: AtomicUsize = AtomicUsize::new(0);
+    static MMAP_PRIVATE_FULL_FILE_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static MMAP_PRIVATE_PARTIAL_FILE_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static MMAP_PRIVATE_ZERO_FILE_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static MMAP_PRIVATE_READ_REQUEST_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static MMAP_PRIVATE_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static MMAP_PRIVATE_FILE_ZERO_BYTES_NEEDED: AtomicUsize = AtomicUsize::new(0);
     static FRAME_DEALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FRAME_DEALLOC_RELEASED: AtomicUsize = AtomicUsize::new(0);
     static FRAME_DEALLOC_REFCOUNT_DROPS: AtomicUsize = AtomicUsize::new(0);
@@ -1170,6 +1188,31 @@ mod enabled {
         }
     }
 
+    pub(crate) fn record_mmap_private_fault(
+        file_backed: bool,
+        full_file_overwrite: bool,
+        read_request_bytes: usize,
+        read_bytes: usize,
+        file_zero_bytes_needed: usize,
+    ) {
+        MMAP_PRIVATE_FAULTS.fetch_add(1, Ordering::Relaxed);
+        if !file_backed {
+            MMAP_PRIVATE_ANON_FAULTS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        MMAP_PRIVATE_FILE_FAULTS.fetch_add(1, Ordering::Relaxed);
+        if read_request_bytes == 0 {
+            MMAP_PRIVATE_ZERO_FILE_PAGES.fetch_add(1, Ordering::Relaxed);
+        } else if full_file_overwrite {
+            MMAP_PRIVATE_FULL_FILE_PAGES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            MMAP_PRIVATE_PARTIAL_FILE_PAGES.fetch_add(1, Ordering::Relaxed);
+        }
+        MMAP_PRIVATE_READ_REQUEST_BYTES.fetch_add(read_request_bytes, Ordering::Relaxed);
+        MMAP_PRIVATE_READ_BYTES.fetch_add(read_bytes, Ordering::Relaxed);
+        MMAP_PRIVATE_FILE_ZERO_BYTES_NEEDED.fetch_add(file_zero_bytes_needed, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_frame_dealloc(
         released: bool,
         refcount_drop: bool,
@@ -1724,6 +1767,18 @@ mod enabled {
             frame_alloc_zeroed_bytes: FRAME_ALLOC_ZEROED_BYTES.load(Ordering::Relaxed),
             frame_alloc_uninit_calls: FRAME_ALLOC_UNINIT_CALLS.load(Ordering::Relaxed),
             frame_alloc_uninit_saved_bytes: FRAME_ALLOC_UNINIT_SAVED_BYTES.load(Ordering::Relaxed),
+            mmap_private_faults: MMAP_PRIVATE_FAULTS.load(Ordering::Relaxed),
+            mmap_private_anon_faults: MMAP_PRIVATE_ANON_FAULTS.load(Ordering::Relaxed),
+            mmap_private_file_faults: MMAP_PRIVATE_FILE_FAULTS.load(Ordering::Relaxed),
+            mmap_private_full_file_pages: MMAP_PRIVATE_FULL_FILE_PAGES.load(Ordering::Relaxed),
+            mmap_private_partial_file_pages: MMAP_PRIVATE_PARTIAL_FILE_PAGES
+                .load(Ordering::Relaxed),
+            mmap_private_zero_file_pages: MMAP_PRIVATE_ZERO_FILE_PAGES.load(Ordering::Relaxed),
+            mmap_private_read_request_bytes: MMAP_PRIVATE_READ_REQUEST_BYTES
+                .load(Ordering::Relaxed),
+            mmap_private_read_bytes: MMAP_PRIVATE_READ_BYTES.load(Ordering::Relaxed),
+            mmap_private_file_zero_bytes_needed: MMAP_PRIVATE_FILE_ZERO_BYTES_NEEDED
+                .load(Ordering::Relaxed),
             frame_dealloc_calls: FRAME_DEALLOC_CALLS.load(Ordering::Relaxed),
             frame_dealloc_released: FRAME_DEALLOC_RELEASED.load(Ordering::Relaxed),
             frame_dealloc_refcount_drops: FRAME_DEALLOC_REFCOUNT_DROPS.load(Ordering::Relaxed),
@@ -2008,6 +2063,15 @@ mod enabled {
          frame_alloc_zeroed_bytes {}\n\
          frame_alloc_uninit_calls {}\n\
          frame_alloc_uninit_saved_bytes {}\n\
+         mmap_private_faults {}\n\
+         mmap_private_anon_faults {}\n\
+         mmap_private_file_faults {}\n\
+         mmap_private_full_file_pages {}\n\
+         mmap_private_partial_file_pages {}\n\
+         mmap_private_zero_file_pages {}\n\
+         mmap_private_read_request_bytes {}\n\
+         mmap_private_read_bytes {}\n\
+         mmap_private_file_zero_bytes_needed {}\n\
          frame_dealloc_calls {}\n\
          frame_dealloc_released {}\n\
          frame_dealloc_refcount_drops {}\n\
@@ -2265,6 +2329,15 @@ mod enabled {
             stats.frame_alloc_zeroed_bytes,
             stats.frame_alloc_uninit_calls,
             stats.frame_alloc_uninit_saved_bytes,
+            stats.mmap_private_faults,
+            stats.mmap_private_anon_faults,
+            stats.mmap_private_file_faults,
+            stats.mmap_private_full_file_pages,
+            stats.mmap_private_partial_file_pages,
+            stats.mmap_private_zero_file_pages,
+            stats.mmap_private_read_request_bytes,
+            stats.mmap_private_read_bytes,
+            stats.mmap_private_file_zero_bytes_needed,
             stats.frame_dealloc_calls,
             stats.frame_dealloc_released,
             stats.frame_dealloc_refcount_drops,
@@ -2675,6 +2748,16 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_frame_alloc(_zeroed: bool) {}
+
+    #[inline(always)]
+    pub(crate) fn record_mmap_private_fault(
+        _file_backed: bool,
+        _full_file_overwrite: bool,
+        _read_request_bytes: usize,
+        _read_bytes: usize,
+        _file_zero_bytes_needed: usize,
+    ) {
+    }
 
     #[inline(always)]
     pub(crate) fn record_frame_dealloc(
