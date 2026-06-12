@@ -125,6 +125,7 @@ impl MmapFaultPage {
             && self.read_len == PAGE_SIZE
             && self.zero_fill_len == 0;
         let alloc_frame = || {
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocMmapPrivate);
             if full_file_overwrite {
                 frame_alloc_uninit()
             } else {
@@ -206,6 +207,7 @@ impl MmapPageCacheFault {
         }
 
         let full_file_overwrite = self.read_len == PAGE_SIZE;
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocMmapPageCache);
         let frame = if full_file_overwrite {
             frame_alloc_uninit()?
         } else {
@@ -468,6 +470,7 @@ impl MemorySet {
             if self.translate(vpn).is_some_and(|pte| pte.bits != 0) {
                 continue;
             }
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocSharedAnon);
             let Some(frame) = frame_alloc() else {
                 return false;
             };
@@ -528,10 +531,6 @@ impl MemorySet {
     }
 
     pub fn resolve_lazy_framed_page_fault(&mut self, addr: usize, access: MmapFaultAccess) -> bool {
-        if addr < self.brk_base || addr >= self.brk_mapped_end {
-            return false;
-        }
-
         let vpn = VirtAddr::from(addr).floor();
 
         let Some(area_idx) = self.find_area_idx_containing(vpn) else {
@@ -541,6 +540,7 @@ impl MemorySet {
         if area.is_mmap()
             || area.is_shm()
             || area.map_type != MapType::Framed
+            || !area.map_perm.contains(MapPermission::U)
             || !access.is_allowed_by(area.map_perm)
         {
             return false;
@@ -556,7 +556,11 @@ impl MemorySet {
             return false;
         }
 
-        let Some(frame) = frame_alloc() else {
+        let frame = {
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocLazyFramed);
+            frame_alloc()
+        };
+        let Some(frame) = frame else {
             return false;
         };
         let page_table = &mut self.page_table;
@@ -564,7 +568,9 @@ impl MemorySet {
         if !area.map_existing_frame(page_table, vpn, frame) {
             return false;
         }
-        perf::record_brk_lazy_fault_page();
+        if addr >= self.brk_base && addr < self.brk_mapped_end {
+            perf::record_brk_lazy_fault_page();
+        }
         true
     }
 

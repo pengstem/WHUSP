@@ -308,13 +308,17 @@ fn write_user_stack(
 }
 
 pub(super) fn init_user_stack(
-    token: usize,
+    memory_set: &mut MemorySet,
     stack_top: usize,
     args: &[String],
     envs: &[String],
     stack_info: &ExecStackInfo,
 ) -> SysResult<(usize, usize, usize)> {
     let layout = plan_user_stack(stack_top, args, envs, stack_info)?;
+    if !memory_set.materialize_framed_range(layout.user_sp, stack_top) {
+        return Err(SysError::ENOMEM);
+    }
+    let token = memory_set.token();
     write_user_stack(token, &layout, args, envs)?;
     Ok((layout.user_sp, layout.argv_base, layout.envp_base))
 }
@@ -421,6 +425,11 @@ impl ProcessControlBlock {
         };
         task_inner.trap_cx_ppn = trap_cx_ppn;
         debug_assert_eq!(user_stack_top, expected_user_stack_top);
+        self.inner_exclusive_access()
+            .memory_set
+            .materialize_framed_range(stack_layout.user_sp, user_stack_top)
+            .then_some(())
+            .ok_or(SysError::ENOMEM)?;
         write_user_stack(new_token, &stack_layout, &args, &envs)?;
         let user_sp = stack_layout.user_sp;
 

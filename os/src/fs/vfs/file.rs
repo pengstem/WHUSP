@@ -1429,6 +1429,7 @@ impl VfsFile {
                 let frame = if page_valid_len == PAGE_SIZE {
                     frame_alloc_uninit()
                 } else {
+                    let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocReadCache);
                     frame_alloc()
                 };
                 let Some(frame) = frame else {

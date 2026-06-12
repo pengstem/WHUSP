@@ -195,14 +195,11 @@ impl TaskUserRes {
         let mut process_inner = process.inner_exclusive_access();
         self.user_stack_allocated = allocate_user_stack;
         if allocate_user_stack {
-            // alloc user stack
-            // UNFINISHED: Linux user stacks grow on demand up to the rlimit. This
-            // kernel does not have a general stack-growth fault path yet, so map
-            // the bounded contest stack eagerly while preserving virtual stack
-            // spacing between threads.
+            // Reserve the bounded contest stack VMA. Pages are materialized by
+            // exec stack setup or by the lazy framed page-fault path.
             let ustack_bottom = ustack_mapped_bottom_from_tid(self.ustack_base, self.tid);
             let ustack_top = ustack_bottom_from_tid(self.ustack_base, self.tid) + USER_STACK_SIZE;
-            process_inner.memory_set.insert_framed_area(
+            process_inner.memory_set.insert_lazy_framed_area(
                 ustack_bottom.into(),
                 ustack_top.into(),
                 MapPermission::R | MapPermission::W | MapPermission::U,

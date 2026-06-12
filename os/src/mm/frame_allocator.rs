@@ -12,6 +12,7 @@ pub struct FrameTracker {
 
 impl FrameTracker {
     pub fn new_zeroed(ppn: PhysPageNum) -> Self {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameZeroFill);
         ppn.get_bytes_array().fill(0);
         perf::record_frame_alloc(true);
         Self { ppn }
@@ -180,6 +181,7 @@ pub fn init_frame_allocator() {
 }
 
 pub fn frame_alloc() -> Option<FrameTracker> {
+    let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocZeroed);
     FRAME_ALLOCATOR
         .exclusive_access()
         .alloc()
@@ -187,6 +189,7 @@ pub fn frame_alloc() -> Option<FrameTracker> {
 }
 
 pub fn frame_alloc_uninit() -> Option<FrameTracker> {
+    let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocUninit);
     FRAME_ALLOCATOR
         .exclusive_access()
         .alloc()
@@ -198,6 +201,7 @@ pub fn frame_alloc_uninit() -> Option<FrameTracker> {
 /// This path intentionally does not satisfy requests from recycled single
 /// pages; callers such as VirtIO pass the first physical address to hardware.
 pub fn frame_alloc_more(num: usize) -> Option<Vec<FrameTracker>> {
+    let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocDma);
     FRAME_ALLOCATOR
         .exclusive_access()
         .alloc_more(num)

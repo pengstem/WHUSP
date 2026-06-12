@@ -119,6 +119,8 @@ impl SharedRegion {
         let len = page_align_len(len)?;
         let mut frames = Vec::with_capacity(len / PAGE_SIZE);
         for _ in 0..len / PAGE_SIZE {
+            let _profile_scope =
+                crate::perf::time_scope(crate::perf::ProfilePoint::FrameAllocFdCompat);
             frames.push(frame_alloc().ok_or(SysError::ENOMEM)?);
         }
         Ok(Self { frames, len })

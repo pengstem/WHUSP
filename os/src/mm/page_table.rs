@@ -105,6 +105,7 @@ pub struct PageTable {
 // kernel bug or an unrecoverable boot-path allocation failure.
 impl PageTable {
     pub fn new() -> Self {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocPageTable);
         let frame = frame_alloc().expect("page table root allocation requires a free frame");
         PageTable {
             root_ppn: frame.ppn,
@@ -112,6 +113,7 @@ impl PageTable {
         }
     }
     pub fn try_new() -> Option<Self> {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocPageTable);
         let frame = frame_alloc()?;
         Some(PageTable {
             root_ppn: frame.ppn,
@@ -139,6 +141,7 @@ impl PageTable {
                 break;
             }
             if !pte.is_valid() {
+                let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocPageTable);
                 let frame = frame_alloc()?;
                 *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
                 self.frames.push(frame);

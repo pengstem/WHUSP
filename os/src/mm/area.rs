@@ -361,6 +361,8 @@ impl MapArea {
                 PhysAddr::from(usize::from(va)).floor()
             }
             MapType::Framed => {
+                let _profile_scope =
+                    crate::perf::time_scope(crate::perf::ProfilePoint::FrameAllocMapArea);
                 let Some(frame) = frame_alloc() else {
                     return false;
                 };

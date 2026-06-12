@@ -165,7 +165,6 @@ impl ProcessControlBlock {
             ustack_base,
             true,
         ));
-        let process_token = process.inner_exclusive_access().memory_set.token();
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         let user_sp = task_inner
@@ -186,8 +185,17 @@ impl ProcessControlBlock {
             egid: 0,
             sysinfo_ehdr,
         };
-        let (stack_top, _, _) = init_user_stack(process_token, user_sp, &args, &envs, &stack_info)
-            .expect("init process stack arguments must fit");
+        let (stack_top, _, _) = {
+            let mut process_inner = process.inner_exclusive_access();
+            init_user_stack(
+                &mut process_inner.memory_set,
+                user_sp,
+                &args,
+                &envs,
+                &stack_info,
+            )
+            .expect("init process stack arguments must fit")
+        };
         let app_trap_cx = TrapContext::app_init_context(
             entry_point,
             stack_top,

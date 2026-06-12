@@ -137,6 +137,7 @@ impl ShmSegment {
         let page_count = aligned_len / PAGE_SIZE;
         let mut pages = Vec::with_capacity(page_count);
         for _ in 0..page_count {
+            let _profile_scope = crate::perf::time_scope(crate::perf::ProfilePoint::FrameAllocShm);
             pages.push(frame_alloc()?);
         }
         let now = now_sec();

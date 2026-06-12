@@ -1,4 +1,4 @@
-use super::trap::handle_mmap_page_fault;
+use super::trap::handle_user_page_fault;
 use crate::mm::{MmapFaultAccess, VirtAddr, page_table::PTEFlags};
 use crate::syscall::user_ptr::{
     UserBufferAccess, read_user_value_with_fault, write_user_value_with_fault,
@@ -155,12 +155,12 @@ fn make_trampoline_page_executable(trampoline_ptr: usize) -> bool {
     true
 }
 
-fn signal_mmap_fault(addr: usize, access: UserBufferAccess) -> bool {
+fn signal_user_fault(addr: usize, access: UserBufferAccess) -> bool {
     let access = match access {
         UserBufferAccess::Read => MmapFaultAccess::Read,
         UserBufferAccess::Write => MmapFaultAccess::Write,
     };
-    handle_mmap_page_fault(addr, access)
+    handle_user_page_fault(addr, access)
 }
 
 fn remove_pending_signal_for_task(task: &TaskControlBlock, signum: usize, signal: SignalFlags) {
@@ -264,7 +264,7 @@ pub fn deliver_pending_signal(
         token,
         frame_sp as *mut LoongArchSignalFrame,
         &frame,
-        Some(signal_mmap_fault),
+        Some(signal_user_fault),
     )
     .is_err()
     {
@@ -308,7 +308,7 @@ pub fn sys_rt_sigreturn() -> SysResult {
     let frame: LoongArchSignalFrame = read_user_value_with_fault(
         token,
         signal_sp as *const LoongArchSignalFrame,
-        Some(signal_mmap_fault),
+        Some(signal_user_fault),
     )?;
     if frame.magic != SIGNAL_FRAME_MAGIC {
         return Err(SysError::EINVAL);

@@ -23,10 +23,24 @@ pub(crate) enum ProfilePoint {
     PageFaultMmapInstallFrame,
     PageFaultMmapResolvePageCache,
     PageFaultMmapInstallPageCache,
+    FrameAllocZeroed,
+    FrameZeroFill,
+    FrameAllocUninit,
+    FrameAllocPageTable,
+    FrameAllocMapArea,
+    FrameAllocLazyFramed,
+    FrameAllocMaterializeFramed,
+    FrameAllocMmapPrivate,
+    FrameAllocShm,
+    FrameAllocDma,
+    FrameAllocFdCompat,
+    FrameAllocMmapPageCache,
+    FrameAllocSharedAnon,
+    FrameAllocReadCache,
 }
 
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
-const PROFILE_POINT_COUNT: usize = 21;
+const PROFILE_POINT_COUNT: usize = 35;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
@@ -605,6 +619,20 @@ mod enabled {
         TimeStat::new("page_fault_mmap_install_frame"),
         TimeStat::new("page_fault_mmap_resolve_page_cache"),
         TimeStat::new("page_fault_mmap_install_page_cache"),
+        TimeStat::new("frame_alloc_zeroed"),
+        TimeStat::new("frame_zero_fill"),
+        TimeStat::new("frame_alloc_uninit"),
+        TimeStat::new("frame_alloc_page_table"),
+        TimeStat::new("frame_alloc_map_area"),
+        TimeStat::new("frame_alloc_lazy_framed"),
+        TimeStat::new("frame_alloc_materialize_framed"),
+        TimeStat::new("frame_alloc_mmap_private"),
+        TimeStat::new("frame_alloc_shm"),
+        TimeStat::new("frame_alloc_dma"),
+        TimeStat::new("frame_alloc_fd_compat"),
+        TimeStat::new("frame_alloc_mmap_page_cache"),
+        TimeStat::new("frame_alloc_shared_anon"),
+        TimeStat::new("frame_alloc_read_cache"),
     ];
 
     fn update_max(cell: &AtomicUsize, value: usize) {

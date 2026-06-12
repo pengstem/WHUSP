@@ -1,6 +1,7 @@
+use super::address::page_align_up;
 use super::{
-    MapArea, MapPermission, MapType, MmapFlush, PageTable, PageTableEntry, VirtAddr, VirtPageNum,
-    page_table::PTEFlags,
+    MapArea, MapPermission, MapType, MmapFlush, PageTable, PageTableEntry, VPNRange, VirtAddr,
+    VirtPageNum, frame_alloc, page_table::PTEFlags,
 };
 use crate::arch::mm as arch_mm;
 use crate::perf;
@@ -80,6 +81,59 @@ impl MemorySet {
             MapArea::new(start_va, end_va, MapType::Framed, permission),
             None,
         );
+    }
+
+    pub(crate) fn insert_lazy_framed_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) {
+        self.insert_area_sorted(MapArea::new(start_va, end_va, MapType::Framed, permission));
+    }
+
+    pub(crate) fn materialize_framed_range(&mut self, start: usize, end: usize) -> bool {
+        if start >= end {
+            return true;
+        }
+        let aligned_end = page_align_up(end);
+        let start_vpn = VirtAddr::from(start).floor();
+        let end_vpn = VirtAddr::from(aligned_end).floor();
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if self
+                .page_table
+                .translate(vpn)
+                .is_some_and(|pte| pte.bits != 0)
+            {
+                continue;
+            }
+            let Some(area_idx) = self.find_area_idx_containing(vpn) else {
+                return false;
+            };
+            let area = &self.areas[area_idx];
+            if area.map_type != MapType::Framed
+                || area.is_mmap()
+                || area.is_shm()
+                || !area.map_perm.contains(MapPermission::U)
+                || area.data_frames.contains_key(&vpn)
+            {
+                return false;
+            }
+            let frame = {
+                let _profile_scope =
+                    perf::time_scope(perf::ProfilePoint::FrameAllocMaterializeFramed);
+                frame_alloc()
+            };
+            let Some(frame) = frame else {
+                return false;
+            };
+            let page_table = &mut self.page_table;
+            let area = &mut self.areas[area_idx];
+            if !area.map_existing_frame(page_table, vpn, frame) {
+                return false;
+            }
+        }
+        true
     }
     #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     pub(crate) fn map_vdso_image(&mut self, start_va: usize, image: &[u8]) -> bool {
