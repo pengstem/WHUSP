@@ -3,9 +3,10 @@ use super::super::devfs;
 use super::super::dirent::{DT_DIR, RawDirEntry, write_dir_entries_with_offset_base};
 use super::super::inode::{OpenFlags, link_node_in};
 use super::super::mount::{
-    MountId, MountNamespaceId, mount_is_devfs, mount_is_noatime, mount_is_nodev,
-    mount_is_nodiratime, mount_is_nosymfollow, mount_is_read_only, mount_supports_dirty_writeback,
-    mount_supports_page_cache, release_inode_from_drop, synthetic_children_for_dir, with_mount,
+    MountId, MountNamespaceId, mount_any_nosymfollow, mount_is_devfs, mount_is_noatime,
+    mount_is_nodev, mount_is_nodiratime, mount_is_nosymfollow, mount_is_read_only,
+    mount_supports_dirty_writeback, mount_supports_page_cache, release_inode_from_drop,
+    synthetic_children_for_dir, with_mount,
 };
 use super::super::named_fifo::open_named_fifo;
 use super::super::path::{PathContext, WorkingDir};
@@ -715,6 +716,9 @@ fn reject_nosymfollow_final_symlink(
     flags: OpenFlags,
 ) -> FsResult {
     if flags.contains(OpenFlags::NOFOLLOW) || flags.contains(OpenFlags::PATH) {
+        return Ok(());
+    }
+    if !mount_any_nosymfollow() {
         return Ok(());
     }
     let Ok(path) = vfs_path::resolve_existing_in(context, name, LookupMode::NoFollowFinal) else {

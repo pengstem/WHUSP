@@ -150,6 +150,7 @@ static NEXT_MOUNT_ID: AtomicUsize = AtomicUsize::new(0);
 static NEXT_MOUNT_NAMESPACE_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_PROPAGATION_GROUP: AtomicUsize = AtomicUsize::new(1);
 static NEXT_MOUNT_EVENT_ID: AtomicUsize = AtomicUsize::new(1);
+static NOSYMFOLLOW_MOUNT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn init_mounts() {
     let already_initialized = MOUNTS_INITIALIZED.exclusive_session(|initialized| {
@@ -192,18 +193,32 @@ impl MountedFs {
         fs_type: &'static str,
         options: &'static str,
     ) -> Arc<Self> {
+        let stat_flags = mount_flags_from_options(options);
+        if mount_flags_have_nosymfollow(stat_flags) {
+            NOSYMFOLLOW_MOUNT_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
         Arc::new(Self {
             source,
             fs_type,
             options: SleepMutex::new(options),
-            stat_flags: SleepMutex::new(mount_flags_from_options(options)),
+            stat_flags: SleepMutex::new(stat_flags),
             backend: SleepMutex::new(backend),
         })
     }
 
     fn set_stat_flags(&self, flags: u64) {
         let flags = normalize_mount_stat_flags(flags);
-        *self.stat_flags.lock() = flags;
+        let mut stat_flags = self.stat_flags.lock();
+        let old_nosymfollow = mount_flags_have_nosymfollow(*stat_flags);
+        let new_nosymfollow = mount_flags_have_nosymfollow(flags);
+        if old_nosymfollow != new_nosymfollow {
+            if new_nosymfollow {
+                NOSYMFOLLOW_MOUNT_COUNT.fetch_add(1, Ordering::Relaxed);
+            } else {
+                NOSYMFOLLOW_MOUNT_COUNT.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        *stat_flags = flags;
         *self.options.lock() = mount_options_from_flags(flags);
     }
 }
@@ -239,6 +254,10 @@ const LINUX_MS_NODIRATIME: usize = 1 << 11;
 
 fn normalize_mount_stat_flags(flags: u64) -> u64 {
     flags | MOUNT_STAT_VALID
+}
+
+fn mount_flags_have_nosymfollow(flags: u64) -> bool {
+    flags & MOUNT_STAT_NOSYMFOLLOW != 0
 }
 
 fn mount_flags_from_options(options: &str) -> u64 {
@@ -2177,6 +2196,12 @@ fn release_dynamic_mount_source_if_unused(source_mount_id: MountId) {
         return;
     }
     if let Some(slot) = MOUNTS.lock().get_mut(source_mount_id.0) {
+        if let Some(mounted) = slot.as_ref() {
+            let flags = *mounted.stat_flags.lock();
+            if mount_flags_have_nosymfollow(flags) {
+                NOSYMFOLLOW_MOUNT_COUNT.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
         *slot = None;
     }
 }
@@ -2433,7 +2458,11 @@ pub(crate) fn mount_is_nodiratime(mount_id: MountId) -> bool {
 }
 
 pub(crate) fn mount_is_nosymfollow(mount_id: MountId) -> bool {
-    mount_stat_flags(mount_id).is_some_and(|flags| flags & MOUNT_STAT_NOSYMFOLLOW != 0)
+    mount_stat_flags(mount_id).is_some_and(mount_flags_have_nosymfollow)
+}
+
+pub(crate) fn mount_any_nosymfollow() -> bool {
+    NOSYMFOLLOW_MOUNT_COUNT.load(Ordering::Relaxed) != 0
 }
 
 pub(super) fn mount_is_devfs(mount_id: MountId) -> bool {
