@@ -8,7 +8,7 @@ use crate::syscall::{
     errno::SysError, syscall_is_exit, syscall_is_exit_group, syscall_with_current_task,
 };
 use crate::task::{
-    SignalAction, SignalFlags, TaskControlBlock, account_task_user_time_until,
+    ProcessControlBlock, SignalAction, SignalFlags, TaskControlBlock, account_task_user_time_until,
     check_signals_of_task, current_add_signal, current_process, current_task,
     exit_current_group_and_run_next, process_of_task, suspend_current_and_run_next,
     timer_tick_should_preempt, trap_cx_of_task, trap_return_context_after_accounting_for_task,
@@ -237,36 +237,46 @@ fn init_lazy_fp_for_task(task: &Arc<TaskControlBlock>) {
 
 pub(crate) fn handle_user_page_fault(addr: usize, access: MmapFaultAccess) -> bool {
     let _profile_scope = perf::time_scope(perf::ProfilePoint::PageFault);
-    if access == MmapFaultAccess::Write {
-        let process = current_process();
-        let _cow_scope = perf::time_scope(perf::ProfilePoint::PageFaultCow);
-        // Private COW pages are resolved before mmap faults so forked heap and
-        // anonymous mappings preserve copy-on-write semantics.
-        if process
-            .inner_exclusive_access()
-            .memory_set
-            .resolve_cow_page_fault(addr)
+    let process = current_process();
+    let fault = if access == MmapFaultAccess::Write {
+        let mut inner = process.inner_exclusive_access();
         {
-            return true;
+            let _cow_scope = perf::time_scope(perf::ProfilePoint::PageFaultCow);
+            // Private COW pages are resolved before mmap faults so forked heap
+            // and anonymous mappings preserve copy-on-write semantics.
+            if inner.memory_set.resolve_cow_page_fault(addr) {
+                return true;
+            }
         }
-    }
-    if handle_mmap_page_fault(addr, access) {
+        let _prepare_scope = perf::time_scope(perf::ProfilePoint::PageFaultMmapPrepare);
+        inner.memory_set.prepare_mmap_page_fault(addr, access)
+    } else {
+        prepare_mmap_page_fault(&process, addr, access)
+    };
+    if handle_prepared_mmap_page_fault(&process, fault) {
         return true;
     }
     let _lazy_scope = perf::time_scope(perf::ProfilePoint::PageFaultLazyFramed);
-    current_process()
+    process
         .inner_exclusive_access()
         .memory_set
         .resolve_lazy_framed_page_fault(addr, access)
 }
 
-pub(crate) fn handle_mmap_page_fault(addr: usize, access: MmapFaultAccess) -> bool {
-    let process = current_process();
-    let fault = {
-        let _prepare_scope = perf::time_scope(perf::ProfilePoint::PageFaultMmapPrepare);
-        let mut inner = process.inner_exclusive_access();
-        inner.memory_set.prepare_mmap_page_fault(addr, access)
-    };
+fn prepare_mmap_page_fault(
+    process: &Arc<ProcessControlBlock>,
+    addr: usize,
+    access: MmapFaultAccess,
+) -> Option<MmapFaultResult> {
+    let _prepare_scope = perf::time_scope(perf::ProfilePoint::PageFaultMmapPrepare);
+    let mut inner = process.inner_exclusive_access();
+    inner.memory_set.prepare_mmap_page_fault(addr, access)
+}
+
+fn handle_prepared_mmap_page_fault(
+    process: &Arc<ProcessControlBlock>,
+    fault: Option<MmapFaultResult>,
+) -> bool {
     let Some(fault) = fault else {
         return false;
     };
