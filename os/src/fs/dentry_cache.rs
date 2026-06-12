@@ -238,6 +238,14 @@ impl DentryCache {
         stamp
     }
 
+    fn touch_hit(&mut self, bucket: DentryCacheBucketKey, stamp: usize) -> usize {
+        // PERF: Exact hit recency only matters once insertions can evict entries.
+        if self.entry_count < self.capacity {
+            return stamp;
+        }
+        self.touch(bucket, Some(stamp))
+    }
+
     fn remove_entry_at(
         &mut self,
         bucket: DentryCacheBucketKey,
@@ -338,7 +346,7 @@ impl DentryCache {
             }
             return None;
         }
-        let stamp = self.touch(bucket, Some(value.lru_stamp()));
+        let stamp = self.touch_hit(bucket, value.lru_stamp());
         if let Some(entry) = self
             .entries
             .get_mut(&bucket)
