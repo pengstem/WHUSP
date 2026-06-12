@@ -347,10 +347,11 @@ impl DentryCache {
             return None;
         }
         let stamp = self.touch_hit(bucket, value.lru_stamp());
-        if let Some(entry) = self
-            .entries
-            .get_mut(&bucket)
-            .and_then(|entries| entries.get_mut(index))
+        if stamp != value.lru_stamp()
+            && let Some(entry) = self
+                .entries
+                .get_mut(&bucket)
+                .and_then(|entries| entries.get_mut(index))
         {
             entry.value = value.with_lru_stamp(stamp);
         }
