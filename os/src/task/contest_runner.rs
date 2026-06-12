@@ -65,6 +65,9 @@ fn append_export(command: &mut String, key: &str, value: &str) {
 }
 
 fn shell_quote(value: &str) -> String {
+    // CONTEXT: The runner only quotes kernel-owned ASCII exports such as
+    // WHUSP_ARCH. Do not feed user paths or script text through this bytewise
+    // encoder as a general shell-escaping API.
     let mut quoted = String::from("'");
     for byte in value.bytes() {
         if byte == b'\'' {

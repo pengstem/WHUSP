@@ -363,6 +363,9 @@ fn seccomp_signal_for_syscall(task: &TaskControlBlock, syscall_id: usize) -> Opt
 }
 
 fn syscall_identity_fast_path(task: &TaskControlBlock, syscall_id: usize) -> Option<isize> {
+    // Keep this path limited to pure identity getters. Anything that touches
+    // user memory, can sleep, or depends on an exec-stable address-space token
+    // must go through SyscallContext below.
     let value = match syscall_id {
         SYSCALL_GETTID => task.linux_tid() as isize,
         SYSCALL_GETPID | SYSCALL_GETPPID | SYSCALL_GETUID | SYSCALL_GETEUID | SYSCALL_GETGID

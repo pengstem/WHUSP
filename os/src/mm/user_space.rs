@@ -440,6 +440,9 @@ impl MemorySet {
             }
         }
         if parent_needs_tlb_flush {
+            // Parent PTEs were downgraded in place for COW while building the
+            // child. Flush once before fork returns so the parent cannot keep
+            // stale writable translations after the child becomes runnable.
             flush_tlb_all_recorded();
         }
         Some(memory_set)

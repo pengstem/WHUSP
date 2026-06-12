@@ -353,6 +353,9 @@ fn sys_clone_vm_helper(args: CloneArgs, synthetic_newnet: bool) -> SysResult {
     }
     let process_token = process.attach_task(Arc::clone(&cloned.task));
 
+    // These helper tasks share the parent's PCB and address space. Publish the
+    // Linux-visible TID stores before scheduling so userspace never observes a
+    // helper that can run before its clone metadata is visible.
     if args.flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
         write_user_value(
             process_token,
@@ -368,6 +371,8 @@ fn sys_clone_vm_helper(args: CloneArgs, synthetic_newnet: bool) -> SysResult {
         )?;
     }
     add_task(cloned.task);
+    // The helper is a process-compatibility facade, not a detachable pthread.
+    // Keep the caller parked until the task table no longer exposes its TID.
     while process
         .tasks_snapshot()
         .iter()
@@ -384,6 +389,9 @@ fn sys_clone_thread(args: CloneArgs) -> SysResult {
     let cloned = clone_current_thread(args);
     let process_token = process.attach_task(Arc::clone(&cloned.task));
 
+    // For real pthread clones, parent_tid/child_tid stores are part of the
+    // publication contract: install them after attach_task() provides the
+    // shared token, but before add_task() lets the child reach userspace.
     if args.flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
         write_user_value(
             process_token,

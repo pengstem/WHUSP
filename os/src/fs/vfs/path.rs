@@ -250,6 +250,9 @@ fn lookup_child_raw(
             cursor.path.as_str(),
         )
     {
+        // Synthetic mount targets such as lazy extra block devices are VFS
+        // overlay entries, not backend dirents. Resolve them before backend
+        // lookup so an absent covered directory can still expose the mount.
         cursor.node = node;
         cursor.kind = FsNodeKind::Directory;
         return Ok(VfsChildLookup {

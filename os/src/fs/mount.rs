@@ -389,6 +389,9 @@ fn drain_pending_inode_releases(mount_id: MountId, backend: &mut dyn FileSystemB
         if pending.is_empty() {
             return;
         }
+        // Take the queue before backend release calls; release_inode() may
+        // enter filesystem code, and this interrupt-masked queue lock must not
+        // be held across backend cleanup.
         core::mem::take(&mut *pending)
     };
 
@@ -2509,6 +2512,8 @@ pub(crate) fn sync_all_mounts() -> FsResult {
             .collect::<Vec<_>>()
     };
 
+    // Snapshot mount ids before writeback. flush/sync can enter VFS and block
+    // backends, so the mount table lock must already be released.
     let mut result = Ok(());
     for mount_id in mount_ids {
         if let Err(err) = super::vfs::flush_dirty_regular_files_on_mount(mount_id) {
@@ -2536,6 +2541,8 @@ pub(crate) fn shutdown_all_mounts() -> FsResult {
             .collect::<Vec<_>>()
     };
 
+    // Snapshot mount ids before shutdown writeback. flush/shutdown can enter
+    // VFS and block backends, so the mount table lock must already be released.
     let mut result = Ok(());
     for mount_id in mount_ids {
         if let Err(err) = super::vfs::flush_dirty_regular_files_on_mount(mount_id) {

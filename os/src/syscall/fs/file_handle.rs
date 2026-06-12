@@ -14,6 +14,8 @@ const VALID_NAME_TO_HANDLE_FLAGS: i32 =
     AT_EMPTY_PATH | NAME_TO_HANDLE_AT_SYMLINK_FOLLOW | AT_HANDLE_FID;
 const MAX_HANDLE_SZ: u32 = 128;
 const FILE_HANDLE_HEADER_LEN: usize = 8;
+// Private handle format tag used by name_to_handle_at(2), open_by_handle_at(2),
+// and fanotify FID records. Keep it paired with the 16-byte mount_id+ino payload.
 const WHUSP_FILE_HANDLE_TYPE: i32 = 0x5753_4855;
 const CAP_DAC_READ_SEARCH: usize = 2;
 

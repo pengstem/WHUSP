@@ -13,6 +13,7 @@ pub struct TrapContext {
     pub _fpu_reserved: u32,
 }
 
+// LoongArch LP64 ABI register indexes used by set_*: r3=sp, r2=tp, r4=a0.
 impl TrapContext {
     pub fn set_sp(&mut self, sp: usize) {
         self.x[3] = sp;
@@ -35,6 +36,8 @@ impl TrapContext {
     ) -> Self {
         let mut cx = Self {
             x: [0; 32],
+            // PRMD.PPLV=3 and PRMD.PIE=1 so ertn enters user mode with
+            // interrupts enabled.
             prmd: 0b0111,
             era: entry,
             kernel_satp,

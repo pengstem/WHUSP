@@ -14,6 +14,7 @@ pub struct TrapContext {
     pub fpu_state_valid: u32,
 }
 
+// RISC-V psABI register indexes used by set_*: x2=sp, x4=tp, x10=a0.
 impl TrapContext {
     pub fn set_sp(&mut self, sp: usize) {
         self.x[2] = sp;

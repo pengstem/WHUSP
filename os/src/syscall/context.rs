@@ -9,6 +9,9 @@ pub(crate) struct SyscallContext {
 
 impl SyscallContext {
     pub(crate) fn new(task: Arc<TaskControlBlock>, process: Arc<ProcessControlBlock>) -> Self {
+        // Snapshot the caller token at syscall entry; user-copy helpers using
+        // this context must not re-read a process token after an exec-style
+        // image switch changes the PCB memory_set.
         let user_token = process.inner_exclusive_access().memory_set.token();
         Self {
             task,
