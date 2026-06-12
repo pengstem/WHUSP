@@ -1,3 +1,4 @@
+use crate::arch::interrupt;
 use crate::task::{
     MINSIGSTKSZ, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SS_DISABLE, SS_ONSTACK, SigAltStack,
     SignalAction, SignalFlags, SignalInfo, TaskControlBlock, block_current_task_no_schedule,
@@ -5,7 +6,7 @@ use crate::task::{
     current_user_token, flags_to_linux_sigset, linux_sigset_to_flags, queue_signal_to_task,
     schedule, task_with_linux_tid,
 };
-use crate::timer::get_time_ms;
+use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
 use core::mem::size_of;
 
@@ -389,9 +390,24 @@ pub fn sys_rt_sigtimedwait(
             return Err(SysError::EAGAIN);
         }
 
-        // UNFINISHED: A real Linux implementation sleeps interruptibly and is
-        // woken by signal delivery. Until this kernel has signal wait queues,
-        // yield cooperatively so child exit and kill paths can run.
-        crate::task::suspend_current_and_run_next();
+        let interrupts_enabled = interrupt::supervisor_interrupt_enabled();
+        interrupt::disable_supervisor_interrupt();
+        let should_retry = peek_pending_signal(wanted).is_some()
+            || current_has_interrupting_signal()
+            || deadline_ms.is_some_and(|deadline_ms| get_time_ms() >= deadline_ms);
+        if should_retry {
+            if interrupts_enabled {
+                interrupt::enable_supervisor_interrupt();
+            }
+            continue;
+        }
+        let (task, task_cx_ptr) = block_current_task_no_schedule();
+        if let Some(deadline_ms) = deadline_ms {
+            add_timer(deadline_ms, task);
+        }
+        if interrupts_enabled {
+            interrupt::enable_supervisor_interrupt();
+        }
+        schedule(task_cx_ptr);
     }
 }
