@@ -396,6 +396,7 @@ impl FileSystemBackend for Ext4Mount {
     }
 
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::Ext4Read);
         self.fs.read_at(ino, buf, offset).expect("ext4 read failed")
     }
 

@@ -3,6 +3,7 @@ mod context;
 use crate::arch::interrupt::{disable_supervisor_interrupt, enable_supervisor_interrupt};
 use crate::config::TRAMPOLINE;
 use crate::mm::{MmapFaultAccess, MmapFaultResult};
+use crate::perf;
 use crate::syscall::{syscall_is_exit, syscall_is_exit_group, syscall_with_current_task};
 use crate::task::{
     SignalAction, SignalFlags, TaskControlBlock, account_task_user_time_until,
@@ -221,6 +222,7 @@ pub fn trap_handler() -> ! {
 }
 
 pub(crate) fn handle_user_page_fault(addr: usize, access: MmapFaultAccess) -> bool {
+    let _profile_scope = perf::time_scope(perf::ProfilePoint::PageFault);
     if access == MmapFaultAccess::Write {
         let process = current_process();
         // Private COW pages are resolved before mmap faults so forked heap and

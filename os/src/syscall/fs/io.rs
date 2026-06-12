@@ -1670,6 +1670,7 @@ fn sys_write_with_process(
     buf: *const u8,
     len: usize,
 ) -> SysResult {
+    let _profile_scope = perf::time_scope(perf::ProfilePoint::SysWrite);
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
     if !file.writable() {
@@ -1923,6 +1924,7 @@ pub fn sys_read_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize)
 }
 
 fn sys_read_with_token(token: usize, fd: usize, buf: *const u8, len: usize) -> SysResult {
+    let _profile_scope = perf::time_scope(perf::ProfilePoint::SysRead);
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
     if file.stat()?.mode & S_IFMT == S_IFDIR {

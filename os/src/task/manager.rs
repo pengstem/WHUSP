@@ -161,6 +161,7 @@ impl TaskManager {
     }
 
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::SchedulerFetch);
         let queue_len = self.ready_len();
         let mut scanned = 0;
         let mut pruned_exited = 0;

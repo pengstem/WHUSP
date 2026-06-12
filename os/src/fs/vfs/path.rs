@@ -466,6 +466,7 @@ pub(crate) fn resolve_existing_in(
     path: &str,
     mode: LookupMode,
 ) -> FsResult<VfsPath> {
+    let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookup);
     let resolved = resolve_path_inner(context, path, mode)?.into_path();
     if path.ends_with('/') && resolved.kind != FsNodeKind::Directory {
         return Err(FsError::NotDir);
