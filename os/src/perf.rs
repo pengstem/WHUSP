@@ -16,10 +16,17 @@ pub(crate) enum ProfilePoint {
     VfsSeekScanRead,
     MmapFaultRead,
     MmapPageCacheFill,
+    PageFaultCow,
+    PageFaultLazyFramed,
+    PageFaultMmapPrepare,
+    PageFaultMmapBuildFrame,
+    PageFaultMmapInstallFrame,
+    PageFaultMmapResolvePageCache,
+    PageFaultMmapInstallPageCache,
 }
 
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
-const PROFILE_POINT_COUNT: usize = 14;
+const PROFILE_POINT_COUNT: usize = 21;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
@@ -591,6 +598,13 @@ mod enabled {
         TimeStat::new("vfs_seek_scan_read"),
         TimeStat::new("mmap_fault_read"),
         TimeStat::new("mmap_page_cache_fill"),
+        TimeStat::new("page_fault_cow"),
+        TimeStat::new("page_fault_lazy_framed"),
+        TimeStat::new("page_fault_mmap_prepare"),
+        TimeStat::new("page_fault_mmap_build_frame"),
+        TimeStat::new("page_fault_mmap_install_frame"),
+        TimeStat::new("page_fault_mmap_resolve_page_cache"),
+        TimeStat::new("page_fault_mmap_install_page_cache"),
     ];
 
     fn update_max(cell: &AtomicUsize, value: usize) {
@@ -627,6 +641,30 @@ mod enabled {
         }
     }
 
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) struct SyscallScopeTimer {
+        syscall_id: usize,
+        start_ticks: usize,
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub(crate) fn time_syscall(syscall_id: usize) -> SyscallScopeTimer {
+        SyscallScopeTimer {
+            syscall_id,
+            start_ticks: crate::timer::get_time(),
+        }
+    }
+
+    impl Drop for SyscallScopeTimer {
+        #[inline(always)]
+        fn drop(&mut self) {
+            let elapsed_ticks = crate::timer::get_time().wrapping_sub(self.start_ticks);
+            record_syscall_time(self.syscall_id, elapsed_ticks);
+        }
+    }
+
     fn record_time(point: ProfilePoint, elapsed_ticks: usize) {
         let stat = &TIME_STATS[point as usize];
         stat.calls.fetch_add(1, Ordering::Relaxed);
@@ -634,8 +672,37 @@ mod enabled {
         update_max(&stat.max_ticks, elapsed_ticks);
     }
 
+    fn record_syscall_time(syscall_id: usize, elapsed_ticks: usize) {
+        let Some(stat) = SYSCALL_TIME_STATS.get(syscall_id) else {
+            return;
+        };
+        stat.calls.fetch_add(1, Ordering::Relaxed);
+        stat.total_ticks.fetch_add(elapsed_ticks, Ordering::Relaxed);
+        update_max(&stat.max_ticks, elapsed_ticks);
+    }
+
     const USEC_PER_SEC: u128 = 1_000_000;
     const NSEC_PER_SEC: u128 = 1_000_000_000;
+    const SYSCALL_TIMING_SLOTS: usize = 512;
+
+    struct SyscallTimeStat {
+        calls: AtomicUsize,
+        total_ticks: AtomicUsize,
+        max_ticks: AtomicUsize,
+    }
+
+    impl SyscallTimeStat {
+        const fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                total_ticks: AtomicUsize::new(0),
+                max_ticks: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    static SYSCALL_TIME_STATS: [SyscallTimeStat; SYSCALL_TIMING_SLOTS] =
+        [const { SyscallTimeStat::new() }; SYSCALL_TIMING_SLOTS];
 
     fn ticks_to_us(ticks: usize) -> u128 {
         let freq = crate::config::clock_freq() as u128;
@@ -680,6 +747,34 @@ mod enabled {
                 stat.name,
                 avg_ns,
                 stat.name,
+                ticks_to_us(max_ticks),
+            );
+        }
+        content.push_str("kperf_syscall_timing_enabled 1\n");
+        for (syscall_id, stat) in SYSCALL_TIME_STATS.iter().enumerate() {
+            let calls = stat.calls.load(Ordering::Relaxed);
+            if calls == 0 {
+                continue;
+            }
+            let total_ticks = stat.total_ticks.load(Ordering::Relaxed);
+            let max_ticks = stat.max_ticks.load(Ordering::Relaxed);
+            let avg_ns = ticks_to_ns(total_ticks) / calls as u128;
+            let _ = write!(
+                content,
+                "profile_syscall_{}_calls {}\n\
+                 profile_syscall_{}_total_ticks {}\n\
+                 profile_syscall_{}_total_us {}\n\
+                 profile_syscall_{}_avg_ns {}\n\
+                 profile_syscall_{}_max_us {}\n",
+                syscall_id,
+                calls,
+                syscall_id,
+                total_ticks,
+                syscall_id,
+                ticks_to_us(total_ticks),
+                syscall_id,
+                avg_ns,
+                syscall_id,
                 ticks_to_us(max_ticks),
             );
         }
@@ -2283,6 +2378,12 @@ mod disabled {
     #[allow(dead_code)]
     #[inline(always)]
     pub(crate) fn time_scope(_point: ProfilePoint) -> ScopeTimer {
+        ScopeTimer
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub(crate) fn time_syscall(_syscall_id: usize) -> ScopeTimer {
         ScopeTimer
     }
 

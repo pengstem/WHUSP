@@ -420,6 +420,7 @@ pub fn syscall_with_current_task(
         sys_exit_group(args[0] as i32);
     }
     let _profile_scope = perf::time_scope(perf::ProfilePoint::SyscallDispatch);
+    let _syscall_profile_scope = perf::time_syscall(syscall_id);
     if let Some(value) = syscall_identity_fast_path(&current, syscall_id) {
         return value;
     }

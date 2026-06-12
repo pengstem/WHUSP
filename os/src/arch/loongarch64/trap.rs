@@ -225,6 +225,7 @@ pub(crate) fn handle_user_page_fault(addr: usize, access: MmapFaultAccess) -> bo
     let _profile_scope = perf::time_scope(perf::ProfilePoint::PageFault);
     if access == MmapFaultAccess::Write {
         let process = current_process();
+        let _cow_scope = perf::time_scope(perf::ProfilePoint::PageFaultCow);
         // Private COW pages are resolved before mmap faults so forked heap and
         // anonymous mappings preserve copy-on-write semantics.
         if process
@@ -235,12 +236,15 @@ pub(crate) fn handle_user_page_fault(addr: usize, access: MmapFaultAccess) -> bo
             return true;
         }
     }
-    if current_process()
-        .inner_exclusive_access()
-        .memory_set
-        .resolve_lazy_framed_page_fault(addr, access)
     {
-        return true;
+        let _lazy_scope = perf::time_scope(perf::ProfilePoint::PageFaultLazyFramed);
+        if current_process()
+            .inner_exclusive_access()
+            .memory_set
+            .resolve_lazy_framed_page_fault(addr, access)
+        {
+            return true;
+        }
     }
     handle_mmap_page_fault(addr, access)
 }
@@ -248,6 +252,7 @@ pub(crate) fn handle_user_page_fault(addr: usize, access: MmapFaultAccess) -> bo
 pub(crate) fn handle_mmap_page_fault(addr: usize, access: MmapFaultAccess) -> bool {
     let process = current_process();
     let fault = {
+        let _prepare_scope = perf::time_scope(perf::ProfilePoint::PageFaultMmapPrepare);
         let mut inner = process.inner_exclusive_access();
         inner.memory_set.prepare_mmap_page_fault(addr, access)
     };
@@ -268,17 +273,29 @@ pub(crate) fn handle_mmap_page_fault(addr: usize, access: MmapFaultAccess) -> bo
             true
         }
         MmapFaultResult::Page(page) => {
-            let Some(frame) = page.build_frame() else {
+            let frame = {
+                let _build_scope = perf::time_scope(perf::ProfilePoint::PageFaultMmapBuildFrame);
+                page.build_frame()
+            };
+            let Some(frame) = frame else {
                 return false;
             };
+            let _install_scope = perf::time_scope(perf::ProfilePoint::PageFaultMmapInstallFrame);
             let mut inner = process.inner_exclusive_access();
             inner.memory_set.install_mmap_fault_page(page, frame)
         }
         MmapFaultResult::PageCache(page) => {
-            let Some(ppn) = page.resolve_ppn() else {
+            let ppn = {
+                let _resolve_scope =
+                    perf::time_scope(perf::ProfilePoint::PageFaultMmapResolvePageCache);
+                page.resolve_ppn()
+            };
+            let Some(ppn) = ppn else {
                 return false;
             };
             let key = page.key();
+            let _install_scope =
+                perf::time_scope(perf::ProfilePoint::PageFaultMmapInstallPageCache);
             let mut inner = process.inner_exclusive_access();
             let installed = inner
                 .memory_set
