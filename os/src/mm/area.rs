@@ -385,10 +385,42 @@ impl MapArea {
         )
     }
 
+    pub(super) fn map_one_uninit(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) -> bool {
+        assert_eq!(self.map_type, MapType::Framed);
+        let _profile_scope = crate::perf::time_scope(crate::perf::ProfilePoint::FrameAllocMapArea);
+        let Some(frame) = frame_alloc_uninit() else {
+            return false;
+        };
+        let ppn = frame.ppn;
+        if !page_table.try_map(
+            vpn,
+            ppn,
+            PTEFlags::from_bits_truncate(self.map_perm.bits() as usize),
+        ) {
+            return false;
+        }
+        self.data_frames.insert(vpn, frame);
+        true
+    }
+
     pub(super) fn map(&mut self, page_table: &mut PageTable) -> bool {
         let mut mapped_vpns = Vec::new();
         for vpn in self.vpn_range {
             if !self.map_one(page_table, vpn) {
+                for mapped_vpn in mapped_vpns {
+                    self.unmap_one(page_table, mapped_vpn);
+                }
+                return false;
+            }
+            mapped_vpns.push(vpn);
+        }
+        true
+    }
+
+    pub(super) fn map_uninit(&mut self, page_table: &mut PageTable) -> bool {
+        let mut mapped_vpns = Vec::new();
+        for vpn in self.vpn_range {
+            if !self.map_one_uninit(page_table, vpn) {
                 for mapped_vpn in mapped_vpns {
                     self.unmap_one(page_table, mapped_vpn);
                 }

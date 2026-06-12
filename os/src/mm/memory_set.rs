@@ -70,17 +70,24 @@ impl MemorySet {
     pub fn token(&self) -> usize {
         self.page_table.token()
     }
-    /// Assume that no conflicts.
-    pub fn insert_framed_area(
+    /// Maps kernel-private framed pages without clearing the new frames.
+    ///
+    /// Callers must only use this for mappings that are never readable from
+    /// user mode and are fully initialized before any kernel read.
+    pub(crate) fn insert_kernel_private_framed_area_uninit(
         &mut self,
         start_va: VirtAddr,
         end_va: VirtAddr,
         permission: MapPermission,
     ) {
-        let _ = self.push(
-            MapArea::new(start_va, end_va, MapType::Framed, permission),
-            None,
+        assert!(
+            !permission.contains(MapPermission::U),
+            "uninitialized framed pages must stay kernel-private"
         );
+        let mut map_area = MapArea::new(start_va, end_va, MapType::Framed, permission);
+        if map_area.map_uninit(&mut self.page_table) {
+            self.insert_area_sorted(map_area);
+        }
     }
 
     pub(crate) fn insert_lazy_framed_area(
