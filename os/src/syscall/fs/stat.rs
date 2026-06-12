@@ -5,6 +5,7 @@ use crate::fs::{
     stat_devfs_input_child, stat_devfs_misc_child, stat_devfs_net_child, stat_devfs_pts_child,
     stat_in, stat_static_path, statfs_for_mount,
 };
+use crate::perf;
 use crate::sync::SleepMutex;
 use crate::task::{PathSnapshot, current_process, current_user_token};
 
@@ -87,9 +88,12 @@ pub(super) fn resolve_stat_from(
     path: &str,
     follow_final_symlink: bool,
 ) -> SysResult<FileStat> {
-    let path = match resolve_at_path(snapshot, dirfd, path, true)? {
-        AtPath::Empty(empty) => return Ok(empty.file().stat()?),
-        AtPath::Path(path) => path,
+    let path = {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathResolveAt);
+        match resolve_at_path(snapshot, dirfd, path, true)? {
+            AtPath::Empty(empty) => return Ok(empty.file().stat()?),
+            AtPath::Path(path) => path,
+        }
     };
     let is_absolute = path.starts_with('/');
     if !is_absolute && dirfd != AT_FDCWD && dirfd >= 0 {
@@ -109,11 +113,15 @@ pub(super) fn resolve_stat_from(
             return stat.ok_or(SysError::ENOENT);
         }
     }
-    if let Ok(global_path) = normalize_path_from(snapshot, dirfd, path)
-        && let Some(stat) = stat_static_path(global_path.as_str())
     {
-        return Ok(stat);
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathStaticPath);
+        if let Ok(global_path) = normalize_path_from(snapshot, dirfd, path)
+            && let Some(stat) = stat_static_path(global_path.as_str())
+        {
+            return Ok(stat);
+        }
     }
+    let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathVfsStat);
     Ok(stat_in(
         path_context_from(snapshot, dirfd, path)?,
         path,
@@ -143,20 +151,25 @@ pub fn sys_newfstatat_ctx(
         return Err(SysError::EINVAL);
     }
 
-    let path = read_user_c_string_ctx(ctx, pathname, PATH_MAX)?;
+    let path = {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::SysNewfstatatReadPath);
+        read_user_c_string_ctx(ctx, pathname, PATH_MAX)?
+    };
     if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
         return Err(SysError::ENOENT);
     }
     let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
     let snapshot = ctx.process().path_snapshot();
     if !path.is_empty() {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::SysNewfstatatAccessCheck);
         check_access_path_prefixes_for_process(ctx.process(), &snapshot, dirfd, path.as_str())?;
     }
-    write_stat_result_ctx(
-        ctx,
-        statbuf,
-        resolve_stat_from(&snapshot, dirfd, path.as_str(), follow_final_symlink)?,
-    )
+    let stat = {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::SysNewfstatatResolve);
+        resolve_stat_from(&snapshot, dirfd, path.as_str(), follow_final_symlink)?
+    };
+    let _profile_scope = perf::time_scope(perf::ProfilePoint::SysNewfstatatWriteback);
+    write_stat_result_ctx(ctx, statbuf, stat)
 }
 
 fn prepare_mode_change(stat: FileStat, mode: u32) -> SysResult<u32> {

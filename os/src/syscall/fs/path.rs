@@ -209,6 +209,14 @@ fn check_access_path_prefixes_from(
     path: &str,
     subject: AccessSubject<'_>,
 ) -> SysResult<()> {
+    // CONTEXT: In this kernel's current DAC model, uid 0 bypasses directory
+    // search mode checks. Final path resolution still reports ENOTDIR for a
+    // non-directory prefix, so the per-prefix stat loop adds no root-visible
+    // semantics but is very hot for stat-heavy libc probes.
+    if subject.is_root() {
+        return Ok(());
+    }
+
     let mut components = path
         .split('/')
         .filter(|component| !component.is_empty() && *component != ".")
