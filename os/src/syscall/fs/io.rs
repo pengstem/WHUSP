@@ -16,7 +16,7 @@ use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
     UserBufferAccess, read_user_array, read_user_array_ctx, read_user_value,
     read_user_value_with_mmap_fault, translated_byte_buffer_checked_with_mmap_fault,
-    write_user_value,
+    translated_byte_buffer_checked_with_mmap_fault_ctx, write_user_value,
 };
 use super::fanotify::{fanotify_notify_access, fanotify_notify_modify};
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
@@ -1660,16 +1660,6 @@ pub fn sys_pwritev2(
 }
 
 pub fn sys_write_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize) -> SysResult {
-    sys_write_with_process(ctx.process(), ctx.user_token(), fd, buf, len)
-}
-
-fn sys_write_with_process(
-    process: &ProcessControlBlock,
-    token: usize,
-    fd: usize,
-    buf: *const u8,
-    len: usize,
-) -> SysResult {
     let _profile_scope = perf::time_scope(perf::ProfilePoint::SysWrite);
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
@@ -1681,17 +1671,17 @@ fn sys_write_with_process(
     }
     check_pipe_write_peer(&entry, len > 0)?;
     let allowed_len = if file.is_eventfd() {
-        let allowed_len = allowed_write_len_for_entry_for_process(process, &entry, len)?;
+        let allowed_len = allowed_write_len_for_entry_for_process(ctx.process(), &entry, len)?;
         file.check_write(
             allowed_len,
             entry.status_flags().contains(OpenFlags::APPEND),
         )?;
-        precheck_eventfd_write_value(file.as_ref(), token, buf)?;
+        precheck_eventfd_write_value(file.as_ref(), ctx.user_token(), buf)?;
         ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
         allowed_len
     } else {
         ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
-        let allowed_len = allowed_write_len_for_entry_for_process(process, &entry, len)?;
+        let allowed_len = allowed_write_len_for_entry_for_process(ctx.process(), &entry, len)?;
         file.check_write(
             allowed_len,
             entry.status_flags().contains(OpenFlags::APPEND),
@@ -1706,8 +1696,8 @@ fn sys_write_with_process(
         inotify_notify_modify(&file, allowed_len);
         return Ok(allowed_len as isize);
     }
-    let buffers = translated_byte_buffer_checked_with_mmap_fault(
-        token,
+    let buffers = translated_byte_buffer_checked_with_mmap_fault_ctx(
+        ctx,
         buf,
         allowed_len,
         UserBufferAccess::Read,
@@ -1920,10 +1910,6 @@ fn sys_readv_with_iovecs(token: usize, fd: usize, iovecs: UserIovecs, iovcnt: us
 }
 
 pub fn sys_read_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize) -> SysResult {
-    sys_read_with_token(ctx.user_token(), fd, buf, len)
-}
-
-fn sys_read_with_token(token: usize, fd: usize, buf: *const u8, len: usize) -> SysResult {
     let _profile_scope = perf::time_scope(perf::ProfilePoint::SysRead);
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
@@ -1936,7 +1922,7 @@ fn sys_read_with_token(token: usize, fd: usize, buf: *const u8, len: usize) -> S
     file.check_read(len)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLIN)?;
     let buffers =
-        translated_byte_buffer_checked_with_mmap_fault(token, buf, len, UserBufferAccess::Write)?;
+        translated_byte_buffer_checked_with_mmap_fault_ctx(ctx, buf, len, UserBufferAccess::Write)?;
     let read = file.read(UserBuffer::new(buffers));
     fanotify_notify_access(&file, read);
     inotify_notify_access(&file, read);
