@@ -6,6 +6,11 @@ pub(crate) enum ProfilePoint {
     SysRead,
     SysWrite,
     VfsLookup,
+    VfsLookupPathComponents,
+    VfsLookupVisiblePath,
+    VfsLookupDentry,
+    VfsLookupBackend,
+    VfsLookupDentryInsert,
     Ext4Read,
     PageFault,
     SchedulerFetch,
@@ -40,7 +45,7 @@ pub(crate) enum ProfilePoint {
 }
 
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
-const PROFILE_POINT_COUNT: usize = 35;
+const PROFILE_POINT_COUNT: usize = 40;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
@@ -602,6 +607,11 @@ mod enabled {
         TimeStat::new("sys_read"),
         TimeStat::new("sys_write"),
         TimeStat::new("vfs_lookup"),
+        TimeStat::new("vfs_lookup_path_components"),
+        TimeStat::new("vfs_lookup_visible_path"),
+        TimeStat::new("vfs_lookup_dentry"),
+        TimeStat::new("vfs_lookup_backend"),
+        TimeStat::new("vfs_lookup_dentry_insert"),
         TimeStat::new("ext4_read"),
         TimeStat::new("page_fault"),
         TimeStat::new("scheduler_fetch"),

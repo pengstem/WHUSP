@@ -171,6 +171,7 @@ fn follow_mounted_root(context: &PathContext, cursor: VfsCursor) -> VfsCursor {
 }
 
 fn join_visible_path(base: &str, component: &str) -> String {
+    let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupVisiblePath);
     perf::record_vfs_visible_path_update(1);
     if base == "/" {
         alloc::format!("/{component}")
@@ -191,6 +192,7 @@ fn reserve_visible_path_for_lookup(cursor: &mut VfsCursor, path: &str) {
 }
 
 fn push_visible_path_component(path: &mut String, component: &str) {
+    let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupVisiblePath);
     perf::record_vfs_visible_path_update(0);
     let slash_len = usize::from(path.as_str() != "/");
     reserve_visible_path(path, slash_len + component.len());
@@ -201,6 +203,7 @@ fn push_visible_path_component(path: &mut String, component: &str) {
 }
 
 fn truncate_visible_path_parent(path: &mut String) {
+    let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupVisiblePath);
     perf::record_vfs_visible_path_update(0);
     if path.as_str() == "/" {
         return;
@@ -213,6 +216,7 @@ fn truncate_visible_path_parent(path: &mut String) {
 }
 
 fn parent_visible_path(path: &str) -> String {
+    let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupVisiblePath);
     perf::record_vfs_visible_path_update(1);
     if path == "/" {
         return String::from("/");
@@ -265,7 +269,11 @@ fn lookup_child_raw(
 
     let cacheable = component != ".." && mount_supports_dentry_cache(parent_node.mount_id);
     if cacheable {
-        match dentry_cache::lookup(context.namespace_id(), parent_node, component) {
+        let cached = {
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupDentry);
+            dentry_cache::lookup(context.namespace_id(), parent_node, component)
+        };
+        match cached {
             Some(DentryLookupResult::Positive { node, kind }) => {
                 cursor.node = node;
                 cursor.kind = kind;
@@ -281,14 +289,18 @@ fn lookup_child_raw(
         }
     }
 
-    let result = with_mount(parent_node.mount_id, |mount| {
-        mount.lookup_component_from(parent_node.ino, component)
-    })
-    .ok_or(FsError::Io)?;
+    let result = {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupBackend);
+        with_mount(parent_node.mount_id, |mount| {
+            mount.lookup_component_from(parent_node.ino, component)
+        })
+        .ok_or(FsError::Io)?
+    };
     let (ino, kind) = match result {
         Ok(found) => found,
         Err(FsError::NotFound) => {
             if cacheable {
+                let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupDentryInsert);
                 dentry_cache::insert_negative(context.namespace_id(), parent_node, component);
             }
             return Err(FsError::NotFound);
@@ -297,6 +309,7 @@ fn lookup_child_raw(
     };
     let node = VfsNodeId::new(parent_node.mount_id, ino);
     if cacheable {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupDentryInsert);
         dentry_cache::insert_positive(context.namespace_id(), parent_node, component, node, kind);
     }
     cursor.node = node;
@@ -349,6 +362,7 @@ fn start_cursor(context: &PathContext, path: &str) -> VfsCursor {
 }
 
 fn borrowed_path_components(path: &str) -> Vec<PathComponent<'_>> {
+    let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupPathComponents);
     let components: Vec<PathComponent<'_>> = path
         .split('/')
         .filter(|component| !component.is_empty() && *component != ".")
@@ -359,6 +373,7 @@ fn borrowed_path_components(path: &str) -> Vec<PathComponent<'_>> {
 }
 
 fn owned_path_components<'a>(path: &str) -> Vec<PathComponent<'a>> {
+    let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupPathComponents);
     let components: Vec<PathComponent<'a>> = path
         .split('/')
         .filter(|component| !component.is_empty() && *component != ".")
