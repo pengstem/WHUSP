@@ -412,10 +412,52 @@ fn read_symlink_target(cursor: &VfsCursor) -> FsResult<String> {
     Ok(String::from(target))
 }
 
-fn resolve_path_inner(context: PathContext, path: &str, mode: LookupMode) -> FsResult<VfsCursor> {
+fn resolve_path_streaming_no_symlink(
+    context: &PathContext,
+    path: &str,
+    mode: LookupMode,
+) -> FsResult<Option<VfsCursor>> {
     if path.is_empty() {
         return Err(FsError::NotFound);
     }
+    let mut cursor = start_cursor(context, path);
+    let mut components_seen = 0usize;
+    let mut components = path
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .peekable();
+
+    while let Some(component) = components.next() {
+        components_seen += 1;
+        let is_final = components.peek().is_none();
+        if component == ".." {
+            cursor = lookup_parent_in_context(cursor, context)?;
+        } else {
+            let child = lookup_child_raw(context, cursor, component)?;
+            if child.cursor.kind == FsNodeKind::Symlink
+                && (!is_final || mode.follow_final_symlink())
+            {
+                perf::record_vfs_path_components(components_seen, 0);
+                return Ok(None);
+            }
+            cursor = child.cursor;
+        }
+        if mode.follow_final_mount() || !is_final {
+            cursor = follow_mounted_root(context, cursor);
+        }
+    }
+    perf::record_vfs_path_components(components_seen, 0);
+    if mode.follow_final_mount() && components_seen == 0 {
+        cursor = follow_mounted_root(context, cursor);
+    }
+    Ok(Some(cursor))
+}
+
+fn resolve_path_with_component_vec(
+    context: PathContext,
+    path: &str,
+    mode: LookupMode,
+) -> FsResult<VfsCursor> {
     let mut cursor = start_cursor(&context, path);
     let mut components = borrowed_path_components(path);
     let mut index = 0usize;
@@ -464,6 +506,16 @@ fn resolve_path_inner(context: PathContext, path: &str, mode: LookupMode) -> FsR
         index += 1;
     }
     Ok(cursor)
+}
+
+fn resolve_path_inner(context: PathContext, path: &str, mode: LookupMode) -> FsResult<VfsCursor> {
+    if path.is_empty() {
+        return Err(FsError::NotFound);
+    }
+    if let Some(cursor) = resolve_path_streaming_no_symlink(&context, path, mode)? {
+        return Ok(cursor);
+    }
+    resolve_path_with_component_vec(context, path, mode)
 }
 
 fn split_parent_path(path: &str) -> FsResult<(&str, &str)> {
