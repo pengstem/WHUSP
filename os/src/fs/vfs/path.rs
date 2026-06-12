@@ -126,12 +126,27 @@ impl VfsCursor {
         }
     }
 
-    fn from_working_dir(context: &PathContext) -> Self {
+    fn root_with_capacity(context: &PathContext, additional: usize) -> Self {
+        let root = context.root();
+        let root_path = context.root_path();
+        let mut path = String::with_capacity(root_path.len().saturating_add(additional));
+        path.push_str(root_path);
+        Self {
+            node: VfsNodeId::new(root.mount_id(), root.ino()),
+            kind: FsNodeKind::Directory,
+            path,
+        }
+    }
+
+    fn from_working_dir_with_capacity(context: &PathContext, additional: usize) -> Self {
         let cwd = context.cwd();
+        let cwd_path = context.cwd_path();
+        let mut path = String::with_capacity(cwd_path.len().saturating_add(additional));
+        path.push_str(cwd_path);
         Self {
             node: VfsNodeId::new(cwd.mount_id(), cwd.ino()),
             kind: FsNodeKind::Directory,
-            path: String::from(context.cwd_path()),
+            path,
         }
     }
 
@@ -354,10 +369,11 @@ fn lookup_parent_in_context(cursor: VfsCursor, context: &PathContext) -> FsResul
 }
 
 fn start_cursor(context: &PathContext, path: &str) -> VfsCursor {
+    let capacity_hint = path.len().saturating_add(1);
     if path.starts_with('/') {
-        VfsCursor::root(context)
+        VfsCursor::root_with_capacity(context, capacity_hint)
     } else {
-        VfsCursor::from_working_dir(context)
+        VfsCursor::from_working_dir_with_capacity(context, capacity_hint)
     }
 }
 
@@ -401,7 +417,6 @@ fn resolve_path_inner(context: PathContext, path: &str, mode: LookupMode) -> FsR
         return Err(FsError::NotFound);
     }
     let mut cursor = start_cursor(&context, path);
-    reserve_visible_path_for_lookup(&mut cursor, path);
     let mut components = borrowed_path_components(path);
     let mut index = 0usize;
     let mut symlink_follows = 0usize;
