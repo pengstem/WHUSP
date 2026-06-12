@@ -1859,16 +1859,46 @@ pub(crate) fn stat_in(
     name: &str,
     follow_final_symlink: bool,
 ) -> FsResult<FileStat> {
+    stat_in_with(context, name, follow_final_symlink, false)
+}
+
+pub(crate) fn stat_full_in(
+    context: PathContext,
+    name: &str,
+    follow_final_symlink: bool,
+) -> FsResult<FileStat> {
+    stat_in_with(context, name, follow_final_symlink, true)
+}
+
+fn stat_in_with(
+    context: PathContext,
+    name: &str,
+    follow_final_symlink: bool,
+    full_stat: bool,
+) -> FsResult<FileStat> {
     let mode = if follow_final_symlink {
         LookupMode::FollowFinal
     } else {
         LookupMode::NoFollowFinal
     };
-    let path = vfs_path::resolve_existing_in(context, name, mode)?;
-    let mut stat =
-        with_mount(path.node.mount_id, |mount| mount.stat(path.node.ino)).ok_or(FsError::Io)??;
+    let path = {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathLookup);
+        vfs_path::resolve_existing_in(context, name, mode)?
+    };
+    let mut stat = {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathBackendStat);
+        with_mount(path.node.mount_id, |mount| {
+            if full_stat {
+                mount.stat(path.node.ino)
+            } else {
+                mount.stat_basic(path.node.ino)
+            }
+        })
+        .ok_or(FsError::Io)??
+    };
     stat.dev = path.node.mount_id.0 as u64;
     if path.kind == FsNodeKind::RegularFile {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathDirtyOverlay);
         overlay_dirty_regular_stat(path.node, &mut stat);
     }
     Ok(stat)

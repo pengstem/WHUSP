@@ -147,6 +147,9 @@ pub(crate) trait FileSystemBackend: Send {
         Err(FsError::InvalidInput)
     }
     fn stat(&mut self, ino: u32) -> FsResult<FileStat>;
+    fn stat_basic(&mut self, ino: u32) -> FsResult<FileStat> {
+        self.stat(ino)
+    }
     fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize>;
     fn supports_read_snapshot(&mut self, _ino: u32) -> bool {
         false

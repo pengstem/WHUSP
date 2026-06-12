@@ -3,7 +3,7 @@ use crate::fs::{
     S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, VfsNodeId, chmod_in, chown_in, lookup_path_in,
     mount_is_read_only, nfs_compat_source_path, open_file_in, stat_devfs_child,
     stat_devfs_input_child, stat_devfs_misc_child, stat_devfs_net_child, stat_devfs_pts_child,
-    stat_in, stat_static_path, statfs_for_mount,
+    stat_full_in, stat_in, stat_static_path, statfs_for_mount,
 };
 use crate::perf;
 use crate::sync::SleepMutex;
@@ -88,6 +88,25 @@ pub(super) fn resolve_stat_from(
     path: &str,
     follow_final_symlink: bool,
 ) -> SysResult<FileStat> {
+    resolve_stat_from_with(snapshot, dirfd, path, follow_final_symlink, false)
+}
+
+fn resolve_full_stat_from(
+    snapshot: &PathSnapshot,
+    dirfd: isize,
+    path: &str,
+    follow_final_symlink: bool,
+) -> SysResult<FileStat> {
+    resolve_stat_from_with(snapshot, dirfd, path, follow_final_symlink, true)
+}
+
+fn resolve_stat_from_with(
+    snapshot: &PathSnapshot,
+    dirfd: isize,
+    path: &str,
+    follow_final_symlink: bool,
+    full_stat: bool,
+) -> SysResult<FileStat> {
     let path = {
         let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathResolveAt);
         match resolve_at_path(snapshot, dirfd, path, true)? {
@@ -122,11 +141,13 @@ pub(super) fn resolve_stat_from(
         }
     }
     let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathVfsStat);
-    Ok(stat_in(
-        path_context_from(snapshot, dirfd, path)?,
-        path,
-        follow_final_symlink,
-    )?)
+    let context = path_context_from(snapshot, dirfd, path)?;
+    let stat = if full_stat {
+        stat_full_in(context, path, follow_final_symlink)?
+    } else {
+        stat_in(context, path, follow_final_symlink)?
+    };
+    Ok(stat)
 }
 
 pub fn sys_fstat_ctx(ctx: &SyscallContext, fd: usize, statbuf: *mut LinuxKstat) -> SysResult {
@@ -775,7 +796,7 @@ fn resolve_statx_stat(
         {
             return Ok(stat);
         }
-        let stat = resolve_stat_from(
+        let stat = resolve_full_stat_from(
             snapshot,
             AT_FDCWD,
             source_path.as_str(),
@@ -785,5 +806,5 @@ fn resolve_statx_stat(
         return Ok(stat);
     }
 
-    resolve_stat_from(snapshot, dirfd, path, follow_final_symlink)
+    resolve_full_stat_from(snapshot, dirfd, path, follow_final_symlink)
 }

@@ -18,6 +18,11 @@ pub(crate) enum ProfilePoint {
     StatPathResolveAt,
     StatPathStaticPath,
     StatPathVfsStat,
+    StatPathLookup,
+    StatPathBackendStat,
+    StatPathDirtyOverlay,
+    Ext4StatGetAttr,
+    Ext4StatInodeFlags,
     Ext4Read,
     PageFault,
     SchedulerFetch,
@@ -52,7 +57,7 @@ pub(crate) enum ProfilePoint {
 }
 
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
-const PROFILE_POINT_COUNT: usize = 47;
+const PROFILE_POINT_COUNT: usize = 52;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
@@ -644,6 +649,11 @@ mod enabled {
         TimeStat::new("stat_path_resolve_at"),
         TimeStat::new("stat_path_static_path"),
         TimeStat::new("stat_path_vfs_stat"),
+        TimeStat::new("stat_path_lookup"),
+        TimeStat::new("stat_path_backend_stat"),
+        TimeStat::new("stat_path_dirty_overlay"),
+        TimeStat::new("ext4_stat_get_attr"),
+        TimeStat::new("ext4_stat_inode_flags"),
         TimeStat::new("ext4_read"),
         TimeStat::new("page_fault"),
         TimeStat::new("scheduler_fetch"),

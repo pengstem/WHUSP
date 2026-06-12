@@ -129,6 +129,37 @@ impl Ext4Mount {
             runtime_special_rdevs: BTreeMap::new(),
         })
     }
+
+    fn stat_from_attr(
+        &self,
+        ino: u32,
+        attr: lwext4_rust::FileAttr,
+        inode_flags: u32,
+        inode_flags_supported: u32,
+    ) -> FileStat {
+        FileStat {
+            dev: attr.device,
+            ino: attr.ino as u64,
+            mode: attr.mode,
+            nlink: attr.nlink as u32,
+            uid: attr.uid,
+            gid: attr.gid,
+            rdev: self.runtime_special_rdevs.get(&ino).copied().unwrap_or(0),
+            inode_flags,
+            inode_flags_supported,
+            size: attr.size,
+            blksize: attr.block_size as u32,
+            blocks: attr.blocks,
+            atime_sec: attr.atime.as_secs(),
+            atime_nsec: attr.atime.subsec_nanos(),
+            btime_sec: attr.btime.as_secs(),
+            btime_nsec: attr.btime.subsec_nanos(),
+            mtime_sec: attr.mtime.as_secs(),
+            mtime_nsec: attr.mtime.subsec_nanos(),
+            ctime_sec: attr.ctime.as_secs(),
+            ctime_nsec: attr.ctime.subsec_nanos(),
+        }
+    }
 }
 
 impl FileSystemBackend for Ext4Mount {
@@ -365,30 +396,24 @@ impl FileSystemBackend for Ext4Mount {
 
     fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
         let mut attr = lwext4_rust::FileAttr::default();
-        self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
-        let inode_flags = self.fs.inode_flags(ino).map_err(map_ext4_error)?;
-        Ok(FileStat {
-            dev: attr.device,
-            ino: attr.ino as u64,
-            mode: attr.mode,
-            nlink: attr.nlink as u32,
-            uid: attr.uid,
-            gid: attr.gid,
-            rdev: self.runtime_special_rdevs.get(&ino).copied().unwrap_or(0),
-            inode_flags,
-            inode_flags_supported: FS_STATX_ATTR_FLAGS,
-            size: attr.size,
-            blksize: attr.block_size as u32,
-            blocks: attr.blocks,
-            atime_sec: attr.atime.as_secs(),
-            atime_nsec: attr.atime.subsec_nanos(),
-            btime_sec: attr.btime.as_secs(),
-            btime_nsec: attr.btime.subsec_nanos(),
-            mtime_sec: attr.mtime.as_secs(),
-            mtime_nsec: attr.mtime.subsec_nanos(),
-            ctime_sec: attr.ctime.as_secs(),
-            ctime_nsec: attr.ctime.subsec_nanos(),
-        })
+        {
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::Ext4StatGetAttr);
+            self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
+        }
+        let inode_flags = {
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::Ext4StatInodeFlags);
+            self.fs.inode_flags(ino).map_err(map_ext4_error)?
+        };
+        Ok(self.stat_from_attr(ino, attr, inode_flags, FS_STATX_ATTR_FLAGS))
+    }
+
+    fn stat_basic(&mut self, ino: u32) -> FsResult<FileStat> {
+        let mut attr = lwext4_rust::FileAttr::default();
+        {
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::Ext4StatGetAttr);
+            self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
+        }
+        Ok(self.stat_from_attr(ino, attr, 0, 0))
     }
 
     fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
