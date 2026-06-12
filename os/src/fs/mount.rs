@@ -2426,14 +2426,23 @@ fn mount_fs_type(mount_id: MountId) -> Option<&'static str> {
 }
 
 pub(super) fn mount_supports_page_cache(mount_id: MountId) -> bool {
+    if mount_id == primary_mount_id() {
+        return true;
+    }
     mount_fs_type(mount_id).is_some_and(|fs_type| matches!(fs_type, "ext4" | "vfat" | "tmpfs"))
 }
 
 pub(super) fn mount_supports_dirty_writeback(mount_id: MountId) -> bool {
+    if mount_id == primary_mount_id() {
+        return true;
+    }
     mount_fs_type(mount_id).is_some_and(|fs_type| fs_type == "ext4")
 }
 
 pub(super) fn mount_supports_dentry_cache(mount_id: MountId) -> bool {
+    if mount_id == primary_mount_id() {
+        return true;
+    }
     mount_fs_type(mount_id).is_some_and(|fs_type| matches!(fs_type, "ext4" | "vfat" | "tmpfs"))
 }
 
