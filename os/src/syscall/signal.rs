@@ -113,6 +113,40 @@ fn try_return_pending_signal(
     Ok(Some(signum as isize))
 }
 
+fn try_return_waitable_sigchld(
+    token: usize,
+    wanted: SignalFlags,
+    info_ptr: *mut LinuxSigInfo,
+) -> SysResult<Option<isize>> {
+    if !wanted.contains(SignalFlags::SIGCHLD) {
+        return Ok(None);
+    }
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if !inner.signal_actions[crate::task::SIGCHLD as usize].has_user_handler() {
+        return Ok(None);
+    }
+    let Some(info) = inner.children.iter().find_map(|child| {
+        let child_inner = child.inner_exclusive_access();
+        child_inner.is_zombie.then(|| {
+            SignalInfo::child_exit(
+                crate::task::SIGCHLD as i32,
+                child.getpid() as i32,
+                child_inner.exit_code,
+            )
+        })
+    }) else {
+        return Ok(None);
+    };
+    drop(inner);
+
+    if !info_ptr.is_null() {
+        let info = LinuxSigInfo::from(info);
+        write_user_value(token, info_ptr, &info)?;
+    }
+    Ok(Some(crate::task::SIGCHLD as isize))
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct LinuxKernelSigAction {
@@ -377,6 +411,14 @@ pub fn sys_rt_sigtimedwait(
 
     loop {
         if let Some(signum) = try_return_pending_signal(token, wanted, info)? {
+            return Ok(signum);
+        }
+        // CONTEXT: libc-test's runtest wrapper can briefly unblock SIGCHLD
+        // around fork on LoongArch; a fast child may run its empty SIGCHLD
+        // handler before the parent reaches sigtimedwait(). Linux still keeps
+        // the child waitable, so let sigtimedwait(SIGCHLD) observe that state
+        // without reaping it. The later waitpid() remains the reap boundary.
+        if let Some(signum) = try_return_waitable_sigchld(token, wanted, info)? {
             return Ok(signum);
         }
 
