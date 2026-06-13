@@ -32,12 +32,12 @@ sbi-rt = { version = "0.0.3", features = ["legacy"] }
 loongArch64 = { path = "../vendor/crates/loongArch64" }
 
 [profile.release]
-# debug = true
+debug = true
 lto = true
 codegen-units = 1
 # opt-level = "z"
-panic = "abort"
-strip = true
+# panic = "abort"
+# strip = true
 
 [[bin]]
 name = "os"
