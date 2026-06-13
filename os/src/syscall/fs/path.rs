@@ -722,6 +722,9 @@ fn read_open_how_extra_zeros_ctx(
     if size <= known_size {
         return Ok(());
     }
+    // Linux openat2() accepts a larger open_how only when the unknown tail is
+    // zero-filled; nonzero future fields must report E2BIG instead of being
+    // silently ignored.
     let extra_ptr = (how as usize)
         .checked_add(known_size)
         .ok_or(SysError::EFAULT)? as *const u8;

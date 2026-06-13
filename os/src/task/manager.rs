@@ -29,7 +29,12 @@ pub struct TaskManager {
     ready_count: usize,
 }
 
-/// A FIFO scheduler with separate realtime priority buckets.
+/// Single-run-queue scheduler used by the contest kernel.
+///
+/// Realtime tasks use Linux-style static priority buckets, while normal tasks
+/// use a nice-weighted vruntime key. Do not treat this as a full Linux
+/// scheduler class implementation; syscall-visible SCHED_DEADLINE attributes
+/// are stored elsewhere but are not enforced by this picker.
 impl TaskManager {
     pub fn new() -> Self {
         Self {
