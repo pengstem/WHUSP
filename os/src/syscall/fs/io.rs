@@ -285,6 +285,7 @@ fn flush_pwritev_bounce(
         return Ok(false);
     }
     let intended_len = bounce.len();
+    perf::record_pwritev_regular_bounce(intended_len);
     file.check_write_at(*offset, intended_len)
         .map_err(SysError::from)?;
     let written = file.write_at(*offset, bounce.as_slice());
@@ -388,6 +389,7 @@ fn pwritev_regular_file_direct_page_slices(
                 let written = file
                     .write_at_aligned_user_buffer(offset, UserBuffer::new(buffers))
                     .map_err(SysError::from)?;
+                perf::record_pwritev_regular_direct_user_buffer(written);
                 return Ok(written);
             }
             Err(err) => return Err(err),
@@ -401,8 +403,11 @@ fn pwritev_regular_file_direct_page_slices(
             break;
         }
     }
-    file.write_at_aligned_user_buffer(offset, UserBuffer::new(buffers))
-        .map_err(SysError::from)
+    let written = file
+        .write_at_aligned_user_buffer(offset, UserBuffer::new(buffers))
+        .map_err(SysError::from)?;
+    perf::record_pwritev_regular_direct_user_buffer(written);
+    Ok(written)
 }
 
 fn writev_regular_file_direct_page_slices(
@@ -587,11 +592,11 @@ fn allowed_write_len_at_with_limit(
     if requested_len == 0 {
         return Ok(0);
     }
-    let stat = file.stat()?;
-    if stat.mode & S_IFMT != S_IFREG {
+    if limit == usize::MAX {
         return Ok(requested_len);
     }
-    if limit == usize::MAX {
+    let stat = file.stat()?;
+    if stat.mode & S_IFMT != S_IFREG {
         return Ok(requested_len);
     }
     let write_end = offset.checked_add(requested_len).ok_or(SysError::EFBIG)?;
@@ -628,6 +633,9 @@ fn allowed_write_len_for_entry_with_limit(
     requested_len: usize,
     limit: usize,
 ) -> SysResult<usize> {
+    if requested_len == 0 || limit == usize::MAX {
+        return Ok(requested_len);
+    }
     let file = entry.file();
     let stat = file.stat()?;
     if stat.mode & S_IFMT != S_IFREG {
@@ -732,18 +740,18 @@ fn checked_position_offset_pair(pos_l: usize, pos_h: usize) -> SysResult<usize> 
 }
 
 fn ensure_positioned_target(file: &(dyn File + Send + Sync)) -> SysResult<()> {
-    let mode = file.stat()?.mode;
-    if mode & S_IFMT == S_IFDIR {
+    let mode_type = file.mode_type()?;
+    if mode_type == S_IFDIR {
         return Err(SysError::EISDIR);
     }
-    if mode & S_IFREG != S_IFREG {
+    if mode_type != S_IFREG {
         return Err(SysError::ESPIPE);
     }
     Ok(())
 }
 
 fn ensure_fadvise_target(file: &(dyn File + Send + Sync)) -> SysResult<()> {
-    if file.stat()?.mode & S_IFMT == S_IFREG {
+    if file.mode_type()? == S_IFREG {
         Ok(())
     } else {
         Err(SysError::ESPIPE)
@@ -795,7 +803,7 @@ pub fn sys_ftruncate(fd: usize, len: usize) -> SysResult {
         // ftruncate03 checks that Linux-visible errno.
         return Err(SysError::EINVAL);
     }
-    if file.stat()?.mode & S_IFREG != S_IFREG {
+    if file.mode_type()? != S_IFREG {
         return Err(SysError::EINVAL);
     }
     check_file_size_limit_for_len(file.as_ref(), len)?;
@@ -1140,7 +1148,7 @@ fn ensure_sendfile_input(file: &(dyn File + Send + Sync)) -> SysResult<()> {
     if !file.readable() {
         return Err(SysError::EBADF);
     }
-    if file.stat()?.mode & S_IFMT != S_IFREG {
+    if file.mode_type()? != S_IFREG {
         return Err(SysError::EINVAL);
     }
     Ok(())
@@ -1289,7 +1297,7 @@ pub fn sys_splice(
     if out_entry.status_flags().contains(OpenFlags::APPEND) {
         return Err(SysError::EINVAL);
     }
-    if in_file.stat()?.mode & S_IFDIR == S_IFDIR || out_file.stat()?.mode & S_IFDIR == S_IFDIR {
+    if in_file.mode_type()? == S_IFDIR || out_file.mode_type()? == S_IFDIR {
         return Err(SysError::EINVAL);
     }
     if !in_file.supports_splice_read() || !out_file.supports_splice_write() {
@@ -1352,8 +1360,8 @@ pub fn sys_splice(
 
 pub fn sys_fsync(fd: usize) -> SysResult {
     let file = get_file_by_fd(fd)?;
-    let mode = file.stat()?.mode;
-    if mode & S_IFREG != S_IFREG && mode & S_IFDIR != S_IFDIR {
+    let mode_type = file.mode_type()?;
+    if mode_type != S_IFREG && mode_type != S_IFDIR {
         return Err(SysError::EINVAL);
     }
     file.sync(false)?;
@@ -1362,8 +1370,7 @@ pub fn sys_fsync(fd: usize) -> SysResult {
 
 pub fn sys_fdatasync(fd: usize) -> SysResult {
     let file = get_file_by_fd(fd)?;
-    let mode = file.stat()?.mode;
-    if mode & S_IFMT != S_IFREG {
+    if file.mode_type()? != S_IFREG {
         return Err(SysError::EINVAL);
     }
     file.sync(true)?;
@@ -1805,7 +1812,7 @@ fn sys_writev_with_iovecs(
     )?;
 
     let requested_len = allowed_len;
-    if iovcnt > 1 && file.stat()?.mode & S_IFMT == S_IFREG {
+    if iovcnt > 1 && file.mode_type()? == S_IFREG {
         let append = entry.status_flags().contains(OpenFlags::APPEND);
         let use_direct_page_slices = writev_can_use_direct_page_slices(&iovecs, allowed_len)
             && file.supports_aligned_user_buffer_write(allowed_len, append);
@@ -1872,8 +1879,8 @@ fn sys_readv_with_iovecs(token: usize, fd: usize, iovecs: UserIovecs, iovcnt: us
     }
     let requested_len = iovecs.total_len;
     let file = get_file_by_fd(fd)?;
-    let mode = file.stat()?.mode;
-    if mode & S_IFMT == S_IFDIR {
+    let mode_type = file.mode_type()?;
+    if mode_type == S_IFDIR {
         return Err(SysError::EISDIR);
     }
     if !file.readable() {
@@ -1884,7 +1891,7 @@ fn sys_readv_with_iovecs(token: usize, fd: usize, iovecs: UserIovecs, iovcnt: us
     ensure_nonblocking_ready(&entry, PollEvents::POLLIN)?;
 
     let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Write);
-    let reuse_checked_range = USER_IOVEC_RANGE_REUSE && iovcnt > 1 && mode & S_IFMT == S_IFREG;
+    let reuse_checked_range = USER_IOVEC_RANGE_REUSE && iovcnt > 1 && mode_type == S_IFREG;
     cursor.validate_all(reuse_checked_range)?;
     if reuse_checked_range {
         let buffers = collect_iovec_buffers(cursor, requested_len)?;
@@ -1913,7 +1920,7 @@ pub fn sys_read_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize)
     let _profile_scope = perf::time_scope(perf::ProfilePoint::SysRead);
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
-    if file.stat()?.mode & S_IFMT == S_IFDIR {
+    if file.mode_type()? == S_IFDIR {
         return Err(SysError::EISDIR);
     }
     if !file.readable() {
@@ -1938,7 +1945,7 @@ pub fn sys_readahead(fd: usize, _offset: usize, _count: usize) -> SysResult {
     if file.is_io_uring() {
         return Err(SysError::EINVAL);
     }
-    match file.stat()?.mode & S_IFMT {
+    match file.mode_type()? {
         S_IFREG => {
             crate::fs::procfs_note_readahead();
             Ok(0)

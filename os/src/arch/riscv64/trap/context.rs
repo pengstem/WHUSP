@@ -12,6 +12,7 @@ pub struct TrapContext {
     pub f: [u64; 32],
     pub fcsr: u32,
     pub fpu_state_valid: u32,
+    pub kernel_entry_flush: usize,
 }
 
 // RISC-V psABI register indexes used by set_*: x2=sp, x4=tp, x10=a0.
@@ -57,11 +58,6 @@ impl TrapContext {
         self.fpu_state_valid = 1;
     }
 
-    pub fn mark_user_fp_disabled(&mut self) {
-        self.sstatus = Self::user_sstatus_with_fs(FS::Off);
-        self.fpu_state_valid = 1;
-    }
-
     pub fn app_init_context(
         entry: usize,
         sp: usize,
@@ -79,6 +75,7 @@ impl TrapContext {
             f: [0; 32],
             fcsr: 0,
             fpu_state_valid: 0,
+            kernel_entry_flush: 1,
         };
         cx.set_sp(sp);
         cx

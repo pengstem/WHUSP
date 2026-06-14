@@ -256,6 +256,22 @@ fn translated_byte_buffer_checked_with_resolver(
     let mut start = ptr as usize;
     let end = start.checked_add(len).ok_or(SysError::EFAULT)?;
     let page_table = PageTable::from_token(token);
+    let start_va = VirtAddr::from(start);
+    if start_va.floor() == VirtAddr::from(end - 1).floor() {
+        let pte = checked_user_pte(
+            &page_table,
+            token,
+            start,
+            access,
+            fault_handler,
+            USER_COPY_LEAF_PTE_CACHE,
+        )?;
+        let offset = start_va.page_offset();
+        let mut buffers = Vec::with_capacity(1);
+        buffers.push(&mut pte.ppn().get_bytes_array()[offset..offset + len]);
+        perf::record_usercopy_checked_range(1, len);
+        return Ok(buffers);
+    }
     let mut buffers = Vec::new();
     while start < end {
         let start_va = VirtAddr::from(start);

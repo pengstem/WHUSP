@@ -12,6 +12,7 @@ const DEFAULT_BLOCK_CACHE_CAPACITY: usize = 1024;
 const READ_CACHE_LINE_BLOCKS: usize = PAGE_SIZE / BLOCK_CACHE_LINE_SIZE;
 const READ_CACHE_LINE_SIZE: usize = READ_CACHE_LINE_BLOCKS * BLOCK_CACHE_LINE_SIZE;
 const DEFAULT_READ_CACHE_CAPACITY: usize = 2048;
+const MAX_CACHED_IO_BLOCKS: usize = 64;
 
 #[cfg(feature = "perf-counters")]
 macro_rules! record_cache_stat {
@@ -272,6 +273,22 @@ impl BlockCache {
             self.stats.write4k_update += 1;
         }
         self.trim_read4k_to_capacity();
+    }
+
+    fn update_after_write4k_run(&mut self, device_key: usize, block_id: usize, data: &[u8]) {
+        if !self.enabled || self.read_capacity == 0 {
+            return;
+        }
+        for (line_offset, chunk) in data.chunks(READ_CACHE_LINE_SIZE).enumerate() {
+            if chunk.len() != READ_CACHE_LINE_SIZE {
+                break;
+            }
+            self.update_after_write4k(
+                device_key,
+                block_id + line_offset * READ_CACHE_LINE_BLOCKS,
+                chunk,
+            );
+        }
     }
 
     fn invalidate_read4k_range(&mut self, device_key: usize, block_id: usize, blocks: usize) {
@@ -537,6 +554,12 @@ fn cache_update_after_write4k(device_key: usize, block_id: usize, data: &[u8]) {
         .update_after_write4k(device_key, block_id, data);
 }
 
+fn cache_update_after_write4k_run(device_key: usize, block_id: usize, data: &[u8]) {
+    BLOCK_CACHE
+        .exclusive_access()
+        .update_after_write4k_run(device_key, block_id, data);
+}
+
 fn cache_insert_read_run(device_key: usize, block_id: usize, data: &[u8]) {
     BLOCK_CACHE
         .exclusive_access()
@@ -621,14 +644,19 @@ fn page_bounded_full_blocks(buf: &[u8], max_blocks: usize) -> usize {
     if max_blocks == 0 {
         return 0;
     }
-    // VirtioHal::share() translates the first byte of each slice. Keep each
-    // cached submission inside one kernel page so DMA never assumes adjacent
-    // virtual pages are physically contiguous.
+    // VirtioHal::share() can now bounce non-contiguous multi-page slices, but
+    // direct single-page submissions still avoid that extra copy.
     let page_offset = (buf.as_ptr() as usize) & (PAGE_SIZE - 1);
     let page_remaining = PAGE_SIZE - page_offset;
     (page_remaining / BLOCK_CACHE_LINE_SIZE)
         .max(1)
         .min(max_blocks)
+}
+
+fn cached_io_full_blocks(buf: &[u8], max_blocks: usize) -> usize {
+    max_blocks
+        .min(MAX_CACHED_IO_BLOCKS)
+        .min(buf.len() / BLOCK_CACHE_LINE_SIZE)
 }
 
 fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
@@ -714,6 +742,17 @@ pub(crate) fn write_with_cache<F>(
     let mut index = 0;
     while index < full_blocks {
         let start = index * BLOCK_CACHE_LINE_SIZE;
+        if full_blocks - index > READ_CACHE_LINE_BLOCKS {
+            let blocks = cached_io_full_blocks(&buf[start..full_bytes], full_blocks - index);
+            let end = start + blocks * BLOCK_CACHE_LINE_SIZE;
+            record_device_write_submit(blocks);
+            write_uncached(block_id + index, &buf[start..end]);
+            cache_invalidate_read4k_range(device_key, block_id + index, blocks);
+            cache_invalidate_legacy_range_after_write(device_key, block_id + index, blocks);
+            cache_update_after_write4k_run(device_key, block_id + index, &buf[start..end]);
+            index += blocks;
+            continue;
+        }
         if can_use_write4k(&buf[start..full_bytes], full_blocks - index) {
             let end = start + READ_CACHE_LINE_SIZE;
             record_device_write_submit(READ_CACHE_LINE_BLOCKS);

@@ -2,6 +2,7 @@ use crate::mm::{
     FrameTracker, PageTable, PhysAddr, PhysPageNum, VirtAddr, frame_alloc_more, kernel_token,
 };
 use crate::sync::UPIntrFreeCell;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 use lazy_static::*;
@@ -26,6 +27,8 @@ lazy_static! {
     // the general allocator earlier would leave device-visible memory aliased.
     static ref QUEUE_FRAMES: UPIntrFreeCell<Vec<FrameTracker>> =
         unsafe { UPIntrFreeCell::new(Vec::new()) };
+    static ref SHARED_BOUNCES: UPIntrFreeCell<BTreeMap<VirtioPhysAddr, Vec<FrameTracker>>> =
+        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
 }
 
 pub struct VirtioHal;
@@ -66,13 +69,54 @@ unsafe impl Hal for VirtioHal {
         NonNull::new({ paddr as usize } as *mut u8).unwrap()
     }
 
-    unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> VirtioPhysAddr {
+    unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> VirtioPhysAddr {
         // Virtio buffers are kernel virtual addresses. Translate through the
         // kernel page table instead of assuming direct virtual=physical layout.
-        virt_to_phys(buffer.as_ptr() as *mut u8 as usize) as VirtioPhysAddr
+        let vaddr = buffer.as_ptr() as *mut u8 as usize;
+        let len = buffer.len();
+        if virt_range_is_phys_contiguous(vaddr, len) {
+            return virt_to_phys(vaddr) as VirtioPhysAddr;
+        }
+
+        let pages = len.div_ceil(crate::config::PAGE_SIZE);
+        let trackers = frame_alloc_more(pages).expect("failed to allocate virtio bounce frames");
+        let ppn_base = trackers
+            .iter()
+            .map(|tracker| tracker.ppn)
+            .min()
+            .expect("virtio bounce allocation returned no frames");
+        let pa: PhysAddr = ppn_base.into();
+        let bounce = unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut u8, len) };
+        let mut buffer = buffer;
+        let original = unsafe { buffer.as_mut() };
+        if matches!(
+            direction,
+            BufferDirection::DriverToDevice | BufferDirection::Both
+        ) {
+            bounce.copy_from_slice(original);
+        }
+        SHARED_BOUNCES
+            .exclusive_access()
+            .insert(pa.0 as VirtioPhysAddr, trackers);
+        pa.0 as VirtioPhysAddr
     }
 
-    unsafe fn unshare(_paddr: VirtioPhysAddr, _buffer: NonNull<[u8]>, _direction: BufferDirection) {
+    unsafe fn unshare(paddr: VirtioPhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection) {
+        let frames = SHARED_BOUNCES.exclusive_access().remove(&paddr);
+        let Some(frames) = frames else {
+            return;
+        };
+        let len = buffer.len();
+        if matches!(
+            direction,
+            BufferDirection::DeviceToDriver | BufferDirection::Both
+        ) {
+            let bounce = unsafe { core::slice::from_raw_parts(paddr as *const u8, len) };
+            let mut buffer = buffer;
+            let original = unsafe { buffer.as_mut() };
+            original.copy_from_slice(bounce);
+        }
+        drop(frames);
     }
 }
 
@@ -81,4 +125,23 @@ fn virt_to_phys(vaddr: usize) -> usize {
         .translate_va(VirtAddr::from(vaddr))
         .unwrap()
         .0
+}
+
+fn virt_range_is_phys_contiguous(vaddr: usize, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let page_size = crate::config::PAGE_SIZE;
+    let first_page = vaddr & !(page_size - 1);
+    let last_page = (vaddr + len - 1) & !(page_size - 1);
+    let mut page = first_page;
+    let mut expected_pa = virt_to_phys(first_page);
+    while page <= last_page {
+        if virt_to_phys(page) != expected_pa {
+            return false;
+        }
+        page += page_size;
+        expected_pa += page_size;
+    }
+    true
 }

@@ -21,7 +21,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 
 const IN_ACCESS: u32 = 0x0000_0001;
@@ -73,6 +73,7 @@ const WATCH_FLAGS: u32 =
 const VALID_WATCH_MASK: u32 = WATCH_EVENTS | GENERATED_EVENTS | WATCH_FLAGS | IN_ISDIR;
 
 static NEXT_MOVE_COOKIE: AtomicU32 = AtomicU32::new(1);
+static LIVE_INOTIFY_GROUPS: AtomicUsize = AtomicUsize::new(0);
 
 lazy_static! {
     static ref INOTIFY_GROUPS: UPIntrFreeCell<Vec<Weak<InotifyGroup>>> =
@@ -168,6 +169,7 @@ impl InotifyGroup {
             },
         });
         INOTIFY_GROUPS.exclusive_session(|groups| groups.push(Arc::downgrade(&group)));
+        LIVE_INOTIFY_GROUPS.fetch_add(1, Ordering::Relaxed);
         group
     }
 
@@ -412,6 +414,12 @@ impl InotifyGroup {
     }
 }
 
+impl Drop for InotifyGroup {
+    fn drop(&mut self) {
+        LIVE_INOTIFY_GROUPS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl InotifyFile {
     fn new(group: Arc<InotifyGroup>) -> Self {
         Self {
@@ -615,6 +623,10 @@ fn publish_file_event(
     event_mask: u32,
     event_path: Option<&str>,
 ) {
+    if LIVE_INOTIFY_GROUPS.load(Ordering::Relaxed) == 0 {
+        perf::record_inotify_no_live_group_fast_path();
+        return;
+    }
     let live_groups = live_inotify_groups();
     if live_groups.is_empty() {
         perf::record_inotify_no_live_group_fast_path();
@@ -644,6 +656,10 @@ fn publish_child_event(
     path: &str,
     cookie: u32,
 ) {
+    if LIVE_INOTIFY_GROUPS.load(Ordering::Relaxed) == 0 {
+        perf::record_inotify_no_live_group_fast_path();
+        return;
+    }
     let live_groups = live_inotify_groups();
     if live_groups.is_empty() {
         perf::record_inotify_no_live_group_fast_path();
@@ -673,6 +689,10 @@ fn publish_child_event(
 }
 
 fn publish_self_event(file: &Arc<dyn File + Send + Sync>, event_mask: u32) {
+    if LIVE_INOTIFY_GROUPS.load(Ordering::Relaxed) == 0 {
+        perf::record_inotify_no_live_group_fast_path();
+        return;
+    }
     let live_groups = live_inotify_groups();
     if live_groups.is_empty() {
         perf::record_inotify_no_live_group_fast_path();

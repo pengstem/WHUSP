@@ -27,6 +27,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 
 const FAN_ACCESS: u64 = 0x0000_0001;
@@ -145,6 +146,8 @@ lazy_static! {
     static ref FANOTIFY_NODE_NAMES: UPIntrFreeCell<BTreeMap<VfsNodeId, String>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
 }
+
+static LIVE_FANOTIFY_GROUPS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Eq, PartialEq)]
 enum FanotifyMarkTarget {
@@ -274,6 +277,7 @@ impl FanotifyGroup {
             },
         });
         FANOTIFY_GROUPS.exclusive_session(|groups| groups.push(Arc::downgrade(&group)));
+        LIVE_FANOTIFY_GROUPS.fetch_add(1, Ordering::Relaxed);
         group
     }
 
@@ -774,6 +778,12 @@ impl FanotifyGroup {
     }
 }
 
+impl Drop for FanotifyGroup {
+    fn drop(&mut self) {
+        LIVE_FANOTIFY_GROUPS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 fn align_to_eight(value: usize) -> usize {
     (value + 7) & !7
 }
@@ -1196,6 +1206,10 @@ fn fanotify_notify_file_at(
     event_mask: u64,
     event_path: Option<&str>,
 ) {
+    if LIVE_FANOTIFY_GROUPS.load(Ordering::Relaxed) == 0 {
+        perf::record_fanotify_no_live_group_fast_path();
+        return;
+    }
     let live_groups = live_fanotify_groups();
     if live_groups.is_empty() {
         perf::record_fanotify_no_live_group_fast_path();
@@ -1248,6 +1262,10 @@ fn fanotify_notify_dirent_event(
     event_mask: u64,
     event_path: &str,
 ) {
+    if LIVE_FANOTIFY_GROUPS.load(Ordering::Relaxed) == 0 {
+        perf::record_fanotify_no_live_group_fast_path();
+        return;
+    }
     let Some(child_node) = file.vfs_node_id() else {
         return;
     };
@@ -1287,6 +1305,10 @@ fn fanotify_notify_self_event(
     event_mask: u64,
     event_path: &str,
 ) {
+    if LIVE_FANOTIFY_GROUPS.load(Ordering::Relaxed) == 0 {
+        perf::record_fanotify_no_live_group_fast_path();
+        return;
+    }
     let Some(node) = file.vfs_node_id() else {
         return;
     };

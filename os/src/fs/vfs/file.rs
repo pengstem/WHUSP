@@ -40,6 +40,8 @@ const VFS_READ_CHUNK_SIZE: usize = 64 * 1024;
 const VFS_READ_ALL_CHUNK_SIZE: usize = 64 * 1024;
 const VFS_DIRENT_SCRATCH_MAX: usize = 4 * 1024;
 const VFS_READ_CACHE_MAX_FILE_SIZE: usize = 1024 * 1024;
+const VFS_SMALL_READ_CACHE_MIN_FILE_SIZE: usize = 64 * 1024;
+const VFS_SMALL_READ_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const VFS_READ_CACHE_READAHEAD_PAGES: usize = 6;
 const VFS_DIRTY_WRITEBACK_MAX_WRITE_SIZE: usize = 64 * 1024;
 const VFS_DIRTY_WRITEBACK_MAX_PAGES: usize = 4096;
@@ -60,9 +62,15 @@ lazy_static! {
     // open/drop and exec image lifetime boundaries.
     static ref WRITABLE_REGULAR_OPEN_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =
         SleepMutex::new(BTreeMap::new());
+    static ref WRITABLE_SHARED_MMAP_REGULAR_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =
+        SleepMutex::new(BTreeMap::new());
     static ref EXECUTABLE_REGULAR_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =
         SleepMutex::new(BTreeMap::new());
     static ref DIRTY_REGULAR_FILES: SleepMutex<BTreeMap<VfsNodeId, DirtyFileCache>> =
+        SleepMutex::new(BTreeMap::new());
+    static ref SMALL_REGULAR_READ_FILES: SleepMutex<BTreeMap<VfsNodeId, SmallRegularReadCache>> =
+        SleepMutex::new(BTreeMap::new());
+    static ref INODE_FLAGS_CACHE: SleepMutex<BTreeMap<VfsNodeId, u32>> =
         SleepMutex::new(BTreeMap::new());
 }
 
@@ -73,11 +81,80 @@ lazy_static! {
 }
 
 #[derive(Debug)]
+struct DirtyPage {
+    data: Vec<u8>,
+    dirty_ranges: Vec<(usize, usize)>,
+}
+
+impl DirtyPage {
+    fn empty() -> Self {
+        Self {
+            data: vec![0u8; PAGE_SIZE],
+            dirty_ranges: Vec::new(),
+        }
+    }
+
+    fn full(mut data: Vec<u8>) -> Self {
+        if data.len() != PAGE_SIZE {
+            data.resize(PAGE_SIZE, 0);
+        }
+        Self {
+            data,
+            dirty_ranges: vec![(0, PAGE_SIZE)],
+        }
+    }
+
+    fn mark_dirty(&mut self, start: usize, end: usize) {
+        debug_assert!(start <= end && end <= PAGE_SIZE);
+        if start == end {
+            return;
+        }
+        let mut merged_start = start;
+        let mut merged_end = end;
+        let mut index = 0usize;
+        while index < self.dirty_ranges.len() {
+            let (range_start, range_end) = self.dirty_ranges[index];
+            if range_end < merged_start {
+                index += 1;
+                continue;
+            }
+            if range_start > merged_end {
+                break;
+            }
+            merged_start = merged_start.min(range_start);
+            merged_end = merged_end.max(range_end);
+            self.dirty_ranges.remove(index);
+        }
+        self.dirty_ranges.insert(index, (merged_start, merged_end));
+    }
+
+    fn dirty_ranges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.dirty_ranges.iter().copied()
+    }
+}
+
+#[derive(Debug)]
 struct DirtyFileCache {
     logical_size: usize,
     mtime: FileTimestamp,
     ctime: FileTimestamp,
-    pages: BTreeMap<usize, Vec<u8>>,
+    pages: BTreeMap<usize, DirtyPage>,
+}
+
+#[derive(Debug)]
+struct SmallRegularReadCache {
+    data: Vec<u8>,
+}
+
+impl SmallRegularReadCache {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        if offset >= self.data.len() {
+            return 0;
+        }
+        let len = buf.len().min(self.data.len() - offset);
+        buf[..len].copy_from_slice(&self.data[offset..offset + len]);
+        len
+    }
 }
 
 impl DirtyFileCache {
@@ -257,6 +334,15 @@ fn dirty_logical_size(node: VfsNodeId) -> Option<usize> {
         .map(|cache| cache.logical_size)
 }
 
+fn dirty_or_backend_logical_size(node: VfsNodeId) -> Option<usize> {
+    if let Some(size) = dirty_logical_size(node) {
+        return Some(size);
+    }
+    with_mount(node.mount_id, |mount| mount.stat(node.ino))
+        .and_then(Result::ok)
+        .map(|stat| stat.size as usize)
+}
+
 fn dirty_regular_file_has_pages(node: VfsNodeId) -> bool {
     DIRTY_REGULAR_FILES
         .lock()
@@ -287,17 +373,27 @@ fn stat_logical_size(node: VfsNodeId, stat_size: u64) -> u64 {
 fn can_cache_dirty_write(
     kind: FsNodeKind,
     supports_dirty_writeback: bool,
-    offset: usize,
+    _offset: usize,
     len: usize,
     status_flags: OpenFlags,
 ) -> bool {
     kind == FsNodeKind::RegularFile
         && len > 0
         && len <= VFS_DIRTY_WRITEBACK_MAX_WRITE_SIZE
-        && offset % PAGE_SIZE == 0
-        && len % PAGE_SIZE == 0
         && !status_flags.intersects(OpenFlags::DIRECT | OpenFlags::DSYNC | OpenFlags::SYNC)
         && supports_dirty_writeback
+}
+
+fn can_cache_dirty_user_buffer_write(
+    kind: FsNodeKind,
+    supports_dirty_writeback: bool,
+    offset: usize,
+    len: usize,
+    status_flags: OpenFlags,
+) -> bool {
+    can_cache_dirty_write(kind, supports_dirty_writeback, offset, len, status_flags)
+        && offset % PAGE_SIZE == 0
+        && len % PAGE_SIZE == 0
 }
 
 fn dirty_write_page_pressure(
@@ -318,16 +414,91 @@ fn dirty_write_page_pressure(
     (dirty_pages, page_count.saturating_sub(existing_pages))
 }
 
+fn dirty_write_existing_pages(
+    dirty: &BTreeMap<VfsNodeId, DirtyFileCache>,
+    node: VfsNodeId,
+    page_start: usize,
+    page_count: usize,
+) -> Vec<bool> {
+    let Some(cache) = dirty.get(&node) else {
+        let mut pages = Vec::with_capacity(page_count);
+        pages.resize(page_count, false);
+        return pages;
+    };
+    (0..page_count)
+        .map(|page_offset| cache.pages.contains_key(&(page_start + page_offset)))
+        .collect()
+}
+
+fn dirty_write_page_range(offset: usize, len: usize) -> Option<(usize, usize)> {
+    if len == 0 {
+        return Some((offset / PAGE_SIZE, 0));
+    }
+    let end = offset.checked_add(len)?;
+    let page_start = offset / PAGE_SIZE;
+    let page_end = (end - 1) / PAGE_SIZE;
+    Some((page_start, page_end - page_start + 1))
+}
+
+fn prepare_dirty_regular_pages(
+    offset: usize,
+    buf: &[u8],
+    existing_pages: &[bool],
+) -> Option<BTreeMap<usize, DirtyPage>> {
+    let end = offset.checked_add(buf.len())?;
+    let (page_start, page_count) = dirty_write_page_range(offset, buf.len())?;
+    let mut pages = BTreeMap::new();
+    for page_delta in 0..page_count {
+        if existing_pages.get(page_delta).copied().unwrap_or_default() {
+            continue;
+        }
+        let page_index = page_start + page_delta;
+        let page_offset = page_index.checked_mul(PAGE_SIZE)?;
+        let copy_start = offset.max(page_offset);
+        let copy_end = end.min(page_offset + PAGE_SIZE);
+        let src_start = copy_start - offset;
+        let dst_start = copy_start - page_offset;
+        let copy_len = copy_end - copy_start;
+        let page = if dst_start == 0 && copy_len == PAGE_SIZE {
+            DirtyPage::full(buf[src_start..src_start + copy_len].to_vec())
+        } else {
+            let mut page = DirtyPage::empty();
+            page.data[dst_start..dst_start + copy_len]
+                .copy_from_slice(&buf[src_start..src_start + copy_len]);
+            page.mark_dirty(dst_start, dst_start + copy_len);
+            page
+        };
+        pages.insert(page_index, page);
+    }
+    Some(pages)
+}
+
+fn merge_dirty_page_write(page_index: usize, page: &mut DirtyPage, offset: usize, buf: &[u8]) {
+    let page_offset = page_index * PAGE_SIZE;
+    let write_end = offset + buf.len();
+    let copy_start = offset.max(page_offset);
+    let copy_end = write_end.min(page_offset + PAGE_SIZE);
+    if copy_start >= copy_end {
+        return;
+    }
+    if page.data.len() < PAGE_SIZE {
+        page.data.resize(PAGE_SIZE, 0);
+    }
+    let src_start = copy_start - offset;
+    let dst_start = copy_start - page_offset;
+    let copy_len = copy_end - copy_start;
+    page.data[dst_start..dst_start + copy_len]
+        .copy_from_slice(&buf[src_start..src_start + copy_len]);
+    page.mark_dirty(dst_start, dst_start + copy_len);
+}
+
 fn cache_dirty_regular_write(node: VfsNodeId, offset: usize, buf: &[u8]) -> DirtyCacheWriteResult {
     if buf.is_empty() {
         return DirtyCacheWriteResult::Cached(0);
     }
-    let stat = match with_mount(node.mount_id, |mount| mount.stat(node.ino)) {
-        Some(Ok(stat)) => stat,
-        _ => return DirtyCacheWriteResult::Fallback,
+    let Some(logical_size) = dirty_or_backend_logical_size(node) else {
+        return DirtyCacheWriteResult::Fallback;
     };
-    let base_size = stat.size as usize;
-    let logical_size = dirty_logical_size(node).unwrap_or(base_size);
     let Some(end) = offset.checked_add(buf.len()) else {
         return DirtyCacheWriteResult::Fallback;
     };
@@ -335,8 +506,21 @@ fn cache_dirty_regular_write(node: VfsNodeId, offset: usize, buf: &[u8]) -> Dirt
         return DirtyCacheWriteResult::Fallback;
     }
 
-    let page_start = offset / PAGE_SIZE;
-    let page_count = buf.len() / PAGE_SIZE;
+    let Some((page_start, page_count)) = dirty_write_page_range(offset, buf.len()) else {
+        return DirtyCacheWriteResult::Fallback;
+    };
+    let existing_pages = {
+        let dirty = DIRTY_REGULAR_FILES.lock();
+        let (dirty_pages, new_pages) =
+            dirty_write_page_pressure(&dirty, node, page_start, page_count);
+        if dirty_pages.saturating_add(new_pages) > VFS_DIRTY_WRITEBACK_MAX_PAGES {
+            return DirtyCacheWriteResult::NeedsPressureFlush;
+        }
+        dirty_write_existing_pages(&dirty, node, page_start, page_count)
+    };
+    let Some(mut prepared_pages) = prepare_dirty_regular_pages(offset, buf, &existing_pages) else {
+        return DirtyCacheWriteResult::Fallback;
+    };
     let needs_pin = {
         let dirty = DIRTY_REGULAR_FILES.lock();
         let (dirty_pages, new_pages) =
@@ -372,14 +556,31 @@ fn cache_dirty_regular_write(node: VfsNodeId, offset: usize, buf: &[u8]) -> Dirt
     let cache = dirty
         .entry(node)
         .or_insert_with(|| DirtyFileCache::new(logical_size, timestamp));
+    let missing_prepared_page = (0..page_count).any(|page_delta| {
+        let page_index = page_start + page_delta;
+        !cache.pages.contains_key(&page_index) && !prepared_pages.contains_key(&page_index)
+    });
+    if missing_prepared_page {
+        drop(dirty);
+        if retained_pin {
+            release_inode_from_drop(node.mount_id, node.ino);
+        }
+        return DirtyCacheWriteResult::Fallback;
+    }
     cache.logical_size = cache.logical_size.max(end);
     cache.mtime = timestamp;
     cache.ctime = timestamp;
-    for (page_offset, chunk) in buf.chunks(PAGE_SIZE).enumerate() {
-        let page_index = page_start + page_offset;
-        let mut page = Vec::with_capacity(PAGE_SIZE);
-        page.extend_from_slice(chunk);
-        cache.pages.insert(page_index, page);
+    for page_delta in 0..page_count {
+        let page_index = page_start + page_delta;
+        match cache.pages.get_mut(&page_index) {
+            Some(existing) => merge_dirty_page_write(page_index, existing, offset, buf),
+            None => {
+                let Some(page) = prepared_pages.remove(&page_index) else {
+                    continue;
+                };
+                cache.pages.insert(page_index, page);
+            }
+        }
     }
     let current_dirty_pages = dirty.values().map(|cache| cache.pages.len()).sum::<usize>();
     drop(dirty);
@@ -387,7 +588,7 @@ fn cache_dirty_regular_write(node: VfsNodeId, offset: usize, buf: &[u8]) -> Dirt
         release_inode_from_drop(node.mount_id, node.ino);
     }
 
-    record_dirty_cache_write(buf.len() / PAGE_SIZE, buf.len());
+    record_dirty_cache_write(page_count, buf.len());
     record_dirty_cache_peak(current_dirty_pages);
     DirtyCacheWriteResult::Cached(buf.len())
 }
@@ -404,12 +605,9 @@ fn cache_dirty_regular_user_buffer_write(
     if buf.buffers.iter().any(|slice| slice.len() % PAGE_SIZE != 0) {
         return DirtyCacheWriteResult::Fallback;
     }
-    let stat = match with_mount(node.mount_id, |mount| mount.stat(node.ino)) {
-        Some(Ok(stat)) => stat,
-        _ => return DirtyCacheWriteResult::Fallback,
+    let Some(logical_size) = dirty_or_backend_logical_size(node) else {
+        return DirtyCacheWriteResult::Fallback;
     };
-    let base_size = stat.size as usize;
-    let logical_size = dirty_logical_size(node).unwrap_or(base_size);
     let Some(end) = offset.checked_add(len) else {
         return DirtyCacheWriteResult::Fallback;
     };
@@ -460,9 +658,9 @@ fn cache_dirty_regular_user_buffer_write(
     let mut page_index = page_start;
     for source in buf.buffers.iter() {
         for chunk in source.chunks(PAGE_SIZE) {
-            let mut page = Vec::with_capacity(PAGE_SIZE);
-            page.extend_from_slice(chunk);
-            cache.pages.insert(page_index, page);
+            cache
+                .pages
+                .insert(page_index, DirtyPage::full(chunk.to_vec()));
             page_index += 1;
         }
     }
@@ -500,10 +698,19 @@ fn overlay_dirty_regular_read(node: VfsNodeId, offset: usize, buf: &mut [u8]) ->
         let Some(page) = cache.pages.get(&page_index) else {
             continue;
         };
-        let dst_start = copy_start - offset;
-        let src_start = copy_start - page_start;
-        let len = copy_end - copy_start;
-        buf[dst_start..dst_start + len].copy_from_slice(&page[src_start..src_start + len]);
+        for (dirty_start, dirty_end) in page.dirty_ranges() {
+            let dirty_file_start = page_start + dirty_start;
+            let dirty_file_end = page_start + dirty_end;
+            let dirty_copy_start = copy_start.max(dirty_file_start);
+            let dirty_copy_end = copy_end.min(dirty_file_end);
+            if dirty_copy_start >= dirty_copy_end {
+                continue;
+            }
+            let dst_start = dirty_copy_start - offset;
+            let src_start = dirty_copy_start - page_start;
+            let len = dirty_copy_end - dirty_copy_start;
+            buf[dst_start..dst_start + len].copy_from_slice(&page.data[src_start..src_start + len]);
+        }
     }
     Some(read_len)
 }
@@ -530,6 +737,7 @@ struct DirtyWritebackRun {
 #[derive(Debug)]
 struct DirtyWritebackBatch {
     logical_size: usize,
+    pages: BTreeMap<usize, DirtyPage>,
     runs: Vec<DirtyWritebackRun>,
 }
 
@@ -540,25 +748,30 @@ fn collect_dirty_writeback(node: VfsNodeId) -> Option<DirtyWritebackBatch> {
     let mut runs = Vec::new();
     let mut current_offset = 0usize;
     let mut current_data = Vec::new();
-    for (page_index, page) in cache.pages {
+    let pages = cache.pages;
+    for (page_index, page) in pages.iter() {
         let page_offset = page_index.saturating_mul(PAGE_SIZE);
-        if current_data.is_empty() {
-            current_offset = page_offset;
-        } else if current_offset + current_data.len() != page_offset {
-            runs.push(DirtyWritebackRun {
-                offset: current_offset,
-                data: current_data,
-            });
-            current_offset = page_offset;
-            current_data = Vec::new();
-        }
-        current_data.extend_from_slice(&page);
-        if current_data.len() >= VFS_WRITE_CHUNK_SIZE {
-            runs.push(DirtyWritebackRun {
-                offset: current_offset,
-                data: current_data,
-            });
-            current_data = Vec::new();
+        for (dirty_start, dirty_end) in page.dirty_ranges() {
+            let dirty_offset = page_offset + dirty_start;
+            let dirty_data = &page.data[dirty_start..dirty_end];
+            if current_data.is_empty() {
+                current_offset = dirty_offset;
+            } else if current_offset + current_data.len() != dirty_offset {
+                runs.push(DirtyWritebackRun {
+                    offset: current_offset,
+                    data: current_data,
+                });
+                current_offset = dirty_offset;
+                current_data = Vec::new();
+            }
+            current_data.extend_from_slice(dirty_data);
+            if current_data.len() >= VFS_WRITE_CHUNK_SIZE {
+                runs.push(DirtyWritebackRun {
+                    offset: current_offset,
+                    data: current_data,
+                });
+                current_data = Vec::new();
+            }
         }
     }
     if !current_data.is_empty() {
@@ -567,7 +780,11 @@ fn collect_dirty_writeback(node: VfsNodeId) -> Option<DirtyWritebackBatch> {
             data: current_data,
         });
     }
-    Some(DirtyWritebackBatch { logical_size, runs })
+    Some(DirtyWritebackBatch {
+        logical_size,
+        pages,
+        runs,
+    })
 }
 
 fn restore_dirty_writeback(node: VfsNodeId, batch: DirtyWritebackBatch) {
@@ -578,13 +795,8 @@ fn restore_dirty_writeback(node: VfsNodeId, batch: DirtyWritebackBatch) {
         .entry(node)
         .or_insert_with(|| DirtyFileCache::new(batch.logical_size, timestamp));
     cache.logical_size = cache.logical_size.max(batch.logical_size);
-    for run in batch.runs {
-        for (page_offset, chunk) in run.data.chunks(PAGE_SIZE).enumerate() {
-            let page_index = run.offset / PAGE_SIZE + page_offset;
-            let mut page = Vec::with_capacity(PAGE_SIZE);
-            page.extend_from_slice(chunk);
-            cache.pages.entry(page_index).or_insert(page);
-        }
+    for (page_index, page) in batch.pages {
+        cache.pages.entry(page_index).or_insert(page);
     }
     drop(dirty);
     if release_batch_pin {
@@ -596,7 +808,7 @@ fn flush_dirty_regular_file_for_reason(node: VfsNodeId, reason: DirtyFlushReason
     let Some(batch) = collect_dirty_writeback(node) else {
         return Ok(());
     };
-    let mut pages = 0usize;
+    let pages = batch.pages.len();
     let mut bytes = 0usize;
     let mut result = Ok(());
     for run in batch.runs.iter() {
@@ -615,7 +827,6 @@ fn flush_dirty_regular_file_for_reason(node: VfsNodeId, reason: DirtyFlushReason
             result = Err(FsError::Io);
             break;
         }
-        pages = pages.saturating_add(run.data.len() / PAGE_SIZE);
         bytes = bytes.saturating_add(run.data.len());
     }
     if result.is_err() {
@@ -687,6 +898,30 @@ fn untrack_writable_regular_open(node: VfsNodeId, kind: FsNodeKind, writable: bo
     }
 }
 
+fn track_writable_shared_regular_mmap(node: VfsNodeId, kind: FsNodeKind) {
+    if kind != FsNodeKind::RegularFile {
+        return;
+    }
+    invalidate_small_regular_read_cache(node, kind);
+    let mut counts = WRITABLE_SHARED_MMAP_REGULAR_COUNTS.lock();
+    *counts.entry(node).or_insert(0) += 1;
+}
+
+fn untrack_writable_shared_regular_mmap(node: VfsNodeId, kind: FsNodeKind) {
+    if kind != FsNodeKind::RegularFile {
+        return;
+    }
+    let mut counts = WRITABLE_SHARED_MMAP_REGULAR_COUNTS.lock();
+    let Some(count) = counts.get_mut(&node) else {
+        return;
+    };
+    if *count > 1 {
+        *count -= 1;
+    } else {
+        counts.remove(&node);
+    }
+}
+
 fn ensure_mount_writable(mount_id: MountId) -> FsResult {
     if mount_is_read_only(mount_id) {
         Err(FsError::ReadOnly)
@@ -746,7 +981,26 @@ fn page_cache_id_for_node(node: VfsNodeId, kind: FsNodeKind) -> Option<PageCache
     page_cache_id_for_node_with_support(node, kind, mount_supports_page_cache(node.mount_id))
 }
 
+fn invalidate_small_regular_read_cache(node: VfsNodeId, kind: FsNodeKind) {
+    if kind == FsNodeKind::RegularFile {
+        SMALL_REGULAR_READ_FILES.lock().remove(&node);
+    }
+}
+
+fn cached_inode_flags(node: VfsNodeId) -> Option<u32> {
+    INODE_FLAGS_CACHE.lock().get(&node).copied()
+}
+
+fn update_inode_flags_cache(node: VfsNodeId, flags: u32) {
+    INODE_FLAGS_CACHE.lock().insert(node, flags);
+}
+
+fn invalidate_inode_flags_cache(node: VfsNodeId) {
+    INODE_FLAGS_CACHE.lock().remove(&node);
+}
+
 pub(crate) fn invalidate_regular_file_read_cache(node: VfsNodeId, kind: FsNodeKind) {
+    invalidate_small_regular_read_cache(node, kind);
     let Some(id) = page_cache_id_for_node(node, kind) else {
         return;
     };
@@ -766,6 +1020,15 @@ pub(crate) fn regular_file_is_open_writable_in(context: PathContext, name: &str)
 
 pub(crate) fn regular_file_node_is_open_writable(node: VfsNodeId) -> bool {
     WRITABLE_REGULAR_OPEN_COUNTS
+        .lock()
+        .get(&node)
+        .copied()
+        .unwrap_or(0)
+        > 0
+}
+
+fn regular_file_node_has_writable_shared_mmap(node: VfsNodeId) -> bool {
+    WRITABLE_SHARED_MMAP_REGULAR_COUNTS
         .lock()
         .get(&node)
         .copied()
@@ -931,7 +1194,7 @@ impl VfsFile {
         }
         *self.read_snapshot.lock() = None;
         if buf.len() > 0 {
-            self.invalidate_read_cache();
+            self.invalidate_read_cache_for_write(*offset, buf.len());
         }
         let mut total_write_size = 0usize;
         perf::record_vfs_write_user_buffer(buf.buffers.len());
@@ -1237,6 +1500,7 @@ impl VfsFile {
     }
 
     fn invalidate_read_cache(&self) {
+        invalidate_small_regular_read_cache(self.node, self.kind);
         let Some(id) = self.cached_page_cache_id() else {
             return;
         };
@@ -1244,6 +1508,24 @@ impl VfsFile {
             .exclusive_access()
             .invalidate_clean_unreferenced(id);
         perf::record_vfs_read_cache_invalidation(removed, scanned);
+    }
+
+    fn can_skip_redundant_dirty_write_invalidation(&self, offset: usize, len: usize) -> bool {
+        dirty_regular_file_has_pages(self.node)
+            && can_cache_dirty_write(
+                self.kind,
+                self.supports_dirty_writeback,
+                offset,
+                len,
+                self.status_flags.get(),
+            )
+    }
+
+    fn invalidate_read_cache_for_write(&self, offset: usize, len: usize) {
+        if self.can_skip_redundant_dirty_write_invalidation(offset, len) {
+            return;
+        }
+        self.invalidate_read_cache();
     }
 
     fn seek_data_or_hole(&self, offset: usize, seek_hole: bool) -> FsResult<usize> {
@@ -1305,14 +1587,19 @@ impl VfsFile {
     }
 
     fn inode_flags_or_empty(&self) -> FsResult<u32> {
-        match self.inode_flags() {
+        if let Some(flags) = cached_inode_flags(self.node) {
+            return Ok(flags);
+        }
+        let flags = match self.inode_flags() {
             Ok(flags) => Ok(flags),
             // CONTEXT: procfs and other synthetic filesystems do not expose
             // ext-style inode flags. Treat them as having no immutable/append
             // bits so writable sysctl-style files can be updated normally.
             Err(FsError::Unsupported) => Ok(0),
             Err(err) => Err(err),
-        }
+        }?;
+        update_inode_flags_cache(self.node, flags);
+        Ok(flags)
     }
 
     fn read_synthetic_dirent64(&self, entry_offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
@@ -1508,6 +1795,77 @@ impl VfsFile {
         }
 
         Some(total_read_size)
+    }
+
+    fn read_small_regular_cached_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        if buf.is_empty() {
+            return Some(0);
+        }
+        if self.kind != FsNodeKind::RegularFile
+            || !self.supports_page_cache
+            || regular_file_node_has_writable_shared_mmap(self.node)
+            || dirty_regular_file_has_pages(self.node)
+        {
+            return None;
+        }
+        {
+            let caches = SMALL_REGULAR_READ_FILES.lock();
+            if let Some(cache) = caches.get(&self.node) {
+                return Some(cache.read_at(offset, buf));
+            }
+        }
+
+        let stat = with_mount(self.node.mount_id, |mount| mount.stat_basic(self.node.ino))?.ok()?;
+        let file_size = stat.size as usize;
+        if !(VFS_SMALL_READ_CACHE_MIN_FILE_SIZE..=VFS_READ_CACHE_MAX_FILE_SIZE).contains(&file_size)
+        {
+            return None;
+        }
+        if offset >= file_size {
+            return Some(0);
+        }
+
+        let mut data = vec![0u8; file_size];
+        let mut filled = 0usize;
+        let noatime_snapshot = self.noatime_snapshot();
+        while filled < file_size {
+            let chunk_len = (file_size - filled).min(VFS_READ_CHUNK_SIZE);
+            let Some(read_size) = with_mount(self.node.mount_id, |mount| {
+                mount.read_at(
+                    self.node.ino,
+                    &mut data[filled..filled + chunk_len],
+                    filled as u64,
+                )
+            }) else {
+                self.restore_noatime(noatime_snapshot);
+                return None;
+            };
+            if read_size == 0 {
+                break;
+            }
+            filled += read_size;
+            if read_size < chunk_len {
+                break;
+            }
+        }
+        self.restore_noatime(noatime_snapshot);
+        data.truncate(filled);
+        if data.is_empty() {
+            return Some(0);
+        }
+        if dirty_regular_file_has_pages(self.node) {
+            return None;
+        }
+
+        let cache = SmallRegularReadCache { data };
+        let read_size = cache.read_at(offset, buf);
+        let mut caches = SMALL_REGULAR_READ_FILES.lock();
+        let cached_bytes = caches.values().map(|cache| cache.data.len()).sum::<usize>();
+        if cached_bytes.saturating_add(cache.data.len()) > VFS_SMALL_READ_CACHE_MAX_BYTES {
+            caches.clear();
+        }
+        caches.insert(self.node, cache);
+        Some(read_size)
     }
 }
 
@@ -2073,6 +2431,7 @@ impl File for VfsFile {
                 } else {
                     self.read_snapshot_at(*offset, slice)
                 })
+                .or_else(|| self.read_small_regular_cached_at(*offset, slice))
                 .or_else(|| self.read_regular_cached_at(*offset, slice))
                 .unwrap_or_else(|| self.read_backend_at_preserve_noatime(*offset, slice));
                 if read_size == 0 {
@@ -2104,6 +2463,19 @@ impl File for VfsFile {
         Ok(stat)
     }
 
+    fn mode_type(&self) -> FsResult<u32> {
+        Ok(match self.kind {
+            FsNodeKind::Directory => S_IFDIR,
+            FsNodeKind::RegularFile => S_IFREG,
+            FsNodeKind::Symlink => S_IFLNK,
+            FsNodeKind::Fifo => S_IFIFO,
+            FsNodeKind::CharacterDevice => S_IFCHR,
+            FsNodeKind::BlockDevice => S_IFBLK,
+            FsNodeKind::Socket => S_IFSOCK,
+            FsNodeKind::Other => 0,
+        })
+    }
+
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
         if self.kind == FsNodeKind::Directory {
             return 0;
@@ -2114,6 +2486,7 @@ impl File for VfsFile {
         } else {
             self.read_snapshot_at(offset, buf)
         })
+        .or_else(|| self.read_small_regular_cached_at(offset, buf))
         .or_else(|| self.read_regular_cached_at(offset, buf))
         .unwrap_or_else(|| self.read_backend_at_preserve_noatime(offset, buf));
         read_size
@@ -2125,13 +2498,13 @@ impl File for VfsFile {
         }
         *self.read_snapshot.lock() = None;
         if !buf.is_empty() {
-            self.invalidate_read_cache();
+            self.invalidate_read_cache_for_write(offset, buf.len());
         }
         self.write_at_chunks(offset, buf)
     }
 
     fn supports_aligned_user_buffer_write_at(&self, offset: usize, len: usize) -> bool {
-        can_cache_dirty_write(
+        can_cache_dirty_user_buffer_write(
             self.kind,
             self.supports_dirty_writeback,
             offset,
@@ -2147,7 +2520,7 @@ impl File for VfsFile {
         }
         self.check_write_at(offset, len)?;
         *self.read_snapshot.lock() = None;
-        self.invalidate_read_cache();
+        self.invalidate_read_cache_for_write(offset, len);
         let mut pressure_retried = false;
         loop {
             match cache_dirty_regular_user_buffer_write(self.node, offset, &buf) {
@@ -2190,7 +2563,7 @@ impl File for VfsFile {
         }
         self.check_write_at(write_offset, len)?;
         *self.read_snapshot.lock() = None;
-        self.invalidate_read_cache();
+        self.invalidate_read_cache_for_write(write_offset, len);
         let mut pressure_retried = false;
         let mut offset_advanced = false;
         let write_size = loop {
@@ -2406,10 +2779,14 @@ impl File for VfsFile {
     }
 
     fn set_inode_flags(&self, flags: u32) -> FsResult {
-        with_mount(self.node.mount_id, |mount| {
+        let result = with_mount(self.node.mount_id, |mount| {
             mount.set_inode_flags(self.node.ino, flags)
         })
-        .ok_or(FsError::Io)?
+        .ok_or(FsError::Io)?;
+        if result.is_ok() {
+            update_inode_flags_cache(self.node, flags);
+        }
+        result
     }
 
     fn check_write(&self, len: usize, append: bool) -> FsResult {
@@ -2494,6 +2871,14 @@ impl File for VfsFile {
         page_cache_id_for_node_with_support(self.node, self.kind, self.supports_page_cache)
     }
 
+    fn inc_writable_shared_mmap(&self) {
+        track_writable_shared_regular_mmap(self.node, self.kind);
+    }
+
+    fn dec_writable_shared_mmap(&self) {
+        untrack_writable_shared_regular_mmap(self.node, self.kind);
+    }
+
     fn status_flags(&self) -> OpenFlags {
         self.status_flags.get()
     }
@@ -2527,6 +2912,7 @@ impl File for VfsFile {
 impl Drop for VfsFile {
     fn drop(&mut self) {
         untrack_writable_regular_open(self.node, self.kind, self.writable);
+        invalidate_inode_flags_cache(self.node);
         release_inode_from_drop(self.node.mount_id, self.node.ino);
     }
 }

@@ -96,6 +96,7 @@ pub fn kstack_alloc() -> KernelStack {
             kstack_top.into(),
             MapPermission::R | MapPermission::W,
         );
+    crate::arch::mm::mark_kernel_tlb_dirty();
     KernelStack(kstack_id)
 }
 
@@ -106,6 +107,7 @@ impl Drop for KernelStack {
         KERNEL_SPACE
             .exclusive_access()
             .remove_area_with_start_vpn(kernel_stack_bottom_va.into());
+        crate::arch::mm::mark_kernel_tlb_dirty();
         KSTACK_ALLOCATOR.exclusive_access().dealloc(self.0);
     }
 }

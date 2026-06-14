@@ -15,6 +15,7 @@
 .equ SSTATUS_FS_DIRTY, 0x6000
 .equ SSTATUS_FS_MASK, 0x6000
 .equ FCSR_OFFSET, 69
+.equ KERNEL_ENTRY_FLUSH_OFFSET, 70
     .section .text.trampoline
     .globl __alltraps
     .globl __restore
@@ -65,19 +66,25 @@ __alltraps:
     ld t0, 34*8(sp)
     # load trap_handler into t1
     ld t1, 36*8(sp)
+    # load return-prepared kernel TLB flush decision into t2
+    ld t2, KERNEL_ENTRY_FLUSH_OFFSET*8(sp)
     # move to kernel_sp
     ld sp, 35*8(sp)
     # switch to kernel space (satp: Supervisor Address Translation and Protection)
     csrw satp, t0
+    beqz t2, .Lalltraps_skip_sfence
     sfence.vma
+.Lalltraps_skip_sfence:
     # jump to trap_handler
     jr t1
 
 __restore:
-    # a0: *TrapContext in user space(Constant); a1: user space token; a2: restore FP
+    # a0: *TrapContext in user space(Constant); a1: user space token; a2: restore FP; a3: flush TLB
     # switch to user space
     csrw satp, a1
+    beqz a3, .Lrestore_skip_sfence
     sfence.vma
+.Lrestore_skip_sfence:
     csrw sscratch, a0
     mv sp, a0
     # now sp points to TrapContext in user space, start restoring based on it

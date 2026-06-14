@@ -29,8 +29,20 @@ pub fn page_table_token(root_ppn: usize) -> usize {
     root_ppn << crate::config::PAGE_SIZE_BITS
 }
 
+pub fn page_table_token_with_asid(root_ppn: usize, _asid: usize) -> usize {
+    page_table_token(root_ppn)
+}
+
 pub fn page_table_root_ppn(token: usize) -> usize {
     token >> crate::config::PAGE_SIZE_BITS
+}
+
+pub fn page_table_asid(_token: usize) -> usize {
+    0
+}
+
+pub fn alloc_page_table_asid() -> usize {
+    0
 }
 
 pub fn activate_page_table(token: usize) {
@@ -74,6 +86,13 @@ pub fn should_flush_tlb_on_return(user_token: usize) -> bool {
     let dirty = RETURN_TLB_DIRTY.swap(false, Ordering::Relaxed);
     previous != user_token || dirty
 }
+
+#[allow(dead_code)]
+pub fn should_flush_tlb_on_kernel_entry(_kernel_token: usize) -> bool {
+    true
+}
+
+pub fn mark_kernel_tlb_dirty() {}
 
 fn mark_return_tlb_dirty() {
     RETURN_TLB_DIRTY.store(true, Ordering::Relaxed);

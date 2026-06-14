@@ -176,6 +176,10 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) writev_regular_bounce_bytes: usize,
     pub(crate) writev_regular_direct_user_buffer_calls: usize,
     pub(crate) writev_regular_direct_user_buffer_bytes: usize,
+    pub(crate) pwritev_regular_bounce_calls: usize,
+    pub(crate) pwritev_regular_bounce_bytes: usize,
+    pub(crate) pwritev_regular_direct_user_buffer_calls: usize,
+    pub(crate) pwritev_regular_direct_user_buffer_bytes: usize,
     pub(crate) page_cache_clean_evictions: usize,
     pub(crate) tmpfs_allocated_payload_len_calls: usize,
     pub(crate) tmpfs_allocated_payload_sparse_extents: usize,
@@ -456,6 +460,10 @@ mod enabled {
     static WRITEV_REGULAR_BOUNCE_BYTES: AtomicUsize = AtomicUsize::new(0);
     static WRITEV_REGULAR_DIRECT_USER_BUFFER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static WRITEV_REGULAR_DIRECT_USER_BUFFER_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static PWRITEV_REGULAR_BOUNCE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PWRITEV_REGULAR_BOUNCE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static PWRITEV_REGULAR_DIRECT_USER_BUFFER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PWRITEV_REGULAR_DIRECT_USER_BUFFER_BYTES: AtomicUsize = AtomicUsize::new(0);
     static PAGE_CACHE_CLEAN_EVICTIONS: AtomicUsize = AtomicUsize::new(0);
     static TMPFS_ALLOCATED_PAYLOAD_LEN_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TMPFS_ALLOCATED_PAYLOAD_SPARSE_EXTENTS: AtomicUsize = AtomicUsize::new(0);
@@ -1152,6 +1160,16 @@ mod enabled {
         WRITEV_REGULAR_DIRECT_USER_BUFFER_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_pwritev_regular_bounce(bytes: usize) {
+        PWRITEV_REGULAR_BOUNCE_CALLS.fetch_add(1, Ordering::Relaxed);
+        PWRITEV_REGULAR_BOUNCE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_pwritev_regular_direct_user_buffer(bytes: usize) {
+        PWRITEV_REGULAR_DIRECT_USER_BUFFER_CALLS.fetch_add(1, Ordering::Relaxed);
+        PWRITEV_REGULAR_DIRECT_USER_BUFFER_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_page_cache_clean_eviction(pages: usize) {
         PAGE_CACHE_CLEAN_EVICTIONS.fetch_add(pages, Ordering::Relaxed);
     }
@@ -1756,6 +1774,12 @@ mod enabled {
                 .load(Ordering::Relaxed),
             writev_regular_direct_user_buffer_bytes: WRITEV_REGULAR_DIRECT_USER_BUFFER_BYTES
                 .load(Ordering::Relaxed),
+            pwritev_regular_bounce_calls: PWRITEV_REGULAR_BOUNCE_CALLS.load(Ordering::Relaxed),
+            pwritev_regular_bounce_bytes: PWRITEV_REGULAR_BOUNCE_BYTES.load(Ordering::Relaxed),
+            pwritev_regular_direct_user_buffer_calls: PWRITEV_REGULAR_DIRECT_USER_BUFFER_CALLS
+                .load(Ordering::Relaxed),
+            pwritev_regular_direct_user_buffer_bytes: PWRITEV_REGULAR_DIRECT_USER_BUFFER_BYTES
+                .load(Ordering::Relaxed),
             page_cache_clean_evictions: PAGE_CACHE_CLEAN_EVICTIONS.load(Ordering::Relaxed),
             tmpfs_allocated_payload_len_calls: TMPFS_ALLOCATED_PAYLOAD_LEN_CALLS
                 .load(Ordering::Relaxed),
@@ -2057,6 +2081,10 @@ mod enabled {
          writev_regular_bounce_bytes {}\n\
          writev_regular_direct_user_buffer_calls {}\n\
          writev_regular_direct_user_buffer_bytes {}\n\
+         pwritev_regular_bounce_calls {}\n\
+         pwritev_regular_bounce_bytes {}\n\
+         pwritev_regular_direct_user_buffer_calls {}\n\
+         pwritev_regular_direct_user_buffer_bytes {}\n\
          page_cache_clean_evictions {}\n\
          tmpfs_allocated_payload_len_calls {}\n\
          tmpfs_allocated_payload_sparse_extents {}\n\
@@ -2323,6 +2351,10 @@ mod enabled {
             stats.writev_regular_bounce_bytes,
             stats.writev_regular_direct_user_buffer_calls,
             stats.writev_regular_direct_user_buffer_bytes,
+            stats.pwritev_regular_bounce_calls,
+            stats.pwritev_regular_bounce_bytes,
+            stats.pwritev_regular_direct_user_buffer_calls,
+            stats.pwritev_regular_direct_user_buffer_bytes,
             stats.page_cache_clean_evictions,
             stats.tmpfs_allocated_payload_len_calls,
             stats.tmpfs_allocated_payload_sparse_extents,
@@ -2731,6 +2763,12 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_writev_regular_direct_user_buffer(_bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_pwritev_regular_bounce(_bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_pwritev_regular_direct_user_buffer(_bytes: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_page_cache_clean_eviction(_pages: usize) {}

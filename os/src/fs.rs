@@ -343,6 +343,10 @@ pub trait File: Send + Sync {
     fn stat(&self) -> FsResult<FileStat> {
         Ok(FileStat::default())
     }
+    /// Fast path for callers that only need the file type bits.
+    fn mode_type(&self) -> FsResult<u32> {
+        Ok(self.stat()?.mode & S_IFMT)
+    }
     /// Non-positionable files return EOF for positioned reads by default.
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
         0

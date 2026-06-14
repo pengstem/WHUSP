@@ -96,6 +96,7 @@ impl PageTableEntry {
 
 pub struct PageTable {
     root_ppn: PhysPageNum,
+    asid: usize,
     frames: Vec<FrameTracker>,
 }
 
@@ -109,6 +110,7 @@ impl PageTable {
         let frame = frame_alloc().expect("page table root allocation requires a free frame");
         PageTable {
             root_ppn: frame.ppn,
+            asid: arch_mm::alloc_page_table_asid(),
             frames: vec![frame],
         }
     }
@@ -117,6 +119,7 @@ impl PageTable {
         let frame = frame_alloc()?;
         Some(PageTable {
             root_ppn: frame.ppn,
+            asid: arch_mm::alloc_page_table_asid(),
             frames: vec![frame],
         })
     }
@@ -127,6 +130,7 @@ impl PageTable {
     pub fn from_token(satp: usize) -> Self {
         Self {
             root_ppn: PhysPageNum::from(arch_mm::page_table_root_ppn(satp)),
+            asid: arch_mm::page_table_asid(satp),
             frames: Vec::new(),
         }
     }
@@ -303,7 +307,7 @@ impl PageTable {
         })
     }
     pub fn token(&self) -> usize {
-        arch_mm::page_table_token(self.root_ppn.0)
+        arch_mm::page_table_token_with_asid(self.root_ppn.0, self.asid)
     }
 }
 

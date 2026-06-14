@@ -66,7 +66,6 @@ pub fn trap_handler() -> ! {
         let user_fp_was_off = cx.user_fp_is_off();
         if cx.user_fp_is_dirty() {
             crate::perf::record_rv_user_fp_save_call();
-            cx.mark_user_fp_disabled();
         }
         let syscall_entry = if is_user_ecall {
             // Snapshot the Linux RISC-V syscall ABI registers before ptrace
@@ -357,9 +356,15 @@ fn trap_return_for_task(
     process: Arc<crate::task::ProcessControlBlock>,
 ) -> ! {
     let now_us = get_time_us();
-    let restore_fp = trap_cx_of_task(&task).user_fp_is_dirty();
+    let restore_fp = {
+        let cx = trap_cx_of_task(&task);
+        cx.kernel_entry_flush =
+            crate::arch::mm::should_flush_tlb_on_kernel_entry(cx.kernel_satp) as usize;
+        cx.user_fp_is_dirty()
+    };
     let (trap_cx_user_va, user_satp) =
         trap_return_context_after_accounting_for_task(&task, &process, now_us);
+    let flush_tlb = crate::arch::mm::should_flush_tlb_on_return(user_satp);
     if restore_fp {
         crate::perf::record_rv_user_fp_restore_call();
     }
@@ -380,6 +385,7 @@ fn trap_return_for_task(
             in("a0") trap_cx_user_va,
             in("a1") user_satp,
             in("a2") restore_fp as usize,
+            in("a3") flush_tlb as usize,
             options(noreturn)
         );
     }
