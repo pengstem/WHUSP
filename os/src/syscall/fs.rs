@@ -24,7 +24,10 @@ pub(crate) use fanotify::{
     fanotify_notify_open_exec_at,
 };
 pub use fanotify::{sys_fanotify_init, sys_fanotify_mark};
-pub(crate) use fd::{close_detached_fd_entry, get_file_by_fd, install_file_fd};
+pub(crate) use fd::{
+    close_detached_fd_entry, close_detached_fd_entry_for_process_teardown, get_file_by_fd,
+    install_file_fd,
+};
 pub use fd::{
     sys_close, sys_dup, sys_dup3, sys_fcntl_ctx, sys_flock, sys_memfd_create, sys_pipe2_ctx,
 };
@@ -33,9 +36,7 @@ pub use fd_compat::{
     sys_bpf, sys_io_uring_enter, sys_io_uring_register, sys_io_uring_setup, sys_memfd_secret,
     sys_perf_event_open, sys_signalfd4, sys_timerfd_create, sys_userfaultfd,
 };
-pub(crate) use fd_lock::{
-    release_flock_locks_for_closed_fd_table, release_record_locks_for_process,
-};
+pub(crate) use fd_lock::release_record_locks_for_process;
 pub use file_handle::{sys_name_to_handle_at, sys_open_by_handle_at};
 pub(crate) use inotify::{
     INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES, inotify_fdinfo,

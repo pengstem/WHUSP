@@ -761,17 +761,34 @@ impl ProcessControlBlockInner {
         previous
     }
 
-    pub(crate) fn close_on_exec_fd_entries(&mut self) {
+    pub(crate) fn close_on_exec_fd_entries(&mut self) -> Vec<FdTableEntry> {
+        let mut closed = Vec::new();
         for fd in 0..self.fd_table.len() {
             let should_close = self.fd_table[fd]
                 .as_ref()
                 .map(|entry| entry.close_on_exec())
                 .unwrap_or(false);
             if should_close {
-                self.fd_table[fd] = None;
+                if let Some(entry) = self.fd_table[fd].take() {
+                    closed.push(entry);
+                }
                 self.clear_fd_open_bit(fd);
             }
         }
+        closed
+    }
+
+    pub(crate) fn take_all_fd_entries(&mut self) -> Vec<FdTableEntry> {
+        let mut closed = Vec::new();
+        for fd in 0..self.fd_table.len() {
+            if let Some(entry) = self.fd_table[fd].take() {
+                closed.push(entry);
+            }
+        }
+        self.fd_table.clear();
+        self.fd_open_bits.clear();
+        self.next_fd_hint = 0;
+        closed
     }
 
     fn ensure_fd_bitmap_covers(&mut self, fd: usize) {

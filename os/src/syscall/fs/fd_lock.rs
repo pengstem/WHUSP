@@ -826,12 +826,6 @@ pub(super) fn release_flock_locks_for_close(entry: &FdTableEntry) {
     wake_waiters(waiters);
 }
 
-pub(crate) fn release_flock_locks_for_closed_fd_table(fd_table: &[Option<FdTableEntry>]) {
-    for entry in fd_table.iter().flatten() {
-        release_flock_locks_for_close(entry);
-    }
-}
-
 pub(crate) fn release_record_locks_for_process(pid: usize) {
     let waiters = RECORD_LOCK_TABLE
         .exclusive_access()

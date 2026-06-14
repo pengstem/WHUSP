@@ -238,6 +238,7 @@ struct FanotifyInner {
     read_waiters: VecDeque<Arc<TaskControlBlock>>,
     poll_waiters: PollWaitQueue,
     overflow_queued: bool,
+    closed: bool,
 }
 
 struct FanotifyGroup {
@@ -268,11 +269,33 @@ impl FanotifyGroup {
                     read_waiters: VecDeque::new(),
                     poll_waiters: PollWaitQueue::new(),
                     overflow_queued: false,
+                    closed: false,
                 })
             },
         });
         FANOTIFY_GROUPS.exclusive_session(|groups| groups.push(Arc::downgrade(&group)));
         group
+    }
+
+    fn close(&self) {
+        let (read_waiters, poll_waiters, events) = self.inner.exclusive_session(|inner| {
+            if inner.closed {
+                return (VecDeque::new(), Vec::new(), VecDeque::new());
+            }
+            inner.closed = true;
+            inner.marks.clear();
+            inner.overflow_queued = false;
+            (
+                core::mem::take(&mut inner.read_waiters),
+                inner.poll_waiters.drain(),
+                core::mem::take(&mut inner.events),
+            )
+        });
+        drop(events);
+        for task in read_waiters {
+            let _ = wakeup_task(task);
+        }
+        PollWaiter::wake_all(poll_waiters);
     }
 
     fn flush(&self) {
@@ -484,6 +507,9 @@ impl FanotifyGroup {
         source: Option<&Arc<dyn File + Send + Sync>>,
     ) {
         let (read_waiters, poll_waiters) = self.inner.exclusive_session(|inner| {
+            if inner.closed {
+                return (VecDeque::new(), Vec::new());
+            }
             let mut emitted = 0u64;
             let mut ignored = 0u64;
             let real_node = overlay_real_node(node);
@@ -668,18 +694,17 @@ impl FanotifyGroup {
             return 0;
         }
         loop {
-            let task_cx_ptr = self.inner.exclusive_session(|inner| {
-                if !inner.events.is_empty() || nonblocking || current_has_interrupting_signal() {
-                    None
-                } else {
-                    let (task, task_cx_ptr) = block_current_task_no_schedule();
-                    inner.read_waiters.push_back(task);
-                    Some(task_cx_ptr)
-                }
-            });
-            let Some(task_cx_ptr) = task_cx_ptr else {
+            let mut inner = self.inner.exclusive_access();
+            if inner.closed
+                || !inner.events.is_empty()
+                || nonblocking
+                || current_has_interrupting_signal()
+            {
                 break;
-            };
+            }
+            let (task, task_cx_ptr) = block_current_task_no_schedule();
+            inner.read_waiters.push_back(task);
+            drop(inner);
             schedule(task_cx_ptr);
         }
 
@@ -844,6 +869,12 @@ impl FanotifyGroupFile {
     }
 }
 
+impl Drop for FanotifyGroupFile {
+    fn drop(&mut self) {
+        self.group.close();
+    }
+}
+
 impl File for FanotifyGroupFile {
     fn as_any(&self) -> &dyn Any {
         self
@@ -875,6 +906,9 @@ impl File for FanotifyGroupFile {
 
     fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
         self.group.inner.exclusive_session(|inner| {
+            if inner.closed {
+                return PollEvents::POLLHUP;
+            }
             if let Some(waiter) = waiter
                 && events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI)
             {
@@ -901,6 +935,10 @@ impl File for FanotifyGroupFile {
         self.status_flags.exclusive_session(|status_flags| {
             *status_flags = flags;
         });
+    }
+
+    fn suppresses_fanotify(&self) -> bool {
+        true
     }
 }
 
@@ -1314,6 +1352,12 @@ pub(super) fn fanotify_notify_file(file: &Arc<dyn File + Send + Sync>, event_mas
     fanotify_notify_file_at(file, event_mask, None);
 }
 
+pub(super) fn fanotify_close_group_file(file: &Arc<dyn File + Send + Sync>) {
+    if let Some(group_file) = file.as_any().downcast_ref::<FanotifyGroupFile>() {
+        group_file.group.close();
+    }
+}
+
 pub(crate) fn fanotify_fdinfo(file: &Arc<dyn File + Send + Sync>) -> Option<String> {
     let group_file = file.as_any().downcast_ref::<FanotifyGroupFile>()?;
     let mut output = String::new();
@@ -1333,17 +1377,13 @@ pub(crate) fn fanotify_max_queued_events() -> usize {
 }
 
 pub(crate) fn fanotify_evict_evictable_marks() {
-    FANOTIFY_GROUPS.exclusive_session(|groups| {
-        groups.retain(|weak| weak.strong_count() > 0);
-        let live_groups: Vec<_> = groups.iter().filter_map(Weak::upgrade).collect();
-        for group in live_groups {
-            group.inner.exclusive_session(|inner| {
-                inner
-                    .marks
-                    .retain(|mark| mark.flags & FAN_MARK_EVICTABLE == 0);
-            });
-        }
-    });
+    for group in live_fanotify_groups() {
+        group.inner.exclusive_session(|inner| {
+            inner
+                .marks
+                .retain(|mark| mark.flags & FAN_MARK_EVICTABLE == 0);
+        });
+    }
 }
 
 pub(super) fn fanotify_notify_open(file: &Arc<dyn File + Send + Sync>) {

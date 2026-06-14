@@ -300,9 +300,9 @@ pub(crate) use aio::aio_max_nr_content;
 pub(crate) use context::SyscallContext;
 pub(crate) use fs::{
     INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES,
-    close_detached_fd_entry, fanotify_evict_evictable_marks, fanotify_fdinfo,
-    fanotify_max_queued_events, inotify_fdinfo, install_file_fd,
-    release_flock_locks_for_closed_fd_table, release_record_locks_for_process,
+    close_detached_fd_entry, close_detached_fd_entry_for_process_teardown,
+    fanotify_evict_evictable_marks, fanotify_fdinfo, fanotify_max_queued_events, inotify_fdinfo,
+    install_file_fd, release_record_locks_for_process,
 };
 pub(crate) use process::pidfd_fdinfo;
 pub(crate) use process::{proc_sys_kernel_printk_content, write_proc_sys_kernel_printk};

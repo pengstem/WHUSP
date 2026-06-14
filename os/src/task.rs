@@ -20,7 +20,9 @@ use crate::fs::{OpenFlags, PathContext, open_file_in, untrack_regular_file_execu
 use crate::sbi::shutdown;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
-use crate::syscall::{release_flock_locks_for_closed_fd_table, release_record_locks_for_process};
+use crate::syscall::{
+    close_detached_fd_entry_for_process_teardown, release_record_locks_for_process,
+};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::*;
@@ -627,7 +629,7 @@ fn exit_current(exit_code: i32, group_exit: bool) {
         let (
             parent,
             children,
-            fd_table,
+            fd_entries,
             flushes,
             executable_node,
             exit_signal,
@@ -657,9 +659,10 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             let flushes = process_inner.memory_set.recycle_data_pages();
             let executable_node = process_inner.executable_node.take();
             let process_keyring = process_inner.process_keyring.take();
-            // Take the fd table out while the current task is still installed.
-            // Dropping VFS file objects can take SleepMutex-backed mount locks.
-            let fd_table = core::mem::take(&mut process_inner.fd_table);
+            // Take fd entries out while the current task is still installed.
+            // Close cleanup can re-enter VFS and notification paths, so run it
+            // after dropping the PCB lock.
+            let fd_entries = process_inner.take_all_fd_entries();
             // Keep only the main task in the zombie process for waitpid reaping.
             // Non-main exiting tasks are parked in EXITED_TASKS until their kernel
             // stacks are no longer active across the next schedule boundary.
@@ -669,7 +672,7 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             (
                 parent,
                 children,
-                fd_table,
+                fd_entries,
                 flushes,
                 executable_node,
                 exit_signal,
@@ -691,7 +694,9 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             untrack_regular_file_executable(node);
         }
         release_record_locks_for_process(pid);
-        release_flock_locks_for_closed_fd_table(&fd_table);
+        for entry in fd_entries {
+            close_detached_fd_entry_for_process_teardown(entry);
+        }
         process.release_vfork_parent();
 
         // Move orphaned children under the nearest live subreaper, or init.
@@ -702,8 +707,6 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             reaper_inner.children.push(child);
         }
         drop(reaper_inner);
-
-        drop(fd_table);
 
         if let Some(parent) = parent {
             let parent_tasks = parent.tasks_snapshot();

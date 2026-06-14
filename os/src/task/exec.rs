@@ -7,6 +7,7 @@ use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::{File, VfsNodeId, track_regular_file_executable, untrack_regular_file_executable};
 use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet};
 use crate::perf;
+use crate::syscall::close_detached_fd_entry_for_process_teardown;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::copy_to_user;
 use crate::trap::{TrapContext, trap_handler};
@@ -383,7 +384,7 @@ impl ProcessControlBlock {
 
         // From this point on, user stack writes must target `new_token`; the old
         // process token may already describe the pre-exec image.
-        let previous_executable_node = {
+        let (previous_executable_node, close_on_exec_entries) = {
             let mut inner = self.inner_exclusive_access();
             inner.memory_set = memory_set;
             inner.pkey_rights = empty_process_pkey_rights();
@@ -397,9 +398,12 @@ impl ProcessControlBlock {
                     *action = SignalAction::default();
                 }
             }
-            inner.close_on_exec_fd_entries();
-            previous
+            let close_on_exec_entries = inner.close_on_exec_fd_entries();
+            (previous, close_on_exec_entries)
         };
+        for entry in close_on_exec_entries {
+            close_detached_fd_entry_for_process_teardown(entry);
+        }
         if let Some(node) = previous_executable_node {
             untrack_regular_file_executable(node);
         }

@@ -14,7 +14,7 @@ use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
     UserBufferAccess, read_user_c_string, translated_byte_buffer_checked_ctx,
 };
-use super::fanotify::fanotify_notify_close;
+use super::fanotify::{fanotify_close_group_file, fanotify_notify_close};
 use super::fd_lock::{
     fcntl_getlk, fcntl_ofd_getlk, fcntl_ofd_setlk, fcntl_ofd_setlkw, fcntl_setlk, fcntl_setlkw,
     flock_operation, release_flock_locks_for_close, release_ofd_record_locks_for_close,
@@ -112,10 +112,24 @@ pub fn sys_close(fd: usize) -> SysResult {
 /// Call this without holding `ProcessControlBlockInner`; lock and fanotify
 /// cleanup can inspect file state and must not run while the fd table is locked.
 pub(crate) fn close_detached_fd_entry(entry: FdTableEntry) {
+    close_detached_fd_entry_inner(entry, false);
+}
+
+pub(crate) fn close_detached_fd_entry_for_process_teardown(entry: FdTableEntry) {
+    close_detached_fd_entry_inner(entry, true);
+}
+
+fn close_detached_fd_entry_inner(entry: FdTableEntry, force_fanotify_release: bool) {
     release_record_locks_for_close(&entry);
     release_ofd_record_locks_for_close(&entry);
     release_flock_locks_for_close(&entry);
     let file = entry.file();
+    if force_fanotify_release {
+        // CONTEXT: process teardown can kill a thread blocked inside read(2)
+        // before its suspended Rust stack unwinds. Make the fanotify group
+        // inert from the fd close path instead of waiting for the last Arc drop.
+        fanotify_close_group_file(&file);
+    }
     fanotify_notify_close(&file, file.writable());
     inotify_notify_close(&file, file.writable());
     drop(entry);
