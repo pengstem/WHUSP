@@ -77,23 +77,36 @@ pub enum MmapFaultResult {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum FutexSharedKey {
+    // Process-shared futexes must rendezvous by backing object, not by each
+    // process's virtual address. Private futex address scoping lives in
+    // `task::futex::FutexKey`.
     File {
+        // Page-cache backed file mappings use the cache id plus byte offset so
+        // independent mappings of the same inode share one futex queue.
         id: PageCacheId,
         offset: usize,
     },
     VfsNode {
+        // Files without page-cache identity still have stable mount/inode
+        // identity through the VFS node id.
         node: crate::fs::VfsNodeId,
         offset: usize,
     },
     FileObject {
+        // Last-resort identity for shared file objects that cannot expose a
+        // VFS node; this is only stable while the file object is shared.
         object: usize,
         offset: usize,
     },
     Shm {
+        // SysV SHM attaches the same segment at potentially different virtual
+        // addresses, so shmid+segment offset is the Linux-visible identity.
         shmid: usize,
         offset: usize,
     },
     AnonymousPage {
+        // Shared anonymous mmap has no file id. Once resident, the retained
+        // physical page is the only common identity across forked processes.
         ppn: usize,
         offset: usize,
     },

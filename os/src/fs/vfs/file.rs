@@ -2481,15 +2481,14 @@ impl File for VfsFile {
             return 0;
         }
         let has_dirty_pages = dirty_regular_file_has_pages(self.node);
-        let read_size = (if has_dirty_pages {
+        (if has_dirty_pages {
             None
         } else {
             self.read_snapshot_at(offset, buf)
         })
         .or_else(|| self.read_small_regular_cached_at(offset, buf))
         .or_else(|| self.read_regular_cached_at(offset, buf))
-        .unwrap_or_else(|| self.read_backend_at_preserve_noatime(offset, buf));
-        read_size
+        .unwrap_or_else(|| self.read_backend_at_preserve_noatime(offset, buf))
     }
 
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize {

@@ -57,6 +57,9 @@ struct LinuxRobustList {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum FutexKey {
+    // FUTEX_PRIVATE_FLAG scopes the word to one Linux process id plus virtual
+    // address. Shared futexes must use `MemorySet::futex_shared_key()` when a
+    // backing object identity can be resolved.
     Private { process_id: usize, addr: usize },
     Shared(FutexSharedKey),
     SharedVirtual { addr: usize },
@@ -85,7 +88,7 @@ enum FutexWaitCleanup {
     AlreadyUnqueued,
 }
 
-/// Process-scoped futex wait queues keyed by futex word address.
+/// Global futex wait queues keyed by Linux futex identity.
 ///
 /// Callers enqueue the already-blocked current task while holding this manager,
 /// then drop the lock before scheduling away. Wake paths return task Arcs to be
@@ -513,6 +516,10 @@ fn futex_key_for_process(addr: usize, private: bool, process_id: usize) -> Futex
     if private {
         FutexKey::Private { process_id, addr }
     } else {
+        // UNFINISHED: Exit-time wake helpers only receive process id plus a
+        // virtual address, so they cannot reconstruct file-backed or SHM-backed
+        // process-shared futex keys. Normal sys_futex wait/wake paths still use
+        // `futex_key()` to resolve backing-object identity when it is available.
         FutexKey::SharedVirtual { addr }
     }
 }
@@ -812,10 +819,9 @@ fn handle_robust_futex_death(
 
     write_futex_word_with_token(token, addr, (word & FUTEX_WAITERS) | FUTEX_OWNER_DIED)?;
     if word & FUTEX_WAITERS != 0 {
-        // CONTEXT: Linux wakes a robust futex waiter by keying the futex word.
-        // This kernel still keeps private and shared futex queues separate, so
-        // exit cleanup wakes both keys to cover private pthread robust mutexes
-        // and process-shared robust mutexes.
+        // CONTEXT: Linux wakes a robust futex waiter by keying the futex word;
+        // this teardown path wakes both the shared-virtual fallback key and the
+        // process-private key used by common pthread robust mutex paths.
         let _ = futex_wake_for_process(addr, false, process_id, 1, FUTEX_BITSET_MATCH_ANY);
         let _ = futex_wake_for_process(addr, true, process_id, 1, FUTEX_BITSET_MATCH_ANY);
     }
