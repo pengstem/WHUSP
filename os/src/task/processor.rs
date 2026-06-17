@@ -11,6 +11,9 @@ use lazy_static::*;
 pub struct Processor {
     current: Option<Arc<TaskControlBlock>>,
     current_process: Option<Arc<ProcessControlBlock>>,
+    // Cached SATP/PGDL token for the running process. Keep it synchronized
+    // with set_current() and refresh_current_user_token(); syscall user-copy
+    // fast paths depend on this being the active address space.
     current_user_token: usize,
     idle_task_cx: TaskContext,
 }
@@ -51,6 +54,9 @@ impl Processor {
             .map(|_| self.current_user_token)
     }
     pub fn refresh_current_user_token(&mut self) -> Option<usize> {
+        // execve replaces the process MemorySet without scheduling a new task.
+        // Refresh after the image switch before any later user-copy helper
+        // reads the cached token through current_user_token().
         let process = self.current_process.as_ref()?;
         let token = process.inner_exclusive_access().memory_set.token();
         self.current_user_token = token;

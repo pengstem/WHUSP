@@ -99,6 +99,11 @@ impl MemorySet {
         self.insert_area_sorted(MapArea::new(start_va, end_va, MapType::Framed, permission));
     }
 
+    /// Materializes already-declared lazy framed user pages.
+    ///
+    /// This is for exec/user-stack style regions after the VMA exists but
+    /// before user pointers are live; mmap and SysV SHM faults must stay on
+    /// their dedicated lazy fault paths.
     pub(crate) fn materialize_framed_range(&mut self, start: usize, end: usize) -> bool {
         if start >= end {
             return true;

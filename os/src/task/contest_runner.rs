@@ -14,6 +14,8 @@ const PERF_COUNTER_DUMP_COMMAND: &str = "; echo '#### KERNEL PERF START ####'; /
 #[cfg(not(feature = "perf-counters"))]
 const PERF_COUNTER_DUMP_COMMAND: &str = "";
 
+// Script-disk entry.sh consumes this narrow runtime ABI. Keep the values short
+// and stable because generated shell conditionals branch on exactly "rv"/"la".
 #[cfg(target_arch = "riscv64")]
 const RUNNER_ARCH: &str = "rv";
 #[cfg(target_arch = "loongarch64")]

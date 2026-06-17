@@ -19,6 +19,8 @@ const LA_PTE_MAT_CC: usize = 0b01 << 4;
 const LA_PTE_P: usize = 1 << 7;
 const LA_PTE_W: usize = 1 << 8;
 const LA_PTE_COW: usize = 1 << 58;
+// LA64 leaf PTEs encode read/execute denial as NR/NX; absence of those bits
+// means read or execute permission is allowed.
 const LA_PTE_NR: usize = 1 << 61;
 const LA_PTE_NX: usize = 1 << 62;
 
@@ -82,6 +84,8 @@ pub fn flush_tlb_page(va: usize) {
 }
 
 pub fn should_flush_tlb_on_return(user_token: usize) -> bool {
+    // The current LA64 path has no ASID allocation, so returning to a different
+    // page-table root or after any PTE edit must request a guest TLB flush.
     let previous = LAST_RETURN_USER_TOKEN.swap(user_token, Ordering::Relaxed);
     let dirty = RETURN_TLB_DIRTY.swap(false, Ordering::Relaxed);
     previous != user_token || dirty

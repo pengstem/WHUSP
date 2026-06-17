@@ -7,10 +7,6 @@ pub const USER_MMAP_LIMIT: usize = 0x20_0000_0000;
 pub const DL_INTERP_OFFSET: usize = 0x30_0000_0000;
 pub const KERNEL_STACK_SIZE: usize = 4096 * 10;
 
-#[cfg(target_arch = "riscv64")]
-pub const KERNEL_HEAP_SIZE: usize = 0x800_0000;
-
-#[cfg(target_arch = "loongarch64")]
 pub const KERNEL_HEAP_SIZE: usize = 0x800_0000;
 
 pub const PAGE_SIZE: usize = 0x1000;

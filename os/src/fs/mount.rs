@@ -638,6 +638,8 @@ pub(super) fn mounted_root_parent(
 }
 
 pub(super) fn primary_mount_id() -> MountId {
+    // Mount id 0 is reserved by init_mounts() for QEMU x0, the contest root
+    // disk. Pseudo filesystems and lazy extra disks must not allocate before it.
     MountId(0)
 }
 

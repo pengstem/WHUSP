@@ -17,6 +17,9 @@ const ASID_SUPPORT_NO: usize = 0;
 const ASID_SUPPORT_YES: usize = 1;
 const ASID_SUPPORT_UNKNOWN: usize = 2;
 
+// ASID allocation starts at 1. On wrap, the allocator globally fences before
+// reusing tag 1 so stale per-address-space TLB entries cannot survive under a
+// recycled ASID.
 static NEXT_ASID: AtomicUsize = AtomicUsize::new(1);
 static ASID_SUPPORT: AtomicUsize = AtomicUsize::new(ASID_SUPPORT_UNKNOWN);
 static LAST_RETURN_USER_TOKEN: AtomicUsize = AtomicUsize::new(0);

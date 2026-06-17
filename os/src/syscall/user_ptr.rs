@@ -154,6 +154,9 @@ fn effective_user_fault_resolver_for_ctx<'a>(
     token: usize,
     fault_handler: Option<UserFaultHandler>,
 ) -> UserFaultResolver<'a> {
+    // A SyscallContext pins the entry address-space token. Only attach the
+    // current process to the resolver when the requested token is that same
+    // token; foreign MemorySet copies must not fault the running process.
     let current_process = (token == ctx.user_token()).then_some(ctx.process().as_ref());
     if let Some(fault_handler) = fault_handler {
         return if let Some(process) = current_process {

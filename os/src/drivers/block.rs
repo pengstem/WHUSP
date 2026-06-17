@@ -321,6 +321,8 @@ lazy_static! {
         .first()
         .expect("DTB is missing a block device")
         .clone();
+    // Legacy callers that still use BLOCK_DEVICE must keep seeing x0, not the
+    // most recently discovered disk. Multi-disk paths should use BLOCK_DEVICES.
 }
 
 #[cfg(feature = "perf-counters")]

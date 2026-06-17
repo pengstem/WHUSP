@@ -1,6 +1,10 @@
 use crate::task::{ProcessControlBlock, TaskControlBlock};
 use alloc::sync::Arc;
 
+/// Per-syscall snapshot of the current task, process, and user address space.
+///
+/// User-copy helpers should prefer this context when a syscall can sleep or
+/// mutate process state before touching user memory again.
 pub(crate) struct SyscallContext {
     task: Arc<TaskControlBlock>,
     process: Arc<ProcessControlBlock>,
