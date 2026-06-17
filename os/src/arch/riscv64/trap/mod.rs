@@ -22,7 +22,7 @@ use riscv::register::{
     sie, sscratch, stval, stvec,
 };
 
-global_asm!(include_str!("trap/trap.S"));
+global_asm!(include_str!("trap.S"));
 
 pub fn init() {
     set_kernel_trap_entry();

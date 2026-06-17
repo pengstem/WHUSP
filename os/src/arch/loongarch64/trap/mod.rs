@@ -23,7 +23,7 @@ use loongArch64::register::{
 };
 use loongArch64::register::{pwch, pwcl};
 
-global_asm!(include_str!("trap/trap.S"));
+global_asm!(include_str!("trap.S"));
 
 pub fn init() {
     // CONTEXT: The LoongArch contest userland is built with the lp64d ABI.
