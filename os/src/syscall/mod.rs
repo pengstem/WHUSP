@@ -161,6 +161,7 @@ const SYSCALL_GETRUSAGE: usize = 165;
 const SYSCALL_UMASK: usize = 166;
 const SYSCALL_PRCTL: usize = 167;
 const SYSCALL_GETTIMEOFDAY: usize = 169;
+const SYSCALL_SETTIMEOFDAY: usize = 170;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_GETPPID: usize = 173;
 const SYSCALL_GETUID: usize = 174;
@@ -981,6 +982,11 @@ pub(crate) fn syscall_with_context(
             ctx,
             args[0] as *mut LinuxTimeVal,
             args[1] as *mut LinuxTimezone,
+        ),
+        SYSCALL_SETTIMEOFDAY => sys_settimeofday_ctx(
+            ctx,
+            args[0] as *const LinuxTimeVal,
+            args[1] as *const LinuxTimezone,
         ),
         SYSCALL_GETPID => Ok(sys_getpid()),
         SYSCALL_GETPPID => Ok(sys_getppid()),

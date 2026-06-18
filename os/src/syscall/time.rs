@@ -2,8 +2,9 @@ use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::SyscallContext;
 use crate::task::{
-    ProcessCpuTimesSnapshot, block_current_task_no_schedule, current_has_deliverable_signal,
-    current_process, current_user_token, pid2process, schedule, task_with_linux_tid,
+    CAP_SYS_TIME, ProcessCpuTimesSnapshot, block_current_task_no_schedule,
+    current_has_deliverable_signal, current_process, current_user_token, pid2process, schedule,
+    task_with_linux_tid,
 };
 use crate::timer::{
     add_posix_timer, add_real_timer, add_timer, get_time_clock_ticks, get_time_ms, get_time_us,
@@ -14,7 +15,9 @@ use lazy_static::*;
 
 use super::errno::{SysError, SysResult};
 use super::uapi::LinuxTimeSpec;
-use super::user_ptr::{read_user_value, write_user_value, write_user_value_ctx};
+use super::user_ptr::{
+    read_user_value, read_user_value_ctx, write_user_value, write_user_value_ctx,
+};
 
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
@@ -402,6 +405,20 @@ fn us_to_timespec(us: usize) -> LinuxTimeSpec {
     }
 }
 
+fn timeval_to_nanos(time: LinuxTimeVal) -> SysResult<u64> {
+    (timeval_to_us(time)? as u64)
+        .checked_mul(1_000)
+        .ok_or(SysError::EINVAL)
+}
+
+fn current_has_cap_sys_time() -> bool {
+    current_process()
+        .credentials()
+        .capabilities
+        .has_effective(CAP_SYS_TIME)
+        .unwrap_or(false)
+}
+
 fn itimerspec_from_us(interval_us: usize, value_us: usize) -> LinuxITimerSpec {
     LinuxITimerSpec {
         it_interval: us_to_timespec(interval_us),
@@ -643,6 +660,31 @@ pub fn sys_gettimeofday_ctx(
     Ok(0)
 }
 
+pub fn sys_settimeofday_ctx(
+    ctx: &SyscallContext,
+    tv: *const LinuxTimeVal,
+    tz: *const LinuxTimezone,
+) -> SysResult {
+    let new_wall_nanos = if tv.is_null() {
+        None
+    } else {
+        Some(timeval_to_nanos(read_user_value_ctx(ctx, tv)?)?)
+    };
+    if !tz.is_null() {
+        // CONTEXT: Linux/musl callers normally pass NULL for timezone. Read it
+        // for EFAULT compatibility, but keep this kernel's timezone fixed at
+        // UTC just like gettimeofday().
+        let _ = read_user_value_ctx(ctx, tz)?;
+    }
+    if !current_has_cap_sys_time() {
+        return Err(SysError::EPERM);
+    }
+    if let Some(new_wall_nanos) = new_wall_nanos {
+        set_wall_time_nanos(new_wall_nanos);
+    }
+    Ok(0)
+}
+
 pub fn sys_times_ctx(ctx: &SyscallContext, tms: *mut LinuxTms) -> SysResult {
     if !tms.is_null() {
         let linux_tms = LinuxTms::from_cpu_times(ctx.process().cpu_times_snapshot());
@@ -838,8 +880,7 @@ pub fn sys_clock_settime(clock_id: i32, tp: *const LinuxTimeSpec) -> SysResult {
         return Err(SysError::EFAULT);
     }
     let request = validate_timespec(read_user_value(current_user_token(), tp)?)?;
-    let credentials = current_process().credentials();
-    if credentials.euid != 0 {
+    if !current_has_cap_sys_time() {
         return Err(SysError::EPERM);
     }
     set_wall_time_nanos(timespec_to_nanos(request)?);
@@ -1001,8 +1042,7 @@ pub fn sys_clock_adjtime(clock_id: i32, timex: *mut LinuxTimex) -> SysResult {
     let token = current_user_token();
     let mut user_timex = read_user_value(token, timex)?;
     let modes = user_timex.modes;
-    let credentials = current_process().credentials();
-    if credentials.euid != 0 && modes != 0 && modes != ADJ_OFFSET_SS_READ {
+    if !current_has_cap_sys_time() && modes != 0 && modes != ADJ_OFFSET_SS_READ {
         return Err(SysError::EPERM);
     }
     let ret = {

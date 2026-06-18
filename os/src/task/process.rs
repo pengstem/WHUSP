@@ -170,6 +170,7 @@ impl CapabilitySets {
     pub const CAP_SYS_PTRACE: usize = 19;
     pub const CAP_SYS_ADMIN: usize = 21;
     pub const CAP_SYS_RESOURCE: usize = 24;
+    pub const CAP_SYS_TIME: usize = 25;
     pub const CAP_SYS_TTY_CONFIG: usize = 26;
     pub const CAP_LAST_CAP: usize = 40;
 
