@@ -1,14 +1,19 @@
 use crate::sbi::shutdown;
+use crate::sync::UPIntrFreeCell;
 use crate::syscall::SyscallContext;
 use crate::syscall::errno::{SysError, SysResult};
 #[cfg(target_arch = "riscv64")]
 use crate::syscall::user_ptr::read_user_value_ctx;
-use crate::syscall::user_ptr::{copy_to_user, copy_to_user_ctx, write_user_value_ctx};
-use crate::task::{current_process, current_user_token, processes_snapshot};
+use crate::syscall::user_ptr::{
+    UserBufferAccess, copy_to_user, copy_to_user_ctx, translated_byte_buffer_checked_ctx,
+    write_user_value_ctx,
+};
+use crate::task::{CAP_SYS_ADMIN, current_process, current_user_token, processes_snapshot};
 use crate::timer::{get_time_clock_ticks, get_time_us};
 use alloc::format;
 use alloc::string::String;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use lazy_static::lazy_static;
 use log::warn;
 
 const UTS_FIELD_LEN: usize = 65;
@@ -59,6 +64,17 @@ static SYSLOG_FAKE_MSG: &[u8] = b"<5>[    0.000000] Linux version 5.10.0 (whusp@
 static SYSLOG_CONSOLE_LEVEL: AtomicUsize = AtomicUsize::new(SYSLOG_DEFAULT_CONSOLE_LEVEL);
 static SYSLOG_SAVED_CONSOLE_LEVEL: AtomicUsize = AtomicUsize::new(SYSLOG_DEFAULT_CONSOLE_LEVEL);
 
+lazy_static! {
+    static ref UTS_STATE: UPIntrFreeCell<UtsState> =
+        unsafe { UPIntrFreeCell::new(UtsState::new()) };
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UtsState {
+    nodename: [u8; UTS_FIELD_LEN],
+    domainname: [u8; UTS_FIELD_LEN],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct LinuxUtsName {
@@ -68,6 +84,15 @@ pub struct LinuxUtsName {
     version: [u8; UTS_FIELD_LEN],
     machine: [u8; UTS_FIELD_LEN],
     domainname: [u8; UTS_FIELD_LEN],
+}
+
+impl UtsState {
+    fn new() -> Self {
+        Self {
+            nodename: LinuxUtsName::field("WHUSP"),
+            domainname: LinuxUtsName::field("(none)"),
+        }
+    }
 }
 
 #[repr(C)]
@@ -106,13 +131,14 @@ impl LinuxUtsName {
     }
 
     fn current() -> Self {
+        let state = *UTS_STATE.exclusive_access();
         Self {
             sysname: Self::field("Linux"),
-            nodename: Self::field("WHUSP"),
+            nodename: state.nodename,
             release: Self::field("6.8.0-whusp"),
             version: Self::field("#1 SMP OSKernel2026"),
             machine: Self::field(machine_name()),
-            domainname: Self::field("(none)"),
+            domainname: state.domainname,
         }
     }
 
@@ -179,11 +205,64 @@ pub fn sys_reboot(magic: usize, magic2: usize, op: usize, _arg: usize) -> SysRes
 }
 
 pub fn sys_uname_ctx(ctx: &SyscallContext, name: *mut LinuxUtsName) -> SysResult {
-    // UNFINISHED: UTS namespaces and sethostname/setdomainname are not
-    // implemented. The personality support below is limited to the UNAME26
-    // release override needed by Linux compatibility tests.
+    // UNFINISHED: UTS namespaces are not modeled. Host and domain names are
+    // global while Linux stores them per UTS namespace.
     let uts = LinuxUtsName::current_for_personality(ctx.process().personality());
     write_user_value_ctx(ctx, name, &uts)?;
+    Ok(0)
+}
+
+fn read_uts_name_ctx(
+    ctx: &SyscallContext,
+    name: *const u8,
+    len: usize,
+) -> SysResult<[u8; UTS_FIELD_LEN]> {
+    if len >= UTS_FIELD_LEN {
+        return Err(SysError::EINVAL);
+    }
+    if len > 0 && name.is_null() {
+        return Err(SysError::EFAULT);
+    }
+
+    let mut field = [0u8; UTS_FIELD_LEN];
+    let buffers = translated_byte_buffer_checked_ctx(ctx, name, len, UserBufferAccess::Read)?;
+    let mut offset = 0;
+    for buffer in buffers {
+        let end = offset + buffer.len();
+        field[offset..end].copy_from_slice(buffer);
+        offset = end;
+    }
+    Ok(field)
+}
+
+fn require_uts_admin(ctx: &SyscallContext) -> SysResult<()> {
+    // UNFINISHED: Linux checks CAP_SYS_ADMIN in the caller's UTS user
+    // namespace. This kernel has one capability namespace, and setuid paths do
+    // not fully recalculate capability sets, so also require root euid.
+    let credentials = ctx.process().credentials();
+    if credentials.is_root()
+        && credentials
+            .capabilities
+            .has_effective(CAP_SYS_ADMIN)
+            .ok_or(SysError::EINVAL)?
+    {
+        Ok(())
+    } else {
+        Err(SysError::EPERM)
+    }
+}
+
+pub fn sys_sethostname_ctx(ctx: &SyscallContext, name: *const u8, len: usize) -> SysResult {
+    require_uts_admin(ctx)?;
+    let nodename = read_uts_name_ctx(ctx, name, len)?;
+    UTS_STATE.exclusive_access().nodename = nodename;
+    Ok(0)
+}
+
+pub fn sys_setdomainname_ctx(ctx: &SyscallContext, name: *const u8, len: usize) -> SysResult {
+    require_uts_admin(ctx)?;
+    let domainname = read_uts_name_ctx(ctx, name, len)?;
+    UTS_STATE.exclusive_access().domainname = domainname;
     Ok(0)
 }
 

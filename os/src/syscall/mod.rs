@@ -150,6 +150,8 @@ const SYSCALL_SETSID: usize = 157;
 const SYSCALL_GETGROUPS: usize = 158;
 const SYSCALL_SETGROUPS: usize = 159;
 const SYSCALL_UNAME: usize = 160;
+const SYSCALL_SETHOSTNAME: usize = 161;
+const SYSCALL_SETDOMAINNAME: usize = 162;
 const SYSCALL_GETRLIMIT: usize = 163;
 const SYSCALL_SETRLIMIT: usize = 164;
 const SYSCALL_GETRUSAGE: usize = 165;
@@ -959,6 +961,8 @@ pub(crate) fn syscall_with_context(
         SYSCALL_GETGROUPS => sys_getgroups_ctx(ctx, args[0], args[1] as *mut u32),
         SYSCALL_SETGROUPS => sys_setgroups_ctx(ctx, args[0], args[1] as *const u32),
         SYSCALL_UNAME => sys_uname_ctx(ctx, args[0] as *mut LinuxUtsName),
+        SYSCALL_SETHOSTNAME => sys_sethostname_ctx(ctx, args[0] as *const u8, args[1]),
+        SYSCALL_SETDOMAINNAME => sys_setdomainname_ctx(ctx, args[0] as *const u8, args[1]),
         SYSCALL_GETRLIMIT => sys_getrlimit_ctx(ctx, args[0] as i32, args[1] as *mut RLimit),
         SYSCALL_SETRLIMIT => sys_setrlimit_ctx(ctx, args[0] as i32, args[1] as *const RLimit),
         SYSCALL_GETRUSAGE => sys_getrusage(args[0] as i32, args[1] as *mut RUsage),

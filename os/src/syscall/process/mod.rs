@@ -35,7 +35,7 @@ pub use sched::{
 #[cfg(target_arch = "riscv64")]
 pub use system::sys_riscv_hwprobe_ctx;
 pub use system::{
-    LinuxSysInfo, LinuxUtsName, sys_getrandom_ctx, sys_personality, sys_reboot, sys_sysinfo_ctx,
-    sys_syslog, sys_uname_ctx,
+    LinuxSysInfo, LinuxUtsName, sys_getrandom_ctx, sys_personality, sys_reboot,
+    sys_setdomainname_ctx, sys_sethostname_ctx, sys_sysinfo_ctx, sys_syslog, sys_uname_ctx,
 };
 pub(crate) use system::{proc_sys_kernel_printk_content, write_proc_sys_kernel_printk};
