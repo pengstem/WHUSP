@@ -230,6 +230,7 @@ fn sys_clone_process_inner(
             Arc::clone(&child_parent),
             mount_namespace_id,
             args.exit_signal,
+            args.flags,
         )
         .ok_or(SysError::ENOMEM)?;
     let new_pid = new_process.getpid();

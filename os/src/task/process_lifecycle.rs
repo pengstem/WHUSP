@@ -2,9 +2,9 @@ use super::exec::{ExecStackInfo, init_user_stack};
 use super::id::RecycleAllocator;
 use super::manager::{insert_into_pid2process, register_task_linux_tid};
 use super::process::{
-    Credentials, ProcessControlBlock, ProcessControlBlockInner, ProcessCpuTimes, ProcessFsContext,
-    ProcessResourceLimits, ProcessTimers, comm_from_cmdline, empty_process_pkey_rights,
-    fd_allocation_state_from_table,
+    Credentials, KcmpResourceOwners, ProcessControlBlock, ProcessControlBlockInner,
+    ProcessCpuTimes, ProcessFsContext, ProcessResourceLimits, ProcessTimers, comm_from_cmdline,
+    empty_process_pkey_rights, fd_allocation_state_from_table,
 };
 use super::{
     CloneArgs, CloneFlags, FdTableEntry, SIGCHLD, SignalAction, TaskControlBlock, add_task,
@@ -155,6 +155,7 @@ impl ProcessControlBlock {
                     pid_namespace_parent_id: None,
                     user_namespace_id: 1,
                     user_namespace_parent_id: None,
+                    kcmp_resources: KcmpResourceOwners::new(pid),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                 })
@@ -239,6 +240,7 @@ impl ProcessControlBlock {
         child_parent: Arc<Self>,
         mount_namespace_id: crate::fs::MountNamespaceId,
         exit_signal: u32,
+        clone_flags: CloneFlags,
     ) -> Option<Arc<Self>> {
         let mut parent = self.inner_exclusive_access();
         let parent_resident_kb = parent.memory_set.resident_bytes() / 1024;
@@ -270,6 +272,7 @@ impl ProcessControlBlock {
         let pid_namespace_parent_id = parent.pid_namespace_parent_id;
         let user_namespace_id = parent.user_namespace_id;
         let user_namespace_parent_id = parent.user_namespace_parent_id;
+        let kcmp_resources = parent.kcmp_resources;
         let fs = parent.fs.forked(mount_namespace_id);
         let executable_node = parent.executable_node;
         let executable_path = parent.executable_path.clone();
@@ -302,6 +305,7 @@ impl ProcessControlBlock {
         drop(parent_task_inner);
         drop(parent);
 
+        let child_pid = pid.0;
         let child = Arc::new(Self {
             pid,
             inner: unsafe {
@@ -350,6 +354,7 @@ impl ProcessControlBlock {
                     pid_namespace_parent_id,
                     user_namespace_id,
                     user_namespace_parent_id,
+                    kcmp_resources: kcmp_resources.forked(child_pid, clone_flags),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                 })

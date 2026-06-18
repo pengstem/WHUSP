@@ -233,6 +233,7 @@ const SYSCALL_OPEN_BY_HANDLE_AT: usize = 265;
 const SYSCALL_CLOCK_ADJTIME: usize = 266;
 const SYSCALL_SYNCFS: usize = 267;
 const SYSCALL_SETNS: usize = 268;
+const SYSCALL_KCMP: usize = 272;
 const SYSCALL_FINIT_MODULE: usize = 273;
 const SYSCALL_SCHED_SETATTR: usize = 274;
 const SYSCALL_SCHED_GETATTR: usize = 275;
@@ -1103,6 +1104,14 @@ pub(crate) fn syscall_with_context(
         ),
         SYSCALL_CLOCK_ADJTIME => sys_clock_adjtime(args[0] as i32, args[1] as *mut LinuxTimex),
         SYSCALL_SETNS => sys_setns(args[0], args[1]),
+        SYSCALL_KCMP => sys_kcmp_ctx(
+            ctx,
+            args[0] as isize,
+            args[1] as isize,
+            args[2] as i32,
+            args[3],
+            args[4],
+        ),
         #[cfg(target_arch = "riscv64")]
         SYSCALL_RISCV_HWPROBE => sys_riscv_hwprobe_ctx(
             ctx,

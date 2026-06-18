@@ -1,7 +1,7 @@
 use super::id::RecycleAllocator;
 use super::{
-    FD_LIMIT, FdTableEntry, PidHandle, SIGNAL_INFO_SLOTS, SignalAction, TaskControlBlock,
-    TaskStatus, wakeup_task,
+    CloneFlags, FD_LIMIT, FdTableEntry, PidHandle, SIGNAL_INFO_SLOTS, SignalAction,
+    TaskControlBlock, TaskStatus, wakeup_task,
 };
 use crate::config::USER_STACK_SIZE;
 use crate::fs::{MountNamespaceId, PathContext, ROOT_MOUNT_NAMESPACE, VfsNodeId, WorkingDir};
@@ -334,6 +334,64 @@ pub(crate) struct ProcessNamespace {
     pub(crate) parent_id: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KcmpResourceOwners {
+    pub(crate) vm: usize,
+    pub(crate) files: usize,
+    pub(crate) fs: usize,
+    pub(crate) sighand: usize,
+    pub(crate) io: usize,
+    pub(crate) sysvsem: usize,
+}
+
+impl KcmpResourceOwners {
+    pub(crate) fn new(process_id: usize) -> Self {
+        Self {
+            vm: process_id,
+            files: process_id,
+            fs: process_id,
+            sighand: process_id,
+            io: process_id,
+            sysvsem: process_id,
+        }
+    }
+
+    pub(crate) fn forked(self, process_id: usize, flags: CloneFlags) -> Self {
+        Self {
+            vm: if flags.contains(CloneFlags::CLONE_VM) {
+                self.vm
+            } else {
+                process_id
+            },
+            files: if flags.contains(CloneFlags::CLONE_FILES) {
+                self.files
+            } else {
+                process_id
+            },
+            fs: if flags.contains(CloneFlags::CLONE_FS) {
+                self.fs
+            } else {
+                process_id
+            },
+            sighand: if flags.contains(CloneFlags::CLONE_SIGHAND) {
+                self.sighand
+            } else {
+                process_id
+            },
+            io: if flags.contains(CloneFlags::CLONE_IO) {
+                self.io
+            } else {
+                process_id
+            },
+            sysvsem: if flags.contains(CloneFlags::CLONE_SYSVSEM) {
+                self.sysvsem
+            } else {
+                process_id
+            },
+        }
+    }
+}
+
 fn proc_task_state(status: TaskStatus, proc_sleeping: bool) -> char {
     if proc_sleeping {
         return 'S';
@@ -637,6 +695,7 @@ pub struct ProcessControlBlockInner {
     pub(crate) pid_namespace_parent_id: Option<usize>,
     pub(crate) user_namespace_id: usize,
     pub(crate) user_namespace_parent_id: Option<usize>,
+    pub(crate) kcmp_resources: KcmpResourceOwners,
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     pub task_res_allocator: RecycleAllocator,
 }

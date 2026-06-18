@@ -1,4 +1,5 @@
 mod clone;
+mod compare;
 mod exec;
 mod id;
 mod identity;
@@ -10,6 +11,7 @@ mod sched;
 mod system;
 
 pub use clone::{LinuxCloneArgs, sys_clone, sys_clone3};
+pub use compare::sys_kcmp_ctx;
 pub use exec::{sys_execve_ctx, sys_execveat_ctx};
 pub use id::{
     sys_exit, sys_exit_group, sys_getpgid_ctx, sys_getpid, sys_getppid, sys_getsid_ctx, sys_gettid,

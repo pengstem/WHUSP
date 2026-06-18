@@ -27,6 +27,7 @@ bitflags! {
         const CLONE_NEWUSER         = 1 << 28;
         const CLONE_NEWPID          = 1 << 29;
         const CLONE_NEWNET          = 1 << 30;
+        const CLONE_IO              = 0x8000_0000;
     }
 }
 
