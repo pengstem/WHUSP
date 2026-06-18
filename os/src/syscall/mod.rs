@@ -78,6 +78,8 @@ const SYSCALL_FSYNC: usize = 82;
 const SYSCALL_FDATASYNC: usize = 83;
 const SYSCALL_SYNC_FILE_RANGE: usize = 84;
 const SYSCALL_TIMERFD_CREATE: usize = 85;
+const SYSCALL_TIMERFD_SETTIME: usize = 86;
+const SYSCALL_TIMERFD_GETTIME: usize = 87;
 const SYSCALL_UTIMENSAT: usize = 88;
 const SYSCALL_CAPGET: usize = 90;
 const SYSCALL_CAPSET: usize = 91;
@@ -730,6 +732,15 @@ pub(crate) fn syscall_with_context(
         SYSCALL_INIT_MODULE => sys_init_module(args[0] as *const u8, args[1], args[2] as *const u8),
         SYSCALL_DELETE_MODULE => sys_delete_module(args[0] as *const u8, args[1] as u32),
         SYSCALL_TIMERFD_CREATE => sys_timerfd_create(args[0] as i32, args[1] as u32),
+        SYSCALL_TIMERFD_SETTIME => sys_timerfd_settime(
+            args[0] as i32,
+            args[1] as u32,
+            args[2] as *const LinuxITimerSpec,
+            args[3] as *mut LinuxITimerSpec,
+        ),
+        SYSCALL_TIMERFD_GETTIME => {
+            sys_timerfd_gettime(args[0] as i32, args[1] as *mut LinuxITimerSpec)
+        }
         SYSCALL_UTIMENSAT => sys_utimensat(
             args[0] as isize,
             args[1] as *const u8,

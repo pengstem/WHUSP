@@ -117,8 +117,8 @@ struct LinuxITimerVal {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LinuxITimerSpec {
-    it_interval: LinuxTimeSpec,
-    it_value: LinuxTimeSpec,
+    pub(in crate::syscall) it_interval: LinuxTimeSpec,
+    pub(in crate::syscall) it_value: LinuxTimeSpec,
 }
 
 #[repr(C)]

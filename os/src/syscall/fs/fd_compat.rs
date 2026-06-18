@@ -1,14 +1,20 @@
 use crate::config::PAGE_SIZE;
-use crate::fs::{File, FileStat, OpenFlags, S_IFCHR, S_IFREG, make_anonymous_fd};
+use crate::fs::{
+    File, FileStat, OpenFlags, S_IFCHR, S_IFREG, TimerFd, TimerFdClock, make_anonymous_fd,
+    make_timerfd,
+};
 use crate::mm::{FrameTracker, UserBuffer, frame_alloc, shm::ShmPageMapping};
 use crate::sync::UPIntrFreeCell;
-use crate::task::current_user_token;
+use crate::task::{current_process, current_user_token};
+use crate::timer::get_time_us;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
+use super::super::time::{ClockBackend, LinuxITimerSpec, current_clock_nanos, timespec_to_nanos};
+use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{
     copy_to_user, read_user_array_item, read_user_value, write_user_value,
 };
@@ -20,6 +26,14 @@ const FD_NONBLOCK: u32 = OpenFlags::NONBLOCK.bits();
 const FD_CLOEXEC: u32 = OpenFlags::CLOEXEC.bits();
 const SIGNALFD_VALID_FLAGS: u32 = FD_NONBLOCK | FD_CLOEXEC;
 const TIMERFD_VALID_FLAGS: u32 = FD_NONBLOCK | FD_CLOEXEC;
+const TFD_TIMER_ABSTIME: u32 = 1;
+const TFD_TIMER_CANCEL_ON_SET: u32 = 2;
+const TIMERFD_SETTIME_VALID_FLAGS: u32 = TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET;
+const CLOCK_REALTIME: i32 = 0;
+const CLOCK_MONOTONIC: i32 = 1;
+const CLOCK_BOOTTIME: i32 = 7;
+const CLOCK_REALTIME_ALARM: i32 = 8;
+const CLOCK_BOOTTIME_ALARM: i32 = 9;
 const MEMFD_SECRET_VALID_FLAGS: u32 = FD_CLOEXEC;
 const UFFD_USER_MODE_ONLY: u32 = 1;
 const USERFAULTFD_VALID_FLAGS: u32 = FD_NONBLOCK | FD_CLOEXEC | UFFD_USER_MODE_ONLY;
@@ -518,14 +532,131 @@ pub fn sys_signalfd4(fd: isize, mask: *const u8, _sizemask: usize, flags: u32) -
 }
 
 pub fn sys_timerfd_create(clockid: i32, flags: u32) -> SysResult {
-    match clockid {
-        0 | 1 | 7 | 8 | 9 | 11 => {}
-        _ => return Err(SysError::EINVAL),
-    }
+    let clock = timerfd_clock_from_id(clockid)?;
     let open_flags = open_flags_from_fd_flags(flags, TIMERFD_VALID_FLAGS)?;
-    // UNFINISHED: timerfd expiration accounting and read semantics are not
-    // implemented; this fd is for fd-class syscall probes.
-    install_dummy_readable_fd(open_flags)
+    install_file_fd(make_timerfd(clock), open_flags, None)
+}
+
+fn timerfd_clock_from_id(clockid: i32) -> SysResult<TimerFdClock> {
+    match clockid {
+        CLOCK_REALTIME => Ok(TimerFdClock::Realtime),
+        CLOCK_MONOTONIC | CLOCK_BOOTTIME => Ok(TimerFdClock::Monotonic),
+        CLOCK_REALTIME_ALARM => {
+            if current_process().credentials().euid == 0 {
+                Ok(TimerFdClock::Realtime)
+            } else {
+                Err(SysError::EPERM)
+            }
+        }
+        CLOCK_BOOTTIME_ALARM => {
+            if current_process().credentials().euid == 0 {
+                Ok(TimerFdClock::Monotonic)
+            } else {
+                Err(SysError::EPERM)
+            }
+        }
+        _ => Err(SysError::EINVAL),
+    }
+}
+
+fn timerfd_backend(clock: TimerFdClock) -> ClockBackend {
+    match clock {
+        TimerFdClock::Realtime => ClockBackend::Wall,
+        TimerFdClock::Monotonic => ClockBackend::Monotonic,
+    }
+}
+
+fn nanos_to_us_ceil(nanos: u64) -> SysResult<usize> {
+    let us = nanos / 1_000 + if nanos % 1_000 == 0 { 0 } else { 1 };
+    if us > usize::MAX as u64 {
+        return Err(SysError::EINVAL);
+    }
+    Ok(us as usize)
+}
+
+fn timespec_to_us_ceil(time: LinuxTimeSpec) -> SysResult<usize> {
+    nanos_to_us_ceil(timespec_to_nanos(time)?)
+}
+
+fn timespec_from_us(us: usize) -> LinuxTimeSpec {
+    LinuxTimeSpec {
+        tv_sec: (us / 1_000_000) as isize,
+        tv_nsec: ((us % 1_000_000) * 1_000) as isize,
+    }
+}
+
+fn itimerspec_from_us(interval_us: usize, value_us: usize) -> LinuxITimerSpec {
+    LinuxITimerSpec {
+        it_interval: timespec_from_us(interval_us),
+        it_value: timespec_from_us(value_us),
+    }
+}
+
+fn timerfd_next_expire_us(
+    clock: TimerFdClock,
+    flags: u32,
+    value: LinuxTimeSpec,
+) -> SysResult<Option<usize>> {
+    let value_nanos = timespec_to_nanos(value)?;
+    if value_nanos == 0 {
+        return Ok(None);
+    }
+    let remaining_us = if flags & TFD_TIMER_ABSTIME != 0 {
+        let now_nanos = current_clock_nanos(timerfd_backend(clock));
+        nanos_to_us_ceil(value_nanos.saturating_sub(now_nanos))?
+    } else {
+        nanos_to_us_ceil(value_nanos)?
+    };
+    Ok(Some(
+        get_time_us()
+            .checked_add(remaining_us)
+            .ok_or(SysError::EINVAL)?,
+    ))
+}
+
+fn timerfd_from_file(file: &Arc<dyn File + Send + Sync>) -> SysResult<&TimerFd> {
+    file.as_any()
+        .downcast_ref::<TimerFd>()
+        .ok_or(SysError::EINVAL)
+}
+
+pub fn sys_timerfd_settime(
+    fd: i32,
+    flags: u32,
+    new_value: *const LinuxITimerSpec,
+    old_value: *mut LinuxITimerSpec,
+) -> SysResult {
+    if flags & !TIMERFD_SETTIME_VALID_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+    if new_value.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    let request = read_user_value(current_user_token(), new_value)?;
+    let interval_us = timespec_to_us_ceil(request.it_interval)?;
+    let file = get_file_by_fd(fd.try_into().map_err(|_| SysError::EBADF)?)?;
+    let timerfd = timerfd_from_file(&file)?;
+    // UNFINISHED: TFD_TIMER_CANCEL_ON_SET is accepted for ABI compatibility,
+    // but this kernel does not yet cancel realtime timerfds on wall-clock jumps.
+    let next_expire_us = timerfd_next_expire_us(timerfd.clock(), flags, request.it_value)?;
+    let (old_interval_us, old_remaining_us) = timerfd.set_time(interval_us, next_expire_us);
+    if !old_value.is_null() {
+        let old = itimerspec_from_us(old_interval_us, old_remaining_us);
+        write_user_value(current_user_token(), old_value, &old)?;
+    }
+    Ok(0)
+}
+
+pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut LinuxITimerSpec) -> SysResult {
+    if curr_value.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    let file = get_file_by_fd(fd.try_into().map_err(|_| SysError::EBADF)?)?;
+    let timerfd = timerfd_from_file(&file)?;
+    let (interval_us, remaining_us) = timerfd.get_time();
+    let current = itimerspec_from_us(interval_us, remaining_us);
+    write_user_value(current_user_token(), curr_value, &current)?;
+    Ok(0)
 }
 
 pub fn sys_memfd_secret(flags: u32) -> SysResult {

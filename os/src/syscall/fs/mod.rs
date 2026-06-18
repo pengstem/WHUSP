@@ -35,7 +35,8 @@ pub use fd::{
 pub(crate) use fd_compat::io_uring_mmap_region;
 pub use fd_compat::{
     sys_bpf, sys_io_uring_enter, sys_io_uring_register, sys_io_uring_setup, sys_memfd_secret,
-    sys_perf_event_open, sys_signalfd4, sys_timerfd_create, sys_userfaultfd,
+    sys_perf_event_open, sys_signalfd4, sys_timerfd_create, sys_timerfd_gettime,
+    sys_timerfd_settime, sys_userfaultfd,
 };
 pub(crate) use fd_lock::release_record_locks_for_process;
 pub use file_handle::{sys_name_to_handle_at, sys_open_by_handle_at};
