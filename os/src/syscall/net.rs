@@ -74,6 +74,10 @@ pub fn sys_sendmsg(fd: usize, msg: usize, flags: i32) -> SysResult {
     crate::fs::socket::sys_sendmsg(fd, msg, flags)
 }
 
+pub fn sys_sendmmsg(fd: usize, msgvec: usize, vlen: usize, flags: i32) -> SysResult {
+    crate::fs::socket::sys_sendmmsg(fd, msgvec, vlen, flags)
+}
+
 pub fn sys_recvmsg(fd: usize, msg: usize, flags: i32) -> SysResult {
     crate::fs::socket::sys_recvmsg(fd, msg, flags)
 }

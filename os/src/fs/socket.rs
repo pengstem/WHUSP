@@ -218,6 +218,13 @@ struct LinuxMsghdr {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+struct LinuxMmsghdr {
+    msg_hdr: LinuxMsghdr,
+    msg_len: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 struct LinuxCmsghdr {
     cmsg_len: usize,
     cmsg_level: i32,
@@ -3619,29 +3626,70 @@ pub fn sys_sendmsg(fd: usize, msg: usize, _flags: i32) -> SysResult {
         let msg = read_user_value(token, msg as *const LinuxMsghdr)?;
         return Ok(socket.send_msg(msg)? as isize);
     }
-    if let Some(socket) = file.as_any().downcast_ref::<LocalSocket>()
-        && socket.domain() == SocketDomain::Netlink
-    {
+    if let Some(socket) = file.as_any().downcast_ref::<LocalSocket>() {
         let token = current_user_token();
         let msg = read_user_value(token, msg as *const LinuxMsghdr)?;
         let data = read_msg_iovecs(token, msg.msg_iov, msg.msg_iovlen)?;
-        return Ok(socket.send_bytes(data, None, false)? as isize);
+        let remote = if socket.domain() == SocketDomain::Netlink || msg.msg_name == 0 {
+            None
+        } else {
+            Some(read_socket_address(token, msg.msg_name, msg.msg_namelen)?)
+        };
+        return match socket.send_bytes(data, remote, recv_nonblock(_flags, socket)) {
+            Ok(written) => Ok(written as isize),
+            Err(SysError::EPIPE) => {
+                current_add_signal(SignalFlags::SIGPIPE);
+                Err(SysError::EPIPE)
+            }
+            Err(err) => Err(err),
+        };
     }
-    // UNFINISHED: scatter/gather socket messages and control messages are not
-    // implemented for the local loopback socket subset.
-    Err(SysError::ENOSYS)
+    Err(SysError::ENOTSOCK)
+}
+
+pub fn sys_sendmmsg(fd: usize, msgvec: usize, vlen: usize, flags: i32) -> SysResult {
+    if vlen == 0 {
+        return Ok(0);
+    }
+    if vlen > 1024 {
+        return Err(SysError::EINVAL);
+    }
+
+    let token = current_user_token();
+    let mut sent = 0usize;
+    for index in 0..vlen {
+        let offset = index
+            .checked_mul(size_of::<LinuxMmsghdr>())
+            .ok_or(SysError::EFAULT)?;
+        let ptr = msgvec.checked_add(offset).ok_or(SysError::EFAULT)?;
+        match sys_sendmsg(fd, ptr, flags) {
+            Ok(len) => {
+                let mut header = read_user_value(token, ptr as *const LinuxMmsghdr)?;
+                header.msg_len = len as u32;
+                write_user_value(token, ptr as *mut LinuxMmsghdr, &header)?;
+                sent += 1;
+            }
+            Err(_err) if sent > 0 => return Ok(sent as isize),
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(sent as isize)
 }
 
 pub fn sys_recvmsg(fd: usize, msg: usize, flags: i32) -> SysResult {
     let file = file_from_fd(fd)?;
-    if let Some(socket) = file.as_any().downcast_ref::<LocalSocket>()
-        && socket.domain() == SocketDomain::Netlink
-    {
+    if let Some(socket) = file.as_any().downcast_ref::<LocalSocket>() {
+        if socket.kind() != SocketKind::Datagram {
+            // UNFINISHED: stream recvmsg scatter/gather is not implemented.
+            return Err(SysError::ENOSYS);
+        }
         let token = current_user_token();
         let mut msg_value = read_user_value(token, msg as *const LinuxMsghdr)?;
         let data = socket.recv_raw_datagram(recv_nonblock(flags, socket))?;
         let copied = copy_to_msg_iovecs(token, msg_value.msg_iov, msg_value.msg_iovlen, &data)?;
-        if msg_value.msg_name != 0 && msg_value.msg_namelen as usize >= size_of::<LinuxSockAddrNl>()
+        if socket.domain() == SocketDomain::Netlink
+            && msg_value.msg_name != 0
+            && msg_value.msg_namelen as usize >= size_of::<LinuxSockAddrNl>()
         {
             write_user_value(
                 token,
@@ -3658,7 +3706,5 @@ pub fn sys_recvmsg(fd: usize, msg: usize, flags: i32) -> SysResult {
         write_user_value(token, msg as *mut LinuxMsghdr, &msg_value)?;
         return Ok(copied as isize);
     }
-    // UNFINISHED: scatter/gather socket messages and control messages are not
-    // implemented for the local loopback socket subset.
-    Err(SysError::ENOSYS)
+    Err(SysError::ENOTSOCK)
 }

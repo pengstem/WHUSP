@@ -238,6 +238,7 @@ const SYSCALL_OPEN_BY_HANDLE_AT: usize = 265;
 const SYSCALL_CLOCK_ADJTIME: usize = 266;
 const SYSCALL_SYNCFS: usize = 267;
 const SYSCALL_SETNS: usize = 268;
+const SYSCALL_SENDMMSG: usize = 269;
 const SYSCALL_KCMP: usize = 272;
 const SYSCALL_FINIT_MODULE: usize = 273;
 const SYSCALL_SCHED_SETATTR: usize = 274;
@@ -1178,6 +1179,7 @@ pub(crate) fn syscall_with_context(
         }
         SYSCALL_SHUTDOWN => sys_shutdown(args[0], args[1] as i32),
         SYSCALL_SENDMSG => sys_sendmsg(args[0], args[1], args[2] as i32),
+        SYSCALL_SENDMMSG => sys_sendmmsg(args[0], args[1], args[2], args[3] as i32),
         SYSCALL_RECVMSG => sys_recvmsg(args[0], args[1], args[2] as i32),
         _ => Err(SysError::ENOSYS),
     }
