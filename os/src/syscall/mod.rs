@@ -76,6 +76,7 @@ const SYSCALL_FSTAT: usize = 80;
 const SYSCALL_SYNC: usize = 81;
 const SYSCALL_FSYNC: usize = 82;
 const SYSCALL_FDATASYNC: usize = 83;
+const SYSCALL_SYNC_FILE_RANGE: usize = 84;
 const SYSCALL_TIMERFD_CREATE: usize = 85;
 const SYSCALL_UTIMENSAT: usize = 88;
 const SYSCALL_CAPGET: usize = 90;
@@ -715,6 +716,9 @@ pub(crate) fn syscall_with_context(
         SYSCALL_SYNC => sys_sync(),
         SYSCALL_FSYNC => sys_fsync(args[0]),
         SYSCALL_FDATASYNC => sys_fdatasync(args[0]),
+        SYSCALL_SYNC_FILE_RANGE => {
+            sys_sync_file_range(args[0], args[1] as i64, args[2] as i64, args[3] as u32)
+        }
         SYSCALL_SYNCFS => sys_syncfs(args[0]),
         SYSCALL_INIT_MODULE => sys_init_module(args[0] as *const u8, args[1], args[2] as *const u8),
         SYSCALL_DELETE_MODULE => sys_delete_module(args[0] as *const u8, args[1] as u32),

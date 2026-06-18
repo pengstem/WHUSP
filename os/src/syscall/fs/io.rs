@@ -1,5 +1,7 @@
 use crate::config::PAGE_SIZE;
-use crate::fs::{File, FileStat, OpenFlags, PollEvents, S_IFDIR, S_IFMT, S_IFREG, SeekWhence};
+use crate::fs::{
+    File, FileStat, OpenFlags, PollEvents, S_IFBLK, S_IFDIR, S_IFMT, S_IFREG, SeekWhence,
+};
 use crate::mm::UserBuffer;
 use crate::perf;
 use crate::syscall::SyscallContext;
@@ -49,6 +51,11 @@ const WRITEV_COALESCE_CHUNK_SIZE: usize = 64 * 1024;
 // CONTEXT: Prepared iovec ranges are syscall-local snapshots of user mappings;
 // do not cache these translated slices beyond the current readv/writev call.
 const USER_IOVEC_RANGE_REUSE: bool = true;
+const SYNC_FILE_RANGE_WAIT_BEFORE: u32 = 0x01;
+const SYNC_FILE_RANGE_WRITE: u32 = 0x02;
+const SYNC_FILE_RANGE_WAIT_AFTER: u32 = 0x04;
+const VALID_SYNC_FILE_RANGE_FLAGS: u32 =
+    SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER;
 
 static PREADV2_NOWAIT_COMPAT_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -1373,6 +1380,30 @@ pub fn sys_fdatasync(fd: usize) -> SysResult {
     if file.mode_type()? != S_IFREG {
         return Err(SysError::EINVAL);
     }
+    file.sync(true)?;
+    Ok(0)
+}
+
+pub fn sys_sync_file_range(fd: usize, offset: i64, nbytes: i64, flags: u32) -> SysResult {
+    let file = get_file_by_fd(fd)?;
+    if flags & !VALID_SYNC_FILE_RANGE_FLAGS != 0
+        || offset < 0
+        || nbytes < 0
+        || offset.checked_add(nbytes).is_none()
+    {
+        return Err(SysError::EINVAL);
+    }
+    let mode_type = file.mode_type()?;
+    if !matches!(mode_type, S_IFREG | S_IFBLK | S_IFDIR) {
+        return Err(SysError::ESPIPE);
+    }
+    if flags == 0 {
+        return Ok(0);
+    }
+    // UNFINISHED: Linux sync_file_range can separately start writeback and
+    // wait on an exact byte range without flushing metadata. This kernel does
+    // not model range writeback yet, so any nonzero legal flag combination
+    // falls back to the existing whole-file data sync path.
     file.sync(true)?;
     Ok(0)
 }
