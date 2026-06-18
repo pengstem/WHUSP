@@ -606,6 +606,7 @@ pub struct ProcessControlBlockInner {
     pub(crate) fd_open_bits: Vec<usize>,
     pub(crate) next_fd_hint: usize,
     pub umask: u32,
+    pub(crate) io_priority: u16,
     pub(crate) comm: String,
     pub(crate) pdeath_signal: u32,
     pub(crate) dumpable: bool,

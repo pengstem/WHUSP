@@ -128,6 +128,7 @@ impl ProcessControlBlock {
                     fd_open_bits,
                     next_fd_hint,
                     umask: 0,
+                    io_priority: 0,
                     comm: comm_from_cmdline(&args),
                     pdeath_signal: 0,
                     dumpable: true,
@@ -251,6 +252,7 @@ impl ProcessControlBlock {
         let new_fd_table = parent.fd_table.clone();
         let (fd_open_bits, next_fd_hint) = fd_allocation_state_from_table(&new_fd_table);
         let umask = parent.umask;
+        let io_priority = parent.io_priority;
         let credentials = parent.credentials.clone();
         let resource_limits = parent.resource_limits;
         let session_keyring = parent.session_keyring;
@@ -319,6 +321,7 @@ impl ProcessControlBlock {
                     fd_open_bits,
                     next_fd_hint,
                     umask,
+                    io_priority,
                     comm,
                     pdeath_signal: 0,
                     dumpable,

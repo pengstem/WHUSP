@@ -30,6 +30,8 @@ const SYSCALL_INOTIFY_INIT1: usize = 26;
 const SYSCALL_INOTIFY_ADD_WATCH: usize = 27;
 const SYSCALL_INOTIFY_RM_WATCH: usize = 28;
 const SYSCALL_IOCTL: usize = 29;
+const SYSCALL_IOPRIO_SET: usize = 30;
+const SYSCALL_IOPRIO_GET: usize = 31;
 const SYSCALL_FLOCK: usize = 32;
 const SYSCALL_MKNODAT: usize = 33;
 const SYSCALL_MKDIRAT: usize = 34;
@@ -534,6 +536,10 @@ pub(crate) fn syscall_with_context(
         }
         SYSCALL_INOTIFY_RM_WATCH => sys_inotify_rm_watch(args[0], args[1] as i32),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
+        SYSCALL_IOPRIO_SET => {
+            sys_ioprio_set_ctx(ctx, args[0] as i32, args[1] as isize, args[2] as i32)
+        }
+        SYSCALL_IOPRIO_GET => sys_ioprio_get_ctx(ctx, args[0] as i32, args[1] as isize),
         SYSCALL_FLOCK => sys_flock(args[0], args[1] as i32),
         SYSCALL_MKNODAT => sys_mknodat(
             args[0] as isize,
