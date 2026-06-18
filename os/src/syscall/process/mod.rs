@@ -23,7 +23,7 @@ pub use identity::{
 };
 pub use namespace::{sys_setns, sys_unshare};
 pub(crate) use pidfd::{install_pidfd_for_fanotify, pidfd_fdinfo};
-pub use pidfd::{sys_pidfd_open, sys_pidfd_send_signal};
+pub use pidfd::{sys_pidfd_getfd, sys_pidfd_open, sys_pidfd_send_signal};
 pub use ptrace::sys_ptrace;
 pub use resource::{sys_getrlimit_ctx, sys_prlimit64_ctx, sys_setrlimit_ctx};
 pub use sched::{

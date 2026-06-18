@@ -5,8 +5,8 @@ use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::install_file_fd;
 use crate::syscall::user_ptr::read_user_value;
 use crate::task::{
-    Credentials, FdTableEntry, ProcessControlBlock, SignalFlags, SignalInfo, current_process,
-    current_user_token, pid2process, queue_signal_to_task, wakeup_task,
+    Credentials, FdFlags, FdTableEntry, ProcessControlBlock, SignalFlags, SignalInfo,
+    current_process, current_user_token, pid2process, queue_signal_to_task, wakeup_task,
 };
 use alloc::format;
 use alloc::string::String;
@@ -172,6 +172,40 @@ pub fn sys_pidfd_send_signal(
     let info = signal_info_from_user(signum, info)?;
     queue_signal_to_process(&target, signal, info);
     Ok(0)
+}
+
+pub fn sys_pidfd_getfd(pidfd: i32, target_fd: i32, flags: u32) -> SysResult {
+    if flags != 0 {
+        return Err(SysError::EINVAL);
+    }
+    if pidfd < 0 || target_fd < 0 {
+        return Err(SysError::EBADF);
+    }
+
+    let pid = pid_from_fd(pidfd as usize)?;
+    let target = pid2process(pid).ok_or(SysError::ESRCH)?;
+
+    let caller = current_process();
+    // UNFINISHED: Linux gates pidfd_getfd() with a
+    // PTRACE_MODE_ATTACH_REALCREDS ptrace check. This kernel has no complete
+    // ptrace access-mode implementation yet, so reuse the existing pidfd
+    // credential check in the single user/PID namespace.
+    if !caller_can_signal_target(&caller.credentials(), &target.credentials()) {
+        return Err(SysError::EPERM);
+    }
+
+    let source_entry = {
+        let inner = target.inner_exclusive_access();
+        inner.fd_entry(target_fd as usize).ok_or(SysError::EBADF)?
+    };
+    let new_fd = {
+        let mut inner = caller.inner_exclusive_access();
+        let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
+        let previous = inner.set_fd_entry(fd, source_entry.duplicate(FdFlags::CLOEXEC));
+        debug_assert!(previous.is_none());
+        fd
+    };
+    Ok(new_fd as isize)
 }
 
 pub fn sys_pidfd_open(pid: usize, flags: u32) -> SysResult {

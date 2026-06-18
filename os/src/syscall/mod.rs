@@ -258,6 +258,7 @@ const SYSCALL_PIDFD_OPEN: usize = 434;
 const SYSCALL_CLONE3: usize = 435;
 const SYSCALL_CLOSE_RANGE: usize = 436;
 const SYSCALL_OPENAT2: usize = 437;
+const SYSCALL_PIDFD_GETFD: usize = 438;
 const SYSCALL_FACCESSAT2: usize = 439;
 const SYSCALL_EPOLL_PWAIT2: usize = 441;
 const SYSCALL_QUOTACTL_FD: usize = 443;
@@ -882,6 +883,7 @@ pub(crate) fn syscall_with_context(
             args[3] as u32,
         ),
         SYSCALL_PIDFD_OPEN => sys_pidfd_open(args[0], args[1] as u32),
+        SYSCALL_PIDFD_GETFD => sys_pidfd_getfd(args[0] as i32, args[1] as i32, args[2] as u32),
         SYSCALL_SIGALTSTACK => sys_sigaltstack_ctx(ctx, args[0] as *const u8, args[1] as *mut u8),
         SYSCALL_RT_SIGSUSPEND => sys_rt_sigsuspend(args[0] as *const u8, args[1]),
         SYSCALL_RT_SIGACTION => sys_rt_sigaction_ctx(
