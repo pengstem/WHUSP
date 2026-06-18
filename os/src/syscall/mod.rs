@@ -225,6 +225,7 @@ const SYSCALL_REMAP_FILE_PAGES: usize = 234;
 const SYSCALL_RT_TGSIGQUEUEINFO: usize = 240;
 const SYSCALL_PERF_EVENT_OPEN: usize = 241;
 const SYSCALL_ACCEPT4: usize = 242;
+const SYSCALL_RECVMMSG: usize = 243;
 #[cfg(target_arch = "riscv64")]
 const SYSCALL_RISCV_HWPROBE: usize = 258;
 #[cfg(target_arch = "riscv64")]
@@ -1181,6 +1182,7 @@ pub(crate) fn syscall_with_context(
         SYSCALL_SENDMSG => sys_sendmsg(args[0], args[1], args[2] as i32),
         SYSCALL_SENDMMSG => sys_sendmmsg(args[0], args[1], args[2], args[3] as i32),
         SYSCALL_RECVMSG => sys_recvmsg(args[0], args[1], args[2] as i32),
+        SYSCALL_RECVMMSG => sys_recvmmsg(args[0], args[1], args[2], args[3] as i32, args[4]),
         _ => Err(SysError::ENOSYS),
     }
 }

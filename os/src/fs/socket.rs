@@ -123,6 +123,7 @@ const SHUT_RD: i32 = 0;
 const SHUT_WR: i32 = 1;
 const SHUT_RDWR: i32 = 2;
 const MSG_DONTWAIT: i32 = 0x40;
+const MSG_WAITFORONE: i32 = 0x10000;
 const ALG_SET_KEY: i32 = 1;
 const ALG_SET_IV: i32 = 2;
 const ALG_SET_OP: i32 = 3;
@@ -221,6 +222,13 @@ struct LinuxMsghdr {
 struct LinuxMmsghdr {
     msg_hdr: LinuxMsghdr,
     msg_len: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxOldTimespec {
+    tv_sec: isize,
+    tv_nsec: isize,
 }
 
 #[repr(C)]
@@ -3674,6 +3682,62 @@ pub fn sys_sendmmsg(fd: usize, msgvec: usize, vlen: usize, flags: i32) -> SysRes
         }
     }
     Ok(sent as isize)
+}
+
+fn validate_recvmmsg_timeout(timeout: usize) -> SysResult<()> {
+    if timeout == 0 {
+        return Ok(());
+    }
+    let token = current_user_token();
+    let timeout = read_user_value(token, timeout as *const LinuxOldTimespec)?;
+    if timeout.tv_sec < 0 || timeout.tv_nsec < 0 || timeout.tv_nsec >= 1_000_000_000 {
+        return Err(SysError::EINVAL);
+    }
+    Ok(())
+}
+
+pub fn sys_recvmmsg(
+    fd: usize,
+    msgvec: usize,
+    vlen: usize,
+    flags: i32,
+    timeout: usize,
+) -> SysResult {
+    if vlen == 0 {
+        return Ok(0);
+    }
+    if vlen > 1024 {
+        return Err(SysError::EINVAL);
+    }
+    validate_recvmmsg_timeout(timeout)?;
+
+    let token = current_user_token();
+    let mut received = 0usize;
+    for index in 0..vlen {
+        let offset = index
+            .checked_mul(size_of::<LinuxMmsghdr>())
+            .ok_or(SysError::EFAULT)?;
+        let ptr = msgvec.checked_add(offset).ok_or(SysError::EFAULT)?;
+        let recv_flags = if received > 0 && flags & MSG_WAITFORONE != 0 {
+            flags | MSG_DONTWAIT
+        } else {
+            flags
+        };
+        match sys_recvmsg(fd, ptr, recv_flags) {
+            Ok(len) => {
+                let mut header = read_user_value(token, ptr as *const LinuxMmsghdr)?;
+                header.msg_len = len as u32;
+                write_user_value(token, ptr as *mut LinuxMmsghdr, &header)?;
+                received += 1;
+                if len == 0 {
+                    break;
+                }
+            }
+            Err(_err) if received > 0 => return Ok(received as isize),
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(received as isize)
 }
 
 pub fn sys_recvmsg(fd: usize, msg: usize, flags: i32) -> SysResult {
