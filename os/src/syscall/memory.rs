@@ -70,6 +70,8 @@ const MEMBARRIER_CMD_PRIVATE_EXPEDITED: i32 = 1 << 3;
 const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: i32 = 1 << 4;
 const MEMBARRIER_SUPPORTED_CMDS: isize =
     (MEMBARRIER_CMD_PRIVATE_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED) as isize;
+#[cfg(target_arch = "riscv64")]
+const SYS_RISCV_FLUSH_ICACHE_ALL: usize = 1;
 
 const MADV_NORMAL: i32 = 0;
 const MADV_RANDOM: i32 = 1;
@@ -936,6 +938,18 @@ pub fn sys_msync(addr: usize, len: usize, flags: i32) -> SysResult {
     // yet, so it only validates the mapping range and writes back dirty shared
     // mmap pages.
     write_back_mmap_flushes(flushes);
+    Ok(0)
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn sys_riscv_flush_icache(_start: usize, _end: usize, flags: usize) -> SysResult {
+    if flags & !SYS_RISCV_FLUSH_ICACHE_ALL != 0 {
+        return Err(SysError::EINVAL);
+    }
+    // CONTEXT: Linux reserves the address range for forward compatibility and
+    // flushes the current mm. The contest kernel runs one hart, so the local
+    // RISC-V instruction barrier covers both ALL and LOCAL flag modes.
+    crate::arch::mm::instruction_barrier();
     Ok(0)
 }
 
