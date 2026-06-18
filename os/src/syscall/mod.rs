@@ -256,6 +256,7 @@ const SYSCALL_FSMOUNT: usize = 432;
 const SYSCALL_FSPICK: usize = 433;
 const SYSCALL_PIDFD_OPEN: usize = 434;
 const SYSCALL_CLONE3: usize = 435;
+const SYSCALL_CLOSE_RANGE: usize = 436;
 const SYSCALL_OPENAT2: usize = 437;
 const SYSCALL_FACCESSAT2: usize = 439;
 const SYSCALL_EPOLL_PWAIT2: usize = 441;
@@ -612,6 +613,11 @@ pub(crate) fn syscall_with_context(
         ),
         SYSCALL_CLOSE => sys_close(args[0]),
         SYSCALL_PIPE2 => sys_pipe2_ctx(ctx, args[0] as *mut i32, args[1] as u32),
+        SYSCALL_CLOSE_RANGE => sys_close_range(
+            args[0] as u32 as usize,
+            args[1] as u32 as usize,
+            args[2] as u32,
+        ),
         SYSCALL_QUOTACTL => sys_quotactl(
             args[0] as i32,
             args[1] as *const u8,

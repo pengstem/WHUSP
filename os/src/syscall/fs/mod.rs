@@ -29,7 +29,8 @@ pub(crate) use fd::{
     install_file_fd,
 };
 pub use fd::{
-    sys_close, sys_dup, sys_dup3, sys_fcntl_ctx, sys_flock, sys_memfd_create, sys_pipe2_ctx,
+    sys_close, sys_close_range, sys_dup, sys_dup3, sys_fcntl_ctx, sys_flock, sys_memfd_create,
+    sys_pipe2_ctx,
 };
 pub(crate) use fd_compat::io_uring_mmap_region;
 pub use fd_compat::{

@@ -8,6 +8,7 @@ use crate::task::{
 };
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::mem::size_of;
 
 use super::super::errno::{SysError, SysResult};
@@ -50,6 +51,9 @@ const MFD_CLOEXEC: u32 = 0x0001;
 const MFD_ALLOW_SEALING: u32 = 0x0002;
 const MFD_VALID_FLAGS: u32 = MFD_CLOEXEC | MFD_ALLOW_SEALING;
 const MEMFD_NAME_MAX: usize = 249;
+const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
+const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+const VALID_CLOSE_RANGE_FLAGS: u32 = CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC;
 
 pub(super) fn get_fd_entry_by_fd(fd: usize) -> SysResult<FdTableEntry> {
     let process = current_process();
@@ -104,6 +108,44 @@ pub fn sys_close(fd: usize) -> SysResult {
         inner.take_fd_entry(fd).ok_or(SysError::EBADF)?
     };
     close_detached_fd_entry(entry);
+    Ok(0)
+}
+
+pub fn sys_close_range(first: usize, last: usize, flags: u32) -> SysResult {
+    if first > last || flags & !VALID_CLOSE_RANGE_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+    // UNFINISHED: CLOSE_RANGE_UNSHARE is accepted for Linux compatibility, but
+    // this kernel's fd table is process-wide rather than a per-thread
+    // files_struct, so it cannot currently unshare one thread's descriptors.
+    let process = current_process();
+    let entries = {
+        let mut inner = process.inner_exclusive_access();
+        let last = last.min(inner.fd_table.len().saturating_sub(1));
+        if first > last {
+            Vec::new()
+        } else if flags & CLOSE_RANGE_CLOEXEC != 0 {
+            for fd in first..=last {
+                if let Some(Some(entry)) = inner.fd_table.get_mut(fd) {
+                    let mut fd_flags = entry.fd_flags();
+                    fd_flags.insert(FdFlags::CLOEXEC);
+                    entry.set_fd_flags(fd_flags);
+                }
+            }
+            Vec::new()
+        } else {
+            let mut entries = Vec::new();
+            for fd in first..=last {
+                if let Some(entry) = inner.take_fd_entry(fd) {
+                    entries.push(entry);
+                }
+            }
+            entries
+        }
+    };
+    for entry in entries {
+        close_detached_fd_entry(entry);
+    }
     Ok(0)
 }
 
