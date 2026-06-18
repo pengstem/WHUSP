@@ -411,12 +411,16 @@ fn timeval_to_nanos(time: LinuxTimeVal) -> SysResult<u64> {
         .ok_or(SysError::EINVAL)
 }
 
-fn current_has_cap_sys_time() -> bool {
-    current_process()
-        .credentials()
-        .capabilities
-        .has_effective(CAP_SYS_TIME)
-        .unwrap_or(false)
+fn current_can_set_time() -> bool {
+    let credentials = current_process().credentials();
+    // CONTEXT: Capabilities are process-wide and are not recalculated across
+    // setuid/exec transitions yet. Require root euid as well as CAP_SYS_TIME
+    // so seteuid(nobody) tests do not retain stale root power.
+    credentials.is_root()
+        && credentials
+            .capabilities
+            .has_effective(CAP_SYS_TIME)
+            .unwrap_or(false)
 }
 
 fn itimerspec_from_us(interval_us: usize, value_us: usize) -> LinuxITimerSpec {
@@ -676,7 +680,7 @@ pub fn sys_settimeofday_ctx(
         // UTC just like gettimeofday().
         let _ = read_user_value_ctx(ctx, tz)?;
     }
-    if !current_has_cap_sys_time() {
+    if !current_can_set_time() {
         return Err(SysError::EPERM);
     }
     if let Some(new_wall_nanos) = new_wall_nanos {
@@ -880,7 +884,7 @@ pub fn sys_clock_settime(clock_id: i32, tp: *const LinuxTimeSpec) -> SysResult {
         return Err(SysError::EFAULT);
     }
     let request = validate_timespec(read_user_value(current_user_token(), tp)?)?;
-    if !current_has_cap_sys_time() {
+    if !current_can_set_time() {
         return Err(SysError::EPERM);
     }
     set_wall_time_nanos(timespec_to_nanos(request)?);
@@ -1042,7 +1046,7 @@ pub fn sys_clock_adjtime(clock_id: i32, timex: *mut LinuxTimex) -> SysResult {
     let token = current_user_token();
     let mut user_timex = read_user_value(token, timex)?;
     let modes = user_timex.modes;
-    if !current_has_cap_sys_time() && modes != 0 && modes != ADJ_OFFSET_SS_READ {
+    if !current_can_set_time() && modes != 0 && modes != ADJ_OFFSET_SS_READ {
         return Err(SysError::EPERM);
     }
     let ret = {
@@ -1055,4 +1059,8 @@ pub fn sys_clock_adjtime(clock_id: i32, timex: *mut LinuxTimex) -> SysResult {
     };
     write_user_value(token, timex, &user_timex)?;
     Ok(ret)
+}
+
+pub fn sys_adjtimex(timex: *mut LinuxTimex) -> SysResult {
+    sys_clock_adjtime(CLOCK_REALTIME, timex)
 }
