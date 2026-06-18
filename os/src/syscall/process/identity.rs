@@ -47,6 +47,8 @@ const PR_NAME_LEN: usize = 16;
 const SECCOMP_MODE_DISABLED: usize = 0;
 const SECCOMP_MODE_STRICT: usize = 1;
 const SECCOMP_MODE_FILTER: usize = 2;
+const SECCOMP_SET_MODE_STRICT: usize = 0;
+const SECCOMP_SET_MODE_FILTER: usize = 1;
 const SECCOMP_FILTER_MAX_INSNS: usize = 4096;
 const BPF_LD_W_ABS: u16 = 0x20;
 const BPF_JMP_JEQ_K: u16 = 0x15;
@@ -319,6 +321,64 @@ fn read_seccomp_filter_ctx(ctx: &SyscallContext, ptr: usize) -> SysResult<Vec<Se
     }
 }
 
+fn set_seccomp_strict_ctx(ctx: &SyscallContext) -> SysResult {
+    // UNFINISHED: This implements Linux strict seccomp, but does not model
+    // ptrace/audit interactions.
+    let mut inner = ctx.task().inner_exclusive_access();
+    inner.seccomp_mode = SECCOMP_MODE_STRICT as u8;
+    inner.seccomp_filter = None;
+    Ok(0)
+}
+
+fn set_seccomp_filter_ctx(ctx: &SyscallContext, filter_ptr: usize) -> SysResult {
+    if filter_ptr == 0 {
+        return Err(SysError::EFAULT);
+    }
+    let filter = read_seccomp_filter_ctx(ctx, filter_ptr)?;
+    let has_sys_admin = ctx
+        .process()
+        .credentials()
+        .capabilities
+        .has_effective(CAP_SYS_ADMIN)
+        .ok_or(SysError::EINVAL)?;
+    let no_new_privs = ctx.process().inner_exclusive_access().no_new_privs;
+    if !has_sys_admin && !no_new_privs {
+        return Err(SysError::EACCES);
+    }
+    // UNFINISHED: This supports the classic BPF instruction subset used by
+    // LTP prctl04: LD syscall nr, JEQ, and RET KILL/ALLOW.
+    let mut inner = ctx.task().inner_exclusive_access();
+    inner.seccomp_mode = SECCOMP_MODE_FILTER as u8;
+    inner.seccomp_filter = Some(filter);
+    Ok(0)
+}
+
+pub fn sys_seccomp_ctx(
+    ctx: &SyscallContext,
+    operation: usize,
+    flags: usize,
+    args: usize,
+) -> SysResult {
+    match operation {
+        SECCOMP_SET_MODE_STRICT => {
+            if flags != 0 || args != 0 {
+                return Err(SysError::EINVAL);
+            }
+            set_seccomp_strict_ctx(ctx)
+        }
+        SECCOMP_SET_MODE_FILTER => {
+            if flags != 0 {
+                return Err(SysError::EINVAL);
+            }
+            set_seccomp_filter_ctx(ctx, args)
+        }
+        // UNFINISHED: seccomp notification/query operations and filter flags
+        // such as TSYNC require cross-thread filter-tree state and user
+        // notification fds. Return an explicit error instead of dummy success.
+        _ => Err(SysError::EINVAL),
+    }
+}
+
 pub fn sys_prctl_ctx(
     ctx: &SyscallContext,
     option: usize,
@@ -367,36 +427,8 @@ pub fn sys_prctl_ctx(
         }
         PR_GET_SECCOMP => Ok(ctx.task().inner_exclusive_access().seccomp_mode as isize),
         PR_SET_SECCOMP => match arg2 {
-            SECCOMP_MODE_STRICT => {
-                // UNFINISHED: This implements Linux strict seccomp, but does
-                // not model ptrace/audit interactions.
-                let mut inner = ctx.task().inner_exclusive_access();
-                inner.seccomp_mode = SECCOMP_MODE_STRICT as u8;
-                inner.seccomp_filter = None;
-                Ok(0)
-            }
-            SECCOMP_MODE_FILTER => {
-                if arg3 == 0 {
-                    return Err(SysError::EFAULT);
-                }
-                let filter = read_seccomp_filter_ctx(ctx, arg3)?;
-                let has_sys_admin = ctx
-                    .process()
-                    .credentials()
-                    .capabilities
-                    .has_effective(CAP_SYS_ADMIN)
-                    .ok_or(SysError::EINVAL)?;
-                let no_new_privs = ctx.process().inner_exclusive_access().no_new_privs;
-                if !has_sys_admin && !no_new_privs {
-                    return Err(SysError::EACCES);
-                }
-                // UNFINISHED: This supports the classic BPF instruction subset
-                // used by LTP prctl04: LD syscall nr, JEQ, and RET KILL/ALLOW.
-                let mut inner = ctx.task().inner_exclusive_access();
-                inner.seccomp_mode = SECCOMP_MODE_FILTER as u8;
-                inner.seccomp_filter = Some(filter);
-                Ok(0)
-            }
+            SECCOMP_MODE_STRICT => set_seccomp_strict_ctx(ctx),
+            SECCOMP_MODE_FILTER => set_seccomp_filter_ctx(ctx, arg3),
             SECCOMP_MODE_DISABLED => Err(SysError::EINVAL),
             _ => Err(SysError::EINVAL),
         },

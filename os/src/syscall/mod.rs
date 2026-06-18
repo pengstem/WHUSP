@@ -233,6 +233,7 @@ const SYSCALL_FINIT_MODULE: usize = 273;
 const SYSCALL_SCHED_SETATTR: usize = 274;
 const SYSCALL_SCHED_GETATTR: usize = 275;
 const SYSCALL_RENAMEAT2: usize = 276;
+const SYSCALL_SECCOMP: usize = 277;
 const SYSCALL_GETRANDOM: usize = 278;
 const SYSCALL_MEMFD_CREATE: usize = 279;
 const SYSCALL_BPF: usize = 280;
@@ -557,6 +558,7 @@ pub(crate) fn syscall_with_context(
             args[3] as *const u8,
             args[4] as u32,
         ),
+        SYSCALL_SECCOMP => sys_seccomp_ctx(ctx, args[0], args[1], args[2]),
         SYSCALL_GETRANDOM => sys_getrandom_ctx(ctx, args[0] as *mut u8, args[1], args[2] as u32),
         SYSCALL_MEMFD_CREATE => sys_memfd_create(args[0] as *const u8, args[1] as u32),
         SYSCALL_MEMFD_SECRET => sys_memfd_secret(args[0] as u32),

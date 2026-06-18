@@ -18,8 +18,8 @@ pub use id::{
 pub use identity::{
     LinuxCapUserData, LinuxCapUserHeader, sys_capget_ctx, sys_capset_ctx, sys_getegid, sys_geteuid,
     sys_getgid, sys_getgroups_ctx, sys_getresgid_ctx, sys_getresuid_ctx, sys_getuid, sys_prctl_ctx,
-    sys_setfsgid, sys_setfsuid, sys_setgid, sys_setgroups_ctx, sys_setregid, sys_setresgid,
-    sys_setresuid, sys_setreuid, sys_setuid,
+    sys_seccomp_ctx, sys_setfsgid, sys_setfsuid, sys_setgid, sys_setgroups_ctx, sys_setregid,
+    sys_setresgid, sys_setresuid, sys_setreuid, sys_setuid,
 };
 pub use namespace::{sys_setns, sys_unshare};
 pub(crate) use pidfd::{install_pidfd_for_fanotify, pidfd_fdinfo};
