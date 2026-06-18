@@ -15,7 +15,7 @@ use super::errno::{SysError, SysResult};
 use super::time::relative_timeout_deadline_ms;
 use super::uapi::LinuxTimeSpec;
 use super::user_ptr::{
-    read_user_value, read_user_value_ctx, write_user_value, write_user_value_ctx,
+    copy_to_user_ctx, read_user_value, read_user_value_ctx, write_user_value, write_user_value_ctx,
 };
 use super::wait::LinuxSigInfo;
 
@@ -338,6 +338,25 @@ pub fn sys_rt_sigprocmask_ctx(
             _ => return Err(SysError::EINVAL),
         }
     }
+    Ok(0)
+}
+
+pub fn sys_rt_sigpending_ctx(ctx: &SyscallContext, set: *mut u8, sigsetsize: usize) -> SysResult {
+    if sigsetsize > LINUX_RT_SIGSET_SIZE {
+        return Err(SysError::EINVAL);
+    }
+    let pending = {
+        let task = ctx.task();
+        let task_inner = task.inner_exclusive_access();
+        // UNFINISHED: Linux reports the union of thread-local pending signals
+        // and process-wide shared pending signals. This kernel currently routes
+        // process-directed signals to a concrete task instead of keeping a
+        // separate shared-pending queue, so the task-local set is the only
+        // pending source available here.
+        task_inner.pending_signals & task_inner.signal_mask
+    };
+    let raw = flags_to_linux_sigset(pending);
+    copy_to_user_ctx(ctx, set, &raw.to_ne_bytes()[..sigsetsize])?;
     Ok(0)
 }
 

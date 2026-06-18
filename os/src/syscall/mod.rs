@@ -122,6 +122,7 @@ const SYSCALL_SIGALTSTACK: usize = 132;
 const SYSCALL_RT_SIGSUSPEND: usize = 133;
 const SYSCALL_RT_SIGACTION: usize = 134;
 const SYSCALL_RT_SIGPROCMASK: usize = 135;
+const SYSCALL_RT_SIGPENDING: usize = 136;
 const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
 const SYSCALL_RT_SIGRETURN: usize = 139;
 const SYSCALL_SETPRIORITY: usize = 140;
@@ -880,6 +881,7 @@ pub(crate) fn syscall_with_context(
             args[2] as *mut u8,
             args[3],
         ),
+        SYSCALL_RT_SIGPENDING => sys_rt_sigpending_ctx(ctx, args[0] as *mut u8, args[1]),
         SYSCALL_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(
             args[0] as *const u8,
             args[1] as *mut LinuxSigInfo,
