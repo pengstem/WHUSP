@@ -211,6 +211,8 @@ const SYSCALL_REMAP_FILE_PAGES: usize = 234;
 const SYSCALL_PERF_EVENT_OPEN: usize = 241;
 const SYSCALL_ACCEPT4: usize = 242;
 #[cfg(target_arch = "riscv64")]
+const SYSCALL_RISCV_HWPROBE: usize = 258;
+#[cfg(target_arch = "riscv64")]
 const SYSCALL_RISCV_FLUSH_ICACHE: usize = 259;
 const SYSCALL_WAIT4: usize = 260;
 const SYSCALL_PRLIMIT64: usize = 261;
@@ -1044,6 +1046,15 @@ pub(crate) fn syscall_with_context(
         ),
         SYSCALL_CLOCK_ADJTIME => sys_clock_adjtime(args[0] as i32, args[1] as *mut LinuxTimex),
         SYSCALL_SETNS => sys_setns(args[0], args[1]),
+        #[cfg(target_arch = "riscv64")]
+        SYSCALL_RISCV_HWPROBE => sys_riscv_hwprobe_ctx(
+            ctx,
+            args[0] as *mut u8,
+            args[1],
+            args[2],
+            args[3],
+            args[4] as u32,
+        ),
         #[cfg(target_arch = "riscv64")]
         SYSCALL_RISCV_FLUSH_ICACHE => sys_riscv_flush_icache(args[0], args[1], args[2]),
         SYSCALL_FINIT_MODULE => sys_finit_module(args[0], args[1] as *const u8, args[2] as u32),

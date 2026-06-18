@@ -1,6 +1,8 @@
 use crate::sbi::shutdown;
 use crate::syscall::SyscallContext;
 use crate::syscall::errno::{SysError, SysResult};
+#[cfg(target_arch = "riscv64")]
+use crate::syscall::user_ptr::read_user_value_ctx;
 use crate::syscall::user_ptr::{copy_to_user, copy_to_user_ctx, write_user_value_ctx};
 use crate::task::{current_process, current_user_token, processes_snapshot};
 use crate::timer::{get_time_clock_ticks, get_time_us};
@@ -46,6 +48,12 @@ const PER_LINUX: u32 = 0;
 const PER_MASK: u32 = 0xff;
 const UNAME26: u32 = 0x0002_0000;
 const UNAME26_RELEASE: &str = "2.6.60";
+#[cfg(target_arch = "riscv64")]
+const RISCV_HWPROBE_KEY_BASE_BEHAVIOR: i64 = 3;
+#[cfg(target_arch = "riscv64")]
+const RISCV_HWPROBE_BASE_BEHAVIOR_IMA: u64 = 1 << 0;
+#[cfg(target_arch = "riscv64")]
+const RISCV_HWPROBE_KEY_IMA_EXT_0: i64 = 4;
 
 static SYSLOG_FAKE_MSG: &[u8] = b"<5>[    0.000000] Linux version 5.10.0 (whusp@oscomp)\n";
 static SYSLOG_CONSOLE_LEVEL: AtomicUsize = AtomicUsize::new(SYSLOG_DEFAULT_CONSOLE_LEVEL);
@@ -78,6 +86,14 @@ pub struct LinuxSysInfo {
     totalhigh: usize,
     freehigh: usize,
     mem_unit: u32,
+}
+
+#[cfg(target_arch = "riscv64")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct RiscvHwprobe {
+    key: i64,
+    value: u64,
 }
 
 impl LinuxUtsName {
@@ -183,6 +199,69 @@ pub fn sys_sysinfo_ctx(ctx: &SyscallContext, info: *mut LinuxSysInfo) -> SysResu
         ..LinuxSysInfo::default()
     };
     write_user_value_ctx(ctx, info, &value)?;
+    Ok(0)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn riscv_hwprobe_pair_ptr(pairs: *mut RiscvHwprobe, index: usize) -> SysResult<*mut RiscvHwprobe> {
+    let offset = index
+        .checked_mul(core::mem::size_of::<RiscvHwprobe>())
+        .ok_or(SysError::EFAULT)?;
+    let addr = (pairs as usize)
+        .checked_add(offset)
+        .ok_or(SysError::EFAULT)?;
+    Ok(addr as *mut RiscvHwprobe)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn fill_riscv_hwprobe_pair(pair: &mut RiscvHwprobe) {
+    match pair.key {
+        RISCV_HWPROBE_KEY_BASE_BEHAVIOR => {
+            pair.value = RISCV_HWPROBE_BASE_BEHAVIOR_IMA;
+        }
+        RISCV_HWPROBE_KEY_IMA_EXT_0 => {
+            pair.value = 0;
+        }
+        _ => {
+            pair.key = -1;
+            pair.value = 0;
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn sys_riscv_hwprobe_ctx(
+    ctx: &SyscallContext,
+    pairs: *mut u8,
+    pair_count: usize,
+    cpuset_size: usize,
+    cpus: usize,
+    flags: u32,
+) -> SysResult {
+    if flags != 0 {
+        return Err(SysError::EINVAL);
+    }
+    if cpuset_size != 0 || cpus != 0 {
+        return Err(SysError::EINVAL);
+    }
+    if pair_count == 0 {
+        return Ok(0);
+    }
+    if pairs.is_null() {
+        return Err(SysError::EFAULT);
+    }
+
+    let pairs = pairs.cast::<RiscvHwprobe>();
+    for index in 0..pair_count {
+        let pair_ptr = riscv_hwprobe_pair_ptr(pairs, index)?;
+        let mut pair = read_user_value_ctx(ctx, pair_ptr as *const RiscvHwprobe)?;
+        // CONTEXT: This conservative RISC-V hwprobe subset supports only the
+        // all-online-CPU shortcut on the contest single-hart kernel. It reports
+        // base IMA behavior and deliberately under-reports optional extensions
+        // until the corresponding arch state is modeled.
+        fill_riscv_hwprobe_pair(&mut pair);
+        write_user_value_ctx(ctx, pair_ptr, &pair)?;
+    }
     Ok(0)
 }
 
