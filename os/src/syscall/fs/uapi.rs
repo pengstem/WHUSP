@@ -12,6 +12,7 @@ pub(super) const AT_NO_AUTOMOUNT: i32 = 0x800;
 pub(super) const AT_EMPTY_PATH: i32 = 0x1000;
 pub(super) const VALID_FSTATAT_FLAGS: i32 = AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH;
 pub(super) const VALID_FCHOWNAT_FLAGS: i32 = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
+pub(super) const VALID_FCHMODAT2_FLAGS: i32 = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
 pub(super) const VALID_UTIMENSAT_FLAGS: i32 = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
 pub(super) const UTIME_NOW: isize = 0x3fffffff;
 pub(super) const UTIME_OMIT: isize = 0x3ffffffe;

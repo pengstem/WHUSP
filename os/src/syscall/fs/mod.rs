@@ -62,10 +62,10 @@ pub use path::{
 pub use poll::{sys_ppoll, sys_pselect6};
 pub use quota::{sys_quotactl, sys_quotactl_fd};
 pub use stat::{
-    sys_fchmod, sys_fchmodat, sys_fchown, sys_fchownat, sys_fgetxattr, sys_flistxattr,
-    sys_fremovexattr, sys_fsetxattr, sys_fstat_ctx, sys_fstatfs_ctx, sys_getxattr, sys_lgetxattr,
-    sys_listxattr, sys_llistxattr, sys_lremovexattr, sys_lsetxattr, sys_newfstatat_ctx,
-    sys_removexattr, sys_setxattr, sys_statfs_ctx, sys_statx_ctx,
+    sys_fchmod, sys_fchmodat, sys_fchmodat2, sys_fchown, sys_fchownat, sys_fgetxattr,
+    sys_flistxattr, sys_fremovexattr, sys_fsetxattr, sys_fstat_ctx, sys_fstatfs_ctx, sys_getxattr,
+    sys_lgetxattr, sys_listxattr, sys_llistxattr, sys_lremovexattr, sys_lsetxattr,
+    sys_newfstatat_ctx, sys_removexattr, sys_setxattr, sys_statfs_ctx, sys_statx_ctx,
 };
 pub(crate) use swap::is_active_swap_file;
 pub use swap::{sys_swapoff, sys_swapon};

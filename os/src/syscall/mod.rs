@@ -260,6 +260,7 @@ const SYSCALL_FACCESSAT2: usize = 439;
 const SYSCALL_EPOLL_PWAIT2: usize = 441;
 const SYSCALL_QUOTACTL_FD: usize = 443;
 const SYSCALL_MEMFD_SECRET: usize = 447;
+const SYSCALL_FCHMODAT2: usize = 452;
 
 mod aio;
 mod context;
@@ -580,6 +581,12 @@ pub(crate) fn syscall_with_context(
         SYSCALL_CHROOT => sys_chroot(args[0] as *const u8),
         SYSCALL_FCHMOD => sys_fchmod(args[0], args[1] as u32),
         SYSCALL_FCHMODAT => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_FCHMODAT2 => sys_fchmodat2(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as u32,
+            args[3] as i32,
+        ),
         SYSCALL_FCHOWNAT => sys_fchownat(
             args[0] as isize,
             args[1] as *const u8,

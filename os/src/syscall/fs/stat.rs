@@ -24,8 +24,8 @@ use super::path::{
 };
 use super::uapi::{
     AT_EMPTY_PATH, AT_FDCWD, AT_STATX_DONT_SYNC, AT_STATX_FORCE_SYNC, AT_SYMLINK_NOFOLLOW,
-    LinuxKstat, LinuxStatfs, LinuxStatx, STATX_RESERVED, VALID_FCHOWNAT_FLAGS, VALID_FSTATAT_FLAGS,
-    VALID_STATX_FLAGS,
+    LinuxKstat, LinuxStatfs, LinuxStatx, STATX_RESERVED, VALID_FCHMODAT2_FLAGS,
+    VALID_FCHOWNAT_FLAGS, VALID_FSTATAT_FLAGS, VALID_STATX_FLAGS,
 };
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -353,6 +353,49 @@ pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> SysResult {
         inotify_notify_attrib(&file);
     }
     Ok(0)
+}
+
+pub fn sys_fchmodat2(dirfd: isize, pathname: *const u8, mode: u32, flags: i32) -> SysResult {
+    if pathname.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    if flags & !VALID_FCHMODAT2_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+
+    let token = current_user_token();
+    let path = read_user_c_string(token, pathname, PATH_MAX)?;
+    reject_proc_self_fd_o_path(path.as_str())?;
+    let snapshot = current_process().path_snapshot();
+    match resolve_at_path(&snapshot, dirfd, path.as_str(), flags & AT_EMPTY_PATH != 0)? {
+        AtPath::Empty(empty) => {
+            let file = empty.file();
+            let stat = file.stat()?;
+            let mode = prepare_mode_change(stat, mode)?;
+            file.set_mode(mode)?;
+            fanotify_notify_attrib(&file);
+            inotify_notify_attrib(&file);
+            Ok(0)
+        }
+        AtPath::Path(path) => {
+            let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
+            check_current_access_path_prefixes_from(&snapshot, dirfd, path)?;
+            let stat = resolve_stat_from(&snapshot, dirfd, path, follow_final_symlink)?;
+            let mode = prepare_mode_change(stat, mode)?;
+            let context = path_context_from(&snapshot, dirfd, path)?;
+            chmod_in(context.clone(), path, follow_final_symlink, mode)?;
+            let open_flags = if follow_final_symlink {
+                OpenFlags::PATH
+            } else {
+                OpenFlags::PATH | OpenFlags::NOFOLLOW
+            };
+            if let Ok(file) = open_file_in(context, path, open_flags) {
+                fanotify_notify_attrib(&file);
+                inotify_notify_attrib(&file);
+            }
+            Ok(0)
+        }
+    }
 }
 
 pub fn sys_fchmod(fd: usize, mode: u32) -> SysResult {
