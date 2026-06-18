@@ -8,7 +8,9 @@ use crate::syscall::user_ptr::{
     UserBufferAccess, copy_to_user, copy_to_user_ctx, translated_byte_buffer_checked_ctx,
     write_user_value_ctx,
 };
-use crate::task::{CAP_SYS_ADMIN, current_process, current_user_token, processes_snapshot};
+use crate::task::{
+    CAP_SYS_ADMIN, CAP_SYS_TTY_CONFIG, current_process, current_user_token, processes_snapshot,
+};
 use crate::timer::{get_time_clock_ticks, get_time_us};
 use alloc::format;
 use alloc::string::String;
@@ -202,6 +204,22 @@ pub fn sys_reboot(magic: usize, magic2: usize, op: usize, _arg: usize) -> SysRes
         // kernel-image handoff, or suspend support that this kernel lacks.
         _ => Err(SysError::EINVAL),
     }
+}
+
+pub fn sys_vhangup_ctx(ctx: &SyscallContext) -> SysResult {
+    let credentials = ctx.process().credentials();
+    if !credentials
+        .capabilities
+        .has_effective(CAP_SYS_TTY_CONFIG)
+        .unwrap_or(false)
+    {
+        return Err(SysError::EPERM);
+    }
+    // UNFINISHED: The kernel has no controlling-terminal/session tty model.
+    // For root-owned LTP and BusyBox compatibility, accepting the call as a
+    // no-op preserves the Linux privilege surface without pretending to revoke
+    // terminal state that is not modeled.
+    Ok(0)
 }
 
 pub fn sys_uname_ctx(ctx: &SyscallContext, name: *mut LinuxUtsName) -> SysResult {

@@ -55,6 +55,7 @@ const SYSCALL_FCHOWNAT: usize = 54;
 const SYSCALL_FCHOWN: usize = 55;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
+const SYSCALL_VHANGUP: usize = 58;
 const SYSCALL_PIPE2: usize = 59;
 const SYSCALL_QUOTACTL: usize = 60;
 const SYSCALL_GETDENTS64: usize = 61;
@@ -628,6 +629,7 @@ pub(crate) fn syscall_with_context(
             args[3],
         ),
         SYSCALL_CLOSE => sys_close(args[0]),
+        SYSCALL_VHANGUP => sys_vhangup_ctx(ctx),
         SYSCALL_PIPE2 => sys_pipe2_ctx(ctx, args[0] as *mut i32, args[1] as u32),
         SYSCALL_CLOSE_RANGE => sys_close_range(
             args[0] as u32 as usize,

@@ -41,6 +41,7 @@ pub(crate) const CAP_SYS_CHROOT: usize = process::CapabilitySets::CAP_SYS_CHROOT
 pub(crate) const CAP_SYS_PTRACE: usize = process::CapabilitySets::CAP_SYS_PTRACE;
 pub(crate) const CAP_SYS_ADMIN: usize = process::CapabilitySets::CAP_SYS_ADMIN;
 pub(crate) const CAP_SYS_RESOURCE: usize = process::CapabilitySets::CAP_SYS_RESOURCE;
+pub(crate) const CAP_SYS_TTY_CONFIG: usize = process::CapabilitySets::CAP_SYS_TTY_CONFIG;
 
 pub use crate::arch::TaskContext;
 pub use clone::{CloneArgs, CloneFlags, clone_current_thread};
