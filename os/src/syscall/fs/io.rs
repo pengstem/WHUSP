@@ -1372,6 +1372,63 @@ pub fn sys_splice(
     Ok(copied as isize)
 }
 
+fn ensure_tee_nonblocking_ready(
+    in_file: &(dyn File + Send + Sync),
+    out_file: &(dyn File + Send + Sync),
+) -> SysResult<()> {
+    let input_occupied = in_file.pipe_occupied().ok_or(SysError::EINVAL)?;
+    if input_occupied == 0
+        && !in_file
+            .poll(PollEvents::POLLIN)
+            .intersects(PollEvents::POLLIN)
+    {
+        return Err(SysError::EAGAIN);
+    }
+
+    let output_capacity = out_file.pipe_capacity().ok_or(SysError::EINVAL)?;
+    let output_occupied = out_file.pipe_occupied().ok_or(SysError::EINVAL)?;
+    if output_capacity.saturating_sub(output_occupied) == 0 {
+        return Err(SysError::EAGAIN);
+    }
+    Ok(())
+}
+
+pub fn sys_tee(fd_in: usize, fd_out: usize, len: usize, flags: u32) -> SysResult {
+    if flags & !SPLICE_KNOWN_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+
+    let in_entry = get_fd_entry_by_fd(fd_in)?;
+    let out_entry = get_fd_entry_by_fd(fd_out)?;
+    let in_file = in_entry.file();
+    let out_file = out_entry.file();
+    if !in_file.is_pipe() || !out_file.is_pipe() {
+        return Err(SysError::EINVAL);
+    }
+    if !in_file.readable() || !out_file.writable() {
+        return Err(SysError::EBADF);
+    }
+    check_pipe_write_peer(&out_entry, true)?;
+    in_file
+        .tee_pipe_to_pipe(out_file.as_ref(), 0)?
+        .ok_or(SysError::EINVAL)?;
+
+    let nonblocking = flags & SPLICE_F_NONBLOCK != 0
+        || in_entry.status_flags().contains(OpenFlags::NONBLOCK)
+        || out_entry.status_flags().contains(OpenFlags::NONBLOCK);
+    if nonblocking {
+        ensure_tee_nonblocking_ready(in_file.as_ref(), out_file.as_ref())?;
+    }
+
+    let copied = in_file
+        .tee_pipe_to_pipe(out_file.as_ref(), len)?
+        .ok_or(SysError::EINVAL)?;
+    Ok(copied as isize)
+}
+
 fn vmsplice_nonblock_len(
     entry: &FdTableEntry,
     events: PollEvents,

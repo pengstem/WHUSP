@@ -74,6 +74,7 @@ const SYSCALL_PPOLL: usize = 73;
 const SYSCALL_SIGNALFD4: usize = 74;
 const SYSCALL_VMSPLICE: usize = 75;
 const SYSCALL_SPLICE: usize = 76;
+const SYSCALL_TEE: usize = 77;
 const SYSCALL_READLINKAT: usize = 78;
 const SYSCALL_NEWFSTATAT: usize = 79;
 const SYSCALL_FSTAT: usize = 80;
@@ -711,6 +712,7 @@ pub(crate) fn syscall_with_context(
             args[4],
             args[5] as u32,
         ),
+        SYSCALL_TEE => sys_tee(args[0], args[1], args[2], args[3] as u32),
         SYSCALL_PSELECT6 => sys_pselect6(
             args[0],
             args[1],

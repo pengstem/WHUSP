@@ -186,6 +186,57 @@ impl Pipe {
         PollWaiter::wake_all(poll_readers);
         Ok(moved)
     }
+
+    fn tee_pipe_to_pipe(&self, out: &Pipe, len: usize) -> FsResult<usize> {
+        if !self.readable || !out.writable {
+            return Err(FsError::InvalidInput);
+        }
+        if Arc::ptr_eq(&self.buffer, &out.buffer) {
+            return Err(FsError::InvalidInput);
+        }
+        if len == 0 {
+            return Ok(0);
+        }
+
+        loop {
+            let wait_for = {
+                let mut in_buffer = self.buffer.exclusive_access();
+                let mut out_buffer = out.buffer.exclusive_access();
+                if in_buffer.available_read() == 0 {
+                    if in_buffer.all_write_ends_closed() || pipe_wait_interrupted() {
+                        return Ok(0);
+                    }
+                    Some(in_buffer.sleep_reader())
+                } else if out_buffer.available_write() == 0 {
+                    if out_buffer.all_read_ends_closed() || pipe_wait_interrupted() {
+                        return Ok(0);
+                    }
+                    Some(out_buffer.sleep_writer())
+                } else {
+                    let copied = in_buffer.duplicate_to(&mut out_buffer, len);
+                    let reader = if copied > 0 {
+                        out_buffer.wake_reader()
+                    } else {
+                        None
+                    };
+                    let poll_readers = if copied > 0 {
+                        out_buffer.wake_read_poll_waiters()
+                    } else {
+                        Vec::new()
+                    };
+                    drop(out_buffer);
+                    drop(in_buffer);
+                    wake_task(reader);
+                    PollWaiter::wake_all(poll_readers);
+                    return Ok(copied);
+                }
+            };
+
+            if let Some(task_cx_ptr) = wait_for {
+                schedule(task_cx_ptr);
+            }
+        }
+    }
 }
 
 pub(super) const PIPE_MIN_CAPACITY: usize = PAGE_SIZE;
@@ -294,6 +345,26 @@ impl PipeRingBuffer {
         }
         moved
     }
+    fn duplicate_to(&self, out: &mut PipeRingBuffer, len: usize) -> usize {
+        let mut remaining = len.min(self.available_read()).min(out.available_write());
+        let mut read_pos = self.head;
+        let mut copied = 0usize;
+        while remaining > 0 {
+            let read_len = self.contiguous_read_len_from(read_pos);
+            let write_len = out.contiguous_write_len();
+            let chunk_len = remaining.min(read_len).min(write_len);
+            if chunk_len == 0 {
+                break;
+            }
+            out.arr[out.tail..out.tail + chunk_len]
+                .copy_from_slice(&self.arr[read_pos..read_pos + chunk_len]);
+            read_pos = (read_pos + chunk_len) % self.capacity();
+            out.advance_tail(chunk_len);
+            copied += chunk_len;
+            remaining -= chunk_len;
+        }
+        copied
+    }
     fn contiguous_read_len(&self) -> usize {
         let available = self.available_read();
         if available == 0 {
@@ -302,6 +373,15 @@ impl PipeRingBuffer {
             self.tail - self.head
         } else {
             self.capacity() - self.head
+        }
+    }
+    fn contiguous_read_len_from(&self, pos: usize) -> usize {
+        if self.available_read() == 0 {
+            0
+        } else if self.tail > pos {
+            self.tail - pos
+        } else {
+            self.capacity() - pos
         }
     }
     fn contiguous_write_len(&self) -> usize {
@@ -557,6 +637,16 @@ impl File for Pipe {
             return Ok(None);
         };
         self.splice_pipe_to_pipe(out, len).map(Some)
+    }
+    fn tee_pipe_to_pipe(
+        &self,
+        out: &(dyn File + Send + Sync),
+        len: usize,
+    ) -> FsResult<Option<usize>> {
+        let Some(out) = out.as_any().downcast_ref::<Pipe>() else {
+            return Ok(None);
+        };
+        self.tee_pipe_to_pipe(out, len).map(Some)
     }
     fn poll(&self, events: PollEvents) -> PollEvents {
         self.poll_with_wait(events, None)

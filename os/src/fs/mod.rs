@@ -595,6 +595,13 @@ pub trait File: Send + Sync {
     ) -> FsResult<Option<usize>> {
         Ok(None)
     }
+    fn tee_pipe_to_pipe(
+        &self,
+        _out: &(dyn File + Send + Sync),
+        _len: usize,
+    ) -> FsResult<Option<usize>> {
+        Ok(None)
+    }
     fn socket_write_peer_closed(&self) -> bool {
         false
     }
