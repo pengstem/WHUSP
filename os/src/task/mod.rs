@@ -590,6 +590,9 @@ fn exit_current(exit_code: i32, group_exit: bool) {
         )
     };
     unregister_task_linux_tid(linux_tid);
+    // Robust-list owner-death and CLONE_CHILD_CLEARTID writes still need the
+    // exiting thread's old user address space; complete them before dropping
+    // TaskUserRes or removing the task from its process slot.
     futex::exit_robust_list(&current, process_token, process_id);
     if let Some(clear_child_tid) = clear_child_tid {
         futex::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);

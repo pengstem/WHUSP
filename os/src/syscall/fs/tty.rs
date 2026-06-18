@@ -89,6 +89,7 @@ const TIOCSPGRP: usize = 0x5410;
 const TIOCGWINSZ: usize = 0x5413;
 const TIOCSWINSZ: usize = 0x5414;
 const FIONREAD: usize = 0x541b;
+const FIONBIO: usize = 0x5421;
 const TIOCNOTTY: usize = 0x5422;
 const TIOCSETD: usize = 0x5423;
 const TIOCGETD: usize = 0x5424;
@@ -352,6 +353,16 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
             return Ok(0);
         }
         _ => {}
+    }
+
+    if request == FIONBIO {
+        let token = current_user_token();
+        let nonblocking = read_user_value(token, argp as *const i32)? != 0;
+        let entry = get_fd_entry_by_fd(fd)?;
+        let mut flags = entry.status_flags();
+        flags.set(crate::fs::OpenFlags::NONBLOCK, nonblocking);
+        entry.set_status_flags(flags);
+        return Ok(0);
     }
 
     if request == FIONREAD {

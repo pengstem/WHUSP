@@ -207,8 +207,9 @@ fn sys_clone_process_inner(
     pidfd: Option<*mut i32>,
     cgroup: Option<VfsNodeId>,
 ) -> SysResult {
+    let calling_task = current_task().ok_or(SysError::ESRCH)?;
     let vfork_parent = if args.flags.contains(CloneFlags::CLONE_VFORK) {
-        Some(current_task().ok_or(SysError::ESRCH)?)
+        Some(Arc::clone(&calling_task))
     } else {
         None
     };
@@ -225,6 +226,7 @@ fn sys_clone_process_inner(
     };
     let new_process = current_process
         .fork(
+            &calling_task,
             Arc::clone(&child_parent),
             mount_namespace_id,
             args.exit_signal,

@@ -227,23 +227,19 @@ impl ProcessControlBlock {
         insert_into_pid2process(self.getpid(), Arc::clone(self));
     }
 
-    /// Forks a single-threaded process without making the child runnable.
+    /// Forks the calling thread into a new process without making the child runnable.
     ///
     /// The parent process lock is released before creating the child task so
     /// task construction cannot re-enter the parent. The caller publishes the
     /// child and makes it runnable after clone-specific metadata is installed.
     pub fn fork(
         self: &Arc<Self>,
+        calling_task: &Arc<TaskControlBlock>,
         child_parent: Arc<Self>,
         mount_namespace_id: crate::fs::MountNamespaceId,
         exit_signal: u32,
     ) -> Option<Arc<Self>> {
         let mut parent = self.inner_exclusive_access();
-        assert_eq!(
-            parent.thread_count(),
-            1,
-            "fork currently requires a single-threaded parent"
-        );
         let parent_resident_kb = parent.memory_set.resident_bytes() / 1024;
         parent.cpu_times.record_resident_kb(parent_resident_kb);
         let inherited_self_maxrss_kb = parent.cpu_times.snapshot().self_maxrss_kb;
@@ -278,13 +274,13 @@ impl ProcessControlBlock {
         let cmdline = parent.cmdline.clone();
         let pgid = parent.pgid;
         let signal_actions = parent.signal_actions;
-        let parent_task = parent.get_task(0);
-        let parent_task_inner = parent_task.inner_exclusive_access();
+        let parent_task_inner = calling_task.inner_exclusive_access();
         let ustack_base = parent_task_inner
             .res
             .as_ref()
-            .expect("fork parent main task must have TaskUserRes")
+            .expect("fork calling task must have TaskUserRes")
             .ustack_base();
+        let parent_trap_cx = *parent_task_inner.get_trap_cx();
         let parent_signal_mask = parent_task_inner.signal_mask;
         let parent_sigaltstack = parent_task_inner.sigaltstack;
         let parent_sched_policy = parent_task_inner.sched_policy;
@@ -367,6 +363,7 @@ impl ProcessControlBlock {
 
         let mut task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
+        *trap_cx = parent_trap_cx;
         trap_cx.kernel_sp = task.kstack.get_top();
         task_inner.signal_mask = parent_signal_mask;
         task_inner.sigaltstack = parent_sigaltstack;

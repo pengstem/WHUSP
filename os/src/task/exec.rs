@@ -401,6 +401,9 @@ impl ProcessControlBlock {
             let close_on_exec_entries = inner.close_on_exec_fd_entries();
             (previous, close_on_exec_entries)
         };
+        // Drop close-on-exec files after releasing the PCB lock. File
+        // destructors can enter VFS/mount cleanup paths, which must not run
+        // while the exec image-commit state is still locked.
         for entry in close_on_exec_entries {
             close_detached_fd_entry_for_process_teardown(entry);
         }

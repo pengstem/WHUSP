@@ -4,6 +4,7 @@ use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{
     PATH_MAX, UserBufferAccess, copy_to_user_ctx, read_user_c_string, read_user_c_string_ctx,
     read_user_value, read_user_value_ctx, translated_byte_buffer_checked_ctx,
+    translated_byte_buffer_checked_with_mmap_fault_ctx,
 };
 use super::fanotify::{
     fanotify_notify_create, fanotify_notify_delete, fanotify_notify_modify, fanotify_notify_move,
@@ -1320,8 +1321,12 @@ pub fn sys_getdents64_ctx(ctx: &SyscallContext, fd: usize, buf: *mut u8, len: us
     if len == 0 {
         return Err(SysError::EINVAL);
     }
-    let buffers =
-        translated_byte_buffer_checked_ctx(ctx, buf.cast_const(), len, UserBufferAccess::Write)?;
+    let buffers = translated_byte_buffer_checked_with_mmap_fault_ctx(
+        ctx,
+        buf.cast_const(),
+        len,
+        UserBufferAccess::Write,
+    )?;
     let file = get_file_by_fd_for_process(ctx.process(), fd)?;
     Ok(file.read_dirent64(UserBuffer::new(buffers))?)
 }
