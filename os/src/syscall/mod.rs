@@ -72,6 +72,7 @@ const SYSCALL_SENDFILE: usize = 71;
 const SYSCALL_PSELECT6: usize = 72;
 const SYSCALL_PPOLL: usize = 73;
 const SYSCALL_SIGNALFD4: usize = 74;
+const SYSCALL_VMSPLICE: usize = 75;
 const SYSCALL_SPLICE: usize = 76;
 const SYSCALL_READLINKAT: usize = 78;
 const SYSCALL_NEWFSTATAT: usize = 79;
@@ -694,6 +695,13 @@ pub(crate) fn syscall_with_context(
             args[3] as *mut i64,
             args[4],
             args[5] as u32,
+        ),
+        SYSCALL_VMSPLICE => sys_vmsplice_ctx(
+            ctx,
+            args[0],
+            args[1] as *const LinuxIovec,
+            args[2],
+            args[3] as u32,
         ),
         SYSCALL_SPLICE => sys_splice(
             args[0],

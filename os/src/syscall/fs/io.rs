@@ -381,6 +381,13 @@ fn writev_can_use_direct_page_slices(iovecs: &UserIovecs, allowed_len: usize) ->
     user_iovecs_can_use_direct_page_slices(iovecs, allowed_len)
 }
 
+fn user_iovecs_are_page_aligned(iovecs: &UserIovecs) -> bool {
+    iovecs
+        .entries
+        .iter()
+        .all(|iovec| iovec.len == 0 || (iovec.base % PAGE_SIZE == 0 && iovec.len % PAGE_SIZE == 0))
+}
+
 fn pwritev_regular_file_direct_page_slices(
     file: &(dyn File + Send + Sync),
     mut cursor: UserIovecCursor,
@@ -1363,6 +1370,152 @@ pub fn sys_splice(
     write_splice_offset(token, off_in, in_offset)?;
     write_splice_offset(token, off_out, out_offset)?;
     Ok(copied as isize)
+}
+
+fn vmsplice_nonblock_len(
+    entry: &FdTableEntry,
+    events: PollEvents,
+    requested_len: usize,
+    flags: u32,
+) -> SysResult<usize> {
+    if flags & SPLICE_F_NONBLOCK == 0 {
+        ensure_nonblocking_ready(entry, events)?;
+        return Ok(requested_len);
+    }
+
+    let file = entry.file();
+    if events.contains(PollEvents::POLLOUT) {
+        let capacity = file.pipe_capacity().ok_or(SysError::EBADF)?;
+        let occupied = file.pipe_occupied().ok_or(SysError::EBADF)?;
+        let available = capacity.saturating_sub(occupied);
+        if available == 0 {
+            return Err(SysError::EAGAIN);
+        }
+        return Ok(requested_len.min(available));
+    }
+    if events.contains(PollEvents::POLLIN) {
+        let occupied = file.pipe_occupied().ok_or(SysError::EBADF)?;
+        if occupied == 0 && !file.poll(events).intersects(events) {
+            return Err(SysError::EAGAIN);
+        }
+        return Ok(requested_len.min(occupied));
+    }
+    if !file.poll(events).intersects(events) {
+        return Err(SysError::EAGAIN);
+    }
+    Ok(requested_len)
+}
+
+fn sys_vmsplice_write(
+    ctx: &SyscallContext,
+    entry: FdTableEntry,
+    iovecs: UserIovecs,
+    flags: u32,
+) -> SysResult {
+    let file = entry.file();
+    let has_data = iovecs.total_len > 0;
+    check_pipe_write_peer(&entry, has_data)?;
+    let requested_len =
+        vmsplice_nonblock_len(&entry, PollEvents::POLLOUT, iovecs.total_len, flags)?;
+    if requested_len == 0 {
+        return Ok(0);
+    }
+    file.check_write(requested_len, false)?;
+
+    let mut cursor = UserIovecCursor::new(ctx.user_token(), iovecs, UserBufferAccess::Read);
+    let mut remaining_len = requested_len;
+    let mut total_written = 0usize;
+    while let Some(chunk) = cursor.next_chunk() {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) if total_written > 0 => {
+                fanotify_notify_modify(&file, total_written);
+                inotify_notify_modify(&file, total_written);
+                return Ok(total_written as isize);
+            }
+            Err(err) => return Err(err),
+        };
+        let chunk_len = chunk.len.min(remaining_len);
+        let buffers = truncate_user_buffers(chunk.buffers, chunk_len);
+        let written = write_with_status_flags(&entry, UserBuffer::new(buffers));
+        total_written += written;
+        remaining_len = remaining_len.saturating_sub(written);
+        if written < chunk_len || remaining_len == 0 {
+            break;
+        }
+    }
+
+    fanotify_notify_modify(&file, total_written);
+    inotify_notify_modify(&file, total_written);
+    checked_write_result_for_entry(&entry, requested_len, total_written)
+}
+
+fn sys_vmsplice_read(
+    ctx: &SyscallContext,
+    entry: FdTableEntry,
+    iovecs: UserIovecs,
+    flags: u32,
+) -> SysResult {
+    let file = entry.file();
+    let requested_len = vmsplice_nonblock_len(&entry, PollEvents::POLLIN, iovecs.total_len, flags)?;
+    if requested_len == 0 {
+        return Ok(0);
+    }
+    file.check_read(requested_len)?;
+
+    let mut cursor = UserIovecCursor::new(ctx.user_token(), iovecs, UserBufferAccess::Write);
+    let mut remaining_len = requested_len;
+    let mut total_read = 0usize;
+    while let Some(chunk) = cursor.next_chunk() {
+        let chunk = chunk?;
+        let chunk_len = chunk.len.min(remaining_len);
+        let buffers = truncate_user_buffers(chunk.buffers, chunk_len);
+        let read = file.read(UserBuffer::new(buffers));
+        total_read += read;
+        remaining_len = remaining_len.saturating_sub(read);
+        if read < chunk_len || remaining_len == 0 {
+            break;
+        }
+    }
+
+    fanotify_notify_access(&file, total_read);
+    inotify_notify_access(&file, total_read);
+    Ok(total_read as isize)
+}
+
+pub fn sys_vmsplice_ctx(
+    ctx: &SyscallContext,
+    fd: usize,
+    iov: *const LinuxIovec,
+    nr_segs: usize,
+    flags: u32,
+) -> SysResult {
+    if flags & !SPLICE_KNOWN_FLAGS != 0 {
+        return Err(SysError::EINVAL);
+    }
+    let iovecs = validate_user_iovecs_arg_ctx(ctx, iov, nr_segs)?;
+    if flags & SPLICE_F_GIFT != 0 && !user_iovecs_are_page_aligned(&iovecs) {
+        return Err(SysError::EINVAL);
+    }
+
+    let entry = get_fd_entry_by_fd(fd)?;
+    let file = entry.file();
+    if !file.is_pipe() {
+        return Err(SysError::EBADF);
+    }
+    if iovecs.total_len == 0 {
+        return Ok(0);
+    }
+
+    // CONTEXT: The pipe layer copies user buffers today; accepted
+    // SPLICE_F_GIFT pages are not retained or moved by later splice calls.
+    if file.writable() {
+        sys_vmsplice_write(ctx, entry, iovecs, flags)
+    } else if file.readable() {
+        sys_vmsplice_read(ctx, entry, iovecs, flags)
+    } else {
+        Err(SysError::EBADF)
+    }
 }
 
 pub fn sys_fsync(fd: usize) -> SysResult {
