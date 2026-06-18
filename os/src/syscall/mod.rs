@@ -127,6 +127,7 @@ const SYSCALL_RT_SIGACTION: usize = 134;
 const SYSCALL_RT_SIGPROCMASK: usize = 135;
 const SYSCALL_RT_SIGPENDING: usize = 136;
 const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
+const SYSCALL_RT_SIGQUEUEINFO: usize = 138;
 const SYSCALL_RT_SIGRETURN: usize = 139;
 const SYSCALL_SETPRIORITY: usize = 140;
 const SYSCALL_GETPRIORITY: usize = 141;
@@ -212,6 +213,7 @@ const SYSCALL_MUNLOCKALL: usize = 231;
 const SYSCALL_MINCORE: usize = 232;
 const SYSCALL_MADVISE: usize = 233;
 const SYSCALL_REMAP_FILE_PAGES: usize = 234;
+const SYSCALL_RT_TGSIGQUEUEINFO: usize = 240;
 const SYSCALL_PERF_EVENT_OPEN: usize = 241;
 const SYSCALL_ACCEPT4: usize = 242;
 #[cfg(target_arch = "riscv64")]
@@ -918,6 +920,11 @@ pub(crate) fn syscall_with_context(
             args[2] as *const LinuxTimeSpec,
             args[3],
         ),
+        SYSCALL_RT_SIGQUEUEINFO => sys_rt_sigqueueinfo(
+            args[0] as isize,
+            args[1] as u32,
+            args[2] as *const LinuxSigInfo,
+        ),
         SYSCALL_RT_SIGRETURN => sys_rt_sigreturn(),
         SYSCALL_SETPRIORITY => sys_setpriority(args[0] as i32, args[1] as isize, args[2] as i32),
         SYSCALL_GETPRIORITY => sys_getpriority(args[0] as i32, args[1] as isize),
@@ -1069,6 +1076,12 @@ pub(crate) fn syscall_with_context(
         SYSCALL_OPEN_BY_HANDLE_AT => {
             sys_open_by_handle_at(args[0] as isize, args[1] as *const u8, args[2] as u32)
         }
+        SYSCALL_RT_TGSIGQUEUEINFO => sys_rt_tgsigqueueinfo(
+            args[0] as isize,
+            args[1] as isize,
+            args[2] as u32,
+            args[3] as *const LinuxSigInfo,
+        ),
         SYSCALL_PERF_EVENT_OPEN => sys_perf_event_open(
             args[0] as *const u8,
             args[1] as isize,

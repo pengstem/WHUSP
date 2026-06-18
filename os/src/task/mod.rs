@@ -68,13 +68,13 @@ pub(crate) use ptrace::{
     ptrace_validate_tracee,
 };
 pub use signal::{
-    CLD_CONTINUED, CLD_STOPPED, DefaultSignalAction, MINSIGSTKSZ, SA_RESTART, SIGCHLD, SIGCONT,
-    SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SIGTRAP, SS_DISABLE, SS_ONSTACK, SigAltStack,
+    CLD_CONTINUED, CLD_STOPPED, DefaultSignalAction, MINSIGSTKSZ, SA_RESTART, SI_TKILL, SIGCHLD,
+    SIGCONT, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SIGTRAP, SS_DISABLE, SS_ONSTACK, SigAltStack,
     SignalAction, SignalFlags, SignalInfo, default_signal_action, default_signal_error,
     default_signal_exit_code, signal_child_status, signal_wait_status,
 };
 #[cfg(target_arch = "riscv64")]
-pub use signal::{SI_TKILL, SIGRT_1, SIGRTMIN};
+pub use signal::{SIGRT_1, SIGRTMIN};
 pub(crate) use signal::{flags_to_linux_sigset, linux_sigset_to_flags};
 pub(crate) use task::SCHED_RR_INTERVAL_US;
 pub use task::{DEFAULT_TIMER_SLACK_NS, SeccompSockFilter, TaskControlBlock, TaskStatus};

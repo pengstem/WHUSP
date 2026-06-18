@@ -1,10 +1,10 @@
 use crate::arch::interrupt;
 use crate::task::{
-    MINSIGSTKSZ, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SS_DISABLE, SS_ONSTACK, SigAltStack,
-    SignalAction, SignalFlags, SignalInfo, TaskControlBlock, block_current_task_no_schedule,
-    current_has_interrupting_signal, current_process, current_task, current_trap_cx,
-    current_user_token, flags_to_linux_sigset, linux_sigset_to_flags, queue_signal_to_task,
-    schedule, task_with_linux_tid,
+    Credentials, MINSIGSTKSZ, ProcessControlBlock, SI_TKILL, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP,
+    SS_DISABLE, SS_ONSTACK, SigAltStack, SignalAction, SignalFlags, SignalInfo, TaskControlBlock,
+    block_current_task_no_schedule, current_has_interrupting_signal, current_process, current_task,
+    current_trap_cx, current_user_token, flags_to_linux_sigset, linux_sigset_to_flags,
+    processes_snapshot, queue_signal_to_task, schedule, task_with_linux_tid, wakeup_task,
 };
 use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
@@ -240,6 +240,119 @@ fn find_task_in_process_by_linux_tid(tgid: usize, tid: usize) -> Option<Arc<Task
     let task = task_with_linux_tid(tid)?;
     let process = task.process.upgrade()?;
     (process.getpid() == tgid).then_some(task)
+}
+
+fn process_by_visible_pid(
+    pid: isize,
+    caller: &Arc<ProcessControlBlock>,
+) -> SysResult<Arc<ProcessControlBlock>> {
+    if pid <= 0 {
+        return Err(SysError::EINVAL);
+    }
+    let namespace = caller.pid_namespace();
+    processes_snapshot()
+        .into_iter()
+        .find(|process| process.pid_visible_from_namespace(namespace) == Some(pid as usize))
+        .ok_or(SysError::ESRCH)
+}
+
+fn caller_can_signal_target(caller: &Credentials, target: &Credentials) -> bool {
+    // UNFINISHED: Linux also checks CAP_KILL in the target user namespace and
+    // permits SIGCONT inside the same session. This kernel has one credential
+    // namespace and process-wide credentials.
+    caller.is_root()
+        || target.uid_matches_saved_set(caller.ruid)
+        || target.uid_matches_saved_set(caller.euid)
+}
+
+fn queue_signal_to_process(
+    process: &Arc<ProcessControlBlock>,
+    signal: SignalFlags,
+    info: SignalInfo,
+) {
+    if signal.is_empty() {
+        return;
+    }
+    let target = {
+        let tasks = process.tasks_snapshot();
+        tasks
+            .iter()
+            .find(|task| {
+                let task_inner = task.inner_exclusive_access();
+                !(task_inner.signal_mask & signal).contains(signal)
+            })
+            .cloned()
+            .or_else(|| tasks.first().cloned())
+    };
+    if let Some(task) = target {
+        queue_signal_to_task(task, signal, info);
+    }
+    if signal.check_error().is_some() {
+        for task in process.tasks_snapshot() {
+            wakeup_task(task);
+        }
+    }
+}
+
+fn sigqueue_info_from_user(signum: u32, info: *const LinuxSigInfo) -> SysResult<SignalInfo> {
+    if info.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    let sender_pid = current_process().getpid() as i32;
+    let mut info = read_user_value(current_user_token(), info)?;
+    info.si_signo = signum as i32;
+    Ok(info.to_signal_info(signum, sender_pid))
+}
+
+fn validate_sigqueue_info_code(target_is_current: bool, info: &SignalInfo) -> SysResult<()> {
+    if !target_is_current && (info.code >= 0 || info.code == SI_TKILL) {
+        return Err(SysError::EPERM);
+    }
+    Ok(())
+}
+
+pub fn sys_rt_sigqueueinfo(pid: isize, signum: u32, info: *const LinuxSigInfo) -> SysResult {
+    let caller = current_process();
+    let target = process_by_visible_pid(pid, &caller)?;
+    let info = sigqueue_info_from_user(signum, info)?;
+    let signal = validate_kill_signum(signum)?;
+    validate_sigqueue_info_code(caller.getpid() == target.getpid(), &info)?;
+
+    if !caller_can_signal_target(&caller.credentials(), &target.credentials()) {
+        return Err(SysError::EPERM);
+    }
+    // UNFINISHED: Linux queues multiple realtime siginfo records and can return
+    // EAGAIN at RLIMIT_SIGPENDING. This kernel stores one siginfo slot per
+    // signum, so repeated sends of the same signal replace the previous info.
+    queue_signal_to_process(&target, signal, info);
+    Ok(0)
+}
+
+pub fn sys_rt_tgsigqueueinfo(
+    tgid: isize,
+    tid: isize,
+    signum: u32,
+    info: *const LinuxSigInfo,
+) -> SysResult {
+    if tgid <= 0 || tid <= 0 {
+        return Err(SysError::EINVAL);
+    }
+    let task =
+        find_task_in_process_by_linux_tid(tgid as usize, tid as usize).ok_or(SysError::ESRCH)?;
+    let target_process = task.process.upgrade().ok_or(SysError::ESRCH)?;
+    let info = sigqueue_info_from_user(signum, info)?;
+    let signal = validate_kill_signum(signum)?;
+    let target_is_current = current_task().is_some_and(|task| task.linux_tid() == tid as usize);
+    validate_sigqueue_info_code(target_is_current, &info)?;
+
+    let caller = current_process();
+    if !caller_can_signal_target(&caller.credentials(), &target_process.credentials()) {
+        return Err(SysError::EPERM);
+    }
+    // UNFINISHED: See sys_rt_sigqueueinfo(); realtime signal queue capacity is
+    // not modeled yet.
+    queue_signal_to_task(task, signal, info);
+    Ok(0)
 }
 
 pub fn sys_tkill(tid: isize, signum: u32) -> SysResult {
