@@ -46,6 +46,8 @@ pub(super) fn build_runner_command() -> String {
     command.push_str(SCRIPT_DISK_ENTRY);
     command.push_str("'; fi");
     command.push_str(PERF_COUNTER_DUMP_COMMAND);
+    // The judge expects the guest to terminate itself after all group markers;
+    // keep this explicit BusyBox sync/reboot outside script-owned selection.
     command.push_str("; cd /musl && ./busybox sync; ./busybox reboot -f");
     command
 }

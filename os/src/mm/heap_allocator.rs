@@ -66,7 +66,11 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
 
 static mut HEAP_SPACE: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
 
-/// what the hack did this init do
+/// Publishes the statically reserved kernel heap to the global allocator.
+///
+/// Call this once during early boot, before code paths that can allocate while
+/// device interrupts are enabled. Allocation itself masks supervisor interrupts
+/// so allocator metadata cannot be re-entered from an interrupt handler.
 pub fn init_heap() {
     unsafe {
         HEAP_ALLOCATOR.init(addr_of_mut!(HEAP_SPACE) as usize, KERNEL_HEAP_SIZE);

@@ -169,7 +169,10 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(FrameAllocatorImpl::new()) };
 }
 
-/// what the hell
+/// Initializes the physical frame allocator from the DTB-selected RAM range.
+///
+/// The first allocatable page starts after `ekernel`; earlier physical memory
+/// contains the loaded kernel image and must never be recycled as user frames.
 pub fn init_frame_allocator() {
     unsafe extern "C" {
         safe fn ekernel();
