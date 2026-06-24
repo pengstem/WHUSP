@@ -920,6 +920,8 @@ pub(crate) fn sys_set_robust_list(head: usize, len: usize) -> SysResult {
     if len != size_of::<LinuxRobustListHead>() {
         return Err(SysError::EINVAL);
     }
+    // Robust-list heads are Linux-thread state, not process state. Exit and
+    // exec cleanup read this field from the owning TaskControlBlock.
     current_task()
         .expect("set_robust_list must run with a current task")
         .set_robust_list_head(head);
@@ -935,6 +937,9 @@ fn robust_list_query_task(pid: isize) -> SysResult<Arc<TaskControlBlock>> {
     }
 
     let pid = pid as usize;
+    // UNFINISHED: Linux get_robust_list(pid) may inspect another task when
+    // ptrace-style permission checks allow it. This kernel currently exposes
+    // robust-list heads only inside the caller's current thread group.
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
     process_inner

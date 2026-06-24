@@ -209,7 +209,9 @@ impl TaskUserRes {
                 MapPermission::R | MapPermission::W | MapPermission::U,
             );
         }
-        // alloc trap_cx
+        // Map one kernel-private TrapContext page in the process page table.
+        // It must stay non-user-accessible; trap return code reaches it through
+        // the per-task PPN or fixed per-tid virtual address.
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
         process_inner
@@ -222,10 +224,12 @@ impl TaskUserRes {
     }
 
     fn dealloc_user_res(&self) {
-        // dealloc tid
+        // The process-local task slot id is recyclable independently from the
+        // Linux-visible TID/PID handles used by futex, signal, and procfs code.
         let process = self.process.upgrade().unwrap();
         let mut process_inner = process.inner_exclusive_access();
-        // dealloc ustack manually
+        // Remove only the default contest stack VMA owned by TaskUserRes.
+        // Pthread-supplied stacks belong to userspace mappings.
         if self.user_stack_allocated {
             let ustack_bottom_va: VirtAddr =
                 ustack_mapped_bottom_from_tid(self.ustack_base, self.tid).into();
@@ -233,7 +237,8 @@ impl TaskUserRes {
                 .memory_set
                 .remove_area_with_start_vpn(ustack_bottom_va.into());
         }
-        // dealloc trap_cx manually
+        // The TrapContext mapping is always owned by TaskUserRes, including
+        // pthreads that supplied their own userspace stack.
         let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_tid(self.tid).into();
         process_inner
             .memory_set
