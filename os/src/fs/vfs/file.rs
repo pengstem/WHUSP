@@ -39,9 +39,13 @@ const VFS_WRITE_CHUNK_SIZE: usize = 64 * 1024;
 const VFS_READ_CHUNK_SIZE: usize = 64 * 1024;
 const VFS_READ_ALL_CHUNK_SIZE: usize = 64 * 1024;
 const VFS_DIRENT_SCRATCH_MAX: usize = 4 * 1024;
-const VFS_READ_CACHE_MAX_FILE_SIZE: usize = 1024 * 1024;
+// CONTEXT: Raised to 8 MiB so that iozone 4 MiB files can use the small‑read cache
+// and the page cache instead of falling through to backend on every read.
+const VFS_READ_CACHE_MAX_FILE_SIZE: usize = 8 * 1024 * 1024;
 const VFS_SMALL_READ_CACHE_MIN_FILE_SIZE: usize = 64 * 1024;
-const VFS_SMALL_READ_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+// CONTEXT: Raised to 32 MiB so the aggregate small‑read cache can hold
+// several 4 MiB files concurrently (iozone -t 4 -s 4m).
+const VFS_SMALL_READ_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 const VFS_READ_CACHE_READAHEAD_PAGES: usize = 6;
 const VFS_DIRTY_WRITEBACK_MAX_WRITE_SIZE: usize = 64 * 1024;
 const VFS_DIRTY_WRITEBACK_MAX_PAGES: usize = 4096;
@@ -1797,6 +1801,52 @@ impl VfsFile {
         Some(total_read_size)
     }
 
+    /// Try to serve a read directly from dirty pages without hitting the
+    /// backend.  When every page in `[offset, offset+len)` is present in the
+    /// dirty cache and is fully dirty the data is copied straight into `buf`
+    /// (zero-filling non-dirty gaps).  Partial coverage returns [`None`] so
+    /// the caller can fall through to the existing backend‑read‑then‑overlay
+    /// path.
+    fn read_dirty_regular_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        if buf.is_empty() {
+            return Some(0);
+        }
+        if self.kind != FsNodeKind::RegularFile {
+            return None;
+        }
+        let dirty = DIRTY_REGULAR_FILES.lock();
+        let cache = dirty.get(&self.node)?;
+        if offset >= cache.logical_size {
+            return Some(0);
+        }
+        let read_len = buf.len().min(cache.logical_size - offset);
+        let first_page = offset / PAGE_SIZE;
+        let last_page = (offset + read_len - 1) / PAGE_SIZE;
+        // Require every page in the range to exist and be fully dirty.
+        for pi in first_page..=last_page {
+            let page = cache.pages.get(&pi)?;
+            if !page.dirty_ranges().any(|(s, e)| s == 0 && e == PAGE_SIZE) {
+                return None;
+            }
+        }
+        // All pages are fully covered – copy dirty data directly.
+        buf[..read_len].fill(0);
+        for pi in first_page..=last_page {
+            let page_start = pi * PAGE_SIZE;
+            let page = &cache.pages[&pi];
+            let copy_start = offset.max(page_start);
+            let copy_end = (offset + read_len).min(page_start + PAGE_SIZE);
+            if copy_start >= copy_end {
+                continue;
+            }
+            let dst_start = copy_start - offset;
+            let src_start = copy_start - page_start;
+            let len = copy_end - copy_start;
+            buf[dst_start..dst_start + len].copy_from_slice(&page.data[src_start..src_start + len]);
+        }
+        Some(read_len)
+    }
+
     fn read_small_regular_cached_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
         if buf.is_empty() {
             return Some(0);
@@ -2431,6 +2481,7 @@ impl File for VfsFile {
                 } else {
                     self.read_snapshot_at(*offset, slice)
                 })
+                .or_else(|| self.read_dirty_regular_at(*offset, slice))
                 .or_else(|| self.read_small_regular_cached_at(*offset, slice))
                 .or_else(|| self.read_regular_cached_at(*offset, slice))
                 .unwrap_or_else(|| self.read_backend_at_preserve_noatime(*offset, slice));
@@ -2486,6 +2537,7 @@ impl File for VfsFile {
         } else {
             self.read_snapshot_at(offset, buf)
         })
+        .or_else(|| self.read_dirty_regular_at(offset, buf))
         .or_else(|| self.read_small_regular_cached_at(offset, buf))
         .or_else(|| self.read_regular_cached_at(offset, buf))
         .unwrap_or_else(|| self.read_backend_at_preserve_noatime(offset, buf))
