@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "lwext4_rust"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bindgen",
  "log",
@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "os"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bitflags 2.11.1",
  "buddy_system_allocator",
