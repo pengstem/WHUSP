@@ -275,6 +275,8 @@ fn terminate_sibling_threads_for_exec(
     process_token: usize,
     process_id: usize,
 ) {
+    // Exec teardown must run before the new image is committed. Sibling tasks
+    // still need the old token for robust-list and clear-child-tid cleanup.
     terminate_sibling_threads(process, current_tid, process_token, process_id, 0);
     remove_ready_tasks_of_process(process_id);
     futex::remove_process_futex_waiters(process_id);
@@ -287,6 +289,9 @@ fn rebind_non_leader_for_exec(
     process_token: usize,
     process_id: usize,
 ) -> SysResult<()> {
+    // A non-leader exec keeps the process PID but moves the caller into slot 0.
+    // Do not preserve the caller's old Linux TID handle after rebinding; the
+    // post-exec main thread is visible as the process leader.
     let mut clear_child_tids = Vec::new();
     let mut recycle_res = Vec::<TaskUserRes>::new();
     let mut robust_tasks = Vec::new();

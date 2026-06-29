@@ -38,7 +38,11 @@ const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
 const FUTEX_WAITERS: u32 = 0x8000_0000;
 const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
 const FUTEX_TID_MASK: u32 = !(FUTEX_WAITERS | FUTEX_OWNER_DIED);
+// Bound robust-list teardown so a corrupted userspace list cannot trap the
+// exiting task forever while it still owns cleanup of clear-child-tid/fd state.
 const ROBUST_LIST_LIMIT: usize = 2048;
+// Keep the bucket count a power of two: bucket_index() masks with
+// FUTEX_BUCKET_COUNT - 1 instead of taking a modulo on every wait/wake path.
 const FUTEX_BUCKET_COUNT: usize = 64;
 
 #[repr(C)]

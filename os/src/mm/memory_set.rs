@@ -308,6 +308,10 @@ impl MemorySet {
     pub fn remap_existing_page_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
         self.page_table.remap_flags(vpn, flags)
     }
+    /// Tears down user mappings and returns deferred file-backed writebacks.
+    ///
+    /// Callers must write the returned flushes after releasing the process
+    /// memory-set lock; VFS writeback can re-enter file and mount locks.
     pub fn recycle_data_pages(&mut self) -> Vec<MmapFlush> {
         let mut flushes = Vec::new();
         for area in &mut self.areas {

@@ -27,6 +27,9 @@ lazy_static! {
     // the general allocator earlier would leave device-visible memory aliased.
     static ref QUEUE_FRAMES: UPIntrFreeCell<Vec<FrameTracker>> =
         unsafe { UPIntrFreeCell::new(Vec::new()) };
+    // Bounce frames are keyed by the physical address handed to the device.
+    // They must stay live until unshare() copies device-written data back into
+    // the original kernel buffer and drops the frame trackers.
     static ref SHARED_BOUNCES: UPIntrFreeCell<BTreeMap<VirtioPhysAddr, Vec<FrameTracker>>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
 }
