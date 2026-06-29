@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
-import re
 import shlex
 import shutil
 from dataclasses import dataclass
@@ -14,7 +13,6 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-RUNNER_PATH = REPO_ROOT / "os" / "src" / "task" / "contest_runner.rs"
 WHITELIST_PATH = REPO_ROOT / "os" / "src" / "task" / "ltp_whitelist.txt"
 DEFAULT_RUNTEST_DIR = (
     REPO_ROOT / "testsuits" / "ltp-full-20240524" / "runtest"
@@ -34,6 +32,7 @@ STATIC_COMPAT_ROOT = "support-root"
 
 # Host-side script disk generation plan. These values are consumed before the
 # disk is built, so they deliberately stay outside the kernel runtime source.
+INTERACTIVE_SHELL = False
 TEST_LIBCS = ("/glibc", "/musl")
 LTP_RUNTEST_MANIFESTS = (
     "syscalls",
@@ -213,17 +212,6 @@ def text_list(source: str, source_name: str) -> list[str]:
             )
         items.append(line)
     return items
-
-
-def rust_const_value(source: str, const_name: str) -> str:
-    match = re.search(
-        rf"const\s+{re.escape(const_name)}\s*:[^=]+=\s*(.*?);",
-        source,
-        re.DOTALL,
-    )
-    if not match:
-        raise ValueError(f"could not find Rust const {const_name}")
-    return " ".join(match.group(1).split())
 
 
 def iter_manifest_entries(path: Path):
@@ -1012,19 +1000,32 @@ def entry_script(
         'export PATH="$WHUSP_SCRIPT_ROOT/bin:/tmp/bin:/musl:/glibc:$PATH"',
         "/musl/busybox mkdir -p /tmp/bin",
         "/musl/busybox --install -s /tmp/bin",
-        "if ! /musl/busybox cat /bin/cat >/dev/null 2>&1; then",
-        "    /musl/busybox rmdir /bin",
-        "    /musl/busybox mkdir -p /bin",
-        "    /musl/busybox ln /musl/busybox /bin/cat 2>/dev/null || /musl/busybox cp /musl/busybox /bin/cat",
-        "fi",
-        '. "$script_dir/common.sh"',
-        "",
-        'case "${WHUSP_ARCH:-rv}" in',
-        '    la|loongarch64) WHUSP_ARCH="la" ;;',
-        '    *) WHUSP_ARCH="rv" ;;',
-        "esac",
-        "",
     ]
+    if INTERACTIVE_SHELL:
+        lines.extend(
+            [
+                "cd /musl || exit 127",
+                "exec /musl/busybox sh",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+
+    lines.extend(
+        [
+            "if ! /musl/busybox cat /bin/cat >/dev/null 2>&1; then",
+            "    /musl/busybox rmdir /bin",
+            "    /musl/busybox mkdir -p /bin",
+            "    /musl/busybox ln /musl/busybox /bin/cat 2>/dev/null || /musl/busybox cp /musl/busybox /bin/cat",
+            "fi",
+            '. "$script_dir/common.sh"',
+            "",
+            'case "${WHUSP_ARCH:-rv}" in',
+            '    la|loongarch64) WHUSP_ARCH="la" ;;',
+            '    *) WHUSP_ARCH="rv" ;;',
+            "esac",
+            "",
+        ]
+    )
     lines.extend(static_compat_install_lines(static_compat_relative_files))
 
     for index, script in enumerate(all_tests):
@@ -1256,7 +1257,6 @@ def write_outputs(
 
 def main() -> int:
     args = parse_args()
-    runner_source = read_text(RUNNER_PATH)
     whitelist_source = read_text(WHITELIST_PATH)
     all_tests = list(ALL_TESTS)
     test_scripts = list(TEST_SCRIPTS)
@@ -1264,7 +1264,7 @@ def main() -> int:
     manifests = list(LTP_RUNTEST_MANIFESTS)
     whitelist = text_list(whitelist_source, str(WHITELIST_PATH.relative_to(REPO_ROOT)))
     active_filter = LTP_CASE_FILTER_OPTION or "None"
-    interactive_shell = rust_const_value(runner_source, "INTERACTIVE_SHELL")
+    interactive_shell = str(INTERACTIVE_SHELL).lower()
     ltp_cases = resolve_ltp_cases(manifests, whitelist, args.runtest_dir)
     write_outputs(
         args.out_dir,

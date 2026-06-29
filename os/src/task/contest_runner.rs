@@ -1,8 +1,5 @@
 use alloc::string::String;
 
-// CONTEXT: Keep submission boots on the generated script disk path. Turning
-// this on bypasses OS COMP group markers and is only for local serial debugging.
-const INTERACTIVE_SHELL: bool = false;
 // Script-disk handoff point. The kernel assembles only the environment and the
 // final shutdown command; marker emission and per-suite shell logic live in
 // this mounted entry script.
@@ -27,10 +24,6 @@ const RUNNER_ARCH: &str = "la";
 /// and final shutdown. Test selection and exact OS COMP group markers belong
 /// to the generated script disk entry.
 pub(super) fn build_runner_command() -> String {
-    if INTERACTIVE_SHELL {
-        return interactive_shell_command();
-    }
-
     let mut command = String::new();
     // Keep the runtime ABI narrow: test selection, libc order, LTP manifests,
     // and filters are consumed by the host-side script exporter.
@@ -50,10 +43,6 @@ pub(super) fn build_runner_command() -> String {
     // keep this explicit BusyBox sync/reboot outside script-owned selection.
     command.push_str("; cd /musl && ./busybox sync; ./busybox reboot -f");
     command
-}
-
-fn interactive_shell_command() -> String {
-    "/musl/busybox mkdir -p /tmp/bin && /musl/busybox --install -s /tmp/bin; export PATH=/tmp/bin:/musl:/glibc:$PATH && cd /musl && exec /musl/busybox sh".into()
 }
 
 fn append_export(command: &mut String, key: &str, value: &str) {
