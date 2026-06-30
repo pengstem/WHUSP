@@ -59,6 +59,13 @@ const SYNTHETIC_DIRENT_OFFSET_BASE: u64 = 1 << 60;
 
 static TMPFILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
+// CONTEXT: Mirrors DIRTY_REGULAR_FILES.len() so the read hot path can skip the
+// global DIRTY_REGULAR_FILES SleepMutex entirely when no regular file has
+// buffered dirty pages (e.g. iozone's read phase after fsync). Maintained only
+// under the map lock at every mutation site, so a value of 0 reliably means
+// "no dirty data anywhere" — it is never a false negative for an active write.
+static DIRTY_REGULAR_FILE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 lazy_static! {
     // CONTEXT: These counters approximate Linux's open-writer vs executable
     // exclusion for ETXTBSY without adding per-inode objects to every backend.
@@ -347,7 +354,18 @@ fn dirty_or_backend_logical_size(node: VfsNodeId) -> Option<usize> {
         .map(|stat| stat.size as usize)
 }
 
+fn any_regular_file_dirty() -> bool {
+    DIRTY_REGULAR_FILE_COUNT.load(Ordering::Relaxed) != 0
+}
+
+fn sync_dirty_regular_file_count(map: &BTreeMap<VfsNodeId, DirtyFileCache>) {
+    DIRTY_REGULAR_FILE_COUNT.store(map.len(), Ordering::Relaxed);
+}
+
 fn dirty_regular_file_has_pages(node: VfsNodeId) -> bool {
+    if !any_regular_file_dirty() {
+        return false;
+    }
     DIRTY_REGULAR_FILES
         .lock()
         .get(&node)
@@ -565,6 +583,7 @@ fn cache_dirty_regular_write(node: VfsNodeId, offset: usize, buf: &[u8]) -> Dirt
         !cache.pages.contains_key(&page_index) && !prepared_pages.contains_key(&page_index)
     });
     if missing_prepared_page {
+        sync_dirty_regular_file_count(&dirty);
         drop(dirty);
         if retained_pin {
             release_inode_from_drop(node.mount_id, node.ino);
@@ -587,6 +606,7 @@ fn cache_dirty_regular_write(node: VfsNodeId, offset: usize, buf: &[u8]) -> Dirt
         }
     }
     let current_dirty_pages = dirty.values().map(|cache| cache.pages.len()).sum::<usize>();
+    sync_dirty_regular_file_count(&dirty);
     drop(dirty);
     if release_extra_pin {
         release_inode_from_drop(node.mount_id, node.ino);
@@ -669,6 +689,7 @@ fn cache_dirty_regular_user_buffer_write(
         }
     }
     let current_dirty_pages = dirty.values().map(|cache| cache.pages.len()).sum::<usize>();
+    sync_dirty_regular_file_count(&dirty);
     drop(dirty);
     if release_extra_pin {
         release_inode_from_drop(node.mount_id, node.ino);
@@ -748,6 +769,7 @@ struct DirtyWritebackBatch {
 fn collect_dirty_writeback(node: VfsNodeId) -> Option<DirtyWritebackBatch> {
     let mut dirty = DIRTY_REGULAR_FILES.lock();
     let cache = dirty.remove(&node)?;
+    sync_dirty_regular_file_count(&dirty);
     let logical_size = cache.logical_size;
     let mut runs = Vec::new();
     let mut current_offset = 0usize;
@@ -802,6 +824,7 @@ fn restore_dirty_writeback(node: VfsNodeId, batch: DirtyWritebackBatch) {
     for (page_index, page) in batch.pages {
         cache.pages.entry(page_index).or_insert(page);
     }
+    sync_dirty_regular_file_count(&dirty);
     drop(dirty);
     if release_batch_pin {
         release_inode_from_drop(node.mount_id, node.ino);
@@ -1812,6 +1835,9 @@ impl VfsFile {
             return Some(0);
         }
         if self.kind != FsNodeKind::RegularFile {
+            return None;
+        }
+        if !any_regular_file_dirty() {
             return None;
         }
         let dirty = DIRTY_REGULAR_FILES.lock();

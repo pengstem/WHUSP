@@ -1,5 +1,8 @@
 use riscv::register::sstatus::{self, FS, SPP, Sstatus};
 
+// Keep this repr(C) field order synchronized with trap.S fixed offsets:
+// x[0..31], sstatus at 32*8, sepc at 33*8, kernel metadata at 34..36*8,
+// FP state at 37..69*8, and kernel_entry_flush at 70*8.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TrapContext {

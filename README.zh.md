@@ -2,11 +2,9 @@
 
 <img src="assets/whu.png" alt="Wuhan University" width="420"/>
 
-# WHUSP-OS
+# WHUSP
 
-**面向 2026 全国大学生计算机系统能力大赛 · 操作系统设计赛**
-
-一个用 Rust 编写的、双架构（RISC-V 64 / LoongArch 64）的现代宏内核
+一个用 Rust 编写的现代宏内核，双架构支持 **RISC-V 64** 和 **LoongArch 64**
 
 [![Rust](https://img.shields.io/badge/rust-nightly--2025--05--20-orange?logo=rust)](rust-toolchain.toml)
 [![Arch](https://img.shields.io/badge/arch-RISC--V%2064%20%7C%20LoongArch%2064-blue)](#)
@@ -26,122 +24,13 @@
 
 ## 📖 目录
 
-- [项目简介](#-项目简介)
-- [核心特性](#-核心特性)
 - [快速开始](#-快速开始)
-- [内核架构](#-内核架构)
 - [项目结构](#-项目结构)
-- [路线图](#-路线图)
 - [团队](#-团队)
-- [致谢](#-致谢)
 
 ---
 
-## 🎯 项目简介
-
-**WHUSP-OS** 是武汉大学参赛队伍（**WHU S**ystem **P**roject）为 2026 年全国大学生计算机系统能力大赛 ——「操作系统设计赛」打造的内核作品。项目使用 [Rust](https://www.rust-lang.org/) 语言构建，目标是在 **RISC-V 64** 与 **LoongArch 64** 两套指令集上提供一个兼容 POSIX、可运行评测脚本与真实用户态程序（busybox / lua / libc-test 等）的宏内核。
-
-> 当前阶段：**积极开发中**。已能在 QEMU 中启动 busybox、挂载 EXT4 测试盘、跑通基础静态测试集；动态链接的 glibc 启动路径仍在补齐中。详见 [路线图](#-路线图)。
-
----
-
-## ✨ 核心特性
-
-| 模块 | 实现亮点 |
-|---|---|
-| 🏗️ **双架构** | RISC-V 64 与 LoongArch 64 共享主干内核，差异收敛于 `os/src/arch/<arch>/` |
-| 🧠 **内存管理** | 伙伴堆 + 物理帧分配器；按进程 `MemorySet`；ELF Loader 支持 `PT_LOAD` / `PT_INTERP` |
-| 🗂️ **文件系统** | EXT4 真磁盘读写（基于 vendored `lwext4_rust`） · 统一 VFS 抽象 · `devfs` / `procfs` / `tmpfs` |
-| ⚙️ **进程线程** | TCB / Thread 分离 · `clone` / `execve` / 信号 · PID 回收 · 同步原语（Mutex / Condvar / SleepMutex）|
-| 📡 **驱动** | VirtIO Block / Input · UART · PLIC（RV）· IOCSR（LA）· 设备发现基于 DTB |
-| 🔌 **系统调用** | Linux Generic ABI 兼容的分发表（`os/src/syscall.rs`），按子系统拆分到 `syscall/` |
-| 🧰 **构建链** | 离线、可复现 —— `vendor/crates/` 镜像所有 crates.io 与 git 依赖，零网络构建 |
-
----
-
-## 🚀 快速开始
-
-### 环境要求
-
-- Rust 工具链：`nightly-2025-05-20`（仓库已通过 `rust-toolchain.toml` 钉版本）
-- `qemu-system-riscv64` ≥ 7.0.0；`qemu-system-loongarch64` ≥ 10.0.0
-- 推荐使用大赛官方容器，确保环境一致：
-
-```bash
-docker run --rm -it \
-    -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-    -v "$PWD":/kernel -w /kernel --privileged \
-    zhouzhouyi/os-contest:20260104 \
-    bash -lc 'chmod o+x /root && exec setpriv --reuid "$HOST_UID" --regid "$HOST_GID" --clear-groups env HOME=/tmp RUSTUP_HOME=/root/.rustup PATH="$PATH" bash'
-```
-
-### 构建
-
-仓库根目录是大赛风格入口，直接产出 `kernel-rv` / `kernel-la` 两个内核 ELF：
-
-```bash
-make all                  # 同时构建 RISC-V 与 LoongArch（评测命令）
-make kernel-rv            # 仅 RISC-V 64
-make kernel-la            # 仅 LoongArch 64
-make fmt                  # 一键格式化
-make clean                # 清理产物
-```
-
-### 在 QEMU 中运行
-
-需要先准备好大赛官方提供的 EXT4 测试盘镜像：
-
-```bash
-make run-rv  TEST_DISK=/path/to/contest-disk-rv.img
-make run-la  TEST_DISK_LA=/path/to/contest-disk-la.img
-```
-
-启动后内核会挂载测试盘到根目录，以 `busybox sh` 为 init，执行 `*_testcode.sh` 测试组，按规约打印：
-
-```
-#### OS COMP TEST GROUP START xxxxx ####
-...
-#### OS COMP TEST GROUP END   xxxxx ####
-```
-
----
-
-## 🧩 内核架构
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                        User Space                            │
-│            busybox · lua · libc-test · *_testcode.sh         │
-├──────────────────────────────────────────────────────────────┤
-│              Syscall Dispatch (os/src/syscall.rs)            │
-│       fs · process · signal · sync · memory · wait · …       │
-├────────────┬───────────┬───────────┬───────────┬─────────────┤
-│   task/    │   mm/     │   fs/     │  drivers/ │   sync/     │
-│ TCB / 调度 │ 伙伴堆 +  │ VFS +     │ VirtIO·   │ UPIntr-     │
-│ signal /   │ MemorySet │ EXT4 /    │ UART·     │ FreeCell ·  │
-│ exec /     │ ELF Load  │ devfs /   │ PLIC /    │ SleepMutex  │
-│ clone      │           │ procfs /  │ IOCSR     │ · Condvar   │
-│            │           │ tmpfs     │           │             │
-├────────────┴───────────┴───────────┴───────────┴─────────────┤
-│      arch/{riscv64, loongarch64} —— entry · trap · MMU       │
-│              · timer · context switch · board                │
-├──────────────────────────────────────────────────────────────┤
-│                  RustSBI (RV) · 直跳入口 (LA)                │
-└──────────────────────────────────────────────────────────────┘
-```
-
-启动序列（`os/src/main.rs::rust_main`）：
-
-```
-arch::init  →  mm::init  →  trap / timer  →  fs::mount(EXT4)  →  task::spawn(initproc)
-   │              │              │                  │                       │
- 板载/UART/    伙伴堆 +        S 态陷阱             挂载根文件系统          busybox sh
- SBI 探测     物理帧分配      时钟中断接管           （EXT4，只读+写）     执行 testcode
-```
-
----
-
-## 📁 项目结构
+## 项目结构
 
 ```
 oskernel2026-whusp/
@@ -151,50 +40,133 @@ oskernel2026-whusp/
 │       ├── arch/             # 架构差异收敛点
 │       │   ├── riscv64/      #   ↳ entry · trap · signal · switch · board
 │       │   └── loongarch64/  #   ↳ entry · trap · signal · switch · board
-│       ├── mm/               # 内存：堆、帧、页表、MemorySet、ELF Loader
-│       ├── task/             # 进程/线程、调度、信号、clone、exec、initproc
+│       ├── mm/               # 堆、帧、页表、MemorySet、ELF Loader
+│       ├── task/             # 进程/线程/调度/信号/exec/clone/initproc
 │       ├── fs/               # VFS、EXT4、devfs、procfs、tmpfs
 │       ├── drivers/          # VirtIO、UART、PLIC / IOCSR
 │       ├── sync/             # UPIntrFreeCell、Mutex、Condvar、SleepMutex
-│       ├── syscall.rs        # 分发表（注意：是文件，不是模块）
-│       └── syscall/          # 各子系统的 handler 实现
+│       ├── syscall.rs        # 分发表（文件，非模块）
+│       └── syscall/          # 各子系统 handler 实现
 ├── vendor/
 │   ├── crates/               # 镜像的 crates.io / git 依赖（离线构建）
 │   ├── config.toml           # 重定向 crates-io 与 riscv git 源
-│   └── lwext4_rust/          # 路径依赖：lwext4 的 Rust 封装
-├── docs/                     # 团队面向文档
-├── assets/                   # 图标、徽标
-└── user/                     # 保留的用户态实验代码（不在默认构建路径）
+│   └── lwext4_rust/          # 路径依赖：lwext4 的 Rust FFI 封装
+├── docs/                     # 团队文档
+├── assets/                   # 图标与徽标
+└── user/                     # 遗留用户态实验（不在默认构建路径）
 ```
 
 ---
 
-## 🗺️ 路线图
+## 🚀 快速开始
 
-### ✅ 已完成
+### 环境准备
 
-- 双架构启动骨架：RISC-V / LoongArch 各自从汇编入口到 `rust_main`
-- 基于 `lwext4_rust` 的 EXT4 真磁盘读写，挂载为根文件系统
-- 虚拟文件系统层：`devfs` / `procfs` / `tmpfs`，以及合成的 `/dev/null` `/dev/zero` `/dev/tty`
-- 进程 / 线程 / 信号：`clone` · `execve` · 信号投递 · PID 回收
-- 内存管理：伙伴堆、物理帧分配、按进程 `MemorySet`、ELF Loader（含 `PT_INTERP` 重定向）
-- 同步原语：`UPIntrFreeCell` / `SleepMutex` / `Condvar`
-- VirtIO Block / Input、UART、PLIC、IOCSR 驱动
-- 离线构建：所有 crates.io / git 依赖镜像至 `vendor/crates/`，零网络下可复现
-- busybox 静态测试集主流程贯通
+- **Rust** `nightly-2025-05-20`（参见 [`rust-toolchain.toml`](rust-toolchain.toml)），需包含：
+  - 组件：`rust-src`、`llvm-tools`、`rustfmt`、`clippy`
+  - 目标平台：`riscv64gc-unknown-none-elf`、`loongarch64-unknown-none`
+- **QEMU** ≥ 10.0.2，需含 `qemu-system-riscv64` 与 `qemu-system-loongarch64`
+- **Python 3** 与 **`mkfs.ext4`**（用于构建测试脚本盘）
+- **测试磁盘镜像** — 从 [oscomp/testsuits-for-oskernel releases](https://github.com/oscomp/testsuits-for-oskernel/releases) 下载：
+  - `sdcard-rv.img`（RISC-V，约 4 GiB）
+  - `sdcard-la.img`（LoongArch，约 4 GiB）
+- *（可选）* **Docker** 镜像 [`zhouzhouyi/os-contest:20260104`](https://hub.docker.com/r/zhouzhouyi/os-contest)，用于官方比赛环境：
+  ```bash
+  docker run -it --rm -v $(pwd):/code zhouzhouyi/os-contest:20260104 bash
+  ```
 
-### 🚧 进行中 / 待办
+### 构建
 
-- **glibc 动态链接启动路径**：补齐 `pread64` / `pwrite64` / `getrandom` / `madvise` / `mremap` / `getuid` / `getgid` / `rseq` 等启动期 syscall
-- `/dev/urandom` 字符设备（让 glibc 的 `getrandom` 回退路径可用）
-- 通过 lua、libc-test、iozone 全部测例
-- 性能优化：lmbench / unixbench / iperf 路径
-- LoongArch 评测路径完整验证
-- 内核 backtrace / 可观测性增强
+```bash
+make all          # 完整提交构建：格式化 → 测试脚本盘 → kernel-rv → kernel-la
+make kernel-rv    # 仅构建 RISC-V 内核
+make kernel-la    # 仅构建 LoongArch 内核
+make clean        # 清理所有构建产物
+```
+
+离线 / 本地镜像构建（无需网络）：
+```bash
+CARGO_NET_OFFLINE=true make all
+```
+
+### 运行
+
+在 QEMU 中启动内核并挂载测试磁盘：
+
+```bash
+make run-rv                          # 启动 RISC-V（默认磁盘：./sdcard-rv.img）
+make run-la                          # 启动 LoongArch（默认磁盘：./sdcard-la.img）
+
+# 覆盖测试磁盘或调整资源
+make run-rv TEST_DISK=/path/to/sdcard-rv.img
+make run-rv MEM=2G SMP=4
+```
+
+### 测试配置
+
+测试用例**不**编译进内核。它们存放在一个自动生成的**脚本盘**（`disk.img`）中，
+该盘作为第二块块设备（`x1`）挂载，由内核 init 进程在启动时执行。
+
+脚本盘由 `scripts/` 下的两个文件构建：
+
+| 脚本 | 作用 |
+|------|------|
+| `scripts/export_contest_case_scripts.py` | **核心配置文件** — 定义运行哪些测试组、使用哪个 libc、跑哪些 LTP 用例。在此处修改配置常量，然后重建。 |
+| `scripts/build_contest_disk.sh` | 调用 Python 导出器并创建 ext4 磁盘镜像。 |
+
+修改配置后重建脚本盘：
+
+```bash
+make contest-disk
+```
+
+#### 配置项一览
+
+所有配置项位于 `scripts/export_contest_case_scripts.py`（及一个配套文件）：
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `INTERACTIVE_SHELL` | `False` | `True` → 进入 BusyBox 交互 shell，不执行测试（调试模式） |
+| `TEST_SCRIPTS` | 全部 11 个组 | 启用哪些测试组。删除条目即可跳过对应套件。 |
+| `TEST_LIBCS` | `("/glibc", "/musl")` | 测试哪些 libc 根目录。 |
+| `LTP_CASE_FILTER_OPTION` | `None` | 运行时过滤 LTP 用例。`None` = 跑完整白名单；`"prefix:ioctl"` = 仅 ioctl 相关用例；`"case:fork07"` = 单个用例；`"a"`–`"z"` = 按首字母筛选；`"range:start,end"` = 字典序区间。 |
+| [`scripts/ltp_whitelist.txt`](scripts/ltp_whitelist.txt) | ~800 个用例 | 精选的 LTP 用例列表（每行一个）。当 `LTP_CASE_FILTER_OPTION` 为 `None` 时生效。 |
+
+#### 常见工作流
+
+**调试单个 LTP 用例：**
+
+1. 编辑 `scripts/export_contest_case_scripts.py`：
+   ```python
+   INTERACTIVE_SHELL = True
+   LTP_CASE_FILTER_OPTION = "case:fork07"
+   ```
+2. 重建并运行：
+   ```bash
+   make contest-disk && make run-rv
+   ```
+
+**快速迭代 — 只跑 basic 测试组：**
+
+1. 编辑 `scripts/export_contest_case_scripts.py`：
+   ```python
+   TEST_SCRIPTS = ("basic_testcode.sh",)
+   ```
+2. 重建并运行：
+   ```bash
+   make contest-disk && make run-rv
+   ```
+
+**向白名单添加新的 LTP 用例：**
+
+```bash
+echo "new_case_name" >> scripts/ltp_whitelist.txt
+make contest-disk
+```
 
 ---
 
-## 👥 团队
+## 团队
 
 <div align="center">
 
@@ -206,16 +178,6 @@ oskernel2026-whusp/
 | 石瑞博 | Shi Ruibo |
 
 </div>
-
----
-
-## 🙏 致谢
-
-仅列出项目中**直接采用其代码**的开源工作：
-
-- [**rCore-Tutorial-v3**](https://github.com/rcore-os/rCore-Tutorial-v3) —— 内核早期骨架的起点（启动流程、`UPIntrFreeCell`、地址空间抽象等借鉴自该教程）
-- [**lwext4**](https://github.com/gkostka/lwext4) —— 内核中 EXT4 文件系统读写直接基于该 C 实现
-- [**lwext4_rust**](https://github.com/elliott10/lwext4_rust) —— `lwext4` 的 Rust FFI 封装，本仓 `vendor/lwext4_rust/` 在其上做了少量本地补丁
 
 ---
 

@@ -375,6 +375,9 @@ fn sys_mmap_impl(
             return Err(SysError::EACCES);
         }
         if let Some((pages, max_size)) = io_uring_mmap_region(&file, offset) {
+            // CONTEXT: io_uring ring offsets map preallocated kernel-owned
+            // frames. They use shared-frame VMA plumbing only to expose the
+            // Linux mmap ABI for SQ/CQ rings and SQEs.
             if !shared || fixed || len == 0 || len > max_size {
                 return Err(SysError::EINVAL);
             }

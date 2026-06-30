@@ -123,6 +123,9 @@ struct RegisteredBuffer {
     len: usize,
 }
 
+// CONTEXT: io_uring mmap exposes these frames as shared user mappings, but
+// the kernel still owns the ring storage and reads/writes it synchronously from
+// io_uring_enter(). Do not treat this as a general SHM segment.
 struct SharedRegion {
     frames: Vec<FrameTracker>,
     len: usize,
@@ -315,6 +318,11 @@ impl IoUringState {
         if flags & !IORING_ENTER_GETEVENTS != 0 {
             return Err(SysError::EINVAL);
         }
+        // CONTEXT: Current LTP coverage submits a small bounded batch and then
+        // observes CQEs. This path consumes SQEs synchronously under the ring
+        // lock instead of queueing work to an async io_uring worker.
+        // UNFINISHED: Full Linux io_uring ordering, SQPOLL, registered files,
+        // cancellation, and wait-for-min-complete semantics are not modeled.
         let sq_head = self.read_sq_u32(self.params.sq_off.head as usize)?;
         let sq_tail = self.read_sq_u32(self.params.sq_off.tail as usize)?;
         let sq_mask = self.read_sq_u32(self.params.sq_off.ring_mask as usize)?;

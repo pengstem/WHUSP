@@ -1,3 +1,6 @@
+// Keep this repr(C) field order synchronized with trap.S fixed offsets:
+// x[0..31], PRMD at 32*8, ERA at 33*8, kernel metadata at 34..36*8,
+// FP registers at 37..68*8, FCC at 69*8, and FCSR at 70*8.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TrapContext {

@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-WHITELIST_PATH = REPO_ROOT / "os" / "src" / "task" / "ltp_whitelist.txt"
+WHITELIST_PATH = REPO_ROOT / "scripts" / "ltp_whitelist.txt"
 DEFAULT_RUNTEST_DIR = (
     REPO_ROOT / "testsuits" / "ltp-full-20240524" / "runtest"
 ).resolve()
@@ -173,7 +173,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Generate guest-side shell scripts for every contest group and "
-            "every case in os/src/task/ltp_whitelist.txt."
+            "every case in scripts/ltp_whitelist.txt."
         )
     )
     parser.add_argument(
@@ -1182,7 +1182,7 @@ Generated from:
 
 - `scripts/export_contest_case_scripts.py`
 - `os/src/task/contest_runner.rs`
-- `os/src/task/ltp_whitelist.txt`
+- `scripts/ltp_whitelist.txt`
 - `{runtest_display}`
 
 This directory exports the guest-side commands for every contest test group in

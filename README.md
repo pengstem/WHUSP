@@ -2,9 +2,7 @@
 
 <img src="assets/whu.png" alt="Wuhan University" width="420"/>
 
-# WHUSP-OS
-
-**For the 2026 National College Student Computer System Capability Contest · OS Track**
+# WHUSP
 
 A modern monolithic kernel written in Rust, dual-targeting **RISC-V 64** and **LoongArch 64**
 
@@ -26,122 +24,13 @@ A modern monolithic kernel written in Rust, dual-targeting **RISC-V 64** and **L
 
 ## 📖 Table of Contents
 
-- [About](#-about)
-- [Highlights](#-highlights)
 - [Quick Start](#-quick-start)
-- [Architecture](#-architecture)
 - [Repository Layout](#-repository-layout)
-- [Roadmap](#-roadmap)
 - [Team](#-team)
-- [Acknowledgements](#-acknowledgements)
 
 ---
 
-## 🎯 About
-
-**WHUSP-OS** is the kernel project from **Wuhan University**, team **WHU S**ystem **P**roject, for the 2026 National College Student Computer System Capability Contest — Operating System Design Track. Written in [Rust](https://www.rust-lang.org/), the goal is a POSIX-compatible monolithic kernel that boots on **RISC-V 64** and **LoongArch 64**, runs the official judge scripts, and exercises real userland (busybox, lua, libc-test, …).
-
-> Status: **active development**. The kernel boots, mounts an EXT4 test image, and runs the basic statically-linked test suite under busybox. Bring-up of the dynamically-linked glibc path is in progress — see the [roadmap](#-roadmap).
-
----
-
-## ✨ Highlights
-
-| Subsystem | What's notable |
-|---|---|
-| 🏗️ **Dual-arch** | RISC-V 64 and LoongArch 64 share a common core; arch-specific code is confined to `os/src/arch/<arch>/` |
-| 🧠 **Memory** | Buddy heap + frame allocator; per-process `MemorySet`; ELF loader handles `PT_LOAD` / `PT_INTERP` |
-| 🗂️ **Filesystem** | Real EXT4 read/write via vendored `lwext4_rust`; unified VFS; `devfs` / `procfs` / `tmpfs` |
-| ⚙️ **Tasks** | TCB / Thread split · `clone` / `execve` / signals · PID recycling · Mutex / Condvar / SleepMutex |
-| 📡 **Drivers** | VirtIO Block / Input · UART · PLIC (RV) · IOCSR (LA) · DTB-driven device discovery |
-| 🔌 **Syscalls** | Linux-generic ABI compatible dispatch table (`os/src/syscall.rs`), handlers split under `syscall/` |
-| 🧰 **Build** | Fully offline & reproducible — every crates.io / git dependency mirrored in `vendor/crates/` |
-
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-
-- Rust toolchain `nightly-2025-05-20` (pinned via `rust-toolchain.toml`)
-- `qemu-system-riscv64` ≥ 7.0.0; `qemu-system-loongarch64` ≥ 10.0.0
-- The official contest container is recommended for parity:
-
-```bash
-docker run --rm -it \
-    -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-    -v "$PWD":/kernel -w /kernel --privileged \
-    zhouzhouyi/os-contest:20260104 \
-    bash -lc 'chmod o+x /root && exec setpriv --reuid "$HOST_UID" --regid "$HOST_GID" --clear-groups env HOME=/tmp RUSTUP_HOME=/root/.rustup PATH="$PATH" bash'
-```
-
-### Build
-
-The repository root is the contest-style entry point. Both kernel ELFs land at the top level:
-
-```bash
-make all                  # build both kernel-rv and kernel-la (judge command)
-make kernel-rv            # RISC-V 64 only
-make kernel-la            # LoongArch 64 only
-make fmt                  # format the workspace
-make clean                # remove build artifacts
-```
-
-### Run in QEMU
-
-You will need the official EXT4 test image distributed by the contest:
-
-```bash
-make run-rv  TEST_DISK=/path/to/contest-disk-rv.img
-make run-la  TEST_DISK_LA=/path/to/contest-disk-la.img
-```
-
-On boot the kernel mounts the test image as `/`, launches `busybox sh` as init, and drives each `*_testcode.sh` group, emitting the contest-required markers:
-
-```
-#### OS COMP TEST GROUP START xxxxx ####
-...
-#### OS COMP TEST GROUP END   xxxxx ####
-```
-
----
-
-## 🧩 Architecture
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                        User Space                            │
-│            busybox · lua · libc-test · *_testcode.sh         │
-├──────────────────────────────────────────────────────────────┤
-│              Syscall Dispatch (os/src/syscall.rs)            │
-│       fs · process · signal · sync · memory · wait · …       │
-├────────────┬───────────┬───────────┬───────────┬─────────────┤
-│   task/    │   mm/     │   fs/     │  drivers/ │   sync/     │
-│  TCB /     │ buddy +   │ VFS +     │ VirtIO·   │ UPIntr-     │
-│  scheduler │ MemorySet │ EXT4 /    │ UART·     │ FreeCell ·  │
-│  signals / │ ELF load  │ devfs /   │ PLIC /    │ SleepMutex  │
-│  exec /    │           │ procfs /  │ IOCSR     │ · Condvar   │
-│  clone     │           │ tmpfs     │           │             │
-├────────────┴───────────┴───────────┴───────────┴─────────────┤
-│      arch/{riscv64, loongarch64} —— entry · trap · MMU       │
-│              · timer · context switch · board                │
-├──────────────────────────────────────────────────────────────┤
-│                RustSBI (RV) · direct entry (LA)              │
-└──────────────────────────────────────────────────────────────┘
-```
-
-Boot order (`os/src/main.rs::rust_main`):
-
-```
-arch::init  →  mm::init  →  trap / timer  →  fs::mount(EXT4)  →  task::spawn(initproc)
-   │              │              │                   │                      │
- board/UART/   buddy heap +    S-mode trap +       mount root            busybox sh
- SBI probe    frame allocator timer interrupts     filesystem (EXT4)    runs testcode
-```
-
----
-
-## 📁 Repository Layout
+## Repository Layout
 
 ```
 oskernel2026-whusp/
@@ -169,32 +58,116 @@ oskernel2026-whusp/
 
 ---
 
-## 🗺️ Roadmap
+## 🚀 Quick Start
 
-### ✅ Done
+### Prerequisites
 
-- Dual-arch boot path: RISC-V and LoongArch each reach `rust_main` from their assembly entry
-- Real EXT4 read/write via `lwext4_rust`, mounted as the root filesystem
-- Virtual filesystems: `devfs` / `procfs` / `tmpfs`, with synthesized `/dev/null` `/dev/zero` `/dev/tty`
-- Processes / threads / signals: `clone` · `execve` · signal delivery · PID recycling
-- Memory: buddy heap, frame allocator, per-process `MemorySet`, ELF loader (with `PT_INTERP` redirection)
-- Sync primitives: `UPIntrFreeCell` / `SleepMutex` / `Condvar`
-- VirtIO Block / Input, UART, PLIC, IOCSR drivers
-- Offline build: every crates.io / git dependency mirrored under `vendor/crates/`
-- busybox + statically-linked test suite running end-to-end
+- **Rust** `nightly-2025-05-20` (see [`rust-toolchain.toml`](rust-toolchain.toml)) with:
+  - Components: `rust-src`, `llvm-tools`, `rustfmt`, `clippy`
+  - Targets: `riscv64gc-unknown-none-elf`, `loongarch64-unknown-none`
+- **QEMU** ≥ 10.0.2 with `qemu-system-riscv64` and `qemu-system-loongarch64`
+- **Python 3** and **`mkfs.ext4`** (for building the test script disk)
+- **Test disk images** — download from [oscomp/testsuits-for-oskernel releases](https://github.com/oscomp/testsuits-for-oskernel/releases):
+  - `sdcard-rv.img` (RISC-V, ~4 GiB)
+  - `sdcard-la.img` (LoongArch, ~4 GiB)
+- *(Optional)* **Docker** image [`zhouzhouyi/os-contest:20260104`](https://hub.docker.com/r/zhouzhouyi/os-contest) for the official contest environment:
+  ```bash
+  docker run -it --rm -v $(pwd):/code zhouzhouyi/os-contest:20260104 bash
+  ```
 
-### 🚧 In progress / Not yet
+### Build
 
-- **glibc dynamic-linker boot path**: implement `pread64` / `pwrite64` / `getrandom` / `madvise` / `mremap` / `getuid` / `getgid` / `rseq` and other early-startup syscalls
-- `/dev/urandom` character device (so glibc's `getrandom` fallback works)
-- Pass lua, libc-test and iozone in full
-- Performance work: lmbench / unixbench / iperf paths
-- Full validation on the LoongArch judging path
-- Kernel backtrace / observability improvements
+```bash
+make all          # Full submission build: format → contest disk → kernel-rv → kernel-la
+make kernel-rv    # RISC-V kernel only
+make kernel-la    # LoongArch kernel only
+make clean        # Remove all build artifacts
+```
+
+Offline / vendored build (no network access):
+```bash
+CARGO_NET_OFFLINE=true make all
+```
+
+### Run
+
+Boot the kernel in QEMU with the test disk attached:
+
+```bash
+make run-rv                          # Boot RISC-V (default: ./sdcard-rv.img)
+make run-la                          # Boot LoongArch (default: ./sdcard-la.img)
+
+# Override test disk or tune resources
+make run-rv TEST_DISK=/path/to/sdcard-rv.img
+make run-rv MEM=2G SMP=4
+```
+
+### Test Configuration
+
+Tests are **not** compiled into the kernel. They live on a generated **script disk**
+(`disk.img`) that is attached as a second block device (`x1`) and executed by the
+kernel's init process at boot.
+
+The script disk is built by two files under `scripts/`:
+
+| Script | Role |
+|--------|------|
+| `scripts/export_contest_case_scripts.py` | **Central configuration** — defines which tests run, under which libc, with which LTP cases. Edit constants here, then rebuild. |
+| `scripts/build_contest_disk.sh` | Wraps the Python exporter and creates the ext4 disk image. |
+
+Rebuild the script disk after changing any configuration:
+
+```bash
+make contest-disk
+```
+
+#### Configuration Knobs
+
+All knobs live in `scripts/export_contest_case_scripts.py` (and one companion file):
+
+| Knob | Default | What it controls |
+|------|---------|-----------------|
+| `INTERACTIVE_SHELL` | `False` | `True` → drop into a BusyBox shell instead of running tests (debug mode) |
+| `TEST_SCRIPTS` | all 11 groups | Which test groups to enable. Remove entries to skip suites. |
+| `TEST_LIBCS` | `("/glibc", "/musl")` | Which libc roots to test. |
+| `LTP_CASE_FILTER_OPTION` | `None` | Filter LTP cases at runtime. `None` = full whitelist; `"prefix:ioctl"` = only ioctl tests; `"case:fork07"` = single case; `"a"`–`"z"` = first-letter filter; `"range:start,end"` = lexicographic range. |
+| [`scripts/ltp_whitelist.txt`](scripts/ltp_whitelist.txt) | ~800 cases | Curated LTP case list (one per line). Used when `LTP_CASE_FILTER_OPTION` is `None`. |
+
+#### Common Workflows
+
+**Debug a specific LTP case:**
+
+1. Edit `scripts/export_contest_case_scripts.py`:
+   ```python
+   INTERACTIVE_SHELL = True
+   LTP_CASE_FILTER_OPTION = "case:fork07"
+   ```
+2. Rebuild and run:
+   ```bash
+   make contest-disk && make run-rv
+   ```
+
+**Fast iteration — run only the basic test group:**
+
+1. Edit `scripts/export_contest_case_scripts.py`:
+   ```python
+   TEST_SCRIPTS = ("basic_testcode.sh",)
+   ```
+2. Rebuild and run:
+   ```bash
+   make contest-disk && make run-rv
+   ```
+
+**Add a new LTP case to the whitelist:**
+
+```bash
+echo "new_case_name" >> scripts/ltp_whitelist.txt
+make contest-disk
+```
 
 ---
 
-## 👥 Team
+## Team
 
 <div align="center">
 
@@ -206,16 +179,6 @@ oskernel2026-whusp/
 | Shi Ruibo | 石瑞博 |
 
 </div>
-
----
-
-## 🙏 Acknowledgements
-
-We only list projects whose **code we directly use** in this kernel:
-
-- [**rCore-Tutorial-v3**](https://github.com/rcore-os/rCore-Tutorial-v3) — the original skeleton this kernel grew out of (boot flow, `UPIntrFreeCell`, address-space abstraction, …)
-- [**lwext4**](https://github.com/gkostka/lwext4) — the C library that powers our EXT4 read/write path
-- [**lwext4_rust**](https://github.com/elliott10/lwext4_rust) — Rust FFI wrapper around `lwext4`; `vendor/lwext4_rust/` carries a few local follow-up patches on top
 
 ---
 
