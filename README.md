@@ -14,6 +14,7 @@ A modern monolithic kernel written in Rust, dual-targeting **RISC-V 64** and **L
 
 [中文](README.zh.md) ·
 [Quick Start](#-quick-start) ·
+[Materials](#-materials) ·
 [Architecture](#-architecture) ·
 [Roadmap](#-roadmap) ·
 [Team](#-team)
@@ -26,6 +27,7 @@ A modern monolithic kernel written in Rust, dual-targeting **RISC-V 64** and **L
 
 - [Quick Start](#-quick-start)
 - [Repository Layout](#-repository-layout)
+- [Materials](#-materials)
 - [Team](#-team)
 
 ---
@@ -55,6 +57,16 @@ oskernel2026-whusp/
 ├── assets/                   # logos & badges
 └── user/                     # legacy userland experiments (not in the default build)
 ```
+
+---
+
+## Materials
+
+| Type | Link |
+|------|------|
+| Video | [Preliminary round video](初赛视频.mkv) |
+| PDF | [Preliminary round report](初赛文档.pdf) |
+| PPT | [Preliminary round slides](WHUSP%20初赛汇报.pptx) |
 
 ---
 
