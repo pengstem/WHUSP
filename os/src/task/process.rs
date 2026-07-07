@@ -925,7 +925,7 @@ impl ProcessControlBlockInner {
                 let fd = word_start + (!unavailable).trailing_zeros() as usize;
                 debug_assert!(fd >= lower_bound);
                 debug_assert!(fd < search_end);
-                debug_assert!(self.fd_table.get(fd).map_or(true, Option::is_none));
+                debug_assert!(self.fd_table.get(fd).is_none_or(Option::is_none));
                 return Some(fd);
             }
             word_index += 1;

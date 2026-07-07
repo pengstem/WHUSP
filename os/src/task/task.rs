@@ -27,7 +27,7 @@ pub enum TaskStatus {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct TaskCpuTimes {
+struct TaskCpuTimes {
     user_us: usize,
     system_us: usize,
     last_user_enter_us: Option<usize>,
@@ -83,8 +83,8 @@ pub struct TaskControlBlockInner {
     pub sched_deadline_period: u64,
     pub nice: i8,
     pub sched_vruntime: u64,
-    pub sched_run_start_us: Option<usize>,
-    pub cpu_times: TaskCpuTimes,
+    sched_run_start_us: Option<usize>,
+    cpu_times: TaskCpuTimes,
     pub timer_slack_ns: usize,
     pub default_timer_slack_ns: usize,
     pub seccomp_mode: u8,
@@ -244,6 +244,12 @@ impl TaskControlBlock {
             .map_or(0, |start_us| now_us.saturating_sub(start_us))
     }
 
+    pub(crate) fn sched_runtime_us(&self, now_us: usize) -> usize {
+        self.inner_exclusive_access()
+            .sched_run_start_us
+            .map_or(0, |start_us| now_us.saturating_sub(start_us))
+    }
+
     pub fn mark_user_time_entry(&self, now_us: usize) {
         self.inner_exclusive_access()
             .cpu_times
@@ -295,24 +301,24 @@ impl TaskControlBlockInner {
 }
 
 impl TaskCpuTimes {
-    pub fn mark_user_entry(&mut self, now_us: usize) {
+    fn mark_user_entry(&mut self, now_us: usize) {
         self.last_user_enter_us = Some(now_us);
         self.last_kernel_enter_us = None;
     }
 
-    pub fn mark_kernel_entry(&mut self, now_us: usize) {
+    fn mark_kernel_entry(&mut self, now_us: usize) {
         self.last_kernel_enter_us = Some(now_us);
         self.last_user_enter_us = None;
     }
 
-    pub fn account_user_until(&mut self, now_us: usize) {
+    fn account_user_until(&mut self, now_us: usize) {
         if let Some(start_us) = self.last_user_enter_us.take() {
             self.user_us = self.user_us.saturating_add(now_us.saturating_sub(start_us));
         }
         self.last_kernel_enter_us = Some(now_us);
     }
 
-    pub fn account_system_until(&mut self, now_us: usize) {
+    fn account_system_until(&mut self, now_us: usize) {
         if let Some(start_us) = self.last_kernel_enter_us.take() {
             self.system_us = self
                 .system_us
@@ -321,7 +327,7 @@ impl TaskCpuTimes {
         self.last_kernel_enter_us = Some(now_us);
     }
 
-    pub fn total_us(&self) -> usize {
+    fn total_us(&self) -> usize {
         self.user_us.saturating_add(self.system_us)
     }
 }

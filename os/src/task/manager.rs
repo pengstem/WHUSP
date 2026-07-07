@@ -93,12 +93,7 @@ impl TaskManager {
     }
 
     fn current_run_time_us(current: &TaskControlBlock) -> usize {
-        current
-            .inner_exclusive_access()
-            .sched_run_start_us
-            .map_or(0, |start_us| {
-                crate::timer::get_time_us().saturating_sub(start_us)
-            })
+        current.sched_runtime_us(crate::timer::get_time_us())
     }
 
     fn rt_priority_bit(priority: usize) -> u128 {
