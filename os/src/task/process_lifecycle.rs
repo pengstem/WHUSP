@@ -1,6 +1,6 @@
 use super::exec::{ExecStackInfo, init_user_stack};
 use super::id::RecycleAllocator;
-use super::manager::{insert_into_pid2process, register_task_linux_tid};
+use super::manager::{register_process, register_task_linux_tid};
 use super::process::{
     Credentials, KcmpResourceOwners, ProcessControlBlock, ProcessControlBlockInner,
     ProcessCpuTimes, ProcessFsContext, ProcessResourceLimits, ProcessTimers, comm_from_cmdline,
@@ -211,7 +211,7 @@ impl ProcessControlBlock {
         let mut process_inner = process.inner_exclusive_access();
         process_inner.tasks.push(Some(Arc::clone(&task)));
         drop(process_inner);
-        insert_into_pid2process(process.getpid(), Arc::clone(&process));
+        register_process(&process);
         add_task(task);
         process
     }
@@ -226,7 +226,7 @@ impl ProcessControlBlock {
             .inner_exclusive_access()
             .children
             .push(Arc::clone(self));
-        insert_into_pid2process(self.getpid(), Arc::clone(self));
+        register_process(self);
     }
 
     /// Forks the calling thread into a new process without making the child runnable.

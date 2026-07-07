@@ -52,7 +52,7 @@ pub(crate) use manager::any_process_references_mount;
 pub(crate) use manager::has_ready_task;
 pub(crate) use manager::list_process_snapshots;
 pub(crate) use manager::processes_snapshot;
-pub(crate) use manager::remove_ready_tasks_of_process;
+use manager::remove_ready_tasks_of_process;
 pub(crate) use manager::reprioritize_ready_task;
 pub(crate) use manager::requeue_task_after_run;
 pub(crate) use manager::task_with_linux_tid;

@@ -104,12 +104,12 @@ impl TaskManager {
         self.enqueue(task, false);
     }
 
-    pub fn requeue_after_run(&mut self, task: Arc<TaskControlBlock>) {
+    fn requeue_after_run(&mut self, task: Arc<TaskControlBlock>) {
         Self::charge_normal_runtime(&task);
         self.enqueue(task, false);
     }
 
-    pub fn add_front(&mut self, task: Arc<TaskControlBlock>) {
+    fn add_front(&mut self, task: Arc<TaskControlBlock>) {
         self.enqueue(task, true);
     }
 
@@ -160,7 +160,7 @@ impl TaskManager {
         Some((u128::BITS - 1 - self.rt_ready_bitmap.leading_zeros()) as usize)
     }
 
-    pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
+    fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
         let _profile_scope = perf::time_scope(perf::ProfilePoint::SchedulerFetch);
         let queue_len = self.ready_len();
         let mut scanned = 0;
@@ -208,7 +208,7 @@ impl TaskManager {
         }
     }
 
-    pub fn should_preempt_current_on_tick(&self, current: &Arc<TaskControlBlock>) -> bool {
+    fn should_preempt_current_on_tick(&self, current: &Arc<TaskControlBlock>) -> bool {
         let current_rt_priority = Self::rt_priority(current);
 
         for priority in (current_rt_priority + 1..=RT_PRIORITY_MAX).rev() {
@@ -262,7 +262,7 @@ impl TaskManager {
                 .saturating_add(NORMAL_PREEMPT_GRANULARITY_US)
     }
 
-    pub fn remove_process_tasks(&mut self, process_id: usize) {
+    fn remove_process_tasks(&mut self, process_id: usize) {
         self.normal_queue.retain(|_, task| {
             task.process
                 .upgrade()
@@ -304,7 +304,7 @@ impl TaskManager {
         false
     }
 
-    pub fn reprioritize_ready_task(&mut self, task: Arc<TaskControlBlock>) {
+    fn reprioritize_ready_task(&mut self, task: Arc<TaskControlBlock>) {
         if task.inner_exclusive_access().task_status != TaskStatus::Ready {
             return;
         }
@@ -343,9 +343,9 @@ fn remove_task_from_queue(
 }
 
 lazy_static! {
-    pub static ref TASK_MANAGER: UPIntrFreeCell<TaskManager> =
+    static ref TASK_MANAGER: UPIntrFreeCell<TaskManager> =
         unsafe { UPIntrFreeCell::new(TaskManager::new()) };
-    pub static ref PID2PCB: UPIntrFreeCell<BTreeMap<usize, Arc<ProcessControlBlock>>> =
+    static ref PID2PCB: UPIntrFreeCell<BTreeMap<usize, Arc<ProcessControlBlock>>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
     static ref LINUX_TID2TASK: UPIntrFreeCell<BTreeMap<usize, Weak<TaskControlBlock>>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
@@ -359,11 +359,11 @@ pub(crate) fn requeue_task_after_run(task: Arc<TaskControlBlock>) {
     TASK_MANAGER.exclusive_access().requeue_after_run(task);
 }
 
-pub(crate) fn charge_task_after_run(task: &TaskControlBlock) {
+pub(super) fn charge_task_after_run(task: &TaskControlBlock) {
     TaskManager::charge_normal_runtime(task);
 }
 
-pub(crate) fn should_preempt_current_on_tick(current: &Arc<TaskControlBlock>) -> bool {
+pub(super) fn should_preempt_current_on_tick(current: &Arc<TaskControlBlock>) -> bool {
     TASK_MANAGER
         .exclusive_access()
         .should_preempt_current_on_tick(current)
@@ -401,7 +401,7 @@ pub(crate) fn wakeup_timer_task(task: Arc<TaskControlBlock>) -> bool {
     wakeup_front_task(task)
 }
 
-pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
+pub(super) fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     TASK_MANAGER.exclusive_access().fetch()
 }
 
@@ -409,7 +409,7 @@ pub(crate) fn has_ready_task() -> bool {
     TASK_MANAGER.exclusive_access().ready_len() > 0
 }
 
-pub(crate) fn remove_ready_tasks_of_process(process_id: usize) {
+pub(super) fn remove_ready_tasks_of_process(process_id: usize) {
     TASK_MANAGER
         .exclusive_access()
         .remove_process_tasks(process_id);
@@ -478,14 +478,14 @@ pub(crate) fn task_with_linux_tid(tid: usize) -> Option<Arc<TaskControlBlock>> {
     None
 }
 
-pub(crate) fn register_task_linux_tid(task: &Arc<TaskControlBlock>) {
+pub(super) fn register_task_linux_tid(task: &Arc<TaskControlBlock>) {
     let tid = task.linux_tid();
     LINUX_TID2TASK
         .exclusive_access()
         .insert(tid, Arc::downgrade(task));
 }
 
-pub(crate) fn unregister_task_linux_tid(tid: usize) {
+pub(super) fn unregister_task_linux_tid(tid: usize) {
     LINUX_TID2TASK.exclusive_access().remove(&tid);
 }
 
@@ -510,8 +510,10 @@ pub(crate) fn any_process_references_mount(mount_id: crate::fs::MountId) -> bool
         .any(|process| process.references_vfs_mount(mount_id))
 }
 
-pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
-    PID2PCB.exclusive_access().insert(pid, Arc::clone(&process));
+pub(super) fn register_process(process: &Arc<ProcessControlBlock>) {
+    PID2PCB
+        .exclusive_access()
+        .insert(process.getpid(), Arc::clone(process));
     for task in process.tasks_snapshot() {
         register_task_linux_tid(&task);
     }
