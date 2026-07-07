@@ -11,7 +11,7 @@ use crate::sync::{UPIntrFreeCell, UPIntrRefMut};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 pub const RLIM_INFINITY: usize = usize::MAX;
 const RLIMIT_COUNT: usize = RLimitResource::RtTime as usize + 1;
@@ -720,8 +720,7 @@ fn fd_bit_position(fd: usize) -> (usize, usize) {
 pub(crate) fn fd_allocation_state_from_table(
     fd_table: &[Option<FdTableEntry>],
 ) -> (Vec<usize>, usize) {
-    let mut fd_open_bits = Vec::new();
-    fd_open_bits.resize(fd_bitmap_word_count(fd_table.len()), 0);
+    let mut fd_open_bits = vec![0; fd_bitmap_word_count(fd_table.len())];
     let mut next_fd_hint = fd_table.len();
 
     for (fd, entry) in fd_table.iter().enumerate() {

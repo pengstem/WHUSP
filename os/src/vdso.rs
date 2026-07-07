@@ -7,7 +7,7 @@ const VDSO_BASE: usize = USER_MMAP_LIMIT - PAGE_SIZE;
 #[cfg(target_arch = "riscv64")]
 mod arch {
     use super::*;
-    use alloc::vec::Vec;
+    use alloc::{vec, vec::Vec};
     use core::arch::global_asm;
 
     const PT_LOAD: u32 = 1;
@@ -229,8 +229,7 @@ __whusp_vdso_clock_getres_end:
             return None;
         }
 
-        let mut image = Vec::new();
-        image.resize(PAGE_SIZE, 0);
+        let mut image = vec![0; PAGE_SIZE];
         write_elf_header(&mut image, phoff, phentsize, phnum);
         write_program_header(
             &mut image,
@@ -540,7 +539,7 @@ __whusp_vdso_clock_getres_end:
 #[cfg(target_arch = "loongarch64")]
 mod arch {
     use super::*;
-    use alloc::vec::Vec;
+    use alloc::{vec, vec::Vec};
     use core::arch::global_asm;
 
     const PT_LOAD: u32 = 1;
@@ -750,8 +749,7 @@ __whusp_la_vdso_clock_getres_end:
             return None;
         }
 
-        let mut image = Vec::new();
-        image.resize(PAGE_SIZE, 0);
+        let mut image = vec![0; PAGE_SIZE];
         write_elf_header(&mut image, phoff, phentsize, phnum);
         write_program_header(
             &mut image,

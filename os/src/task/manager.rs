@@ -100,7 +100,7 @@ impl TaskManager {
         1u128 << priority
     }
 
-    pub fn add(&mut self, task: Arc<TaskControlBlock>) {
+    fn add(&mut self, task: Arc<TaskControlBlock>) {
         self.enqueue(task, false);
     }
 

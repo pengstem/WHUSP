@@ -13,7 +13,7 @@ use crate::syscall::user_ptr::copy_to_user;
 use crate::trap::{TrapContext, trap_handler};
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 const AT_NULL: usize = 0;
 const AT_PHDR: usize = 3;
@@ -245,8 +245,7 @@ fn write_user_stack(
         .stack_top
         .checked_sub(layout.user_sp)
         .ok_or(SysError::EFAULT)?;
-    let mut stack = Vec::new();
-    stack.resize(stack_len, 0);
+    let mut stack = vec![0; stack_len];
 
     for (addr, string) in layout.env_ptrs.iter().zip(envs.iter()) {
         write_stack_string(stack.as_mut_slice(), layout, *addr, string.as_str())?;
