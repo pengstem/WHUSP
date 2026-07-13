@@ -3,6 +3,15 @@ PERF_COUNTERS ?= 0
 CARGO_HOME ?= $(CURDIR)/vendor
 export CARGO_HOME
 
+# Keep local development usable when the contest Docker image is unavailable.
+# The extracted GCC 13.2 LoongArch toolchain is intentionally ignored with the
+# other large tools, and the official image still wins when this directory is
+# absent.
+LOONGARCH_TOOLCHAIN_BIN ?= $(CURDIR)/tools/loongarch64-linux-musl-cross/bin
+ifneq ($(wildcard $(LOONGARCH_TOOLCHAIN_BIN)/loongarch64-linux-musl-gcc),)
+export PATH := $(LOONGARCH_TOOLCHAIN_BIN):$(PATH)
+endif
+
 RISCV_TARGET := riscv64gc-unknown-none-elf
 LOONGARCH_TARGET := loongarch64-unknown-none
 KERNEL_RV_SRC := os/target/$(RISCV_TARGET)/$(MODE)/os
