@@ -51,6 +51,35 @@ impl CpuLocal {
     }
 }
 
+#[repr(C, align(64))]
+struct Phase2ProbePerf {
+    contended: AtomicUsize,
+    spins: AtomicUsize,
+    max_wait_ticks: AtomicUsize,
+    max_hold_ticks: AtomicUsize,
+    elapsed_ticks: AtomicUsize,
+}
+
+impl Phase2ProbePerf {
+    const fn new() -> Self {
+        Self {
+            contended: AtomicUsize::new(0),
+            spins: AtomicUsize::new(0),
+            max_wait_ticks: AtomicUsize::new(0),
+            max_hold_ticks: AtomicUsize::new(0),
+            elapsed_ticks: AtomicUsize::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        self.contended.store(0, Ordering::Relaxed);
+        self.spins.store(0, Ordering::Relaxed);
+        self.max_wait_ticks.store(0, Ordering::Relaxed);
+        self.max_hold_ticks.store(0, Ordering::Relaxed);
+        self.elapsed_ticks.store(0, Ordering::Relaxed);
+    }
+}
+
 impl CpuBootLocal {
     const fn new() -> Self {
         Self {
@@ -309,6 +338,8 @@ static PHASE2_PROBE_DONE: AtomicCpuMask = AtomicCpuMask::new(CpuMask::empty());
 static PHASE2_LOCK_COUNTER: SpinLock<usize> = SpinLock::new(0);
 static PHASE2_IRQ_RESTORED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 static PHASE2_PROBE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+static PHASE2_PROBE_PERF: [Phase2ProbePerf; MAX_CPUS] =
+    [const { Phase2ProbePerf::new() }; MAX_CPUS];
 
 pub fn record_boot_entry() {
     let count = BOOT_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -376,20 +407,23 @@ pub fn install_current(logical_id: CpuId, hardware_id: usize) {
 }
 
 pub fn current() -> &'static CpuLocal {
+    let logical_id = try_current_id().expect("CPU-local pointer is not installed or invalid");
+    &CPU_LOCALS[logical_id]
+}
+
+pub fn try_current_id() -> Option<CpuId> {
     let pointer = crate::arch::smp::cpu_local_ptr();
-    assert_ne!(pointer, 0, "CPU-local pointer is not installed");
-    let local = unsafe { &*(pointer as *const CpuLocal) };
-    let logical_id = local.logical_id();
-    assert!(logical_id < MAX_CPUS, "CPU-local pointer has an invalid ID");
-    assert!(
-        core::ptr::eq(local, &CPU_LOCALS[logical_id]),
-        "CPU-local pointer is outside the static CPU-local array"
-    );
-    assert!(
-        local.installed.load(Ordering::Acquire),
-        "CPU-local pointer observed before publication"
-    );
-    local
+    let base = &CPU_LOCALS[0] as *const CpuLocal as usize;
+    let stride = core::mem::size_of::<CpuLocal>();
+    let bytes = stride.checked_mul(MAX_CPUS)?;
+    let offset = pointer.checked_sub(base)?;
+    if offset >= bytes || offset % stride != 0 {
+        return None;
+    }
+    let logical_id = offset / stride;
+    let local = &CPU_LOCALS[logical_id];
+    (local.installed.load(Ordering::Acquire) && local.logical_id() == logical_id)
+        .then_some(logical_id)
 }
 
 pub fn current_id() -> CpuId {
@@ -696,6 +730,7 @@ fn run_phase2_lock_irq_probe() {
     for logical_id in 0..cpu_count {
         PHASE2_PROBE_PENDING[logical_id].store(false, Ordering::Relaxed);
         PHASE2_IRQ_RESTORED[logical_id].store(false, Ordering::Relaxed);
+        PHASE2_PROBE_PERF[logical_id].reset();
     }
 
     PHASE2_PROBE_ACTIVE.store(true, Ordering::Release);
@@ -746,6 +781,33 @@ fn run_phase2_lock_irq_probe() {
         &restored[..cpu_count],
         failures,
     );
+    let contended = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+        PHASE2_PROBE_PERF[cpu].contended.load(Ordering::Acquire)
+    });
+    let spins = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+        PHASE2_PROBE_PERF[cpu].spins.load(Ordering::Acquire)
+    });
+    let max_wait = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+        PHASE2_PROBE_PERF[cpu]
+            .max_wait_ticks
+            .load(Ordering::Acquire)
+    });
+    let max_hold = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+        PHASE2_PROBE_PERF[cpu]
+            .max_hold_ticks
+            .load(Ordering::Acquire)
+    });
+    let elapsed = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+        PHASE2_PROBE_PERF[cpu].elapsed_ticks.load(Ordering::Acquire)
+    });
+    info!(
+        "smp lock-perf: contended={:?} spins={:?} max_wait_ticks={:?} max_hold_ticks={:?} elapsed_ticks={:?}",
+        &contended[..cpu_count],
+        &spins[..cpu_count],
+        &max_wait[..cpu_count],
+        &max_hold[..cpu_count],
+        &elapsed[..cpu_count],
+    );
 }
 
 fn run_phase2_probe_on_cpu(logical_id: CpuId) {
@@ -783,9 +845,30 @@ fn run_phase2_probe_on_cpu(logical_id: CpuId) {
     while !PHASE2_PROBE_GO.load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
+    let loop_start = crate::timer::get_time();
+    let mut contended = 0usize;
+    let mut spins_total = 0usize;
+    let mut max_wait_ticks = 0usize;
+    let mut max_hold_ticks = 0usize;
     for _ in 0..PHASE2_LOCK_INCREMENTS {
-        *PHASE2_LOCK_COUNTER.lock() += 1;
+        let wait_start = crate::timer::get_time();
+        let (mut counter, spins) = PHASE2_LOCK_COUNTER.lock_counted();
+        let acquired = crate::timer::get_time();
+        *counter += 1;
+        drop(counter);
+        let released = crate::timer::get_time();
+        contended += usize::from(spins != 0);
+        spins_total = spins_total.saturating_add(spins);
+        max_wait_ticks = max_wait_ticks.max(acquired.wrapping_sub(wait_start));
+        max_hold_ticks = max_hold_ticks.max(released.wrapping_sub(acquired));
     }
+    let elapsed_ticks = crate::timer::get_time().wrapping_sub(loop_start);
+    let perf = &PHASE2_PROBE_PERF[logical_id];
+    perf.contended.store(contended, Ordering::Relaxed);
+    perf.spins.store(spins_total, Ordering::Relaxed);
+    perf.max_wait_ticks.store(max_wait_ticks, Ordering::Relaxed);
+    perf.max_hold_ticks.store(max_hold_ticks, Ordering::Relaxed);
+    perf.elapsed_ticks.store(elapsed_ticks, Ordering::Release);
     PHASE2_PROBE_DONE.insert(logical_id, Ordering::Release);
 }
 
