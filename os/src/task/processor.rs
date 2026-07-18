@@ -1,6 +1,6 @@
 use super::__switch;
 use super::fetch_task;
-use super::{ProcessControlBlock, TaskContext, TaskControlBlock};
+use super::{ProcessControlBlock, TaskContext, TaskControlBlock, TaskStatus};
 use crate::arch::hart;
 use crate::config::MAX_CPUS;
 use crate::perf;
@@ -15,7 +15,15 @@ pub struct Processor {
     // with set_current() and refresh_current_user_token(); syscall user-copy
     // fast paths depend on this being the active address space.
     current_user_token: usize,
+    pending_switch: Option<SwitchReason>,
     idle_task_cx: TaskContext,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SwitchReason {
+    Yield,
+    Block,
+    Exit,
 }
 
 impl Processor {
@@ -24,28 +32,19 @@ impl Processor {
             current: None,
             current_process: None,
             current_user_token: 0,
+            pending_switch: None,
             idle_task_cx: TaskContext::zero_init(),
         }
     }
     fn get_idle_task_cx_ptr(&mut self) -> *mut TaskContext {
         &mut self.idle_task_cx as *mut _
     }
-    pub fn take_current(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.current_process = None;
-        self.current_user_token = 0;
-        let task = self.current.take()?;
-        let mut inner = task.inner_exclusive_access();
-        assert_eq!(
-            inner.on_cpu,
-            Some(crate::cpu::current_id()),
-            "current task is owned by another CPU"
-        );
-        assert!(!inner.on_rq, "current task is also on a run queue");
-        inner.on_cpu = None;
-        drop(inner);
-        Some(task)
-    }
     pub fn set_current(&mut self, task: Arc<TaskControlBlock>) {
+        assert!(self.current.is_none(), "CPU already has a current task");
+        assert!(
+            self.pending_switch.is_none(),
+            "CPU retained a completed switch"
+        );
         let process = process_of_task(&task);
         let user_token = process.inner_exclusive_access().memory_set.token();
         self.current = Some(task);
@@ -103,6 +102,117 @@ pub(crate) fn current_processor_is_empty() -> bool {
     processor.current.is_none()
         && processor.current_process.is_none()
         && processor.current_user_token == 0
+        && processor.pending_switch.is_none()
+}
+
+pub(super) fn prepare_current_switch(
+    reason: SwitchReason,
+) -> (Arc<TaskControlBlock>, *mut TaskContext) {
+    let cpu = crate::cpu::current_id();
+    let mut processor = processor();
+    assert!(
+        processor.pending_switch.is_none(),
+        "task prepared two context switches"
+    );
+    let task = processor
+        .current
+        .as_ref()
+        .map(Arc::clone)
+        .expect("context switch requires a current task");
+    let task_cx_ptr = {
+        let mut inner = task.inner_exclusive_access();
+        assert_eq!(
+            inner.task_status,
+            TaskStatus::Running,
+            "only a Running task may prepare a switch"
+        );
+        assert_eq!(
+            inner.on_cpu,
+            Some(cpu),
+            "current task is owned by another CPU"
+        );
+        assert!(!inner.on_rq, "current task is also on a run queue");
+        assert!(!inner.wake_pending, "running task retained a wakeup");
+        if reason == SwitchReason::Block {
+            inner.task_status = TaskStatus::Blocked;
+        } else if reason == SwitchReason::Exit {
+            inner.task_status = TaskStatus::Exited;
+        }
+        &mut inner.task_cx as *mut TaskContext
+    };
+    processor.pending_switch = Some(reason);
+    (task, task_cx_ptr)
+}
+
+fn finish_current_switch() {
+    let cpu = crate::cpu::current_id();
+    let (task, reason) = {
+        let mut processor = processor();
+        let reason = processor
+            .pending_switch
+            .take()
+            .expect("idle context resumed without a pending task switch");
+        let task = processor
+            .current
+            .take()
+            .expect("pending switch lost its current task");
+        processor.current_process = None;
+        processor.current_user_token = 0;
+        (task, reason)
+    };
+
+    if reason == SwitchReason::Block {
+        // Stop runtime accounting while on_cpu still prevents a concurrent
+        // waker from publishing the task to another CPU.
+        super::charge_task_after_run(&task);
+    }
+
+    let mut enqueue = None;
+    {
+        let mut inner = task.inner_exclusive_access();
+        assert_eq!(
+            inner.on_cpu,
+            Some(cpu),
+            "switch completion observed the wrong CPU owner"
+        );
+        assert!(
+            !inner.on_rq,
+            "switching task was queued before switch completion"
+        );
+        inner.on_cpu = None;
+        match reason {
+            SwitchReason::Yield => {
+                assert_eq!(inner.task_status, TaskStatus::Running);
+                assert!(!inner.wake_pending);
+                inner.task_status = TaskStatus::Ready;
+                enqueue = Some(false);
+            }
+            SwitchReason::Block => {
+                assert_eq!(inner.task_status, TaskStatus::Blocked);
+                if inner.wake_pending {
+                    let front = inner.wake_front;
+                    inner.wake_pending = false;
+                    inner.wake_front = false;
+                    inner.task_status = TaskStatus::Ready;
+                    enqueue = Some(front);
+                }
+            }
+            SwitchReason::Exit => {
+                assert_eq!(inner.task_status, TaskStatus::Exited);
+                assert!(!inner.wake_pending);
+            }
+        }
+    }
+
+    match reason {
+        SwitchReason::Yield => super::requeue_task_after_run(task),
+        SwitchReason::Block => {
+            if let Some(front) = enqueue {
+                super::manager::enqueue_woken_task(task, front);
+            }
+        }
+        SwitchReason::Exit => super::queue_exited_task(task),
+    }
 }
 
 pub fn run_tasks() {
@@ -122,6 +232,7 @@ pub fn run_tasks() {
             unsafe {
                 __switch(idle_task_cx_ptr, next_task_cx_ptr);
             }
+            finish_current_switch();
             super::reap_exited_tasks();
         } else {
             drop(processor);
@@ -132,10 +243,6 @@ pub fn run_tasks() {
             hart::enable_interrupt_and_wait();
         }
     }
-}
-
-pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
-    processor().take_current()
 }
 
 pub fn current_task() -> Option<Arc<TaskControlBlock>> {

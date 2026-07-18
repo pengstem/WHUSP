@@ -60,8 +60,8 @@ pub use manager::{add_task, pid2process, remove_from_pid2process, wakeup_task};
 pub(crate) use manager::{wakeup_front_task, wakeup_timer_task};
 pub use processor::{
     current_kstack_bounds, current_process, current_task, current_trap_cx, current_user_token,
-    process_of_task, refresh_current_user_token, run_tasks, schedule, take_current_task,
-    trap_cx_of_task, trap_return_context_after_accounting_for_task,
+    process_of_task, refresh_current_user_token, run_tasks, schedule, trap_cx_of_task,
+    trap_return_context_after_accounting_for_task,
 };
 pub(crate) use processor::{current_processor_is_empty, processor_slot_ptr};
 pub(crate) use ptrace::{
@@ -143,43 +143,25 @@ pub fn timer_tick_should_preempt(current: &Arc<TaskControlBlock>) -> bool {
 pub fn suspend_current_and_run_next() {
     // There must be an application running.
     account_current_system_time();
-    let task = take_current_task().expect("suspend_current_and_run_next requires a current task");
-
-    // ---- access current TCB exclusively
-    let mut task_inner = task.inner_exclusive_access();
-    let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
-    // Change status to Ready
-    task_inner.task_status = TaskStatus::Ready;
-    drop(task_inner);
-    // ---- release current TCB
-
-    // push back to ready queue.
-    requeue_task_after_run(task);
-    // jump to scheduling cycle
+    let (_task, task_cx_ptr) = processor::prepare_current_switch(processor::SwitchReason::Yield);
     schedule(task_cx_ptr);
 }
 
-/// Mark the current task blocked and remove it from the processor without
-/// scheduling. The caller must either enqueue the task on a wait queue and then
-/// call `schedule`, or otherwise make it reachable for a later wakeup.
+/// Mark the current task blocked and prepare a deferred processor release
+/// without scheduling. The caller must enqueue the task on a wait queue and
+/// then call `schedule`; the idle context clears `on_cpu` after the switch.
 ///
 /// # Safety (logical)
-/// The returned `Arc` must remain alive (e.g. on a wait queue) until after
-/// `schedule(task_cx_ptr)` completes, because the pointer targets memory
-/// owned by the `TaskControlBlock`.
+/// The returned `Arc` is the wait-queue reference. The processor retains its
+/// own reference through `__switch`, so the context pointer and kernel stack
+/// remain valid until switch completion.
 pub fn block_current_task_no_schedule() -> (Arc<TaskControlBlock>, *mut TaskContext) {
     // CONTEXT: `SleepMutex::lock()` can be reached from exit-time destructors
     // while nearby PCB cleanup is in progress. CPU accounting must not turn
     // that cleanup path into a RefCell panic; skipping one sample is preferable
     // to aborting the kernel while the task is about to block.
     try_account_current_system_time();
-    let task = take_current_task().expect("block_current_task_no_schedule requires a current task");
-    charge_task_after_run(&task);
-    let mut task_inner = task.inner_exclusive_access();
-    task_inner.task_status = TaskStatus::Blocked;
-    let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
-    drop(task_inner);
-    (task, task_cx_ptr)
+    processor::prepare_current_switch(processor::SwitchReason::Block)
 }
 
 static EXITED_DIRTY: AtomicBool = AtomicBool::new(false);
@@ -753,15 +735,15 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             }
         }
     }
-    let task = take_current_task().expect("exit_current requires the current task to be scheduled");
+    let task = current_task().expect("exit_current requires the current task to be scheduled");
     let mut task_inner = task.inner_exclusive_access();
     task_inner.exit_code = Some(exit_code);
-    task_inner.task_status = TaskStatus::Exited;
     drop(task_inner);
-    // Keep the exiting task's kernel stack mapped until after the scheduler has
-    // switched to a different stack.  This also covers auto-reaped process exits
-    // where dropping the PCB below can otherwise release the main task here.
-    queue_exited_task(Arc::clone(&task));
+    let (switch_task, _task_cx_ptr) =
+        processor::prepare_current_switch(processor::SwitchReason::Exit);
+    // Processor::current now keeps the exiting task and its kernel stack alive
+    // through __switch; switch completion transfers that Arc to EXITED_TASKS.
+    drop(switch_task);
     drop(current);
     drop(task);
     drop(process);

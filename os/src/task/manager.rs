@@ -443,17 +443,35 @@ pub(super) fn should_preempt_current_on_tick(current: &Arc<TaskControlBlock>) ->
 fn wakeup_task_with_placement(task: Arc<TaskControlBlock>, front: bool) -> bool {
     let mut task_inner = task.inner_exclusive_access();
     if task_inner.task_status == TaskStatus::Blocked {
+        assert!(!task_inner.on_rq, "blocked task is still on a run queue");
+        if task_inner.on_cpu.is_some() {
+            if task_inner.wake_pending {
+                task_inner.wake_front |= front;
+                return false;
+            }
+            task_inner.wake_pending = true;
+            task_inner.wake_front = front;
+            drop(task_inner);
+            perf::record_task_wakeup(front);
+            return true;
+        }
+        assert!(!task_inner.wake_pending, "off-CPU task retained a wakeup");
         task_inner.task_status = TaskStatus::Ready;
         drop(task_inner);
-        if front {
-            TASK_MANAGER.exclusive_access().add_front(task);
-        } else {
-            add_task(task);
-        }
+        enqueue_woken_task(task, front);
         perf::record_task_wakeup(front);
         true
     } else {
         false
+    }
+}
+
+pub(super) fn enqueue_woken_task(task: Arc<TaskControlBlock>, front: bool) {
+    let mut manager = TASK_MANAGER.exclusive_access();
+    if front {
+        manager.add_front(task);
+    } else {
+        manager.add(task);
     }
 }
 

@@ -65,6 +65,11 @@ pub struct TaskControlBlockInner {
     // placement hint and diagnostic now so later per-CPU queues do not need to
     // infer ownership from TaskStatus.
     pub(crate) queued_cpu: Option<crate::cpu::CpuId>,
+    // A wakeup can race after a task publishes Blocked but before its CPU has
+    // crossed the task-to-idle context switch. The old CPU owns the only legal
+    // enqueue at that boundary, so remember the wakeup until switch completion.
+    pub(crate) wake_pending: bool,
+    pub(crate) wake_front: bool,
     // Linux-visible sleep state for cooperative wait loops that stay runnable.
     pub proc_sleeping: bool,
     pub exit_code: Option<i32>,
@@ -146,6 +151,8 @@ impl TaskControlBlock {
                     on_cpu: None,
                     on_rq: false,
                     queued_cpu: None,
+                    wake_pending: false,
+                    wake_front: false,
                     proc_sleeping: false,
                     exit_code: None,
                     linux_tid: None,
