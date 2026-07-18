@@ -9,7 +9,7 @@ pub struct TaskContext {
 }
 
 impl TaskContext {
-    pub fn zero_init() -> Self {
+    pub const fn zero_init() -> Self {
         Self {
             sp: 0,
             tp: 0,

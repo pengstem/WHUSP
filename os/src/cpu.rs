@@ -534,13 +534,15 @@ fn log_online_cpus() {
         let hardware_id = topology().hardware_id(logical_id);
         let (stack_bottom, stack_top) = crate::arch::hart::boot_stack_bounds_for(logical_id);
         info!(
-            "cpu boot: logical={} hw_id={} stack={:#x}..{:#x} state={} local={:#x}",
+            "cpu boot: logical={} hw_id={} stack={:#x}..{:#x} state={} local={:#x} processor={:#x} mmu={:#x}",
             logical_id,
             hardware_id,
             stack_bottom,
             stack_top,
             CPU_BOOT_LOCALS[logical_id].state_name(),
             &CPU_LOCALS[logical_id] as *const CpuLocal as usize,
+            crate::task::processor_slot_ptr(logical_id),
+            crate::arch::mm::fast_state_ptr(logical_id),
         );
     }
     let online = online_mask();
@@ -750,6 +752,7 @@ fn run_phase2_probe_on_cpu(logical_id: CpuId) {
     let current = current();
     if current.logical_id() != logical_id
         || current.hardware_id() != topology().hardware_id(logical_id)
+        || !crate::task::current_processor_is_empty()
     {
         PHASE2_PROBE_FAILURES.fetch_add(1, Ordering::Relaxed);
     }

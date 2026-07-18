@@ -2,6 +2,8 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use riscv::register::satp;
 
+use crate::config::MAX_CPUS;
+
 const SV39_MODE: usize = 8;
 const SATP_ASID_SHIFT: usize = 44;
 const SATP_ASID_BITS: usize = 16;
@@ -22,10 +24,36 @@ const ASID_SUPPORT_UNKNOWN: usize = 2;
 // recycled ASID.
 static NEXT_ASID: AtomicUsize = AtomicUsize::new(1);
 static ASID_SUPPORT: AtomicUsize = AtomicUsize::new(ASID_SUPPORT_UNKNOWN);
-static LAST_RETURN_USER_TOKEN: AtomicUsize = AtomicUsize::new(0);
-static LAST_ENTRY_KERNEL_TOKEN: AtomicUsize = AtomicUsize::new(0);
-static RETURN_TLB_DIRTY: AtomicBool = AtomicBool::new(true);
-static KERNEL_TLB_DIRTY: AtomicBool = AtomicBool::new(true);
+#[repr(C, align(64))]
+struct CpuMmuFastState {
+    last_return_user_token: AtomicUsize,
+    last_entry_kernel_token: AtomicUsize,
+    return_tlb_dirty: AtomicBool,
+    kernel_tlb_dirty: AtomicBool,
+}
+
+impl CpuMmuFastState {
+    const fn new() -> Self {
+        Self {
+            last_return_user_token: AtomicUsize::new(0),
+            last_entry_kernel_token: AtomicUsize::new(0),
+            return_tlb_dirty: AtomicBool::new(true),
+            kernel_tlb_dirty: AtomicBool::new(true),
+        }
+    }
+}
+
+static CPU_MMU_FAST_STATE: [CpuMmuFastState; MAX_CPUS] =
+    [const { CpuMmuFastState::new() }; MAX_CPUS];
+
+fn current_fast_state() -> &'static CpuMmuFastState {
+    &CPU_MMU_FAST_STATE[crate::cpu::current_id()]
+}
+
+pub fn fast_state_ptr(cpu: usize) -> usize {
+    assert!(cpu < MAX_CPUS, "MMU fast-state CPU exceeds MAX_CPUS");
+    &CPU_MMU_FAST_STATE[cpu] as *const CpuMmuFastState as usize
+}
 
 pub fn page_table_token_with_asid(root_ppn: usize, asid: usize) -> usize {
     SV39_MODE << 60 | ((asid & SATP_ASID_MAX) << SATP_ASID_SHIFT) | (root_ppn & SATP_PPN_MASK)
@@ -76,8 +104,11 @@ pub fn should_flush_tlb_on_return(user_token: usize) -> bool {
     if !asid_supported() {
         return true;
     }
-    let previous = LAST_RETURN_USER_TOKEN.swap(user_token, Ordering::Relaxed);
-    let dirty = RETURN_TLB_DIRTY.swap(false, Ordering::Relaxed);
+    let state = current_fast_state();
+    let previous = state
+        .last_return_user_token
+        .swap(user_token, Ordering::Relaxed);
+    let dirty = state.return_tlb_dirty.swap(false, Ordering::Relaxed);
     previous != user_token || dirty
 }
 
@@ -85,17 +116,24 @@ pub fn should_flush_tlb_on_kernel_entry(kernel_token: usize) -> bool {
     if !asid_supported() {
         return true;
     }
-    let previous = LAST_ENTRY_KERNEL_TOKEN.swap(kernel_token, Ordering::Relaxed);
-    let dirty = KERNEL_TLB_DIRTY.swap(false, Ordering::Relaxed);
+    let state = current_fast_state();
+    let previous = state
+        .last_entry_kernel_token
+        .swap(kernel_token, Ordering::Relaxed);
+    let dirty = state.kernel_tlb_dirty.swap(false, Ordering::Relaxed);
     previous != kernel_token || dirty
 }
 
 pub fn mark_kernel_tlb_dirty() {
-    KERNEL_TLB_DIRTY.store(true, Ordering::Relaxed);
+    current_fast_state()
+        .kernel_tlb_dirty
+        .store(true, Ordering::Relaxed);
 }
 
 fn mark_return_tlb_dirty() {
-    RETURN_TLB_DIRTY.store(true, Ordering::Relaxed);
+    current_fast_state()
+        .return_tlb_dirty
+        .store(true, Ordering::Relaxed);
 }
 
 fn asid_supported() -> bool {

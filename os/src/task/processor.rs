@@ -2,11 +2,11 @@ use super::__switch;
 use super::{ProcessControlBlock, TaskContext, TaskControlBlock};
 use super::{TaskStatus, fetch_task};
 use crate::arch::hart;
+use crate::config::MAX_CPUS;
 use crate::perf;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
-use lazy_static::*;
 
 pub struct Processor {
     current: Option<Arc<TaskControlBlock>>,
@@ -19,7 +19,7 @@ pub struct Processor {
 }
 
 impl Processor {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             current: None,
             current_process: None,
@@ -64,14 +64,40 @@ impl Processor {
     }
 }
 
-lazy_static! {
-    pub static ref PROCESSOR: UPIntrFreeCell<Processor> =
-        unsafe { UPIntrFreeCell::new(Processor::new()) };
+#[repr(C, align(64))]
+struct PerCpuProcessor {
+    inner: SpinNoIrqLock<Processor>,
+}
+
+impl PerCpuProcessor {
+    const fn new() -> Self {
+        Self {
+            inner: SpinNoIrqLock::new(Processor::new()),
+        }
+    }
+}
+
+static PROCESSORS: [PerCpuProcessor; MAX_CPUS] = [const { PerCpuProcessor::new() }; MAX_CPUS];
+
+fn processor() -> SpinNoIrqLockGuard<'static, Processor> {
+    PROCESSORS[crate::cpu::current_id()].inner.lock()
+}
+
+pub(crate) fn processor_slot_ptr(cpu: usize) -> usize {
+    assert!(cpu < MAX_CPUS, "processor slot CPU exceeds MAX_CPUS");
+    &PROCESSORS[cpu] as *const PerCpuProcessor as usize
+}
+
+pub(crate) fn current_processor_is_empty() -> bool {
+    let processor = processor();
+    processor.current.is_none()
+        && processor.current_process.is_none()
+        && processor.current_user_token == 0
 }
 
 pub fn run_tasks() {
     loop {
-        let mut processor = PROCESSOR.exclusive_access();
+        let mut processor = processor();
         if let Some(task) = fetch_task() {
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
             // access coming task TCB exclusively
@@ -99,41 +125,37 @@ pub fn run_tasks() {
 }
 
 pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
-    PROCESSOR.exclusive_access().take_current()
+    processor().take_current()
 }
 
 pub fn current_task() -> Option<Arc<TaskControlBlock>> {
     perf::record_task_current_call();
-    PROCESSOR.exclusive_access().current()
+    processor().current()
 }
 
 pub fn current_process() -> Arc<ProcessControlBlock> {
     perf::record_task_current_process_call();
-    PROCESSOR
-        .exclusive_access()
+    processor()
         .current_process()
         .expect("current_process requires a running task")
 }
 
 pub fn current_user_token() -> usize {
     perf::record_task_current_user_token_call();
-    PROCESSOR
-        .exclusive_access()
+    processor()
         .current_user_token()
         .expect("current_user_token requires a running task")
 }
 
 pub fn refresh_current_user_token() {
-    PROCESSOR
-        .exclusive_access()
+    processor()
         .refresh_current_user_token()
         .expect("refresh_current_user_token requires a running task");
 }
 
 pub fn current_trap_cx() -> &'static mut TrapContext {
     perf::record_task_current_trap_cx_call();
-    let trap_cx_ppn = PROCESSOR
-        .exclusive_access()
+    let trap_cx_ppn = processor()
         .current
         .as_ref()
         .map(|task| task.inner_exclusive_access().trap_cx_ppn)
@@ -194,16 +216,14 @@ pub fn trap_return_context_after_accounting_for_task(
 }
 
 pub fn current_kstack_bounds() -> (usize, usize) {
-    PROCESSOR
-        .exclusive_access()
+    processor()
         .current
         .as_ref()
         .map_or_else(hart::boot_stack_bounds, |task| task.kstack.bounds())
 }
 
 pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
-    let idle_task_cx_ptr =
-        PROCESSOR.exclusive_session(|processor| processor.get_idle_task_cx_ptr());
+    let idle_task_cx_ptr = processor().get_idle_task_cx_ptr();
     unsafe {
         __switch(switched_task_cx_ptr, idle_task_cx_ptr);
     }
