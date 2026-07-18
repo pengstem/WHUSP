@@ -361,9 +361,16 @@ pub fn trap_from_kernel(_trap_cx: &TrapContext) {
     let estat = estat::read();
     let badv = badv::read().vaddr();
     match estat.cause() {
+        Trap::Interrupt(Interrupt::IPI) => {
+            crate::arch::smp::clear_local_ipi();
+            crate::cpu::handle_phase1_ipi();
+        }
         Trap::Interrupt(Interrupt::Timer) => {
             ticlr::clear_timer_interrupt();
             set_next_trigger();
+            if crate::cpu::is_parked_secondary() {
+                return;
+            }
             // CONTEXT: A kernel-mode timer interrupt can arrive while the
             // interrupted code holds non-IRQ-safe locks such as the global
             // heap allocator. `check_timer()` may drop timer events, queue

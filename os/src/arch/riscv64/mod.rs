@@ -8,6 +8,7 @@ pub mod interrupt;
 pub mod mm;
 pub mod sbi;
 pub mod signal;
+pub mod smp;
 mod task_context;
 pub mod timer;
 pub mod trap;

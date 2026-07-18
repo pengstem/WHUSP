@@ -119,6 +119,7 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     fs::init();
     fs::list_apps();
     task::add_initproc();
+    cpu::start_parked_secondaries();
     // CONTEXT: Task-context block I/O can use the nonblocking path only after
     // the active architecture has wired device IRQ completion. The driver still
     // falls back to sync I/O when a read happens from an unsafe context such as
@@ -126,4 +127,21 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     *DEV_NON_BLOCKING_ACCESS.exclusive_access() = board::block_irq_available();
     task::run_tasks();
     panic!("Unreachable in rust_main!");
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_secondary_main(hardware_id: usize, logical_id: usize) -> ! {
+    if !cpu::secondary_mark_early(hardware_id, logical_id) {
+        crate::arch::smp::park_without_interrupts();
+    }
+    mm::activate_kernel_page_table_for_secondary();
+    trap::init();
+    crate::arch::smp::enable_local_ipi();
+    trap::enable_timer_interrupt();
+    timer::set_next_trigger();
+    crate::arch::interrupt::enable_supervisor_interrupt();
+    cpu::secondary_publish_online(logical_id);
+    loop {
+        crate::arch::hart::enable_interrupt_and_wait();
+    }
 }

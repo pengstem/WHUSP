@@ -1,9 +1,48 @@
 use crate::config::MAX_CPUS;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use fdt::Fdt;
+use log::info;
 
 pub type CpuId = usize;
+
+pub const PHASE1_IPI_ROUNDS: usize = 32;
+
+const CPU_STATE_OFFLINE: u8 = 0;
+const CPU_STATE_START_REQUESTED: u8 = 1;
+const CPU_STATE_EARLY: u8 = 2;
+const CPU_STATE_ONLINE: u8 = 3;
+const CPU_STATE_FAILED: u8 = 4;
+const STARTUP_ERROR_NONE: usize = 0;
+const STARTUP_ERROR_ID_MISMATCH: usize = 1;
+const STARTUP_ERROR_BAD_TRANSITION: usize = 2;
+const STARTUP_ERROR_TIMEOUT: usize = 3;
+
+#[repr(C, align(64))]
+struct CpuBootLocal {
+    state: AtomicU8,
+    startup_error: AtomicUsize,
+}
+
+impl CpuBootLocal {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(CPU_STATE_OFFLINE),
+            startup_error: AtomicUsize::new(STARTUP_ERROR_NONE),
+        }
+    }
+
+    fn state_name(&self) -> &'static str {
+        match self.state.load(Ordering::Acquire) {
+            CPU_STATE_OFFLINE => "offline",
+            CPU_STATE_START_REQUESTED => "start-requested",
+            CPU_STATE_EARLY => "early",
+            CPU_STATE_ONLINE => "online",
+            CPU_STATE_FAILED => "failed",
+            _ => "invalid",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuMask(u64);
@@ -213,6 +252,27 @@ static CPU_TOPOLOGY: CpuTopologyCell = CpuTopologyCell::new();
 static ONLINE_CPUS: AtomicCpuMask = AtomicCpuMask::new(CpuMask::empty());
 static BOOT_ENTRY_COUNT: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_INIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static CPU_BOOT_LOCALS: [CpuBootLocal; MAX_CPUS] = [const { CpuBootLocal::new() }; MAX_CPUS];
+
+// LoongArch secondary entry has no SBI-style opaque argument. These symbols
+// are consumed directly by entry.asm after it installs the high DMW alias.
+#[unsafe(no_mangle)]
+pub static CPU_EARLY_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[unsafe(no_mangle)]
+pub static CPU_EARLY_HW_IDS: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
+
+static PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PROBE_COMMAND_SEQ: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+static PROBE_COMMAND_DONE: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+static PROBE_COMMAND_TARGET: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+static PROBE_RECEIVE_EXPECTED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+static PROBE_RECEIVE_SEEN: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+static PROBE_SENT: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+static PROBE_RECEIVED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+static PROBE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+static PROBE_DUPLICATES: AtomicUsize = AtomicUsize::new(0);
+static PROBE_UNEXPECTED: AtomicUsize = AtomicUsize::new(0);
 
 pub fn record_boot_entry() {
     let count = BOOT_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -240,6 +300,10 @@ pub fn global_init_count() -> usize {
 
 pub fn init_from_dtb(fdt: &Fdt<'_>, boot_hw_id: usize) {
     let topology = CpuTopology::discover(fdt, boot_hw_id);
+    for (logical_id, hardware_id) in topology.hardware_ids().iter().copied().enumerate() {
+        CPU_EARLY_HW_IDS[logical_id].store(hardware_id, Ordering::Relaxed);
+    }
+    CPU_EARLY_COUNT.store(topology.possible_count(), Ordering::Release);
     CPU_TOPOLOGY.init(topology);
     // Phase 0 deliberately leaves application processors parked in firmware.
     // The actual boot CPU is normalized to logical CPU 0.
@@ -252,4 +316,277 @@ pub fn topology() -> &'static CpuTopology {
 
 pub fn online_mask() -> CpuMask {
     ONLINE_CPUS.load(Ordering::Acquire)
+}
+
+pub fn secondary_mark_early(hardware_id: usize, logical_id: CpuId) -> bool {
+    let possible = CPU_EARLY_COUNT.load(Ordering::Acquire);
+    if logical_id >= possible || CPU_EARLY_HW_IDS[logical_id].load(Ordering::Relaxed) != hardware_id
+    {
+        if logical_id < MAX_CPUS {
+            CPU_BOOT_LOCALS[logical_id]
+                .startup_error
+                .store(STARTUP_ERROR_ID_MISMATCH, Ordering::Relaxed);
+            CPU_BOOT_LOCALS[logical_id]
+                .state
+                .store(CPU_STATE_FAILED, Ordering::Release);
+        }
+        return false;
+    }
+    if CPU_BOOT_LOCALS[logical_id]
+        .state
+        .compare_exchange(
+            CPU_STATE_START_REQUESTED,
+            CPU_STATE_EARLY,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        CPU_BOOT_LOCALS[logical_id]
+            .startup_error
+            .store(STARTUP_ERROR_BAD_TRANSITION, Ordering::Relaxed);
+        CPU_BOOT_LOCALS[logical_id]
+            .state
+            .store(CPU_STATE_FAILED, Ordering::Release);
+        return false;
+    }
+    true
+}
+
+pub fn secondary_publish_online(logical_id: CpuId) {
+    assert_eq!(
+        CPU_BOOT_LOCALS[logical_id].state.load(Ordering::Acquire),
+        CPU_STATE_EARLY,
+        "secondary CPU published online from the wrong state"
+    );
+    CPU_BOOT_LOCALS[logical_id]
+        .state
+        .store(CPU_STATE_ONLINE, Ordering::Release);
+    ONLINE_CPUS.insert(logical_id, Ordering::Release);
+}
+
+pub fn is_parked_secondary() -> bool {
+    crate::arch::hart::current_boot_stack_cpu().is_some_and(|cpu| cpu != 0)
+}
+
+pub fn start_parked_secondaries() {
+    let topology = topology();
+    CPU_BOOT_LOCALS[0]
+        .state
+        .store(CPU_STATE_ONLINE, Ordering::Release);
+
+    if topology.possible_count() > 1 {
+        crate::arch::smp::validate_startup_extensions()
+            .unwrap_or_else(|reason| panic!("SMP startup transport unavailable: {reason}"));
+        for logical_id in 1..topology.possible_count() {
+            let local = &CPU_BOOT_LOCALS[logical_id];
+            local
+                .state
+                .store(CPU_STATE_START_REQUESTED, Ordering::Release);
+            let hardware_id = topology.hardware_id(logical_id);
+            if let Err(error) = crate::arch::smp::start_secondary(logical_id, hardware_id) {
+                local.startup_error.store(error, Ordering::Relaxed);
+                local.state.store(CPU_STATE_FAILED, Ordering::Release);
+                panic!(
+                    "failed to start logical CPU {logical_id} hardware CPU {hardware_id}: {error:#x}"
+                );
+            }
+        }
+        wait_for_online_barrier();
+    }
+
+    log_online_cpus();
+    crate::arch::smp::enable_local_ipi();
+    crate::arch::interrupt::enable_supervisor_interrupt();
+    if topology.possible_count() > 1 {
+        run_phase1_ipi_probe();
+    }
+}
+
+fn wait_for_online_barrier() {
+    let expected = topology().possible_mask();
+    let start = crate::timer::get_time();
+    let timeout = crate::config::clock_freq().saturating_mul(2);
+    loop {
+        let observed = online_mask();
+        if observed == expected {
+            return;
+        }
+        for logical_id in 1..topology().possible_count() {
+            if CPU_BOOT_LOCALS[logical_id].state.load(Ordering::Acquire) == CPU_STATE_FAILED {
+                let error = CPU_BOOT_LOCALS[logical_id]
+                    .startup_error
+                    .load(Ordering::Relaxed);
+                panic!("logical CPU {logical_id} failed during early startup: {error:#x}");
+            }
+        }
+        if crate::timer::get_time().wrapping_sub(start) >= timeout {
+            for logical_id in 1..topology().possible_count() {
+                if !observed.contains(logical_id) {
+                    CPU_BOOT_LOCALS[logical_id]
+                        .startup_error
+                        .store(STARTUP_ERROR_TIMEOUT, Ordering::Relaxed);
+                    CPU_BOOT_LOCALS[logical_id]
+                        .state
+                        .store(CPU_STATE_FAILED, Ordering::Release);
+                }
+            }
+            panic!(
+                "SMP online barrier timeout: expected={:#x} observed={:#x}",
+                expected.bits(),
+                observed.bits()
+            );
+        }
+        core::hint::spin_loop();
+    }
+}
+
+fn log_online_cpus() {
+    for logical_id in 0..topology().possible_count() {
+        let hardware_id = topology().hardware_id(logical_id);
+        let (stack_bottom, stack_top) = crate::arch::hart::boot_stack_bounds_for(logical_id);
+        info!(
+            "cpu boot: logical={} hw_id={} stack={:#x}..{:#x} state={}",
+            logical_id,
+            hardware_id,
+            stack_bottom,
+            stack_top,
+            CPU_BOOT_LOCALS[logical_id].state_name(),
+        );
+    }
+    let online = online_mask();
+    info!(
+        "smp online: mask={:#x} count={}",
+        online.bits(),
+        online.count()
+    );
+}
+
+fn reset_phase1_ipi_probe() {
+    for logical_id in 0..topology().possible_count() {
+        PROBE_COMMAND_SEQ[logical_id].store(0, Ordering::Relaxed);
+        PROBE_COMMAND_DONE[logical_id].store(0, Ordering::Relaxed);
+        PROBE_COMMAND_TARGET[logical_id].store(0, Ordering::Relaxed);
+        PROBE_RECEIVE_EXPECTED[logical_id].store(0, Ordering::Relaxed);
+        PROBE_RECEIVE_SEEN[logical_id].store(0, Ordering::Relaxed);
+        PROBE_SENT[logical_id].store(0, Ordering::Relaxed);
+        PROBE_RECEIVED[logical_id].store(0, Ordering::Relaxed);
+    }
+    PROBE_FAILURES.store(0, Ordering::Relaxed);
+    PROBE_DUPLICATES.store(0, Ordering::Relaxed);
+    PROBE_UNEXPECTED.store(0, Ordering::Relaxed);
+}
+
+fn run_phase1_ipi_probe() {
+    reset_phase1_ipi_probe();
+    PROBE_ACTIVE.store(true, Ordering::Release);
+    let cpu_count = topology().possible_count();
+    let mut sequence = 0usize;
+
+    for _round in 0..PHASE1_IPI_ROUNDS {
+        for sender in 0..cpu_count {
+            for target in 0..cpu_count {
+                if sender == target {
+                    continue;
+                }
+                sequence += 1;
+                PROBE_RECEIVE_EXPECTED[target].store(sequence, Ordering::Release);
+                if sender == 0 {
+                    send_probe_ipi(sender, target)
+                        .unwrap_or_else(|error| panic!("boot IPI send failed: {error:#x}"));
+                } else {
+                    PROBE_COMMAND_TARGET[sender].store(target, Ordering::Relaxed);
+                    PROBE_COMMAND_SEQ[sender].store(sequence, Ordering::Release);
+                    crate::arch::smp::send_ipi(sender).unwrap_or_else(|error| {
+                        panic!("IPI command send to logical CPU {sender} failed: {error:#x}")
+                    });
+                    wait_for_probe_value(&PROBE_COMMAND_DONE[sender], sequence, "command");
+                }
+                wait_for_probe_value(&PROBE_RECEIVE_SEEN[target], sequence, "receive");
+            }
+        }
+    }
+
+    PROBE_ACTIVE.store(false, Ordering::Release);
+    let expected_per_cpu = PHASE1_IPI_ROUNDS * (cpu_count - 1);
+    let sent =
+        core::array::from_fn::<_, MAX_CPUS, _>(|cpu| PROBE_SENT[cpu].load(Ordering::Acquire));
+    let received =
+        core::array::from_fn::<_, MAX_CPUS, _>(|cpu| PROBE_RECEIVED[cpu].load(Ordering::Acquire));
+    for logical_id in 0..cpu_count {
+        assert_eq!(
+            sent[logical_id], expected_per_cpu,
+            "Phase 1 IPI sent count mismatch on CPU {logical_id}"
+        );
+        assert_eq!(
+            received[logical_id], expected_per_cpu,
+            "Phase 1 IPI receive count mismatch on CPU {logical_id}"
+        );
+    }
+    let failures = PROBE_FAILURES.load(Ordering::Acquire);
+    let duplicates = PROBE_DUPLICATES.load(Ordering::Acquire);
+    let unexpected = PROBE_UNEXPECTED.load(Ordering::Acquire);
+    assert_eq!(failures, 0, "Phase 1 IPI transport failure");
+    assert_eq!(duplicates, 0, "Phase 1 duplicate IPI delivery");
+    assert_eq!(unexpected, 0, "Phase 1 unexpected IPI delivery");
+    info!(
+        "smp boot-ipi: rounds={} cpus={} expected_per_cpu={} sent={:?} received={:?} failures={} duplicates={} unexpected={}",
+        PHASE1_IPI_ROUNDS,
+        cpu_count,
+        expected_per_cpu,
+        &sent[..cpu_count],
+        &received[..cpu_count],
+        failures,
+        duplicates,
+        unexpected,
+    );
+}
+
+fn send_probe_ipi(sender: CpuId, target: CpuId) -> Result<(), usize> {
+    match crate::arch::smp::send_ipi(target) {
+        Ok(()) => {
+            PROBE_SENT[sender].fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(error) => {
+            PROBE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            Err(error)
+        }
+    }
+}
+
+fn wait_for_probe_value(value: &AtomicUsize, expected: usize, what: &str) {
+    let start = crate::timer::get_time();
+    let timeout = (crate::config::clock_freq() / 4).max(1);
+    while value.load(Ordering::Acquire) != expected {
+        if crate::timer::get_time().wrapping_sub(start) >= timeout {
+            panic!("Phase 1 IPI {what} timeout waiting for sequence {expected}");
+        }
+        core::hint::spin_loop();
+    }
+}
+
+pub fn handle_phase1_ipi() {
+    if !PROBE_ACTIVE.load(Ordering::Acquire) {
+        PROBE_UNEXPECTED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let logical_id = crate::arch::hart::current_boot_stack_cpu().unwrap_or(0);
+    let command = PROBE_COMMAND_SEQ[logical_id].load(Ordering::Acquire);
+    if command != PROBE_COMMAND_DONE[logical_id].load(Ordering::Relaxed) {
+        let target = PROBE_COMMAND_TARGET[logical_id].load(Ordering::Relaxed);
+        let _ = send_probe_ipi(logical_id, target);
+        PROBE_COMMAND_DONE[logical_id].store(command, Ordering::Release);
+        return;
+    }
+
+    let expected = PROBE_RECEIVE_EXPECTED[logical_id].load(Ordering::Acquire);
+    let previous = PROBE_RECEIVE_SEEN[logical_id].swap(expected, Ordering::AcqRel);
+    if expected == 0 {
+        PROBE_UNEXPECTED.fetch_add(1, Ordering::Relaxed);
+    } else if previous == expected {
+        PROBE_DUPLICATES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PROBE_RECEIVED[logical_id].fetch_add(1, Ordering::Relaxed);
+    }
 }

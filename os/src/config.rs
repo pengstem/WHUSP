@@ -10,6 +10,7 @@ pub const KERNEL_STACK_SIZE: usize = 4096 * 10;
 /// Maximum number of logical CPUs supported by the current contest machine.
 /// Keep the QEMU SMP guards in the root and kernel Makefiles synchronized.
 pub const MAX_CPUS: usize = 8;
+pub const BOOT_STACK_SIZE: usize = 4096 * 16;
 
 pub const KERNEL_HEAP_SIZE: usize = 0x800_0000;
 

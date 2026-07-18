@@ -10,6 +10,8 @@ pub mod page_table;
 pub(crate) mod shm;
 mod user_space;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 pub use address::VPNRange;
 pub use address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
 pub use area::{MapArea, MapPermission, MapType, MmapFlush};
@@ -24,8 +26,23 @@ pub use page_table::{PageTable, PageTableEntry, UserBuffer};
 pub(crate) use user_space::FutexSharedKey;
 pub use user_space::{MemoryProtectError, MmapFaultAccess, MmapFaultResult};
 
+static PUBLISHED_KERNEL_TOKEN: AtomicUsize = AtomicUsize::new(0);
+
 pub fn init() {
     heap_allocator::init_heap();
     frame_allocator::init_frame_allocator();
-    KERNEL_SPACE.exclusive_access().activate();
+    let kernel_space = KERNEL_SPACE.exclusive_access();
+    kernel_space.activate();
+    let token = kernel_space.token();
+    drop(kernel_space);
+    PUBLISHED_KERNEL_TOKEN.store(token, Ordering::Release);
+}
+
+pub fn activate_kernel_page_table_for_secondary() {
+    let token = PUBLISHED_KERNEL_TOKEN.load(Ordering::Acquire);
+    assert_ne!(
+        token, 0,
+        "kernel page table was not published before CPU start"
+    );
+    crate::arch::mm::activate_page_table(token);
 }
