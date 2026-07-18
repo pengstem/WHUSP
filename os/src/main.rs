@@ -142,6 +142,7 @@ pub extern "C" fn rust_secondary_main(hardware_id: usize, logical_id: usize) -> 
     crate::arch::interrupt::enable_supervisor_interrupt();
     cpu::secondary_publish_online(logical_id);
     loop {
+        cpu::run_pending_parked_probe(logical_id);
         crate::arch::hart::enable_interrupt_and_wait();
     }
 }

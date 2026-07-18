@@ -1,7 +1,6 @@
-use crate::arch::interrupt;
-use core::cell::{RefCell, RefMut, UnsafeCell};
+use super::LocalIrqGuard;
+use core::cell::{RefCell, RefMut};
 use core::ops::{Deref, DerefMut};
-use lazy_static::*;
 
 /*
 /// Wrap a static data structure inside it so that we are
@@ -33,63 +32,11 @@ impl<T> UPSafeCell<T> {
 }
 */
 
-pub struct UPSafeCellRaw<T> {
-    inner: UnsafeCell<T>,
-}
-
-unsafe impl<T> Sync for UPSafeCellRaw<T> {}
-
-impl<T> UPSafeCellRaw<T> {
-    pub unsafe fn new(value: T) -> Self {
-        Self {
-            inner: UnsafeCell::new(value),
-        }
-    }
-    fn with_mut<F, V>(&self, f: F) -> V
-    where
-        F: FnOnce(&mut T) -> V,
-    {
-        // SAFETY: this raw cell is used only for the interrupt-masking
-        // recursion counter on the current uniprocessor kernel path.
-        unsafe { f(&mut *self.inner.get()) }
-    }
-}
-
-pub struct IntrMaskingInfo {
-    nested_level: usize,
-    sie_before_masking: bool,
-}
-
-lazy_static! {
-    static ref INTR_MASKING_INFO: UPSafeCellRaw<IntrMaskingInfo> =
-        unsafe { UPSafeCellRaw::new(IntrMaskingInfo::new()) };
-}
-
-impl IntrMaskingInfo {
-    pub fn new() -> Self {
-        Self {
-            nested_level: 0,
-            sie_before_masking: false,
-        }
-    }
-
-    pub fn enter(&mut self) {
-        let sie = interrupt::supervisor_interrupt_enabled();
-        interrupt::disable_supervisor_interrupt();
-        if self.nested_level == 0 {
-            self.sie_before_masking = sie;
-        }
-        self.nested_level += 1;
-    }
-
-    pub fn exit(&mut self) {
-        self.nested_level -= 1;
-        if self.nested_level == 0 && self.sie_before_masking {
-            interrupt::enable_supervisor_interrupt();
-        }
-    }
-}
-
+/// Legacy CPU-local cell used while scheduler-owned objects are migrated.
+///
+/// Local interrupt masking prevents re-entry on one CPU, but does not provide
+/// mutual exclusion between CPUs. Do not place data reachable by multiple CPUs
+/// behind this type; use SpinLock or SpinNoIrqLock instead.
 pub struct UPIntrFreeCell<T> {
     /// inner data
     inner: RefCell<T>,
@@ -97,7 +44,10 @@ pub struct UPIntrFreeCell<T> {
 
 unsafe impl<T> Sync for UPIntrFreeCell<T> {}
 
-pub struct UPIntrRefMut<'a, T>(Option<RefMut<'a, T>>);
+pub struct UPIntrRefMut<'a, T> {
+    inner: Option<RefMut<'a, T>>,
+    _irq: LocalIrqGuard,
+}
 
 impl<T> UPIntrFreeCell<T> {
     pub unsafe fn new(value: T) -> Self {
@@ -108,18 +58,21 @@ impl<T> UPIntrFreeCell<T> {
 
     /// Panic if the data has been borrowed.
     pub fn exclusive_access(&self) -> UPIntrRefMut<'_, T> {
-        INTR_MASKING_INFO.with_mut(IntrMaskingInfo::enter);
-        UPIntrRefMut(Some(self.inner.borrow_mut()))
+        let irq = LocalIrqGuard::disable();
+        UPIntrRefMut {
+            inner: Some(self.inner.borrow_mut()),
+            _irq: irq,
+        }
     }
 
     pub fn try_exclusive_access(&self) -> Option<UPIntrRefMut<'_, T>> {
-        INTR_MASKING_INFO.with_mut(IntrMaskingInfo::enter);
+        let irq = LocalIrqGuard::disable();
         match self.inner.try_borrow_mut() {
-            Ok(inner) => Some(UPIntrRefMut(Some(inner))),
-            Err(_) => {
-                INTR_MASKING_INFO.with_mut(IntrMaskingInfo::exit);
-                None
-            }
+            Ok(inner) => Some(UPIntrRefMut {
+                inner: Some(inner),
+                _irq: irq,
+            }),
+            Err(_) => None,
         }
     }
 
@@ -134,19 +87,18 @@ impl<T> UPIntrFreeCell<T> {
 
 impl<'a, T> Drop for UPIntrRefMut<'a, T> {
     fn drop(&mut self) {
-        self.0 = None;
-        INTR_MASKING_INFO.with_mut(IntrMaskingInfo::exit);
+        self.inner = None;
     }
 }
 
 impl<'a, T> Deref for UPIntrRefMut<'a, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref().unwrap().deref()
+        self.inner.as_ref().unwrap().deref()
     }
 }
 impl<'a, T> DerefMut for UPIntrRefMut<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_mut().unwrap().deref_mut()
+        self.inner.as_mut().unwrap().deref_mut()
     }
 }

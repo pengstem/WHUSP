@@ -1,4 +1,5 @@
 use crate::config::MAX_CPUS;
+use crate::sync::{LocalIrqGuard, SpinLock};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use fdt::Fdt;
@@ -7,6 +8,7 @@ use log::info;
 pub type CpuId = usize;
 
 pub const PHASE1_IPI_ROUNDS: usize = 32;
+pub const PHASE2_LOCK_INCREMENTS: usize = 4096;
 
 const CPU_STATE_OFFLINE: u8 = 0;
 const CPU_STATE_START_REQUESTED: u8 = 1;
@@ -274,6 +276,14 @@ static PROBE_FAILURES: AtomicUsize = AtomicUsize::new(0);
 static PROBE_DUPLICATES: AtomicUsize = AtomicUsize::new(0);
 static PROBE_UNEXPECTED: AtomicUsize = AtomicUsize::new(0);
 
+static PHASE2_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PHASE2_PROBE_GO: AtomicBool = AtomicBool::new(false);
+static PHASE2_PROBE_PENDING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+static PHASE2_PROBE_DONE: AtomicCpuMask = AtomicCpuMask::new(CpuMask::empty());
+static PHASE2_LOCK_COUNTER: SpinLock<usize> = SpinLock::new(0);
+static PHASE2_IRQ_RESTORED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+static PHASE2_PROBE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
 pub fn record_boot_entry() {
     let count = BOOT_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     assert_eq!(
@@ -401,6 +411,7 @@ pub fn start_parked_secondaries() {
     if topology.possible_count() > 1 {
         run_phase1_ipi_probe();
     }
+    run_phase2_lock_irq_probe();
 }
 
 fn wait_for_online_barrier() {
@@ -567,6 +578,11 @@ fn wait_for_probe_value(value: &AtomicUsize, expected: usize, what: &str) {
 }
 
 pub fn handle_phase1_ipi() {
+    if PHASE2_PROBE_ACTIVE.load(Ordering::Acquire) {
+        let logical_id = crate::arch::hart::current_boot_stack_cpu().unwrap_or(0);
+        PHASE2_PROBE_PENDING[logical_id].store(true, Ordering::Release);
+        return;
+    }
     if !PROBE_ACTIVE.load(Ordering::Acquire) {
         PROBE_UNEXPECTED.fetch_add(1, Ordering::Relaxed);
         return;
@@ -588,5 +604,108 @@ pub fn handle_phase1_ipi() {
         PROBE_DUPLICATES.fetch_add(1, Ordering::Relaxed);
     } else {
         PROBE_RECEIVED[logical_id].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn run_phase2_lock_irq_probe() {
+    let cpu_count = topology().possible_count();
+    *PHASE2_LOCK_COUNTER.lock() = 0;
+    PHASE2_PROBE_DONE.store(CpuMask::empty(), Ordering::Relaxed);
+    PHASE2_PROBE_FAILURES.store(0, Ordering::Relaxed);
+    PHASE2_PROBE_GO.store(false, Ordering::Relaxed);
+    for logical_id in 0..cpu_count {
+        PHASE2_PROBE_PENDING[logical_id].store(false, Ordering::Relaxed);
+        PHASE2_IRQ_RESTORED[logical_id].store(false, Ordering::Relaxed);
+    }
+
+    PHASE2_PROBE_ACTIVE.store(true, Ordering::Release);
+    for logical_id in 1..cpu_count {
+        crate::arch::smp::send_ipi(logical_id).unwrap_or_else(|error| {
+            panic!("Phase 2 probe IPI to logical CPU {logical_id} failed: {error:#x}")
+        });
+    }
+    PHASE2_PROBE_GO.store(true, Ordering::Release);
+    run_phase2_probe_on_cpu(0);
+
+    let expected_mask = CpuMask::first(cpu_count);
+    let start = crate::timer::get_time();
+    let timeout = crate::config::clock_freq().saturating_mul(2);
+    while PHASE2_PROBE_DONE.load(Ordering::Acquire) != expected_mask {
+        if crate::timer::get_time().wrapping_sub(start) >= timeout {
+            panic!(
+                "Phase 2 lock/IRQ probe timeout: expected={:#x} observed={:#x}",
+                expected_mask.bits(),
+                PHASE2_PROBE_DONE.load(Ordering::Acquire).bits()
+            );
+        }
+        core::hint::spin_loop();
+    }
+    PHASE2_PROBE_ACTIVE.store(false, Ordering::Release);
+
+    let total = *PHASE2_LOCK_COUNTER.lock();
+    let expected_total = PHASE2_LOCK_INCREMENTS * cpu_count;
+    assert_eq!(
+        total, expected_total,
+        "Phase 2 shared spin-lock count mismatch"
+    );
+    let restored = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+        PHASE2_IRQ_RESTORED[cpu].load(Ordering::Acquire)
+    });
+    assert!(
+        restored[..cpu_count].iter().all(|value| *value),
+        "Phase 2 local IRQ nesting/restore mismatch"
+    );
+    let failures = PHASE2_PROBE_FAILURES.load(Ordering::Acquire);
+    assert_eq!(failures, 0, "Phase 2 lock/IRQ invariant failure");
+    info!(
+        "smp lock-irq: increments_per_cpu={} cpus={} total={} expected={} irq_restored={:?} failures={}",
+        PHASE2_LOCK_INCREMENTS,
+        cpu_count,
+        total,
+        expected_total,
+        &restored[..cpu_count],
+        failures,
+    );
+}
+
+fn run_phase2_probe_on_cpu(logical_id: CpuId) {
+    if !crate::arch::interrupt::supervisor_interrupt_enabled() {
+        PHASE2_PROBE_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+    {
+        let outer = LocalIrqGuard::disable();
+        if !outer.was_enabled() || crate::arch::interrupt::supervisor_interrupt_enabled() {
+            PHASE2_PROBE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
+        {
+            let inner = LocalIrqGuard::disable();
+            if inner.was_enabled() || crate::arch::interrupt::supervisor_interrupt_enabled() {
+                PHASE2_PROBE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if crate::arch::interrupt::supervisor_interrupt_enabled() {
+            PHASE2_PROBE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let restored = crate::arch::interrupt::supervisor_interrupt_enabled();
+    PHASE2_IRQ_RESTORED[logical_id].store(restored, Ordering::Release);
+    if !restored {
+        PHASE2_PROBE_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    while !PHASE2_PROBE_GO.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    for _ in 0..PHASE2_LOCK_INCREMENTS {
+        *PHASE2_LOCK_COUNTER.lock() += 1;
+    }
+    PHASE2_PROBE_DONE.insert(logical_id, Ordering::Release);
+}
+
+/// Runs boot-only work from a parked secondary's normal kernel context.
+/// IPI handlers only publish the command, keeping long probes out of IRQ context.
+pub fn run_pending_parked_probe(logical_id: CpuId) {
+    if PHASE2_PROBE_PENDING[logical_id].swap(false, Ordering::AcqRel) {
+        run_phase2_probe_on_cpu(logical_id);
     }
 }
