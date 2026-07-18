@@ -457,9 +457,10 @@ fn discover_pci_blocks(config: &mut BoardConfig, pci_node: FdtNode<'_, '_>) {
     }
 }
 
-pub fn init_from_dtb(dtb_addr: usize) {
+pub fn init_from_dtb(dtb_addr: usize, boot_hw_id: usize) {
     let fdt = unsafe { Fdt::from_ptr(dtb_addr as *const u8) }
         .unwrap_or_else(|err| panic!("failed to parse DTB at {:#x}: {:?}", dtb_addr, err));
+    crate::cpu::init_from_dtb(&fdt, boot_hw_id);
 
     let mut config = BoardConfig::empty();
     config.clock_freq = cpu_timer_frequency(&fdt);

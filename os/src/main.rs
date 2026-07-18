@@ -14,6 +14,7 @@ use log::*;
 mod console;
 mod arch;
 mod config;
+mod cpu;
 mod drivers;
 mod fs;
 mod lang_items;
@@ -58,7 +59,7 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     clear_bss();
     BOOT_HART_ID.store(hart_id, Ordering::Relaxed);
     DTB_ADDR.store(dtb_addr, Ordering::Relaxed);
-    board::init_from_dtb(dtb_addr);
+    board::init_from_dtb(dtb_addr, hart_id);
     mm::init();
     timer::init_wall_clock();
     UART.init();
@@ -70,6 +71,17 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
         board::memory_end(),
         board::uart_base(),
         board::plic_base(),
+    );
+    let topology = cpu::topology();
+    let online = cpu::online_mask();
+    info!(
+        "cpu topology: possible={} online={} possible_mask={:#x} online_mask={:#x} boot_logical=0 boot_hw_id={} hw_ids={:?}",
+        topology.possible_count(),
+        online.count(),
+        topology.possible_mask().bits(),
+        online.bits(),
+        topology.boot_hw_id(),
+        topology.hardware_ids(),
     );
 
     // CONTEXT: Headless contest QEMU may omit these optional devices, but

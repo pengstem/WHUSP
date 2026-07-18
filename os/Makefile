@@ -19,6 +19,7 @@ MODE_ARG := $(if $(filter release,$(MODE)),--release)
 PERF_FEATURE_ARG := $(if $(filter 1 yes true on,$(PERF_COUNTERS)),--features perf-counters)
 MEM ?= 1G
 SMP ?= 1
+MAX_CPUS := 8
 TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 KERNEL_ELF := $(TARGET_DIR)/$(TARGET)/$(MODE)/os
 PRIMARY_DISK ?= $(DEFAULT_DISK)
@@ -41,7 +42,14 @@ kernel:
 run: kernel
 	@$(MAKE) --no-print-directory run-inner
 
-run-inner:
+check-smp:
+	@case "$(SMP)" in ''|*[!0-9]*) echo "SMP must be an integer in 1..$(MAX_CPUS): $(SMP)"; exit 1;; esac
+	@if [ "$(SMP)" -lt 1 ] || [ "$(SMP)" -gt "$(MAX_CPUS)" ]; then \
+		echo "SMP must be in 1..$(MAX_CPUS): $(SMP)"; \
+		exit 1; \
+	fi
+
+run-inner: check-smp
 	@if [ ! -f "$(PRIMARY_DISK)" ]; then \
 		echo "PRIMARY_DISK does not exist: $(PRIMARY_DISK)"; \
 		exit 1; \
@@ -77,4 +85,4 @@ clean:
 	@cargo clean
 	@rm -f src/linker.ld
 
-.PHONY: prepare-cargo-config kernel run run-inner fmt clean
+.PHONY: prepare-cargo-config kernel run check-smp run-inner fmt clean
