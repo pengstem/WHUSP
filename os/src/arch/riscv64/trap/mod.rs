@@ -190,9 +190,15 @@ pub fn trap_handler() -> ! {
             }
             current_add_signal(SignalFlags::SIGILL);
         }
+        Trap::Interrupt(Interrupt::SupervisorSoft) => {
+            crate::arch::smp::clear_local_ipi();
+            crate::cpu::handle_ipi();
+        }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             set_next_trigger();
-            check_timer();
+            if crate::cpu::current_id() == 0 {
+                check_timer();
+            }
             if timer_tick_should_preempt(&task) {
                 suspend_current_and_run_next();
             }
@@ -399,7 +405,7 @@ pub fn trap_from_kernel(_trap_cx: &TrapContext) {
     match scause.cause() {
         Trap::Interrupt(Interrupt::SupervisorSoft) => {
             crate::arch::smp::clear_local_ipi();
-            crate::cpu::handle_phase1_ipi();
+            crate::cpu::handle_ipi();
         }
         Trap::Interrupt(Interrupt::SupervisorExternal) => {
             crate::board::irq_handler();
@@ -415,7 +421,7 @@ pub fn trap_from_kernel(_trap_cx: &TrapContext) {
             // signals, and wake tasks, all of which can allocate/free memory;
             // only do that work from the idle loop, where no task kernel code
             // was interrupted and sleeping tasks still need timer wakeups.
-            if current_task().is_none() {
+            if crate::cpu::current_id() == 0 && current_task().is_none() {
                 check_timer();
             }
         }

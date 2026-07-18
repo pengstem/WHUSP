@@ -464,10 +464,12 @@ lazy_static! {
 
 pub fn add_task(task: Arc<TaskControlBlock>) {
     TASK_MANAGER.exclusive_access().add(task);
+    crate::cpu::wake_scheduler_cpus();
 }
 
 pub(crate) fn requeue_task_after_run(task: Arc<TaskControlBlock>) {
     TASK_MANAGER.exclusive_access().requeue_after_run(task);
+    crate::cpu::wake_scheduler_cpus();
 }
 
 pub(super) fn charge_task_after_run(task: &TaskControlBlock) {
@@ -513,6 +515,8 @@ pub(super) fn enqueue_woken_task(task: Arc<TaskControlBlock>, front: bool) {
     } else {
         manager.add(task);
     }
+    drop(manager);
+    crate::cpu::wake_scheduler_cpus();
 }
 
 pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
@@ -550,6 +554,7 @@ pub(crate) fn reprioritize_ready_task(task: Arc<TaskControlBlock>) {
     TASK_MANAGER
         .exclusive_access()
         .reprioritize_ready_task(task);
+    crate::cpu::wake_scheduler_cpus();
 }
 
 pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {

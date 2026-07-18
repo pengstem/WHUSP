@@ -7,6 +7,7 @@ use crate::perf;
 use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 pub struct Processor {
     current: Option<Arc<TaskControlBlock>>,
@@ -87,6 +88,7 @@ impl PerCpuProcessor {
 }
 
 static PROCESSORS: [PerCpuProcessor; MAX_CPUS] = [const { PerCpuProcessor::new() }; MAX_CPUS];
+static PROCESSOR_IDLE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
 fn processor() -> SpinNoIrqLockGuard<'static, Processor> {
     PROCESSORS[crate::cpu::current_id()].inner.lock()
@@ -103,6 +105,10 @@ pub(crate) fn current_processor_is_empty() -> bool {
         && processor.current_process.is_none()
         && processor.current_user_token == 0
         && processor.pending_switch.is_none()
+}
+
+pub(crate) fn processor_is_idle(cpu: usize) -> bool {
+    PROCESSOR_IDLE[cpu].load(Ordering::Acquire)
 }
 
 pub(super) fn prepare_current_switch(
@@ -218,7 +224,7 @@ fn finish_current_switch() {
     }
 }
 
-pub fn run_tasks() {
+pub fn run_tasks() -> ! {
     loop {
         let mut processor = processor();
         if let Some(task) = fetch_task() {
@@ -239,11 +245,20 @@ pub fn run_tasks() {
             super::reap_exited_tasks();
         } else {
             drop(processor);
+            let cpu = crate::cpu::current_id();
+            PROCESSOR_IDLE[cpu].store(true, Ordering::Release);
+            // Pair idle publication with enqueue's pending-before-IPI order.
+            // If work arrived just before publication, do not cross into WFI.
+            if crate::cpu::take_scheduler_wake(cpu) {
+                PROCESSOR_IDLE[cpu].store(false, Ordering::Release);
+                continue;
+            }
             #[cfg(target_arch = "loongarch64")]
             // CONTEXT: LA UART IRQ dispatch is not wired yet. Poll the console
             // while idle so stdin poll/select waiters can be woken by typed data.
             crate::fs::console_tty_drain_uart();
             hart::enable_interrupt_and_wait();
+            PROCESSOR_IDLE[cpu].store(false, Ordering::Release);
         }
     }
 }

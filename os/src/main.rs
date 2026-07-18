@@ -121,13 +121,13 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     fs::list_apps();
     task::add_initproc();
     cpu::start_parked_secondaries();
+    cpu::activate_scheduler_aps();
     // CONTEXT: Task-context block I/O can use the nonblocking path only after
     // the active architecture has wired device IRQ completion. The driver still
     // falls back to sync I/O when a read happens from an unsafe context such as
     // interrupt-disabled lazy fault-in.
     *DEV_NON_BLOCKING_ACCESS.exclusive_access() = board::block_irq_available();
-    task::run_tasks();
-    panic!("Unreachable in rust_main!");
+    task::run_tasks()
 }
 
 #[unsafe(no_mangle)]
@@ -143,8 +143,9 @@ pub extern "C" fn rust_secondary_main(hardware_id: usize, logical_id: usize) -> 
     timer::set_next_trigger();
     crate::arch::interrupt::enable_supervisor_interrupt();
     cpu::secondary_publish_online(logical_id);
-    loop {
+    while !cpu::scheduler_aps_active() {
         cpu::run_pending_parked_probe(logical_id);
         crate::arch::hart::enable_interrupt_and_wait();
     }
+    task::run_tasks()
 }

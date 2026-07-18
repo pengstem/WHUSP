@@ -340,6 +340,9 @@ static PHASE2_IRQ_RESTORED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(fa
 static PHASE2_PROBE_FAILURES: AtomicUsize = AtomicUsize::new(0);
 static PHASE2_PROBE_PERF: [Phase2ProbePerf; MAX_CPUS] =
     [const { Phase2ProbePerf::new() }; MAX_CPUS];
+static SCHEDULER_APS_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SCHEDULER_WAKE_PENDING: [AtomicBool; MAX_CPUS] =
+    [const { AtomicBool::new(false) }; MAX_CPUS];
 
 pub fn record_boot_entry() {
     let count = BOOT_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -487,7 +490,45 @@ pub fn secondary_publish_online(logical_id: CpuId) {
 }
 
 pub fn is_parked_secondary() -> bool {
-    current_id() != 0
+    current_id() != 0 && !SCHEDULER_APS_ACTIVE.load(Ordering::Acquire)
+}
+
+pub fn scheduler_aps_active() -> bool {
+    SCHEDULER_APS_ACTIVE.load(Ordering::Acquire)
+}
+
+pub fn activate_scheduler_aps() {
+    SCHEDULER_APS_ACTIVE.store(true, Ordering::Release);
+    for cpu in 1..topology().possible_count() {
+        SCHEDULER_WAKE_PENDING[cpu].store(true, Ordering::Release);
+        crate::arch::smp::send_ipi(cpu).unwrap_or_else(|error| {
+            panic!("scheduler activation IPI to CPU {cpu} failed: {error:#x}")
+        });
+    }
+}
+
+pub fn wake_scheduler_cpus() {
+    if !scheduler_aps_active() {
+        return;
+    }
+    let current = current_id();
+    for cpu in 0..topology().possible_count() {
+        if cpu == current {
+            continue;
+        }
+        let already_pending = SCHEDULER_WAKE_PENDING[cpu].swap(true, Ordering::AcqRel);
+        if !already_pending
+            && crate::task::processor_is_idle(cpu)
+            && let Err(error) = crate::arch::smp::send_ipi(cpu)
+        {
+            SCHEDULER_WAKE_PENDING[cpu].store(false, Ordering::Release);
+            panic!("scheduler wake IPI to CPU {cpu} failed: {error:#x}");
+        }
+    }
+}
+
+pub fn take_scheduler_wake(cpu: CpuId) -> bool {
+    SCHEDULER_WAKE_PENDING[cpu].swap(false, Ordering::AcqRel)
 }
 
 pub fn start_parked_secondaries() {
@@ -691,17 +732,25 @@ fn wait_for_probe_value(value: &AtomicUsize, expected: usize, what: &str) {
     }
 }
 
-pub fn handle_phase1_ipi() {
+pub fn handle_ipi() {
+    let logical_id = current_id();
+    if take_scheduler_wake(logical_id) {
+        return;
+    }
     if PHASE2_PROBE_ACTIVE.load(Ordering::Acquire) {
-        let logical_id = current_id();
         PHASE2_PROBE_PENDING[logical_id].store(true, Ordering::Release);
         return;
     }
     if !PROBE_ACTIVE.load(Ordering::Acquire) {
+        if scheduler_aps_active() {
+            // An idle CPU may consume the pending flag immediately before the
+            // already-issued interrupt is delivered. The interrupt is then a
+            // harmless coalesced scheduler wake, not a boot-probe violation.
+            return;
+        }
         PROBE_UNEXPECTED.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let logical_id = current_id();
     let command = PROBE_COMMAND_SEQ[logical_id].load(Ordering::Acquire);
     if command != PROBE_COMMAND_DONE[logical_id].load(Ordering::Relaxed) {
         let target = PROBE_COMMAND_TARGET[logical_id].load(Ordering::Relaxed);
