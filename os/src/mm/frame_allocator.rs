@@ -162,8 +162,9 @@ impl StackFrameAllocator {
 
 type FrameAllocatorImpl = StackFrameAllocator;
 
-// The allocator is initialized after DTB memory discovery; UPIntrFreeCell keeps
-// frame metadata updates atomic with interrupts masked on this uniprocessor.
+// The allocator is initialized after DTB memory discovery. The compatibility
+// cell is backed by an irq-safe SMP spin lock, so allocation and refcount
+// metadata remain one atomic critical section across CPUs.
 lazy_static! {
     pub static ref FRAME_ALLOCATOR: UPIntrFreeCell<FrameAllocatorImpl> =
         unsafe { UPIntrFreeCell::new(FrameAllocatorImpl::new()) };
