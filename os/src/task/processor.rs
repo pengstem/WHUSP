@@ -1,6 +1,6 @@
 use super::__switch;
+use super::fetch_task;
 use super::{ProcessControlBlock, TaskContext, TaskControlBlock};
-use super::{TaskStatus, fetch_task};
 use crate::arch::hart;
 use crate::config::MAX_CPUS;
 use crate::perf;
@@ -33,7 +33,17 @@ impl Processor {
     pub fn take_current(&mut self) -> Option<Arc<TaskControlBlock>> {
         self.current_process = None;
         self.current_user_token = 0;
-        self.current.take()
+        let task = self.current.take()?;
+        let mut inner = task.inner_exclusive_access();
+        assert_eq!(
+            inner.on_cpu,
+            Some(crate::cpu::current_id()),
+            "current task is owned by another CPU"
+        );
+        assert!(!inner.on_rq, "current task is also on a run queue");
+        inner.on_cpu = None;
+        drop(inner);
+        Some(task)
     }
     pub fn set_current(&mut self, task: Arc<TaskControlBlock>) {
         let process = process_of_task(&task);
@@ -100,11 +110,11 @@ pub fn run_tasks() {
         let mut processor = processor();
         if let Some(task) = fetch_task() {
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
-            // access coming task TCB exclusively
-            let next_task_cx_ptr = task.inner.exclusive_session(|task_inner| {
-                task_inner.task_status = TaskStatus::Running;
-                &task_inner.task_cx as *const TaskContext
-            });
+            // fetch_task() atomically claims the task for this CPU before it
+            // becomes visible as Processor::current.
+            let next_task_cx_ptr = task
+                .inner
+                .exclusive_session(|task_inner| &task_inner.task_cx as *const TaskContext);
             task.mark_sched_run_start(crate::timer::get_time_us());
             processor.set_current(task);
             // release processor manually

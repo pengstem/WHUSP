@@ -101,16 +101,64 @@ impl TaskManager {
     }
 
     fn add(&mut self, task: Arc<TaskControlBlock>) {
+        Self::mark_queued(&task);
         self.enqueue(task, false);
     }
 
     fn requeue_after_run(&mut self, task: Arc<TaskControlBlock>) {
         Self::charge_normal_runtime(&task);
+        Self::mark_queued(&task);
         self.enqueue(task, false);
     }
 
     fn add_front(&mut self, task: Arc<TaskControlBlock>) {
+        Self::mark_queued(&task);
         self.enqueue(task, true);
+    }
+
+    fn mark_queued(task: &TaskControlBlock) {
+        let mut inner = task.inner_exclusive_access();
+        assert_eq!(
+            inner.task_status,
+            TaskStatus::Ready,
+            "only Ready tasks may enter the run queue"
+        );
+        assert!(!inner.on_rq, "task is already on a run queue");
+        assert!(
+            inner.on_cpu.is_none(),
+            "running task cannot enter a run queue"
+        );
+        inner.on_rq = true;
+        inner.queued_cpu = Some(crate::cpu::try_current_id().unwrap_or(0));
+    }
+
+    fn clear_queued(task: &TaskControlBlock) {
+        let mut inner = task.inner_exclusive_access();
+        assert!(inner.on_rq, "removed task was not marked on a run queue");
+        inner.on_rq = false;
+        inner.queued_cpu = None;
+    }
+
+    fn claim_for_cpu(task: &TaskControlBlock, cpu: crate::cpu::CpuId) -> bool {
+        let mut inner = task.inner_exclusive_access();
+        if inner.task_status == TaskStatus::Exited {
+            assert!(inner.on_rq, "exited run-queue task lost its queue marker");
+            inner.on_rq = false;
+            inner.queued_cpu = None;
+            return false;
+        }
+        assert_eq!(
+            inner.task_status,
+            TaskStatus::Ready,
+            "run queue contained a non-ready task"
+        );
+        assert!(inner.on_rq, "run-queue task lost its queue marker");
+        assert!(inner.on_cpu.is_none(), "run-queue task is already running");
+        inner.on_rq = false;
+        inner.queued_cpu = None;
+        inner.on_cpu = Some(cpu);
+        inner.task_status = TaskStatus::Running;
+        true
     }
 
     fn enqueue(&mut self, task: Arc<TaskControlBlock>, front: bool) {
@@ -160,7 +208,7 @@ impl TaskManager {
         Some((u128::BITS - 1 - self.rt_ready_bitmap.leading_zeros()) as usize)
     }
 
-    fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
+    fn fetch(&mut self, cpu: crate::cpu::CpuId) -> Option<Arc<TaskControlBlock>> {
         let _profile_scope = perf::time_scope(perf::ProfilePoint::SchedulerFetch);
         let queue_len = self.ready_len();
         let mut scanned = 0;
@@ -174,23 +222,32 @@ impl TaskManager {
                 };
                 self.decrement_ready_count();
                 self.clear_rt_priority_if_empty(priority);
-                if task.inner_exclusive_access().task_status == TaskStatus::Exited {
+                if Self::task_is_exited(&task) {
+                    Self::clear_queued(&task);
                     pruned_exited += 1;
                     continue;
                 }
                 scanned += 1;
                 let current_priority = Self::rt_priority(&task);
                 if current_priority == priority {
+                    if !Self::claim_for_cpu(&task, cpu) {
+                        pruned_exited += 1;
+                        continue;
+                    }
                     perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
                     return Some(task);
                 }
+                // A concurrent policy update can leave a task in the old
+                // priority bucket. Relocate it without dropping its on_rq
+                // ownership between the two internal queues.
                 self.enqueue(task, false);
             }
 
             while let Some((key, task)) = self.normal_queue.pop_first() {
                 self.decrement_ready_count();
                 self.normal_min_vruntime = self.normal_min_vruntime.max(key.0);
-                if task.inner_exclusive_access().task_status == TaskStatus::Exited {
+                if Self::task_is_exited(&task) {
+                    Self::clear_queued(&task);
                     pruned_exited += 1;
                     continue;
                 }
@@ -198,6 +255,10 @@ impl TaskManager {
                 if Self::rt_priority(&task) > 0 {
                     self.enqueue(task, false);
                     continue 'select;
+                }
+                if !Self::claim_for_cpu(&task, cpu) {
+                    pruned_exited += 1;
+                    continue;
                 }
                 perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
                 return Some(task);
@@ -264,15 +325,25 @@ impl TaskManager {
 
     fn remove_process_tasks(&mut self, process_id: usize) {
         self.normal_queue.retain(|_, task| {
-            task.process
+            let keep = task
+                .process
                 .upgrade()
-                .is_none_or(|process| process.getpid() != process_id)
+                .is_none_or(|process| process.getpid() != process_id);
+            if !keep {
+                Self::clear_queued(task);
+            }
+            keep
         });
         for queue in &mut self.rt_queues {
             queue.retain(|task| {
-                task.process
+                let keep = task
+                    .process
                     .upgrade()
-                    .is_none_or(|process| process.getpid() != process_id)
+                    .is_none_or(|process| process.getpid() != process_id);
+                if !keep {
+                    Self::clear_queued(task);
+                }
+                keep
             });
         }
         self.rebuild_ready_metadata();
@@ -402,7 +473,9 @@ pub(crate) fn wakeup_timer_task(task: Arc<TaskControlBlock>) -> bool {
 }
 
 pub(super) fn fetch_task() -> Option<Arc<TaskControlBlock>> {
-    TASK_MANAGER.exclusive_access().fetch()
+    TASK_MANAGER
+        .exclusive_access()
+        .fetch(crate::cpu::current_id())
 }
 
 pub(crate) fn has_ready_task() -> bool {

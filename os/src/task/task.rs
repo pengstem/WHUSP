@@ -18,7 +18,7 @@ pub(crate) const SCHED_RR_INTERVAL_US: usize = 100_000;
 const SCHED_FIFO: i32 = 1;
 const SCHED_RR: i32 = 2;
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TaskStatus {
     Ready,
     Running,
@@ -56,6 +56,15 @@ pub struct TaskControlBlockInner {
     pub trap_cx_ppn: PhysPageNum,
     pub task_cx: TaskContext,
     pub task_status: TaskStatus,
+    // Scheduler ownership is explicit so a task cannot be both running and
+    // reachable from the global run queue once application processors start
+    // participating in scheduling.
+    pub(crate) on_cpu: Option<crate::cpu::CpuId>,
+    pub(crate) on_rq: bool,
+    // The current scheduler has one global queue. Keep the enqueue CPU as a
+    // placement hint and diagnostic now so later per-CPU queues do not need to
+    // infer ownership from TaskStatus.
+    pub(crate) queued_cpu: Option<crate::cpu::CpuId>,
     // Linux-visible sleep state for cooperative wait loops that stay runnable.
     pub proc_sleeping: bool,
     pub exit_code: Option<i32>,
@@ -134,6 +143,9 @@ impl TaskControlBlock {
                     trap_cx_ppn,
                     task_cx: TaskContext::goto_trap_return(kstack_top),
                     task_status: TaskStatus::Ready,
+                    on_cpu: None,
+                    on_rq: false,
+                    queued_cpu: None,
                     proc_sleeping: false,
                     exit_code: None,
                     linux_tid: None,
