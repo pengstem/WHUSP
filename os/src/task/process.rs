@@ -12,6 +12,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::{vec, vec::Vec};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const RLIM_INFINITY: usize = usize::MAX;
 const RLIMIT_COUNT: usize = RLimitResource::RtTime as usize + 1;
@@ -646,8 +647,30 @@ impl ProcessTimers {
 pub struct ProcessControlBlock {
     // immutable
     pub pid: PidHandle,
+    // Phase 3 deliberately permits at most one CPU to execute tasks from one
+    // address space. Phase 5 replaces this pin with active masks and TLB
+    // shootdown after shared-mm mutation is made concurrent-safe.
+    pub(super) scheduler_cpu: AtomicUsize,
     // mutable
     pub(super) inner: UPIntrFreeCell<ProcessControlBlockInner>,
+}
+
+const NO_SCHEDULER_CPU: usize = usize::MAX;
+
+impl ProcessControlBlock {
+    pub(crate) fn try_claim_scheduler_cpu(&self, cpu: crate::cpu::CpuId) -> bool {
+        self.scheduler_cpu
+            .compare_exchange(NO_SCHEDULER_CPU, cpu, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn release_scheduler_cpu(&self, cpu: crate::cpu::CpuId) {
+        self.scheduler_cpu
+            .compare_exchange(cpu, NO_SCHEDULER_CPU, Ordering::AcqRel, Ordering::Acquire)
+            .unwrap_or_else(|owner| {
+                panic!("process scheduler owner mismatch: expected={cpu} actual={owner}")
+            });
+    }
 }
 
 pub struct ProcessControlBlockInner {

@@ -70,6 +70,10 @@ pub struct TaskControlBlockInner {
     // enqueue at that boundary, so remember the wakeup until switch completion.
     pub(crate) wake_pending: bool,
     pub(crate) wake_front: bool,
+    // Phase 3 keeps all ordinary contest work on CPU 0. Only the bounded
+    // independent-address-space probe widens this mask before Phase 4 audits
+    // shared I/O and waitable subsystems.
+    pub(crate) allowed_cpus: crate::cpu::CpuMask,
     // Linux-visible sleep state for cooperative wait loops that stay runnable.
     pub proc_sleeping: bool,
     pub exit_code: Option<i32>,
@@ -153,6 +157,7 @@ impl TaskControlBlock {
                     queued_cpu: None,
                     wake_pending: false,
                     wake_front: false,
+                    allowed_cpus: crate::cpu::CpuMask::single(0),
                     proc_sleeping: false,
                     exit_code: None,
                     linux_tid: None,

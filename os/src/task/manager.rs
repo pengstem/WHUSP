@@ -20,6 +20,12 @@ const NICE_TO_WEIGHT: [u64; 40] = [
 
 type NormalQueueKey = (u64, u64);
 
+enum ClaimResult {
+    Claimed,
+    Ineligible,
+    Exited,
+}
+
 pub struct TaskManager {
     normal_queue: BTreeMap<NormalQueueKey, Arc<TaskControlBlock>>,
     normal_enqueue_seq: u64,
@@ -139,13 +145,13 @@ impl TaskManager {
         inner.queued_cpu = None;
     }
 
-    fn claim_for_cpu(task: &TaskControlBlock, cpu: crate::cpu::CpuId) -> bool {
+    fn claim_for_cpu(task: &TaskControlBlock, cpu: crate::cpu::CpuId) -> ClaimResult {
         let mut inner = task.inner_exclusive_access();
         if inner.task_status == TaskStatus::Exited {
             assert!(inner.on_rq, "exited run-queue task lost its queue marker");
             inner.on_rq = false;
             inner.queued_cpu = None;
-            return false;
+            return ClaimResult::Exited;
         }
         assert_eq!(
             inner.task_status,
@@ -154,11 +160,21 @@ impl TaskManager {
         );
         assert!(inner.on_rq, "run-queue task lost its queue marker");
         assert!(inner.on_cpu.is_none(), "run-queue task is already running");
+        if !inner.allowed_cpus.contains(cpu) {
+            return ClaimResult::Ineligible;
+        }
+        let process = task
+            .process
+            .upgrade()
+            .expect("runnable task process must outlive the task");
+        if !process.try_claim_scheduler_cpu(cpu) {
+            return ClaimResult::Ineligible;
+        }
         inner.on_rq = false;
         inner.queued_cpu = None;
         inner.on_cpu = Some(cpu);
         inner.task_status = TaskStatus::Running;
-        true
+        ClaimResult::Claimed
     }
 
     fn enqueue(&mut self, task: Arc<TaskControlBlock>, front: bool) {
@@ -211,16 +227,22 @@ impl TaskManager {
     fn fetch(&mut self, cpu: crate::cpu::CpuId) -> Option<Arc<TaskControlBlock>> {
         let _profile_scope = perf::time_scope(perf::ProfilePoint::SchedulerFetch);
         let queue_len = self.ready_len();
+        let mut remaining = queue_len;
         let mut scanned = 0;
         let mut pruned_exited = 0;
 
         'select: loop {
+            if remaining == 0 {
+                perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
+                return None;
+            }
             while let Some(priority) = self.highest_rt_priority() {
                 let Some(task) = self.rt_queues[priority].pop_front() else {
                     self.clear_rt_priority_if_empty(priority);
                     continue;
                 };
                 self.decrement_ready_count();
+                remaining = remaining.saturating_sub(1);
                 self.clear_rt_priority_if_empty(priority);
                 if Self::task_is_exited(&task) {
                     Self::clear_queued(&task);
@@ -230,21 +252,33 @@ impl TaskManager {
                 scanned += 1;
                 let current_priority = Self::rt_priority(&task);
                 if current_priority == priority {
-                    if !Self::claim_for_cpu(&task, cpu) {
-                        pruned_exited += 1;
-                        continue;
+                    match Self::claim_for_cpu(&task, cpu) {
+                        ClaimResult::Claimed => {
+                            perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
+                            return Some(task);
+                        }
+                        ClaimResult::Ineligible => self.enqueue(task, false),
+                        ClaimResult::Exited => pruned_exited += 1,
                     }
-                    perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
-                    return Some(task);
+                    if remaining == 0 {
+                        perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
+                        return None;
+                    }
+                    continue;
                 }
                 // A concurrent policy update can leave a task in the old
                 // priority bucket. Relocate it without dropping its on_rq
                 // ownership between the two internal queues.
                 self.enqueue(task, false);
+                if remaining == 0 {
+                    perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
+                    return None;
+                }
             }
 
             while let Some((key, task)) = self.normal_queue.pop_first() {
                 self.decrement_ready_count();
+                remaining = remaining.saturating_sub(1);
                 self.normal_min_vruntime = self.normal_min_vruntime.max(key.0);
                 if Self::task_is_exited(&task) {
                     Self::clear_queued(&task);
@@ -256,12 +290,18 @@ impl TaskManager {
                     self.enqueue(task, false);
                     continue 'select;
                 }
-                if !Self::claim_for_cpu(&task, cpu) {
-                    pruned_exited += 1;
-                    continue;
+                match Self::claim_for_cpu(&task, cpu) {
+                    ClaimResult::Claimed => {
+                        perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
+                        return Some(task);
+                    }
+                    ClaimResult::Ineligible => self.enqueue(task, false),
+                    ClaimResult::Exited => pruned_exited += 1,
                 }
-                perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
-                return Some(task);
+                if remaining == 0 {
+                    perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
+                    return None;
+                }
             }
 
             perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);

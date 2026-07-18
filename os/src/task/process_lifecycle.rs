@@ -18,6 +18,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::AtomicUsize;
 
 impl ProcessControlBlock {
     /// Attaches a newly created task to this process and returns the user token.
@@ -111,6 +112,7 @@ impl ProcessControlBlock {
         let (fd_open_bits, next_fd_hint) = fd_allocation_state_from_table(&fd_table);
         let process = Arc::new(Self {
             pid: pid_handle,
+            scheduler_cpu: AtomicUsize::new(usize::MAX),
             inner: unsafe {
                 UPIntrFreeCell::new(ProcessControlBlockInner {
                     is_zombie: false,
@@ -308,6 +310,7 @@ impl ProcessControlBlock {
         let child_pid = pid.0;
         let child = Arc::new(Self {
             pid,
+            scheduler_cpu: AtomicUsize::new(usize::MAX),
             inner: unsafe {
                 UPIntrFreeCell::new(ProcessControlBlockInner {
                     is_zombie: false,

@@ -204,6 +204,9 @@ fn finish_current_switch() {
         }
     }
 
+    let process = process_of_task(&task);
+    process.release_scheduler_cpu(cpu);
+
     match reason {
         SwitchReason::Yield => super::requeue_task_after_run(task),
         SwitchReason::Block => {
