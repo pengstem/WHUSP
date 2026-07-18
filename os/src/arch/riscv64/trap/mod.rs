@@ -358,6 +358,7 @@ fn trap_return_for_task(
     let now_us = get_time_us();
     let restore_fp = {
         let cx = trap_cx_of_task(&task);
+        cx.kernel_tp = crate::cpu::current_ptr();
         cx.kernel_entry_flush =
             crate::arch::mm::should_flush_tlb_on_kernel_entry(cx.kernel_satp) as usize;
         cx.user_fp_is_dirty()

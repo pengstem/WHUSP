@@ -7,6 +7,7 @@ use loongArch64::ipi::{csr_mail_send, send_ipi_single};
 
 const BOOT_IPI_ACTION: u32 = 1;
 const BOOT_MAILBOX: usize = 0;
+const KSAVE_CPU_LOCAL: usize = 0x33;
 
 pub fn validate_startup_extensions() -> Result<(), &'static str> {
     if !loongArch64::cpu::get_support_iocsr() {
@@ -41,6 +42,30 @@ pub fn clear_local_ipi() {
     if pending != 0 {
         iocsr_write_w(LOONGARCH_IOCSR_IPI_CLEAR, pending);
     }
+}
+
+pub fn install_cpu_local(pointer: usize) {
+    unsafe {
+        core::arch::asm!(
+            "csrwr {pointer}, {ksave}",
+            pointer = inout(reg) pointer => _,
+            ksave = const KSAVE_CPU_LOCAL,
+            options(nomem, nostack),
+        );
+    }
+}
+
+pub fn cpu_local_ptr() -> usize {
+    let pointer: usize;
+    unsafe {
+        core::arch::asm!(
+            "csrrd {pointer}, {ksave}",
+            pointer = out(reg) pointer,
+            ksave = const KSAVE_CPU_LOCAL,
+            options(nomem, nostack),
+        );
+    }
+    pointer
 }
 
 pub fn park_without_interrupts() -> ! {

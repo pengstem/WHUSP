@@ -42,6 +42,20 @@ pub fn clear_local_ipi() {
     }
 }
 
+pub fn install_cpu_local(pointer: usize) {
+    unsafe {
+        asm!("mv tp, {pointer}", pointer = in(reg) pointer, options(nomem, nostack));
+    }
+}
+
+pub fn cpu_local_ptr() -> usize {
+    let pointer: usize;
+    unsafe {
+        asm!("mv {pointer}, tp", pointer = out(reg) pointer, options(nomem, nostack));
+    }
+    pointer
+}
+
 pub fn park_without_interrupts() -> ! {
     loop {
         unsafe {

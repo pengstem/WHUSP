@@ -26,6 +26,31 @@ struct CpuBootLocal {
     startup_error: AtomicUsize,
 }
 
+#[repr(C, align(64))]
+pub struct CpuLocal {
+    logical_id: AtomicUsize,
+    hardware_id: AtomicUsize,
+    installed: AtomicBool,
+}
+
+impl CpuLocal {
+    const fn new() -> Self {
+        Self {
+            logical_id: AtomicUsize::new(usize::MAX),
+            hardware_id: AtomicUsize::new(usize::MAX),
+            installed: AtomicBool::new(false),
+        }
+    }
+
+    pub fn logical_id(&self) -> CpuId {
+        self.logical_id.load(Ordering::Relaxed)
+    }
+
+    pub fn hardware_id(&self) -> usize {
+        self.hardware_id.load(Ordering::Relaxed)
+    }
+}
+
 impl CpuBootLocal {
     const fn new() -> Self {
         Self {
@@ -255,6 +280,7 @@ static ONLINE_CPUS: AtomicCpuMask = AtomicCpuMask::new(CpuMask::empty());
 static BOOT_ENTRY_COUNT: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_INIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static CPU_BOOT_LOCALS: [CpuBootLocal; MAX_CPUS] = [const { CpuBootLocal::new() }; MAX_CPUS];
+static CPU_LOCALS: [CpuLocal; MAX_CPUS] = [const { CpuLocal::new() }; MAX_CPUS];
 
 // LoongArch secondary entry has no SBI-style opaque argument. These symbols
 // are consumed directly by entry.asm after it installs the high DMW alias.
@@ -324,6 +350,57 @@ pub fn topology() -> &'static CpuTopology {
     CPU_TOPOLOGY.get()
 }
 
+pub fn install_current(logical_id: CpuId, hardware_id: usize) {
+    assert!(
+        logical_id < topology().possible_count(),
+        "CPU-local ID is not possible"
+    );
+    assert_eq!(
+        topology().hardware_id(logical_id),
+        hardware_id,
+        "CPU-local hardware ID disagrees with topology"
+    );
+    let local = &CPU_LOCALS[logical_id];
+    assert!(
+        !local.installed.load(Ordering::Acquire),
+        "CPU-local state installed twice for logical CPU {logical_id}"
+    );
+    local.logical_id.store(logical_id, Ordering::Relaxed);
+    local.hardware_id.store(hardware_id, Ordering::Relaxed);
+    local.installed.store(true, Ordering::Release);
+    crate::arch::smp::install_cpu_local(local as *const CpuLocal as usize);
+    assert!(
+        core::ptr::eq(current(), local),
+        "architecture CPU-local pointer did not round-trip"
+    );
+}
+
+pub fn current() -> &'static CpuLocal {
+    let pointer = crate::arch::smp::cpu_local_ptr();
+    assert_ne!(pointer, 0, "CPU-local pointer is not installed");
+    let local = unsafe { &*(pointer as *const CpuLocal) };
+    let logical_id = local.logical_id();
+    assert!(logical_id < MAX_CPUS, "CPU-local pointer has an invalid ID");
+    assert!(
+        core::ptr::eq(local, &CPU_LOCALS[logical_id]),
+        "CPU-local pointer is outside the static CPU-local array"
+    );
+    assert!(
+        local.installed.load(Ordering::Acquire),
+        "CPU-local pointer observed before publication"
+    );
+    local
+}
+
+pub fn current_id() -> CpuId {
+    current().logical_id()
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn current_ptr() -> usize {
+    current() as *const CpuLocal as usize
+}
+
 pub fn online_mask() -> CpuMask {
     ONLINE_CPUS.load(Ordering::Acquire)
 }
@@ -376,7 +453,7 @@ pub fn secondary_publish_online(logical_id: CpuId) {
 }
 
 pub fn is_parked_secondary() -> bool {
-    crate::arch::hart::current_boot_stack_cpu().is_some_and(|cpu| cpu != 0)
+    current_id() != 0
 }
 
 pub fn start_parked_secondaries() {
@@ -457,12 +534,13 @@ fn log_online_cpus() {
         let hardware_id = topology().hardware_id(logical_id);
         let (stack_bottom, stack_top) = crate::arch::hart::boot_stack_bounds_for(logical_id);
         info!(
-            "cpu boot: logical={} hw_id={} stack={:#x}..{:#x} state={}",
+            "cpu boot: logical={} hw_id={} stack={:#x}..{:#x} state={} local={:#x}",
             logical_id,
             hardware_id,
             stack_bottom,
             stack_top,
             CPU_BOOT_LOCALS[logical_id].state_name(),
+            &CPU_LOCALS[logical_id] as *const CpuLocal as usize,
         );
     }
     let online = online_mask();
@@ -579,7 +657,7 @@ fn wait_for_probe_value(value: &AtomicUsize, expected: usize, what: &str) {
 
 pub fn handle_phase1_ipi() {
     if PHASE2_PROBE_ACTIVE.load(Ordering::Acquire) {
-        let logical_id = crate::arch::hart::current_boot_stack_cpu().unwrap_or(0);
+        let logical_id = current_id();
         PHASE2_PROBE_PENDING[logical_id].store(true, Ordering::Release);
         return;
     }
@@ -587,7 +665,7 @@ pub fn handle_phase1_ipi() {
         PROBE_UNEXPECTED.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let logical_id = crate::arch::hart::current_boot_stack_cpu().unwrap_or(0);
+    let logical_id = current_id();
     let command = PROBE_COMMAND_SEQ[logical_id].load(Ordering::Acquire);
     if command != PROBE_COMMAND_DONE[logical_id].load(Ordering::Relaxed) {
         let target = PROBE_COMMAND_TARGET[logical_id].load(Ordering::Relaxed);
@@ -669,6 +747,12 @@ fn run_phase2_lock_irq_probe() {
 }
 
 fn run_phase2_probe_on_cpu(logical_id: CpuId) {
+    let current = current();
+    if current.logical_id() != logical_id
+        || current.hardware_id() != topology().hardware_id(logical_id)
+    {
+        PHASE2_PROBE_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
     if !crate::arch::interrupt::supervisor_interrupt_enabled() {
         PHASE2_PROBE_FAILURES.fetch_add(1, Ordering::Relaxed);
     }

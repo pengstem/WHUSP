@@ -16,6 +16,7 @@
 .equ SSTATUS_FS_MASK, 0x6000
 .equ FCSR_OFFSET, 69
 .equ KERNEL_ENTRY_FLUSH_OFFSET, 70
+.equ KERNEL_TP_OFFSET, 71
     .section .text.trampoline
     .globl __alltraps
     .globl __restore
@@ -68,6 +69,8 @@ __alltraps:
     ld t1, 36*8(sp)
     # load return-prepared kernel TLB flush decision into t2
     ld t2, KERNEL_ENTRY_FLUSH_OFFSET*8(sp)
+    # Restore the CPU-local kernel tp after preserving the user's x4 above.
+    ld tp, KERNEL_TP_OFFSET*8(sp)
     # move to kernel_sp
     ld sp, 35*8(sp)
     # switch to kernel space (satp: Supervisor Address Translation and Protection)
@@ -123,6 +126,7 @@ __alltraps_k:
     addi sp, sp, -34*8 
     sd x1, 1*8(sp)
     sd x3, 3*8(sp)
+    sd x4, 4*8(sp)
     .set n, 5
     .rept 27
         SAVE_GP %n
@@ -143,6 +147,7 @@ __restore_k:
     csrw sepc, t1
     ld x1, 1*8(sp)
     ld x3, 3*8(sp)
+    ld x4, 4*8(sp)
     .set n, 5
     .rept 27
         LOAD_GP %n

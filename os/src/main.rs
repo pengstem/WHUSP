@@ -62,6 +62,7 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     BOOT_HART_ID.store(hart_id, Ordering::Relaxed);
     DTB_ADDR.store(dtb_addr, Ordering::Relaxed);
     board::init_from_dtb(dtb_addr, hart_id);
+    cpu::install_current(0, hart_id);
     mm::init();
     timer::init_wall_clock();
     UART.init();
@@ -134,6 +135,7 @@ pub extern "C" fn rust_secondary_main(hardware_id: usize, logical_id: usize) -> 
     if !cpu::secondary_mark_early(hardware_id, logical_id) {
         crate::arch::smp::park_without_interrupts();
     }
+    cpu::install_current(logical_id, hardware_id);
     mm::activate_kernel_page_table_for_secondary();
     trap::init();
     crate::arch::smp::enable_local_ipi();
