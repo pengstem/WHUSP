@@ -57,6 +57,8 @@ lazy_static! {
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     clear_bss();
+    cpu::record_boot_entry();
+    cpu::record_global_init();
     BOOT_HART_ID.store(hart_id, Ordering::Relaxed);
     DTB_ADDR.store(dtb_addr, Ordering::Relaxed);
     board::init_from_dtb(dtb_addr, hart_id);
@@ -82,6 +84,11 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
         online.bits(),
         topology.boot_hw_id(),
         topology.hardware_ids(),
+    );
+    info!(
+        "smp invariants: boot_entries={} global_init_entries={}",
+        cpu::boot_entry_count(),
+        cpu::global_init_count(),
     );
 
     // CONTEXT: Headless contest QEMU may omit these optional devices, but

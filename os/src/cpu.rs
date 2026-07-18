@@ -1,6 +1,6 @@
 use crate::config::MAX_CPUS;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use fdt::Fdt;
 
 pub type CpuId = usize;
@@ -211,6 +211,32 @@ impl CpuTopologyCell {
 
 static CPU_TOPOLOGY: CpuTopologyCell = CpuTopologyCell::new();
 static ONLINE_CPUS: AtomicCpuMask = AtomicCpuMask::new(CpuMask::empty());
+static BOOT_ENTRY_COUNT: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_INIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+pub fn record_boot_entry() {
+    let count = BOOT_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    assert_eq!(
+        count, 1,
+        "primary kernel boot entry executed more than once"
+    );
+}
+
+pub fn record_global_init() {
+    let count = GLOBAL_INIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    assert_eq!(
+        count, 1,
+        "global kernel initialization executed more than once"
+    );
+}
+
+pub fn boot_entry_count() -> usize {
+    BOOT_ENTRY_COUNT.load(Ordering::Relaxed)
+}
+
+pub fn global_init_count() -> usize {
+    GLOBAL_INIT_COUNT.load(Ordering::Relaxed)
+}
 
 pub fn init_from_dtb(fdt: &Fdt<'_>, boot_hw_id: usize) {
     let topology = CpuTopology::discover(fdt, boot_hw_id);
