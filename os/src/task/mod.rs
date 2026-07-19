@@ -168,6 +168,16 @@ pub fn block_current_task_no_schedule() -> (Arc<TaskControlBlock>, *mut TaskCont
     processor::prepare_current_switch(processor::SwitchReason::Block)
 }
 
+/// Atomically publish Blocked only when no unmasked signal is pending.
+///
+/// Signal queueing takes the same task lock and wakes a task it observes as
+/// Blocked, closing the check-then-sleep window for interruptible wait queues.
+pub fn block_current_task_no_schedule_unless_unmasked_signal()
+-> Option<(Arc<TaskControlBlock>, *mut TaskContext)> {
+    try_account_current_system_time();
+    processor::prepare_current_block_unless_unmasked_signal()
+}
+
 static EXITED_DIRTY: AtomicBool = AtomicBool::new(false);
 
 // CONTEXT: EXITED_TASKS defers Arc<TaskControlBlock> drops past the

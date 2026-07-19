@@ -41,8 +41,14 @@ fn is_smp_wait_io_probe_path(path: &str) -> bool {
     matches!(path, "/x1/smp-wait-io-rv" | "/x1/smp-wait-io-la")
 }
 
-fn is_smp_wait_timer_probe_path(path: &str) -> bool {
-    matches!(path, "/x1/smp-wait-timer-rv" | "/x1/smp-wait-timer-la")
+fn is_smp_phase4_wait_probe_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/x1/smp-wait-timer-rv"
+            | "/x1/smp-wait-timer-la"
+            | "/x1/smp-wait-futex-rv"
+            | "/x1/smp-wait-futex-la"
+    )
 }
 const AT_CLKTCK: usize = 17;
 const AT_SECURE: usize = 23;
@@ -364,7 +370,7 @@ impl ProcessControlBlock {
         let smp_sched_probe = is_smp_sched_probe_path(&executable_path);
         let smp_cpu_probe = is_smp_cpu_probe_path(&executable_path);
         let smp_wait_io_probe = is_smp_wait_io_probe_path(&executable_path);
-        let smp_wait_timer_probe = is_smp_wait_timer_probe_path(&executable_path);
+        let smp_phase4_wait_probe = is_smp_phase4_wait_probe_path(&executable_path);
         let current = current_task().ok_or(SysError::ESRCH)?;
         let process_token = self.inner_exclusive_access().get_user_token();
         let task = prepare_exec_thread_group(self, current, process_token, self.getpid())?;
@@ -447,7 +453,7 @@ impl ProcessControlBlock {
         task_inner.smp_sched_probe_active = false;
         task_inner.smp_cpu_probe = smp_cpu_probe;
         task_inner.smp_wait_io_probe = smp_wait_io_probe;
-        task_inner.smp_wait_timer_probe = smp_wait_timer_probe;
+        task_inner.smp_phase4_wait_probe = smp_phase4_wait_probe;
         // Keep initial executable page-in on CPU 0. The probe's first
         // sched_setaffinity() call widens placement only after it has entered
         // its self-contained scheduler workload; shared VFS/I/O concurrency is

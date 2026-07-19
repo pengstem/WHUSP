@@ -1,10 +1,11 @@
 use super::{
-    TaskControlBlock, TaskStatus, block_current_task_no_schedule, current_has_deliverable_signal,
-    current_process, current_task, current_user_token, schedule, wakeup_front_task, wakeup_task,
+    TaskControlBlock, TaskStatus, block_current_task_no_schedule_unless_unmasked_signal,
+    current_has_deliverable_signal, current_process, current_task, current_user_token, schedule,
+    wakeup_front_task, wakeup_task,
 };
 use crate::mm::FutexSharedKey;
 use crate::perf;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::time::{
     ClockBackend, current_clock_nanos, relative_timeout_deadline_ms,
@@ -221,9 +222,9 @@ impl FutexManager {
     /// The returned task context pointer must be passed to `schedule()` after
     /// releasing `FUTEX_MANAGER`; scheduling while holding the queue lock can
     /// deadlock wake paths.
-    fn block_current_on(&mut self, key: FutexKey, bitset: u32) -> *mut super::TaskContext {
+    fn block_current_on(&mut self, key: FutexKey, bitset: u32) -> Option<*mut super::TaskContext> {
         let bucket_index = Self::bucket_index(key);
-        let (task, task_cx_ptr) = block_current_task_no_schedule();
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
         let created_queue = {
             let bucket = &mut self.buckets[bucket_index];
             let queue = bucket.waiters.entry(key).or_default();
@@ -246,7 +247,7 @@ impl FutexManager {
             },
         );
         self.record_state_for_bucket(bucket_index);
-        task_cx_ptr
+        Some(task_cx_ptr)
     }
 
     fn wake(&mut self, key: FutexKey, limit: usize, bitset: u32) -> Vec<Arc<TaskControlBlock>> {
@@ -496,8 +497,7 @@ impl FutexWaiter {
 }
 
 lazy_static! {
-    static ref FUTEX_MANAGER: UPIntrFreeCell<FutexManager> =
-        unsafe { UPIntrFreeCell::new(FutexManager::new()) };
+    static ref FUTEX_MANAGER: SpinNoIrqLock<FutexManager> = SpinNoIrqLock::new(FutexManager::new());
 }
 
 fn futex_key(addr: usize, private: bool) -> SysResult<FutexKey> {
@@ -553,6 +553,15 @@ fn read_futex_word_with_token(token: usize, addr: usize) -> SysResult<u32> {
     read_user_value(token, addr as *const u32)
 }
 
+fn write_futex_word_with_current_token_no_fault(
+    token: usize,
+    addr: usize,
+    value: u32,
+) -> SysResult<()> {
+    validate_futex_addr(addr)?;
+    write_user_value(token, addr as *mut u32, &value)
+}
+
 fn write_futex_word_with_token(token: usize, addr: usize, value: u32) -> SysResult<()> {
     validate_futex_addr(addr)?;
     write_user_value(token, addr as *mut u32, &value)
@@ -604,22 +613,34 @@ fn futex_wait(
 ) -> SysResult {
     let key = futex_key(addr, private)?;
     let task = current_task().expect("futex wait must run with a current task");
+    let token = current_user_token();
+
+    // Fault the word in before taking the IRQ-safe bucket manager. The second
+    // no-fault read under the manager lock is the compare-and-block point.
+    if read_futex_word(addr)? != expected {
+        return Err(SysError::EAGAIN);
+    }
+    if futex_timeout_expired(timeout_ms) {
+        return Err(SysError::ETIMEDOUT);
+    }
+    if current_has_deliverable_signal() {
+        return Err(SysError::EINTR);
+    }
 
     let task_cx_ptr = {
-        let mut manager = FUTEX_MANAGER.exclusive_access();
+        let mut manager = FUTEX_MANAGER.lock();
         // Value check and enqueue are one critical section: a wake that runs
         // after the user word changes must either see the queued waiter or the
         // waiter must return EAGAIN before sleeping.
-        if read_futex_word(addr)? != expected {
+        if read_futex_word_with_token(token, addr)? != expected {
             return Err(SysError::EAGAIN);
         }
         if futex_timeout_expired(timeout_ms) {
             return Err(SysError::ETIMEDOUT);
         }
-        if current_has_deliverable_signal() {
-            return Err(SysError::EINTR);
-        }
-        manager.block_current_on(key, bitset)
+        manager
+            .block_current_on(key, bitset)
+            .ok_or(SysError::EINTR)?
     };
 
     if let Some(deadline_ms) = timeout_ms {
@@ -627,8 +648,9 @@ fn futex_wait(
     }
     schedule(task_cx_ptr);
 
-    let mut manager = FUTEX_MANAGER.exclusive_access();
+    let mut manager = FUTEX_MANAGER.lock();
     let cleanup = manager.remove_waiter_for_task(&task);
+    drop(manager);
     if futex_timeout_expired(timeout_ms) {
         if cleanup == FutexWaitCleanup::StillQueued {
             return Err(SysError::ETIMEDOUT);
@@ -649,7 +671,7 @@ fn futex_wait(
 
 fn futex_wake(addr: usize, private: bool, limit: usize, bitset: u32) -> SysResult<usize> {
     let key = futex_key(addr, private)?;
-    let tasks = FUTEX_MANAGER.exclusive_access().wake(key, limit, bitset);
+    let tasks = FUTEX_MANAGER.lock().wake(key, limit, bitset);
     Ok(wake_futex_tasks(tasks))
 }
 
@@ -661,7 +683,7 @@ fn futex_wake_for_process(
     bitset: u32,
 ) -> usize {
     let key = futex_key_for_process(addr, private, process_id);
-    let tasks = FUTEX_MANAGER.exclusive_access().wake(key, limit, bitset);
+    let tasks = FUTEX_MANAGER.lock().wake(key, limit, bitset);
     wake_futex_tasks(tasks)
 }
 
@@ -687,7 +709,7 @@ fn futex_waiters_word(owner_tid: u32, has_waiters: bool) -> u32 {
 }
 
 fn clear_pi_waiters_bit_if_idle(addr: usize, key: FutexKey) -> SysResult {
-    if FUTEX_MANAGER.exclusive_access().has_waiters(key) {
+    if FUTEX_MANAGER.lock().has_waiters(key) {
         return Ok(0);
     }
     let word = read_futex_word(addr)?;
@@ -725,23 +747,34 @@ fn futex_lock_pi(addr: usize, private: bool, timeout_ms: Option<usize>) -> SysRe
     let key = futex_key(addr, private)?;
     let tid = current_linux_tid_u32()?;
     let task = current_task().expect("PI futex lock must run with a current task");
+    let token = current_user_token();
+
+    // Resolve lazy/COW mappings before entering the IRQ-safe futex manager.
+    let _ = read_futex_word(addr)?;
 
     let task_cx_ptr = {
-        let mut manager = FUTEX_MANAGER.exclusive_access();
-        if try_acquire_pi_word(addr, tid)? {
+        let mut manager = FUTEX_MANAGER.lock();
+        let word = read_futex_word_with_token(token, addr)?;
+        let owner_tid = word & FUTEX_TID_MASK;
+        if owner_tid == 0 {
+            if word & FUTEX_WAITERS != 0 {
+                return Err(SysError::EINVAL);
+            }
+            write_futex_word_with_current_token_no_fault(token, addr, tid)?;
             return Ok(0);
+        }
+        if owner_tid == tid {
+            return Err(SysError::EDEADLK);
         }
         if futex_timeout_expired(timeout_ms) {
             return Err(SysError::ETIMEDOUT);
         }
-        if current_has_deliverable_signal() {
-            return Err(SysError::EINTR);
-        }
-        let word = read_futex_word(addr)?;
         if word & FUTEX_WAITERS == 0 {
-            write_futex_word(addr, word | FUTEX_WAITERS)?;
+            write_futex_word_with_current_token_no_fault(token, addr, word | FUTEX_WAITERS)?;
         }
-        manager.block_current_on(key, FUTEX_BITSET_MATCH_ANY)
+        manager
+            .block_current_on(key, FUTEX_BITSET_MATCH_ANY)
+            .ok_or(SysError::EINTR)?
     };
 
     if let Some(deadline_ms) = timeout_ms {
@@ -749,7 +782,7 @@ fn futex_lock_pi(addr: usize, private: bool, timeout_ms: Option<usize>) -> SysRe
     }
     schedule(task_cx_ptr);
 
-    let mut manager = FUTEX_MANAGER.exclusive_access();
+    let mut manager = FUTEX_MANAGER.lock();
     let cleanup = manager.remove_waiter_for_task(&task);
     drop(manager);
     if futex_timeout_expired(timeout_ms) {
@@ -781,7 +814,7 @@ fn futex_unlock_pi(addr: usize, private: bool) -> SysResult {
         return Err(SysError::EPERM);
     }
 
-    let (next_task, has_more_waiters) = FUTEX_MANAGER.exclusive_access().wake_one(key);
+    let (next_task, has_more_waiters) = FUTEX_MANAGER.lock().wake_one(key);
     if let Some(task) = next_task {
         let next_tid = linux_tid_to_futex_word(task.linux_tid())?;
         // UNFINISHED: This is PI-futex ownership handoff without scheduler
@@ -908,16 +941,15 @@ fn futex_requeue(
     if source == target {
         return Err(SysError::EINVAL);
     }
-    let (tasks, moved) =
-        FUTEX_MANAGER
-            .exclusive_access()
-            .requeue(source, target, wake_limit, requeue_limit);
+    let (tasks, moved) = FUTEX_MANAGER
+        .lock()
+        .requeue(source, target, wake_limit, requeue_limit);
     let woken = wake_futex_tasks(tasks);
     Ok(if count_requeued { moved + woken } else { woken })
 }
 
 pub(crate) fn remove_process_futex_waiters(process_id: usize) {
-    FUTEX_MANAGER.exclusive_access().remove_process(process_id);
+    FUTEX_MANAGER.lock().remove_process(process_id);
 }
 
 pub(crate) fn sys_set_robust_list(head: usize, len: usize) -> SysResult {

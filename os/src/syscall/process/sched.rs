@@ -390,7 +390,7 @@ pub fn sys_sched_setaffinity_ctx(
     if (inner.smp_sched_probe
         || inner.smp_cpu_probe
         || inner.smp_wait_io_probe
-        || inner.smp_wait_timer_probe)
+        || inner.smp_phase4_wait_probe)
         && pid == 0
         && Arc::ptr_eq(&task, ctx.task())
     {

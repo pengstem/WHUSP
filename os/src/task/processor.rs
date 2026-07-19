@@ -114,6 +114,18 @@ pub(crate) fn processor_is_idle(cpu: usize) -> bool {
 pub(super) fn prepare_current_switch(
     reason: SwitchReason,
 ) -> (Arc<TaskControlBlock>, *mut TaskContext) {
+    prepare_current_switch_inner(reason, false).expect("unconditional context switch was rejected")
+}
+
+pub(super) fn prepare_current_block_unless_unmasked_signal()
+-> Option<(Arc<TaskControlBlock>, *mut TaskContext)> {
+    prepare_current_switch_inner(SwitchReason::Block, true)
+}
+
+fn prepare_current_switch_inner(
+    reason: SwitchReason,
+    reject_unmasked_signal: bool,
+) -> Option<(Arc<TaskControlBlock>, *mut TaskContext)> {
     let cpu = crate::cpu::current_id();
     let mut processor = processor();
     assert!(
@@ -139,6 +151,9 @@ pub(super) fn prepare_current_switch(
         );
         assert!(!inner.on_rq, "current task is also on a run queue");
         assert!(!inner.wake_pending, "running task retained a wakeup");
+        if reject_unmasked_signal && !(inner.pending_signals & !inner.signal_mask).is_empty() {
+            return None;
+        }
         if reason == SwitchReason::Block {
             inner.task_status = TaskStatus::Blocked;
             if inner.smp_sched_probe_active {
@@ -150,7 +165,7 @@ pub(super) fn prepare_current_switch(
         &mut inner.task_cx as *mut TaskContext
     };
     processor.pending_switch = Some(reason);
-    (task, task_cx_ptr)
+    Some((task, task_cx_ptr))
 }
 
 fn finish_current_switch() {
