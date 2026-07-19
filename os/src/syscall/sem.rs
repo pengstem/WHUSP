@@ -5,9 +5,9 @@ use super::user_ptr::{read_user_array, read_user_value, write_user_array, write_
 use crate::sync::UPIntrFreeCell;
 use crate::task::check_signals_of_current;
 use crate::task::{
-    TaskContext, TaskControlBlock, block_current_task_no_schedule, current_has_deliverable_signal,
-    current_process, current_task, current_user_token, exit_current_group_and_run_next, schedule,
-    wakeup_task,
+    TaskContext, TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
+    current_has_deliverable_signal, current_process, current_task, current_user_token,
+    exit_current_group_and_run_next, schedule, wakeup_task,
 };
 use crate::timer::{add_timer, get_time_ms};
 use alloc::collections::BTreeMap;
@@ -104,6 +104,7 @@ enum SemError {
     Range,
     TooBig,
     WouldBlock,
+    Interrupted,
 }
 
 #[derive(Clone, Copy)]
@@ -551,28 +552,27 @@ impl SemManager {
         &mut self,
         semid: usize,
         ops: &[LinuxSembuf],
+        timeout_deadline_ms: Option<usize>,
     ) -> Result<*mut TaskContext, SemError> {
         let set = self.sets.get_mut(&semid).ok_or(SemError::Invalid)?;
         let (semnum, kind) = first_waiting_op(set, ops).ok_or(SemError::Invalid)?;
         if ops.iter().any(|op| op.sem_flg & IPC_NOWAIT != 0) {
             return Err(SemError::WouldBlock);
         }
-        let (task, task_cx_ptr) = block_current_task_no_schedule();
+        let (task, task_cx_ptr) =
+            block_current_task_no_schedule_unless_unmasked_signal().ok_or(SemError::Interrupted)?;
         match kind {
             SemWaitKind::NonZero => set.values[semnum].ncnt += 1,
             SemWaitKind::Zero => set.values[semnum].zcnt += 1,
         }
-        // UNFINISHED: System V semaphore sleeps should wake directly from
-        // signal delivery, IPC_RMID, or a precise semtimedop timeout. This
-        // fallback prevents a missed signal wake from pinning LTP cleanup
-        // until the outer testcase alarm while the wait queue model is still
-        // minimal.
-        add_timer(get_time_ms() + 1000, Arc::clone(&task));
         set.waiters.push(SemWaiter {
-            task,
+            task: Arc::clone(&task),
             sem_num: semnum,
             kind,
         });
+        if let Some(deadline_ms) = timeout_deadline_ms {
+            add_timer(deadline_ms, task);
+        }
         Ok(task_cx_ptr)
     }
 
@@ -819,7 +819,7 @@ pub(super) fn sys_semtimedop(
         if timeout_deadline_ms.is_some_and(|deadline| get_time_ms() >= deadline) {
             return Err(SysError::EAGAIN);
         }
-        match try_or_block_semop(semid, &ops, &caller)? {
+        match try_or_block_semop(semid, &ops, &caller, timeout_deadline_ms)? {
             SemOpAttempt::Done => return Ok(0),
             SemOpAttempt::Blocked(task_cx_ptr) => schedule(task_cx_ptr),
         }
@@ -849,12 +849,13 @@ fn try_or_block_semop(
     semid: usize,
     ops: &[LinuxSembuf],
     caller: &SemCaller,
+    timeout_deadline_ms: Option<usize>,
 ) -> Result<SemOpAttempt, SysError> {
     let mut manager = SEM_MANAGER.exclusive_access();
     match manager.try_semop(semid, ops, caller) {
         Ok(()) => Ok(SemOpAttempt::Done),
         Err(SemError::WouldBlock) => manager
-            .block_current_on_first_wait(semid, ops)
+            .block_current_on_first_wait(semid, ops, timeout_deadline_ms)
             .map(SemOpAttempt::Blocked)
             .map_err(sem_error_to_sys_error),
         Err(error) => Err(sem_error_to_sys_error(error)),
@@ -928,6 +929,7 @@ fn sem_error_to_sys_error(error: SemError) -> SysError {
         SemError::Range => SysError::ERANGE,
         SemError::TooBig => SysError::EFBIG,
         SemError::WouldBlock => SysError::EAGAIN,
+        SemError::Interrupted => SysError::EINTR,
     }
 }
 

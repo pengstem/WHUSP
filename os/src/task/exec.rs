@@ -56,6 +56,8 @@ fn is_smp_phase4_wait_probe_path(path: &str) -> bool {
             | "/x1/smp-wait-socket-la"
             | "/x1/smp-wait-msg-rv"
             | "/x1/smp-wait-msg-la"
+            | "/x1/smp-wait-sem-rv"
+            | "/x1/smp-wait-sem-la"
     )
 }
 const AT_CLKTCK: usize = 17;
