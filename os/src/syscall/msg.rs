@@ -4,11 +4,10 @@ use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::task::check_signals_of_current;
 use crate::task::{
-    TaskContext, TaskControlBlock, block_current_task_no_schedule, current_has_deliverable_signal,
-    current_process, current_task, current_user_token, exit_current_group_and_run_next, schedule,
-    wakeup_task,
+    TaskContext, TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
+    current_has_deliverable_signal, current_process, current_task, current_user_token,
+    exit_current_group_and_run_next, schedule, wakeup_task,
 };
-use crate::timer::{add_timer, get_time_ms};
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
@@ -96,6 +95,7 @@ enum MsgError {
     TooBig,
     NoMessage,
     WouldBlock,
+    Interrupted,
 }
 
 #[derive(Clone)]
@@ -477,12 +477,8 @@ impl MsgManager {
 
     fn block_current(&mut self, msqid: usize) -> Result<*mut TaskContext, MsgError> {
         let queue = self.queues.get_mut(&msqid).ok_or(MsgError::Invalid)?;
-        let (task, task_cx_ptr) = block_current_task_no_schedule();
-        // UNFINISHED: System V message queue sleeps should wake directly from
-        // signal delivery or IPC_RMID. This timer is a bounded fallback for the
-        // current wait queue model so LTP signal interruption cases do not
-        // stick until the testcase alarm.
-        add_timer(get_time_ms() + 1000, Arc::clone(&task));
+        let (task, task_cx_ptr) =
+            block_current_task_no_schedule_unless_unmasked_signal().ok_or(MsgError::Interrupted)?;
         queue.waiters.push(MsgWaiter { task });
         Ok(task_cx_ptr)
     }
@@ -881,6 +877,7 @@ fn msg_error_to_sys_error(error: MsgError) -> SysError {
         MsgError::TooBig => SysError::E2BIG,
         MsgError::NoMessage => SysError::ENOMSG,
         MsgError::WouldBlock => SysError::EAGAIN,
+        MsgError::Interrupted => SysError::EINTR,
     }
 }
 
