@@ -15,7 +15,8 @@ use crate::mm::UserBuffer;
 use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
-    TaskControlBlock, block_current_task_no_schedule, current_has_unmasked_signal, schedule,
+    TaskControlBlock, block_current_task_no_schedule,
+    block_current_task_no_schedule_unless_unmasked_signal, current_has_unmasked_signal, schedule,
     wakeup_task,
 };
 use alloc::collections::VecDeque;
@@ -546,16 +547,16 @@ impl PtyBuffer {
         }
     }
 
-    fn sleep_reader(&mut self) -> *mut crate::task::TaskContext {
-        let (task, task_cx_ptr) = block_current_task_no_schedule();
+    fn sleep_reader(&mut self) -> Option<*mut crate::task::TaskContext> {
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
         self.read_wait_queue.push_back(task);
-        task_cx_ptr
+        Some(task_cx_ptr)
     }
 
-    fn sleep_writer(&mut self) -> *mut crate::task::TaskContext {
-        let (task, task_cx_ptr) = block_current_task_no_schedule();
+    fn sleep_writer(&mut self) -> Option<*mut crate::task::TaskContext> {
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
         self.write_wait_queue.push_back(task);
-        task_cx_ptr
+        Some(task_cx_ptr)
     }
 
     fn wake_reader(&mut self) -> Option<Arc<TaskControlBlock>> {
@@ -2086,7 +2087,9 @@ fn read_pty(
             if pty_wait_interrupted() {
                 return 0;
             }
-            let task_cx_ptr = inner.input_buffer_mut(endpoint).sleep_reader();
+            let Some(task_cx_ptr) = inner.input_buffer_mut(endpoint).sleep_reader() else {
+                return 0;
+            };
             drop(inner);
             schedule(task_cx_ptr);
             continue;
@@ -2137,7 +2140,9 @@ fn write_pty(
             if pty_wait_interrupted() {
                 return already_written;
             }
-            let task_cx_ptr = inner.output_buffer_mut(endpoint).sleep_writer();
+            let Some(task_cx_ptr) = inner.output_buffer_mut(endpoint).sleep_writer() else {
+                return already_written;
+            };
             drop(inner);
             schedule(task_cx_ptr);
             continue;
