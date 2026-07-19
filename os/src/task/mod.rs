@@ -790,6 +790,9 @@ lazy_static! {
 }
 
 pub fn add_initproc() {
+    // Build the sharded futex table on the boot CPU before secondary
+    // schedulers can race through its lazy initializer on their first wait.
+    futex::init();
     let _initproc = INITPROC.clone();
 }
 

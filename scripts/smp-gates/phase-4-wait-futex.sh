@@ -11,7 +11,8 @@ esac
 
 worker="/x1/@FUTEX_WORKER_BASENAME@-$arch"
 workers=@WORKERS@
-ltp_case="/x1/$arch/musl/ltp-cases/@FUTEX_WAIT01_SCRIPT@"
+ltp_wait_case="/x1/$arch/musl/ltp-cases/@FUTEX_WAIT01_SCRIPT@"
+ltp_requeue_case="/x1/$arch/musl/ltp-cases/@FUTEX_REQUEUE_SCRIPT@"
 echo "#### SMP GATE START phase=$phase arch=$arch profile=wait-futex ####"
 if [ "$workers" -ne 8 ] || [ ! -x "$worker" ]; then
     echo "#### SMP GATE FAIL phase=$phase arch=$arch reason=bad-worker-config ####"
@@ -34,8 +35,12 @@ if ! wait; then
 fi
 /musl/busybox rm -f /x1/.smp-wait-futex
 
-if ! "$ltp_case"; then
+if ! "$ltp_wait_case"; then
     echo "#### SMP GATE FAIL phase=$phase arch=$arch reason=futex-wait01 ####"
+    exit 1
+fi
+if ! "$ltp_requeue_case"; then
+    echo "#### SMP GATE FAIL phase=$phase arch=$arch reason=futex-cmp-requeue02 ####"
     exit 1
 fi
 echo "#### SMP GATE PASS phase=$phase arch=$arch ####"
