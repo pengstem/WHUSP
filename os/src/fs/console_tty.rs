@@ -1,16 +1,16 @@
 use super::{PollEvents, PollWaitQueue, PollWaiter};
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::UserBuffer;
-use crate::sync::{Condvar, UPIntrFreeCell};
-#[cfg(not(target_arch = "loongarch64"))]
-use crate::task::schedule;
+use crate::sync::{SpinNoIrqLock, UPIntrFreeCell};
 #[cfg(target_arch = "loongarch64")]
 use crate::task::suspend_current_and_run_next;
 use crate::task::{
-    SignalFlags, current_has_interrupting_signal, current_process_group_id,
-    send_tty_signal_to_process_group,
+    SignalFlags, TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
+    current_has_interrupting_signal, current_process_group_id, current_task, schedule,
+    send_tty_signal_to_process_group, wakeup_task,
 };
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use lazy_static::lazy_static;
 
@@ -172,6 +172,7 @@ struct ConsoleTtyState {
     line_buf: Vec<u8>,
     read_buf: VecDeque<u8>,
     pending_eof: bool,
+    read_wait_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
 impl ConsoleTtyState {
@@ -181,6 +182,7 @@ impl ConsoleTtyState {
             line_buf: Vec::new(),
             read_buf: VecDeque::new(),
             pending_eof: false,
+            read_wait_queue: VecDeque::new(),
         }
     }
 
@@ -193,14 +195,14 @@ impl ConsoleTtyState {
 
 struct ConsoleTty {
     state: UPIntrFreeCell<ConsoleTtyState>,
-    read_waiters: Condvar,
+    input_drain_lock: SpinNoIrqLock<()>,
     poll_waiters: UPIntrFreeCell<PollWaitQueue>,
 }
 
 lazy_static! {
     static ref CONSOLE_TTY: ConsoleTty = ConsoleTty {
         state: unsafe { UPIntrFreeCell::new(ConsoleTtyState::new()) },
-        read_waiters: Condvar::new(),
+        input_drain_lock: SpinNoIrqLock::new(()),
         poll_waiters: unsafe { UPIntrFreeCell::new(PollWaitQueue::new()) },
     };
 }
@@ -342,67 +344,86 @@ pub(crate) fn console_tty_read(user_buf: UserBuffer) -> usize {
 
     loop {
         console_tty_drain_uart();
-        match try_read_buffered(want_to_read) {
+        let mut state = CONSOLE_TTY.state.exclusive_access();
+        match try_read_buffered(&mut state, want_to_read) {
             ReadAttempt::Data(data) => {
+                drop(state);
                 let mut user_buf = user_buf;
                 return user_buf.copy_from_slice(data.as_slice());
             }
             ReadAttempt::Eof => return 0,
             ReadAttempt::Block => {}
         }
+        if let Some(task) = current_task() {
+            state
+                .read_wait_queue
+                .retain(|waiter| !Arc::ptr_eq(waiter, &task));
+        }
         if current_has_interrupting_signal() {
             return 0;
         }
 
         #[cfg(target_arch = "loongarch64")]
-        {
+        if !crate::board::external_irq_available() {
+            drop(state);
             suspend_current_and_run_next();
+            continue;
         }
-        #[cfg(not(target_arch = "loongarch64"))]
-        {
-            let task_cx_ptr = CONSOLE_TTY.read_waiters.wait_no_sched();
-            schedule(task_cx_ptr);
-        }
+        let Some((task, task_cx_ptr)) = block_current_task_no_schedule_unless_unmasked_signal()
+        else {
+            return 0;
+        };
+        state.read_wait_queue.push_back(task);
+        drop(state);
+        schedule(task_cx_ptr);
     }
 }
 
 pub(crate) fn console_tty_drain_uart() {
+    let _drain_guard = CONSOLE_TTY.input_drain_lock.lock();
     let mut should_signal = false;
+    let mut echo_bytes = Vec::new();
     while let Some(ch) = UART.try_read() {
         let action = process_input(ch);
-        echo(action.echo);
+        append_echo(&mut echo_bytes, action.echo);
         if let Some(signal) = action.signal {
             signal_foreground_process_group(signal);
         }
         should_signal |= action.wake_readers;
     }
+    if !echo_bytes.is_empty() {
+        UART.write_bytes(&echo_bytes);
+    }
     if should_signal {
+        let task = CONSOLE_TTY
+            .state
+            .exclusive_session(|state| state.read_wait_queue.pop_front());
         let poll_waiters = CONSOLE_TTY
             .poll_waiters
             .exclusive_session(|waiters| waiters.drain());
-        CONSOLE_TTY.read_waiters.signal();
+        if let Some(task) = task {
+            wakeup_task(task);
+        }
         PollWaiter::wake_all(poll_waiters);
     }
 }
 
-fn try_read_buffered(want_to_read: usize) -> ReadAttempt {
-    CONSOLE_TTY.state.exclusive_session(|state| {
-        if !state.read_buf.is_empty() {
-            let count = want_to_read.min(state.read_buf.len());
-            let mut data = Vec::with_capacity(count);
-            for _ in 0..count {
-                if let Some(ch) = state.read_buf.pop_front() {
-                    data.push(ch);
-                }
+fn try_read_buffered(state: &mut ConsoleTtyState, want_to_read: usize) -> ReadAttempt {
+    if !state.read_buf.is_empty() {
+        let count = want_to_read.min(state.read_buf.len());
+        let mut data = Vec::with_capacity(count);
+        for _ in 0..count {
+            if let Some(ch) = state.read_buf.pop_front() {
+                data.push(ch);
             }
-            return ReadAttempt::Data(data);
         }
-        if state.pending_eof {
-            state.pending_eof = false;
-            return ReadAttempt::Eof;
-        }
-        ReadAttempt::Block
-    })
+        return ReadAttempt::Data(data);
+    }
+    if state.pending_eof {
+        state.pending_eof = false;
+        return ReadAttempt::Eof;
+    }
+    ReadAttempt::Block
 }
 
 fn process_input(mut ch: u8) -> InputAction {
@@ -582,27 +603,15 @@ fn kill_echo(termios: LinuxTermios) -> EchoAction {
     }
 }
 
-fn echo(action: EchoAction) {
+fn append_echo(output: &mut Vec<u8>, action: EchoAction) {
     match action {
         EchoAction::None => {}
-        EchoAction::Byte(ch) => UART.write(ch),
-        EchoAction::Control(ch) => echo_control(ch),
-        EchoAction::ControlNewline(ch) => {
-            echo_control(ch);
-            UART.write(b'\n');
-        }
-        EchoAction::Backspace => {
-            UART.write(8);
-            UART.write(b' ');
-            UART.write(8);
-        }
-        EchoAction::Newline => UART.write(b'\n'),
+        EchoAction::Byte(ch) => output.push(ch),
+        EchoAction::Control(ch) => output.extend_from_slice(&[b'^', ch ^ 0x40]),
+        EchoAction::ControlNewline(ch) => output.extend_from_slice(&[b'^', ch ^ 0x40, b'\n']),
+        EchoAction::Backspace => output.extend_from_slice(&[8, b' ', 8]),
+        EchoAction::Newline => output.push(b'\n'),
     }
-}
-
-fn echo_control(ch: u8) {
-    UART.write(b'^');
-    UART.write(ch ^ 0x40);
 }
 
 fn termios_to_termio(termios: LinuxTermios) -> LinuxTermio {

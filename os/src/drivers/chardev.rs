@@ -9,6 +9,7 @@ use crate::task::suspend_current_and_run_next;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use bitflags::*;
+use core::fmt::{self, Write};
 use core::ptr::NonNull;
 use lazy_static::*;
 use volatile::{
@@ -150,6 +151,19 @@ struct NS16550aInner {
     read_buffer: VecDeque<u8>,
 }
 
+struct NS16550aFmtWriter<'a> {
+    raw: &'a mut NS16550aRaw,
+    bytes: usize,
+}
+
+impl Write for NS16550aFmtWriter<'_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.raw.write_bytes(value.as_bytes());
+        self.bytes = self.bytes.saturating_add(value.len());
+        Ok(())
+    }
+}
+
 impl NS16550aInner {
     fn poll_rx(&mut self) {
         while let Some(ch) = self.ns16550a.read() {
@@ -188,6 +202,19 @@ impl NS16550a {
         }
         drop(inner);
         crate::perf::record_uart_write(total_bytes);
+    }
+
+    pub fn write_fmt_record(&self, args: fmt::Arguments<'_>) -> fmt::Result {
+        let mut inner = self.inner.exclusive_access();
+        let mut writer = NS16550aFmtWriter {
+            raw: &mut inner.ns16550a,
+            bytes: 0,
+        };
+        let result = writer.write_fmt(args);
+        let bytes = writer.bytes;
+        drop(inner);
+        crate::perf::record_uart_write(bytes);
+        result
     }
 }
 
