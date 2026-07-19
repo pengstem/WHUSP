@@ -627,11 +627,16 @@ fn enable_external_irq(eiointc: irq::Eiointc, pch_pic: irq::PchPic, irq: usize) 
     pch_pic.enable(irq);
 }
 
-pub fn device_init(_hart_id: usize) {
+pub fn device_init(hart_id: usize) {
     let config = board_config();
+    let owner_hardware_id = crate::cpu::external_irq_owner_hardware_id();
+    assert_eq!(
+        hart_id, owner_hardware_id,
+        "LoongArch EIOINTC initialized for a non-owner CPU"
+    );
     let eiointc = irq::Eiointc::new(config.eiointc_base);
     let pch_pic = irq::PchPic::new(config.pch_pic.base);
-    eiointc.init();
+    eiointc.init(owner_hardware_id);
     pch_pic.init();
 
     let uart_irq = uart_irq();
@@ -660,6 +665,9 @@ pub fn device_init(_hart_id: usize) {
 pub fn irq_handler() {
     let config = board_config();
     let eiointc = irq::Eiointc::new(config.eiointc_base);
+    // EIOINTC ISR is a current-core IOCSR view, so claim and completion must
+    // execute on the CPU selected by the route byte above.
+    crate::cpu::assert_current_external_irq_owner();
     let Some(intr_src_id) = eiointc.claim() else {
         warn!("spurious LoongArch external IRQ");
         return;

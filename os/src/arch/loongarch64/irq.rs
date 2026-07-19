@@ -27,12 +27,23 @@ impl Eiointc {
         Self { base }
     }
 
-    pub fn init(self) {
+    pub fn init(self, owner_hardware_id: usize) {
         // CONTEXT: QEMU LA virt routes PCH PIC output through extended IOI.
-        // Keep the setup uniprocessor: route all vectors to node/core 0,
-        // matching the current single-hart contest runtime. The contest QEMU
-        // already exposes EIOINTC; probing IOCSR MISC_FUNC is not required for
-        // this virtual platform and may trap on trimmed implementations.
+        // Keep delivery on one CPU, but encode that CPU explicitly rather than
+        // assuming that logical CPU 0 always has hardware ID 0. A legacy route
+        // byte uses high-nibble node plus a low-nibble one-hot core map.
+        let route_node = owner_hardware_id / 4;
+        let route_core = owner_hardware_id % 4;
+        assert!(
+            route_node < 16,
+            "EIOINTC owner node does not fit route byte"
+        );
+        let route = (route_node << 4) | (1usize << route_core);
+        let route = route as u32;
+
+        // The contest QEMU already exposes EIOINTC; probing IOCSR MISC_FUNC is
+        // not required for this virtual platform and may trap on trimmed
+        // implementations.
         for i in 0..(EIOINTC_VEC_COUNT / 32) {
             let data = ((1 << (i * 2 + 1)) << 16) | (1 << (i * 2));
             iocsr_write_w(self.base + EIOINTC_NODEMAP_OFFSET + i * 4, data);
@@ -43,8 +54,7 @@ impl Eiointc {
             iocsr_write_w(self.base + EIOINTC_IPMAP_OFFSET + i * 4, data);
         }
         for i in 0..(EIOINTC_VEC_COUNT / 4) {
-            let bit = 1;
-            let data = bit | (bit << 8) | (bit << 16) | (bit << 24);
+            let data = route | (route << 8) | (route << 16) | (route << 24);
             iocsr_write_w(self.base + EIOINTC_ROUTE_OFFSET + i * 4, data);
         }
         for i in 0..(EIOINTC_VEC_COUNT / 32) {

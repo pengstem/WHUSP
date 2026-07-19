@@ -1,4 +1,3 @@
-use crate::BOOT_HART_ID;
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::drivers::plic::{IntrTargetPriority, PLIC};
 use crate::drivers::{KEYBOARD_DEVICE, MOUSE_DEVICE};
@@ -425,6 +424,11 @@ pub fn rtc_base() -> usize {
 }
 
 pub fn device_init(hart_id: usize) {
+    assert_eq!(
+        hart_id,
+        crate::cpu::external_irq_owner_hardware_id(),
+        "RISC-V PLIC initialized for a non-owner hart"
+    );
     let mut plic = unsafe { PLIC::new(plic_base()) };
     let supervisor = IntrTargetPriority::Supervisor;
     let machine = IntrTargetPriority::Machine;
@@ -452,7 +456,9 @@ pub fn device_init(hart_id: usize) {
 
 pub fn irq_handler() {
     let mut plic = unsafe { PLIC::new(plic_base()) };
-    let hart_id = BOOT_HART_ID.load(Ordering::Relaxed);
+    // PLIC claim/complete registers are per-hart contexts. Read the current
+    // CPU-local hardware ID even while delivery remains fixed on logical CPU0.
+    let hart_id = crate::cpu::assert_current_external_irq_owner();
     let intr_src_id = plic.claim(hart_id, IntrTargetPriority::Supervisor);
     let keyboard_irq = keyboard_irq().map(|irq| irq as u32);
     let mouse_irq = mouse_irq().map(|irq| irq as u32);

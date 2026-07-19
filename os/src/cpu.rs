@@ -7,6 +7,10 @@ use log::info;
 
 pub type CpuId = usize;
 
+// Keep all external device interrupts on the boot scheduler CPU until Phase 4
+// has made each driver queue safe for distributed interrupt handling.
+pub const EXTERNAL_IRQ_OWNER_CPU: CpuId = 0;
+
 pub const PHASE1_IPI_ROUNDS: usize = 32;
 pub const PHASE2_LOCK_INCREMENTS: usize = 4096;
 
@@ -438,6 +442,28 @@ pub fn try_current_id() -> Option<CpuId> {
 
 pub fn current_id() -> CpuId {
     current().logical_id()
+}
+
+pub fn external_irq_owner_hardware_id() -> usize {
+    topology().hardware_id(EXTERNAL_IRQ_OWNER_CPU)
+}
+
+/// Verify the Phase 4 policy that the current-core interrupt controller
+/// context belongs to the one CPU configured for external device interrupts.
+pub fn assert_current_external_irq_owner() -> usize {
+    let current = current();
+    assert_eq!(
+        current.logical_id(),
+        EXTERNAL_IRQ_OWNER_CPU,
+        "external device IRQ reached a non-owner logical CPU"
+    );
+    let expected_hardware_id = external_irq_owner_hardware_id();
+    assert_eq!(
+        current.hardware_id(),
+        expected_hardware_id,
+        "external device IRQ used the wrong hardware CPU context"
+    );
+    expected_hardware_id
 }
 
 #[cfg(target_arch = "riscv64")]

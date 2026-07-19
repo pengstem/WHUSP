@@ -30,8 +30,6 @@ pub(crate) use arch::{board, sbi, timer, trap};
 
 use crate::drivers::chardev::CharDevice;
 use crate::drivers::chardev::UART;
-use core::sync::atomic::{AtomicUsize, Ordering};
-
 fn clear_bss() {
     unsafe extern "C" {
         safe fn sbss();
@@ -46,9 +44,6 @@ fn clear_bss() {
 use lazy_static::*;
 use sync::UPIntrFreeCell;
 
-static BOOT_HART_ID: AtomicUsize = AtomicUsize::new(0);
-static DTB_ADDR: AtomicUsize = AtomicUsize::new(0);
-
 lazy_static! {
     pub static ref DEV_NON_BLOCKING_ACCESS: UPIntrFreeCell<bool> =
         unsafe { UPIntrFreeCell::new(false) };
@@ -59,8 +54,6 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     clear_bss();
     cpu::record_boot_entry();
     cpu::record_global_init();
-    BOOT_HART_ID.store(hart_id, Ordering::Relaxed);
-    DTB_ADDR.store(dtb_addr, Ordering::Relaxed);
     board::init_from_dtb(dtb_addr, hart_id);
     cpu::install_current(0, hart_id);
     mm::init();
