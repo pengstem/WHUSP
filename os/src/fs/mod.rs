@@ -50,7 +50,7 @@ pub(crate) use console_tty::{
 };
 pub(crate) use eventfd::make_eventfd;
 pub(crate) use mount_fd::{DetachedMountFile, FsContextFile, FsContextStateError};
-pub(crate) use timerfd::{TimerFd, TimerFdClock, make_timerfd};
+pub(crate) use timerfd::{TimerFd, TimerFdClock, TimerFdState, make_timerfd};
 
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
 
@@ -189,10 +189,6 @@ impl PollWaiter {
         for waiter in waiters {
             waiter.wake();
         }
-    }
-
-    pub(crate) fn arm_timeout_ms(&self, expire_ms: usize) {
-        crate::timer::add_timer(expire_ms, Arc::clone(&self.task));
     }
 }
 

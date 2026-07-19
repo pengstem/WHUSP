@@ -3,10 +3,10 @@ use super::{
     File, FileStat, FsError, FsResult, OpenFlags, PollEvents, PollWaitQueue, PollWaiter, S_IFIFO,
 };
 use crate::mm::UserBuffer;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::task::{
-    TaskControlBlock, block_current_task_no_schedule, current_has_unmasked_signal, current_task,
-    schedule, wakeup_task,
+    TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
+    current_has_unmasked_signal, current_task, schedule, wakeup_task,
 };
 use crate::timer::get_time_us;
 use alloc::collections::VecDeque;
@@ -21,6 +21,7 @@ pub(crate) enum TimerFdClock {
 }
 
 struct TimerFdInner {
+    generation: u64,
     interval_us: usize,
     next_expire_us: Option<usize>,
     expirations: u64,
@@ -30,23 +31,28 @@ struct TimerFdInner {
 
 pub(crate) struct TimerFd {
     clock: TimerFdClock,
-    inner: UPIntrFreeCell<TimerFdInner>,
+    state: Arc<TimerFdState>,
     status_flags: StatusFlagsCell,
+}
+
+pub(crate) struct TimerFdState {
+    inner: SpinNoIrqLock<TimerFdInner>,
 }
 
 impl TimerFd {
     fn new(clock: TimerFdClock) -> Self {
         Self {
             clock,
-            inner: unsafe {
-                UPIntrFreeCell::new(TimerFdInner {
+            state: Arc::new(TimerFdState {
+                inner: SpinNoIrqLock::new(TimerFdInner {
+                    generation: 0,
                     interval_us: 0,
                     next_expire_us: None,
                     expirations: 0,
                     read_waiters: VecDeque::new(),
                     poll_waiters: PollWaitQueue::new(),
-                })
-            },
+                }),
+            }),
             status_flags: StatusFlagsCell::new(OpenFlags::empty()),
         }
     }
@@ -61,27 +67,63 @@ impl TimerFd {
         next_expire_us: Option<usize>,
     ) -> (usize, usize) {
         let now_us = get_time_us();
-        let (old_interval_us, old_remaining_us, readers, poll_waiters) = {
-            let mut inner = self.inner.exclusive_access();
+        let (old_interval_us, old_remaining_us, readers, poll_waiters, event) = {
+            let mut inner = self.state.inner.lock();
             inner.refresh_expirations(now_us);
             let old_interval_us = inner.interval_us;
             let old_remaining_us = inner.remaining_us(now_us);
+            inner.generation = inner.generation.wrapping_add(1);
             inner.expirations = 0;
             inner.interval_us = interval_us;
             inner.next_expire_us = next_expire_us;
             let (readers, poll_waiters) = inner.drain_waiters();
-            (old_interval_us, old_remaining_us, readers, poll_waiters)
+            let event = next_expire_us.map(|deadline| (deadline, inner.generation));
+            (
+                old_interval_us,
+                old_remaining_us,
+                readers,
+                poll_waiters,
+                event,
+            )
         };
         wake_readers(readers);
         PollWaiter::wake_all(poll_waiters);
+        if let Some((deadline_us, generation)) = event {
+            crate::timer::add_timerfd_timer(deadline_us, generation, Arc::clone(&self.state));
+        }
         (old_interval_us, old_remaining_us)
     }
 
     pub(crate) fn get_time(&self) -> (usize, usize) {
         let now_us = get_time_us();
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.state.inner.lock();
         inner.refresh_expirations(now_us);
         (inner.interval_us, inner.remaining_us(now_us))
+    }
+}
+
+impl TimerFdState {
+    pub(crate) fn expire(&self, generation: u64, now_us: usize) -> Option<(usize, u64)> {
+        let (readers, poll_waiters, next_event) = {
+            let mut inner = self.inner.lock();
+            if inner.generation != generation {
+                return None;
+            }
+            inner.refresh_expirations(now_us);
+            if inner.expirations == 0 {
+                return inner
+                    .next_expire_us
+                    .map(|deadline| (deadline, inner.generation));
+            }
+            let (readers, poll_waiters) = inner.drain_waiters();
+            let next_event = inner
+                .next_expire_us
+                .map(|deadline| (deadline, inner.generation));
+            (readers, poll_waiters, next_event)
+        };
+        wake_readers(readers);
+        PollWaiter::wake_all(poll_waiters);
+        next_event
     }
 }
 
@@ -130,10 +172,6 @@ impl TimerFdInner {
     }
 }
 
-fn deadline_us_to_ms(deadline_us: usize) -> usize {
-    deadline_us.div_ceil(1_000)
-}
-
 fn wake_readers(readers: Vec<Arc<TaskControlBlock>>) {
     for task in readers {
         wakeup_task(task);
@@ -161,7 +199,7 @@ impl File for TimerFd {
         loop {
             let (task, task_cx_ptr) = {
                 let now_us = get_time_us();
-                let mut inner = self.inner.exclusive_access();
+                let mut inner = self.state.inner.lock();
                 inner.refresh_expirations(now_us);
                 if inner.expirations > 0 {
                     let expirations = inner.expirations;
@@ -178,15 +216,16 @@ impl File for TimerFd {
                     return 0;
                 }
 
-                let (task, task_cx_ptr) = block_current_task_no_schedule();
+                let Some((task, task_cx_ptr)) =
+                    block_current_task_no_schedule_unless_unmasked_signal()
+                else {
+                    return 0;
+                };
                 inner.read_waiters.push_back(Arc::clone(&task));
-                if let Some(deadline_us) = inner.next_expire_us {
-                    crate::timer::add_timer(deadline_us_to_ms(deadline_us), Arc::clone(&task));
-                }
                 (task, task_cx_ptr)
             };
             schedule(task_cx_ptr);
-            self.inner.exclusive_access().remove_reader(&task);
+            self.state.inner.lock().remove_reader(&task);
         }
     }
 
@@ -201,9 +240,8 @@ impl File for TimerFd {
     fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
         let now_us = get_time_us();
         let mut ready = PollEvents::empty();
-        let mut arm_deadline_ms = None;
         {
-            let mut inner = self.inner.exclusive_access();
+            let mut inner = self.state.inner.lock();
             inner.refresh_expirations(now_us);
             if events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI) && inner.expirations > 0
             {
@@ -212,13 +250,7 @@ impl File for TimerFd {
                 && events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI)
             {
                 inner.poll_waiters.register(waiter);
-                arm_deadline_ms = inner.next_expire_us.map(deadline_us_to_ms);
             }
-        }
-        if let Some(deadline_ms) = arm_deadline_ms
-            && let Some(waiter) = waiter
-        {
-            waiter.arm_timeout_ms(deadline_ms);
         }
         ready
     }

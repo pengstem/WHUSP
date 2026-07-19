@@ -2,6 +2,7 @@ use core::cmp::Ordering;
 use core::sync::atomic::AtomicU64;
 
 use crate::config::clock_freq;
+use crate::fs::TimerFdState;
 use crate::sbi::set_timer;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{
@@ -220,6 +221,12 @@ pub struct TimerCondVar {
     pub task: Weak<TaskControlBlock>,
 }
 
+pub struct TimerFdTimerEvent {
+    pub expire_us: usize,
+    pub generation: u64,
+    pub state: Weak<TimerFdState>,
+}
+
 pub struct RealTimerEvent {
     pub expire_us: usize,
     pub generation: u64,
@@ -250,6 +257,29 @@ impl PartialOrd for TimerCondVar {
 impl Ord for TimerCondVar {
     fn cmp(&self, other: &Self) -> Ordering {
         other.expire_ms.cmp(&self.expire_ms)
+    }
+}
+
+impl PartialEq for TimerFdTimerEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.expire_us == other.expire_us && self.generation == other.generation
+    }
+}
+
+impl Eq for TimerFdTimerEvent {}
+
+impl PartialOrd for TimerFdTimerEvent {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimerFdTimerEvent {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .expire_us
+            .cmp(&self.expire_us)
+            .then_with(|| other.generation.cmp(&self.generation))
     }
 }
 
@@ -305,6 +335,8 @@ impl Ord for PosixTimerEvent {
 lazy_static! {
     static ref TIMERS: SpinNoIrqLock<BinaryHeap<TimerCondVar>> =
         SpinNoIrqLock::new(BinaryHeap::<TimerCondVar>::new());
+    static ref TIMERFD_TIMERS: SpinNoIrqLock<BinaryHeap<TimerFdTimerEvent>> =
+        SpinNoIrqLock::new(BinaryHeap::<TimerFdTimerEvent>::new());
     static ref REAL_TIMERS: SpinNoIrqLock<BinaryHeap<RealTimerEvent>> =
         SpinNoIrqLock::new(BinaryHeap::<RealTimerEvent>::new());
     static ref POSIX_TIMERS: SpinNoIrqLock<BinaryHeap<PosixTimerEvent>> =
@@ -316,6 +348,14 @@ pub fn add_timer(expire_ms: usize, task: Arc<TaskControlBlock>) {
     timers.push(TimerCondVar {
         expire_ms,
         task: Arc::downgrade(&task),
+    });
+}
+
+pub fn add_timerfd_timer(expire_us: usize, generation: u64, state: Arc<TimerFdState>) {
+    TIMERFD_TIMERS.lock().push(TimerFdTimerEvent {
+        expire_us,
+        generation,
+        state: Arc::downgrade(&state),
     });
 }
 
@@ -423,6 +463,24 @@ pub fn check_timer() {
         }
     }
     let current_us = get_time_us();
+    loop {
+        let event = {
+            let mut timers = TIMERFD_TIMERS.lock();
+            match timers.peek() {
+                Some(event) if event.expire_us <= current_us => timers.pop(),
+                _ => None,
+            }
+        };
+        let Some(event) = event else {
+            break;
+        };
+        let Some(state) = event.state.upgrade() else {
+            continue;
+        };
+        if let Some((next_expire_us, generation)) = state.expire(event.generation, current_us) {
+            add_timerfd_timer(next_expire_us, generation, state);
+        }
+    }
     check_real_timers(current_us);
     check_posix_timers(current_us);
 }

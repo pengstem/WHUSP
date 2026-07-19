@@ -4,10 +4,10 @@ use super::{
 };
 use crate::mm::UserBuffer;
 use crate::perf;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::task::{
-    TaskControlBlock, block_current_task_no_schedule, current_has_unmasked_signal, current_task,
-    schedule, wakeup_task,
+    TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
+    current_has_unmasked_signal, current_task, schedule, wakeup_task,
 };
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -28,39 +28,37 @@ struct EventFdInner {
 }
 
 pub struct EventFd {
-    inner: UPIntrFreeCell<EventFdInner>,
+    inner: SpinNoIrqLock<EventFdInner>,
     status_flags: StatusFlagsCell,
 }
 
 impl EventFd {
     fn new(initval: u64, semaphore: bool) -> Self {
         Self {
-            inner: unsafe {
-                UPIntrFreeCell::new(EventFdInner {
-                    counter: initval,
-                    semaphore,
-                    read_wait_queue: VecDeque::new(),
-                    write_wait_queue: VecDeque::new(),
-                    read_poll_waiters: PollWaitQueue::new(),
-                    write_poll_waiters: PollWaitQueue::new(),
-                })
-            },
+            inner: SpinNoIrqLock::new(EventFdInner {
+                counter: initval,
+                semaphore,
+                read_wait_queue: VecDeque::new(),
+                write_wait_queue: VecDeque::new(),
+                read_poll_waiters: PollWaitQueue::new(),
+                write_poll_waiters: PollWaitQueue::new(),
+            }),
             status_flags: StatusFlagsCell::new(OpenFlags::empty()),
         }
     }
 }
 
 impl EventFdInner {
-    fn sleep_reader(&mut self) -> *mut crate::task::TaskContext {
-        let (task, task_cx_ptr) = block_current_task_no_schedule();
+    fn sleep_reader(&mut self) -> Option<*mut crate::task::TaskContext> {
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
         self.read_wait_queue.push_back(task);
-        task_cx_ptr
+        Some(task_cx_ptr)
     }
 
-    fn sleep_writer(&mut self) -> *mut crate::task::TaskContext {
-        let (task, task_cx_ptr) = block_current_task_no_schedule();
+    fn sleep_writer(&mut self) -> Option<*mut crate::task::TaskContext> {
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
         self.write_wait_queue.push_back(task);
-        task_cx_ptr
+        Some(task_cx_ptr)
     }
 
     fn wake_reader(&mut self) -> Option<Arc<TaskControlBlock>> {
@@ -125,7 +123,7 @@ impl File for EventFd {
         perf::record_eventfd_read_call();
 
         loop {
-            let mut inner = self.inner.exclusive_access();
+            let mut inner = self.inner.lock();
             let (value, writer, poll_writers) = if inner.counter == 0 {
                 if self.status_flags().contains(OpenFlags::NONBLOCK) {
                     return 0;
@@ -137,7 +135,9 @@ impl File for EventFd {
                     return 0;
                 }
                 perf::record_eventfd_reader_sleep();
-                let task_cx_ptr = inner.sleep_reader();
+                let Some(task_cx_ptr) = inner.sleep_reader() else {
+                    return 0;
+                };
                 drop(inner);
                 schedule(task_cx_ptr);
                 continue;
@@ -170,7 +170,7 @@ impl File for EventFd {
         }
 
         loop {
-            let mut inner = self.inner.exclusive_access();
+            let mut inner = self.inner.lock();
             let (reader, poll_readers) =
                 if value <= EVENTFD_COUNTER_MAX.saturating_sub(inner.counter) {
                     inner.counter += value;
@@ -190,7 +190,9 @@ impl File for EventFd {
                         return 0;
                     }
                     perf::record_eventfd_writer_sleep();
-                    let task_cx_ptr = inner.sleep_writer();
+                    let Some(task_cx_ptr) = inner.sleep_writer() else {
+                        return 0;
+                    };
                     drop(inner);
                     schedule(task_cx_ptr);
                     continue;
@@ -207,7 +209,7 @@ impl File for EventFd {
     }
 
     fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         if let Some(waiter) = waiter {
             if events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI) {
                 inner.read_poll_waiters.register(waiter);
