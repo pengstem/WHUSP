@@ -6,26 +6,26 @@ use crate::config::PAGE_SIZE;
 use crate::fs::pipe_max_size;
 use crate::mm::UserBuffer;
 use crate::perf;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::task::{
-    ProcessControlBlock, TaskControlBlock, block_current_task_no_schedule,
+    ProcessControlBlock, TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
     current_has_unmasked_signal, current_process, schedule, wakeup_task,
 };
 
 pub struct Pipe {
     readable: bool,
     writable: bool,
-    buffer: Arc<UPIntrFreeCell<PipeRingBuffer>>,
+    buffer: Arc<SpinNoIrqLock<PipeRingBuffer>>,
     status_flags: StatusFlagsCell,
 }
 
 impl Pipe {
-    pub fn read_end_with_buffer(buffer: Arc<UPIntrFreeCell<PipeRingBuffer>>) -> Self {
+    pub fn read_end_with_buffer(buffer: Arc<SpinNoIrqLock<PipeRingBuffer>>) -> Self {
         Self {
             readable: true,
             writable: false,
@@ -33,7 +33,7 @@ impl Pipe {
             status_flags: StatusFlagsCell::new(OpenFlags::RDONLY),
         }
     }
-    pub fn write_end_with_buffer(buffer: Arc<UPIntrFreeCell<PipeRingBuffer>>) -> Self {
+    pub fn write_end_with_buffer(buffer: Arc<SpinNoIrqLock<PipeRingBuffer>>) -> Self {
         Self {
             readable: false,
             writable: true,
@@ -50,7 +50,7 @@ impl Pipe {
         }
         perf::record_pipe_read_call();
         loop {
-            let mut ring_buffer = self.buffer.exclusive_access();
+            let mut ring_buffer = self.buffer.lock();
             let loop_read = ring_buffer.available_read().min(want_to_read);
             if loop_read == 0 {
                 if ring_buffer.all_write_ends_closed() {
@@ -60,7 +60,9 @@ impl Pipe {
                     return 0;
                 }
                 perf::record_pipe_reader_sleep();
-                let task_cx_ptr = ring_buffer.sleep_reader();
+                let Some(task_cx_ptr) = ring_buffer.sleep_reader() else {
+                    return 0;
+                };
                 drop(ring_buffer);
                 schedule(task_cx_ptr);
                 continue;
@@ -92,7 +94,7 @@ impl Pipe {
         perf::record_pipe_write_call();
         let mut already_write = 0usize;
         loop {
-            let mut ring_buffer = self.buffer.exclusive_access();
+            let mut ring_buffer = self.buffer.lock();
             if ring_buffer.all_read_ends_closed() {
                 // CONTEXT: sys_write/sys_writev translate the initial
                 // no-reader case into SIGPIPE/EPIPE. If readers disappear
@@ -108,7 +110,9 @@ impl Pipe {
                     return already_write;
                 }
                 perf::record_pipe_writer_sleep();
-                let task_cx_ptr = ring_buffer.sleep_writer();
+                let Some(task_cx_ptr) = ring_buffer.sleep_writer() else {
+                    return already_write;
+                };
                 drop(ring_buffer);
                 schedule(task_cx_ptr);
                 continue;
@@ -143,6 +147,25 @@ impl Pipe {
         }
     }
 
+    fn with_two_buffers<R>(
+        &self,
+        out: &Pipe,
+        operation: impl FnOnce(&mut PipeRingBuffer, &mut PipeRingBuffer) -> R,
+    ) -> R {
+        let in_addr = Arc::as_ptr(&self.buffer) as usize;
+        let out_addr = Arc::as_ptr(&out.buffer) as usize;
+        debug_assert_ne!(in_addr, out_addr);
+        if in_addr < out_addr {
+            let mut in_buffer = self.buffer.lock();
+            let mut out_buffer = out.buffer.lock();
+            operation(&mut in_buffer, &mut out_buffer)
+        } else {
+            let mut out_buffer = out.buffer.lock();
+            let mut in_buffer = self.buffer.lock();
+            operation(&mut in_buffer, &mut out_buffer)
+        }
+    }
+
     fn splice_pipe_to_pipe(&self, out: &Pipe, len: usize) -> FsResult<usize> {
         if !self.readable || !out.writable {
             return Err(FsError::InvalidInput);
@@ -154,32 +177,31 @@ impl Pipe {
         // CONTEXT: Hold both ring locks only while moving bytes and collecting
         // wake targets. Scheduler and poll wakeups run after the locks are
         // dropped, matching the read/write paths' lock boundary.
-        let (writer, reader, poll_writers, poll_readers, moved) = {
-            let mut in_buffer = self.buffer.exclusive_access();
-            let mut out_buffer = out.buffer.exclusive_access();
-            let moved = in_buffer.transfer_to(&mut out_buffer, len);
-            let writer = if moved > 0 {
-                in_buffer.wake_writer()
-            } else {
-                None
-            };
-            let reader = if moved > 0 {
-                out_buffer.wake_reader()
-            } else {
-                None
-            };
-            let poll_writers = if moved > 0 {
-                in_buffer.wake_write_poll_waiters()
-            } else {
-                Vec::new()
-            };
-            let poll_readers = if moved > 0 {
-                out_buffer.wake_read_poll_waiters()
-            } else {
-                Vec::new()
-            };
-            (writer, reader, poll_writers, poll_readers, moved)
-        };
+        let (writer, reader, poll_writers, poll_readers, moved) =
+            self.with_two_buffers(out, |in_buffer, out_buffer| {
+                let moved = in_buffer.transfer_to(out_buffer, len);
+                let writer = if moved > 0 {
+                    in_buffer.wake_writer()
+                } else {
+                    None
+                };
+                let reader = if moved > 0 {
+                    out_buffer.wake_reader()
+                } else {
+                    None
+                };
+                let poll_writers = if moved > 0 {
+                    in_buffer.wake_write_poll_waiters()
+                } else {
+                    Vec::new()
+                };
+                let poll_readers = if moved > 0 {
+                    out_buffer.wake_read_poll_waiters()
+                } else {
+                    Vec::new()
+                };
+                (writer, reader, poll_writers, poll_readers, moved)
+            });
         wake_task(writer);
         wake_task(reader);
         PollWaiter::wake_all(poll_writers);
@@ -199,21 +221,41 @@ impl Pipe {
         }
 
         loop {
-            let wait_for = {
-                let mut in_buffer = self.buffer.exclusive_access();
-                let mut out_buffer = out.buffer.exclusive_access();
+            let step = self.with_two_buffers(out, |in_buffer, out_buffer| {
                 if in_buffer.available_read() == 0 {
                     if in_buffer.all_write_ends_closed() || pipe_wait_interrupted() {
-                        return Ok(0);
+                        return PipeTeeStep::Complete {
+                            copied: 0,
+                            reader: None,
+                            poll_readers: Vec::new(),
+                        };
                     }
-                    Some(in_buffer.sleep_reader())
+                    match in_buffer.sleep_reader() {
+                        Some(task_cx_ptr) => PipeTeeStep::Wait(task_cx_ptr),
+                        None => PipeTeeStep::Complete {
+                            copied: 0,
+                            reader: None,
+                            poll_readers: Vec::new(),
+                        },
+                    }
                 } else if out_buffer.available_write() == 0 {
                     if out_buffer.all_read_ends_closed() || pipe_wait_interrupted() {
-                        return Ok(0);
+                        return PipeTeeStep::Complete {
+                            copied: 0,
+                            reader: None,
+                            poll_readers: Vec::new(),
+                        };
                     }
-                    Some(out_buffer.sleep_writer())
+                    match out_buffer.sleep_writer() {
+                        Some(task_cx_ptr) => PipeTeeStep::Wait(task_cx_ptr),
+                        None => PipeTeeStep::Complete {
+                            copied: 0,
+                            reader: None,
+                            poll_readers: Vec::new(),
+                        },
+                    }
                 } else {
-                    let copied = in_buffer.duplicate_to(&mut out_buffer, len);
+                    let copied = in_buffer.duplicate_to(out_buffer, len);
                     let reader = if copied > 0 {
                         out_buffer.wake_reader()
                     } else {
@@ -224,19 +266,37 @@ impl Pipe {
                     } else {
                         Vec::new()
                     };
-                    drop(out_buffer);
-                    drop(in_buffer);
+                    PipeTeeStep::Complete {
+                        copied,
+                        reader,
+                        poll_readers,
+                    }
+                }
+            });
+
+            match step {
+                PipeTeeStep::Wait(task_cx_ptr) => schedule(task_cx_ptr),
+                PipeTeeStep::Complete {
+                    copied,
+                    reader,
+                    poll_readers,
+                } => {
                     wake_task(reader);
                     PollWaiter::wake_all(poll_readers);
                     return Ok(copied);
                 }
-            };
-
-            if let Some(task_cx_ptr) = wait_for {
-                schedule(task_cx_ptr);
             }
         }
     }
+}
+
+enum PipeTeeStep {
+    Wait(*mut crate::task::TaskContext),
+    Complete {
+        copied: usize,
+        reader: Option<Arc<TaskControlBlock>>,
+        poll_readers: Vec<Arc<PollWaiter>>,
+    },
 }
 
 pub(super) const PIPE_MIN_CAPACITY: usize = PAGE_SIZE;
@@ -465,20 +525,20 @@ impl PipeRingBuffer {
     ///
     /// The caller must drop the ring-buffer lock before passing the returned
     /// context pointer to `schedule()`, otherwise writers cannot wake it.
-    fn sleep_reader(&mut self) -> *mut crate::task::TaskContext {
-        let (task, task_cx_ptr) = block_current_task_no_schedule();
+    fn sleep_reader(&mut self) -> Option<*mut crate::task::TaskContext> {
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
         self.read_wait_queue.push_back(task);
-        task_cx_ptr
+        Some(task_cx_ptr)
     }
 
     /// Blocks the current writer until pipe capacity or peer teardown changes.
     ///
     /// The caller must drop the ring-buffer lock before passing the returned
     /// context pointer to `schedule()`, otherwise readers cannot wake it.
-    fn sleep_writer(&mut self) -> *mut crate::task::TaskContext {
-        let (task, task_cx_ptr) = block_current_task_no_schedule();
+    fn sleep_writer(&mut self) -> Option<*mut crate::task::TaskContext> {
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
         self.write_wait_queue.push_back(task);
-        task_cx_ptr
+        Some(task_cx_ptr)
     }
     fn wake_reader(&mut self) -> Option<Arc<TaskControlBlock>> {
         self.read_wait_queue.pop_front()
@@ -526,10 +586,10 @@ fn default_pipe_capacity_for_credentials_root(is_root: bool) -> usize {
 }
 
 pub fn make_pipe(capacity: usize) -> (Arc<Pipe>, Arc<Pipe>) {
-    let buffer = Arc::new(unsafe { UPIntrFreeCell::new(PipeRingBuffer::new(capacity)) });
+    let buffer = Arc::new(SpinNoIrqLock::new(PipeRingBuffer::new(capacity)));
     let read_end = Arc::new(Pipe::read_end_with_buffer(buffer.clone()));
     let write_end = Arc::new(Pipe::write_end_with_buffer(buffer.clone()));
-    let mut inner = buffer.exclusive_access();
+    let mut inner = buffer.lock();
     inner.set_read_end(&read_end);
     inner.set_write_end(&write_end);
     (read_end, write_end)
@@ -560,7 +620,7 @@ impl Drop for Pipe {
         // can be produced by the syscall layer. Wake after releasing the ring
         // lock because the scheduler may inspect the same pipe state.
         let (readers, writers, poll_readers, poll_writers) = {
-            let mut ring_buffer = self.buffer.exclusive_access();
+            let mut ring_buffer = self.buffer.lock();
             let readers = if self.writable {
                 ring_buffer.wake_all_readers()
             } else {
@@ -617,16 +677,16 @@ impl File for Pipe {
         self.status_flags.set(flags);
     }
     fn pipe_capacity(&self) -> Option<usize> {
-        Some(self.buffer.exclusive_access().capacity())
+        Some(self.buffer.lock().capacity())
     }
     fn set_pipe_capacity(&self, capacity: usize) -> FsResult<usize> {
-        self.buffer.exclusive_access().resize(capacity)
+        self.buffer.lock().resize(capacity)
     }
     fn pipe_occupied(&self) -> Option<usize> {
-        Some(self.buffer.exclusive_access().available_read())
+        Some(self.buffer.lock().available_read())
     }
     fn pipe_readers_closed(&self) -> bool {
-        self.writable && self.buffer.exclusive_access().all_read_ends_closed()
+        self.writable && self.buffer.lock().all_read_ends_closed()
     }
     fn splice_pipe_to_pipe(
         &self,
@@ -652,7 +712,7 @@ impl File for Pipe {
         self.poll_with_wait(events, None)
     }
     fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
-        let mut ring_buffer = self.buffer.exclusive_access();
+        let mut ring_buffer = self.buffer.lock();
         if let Some(waiter) = waiter {
             if self.readable && events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI) {
                 ring_buffer.register_read_poll_waiter(waiter);

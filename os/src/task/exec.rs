@@ -48,6 +48,8 @@ fn is_smp_phase4_wait_probe_path(path: &str) -> bool {
             | "/x1/smp-wait-timer-la"
             | "/x1/smp-wait-futex-rv"
             | "/x1/smp-wait-futex-la"
+            | "/x1/smp-wait-pipe-rv"
+            | "/x1/smp-wait-pipe-la"
     )
 }
 const AT_CLKTCK: usize = 17;

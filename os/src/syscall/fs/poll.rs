@@ -1,9 +1,8 @@
-use crate::arch::interrupt;
 use crate::fs::{File, PollEvents, PollWaiter};
 use crate::perf;
 use crate::task::{
-    block_current_task_no_schedule, current_has_interrupting_signal, current_task,
-    current_user_token, schedule,
+    block_current_task_no_schedule_unless_unmasked_signal, current_has_interrupting_signal,
+    current_task, current_user_token, schedule,
 };
 use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
@@ -58,31 +57,23 @@ fn sleep_until_poll_event(waiter: &Arc<PollWaiter>, deadline_ms: Option<usize>) 
     }
 
     let _sleep_guard = ProcSleepGuard::new()?;
-    let interrupts_enabled = interrupt::supervisor_interrupt_enabled();
-    // CONTEXT: Registering the waiter and blocking must be atomic with respect
-    // to IRQ wakeups. Recheck after disabling interrupts so a device/timer wake
-    // cannot be lost between scan_pollfds() and schedule().
-    interrupt::disable_supervisor_interrupt();
-    if waiter.was_triggered() {
-        if interrupts_enabled {
-            interrupt::enable_supervisor_interrupt();
-        }
-        return Ok(0);
-    }
-    let (task, task_cx_ptr) = block_current_task_no_schedule();
+    let (task, task_cx_ptr) =
+        block_current_task_no_schedule_unless_unmasked_signal().ok_or(SysError::EINTR)?;
     debug_assert!(waiter.task_matches(&task));
     if let Some(deadline_ms) = deadline_ms {
-        add_timer(deadline_ms, task);
+        add_timer(deadline_ms, Arc::clone(&task));
     }
-    if interrupts_enabled {
-        interrupt::enable_supervisor_interrupt();
-    }
+    // A remote producer may have set triggered while this task was still
+    // Running. Recheck after publishing Blocked so that wake becomes a
+    // wake_pending handoff instead of a lost notification.
+    waiter.complete_block_handoff();
     schedule(task_cx_ptr);
     Ok(0)
 }
 
 fn block_signal_only_waiter() -> SysResult {
-    let (blocked_task, task_cx_ptr) = block_current_task_no_schedule();
+    let (blocked_task, task_cx_ptr) =
+        block_current_task_no_schedule_unless_unmasked_signal().ok_or(SysError::EINTR)?;
     drop(blocked_task);
     schedule(task_cx_ptr);
     Ok(0)

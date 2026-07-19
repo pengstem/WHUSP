@@ -25,7 +25,7 @@ mod tmpfs;
 mod vfs;
 
 use crate::mm::{UserBuffer, page_cache::PageCacheId};
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use alloc::{
     collections::{BTreeSet, VecDeque},
     string::String,
@@ -117,7 +117,7 @@ pub struct PollWaiter {
     triggered: AtomicBool,
     registrations: AtomicUsize,
     registration_source: AtomicUsize,
-    ready_sources: UPIntrFreeCell<PollWaiterReadySources>,
+    ready_sources: SpinNoIrqLock<PollWaiterReadySources>,
 }
 
 pub struct PollRegistrationSourceGuard<'a> {
@@ -132,7 +132,7 @@ impl PollWaiter {
             triggered: AtomicBool::new(false),
             registrations: AtomicUsize::new(0),
             registration_source: AtomicUsize::new(POLL_WAIT_NO_SOURCE),
-            ready_sources: unsafe { UPIntrFreeCell::new(PollWaiterReadySources::new()) },
+            ready_sources: SpinNoIrqLock::new(PollWaiterReadySources::new()),
         })
     }
 
@@ -167,18 +167,22 @@ impl PollWaiter {
     }
 
     fn record_ready_source(&self, source: usize) {
-        self.ready_sources
-            .exclusive_session(|sources| sources.push(source));
+        self.ready_sources.lock().push(source);
     }
 
     pub fn drain_ready_sources(&self) -> Vec<usize> {
-        self.ready_sources
-            .exclusive_session(PollWaiterReadySources::drain)
+        self.ready_sources.lock().drain()
     }
 
     pub fn wake(&self) -> bool {
         self.triggered.store(true, Ordering::Release);
         crate::task::wakeup_task(Arc::clone(&self.task))
+    }
+
+    pub fn complete_block_handoff(&self) {
+        if self.was_triggered() {
+            let _ = crate::task::wakeup_task(Arc::clone(&self.task));
+        }
     }
 
     pub fn wake_all(waiters: Vec<Arc<Self>>) {

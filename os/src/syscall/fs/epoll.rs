@@ -1,11 +1,11 @@
-use crate::arch::interrupt;
 use crate::fs::{File, FileStat, OpenFlags, PollEvents, PollWaiter, S_IFDIR, S_IFMT};
 use crate::mm::UserBuffer;
 use crate::perf;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::task::{
-    SignalFlags, block_current_task_no_schedule, current_has_interrupting_signal, current_task,
-    current_user_token, linux_sigset_to_flags, schedule,
+    SignalFlags, block_current_task_no_schedule_unless_unmasked_signal,
+    current_has_interrupting_signal, current_task, current_user_token, linux_sigset_to_flags,
+    schedule,
 };
 use crate::timer::{add_timer, get_time_us};
 use alloc::collections::{BTreeMap, btree_map::Entry};
@@ -104,18 +104,19 @@ impl Drop for TemporarySignalMask {
 }
 
 pub struct EpollFile {
-    interests: UPIntrFreeCell<BTreeMap<usize, EpollInterest>>,
+    interests: SpinNoIrqLock<BTreeMap<usize, EpollInterest>>,
 }
 
 impl EpollFile {
     fn new() -> Self {
         Self {
-            interests: unsafe { UPIntrFreeCell::new(BTreeMap::new()) },
+            interests: SpinNoIrqLock::new(BTreeMap::new()),
         }
     }
 
     fn collect_ready_sources(&self, maxevents: usize, sources: &[usize]) -> Vec<LinuxEpollEvent> {
-        self.interests.exclusive_session(|interests| {
+        {
+            let interests = &mut *self.interests.lock();
             let mut ready_events = Vec::new();
             let mut visits = 0usize;
             for fd in sources.iter().copied() {
@@ -137,7 +138,7 @@ impl EpollFile {
             }
             perf::record_epoll_ready_list(visits, ready_events.len());
             ready_events
-        })
+        }
     }
 
     fn scan_ready_with_waiter(
@@ -145,7 +146,8 @@ impl EpollFile {
         maxevents: usize,
         waiter: Option<&Arc<PollWaiter>>,
     ) -> EpollScanResult {
-        self.interests.exclusive_session(|interests| {
+        {
+            let interests = &mut *self.interests.lock();
             let mut ready_events = Vec::new();
             let mut visits = 0usize;
             let mut fallback_needed = false;
@@ -177,7 +179,7 @@ impl EpollFile {
                 waiter_registrations: waiter.map_or(0, |waiter| waiter.registration_count()),
                 fallback_needed,
             }
-        })
+        }
     }
 }
 
@@ -349,12 +351,12 @@ fn epoll_file_from(file: &Arc<dyn File + Send + Sync>) -> Option<&EpollFile> {
 
 fn epoll_children(file: &Arc<dyn File + Send + Sync>) -> Vec<Arc<dyn File + Send + Sync>> {
     epoll_file_from(file).map_or_else(Vec::new, |epoll| {
-        epoll.interests.exclusive_session(|interests| {
-            interests
-                .values()
-                .map(|entry| Arc::clone(&entry.file))
-                .collect()
-        })
+        epoll
+            .interests
+            .lock()
+            .values()
+            .map(|entry| Arc::clone(&entry.file))
+            .collect()
     })
 }
 
@@ -445,7 +447,8 @@ pub fn sys_epoll_ctl(epfd_raw: usize, op: i32, fd_raw: usize, event: *const u8) 
         EPOLL_CTL_ADD => {
             let event = read_epoll_event(token, event)?;
             validate_epoll_target(&epoll_file, &target_file)?;
-            epoll.interests.exclusive_session(|interests| {
+            {
+                let interests = &mut *epoll.interests.lock();
                 let result = match interests.entry(fd_raw) {
                     Entry::Occupied(_) => Err(SysError::EEXIST),
                     Entry::Vacant(slot) => {
@@ -460,16 +463,18 @@ pub fn sys_epoll_ctl(epfd_raw: usize, op: i32, fd_raw: usize, event: *const u8) 
                 };
                 perf::record_epoll_ctl(0, 1, interests.len());
                 result
-            })
+            }
         }
-        EPOLL_CTL_DEL => epoll.interests.exclusive_session(|interests| {
+        EPOLL_CTL_DEL => {
+            let interests = &mut *epoll.interests.lock();
             let result = interests.remove(&fd_raw).map(|_| 0).ok_or(SysError::ENOENT);
             perf::record_epoll_ctl(0, 1, interests.len());
             result
-        }),
+        }
         EPOLL_CTL_MOD => {
             let event = read_epoll_event(token, event)?;
-            epoll.interests.exclusive_session(|interests| {
+            {
+                let interests = &mut *epoll.interests.lock();
                 let result = match interests.get_mut(&fd_raw) {
                     Some(interest) => {
                         interest.event = event;
@@ -481,7 +486,7 @@ pub fn sys_epoll_ctl(epfd_raw: usize, op: i32, fd_raw: usize, event: *const u8) 
                 };
                 perf::record_epoll_ctl(0, 1, interests.len());
                 result
-            })
+            }
         }
         _ => Err(SysError::EINVAL),
     }
@@ -541,7 +546,8 @@ fn sleep_until_next_epoll_probe(deadline_us: Option<usize>) -> SysResult {
     let sleep_us = target_us.saturating_sub(now_us);
     let expire_ms = target_us.div_ceil(1_000);
     current_task().ok_or(SysError::ESRCH)?;
-    let (task, task_cx_ptr) = block_current_task_no_schedule();
+    let (task, task_cx_ptr) =
+        block_current_task_no_schedule_unless_unmasked_signal().ok_or(SysError::EINTR)?;
     add_timer(expire_ms, task);
     perf::record_epoll_backoff_sleep(sleep_us);
     schedule(task_cx_ptr);
@@ -559,22 +565,13 @@ fn sleep_until_epoll_event(waiter: &Arc<PollWaiter>, deadline_us: Option<usize>)
         return Err(SysError::EINTR);
     }
 
-    let interrupts_enabled = interrupt::supervisor_interrupt_enabled();
-    interrupt::disable_supervisor_interrupt();
-    if waiter.was_triggered() {
-        if interrupts_enabled {
-            interrupt::enable_supervisor_interrupt();
-        }
-        return Ok(0);
-    }
-    let (task, task_cx_ptr) = block_current_task_no_schedule();
+    let (task, task_cx_ptr) =
+        block_current_task_no_schedule_unless_unmasked_signal().ok_or(SysError::EINTR)?;
     debug_assert!(waiter.task_matches(&task));
     if let Some(deadline_us) = deadline_us {
-        add_timer(deadline_us.div_ceil(1_000), task);
+        add_timer(deadline_us.div_ceil(1_000), Arc::clone(&task));
     }
-    if interrupts_enabled {
-        interrupt::enable_supervisor_interrupt();
-    }
+    waiter.complete_block_handoff();
     perf::record_epoll_waiter_sleep();
     schedule(task_cx_ptr);
     Ok(0)
