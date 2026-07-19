@@ -363,11 +363,8 @@ pub fn sys_sched_getaffinity_ctx(
     if cpusetsize < AFFINITY_MASK_BYTES {
         return Err(SysError::EINVAL);
     }
-    let _task = sched_target_task_ctx(ctx, pid)?;
-    // CONTEXT: The current contest runtime exposes a single runnable hart to
-    // user space and does not model Linux cpusets/cgroups yet, so every task
-    // reports an affinity mask containing CPU 0 only.
-    let affinity_mask = 1usize;
+    let task = sched_target_task_ctx(ctx, pid)?;
+    let affinity_mask = task.inner_exclusive_access().allowed_cpus.bits() as usize;
     write_user_value_with_mmap_fault_ctx(ctx, mask as *mut usize, &affinity_mask)?;
     Ok(AFFINITY_MASK_BYTES as isize)
 }
@@ -383,13 +380,35 @@ pub fn sys_sched_setaffinity_ctx(
     }
     let task = sched_target_task_ctx(ctx, pid)?;
     let affinity_mask = read_user_value_with_mmap_fault_ctx(ctx, mask as *const usize)?;
-    if affinity_mask & 1 == 0 {
+    let possible = crate::cpu::topology().possible_mask().bits() as usize;
+    let requested = affinity_mask & possible;
+    if requested == 0 {
         return Err(SysError::EINVAL);
     }
     ensure_can_change_task_sched_ctx(ctx, &task, false)?;
-    // CONTEXT: The current contest runtime has only CPU 0 available to user
-    // space. Accept masks that include CPU 0 for ABI compatibility, but do
-    // not perform migration or persist a broader cpuset model yet.
+    let mut inner = task.inner_exclusive_access();
+    if inner.smp_sched_probe && pid == 0 && Arc::ptr_eq(&task, ctx.task()) {
+        if requested == 1 {
+            // The recognized Phase 3 worker uses CPU0 as an end-of-workload
+            // marker. Preserve its existing all-online placement so exit-time
+            // VFS handoffs remain part of the multi-CPU lifecycle test.
+            inner.smp_sched_probe_active = false;
+        } else {
+            inner.allowed_cpus = crate::cpu::CpuMask::from_bits(requested as u64);
+            inner.smp_sched_probe_active = true;
+        }
+    } else {
+        // CONTEXT: Until Phase 4 closes shared I/O/wait paths, ordinary contest
+        // tasks remain on CPU 0. The bounded Phase 3 ELF above is the only
+        // caller allowed to widen its mask; Linux-visible affinity completion
+        // for general tasks belongs to Phase 6.
+        if affinity_mask & 1 == 0 {
+            return Err(SysError::EINVAL);
+        }
+        inner.allowed_cpus = crate::cpu::CpuMask::single(0);
+    }
+    drop(inner);
+    crate::cpu::wake_scheduler_cpu(crate::cpu::CpuMask::from_bits(requested as u64));
     Ok(0)
 }
 

@@ -11,6 +11,7 @@ mod process_lifecycle;
 mod processor;
 mod ptrace;
 mod signal;
+mod smp_probe;
 #[allow(clippy::module_inception)]
 mod task;
 
@@ -79,6 +80,7 @@ pub use signal::{
 #[cfg(target_arch = "riscv64")]
 pub use signal::{SIGRT_1, SIGRTMIN};
 pub(crate) use signal::{flags_to_linux_sigset, linux_sigset_to_flags};
+pub(crate) use smp_probe::record_yield_syscall as record_smp_probe_yield_syscall;
 pub(crate) use task::SCHED_RR_INTERVAL_US;
 pub use task::{DEFAULT_TIMER_SLACK_NS, SeccompSockFilter, TaskControlBlock, TaskStatus};
 
@@ -557,8 +559,8 @@ fn write_core_dump(context: PathContext, path: String, bytes: Vec<u8>) {
 }
 
 fn exit_current(exit_code: i32, group_exit: bool) {
-    account_current_system_time();
     let current = current_task().expect("exit_current requires a current task");
+    account_current_system_time();
     let process = current
         .process
         .upgrade()

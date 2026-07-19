@@ -141,6 +141,9 @@ pub(super) fn prepare_current_switch(
         assert!(!inner.wake_pending, "running task retained a wakeup");
         if reason == SwitchReason::Block {
             inner.task_status = TaskStatus::Blocked;
+            if inner.smp_sched_probe_active {
+                super::smp_probe::record_block();
+            }
         } else if reason == SwitchReason::Exit {
             inner.task_status = TaskStatus::Exited;
         }
@@ -152,7 +155,7 @@ pub(super) fn prepare_current_switch(
 
 fn finish_current_switch() {
     let cpu = crate::cpu::current_id();
-    let (task, reason) = {
+    let (task, process, reason) = {
         let mut processor = processor();
         let reason = processor
             .pending_switch
@@ -162,9 +165,12 @@ fn finish_current_switch() {
             .current
             .take()
             .expect("pending switch lost its current task");
-        processor.current_process = None;
+        let process = processor
+            .current_process
+            .take()
+            .expect("pending switch lost its current process");
         processor.current_user_token = 0;
-        (task, reason)
+        (task, process, reason)
     };
 
     if reason == SwitchReason::Block {
@@ -174,8 +180,10 @@ fn finish_current_switch() {
     }
 
     let mut enqueue = None;
+    let probe;
     {
         let mut inner = task.inner_exclusive_access();
+        probe = inner.smp_sched_probe;
         assert_eq!(
             inner.on_cpu,
             Some(cpu),
@@ -210,8 +218,11 @@ fn finish_current_switch() {
         }
     }
 
-    let process = process_of_task(&task);
     process.release_scheduler_cpu(cpu);
+
+    if probe && reason == SwitchReason::Exit {
+        super::smp_probe::record_exit();
+    }
 
     match reason {
         SwitchReason::Yield => super::requeue_task_after_run(task),
@@ -225,6 +236,7 @@ fn finish_current_switch() {
 }
 
 pub fn run_tasks() -> ! {
+    crate::cpu::scheduler_publish_active(crate::cpu::current_id());
     loop {
         let mut processor = processor();
         if let Some(task) = fetch_task() {

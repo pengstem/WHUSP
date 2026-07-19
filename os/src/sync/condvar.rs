@@ -22,8 +22,8 @@ impl Condvar {
     }
 
     pub fn signal(&self) -> bool {
-        let mut inner = self.inner.exclusive_access();
-        if let Some(task) = inner.wait_queue.pop_front() {
+        let task = self.inner.exclusive_access().wait_queue.pop_front();
+        if let Some(task) = task {
             wakeup_task(task);
             true
         } else {
@@ -32,10 +32,12 @@ impl Condvar {
     }
 
     pub fn wait_no_sched(&self) -> *mut TaskContext {
+        // Serialize the Blocked publication and queue insertion against
+        // signal(). Otherwise a completion can observe an empty queue after
+        // the task has committed to sleeping but before it becomes wakeable.
+        let mut inner = self.inner.exclusive_access();
         let (task, task_cx_ptr) = block_current_task_no_schedule();
-        self.inner.exclusive_session(|inner| {
-            inner.wait_queue.push_back(task);
-        });
+        inner.wait_queue.push_back(task);
         task_cx_ptr
     }
 }

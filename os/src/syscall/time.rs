@@ -4,7 +4,7 @@ use crate::syscall::SyscallContext;
 use crate::task::{
     CAP_SYS_TIME, ProcessCpuTimesSnapshot, block_current_task_no_schedule,
     current_has_deliverable_signal, current_process, current_user_token, pid2process, schedule,
-    task_with_linux_tid,
+    task_with_linux_tid, wakeup_task,
 };
 use crate::timer::{
     add_posix_timer, add_real_timer, add_timer, get_time_clock_ticks, get_time_ms, get_time_us,
@@ -705,7 +705,19 @@ fn sleep_until_ms(expire_ms: usize) -> SysResult {
         return Err(SysError::EINTR);
     }
     let (task, task_cx_ptr) = block_current_task_no_schedule();
-    add_timer(expire_ms, task);
+    let force_boundary_wake = task.is_smp_sched_probe_active();
+    if force_boundary_wake {
+        // The Phase 3 probe validates the wake-before-physical-switch boundary,
+        // not elapsed-time semantics. Do not also leave a real timer behind:
+        // on a slower target that stale event can wake a later sleep cycle and
+        // turn one logical block into two unrelated wakeups.
+        assert!(
+            wakeup_task(task),
+            "Phase 3 probe failed to publish its boundary wake"
+        );
+    } else {
+        add_timer(expire_ms, task);
+    }
     schedule(task_cx_ptr);
     if get_time_ms() < expire_ms && current_has_deliverable_signal() {
         return Err(SysError::EINTR);

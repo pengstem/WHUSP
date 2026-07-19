@@ -174,6 +174,9 @@ impl TaskManager {
         inner.queued_cpu = None;
         inner.on_cpu = Some(cpu);
         inner.task_status = TaskStatus::Running;
+        if inner.smp_sched_probe_active {
+            super::smp_probe::record_run(cpu);
+        }
         ClaimResult::Claimed
     }
 
@@ -463,13 +466,15 @@ lazy_static! {
 }
 
 pub fn add_task(task: Arc<TaskControlBlock>) {
+    let allowed = task.inner_exclusive_access().allowed_cpus;
     TASK_MANAGER.exclusive_access().add(task);
-    crate::cpu::wake_scheduler_cpus();
+    crate::cpu::wake_scheduler_cpu(allowed);
 }
 
 pub(crate) fn requeue_task_after_run(task: Arc<TaskControlBlock>) {
+    let allowed = task.inner_exclusive_access().allowed_cpus;
     TASK_MANAGER.exclusive_access().requeue_after_run(task);
-    crate::cpu::wake_scheduler_cpus();
+    crate::cpu::wake_scheduler_cpu(allowed);
 }
 
 pub(super) fn charge_task_after_run(task: &TaskControlBlock) {
@@ -493,14 +498,22 @@ fn wakeup_task_with_placement(task: Arc<TaskControlBlock>, front: bool) -> bool 
             }
             task_inner.wake_pending = true;
             task_inner.wake_front = front;
+            let probe = task_inner.smp_sched_probe_active;
             drop(task_inner);
+            if probe {
+                super::smp_probe::record_wake(true);
+            }
             perf::record_task_wakeup(front);
             return true;
         }
         assert!(!task_inner.wake_pending, "off-CPU task retained a wakeup");
         task_inner.task_status = TaskStatus::Ready;
+        let probe = task_inner.smp_sched_probe_active;
         drop(task_inner);
         enqueue_woken_task(task, front);
+        if probe {
+            super::smp_probe::record_wake(false);
+        }
         perf::record_task_wakeup(front);
         true
     } else {
@@ -509,6 +522,7 @@ fn wakeup_task_with_placement(task: Arc<TaskControlBlock>, front: bool) -> bool 
 }
 
 pub(super) fn enqueue_woken_task(task: Arc<TaskControlBlock>, front: bool) {
+    let allowed = task.inner_exclusive_access().allowed_cpus;
     let mut manager = TASK_MANAGER.exclusive_access();
     if front {
         manager.add_front(task);
@@ -516,7 +530,7 @@ pub(super) fn enqueue_woken_task(task: Arc<TaskControlBlock>, front: bool) {
         manager.add(task);
     }
     drop(manager);
-    crate::cpu::wake_scheduler_cpus();
+    crate::cpu::wake_scheduler_cpu(allowed);
 }
 
 pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
@@ -551,10 +565,11 @@ pub(super) fn remove_ready_tasks_of_process(process_id: usize) {
 }
 
 pub(crate) fn reprioritize_ready_task(task: Arc<TaskControlBlock>) {
+    let allowed = task.inner_exclusive_access().allowed_cpus;
     TASK_MANAGER
         .exclusive_access()
         .reprioritize_ready_task(task);
-    crate::cpu::wake_scheduler_cpus();
+    crate::cpu::wake_scheduler_cpu(allowed);
 }
 
 pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {

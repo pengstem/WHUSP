@@ -74,6 +74,8 @@ pub struct TaskControlBlockInner {
     // independent-address-space probe widens this mask before Phase 4 audits
     // shared I/O and waitable subsystems.
     pub(crate) allowed_cpus: crate::cpu::CpuMask,
+    pub(crate) smp_sched_probe: bool,
+    pub(crate) smp_sched_probe_active: bool,
     // Linux-visible sleep state for cooperative wait loops that stay runnable.
     pub proc_sleeping: bool,
     pub exit_code: Option<i32>,
@@ -158,6 +160,8 @@ impl TaskControlBlock {
                     wake_pending: false,
                     wake_front: false,
                     allowed_cpus: crate::cpu::CpuMask::single(0),
+                    smp_sched_probe: false,
+                    smp_sched_probe_active: false,
                     proc_sleeping: false,
                     exit_code: None,
                     linux_tid: None,
@@ -192,6 +196,10 @@ impl TaskControlBlock {
 
     pub fn inner_exclusive_access(&self) -> UPIntrRefMut<'_, TaskControlBlockInner> {
         self.inner.exclusive_access()
+    }
+
+    pub(crate) fn is_smp_sched_probe_active(&self) -> bool {
+        self.inner_exclusive_access().smp_sched_probe_active
     }
 
     pub fn get_user_token(&self) -> usize {

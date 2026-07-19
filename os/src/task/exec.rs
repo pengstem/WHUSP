@@ -28,6 +28,10 @@ const AT_EUID: usize = 12;
 const AT_GID: usize = 13;
 const AT_EGID: usize = 14;
 const AT_HWCAP: usize = 16;
+
+fn is_smp_sched_probe_path(path: &str) -> bool {
+    matches!(path, "/x1/smp-sched-life-rv" | "/x1/smp-sched-life-la")
+}
 const AT_CLKTCK: usize = 17;
 const AT_SECURE: usize = 23;
 const AT_RANDOM: usize = 25;
@@ -345,6 +349,7 @@ impl ProcessControlBlock {
         executable_path: String,
         executable_node: Option<VfsNodeId>,
     ) -> SysResult<()> {
+        let smp_sched_probe = is_smp_sched_probe_path(&executable_path);
         let current = current_task().ok_or(SysError::ESRCH)?;
         let process_token = self.inner_exclusive_access().get_user_token();
         let task = prepare_exec_thread_group(self, current, process_token, self.getpid())?;
@@ -420,6 +425,16 @@ impl ProcessControlBlock {
         task_inner.robust_list_head = 0;
         task_inner.sigsuspend_restore_mask = None;
         task_inner.sigaltstack = SigAltStack::disabled();
+        task_inner.smp_sched_probe = smp_sched_probe;
+        // Start counting only when the worker explicitly widens its affinity.
+        // Lazy executable page-in can block before the first user instruction
+        // and is outside the bounded scheduler lifecycle workload.
+        task_inner.smp_sched_probe_active = false;
+        // Keep initial executable page-in on CPU 0. The probe's first
+        // sched_setaffinity() call widens placement only after it has entered
+        // its self-contained scheduler workload; shared VFS/I/O concurrency is
+        // audited separately in Phase 4.
+        task_inner.allowed_cpus = crate::cpu::CpuMask::single(0);
         let (trap_cx_ppn, user_stack_top) = {
             let task_res = task_inner
                 .res

@@ -363,7 +363,7 @@ fn trap_return_for_task(
 }
 
 #[unsafe(no_mangle)]
-pub fn trap_from_kernel(_trap_cx: &TrapContext) {
+pub fn trap_from_kernel(trap_cx: &TrapContext) {
     let estat = estat::read();
     let badv = badv::read().vaddr();
     match estat.cause() {
@@ -401,8 +401,14 @@ pub fn trap_from_kernel(_trap_cx: &TrapContext) {
         }
         other => {
             panic!(
-                "Unsupported LoongArch trap from kernel: {:?}, badv = {:#x}, trampoline={:#x}!",
-                other, badv, TRAMPOLINE
+                "Unsupported LoongArch trap from kernel: {:?}, cpu={}, era={:#x}, badv={:#x}, ra={:#x}, sp={:#x}, trampoline={:#x}!",
+                other,
+                crate::cpu::current_id(),
+                trap_cx.era,
+                badv,
+                trap_cx.x[1],
+                trap_cx.x[3],
+                TRAMPOLINE
             );
         }
     }

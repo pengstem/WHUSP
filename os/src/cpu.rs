@@ -123,6 +123,10 @@ impl CpuMask {
         Self(1u64 << cpu)
     }
 
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
     pub const fn bits(self) -> u64 {
         self.0
     }
@@ -341,8 +345,11 @@ static PHASE2_PROBE_FAILURES: AtomicUsize = AtomicUsize::new(0);
 static PHASE2_PROBE_PERF: [Phase2ProbePerf; MAX_CPUS] =
     [const { Phase2ProbePerf::new() }; MAX_CPUS];
 static SCHEDULER_APS_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SCHEDULER_ACTIVE_CPUS: AtomicCpuMask = AtomicCpuMask::new(CpuMask::empty());
+static SCHEDULER_ACTIVE_LOGGED: AtomicBool = AtomicBool::new(false);
 static SCHEDULER_WAKE_PENDING: [AtomicBool; MAX_CPUS] =
     [const { AtomicBool::new(false) }; MAX_CPUS];
+static SCHEDULER_WAKE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
 pub fn record_boot_entry() {
     let count = BOOT_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -507,13 +514,34 @@ pub fn activate_scheduler_aps() {
     }
 }
 
-pub fn wake_scheduler_cpus() {
+pub fn scheduler_publish_active(cpu: CpuId) {
+    let before = SCHEDULER_ACTIVE_CPUS.load(Ordering::Acquire);
+    assert!(!before.contains(cpu), "CPU entered scheduler twice");
+    SCHEDULER_ACTIVE_CPUS.insert(cpu, Ordering::AcqRel);
+    let active = SCHEDULER_ACTIVE_CPUS.load(Ordering::Acquire);
+    if active == online_mask()
+        && SCHEDULER_ACTIVE_LOGGED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        info!(
+            "smp schedulers: active_mask={:#x} count={}",
+            active.bits(),
+            active.count()
+        );
+    }
+}
+
+pub fn wake_scheduler_cpu(allowed: CpuMask) {
     if !scheduler_aps_active() {
         return;
     }
     let current = current_id();
-    for cpu in 0..topology().possible_count() {
-        if cpu == current {
+    let cpu_count = topology().possible_count();
+    let start = SCHEDULER_WAKE_CURSOR.fetch_add(1, Ordering::Relaxed) % cpu_count;
+    for offset in 0..cpu_count {
+        let cpu = (start + offset) % cpu_count;
+        if cpu == current || !allowed.contains(cpu) || !online_mask().contains(cpu) {
             continue;
         }
         let already_pending = SCHEDULER_WAKE_PENDING[cpu].swap(true, Ordering::AcqRel);
@@ -524,6 +552,7 @@ pub fn wake_scheduler_cpus() {
             SCHEDULER_WAKE_PENDING[cpu].store(false, Ordering::Release);
             panic!("scheduler wake IPI to CPU {cpu} failed: {error:#x}");
         }
+        return;
     }
 }
 
