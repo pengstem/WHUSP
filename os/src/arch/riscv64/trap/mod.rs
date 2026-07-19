@@ -199,7 +199,7 @@ pub fn trap_handler() -> ! {
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             set_next_trigger();
-            if crate::cpu::current_id() == 0 {
+            if crate::cpu::is_timer_expiry_owner() {
                 check_timer();
             }
             if timer_tick_should_preempt(&task) {
@@ -424,7 +424,7 @@ pub fn trap_from_kernel(_trap_cx: &TrapContext) {
             // signals, and wake tasks, all of which can allocate/free memory;
             // only do that work from the idle loop, where no task kernel code
             // was interrupted and sleeping tasks still need timer wakeups.
-            if crate::cpu::current_id() == 0 && current_task().is_none() {
+            if crate::cpu::is_timer_expiry_owner() && current_task().is_none() {
                 check_timer();
             }
         }

@@ -3,7 +3,7 @@ use core::sync::atomic::AtomicU64;
 
 use crate::config::clock_freq;
 use crate::sbi::set_timer;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::task::{
     ProcessControlBlock, SignalFlags, SignalInfo, TaskControlBlock, queue_signal_to_task,
     wakeup_timer_task,
@@ -303,16 +303,16 @@ impl Ord for PosixTimerEvent {
 }
 
 lazy_static! {
-    static ref TIMERS: UPIntrFreeCell<BinaryHeap<TimerCondVar>> =
-        unsafe { UPIntrFreeCell::new(BinaryHeap::<TimerCondVar>::new()) };
-    static ref REAL_TIMERS: UPIntrFreeCell<BinaryHeap<RealTimerEvent>> =
-        unsafe { UPIntrFreeCell::new(BinaryHeap::<RealTimerEvent>::new()) };
-    static ref POSIX_TIMERS: UPIntrFreeCell<BinaryHeap<PosixTimerEvent>> =
-        unsafe { UPIntrFreeCell::new(BinaryHeap::<PosixTimerEvent>::new()) };
+    static ref TIMERS: SpinNoIrqLock<BinaryHeap<TimerCondVar>> =
+        SpinNoIrqLock::new(BinaryHeap::<TimerCondVar>::new());
+    static ref REAL_TIMERS: SpinNoIrqLock<BinaryHeap<RealTimerEvent>> =
+        SpinNoIrqLock::new(BinaryHeap::<RealTimerEvent>::new());
+    static ref POSIX_TIMERS: SpinNoIrqLock<BinaryHeap<PosixTimerEvent>> =
+        SpinNoIrqLock::new(BinaryHeap::<PosixTimerEvent>::new());
 }
 
 pub fn add_timer(expire_ms: usize, task: Arc<TaskControlBlock>) {
-    let mut timers = TIMERS.exclusive_access();
+    let mut timers = TIMERS.lock();
     timers.push(TimerCondVar {
         expire_ms,
         task: Arc::downgrade(&task),
@@ -320,7 +320,7 @@ pub fn add_timer(expire_ms: usize, task: Arc<TaskControlBlock>) {
 }
 
 pub fn add_real_timer(expire_us: usize, generation: u64, process: Arc<ProcessControlBlock>) {
-    let mut timers = REAL_TIMERS.exclusive_access();
+    let mut timers = REAL_TIMERS.lock();
     timers.push(RealTimerEvent {
         expire_us,
         generation,
@@ -334,7 +334,7 @@ pub fn add_posix_timer(
     generation: u64,
     process: Arc<ProcessControlBlock>,
 ) {
-    let mut timers = POSIX_TIMERS.exclusive_access();
+    let mut timers = POSIX_TIMERS.lock();
     timers.push(PosixTimerEvent {
         expire_us,
         timer_id,
@@ -346,7 +346,7 @@ pub fn add_posix_timer(
 fn check_real_timers(current_us: usize) {
     loop {
         let event = {
-            let mut timers = REAL_TIMERS.exclusive_access();
+            let mut timers = REAL_TIMERS.lock();
             let Some(timer) = timers.peek() else {
                 return;
             };
@@ -372,7 +372,7 @@ fn check_real_timers(current_us: usize) {
 fn check_posix_timers(current_us: usize) {
     loop {
         let event = {
-            let mut timers = POSIX_TIMERS.exclusive_access();
+            let mut timers = POSIX_TIMERS.lock();
             let Some(timer) = timers.peek() else {
                 return;
             };
@@ -400,19 +400,28 @@ fn check_posix_timers(current_us: usize) {
 }
 
 pub fn check_timer() {
+    assert!(
+        crate::cpu::is_timer_expiry_owner(),
+        "global timer heaps checked by a non-owner CPU"
+    );
     let current_ms = get_time_ms();
-    TIMERS.exclusive_session(|timers| {
-        while let Some(timer) = timers.peek() {
-            if timer.expire_ms <= current_ms {
-                let timer = timers.pop().unwrap();
-                if let Some(task) = timer.task.upgrade() {
-                    wakeup_timer_task(task);
-                }
-            } else {
-                break;
+    loop {
+        let timer = {
+            let mut timers = TIMERS.lock();
+            match timers.peek() {
+                Some(timer) if timer.expire_ms <= current_ms => timers.pop(),
+                _ => None,
             }
+        };
+        let Some(timer) = timer else {
+            break;
+        };
+        // Waking may take task/run-queue locks and send a remote reschedule
+        // IPI. Never perform that handoff while holding the global timer heap.
+        if let Some(task) = timer.task.upgrade() {
+            wakeup_timer_task(task);
         }
-    });
+    }
     let current_us = get_time_us();
     check_real_timers(current_us);
     check_posix_timers(current_us);

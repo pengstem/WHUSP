@@ -387,7 +387,10 @@ pub fn sys_sched_setaffinity_ctx(
     }
     ensure_can_change_task_sched_ctx(ctx, &task, false)?;
     let mut inner = task.inner_exclusive_access();
-    if (inner.smp_sched_probe || inner.smp_cpu_probe || inner.smp_wait_io_probe)
+    if (inner.smp_sched_probe
+        || inner.smp_cpu_probe
+        || inner.smp_wait_io_probe
+        || inner.smp_wait_timer_probe)
         && pid == 0
         && Arc::ptr_eq(&task, ctx.task())
     {

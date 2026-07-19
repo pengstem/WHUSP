@@ -11,6 +11,10 @@ pub type CpuId = usize;
 // has made each driver queue safe for distributed interrupt handling.
 pub const EXTERNAL_IRQ_OWNER_CPU: CpuId = 0;
 
+// Global sleep, real-time, and POSIX timer heaps have one expiry owner. Every
+// CPU still programs its local timer interrupt for scheduler preemption.
+pub const TIMER_EXPIRY_OWNER_CPU: CpuId = 0;
+
 pub const PHASE1_IPI_ROUNDS: usize = 32;
 pub const PHASE2_LOCK_INCREMENTS: usize = 4096;
 
@@ -446,6 +450,10 @@ pub fn current_id() -> CpuId {
 
 pub fn external_irq_owner_hardware_id() -> usize {
     topology().hardware_id(EXTERNAL_IRQ_OWNER_CPU)
+}
+
+pub fn is_timer_expiry_owner() -> bool {
+    current_id() == TIMER_EXPIRY_OWNER_CPU
 }
 
 /// Verify the Phase 4 policy that the current-core interrupt controller
