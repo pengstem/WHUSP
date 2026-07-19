@@ -310,9 +310,10 @@ impl MemorySet {
     }
     /// Tears down user mappings and returns deferred file-backed writebacks.
     ///
-    /// Callers must write the returned flushes after releasing the process
-    /// memory-set lock; VFS writeback can re-enter file and mount locks.
-    pub fn recycle_data_pages(&mut self) -> Vec<MmapFlush> {
+    /// Callers must write the returned flushes and drop the returned areas
+    /// after releasing the process memory-set lock. Both operations can enter
+    /// VFS file and mount cleanup paths that may sleep.
+    pub fn recycle_data_pages(&mut self) -> (Vec<MmapFlush>, Vec<MapArea>) {
         let mut flushes = Vec::new();
         for area in &mut self.areas {
             if area.is_mmap() || area.is_shm() || area.map_type == MapType::Framed {
@@ -322,9 +323,9 @@ impl MemorySet {
                 area.unmap(&mut self.page_table);
             }
         }
-        self.areas.clear();
+        let retired_areas = core::mem::take(&mut self.areas);
         self.last_area_idx_containing.set(None);
-        flushes
+        (flushes, retired_areas)
     }
 
     pub(crate) fn proc_maps_entries(&self) -> Vec<MemoryMapEntry> {

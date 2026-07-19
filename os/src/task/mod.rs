@@ -637,6 +637,7 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             parent,
             children,
             fd_entries,
+            retired_areas,
             flushes,
             executable_node,
             exit_signal,
@@ -663,7 +664,7 @@ fn exit_current(exit_code: i32, group_exit: bool) {
                 )
             });
             // deallocate other data in user space i.e. program code/data section
-            let flushes = process_inner.memory_set.recycle_data_pages();
+            let (flushes, retired_areas) = process_inner.memory_set.recycle_data_pages();
             let executable_node = process_inner.executable_node.take();
             let process_keyring = process_inner.process_keyring.take();
             // Take fd entries out while the current task is still installed.
@@ -680,6 +681,7 @@ fn exit_current(exit_code: i32, group_exit: bool) {
                 parent,
                 children,
                 fd_entries,
+                retired_areas,
                 flushes,
                 executable_node,
                 exit_signal,
@@ -688,6 +690,10 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             )
         };
 
+        // MapArea owns file-backed ELF/mmap references. Its destructors can
+        // enter sleepable VFS locks, so they must run after the PCB spin lock
+        // has been released.
+        drop(retired_areas);
         if let Some((context, path, bytes)) = core_dump {
             write_core_dump(context, path, bytes);
         }
