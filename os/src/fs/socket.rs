@@ -21,7 +21,7 @@ use crate::syscall::user_ptr::{
 };
 use crate::syscall::{close_detached_fd_entry, install_file_fd};
 use crate::task::{
-    FdTableEntry, SignalFlags, TaskControlBlock, block_current_task_no_schedule,
+    FdTableEntry, SignalFlags, TaskControlBlock,
     block_current_task_no_schedule_unless_unmasked_signal, current_add_signal,
     current_has_unmasked_signal, current_process, current_task, current_user_token, schedule,
     wakeup_task,
@@ -770,16 +770,26 @@ fn remove_socket_waiter(queue: &mut VecDeque<Arc<TaskControlBlock>>, task: &Arc<
     }
 }
 
-fn sleep_tcp_connect_waiter(port: u16, deadline_ms: usize) -> *mut crate::task::TaskContext {
-    let (task, task_cx_ptr) = block_current_task_no_schedule();
-    LOOPBACK
-        .exclusive_access()
-        .tcp_connect_waiters
-        .entry(port)
-        .or_default()
-        .push_back(Arc::clone(&task));
+enum TcpConnectWait {
+    Listener(Arc<UPIntrFreeCell<LocalSocketInner>>),
+    Blocked(*mut crate::task::TaskContext),
+}
+
+fn find_tcp_listener_or_block(port: u16, deadline_ms: usize) -> SysResult<TcpConnectWait> {
+    let mut loopback = LOOPBACK.exclusive_access();
+    loopback.prune();
+    if let Some(listener) = loopback.tcp_listeners.get(&port).and_then(Weak::upgrade) {
+        return Ok(TcpConnectWait::Listener(listener));
+    }
+    perf::record_local_socket_writer_sleep();
+    let (task, task_cx_ptr) =
+        block_current_task_no_schedule_unless_unmasked_signal().ok_or(SysError::EINTR)?;
+    let waiters = loopback.tcp_connect_waiters.entry(port).or_default();
+    remove_socket_waiter(waiters, &task);
+    waiters.push_back(Arc::clone(&task));
+    drop(loopback);
     add_timer(deadline_ms, task);
-    task_cx_ptr
+    Ok(TcpConnectWait::Blocked(task_cx_ptr))
 }
 
 fn remove_tcp_connect_waiter(port: u16, task: &Arc<TaskControlBlock>) {
@@ -1024,6 +1034,11 @@ impl LocalSocket {
     fn listen(&self, backlog: i32) -> SysResult {
         let backlog = backlog.clamp(1, MAX_LISTEN_BACKLOG as i32) as usize;
         let local = self.ensure_bound(SocketKind::Stream)?;
+        {
+            let mut inner = self.inner.exclusive_access();
+            inner.listening = true;
+            inner.listen_backlog = backlog;
+        }
         let connect_waiters = {
             let mut loopback = LOOPBACK.exclusive_access();
             loopback.prune();
@@ -1035,17 +1050,13 @@ impl LocalSocket {
                 .remove(&local.port)
                 .unwrap_or_default()
         };
-        let mut inner = self.inner.exclusive_access();
-        inner.listening = true;
-        inner.listen_backlog = backlog;
-        drop(inner);
         wake_local_socket_writers(connect_waiters);
         Ok(0)
     }
 
     fn accept(&self, nonblock: bool) -> SysResult<Arc<LocalSocket>> {
         loop {
-            let (accepted, local) = {
+            let task_cx_ptr = {
                 let mut inner = self.inner.exclusive_access();
                 if inner.kind != SocketKind::Stream {
                     return Err(SysError::ENOTSUP);
@@ -1053,50 +1064,44 @@ impl LocalSocket {
                 if !inner.listening {
                     return Err(SysError::EINVAL);
                 }
-                (
-                    inner.accept_queue.pop_front(),
-                    inner.local.unwrap_or(InetEndpoint {
+                if let Some(accepted) = inner.accept_queue.pop_front() {
+                    return Ok(Self::from_inner(accepted, OpenFlags::RDWR));
+                }
+                if nonblock {
+                    return Err(SysError::EAGAIN);
+                }
+                if current_has_unmasked_signal() {
+                    if let Some(task) = current_task() {
+                        inner.remove_reader(&task);
+                    }
+                    let local = inner.local.unwrap_or(InetEndpoint {
                         ip: LOOPBACK_IP,
                         port: 0,
-                    }),
-                )
-            };
-            if let Some(inner) = accepted {
-                return Ok(Self::from_inner(inner, OpenFlags::RDWR));
-            }
-            if nonblock {
-                return Err(SysError::EAGAIN);
-            }
-            if current_has_unmasked_signal() {
-                if let Some(task) = current_task() {
-                    self.inner.exclusive_access().remove_reader(&task);
+                    });
+                    let peer = InetEndpoint {
+                        ip: LOOPBACK_IP,
+                        port: 0,
+                    };
+                    // CONTEXT: netperf's timed TCP_CRR server expects a blocking
+                    // accept() to return to user mode when SIGALRM fires. Returning
+                    // a closed placeholder lets the signal handler run and the
+                    // server loop observe `times_up` without leaking a listener.
+                    return Ok(Self::from_inner(
+                        Arc::new(unsafe {
+                            UPIntrFreeCell::new(LocalSocketInner::connected(
+                                SocketDomain::Inet,
+                                SocketKind::Stream,
+                                local,
+                                peer,
+                                None,
+                                ShutdownState::CLOSED,
+                                None,
+                                None,
+                            ))
+                        }),
+                        OpenFlags::RDWR,
+                    ));
                 }
-                let peer = InetEndpoint {
-                    ip: LOOPBACK_IP,
-                    port: 0,
-                };
-                // CONTEXT: netperf's timed TCP_CRR server expects a blocking
-                // accept() to return to user mode when SIGALRM fires. Returning
-                // a closed placeholder lets the signal handler run and the
-                // server loop observe `times_up` without leaking a listener.
-                return Ok(Self::from_inner(
-                    Arc::new(unsafe {
-                        UPIntrFreeCell::new(LocalSocketInner::connected(
-                            SocketDomain::Inet,
-                            SocketKind::Stream,
-                            local,
-                            peer,
-                            None,
-                            ShutdownState::CLOSED,
-                            None,
-                            None,
-                        ))
-                    }),
-                    OpenFlags::RDWR,
-                ));
-            }
-            let task_cx_ptr = {
-                let mut inner = self.inner.exclusive_access();
                 perf::record_local_socket_reader_sleep();
                 inner.sleep_reader()
             };
@@ -1137,16 +1142,6 @@ impl LocalSocket {
         }
         let connect_deadline_ms = get_time_ms() + 1000;
         let listener = loop {
-            let listener = {
-                let loopback = LOOPBACK.exclusive_access();
-                loopback
-                    .tcp_listeners
-                    .get(&remote.port)
-                    .and_then(Weak::upgrade)
-            };
-            if let Some(listener) = listener {
-                break listener;
-            }
             if get_time_ms() >= connect_deadline_ms {
                 if let Some(task) = current_task() {
                     remove_tcp_connect_waiter(remote.port, &task);
@@ -1159,9 +1154,10 @@ impl LocalSocket {
                 }
                 return Err(SysError::EINTR);
             }
-            perf::record_local_socket_writer_sleep();
-            let task_cx_ptr = sleep_tcp_connect_waiter(remote.port, connect_deadline_ms);
-            schedule(task_cx_ptr);
+            match find_tcp_listener_or_block(remote.port, connect_deadline_ms)? {
+                TcpConnectWait::Listener(listener) => break listener,
+                TcpConnectWait::Blocked(task_cx_ptr) => schedule(task_cx_ptr),
+            }
         };
         let listener_unix_local = listener.exclusive_access().unix_local.clone();
         let (domain, client_unix_local) = {
@@ -1182,20 +1178,20 @@ impl LocalSocket {
             ))
         });
 
-        {
-            let listener = listener.exclusive_access();
-            if listener.accept_queue.len() >= listener.listen_backlog.max(1) {
-                return Err(SysError::ECONNREFUSED);
-            }
-        }
-        {
-            let mut client = self.inner.exclusive_access();
-            client.peer = Some(remote);
-            client.unix_peer = unix_peer;
-            client.peer_socket = Some(Arc::downgrade(&server_inner));
-        }
         let (reader, read_waiters) = {
             let mut listener = listener.exclusive_access();
+            if !listener.listening
+                || listener.read_shutdown
+                || listener.accept_queue.len() >= listener.listen_backlog.max(1)
+            {
+                return Err(SysError::ECONNREFUSED);
+            }
+            {
+                let mut client = self.inner.exclusive_access();
+                client.peer = Some(remote);
+                client.unix_peer = unix_peer;
+                client.peer_socket = Some(Arc::downgrade(&server_inner));
+            }
             listener.accept_queue.push_back(server_inner);
             (listener.wake_reader(), listener.read_poll_waiters.drain())
         };
