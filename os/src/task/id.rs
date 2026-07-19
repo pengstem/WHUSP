@@ -108,7 +108,13 @@ impl Drop for KernelStack {
             .exclusive_access()
             .remove_area_with_start_vpn(kernel_stack_bottom_va.into());
         crate::arch::mm::mark_kernel_tlb_dirty();
-        KSTACK_ALLOCATOR.exclusive_access().dealloc(self.0);
+        // CONTEXT: A kernel-stack VA can have stale translations on a remote
+        // CPU after the task exits. Until Phase 5 supplies synchronous kernel
+        // TLB shootdown, release the physical pages but keep stack VA IDs
+        // monotonic so a stale entry can never alias a new task's stack.
+        KSTACK_ALLOCATOR
+            .exclusive_access()
+            .dealloc_without_reuse(self.0);
     }
 }
 

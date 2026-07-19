@@ -465,15 +465,33 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
 }
 
+fn with_task_manager<R>(operation: impl FnOnce(&mut TaskManager) -> R) -> R {
+    if !super::smp_probe::cpu_probe_active() {
+        return operation(&mut TASK_MANAGER.exclusive_access());
+    }
+
+    let wait_start = crate::timer::get_time();
+    let mut manager = TASK_MANAGER.exclusive_access();
+    let acquired = crate::timer::get_time();
+    let result = operation(&mut manager);
+    drop(manager);
+    let released = crate::timer::get_time();
+    super::smp_probe::record_cpu_probe_run_queue(
+        acquired.saturating_sub(wait_start),
+        released.saturating_sub(acquired),
+    );
+    result
+}
+
 pub fn add_task(task: Arc<TaskControlBlock>) {
     let allowed = task.inner_exclusive_access().allowed_cpus;
-    TASK_MANAGER.exclusive_access().add(task);
+    with_task_manager(|manager| manager.add(task));
     crate::cpu::wake_scheduler_cpu(allowed);
 }
 
 pub(crate) fn requeue_task_after_run(task: Arc<TaskControlBlock>) {
     let allowed = task.inner_exclusive_access().allowed_cpus;
-    TASK_MANAGER.exclusive_access().requeue_after_run(task);
+    with_task_manager(|manager| manager.requeue_after_run(task));
     crate::cpu::wake_scheduler_cpu(allowed);
 }
 
@@ -482,9 +500,7 @@ pub(super) fn charge_task_after_run(task: &TaskControlBlock) {
 }
 
 pub(super) fn should_preempt_current_on_tick(current: &Arc<TaskControlBlock>) -> bool {
-    TASK_MANAGER
-        .exclusive_access()
-        .should_preempt_current_on_tick(current)
+    with_task_manager(|manager| manager.should_preempt_current_on_tick(current))
 }
 
 fn wakeup_task_with_placement(task: Arc<TaskControlBlock>, front: bool) -> bool {
@@ -523,13 +539,13 @@ fn wakeup_task_with_placement(task: Arc<TaskControlBlock>, front: bool) -> bool 
 
 pub(super) fn enqueue_woken_task(task: Arc<TaskControlBlock>, front: bool) {
     let allowed = task.inner_exclusive_access().allowed_cpus;
-    let mut manager = TASK_MANAGER.exclusive_access();
-    if front {
-        manager.add_front(task);
-    } else {
-        manager.add(task);
-    }
-    drop(manager);
+    with_task_manager(|manager| {
+        if front {
+            manager.add_front(task);
+        } else {
+            manager.add(task);
+        }
+    });
     crate::cpu::wake_scheduler_cpu(allowed);
 }
 
@@ -549,26 +565,20 @@ pub(crate) fn wakeup_timer_task(task: Arc<TaskControlBlock>) -> bool {
 }
 
 pub(super) fn fetch_task() -> Option<Arc<TaskControlBlock>> {
-    TASK_MANAGER
-        .exclusive_access()
-        .fetch(crate::cpu::current_id())
+    with_task_manager(|manager| manager.fetch(crate::cpu::current_id()))
 }
 
 pub(crate) fn has_ready_task() -> bool {
-    TASK_MANAGER.exclusive_access().ready_len() > 0
+    with_task_manager(|manager| manager.ready_len() > 0)
 }
 
 pub(super) fn remove_ready_tasks_of_process(process_id: usize) {
-    TASK_MANAGER
-        .exclusive_access()
-        .remove_process_tasks(process_id);
+    with_task_manager(|manager| manager.remove_process_tasks(process_id));
 }
 
 pub(crate) fn reprioritize_ready_task(task: Arc<TaskControlBlock>) {
     let allowed = task.inner_exclusive_access().allowed_cpus;
-    TASK_MANAGER
-        .exclusive_access()
-        .reprioritize_ready_task(task);
+    with_task_manager(|manager| manager.reprioritize_ready_task(task));
     crate::cpu::wake_scheduler_cpu(allowed);
 }
 

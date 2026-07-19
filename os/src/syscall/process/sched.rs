@@ -387,15 +387,18 @@ pub fn sys_sched_setaffinity_ctx(
     }
     ensure_can_change_task_sched_ctx(ctx, &task, false)?;
     let mut inner = task.inner_exclusive_access();
-    if inner.smp_sched_probe && pid == 0 && Arc::ptr_eq(&task, ctx.task()) {
-        if requested == 1 {
+    if (inner.smp_sched_probe || inner.smp_cpu_probe) && pid == 0 && Arc::ptr_eq(&task, ctx.task())
+    {
+        if inner.smp_sched_probe && requested == 1 {
             // The recognized Phase 3 worker uses CPU0 as an end-of-workload
             // marker. Preserve its existing all-online placement so exit-time
             // VFS handoffs remain part of the multi-CPU lifecycle test.
             inner.smp_sched_probe_active = false;
         } else {
             inner.allowed_cpus = crate::cpu::CpuMask::from_bits(requested as u64);
-            inner.smp_sched_probe_active = true;
+            if inner.smp_sched_probe {
+                inner.smp_sched_probe_active = true;
+            }
         }
     } else {
         // CONTEXT: Until Phase 4 closes shared I/O/wait paths, ordinary contest

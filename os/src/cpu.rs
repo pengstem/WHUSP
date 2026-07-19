@@ -545,15 +545,18 @@ pub fn wake_scheduler_cpu(allowed: CpuMask) {
             continue;
         }
         let already_pending = SCHEDULER_WAKE_PENDING[cpu].swap(true, Ordering::AcqRel);
-        if !already_pending
-            && crate::task::processor_is_idle(cpu)
-            && let Err(error) = crate::arch::smp::send_ipi(cpu)
-        {
-            SCHEDULER_WAKE_PENDING[cpu].store(false, Ordering::Release);
-            panic!("scheduler wake IPI to CPU {cpu} failed: {error:#x}");
+        let mut sent_ipi = false;
+        if !already_pending && crate::task::processor_is_idle(cpu) {
+            if let Err(error) = crate::arch::smp::send_ipi(cpu) {
+                SCHEDULER_WAKE_PENDING[cpu].store(false, Ordering::Release);
+                panic!("scheduler wake IPI to CPU {cpu} failed: {error:#x}");
+            }
+            sent_ipi = true;
         }
+        crate::task::record_smp_cpu_probe_scheduler_wake(true, sent_ipi);
         return;
     }
+    crate::task::record_smp_cpu_probe_scheduler_wake(false, false);
 }
 
 pub fn take_scheduler_wake(cpu: CpuId) -> bool {
