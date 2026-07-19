@@ -22,8 +22,9 @@ use crate::syscall::user_ptr::{
 use crate::syscall::{close_detached_fd_entry, install_file_fd};
 use crate::task::{
     FdTableEntry, SignalFlags, TaskControlBlock, block_current_task_no_schedule,
-    current_add_signal, current_has_unmasked_signal, current_process, current_task,
-    current_user_token, schedule, wakeup_task,
+    block_current_task_no_schedule_unless_unmasked_signal, current_add_signal,
+    current_has_unmasked_signal, current_process, current_task, current_user_token, schedule,
+    wakeup_task,
 };
 use crate::timer::{add_timer, get_time_ms};
 use alloc::collections::{BTreeMap, VecDeque};
@@ -707,16 +708,16 @@ impl LocalSocketInner {
         inner
     }
 
-    fn sleep_reader(&mut self) -> *mut crate::task::TaskContext {
-        let (task, task_cx_ptr) = block_current_task_no_schedule();
+    fn sleep_reader(&mut self) -> Option<*mut crate::task::TaskContext> {
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
         self.read_wait_queue.push_back(task);
-        task_cx_ptr
+        Some(task_cx_ptr)
     }
 
-    fn sleep_writer(&mut self) -> *mut crate::task::TaskContext {
-        let (task, task_cx_ptr) = block_current_task_no_schedule();
+    fn sleep_writer(&mut self) -> Option<*mut crate::task::TaskContext> {
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
         self.write_wait_queue.push_back(task);
-        task_cx_ptr
+        Some(task_cx_ptr)
     }
 
     fn wake_reader(&mut self) -> Option<Arc<TaskControlBlock>> {
@@ -1099,6 +1100,9 @@ impl LocalSocket {
                 perf::record_local_socket_reader_sleep();
                 inner.sleep_reader()
             };
+            let Some(task_cx_ptr) = task_cx_ptr else {
+                continue;
+            };
             schedule(task_cx_ptr);
         }
     }
@@ -1282,7 +1286,9 @@ impl LocalSocket {
                     return Err(SysError::EINTR);
                 }
                 perf::record_local_socket_writer_sleep();
-                let task_cx_ptr = peer_inner.sleep_writer();
+                let Some(task_cx_ptr) = peer_inner.sleep_writer() else {
+                    return Err(SysError::EINTR);
+                };
                 drop(peer_inner);
                 schedule(task_cx_ptr);
                 continue;
@@ -1344,7 +1350,9 @@ impl LocalSocket {
                     return Err(SysError::EINTR);
                 }
                 perf::record_local_socket_writer_sleep();
-                let task_cx_ptr = peer_inner.sleep_writer();
+                let Some(task_cx_ptr) = peer_inner.sleep_writer() else {
+                    return Err(SysError::EINTR);
+                };
                 drop(peer_inner);
                 schedule(task_cx_ptr);
                 continue;
@@ -1455,7 +1463,9 @@ impl LocalSocket {
                     return Err(SysError::EINTR);
                 }
                 perf::record_local_socket_writer_sleep();
-                let task_cx_ptr = peer.sleep_writer();
+                let Some(task_cx_ptr) = peer.sleep_writer() else {
+                    return Err(SysError::EINTR);
+                };
                 drop(peer);
                 schedule(task_cx_ptr);
             }
@@ -1585,7 +1595,9 @@ impl LocalSocket {
                 return Err(SysError::EINTR);
             }
             perf::record_local_socket_reader_sleep();
-            let task_cx_ptr = inner.sleep_reader();
+            let Some(task_cx_ptr) = inner.sleep_reader() else {
+                return Err(SysError::EINTR);
+            };
             drop(inner);
             schedule(task_cx_ptr);
         }
@@ -1648,6 +1660,9 @@ impl LocalSocket {
                 perf::record_local_socket_reader_sleep();
                 inner.sleep_reader()
             };
+            let Some(task_cx_ptr) = task_cx_ptr else {
+                return Err(SysError::EINTR);
+            };
             schedule(task_cx_ptr);
         }
     }
@@ -1680,6 +1695,9 @@ impl LocalSocket {
                 let mut inner = self.inner.exclusive_access();
                 perf::record_local_socket_reader_sleep();
                 inner.sleep_reader()
+            };
+            let Some(task_cx_ptr) = task_cx_ptr else {
+                return Err(SysError::EINTR);
             };
             schedule(task_cx_ptr);
         }
