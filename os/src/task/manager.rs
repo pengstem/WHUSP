@@ -177,6 +177,9 @@ impl TaskManager {
         if inner.smp_sched_probe_active {
             super::smp_probe::record_run(cpu);
         }
+        if inner.smp_wait_io_probe {
+            super::smp_probe::record_wait_io_run(cpu);
+        }
         ClaimResult::Claimed
     }
 
@@ -566,10 +569,6 @@ pub(crate) fn wakeup_timer_task(task: Arc<TaskControlBlock>) -> bool {
 
 pub(super) fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     with_task_manager(|manager| manager.fetch(crate::cpu::current_id()))
-}
-
-pub(crate) fn has_ready_task() -> bool {
-    with_task_manager(|manager| manager.ready_len() > 0)
 }
 
 pub(super) fn remove_ready_tasks_of_process(process_id: usize) {

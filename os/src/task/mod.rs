@@ -50,7 +50,6 @@ pub use clone::{CloneArgs, CloneFlags, clone_current_thread};
 pub(crate) use fd::{FD_LIMIT, FdFlags, FdTableEntry};
 pub use id::{IDLE_PID, KernelStack, PidHandle, kstack_alloc, pid_alloc};
 pub(crate) use manager::any_process_references_mount;
-pub(crate) use manager::has_ready_task;
 pub(crate) use manager::list_process_snapshots;
 pub(crate) use manager::processes_snapshot;
 use manager::remove_ready_tasks_of_process;
@@ -83,6 +82,7 @@ pub(crate) use signal::{flags_to_linux_sigset, linux_sigset_to_flags};
 pub(crate) use smp_probe::record_cpu_probe_scheduler_wake as record_smp_cpu_probe_scheduler_wake;
 pub(crate) use smp_probe::record_yield_syscall as record_smp_probe_yield_syscall;
 pub(crate) use smp_probe::start_cpu_probe as start_smp_cpu_probe;
+pub(crate) use smp_probe::start_wait_io_probe as start_smp_wait_io_probe;
 pub(crate) use task::SCHED_RR_INTERVAL_US;
 pub use task::{DEFAULT_TIMER_SLACK_NS, SeccompSockFilter, TaskControlBlock, TaskStatus};
 

@@ -156,6 +156,7 @@ pub fn trap_handler() -> ! {
         }
         Trap::Exception(Exception::StorePageFault)
         | Trap::Exception(Exception::PageModifyFault) => {
+            enable_supervisor_interrupt();
             if !handle_user_page_fault(badv, MmapFaultAccess::Write) {
                 current_add_signal(SignalFlags::SIGSEGV);
             }
@@ -163,6 +164,7 @@ pub fn trap_handler() -> ! {
         Trap::Exception(Exception::FetchPageFault)
         | Trap::Exception(Exception::PageNonExecutableFault)
         | Trap::Exception(Exception::FetchInstructionAddressError) => {
+            enable_supervisor_interrupt();
             if !handle_user_page_fault(badv, MmapFaultAccess::Execute) {
                 current_add_signal(SignalFlags::SIGSEGV);
             }
@@ -171,6 +173,7 @@ pub fn trap_handler() -> ! {
         | Trap::Exception(Exception::PageNonReadableFault)
         | Trap::Exception(Exception::MemoryAccessAddressError)
         | Trap::Exception(Exception::PagePrivilegeIllegal) => {
+            enable_supervisor_interrupt();
             if !handle_user_page_fault(badv, MmapFaultAccess::Read) {
                 current_add_signal(SignalFlags::SIGSEGV);
             }

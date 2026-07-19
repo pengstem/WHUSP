@@ -2,7 +2,7 @@ use crate::DEV_NON_BLOCKING_ACCESS;
 use crate::board::{BlockDeviceConfig, BlockDeviceImpl};
 use crate::drivers::block_cache;
 use crate::drivers::virtio::{VirtioHal, VirtioTransport, mmio_transport};
-use crate::sync::{Condvar, UPIntrFreeCell};
+use crate::sync::{Condvar, SpinNoIrqLock};
 use crate::task::schedule;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -69,16 +69,20 @@ enum BlockIoPath {
     Nonblocking,
     Sync,
     FallbackUnsafe,
-    FallbackNoReady,
 }
 
 pub struct VirtIOBlock {
-    virtio_blk: UPIntrFreeCell<VirtIOBlk<VirtioHal, VirtioTransport>>,
+    state: SpinNoIrqLock<VirtIOBlockState>,
     base_addr: usize,
     cache_key: usize,
     irq: usize,
     capacity_blocks: usize,
     condvars: BTreeMap<u16, Condvar>,
+}
+
+struct VirtIOBlockState {
+    device: VirtIOBlk<VirtioHal, VirtioTransport>,
+    async_inflight: usize,
 }
 
 impl VirtIOBlock {
@@ -100,10 +104,6 @@ impl VirtIOBlock {
                 record_fallback_unsafe_read();
                 self.read_blocks_sync_uncached(block_id, buf);
             }
-            BlockIoPath::FallbackNoReady => {
-                record_fallback_no_ready_read();
-                self.read_blocks_sync_uncached(block_id, buf);
-            }
         }
     }
 
@@ -113,31 +113,45 @@ impl VirtIOBlock {
         // never observes pointers into a returned stack frame.
         let mut req = BlkReq::default();
         let mut resp = BlkResp::default();
-        let mut token = 0;
         record_nb_read_submit();
-        let task_cx_ptr = self.virtio_blk.exclusive_session(|blk| {
-            token = unsafe {
-                blk.read_blocks_nb(block_id, &mut req, buf, &mut resp)
+        let (task_cx_ptr, token) = {
+            let mut state = self.state.lock();
+            let token = unsafe {
+                state
+                    .device
+                    .read_blocks_nb(block_id, &mut req, buf, &mut resp)
                     .unwrap()
             };
+            state.async_inflight += 1;
             record_nb_read_wait();
-            self.condvars.get(&token).unwrap().wait_no_sched()
-        });
+            (self.condvars.get(&token).unwrap().wait_no_sched(), token)
+        };
         schedule(task_cx_ptr);
-        self.virtio_blk.exclusive_session(|blk| {
+        let next_completed = {
+            let mut state = self.state.lock();
             unsafe {
-                blk.complete_read_blocks(token, &req, buf, &mut resp)
+                state
+                    .device
+                    .complete_read_blocks(token, &req, buf, &mut resp)
                     .expect("Error when reading VirtIOBlk");
             }
+            assert_ne!(state.async_inflight, 0, "VirtIO read inflight underflow");
+            state.async_inflight -= 1;
             record_nb_read_completion();
-            self.signal_next_completed(blk);
-        });
+            state.device.peek_used()
+        };
+        self.signal_completed(next_completed);
     }
 
     fn read_blocks_sync_uncached(&self, block_id: usize, buf: &mut [u8]) {
         record_sync_read_submit();
-        self.virtio_blk
-            .exclusive_access()
+        let mut state = self.state.lock();
+        assert_eq!(
+            state.async_inflight, 0,
+            "synchronous VirtIO read mixed with asynchronous requests"
+        );
+        state
+            .device
             .read_blocks(block_id, buf)
             .unwrap_or_else(|err| {
                 panic!(
@@ -168,10 +182,6 @@ impl VirtIOBlock {
                 record_fallback_unsafe_write();
                 self.write_blocks_sync_uncached(block_id, buf);
             }
-            BlockIoPath::FallbackNoReady => {
-                record_fallback_no_ready_write();
-                self.write_blocks_sync_uncached(block_id, buf);
-            }
         }
     }
 
@@ -180,31 +190,45 @@ impl VirtIOBlock {
         // owned by this blocked task until complete_write_blocks() returns.
         let mut req = BlkReq::default();
         let mut resp = BlkResp::default();
-        let mut token = 0;
         record_nb_write_submit();
-        let task_cx_ptr = self.virtio_blk.exclusive_session(|blk| {
-            token = unsafe {
-                blk.write_blocks_nb(block_id, &mut req, buf, &mut resp)
+        let (task_cx_ptr, token) = {
+            let mut state = self.state.lock();
+            let token = unsafe {
+                state
+                    .device
+                    .write_blocks_nb(block_id, &mut req, buf, &mut resp)
                     .unwrap()
             };
+            state.async_inflight += 1;
             record_nb_write_wait();
-            self.condvars.get(&token).unwrap().wait_no_sched()
-        });
+            (self.condvars.get(&token).unwrap().wait_no_sched(), token)
+        };
         schedule(task_cx_ptr);
-        self.virtio_blk.exclusive_session(|blk| {
+        let next_completed = {
+            let mut state = self.state.lock();
             unsafe {
-                blk.complete_write_blocks(token, &req, buf, &mut resp)
+                state
+                    .device
+                    .complete_write_blocks(token, &req, buf, &mut resp)
                     .expect("Error when writing VirtIOBlk");
             }
+            assert_ne!(state.async_inflight, 0, "VirtIO write inflight underflow");
+            state.async_inflight -= 1;
             record_nb_write_completion();
-            self.signal_next_completed(blk);
-        });
+            state.device.peek_used()
+        };
+        self.signal_completed(next_completed);
     }
 
     fn write_blocks_sync_uncached(&self, block_id: usize, buf: &[u8]) {
         record_sync_write_submit();
-        self.virtio_blk
-            .exclusive_access()
+        let mut state = self.state.lock();
+        assert_eq!(
+            state.async_inflight, 0,
+            "synchronous VirtIO write mixed with asynchronous requests"
+        );
+        state
+            .device
             .write_blocks(block_id, buf)
             .unwrap_or_else(|err| {
                 panic!(
@@ -219,11 +243,13 @@ impl VirtIOBlock {
 
     #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     pub fn handle_irq(&self) {
-        self.virtio_blk.exclusive_session(|blk| {
-            let _ = blk.ack_interrupt();
+        let next_completed = {
+            let mut state = self.state.lock();
+            let _ = state.device.ack_interrupt();
             record_irq_ack();
-            self.signal_next_completed(blk);
-        });
+            state.device.peek_used()
+        };
+        self.signal_completed(next_completed);
     }
 
     pub fn num_blocks(&self) -> u64 {
@@ -242,11 +268,12 @@ impl VirtIOBlock {
         self.cache_key
     }
 
-    fn signal_next_completed(&self, blk: &mut VirtIOBlk<VirtioHal, VirtioTransport>) {
+    fn signal_completed(&self, token: Option<u16>) {
         // CONTEXT: Completion is serialized through the virtqueue used ring.
         // Wake only the descriptor head reported by the device; unrelated
-        // sleepers must stay blocked until their own token reaches used.
-        if let Some(token) = blk.peek_used() {
+        // sleepers must stay blocked until their own token reaches used. Do
+        // the scheduler wake only after releasing the IRQ-safe queue lock.
+        if let Some(token) = token {
             record_completion_signal();
             if self.condvars.get(&token).unwrap().signal() {
                 record_completion_wakeup();
@@ -280,7 +307,10 @@ impl VirtIOBlock {
         let virtio_blk = VirtIOBlk::<VirtioHal, _>::new(transport).unwrap();
         let capacity_blocks = virtio_blk.capacity() as usize;
         let channels = virtio_blk.virt_queue_size();
-        let virtio_blk = unsafe { UPIntrFreeCell::new(virtio_blk) };
+        let state = SpinNoIrqLock::new(VirtIOBlockState {
+            device: virtio_blk,
+            async_inflight: 0,
+        });
         let mut condvars = BTreeMap::new();
         // Nonblocking tokens are virtqueue descriptor-head indexes, so the
         // wait-channel count follows virt_queue_size(), not disk capacity.
@@ -289,7 +319,7 @@ impl VirtIOBlock {
             condvars.insert(i, condvar);
         }
         Self {
-            virtio_blk,
+            state,
             base_addr,
             cache_key,
             irq,
@@ -364,13 +394,17 @@ fn choose_block_io_path() -> BlockIoPath {
         return BlockIoPath::Sync;
     }
     // Nonblocking virtio waits may schedule only from task context with
-    // supervisor interrupts enabled and another ready task to run. Otherwise
-    // use synchronous I/O so boot and IRQ-sensitive paths never sleep here.
+    // supervisor interrupts enabled. Otherwise use synchronous I/O so boot
+    // and IRQ-sensitive paths never sleep here.
     if !can_sleep_for_nonblocking_block_io() {
         return BlockIoPath::FallbackUnsafe;
     }
-    if !crate::task::has_ready_task() {
-        return BlockIoPath::FallbackNoReady;
+    // A single CPU cannot overlap the blocked caller with useful kernel work;
+    // the async submit/sleep/wake path only adds scheduler and IRQ latency.
+    // Keep the lower-overhead synchronous path for UP while making SMP I/O
+    // waitable whenever the caller can safely sleep.
+    if crate::cpu::topology().possible_count() == 1 {
+        return BlockIoPath::Sync;
     }
     BlockIoPath::Nonblocking
 }
@@ -378,6 +412,9 @@ fn choose_block_io_path() -> BlockIoPath {
 fn can_sleep_for_nonblocking_block_io() -> bool {
     #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     {
+        // Syscalls and user page-fault handlers explicitly enable supervisor
+        // interrupts before entering VFS. A caller that still has interrupts
+        // disabled may own an IRQ-safe lock and must not strand it by sleeping.
         crate::arch::interrupt::supervisor_interrupt_enabled()
             && crate::task::current_task().is_some()
     }
@@ -480,17 +517,6 @@ fn record_fallback_unsafe_read() {}
 
 #[cfg(feature = "perf-counters")]
 #[inline(always)]
-fn record_fallback_no_ready_read() {
-    block_io_perf::inc(&block_io_perf::FALLBACK_SYNC_READS);
-    block_io_perf::inc(&block_io_perf::FALLBACK_NO_READY_READS);
-}
-
-#[cfg(not(feature = "perf-counters"))]
-#[inline(always)]
-fn record_fallback_no_ready_read() {}
-
-#[cfg(feature = "perf-counters")]
-#[inline(always)]
 fn record_fallback_unsafe_write() {
     block_io_perf::inc(&block_io_perf::FALLBACK_SYNC_WRITES);
     block_io_perf::inc(&block_io_perf::FALLBACK_UNSAFE_WRITES);
@@ -499,17 +525,6 @@ fn record_fallback_unsafe_write() {
 #[cfg(not(feature = "perf-counters"))]
 #[inline(always)]
 fn record_fallback_unsafe_write() {}
-
-#[cfg(feature = "perf-counters")]
-#[inline(always)]
-fn record_fallback_no_ready_write() {
-    block_io_perf::inc(&block_io_perf::FALLBACK_SYNC_WRITES);
-    block_io_perf::inc(&block_io_perf::FALLBACK_NO_READY_WRITES);
-}
-
-#[cfg(not(feature = "perf-counters"))]
-#[inline(always)]
-fn record_fallback_no_ready_write() {}
 
 #[cfg(all(
     any(target_arch = "riscv64", target_arch = "loongarch64"),

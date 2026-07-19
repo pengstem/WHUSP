@@ -77,6 +77,7 @@ pub struct TaskControlBlockInner {
     pub(crate) smp_sched_probe: bool,
     pub(crate) smp_sched_probe_active: bool,
     pub(crate) smp_cpu_probe: bool,
+    pub(crate) smp_wait_io_probe: bool,
     // Linux-visible sleep state for cooperative wait loops that stay runnable.
     pub proc_sleeping: bool,
     pub exit_code: Option<i32>,
@@ -164,6 +165,7 @@ impl TaskControlBlock {
                     smp_sched_probe: false,
                     smp_sched_probe_active: false,
                     smp_cpu_probe: false,
+                    smp_wait_io_probe: false,
                     proc_sleeping: false,
                     exit_code: None,
                     linux_tid: None,

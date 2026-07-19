@@ -64,6 +64,11 @@ static CPU_PROBE_EXITS: AtomicUsize = AtomicUsize::new(0);
 static CPU_PROBE_COUNTERS: [CpuProbeCounters; MAX_CPUS] =
     [const { CpuProbeCounters::new() }; MAX_CPUS];
 
+static WAIT_IO_STATE: AtomicUsize = AtomicUsize::new(CPU_PROBE_INACTIVE);
+static WAIT_IO_STARTS: AtomicUsize = AtomicUsize::new(0);
+static WAIT_IO_EXITS: AtomicUsize = AtomicUsize::new(0);
+static WAIT_IO_RUNS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+
 pub(super) fn record_run(cpu: usize) {
     RUNS[cpu].fetch_add(1, Ordering::Relaxed);
 }
@@ -263,4 +268,73 @@ pub(super) fn record_cpu_probe_exit() {
         &runnable_us[..cpu_count],
     );
     CPU_PROBE_STATE.store(CPU_PROBE_INACTIVE, Ordering::Release);
+}
+
+pub(crate) fn start_wait_io_probe() {
+    loop {
+        match WAIT_IO_STATE.load(Ordering::Acquire) {
+            CPU_PROBE_INACTIVE => {
+                if WAIT_IO_STATE
+                    .compare_exchange(
+                        CPU_PROBE_INACTIVE,
+                        CPU_PROBE_INITIALIZING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                for runs in &WAIT_IO_RUNS {
+                    runs.store(0, Ordering::Relaxed);
+                }
+                WAIT_IO_STARTS.store(1, Ordering::Relaxed);
+                WAIT_IO_EXITS.store(0, Ordering::Relaxed);
+                WAIT_IO_STATE.store(CPU_PROBE_ACTIVE, Ordering::Release);
+                return;
+            }
+            CPU_PROBE_INITIALIZING => spin_loop(),
+            CPU_PROBE_ACTIVE => {
+                let starts = WAIT_IO_STARTS.fetch_add(1, Ordering::AcqRel) + 1;
+                assert!(
+                    starts <= crate::cpu::topology().possible_count(),
+                    "too many Phase 4 wait-io starts"
+                );
+                return;
+            }
+            state => panic!("invalid Phase 4 wait-io state {state}"),
+        }
+    }
+}
+
+pub(super) fn record_wait_io_run(cpu: usize) {
+    if WAIT_IO_STATE.load(Ordering::Acquire) == CPU_PROBE_ACTIVE {
+        WAIT_IO_RUNS[cpu].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(super) fn record_wait_io_exit() {
+    if WAIT_IO_STATE.load(Ordering::Acquire) != CPU_PROBE_ACTIVE {
+        return;
+    }
+    let exits = WAIT_IO_EXITS.fetch_add(1, Ordering::AcqRel) + 1;
+    let expected = crate::cpu::topology().possible_count();
+    assert!(exits <= expected, "too many Phase 4 wait-io exits");
+    if exits != expected {
+        return;
+    }
+    assert_eq!(
+        WAIT_IO_STARTS.load(Ordering::Acquire),
+        expected,
+        "Phase 4 wait-io exited before every worker started"
+    );
+    let runs =
+        core::array::from_fn::<_, MAX_CPUS, _>(|cpu| WAIT_IO_RUNS[cpu].load(Ordering::Acquire));
+    info!(
+        "smp wait-io block: workers={} runs={:?} exits={}",
+        expected,
+        &runs[..expected],
+        exits,
+    );
+    WAIT_IO_STATE.store(CPU_PROBE_INACTIVE, Ordering::Release);
 }

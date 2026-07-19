@@ -182,10 +182,12 @@ fn finish_current_switch() {
     let mut enqueue = None;
     let probe;
     let cpu_probe;
+    let wait_io_probe;
     {
         let mut inner = task.inner_exclusive_access();
         probe = inner.smp_sched_probe;
         cpu_probe = inner.smp_cpu_probe;
+        wait_io_probe = inner.smp_wait_io_probe;
         assert_eq!(
             inner.on_cpu,
             Some(cpu),
@@ -233,6 +235,9 @@ fn finish_current_switch() {
     }
     if cpu_probe && reason == SwitchReason::Exit {
         super::smp_probe::record_cpu_probe_exit();
+    }
+    if wait_io_probe && reason == SwitchReason::Exit {
+        super::smp_probe::record_wait_io_exit();
     }
 
     match reason {

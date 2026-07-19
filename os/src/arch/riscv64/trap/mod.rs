@@ -156,16 +156,19 @@ pub fn trap_handler() -> ! {
             signal_delivery_attempted = true;
         }
         Trap::Exception(Exception::StorePageFault) => {
+            enable_supervisor_interrupt();
             if !handle_user_page_fault(stval, MmapFaultAccess::Write) {
                 current_add_signal(SignalFlags::SIGSEGV);
             }
         }
         Trap::Exception(Exception::InstructionPageFault) => {
+            enable_supervisor_interrupt();
             if !handle_user_page_fault(stval, MmapFaultAccess::Execute) {
                 current_add_signal(SignalFlags::SIGSEGV);
             }
         }
         Trap::Exception(Exception::LoadPageFault) => {
+            enable_supervisor_interrupt();
             if !handle_user_page_fault(stval, MmapFaultAccess::Read) {
                 current_add_signal(SignalFlags::SIGSEGV);
             }
