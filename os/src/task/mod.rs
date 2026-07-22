@@ -18,7 +18,7 @@ mod task;
 use self::id::TaskUserRes;
 use crate::arch::__switch;
 use crate::fs::{OpenFlags, PathContext, open_file_in, untrack_regular_file_executable};
-use crate::sbi::shutdown;
+use crate::shutdown::shutdown;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::{
@@ -59,9 +59,9 @@ pub(crate) use manager::task_with_linux_tid;
 pub use manager::{add_task, pid2process, remove_from_pid2process, wakeup_task};
 pub(crate) use manager::{wakeup_front_task, wakeup_timer_task};
 pub use processor::{
-    current_kstack_bounds, current_process, current_task, current_trap_cx, current_user_token,
-    process_of_task, refresh_current_user_token, run_tasks, schedule, trap_cx_of_task,
-    trap_return_context_after_accounting_for_task,
+    current_process, current_task, current_trap_cx, current_user_token, process_of_task,
+    refresh_current_user_token, run_tasks, schedule, trap_cx_of_task,
+    trap_return_context_after_accounting_for_task, try_current_kstack_bounds,
 };
 pub(crate) use processor::{current_processor_is_empty, processor_is_idle, processor_slot_ptr};
 pub(crate) use ptrace::{

@@ -21,6 +21,7 @@ mod lang_items;
 mod logging;
 mod mm;
 mod perf;
+mod shutdown;
 mod sync;
 mod syscall;
 mod task;

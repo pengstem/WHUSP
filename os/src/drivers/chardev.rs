@@ -216,6 +216,26 @@ impl NS16550a {
         crate::perf::record_uart_write(bytes);
         result
     }
+
+    pub fn emergency_write_fmt(&self, args: fmt::Arguments<'_>) {
+        if let Some(mut inner) = self.inner.try_exclusive_access() {
+            let mut writer = NS16550aFmtWriter {
+                raw: &mut inner.ns16550a,
+                bytes: 0,
+            };
+            let _ = writer.write_fmt(args);
+            return;
+        }
+        // CONTEXT: Panic/shutdown cannot wait for a UART lock that may belong
+        // to a stopped CPU. Direct output may overlap a final in-flight byte
+        // sequence, but it remains bounded and preserves the failure report.
+        let mut raw = NS16550aRaw::new(crate::board::uart_base());
+        let mut writer = NS16550aFmtWriter {
+            raw: &mut raw,
+            bytes: 0,
+        };
+        let _ = writer.write_fmt(args);
+    }
 }
 
 impl CharDevice for NS16550a {

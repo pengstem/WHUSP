@@ -184,6 +184,9 @@ pub fn trap_handler() -> ! {
         }
         Trap::Interrupt(Interrupt::IPI) => {
             crate::arch::smp::clear_local_ipi();
+            if crate::shutdown::stop_requested() {
+                crate::shutdown::stop_current_cpu();
+            }
             crate::cpu::handle_ipi();
         }
         Trap::Interrupt(Interrupt::Timer) => {
@@ -372,6 +375,9 @@ pub fn trap_from_kernel(trap_cx: &TrapContext) {
     match estat.cause() {
         Trap::Interrupt(Interrupt::IPI) => {
             crate::arch::smp::clear_local_ipi();
+            if crate::shutdown::stop_requested() {
+                crate::shutdown::stop_current_cpu();
+            }
             crate::cpu::handle_ipi();
         }
         Trap::Interrupt(Interrupt::Timer) => {

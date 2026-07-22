@@ -1,4 +1,4 @@
-use crate::sbi::shutdown;
+use crate::shutdown::shutdown;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::SyscallContext;
 use crate::syscall::errno::{SysError, SysResult};

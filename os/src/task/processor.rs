@@ -269,6 +269,9 @@ fn finish_current_switch() {
 pub fn run_tasks() -> ! {
     crate::cpu::scheduler_publish_active(crate::cpu::current_id());
     loop {
+        if crate::shutdown::stop_requested() {
+            crate::shutdown::stop_current_cpu();
+        }
         let mut processor = processor();
         if let Some(task) = fetch_task() {
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
@@ -393,11 +396,15 @@ pub fn trap_return_context_after_accounting_for_task(
     (trap_cx, user_token)
 }
 
-pub fn current_kstack_bounds() -> (usize, usize) {
-    processor()
-        .current
-        .as_ref()
-        .map_or_else(hart::boot_stack_bounds, |task| task.kstack.bounds())
+pub fn try_current_kstack_bounds() -> Option<(usize, usize)> {
+    let cpu = crate::cpu::try_current_id()?;
+    let processor = PROCESSORS[cpu].inner.try_lock()?;
+    Some(
+        processor
+            .current
+            .as_ref()
+            .map_or_else(hart::boot_stack_bounds, |task| task.kstack.bounds()),
+    )
 }
 
 pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {

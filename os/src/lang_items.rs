@@ -1,33 +1,38 @@
-use crate::sbi::shutdown;
-use crate::task::current_kstack_bounds;
+use crate::task::try_current_kstack_bounds;
 use core::panic::PanicInfo;
-use log::*;
 
 const MAX_BACKTRACE_FRAMES: usize = 10;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    let leader = crate::shutdown::begin(true);
     if let Some(location) = info.location() {
-        error!(
-            "[kernel] Panicked at {}:{} {}",
+        crate::console::emergency_print(format_args!(
+            "[kernel] Panicked at {}:{} {}\n",
             location.file(),
             location.line(),
             info.message()
-        );
+        ));
     } else {
-        error!("[kernel] Panicked: {}", info.message());
+        crate::console::emergency_print(format_args!("[kernel] Panicked: {}\n", info.message()));
     }
     backtrace();
-    shutdown(true)
+    crate::shutdown::complete(leader)
 }
 
 fn backtrace() {
     let mut fp = crate::arch::backtrace::frame_pointer();
-    let (stack_bottom, stack_top) = current_kstack_bounds();
-    println!("---START BACKTRACE---");
+    let Some((stack_bottom, stack_top)) = try_current_kstack_bounds() else {
+        crate::console::emergency_print(format_args!(
+            "backtrace unavailable: processor lock busy\n"
+        ));
+        return;
+    };
+    crate::console::emergency_print(format_args!("---START BACKTRACE---\n"));
     if fp == 0 {
-        println!("backtrace unavailable: frame pointer is zero");
-        println!("---END   BACKTRACE---");
+        crate::console::emergency_print(format_args!(
+            "backtrace unavailable: frame pointer is zero\n---END   BACKTRACE---\n"
+        ));
         return;
     }
     for i in 0..MAX_BACKTRACE_FRAMES {
@@ -35,7 +40,11 @@ fn backtrace() {
             break;
         }
         unsafe {
-            println!("#{}:ra={:#x}", i, *((fp - 8) as *const usize));
+            crate::console::emergency_print(format_args!(
+                "#{}:ra={:#x}\n",
+                i,
+                *((fp - 8) as *const usize)
+            ));
             let next_fp = *((fp - 16) as *const usize);
             if next_fp <= fp {
                 break;
@@ -43,7 +52,7 @@ fn backtrace() {
             fp = next_fp;
         }
     }
-    println!("---END   BACKTRACE---");
+    crate::console::emergency_print(format_args!("---END   BACKTRACE---\n"));
 }
 
 fn frame_pointer_in_current_stack(fp: usize, stack_bottom: usize, stack_top: usize) -> bool {
