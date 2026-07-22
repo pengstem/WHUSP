@@ -29,10 +29,11 @@ pub use pidfd::{sys_pidfd_getfd, sys_pidfd_open, sys_pidfd_send_signal};
 pub use ptrace::sys_ptrace;
 pub use resource::{sys_getrlimit_ctx, sys_prlimit64_ctx, sys_setrlimit_ctx};
 pub use sched::{
-    sys_getpriority, sys_ioprio_get_ctx, sys_ioprio_set_ctx, sys_sched_get_priority_max,
-    sys_sched_get_priority_min, sys_sched_getaffinity_ctx, sys_sched_getattr, sys_sched_getparam,
-    sys_sched_getscheduler, sys_sched_rr_get_interval, sys_sched_setaffinity_ctx,
-    sys_sched_setattr, sys_sched_setparam, sys_sched_setscheduler, sys_setpriority,
+    sys_getcpu_ctx, sys_getpriority, sys_ioprio_get_ctx, sys_ioprio_set_ctx,
+    sys_sched_get_priority_max, sys_sched_get_priority_min, sys_sched_getaffinity_ctx,
+    sys_sched_getattr, sys_sched_getparam, sys_sched_getscheduler, sys_sched_rr_get_interval,
+    sys_sched_setaffinity_ctx, sys_sched_setattr, sys_sched_setparam, sys_sched_setscheduler,
+    sys_setpriority,
 };
 #[cfg(target_arch = "riscv64")]
 pub use system::sys_riscv_hwprobe_ctx;

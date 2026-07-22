@@ -1,8 +1,9 @@
 use super::{
     ProcessControlBlock, ProcessProcSnapshot, SCHED_RR_INTERVAL_US, TaskControlBlock, TaskStatus,
 };
+use crate::config::MAX_CPUS;
 use crate::perf;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::{SpinNoIrqLock, UPIntrFreeCell};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -27,6 +28,7 @@ enum ClaimResult {
 }
 
 pub struct TaskManager {
+    cpu: crate::cpu::CpuId,
     normal_queue: BTreeMap<NormalQueueKey, Arc<TaskControlBlock>>,
     normal_enqueue_seq: u64,
     normal_min_vruntime: u64,
@@ -35,15 +37,16 @@ pub struct TaskManager {
     ready_count: usize,
 }
 
-/// Single-run-queue scheduler used by the contest kernel.
+/// One CPU's run queue.
 ///
 /// Realtime tasks use Linux-style static priority buckets, while normal tasks
 /// use a nice-weighted vruntime key. Do not treat this as a full Linux
 /// scheduler class implementation; syscall-visible SCHED_DEADLINE attributes
 /// are stored elsewhere but are not enforced by this picker.
 impl TaskManager {
-    pub fn new() -> Self {
+    pub fn new(cpu: crate::cpu::CpuId) -> Self {
         Self {
+            cpu,
             normal_queue: BTreeMap::new(),
             normal_enqueue_seq: 0,
             normal_min_vruntime: 0,
@@ -59,6 +62,10 @@ impl TaskManager {
 
     fn ready_len(&self) -> usize {
         self.ready_count
+    }
+
+    fn min_vruntime(&self) -> u64 {
+        self.normal_min_vruntime
     }
 
     fn nice_weight(nice: i8) -> u64 {
@@ -107,22 +114,22 @@ impl TaskManager {
     }
 
     fn add(&mut self, task: Arc<TaskControlBlock>) {
-        Self::mark_queued(&task);
+        Self::mark_queued_on(&task, self.cpu);
         self.enqueue(task, false);
     }
 
     fn requeue_after_run(&mut self, task: Arc<TaskControlBlock>) {
         Self::charge_normal_runtime(&task);
-        Self::mark_queued(&task);
+        Self::mark_queued_on(&task, self.cpu);
         self.enqueue(task, false);
     }
 
     fn add_front(&mut self, task: Arc<TaskControlBlock>) {
-        Self::mark_queued(&task);
+        Self::mark_queued_on(&task, self.cpu);
         self.enqueue(task, true);
     }
 
-    fn mark_queued(task: &TaskControlBlock) {
+    fn mark_queued_on(task: &TaskControlBlock, cpu: crate::cpu::CpuId) {
         let mut inner = task.inner_exclusive_access();
         assert_eq!(
             inner.task_status,
@@ -135,7 +142,7 @@ impl TaskManager {
             "running task cannot enter a run queue"
         );
         inner.on_rq = true;
-        inner.queued_cpu = Some(crate::cpu::try_current_id().unwrap_or(0));
+        inner.queued_cpu = Some(cpu);
     }
 
     fn clear_queued(task: &TaskControlBlock) {
@@ -145,7 +152,7 @@ impl TaskManager {
         inner.queued_cpu = None;
     }
 
-    fn claim_for_cpu(task: &TaskControlBlock, cpu: crate::cpu::CpuId) -> ClaimResult {
+    fn claim_for_cpu(&self, task: &TaskControlBlock, cpu: crate::cpu::CpuId) -> ClaimResult {
         let mut inner = task.inner_exclusive_access();
         if inner.task_status == TaskStatus::Exited {
             assert!(inner.on_rq, "exited run-queue task lost its queue marker");
@@ -159,6 +166,11 @@ impl TaskManager {
             "run queue contained a non-ready task"
         );
         assert!(inner.on_rq, "run-queue task lost its queue marker");
+        assert_eq!(
+            inner.queued_cpu,
+            Some(self.cpu),
+            "run-queue task has the wrong queue owner"
+        );
         assert!(inner.on_cpu.is_none(), "run-queue task is already running");
         if !inner.allowed_cpus.contains(cpu) {
             return ClaimResult::Ineligible;
@@ -258,7 +270,7 @@ impl TaskManager {
                 scanned += 1;
                 let current_priority = Self::rt_priority(&task);
                 if current_priority == priority {
-                    match Self::claim_for_cpu(&task, cpu) {
+                    match self.claim_for_cpu(&task, cpu) {
                         ClaimResult::Claimed => {
                             perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
                             return Some(task);
@@ -296,7 +308,7 @@ impl TaskManager {
                     self.enqueue(task, false);
                     continue 'select;
                 }
-                match Self::claim_for_cpu(&task, cpu) {
+                match self.claim_for_cpu(&task, cpu) {
                     ClaimResult::Claimed => {
                         perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
                         return Some(task);
@@ -470,21 +482,23 @@ fn remove_task_from_queue(
 }
 
 lazy_static! {
-    static ref TASK_MANAGER: UPIntrFreeCell<TaskManager> =
-        unsafe { UPIntrFreeCell::new(TaskManager::new()) };
+    static ref RUN_QUEUES: Vec<SpinNoIrqLock<TaskManager>> = (0..MAX_CPUS)
+        .map(|cpu| SpinNoIrqLock::new(TaskManager::new(cpu)))
+        .collect();
     static ref PID2PCB: UPIntrFreeCell<BTreeMap<usize, Arc<ProcessControlBlock>>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
     static ref LINUX_TID2TASK: UPIntrFreeCell<BTreeMap<usize, Weak<TaskControlBlock>>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
 }
 
-fn with_task_manager<R>(operation: impl FnOnce(&mut TaskManager) -> R) -> R {
+fn with_run_queue<R>(cpu: crate::cpu::CpuId, operation: impl FnOnce(&mut TaskManager) -> R) -> R {
+    assert!(cpu < MAX_CPUS, "run-queue CPU exceeds MAX_CPUS");
     if !super::smp_probe::cpu_probe_active() {
-        return operation(&mut TASK_MANAGER.exclusive_access());
+        return operation(&mut RUN_QUEUES[cpu].lock());
     }
 
     let wait_start = crate::timer::get_time();
-    let mut manager = TASK_MANAGER.exclusive_access();
+    let mut manager = RUN_QUEUES[cpu].lock();
     let acquired = crate::timer::get_time();
     let result = operation(&mut manager);
     drop(manager);
@@ -496,16 +510,62 @@ fn with_task_manager<R>(operation: impl FnOnce(&mut TaskManager) -> R) -> R {
     result
 }
 
-pub fn add_task(task: Arc<TaskControlBlock>) {
+fn run_queue_load(cpu: crate::cpu::CpuId) -> usize {
+    let ready = RUN_QUEUES[cpu].lock().ready_len();
+    ready + usize::from(!super::processor_is_idle(cpu))
+}
+
+fn choose_run_queue(
+    allowed: crate::cpu::CpuMask,
+    preferred: Option<crate::cpu::CpuId>,
+) -> crate::cpu::CpuId {
+    let online = crate::cpu::online_mask();
+    let eligible = crate::cpu::CpuMask::from_bits(allowed.bits() & online.bits());
+    assert!(eligible.bits() != 0, "runnable task has no online CPU");
+
+    let mut best = None;
+    for cpu in 0..crate::cpu::topology().possible_count() {
+        if !eligible.contains(cpu) {
+            continue;
+        }
+        let load = run_queue_load(cpu);
+        let prefer = usize::from(preferred == Some(cpu));
+        if best.is_none_or(|(_, best_load, best_prefer)| {
+            load < best_load || (load == best_load && prefer > best_prefer)
+        }) {
+            best = Some((cpu, load, prefer));
+        }
+    }
+    best.expect("eligible CPU mask contained no topology CPU").0
+}
+
+fn enqueue_task_on_best_queue(
+    task: Arc<TaskControlBlock>,
+    front: bool,
+    charge_runtime: bool,
+) -> crate::cpu::CpuId {
     let allowed = task.inner_exclusive_access().allowed_cpus;
-    with_task_manager(|manager| manager.add(task));
-    crate::cpu::wake_scheduler_cpu(allowed);
+    let preferred = crate::cpu::try_current_id().filter(|cpu| allowed.contains(*cpu));
+    let target = choose_run_queue(allowed, preferred);
+    with_run_queue(target, |manager| {
+        if charge_runtime {
+            manager.requeue_after_run(task);
+        } else if front {
+            manager.add_front(task);
+        } else {
+            manager.add(task);
+        }
+    });
+    crate::cpu::wake_scheduler_cpu(crate::cpu::CpuMask::single(target));
+    target
+}
+
+pub fn add_task(task: Arc<TaskControlBlock>) {
+    enqueue_task_on_best_queue(task, false, false);
 }
 
 pub(crate) fn requeue_task_after_run(task: Arc<TaskControlBlock>) {
-    let allowed = task.inner_exclusive_access().allowed_cpus;
-    with_task_manager(|manager| manager.requeue_after_run(task));
-    crate::cpu::wake_scheduler_cpu(allowed);
+    enqueue_task_on_best_queue(task, false, true);
 }
 
 pub(super) fn charge_task_after_run(task: &TaskControlBlock) {
@@ -513,7 +573,9 @@ pub(super) fn charge_task_after_run(task: &TaskControlBlock) {
 }
 
 pub(super) fn should_preempt_current_on_tick(current: &Arc<TaskControlBlock>) -> bool {
-    with_task_manager(|manager| manager.should_preempt_current_on_tick(current))
+    with_run_queue(crate::cpu::current_id(), |manager| {
+        manager.should_preempt_current_on_tick(current)
+    })
 }
 
 fn wakeup_task_with_placement(task: Arc<TaskControlBlock>, front: bool) -> bool {
@@ -551,15 +613,7 @@ fn wakeup_task_with_placement(task: Arc<TaskControlBlock>, front: bool) -> bool 
 }
 
 pub(super) fn enqueue_woken_task(task: Arc<TaskControlBlock>, front: bool) {
-    let allowed = task.inner_exclusive_access().allowed_cpus;
-    with_task_manager(|manager| {
-        if front {
-            manager.add_front(task);
-        } else {
-            manager.add(task);
-        }
-    });
-    crate::cpu::wake_scheduler_cpu(allowed);
+    enqueue_task_on_best_queue(task, front, false);
 }
 
 pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
@@ -578,17 +632,93 @@ pub(crate) fn wakeup_timer_task(task: Arc<TaskControlBlock>) -> bool {
 }
 
 pub(super) fn fetch_task() -> Option<Arc<TaskControlBlock>> {
-    with_task_manager(|manager| manager.fetch(crate::cpu::current_id()))
+    let cpu = crate::cpu::current_id();
+    if let Some(task) = with_run_queue(cpu, |manager| manager.fetch(cpu)) {
+        return Some(task);
+    }
+
+    let cpu_count = crate::cpu::topology().possible_count();
+    for offset in 1..cpu_count {
+        let victim = (cpu + offset) % cpu_count;
+        if !crate::cpu::online_mask().contains(victim) {
+            continue;
+        }
+        let stolen = with_run_queue(victim, |manager| {
+            let source_min = manager.min_vruntime();
+            manager.fetch(cpu).map(|task| (task, source_min))
+        });
+        if let Some((task, source_min)) = stolen {
+            let target_min = with_run_queue(cpu, |manager| manager.min_vruntime());
+            task.migrate_sched_vruntime(source_min, target_min);
+            return Some(task);
+        }
+    }
+    None
 }
 
 pub(super) fn remove_ready_tasks_of_process(process_id: usize) {
-    with_task_manager(|manager| manager.remove_process_tasks(process_id));
+    for cpu in 0..crate::cpu::topology().possible_count() {
+        with_run_queue(cpu, |manager| manager.remove_process_tasks(process_id));
+    }
 }
 
 pub(crate) fn reprioritize_ready_task(task: Arc<TaskControlBlock>) {
+    let queued_cpu = task.inner_exclusive_access().queued_cpu;
+    if let Some(cpu) = queued_cpu {
+        with_run_queue(cpu, |manager| manager.reprioritize_ready_task(task));
+        crate::cpu::wake_scheduler_cpu(crate::cpu::CpuMask::single(cpu));
+    }
+}
+
+pub(crate) fn migrate_ready_task(task: Arc<TaskControlBlock>) {
+    let queued_cpu = task.inner_exclusive_access().queued_cpu;
+    let Some(source) = queued_cpu else {
+        return;
+    };
     let allowed = task.inner_exclusive_access().allowed_cpus;
-    with_task_manager(|manager| manager.reprioritize_ready_task(task));
-    crate::cpu::wake_scheduler_cpu(allowed);
+    let target = choose_run_queue(allowed, None);
+    if source == target {
+        return;
+    }
+
+    let moved = if source < target {
+        let mut source_queue = RUN_QUEUES[source].lock();
+        let mut target_queue = RUN_QUEUES[target].lock();
+        migrate_ready_task_locked(&mut source_queue, &mut target_queue, task)
+    } else {
+        let mut target_queue = RUN_QUEUES[target].lock();
+        let mut source_queue = RUN_QUEUES[source].lock();
+        migrate_ready_task_locked(&mut source_queue, &mut target_queue, task)
+    };
+    if moved {
+        crate::cpu::wake_scheduler_cpu(crate::cpu::CpuMask::single(target));
+    }
+}
+
+fn migrate_ready_task_locked(
+    source: &mut TaskManager,
+    target: &mut TaskManager,
+    task: Arc<TaskControlBlock>,
+) -> bool {
+    if !source.remove_ready_task(&task) {
+        return false;
+    }
+    let mut inner = task.inner_exclusive_access();
+    if inner.task_status == TaskStatus::Exited {
+        inner.on_rq = false;
+        inner.queued_cpu = None;
+        return false;
+    }
+    assert_eq!(inner.task_status, TaskStatus::Ready);
+    assert!(inner.on_rq);
+    assert_eq!(inner.queued_cpu, Some(source.cpu));
+    assert!(inner.on_cpu.is_none());
+    let relative = inner.sched_vruntime.saturating_sub(source.min_vruntime());
+    inner.sched_vruntime = target.min_vruntime().saturating_add(relative);
+    inner.queued_cpu = Some(target.cpu);
+    drop(inner);
+    target.enqueue(task, false);
+    true
 }
 
 pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {

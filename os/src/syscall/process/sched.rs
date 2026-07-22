@@ -10,8 +10,9 @@ use crate::{
     },
     task::{
         CAP_SYS_ADMIN, ProcessControlBlock, SCHED_RR_INTERVAL_US, TaskControlBlock,
-        current_process, current_task, current_user_token, pid2process, processes_snapshot,
-        reprioritize_ready_task, task_with_linux_tid,
+        current_process, current_task, current_user_token, migrate_ready_task, pid2process,
+        processes_snapshot, reprioritize_ready_task, suspend_current_and_run_next,
+        task_with_linux_tid,
     },
 };
 use alloc::{sync::Arc, vec, vec::Vec};
@@ -369,6 +370,22 @@ pub fn sys_sched_getaffinity_ctx(
     Ok(AFFINITY_MASK_BYTES as isize)
 }
 
+pub fn sys_getcpu_ctx(ctx: &SyscallContext, cpu: usize, node: usize) -> SysResult {
+    // Linux permits either output pointer to be null. Logical kernel CPU IDs
+    // are the userspace-visible CPU numbers; this machine has one NUMA node.
+    if cpu != 0 {
+        write_user_value_with_mmap_fault_ctx(
+            ctx,
+            cpu as *mut u32,
+            &(crate::cpu::current_id() as u32),
+        )?;
+    }
+    if node != 0 {
+        write_user_value_with_mmap_fault_ctx(ctx, node as *mut u32, &0u32)?;
+    }
+    Ok(0)
+}
+
 pub fn sys_sched_setaffinity_ctx(
     ctx: &SyscallContext,
     pid: isize,
@@ -400,8 +417,20 @@ pub fn sys_sched_setaffinity_ctx(
     } else {
         inner.allowed_cpus = crate::cpu::CpuMask::from_bits(requested as u64);
     }
+    let running_cpu = inner.on_cpu;
     drop(inner);
-    crate::cpu::wake_scheduler_cpu(crate::cpu::CpuMask::from_bits(requested as u64));
+    migrate_ready_task(Arc::clone(&task));
+    let requested_mask = crate::cpu::CpuMask::from_bits(requested as u64);
+    if let Some(cpu) = running_cpu
+        && !requested_mask.contains(cpu)
+    {
+        if Arc::ptr_eq(&task, ctx.task()) {
+            suspend_current_and_run_next();
+        } else {
+            crate::cpu::request_scheduler_preemption(crate::cpu::CpuMask::single(cpu));
+        }
+    }
+    crate::cpu::wake_scheduler_cpu(requested_mask);
     Ok(0)
 }
 

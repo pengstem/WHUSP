@@ -57,22 +57,18 @@ pub struct TaskControlBlockInner {
     pub task_cx: TaskContext,
     pub task_status: TaskStatus,
     // Scheduler ownership is explicit so a task cannot be both running and
-    // reachable from the global run queue once application processors start
-    // participating in scheduling.
+    // reachable from any per-CPU run queue.
     pub(crate) on_cpu: Option<crate::cpu::CpuId>,
     pub(crate) on_rq: bool,
-    // The current scheduler has one global queue. Keep the enqueue CPU as a
-    // placement hint and diagnostic now so later per-CPU queues do not need to
-    // infer ownership from TaskStatus.
+    // Exact per-CPU run-queue ownership. It changes only while the source or
+    // destination queue lock serializes removal/publication.
     pub(crate) queued_cpu: Option<crate::cpu::CpuId>,
     // A wakeup can race after a task publishes Blocked but before its CPU has
     // crossed the task-to-idle context switch. The old CPU owns the only legal
     // enqueue at that boundary, so remember the wakeup until switch completion.
     pub(crate) wake_pending: bool,
     pub(crate) wake_front: bool,
-    // Phase 3 keeps all ordinary contest work on CPU 0. Only the bounded
-    // independent-address-space probe widens this mask before Phase 4 audits
-    // shared I/O and waitable subsystems.
+    // Linux-visible affinity mask used for placement, stealing, and migration.
     pub(crate) allowed_cpus: crate::cpu::CpuMask,
     pub(crate) smp_sched_probe: bool,
     pub(crate) smp_sched_probe_active: bool,
@@ -269,6 +265,12 @@ impl TaskControlBlock {
         let mut inner = self.inner_exclusive_access();
         inner.sched_vruntime = inner.sched_vruntime.saturating_add(delta);
         inner.sched_vruntime
+    }
+
+    pub(crate) fn migrate_sched_vruntime(&self, source_min: u64, target_min: u64) {
+        let mut inner = self.inner_exclusive_access();
+        let relative = inner.sched_vruntime.saturating_sub(source_min);
+        inner.sched_vruntime = target_min.saturating_add(relative);
     }
 
     pub(crate) fn mark_sched_run_start(&self, now_us: usize) {

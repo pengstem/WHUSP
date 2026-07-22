@@ -162,6 +162,7 @@ const SYSCALL_SETRLIMIT: usize = 164;
 const SYSCALL_GETRUSAGE: usize = 165;
 const SYSCALL_UMASK: usize = 166;
 const SYSCALL_PRCTL: usize = 167;
+const SYSCALL_GETCPU: usize = 168;
 const SYSCALL_GETTIMEOFDAY: usize = 169;
 const SYSCALL_SETTIMEOFDAY: usize = 170;
 const SYSCALL_ADJTIMEX: usize = 171;
@@ -909,6 +910,7 @@ pub(crate) fn syscall_with_context(
         SYSCALL_SCHED_RR_GET_INTERVAL => {
             sys_sched_rr_get_interval(args[0] as isize, args[1] as *mut LinuxTimeSpec)
         }
+        SYSCALL_GETCPU => sys_getcpu_ctx(ctx, args[0], args[1]),
         SYSCALL_SCHED_SETATTR => sys_sched_setattr(args[0] as isize, args[1], args[2] as u32),
         SYSCALL_SCHED_GETATTR => {
             sys_sched_getattr(args[0] as isize, args[1], args[2], args[3] as u32)
