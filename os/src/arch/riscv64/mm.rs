@@ -2,6 +2,9 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use riscv::register::satp;
 
+use crate::cpu::{CpuMask, current_id, online_mask};
+use crate::sync::SpinNoIrqLock;
+
 const LOCAL_TLB_RANGE_PAGE_LIMIT: usize = 64;
 
 const SV39_MODE: usize = 8;
@@ -21,6 +24,17 @@ const ASID_SUPPORT_UNKNOWN: usize = 2;
 
 static ASID_SUPPORT: AtomicUsize = AtomicUsize::new(ASID_SUPPORT_UNKNOWN);
 
+struct AsidAllocator {
+    next: usize,
+    generation: usize,
+}
+
+static ASID_ALLOCATOR: SpinNoIrqLock<AsidAllocator> = SpinNoIrqLock::new(AsidAllocator {
+    // Keep ASID 0 reserved for conservative/non-ASID paths.
+    next: 1,
+    generation: 1,
+});
+
 pub fn page_table_token_with_asid(root_ppn: usize, asid: usize) -> usize {
     SV39_MODE << 60 | ((asid & SATP_ASID_MAX) << SATP_ASID_SHIFT) | (root_ppn & SATP_PPN_MASK)
 }
@@ -34,10 +48,30 @@ pub fn page_table_asid(token: usize) -> usize {
 }
 
 pub fn alloc_page_table_asid() -> usize {
-    // CONTEXT: Keep ASID 0 until Phase 5 adds a global ASID generation and
-    // acknowledged all-CPU rollover. Reusing a tag after only a local fence
-    // would permit a remote CPU to retain a stale translation.
-    0
+    let mut allocator = ASID_ALLOCATOR.lock();
+    if allocator.next > SATP_ASID_MAX {
+        let cpu = current_id();
+        let online = online_mask();
+        flush_tlb_all();
+        let remote = CpuMask::from_bits(online.bits() & !CpuMask::single(cpu).bits());
+        if remote.bits() != 0 {
+            crate::arch::smp::remote_tlb_flush(remote, 0, usize::MAX).unwrap_or_else(|error| {
+                panic!(
+                    "RISC-V ASID rollover flush failed: generation={} targets={:#x} error={error:#x}",
+                    allocator.generation,
+                    remote.bits(),
+                )
+            });
+        }
+        allocator.generation = allocator
+            .generation
+            .checked_add(1)
+            .expect("RISC-V ASID generation wrapped");
+        allocator.next = 1;
+    }
+    let asid = allocator.next;
+    allocator.next += 1;
+    asid
 }
 
 pub fn activate_page_table(token: usize) {
