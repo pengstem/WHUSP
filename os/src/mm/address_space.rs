@@ -70,10 +70,9 @@ impl AddressSpaceControl {
 
     pub(crate) fn enter_cpu(self: &Arc<Self>, cpu: CpuId) -> ActiveAddressSpace {
         let previous = self.active_cpus.fetch_insert(cpu, Ordering::SeqCst);
-        assert_eq!(
-            previous.bits(),
-            0,
-            "shared address space entered multiple CPUs before shootdown: id={} active={:#x} entering={cpu}",
+        assert!(
+            !previous.contains(cpu),
+            "CPU entered address space twice: id={} active={:#x} entering={cpu}",
             self.id,
             previous.bits(),
         );

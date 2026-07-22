@@ -112,9 +112,8 @@ impl ProcessControlBlock {
         let (fd_open_bits, next_fd_hint) = fd_allocation_state_from_table(&fd_table);
         let process = Arc::new(Self {
             pid: pid_handle,
-            scheduler_cpu: AtomicUsize::new(usize::MAX),
             running_tasks: AtomicUsize::new(0),
-            exec_task: AtomicUsize::new(0),
+            exclusive_task: AtomicUsize::new(0),
             inner_owner_cpu: AtomicUsize::new(usize::MAX),
             inner: unsafe {
                 UPIntrFreeCell::new(ProcessControlBlockInner {
@@ -313,9 +312,8 @@ impl ProcessControlBlock {
         let child_pid = pid.0;
         let child = Arc::new(Self {
             pid,
-            scheduler_cpu: AtomicUsize::new(usize::MAX),
             running_tasks: AtomicUsize::new(0),
-            exec_task: AtomicUsize::new(0),
+            exclusive_task: AtomicUsize::new(0),
             inner_owner_cpu: AtomicUsize::new(usize::MAX),
             inner: unsafe {
                 UPIntrFreeCell::new(ProcessControlBlockInner {

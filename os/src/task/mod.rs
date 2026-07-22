@@ -579,6 +579,10 @@ fn exit_current(exit_code: i32, group_exit: bool) {
         .expect("current task process must outlive the task");
     let process_token = process.inner_exclusive_access().get_user_token();
     let process_id = process.getpid();
+    let tid = current.inner_exclusive_access().tid;
+    let process_exit = group_exit || tid == 0;
+    let group_exit_exclusion =
+        process_exit.then(|| process.begin_group_exit_exclusion(current.as_ref()));
     let (tid, linux_tid, clear_child_tid, thread_keyring) = {
         let mut task_inner = current.inner_exclusive_access();
         let linux_tid = task_inner
@@ -606,7 +610,6 @@ fn exit_current(exit_code: i32, group_exit: bool) {
     }
     current.inner_exclusive_access().res = None;
 
-    let process_exit = group_exit || tid == 0;
     if tid != 0 {
         let mut process_inner = process.inner_exclusive_access();
         if tid < process_inner.tasks.len() {
@@ -755,6 +758,7 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             }
         }
     }
+    drop(group_exit_exclusion);
     let task = current_task().expect("exit_current requires the current task to be scheduled");
     let mut task_inner = task.inner_exclusive_access();
     task_inner.exit_code = Some(exit_code);

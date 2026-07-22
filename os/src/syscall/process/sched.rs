@@ -387,13 +387,7 @@ pub fn sys_sched_setaffinity_ctx(
     }
     ensure_can_change_task_sched_ctx(ctx, &task, false)?;
     let mut inner = task.inner_exclusive_access();
-    if (inner.smp_sched_probe
-        || inner.smp_cpu_probe
-        || inner.smp_wait_io_probe
-        || inner.smp_phase4_wait_probe)
-        && pid == 0
-        && Arc::ptr_eq(&task, ctx.task())
-    {
+    if inner.smp_sched_probe && pid == 0 && Arc::ptr_eq(&task, ctx.task()) {
         if inner.smp_sched_probe && requested == 1 {
             // The recognized Phase 3 worker uses CPU0 as an end-of-workload
             // marker. Preserve its existing all-online placement so exit-time
@@ -401,19 +395,10 @@ pub fn sys_sched_setaffinity_ctx(
             inner.smp_sched_probe_active = false;
         } else {
             inner.allowed_cpus = crate::cpu::CpuMask::from_bits(requested as u64);
-            if inner.smp_sched_probe {
-                inner.smp_sched_probe_active = true;
-            }
+            inner.smp_sched_probe_active = true;
         }
     } else {
-        // CONTEXT: Until Phase 4 closes shared I/O/wait paths, ordinary contest
-        // tasks remain on CPU 0. The bounded Phase 3 ELF above is the only
-        // caller allowed to widen its mask; Linux-visible affinity completion
-        // for general tasks belongs to Phase 6.
-        if affinity_mask & 1 == 0 {
-            return Err(SysError::EINVAL);
-        }
-        inner.allowed_cpus = crate::cpu::CpuMask::single(0);
+        inner.allowed_cpus = crate::cpu::CpuMask::from_bits(requested as u64);
     }
     drop(inner);
     crate::cpu::wake_scheduler_cpu(crate::cpu::CpuMask::from_bits(requested as u64));

@@ -282,7 +282,7 @@ fn finish_current_switch() {
     }
 
     drop(address_space);
-    process.release_scheduler_task(&task, cpu);
+    process.release_scheduler_task(&task);
 
     if probe && reason == SwitchReason::Exit {
         super::smp_probe::record_exit();

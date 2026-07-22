@@ -648,36 +648,34 @@ impl ProcessTimers {
 pub struct ProcessControlBlock {
     // immutable
     pub pid: PidHandle,
-    pub(super) scheduler_cpu: AtomicUsize,
     pub(super) running_tasks: AtomicUsize,
-    pub(super) exec_task: AtomicUsize,
+    pub(super) exclusive_task: AtomicUsize,
     pub(super) inner_owner_cpu: AtomicUsize,
     // mutable
     pub(super) inner: UPIntrFreeCell<ProcessControlBlockInner>,
 }
 
-const NO_SCHEDULER_CPU: usize = usize::MAX;
-const NO_EXEC_TASK: usize = 0;
+const NO_EXCLUSIVE_TASK: usize = 0;
 const NO_INNER_OWNER: usize = usize::MAX;
 
-pub(crate) struct ExecSchedulerGuard<'a> {
+pub(crate) struct TaskGroupSchedulerGuard<'a> {
     process: &'a ProcessControlBlock,
     task_id: usize,
 }
 
-impl Drop for ExecSchedulerGuard<'_> {
+impl Drop for TaskGroupSchedulerGuard<'_> {
     fn drop(&mut self) {
         self.process
-            .exec_task
+            .exclusive_task
             .compare_exchange(
                 self.task_id,
-                NO_EXEC_TASK,
+                NO_EXCLUSIVE_TASK,
                 Ordering::Release,
                 Ordering::Relaxed,
             )
             .unwrap_or_else(|owner| {
                 panic!(
-                    "exec scheduler owner mismatch: expected={:#x} actual={owner:#x}",
+                    "task-group scheduler owner mismatch: expected={:#x} actual={owner:#x}",
                     self.task_id
                 )
             });
@@ -722,77 +720,78 @@ impl ProcessControlBlock {
         task as *const TaskControlBlock as usize
     }
 
-    pub(crate) fn try_claim_scheduler_task(
-        &self,
-        task: &TaskControlBlock,
-        cpu: crate::cpu::CpuId,
-    ) -> bool {
-        if self
-            .scheduler_cpu
-            .compare_exchange(NO_SCHEDULER_CPU, cpu, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return false;
-        }
+    pub(crate) fn try_claim_scheduler_task(&self, task: &TaskControlBlock) -> bool {
         let task_id = Self::scheduler_task_id(task);
-        let exec_task = self.exec_task.load(Ordering::Acquire);
-        if exec_task != NO_EXEC_TASK && exec_task != task_id {
-            self.scheduler_cpu
-                .store(NO_SCHEDULER_CPU, Ordering::Release);
+        let exclusive_task = self.exclusive_task.load(Ordering::Acquire);
+        if exclusive_task != NO_EXCLUSIVE_TASK && exclusive_task != task_id {
             return false;
         }
         self.running_tasks.fetch_add(1, Ordering::AcqRel);
-        let exec_task = self.exec_task.load(Ordering::Acquire);
-        if exec_task == NO_EXEC_TASK || exec_task == task_id {
+        let exclusive_task = self.exclusive_task.load(Ordering::Acquire);
+        if exclusive_task == NO_EXCLUSIVE_TASK || exclusive_task == task_id {
             return true;
         }
         let previous = self.running_tasks.fetch_sub(1, Ordering::AcqRel);
         assert_ne!(previous, 0, "process running-task count underflow");
-        self.scheduler_cpu
-            .store(NO_SCHEDULER_CPU, Ordering::Release);
         false
     }
 
-    pub(crate) fn release_scheduler_task(&self, task: &TaskControlBlock, cpu: crate::cpu::CpuId) {
+    pub(crate) fn release_scheduler_task(&self, task: &TaskControlBlock) {
         let previous = self.running_tasks.fetch_sub(1, Ordering::AcqRel);
         assert_ne!(previous, 0, "process running-task count underflow");
-        let exec_task = self.exec_task.load(Ordering::Acquire);
+        let exclusive_task = self.exclusive_task.load(Ordering::Acquire);
         let task_id = Self::scheduler_task_id(task);
         assert!(
-            exec_task == NO_EXEC_TASK || exec_task == task_id || previous > 1,
-            "non-exec task was the final runner under exec exclusion"
+            exclusive_task == NO_EXCLUSIVE_TASK || exclusive_task == task_id || previous > 1,
+            "non-owner task was the final runner under task-group exclusion"
         );
-        self.scheduler_cpu
-            .compare_exchange(cpu, NO_SCHEDULER_CPU, Ordering::Release, Ordering::Relaxed)
-            .unwrap_or_else(|owner| {
-                panic!("process scheduler owner mismatch: expected={cpu} actual={owner}")
-            });
+    }
+
+    fn try_begin_scheduler_exclusion<'a>(
+        &'a self,
+        task: &TaskControlBlock,
+    ) -> Option<TaskGroupSchedulerGuard<'a>> {
+        let task_id = Self::scheduler_task_id(task);
+        self.exclusive_task
+            .compare_exchange(
+                NO_EXCLUSIVE_TASK,
+                task_id,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+
+        while self.running_tasks.load(Ordering::Acquire) != 1 {
+            crate::task::suspend_current_and_run_next();
+        }
+        Some(TaskGroupSchedulerGuard {
+            process: self,
+            task_id,
+        })
     }
 
     pub(crate) fn begin_exec_exclusion<'a>(
         &'a self,
         task: &TaskControlBlock,
-    ) -> crate::syscall::errno::SysResult<ExecSchedulerGuard<'a>> {
-        let task_id = Self::scheduler_task_id(task);
-        self.exec_task
-            .compare_exchange(NO_EXEC_TASK, task_id, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| crate::syscall::errno::SysError::EAGAIN)?;
+    ) -> crate::syscall::errno::SysResult<TaskGroupSchedulerGuard<'a>> {
+        self.try_begin_scheduler_exclusion(task)
+            .ok_or(crate::syscall::errno::SysError::EAGAIN)
+    }
 
-        let start = crate::timer::get_time();
-        let timeout = crate::config::clock_freq().saturating_mul(2);
-        while self.running_tasks.load(Ordering::Acquire) != 1 {
-            if crate::timer::get_time().wrapping_sub(start) >= timeout {
-                panic!(
-                    "exec exclusion timeout: task={task_id:#x} running={}",
-                    self.running_tasks.load(Ordering::Acquire)
-                );
+    pub(crate) fn begin_group_exit_exclusion<'a>(
+        &'a self,
+        task: &TaskControlBlock,
+    ) -> TaskGroupSchedulerGuard<'a> {
+        loop {
+            if let Some(guard) = self.try_begin_scheduler_exclusion(task) {
+                return guard;
             }
+            // A competing exec/group-exit owner needs this task to leave its
+            // CPU before it can tear down the thread group. If that owner
+            // removes us, this yield never returns; otherwise retry after the
+            // earlier exclusive operation completes.
             crate::task::suspend_current_and_run_next();
         }
-        Ok(ExecSchedulerGuard {
-            process: self,
-            task_id,
-        })
     }
 }
 
