@@ -2,7 +2,7 @@ use crate::config::PAGE_SIZE;
 use crate::fs::{
     File, FileStat, OpenFlags, PollEvents, S_IFBLK, S_IFDIR, S_IFMT, S_IFREG, SeekWhence,
 };
-use crate::mm::UserBuffer;
+use crate::mm::{TranslatedUserBuffer, UserBuffer};
 use crate::perf;
 use crate::syscall::SyscallContext;
 use crate::task::{
@@ -32,7 +32,7 @@ struct UserIovecs {
 
 struct UserIovecChunk {
     len: usize,
-    buffers: Vec<&'static mut [u8]>,
+    buffers: TranslatedUserBuffer,
 }
 
 struct UserIovecCursor {
@@ -59,25 +59,8 @@ const VALID_SYNC_FILE_RANGE_FLAGS: u32 =
 
 static PREADV2_NOWAIT_COMPAT_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-fn truncate_user_buffers(
-    buffers: Vec<&'static mut [u8]>,
-    mut limit: usize,
-) -> Vec<&'static mut [u8]> {
-    let mut truncated = Vec::new();
-    for buffer in buffers {
-        if limit == 0 {
-            break;
-        }
-        if buffer.len() <= limit {
-            limit -= buffer.len();
-            truncated.push(buffer);
-        } else {
-            let (head, _) = buffer.split_at_mut(limit);
-            truncated.push(head);
-            break;
-        }
-    }
-    truncated
+fn truncate_user_buffers(buffers: TranslatedUserBuffer, limit: usize) -> TranslatedUserBuffer {
+    buffers.truncate(limit)
 }
 
 impl UserIovecCursor {
@@ -394,7 +377,7 @@ fn pwritev_regular_file_direct_page_slices(
     offset: usize,
     mut remaining_len: usize,
 ) -> SysResult<usize> {
-    let mut buffers = Vec::new();
+    let mut buffers = TranslatedUserBuffer::empty();
     let mut pending_len = 0usize;
     while let Some(chunk) = cursor.next_chunk() {
         let chunk = match chunk {
@@ -410,7 +393,7 @@ fn pwritev_regular_file_direct_page_slices(
         };
         let chunk_len = chunk.len.min(remaining_len);
         let chunk_buffers = truncate_user_buffers(chunk.buffers, chunk_len);
-        buffers.extend(chunk_buffers);
+        buffers.append(chunk_buffers);
         pending_len = pending_len.saturating_add(chunk_len);
         remaining_len = remaining_len.saturating_sub(chunk_len);
         if remaining_len == 0 {
@@ -430,7 +413,7 @@ fn writev_regular_file_direct_page_slices(
     mut remaining_len: usize,
     append: bool,
 ) -> SysResult<usize> {
-    let mut buffers = Vec::new();
+    let mut buffers = TranslatedUserBuffer::empty();
     let mut pending_len = 0usize;
     while let Some(chunk) = cursor.next_chunk() {
         let chunk = match chunk {
@@ -446,7 +429,7 @@ fn writev_regular_file_direct_page_slices(
         };
         let chunk_len = chunk.len.min(remaining_len);
         let chunk_buffers = truncate_user_buffers(chunk.buffers, chunk_len);
-        buffers.extend(chunk_buffers);
+        buffers.append(chunk_buffers);
         pending_len = pending_len.saturating_add(chunk_len);
         remaining_len = remaining_len.saturating_sub(chunk_len);
         if remaining_len == 0 {
@@ -463,12 +446,12 @@ fn writev_regular_file_direct_page_slices(
 fn collect_iovec_buffers(
     mut cursor: UserIovecCursor,
     mut remaining_len: usize,
-) -> SysResult<Vec<&'static mut [u8]>> {
-    let mut buffers = Vec::new();
+) -> SysResult<TranslatedUserBuffer> {
+    let mut buffers = TranslatedUserBuffer::empty();
     while let Some(chunk) = cursor.next_chunk() {
         let chunk = chunk?;
         let chunk_len = chunk.len.min(remaining_len);
-        buffers.extend(truncate_user_buffers(chunk.buffers, chunk_len));
+        buffers.append(truncate_user_buffers(chunk.buffers, chunk_len));
         remaining_len = remaining_len.saturating_sub(chunk_len);
         if remaining_len == 0 {
             break;

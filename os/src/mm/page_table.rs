@@ -4,6 +4,7 @@ use crate::perf;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
+use core::ops::{Deref, DerefMut};
 
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,6 +276,119 @@ impl PageTable {
     }
 }
 
+/// A checked user translation together with allocator references for its pages.
+///
+/// The slices and pins must move together until the copy or File operation is
+/// complete. Keeping this intermediate type separate prevents truncation and
+/// iovec assembly from accidentally dropping a pin before its slice.
+pub(crate) struct TranslatedUserBuffer {
+    buffers: Vec<&'static mut [u8]>,
+    pins: Vec<FrameTracker>,
+}
+
+impl TranslatedUserBuffer {
+    pub(crate) fn new(buffers: Vec<&'static mut [u8]>, pins: Vec<FrameTracker>) -> Self {
+        assert_eq!(
+            buffers.len(),
+            pins.len(),
+            "translated user segments and pins diverged"
+        );
+        Self { buffers, pins }
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            buffers: Vec::new(),
+            pins: Vec::new(),
+        }
+    }
+
+    pub(crate) fn append(&mut self, mut other: Self) {
+        self.buffers.append(&mut other.buffers);
+        self.pins.append(&mut other.pins);
+    }
+
+    pub(crate) fn truncate(mut self, mut limit: usize) -> Self {
+        let keep = self
+            .buffers
+            .iter()
+            .position(|buffer| {
+                if limit == 0 {
+                    true
+                } else if buffer.len() <= limit {
+                    limit -= buffer.len();
+                    false
+                } else {
+                    true
+                }
+            })
+            .unwrap_or(self.buffers.len());
+        if keep < self.buffers.len() && limit > 0 {
+            let buffer = &mut self.buffers[keep];
+            let ptr = buffer.as_mut_ptr();
+            *buffer = unsafe { core::slice::from_raw_parts_mut(ptr, limit) };
+            self.buffers.truncate(keep + 1);
+            self.pins.truncate(keep + 1);
+        } else {
+            self.buffers.truncate(keep);
+            self.pins.truncate(keep);
+        }
+        self
+    }
+
+    fn into_parts(self) -> (Vec<&'static mut [u8]>, Vec<FrameTracker>) {
+        (self.buffers, self.pins)
+    }
+}
+
+impl Deref for TranslatedUserBuffer {
+    type Target = Vec<&'static mut [u8]>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.buffers
+    }
+}
+
+impl DerefMut for TranslatedUserBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffers
+    }
+}
+
+pub(crate) struct TranslatedUserBufferIntoIter {
+    buffers: alloc::vec::IntoIter<&'static mut [u8]>,
+    _pins: Vec<FrameTracker>,
+}
+
+impl Iterator for TranslatedUserBufferIntoIter {
+    type Item = &'static mut [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.buffers.next()
+    }
+}
+
+impl IntoIterator for TranslatedUserBuffer {
+    type Item = &'static mut [u8];
+    type IntoIter = TranslatedUserBufferIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        TranslatedUserBufferIntoIter {
+            buffers: self.buffers.into_iter(),
+            _pins: self.pins,
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a TranslatedUserBuffer {
+    type Item = &'a &'static mut [u8];
+    type IntoIter = core::slice::Iter<'a, &'static mut [u8]>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.buffers.iter()
+    }
+}
+
 // CONTEXT: most syscall copy paths use checked byte-buffer helpers now. Keep
 // this segmented buffer type for legacy in-kernel adapters that still iterate
 // translated slices directly.
@@ -287,20 +401,8 @@ pub struct UserBuffer {
 }
 
 impl UserBuffer {
-    pub fn new(buffers: Vec<&'static mut [u8]>) -> Self {
-        let mut pins = Vec::with_capacity(buffers.len());
-        for buffer in &buffers {
-            if buffer.is_empty() {
-                continue;
-            }
-            let ppn = PhysAddr::from(buffer.as_ptr() as usize).floor();
-            pins.push(FrameTracker::from_retained(ppn).unwrap_or_else(|| {
-                panic!(
-                    "translated user buffer references unallocated frame: ppn={:#x}",
-                    ppn.0
-                )
-            }));
-        }
+    pub(crate) fn new(translated: TranslatedUserBuffer) -> Self {
+        let (buffers, pins) = translated.into_parts();
         Self {
             buffers,
             _pins: pins,

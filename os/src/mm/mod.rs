@@ -28,6 +28,7 @@ pub use frame_allocator::{
 pub use kernel_space::{KERNEL_SPACE, kernel_token};
 pub(crate) use kernel_space::{insert_global_kernel_framed_area_uninit, remove_global_kernel_area};
 pub use memory_set::MemorySet;
+pub(crate) use page_table::TranslatedUserBuffer;
 pub use page_table::{PageTable, PageTableEntry, UserBuffer};
 pub(crate) use user_space::FutexSharedKey;
 pub use user_space::{MemoryProtectError, MmapFaultAccess, MmapFaultResult};

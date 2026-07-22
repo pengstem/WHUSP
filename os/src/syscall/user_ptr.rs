@@ -1,8 +1,12 @@
-use crate::mm::{MemorySet, MmapFaultAccess, PageTable, StepByOne, VirtAddr};
+use crate::mm::{
+    FrameTracker, MemorySet, MmapFaultAccess, PageTable, StepByOne, TranslatedUserBuffer, VirtAddr,
+};
 use crate::perf;
 use alloc::string::String;
-use alloc::vec::Vec;
+use alloc::sync::Arc;
+use alloc::{vec, vec::Vec};
 use core::mem::{MaybeUninit, size_of};
+use core::ops::{Deref, DerefMut};
 
 use super::SyscallContext;
 use super::errno::{SysError, SysResult};
@@ -24,20 +28,20 @@ pub(crate) enum UserBufferAccess {
 /// mappings before copying. A `false` return is reported as `EFAULT`.
 pub(crate) type UserFaultHandler = fn(usize, UserBufferAccess) -> bool;
 
-#[derive(Clone, Copy)]
-enum EffectiveUserFault<'a> {
+#[derive(Clone)]
+enum EffectiveUserFault {
     None,
     Function(UserFaultHandler),
-    CurrentLazyFramed(&'a crate::task::ProcessControlBlock),
+    CurrentLazyFramed(Arc<crate::task::ProcessControlBlock>),
 }
 
-#[derive(Clone, Copy)]
-struct UserFaultResolver<'a> {
-    fault: EffectiveUserFault<'a>,
-    current_process: Option<&'a crate::task::ProcessControlBlock>,
+#[derive(Clone)]
+struct UserFaultResolver {
+    fault: EffectiveUserFault,
+    current_process: Option<Arc<crate::task::ProcessControlBlock>>,
 }
 
-impl<'a> UserFaultResolver<'a> {
+impl UserFaultResolver {
     fn none() -> Self {
         Self {
             fault: EffectiveUserFault::None,
@@ -52,16 +56,16 @@ impl<'a> UserFaultResolver<'a> {
         }
     }
 
-    fn from_current_lazy_framed(process: &'a crate::task::ProcessControlBlock) -> Self {
+    fn from_current_lazy_framed(process: Arc<crate::task::ProcessControlBlock>) -> Self {
         Self {
-            fault: EffectiveUserFault::CurrentLazyFramed(process),
+            fault: EffectiveUserFault::CurrentLazyFramed(Arc::clone(&process)),
             current_process: Some(process),
         }
     }
 
     fn with_current_process(
         fault_handler: UserFaultHandler,
-        process: &'a crate::task::ProcessControlBlock,
+        process: Arc<crate::task::ProcessControlBlock>,
     ) -> Self {
         Self {
             fault: EffectiveUserFault::Function(fault_handler),
@@ -77,14 +81,14 @@ impl<'a> UserFaultResolver<'a> {
         match self.fault {
             EffectiveUserFault::None => false,
             EffectiveUserFault::Function(handler) => handler(addr, access),
-            EffectiveUserFault::CurrentLazyFramed(process) => {
-                lazy_framed_user_fault_for_process(process, addr, access)
+            EffectiveUserFault::CurrentLazyFramed(ref process) => {
+                lazy_framed_user_fault_for_process(process.as_ref(), addr, access)
             }
         }
     }
 
     fn resolve_cow(&self, token: usize, addr: usize) -> bool {
-        if let Some(process) = self.current_process {
+        if let Some(process) = &self.current_process {
             return process
                 .inner_exclusive_access()
                 .memory_set
@@ -100,11 +104,6 @@ fn mmap_user_fault(addr: usize, access: UserBufferAccess) -> bool {
         UserBufferAccess::Write => MmapFaultAccess::Write,
     };
     crate::arch::trap::handle_user_page_fault(addr, access)
-}
-
-fn lazy_framed_user_fault(addr: usize, access: UserBufferAccess) -> bool {
-    let process = crate::task::current_process();
-    lazy_framed_user_fault_for_process(&process, addr, access)
 }
 
 fn lazy_framed_user_fault_for_process(
@@ -125,10 +124,7 @@ fn lazy_framed_user_fault_for_process(
 fn effective_user_fault_resolver(
     token: usize,
     fault_handler: Option<UserFaultHandler>,
-) -> UserFaultResolver<'static> {
-    if let Some(fault_handler) = fault_handler {
-        return UserFaultResolver::from_function(fault_handler);
-    }
+) -> UserFaultResolver {
     let Some(task) = crate::task::current_task() else {
         return UserFaultResolver::none();
     };
@@ -141,22 +137,28 @@ fn effective_user_fault_resolver(
     let Some(inner) = process.try_inner_exclusive_access() else {
         return UserFaultResolver::none();
     };
-    if inner.memory_set.token() == token {
-        UserFaultResolver::from_function(lazy_framed_user_fault)
+    let is_current_token = inner.memory_set.token() == token;
+    drop(inner);
+    if !is_current_token {
+        return fault_handler
+            .map_or_else(UserFaultResolver::none, UserFaultResolver::from_function);
+    }
+    if let Some(fault_handler) = fault_handler {
+        UserFaultResolver::with_current_process(fault_handler, process)
     } else {
-        UserFaultResolver::none()
+        UserFaultResolver::from_current_lazy_framed(process)
     }
 }
 
-fn effective_user_fault_resolver_for_ctx<'a>(
-    ctx: &'a SyscallContext,
+fn effective_user_fault_resolver_for_ctx(
+    ctx: &SyscallContext,
     token: usize,
     fault_handler: Option<UserFaultHandler>,
-) -> UserFaultResolver<'a> {
+) -> UserFaultResolver {
     // A SyscallContext pins the entry address-space token. Only attach the
     // current process to the resolver when the requested token is that same
     // token; foreign MemorySet copies must not fault the running process.
-    let current_process = (token == ctx.user_token()).then_some(ctx.process().as_ref());
+    let current_process = (token == ctx.user_token()).then(|| Arc::clone(ctx.process()));
     if let Some(fault_handler) = fault_handler {
         return if let Some(process) = current_process {
             UserFaultResolver::with_current_process(fault_handler, process)
@@ -176,7 +178,7 @@ pub(crate) fn translated_byte_buffer_checked(
     ptr: *const u8,
     len: usize,
     access: UserBufferAccess,
-) -> SysResult<Vec<&'static mut [u8]>> {
+) -> SysResult<TranslatedUserBuffer> {
     translated_byte_buffer_checked_with_fault(token, ptr, len, access, None)
 }
 
@@ -185,7 +187,7 @@ pub(crate) fn translated_byte_buffer_checked_ctx(
     ptr: *const u8,
     len: usize,
     access: UserBufferAccess,
-) -> SysResult<Vec<&'static mut [u8]>> {
+) -> SysResult<TranslatedUserBuffer> {
     translated_byte_buffer_checked_with_fault_ctx(ctx, ptr, len, access, None)
 }
 
@@ -198,7 +200,7 @@ pub(crate) fn translated_byte_buffer_checked_with_mmap_fault(
     ptr: *const u8,
     len: usize,
     access: UserBufferAccess,
-) -> SysResult<Vec<&'static mut [u8]>> {
+) -> SysResult<TranslatedUserBuffer> {
     // CONTEXT: plain metadata copy helpers use `translated_byte_buffer_checked`
     // so an unmapped user range still returns `EFAULT` without invoking the
     // mmap fault handler from an unrelated ABI path.
@@ -210,7 +212,7 @@ pub(crate) fn translated_byte_buffer_checked_with_mmap_fault_ctx(
     ptr: *const u8,
     len: usize,
     access: UserBufferAccess,
-) -> SysResult<Vec<&'static mut [u8]>> {
+) -> SysResult<TranslatedUserBuffer> {
     translated_byte_buffer_checked_with_fault_ctx(ctx, ptr, len, access, Some(mmap_user_fault))
 }
 
@@ -225,7 +227,7 @@ pub(crate) fn translated_byte_buffer_checked_with_fault(
     len: usize,
     access: UserBufferAccess,
     fault_handler: Option<UserFaultHandler>,
-) -> SysResult<Vec<&'static mut [u8]>> {
+) -> SysResult<TranslatedUserBuffer> {
     let fault_handler = effective_user_fault_resolver(token, fault_handler);
     translated_byte_buffer_checked_with_resolver(token, ptr, len, access, fault_handler)
 }
@@ -236,7 +238,7 @@ fn translated_byte_buffer_checked_with_fault_ctx(
     len: usize,
     access: UserBufferAccess,
     fault_handler: Option<UserFaultHandler>,
-) -> SysResult<Vec<&'static mut [u8]>> {
+) -> SysResult<TranslatedUserBuffer> {
     let token = ctx.user_token();
     let fault_handler = effective_user_fault_resolver_for_ctx(ctx, token, fault_handler);
     translated_byte_buffer_checked_with_resolver(token, ptr, len, access, fault_handler)
@@ -247,32 +249,32 @@ fn translated_byte_buffer_checked_with_resolver(
     ptr: *const u8,
     len: usize,
     access: UserBufferAccess,
-    fault_handler: UserFaultResolver<'_>,
-) -> SysResult<Vec<&'static mut [u8]>> {
+    fault_handler: UserFaultResolver,
+) -> SysResult<TranslatedUserBuffer> {
     if len == 0 {
-        return Ok(Vec::new());
+        return Ok(TranslatedUserBuffer::empty());
     }
     // CONTEXT: brk growth is VMA-reserved and materialized lazily. Default
     // current-process syscall copies should fault those framed pages in, while
     // full mmap fault handling remains opt-in through the explicit mmap helper.
     let mut start = ptr as usize;
     let end = start.checked_add(len).ok_or(SysError::EFAULT)?;
-    let page_table = PageTable::from_token(token);
     let start_va = VirtAddr::from(start);
     if start_va.floor() == VirtAddr::from(end - 1).floor() {
-        let pte = checked_user_pte(&page_table, token, start, access, fault_handler)?;
+        let (pte, pin) = checked_and_pin_user_pte(token, start, access, &fault_handler)?;
         let offset = start_va.page_offset();
-        let mut buffers = Vec::with_capacity(1);
-        buffers.push(&mut pte.ppn().get_bytes_array()[offset..offset + len]);
+        let buffers = vec![&mut pte.ppn().get_bytes_array()[offset..offset + len]];
         perf::record_usercopy_checked_range(1, len);
-        return Ok(buffers);
+        return Ok(TranslatedUserBuffer::new(buffers, vec![pin]));
     }
     let mut buffers = Vec::new();
+    let mut pins = Vec::new();
     while start < end {
         let start_va = VirtAddr::from(start);
         let mut vpn = start_va.floor();
-        let pte = checked_user_pte(&page_table, token, start, access, fault_handler)?;
+        let (pte, pin) = checked_and_pin_user_pte(token, start, access, &fault_handler)?;
         let ppn = pte.ppn();
+        pins.push(pin);
         vpn.step();
         let mut end_va: VirtAddr = vpn.into();
         end_va = end_va.min(VirtAddr::from(end));
@@ -284,7 +286,59 @@ fn translated_byte_buffer_checked_with_resolver(
         start = end_va.into();
     }
     perf::record_usercopy_checked_range(buffers.len(), len);
-    Ok(buffers)
+    Ok(TranslatedUserBuffer::new(buffers, pins))
+}
+
+fn checked_and_pin_user_pte(
+    token: usize,
+    addr: usize,
+    access: UserBufferAccess,
+    fault_handler: &UserFaultResolver,
+) -> SysResult<(crate::mm::PageTableEntry, FrameTracker)> {
+    if let Some(process) = &fault_handler.current_process {
+        const MAX_FAULT_RETRIES: usize = 4;
+        for _ in 0..MAX_FAULT_RETRIES {
+            let inner = process.inner_exclusive_access();
+            if inner.memory_set.token() != token {
+                return Err(SysError::EFAULT);
+            }
+            let pte = inner.memory_set.translate(VirtAddr::from(addr).floor());
+            let reject_zero_ppn = fault_handler.can_fault();
+            if let Some(pte) = pte
+                && user_pte_allows(pte, access, reject_zero_ppn)
+            {
+                // Mapping mutation uses this same process lock. Taking the
+                // allocator reference before releasing it closes the
+                // translate -> munmap -> frame-reuse window.
+                let pin = FrameTracker::from_retained(pte.ppn()).ok_or(SysError::EFAULT)?;
+                drop(inner);
+                return Ok((pte, pin));
+            }
+            let cow = pte.is_some_and(|pte| {
+                access == UserBufferAccess::Write && pte.cow() && !pte.writable()
+            });
+            drop(inner);
+            let resolved = if cow {
+                fault_handler.resolve_cow(token, addr)
+            } else if fault_handler.can_fault() {
+                fault_handler.resolve(addr, access)
+            } else {
+                false
+            };
+            if !resolved {
+                return Err(SysError::EFAULT);
+            }
+        }
+        return Err(SysError::EFAULT);
+    }
+
+    // Foreign or freshly constructed address spaces are translated only by
+    // callers that already own their MemorySet. Retain immediately so the
+    // returned carrier still has an explicit physical-page lifetime.
+    let page_table = PageTable::from_token(token);
+    let pte = checked_user_pte(&page_table, token, addr, access, fault_handler)?;
+    let pin = FrameTracker::from_retained(pte.ppn()).ok_or(SysError::EFAULT)?;
+    Ok((pte, pin))
 }
 
 fn checked_user_pte(
@@ -292,7 +346,7 @@ fn checked_user_pte(
     token: usize,
     addr: usize,
     access: UserBufferAccess,
-    fault_handler: UserFaultResolver<'_>,
+    fault_handler: &UserFaultResolver,
 ) -> SysResult<crate::mm::PageTableEntry> {
     // Passing a fault handler means the copy is allowed to mutate the current
     // process mappings by resolving lazy mmap/COW faults. Cross-address-space
@@ -335,8 +389,8 @@ fn try_same_page_user_slice(
     ptr: *const u8,
     len: usize,
     access: UserBufferAccess,
-    fault_handler: UserFaultResolver<'_>,
-) -> Option<SysResult<&'static mut [u8]>> {
+    fault_handler: &UserFaultResolver,
+) -> Option<SysResult<PinnedUserSlice>> {
     // This is only an allocation-saving fast path for short ABI scalars. It
     // still goes through checked_user_pte(), so permission, COW, and optional
     // mmap-fault behavior match the multi-page copy path.
@@ -352,13 +406,34 @@ fn try_same_page_user_slice(
     if start_va.floor() != VirtAddr::from(end - 1).floor() {
         return None;
     }
-    let page_table = PageTable::from_token(token);
-    let pte = match checked_user_pte(&page_table, token, start, access, fault_handler) {
-        Ok(pte) => pte,
+    let (pte, pin) = match checked_and_pin_user_pte(token, start, access, fault_handler) {
+        Ok(result) => result,
         Err(err) => return Some(Err(err)),
     };
     let offset = start_va.page_offset();
-    Some(Ok(&mut pte.ppn().get_bytes_array()[offset..offset + len]))
+    Some(Ok(PinnedUserSlice {
+        buffer: &mut pte.ppn().get_bytes_array()[offset..offset + len],
+        _pin: pin,
+    }))
+}
+
+struct PinnedUserSlice {
+    buffer: &'static mut [u8],
+    _pin: FrameTracker,
+}
+
+impl Deref for PinnedUserSlice {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.buffer
+    }
+}
+
+impl DerefMut for PinnedUserSlice {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.buffer
+    }
 }
 
 fn resolve_current_cow_page(token: usize, addr: usize) -> bool {
@@ -634,16 +709,20 @@ fn copy_from_user_with_resolver(
     token: usize,
     ptr: *const u8,
     dst: &mut [u8],
-    fault_handler: UserFaultResolver<'_>,
+    fault_handler: UserFaultResolver,
 ) -> SysResult<()> {
     if dst.is_empty() {
         return Ok(());
     }
-    if let Some(buffer) =
-        try_same_page_user_slice(token, ptr, dst.len(), UserBufferAccess::Read, fault_handler)
-    {
+    if let Some(buffer) = try_same_page_user_slice(
+        token,
+        ptr,
+        dst.len(),
+        UserBufferAccess::Read,
+        &fault_handler,
+    ) {
         let buffer = buffer?;
-        dst.copy_from_slice(buffer);
+        dst.copy_from_slice(&buffer);
         perf::record_usercopy_same_page_fast(perf::UsercopyAccess::Read, dst.len());
         return Ok(());
     }
@@ -664,7 +743,7 @@ fn copy_from_user_with_resolver(
     Ok(())
 }
 
-fn copy_to_user_buffers(buffers: Vec<&'static mut [u8]>, src: &[u8]) {
+fn copy_to_user_buffers(buffers: TranslatedUserBuffer, src: &[u8]) {
     let mut copied = 0usize;
     for buffer in buffers {
         let next = copied + buffer.len();
@@ -738,7 +817,7 @@ fn copy_to_user_with_resolver(
     token: usize,
     ptr: *mut u8,
     src: &[u8],
-    fault_handler: UserFaultResolver<'_>,
+    fault_handler: UserFaultResolver,
     site: perf::UsercopySite,
 ) -> SysResult<()> {
     perf::record_usercopy_site(site, src.len());
@@ -750,9 +829,9 @@ fn copy_to_user_with_resolver(
         ptr.cast_const(),
         src.len(),
         UserBufferAccess::Write,
-        fault_handler,
+        &fault_handler,
     ) {
-        let buffer = buffer?;
+        let mut buffer = buffer?;
         buffer.copy_from_slice(src);
         perf::record_usercopy_same_page_fast(perf::UsercopyAccess::Write, src.len());
         return Ok(());
