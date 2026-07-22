@@ -866,18 +866,26 @@ impl MemorySet {
             exec_segment: None,
         });
         apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
-        let mut mapped_any = false;
-        for mapping in pages {
-            if mapping.page_index >= map_len / PAGE_SIZE {
-                continue;
-            }
-            let vpn = VirtPageNum(start_vpn.0 + mapping.page_index);
-            let frame = FrameTracker::from_retained(mapping.ppn)?;
-            if !area.map_existing_frame(&mut self.page_table, vpn, frame) {
-                area.unmap_resident(&mut self.page_table);
+        let candidates: Vec<_> = pages
+            .iter()
+            .filter(|mapping| mapping.page_index < map_len / PAGE_SIZE)
+            .map(|mapping| (VirtPageNum(start_vpn.0 + mapping.page_index), mapping.ppn))
+            .collect();
+        for (vpn, _) in &candidates {
+            if !self.page_table.prepare_empty_leaf_path(*vpn) {
                 return None;
             }
-            mapped_any = true;
+        }
+        let mut retained = Vec::new();
+        for (vpn, ppn) in candidates {
+            retained.push((vpn, FrameTracker::from_retained(ppn)?));
+        }
+        let mapped_any = !retained.is_empty();
+        for (vpn, frame) in retained {
+            assert!(
+                area.map_existing_frame(&mut self.page_table, vpn, frame),
+                "preflighted shared frame leaf changed before publication: vpn={vpn:?}"
+            );
         }
         self.insert_area_sorted(area);
         self.mmap_next = next_mmap_hint(end);
@@ -955,17 +963,28 @@ impl MemorySet {
         let mut area = MapArea::new(start.into(), end.into(), MapType::Framed, permission);
         area.shm_info = Some(ShmAreaInfo::new(shmid, len));
         apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
-        let mut mapped_any = false;
-        for mapping in pages {
-            if mapping.page_index >= map_len / PAGE_SIZE {
-                continue;
-            }
-            let vpn = VirtPageNum(start_vpn.0 + mapping.page_index);
-            if !area.map_shm_frame(&mut self.page_table, vpn, mapping.ppn, mapping.page_index) {
-                area.unmap_resident(&mut self.page_table);
+        let candidates: Vec<_> = pages
+            .iter()
+            .filter(|mapping| mapping.page_index < map_len / PAGE_SIZE)
+            .map(|mapping| {
+                (
+                    VirtPageNum(start_vpn.0 + mapping.page_index),
+                    mapping.ppn,
+                    mapping.page_index,
+                )
+            })
+            .collect();
+        for (vpn, _, _) in &candidates {
+            if !self.page_table.prepare_empty_leaf_path(*vpn) {
                 return None;
             }
-            mapped_any = true;
+        }
+        let mapped_any = !candidates.is_empty();
+        for (vpn, ppn, page_index) in candidates {
+            assert!(
+                area.map_shm_frame(&mut self.page_table, vpn, ppn, page_index),
+                "preflighted shm leaf changed before publication: vpn={vpn:?}"
+            );
         }
         self.insert_area_sorted(area);
         self.mmap_next = next_mmap_hint(end);

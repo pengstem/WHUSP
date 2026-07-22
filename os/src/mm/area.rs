@@ -417,59 +417,58 @@ impl MapArea {
         changed
     }
 
-    pub(super) fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) -> bool {
-        let ppn: PhysPageNum = match self.map_type {
-            MapType::Identical => {
-                let va: VirtAddr = vpn.into();
-                PhysAddr::from(usize::from(va)).floor()
-            }
-            MapType::Framed => {
-                let _profile_scope =
-                    crate::perf::time_scope(crate::perf::ProfilePoint::FrameAllocMapArea);
-                let Some(frame) = frame_alloc() else {
-                    return false;
-                };
-                let ppn = frame.ppn;
-                if !page_table.try_map(
-                    vpn,
-                    ppn,
-                    PTEFlags::from_bits_truncate(self.map_perm.bits() as usize),
-                ) {
-                    return false;
-                }
-                self.data_frames.insert(vpn, frame);
-                return true;
-            }
-        };
-        page_table.try_map(
-            vpn,
-            ppn,
-            PTEFlags::from_bits_truncate(self.map_perm.bits() as usize),
-        )
-    }
-
-    pub(super) fn map_one_uninit(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) -> bool {
+    fn map_framed_preflight(&mut self, page_table: &mut PageTable, zeroed: bool) -> bool {
         assert_eq!(self.map_type, MapType::Framed);
-        let _profile_scope = crate::perf::time_scope(crate::perf::ProfilePoint::FrameAllocMapArea);
-        let Some(frame) = frame_alloc_uninit() else {
-            return false;
-        };
-        let ppn = frame.ppn;
-        if !page_table.try_map(
-            vpn,
-            ppn,
-            PTEFlags::from_bits_truncate(self.map_perm.bits() as usize),
-        ) {
-            return false;
+        for vpn in self.vpn_range {
+            if !page_table.prepare_empty_leaf_path(vpn) {
+                return false;
+            }
         }
-        self.data_frames.insert(vpn, frame);
+
+        let mut frames = Vec::new();
+        for vpn in self.vpn_range {
+            let _profile_scope =
+                crate::perf::time_scope(crate::perf::ProfilePoint::FrameAllocMapArea);
+            let frame = if zeroed {
+                frame_alloc()
+            } else {
+                frame_alloc_uninit()
+            };
+            let Some(frame) = frame else {
+                return false;
+            };
+            frames.push((vpn, frame));
+        }
+
+        let flags = PTEFlags::from_bits_truncate(self.map_perm.bits() as usize);
+        for (vpn, frame) in frames {
+            let ppn = frame.ppn;
+            assert!(
+                page_table.try_map(vpn, ppn, flags),
+                "preflighted framed leaf changed before publication: vpn={vpn:?}"
+            );
+            assert!(
+                self.data_frames.insert(vpn, frame).is_none(),
+                "preflighted framed area already owned vpn={vpn:?}"
+            );
+        }
         true
     }
 
     pub(super) fn map(&mut self, page_table: &mut PageTable) -> bool {
+        if self.map_type == MapType::Framed {
+            return self.map_framed_preflight(page_table, true);
+        }
+
         let mut mapped_vpns = Vec::new();
         for vpn in self.vpn_range {
-            if !self.map_one(page_table, vpn) {
+            let va: VirtAddr = vpn.into();
+            let ppn = PhysAddr::from(usize::from(va)).floor();
+            if !page_table.try_map(
+                vpn,
+                ppn,
+                PTEFlags::from_bits_truncate(self.map_perm.bits() as usize),
+            ) {
                 for mapped_vpn in mapped_vpns {
                     self.unmap_one(page_table, mapped_vpn);
                 }
@@ -481,17 +480,7 @@ impl MapArea {
     }
 
     pub(super) fn map_uninit(&mut self, page_table: &mut PageTable) -> bool {
-        let mut mapped_vpns = Vec::new();
-        for vpn in self.vpn_range {
-            if !self.map_one_uninit(page_table, vpn) {
-                for mapped_vpn in mapped_vpns {
-                    self.unmap_one(page_table, mapped_vpn);
-                }
-                return false;
-            }
-            mapped_vpns.push(vpn);
-        }
-        true
+        self.map_framed_preflight(page_table, false)
     }
 
     pub(super) fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
@@ -609,12 +598,6 @@ impl MapArea {
         }
         info.pages.insert(vpn, page_index);
         true
-    }
-
-    pub(super) fn unmap_resident(&mut self, page_table: &mut PageTable) {
-        let mut retired = RetiredUserPages::new();
-        self.unmap_resident_deferred(page_table, &mut retired);
-        retired.release();
     }
 
     pub(super) fn unmap_resident_deferred(

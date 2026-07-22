@@ -172,6 +172,13 @@ impl PageTable {
         *pte = PageTableEntry::new(ppn, flags);
         true
     }
+    /// Allocates the page-table path for `vpn` without publishing a leaf.
+    ///
+    /// Bulk mapping code uses this as a preflight step so allocation failure
+    /// cannot occur after some leaf PTEs have become visible to another CPU.
+    pub(super) fn prepare_empty_leaf_path(&mut self, vpn: VirtPageNum) -> bool {
+        self.find_pte_create(vpn).is_some_and(|pte| pte.bits == 0)
+    }
     pub fn unmap(&mut self, vpn: VirtPageNum) {
         let pte = self
             .find_pte_mut(vpn)
