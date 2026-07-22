@@ -113,6 +113,9 @@ impl ProcessControlBlock {
         let process = Arc::new(Self {
             pid: pid_handle,
             scheduler_cpu: AtomicUsize::new(usize::MAX),
+            running_tasks: AtomicUsize::new(0),
+            exec_task: AtomicUsize::new(0),
+            inner_owner_cpu: AtomicUsize::new(usize::MAX),
             inner: unsafe {
                 UPIntrFreeCell::new(ProcessControlBlockInner {
                     is_zombie: false,
@@ -311,6 +314,9 @@ impl ProcessControlBlock {
         let child = Arc::new(Self {
             pid,
             scheduler_cpu: AtomicUsize::new(usize::MAX),
+            running_tasks: AtomicUsize::new(0),
+            exec_task: AtomicUsize::new(0),
+            inner_owner_cpu: AtomicUsize::new(usize::MAX),
             inner: unsafe {
                 UPIntrFreeCell::new(ProcessControlBlockInner {
                     is_zombie: false,

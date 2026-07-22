@@ -134,12 +134,22 @@ fn effective_user_fault_resolver(
     // Default lazy-framed faults are safe only for the current process token.
     // Child or foreign address spaces must use explicit MemorySet copy helpers
     // so user-stack setup and ptrace writes do not fault the wrong process.
-    let Some(inner) = process.try_inner_exclusive_access() else {
-        return UserFaultResolver::none();
+    let is_current_token = if process.inner_owned_by_current() {
+        // A caller already holding this PCB lock owns mapping stability. Do
+        // not recurse; leave `current_process` empty so the checked walk uses
+        // that existing serialization and still retains the frame.
+        token == crate::task::current_user_token()
+    } else {
+        let inner = process.inner_exclusive_access();
+        let matches = inner.memory_set.token() == token;
+        drop(inner);
+        matches
     };
-    let is_current_token = inner.memory_set.token() == token;
-    drop(inner);
     if !is_current_token {
+        return fault_handler
+            .map_or_else(UserFaultResolver::none, UserFaultResolver::from_function);
+    }
+    if process.inner_owned_by_current() {
         return fault_handler
             .map_or_else(UserFaultResolver::none, UserFaultResolver::from_function);
     }
@@ -158,7 +168,8 @@ fn effective_user_fault_resolver_for_ctx(
     // A SyscallContext pins the entry address-space token. Only attach the
     // current process to the resolver when the requested token is that same
     // token; foreign MemorySet copies must not fault the running process.
-    let current_process = (token == ctx.user_token()).then(|| Arc::clone(ctx.process()));
+    let current_process = (token == ctx.user_token() && !ctx.process().inner_owned_by_current())
+        .then(|| Arc::clone(ctx.process()));
     if let Some(fault_handler) = fault_handler {
         return if let Some(process) = current_process {
             UserFaultResolver::with_current_process(fault_handler, process)

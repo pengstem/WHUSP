@@ -390,6 +390,7 @@ impl ProcessControlBlock {
         let smp_wait_io_probe = is_smp_wait_io_probe_path(&executable_path);
         let smp_phase4_wait_probe = is_smp_phase4_wait_probe_path(&executable_path);
         let current = current_task().ok_or(SysError::ESRCH)?;
+        let _exec_exclusion = self.begin_exec_exclusion(current.as_ref())?;
         let process_token = self.inner_exclusive_access().get_user_token();
         let task = prepare_exec_thread_group(self, current, process_token, self.getpid())?;
 

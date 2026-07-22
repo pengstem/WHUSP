@@ -167,7 +167,7 @@ impl TaskManager {
             .process
             .upgrade()
             .expect("runnable task process must outlive the task");
-        if !process.try_claim_scheduler_cpu(cpu) {
+        if !process.try_claim_scheduler_task(task, cpu) {
             return ClaimResult::Ineligible;
         }
         inner.on_rq = false;

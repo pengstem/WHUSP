@@ -12,6 +12,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::{vec, vec::Vec};
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const RLIM_INFINITY: usize = usize::MAX;
@@ -647,29 +648,151 @@ impl ProcessTimers {
 pub struct ProcessControlBlock {
     // immutable
     pub pid: PidHandle,
-    // Phase 3 deliberately permits at most one CPU to execute tasks from one
-    // address space. Phase 5 replaces this pin with active masks and TLB
-    // shootdown after shared-mm mutation is made concurrent-safe.
     pub(super) scheduler_cpu: AtomicUsize,
+    pub(super) running_tasks: AtomicUsize,
+    pub(super) exec_task: AtomicUsize,
+    pub(super) inner_owner_cpu: AtomicUsize,
     // mutable
     pub(super) inner: UPIntrFreeCell<ProcessControlBlockInner>,
 }
 
 const NO_SCHEDULER_CPU: usize = usize::MAX;
+const NO_EXEC_TASK: usize = 0;
+const NO_INNER_OWNER: usize = usize::MAX;
+
+pub(crate) struct ExecSchedulerGuard<'a> {
+    process: &'a ProcessControlBlock,
+    task_id: usize,
+}
+
+impl Drop for ExecSchedulerGuard<'_> {
+    fn drop(&mut self) {
+        self.process
+            .exec_task
+            .compare_exchange(
+                self.task_id,
+                NO_EXEC_TASK,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .unwrap_or_else(|owner| {
+                panic!(
+                    "exec scheduler owner mismatch: expected={:#x} actual={owner:#x}",
+                    self.task_id
+                )
+            });
+        crate::cpu::wake_scheduler_cpu(crate::cpu::online_mask());
+    }
+}
+
+pub struct ProcessInnerGuard<'a> {
+    process: &'a ProcessControlBlock,
+    inner: Option<UPIntrRefMut<'a, ProcessControlBlockInner>>,
+}
+
+impl Deref for ProcessInnerGuard<'_> {
+    type Target = ProcessControlBlockInner;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref().expect("process inner guard released")
+    }
+}
+
+impl DerefMut for ProcessInnerGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner.as_mut().expect("process inner guard released")
+    }
+}
+
+impl Drop for ProcessInnerGuard<'_> {
+    fn drop(&mut self) {
+        let cpu = crate::cpu::current_id();
+        self.process
+            .inner_owner_cpu
+            .compare_exchange(cpu, NO_INNER_OWNER, Ordering::Release, Ordering::Relaxed)
+            .unwrap_or_else(|owner| {
+                panic!("process inner owner mismatch: expected={cpu} actual={owner}")
+            });
+        drop(self.inner.take());
+    }
+}
 
 impl ProcessControlBlock {
-    pub(crate) fn try_claim_scheduler_cpu(&self, cpu: crate::cpu::CpuId) -> bool {
-        self.scheduler_cpu
-            .compare_exchange(NO_SCHEDULER_CPU, cpu, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    fn scheduler_task_id(task: &TaskControlBlock) -> usize {
+        task as *const TaskControlBlock as usize
     }
 
-    pub(crate) fn release_scheduler_cpu(&self, cpu: crate::cpu::CpuId) {
+    pub(crate) fn try_claim_scheduler_task(
+        &self,
+        task: &TaskControlBlock,
+        cpu: crate::cpu::CpuId,
+    ) -> bool {
+        if self
+            .scheduler_cpu
+            .compare_exchange(NO_SCHEDULER_CPU, cpu, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        let task_id = Self::scheduler_task_id(task);
+        let exec_task = self.exec_task.load(Ordering::Acquire);
+        if exec_task != NO_EXEC_TASK && exec_task != task_id {
+            self.scheduler_cpu
+                .store(NO_SCHEDULER_CPU, Ordering::Release);
+            return false;
+        }
+        self.running_tasks.fetch_add(1, Ordering::AcqRel);
+        let exec_task = self.exec_task.load(Ordering::Acquire);
+        if exec_task == NO_EXEC_TASK || exec_task == task_id {
+            return true;
+        }
+        let previous = self.running_tasks.fetch_sub(1, Ordering::AcqRel);
+        assert_ne!(previous, 0, "process running-task count underflow");
         self.scheduler_cpu
-            .compare_exchange(cpu, NO_SCHEDULER_CPU, Ordering::AcqRel, Ordering::Acquire)
+            .store(NO_SCHEDULER_CPU, Ordering::Release);
+        false
+    }
+
+    pub(crate) fn release_scheduler_task(&self, task: &TaskControlBlock, cpu: crate::cpu::CpuId) {
+        let previous = self.running_tasks.fetch_sub(1, Ordering::AcqRel);
+        assert_ne!(previous, 0, "process running-task count underflow");
+        let exec_task = self.exec_task.load(Ordering::Acquire);
+        let task_id = Self::scheduler_task_id(task);
+        assert!(
+            exec_task == NO_EXEC_TASK || exec_task == task_id || previous > 1,
+            "non-exec task was the final runner under exec exclusion"
+        );
+        self.scheduler_cpu
+            .compare_exchange(cpu, NO_SCHEDULER_CPU, Ordering::Release, Ordering::Relaxed)
             .unwrap_or_else(|owner| {
                 panic!("process scheduler owner mismatch: expected={cpu} actual={owner}")
             });
+    }
+
+    pub(crate) fn begin_exec_exclusion<'a>(
+        &'a self,
+        task: &TaskControlBlock,
+    ) -> crate::syscall::errno::SysResult<ExecSchedulerGuard<'a>> {
+        let task_id = Self::scheduler_task_id(task);
+        self.exec_task
+            .compare_exchange(NO_EXEC_TASK, task_id, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| crate::syscall::errno::SysError::EAGAIN)?;
+
+        let start = crate::timer::get_time();
+        let timeout = crate::config::clock_freq().saturating_mul(2);
+        while self.running_tasks.load(Ordering::Acquire) != 1 {
+            if crate::timer::get_time().wrapping_sub(start) >= timeout {
+                panic!(
+                    "exec exclusion timeout: task={task_id:#x} running={}",
+                    self.running_tasks.load(Ordering::Acquire)
+                );
+            }
+            crate::task::suspend_current_and_run_next();
+        }
+        Ok(ExecSchedulerGuard {
+            process: self,
+            task_id,
+        })
     }
 }
 
@@ -989,19 +1112,40 @@ pub(crate) fn comm_from_cmdline(cmdline: &[String]) -> String {
 }
 
 impl ProcessControlBlock {
-    pub fn inner_exclusive_access(&self) -> UPIntrRefMut<'_, ProcessControlBlockInner> {
-        self.inner.exclusive_access()
+    pub fn inner_exclusive_access(&self) -> ProcessInnerGuard<'_> {
+        let inner = self.inner.exclusive_access();
+        self.note_inner_acquired();
+        ProcessInnerGuard {
+            process: self,
+            inner: Some(inner),
+        }
     }
 
-    pub fn try_inner_exclusive_access(&self) -> Option<UPIntrRefMut<'_, ProcessControlBlockInner>> {
-        self.inner.try_exclusive_access()
+    pub fn try_inner_exclusive_access(&self) -> Option<ProcessInnerGuard<'_>> {
+        let inner = self.inner.try_exclusive_access()?;
+        self.note_inner_acquired();
+        Some(ProcessInnerGuard {
+            process: self,
+            inner: Some(inner),
+        })
+    }
+
+    fn note_inner_acquired(&self) {
+        let cpu = crate::cpu::current_id();
+        self.inner_owner_cpu
+            .compare_exchange(NO_INNER_OWNER, cpu, Ordering::Acquire, Ordering::Relaxed)
+            .unwrap_or_else(|owner| panic!("process inner lock acquired with stale owner {owner}"));
+    }
+
+    pub(crate) fn inner_owned_by_current(&self) -> bool {
+        self.inner_owner_cpu.load(Ordering::Relaxed) == crate::cpu::current_id()
     }
 
     pub(crate) fn path_snapshot(&self) -> PathSnapshot {
         // Snapshot lookup identity and visible path strings under the PCB lock,
         // then let syscall path code release it before touching fd tables or
         // VFS backends.
-        let inner = self.inner.exclusive_access();
+        let inner = self.inner_exclusive_access();
         PathSnapshot {
             context: inner.fs.path_context(),
             cwd_path: inner.fs.cwd_path.clone(),
@@ -1069,17 +1213,17 @@ impl ProcessControlBlock {
     }
 
     pub fn set_working_dir(&self, cwd: WorkingDir, cwd_path: String) {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner_exclusive_access();
         inner.fs.set_working_dir(cwd, cwd_path);
     }
 
     pub fn set_root_dir(&self, root: WorkingDir, root_path: String) {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner_exclusive_access();
         inner.fs.set_root_dir(root, root_path);
     }
 
     pub(crate) fn references_vfs_mount(&self, mount_id: crate::fs::MountId) -> bool {
-        let inner = self.inner.exclusive_access();
+        let inner = self.inner_exclusive_access();
         inner.fs.references_mount(mount_id)
             || inner
                 .fd_table
@@ -1294,7 +1438,7 @@ impl ProcessControlBlock {
     }
 
     pub fn try_account_system_time_until(&self, now_us: usize) {
-        if let Some(mut inner) = self.inner.try_exclusive_access() {
+        if let Some(mut inner) = self.try_inner_exclusive_access() {
             inner.cpu_times.account_system_until(now_us);
         }
     }
