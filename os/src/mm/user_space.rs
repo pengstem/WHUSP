@@ -40,10 +40,6 @@ fn flush_tlb_vpn_range(start_vpn: VirtPageNum, end_vpn: VirtPageNum) {
     }
 }
 
-fn flush_tlb_vpn(vpn: VirtPageNum) {
-    flush_tlb_vpn_range(vpn, VirtPageNum(vpn.0 + 1));
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryProtectError {
     Unmapped,
@@ -502,19 +498,30 @@ impl MemorySet {
         }
 
         let vpn_range = area.vpn_range;
+        let mut installed_any = false;
         for vpn in vpn_range {
             if self.translate(vpn).is_some_and(|pte| pte.bits != 0) {
                 continue;
             }
             let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocSharedAnon);
             let Some(frame) = frame_alloc() else {
+                if installed_any {
+                    self.invalidate_tlb_vpn_range(vpn_range.get_start(), vpn_range.get_end());
+                }
                 return false;
             };
             let page_table = &mut self.page_table;
             let area = &mut self.areas[area_idx];
             if !area.map_existing_frame(page_table, vpn, frame) {
+                if installed_any {
+                    self.invalidate_tlb_vpn_range(vpn_range.get_start(), vpn_range.get_end());
+                }
                 return false;
             }
+            installed_any = true;
+        }
+        if installed_any {
+            self.invalidate_tlb_vpn_range(vpn_range.get_start(), vpn_range.get_end());
         }
         true
     }
@@ -610,6 +617,7 @@ impl MemorySet {
         if !area.map_existing_frame(page_table, vpn, frame) {
             return false;
         }
+        self.invalidate_tlb_page(usize::from(VirtAddr::from(vpn)));
         if addr >= self.brk_base && addr < self.brk_mapped_end {
             perf::record_brk_lazy_fault_page();
         }
@@ -648,6 +656,7 @@ impl MemorySet {
                     return self.brk;
                 }
                 self.insert_area_sorted(heap_area);
+                self.invalidate_tlb_vpn_range(old_end_vpn, new_end_vpn);
                 perf::record_brk_grow(grow_pages);
                 perf::record_brk_eager_mapped(grow_pages);
                 self.brk = addr;
@@ -876,6 +885,7 @@ impl MemorySet {
             exec_segment: None,
         });
         apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
+        let mut mapped_any = false;
         for mapping in pages {
             if mapping.page_index >= map_len / PAGE_SIZE {
                 continue;
@@ -886,9 +896,13 @@ impl MemorySet {
                 area.unmap_resident(&mut self.page_table);
                 return None;
             }
+            mapped_any = true;
         }
         self.insert_area_sorted(area);
         self.mmap_next = next_mmap_hint(end);
+        if mapped_any {
+            self.invalidate_tlb_vpn_range(start_vpn, VirtAddr::from(end).floor());
+        }
         Some(start)
     }
 
@@ -960,6 +974,7 @@ impl MemorySet {
         let mut area = MapArea::new(start.into(), end.into(), MapType::Framed, permission);
         area.shm_info = Some(ShmAreaInfo::new(shmid, len));
         apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
+        let mut mapped_any = false;
         for mapping in pages {
             if mapping.page_index >= map_len / PAGE_SIZE {
                 continue;
@@ -969,9 +984,13 @@ impl MemorySet {
                 area.unmap_resident(&mut self.page_table);
                 return None;
             }
+            mapped_any = true;
         }
         self.insert_area_sorted(area);
         self.mmap_next = next_mmap_hint(end);
+        if mapped_any {
+            self.invalidate_tlb_vpn_range(start_vpn, VirtAddr::from(end).floor());
+        }
         Some(start)
     }
 
@@ -1103,7 +1122,7 @@ impl MemorySet {
                 if !self.page_table.remap_flags(vpn, pte_flags) {
                     return None;
                 }
-                flush_tlb_vpn(vpn);
+                self.invalidate_tlb_page(usize::from(VirtAddr::from(vpn)));
             }
             return Some(MmapFaultResult::Handled);
         }
@@ -1198,9 +1217,19 @@ impl MemorySet {
         if !self.areas[idx].is_mmap() {
             return false;
         }
-        let page_table = &mut self.page_table;
-        let area = &mut self.areas[idx];
-        area.map_existing_frame(page_table, page.vpn, frame)
+        let exec_fault = page.exec_fault;
+        let installed = {
+            let page_table = &mut self.page_table;
+            let area = &mut self.areas[idx];
+            area.map_existing_frame(page_table, page.vpn, frame)
+        };
+        if installed {
+            self.invalidate_tlb_page(usize::from(VirtAddr::from(page.vpn)));
+            if exec_fault {
+                arch_mm::instruction_barrier();
+            }
+        }
+        installed
     }
 
     /// Installs a page-cache frame resolved for a MAP_SHARED mmap fault.
@@ -1222,8 +1251,11 @@ impl MemorySet {
         let area = &mut self.areas[idx];
         let exec_fault = page.is_exec_fault();
         let installed = area.map_page_cache_frame(page_table, page.vpn, ppn, page.key);
-        if installed && exec_fault {
-            arch_mm::publish_pte_barrier();
+        if installed {
+            self.invalidate_tlb_page(usize::from(VirtAddr::from(page.vpn)));
+            if exec_fault {
+                arch_mm::instruction_barrier();
+            }
         }
         installed
     }
@@ -1333,6 +1365,9 @@ impl MemorySet {
         self.split_area_at(end_vpn);
 
         let mut touched = false;
+        let mut failed = false;
+        let mut pte_mutated = false;
+        let mut retired_cache_keys = Vec::new();
         let (start_idx, end_idx) = self.overlap_area_idx_bounds(start_vpn, end_vpn);
         let mut area_visits = 0usize;
         for area in &mut self.areas[start_idx..end_idx] {
@@ -1340,17 +1375,38 @@ impl MemorySet {
             let area_start = area.vpn_range.get_start();
             let area_end = area.vpn_range.get_end();
             if area_start >= start_vpn && area_end <= end_vpn {
-                if !area.remap_permission(&mut self.page_table, permission, reported_permission) {
-                    return Err(MemoryProtectError::Unmapped);
+                if !area.remap_permission(
+                    &mut self.page_table,
+                    permission,
+                    reported_permission,
+                    &mut retired_cache_keys,
+                    &mut pte_mutated,
+                ) {
+                    failed = true;
+                    break;
                 }
                 touched = true;
             }
         }
         perf::record_vma_range_scan(area_visits, start_idx);
+        if pte_mutated {
+            self.invalidate_tlb_vpn_range(start_vpn, end_vpn);
+            if permission.contains(MapPermission::X) {
+                arch_mm::instruction_barrier();
+            }
+        }
+        if !retired_cache_keys.is_empty() {
+            let mut cache = PAGE_CACHE.exclusive_access();
+            for key in retired_cache_keys {
+                cache.dec_ref(key);
+            }
+        }
+        if failed {
+            return Err(MemoryProtectError::Unmapped);
+        }
         if !touched {
             return Err(MemoryProtectError::Unmapped);
         }
-        flush_tlb_vpn_range(start_vpn, end_vpn);
         Ok(())
     }
 
@@ -1733,9 +1789,11 @@ impl MemorySet {
         if let Some(info) = self.areas[idx].mmap_info.as_mut() {
             info.len = new_len;
         }
-        self.areas[idx].write_protect_shared_mmap_pages(&mut self.page_table);
+        let write_protected = self.areas[idx].write_protect_shared_mmap_pages(&mut self.page_table);
         self.last_area_idx_containing.set(None);
-        flush_tlb_all_recorded();
+        if write_protected {
+            self.invalidate_tlb_vpn_range(old_start_vpn, old_end_vpn);
+        }
         Some((old_addr, Vec::new()))
     }
 

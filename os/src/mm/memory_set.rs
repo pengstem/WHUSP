@@ -85,6 +85,19 @@ impl MemorySet {
     pub(super) fn invalidate_tlb_page(&self, virtual_address: usize) {
         self.control.invalidate_tlb_page(virtual_address);
     }
+
+    pub(super) fn invalidate_tlb_vpn_range(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) {
+        assert!(start_vpn < end_vpn, "empty virtual-page invalidation range");
+        let start = usize::from(VirtAddr::from(start_vpn));
+        let pages = end_vpn
+            .0
+            .checked_sub(start_vpn.0)
+            .expect("inverted virtual-page invalidation range");
+        let size = pages
+            .checked_mul(crate::config::PAGE_SIZE)
+            .expect("virtual-page invalidation size overflow");
+        self.control.invalidate_tlb_range(start, size);
+    }
     /// Maps kernel-private framed pages without clearing the new frames.
     ///
     /// Callers must only use this for mappings that are never readable from
@@ -320,7 +333,11 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
     pub fn remap_existing_page_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
-        self.page_table.remap_flags(vpn, flags)
+        if !self.page_table.remap_flags(vpn, flags) {
+            return false;
+        }
+        self.invalidate_tlb_page(usize::from(VirtAddr::from(vpn)));
+        true
     }
     /// Tears down user mappings and returns deferred file-backed writebacks.
     ///

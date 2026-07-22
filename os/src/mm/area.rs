@@ -232,7 +232,8 @@ impl MapArea {
         &mut self,
         page_table: &mut PageTable,
         pte_flags: PTEFlags,
-        keep_clean_cache_pages: bool,
+        retired_cache_keys: &mut Vec<PageCacheKey>,
+        pte_mutated: &mut bool,
     ) -> bool {
         let pages: Vec<_> = self
             .mmap_info
@@ -262,16 +263,12 @@ impl MapArea {
             if !page_table.replace_leaf(vpn, frame.ppn, pte_flags) {
                 return false;
             }
+            *pte_mutated = true;
             self.data_frames.insert(vpn, frame);
             if let Some(info) = self.mmap_info.as_mut() {
                 info.page_cache_pages.remove(&vpn);
             }
-            let mut cache = PAGE_CACHE.exclusive_access();
-            if keep_clean_cache_pages {
-                cache.dec_ref(key);
-            } else {
-                let _ = cache.dec_ref_and_take_if_unused(key);
-            }
+            retired_cache_keys.push(key);
         }
 
         true
@@ -282,6 +279,8 @@ impl MapArea {
         page_table: &mut PageTable,
         permission: MapPermission,
         reported_permission: MapPermission,
+        retired_cache_keys: &mut Vec<PageCacheKey>,
+        pte_mutated: &mut bool,
     ) -> bool {
         let pte_flags = PTEFlags::from_bits_truncate(permission.bits() as usize);
         let has_leaf_permission =
@@ -294,7 +293,12 @@ impl MapArea {
                     && !info.page_cache_pages.is_empty()
             });
             if materialize_exec_cache_for_write
-                && !self.materialize_page_cache_pages(page_table, pte_flags, true)
+                && !self.materialize_page_cache_pages(
+                    page_table,
+                    pte_flags,
+                    retired_cache_keys,
+                    pte_mutated,
+                )
             {
                 return false;
             }
@@ -308,6 +312,7 @@ impl MapArea {
                 ) {
                     return false;
                 }
+                *pte_mutated = true;
             }
             if let Some(info) = &mut self.mmap_info {
                 info.writable = permission.contains(MapPermission::W);
@@ -320,6 +325,7 @@ impl MapArea {
                     if !page_table.remap_flags(vpn, page_cache_pte_flags) {
                         return false;
                     }
+                    *pte_mutated = true;
                 }
             }
         } else {
@@ -333,25 +339,28 @@ impl MapArea {
                 ) {
                     return false;
                 }
+                *pte_mutated = true;
             }
         }
         self.map_perm = permission;
         true
     }
 
-    pub(super) fn write_protect_shared_mmap_pages(&mut self, page_table: &mut PageTable) {
+    pub(super) fn write_protect_shared_mmap_pages(&mut self, page_table: &mut PageTable) -> bool {
         let Some(info) = self.mmap_info.as_ref() else {
-            return;
+            return false;
         };
         if !info.shared || !info.writable || info.backing_file.is_none() {
-            return;
+            return false;
         }
 
         let mut pte_flags = PTEFlags::from_bits_truncate(self.map_perm.bits() as usize);
         pte_flags.remove(PTEFlags::W);
+        let mut changed = false;
         for vpn in info.page_cache_pages.keys().copied() {
-            let _ = page_table.remap_flags(vpn, pte_flags);
+            changed |= page_table.remap_flags(vpn, pte_flags);
         }
+        changed
     }
 
     pub(super) fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) -> bool {

@@ -3,6 +3,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const NO_ADDRESS_SPACE_ID: usize = 0;
+const TLB_RANGE_FULL_FLUSH_THRESHOLD: usize = 64;
 static NEXT_ADDRESS_SPACE_ID: AtomicUsize = AtomicUsize::new(1);
 
 pub(crate) struct AddressSpaceControl {
@@ -56,6 +57,27 @@ impl AddressSpaceControl {
         );
         crate::perf::record_tlb_flush_range(1);
         self.invalidate_tlb_range_inner(virtual_address, crate::config::PAGE_SIZE);
+    }
+
+    pub(crate) fn invalidate_tlb_range(&self, start: usize, size: usize) {
+        assert_ne!(size, 0, "empty address-space TLB invalidation");
+        assert_eq!(
+            start % crate::config::PAGE_SIZE,
+            0,
+            "address-space TLB invalidation start is not page aligned"
+        );
+        assert_eq!(
+            size % crate::config::PAGE_SIZE,
+            0,
+            "address-space TLB invalidation size is not page aligned"
+        );
+        let pages = size / crate::config::PAGE_SIZE;
+        if pages > TLB_RANGE_FULL_FLUSH_THRESHOLD {
+            self.invalidate_tlb_all();
+        } else {
+            crate::perf::record_tlb_flush_range(pages);
+            self.invalidate_tlb_range_inner(start, size);
+        }
     }
 
     fn invalidate_tlb_range_inner(&self, start: usize, size: usize) {
