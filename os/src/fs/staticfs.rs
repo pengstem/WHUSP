@@ -2,6 +2,7 @@ use super::dirent::{DT_DIR, DT_REG, RawDirEntry, write_dir_entries};
 use super::{File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFDIR, S_IFREG};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
+use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -50,6 +51,11 @@ enum StaticNode {
     SysClassNetVeth1Dir,
     SysClassNetVeth2Dir,
     SysDevicesDir,
+    SysDevicesSystemDir,
+    SysCpuDir,
+    SysCpuOnline,
+    SysCpuPossible,
+    SysCpuPresent,
     SysDevicesVirtualDir,
     SysDevicesVirtualInputDir,
     SysInput0Dir,
@@ -129,6 +135,11 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
             Some(StaticNode::SysClassNetVeth2Dir)
         }
         "/sys/devices" | "/sys/devices/" => Some(StaticNode::SysDevicesDir),
+        "/sys/devices/system" | "/sys/devices/system/" => Some(StaticNode::SysDevicesSystemDir),
+        "/sys/devices/system/cpu" | "/sys/devices/system/cpu/" => Some(StaticNode::SysCpuDir),
+        "/sys/devices/system/cpu/online" => Some(StaticNode::SysCpuOnline),
+        "/sys/devices/system/cpu/possible" => Some(StaticNode::SysCpuPossible),
+        "/sys/devices/system/cpu/present" => Some(StaticNode::SysCpuPresent),
         "/sys/devices/virtual" | "/sys/devices/virtual/" => Some(StaticNode::SysDevicesVirtualDir),
         "/sys/devices/virtual/input" | "/sys/devices/virtual/input/" => {
             Some(StaticNode::SysDevicesVirtualInputDir)
@@ -189,6 +200,11 @@ fn canonical_path(node: StaticNode) -> &'static str {
         StaticNode::SysClassNetVeth1Dir => "/sys/class/net/ltp_ns_veth1",
         StaticNode::SysClassNetVeth2Dir => "/sys/class/net/ltp_ns_veth2",
         StaticNode::SysDevicesDir => "/sys/devices",
+        StaticNode::SysDevicesSystemDir => "/sys/devices/system",
+        StaticNode::SysCpuDir => "/sys/devices/system/cpu",
+        StaticNode::SysCpuOnline => "/sys/devices/system/cpu/online",
+        StaticNode::SysCpuPossible => "/sys/devices/system/cpu/possible",
+        StaticNode::SysCpuPresent => "/sys/devices/system/cpu/present",
         StaticNode::SysDevicesVirtualDir => "/sys/devices/virtual",
         StaticNode::SysDevicesVirtualInputDir => "/sys/devices/virtual/input",
         StaticNode::SysInput0Dir => "/sys/devices/virtual/input/input0",
@@ -227,6 +243,10 @@ fn canonical_path(node: StaticNode) -> &'static str {
 
 fn content(node: StaticNode) -> Option<Vec<u8>> {
     match node {
+        StaticNode::SysCpuOnline => Some(cpu_list_content(crate::cpu::online_mask())),
+        StaticNode::SysCpuPossible | StaticNode::SysCpuPresent => {
+            Some(cpu_list_content(crate::cpu::topology().possible_mask()))
+        }
         StaticNode::ProcBusInputDevices => Some(PROC_BUS_INPUT_DEVICES.to_vec()),
         StaticNode::SysInput0Name => Some(SYS_INPUT0_NAME.to_vec()),
         StaticNode::ProcRandomEntropyAvail => Some(PROC_RANDOM_ENTROPY_AVAIL.to_vec()),
@@ -292,10 +312,40 @@ fn content(node: StaticNode) -> Option<Vec<u8>> {
         | StaticNode::SysClassNetVeth1Dir
         | StaticNode::SysClassNetVeth2Dir
         | StaticNode::SysDevicesDir
+        | StaticNode::SysDevicesSystemDir
+        | StaticNode::SysCpuDir
         | StaticNode::SysDevicesVirtualDir
         | StaticNode::SysDevicesVirtualInputDir
         | StaticNode::SysInput0Dir => None,
     }
+}
+
+fn cpu_list_content(mask: crate::cpu::CpuMask) -> Vec<u8> {
+    let mut list = String::new();
+    let mut cpu = 0;
+    let mut first_range = true;
+    while cpu < crate::config::MAX_CPUS {
+        if !mask.contains(cpu) {
+            cpu += 1;
+            continue;
+        }
+        let start = cpu;
+        while cpu + 1 < crate::config::MAX_CPUS && mask.contains(cpu + 1) {
+            cpu += 1;
+        }
+        if !first_range {
+            list.push(',');
+        }
+        if start == cpu {
+            list.push_str(&format!("{start}"));
+        } else {
+            list.push_str(&format!("{start}-{cpu}"));
+        }
+        first_range = false;
+        cpu += 1;
+    }
+    list.push('\n');
+    list.into_bytes()
 }
 
 fn is_dir(node: StaticNode) -> bool {
@@ -317,6 +367,8 @@ fn is_dir(node: StaticNode) -> bool {
         | StaticNode::SysClassNetVeth1Dir
         | StaticNode::SysClassNetVeth2Dir
         | StaticNode::SysDevicesDir
+        | StaticNode::SysDevicesSystemDir
+        | StaticNode::SysCpuDir
         | StaticNode::SysDevicesVirtualDir
         | StaticNode::SysDevicesVirtualInputDir
         | StaticNode::SysInput0Dir => true,
@@ -340,6 +392,11 @@ fn stat_node(node: StaticNode) -> FileStat {
         StaticNode::SysDevDir => 31,
         StaticNode::SysDevBlockDir => 32,
         StaticNode::SysDevicesDir => 33,
+        StaticNode::SysDevicesSystemDir => 76,
+        StaticNode::SysCpuDir => 77,
+        StaticNode::SysCpuOnline => 78,
+        StaticNode::SysCpuPossible => 79,
+        StaticNode::SysCpuPresent => 80,
         StaticNode::SysDevicesVirtualDir => 34,
         StaticNode::SysDevicesVirtualInputDir => 35,
         StaticNode::SysInput0Dir => 36,
@@ -532,6 +589,28 @@ fn dir_entries(node: StaticNode) -> Option<Vec<RawDirEntry>> {
                 "ifindex",
                 DT_REG,
             ));
+        }
+        StaticNode::SysDevicesDir => {
+            entries.push(dir_entry(StaticNode::SysDevicesDir, ".", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysDir, "..", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysDevicesSystemDir, "system", DT_DIR));
+            entries.push(dir_entry(
+                StaticNode::SysDevicesVirtualDir,
+                "virtual",
+                DT_DIR,
+            ));
+        }
+        StaticNode::SysDevicesSystemDir => {
+            entries.push(dir_entry(StaticNode::SysDevicesSystemDir, ".", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysDevicesDir, "..", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysCpuDir, "cpu", DT_DIR));
+        }
+        StaticNode::SysCpuDir => {
+            entries.push(dir_entry(StaticNode::SysCpuDir, ".", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysDevicesSystemDir, "..", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysCpuOnline, "online", DT_REG));
+            entries.push(dir_entry(StaticNode::SysCpuPossible, "possible", DT_REG));
+            entries.push(dir_entry(StaticNode::SysCpuPresent, "present", DT_REG));
         }
         _ => return None,
     }

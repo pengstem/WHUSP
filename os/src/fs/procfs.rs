@@ -1652,22 +1652,33 @@ fn uptime_content() -> String {
 
 fn cpuinfo_content() -> String {
     // UNFINISHED: Linux /proc/cpuinfo is architecture-specific and exposes
-    // detailed per-hart CPU features. This minimal node only provides stable
-    // virtual CPU identification for LTP and libc environment probes.
+    // detailed per-hart CPU features. This node deliberately keeps the feature
+    // vocabulary small, but every online logical CPU and its firmware hardware
+    // ID must be reported truthfully.
     let (architecture, isa, mmu) = if cfg!(target_arch = "loongarch64") {
         ("loongarch64", "la64", "pg")
     } else {
         ("riscv64", "rv64imafdcsu", "sv39")
     };
-    format!(
-        "processor\t: 0\n\
-         hart\t\t: 0\n\
-         vendor_id\t: WHUSP\n\
-         model name\t: QEMU Virtual CPU\n\
-         architecture\t: {architecture}\n\
-         isa\t\t: {isa}\n\
-         mmu\t\t: {mmu}\n\n"
-    )
+    let topology = crate::cpu::topology();
+    let online = crate::cpu::online_mask();
+    let mut content = String::new();
+    for logical_id in 0..topology.possible_count() {
+        if !online.contains(logical_id) {
+            continue;
+        }
+        content.push_str(&format!(
+            "processor\t: {logical_id}\n\
+             hart\t\t: {}\n\
+             vendor_id\t: WHUSP\n\
+             model name\t: QEMU Virtual CPU\n\
+             architecture\t: {architecture}\n\
+             isa\t\t: {isa}\n\
+             mmu\t\t: {mmu}\n\n",
+            topology.hardware_id(logical_id),
+        ));
+    }
+    content
 }
 
 fn proc_io_content() -> String {
