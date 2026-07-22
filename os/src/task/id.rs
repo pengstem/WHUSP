@@ -1,6 +1,9 @@
 use super::ProcessControlBlock;
 use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
-use crate::mm::{KERNEL_SPACE, MapPermission, PhysPageNum, VirtAddr};
+use crate::mm::{
+    MapPermission, PhysPageNum, VirtAddr, insert_global_kernel_framed_area_uninit,
+    remove_global_kernel_area,
+};
 use crate::sync::UPIntrFreeCell;
 use alloc::{
     sync::{Arc, Weak},
@@ -89,14 +92,14 @@ pub struct KernelStack(pub usize);
 pub fn kstack_alloc() -> KernelStack {
     let kstack_id = KSTACK_ALLOCATOR.exclusive_access().alloc();
     let (kstack_bottom, kstack_top) = kernel_stack_position(kstack_id);
-    KERNEL_SPACE
-        .exclusive_access()
-        .insert_kernel_private_framed_area_uninit(
-            kstack_bottom.into(),
-            kstack_top.into(),
-            MapPermission::R | MapPermission::W,
-        );
-    crate::arch::mm::mark_kernel_tlb_dirty();
+    if !insert_global_kernel_framed_area_uninit(
+        kstack_bottom.into(),
+        kstack_top.into(),
+        MapPermission::R | MapPermission::W,
+    ) {
+        KSTACK_ALLOCATOR.exclusive_access().dealloc(kstack_id);
+        panic!("failed to allocate kernel stack {kstack_id}");
+    }
     KernelStack(kstack_id)
 }
 
@@ -104,17 +107,14 @@ impl Drop for KernelStack {
     fn drop(&mut self) {
         let (kernel_stack_bottom, _) = kernel_stack_position(self.0);
         let kernel_stack_bottom_va: VirtAddr = kernel_stack_bottom.into();
-        KERNEL_SPACE
-            .exclusive_access()
-            .remove_area_with_start_vpn(kernel_stack_bottom_va.into());
-        crate::arch::mm::mark_kernel_tlb_dirty();
-        // CONTEXT: A kernel-stack VA can have stale translations on a remote
-        // CPU after the task exits. Until Phase 5 supplies synchronous kernel
-        // TLB shootdown, release the physical pages but keep stack VA IDs
-        // monotonic so a stale entry can never alias a new task's stack.
-        KSTACK_ALLOCATOR
-            .exclusive_access()
-            .dealloc_without_reuse(self.0);
+        assert!(
+            remove_global_kernel_area(kernel_stack_bottom_va.into()),
+            "kernel stack {} was not mapped",
+            self.0
+        );
+        // The stack VA is reusable only after every online CPU has invalidated
+        // the old mapping and the retired backing pages have been released.
+        KSTACK_ALLOCATOR.exclusive_access().dealloc(self.0);
     }
 }
 
@@ -220,13 +220,17 @@ impl TaskUserRes {
         // the per-task PPN or fixed per-tid virtual address.
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-        process_inner
-            .memory_set
-            .insert_kernel_private_framed_area_uninit(
-                trap_cx_bottom.into(),
-                trap_cx_top.into(),
-                MapPermission::R | MapPermission::W,
-            );
+        assert!(
+            process_inner
+                .memory_set
+                .insert_kernel_private_framed_area_uninit(
+                    trap_cx_bottom.into(),
+                    trap_cx_top.into(),
+                    MapPermission::R | MapPermission::W,
+                ),
+            "failed to allocate trap context for task {}",
+            self.tid
+        );
     }
 
     fn dealloc_user_res(&self) {

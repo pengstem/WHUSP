@@ -6,6 +6,49 @@ const NO_ADDRESS_SPACE_ID: usize = 0;
 const TLB_RANGE_FULL_FLUSH_THRESHOLD: usize = 64;
 static NEXT_ADDRESS_SPACE_ID: AtomicUsize = AtomicUsize::new(1);
 
+pub(crate) fn invalidate_global_tlb_range(start: usize, size: usize) {
+    assert_ne!(size, 0, "empty global TLB invalidation");
+    assert_eq!(
+        start % crate::config::PAGE_SIZE,
+        0,
+        "global TLB invalidation start is not page aligned"
+    );
+    assert_eq!(
+        size % crate::config::PAGE_SIZE,
+        0,
+        "global TLB invalidation size is not page aligned"
+    );
+    let pages = size / crate::config::PAGE_SIZE;
+    let (start, size) = if pages > TLB_RANGE_FULL_FLUSH_THRESHOLD {
+        crate::perf::record_tlb_flush_all();
+        (0, usize::MAX)
+    } else {
+        crate::perf::record_tlb_flush_range(pages);
+        (start, size)
+    };
+
+    crate::arch::mm::publish_pte_barrier();
+    let current = crate::cpu::current_id();
+    let online = crate::cpu::online_mask();
+    assert!(
+        online.contains(current),
+        "global TLB invalidation initiated by an offline CPU"
+    );
+    crate::arch::mm::flush_tlb_range(start, size);
+    let remote = CpuMask::from_bits(online.bits() & !CpuMask::single(current).bits());
+    if remote.bits() != 0 {
+        crate::arch::smp::remote_tlb_flush(remote, start, size).unwrap_or_else(|error| {
+            panic!(
+                "global TLB shootdown failed: targets={:#x} error={error:#x}",
+                remote.bits(),
+            )
+        });
+    }
+    // A CPU that is not yet online is excluded intentionally. Secondary boot
+    // activates the published kernel root and performs a full local flush
+    // before setting its online bit, so it cannot retain the pre-edit entry.
+}
+
 pub(crate) struct AddressSpaceControl {
     id: usize,
     active_cpus: AtomicCpuMask,

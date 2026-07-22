@@ -501,12 +501,6 @@ impl MapArea {
         }
     }
 
-    pub(super) fn unmap(&mut self, page_table: &mut PageTable) {
-        for vpn in self.vpn_range {
-            self.unmap_one(page_table, vpn);
-        }
-    }
-
     pub(super) fn map_existing_frame(
         &mut self,
         page_table: &mut PageTable,

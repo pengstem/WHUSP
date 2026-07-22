@@ -87,12 +87,7 @@ pub fn should_flush_tlb_on_kernel_entry(kernel_token: usize) -> bool {
     }
     let state = crate::cpu::current().mmu();
     let previous = state.swap_last_entry_kernel_token(kernel_token);
-    let dirty = state.take_kernel_tlb_dirty();
-    previous != kernel_token || dirty
-}
-
-pub fn mark_kernel_tlb_dirty() {
-    crate::cpu::current().mmu().mark_kernel_tlb_dirty();
+    previous != kernel_token
 }
 
 fn mark_return_tlb_dirty() {

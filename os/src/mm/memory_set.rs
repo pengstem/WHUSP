@@ -107,15 +107,38 @@ impl MemorySet {
         start_va: VirtAddr,
         end_va: VirtAddr,
         permission: MapPermission,
-    ) {
+    ) -> bool {
+        let Some((start_vpn, end_vpn)) =
+            self.insert_kernel_private_framed_area_uninit_deferred(start_va, end_va, permission)
+        else {
+            return false;
+        };
+        self.invalidate_tlb_vpn_range(start_vpn, end_vpn);
+        true
+    }
+
+    /// Installs a kernel-only framed range without publishing the PTE edit.
+    ///
+    /// The caller must invalidate the returned virtual range after releasing
+    /// any lock that a remote CPU could be waiting for with interrupts masked.
+    pub(crate) fn insert_kernel_private_framed_area_uninit_deferred(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) -> Option<(VirtPageNum, VirtPageNum)> {
         assert!(
             !permission.contains(MapPermission::U),
             "uninitialized framed pages must stay kernel-private"
         );
         let mut map_area = MapArea::new(start_va, end_va, MapType::Framed, permission);
-        if map_area.map_uninit(&mut self.page_table) {
-            self.insert_area_sorted(map_area);
+        let start_vpn = map_area.vpn_range.get_start();
+        let end_vpn = map_area.vpn_range.get_end();
+        if !map_area.map_uninit(&mut self.page_table) {
+            return None;
         }
+        self.insert_area_sorted(map_area);
+        Some((start_vpn, end_vpn))
     }
 
     pub(crate) fn insert_lazy_framed_area(
@@ -227,16 +250,34 @@ impl MemorySet {
         true
     }
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
-        if let Some(idx) = self.find_area_idx_by_start(start_vpn) {
-            let area = &mut self.areas[idx];
-            if area.is_mmap() || area.is_shm() || area.map_type == MapType::Framed {
-                area.unmap_resident(&mut self.page_table);
-            } else {
-                area.unmap(&mut self.page_table);
-            }
-            self.areas.remove(idx);
-            self.last_area_idx_containing.set(None);
+        let Some((range_start, range_end, retired)) =
+            self.remove_area_with_start_vpn_deferred(start_vpn)
+        else {
+            return;
+        };
+        if retired.pte_cleared() {
+            self.invalidate_tlb_vpn_range(range_start, range_end);
         }
+        retired.release();
+    }
+
+    /// Clears an area's PTEs while retaining all backing resources.
+    ///
+    /// The caller must invalidate the returned range before releasing the
+    /// retired resources. This split lets global kernel mappings wait for
+    /// remote CPUs without holding `KERNEL_SPACE`'s interrupt-masking lock.
+    pub(crate) fn remove_area_with_start_vpn_deferred(
+        &mut self,
+        start_vpn: VirtPageNum,
+    ) -> Option<(VirtPageNum, VirtPageNum, RetiredUserPages)> {
+        let idx = self.find_area_idx_by_start(start_vpn)?;
+        let mut area = self.areas.remove(idx);
+        let range_start = area.vpn_range.get_start();
+        let range_end = area.vpn_range.get_end();
+        let mut retired = RetiredUserPages::new();
+        area.unmap_resident_deferred(&mut self.page_table, &mut retired);
+        self.last_area_idx_containing.set(None);
+        Some((range_start, range_end, retired))
     }
     /// Add a new MapArea into this MemorySet.
     /// Assuming that there are no conflicts in the virtual address

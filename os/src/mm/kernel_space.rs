@@ -1,6 +1,9 @@
 use super::page_table::PTEFlags;
-use super::{MapArea, MapPermission, MapType, MemorySet, PhysAddr, VirtAddr};
-use crate::config::{TRAMPOLINE, memory_end, mmio_regions};
+use super::{
+    MapArea, MapPermission, MapType, MemorySet, PhysAddr, VirtAddr, VirtPageNum,
+    invalidate_global_tlb_range,
+};
+use crate::config::{PAGE_SIZE, TRAMPOLINE, memory_end, mmio_regions};
 use crate::sync::UPIntrFreeCell;
 use alloc::sync::Arc;
 use lazy_static::*;
@@ -25,6 +28,53 @@ lazy_static! {
 
 pub fn kernel_token() -> usize {
     KERNEL_SPACE.exclusive_access().token()
+}
+
+fn invalidate_global_vpn_range(start_vpn: VirtPageNum, end_vpn: VirtPageNum) {
+    let start = usize::from(VirtAddr::from(start_vpn));
+    let pages = end_vpn
+        .0
+        .checked_sub(start_vpn.0)
+        .expect("inverted global virtual-page invalidation range");
+    let size = pages
+        .checked_mul(PAGE_SIZE)
+        .expect("global virtual-page invalidation size overflow");
+    invalidate_global_tlb_range(start, size);
+}
+
+/// Installs a dynamically allocated mapping shared by every kernel page table.
+///
+/// Remote invalidation deliberately happens after dropping `KERNEL_SPACE`'s
+/// interrupt-masking lock. A target CPU can otherwise spin on that same lock
+/// with interrupts disabled and be unable to acknowledge the shootdown.
+pub(crate) fn insert_global_kernel_framed_area_uninit(
+    start_va: VirtAddr,
+    end_va: VirtAddr,
+    permission: MapPermission,
+) -> bool {
+    let inserted = KERNEL_SPACE
+        .exclusive_access()
+        .insert_kernel_private_framed_area_uninit_deferred(start_va, end_va, permission);
+    let Some((start_vpn, end_vpn)) = inserted else {
+        return false;
+    };
+    invalidate_global_vpn_range(start_vpn, end_vpn);
+    true
+}
+
+/// Removes a dynamically allocated mapping shared by every kernel page table.
+pub(crate) fn remove_global_kernel_area(start_vpn: VirtPageNum) -> bool {
+    let removed = KERNEL_SPACE
+        .exclusive_access()
+        .remove_area_with_start_vpn_deferred(start_vpn);
+    let Some((range_start, range_end, retired)) = removed else {
+        return false;
+    };
+    if retired.pte_cleared() {
+        invalidate_global_vpn_range(range_start, range_end);
+    }
+    retired.release();
+    true
 }
 
 impl MemorySet {

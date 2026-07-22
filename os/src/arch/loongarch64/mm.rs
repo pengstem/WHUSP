@@ -113,8 +113,6 @@ pub fn should_flush_tlb_on_kernel_entry(_kernel_token: usize) -> bool {
     true
 }
 
-pub fn mark_kernel_tlb_dirty() {}
-
 fn mark_return_tlb_dirty() {
     crate::cpu::current().mmu().mark_return_tlb_dirty();
 }

@@ -48,8 +48,6 @@ pub(crate) struct CpuMmuFastState {
     #[cfg(target_arch = "riscv64")]
     last_entry_kernel_token: AtomicUsize,
     return_tlb_dirty: AtomicBool,
-    #[cfg(target_arch = "riscv64")]
-    kernel_tlb_dirty: AtomicBool,
     observed_address_space_id: AtomicUsize,
     observed_tlb_generation: AtomicUsize,
 }
@@ -61,8 +59,6 @@ impl CpuMmuFastState {
             #[cfg(target_arch = "riscv64")]
             last_entry_kernel_token: AtomicUsize::new(0),
             return_tlb_dirty: AtomicBool::new(true),
-            #[cfg(target_arch = "riscv64")]
-            kernel_tlb_dirty: AtomicBool::new(true),
             observed_address_space_id: AtomicUsize::new(0),
             observed_tlb_generation: AtomicUsize::new(0),
         }
@@ -81,18 +77,8 @@ impl CpuMmuFastState {
         self.return_tlb_dirty.swap(false, Ordering::Relaxed)
     }
 
-    #[cfg(target_arch = "riscv64")]
-    pub(crate) fn take_kernel_tlb_dirty(&self) -> bool {
-        self.kernel_tlb_dirty.swap(false, Ordering::Relaxed)
-    }
-
     pub(crate) fn mark_return_tlb_dirty(&self) {
         self.return_tlb_dirty.store(true, Ordering::Relaxed);
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    pub(crate) fn mark_kernel_tlb_dirty(&self) {
-        self.kernel_tlb_dirty.store(true, Ordering::Relaxed);
     }
 
     pub(crate) fn observe_address_space(&self, id: usize, generation: usize) {

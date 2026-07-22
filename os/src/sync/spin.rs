@@ -34,9 +34,20 @@ impl<T> SpinLock<T> {
     }
 
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
+        self.lock_inner(false)
+    }
+
+    fn lock_while_irqs_masked(&self) -> SpinLockGuard<'_, T> {
+        self.lock_inner(true)
+    }
+
+    fn lock_inner(&self, poll_tlb: bool) -> SpinLockGuard<'_, T> {
         self.assert_not_owned_by_current();
         loop {
             while self.locked.load(Ordering::Relaxed) {
+                if poll_tlb {
+                    poll_tlb_while_spinning();
+                }
                 spin_loop();
             }
             if self
@@ -49,6 +60,9 @@ impl<T> SpinLock<T> {
                     lock: self,
                     _not_send: PhantomData,
                 };
+            }
+            if poll_tlb {
+                poll_tlb_while_spinning();
             }
         }
     }
@@ -184,7 +198,12 @@ impl<T> SpinNoIrqLock<T> {
 
     pub fn lock(&self) -> SpinNoIrqLockGuard<'_, T> {
         let irq = LocalIrqGuard::disable();
-        let lock = self.inner.lock();
+        // LoongArch implements synchronous remote TLB invalidation with an
+        // S-mode IPI. If this CPU is waiting for a lock while interrupts are
+        // masked, the lock owner may itself be waiting for our acknowledgement.
+        // Poll only the lock-free TLB request path here; scheduler/device IPIs
+        // remain deferred until the saved interrupt state is restored.
+        let lock = self.inner.lock_while_irqs_masked();
         SpinNoIrqLockGuard {
             lock: Some(lock),
             irq,
@@ -197,6 +216,16 @@ impl<T> SpinNoIrqLock<T> {
             lock: Some(lock),
             irq,
         })
+    }
+}
+
+#[inline]
+fn poll_tlb_while_spinning() {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        if crate::cpu::try_current_id().is_some() {
+            crate::arch::smp::handle_tlb_ipi();
+        }
     }
 }
 
