@@ -1,7 +1,7 @@
 use super::address::page_align_up;
 use super::{
     AddressSpaceControl, MapArea, MapPermission, MapType, MmapFlush, PageTable, PageTableEntry,
-    VPNRange, VirtAddr, VirtPageNum, frame_alloc, page_table::PTEFlags,
+    RetiredUserPages, VPNRange, VirtAddr, VirtPageNum, frame_alloc, page_table::PTEFlags,
 };
 use crate::arch::mm as arch_mm;
 use crate::perf;
@@ -346,14 +346,19 @@ impl MemorySet {
     /// VFS file and mount cleanup paths that may sleep.
     pub fn recycle_data_pages(&mut self) -> (Vec<MmapFlush>, Vec<MapArea>) {
         let mut flushes = Vec::new();
+        let mut retired = RetiredUserPages::new();
         for area in &mut self.areas {
             if area.is_mmap() || area.is_shm() || area.map_type == MapType::Framed {
-                flushes.extend(area.take_mmap_flushes(&mut self.page_table));
+                flushes.extend(area.take_mmap_flushes(&mut self.page_table, &mut retired));
                 area.release_mmap_refs();
             } else {
-                area.unmap(&mut self.page_table);
+                area.unmap_resident_deferred(&mut self.page_table, &mut retired);
             }
         }
+        if retired.pte_cleared() {
+            self.invalidate_tlb_all();
+        }
+        retired.release();
         let retired_areas = core::mem::take(&mut self.areas);
         self.last_area_idx_containing.set(None);
         (flushes, retired_areas)
@@ -398,10 +403,15 @@ impl MemorySet {
 
 impl Drop for MemorySet {
     fn drop(&mut self) {
+        let mut retired = RetiredUserPages::new();
         for area in &mut self.areas {
             area.release_mmap_refs();
-            area.unmap_resident(&mut self.page_table);
+            area.unmap_resident_deferred(&mut self.page_table, &mut retired);
         }
+        if retired.pte_cleared() {
+            self.invalidate_tlb_all();
+        }
+        retired.release();
         self.areas.clear();
     }
 }

@@ -3,7 +3,7 @@ use super::area::{ExecSegmentInfo, MmapInfo, ShmAreaInfo};
 use super::page_table::PTEFlags;
 use super::{
     FrameTracker, MapArea, MapPermission, MapType, MemorySet, MmapFlush, PageTableEntry,
-    PhysPageNum, VPNRange, VirtAddr,
+    PhysPageNum, RetiredUserPages, VPNRange, VirtAddr,
 };
 use super::{VirtPageNum, frame_alloc, frame_alloc_uninit, frame_ref_count};
 use crate::arch::mm as arch_mm;
@@ -18,27 +18,6 @@ use alloc::vec::Vec;
 // Leave unmapped space below MAP_GROWSDOWN expansion so a stack-like VMA does
 // not grow into an adjacent mapping when handling one-page-at-a-time faults.
 const STACK_GUARD_GAP_PAGES: usize = 256;
-const TLB_RANGE_FULL_FLUSH_THRESHOLD: usize = 64;
-
-fn flush_tlb_all_recorded() {
-    perf::record_tlb_flush_all();
-    arch_mm::flush_tlb_all();
-}
-
-fn flush_tlb_vpn_range(start_vpn: VirtPageNum, end_vpn: VirtPageNum) {
-    let pages = end_vpn.0.saturating_sub(start_vpn.0);
-    if pages == 0 {
-        return;
-    }
-    if pages > TLB_RANGE_FULL_FLUSH_THRESHOLD {
-        flush_tlb_all_recorded();
-        return;
-    }
-    perf::record_tlb_flush_range(pages);
-    for vpn in VPNRange::new(start_vpn, end_vpn) {
-        arch_mm::flush_tlb_page(usize::from(VirtAddr::from(vpn)));
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryProtectError {
@@ -711,6 +690,7 @@ impl MemorySet {
         self.split_area_at(new_end_vpn);
         self.split_area_at(old_end_vpn);
 
+        let mut retired = RetiredUserPages::new();
         let mut idx = 0;
         while idx < self.areas.len() {
             let area_start = self.areas[idx].vpn_range.get_start();
@@ -722,11 +702,15 @@ impl MemorySet {
                 && area_end <= old_end_vpn
             {
                 let mut area = self.areas.remove(idx);
-                area.unmap_resident(&mut self.page_table);
+                area.unmap_resident_deferred(&mut self.page_table, &mut retired);
             } else {
                 idx += 1;
             }
         }
+        if retired.pte_cleared() {
+            self.invalidate_tlb_vpn_range(new_end_vpn, old_end_vpn);
+        }
+        retired.release();
     }
 
     /// Creates a non-fixed mmap VMA and returns its chosen start address.
@@ -808,7 +792,7 @@ impl MemorySet {
         self.split_area_at(end_vpn);
 
         let mut flushes = Vec::new();
-        let mut unmapped = false;
+        let mut retired = RetiredUserPages::new();
         let mut idx = self.first_area_idx_ending_after(start_vpn);
         let index_skips = idx;
         let mut area_visits = 0usize;
@@ -821,23 +805,21 @@ impl MemorySet {
             let area_end = self.areas[idx].vpn_range.get_end();
             if area_start < end_vpn && area_end > start_vpn {
                 let mut area = self.areas.remove(idx);
-                unmapped = true;
                 if area.is_mmap() {
-                    flushes.extend(area.take_mmap_flushes(&mut self.page_table));
+                    flushes.extend(area.take_mmap_flushes(&mut self.page_table, &mut retired));
                     area.release_mmap_refs();
-                } else if area.is_shm() || area.map_type == MapType::Framed {
-                    area.unmap_resident(&mut self.page_table);
                 } else {
-                    area.unmap(&mut self.page_table);
+                    area.unmap_resident_deferred(&mut self.page_table, &mut retired);
                 }
             } else {
                 idx += 1;
             }
         }
         perf::record_vma_range_scan(area_visits, index_skips);
-        if unmapped {
-            flush_tlb_vpn_range(start_vpn, end_vpn);
+        if retired.pte_cleared() {
+            self.invalidate_tlb_vpn_range(start_vpn, end_vpn);
         }
+        retired.release();
 
         let mut area = MapArea::new(start.into(), end.into(), MapType::Framed, permission);
         area.mmap_info = Some(MmapInfo {
@@ -1004,7 +986,13 @@ impl MemorySet {
             .iter()
             .position(|area| area.is_shm() && area.vpn_range.get_start() == start_vpn)?;
         let mut area = self.areas.remove(idx);
-        area.unmap_resident(&mut self.page_table);
+        let end_vpn = area.vpn_range.get_end();
+        let mut retired = RetiredUserPages::new();
+        area.unmap_resident_deferred(&mut self.page_table, &mut retired);
+        if retired.pte_cleared() {
+            self.invalidate_tlb_vpn_range(start_vpn, end_vpn);
+        }
+        retired.release();
         Some(())
     }
 
@@ -1277,7 +1265,7 @@ impl MemorySet {
         self.split_area_at(end_vpn);
 
         let mut flushes = Vec::new();
-        let mut unmapped = false;
+        let mut retired = RetiredUserPages::new();
         let mut idx = self.first_area_idx_ending_after(start_vpn);
         let index_skips = idx;
         let mut area_visits = 0usize;
@@ -1290,17 +1278,17 @@ impl MemorySet {
             let area_end = self.areas[idx].vpn_range.get_end();
             if self.areas[idx].is_mmap() && area_start >= start_vpn && area_end <= end_vpn {
                 let mut area = self.areas.remove(idx);
-                unmapped = true;
-                flushes.extend(area.take_mmap_flushes(&mut self.page_table));
+                flushes.extend(area.take_mmap_flushes(&mut self.page_table, &mut retired));
                 area.release_mmap_refs();
             } else {
                 idx += 1;
             }
         }
         perf::record_vma_range_scan(area_visits, index_skips);
-        if unmapped {
-            flush_tlb_vpn_range(start_vpn, end_vpn);
+        if retired.pte_cleared() {
+            self.invalidate_tlb_vpn_range(start_vpn, end_vpn);
         }
+        retired.release();
         Some(flushes)
     }
 
@@ -1624,17 +1612,19 @@ impl MemorySet {
         self.split_area_at(start_vpn);
         self.split_area_at(end_vpn);
         let mut poisoned = false;
+        let mut retired = RetiredUserPages::new();
         for area in &mut self.areas {
             let area_start = area.vpn_range.get_start();
             let area_end = area.vpn_range.get_end();
             if area_start >= start_vpn && area_end <= end_vpn && area.is_private_anonymous_mmap() {
-                area.poison_pages(&mut self.page_table, start_vpn, end_vpn);
+                area.poison_pages(&mut self.page_table, start_vpn, end_vpn, &mut retired);
                 poisoned = true;
             }
         }
-        if poisoned {
-            flush_tlb_all_recorded();
+        if retired.pte_cleared() {
+            self.invalidate_tlb_vpn_range(start_vpn, end_vpn);
         }
+        retired.release();
         poisoned
     }
 
@@ -1668,44 +1658,48 @@ impl MemorySet {
         }
         self.split_area_at(start_vpn);
         self.split_area_at(end_vpn);
-        let mut touched = false;
+        let mut retired = RetiredUserPages::new();
         for area in &mut self.areas {
             let area_start = area.vpn_range.get_start();
             let area_end = area.vpn_range.get_end();
             if area_start >= start_vpn && area_end <= end_vpn && area.is_mmap() {
-                area.unmap_resident(&mut self.page_table);
-                touched = true;
+                area.unmap_resident_deferred(&mut self.page_table, &mut retired);
             }
         }
-        if touched {
-            flush_tlb_vpn_range(start_vpn, end_vpn);
+        if retired.pte_cleared() {
+            self.invalidate_tlb_vpn_range(start_vpn, end_vpn);
         }
+        retired.release();
         true
     }
 
     pub fn discard_lazy_free_pages(&mut self) -> bool {
         let mut discarded = false;
+        let mut retired = RetiredUserPages::new();
         for area in &mut self.areas {
-            if area.discard_lazy_free_pages(&mut self.page_table) {
+            if area.discard_lazy_free_pages(&mut self.page_table, &mut retired) {
                 discarded = true;
             }
         }
-        if discarded {
-            flush_tlb_all_recorded();
+        if retired.pte_cleared() {
+            self.invalidate_tlb_all();
         }
+        retired.release();
         discarded
     }
 
     pub fn discard_memcg_pressure_pages(&mut self) -> bool {
         let mut discarded = false;
+        let mut retired = RetiredUserPages::new();
         for area in &mut self.areas {
-            if area.discard_memcg_pressure_pages(&mut self.page_table) {
+            if area.discard_memcg_pressure_pages(&mut self.page_table, &mut retired) {
                 discarded = true;
             }
         }
-        if discarded {
-            flush_tlb_all_recorded();
+        if retired.pte_cleared() {
+            self.invalidate_tlb_all();
         }
+        retired.release();
         discarded
     }
 

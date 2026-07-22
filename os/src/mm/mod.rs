@@ -16,6 +16,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 pub use address::VPNRange;
 pub use address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
 pub(crate) use address_space::{ActiveAddressSpace, AddressSpaceControl};
+pub(crate) use area::RetiredUserPages;
 pub use area::{MapArea, MapPermission, MapType, MmapFlush};
 pub use elf_loader::ElfLoadInfo;
 pub(crate) use elf_loader::{exec_load_stats_content, record_exec_metadata_read};

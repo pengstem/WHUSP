@@ -74,18 +74,6 @@ pub fn flush_tlb_all() {
     }
 }
 
-pub fn flush_tlb_page(va: usize) {
-    mark_return_tlb_dirty();
-    unsafe {
-        asm!(
-            "dbar 0",
-            "invtlb 0x05, $r0, {va}",
-            "dbar 0",
-            va = in(reg) va
-        );
-    }
-}
-
 pub fn flush_tlb_range(start: usize, size: usize) {
     mark_return_tlb_dirty();
     unsafe {

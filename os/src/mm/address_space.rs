@@ -97,6 +97,9 @@ impl AddressSpaceControl {
         assert_ne!(generation, 0, "address-space TLB generation is zero");
 
         let active = self.active_cpus.load(Ordering::SeqCst);
+        if active.bits() == 0 {
+            return;
+        }
         let current = crate::cpu::current_id();
         if active.contains(current) {
             crate::arch::mm::flush_tlb_range(start, size);

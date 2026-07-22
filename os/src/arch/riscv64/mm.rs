@@ -52,13 +52,6 @@ pub fn flush_tlb_all() {
     }
 }
 
-pub fn flush_tlb_page(va: usize) {
-    mark_return_tlb_dirty();
-    unsafe {
-        asm!("sfence.vma {va}, x0", va = in(reg) va);
-    }
-}
-
 pub fn flush_tlb_range(start: usize, size: usize) {
     mark_return_tlb_dirty();
     if size == usize::MAX

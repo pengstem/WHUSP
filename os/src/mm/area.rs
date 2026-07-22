@@ -33,6 +33,60 @@ pub struct MmapFlush {
     data: Vec<u8>,
 }
 
+/// Owns backing resources after their leaf PTEs have been cleared.
+///
+/// Callers must keep this batch alive until the address-space invalidation
+/// covering those PTEs has completed on every active CPU.
+#[must_use = "retired user pages must be released after TLB invalidation"]
+pub(crate) struct RetiredUserPages {
+    frames: Vec<FrameTracker>,
+    page_cache_refs: Vec<(PageCacheKey, bool)>,
+    shm_attachments: Vec<usize>,
+    pte_cleared: bool,
+}
+
+impl RetiredUserPages {
+    pub(crate) fn new() -> Self {
+        Self {
+            frames: Vec::new(),
+            page_cache_refs: Vec::new(),
+            shm_attachments: Vec::new(),
+            pte_cleared: false,
+        }
+    }
+
+    pub(crate) fn pte_cleared(&self) -> bool {
+        self.pte_cleared
+    }
+
+    pub(crate) fn release(self) {
+        let Self {
+            frames,
+            page_cache_refs,
+            shm_attachments,
+            pte_cleared: _,
+        } = self;
+        drop(frames);
+        if !page_cache_refs.is_empty() {
+            let mut cache = PAGE_CACHE.exclusive_access();
+            for (key, keep_clean) in page_cache_refs {
+                if keep_clean {
+                    cache.dec_ref(key);
+                } else {
+                    let _ = cache.dec_ref_and_take_if_unused(key);
+                }
+            }
+        }
+        for shmid in shm_attachments {
+            let _ = crate::mm::shm::detach_segment(shmid, 0);
+        }
+    }
+
+    fn mark_pte_cleared(&mut self) {
+        self.pte_cleared = true;
+    }
+}
+
 impl MmapFlush {
     /// Writes one collected MAP_SHARED dirty page fragment back to its file.
     ///
@@ -441,10 +495,10 @@ impl MapArea {
     }
 
     pub(super) fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+        page_table.unmap(vpn);
         if self.map_type == MapType::Framed {
             self.data_frames.remove(&vpn);
         }
-        page_table.unmap(vpn);
     }
 
     pub(super) fn unmap(&mut self, page_table: &mut PageTable) {
@@ -564,42 +618,57 @@ impl MapArea {
     }
 
     pub(super) fn unmap_resident(&mut self, page_table: &mut PageTable) {
-        let vpns: Vec<_> = self.data_frames.keys().copied().collect();
-        for vpn in vpns {
-            page_table.unmap(vpn);
+        let mut retired = RetiredUserPages::new();
+        self.unmap_resident_deferred(page_table, &mut retired);
+        retired.release();
+    }
+
+    pub(super) fn unmap_resident_deferred(
+        &mut self,
+        page_table: &mut PageTable,
+        retired: &mut RetiredUserPages,
+    ) {
+        let data_frames = core::mem::take(&mut self.data_frames);
+        for (vpn, frame) in data_frames {
+            clear_resident_pte(page_table, vpn, retired);
+            retired.frames.push(frame);
         }
-        self.data_frames.clear();
 
         if let Some(info) = self.mmap_info.as_mut() {
-            let keep_clean_cache_pages = info.exec_segment.is_some() && !info.writable;
-            let cache_vpns: Vec<_> = info.page_cache_pages.keys().copied().collect();
-            let cache_keys: Vec<_> = info.page_cache_pages.values().copied().collect();
-            for vpn in cache_vpns {
-                if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
-                    page_table.unmap(vpn);
-                }
+            let keep_clean = info.exec_segment.is_some() && !info.writable;
+            let page_cache_pages = core::mem::take(&mut info.page_cache_pages);
+            for (vpn, key) in page_cache_pages {
+                clear_resident_pte(page_table, vpn, retired);
+                retired.page_cache_refs.push((key, keep_clean));
             }
-            let mut cache = PAGE_CACHE.exclusive_access();
-            for key in cache_keys {
-                if keep_clean_cache_pages {
-                    cache.dec_ref(key);
-                } else {
-                    let _ = cache.dec_ref_and_take_if_unused(key);
-                }
-            }
-            info.page_cache_pages.clear();
         }
 
-        if let Some(info) = self.shm_info.as_mut() {
-            let shm_vpns: Vec<_> = info.pages.keys().copied().collect();
-            for vpn in shm_vpns {
-                if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
-                    page_table.unmap(vpn);
-                }
+        if let Some(info) = self.shm_info.take() {
+            for vpn in info.pages.keys().copied() {
+                clear_resident_pte(page_table, vpn, retired);
             }
-            info.pages.clear();
-            let _ = crate::mm::shm::detach_segment(info.shmid, 0);
+            retired.shm_attachments.push(info.shmid);
         }
+
+        if self.map_type == MapType::Identical {
+            for vpn in self.vpn_range {
+                clear_resident_pte(page_table, vpn, retired);
+            }
+        }
+    }
+
+    fn retire_framed_page(
+        &mut self,
+        page_table: &mut PageTable,
+        vpn: VirtPageNum,
+        retired: &mut RetiredUserPages,
+    ) -> bool {
+        let Some(frame) = self.data_frames.remove(&vpn) else {
+            return false;
+        };
+        clear_resident_pte(page_table, vpn, retired);
+        retired.frames.push(frame);
+        true
     }
 
     pub(super) fn copy_data(&mut self, page_table: &PageTable, data: &[u8], data_offset: usize) {
@@ -665,6 +734,7 @@ impl MapArea {
         page_table: &mut PageTable,
         start: VirtPageNum,
         end: VirtPageNum,
+        retired: &mut RetiredUserPages,
     ) {
         for vpn in self
             .vpn_range
@@ -673,9 +743,7 @@ impl MapArea {
         {
             self.poisoned_pages.insert(vpn);
             self.lazy_free_pages.remove(&vpn);
-            if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
-                self.unmap_one(page_table, vpn);
-            }
+            self.retire_framed_page(page_table, vpn, retired);
         }
     }
 
@@ -689,7 +757,11 @@ impl MapArea {
         }
     }
 
-    pub(super) fn discard_lazy_free_pages(&mut self, page_table: &mut PageTable) -> bool {
+    pub(super) fn discard_lazy_free_pages(
+        &mut self,
+        page_table: &mut PageTable,
+        retired: &mut RetiredUserPages,
+    ) -> bool {
         let mut discarded = false;
         let candidates: Vec<_> = self.lazy_free_pages.iter().copied().collect();
         for vpn in candidates {
@@ -705,15 +777,18 @@ impl MapArea {
                 continue;
             }
             self.lazy_free_pages.remove(&vpn);
-            if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
-                self.unmap_one(page_table, vpn);
+            if self.retire_framed_page(page_table, vpn, retired) {
                 discarded = true;
             }
         }
         discarded
     }
 
-    pub(super) fn discard_memcg_pressure_pages(&mut self, page_table: &mut PageTable) -> bool {
+    pub(super) fn discard_memcg_pressure_pages(
+        &mut self,
+        page_table: &mut PageTable,
+        retired: &mut RetiredUserPages,
+    ) -> bool {
         if self.locked || self.lock_on_fault {
             return false;
         }
@@ -736,9 +811,7 @@ impl MapArea {
         // contents instead of preserving them in swap. It is intentionally
         // limited to large pressure mappings used by LTP madvise reclaim tests.
         for vpn in vpns {
-            if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
-                self.unmap_one(page_table, vpn);
-            }
+            self.retire_framed_page(page_table, vpn, retired);
         }
         true
     }
@@ -847,32 +920,14 @@ impl MapArea {
         flushes
     }
 
-    /// Tears down resident mmap pages and releases page-cache references.
-    pub(super) fn take_mmap_flushes(&mut self, page_table: &mut PageTable) -> Vec<MmapFlush> {
+    /// Collects writeback data, clears resident PTEs, and defers backing release.
+    pub(super) fn take_mmap_flushes(
+        &mut self,
+        page_table: &mut PageTable,
+        retired: &mut RetiredUserPages,
+    ) -> Vec<MmapFlush> {
         let flushes = self.collect_mmap_flushes(page_table);
-        let data_frames = core::mem::take(&mut self.data_frames);
-        for (vpn, _frame) in data_frames {
-            if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
-                page_table.unmap(vpn);
-            }
-        }
-
-        if let Some(info) = self.mmap_info.as_mut() {
-            let keep_clean_cache_pages = info.exec_segment.is_some() && !info.writable;
-            let page_cache_pages = core::mem::take(&mut info.page_cache_pages);
-            for (vpn, key) in page_cache_pages {
-                if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
-                    page_table.unmap(vpn);
-                }
-                let mut cache = PAGE_CACHE.exclusive_access();
-                if keep_clean_cache_pages {
-                    cache.dec_ref(key);
-                } else {
-                    let _ = cache.dec_ref_and_take_if_unused(key);
-                }
-            }
-        }
-
+        self.unmap_resident_deferred(page_table, retired);
         flushes
     }
 
@@ -889,6 +944,17 @@ impl MapArea {
         {
             file.dec_writable_shared_mmap();
         }
+    }
+}
+
+fn clear_resident_pte(
+    page_table: &mut PageTable,
+    vpn: VirtPageNum,
+    retired: &mut RetiredUserPages,
+) {
+    if page_table.translate(vpn).is_some_and(|pte| pte.bits != 0) {
+        page_table.unmap(vpn);
+        retired.mark_pte_cleared();
     }
 }
 
