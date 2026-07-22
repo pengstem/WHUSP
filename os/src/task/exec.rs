@@ -478,10 +478,6 @@ impl ProcessControlBlock {
         task_inner.smp_cpu_probe = smp_cpu_probe;
         task_inner.smp_wait_io_probe = smp_wait_io_probe;
         task_inner.smp_phase4_wait_probe = smp_phase4_wait_probe;
-        // A fresh image is unconstrained unless userspace narrows it through
-        // sched_setaffinity(). Probe accounting still begins only after its
-        // explicit affinity call, keeping loader work outside the sentinel.
-        task_inner.allowed_cpus = crate::cpu::topology().possible_mask();
         let (trap_cx_ppn, user_stack_top) = {
             let task_res = task_inner
                 .res

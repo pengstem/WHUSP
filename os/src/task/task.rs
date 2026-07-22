@@ -158,7 +158,7 @@ impl TaskControlBlock {
                     queued_cpu: None,
                     wake_pending: false,
                     wake_front: false,
-                    allowed_cpus: crate::cpu::CpuMask::single(0),
+                    allowed_cpus: crate::cpu::topology().possible_mask(),
                     smp_sched_probe: false,
                     smp_sched_probe_active: false,
                     smp_cpu_probe: false,
