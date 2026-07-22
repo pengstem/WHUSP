@@ -1305,7 +1305,7 @@ impl LocalSocket {
 
     fn send_stream_user_buffer(&self, buf: UserBuffer, nonblock: bool) -> SysResult<usize> {
         perf::record_local_socket_write_call();
-        let buffers = buf.buffers;
+        let buffers = &buf.buffers;
         let total_len = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
         let mut written = 0usize;
         let mut buffer_index = 0usize;

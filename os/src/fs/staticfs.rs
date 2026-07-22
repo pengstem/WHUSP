@@ -646,7 +646,7 @@ impl File for StaticFile {
         *self.status_flags.exclusive_access() = flags;
     }
 
-    fn read_dirent64(&self, user_buf: UserBuffer) -> FsResult<isize> {
+    fn read_dirent64(&self, mut user_buf: UserBuffer) -> FsResult<isize> {
         let Some(entries) = dir_entries(self.node) else {
             return Err(FsError::NotDir);
         };
@@ -657,11 +657,7 @@ impl File for StaticFile {
         if written == 0 {
             return Ok(0);
         }
-        for (idx, byte_ref) in user_buf.into_iter().take(written).enumerate() {
-            unsafe {
-                *byte_ref = kernel_buf[idx];
-            }
-        }
+        assert_eq!(user_buf.copy_from_slice(&kernel_buf[..written]), written);
         Ok(written as isize)
     }
 

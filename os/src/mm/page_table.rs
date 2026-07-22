@@ -280,11 +280,31 @@ impl PageTable {
 // translated slices directly.
 pub struct UserBuffer {
     pub buffers: Vec<&'static mut [u8]>,
+    // Keep every translated user page allocated for the entire possibly
+    // sleeping File operation. Mapping removal may clear its PTE meanwhile,
+    // but the physical frame cannot be recycled until this buffer is dropped.
+    _pins: Vec<FrameTracker>,
 }
 
 impl UserBuffer {
     pub fn new(buffers: Vec<&'static mut [u8]>) -> Self {
-        Self { buffers }
+        let mut pins = Vec::with_capacity(buffers.len());
+        for buffer in &buffers {
+            if buffer.is_empty() {
+                continue;
+            }
+            let ppn = PhysAddr::from(buffer.as_ptr() as usize).floor();
+            pins.push(FrameTracker::from_retained(ppn).unwrap_or_else(|| {
+                panic!(
+                    "translated user buffer references unallocated frame: ppn={:#x}",
+                    ppn.0
+                )
+            }));
+        }
+        Self {
+            buffers,
+            _pins: pins,
+        }
     }
     /// Wraps a kernel-owned slice for synchronous in-kernel File trait I/O.
     ///
@@ -293,7 +313,10 @@ impl UserBuffer {
     /// use UserBuffer as their byte carrier even when the source is kernel memory.
     pub fn from_kernel_slice_for_sync_io(buf: &mut [u8]) -> Self {
         let slice = unsafe { core::mem::transmute::<&mut [u8], &'static mut [u8]>(buf) };
-        Self::new(vec![slice])
+        Self {
+            buffers: vec![slice],
+            _pins: Vec::new(),
+        }
     }
     pub fn len(&self) -> usize {
         let mut total: usize = 0;
@@ -324,38 +347,8 @@ impl UserBuffer {
     }
 }
 
-impl IntoIterator for UserBuffer {
-    type Item = *mut u8;
-    type IntoIter = UserBufferIterator;
-    fn into_iter(self) -> Self::IntoIter {
-        UserBufferIterator {
-            buffers: self.buffers,
-            current_buffer: 0,
-            current_idx: 0,
-        }
-    }
-}
-
-pub struct UserBufferIterator {
-    buffers: Vec<&'static mut [u8]>,
-    current_buffer: usize,
-    current_idx: usize,
-}
-
-impl Iterator for UserBufferIterator {
-    type Item = *mut u8;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current_buffer >= self.buffers.len() {
-            None
-        } else {
-            let r = &mut self.buffers[self.current_buffer][self.current_idx] as *mut _;
-            if self.current_idx + 1 == self.buffers[self.current_buffer].len() {
-                self.current_idx = 0;
-                self.current_buffer += 1;
-            } else {
-                self.current_idx += 1;
-            }
-            Some(r)
-        }
-    }
+// An explicit destructor prevents callers from partially moving `buffers`
+// out and dropping the page pins before the raw slices have been consumed.
+impl Drop for UserBuffer {
+    fn drop(&mut self) {}
 }

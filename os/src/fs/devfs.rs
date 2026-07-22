@@ -2195,7 +2195,7 @@ fn dir_entries(node: DevNode) -> Option<&'static [DevDirEntry]> {
 fn copy_dirents(
     entries: &'static [DevDirEntry],
     entries_offset: &mut usize,
-    user_buf: UserBuffer,
+    mut user_buf: UserBuffer,
 ) -> FsResult<isize> {
     let mut kernel_buf = vec![0u8; user_buf.len()];
     let mut written = 0usize;
@@ -2230,11 +2230,7 @@ fn copy_dirents(
     if written == 0 {
         return Ok(0);
     }
-    for (idx, byte_ref) in user_buf.into_iter().take(written).enumerate() {
-        unsafe {
-            *byte_ref = kernel_buf[idx];
-        }
-    }
+    assert_eq!(user_buf.copy_from_slice(&kernel_buf[..written]), written);
     Ok(written as isize)
 }
 
@@ -2270,7 +2266,7 @@ fn pts_dir_entries() -> alloc::vec::Vec<DynamicDirEntry> {
 fn copy_dynamic_dirents(
     entries: &[DynamicDirEntry],
     entries_offset: &mut usize,
-    user_buf: UserBuffer,
+    mut user_buf: UserBuffer,
 ) -> FsResult<isize> {
     let mut kernel_buf = vec![0u8; user_buf.len()];
     let mut written = 0usize;
@@ -2305,11 +2301,7 @@ fn copy_dynamic_dirents(
     if written == 0 {
         return Ok(0);
     }
-    for (idx, byte_ref) in user_buf.into_iter().take(written).enumerate() {
-        unsafe {
-            *byte_ref = kernel_buf[idx];
-        }
-    }
+    assert_eq!(user_buf.copy_from_slice(&kernel_buf[..written]), written);
     Ok(written as isize)
 }
 
