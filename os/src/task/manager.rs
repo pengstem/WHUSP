@@ -316,6 +316,16 @@ impl TaskManager {
     }
 
     fn should_preempt_current_on_tick(&self, current: &Arc<TaskControlBlock>) -> bool {
+        if let Some(is_owner) = current
+            .process
+            .upgrade()
+            .and_then(|process| process.scheduler_task_exclusion_owner(current))
+        {
+            // Keep the exclusive owner running while forcing every remote
+            // sibling through switch completion so its resources become safe
+            // to tear down.
+            return !is_owner;
+        }
         let current_rt_priority = Self::rt_priority(current);
 
         for priority in (current_rt_priority + 1..=RT_PRIORITY_MAX).rev() {

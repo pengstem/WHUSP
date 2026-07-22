@@ -113,6 +113,7 @@ impl ProcessControlBlock {
         let process = Arc::new(Self {
             pid: pid_handle,
             running_tasks: AtomicUsize::new(0),
+            switching_tasks: AtomicUsize::new(0),
             exclusive_task: AtomicUsize::new(0),
             inner_owner_cpu: AtomicUsize::new(usize::MAX),
             inner: unsafe {
@@ -313,6 +314,7 @@ impl ProcessControlBlock {
         let child = Arc::new(Self {
             pid,
             running_tasks: AtomicUsize::new(0),
+            switching_tasks: AtomicUsize::new(0),
             exclusive_task: AtomicUsize::new(0),
             inner_owner_cpu: AtomicUsize::new(usize::MAX),
             inner: unsafe {

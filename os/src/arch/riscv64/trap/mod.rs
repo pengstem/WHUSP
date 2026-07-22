@@ -199,6 +199,9 @@ pub fn trap_handler() -> ! {
                 crate::shutdown::stop_current_cpu();
             }
             crate::cpu::handle_ipi();
+            if timer_tick_should_preempt(&task) {
+                suspend_current_and_run_next();
+            }
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             set_next_trigger();

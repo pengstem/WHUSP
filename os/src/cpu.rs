@@ -679,6 +679,23 @@ pub fn wake_scheduler_cpu(allowed: CpuMask) {
     crate::task::record_smp_cpu_probe_scheduler_wake(false, false);
 }
 
+pub(crate) fn request_scheduler_preemption(targets: CpuMask) {
+    if !scheduler_aps_active() {
+        return;
+    }
+    let current = current_id();
+    let targets = CpuMask::from_bits(targets.bits() & online_mask().bits());
+    for cpu in 0..topology().possible_count() {
+        if cpu == current || !targets.contains(cpu) {
+            continue;
+        }
+        SCHEDULER_WAKE_PENDING[cpu].store(true, Ordering::Release);
+        crate::arch::smp::send_ipi(cpu).unwrap_or_else(|error| {
+            panic!("scheduler preemption IPI to CPU {cpu} failed: {error:#x}")
+        });
+    }
+}
+
 pub fn take_scheduler_wake(cpu: CpuId) -> bool {
     SCHEDULER_WAKE_PENDING[cpu].swap(false, Ordering::AcqRel)
 }

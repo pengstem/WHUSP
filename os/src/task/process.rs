@@ -649,6 +649,7 @@ pub struct ProcessControlBlock {
     // immutable
     pub pid: PidHandle,
     pub(super) running_tasks: AtomicUsize,
+    pub(super) switching_tasks: AtomicUsize,
     pub(super) exclusive_task: AtomicUsize,
     pub(super) inner_owner_cpu: AtomicUsize,
     // mutable
@@ -736,15 +737,23 @@ impl ProcessControlBlock {
         false
     }
 
-    pub(crate) fn release_scheduler_task(&self, task: &TaskControlBlock) {
+    pub(crate) fn release_scheduler_task(&self) {
         let previous = self.running_tasks.fetch_sub(1, Ordering::AcqRel);
         assert_ne!(previous, 0, "process running-task count underflow");
-        let exclusive_task = self.exclusive_task.load(Ordering::Acquire);
-        let task_id = Self::scheduler_task_id(task);
-        assert!(
-            exclusive_task == NO_EXCLUSIVE_TASK || exclusive_task == task_id || previous > 1,
-            "non-owner task was the final runner under task-group exclusion"
-        );
+    }
+
+    pub(crate) fn begin_scheduler_switch(&self) {
+        self.switching_tasks.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn finish_scheduler_switch(&self) {
+        let previous = self.switching_tasks.fetch_sub(1, Ordering::AcqRel);
+        assert_ne!(previous, 0, "process switching-task count underflow");
+    }
+
+    pub(crate) fn scheduler_task_exclusion_owner(&self, task: &TaskControlBlock) -> Option<bool> {
+        let owner = self.exclusive_task.load(Ordering::Acquire);
+        (owner != NO_EXCLUSIVE_TASK).then(|| owner == Self::scheduler_task_id(task))
     }
 
     fn try_begin_scheduler_exclusion<'a>(
@@ -761,8 +770,15 @@ impl ProcessControlBlock {
             )
             .ok()?;
 
-        while self.running_tasks.load(Ordering::Acquire) != 1 {
-            crate::task::suspend_current_and_run_next();
+        crate::cpu::request_scheduler_preemption(crate::cpu::online_mask());
+
+        while self.running_tasks.load(Ordering::Acquire) != 1
+            || self.switching_tasks.load(Ordering::Acquire) != 0
+        {
+            // Keep the owner on its CPU. Remote siblings leave through their
+            // normal timer/preemption paths, while yielding the owner here can
+            // starve it behind affinity-ineligible tasks on the global queue.
+            core::hint::spin_loop();
         }
         Some(TaskGroupSchedulerGuard {
             process: self,

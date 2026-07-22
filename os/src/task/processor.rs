@@ -198,6 +198,11 @@ fn prepare_current_switch_inner(
         }
         &mut inner.task_cx as *mut TaskContext
     };
+    processor
+        .current_process
+        .as_ref()
+        .expect("context switch lost its current process")
+        .begin_scheduler_switch();
     processor.pending_switch = Some(reason);
     Some((task, task_cx_ptr))
 }
@@ -282,7 +287,7 @@ fn finish_current_switch() {
     }
 
     drop(address_space);
-    process.release_scheduler_task(&task);
+    process.release_scheduler_task();
 
     if probe && reason == SwitchReason::Exit {
         super::smp_probe::record_exit();
@@ -303,6 +308,7 @@ fn finish_current_switch() {
         }
         SwitchReason::Exit => super::queue_exited_task(task),
     }
+    process.finish_scheduler_switch();
 }
 
 pub fn run_tasks() -> ! {
