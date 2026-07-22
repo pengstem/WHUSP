@@ -7,7 +7,6 @@ use crate::task::{
     current_process, current_user_token,
 };
 use alloc::vec::Vec;
-use core::sync::atomic::{Ordering, fence};
 
 use super::errno::{SysError, SysResult};
 use super::fs::{get_file_by_fd, io_uring_mmap_region};
@@ -71,7 +70,7 @@ const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: i32 = 1 << 4;
 const MEMBARRIER_SUPPORTED_CMDS: isize =
     (MEMBARRIER_CMD_PRIVATE_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED) as isize;
 #[cfg(target_arch = "riscv64")]
-const SYS_RISCV_FLUSH_ICACHE_ALL: usize = 1;
+const SYS_RISCV_FLUSH_ICACHE_LOCAL: usize = 1;
 
 const MADV_NORMAL: i32 = 0;
 const MADV_RANDOM: i32 = 1;
@@ -946,13 +945,20 @@ pub fn sys_msync(addr: usize, len: usize, flags: i32) -> SysResult {
 
 #[cfg(target_arch = "riscv64")]
 pub fn sys_riscv_flush_icache(_start: usize, _end: usize, flags: usize) -> SysResult {
-    if flags & !SYS_RISCV_FLUSH_ICACHE_ALL != 0 {
+    if flags & !SYS_RISCV_FLUSH_ICACHE_LOCAL != 0 {
         return Err(SysError::EINVAL);
     }
-    // CONTEXT: Linux reserves the address range for forward compatibility and
-    // flushes the current mm. The contest kernel runs one hart, so the local
-    // RISC-V instruction barrier covers both ALL and LOCAL flag modes.
-    crate::arch::mm::instruction_barrier();
+    // Linux reserves the address range for forward compatibility. LOCAL
+    // affects only the caller; flags=0 synchronizes every CPU currently using
+    // the mm, while the address-space generation covers later entrants.
+    if flags & SYS_RISCV_FLUSH_ICACHE_LOCAL != 0 {
+        crate::arch::mm::instruction_barrier();
+    } else {
+        current_process()
+            .inner_exclusive_access()
+            .memory_set
+            .synchronize_instruction_stream();
+    }
     Ok(0)
 }
 
@@ -970,17 +976,12 @@ pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> SysResult {
             Ok(0)
         }
         MEMBARRIER_CMD_PRIVATE_EXPEDITED => {
-            if !current_process()
-                .inner_exclusive_access()
-                .membarrier_private_expedited_registered
-            {
+            let process = current_process();
+            let inner = process.inner_exclusive_access();
+            if !inner.membarrier_private_expedited_registered {
                 return Err(SysError::EPERM);
             }
-            // UNFINISHED: A real SMP kernel must force every running sibling
-            // thread through a matching memory-ordering state. The contest
-            // kernel currently runs one hart, so a full local fence is enough
-            // for the libc private-expedited compatibility path.
-            fence(Ordering::SeqCst);
+            inner.memory_set.synchronize_memory();
             Ok(0)
         }
         _ => Err(SysError::EINVAL),

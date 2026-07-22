@@ -151,7 +151,7 @@ fn make_trampoline_page_executable(trampoline_ptr: usize) -> bool {
     {
         return false;
     }
-    crate::arch::mm::instruction_barrier();
+    inner.memory_set.synchronize_instruction_stream();
     true
 }
 

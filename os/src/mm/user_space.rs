@@ -6,7 +6,6 @@ use super::{
     PhysPageNum, RetiredUserPages, VPNRange, VirtAddr,
 };
 use super::{VirtPageNum, frame_alloc, frame_alloc_uninit, frame_ref_count};
-use crate::arch::mm as arch_mm;
 use crate::config::{PAGE_SIZE, USER_MMAP_BASE, USER_MMAP_LIMIT};
 use crate::fs::{File, FsError};
 use crate::mm::page_cache::{PAGE_CACHE, PAGE_CACHE_SOFT_MAX_PAGES, PageCacheId, PageCacheKey};
@@ -1214,7 +1213,7 @@ impl MemorySet {
         if installed {
             self.invalidate_tlb_page(usize::from(VirtAddr::from(page.vpn)));
             if exec_fault {
-                arch_mm::instruction_barrier();
+                self.synchronize_instruction_stream();
             }
         }
         installed
@@ -1242,7 +1241,7 @@ impl MemorySet {
         if installed {
             self.invalidate_tlb_page(usize::from(VirtAddr::from(page.vpn)));
             if exec_fault {
-                arch_mm::instruction_barrier();
+                self.synchronize_instruction_stream();
             }
         }
         installed
@@ -1380,7 +1379,7 @@ impl MemorySet {
         if pte_mutated {
             self.invalidate_tlb_vpn_range(start_vpn, end_vpn);
             if permission.contains(MapPermission::X) {
-                arch_mm::instruction_barrier();
+                self.synchronize_instruction_stream();
             }
         }
         if !retired_cache_keys.is_empty() {

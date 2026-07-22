@@ -118,6 +118,10 @@ fn mark_return_tlb_dirty() {
 }
 
 pub fn publish_pte_barrier() {
+    memory_barrier();
+}
+
+pub fn memory_barrier() {
     unsafe {
         asm!("dbar 0");
     }

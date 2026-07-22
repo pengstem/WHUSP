@@ -86,6 +86,14 @@ impl MemorySet {
         self.control.invalidate_tlb_page(virtual_address);
     }
 
+    pub(crate) fn synchronize_instruction_stream(&self) {
+        self.control.synchronize_instruction_stream();
+    }
+
+    pub(crate) fn synchronize_memory(&self) {
+        self.control.synchronize_memory();
+    }
+
     pub(super) fn invalidate_tlb_vpn_range(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) {
         assert!(start_vpn < end_vpn, "empty virtual-page invalidation range");
         let start = usize::from(VirtAddr::from(start_vpn));
@@ -298,8 +306,7 @@ impl MemorySet {
         if let Some(data) = data {
             map_area.copy_data(&self.page_table, data, data_offset);
             if map_area.is_executable() {
-                arch_mm::publish_pte_barrier();
-                arch_mm::instruction_barrier();
+                self.synchronize_instruction_stream();
             }
         }
         self.insert_area_sorted(map_area);

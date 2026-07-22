@@ -172,6 +172,10 @@ fn write_satp_bits(bits: usize) {
 }
 
 pub fn publish_pte_barrier() {
+    memory_barrier();
+}
+
+pub fn memory_barrier() {
     unsafe {
         asm!("fence rw, rw");
     }

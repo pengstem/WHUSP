@@ -27,6 +27,9 @@ const STARTUP_ERROR_NONE: usize = 0;
 const STARTUP_ERROR_ID_MISMATCH: usize = 1;
 const STARTUP_ERROR_BAD_TRANSITION: usize = 2;
 const STARTUP_ERROR_TIMEOUT: usize = 3;
+const REMOTE_SYNC_NONE: usize = 0;
+const REMOTE_SYNC_MEMORY: usize = 1;
+const REMOTE_SYNC_INSTRUCTION: usize = 2;
 
 #[repr(C, align(64))]
 struct CpuBootLocal {
@@ -50,6 +53,8 @@ pub(crate) struct CpuMmuFastState {
     return_tlb_dirty: AtomicBool,
     observed_address_space_id: AtomicUsize,
     observed_tlb_generation: AtomicUsize,
+    observed_instruction_space_id: AtomicUsize,
+    observed_instruction_generation: AtomicUsize,
 }
 
 impl CpuMmuFastState {
@@ -61,6 +66,8 @@ impl CpuMmuFastState {
             return_tlb_dirty: AtomicBool::new(true),
             observed_address_space_id: AtomicUsize::new(0),
             observed_tlb_generation: AtomicUsize::new(0),
+            observed_instruction_space_id: AtomicUsize::new(0),
+            observed_instruction_generation: AtomicUsize::new(0),
         }
     }
 
@@ -93,6 +100,20 @@ impl CpuMmuFastState {
         if previous_id != id || previous_generation < generation {
             self.mark_return_tlb_dirty();
         }
+    }
+
+    pub(crate) fn instruction_barrier_required(&self, id: usize, generation: usize) -> bool {
+        let previous_id = self
+            .observed_instruction_space_id
+            .swap(id, Ordering::Relaxed);
+        let previous_generation = self
+            .observed_instruction_generation
+            .swap(generation, Ordering::Relaxed);
+        assert!(
+            previous_id != id || previous_generation <= generation,
+            "address-space instruction generation regressed: id={id} previous={previous_generation} current={generation}",
+        );
+        previous_id != id || previous_generation < generation
     }
 }
 
@@ -240,7 +261,6 @@ impl AtomicCpuMask {
         self.0.store(mask.bits(), order);
     }
 
-    #[cfg(target_arch = "loongarch64")]
     pub fn swap(&self, mask: CpuMask, order: Ordering) -> CpuMask {
         CpuMask(self.0.swap(mask.bits(), order))
     }
@@ -443,6 +463,31 @@ static SCHEDULER_ACTIVE_CPUS: AtomicCpuMask = AtomicCpuMask::new(CpuMask::empty(
 static SCHEDULER_ACTIVE_LOGGED: AtomicBool = AtomicBool::new(false);
 static SCHEDULER_WAKE_PENDING: [AtomicBool; MAX_CPUS] =
     [const { AtomicBool::new(false) }; MAX_CPUS];
+
+struct RemoteSyncRequest {
+    active: AtomicBool,
+    sequence: AtomicUsize,
+    action: AtomicUsize,
+    remaining: AtomicCpuMask,
+}
+
+impl RemoteSyncRequest {
+    const fn new() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+            sequence: AtomicUsize::new(0),
+            action: AtomicUsize::new(REMOTE_SYNC_NONE),
+            remaining: AtomicCpuMask::new(CpuMask::empty()),
+        }
+    }
+}
+
+static REMOTE_SYNC_REQUESTS: [RemoteSyncRequest; MAX_CPUS] =
+    [const { RemoteSyncRequest::new() }; MAX_CPUS];
+static REMOTE_SYNC_PENDING_SOURCES: [AtomicCpuMask; MAX_CPUS] =
+    [const { AtomicCpuMask::new(CpuMask::empty()) }; MAX_CPUS];
+static REMOTE_SYNC_OBSERVED_SEQUENCE: [[AtomicUsize; MAX_CPUS]; MAX_CPUS] =
+    [const { [const { AtomicUsize::new(0) }; MAX_CPUS] }; MAX_CPUS];
 static SCHEDULER_WAKE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
 pub fn record_boot_entry() {
@@ -700,6 +745,154 @@ pub fn take_scheduler_wake(cpu: CpuId) -> bool {
     SCHEDULER_WAKE_PENDING[cpu].swap(false, Ordering::AcqRel)
 }
 
+pub(crate) fn synchronize_remote_memory(targets: CpuMask) -> Result<(), usize> {
+    submit_remote_sync(targets, REMOTE_SYNC_MEMORY)
+}
+
+pub(crate) fn synchronize_remote_instruction(targets: CpuMask) -> Result<(), usize> {
+    submit_remote_sync(targets, REMOTE_SYNC_INSTRUCTION)
+}
+
+fn submit_remote_sync(targets: CpuMask, action: usize) -> Result<(), usize> {
+    assert!(
+        matches!(action, REMOTE_SYNC_MEMORY | REMOTE_SYNC_INSTRUCTION),
+        "invalid remote synchronization action {action}"
+    );
+    assert_eq!(
+        targets.bits() & !online_mask().bits(),
+        0,
+        "remote synchronization targets an offline CPU"
+    );
+    let source = current_id();
+    assert!(
+        !targets.contains(source),
+        "remote synchronization target mask contains the caller"
+    );
+    if targets.bits() == 0 {
+        return Ok(());
+    }
+
+    crate::arch::mm::memory_barrier();
+    let request = &REMOTE_SYNC_REQUESTS[source];
+    assert!(
+        !request.active.swap(true, Ordering::AcqRel),
+        "CPU {source} started a nested remote synchronization"
+    );
+    assert_eq!(
+        request.remaining.load(Ordering::Acquire).bits(),
+        0,
+        "CPU {source} reused an incomplete remote synchronization"
+    );
+    request.action.store(action, Ordering::Relaxed);
+    let sequence = request.sequence.load(Ordering::Relaxed).wrapping_add(1);
+    assert_ne!(sequence, 0, "remote synchronization sequence wrapped");
+    request.sequence.store(sequence, Ordering::Release);
+
+    let mut send_error = None;
+    for target in 0..topology().possible_count() {
+        if !targets.contains(target) {
+            continue;
+        }
+        let old_remaining = request.remaining.fetch_insert(target, Ordering::AcqRel);
+        assert!(
+            !old_remaining.contains(target),
+            "remote synchronization target {target} was already pending from {source}"
+        );
+        let old_sources =
+            REMOTE_SYNC_PENDING_SOURCES[target].fetch_insert(source, Ordering::AcqRel);
+        assert!(
+            !old_sources.contains(source),
+            "remote synchronization source {source} was already pending on {target}"
+        );
+        if old_sources.bits() == 0
+            && let Err(error) = crate::arch::smp::send_ipi(target)
+        {
+            let pending =
+                REMOTE_SYNC_PENDING_SOURCES[target].fetch_remove(source, Ordering::AcqRel);
+            if pending.contains(source) {
+                let remaining = request.remaining.fetch_remove(target, Ordering::AcqRel);
+                assert!(remaining.contains(target));
+            }
+            send_error = Some(error);
+            break;
+        }
+    }
+
+    wait_for_remote_sync_completion(source, sequence, request);
+    request.action.store(REMOTE_SYNC_NONE, Ordering::Relaxed);
+    request.active.store(false, Ordering::Release);
+    send_error.map_or(Ok(()), Err)
+}
+
+fn wait_for_remote_sync_completion(source: CpuId, sequence: usize, request: &RemoteSyncRequest) {
+    let start = crate::timer::get_time();
+    let timeout = crate::config::clock_freq().saturating_mul(2);
+    loop {
+        let remaining = request.remaining.load(Ordering::Acquire);
+        if remaining.bits() == 0 {
+            return;
+        }
+        // Close the cross-rendezvous deadlock when two IRQ-masked CPUs target
+        // one another while holding unrelated process/address-space locks.
+        handle_remote_sync_ipi();
+        if crate::timer::get_time().wrapping_sub(start) >= timeout {
+            panic!(
+                "remote synchronization timeout: source={source} sequence={sequence} remaining={:#x}",
+                remaining.bits()
+            );
+        }
+        core::hint::spin_loop();
+    }
+}
+
+pub(crate) fn handle_remote_sync_ipi() -> bool {
+    let target = current_id();
+    let mut handled = false;
+    loop {
+        let sources = REMOTE_SYNC_PENDING_SOURCES[target].swap(CpuMask::empty(), Ordering::AcqRel);
+        if sources.bits() == 0 {
+            return handled;
+        }
+        handled = true;
+        for source in 0..topology().possible_count() {
+            if !sources.contains(source) {
+                continue;
+            }
+            assert_ne!(
+                source, target,
+                "remote synchronization targeted its source CPU"
+            );
+            let request = &REMOTE_SYNC_REQUESTS[source];
+            assert!(
+                request.active.load(Ordering::Acquire),
+                "target {target} observed an inactive synchronization from {source}"
+            );
+            let sequence = request.sequence.load(Ordering::Acquire);
+            let previous = REMOTE_SYNC_OBSERVED_SEQUENCE[target][source].load(Ordering::Relaxed);
+            assert!(
+                sequence > previous,
+                "stale remote synchronization: source={source} target={target} sequence={sequence} previous={previous}"
+            );
+            match request.action.load(Ordering::Relaxed) {
+                REMOTE_SYNC_MEMORY => crate::arch::mm::memory_barrier(),
+                REMOTE_SYNC_INSTRUCTION => {
+                    crate::arch::mm::memory_barrier();
+                    crate::arch::mm::instruction_barrier();
+                }
+                action => {
+                    panic!("target {target} observed invalid synchronization action {action}")
+                }
+            }
+            REMOTE_SYNC_OBSERVED_SEQUENCE[target][source].store(sequence, Ordering::Release);
+            let remaining = request.remaining.fetch_remove(target, Ordering::AcqRel);
+            assert!(
+                remaining.contains(target),
+                "target {target} acknowledged a completed synchronization from {source}"
+            );
+        }
+    }
+}
+
 pub fn start_parked_secondaries() {
     let topology = topology();
     CPU_BOOT_LOCALS[0]
@@ -904,6 +1097,7 @@ fn wait_for_probe_value(value: &AtomicUsize, expected: usize, what: &str) {
 
 pub fn handle_ipi() {
     let logical_id = current_id();
+    let handled_remote_sync = handle_remote_sync_ipi();
     let handled_tlb = crate::arch::smp::handle_tlb_ipi();
     let handled_scheduler_wake = take_scheduler_wake(logical_id);
     let handled_tlb_cross_command = TLB_CROSS_PROBE_ACTIVE.load(Ordering::Acquire)
@@ -916,7 +1110,8 @@ pub fn handle_ipi() {
         return;
     }
     if !PROBE_ACTIVE.load(Ordering::Acquire) {
-        if handled_tlb
+        if handled_remote_sync
+            || handled_tlb
             || handled_scheduler_wake
             || handled_tlb_cross_command
             || TLB_CROSS_PROBE_ACTIVE.load(Ordering::Acquire)

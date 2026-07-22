@@ -221,6 +221,9 @@ impl<T> SpinNoIrqLock<T> {
 
 #[inline]
 fn poll_tlb_while_spinning() {
+    if crate::cpu::try_current_id().is_some() {
+        crate::cpu::handle_remote_sync_ipi();
+    }
     #[cfg(target_arch = "loongarch64")]
     {
         if crate::cpu::try_current_id().is_some() {

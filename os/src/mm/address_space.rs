@@ -53,6 +53,7 @@ pub(crate) struct AddressSpaceControl {
     id: usize,
     active_cpus: AtomicCpuMask,
     tlb_generation: AtomicUsize,
+    instruction_generation: AtomicUsize,
 }
 
 impl AddressSpaceControl {
@@ -65,6 +66,7 @@ impl AddressSpaceControl {
             // Generation zero is reserved for a CPU that has not observed an
             // address space. Later mutation units increment from this value.
             tlb_generation: AtomicUsize::new(1),
+            instruction_generation: AtomicUsize::new(1),
         })
     }
 
@@ -84,6 +86,60 @@ impl AddressSpaceControl {
 
     fn generation(&self) -> usize {
         self.tlb_generation.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn synchronize_instruction_stream(&self) {
+        crate::arch::mm::memory_barrier();
+        let generation = self
+            .instruction_generation
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |generation| {
+                generation.checked_add(1)
+            })
+            .unwrap_or_else(|_| {
+                panic!(
+                    "address-space instruction generation wrapped: id={}",
+                    self.id
+                )
+            })
+            + 1;
+        assert_ne!(
+            generation, 0,
+            "address-space instruction generation is zero"
+        );
+
+        let active = self.active_cpus.load(Ordering::SeqCst);
+        let current = crate::cpu::current_id();
+        if active.contains(current) {
+            crate::arch::mm::instruction_barrier();
+        }
+        let remote = CpuMask::from_bits(active.bits() & !CpuMask::single(current).bits());
+        if remote.bits() != 0 {
+            crate::cpu::synchronize_remote_instruction(remote).unwrap_or_else(|error| {
+                panic!(
+                    "remote instruction synchronization failed: id={} generation={} targets={:#x} error={error:#x}",
+                    self.id,
+                    generation,
+                    remote.bits(),
+                )
+            });
+        }
+    }
+
+    pub(crate) fn synchronize_memory(&self) {
+        crate::arch::mm::memory_barrier();
+        let current = crate::cpu::current_id();
+        let active = self.active_cpus.load(Ordering::SeqCst);
+        let remote = CpuMask::from_bits(active.bits() & !CpuMask::single(current).bits());
+        if remote.bits() != 0 {
+            crate::cpu::synchronize_remote_memory(remote).unwrap_or_else(|error| {
+                panic!(
+                    "remote memory synchronization failed: id={} targets={:#x} error={error:#x}",
+                    self.id,
+                    remote.bits(),
+                )
+            });
+        }
+        crate::arch::mm::memory_barrier();
     }
 
     pub(crate) fn invalidate_tlb_all(&self) {
@@ -191,6 +247,13 @@ impl ActiveAddressSpace {
         crate::cpu::current()
             .mmu()
             .observe_address_space(self.control.id, self.control.generation());
+        let instruction_generation = self.control.instruction_generation.load(Ordering::SeqCst);
+        if crate::cpu::current()
+            .mmu()
+            .instruction_barrier_required(self.control.id, instruction_generation)
+        {
+            crate::arch::mm::instruction_barrier();
+        }
     }
 }
 
