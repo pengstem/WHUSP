@@ -3,6 +3,7 @@ use super::fetch_task;
 use super::{ProcessControlBlock, TaskContext, TaskControlBlock, TaskStatus};
 use crate::arch::hart;
 use crate::config::MAX_CPUS;
+use crate::mm::ActiveAddressSpace;
 use crate::perf;
 use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::trap::TrapContext;
@@ -16,6 +17,7 @@ pub struct Processor {
     // with set_current() and refresh_current_user_token(); syscall user-copy
     // fast paths depend on this being the active address space.
     current_user_token: usize,
+    current_address_space: Option<ActiveAddressSpace>,
     pending_switch: Option<SwitchReason>,
     idle_task_cx: TaskContext,
 }
@@ -33,6 +35,7 @@ impl Processor {
             current: None,
             current_process: None,
             current_user_token: 0,
+            current_address_space: None,
             pending_switch: None,
             idle_task_cx: TaskContext::zero_init(),
         }
@@ -47,10 +50,17 @@ impl Processor {
             "CPU retained a completed switch"
         );
         let process = process_of_task(&task);
-        let user_token = process.inner_exclusive_access().memory_set.token();
+        let cpu = crate::cpu::current_id();
+        let (user_token, address_space) = {
+            let inner = process.inner_exclusive_access();
+            let user_token = inner.memory_set.token();
+            let control = inner.memory_set.address_space_control();
+            (user_token, control.enter_cpu(cpu))
+        };
         self.current = Some(task);
         self.current_process = Some(process);
         self.current_user_token = user_token;
+        self.current_address_space = Some(address_space);
     }
     pub fn current(&self) -> Option<Arc<TaskControlBlock>> {
         self.current.as_ref().map(Arc::clone)
@@ -68,9 +78,32 @@ impl Processor {
         // Refresh after the image switch before any later user-copy helper
         // reads the cached token through current_user_token().
         let process = self.current_process.as_ref()?;
-        let token = process.inner_exclusive_access().memory_set.token();
+        let cpu = crate::cpu::current_id();
+        let (token, control) = {
+            let inner = process.inner_exclusive_access();
+            (
+                inner.memory_set.token(),
+                inner.memory_set.address_space_control(),
+            )
+        };
+        if !self
+            .current_address_space
+            .as_ref()
+            .is_some_and(|active| active.belongs_to(&control))
+        {
+            let replacement = control.enter_cpu(cpu);
+            let previous = self.current_address_space.replace(replacement);
+            drop(previous);
+        }
         self.current_user_token = token;
         Some(token)
+    }
+
+    fn prepare_current_address_space_return(&self) {
+        self.current_address_space
+            .as_ref()
+            .expect("user return requires an active address space")
+            .prepare_user_return();
     }
 }
 
@@ -104,6 +137,7 @@ pub(crate) fn current_processor_is_empty() -> bool {
     processor.current.is_none()
         && processor.current_process.is_none()
         && processor.current_user_token == 0
+        && processor.current_address_space.is_none()
         && processor.pending_switch.is_none()
 }
 
@@ -170,7 +204,7 @@ fn prepare_current_switch_inner(
 
 fn finish_current_switch() {
     let cpu = crate::cpu::current_id();
-    let (task, process, reason) = {
+    let (task, process, address_space, reason) = {
         let mut processor = processor();
         let reason = processor
             .pending_switch
@@ -184,8 +218,12 @@ fn finish_current_switch() {
             .current_process
             .take()
             .expect("pending switch lost its current process");
+        let address_space = processor
+            .current_address_space
+            .take()
+            .expect("pending switch lost its active address space");
         processor.current_user_token = 0;
-        (task, process, reason)
+        (task, process, address_space, reason)
     };
 
     if reason == SwitchReason::Block {
@@ -243,6 +281,7 @@ fn finish_current_switch() {
         );
     }
 
+    drop(address_space);
     process.release_scheduler_cpu(cpu);
 
     if probe && reason == SwitchReason::Exit {
@@ -334,6 +373,10 @@ pub fn refresh_current_user_token() {
         .expect("refresh_current_user_token requires a running task");
 }
 
+fn prepare_current_address_space_return() {
+    processor().prepare_current_address_space_return();
+}
+
 pub fn current_trap_cx() -> &'static mut TrapContext {
     perf::record_task_current_trap_cx_call();
     let trap_cx_ppn = processor()
@@ -373,6 +416,7 @@ pub fn trap_return_context_after_accounting_for_task(
 ) -> (usize, usize) {
     perf::record_task_current_trap_return_context_call();
     account_trap_return_for_task(task, process, now_us);
+    prepare_current_address_space_return();
     let trap_cx_user_va = task
         .inner_exclusive_access()
         .res
@@ -391,6 +435,7 @@ pub fn trap_return_context_after_accounting_for_task(
 ) -> (usize, usize) {
     perf::record_task_current_trap_return_context_call();
     account_trap_return_for_task(task, process, now_us);
+    prepare_current_address_space_return();
     let trap_cx = task.inner_exclusive_access().get_trap_cx() as *mut TrapContext as usize;
     let user_token = process.inner_exclusive_access().memory_set.token();
     (trap_cx, user_token)

@@ -1,11 +1,11 @@
 use super::address::page_align_up;
 use super::{
-    MapArea, MapPermission, MapType, MmapFlush, PageTable, PageTableEntry, VPNRange, VirtAddr,
-    VirtPageNum, frame_alloc, page_table::PTEFlags,
+    AddressSpaceControl, MapArea, MapPermission, MapType, MmapFlush, PageTable, PageTableEntry,
+    VPNRange, VirtAddr, VirtPageNum, frame_alloc, page_table::PTEFlags,
 };
 use crate::arch::mm as arch_mm;
 use crate::perf;
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use core::cell::Cell;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,6 +23,7 @@ pub(crate) struct MemoryMapEntry {
 
 pub struct MemorySet {
     pub(super) page_table: PageTable,
+    control: Arc<AddressSpaceControl>,
     // CONTEXT: contest address spaces have a small VMA count today. Keep the
     // VMA list simple until measured mmap pressure justifies an interval tree.
     pub(super) areas: Vec<MapArea>,
@@ -42,6 +43,7 @@ impl MemorySet {
     pub fn new_bare() -> Self {
         Self {
             page_table: PageTable::new(),
+            control: AddressSpaceControl::new(),
             areas: Vec::new(),
             last_area_idx_containing: Cell::new(None),
             brk_base: 0,
@@ -56,6 +58,7 @@ impl MemorySet {
     pub fn try_new_bare() -> Option<Self> {
         Some(Self {
             page_table: PageTable::try_new()?,
+            control: AddressSpaceControl::new(),
             areas: Vec::new(),
             last_area_idx_containing: Cell::new(None),
             brk_base: 0,
@@ -69,6 +72,10 @@ impl MemorySet {
     }
     pub fn token(&self) -> usize {
         self.page_table.token()
+    }
+
+    pub(crate) fn address_space_control(&self) -> Arc<AddressSpaceControl> {
+        Arc::clone(&self.control)
     }
     /// Maps kernel-private framed pages without clearing the new frames.
     ///

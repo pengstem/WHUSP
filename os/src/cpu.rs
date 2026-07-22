@@ -50,6 +50,8 @@ pub(crate) struct CpuMmuFastState {
     return_tlb_dirty: AtomicBool,
     #[cfg(target_arch = "riscv64")]
     kernel_tlb_dirty: AtomicBool,
+    observed_address_space_id: AtomicUsize,
+    observed_tlb_generation: AtomicUsize,
 }
 
 impl CpuMmuFastState {
@@ -61,6 +63,8 @@ impl CpuMmuFastState {
             return_tlb_dirty: AtomicBool::new(true),
             #[cfg(target_arch = "riscv64")]
             kernel_tlb_dirty: AtomicBool::new(true),
+            observed_address_space_id: AtomicUsize::new(0),
+            observed_tlb_generation: AtomicUsize::new(0),
         }
     }
 
@@ -89,6 +93,20 @@ impl CpuMmuFastState {
     #[cfg(target_arch = "riscv64")]
     pub(crate) fn mark_kernel_tlb_dirty(&self) {
         self.kernel_tlb_dirty.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn observe_address_space(&self, id: usize, generation: usize) {
+        let previous_id = self.observed_address_space_id.swap(id, Ordering::Relaxed);
+        let previous_generation = self
+            .observed_tlb_generation
+            .swap(generation, Ordering::Relaxed);
+        assert!(
+            previous_id != id || previous_generation <= generation,
+            "address-space TLB generation regressed: id={id} previous={previous_generation} current={generation}",
+        );
+        if previous_id != id || previous_generation < generation {
+            self.mark_return_tlb_dirty();
+        }
     }
 }
 
@@ -242,10 +260,20 @@ impl AtomicCpuMask {
         self.0.fetch_or(1u64 << cpu, order);
     }
 
+    pub fn fetch_insert(&self, cpu: CpuId, order: Ordering) -> CpuMask {
+        assert!(cpu < MAX_CPUS, "CPU ID exceeds MAX_CPUS");
+        CpuMask(self.0.fetch_or(1u64 << cpu, order))
+    }
+
     #[allow(dead_code)]
     pub fn remove(&self, cpu: CpuId, order: Ordering) {
         assert!(cpu < MAX_CPUS, "CPU ID exceeds MAX_CPUS");
         self.0.fetch_and(!(1u64 << cpu), order);
+    }
+
+    pub fn fetch_remove(&self, cpu: CpuId, order: Ordering) -> CpuMask {
+        assert!(cpu < MAX_CPUS, "CPU ID exceeds MAX_CPUS");
+        CpuMask(self.0.fetch_and(!(1u64 << cpu), order))
     }
 }
 
