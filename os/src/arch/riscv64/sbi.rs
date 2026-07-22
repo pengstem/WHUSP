@@ -11,6 +11,18 @@ pub fn ipi_available() -> bool {
     sbi_rt::probe_extension(sbi_rt::Ipi).is_available()
 }
 
+pub fn rfence_available() -> bool {
+    sbi_rt::probe_extension(sbi_rt::Fence).is_available()
+}
+
+pub fn opensbi_rfence_completion_available() -> bool {
+    // SBI identifies OpenSBI as implementation 1. The RFENCE specification's
+    // success text only promises that the IPI was sent; this kernel relies on
+    // OpenSBI's TLB event sync callback before using the return as a reclaim
+    // boundary.
+    sbi_rt::get_sbi_impl_id() == 1 && rfence_available()
+}
+
 pub fn hart_status(hart_id: usize) -> Result<usize, usize> {
     let result = sbi_rt::hart_get_status(hart_id);
     if result.is_ok() {
@@ -32,6 +44,21 @@ pub fn start_hart(hart_id: usize, start_addr: usize, opaque: usize) -> Result<()
 pub fn send_ipi(hart_id: usize) -> Result<(), usize> {
     let mask = sbi_rt::HartMask::from_mask_base(1, hart_id);
     let result = sbi_rt::send_ipi(mask);
+    if result.is_ok() {
+        Ok(())
+    } else {
+        Err(result.error)
+    }
+}
+
+pub fn remote_sfence_vma(
+    hart_mask: usize,
+    hart_mask_base: usize,
+    start_addr: usize,
+    size: usize,
+) -> Result<(), usize> {
+    let mask = sbi_rt::HartMask::from_mask_base(hart_mask, hart_mask_base);
+    let result = sbi_rt::remote_sfence_vma(mask, start_addr, size);
     if result.is_ok() {
         Ok(())
     } else {

@@ -2,6 +2,8 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use riscv::register::satp;
 
+const LOCAL_TLB_RANGE_PAGE_LIMIT: usize = 64;
+
 const SV39_MODE: usize = 8;
 const SATP_ASID_SHIFT: usize = 44;
 const SATP_ASID_BITS: usize = 16;
@@ -54,6 +56,25 @@ pub fn flush_tlb_page(va: usize) {
     mark_return_tlb_dirty();
     unsafe {
         asm!("sfence.vma {va}, x0", va = in(reg) va);
+    }
+}
+
+pub fn flush_tlb_range(start: usize, size: usize) {
+    mark_return_tlb_dirty();
+    if size == usize::MAX
+        || (start == 0 && size == 0)
+        || size / crate::config::PAGE_SIZE > LOCAL_TLB_RANGE_PAGE_LIMIT
+    {
+        unsafe {
+            asm!("sfence.vma");
+        }
+        return;
+    }
+    for offset in (0..size).step_by(crate::config::PAGE_SIZE) {
+        let va = start.checked_add(offset).expect("TLB flush range overflow");
+        unsafe {
+            asm!("sfence.vma {va}, x0", va = in(reg) va);
+        }
     }
 }
 
@@ -128,7 +149,11 @@ fn write_satp_bits(bits: usize) {
     }
 }
 
-pub fn publish_pte_barrier() {}
+pub fn publish_pte_barrier() {
+    unsafe {
+        asm!("fence rw, rw");
+    }
+}
 
 pub fn instruction_barrier() {
     crate::perf::record_arch_instruction_barrier_call();

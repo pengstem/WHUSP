@@ -1,5 +1,7 @@
 use core::arch::asm;
 
+const LOCAL_TLB_RANGE_PAGE_LIMIT: usize = 64;
+
 pub const VIRT_ADDR_START: usize = 0x9000_0000_0000_0000;
 const DIRECT_MAP_MASK: usize = 0xf000_0000_0000_0000;
 const PHYS_ADDR_MASK: usize = 0x0000_ffff_ffff_ffff;
@@ -68,14 +70,44 @@ fn write_page_table_roots(pgdl_token: usize, pgdh_token: usize) {
 pub fn flush_tlb_all() {
     mark_return_tlb_dirty();
     unsafe {
-        asm!("dbar 0", "invtlb 0x00, $r0, $r0");
+        asm!("dbar 0", "invtlb 0x00, $r0, $r0", "dbar 0");
     }
 }
 
 pub fn flush_tlb_page(va: usize) {
     mark_return_tlb_dirty();
     unsafe {
-        asm!("dbar 0", "invtlb 0x05, $r0, {va}", va = in(reg) va);
+        asm!(
+            "dbar 0",
+            "invtlb 0x05, $r0, {va}",
+            "dbar 0",
+            va = in(reg) va
+        );
+    }
+}
+
+pub fn flush_tlb_range(start: usize, size: usize) {
+    mark_return_tlb_dirty();
+    unsafe {
+        asm!("dbar 0");
+    }
+    if size == usize::MAX
+        || (start == 0 && size == 0)
+        || size / crate::config::PAGE_SIZE > LOCAL_TLB_RANGE_PAGE_LIMIT
+    {
+        unsafe {
+            asm!("invtlb 0x00, $r0, $r0");
+        }
+    } else {
+        for offset in (0..size).step_by(crate::config::PAGE_SIZE) {
+            let va = start.checked_add(offset).expect("TLB flush range overflow");
+            unsafe {
+                asm!("invtlb 0x05, $r0, {va}", va = in(reg) va);
+            }
+        }
+    }
+    unsafe {
+        asm!("dbar 0");
     }
 }
 

@@ -254,6 +254,11 @@ impl AtomicCpuMask {
         self.0.store(mask.bits(), order);
     }
 
+    #[cfg(target_arch = "loongarch64")]
+    pub fn swap(&self, mask: CpuMask, order: Ordering) -> CpuMask {
+        CpuMask(self.0.swap(mask.bits(), order))
+    }
+
     #[allow(dead_code)]
     pub fn insert(&self, cpu: CpuId, order: Ordering) {
         assert!(cpu < MAX_CPUS, "CPU ID exceeds MAX_CPUS");
@@ -440,6 +445,13 @@ static PHASE2_IRQ_RESTORED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(fa
 static PHASE2_PROBE_FAILURES: AtomicUsize = AtomicUsize::new(0);
 static PHASE2_PROBE_PERF: [Phase2ProbePerf; MAX_CPUS] =
     [const { Phase2ProbePerf::new() }; MAX_CPUS];
+static TLB_CROSS_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static TLB_CROSS_PROBE_GO: AtomicBool = AtomicBool::new(false);
+static TLB_CROSS_COMMAND_PENDING: [AtomicBool; MAX_CPUS] =
+    [const { AtomicBool::new(false) }; MAX_CPUS];
+static TLB_CROSS_RUN_PENDING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+static TLB_CROSS_READY: AtomicCpuMask = AtomicCpuMask::new(CpuMask::empty());
+static TLB_CROSS_DONE: AtomicCpuMask = AtomicCpuMask::new(CpuMask::empty());
 static SCHEDULER_APS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SCHEDULER_ACTIVE_CPUS: AtomicCpuMask = AtomicCpuMask::new(CpuMask::empty());
 static SCHEDULER_ACTIVE_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -718,6 +730,7 @@ pub fn start_parked_secondaries() {
         run_phase1_ipi_probe();
     }
     run_phase2_lock_irq_probe();
+    run_tlb_transport_probe();
 }
 
 fn wait_for_online_barrier() {
@@ -888,18 +901,28 @@ fn wait_for_probe_value(value: &AtomicUsize, expected: usize, what: &str) {
 
 pub fn handle_ipi() {
     let logical_id = current_id();
-    if take_scheduler_wake(logical_id) {
-        return;
+    let handled_tlb = crate::arch::smp::handle_tlb_ipi();
+    let handled_scheduler_wake = take_scheduler_wake(logical_id);
+    let handled_tlb_cross_command = TLB_CROSS_PROBE_ACTIVE.load(Ordering::Acquire)
+        && TLB_CROSS_COMMAND_PENDING[logical_id].swap(false, Ordering::AcqRel);
+    if handled_tlb_cross_command {
+        TLB_CROSS_RUN_PENDING[logical_id].store(true, Ordering::Release);
     }
     if PHASE2_PROBE_ACTIVE.load(Ordering::Acquire) {
         PHASE2_PROBE_PENDING[logical_id].store(true, Ordering::Release);
         return;
     }
     if !PROBE_ACTIVE.load(Ordering::Acquire) {
-        if scheduler_aps_active() {
+        if handled_tlb
+            || handled_scheduler_wake
+            || handled_tlb_cross_command
+            || TLB_CROSS_PROBE_ACTIVE.load(Ordering::Acquire)
+            || scheduler_aps_active()
+        {
             // An idle CPU may consume the pending flag immediately before the
             // already-issued interrupt is delivered. The interrupt is then a
-            // harmless coalesced scheduler wake, not a boot-probe violation.
+            // harmless coalesced scheduler/TLB wake, not a boot-probe
+            // violation.
             return;
         }
         PROBE_UNEXPECTED.fetch_add(1, Ordering::Relaxed);
@@ -921,6 +944,107 @@ pub fn handle_ipi() {
         PROBE_DUPLICATES.fetch_add(1, Ordering::Relaxed);
     } else {
         PROBE_RECEIVED[logical_id].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn run_tlb_transport_probe() {
+    let current = current_id();
+    let targets = CpuMask::from_bits(online_mask().bits() & !CpuMask::single(current).bits());
+    if targets.bits() == 0 {
+        info!(
+            "smp tlb-transport: backend={} requests=0 targets_per_request=0 completions=0 failures=0",
+            crate::arch::smp::tlb_backend_name()
+        );
+        return;
+    }
+
+    crate::arch::mm::flush_tlb_range(crate::config::PAGE_SIZE * 4, crate::config::PAGE_SIZE);
+    crate::arch::smp::remote_tlb_flush(
+        targets,
+        crate::config::PAGE_SIZE * 4,
+        crate::config::PAGE_SIZE,
+    )
+    .unwrap_or_else(|error| panic!("range TLB transport probe failed: {error:#x}"));
+    crate::arch::mm::flush_tlb_range(0, usize::MAX);
+    crate::arch::smp::remote_tlb_flush(targets, 0, usize::MAX)
+        .unwrap_or_else(|error| panic!("full TLB transport probe failed: {error:#x}"));
+    info!(
+        "smp tlb-transport: backend={} requests=2 targets_per_request={} completions={} failures=0",
+        crate::arch::smp::tlb_backend_name(),
+        targets.count(),
+        targets.count() * 2,
+    );
+    run_tlb_cross_probe();
+}
+
+fn run_tlb_cross_probe() {
+    if topology().possible_count() < 2 {
+        info!("smp tlb-cross: participants=1 completions=0 failures=0");
+        return;
+    }
+
+    TLB_CROSS_PROBE_GO.store(false, Ordering::Relaxed);
+    TLB_CROSS_READY.store(CpuMask::empty(), Ordering::Relaxed);
+    TLB_CROSS_DONE.store(CpuMask::empty(), Ordering::Relaxed);
+    for cpu in 0..2 {
+        TLB_CROSS_COMMAND_PENDING[cpu].store(false, Ordering::Relaxed);
+        TLB_CROSS_RUN_PENDING[cpu].store(false, Ordering::Relaxed);
+    }
+    TLB_CROSS_PROBE_ACTIVE.store(true, Ordering::Release);
+    TLB_CROSS_COMMAND_PENDING[1].store(true, Ordering::Release);
+    crate::arch::smp::send_ipi(1)
+        .unwrap_or_else(|error| panic!("TLB cross-probe command IPI failed: {error:#x}"));
+
+    wait_for_tlb_cross_mask(&TLB_CROSS_READY, CpuMask::single(1), "ready");
+    TLB_CROSS_PROBE_GO.store(true, Ordering::Release);
+    run_tlb_cross_probe_on_cpu(0);
+    wait_for_tlb_cross_mask(&TLB_CROSS_DONE, CpuMask::first(2), "completion");
+    TLB_CROSS_PROBE_ACTIVE.store(false, Ordering::Release);
+    info!("smp tlb-cross: participants=2 completions=2 failures=0");
+}
+
+fn run_tlb_cross_probe_on_cpu(logical_id: CpuId) {
+    assert_eq!(current_id(), logical_id, "TLB cross probe ran on wrong CPU");
+    if logical_id == 1 {
+        TLB_CROSS_READY.insert(logical_id, Ordering::Release);
+        while !TLB_CROSS_PROBE_GO.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+    let target = 1 - logical_id;
+    let irq_guard = LocalIrqGuard::disable();
+    assert!(
+        !crate::arch::interrupt::supervisor_interrupt_enabled(),
+        "TLB cross probe failed to disable local interrupts"
+    );
+    crate::arch::smp::remote_tlb_flush(
+        CpuMask::single(target),
+        crate::config::PAGE_SIZE * 8,
+        crate::config::PAGE_SIZE,
+    )
+    .unwrap_or_else(|error| {
+        panic!("TLB cross probe from CPU {logical_id} to CPU {target} failed: {error:#x}")
+    });
+    drop(irq_guard);
+    TLB_CROSS_DONE.insert(logical_id, Ordering::Release);
+}
+
+fn wait_for_tlb_cross_mask(value: &AtomicCpuMask, expected: CpuMask, what: &str) {
+    let start = crate::timer::get_time();
+    let timeout = crate::config::clock_freq().saturating_mul(2);
+    loop {
+        let observed = value.load(Ordering::Acquire);
+        if observed.bits() & expected.bits() == expected.bits() {
+            return;
+        }
+        if crate::timer::get_time().wrapping_sub(start) >= timeout {
+            panic!(
+                "TLB cross-probe {what} timeout: expected={:#x} observed={:#x}",
+                expected.bits(),
+                observed.bits()
+            );
+        }
+        core::hint::spin_loop();
     }
 }
 
@@ -1080,5 +1204,8 @@ fn run_phase2_probe_on_cpu(logical_id: CpuId) {
 pub fn run_pending_parked_probe(logical_id: CpuId) {
     if PHASE2_PROBE_PENDING[logical_id].swap(false, Ordering::AcqRel) {
         run_phase2_probe_on_cpu(logical_id);
+    }
+    if TLB_CROSS_RUN_PENDING[logical_id].swap(false, Ordering::AcqRel) {
+        run_tlb_cross_probe_on_cpu(logical_id);
     }
 }
