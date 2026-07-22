@@ -1,8 +1,6 @@
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use riscv::register::satp;
-
-use crate::config::MAX_CPUS;
 
 const SV39_MODE: usize = 8;
 const SATP_ASID_SHIFT: usize = 44;
@@ -19,41 +17,7 @@ const ASID_SUPPORT_NO: usize = 0;
 const ASID_SUPPORT_YES: usize = 1;
 const ASID_SUPPORT_UNKNOWN: usize = 2;
 
-// ASID allocation starts at 1. On wrap, the allocator globally fences before
-// reusing tag 1 so stale per-address-space TLB entries cannot survive under a
-// recycled ASID.
-static NEXT_ASID: AtomicUsize = AtomicUsize::new(1);
 static ASID_SUPPORT: AtomicUsize = AtomicUsize::new(ASID_SUPPORT_UNKNOWN);
-#[repr(C, align(64))]
-struct CpuMmuFastState {
-    last_return_user_token: AtomicUsize,
-    last_entry_kernel_token: AtomicUsize,
-    return_tlb_dirty: AtomicBool,
-    kernel_tlb_dirty: AtomicBool,
-}
-
-impl CpuMmuFastState {
-    const fn new() -> Self {
-        Self {
-            last_return_user_token: AtomicUsize::new(0),
-            last_entry_kernel_token: AtomicUsize::new(0),
-            return_tlb_dirty: AtomicBool::new(true),
-            kernel_tlb_dirty: AtomicBool::new(true),
-        }
-    }
-}
-
-static CPU_MMU_FAST_STATE: [CpuMmuFastState; MAX_CPUS] =
-    [const { CpuMmuFastState::new() }; MAX_CPUS];
-
-fn current_fast_state() -> &'static CpuMmuFastState {
-    &CPU_MMU_FAST_STATE[crate::cpu::current_id()]
-}
-
-pub fn fast_state_ptr(cpu: usize) -> usize {
-    assert!(cpu < MAX_CPUS, "MMU fast-state CPU exceeds MAX_CPUS");
-    &CPU_MMU_FAST_STATE[cpu] as *const CpuMmuFastState as usize
-}
 
 pub fn page_table_token_with_asid(root_ppn: usize, asid: usize) -> usize {
     SV39_MODE << 60 | ((asid & SATP_ASID_MAX) << SATP_ASID_SHIFT) | (root_ppn & SATP_PPN_MASK)
@@ -68,17 +32,10 @@ pub fn page_table_asid(token: usize) -> usize {
 }
 
 pub fn alloc_page_table_asid() -> usize {
-    let asid = NEXT_ASID.fetch_add(1, Ordering::Relaxed);
-    if asid == 0 || asid > SATP_ASID_MAX {
-        NEXT_ASID.store(2, Ordering::Relaxed);
-        mark_return_tlb_dirty();
-        unsafe {
-            asm!("sfence.vma");
-        }
-        1
-    } else {
-        asid
-    }
+    // CONTEXT: Keep ASID 0 until Phase 5 adds a global ASID generation and
+    // acknowledged all-CPU rollover. Reusing a tag after only a local fence
+    // would permit a remote CPU to retain a stale translation.
+    0
 }
 
 pub fn activate_page_table(token: usize) {
@@ -104,11 +61,9 @@ pub fn should_flush_tlb_on_return(user_token: usize) -> bool {
     if !asid_supported() {
         return true;
     }
-    let state = current_fast_state();
-    let previous = state
-        .last_return_user_token
-        .swap(user_token, Ordering::Relaxed);
-    let dirty = state.return_tlb_dirty.swap(false, Ordering::Relaxed);
+    let state = crate::cpu::current().mmu();
+    let previous = state.swap_last_return_user_token(user_token);
+    let dirty = state.take_return_tlb_dirty();
     previous != user_token || dirty
 }
 
@@ -116,24 +71,18 @@ pub fn should_flush_tlb_on_kernel_entry(kernel_token: usize) -> bool {
     if !asid_supported() {
         return true;
     }
-    let state = current_fast_state();
-    let previous = state
-        .last_entry_kernel_token
-        .swap(kernel_token, Ordering::Relaxed);
-    let dirty = state.kernel_tlb_dirty.swap(false, Ordering::Relaxed);
+    let state = crate::cpu::current().mmu();
+    let previous = state.swap_last_entry_kernel_token(kernel_token);
+    let dirty = state.take_kernel_tlb_dirty();
     previous != kernel_token || dirty
 }
 
 pub fn mark_kernel_tlb_dirty() {
-    current_fast_state()
-        .kernel_tlb_dirty
-        .store(true, Ordering::Relaxed);
+    crate::cpu::current().mmu().mark_kernel_tlb_dirty();
 }
 
 fn mark_return_tlb_dirty() {
-    current_fast_state()
-        .return_tlb_dirty
-        .store(true, Ordering::Relaxed);
+    crate::cpu::current().mmu().mark_return_tlb_dirty();
 }
 
 fn asid_supported() -> bool {

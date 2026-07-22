@@ -7,11 +7,10 @@ use core::mem::{MaybeUninit, size_of};
 use super::SyscallContext;
 use super::errno::{SysError, SysResult};
 
-// These knobs affect only allocation/cache behavior for small ABI values. The
-// fast path still goes through checked_user_pte(), so permissions, COW, and
-// optional fault-in semantics must match the multi-page copy path.
+// This limit affects only allocation behavior for small ABI values. The fast
+// path still goes through checked_user_pte(), so permissions, COW, and optional
+// fault-in semantics must match the multi-page copy path.
 const USER_COPY_SAME_PAGE_FAST_MAX: usize = 64;
-const USER_COPY_LEAF_PTE_CACHE: bool = true;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UserBufferAccess {
@@ -261,14 +260,7 @@ fn translated_byte_buffer_checked_with_resolver(
     let page_table = PageTable::from_token(token);
     let start_va = VirtAddr::from(start);
     if start_va.floor() == VirtAddr::from(end - 1).floor() {
-        let pte = checked_user_pte(
-            &page_table,
-            token,
-            start,
-            access,
-            fault_handler,
-            USER_COPY_LEAF_PTE_CACHE,
-        )?;
+        let pte = checked_user_pte(&page_table, token, start, access, fault_handler)?;
         let offset = start_va.page_offset();
         let mut buffers = Vec::with_capacity(1);
         buffers.push(&mut pte.ppn().get_bytes_array()[offset..offset + len]);
@@ -279,7 +271,7 @@ fn translated_byte_buffer_checked_with_resolver(
     while start < end {
         let start_va = VirtAddr::from(start);
         let mut vpn = start_va.floor();
-        let pte = checked_user_pte(&page_table, token, start, access, fault_handler, false)?;
+        let pte = checked_user_pte(&page_table, token, start, access, fault_handler)?;
         let ppn = pte.ppn();
         vpn.step();
         let mut end_va: VirtAddr = vpn.into();
@@ -301,19 +293,12 @@ fn checked_user_pte(
     addr: usize,
     access: UserBufferAccess,
     fault_handler: UserFaultResolver<'_>,
-    use_leaf_cache: bool,
 ) -> SysResult<crate::mm::PageTableEntry> {
     // Passing a fault handler means the copy is allowed to mutate the current
     // process mappings by resolving lazy mmap/COW faults. Cross-address-space
     // copies should use the explicit MemorySet helpers instead.
     let vpn = VirtAddr::from(addr).floor();
-    let translate = |page_table: &PageTable| {
-        if use_leaf_cache {
-            page_table.translate_cached_user_leaf(token, vpn)
-        } else {
-            page_table.translate(vpn)
-        }
-    };
+    let translate = |page_table: &PageTable| page_table.translate(vpn);
     let mut pte = match translate(page_table) {
         Some(pte) => pte,
         None => {
@@ -368,14 +353,7 @@ fn try_same_page_user_slice(
         return None;
     }
     let page_table = PageTable::from_token(token);
-    let pte = match checked_user_pte(
-        &page_table,
-        token,
-        start,
-        access,
-        fault_handler,
-        USER_COPY_LEAF_PTE_CACHE,
-    ) {
+    let pte = match checked_user_pte(&page_table, token, start, access, fault_handler) {
         Ok(pte) => pte,
         Err(err) => return Some(Err(err)),
     };

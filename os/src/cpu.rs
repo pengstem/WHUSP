@@ -39,6 +39,57 @@ pub struct CpuLocal {
     logical_id: AtomicUsize,
     hardware_id: AtomicUsize,
     installed: AtomicBool,
+    mmu: CpuMmuFastState,
+}
+
+#[repr(C)]
+pub(crate) struct CpuMmuFastState {
+    last_return_user_token: AtomicUsize,
+    #[cfg(target_arch = "riscv64")]
+    last_entry_kernel_token: AtomicUsize,
+    return_tlb_dirty: AtomicBool,
+    #[cfg(target_arch = "riscv64")]
+    kernel_tlb_dirty: AtomicBool,
+}
+
+impl CpuMmuFastState {
+    const fn new() -> Self {
+        Self {
+            last_return_user_token: AtomicUsize::new(0),
+            #[cfg(target_arch = "riscv64")]
+            last_entry_kernel_token: AtomicUsize::new(0),
+            return_tlb_dirty: AtomicBool::new(true),
+            #[cfg(target_arch = "riscv64")]
+            kernel_tlb_dirty: AtomicBool::new(true),
+        }
+    }
+
+    pub(crate) fn swap_last_return_user_token(&self, token: usize) -> usize {
+        self.last_return_user_token.swap(token, Ordering::Relaxed)
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub(crate) fn swap_last_entry_kernel_token(&self, token: usize) -> usize {
+        self.last_entry_kernel_token.swap(token, Ordering::Relaxed)
+    }
+
+    pub(crate) fn take_return_tlb_dirty(&self) -> bool {
+        self.return_tlb_dirty.swap(false, Ordering::Relaxed)
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub(crate) fn take_kernel_tlb_dirty(&self) -> bool {
+        self.kernel_tlb_dirty.swap(false, Ordering::Relaxed)
+    }
+
+    pub(crate) fn mark_return_tlb_dirty(&self) {
+        self.return_tlb_dirty.store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub(crate) fn mark_kernel_tlb_dirty(&self) {
+        self.kernel_tlb_dirty.store(true, Ordering::Relaxed);
+    }
 }
 
 impl CpuLocal {
@@ -47,6 +98,7 @@ impl CpuLocal {
             logical_id: AtomicUsize::new(usize::MAX),
             hardware_id: AtomicUsize::new(usize::MAX),
             installed: AtomicBool::new(false),
+            mmu: CpuMmuFastState::new(),
         }
     }
 
@@ -56,6 +108,14 @@ impl CpuLocal {
 
     pub fn hardware_id(&self) -> usize {
         self.hardware_id.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn mmu(&self) -> &CpuMmuFastState {
+        &self.mmu
+    }
+
+    fn mmu_ptr(&self) -> usize {
+        &self.mmu as *const CpuMmuFastState as usize
     }
 }
 
@@ -683,7 +743,7 @@ fn log_online_cpus() {
             CPU_BOOT_LOCALS[logical_id].state_name(),
             &CPU_LOCALS[logical_id] as *const CpuLocal as usize,
             crate::task::processor_slot_ptr(logical_id),
-            crate::arch::mm::fast_state_ptr(logical_id),
+            CPU_LOCALS[logical_id].mmu_ptr(),
         );
     }
     let online = online_mask();

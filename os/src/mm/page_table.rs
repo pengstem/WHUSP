@@ -4,7 +4,6 @@ use crate::perf;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,38 +27,6 @@ bitflags! {
 #[repr(C)]
 pub struct PageTableEntry {
     pub bits: usize,
-}
-
-static USER_LEAF_PTE_CACHE_VALID: AtomicBool = AtomicBool::new(false);
-static USER_LEAF_PTE_CACHE_TOKEN: AtomicUsize = AtomicUsize::new(0);
-static USER_LEAF_PTE_CACHE_VPN: AtomicUsize = AtomicUsize::new(0);
-static USER_LEAF_PTE_CACHE_BITS: AtomicUsize = AtomicUsize::new(0);
-
-pub(crate) fn invalidate_user_leaf_pte_cache() {
-    if USER_LEAF_PTE_CACHE_VALID.swap(false, Ordering::Relaxed) {
-        perf::record_usercopy_leaf_pte_cache_invalidation();
-    }
-}
-
-fn cached_user_leaf_pte(token: usize, vpn: VirtPageNum) -> Option<PageTableEntry> {
-    if USER_LEAF_PTE_CACHE_VALID.load(Ordering::Relaxed)
-        && USER_LEAF_PTE_CACHE_TOKEN.load(Ordering::Relaxed) == token
-        && USER_LEAF_PTE_CACHE_VPN.load(Ordering::Relaxed) == vpn.0
-    {
-        perf::record_usercopy_leaf_pte_cache_hit();
-        return Some(PageTableEntry {
-            bits: USER_LEAF_PTE_CACHE_BITS.load(Ordering::Relaxed),
-        });
-    }
-    perf::record_usercopy_leaf_pte_cache_miss();
-    None
-}
-
-fn store_user_leaf_pte_cache(token: usize, vpn: VirtPageNum, pte: PageTableEntry) {
-    USER_LEAF_PTE_CACHE_BITS.store(pte.bits, Ordering::Relaxed);
-    USER_LEAF_PTE_CACHE_TOKEN.store(token, Ordering::Relaxed);
-    USER_LEAF_PTE_CACHE_VPN.store(vpn.0, Ordering::Relaxed);
-    USER_LEAF_PTE_CACHE_VALID.store(true, Ordering::Relaxed);
 }
 
 impl PageTableEntry {
@@ -139,7 +106,7 @@ impl PageTable {
         let mut ppn = self.root_ppn;
         let mut result: Option<&mut PageTableEntry> = None;
         for (i, idx) in idxs.iter().enumerate() {
-            let pte = &mut ppn.get_pte_array()[*idx];
+            let pte = &mut ppn.get_pte_array_mut()[*idx];
             if i == 2 {
                 result = Some(pte);
                 break;
@@ -154,12 +121,29 @@ impl PageTable {
         }
         result
     }
-    fn find_pte(&self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
+    fn find_pte(&self, vpn: VirtPageNum) -> Option<&PageTableEntry> {
+        let idxs = vpn.indexes();
+        let mut ppn = self.root_ppn;
+        let mut result: Option<&PageTableEntry> = None;
+        for (i, idx) in idxs.iter().enumerate() {
+            let pte = &ppn.get_pte_array()[*idx];
+            if i == 2 {
+                result = Some(pte);
+                break;
+            }
+            if !pte.is_valid() {
+                return None;
+            }
+            ppn = pte.ppn();
+        }
+        result
+    }
+    fn find_pte_mut(&mut self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
         let idxs = vpn.indexes();
         let mut ppn = self.root_ppn;
         let mut result: Option<&mut PageTableEntry> = None;
         for (i, idx) in idxs.iter().enumerate() {
-            let pte = &mut ppn.get_pte_array()[*idx];
+            let pte = &mut ppn.get_pte_array_mut()[*idx];
             if i == 2 {
                 result = Some(pte);
                 break;
@@ -185,22 +169,20 @@ impl PageTable {
             flags
         };
         *pte = PageTableEntry::new(ppn, flags);
-        invalidate_user_leaf_pte_cache();
         true
     }
     pub fn unmap(&mut self, vpn: VirtPageNum) {
         let pte = self
-            .find_pte(vpn)
+            .find_pte_mut(vpn)
             .expect("unmap requires an existing page-table path");
         assert!(
             pte.is_valid() || pte.bits != 0,
             "vpn {vpn:?} is invalid before unmapping"
         );
         *pte = PageTableEntry::empty();
-        invalidate_user_leaf_pte_cache();
     }
     pub fn remap_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
-        let Some(pte) = self.find_pte(vpn) else {
+        let Some(pte) = self.find_pte_mut(vpn) else {
             return false;
         };
         if !pte.is_valid() && pte.bits == 0 {
@@ -213,15 +195,13 @@ impl PageTable {
             flags
         };
         *pte = PageTableEntry::new(pte.ppn(), flags);
-        invalidate_user_leaf_pte_cache();
         true
     }
     pub fn clear_leaf(&mut self, vpn: VirtPageNum) -> bool {
-        let Some(pte) = self.find_pte(vpn) else {
+        let Some(pte) = self.find_pte_mut(vpn) else {
             return false;
         };
         *pte = PageTableEntry::empty();
-        invalidate_user_leaf_pte_cache();
         true
     }
     pub fn clear_leaf_create_path(&mut self, vpn: VirtPageNum) -> bool {
@@ -229,11 +209,10 @@ impl PageTable {
             return false;
         };
         *pte = PageTableEntry::empty();
-        invalidate_user_leaf_pte_cache();
         true
     }
     pub fn mark_cow_readonly(&mut self, vpn: VirtPageNum) -> bool {
-        let Some(pte) = self.find_pte(vpn) else {
+        let Some(pte) = self.find_pte_mut(vpn) else {
             return false;
         };
         if !pte.is_valid() || pte.bits == 0 {
@@ -249,11 +228,10 @@ impl PageTable {
         flags.remove(PTEFlags::W);
         flags.insert(PTEFlags::COW);
         *pte = PageTableEntry::new(pte.ppn(), flags);
-        invalidate_user_leaf_pte_cache();
         true
     }
     pub fn restore_write_clear_cow(&mut self, vpn: VirtPageNum) -> bool {
-        let Some(pte) = self.find_pte(vpn) else {
+        let Some(pte) = self.find_pte_mut(vpn) else {
             return false;
         };
         if !pte.is_valid() || pte.bits == 0 || !pte.cow() {
@@ -263,11 +241,10 @@ impl PageTable {
         flags.remove(PTEFlags::COW);
         flags.insert(PTEFlags::W);
         *pte = PageTableEntry::new(pte.ppn(), flags);
-        invalidate_user_leaf_pte_cache();
         true
     }
     pub fn replace_leaf(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
-        let Some(pte) = self.find_pte(vpn) else {
+        let Some(pte) = self.find_pte_mut(vpn) else {
             return false;
         };
         if !pte.is_valid() || pte.bits == 0 {
@@ -280,23 +257,10 @@ impl PageTable {
             flags
         };
         *pte = PageTableEntry::new(ppn, flags);
-        invalidate_user_leaf_pte_cache();
         true
     }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_pte(vpn).map(|pte| *pte)
-    }
-    pub fn translate_cached_user_leaf(
-        &self,
-        token: usize,
-        vpn: VirtPageNum,
-    ) -> Option<PageTableEntry> {
-        if let Some(pte) = cached_user_leaf_pte(token, vpn) {
-            return Some(pte);
-        }
-        let pte = self.translate(vpn)?;
-        store_user_leaf_pte_cache(token, vpn, pte);
-        Some(pte)
     }
     pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {
         self.find_pte(va.clone().floor()).map(|pte| {

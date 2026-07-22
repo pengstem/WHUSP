@@ -175,7 +175,13 @@ impl PhysAddr {
     }
 }
 impl PhysPageNum {
-    pub fn get_pte_array(&self) -> &'static mut [PageTableEntry] {
+    pub fn get_pte_array(&self) -> &'static [PageTableEntry] {
+        let pa: PhysAddr = (*self).into();
+        unsafe {
+            core::slice::from_raw_parts(arch_mm::phys_to_virt(pa.0) as *const PageTableEntry, 512)
+        }
+    }
+    pub fn get_pte_array_mut(&self) -> &'static mut [PageTableEntry] {
         let pa: PhysAddr = (*self).into();
         unsafe {
             core::slice::from_raw_parts_mut(arch_mm::phys_to_virt(pa.0) as *mut PageTableEntry, 512)

@@ -1,7 +1,4 @@
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-use crate::config::MAX_CPUS;
 
 pub const VIRT_ADDR_START: usize = 0x9000_0000_0000_0000;
 const DIRECT_MAP_MASK: usize = 0xf000_0000_0000_0000;
@@ -25,33 +22,6 @@ const LA_PTE_COW: usize = 1 << 58;
 // means read or execute permission is allowed.
 const LA_PTE_NR: usize = 1 << 61;
 const LA_PTE_NX: usize = 1 << 62;
-
-#[repr(C, align(64))]
-struct CpuMmuFastState {
-    last_return_user_token: AtomicUsize,
-    return_tlb_dirty: AtomicBool,
-}
-
-impl CpuMmuFastState {
-    const fn new() -> Self {
-        Self {
-            last_return_user_token: AtomicUsize::new(0),
-            return_tlb_dirty: AtomicBool::new(true),
-        }
-    }
-}
-
-static CPU_MMU_FAST_STATE: [CpuMmuFastState; MAX_CPUS] =
-    [const { CpuMmuFastState::new() }; MAX_CPUS];
-
-fn current_fast_state() -> &'static CpuMmuFastState {
-    &CPU_MMU_FAST_STATE[crate::cpu::current_id()]
-}
-
-pub fn fast_state_ptr(cpu: usize) -> usize {
-    assert!(cpu < MAX_CPUS, "MMU fast-state CPU exceeds MAX_CPUS");
-    &CPU_MMU_FAST_STATE[cpu] as *const CpuMmuFastState as usize
-}
 
 pub fn page_table_token(root_ppn: usize) -> usize {
     root_ppn << crate::config::PAGE_SIZE_BITS
@@ -112,11 +82,9 @@ pub fn flush_tlb_page(va: usize) {
 pub fn should_flush_tlb_on_return(user_token: usize) -> bool {
     // The current LA64 path has no ASID allocation, so returning to a different
     // page-table root or after any PTE edit must request a guest TLB flush.
-    let state = current_fast_state();
-    let previous = state
-        .last_return_user_token
-        .swap(user_token, Ordering::Relaxed);
-    let dirty = state.return_tlb_dirty.swap(false, Ordering::Relaxed);
+    let state = crate::cpu::current().mmu();
+    let previous = state.swap_last_return_user_token(user_token);
+    let dirty = state.take_return_tlb_dirty();
     previous != user_token || dirty
 }
 
@@ -128,9 +96,7 @@ pub fn should_flush_tlb_on_kernel_entry(_kernel_token: usize) -> bool {
 pub fn mark_kernel_tlb_dirty() {}
 
 fn mark_return_tlb_dirty() {
-    current_fast_state()
-        .return_tlb_dirty
-        .store(true, Ordering::Relaxed);
+    crate::cpu::current().mmu().mark_return_tlb_dirty();
 }
 
 pub fn publish_pte_barrier() {
