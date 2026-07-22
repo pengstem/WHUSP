@@ -8,6 +8,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use lazy_static::*;
+use log::info;
 
 const RT_PRIORITY_MAX: usize = 99;
 const RT_QUEUE_COUNT: usize = RT_PRIORITY_MAX + 1;
@@ -650,6 +651,7 @@ pub(super) fn fetch_task() -> Option<Arc<TaskControlBlock>> {
         if let Some((task, source_min)) = stolen {
             let target_min = with_run_queue(cpu, |manager| manager.min_vruntime());
             task.migrate_sched_vruntime(source_min, target_min);
+            super::smp_probe::record_cpu_probe_steal();
             return Some(task);
         }
     }
@@ -691,8 +693,31 @@ pub(crate) fn migrate_ready_task(task: Arc<TaskControlBlock>) {
         migrate_ready_task_locked(&mut source_queue, &mut target_queue, task)
     };
     if moved {
+        super::smp_probe::record_cpu_probe_migration();
         crate::cpu::wake_scheduler_cpu(crate::cpu::CpuMask::single(target));
     }
+}
+
+/// Take one ordered snapshot of every possible CPU's ready queue.
+///
+/// This is a bounded phase-gate assertion, not a scheduler hot path. Holding
+/// every queue in ascending CPU-ID order prevents a concurrent steal or
+/// affinity migration from making an empty snapshot appear accidentally.
+pub(super) fn assert_run_queues_drained() {
+    let cpu_count = crate::cpu::topology().possible_count();
+    let mut queues = Vec::with_capacity(cpu_count);
+    for cpu in 0..cpu_count {
+        queues.push(RUN_QUEUES[cpu].lock());
+    }
+    let ready = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+        queues.get(cpu).map_or(0, |queue| queue.ready_len())
+    });
+    let total = ready[..cpu_count].iter().sum::<usize>();
+    info!(
+        "smp run-queue drain: ready={:?} total={total}",
+        &ready[..cpu_count]
+    );
+    assert_eq!(total, 0, "Phase 6 gate found runnable tasks on run queues");
 }
 
 fn migrate_ready_task_locked(

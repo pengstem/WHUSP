@@ -738,6 +738,7 @@ pub(crate) fn request_scheduler_preemption(targets: CpuMask) {
         crate::arch::smp::send_ipi(cpu).unwrap_or_else(|error| {
             panic!("scheduler preemption IPI to CPU {cpu} failed: {error:#x}")
         });
+        crate::task::record_smp_cpu_probe_scheduler_preemption_ipi();
     }
 }
 

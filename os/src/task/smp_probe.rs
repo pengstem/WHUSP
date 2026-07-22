@@ -25,6 +25,8 @@ struct CpuProbeCounters {
     local_wakes: AtomicUsize,
     remote_wakes: AtomicUsize,
     reschedule_ipis: AtomicUsize,
+    steals: AtomicUsize,
+    migrations: AtomicUsize,
     run_queue_accesses: AtomicUsize,
     run_queue_wait_ticks: AtomicUsize,
     run_queue_hold_ticks: AtomicUsize,
@@ -38,6 +40,8 @@ impl CpuProbeCounters {
             local_wakes: AtomicUsize::new(0),
             remote_wakes: AtomicUsize::new(0),
             reschedule_ipis: AtomicUsize::new(0),
+            steals: AtomicUsize::new(0),
+            migrations: AtomicUsize::new(0),
             run_queue_accesses: AtomicUsize::new(0),
             run_queue_wait_ticks: AtomicUsize::new(0),
             run_queue_hold_ticks: AtomicUsize::new(0),
@@ -50,6 +54,8 @@ impl CpuProbeCounters {
         self.local_wakes.store(0, Ordering::Relaxed);
         self.remote_wakes.store(0, Ordering::Relaxed);
         self.reschedule_ipis.store(0, Ordering::Relaxed);
+        self.steals.store(0, Ordering::Relaxed);
+        self.migrations.store(0, Ordering::Relaxed);
         self.run_queue_accesses.store(0, Ordering::Relaxed);
         self.run_queue_wait_ticks.store(0, Ordering::Relaxed);
         self.run_queue_hold_ticks.store(0, Ordering::Relaxed);
@@ -188,6 +194,30 @@ pub(crate) fn record_cpu_probe_scheduler_wake(remote: bool, sent_ipi: bool) {
     }
 }
 
+pub(crate) fn record_cpu_probe_scheduler_preemption_ipi() {
+    if cpu_probe_active() {
+        current_cpu_counters()
+            .reschedule_ipis
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_cpu_probe_steal() {
+    if cpu_probe_active() {
+        current_cpu_counters()
+            .steals
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_cpu_probe_migration() {
+    if cpu_probe_active() {
+        current_cpu_counters()
+            .migrations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn record_cpu_probe_run_queue(wait_ticks: usize, hold_ticks: usize) {
     if !cpu_probe_active() {
         return;
@@ -235,6 +265,12 @@ pub(super) fn record_cpu_probe_exit() {
             .reschedule_ipis
             .load(Ordering::Acquire)
     });
+    let steals = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+        CPU_PROBE_COUNTERS[cpu].steals.load(Ordering::Acquire)
+    });
+    let migrations = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+        CPU_PROBE_COUNTERS[cpu].migrations.load(Ordering::Acquire)
+    });
     let run_queue_accesses = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
         CPU_PROBE_COUNTERS[cpu]
             .run_queue_accesses
@@ -254,7 +290,7 @@ pub(super) fn record_cpu_probe_exit() {
         CPU_PROBE_COUNTERS[cpu].runnable_us.load(Ordering::Acquire)
     });
     info!(
-        "smp cpu-sentinel: sample={} workers={} clock_freq={} switches={:?} local_wakes={:?} remote_wakes={:?} resched_ipis={:?} rq_accesses={:?} rq_wait_ticks={:?} rq_hold_ticks={:?} runnable_us={:?}",
+        "smp cpu-sentinel: sample={} workers={} clock_freq={} switches={:?} local_wakes={:?} remote_wakes={:?} resched_ipis={:?} rq_accesses={:?} rq_wait_ticks={:?} rq_hold_ticks={:?} runnable_us={:?} steals={:?} migrations={:?}",
         CPU_PROBE_SAMPLE.load(Ordering::Acquire),
         expected,
         crate::config::clock_freq(),
@@ -266,6 +302,8 @@ pub(super) fn record_cpu_probe_exit() {
         &run_queue_wait_ticks[..cpu_count],
         &run_queue_hold_ticks[..cpu_count],
         &runnable_us[..cpu_count],
+        &steals[..cpu_count],
+        &migrations[..cpu_count],
     );
     CPU_PROBE_STATE.store(CPU_PROBE_INACTIVE, Ordering::Release);
 }

@@ -80,6 +80,7 @@ pub use signal::{
 #[cfg(target_arch = "riscv64")]
 pub use signal::{SIGRT_1, SIGRTMIN};
 pub(crate) use signal::{flags_to_linux_sigset, linux_sigset_to_flags};
+pub(crate) use smp_probe::record_cpu_probe_scheduler_preemption_ipi as record_smp_cpu_probe_scheduler_preemption_ipi;
 pub(crate) use smp_probe::record_cpu_probe_scheduler_wake as record_smp_cpu_probe_scheduler_wake;
 pub(crate) use smp_probe::record_yield_syscall as record_smp_probe_yield_syscall;
 pub(crate) use smp_probe::start_cpu_probe as start_smp_cpu_probe;

@@ -37,6 +37,10 @@ fn is_smp_cpu_probe_path(path: &str) -> bool {
     matches!(path, "/x1/smp-cpu-sentinel-rv" | "/x1/smp-cpu-sentinel-la")
 }
 
+fn is_smp_run_queue_drain_probe_path(path: &str) -> bool {
+    matches!(path, "/x1/smp-rq-drain-rv" | "/x1/smp-rq-drain-la")
+}
+
 fn is_smp_wait_io_probe_path(path: &str) -> bool {
     matches!(path, "/x1/smp-wait-io-rv" | "/x1/smp-wait-io-la")
 }
@@ -387,6 +391,7 @@ impl ProcessControlBlock {
     ) -> SysResult<()> {
         let smp_sched_probe = is_smp_sched_probe_path(&executable_path);
         let smp_cpu_probe = is_smp_cpu_probe_path(&executable_path);
+        let smp_run_queue_drain_probe = is_smp_run_queue_drain_probe_path(&executable_path);
         let smp_wait_io_probe = is_smp_wait_io_probe_path(&executable_path);
         let smp_phase4_wait_probe = is_smp_phase4_wait_probe_path(&executable_path);
         let current = current_task().ok_or(SysError::ESRCH)?;
@@ -513,6 +518,9 @@ impl ProcessControlBlock {
         }
         if smp_wait_io_probe {
             crate::task::start_smp_wait_io_probe();
+        }
+        if smp_run_queue_drain_probe {
+            super::manager::assert_run_queues_drained();
         }
         Ok(())
     }
