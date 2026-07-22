@@ -42,6 +42,56 @@ impl AddressSpaceControl {
     fn generation(&self) -> usize {
         self.tlb_generation.load(Ordering::SeqCst)
     }
+
+    pub(crate) fn invalidate_tlb_all(&self) {
+        crate::perf::record_tlb_flush_all();
+        self.invalidate_tlb_range_inner(0, usize::MAX);
+    }
+
+    pub(crate) fn invalidate_tlb_page(&self, virtual_address: usize) {
+        assert_eq!(
+            virtual_address % crate::config::PAGE_SIZE,
+            0,
+            "address-space TLB invalidation is not page aligned"
+        );
+        crate::perf::record_tlb_flush_range(1);
+        self.invalidate_tlb_range_inner(virtual_address, crate::config::PAGE_SIZE);
+    }
+
+    fn invalidate_tlb_range_inner(&self, start: usize, size: usize) {
+        // Publish the PTE writes before making the new generation visible.
+        // enter_cpu() and this snapshot are SeqCst: an enter ordered before
+        // the snapshot is targeted below, while an enter ordered afterward
+        // must observe this generation in prepare_user_return() and flush
+        // locally before executing user instructions.
+        crate::arch::mm::publish_pte_barrier();
+        let generation = self
+            .tlb_generation
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |generation| {
+                generation.checked_add(1)
+            })
+            .unwrap_or_else(|_| panic!("address-space TLB generation wrapped: id={}", self.id))
+            + 1;
+        assert_ne!(generation, 0, "address-space TLB generation is zero");
+
+        let active = self.active_cpus.load(Ordering::SeqCst);
+        let current = crate::cpu::current_id();
+        if active.contains(current) {
+            crate::arch::mm::flush_tlb_range(start, size);
+        }
+
+        let remote = CpuMask::from_bits(active.bits() & !CpuMask::single(current).bits());
+        if remote.bits() != 0 {
+            crate::arch::smp::remote_tlb_flush(remote, start, size).unwrap_or_else(|error| {
+                panic!(
+                    "address-space TLB shootdown failed: id={} generation={} targets={:#x} error={error:#x}",
+                    self.id,
+                    generation,
+                    remote.bits(),
+                )
+            });
+        }
+    }
 }
 
 impl Drop for AddressSpaceControl {

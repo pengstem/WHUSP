@@ -77,6 +77,14 @@ impl MemorySet {
     pub(crate) fn address_space_control(&self) -> Arc<AddressSpaceControl> {
         Arc::clone(&self.control)
     }
+
+    pub(super) fn invalidate_tlb_all(&self) {
+        self.control.invalidate_tlb_all();
+    }
+
+    pub(super) fn invalidate_tlb_page(&self, virtual_address: usize) {
+        self.control.invalidate_tlb_page(virtual_address);
+    }
     /// Maps kernel-private framed pages without clearing the new frames.
     ///
     /// Callers must only use this for mappings that are never readable from

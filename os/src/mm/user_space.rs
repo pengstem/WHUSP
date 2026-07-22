@@ -483,7 +483,7 @@ impl MemorySet {
             // Parent PTEs were downgraded in place for COW while building the
             // child. Flush once before fork returns so the parent cannot keep
             // stale writable translations after the child becomes runnable.
-            flush_tlb_all_recorded();
+            user_space.invalidate_tlb_all();
         }
         Some(memory_set)
     }
@@ -543,7 +543,7 @@ impl MemorySet {
             if !self.page_table.restore_write_clear_cow(vpn) {
                 return false;
             }
-            arch_mm::flush_tlb_page(usize::from(VirtAddr::from(vpn)));
+            self.invalidate_tlb_page(usize::from(VirtAddr::from(vpn)));
             return true;
         }
 
@@ -561,8 +561,14 @@ impl MemorySet {
         if !self.page_table.replace_leaf(vpn, ppn, flags) {
             return false;
         }
-        self.areas[area_idx].data_frames.insert(vpn, frame);
-        arch_mm::flush_tlb_page(usize::from(VirtAddr::from(vpn)));
+        let retired_frame = self.areas[area_idx]
+            .data_frames
+            .insert(vpn, frame)
+            .expect("COW replacement lost ownership of the old frame");
+        self.invalidate_tlb_page(usize::from(VirtAddr::from(vpn)));
+        // The old mapping may remain in an active CPU's TLB until the
+        // synchronous shootdown above completes. Retain its frame until then.
+        drop(retired_frame);
         true
     }
 
