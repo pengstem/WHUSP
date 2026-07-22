@@ -39,6 +39,7 @@ const FILESYSTEMS_INO: u32 = 30;
 const MEMINFO_INO: u32 = 4;
 const UPTIME_INO: u32 = 5;
 const CPUINFO_INO: u32 = 6;
+const STAT_INO: u32 = 67;
 const SYS_DIR_INO: u32 = 7;
 const SYS_KERNEL_DIR_INO: u32 = 8;
 const PID_MAX_INO: u32 = 9;
@@ -235,6 +236,7 @@ enum ProcNode {
     Meminfo,
     Uptime,
     Cpuinfo,
+    Stat,
     SysDir,
     SysKernelDir,
     SysKernelKeysDir,
@@ -551,6 +553,7 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         MEMINFO_INO => Some(ProcNode::Meminfo),
         UPTIME_INO => Some(ProcNode::Uptime),
         CPUINFO_INO => Some(ProcNode::Cpuinfo),
+        STAT_INO => Some(ProcNode::Stat),
         SYS_DIR_INO => Some(ProcNode::SysDir),
         SYS_KERNEL_DIR_INO => Some(ProcNode::SysKernelDir),
         SYS_KERNEL_KEYS_DIR_INO => Some(ProcNode::SysKernelKeysDir),
@@ -753,6 +756,11 @@ fn root_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: CPUINFO_INO,
         name: "cpuinfo".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: STAT_INO,
+        name: "stat".into(),
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
@@ -1681,6 +1689,24 @@ fn cpuinfo_content() -> String {
     content
 }
 
+fn stat_content() -> String {
+    // UNFINISHED: Per-CPU accounting is not wired into procfs yet, so the
+    // counters remain zero. The CPU rows themselves truthfully describe the
+    // online logical CPU set and let libc discover SMP topology.
+    let topology = crate::cpu::topology();
+    let online = crate::cpu::online_mask();
+    let mut content = String::from("cpu  0 0 0 0 0 0 0 0 0 0\n");
+    for logical_id in 0..topology.possible_count() {
+        if online.contains(logical_id) {
+            content.push_str(&format!("cpu{logical_id} 0 0 0 0 0 0 0 0 0 0\n"));
+        }
+    }
+    content.push_str(
+        "intr 0\nctxt 0\nbtime 0\nprocesses 0\nprocs_running 0\nprocs_blocked 0\nsoftirq 0\n",
+    );
+    content
+}
+
 fn proc_io_content() -> String {
     let read_bytes = if PROC_IO_READAHEAD_SUPPRESS_READS.load(Ordering::Relaxed) > 0 {
         PROC_IO_READAHEAD_SUPPRESS_READS.fetch_sub(1, Ordering::Relaxed);
@@ -2476,6 +2502,7 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::Meminfo => Ok(meminfo_content().into_bytes()),
         ProcNode::Uptime => Ok(uptime_content().into_bytes()),
         ProcNode::Cpuinfo => Ok(cpuinfo_content().into_bytes()),
+        ProcNode::Stat => Ok(stat_content().into_bytes()),
         ProcNode::Version => Ok(b"Linux version 6.8.0-whusp (oskernel2026)\n".to_vec()),
         ProcNode::ConfigGz => Ok(PROC_CONFIG_GZ.to_vec()),
         ProcNode::OsKernelPerf => Ok(oskernel_perf_content().into_bytes()),
@@ -2700,6 +2727,7 @@ impl FileSystemBackend for ProcFs {
                 "meminfo" => Ok((MEMINFO_INO, FsNodeKind::RegularFile)),
                 "uptime" => Ok((UPTIME_INO, FsNodeKind::RegularFile)),
                 "cpuinfo" => Ok((CPUINFO_INO, FsNodeKind::RegularFile)),
+                "stat" => Ok((STAT_INO, FsNodeKind::RegularFile)),
                 "version" => Ok((VERSION_INO, FsNodeKind::RegularFile)),
                 "config.gz" => Ok((CONFIG_GZ_INO, FsNodeKind::RegularFile)),
                 "sys" => Ok((SYS_DIR_INO, FsNodeKind::Directory)),

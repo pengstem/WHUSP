@@ -56,6 +56,15 @@ enum StaticNode {
     SysCpuOnline,
     SysCpuPossible,
     SysCpuPresent,
+    SysCpuKernelMax,
+    SysCpu0Dir,
+    SysCpu1Dir,
+    SysCpu2Dir,
+    SysCpu3Dir,
+    SysCpu4Dir,
+    SysCpu5Dir,
+    SysCpu6Dir,
+    SysCpu7Dir,
     SysDevicesVirtualDir,
     SysDevicesVirtualInputDir,
     SysInput0Dir,
@@ -140,6 +149,31 @@ fn lookup_absolute(path: &str) -> Option<StaticNode> {
         "/sys/devices/system/cpu/online" => Some(StaticNode::SysCpuOnline),
         "/sys/devices/system/cpu/possible" => Some(StaticNode::SysCpuPossible),
         "/sys/devices/system/cpu/present" => Some(StaticNode::SysCpuPresent),
+        "/sys/devices/system/cpu/kernel_max" => Some(StaticNode::SysCpuKernelMax),
+        "/sys/devices/system/cpu/cpu0" | "/sys/devices/system/cpu/cpu0/" => {
+            Some(StaticNode::SysCpu0Dir)
+        }
+        "/sys/devices/system/cpu/cpu1" | "/sys/devices/system/cpu/cpu1/" => {
+            Some(StaticNode::SysCpu1Dir)
+        }
+        "/sys/devices/system/cpu/cpu2" | "/sys/devices/system/cpu/cpu2/" => {
+            Some(StaticNode::SysCpu2Dir)
+        }
+        "/sys/devices/system/cpu/cpu3" | "/sys/devices/system/cpu/cpu3/" => {
+            Some(StaticNode::SysCpu3Dir)
+        }
+        "/sys/devices/system/cpu/cpu4" | "/sys/devices/system/cpu/cpu4/" => {
+            Some(StaticNode::SysCpu4Dir)
+        }
+        "/sys/devices/system/cpu/cpu5" | "/sys/devices/system/cpu/cpu5/" => {
+            Some(StaticNode::SysCpu5Dir)
+        }
+        "/sys/devices/system/cpu/cpu6" | "/sys/devices/system/cpu/cpu6/" => {
+            Some(StaticNode::SysCpu6Dir)
+        }
+        "/sys/devices/system/cpu/cpu7" | "/sys/devices/system/cpu/cpu7/" => {
+            Some(StaticNode::SysCpu7Dir)
+        }
         "/sys/devices/virtual" | "/sys/devices/virtual/" => Some(StaticNode::SysDevicesVirtualDir),
         "/sys/devices/virtual/input" | "/sys/devices/virtual/input/" => {
             Some(StaticNode::SysDevicesVirtualInputDir)
@@ -205,6 +239,15 @@ fn canonical_path(node: StaticNode) -> &'static str {
         StaticNode::SysCpuOnline => "/sys/devices/system/cpu/online",
         StaticNode::SysCpuPossible => "/sys/devices/system/cpu/possible",
         StaticNode::SysCpuPresent => "/sys/devices/system/cpu/present",
+        StaticNode::SysCpuKernelMax => "/sys/devices/system/cpu/kernel_max",
+        StaticNode::SysCpu0Dir => "/sys/devices/system/cpu/cpu0",
+        StaticNode::SysCpu1Dir => "/sys/devices/system/cpu/cpu1",
+        StaticNode::SysCpu2Dir => "/sys/devices/system/cpu/cpu2",
+        StaticNode::SysCpu3Dir => "/sys/devices/system/cpu/cpu3",
+        StaticNode::SysCpu4Dir => "/sys/devices/system/cpu/cpu4",
+        StaticNode::SysCpu5Dir => "/sys/devices/system/cpu/cpu5",
+        StaticNode::SysCpu6Dir => "/sys/devices/system/cpu/cpu6",
+        StaticNode::SysCpu7Dir => "/sys/devices/system/cpu/cpu7",
         StaticNode::SysDevicesVirtualDir => "/sys/devices/virtual",
         StaticNode::SysDevicesVirtualInputDir => "/sys/devices/virtual/input",
         StaticNode::SysInput0Dir => "/sys/devices/virtual/input/input0",
@@ -246,6 +289,9 @@ fn content(node: StaticNode) -> Option<Vec<u8>> {
         StaticNode::SysCpuOnline => Some(cpu_list_content(crate::cpu::online_mask())),
         StaticNode::SysCpuPossible | StaticNode::SysCpuPresent => {
             Some(cpu_list_content(crate::cpu::topology().possible_mask()))
+        }
+        StaticNode::SysCpuKernelMax => {
+            Some(format!("{}\n", crate::config::MAX_CPUS - 1).into_bytes())
         }
         StaticNode::ProcBusInputDevices => Some(PROC_BUS_INPUT_DEVICES.to_vec()),
         StaticNode::SysInput0Name => Some(SYS_INPUT0_NAME.to_vec()),
@@ -314,6 +360,14 @@ fn content(node: StaticNode) -> Option<Vec<u8>> {
         | StaticNode::SysDevicesDir
         | StaticNode::SysDevicesSystemDir
         | StaticNode::SysCpuDir
+        | StaticNode::SysCpu0Dir
+        | StaticNode::SysCpu1Dir
+        | StaticNode::SysCpu2Dir
+        | StaticNode::SysCpu3Dir
+        | StaticNode::SysCpu4Dir
+        | StaticNode::SysCpu5Dir
+        | StaticNode::SysCpu6Dir
+        | StaticNode::SysCpu7Dir
         | StaticNode::SysDevicesVirtualDir
         | StaticNode::SysDevicesVirtualInputDir
         | StaticNode::SysInput0Dir => None,
@@ -369,6 +423,14 @@ fn is_dir(node: StaticNode) -> bool {
         | StaticNode::SysDevicesDir
         | StaticNode::SysDevicesSystemDir
         | StaticNode::SysCpuDir
+        | StaticNode::SysCpu0Dir
+        | StaticNode::SysCpu1Dir
+        | StaticNode::SysCpu2Dir
+        | StaticNode::SysCpu3Dir
+        | StaticNode::SysCpu4Dir
+        | StaticNode::SysCpu5Dir
+        | StaticNode::SysCpu6Dir
+        | StaticNode::SysCpu7Dir
         | StaticNode::SysDevicesVirtualDir
         | StaticNode::SysDevicesVirtualInputDir
         | StaticNode::SysInput0Dir => true,
@@ -397,6 +459,15 @@ fn stat_node(node: StaticNode) -> FileStat {
         StaticNode::SysCpuOnline => 78,
         StaticNode::SysCpuPossible => 79,
         StaticNode::SysCpuPresent => 80,
+        StaticNode::SysCpuKernelMax => 89,
+        StaticNode::SysCpu0Dir => 81,
+        StaticNode::SysCpu1Dir => 82,
+        StaticNode::SysCpu2Dir => 83,
+        StaticNode::SysCpu3Dir => 84,
+        StaticNode::SysCpu4Dir => 85,
+        StaticNode::SysCpu5Dir => 86,
+        StaticNode::SysCpu6Dir => 87,
+        StaticNode::SysCpu7Dir => 88,
         StaticNode::SysDevicesVirtualDir => 34,
         StaticNode::SysDevicesVirtualInputDir => 35,
         StaticNode::SysInput0Dir => 36,
@@ -611,10 +682,40 @@ fn dir_entries(node: StaticNode) -> Option<Vec<RawDirEntry>> {
             entries.push(dir_entry(StaticNode::SysCpuOnline, "online", DT_REG));
             entries.push(dir_entry(StaticNode::SysCpuPossible, "possible", DT_REG));
             entries.push(dir_entry(StaticNode::SysCpuPresent, "present", DT_REG));
+            entries.push(dir_entry(StaticNode::SysCpuKernelMax, "kernel_max", DT_REG));
+            for cpu in 0..crate::cpu::topology().possible_count() {
+                let node = cpu_dir_node(cpu).expect("possible CPU exceeds staticfs CPU nodes");
+                entries.push(dir_entry(node, &format!("cpu{cpu}"), DT_DIR));
+            }
+        }
+        StaticNode::SysCpu0Dir
+        | StaticNode::SysCpu1Dir
+        | StaticNode::SysCpu2Dir
+        | StaticNode::SysCpu3Dir
+        | StaticNode::SysCpu4Dir
+        | StaticNode::SysCpu5Dir
+        | StaticNode::SysCpu6Dir
+        | StaticNode::SysCpu7Dir => {
+            entries.push(dir_entry(node, ".", DT_DIR));
+            entries.push(dir_entry(StaticNode::SysCpuDir, "..", DT_DIR));
         }
         _ => return None,
     }
     Some(entries)
+}
+
+fn cpu_dir_node(cpu: usize) -> Option<StaticNode> {
+    match cpu {
+        0 => Some(StaticNode::SysCpu0Dir),
+        1 => Some(StaticNode::SysCpu1Dir),
+        2 => Some(StaticNode::SysCpu2Dir),
+        3 => Some(StaticNode::SysCpu3Dir),
+        4 => Some(StaticNode::SysCpu4Dir),
+        5 => Some(StaticNode::SysCpu5Dir),
+        6 => Some(StaticNode::SysCpu6Dir),
+        7 => Some(StaticNode::SysCpu7Dir),
+        _ => None,
+    }
 }
 
 impl File for StaticFile {
