@@ -63,6 +63,7 @@ pub fn send_ipi(logical_id: CpuId) -> Result<(), usize> {
 pub fn enable_local_ipi() {
     clear_local_ipi();
     iocsr_write_w(LOONGARCH_IOCSR_IPI_EN, u32::MAX);
+    crate::trap::enable_ipi_interrupt();
 }
 
 pub fn clear_local_ipi() {

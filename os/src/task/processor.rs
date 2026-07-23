@@ -5,7 +5,7 @@ use crate::arch::hart;
 use crate::config::MAX_CPUS;
 use crate::mm::ActiveAddressSpace;
 use crate::perf;
-use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
+use crate::sync::{LocalIrqGuard, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -313,12 +313,17 @@ fn finish_current_switch() {
 
 pub fn run_tasks() -> ! {
     crate::cpu::scheduler_publish_active(crate::cpu::current_id());
+    let mut idle_timer_suppressed = false;
     loop {
         if crate::shutdown::stop_requested() {
             crate::shutdown::stop_current_cpu();
         }
         let mut processor = processor();
         if let Some(task) = fetch_task() {
+            if idle_timer_suppressed {
+                crate::timer::set_next_trigger();
+                idle_timer_suppressed = false;
+            }
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
             // fetch_task() atomically claims the task for this CPU before it
             // becomes visible as Processor::current.
@@ -337,19 +342,30 @@ pub fn run_tasks() -> ! {
         } else {
             drop(processor);
             let cpu = crate::cpu::current_id();
+            let irq = LocalIrqGuard::disable();
             PROCESSOR_IDLE[cpu].store(true, Ordering::Release);
             // Pair idle publication with enqueue's pending-before-IPI order.
             // If work arrived just before publication, do not cross into WFI.
             if crate::cpu::take_scheduler_wake(cpu) {
                 PROCESSOR_IDLE[cpu].store(false, Ordering::Release);
+                drop(irq);
                 continue;
             }
             #[cfg(target_arch = "loongarch64")]
             // CONTEXT: LA UART IRQ dispatch is not wired yet. Poll the console
             // while idle so stdin poll/select waiters can be woken by typed data.
             crate::fs::console_tty_drain_uart();
-            hart::enable_interrupt_and_wait();
+            idle_timer_suppressed |= crate::timer::prepare_idle_timer();
+            // Closing the timer can overlap an enqueue after the first pending
+            // check. Recheck with interrupts still disabled before sleeping.
+            if crate::cpu::take_scheduler_wake(cpu) {
+                PROCESSOR_IDLE[cpu].store(false, Ordering::Release);
+                drop(irq);
+                continue;
+            }
+            hart::wait_for_interrupt_disabled();
             PROCESSOR_IDLE[cpu].store(false, Ordering::Release);
+            drop(irq);
         }
     }
 }

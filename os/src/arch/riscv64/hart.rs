@@ -7,6 +7,11 @@ pub fn enable_interrupt_and_wait() {
     wait_for_interrupt();
 }
 
+pub fn wait_for_interrupt_disabled() {
+    debug_assert!(!interrupt::supervisor_interrupt_enabled());
+    wait_for_interrupt();
+}
+
 fn wait_for_interrupt() {
     unsafe {
         asm!("wfi");

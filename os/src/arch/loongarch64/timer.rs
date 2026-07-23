@@ -19,6 +19,7 @@ pub const TICKS_PER_SEC: usize = 100;
 // timer interrupts at 1 kHz so 1 ms clock_nanosleep workloads can wake on
 // time instead of waiting for the next 10 ms accounting tick.
 const TIMER_INTERRUPTS_PER_SEC: usize = 1000;
+const IDLE_UART_POLL_INTERRUPTS_PER_SEC: usize = 100;
 const MSEC_PER_SEC: usize = 1000;
 const USEC_PER_SEC: usize = 1_000_000;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
@@ -214,6 +215,26 @@ pub fn get_time_clock_ticks() -> usize {
 
 pub fn set_next_trigger() {
     set_timer(get_time() + clock_freq() / TIMER_INTERRUPTS_PER_SEC);
+}
+
+/// Suppress the scheduler tick while a non-housekeeping CPU is idle.
+///
+/// Stop the scheduler tick while a non-housekeeping CPU is idle.
+///
+/// The architecture idle entry redirects interrupts that land between
+/// enabling CRMD.IE and executing `idle 0`, so an AP does not need a periodic
+/// safety tick. Retain a low-rate polling tick only on boards where external
+/// UART interrupts are unavailable. CPU 0 remains the 1 kHz timer-heap owner.
+pub fn prepare_idle_timer() -> bool {
+    if crate::cpu::is_timer_expiry_owner() {
+        return false;
+    }
+    if crate::board::external_irq_available() {
+        crate::sbi::cancel_timer();
+    } else {
+        set_timer(get_time() + clock_freq() / IDLE_UART_POLL_INTERRUPTS_PER_SEC);
+    }
+    true
 }
 
 pub struct TimerCondVar {

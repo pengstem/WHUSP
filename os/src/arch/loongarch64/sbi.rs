@@ -10,6 +10,11 @@ pub fn set_timer(timer: usize) {
     loongArch64::register::tcfg::set_en(true);
 }
 
+pub fn cancel_timer() {
+    loongArch64::register::tcfg::set_en(false);
+    loongArch64::register::ticlr::clear_timer_interrupt();
+}
+
 pub fn shutdown(_failure: bool) -> ! {
     let poweroff = phys_to_virt(QEMU_GED_POWEROFF) as *mut u8;
     unsafe {

@@ -102,6 +102,18 @@ pub fn set_next_trigger() {
     set_timer(get_time() + clock_freq() / TIMER_INTERRUPTS_PER_SEC);
 }
 
+/// Stop the periodic scheduler tick while a non-housekeeping CPU is idle.
+///
+/// CPU 0 remains the global timer-heap owner and must keep its 1 kHz tick so
+/// sleeping tasks and process timers still expire on time.
+pub fn prepare_idle_timer() -> bool {
+    if crate::cpu::is_timer_expiry_owner() {
+        return false;
+    }
+    crate::sbi::cancel_timer();
+    true
+}
+
 pub struct TimerCondVar {
     pub expire_ms: usize,
     pub task: Weak<TaskControlBlock>,

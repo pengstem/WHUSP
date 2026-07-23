@@ -3,6 +3,10 @@ pub fn set_timer(timer: usize) {
     sbi_rt::set_timer(timer as _);
 }
 
+pub fn cancel_timer() {
+    sbi_rt::set_timer(u64::MAX);
+}
+
 pub fn hsm_available() -> bool {
     sbi_rt::probe_extension(sbi_rt::Hsm).is_available()
 }

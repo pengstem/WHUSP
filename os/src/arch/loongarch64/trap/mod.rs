@@ -53,6 +53,10 @@ pub fn enable_timer_interrupt() {
     ecfg::set_lie(ecfg::read().lie() | LineBasedInterrupt::TIMER);
 }
 
+pub fn enable_ipi_interrupt() {
+    ecfg::set_lie(ecfg::read().lie() | LineBasedInterrupt::IPI);
+}
+
 pub fn enable_external_interrupt() {
     // CONTEXT: QEMU LoongArch virt routes external device interrupts through
     // EIOINTC. Different references number the CPU input by DTB cell or CSR
@@ -380,7 +384,8 @@ fn trap_return_for_task(
 }
 
 #[unsafe(no_mangle)]
-pub fn trap_from_kernel(trap_cx: &TrapContext) {
+pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
+    crate::arch::hart::redirect_idle_interrupt(trap_cx);
     let estat = estat::read();
     let badv = badv::read().vaddr();
     match estat.cause() {

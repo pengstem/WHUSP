@@ -7,6 +7,7 @@ use crate::sync::{SpinNoIrqLock, UPIntrFreeCell};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 use lazy_static::*;
 use log::info;
 
@@ -492,22 +493,38 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
 }
 
+static RUNNABLE_QUEUES: crate::cpu::AtomicCpuMask =
+    crate::cpu::AtomicCpuMask::new(crate::cpu::CpuMask::empty());
+
+fn publish_run_queue_transition(cpu: crate::cpu::CpuId, was_runnable: bool, ready: usize) {
+    let is_runnable = ready != 0;
+    if was_runnable == is_runnable {
+        return;
+    }
+    if is_runnable {
+        RUNNABLE_QUEUES.insert(cpu, Ordering::Release);
+    } else {
+        RUNNABLE_QUEUES.remove(cpu, Ordering::Release);
+    }
+}
+
 fn with_run_queue<R>(cpu: crate::cpu::CpuId, operation: impl FnOnce(&mut TaskManager) -> R) -> R {
     assert!(cpu < MAX_CPUS, "run-queue CPU exceeds MAX_CPUS");
-    if !super::smp_probe::cpu_probe_active() {
-        return operation(&mut RUN_QUEUES[cpu].lock());
-    }
-
-    let wait_start = crate::timer::get_time();
+    let probe = super::smp_probe::cpu_probe_active();
+    let wait_start = probe.then(crate::timer::get_time);
     let mut manager = RUN_QUEUES[cpu].lock();
-    let acquired = crate::timer::get_time();
+    let acquired = probe.then(crate::timer::get_time);
+    let was_runnable = manager.ready_len() != 0;
     let result = operation(&mut manager);
+    publish_run_queue_transition(cpu, was_runnable, manager.ready_len());
     drop(manager);
-    let released = crate::timer::get_time();
-    super::smp_probe::record_cpu_probe_run_queue(
-        acquired.saturating_sub(wait_start),
-        released.saturating_sub(acquired),
-    );
+    if let (Some(wait_start), Some(acquired)) = (wait_start, acquired) {
+        let released = crate::timer::get_time();
+        super::smp_probe::record_cpu_probe_run_queue(
+            acquired.saturating_sub(wait_start),
+            released.saturating_sub(acquired),
+        );
+    }
     result
 }
 
@@ -639,9 +656,17 @@ pub(super) fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     }
 
     let cpu_count = crate::cpu::topology().possible_count();
+    let candidates = crate::cpu::CpuMask::from_bits(
+        RUNNABLE_QUEUES.load(Ordering::Acquire).bits()
+            & crate::cpu::online_mask().bits()
+            & !crate::cpu::CpuMask::single(cpu).bits(),
+    );
+    if candidates.bits() == 0 {
+        return None;
+    }
     for offset in 1..cpu_count {
         let victim = (cpu + offset) % cpu_count;
-        if !crate::cpu::online_mask().contains(victim) {
+        if !candidates.contains(victim) {
             continue;
         }
         let stolen = with_run_queue(victim, |manager| {
@@ -686,11 +711,21 @@ pub(crate) fn migrate_ready_task(task: Arc<TaskControlBlock>) {
     let moved = if source < target {
         let mut source_queue = RUN_QUEUES[source].lock();
         let mut target_queue = RUN_QUEUES[target].lock();
-        migrate_ready_task_locked(&mut source_queue, &mut target_queue, task)
+        let source_was_runnable = source_queue.ready_len() != 0;
+        let target_was_runnable = target_queue.ready_len() != 0;
+        let moved = migrate_ready_task_locked(&mut source_queue, &mut target_queue, task);
+        publish_run_queue_transition(source, source_was_runnable, source_queue.ready_len());
+        publish_run_queue_transition(target, target_was_runnable, target_queue.ready_len());
+        moved
     } else {
         let mut target_queue = RUN_QUEUES[target].lock();
         let mut source_queue = RUN_QUEUES[source].lock();
-        migrate_ready_task_locked(&mut source_queue, &mut target_queue, task)
+        let source_was_runnable = source_queue.ready_len() != 0;
+        let target_was_runnable = target_queue.ready_len() != 0;
+        let moved = migrate_ready_task_locked(&mut source_queue, &mut target_queue, task);
+        publish_run_queue_transition(source, source_was_runnable, source_queue.ready_len());
+        publish_run_queue_transition(target, target_was_runnable, target_queue.ready_len());
+        moved
     };
     if moved {
         super::smp_probe::record_cpu_probe_migration();
