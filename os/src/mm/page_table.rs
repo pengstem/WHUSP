@@ -6,6 +6,9 @@ use alloc::vec::Vec;
 use bitflags::*;
 use core::ops::{Deref, DerefMut};
 
+const PAGE_TABLE_LEVELS: usize = 3;
+const PAGE_TABLE_INDEX_BITS: usize = 9;
+
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct PTEFlags: usize {
@@ -39,6 +42,11 @@ impl PageTableEntry {
     pub fn empty() -> Self {
         PageTableEntry { bits: 0 }
     }
+    fn new_leaf(ppn: PhysPageNum, flags: PTEFlags, level: usize) -> Self {
+        PageTableEntry {
+            bits: arch_mm::pte_new_leaf_bits(ppn.0, flags, level),
+        }
+    }
     pub fn ppn(&self) -> PhysPageNum {
         arch_mm::pte_ppn(self.bits).into()
     }
@@ -47,6 +55,9 @@ impl PageTableEntry {
     }
     pub fn is_valid(&self) -> bool {
         arch_mm::pte_is_valid(self.bits)
+    }
+    fn is_leaf(&self) -> bool {
+        arch_mm::pte_is_leaf(self.bits)
     }
     pub fn readable(&self) -> bool {
         self.flags().contains(PTEFlags::R)
@@ -122,15 +133,22 @@ impl PageTable {
             leaves_1g: 0,
         }
     }
-    fn find_pte_create(&mut self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
+    fn find_pte_create_at_level(
+        &mut self,
+        vpn: VirtPageNum,
+        target_level: usize,
+    ) -> Option<&mut PageTableEntry> {
+        assert!(target_level < PAGE_TABLE_LEVELS);
         let idxs = vpn.indexes();
         let mut ppn = self.root_ppn;
-        let mut result: Option<&mut PageTableEntry> = None;
-        for (i, idx) in idxs.iter().enumerate() {
+        let target_depth = PAGE_TABLE_LEVELS - 1 - target_level;
+        for (depth, idx) in idxs.iter().enumerate() {
             let pte = &mut ppn.get_pte_array_mut()[*idx];
-            if i == 2 {
-                result = Some(pte);
-                break;
+            if depth == target_depth {
+                return Some(pte);
+            }
+            if pte.is_leaf() {
+                return None;
             }
             if !pte.is_valid() {
                 let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocPageTable);
@@ -140,41 +158,50 @@ impl PageTable {
             }
             ppn = pte.ppn();
         }
-        result
+        None
     }
-    fn find_pte(&self, vpn: VirtPageNum) -> Option<&PageTableEntry> {
+    fn find_pte_create(&mut self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
+        self.find_pte_create_at_level(vpn, 0)
+    }
+    fn find_leaf(&self, vpn: VirtPageNum) -> Option<(&PageTableEntry, usize)> {
         let idxs = vpn.indexes();
         let mut ppn = self.root_ppn;
-        let mut result: Option<&PageTableEntry> = None;
-        for (i, idx) in idxs.iter().enumerate() {
+        for (depth, idx) in idxs.iter().enumerate() {
             let pte = &ppn.get_pte_array()[*idx];
-            if i == 2 {
-                result = Some(pte);
-                break;
+            let level = PAGE_TABLE_LEVELS - 1 - depth;
+            if level == 0 || pte.is_leaf() {
+                return Some((pte, level));
             }
             if !pte.is_valid() {
                 return None;
             }
             ppn = pte.ppn();
         }
-        result
+        None
+    }
+    fn find_pte_at_level_mut(
+        &mut self,
+        vpn: VirtPageNum,
+        target_level: usize,
+    ) -> Option<&mut PageTableEntry> {
+        assert!(target_level < PAGE_TABLE_LEVELS);
+        let idxs = vpn.indexes();
+        let mut ppn = self.root_ppn;
+        let target_depth = PAGE_TABLE_LEVELS - 1 - target_level;
+        for (depth, idx) in idxs.iter().enumerate() {
+            let pte = &mut ppn.get_pte_array_mut()[*idx];
+            if depth == target_depth {
+                return Some(pte);
+            }
+            if !pte.is_valid() || pte.is_leaf() {
+                return None;
+            }
+            ppn = pte.ppn();
+        }
+        None
     }
     fn find_pte_mut(&mut self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
-        let idxs = vpn.indexes();
-        let mut ppn = self.root_ppn;
-        let mut result: Option<&mut PageTableEntry> = None;
-        for (i, idx) in idxs.iter().enumerate() {
-            let pte = &mut ppn.get_pte_array_mut()[*idx];
-            if i == 2 {
-                result = Some(pte);
-                break;
-            }
-            if !pte.is_valid() {
-                return None;
-            }
-            ppn = pte.ppn();
-        }
-        result
+        self.find_pte_at_level_mut(vpn, 0)
     }
     pub fn try_map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
         let Some(pte) = self.find_pte_create(vpn) else {
@@ -189,7 +216,7 @@ impl PageTable {
         } else {
             flags
         };
-        *pte = PageTableEntry::new(ppn, flags);
+        *pte = PageTableEntry::new_leaf(ppn, flags, 0);
         self.leaves_4k += 1;
         true
     }
@@ -199,6 +226,78 @@ impl PageTable {
     /// cannot occur after some leaf PTEs have become visible to another CPU.
     pub(super) fn prepare_empty_leaf_path(&mut self, vpn: VirtPageNum) -> bool {
         self.find_pte_create(vpn).is_some_and(|pte| pte.bits == 0)
+    }
+    pub(super) fn try_map_kernel_identical_range(
+        &mut self,
+        start_vpn: VirtPageNum,
+        end_vpn: VirtPageNum,
+        flags: PTEFlags,
+    ) -> bool {
+        assert!(start_vpn <= end_vpn);
+
+        // Preflight allocates every required intermediate table and checks
+        // every destination before publishing any leaf. A failed preflight
+        // can leave empty table pages owned by this PageTable, but cannot
+        // expose a partial mapping to another CPU.
+        let mut vpn = start_vpn;
+        while vpn < end_vpn {
+            let ppn = identical_ppn(vpn);
+            let level = largest_fit_kernel_leaf_level(vpn, ppn, end_vpn.0 - vpn.0);
+            let Some(pte) = self.find_pte_create_at_level(vpn, level) else {
+                return false;
+            };
+            if pte.bits != 0 {
+                return false;
+            }
+            vpn.0 += pages_per_leaf(level);
+        }
+
+        let flags = normalized_leaf_flags(flags);
+        vpn = start_vpn;
+        while vpn < end_vpn {
+            let ppn = identical_ppn(vpn);
+            let level = largest_fit_kernel_leaf_level(vpn, ppn, end_vpn.0 - vpn.0);
+            let pte = self
+                .find_pte_at_level_mut(vpn, level)
+                .expect("preflighted kernel leaf path disappeared");
+            assert_eq!(
+                pte.bits, 0,
+                "preflighted kernel leaf became occupied: vpn={vpn:?} level={level}"
+            );
+            *pte = PageTableEntry::new_leaf(ppn, flags, level);
+            self.increment_leaf_count(level);
+            vpn.0 += pages_per_leaf(level);
+        }
+
+        self.verify_kernel_identical_range(start_vpn, end_vpn, flags);
+        true
+    }
+    pub(super) fn unmap_kernel_identical_range(
+        &mut self,
+        start_vpn: VirtPageNum,
+        end_vpn: VirtPageNum,
+    ) -> bool {
+        assert!(start_vpn <= end_vpn);
+        let mut vpn = start_vpn;
+        while vpn < end_vpn {
+            let Some((pte, level)) = self.find_leaf(vpn) else {
+                return false;
+            };
+            if pte.bits == 0 {
+                return false;
+            }
+            let pages = pages_per_leaf(level);
+            if vpn.0 & (pages - 1) != 0 || pages > end_vpn.0 - vpn.0 {
+                return false;
+            }
+            let pte = self
+                .find_pte_at_level_mut(vpn, level)
+                .expect("located kernel leaf path disappeared");
+            *pte = PageTableEntry::empty();
+            self.decrement_leaf_count(level);
+            vpn.0 += pages;
+        }
+        true
     }
     pub fn unmap(&mut self, vpn: VirtPageNum) {
         let pte = self
@@ -289,10 +388,25 @@ impl PageTable {
         true
     }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
-        self.find_pte(vpn).map(|pte| *pte)
+        self.find_leaf(vpn).map(|(pte, level)| {
+            if level == 0 || pte.bits == 0 {
+                return *pte;
+            }
+            let offset_mask = pages_per_leaf(level) - 1;
+            let base_ppn = pte.ppn().0;
+            assert_eq!(
+                base_ppn & offset_mask,
+                0,
+                "unaligned level-{level} leaf PPN {base_ppn:#x}"
+            );
+            PageTableEntry::new(
+                PhysPageNum::from(base_ppn | (vpn.0 & offset_mask)),
+                pte.flags(),
+            )
+        })
     }
     pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {
-        self.find_pte(va.clone().floor()).map(|pte| {
+        self.translate(va.clone().floor()).map(|pte| {
             let aligned_pa: PhysAddr = pte.ppn().into();
             let offset = va.page_offset();
             let aligned_pa_usize: usize = aligned_pa.into();
@@ -311,6 +425,101 @@ impl PageTable {
             leaves_1g: self.leaves_1g,
         }
     }
+
+    fn increment_leaf_count(&mut self, level: usize) {
+        match level {
+            0 => self.leaves_4k += 1,
+            1 => self.leaves_2m += 1,
+            2 => self.leaves_1g += 1,
+            _ => unreachable!("unsupported page-table leaf level {level}"),
+        }
+    }
+
+    fn decrement_leaf_count(&mut self, level: usize) {
+        let counter = match level {
+            0 => &mut self.leaves_4k,
+            1 => &mut self.leaves_2m,
+            2 => &mut self.leaves_1g,
+            _ => unreachable!("unsupported page-table leaf level {level}"),
+        };
+        *counter = counter
+            .checked_sub(1)
+            .expect("page-table leaf counter underflow");
+    }
+
+    fn verify_kernel_identical_range(
+        &self,
+        start_vpn: VirtPageNum,
+        end_vpn: VirtPageNum,
+        expected_flags: PTEFlags,
+    ) {
+        let mut vpn = start_vpn;
+        while vpn < end_vpn {
+            let expected_ppn = identical_ppn(vpn);
+            let remaining = end_vpn.0 - vpn.0;
+            let expected_level = largest_fit_kernel_leaf_level(vpn, expected_ppn, remaining);
+            let (pte, actual_level) = self
+                .find_leaf(vpn)
+                .expect("published kernel identity leaf is not walkable");
+            assert_ne!(pte.bits, 0, "published kernel identity leaf is empty");
+            assert_eq!(
+                actual_level, expected_level,
+                "kernel identity leaf level mismatch at {vpn:?}"
+            );
+            assert_eq!(
+                pte.flags(),
+                expected_flags,
+                "kernel identity leaf permissions mismatch at {vpn:?}"
+            );
+            assert_eq!(
+                self.translate(vpn).map(|entry| entry.ppn()),
+                Some(expected_ppn),
+                "kernel identity translation mismatch at {vpn:?}"
+            );
+
+            let pages = pages_per_leaf(expected_level);
+            let last_vpn = VirtPageNum(vpn.0 + pages - 1);
+            let expected_last_ppn = PhysPageNum(expected_ppn.0 + pages - 1);
+            assert_eq!(
+                self.translate(last_vpn).map(|entry| entry.ppn()),
+                Some(expected_last_ppn),
+                "kernel identity end translation mismatch at {last_vpn:?}"
+            );
+            vpn.0 += pages;
+        }
+    }
+}
+
+fn normalized_leaf_flags(flags: PTEFlags) -> PTEFlags {
+    let leaf_flags = PTEFlags::R | PTEFlags::W | PTEFlags::X;
+    if flags.intersects(leaf_flags) {
+        flags | PTEFlags::V
+    } else {
+        flags
+    }
+}
+
+fn pages_per_leaf(level: usize) -> usize {
+    1usize << (PAGE_TABLE_INDEX_BITS * level)
+}
+
+fn identical_ppn(vpn: VirtPageNum) -> PhysPageNum {
+    let va: VirtAddr = vpn.into();
+    PhysAddr::from(usize::from(va)).floor()
+}
+
+fn largest_fit_kernel_leaf_level(
+    vpn: VirtPageNum,
+    ppn: PhysPageNum,
+    remaining_pages: usize,
+) -> usize {
+    for level in (1..=arch_mm::MAX_KERNEL_LEAF_LEVEL).rev() {
+        let pages = pages_per_leaf(level);
+        if remaining_pages >= pages && vpn.0 & (pages - 1) == 0 && ppn.0 & (pages - 1) == 0 {
+            return level;
+        }
+    }
+    0
 }
 
 /// A checked user translation together with allocator references for its pages.

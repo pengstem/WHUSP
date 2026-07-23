@@ -1,7 +1,5 @@
 use super::page_table::PTEFlags;
-use super::{
-    FrameTracker, PageTable, PhysAddr, PhysPageNum, StepByOne, VPNRange, VirtAddr, VirtPageNum,
-};
+use super::{FrameTracker, PageTable, PhysPageNum, StepByOne, VPNRange, VirtAddr, VirtPageNum};
 use super::{frame_alloc, frame_alloc_uninit};
 use crate::config::PAGE_SIZE;
 use crate::fs::File;
@@ -459,35 +457,15 @@ impl MapArea {
         if self.map_type == MapType::Framed {
             return self.map_framed_preflight(page_table, true);
         }
-
-        let mut mapped_vpns = Vec::new();
-        for vpn in self.vpn_range {
-            let va: VirtAddr = vpn.into();
-            let ppn = PhysAddr::from(usize::from(va)).floor();
-            if !page_table.try_map(
-                vpn,
-                ppn,
-                PTEFlags::from_bits_truncate(self.map_perm.bits() as usize),
-            ) {
-                for mapped_vpn in mapped_vpns {
-                    self.unmap_one(page_table, mapped_vpn);
-                }
-                return false;
-            }
-            mapped_vpns.push(vpn);
-        }
-        true
+        page_table.try_map_kernel_identical_range(
+            self.vpn_range.get_start(),
+            self.vpn_range.get_end(),
+            PTEFlags::from_bits_truncate(self.map_perm.bits() as usize),
+        )
     }
 
     pub(super) fn map_uninit(&mut self, page_table: &mut PageTable) -> bool {
         self.map_framed_preflight(page_table, false)
-    }
-
-    pub(super) fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
-        page_table.unmap(vpn);
-        if self.map_type == MapType::Framed {
-            self.data_frames.remove(&vpn);
-        }
     }
 
     pub(super) fn map_existing_frame(
@@ -628,8 +606,10 @@ impl MapArea {
         }
 
         if self.map_type == MapType::Identical {
-            for vpn in self.vpn_range {
-                clear_resident_pte(page_table, vpn, retired);
+            if page_table
+                .unmap_kernel_identical_range(self.vpn_range.get_start(), self.vpn_range.get_end())
+            {
+                retired.mark_pte_cleared();
             }
         }
     }

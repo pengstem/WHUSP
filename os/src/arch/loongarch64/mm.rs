@@ -13,10 +13,13 @@ const VA_WIDTH: usize = 48;
 const PPN_WIDTH: usize = PA_WIDTH - crate::config::PAGE_SIZE_BITS;
 const VPN_WIDTH: usize = VA_WIDTH - crate::config::PAGE_SIZE_BITS;
 
+pub const MAX_KERNEL_LEAF_LEVEL: usize = 1;
+
 const LA_PTE_V: usize = 1 << 0;
 const LA_PTE_D: usize = 1 << 1;
 const LA_PTE_PLV_USER: usize = 0b11 << 2;
 const LA_PTE_MAT_CC: usize = 0b01 << 4;
+const LA_PTE_HUGE: usize = 1 << 6;
 const LA_PTE_P: usize = 1 << 7;
 const LA_PTE_W: usize = 1 << 8;
 const LA_PTE_COW: usize = 1 << 58;
@@ -194,6 +197,19 @@ pub fn pte_new_bits(ppn: usize, flags: crate::mm::page_table::PTEFlags) -> usize
     bits
 }
 
+pub fn pte_new_leaf_bits(
+    ppn: usize,
+    flags: crate::mm::page_table::PTEFlags,
+    level: usize,
+) -> usize {
+    assert!(
+        level <= MAX_KERNEL_LEAF_LEVEL,
+        "LoongArch leaf level {level} is out of range"
+    );
+    let bits = pte_new_bits(ppn, flags);
+    if level == 1 { bits | LA_PTE_HUGE } else { bits }
+}
+
 pub fn pte_ppn(bits: usize) -> usize {
     (bits & PTE_ADDR_MASK) >> crate::config::PAGE_SIZE_BITS
 }
@@ -223,4 +239,8 @@ pub fn pte_flags(bits: usize) -> crate::mm::page_table::PTEFlags {
 
 pub fn pte_is_valid(bits: usize) -> bool {
     bits != 0
+}
+
+pub fn pte_is_leaf(bits: usize) -> bool {
+    bits & (LA_PTE_V | LA_PTE_HUGE) != 0
 }

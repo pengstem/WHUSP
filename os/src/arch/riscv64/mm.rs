@@ -18,6 +18,8 @@ const VA_WIDTH: usize = 39;
 const PPN_WIDTH: usize = PA_WIDTH - crate::config::PAGE_SIZE_BITS;
 const VPN_WIDTH: usize = VA_WIDTH - crate::config::PAGE_SIZE_BITS;
 
+pub const MAX_KERNEL_LEAF_LEVEL: usize = 2;
+
 const ASID_SUPPORT_NO: usize = 0;
 const ASID_SUPPORT_YES: usize = 1;
 const ASID_SUPPORT_UNKNOWN: usize = 2;
@@ -220,6 +222,18 @@ pub fn pte_new_bits(ppn: usize, flags: crate::mm::page_table::PTEFlags) -> usize
     ppn << 10 | flags.bits()
 }
 
+pub fn pte_new_leaf_bits(
+    ppn: usize,
+    flags: crate::mm::page_table::PTEFlags,
+    level: usize,
+) -> usize {
+    assert!(
+        level <= MAX_KERNEL_LEAF_LEVEL,
+        "Sv39 leaf level {level} is out of range"
+    );
+    pte_new_bits(ppn, flags)
+}
+
 pub fn pte_ppn(bits: usize) -> usize {
     bits >> 10 & ((1usize << PPN_WIDTH) - 1)
 }
@@ -230,4 +244,13 @@ pub fn pte_flags(bits: usize) -> crate::mm::page_table::PTEFlags {
 
 pub fn pte_is_valid(bits: usize) -> bool {
     pte_flags(bits).contains(crate::mm::page_table::PTEFlags::V)
+}
+
+pub fn pte_is_leaf(bits: usize) -> bool {
+    pte_is_valid(bits)
+        && pte_flags(bits).intersects(
+            crate::mm::page_table::PTEFlags::R
+                | crate::mm::page_table::PTEFlags::W
+                | crate::mm::page_table::PTEFlags::X,
+        )
 }
