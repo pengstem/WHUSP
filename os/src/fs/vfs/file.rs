@@ -43,9 +43,13 @@ const VFS_DIRENT_SCRATCH_MAX: usize = 4 * 1024;
 // and the page cache instead of falling through to backend on every read.
 const VFS_READ_CACHE_MAX_FILE_SIZE: usize = 8 * 1024 * 1024;
 const VFS_SMALL_READ_CACHE_MIN_FILE_SIZE: usize = 64 * 1024;
-// CONTEXT: Raised to 32 MiB so the aggregate small‑read cache can hold
-// several 4 MiB files concurrently (iozone -t 4 -s 4m).
-const VFS_SMALL_READ_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+// CONTEXT: Eight 8 MiB shards bound the cache at 64 MiB. This preserves the
+// existing per-file eligibility limit while allowing eight independent 4 MiB
+// iozone files to remain hot without one global copy lock.
+const VFS_SMALL_READ_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const VFS_SMALL_READ_CACHE_SHARDS: usize = 8;
+const VFS_SMALL_READ_CACHE_SHARD_MAX_BYTES: usize =
+    VFS_SMALL_READ_CACHE_MAX_BYTES / VFS_SMALL_READ_CACHE_SHARDS;
 const VFS_READ_CACHE_READAHEAD_PAGES: usize = 6;
 const VFS_DIRTY_WRITEBACK_MAX_WRITE_SIZE: usize = 64 * 1024;
 const VFS_DIRTY_WRITEBACK_MAX_PAGES: usize = 4096;
@@ -79,8 +83,8 @@ lazy_static! {
         SleepMutex::new(BTreeMap::new());
     static ref DIRTY_REGULAR_FILES: SleepMutex<BTreeMap<VfsNodeId, DirtyFileCache>> =
         SleepMutex::new(BTreeMap::new());
-    static ref SMALL_REGULAR_READ_FILES: SleepMutex<BTreeMap<VfsNodeId, SmallRegularReadCache>> =
-        SleepMutex::new(BTreeMap::new());
+    static ref SMALL_REGULAR_READ_FILES: SmallRegularReadCaches =
+        SmallRegularReadCaches::new();
     static ref INODE_FLAGS_CACHE: SleepMutex<BTreeMap<VfsNodeId, u32>> =
         SleepMutex::new(BTreeMap::new());
 }
@@ -157,6 +161,15 @@ struct SmallRegularReadCache {
     data: Vec<u8>,
 }
 
+struct SmallRegularReadCacheShard {
+    files: BTreeMap<VfsNodeId, SmallRegularReadCache>,
+    bytes: usize,
+}
+
+struct SmallRegularReadCaches {
+    shards: [SleepMutex<SmallRegularReadCacheShard>; VFS_SMALL_READ_CACHE_SHARDS],
+}
+
 impl SmallRegularReadCache {
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
         if offset >= self.data.len() {
@@ -165,6 +178,66 @@ impl SmallRegularReadCache {
         let len = buf.len().min(self.data.len() - offset);
         buf[..len].copy_from_slice(&self.data[offset..offset + len]);
         len
+    }
+}
+
+impl SmallRegularReadCacheShard {
+    fn new() -> Self {
+        Self {
+            files: BTreeMap::new(),
+            bytes: 0,
+        }
+    }
+
+    fn remove(&mut self, node: VfsNodeId) {
+        if let Some(cache) = self.files.remove(&node) {
+            self.bytes = self.bytes.saturating_sub(cache.data.len());
+        }
+    }
+
+    fn insert(&mut self, node: VfsNodeId, cache: SmallRegularReadCache) {
+        let cache_bytes = cache.data.len();
+        if cache_bytes > VFS_SMALL_READ_CACHE_SHARD_MAX_BYTES {
+            return;
+        }
+        self.remove(node);
+        if self.bytes.saturating_add(cache_bytes) > VFS_SMALL_READ_CACHE_SHARD_MAX_BYTES {
+            self.files.clear();
+            self.bytes = 0;
+        }
+        self.bytes += cache_bytes;
+        self.files.insert(node, cache);
+    }
+}
+
+impl SmallRegularReadCaches {
+    fn new() -> Self {
+        Self {
+            shards: core::array::from_fn(|_| SleepMutex::new(SmallRegularReadCacheShard::new())),
+        }
+    }
+
+    fn shard_index(node: VfsNodeId) -> usize {
+        debug_assert!(VFS_SMALL_READ_CACHE_SHARDS.is_power_of_two());
+        (node.ino as usize ^ node.mount_id.0.rotate_left(8)) & (VFS_SMALL_READ_CACHE_SHARDS - 1)
+    }
+
+    fn read_at(&self, node: VfsNodeId, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        let shard = self.shards[Self::shard_index(node)].lock();
+        shard
+            .files
+            .get(&node)
+            .map(|cache| cache.read_at(offset, buf))
+    }
+
+    fn remove(&self, node: VfsNodeId) {
+        self.shards[Self::shard_index(node)].lock().remove(node);
+    }
+
+    fn insert(&self, node: VfsNodeId, cache: SmallRegularReadCache) {
+        self.shards[Self::shard_index(node)]
+            .lock()
+            .insert(node, cache);
     }
 }
 
@@ -1010,7 +1083,7 @@ fn page_cache_id_for_node(node: VfsNodeId, kind: FsNodeKind) -> Option<PageCache
 
 fn invalidate_small_regular_read_cache(node: VfsNodeId, kind: FsNodeKind) {
     if kind == FsNodeKind::RegularFile {
-        SMALL_REGULAR_READ_FILES.lock().remove(&node);
+        SMALL_REGULAR_READ_FILES.remove(node);
     }
 }
 
@@ -1884,11 +1957,8 @@ impl VfsFile {
         {
             return None;
         }
-        {
-            let caches = SMALL_REGULAR_READ_FILES.lock();
-            if let Some(cache) = caches.get(&self.node) {
-                return Some(cache.read_at(offset, buf));
-            }
+        if let Some(read_size) = SMALL_REGULAR_READ_FILES.read_at(self.node, offset, buf) {
+            return Some(read_size);
         }
 
         let stat = with_mount(self.node.mount_id, |mount| mount.stat_basic(self.node.ino))?.ok()?;
@@ -1935,12 +2005,7 @@ impl VfsFile {
 
         let cache = SmallRegularReadCache { data };
         let read_size = cache.read_at(offset, buf);
-        let mut caches = SMALL_REGULAR_READ_FILES.lock();
-        let cached_bytes = caches.values().map(|cache| cache.data.len()).sum::<usize>();
-        if cached_bytes.saturating_add(cache.data.len()) > VFS_SMALL_READ_CACHE_MAX_BYTES {
-            caches.clear();
-        }
-        caches.insert(self.node, cache);
+        SMALL_REGULAR_READ_FILES.insert(self.node, cache);
         Some(read_size)
     }
 }
