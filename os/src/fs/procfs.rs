@@ -12,6 +12,8 @@ use super::{FileStat, FileTimestamp, S_IFDIR, S_IFLNK, S_IFREG};
 use super::{PathContext, lookup_path_in};
 use crate::config::PAGE_SIZE;
 use crate::drivers::block_cache;
+#[cfg(feature = "perf-counters")]
+use crate::mm::frame_cache_stats;
 use crate::mm::{VirtAddr, exec_load_stats_content, frame_stats};
 use crate::perf;
 use crate::sync::UPIntrFreeCell;
@@ -1759,6 +1761,7 @@ fn oskernel_perf_content() -> String {
 #[cfg(feature = "perf-counters")]
 fn oskernel_perf_content() -> String {
     let (frame_total, frame_free) = frame_stats();
+    let frame_cache = frame_cache_stats();
     let block = block_cache::stats_snapshot();
     let block_io = crate::drivers::block::block_io_stats_snapshot();
     let dentry = dentry_cache::stats_snapshot();
@@ -1768,6 +1771,13 @@ fn oskernel_perf_content() -> String {
         "{}\
          frame_total {}\n\
          frame_free {}\n\
+         frame_cache_hits {}\n\
+         frame_cache_refills {}\n\
+         frame_cache_refill_pages {}\n\
+         frame_cache_local_frees {}\n\
+         frame_cache_drains {}\n\
+         frame_cache_drain_pages {}\n\
+         frame_cache_global_allocs {}\n\
          page_cache_entries {}\n\
          vfs_dirty_writeback_dirty_files {}\n\
          vfs_dirty_writeback_dirty_pages {}\n\
@@ -1858,6 +1868,13 @@ fn oskernel_perf_content() -> String {
         perf::stats_content(),
         frame_total,
         frame_free,
+        frame_cache.hits,
+        frame_cache.refills,
+        frame_cache.refill_pages,
+        frame_cache.local_frees,
+        frame_cache.drains,
+        frame_cache.drain_pages,
+        frame_cache.global_allocs,
         page_cache_entries,
         dirty_writeback.dirty_files,
         dirty_writeback.dirty_pages,
