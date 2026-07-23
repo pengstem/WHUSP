@@ -74,6 +74,10 @@ impl MemorySet {
         self.page_table.token()
     }
 
+    pub(crate) fn page_table_stats(&self) -> super::page_table::PageTableStats {
+        self.page_table.stats()
+    }
+
     pub(crate) fn address_space_control(&self) -> Arc<AddressSpaceControl> {
         Arc::clone(&self.control)
     }

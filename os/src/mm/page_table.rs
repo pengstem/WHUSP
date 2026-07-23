@@ -66,6 +66,17 @@ pub struct PageTable {
     root_ppn: PhysPageNum,
     asid: usize,
     frames: Vec<FrameTracker>,
+    leaves_4k: usize,
+    leaves_2m: usize,
+    leaves_1g: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PageTableStats {
+    pub(crate) frames: usize,
+    pub(crate) leaves_4k: usize,
+    pub(crate) leaves_2m: usize,
+    pub(crate) leaves_1g: usize,
 }
 
 // CONTEXT: `try_new`/`try_map` are the recoverable allocation API for user
@@ -80,6 +91,9 @@ impl PageTable {
             root_ppn: frame.ppn,
             asid: arch_mm::alloc_page_table_asid(),
             frames: vec![frame],
+            leaves_4k: 0,
+            leaves_2m: 0,
+            leaves_1g: 0,
         }
     }
     pub fn try_new() -> Option<Self> {
@@ -89,6 +103,9 @@ impl PageTable {
             root_ppn: frame.ppn,
             asid: arch_mm::alloc_page_table_asid(),
             frames: vec![frame],
+            leaves_4k: 0,
+            leaves_2m: 0,
+            leaves_1g: 0,
         })
     }
     /// Builds a non-owning view over an existing page-table token.
@@ -100,6 +117,9 @@ impl PageTable {
             root_ppn: PhysPageNum::from(arch_mm::page_table_root_ppn(satp)),
             asid: arch_mm::page_table_asid(satp),
             frames: Vec::new(),
+            leaves_4k: 0,
+            leaves_2m: 0,
+            leaves_1g: 0,
         }
     }
     fn find_pte_create(&mut self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
@@ -170,6 +190,7 @@ impl PageTable {
             flags
         };
         *pte = PageTableEntry::new(ppn, flags);
+        self.leaves_4k += 1;
         true
     }
     /// Allocates the page-table path for `vpn` without publishing a leaf.
@@ -280,6 +301,15 @@ impl PageTable {
     }
     pub fn token(&self) -> usize {
         arch_mm::page_table_token_with_asid(self.root_ppn.0, self.asid)
+    }
+
+    pub(crate) fn stats(&self) -> PageTableStats {
+        PageTableStats {
+            frames: self.frames.len(),
+            leaves_4k: self.leaves_4k,
+            leaves_2m: self.leaves_2m,
+            leaves_1g: self.leaves_1g,
+        }
     }
 }
 

@@ -85,6 +85,15 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
         cpu::boot_entry_count(),
         cpu::global_init_count(),
     );
+    let kernel_mapping = mm::kernel_mapping_stats();
+    info!(
+        "kernel mapping: elapsed_us={} page_table_frames={} leaves_4k={} leaves_2m={} leaves_1g={}",
+        kernel_mapping.elapsed_us,
+        kernel_mapping.page_table_frames,
+        kernel_mapping.leaves_4k,
+        kernel_mapping.leaves_2m,
+        kernel_mapping.leaves_1g,
+    );
 
     // CONTEXT: Headless contest QEMU may omit these optional devices, but
     // smoke checks key on the unavailable-device log lines below.
