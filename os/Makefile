@@ -17,8 +17,8 @@ endif
 
 MODE_ARG := $(if $(filter release,$(MODE)),--release)
 PERF_FEATURE_ARG := $(if $(filter 1 yes true on,$(PERF_COUNTERS)),--features perf-counters)
-MEM ?= 1G
-SMP ?= 1
+MEM ?= 8G
+SMP ?= 8
 MAX_CPUS := 8
 TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 KERNEL_ELF := $(TARGET_DIR)/$(TARGET)/$(MODE)/os

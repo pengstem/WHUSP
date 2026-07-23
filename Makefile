@@ -1,6 +1,7 @@
 MODE ?= release
 PERF_COUNTERS ?= 0
-SMP ?= 1
+MEM ?= 8G
+SMP ?= 8
 MAX_CPUS := 8
 CARGO_HOME ?= $(CURDIR)/vendor
 export CARGO_HOME
@@ -19,8 +20,8 @@ LOONGARCH_TARGET := loongarch64-unknown-none
 KERNEL_RV_SRC := os/target/$(RISCV_TARGET)/$(MODE)/os
 KERNEL_LA_SRC := os/target/$(LOONGARCH_TARGET)/$(MODE)/os
 
-TEST_DISK ?= $(CURDIR)/sdcard-rv.img
-TEST_DISK_LA ?= $(CURDIR)/sdcard-la.img
+TEST_DISK ?= $(CURDIR)/sdcard-rv-pub.img
+TEST_DISK_LA ?= $(CURDIR)/sdcard-la-pub.img
 CONTEST_SCRIPT_DISK ?= $(CURDIR)/disk.img
 CONTEST_SCRIPT_DISK_SIZE ?= 64M
 
@@ -53,10 +54,10 @@ check-smp:
 	fi
 
 run-rv: check-smp kernel-rv contest-disk
-	@$(MAKE) --no-print-directory -C os ARCH=riscv64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) run-inner PRIMARY_DISK="$(TEST_DISK)" AUX_DISK="$(CONTEST_SCRIPT_DISK)"
+	@$(MAKE) --no-print-directory -C os ARCH=riscv64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) MEM=$(MEM) SMP=$(SMP) run-inner PRIMARY_DISK="$(TEST_DISK)" AUX_DISK="$(CONTEST_SCRIPT_DISK)"
 
 run-la: check-smp kernel-la contest-disk
-	@$(MAKE) --no-print-directory -C os ARCH=loongarch64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) run-inner PRIMARY_DISK="$(TEST_DISK_LA)" AUX_DISK="$(CONTEST_SCRIPT_DISK)"
+	@$(MAKE) --no-print-directory -C os ARCH=loongarch64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) MEM=$(MEM) SMP=$(SMP) run-inner PRIMARY_DISK="$(TEST_DISK_LA)" AUX_DISK="$(CONTEST_SCRIPT_DISK)"
 fmt:
 	@$(MAKE) --no-print-directory -C os fmt
 	@cd vendor/lwext4_rust && cargo fmt

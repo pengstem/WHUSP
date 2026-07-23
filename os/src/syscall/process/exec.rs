@@ -71,6 +71,11 @@ struct ExecImageSource {
     file_size: usize,
 }
 
+struct ElfInterpreterSource {
+    image: ExecImageSource,
+    compat_root: Option<&'static str>,
+}
+
 impl ExecImageSource {
     fn elf(&self) -> SysResult<xmas_elf::ElfFile<'_>> {
         xmas_elf::ElfFile::new(self.data.as_slice()).map_err(|_| SysError::ENOEXEC)
@@ -247,17 +252,6 @@ fn libc_test_root_from_envs(envs: &[String]) -> Option<&'static str> {
         }
     }
     None
-}
-
-fn libc_test_root_from_interpreter(path: &str) -> Option<&'static str> {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    if name.starts_with("ld-musl") {
-        Some("/musl")
-    } else if name.starts_with("ld-linux") {
-        Some("/glibc")
-    } else {
-        None
-    }
 }
 
 fn push_missing_library_path(envs: &mut Vec<String>, root: &str) {
@@ -487,7 +481,13 @@ fn read_exec_file(path: &str) -> SysResult<ExecImageSource> {
     read_exec_file_in(current_process().path_snapshot().context, path, true)
 }
 
-fn read_elf_interpreter(path: &str) -> SysResult<ExecImageSource> {
+fn read_elf_exec_file(path: &str) -> SysResult<ExecImageSource> {
+    let source = read_exec_file(path)?;
+    source.elf()?;
+    Ok(source)
+}
+
+fn read_elf_interpreter(path: &str) -> SysResult<ElfInterpreterSource> {
     const REDIRECTS: &[(&str, &str)] = &[
         // CONTEXT: libc-test's musl dynamic binary names the soft-float
         // interpreter as a symlink to libc.so. Official test sources state
@@ -512,12 +512,34 @@ fn read_elf_interpreter(path: &str) -> SysResult<ExecImageSource> {
         ("/lib64/ld-musl-loongarch-lp64d.so.1", "/musl/lib/libc.so"),
     ];
 
+    // Respect the executable's PT_INTERP path whenever the mounted root
+    // provides a real ELF loader. Final-round Debian images materialize their
+    // system loader at the standard path, and redirecting those binaries to
+    // the preliminary `/glibc/lib` loader mixes incompatible glibc versions.
+    let direct_error = match read_elf_exec_file(path) {
+        Ok(image) => {
+            return Ok(ElfInterpreterSource {
+                image,
+                compat_root: None,
+            });
+        }
+        Err(error @ (SysError::ENOENT | SysError::ENOEXEC)) => error,
+        Err(error) => return Err(error),
+    };
+
     for (alias, target) in REDIRECTS {
         if path == *alias {
-            return read_exec_file(target).or_else(|_| read_exec_file(path));
+            // CONTEXT: Preliminary images may omit the standard loader or
+            // materialize it as a non-ELF redirect file. Preserve their
+            // established libc-root fallback after the real path is rejected.
+            let image = read_elf_exec_file(target)?;
+            return Ok(ElfInterpreterSource {
+                image,
+                compat_root: libc_test_root("", target),
+            });
         }
     }
-    read_exec_file(path)
+    Err(direct_error)
 }
 
 fn append_script_args(
@@ -660,29 +682,38 @@ fn exec_loaded_program(
         // test programs before dynamic linker support; keep that compatibility
         // path while using PT_INTERP for binaries that actually need DSOs.
         let interpreter_path = elf_required_interpreter_path_from_source(&elf, &source)?;
-        if let Some(root) = interpreter_path
-            .as_deref()
-            .and_then(libc_test_root_from_interpreter)
+        if interpreter_path.is_some()
+            && let Some(root) = libc_test_root("", path.as_str())
         {
-            // CONTEXT: LTP may copy a dynamically linked libc-root helper into
-            // a temporary mountpoint and exec it with a minimal custom envp.
-            // The interpreter still identifies the libc family, so preserve the
-            // custom envp and add only the library search path the loader needs.
+            // CONTEXT: Preliminary libc-root dynamic ELF helpers need their
+            // adjacent DSOs even when a standard loader path is materialized.
+            // Static BusyBox binaries and scripts must not inject this into
+            // descendants that use the final image's Debian runtime.
             push_missing_library_path(&mut envs, root);
         }
         let interpreter_source = interpreter_path
             .as_ref()
             .map(|path| read_elf_interpreter(path.as_str()))
             .transpose()?;
+        if let Some(root) = interpreter_source
+            .as_ref()
+            .and_then(|source| source.compat_root)
+        {
+            // CONTEXT: LTP may copy a dynamically linked libc-root helper into
+            // a temporary mountpoint and exec it with a minimal custom envp.
+            // A compatibility-loader selection still identifies the libc
+            // family even when the executable pathname no longer does.
+            push_missing_library_path(&mut envs, root);
+        }
         let interpreter_elf = interpreter_source
             .as_ref()
-            .map(ExecImageSource::elf)
+            .map(|source| source.image.elf())
             .transpose()?;
         let interpreter = match (interpreter_elf.as_ref(), interpreter_source.as_ref()) {
             (Some(interpreter_elf), Some(interpreter_source)) => Some((
                 interpreter_elf,
-                interpreter_source.file.clone(),
-                interpreter_source.file_size,
+                interpreter_source.image.file.clone(),
+                interpreter_source.image.file_size,
             )),
             _ => None,
         };
@@ -714,7 +745,6 @@ fn exec_loaded_program(
 
 fn exec_path(path: String, args: Vec<String>, envs: Vec<String>) -> SysResult {
     let args = normalize_exec_args(args);
-    let envs = normalize_exec_envs(path.as_str(), envs);
     let path = shell_path_redirect(path.as_str(), envs.as_slice()).unwrap_or(path);
     let context = current_process().path_snapshot().context;
     let executable_node = executable_node_in(context.clone(), path.as_str(), true);
@@ -731,7 +761,6 @@ fn exec_path_in(
     envs: Vec<String>,
 ) -> SysResult {
     let args = normalize_exec_args(args);
-    let envs = normalize_exec_envs(path.as_str(), envs);
     let executable_path = normalized_exec_path_in(&context, path.as_str());
     let executable_node = executable_node_in(context.clone(), path.as_str(), follow_final_symlink);
     let data = read_exec_file_in(context, path.as_str(), follow_final_symlink)?;
@@ -745,7 +774,6 @@ fn exec_open_file(
     envs: Vec<String>,
 ) -> SysResult {
     let args = normalize_exec_args(args);
-    let envs = normalize_exec_envs(display_path.as_str(), envs);
     let executable_node = file.vfs_node_id();
     let data = read_exec_open_file(file)?;
     // UNFINISHED: Linux gives execveat(AT_EMPTY_PATH) scripts a `/dev/fd/N`
@@ -771,18 +799,6 @@ fn normalize_exec_args(mut args: Vec<String>) -> Vec<String> {
         args.push(String::new());
     }
     args
-}
-
-fn normalize_exec_envs(path: &str, mut envs: Vec<String>) -> Vec<String> {
-    let snapshot = current_process().path_snapshot();
-    if let Some(root) = libc_test_root(snapshot.cwd_path.as_str(), path) {
-        // CONTEXT: Official-style test disks keep glibc/musl DSOs under the
-        // libc root instead of materializing the default root `/lib` search
-        // tree. Preserve custom envp contents, but add the loader path needed
-        // for dynamically linked LTP child helpers.
-        push_missing_library_path(&mut envs, root);
-    }
-    envs
 }
 
 pub fn sys_execve_ctx(
