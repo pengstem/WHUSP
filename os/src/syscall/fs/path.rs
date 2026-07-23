@@ -2,9 +2,9 @@ use super::super::SyscallContext;
 use super::super::errno::{SysError, SysResult};
 use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{
-    PATH_MAX, UserBufferAccess, copy_to_user_ctx, read_user_c_string, read_user_c_string_ctx,
-    read_user_value, read_user_value_ctx, translated_byte_buffer_checked_ctx,
-    translated_byte_buffer_checked_with_mmap_fault_ctx,
+    PATH_MAX, UserBufferAccess, copy_to_user_ctx, copy_to_user_with_mmap_fault_ctx,
+    read_user_c_string, read_user_c_string_ctx, read_user_value, read_user_value_ctx,
+    translated_byte_buffer_checked_ctx, translated_byte_buffer_checked_with_mmap_fault_ctx,
 };
 use super::fanotify::{
     fanotify_notify_create, fanotify_notify_delete, fanotify_notify_modify, fanotify_notify_move,
@@ -528,7 +528,7 @@ fn copy_c_string_to_user_ctx(
     let mut bytes = Vec::with_capacity(total_len);
     bytes.extend_from_slice(string.as_bytes());
     bytes.push(0);
-    copy_to_user_ctx(ctx, ptr, &bytes)?;
+    copy_to_user_with_mmap_fault_ctx(ctx, ptr, &bytes)?;
     Ok(total_len as isize)
 }
 

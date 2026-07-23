@@ -801,6 +801,25 @@ pub(crate) fn copy_to_user_ctx(ctx: &SyscallContext, ptr: *mut u8, src: &[u8]) -
     copy_to_user_with_site_ctx(ctx, ptr, src, None, perf::UsercopySite::CopyToUser)
 }
 
+/// Copies kernel bytes into a user buffer, resolving valid mmap-backed pages.
+///
+/// Syscalls whose output buffer may point at a lazily populated mapping must
+/// use this variant. The normal context helper intentionally only resolves the
+/// anonymous framed pages used by stacks and similar process-owned regions.
+pub(crate) fn copy_to_user_with_mmap_fault_ctx(
+    ctx: &SyscallContext,
+    ptr: *mut u8,
+    src: &[u8],
+) -> SysResult<()> {
+    copy_to_user_with_site_ctx(
+        ctx,
+        ptr,
+        src,
+        Some(mmap_user_fault),
+        perf::UsercopySite::CopyToUser,
+    )
+}
+
 fn copy_to_user_with_site(
     token: usize,
     ptr: *mut u8,
