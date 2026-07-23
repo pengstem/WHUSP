@@ -81,6 +81,9 @@ def entry_script(run_cagent: bool, run_buildstorm: bool) -> str:
 run_cagent="{enabled_default(run_cagent)}"
 run_buildstorm="{enabled_default(run_buildstorm)}"
 
+export PATH="/glibc:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export TERM="vt220"
+
 is_enabled() {{
     case "$1" in
         1|yes|true|on) return 0 ;;
@@ -101,8 +104,6 @@ run_case() {{
     echo "FINAL: finished $case_name (status=$case_status)"
     return "$case_status"
 }}
-
-export PATH="/glibc:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 overall_status=0
 
@@ -131,6 +132,15 @@ else
 fi
 
 echo "FINAL: all enabled tests finished (status=$overall_status)"
+
+if /musl/busybox grep -q '^perf_counters_enabled 1$' /proc/oskernel/perf 2>/dev/null; then
+    echo "#### KERNEL PERF START ####"
+    /musl/busybox cat /proc/oskernel/perf
+    echo "#### KERNEL PERF END ####"
+fi
+
+/musl/busybox sync
+/musl/busybox reboot -f
 exit "$overall_status"
 """
 

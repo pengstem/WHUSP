@@ -216,42 +216,14 @@ fn is_path_under(path: &str, root: &str) -> bool {
     }
 }
 
-fn libc_test_root(cwd_path: &str, script_path: &str) -> Option<&'static str> {
-    if is_path_under(script_path, "/musl") || is_path_under(cwd_path, "/musl") {
+fn libc_test_root(path: &str) -> Option<&'static str> {
+    if is_path_under(path, "/musl") {
         Some("/musl")
-    } else if is_path_under(script_path, "/glibc") || is_path_under(cwd_path, "/glibc") {
+    } else if is_path_under(path, "/glibc") {
         Some("/glibc")
     } else {
         None
     }
-}
-
-fn libc_test_root_from_envs(envs: &[String]) -> Option<&'static str> {
-    // Contest helper scripts can exec `/tmp` files whose pathname no longer
-    // reveals `/musl` or `/glibc`. Use inherited environment only to choose the
-    // BusyBox shebang fallback root; ELF interpreter aliases stay separate.
-    for env in envs {
-        if let Some(root) = env.strip_prefix("LTPROOT=") {
-            if is_path_under(root, "/musl") {
-                return Some("/musl");
-            }
-            if is_path_under(root, "/glibc") {
-                return Some("/glibc");
-            }
-        }
-    }
-
-    for env in envs {
-        if let Some(paths) = env.strip_prefix("LD_LIBRARY_PATH=") {
-            if paths.starts_with("/musl/lib") {
-                return Some("/musl");
-            }
-            if paths.starts_with("/glibc/lib") {
-                return Some("/glibc");
-            }
-        }
-    }
-    None
 }
 
 fn push_missing_library_path(envs: &mut Vec<String>, root: &str) {
@@ -313,54 +285,6 @@ fn executable_node_in(
 ) -> Option<VfsNodeId> {
     let path = lookup_path_in(context, path, follow_final_symlink).ok()?;
     (path.kind == FsNodeKind::RegularFile).then_some(path.node)
-}
-
-fn busybox_fallback(
-    interpreter: &ScriptInterpreter,
-    script_path: &str,
-    envs: &[String],
-) -> Option<(String, Vec<String>)> {
-    let snapshot = current_process().path_snapshot();
-    let root = libc_test_root(snapshot.cwd_path.as_str(), script_path)
-        .or_else(|| libc_test_root_from_envs(envs))
-        .unwrap_or("/musl");
-    let mut busybox_path = String::from(root);
-    busybox_path.push_str("/busybox");
-
-    let mut args = Vec::new();
-    args.push(busybox_path.clone());
-    match interpreter.path.as_str() {
-        "/bin/sh" | "/bin/bash" | "sh" | "bash" => args.push(String::from("sh")),
-        "/busybox" | "/bin/busybox" | "busybox" => {}
-        _ => return None,
-    }
-    if let Some(optional_arg) = interpreter.optional_arg.as_ref() {
-        args.push(optional_arg.clone());
-    }
-    Some((busybox_path, args))
-}
-
-fn interpreter_candidates(
-    interpreter: &ScriptInterpreter,
-    script_path: &str,
-    envs: &[String],
-) -> Vec<(String, Vec<String>)> {
-    let mut direct_args = Vec::new();
-    direct_args.push(interpreter.path.clone());
-    if let Some(optional_arg) = interpreter.optional_arg.as_ref() {
-        direct_args.push(optional_arg.clone());
-    }
-
-    let mut candidates = Vec::new();
-    candidates.push((interpreter.path.clone(), direct_args));
-    if let Some(fallback) = busybox_fallback(interpreter, script_path, envs) {
-        // CONTEXT: Official-style test disks put shell-capable BusyBox under
-        // `/musl` or `/glibc` instead of providing a real `/bin/sh`. LTP often
-        // executes temporary scripts from `/tmp`, so infer the active libc root
-        // from inherited environment when the path alone is ambiguous.
-        candidates.push(fallback);
-    }
-    candidates
 }
 
 fn read_u16_le(data: &[u8], offset: usize) -> SysResult<usize> {
@@ -535,7 +459,7 @@ fn read_elf_interpreter(path: &str) -> SysResult<ElfInterpreterSource> {
             let image = read_elf_exec_file(target)?;
             return Ok(ElfInterpreterSource {
                 image,
-                compat_root: libc_test_root("", target),
+                compat_root: libc_test_root(target),
             });
         }
     }
@@ -625,40 +549,24 @@ fn exec_script(
         return Err(SysError::ELOOP);
     }
 
-    for (interpreter_path, candidate_args) in
-        interpreter_candidates(&interpreter, script_path.as_str(), envs.as_slice())
-    {
-        let Ok(interpreter_data) = read_exec_file(interpreter_path.as_str()) else {
-            continue;
-        };
-        let context = current_process().path_snapshot().context;
-        let executable_path = normalized_exec_path_in(&context, interpreter_path.as_str());
-        let next_args = append_script_args(candidate_args, script_path, args);
-        return exec_loaded_program(
-            interpreter_path,
-            executable_path,
-            next_args,
-            envs,
-            depth + 1,
-            interpreter_data,
-            None,
-        );
+    let interpreter_path = interpreter.path;
+    let mut interpreter_args = vec![interpreter_path.clone()];
+    if let Some(optional_arg) = interpreter.optional_arg {
+        interpreter_args.push(optional_arg);
     }
-
-    Err(SysError::ENOENT)
-}
-
-fn shell_path_redirect(path: &str, envs: &[String]) -> Option<String> {
-    match path {
-        "/bin/sh" | "/bin/bash" => {
-            // CONTEXT: Official-style test disks do not materialize root-level
-            // shell paths; direct execs inherit the active libc family through
-            // envp and run that root's BusyBox shell applet instead.
-            let root = libc_test_root_from_envs(envs).unwrap_or("/musl");
-            Some(format!("{root}/busybox"))
-        }
-        _ => None,
-    }
+    let interpreter_data = read_exec_file(interpreter_path.as_str())?;
+    let context = current_process().path_snapshot().context;
+    let executable_path = normalized_exec_path_in(&context, interpreter_path.as_str());
+    let next_args = append_script_args(interpreter_args, script_path, args);
+    exec_loaded_program(
+        interpreter_path,
+        executable_path,
+        next_args,
+        envs,
+        depth + 1,
+        interpreter_data,
+        None,
+    )
 }
 
 fn exec_loaded_program(
@@ -683,7 +591,7 @@ fn exec_loaded_program(
         // path while using PT_INTERP for binaries that actually need DSOs.
         let interpreter_path = elf_required_interpreter_path_from_source(&elf, &source)?;
         if interpreter_path.is_some()
-            && let Some(root) = libc_test_root("", path.as_str())
+            && let Some(root) = libc_test_root(path.as_str())
         {
             // CONTEXT: Preliminary libc-root dynamic ELF helpers need their
             // adjacent DSOs even when a standard loader path is materialized.
@@ -745,7 +653,15 @@ fn exec_loaded_program(
 
 fn exec_path(path: String, args: Vec<String>, envs: Vec<String>) -> SysResult {
     let args = normalize_exec_args(args);
-    let path = shell_path_redirect(path.as_str(), envs.as_slice()).unwrap_or(path);
+    // CONTEXT: CAgent's statically linked command runner invokes `/bin/sh -c`
+    // directly. Keep that narrow command-shell ABI on the static BusyBox path
+    // until the Debian dash syscall/runtime closure is complete. Shebang
+    // interpreters and `/bin/bash` still resolve exactly as named.
+    let path = if path == "/bin/sh" {
+        String::from("/musl/busybox")
+    } else {
+        path
+    };
     let context = current_process().path_snapshot().context;
     let executable_node = executable_node_in(context.clone(), path.as_str(), true);
     let executable_path = normalized_exec_path_in(&context, path.as_str());

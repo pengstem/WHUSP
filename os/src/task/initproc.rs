@@ -3,7 +3,7 @@ use alloc::{string::String, vec, vec::Vec};
 
 const BUSYBOX_PATH: &str = "/musl/busybox";
 const BUSYBOX_APPLET: &str = "sh";
-const BUSYBOX_COMMAND_FLAG: &str = "-c";
+const SCRIPT_DISK_ENTRY: &str = "/x1/entry.sh";
 
 pub(super) struct KernelInitProc {
     pub(super) path: String,
@@ -14,9 +14,9 @@ pub(super) struct KernelInitProc {
 }
 
 pub(super) fn load() -> Option<KernelInitProc> {
-    // CONTEXT: The submit path is kernel-owned: load BusyBox from the mounted
-    // contest disk and run the generated test command through `sh -c`, without
-    // depending on user/Cargo initproc binaries.
+    // CONTEXT: The kernel owns only the PID 1 ELF bootstrap and the stable
+    // script-disk handoff path. Test selection, environment, diagnostics, and
+    // shutdown policy live in the generated `/x1/entry.sh`.
     let inode = open_file(BUSYBOX_PATH, OpenFlags::RDONLY).ok()?;
     Some(KernelInitProc {
         path: BUSYBOX_PATH.into(),
@@ -25,12 +25,8 @@ pub(super) fn load() -> Option<KernelInitProc> {
         argv: vec![
             BUSYBOX_PATH.into(),
             BUSYBOX_APPLET.into(),
-            BUSYBOX_COMMAND_FLAG.into(),
-            super::contest_runner::build_runner_command(),
+            SCRIPT_DISK_ENTRY.into(),
         ],
-        envp: vec![
-            "PATH=/:/bin:/sbin:/usr/bin:/usr/local/bin".into(),
-            "TERM=vt220".into(),
-        ],
+        envp: Vec::new(),
     })
 }

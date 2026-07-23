@@ -998,6 +998,7 @@ def entry_script(
         "esac",
         'WHUSP_SCRIPT_ROOT="$script_dir"',
         'export PATH="$WHUSP_SCRIPT_ROOT/bin:/tmp/bin:/musl:/glibc:$PATH"',
+        'export TERM="vt220"',
         "/musl/busybox mkdir -p /tmp/bin",
         "/musl/busybox --install -s /tmp/bin",
     ]
@@ -1019,7 +1020,8 @@ def entry_script(
             "fi",
             '. "$script_dir/common.sh"',
             "",
-            'case "${WHUSP_ARCH:-rv}" in',
+            'machine=$(/musl/busybox uname -m 2>/dev/null)',
+            'case "${WHUSP_ARCH:-$machine}" in',
             '    la|loongarch64) WHUSP_ARCH="la" ;;',
             '    *) WHUSP_ARCH="rv" ;;',
             "esac",
@@ -1047,7 +1049,19 @@ def entry_script(
             for libc_root in libc_roots:
                 append_skip_group_marker(lines, name, libc_label(libc_root))
         lines.append("")
-    lines.append("exit 0")
+    lines.extend(
+        [
+            "if /musl/busybox grep -q '^perf_counters_enabled 1$' /proc/oskernel/perf 2>/dev/null; then",
+            "    echo '#### KERNEL PERF START ####'",
+            "    /musl/busybox cat /proc/oskernel/perf",
+            "    echo '#### KERNEL PERF END ####'",
+            "fi",
+            "",
+            "/musl/busybox sync",
+            "/musl/busybox reboot -f",
+            "exit 0",
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -1181,13 +1195,13 @@ def _write_outputs_unlocked(
 Generated from:
 
 - `scripts/export_preliminary_contest_case_scripts.py`
-- `os/src/task/contest_runner.rs`
+- `os/src/task/initproc.rs`
 - `scripts/ltp_whitelist.txt`
 - `{runtest_display}`
 
 This directory exports the guest-side commands for every contest test group in
 `ALL_TESTS`, plus every current LTP whitelist case. It is a script view of the
-script-disk generation plan and runner command construction.
+script-disk generation and PID 1 handoff plan.
 
 Current metadata:
 

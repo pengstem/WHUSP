@@ -1,5 +1,4 @@
 mod clone;
-mod contest_runner;
 mod exec;
 mod fd;
 pub(crate) mod futex;
