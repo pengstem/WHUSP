@@ -3,14 +3,16 @@
     .equ KSAVE_CTX,  0x31
     .equ KSAVE_USP,  0x32
     .equ LA_CSR_PRMD, 0x1
+    .equ LA_CSR_EUEN, 0x2
     .equ LA_CSR_ESTAT, 0x5
     .equ LA_CSR_ERA, 0x6
     .equ LA_CSR_PGDL, 0x19
     .equ LA_CSR_PGDH, 0x1a
     .equ LA_CSR_PGD, 0x1b
     .equ LA_CSR_TLBRSAVE, 0x8b
-    .equ FCC_OFFSET, 69
-    .equ FCSR_OFFSET, 70
+    .equ VECTOR_OFFSET, 40
+    .equ FCC_OFFSET, 168
+    .equ FCSR_OFFSET, 169
 
     .macro SAVE_REGS
         st.d    $ra, $sp,  1*8
@@ -90,19 +92,55 @@
     .endm
 
     .macro SAVE_FP n
-        fst.d   $f\n, $sp, (37+\n)*8
+        fst.d   $f\n, $sp, (VECTOR_OFFSET+4*\n)*8
     .endm
 
     .macro LOAD_FP n
-        fld.d   $f\n, $sp, (37+\n)*8
+        fld.d   $f\n, $sp, (VECTOR_OFFSET+4*\n)*8
+    .endm
+
+    .macro SAVE_LSX n
+        vst     $vr\n, $sp, (VECTOR_OFFSET+4*\n)*8
+    .endm
+
+    .macro LOAD_LSX n
+        vld     $vr\n, $sp, (VECTOR_OFFSET+4*\n)*8
+    .endm
+
+    .macro SAVE_LASX n
+        xvst    $xr\n, $sp, (VECTOR_OFFSET+4*\n)*8
+    .endm
+
+    .macro LOAD_LASX n
+        xvld    $xr\n, $sp, (VECTOR_OFFSET+4*\n)*8
     .endm
 
     .macro SAVE_FP_REGS
+        csrrd   $t0, LA_CSR_EUEN
+        andi    $t1, $t0, 0x4
+        bnez    $t1, 1f
+        andi    $t1, $t0, 0x2
+        bnez    $t1, 2f
         .set n, 0
         .rept 32
             SAVE_FP %n
             .set n, n+1
         .endr
+        b       3f
+1:
+        .set n, 0
+        .rept 32
+            SAVE_LASX %n
+            .set n, n+1
+        .endr
+        b       3f
+2:
+        .set n, 0
+        .rept 32
+            SAVE_LSX %n
+            .set n, n+1
+        .endr
+3:
         movcf2gr    $t0, $fcc0
         move        $t1, $t0
         movcf2gr    $t0, $fcc1
@@ -125,11 +163,31 @@
     .endm
 
     .macro LOAD_FP_REGS
+        csrrd   $t0, LA_CSR_EUEN
+        andi    $t1, $t0, 0x4
+        bnez    $t1, 1f
+        andi    $t1, $t0, 0x2
+        bnez    $t1, 2f
         .set n, 0
         .rept 32
             LOAD_FP %n
             .set n, n+1
         .endr
+        b       3f
+1:
+        .set n, 0
+        .rept 32
+            LOAD_LASX %n
+            .set n, n+1
+        .endr
+        b       3f
+2:
+        .set n, 0
+        .rept 32
+            LOAD_LSX %n
+            .set n, n+1
+        .endr
+3:
         ld.d        $t0, $sp, FCC_OFFSET*8
         bstrpick.d  $t1, $t0, 7, 0
         movgr2cf    $fcc0, $t1

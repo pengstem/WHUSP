@@ -14,6 +14,7 @@ use crate::task::{
 use crate::timer::{check_timer, get_time_us, set_next_trigger};
 use alloc::sync::Arc;
 use core::arch::global_asm;
+use loongArch64::cpu::CPUCFG;
 use loongArch64::register::{
     badv, ecfg,
     ecfg::LineBasedInterrupt,
@@ -27,8 +28,15 @@ global_asm!(include_str!("trap.S"));
 
 pub fn init() {
     // CONTEXT: The LoongArch contest userland is built with the lp64d ABI.
-    // Keep the FP unit enabled and save its state at user trap boundaries.
+    // Enable every vector width implemented by this CPU. trap.S inspects the
+    // same EUEN bits and eagerly preserves the corresponding user state.
+    let extension_config = CPUCFG::read(2);
+    let lsx = extension_config.get_bit(6);
+    let lasx = extension_config.get_bit(7);
+    assert!(!lasx || lsx, "LASX CPUCFG support requires LSX support");
     euen::set_fpe(true);
+    euen::set_sxe(lsx);
+    euen::set_asxe(lasx);
     tlb_init();
     set_kernel_trap_entry();
 }
