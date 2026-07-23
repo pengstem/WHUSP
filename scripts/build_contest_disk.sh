@@ -8,13 +8,29 @@ image_size="${CONTEST_SCRIPT_DISK_SIZE:-64M}"
 script_dir="${CONTEST_SCRIPT_DIR:-$repo_root/contest-case-commands}"
 tmp_image="${image_path}.tmp"
 lock_path="${CONTEST_SCRIPT_LOCK:-/tmp/whusp-build-contest-disk.lock}"
+interactive="${CONTEST_INTERACTIVE:-0}"
 
 exec 9>"$lock_path"
 flock 9
 
-python3 "$repo_root/scripts/export_contest_case_scripts.py" \
-    --out-dir "$script_dir" \
+exporter_args=(
+    --out-dir "$script_dir"
     --force
+)
+case "$interactive" in
+    1|yes|true|on)
+        exporter_args+=(--interactive)
+        ;;
+    0|no|false|off|"")
+        ;;
+    *)
+        echo "CONTEST_INTERACTIVE must be one of 0/1, no/yes, false/true, or off/on: $interactive" >&2
+        exit 2
+        ;;
+esac
+
+python3 "$repo_root/scripts/export_contest_case_scripts.py" \
+    "${exporter_args[@]}"
 
 rm -f "$tmp_image"
 truncate -s "$image_size" "$tmp_image"

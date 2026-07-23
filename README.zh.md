@@ -106,12 +106,19 @@ CARGO_NET_OFFLINE=true make all
 在 QEMU 中启动内核并挂载测试磁盘：
 
 ```bash
-make run-rv                          # 启动 RISC-V（默认磁盘：./sdcard-rv.img）
-make run-la                          # 启动 LoongArch（默认磁盘：./sdcard-la.img）
+make run-rv                          # 编译并启动 RISC-V
+make run-la                          # 编译并启动 LoongArch
 
 # 覆盖测试磁盘或调整资源
 make run-rv TEST_DISK=/path/to/sdcard-rv.img
 make run-rv MEM=2G SMP=4
+
+# 复用根目录中已有的内核产物
+make run-rv NO_BUILD=1
+
+# 不执行测试，进入 BusyBox 交互 shell
+make shell-rv
+make shell-rv NO_BUILD=1             # 同时跳过内核编译
 ```
 
 ### 测试配置
@@ -123,57 +130,37 @@ make run-rv MEM=2G SMP=4
 
 | 脚本 | 作用 |
 |------|------|
-| `scripts/export_contest_case_scripts.py` | **核心配置文件** — 定义运行哪些测试组、使用哪个 libc、跑哪些 LTP 用例。在此处修改配置常量，然后重建。 |
+| `scripts/export_contest_case_scripts.py` | 生成决赛 CAgent/BuildStorm runner，或生成交互 shell 入口。 |
 | `scripts/build_contest_disk.sh` | 调用 Python 导出器并创建 ext4 磁盘镜像。 |
 
-修改配置后重建脚本盘：
+普通运行目标每次只会重新生成这个很小的脚本盘；除非传入 `NO_BUILD=1`，
+否则仍会正常编译内核。
 
 ```bash
-make contest-disk
+make contest-disk                       # 普通决赛 runner
+make contest-disk INTERACTIVE=1         # 交互 shell runner
 ```
 
 #### 配置项一览
 
-所有配置项位于 `scripts/export_contest_case_scripts.py`（及一个配套文件）：
-
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `INTERACTIVE_SHELL` | `False` | `True` → 进入 BusyBox 交互 shell，不执行测试（调试模式） |
-| `TEST_SCRIPTS` | 全部 11 个组 | 启用哪些测试组。删除条目即可跳过对应套件。 |
-| `TEST_LIBCS` | `("/glibc", "/musl")` | 测试哪些 libc 根目录。 |
-| `LTP_CASE_FILTER_OPTION` | `None` | 运行时过滤 LTP 用例。`None` = 跑完整白名单；`"prefix:ioctl"` = 仅 ioctl 相关用例；`"case:fork07"` = 单个用例；`"a"`–`"z"` = 按首字母筛选；`"range:start,end"` = 字典序区间。 |
-| [`scripts/ltp_whitelist.txt`](scripts/ltp_whitelist.txt) | ~800 个用例 | 精选的 LTP 用例列表（每行一个）。当 `LTP_CASE_FILTER_OPTION` 为 `None` 时生效。 |
+| `INTERACTIVE` | `0` | 设为 `1` 时生成进入 BusyBox shell 的脚本盘，不执行测试。 |
+| `NO_BUILD` | `0` | 设为 `1` 时复用 `./kernel-rv` 或 `./kernel-la`；产物不存在会明确报错。 |
+| `RUN_CAGENT` | `True` | 在导出器中启用决赛 CAgent 测试。 |
+| `RUN_BUILDSTORM` | `False` | 在导出器中启用决赛 BuildStorm 测试。 |
 
 #### 常见工作流
 
-**调试单个 LTP 用例：**
-
-1. 编辑 `scripts/export_contest_case_scripts.py`：
-   ```python
-   INTERACTIVE_SHELL = True
-   LTP_CASE_FILTER_OPTION = "case:fork07"
-   ```
-2. 重建并运行：
-   ```bash
-   make contest-disk && make run-rv
-   ```
-
-**快速迭代 — 只跑 basic 测试组：**
-
-1. 编辑 `scripts/export_contest_case_scripts.py`：
-   ```python
-   TEST_SCRIPTS = ("basic_testcode.sh",)
-   ```
-2. 重建并运行：
-   ```bash
-   make contest-disk && make run-rv
-   ```
-
-**向白名单添加新的 LTP 用例：**
-
 ```bash
-echo "new_case_name" >> scripts/ltp_whitelist.txt
-make contest-disk
+# 只改变 guest 里运行的普通任务，复用上次编译的内核
+make run-rv NO_BUILD=1
+
+# 使用同一个内核进入 shell
+make shell-rv NO_BUILD=1
+
+# 自动评分工具也支持同样的快速路径
+python3 tools/score_autotest.py --arch rv --no-build
 ```
 
 ---

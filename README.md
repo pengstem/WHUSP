@@ -106,12 +106,19 @@ CARGO_NET_OFFLINE=true make all
 Boot the kernel in QEMU with the test disk attached:
 
 ```bash
-make run-rv                          # Boot RISC-V (default: ./sdcard-rv.img)
-make run-la                          # Boot LoongArch (default: ./sdcard-la.img)
+make run-rv                          # Build and boot RISC-V
+make run-la                          # Build and boot LoongArch
 
 # Override test disk or tune resources
 make run-rv TEST_DISK=/path/to/sdcard-rv.img
 make run-rv MEM=2G SMP=4
+
+# Reuse an existing root-level kernel artifact
+make run-rv NO_BUILD=1
+
+# Enter an interactive BusyBox shell instead of running tests
+make shell-rv
+make shell-rv NO_BUILD=1             # Also skip the kernel build
 ```
 
 ### Test Configuration
@@ -124,57 +131,37 @@ The script disk is built by two files under `scripts/`:
 
 | Script | Role |
 |--------|------|
-| `scripts/export_contest_case_scripts.py` | **Central configuration** — defines which tests run, under which libc, with which LTP cases. Edit constants here, then rebuild. |
+| `scripts/export_contest_case_scripts.py` | Generates the final-round CAgent/BuildStorm runner or an interactive shell entry point. |
 | `scripts/build_contest_disk.sh` | Wraps the Python exporter and creates the ext4 disk image. |
 
-Rebuild the script disk after changing any configuration:
+The normal run targets rebuild only this small script disk on every invocation.
+The kernel is rebuilt unless `NO_BUILD=1` is supplied.
 
 ```bash
-make contest-disk
+make contest-disk                       # Normal final-round runner
+make contest-disk INTERACTIVE=1         # Interactive shell runner
 ```
 
 #### Configuration Knobs
 
-All knobs live in `scripts/export_contest_case_scripts.py` (and one companion file):
-
 | Knob | Default | What it controls |
 |------|---------|-----------------|
-| `INTERACTIVE_SHELL` | `False` | `True` → drop into a BusyBox shell instead of running tests (debug mode) |
-| `TEST_SCRIPTS` | all 11 groups | Which test groups to enable. Remove entries to skip suites. |
-| `TEST_LIBCS` | `("/glibc", "/musl")` | Which libc roots to test. |
-| `LTP_CASE_FILTER_OPTION` | `None` | Filter LTP cases at runtime. `None` = full whitelist; `"prefix:ioctl"` = only ioctl tests; `"case:fork07"` = single case; `"a"`–`"z"` = first-letter filter; `"range:start,end"` = lexicographic range. |
-| [`scripts/ltp_whitelist.txt`](scripts/ltp_whitelist.txt) | ~800 cases | Curated LTP case list (one per line). Used when `LTP_CASE_FILTER_OPTION` is `None`. |
+| `INTERACTIVE` | `0` | `1` creates a script disk that enters a BusyBox shell instead of running tests. |
+| `NO_BUILD` | `0` | `1` reuses `./kernel-rv` or `./kernel-la`; the command fails clearly if the requested artifact is absent. |
+| `RUN_CAGENT` | `True` | Enables the final-round CAgent test in the exporter. |
+| `RUN_BUILDSTORM` | `False` | Enables the final-round BuildStorm test in the exporter. |
 
 #### Common Workflows
 
-**Debug a specific LTP case:**
-
-1. Edit `scripts/export_contest_case_scripts.py`:
-   ```python
-   INTERACTIVE_SHELL = True
-   LTP_CASE_FILTER_OPTION = "case:fork07"
-   ```
-2. Rebuild and run:
-   ```bash
-   make contest-disk && make run-rv
-   ```
-
-**Fast iteration — run only the basic test group:**
-
-1. Edit `scripts/export_contest_case_scripts.py`:
-   ```python
-   TEST_SCRIPTS = ("basic_testcode.sh",)
-   ```
-2. Rebuild and run:
-   ```bash
-   make contest-disk && make run-rv
-   ```
-
-**Add a new LTP case to the whitelist:**
-
 ```bash
-echo "new_case_name" >> scripts/ltp_whitelist.txt
-make contest-disk
+# Change only the guest-side task and reuse the last compiled kernel
+make run-rv NO_BUILD=1
+
+# Open a shell with that same kernel
+make shell-rv NO_BUILD=1
+
+# The scorer supports the same fast path
+python3 tools/score_autotest.py --arch rv --no-build
 ```
 
 ---
