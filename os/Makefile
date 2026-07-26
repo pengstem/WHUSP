@@ -17,9 +17,15 @@ endif
 
 MODE_ARG := $(if $(filter release,$(MODE)),--release)
 PERF_FEATURE_ARG := $(if $(filter 1 yes true on,$(PERF_COUNTERS)),--features perf-counters)
-MEM ?= 8G
+# Per-arch defaults when this Makefile is invoked directly; root targets pass MEM explicitly.
+ifeq ($(ARCH),loongarch64)
+MEM ?= 16G
+else
+MEM ?= 12G
+endif
 SMP ?= 8
-MAX_CPUS := 8
+# Must stay in sync with os/src/config.rs and both entry.asm boot stacks.
+MAX_CPUS := 12
 TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 KERNEL_ELF := $(TARGET_DIR)/$(TARGET)/$(MODE)/os
 PRIMARY_DISK ?= $(DEFAULT_DISK)

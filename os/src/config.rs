@@ -8,8 +8,9 @@ pub const DL_INTERP_OFFSET: usize = 0x30_0000_0000;
 pub const KERNEL_STACK_SIZE: usize = 4096 * 10;
 
 /// Maximum number of logical CPUs supported by the current contest machine.
-/// Keep the QEMU SMP guards in the root and kernel Makefiles synchronized.
-pub const MAX_CPUS: usize = 8;
+/// Keep the QEMU SMP guards in the root/kernel Makefiles, entry.asm boot
+/// stacks, and host-side SMP tools synchronized with this value.
+pub const MAX_CPUS: usize = 12;
 pub const BOOT_STACK_SIZE: usize = 4096 * 16;
 
 pub const KERNEL_HEAP_SIZE: usize = 0x800_0000;

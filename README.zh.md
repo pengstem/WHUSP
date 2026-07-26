@@ -112,6 +112,7 @@ make run-la                          # 编译并启动 LoongArch
 # 覆盖测试磁盘或调整资源
 make run-rv TEST_DISK=/path/to/sdcard-rv.img
 make run-rv MEM=2G SMP=4
+# 默认：RV 12G / LA 16G，SMP=8（MAX_CPUS=12）
 
 # 复用根目录中已有的内核产物
 make run-rv NO_BUILD=1

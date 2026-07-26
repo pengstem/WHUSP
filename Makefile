@@ -1,12 +1,24 @@
 MODE ?= release
 PERF_COUNTERS ?= 0
-MEM ?= 8G
+# Per-arch QEMU memory defaults. `MEM=...` on the command line still overrides both.
+MEM_RV ?= 12G
+MEM_LA ?= 16G
 SMP ?= 8
 INTERACTIVE ?= 0
 NO_BUILD ?= 0
-MAX_CPUS := 8
+# Must stay in sync with os/src/config.rs and both entry.asm boot stacks.
+MAX_CPUS := 12
 CARGO_HOME ?= $(CURDIR)/vendor
 export CARGO_HOME
+
+# Optional unified override: `make run-rv MEM=2G` / `make run-la MEM=2G`.
+ifdef MEM
+EFFECTIVE_MEM_RV := $(MEM)
+EFFECTIVE_MEM_LA := $(MEM)
+else
+EFFECTIVE_MEM_RV := $(MEM_RV)
+EFFECTIVE_MEM_LA := $(MEM_LA)
+endif
 
 # Keep local development usable when the contest Docker image is unavailable.
 # The extracted GCC 13.2 LoongArch toolchain is intentionally ignored with the
@@ -22,8 +34,8 @@ LOONGARCH_TARGET := loongarch64-unknown-none
 KERNEL_RV_SRC := os/target/$(RISCV_TARGET)/$(MODE)/os
 KERNEL_LA_SRC := os/target/$(LOONGARCH_TARGET)/$(MODE)/os
 
-TEST_DISK ?= $(CURDIR)/sdcard-rv-pub.img
-TEST_DISK_LA ?= $(CURDIR)/sdcard-la-pub.img
+TEST_DISK ?= $(CURDIR)/sdcard-rv-run.img
+TEST_DISK_LA ?= $(CURDIR)/sdcard-la-run.img
 CONTEST_SCRIPT_DISK ?= $(CURDIR)/disk.img
 CONTEST_SCRIPT_DISK_SIZE ?= 64M
 
@@ -78,10 +90,10 @@ check-smp:
 	fi
 
 run-rv: check-smp $(RUN_RV_KERNEL_PREREQ) contest-disk
-	@$(MAKE) --no-print-directory -C os ARCH=riscv64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) MEM=$(MEM) SMP=$(SMP) run-inner KERNEL_ELF="$(CURDIR)/kernel-rv" PRIMARY_DISK="$(TEST_DISK)" AUX_DISK="$(CONTEST_SCRIPT_DISK)"
+	@$(MAKE) --no-print-directory -C os ARCH=riscv64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) MEM=$(EFFECTIVE_MEM_RV) SMP=$(SMP) run-inner KERNEL_ELF="$(CURDIR)/kernel-rv" PRIMARY_DISK="$(TEST_DISK)" AUX_DISK="$(CONTEST_SCRIPT_DISK)"
 
 run-la: check-smp $(RUN_LA_KERNEL_PREREQ) contest-disk
-	@$(MAKE) --no-print-directory -C os ARCH=loongarch64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) MEM=$(MEM) SMP=$(SMP) run-inner KERNEL_ELF="$(CURDIR)/kernel-la" PRIMARY_DISK="$(TEST_DISK_LA)" AUX_DISK="$(CONTEST_SCRIPT_DISK)"
+	@$(MAKE) --no-print-directory -C os ARCH=loongarch64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) MEM=$(EFFECTIVE_MEM_LA) SMP=$(SMP) run-inner KERNEL_ELF="$(CURDIR)/kernel-la" PRIMARY_DISK="$(TEST_DISK_LA)" AUX_DISK="$(CONTEST_SCRIPT_DISK)"
 
 shell-rv: INTERACTIVE=1
 shell-rv: run-rv

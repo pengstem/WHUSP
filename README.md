@@ -112,6 +112,7 @@ make run-la                          # Build and boot LoongArch
 # Override test disk or tune resources
 make run-rv TEST_DISK=/path/to/sdcard-rv.img
 make run-rv MEM=2G SMP=4
+# Defaults: RV 12G / LA 16G, SMP=8 (MAX_CPUS=12)
 
 # Reuse an existing root-level kernel artifact
 make run-rv NO_BUILD=1

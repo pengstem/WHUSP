@@ -1,7 +1,7 @@
     .section .text.entry
     .globl _start
     .equ BOOT_STACK_SHIFT, 16
-    .equ MAX_CPUS, 8
+    .equ MAX_CPUS, 12
 _start:
     la sp, boot_stack_lower_bound
     li t0, 1
