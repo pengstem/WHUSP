@@ -313,6 +313,9 @@ pub(crate) struct ProcessProcSnapshot {
     pub(crate) pid: usize,
     pub(crate) ppid: usize,
     pub(crate) pgid: usize,
+    pub(crate) sid: usize,
+    pub(crate) tty_nr: i32,
+    pub(crate) tpgid: isize,
     pub(crate) comm: String,
     pub(crate) state: char,
     pub(crate) executable_node: Option<VfsNodeId>,
@@ -396,7 +399,10 @@ impl KcmpResourceOwners {
     }
 }
 
-fn proc_task_state(status: TaskStatus, proc_sleeping: bool) -> char {
+fn proc_task_state(status: TaskStatus, proc_sleeping: bool, job_control_stopped: bool) -> char {
+    if job_control_stopped {
+        return 'T';
+    }
     if proc_sleeping {
         return 'S';
     }
@@ -652,6 +658,8 @@ pub struct ProcessControlBlock {
     pub(super) switching_tasks: AtomicUsize,
     pub(super) exclusive_task: AtomicUsize,
     pub(super) inner_owner_cpu: AtomicUsize,
+    pub(crate) job_control_stop_generation: AtomicUsize,
+    pub(crate) job_control_stop_pending: AtomicUsize,
     // mutable
     pub(super) inner: UPIntrFreeCell<ProcessControlBlockInner>,
 }
@@ -819,6 +827,22 @@ pub struct ProcessControlBlockInner {
     pub(crate) fs: ProcessFsContext,
     pub cmdline: Vec<String>,
     pub pgid: usize,
+    pub sid: usize,
+    /// Set only after a forked process commits a new executable image.
+    ///
+    /// A parent may change a direct child's process group only before this
+    /// transition, as required by setpgid(2). Threads share the PCB and do not
+    /// create independent exec state.
+    pub(crate) did_exec_after_fork: bool,
+    /// Set when a non-session-leader uses TIOCNOTTY. The session may retain
+    /// its controlling terminal while this process no longer treats it as its
+    /// own controlling terminal.
+    pub(crate) controlling_tty_detached: bool,
+    /// Process-wide job-control stop state. Each task also carries a scheduler
+    /// gate so ordinary wakeups cannot publish it while this flag is set.
+    pub(crate) job_control_stopped: bool,
+    pub(crate) job_control_stop_signal: Option<u32>,
+    pub(crate) job_control_stop_reported: bool,
     pub exit_signal: u32,
     pub parent: Option<Weak<ProcessControlBlock>>,
     pub children: Vec<Arc<ProcessControlBlock>>,
@@ -1307,19 +1331,64 @@ impl ProcessControlBlock {
         self.inner_exclusive_access().pgid
     }
 
-    pub fn set_process_group_id(&self, pgid: usize) {
-        self.inner_exclusive_access().pgid = pgid;
+    pub fn session_id(&self) -> usize {
+        self.inner_exclusive_access().sid
+    }
+
+    pub(crate) fn job_control_identity(&self) -> (usize, usize, bool) {
+        let inner = self.inner_exclusive_access();
+        (inner.pgid, inner.sid, inner.did_exec_after_fork)
+    }
+
+    pub(crate) fn set_process_group_identity(&self, pgid: usize, sid: usize) {
+        let mut inner = self.inner_exclusive_access();
+        inner.pgid = pgid;
+        inner.sid = sid;
+    }
+
+    pub(crate) fn is_job_control_stopped(&self) -> bool {
+        self.inner_exclusive_access().job_control_stopped
+    }
+
+    pub(crate) fn is_zombie(&self) -> bool {
+        self.inner_exclusive_access().is_zombie
+    }
+
+    pub(crate) fn controlling_tty_detached(&self) -> bool {
+        self.inner_exclusive_access().controlling_tty_detached
+    }
+
+    pub(crate) fn set_controlling_tty_detached(&self, detached: bool) {
+        self.inner_exclusive_access().controlling_tty_detached = detached;
     }
 
     pub(crate) fn proc_snapshot(&self) -> ProcessProcSnapshot {
         let mut inner = self.inner_exclusive_access();
+        let (tty_nr, tpgid) = if inner.controlling_tty_detached {
+            (0, -1)
+        } else {
+            crate::fs::tty_for_session(inner.sid)
+                .and_then(|tty| crate::fs::tty_control_state(tty).map(|control| (tty, control)))
+                .filter(|(_, control)| control.session == Some(inner.sid) && !control.hung_up)
+                .map(|(tty, control)| {
+                    (
+                        tty.proc_tty_nr(),
+                        control.foreground_pgid.map_or(-1, |pgid| pgid as isize),
+                    )
+                })
+                .unwrap_or((0, -1))
+        };
         let leader_status = inner
             .tasks
             .first()
             .and_then(|task| task.as_ref())
             .map(|task| {
                 let task_inner = task.inner_exclusive_access();
-                proc_task_state(task_inner.task_status, task_inner.proc_sleeping)
+                proc_task_state(
+                    task_inner.task_status,
+                    task_inner.proc_sleeping,
+                    task_inner.job_control_stopped,
+                )
             });
         let state = if inner.is_zombie {
             'Z'
@@ -1359,6 +1428,9 @@ impl ProcessControlBlock {
                 .and_then(Weak::upgrade)
                 .map_or(0, |parent| parent.getpid()),
             pgid: inner.pgid,
+            sid: inner.sid,
+            tty_nr,
+            tpgid,
             comm: inner.comm.clone(),
             state,
             executable_node: inner.executable_node,

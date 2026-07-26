@@ -116,6 +116,8 @@ impl ProcessControlBlock {
             switching_tasks: AtomicUsize::new(0),
             exclusive_task: AtomicUsize::new(0),
             inner_owner_cpu: AtomicUsize::new(usize::MAX),
+            job_control_stop_generation: AtomicUsize::new(0),
+            job_control_stop_pending: AtomicUsize::new(0),
             inner: unsafe {
                 UPIntrFreeCell::new(ProcessControlBlockInner {
                     is_zombie: false,
@@ -125,6 +127,12 @@ impl ProcessControlBlock {
                     fs: ProcessFsContext::root(),
                     cmdline: args.clone(),
                     pgid: pid,
+                    sid: pid,
+                    did_exec_after_fork: false,
+                    controlling_tty_detached: false,
+                    job_control_stopped: false,
+                    job_control_stop_signal: None,
+                    job_control_stop_reported: false,
                     exit_signal: SIGCHLD,
                     parent: None,
                     children: Vec::new(),
@@ -166,6 +174,8 @@ impl ProcessControlBlock {
                 })
             },
         });
+        crate::fs::tty_attach(crate::fs::TtyId::Console, pid, pid, false)
+            .expect("init process must acquire the console tty");
 
         let task = Arc::new(TaskControlBlock::new(
             Arc::clone(&process),
@@ -283,6 +293,8 @@ impl ProcessControlBlock {
         let executable_path = parent.executable_path.clone();
         let cmdline = parent.cmdline.clone();
         let pgid = parent.pgid;
+        let sid = parent.sid;
+        let controlling_tty_detached = parent.controlling_tty_detached;
         let signal_actions = parent.signal_actions;
         let parent_task_inner = calling_task.inner_exclusive_access();
         let ustack_base = parent_task_inner
@@ -317,6 +329,8 @@ impl ProcessControlBlock {
             switching_tasks: AtomicUsize::new(0),
             exclusive_task: AtomicUsize::new(0),
             inner_owner_cpu: AtomicUsize::new(usize::MAX),
+            job_control_stop_generation: AtomicUsize::new(0),
+            job_control_stop_pending: AtomicUsize::new(0),
             inner: unsafe {
                 UPIntrFreeCell::new(ProcessControlBlockInner {
                     is_zombie: false,
@@ -326,6 +340,12 @@ impl ProcessControlBlock {
                     fs,
                     cmdline,
                     pgid,
+                    sid,
+                    did_exec_after_fork: false,
+                    controlling_tty_detached,
+                    job_control_stopped: false,
+                    job_control_stop_signal: None,
+                    job_control_stop_reported: false,
                     exit_signal,
                     parent: Some(Arc::downgrade(&child_parent)),
                     children: Vec::new(),

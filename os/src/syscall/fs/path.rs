@@ -31,8 +31,8 @@ use crate::fs::{
     mkdir_in, mount_is_read_only, normalize_path_at_root, open_devfs_child, open_devfs_input_child,
     open_devfs_misc_child, open_devfs_net_child, open_devfs_pts_child, open_file_in,
     open_file_in_with_attrs, open_static_path, open_tmpfile_in_with_attrs, path_inside_root,
-    rename_exchange_in, rename_in, rmdir_in, stat_static_path, symlink_in, truncate_in,
-    unlink_file_in,
+    rename_exchange_in, rename_in, rmdir_in, stat_static_path, symlink_in, truncate_in, tty_attach,
+    tty_for_session, unlink_file_in,
 };
 use crate::mm::UserBuffer;
 use crate::task::{
@@ -640,9 +640,31 @@ fn do_openat_for_process(
     flags: OpenFlags,
     mode: u32,
 ) -> SysResult {
+    fn install_opened_file(
+        process: &ProcessControlBlock,
+        file: Arc<dyn File + Send + Sync>,
+        flags: OpenFlags,
+        path: Option<String>,
+    ) -> SysResult {
+        if !flags.contains(OpenFlags::NOCTTY)
+            && file.can_acquire_controlling_tty()
+            && let Some(tty) = file.tty_id()
+            && process.getpid() == process.session_id()
+            && tty_for_session(process.session_id()).is_none()
+        {
+            // Automatic controlling-terminal acquisition is best effort: an
+            // already-owned terminal remains open but does not become this
+            // session's ctty, matching open(2)'s separation from TIOCSCTTY.
+            if tty_attach(tty, process.session_id(), process.process_group_id(), false).is_ok() {
+                process.set_controlling_tty_detached(false);
+            }
+        }
+        install_file_fd(file, flags, path)
+    }
+
     let snapshot = process.path_snapshot();
     if let Some(file) = open_devfs_child_from_dirfd(dirfd, path, flags)? {
-        return install_file_fd(file, flags, None);
+        return install_opened_file(process, file, flags, None);
     }
     let dir_path = openat_dir_path(&snapshot, dirfd, path)?;
     if let Some(path) = dir_path.as_deref()
@@ -653,12 +675,12 @@ fn do_openat_for_process(
         // chrooted process sees only aliases explicitly registered under its
         // normalized root path, such as the libc-local module metadata used by
         // BusyBox modprobe.
-        return install_file_fd(file, flags, None);
+        return install_opened_file(process, file, flags, None);
     }
     if path.starts_with('/')
         && let Some(file) = reopen_proc_self_fd(path, flags)?
     {
-        return install_file_fd(file, flags, None);
+        return install_opened_file(process, file, flags, None);
     }
     let context = path_context_from(&snapshot, dirfd, path)?;
     let created_file = flags.contains(OpenFlags::CREATE)
@@ -687,7 +709,7 @@ fn do_openat_for_process(
     };
     let notify_file = Arc::clone(&file);
     let notify_path = dir_path.clone();
-    let fd = install_file_fd(file, flags, dir_path)?;
+    let fd = install_opened_file(process, file, flags, dir_path)?;
     if created_file && let Some(path) = notify_path.as_deref() {
         fanotify_notify_create(&notify_file, path);
         inotify_notify_create(&notify_file, path);

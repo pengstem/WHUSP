@@ -26,6 +26,7 @@ type NormalQueueKey = (u64, u64);
 enum ClaimResult {
     Claimed,
     Ineligible,
+    Stopped,
     Exited,
 }
 
@@ -116,22 +117,25 @@ impl TaskManager {
     }
 
     fn add(&mut self, task: Arc<TaskControlBlock>) {
-        Self::mark_queued_on(&task, self.cpu);
-        self.enqueue(task, false);
+        if Self::mark_queued_on(&task, self.cpu) {
+            self.enqueue(task, false);
+        }
     }
 
     fn requeue_after_run(&mut self, task: Arc<TaskControlBlock>) {
         Self::charge_normal_runtime(&task);
-        Self::mark_queued_on(&task, self.cpu);
-        self.enqueue(task, false);
+        if Self::mark_queued_on(&task, self.cpu) {
+            self.enqueue(task, false);
+        }
     }
 
     fn add_front(&mut self, task: Arc<TaskControlBlock>) {
-        Self::mark_queued_on(&task, self.cpu);
-        self.enqueue(task, true);
+        if Self::mark_queued_on(&task, self.cpu) {
+            self.enqueue(task, true);
+        }
     }
 
-    fn mark_queued_on(task: &TaskControlBlock, cpu: crate::cpu::CpuId) {
+    fn mark_queued_on(task: &TaskControlBlock, cpu: crate::cpu::CpuId) -> bool {
         let mut inner = task.inner_exclusive_access();
         assert_eq!(
             inner.task_status,
@@ -143,8 +147,12 @@ impl TaskManager {
             inner.on_cpu.is_none(),
             "running task cannot enter a run queue"
         );
+        if inner.job_control_stopped {
+            return false;
+        }
         inner.on_rq = true;
         inner.queued_cpu = Some(cpu);
+        true
     }
 
     fn clear_queued(task: &TaskControlBlock) {
@@ -161,6 +169,12 @@ impl TaskManager {
             inner.on_rq = false;
             inner.queued_cpu = None;
             return ClaimResult::Exited;
+        }
+        if inner.job_control_stopped {
+            assert!(inner.on_rq, "stopped run-queue task lost its queue marker");
+            inner.on_rq = false;
+            inner.queued_cpu = None;
+            return ClaimResult::Stopped;
         }
         assert_eq!(
             inner.task_status,
@@ -278,6 +292,7 @@ impl TaskManager {
                             return Some(task);
                         }
                         ClaimResult::Ineligible => self.enqueue(task, false),
+                        ClaimResult::Stopped => {}
                         ClaimResult::Exited => pruned_exited += 1,
                     }
                     if remaining == 0 {
@@ -316,6 +331,7 @@ impl TaskManager {
                         return Some(task);
                     }
                     ClaimResult::Ineligible => self.enqueue(task, false),
+                    ClaimResult::Stopped => {}
                     ClaimResult::Exited => pruned_exited += 1,
                 }
                 if remaining == 0 {
@@ -617,9 +633,12 @@ fn wakeup_task_with_placement(task: Arc<TaskControlBlock>, front: bool) -> bool 
         }
         assert!(!task_inner.wake_pending, "off-CPU task retained a wakeup");
         task_inner.task_status = TaskStatus::Ready;
+        let stopped = task_inner.job_control_stopped;
         let probe = task_inner.smp_sched_probe_active;
         drop(task_inner);
-        enqueue_woken_task(task, front);
+        if !stopped {
+            enqueue_woken_task(task, front);
+        }
         if probe {
             super::smp_probe::record_wake(false);
         }
@@ -687,6 +706,21 @@ pub(super) fn remove_ready_tasks_of_process(process_id: usize) {
     for cpu in 0..crate::cpu::topology().possible_count() {
         with_run_queue(cpu, |manager| manager.remove_process_tasks(process_id));
     }
+}
+
+/// Removes a stopped task from its current run queue if it has not already
+/// been claimed by a CPU. A concurrent fetch observes the task-local stop gate
+/// and drops the dequeued entry instead of running it.
+pub(crate) fn remove_ready_task_for_job_stop(task: &Arc<TaskControlBlock>) {
+    let queued_cpu = task.inner_exclusive_access().queued_cpu;
+    let Some(cpu) = queued_cpu else {
+        return;
+    };
+    with_run_queue(cpu, |manager| {
+        if manager.remove_ready_task(task) {
+            TaskManager::clear_queued(task);
+        }
+    });
 }
 
 pub(crate) fn reprioritize_ready_task(task: Arc<TaskControlBlock>) {

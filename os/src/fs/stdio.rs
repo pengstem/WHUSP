@@ -1,7 +1,7 @@
 use super::status_flags::StatusFlagsCell;
 use super::{
-    File, FileStat, FsResult, OpenFlags, PollEvents, PollWaiter, S_IFCHR, console_tty_poll,
-    console_tty_poll_with_wait, console_tty_read,
+    File, FileStat, FsResult, OpenFlags, PollEvents, PollWaiter, S_IFCHR, TtyId, console_tty_poll,
+    console_tty_poll_with_wait, console_tty_read, tty_job_control_check,
 };
 use crate::drivers::chardev::UART;
 use crate::mm::UserBuffer;
@@ -60,6 +60,9 @@ impl File for Stdin {
     fn stat(&self) -> FsResult<FileStat> {
         Ok(FileStat::with_mode(S_IFCHR | 0o666))
     }
+    fn check_read(&self, _len: usize) -> FsResult {
+        tty_job_control_check(TtyId::Console, false)
+    }
     fn status_flags(&self) -> OpenFlags {
         self.status_flags.get()
     }
@@ -68,6 +71,9 @@ impl File for Stdin {
     }
     fn is_tty(&self) -> bool {
         true
+    }
+    fn tty_id(&self) -> Option<TtyId> {
+        Some(TtyId::Console)
     }
 }
 
@@ -100,6 +106,9 @@ impl File for Stdout {
     fn stat(&self) -> FsResult<FileStat> {
         Ok(FileStat::with_mode(S_IFCHR | 0o666))
     }
+    fn check_write(&self, _len: usize, _append: bool) -> FsResult {
+        tty_job_control_check(TtyId::Console, true)
+    }
     fn status_flags(&self) -> OpenFlags {
         self.status_flags.get()
     }
@@ -108,5 +117,8 @@ impl File for Stdout {
     }
     fn is_tty(&self) -> bool {
         true
+    }
+    fn tty_id(&self) -> Option<TtyId> {
+        Some(TtyId::Console)
     }
 }

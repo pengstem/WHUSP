@@ -19,6 +19,7 @@ pub const CLD_STOPPED: i32 = 5;
 pub const CLD_CONTINUED: i32 = 6;
 const SIGNAL_EXIT_CORE_DUMPED: i32 = 0x80;
 pub const SA_RESTART: usize = 0x1000_0000;
+pub const SA_NOCLDSTOP: usize = 0x0000_0001;
 pub const SS_ONSTACK: i32 = 1;
 pub const SS_DISABLE: i32 = 2;
 pub const MINSIGSTKSZ: usize = 2048;
@@ -150,6 +151,17 @@ impl SignalInfo {
 
     pub fn child_exit(signo: i32, pid: i32, status: i32) -> Self {
         let (code, status) = signal_child_status(status);
+        Self {
+            signo,
+            code,
+            pid,
+            uid: 0,
+            status,
+            value: 0,
+        }
+    }
+
+    pub fn child_job_control(signo: i32, pid: i32, code: i32, status: i32) -> Self {
         Self {
             signo,
             code,

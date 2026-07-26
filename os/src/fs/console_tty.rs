@@ -6,10 +6,10 @@ use crate::sync::{SpinNoIrqLock, UPIntrFreeCell};
 use crate::task::suspend_current_and_run_next;
 use crate::task::{
     SignalFlags, TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
-    current_has_interrupting_signal, current_process_group_id, current_task, schedule,
-    send_tty_signal_to_process_group, wakeup_task,
+    current_has_interrupting_signal, current_process, current_process_group_id, current_task,
+    processes_snapshot, schedule, send_tty_signal_to_process_group, wakeup_task,
 };
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use lazy_static::lazy_static;
@@ -31,6 +31,8 @@ const ECHOK: u32 = 0x0020;
 const ECHOCTL: u32 = 0x0200;
 const ECHOKE: u32 = 0x0800;
 const IEXTEN: u32 = 0x8000;
+const TOSTOP: u32 = 0x0100;
+const NOFLSH: u32 = 0x0080;
 
 const VINTR: usize = 0;
 const VQUIT: usize = 1;
@@ -85,7 +87,7 @@ pub(crate) struct LinuxTermio {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct LinuxWinsize {
     pub(crate) ws_row: u16,
     pub(crate) ws_col: u16,
@@ -120,11 +122,33 @@ impl InputAction {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum TtyId {
+    Console,
+    Pty(u32),
+}
+
+impl TtyId {
+    pub(crate) fn proc_tty_nr(self) -> i32 {
+        match self {
+            Self::Console => (4 << 8) | 64,
+            Self::Pty(id) => (136 << 8) | id as i32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TtyControlState {
+    pub(crate) session: Option<usize>,
+    pub(crate) foreground_pgid: Option<usize>,
+    pub(crate) hung_up: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ConsoleTtySettings {
     termios: LinuxTermios,
     winsize: LinuxWinsize,
-    foreground_pgid: Option<usize>,
+    control: TtyControlState,
 }
 
 impl ConsoleTtySettings {
@@ -162,7 +186,11 @@ impl ConsoleTtySettings {
                 ws_xpixel: 0,
                 ws_ypixel: 0,
             },
-            foreground_pgid: None,
+            control: TtyControlState {
+                session: None,
+                foreground_pgid: None,
+                hung_up: false,
+            },
         }
     }
 }
@@ -187,8 +215,8 @@ impl ConsoleTtyState {
     }
 
     fn ensure_foreground_pgid(&mut self, pgid: Option<usize>) {
-        if self.settings.foreground_pgid.is_none() {
-            self.settings.foreground_pgid = pgid;
+        if self.settings.control.foreground_pgid.is_none() {
+            self.settings.control.foreground_pgid = pgid;
         }
     }
 }
@@ -205,6 +233,10 @@ lazy_static! {
         input_drain_lock: SpinNoIrqLock::new(()),
         poll_waiters: unsafe { UPIntrFreeCell::new(PollWaitQueue::new()) },
     };
+    static ref PTY_TTY_SETTINGS: UPIntrFreeCell<BTreeMap<u32, ConsoleTtySettings>> =
+        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+    static ref SESSION_TTYS: UPIntrFreeCell<BTreeMap<usize, TtyId>> =
+        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
 }
 
 enum ReadAttempt {
@@ -213,15 +245,141 @@ enum ReadAttempt {
     Block,
 }
 
-pub(crate) fn console_tty_termios() -> LinuxTermios {
-    CONSOLE_TTY
-        .state
-        .exclusive_session(|state| state.settings.termios)
+fn with_tty_settings<R>(id: TtyId, f: impl FnOnce(&ConsoleTtySettings) -> R) -> Option<R> {
+    match id {
+        TtyId::Console => Some(
+            CONSOLE_TTY
+                .state
+                .exclusive_session(|state| f(&state.settings)),
+        ),
+        TtyId::Pty(id) => PTY_TTY_SETTINGS.exclusive_session(|settings| settings.get(&id).map(f)),
+    }
 }
 
-pub(crate) fn console_tty_termios2() -> LinuxTermios2 {
-    let termios = console_tty_termios();
-    LinuxTermios2 {
+fn with_tty_settings_mut<R>(id: TtyId, f: impl FnOnce(&mut ConsoleTtySettings) -> R) -> Option<R> {
+    match id {
+        TtyId::Console => Some(
+            CONSOLE_TTY
+                .state
+                .exclusive_session(|state| f(&mut state.settings)),
+        ),
+        TtyId::Pty(id) => {
+            PTY_TTY_SETTINGS.exclusive_session(|settings| settings.get_mut(&id).map(f))
+        }
+    }
+}
+
+pub(crate) fn register_pty_tty(id: u32) {
+    PTY_TTY_SETTINGS.exclusive_session(|settings| {
+        settings.entry(id).or_insert_with(ConsoleTtySettings::new);
+    });
+}
+
+pub(crate) fn unregister_pty_tty(id: u32) {
+    tty_hangup(TtyId::Pty(id));
+    PTY_TTY_SETTINGS.exclusive_session(|settings| {
+        settings.remove(&id);
+    });
+}
+
+pub(crate) fn tty_control_state(id: TtyId) -> Option<TtyControlState> {
+    with_tty_settings(id, |settings| settings.control)
+}
+
+pub(crate) fn tty_for_session(sid: usize) -> Option<TtyId> {
+    SESSION_TTYS.exclusive_session(|sessions| sessions.get(&sid).copied())
+}
+
+pub(crate) fn tty_attach(
+    id: TtyId,
+    sid: usize,
+    foreground_pgid: usize,
+    force: bool,
+) -> super::FsResult {
+    let mut sessions = SESSION_TTYS.exclusive_access();
+    if sessions.get(&sid).is_some_and(|existing| *existing != id) {
+        return Err(super::FsError::PermissionDenied);
+    }
+    let control = tty_control_state(id).ok_or(super::FsError::NoDeviceOrAddress)?;
+    if let Some(owner) = control.session
+        && owner != sid
+        && !force
+    {
+        return Err(super::FsError::Busy);
+    }
+    if let Some(owner) = control.session
+        && owner != sid
+    {
+        sessions.remove(&owner);
+    }
+    with_tty_settings_mut(id, |settings| {
+        settings.control.session = Some(sid);
+        settings.control.foreground_pgid = Some(foreground_pgid);
+        settings.control.hung_up = false;
+    })
+    .ok_or(super::FsError::NoDeviceOrAddress)?;
+    sessions.insert(sid, id);
+    Ok(())
+}
+
+pub(crate) fn tty_release(id: TtyId, sid: usize) -> super::FsResult<Option<usize>> {
+    // Keep the session-to-TTY map and the TTY owner fields under one
+    // serialization boundary so concurrent release/acquire cannot leave only
+    // one side of the relationship installed.
+    let mut sessions = SESSION_TTYS.exclusive_access();
+    let control = tty_control_state(id).ok_or(super::FsError::NoDeviceOrAddress)?;
+    if control.session != Some(sid) || sessions.get(&sid) != Some(&id) {
+        return Err(super::FsError::NoDeviceOrAddress);
+    }
+    let foreground = control.foreground_pgid;
+    with_tty_settings_mut(id, |settings| {
+        settings.control.session = None;
+        settings.control.foreground_pgid = None;
+    })
+    .ok_or(super::FsError::NoDeviceOrAddress)?;
+    sessions.remove(&sid);
+    Ok(foreground)
+}
+
+pub(crate) fn tty_hangup(id: TtyId) {
+    let mut sessions = SESSION_TTYS.exclusive_access();
+    let Some(control) = tty_control_state(id) else {
+        return;
+    };
+    if let Some(sid) = control.session {
+        if sessions.get(&sid) == Some(&id) {
+            sessions.remove(&sid);
+        }
+    }
+    with_tty_settings_mut(id, |settings| {
+        settings.control.session = None;
+        settings.control.foreground_pgid = None;
+        settings.control.hung_up = true;
+    });
+    drop(sessions);
+    if let Some(pgid) = control.foreground_pgid {
+        send_tty_signal_to_process_group(pgid, SignalFlags::SIGHUP);
+        send_tty_signal_to_process_group(pgid, SignalFlags::SIGCONT);
+    }
+}
+
+pub(crate) fn tty_detach_session(sid: usize, hangup: bool) {
+    let Some(id) = tty_for_session(sid) else {
+        return;
+    };
+    if hangup {
+        tty_hangup(id);
+    } else {
+        let _ = tty_release(id, sid);
+    }
+}
+
+pub(crate) fn tty_termios(id: TtyId) -> Option<LinuxTermios> {
+    with_tty_settings(id, |settings| settings.termios)
+}
+
+pub(crate) fn tty_termios2(id: TtyId) -> Option<LinuxTermios2> {
+    tty_termios(id).map(|termios| LinuxTermios2 {
         c_iflag: termios.c_iflag,
         c_oflag: termios.c_oflag,
         c_cflag: termios.c_cflag,
@@ -230,70 +388,156 @@ pub(crate) fn console_tty_termios2() -> LinuxTermios2 {
         c_cc: termios.c_cc,
         c_ispeed: 38400,
         c_ospeed: 38400,
-    }
-}
-
-pub(crate) fn set_console_tty_termios(termios: LinuxTermios) {
-    CONSOLE_TTY.state.exclusive_session(|state| {
-        state.settings.termios = termios;
-        state.line_buf.clear();
-        state.read_buf.clear();
-        state.pending_eof = false;
-    });
-}
-
-pub(crate) fn set_console_tty_termios2(termios: LinuxTermios2) {
-    set_console_tty_termios(LinuxTermios {
-        c_iflag: termios.c_iflag,
-        c_oflag: termios.c_oflag,
-        c_cflag: termios.c_cflag,
-        c_lflag: termios.c_lflag,
-        c_line: termios.c_line,
-        c_cc: termios.c_cc,
-    });
-}
-
-pub(crate) fn console_tty_termio() -> LinuxTermio {
-    termios_to_termio(console_tty_termios())
-}
-
-pub(crate) fn apply_console_tty_termio(termio: LinuxTermio) {
-    CONSOLE_TTY.state.exclusive_session(|state| {
-        apply_termio(&mut state.settings.termios, termio);
-        state.line_buf.clear();
-        state.read_buf.clear();
-        state.pending_eof = false;
-    });
-}
-
-pub(crate) fn console_tty_winsize() -> LinuxWinsize {
-    CONSOLE_TTY
-        .state
-        .exclusive_session(|state| state.settings.winsize)
-}
-
-pub(crate) fn set_console_tty_winsize(winsize: LinuxWinsize) {
-    CONSOLE_TTY
-        .state
-        .exclusive_session(|state| state.settings.winsize = winsize);
-}
-
-pub(crate) fn console_tty_foreground_pgid() -> usize {
-    let current_pgid = current_process_group_id();
-    CONSOLE_TTY.state.exclusive_session(|state| {
-        state.ensure_foreground_pgid(current_pgid);
-        state
-            .settings
-            .foreground_pgid
-            .or(current_pgid)
-            .unwrap_or_default()
     })
 }
 
-pub(crate) fn set_console_tty_foreground_pgid(pgid: usize) {
-    CONSOLE_TTY
-        .state
-        .exclusive_session(|state| state.settings.foreground_pgid = Some(pgid));
+pub(crate) fn set_tty_termios(id: TtyId, termios: LinuxTermios) -> bool {
+    with_tty_settings_mut(id, |settings| settings.termios = termios).is_some()
+}
+
+pub(crate) fn set_tty_termios2(id: TtyId, termios: LinuxTermios2) -> bool {
+    set_tty_termios(
+        id,
+        LinuxTermios {
+            c_iflag: termios.c_iflag,
+            c_oflag: termios.c_oflag,
+            c_cflag: termios.c_cflag,
+            c_lflag: termios.c_lflag,
+            c_line: termios.c_line,
+            c_cc: termios.c_cc,
+        },
+    )
+}
+
+pub(crate) fn tty_termio(id: TtyId) -> Option<LinuxTermio> {
+    tty_termios(id).map(termios_to_termio)
+}
+
+pub(crate) fn apply_tty_termio(id: TtyId, termio: LinuxTermio) -> bool {
+    with_tty_settings_mut(id, |settings| apply_termio(&mut settings.termios, termio)).is_some()
+}
+
+pub(crate) fn tty_winsize(id: TtyId) -> Option<LinuxWinsize> {
+    with_tty_settings(id, |settings| settings.winsize)
+}
+
+pub(crate) fn set_tty_winsize(id: TtyId, winsize: LinuxWinsize) -> bool {
+    let mut foreground = None;
+    let changed = with_tty_settings_mut(id, |settings| {
+        if settings.winsize == winsize {
+            return false;
+        }
+        settings.winsize = winsize;
+        foreground = settings.control.foreground_pgid;
+        true
+    })
+    .unwrap_or(false);
+    if changed && let Some(pgid) = foreground {
+        send_tty_signal_to_process_group(pgid, SignalFlags::SIGWINCH);
+    }
+    changed
+}
+
+pub(crate) fn set_tty_foreground_pgid(id: TtyId, sid: usize, pgid: usize) -> super::FsResult {
+    let control = tty_control_state(id).ok_or(super::FsError::NoDeviceOrAddress)?;
+    if control.session != Some(sid) || control.hung_up {
+        return Err(super::FsError::NoDeviceOrAddress);
+    }
+    with_tty_settings_mut(id, |settings| {
+        settings.control.foreground_pgid = Some(pgid);
+    })
+    .ok_or(super::FsError::NoDeviceOrAddress)?;
+    Ok(())
+}
+
+fn process_group_is_orphaned(pgid: usize, sid: usize) -> bool {
+    let members: Vec<_> = processes_snapshot()
+        .into_iter()
+        .filter(|process| {
+            !process.is_zombie()
+                && process.process_group_id() == pgid
+                && process.session_id() == sid
+        })
+        .collect();
+    !members.is_empty()
+        && members.iter().all(|member| {
+            member.parent_process().is_none_or(|parent| {
+                parent.process_group_id() == pgid || parent.session_id() != sid
+            })
+        })
+}
+
+pub(crate) fn tty_job_control_check(id: TtyId, write: bool) -> super::FsResult {
+    let process = current_process();
+    let sid = process.session_id();
+    let pgid = process.process_group_id();
+    let Some(control) = tty_control_state(id) else {
+        return Err(super::FsError::NoDeviceOrAddress);
+    };
+    if control.hung_up {
+        return Err(super::FsError::Io);
+    }
+    if process.controlling_tty_detached()
+        || control.session != Some(sid)
+        || control.foreground_pgid == Some(pgid)
+    {
+        return Ok(());
+    }
+    if write && !tty_termios(id).is_some_and(|termios| has_lflag(termios, TOSTOP)) {
+        return Ok(());
+    }
+
+    let signal = if write {
+        SignalFlags::SIGTTOU
+    } else {
+        SignalFlags::SIGTTIN
+    };
+    if process_group_is_orphaned(pgid, sid) {
+        return Err(super::FsError::Io);
+    }
+    let task = current_task().ok_or(super::FsError::Io)?;
+    let blocked = task.inner_exclusive_access().signal_mask.contains(signal);
+    let signum = signal.bits().trailing_zeros() as usize;
+    let ignored = process.inner_exclusive_access().signal_actions[signum].is_ignore();
+    if blocked || ignored {
+        return if write {
+            Ok(())
+        } else {
+            Err(super::FsError::Io)
+        };
+    }
+    send_tty_signal_to_process_group(pgid, signal);
+    Err(super::FsError::Io)
+}
+
+/// Classifies an N_TTY signal-generating input byte for a PTY master write.
+/// The caller owns the PTY queues, so it performs any requested flush before
+/// delivering the returned signal without holding the PTY lock.
+pub(crate) fn tty_input_signal_action(
+    id: TtyId,
+    ch: u8,
+) -> Option<(SignalFlags, Option<usize>, bool)> {
+    with_tty_settings(id, |settings| {
+        let termios = settings.termios;
+        if !has_lflag(termios, ISIG) {
+            return None;
+        }
+        let signal = if is_special_char(termios, VINTR, ch) {
+            SignalFlags::SIGINT
+        } else if is_special_char(termios, VQUIT, ch) {
+            SignalFlags::SIGQUIT
+        } else if is_special_char(termios, VSUSP, ch) {
+            SignalFlags::SIGTSTP
+        } else {
+            return None;
+        };
+        Some((
+            signal,
+            settings.control.foreground_pgid,
+            !has_lflag(termios, NOFLSH),
+        ))
+    })
+    .flatten()
 }
 
 pub(crate) fn console_tty_available_bytes() -> usize {
@@ -441,23 +685,27 @@ fn process_input(mut ch: u8) -> InputAction {
         }
 
         if has_lflag(termios, ISIG) {
-            if ch == special_char(termios, VINTR) {
-                state.line_buf.clear();
-                state.read_buf.clear();
-                state.pending_eof = false;
+            if is_special_char(termios, VINTR, ch) {
+                flush_input_after_signal(state, termios);
                 return InputAction {
                     echo: signal_echo(termios, ch),
                     signal: Some(SignalFlags::SIGINT),
                     wake_readers: true,
                 };
             }
-            if ch == special_char(termios, VQUIT) {
-                state.line_buf.clear();
-                state.read_buf.clear();
-                state.pending_eof = false;
+            if is_special_char(termios, VQUIT, ch) {
+                flush_input_after_signal(state, termios);
                 return InputAction {
                     echo: signal_echo(termios, ch),
                     signal: Some(SignalFlags::SIGQUIT),
+                    wake_readers: true,
+                };
+            }
+            if is_special_char(termios, VSUSP, ch) {
+                flush_input_after_signal(state, termios);
+                return InputAction {
+                    echo: signal_echo(termios, ch),
+                    signal: Some(SignalFlags::SIGTSTP),
                     wake_readers: true,
                 };
             }
@@ -472,7 +720,7 @@ fn process_input(mut ch: u8) -> InputAction {
             };
         }
 
-        if ch == special_char(termios, VEOF) {
+        if is_special_char(termios, VEOF, ch) {
             if state.line_buf.is_empty() {
                 state.pending_eof = true;
             } else {
@@ -484,7 +732,7 @@ fn process_input(mut ch: u8) -> InputAction {
                 wake_readers: true,
             };
         }
-        if ch == special_char(termios, VERASE) {
+        if is_special_char(termios, VERASE, ch) {
             if state.line_buf.pop().is_some() {
                 return InputAction {
                     echo: erase_echo(termios),
@@ -494,7 +742,7 @@ fn process_input(mut ch: u8) -> InputAction {
             }
             return InputAction::none();
         }
-        if ch == special_char(termios, VKILL) {
+        if is_special_char(termios, VKILL, ch) {
             if !state.line_buf.is_empty() {
                 state.line_buf.clear();
                 return InputAction {
@@ -524,11 +772,19 @@ fn process_input(mut ch: u8) -> InputAction {
     })
 }
 
+fn flush_input_after_signal(state: &mut ConsoleTtyState, termios: LinuxTermios) {
+    if !has_lflag(termios, NOFLSH) {
+        state.line_buf.clear();
+        state.read_buf.clear();
+        state.pending_eof = false;
+    }
+}
+
 fn signal_foreground_process_group(signal: SignalFlags) {
     let current_pgid = current_process_group_id();
     let pgid = CONSOLE_TTY.state.exclusive_session(|state| {
         state.ensure_foreground_pgid(current_pgid);
-        state.settings.foreground_pgid.or(current_pgid)
+        state.settings.control.foreground_pgid.or(current_pgid)
     });
     if let Some(pgid) = pgid {
         send_tty_signal_to_process_group(pgid, signal);
@@ -553,10 +809,15 @@ fn special_char(termios: LinuxTermios, index: usize) -> u8 {
     termios.c_cc[index]
 }
 
+fn is_special_char(termios: LinuxTermios, index: usize, ch: u8) -> bool {
+    let special = special_char(termios, index);
+    special != 0 && ch == special
+}
+
 fn is_eol(termios: LinuxTermios, ch: u8) -> bool {
     ch == b'\n'
-        || ch == special_char(termios, VEOL)
-        || (has_lflag(termios, IEXTEN) && ch == special_char(termios, VEOL2))
+        || is_special_char(termios, VEOL, ch)
+        || (has_lflag(termios, IEXTEN) && is_special_char(termios, VEOL2, ch))
 }
 
 fn echo_char(termios: LinuxTermios, ch: u8) -> EchoAction {

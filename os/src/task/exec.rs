@@ -439,6 +439,7 @@ impl ProcessControlBlock {
             inner.pkey_rights = empty_process_pkey_rights();
             let previous = core::mem::replace(&mut inner.executable_node, executable_node);
             inner.executable_path = executable_path;
+            inner.did_exec_after_fork = true;
             inner.cmdline = args.clone();
             inner.comm = comm_from_cmdline(&args);
             inner.timers.clear_posix_after_exec();

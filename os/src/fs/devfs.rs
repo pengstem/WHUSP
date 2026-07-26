@@ -8,7 +8,9 @@ use super::status_flags::StatusFlagsCell;
 use super::vfs::{FileSystemBackend, FileSystemStat, FsNodeKind, VfsNodeId};
 use super::{
     File, FileStat, FsError, FsResult, OpenFlags, PollEvents, PollWaitQueue, PollWaiter, S_IFBLK,
-    S_IFCHR, S_IFDIR, SeekWhence, console_tty_poll, console_tty_poll_with_wait, console_tty_read,
+    S_IFCHR, S_IFDIR, SeekWhence, TtyId, console_tty_poll, console_tty_poll_with_wait,
+    console_tty_read, register_pty_tty, tty_for_session, tty_input_signal_action,
+    tty_job_control_check, unregister_pty_tty,
 };
 use crate::drivers::chardev::UART;
 use crate::mm::UserBuffer;
@@ -16,8 +18,8 @@ use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
     TaskControlBlock, block_current_task_no_schedule,
-    block_current_task_no_schedule_unless_unmasked_signal, current_has_unmasked_signal, schedule,
-    wakeup_task,
+    block_current_task_no_schedule_unless_unmasked_signal, current_has_unmasked_signal,
+    current_process, schedule, send_tty_signal_to_process_group, wakeup_task,
 };
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -1017,6 +1019,8 @@ fn open_ptmx(flags: OpenFlags) -> FsResult<Arc<dyn File + Send + Sync>> {
     }
     let (readable, writable) = flags.read_write();
     let pair = PTY_TABLE.exclusive_session(|table| table.allocate())?;
+    let id = pair.exclusive_access().id;
+    register_pty_tty(id);
     Ok(Arc::new(PtyFile::new(
         pair,
         PtyEndpoint::Master,
@@ -1066,6 +1070,29 @@ fn open_node_at(
     }
     if node == DevNode::PtMx {
         return open_ptmx(flags);
+    }
+    if node == DevNode::Tty {
+        if flags.contains(OpenFlags::DIRECTORY) {
+            return Err(FsError::NotDir);
+        }
+        let process = current_process();
+        if process.controlling_tty_detached() {
+            return Err(FsError::NoDeviceOrAddress);
+        }
+        return match tty_for_session(process.session_id()) {
+            Some(TtyId::Console) => {
+                let (readable, writable) = flags.read_write();
+                Ok(Arc::new(DevFsFile::new(
+                    node,
+                    mount_id,
+                    readable,
+                    writable,
+                    OpenFlags::file_status_flags(flags),
+                )))
+            }
+            Some(TtyId::Pty(id)) => open_pty_slave(id as usize, flags),
+            None => Err(FsError::NoDeviceOrAddress),
+        };
     }
     if node == DevNode::UInput {
         if flags.contains(OpenFlags::DIRECTORY) {
@@ -2126,8 +2153,45 @@ fn write_pty(
     if want_to_write == 0 {
         return 0;
     }
+    let data: Vec<u8> = user_buf
+        .buffers
+        .iter()
+        .flat_map(|buffer| buffer.iter().copied())
+        .collect();
+    let pty_id = TtyId::Pty(pair.exclusive_access().id);
     let mut already_written = 0usize;
     loop {
+        if !pair.exclusive_access().peer_open(endpoint) {
+            return already_written;
+        }
+        if endpoint == PtyEndpoint::Master
+            && let Some((signal, foreground_pgid, flush)) =
+                tty_input_signal_action(pty_id, data[already_written])
+        {
+            let (writers, poll_writers) = if flush {
+                let mut inner = pair.exclusive_access();
+                inner.master_to_slave.data.clear();
+                inner.slave_to_master.data.clear();
+                let mut writers = inner.master_to_slave.wake_all_writers();
+                writers.extend(inner.slave_to_master.wake_all_writers());
+                let mut poll_writers = inner.master_to_slave.wake_write_poll_waiters();
+                poll_writers.extend(inner.slave_to_master.wake_write_poll_waiters());
+                (writers, poll_writers)
+            } else {
+                (VecDeque::new(), Vec::new())
+            };
+            wake_tasks(writers);
+            PollWaiter::wake_all(poll_writers);
+            if let Some(pgid) = foreground_pgid {
+                send_tty_signal_to_process_group(pgid, signal);
+            }
+            already_written += 1;
+            if already_written == want_to_write {
+                return already_written;
+            }
+            continue;
+        }
+
         let mut inner = pair.exclusive_access();
         if !inner.peer_open(endpoint) {
             return already_written;
@@ -2148,29 +2212,16 @@ fn write_pty(
             continue;
         }
 
-        let write_len = available.min(want_to_write - already_written);
-        let mut skipped = 0usize;
-        let mut written = 0usize;
-        for buffer in user_buf.buffers.iter() {
-            if skipped + buffer.len() <= already_written {
-                skipped += buffer.len();
-                continue;
-            }
-            let offset = already_written.saturating_sub(skipped);
-            for &byte in &buffer[offset..] {
-                if written == write_len {
-                    break;
-                }
-                inner.output_buffer_mut(endpoint).write_byte(byte);
-                written += 1;
-            }
-            if written == write_len {
-                break;
-            }
-            skipped += buffer.len();
+        let write_len = if endpoint == PtyEndpoint::Master {
+            1
+        } else {
+            available.min(want_to_write - already_written)
+        };
+        for &byte in &data[already_written..already_written + write_len] {
+            inner.output_buffer_mut(endpoint).write_byte(byte);
         }
 
-        already_written += written;
+        already_written += write_len;
         let reader = inner.output_buffer_mut(endpoint).wake_reader();
         let poll_readers = inner.output_buffer_mut(endpoint).wake_read_poll_waiters();
         drop(inner);
@@ -2544,6 +2595,9 @@ impl File for DevFsFile {
     }
 
     fn check_write(&self, _len: usize, _append: bool) -> FsResult {
+        if self.node.is_tty() {
+            tty_job_control_check(TtyId::Console, true)?;
+        }
         if let Some(loop_id) = loop_node_id(self.node) {
             if !loop_device_is_attached(loop_id) {
                 return Err(FsError::NoDeviceOrAddress);
@@ -2551,6 +2605,13 @@ impl File for DevFsFile {
             if loop_device_is_read_only(loop_id) {
                 return Err(FsError::PermissionDenied);
             }
+        }
+        Ok(())
+    }
+
+    fn check_read(&self, _len: usize) -> FsResult {
+        if self.node.is_tty() {
+            tty_job_control_check(TtyId::Console, false)?;
         }
         Ok(())
     }
@@ -2663,6 +2724,10 @@ impl File for DevFsFile {
 
     fn is_tty(&self) -> bool {
         self.node.is_tty()
+    }
+
+    fn tty_id(&self) -> Option<TtyId> {
+        self.node.is_tty().then_some(TtyId::Console)
     }
 
     fn is_rtc(&self) -> bool {
@@ -2827,7 +2892,7 @@ impl Drop for InputEventFile {
 
 impl Drop for PtyFile {
     fn drop(&mut self) {
-        let (readers, writers, poll_readers, poll_writers, remove) = {
+        let (readers, writers, poll_readers, poll_writers, hangup, remove) = {
             let mut pair = self.pair.exclusive_access();
             match self.endpoint {
                 PtyEndpoint::Master => {
@@ -2841,6 +2906,7 @@ impl Drop for PtyFile {
                         writers,
                         poll_readers,
                         poll_writers,
+                        pair.master_open == 0,
                         pair.is_closed(),
                     )
                 }
@@ -2855,6 +2921,7 @@ impl Drop for PtyFile {
                         writers,
                         poll_readers,
                         poll_writers,
+                        false,
                         pair.is_closed(),
                     )
                 }
@@ -2864,9 +2931,13 @@ impl Drop for PtyFile {
         wake_tasks(writers);
         PollWaiter::wake_all(poll_readers);
         PollWaiter::wake_all(poll_writers);
+        if hangup {
+            super::tty_hangup(TtyId::Pty(self.id()));
+        }
         if remove {
             let id = self.id() as usize;
             PTY_TABLE.exclusive_session(|table| table.remove_if_same(id, &self.pair));
+            unregister_pty_tty(id as u32);
         }
     }
 }
@@ -2890,6 +2961,20 @@ impl File for PtyFile {
 
     fn write(&self, user_buf: UserBuffer) -> usize {
         write_pty(&self.pair, self.endpoint, user_buf, self.status_flags.get())
+    }
+
+    fn check_read(&self, _len: usize) -> FsResult {
+        if self.endpoint == PtyEndpoint::Slave {
+            tty_job_control_check(TtyId::Pty(self.id()), false)?;
+        }
+        Ok(())
+    }
+
+    fn check_write(&self, _len: usize, _append: bool) -> FsResult {
+        if self.endpoint == PtyEndpoint::Slave {
+            tty_job_control_check(TtyId::Pty(self.id()), true)?;
+        }
+        Ok(())
     }
 
     fn poll(&self, events: PollEvents) -> PollEvents {
@@ -2964,6 +3049,14 @@ impl File for PtyFile {
 
     fn is_tty(&self) -> bool {
         true
+    }
+
+    fn tty_id(&self) -> Option<TtyId> {
+        Some(TtyId::Pty(self.id()))
+    }
+
+    fn can_acquire_controlling_tty(&self) -> bool {
+        self.endpoint == PtyEndpoint::Slave
     }
 }
 

@@ -2377,7 +2377,10 @@ fn set_domainname_len(len: u64) -> FsResult {
     Ok(())
 }
 
-fn task_status_char(status: TaskStatus, proc_sleeping: bool) -> char {
+fn task_status_char(status: TaskStatus, proc_sleeping: bool, job_control_stopped: bool) -> char {
+    if job_control_stopped {
+        return 'T';
+    }
     if proc_sleeping {
         return 'S';
     }
@@ -2399,13 +2402,15 @@ fn proc_stat_content(process: ProcessProcSnapshot, stat_pid: usize, state: char)
     // provides stable parseable fields for BusyBox/procps consumers while the
     // kernel lacks full process accounting.
     format!(
-        "{} ({}) {} {} {} {} 0 -1 0 0 0 0 0 {} {} {} {} 20 0 {} 0 0 4096 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} {} {} {} 20 0 {} 0 0 4096 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         stat_pid,
         process.comm,
         state,
         process.ppid,
         process.pgid,
-        process.pid,
+        process.sid,
+        process.tty_nr,
+        process.tpgid,
         utime,
         stime,
         cutime,
@@ -2426,7 +2431,11 @@ fn task_stat_content(pid: usize, local_tid: usize) -> FsResult<Vec<u8>> {
     let task = lookup_task_by_local_tid(pid, local_tid).ok_or(FsError::NotFound)?;
     let state = {
         let task_inner = task.inner_exclusive_access();
-        task_status_char(task_inner.task_status, task_inner.proc_sleeping)
+        task_status_char(
+            task_inner.task_status,
+            task_inner.proc_sleeping,
+            task_inner.job_control_stopped,
+        )
     };
     Ok(proc_stat_content(process_snapshot, task.linux_tid(), state).into_bytes())
 }

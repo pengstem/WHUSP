@@ -1,7 +1,7 @@
 use crate::arch::interrupt;
 use crate::task::{
-    Credentials, MINSIGSTKSZ, ProcessControlBlock, SI_TKILL, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP,
-    SS_DISABLE, SS_ONSTACK, SigAltStack, SignalAction, SignalFlags, SignalInfo, TaskControlBlock,
+    MINSIGSTKSZ, ProcessControlBlock, SI_TKILL, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SS_DISABLE,
+    SS_ONSTACK, SigAltStack, SignalAction, SignalFlags, SignalInfo, TaskControlBlock,
     block_current_task_no_schedule, current_has_interrupting_signal, current_process, current_task,
     current_trap_cx, current_user_token, flags_to_linux_sigset, linux_sigset_to_flags,
     processes_snapshot, queue_signal_to_task, schedule, task_with_linux_tid, wakeup_task,
@@ -256,10 +256,18 @@ fn process_by_visible_pid(
         .ok_or(SysError::ESRCH)
 }
 
-fn caller_can_signal_target(caller: &Credentials, target: &Credentials) -> bool {
-    // UNFINISHED: Linux also checks CAP_KILL in the target user namespace and
-    // permits SIGCONT inside the same session. This kernel has one credential
-    // namespace and process-wide credentials.
+fn caller_can_signal_target(
+    caller: &ProcessControlBlock,
+    target: &ProcessControlBlock,
+    signal: SignalFlags,
+) -> bool {
+    if signal.contains(SignalFlags::SIGCONT) && caller.session_id() == target.session_id() {
+        return true;
+    }
+    // UNFINISHED: Linux also checks CAP_KILL in the target user namespace.
+    // This kernel has one credential namespace and process-wide credentials.
+    let caller = caller.credentials();
+    let target = target.credentials();
     caller.is_root()
         || target.uid_matches_saved_set(caller.ruid)
         || target.uid_matches_saved_set(caller.euid)
@@ -318,7 +326,7 @@ pub fn sys_rt_sigqueueinfo(pid: isize, signum: u32, info: *const LinuxSigInfo) -
     let signal = validate_kill_signum(signum)?;
     validate_sigqueue_info_code(caller.getpid() == target.getpid(), &info)?;
 
-    if !caller_can_signal_target(&caller.credentials(), &target.credentials()) {
+    if !caller_can_signal_target(&caller, &target, signal) {
         return Err(SysError::EPERM);
     }
     // UNFINISHED: Linux queues multiple realtime siginfo records and can return
@@ -346,7 +354,7 @@ pub fn sys_rt_tgsigqueueinfo(
     validate_sigqueue_info_code(target_is_current, &info)?;
 
     let caller = current_process();
-    if !caller_can_signal_target(&caller.credentials(), &target_process.credentials()) {
+    if !caller_can_signal_target(&caller, &target_process, signal) {
         return Err(SysError::EPERM);
     }
     // UNFINISHED: See sys_rt_sigqueueinfo(); realtime signal queue capacity is

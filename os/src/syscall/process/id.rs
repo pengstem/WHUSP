@@ -1,8 +1,10 @@
+use crate::sync::SpinNoIrqLock;
 use crate::syscall::SyscallContext;
 use crate::syscall::errno::{SysError, SysResult};
 use crate::task::{
-    Credentials, ProcessControlBlock, SignalFlags, SignalInfo, current_process, current_task,
-    exit_current_and_run_next, exit_current_group_and_run_next, pid2process, processes_snapshot,
+    ProcessControlBlock, SignalFlags, SignalInfo, current_process, current_task,
+    exit_current_and_run_next, exit_current_group_and_run_next,
+    notify_if_orphaned_stopped_process_group, pid2process, processes_snapshot,
     queue_signal_to_task, suspend_current_and_run_next, wakeup_task,
 };
 use alloc::{sync::Arc, vec::Vec};
@@ -62,10 +64,70 @@ fn visible_process_group_id(
     caller: &Arc<ProcessControlBlock>,
 ) -> usize {
     let namespace = caller.pid_namespace();
-    pid2process(target.process_group_id())
+    let pgid = target.process_group_id();
+    pid2process(pgid)
         .and_then(|leader| leader.pid_visible_from_namespace(namespace))
+        .or_else(|| {
+            // A process group outlives its leader. Internal PIDs are monotonic,
+            // so the numeric group identity remains stable until the last
+            // member leaves even after the leader has been reaped.
+            processes_snapshot()
+                .into_iter()
+                .find(|member| {
+                    member.process_group_id() == pgid
+                        && member.pid_visible_from_namespace(namespace).is_some()
+                })
+                .map(|_| pgid)
+        })
         .unwrap_or(0)
 }
+
+fn visible_session_id(
+    target: &Arc<ProcessControlBlock>,
+    caller: &Arc<ProcessControlBlock>,
+) -> usize {
+    let sid = target.session_id();
+    let namespace = caller.pid_namespace();
+    pid2process(sid)
+        .and_then(|leader| leader.pid_visible_from_namespace(namespace))
+        .or_else(|| {
+            processes_snapshot()
+                .into_iter()
+                .find(|member| {
+                    member.session_id() == sid
+                        && member.pid_visible_from_namespace(namespace).is_some()
+                })
+                .map(|_| sid)
+        })
+        .unwrap_or(0)
+}
+
+fn process_group_session(pgid: usize) -> Option<usize> {
+    processes_snapshot()
+        .into_iter()
+        .find(|process| process.process_group_id() == pgid)
+        .map(|process| process.session_id())
+}
+
+fn process_group_from_visible_id(
+    caller: &Arc<ProcessControlBlock>,
+    visible_pgid: usize,
+) -> Option<(usize, usize)> {
+    let namespace = caller.pid_namespace();
+    let processes = processes_snapshot();
+    processes.iter().find_map(|member| {
+        let pgid = member.process_group_id();
+        let visible = pid2process(pgid)
+            .and_then(|leader| leader.pid_visible_from_namespace(namespace))
+            .or_else(|| member.pid_visible_from_namespace(namespace).map(|_| pgid));
+        (visible == Some(visible_pgid)).then(|| (pgid, member.session_id()))
+    })
+}
+
+// Serializes setpgid()/setsid() validation with their membership commit. The
+// current numeric identity model is safe from ABA because Linux-visible PIDs
+// are allocated monotonically and are deliberately not recycled.
+static JOB_CONTROL_IDENTITY_LOCK: SpinNoIrqLock<()> = SpinNoIrqLock::new(());
 
 pub fn sys_setpgid_ctx(ctx: &SyscallContext, pid: isize, pgid: isize) -> SysResult {
     if pid < 0 || pgid < 0 {
@@ -82,17 +144,52 @@ pub fn sys_setpgid_ctx(ctx: &SyscallContext, pid: isize, pgid: isize) -> SysResu
     } else {
         process_from_visible_pid(current, target_pid).ok_or(SysError::ESRCH)?
     };
-    let new_pgid = if pgid == 0 {
+    let target_is_caller = Arc::ptr_eq(&target, current);
+    if !target_is_caller
+        && !target
+            .parent_process()
+            .is_some_and(|parent| Arc::ptr_eq(&parent, current))
+    {
+        return Err(SysError::ESRCH);
+    }
+
+    let identity = JOB_CONTROL_IDENTITY_LOCK.lock();
+    let (_, caller_sid, _) = current.job_control_identity();
+    let (old_pgid, target_sid, target_did_exec) = target.job_control_identity();
+    if !target_is_caller && target_did_exec {
+        return Err(SysError::EACCES);
+    }
+    if target_sid != caller_sid {
+        return Err(SysError::EPERM);
+    }
+    if target_sid == target.getpid() {
+        return Err(SysError::EPERM);
+    }
+
+    let target_visible_pid = target
+        .pid_visible_from_namespace(current.pid_namespace())
+        .ok_or(SysError::ESRCH)?;
+    let new_pgid = if pgid == 0 || pgid as usize == target_visible_pid {
         target.getpid()
     } else {
-        process_from_visible_pid(current, pgid as usize)
-            .map(|process| process.getpid())
-            .unwrap_or(pgid as usize)
+        let (existing_pgid, existing_sid) =
+            process_group_from_visible_id(current, pgid as usize).ok_or(SysError::EPERM)?;
+        if existing_sid != target_sid {
+            return Err(SysError::EPERM);
+        }
+        existing_pgid
     };
-    // UNFINISHED: Linux setpgid enforces sessions, exec-time constraints, and
-    // parent/child relationship checks. This compatibility layer exists first
-    // to satisfy libc/LTP harness calls such as setpgid(0, 0).
-    target.set_process_group_id(new_pgid);
+    if let Some(existing_sid) = process_group_session(new_pgid)
+        && existing_sid != target_sid
+    {
+        return Err(SysError::EPERM);
+    }
+    target.set_process_group_identity(new_pgid, target_sid);
+    drop(identity);
+    if old_pgid != new_pgid {
+        notify_if_orphaned_stopped_process_group(old_pgid, target_sid);
+        notify_if_orphaned_stopped_process_group(new_pgid, target_sid);
+    }
     Ok(0)
 }
 
@@ -111,7 +208,7 @@ pub fn sys_getpgid_ctx(ctx: &SyscallContext, pid: isize) -> SysResult {
 
 pub fn sys_getsid_ctx(ctx: &SyscallContext, pid: isize) -> SysResult {
     if pid < 0 {
-        return Err(SysError::EINVAL);
+        return Err(SysError::ESRCH);
     }
     let current = ctx.process();
     let target = if pid == 0 || pid as usize == current.getpid() {
@@ -119,25 +216,24 @@ pub fn sys_getsid_ctx(ctx: &SyscallContext, pid: isize) -> SysResult {
     } else {
         process_from_visible_pid(current, pid as usize).ok_or(SysError::ESRCH)?
     };
-    // UNFINISHED: A distinct session ID is not modeled yet. The existing
-    // process-group leader value gives the Linux-visible PID namespace behavior
-    // needed by getsid()/setsid() tests.
-    Ok(visible_process_group_id(&target, current) as isize)
+    Ok(visible_session_id(&target, current) as isize)
 }
 
 pub fn sys_setsid() -> SysResult {
     let current = current_process();
     let pid = current.getpid();
+    let identity = JOB_CONTROL_IDENTITY_LOCK.lock();
     if processes_snapshot()
         .iter()
         .any(|process| process.process_group_id() == pid)
     {
         return Err(SysError::EPERM);
     }
-    // UNFINISHED: This kernel does not yet store a separate session ID or
-    // controlling-terminal state. Setting PGID to PID provides the Linux-visible
-    // process-group effect needed by libc daemonization and LTP compatibility.
-    current.set_process_group_id(pid);
+    let (old_pgid, old_sid, _) = current.job_control_identity();
+    current.set_process_group_identity(pid, pid);
+    current.set_controlling_tty_detached(false);
+    drop(identity);
+    notify_if_orphaned_stopped_process_group(old_pgid, old_sid);
     Ok(current.visible_pid() as isize)
 }
 
@@ -148,10 +244,19 @@ pub fn sys_set_tid_address_ctx(ctx: &SyscallContext, tidptr: usize) -> SysResult
     Ok(tid as isize)
 }
 
-fn caller_can_signal_target(caller: &Credentials, target: &Credentials) -> bool {
+fn caller_can_signal_target(
+    caller: &Arc<ProcessControlBlock>,
+    target: &Arc<ProcessControlBlock>,
+    signal: SignalFlags,
+) -> bool {
+    if signal.contains(SignalFlags::SIGCONT) && caller.session_id() == target.session_id() {
+        return true;
+    }
     // UNFINISHED: Linux kill permission also checks CAP_KILL in the target's
-    // user namespace and has a SIGCONT session rule. This kernel currently has
-    // one credential namespace and process-wide credentials.
+    // user namespace. This kernel currently has one credential namespace and
+    // process-wide credentials.
+    let caller = caller.credentials();
+    let target = target.credentials();
     caller.is_root()
         || target.uid_matches_saved_set(caller.ruid)
         || target.uid_matches_saved_set(caller.euid)
@@ -258,7 +363,6 @@ fn signal_ignored_by_namespace_init(
 pub fn sys_kill(pid: isize, signal: u32) -> SysResult {
     let flag = SignalFlags::from_signum(signal).ok_or(SysError::EINVAL)?;
     let current = current_process();
-    let sender_credentials = current.credentials();
     let targets = kill_targets(pid, &current)?;
     if targets.is_empty() {
         return Err(SysError::ESRCH);
@@ -266,8 +370,7 @@ pub fn sys_kill(pid: isize, signal: u32) -> SysResult {
 
     let mut permitted = false;
     for process in targets {
-        let target_credentials = process.credentials();
-        if !caller_can_signal_target(&sender_credentials, &target_credentials) {
+        if !caller_can_signal_target(&current, &process, flag) {
             continue;
         }
         permitted = true;

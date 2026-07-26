@@ -42,11 +42,12 @@ pub(crate) use anonfd::make_anonymous_fd;
 pub(crate) use cgroupfs::{memcg_pressure_active, reclaim_memcg_pressure_pages};
 pub(crate) use console_tty::console_tty_drain_uart;
 pub(crate) use console_tty::{
-    LinuxTermio, LinuxTermios, LinuxTermios2, LinuxWinsize, apply_console_tty_termio,
-    console_tty_available_bytes, console_tty_foreground_pgid, console_tty_poll,
-    console_tty_poll_with_wait, console_tty_read, console_tty_termio, console_tty_termios,
-    console_tty_termios2, console_tty_winsize, set_console_tty_foreground_pgid,
-    set_console_tty_termios, set_console_tty_termios2, set_console_tty_winsize,
+    LinuxTermio, LinuxTermios, LinuxTermios2, LinuxWinsize, TtyId, apply_tty_termio,
+    console_tty_available_bytes, console_tty_poll, console_tty_poll_with_wait, console_tty_read,
+    register_pty_tty, set_tty_foreground_pgid, set_tty_termios, set_tty_termios2, set_tty_winsize,
+    tty_attach, tty_control_state, tty_detach_session, tty_for_session, tty_hangup,
+    tty_input_signal_action, tty_job_control_check, tty_release, tty_termio, tty_termios,
+    tty_termios2, tty_winsize, unregister_pty_tty,
 };
 pub(crate) use eventfd::make_eventfd;
 pub(crate) use mount_fd::{DetachedMountFile, FsContextFile, FsContextStateError};
@@ -607,6 +608,12 @@ pub trait File: Send + Sync {
     }
     fn is_tty(&self) -> bool {
         false
+    }
+    fn tty_id(&self) -> Option<TtyId> {
+        None
+    }
+    fn can_acquire_controlling_tty(&self) -> bool {
+        self.tty_id().is_some()
     }
     fn is_rtc(&self) -> bool {
         false

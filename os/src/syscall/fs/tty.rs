@@ -1,14 +1,16 @@
 use crate::config::PAGE_SIZE;
 use crate::fs::{
     FS_VERITY_FL, LinuxTermio, LinuxTermios, LinuxTermios2, LinuxWinsize, ProcNamespaceInfo,
-    ProcNamespaceKind, apply_console_tty_termio, console_tty_available_bytes,
-    console_tty_foreground_pgid, console_tty_termio, console_tty_termios, console_tty_termios2,
-    console_tty_winsize, proc_namespace_info_from_path, proc_namespace_kind_name,
-    proc_namespace_stat_ino, set_console_tty_foreground_pgid, set_console_tty_termios,
-    set_console_tty_termios2, set_console_tty_winsize,
+    ProcNamespaceKind, apply_tty_termio, console_tty_available_bytes,
+    proc_namespace_info_from_path, proc_namespace_kind_name, proc_namespace_stat_ino,
+    set_tty_foreground_pgid, set_tty_termios, set_tty_termios2, set_tty_winsize, tty_attach,
+    tty_control_state, tty_hangup, tty_release, tty_termio, tty_termios, tty_termios2, tty_winsize,
 };
 use crate::mm::UserBuffer;
-use crate::task::current_user_token;
+use crate::task::{
+    CAP_SYS_ADMIN, SignalFlags, current_process, current_task, current_user_token,
+    processes_snapshot, send_tty_signal_to_process_group,
+};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -93,6 +95,7 @@ const FIONBIO: usize = 0x5421;
 const TIOCNOTTY: usize = 0x5422;
 const TIOCSETD: usize = 0x5423;
 const TIOCGETD: usize = 0x5424;
+const TIOCGSID: usize = 0x5429;
 const TCSBRKP: usize = 0x5425;
 const TCGETS2: usize = 0x802c_542a;
 const TCSETS2: usize = 0x402c_542b;
@@ -366,11 +369,12 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
     }
 
     if request == FIONREAD {
-        let unread = if file.is_tty() {
-            console_tty_available_bytes()
-        } else {
-            file.pipe_occupied().ok_or(SysError::ENOTTY)?
-        } as i32;
+        let unread = file.pipe_occupied().or_else(|| {
+            file.tty_id()
+                .is_some_and(|tty| tty == crate::fs::TtyId::Console)
+                .then(console_tty_available_bytes)
+        });
+        let unread = unread.ok_or(SysError::ENOTTY)? as i32;
         let token = current_user_token();
         write_user_value(token, argp as *mut i32, &unread)?;
         return Ok(0);
@@ -409,15 +413,16 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
         return Err(SysError::ENOTTY);
     }
 
+    let tty_id = file.tty_id().ok_or(SysError::ENOTTY)?;
     let token = current_user_token();
     match request {
         TCGETS => {
-            let termios = console_tty_termios();
+            let termios = tty_termios(tty_id).ok_or(SysError::ENOTTY)?;
             write_user_value(token, argp as *mut LinuxTermios, &termios)?;
             Ok(0)
         }
         TCGETS2 => {
-            let termios = console_tty_termios2();
+            let termios = tty_termios2(tty_id).ok_or(SysError::ENOTTY)?;
             write_user_value(token, argp as *mut LinuxTermios2, &termios)?;
             Ok(0)
         }
@@ -425,28 +430,42 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
             let termios = read_user_value(token, argp as *const LinuxTermios)?;
             // CONTEXT: Linux differentiates drain/flush behavior across TCSETS*, but for the
             // contest shell path we only need the termios state to round-trip and persist.
-            set_console_tty_termios(termios);
+            if !set_tty_termios(tty_id, termios) {
+                return Err(SysError::ENOTTY);
+            }
             Ok(0)
         }
         TCSETS2 | TCSETSW2 | TCSETSF2 => {
             let termios = read_user_value(token, argp as *const LinuxTermios2)?;
             // CONTEXT: Linux differentiates drain/flush behavior across TCSETS2*, but for the
             // contest shell path we only need the termios state to round-trip and persist.
-            set_console_tty_termios2(termios);
+            if !set_tty_termios2(tty_id, termios) {
+                return Err(SysError::ENOTTY);
+            }
             Ok(0)
         }
         TCGETA => {
-            let termio = console_tty_termio();
+            let termio = tty_termio(tty_id).ok_or(SysError::ENOTTY)?;
             write_user_value(token, argp as *mut LinuxTermio, &termio)?;
             Ok(0)
         }
         TCSETA | TCSETAW | TCSETAF => {
             let termio = read_user_value(token, argp as *const LinuxTermio)?;
-            apply_console_tty_termio(termio);
+            if !apply_tty_termio(tty_id, termio) {
+                return Err(SysError::ENOTTY);
+            }
             Ok(0)
         }
         TIOCGPGRP => {
-            let pgid = console_tty_foreground_pgid() as i32;
+            let process = current_process();
+            if process.controlling_tty_detached() {
+                return Err(SysError::ENOTTY);
+            }
+            let control = tty_control_state(tty_id).ok_or(SysError::ENOTTY)?;
+            if control.session != Some(process.session_id()) {
+                return Err(SysError::ENOTTY);
+            }
+            let pgid = control.foreground_pgid.ok_or(SysError::ENOTTY)? as i32;
             write_user_value(token, argp as *mut i32, &pgid)?;
             Ok(0)
         }
@@ -455,23 +474,124 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
             if pgid <= 0 {
                 return Err(SysError::EINVAL);
             }
-            // CONTEXT: This console has a single shared foreground process
-            // group; full Linux session/controlling-tty permission checks are
-            // still outside the current tty model.
-            set_console_tty_foreground_pgid(pgid as usize);
+            let process = current_process();
+            if process.controlling_tty_detached() {
+                return Err(SysError::ENOTTY);
+            }
+            let sid = process.session_id();
+            let caller_pgid = process.process_group_id();
+            let control = tty_control_state(tty_id).ok_or(SysError::ENOTTY)?;
+            if control.session != Some(sid) {
+                return Err(SysError::ENOTTY);
+            }
+            if control.foreground_pgid != Some(caller_pgid) {
+                let task = current_task().ok_or(SysError::ESRCH)?;
+                let blocked = task
+                    .inner_exclusive_access()
+                    .signal_mask
+                    .contains(SignalFlags::SIGTTOU);
+                let ignored = process.inner_exclusive_access().signal_actions
+                    [SignalFlags::SIGTTOU.bits().trailing_zeros() as usize]
+                    .is_ignore();
+                if !blocked && !ignored {
+                    send_tty_signal_to_process_group(caller_pgid, SignalFlags::SIGTTOU);
+                    return Err(SysError::EINTR);
+                }
+            }
+            let target_exists = processes_snapshot().into_iter().any(|candidate| {
+                candidate.process_group_id() == pgid as usize && candidate.session_id() == sid
+            });
+            if !target_exists {
+                return Err(SysError::EPERM);
+            }
+            set_tty_foreground_pgid(tty_id, sid, pgid as usize)?;
+            Ok(0)
+        }
+        TIOCGSID => {
+            let process = current_process();
+            if process.controlling_tty_detached() {
+                return Err(SysError::ENOTTY);
+            }
+            let control = tty_control_state(tty_id).ok_or(SysError::ENOTTY)?;
+            if control.session != Some(process.session_id()) {
+                return Err(SysError::ENOTTY);
+            }
+            write_user_value(
+                token,
+                argp as *mut i32,
+                &(control.session.ok_or(SysError::ENOTTY)? as i32),
+            )?;
             Ok(0)
         }
         TIOCGWINSZ => {
-            let winsize = console_tty_winsize();
+            let winsize = tty_winsize(tty_id).ok_or(SysError::ENOTTY)?;
             write_user_value(token, argp as *mut LinuxWinsize, &winsize)?;
             Ok(0)
         }
         TIOCSWINSZ => {
             let winsize = read_user_value(token, argp as *const LinuxWinsize)?;
-            set_console_tty_winsize(winsize);
+            if !set_tty_winsize(tty_id, winsize) && tty_winsize(tty_id).is_none() {
+                return Err(SysError::ENOTTY);
+            }
             Ok(0)
         }
-        TCSBRK | TCSBRKP | TIOCSCTTY | TIOCNOTTY | TIOCVHANGUP => Ok(0),
+        TIOCSCTTY => {
+            if argp > 1 {
+                return Err(SysError::EINVAL);
+            }
+            let process = current_process();
+            let pid = process.getpid();
+            let sid = process.session_id();
+            if pid != sid {
+                return Err(SysError::EPERM);
+            }
+            let force = argp == 1;
+            if force
+                && !process
+                    .credentials()
+                    .capabilities
+                    .has_effective(CAP_SYS_ADMIN)
+                    .unwrap_or(false)
+            {
+                return Err(SysError::EPERM);
+            }
+            tty_attach(tty_id, sid, process.process_group_id(), force)
+                .map_err(|_| SysError::EPERM)?;
+            process.set_controlling_tty_detached(false);
+            Ok(0)
+        }
+        TIOCNOTTY => {
+            let process = current_process();
+            let sid = process.session_id();
+            let control = tty_control_state(tty_id).ok_or(SysError::ENOTTY)?;
+            if process.controlling_tty_detached() || control.session != Some(sid) {
+                return Err(SysError::ENOTTY);
+            }
+            if process.getpid() == sid {
+                let foreground = tty_release(tty_id, sid).map_err(|_| SysError::ENOTTY)?;
+                if let Some(pgid) = foreground {
+                    send_tty_signal_to_process_group(pgid, SignalFlags::SIGHUP);
+                    send_tty_signal_to_process_group(pgid, SignalFlags::SIGCONT);
+                }
+            } else {
+                process.set_controlling_tty_detached(true);
+            }
+            Ok(0)
+        }
+        TIOCVHANGUP => {
+            let process = current_process();
+            if !process
+                .credentials()
+                .capabilities
+                .has_effective(CAP_SYS_ADMIN)
+                .unwrap_or(false)
+            {
+                return Err(SysError::EPERM);
+            }
+            tty_hangup(tty_id);
+            Ok(0)
+        }
+        TCSBRK | TCSBRKP => Ok(0),
         TCXONC => match argp {
             TCOOFF | TCOON | TCIOFF | TCION => Ok(0),
             _ => Err(SysError::EINVAL),

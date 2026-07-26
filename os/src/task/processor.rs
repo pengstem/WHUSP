@@ -261,7 +261,9 @@ fn finish_current_switch() {
                 assert_eq!(inner.task_status, TaskStatus::Running);
                 assert!(!inner.wake_pending);
                 inner.task_status = TaskStatus::Ready;
-                enqueue = Some(false);
+                if !inner.job_control_stopped {
+                    enqueue = Some(false);
+                }
             }
             SwitchReason::Block => {
                 assert_eq!(inner.task_status, TaskStatus::Blocked);
@@ -270,7 +272,9 @@ fn finish_current_switch() {
                     inner.wake_pending = false;
                     inner.wake_front = false;
                     inner.task_status = TaskStatus::Ready;
-                    enqueue = Some(front);
+                    if !inner.job_control_stopped {
+                        enqueue = Some(front);
+                    }
                 }
             }
             SwitchReason::Exit => {
@@ -279,6 +283,8 @@ fn finish_current_switch() {
             }
         }
     }
+
+    super::acknowledge_task_job_control_stop(&task);
 
     if cpu_probe {
         super::smp_probe::record_cpu_probe_switch(
@@ -300,7 +306,13 @@ fn finish_current_switch() {
     }
 
     match reason {
-        SwitchReason::Yield => super::requeue_task_after_run(task),
+        SwitchReason::Yield => {
+            if enqueue.is_some() {
+                super::requeue_task_after_run(task);
+            } else {
+                super::charge_task_after_run(&task);
+            }
+        }
         SwitchReason::Block => {
             if let Some(front) = enqueue {
                 super::manager::enqueue_woken_task(task, front);

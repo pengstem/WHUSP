@@ -16,7 +16,9 @@ mod task;
 
 use self::id::TaskUserRes;
 use crate::arch::__switch;
-use crate::fs::{OpenFlags, PathContext, open_file_in, untrack_regular_file_executable};
+use crate::fs::{
+    OpenFlags, PathContext, open_file_in, tty_detach_session, untrack_regular_file_executable,
+};
 use crate::shutdown::shutdown;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::errno::{SysError, SysResult};
@@ -52,6 +54,7 @@ pub(crate) use manager::any_process_references_mount;
 pub(crate) use manager::list_process_snapshots;
 pub(crate) use manager::migrate_ready_task;
 pub(crate) use manager::processes_snapshot;
+pub(crate) use manager::remove_ready_task_for_job_stop;
 use manager::remove_ready_tasks_of_process;
 pub(crate) use manager::reprioritize_ready_task;
 pub(crate) use manager::requeue_task_after_run;
@@ -71,10 +74,10 @@ pub(crate) use ptrace::{
     ptrace_validate_tracee,
 };
 pub use signal::{
-    CLD_CONTINUED, CLD_STOPPED, DefaultSignalAction, MINSIGSTKSZ, SA_RESTART, SI_TKILL, SIGCHLD,
-    SIGCONT, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SIGTRAP, SS_DISABLE, SS_ONSTACK, SigAltStack,
-    SignalAction, SignalFlags, SignalInfo, default_signal_action, default_signal_error,
-    default_signal_exit_code, signal_child_status, signal_wait_status,
+    CLD_CONTINUED, CLD_STOPPED, DefaultSignalAction, MINSIGSTKSZ, SA_NOCLDSTOP, SA_RESTART,
+    SI_TKILL, SIGCHLD, SIGCONT, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SIGTRAP, SS_DISABLE,
+    SS_ONSTACK, SigAltStack, SignalAction, SignalFlags, SignalInfo, default_signal_action,
+    default_signal_error, default_signal_exit_code, signal_child_status, signal_wait_status,
 };
 #[cfg(target_arch = "riscv64")]
 pub use signal::{SIGRT_1, SIGRTMIN};
@@ -142,7 +145,8 @@ pub fn mark_current_kernel_time_entry(now_us: usize) {
 }
 
 pub fn timer_tick_should_preempt(current: &Arc<TaskControlBlock>) -> bool {
-    manager::should_preempt_current_on_tick(current)
+    current.inner_exclusive_access().job_control_stopped
+        || manager::should_preempt_current_on_tick(current)
 }
 
 pub fn suspend_current_and_run_next() {
@@ -426,7 +430,26 @@ pub(crate) fn queue_signal_to_task(
     if signal.is_empty() {
         return;
     }
-    record_job_control_wait_state(&task, signal);
+
+    let Some(process) = task.process.upgrade() else {
+        return;
+    };
+    if signal.contains(SignalFlags::SIGKILL) {
+        resume_process_from_job_control_stop(&process, false);
+    }
+    if signal.contains(SignalFlags::SIGCONT) {
+        let has_handler =
+            process.inner_exclusive_access().signal_actions[SIGCONT as usize].has_user_handler();
+        resume_process_from_job_control_stop(&process, true);
+        if !has_handler {
+            return;
+        }
+    }
+
+    if let Some(signum) = default_job_control_stop_for_task(&task, &process, signal) {
+        request_process_job_control_stop(&process, signum);
+        return;
+    }
     {
         let mut task_inner = task.inner_exclusive_access();
         task_inner.pending_signals |= signal;
@@ -440,8 +463,24 @@ pub(crate) fn queue_signal_to_task(
 }
 
 fn signal_should_wake_target(task: &Arc<TaskControlBlock>, signal: SignalFlags) -> bool {
+    let job_stop_signals =
+        SignalFlags::SIGSTOP | SignalFlags::SIGTSTP | SignalFlags::SIGTTIN | SignalFlags::SIGTTOU;
+    if signal.intersects(job_stop_signals) {
+        let Some(process) = task.process.upgrade() else {
+            return false;
+        };
+        let Some(signum) = job_control_stop_signum(signal) else {
+            return false;
+        };
+        let action = process.inner_exclusive_access().signal_actions[signum as usize];
+        let unmasked = !task
+            .inner_exclusive_access()
+            .signal_mask
+            .contains(SignalFlags::from_signum(signum).unwrap_or_default());
+        return action.has_user_handler() && unmasked;
+    }
     let mut non_job_control = signal;
-    non_job_control.remove(SignalFlags::SIGSTOP);
+    non_job_control.remove(job_stop_signals);
     non_job_control.remove(SignalFlags::SIGCONT);
     if !non_job_control.is_empty() {
         return true;
@@ -449,36 +488,235 @@ fn signal_should_wake_target(task: &Arc<TaskControlBlock>, signal: SignalFlags) 
     let Some(process) = task.process.upgrade() else {
         return false;
     };
-    let process_inner = process.inner_exclusive_access();
-    // CONTEXT: Full Linux job control would wake a task that is actually
-    // stopped by SIGCONT. This kernel only records stop/continue waitid
-    // events, so waking a normal futex/pipe sleeper here turns checkpoints
-    // into spurious EINTR. A user SIGCONT handler still needs delivery.
-    process_inner.signal_actions[SIGCONT as usize].has_user_handler()
+    process.inner_exclusive_access().signal_actions[SIGCONT as usize].has_user_handler()
 }
 
-fn record_job_control_wait_state(task: &Arc<TaskControlBlock>, signal: SignalFlags) {
+fn job_control_stop_signum(signal: SignalFlags) -> Option<u32> {
+    [
+        SignalFlags::SIGSTOP,
+        SignalFlags::SIGTSTP,
+        SignalFlags::SIGTTIN,
+        SignalFlags::SIGTTOU,
+    ]
+    .into_iter()
+    .find(|candidate| signal.contains(*candidate))
+    .map(|candidate| candidate.bits().trailing_zeros())
+}
+
+fn default_job_control_stop_for_task(
+    task: &Arc<TaskControlBlock>,
+    process: &Arc<ProcessControlBlock>,
+    signal: SignalFlags,
+) -> Option<u32> {
+    let signum = job_control_stop_signum(signal)?;
+    if signum != SIGSTOP {
+        let action = process.inner_exclusive_access().signal_actions[signum as usize];
+        if action.is_ignore() || action.has_user_handler() {
+            return None;
+        }
+        if task
+            .inner_exclusive_access()
+            .signal_mask
+            .contains(SignalFlags::from_signum(signum).unwrap_or_default())
+        {
+            return None;
+        }
+    }
+    Some(signum)
+}
+
+fn clear_pending_signals(task: &TaskControlBlock, signals: SignalFlags) {
+    let mut inner = task.inner_exclusive_access();
+    inner.pending_signals.remove(signals);
+    for signum in 1..SIGNAL_INFO_SLOTS {
+        if SignalFlags::from_signum(signum as u32).is_some_and(|signal| signals.contains(signal)) {
+            inner.signal_infos[signum] = None;
+        }
+    }
+}
+
+fn notify_parent_job_control_event(process: &Arc<ProcessControlBlock>, code: i32, status: i32) {
+    let Some(parent) = process.parent_process() else {
+        return;
+    };
+    let parent_tasks = parent.tasks_snapshot();
+    let action = parent.inner_exclusive_access().signal_actions[SIGCHLD as usize];
+    if action.flags & SA_NOCLDSTOP == 0
+        && let Some(parent_task) = parent_tasks.first()
+    {
+        let child_pid = process
+            .pid_visible_from_namespace(parent.pid_namespace())
+            .unwrap_or(0) as i32;
+        queue_signal_to_task(
+            Arc::clone(parent_task),
+            SignalFlags::SIGCHLD,
+            SignalInfo::child_job_control(SIGCHLD as i32, child_pid, code, status),
+        );
+    }
+    wake_parent_waiters(process);
+}
+
+fn request_process_job_control_stop(process: &Arc<ProcessControlBlock>, signum: u32) {
+    let changed = {
+        let mut inner = process.inner_exclusive_access();
+        if inner.is_zombie || inner.job_control_stopped {
+            false
+        } else {
+            inner.job_control_stopped = true;
+            inner.wait_continued = false;
+            inner.job_control_stop_signal = Some(signum);
+            inner.job_control_stop_reported = false;
+            true
+        }
+    };
+    if !changed {
+        return;
+    }
+
+    let tasks = process.tasks_snapshot();
+    let generation = process
+        .job_control_stop_generation
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    process.job_control_stop_pending.store(0, Ordering::Release);
+    for task in &tasks {
+        let mut inner = task.inner_exclusive_access();
+        if inner.task_status != TaskStatus::Exited {
+            inner.job_control_stopped = true;
+            if inner.on_cpu.is_some() {
+                inner.job_control_stop_ack_generation = generation;
+                process
+                    .job_control_stop_pending
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        drop(inner);
+        remove_ready_task_for_job_stop(task);
+    }
+    let mut conflicting = SignalFlags::SIGCONT;
+    if let Some(stop_signal) = SignalFlags::from_signum(signum) {
+        conflicting |= stop_signal;
+    }
+    for task in &tasks {
+        clear_pending_signals(task, conflicting);
+    }
+    crate::cpu::request_scheduler_preemption(crate::cpu::online_mask());
+    if process.job_control_stop_pending.load(Ordering::Acquire) == 0 {
+        complete_process_job_control_stop(process);
+    }
+}
+
+fn complete_process_job_control_stop(process: &Arc<ProcessControlBlock>) {
+    let signum = {
+        let mut inner = process.inner_exclusive_access();
+        if !inner.job_control_stopped
+            || process.job_control_stop_pending.load(Ordering::Acquire) != 0
+            || inner.job_control_stop_reported
+        {
+            return;
+        }
+        let Some(signum) = inner.job_control_stop_signal.take() else {
+            return;
+        };
+        inner.job_control_stop_reported = true;
+        inner.wait_stop_status = Some(signum as i32);
+        signum
+    };
+    notify_parent_job_control_event(process, CLD_STOPPED, signum as i32);
+}
+
+pub(crate) fn acknowledge_task_job_control_stop(task: &Arc<TaskControlBlock>) {
+    let generation = {
+        let mut inner = task.inner_exclusive_access();
+        if !inner.job_control_stopped || inner.job_control_stop_ack_generation == 0 {
+            return;
+        }
+        let generation = inner.job_control_stop_ack_generation;
+        inner.job_control_stop_ack_generation = 0;
+        generation
+    };
     let Some(process) = task.process.upgrade() else {
         return;
     };
-    let mut changed = false;
-    {
-        let mut process_inner = process.inner_exclusive_access();
-        if signal.contains(SignalFlags::SIGSTOP) {
-            // UNFINISHED: This records the Linux-visible waitid stop event but
-            // does not yet implement full job-control task suspension.
-            process_inner.wait_stop_status = Some(SIGSTOP as i32);
-            changed = true;
+    if process.job_control_stop_generation.load(Ordering::Acquire) != generation {
+        return;
+    }
+    let complete = process
+        .job_control_stop_pending
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+            (pending > 0).then(|| pending - 1)
+        })
+        .is_ok_and(|previous| previous == 1);
+    if complete {
+        complete_process_job_control_stop(&process);
+    }
+}
+
+fn resume_process_from_job_control_stop(process: &Arc<ProcessControlBlock>, report: bool) {
+    let (changed, was_reported) = {
+        let mut inner = process.inner_exclusive_access();
+        if !inner.job_control_stopped {
+            (false, false)
+        } else {
+            let was_reported = inner.job_control_stop_reported;
+            inner.job_control_stopped = false;
+            inner.job_control_stop_signal = None;
+            inner.job_control_stop_reported = false;
+            if report && was_reported {
+                inner.wait_continued = true;
+            }
+            (true, was_reported)
         }
-        if signal.contains(SignalFlags::SIGCONT) {
-            // UNFINISHED: This records the waitid continued event; full
-            // process-group job control and terminal stop semantics are not modeled.
-            process_inner.wait_continued = true;
-            changed = true;
+    };
+    process
+        .job_control_stop_generation
+        .fetch_add(1, Ordering::AcqRel);
+    process.job_control_stop_pending.store(0, Ordering::Release);
+
+    let stop_signals =
+        SignalFlags::SIGSTOP | SignalFlags::SIGTSTP | SignalFlags::SIGTTIN | SignalFlags::SIGTTOU;
+    let mut ready = Vec::new();
+    for task in process.tasks_snapshot() {
+        clear_pending_signals(&task, stop_signals);
+        let mut inner = task.inner_exclusive_access();
+        inner.job_control_stopped = false;
+        inner.job_control_stop_ack_generation = 0;
+        if changed
+            && inner.task_status == TaskStatus::Ready
+            && !inner.on_rq
+            && inner.on_cpu.is_none()
+        {
+            ready.push(Arc::clone(&task));
         }
     }
-    if changed {
-        wake_parent_waiters(&process);
+    for task in ready {
+        add_task(task);
+    }
+    if changed && report && was_reported {
+        notify_parent_job_control_event(process, CLD_CONTINUED, SIGCONT as i32);
+    }
+}
+
+/// Consumes a newly unmasked default stop signal and parks the current task at
+/// the trap-return boundary. A stopped task becomes schedulable again only
+/// after SIGCONT (or SIGKILL) clears its task-local gate.
+pub fn stop_current_task_if_needed() {
+    let Some(task) = current_task() else {
+        return;
+    };
+    let Some(process) = task.process.upgrade() else {
+        return;
+    };
+    let pending = {
+        let inner = task.inner_exclusive_access();
+        SignalFlags::from_bits_retain(inner.pending_signals.bits() & !inner.signal_mask.bits())
+    };
+    if let Some(signum) = default_job_control_stop_for_task(&task, &process, pending) {
+        clear_pending_signals(&task, SignalFlags::from_signum(signum).unwrap_or_default());
+        request_process_job_control_stop(&process, signum);
+    }
+    if task.inner_exclusive_access().job_control_stopped {
+        suspend_current_and_run_next();
     }
 }
 
@@ -511,6 +749,29 @@ pub(crate) fn send_tty_signal_to_process_group(pgid: usize, signal: SignalFlags)
         .filter(|process| process.process_group_id() == pgid)
     {
         queue_signal_to_process_for_tty(&process, signal, info);
+    }
+}
+
+pub(crate) fn notify_if_orphaned_stopped_process_group(pgid: usize, sid: usize) {
+    let members: Vec<_> = processes_snapshot()
+        .into_iter()
+        .filter(|process| {
+            !process.is_zombie()
+                && process.process_group_id() == pgid
+                && process.session_id() == sid
+        })
+        .collect();
+    if members.is_empty() || !members.iter().any(|member| member.is_job_control_stopped()) {
+        return;
+    }
+    let orphaned = members.iter().all(|member| {
+        member
+            .parent_process()
+            .is_none_or(|parent| parent.process_group_id() == pgid || parent.session_id() != sid)
+    });
+    if orphaned {
+        send_tty_signal_to_process_group(pgid, SignalFlags::SIGHUP);
+        send_tty_signal_to_process_group(pgid, SignalFlags::SIGCONT);
     }
 }
 
@@ -619,6 +880,11 @@ fn exit_current(exit_code: i32, group_exit: bool) {
     }
     if process_exit {
         let pid = process.getpid();
+        let pgid = process.process_group_id();
+        let sid = process.session_id();
+        if pid == sid {
+            tty_detach_session(sid, true);
+        }
         if pid == IDLE_PID || Arc::ptr_eq(&process, &INITPROC) {
             println!(
                 "[kernel] init process exit with exit_code {} ...",
@@ -715,15 +981,24 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             close_detached_fd_entry_for_process_teardown(entry);
         }
         process.release_vfork_parent();
+        notify_if_orphaned_stopped_process_group(pgid, sid);
 
         // Move orphaned children under the nearest live subreaper, or init.
         let reaper = nearest_child_reaper(parent.clone());
+        let mut orphan_candidates = Vec::new();
         let mut reaper_inner = reaper.inner_exclusive_access();
         for child in children {
+            let identity = (child.process_group_id(), child.session_id());
+            if !orphan_candidates.contains(&identity) {
+                orphan_candidates.push(identity);
+            }
             child.inner_exclusive_access().parent = Some(Arc::downgrade(&reaper));
             reaper_inner.children.push(child);
         }
         drop(reaper_inner);
+        for (pgid, sid) in orphan_candidates {
+            notify_if_orphaned_stopped_process_group(pgid, sid);
+        }
 
         if let Some(parent) = parent {
             let parent_tasks = parent.tasks_snapshot();

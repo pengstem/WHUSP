@@ -252,7 +252,9 @@ struct WaitZombie {
 
 struct Wait4ChildScan {
     matched: bool,
-    stopped: Option<(usize, i32)>,
+    /// (child index, child pid, encoded status, process job-control event)
+    stopped: Option<(usize, usize, i32, bool)>,
+    continued: Option<(usize, usize)>,
     zombie: Option<WaitZombie>,
 }
 
@@ -262,6 +264,7 @@ fn scan_wait4_children(
     caller_pgid: usize,
     waiter_pid: usize,
     include_untraced: bool,
+    include_continued: bool,
 ) -> Wait4ChildScan {
     // Keep stop and zombie discovery in one parent-child-list pass. Ptrace
     // stop status is observable without reaping, while the zombie record
@@ -270,6 +273,7 @@ fn scan_wait4_children(
     let mut scan = Wait4ChildScan {
         matched: false,
         stopped: None,
+        continued: None,
         zombie: None,
     };
     for (idx, child) in children.iter().enumerate() {
@@ -277,21 +281,33 @@ fn scan_wait4_children(
             continue;
         }
         scan.matched = true;
+        {
+            let child_inner = child.inner_exclusive_access();
+            if child_inner.is_zombie {
+                if scan.zombie.is_none() {
+                    scan.zombie = Some(WaitZombie {
+                        idx,
+                        pid: child.getpid(),
+                        exit_code: child_inner.exit_code,
+                        child_times: child_inner.cpu_times.snapshot(),
+                    });
+                }
+                continue;
+            }
+            if scan.stopped.is_none()
+                && include_untraced
+                && let Some(signum) = child_inner.wait_stop_status
+            {
+                scan.stopped = Some((idx, child.getpid(), (signum << 8) | 0x7f, true));
+            }
+            if scan.continued.is_none() && include_continued && child_inner.wait_continued {
+                scan.continued = Some((idx, child.getpid()));
+            }
+        }
         if scan.stopped.is_none()
             && let Some(status) = ptrace_take_wait_status(child, waiter_pid, include_untraced)
         {
-            scan.stopped = Some((child.getpid(), status));
-        }
-        if scan.zombie.is_none() {
-            let child_inner = child.inner_exclusive_access();
-            if child_inner.is_zombie {
-                scan.zombie = Some(WaitZombie {
-                    idx,
-                    pid: child.getpid(),
-                    exit_code: child_inner.exit_code,
-                    child_times: child_inner.cpu_times.snapshot(),
-                });
-            }
+            scan.stopped = Some((idx, child.getpid(), status, false));
         }
     }
     scan
@@ -387,6 +403,7 @@ fn sys_wait4_for_process(
             caller_pgid,
             waiter_pid,
             options & WUNTRACED != 0,
+            options & WCONTINUED != 0,
         );
         if !scan.matched {
             if let Some((tracee_pid, status)) = ptrace_wait4_target(pid, waiter_pid) {
@@ -399,14 +416,8 @@ fn sys_wait4_for_process(
             return Err(SysError::ECHILD);
         }
 
-        if let Some((found_pid, status)) = scan.stopped {
-            if !wstatus.is_null() {
-                write_user_value_in_memory_set(&mut inner.memory_set, wstatus, &status)?;
-            }
-            write_rusage(&mut inner.memory_set, rusage)?;
-            return Ok(found_pid as isize);
-        }
-
+        // Exit wins over older stop/continue notifications so an unreaped
+        // transition can never hide a zombie indefinitely.
         if let Some(zombie) = scan.zombie {
             if !wstatus.is_null() {
                 write_user_value_in_memory_set(
@@ -426,6 +437,28 @@ fn sys_wait4_for_process(
             // references must not turn a successful wait into a panic.
             drop(inner.children.remove(zombie.idx));
             return Ok(zombie.pid as isize);
+        }
+
+        if let Some((idx, found_pid, status, is_job_control)) = scan.stopped {
+            if !wstatus.is_null() {
+                write_user_value_in_memory_set(&mut inner.memory_set, wstatus, &status)?;
+            }
+            write_rusage(&mut inner.memory_set, rusage)?;
+            if is_job_control && let Some(child) = inner.children.get(idx) {
+                child.inner_exclusive_access().wait_stop_status = None;
+            }
+            return Ok(found_pid as isize);
+        }
+
+        if let Some((idx, found_pid)) = scan.continued {
+            if !wstatus.is_null() {
+                write_user_value_in_memory_set(&mut inner.memory_set, wstatus, &0xffff_i32)?;
+            }
+            write_rusage(&mut inner.memory_set, rusage)?;
+            if let Some(child) = inner.children.get(idx) {
+                child.inner_exclusive_access().wait_continued = false;
+            }
+            return Ok(found_pid as isize);
         }
 
         if options & WNOHANG != 0 {
@@ -489,6 +522,23 @@ pub fn sys_waitid(
             return Err(SysError::ECHILD);
         }
 
+        if let Some(zombie) = scan.zombie {
+            let (si_code, si_status) = waitid_code_and_status(zombie.exit_code);
+            write_waitid_siginfo(&mut inner.memory_set, infop, zombie.pid, si_code, si_status)?;
+            write_rusage(&mut inner.memory_set, rusage)?;
+
+            if options & WNOWAIT == 0 {
+                inner.cpu_times.add_waited_child(zombie.child_times);
+                // CONTEXT: WNOWAIT observes the zombie without reaping it; only
+                // the actual reap removes the PID from process lookup.
+                remove_from_pid2process(zombie.pid);
+                // CONTEXT: waitid reaping has the same user-visible boundary
+                // as wait4 and must not assert on Arc ownership.
+                drop(inner.children.remove(zombie.idx));
+            }
+            return Ok(0);
+        }
+
         if let Some((idx, child_pid, stop_status)) = scan.stopped {
             write_waitid_siginfo(
                 &mut inner.memory_set,
@@ -519,23 +569,6 @@ pub fn sys_waitid(
                 && let Some(child) = inner.children.get(idx)
             {
                 child.inner_exclusive_access().wait_continued = false;
-            }
-            return Ok(0);
-        }
-
-        if let Some(zombie) = scan.zombie {
-            let (si_code, si_status) = waitid_code_and_status(zombie.exit_code);
-            write_waitid_siginfo(&mut inner.memory_set, infop, zombie.pid, si_code, si_status)?;
-            write_rusage(&mut inner.memory_set, rusage)?;
-
-            if options & WNOWAIT == 0 {
-                inner.cpu_times.add_waited_child(zombie.child_times);
-                // CONTEXT: WNOWAIT observes the zombie without reaping it; only
-                // the actual reap removes the PID from process lookup.
-                remove_from_pid2process(zombie.pid);
-                // CONTEXT: waitid reaping has the same user-visible boundary
-                // as wait4 and must not assert on Arc ownership.
-                drop(inner.children.remove(zombie.idx));
             }
             return Ok(0);
         }

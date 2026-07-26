@@ -145,6 +145,7 @@ pub fn trap_handler() -> ! {
             if crate::task::ptrace_stop_task_if_needed(&task, &process) {
                 interrupted_pc = trap_cx_of_task(&task).sepc;
             }
+            crate::task::stop_current_task_if_needed();
             if crate::arch::signal::deliver_pending_signal(
                 &task,
                 &process,
@@ -226,6 +227,7 @@ pub fn trap_handler() -> ! {
     if !signal_delivery_attempted && crate::task::ptrace_stop_task_if_needed(&task, &process) {
         interrupted_pc = trap_cx_of_task(&task).sepc;
     }
+    crate::task::stop_current_task_if_needed();
     if !signal_delivery_attempted
         && crate::arch::signal::deliver_pending_signal(&task, &process, interrupted_pc, None)
     {

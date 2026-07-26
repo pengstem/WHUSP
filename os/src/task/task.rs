@@ -68,6 +68,12 @@ pub struct TaskControlBlockInner {
     // enqueue at that boundary, so remember the wakeup until switch completion.
     pub(crate) wake_pending: bool,
     pub(crate) wake_front: bool,
+    /// Orthogonal job-control gate. The base status continues to describe
+    /// whether the task was runnable or waiting when the process stopped.
+    pub(crate) job_control_stopped: bool,
+    /// This running task still owes the process-wide group-stop generation an
+    /// acknowledgement at switch completion.
+    pub(crate) job_control_stop_ack_generation: usize,
     // Linux-visible affinity mask used for placement, stealing, and migration.
     pub(crate) allowed_cpus: crate::cpu::CpuMask,
     pub(crate) smp_sched_probe: bool,
@@ -143,6 +149,7 @@ impl TaskControlBlock {
         let trap_cx_ppn = res.trap_cx_ppn();
         let kstack = kstack_alloc();
         let kstack_top = kstack.get_top();
+        let job_control_stopped = process.is_job_control_stopped();
         Self {
             process: Arc::downgrade(&process),
             kstack,
@@ -158,6 +165,8 @@ impl TaskControlBlock {
                     queued_cpu: None,
                     wake_pending: false,
                     wake_front: false,
+                    job_control_stopped,
+                    job_control_stop_ack_generation: 0,
                     allowed_cpus: crate::cpu::topology().possible_mask(),
                     smp_sched_probe: false,
                     smp_sched_probe_active: false,
