@@ -38,7 +38,7 @@
 - [x] 接入比赛模式 initproc：内核直接加载 `/musl/busybox sh`。
 - [x] `make run-rv` 默认使用 `sdcard-rv.img` 作为 `PRIMARY_DISK / x0`，并构建 `disk.img` 作为 `AUX_DISK / x1` 脚本盘。
 - [x] `make run-la` 默认使用 `sdcard-la.img` 作为 `PRIMARY_DISK / x0`，并同样接入 `AUX_DISK / x1` 脚本盘；LA guest 侧仍未打分闭环。
-- [x] `os/Makefile` 的 `run-inner` 会检查 `PRIMARY_DISK` 和已设置的 `AUX_DISK`，当前 RV/LA QEMU 命令都会把 `x1` 作为辅助块设备挂上。
+- [x] `os/Makefile` 的 `run-inner` 会检查 `PRIMARY_DISK` 和已设置的 `AUX_DISK`，在 `/tmp` 为 `x0` 和可选 `x1` 创建单次运行的 qcow2 overlay，RV/LA QEMU 只写 overlay，并在退出或中断后删除；raw 基盘保持不变。
 
 ### 已完成闭环
 

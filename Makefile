@@ -8,7 +8,7 @@ INTERACTIVE ?= 0
 NO_BUILD ?= 0
 # Must stay in sync with os/src/config.rs and both entry.asm boot stacks.
 MAX_CPUS := 12
-CARGO_HOME ?= $(CURDIR)/vendor
+override CARGO_HOME := $(CURDIR)/vendor
 export CARGO_HOME
 
 # Optional unified override: `make run-rv MEM=2G` / `make run-la MEM=2G`.

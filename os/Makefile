@@ -1,9 +1,8 @@
 ARCH ?= riscv64
 MODE ?= release
 PERF_COUNTERS ?= 0
-CARGO_HOME ?= $(abspath ../vendor)
+override CARGO_HOME := $(abspath ../vendor)
 export CARGO_HOME
-CARGO_CONFIG_DIR ?= dotcargo
 
 ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
@@ -32,14 +31,22 @@ PRIMARY_DISK ?= $(DEFAULT_DISK)
 AUX_DISK ?=
 COMMA := ,
 ifeq ($(ARCH),riscv64)
-AUX_DISK_ARGS := $(if $(AUX_DISK),-drive file=$(AUX_DISK)$(COMMA)if=none$(COMMA)format=raw$(COMMA)id=x1 -device virtio-blk-device$(COMMA)drive=x1$(COMMA)bus=virtio-mmio-bus.1)
+QEMU_SYSTEM := qemu-system-riscv64
+QEMU_MACHINE_ARGS := -machine virt -bios default
+PRIMARY_DEVICE_ARGS := -device virtio-blk-device$(COMMA)drive=x0$(COMMA)bus=virtio-mmio-bus.0
+AUX_DISK_ARGS := $(if $(AUX_DISK),-drive file="$$aux_overlay"$(COMMA)if=none$(COMMA)format=qcow2$(COMMA)id=x1 -device virtio-blk-device$(COMMA)drive=x1$(COMMA)bus=virtio-mmio-bus.1)
+QEMU_NETWORK_ARGS := -device virtio-net-device$(COMMA)netdev=net -netdev user$(COMMA)id=net
 else ifeq ($(ARCH),loongarch64)
-AUX_DISK_ARGS := $(if $(AUX_DISK),-drive file=$(AUX_DISK)$(COMMA)if=none$(COMMA)format=raw$(COMMA)id=x1 -device virtio-blk-pci$(COMMA)drive=x1)
+QEMU_SYSTEM := qemu-system-loongarch64
+QEMU_MACHINE_ARGS :=
+PRIMARY_DEVICE_ARGS := -device virtio-blk-pci$(COMMA)drive=x0
+AUX_DISK_ARGS := $(if $(AUX_DISK),-drive file="$$aux_overlay"$(COMMA)if=none$(COMMA)format=qcow2$(COMMA)id=x1 -device virtio-blk-pci$(COMMA)drive=x1)
+QEMU_NETWORK_ARGS := -device virtio-net-pci$(COMMA)netdev=net0 -netdev user$(COMMA)id=net0
 endif
 
 prepare-cargo-config:
 	@rm -rf .cargo
-	@ln -sfn $(CARGO_CONFIG_DIR) .cargo
+	@ln -sfn dotcargo .cargo
 
 kernel:
 	@$(MAKE) --no-print-directory prepare-cargo-config
@@ -56,32 +63,50 @@ check-smp:
 	fi
 
 run-inner: check-smp
-	@if [ ! -f "$(PRIMARY_DISK)" ]; then \
+	@set -eu; \
+	if [ ! -f "$(PRIMARY_DISK)" ]; then \
 		echo "PRIMARY_DISK does not exist: $(PRIMARY_DISK)"; \
 		exit 1; \
-	fi
-	@if [ -n "$(AUX_DISK)" ] && [ ! -f "$(AUX_DISK)" ]; then \
+	fi; \
+	if [ -n "$(AUX_DISK)" ] && [ ! -f "$(AUX_DISK)" ]; then \
 		echo "AUX_DISK does not exist: $(AUX_DISK)"; \
 		exit 1; \
-	fi
-ifeq ($(ARCH),riscv64)
-	@qemu-system-riscv64 -machine virt -kernel $(KERNEL_ELF) -m $(MEM) -nographic -smp $(SMP) -bios default \
-		-drive file=$(PRIMARY_DISK),if=none,format=raw,id=x0 \
-		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+	fi; \
+	if ! command -v qemu-img >/dev/null 2>&1; then \
+		echo "qemu-img is required to create temporary disk overlays"; \
+		exit 1; \
+	fi; \
+	if [ ! -d /tmp ] || [ ! -w /tmp ]; then \
+		echo "/tmp must be a writable directory"; \
+		exit 1; \
+	fi; \
+	overlay_dir=$$(mktemp -d "/tmp/whusp-qemu.XXXXXX"); \
+	primary_overlay="$$overlay_dir/x0.qcow2"; \
+	aux_overlay=""; \
+	cleanup() { \
+		status=$$?; \
+		trap - 0 1 2 15; \
+		rm -f -- "$$primary_overlay"; \
+		if [ -n "$$aux_overlay" ]; then rm -f -- "$$aux_overlay"; fi; \
+		rmdir -- "$$overlay_dir"; \
+		exit $$status; \
+	}; \
+	trap cleanup 0 1 2 15; \
+	primary_base=$$(realpath -- "$(PRIMARY_DISK)"); \
+	qemu-img create -q -f qcow2 -o "backing_file=$$primary_base,backing_fmt=raw" "$$primary_overlay"; \
+	if [ -n "$(AUX_DISK)" ]; then \
+		aux_overlay="$$overlay_dir/x1.qcow2"; \
+		aux_base=$$(realpath -- "$(AUX_DISK)"); \
+		qemu-img create -q -f qcow2 -o "backing_file=$$aux_base,backing_fmt=raw" "$$aux_overlay"; \
+	fi; \
+	echo "using temporary disk overlays in $$overlay_dir"; \
+	$(QEMU_SYSTEM) $(QEMU_MACHINE_ARGS) -kernel "$(KERNEL_ELF)" -m "$(MEM)" -nographic -smp "$(SMP)" \
+		-drive file="$$primary_overlay",if=none,format=qcow2,id=x0 \
+		$(PRIMARY_DEVICE_ARGS) \
 		$(AUX_DISK_ARGS) \
 		-no-reboot \
-		-device virtio-net-device,netdev=net -netdev user,id=net \
+		$(QEMU_NETWORK_ARGS) \
 		-rtc base=utc
-else ifeq ($(ARCH),loongarch64)
-	@qemu-system-loongarch64 -kernel $(KERNEL_ELF) -m $(MEM) -nographic -smp $(SMP) \
-		-drive file=$(PRIMARY_DISK),if=none,format=raw,id=x0 \
-		-device virtio-blk-pci,drive=x0 \
-		$(AUX_DISK_ARGS) \
-		-no-reboot \
-		-device virtio-net-pci,netdev=net0 \
-		-netdev user,id=net0 \
-		-rtc base=utc 
-endif
 
 fmt: prepare-cargo-config
 	@cargo fmt
