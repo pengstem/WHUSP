@@ -1,7 +1,7 @@
 ARCH ?= riscv64
 MODE ?= release
 PERF_COUNTERS ?= 0
-BLOCK_IO_MODE ?= auto
+BLOCK_IO_MODE ?= force-sync
 override CARGO_HOME := $(abspath ../vendor)
 export CARGO_HOME
 

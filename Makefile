@@ -1,6 +1,6 @@
 MODE ?= release
 PERF_COUNTERS ?= 0
-BLOCK_IO_MODE ?= auto
+BLOCK_IO_MODE ?= force-sync
 
 ifeq ($(BLOCK_IO_MODE),auto)
 else ifeq ($(BLOCK_IO_MODE),force-sync)
