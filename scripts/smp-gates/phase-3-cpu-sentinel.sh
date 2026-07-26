@@ -29,7 +29,7 @@ sample=0
 while [ "$sample" -lt 4 ]; do
     worker_index=0
     while [ "$worker_index" -lt "$workers" ]; do
-        "$sentinel" "$sample" &
+        "$sentinel" "$sample" "$workers" &
         worker_index=$((worker_index + 1))
     done
     if ! wait; then
