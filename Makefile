@@ -34,8 +34,8 @@ LOONGARCH_TARGET := loongarch64-unknown-none
 KERNEL_RV_SRC := os/target/$(RISCV_TARGET)/$(MODE)/os
 KERNEL_LA_SRC := os/target/$(LOONGARCH_TARGET)/$(MODE)/os
 
-TEST_DISK ?= $(CURDIR)/sdcard-rv-run.img
-TEST_DISK_LA ?= $(CURDIR)/sdcard-la-run.img
+TEST_DISK ?= $(CURDIR)/sdcard-rv-pub.img
+TEST_DISK_LA ?= $(CURDIR)/sdcard-la-pub.img
 CONTEST_SCRIPT_DISK ?= $(CURDIR)/disk.img
 CONTEST_SCRIPT_DISK_SIZE ?= 64M
 
