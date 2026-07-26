@@ -74,6 +74,17 @@ impl PLIC {
             reg_ptr.write_volatile(reg_ptr.read_volatile() | 1 << shift);
         }
     }
+    pub fn disable(
+        &mut self,
+        hart_id: usize,
+        target_priority: IntrTargetPriority,
+        intr_source_id: usize,
+    ) {
+        let (reg_ptr, shift) = self.enable_ptr(hart_id, target_priority, intr_source_id);
+        unsafe {
+            reg_ptr.write_volatile(reg_ptr.read_volatile() & !(1 << shift));
+        }
+    }
     pub fn set_threshold(
         &mut self,
         hart_id: usize,

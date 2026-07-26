@@ -641,15 +641,22 @@ pub fn device_init(hart_id: usize) {
 
     let uart_irq = uart_irq();
     enable_external_irq(eiointc, pch_pic, uart_irq);
-    for block in block_devices() {
-        let irq = match block {
-            BlockDeviceConfig::Mmio(device) => device.irq,
-            BlockDeviceConfig::Pci(device) => device.irq,
-        };
-        if irq != 0 {
-            enable_external_irq(eiointc, pch_pic, irq);
+    let block_irq_delivery_enabled = !cfg!(feature = "block-io-force-sync");
+    if block_irq_delivery_enabled {
+        for block in block_devices() {
+            let irq = match block {
+                BlockDeviceConfig::Mmio(device) => device.irq,
+                BlockDeviceConfig::Pci(device) => device.irq,
+            };
+            if irq != 0 {
+                enable_external_irq(eiointc, pch_pic, irq);
+            }
         }
     }
+    info!(
+        "KERN: block completion irq delivery enabled={}",
+        block_irq_delivery_enabled
+    );
 
     crate::trap::enable_external_interrupt();
     info!(

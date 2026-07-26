@@ -5,6 +5,7 @@ use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 use fdt::{Fdt, node::FdtNode};
+use log::info;
 use riscv::register::sie;
 use virtio_drivers::transport::{
     DeviceType, Transport,
@@ -441,13 +442,22 @@ pub fn device_init(hart_id: usize) {
         plic.enable(hart_id, supervisor, irq);
         plic.set_priority(irq, 1);
     }
+    let block_irq_delivery_enabled = !cfg!(feature = "block-io-force-sync");
     for block in block_devices() {
         let BlockDeviceConfig::Mmio(block) = block else {
             unreachable!("RISC-V QEMU uses virtio-mmio block devices");
         };
-        plic.enable(hart_id, supervisor, block.irq);
-        plic.set_priority(block.irq, 1);
+        if block_irq_delivery_enabled {
+            plic.enable(hart_id, supervisor, block.irq);
+            plic.set_priority(block.irq, 1);
+        } else {
+            plic.disable(hart_id, supervisor, block.irq);
+        }
     }
+    info!(
+        "KERN: block completion irq delivery enabled={}",
+        block_irq_delivery_enabled
+    );
 
     unsafe {
         sie::set_sext();
