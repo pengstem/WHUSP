@@ -2,7 +2,7 @@ mod context;
 
 use crate::arch::interrupt::{disable_supervisor_interrupt, enable_supervisor_interrupt};
 use crate::config::TRAMPOLINE;
-use crate::mm::{MmapFaultAccess, MmapFaultResult};
+use crate::mm::{MmapFaultAccess, MmapFaultResult, MmapPageCacheInstall, MmapPageCacheResolve};
 use crate::perf;
 use crate::syscall::{
     errno::SysError, syscall_is_exit, syscall_is_exit_group, syscall_with_current_task,
@@ -321,28 +321,28 @@ fn handle_prepared_mmap_page_fault(
             let mut inner = process.inner_exclusive_access();
             inner.memory_set.install_mmap_fault_page(page, frame)
         }
-        MmapFaultResult::PageCache(page) => {
+        MmapFaultResult::PageCache(mut page) => {
             let ppn = {
                 let _resolve_scope =
                     perf::time_scope(perf::ProfilePoint::PageFaultMmapResolvePageCache);
                 page.resolve_ppn()
             };
-            let Some(ppn) = ppn else {
-                return false;
+            let ppn = match ppn {
+                MmapPageCacheResolve::Ready(ppn) => ppn,
+                MmapPageCacheResolve::Retry => return true,
+                MmapPageCacheResolve::Failed => return false,
             };
-            let key = page.key();
             let _install_scope =
                 perf::time_scope(perf::ProfilePoint::PageFaultMmapInstallPageCache);
             let mut inner = process.inner_exclusive_access();
-            let installed = inner
+            match inner
                 .memory_set
-                .install_mmap_page_cache_fault_page(page, ppn);
-            if !installed {
-                crate::mm::page_cache::PAGE_CACHE
-                    .exclusive_access()
-                    .dec_ref(key);
+                .install_mmap_page_cache_fault_page(page, ppn)
+            {
+                MmapPageCacheInstall::InstalledOrDuplicate => true,
+                MmapPageCacheInstall::Retry => true,
+                MmapPageCacheInstall::Failed => false,
             }
-            installed
         }
     }
 }

@@ -181,6 +181,15 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) pwritev_regular_direct_user_buffer_calls: usize,
     pub(crate) pwritev_regular_direct_user_buffer_bytes: usize,
     pub(crate) page_cache_clean_evictions: usize,
+    pub(crate) page_cache_generation_epochs_begun: usize,
+    pub(crate) page_cache_generation_epochs_finished: usize,
+    pub(crate) page_cache_generation_retries: usize,
+    pub(crate) page_cache_stale_fill_drops: usize,
+    pub(crate) page_cache_stale_install_retries: usize,
+    pub(crate) page_cache_capacity_rejects: usize,
+    pub(crate) mmap_clean_page_cache_hits: usize,
+    pub(crate) mmap_clean_page_cache_misses: usize,
+    pub(crate) mmap_clean_page_cache_fills: usize,
     pub(crate) tmpfs_allocated_payload_len_calls: usize,
     pub(crate) tmpfs_allocated_payload_sparse_extents: usize,
     pub(crate) tmpfs_allocated_logical_len_calls: usize,
@@ -462,6 +471,15 @@ mod enabled {
     static PWRITEV_REGULAR_DIRECT_USER_BUFFER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PWRITEV_REGULAR_DIRECT_USER_BUFFER_BYTES: AtomicUsize = AtomicUsize::new(0);
     static PAGE_CACHE_CLEAN_EVICTIONS: AtomicUsize = AtomicUsize::new(0);
+    static PAGE_CACHE_GENERATION_EPOCHS_BEGUN: AtomicUsize = AtomicUsize::new(0);
+    static PAGE_CACHE_GENERATION_EPOCHS_FINISHED: AtomicUsize = AtomicUsize::new(0);
+    static PAGE_CACHE_GENERATION_RETRIES: AtomicUsize = AtomicUsize::new(0);
+    static PAGE_CACHE_STALE_FILL_DROPS: AtomicUsize = AtomicUsize::new(0);
+    static PAGE_CACHE_STALE_INSTALL_RETRIES: AtomicUsize = AtomicUsize::new(0);
+    static PAGE_CACHE_CAPACITY_REJECTS: AtomicUsize = AtomicUsize::new(0);
+    static MMAP_CLEAN_PAGE_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+    static MMAP_CLEAN_PAGE_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
+    static MMAP_CLEAN_PAGE_CACHE_FILLS: AtomicUsize = AtomicUsize::new(0);
     static TMPFS_ALLOCATED_PAYLOAD_LEN_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TMPFS_ALLOCATED_PAYLOAD_SPARSE_EXTENTS: AtomicUsize = AtomicUsize::new(0);
     static TMPFS_ALLOCATED_LOGICAL_LEN_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -1168,6 +1186,42 @@ mod enabled {
         PAGE_CACHE_CLEAN_EVICTIONS.fetch_add(pages, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_page_cache_generation_epoch_begin() {
+        PAGE_CACHE_GENERATION_EPOCHS_BEGUN.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_page_cache_generation_epoch_finish() {
+        PAGE_CACHE_GENERATION_EPOCHS_FINISHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_page_cache_generation_retry() {
+        PAGE_CACHE_GENERATION_RETRIES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_page_cache_stale_fill_drop(pages: usize) {
+        PAGE_CACHE_STALE_FILL_DROPS.fetch_add(pages, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_page_cache_stale_install_retry() {
+        PAGE_CACHE_STALE_INSTALL_RETRIES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_page_cache_capacity_reject() {
+        PAGE_CACHE_CAPACITY_REJECTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_mmap_clean_page_cache(hit: bool) {
+        if hit {
+            MMAP_CLEAN_PAGE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            MMAP_CLEAN_PAGE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_mmap_clean_page_cache_fill() {
+        MMAP_CLEAN_PAGE_CACHE_FILLS.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_tmpfs_allocated_payload_len(sparse_extents: usize) {
         TMPFS_ALLOCATED_PAYLOAD_LEN_CALLS.fetch_add(1, Ordering::Relaxed);
         TMPFS_ALLOCATED_PAYLOAD_SPARSE_EXTENTS.fetch_add(sparse_extents, Ordering::Relaxed);
@@ -1763,6 +1817,18 @@ mod enabled {
             pwritev_regular_direct_user_buffer_bytes: PWRITEV_REGULAR_DIRECT_USER_BUFFER_BYTES
                 .load(Ordering::Relaxed),
             page_cache_clean_evictions: PAGE_CACHE_CLEAN_EVICTIONS.load(Ordering::Relaxed),
+            page_cache_generation_epochs_begun: PAGE_CACHE_GENERATION_EPOCHS_BEGUN
+                .load(Ordering::Relaxed),
+            page_cache_generation_epochs_finished: PAGE_CACHE_GENERATION_EPOCHS_FINISHED
+                .load(Ordering::Relaxed),
+            page_cache_generation_retries: PAGE_CACHE_GENERATION_RETRIES.load(Ordering::Relaxed),
+            page_cache_stale_fill_drops: PAGE_CACHE_STALE_FILL_DROPS.load(Ordering::Relaxed),
+            page_cache_stale_install_retries: PAGE_CACHE_STALE_INSTALL_RETRIES
+                .load(Ordering::Relaxed),
+            page_cache_capacity_rejects: PAGE_CACHE_CAPACITY_REJECTS.load(Ordering::Relaxed),
+            mmap_clean_page_cache_hits: MMAP_CLEAN_PAGE_CACHE_HITS.load(Ordering::Relaxed),
+            mmap_clean_page_cache_misses: MMAP_CLEAN_PAGE_CACHE_MISSES.load(Ordering::Relaxed),
+            mmap_clean_page_cache_fills: MMAP_CLEAN_PAGE_CACHE_FILLS.load(Ordering::Relaxed),
             tmpfs_allocated_payload_len_calls: TMPFS_ALLOCATED_PAYLOAD_LEN_CALLS
                 .load(Ordering::Relaxed),
             tmpfs_allocated_payload_sparse_extents: TMPFS_ALLOCATED_PAYLOAD_SPARSE_EXTENTS
@@ -2064,6 +2130,15 @@ mod enabled {
          pwritev_regular_direct_user_buffer_calls {}\n\
          pwritev_regular_direct_user_buffer_bytes {}\n\
          page_cache_clean_evictions {}\n\
+         page_cache_generation_epochs_begun {}\n\
+         page_cache_generation_epochs_finished {}\n\
+         page_cache_generation_retries {}\n\
+         page_cache_stale_fill_drops {}\n\
+         page_cache_stale_install_retries {}\n\
+         page_cache_capacity_rejects {}\n\
+         mmap_clean_page_cache_hits {}\n\
+         mmap_clean_page_cache_misses {}\n\
+         mmap_clean_page_cache_fills {}\n\
          tmpfs_allocated_payload_len_calls {}\n\
          tmpfs_allocated_payload_sparse_extents {}\n\
          tmpfs_allocated_logical_len_calls {}\n\
@@ -2331,6 +2406,15 @@ mod enabled {
             stats.pwritev_regular_direct_user_buffer_calls,
             stats.pwritev_regular_direct_user_buffer_bytes,
             stats.page_cache_clean_evictions,
+            stats.page_cache_generation_epochs_begun,
+            stats.page_cache_generation_epochs_finished,
+            stats.page_cache_generation_retries,
+            stats.page_cache_stale_fill_drops,
+            stats.page_cache_stale_install_retries,
+            stats.page_cache_capacity_rejects,
+            stats.mmap_clean_page_cache_hits,
+            stats.mmap_clean_page_cache_misses,
+            stats.mmap_clean_page_cache_fills,
             stats.tmpfs_allocated_payload_len_calls,
             stats.tmpfs_allocated_payload_sparse_extents,
             stats.tmpfs_allocated_logical_len_calls,
@@ -2744,6 +2828,30 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_page_cache_clean_eviction(_pages: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_page_cache_generation_epoch_begin() {}
+
+    #[inline(always)]
+    pub(crate) fn record_page_cache_generation_epoch_finish() {}
+
+    #[inline(always)]
+    pub(crate) fn record_page_cache_generation_retry() {}
+
+    #[inline(always)]
+    pub(crate) fn record_page_cache_stale_fill_drop(_pages: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_page_cache_stale_install_retry() {}
+
+    #[inline(always)]
+    pub(crate) fn record_page_cache_capacity_reject() {}
+
+    #[inline(always)]
+    pub(crate) fn record_mmap_clean_page_cache(_hit: bool) {}
+
+    #[inline(always)]
+    pub(crate) fn record_mmap_clean_page_cache_fill() {}
 
     #[inline(always)]
     pub(crate) fn record_tmpfs_allocated_payload_len(_sparse_extents: usize) {}

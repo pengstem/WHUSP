@@ -20,7 +20,9 @@ use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
 use crate::config::PAGE_SIZE;
 use crate::mm::{
     UserBuffer, frame_alloc, frame_alloc_uninit,
-    page_cache::{PAGE_CACHE, PageCacheId, PageCacheKey},
+    page_cache::{
+        PAGE_CACHE, PageCacheId, PageCacheKey, PageCacheMutationGuard, begin_page_cache_mutation,
+    },
 };
 use crate::perf;
 use crate::sync::SleepMutex;
@@ -905,6 +907,13 @@ fn restore_dirty_writeback(node: VfsNodeId, batch: DirtyWritebackBatch) {
 }
 
 fn flush_dirty_regular_file_for_reason(node: VfsNodeId, reason: DirtyFlushReason) -> FsResult {
+    if !dirty_regular_file_has_pages(node) {
+        return Ok(());
+    }
+    // Removing the dirty overlay before its runs reach the backend creates a
+    // temporary window where an unguarded reader could observe old disk data.
+    // Keep the inode generation unstable through collect, write, and restore.
+    let _mutation = begin_regular_file_page_cache_mutation(node, FsNodeKind::RegularFile);
     let Some(batch) = collect_dirty_writeback(node) else {
         return Ok(());
     };
@@ -1099,15 +1108,40 @@ fn invalidate_inode_flags_cache(node: VfsNodeId) {
     INODE_FLAGS_CACHE.lock().remove(&node);
 }
 
-pub(crate) fn invalidate_regular_file_read_cache(node: VfsNodeId, kind: FsNodeKind) {
+pub(crate) fn begin_regular_file_page_cache_mutation(
+    node: VfsNodeId,
+    kind: FsNodeKind,
+) -> Option<PageCacheMutationGuard> {
+    begin_regular_file_page_cache_mutation_with_support(
+        node,
+        kind,
+        mount_supports_page_cache(node.mount_id),
+    )
+}
+
+fn begin_regular_file_page_cache_mutation_with_support(
+    node: VfsNodeId,
+    kind: FsNodeKind,
+    supports_page_cache: bool,
+) -> Option<PageCacheMutationGuard> {
     invalidate_small_regular_read_cache(node, kind);
-    let Some(id) = page_cache_id_for_node(node, kind) else {
-        return;
-    };
-    let (removed, scanned) = PAGE_CACHE
-        .exclusive_access()
-        .invalidate_clean_unreferenced(id);
+    let id = page_cache_id_for_node_with_support(node, kind, supports_page_cache)?;
+    let (guard, removed, scanned) = begin_page_cache_mutation(id);
     perf::record_vfs_read_cache_invalidation(removed, scanned);
+    Some(guard)
+}
+
+/// Establishes a fresh content incarnation before a newly created inode can
+/// race with a lookup after backend serialization is released.
+pub(crate) fn initialize_regular_file_page_cache_incarnation(
+    node: VfsNodeId,
+    supports_page_cache: bool,
+) {
+    drop(begin_regular_file_page_cache_mutation_with_support(
+        node,
+        FsNodeKind::RegularFile,
+        supports_page_cache,
+    ));
 }
 
 pub(crate) fn regular_file_is_open_writable_in(context: PathContext, name: &str) -> FsResult<bool> {
@@ -1293,9 +1327,9 @@ impl VfsFile {
             *offset = stat_logical_size(self.node, stat.size) as usize;
         }
         *self.read_snapshot.lock() = None;
-        if buf.len() > 0 {
-            self.invalidate_read_cache_for_write(*offset, buf.len());
-        }
+        let _mutation = (buf.len() > 0)
+            .then(|| begin_regular_file_page_cache_mutation(self.node, self.kind))
+            .flatten();
         let mut total_write_size = 0usize;
         perf::record_vfs_write_user_buffer(buf.buffers.len());
         if self.kind == FsNodeKind::RegularFile && buf.buffers.len() > 1 {
@@ -1599,35 +1633,6 @@ impl VfsFile {
         page_cache_id_for_node_with_support(self.node, self.kind, self.supports_page_cache)
     }
 
-    fn invalidate_read_cache(&self) {
-        invalidate_small_regular_read_cache(self.node, self.kind);
-        let Some(id) = self.cached_page_cache_id() else {
-            return;
-        };
-        let (removed, scanned) = PAGE_CACHE
-            .exclusive_access()
-            .invalidate_clean_unreferenced(id);
-        perf::record_vfs_read_cache_invalidation(removed, scanned);
-    }
-
-    fn can_skip_redundant_dirty_write_invalidation(&self, offset: usize, len: usize) -> bool {
-        dirty_regular_file_has_pages(self.node)
-            && can_cache_dirty_write(
-                self.kind,
-                self.supports_dirty_writeback,
-                offset,
-                len,
-                self.status_flags.get(),
-            )
-    }
-
-    fn invalidate_read_cache_for_write(&self, offset: usize, len: usize) {
-        if self.can_skip_redundant_dirty_write_invalidation(offset, len) {
-            return;
-        }
-        self.invalidate_read_cache();
-    }
-
     fn seek_data_or_hole(&self, offset: usize, seek_hole: bool) -> FsResult<usize> {
         if self.kind != FsNodeKind::RegularFile {
             return Err(FsError::IllegalSeek);
@@ -1732,11 +1737,7 @@ impl VfsFile {
         Ok((read_size, SYNTHETIC_DIRENT_OFFSET_BASE + next_entry_offset))
     }
 
-    fn read_cache_id_for_size(&self, file_size: usize) -> Option<PageCacheId> {
-        if file_size > VFS_READ_CACHE_MAX_FILE_SIZE {
-            perf::record_vfs_read_cache_skip_too_large();
-            return None;
-        }
+    fn read_cache_id_for_size(&self, _file_size: usize) -> Option<PageCacheId> {
         if dirty_regular_file_has_pages(self.node) {
             perf::record_vfs_read_cache_skip_dirty_pages();
             return None;
@@ -1757,6 +1758,9 @@ impl VfsFile {
             return None;
         }
         let id = self.cached_page_cache_id()?;
+        let generation = PAGE_CACHE
+            .exclusive_access()
+            .current_stable_generation(id)?;
         let mut cached_file_size = None;
         let mut total_read_size = 0usize;
 
@@ -1765,10 +1769,7 @@ impl VfsFile {
             let page_start = file_offset / PAGE_SIZE * PAGE_SIZE;
             let page_offset = file_offset - page_start;
             let copy_len = (buf.len() - total_read_size).min(PAGE_SIZE - page_offset);
-            let key = PageCacheKey {
-                id,
-                page_index: page_start / PAGE_SIZE,
-            };
+            let key = PageCacheKey::for_page(id, generation, page_start / PAGE_SIZE);
 
             if let Some(read_size) = PAGE_CACHE.exclusive_access().copy_read_cache_page_data(
                 key,
@@ -1811,10 +1812,7 @@ impl VfsFile {
                 let cache = PAGE_CACHE.exclusive_access();
                 let mut pages = 1usize;
                 while pages < max_readahead_pages {
-                    let next_key = PageCacheKey {
-                        id,
-                        page_index: key.page_index + pages,
-                    };
+                    let next_key = PageCacheKey::for_page(id, generation, key.page_index + pages);
                     if cache.contains(next_key) {
                         break;
                     }
@@ -1861,20 +1859,32 @@ impl VfsFile {
                 frame.ppn.get_bytes_array()[..page_valid_len]
                     .copy_from_slice(&read_buf[batch_offset..batch_offset + page_valid_len]);
                 pages_to_cache.push((
-                    PageCacheKey {
-                        id,
-                        page_index: key.page_index + page_delta,
-                    },
+                    PageCacheKey::for_page(id, generation, key.page_index + page_delta),
                     frame,
                 ));
             }
 
             if !pages_to_cache.is_empty() {
-                let readahead_cached_pages = pages_to_cache.len().saturating_sub(1);
                 let mut evicted = 0usize;
+                let mut readahead_cached_pages = 0usize;
                 let mut cache = PAGE_CACHE.exclusive_access();
-                for (cache_key, frame) in pages_to_cache {
-                    evicted += cache.insert_read_cache_page(cache_key, frame, file_size);
+                if cache.current_stable_generation(id) == Some(generation) {
+                    for (cache_key, frame) in pages_to_cache {
+                        let is_readahead = cache_key.page_index != key.page_index;
+                        let (page_evictions, inserted) =
+                            cache.insert_read_cache_page(cache_key, frame, file_size);
+                        evicted += page_evictions;
+                        if inserted && is_readahead {
+                            readahead_cached_pages += 1;
+                        }
+                    }
+                } else {
+                    perf::record_page_cache_stale_fill_drop(pages_to_cache.len());
+                    drop(cache);
+                    // Earlier cache hits may already have copied into `buf`.
+                    // Returning None makes the caller overwrite the complete
+                    // request through the backend instead of mixing epochs.
+                    return None;
                 }
                 drop(cache);
                 if evicted > 0 {
@@ -1894,6 +1904,13 @@ impl VfsFile {
             }
         }
 
+        if PAGE_CACHE.exclusive_access().current_stable_generation(id) != Some(generation) {
+            perf::record_page_cache_generation_retry();
+            // The caller overwrites the complete destination through the
+            // backend, so cache hits copied before the mutation cannot leak as
+            // a mixed-generation short read.
+            return None;
+        }
         Some(total_read_size)
     }
 
@@ -1946,6 +1963,7 @@ impl VfsFile {
         Some(read_len)
     }
 
+    #[allow(dead_code)]
     fn read_small_regular_cached_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
         if buf.is_empty() {
             return Some(0);
@@ -2112,8 +2130,8 @@ fn open_vfs_file_impl(
                 }
                 if flags.contains(OpenFlags::TRUNC) && flags.writable_target() {
                     ensure_mount_writable(path.node.mount_id)?;
+                    let _mutation = begin_regular_file_page_cache_mutation(path.node, path.kind);
                     flush_dirty_regular_file(path.node)?;
-                    invalidate_regular_file_read_cache(path.node, path.kind);
                     with_mount(path.node.mount_id, |mount| mount.set_len(path.node.ino, 0))
                         .ok_or(FsError::Io)??;
                 }
@@ -2129,8 +2147,14 @@ fn open_vfs_file_impl(
                 mount.stat(target.parent.ino)
             })
             .ok_or(FsError::Io)??;
+            let supports_page_cache = mount_supports_page_cache(target.parent.mount_id);
             let ino = with_mount(target.parent.mount_id, |mount| {
-                mount.create_file(target.parent.ino, target.leaf_name)
+                let ino = mount.create_file(target.parent.ino, target.leaf_name)?;
+                initialize_regular_file_page_cache_incarnation(
+                    VfsNodeId::new(target.parent.mount_id, ino),
+                    supports_page_cache,
+                );
+                Ok(ino)
             })
             .ok_or(FsError::Io)??;
             dentry_cache::invalidate_parent(target.parent);
@@ -2192,13 +2216,19 @@ fn create_tmpfile_inode(
         mount.stat(directory.node.ino)
     })
     .ok_or(FsError::Io)??;
+    let supports_page_cache = mount_supports_page_cache(directory.node.mount_id);
     let (ino, leaf_name) = {
         let mut created = None;
         for _ in 0..TMPFILE_CREATE_ATTEMPTS {
             let seq = TMPFILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let leaf_name = format!(".whusp-tmpfile-{seq:x}");
             let result = with_mount(directory.node.mount_id, |mount| {
-                mount.create_file(directory.node.ino, leaf_name.as_str())
+                let ino = mount.create_file(directory.node.ino, leaf_name.as_str())?;
+                initialize_regular_file_page_cache_incarnation(
+                    VfsNodeId::new(directory.node.mount_id, ino),
+                    supports_page_cache,
+                );
+                Ok(ino)
             })
             .ok_or(FsError::Io)?;
             match result {
@@ -2243,6 +2273,7 @@ fn create_tmpfile_inode(
         false,
     )?);
 
+    let _unlink_mutation = begin_regular_file_page_cache_mutation(file.node, file.kind);
     match with_mount(directory.node.mount_id, |mount| {
         mount.unlink(directory.node.ino, leaf_name.as_str())
     })
@@ -2362,8 +2393,8 @@ pub(crate) fn open_file_handle_node(
     }
     if kind == FsNodeKind::RegularFile && flags.contains(OpenFlags::TRUNC) && writable {
         ensure_mount_writable(node.mount_id)?;
+        let _mutation = begin_regular_file_page_cache_mutation(node, kind);
         flush_dirty_regular_file(node)?;
-        invalidate_regular_file_read_cache(node, kind);
         with_mount(node.mount_id, |mount| mount.set_len(node.ino, 0)).ok_or(FsError::Io)??;
     }
 
@@ -2531,8 +2562,8 @@ pub(crate) fn truncate_in(context: PathContext, name: &str, len: usize) -> FsRes
         return Err(FsError::InvalidInput);
     }
     ensure_mount_writable(path.node.mount_id)?;
+    let _mutation = begin_regular_file_page_cache_mutation(path.node, path.kind);
     flush_dirty_regular_file(path.node)?;
-    invalidate_regular_file_read_cache(path.node, path.kind);
     with_mount(path.node.mount_id, |mount| {
         mount.set_len(path.node.ino, len as u64)
     })
@@ -2573,7 +2604,6 @@ impl File for VfsFile {
                     self.read_snapshot_at(*offset, slice)
                 })
                 .or_else(|| self.read_dirty_regular_at(*offset, slice))
-                .or_else(|| self.read_small_regular_cached_at(*offset, slice))
                 .or_else(|| self.read_regular_cached_at(*offset, slice))
                 .unwrap_or_else(|| self.read_backend_at_preserve_noatime(*offset, slice));
                 if read_size == 0 {
@@ -2629,7 +2659,6 @@ impl File for VfsFile {
             self.read_snapshot_at(offset, buf)
         })
         .or_else(|| self.read_dirty_regular_at(offset, buf))
-        .or_else(|| self.read_small_regular_cached_at(offset, buf))
         .or_else(|| self.read_regular_cached_at(offset, buf))
         .unwrap_or_else(|| self.read_backend_at_preserve_noatime(offset, buf))
     }
@@ -2639,9 +2668,9 @@ impl File for VfsFile {
             return 0;
         }
         *self.read_snapshot.lock() = None;
-        if !buf.is_empty() {
-            self.invalidate_read_cache_for_write(offset, buf.len());
-        }
+        let _mutation = (!buf.is_empty())
+            .then(|| begin_regular_file_page_cache_mutation(self.node, self.kind))
+            .flatten();
         self.write_at_chunks(offset, buf)
     }
 
@@ -2662,7 +2691,7 @@ impl File for VfsFile {
         }
         self.check_write_at(offset, len)?;
         *self.read_snapshot.lock() = None;
-        self.invalidate_read_cache_for_write(offset, len);
+        let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         let mut pressure_retried = false;
         loop {
             match cache_dirty_regular_user_buffer_write(self.node, offset, &buf) {
@@ -2705,7 +2734,7 @@ impl File for VfsFile {
         }
         self.check_write_at(write_offset, len)?;
         *self.read_snapshot.lock() = None;
-        self.invalidate_read_cache_for_write(write_offset, len);
+        let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         let mut pressure_retried = false;
         let mut offset_advanced = false;
         let write_size = loop {
@@ -2739,8 +2768,8 @@ impl File for VfsFile {
             return Err(FsError::PermissionDenied);
         }
         self.check_set_len(len)?;
+        let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         flush_dirty_regular_file(self.node)?;
-        self.invalidate_read_cache();
         with_mount(self.node.mount_id, |mount| {
             mount.set_len(self.node.ino, len as u64)
         })
@@ -2755,8 +2784,8 @@ impl File for VfsFile {
             return Err(FsError::PermissionDenied);
         }
         self.check_write_at(offset, len)?;
+        let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         flush_dirty_regular_file(self.node)?;
-        self.invalidate_read_cache();
         with_mount(self.node.mount_id, |mount| {
             mount.allocate_range(self.node.ino, offset as u64, len as u64, keep_size)
         })
@@ -2771,8 +2800,8 @@ impl File for VfsFile {
             return Err(FsError::PermissionDenied);
         }
         self.check_write_at(offset, len)?;
+        let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         flush_dirty_regular_file(self.node)?;
-        self.invalidate_read_cache();
         with_mount(self.node.mount_id, |mount| {
             mount.zero_range(self.node.ino, offset as u64, len as u64, keep_size)
         })
@@ -2791,8 +2820,8 @@ impl File for VfsFile {
         if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
             return Err(FsError::PermissionDenied);
         }
+        let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         flush_dirty_regular_file(self.node)?;
-        self.invalidate_read_cache();
         with_mount(self.node.mount_id, |mount| {
             mount.punch_hole(self.node.ino, offset as u64, len as u64)
         })

@@ -1,10 +1,10 @@
 use crate::config::PAGE_SIZE;
 use crate::mm::shm::{ShmCaller, ShmCreateContext, ShmError, ShmSegmentStat, ShmSetAttrs};
-use crate::mm::{MapPermission, MemoryProtectError, MmapFlush};
+use crate::mm::{MapPermission, MemoryProtectError, MmapFlush, MmapPrefaultResult};
 use crate::syscall::user_ptr::{copy_to_user, read_user_value, write_user_value};
 use crate::task::{
     CAP_IPC_LOCK, CAP_IPC_OWNER, CAP_SYS_ADMIN, PROCESS_PKEY_COUNT, RLimitResource,
-    current_process, current_user_token,
+    current_process, current_user_token, suspend_current_and_run_next,
 };
 use alloc::vec::Vec;
 
@@ -398,7 +398,14 @@ fn sys_mmap_impl(
             return Err(SysError::EPERM);
         }
         let file_size = file.stat()?.size as usize;
-        let page_cache_id = if shared { file.page_cache_id() } else { None };
+        // Shared mappings keep the existing page-cache path. Readonly private
+        // mappings may share a clean versioned file page; a later mprotect(W)
+        // materializes every resident cache page before granting write access.
+        let page_cache_id = if shared || !writable {
+            file.page_cache_id()
+        } else {
+            None
+        };
         (Some(file), file_size, page_cache_id)
     };
     let writable_shared_file = if shared && writable {
@@ -436,10 +443,20 @@ fn sys_mmap_impl(
         // mappings resident on Linux. Prefaulting here also keeps large
         // memset-heavy LTP probes from taking one page-fault trap per page.
         let prefault = populate || inner.memory_set.future_mlock_prefaults();
-        if prefault && !inner.memory_set.prefault_mmap_range(mapped_addr, len) {
-            return Err(SysError::ENOMEM);
-        }
         drop(inner);
+        if prefault {
+            loop {
+                let result = process
+                    .inner_exclusive_access()
+                    .memory_set
+                    .prefault_mmap_range(mapped_addr, len);
+                match result {
+                    MmapPrefaultResult::Complete => break,
+                    MmapPrefaultResult::Retry => suspend_current_and_run_next(),
+                    MmapPrefaultResult::Failed => return Err(SysError::ENOMEM),
+                }
+            }
+        }
         if let Some(file) = writable_shared_file {
             file.inc_writable_shared_mmap();
         }
@@ -466,10 +483,20 @@ fn sys_mmap_impl(
     // resident on Linux. Prefaulting here also keeps large memset-heavy LTP
     // probes from taking one page-fault trap per page.
     let prefault = populate || inner.memory_set.future_mlock_prefaults();
-    if prefault && !inner.memory_set.prefault_mmap_range(mapped_addr, len) {
-        return Err(SysError::ENOMEM);
-    }
     drop(inner);
+    if prefault {
+        loop {
+            let result = process
+                .inner_exclusive_access()
+                .memory_set
+                .prefault_mmap_range(mapped_addr, len);
+            match result {
+                MmapPrefaultResult::Complete => break,
+                MmapPrefaultResult::Retry => suspend_current_and_run_next(),
+                MmapPrefaultResult::Failed => return Err(SysError::ENOMEM),
+            }
+        }
+    }
     if let Some(file) = writable_shared_file {
         file.inc_writable_shared_mmap();
     }
@@ -804,9 +831,16 @@ pub fn sys_mlock(addr: usize, len: usize) -> SysResult {
     check_memlock_limit(additional)?;
 
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    if !inner.memory_set.mlock_range(addr, len, false) {
-        return Err(SysError::ENOMEM);
+    loop {
+        let result = process
+            .inner_exclusive_access()
+            .memory_set
+            .mlock_range(addr, len, false);
+        match result {
+            MmapPrefaultResult::Complete => break,
+            MmapPrefaultResult::Retry => suspend_current_and_run_next(),
+            MmapPrefaultResult::Failed => return Err(SysError::ENOMEM),
+        }
     }
     Ok(0)
 }
@@ -827,9 +861,16 @@ pub fn sys_mlock2(addr: usize, len: usize, flags: usize) -> SysResult {
     check_memlock_limit(additional)?;
 
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    if !inner.memory_set.mlock_range(addr, len, on_fault) {
-        return Err(SysError::ENOMEM);
+    loop {
+        let result = process
+            .inner_exclusive_access()
+            .memory_set
+            .mlock_range(addr, len, on_fault);
+        match result {
+            MmapPrefaultResult::Complete => break,
+            MmapPrefaultResult::Retry => suspend_current_and_run_next(),
+            MmapPrefaultResult::Failed => return Err(SysError::ENOMEM),
+        }
     }
     Ok(0)
 }
@@ -861,12 +902,28 @@ pub fn sys_mlockall(flags: usize) -> SysResult {
     check_memlock_limit(additional)?;
 
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    if lock_current && !inner.memory_set.mlock_current(on_fault) {
-        return Err(SysError::ENOMEM);
+    if lock_current {
+        loop {
+            let result = {
+                let mut inner = process.inner_exclusive_access();
+                let result = inner.memory_set.mlock_current(on_fault);
+                if result == MmapPrefaultResult::Complete && lock_future {
+                    inner.memory_set.set_mlock_future(on_fault);
+                }
+                result
+            };
+            match result {
+                MmapPrefaultResult::Complete => break,
+                MmapPrefaultResult::Retry => suspend_current_and_run_next(),
+                MmapPrefaultResult::Failed => return Err(SysError::ENOMEM),
+            }
+        }
     }
-    if lock_future {
-        inner.memory_set.set_mlock_future(on_fault);
+    if lock_future && !lock_current {
+        process
+            .inner_exclusive_access()
+            .memory_set
+            .set_mlock_future(on_fault);
     }
     Ok(0)
 }

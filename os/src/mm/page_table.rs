@@ -384,6 +384,31 @@ impl PageTable {
         *pte = PageTableEntry::new(ppn, flags);
         true
     }
+
+    /// Replaces an existing 4 KiB leaf or a PROT_NONE tombstone while checking
+    /// the physical page recorded by the caller's ownership ledger.
+    pub(super) fn replace_leaf_or_tombstone(
+        &mut self,
+        vpn: VirtPageNum,
+        expected_ppn: PhysPageNum,
+        ppn: PhysPageNum,
+        flags: PTEFlags,
+    ) -> bool {
+        let Some(pte) = self.find_pte_mut(vpn) else {
+            return false;
+        };
+        if pte.bits == 0 || pte.ppn() != expected_ppn {
+            return false;
+        }
+        let leaf_flags = PTEFlags::R | PTEFlags::W | PTEFlags::X;
+        let flags = if flags.intersects(leaf_flags) {
+            flags | PTEFlags::V
+        } else {
+            flags
+        };
+        *pte = PageTableEntry::new(ppn, flags);
+        true
+    }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_leaf(vpn).map(|(pte, level)| {
             if level == 0 || pte.bits == 0 {

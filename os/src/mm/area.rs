@@ -38,7 +38,7 @@ pub struct MmapFlush {
 #[must_use = "retired user pages must be released after TLB invalidation"]
 pub(crate) struct RetiredUserPages {
     frames: Vec<FrameTracker>,
-    page_cache_refs: Vec<(PageCacheKey, bool)>,
+    page_cache_refs: Vec<PageCacheKey>,
     shm_attachments: Vec<usize>,
     pte_cleared: bool,
 }
@@ -67,12 +67,8 @@ impl RetiredUserPages {
         drop(frames);
         if !page_cache_refs.is_empty() {
             let mut cache = PAGE_CACHE.exclusive_access();
-            for (key, keep_clean) in page_cache_refs {
-                if keep_clean {
-                    cache.dec_ref(key);
-                } else {
-                    let _ = cache.dec_ref_and_take_if_unused(key);
-                }
+            for key in page_cache_refs {
+                cache.dec_ref(key);
             }
         }
         for shmid in shm_attachments {
@@ -298,13 +294,17 @@ impl MapArea {
             })
             .unwrap_or_default();
 
+        let mut prepared = Vec::new();
         for (vpn, key) in pages {
             if self.data_frames.contains_key(&vpn) {
                 continue;
             }
             let Some(pte) = page_table.translate(vpn) else {
-                continue;
+                return false;
             };
+            if pte.bits == 0 {
+                return false;
+            }
             let Some(frame) = frame_alloc_uninit() else {
                 return false;
             };
@@ -312,13 +312,24 @@ impl MapArea {
                 .ppn
                 .get_bytes_array()
                 .copy_from_slice(pte.ppn().get_bytes_array());
-            if !page_table.replace_leaf(vpn, frame.ppn, pte_flags) {
+            prepared.push((vpn, key, pte.ppn(), frame));
+        }
+
+        // All allocation and source validation finished before the first PTE
+        // or ownership ledger mutation, so ENOMEM cannot leave a half-private
+        // mprotect result.
+        for (vpn, key, expected_ppn, frame) in prepared {
+            if !page_table.replace_leaf_or_tombstone(vpn, expected_ppn, frame.ppn, pte_flags) {
                 return false;
             }
             *pte_mutated = true;
             self.data_frames.insert(vpn, frame);
-            if let Some(info) = self.mmap_info.as_mut() {
-                info.page_cache_pages.remove(&vpn);
+            let removed = self
+                .mmap_info
+                .as_mut()
+                .and_then(|info| info.page_cache_pages.remove(&vpn));
+            if removed != Some(key) {
+                return false;
             }
             retired_cache_keys.push(key);
         }
@@ -338,13 +349,12 @@ impl MapArea {
         let has_leaf_permission =
             permission.intersects(MapPermission::R | MapPermission::W | MapPermission::X);
         if self.is_mmap() {
-            let materialize_exec_cache_for_write = self.mmap_info.as_ref().is_some_and(|info| {
-                info.exec_segment.is_some()
-                    && !info.shared
+            let materialize_private_cache_for_write = self.mmap_info.as_ref().is_some_and(|info| {
+                !info.shared
                     && permission.contains(MapPermission::W)
                     && !info.page_cache_pages.is_empty()
             });
-            if materialize_exec_cache_for_write
+            if materialize_private_cache_for_write
                 && !self.materialize_page_cache_pages(
                     page_table,
                     pte_flags,
@@ -370,7 +380,7 @@ impl MapArea {
                 info.writable = permission.contains(MapPermission::W);
                 info.reported_perm = reported_permission;
                 let mut page_cache_pte_flags = pte_flags;
-                if info.shared && info.writable {
+                if info.writable {
                     page_cache_pte_flags.remove(PTEFlags::W);
                 }
                 for vpn in info.page_cache_pages.keys().copied() {
@@ -541,7 +551,7 @@ impl MapArea {
             return true;
         }
         let mut pte_flags = PTEFlags::from_bits_truncate(self.map_perm.bits() as usize);
-        if info.shared && info.writable {
+        if info.writable {
             pte_flags.remove(PTEFlags::W);
         }
         if !page_table.try_map(vpn, ppn, pte_flags) {
@@ -590,11 +600,10 @@ impl MapArea {
         }
 
         if let Some(info) = self.mmap_info.as_mut() {
-            let keep_clean = info.exec_segment.is_some() && !info.writable;
             let page_cache_pages = core::mem::take(&mut info.page_cache_pages);
             for (vpn, key) in page_cache_pages {
                 clear_resident_pte(page_table, vpn, retired);
-                retired.page_cache_refs.push((key, keep_clean));
+                retired.page_cache_refs.push(key);
             }
         }
 

@@ -1,10 +1,11 @@
 use super::dentry_cache;
-use super::mount::{mounted_root_for_any_path, with_mount};
+use super::mount::{mount_supports_page_cache, mounted_root_for_any_path, with_mount};
 use super::path::{PathContext, WorkingDir};
 use super::vfs::{
     FsError, FsNodeKind, FsResult, LookupMode, VfsCreateTarget, VfsNodeId,
-    flush_dirty_regular_file, invalidate_regular_file_read_cache, resolve_create_parent_in,
-    resolve_existing_in, resolve_mount_target_in,
+    begin_regular_file_page_cache_mutation, flush_dirty_regular_file,
+    initialize_regular_file_page_cache_incarnation, resolve_create_parent_in, resolve_existing_in,
+    resolve_mount_target_in,
 };
 use bitflags::*;
 use lwext4_rust::ffi::EXT4_ROOT_INO;
@@ -235,6 +236,7 @@ pub(crate) fn create_node_in(
     let trailing_slash = has_trailing_slash(name);
     let target = resolve_create_parent_in(context.clone(), trimmed_nonroot_path(name))?;
     ensure_create_target_absent(&context, &target, trailing_slash)?;
+    let supports_page_cache = mount_supports_page_cache(target.parent.mount_id);
     with_mount(target.parent.mount_id, |mount| {
         let parent_stat = mount.stat(target.parent.ino)?;
         let ino = mount.create_node(
@@ -244,6 +246,12 @@ pub(crate) fn create_node_in(
             mode & MODE_PERMISSIONS_MASK,
             rdev,
         )?;
+        if kind == FsNodeKind::RegularFile {
+            initialize_regular_file_page_cache_incarnation(
+                VfsNodeId::new(target.parent.mount_id, ino),
+                supports_page_cache,
+            );
+        }
         let gid = if parent_stat.mode & MODE_SETGID != 0 {
             parent_stat.gid
         } else {
@@ -423,6 +431,8 @@ pub(crate) fn rename_in(
     }
 
     flush_dirty_regular_file(old_node)?;
+    let _replaced_mutation =
+        replaced_target.and_then(|(node, kind)| begin_regular_file_page_cache_mutation(node, kind));
     if let Some((node, _kind)) = replaced_target {
         flush_dirty_regular_file(node)?;
     }
@@ -438,9 +448,6 @@ pub(crate) fn rename_in(
     dentry_cache::invalidate_parent(old_target.parent);
     if new_target.parent != old_target.parent {
         dentry_cache::invalidate_parent(new_target.parent);
-    }
-    if let Some((node, kind)) = replaced_target {
-        invalidate_regular_file_read_cache(node, kind);
     }
     Ok(())
 }
@@ -512,8 +519,8 @@ pub(crate) fn rename_exchange_in(
     if new_target.parent != old_target.parent {
         dentry_cache::invalidate_parent(new_target.parent);
     }
-    invalidate_regular_file_read_cache(old_node, old_kind);
-    invalidate_regular_file_read_cache(new_node, new_kind);
+    // Exchanging names does not change either inode's identity or contents,
+    // so inode-keyed clean pages remain valid.
     Ok(())
 }
 
@@ -535,13 +542,13 @@ pub(crate) fn unlink_file_in(context: PathContext, name: &str) -> FsResult {
     if is_synthetic {
         return Err(FsError::Busy);
     }
+    let _mutation = begin_regular_file_page_cache_mutation(node, kind);
     flush_dirty_regular_file(node)?;
     with_mount(target.parent.mount_id, |mount| {
         mount.unlink(target.parent.ino, target.leaf_name)
     })
     .ok_or(FsError::Io)??;
     dentry_cache::invalidate_parent(target.parent);
-    invalidate_regular_file_read_cache(node, kind);
     Ok(())
 }
 

@@ -33,7 +33,10 @@ pub use memory_set::MemorySet;
 pub(crate) use page_table::TranslatedUserBuffer;
 pub use page_table::{PageTable, PageTableEntry, UserBuffer};
 pub(crate) use user_space::FutexSharedKey;
-pub use user_space::{MemoryProtectError, MmapFaultAccess, MmapFaultResult};
+pub use user_space::{
+    MemoryProtectError, MmapFaultAccess, MmapFaultResult, MmapPageCacheInstall,
+    MmapPageCacheResolve, MmapPrefaultResult,
+};
 
 static PUBLISHED_KERNEL_TOKEN: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_MAP_ELAPSED_US: AtomicUsize = AtomicUsize::new(0);
