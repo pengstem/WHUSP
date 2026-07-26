@@ -349,9 +349,6 @@ impl PageTable {
         if pte.cow() && !pte.writable() {
             return true;
         }
-        if !pte.writable() {
-            return false;
-        }
         let mut flags = pte.flags();
         flags.remove(PTEFlags::W);
         flags.insert(PTEFlags::COW);

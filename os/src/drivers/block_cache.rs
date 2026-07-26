@@ -214,15 +214,23 @@ impl BlockCache {
         }
     }
 
-    fn read4k_or_miss(&mut self, device_key: usize, block_id: usize, buf: &mut [u8]) -> bool {
-        debug_assert_eq!(buf.len(), READ_CACHE_LINE_SIZE);
+    fn read4k_or_miss_run(
+        &mut self,
+        device_key: usize,
+        block_id: usize,
+        max_blocks: usize,
+        first_buf: &mut [u8],
+    ) -> Option<usize> {
+        debug_assert!(max_blocks >= READ_CACHE_LINE_BLOCKS);
+        debug_assert_eq!(max_blocks % READ_CACHE_LINE_BLOCKS, 0);
+        debug_assert_eq!(first_buf.len(), READ_CACHE_LINE_SIZE);
         if !self.enabled || self.read_capacity == 0 {
-            return false;
+            return Some(max_blocks);
         }
         let key = ReadCacheKey::new(device_key, block_id);
         if let Some(line) = self.read_lines.get(&key) {
             debug_assert_eq!(line.data.len(), READ_CACHE_LINE_SIZE);
-            buf.copy_from_slice(line.data.as_ref());
+            first_buf.copy_from_slice(line.data.as_ref());
             let old_stamp = line.lru_stamp;
             record_cache_stat! {
                 self.stats.read4k_hit += 1;
@@ -231,12 +239,23 @@ impl BlockCache {
             if let Some(line) = self.read_lines.get_mut(&key) {
                 line.lru_stamp = stamp;
             }
-            return true;
+            return None;
         }
         record_cache_stat! {
             self.stats.read4k_miss += 1;
         }
-        false
+        let mut blocks = READ_CACHE_LINE_BLOCKS;
+        while blocks < max_blocks {
+            let key = ReadCacheKey::new(device_key, block_id + blocks);
+            if self.read_lines.contains_key(&key) {
+                break;
+            }
+            record_cache_stat! {
+                self.stats.read4k_miss += 1;
+            }
+            blocks += READ_CACHE_LINE_BLOCKS;
+        }
+        Some(blocks)
     }
 
     fn insert_read4k(&mut self, device_key: usize, block_id: usize, data: &[u8]) {
@@ -255,6 +274,20 @@ impl BlockCache {
             self.stats.read4k_fill += 1;
         }
         self.trim_read4k_to_capacity();
+    }
+
+    fn insert_read4k_run(&mut self, device_key: usize, block_id: usize, data: &[u8]) {
+        debug_assert_eq!(data.len() % READ_CACHE_LINE_SIZE, 0);
+        if !self.enabled || self.read_capacity == 0 {
+            return;
+        }
+        for (line_offset, chunk) in data.chunks_exact(READ_CACHE_LINE_SIZE).enumerate() {
+            self.insert_read4k(
+                device_key,
+                block_id + line_offset * READ_CACHE_LINE_BLOCKS,
+                chunk,
+            );
+        }
     }
 
     fn update_after_write4k(&mut self, device_key: usize, block_id: usize, data: &[u8]) {
@@ -536,16 +569,21 @@ fn cache_read_or_miss_run(
         .read_or_miss_run(device_key, block_id, max_blocks, first_buf)
 }
 
-fn cache_read4k_or_miss(device_key: usize, block_id: usize, buf: &mut [u8]) -> bool {
+fn cache_read4k_or_miss_run(
+    device_key: usize,
+    block_id: usize,
+    max_blocks: usize,
+    first_buf: &mut [u8],
+) -> Option<usize> {
     BLOCK_CACHE
         .exclusive_access()
-        .read4k_or_miss(device_key, block_id, buf)
+        .read4k_or_miss_run(device_key, block_id, max_blocks, first_buf)
 }
 
-fn cache_insert_read4k(device_key: usize, block_id: usize, data: &[u8]) {
+fn cache_insert_read4k_run(device_key: usize, block_id: usize, data: &[u8]) {
     BLOCK_CACHE
         .exclusive_access()
-        .insert_read4k(device_key, block_id, data);
+        .insert_read4k_run(device_key, block_id, data);
 }
 
 fn cache_update_after_write4k(device_key: usize, block_id: usize, data: &[u8]) {
@@ -664,8 +702,7 @@ fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) ->
 }
 
 fn can_use_read4k(_block_id: usize, buf: &[u8], remaining_blocks: usize) -> bool {
-    remaining_blocks >= READ_CACHE_LINE_BLOCKS
-        && page_bounded_full_blocks(buf, remaining_blocks) >= READ_CACHE_LINE_BLOCKS
+    remaining_blocks >= READ_CACHE_LINE_BLOCKS && buf.len() >= READ_CACHE_LINE_SIZE
 }
 
 fn can_use_write4k(buf: &[u8], remaining_blocks: usize) -> bool {
@@ -691,13 +728,26 @@ pub(crate) fn read_with_cache<F>(
             &buf[start..full_bytes],
             full_blocks - index,
         ) {
-            let end = start + READ_CACHE_LINE_SIZE;
-            if !cache_read4k_or_miss(device_key, block_id + index, &mut buf[start..end]) {
-                record_device_read_submit(READ_CACHE_LINE_BLOCKS);
-                read_uncached(block_id + index, &mut buf[start..end]);
-                cache_insert_read4k(device_key, block_id + index, &buf[start..end]);
+            let max_blocks = cached_io_full_blocks(&buf[start..full_bytes], full_blocks - index);
+            let max_blocks = max_blocks / READ_CACHE_LINE_BLOCKS * READ_CACHE_LINE_BLOCKS;
+            let first_end = start + READ_CACHE_LINE_SIZE;
+            match cache_read4k_or_miss_run(
+                device_key,
+                block_id + index,
+                max_blocks,
+                &mut buf[start..first_end],
+            ) {
+                None => {
+                    index += READ_CACHE_LINE_BLOCKS;
+                }
+                Some(blocks) => {
+                    let end = start + blocks * BLOCK_CACHE_LINE_SIZE;
+                    record_device_read_submit(blocks);
+                    read_uncached(block_id + index, &mut buf[start..end]);
+                    cache_insert_read4k_run(device_key, block_id + index, &buf[start..end]);
+                    index += blocks;
+                }
             }
-            index += READ_CACHE_LINE_BLOCKS;
             continue;
         }
         record_read4k_fallback();

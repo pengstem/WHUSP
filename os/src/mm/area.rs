@@ -934,10 +934,16 @@ fn remap_resident_frame(
     pte_flags: PTEFlags,
     has_leaf_permission: bool,
 ) -> bool {
+    let flags = remap_flags_preserving_cow(page_table, vpn, pte_flags);
     if !has_leaf_permission {
+        // Preserve private fork ownership across PROT_NONE. Clearing a COW
+        // entry would lose the shared-frame marker, so a later PROT_WRITE
+        // could remap the retained PPN writable in both parent and child.
+        if flags.contains(PTEFlags::COW) {
+            return page_table.remap_flags(vpn, flags);
+        }
         return page_table.clear_leaf(vpn);
     }
-    let flags = remap_flags_preserving_cow(page_table, vpn, pte_flags);
     if page_table.translate(vpn).is_some_and(|pte| pte.bits == 0) {
         page_table.try_map(vpn, ppn, flags)
     } else {
