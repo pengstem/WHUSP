@@ -20,10 +20,6 @@ EFFECTIVE_MEM_RV := $(MEM_RV)
 EFFECTIVE_MEM_LA := $(MEM_LA)
 endif
 
-# Keep local development usable when the contest Docker image is unavailable.
-# The extracted GCC 13.2 LoongArch toolchain is intentionally ignored with the
-# other large tools, and the official image still wins when this directory is
-# absent.
 LOONGARCH_TOOLCHAIN_BIN ?= $(CURDIR)/tools/loongarch64-linux-musl-cross/bin
 ifneq ($(wildcard $(LOONGARCH_TOOLCHAIN_BIN)/loongarch64-linux-musl-gcc),)
 export PATH := $(LOONGARCH_TOOLCHAIN_BIN):$(PATH)
