@@ -1,5 +1,13 @@
 MODE ?= release
 PERF_COUNTERS ?= 0
+BLOCK_IO_MODE ?= auto
+
+ifeq ($(BLOCK_IO_MODE),auto)
+else ifeq ($(BLOCK_IO_MODE),force-sync)
+else
+$(error BLOCK_IO_MODE must be auto or force-sync: $(BLOCK_IO_MODE))
+endif
+
 # Per-arch QEMU memory defaults. `MEM=...` on the command line still overrides both.
 MEM_RV ?= 12G
 MEM_LA ?= 16G
@@ -54,11 +62,11 @@ validation:
 validate: validation
 
 kernel-rv:
-	@$(MAKE) --no-print-directory -C os ARCH=riscv64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) kernel
+	@$(MAKE) --no-print-directory -C os ARCH=riscv64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) BLOCK_IO_MODE=$(BLOCK_IO_MODE) kernel
 	@cp -f $(KERNEL_RV_SRC) kernel-rv
 
 kernel-la:
-	@$(MAKE) --no-print-directory -C os ARCH=loongarch64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) kernel
+	@$(MAKE) --no-print-directory -C os ARCH=loongarch64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) BLOCK_IO_MODE=$(BLOCK_IO_MODE) kernel
 	@cp -f $(KERNEL_LA_SRC) kernel-la
 
 contest-disk:

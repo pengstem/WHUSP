@@ -5,6 +5,7 @@ authors = ["Pengsteam <2285566738@qq.com>"]
 edition = "2024"
 
 [features]
+block-io-force-sync = []
 perf-counters = []
 
 [dependencies]

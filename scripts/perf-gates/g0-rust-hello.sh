@@ -1,4 +1,4 @@
-#!/musl/busybox sh
+#!/musl/busybox ash
 
 set -u
 
@@ -8,6 +8,8 @@ KIND='@KIND@'
 SAMPLE='@SAMPLE@'
 SMP='@SMP@'
 MEM='@MEM@'
+BLOCK_IO='@BLOCK_IO_MODE@'
+PERF='@PERF_COUNTERS@'
 
 BB=/musl/busybox
 TIMER=/x1/rust_build_timer
@@ -17,6 +19,11 @@ PROJECT=/tmp/minibuild
 TIMER_RESULT=/tmp/rust-build-timer.result
 PROGRAM_OUTPUT=/tmp/minibuild.stdout
 PROGRAM_STDERR=/tmp/minibuild.stderr
+PERF_PATH=/proc/oskernel/perf
+PERF_BEFORE=/tmp/g0-rust-hello-perf.before
+PERF_AFTER=/tmp/g0-rust-hello-perf.after
+PERF_SNAPSHOT_MAX_BYTES=262144
+PERF_SNAPSHOT_MAX_LINES=4096
 
 PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
 HOME=/root
@@ -48,7 +55,7 @@ fail()
     FAIL_REASON=$2
     FAIL_RC=${3:--1}
     printf '%s\n' \
-        "G0_RUST_HELLO_FAIL run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM stage=$FAIL_STAGE reason=$FAIL_REASON rc=$FAIL_RC"
+        "G0_RUST_HELLO_FAIL run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF stage=$FAIL_STAGE reason=$FAIL_REASON rc=$FAIL_RC"
     exit 1
 }
 
@@ -85,12 +92,58 @@ path_exists()
     [ -e "$1" ] || [ -L "$1" ]
 }
 
+capture_perf_snapshot()
+{
+    PERF_POINT=$1
+    PERF_DEST=$2
+    [ "$PERF" -eq 1 ] || fail perf capture_disabled
+    path_exists "$PERF_DEST" && fail perf stale_snapshot
+    $BB cat "$PERF_PATH" > "$PERF_DEST"
+    PERF_CAPTURE_RC=$?
+    [ "$PERF_CAPTURE_RC" -eq 0 ] || fail perf "${PERF_POINT}_snapshot_read_failed" "$PERF_CAPTURE_RC"
+    [ -f "$PERF_DEST" ] || fail perf "${PERF_POINT}_snapshot_missing"
+}
+
+validate_perf_snapshot()
+{
+    PERF_POINT=$1
+    PERF_DEST=$2
+    [ "$PERF" -eq 1 ] || fail perf validate_disabled
+    [ -f "$PERF_DEST" ] || fail perf "${PERF_POINT}_snapshot_missing"
+    PERF_CAPTURE_BYTES=$($BB wc -c < "$PERF_DEST") \
+        || fail perf "${PERF_POINT}_snapshot_size_failed" "$?"
+    PERF_CAPTURE_LINES=$($BB wc -l < "$PERF_DEST") \
+        || fail perf "${PERF_POINT}_snapshot_lines_failed" "$?"
+    is_uint "$PERF_CAPTURE_BYTES" || fail perf "${PERF_POINT}_snapshot_size_invalid"
+    is_uint "$PERF_CAPTURE_LINES" || fail perf "${PERF_POINT}_snapshot_lines_invalid"
+    [ "$PERF_CAPTURE_BYTES" -gt 0 ] || fail perf "${PERF_POINT}_snapshot_empty"
+    [ "$PERF_CAPTURE_BYTES" -le "$PERF_SNAPSHOT_MAX_BYTES" ] \
+        || fail perf "${PERF_POINT}_snapshot_too_large"
+    [ "$PERF_CAPTURE_LINES" -gt 0 ] || fail perf "${PERF_POINT}_snapshot_no_lines"
+    [ "$PERF_CAPTURE_LINES" -le "$PERF_SNAPSHOT_MAX_LINES" ] \
+        || fail perf "${PERF_POINT}_snapshot_too_many_lines"
+}
+
+emit_perf_snapshot()
+{
+    PERF_POINT=$1
+    PERF_SOURCE=$2
+    [ "$PERF" -eq 1 ] || fail perf emit_disabled
+    printf '%s\n' \
+        "G0_RUST_HELLO_PERF_BEGIN run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF point=$PERF_POINT"
+    $BB cat "$PERF_SOURCE" || fail perf "${PERF_POINT}_snapshot_emit_failed" "$?"
+    printf '%s\n' \
+        "G0_RUST_HELLO_PERF_END run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF point=$PERF_POINT"
+}
+
 is_marker_token "$RUN_ID" || fail identity invalid_run_id
 is_marker_token "$ARCH" || fail identity invalid_arch
 is_marker_token "$KIND" || fail identity invalid_kind
 is_marker_token "$SAMPLE" || fail identity invalid_sample
 is_marker_token "$SMP" || fail identity invalid_smp
 is_marker_token "$MEM" || fail identity invalid_mem
+is_marker_token "$BLOCK_IO" || fail identity invalid_block_io
+is_marker_token "$PERF" || fail identity invalid_perf
 
 case "$ARCH" in
     rv) EXPECTED_MACHINE=riscv64 ;;
@@ -103,12 +156,22 @@ case "$KIND" in
     *) fail identity unsupported_kind ;;
 esac
 
+case "$BLOCK_IO" in
+    auto|force-sync) ;;
+    *) fail identity unsupported_block_io ;;
+esac
+
+case "$PERF" in
+    0|1) ;;
+    *) fail identity unsupported_perf ;;
+esac
+
 is_uint "$SAMPLE" || fail identity sample_not_uint
 is_uint "$SMP" || fail identity smp_not_uint
 [ "$SMP" -ge 1 ] || fail identity smp_not_positive
 
 printf '%s\n' \
-    "G0_RUST_HELLO_START run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM"
+    "G0_RUST_HELLO_START run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF"
 
 [ -x "$BB" ] || fail preflight busybox_missing
 [ -x "$TIMER" ] || fail preflight timer_missing
@@ -116,6 +179,9 @@ printf '%s\n' \
 [ -x "$RUSTC" ] || fail preflight rustc_missing
 [ -r /proc/mounts ] || fail preflight proc_mounts_missing
 [ -r /proc/uptime ] || fail preflight proc_uptime_missing
+if [ "$PERF" -eq 1 ]; then
+    [ -r "$PERF_PATH" ] || fail preflight perf_snapshot_missing
+fi
 
 MACHINE=$($BB uname -m) || fail identity uname_failed "$?"
 [ "$MACHINE" = "$EXPECTED_MACHINE" ] || fail identity uname_mismatch
@@ -140,6 +206,10 @@ path_exists "$PROJECT" && fail setup stale_project
 path_exists "$TIMER_RESULT" && fail setup stale_timer_result
 path_exists "$PROGRAM_OUTPUT" && fail setup stale_program_output
 path_exists "$PROGRAM_STDERR" && fail setup stale_program_stderr
+if [ "$PERF" -eq 1 ]; then
+    path_exists "$PERF_BEFORE" && fail setup stale_perf_before
+    path_exists "$PERF_AFTER" && fail setup stale_perf_after
+fi
 
 RUSTC_VERSION_LINE=$($RUSTC --version 2>/dev/null)
 RUSTC_VERSION_RC=$?
@@ -214,8 +284,16 @@ IFS=' ' read -r UPTIME_BEFORE UPTIME_IDLE_BEFORE UPTIME_EXTRA < /proc/uptime \
 is_uptime_value "$UPTIME_BEFORE" || fail timer uptime_before_invalid
 is_uptime_value "$UPTIME_IDLE_BEFORE" || fail timer uptime_idle_before_invalid
 
+if [ "$PERF" -eq 1 ]; then
+    capture_perf_snapshot before "$PERF_BEFORE"
+fi
+
 $TIMER "$TIMER_RESULT" "$CARGO" build >/dev/null 2>&1
 TIMER_RC=$?
+
+if [ "$PERF" -eq 1 ]; then
+    capture_perf_snapshot after "$PERF_AFTER"
+fi
 
 UPTIME_IDLE_AFTER=
 UPTIME_EXTRA=
@@ -224,6 +302,11 @@ IFS=' ' read -r UPTIME_AFTER UPTIME_IDLE_AFTER UPTIME_EXTRA < /proc/uptime \
 [ -z "$UPTIME_EXTRA" ] || fail timer uptime_after_extra_field
 is_uptime_value "$UPTIME_AFTER" || fail timer uptime_after_invalid
 is_uptime_value "$UPTIME_IDLE_AFTER" || fail timer uptime_idle_after_invalid
+
+if [ "$PERF" -eq 1 ]; then
+    validate_perf_snapshot before "$PERF_BEFORE"
+    validate_perf_snapshot after "$PERF_AFTER"
+fi
 
 [ "$TIMER_RC" -eq 0 ] || fail build cargo_or_timer_failed "$TIMER_RC"
 [ -f "$TIMER_RESULT" ] || fail timer result_missing
@@ -279,9 +362,14 @@ STDERR_BYTES=$($BB wc -c < "$PROGRAM_STDERR") \
 [ "$OUTPUT_BYTES" -eq 14 ] || fail validate output_size_mismatch
 [ "$STDERR_BYTES" -eq 0 ] || fail validate unexpected_stderr
 
+if [ "$PERF" -eq 1 ]; then
+    emit_perf_snapshot before "$PERF_BEFORE"
+    emit_perf_snapshot after "$PERF_AFTER"
+fi
+
 printf '%s\n' \
-    "G0_RUST_HELLO_RESULT run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM uname=$MACHINE nproc=$ONLINE_CPUS cargo_version=$CARGO_VERSION rustc_version=$RUSTC_VERSION tmp_mount=1 tmp_writable=1 elapsed_ns=$ELAPSED_NS timer_exited=1 timer_exit_code=0 timer_signaled=0 timer_signal=0 timer_rc=$TIMER_RC uptime_before=$UPTIME_BEFORE uptime_after=$UPTIME_AFTER lock_created=1 artifact_bytes=$ARTIFACT_BYTES output_bytes=$OUTPUT_BYTES output_ok=1 ok=1"
+    "G0_RUST_HELLO_RESULT run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF uname=$MACHINE nproc=$ONLINE_CPUS cargo_version=$CARGO_VERSION rustc_version=$RUSTC_VERSION tmp_mount=1 tmp_writable=1 elapsed_ns=$ELAPSED_NS timer_exited=1 timer_exit_code=0 timer_signaled=0 timer_signal=0 timer_rc=$TIMER_RC uptime_before=$UPTIME_BEFORE uptime_after=$UPTIME_AFTER lock_created=1 artifact_bytes=$ARTIFACT_BYTES output_bytes=$OUTPUT_BYTES output_ok=1 ok=1"
 printf '%s\n' \
-    "G0_RUST_HELLO_PASS run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM"
+    "G0_RUST_HELLO_PASS run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF"
 
 exit 0

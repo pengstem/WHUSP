@@ -25,6 +25,7 @@ RUNNER_SOURCE = Path(__file__).resolve()
 OS_MAKEFILE = REPO_ROOT / "os" / "Makefile"
 GUEST_TEMPLATE = REPO_ROOT / "scripts" / "perf-gates" / "g0-rust-hello.sh"
 TIMER_SOURCE = REPO_ROOT / "scripts" / "perf-gates" / "rust_build_timer.c"
+GUEST_WORKLOAD_PATH = "/x1/g0-rust-hello.sh"
 MAX_CPUS = 12
 PROCESS_STOP_TIMEOUT_SECONDS = 2.0
 TOKEN_RE = re.compile(r"[A-Za-z0-9._-]+")
@@ -32,6 +33,10 @@ MEM_RE = re.compile(r"[1-9][0-9]*[MG]")
 IMAGE_SIZE_RE = re.compile(r"[1-9][0-9]*[MG]")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 PANIC_RE = re.compile(r"panicked at|kernel panic|assertion failed", re.IGNORECASE)
+FORBIDDEN_SHELL_DIAGNOSTICS = (
+    "set: -u: invalid option",
+    "waitpid: Interrupted system call",
+)
 SHUTDOWN_RE = re.compile(
     r"smp shutdown: leader=(?P<leader>[0-9]+) "
     r"requested=(?P<requested>0x[0-9a-f]+) "
@@ -42,20 +47,27 @@ OVERLAY_RE = re.compile(
     r"WHUSP_QEMU_OVERLAY state=(?P<state>created|cleaned) "
     r"path=(?P<path>/[^\r\n ]+)"
 )
+BLOCK_IO_POLICY_RE = re.compile(
+    r"(?:\[\s*INFO\]\s+)?"
+    r"KERN: block io policy mode=(?P<block_io>auto|force-sync) "
+    r"irq_ready=(?P<irq_ready>true|false) "
+    r"nonblocking=(?P<nonblocking>true|false) "
+    r"perf_counters=(?P<perf_counters>true|false)"
+)
 IDENTITY_PATTERN = (
     r"run_id=(?P<run_id>[A-Za-z0-9._-]+) "
     r"arch=(?P<arch>rv|la) "
     r"kind=(?P<kind>warmup|measured) "
     r"sample=(?P<sample>[0-9]+) "
     r"smp=(?P<smp>[0-9]+) "
-    r"mem=(?P<mem>[A-Za-z0-9._-]+)"
+    r"mem=(?P<mem>[A-Za-z0-9._-]+) "
+    r"block_io=(?P<block_io>auto|force-sync) "
+    r"perf=(?P<perf>[01])"
 )
 START_RE = re.compile(r"G0_RUST_HELLO_START " + IDENTITY_PATTERN)
 PASS_RE = re.compile(r"G0_RUST_HELLO_PASS " + IDENTITY_PATTERN)
 FAIL_RE = re.compile(
-    r"G0_RUST_HELLO_FAIL "
-    + IDENTITY_PATTERN
-    + r" stage=(?P<stage>[A-Za-z0-9._-]+)"
+    r"G0_RUST_HELLO_FAIL " + IDENTITY_PATTERN + r" stage=(?P<stage>[A-Za-z0-9._-]+)"
     r" reason=(?P<reason>[A-Za-z0-9._-]+) rc=(?P<rc>-?[0-9]+)"
 )
 RESULT_RE = re.compile(
@@ -79,6 +91,96 @@ RESULT_RE = re.compile(
     r" artifact_bytes=(?P<artifact_bytes>[0-9]+)"
     r" output_bytes=(?P<output_bytes>[0-9]+)"
     r" output_ok=(?P<output_ok>[01]) ok=(?P<ok>[01])"
+)
+PERF_BEGIN_RE = re.compile(
+    r"G0_RUST_HELLO_PERF_BEGIN " + IDENTITY_PATTERN + r" point=(?P<point>before|after)"
+)
+PERF_END_RE = re.compile(
+    r"G0_RUST_HELLO_PERF_END " + IDENTITY_PATTERN + r" point=(?P<point>before|after)"
+)
+PERF_VALUE_RE = re.compile(r"(?P<key>[a-z][a-z0-9_]*) (?P<value>[0-9]+)")
+PERF_SYSCALL_KEY_RE = re.compile(
+    r"profile_syscall_(?P<syscall>[0-9]+)_"
+    r"(?P<metric>calls|total_ticks|total_us|avg_ns|max_us)"
+)
+PERF_SYSCALL_METRICS = ("calls", "total_ticks", "total_us", "avg_ns", "max_us")
+
+# These keys freeze the IO0 causal contract and their relative procfs order.
+# The parser also preserves every additional integer key/value line verbatim.
+PERF_REQUIRED_KEYS = (
+    "perf_counters_enabled",
+    "scheduler_fetch_calls",
+    "scheduler_scanned_tasks",
+    "wakeup_front_successes",
+    "wakeup_back_successes",
+    "scheduler_normal_requeue_calls",
+    "vfs_read_all_calls",
+    "vfs_read_all_backend_reads",
+    "vfs_read_backend_calls",
+    "vfs_read_backend_bytes",
+    "mmap_private_faults",
+    "kperf_timing_enabled",
+    "profile_ext4_read_calls",
+    "profile_ext4_read_total_ticks",
+    "profile_ext4_read_total_us",
+    "profile_page_fault_calls",
+    "profile_page_fault_total_ticks",
+    "profile_page_fault_total_us",
+    "profile_scheduler_fetch_calls",
+    "profile_scheduler_fetch_total_ticks",
+    "profile_scheduler_fetch_total_us",
+    "profile_vfs_read_backend_calls",
+    "profile_vfs_read_backend_total_ticks",
+    "profile_vfs_read_backend_total_us",
+    "profile_vfs_read_all_backend_calls",
+    "profile_vfs_read_all_backend_total_ticks",
+    "profile_vfs_read_all_backend_total_us",
+    "profile_mmap_fault_read_calls",
+    "profile_mmap_fault_read_total_ticks",
+    "profile_mmap_fault_read_total_us",
+    "kperf_syscall_timing_enabled",
+    "block_cache_device_read_submit",
+    "block_cache_device_read_blocks",
+    "block_cache_device_write_submit",
+    "block_cache_device_write_blocks",
+    "block_io_nonblocking_requested",
+    "block_io_nb_read_submits",
+    "block_io_nb_write_submits",
+    "block_io_nb_read_waits",
+    "block_io_nb_write_waits",
+    "block_io_nb_read_completions",
+    "block_io_nb_write_completions",
+    "block_io_fallback_sync_reads",
+    "block_io_fallback_sync_writes",
+    "block_io_fallback_unsafe_reads",
+    "block_io_fallback_unsafe_writes",
+    "block_io_fallback_no_ready_reads",
+    "block_io_fallback_no_ready_writes",
+    "block_io_sync_read_submits",
+    "block_io_sync_write_submits",
+    "block_io_irq_acks",
+    "block_io_completion_signals",
+    "block_io_completion_wakeups",
+    "exec_elf_header_bytes_read",
+    "exec_phdr_bytes_read",
+    "exec_eager_segment_bytes_read",
+    "exec_lazy_segment_faults",
+    "exec_lazy_segment_bytes_read",
+    "exec_lazy_page_cache_faults",
+    "exec_lazy_page_cache_hits",
+    "exec_lazy_page_cache_misses",
+    "exec_lazy_page_cache_bytes_read",
+)
+PERF_SELECTED_DELTA_KEYS = tuple(
+    key
+    for key in PERF_REQUIRED_KEYS
+    if key
+    not in {
+        "perf_counters_enabled",
+        "kperf_timing_enabled",
+        "kperf_syscall_timing_enabled",
+        "block_io_nonblocking_requested",
+    }
 )
 
 
@@ -134,7 +236,9 @@ def command_text(command: list[str]) -> str:
     return shlex.join(command) + "\n"
 
 
-def run_capture(command: list[str], *, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess[str]:
+def run_capture(
+    command: list[str], *, cwd: Path = REPO_ROOT
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         command,
         cwd=cwd,
@@ -231,6 +335,8 @@ def render_guest(identity: dict[str, str]) -> str:
         "@SAMPLE@": identity["sample"],
         "@SMP@": identity["smp"],
         "@MEM@": identity["mem"],
+        "@BLOCK_IO_MODE@": identity["block_io"],
+        "@PERF_COUNTERS@": identity["perf"],
     }
     for placeholder, replacement in replacements.items():
         count = source.count(placeholder)
@@ -244,6 +350,13 @@ def render_guest(identity: dict[str, str]) -> str:
     return source
 
 
+def render_guest_launcher() -> str:
+    return (
+        "#!/musl/busybox sh\n"
+        f"exec /musl/busybox ash {GUEST_WORKLOAD_PATH} || exit 127\n"
+    )
+
+
 def normalized_lines(log: str) -> list[str]:
     return [ANSI_RE.sub("", line.rstrip("\r")) for line in log.splitlines()]
 
@@ -252,12 +365,231 @@ def marker_identity_errors(
     groups: dict[str, str], expected: dict[str, str], label: str
 ) -> list[str]:
     errors: list[str] = []
-    for field in ("run_id", "arch", "kind", "sample", "smp", "mem"):
+    for field in (
+        "run_id",
+        "arch",
+        "kind",
+        "sample",
+        "smp",
+        "mem",
+        "block_io",
+        "perf",
+    ):
         if groups[field] != expected[field]:
             errors.append(
                 f"{label} {field} mismatch: {groups[field]!r} != {expected[field]!r}"
             )
     return errors
+
+
+def parse_perf_snapshot(
+    snapshot_lines: list[str], *, label: str
+) -> tuple[dict[str, Any], list[str]]:
+    errors: list[str] = []
+    ordered_keys: list[str] = []
+    values: dict[str, int] = {}
+    if not snapshot_lines:
+        errors.append(f"{label} perf snapshot is empty")
+    if len(snapshot_lines) > 4096:
+        errors.append(
+            f"{label} perf snapshot has too many lines: {len(snapshot_lines)}"
+        )
+    for line in snapshot_lines:
+        if len(line) > 256:
+            errors.append(f"{label} perf snapshot line is too long")
+            continue
+        match = PERF_VALUE_RE.fullmatch(line)
+        if match is None:
+            errors.append(f"{label} perf snapshot has malformed line: {line!r}")
+            continue
+        key = match.group("key")
+        if key in values:
+            errors.append(f"{label} perf snapshot has duplicate key: {key}")
+            continue
+        ordered_keys.append(key)
+        values[key] = int(match.group("value"))
+
+    missing = [key for key in PERF_REQUIRED_KEYS if key not in values]
+    if missing:
+        errors.append(f"{label} perf snapshot is missing required keys: {missing!r}")
+    else:
+        required_indices = [ordered_keys.index(key) for key in PERF_REQUIRED_KEYS]
+        if required_indices != sorted(required_indices):
+            errors.append(f"{label} perf snapshot required keys are out of order")
+    for enabled_key in (
+        "perf_counters_enabled",
+        "kperf_timing_enabled",
+        "kperf_syscall_timing_enabled",
+    ):
+        if values.get(enabled_key) != 1:
+            errors.append(f"{label} perf snapshot {enabled_key} must be 1")
+
+    syscall_entries: list[tuple[int, str, str]] = []
+    syscall_indices: list[int] = []
+    for index, key in enumerate(ordered_keys):
+        match = PERF_SYSCALL_KEY_RE.fullmatch(key)
+        if match is None:
+            continue
+        syscall_indices.append(index)
+        syscall_entries.append(
+            (int(match.group("syscall")), match.group("metric"), key)
+        )
+    syscall_ids: list[int] = []
+    if syscall_entries:
+        sentinel_index = (
+            ordered_keys.index("kperf_syscall_timing_enabled")
+            if "kperf_syscall_timing_enabled" in values
+            else -1
+        )
+        expected_indices = list(
+            range(syscall_indices[0], syscall_indices[0] + len(syscall_indices))
+        )
+        if (
+            syscall_indices != expected_indices
+            or syscall_indices[0] != sentinel_index + 1
+        ):
+            errors.append(
+                f"{label} perf snapshot syscall timing keys are not one contiguous suffix"
+            )
+        for offset in range(0, len(syscall_entries), len(PERF_SYSCALL_METRICS)):
+            group = syscall_entries[offset : offset + len(PERF_SYSCALL_METRICS)]
+            if len(group) != len(PERF_SYSCALL_METRICS):
+                errors.append(
+                    f"{label} perf snapshot has a partial syscall timing group"
+                )
+                break
+            syscall_id = group[0][0]
+            if syscall_id >= 512:
+                errors.append(
+                    f"{label} perf snapshot syscall ID is outside 0..511: {syscall_id}"
+                )
+            if [item[0] for item in group] != [syscall_id] * len(group) or [
+                item[1] for item in group
+            ] != list(PERF_SYSCALL_METRICS):
+                errors.append(
+                    f"{label} perf snapshot malformed syscall timing group at {syscall_id}"
+                )
+            syscall_ids.append(syscall_id)
+        if syscall_ids != sorted(set(syscall_ids)):
+            errors.append(
+                f"{label} perf snapshot syscall timing IDs are not unique ascending"
+            )
+
+    return (
+        {
+            "raw_lines": snapshot_lines,
+            "ordered_keys": ordered_keys,
+            "values": values,
+            "syscall_ids": syscall_ids,
+        },
+        errors,
+    )
+
+
+def validate_perf_snapshot_pair(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    *,
+    block_io_mode: str,
+) -> tuple[dict[str, int], list[str]]:
+    errors: list[str] = []
+    before_keys = [
+        key
+        for key in before["ordered_keys"]
+        if PERF_SYSCALL_KEY_RE.fullmatch(key) is None
+    ]
+    after_keys = [
+        key
+        for key in after["ordered_keys"]
+        if PERF_SYSCALL_KEY_RE.fullmatch(key) is None
+    ]
+    if before_keys != after_keys:
+        errors.append("before/after perf snapshot non-syscall key set/order differs")
+    if not set(before["syscall_ids"]).issubset(after["syscall_ids"]):
+        errors.append("after perf snapshot lost a syscall timing group present before")
+
+    expected_nonblocking = 1 if block_io_mode == "auto" else 0
+    for label, snapshot in (("before", before), ("after", after)):
+        actual = snapshot["values"].get("block_io_nonblocking_requested")
+        if actual != expected_nonblocking:
+            errors.append(
+                f"{label} block_io_nonblocking_requested={actual!r}, "
+                f"expected {expected_nonblocking}"
+            )
+
+    deltas: dict[str, int] = {}
+    for key in PERF_SELECTED_DELTA_KEYS:
+        if key not in before["values"] or key not in after["values"]:
+            continue
+        delta = after["values"][key] - before["values"][key]
+        deltas[key] = delta
+        if delta < 0:
+            errors.append(f"selected perf counter moved backwards: {key} delta={delta}")
+    if tuple(deltas) != PERF_SELECTED_DELTA_KEYS:
+        missing = [key for key in PERF_SELECTED_DELTA_KEYS if key not in deltas]
+        errors.append(f"selected perf deltas are incomplete: {missing!r}")
+
+    nb_read_keys = (
+        "block_io_nb_read_submits",
+        "block_io_nb_read_waits",
+        "block_io_nb_read_completions",
+    )
+    nb_write_keys = (
+        "block_io_nb_write_submits",
+        "block_io_nb_write_waits",
+        "block_io_nb_write_completions",
+    )
+    if all(key in deltas for key in (*nb_read_keys, *nb_write_keys)):
+        read_submits, read_waits, read_completions = (
+            deltas[key] for key in nb_read_keys
+        )
+        write_submits, write_waits, write_completions = (
+            deltas[key] for key in nb_write_keys
+        )
+        if block_io_mode == "auto":
+            if read_submits <= 0:
+                errors.append("auto mode requires block_io_nb_read_submits delta > 0")
+            if not read_submits == read_waits == read_completions:
+                errors.append(
+                    "auto read nonblocking lifecycle mismatch: "
+                    f"submits={read_submits} waits={read_waits} "
+                    f"completions={read_completions}"
+                )
+            if not write_submits == write_waits == write_completions:
+                errors.append(
+                    "auto write nonblocking lifecycle mismatch: "
+                    f"submits={write_submits} waits={write_waits} "
+                    f"completions={write_completions}"
+                )
+        else:
+            nonzero = {
+                key: deltas[key]
+                for key in (*nb_read_keys, *nb_write_keys)
+                if deltas[key] != 0
+            }
+            if nonzero:
+                errors.append(
+                    f"force-sync mode requires zero nonblocking lifecycle deltas: {nonzero!r}"
+                )
+            if deltas.get("block_io_sync_read_submits", 0) <= 0:
+                errors.append(
+                    "force-sync mode requires block_io_sync_read_submits delta > 0"
+                )
+
+    for direction in ("read", "write"):
+        device_key = f"block_cache_device_{direction}_submit"
+        nonblocking_key = f"block_io_nb_{direction}_submits"
+        synchronous_key = f"block_io_sync_{direction}_submits"
+        accounting_keys = (device_key, nonblocking_key, synchronous_key)
+        if all(key in deltas for key in accounting_keys):
+            routed_submits = deltas[nonblocking_key] + deltas[synchronous_key]
+            if deltas[device_key] != routed_submits:
+                errors.append(
+                    f"{direction} submit accounting mismatch: "
+                    f"{device_key}={deltas[device_key]} != "
+                    f"{nonblocking_key}+{synchronous_key}={routed_submits}"
+                )
+    return deltas, errors
 
 
 def validate_guest_log(
@@ -270,6 +602,7 @@ def validate_guest_log(
 ) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     lines = normalized_lines(log)
+    parsed: dict[str, Any] = {}
     if "\ufffd" in log:
         errors.append("serial log contains a UTF-8 replacement character")
     if PANIC_RE.search(ANSI_RE.sub("", log)):
@@ -282,8 +615,18 @@ def validate_guest_log(
     results: list[tuple[int, re.Match[str]]] = []
     passes: list[tuple[int, re.Match[str]]] = []
     failures: list[tuple[int, re.Match[str]]] = []
+    perf_begins: list[tuple[int, re.Match[str]]] = []
+    perf_ends: list[tuple[int, re.Match[str]]] = []
+    policies: list[tuple[int, re.Match[str]]] = []
+    malformed_policies: list[str] = []
     malformed: list[str] = []
     for index, line in enumerate(lines):
+        if "KERN: block io policy" in line:
+            policy_match = BLOCK_IO_POLICY_RE.fullmatch(line)
+            if policy_match:
+                policies.append((index, policy_match))
+            else:
+                malformed_policies.append(line)
         if "G0_RUST_HELLO_" not in line:
             continue
         match = START_RE.fullmatch(line)
@@ -302,7 +645,42 @@ def validate_guest_log(
         if match:
             failures.append((index, match))
             continue
+        match = PERF_BEGIN_RE.fullmatch(line)
+        if match:
+            perf_begins.append((index, match))
+            continue
+        match = PERF_END_RE.fullmatch(line)
+        if match:
+            perf_ends.append((index, match))
+            continue
         malformed.append(line)
+
+    if malformed_policies:
+        errors.append(f"malformed block IO policy lines: {malformed_policies!r}")
+    if len(policies) != 1:
+        errors.append(f"expected one block IO policy marker, found {len(policies)}")
+    else:
+        policy = policies[0][1].groupdict()
+        expected_policy = {
+            "block_io": identity["block_io"],
+            "irq_ready": "true",
+            "nonblocking": "true" if identity["block_io"] == "auto" else "false",
+            "perf_counters": "true" if identity["perf"] == "1" else "false",
+        }
+        for field, expected in expected_policy.items():
+            if policy[field] != expected:
+                errors.append(
+                    f"block IO policy {field} mismatch: "
+                    f"{policy[field]!r} != {expected!r}"
+                )
+        parsed["block_io_policy"] = {
+            "mode": policy["block_io"],
+            "irq_ready": policy["irq_ready"] == "true",
+            "nonblocking": policy["nonblocking"] == "true",
+            "perf_counters": policy["perf_counters"] == "true",
+        }
+        if len(starts) == 1 and policies[0][0] >= starts[0][0]:
+            errors.append("block IO policy marker did not precede guest START")
 
     if malformed:
         errors.append(f"malformed guest marker lines: {malformed!r}")
@@ -321,14 +699,80 @@ def validate_guest_log(
 
     for label, matches in (("START", starts), ("RESULT", results), ("PASS", passes)):
         if len(matches) == 1:
-            errors.extend(marker_identity_errors(matches[0][1].groupdict(), identity, label))
+            errors.extend(
+                marker_identity_errors(matches[0][1].groupdict(), identity, label)
+            )
+    for label, matches in (("PERF_BEGIN", perf_begins), ("PERF_END", perf_ends)):
+        for _, match in matches:
+            errors.extend(
+                marker_identity_errors(
+                    match.groupdict(), identity, f"{label}/{match.group('point')}"
+                )
+            )
     if (
         len(starts) == len(results) == len(passes) == 1
         and not starts[0][0] < results[0][0] < passes[0][0]
     ):
         errors.append("START, RESULT and PASS markers are out of order")
 
-    parsed: dict[str, Any] = {}
+    if identity["perf"] == "0":
+        if perf_begins or perf_ends:
+            errors.append("perf=0 guest emitted a perf snapshot marker")
+        parsed["perf_snapshots"] = None
+    else:
+        before_begins = [
+            item for item in perf_begins if item[1].group("point") == "before"
+        ]
+        before_ends = [item for item in perf_ends if item[1].group("point") == "before"]
+        after_begins = [
+            item for item in perf_begins if item[1].group("point") == "after"
+        ]
+        after_ends = [item for item in perf_ends if item[1].group("point") == "after"]
+        perf_parts = (
+            ("before BEGIN", before_begins),
+            ("before END", before_ends),
+            ("after BEGIN", after_begins),
+            ("after END", after_ends),
+        )
+        for label, matches in perf_parts:
+            if len(matches) != 1:
+                errors.append(f"expected one perf {label} marker, found {len(matches)}")
+        if all(len(matches) == 1 for _, matches in perf_parts):
+            before_begin_index = before_begins[0][0]
+            before_end_index = before_ends[0][0]
+            after_begin_index = after_begins[0][0]
+            after_end_index = after_ends[0][0]
+            if (
+                len(starts) == len(results) == len(passes) == 1
+                and not starts[0][0]
+                < before_begin_index
+                < before_end_index
+                < after_begin_index
+                < after_end_index
+                < results[0][0]
+                < passes[0][0]
+            ):
+                errors.append(
+                    "START, perf before/after, RESULT and PASS markers are out of order"
+                )
+            before, before_errors = parse_perf_snapshot(
+                lines[before_begin_index + 1 : before_end_index], label="before"
+            )
+            after, after_errors = parse_perf_snapshot(
+                lines[after_begin_index + 1 : after_end_index], label="after"
+            )
+            errors.extend(before_errors)
+            errors.extend(after_errors)
+            selected_deltas, pair_errors = validate_perf_snapshot_pair(
+                before, after, block_io_mode=identity["block_io"]
+            )
+            errors.extend(pair_errors)
+            parsed["perf_snapshots"] = {
+                "before": before,
+                "after": after,
+                "selected_deltas": selected_deltas,
+            }
+
     if len(results) == 1:
         fields = results[0][1].groupdict()
         parsed.update(fields)
@@ -389,6 +833,9 @@ def validate_guest_log(
         f"possible_mask={possible_mask:#x} online_mask=0x1"
     )
     normalized_log = "\n".join(lines)
+    for diagnostic in FORBIDDEN_SHELL_DIAGNOSTICS:
+        if diagnostic in normalized_log:
+            errors.append(f"forbidden guest shell diagnostic: {diagnostic}")
     if normalized_log.count(topology) != 1:
         errors.append(f"expected one truthful early topology line: {topology}")
     memory = f"memory_end={expected_memory_end(architecture.name, mem):#x}"
@@ -419,7 +866,9 @@ def validate_guest_log(
                     f"shutdown requested mask {requested:#x} != {expected_requested:#x}"
                 )
         if stopped != requested:
-            errors.append(f"shutdown stopped mask {stopped:#x} != requested {requested:#x}")
+            errors.append(
+                f"shutdown stopped mask {stopped:#x} != requested {requested:#x}"
+            )
         if missing != 0:
             errors.append(f"shutdown missing mask is nonzero: {missing:#x}")
         if shutdown["failure"] != "false":
@@ -614,15 +1063,20 @@ def build_script_disk(
     staging = temp_root / "staging"
     staging.mkdir()
     entry = staging / "entry.sh"
-    entry.write_text(render_guest(identity), encoding="utf-8")
+    entry.write_text(render_guest_launcher(), encoding="utf-8")
     entry.chmod(0o755)
+    workload = staging / Path(GUEST_WORKLOAD_PATH).name
+    workload.write_text(render_guest(identity), encoding="utf-8")
+    workload.chmod(0o755)
     installed_timer = staging / "rust_build_timer"
     shutil.copy2(timer_binary, installed_timer)
     installed_timer.chmod(0o755)
     image = temp_root / "g0-rust-hello.img"
     output: list[str] = []
     try:
-        run_setup_command([require_command("truncate"), "-s", image_size, str(image)], output)
+        run_setup_command(
+            [require_command("truncate"), "-s", image_size, str(image)], output
+        )
         run_setup_command(
             [
                 require_command("mkfs.ext4"),
@@ -648,6 +1102,8 @@ def qemu_command(
     architecture: Architecture,
     smp: int,
     mem: str,
+    block_io_mode: str,
+    perf_counters: int,
     kernel: Path,
     disk: Path,
     aux_disk: Path,
@@ -660,7 +1116,8 @@ def qemu_command(
         str(REPO_ROOT / "os"),
         f"ARCH={architecture.make_arch}",
         "MODE=release",
-        "PERF_COUNTERS=0",
+        f"BLOCK_IO_MODE={block_io_mode}",
+        f"PERF_COUNTERS={perf_counters}",
         f"SMP={smp}",
         f"MEM={mem}",
         f"KERNEL_ELF={kernel}",
@@ -678,6 +1135,8 @@ def run_trial(
     architecture: Architecture,
     smp: int,
     mem: str,
+    block_io_mode: str,
+    perf_counters: int,
     kernel: Path,
     disk: Path,
     timer_binary: Path,
@@ -685,6 +1144,10 @@ def run_trial(
     timeout: float,
     evidence_dir: Path,
 ) -> dict[str, Any]:
+    if block_io_mode not in {"auto", "force-sync"}:
+        raise BenchmarkError(f"unsupported block IO mode: {block_io_mode!r}")
+    if perf_counters not in {0, 1}:
+        raise BenchmarkError(f"perf_counters must be 0 or 1: {perf_counters!r}")
     trial_dir = evidence_dir / trial.directory_name
     trial_dir.mkdir()
     identity = {
@@ -694,6 +1157,8 @@ def run_trial(
         "sample": str(trial.sample),
         "smp": str(smp),
         "mem": mem,
+        "block_io": block_io_mode,
+        "perf": str(perf_counters),
     }
     temp_root: Path | None = None
     overlay_root: Path | None = None
@@ -727,6 +1192,8 @@ def run_trial(
             architecture=architecture,
             smp=smp,
             mem=mem,
+            block_io_mode=block_io_mode,
+            perf_counters=perf_counters,
             kernel=kernel,
             disk=disk,
             aux_disk=aux_disk,
@@ -799,7 +1266,9 @@ def format_seconds(nanoseconds: Decimal) -> str:
     return f"{nanoseconds / Decimal(1_000_000_000):.9f}"
 
 
-def aggregate(samples: list[dict[str, Any]], warmups: int, measured: int) -> dict[str, Any]:
+def aggregate(
+    samples: list[dict[str, Any]], warmups: int, measured: int
+) -> dict[str, Any]:
     valid_warmups = [
         sample
         for sample in samples
@@ -811,10 +1280,10 @@ def aggregate(samples: list[dict[str, Any]], warmups: int, measured: int) -> dic
         if sample["identity"]["kind"] == "measured" and sample["valid"]
     ]
     complete = len(samples) == warmups + measured
-    all_valid = complete and len(valid_warmups) == warmups and len(valid_measured) == measured
-    values = [
-        int(sample["guest_result"]["elapsed_ns"]) for sample in valid_measured
-    ]
+    all_valid = (
+        complete and len(valid_warmups) == warmups and len(valid_measured) == measured
+    )
+    values = [int(sample["guest_result"]["elapsed_ns"]) for sample in valid_measured]
     result: dict[str, Any] = {
         "schema_version": 1,
         "updated_at": utc_now(),
@@ -826,7 +1295,9 @@ def aggregate(samples: list[dict[str, Any]], warmups: int, measured: int) -> dic
         "all_required_samples_valid": all_valid,
         "run_valid": None,
         "measured_elapsed_ns": values,
-        "measured_elapsed_seconds": [format_seconds(Decimal(value)) for value in values],
+        "measured_elapsed_seconds": [
+            format_seconds(Decimal(value)) for value in values
+        ],
         "median_elapsed_ns": None,
         "median_elapsed_seconds": None,
         "min_elapsed_seconds": None,
@@ -875,7 +1346,9 @@ def version_line(command: list[str]) -> str:
         raise BenchmarkError(f"version command failed: {shlex.join(command)}")
     lines = completed.stdout.splitlines()
     if not lines:
-        raise BenchmarkError(f"version command produced no output: {shlex.join(command)}")
+        raise BenchmarkError(
+            f"version command produced no output: {shlex.join(command)}"
+        )
     return lines[0]
 
 
@@ -911,7 +1384,9 @@ def run_cell(args: argparse.Namespace) -> int:
         path.is_file()
         for path in (RUNNER_SOURCE, OS_MAKEFILE, GUEST_TEMPLATE, TIMER_SOURCE)
     ):
-        raise BenchmarkError("G0-B runner/Makefile/guest template/timer source is missing")
+        raise BenchmarkError(
+            "G0-B runner/Makefile/guest template/timer source is missing"
+        )
     compiler = compiler_for(args.arch)
     require_command("qemu-img")
     qemu_command_name = (
@@ -935,10 +1410,20 @@ def run_cell(args: argparse.Namespace) -> int:
         "make_arch": architecture.make_arch,
         "smp": args.smp,
         "mem": args.mem,
-        "run_inner_make_parameters": {"MODE": "release", "PERF_COUNTERS": "0"},
+        "block_io_mode": args.block_io_mode,
+        "perf_counters": args.perf_counters,
+        "run_inner_make_parameters": {
+            "MODE": "release",
+            "BLOCK_IO_MODE": args.block_io_mode,
+            "PERF_COUNTERS": str(args.perf_counters),
+        },
         "kernel_elf_provenance": {
             "built_by_runner": False,
-            "build_configuration_verified_by_runner": False,
+            "runtime_feature_identity_verified": False,
+            "verification_scope": (
+                "runtime BLOCK_IO_MODE/PERF_COUNTERS identity only; "
+                "the runner does not build the kernel ELF"
+            ),
         },
         "warmups": args.warmups,
         "measured_samples": args.samples,
@@ -985,6 +1470,8 @@ def run_cell(args: argparse.Namespace) -> int:
                 architecture=architecture,
                 smp=args.smp,
                 mem=args.mem,
+                block_io_mode=args.block_io_mode,
+                perf_counters=args.perf_counters,
                 kernel=kernel,
                 disk=disk,
                 timer_binary=timer_binary,
@@ -1033,7 +1520,9 @@ def run_cell(args: argparse.Namespace) -> int:
             input_metadata_after == input_metadata_before
         )
         if not manifest["input_metadata_stable"]:
-            manifest["input_metadata_error"] = "selected input metadata changed during run"
+            manifest["input_metadata_error"] = (
+                "selected input metadata changed during run"
+            )
             failure = True
         manifest["git_head_after"] = current_git_head()
         manifest["git_head_stable"] = manifest["git_head_after"] == manifest["git_head"]
@@ -1044,6 +1533,9 @@ def run_cell(args: argparse.Namespace) -> int:
         manifest["finished_at"] = utc_now()
         manifest["interrupted"] = interrupted
         final_aggregate = aggregate(samples, args.warmups, args.samples)
+        manifest["kernel_elf_provenance"]["runtime_feature_identity_verified"] = (
+            final_aggregate["all_required_samples_valid"]
+        )
         final_aggregate["run_valid"] = (
             not failure
             and controller_cleanup
@@ -1060,6 +1552,7 @@ def run_cell(args: argparse.Namespace) -> int:
         return 1
     print(
         f"G0-B cell PASS arch={args.arch} smp={args.smp} mem={args.mem} "
+        f"block_io={args.block_io_mode} perf={args.perf_counters} "
         f"median_s={final_aggregate['median_elapsed_seconds']} "
         f"goal_met={final_aggregate['goal_met']}",
         flush=True,
@@ -1067,30 +1560,132 @@ def run_cell(args: argparse.Namespace) -> int:
     return 0
 
 
-def synthetic_log(identity: dict[str, str], architecture: Architecture, smp: int, mem: str) -> str:
+def marker_identity_text(identity: dict[str, str]) -> str:
+    return " ".join(
+        f"{key}={identity[key]}"
+        for key in (
+            "run_id",
+            "arch",
+            "kind",
+            "sample",
+            "smp",
+            "mem",
+            "block_io",
+            "perf",
+        )
+    )
+
+
+def synthetic_perf_snapshot(identity: dict[str, str], point: str) -> list[str]:
+    if point not in {"before", "after"}:
+        raise BenchmarkError(f"unsupported synthetic perf point: {point!r}")
+    increment = 0 if point == "before" else 5
+    lines: list[str] = []
+    for ordinal, key in enumerate(PERF_REQUIRED_KEYS, start=1):
+        if key in {
+            "perf_counters_enabled",
+            "kperf_timing_enabled",
+            "kperf_syscall_timing_enabled",
+        }:
+            value = 1
+        elif key == "block_io_nonblocking_requested":
+            value = 1 if identity["block_io"] == "auto" else 0
+        elif point == "after" and (
+            (
+                identity["block_io"] == "auto"
+                and key in {"block_io_sync_read_submits", "block_io_sync_write_submits"}
+            )
+            or (
+                identity["block_io"] == "force-sync"
+                and key
+                in {
+                    "block_io_nb_read_submits",
+                    "block_io_nb_write_submits",
+                    "block_io_nb_read_waits",
+                    "block_io_nb_write_waits",
+                    "block_io_nb_read_completions",
+                    "block_io_nb_write_completions",
+                }
+            )
+        ):
+            value = ordinal
+        else:
+            value = ordinal + increment
+        lines.append(f"{key} {value}")
+        if key == "kperf_syscall_timing_enabled":
+            lines.extend(
+                [
+                    f"profile_syscall_17_calls {1 + increment}",
+                    f"profile_syscall_17_total_ticks {100 + increment}",
+                    f"profile_syscall_17_total_us {10 + increment}",
+                    f"profile_syscall_17_avg_ns {1000 + increment}",
+                    f"profile_syscall_17_max_us {2 + increment}",
+                ]
+            )
+            if point == "after":
+                lines.extend(
+                    [
+                        "profile_syscall_63_calls 1",
+                        "profile_syscall_63_total_ticks 10",
+                        "profile_syscall_63_total_us 1",
+                        "profile_syscall_63_avg_ns 100",
+                        "profile_syscall_63_max_us 1",
+                    ]
+                )
+    return lines
+
+
+def synthetic_log(
+    identity: dict[str, str], architecture: Architecture, smp: int, mem: str
+) -> str:
     mask = (1 << smp) - 1
     leader = 1 if smp > 1 else 0
     requested = mask & ~(1 << leader)
-    return "\n".join(
+    nonblocking = "true" if identity["block_io"] == "auto" else "false"
+    perf_counters = "true" if identity["perf"] == "1" else "false"
+    identity_text = marker_identity_text(identity)
+    lines = [
+        (
+            "board config: clock_freq=10000000, "
+            f"memory_end={expected_memory_end(architecture.name, mem):#x}, "
+            "uart=0x0, plic=0x0"
+        ),
+        (
+            f"cpu topology: possible={smp} online=1 possible_mask={mask:#x} "
+            "online_mask=0x1 boot_logical=0 boot_hw_id=0 hw_ids=[]"
+        ),
+        "smp invariants: boot_entries=1 global_init_entries=1",
+        f"smp schedulers: active_mask={mask:#x} count={smp}",
+        (
+            f"[ INFO] KERN: block io policy mode={identity['block_io']} irq_ready=true "
+            f"nonblocking={nonblocking} perf_counters={perf_counters}"
+        ),
+        f"G0_RUST_HELLO_START {identity_text}",
+    ]
+    if identity["perf"] == "1":
+        for point in ("before", "after"):
+            lines.append(f"G0_RUST_HELLO_PERF_BEGIN {identity_text} point={point}")
+            lines.extend(synthetic_perf_snapshot(identity, point))
+            lines.append(f"G0_RUST_HELLO_PERF_END {identity_text} point={point}")
+    lines.extend(
         [
-            f"board config: clock_freq=10000000, memory_end={expected_memory_end(architecture.name, mem):#x}, uart=0x0, plic=0x0",
-            f"cpu topology: possible={smp} online=1 possible_mask={mask:#x} online_mask=0x1 boot_logical=0 boot_hw_id=0 hw_ids=[]",
-            "smp invariants: boot_entries=1 global_init_entries=1",
-            f"smp schedulers: active_mask={mask:#x} count={smp}",
-            "G0_RUST_HELLO_START "
-            + " ".join(f"{key}={identity[key]}" for key in ("run_id", "arch", "kind", "sample", "smp", "mem")),
-            "G0_RUST_HELLO_RESULT "
-            + " ".join(f"{key}={identity[key]}" for key in ("run_id", "arch", "kind", "sample", "smp", "mem"))
-            + f" uname={architecture.uname} nproc={smp} cargo_version=1.0.0 rustc_version=1.0.0"
-            " tmp_mount=1 tmp_writable=1 elapsed_ns=900000000 timer_exited=1"
-            " timer_exit_code=0 timer_signaled=0 timer_signal=0 timer_rc=0"
-            " uptime_before=10.00 uptime_after=10.90 lock_created=1"
-            " artifact_bytes=100 output_bytes=14 output_ok=1 ok=1",
-            "G0_RUST_HELLO_PASS "
-            + " ".join(f"{key}={identity[key]}" for key in ("run_id", "arch", "kind", "sample", "smp", "mem")),
-            f"smp shutdown: leader={leader} requested={requested:#x} stopped={requested:#x} missing=0x0 failure=false",
+            (
+                f"G0_RUST_HELLO_RESULT {identity_text} "
+                f"uname={architecture.uname} nproc={smp} "
+                "cargo_version=1.0.0 rustc_version=1.0.0 "
+                "tmp_mount=1 tmp_writable=1 elapsed_ns=900000000 timer_exited=1 "
+                "timer_exit_code=0 timer_signaled=0 timer_signal=0 timer_rc=0 "
+                "uptime_before=10.00 uptime_after=10.90 lock_created=1 "
+                "artifact_bytes=100 output_bytes=14 output_ok=1 ok=1"
+            ),
+            f"G0_RUST_HELLO_PASS {identity_text}",
+            (
+                f"smp shutdown: leader={leader} requested={requested:#x} "
+                f"stopped={requested:#x} missing=0x0 failure=false"
+            ),
         ]
-    ) + "\n"
+    )
+    return "\n".join(lines) + "\n"
 
 
 def self_test() -> int:
@@ -1102,8 +1697,15 @@ def self_test() -> int:
         "sample": "1",
         "smp": "8",
         "mem": "8G",
+        "block_io": "auto",
+        "perf": "0",
     }
     render_guest(identity)
+    expected_launcher = (
+        "#!/musl/busybox sh\nexec /musl/busybox ash /x1/g0-rust-hello.sh || exit 127\n"
+    )
+    if render_guest_launcher() != expected_launcher:
+        raise BenchmarkError("guest ash launcher does not match the frozen handoff")
     try:
         render_guest({**identity, "run_id": "bad'\nG0_RUST_HELLO_PASS"})
     except BenchmarkError:
@@ -1114,10 +1716,18 @@ def self_test() -> int:
     parsed, errors = validate_guest_log(
         good, identity=identity, architecture=architecture, smp=8, mem="8G"
     )
-    if errors or parsed.get("elapsed_ns") != "900000000":
+    if (
+        errors
+        or parsed.get("elapsed_ns") != "900000000"
+        or parsed.get("perf_snapshots") is not None
+        or parsed.get("block_io_policy", {}).get("mode") != "auto"
+    ):
         raise BenchmarkError(f"positive synthetic log failed: {errors}")
+    pass_line = next(
+        line for line in good.splitlines() if line.startswith("G0_RUST_HELLO_PASS ")
+    )
     _, errors = validate_guest_log(
-        good + good.splitlines()[6] + "\n",
+        good + pass_line + "\n",
         identity=identity,
         architecture=architecture,
         smp=8,
@@ -1131,12 +1741,196 @@ def self_test() -> int:
     )
     if not any("malformed" in error for error in errors):
         raise BenchmarkError("malformed marker was accepted")
+    shell_error = good.replace(
+        "G0_RUST_HELLO_START ",
+        "ash: waitpid: Interrupted system call\nG0_RUST_HELLO_START ",
+        1,
+    )
+    _, errors = validate_guest_log(
+        shell_error, identity=identity, architecture=architecture, smp=8, mem="8G"
+    )
+    if not any("forbidden guest shell diagnostic" in error for error in errors):
+        raise BenchmarkError("forbidden shell diagnostic was accepted")
     bad_clock = good.replace("uptime_after=10.90", "uptime_after=19.90")
     _, errors = validate_guest_log(
         bad_clock, identity=identity, architecture=architecture, smp=8, mem="8G"
     )
     if not any("disagreement" in error for error in errors):
         raise BenchmarkError("timer/uptime mismatch was accepted")
+
+    force_sync_identity = {**identity, "block_io": "force-sync"}
+    force_sync = synthetic_log(force_sync_identity, architecture, 8, "8G")
+    parsed, errors = validate_guest_log(
+        force_sync,
+        identity=force_sync_identity,
+        architecture=architecture,
+        smp=8,
+        mem="8G",
+    )
+    if errors or parsed["block_io_policy"]["nonblocking"]:
+        raise BenchmarkError(f"positive force-sync synthetic log failed: {errors}")
+
+    perf_identity = {**identity, "perf": "1"}
+    perf_log = synthetic_log(perf_identity, architecture, 8, "8G")
+    parsed, errors = validate_guest_log(
+        perf_log,
+        identity=perf_identity,
+        architecture=architecture,
+        smp=8,
+        mem="8G",
+    )
+    perf_snapshots = parsed.get("perf_snapshots") or {}
+    if (
+        errors
+        or perf_snapshots.get("selected_deltas", {}).get(
+            "block_cache_device_read_submit"
+        )
+        != 5
+        or perf_snapshots.get("after", {}).get("syscall_ids") != [17, 63]
+    ):
+        raise BenchmarkError(f"positive perf synthetic log failed: {errors}")
+
+    perf_before = perf_snapshots["before"]
+    perf_after = perf_snapshots["after"]
+    no_auto_nb_read = {
+        **perf_after,
+        "values": {
+            **perf_after["values"],
+            "block_io_nb_read_submits": perf_before["values"][
+                "block_io_nb_read_submits"
+            ],
+        },
+    }
+    _, errors = validate_perf_snapshot_pair(
+        perf_before, no_auto_nb_read, block_io_mode="auto"
+    )
+    if not any(
+        "auto mode requires block_io_nb_read_submits" in error for error in errors
+    ):
+        raise BenchmarkError("auto mode accepted zero nonblocking read submits")
+
+    mismatched_auto_read = {
+        **perf_after,
+        "values": {
+            **perf_after["values"],
+            "block_io_nb_read_waits": perf_after["values"]["block_io_nb_read_waits"]
+            - 1,
+        },
+    }
+    _, errors = validate_perf_snapshot_pair(
+        perf_before, mismatched_auto_read, block_io_mode="auto"
+    )
+    if not any("auto read nonblocking lifecycle mismatch" in error for error in errors):
+        raise BenchmarkError("auto mode accepted mismatched read lifecycle counters")
+
+    force_perf_identity = {**perf_identity, "block_io": "force-sync"}
+    force_perf_log = synthetic_log(force_perf_identity, architecture, 8, "8G")
+    force_parsed, errors = validate_guest_log(
+        force_perf_log,
+        identity=force_perf_identity,
+        architecture=architecture,
+        smp=8,
+        mem="8G",
+    )
+    if errors:
+        raise BenchmarkError(f"positive force-sync perf log failed: {errors}")
+    force_snapshots = force_parsed["perf_snapshots"]
+    force_before = force_snapshots["before"]
+    force_after = force_snapshots["after"]
+
+    force_with_nb_wait = {
+        **force_after,
+        "values": {
+            **force_after["values"],
+            "block_io_nb_read_waits": force_before["values"]["block_io_nb_read_waits"]
+            + 1,
+        },
+    }
+    _, errors = validate_perf_snapshot_pair(
+        force_before, force_with_nb_wait, block_io_mode="force-sync"
+    )
+    if not any("requires zero nonblocking lifecycle" in error for error in errors):
+        raise BenchmarkError("force-sync mode accepted a nonblocking lifecycle delta")
+
+    force_without_sync_read = {
+        **force_after,
+        "values": {
+            **force_after["values"],
+            "block_io_sync_read_submits": force_before["values"][
+                "block_io_sync_read_submits"
+            ],
+        },
+    }
+    _, errors = validate_perf_snapshot_pair(
+        force_before, force_without_sync_read, block_io_mode="force-sync"
+    )
+    if not any("requires block_io_sync_read_submits" in error for error in errors):
+        raise BenchmarkError("force-sync mode accepted zero synchronous read submits")
+
+    bad_policy = good.replace("mode=auto", "mode=force-sync", 1)
+    _, errors = validate_guest_log(
+        bad_policy,
+        identity=identity,
+        architecture=architecture,
+        smp=8,
+        mem="8G",
+    )
+    if not any("policy block_io mismatch" in error for error in errors):
+        raise BenchmarkError("mismatched block IO policy was accepted")
+
+    duplicate_policy_line = next(
+        line for line in good.splitlines() if "KERN: block io policy " in line
+    )
+    duplicate_policy = good + duplicate_policy_line + "\n"
+    _, errors = validate_guest_log(
+        duplicate_policy,
+        identity=identity,
+        architecture=architecture,
+        smp=8,
+        mem="8G",
+    )
+    if not any("policy marker, found 2" in error for error in errors):
+        raise BenchmarkError("duplicate block IO policy was accepted")
+
+    perf0_snapshot_marker = (
+        f"G0_RUST_HELLO_PERF_BEGIN {marker_identity_text(identity)} point=before\n"
+    )
+    perf0_with_snapshot = good.replace(
+        "G0_RUST_HELLO_RESULT ", perf0_snapshot_marker + "G0_RUST_HELLO_RESULT ", 1
+    )
+    _, errors = validate_guest_log(
+        perf0_with_snapshot,
+        identity=identity,
+        architecture=architecture,
+        smp=8,
+        mem="8G",
+    )
+    if not any("perf=0 guest emitted" in error for error in errors):
+        raise BenchmarkError("perf=0 snapshot marker was accepted")
+
+    malformed_snapshot = perf_log.replace(
+        "scheduler_fetch_calls 2", "scheduler_fetch_calls not-an-integer", 1
+    )
+    _, errors = validate_guest_log(
+        malformed_snapshot,
+        identity=perf_identity,
+        architecture=architecture,
+        smp=8,
+        mem="8G",
+    )
+    if not any("malformed line" in error for error in errors):
+        raise BenchmarkError("malformed perf counter was accepted")
+
+    wrong_perf_policy = perf_log.replace("perf_counters=true", "perf_counters=false", 1)
+    _, errors = validate_guest_log(
+        wrong_perf_policy,
+        identity=perf_identity,
+        architecture=architecture,
+        smp=8,
+        mem="8G",
+    )
+    if not any("policy perf_counters mismatch" in error for error in errors):
+        raise BenchmarkError("mismatched perf policy was accepted")
     with tempfile.TemporaryDirectory(prefix="whusp-g0b-selftest-") as directory:
         root = Path(directory)
         overlay = root / "whusp-qemu.abcdef"
@@ -1147,7 +1941,7 @@ def self_test() -> int:
         _, errors = validate_overlay_log(overlay_log, root)
         if errors:
             raise BenchmarkError(f"positive overlay markers failed: {errors}")
-    print("G0-B synthetic self-test PASS")
+    print("IO0-A synthetic self-test PASS")
     return 0
 
 
@@ -1162,6 +1956,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arch", choices=("rv", "la"))
     parser.add_argument("--smp", type=int, default=8)
     parser.add_argument("--mem", default="8G")
+    parser.add_argument(
+        "--block-io-mode", choices=("auto", "force-sync"), default="auto"
+    )
+    parser.add_argument("--perf-counters", type=int, choices=(0, 1), default=0)
     parser.add_argument("--kernel-elf", type=Path)
     parser.add_argument("--test-disk", type=Path)
     parser.add_argument("--output-dir", type=Path)

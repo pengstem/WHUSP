@@ -129,7 +129,22 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     // the active architecture has wired device IRQ completion. The driver still
     // falls back to sync I/O when a read happens from an unsafe context such as
     // interrupt-disabled lazy fault-in.
-    *DEV_NON_BLOCKING_ACCESS.exclusive_access() = board::block_irq_available();
+    let block_irq_ready = board::block_irq_available();
+    let block_io_force_sync = cfg!(feature = "block-io-force-sync");
+    let block_io_nonblocking = block_irq_ready && !block_io_force_sync;
+    let perf_counters = cfg!(feature = "perf-counters");
+    *DEV_NON_BLOCKING_ACCESS.exclusive_access() = block_io_nonblocking;
+    info!(
+        "KERN: block io policy mode={} irq_ready={} nonblocking={} perf_counters={}",
+        if block_io_force_sync {
+            "force-sync"
+        } else {
+            "auto"
+        },
+        block_irq_ready,
+        block_io_nonblocking,
+        perf_counters,
+    );
     task::run_tasks()
 }
 
