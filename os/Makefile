@@ -29,6 +29,7 @@ TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 KERNEL_ELF := $(TARGET_DIR)/$(TARGET)/$(MODE)/os
 PRIMARY_DISK ?= $(DEFAULT_DISK)
 AUX_DISK ?=
+QEMU_OVERLAY_ROOT ?= /tmp
 COMMA := ,
 ifeq ($(ARCH),riscv64)
 QEMU_SYSTEM := qemu-system-riscv64
@@ -76,22 +77,50 @@ run-inner: check-smp
 		echo "qemu-img is required to create temporary disk overlays"; \
 		exit 1; \
 	fi; \
-	if [ ! -d /tmp ] || [ ! -w /tmp ]; then \
-		echo "/tmp must be a writable directory"; \
+	if [ -z "$(QEMU_OVERLAY_ROOT)" ] || [ ! -d "$(QEMU_OVERLAY_ROOT)" ] || \
+		[ ! -w "$(QEMU_OVERLAY_ROOT)" ] || [ ! -x "$(QEMU_OVERLAY_ROOT)" ]; then \
+		echo "QEMU_OVERLAY_ROOT must be a writable, searchable directory: $(QEMU_OVERLAY_ROOT)"; \
 		exit 1; \
 	fi; \
-	overlay_dir=$$(mktemp -d "/tmp/whusp-qemu.XXXXXX"); \
-	primary_overlay="$$overlay_dir/x0.qcow2"; \
+	if ! overlay_root=$$(realpath -- "$(QEMU_OVERLAY_ROOT)"); then \
+		echo "failed to resolve QEMU_OVERLAY_ROOT: $(QEMU_OVERLAY_ROOT)"; \
+		exit 1; \
+	fi; \
+	if [ ! -d "$$overlay_root" ] || [ ! -w "$$overlay_root" ] || [ ! -x "$$overlay_root" ]; then \
+		echo "resolved QEMU_OVERLAY_ROOT must be a writable, searchable directory: $$overlay_root"; \
+		exit 1; \
+	fi; \
+	overlay_dir=""; \
+	primary_overlay=""; \
 	aux_overlay=""; \
 	cleanup() { \
 		status=$$?; \
 		trap - 0 1 2 15; \
-		rm -f -- "$$primary_overlay"; \
-		if [ -n "$$aux_overlay" ]; then rm -f -- "$$aux_overlay"; fi; \
-		rmdir -- "$$overlay_dir"; \
+		if [ -n "$$overlay_dir" ]; then \
+			cleanup_ok=1; \
+			if [ -n "$$primary_overlay" ]; then \
+				rm -f -- "$$primary_overlay" || cleanup_ok=0; \
+			fi; \
+			if [ -n "$$aux_overlay" ]; then \
+				rm -f -- "$$aux_overlay" || cleanup_ok=0; \
+			fi; \
+			rmdir -- "$$overlay_dir" || cleanup_ok=0; \
+			if [ "$$cleanup_ok" -eq 1 ]; then \
+				printf 'WHUSP_QEMU_OVERLAY state=cleaned path=%s\n' "$$overlay_dir"; \
+			else \
+				echo "failed to remove QEMU overlay directory: $$overlay_dir" >&2; \
+				if [ "$$status" -eq 0 ]; then status=1; fi; \
+			fi; \
+		fi; \
 		exit $$status; \
 	}; \
-	trap cleanup 0 1 2 15; \
+	trap cleanup 0; \
+	trap 'exit 129' 1; \
+	trap 'exit 130' 2; \
+	trap 'exit 143' 15; \
+	overlay_dir=$$(mktemp -d "$$overlay_root/whusp-qemu.XXXXXX"); \
+	printf 'WHUSP_QEMU_OVERLAY state=created path=%s\n' "$$overlay_dir"; \
+	primary_overlay="$$overlay_dir/x0.qcow2"; \
 	primary_base=$$(realpath -- "$(PRIMARY_DISK)"); \
 	qemu-img create -q -f qcow2 -o "backing_file=$$primary_base,backing_fmt=raw" "$$primary_overlay"; \
 	if [ -n "$(AUX_DISK)" ]; then \
