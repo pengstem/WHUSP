@@ -82,10 +82,6 @@ oskernel2026-whusp/
 - **Test disk images** — download from [oscomp/testsuits-for-oskernel releases](https://github.com/oscomp/testsuits-for-oskernel/releases):
   - `sdcard-rv.img` (RISC-V, ~4 GiB)
   - `sdcard-la.img` (LoongArch, ~4 GiB)
-- *(Optional)* **Docker** image [`zhouzhouyi/os-contest:20260104`](https://hub.docker.com/r/zhouzhouyi/os-contest) for the official contest environment:
-  ```bash
-  docker run -it --rm -v $(pwd):/code zhouzhouyi/os-contest:20260104 bash
-  ```
 
 ### Build
 
@@ -97,6 +93,7 @@ make clean        # Remove all build artifacts
 ```
 
 Offline / vendored build (no network access):
+
 ```bash
 CARGO_NET_OFFLINE=true make all
 ```

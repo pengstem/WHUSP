@@ -82,10 +82,6 @@ oskernel2026-whusp/
 - **测试磁盘镜像** — 从 [oscomp/testsuits-for-oskernel releases](https://github.com/oscomp/testsuits-for-oskernel/releases) 下载：
   - `sdcard-rv.img`（RISC-V，约 4 GiB）
   - `sdcard-la.img`（LoongArch，约 4 GiB）
-- *（可选）* **Docker** 镜像 [`zhouzhouyi/os-contest:20260104`](https://hub.docker.com/r/zhouzhouyi/os-contest)，用于官方比赛环境：
-  ```bash
-  docker run -it --rm -v $(pwd):/code zhouzhouyi/os-contest:20260104 bash
-  ```
 
 ### 构建
 
@@ -97,6 +93,7 @@ make clean        # 清理所有构建产物
 ```
 
 离线 / 本地镜像构建（无需网络）：
+
 ```bash
 CARGO_NET_OFFLINE=true make all
 ```
