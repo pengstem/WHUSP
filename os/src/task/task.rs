@@ -12,6 +12,8 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::ptr;
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 pub const DEFAULT_TIMER_SLACK_NS: usize = 50_000;
 pub(crate) const SCHED_RR_INTERVAL_US: usize = 100_000;
@@ -46,8 +48,34 @@ pub struct TaskControlBlock {
     // immutable
     pub process: Weak<ProcessControlBlock>,
     pub kstack: KernelStack,
+    // Scheduler-owned hot data that must remain reachable without taking the
+    // broad task inner lock.
+    sched: TaskSched,
     // mutable
     pub inner: UPIntrFreeCell<TaskControlBlockInner>,
+}
+
+#[repr(C, align(64))]
+struct TaskSched {
+    remote_wake: TaskWakeNode,
+}
+
+struct TaskWakeNode {
+    next: AtomicPtr<TaskControlBlock>,
+    front: AtomicBool,
+    linked: AtomicBool,
+}
+
+impl TaskSched {
+    const fn new() -> Self {
+        Self {
+            remote_wake: TaskWakeNode {
+                next: AtomicPtr::new(ptr::null_mut()),
+                front: AtomicBool::new(false),
+                linked: AtomicBool::new(false),
+            },
+        }
+    }
 }
 
 pub struct TaskControlBlockInner {
@@ -156,6 +184,7 @@ impl TaskControlBlock {
         Self {
             process: Arc::downgrade(&process),
             kstack,
+            sched: TaskSched::new(),
             inner: unsafe {
                 UPIntrFreeCell::new(TaskControlBlockInner {
                     res: Some(res),
@@ -211,6 +240,66 @@ impl TaskControlBlock {
 
     pub fn inner_exclusive_access(&self) -> UPIntrRefMut<'_, TaskControlBlockInner> {
         self.inner.exclusive_access()
+    }
+
+    /// Claims this task's embedded remote-wake node before list publication.
+    ///
+    /// The task state machine permits at most one remote-list reference for a
+    /// task. Keep the atomic membership bit as a fail-stop guard so a future
+    /// regression cannot overwrite `next` and lose an Arc raw reference.
+    pub(crate) fn claim_remote_wake_node(&self, front: bool) {
+        assert!(
+            self.sched
+                .remote_wake
+                .linked
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "task already owns a linked remote-wake node"
+        );
+        self.sched.remote_wake.front.store(front, Ordering::Relaxed);
+        self.sched
+            .remote_wake
+            .next
+            .store(ptr::null_mut(), Ordering::Relaxed);
+    }
+
+    /// Updates the link while the node is producer-private or belongs to the
+    /// target CPU's detached list.
+    pub(crate) fn set_remote_wake_next(&self, next: *mut TaskControlBlock) {
+        assert!(
+            self.sched.remote_wake.linked.load(Ordering::Relaxed),
+            "unlinked task cannot carry a remote-wake next pointer"
+        );
+        self.sched.remote_wake.next.store(next, Ordering::Relaxed);
+    }
+
+    pub(crate) fn remote_wake_next(&self) -> *mut TaskControlBlock {
+        assert!(
+            self.sched.remote_wake.linked.load(Ordering::Relaxed),
+            "unlinked task cannot be traversed as a remote-wake node"
+        );
+        self.sched.remote_wake.next.load(Ordering::Relaxed)
+    }
+
+    /// Returns the detached node payload and makes the embedded node reusable.
+    /// The caller must own the target CPU's detached list and reconstruct the
+    /// list's Arc strong reference exactly once after this call.
+    pub(crate) fn release_remote_wake_node(&self) -> (*mut TaskControlBlock, bool) {
+        assert!(
+            self.sched.remote_wake.linked.load(Ordering::Relaxed),
+            "remote-wake consumer observed an unlinked task"
+        );
+        let next = self
+            .sched
+            .remote_wake
+            .next
+            .swap(ptr::null_mut(), Ordering::Relaxed);
+        let front = self.sched.remote_wake.front.swap(false, Ordering::Relaxed);
+        self.sched
+            .remote_wake
+            .linked
+            .store(false, Ordering::Release);
+        (next, front)
     }
 
     pub(crate) fn is_smp_sched_probe_active(&self) -> bool {

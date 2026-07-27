@@ -4,7 +4,6 @@ use super::{
 use crate::config::MAX_CPUS;
 use crate::perf;
 use crate::sync::{SpinNoIrqLock, UPIntrFreeCell};
-use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -42,22 +41,16 @@ enum RemoteEnqueueResult {
     Retarget(Arc<TaskControlBlock>, bool),
 }
 
-struct RemoteWakeNode {
-    next: *mut RemoteWakeNode,
-    task: Arc<TaskControlBlock>,
-    front: bool,
-}
-
 /// Multi-producer, single-consumer handoff for one target CPU.
 ///
-/// Producers publish fully initialized nodes with Release ordering. Only the
-/// target CPU detaches nodes, using Acquire ordering before reading node data.
-/// CONTEXT: Nodes allocate until Phase 3 embeds an intrusive wake node in the
-/// scheduler-owned task data. The handoff itself is lock-free and keeps remote
+/// Each pointer is both the task allocation and its embedded intrusive node.
+/// `Arc::into_raw` transfers one strong reference to the list; the target CPU
+/// detaches nodes with Acquire ordering and restores each reference exactly
+/// once with `Arc::from_raw`. The handoff is allocation-free and keeps remote
 /// producers away from the target run-queue lock.
 #[repr(C, align(64))]
 struct RemoteWakeList {
-    head: AtomicPtr<RemoteWakeNode>,
+    head: AtomicPtr<TaskControlBlock>,
 }
 
 impl RemoteWakeList {
@@ -68,22 +61,22 @@ impl RemoteWakeList {
     }
 
     fn push(&self, task: Arc<TaskControlBlock>, front: bool) {
-        let node = Box::into_raw(Box::new(RemoteWakeNode {
-            next: ptr::null_mut(),
-            task,
-            front,
-        }));
+        task.claim_remote_wake_node(front);
+        let task_ptr = Arc::into_raw(task) as *mut TaskControlBlock;
         let mut head = self.head.load(Ordering::Relaxed);
         loop {
-            // SAFETY: `node` is private to this producer until the Release CAS
-            // succeeds. A failed CAS leaves ownership with this producer.
+            // SAFETY: the membership claim makes this embedded node private to
+            // the producer until the Release CAS publishes it. `Arc::into_raw`
+            // keeps the TCB allocation alive across every CAS retry.
             unsafe {
-                (*node).next = head;
+                (*task_ptr).set_remote_wake_next(head);
             }
-            match self
-                .head
-                .compare_exchange_weak(head, node, Ordering::Release, Ordering::Relaxed)
-            {
+            match self.head.compare_exchange_weak(
+                head,
+                task_ptr,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => return,
                 Err(observed) => head = observed,
             }
@@ -94,16 +87,16 @@ impl RemoteWakeList {
         self.head.load(Ordering::Acquire).is_null()
     }
 
-    fn take_fifo(&self) -> *mut RemoteWakeNode {
+    fn take_fifo(&self) -> *mut TaskControlBlock {
         let mut current = self.head.swap(ptr::null_mut(), Ordering::AcqRel);
         let mut reversed = ptr::null_mut();
         while !current.is_null() {
             // SAFETY: the AcqRel swap detached this entire chain from every
             // producer. The target CPU is its only consumer and may reverse
             // the private `next` links in place.
-            let next = unsafe { (*current).next };
+            let next = unsafe { (*current).remote_wake_next() };
             unsafe {
-                (*current).next = reversed;
+                (*current).set_remote_wake_next(reversed);
             }
             reversed = current;
             current = next;
@@ -884,24 +877,31 @@ fn drain_remote_wakes(cpu: crate::cpu::CpuId) {
         return;
     }
 
-    let mut entries = Vec::new();
-    while !node.is_null() {
-        // SAFETY: `take_fifo()` detached and reversed the list for this sole
-        // target-CPU consumer. Rebuilding the Box transfers each node back to
-        // allocator ownership exactly once.
-        let boxed = unsafe { Box::from_raw(node) };
-        node = boxed.next;
-        entries.push((boxed.task, boxed.front));
+    // Count without consuming the detached chain so all potentially deferred
+    // storage is allocated before the run-queue lock is acquired.
+    let mut cursor = node;
+    let mut task_count = 0usize;
+    while !cursor.is_null() {
+        task_count += 1;
+        // SAFETY: `take_fifo()` detached the chain for this target CPU, and the
+        // list's raw Arc reference keeps every pointed-to TCB alive.
+        cursor = unsafe { (*cursor).remote_wake_next() };
     }
-    let task_count = entries.len();
-    let mut deferred_drops = Vec::with_capacity(task_count);
-    let mut retarget = Vec::with_capacity(task_count);
+    // One batch-sized scratch allocation keeps uncommon stale/retarget Arc
+    // destruction and recursive placement outside the rq lock. Normal entries
+    // no longer require a separately allocated staging node or vector entry.
+    let mut deferred = Vec::with_capacity(task_count);
     with_run_queue(cpu, |manager| {
-        for (task, front) in entries {
+        while !node.is_null() {
+            // SAFETY: this target CPU exclusively owns the detached chain.
+            // Release the embedded membership before rebuilding exactly the
+            // one Arc strong reference transferred by `RemoteWakeList::push`.
+            let (next, front) = unsafe { (*node).release_remote_wake_node() };
+            let task = unsafe { Arc::from_raw(node as *const TaskControlBlock) };
+            node = next;
             match manager.add_remote(task, front) {
                 RemoteEnqueueResult::Enqueued => {}
-                RemoteEnqueueResult::Stale(task) => deferred_drops.push(task),
-                RemoteEnqueueResult::Retarget(task, front) => retarget.push((task, front)),
+                outcome => deferred.push(outcome),
             }
         }
     });
@@ -910,9 +910,12 @@ fn drain_remote_wakes(cpu: crate::cpu::CpuId) {
     // Arc destruction and recursive retarget placement stay outside the rq
     // lock. A resumed stopped task may already own a normal rq reference, in
     // which case dropping the stale wake-list reference is the only action.
-    drop(deferred_drops);
-    for (task, front) in retarget {
-        enqueue_woken_task(task, front);
+    for outcome in deferred {
+        match outcome {
+            RemoteEnqueueResult::Enqueued => unreachable!(),
+            RemoteEnqueueResult::Stale(task) => drop(task),
+            RemoteEnqueueResult::Retarget(task, front) => enqueue_woken_task(task, front),
+        }
     }
 }
 
