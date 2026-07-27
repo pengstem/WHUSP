@@ -1778,6 +1778,10 @@ fn oskernel_perf_content() -> String {
          frame_cache_drains {}\n\
          frame_cache_drain_pages {}\n\
          frame_cache_global_allocs {}\n\
+         frame_cache_contiguous_read_attempts {}\n\
+         frame_cache_contiguous_read_successes {}\n\
+         frame_cache_contiguous_read_pages {}\n\
+         frame_cache_contiguous_read_failures {}\n\
          page_cache_entries {}\n\
          vfs_dirty_writeback_dirty_files {}\n\
          vfs_dirty_writeback_dirty_pages {}\n\
@@ -1875,6 +1879,10 @@ fn oskernel_perf_content() -> String {
         frame_cache.drains,
         frame_cache.drain_pages,
         frame_cache.global_allocs,
+        frame_cache.contiguous_read_attempts,
+        frame_cache.contiguous_read_successes,
+        frame_cache.contiguous_read_pages,
+        frame_cache.contiguous_read_failures,
         page_cache_entries,
         dirty_writeback.dirty_files,
         dirty_writeback.dirty_pages,

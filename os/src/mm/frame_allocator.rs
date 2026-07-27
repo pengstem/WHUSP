@@ -1,5 +1,5 @@
 use super::{PhysAddr, PhysPageNum};
-use crate::config::{MAX_CPUS, memory_end};
+use crate::config::{MAX_CPUS, PAGE_SIZE, memory_end};
 use crate::perf;
 use crate::sync::{SpinNoIrqLock, UPIntrFreeCell};
 use alloc::vec::Vec;
@@ -26,6 +26,14 @@ static FRAME_CACHE_DRAINS: AtomicUsize = AtomicUsize::new(0);
 static FRAME_CACHE_DRAIN_PAGES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "perf-counters")]
 static FRAME_CACHE_GLOBAL_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "perf-counters")]
+static CONTIGUOUS_READ_CACHE_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "perf-counters")]
+static CONTIGUOUS_READ_CACHE_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "perf-counters")]
+static CONTIGUOUS_READ_CACHE_PAGES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "perf-counters")]
+static CONTIGUOUS_READ_CACHE_FAILURES: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(feature = "perf-counters")]
 #[derive(Clone, Copy, Debug, Default)]
@@ -37,10 +45,46 @@ pub(crate) struct FrameCacheStats {
     pub(crate) drains: usize,
     pub(crate) drain_pages: usize,
     pub(crate) global_allocs: usize,
+    pub(crate) contiguous_read_attempts: usize,
+    pub(crate) contiguous_read_successes: usize,
+    pub(crate) contiguous_read_pages: usize,
+    pub(crate) contiguous_read_failures: usize,
 }
 
 pub struct FrameTracker {
     pub ppn: PhysPageNum,
+}
+
+/// An ascending, physically adjacent run of exclusively owned frames.
+///
+/// The run is allocated only from the fresh bump range, so recycled or
+/// per-CPU cached pages cannot create a false-contiguous result.
+pub(crate) struct ContiguousFrameRun {
+    frames: Vec<FrameTracker>,
+}
+
+impl ContiguousFrameRun {
+    pub(crate) fn as_mut_bytes(&mut self) -> &mut [u8] {
+        let byte_len = self
+            .frames
+            .len()
+            .checked_mul(PAGE_SIZE)
+            .expect("contiguous frame run byte length overflow");
+        let first = self
+            .frames
+            .first_mut()
+            .expect("contiguous frame run must not be empty");
+        let start = first.ppn.get_bytes_array().as_mut_ptr();
+        // SAFETY: construction below accepts only a non-empty ascending run
+        // of adjacent physical pages. Both supported architectures map that
+        // physical range linearly into the kernel direct map. `&mut self`
+        // proves exclusive access to every owned frame for the slice lifetime.
+        unsafe { core::slice::from_raw_parts_mut(start, byte_len) }
+    }
+
+    pub(crate) fn into_frames(self) -> Vec<FrameTracker> {
+        self.frames
+    }
 }
 
 impl FrameTracker {
@@ -310,6 +354,26 @@ pub fn frame_alloc_more(num: usize) -> Option<Vec<FrameTracker>> {
     Some(pages.into_iter().map(FrameTracker::new_zeroed).collect())
 }
 
+/// Allocates uninitialized cache-owned frames as one fresh contiguous run.
+pub(crate) fn frame_alloc_contiguous_uninit(pages: usize) -> Option<ContiguousFrameRun> {
+    let Some(mut ppns) = FRAME_ALLOCATOR.exclusive_access().alloc_more(pages) else {
+        record_contiguous_read_cache_alloc(false, 0);
+        return None;
+    };
+    ppns.reverse();
+    assert_eq!(ppns.len(), pages);
+    assert!(
+        ppns.windows(2).all(|pair| pair[1].0 == pair[0].0 + 1),
+        "fresh contiguous frame run is not ascending and adjacent"
+    );
+    for ppn in ppns.iter().copied() {
+        FRAME_REF_COUNTS.claim_free(ppn);
+    }
+    let frames = ppns.into_iter().map(FrameTracker::new_uninit).collect();
+    record_contiguous_read_cache_alloc(true, pages);
+    Some(ContiguousFrameRun { frames })
+}
+
 pub fn frame_dealloc(ppn: PhysPageNum) {
     if !FRAME_REF_COUNTS.release(ppn) {
         perf::record_frame_dealloc(false, true, 0, 0);
@@ -443,6 +507,20 @@ fn record_frame_cache_global_alloc() {
 fn record_frame_cache_global_alloc() {}
 
 #[cfg(feature = "perf-counters")]
+fn record_contiguous_read_cache_alloc(success: bool, pages: usize) {
+    CONTIGUOUS_READ_CACHE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    if success {
+        CONTIGUOUS_READ_CACHE_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+        CONTIGUOUS_READ_CACHE_PAGES.fetch_add(pages, Ordering::Relaxed);
+    } else {
+        CONTIGUOUS_READ_CACHE_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(feature = "perf-counters"))]
+fn record_contiguous_read_cache_alloc(_success: bool, _pages: usize) {}
+
+#[cfg(feature = "perf-counters")]
 pub(crate) fn frame_cache_stats() -> FrameCacheStats {
     FrameCacheStats {
         hits: FRAME_CACHE_HITS.load(Ordering::Relaxed),
@@ -452,5 +530,9 @@ pub(crate) fn frame_cache_stats() -> FrameCacheStats {
         drains: FRAME_CACHE_DRAINS.load(Ordering::Relaxed),
         drain_pages: FRAME_CACHE_DRAIN_PAGES.load(Ordering::Relaxed),
         global_allocs: FRAME_CACHE_GLOBAL_ALLOCS.load(Ordering::Relaxed),
+        contiguous_read_attempts: CONTIGUOUS_READ_CACHE_ATTEMPTS.load(Ordering::Relaxed),
+        contiguous_read_successes: CONTIGUOUS_READ_CACHE_SUCCESSES.load(Ordering::Relaxed),
+        contiguous_read_pages: CONTIGUOUS_READ_CACHE_PAGES.load(Ordering::Relaxed),
+        contiguous_read_failures: CONTIGUOUS_READ_CACHE_FAILURES.load(Ordering::Relaxed),
     }
 }

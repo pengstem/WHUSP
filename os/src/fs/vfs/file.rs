@@ -19,7 +19,7 @@ use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
 use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
 use crate::config::PAGE_SIZE;
 use crate::mm::{
-    UserBuffer, frame_alloc, frame_alloc_uninit,
+    UserBuffer, frame_alloc, frame_alloc_contiguous_uninit, frame_alloc_uninit,
     page_cache::{
         PAGE_CACHE, PageCacheId, PageCacheKey, PageCacheLoadGate, PageCacheMutationGuard,
         ReadCacheLoadReservation, begin_page_cache_mutation,
@@ -1829,7 +1829,12 @@ impl VfsFile {
                 ReadCacheLoadReservation::StaleGeneration => return None,
             };
             let read_limit = (readahead_pages * PAGE_SIZE).min(file_size - page_start);
-            let mut read_buf = vec![0u8; read_limit];
+            let mut frame_run = frame_alloc_contiguous_uninit(readahead_pages);
+            let mut staging = if frame_run.is_some() {
+                Vec::new()
+            } else {
+                vec![0u8; read_limit]
+            };
 
             let noatime_snapshot = self.noatime_snapshot();
             let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsReadCacheFill);
@@ -1841,16 +1846,28 @@ impl VfsFile {
             } else {
                 None
             };
+            let fill_buf = if let Some(run) = frame_run.as_mut() {
+                &mut run.as_mut_bytes()[..read_limit]
+            } else {
+                staging.as_mut_slice()
+            };
             let read_len = if let Some(read_plan) = read_plan {
-                read_plan.execute(read_buf.as_mut_slice())
+                read_plan.execute(fill_buf)
             } else {
                 with_mount(self.node.mount_id, |mount| {
-                    mount.read_at(self.node.ino, read_buf.as_mut_slice(), page_start as u64)
+                    mount.read_at(self.node.ino, fill_buf, page_start as u64)
                 })
                 .expect("filesystem mount is missing")
             };
             self.restore_noatime(noatime_snapshot);
             perf::record_vfs_read_cache_backend_read();
+            assert!(
+                read_len <= read_limit,
+                "filesystem backend read exceeded its destination"
+            );
+            if let Some(run) = frame_run.as_mut() {
+                run.as_mut_bytes()[read_len..].fill(0);
+            }
             if read_len == 0 || page_offset >= read_len {
                 PAGE_CACHE.exclusive_access().release_read_cache_load(
                     key,
@@ -1861,33 +1878,58 @@ impl VfsFile {
                 break;
             }
 
-            let mut pages_to_cache = Vec::new();
-            for page_delta in 0..readahead_pages {
-                let batch_offset = page_delta * PAGE_SIZE;
-                if batch_offset >= read_len {
-                    break;
+            let copy_len = copy_len.min(read_len - page_offset);
+            let mut pages_to_cache = Vec::with_capacity(readahead_pages);
+            if let Some(mut run) = frame_run {
+                buf[total_read_size..total_read_size + copy_len]
+                    .copy_from_slice(&run.as_mut_bytes()[page_offset..page_offset + copy_len]);
+                for (page_delta, frame) in run.into_frames().into_iter().enumerate() {
+                    let batch_offset = page_delta * PAGE_SIZE;
+                    if batch_offset >= read_len {
+                        break;
+                    }
+                    let page_file_offset = page_start + batch_offset;
+                    let page_valid_len = PAGE_SIZE.min(file_size - page_file_offset);
+                    let page_read_len = (read_len - batch_offset).min(page_valid_len);
+                    if page_read_len != page_valid_len {
+                        break;
+                    }
+                    pages_to_cache.push((
+                        PageCacheKey::for_page(id, generation, key.page_index + page_delta),
+                        frame,
+                    ));
                 }
-                let page_file_offset = page_start + batch_offset;
-                let page_valid_len = PAGE_SIZE.min(file_size - page_file_offset);
-                let page_read_len = (read_len - batch_offset).min(page_valid_len);
-                if page_read_len != page_valid_len {
-                    break;
+            } else {
+                buf[total_read_size..total_read_size + copy_len]
+                    .copy_from_slice(&staging[page_offset..page_offset + copy_len]);
+                for page_delta in 0..readahead_pages {
+                    let batch_offset = page_delta * PAGE_SIZE;
+                    if batch_offset >= read_len {
+                        break;
+                    }
+                    let page_file_offset = page_start + batch_offset;
+                    let page_valid_len = PAGE_SIZE.min(file_size - page_file_offset);
+                    let page_read_len = (read_len - batch_offset).min(page_valid_len);
+                    if page_read_len != page_valid_len {
+                        break;
+                    }
+                    let frame = if page_valid_len == PAGE_SIZE {
+                        frame_alloc_uninit()
+                    } else {
+                        let _profile_scope =
+                            perf::time_scope(perf::ProfilePoint::FrameAllocReadCache);
+                        frame_alloc()
+                    };
+                    let Some(frame) = frame else {
+                        continue;
+                    };
+                    frame.ppn.get_bytes_array()[..page_valid_len]
+                        .copy_from_slice(&staging[batch_offset..batch_offset + page_valid_len]);
+                    pages_to_cache.push((
+                        PageCacheKey::for_page(id, generation, key.page_index + page_delta),
+                        frame,
+                    ));
                 }
-                let frame = if page_valid_len == PAGE_SIZE {
-                    frame_alloc_uninit()
-                } else {
-                    let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocReadCache);
-                    frame_alloc()
-                };
-                let Some(frame) = frame else {
-                    continue;
-                };
-                frame.ppn.get_bytes_array()[..page_valid_len]
-                    .copy_from_slice(&read_buf[batch_offset..batch_offset + page_valid_len]);
-                pages_to_cache.push((
-                    PageCacheKey::for_page(id, generation, key.page_index + page_delta),
-                    frame,
-                ));
             }
 
             let prepared_pages = pages_to_cache.len();
@@ -1925,9 +1967,6 @@ impl VfsFile {
                 perf::record_vfs_read_cache_readahead(readahead_cached_pages);
             }
 
-            let copy_len = copy_len.min(read_len - page_offset);
-            buf[total_read_size..total_read_size + copy_len]
-                .copy_from_slice(&read_buf[page_offset..page_offset + copy_len]);
             total_read_size += copy_len;
             if read_len < valid_len {
                 break;

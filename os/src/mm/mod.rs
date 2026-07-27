@@ -22,6 +22,7 @@ pub(crate) use area::RetiredUserPages;
 pub use area::{MapArea, MapPermission, MapType, MmapFlush};
 pub use elf_loader::ElfLoadInfo;
 pub(crate) use elf_loader::{exec_load_stats_content, record_exec_metadata_read};
+pub(crate) use frame_allocator::frame_alloc_contiguous_uninit;
 #[cfg(feature = "perf-counters")]
 pub(crate) use frame_allocator::frame_cache_stats;
 pub use frame_allocator::{
