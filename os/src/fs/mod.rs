@@ -358,6 +358,13 @@ pub trait File: Send + Sync {
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
         0
     }
+    /// Populates a clean page-cache page without requiring a page-sized caller buffer.
+    ///
+    /// Callers must still validate and pin their own cache key after this
+    /// returns. Files without a unified clean cache keep the default fallback.
+    fn populate_clean_page_cache_at(&self, _offset: usize) -> bool {
+        false
+    }
     /// Non-positionable files accept no positioned write data by default.
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0

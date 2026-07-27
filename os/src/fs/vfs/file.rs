@@ -2728,6 +2728,14 @@ impl File for VfsFile {
         .unwrap_or_else(|| self.read_backend_at_preserve_noatime(offset, buf))
     }
 
+    fn populate_clean_page_cache_at(&self, offset: usize) -> bool {
+        if offset % PAGE_SIZE != 0 {
+            return false;
+        }
+        let mut probe = [0u8; 1];
+        self.read_regular_cached_at(offset, &mut probe) == Some(1)
+    }
+
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
         if self.kind == FsNodeKind::Directory {
             return 0;

@@ -599,6 +599,37 @@ impl MmapPageCacheFault {
         }
         perf::record_mmap_clean_page_cache(false);
 
+        if self.read_len > 0
+            && self
+                .backing_file
+                .populate_clean_page_cache_at(self.file_offset)
+        {
+            let populated_ppn = {
+                let mut cache = PAGE_CACHE.exclusive_access();
+                if !cache.is_usable_mmap_key(
+                    self.key,
+                    self.expected_shared,
+                    self.observed_generation,
+                ) {
+                    perf::record_page_cache_generation_retry();
+                    return MmapPageCacheResolve::Retry;
+                }
+                cache.get_and_inc_ref_for_mmap(
+                    self.key,
+                    self.exec_fault,
+                    self.expected_shared,
+                    self.observed_generation,
+                )
+            };
+            if let Some(ppn) = populated_ppn {
+                perf::record_mmap_clean_page_cache_fill();
+                if self.exec_fault {
+                    super::elf_loader::record_exec_lazy_page_cache_fault(false, self.read_len);
+                }
+                return MmapPageCacheResolve::Ready(ppn);
+            }
+        }
+
         let file_fill = self.read_len > 0;
         let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocMmapPageCache);
         let frame = if file_fill {
