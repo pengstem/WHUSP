@@ -21,8 +21,8 @@ use crate::config::PAGE_SIZE;
 use crate::mm::{
     UserBuffer, frame_alloc, frame_alloc_uninit,
     page_cache::{
-        PAGE_CACHE, PageCacheId, PageCacheKey, PageCacheMutationGuard, ReadCacheLoadReservation,
-        begin_page_cache_mutation,
+        PAGE_CACHE, PageCacheId, PageCacheKey, PageCacheLoadGate, PageCacheMutationGuard,
+        ReadCacheLoadReservation, begin_page_cache_mutation,
     },
 };
 use crate::perf;
@@ -1809,34 +1809,24 @@ impl VfsFile {
             perf::record_vfs_read_cache_miss();
             let max_readahead_pages =
                 ((file_size - page_start).div_ceil(PAGE_SIZE)).min(VFS_READ_CACHE_READAHEAD_PAGES);
-            // Hold the new gate before publishing it so a waiter can never
-            // observe an unlocked owner that has not started the fill yet.
-            let load_gate = Arc::new(SleepMutex::new(()));
-            let load_owner_guard = load_gate.lock();
+            let load_gate = Arc::new(PageCacheLoadGate::new());
             let reservation = PAGE_CACHE.exclusive_access().reserve_read_cache_load(
                 key,
                 max_readahead_pages,
                 load_gate.clone(),
             );
             let readahead_pages = match reservation {
-                ReadCacheLoadReservation::Cached => {
-                    drop(load_owner_guard);
-                    continue;
-                }
+                ReadCacheLoadReservation::Cached => continue,
                 ReadCacheLoadReservation::Wait(existing_gate) => {
-                    drop(load_owner_guard);
                     {
                         let _profile_scope =
                             perf::time_scope(perf::ProfilePoint::PageCacheLoadWait);
-                        let _waiter_guard = existing_gate.lock();
+                        existing_gate.wait();
                     }
                     continue;
                 }
                 ReadCacheLoadReservation::Owner { pages } => pages,
-                ReadCacheLoadReservation::StaleGeneration => {
-                    drop(load_owner_guard);
-                    return None;
-                }
+                ReadCacheLoadReservation::StaleGeneration => return None,
             };
             let read_limit = (readahead_pages * PAGE_SIZE).min(file_size - page_start);
             let mut read_buf = vec![0u8; read_limit];
@@ -1867,7 +1857,7 @@ impl VfsFile {
                     readahead_pages,
                     &load_gate,
                 );
-                drop(load_owner_guard);
+                load_gate.complete();
                 break;
             }
 
@@ -1921,7 +1911,7 @@ impl VfsFile {
             }
             cache.release_read_cache_load(key, readahead_pages, &load_gate);
             drop(cache);
-            drop(load_owner_guard);
+            load_gate.complete();
             if stale_generation {
                 // Earlier cache hits may already have copied into `buf`.
                 // Returning None makes the caller overwrite the complete

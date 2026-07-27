@@ -4,8 +4,9 @@ use super::{FrameTracker, PhysPageNum};
 use crate::config::PAGE_SIZE;
 use crate::fs::MountId;
 use crate::perf;
-use crate::sync::{SleepMutex, UPIntrFreeCell};
-use alloc::collections::{BTreeMap, BTreeSet};
+use crate::sync::UPIntrFreeCell;
+use crate::task::{TaskControlBlock, block_current_task_no_schedule, schedule, wakeup_task};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use lazy_static::*;
@@ -119,15 +120,63 @@ struct PageCacheLruEntry {
 
 pub(crate) struct PageCache {
     pages: BTreeMap<PageCacheKey, PageCachePage>,
-    loading: BTreeMap<PageCacheKey, Arc<SleepMutex<()>>>,
+    loading: BTreeMap<PageCacheKey, Arc<PageCacheLoadGate>>,
     generations: BTreeMap<PageCacheId, PageCacheGeneration>,
     lru: BTreeSet<PageCacheLruEntry>,
     lru_clock: usize,
 }
 
+pub(crate) struct PageCacheLoadGate {
+    inner: UPIntrFreeCell<PageCacheLoadGateInner>,
+}
+
+struct PageCacheLoadGateInner {
+    complete: bool,
+    waiters: VecDeque<Arc<TaskControlBlock>>,
+}
+
+impl PageCacheLoadGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: unsafe {
+                UPIntrFreeCell::new(PageCacheLoadGateInner {
+                    complete: false,
+                    waiters: VecDeque::new(),
+                })
+            },
+        }
+    }
+
+    /// Waits for the owner without a completion-before-enqueue lost wake.
+    pub(crate) fn wait(&self) {
+        let mut inner = self.inner.exclusive_access();
+        if inner.complete {
+            return;
+        }
+        let (task, task_cx_ptr) = block_current_task_no_schedule();
+        inner.waiters.push_back(task);
+        drop(inner);
+        schedule(task_cx_ptr);
+    }
+
+    /// Publishes completion and wakes every task that joined this load.
+    pub(crate) fn complete(&self) {
+        let waiters = self.inner.exclusive_session(|inner| {
+            if inner.complete {
+                return VecDeque::new();
+            }
+            inner.complete = true;
+            core::mem::take(&mut inner.waiters)
+        });
+        for task in waiters {
+            wakeup_task(task);
+        }
+    }
+}
+
 pub(crate) enum ReadCacheLoadReservation {
     Cached,
-    Wait(Arc<SleepMutex<()>>),
+    Wait(Arc<PageCacheLoadGate>),
     Owner { pages: usize },
     StaleGeneration,
 }
@@ -175,13 +224,13 @@ impl PageCache {
     }
 
     /// Reserves one demand page and its uncached readahead suffix for a single
-    /// owner. The caller must already hold `gate`; waiters clone the published
-    /// gate only after dropping the page-cache guard.
+    /// owner. Waiters clone the pending gate under the page-cache guard, then
+    /// call `wait` only after dropping that guard.
     pub(crate) fn reserve_read_cache_load(
         &mut self,
         first_key: PageCacheKey,
         max_pages: usize,
-        gate: Arc<SleepMutex<()>>,
+        gate: Arc<PageCacheLoadGate>,
     ) -> ReadCacheLoadReservation {
         if max_pages == 0 || !self.is_current_key(first_key) {
             return ReadCacheLoadReservation::StaleGeneration;
@@ -221,7 +270,7 @@ impl PageCache {
         &mut self,
         first_key: PageCacheKey,
         pages: usize,
-        gate: &Arc<SleepMutex<()>>,
+        gate: &Arc<PageCacheLoadGate>,
     ) {
         for page_delta in 0..pages {
             let page_index = first_key
