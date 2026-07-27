@@ -63,6 +63,9 @@ pub struct TaskControlBlockInner {
     // Exact per-CPU run-queue ownership. It changes only while the source or
     // destination queue lock serializes removal/publication.
     pub(crate) queued_cpu: Option<crate::cpu::CpuId>,
+    // Most recent CPU that successfully claimed this task. Sleeping wakeup
+    // placement uses it only after intersecting affinity with the online mask.
+    pub(crate) last_cpu: Option<crate::cpu::CpuId>,
     // A wakeup can race after a task publishes Blocked but before its CPU has
     // crossed the task-to-idle context switch. The old CPU owns the only legal
     // enqueue at that boundary, so remember the wakeup until switch completion.
@@ -163,6 +166,7 @@ impl TaskControlBlock {
                     on_cpu: None,
                     on_rq: false,
                     queued_cpu: None,
+                    last_cpu: None,
                     wake_pending: false,
                     wake_front: false,
                     job_control_stopped,

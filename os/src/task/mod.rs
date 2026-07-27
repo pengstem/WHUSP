@@ -66,7 +66,9 @@ pub use processor::{
     refresh_current_user_token, run_tasks, schedule, trap_cx_of_task,
     trap_return_context_after_accounting_for_task, try_current_kstack_bounds,
 };
-pub(crate) use processor::{current_processor_is_empty, processor_is_idle, processor_slot_ptr};
+pub(crate) use processor::{
+    current_processor_is_empty, processor_idle_mask, processor_is_idle, processor_slot_ptr,
+};
 pub(crate) use ptrace::{
     ptrace_attach_process, ptrace_kill_process, ptrace_note_exec_current, ptrace_resume_process,
     ptrace_stop_task_if_needed, ptrace_syscall_enter_stop_for_task,

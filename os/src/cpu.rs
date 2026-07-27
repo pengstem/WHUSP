@@ -488,7 +488,6 @@ static REMOTE_SYNC_PENDING_SOURCES: [AtomicCpuMask; MAX_CPUS] =
     [const { AtomicCpuMask::new(CpuMask::empty()) }; MAX_CPUS];
 static REMOTE_SYNC_OBSERVED_SEQUENCE: [[AtomicUsize; MAX_CPUS]; MAX_CPUS] =
     [const { [const { AtomicUsize::new(0) }; MAX_CPUS] }; MAX_CPUS];
-static SCHEDULER_WAKE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
 pub fn record_boot_entry() {
     let count = BOOT_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -697,29 +696,44 @@ pub fn scheduler_publish_active(cpu: CpuId) {
     }
 }
 
+fn wake_scheduler_cpu_remote(cpu: CpuId) {
+    let already_pending = SCHEDULER_WAKE_PENDING[cpu].swap(true, Ordering::AcqRel);
+    let mut sent_ipi = false;
+    if !already_pending && crate::task::processor_is_idle(cpu) {
+        if let Err(error) = crate::arch::smp::send_ipi(cpu) {
+            SCHEDULER_WAKE_PENDING[cpu].store(false, Ordering::Release);
+            panic!("scheduler wake IPI to CPU {cpu} failed: {error:#x}");
+        }
+        sent_ipi = true;
+    }
+    crate::task::record_smp_cpu_probe_scheduler_wake(true, sent_ipi);
+}
+
+pub fn wake_scheduler_cpu_exact(cpu: CpuId) {
+    if !scheduler_aps_active() {
+        return;
+    }
+    let current = current_id();
+    if cpu == current || !online_mask().contains(cpu) {
+        crate::task::record_smp_cpu_probe_scheduler_wake(false, false);
+        return;
+    }
+    wake_scheduler_cpu_remote(cpu);
+}
+
 pub fn wake_scheduler_cpu(allowed: CpuMask) {
     if !scheduler_aps_active() {
         return;
     }
     let current = current_id();
     let cpu_count = topology().possible_count();
-    let start = SCHEDULER_WAKE_CURSOR.fetch_add(1, Ordering::Relaxed) % cpu_count;
-    for offset in 0..cpu_count {
-        let cpu = (start + offset) % cpu_count;
-        if cpu == current || !allowed.contains(cpu) || !online_mask().contains(cpu) {
-            continue;
+    let eligible = CpuMask::from_bits(allowed.bits() & online_mask().bits());
+    for offset in 1..cpu_count {
+        let cpu = (current + offset) % cpu_count;
+        if eligible.contains(cpu) {
+            wake_scheduler_cpu_remote(cpu);
+            return;
         }
-        let already_pending = SCHEDULER_WAKE_PENDING[cpu].swap(true, Ordering::AcqRel);
-        let mut sent_ipi = false;
-        if !already_pending && crate::task::processor_is_idle(cpu) {
-            if let Err(error) = crate::arch::smp::send_ipi(cpu) {
-                SCHEDULER_WAKE_PENDING[cpu].store(false, Ordering::Release);
-                panic!("scheduler wake IPI to CPU {cpu} failed: {error:#x}");
-            }
-            sent_ipi = true;
-        }
-        crate::task::record_smp_cpu_probe_scheduler_wake(true, sent_ipi);
-        return;
     }
     crate::task::record_smp_cpu_probe_scheduler_wake(false, false);
 }

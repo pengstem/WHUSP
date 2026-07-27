@@ -7,7 +7,7 @@ use crate::sync::{SpinNoIrqLock, UPIntrFreeCell};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::*;
 use log::info;
 
@@ -201,6 +201,7 @@ impl TaskManager {
         inner.on_rq = false;
         inner.queued_cpu = None;
         inner.on_cpu = Some(cpu);
+        inner.last_cpu = Some(cpu);
         inner.task_status = TaskStatus::Running;
         if inner.smp_sched_probe_active {
             super::smp_probe::record_run(cpu);
@@ -499,10 +500,23 @@ fn remove_task_from_queue(
     true
 }
 
+#[repr(C, align(64))]
+struct PerCpuRunQueue {
+    inner: SpinNoIrqLock<TaskManager>,
+    nr_running: AtomicUsize,
+}
+
+impl PerCpuRunQueue {
+    fn new(cpu: crate::cpu::CpuId) -> Self {
+        Self {
+            inner: SpinNoIrqLock::new(TaskManager::new(cpu)),
+            nr_running: AtomicUsize::new(0),
+        }
+    }
+}
+
 lazy_static! {
-    static ref RUN_QUEUES: Vec<SpinNoIrqLock<TaskManager>> = (0..MAX_CPUS)
-        .map(|cpu| SpinNoIrqLock::new(TaskManager::new(cpu)))
-        .collect();
+    static ref RUN_QUEUES: Vec<PerCpuRunQueue> = (0..MAX_CPUS).map(PerCpuRunQueue::new).collect();
     static ref PID2PCB: UPIntrFreeCell<BTreeMap<usize, Arc<ProcessControlBlock>>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
     static ref LINUX_TID2TASK: UPIntrFreeCell<BTreeMap<usize, Weak<TaskControlBlock>>> =
@@ -511,16 +525,24 @@ lazy_static! {
 
 static RUNNABLE_QUEUES: crate::cpu::AtomicCpuMask =
     crate::cpu::AtomicCpuMask::new(crate::cpu::CpuMask::empty());
+static OVERLOADED_QUEUES: crate::cpu::AtomicCpuMask =
+    crate::cpu::AtomicCpuMask::new(crate::cpu::CpuMask::empty());
 
-fn publish_run_queue_transition(cpu: crate::cpu::CpuId, was_runnable: bool, ready: usize) {
-    let is_runnable = ready != 0;
-    if was_runnable == is_runnable {
-        return;
+fn publish_run_queue_state(cpu: crate::cpu::CpuId, previous_ready: usize, ready: usize) {
+    RUN_QUEUES[cpu].nr_running.store(ready, Ordering::Release);
+    if (previous_ready != 0) != (ready != 0) {
+        if ready != 0 {
+            RUNNABLE_QUEUES.insert(cpu, Ordering::Release);
+        } else {
+            RUNNABLE_QUEUES.remove(cpu, Ordering::Release);
+        }
     }
-    if is_runnable {
-        RUNNABLE_QUEUES.insert(cpu, Ordering::Release);
-    } else {
-        RUNNABLE_QUEUES.remove(cpu, Ordering::Release);
+    if (previous_ready > 1) != (ready > 1) {
+        if ready > 1 {
+            OVERLOADED_QUEUES.insert(cpu, Ordering::Release);
+        } else {
+            OVERLOADED_QUEUES.remove(cpu, Ordering::Release);
+        }
     }
 }
 
@@ -529,11 +551,11 @@ fn with_run_queue<R>(cpu: crate::cpu::CpuId, operation: impl FnOnce(&mut TaskMan
     record_remote_run_queue_lock(cpu);
     let probe = super::smp_probe::cpu_probe_active();
     let wait_start = probe.then(crate::timer::get_time);
-    let mut manager = RUN_QUEUES[cpu].lock();
+    let mut manager = RUN_QUEUES[cpu].inner.lock();
     let acquired = probe.then(crate::timer::get_time);
-    let was_runnable = manager.ready_len() != 0;
+    let previous_ready = manager.ready_len();
     let result = operation(&mut manager);
-    publish_run_queue_transition(cpu, was_runnable, manager.ready_len());
+    publish_run_queue_state(cpu, previous_ready, manager.ready_len());
     drop(manager);
     if let (Some(wait_start), Some(acquired)) = (wait_start, acquired) {
         let released = crate::timer::get_time();
@@ -556,82 +578,247 @@ fn record_remote_run_queue_lock(cpu: crate::cpu::CpuId) {
 #[inline(always)]
 fn record_remote_run_queue_lock(_cpu: crate::cpu::CpuId) {}
 
-fn run_queue_load(cpu: crate::cpu::CpuId) -> usize {
-    record_remote_run_queue_lock(cpu);
-    let ready = RUN_QUEUES[cpu].lock().ready_len();
-    ready + usize::from(!super::processor_is_idle(cpu))
+fn run_queue_ready_snapshot(cpu: crate::cpu::CpuId) -> usize {
+    RUN_QUEUES[cpu].nr_running.load(Ordering::Acquire)
 }
 
-fn choose_run_queue(
-    allowed: crate::cpu::CpuMask,
-    preferred: Option<crate::cpu::CpuId>,
+fn run_queue_load_snapshot(cpu: crate::cpu::CpuId) -> usize {
+    run_queue_ready_snapshot(cpu) + usize::from(!super::processor_is_idle(cpu))
+}
+
+#[derive(Clone, Copy)]
+enum PlacementKind {
+    New,
+    Wake,
+    Affinity { source: crate::cpu::CpuId },
+}
+
+fn first_cpu_from(
+    mask: crate::cpu::CpuMask,
+    start: crate::cpu::CpuId,
+) -> Option<crate::cpu::CpuId> {
+    let cpu_count = crate::cpu::topology().possible_count();
+    for offset in 0..cpu_count {
+        let cpu = (start + offset) % cpu_count;
+        if mask.contains(cpu) {
+            return Some(cpu);
+        }
+    }
+    None
+}
+
+fn cpu_at_mask_index(mask: crate::cpu::CpuMask, mut index: usize) -> crate::cpu::CpuId {
+    let mut bits = mask.bits();
+    loop {
+        let cpu = bits.trailing_zeros() as usize;
+        assert!(cpu < u64::BITS as usize, "CPU mask index exceeded set bits");
+        if index == 0 {
+            return cpu;
+        }
+        bits &= !(1u64 << cpu);
+        index -= 1;
+    }
+}
+
+fn prefer_tied_cpu(
+    first: crate::cpu::CpuId,
+    second: crate::cpu::CpuId,
+    last_cpu: Option<crate::cpu::CpuId>,
+    current: Option<crate::cpu::CpuId>,
 ) -> crate::cpu::CpuId {
+    let cpu_count = crate::cpu::topology().possible_count();
+    let origin = current.or(last_cpu).unwrap_or(0);
+    let rank = |cpu| {
+        (
+            usize::from(last_cpu != Some(cpu)),
+            usize::from(current != Some(cpu)),
+            (cpu + cpu_count - origin) % cpu_count,
+            cpu,
+        )
+    };
+    if rank(first) <= rank(second) {
+        first
+    } else {
+        second
+    }
+}
+
+fn sample_two_cpus(
+    eligible: crate::cpu::CpuMask,
+    tid: usize,
+    last_cpu: Option<crate::cpu::CpuId>,
+    current: Option<crate::cpu::CpuId>,
+    probes: &mut usize,
+) -> crate::cpu::CpuId {
+    let count = eligible.count();
+    assert!(count != 0, "cannot sample an empty CPU mask");
+    if count == 1 {
+        let cpu = cpu_at_mask_index(eligible, 0);
+        *probes += 1;
+        let _ = run_queue_load_snapshot(cpu);
+        return cpu;
+    }
+
+    let mut seed = tid.wrapping_mul(0x9e37_79b9_7f4a_7c15usize);
+    if let Some(cpu) = last_cpu {
+        seed ^= cpu.wrapping_add(1).rotate_left(17);
+    }
+    if let Some(cpu) = current {
+        seed ^= cpu.wrapping_add(1).rotate_left(31);
+    }
+    let first_index = seed % count;
+    let second_index = (first_index + 1 + (seed / count) % (count - 1)) % count;
+    let first = cpu_at_mask_index(eligible, first_index);
+    let second = cpu_at_mask_index(eligible, second_index);
+    debug_assert_ne!(first, second);
+
+    let first_load = run_queue_load_snapshot(first);
+    let second_load = run_queue_load_snapshot(second);
+    *probes += 2;
+    if first_load < second_load {
+        return first;
+    }
+    if second_load < first_load {
+        return second;
+    }
+
+    prefer_tied_cpu(first, second, last_cpu, current)
+}
+
+fn sample_against_cpu(
+    eligible: crate::cpu::CpuMask,
+    known_cpu: crate::cpu::CpuId,
+    known_ready: usize,
+    tid: usize,
+    last_cpu: Option<crate::cpu::CpuId>,
+    current: Option<crate::cpu::CpuId>,
+    probes: &mut usize,
+) -> crate::cpu::CpuId {
+    let candidates = crate::cpu::CpuMask::from_bits(
+        eligible.bits() & !crate::cpu::CpuMask::single(known_cpu).bits(),
+    );
+    if candidates.bits() == 0 {
+        return known_cpu;
+    }
+    let mut seed = tid.wrapping_mul(0x517c_c1b7_2722_0a95usize);
+    if let Some(cpu) = last_cpu {
+        seed ^= cpu.wrapping_add(1).rotate_left(13);
+    }
+    let candidate = cpu_at_mask_index(candidates, seed % candidates.count());
+    let candidate_load = run_queue_load_snapshot(candidate);
+    *probes += 1;
+    let known_load = known_ready + usize::from(!super::processor_is_idle(known_cpu));
+    if candidate_load < known_load {
+        candidate
+    } else if known_load < candidate_load {
+        known_cpu
+    } else {
+        prefer_tied_cpu(known_cpu, candidate, last_cpu, current)
+    }
+}
+
+fn choose_run_queue(task: &TaskControlBlock, kind: PlacementKind) -> crate::cpu::CpuId {
+    let (allowed, last_cpu, tid) = {
+        let inner = task.inner_exclusive_access();
+        (inner.allowed_cpus, inner.last_cpu, inner.tid)
+    };
     let online = crate::cpu::online_mask();
     let eligible = crate::cpu::CpuMask::from_bits(allowed.bits() & online.bits());
     assert!(eligible.bits() != 0, "runnable task has no online CPU");
-
-    let mut best = None;
-    #[cfg(feature = "perf-counters")]
+    let current = crate::cpu::try_current_id().filter(|cpu| eligible.contains(*cpu));
+    let idle =
+        crate::cpu::CpuMask::from_bits(super::processor_idle_mask().bits() & eligible.bits());
+    let idle_start = current.map_or(0, |cpu| (cpu + 1) % crate::cpu::topology().possible_count());
+    let idle_cpu = || first_cpu_from(idle, idle_start);
     let mut probes = 0;
-    for cpu in 0..crate::cpu::topology().possible_count() {
-        if !eligible.contains(cpu) {
-            continue;
+
+    let target = match kind {
+        PlacementKind::New => {
+            if let Some(cpu) = current {
+                probes += 1;
+                if run_queue_ready_snapshot(cpu) == 0 {
+                    cpu
+                } else {
+                    idle_cpu().unwrap_or(cpu)
+                }
+            } else if let Some(cpu) = idle_cpu() {
+                cpu
+            } else {
+                sample_two_cpus(eligible, tid, last_cpu, current, &mut probes)
+            }
         }
-        #[cfg(feature = "perf-counters")]
-        {
-            probes += 1;
+        PlacementKind::Wake => {
+            if let Some(cpu) = last_cpu.filter(|cpu| idle.contains(*cpu)) {
+                cpu
+            } else if let Some(cpu) = current {
+                probes += 1;
+                let ready = run_queue_ready_snapshot(cpu);
+                if ready <= 1 {
+                    cpu
+                } else if let Some(idle_cpu) = idle_cpu() {
+                    idle_cpu
+                } else {
+                    sample_against_cpu(eligible, cpu, ready, tid, last_cpu, current, &mut probes)
+                }
+            } else if let Some(cpu) = idle_cpu() {
+                cpu
+            } else {
+                sample_two_cpus(eligible, tid, last_cpu, current, &mut probes)
+            }
         }
-        let load = run_queue_load(cpu);
-        let prefer = usize::from(preferred == Some(cpu));
-        if best.is_none_or(|(_, best_load, best_prefer)| {
-            load < best_load || (load == best_load && prefer > best_prefer)
-        }) {
-            best = Some((cpu, load, prefer));
+        PlacementKind::Affinity { source } => {
+            if eligible.contains(source) {
+                source
+            } else if let Some(cpu) = idle_cpu() {
+                cpu
+            } else {
+                sample_two_cpus(eligible, tid, last_cpu, current, &mut probes)
+            }
         }
-    }
-    #[cfg(feature = "perf-counters")]
+    };
     perf::record_scheduler_placement(probes);
-    best.expect("eligible CPU mask contained no topology CPU").0
+    target
 }
 
-fn enqueue_task_on_best_queue(
-    task: Arc<TaskControlBlock>,
-    front: bool,
-    charge_runtime: bool,
-) -> crate::cpu::CpuId {
-    let allowed = task.inner_exclusive_access().allowed_cpus;
-    let preferred = crate::cpu::try_current_id().filter(|cpu| allowed.contains(*cpu));
-    let target = choose_run_queue(allowed, preferred);
+fn wake_enqueued_cpu(target: crate::cpu::CpuId) {
+    if crate::cpu::try_current_id() != Some(target) {
+        crate::cpu::wake_scheduler_cpu_exact(target);
+    }
+}
+
+fn enqueue_task_on_cpu(task: Arc<TaskControlBlock>, target: crate::cpu::CpuId, front: bool) {
     with_run_queue(target, |manager| {
-        if charge_runtime {
-            manager.requeue_after_run(task);
-        } else if front {
+        if front {
             manager.add_front(task);
         } else {
             manager.add(task);
         }
     });
-    crate::cpu::wake_scheduler_cpu(crate::cpu::CpuMask::single(target));
-    target
+    wake_enqueued_cpu(target);
 }
 
 pub fn add_task(task: Arc<TaskControlBlock>) {
-    enqueue_task_on_best_queue(task, false, false);
+    let target = choose_run_queue(&task, PlacementKind::New);
+    enqueue_task_on_cpu(task, target, false);
 }
 
 pub(crate) fn requeue_task_after_run(task: Arc<TaskControlBlock>) {
+    let origin = crate::cpu::current_id();
+    let allowed = task.inner_exclusive_access().allowed_cpus;
+    let eligible =
+        crate::cpu::CpuMask::from_bits(allowed.bits() & crate::cpu::online_mask().bits());
+    let target = if eligible.contains(origin) {
+        origin
+    } else {
+        choose_run_queue(&task, PlacementKind::Affinity { source: origin })
+    };
     #[cfg(feature = "perf-counters")]
-    {
-        let normal = task.realtime_priority() == 0;
-        let origin = crate::cpu::current_id();
-        let target = enqueue_task_on_best_queue(task, false, true);
-        if normal {
-            perf::record_scheduler_requeue(origin == target);
-        }
-    }
-    #[cfg(not(feature = "perf-counters"))]
-    {
-        enqueue_task_on_best_queue(task, false, true);
+    let normal = task.realtime_priority() == 0;
+    with_run_queue(target, |manager| manager.requeue_after_run(task));
+    wake_enqueued_cpu(target);
+    #[cfg(feature = "perf-counters")]
+    if normal {
+        perf::record_scheduler_requeue(origin == target);
     }
 }
 
@@ -683,7 +870,8 @@ fn wakeup_task_with_placement(task: Arc<TaskControlBlock>, front: bool) -> bool 
 }
 
 pub(super) fn enqueue_woken_task(task: Arc<TaskControlBlock>, front: bool) {
-    enqueue_task_on_best_queue(task, front, false);
+    let target = choose_run_queue(&task, PlacementKind::Wake);
+    enqueue_task_on_cpu(task, target, front);
 }
 
 pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
@@ -762,7 +950,7 @@ pub(crate) fn reprioritize_ready_task(task: Arc<TaskControlBlock>) {
     let queued_cpu = task.inner_exclusive_access().queued_cpu;
     if let Some(cpu) = queued_cpu {
         with_run_queue(cpu, |manager| manager.reprioritize_ready_task(task));
-        crate::cpu::wake_scheduler_cpu(crate::cpu::CpuMask::single(cpu));
+        wake_enqueued_cpu(cpu);
     }
 }
 
@@ -771,8 +959,7 @@ pub(crate) fn migrate_ready_task(task: Arc<TaskControlBlock>) {
     let Some(source) = queued_cpu else {
         return;
     };
-    let allowed = task.inner_exclusive_access().allowed_cpus;
-    let target = choose_run_queue(allowed, None);
+    let target = choose_run_queue(&task, PlacementKind::Affinity { source });
     if source == target {
         return;
     }
@@ -786,27 +973,27 @@ pub(crate) fn migrate_ready_task(task: Arc<TaskControlBlock>) {
         }
     }
     let moved = if source < target {
-        let mut source_queue = RUN_QUEUES[source].lock();
-        let mut target_queue = RUN_QUEUES[target].lock();
-        let source_was_runnable = source_queue.ready_len() != 0;
-        let target_was_runnable = target_queue.ready_len() != 0;
+        let mut source_queue = RUN_QUEUES[source].inner.lock();
+        let mut target_queue = RUN_QUEUES[target].inner.lock();
+        let source_previous_ready = source_queue.ready_len();
+        let target_previous_ready = target_queue.ready_len();
         let moved = migrate_ready_task_locked(&mut source_queue, &mut target_queue, task);
-        publish_run_queue_transition(source, source_was_runnable, source_queue.ready_len());
-        publish_run_queue_transition(target, target_was_runnable, target_queue.ready_len());
+        publish_run_queue_state(source, source_previous_ready, source_queue.ready_len());
+        publish_run_queue_state(target, target_previous_ready, target_queue.ready_len());
         moved
     } else {
-        let mut target_queue = RUN_QUEUES[target].lock();
-        let mut source_queue = RUN_QUEUES[source].lock();
-        let source_was_runnable = source_queue.ready_len() != 0;
-        let target_was_runnable = target_queue.ready_len() != 0;
+        let mut target_queue = RUN_QUEUES[target].inner.lock();
+        let mut source_queue = RUN_QUEUES[source].inner.lock();
+        let source_previous_ready = source_queue.ready_len();
+        let target_previous_ready = target_queue.ready_len();
         let moved = migrate_ready_task_locked(&mut source_queue, &mut target_queue, task);
-        publish_run_queue_transition(source, source_was_runnable, source_queue.ready_len());
-        publish_run_queue_transition(target, target_was_runnable, target_queue.ready_len());
+        publish_run_queue_state(source, source_previous_ready, source_queue.ready_len());
+        publish_run_queue_state(target, target_previous_ready, target_queue.ready_len());
         moved
     };
     if moved {
         super::smp_probe::record_cpu_probe_migration();
-        crate::cpu::wake_scheduler_cpu(crate::cpu::CpuMask::single(target));
+        wake_enqueued_cpu(target);
     }
 }
 
@@ -819,7 +1006,7 @@ pub(super) fn assert_run_queues_drained() {
     let cpu_count = crate::cpu::topology().possible_count();
     let mut queues = Vec::with_capacity(cpu_count);
     for cpu in 0..cpu_count {
-        queues.push(RUN_QUEUES[cpu].lock());
+        queues.push(RUN_QUEUES[cpu].inner.lock());
     }
     let ready = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
         queues.get(cpu).map_or(0, |queue| queue.ready_len())

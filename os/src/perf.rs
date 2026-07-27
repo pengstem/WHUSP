@@ -2831,6 +2831,9 @@ mod disabled {
     pub(crate) fn record_scheduler_rt_priority_probes(_probes: usize) {}
 
     #[inline(always)]
+    pub(crate) fn record_scheduler_placement(_cpu_probes: usize) {}
+
+    #[inline(always)]
     pub(crate) fn record_scheduler_victim_probe() {}
 
     #[inline(always)]

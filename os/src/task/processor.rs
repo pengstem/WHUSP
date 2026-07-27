@@ -3,12 +3,13 @@ use super::fetch_task;
 use super::{ProcessControlBlock, TaskContext, TaskControlBlock, TaskStatus};
 use crate::arch::hart;
 use crate::config::MAX_CPUS;
+use crate::cpu::{AtomicCpuMask, CpuMask};
 use crate::mm::ActiveAddressSpace;
 use crate::perf;
 use crate::sync::{LocalIrqGuard, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::Ordering;
 
 pub struct Processor {
     current: Option<Arc<TaskControlBlock>>,
@@ -121,7 +122,7 @@ impl PerCpuProcessor {
 }
 
 static PROCESSORS: [PerCpuProcessor; MAX_CPUS] = [const { PerCpuProcessor::new() }; MAX_CPUS];
-static PROCESSOR_IDLE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+static PROCESSOR_IDLE: AtomicCpuMask = AtomicCpuMask::new(CpuMask::empty());
 
 fn processor() -> SpinNoIrqLockGuard<'static, Processor> {
     PROCESSORS[crate::cpu::current_id()].inner.lock()
@@ -142,7 +143,19 @@ pub(crate) fn current_processor_is_empty() -> bool {
 }
 
 pub(crate) fn processor_is_idle(cpu: usize) -> bool {
-    PROCESSOR_IDLE[cpu].load(Ordering::Acquire)
+    PROCESSOR_IDLE.load(Ordering::Acquire).contains(cpu)
+}
+
+pub(crate) fn processor_idle_mask() -> CpuMask {
+    PROCESSOR_IDLE.load(Ordering::Acquire)
+}
+
+fn publish_processor_idle(cpu: usize, idle: bool) {
+    if idle {
+        PROCESSOR_IDLE.insert(cpu, Ordering::Release);
+    } else {
+        PROCESSOR_IDLE.remove(cpu, Ordering::Release);
+    }
 }
 
 pub(super) fn prepare_current_switch(
@@ -355,11 +368,11 @@ pub fn run_tasks() -> ! {
             drop(processor);
             let cpu = crate::cpu::current_id();
             let irq = LocalIrqGuard::disable();
-            PROCESSOR_IDLE[cpu].store(true, Ordering::Release);
+            publish_processor_idle(cpu, true);
             // Pair idle publication with enqueue's pending-before-IPI order.
             // If work arrived just before publication, do not cross into WFI.
             if crate::cpu::take_scheduler_wake(cpu) {
-                PROCESSOR_IDLE[cpu].store(false, Ordering::Release);
+                publish_processor_idle(cpu, false);
                 drop(irq);
                 continue;
             }
@@ -371,12 +384,12 @@ pub fn run_tasks() -> ! {
             // Closing the timer can overlap an enqueue after the first pending
             // check. Recheck with interrupts still disabled before sleeping.
             if crate::cpu::take_scheduler_wake(cpu) {
-                PROCESSOR_IDLE[cpu].store(false, Ordering::Release);
+                publish_processor_idle(cpu, false);
                 drop(irq);
                 continue;
             }
             hart::wait_for_interrupt_disabled();
-            PROCESSOR_IDLE[cpu].store(false, Ordering::Release);
+            publish_processor_idle(cpu, false);
             drop(irq);
         }
     }
