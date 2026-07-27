@@ -77,6 +77,10 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) scheduler_remote_rq_lock_acquires: usize,
     pub(crate) scheduler_victim_probes: usize,
     pub(crate) scheduler_steal_tasks: usize,
+    pub(crate) scheduler_idle_pull_calls: usize,
+    pub(crate) scheduler_idle_pull_probe_max: usize,
+    pub(crate) scheduler_steal_batches: usize,
+    pub(crate) scheduler_steal_batch_max: usize,
     pub(crate) wakeup_front_successes: usize,
     pub(crate) wakeup_back_successes: usize,
     pub(crate) syscall_dispatch_calls: usize,
@@ -389,6 +393,10 @@ mod enabled {
     static SCHEDULER_REMOTE_RQ_LOCK_ACQUIRES: AtomicUsize = AtomicUsize::new(0);
     static SCHEDULER_VICTIM_PROBES: AtomicUsize = AtomicUsize::new(0);
     static SCHEDULER_STEAL_TASKS: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_IDLE_PULL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_IDLE_PULL_PROBE_MAX: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_STEAL_BATCHES: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_STEAL_BATCH_MAX: AtomicUsize = AtomicUsize::new(0);
     static WAKEUP_FRONT_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
     static WAKEUP_BACK_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
     static SYSCALL_DISPATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -967,12 +975,15 @@ mod enabled {
         SCHEDULER_REMOTE_RQ_LOCK_ACQUIRES.fetch_add(acquires, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_scheduler_victim_probe() {
-        SCHEDULER_VICTIM_PROBES.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn record_scheduler_steal_tasks(tasks: usize) {
-        SCHEDULER_STEAL_TASKS.fetch_add(tasks, Ordering::Relaxed);
+    pub(crate) fn record_scheduler_idle_pull(probes: usize, stolen_tasks: usize) {
+        SCHEDULER_IDLE_PULL_CALLS.fetch_add(1, Ordering::Relaxed);
+        SCHEDULER_VICTIM_PROBES.fetch_add(probes, Ordering::Relaxed);
+        update_max(&SCHEDULER_IDLE_PULL_PROBE_MAX, probes);
+        if stolen_tasks != 0 {
+            SCHEDULER_STEAL_BATCHES.fetch_add(1, Ordering::Relaxed);
+            SCHEDULER_STEAL_TASKS.fetch_add(stolen_tasks, Ordering::Relaxed);
+            update_max(&SCHEDULER_STEAL_BATCH_MAX, stolen_tasks);
+        }
     }
 
     pub(crate) fn record_task_wakeup(front: bool) {
@@ -1827,6 +1838,10 @@ mod enabled {
                 .load(Ordering::Relaxed),
             scheduler_victim_probes: SCHEDULER_VICTIM_PROBES.load(Ordering::Relaxed),
             scheduler_steal_tasks: SCHEDULER_STEAL_TASKS.load(Ordering::Relaxed),
+            scheduler_idle_pull_calls: SCHEDULER_IDLE_PULL_CALLS.load(Ordering::Relaxed),
+            scheduler_idle_pull_probe_max: SCHEDULER_IDLE_PULL_PROBE_MAX.load(Ordering::Relaxed),
+            scheduler_steal_batches: SCHEDULER_STEAL_BATCHES.load(Ordering::Relaxed),
+            scheduler_steal_batch_max: SCHEDULER_STEAL_BATCH_MAX.load(Ordering::Relaxed),
             wakeup_front_successes: WAKEUP_FRONT_SUCCESSES.load(Ordering::Relaxed),
             wakeup_back_successes: WAKEUP_BACK_SUCCESSES.load(Ordering::Relaxed),
             syscall_dispatch_calls: SYSCALL_DISPATCH_CALLS.load(Ordering::Relaxed),
@@ -2180,6 +2195,10 @@ mod enabled {
          scheduler_remote_rq_lock_acquires {}\n\
          scheduler_victim_probes {}\n\
          scheduler_steal_tasks {}\n\
+         scheduler_idle_pull_calls {}\n\
+         scheduler_idle_pull_probe_max {}\n\
+         scheduler_steal_batches {}\n\
+         scheduler_steal_batch_max {}\n\
          wakeup_front_successes {}\n\
          wakeup_back_successes {}\n\
          syscall_dispatch_calls {}\n\
@@ -2482,6 +2501,10 @@ mod enabled {
             stats.scheduler_remote_rq_lock_acquires,
             stats.scheduler_victim_probes,
             stats.scheduler_steal_tasks,
+            stats.scheduler_idle_pull_calls,
+            stats.scheduler_idle_pull_probe_max,
+            stats.scheduler_steal_batches,
+            stats.scheduler_steal_batch_max,
             stats.wakeup_front_successes,
             stats.wakeup_back_successes,
             stats.syscall_dispatch_calls,
@@ -2834,10 +2857,7 @@ mod disabled {
     pub(crate) fn record_scheduler_placement(_cpu_probes: usize) {}
 
     #[inline(always)]
-    pub(crate) fn record_scheduler_victim_probe() {}
-
-    #[inline(always)]
-    pub(crate) fn record_scheduler_steal_tasks(_tasks: usize) {}
+    pub(crate) fn record_scheduler_idle_pull(_probes: usize, _stolen_tasks: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_task_wakeup(_front: bool) {}

@@ -15,6 +15,10 @@ const RT_PRIORITY_MAX: usize = 99;
 const RT_QUEUE_COUNT: usize = RT_PRIORITY_MAX + 1;
 const NICE_0_LOAD: u64 = 1024;
 const NORMAL_PREEMPT_GRANULARITY_US: u64 = 1_000;
+const STEAL_VICTIM_PROBE_LIMIT: usize = 4;
+const STEAL_BATCH_MAX: usize = 4;
+const STEAL_TASK_SCAN_BUDGET: usize = 8;
+const STEAL_SEQUENCE_INCREMENT: usize = 0x9e37_79b9_7f4a_7c15usize;
 const NICE_TO_WEIGHT: [u64; 40] = [
     88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904,
     3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, 110, 87,
@@ -346,6 +350,191 @@ impl TaskManager {
         }
     }
 
+    fn steal_candidate_relevant(task: &TaskControlBlock, cpu: crate::cpu::CpuId) -> bool {
+        let inner = task.inner_exclusive_access();
+        inner.task_status == TaskStatus::Exited
+            || inner.job_control_stopped
+            || (inner.task_status == TaskStatus::Ready && inner.allowed_cpus.contains(cpu))
+    }
+
+    fn steal_one_for_cpu(
+        &mut self,
+        cpu: crate::cpu::CpuId,
+        scan_budget: &mut usize,
+    ) -> Option<(Arc<TaskControlBlock>, u64)> {
+        enum QueueSlot {
+            Realtime {
+                priority: usize,
+                index: usize,
+            },
+            Normal {
+                key: NormalQueueKey,
+                was_first: bool,
+            },
+        }
+
+        let queue_len = self.ready_len();
+        let source_min = self.min_vruntime();
+        let mut scanned = 0;
+        let mut pruned_exited = 0;
+
+        loop {
+            if *scan_budget == 0 {
+                perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
+                return None;
+            }
+
+            let mut slot = None;
+            'realtime: for priority in (1..=RT_PRIORITY_MAX).rev() {
+                for (index, task) in self.rt_queues[priority].iter().enumerate() {
+                    if *scan_budget == 0 {
+                        break 'realtime;
+                    }
+                    *scan_budget -= 1;
+                    scanned += 1;
+                    if Self::steal_candidate_relevant(task, cpu) {
+                        slot = Some(QueueSlot::Realtime { priority, index });
+                        break 'realtime;
+                    }
+                }
+            }
+
+            if slot.is_none() && *scan_budget != 0 {
+                let first_key = self.normal_queue.first_key_value().map(|(key, _)| *key);
+                for (key, task) in &self.normal_queue {
+                    if *scan_budget == 0 {
+                        break;
+                    }
+                    *scan_budget -= 1;
+                    scanned += 1;
+                    if Self::steal_candidate_relevant(task, cpu) {
+                        slot = Some(QueueSlot::Normal {
+                            key: *key,
+                            was_first: first_key == Some(*key),
+                        });
+                        break;
+                    }
+                }
+            }
+
+            let Some(slot) = slot else {
+                perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
+                return None;
+            };
+
+            let (task, expected_rt_priority) = match slot {
+                QueueSlot::Realtime { priority, index } => {
+                    let task = self.rt_queues[priority]
+                        .remove(index)
+                        .expect("selected RT steal task disappeared under rq lock");
+                    self.decrement_ready_count();
+                    self.clear_rt_priority_if_empty(priority);
+                    (task, Some(priority))
+                }
+                QueueSlot::Normal { key, was_first } => {
+                    let task = self
+                        .normal_queue
+                        .remove(&key)
+                        .expect("selected normal steal task disappeared under rq lock");
+                    self.decrement_ready_count();
+                    if was_first {
+                        self.normal_min_vruntime = self.normal_min_vruntime.max(key.0);
+                    }
+                    (task, None)
+                }
+            };
+
+            let current_rt_priority = Self::rt_priority(&task);
+            if expected_rt_priority.is_some_and(|priority| priority != current_rt_priority)
+                || (expected_rt_priority.is_none() && current_rt_priority != 0)
+            {
+                self.enqueue(task, false);
+                continue;
+            }
+
+            match self.claim_for_cpu(&task, cpu) {
+                ClaimResult::Claimed => {
+                    perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
+                    return Some((task, source_min));
+                }
+                ClaimResult::Ineligible => {
+                    self.enqueue(task, false);
+                    perf::record_scheduler_fetch(queue_len, scanned, pruned_exited);
+                    return None;
+                }
+                ClaimResult::Stopped => {}
+                ClaimResult::Exited => pruned_exited += 1,
+            }
+        }
+    }
+
+    fn steal_normal_batch_to(
+        &mut self,
+        target: &mut TaskManager,
+        target_cpu: crate::cpu::CpuId,
+        max_tasks: usize,
+        scan_budget: &mut usize,
+        source_min: u64,
+        target_min: u64,
+    ) -> usize {
+        let mut selected = [None; STEAL_BATCH_MAX];
+        let mut selected_count = 0;
+
+        for (key, task) in self.normal_queue.iter().rev() {
+            if selected_count == max_tasks || *scan_budget == 0 {
+                break;
+            }
+            *scan_budget -= 1;
+            let eligible = {
+                let inner = task.inner_exclusive_access();
+                inner.task_status == TaskStatus::Ready
+                    && inner.on_rq
+                    && inner.queued_cpu == Some(self.cpu)
+                    && inner.on_cpu.is_none()
+                    && !inner.job_control_stopped
+                    && inner.allowed_cpus.contains(target_cpu)
+            };
+            if eligible && Self::rt_priority(task) == 0 {
+                selected[selected_count] = Some(*key);
+                selected_count += 1;
+            }
+        }
+
+        let mut moved = 0;
+        for key in selected.into_iter().flatten().take(selected_count) {
+            let task = self
+                .normal_queue
+                .remove(&key)
+                .expect("selected batch steal task disappeared under rq lock");
+            self.decrement_ready_count();
+
+            let normal = Self::rt_priority(&task) == 0;
+            let mut inner = task.inner_exclusive_access();
+            if inner.task_status == TaskStatus::Exited || inner.job_control_stopped {
+                inner.on_rq = false;
+                inner.queued_cpu = None;
+                continue;
+            }
+            assert_eq!(inner.task_status, TaskStatus::Ready);
+            assert!(inner.on_rq);
+            assert_eq!(inner.queued_cpu, Some(self.cpu));
+            assert!(inner.on_cpu.is_none());
+            if !normal || !inner.allowed_cpus.contains(target_cpu) {
+                drop(inner);
+                self.enqueue(task, false);
+                continue;
+            }
+
+            let relative = inner.sched_vruntime.saturating_sub(source_min);
+            inner.sched_vruntime = target_min.saturating_add(relative);
+            inner.queued_cpu = Some(target.cpu);
+            drop(inner);
+            target.enqueue(task, false);
+            moved += 1;
+        }
+        moved
+    }
+
     fn should_preempt_current_on_tick(&self, current: &Arc<TaskControlBlock>) -> bool {
         if let Some(is_owner) = current
             .process
@@ -504,6 +693,7 @@ fn remove_task_from_queue(
 struct PerCpuRunQueue {
     inner: SpinNoIrqLock<TaskManager>,
     nr_running: AtomicUsize,
+    steal_sequence: AtomicUsize,
 }
 
 impl PerCpuRunQueue {
@@ -511,6 +701,9 @@ impl PerCpuRunQueue {
         Self {
             inner: SpinNoIrqLock::new(TaskManager::new(cpu)),
             nr_running: AtomicUsize::new(0),
+            steal_sequence: AtomicUsize::new(
+                cpu.wrapping_add(1).wrapping_mul(STEAL_SEQUENCE_INCREMENT),
+            ),
         }
     }
 }
@@ -567,6 +760,57 @@ fn with_run_queue<R>(cpu: crate::cpu::CpuId, operation: impl FnOnce(&mut TaskMan
     result
 }
 
+fn with_run_queue_pair<R>(
+    first_cpu: crate::cpu::CpuId,
+    second_cpu: crate::cpu::CpuId,
+    operation: impl FnOnce(&mut TaskManager, &mut TaskManager) -> R,
+) -> R {
+    assert_ne!(
+        first_cpu, second_cpu,
+        "run-queue pair requires distinct CPUs"
+    );
+    assert!(first_cpu < MAX_CPUS && second_cpu < MAX_CPUS);
+    record_remote_run_queue_lock(first_cpu);
+    record_remote_run_queue_lock(second_cpu);
+    let probe = super::smp_probe::cpu_probe_active();
+    let wait_start = probe.then(crate::timer::get_time);
+
+    let result = if first_cpu < second_cpu {
+        let mut first = RUN_QUEUES[first_cpu].inner.lock();
+        let mut second = RUN_QUEUES[second_cpu].inner.lock();
+        let acquired = probe.then(crate::timer::get_time);
+        let first_previous_ready = first.ready_len();
+        let second_previous_ready = second.ready_len();
+        let result = operation(&mut first, &mut second);
+        publish_run_queue_state(first_cpu, first_previous_ready, first.ready_len());
+        publish_run_queue_state(second_cpu, second_previous_ready, second.ready_len());
+        drop(second);
+        drop(first);
+        (result, acquired)
+    } else {
+        let mut second = RUN_QUEUES[second_cpu].inner.lock();
+        let mut first = RUN_QUEUES[first_cpu].inner.lock();
+        let acquired = probe.then(crate::timer::get_time);
+        let first_previous_ready = first.ready_len();
+        let second_previous_ready = second.ready_len();
+        let result = operation(&mut first, &mut second);
+        publish_run_queue_state(first_cpu, first_previous_ready, first.ready_len());
+        publish_run_queue_state(second_cpu, second_previous_ready, second.ready_len());
+        drop(first);
+        drop(second);
+        (result, acquired)
+    };
+
+    if let (Some(wait_start), Some(acquired)) = (wait_start, result.1) {
+        let released = crate::timer::get_time();
+        super::smp_probe::record_cpu_probe_run_queue(
+            acquired.saturating_sub(wait_start),
+            released.saturating_sub(acquired),
+        );
+    }
+    result.0
+}
+
 #[cfg(feature = "perf-counters")]
 fn record_remote_run_queue_lock(cpu: crate::cpu::CpuId) {
     if crate::cpu::try_current_id().is_some_and(|current| current != cpu) {
@@ -584,6 +828,77 @@ fn run_queue_ready_snapshot(cpu: crate::cpu::CpuId) -> usize {
 
 fn run_queue_load_snapshot(cpu: crate::cpu::CpuId) -> usize {
     run_queue_ready_snapshot(cpu) + usize::from(!super::processor_is_idle(cpu))
+}
+
+fn mix_steal_seed(mut value: usize) -> usize {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9usize);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11ebusize);
+    value ^ (value >> 31)
+}
+
+fn choose_steal_victim(
+    cpu: crate::cpu::CpuId,
+    candidates: crate::cpu::CpuMask,
+) -> (Option<crate::cpu::CpuId>, usize) {
+    let mut remaining = candidates;
+    let sample_count = remaining.count().min(STEAL_VICTIM_PROBE_LIMIT);
+    let sequence = RUN_QUEUES[cpu]
+        .steal_sequence
+        .fetch_add(STEAL_SEQUENCE_INCREMENT, Ordering::Relaxed);
+    let mut seed = mix_steal_seed(sequence ^ cpu.wrapping_add(1));
+    let mut best = None;
+
+    for _ in 0..sample_count {
+        seed = mix_steal_seed(seed.wrapping_add(STEAL_SEQUENCE_INCREMENT));
+        let victim = cpu_at_mask_index(remaining, seed % remaining.count());
+        remaining.remove(victim);
+        let ready = run_queue_ready_snapshot(victim);
+        if best.is_none_or(|(_, best_ready)| ready > best_ready) {
+            best = Some((victim, ready));
+        }
+    }
+    (best.map(|(victim, _)| victim), sample_count)
+}
+
+fn steal_batch_from(
+    victim: crate::cpu::CpuId,
+    target_cpu: crate::cpu::CpuId,
+) -> (Option<Arc<TaskControlBlock>>, usize) {
+    with_run_queue_pair(victim, target_cpu, |source, target| {
+        if let Some(task) = target.fetch(target_cpu) {
+            return (Some(task), 0);
+        }
+
+        let source_ready = source.ready_len();
+        if source_ready == 0 {
+            return (None, 0);
+        }
+        let target_ready = target.ready_len();
+        let excess = source_ready.saturating_sub(target_ready);
+        let batch_limit = if source_ready > 1 {
+            (excess / 2).clamp(1, STEAL_BATCH_MAX)
+        } else {
+            1
+        };
+        let mut scan_budget = STEAL_TASK_SCAN_BUDGET;
+        let Some((task, source_min)) = source.steal_one_for_cpu(target_cpu, &mut scan_budget)
+        else {
+            return (None, 0);
+        };
+        let target_min = target.min_vruntime();
+        task.migrate_sched_vruntime(source_min, target_min);
+        let additional = source.steal_normal_batch_to(
+            target,
+            target_cpu,
+            batch_limit.saturating_sub(1),
+            &mut scan_budget,
+            source_min,
+            target_min,
+        );
+        (Some(task), additional + 1)
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -895,34 +1210,34 @@ pub(super) fn fetch_task() -> Option<Arc<TaskControlBlock>> {
         return Some(task);
     }
 
-    let cpu_count = crate::cpu::topology().possible_count();
-    let candidates = crate::cpu::CpuMask::from_bits(
-        RUNNABLE_QUEUES.load(Ordering::Acquire).bits()
-            & crate::cpu::online_mask().bits()
-            & !crate::cpu::CpuMask::single(cpu).bits(),
+    let eligible_victims = crate::cpu::CpuMask::from_bits(
+        crate::cpu::online_mask().bits() & !crate::cpu::CpuMask::single(cpu).bits(),
     );
+    let overloaded = crate::cpu::CpuMask::from_bits(
+        OVERLOADED_QUEUES.load(Ordering::Acquire).bits() & eligible_victims.bits(),
+    );
+    let candidates = if overloaded.bits() != 0 {
+        overloaded
+    } else {
+        crate::cpu::CpuMask::from_bits(
+            RUNNABLE_QUEUES.load(Ordering::Acquire).bits() & eligible_victims.bits(),
+        )
+    };
     if candidates.bits() == 0 {
+        perf::record_scheduler_idle_pull(0, 0);
         return None;
     }
-    for offset in 1..cpu_count {
-        let victim = (cpu + offset) % cpu_count;
-        if !candidates.contains(victim) {
-            continue;
-        }
-        perf::record_scheduler_victim_probe();
-        let stolen = with_run_queue(victim, |manager| {
-            let source_min = manager.min_vruntime();
-            manager.fetch(cpu).map(|task| (task, source_min))
-        });
-        if let Some((task, source_min)) = stolen {
-            let target_min = with_run_queue(cpu, |manager| manager.min_vruntime());
-            task.migrate_sched_vruntime(source_min, target_min);
-            super::smp_probe::record_cpu_probe_steal();
-            perf::record_scheduler_steal_tasks(1);
-            return Some(task);
-        }
+    let (victim, probes) = choose_steal_victim(cpu, candidates);
+    let Some(victim) = victim else {
+        perf::record_scheduler_idle_pull(probes, 0);
+        return None;
+    };
+    let (task, stolen_tasks) = steal_batch_from(victim, cpu);
+    perf::record_scheduler_idle_pull(probes, stolen_tasks);
+    for _ in 0..stolen_tasks {
+        super::smp_probe::record_cpu_probe_steal();
     }
-    None
+    task
 }
 
 pub(super) fn remove_ready_tasks_of_process(process_id: usize) {
