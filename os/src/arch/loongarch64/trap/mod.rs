@@ -4,7 +4,10 @@ use crate::arch::interrupt::{disable_supervisor_interrupt, enable_supervisor_int
 use crate::config::TRAMPOLINE;
 use crate::mm::{MmapFaultAccess, MmapFaultResult, MmapPageCacheInstall, MmapPageCacheResolve};
 use crate::perf;
-use crate::syscall::{syscall_is_exit, syscall_is_exit_group, syscall_with_current_task};
+use crate::syscall::{
+    syscall_exit_with_current_task, syscall_is_exit, syscall_is_exit_group,
+    syscall_with_current_task,
+};
 use crate::task::{
     ProcessControlBlock, SignalAction, SignalFlags, TaskControlBlock, account_task_user_time_until,
     check_signals_of_task, current_add_signal, current_process, current_task,
@@ -140,17 +143,20 @@ pub fn trap_handler() -> ! {
             // process kept alive only by this handler frame.
             if syscall_is_exit(syscall_nr) {
                 drop(process);
-                let _ = syscall_with_current_task(task, syscall_nr, syscall_args);
+                let _ = syscall_exit_with_current_task(task, syscall_nr, syscall_args);
                 unreachable!("exit syscall returned");
             }
             let result = if syscall_is_exit_group(syscall_nr) {
                 drop(process);
-                let result = syscall_with_current_task(task, syscall_nr, syscall_args);
+                let result = syscall_exit_with_current_task(task, syscall_nr, syscall_args);
                 task = current_task().expect("seccomp-blocked exit_group requires a running task");
                 process = process_of_task(&task);
                 result
             } else {
-                syscall_with_current_task(Arc::clone(&task), syscall_nr, syscall_args)
+                let outcome = syscall_with_current_task(task, process, syscall_nr, syscall_args);
+                task = outcome.task;
+                process = outcome.process;
+                outcome.result
             };
             let cx = trap_cx_of_task(&task);
             interrupted_pc = cx.era;

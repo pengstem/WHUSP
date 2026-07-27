@@ -5,7 +5,8 @@ use crate::config::TRAMPOLINE;
 use crate::mm::{MmapFaultAccess, MmapFaultResult, MmapPageCacheInstall, MmapPageCacheResolve};
 use crate::perf;
 use crate::syscall::{
-    errno::SysError, syscall_is_exit, syscall_is_exit_group, syscall_with_current_task,
+    errno::SysError, syscall_exit_with_current_task, syscall_is_exit, syscall_is_exit_group,
+    syscall_with_current_task,
 };
 use crate::task::{
     ProcessControlBlock, SignalAction, SignalFlags, TaskControlBlock, account_task_user_time_until,
@@ -106,17 +107,20 @@ pub fn trap_handler() -> ! {
             // process kept alive only by this handler frame.
             if syscall_is_exit(syscall_nr) {
                 drop(process);
-                let _ = syscall_with_current_task(task, syscall_nr, syscall_args);
+                let _ = syscall_exit_with_current_task(task, syscall_nr, syscall_args);
                 unreachable!("exit syscall returned");
             }
             let result = if syscall_is_exit_group(syscall_nr) {
                 drop(process);
-                let result = syscall_with_current_task(task, syscall_nr, syscall_args);
+                let result = syscall_exit_with_current_task(task, syscall_nr, syscall_args);
                 task = current_task().expect("seccomp-blocked exit_group requires a running task");
                 process = process_of_task(&task);
                 result
             } else {
-                syscall_with_current_task(Arc::clone(&task), syscall_nr, syscall_args)
+                let outcome = syscall_with_current_task(task, process, syscall_nr, syscall_args);
+                task = outcome.task;
+                process = outcome.process;
+                outcome.result
             };
             // cx is changed during sys_execve, so we have to call it again
             let cx = trap_cx_of_task(&task);

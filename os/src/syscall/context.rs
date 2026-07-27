@@ -35,4 +35,10 @@ impl SyscallContext {
     pub(crate) fn user_token(&self) -> usize {
         self.user_token
     }
+
+    /// Returns the trap frame's original owning references without changing
+    /// either strong count.
+    pub(crate) fn into_current(self) -> (Arc<TaskControlBlock>, Arc<ProcessControlBlock>) {
+        (self.task, self.process)
+    }
 }

@@ -303,7 +303,7 @@ mod wait;
 
 use crate::perf;
 use crate::task::{
-    RLimit, SeccompSockFilter, SignalFlags, SignalInfo, TaskControlBlock, process_of_task,
+    ProcessControlBlock, RLimit, SeccompSockFilter, SignalFlags, SignalInfo, TaskControlBlock,
     queue_signal_to_task,
 };
 use aio::*;
@@ -389,28 +389,26 @@ fn seccomp_signal_for_syscall(task: &TaskControlBlock, syscall_id: usize) -> Opt
     }
 }
 
-fn syscall_identity_fast_path(task: &TaskControlBlock, syscall_id: usize) -> Option<isize> {
+fn syscall_identity_fast_path(
+    task: &TaskControlBlock,
+    process: &ProcessControlBlock,
+    syscall_id: usize,
+) -> Option<isize> {
     // Keep this path limited to pure identity getters. Anything that touches
     // user memory, can sleep, or depends on an exec-stable address-space token
     // must go through SyscallContext below.
     let value = match syscall_id {
         SYSCALL_GETTID => task.linux_tid() as isize,
         SYSCALL_GETPID | SYSCALL_GETPPID | SYSCALL_GETUID | SYSCALL_GETEUID | SYSCALL_GETGID
-        | SYSCALL_GETEGID => {
-            let process = task
-                .process
-                .upgrade()
-                .expect("current task process must outlive the task");
-            match syscall_id {
-                SYSCALL_GETPID => process.visible_pid() as isize,
-                SYSCALL_GETPPID => process.getppid() as isize,
-                SYSCALL_GETUID => process.credentials().ruid as isize,
-                SYSCALL_GETEUID => process.credentials().euid as isize,
-                SYSCALL_GETGID => process.credentials().rgid as isize,
-                SYSCALL_GETEGID => process.credentials().egid as isize,
-                _ => unreachable!(),
-            }
-        }
+        | SYSCALL_GETEGID => match syscall_id {
+            SYSCALL_GETPID => process.visible_pid() as isize,
+            SYSCALL_GETPPID => process.getppid() as isize,
+            SYSCALL_GETUID => process.credentials().ruid as isize,
+            SYSCALL_GETEUID => process.credentials().euid as isize,
+            SYSCALL_GETGID => process.credentials().rgid as isize,
+            SYSCALL_GETEGID => process.credentials().egid as isize,
+            _ => unreachable!(),
+        },
         _ => return None,
     };
     perf::record_syscall_identity_fast_path();
@@ -425,11 +423,23 @@ pub fn syscall_is_exit_group(syscall_id: usize) -> bool {
     syscall_id == SYSCALL_EXIT_GROUP
 }
 
-pub fn syscall_with_current_task(
+pub(crate) struct SyscallOutcome {
+    pub(crate) result: isize,
+    pub(crate) task: Arc<TaskControlBlock>,
+    pub(crate) process: Arc<ProcessControlBlock>,
+}
+
+/// Handles the only syscall paths that may consume the trap frame's current
+/// task reference without returning it.
+pub(crate) fn syscall_exit_with_current_task(
     current: Arc<TaskControlBlock>,
     syscall_id: usize,
     args: [usize; 6],
 ) -> isize {
+    assert!(
+        syscall_is_exit(syscall_id) || syscall_is_exit_group(syscall_id),
+        "exit syscall dispatcher received a returning syscall"
+    );
     perf::record_syscall_dispatch_call();
     if syscall_id == SYSCALL_EXIT {
         drop(current);
@@ -442,19 +452,55 @@ pub fn syscall_with_current_task(
         queue_signal_to_task(Arc::clone(&current), signal, SignalInfo::user(signum, 0));
         return 0;
     }
-    if syscall_id == SYSCALL_EXIT_GROUP {
-        drop(current);
-        sys_exit_group(args[0] as i32);
+    drop(current);
+    sys_exit_group(args[0] as i32);
+}
+
+/// Moves the trap frame's owning references through a returning syscall.
+///
+/// This avoids a task Arc clone/drop and a process Weak upgrade/drop on every
+/// ordinary dispatch. `SyscallContext` remains owning, so a handler may sleep
+/// or schedule before the same references are moved back to the trap frame.
+pub(crate) fn syscall_with_current_task(
+    current: Arc<TaskControlBlock>,
+    process: Arc<ProcessControlBlock>,
+    syscall_id: usize,
+    args: [usize; 6],
+) -> SyscallOutcome {
+    assert!(
+        !syscall_is_exit(syscall_id) && !syscall_is_exit_group(syscall_id),
+        "returning syscall dispatcher received an exit syscall"
+    );
+    perf::record_syscall_dispatch_call();
+    if let Some(signal) = seccomp_signal_for_syscall(&current, syscall_id) {
+        // UNFINISHED: Filter mode supports only a small classic-BPF subset.
+        // Unsupported or denied filter paths fail closed with SIGSYS.
+        let signum = signal.bits().trailing_zeros() as i32;
+        queue_signal_to_task(Arc::clone(&current), signal, SignalInfo::user(signum, 0));
+        return SyscallOutcome {
+            result: 0,
+            task: current,
+            process,
+        };
     }
     let _profile_scope = perf::time_scope(perf::ProfilePoint::SyscallDispatch);
     let _syscall_profile_scope = perf::time_syscall(syscall_id);
-    if let Some(value) = syscall_identity_fast_path(&current, syscall_id) {
-        return value;
+    if let Some(result) = syscall_identity_fast_path(&current, &process, syscall_id) {
+        return SyscallOutcome {
+            result,
+            task: current,
+            process,
+        };
     }
 
-    let process = process_of_task(&current);
     let ctx = SyscallContext::new(current, process);
-    ret(syscall_with_context(&ctx, syscall_id, args))
+    let result = ret(syscall_with_context(&ctx, syscall_id, args));
+    let (task, process) = ctx.into_current();
+    SyscallOutcome {
+        result,
+        task,
+        process,
+    }
 }
 
 pub(crate) fn syscall_with_context(
