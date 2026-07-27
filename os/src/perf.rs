@@ -1116,10 +1116,6 @@ mod enabled {
         VFS_READ_CACHE_ELIGIBLE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_read_cache_skip_too_large() {
-        VFS_READ_CACHE_SKIP_TOO_LARGE.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub(crate) fn record_vfs_read_cache_skip_dirty_pages() {
         VFS_READ_CACHE_SKIP_DIRTY_PAGES.fetch_add(1, Ordering::Relaxed);
     }
@@ -2911,9 +2907,6 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_vfs_read_cache_eligible() {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_read_cache_skip_too_large() {}
 
     #[inline(always)]
     pub(crate) fn record_vfs_read_cache_skip_dirty_pages() {}

@@ -1087,10 +1087,6 @@ fn page_cache_id_for_node_with_support(
     Some(PageCacheId::new(node.mount_id, node.ino))
 }
 
-fn page_cache_id_for_node(node: VfsNodeId, kind: FsNodeKind) -> Option<PageCacheId> {
-    page_cache_id_for_node_with_support(node, kind, mount_supports_page_cache(node.mount_id))
-}
-
 fn invalidate_small_regular_read_cache(node: VfsNodeId, kind: FsNodeKind) {
     if kind == FsNodeKind::RegularFile {
         SMALL_REGULAR_READ_FILES.remove(node);

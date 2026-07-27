@@ -505,10 +505,6 @@ impl MmapPageCacheFault {
         }
     }
 
-    pub fn key(&self) -> PageCacheKey {
-        self.key
-    }
-
     pub fn is_exec_fault(&self) -> bool {
         self.exec_fault
     }
