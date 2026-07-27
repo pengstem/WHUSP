@@ -866,10 +866,15 @@ fn with_run_queue<R>(cpu: crate::cpu::CpuId, operation: impl FnOnce(&mut TaskMan
     result
 }
 
-fn queue_remote_wake(task: Arc<TaskControlBlock>, target: crate::cpu::CpuId, front: bool) {
+fn queue_remote_wake(
+    task: Arc<TaskControlBlock>,
+    target: crate::cpu::CpuId,
+    front: bool,
+    rt_priority: usize,
+) {
     assert!(target < MAX_CPUS, "remote wake CPU exceeds MAX_CPUS");
     REMOTE_WAKE_LISTS[target].push(task, front);
-    let sent_ipi = crate::cpu::wake_scheduler_cpu_exact(target);
+    let sent_ipi = crate::cpu::wake_scheduler_cpu_for_task(target, rt_priority);
     perf::record_scheduler_remote_wake_push(sent_ipi);
 }
 
@@ -1342,10 +1347,12 @@ fn wakeup_task_with_placement(task: Arc<TaskControlBlock>, front: bool) -> bool 
 
 pub(super) fn enqueue_woken_task(task: Arc<TaskControlBlock>, front: bool) {
     let target = choose_run_queue(&task, PlacementKind::Wake);
+    let rt_priority = TaskManager::rt_priority(&task);
     if crate::cpu::try_current_id() == Some(target) {
         enqueue_task_on_cpu(task, target, front);
+        crate::cpu::wake_scheduler_cpu_for_task(target, rt_priority);
     } else {
-        queue_remote_wake(task, target, front);
+        queue_remote_wake(task, target, front, rt_priority);
     }
 }
 
@@ -1366,6 +1373,7 @@ pub(crate) fn wakeup_timer_task(task: Arc<TaskControlBlock>) -> bool {
 
 pub(super) fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     let cpu = crate::cpu::current_id();
+    crate::cpu::take_scheduler_need_resched(cpu);
     drain_remote_wakes(cpu);
     if let Some(task) = with_run_queue(cpu, |manager| manager.fetch(cpu)) {
         return Some(task);

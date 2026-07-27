@@ -147,9 +147,18 @@ pub fn mark_current_kernel_time_entry(now_us: usize) {
 }
 
 pub fn timer_tick_should_preempt(current: &Arc<TaskControlBlock>) -> bool {
-    manager::remote_wake_pending(crate::cpu::current_id())
+    let cpu = crate::cpu::current_id();
+    (crate::cpu::scheduler_need_resched(cpu) && crate::cpu::take_scheduler_need_resched(cpu))
+        || manager::remote_wake_pending(cpu)
         || current.inner_exclusive_access().job_control_stopped
         || manager::should_preempt_current_on_tick(current)
+}
+
+pub fn preempt_current_if_needed_on_user_return() {
+    let cpu = crate::cpu::current_id();
+    if crate::cpu::scheduler_need_resched(cpu) && crate::cpu::take_scheduler_need_resched(cpu) {
+        suspend_current_and_run_next();
+    }
 }
 
 pub(crate) fn remote_wake_pending(cpu: crate::cpu::CpuId) -> bool {

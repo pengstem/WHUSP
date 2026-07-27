@@ -355,13 +355,16 @@ pub fn run_tasks() -> ! {
             let next_task_cx_ptr = task
                 .inner
                 .exclusive_session(|task_inner| &task_inner.task_cx as *const TaskContext);
+            let rt_priority = task.realtime_priority() as usize;
             task.mark_sched_run_start(crate::timer::get_time_us());
             processor.set_current(task);
+            crate::cpu::scheduler_publish_current_priority(rt_priority);
             // release processor manually
             drop(processor);
             unsafe {
                 __switch(idle_task_cx_ptr, next_task_cx_ptr);
             }
+            crate::cpu::scheduler_clear_current_priority();
             finish_current_switch();
             super::reap_exited_tasks();
         } else {

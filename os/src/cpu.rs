@@ -461,8 +461,27 @@ static TLB_CROSS_DONE: AtomicCpuMask = AtomicCpuMask::new(CpuMask::empty());
 static SCHEDULER_APS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SCHEDULER_ACTIVE_CPUS: AtomicCpuMask = AtomicCpuMask::new(CpuMask::empty());
 static SCHEDULER_ACTIVE_LOGGED: AtomicBool = AtomicBool::new(false);
-static SCHEDULER_WAKE_PENDING: [AtomicBool; MAX_CPUS] =
-    [const { AtomicBool::new(false) }; MAX_CPUS];
+const SCHEDULER_NO_CURRENT_PRIORITY: usize = usize::MAX;
+
+#[repr(C, align(64))]
+struct SchedulerCpuSignals {
+    wake_pending: AtomicBool,
+    need_resched: AtomicBool,
+    current_rt_priority: AtomicUsize,
+}
+
+impl SchedulerCpuSignals {
+    const fn new() -> Self {
+        Self {
+            wake_pending: AtomicBool::new(false),
+            need_resched: AtomicBool::new(false),
+            current_rt_priority: AtomicUsize::new(SCHEDULER_NO_CURRENT_PRIORITY),
+        }
+    }
+}
+
+static SCHEDULER_SIGNALS: [SchedulerCpuSignals; MAX_CPUS] =
+    [const { SchedulerCpuSignals::new() }; MAX_CPUS];
 
 struct RemoteSyncRequest {
     active: AtomicBool,
@@ -671,7 +690,9 @@ pub fn scheduler_aps_active() -> bool {
 pub fn activate_scheduler_aps() {
     SCHEDULER_APS_ACTIVE.store(true, Ordering::Release);
     for cpu in 1..topology().possible_count() {
-        SCHEDULER_WAKE_PENDING[cpu].store(true, Ordering::Release);
+        SCHEDULER_SIGNALS[cpu]
+            .wake_pending
+            .store(true, Ordering::Release);
         crate::arch::smp::send_ipi(cpu).unwrap_or_else(|error| {
             panic!("scheduler activation IPI to CPU {cpu} failed: {error:#x}")
         });
@@ -696,15 +717,46 @@ pub fn scheduler_publish_active(cpu: CpuId) {
     }
 }
 
-fn wake_scheduler_cpu_remote(cpu: CpuId) -> bool {
-    let already_pending = SCHEDULER_WAKE_PENDING[cpu].swap(true, Ordering::AcqRel);
+fn wake_should_preempt(cpu: CpuId, wakee_rt_priority: usize) -> bool {
+    let current_rt_priority = SCHEDULER_SIGNALS[cpu]
+        .current_rt_priority
+        .load(Ordering::Acquire);
+    wakee_rt_priority != 0
+        && (current_rt_priority == SCHEDULER_NO_CURRENT_PRIORITY
+            || current_rt_priority == 0
+            || wakee_rt_priority > current_rt_priority)
+}
+
+fn request_need_resched(cpu: CpuId, needed: bool) -> bool {
+    let newly_set = needed
+        && !SCHEDULER_SIGNALS[cpu]
+            .need_resched
+            .swap(true, Ordering::AcqRel);
+    crate::perf::record_scheduler_need_resched(needed, newly_set);
+    newly_set
+}
+
+fn wake_scheduler_cpu_remote(cpu: CpuId, wakee_rt_priority: Option<usize>) -> bool {
+    let signals = &SCHEDULER_SIGNALS[cpu];
+    let already_pending = signals.wake_pending.swap(true, Ordering::AcqRel);
+    let need_resched = wakee_rt_priority
+        .map(|priority| request_need_resched(cpu, wake_should_preempt(cpu, priority)))
+        .unwrap_or(false);
     let mut sent_ipi = false;
-    if !already_pending && crate::task::processor_is_idle(cpu) {
+    if need_resched || (!already_pending && crate::task::processor_is_idle(cpu)) {
         if let Err(error) = crate::arch::smp::send_ipi(cpu) {
-            SCHEDULER_WAKE_PENDING[cpu].store(false, Ordering::Release);
+            if !already_pending {
+                signals.wake_pending.store(false, Ordering::Release);
+            }
+            if need_resched {
+                signals.need_resched.store(false, Ordering::Release);
+            }
             panic!("scheduler wake IPI to CPU {cpu} failed: {error:#x}");
         }
         sent_ipi = true;
+    }
+    if need_resched && sent_ipi {
+        crate::perf::record_scheduler_need_resched_ipi();
     }
     crate::task::record_smp_cpu_probe_scheduler_wake(true, sent_ipi);
     sent_ipi
@@ -719,7 +771,24 @@ pub fn wake_scheduler_cpu_exact(cpu: CpuId) -> bool {
         crate::task::record_smp_cpu_probe_scheduler_wake(false, false);
         return false;
     }
-    wake_scheduler_cpu_remote(cpu)
+    wake_scheduler_cpu_remote(cpu, None)
+}
+
+pub fn wake_scheduler_cpu_for_task(cpu: CpuId, wakee_rt_priority: usize) -> bool {
+    if !scheduler_aps_active() {
+        return false;
+    }
+    let current = current_id();
+    if !online_mask().contains(cpu) {
+        crate::task::record_smp_cpu_probe_scheduler_wake(false, false);
+        return false;
+    }
+    if cpu == current {
+        request_need_resched(cpu, wake_should_preempt(cpu, wakee_rt_priority));
+        crate::task::record_smp_cpu_probe_scheduler_wake(false, false);
+        return false;
+    }
+    wake_scheduler_cpu_remote(cpu, Some(wakee_rt_priority))
 }
 
 pub fn wake_scheduler_cpu(allowed: CpuMask) {
@@ -732,7 +801,7 @@ pub fn wake_scheduler_cpu(allowed: CpuMask) {
     for offset in 1..cpu_count {
         let cpu = (current + offset) % cpu_count;
         if eligible.contains(cpu) {
-            wake_scheduler_cpu_remote(cpu);
+            wake_scheduler_cpu_remote(cpu, None);
             return;
         }
     }
@@ -749,7 +818,9 @@ pub(crate) fn request_scheduler_preemption(targets: CpuMask) {
         if cpu == current || !targets.contains(cpu) {
             continue;
         }
-        SCHEDULER_WAKE_PENDING[cpu].store(true, Ordering::Release);
+        SCHEDULER_SIGNALS[cpu]
+            .wake_pending
+            .store(true, Ordering::Release);
         crate::arch::smp::send_ipi(cpu).unwrap_or_else(|error| {
             panic!("scheduler preemption IPI to CPU {cpu} failed: {error:#x}")
         });
@@ -758,8 +829,37 @@ pub(crate) fn request_scheduler_preemption(targets: CpuMask) {
 }
 
 pub fn take_scheduler_wake(cpu: CpuId) -> bool {
-    SCHEDULER_WAKE_PENDING[cpu].swap(false, Ordering::AcqRel)
+    SCHEDULER_SIGNALS[cpu]
+        .wake_pending
+        .swap(false, Ordering::AcqRel)
         || crate::task::remote_wake_pending(cpu)
+}
+
+pub(crate) fn scheduler_publish_current_priority(rt_priority: usize) {
+    assert!(rt_priority <= 99, "invalid current RT priority");
+    SCHEDULER_SIGNALS[current_id()]
+        .current_rt_priority
+        .store(rt_priority, Ordering::Release);
+}
+
+pub(crate) fn scheduler_clear_current_priority() {
+    SCHEDULER_SIGNALS[current_id()]
+        .current_rt_priority
+        .store(SCHEDULER_NO_CURRENT_PRIORITY, Ordering::Release);
+}
+
+pub(crate) fn scheduler_need_resched(cpu: CpuId) -> bool {
+    SCHEDULER_SIGNALS[cpu].need_resched.load(Ordering::Acquire)
+}
+
+pub(crate) fn take_scheduler_need_resched(cpu: CpuId) -> bool {
+    let needed = SCHEDULER_SIGNALS[cpu]
+        .need_resched
+        .swap(false, Ordering::AcqRel);
+    if needed {
+        crate::perf::record_scheduler_need_resched_consumed();
+    }
+    needed
 }
 
 pub(crate) fn synchronize_remote_memory(targets: CpuMask) -> Result<(), usize> {

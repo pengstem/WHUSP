@@ -367,6 +367,7 @@ fn trap_return_for_task(
     task: Arc<TaskControlBlock>,
     process: Arc<crate::task::ProcessControlBlock>,
 ) -> ! {
+    crate::task::preempt_current_if_needed_on_user_return();
     let now_us = get_time_us();
     let (trap_cx, user_token) =
         trap_return_context_after_accounting_for_task(&task, &process, now_us);

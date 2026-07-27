@@ -86,6 +86,12 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) scheduler_remote_wake_list_tasks: usize,
     pub(crate) scheduler_remote_wake_list_batch_max: usize,
     pub(crate) scheduler_remote_wake_ipis: usize,
+    pub(crate) scheduler_need_resched_checks: usize,
+    pub(crate) scheduler_need_resched_requests: usize,
+    pub(crate) scheduler_need_resched_sets: usize,
+    pub(crate) scheduler_need_resched_coalesced: usize,
+    pub(crate) scheduler_need_resched_ipis: usize,
+    pub(crate) scheduler_need_resched_consumed: usize,
     pub(crate) wakeup_front_successes: usize,
     pub(crate) wakeup_back_successes: usize,
     pub(crate) syscall_dispatch_calls: usize,
@@ -407,6 +413,12 @@ mod enabled {
     static SCHEDULER_REMOTE_WAKE_LIST_TASKS: AtomicUsize = AtomicUsize::new(0);
     static SCHEDULER_REMOTE_WAKE_LIST_BATCH_MAX: AtomicUsize = AtomicUsize::new(0);
     static SCHEDULER_REMOTE_WAKE_IPIS: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_NEED_RESCHED_CHECKS: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_NEED_RESCHED_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_NEED_RESCHED_SETS: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_NEED_RESCHED_COALESCED: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_NEED_RESCHED_IPIS: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_NEED_RESCHED_CONSUMED: AtomicUsize = AtomicUsize::new(0);
     static WAKEUP_FRONT_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
     static WAKEUP_BACK_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
     static SYSCALL_DISPATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -1010,6 +1022,28 @@ mod enabled {
         SCHEDULER_REMOTE_WAKE_LIST_DRAINS.fetch_add(1, Ordering::Relaxed);
         SCHEDULER_REMOTE_WAKE_LIST_TASKS.fetch_add(tasks, Ordering::Relaxed);
         update_max(&SCHEDULER_REMOTE_WAKE_LIST_BATCH_MAX, tasks);
+    }
+
+    pub(crate) fn record_scheduler_need_resched(needed: bool, newly_set: bool) {
+        SCHEDULER_NEED_RESCHED_CHECKS.fetch_add(1, Ordering::Relaxed);
+        if !needed {
+            return;
+        }
+        SCHEDULER_NEED_RESCHED_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        let counter = if newly_set {
+            &SCHEDULER_NEED_RESCHED_SETS
+        } else {
+            &SCHEDULER_NEED_RESCHED_COALESCED
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_scheduler_need_resched_ipi() {
+        SCHEDULER_NEED_RESCHED_IPIS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_scheduler_need_resched_consumed() {
+        SCHEDULER_NEED_RESCHED_CONSUMED.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_task_wakeup(front: bool) {
@@ -1877,6 +1911,15 @@ mod enabled {
             scheduler_remote_wake_list_batch_max: SCHEDULER_REMOTE_WAKE_LIST_BATCH_MAX
                 .load(Ordering::Relaxed),
             scheduler_remote_wake_ipis: SCHEDULER_REMOTE_WAKE_IPIS.load(Ordering::Relaxed),
+            scheduler_need_resched_checks: SCHEDULER_NEED_RESCHED_CHECKS.load(Ordering::Relaxed),
+            scheduler_need_resched_requests: SCHEDULER_NEED_RESCHED_REQUESTS
+                .load(Ordering::Relaxed),
+            scheduler_need_resched_sets: SCHEDULER_NEED_RESCHED_SETS.load(Ordering::Relaxed),
+            scheduler_need_resched_coalesced: SCHEDULER_NEED_RESCHED_COALESCED
+                .load(Ordering::Relaxed),
+            scheduler_need_resched_ipis: SCHEDULER_NEED_RESCHED_IPIS.load(Ordering::Relaxed),
+            scheduler_need_resched_consumed: SCHEDULER_NEED_RESCHED_CONSUMED
+                .load(Ordering::Relaxed),
             wakeup_front_successes: WAKEUP_FRONT_SUCCESSES.load(Ordering::Relaxed),
             wakeup_back_successes: WAKEUP_BACK_SUCCESSES.load(Ordering::Relaxed),
             syscall_dispatch_calls: SYSCALL_DISPATCH_CALLS.load(Ordering::Relaxed),
@@ -2239,6 +2282,12 @@ mod enabled {
          scheduler_remote_wake_list_tasks {}\n\
          scheduler_remote_wake_list_batch_max {}\n\
          scheduler_remote_wake_ipis {}\n\
+         scheduler_need_resched_checks {}\n\
+         scheduler_need_resched_requests {}\n\
+         scheduler_need_resched_sets {}\n\
+         scheduler_need_resched_coalesced {}\n\
+         scheduler_need_resched_ipis {}\n\
+         scheduler_need_resched_consumed {}\n\
          wakeup_front_successes {}\n\
          wakeup_back_successes {}\n\
          syscall_dispatch_calls {}\n\
@@ -2550,6 +2599,12 @@ mod enabled {
             stats.scheduler_remote_wake_list_tasks,
             stats.scheduler_remote_wake_list_batch_max,
             stats.scheduler_remote_wake_ipis,
+            stats.scheduler_need_resched_checks,
+            stats.scheduler_need_resched_requests,
+            stats.scheduler_need_resched_sets,
+            stats.scheduler_need_resched_coalesced,
+            stats.scheduler_need_resched_ipis,
+            stats.scheduler_need_resched_consumed,
             stats.wakeup_front_successes,
             stats.wakeup_back_successes,
             stats.syscall_dispatch_calls,
@@ -2909,6 +2964,15 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_scheduler_remote_wake_drain(_tasks: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_scheduler_need_resched(_needed: bool, _newly_set: bool) {}
+
+    #[inline(always)]
+    pub(crate) fn record_scheduler_need_resched_ipi() {}
+
+    #[inline(always)]
+    pub(crate) fn record_scheduler_need_resched_consumed() {}
 
     #[inline(always)]
     pub(crate) fn record_task_wakeup(_front: bool) {}
