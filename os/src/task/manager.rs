@@ -526,6 +526,7 @@ fn publish_run_queue_transition(cpu: crate::cpu::CpuId, was_runnable: bool, read
 
 fn with_run_queue<R>(cpu: crate::cpu::CpuId, operation: impl FnOnce(&mut TaskManager) -> R) -> R {
     assert!(cpu < MAX_CPUS, "run-queue CPU exceeds MAX_CPUS");
+    record_remote_run_queue_lock(cpu);
     let probe = super::smp_probe::cpu_probe_active();
     let wait_start = probe.then(crate::timer::get_time);
     let mut manager = RUN_QUEUES[cpu].lock();
@@ -544,7 +545,19 @@ fn with_run_queue<R>(cpu: crate::cpu::CpuId, operation: impl FnOnce(&mut TaskMan
     result
 }
 
+#[cfg(feature = "perf-counters")]
+fn record_remote_run_queue_lock(cpu: crate::cpu::CpuId) {
+    if crate::cpu::try_current_id().is_some_and(|current| current != cpu) {
+        perf::record_scheduler_remote_rq_lock_acquires(1);
+    }
+}
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_remote_run_queue_lock(_cpu: crate::cpu::CpuId) {}
+
 fn run_queue_load(cpu: crate::cpu::CpuId) -> usize {
+    record_remote_run_queue_lock(cpu);
     let ready = RUN_QUEUES[cpu].lock().ready_len();
     ready + usize::from(!super::processor_is_idle(cpu))
 }
@@ -558,9 +571,15 @@ fn choose_run_queue(
     assert!(eligible.bits() != 0, "runnable task has no online CPU");
 
     let mut best = None;
+    #[cfg(feature = "perf-counters")]
+    let mut probes = 0;
     for cpu in 0..crate::cpu::topology().possible_count() {
         if !eligible.contains(cpu) {
             continue;
+        }
+        #[cfg(feature = "perf-counters")]
+        {
+            probes += 1;
         }
         let load = run_queue_load(cpu);
         let prefer = usize::from(preferred == Some(cpu));
@@ -570,6 +589,8 @@ fn choose_run_queue(
             best = Some((cpu, load, prefer));
         }
     }
+    #[cfg(feature = "perf-counters")]
+    perf::record_scheduler_placement(probes);
     best.expect("eligible CPU mask contained no topology CPU").0
 }
 
@@ -599,7 +620,19 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
 }
 
 pub(crate) fn requeue_task_after_run(task: Arc<TaskControlBlock>) {
-    enqueue_task_on_best_queue(task, false, true);
+    #[cfg(feature = "perf-counters")]
+    {
+        let normal = task.realtime_priority() == 0;
+        let origin = crate::cpu::current_id();
+        let target = enqueue_task_on_best_queue(task, false, true);
+        if normal {
+            perf::record_scheduler_requeue(origin == target);
+        }
+    }
+    #[cfg(not(feature = "perf-counters"))]
+    {
+        enqueue_task_on_best_queue(task, false, true);
+    }
 }
 
 pub(super) fn charge_task_after_run(task: &TaskControlBlock) {
@@ -688,6 +721,7 @@ pub(super) fn fetch_task() -> Option<Arc<TaskControlBlock>> {
         if !candidates.contains(victim) {
             continue;
         }
+        perf::record_scheduler_victim_probe();
         let stolen = with_run_queue(victim, |manager| {
             let source_min = manager.min_vruntime();
             manager.fetch(cpu).map(|task| (task, source_min))
@@ -696,6 +730,7 @@ pub(super) fn fetch_task() -> Option<Arc<TaskControlBlock>> {
             let target_min = with_run_queue(cpu, |manager| manager.min_vruntime());
             task.migrate_sched_vruntime(source_min, target_min);
             super::smp_probe::record_cpu_probe_steal();
+            perf::record_scheduler_steal_tasks(1);
             return Some(task);
         }
     }
@@ -742,6 +777,14 @@ pub(crate) fn migrate_ready_task(task: Arc<TaskControlBlock>) {
         return;
     }
 
+    #[cfg(feature = "perf-counters")]
+    {
+        if let Some(current) = crate::cpu::try_current_id() {
+            perf::record_scheduler_remote_rq_lock_acquires(
+                usize::from(current != source) + usize::from(current != target),
+            );
+        }
+    }
     let moved = if source < target {
         let mut source_queue = RUN_QUEUES[source].lock();
         let mut target_queue = RUN_QUEUES[target].lock();

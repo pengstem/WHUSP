@@ -70,6 +70,13 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) scheduler_pruned_exited_tasks: usize,
     pub(crate) scheduler_ready_queue_len_max: usize,
     pub(crate) scheduler_rt_priority_probes: usize,
+    pub(crate) scheduler_local_requeues: usize,
+    pub(crate) scheduler_cross_cpu_requeues: usize,
+    pub(crate) scheduler_placement_calls: usize,
+    pub(crate) scheduler_placement_cpu_probes: usize,
+    pub(crate) scheduler_remote_rq_lock_acquires: usize,
+    pub(crate) scheduler_victim_probes: usize,
+    pub(crate) scheduler_steal_tasks: usize,
     pub(crate) wakeup_front_successes: usize,
     pub(crate) wakeup_back_successes: usize,
     pub(crate) syscall_dispatch_calls: usize,
@@ -375,6 +382,13 @@ mod enabled {
     static SCHEDULER_PRUNED_EXITED_TASKS: AtomicUsize = AtomicUsize::new(0);
     static SCHEDULER_READY_QUEUE_LEN_MAX: AtomicUsize = AtomicUsize::new(0);
     static SCHEDULER_RT_PRIORITY_PROBES: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_LOCAL_REQUEUES: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_CROSS_CPU_REQUEUES: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_PLACEMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_PLACEMENT_CPU_PROBES: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_REMOTE_RQ_LOCK_ACQUIRES: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_VICTIM_PROBES: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_STEAL_TASKS: AtomicUsize = AtomicUsize::new(0);
     static WAKEUP_FRONT_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
     static WAKEUP_BACK_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
     static SYSCALL_DISPATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -933,6 +947,32 @@ mod enabled {
 
     pub(crate) fn record_scheduler_rt_priority_probes(probes: usize) {
         SCHEDULER_RT_PRIORITY_PROBES.fetch_add(probes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_scheduler_requeue(local: bool) {
+        let counter = if local {
+            &SCHEDULER_LOCAL_REQUEUES
+        } else {
+            &SCHEDULER_CROSS_CPU_REQUEUES
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_scheduler_placement(cpu_probes: usize) {
+        SCHEDULER_PLACEMENT_CALLS.fetch_add(1, Ordering::Relaxed);
+        SCHEDULER_PLACEMENT_CPU_PROBES.fetch_add(cpu_probes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_scheduler_remote_rq_lock_acquires(acquires: usize) {
+        SCHEDULER_REMOTE_RQ_LOCK_ACQUIRES.fetch_add(acquires, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_scheduler_victim_probe() {
+        SCHEDULER_VICTIM_PROBES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_scheduler_steal_tasks(tasks: usize) {
+        SCHEDULER_STEAL_TASKS.fetch_add(tasks, Ordering::Relaxed);
     }
 
     pub(crate) fn record_task_wakeup(front: bool) {
@@ -1779,6 +1819,14 @@ mod enabled {
             scheduler_pruned_exited_tasks: SCHEDULER_PRUNED_EXITED_TASKS.load(Ordering::Relaxed),
             scheduler_ready_queue_len_max: SCHEDULER_READY_QUEUE_LEN_MAX.load(Ordering::Relaxed),
             scheduler_rt_priority_probes: SCHEDULER_RT_PRIORITY_PROBES.load(Ordering::Relaxed),
+            scheduler_local_requeues: SCHEDULER_LOCAL_REQUEUES.load(Ordering::Relaxed),
+            scheduler_cross_cpu_requeues: SCHEDULER_CROSS_CPU_REQUEUES.load(Ordering::Relaxed),
+            scheduler_placement_calls: SCHEDULER_PLACEMENT_CALLS.load(Ordering::Relaxed),
+            scheduler_placement_cpu_probes: SCHEDULER_PLACEMENT_CPU_PROBES.load(Ordering::Relaxed),
+            scheduler_remote_rq_lock_acquires: SCHEDULER_REMOTE_RQ_LOCK_ACQUIRES
+                .load(Ordering::Relaxed),
+            scheduler_victim_probes: SCHEDULER_VICTIM_PROBES.load(Ordering::Relaxed),
+            scheduler_steal_tasks: SCHEDULER_STEAL_TASKS.load(Ordering::Relaxed),
             wakeup_front_successes: WAKEUP_FRONT_SUCCESSES.load(Ordering::Relaxed),
             wakeup_back_successes: WAKEUP_BACK_SUCCESSES.load(Ordering::Relaxed),
             syscall_dispatch_calls: SYSCALL_DISPATCH_CALLS.load(Ordering::Relaxed),
@@ -2125,6 +2173,13 @@ mod enabled {
          scheduler_pruned_exited_tasks {}\n\
          scheduler_ready_queue_len_max {}\n\
          scheduler_rt_priority_probes {}\n\
+         scheduler_local_requeues {}\n\
+         scheduler_cross_cpu_requeues {}\n\
+         scheduler_placement_calls {}\n\
+         scheduler_placement_cpu_probes {}\n\
+         scheduler_remote_rq_lock_acquires {}\n\
+         scheduler_victim_probes {}\n\
+         scheduler_steal_tasks {}\n\
          wakeup_front_successes {}\n\
          wakeup_back_successes {}\n\
          syscall_dispatch_calls {}\n\
@@ -2420,6 +2475,13 @@ mod enabled {
             stats.scheduler_pruned_exited_tasks,
             stats.scheduler_ready_queue_len_max,
             stats.scheduler_rt_priority_probes,
+            stats.scheduler_local_requeues,
+            stats.scheduler_cross_cpu_requeues,
+            stats.scheduler_placement_calls,
+            stats.scheduler_placement_cpu_probes,
+            stats.scheduler_remote_rq_lock_acquires,
+            stats.scheduler_victim_probes,
+            stats.scheduler_steal_tasks,
             stats.wakeup_front_successes,
             stats.wakeup_back_successes,
             stats.syscall_dispatch_calls,
@@ -2767,6 +2829,12 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_scheduler_rt_priority_probes(_probes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_scheduler_victim_probe() {}
+
+    #[inline(always)]
+    pub(crate) fn record_scheduler_steal_tasks(_tasks: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_task_wakeup(_front: bool) {}
