@@ -4,10 +4,12 @@ use super::{
 use crate::config::MAX_CPUS;
 use crate::perf;
 use crate::sync::{SpinNoIrqLock, UPIntrFreeCell};
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use lazy_static::*;
 use log::info;
 
@@ -32,6 +34,82 @@ enum ClaimResult {
     Ineligible,
     Stopped,
     Exited,
+}
+
+enum RemoteEnqueueResult {
+    Enqueued,
+    Stale(Arc<TaskControlBlock>),
+    Retarget(Arc<TaskControlBlock>, bool),
+}
+
+struct RemoteWakeNode {
+    next: *mut RemoteWakeNode,
+    task: Arc<TaskControlBlock>,
+    front: bool,
+}
+
+/// Multi-producer, single-consumer handoff for one target CPU.
+///
+/// Producers publish fully initialized nodes with Release ordering. Only the
+/// target CPU detaches nodes, using Acquire ordering before reading node data.
+/// CONTEXT: Nodes allocate until Phase 3 embeds an intrusive wake node in the
+/// scheduler-owned task data. The handoff itself is lock-free and keeps remote
+/// producers away from the target run-queue lock.
+#[repr(C, align(64))]
+struct RemoteWakeList {
+    head: AtomicPtr<RemoteWakeNode>,
+}
+
+impl RemoteWakeList {
+    const fn new() -> Self {
+        Self {
+            head: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    fn push(&self, task: Arc<TaskControlBlock>, front: bool) {
+        let node = Box::into_raw(Box::new(RemoteWakeNode {
+            next: ptr::null_mut(),
+            task,
+            front,
+        }));
+        let mut head = self.head.load(Ordering::Relaxed);
+        loop {
+            // SAFETY: `node` is private to this producer until the Release CAS
+            // succeeds. A failed CAS leaves ownership with this producer.
+            unsafe {
+                (*node).next = head;
+            }
+            match self
+                .head
+                .compare_exchange_weak(head, node, Ordering::Release, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(observed) => head = observed,
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head.load(Ordering::Acquire).is_null()
+    }
+
+    fn take_fifo(&self) -> *mut RemoteWakeNode {
+        let mut current = self.head.swap(ptr::null_mut(), Ordering::AcqRel);
+        let mut reversed = ptr::null_mut();
+        while !current.is_null() {
+            // SAFETY: the AcqRel swap detached this entire chain from every
+            // producer. The target CPU is its only consumer and may reverse
+            // the private `next` links in place.
+            let next = unsafe { (*current).next };
+            unsafe {
+                (*current).next = reversed;
+            }
+            reversed = current;
+            current = next;
+        }
+        reversed
+    }
 }
 
 pub struct TaskManager {
@@ -137,6 +215,32 @@ impl TaskManager {
         if Self::mark_queued_on(&task, self.cpu) {
             self.enqueue(task, true);
         }
+    }
+
+    fn add_remote(&mut self, task: Arc<TaskControlBlock>, front: bool) -> RemoteEnqueueResult {
+        let mut inner = task.inner_exclusive_access();
+        if inner.task_status == TaskStatus::Exited
+            || inner.job_control_stopped
+            || inner.on_rq
+            || inner.on_cpu.is_some()
+        {
+            drop(inner);
+            return RemoteEnqueueResult::Stale(task);
+        }
+        assert_eq!(
+            inner.task_status,
+            TaskStatus::Ready,
+            "remote wake-list contained a non-ready task"
+        );
+        if !inner.allowed_cpus.contains(self.cpu) {
+            drop(inner);
+            return RemoteEnqueueResult::Retarget(task, front);
+        }
+        inner.on_rq = true;
+        inner.queued_cpu = Some(self.cpu);
+        drop(inner);
+        self.enqueue(task, front);
+        RemoteEnqueueResult::Enqueued
     }
 
     fn mark_queued_on(task: &TaskControlBlock, cpu: crate::cpu::CpuId) -> bool {
@@ -710,6 +814,8 @@ impl PerCpuRunQueue {
 
 lazy_static! {
     static ref RUN_QUEUES: Vec<PerCpuRunQueue> = (0..MAX_CPUS).map(PerCpuRunQueue::new).collect();
+    static ref REMOTE_WAKE_LISTS: Vec<RemoteWakeList> =
+        (0..MAX_CPUS).map(|_| RemoteWakeList::new()).collect();
     static ref PID2PCB: UPIntrFreeCell<BTreeMap<usize, Arc<ProcessControlBlock>>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
     static ref LINUX_TID2TASK: UPIntrFreeCell<BTreeMap<usize, Weak<TaskControlBlock>>> =
@@ -758,6 +864,56 @@ fn with_run_queue<R>(cpu: crate::cpu::CpuId, operation: impl FnOnce(&mut TaskMan
         );
     }
     result
+}
+
+fn queue_remote_wake(task: Arc<TaskControlBlock>, target: crate::cpu::CpuId, front: bool) {
+    assert!(target < MAX_CPUS, "remote wake CPU exceeds MAX_CPUS");
+    REMOTE_WAKE_LISTS[target].push(task, front);
+    let sent_ipi = crate::cpu::wake_scheduler_cpu_exact(target);
+    perf::record_scheduler_remote_wake_push(sent_ipi);
+}
+
+fn drain_remote_wakes(cpu: crate::cpu::CpuId) {
+    let mut node = REMOTE_WAKE_LISTS[cpu].take_fifo();
+    if node.is_null() {
+        return;
+    }
+
+    let mut entries = Vec::new();
+    while !node.is_null() {
+        // SAFETY: `take_fifo()` detached and reversed the list for this sole
+        // target-CPU consumer. Rebuilding the Box transfers each node back to
+        // allocator ownership exactly once.
+        let boxed = unsafe { Box::from_raw(node) };
+        node = boxed.next;
+        entries.push((boxed.task, boxed.front));
+    }
+    let task_count = entries.len();
+    let mut deferred_drops = Vec::with_capacity(task_count);
+    let mut retarget = Vec::with_capacity(task_count);
+    with_run_queue(cpu, |manager| {
+        for (task, front) in entries {
+            match manager.add_remote(task, front) {
+                RemoteEnqueueResult::Enqueued => {}
+                RemoteEnqueueResult::Stale(task) => deferred_drops.push(task),
+                RemoteEnqueueResult::Retarget(task, front) => retarget.push((task, front)),
+            }
+        }
+    });
+    perf::record_scheduler_remote_wake_drain(task_count);
+
+    // Arc destruction and recursive retarget placement stay outside the rq
+    // lock. A resumed stopped task may already own a normal rq reference, in
+    // which case dropping the stale wake-list reference is the only action.
+    drop(deferred_drops);
+    for (task, front) in retarget {
+        enqueue_woken_task(task, front);
+    }
+}
+
+pub(super) fn remote_wake_pending(cpu: crate::cpu::CpuId) -> bool {
+    assert!(cpu < MAX_CPUS, "remote wake CPU exceeds MAX_CPUS");
+    !REMOTE_WAKE_LISTS[cpu].is_empty()
 }
 
 fn with_run_queue_pair<R>(
@@ -1186,7 +1342,11 @@ fn wakeup_task_with_placement(task: Arc<TaskControlBlock>, front: bool) -> bool 
 
 pub(super) fn enqueue_woken_task(task: Arc<TaskControlBlock>, front: bool) {
     let target = choose_run_queue(&task, PlacementKind::Wake);
-    enqueue_task_on_cpu(task, target, front);
+    if crate::cpu::try_current_id() == Some(target) {
+        enqueue_task_on_cpu(task, target, front);
+    } else {
+        queue_remote_wake(task, target, front);
+    }
 }
 
 pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
@@ -1206,6 +1366,7 @@ pub(crate) fn wakeup_timer_task(task: Arc<TaskControlBlock>) -> bool {
 
 pub(super) fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     let cpu = crate::cpu::current_id();
+    drain_remote_wakes(cpu);
     if let Some(task) = with_run_queue(cpu, |manager| manager.fetch(cpu)) {
         return Some(task);
     }

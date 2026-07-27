@@ -81,6 +81,11 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) scheduler_idle_pull_probe_max: usize,
     pub(crate) scheduler_steal_batches: usize,
     pub(crate) scheduler_steal_batch_max: usize,
+    pub(crate) scheduler_remote_wake_list_pushes: usize,
+    pub(crate) scheduler_remote_wake_list_drains: usize,
+    pub(crate) scheduler_remote_wake_list_tasks: usize,
+    pub(crate) scheduler_remote_wake_list_batch_max: usize,
+    pub(crate) scheduler_remote_wake_ipis: usize,
     pub(crate) wakeup_front_successes: usize,
     pub(crate) wakeup_back_successes: usize,
     pub(crate) syscall_dispatch_calls: usize,
@@ -397,6 +402,11 @@ mod enabled {
     static SCHEDULER_IDLE_PULL_PROBE_MAX: AtomicUsize = AtomicUsize::new(0);
     static SCHEDULER_STEAL_BATCHES: AtomicUsize = AtomicUsize::new(0);
     static SCHEDULER_STEAL_BATCH_MAX: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_REMOTE_WAKE_LIST_PUSHES: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_REMOTE_WAKE_LIST_DRAINS: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_REMOTE_WAKE_LIST_TASKS: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_REMOTE_WAKE_LIST_BATCH_MAX: AtomicUsize = AtomicUsize::new(0);
+    static SCHEDULER_REMOTE_WAKE_IPIS: AtomicUsize = AtomicUsize::new(0);
     static WAKEUP_FRONT_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
     static WAKEUP_BACK_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
     static SYSCALL_DISPATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -984,6 +994,22 @@ mod enabled {
             SCHEDULER_STEAL_TASKS.fetch_add(stolen_tasks, Ordering::Relaxed);
             update_max(&SCHEDULER_STEAL_BATCH_MAX, stolen_tasks);
         }
+    }
+
+    pub(crate) fn record_scheduler_remote_wake_push(sent_ipi: bool) {
+        SCHEDULER_REMOTE_WAKE_LIST_PUSHES.fetch_add(1, Ordering::Relaxed);
+        if sent_ipi {
+            SCHEDULER_REMOTE_WAKE_IPIS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_scheduler_remote_wake_drain(tasks: usize) {
+        if tasks == 0 {
+            return;
+        }
+        SCHEDULER_REMOTE_WAKE_LIST_DRAINS.fetch_add(1, Ordering::Relaxed);
+        SCHEDULER_REMOTE_WAKE_LIST_TASKS.fetch_add(tasks, Ordering::Relaxed);
+        update_max(&SCHEDULER_REMOTE_WAKE_LIST_BATCH_MAX, tasks);
     }
 
     pub(crate) fn record_task_wakeup(front: bool) {
@@ -1842,6 +1868,15 @@ mod enabled {
             scheduler_idle_pull_probe_max: SCHEDULER_IDLE_PULL_PROBE_MAX.load(Ordering::Relaxed),
             scheduler_steal_batches: SCHEDULER_STEAL_BATCHES.load(Ordering::Relaxed),
             scheduler_steal_batch_max: SCHEDULER_STEAL_BATCH_MAX.load(Ordering::Relaxed),
+            scheduler_remote_wake_list_pushes: SCHEDULER_REMOTE_WAKE_LIST_PUSHES
+                .load(Ordering::Relaxed),
+            scheduler_remote_wake_list_drains: SCHEDULER_REMOTE_WAKE_LIST_DRAINS
+                .load(Ordering::Relaxed),
+            scheduler_remote_wake_list_tasks: SCHEDULER_REMOTE_WAKE_LIST_TASKS
+                .load(Ordering::Relaxed),
+            scheduler_remote_wake_list_batch_max: SCHEDULER_REMOTE_WAKE_LIST_BATCH_MAX
+                .load(Ordering::Relaxed),
+            scheduler_remote_wake_ipis: SCHEDULER_REMOTE_WAKE_IPIS.load(Ordering::Relaxed),
             wakeup_front_successes: WAKEUP_FRONT_SUCCESSES.load(Ordering::Relaxed),
             wakeup_back_successes: WAKEUP_BACK_SUCCESSES.load(Ordering::Relaxed),
             syscall_dispatch_calls: SYSCALL_DISPATCH_CALLS.load(Ordering::Relaxed),
@@ -2199,6 +2234,11 @@ mod enabled {
          scheduler_idle_pull_probe_max {}\n\
          scheduler_steal_batches {}\n\
          scheduler_steal_batch_max {}\n\
+         scheduler_remote_wake_list_pushes {}\n\
+         scheduler_remote_wake_list_drains {}\n\
+         scheduler_remote_wake_list_tasks {}\n\
+         scheduler_remote_wake_list_batch_max {}\n\
+         scheduler_remote_wake_ipis {}\n\
          wakeup_front_successes {}\n\
          wakeup_back_successes {}\n\
          syscall_dispatch_calls {}\n\
@@ -2505,6 +2545,11 @@ mod enabled {
             stats.scheduler_idle_pull_probe_max,
             stats.scheduler_steal_batches,
             stats.scheduler_steal_batch_max,
+            stats.scheduler_remote_wake_list_pushes,
+            stats.scheduler_remote_wake_list_drains,
+            stats.scheduler_remote_wake_list_tasks,
+            stats.scheduler_remote_wake_list_batch_max,
+            stats.scheduler_remote_wake_ipis,
             stats.wakeup_front_successes,
             stats.wakeup_back_successes,
             stats.syscall_dispatch_calls,
@@ -2858,6 +2903,12 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_scheduler_idle_pull(_probes: usize, _stolen_tasks: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_scheduler_remote_wake_push(_sent_ipi: bool) {}
+
+    #[inline(always)]
+    pub(crate) fn record_scheduler_remote_wake_drain(_tasks: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_task_wakeup(_front: bool) {}

@@ -696,7 +696,7 @@ pub fn scheduler_publish_active(cpu: CpuId) {
     }
 }
 
-fn wake_scheduler_cpu_remote(cpu: CpuId) {
+fn wake_scheduler_cpu_remote(cpu: CpuId) -> bool {
     let already_pending = SCHEDULER_WAKE_PENDING[cpu].swap(true, Ordering::AcqRel);
     let mut sent_ipi = false;
     if !already_pending && crate::task::processor_is_idle(cpu) {
@@ -707,18 +707,19 @@ fn wake_scheduler_cpu_remote(cpu: CpuId) {
         sent_ipi = true;
     }
     crate::task::record_smp_cpu_probe_scheduler_wake(true, sent_ipi);
+    sent_ipi
 }
 
-pub fn wake_scheduler_cpu_exact(cpu: CpuId) {
+pub fn wake_scheduler_cpu_exact(cpu: CpuId) -> bool {
     if !scheduler_aps_active() {
-        return;
+        return false;
     }
     let current = current_id();
     if cpu == current || !online_mask().contains(cpu) {
         crate::task::record_smp_cpu_probe_scheduler_wake(false, false);
-        return;
+        return false;
     }
-    wake_scheduler_cpu_remote(cpu);
+    wake_scheduler_cpu_remote(cpu)
 }
 
 pub fn wake_scheduler_cpu(allowed: CpuMask) {
@@ -758,6 +759,7 @@ pub(crate) fn request_scheduler_preemption(targets: CpuMask) {
 
 pub fn take_scheduler_wake(cpu: CpuId) -> bool {
     SCHEDULER_WAKE_PENDING[cpu].swap(false, Ordering::AcqRel)
+        || crate::task::remote_wake_pending(cpu)
 }
 
 pub(crate) fn synchronize_remote_memory(targets: CpuMask) -> Result<(), usize> {
