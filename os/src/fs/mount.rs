@@ -374,9 +374,25 @@ pub(super) fn with_mount<V>(
             .get(mount_id.0)
             .and_then(|mount| mount.as_ref().cloned())
     }?;
+    #[cfg(feature = "perf-counters")]
+    let mut backend = match mounted.backend.try_lock() {
+        Some(backend) => backend,
+        None => {
+            perf::record_mount_backend_contended_acquisition();
+            let wait_scope = perf::time_scope(perf::ProfilePoint::MountBackendContendedWait);
+            let backend = mounted.backend.lock();
+            drop(wait_scope);
+            backend
+        }
+    };
+    #[cfg(not(feature = "perf-counters"))]
     let mut backend = mounted.backend.lock();
+    let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
     drain_pending_inode_releases(mount_id, &mut **backend);
-    Some(f(&mut **backend))
+    let result = f(&mut **backend);
+    drop(backend);
+    drop(hold_scope);
+    Some(result)
 }
 
 pub(crate) fn overlay_real_node(node: VfsNodeId) -> Option<VfsNodeId> {

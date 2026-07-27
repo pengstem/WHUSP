@@ -3,7 +3,8 @@ use core::{marker::PhantomData, mem, time::Duration};
 use alloc::boxed::Box;
 
 use crate::{
-    DirLookupResult, DirReader, Ext4Error, Ext4Result, FileAttr, InodeRef, InodeType,
+    DirLookupResult, DirReader, Ext4Error, Ext4MappedReadPlan, Ext4Result, FileAttr, InodeRef,
+    InodeType,
     blockdev::{BlockDevice, Ext4BlockDevice},
     error::Context,
     ffi::*,
@@ -129,6 +130,14 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
 
     pub fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> Ext4Result<usize> {
         self.inode_ref(ino)?.read_at(buf, offset)
+    }
+    pub fn plan_aligned_read(
+        &mut self,
+        ino: u32,
+        len: usize,
+        offset: u64,
+    ) -> Ext4Result<Option<Ext4MappedReadPlan>> {
+        self.inode_ref(ino)?.plan_aligned_read(len, offset)
     }
     pub fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> Ext4Result<usize> {
         self.inode_ref(ino)?.write_at(buf, offset)

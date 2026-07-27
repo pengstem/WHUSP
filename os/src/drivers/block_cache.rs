@@ -126,6 +126,23 @@ pub(crate) struct BlockCacheStats {
     pub(crate) lru_scan_slots: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VersionedReadStats {
+    pub(crate) device_calls: usize,
+    pub(crate) device_blocks: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ReadFillToken {
+    write_epoch: usize,
+}
+
+#[derive(Default)]
+struct DeviceWriteState {
+    write_epoch: usize,
+    writers_inflight: usize,
+}
+
 struct BlockCache {
     enabled: bool,
     capacity: usize,
@@ -136,6 +153,10 @@ struct BlockCache {
     read_lines: BTreeMap<ReadCacheKey, ReadCacheLine>,
     read_lru: BTreeSet<ReadCacheLruEntry>,
     read_lru_clock: usize,
+    // CONTEXT: A lock-elided file read may finish after a concurrent ext4 write.
+    // Track each device's write epoch so only reads that observed no intervening
+    // writer can publish their data into the shared read cache.
+    device_write_states: BTreeMap<usize, DeviceWriteState>,
     stats: BlockCacheStats,
 }
 
@@ -151,6 +172,7 @@ impl BlockCache {
             read_lines: BTreeMap::new(),
             read_lru: BTreeSet::new(),
             read_lru_clock: 0,
+            device_write_states: BTreeMap::new(),
             stats: BlockCacheStats {
                 enabled: true,
                 capacity,
@@ -158,6 +180,72 @@ impl BlockCache {
                 ..BlockCacheStats::default()
             },
         }
+    }
+
+    fn begin_device_write(&mut self, device_key: usize) {
+        let state = self.device_write_states.entry(device_key).or_default();
+        state.write_epoch = state.write_epoch.wrapping_add(1);
+        state.writers_inflight = state
+            .writers_inflight
+            .checked_add(1)
+            .expect("block-cache writer count overflow");
+    }
+
+    fn end_device_write(&mut self, device_key: usize) {
+        let state = self
+            .device_write_states
+            .get_mut(&device_key)
+            .expect("block-cache writer state is missing");
+        assert_ne!(
+            state.writers_inflight, 0,
+            "block-cache writer count underflow"
+        );
+        state.writers_inflight -= 1;
+        state.write_epoch = state.write_epoch.wrapping_add(1);
+    }
+
+    fn read_fill_token(&self, device_key: usize) -> Option<ReadFillToken> {
+        let state = self.device_write_states.get(&device_key);
+        if state.is_some_and(|state| state.writers_inflight != 0) {
+            return None;
+        }
+        Some(ReadFillToken {
+            write_epoch: state.map_or(0, |state| state.write_epoch),
+        })
+    }
+
+    fn read_fill_token_is_current(&self, device_key: usize, token: ReadFillToken) -> bool {
+        let state = self.device_write_states.get(&device_key);
+        !state.is_some_and(|state| state.writers_inflight != 0)
+            && state.map_or(0, |state| state.write_epoch) == token.write_epoch
+    }
+
+    fn insert_read4k_run_if_token(
+        &mut self,
+        device_key: usize,
+        block_id: usize,
+        data: &[u8],
+        token: ReadFillToken,
+    ) -> bool {
+        if !self.read_fill_token_is_current(device_key, token) {
+            return false;
+        }
+        self.insert_read4k_run(device_key, block_id, data);
+        true
+    }
+
+    fn insert_read_run_if_token(
+        &mut self,
+        device_key: usize,
+        block_id: usize,
+        data: &[u8],
+        token: ReadFillToken,
+    ) -> bool {
+        if !self.read_fill_token_is_current(device_key, token) {
+            return false;
+        }
+        self.insert_read_run(device_key, block_id, data);
+        true
     }
 
     fn touch(&mut self, key: BlockCacheKey, old_stamp: Option<usize>) -> usize {
@@ -586,6 +674,21 @@ fn cache_insert_read4k_run(device_key: usize, block_id: usize, data: &[u8]) {
         .insert_read4k_run(device_key, block_id, data);
 }
 
+fn cache_read_fill_token(device_key: usize) -> Option<ReadFillToken> {
+    BLOCK_CACHE.exclusive_access().read_fill_token(device_key)
+}
+
+fn cache_insert_read4k_run_if_token(
+    device_key: usize,
+    block_id: usize,
+    data: &[u8],
+    token: ReadFillToken,
+) -> bool {
+    BLOCK_CACHE
+        .exclusive_access()
+        .insert_read4k_run_if_token(device_key, block_id, data, token)
+}
+
 fn cache_update_after_write4k(device_key: usize, block_id: usize, data: &[u8]) {
     BLOCK_CACHE
         .exclusive_access()
@@ -602,6 +705,36 @@ fn cache_insert_read_run(device_key: usize, block_id: usize, data: &[u8]) {
     BLOCK_CACHE
         .exclusive_access()
         .insert_read_run(device_key, block_id, data);
+}
+
+fn cache_insert_read_run_if_token(
+    device_key: usize,
+    block_id: usize,
+    data: &[u8],
+    token: ReadFillToken,
+) -> bool {
+    BLOCK_CACHE
+        .exclusive_access()
+        .insert_read_run_if_token(device_key, block_id, data, token)
+}
+
+struct DeviceWriteGuard {
+    device_key: usize,
+}
+
+impl Drop for DeviceWriteGuard {
+    fn drop(&mut self) {
+        BLOCK_CACHE
+            .exclusive_access()
+            .end_device_write(self.device_key);
+    }
+}
+
+fn begin_device_write(device_key: usize) -> DeviceWriteGuard {
+    BLOCK_CACHE
+        .exclusive_access()
+        .begin_device_write(device_key);
+    DeviceWriteGuard { device_key }
 }
 
 fn cache_update_after_write_run(device_key: usize, block_id: usize, data: &[u8]) {
@@ -779,6 +912,96 @@ pub(crate) fn read_with_cache<F>(
     }
 }
 
+pub(crate) fn read_with_cache_versioned_fill<F>(
+    device_key: usize,
+    block_id: usize,
+    buf: &mut [u8],
+    mut read_uncached: F,
+) -> VersionedReadStats
+where
+    F: FnMut(usize, &mut [u8]),
+{
+    let full_blocks = buf.len() / BLOCK_CACHE_LINE_SIZE;
+    let full_bytes = full_blocks * BLOCK_CACHE_LINE_SIZE;
+    let mut stats = VersionedReadStats::default();
+    let mut index = 0;
+    while index < full_blocks {
+        let start = index * BLOCK_CACHE_LINE_SIZE;
+        if can_use_read4k(
+            block_id + index,
+            &buf[start..full_bytes],
+            full_blocks - index,
+        ) {
+            let max_blocks = cached_io_full_blocks(&buf[start..full_bytes], full_blocks - index);
+            let max_blocks = max_blocks / READ_CACHE_LINE_BLOCKS * READ_CACHE_LINE_BLOCKS;
+            let first_end = start + READ_CACHE_LINE_SIZE;
+            match cache_read4k_or_miss_run(
+                device_key,
+                block_id + index,
+                max_blocks,
+                &mut buf[start..first_end],
+            ) {
+                None => index += READ_CACHE_LINE_BLOCKS,
+                Some(blocks) => {
+                    let end = start + blocks * BLOCK_CACHE_LINE_SIZE;
+                    let fill_token = cache_read_fill_token(device_key);
+                    record_device_read_submit(blocks);
+                    read_uncached(block_id + index, &mut buf[start..end]);
+                    if let Some(fill_token) = fill_token {
+                        let _ = cache_insert_read4k_run_if_token(
+                            device_key,
+                            block_id + index,
+                            &buf[start..end],
+                            fill_token,
+                        );
+                    }
+                    stats.device_calls += 1;
+                    stats.device_blocks += blocks;
+                    index += blocks;
+                }
+            }
+            continue;
+        }
+        record_read4k_fallback();
+        let max_blocks = page_bounded_full_blocks(&buf[start..full_bytes], full_blocks - index);
+        match cache_read_or_miss_run(
+            device_key,
+            block_id + index,
+            max_blocks,
+            &mut buf[start..start + BLOCK_CACHE_LINE_SIZE],
+        ) {
+            None => index += 1,
+            Some(blocks) => {
+                let end = start + blocks * BLOCK_CACHE_LINE_SIZE;
+                let fill_token = cache_read_fill_token(device_key);
+                record_device_read_submit(blocks);
+                read_uncached(block_id + index, &mut buf[start..end]);
+                if let Some(fill_token) = fill_token {
+                    let _ = cache_insert_read_run_if_token(
+                        device_key,
+                        block_id + index,
+                        &buf[start..end],
+                        fill_token,
+                    );
+                }
+                stats.device_calls += 1;
+                stats.device_blocks += blocks;
+                index += blocks;
+            }
+        }
+    }
+
+    let tail = &mut buf[full_bytes..];
+    if !tail.is_empty() {
+        record_bypass_unaligned();
+        record_device_read_submit(1);
+        read_uncached(block_id + full_blocks, tail);
+        stats.device_calls += 1;
+        stats.device_blocks += 1;
+    }
+    stats
+}
+
 pub(crate) fn write_with_cache<F>(
     device_key: usize,
     block_id: usize,
@@ -787,6 +1010,7 @@ pub(crate) fn write_with_cache<F>(
 ) where
     F: FnMut(usize, &[u8]),
 {
+    let _device_write_guard = begin_device_write(device_key);
     let full_blocks = buf.len() / BLOCK_CACHE_LINE_SIZE;
     let full_bytes = full_blocks * BLOCK_CACHE_LINE_SIZE;
     let mut index = 0;

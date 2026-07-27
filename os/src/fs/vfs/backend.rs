@@ -2,8 +2,15 @@ use super::super::{FileStat, FileTimestamp};
 use super::FsError;
 use super::FsResult;
 use super::VfsNodeId;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+
+pub(crate) trait BackendReadPlan: Send {
+    // The caller must validate the VFS content generation before publishing the
+    // result because executing a plan intentionally does not hold the backend lock.
+    fn execute(self: Box<Self>, buf: &mut [u8]) -> usize;
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FsNodeKind {
@@ -155,6 +162,14 @@ pub(crate) trait FileSystemBackend: Send {
         false
     }
     fn read_snapshot(&mut self, _ino: u32) -> Option<FsResult<Vec<u8>>> {
+        None
+    }
+    fn prepare_read_plan(
+        &mut self,
+        _ino: u32,
+        _offset: u64,
+        _len: usize,
+    ) -> Option<Box<dyn BackendReadPlan>> {
         None
     }
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize;

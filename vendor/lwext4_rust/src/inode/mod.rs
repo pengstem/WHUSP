@@ -5,6 +5,7 @@ mod file;
 use alloc::boxed::Box;
 pub use attr::FileAttr;
 pub use dir::{DirEntry, DirLookupResult, DirReader};
+pub use file::{Ext4MappedReadPlan, Ext4MappedReadRun};
 
 use core::marker::PhantomData;
 

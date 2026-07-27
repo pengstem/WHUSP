@@ -96,6 +96,26 @@ impl VirtIOBlock {
         });
     }
 
+    pub(crate) fn read_blocks_versioned_fill_for_file_plan(
+        &self,
+        block_id: usize,
+        buf: &mut [u8],
+    ) -> block_cache::VersionedReadStats {
+        assert_eq!(buf.len() % 512, 0, "file read plan must use full blocks");
+        assert!(
+            block_id
+                .checked_add(buf.len() / 512)
+                .is_some_and(|end| end <= self.capacity_blocks),
+            "file read plan exceeds block device capacity"
+        );
+        block_cache::read_with_cache_versioned_fill(
+            self.cache_key(),
+            block_id,
+            buf,
+            |block_id, buf| self.read_blocks_uncached(block_id, buf),
+        )
+    }
+
     fn read_blocks_uncached(&self, block_id: usize, buf: &mut [u8]) {
         match choose_block_io_path() {
             BlockIoPath::Nonblocking => self.read_blocks_nonblocking_uncached(block_id, buf),

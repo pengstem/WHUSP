@@ -3,11 +3,27 @@ use core::{
     slice,
 };
 
+use alloc::vec::Vec;
+
 use super::InodeRef;
 
 use crate::{
     Ext4Result, InodeType, SystemHal, WritebackGuard, error::Context, ffi::*, util::get_block_size,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ext4MappedReadRun {
+    pub buffer_block: usize,
+    pub block_count: usize,
+    pub fs_block: Option<u64>,
+}
+
+#[derive(Debug)]
+pub struct Ext4MappedReadPlan {
+    pub block_size: usize,
+    pub read_len: usize,
+    pub runs: Vec<Ext4MappedReadRun>,
+}
 
 fn take<'a>(buf: &mut &'a [u8], cnt: usize) -> &'a [u8] {
     let (first, rem) = buf.split_at(cnt.min(buf.len()));
@@ -23,6 +39,92 @@ fn take_mut<'a>(buf: &mut &'a mut [u8], cnt: usize) -> &'a mut [u8] {
 }
 
 impl<Hal: SystemHal> InodeRef<Hal> {
+    pub fn plan_aligned_read(
+        &mut self,
+        len: usize,
+        pos: u64,
+    ) -> Ext4Result<Option<Ext4MappedReadPlan>> {
+        let file_size = self.size();
+        let block_size = get_block_size(self.superblock()) as usize;
+        let Some(end) = pos.checked_add(len as u64) else {
+            return Ok(None);
+        };
+        if self.inode_type() != InodeType::RegularFile
+            || self.flags() & EXT4_INODE_FLAG_EXTENTS == 0
+            || len == 0
+            || block_size == 0
+            || pos % block_size as u64 != 0
+            || len % block_size != 0
+            || end > file_size
+        {
+            return Ok(None);
+        }
+
+        let logical_start = pos / block_size as u64;
+        let logical_blocks = len / block_size;
+        let Ok(logical_start) = u32::try_from(logical_start) else {
+            return Ok(None);
+        };
+        let Ok(logical_blocks_u32) = u32::try_from(logical_blocks) else {
+            return Ok(None);
+        };
+        if logical_start.checked_add(logical_blocks_u32).is_none() {
+            return Ok(None);
+        }
+
+        let mut runs: Vec<Ext4MappedReadRun> = Vec::new();
+        let mut buffer_block = 0usize;
+        while buffer_block < logical_blocks {
+            let logical_block = logical_start + buffer_block as u32;
+            let remaining = logical_blocks - buffer_block;
+            let mut fs_block = 0u64;
+            let mut mapped_blocks = 0u32;
+            unsafe {
+                ext4_extent_get_blocks(
+                    self.inner.as_mut(),
+                    logical_block,
+                    remaining as u32,
+                    &mut fs_block,
+                    false,
+                    &mut mapped_blocks,
+                )
+                .context("ext4_extent_get_blocks")?;
+            }
+            let run_blocks = if mapped_blocks == 0 {
+                1
+            } else {
+                (mapped_blocks as usize).min(remaining)
+            };
+            let fs_block = (fs_block != 0).then_some(fs_block);
+            let can_merge = runs.last().is_some_and(|last| {
+                last.buffer_block + last.block_count == buffer_block
+                    && match (last.fs_block, fs_block) {
+                        (None, None) => true,
+                        (Some(last_block), Some(next_block)) => {
+                            last_block + last.block_count as u64 == next_block
+                        }
+                        _ => false,
+                    }
+            });
+            if can_merge {
+                runs.last_mut().unwrap().block_count += run_blocks;
+            } else {
+                runs.push(Ext4MappedReadRun {
+                    buffer_block,
+                    block_count: run_blocks,
+                    fs_block,
+                });
+            }
+            buffer_block += run_blocks;
+        }
+
+        Ok(Some(Ext4MappedReadPlan {
+            block_size,
+            read_len: len,
+            runs,
+        }))
+    }
+
     fn get_inode_fblock(&mut self, block: u32) -> Ext4Result<u64> {
         unsafe {
             let mut fblock = 0u64;

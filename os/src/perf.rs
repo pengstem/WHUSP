@@ -54,10 +54,12 @@ pub(crate) enum ProfilePoint {
     FrameAllocMmapPageCache,
     FrameAllocSharedAnon,
     FrameAllocReadCache,
+    MountBackendContendedWait,
+    MountBackendHold,
 }
 
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
-const PROFILE_POINT_COUNT: usize = 52;
+const PROFILE_POINT_COUNT: usize = 54;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
@@ -236,6 +238,25 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) mount_metadata_source_clone_bytes: usize,
     pub(crate) mount_fast_stat_flags_calls: usize,
     pub(crate) mount_fast_fs_type_calls: usize,
+    pub(crate) mount_backend_contended_acquisitions: usize,
+    pub(crate) ext4_block_read_calls: usize,
+    pub(crate) ext4_block_read_blocks: usize,
+    pub(crate) ext4_block_read_bytes: usize,
+    pub(crate) ext4_block_write_calls: usize,
+    pub(crate) ext4_block_write_blocks: usize,
+    pub(crate) ext4_block_write_bytes: usize,
+    pub(crate) ext4_read_plan_attempts: usize,
+    pub(crate) ext4_read_plan_prepared: usize,
+    pub(crate) ext4_read_plan_executed: usize,
+    pub(crate) ext4_read_plan_fallbacks: usize,
+    pub(crate) ext4_read_plan_data_runs: usize,
+    pub(crate) ext4_read_plan_data_blocks: usize,
+    pub(crate) ext4_read_plan_zero_runs: usize,
+    pub(crate) ext4_read_plan_zero_blocks: usize,
+    pub(crate) ext4_read_plan_executed_bytes: usize,
+    pub(crate) ext4_read_plan_direct_io_calls: usize,
+    pub(crate) ext4_read_plan_direct_io_blocks: usize,
+    pub(crate) ext4_read_plan_direct_io_bytes: usize,
     pub(crate) eventfd_read_calls: usize,
     pub(crate) eventfd_write_calls: usize,
     pub(crate) eventfd_read_block_yields: usize,
@@ -526,6 +547,25 @@ mod enabled {
     static MOUNT_METADATA_SOURCE_CLONE_BYTES: AtomicUsize = AtomicUsize::new(0);
     static MOUNT_FAST_STAT_FLAGS_CALLS: AtomicUsize = AtomicUsize::new(0);
     static MOUNT_FAST_FS_TYPE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static MOUNT_BACKEND_CONTENDED_ACQUISITIONS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_BLOCK_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_BLOCK_READ_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_BLOCK_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_BLOCK_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_BLOCK_WRITE_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_BLOCK_WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_READ_PLAN_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_READ_PLAN_PREPARED: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_READ_PLAN_EXECUTED: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_READ_PLAN_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_READ_PLAN_DATA_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_READ_PLAN_DATA_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_READ_PLAN_ZERO_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_READ_PLAN_ZERO_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_READ_PLAN_EXECUTED_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_READ_PLAN_DIRECT_IO_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_READ_PLAN_DIRECT_IO_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_READ_PLAN_DIRECT_IO_BYTES: AtomicUsize = AtomicUsize::new(0);
     static EVENTFD_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EVENTFD_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EVENTFD_READ_BLOCK_YIELDS: AtomicUsize = AtomicUsize::new(0);
@@ -705,6 +745,8 @@ mod enabled {
         TimeStat::new("frame_alloc_mmap_page_cache"),
         TimeStat::new("frame_alloc_shared_anon"),
         TimeStat::new("frame_alloc_read_cache"),
+        TimeStat::new("mount_backend_contended_wait"),
+        TimeStat::new("mount_backend_hold"),
     ];
 
     fn update_max(cell: &AtomicUsize, value: usize) {
@@ -1347,6 +1389,54 @@ mod enabled {
         MOUNT_FAST_FS_TYPE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_mount_backend_contended_acquisition() {
+        MOUNT_BACKEND_CONTENDED_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_block_read(blocks: usize, bytes: usize) {
+        EXT4_BLOCK_READ_CALLS.fetch_add(1, Ordering::Relaxed);
+        EXT4_BLOCK_READ_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
+        EXT4_BLOCK_READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_block_write(blocks: usize, bytes: usize) {
+        EXT4_BLOCK_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
+        EXT4_BLOCK_WRITE_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
+        EXT4_BLOCK_WRITE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_read_plan_attempt() {
+        EXT4_READ_PLAN_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_read_plan_prepared(
+        data_runs: usize,
+        data_blocks: usize,
+        zero_runs: usize,
+        zero_blocks: usize,
+    ) {
+        EXT4_READ_PLAN_PREPARED.fetch_add(1, Ordering::Relaxed);
+        EXT4_READ_PLAN_DATA_RUNS.fetch_add(data_runs, Ordering::Relaxed);
+        EXT4_READ_PLAN_DATA_BLOCKS.fetch_add(data_blocks, Ordering::Relaxed);
+        EXT4_READ_PLAN_ZERO_RUNS.fetch_add(zero_runs, Ordering::Relaxed);
+        EXT4_READ_PLAN_ZERO_BLOCKS.fetch_add(zero_blocks, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_read_plan_fallback() {
+        EXT4_READ_PLAN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_read_plan_executed(bytes: usize) {
+        EXT4_READ_PLAN_EXECUTED.fetch_add(1, Ordering::Relaxed);
+        EXT4_READ_PLAN_EXECUTED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_read_plan_direct_io(calls: usize, blocks: usize, bytes: usize) {
+        EXT4_READ_PLAN_DIRECT_IO_CALLS.fetch_add(calls, Ordering::Relaxed);
+        EXT4_READ_PLAN_DIRECT_IO_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
+        EXT4_READ_PLAN_DIRECT_IO_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_eventfd_read_call() {
         EVENTFD_READ_CALLS.fetch_add(1, Ordering::Relaxed);
     }
@@ -1885,6 +1975,27 @@ mod enabled {
                 .load(Ordering::Relaxed),
             mount_fast_stat_flags_calls: MOUNT_FAST_STAT_FLAGS_CALLS.load(Ordering::Relaxed),
             mount_fast_fs_type_calls: MOUNT_FAST_FS_TYPE_CALLS.load(Ordering::Relaxed),
+            mount_backend_contended_acquisitions: MOUNT_BACKEND_CONTENDED_ACQUISITIONS
+                .load(Ordering::Relaxed),
+            ext4_block_read_calls: EXT4_BLOCK_READ_CALLS.load(Ordering::Relaxed),
+            ext4_block_read_blocks: EXT4_BLOCK_READ_BLOCKS.load(Ordering::Relaxed),
+            ext4_block_read_bytes: EXT4_BLOCK_READ_BYTES.load(Ordering::Relaxed),
+            ext4_block_write_calls: EXT4_BLOCK_WRITE_CALLS.load(Ordering::Relaxed),
+            ext4_block_write_blocks: EXT4_BLOCK_WRITE_BLOCKS.load(Ordering::Relaxed),
+            ext4_block_write_bytes: EXT4_BLOCK_WRITE_BYTES.load(Ordering::Relaxed),
+            ext4_read_plan_attempts: EXT4_READ_PLAN_ATTEMPTS.load(Ordering::Relaxed),
+            ext4_read_plan_prepared: EXT4_READ_PLAN_PREPARED.load(Ordering::Relaxed),
+            ext4_read_plan_executed: EXT4_READ_PLAN_EXECUTED.load(Ordering::Relaxed),
+            ext4_read_plan_fallbacks: EXT4_READ_PLAN_FALLBACKS.load(Ordering::Relaxed),
+            ext4_read_plan_data_runs: EXT4_READ_PLAN_DATA_RUNS.load(Ordering::Relaxed),
+            ext4_read_plan_data_blocks: EXT4_READ_PLAN_DATA_BLOCKS.load(Ordering::Relaxed),
+            ext4_read_plan_zero_runs: EXT4_READ_PLAN_ZERO_RUNS.load(Ordering::Relaxed),
+            ext4_read_plan_zero_blocks: EXT4_READ_PLAN_ZERO_BLOCKS.load(Ordering::Relaxed),
+            ext4_read_plan_executed_bytes: EXT4_READ_PLAN_EXECUTED_BYTES.load(Ordering::Relaxed),
+            ext4_read_plan_direct_io_calls: EXT4_READ_PLAN_DIRECT_IO_CALLS.load(Ordering::Relaxed),
+            ext4_read_plan_direct_io_blocks: EXT4_READ_PLAN_DIRECT_IO_BLOCKS
+                .load(Ordering::Relaxed),
+            ext4_read_plan_direct_io_bytes: EXT4_READ_PLAN_DIRECT_IO_BYTES.load(Ordering::Relaxed),
             eventfd_read_calls: EVENTFD_READ_CALLS.load(Ordering::Relaxed),
             eventfd_write_calls: EVENTFD_WRITE_CALLS.load(Ordering::Relaxed),
             eventfd_read_block_yields: EVENTFD_READ_BLOCK_YIELDS.load(Ordering::Relaxed),
@@ -2185,6 +2296,25 @@ mod enabled {
          mount_metadata_source_clone_bytes {}\n\
          mount_fast_stat_flags_calls {}\n\
          mount_fast_fs_type_calls {}\n\
+         mount_backend_contended_acquisitions {}\n\
+         ext4_block_read_calls {}\n\
+         ext4_block_read_blocks {}\n\
+         ext4_block_read_bytes {}\n\
+         ext4_block_write_calls {}\n\
+         ext4_block_write_blocks {}\n\
+         ext4_block_write_bytes {}\n\
+         ext4_read_plan_attempts {}\n\
+         ext4_read_plan_prepared {}\n\
+         ext4_read_plan_executed {}\n\
+         ext4_read_plan_fallbacks {}\n\
+         ext4_read_plan_data_runs {}\n\
+         ext4_read_plan_data_blocks {}\n\
+         ext4_read_plan_zero_runs {}\n\
+         ext4_read_plan_zero_blocks {}\n\
+         ext4_read_plan_executed_bytes {}\n\
+         ext4_read_plan_direct_io_calls {}\n\
+         ext4_read_plan_direct_io_blocks {}\n\
+         ext4_read_plan_direct_io_bytes {}\n\
          eventfd_read_calls {}\n\
          eventfd_write_calls {}\n\
          eventfd_read_block_yields {}\n\
@@ -2461,6 +2591,25 @@ mod enabled {
             stats.mount_metadata_source_clone_bytes,
             stats.mount_fast_stat_flags_calls,
             stats.mount_fast_fs_type_calls,
+            stats.mount_backend_contended_acquisitions,
+            stats.ext4_block_read_calls,
+            stats.ext4_block_read_blocks,
+            stats.ext4_block_read_bytes,
+            stats.ext4_block_write_calls,
+            stats.ext4_block_write_blocks,
+            stats.ext4_block_write_bytes,
+            stats.ext4_read_plan_attempts,
+            stats.ext4_read_plan_prepared,
+            stats.ext4_read_plan_executed,
+            stats.ext4_read_plan_fallbacks,
+            stats.ext4_read_plan_data_runs,
+            stats.ext4_read_plan_data_blocks,
+            stats.ext4_read_plan_zero_runs,
+            stats.ext4_read_plan_zero_blocks,
+            stats.ext4_read_plan_executed_bytes,
+            stats.ext4_read_plan_direct_io_calls,
+            stats.ext4_read_plan_direct_io_blocks,
+            stats.ext4_read_plan_direct_io_bytes,
             stats.eventfd_read_calls,
             stats.eventfd_write_calls,
             stats.eventfd_read_block_yields,
@@ -2924,6 +3073,37 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_mount_fast_fs_type() {}
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn record_mount_backend_contended_acquisition() {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_block_read(_blocks: usize, _bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_block_write(_blocks: usize, _bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_read_plan_attempt() {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_read_plan_prepared(
+        _data_runs: usize,
+        _data_blocks: usize,
+        _zero_runs: usize,
+        _zero_blocks: usize,
+    ) {
+    }
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_read_plan_fallback() {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_read_plan_executed(_bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_read_plan_direct_io(_calls: usize, _blocks: usize, _bytes: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_eventfd_read_call() {}

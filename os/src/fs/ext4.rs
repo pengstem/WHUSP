@@ -2,10 +2,13 @@ use super::dirent::{
     DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, DT_UNKNOWN, LINUX_DIRENT64_ALIGN,
     LINUX_DIRENT64_HEADER_SIZE,
 };
-use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult};
+use super::vfs::{
+    BackendReadPlan, FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult,
+};
 use super::{FS_STATX_ATTR_FLAGS, FileStat, FileTimestamp};
 use crate::drivers::block::VirtIOBlock;
 use crate::perf;
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -41,6 +44,7 @@ impl Ext4BlockDevice for KernelDisk {
             return Err(Ext4Error::new(EIO as _, "unaligned block write"));
         }
         self.dev.write_blocks(block_id as usize, buf);
+        perf::record_ext4_block_write(buf.len() / EXT4_DEV_BSIZE, buf.len());
         Ok(buf.len())
     }
 
@@ -49,6 +53,7 @@ impl Ext4BlockDevice for KernelDisk {
             return Err(Ext4Error::new(EIO as _, "unaligned block read"));
         }
         self.dev.read_blocks(block_id as usize, buf);
+        perf::record_ext4_block_read(buf.len() / EXT4_DEV_BSIZE, buf.len());
         Ok(buf.len())
     }
 
@@ -112,6 +117,7 @@ fn map_ext4_error(err: Ext4Error) -> FsError {
 
 pub(super) struct Ext4Mount {
     fs: KernelExt4Fs,
+    device: Arc<VirtIOBlock>,
     open_inodes: BTreeMap<u32, usize>,
     pending_unlinks: BTreeSet<u32>,
     runtime_special_rdevs: BTreeMap<u32, u64>,
@@ -123,7 +129,13 @@ unsafe impl Sync for Ext4Mount {}
 impl Ext4Mount {
     pub(super) fn open(device: Arc<VirtIOBlock>) -> Result<Self, Ext4Error> {
         Ok(Self {
-            fs: KernelExt4Fs::new(KernelDisk { dev: device }, EXT4_CONFIG)?,
+            fs: KernelExt4Fs::new(
+                KernelDisk {
+                    dev: device.clone(),
+                },
+                EXT4_CONFIG,
+            )?,
+            device,
             open_inodes: BTreeMap::new(),
             pending_unlinks: BTreeSet::new(),
             runtime_special_rdevs: BTreeMap::new(),
@@ -159,6 +171,43 @@ impl Ext4Mount {
             ctime_sec: attr.ctime.as_secs(),
             ctime_nsec: attr.ctime.subsec_nanos(),
         }
+    }
+}
+
+struct Ext4DeviceReadRun {
+    buffer_start: usize,
+    byte_len: usize,
+    device_block: Option<usize>,
+}
+
+struct Ext4DeviceReadPlan {
+    device: Arc<VirtIOBlock>,
+    read_len: usize,
+    runs: Vec<Ext4DeviceReadRun>,
+}
+
+impl BackendReadPlan for Ext4DeviceReadPlan {
+    fn execute(self: Box<Self>, buf: &mut [u8]) -> usize {
+        if buf.len() < self.read_len {
+            return 0;
+        }
+        for run in &self.runs {
+            let run_buf = &mut buf[run.buffer_start..run.buffer_start + run.byte_len];
+            if let Some(device_block) = run.device_block {
+                let io = self
+                    .device
+                    .read_blocks_versioned_fill_for_file_plan(device_block, run_buf);
+                perf::record_ext4_read_plan_direct_io(
+                    io.device_calls,
+                    io.device_blocks,
+                    io.device_blocks * EXT4_DEV_BSIZE,
+                );
+            } else {
+                run_buf.fill(0);
+            }
+        }
+        perf::record_ext4_read_plan_executed(self.read_len);
+        self.read_len
     }
 }
 
@@ -418,6 +467,81 @@ impl FileSystemBackend for Ext4Mount {
 
     fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
         self.fs.read_at(ino, buf, 0).map_err(map_ext4_error)
+    }
+
+    fn prepare_read_plan(
+        &mut self,
+        ino: u32,
+        offset: u64,
+        len: usize,
+    ) -> Option<Box<dyn BackendReadPlan>> {
+        perf::record_ext4_read_plan_attempt();
+        let Ok(Some(plan)) = self.fs.plan_aligned_read(ino, len, offset) else {
+            perf::record_ext4_read_plan_fallback();
+            return None;
+        };
+        if plan.block_size % EXT4_DEV_BSIZE != 0 {
+            perf::record_ext4_read_plan_fallback();
+            return None;
+        }
+        let device_blocks_per_fs_block = plan.block_size / EXT4_DEV_BSIZE;
+        let mut runs = Vec::with_capacity(plan.runs.len());
+        let mut data_runs = 0usize;
+        let mut data_blocks = 0usize;
+        let mut zero_runs = 0usize;
+        let mut zero_blocks = 0usize;
+        for run in plan.runs {
+            let Some(buffer_start) = run.buffer_block.checked_mul(plan.block_size) else {
+                perf::record_ext4_read_plan_fallback();
+                return None;
+            };
+            let Some(byte_len) = run.block_count.checked_mul(plan.block_size) else {
+                perf::record_ext4_read_plan_fallback();
+                return None;
+            };
+            if buffer_start
+                .checked_add(byte_len)
+                .is_none_or(|end| end > plan.read_len)
+            {
+                perf::record_ext4_read_plan_fallback();
+                return None;
+            }
+            let device_block = if let Some(fs_block) = run.fs_block {
+                let Some(device_block) = fs_block
+                    .checked_mul(device_blocks_per_fs_block as u64)
+                    .and_then(|block| usize::try_from(block).ok())
+                else {
+                    perf::record_ext4_read_plan_fallback();
+                    return None;
+                };
+                let device_blocks = run.block_count * device_blocks_per_fs_block;
+                if device_block
+                    .checked_add(device_blocks)
+                    .is_none_or(|end| end > self.device.num_blocks() as usize)
+                {
+                    perf::record_ext4_read_plan_fallback();
+                    return None;
+                }
+                data_runs += 1;
+                data_blocks += run.block_count;
+                Some(device_block)
+            } else {
+                zero_runs += 1;
+                zero_blocks += run.block_count;
+                None
+            };
+            runs.push(Ext4DeviceReadRun {
+                buffer_start,
+                byte_len,
+                device_block,
+            });
+        }
+        perf::record_ext4_read_plan_prepared(data_runs, data_blocks, zero_runs, zero_blocks);
+        Some(Box::new(Ext4DeviceReadPlan {
+            device: self.device.clone(),
+            read_len: plan.read_len,
+            runs,
+        }))
     }
 
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {

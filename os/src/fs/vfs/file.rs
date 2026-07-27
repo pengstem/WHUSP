@@ -1825,10 +1825,22 @@ impl VfsFile {
 
             let noatime_snapshot = self.noatime_snapshot();
             let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsReadCacheFill);
-            let read_len = with_mount(self.node.mount_id, |mount| {
-                mount.read_at(self.node.ino, read_buf.as_mut_slice(), page_start as u64)
-            })
-            .expect("filesystem mount is missing");
+            let read_plan = if read_limit % PAGE_SIZE == 0 {
+                with_mount(self.node.mount_id, |mount| {
+                    mount.prepare_read_plan(self.node.ino, page_start as u64, read_limit)
+                })
+                .flatten()
+            } else {
+                None
+            };
+            let read_len = if let Some(read_plan) = read_plan {
+                read_plan.execute(read_buf.as_mut_slice())
+            } else {
+                with_mount(self.node.mount_id, |mount| {
+                    mount.read_at(self.node.ino, read_buf.as_mut_slice(), page_start as u64)
+                })
+                .expect("filesystem mount is missing")
+            };
             self.restore_noatime(noatime_snapshot);
             perf::record_vfs_read_cache_backend_read();
             if read_len == 0 || page_offset >= read_len {
