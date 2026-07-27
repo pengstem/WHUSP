@@ -54,12 +54,13 @@ pub(crate) enum ProfilePoint {
     FrameAllocMmapPageCache,
     FrameAllocSharedAnon,
     FrameAllocReadCache,
+    PageCacheLoadWait,
     MountBackendContendedWait,
     MountBackendHold,
 }
 
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
-const PROFILE_POINT_COUNT: usize = 54;
+const PROFILE_POINT_COUNT: usize = 55;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
@@ -745,6 +746,7 @@ mod enabled {
         TimeStat::new("frame_alloc_mmap_page_cache"),
         TimeStat::new("frame_alloc_shared_anon"),
         TimeStat::new("frame_alloc_read_cache"),
+        TimeStat::new("page_cache_load_wait"),
         TimeStat::new("mount_backend_contended_wait"),
         TimeStat::new("mount_backend_hold"),
     ];

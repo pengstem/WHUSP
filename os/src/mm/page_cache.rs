@@ -4,8 +4,9 @@ use super::{FrameTracker, PhysPageNum};
 use crate::config::PAGE_SIZE;
 use crate::fs::MountId;
 use crate::perf;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::{SleepMutex, UPIntrFreeCell};
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use lazy_static::*;
 
@@ -118,9 +119,17 @@ struct PageCacheLruEntry {
 
 pub(crate) struct PageCache {
     pages: BTreeMap<PageCacheKey, PageCachePage>,
+    loading: BTreeMap<PageCacheKey, Arc<SleepMutex<()>>>,
     generations: BTreeMap<PageCacheId, PageCacheGeneration>,
     lru: BTreeSet<PageCacheLruEntry>,
     lru_clock: usize,
+}
+
+pub(crate) enum ReadCacheLoadReservation {
+    Cached,
+    Wait(Arc<SleepMutex<()>>),
+    Owner { pages: usize },
+    StaleGeneration,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -146,6 +155,7 @@ impl PageCache {
     pub(crate) fn new() -> Self {
         Self {
             pages: BTreeMap::new(),
+            loading: BTreeMap::new(),
             generations: BTreeMap::new(),
             lru: BTreeSet::new(),
             lru_clock: 0,
@@ -162,6 +172,70 @@ impl PageCache {
 
     pub(crate) fn contains(&self, key: PageCacheKey) -> bool {
         self.pages.contains_key(&key)
+    }
+
+    /// Reserves one demand page and its uncached readahead suffix for a single
+    /// owner. The caller must already hold `gate`; waiters clone the published
+    /// gate only after dropping the page-cache guard.
+    pub(crate) fn reserve_read_cache_load(
+        &mut self,
+        first_key: PageCacheKey,
+        max_pages: usize,
+        gate: Arc<SleepMutex<()>>,
+    ) -> ReadCacheLoadReservation {
+        if max_pages == 0 || !self.is_current_key(first_key) {
+            return ReadCacheLoadReservation::StaleGeneration;
+        }
+        if self.pages.contains_key(&first_key) {
+            return ReadCacheLoadReservation::Cached;
+        }
+        if let Some(existing) = self.loading.get(&first_key) {
+            return ReadCacheLoadReservation::Wait(existing.clone());
+        }
+
+        let mut pages = 1usize;
+        while pages < max_pages {
+            let Some(page_index) = first_key.page_index.checked_add(pages) else {
+                break;
+            };
+            let key = PageCacheKey::for_page(first_key.id, first_key.generation, page_index);
+            if self.pages.contains_key(&key) || self.loading.contains_key(&key) {
+                break;
+            }
+            pages += 1;
+        }
+        for page_delta in 0..pages {
+            let page_index = first_key
+                .page_index
+                .checked_add(page_delta)
+                .expect("read-cache reservation page index overflow");
+            let key = PageCacheKey::for_page(first_key.id, first_key.generation, page_index);
+            assert!(self.loading.insert(key, gate.clone()).is_none());
+        }
+        ReadCacheLoadReservation::Owner { pages }
+    }
+
+    /// Releases exactly the pages owned by `gate` after publish or failure.
+    /// Identity checks prevent one completion from removing a later owner.
+    pub(crate) fn release_read_cache_load(
+        &mut self,
+        first_key: PageCacheKey,
+        pages: usize,
+        gate: &Arc<SleepMutex<()>>,
+    ) {
+        for page_delta in 0..pages {
+            let page_index = first_key
+                .page_index
+                .checked_add(page_delta)
+                .expect("read-cache release page index overflow");
+            let key = PageCacheKey::for_page(first_key.id, first_key.generation, page_index);
+            let owns_key = self
+                .loading
+                .get(&key)
+                .is_some_and(|owner| Arc::ptr_eq(owner, gate));
+            assert!(owns_key, "read-cache loading reservation owner changed");
+            self.loading.remove(&key);
+        }
     }
 
     pub(crate) fn current_generation(&self, id: PageCacheId) -> usize {

@@ -21,7 +21,8 @@ use crate::config::PAGE_SIZE;
 use crate::mm::{
     UserBuffer, frame_alloc, frame_alloc_uninit,
     page_cache::{
-        PAGE_CACHE, PageCacheId, PageCacheKey, PageCacheMutationGuard, begin_page_cache_mutation,
+        PAGE_CACHE, PageCacheId, PageCacheKey, PageCacheMutationGuard, ReadCacheLoadReservation,
+        begin_page_cache_mutation,
     },
 };
 use crate::perf;
@@ -1808,17 +1809,34 @@ impl VfsFile {
             perf::record_vfs_read_cache_miss();
             let max_readahead_pages =
                 ((file_size - page_start).div_ceil(PAGE_SIZE)).min(VFS_READ_CACHE_READAHEAD_PAGES);
-            let readahead_pages = {
-                let cache = PAGE_CACHE.exclusive_access();
-                let mut pages = 1usize;
-                while pages < max_readahead_pages {
-                    let next_key = PageCacheKey::for_page(id, generation, key.page_index + pages);
-                    if cache.contains(next_key) {
-                        break;
-                    }
-                    pages += 1;
+            // Hold the new gate before publishing it so a waiter can never
+            // observe an unlocked owner that has not started the fill yet.
+            let load_gate = Arc::new(SleepMutex::new(()));
+            let load_owner_guard = load_gate.lock();
+            let reservation = PAGE_CACHE.exclusive_access().reserve_read_cache_load(
+                key,
+                max_readahead_pages,
+                load_gate.clone(),
+            );
+            let readahead_pages = match reservation {
+                ReadCacheLoadReservation::Cached => {
+                    drop(load_owner_guard);
+                    continue;
                 }
-                pages
+                ReadCacheLoadReservation::Wait(existing_gate) => {
+                    drop(load_owner_guard);
+                    {
+                        let _profile_scope =
+                            perf::time_scope(perf::ProfilePoint::PageCacheLoadWait);
+                        let _waiter_guard = existing_gate.lock();
+                    }
+                    continue;
+                }
+                ReadCacheLoadReservation::Owner { pages } => pages,
+                ReadCacheLoadReservation::StaleGeneration => {
+                    drop(load_owner_guard);
+                    return None;
+                }
             };
             let read_limit = (readahead_pages * PAGE_SIZE).min(file_size - page_start);
             let mut read_buf = vec![0u8; read_limit];
@@ -1844,6 +1862,12 @@ impl VfsFile {
             self.restore_noatime(noatime_snapshot);
             perf::record_vfs_read_cache_backend_read();
             if read_len == 0 || page_offset >= read_len {
+                PAGE_CACHE.exclusive_access().release_read_cache_load(
+                    key,
+                    readahead_pages,
+                    &load_gate,
+                );
+                drop(load_owner_guard);
                 break;
             }
 
@@ -1876,35 +1900,39 @@ impl VfsFile {
                 ));
             }
 
-            if !pages_to_cache.is_empty() {
-                let mut evicted = 0usize;
-                let mut readahead_cached_pages = 0usize;
-                let mut cache = PAGE_CACHE.exclusive_access();
-                if cache.current_stable_generation(id) == Some(generation) {
-                    for (cache_key, frame) in pages_to_cache {
-                        let is_readahead = cache_key.page_index != key.page_index;
-                        let (page_evictions, inserted) =
-                            cache.insert_read_cache_page(cache_key, frame, file_size);
-                        evicted += page_evictions;
-                        if inserted && is_readahead {
-                            readahead_cached_pages += 1;
-                        }
+            let prepared_pages = pages_to_cache.len();
+            let mut evicted = 0usize;
+            let mut readahead_cached_pages = 0usize;
+            let mut stale_generation = false;
+            let mut cache = PAGE_CACHE.exclusive_access();
+            if cache.current_stable_generation(id) == Some(generation) {
+                for (cache_key, frame) in pages_to_cache {
+                    let is_readahead = cache_key.page_index != key.page_index;
+                    let (page_evictions, inserted) =
+                        cache.insert_read_cache_page(cache_key, frame, file_size);
+                    evicted += page_evictions;
+                    if inserted && is_readahead {
+                        readahead_cached_pages += 1;
                     }
-                } else {
-                    perf::record_page_cache_stale_fill_drop(pages_to_cache.len());
-                    drop(cache);
-                    // Earlier cache hits may already have copied into `buf`.
-                    // Returning None makes the caller overwrite the complete
-                    // request through the backend instead of mixing epochs.
-                    return None;
                 }
-                drop(cache);
-                if evicted > 0 {
-                    perf::record_page_cache_clean_eviction(evicted);
-                }
-                if readahead_cached_pages > 0 {
-                    perf::record_vfs_read_cache_readahead(readahead_cached_pages);
-                }
+            } else {
+                perf::record_page_cache_stale_fill_drop(prepared_pages);
+                stale_generation = true;
+            }
+            cache.release_read_cache_load(key, readahead_pages, &load_gate);
+            drop(cache);
+            drop(load_owner_guard);
+            if stale_generation {
+                // Earlier cache hits may already have copied into `buf`.
+                // Returning None makes the caller overwrite the complete
+                // request through the backend instead of mixing epochs.
+                return None;
+            }
+            if evicted > 0 {
+                perf::record_page_cache_clean_eviction(evicted);
+            }
+            if readahead_cached_pages > 0 {
+                perf::record_vfs_read_cache_readahead(readahead_cached_pages);
             }
 
             let copy_len = copy_len.min(read_len - page_offset);
