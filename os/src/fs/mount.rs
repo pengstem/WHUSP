@@ -580,17 +580,14 @@ pub(super) fn with_mount<V>(
                 )
             })
     }?;
+    drain_pending_inode_releases(&pending_releases, backend.as_ref());
     let mut result = None;
     let mut f = Some(f);
-    backend.execute_serialized(
-        op,
-        &mut |legacy| drain_pending_inode_releases(&pending_releases, legacy),
-        &mut |legacy| {
-            result = Some(f.take().expect("mount backend operation called twice")(
-                legacy,
-            ));
-        },
-    );
+    backend.execute_serialized(op, &mut |_| {}, &mut |legacy| {
+        result = Some(f.take().expect("mount backend operation called twice")(
+            legacy,
+        ));
+    });
     result
 }
 
@@ -610,37 +607,28 @@ fn try_with_mount<V>(
     op: BackendOp,
     f: impl FnOnce(&mut dyn LegacyFileSystemBackend) -> V,
 ) -> Option<V> {
-    let (backend, pending_releases) = {
+    let backend = {
         let mounts = MOUNTS.try_lock()?;
         mounts
             .get(mount_id.0)
             .and_then(|mount| mount.as_ref())
-            .map(|mounted| {
-                (
-                    Arc::clone(&mounted.backend),
-                    Arc::clone(&mounted.pending_inode_releases),
-                )
-            })
+            .map(|mounted| Arc::clone(&mounted.backend))
     }?;
     let mut result = None;
     let mut f = Some(f);
     backend
-        .try_execute_serialized(
-            op,
-            &mut |legacy| drain_pending_inode_releases(&pending_releases, legacy),
-            &mut |legacy| {
-                result = Some(f.take().expect("mount backend try-operation called twice")(
-                    legacy,
-                ));
-            },
-        )
+        .try_execute_serialized(op, &mut |_| {}, &mut |legacy| {
+            result = Some(f.take().expect("mount backend try-operation called twice")(
+                legacy,
+            ));
+        })
         .then_some(())?;
     result
 }
 
 fn drain_pending_inode_releases(
     pending_releases: &PendingReleaseQueue,
-    backend: &mut dyn LegacyFileSystemBackend,
+    backend: &dyn ConcurrentFileSystemBackend,
 ) {
     #[cfg(feature = "perf-counters")]
     let timer = perf::time_pending_release_drain();

@@ -284,6 +284,9 @@ pub(crate) trait LegacyFileSystemBackend: Send {
 /// VFS migrates away from the compatibility execution bridge below.
 #[allow(dead_code)]
 pub(crate) trait ConcurrentFileSystemBackend: Send + Sync {
+    #[cfg(feature = "perf-counters")]
+    fn io_snapshot(&self) -> BackendIoSnapshot;
+
     fn root_ino(&self) -> u32;
     fn overlay_real_node(&self, ino: u32) -> Option<VfsNodeId>;
     fn statfs(&self) -> FileSystemStat;
@@ -386,6 +389,11 @@ impl SerializedBackend {
 }
 
 impl ConcurrentFileSystemBackend for SerializedBackend {
+    #[cfg(feature = "perf-counters")]
+    fn io_snapshot(&self) -> BackendIoSnapshot {
+        self.state.lock().io_snapshot()
+    }
+
     fn root_ino(&self) -> u32 {
         self.call(BackendOp::Lookup, |backend| backend.root_ino())
     }
