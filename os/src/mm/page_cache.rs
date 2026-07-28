@@ -12,10 +12,11 @@ use alloc::vec::Vec;
 use lazy_static::*;
 
 // CONTEXT: This is a bounded transition toward watermark-driven reclaim. The
-// clean Rust workload runs with an explicitly frozen 8 GiB guest, so retaining
-// at most 256 MiB of clean file pages lets read(2), exec, and readonly private
-// mmap share their working set without allowing unbounded cache growth.
-pub(crate) const PAGE_CACHE_SOFT_MAX_PAGES: usize = 65_536;
+// smallest default run configuration has 12 GiB, so retaining 512 MiB of
+// clean file pages lets read(2), exec, and readonly private mmap share larger
+// Cargo working sets without allowing unbounded cache growth. Frames remain
+// demand allocated; this limit does not reserve 512 MiB at boot.
+pub(crate) const PAGE_CACHE_SOFT_MAX_PAGES: usize = 131_072;
 const SHARED_MMAP_GENERATION: usize = usize::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]

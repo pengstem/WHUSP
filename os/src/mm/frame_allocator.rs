@@ -9,8 +9,8 @@ use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{AtomicU32, Ordering};
 use lazy_static::*;
 
-const FRAME_CACHE_CAPACITY: usize = 64;
-const FRAME_CACHE_BATCH: usize = 32;
+const FRAME_CACHE_CAPACITY: usize = 256;
+const FRAME_CACHE_BATCH: usize = 128;
 
 #[cfg(feature = "perf-counters")]
 static FRAME_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);

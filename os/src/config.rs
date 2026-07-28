@@ -5,7 +5,7 @@ pub const USER_HEAP_SIZE: usize = 0x20_0000;
 pub const USER_MMAP_BASE: usize = 0x6000_0000;
 pub const USER_MMAP_LIMIT: usize = 0x20_0000_0000;
 pub const DL_INTERP_OFFSET: usize = 0x30_0000_0000;
-pub const KERNEL_STACK_SIZE: usize = 4096 * 10;
+pub const KERNEL_STACK_SIZE: usize = 64 * 1024;
 
 /// Maximum number of logical CPUs supported by the current contest machine.
 /// Keep the QEMU SMP guards in the root/kernel Makefiles, entry.asm boot
@@ -13,7 +13,7 @@ pub const KERNEL_STACK_SIZE: usize = 4096 * 10;
 pub const MAX_CPUS: usize = 12;
 pub const BOOT_STACK_SIZE: usize = 4096 * 16;
 
-pub const KERNEL_HEAP_SIZE: usize = 0x800_0000;
+pub const KERNEL_HEAP_SIZE: usize = 512 * 1024 * 1024;
 
 pub const PAGE_SIZE: usize = 0x1000;
 pub const PAGE_SIZE_BITS: usize = 0xc;
