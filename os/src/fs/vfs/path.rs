@@ -456,10 +456,18 @@ fn owned_path_components<'a>(path: &str) -> Vec<PathComponent<'a>> {
 fn read_symlink_target(cursor: &VfsCursor) -> FsResult<String> {
     let mut buffer = vec![0u8; SYMLINK_TARGET_MAX + 1];
     let len = inode_state::with_mapping_read(cursor.node, || {
-        with_mount(cursor.node.mount_id, BackendOp::Readlink, |mount| {
-            mount.readlink(cursor.node.ino, &mut buffer)
+        let plan = with_mount(cursor.node.mount_id, BackendOp::ReadPlan, |mount| {
+            mount.prepare_readlink_plan(cursor.node.ino, buffer.len())
         })
-        .ok_or(FsError::Io)?
+        .flatten();
+        if let Some(plan) = plan {
+            Ok(plan.execute(&mut buffer))
+        } else {
+            with_mount(cursor.node.mount_id, BackendOp::Readlink, |mount| {
+                mount.readlink(cursor.node.ino, &mut buffer)
+            })
+            .ok_or(FsError::Io)?
+        }
     })?;
     if len > SYMLINK_TARGET_MAX {
         return Err(FsError::NameTooLong);

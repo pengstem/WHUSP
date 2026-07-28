@@ -27,6 +27,12 @@ pub struct Ext4MappedReadPlan {
     pub runs: Vec<Ext4MappedReadRun>,
 }
 
+#[derive(Debug)]
+pub enum Ext4SymlinkReadPlan {
+    Inline(Vec<u8>),
+    Mapped(Ext4MappedReadPlan),
+}
+
 fn take<'a>(buf: &mut &'a [u8], cnt: usize) -> &'a [u8] {
     let (first, rem) = buf.split_at(cnt.min(buf.len()));
     *buf = rem;
@@ -142,6 +148,44 @@ impl<Hal: SystemHal> InodeRef<Hal> {
             read_len,
             runs,
         }))
+    }
+
+    pub fn plan_symlink_read(&mut self, len: usize) -> Ext4Result<Option<Ext4SymlinkReadPlan>> {
+        let file_size = self.size();
+        let block_size = get_block_size(self.superblock()) as usize;
+        if self.inode_type() != InodeType::Symlink || len == 0 || file_size == 0 || block_size == 0
+        {
+            return Ok(None);
+        }
+        let read_len = len.min(file_size as usize);
+        if file_size < size_of::<[u32; 15]>() as u64 {
+            let inode = self.raw_inode();
+            let content = unsafe {
+                let start = (inode as *const _ as *const u8).add(offset_of!(ext4_inode, blocks));
+                slice::from_raw_parts(start, read_len)
+            };
+            return Ok(Some(Ext4SymlinkReadPlan::Inline(content.to_vec())));
+        }
+
+        // lwext4 stores an external symlink in at most one filesystem block.
+        // Unlike regular files, this path may use legacy indirect mapping, so
+        // resolve logical block zero through the generic inode block helper.
+        let fs_block = self.get_inode_fblock(0)?;
+        Ok(Some(Ext4SymlinkReadPlan::Mapped(Ext4MappedReadPlan {
+            block_size,
+            buffer_len: block_size,
+            read_offset: 0,
+            read_len,
+            runs: {
+                let mut runs = Vec::with_capacity(1);
+                runs.push(Ext4MappedReadRun {
+                    buffer_block: 0,
+                    block_count: 1,
+                    fs_block: (fs_block != 0).then_some(fs_block),
+                });
+                runs
+            },
+        })))
     }
 
     fn get_inode_fblock(&mut self, block: u32) -> Ext4Result<u64> {

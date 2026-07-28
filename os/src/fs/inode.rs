@@ -592,13 +592,15 @@ pub(crate) fn unlink_file_in(context: PathContext, name: &str) -> FsResult {
     }
     let _mutation = begin_regular_file_page_cache_mutation(node, kind);
     flush_dirty_regular_file(node)?;
-    inode_state::with_directory_mutation(target.parent, || {
-        with_mount(
-            target.parent.mount_id,
-            BackendOp::NamespaceMutation,
-            |mount| mount.unlink(target.parent.ino, target.leaf_name),
-        )
-        .ok_or(FsError::Io)?
+    inode_state::with_mapping_mutation(node, || {
+        inode_state::with_directory_mutation(target.parent, || {
+            with_mount(
+                target.parent.mount_id,
+                BackendOp::NamespaceMutation,
+                |mount| mount.unlink(target.parent.ino, target.leaf_name),
+            )
+            .ok_or(FsError::Io)?
+        })
     })?;
     inode_state::invalidate_metadata(node);
     dentry_cache::invalidate_parent(target.parent);

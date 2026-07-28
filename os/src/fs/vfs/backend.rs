@@ -257,6 +257,13 @@ pub(crate) trait LegacyFileSystemBackend: Send {
         self.stat(ino)
     }
     fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize>;
+    fn prepare_readlink_plan(
+        &mut self,
+        _ino: u32,
+        _len: usize,
+    ) -> Option<Box<dyn BackendReadPlan>> {
+        None
+    }
     fn supports_read_snapshot(&mut self, _ino: u32) -> bool {
         false
     }
@@ -345,6 +352,7 @@ pub(crate) trait ConcurrentFileSystemBackend: Send + Sync {
     fn stat(&self, ino: u32) -> FsResult<FileStat>;
     fn stat_basic(&self, ino: u32) -> FsResult<FileStat>;
     fn readlink(&self, ino: u32, buf: &mut [u8]) -> FsResult<usize>;
+    fn prepare_readlink_plan(&self, ino: u32, len: usize) -> Option<Box<dyn BackendReadPlan>>;
     fn supports_read_snapshot(&self, ino: u32) -> bool;
     fn read_snapshot(&self, ino: u32) -> Option<FsResult<Vec<u8>>>;
     fn prepare_read_plan(
@@ -640,6 +648,17 @@ impl ConcurrentFileSystemBackend for SerializedBackend {
 
     fn readlink(&self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
         self.call(BackendOp::Readlink, |backend| backend.readlink(ino, buf))
+    }
+
+    fn prepare_readlink_plan(&self, ino: u32, len: usize) -> Option<Box<dyn BackendReadPlan>> {
+        // Preparing the immutable mapping may fault inode or indirect-block
+        // metadata into the backend cache, but it must not read symlink data.
+        // Account it with the other metadata-only read-plan operations; the
+        // returned plan performs target-data I/O after `call()` releases the
+        // serialized backend core.
+        self.call(BackendOp::ReadPlan, |backend| {
+            backend.prepare_readlink_plan(ino, len)
+        })
     }
 
     fn supports_read_snapshot(&self, ino: u32) -> bool {

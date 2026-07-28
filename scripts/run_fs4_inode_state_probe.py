@@ -26,6 +26,8 @@ CASES = (
     "lookup_stat_vs_namespace_mutation",
     "read_vs_mapping_mutation",
     "partial_read_plan",
+    "readlink_plan",
+    "readlink_vs_unlink",
     "shutdown_drain_stress",
 )
 

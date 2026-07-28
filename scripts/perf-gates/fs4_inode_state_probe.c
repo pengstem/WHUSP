@@ -156,6 +156,95 @@ static int phase_partial_read_plan(const char *base)
     return 0;
 }
 
+static int phase_readlink_plan(const char *base)
+{
+    char short_path[512];
+    char long_path[512];
+    char long_target[241];
+    char observed[256];
+    snprintf(short_path, sizeof(short_path), "%s/readlink-inline", base);
+    snprintf(long_path, sizeof(long_path), "%s/readlink-external", base);
+    for (size_t i = 0; i + 1 < sizeof(long_target); ++i) {
+        long_target[i] = (char)('a' + i % 26);
+    }
+    long_target[sizeof(long_target) - 1] = '\0';
+    if (symlink("inline-target", short_path) != 0 || symlink(long_target, long_path) != 0) {
+        return -1;
+    }
+    memset(observed, 0, sizeof(observed));
+    if (readlink(short_path, observed, sizeof(observed)) != 13
+        || memcmp(observed, "inline-target", 13) != 0) {
+        return -1;
+    }
+    memset(observed, 0, sizeof(observed));
+    if (readlink(long_path, observed, sizeof(observed)) != (ssize_t)strlen(long_target)
+        || memcmp(observed, long_target, strlen(long_target)) != 0) {
+        return -1;
+    }
+    memset(observed, 0, sizeof(observed));
+    if (readlink(long_path, observed, 17) != 17 || memcmp(observed, long_target, 17) != 0
+        || unlink(short_path) != 0 || unlink(long_path) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int phase_readlink_vs_unlink(const char *base)
+{
+    enum { TARGET_LEN = 191 };
+    char path[512];
+    char target_a[TARGET_LEN + 1];
+    char target_b[TARGET_LEN + 1];
+    snprintf(path, sizeof(path), "%s/readlink-unlink-race", base);
+    memset(target_a, 'A', TARGET_LEN);
+    memset(target_b, 'B', TARGET_LEN);
+    target_a[TARGET_LEN] = '\0';
+    target_b[TARGET_LEN] = '\0';
+    if (symlink(target_a, path) != 0) {
+        return -1;
+    }
+    pid_t writer = fork();
+    if (writer == 0) {
+        for (int i = 0; i < READ_MUTATION_ITERATIONS; ++i) {
+            const char *target = i & 1 ? target_a : target_b;
+            if (unlink(path) != 0 || symlink(target, path) != 0) {
+                _exit(81);
+            }
+        }
+        _exit(0);
+    }
+    pid_t reader = fork();
+    if (reader == 0) {
+        char observed[TARGET_LEN + 1];
+        for (int i = 0; i < READ_MUTATION_ITERATIONS * 4; ++i) {
+            ssize_t amount = readlink(path, observed, TARGET_LEN);
+            if (amount < 0) {
+                if (errno == ENOENT) {
+                    continue;
+                }
+                _exit(82);
+            }
+            if (amount != TARGET_LEN || (observed[0] != 'A' && observed[0] != 'B')) {
+                fprintf(stderr,
+                        "FS4_INODE_STATE_READLINK_RACE amount=%ld first=%u errno=%d\n",
+                        (long)amount, amount > 0 ? (unsigned char)observed[0] : 0u, errno);
+                _exit(83);
+            }
+            for (int j = 1; j < TARGET_LEN; ++j) {
+                if (observed[j] != observed[0]) {
+                    _exit(84);
+                }
+            }
+        }
+        _exit(0);
+    }
+    if (writer < 0 || reader < 0 || wait_success(writer) != 0 || wait_success(reader) != 0
+        || unlink(path) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static int write_exact(int fd, const void *buffer, size_t length)
 {
     const unsigned char *cursor = buffer;
@@ -176,7 +265,17 @@ static int wait_success(pid_t pid)
     if (waitpid(pid, &status, 0) != pid) {
         return -1;
     }
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        return 0;
+    }
+    if (WIFEXITED(status)) {
+        fprintf(stderr, "FS4_INODE_STATE_CHILD_FAIL pid=%ld exit=%d\n", (long)pid,
+                WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        fprintf(stderr, "FS4_INODE_STATE_CHILD_FAIL pid=%ld signal=%d\n", (long)pid,
+                WTERMSIG(status));
+    }
+    return -1;
 }
 
 static int create_with_payload(const char *path, const char *payload, struct stat *stat_out)
@@ -438,8 +537,10 @@ int main(int argc, char **argv)
     RUN_CASE(lookup_stat_vs_namespace_mutation);
     RUN_CASE(read_vs_mapping_mutation);
     RUN_CASE(partial_read_plan);
+    RUN_CASE(readlink_plan);
+    RUN_CASE(readlink_vs_unlink);
     RUN_CASE(shutdown_drain_stress);
 #undef RUN_CASE
-    puts("FS4_INODE_STATE_PROBE_PASS cases=8");
+    puts("FS4_INODE_STATE_PROBE_PASS cases=10");
     return 0;
 }

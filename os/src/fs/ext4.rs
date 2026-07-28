@@ -26,8 +26,8 @@ use lwext4_rust::ffi::{
     EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, ENOTSUP, EXT4_ROOT_INO,
 };
 use lwext4_rust::{
-    BlockDevice as Ext4BlockDevice, EXT4_DEV_BSIZE, Ext4Error, Ext4Filesystem, Ext4Result,
-    FsConfig, InodeType, SystemHal,
+    BlockDevice as Ext4BlockDevice, EXT4_DEV_BSIZE, Ext4Error, Ext4Filesystem, Ext4MappedReadPlan,
+    Ext4Result, Ext4SymlinkReadPlan, FsConfig, InodeType, SystemHal,
 };
 
 pub(super) struct KernelHal;
@@ -242,6 +242,7 @@ pub(super) struct Ext4Mount {
 #[derive(Default)]
 struct Ext4InodeRuntimeState {
     open_count: usize,
+    unlinking: bool,
     pending_unlink: bool,
     special_rdev: Option<u64>,
 }
@@ -276,27 +277,75 @@ impl Ext4InodeRuntimeTable {
         self.shard(ino).lock().entry(ino).or_default().special_rdev = Some(rdev);
     }
 
-    fn has_open_reference(&self, ino: u32) -> bool {
-        self.shard(ino)
-            .lock()
-            .get(&ino)
-            .is_some_and(|state| state.open_count > 0)
+    fn begin_unlink(&self, ino: u32) -> bool {
+        let mut runtime = self.shard(ino).lock();
+        let state = runtime.entry(ino).or_default();
+        debug_assert!(!state.unlinking);
+        state.unlinking = true;
+        state.open_count > 0
     }
 
-    fn mark_pending_unlink(&self, ino: u32) {
-        self.shard(ino)
-            .lock()
-            .entry(ino)
-            .or_default()
-            .pending_unlink = true;
+    fn abort_unlink(&self, ino: u32) {
+        let mut runtime = self.shard(ino).lock();
+        let Some(state) = runtime.get_mut(&ino) else {
+            return;
+        };
+        state.unlinking = false;
+        if state.open_count == 0 && !state.pending_unlink && state.special_rdev.is_none() {
+            runtime.remove(&ino);
+        }
+    }
+
+    /// Completes the runtime half of unlink after the filesystem transaction.
+    /// Returns true when the last open reference disappeared while the
+    /// deferred unlink was in flight, so the caller must free the inode now.
+    fn finish_unlink(&self, ino: u32, pending_unlink: bool, inode_exists: bool) -> bool {
+        let mut runtime = self.shard(ino).lock();
+        if !inode_exists {
+            runtime.remove(&ino);
+            return false;
+        }
+        let state = runtime.entry(ino).or_default();
+        state.unlinking = false;
+        state.pending_unlink |= pending_unlink;
+        if state.pending_unlink {
+            return state.open_count == 0;
+        }
+        if state.open_count == 0 && state.special_rdev.is_none() {
+            runtime.remove(&ino);
+        }
+        false
     }
 
     fn remove(&self, ino: u32) {
         self.shard(ino).lock().remove(&ino);
     }
 
-    fn retain(&self, ino: u32) {
-        self.shard(ino).lock().entry(ino).or_default().open_count += 1;
+    fn retain(&self, ino: u32) -> bool {
+        let mut runtime = self.shard(ino).lock();
+        let state = runtime.entry(ino).or_default();
+        if state.unlinking || state.pending_unlink {
+            return false;
+        }
+        state.open_count += 1;
+        true
+    }
+
+    fn retain_at_generation(&self, ino: u32, generation: usize, sequence: &Ext4Sequence) -> bool {
+        let mut runtime = self.shard(ino).lock();
+        // Check the writer epoch while holding the same inode-runtime shard
+        // that begin_unlink() must acquire. If a writer starts after this
+        // check, it necessarily observes the incremented open_count; if it
+        // started earlier, the odd or changed generation rejects this retain.
+        if sequence.value.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        let state = runtime.entry(ino).or_default();
+        if state.unlinking || state.pending_unlink {
+            return false;
+        }
+        state.open_count += 1;
+        true
     }
 
     fn prepare_release(&self, ino: u32) -> Ext4RuntimeRelease {
@@ -329,6 +378,12 @@ fn prepare_runtime_release_locked(
     }
     if state.open_count == 1 {
         state.open_count = 0;
+    }
+    if state.unlinking {
+        // unlink() has already sampled the open count and will either install
+        // pending_unlink or remove this state when its filesystem transaction
+        // completes. Preserve the zero-count record until that handoff.
+        return Ext4RuntimeRelease::Retained;
     }
     if state.pending_unlink {
         // Keep the record until the physical free succeeds. A failed
@@ -399,6 +454,93 @@ impl Ext4Mount {
 
     fn flush_for_replica_visibility(&mut self) -> FsResult {
         self.fs.flush().map_err(map_ext4_error)
+    }
+
+    fn mapped_read_plan(
+        &self,
+        plan: Ext4MappedReadPlan,
+        record_regular: bool,
+    ) -> Option<Box<dyn BackendReadPlan>> {
+        if plan.block_size % EXT4_DEV_BSIZE != 0 {
+            if record_regular {
+                perf::record_ext4_read_plan_fallback();
+            }
+            return None;
+        }
+        let device_blocks_per_fs_block = plan.block_size / EXT4_DEV_BSIZE;
+        let mut runs = Vec::with_capacity(plan.runs.len());
+        let mut data_runs = 0usize;
+        let mut data_blocks = 0usize;
+        let mut zero_runs = 0usize;
+        let mut zero_blocks = 0usize;
+        for run in plan.runs {
+            let Some(buffer_start) = run.buffer_block.checked_mul(plan.block_size) else {
+                if record_regular {
+                    perf::record_ext4_read_plan_fallback();
+                }
+                return None;
+            };
+            let Some(byte_len) = run.block_count.checked_mul(plan.block_size) else {
+                if record_regular {
+                    perf::record_ext4_read_plan_fallback();
+                }
+                return None;
+            };
+            if buffer_start
+                .checked_add(byte_len)
+                .is_none_or(|end| end > plan.buffer_len)
+            {
+                if record_regular {
+                    perf::record_ext4_read_plan_fallback();
+                }
+                return None;
+            }
+            let device_block = if let Some(fs_block) = run.fs_block {
+                let Some(device_block) = fs_block
+                    .checked_mul(device_blocks_per_fs_block as u64)
+                    .and_then(|block| usize::try_from(block).ok())
+                else {
+                    if record_regular {
+                        perf::record_ext4_read_plan_fallback();
+                    }
+                    return None;
+                };
+                let device_blocks = run.block_count * device_blocks_per_fs_block;
+                if device_block
+                    .checked_add(device_blocks)
+                    .is_none_or(|end| end > self.device.num_blocks() as usize)
+                {
+                    if record_regular {
+                        perf::record_ext4_read_plan_fallback();
+                    }
+                    return None;
+                }
+                data_runs += 1;
+                data_blocks += run.block_count;
+                Some(device_block)
+            } else {
+                zero_runs += 1;
+                zero_blocks += run.block_count;
+                None
+            };
+            runs.push(Ext4DeviceReadRun {
+                buffer_start,
+                byte_len,
+                device_block,
+            });
+        }
+        if record_regular {
+            perf::record_ext4_read_plan_prepared(data_runs, data_blocks, zero_runs, zero_blocks);
+        }
+        Some(Box::new(Ext4DeviceReadPlan {
+            device: self.device.clone(),
+            write_sequence: self.write_sequence.clone(),
+            buffer_len: plan.buffer_len,
+            read_offset: plan.read_offset,
+            read_len: plan.read_len,
+            runs,
+            record_regular,
+        }))
     }
 
     fn free_unlinked_inode(&mut self, ino: u32) -> FsResult<InodeRelease> {
@@ -504,7 +646,7 @@ impl ConcurrentExt4Backend {
         &self,
         op: BackendOp,
         _ino: u32,
-        mut f: impl FnMut(&mut Ext4Mount) -> V,
+        mut f: impl FnMut(&mut Ext4Mount, usize) -> V,
     ) -> V {
         let _ = op;
         loop {
@@ -552,7 +694,7 @@ impl ConcurrentExt4Backend {
             let io_before = reader.io_counters.snapshot();
             #[cfg(feature = "perf-counters")]
             let op_hold_scope = perf::time_backend_op_hold(op);
-            let result = f(&mut reader);
+            let result = f(&mut reader, generation);
             #[cfg(feature = "perf-counters")]
             {
                 drop(op_hold_scope);
@@ -677,6 +819,19 @@ struct Ext4DeviceReadPlan {
     read_offset: usize,
     read_len: usize,
     runs: Vec<Ext4DeviceReadRun>,
+    record_regular: bool,
+}
+
+struct Ext4InlineReadPlan {
+    data: Vec<u8>,
+}
+
+impl BackendReadPlan for Ext4InlineReadPlan {
+    fn execute(self: Box<Self>, buf: &mut [u8]) -> usize {
+        let read_len = self.data.len().min(buf.len());
+        buf[..read_len].copy_from_slice(&self.data[..read_len]);
+        read_len
+    }
 }
 
 impl BackendReadPlan for Ext4DeviceReadPlan {
@@ -697,11 +852,13 @@ impl BackendReadPlan for Ext4DeviceReadPlan {
                     let io = self
                         .device
                         .read_blocks_versioned_fill_for_file_plan(device_block, run_buf);
-                    perf::record_ext4_read_plan_direct_io(
-                        io.device_calls,
-                        io.device_blocks,
-                        io.device_blocks * EXT4_DEV_BSIZE,
-                    );
+                    if self.record_regular {
+                        perf::record_ext4_read_plan_direct_io(
+                            io.device_calls,
+                            io.device_blocks,
+                            io.device_blocks * EXT4_DEV_BSIZE,
+                        );
+                    }
                 });
             } else {
                 run_buf.fill(0);
@@ -711,7 +868,9 @@ impl BackendReadPlan for Ext4DeviceReadPlan {
             buf[..self.read_len]
                 .copy_from_slice(&bounce[self.read_offset..self.read_offset + self.read_len]);
         }
-        perf::record_ext4_read_plan_executed(self.read_len);
+        if self.record_regular {
+            perf::record_ext4_read_plan_executed(self.read_len);
+        }
         self.read_len
     }
 }
@@ -830,28 +989,42 @@ impl LegacyFileSystemBackend for Ext4Mount {
             .lookup(parent_ino, leaf_name)
             .map_err(map_ext4_error)?;
         let child_ino = lookup.entry().ino();
-        let defer_free = self.inode_runtime.has_open_reference(child_ino);
+        // Publish the unlink-in-progress state before dropping the lookup.
+        // A concurrent VfsFile retain must either be counted in defer_free or
+        // fail with ENOENT; it must never pin an inode after the decision and
+        // then race with its physical removal.
+        let defer_free = self.inode_runtime.begin_unlink(child_ino);
         drop(lookup);
 
         // UNFINISHED: Linux also keeps opened directories alive across unlink.
         // This ext4 path currently defers final free only for non-directory
         // inodes, which is enough for mkstemp/unlink/fstat file workloads.
-        let deferred = if defer_free {
-            self.fs
-                .unlink_defer_free(parent_ino, leaf_name)
-                .map_err(map_ext4_error)?
-        } else {
-            self.fs
-                .unlink(parent_ino, leaf_name)
-                .map_err(map_ext4_error)?;
-            let mut attr = lwext4_rust::FileAttr::default();
-            if self.fs.get_attr(child_ino, &mut attr).is_err() {
-                self.inode_runtime.remove(child_ino);
+        if defer_free {
+            let deferred = match self.fs.unlink_defer_free(parent_ino, leaf_name) {
+                Ok(deferred) => deferred,
+                Err(err) => {
+                    self.inode_runtime.abort_unlink(child_ino);
+                    return Err(map_ext4_error(err));
+                }
+            };
+            if let Some(ino) = deferred {
+                let free_now = self.inode_runtime.finish_unlink(ino, true, true);
+                if free_now {
+                    self.free_unlinked_inode(ino)?;
+                }
+            } else {
+                // Another hard link still owns the inode.
+                self.inode_runtime.finish_unlink(child_ino, false, true);
             }
-            None
-        };
-        if let Some(ino) = deferred {
-            self.inode_runtime.mark_pending_unlink(ino);
+        } else {
+            if let Err(err) = self.fs.unlink(parent_ino, leaf_name) {
+                self.inode_runtime.abort_unlink(child_ino);
+                return Err(map_ext4_error(err));
+            }
+            let mut attr = lwext4_rust::FileAttr::default();
+            let inode_exists = self.fs.get_attr(child_ino, &mut attr).is_ok();
+            self.inode_runtime
+                .finish_unlink(child_ino, false, inode_exists);
         }
         Ok(())
     }
@@ -931,8 +1104,14 @@ impl LegacyFileSystemBackend for Ext4Mount {
         // existence here so stale VfsNodeId values do not create open counts.
         let mut attr = lwext4_rust::FileAttr::default();
         self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
-        self.inode_runtime.retain(ino);
-        Ok(())
+        if attr.nlink == 0 {
+            return Err(FsError::NotFound);
+        }
+        if self.inode_runtime.retain(ino) {
+            Ok(())
+        } else {
+            Err(FsError::NotFound)
+        }
     }
 
     fn release_inode(&mut self, ino: u32) -> FsResult<InodeRelease> {
@@ -971,6 +1150,13 @@ impl LegacyFileSystemBackend for Ext4Mount {
         self.fs.read_at(ino, buf, 0).map_err(map_ext4_error)
     }
 
+    fn prepare_readlink_plan(&mut self, ino: u32, len: usize) -> Option<Box<dyn BackendReadPlan>> {
+        match self.fs.plan_symlink_read(ino, len).ok()?? {
+            Ext4SymlinkReadPlan::Inline(data) => Some(Box::new(Ext4InlineReadPlan { data })),
+            Ext4SymlinkReadPlan::Mapped(plan) => self.mapped_read_plan(plan, false),
+        }
+    }
+
     fn prepare_read_plan(
         &mut self,
         ino: u32,
@@ -982,71 +1168,7 @@ impl LegacyFileSystemBackend for Ext4Mount {
             perf::record_ext4_read_plan_fallback();
             return None;
         };
-        if plan.block_size % EXT4_DEV_BSIZE != 0 {
-            perf::record_ext4_read_plan_fallback();
-            return None;
-        }
-        let device_blocks_per_fs_block = plan.block_size / EXT4_DEV_BSIZE;
-        let mut runs = Vec::with_capacity(plan.runs.len());
-        let mut data_runs = 0usize;
-        let mut data_blocks = 0usize;
-        let mut zero_runs = 0usize;
-        let mut zero_blocks = 0usize;
-        for run in plan.runs {
-            let Some(buffer_start) = run.buffer_block.checked_mul(plan.block_size) else {
-                perf::record_ext4_read_plan_fallback();
-                return None;
-            };
-            let Some(byte_len) = run.block_count.checked_mul(plan.block_size) else {
-                perf::record_ext4_read_plan_fallback();
-                return None;
-            };
-            if buffer_start
-                .checked_add(byte_len)
-                .is_none_or(|end| end > plan.buffer_len)
-            {
-                perf::record_ext4_read_plan_fallback();
-                return None;
-            }
-            let device_block = if let Some(fs_block) = run.fs_block {
-                let Some(device_block) = fs_block
-                    .checked_mul(device_blocks_per_fs_block as u64)
-                    .and_then(|block| usize::try_from(block).ok())
-                else {
-                    perf::record_ext4_read_plan_fallback();
-                    return None;
-                };
-                let device_blocks = run.block_count * device_blocks_per_fs_block;
-                if device_block
-                    .checked_add(device_blocks)
-                    .is_none_or(|end| end > self.device.num_blocks() as usize)
-                {
-                    perf::record_ext4_read_plan_fallback();
-                    return None;
-                }
-                data_runs += 1;
-                data_blocks += run.block_count;
-                Some(device_block)
-            } else {
-                zero_runs += 1;
-                zero_blocks += run.block_count;
-                None
-            };
-            runs.push(Ext4DeviceReadRun {
-                buffer_start,
-                byte_len,
-                device_block,
-            });
-        }
-        perf::record_ext4_read_plan_prepared(data_runs, data_blocks, zero_runs, zero_blocks);
-        Some(Box::new(Ext4DeviceReadPlan {
-            device: self.device.clone(),
-            write_sequence: self.write_sequence.clone(),
-            buffer_len: plan.buffer_len,
-            read_offset: plan.read_offset,
-            read_len: plan.read_len,
-            runs,
-        }))
+        self.mapped_read_plan(plan, true)
     }
 
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
@@ -1145,7 +1267,7 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         parent_ino: u32,
         component: &str,
     ) -> FsResult<(u32, FsNodeKind)> {
-        self.with_reader(BackendOp::Lookup, parent_ino, |reader| {
+        self.with_reader(BackendOp::Lookup, parent_ino, |reader, _| {
             reader.lookup_component_from(parent_ino, component)
         })
     }
@@ -1294,7 +1416,9 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
     }
 
     fn inode_flags(&self, ino: u32) -> FsResult<u32> {
-        self.with_reader(BackendOp::StatFull, ino, |reader| reader.inode_flags(ino))
+        self.with_reader(BackendOp::StatFull, ino, |reader, _| {
+            reader.inode_flags(ino)
+        })
     }
 
     fn set_inode_flags(&self, ino: u32, flags: u32) -> FsResult {
@@ -1304,9 +1428,24 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
     }
 
     fn retain_inode(&self, ino: u32) -> FsResult {
-        self.with_reader(BackendOp::InodeLifetime, ino, |reader| {
-            reader.retain_inode(ino)
-        })
+        loop {
+            let retained =
+                self.with_reader(BackendOp::InodeLifetime, ino, |reader, generation| {
+                    let mut attr = lwext4_rust::FileAttr::default();
+                    reader.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
+                    if attr.nlink == 0 {
+                        return Err(FsError::NotFound);
+                    }
+                    Ok(self.inode_runtime.retain_at_generation(
+                        ino,
+                        generation,
+                        &self.cache_generation,
+                    ))
+                })?;
+            if retained {
+                return Ok(());
+            }
+        }
     }
 
     fn release_inode(&self, ino: u32) -> FsResult<InodeRelease> {
@@ -1337,15 +1476,28 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
     }
 
     fn stat(&self, ino: u32) -> FsResult<FileStat> {
-        self.with_reader(BackendOp::StatFull, ino, |reader| reader.stat(ino))
+        self.with_reader(BackendOp::StatFull, ino, |reader, _| reader.stat(ino))
     }
 
     fn stat_basic(&self, ino: u32) -> FsResult<FileStat> {
-        self.with_reader(BackendOp::StatBasic, ino, |reader| reader.stat_basic(ino))
+        self.with_reader(BackendOp::StatBasic, ino, |reader, _| {
+            reader.stat_basic(ino)
+        })
     }
 
     fn readlink(&self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
-        self.with_reader(BackendOp::Readlink, ino, |reader| reader.readlink(ino, buf))
+        self.with_reader(BackendOp::Readlink, ino, |reader, _| {
+            reader.readlink(ino, buf)
+        })
+    }
+
+    fn prepare_readlink_plan(&self, ino: u32, len: usize) -> Option<Box<dyn BackendReadPlan>> {
+        // This phase reads only inode/mapping metadata. External target data
+        // is fetched by the returned pointer-free plan after the reader core
+        // lock has been released.
+        self.with_reader(BackendOp::ReadPlan, ino, |reader, _| {
+            reader.prepare_readlink_plan(ino, len)
+        })
     }
 
     fn supports_read_snapshot(&self, _ino: u32) -> bool {
@@ -1362,13 +1514,13 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         offset: u64,
         len: usize,
     ) -> Option<Box<dyn BackendReadPlan>> {
-        self.with_reader(BackendOp::ReadPlan, ino, |reader| {
+        self.with_reader(BackendOp::ReadPlan, ino, |reader, _| {
             reader.prepare_read_plan(ino, offset, len)
         })
     }
 
     fn read_at(&self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
-        self.with_reader(BackendOp::ReadFallback, ino, |reader| {
+        self.with_reader(BackendOp::ReadFallback, ino, |reader, _| {
             reader.read_at(ino, buf, offset)
         })
     }
@@ -1380,13 +1532,13 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
     }
 
     fn read_dirent64(&self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
-        self.with_reader(BackendOp::Readdir, ino, |reader| {
+        self.with_reader(BackendOp::Readdir, ino, |reader, _| {
             reader.read_dirent64(ino, offset, buf)
         })
     }
 
     fn list_root_names(&self) -> Vec<String> {
-        self.with_reader(BackendOp::Readdir, EXT4_ROOT_INO, |reader| {
+        self.with_reader(BackendOp::Readdir, EXT4_ROOT_INO, |reader, _| {
             reader.list_root_names()
         })
     }

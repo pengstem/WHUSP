@@ -3123,10 +3123,18 @@ impl File for VfsFile {
             return Err(FsError::InvalidInput);
         }
         inode_state::with_mapping_read(self.node, || {
-            with_mount(self.node.mount_id, BackendOp::Readlink, |mount| {
-                mount.readlink(self.node.ino, buf)
+            let plan = with_mount(self.node.mount_id, BackendOp::ReadPlan, |mount| {
+                mount.prepare_readlink_plan(self.node.ino, buf.len())
             })
-            .ok_or(FsError::Io)?
+            .flatten();
+            if let Some(plan) = plan {
+                Ok(plan.execute(buf))
+            } else {
+                with_mount(self.node.mount_id, BackendOp::Readlink, |mount| {
+                    mount.readlink(self.node.ino, buf)
+                })
+                .ok_or(FsError::Io)?
+            }
         })
     }
 
