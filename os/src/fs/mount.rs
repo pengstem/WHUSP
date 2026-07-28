@@ -3,12 +3,14 @@ use super::dentry_cache;
 use super::devfs::DevFs;
 use super::ext4::Ext4Mount;
 use super::fat::FatMount;
+use super::inode_state::{self, InodeState};
 use super::overlayfs::OverlayFs;
 use super::path::WorkingDir;
 use super::procfs::ProcFs;
 use super::tmpfs::{EXT234_SUPER_MAGIC, TmpFs};
 use super::vfs::{
-    FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult, VfsNodeId,
+    BackendOp, ConcurrentFileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult,
+    InodeRelease, LegacyFileSystemBackend, SerializedBackend, VfsNodeId,
     mount_has_writable_regular_open,
 };
 use crate::drivers::block::BLOCK_DEVICES;
@@ -85,7 +87,40 @@ struct MountedFs {
     fs_type: &'static str,
     options: SleepMutex<&'static str>,
     stat_flags: SleepMutex<u64>,
-    backend: SleepMutex<Box<dyn FileSystemBackend>>,
+    backend: Arc<dyn ConcurrentFileSystemBackend>,
+    pending_inode_releases: Arc<PendingReleaseQueue>,
+}
+
+struct PendingReleaseQueue {
+    entries: UPIntrFreeCell<Vec<PendingInodeRelease>>,
+}
+
+struct PendingInodeRelease {
+    ino: u32,
+    state: Arc<InodeState>,
+    attempts: usize,
+}
+
+impl PendingReleaseQueue {
+    fn new() -> Self {
+        Self {
+            entries: unsafe { UPIntrFreeCell::new(Vec::new()) },
+        }
+    }
+
+    fn push(&self, entry: PendingInodeRelease) {
+        self.entries.exclusive_access().push(entry);
+    }
+
+    fn take(&self) -> Vec<PendingInodeRelease> {
+        core::mem::take(&mut *self.entries.exclusive_access())
+    }
+
+    fn put_back(&self, entries: Vec<PendingInodeRelease>) {
+        if !entries.is_empty() {
+            self.entries.exclusive_access().extend(entries);
+        }
+    }
 }
 
 // CONTEXT: Loop-backed ext scratch mounts are tmpfs compatibility mounts until
@@ -138,7 +173,9 @@ lazy_static! {
     // short table edits. Do not perform filesystem or block I/O while holding it.
     static ref DYNAMIC_MOUNTS: UPIntrFreeCell<Vec<DynamicMount>> =
         unsafe { UPIntrFreeCell::new(Vec::new()) };
-    static ref PENDING_INODE_RELEASES: UPIntrFreeCell<Vec<(MountId, u32)>> =
+    // A short mount-id registry lets drop-time cleanup clone only the target
+    // mount's queue without waiting for the sleeping mount/backend locks.
+    static ref PENDING_RELEASE_QUEUES: UPIntrFreeCell<Vec<Option<Arc<PendingReleaseQueue>>>> =
         unsafe { UPIntrFreeCell::new(Vec::new()) };
     static ref EXT_SCRATCH_MOUNTS: SleepMutex<Vec<(String, &'static str, Arc<MountedFs>)>> =
         SleepMutex::new(Vec::new());
@@ -174,6 +211,7 @@ pub fn init_mounts() {
         .clone();
     let primary_mount = open_backend(BackendKind::Ext4, primary_device, 0)
         .expect("failed to mount primary ext4 filesystem");
+    register_pending_release_queue(MountId(0), &primary_mount);
     let block_mount_count = BLOCK_DEVICES.len();
     {
         let mut mounts = MOUNTS.lock();
@@ -188,7 +226,7 @@ pub fn init_mounts() {
 
 impl MountedFs {
     fn new(
-        backend: Box<dyn FileSystemBackend>,
+        backend: Box<dyn LegacyFileSystemBackend>,
         source: String,
         fs_type: &'static str,
         options: &'static str,
@@ -202,7 +240,8 @@ impl MountedFs {
             fs_type,
             options: SleepMutex::new(options),
             stat_flags: SleepMutex::new(stat_flags),
-            backend: SleepMutex::new(backend),
+            backend: Arc::new(SerializedBackend::new(backend)),
+            pending_inode_releases: Arc::new(PendingReleaseQueue::new()),
         })
     }
 
@@ -351,12 +390,37 @@ fn open_backend(
 
 fn register_mount(mounted: Arc<MountedFs>) -> MountId {
     let mount_id = MountId(NEXT_MOUNT_ID.fetch_add(1, Ordering::SeqCst));
+    register_pending_release_queue(mount_id, &mounted);
     let mut mounts = MOUNTS.lock();
     if mount_id.0 >= mounts.len() {
         mounts.resize_with(mount_id.0 + 1, || None);
     }
     mounts[mount_id.0] = Some(mounted);
     mount_id
+}
+
+fn register_pending_release_queue(mount_id: MountId, mounted: &Arc<MountedFs>) {
+    let mut queues = PENDING_RELEASE_QUEUES.exclusive_access();
+    if mount_id.0 >= queues.len() {
+        queues.resize_with(mount_id.0 + 1, || None);
+    }
+    queues[mount_id.0] = Some(Arc::clone(&mounted.pending_inode_releases));
+}
+
+fn pending_release_queue(mount_id: MountId) -> Option<Arc<PendingReleaseQueue>> {
+    PENDING_RELEASE_QUEUES
+        .exclusive_access()
+        .get(mount_id.0)
+        .and_then(|queue| queue.as_ref().cloned())
+}
+
+fn unregister_pending_release_queue(mount_id: MountId) {
+    if let Some(queue) = PENDING_RELEASE_QUEUES
+        .exclusive_access()
+        .get_mut(mount_id.0)
+    {
+        *queue = None;
+    }
 }
 
 /// Runs a backend operation for a mounted filesystem.
@@ -366,37 +430,40 @@ fn register_mount(mounted: Arc<MountedFs>) -> MountId {
 /// interrupt-masked mount metadata locks across this boundary.
 pub(super) fn with_mount<V>(
     mount_id: MountId,
-    f: impl FnOnce(&mut dyn FileSystemBackend) -> V,
+    op: BackendOp,
+    f: impl FnOnce(&mut dyn LegacyFileSystemBackend) -> V,
 ) -> Option<V> {
-    let mounted = {
+    let (backend, pending_releases) = {
         let mounts = MOUNTS.lock();
         mounts
             .get(mount_id.0)
-            .and_then(|mount| mount.as_ref().cloned())
+            .and_then(|mount| mount.as_ref())
+            .map(|mounted| {
+                (
+                    Arc::clone(&mounted.backend),
+                    Arc::clone(&mounted.pending_inode_releases),
+                )
+            })
     }?;
-    #[cfg(feature = "perf-counters")]
-    let mut backend = match mounted.backend.try_lock() {
-        Some(backend) => backend,
-        None => {
-            perf::record_mount_backend_contended_acquisition();
-            let wait_scope = perf::time_scope(perf::ProfilePoint::MountBackendContendedWait);
-            let backend = mounted.backend.lock();
-            drop(wait_scope);
-            backend
-        }
-    };
-    #[cfg(not(feature = "perf-counters"))]
-    let mut backend = mounted.backend.lock();
-    let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
-    drain_pending_inode_releases(mount_id, &mut **backend);
-    let result = f(&mut **backend);
-    drop(backend);
-    drop(hold_scope);
-    Some(result)
+    let mut result = None;
+    let mut f = Some(f);
+    backend.execute_serialized(
+        op,
+        &mut |legacy| drain_pending_inode_releases(&pending_releases, legacy),
+        &mut |legacy| {
+            result = Some(f.take().expect("mount backend operation called twice")(
+                legacy,
+            ));
+        },
+    );
+    result
 }
 
 pub(crate) fn overlay_real_node(node: VfsNodeId) -> Option<VfsNodeId> {
-    with_mount(node.mount_id, |mount| mount.overlay_real_node(node.ino)).flatten()
+    with_mount(node.mount_id, BackendOp::Lookup, |mount| {
+        mount.overlay_real_node(node.ino)
+    })
+    .flatten()
 }
 
 /// Best-effort backend access for drop-time cleanup paths.
@@ -405,54 +472,154 @@ pub(crate) fn overlay_real_node(node: VfsNodeId) -> Option<VfsNodeId> {
 /// cleanup instead of blocking while a file destructor is running.
 fn try_with_mount<V>(
     mount_id: MountId,
-    f: impl FnOnce(&mut dyn FileSystemBackend) -> V,
+    op: BackendOp,
+    f: impl FnOnce(&mut dyn LegacyFileSystemBackend) -> V,
 ) -> Option<V> {
-    let mounted = {
+    let (backend, pending_releases) = {
         let mounts = MOUNTS.try_lock()?;
         mounts
             .get(mount_id.0)
-            .and_then(|mount| mount.as_ref().cloned())
+            .and_then(|mount| mount.as_ref())
+            .map(|mounted| {
+                (
+                    Arc::clone(&mounted.backend),
+                    Arc::clone(&mounted.pending_inode_releases),
+                )
+            })
     }?;
-    let mut backend = mounted.backend.try_lock()?;
-    drain_pending_inode_releases(mount_id, &mut **backend);
-    Some(f(&mut **backend))
+    let mut result = None;
+    let mut f = Some(f);
+    backend
+        .try_execute_serialized(
+            op,
+            &mut |legacy| drain_pending_inode_releases(&pending_releases, legacy),
+            &mut |legacy| {
+                result = Some(f.take().expect("mount backend try-operation called twice")(
+                    legacy,
+                ));
+            },
+        )
+        .then_some(())?;
+    result
 }
 
-fn drain_pending_inode_releases(mount_id: MountId, backend: &mut dyn FileSystemBackend) {
-    let pending = {
-        let mut pending = PENDING_INODE_RELEASES.exclusive_access();
-        if pending.is_empty() {
-            return;
-        }
-        // Take the queue before backend release calls; release_inode() may
-        // enter filesystem code, and this interrupt-masked queue lock must not
-        // be held across backend cleanup.
-        core::mem::take(&mut *pending)
-    };
+fn drain_pending_inode_releases(
+    pending_releases: &PendingReleaseQueue,
+    backend: &mut dyn LegacyFileSystemBackend,
+) {
+    #[cfg(feature = "perf-counters")]
+    let timer = perf::time_pending_release_drain();
+    #[cfg(feature = "perf-counters")]
+    let io_before = backend.io_snapshot();
+    // Take this mount's queue before backend release calls; release_inode()
+    // may enter filesystem code, and this interrupt-masked queue lock must not
+    // be held across backend cleanup.
+    let pending = pending_releases.take();
+    if pending.is_empty() {
+        return;
+    }
 
+    #[cfg(feature = "perf-counters")]
+    let entries = pending.len();
+    #[cfg(feature = "perf-counters")]
+    let mut released = 0usize;
     let mut deferred = Vec::new();
-    for (pending_mount_id, ino) in pending {
-        if pending_mount_id == mount_id {
-            let _ = backend.release_inode(ino);
-        } else {
-            deferred.push((pending_mount_id, ino));
+    for mut entry in pending {
+        if !inode_state::is_current(&entry.state) {
+            #[cfg(feature = "perf-counters")]
+            {
+                released += 1;
+            }
+            continue;
+        }
+        match backend.release_inode(entry.ino) {
+            Ok(outcome) => {
+                if outcome == InodeRelease::Freed {
+                    inode_state::remove_if_same(entry.state.node(), &entry.state);
+                }
+                #[cfg(feature = "perf-counters")]
+                {
+                    released += 1;
+                }
+            }
+            // CONTEXT: A deferred final close can race with another close or
+            // namespace cleanup that already completed the backend lifetime.
+            // Once the backend reports no such inode, this exact-incarnation
+            // release record is terminal; retrying it on every operation would
+            // make a stale close a permanent mount-wide drain tax.
+            Err(FsError::NotFound) => {
+                inode_state::remove_if_same(entry.state.node(), &entry.state);
+                #[cfg(feature = "perf-counters")]
+                {
+                    released += 1;
+                }
+            }
+            Err(_err) => {
+                #[cfg(feature = "perf-counters")]
+                if entry.attempts == 0 {
+                    warn!(
+                        "pending inode release failed: node={:?} incarnation={} error={_err:?}",
+                        entry.state.node(),
+                        entry.state.incarnation(),
+                    );
+                }
+                entry.attempts = entry.attempts.saturating_add(1);
+                deferred.push(entry);
+            }
         }
     }
-    if !deferred.is_empty() {
-        PENDING_INODE_RELEASES.exclusive_access().extend(deferred);
-    }
+    pending_releases.put_back(deferred);
+    #[cfg(feature = "perf-counters")]
+    perf::record_pending_release_drain(
+        timer,
+        entries,
+        released,
+        backend.io_snapshot().delta_since(io_before),
+    );
 }
 
 /// Releases an inode reference from `VfsFile::drop`.
 ///
 /// This must not block on mount locks; busy backends are recorded for the next
 /// successful mount operation to drain.
-pub(super) fn release_inode_from_drop(mount_id: MountId, ino: u32) {
-    if try_with_mount(mount_id, |mount| mount.release_inode(ino)).is_none() {
-        PENDING_INODE_RELEASES
-            .exclusive_access()
-            .push((mount_id, ino));
+pub(super) fn release_inode_from_drop(state: &Arc<InodeState>) {
+    if !inode_state::is_current(state) {
+        return;
     }
+    let node = state.node();
+    match try_with_mount(node.mount_id, BackendOp::InodeLifetime, |mount| {
+        mount.release_inode(node.ino)
+    }) {
+        Some(Ok(InodeRelease::Freed)) => {
+            inode_state::remove_if_same(node, state);
+        }
+        Some(Ok(InodeRelease::Retained)) => {}
+        // `NotFound` is the idempotent terminal state for a late final close.
+        // Pointer matching prevents an old close from erasing state belonging
+        // to a reused inode number.
+        Some(Err(FsError::NotFound)) => {
+            inode_state::remove_if_same(node, state);
+        }
+        Some(Err(_)) | None => {
+            if let Some(queue) = pending_release_queue(node.mount_id) {
+                queue.push(PendingInodeRelease {
+                    ino: node.ino,
+                    state: Arc::clone(state),
+                    attempts: 0,
+                });
+            }
+        }
+    }
+}
+
+/// Pins an inode and installs its exact-incarnation Rust-side state only after
+/// the backend has confirmed that the inode still exists.
+pub(super) fn retain_inode(node: VfsNodeId) -> FsResult<Arc<InodeState>> {
+    with_mount(node.mount_id, BackendOp::InodeLifetime, |mount| {
+        mount.retain_inode(node.ino)
+    })
+    .ok_or(FsError::Io)??;
+    Ok(inode_state::state_for(node))
 }
 
 pub(super) fn mount_exists(mount_id: MountId) -> bool {
@@ -505,13 +672,15 @@ fn ensure_mount_open(mount_id: MountId) -> Result<(), MountError> {
         return Err(MountError::SourceMissing);
     };
     if slot.is_none() {
-        *slot = Some(mount);
+        *slot = Some(Arc::clone(&mount));
+        drop(mounts);
+        register_pending_release_queue(mount_id, &mount);
     }
     Ok(())
 }
 
 pub(crate) fn root_ino_for(mount_id: MountId) -> Option<u32> {
-    with_mount(mount_id, |mount| mount.root_ino())
+    with_mount(mount_id, BackendOp::Lookup, |mount| mount.root_ino())
 }
 
 fn primary_root_ino() -> u32 {
@@ -660,7 +829,7 @@ pub(super) fn primary_mount_id() -> MountId {
 }
 
 fn lookup_covered_parent(target: VfsNodeId) -> Result<VfsNodeId, MountError> {
-    let (parent_ino, kind) = with_mount(target.mount_id, |mount| {
+    let (parent_ino, kind) = with_mount(target.mount_id, BackendOp::Lookup, |mount| {
         mount.lookup_component_from(target.ino, "..")
     })
     .ok_or(MountError::InvalidTarget)?
@@ -1440,7 +1609,7 @@ fn mount_new_fs_on_target(
 pub(crate) fn mount_pseudo_fs_at_with_options(
     namespace_id: MountNamespaceId,
     target: WorkingDir,
-    backend: Box<dyn FileSystemBackend>,
+    backend: Box<dyn LegacyFileSystemBackend>,
     fs_type: &'static str,
     target_path: &str,
     options: &'static str,
@@ -1463,7 +1632,7 @@ pub(crate) fn mount_pseudo_fs_at_with_options(
 fn mount_pseudo_fs_on_target(
     namespace_id: MountNamespaceId,
     target: MountTarget,
-    backend: Box<dyn FileSystemBackend>,
+    backend: Box<dyn LegacyFileSystemBackend>,
     fs_type: &'static str,
     target_path: &str,
     options: &'static str,
@@ -2021,7 +2190,7 @@ pub(crate) fn mount_cgroup_memory_at(
 }
 
 pub(crate) fn assign_pid_to_cgroup(node: VfsNodeId, pid: usize) -> FsResult {
-    with_mount(node.mount_id, |mount| {
+    with_mount(node.mount_id, BackendOp::NamespaceMutation, |mount| {
         mount.assign_cgroup_pid(node.ino, pid)
     })
     .ok_or(FsError::InvalidInput)?
@@ -2213,6 +2382,9 @@ fn release_dynamic_mount_source_if_unused(source_mount_id: MountId) {
     {
         return;
     }
+    // Drain the mount-local queue before its registry/table ownership is
+    // removed. No other process reference is allowed past the checks above.
+    let _ = with_mount(source_mount_id, BackendOp::InodeLifetime, |_| ());
     if let Some(slot) = MOUNTS.lock().get_mut(source_mount_id.0) {
         if let Some(mounted) = slot.as_ref() {
             let flags = *mounted.stat_flags.lock();
@@ -2222,6 +2394,7 @@ fn release_dynamic_mount_source_if_unused(source_mount_id: MountId) {
         }
         *slot = None;
     }
+    unregister_pending_release_queue(source_mount_id);
 }
 
 fn mount_extra_block_devices() {
@@ -2256,7 +2429,7 @@ fn ensure_primary_child_dir(
     mode: u32,
     display_path: &str,
 ) -> Option<WorkingDir> {
-    with_mount(parent.mount_id(), |mount| {
+    with_mount(parent.mount_id(), BackendOp::Lookup, |mount| {
         match mount.lookup_component_from(parent.ino(), name) {
             Ok((ino, kind)) => {
                 if kind == FsNodeKind::Directory {
@@ -2294,7 +2467,7 @@ fn mount_synthetic_pseudo_fs_at(
     namespace_id: MountNamespaceId,
     parent: WorkingDir,
     target_path: &str,
-    backend: Box<dyn FileSystemBackend>,
+    backend: Box<dyn LegacyFileSystemBackend>,
     fs_type: &'static str,
     options: &'static str,
 ) -> Result<MountId, MountError> {
@@ -2411,7 +2584,10 @@ pub fn mount_status_log() {
 }
 
 pub fn list_root_apps() -> Vec<String> {
-    with_mount(primary_mount_id(), |mount| mount.list_root_names()).unwrap_or_default()
+    with_mount(primary_mount_id(), BackendOp::Readdir, |mount| {
+        mount.list_root_names()
+    })
+    .unwrap_or_default()
 }
 
 fn mounted_fs(mount_id: MountId) -> Option<Arc<MountedFs>> {
@@ -2551,7 +2727,7 @@ pub(crate) fn list_mounts(namespace_id: MountNamespaceId) -> Vec<MountInfo> {
 
 pub(crate) fn statfs_for_mount(mount_id: MountId) -> Option<FileSystemStat> {
     let flags = mount_stat_flags(mount_id)?;
-    with_mount(mount_id, |backend| {
+    with_mount(mount_id, BackendOp::Sync, |backend| {
         let mut stat = backend.statfs();
         stat.flags |= flags;
         stat
@@ -2575,7 +2751,7 @@ pub(crate) fn sync_all_mounts() -> FsResult {
         if let Err(err) = super::vfs::flush_dirty_regular_files_on_mount(mount_id) {
             result = result.and(Err(err));
         }
-        match with_mount(mount_id, |backend| {
+        match with_mount(mount_id, BackendOp::Sync, |backend| {
             let root_ino = backend.root_ino();
             backend.sync(root_ino, false)
         }) {
@@ -2604,7 +2780,7 @@ pub(crate) fn shutdown_all_mounts() -> FsResult {
         if let Err(err) = super::vfs::flush_dirty_regular_files_on_mount(mount_id) {
             result = result.and(Err(err));
         }
-        match with_mount(mount_id, |backend| backend.shutdown()) {
+        match with_mount(mount_id, BackendOp::Sync, |backend| backend.shutdown()) {
             Some(Ok(())) => {}
             Some(Err(err)) => result = result.and(Err(err)),
             None => result = result.and(Err(FsError::Io)),

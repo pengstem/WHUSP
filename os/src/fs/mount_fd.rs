@@ -4,7 +4,7 @@ use super::mount::{
 };
 use super::path::WorkingDir;
 use super::status_flags::StatusFlagsCell;
-use super::vfs::VfsNodeId;
+use super::vfs::{BackendOp, VfsNodeId};
 use super::{File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFREG};
 use crate::mm::UserBuffer;
 use crate::sync::SleepMutex;
@@ -257,7 +257,10 @@ impl File for DetachedMountFile {
 
     fn stat(&self) -> FsResult<FileStat> {
         let node = self.source_node();
-        with_mount(node.mount_id, |mount| mount.stat(node.ino)).ok_or(FsError::Io)?
+        with_mount(node.mount_id, BackendOp::StatFull, |mount| {
+            mount.stat(node.ino)
+        })
+        .ok_or(FsError::Io)?
     }
 
     fn poll(&self, _events: PollEvents) -> PollEvents {

@@ -8,6 +8,7 @@ mod eventfd;
 mod ext4;
 mod fat;
 mod inode;
+mod inode_state;
 mod memfd;
 mod mount;
 mod mount_fd;
@@ -52,6 +53,10 @@ pub(crate) use console_tty::{
 pub(crate) use eventfd::make_eventfd;
 pub(crate) use mount_fd::{DetachedMountFile, FsContextFile, FsContextStateError};
 pub(crate) use timerfd::{TimerFd, TimerFdClock, TimerFdState, make_timerfd};
+#[cfg(feature = "perf-counters")]
+pub(crate) use vfs::BackendIoSnapshot;
+#[cfg(feature = "perf-counters")]
+pub(crate) use vfs::BackendOp;
 
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
 

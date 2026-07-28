@@ -5,7 +5,7 @@ use super::dirent::{
 use super::mount::MountId;
 use super::path::WorkingDir;
 use super::status_flags::StatusFlagsCell;
-use super::vfs::{FileSystemBackend, FileSystemStat, FsNodeKind, VfsNodeId};
+use super::vfs::{FileSystemStat, FsNodeKind, LegacyFileSystemBackend, VfsNodeId};
 use super::{
     File, FileStat, FsError, FsResult, OpenFlags, PollEvents, PollWaitQueue, PollWaiter, S_IFBLK,
     S_IFCHR, S_IFDIR, SeekWhence, TtyId, console_tty_poll, console_tty_poll_with_wait,
@@ -2398,7 +2398,7 @@ fn raw_pts_entries() -> Vec<RawDirEntry> {
     entries
 }
 
-impl FileSystemBackend for DevFs {
+impl LegacyFileSystemBackend for DevFs {
     fn root_ino(&self) -> u32 {
         DevNode::Root.ino()
     }

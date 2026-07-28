@@ -2,6 +2,7 @@ ARCH ?= riscv64
 MODE ?= release
 PERF_COUNTERS ?= 0
 BLOCK_IO_MODE ?= force-sync
+EXTRA_FEATURES ?=
 override CARGO_HOME := $(abspath ../vendor)
 export CARGO_HOME
 
@@ -25,7 +26,7 @@ endif
 
 MODE_ARG := $(if $(filter release,$(MODE)),--release)
 PERF_FEATURE := $(if $(filter 1 yes true on,$(PERF_COUNTERS)),perf-counters)
-CARGO_FEATURES := $(strip $(PERF_FEATURE) $(BLOCK_IO_FEATURE))
+CARGO_FEATURES := $(strip $(PERF_FEATURE) $(BLOCK_IO_FEATURE) $(EXTRA_FEATURES))
 CARGO_FEATURE_ARG := $(if $(CARGO_FEATURES),--features "$(CARGO_FEATURES)")
 # Per-arch defaults when this Makefile is invoked directly; root targets pass MEM explicitly.
 ifeq ($(ARCH),loongarch64)

@@ -1,5 +1,5 @@
 use super::dirent::{DT_DIR, DT_REG, RawDirEntry, write_dir_entries};
-use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult};
+use super::vfs::{FileSystemStat, FsError, FsNodeKind, FsResult, LegacyFileSystemBackend};
 use super::{FileStat, FileTimestamp, S_IFDIR, S_IFREG};
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -455,7 +455,7 @@ fn discard_madv_free_pages() {
     }
 }
 
-impl FileSystemBackend for CgroupFs {
+impl LegacyFileSystemBackend for CgroupFs {
     fn root_ino(&self) -> u32 {
         ROOT_INO
     }

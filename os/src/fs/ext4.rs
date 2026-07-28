@@ -2,18 +2,23 @@ use super::dirent::{
     DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, DT_UNKNOWN, LINUX_DIRENT64_ALIGN,
     LINUX_DIRENT64_HEADER_SIZE,
 };
+#[cfg(feature = "perf-counters")]
+use super::vfs::BackendIoSnapshot;
 use super::vfs::{
-    BackendReadPlan, FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult,
+    BackendReadPlan, FileSystemStat, FsError, FsNodeKind, FsResult, InodeRelease,
+    LegacyFileSystemBackend,
 };
 use super::{FS_STATX_ATTR_FLAGS, FileStat, FileTimestamp};
 use crate::drivers::block::VirtIOBlock;
 use crate::perf;
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::str;
+#[cfg(feature = "perf-counters")]
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 use lwext4_rust::ffi::{
     EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, ENOTSUP, EXT4_ROOT_INO,
@@ -36,6 +41,45 @@ impl SystemHal for KernelHal {
 #[derive(Clone)]
 pub(super) struct KernelDisk {
     dev: Arc<VirtIOBlock>,
+    #[cfg(feature = "perf-counters")]
+    io_counters: Arc<Ext4IoCounters>,
+}
+
+#[cfg(feature = "perf-counters")]
+#[derive(Default)]
+struct Ext4IoCounters {
+    read_calls: AtomicUsize,
+    read_blocks: AtomicUsize,
+    read_bytes: AtomicUsize,
+    write_calls: AtomicUsize,
+    write_blocks: AtomicUsize,
+    write_bytes: AtomicUsize,
+}
+
+#[cfg(feature = "perf-counters")]
+impl Ext4IoCounters {
+    fn record_read(&self, blocks: usize, bytes: usize) {
+        self.read_calls.fetch_add(1, Ordering::Relaxed);
+        self.read_blocks.fetch_add(blocks, Ordering::Relaxed);
+        self.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn record_write(&self, blocks: usize, bytes: usize) {
+        self.write_calls.fetch_add(1, Ordering::Relaxed);
+        self.write_blocks.fetch_add(blocks, Ordering::Relaxed);
+        self.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> BackendIoSnapshot {
+        BackendIoSnapshot {
+            read_calls: self.read_calls.load(Ordering::Relaxed),
+            read_blocks: self.read_blocks.load(Ordering::Relaxed),
+            read_bytes: self.read_bytes.load(Ordering::Relaxed),
+            write_calls: self.write_calls.load(Ordering::Relaxed),
+            write_blocks: self.write_blocks.load(Ordering::Relaxed),
+            write_bytes: self.write_bytes.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl Ext4BlockDevice for KernelDisk {
@@ -44,6 +88,9 @@ impl Ext4BlockDevice for KernelDisk {
             return Err(Ext4Error::new(EIO as _, "unaligned block write"));
         }
         self.dev.write_blocks(block_id as usize, buf);
+        #[cfg(feature = "perf-counters")]
+        self.io_counters
+            .record_write(buf.len() / EXT4_DEV_BSIZE, buf.len());
         perf::record_ext4_block_write(buf.len() / EXT4_DEV_BSIZE, buf.len());
         Ok(buf.len())
     }
@@ -53,6 +100,9 @@ impl Ext4BlockDevice for KernelDisk {
             return Err(Ext4Error::new(EIO as _, "unaligned block read"));
         }
         self.dev.read_blocks(block_id as usize, buf);
+        #[cfg(feature = "perf-counters")]
+        self.io_counters
+            .record_read(buf.len() / EXT4_DEV_BSIZE, buf.len());
         perf::record_ext4_block_read(buf.len() / EXT4_DEV_BSIZE, buf.len());
         Ok(buf.len())
     }
@@ -118,27 +168,40 @@ fn map_ext4_error(err: Ext4Error) -> FsError {
 pub(super) struct Ext4Mount {
     fs: KernelExt4Fs,
     device: Arc<VirtIOBlock>,
-    open_inodes: BTreeMap<u32, usize>,
-    pending_unlinks: BTreeSet<u32>,
-    runtime_special_rdevs: BTreeMap<u32, u64>,
+    #[cfg(feature = "perf-counters")]
+    io_counters: Arc<Ext4IoCounters>,
+    inode_runtime: BTreeMap<u32, Ext4InodeRuntimeState>,
 }
 
+#[derive(Default)]
+struct Ext4InodeRuntimeState {
+    open_count: usize,
+    pending_unlink: bool,
+    special_rdev: Option<u64>,
+}
+
+// SAFETY: the FFI core and its raw pointers move only as one `Ext4Mount`.
+// Every dereference happens behind `SerializedBackend.state`; the core itself
+// is intentionally not `Sync` and must never be entered by two callers.
 unsafe impl Send for Ext4Mount {}
-unsafe impl Sync for Ext4Mount {}
 
 impl Ext4Mount {
     pub(super) fn open(device: Arc<VirtIOBlock>) -> Result<Self, Ext4Error> {
+        #[cfg(feature = "perf-counters")]
+        let io_counters = Arc::new(Ext4IoCounters::default());
         Ok(Self {
             fs: KernelExt4Fs::new(
                 KernelDisk {
                     dev: device.clone(),
+                    #[cfg(feature = "perf-counters")]
+                    io_counters: io_counters.clone(),
                 },
                 EXT4_CONFIG,
             )?,
             device,
-            open_inodes: BTreeMap::new(),
-            pending_unlinks: BTreeSet::new(),
-            runtime_special_rdevs: BTreeMap::new(),
+            #[cfg(feature = "perf-counters")]
+            io_counters,
+            inode_runtime: BTreeMap::new(),
         })
     }
 
@@ -156,7 +219,11 @@ impl Ext4Mount {
             nlink: attr.nlink as u32,
             uid: attr.uid,
             gid: attr.gid,
-            rdev: self.runtime_special_rdevs.get(&ino).copied().unwrap_or(0),
+            rdev: self
+                .inode_runtime
+                .get(&ino)
+                .and_then(|state| state.special_rdev)
+                .unwrap_or(0),
             inode_flags,
             inode_flags_supported,
             size: attr.size,
@@ -211,7 +278,12 @@ impl BackendReadPlan for Ext4DeviceReadPlan {
     }
 }
 
-impl FileSystemBackend for Ext4Mount {
+impl LegacyFileSystemBackend for Ext4Mount {
+    #[cfg(feature = "perf-counters")]
+    fn io_snapshot(&self) -> BackendIoSnapshot {
+        self.io_counters.snapshot()
+    }
+
     fn statfs(&mut self) -> FileSystemStat {
         match self.fs.stat() {
             Ok(st) => FileSystemStat {
@@ -283,7 +355,7 @@ impl FileSystemBackend for Ext4Mount {
             // types, but it does not yet expose persistent device major/minor
             // payloads. Keep runtime-created rdevs for stat/statx until the
             // wrapper can read/write the on-disk special inode fields.
-            self.runtime_special_rdevs.insert(ino, rdev);
+            self.inode_runtime.entry(ino).or_default().special_rdev = Some(rdev);
         }
         Ok(ino)
     }
@@ -320,7 +392,10 @@ impl FileSystemBackend for Ext4Mount {
             .lookup(parent_ino, leaf_name)
             .map_err(map_ext4_error)?;
         let child_ino = lookup.entry().ino();
-        let defer_free = self.open_inodes.get(&child_ino).copied().unwrap_or(0) > 0;
+        let defer_free = self
+            .inode_runtime
+            .get(&child_ino)
+            .is_some_and(|state| state.open_count > 0);
         drop(lookup);
 
         // UNFINISHED: Linux also keeps opened directories alive across unlink.
@@ -336,12 +411,12 @@ impl FileSystemBackend for Ext4Mount {
                 .map_err(map_ext4_error)?;
             let mut attr = lwext4_rust::FileAttr::default();
             if self.fs.get_attr(child_ino, &mut attr).is_err() {
-                self.runtime_special_rdevs.remove(&child_ino);
+                self.inode_runtime.remove(&child_ino);
             }
             None
         };
         if let Some(ino) = deferred {
-            self.pending_unlinks.insert(ino);
+            self.inode_runtime.entry(ino).or_default().pending_unlink = true;
         }
         Ok(())
     }
@@ -421,26 +496,40 @@ impl FileSystemBackend for Ext4Mount {
         // existence here so stale VfsNodeId values do not create open counts.
         let mut attr = lwext4_rust::FileAttr::default();
         self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
-        *self.open_inodes.entry(ino).or_insert(0) += 1;
+        self.inode_runtime.entry(ino).or_default().open_count += 1;
         Ok(())
     }
 
-    fn release_inode(&mut self, ino: u32) -> FsResult {
-        let Some(open_count) = self.open_inodes.get_mut(&ino) else {
-            return Ok(());
+    fn release_inode(&mut self, ino: u32) -> FsResult<InodeRelease> {
+        let Some(state) = self.inode_runtime.get(&ino) else {
+            return Ok(InodeRelease::Retained);
         };
-        if *open_count > 1 {
-            *open_count -= 1;
-            return Ok(());
+        if state.open_count == 0 {
+            return Ok(InodeRelease::Retained);
+        }
+        if state.open_count > 1 {
+            self.inode_runtime
+                .get_mut(&ino)
+                .expect("ext4 inode runtime state disappeared")
+                .open_count -= 1;
+            return Ok(InodeRelease::Retained);
         }
         // The final open reference is the point where an unlinked-but-open
         // inode can be physically freed from the ext4 backend.
-        self.open_inodes.remove(&ino);
-        if self.pending_unlinks.remove(&ino) {
+        if state.pending_unlink {
             self.fs.free_unlinked_inode(ino).map_err(map_ext4_error)?;
-            self.runtime_special_rdevs.remove(&ino);
+            self.inode_runtime.remove(&ino);
+            return Ok(InodeRelease::Freed);
         }
-        Ok(())
+        let state = self
+            .inode_runtime
+            .get_mut(&ino)
+            .expect("ext4 inode runtime state disappeared");
+        state.open_count = 0;
+        if state.special_rdev.is_none() {
+            self.inode_runtime.remove(&ino);
+        }
+        Ok(InodeRelease::Retained)
     }
 
     fn stat(&mut self, ino: u32) -> FsResult<FileStat> {

@@ -2,11 +2,12 @@ use super::super::dentry_cache;
 use super::super::devfs;
 use super::super::dirent::{DT_DIR, RawDirEntry, write_dir_entries_with_offset_base};
 use super::super::inode::{OpenFlags, link_node_in};
+use super::super::inode_state;
 use super::super::mount::{
     MountId, MountNamespaceId, mount_any_nosymfollow, mount_is_devfs, mount_is_noatime,
     mount_is_nodev, mount_is_nodiratime, mount_is_nosymfollow, mount_is_read_only,
     mount_supports_dirty_writeback, mount_supports_page_cache, release_inode_from_drop,
-    synthetic_children_for_dir, with_mount,
+    retain_inode, synthetic_children_for_dir, with_mount,
 };
 use super::super::named_fifo::open_named_fifo;
 use super::super::path::{PathContext, WorkingDir};
@@ -16,7 +17,7 @@ use super::super::{
     S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, SeekWhence,
 };
 use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
-use super::{FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
+use super::{BackendOp, FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
 use crate::config::PAGE_SIZE;
 use crate::mm::{
     UserBuffer, frame_alloc, frame_alloc_contiguous_uninit, frame_alloc_uninit,
@@ -151,8 +152,8 @@ impl DirtyPage {
     }
 }
 
-#[derive(Debug)]
 struct DirtyFileCache {
+    inode_state: Arc<inode_state::InodeState>,
     logical_size: usize,
     mtime: FileTimestamp,
     ctime: FileTimestamp,
@@ -245,8 +246,13 @@ impl SmallRegularReadCaches {
 }
 
 impl DirtyFileCache {
-    fn new(logical_size: usize, timestamp: FileTimestamp) -> Self {
+    fn new(
+        inode_state: Arc<inode_state::InodeState>,
+        logical_size: usize,
+        timestamp: FileTimestamp,
+    ) -> Self {
         Self {
+            inode_state,
             logical_size,
             mtime: timestamp,
             ctime: timestamp,
@@ -425,9 +431,11 @@ fn dirty_or_backend_logical_size(node: VfsNodeId) -> Option<usize> {
     if let Some(size) = dirty_logical_size(node) {
         return Some(size);
     }
-    with_mount(node.mount_id, |mount| mount.stat(node.ino))
-        .and_then(Result::ok)
-        .map(|stat| stat.size as usize)
+    with_mount(node.mount_id, BackendOp::StatFull, |mount| {
+        mount.stat(node.ino)
+    })
+    .and_then(Result::ok)
+    .map(|stat| stat.size as usize)
 }
 
 fn any_regular_file_dirty() -> bool {
@@ -629,12 +637,12 @@ fn cache_dirty_regular_write(node: VfsNodeId, offset: usize, buf: &[u8]) -> Dirt
         !dirty.contains_key(&node)
     };
     let retained_pin = if needs_pin {
-        match with_mount(node.mount_id, |mount| mount.retain_inode(node.ino)) {
-            Some(Ok(())) => true,
-            _ => return DirtyCacheWriteResult::Fallback,
+        match retain_inode(node) {
+            Ok(state) => Some(state),
+            Err(_) => return DirtyCacheWriteResult::Fallback,
         }
     } else {
-        false
+        None
     };
 
     let timestamp = FileTimestamp::now();
@@ -643,29 +651,45 @@ fn cache_dirty_regular_write(node: VfsNodeId, offset: usize, buf: &[u8]) -> Dirt
     let (dirty_pages, new_pages) = dirty_write_page_pressure(&dirty, node, page_start, page_count);
     if dirty_pages.saturating_add(new_pages) > VFS_DIRTY_WRITEBACK_MAX_PAGES {
         drop(dirty);
-        if retained_pin {
-            release_inode_from_drop(node.mount_id, node.ino);
+        if let Some(state) = retained_pin.as_ref() {
+            release_inode_from_drop(state);
         }
         return DirtyCacheWriteResult::NeedsPressureFlush;
     }
-    if retained_pin && dirty.contains_key(&node) {
-        release_extra_pin = true;
+    let cache_exists = dirty.contains_key(&node);
+    if !cache_exists && retained_pin.is_none() {
+        drop(dirty);
+        return DirtyCacheWriteResult::Fallback;
     }
-    let cache = dirty
-        .entry(node)
-        .or_insert_with(|| DirtyFileCache::new(logical_size, timestamp));
     let missing_prepared_page = (0..page_count).any(|page_delta| {
         let page_index = page_start + page_delta;
-        !cache.pages.contains_key(&page_index) && !prepared_pages.contains_key(&page_index)
+        !dirty
+            .get(&node)
+            .is_some_and(|cache| cache.pages.contains_key(&page_index))
+            && !prepared_pages.contains_key(&page_index)
     });
     if missing_prepared_page {
         sync_dirty_regular_file_count(&dirty);
         drop(dirty);
-        if retained_pin {
-            release_inode_from_drop(node.mount_id, node.ino);
+        if let Some(state) = retained_pin.as_ref() {
+            release_inode_from_drop(state);
         }
         return DirtyCacheWriteResult::Fallback;
     }
+    if cache_exists && retained_pin.is_some() {
+        release_extra_pin = true;
+    }
+    let cache = dirty.entry(node).or_insert_with(|| {
+        DirtyFileCache::new(
+            Arc::clone(
+                retained_pin
+                    .as_ref()
+                    .expect("new dirty cache without inode pin"),
+            ),
+            logical_size,
+            timestamp,
+        )
+    });
     cache.logical_size = cache.logical_size.max(end);
     cache.mtime = timestamp;
     cache.ctime = timestamp;
@@ -685,7 +709,11 @@ fn cache_dirty_regular_write(node: VfsNodeId, offset: usize, buf: &[u8]) -> Dirt
     sync_dirty_regular_file_count(&dirty);
     drop(dirty);
     if release_extra_pin {
-        release_inode_from_drop(node.mount_id, node.ino);
+        release_inode_from_drop(
+            retained_pin
+                .as_ref()
+                .expect("missing extra dirty inode pin"),
+        );
     }
 
     record_dirty_cache_write(page_count, buf.len());
@@ -727,12 +755,12 @@ fn cache_dirty_regular_user_buffer_write(
         !dirty.contains_key(&node)
     };
     let retained_pin = if needs_pin {
-        match with_mount(node.mount_id, |mount| mount.retain_inode(node.ino)) {
-            Some(Ok(())) => true,
-            _ => return DirtyCacheWriteResult::Fallback,
+        match retain_inode(node) {
+            Ok(state) => Some(state),
+            Err(_) => return DirtyCacheWriteResult::Fallback,
         }
     } else {
-        false
+        None
     };
 
     let timestamp = FileTimestamp::now();
@@ -741,17 +769,30 @@ fn cache_dirty_regular_user_buffer_write(
     let (dirty_pages, new_pages) = dirty_write_page_pressure(&dirty, node, page_start, page_count);
     if dirty_pages.saturating_add(new_pages) > VFS_DIRTY_WRITEBACK_MAX_PAGES {
         drop(dirty);
-        if retained_pin {
-            release_inode_from_drop(node.mount_id, node.ino);
+        if let Some(state) = retained_pin.as_ref() {
+            release_inode_from_drop(state);
         }
         return DirtyCacheWriteResult::NeedsPressureFlush;
     }
-    if retained_pin && dirty.contains_key(&node) {
+    let cache_exists = dirty.contains_key(&node);
+    if !cache_exists && retained_pin.is_none() {
+        drop(dirty);
+        return DirtyCacheWriteResult::Fallback;
+    }
+    if cache_exists && retained_pin.is_some() {
         release_extra_pin = true;
     }
-    let cache = dirty
-        .entry(node)
-        .or_insert_with(|| DirtyFileCache::new(logical_size, timestamp));
+    let cache = dirty.entry(node).or_insert_with(|| {
+        DirtyFileCache::new(
+            Arc::clone(
+                retained_pin
+                    .as_ref()
+                    .expect("new dirty cache without inode pin"),
+            ),
+            logical_size,
+            timestamp,
+        )
+    });
     cache.logical_size = cache.logical_size.max(end);
     cache.mtime = timestamp;
     cache.ctime = timestamp;
@@ -768,7 +809,11 @@ fn cache_dirty_regular_user_buffer_write(
     sync_dirty_regular_file_count(&dirty);
     drop(dirty);
     if release_extra_pin {
-        release_inode_from_drop(node.mount_id, node.ino);
+        release_inode_from_drop(
+            retained_pin
+                .as_ref()
+                .expect("missing extra dirty inode pin"),
+        );
     }
 
     record_dirty_cache_write(page_count, len);
@@ -835,8 +880,8 @@ struct DirtyWritebackRun {
     data: Vec<u8>,
 }
 
-#[derive(Debug)]
 struct DirtyWritebackBatch {
+    inode_state: Arc<inode_state::InodeState>,
     logical_size: usize,
     pages: BTreeMap<usize, DirtyPage>,
     runs: Vec<DirtyWritebackRun>,
@@ -847,6 +892,7 @@ fn collect_dirty_writeback(node: VfsNodeId) -> Option<DirtyWritebackBatch> {
     let cache = dirty.remove(&node)?;
     sync_dirty_regular_file_count(&dirty);
     let logical_size = cache.logical_size;
+    let inode_state = cache.inode_state;
     let mut runs = Vec::new();
     let mut current_offset = 0usize;
     let mut current_data = Vec::new();
@@ -883,6 +929,7 @@ fn collect_dirty_writeback(node: VfsNodeId) -> Option<DirtyWritebackBatch> {
         });
     }
     Some(DirtyWritebackBatch {
+        inode_state,
         logical_size,
         pages,
         runs,
@@ -893,9 +940,13 @@ fn restore_dirty_writeback(node: VfsNodeId, batch: DirtyWritebackBatch) {
     let timestamp = FileTimestamp::now();
     let mut dirty = DIRTY_REGULAR_FILES.lock();
     let release_batch_pin = dirty.contains_key(&node);
-    let cache = dirty
-        .entry(node)
-        .or_insert_with(|| DirtyFileCache::new(batch.logical_size, timestamp));
+    let cache = dirty.entry(node).or_insert_with(|| {
+        DirtyFileCache::new(
+            Arc::clone(&batch.inode_state),
+            batch.logical_size,
+            timestamp,
+        )
+    });
     cache.logical_size = cache.logical_size.max(batch.logical_size);
     for (page_index, page) in batch.pages {
         cache.pages.entry(page_index).or_insert(page);
@@ -903,7 +954,7 @@ fn restore_dirty_writeback(node: VfsNodeId, batch: DirtyWritebackBatch) {
     sync_dirty_regular_file_count(&dirty);
     drop(dirty);
     if release_batch_pin {
-        release_inode_from_drop(node.mount_id, node.ino);
+        release_inode_from_drop(&batch.inode_state);
     }
 }
 
@@ -923,7 +974,7 @@ fn flush_dirty_regular_file_for_reason(node: VfsNodeId, reason: DirtyFlushReason
     let mut result = Ok(());
     for run in batch.runs.iter() {
         perf::record_vfs_write_backend(run.data.len());
-        let write_size = with_mount(node.mount_id, |mount| {
+        let write_size = with_mount(node.mount_id, BackendOp::Write, |mount| {
             mount.write_at(node.ino, &run.data, run.offset as u64)
         });
         let write_size = match write_size {
@@ -945,7 +996,7 @@ fn flush_dirty_regular_file_for_reason(node: VfsNodeId, reason: DirtyFlushReason
         return result;
     }
     record_dirty_cache_flush(reason, pages, bytes);
-    release_inode_from_drop(node.mount_id, node.ino);
+    release_inode_from_drop(&batch.inode_state);
     Ok(())
 }
 
@@ -1134,6 +1185,7 @@ pub(crate) fn initialize_regular_file_page_cache_incarnation(
     node: VfsNodeId,
     supports_page_cache: bool,
 ) {
+    inode_state::initialize_new(node);
     drop(begin_regular_file_page_cache_mutation_with_support(
         node,
         FsNodeKind::RegularFile,
@@ -1231,6 +1283,7 @@ fn prepare_created_file_mode(parent_stat: FileStat, attrs: &FileCreateAttrs) -> 
 
 pub(crate) struct VfsFile {
     node: VfsNodeId,
+    inode_state: Arc<inode_state::InodeState>,
     parent: Option<VfsNodeId>,
     kind: FsNodeKind,
     namespace_id: MountNamespaceId,
@@ -1261,8 +1314,8 @@ impl VfsFile {
         let visible_path = path.visible_path;
         // An open file description pins its backend inode even if the path is
         // later unlinked. Keep this retain paired with Drop's release path.
-        with_mount(node.mount_id, |mount| mount.retain_inode(node.ino)).ok_or(FsError::Io)??;
-        let read_snapshot_supported = with_mount(node.mount_id, |mount| {
+        let inode_state = retain_inode(node)?;
+        let read_snapshot_supported = with_mount(node.mount_id, BackendOp::ReadPlan, |mount| {
             mount.supports_read_snapshot(node.ino)
         })
         .unwrap_or(false);
@@ -1271,6 +1324,7 @@ impl VfsFile {
         track_writable_regular_open(node, kind, writable);
         let file = Self {
             node,
+            inode_state,
             parent,
             kind,
             namespace_id,
@@ -1315,7 +1369,9 @@ impl VfsFile {
         }
         let mut offset = self.offset.lock();
         if append {
-            let stat = match with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino)) {
+            let stat = match with_mount(self.node.mount_id, BackendOp::StatFull, |mount| {
+                mount.stat(self.node.ino)
+            }) {
                 Some(Ok(stat)) => stat,
                 _ => {
                     return 0;
@@ -1379,62 +1435,67 @@ impl VfsFile {
     }
 
     fn write_at_chunks(&self, offset: usize, buf: &[u8]) -> usize {
-        let mut total_write_size = 0usize;
-        for chunk in buf.chunks(VFS_WRITE_CHUNK_SIZE) {
-            let Some(chunk_offset) = offset.checked_add(total_write_size) else {
-                break;
-            };
-            let mut cached_dirty = false;
-            if can_cache_dirty_write(
-                self.kind,
-                self.supports_dirty_writeback,
-                chunk_offset,
-                chunk.len(),
-                self.status_flags.get(),
-            ) {
-                let mut pressure_retried = false;
-                loop {
-                    match cache_dirty_regular_write(self.node, chunk_offset, chunk) {
-                        DirtyCacheWriteResult::Cached(write_size) => {
-                            total_write_size = total_write_size.saturating_add(write_size);
-                            if write_size < chunk.len() {
+        if buf.is_empty() {
+            return 0;
+        }
+        inode_state::with_mapping_mutation_value(self.node, || {
+            let mut total_write_size = 0usize;
+            for chunk in buf.chunks(VFS_WRITE_CHUNK_SIZE) {
+                let Some(chunk_offset) = offset.checked_add(total_write_size) else {
+                    break;
+                };
+                let mut cached_dirty = false;
+                if can_cache_dirty_write(
+                    self.kind,
+                    self.supports_dirty_writeback,
+                    chunk_offset,
+                    chunk.len(),
+                    self.status_flags.get(),
+                ) {
+                    let mut pressure_retried = false;
+                    loop {
+                        match cache_dirty_regular_write(self.node, chunk_offset, chunk) {
+                            DirtyCacheWriteResult::Cached(write_size) => {
+                                total_write_size = total_write_size.saturating_add(write_size);
+                                if write_size < chunk.len() {
+                                    break;
+                                }
+                                cached_dirty = true;
                                 break;
                             }
-                            cached_dirty = true;
-                            break;
-                        }
-                        DirtyCacheWriteResult::NeedsPressureFlush if !pressure_retried => {
-                            if flush_dirty_regular_files_for_pressure().is_err() {
-                                break;
+                            DirtyCacheWriteResult::NeedsPressureFlush if !pressure_retried => {
+                                if flush_dirty_regular_files_for_pressure().is_err() {
+                                    break;
+                                }
+                                pressure_retried = true;
                             }
-                            pressure_retried = true;
+                            DirtyCacheWriteResult::NeedsPressureFlush
+                            | DirtyCacheWriteResult::Fallback => break,
                         }
-                        DirtyCacheWriteResult::NeedsPressureFlush
-                        | DirtyCacheWriteResult::Fallback => break,
                     }
                 }
-            }
-            if cached_dirty {
-                continue;
-            }
-            if self.kind == FsNodeKind::RegularFile && !chunk.is_empty() {
-                record_dirty_cache_fallback();
-                if flush_dirty_regular_file(self.node).is_err() {
+                if cached_dirty {
+                    continue;
+                }
+                if self.kind == FsNodeKind::RegularFile && !chunk.is_empty() {
+                    record_dirty_cache_fallback();
+                    if flush_dirty_regular_file(self.node).is_err() {
+                        break;
+                    }
+                }
+                perf::record_vfs_write_backend(chunk.len());
+                let Some(write_size) = with_mount(self.node.mount_id, BackendOp::Write, |mount| {
+                    mount.write_at(self.node.ino, chunk, chunk_offset as u64)
+                }) else {
+                    break;
+                };
+                total_write_size = total_write_size.saturating_add(write_size);
+                if write_size < chunk.len() {
                     break;
                 }
             }
-            perf::record_vfs_write_backend(chunk.len());
-            let Some(write_size) = with_mount(self.node.mount_id, |mount| {
-                mount.write_at(self.node.ino, chunk, chunk_offset as u64)
-            }) else {
-                break;
-            };
-            total_write_size = total_write_size.saturating_add(write_size);
-            if write_size < chunk.len() {
-                break;
-            }
-        }
-        total_write_size
+            total_write_size
+        })
     }
 
     fn read_backend_at_profiled(
@@ -1444,7 +1505,7 @@ impl VfsFile {
         point: perf::ProfilePoint,
     ) -> usize {
         let _profile_scope = perf::time_scope(point);
-        let Some(read_size) = with_mount(self.node.mount_id, |mount| {
+        let Some(read_size) = with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
             mount.read_at(self.node.ino, buf, offset as u64)
         }) else {
             return 0;
@@ -1486,7 +1547,7 @@ impl VfsFile {
             *snapshot = None;
         }
         if snapshot.is_none() {
-            let content = match with_mount(self.node.mount_id, |mount| {
+            let content = match with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
                 mount.read_snapshot(self.node.ino)
             })? {
                 Some(Ok(content)) => content,
@@ -1536,7 +1597,10 @@ impl VfsFile {
         {
             return None;
         }
-        let stat = with_mount(self.node.mount_id, |mount| mount.stat_basic(self.node.ino))?.ok()?;
+        let stat = with_mount(self.node.mount_id, BackendOp::StatBasic, |mount| {
+            mount.stat_basic(self.node.ino)
+        })?
+        .ok()?;
         let file_size = stat.size as usize;
         if self.read_cache_id_for_size(file_size).is_some() {
             return None;
@@ -1588,7 +1652,10 @@ impl VfsFile {
         {
             return None;
         }
-        let stat = with_mount(self.node.mount_id, |mount| mount.stat_basic(self.node.ino))?.ok()?;
+        let stat = with_mount(self.node.mount_id, BackendOp::StatBasic, |mount| {
+            mount.stat_basic(self.node.ino)
+        })?
+        .ok()?;
         Some((
             FileTimestamp {
                 sec: stat.atime_sec,
@@ -1603,8 +1670,11 @@ impl VfsFile {
 
     fn restore_noatime(&self, snapshot: Option<(FileTimestamp, FileTimestamp)>) {
         if let Some((atime, ctime)) = snapshot {
-            let _ = with_mount(self.node.mount_id, |mount| {
-                mount.set_times(self.node.ino, Some(atime), None, ctime)
+            let _ = inode_state::with_metadata_mutation(self.node, || {
+                with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                    mount.set_times(self.node.ino, Some(atime), None, ctime)
+                })
+                .ok_or(FsError::Io)?
             });
         }
     }
@@ -1613,16 +1683,20 @@ impl VfsFile {
         if mount_is_noatime(self.node.mount_id) || mount_is_nodiratime(self.node.mount_id) {
             return;
         }
-        let Some(Ok(stat)) = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))
-        else {
+        let Some(Ok(stat)) = with_mount(self.node.mount_id, BackendOp::StatFull, |mount| {
+            mount.stat(self.node.ino)
+        }) else {
             return;
         };
         let ctime = FileTimestamp {
             sec: stat.ctime_sec,
             nsec: stat.ctime_nsec,
         };
-        let _ = with_mount(self.node.mount_id, |mount| {
-            mount.set_times(self.node.ino, Some(FileTimestamp::now()), None, ctime)
+        let _ = inode_state::with_metadata_mutation(self.node, || {
+            with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                mount.set_times(self.node.ino, Some(FileTimestamp::now()), None, ctime)
+            })
+            .ok_or(FsError::Io)?
         });
     }
 
@@ -1641,8 +1715,10 @@ impl VfsFile {
         // from nonzero bytes in filesystem-sized blocks instead of querying
         // backend extent allocation, so allocated zero-filled blocks may be
         // reported as holes.
-        let stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))
-            .ok_or(FsError::Io)??;
+        let stat = with_mount(self.node.mount_id, BackendOp::StatFull, |mount| {
+            mount.stat(self.node.ino)
+        })
+        .ok_or(FsError::Io)??;
         let size = stat.size as usize;
         if offset > size {
             return Err(FsError::NoDeviceOrAddress);
@@ -1665,7 +1741,7 @@ impl VfsFile {
             let valid_len = block_end - block_start;
             buf[..valid_len].fill(0);
             let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsSeekScanRead);
-            let read_len = with_mount(self.node.mount_id, |mount| {
+            let read_len = with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
                 mount.read_at(self.node.ino, &mut buf[..valid_len], block_start as u64)
             })
             .ok_or(FsError::Io)?;
@@ -1712,7 +1788,7 @@ impl VfsFile {
             synthetic_children_for_dir(self.namespace_id, self.node, parent_path)
                 .into_iter()
                 .filter(|entry| {
-                    !with_mount(self.node.mount_id, |mount| {
+                    !with_mount(self.node.mount_id, BackendOp::Lookup, |mount| {
                         mount
                             .lookup_component_from(self.node.ino, entry.name.as_str())
                             .is_ok()
@@ -1785,9 +1861,10 @@ impl VfsFile {
             let file_size = match cached_file_size {
                 Some(file_size) => file_size,
                 None => {
-                    let stat =
-                        with_mount(self.node.mount_id, |mount| mount.stat_basic(self.node.ino))?
-                            .ok()?;
+                    let stat = with_mount(self.node.mount_id, BackendOp::StatBasic, |mount| {
+                        mount.stat_basic(self.node.ino)
+                    })?
+                    .ok()?;
                     let file_size = stat.size as usize;
                     self.read_cache_id_for_size(file_size)?;
                     cached_file_size = Some(file_size);
@@ -1835,7 +1912,7 @@ impl VfsFile {
             let noatime_snapshot = self.noatime_snapshot();
             let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsReadCacheFill);
             let read_plan = if read_limit % PAGE_SIZE == 0 {
-                with_mount(self.node.mount_id, |mount| {
+                with_mount(self.node.mount_id, BackendOp::ReadPlan, |mount| {
                     mount.prepare_read_plan(self.node.ino, page_start as u64, read_limit)
                 })
                 .flatten()
@@ -1850,7 +1927,7 @@ impl VfsFile {
             let read_len = if let Some(read_plan) = read_plan {
                 read_plan.execute(fill_buf)
             } else {
-                with_mount(self.node.mount_id, |mount| {
+                with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
                     mount.read_at(self.node.ino, fill_buf, page_start as u64)
                 })
                 .expect("filesystem mount is missing")
@@ -2044,7 +2121,10 @@ impl VfsFile {
             return Some(read_size);
         }
 
-        let stat = with_mount(self.node.mount_id, |mount| mount.stat_basic(self.node.ino))?.ok()?;
+        let stat = with_mount(self.node.mount_id, BackendOp::StatBasic, |mount| {
+            mount.stat_basic(self.node.ino)
+        })?
+        .ok()?;
         let file_size = stat.size as usize;
         if !(VFS_SMALL_READ_CACHE_MIN_FILE_SIZE..=VFS_READ_CACHE_MAX_FILE_SIZE).contains(&file_size)
         {
@@ -2059,13 +2139,15 @@ impl VfsFile {
         let noatime_snapshot = self.noatime_snapshot();
         while filled < file_size {
             let chunk_len = (file_size - filled).min(VFS_READ_CHUNK_SIZE);
-            let Some(read_size) = with_mount(self.node.mount_id, |mount| {
-                mount.read_at(
-                    self.node.ino,
-                    &mut data[filled..filled + chunk_len],
-                    filled as u64,
-                )
-            }) else {
+            let Some(read_size) =
+                with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
+                    mount.read_at(
+                        self.node.ino,
+                        &mut data[filled..filled + chunk_len],
+                        filled as u64,
+                    )
+                })
+            else {
                 self.restore_noatime(noatime_snapshot);
                 return None;
             };
@@ -2197,8 +2279,12 @@ fn open_vfs_file_impl(
                     ensure_mount_writable(path.node.mount_id)?;
                     let _mutation = begin_regular_file_page_cache_mutation(path.node, path.kind);
                     flush_dirty_regular_file(path.node)?;
-                    with_mount(path.node.mount_id, |mount| mount.set_len(path.node.ino, 0))
-                        .ok_or(FsError::Io)??;
+                    inode_state::with_mapping_mutation(path.node, || {
+                        with_mount(path.node.mount_id, BackendOp::TruncateAllocate, |mount| {
+                            mount.set_len(path.node.ino, 0)
+                        })
+                        .ok_or(FsError::Io)?
+                    })?;
                 }
                 (path, parent_hint, readable, writable)
             }
@@ -2208,20 +2294,24 @@ fn open_vfs_file_impl(
                 return Err(FsError::InvalidInput);
             }
             ensure_mount_writable(target.parent.mount_id)?;
-            let parent_stat = with_mount(target.parent.mount_id, |mount| {
+            let parent_stat = with_mount(target.parent.mount_id, BackendOp::StatFull, |mount| {
                 mount.stat(target.parent.ino)
             })
             .ok_or(FsError::Io)??;
             let supports_page_cache = mount_supports_page_cache(target.parent.mount_id);
-            let ino = with_mount(target.parent.mount_id, |mount| {
-                let ino = mount.create_file(target.parent.ino, target.leaf_name)?;
+            let ino = inode_state::with_directory_mutation(target.parent, || {
+                let ino = with_mount(
+                    target.parent.mount_id,
+                    BackendOp::NamespaceMutation,
+                    |mount| mount.create_file(target.parent.ino, target.leaf_name),
+                )
+                .ok_or(FsError::Io)??;
                 initialize_regular_file_page_cache_incarnation(
                     VfsNodeId::new(target.parent.mount_id, ino),
                     supports_page_cache,
                 );
                 Ok(ino)
-            })
-            .ok_or(FsError::Io)??;
+            })?;
             dentry_cache::invalidate_parent(target.parent);
             if let Some(attrs) = create_attrs {
                 let gid = if parent_stat.mode & MODE_SETGID != 0 {
@@ -2229,13 +2319,22 @@ fn open_vfs_file_impl(
                 } else {
                     attrs.gid
                 };
-                with_mount(target.parent.mount_id, |mount| {
-                    mount.set_owner(ino, Some(attrs.uid), Some(gid))
-                })
-                .ok_or(FsError::Io)??;
                 let mode = prepare_created_file_mode(parent_stat, &attrs);
-                with_mount(target.parent.mount_id, |mount| mount.set_mode(ino, mode))
+                let node = VfsNodeId::new(target.parent.mount_id, ino);
+                inode_state::with_metadata_mutation(node, || {
+                    with_mount(
+                        target.parent.mount_id,
+                        BackendOp::NamespaceMutation,
+                        |mount| mount.set_owner(ino, Some(attrs.uid), Some(gid)),
+                    )
                     .ok_or(FsError::Io)??;
+                    with_mount(
+                        target.parent.mount_id,
+                        BackendOp::NamespaceMutation,
+                        |mount| mount.set_mode(ino, mode),
+                    )
+                    .ok_or(FsError::Io)?
+                })?;
             }
             let (readable, writable) = flags.read_write();
             (
@@ -2277,7 +2376,7 @@ fn create_tmpfile_inode(
     }
     ensure_mount_writable(directory.node.mount_id)?;
 
-    let parent_stat = with_mount(directory.node.mount_id, |mount| {
+    let parent_stat = with_mount(directory.node.mount_id, BackendOp::StatFull, |mount| {
         mount.stat(directory.node.ino)
     })
     .ok_or(FsError::Io)??;
@@ -2287,15 +2386,19 @@ fn create_tmpfile_inode(
         for _ in 0..TMPFILE_CREATE_ATTEMPTS {
             let seq = TMPFILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let leaf_name = format!(".whusp-tmpfile-{seq:x}");
-            let result = with_mount(directory.node.mount_id, |mount| {
-                let ino = mount.create_file(directory.node.ino, leaf_name.as_str())?;
+            let result = inode_state::with_directory_mutation(directory.node, || {
+                let ino = with_mount(
+                    directory.node.mount_id,
+                    BackendOp::NamespaceMutation,
+                    |mount| mount.create_file(directory.node.ino, leaf_name.as_str()),
+                )
+                .ok_or(FsError::Io)??;
                 initialize_regular_file_page_cache_incarnation(
                     VfsNodeId::new(directory.node.mount_id, ino),
                     supports_page_cache,
                 );
                 Ok(ino)
-            })
-            .ok_or(FsError::Io)?;
+            });
             match result {
                 Ok(ino) => {
                     dentry_cache::invalidate_parent(directory.node);
@@ -2315,13 +2418,22 @@ fn create_tmpfile_inode(
         } else {
             attrs.gid
         };
-        with_mount(directory.node.mount_id, |mount| {
-            mount.set_owner(ino, Some(attrs.uid), Some(gid))
-        })
-        .ok_or(FsError::Io)??;
         let mode = prepare_created_file_mode(parent_stat, &attrs);
-        with_mount(directory.node.mount_id, |mount| mount.set_mode(ino, mode))
+        let node = VfsNodeId::new(directory.node.mount_id, ino);
+        inode_state::with_metadata_mutation(node, || {
+            with_mount(
+                directory.node.mount_id,
+                BackendOp::NamespaceMutation,
+                |mount| mount.set_owner(ino, Some(attrs.uid), Some(gid)),
+            )
             .ok_or(FsError::Io)??;
+            with_mount(
+                directory.node.mount_id,
+                BackendOp::NamespaceMutation,
+                |mount| mount.set_mode(ino, mode),
+            )
+            .ok_or(FsError::Io)?
+        })?;
     }
 
     let (readable, writable) = flags.read_write();
@@ -2339,11 +2451,14 @@ fn create_tmpfile_inode(
     )?);
 
     let _unlink_mutation = begin_regular_file_page_cache_mutation(file.node, file.kind);
-    match with_mount(directory.node.mount_id, |mount| {
-        mount.unlink(directory.node.ino, leaf_name.as_str())
-    })
-    .ok_or(FsError::Io)?
-    {
+    match inode_state::with_directory_mutation(directory.node, || {
+        with_mount(
+            directory.node.mount_id,
+            BackendOp::NamespaceMutation,
+            |mount| mount.unlink(directory.node.ino, leaf_name.as_str()),
+        )
+        .ok_or(FsError::Io)?
+    }) {
         Ok(()) => {
             dentry_cache::invalidate_parent(directory.node);
             Ok(file)
@@ -2435,8 +2550,10 @@ pub(crate) fn open_file_handle_node(
         return devfs::open_inode(node.mount_id, node.ino, flags);
     }
 
-    let stat =
-        with_mount(node.mount_id, |mount| mount.stat(node.ino)).ok_or(FsError::NotFound)??;
+    let stat = with_mount(node.mount_id, BackendOp::StatFull, |mount| {
+        mount.stat(node.ino)
+    })
+    .ok_or(FsError::NotFound)??;
     let kind = node_kind_from_mode(stat.mode);
     if flags.contains(OpenFlags::DIRECTORY) && kind != FsNodeKind::Directory {
         return Err(FsError::NotDir);
@@ -2460,7 +2577,12 @@ pub(crate) fn open_file_handle_node(
         ensure_mount_writable(node.mount_id)?;
         let _mutation = begin_regular_file_page_cache_mutation(node, kind);
         flush_dirty_regular_file(node)?;
-        with_mount(node.mount_id, |mount| mount.set_len(node.ino, 0)).ok_or(FsError::Io)??;
+        inode_state::with_mapping_mutation(node, || {
+            with_mount(node.mount_id, BackendOp::TruncateAllocate, |mount| {
+                mount.set_len(node.ino, 0)
+            })
+            .ok_or(FsError::Io)?
+        })?;
     }
 
     Ok(Arc::new(VfsFile::new(
@@ -2518,14 +2640,17 @@ fn stat_in_with(
     };
     let mut stat = {
         let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathBackendStat);
-        with_mount(path.node.mount_id, |mount| {
-            if full_stat {
+        if full_stat {
+            with_mount(path.node.mount_id, BackendOp::StatFull, |mount| {
                 mount.stat(path.node.ino)
-            } else {
+            })
+            .ok_or(FsError::Io)??
+        } else {
+            with_mount(path.node.mount_id, BackendOp::StatBasic, |mount| {
                 mount.stat_basic(path.node.ino)
-            }
-        })
-        .ok_or(FsError::Io)??
+            })
+            .ok_or(FsError::Io)??
+        }
     };
     stat.dev = path.node.mount_id.0 as u64;
     if path.kind == FsNodeKind::RegularFile {
@@ -2556,8 +2681,10 @@ pub(crate) fn lookup_dir_with_stat_in(
     if path.kind != FsNodeKind::Directory {
         return Err(FsError::NotDir);
     }
-    let mut stat =
-        with_mount(path.node.mount_id, |mount| mount.stat(path.node.ino)).ok_or(FsError::Io)??;
+    let mut stat = with_mount(path.node.mount_id, BackendOp::StatFull, |mount| {
+        mount.stat(path.node.ino)
+    })
+    .ok_or(FsError::Io)??;
     stat.dev = path.node.mount_id.0 as u64;
     Ok((WorkingDir::new(path.node.mount_id, path.node.ino), stat))
 }
@@ -2570,8 +2697,10 @@ pub(crate) fn lookup_dir_with_stat_path_in(
     if path.kind != FsNodeKind::Directory {
         return Err(FsError::NotDir);
     }
-    let mut stat =
-        with_mount(path.node.mount_id, |mount| mount.stat(path.node.ino)).ok_or(FsError::Io)??;
+    let mut stat = with_mount(path.node.mount_id, BackendOp::StatFull, |mount| {
+        mount.stat(path.node.ino)
+    })
+    .ok_or(FsError::Io)??;
     stat.dev = path.node.mount_id.0 as u64;
     let visible_path = path.visible_path.ok_or(FsError::NotFound)?;
     Ok((
@@ -2593,10 +2722,12 @@ pub(crate) fn chmod_in(
         LookupMode::NoFollowFinal
     };
     let path = vfs_path::resolve_existing_in(context, name, lookup_mode)?;
-    with_mount(path.node.mount_id, |mount| {
-        mount.set_mode(path.node.ino, mode)
+    inode_state::with_metadata_mutation(path.node, || {
+        with_mount(path.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+            mount.set_mode(path.node.ino, mode)
+        })
+        .ok_or(FsError::Io)?
     })
-    .ok_or(FsError::Io)?
 }
 
 pub(crate) fn chown_in(
@@ -2612,10 +2743,12 @@ pub(crate) fn chown_in(
         LookupMode::NoFollowFinal
     };
     let path = vfs_path::resolve_existing_in(context, name, lookup_mode)?;
-    with_mount(path.node.mount_id, |mount| {
-        mount.set_owner(path.node.ino, uid, gid)
+    inode_state::with_metadata_mutation(path.node, || {
+        with_mount(path.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+            mount.set_owner(path.node.ino, uid, gid)
+        })
+        .ok_or(FsError::Io)?
     })
-    .ok_or(FsError::Io)?
 }
 
 pub(crate) fn truncate_in(context: PathContext, name: &str, len: usize) -> FsResult {
@@ -2629,10 +2762,12 @@ pub(crate) fn truncate_in(context: PathContext, name: &str, len: usize) -> FsRes
     ensure_mount_writable(path.node.mount_id)?;
     let _mutation = begin_regular_file_page_cache_mutation(path.node, path.kind);
     flush_dirty_regular_file(path.node)?;
-    with_mount(path.node.mount_id, |mount| {
-        mount.set_len(path.node.ino, len as u64)
+    inode_state::with_mapping_mutation(path.node, || {
+        with_mount(path.node.mount_id, BackendOp::TruncateAllocate, |mount| {
+            mount.set_len(path.node.ino, len as u64)
+        })
+        .ok_or(FsError::Io)?
     })
-    .ok_or(FsError::Io)?
 }
 
 impl File for VfsFile {
@@ -2691,8 +2826,10 @@ impl File for VfsFile {
     }
 
     fn stat(&self) -> FsResult<FileStat> {
-        let mut stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))
-            .ok_or(FsError::Io)??;
+        let mut stat = with_mount(self.node.mount_id, BackendOp::StatFull, |mount| {
+            mount.stat(self.node.ino)
+        })
+        .ok_or(FsError::Io)??;
         stat.dev = self.node.mount_id.0 as u64;
         if self.kind == FsNodeKind::RegularFile {
             overlay_dirty_regular_stat(self.node, &mut stat);
@@ -2797,8 +2934,10 @@ impl File for VfsFile {
         let len = buf.len();
         let mut offset = self.offset.lock();
         if append {
-            let stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))
-                .ok_or(FsError::Io)??;
+            let stat = with_mount(self.node.mount_id, BackendOp::StatFull, |mount| {
+                mount.stat(self.node.ino)
+            })
+            .ok_or(FsError::Io)??;
             *offset = stat_logical_size(self.node, stat.size) as usize;
         }
         let write_offset = *offset;
@@ -2843,10 +2982,12 @@ impl File for VfsFile {
         self.check_set_len(len)?;
         let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         flush_dirty_regular_file(self.node)?;
-        with_mount(self.node.mount_id, |mount| {
-            mount.set_len(self.node.ino, len as u64)
+        inode_state::with_mapping_mutation(self.node, || {
+            with_mount(self.node.mount_id, BackendOp::TruncateAllocate, |mount| {
+                mount.set_len(self.node.ino, len as u64)
+            })
+            .ok_or(FsError::Io)?
         })
-        .ok_or(FsError::Io)?
     }
 
     fn allocate_range(&self, offset: usize, len: usize, keep_size: bool) -> FsResult {
@@ -2859,10 +3000,12 @@ impl File for VfsFile {
         self.check_write_at(offset, len)?;
         let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         flush_dirty_regular_file(self.node)?;
-        with_mount(self.node.mount_id, |mount| {
-            mount.allocate_range(self.node.ino, offset as u64, len as u64, keep_size)
+        inode_state::with_mapping_mutation(self.node, || {
+            with_mount(self.node.mount_id, BackendOp::TruncateAllocate, |mount| {
+                mount.allocate_range(self.node.ino, offset as u64, len as u64, keep_size)
+            })
+            .ok_or(FsError::Io)?
         })
-        .ok_or(FsError::Io)?
     }
 
     fn zero_range(&self, offset: usize, len: usize, keep_size: bool) -> FsResult {
@@ -2875,10 +3018,12 @@ impl File for VfsFile {
         self.check_write_at(offset, len)?;
         let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         flush_dirty_regular_file(self.node)?;
-        with_mount(self.node.mount_id, |mount| {
-            mount.zero_range(self.node.ino, offset as u64, len as u64, keep_size)
+        inode_state::with_mapping_mutation(self.node, || {
+            with_mount(self.node.mount_id, BackendOp::TruncateAllocate, |mount| {
+                mount.zero_range(self.node.ino, offset as u64, len as u64, keep_size)
+            })
+            .ok_or(FsError::Io)?
         })
-        .ok_or(FsError::Io)?
     }
 
     fn punch_hole(&self, offset: usize, len: usize) -> FsResult {
@@ -2895,15 +3040,17 @@ impl File for VfsFile {
         }
         let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         flush_dirty_regular_file(self.node)?;
-        with_mount(self.node.mount_id, |mount| {
-            mount.punch_hole(self.node.ino, offset as u64, len as u64)
+        inode_state::with_mapping_mutation(self.node, || {
+            with_mount(self.node.mount_id, BackendOp::TruncateAllocate, |mount| {
+                mount.punch_hole(self.node.ino, offset as u64, len as u64)
+            })
+            .ok_or(FsError::Io)?
         })
-        .ok_or(FsError::Io)?
     }
 
     fn sync(&self, data_only: bool) -> FsResult {
         flush_dirty_regular_file(self.node)?;
-        with_mount(self.node.mount_id, |mount| {
+        with_mount(self.node.mount_id, BackendOp::Sync, |mount| {
             mount.sync(self.node.ino, data_only)
         })
         .ok_or(FsError::Io)?
@@ -2915,8 +3062,10 @@ impl File for VfsFile {
             SeekWhence::Set => 0i128,
             SeekWhence::Current => *current as i128,
             SeekWhence::End => {
-                let stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))
-                    .ok_or(FsError::Io)??;
+                let stat = with_mount(self.node.mount_id, BackendOp::StatFull, |mount| {
+                    mount.stat(self.node.ino)
+                })
+                .ok_or(FsError::Io)??;
                 stat_logical_size(self.node, stat.size) as i128
             }
             SeekWhence::Data | SeekWhence::Hole => {
@@ -2952,10 +3101,11 @@ impl File for VfsFile {
                 &mut kernel_buf,
             )?
         } else {
-            let (read_size, next_offset) = with_mount(self.node.mount_id, |mount| {
-                mount.read_dirent64(self.node.ino, current_offset, &mut kernel_buf)
-            })
-            .ok_or(FsError::Io)??;
+            let (read_size, next_offset) =
+                with_mount(self.node.mount_id, BackendOp::Readdir, |mount| {
+                    mount.read_dirent64(self.node.ino, current_offset, &mut kernel_buf)
+                })
+                .ok_or(FsError::Io)??;
             if read_size == 0 {
                 // Synthetic mountpoint dirents are appended after backend EOF
                 // and resume from a disjoint high offset range, so real
@@ -2981,7 +3131,7 @@ impl File for VfsFile {
         if self.kind != FsNodeKind::Symlink {
             return Err(FsError::InvalidInput);
         }
-        with_mount(self.node.mount_id, |mount| {
+        with_mount(self.node.mount_id, BackendOp::Readlink, |mount| {
             mount.readlink(self.node.ino, buf)
         })
         .ok_or(FsError::Io)?
@@ -2997,36 +3147,46 @@ impl File for VfsFile {
         mtime: Option<FileTimestamp>,
         ctime: FileTimestamp,
     ) -> FsResult {
-        with_mount(self.node.mount_id, |mount| {
-            mount.set_times(self.node.ino, atime, mtime, ctime)
+        inode_state::with_metadata_mutation(self.node, || {
+            with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                mount.set_times(self.node.ino, atime, mtime, ctime)
+            })
+            .ok_or(FsError::Io)?
         })
-        .ok_or(FsError::Io)?
     }
 
     fn set_mode(&self, mode: u32) -> FsResult {
-        with_mount(self.node.mount_id, |mount| {
-            mount.set_mode(self.node.ino, mode)
+        inode_state::with_metadata_mutation(self.node, || {
+            with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                mount.set_mode(self.node.ino, mode)
+            })
+            .ok_or(FsError::Io)?
         })
-        .ok_or(FsError::Io)?
     }
 
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> FsResult {
-        with_mount(self.node.mount_id, |mount| {
-            mount.set_owner(self.node.ino, uid, gid)
+        inode_state::with_metadata_mutation(self.node, || {
+            with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                mount.set_owner(self.node.ino, uid, gid)
+            })
+            .ok_or(FsError::Io)?
+        })
+    }
+
+    fn inode_flags(&self) -> FsResult<u32> {
+        with_mount(self.node.mount_id, BackendOp::StatFull, |mount| {
+            mount.inode_flags(self.node.ino)
         })
         .ok_or(FsError::Io)?
     }
 
-    fn inode_flags(&self) -> FsResult<u32> {
-        with_mount(self.node.mount_id, |mount| mount.inode_flags(self.node.ino))
-            .ok_or(FsError::Io)?
-    }
-
     fn set_inode_flags(&self, flags: u32) -> FsResult {
-        let result = with_mount(self.node.mount_id, |mount| {
-            mount.set_inode_flags(self.node.ino, flags)
-        })
-        .ok_or(FsError::Io)?;
+        let result = inode_state::with_metadata_mutation(self.node, || {
+            with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                mount.set_inode_flags(self.node.ino, flags)
+            })
+            .ok_or(FsError::Io)?
+        });
         if result.is_ok() {
             update_inode_flags_cache(self.node, flags);
         }
@@ -3043,14 +3203,16 @@ impl File for VfsFile {
             return Err(FsError::PermissionDenied);
         }
         let offset = if append {
-            let stat = with_mount(self.node.mount_id, |mount| mount.stat(self.node.ino))
-                .ok_or(FsError::Io)??
-                .size;
+            let stat = with_mount(self.node.mount_id, BackendOp::StatFull, |mount| {
+                mount.stat(self.node.ino)
+            })
+            .ok_or(FsError::Io)??
+            .size;
             stat_logical_size(self.node, stat)
         } else {
             *self.offset.lock() as u64
         };
-        with_mount(self.node.mount_id, |mount| {
+        with_mount(self.node.mount_id, BackendOp::Write, |mount| {
             mount.check_write_at(self.node.ino, offset, len)
         })
         .ok_or(FsError::Io)?
@@ -3062,7 +3224,7 @@ impl File for VfsFile {
         if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
             return Err(FsError::PermissionDenied);
         }
-        with_mount(self.node.mount_id, |mount| {
+        with_mount(self.node.mount_id, BackendOp::Write, |mount| {
             mount.check_write_at(self.node.ino, offset as u64, len)
         })
         .ok_or(FsError::Io)?
@@ -3074,7 +3236,7 @@ impl File for VfsFile {
         if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
             return Err(FsError::PermissionDenied);
         }
-        with_mount(self.node.mount_id, |mount| {
+        with_mount(self.node.mount_id, BackendOp::TruncateAllocate, |mount| {
             mount.check_set_len(self.node.ino, len as u64)
         })
         .ok_or(FsError::Io)?
@@ -3157,6 +3319,6 @@ impl Drop for VfsFile {
     fn drop(&mut self) {
         untrack_writable_regular_open(self.node, self.kind, self.writable);
         invalidate_inode_flags_cache(self.node);
-        release_inode_from_drop(self.node.mount_id, self.node.ino);
+        release_inode_from_drop(&self.inode_state);
     }
 }

@@ -1,6 +1,6 @@
 use super::dirent::{DT_DIR, DT_REG, RawDirEntry, write_dir_entries};
 use super::mount::BlockPartition;
-use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult};
+use super::vfs::{FileSystemStat, FsError, FsNodeKind, FsResult, LegacyFileSystemBackend};
 use super::{FileStat, FileTimestamp, S_IFDIR, S_IFREG};
 use crate::drivers::block::VirtIOBlock;
 use alloc::collections::BTreeMap;
@@ -337,7 +337,7 @@ impl FatMount {
     }
 }
 
-impl FileSystemBackend for FatMount {
+impl LegacyFileSystemBackend for FatMount {
     fn root_ino(&self) -> u32 {
         ROOT_INO
     }

@@ -4,7 +4,7 @@ use super::super::mount::{
 };
 use super::super::path::PathContext;
 use super::super::{dentry_cache, dentry_cache::DentryLookupResult};
-use super::{FsError, FsNodeKind, FsResult, VfsNodeId};
+use super::{BackendOp, FsError, FsNodeKind, FsResult, VfsNodeId};
 use crate::perf;
 use alloc::string::String;
 use alloc::vec;
@@ -306,7 +306,7 @@ fn lookup_child_raw(
 
     let result = {
         let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupBackend);
-        with_mount(parent_node.mount_id, |mount| {
+        with_mount(parent_node.mount_id, BackendOp::Lookup, |mount| {
             mount.lookup_component_from(parent_node.ino, component)
         })
         .ok_or(FsError::Io)?
@@ -401,7 +401,7 @@ fn owned_path_components<'a>(path: &str) -> Vec<PathComponent<'a>> {
 
 fn read_symlink_target(cursor: &VfsCursor) -> FsResult<String> {
     let mut buffer = vec![0u8; SYMLINK_TARGET_MAX + 1];
-    let len = with_mount(cursor.node.mount_id, |mount| {
+    let len = with_mount(cursor.node.mount_id, BackendOp::Readlink, |mount| {
         mount.readlink(cursor.node.ino, &mut buffer)
     })
     .ok_or(FsError::Io)??;

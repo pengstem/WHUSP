@@ -1,7 +1,10 @@
 use super::dirent::{DT_DIR, DT_FIFO, DT_LNK, DT_REG, RawDirEntry, write_dir_entries};
 use super::mount::with_mount;
 use super::path::WorkingDir;
-use super::vfs::{FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult, VfsNodeId};
+use super::vfs::{
+    BackendOp, FileSystemStat, FsError, FsNodeKind, FsResult, InodeRelease,
+    LegacyFileSystemBackend, VfsNodeId,
+};
 use super::{FileStat, FileTimestamp, S_IFDIR};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
@@ -44,7 +47,7 @@ impl OverlayFs {
     }
 
     fn lookup_real(parent: VfsNodeId, component: &str) -> FsResult<(VfsNodeId, FsNodeKind)> {
-        let (ino, kind) = with_mount(parent.mount_id, |mount| {
+        let (ino, kind) = with_mount(parent.mount_id, BackendOp::Lookup, |mount| {
             mount.lookup_component_from(parent.ino, component)
         })
         .ok_or(FsError::Io)??;
@@ -86,9 +89,10 @@ impl OverlayFs {
     fn with_real<V>(
         ino: u32,
         real: VfsNodeId,
-        f: impl FnOnce(&mut dyn FileSystemBackend, u32) -> V,
+        op: BackendOp,
+        f: impl FnOnce(&mut dyn LegacyFileSystemBackend, u32) -> V,
     ) -> FsResult<V> {
-        with_mount(real.mount_id, |mount| f(mount, real.ino)).ok_or({
+        with_mount(real.mount_id, op, |mount| f(mount, real.ino)).ok_or({
             if ino == OVERLAY_ROOT_INO {
                 FsError::Io
             } else {
@@ -98,7 +102,7 @@ impl OverlayFs {
     }
 }
 
-impl FileSystemBackend for OverlayFs {
+impl LegacyFileSystemBackend for OverlayFs {
     fn root_ino(&self) -> u32 {
         OVERLAY_ROOT_INO
     }
@@ -153,7 +157,7 @@ impl FileSystemBackend for OverlayFs {
 
     fn create_file(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult<u32> {
         let parent = self.upper_parent_for_create(parent_ino)?;
-        let real_ino = with_mount(parent.mount_id, |mount| {
+        let real_ino = with_mount(parent.mount_id, BackendOp::NamespaceMutation, |mount| {
             mount.create_file(parent.ino, leaf_name)
         })
         .ok_or(FsError::Io)??;
@@ -169,7 +173,7 @@ impl FileSystemBackend for OverlayFs {
         rdev: u64,
     ) -> FsResult<u32> {
         let parent = self.upper_parent_for_create(parent_ino)?;
-        let real_ino = with_mount(parent.mount_id, |mount| {
+        let real_ino = with_mount(parent.mount_id, BackendOp::NamespaceMutation, |mount| {
             mount.create_node(parent.ino, leaf_name, kind, mode, rdev)
         })
         .ok_or(FsError::Io)??;
@@ -178,7 +182,7 @@ impl FileSystemBackend for OverlayFs {
 
     fn create_dir(&mut self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32> {
         let parent = self.upper_parent_for_create(parent_ino)?;
-        let real_ino = with_mount(parent.mount_id, |mount| {
+        let real_ino = with_mount(parent.mount_id, BackendOp::NamespaceMutation, |mount| {
             mount.create_dir(parent.ino, leaf_name, mode)
         })
         .ok_or(FsError::Io)??;
@@ -191,7 +195,7 @@ impl FileSystemBackend for OverlayFs {
 
     fn symlink(&mut self, parent_ino: u32, leaf_name: &str, target: &[u8]) -> FsResult {
         let parent = self.upper_parent_for_create(parent_ino)?;
-        with_mount(parent.mount_id, |mount| {
+        with_mount(parent.mount_id, BackendOp::NamespaceMutation, |mount| {
             mount.symlink(parent.ino, leaf_name, target)
         })
         .ok_or(FsError::Io)?
@@ -199,8 +203,10 @@ impl FileSystemBackend for OverlayFs {
 
     fn unlink(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult {
         let parent = self.upper_parent_for_create(parent_ino)?;
-        with_mount(parent.mount_id, |mount| mount.unlink(parent.ino, leaf_name))
-            .ok_or(FsError::Io)?
+        with_mount(parent.mount_id, BackendOp::NamespaceMutation, |mount| {
+            mount.unlink(parent.ino, leaf_name)
+        })
+        .ok_or(FsError::Io)?
     }
 
     fn rename(
@@ -215,12 +221,16 @@ impl FileSystemBackend for OverlayFs {
 
     fn set_len(&mut self, ino: u32, len: u64) -> FsResult {
         let real = self.real_for_overlay(ino)?;
-        Self::with_real(ino, real, |mount, real_ino| mount.set_len(real_ino, len))?
+        Self::with_real(ino, real, BackendOp::TruncateAllocate, |mount, real_ino| {
+            mount.set_len(real_ino, len)
+        })?
     }
 
     fn sync(&mut self, ino: u32, data_only: bool) -> FsResult {
         let real = self.real_for_overlay(ino)?;
-        Self::with_real(ino, real, |mount, real_ino| mount.sync(real_ino, data_only))?
+        Self::with_real(ino, real, BackendOp::Sync, |mount, real_ino| {
+            mount.sync(real_ino, data_only)
+        })?
     }
 
     fn set_times(
@@ -231,43 +241,63 @@ impl FileSystemBackend for OverlayFs {
         ctime: FileTimestamp,
     ) -> FsResult {
         let real = self.real_for_overlay(ino)?;
-        Self::with_real(ino, real, |mount, real_ino| {
-            mount.set_times(real_ino, atime, mtime, ctime)
-        })?
+        Self::with_real(
+            ino,
+            real,
+            BackendOp::NamespaceMutation,
+            |mount, real_ino| mount.set_times(real_ino, atime, mtime, ctime),
+        )?
     }
 
     fn set_mode(&mut self, ino: u32, mode: u32) -> FsResult {
         let real = self.real_for_overlay(ino)?;
-        Self::with_real(ino, real, |mount, real_ino| mount.set_mode(real_ino, mode))?
+        Self::with_real(
+            ino,
+            real,
+            BackendOp::NamespaceMutation,
+            |mount, real_ino| mount.set_mode(real_ino, mode),
+        )?
     }
 
     fn set_owner(&mut self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
         let real = self.real_for_overlay(ino)?;
-        Self::with_real(ino, real, |mount, real_ino| {
-            mount.set_owner(real_ino, uid, gid)
-        })?
+        Self::with_real(
+            ino,
+            real,
+            BackendOp::NamespaceMutation,
+            |mount, real_ino| mount.set_owner(real_ino, uid, gid),
+        )?
     }
 
     fn inode_flags(&mut self, ino: u32) -> FsResult<u32> {
         let real = self.real_for_overlay(ino)?;
-        Self::with_real(ino, real, |mount, real_ino| mount.inode_flags(real_ino))?
+        Self::with_real(ino, real, BackendOp::StatFull, |mount, real_ino| {
+            mount.inode_flags(real_ino)
+        })?
     }
 
     fn set_inode_flags(&mut self, ino: u32, flags: u32) -> FsResult {
         let real = self.real_for_overlay(ino)?;
-        Self::with_real(ino, real, |mount, real_ino| {
-            mount.set_inode_flags(real_ino, flags)
-        })?
+        Self::with_real(
+            ino,
+            real,
+            BackendOp::NamespaceMutation,
+            |mount, real_ino| mount.set_inode_flags(real_ino, flags),
+        )?
     }
 
     fn retain_inode(&mut self, ino: u32) -> FsResult {
         let real = self.real_for_overlay(ino)?;
-        Self::with_real(ino, real, |mount, real_ino| mount.retain_inode(real_ino))?
+        Self::with_real(ino, real, BackendOp::InodeLifetime, |mount, real_ino| {
+            mount.retain_inode(real_ino)
+        })?
     }
 
-    fn release_inode(&mut self, ino: u32) -> FsResult {
+    fn release_inode(&mut self, ino: u32) -> FsResult<InodeRelease> {
         let real = self.real_for_overlay(ino)?;
-        Self::with_real(ino, real, |mount, real_ino| mount.release_inode(real_ino))?
+        Self::with_real(ino, real, BackendOp::InodeLifetime, |mount, real_ino| {
+            mount.release_inode(real_ino)
+        })?
     }
 
     fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
@@ -277,41 +307,53 @@ impl FileSystemBackend for OverlayFs {
             return Ok(stat);
         }
         let real = self.real_for_overlay(ino)?;
-        let mut stat = Self::with_real(ino, real, |mount, real_ino| mount.stat(real_ino))??;
+        let mut stat = Self::with_real(ino, real, BackendOp::StatFull, |mount, real_ino| {
+            mount.stat(real_ino)
+        })??;
         stat.ino = ino as u64;
         Ok(stat)
     }
 
     fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
         let real = self.real_for_overlay(ino)?;
-        Self::with_real(ino, real, |mount, real_ino| mount.readlink(real_ino, buf))?
+        Self::with_real(ino, real, BackendOp::Readlink, |mount, real_ino| {
+            mount.readlink(real_ino, buf)
+        })?
     }
 
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
         let Ok(real) = self.real_for_overlay(ino) else {
             return 0;
         };
-        with_mount(real.mount_id, |mount| mount.read_at(real.ino, buf, offset)).unwrap_or(0)
+        with_mount(real.mount_id, BackendOp::ReadFallback, |mount| {
+            mount.read_at(real.ino, buf, offset)
+        })
+        .unwrap_or(0)
     }
 
     fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize {
         let Ok(real) = self.real_for_overlay(ino) else {
             return 0;
         };
-        with_mount(real.mount_id, |mount| mount.write_at(real.ino, buf, offset)).unwrap_or(0)
+        with_mount(real.mount_id, BackendOp::Write, |mount| {
+            mount.write_at(real.ino, buf, offset)
+        })
+        .unwrap_or(0)
     }
 
     fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
         if ino != OVERLAY_ROOT_INO {
             let real = self.real_for_overlay(ino)?;
-            return Self::with_real(ino, real, |mount, real_ino| {
+            return Self::with_real(ino, real, BackendOp::Readdir, |mount, real_ino| {
                 mount.read_dirent64(real_ino, offset, buf)
             })?;
         }
 
         let mut names = BTreeSet::new();
         for root in [self.upper, self.lower] {
-            if let Some(layer_names) = with_mount(root.mount_id, |mount| mount.list_root_names()) {
+            if let Some(layer_names) = with_mount(root.mount_id, BackendOp::Readdir, |mount| {
+                mount.list_root_names()
+            }) {
                 names.extend(layer_names);
             }
         }
@@ -343,7 +385,9 @@ impl FileSystemBackend for OverlayFs {
     fn list_root_names(&mut self) -> Vec<String> {
         let mut names = BTreeSet::new();
         for root in [self.upper, self.lower] {
-            if let Some(layer_names) = with_mount(root.mount_id, |mount| mount.list_root_names()) {
+            if let Some(layer_names) = with_mount(root.mount_id, BackendOp::Readdir, |mount| {
+                mount.list_root_names()
+            }) {
                 names.extend(layer_names);
             }
         }

@@ -387,6 +387,7 @@ pub(crate) struct KernelPerfSnapshot {
 #[cfg(feature = "perf-counters")]
 mod enabled {
     use super::{KernelPerfSnapshot, PROFILE_POINT_COUNT, ProfilePoint};
+    use crate::fs::{BackendIoSnapshot, BackendOp};
     use alloc::format;
     use alloc::string::String;
     use core::fmt::Write;
@@ -726,6 +727,172 @@ mod enabled {
         max_ticks: AtomicUsize,
     }
 
+    struct BackendIoStat {
+        read_calls: AtomicUsize,
+        read_blocks: AtomicUsize,
+        read_bytes: AtomicUsize,
+        write_calls: AtomicUsize,
+        write_blocks: AtomicUsize,
+        write_bytes: AtomicUsize,
+    }
+
+    impl BackendIoStat {
+        const fn new() -> Self {
+            Self {
+                read_calls: AtomicUsize::new(0),
+                read_blocks: AtomicUsize::new(0),
+                read_bytes: AtomicUsize::new(0),
+                write_calls: AtomicUsize::new(0),
+                write_blocks: AtomicUsize::new(0),
+                write_bytes: AtomicUsize::new(0),
+            }
+        }
+
+        fn record(&self, io: BackendIoSnapshot) {
+            self.read_calls.fetch_add(io.read_calls, Ordering::Relaxed);
+            self.read_blocks
+                .fetch_add(io.read_blocks, Ordering::Relaxed);
+            self.read_bytes.fetch_add(io.read_bytes, Ordering::Relaxed);
+            self.write_calls
+                .fetch_add(io.write_calls, Ordering::Relaxed);
+            self.write_blocks
+                .fetch_add(io.write_blocks, Ordering::Relaxed);
+            self.write_bytes
+                .fetch_add(io.write_bytes, Ordering::Relaxed);
+        }
+    }
+
+    struct BackendOpStat {
+        calls: AtomicUsize,
+        contended: AtomicUsize,
+        wait_ticks: AtomicUsize,
+        wait_max_ticks: AtomicUsize,
+        hold_ticks: AtomicUsize,
+        hold_max_ticks: AtomicUsize,
+        io: BackendIoStat,
+    }
+
+    impl BackendOpStat {
+        const fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                contended: AtomicUsize::new(0),
+                wait_ticks: AtomicUsize::new(0),
+                wait_max_ticks: AtomicUsize::new(0),
+                hold_ticks: AtomicUsize::new(0),
+                hold_max_ticks: AtomicUsize::new(0),
+                io: BackendIoStat::new(),
+            }
+        }
+    }
+
+    static BACKEND_OP_STATS: [BackendOpStat; BackendOp::COUNT] =
+        [const { BackendOpStat::new() }; BackendOp::COUNT];
+    static BACKEND_LOCK_HELD_DATA_IO: BackendIoStat = BackendIoStat::new();
+    static BACKEND_LOCK_HELD_METADATA_IO: BackendIoStat = BackendIoStat::new();
+    static PENDING_RELEASE_DRAIN_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PENDING_RELEASE_DRAIN_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+    static PENDING_RELEASE_DRAIN_RELEASED: AtomicUsize = AtomicUsize::new(0);
+    static PENDING_RELEASE_DRAIN_TICKS: AtomicUsize = AtomicUsize::new(0);
+    static PENDING_RELEASE_DRAIN_MAX_TICKS: AtomicUsize = AtomicUsize::new(0);
+    static BACKEND_TRY_SUCCESSFUL_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    enum BackendOpTimerKind {
+        Wait,
+        Hold,
+    }
+
+    #[must_use]
+    pub(crate) struct BackendOpTimer {
+        op: BackendOp,
+        kind: BackendOpTimerKind,
+        start_ticks: usize,
+    }
+
+    pub(crate) fn time_backend_op_wait(op: BackendOp) -> BackendOpTimer {
+        BackendOpTimer {
+            op,
+            kind: BackendOpTimerKind::Wait,
+            start_ticks: crate::timer::get_time(),
+        }
+    }
+
+    pub(crate) fn time_backend_op_hold(op: BackendOp) -> BackendOpTimer {
+        BackendOpTimer {
+            op,
+            kind: BackendOpTimerKind::Hold,
+            start_ticks: crate::timer::get_time(),
+        }
+    }
+
+    impl Drop for BackendOpTimer {
+        fn drop(&mut self) {
+            let elapsed_ticks = crate::timer::get_time().wrapping_sub(self.start_ticks);
+            let stat = &BACKEND_OP_STATS[self.op as usize];
+            match self.kind {
+                BackendOpTimerKind::Wait => {
+                    stat.wait_ticks.fetch_add(elapsed_ticks, Ordering::Relaxed);
+                    update_max(&stat.wait_max_ticks, elapsed_ticks);
+                }
+                BackendOpTimerKind::Hold => {
+                    stat.hold_ticks.fetch_add(elapsed_ticks, Ordering::Relaxed);
+                    update_max(&stat.hold_max_ticks, elapsed_ticks);
+                }
+            }
+        }
+    }
+
+    #[must_use]
+    pub(crate) struct PendingReleaseTimer {
+        start_ticks: usize,
+    }
+
+    pub(crate) fn time_pending_release_drain() -> PendingReleaseTimer {
+        PendingReleaseTimer {
+            start_ticks: crate::timer::get_time(),
+        }
+    }
+
+    pub(crate) fn record_pending_release_drain(
+        timer: PendingReleaseTimer,
+        entries: usize,
+        released: usize,
+        io: BackendIoSnapshot,
+    ) {
+        let elapsed_ticks = crate::timer::get_time().wrapping_sub(timer.start_ticks);
+        PENDING_RELEASE_DRAIN_CALLS.fetch_add(1, Ordering::Relaxed);
+        PENDING_RELEASE_DRAIN_ENTRIES.fetch_add(entries, Ordering::Relaxed);
+        PENDING_RELEASE_DRAIN_RELEASED.fetch_add(released, Ordering::Relaxed);
+        PENDING_RELEASE_DRAIN_TICKS.fetch_add(elapsed_ticks, Ordering::Relaxed);
+        update_max(&PENDING_RELEASE_DRAIN_MAX_TICKS, elapsed_ticks);
+        BACKEND_LOCK_HELD_METADATA_IO.record(io);
+    }
+
+    pub(crate) fn record_backend_op_call(op: BackendOp) {
+        BACKEND_OP_STATS[op as usize]
+            .calls
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_backend_op_contended(op: BackendOp) {
+        BACKEND_OP_STATS[op as usize]
+            .contended
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_backend_try_successful_call() {
+        BACKEND_TRY_SUCCESSFUL_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_backend_op_io(op: BackendOp, io: BackendIoSnapshot) {
+        BACKEND_OP_STATS[op as usize].io.record(io);
+        if op.holds_data_io() {
+            BACKEND_LOCK_HELD_DATA_IO.record(io);
+        } else {
+            BACKEND_LOCK_HELD_METADATA_IO.record(io);
+        }
+    }
+
     impl TimeStat {
         const fn new(name: &'static str) -> Self {
             Self {
@@ -964,6 +1131,96 @@ mod enabled {
                 avg_ns,
                 syscall_id,
                 ticks_to_us(max_ticks),
+            );
+        }
+    }
+
+    fn append_backend_op_stats(content: &mut String) {
+        for op in BackendOp::ALL {
+            let stat = &BACKEND_OP_STATS[op as usize];
+            let name = op.name();
+            let _ = write!(
+                content,
+                "backend_op_{}_calls {}\n\
+                 backend_op_{}_contended {}\n\
+                 backend_op_{}_wait_us {}\n\
+                 backend_op_{}_wait_max_us {}\n\
+                 backend_op_{}_hold_us {}\n\
+                 backend_op_{}_hold_max_us {}\n\
+                 backend_op_{}_read_calls {}\n\
+                 backend_op_{}_read_blocks {}\n\
+                 backend_op_{}_read_bytes {}\n\
+                 backend_op_{}_write_calls {}\n\
+                 backend_op_{}_write_blocks {}\n\
+                 backend_op_{}_write_bytes {}\n",
+                name,
+                stat.calls.load(Ordering::Relaxed),
+                name,
+                stat.contended.load(Ordering::Relaxed),
+                name,
+                ticks_to_us(stat.wait_ticks.load(Ordering::Relaxed)),
+                name,
+                ticks_to_us(stat.wait_max_ticks.load(Ordering::Relaxed)),
+                name,
+                ticks_to_us(stat.hold_ticks.load(Ordering::Relaxed)),
+                name,
+                ticks_to_us(stat.hold_max_ticks.load(Ordering::Relaxed)),
+                name,
+                stat.io.read_calls.load(Ordering::Relaxed),
+                name,
+                stat.io.read_blocks.load(Ordering::Relaxed),
+                name,
+                stat.io.read_bytes.load(Ordering::Relaxed),
+                name,
+                stat.io.write_calls.load(Ordering::Relaxed),
+                name,
+                stat.io.write_blocks.load(Ordering::Relaxed),
+                name,
+                stat.io.write_bytes.load(Ordering::Relaxed),
+            );
+        }
+        let _ = write!(
+            content,
+            "pending_release_drain_calls {}\n\
+             pending_release_drain_entries {}\n\
+             pending_release_drain_released {}\n\
+             pending_release_drain_total_us {}\n\
+             pending_release_drain_max_us {}\n\
+             backend_try_successful_calls {}\n",
+            PENDING_RELEASE_DRAIN_CALLS.load(Ordering::Relaxed),
+            PENDING_RELEASE_DRAIN_ENTRIES.load(Ordering::Relaxed),
+            PENDING_RELEASE_DRAIN_RELEASED.load(Ordering::Relaxed),
+            ticks_to_us(PENDING_RELEASE_DRAIN_TICKS.load(Ordering::Relaxed)),
+            ticks_to_us(PENDING_RELEASE_DRAIN_MAX_TICKS.load(Ordering::Relaxed)),
+            BACKEND_TRY_SUCCESSFUL_CALLS.load(Ordering::Relaxed),
+        );
+        for (name, io) in [
+            ("backend_lock_held_data_io", &BACKEND_LOCK_HELD_DATA_IO),
+            (
+                "backend_lock_held_metadata_io",
+                &BACKEND_LOCK_HELD_METADATA_IO,
+            ),
+        ] {
+            let _ = write!(
+                content,
+                "{}_read_calls {}\n\
+                 {}_read_blocks {}\n\
+                 {}_read_bytes {}\n\
+                 {}_write_calls {}\n\
+                 {}_write_blocks {}\n\
+                 {}_write_bytes {}\n",
+                name,
+                io.read_calls.load(Ordering::Relaxed),
+                name,
+                io.read_blocks.load(Ordering::Relaxed),
+                name,
+                io.read_bytes.load(Ordering::Relaxed),
+                name,
+                io.write_calls.load(Ordering::Relaxed),
+                name,
+                io.write_blocks.load(Ordering::Relaxed),
+                name,
+                io.write_bytes.load(Ordering::Relaxed),
             );
         }
     }
@@ -2897,6 +3154,7 @@ mod enabled {
             stats.futex_bucket_waiter_count_max,
         );
         append_timing_stats(&mut content);
+        append_backend_op_stats(&mut content);
         content
     }
 }

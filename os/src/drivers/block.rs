@@ -34,6 +34,8 @@ pub(crate) struct BlockIoStats {
     pub(crate) irq_acks: usize,
     pub(crate) completion_signals: usize,
     pub(crate) completion_wakeups: usize,
+    pub(crate) device_inflight: usize,
+    pub(crate) device_inflight_high_watermark: usize,
 }
 
 #[cfg(feature = "perf-counters")]
@@ -57,10 +59,48 @@ mod block_io_perf {
     pub(super) static IRQ_ACKS: AtomicUsize = AtomicUsize::new(0);
     pub(super) static COMPLETION_SIGNALS: AtomicUsize = AtomicUsize::new(0);
     pub(super) static COMPLETION_WAKEUPS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static DEVICE_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static DEVICE_INFLIGHT_HIGH_WATERMARK: AtomicUsize = AtomicUsize::new(0);
 
     #[inline(always)]
     pub(super) fn inc(counter: &AtomicUsize) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+struct DeviceIoInflightGuard;
+
+impl DeviceIoInflightGuard {
+    #[inline(always)]
+    fn new() -> Self {
+        #[cfg(feature = "perf-counters")]
+        {
+            let inflight = block_io_perf::DEVICE_INFLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
+            let mut current = block_io_perf::DEVICE_INFLIGHT_HIGH_WATERMARK.load(Ordering::Relaxed);
+            while inflight > current {
+                match block_io_perf::DEVICE_INFLIGHT_HIGH_WATERMARK.compare_exchange_weak(
+                    current,
+                    inflight,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => current = next,
+                }
+            }
+        }
+        Self
+    }
+}
+
+impl Drop for DeviceIoInflightGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        #[cfg(feature = "perf-counters")]
+        {
+            let previous = block_io_perf::DEVICE_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+            assert_ne!(previous, 0, "block device inflight counter underflow");
+        }
     }
 }
 
@@ -117,6 +157,7 @@ impl VirtIOBlock {
     }
 
     fn read_blocks_uncached(&self, block_id: usize, buf: &mut [u8]) {
+        let _inflight = DeviceIoInflightGuard::new();
         match choose_block_io_path() {
             BlockIoPath::Nonblocking => self.read_blocks_nonblocking_uncached(block_id, buf),
             BlockIoPath::Sync => self.read_blocks_sync_uncached(block_id, buf),
@@ -195,6 +236,7 @@ impl VirtIOBlock {
     }
 
     fn write_blocks_uncached(&self, block_id: usize, buf: &[u8]) {
+        let _inflight = DeviceIoInflightGuard::new();
         match choose_block_io_path() {
             BlockIoPath::Nonblocking => self.write_blocks_nonblocking_uncached(block_id, buf),
             BlockIoPath::Sync => self.write_blocks_sync_uncached(block_id, buf),
@@ -378,9 +420,10 @@ lazy_static! {
 #[cfg(feature = "perf-counters")]
 pub(crate) fn block_io_stats_snapshot() -> BlockIoStats {
     use block_io_perf::{
-        COMPLETION_SIGNALS, COMPLETION_WAKEUPS, FALLBACK_NO_READY_READS, FALLBACK_NO_READY_WRITES,
-        FALLBACK_SYNC_READS, FALLBACK_SYNC_WRITES, FALLBACK_UNSAFE_READS, FALLBACK_UNSAFE_WRITES,
-        IRQ_ACKS, NB_READ_COMPLETIONS, NB_READ_SUBMITS, NB_READ_WAITS, NB_WRITE_COMPLETIONS,
+        COMPLETION_SIGNALS, COMPLETION_WAKEUPS, DEVICE_INFLIGHT, DEVICE_INFLIGHT_HIGH_WATERMARK,
+        FALLBACK_NO_READY_READS, FALLBACK_NO_READY_WRITES, FALLBACK_SYNC_READS,
+        FALLBACK_SYNC_WRITES, FALLBACK_UNSAFE_READS, FALLBACK_UNSAFE_WRITES, IRQ_ACKS,
+        NB_READ_COMPLETIONS, NB_READ_SUBMITS, NB_READ_WAITS, NB_WRITE_COMPLETIONS,
         NB_WRITE_SUBMITS, NB_WRITE_WAITS, SYNC_READ_SUBMITS, SYNC_WRITE_SUBMITS,
     };
     BlockIoStats {
@@ -402,6 +445,8 @@ pub(crate) fn block_io_stats_snapshot() -> BlockIoStats {
         irq_acks: IRQ_ACKS.load(Ordering::Relaxed),
         completion_signals: COMPLETION_SIGNALS.load(Ordering::Relaxed),
         completion_wakeups: COMPLETION_WAKEUPS.load(Ordering::Relaxed),
+        device_inflight: DEVICE_INFLIGHT.load(Ordering::Relaxed),
+        device_inflight_high_watermark: DEVICE_INFLIGHT_HIGH_WATERMARK.load(Ordering::Relaxed),
     }
 }
 

@@ -282,6 +282,8 @@ const SYSCALL_EPOLL_PWAIT2: usize = 441;
 const SYSCALL_QUOTACTL_FD: usize = 443;
 const SYSCALL_MEMFD_SECRET: usize = 447;
 const SYSCALL_FCHMODAT2: usize = 452;
+#[cfg(feature = "sleep-rwlock-probe")]
+const SYSCALL_FS4_SLEEP_RWLOCK_PROBE: usize = 0x5f54;
 
 mod aio;
 mod context;
@@ -294,6 +296,8 @@ mod memory;
 pub(crate) mod msg;
 mod net;
 mod process;
+#[cfg(feature = "sleep-rwlock-probe")]
+mod rwlock_probe;
 pub(crate) mod sem;
 mod signal;
 pub(crate) mod time;
@@ -317,6 +321,8 @@ use memory::*;
 use msg::*;
 use net::*;
 use process::*;
+#[cfg(feature = "sleep-rwlock-probe")]
+use rwlock_probe::sys_fs4_sleep_rwlock_probe;
 use sem::*;
 use signal::*;
 use time::*;
@@ -509,6 +515,8 @@ pub(crate) fn syscall_with_context(
     args: [usize; 6],
 ) -> Result<isize, SysError> {
     match syscall_id {
+        #[cfg(feature = "sleep-rwlock-probe")]
+        SYSCALL_FS4_SLEEP_RWLOCK_PROBE => sys_fs4_sleep_rwlock_probe(args[0], args[1], args[2]),
         SYSCALL_IO_SETUP => sys_io_setup(args[0], args[1] as *mut usize),
         SYSCALL_IO_DESTROY => sys_io_destroy(args[0]),
         SYSCALL_IO_SUBMIT => sys_io_submit(args[0], args[1] as isize, args[2] as *const _),

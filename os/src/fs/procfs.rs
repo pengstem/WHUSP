@@ -7,7 +7,7 @@ use super::dentry_cache;
 use super::dirent::{DT_DIR, DT_LNK, DT_REG, RawDirEntry, write_dir_entries};
 use super::mount;
 use super::pipe::{PIPE_DEFAULT_CAPACITY, PIPE_MAX_CAPACITY, PIPE_MIN_CAPACITY};
-use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
+use super::vfs::{FsError, FsNodeKind, FsResult, LegacyFileSystemBackend};
 use super::{FileStat, FileTimestamp, S_IFDIR, S_IFLNK, S_IFREG};
 use super::{PathContext, lookup_path_in};
 use crate::config::PAGE_SIZE;
@@ -1849,6 +1849,8 @@ fn oskernel_perf_content() -> String {
          block_io_irq_acks {}\n\
          block_io_completion_signals {}\n\
          block_io_completion_wakeups {}\n\
+         block_io_device_inflight {}\n\
+         block_io_device_inflight_high_watermark {}\n\
          dentry_cache_enabled {}\n\
          dentry_cache_entries {}\n\
          dentry_cache_capacity {}\n\
@@ -1950,6 +1952,8 @@ fn oskernel_perf_content() -> String {
         block_io.irq_acks,
         block_io.completion_signals,
         block_io.completion_wakeups,
+        block_io.device_inflight,
+        block_io.device_inflight_high_watermark,
         dentry.enabled as usize,
         dentry.entries,
         dentry.capacity,
@@ -2726,7 +2730,7 @@ fn snapshot_node_content(node: ProcNode) -> FsResult<Vec<u8>> {
     Ok(content)
 }
 
-impl FileSystemBackend for ProcFs {
+impl LegacyFileSystemBackend for ProcFs {
     fn root_ino(&self) -> u32 {
         ROOT_INO
     }

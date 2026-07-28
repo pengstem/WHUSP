@@ -1,7 +1,7 @@
 use super::dirent::{
     DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, RawDirEntry, write_dir_entries,
 };
-use super::vfs::{FileSystemBackend, FsError, FsNodeKind, FsResult};
+use super::vfs::{FsError, FsNodeKind, FsResult, InodeRelease, LegacyFileSystemBackend};
 use super::{
     FS_ENCRYPT_FL, FS_STATX_ATTR_FLAGS, FS_STATX_COMMON_ATTR_FLAGS, FileStat, FileTimestamp,
     S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK,
@@ -883,7 +883,7 @@ impl TmpFs {
     }
 }
 
-impl FileSystemBackend for TmpFs {
+impl LegacyFileSystemBackend for TmpFs {
     fn root_ino(&self) -> u32 {
         ROOT_INO
     }
@@ -1223,7 +1223,7 @@ impl FileSystemBackend for TmpFs {
         Ok(())
     }
 
-    fn release_inode(&mut self, ino: u32) -> FsResult {
+    fn release_inode(&mut self, ino: u32) -> FsResult<InodeRelease> {
         let should_remove = {
             let inode = self.inode_mut(ino)?;
             inode.open_count = inode.open_count.saturating_sub(1);
@@ -1231,8 +1231,9 @@ impl FileSystemBackend for TmpFs {
         };
         if should_remove {
             self.inodes.remove(&ino);
+            return Ok(InodeRelease::Freed);
         }
-        Ok(())
+        Ok(InodeRelease::Retained)
     }
 
     fn stat(&mut self, ino: u32) -> FsResult<FileStat> {

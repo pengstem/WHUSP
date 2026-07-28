@@ -4,7 +4,12 @@ mod file;
 mod node;
 mod path;
 
-pub(crate) use backend::{BackendReadPlan, FileSystemBackend, FileSystemStat, FsNodeKind};
+#[cfg(feature = "perf-counters")]
+pub(crate) use backend::BackendIoSnapshot;
+pub(crate) use backend::{
+    BackendOp, BackendReadPlan, ConcurrentFileSystemBackend, FileSystemStat, FsNodeKind,
+    InodeRelease, LegacyFileSystemBackend, SerializedBackend,
+};
 pub(crate) use error::{FsError, FsResult};
 #[cfg(feature = "perf-counters")]
 pub(crate) use file::dirty_writeback_stats_snapshot;

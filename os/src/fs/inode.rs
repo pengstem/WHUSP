@@ -1,8 +1,9 @@
 use super::dentry_cache;
+use super::inode_state;
 use super::mount::{mount_supports_page_cache, mounted_root_for_any_path, with_mount};
 use super::path::{PathContext, WorkingDir};
 use super::vfs::{
-    FsError, FsNodeKind, FsResult, LookupMode, VfsCreateTarget, VfsNodeId,
+    BackendOp, FsError, FsNodeKind, FsResult, LookupMode, VfsCreateTarget, VfsNodeId,
     begin_regular_file_page_cache_mutation, flush_dirty_regular_file,
     initialize_regular_file_page_cache_incarnation, resolve_create_parent_in, resolve_existing_in,
     resolve_mount_target_in,
@@ -125,7 +126,7 @@ fn validate_rename_path(name: &str) -> FsResult {
 }
 
 fn lookup_node(parent: VfsNodeId, leaf_name: &str) -> FsResult<(VfsNodeId, FsNodeKind)> {
-    let (ino, kind) = with_mount(parent.mount_id, |mount| {
+    let (ino, kind) = with_mount(parent.mount_id, BackendOp::Lookup, |mount| {
         mount.lookup_component_from(parent.ino, leaf_name)
     })
     .ok_or(FsError::Io)??;
@@ -170,7 +171,7 @@ fn is_descendant_or_self(mut node: VfsNodeId, ancestor: VfsNodeId) -> FsResult<b
     if node.mount_id != ancestor.mount_id {
         return Ok(false);
     }
-    with_mount(node.mount_id, |mount| {
+    with_mount(node.mount_id, BackendOp::Lookup, |mount| {
         for _ in 0..MAX_DEPTH {
             if node == ancestor {
                 return Ok(true);
@@ -211,10 +212,16 @@ pub(crate) fn mkdir_in(context: PathContext, name: &str, mode: u32) -> FsResult 
     }
     let target = resolve_create_parent_in(context.clone(), trimmed_nonroot_path(name))?;
     ensure_create_target_absent(&context, &target, false)?;
-    with_mount(target.parent.mount_id, |mount| {
-        mount.create_dir(target.parent.ino, target.leaf_name, mode)
-    })
-    .ok_or(FsError::Io)??;
+    inode_state::with_directory_mutation(target.parent, || {
+        let ino = with_mount(
+            target.parent.mount_id,
+            BackendOp::NamespaceMutation,
+            |mount| mount.create_dir(target.parent.ino, target.leaf_name, mode),
+        )
+        .ok_or(FsError::Io)??;
+        inode_state::initialize_new(VfsNodeId::new(target.parent.mount_id, ino));
+        Ok(())
+    })?;
     dentry_cache::invalidate_parent(target.parent);
     Ok(())
 }
@@ -237,30 +244,38 @@ pub(crate) fn create_node_in(
     let target = resolve_create_parent_in(context.clone(), trimmed_nonroot_path(name))?;
     ensure_create_target_absent(&context, &target, trailing_slash)?;
     let supports_page_cache = mount_supports_page_cache(target.parent.mount_id);
-    with_mount(target.parent.mount_id, |mount| {
-        let parent_stat = mount.stat(target.parent.ino)?;
-        let ino = mount.create_node(
-            target.parent.ino,
-            target.leaf_name,
-            kind,
-            mode & MODE_PERMISSIONS_MASK,
-            rdev,
-        )?;
+    inode_state::with_directory_mutation(target.parent, || {
+        let ino = with_mount(
+            target.parent.mount_id,
+            BackendOp::NamespaceMutation,
+            |mount| {
+                let parent_stat = mount.stat(target.parent.ino)?;
+                let ino = mount.create_node(
+                    target.parent.ino,
+                    target.leaf_name,
+                    kind,
+                    mode & MODE_PERMISSIONS_MASK,
+                    rdev,
+                )?;
+                let gid = if parent_stat.mode & MODE_SETGID != 0 {
+                    parent_stat.gid
+                } else {
+                    gid
+                };
+                mount.set_owner(ino, Some(uid), Some(gid))?;
+                mount.set_mode(ino, mode & MODE_PERMISSIONS_MASK)?;
+                Ok(ino)
+            },
+        )
+        .ok_or(FsError::Io)??;
+        let node = VfsNodeId::new(target.parent.mount_id, ino);
         if kind == FsNodeKind::RegularFile {
-            initialize_regular_file_page_cache_incarnation(
-                VfsNodeId::new(target.parent.mount_id, ino),
-                supports_page_cache,
-            );
-        }
-        let gid = if parent_stat.mode & MODE_SETGID != 0 {
-            parent_stat.gid
+            initialize_regular_file_page_cache_incarnation(node, supports_page_cache);
         } else {
-            gid
-        };
-        mount.set_owner(ino, Some(uid), Some(gid))?;
-        mount.set_mode(ino, mode & MODE_PERMISSIONS_MASK)
-    })
-    .ok_or(FsError::Io)??;
+            inode_state::initialize_new(node);
+        }
+        Ok(())
+    })?;
     dentry_cache::invalidate_parent(target.parent);
     Ok(())
 }
@@ -300,10 +315,14 @@ pub(crate) fn link_file_in(
         return Err(FsError::PermissionDenied);
     }
     ensure_create_target_absent(&new_context, &new_target, new_has_trailing_slash)?;
-    with_mount(new_target.parent.mount_id, |mount| {
-        mount.link(new_target.parent.ino, new_target.leaf_name, old_node.ino)
-    })
-    .ok_or(FsError::Io)??;
+    inode_state::with_directory_mutation(new_target.parent, || {
+        with_mount(
+            new_target.parent.mount_id,
+            BackendOp::NamespaceMutation,
+            |mount| mount.link(new_target.parent.ino, new_target.leaf_name, old_node.ino),
+        )
+        .ok_or(FsError::Io)?
+    })?;
     dentry_cache::invalidate_parent(new_target.parent);
     Ok(())
 }
@@ -329,10 +348,14 @@ pub(crate) fn link_node_in(
         return Err(FsError::CrossDevice);
     }
     ensure_create_target_absent(&new_context, &new_target, new_has_trailing_slash)?;
-    with_mount(new_target.parent.mount_id, |mount| {
-        mount.link(new_target.parent.ino, new_target.leaf_name, old_node.ino)
-    })
-    .ok_or(FsError::Io)??;
+    inode_state::with_directory_mutation(new_target.parent, || {
+        with_mount(
+            new_target.parent.mount_id,
+            BackendOp::NamespaceMutation,
+            |mount| mount.link(new_target.parent.ino, new_target.leaf_name, old_node.ino),
+        )
+        .ok_or(FsError::Io)?
+    })?;
     dentry_cache::invalidate_parent(new_target.parent);
     Ok(())
 }
@@ -347,14 +370,25 @@ pub(crate) fn symlink_in(context: PathContext, target: &str, link_name: &str) ->
     let link_has_trailing_slash = has_trailing_slash(link_name);
     let create_target = resolve_create_parent_in(context.clone(), trimmed_nonroot_path(link_name))?;
     ensure_create_target_absent(&context, &create_target, link_has_trailing_slash)?;
-    with_mount(create_target.parent.mount_id, |mount| {
-        mount.symlink(
-            create_target.parent.ino,
-            create_target.leaf_name,
-            target.as_bytes(),
+    inode_state::with_directory_mutation(create_target.parent, || {
+        let ino = with_mount(
+            create_target.parent.mount_id,
+            BackendOp::NamespaceMutation,
+            |mount| {
+                mount.symlink(
+                    create_target.parent.ino,
+                    create_target.leaf_name,
+                    target.as_bytes(),
+                )?;
+                mount
+                    .lookup_component_from(create_target.parent.ino, create_target.leaf_name)
+                    .map(|(ino, _)| ino)
+            },
         )
-    })
-    .ok_or(FsError::Io)??;
+        .ok_or(FsError::Io)??;
+        inode_state::initialize_new(VfsNodeId::new(create_target.parent.mount_id, ino));
+        Ok(())
+    })?;
     dentry_cache::invalidate_parent(create_target.parent);
     Ok(())
 }
@@ -436,15 +470,21 @@ pub(crate) fn rename_in(
     if let Some((node, _kind)) = replaced_target {
         flush_dirty_regular_file(node)?;
     }
-    with_mount(old_target.parent.mount_id, |mount| {
-        mount.rename(
-            old_target.parent.ino,
-            old_target.leaf_name,
-            new_target.parent.ino,
-            new_target.leaf_name,
+    inode_state::with_directory_mutations(old_target.parent, new_target.parent, || {
+        with_mount(
+            old_target.parent.mount_id,
+            BackendOp::NamespaceMutation,
+            |mount| {
+                mount.rename(
+                    old_target.parent.ino,
+                    old_target.leaf_name,
+                    new_target.parent.ino,
+                    new_target.leaf_name,
+                )
+            },
         )
-    })
-    .ok_or(FsError::Io)??;
+        .ok_or(FsError::Io)?
+    })?;
     dentry_cache::invalidate_parent(old_target.parent);
     if new_target.parent != old_target.parent {
         dentry_cache::invalidate_parent(new_target.parent);
@@ -506,15 +546,21 @@ pub(crate) fn rename_exchange_in(
 
     flush_dirty_regular_file(old_node)?;
     flush_dirty_regular_file(new_node)?;
-    with_mount(old_target.parent.mount_id, |mount| {
-        mount.exchange(
-            old_target.parent.ino,
-            old_target.leaf_name,
-            new_target.parent.ino,
-            new_target.leaf_name,
+    inode_state::with_directory_mutations(old_target.parent, new_target.parent, || {
+        with_mount(
+            old_target.parent.mount_id,
+            BackendOp::NamespaceMutation,
+            |mount| {
+                mount.exchange(
+                    old_target.parent.ino,
+                    old_target.leaf_name,
+                    new_target.parent.ino,
+                    new_target.leaf_name,
+                )
+            },
         )
-    })
-    .ok_or(FsError::Io)??;
+        .ok_or(FsError::Io)?
+    })?;
     dentry_cache::invalidate_parent(old_target.parent);
     if new_target.parent != old_target.parent {
         dentry_cache::invalidate_parent(new_target.parent);
@@ -544,10 +590,14 @@ pub(crate) fn unlink_file_in(context: PathContext, name: &str) -> FsResult {
     }
     let _mutation = begin_regular_file_page_cache_mutation(node, kind);
     flush_dirty_regular_file(node)?;
-    with_mount(target.parent.mount_id, |mount| {
-        mount.unlink(target.parent.ino, target.leaf_name)
-    })
-    .ok_or(FsError::Io)??;
+    inode_state::with_directory_mutation(target.parent, || {
+        with_mount(
+            target.parent.mount_id,
+            BackendOp::NamespaceMutation,
+            |mount| mount.unlink(target.parent.ino, target.leaf_name),
+        )
+        .ok_or(FsError::Io)?
+    })?;
     dentry_cache::invalidate_parent(target.parent);
     Ok(())
 }
@@ -573,10 +623,14 @@ pub(crate) fn rmdir_in(context: PathContext, name: &str) -> FsResult {
     {
         return Err(FsError::Busy);
     }
-    with_mount(target.parent.mount_id, |mount| {
-        mount.unlink(target.parent.ino, target.leaf_name)
-    })
-    .ok_or(FsError::Io)??;
+    inode_state::with_directory_mutation(target.parent, || {
+        with_mount(
+            target.parent.mount_id,
+            BackendOp::NamespaceMutation,
+            |mount| mount.unlink(target.parent.ino, target.leaf_name),
+        )
+        .ok_or(FsError::Io)?
+    })?;
     dentry_cache::invalidate_parent(target.parent);
     Ok(())
 }

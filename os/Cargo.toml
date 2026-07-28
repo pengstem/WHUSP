@@ -7,6 +7,7 @@ edition = "2024"
 [features]
 block-io-force-sync = []
 perf-counters = []
+sleep-rwlock-probe = []
 
 [dependencies]
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
