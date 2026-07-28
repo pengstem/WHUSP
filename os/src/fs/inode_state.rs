@@ -1,6 +1,6 @@
 use super::{FileStat, MountNamespaceId, WorkingDir, vfs::VfsNodeId};
 use crate::config::MAX_CPUS;
-use crate::sync::{SleepRwLock, SleepRwLockWriteGuard, SpinRwLock};
+use crate::sync::{SleepRwLock, SleepRwLockReadGuard, SleepRwLockWriteGuard, SpinRwLock};
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -206,6 +206,10 @@ impl VersionDomain {
             start_version,
             committed: false,
         }
+    }
+
+    fn read(&self) -> SleepRwLockReadGuard<'_, ()> {
+        self.writer.read()
     }
 }
 
@@ -434,6 +438,24 @@ pub(crate) fn with_directory_mutations<V>(
     result
 }
 
+pub(crate) fn with_metadata_read<V>(node: VfsNodeId, read: impl FnOnce() -> V) -> V {
+    let state = state_for(node);
+    let _lease = state.metadata_version.read();
+    read()
+}
+
+pub(crate) fn with_mapping_read<V>(node: VfsNodeId, read: impl FnOnce() -> V) -> V {
+    let state = state_for(node);
+    let _lease = state.mapping_version.read();
+    read()
+}
+
+pub(crate) fn with_directory_read<V>(node: VfsNodeId, read: impl FnOnce() -> V) -> V {
+    let state = state_for(node);
+    let _lease = state.directory_version.read();
+    read()
+}
+
 fn metadata_or_load(
     node: VfsNodeId,
     full: bool,
@@ -446,27 +468,26 @@ fn metadata_or_load(
         return Ok(stat);
     }
 
-    // The metadata cache writer doubles as the per-inode single-flight gate.
-    // It is a sleeping lock and may cover the serialized backend miss, unlike
-    // the short interrupt-masked state-table shard locks.
+    // Lock order is version read lease -> metadata cache. Mutations use
+    // version write lease -> metadata cache, so a miss cannot deadlock a
+    // mutation or observe a partially-flushed inode.
+    let _version_lease = state.metadata_version.read();
     let mut metadata = state.metadata.write();
-    let Some(version) = state.metadata_version.stable_version() else {
-        drop(metadata);
-        return load();
-    };
+    let version = state
+        .metadata_version
+        .stable_version()
+        .expect("metadata version must be stable under a read lease");
     let cached = if full { metadata.full } else { metadata.basic };
     if let Some(cached) = cached.filter(|cached| cached.version == version) {
         return Ok(cached.stat);
     }
 
     let stat = load()?;
-    if state.metadata_version.stable_version() == Some(version) {
-        let cached = Some(CachedMetadata { version, stat });
-        if full {
-            metadata.full = cached;
-        } else {
-            metadata.basic = cached;
-        }
+    let cached = Some(CachedMetadata { version, stat });
+    if full {
+        metadata.full = cached;
+    } else {
+        metadata.basic = cached;
     }
     Ok(stat)
 }

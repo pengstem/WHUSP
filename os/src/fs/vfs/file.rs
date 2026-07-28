@@ -1504,8 +1504,10 @@ impl VfsFile {
         point: perf::ProfilePoint,
     ) -> usize {
         let _profile_scope = perf::time_scope(point);
-        let Some(read_size) = with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
-            mount.read_at(self.node.ino, buf, offset as u64)
+        let Some(read_size) = inode_state::with_mapping_read(self.node, || {
+            with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
+                mount.read_at(self.node.ino, buf, offset as u64)
+            })
         }) else {
             return 0;
         };
@@ -1546,8 +1548,10 @@ impl VfsFile {
             *snapshot = None;
         }
         if snapshot.is_none() {
-            let content = match with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
-                mount.read_snapshot(self.node.ino)
+            let content = match inode_state::with_mapping_read(self.node, || {
+                with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
+                    mount.read_snapshot(self.node.ino)
+                })
             })? {
                 Some(Ok(content)) => content,
                 Some(Err(_)) => return Some(0),
@@ -1729,10 +1733,12 @@ impl VfsFile {
             let valid_len = block_end - block_start;
             buf[..valid_len].fill(0);
             let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsSeekScanRead);
-            let read_len = with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
-                mount.read_at(self.node.ino, &mut buf[..valid_len], block_start as u64)
-            })
-            .ok_or(FsError::Io)?;
+            let read_len = inode_state::with_mapping_read(self.node, || {
+                with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
+                    mount.read_at(self.node.ino, &mut buf[..valid_len], block_start as u64)
+                })
+                .ok_or(FsError::Io)
+            })?;
             if read_len < valid_len {
                 buf[read_len..valid_len].fill(0);
             }
@@ -1894,27 +1900,29 @@ impl VfsFile {
 
             let noatime_snapshot = self.noatime_snapshot();
             let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsReadCacheFill);
-            let read_plan = if read_limit % PAGE_SIZE == 0 {
-                with_mount(self.node.mount_id, BackendOp::ReadPlan, |mount| {
-                    mount.prepare_read_plan(self.node.ino, page_start as u64, read_limit)
-                })
-                .flatten()
-            } else {
-                None
-            };
             let fill_buf = if let Some(run) = frame_run.as_mut() {
                 &mut run.as_mut_bytes()[..read_limit]
             } else {
                 staging.as_mut_slice()
             };
-            let read_len = if let Some(read_plan) = read_plan {
-                read_plan.execute(fill_buf)
-            } else {
-                with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
-                    mount.read_at(self.node.ino, fill_buf, page_start as u64)
-                })
-                .expect("filesystem mount is missing")
-            };
+            let read_len = inode_state::with_mapping_read(self.node, || {
+                let read_plan = if read_limit % PAGE_SIZE == 0 {
+                    with_mount(self.node.mount_id, BackendOp::ReadPlan, |mount| {
+                        mount.prepare_read_plan(self.node.ino, page_start as u64, read_limit)
+                    })
+                    .flatten()
+                } else {
+                    None
+                };
+                if let Some(read_plan) = read_plan {
+                    read_plan.execute(fill_buf)
+                } else {
+                    with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
+                        mount.read_at(self.node.ino, fill_buf, page_start as u64)
+                    })
+                    .expect("filesystem mount is missing")
+                }
+            });
             self.restore_noatime(noatime_snapshot);
             perf::record_vfs_read_cache_backend_read();
             assert!(
@@ -2117,7 +2125,7 @@ impl VfsFile {
         let noatime_snapshot = self.noatime_snapshot();
         while filled < file_size {
             let chunk_len = (file_size - filled).min(VFS_READ_CHUNK_SIZE);
-            let Some(read_size) =
+            let Some(read_size) = inode_state::with_mapping_read(self.node, || {
                 with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
                     mount.read_at(
                         self.node.ino,
@@ -2125,7 +2133,7 @@ impl VfsFile {
                         filled as u64,
                     )
                 })
-            else {
+            }) else {
                 self.restore_noatime(noatime_snapshot);
                 return None;
             };
@@ -3088,11 +3096,12 @@ impl File for VfsFile {
                 &mut kernel_buf,
             )?
         } else {
-            let (read_size, next_offset) =
+            let (read_size, next_offset) = inode_state::with_directory_read(self.node, || {
                 with_mount(self.node.mount_id, BackendOp::Readdir, |mount| {
                     mount.read_dirent64(self.node.ino, current_offset, &mut kernel_buf)
                 })
-                .ok_or(FsError::Io)??;
+                .ok_or(FsError::Io)?
+            })?;
             if read_size == 0 {
                 // Synthetic mountpoint dirents are appended after backend EOF
                 // and resume from a disjoint high offset range, so real
@@ -3118,10 +3127,12 @@ impl File for VfsFile {
         if self.kind != FsNodeKind::Symlink {
             return Err(FsError::InvalidInput);
         }
-        with_mount(self.node.mount_id, BackendOp::Readlink, |mount| {
-            mount.readlink(self.node.ino, buf)
+        inode_state::with_mapping_read(self.node, || {
+            with_mount(self.node.mount_id, BackendOp::Readlink, |mount| {
+                mount.readlink(self.node.ino, buf)
+            })
+            .ok_or(FsError::Io)?
         })
-        .ok_or(FsError::Io)?
     }
 
     fn proc_fd_target(&self) -> Option<String> {

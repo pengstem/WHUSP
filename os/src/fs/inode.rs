@@ -125,10 +125,12 @@ fn validate_rename_path(name: &str) -> FsResult {
 }
 
 fn lookup_node(parent: VfsNodeId, leaf_name: &str) -> FsResult<(VfsNodeId, FsNodeKind)> {
-    let (ino, kind) = with_mount(parent.mount_id, BackendOp::Lookup, |mount| {
-        mount.lookup_component_from(parent.ino, leaf_name)
-    })
-    .ok_or(FsError::Io)??;
+    let (ino, kind) = inode_state::with_directory_read(parent, || {
+        with_mount(parent.mount_id, BackendOp::Lookup, |mount| {
+            mount.lookup_component_from(parent.ino, leaf_name)
+        })
+        .ok_or(FsError::Io)?
+    })?;
     Ok((VfsNodeId::new(parent.mount_id, ino), kind))
 }
 

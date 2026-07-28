@@ -820,10 +820,12 @@ pub(super) fn release_inode_from_drop(state: &Arc<InodeState>) {
 /// Pins an inode and installs its exact-incarnation Rust-side state only after
 /// the backend has confirmed that the inode still exists.
 pub(super) fn retain_inode(node: VfsNodeId) -> FsResult<Arc<InodeState>> {
-    with_mount(node.mount_id, BackendOp::InodeLifetime, |mount| {
-        mount.retain_inode(node.ino)
-    })
-    .ok_or(FsError::Io)??;
+    inode_state::with_metadata_read(node, || {
+        with_mount(node.mount_id, BackendOp::InodeLifetime, |mount| {
+            mount.retain_inode(node.ino)
+        })
+        .ok_or(FsError::Io)?
+    })?;
     Ok(inode_state::state_for(node))
 }
 

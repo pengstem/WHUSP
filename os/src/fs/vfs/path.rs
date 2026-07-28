@@ -4,7 +4,7 @@ use super::super::mount::{
     with_mount,
 };
 use super::super::path::{PathContext, WorkingDir};
-use super::super::{dentry_cache, dentry_cache::DentryLookupResult};
+use super::super::{dentry_cache, dentry_cache::DentryLookupResult, inode_state};
 use super::{BackendOp, FsError, FsNodeKind, FsResult, VfsNodeId};
 use crate::perf;
 use alloc::string::String;
@@ -250,43 +250,45 @@ fn lookup_cached_child(
 ) -> FsResult<DentryLookupResult> {
     let cacheable = component != ".." && mount_supports_dentry_cache(parent_node.mount_id);
     let lookup_backend = || -> FsResult<DentryLookupResult> {
-        let token = cacheable
-            .then(|| dentry_cache::version_token(parent_node))
-            .flatten();
-        let result = {
-            let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupBackend);
-            with_mount(parent_node.mount_id, BackendOp::Lookup, |mount| {
-                mount.lookup_component_from(parent_node.ino, component)
-            })
-            .ok_or(FsError::Io)?
-        };
-        match result {
-            Ok((ino, kind)) => {
-                let node = VfsNodeId::new(parent_node.mount_id, ino);
-                if let Some(token) = token {
-                    let _profile_scope =
-                        perf::time_scope(perf::ProfilePoint::VfsLookupDentryInsert);
-                    dentry_cache::insert_positive(
-                        namespace_id,
-                        parent_node,
-                        token,
-                        component,
-                        node,
-                        kind,
-                    );
+        inode_state::with_directory_read(parent_node, || {
+            let token = cacheable
+                .then(|| dentry_cache::version_token(parent_node))
+                .flatten();
+            let result = {
+                let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupBackend);
+                with_mount(parent_node.mount_id, BackendOp::Lookup, |mount| {
+                    mount.lookup_component_from(parent_node.ino, component)
+                })
+                .ok_or(FsError::Io)?
+            };
+            match result {
+                Ok((ino, kind)) => {
+                    let node = VfsNodeId::new(parent_node.mount_id, ino);
+                    if let Some(token) = token {
+                        let _profile_scope =
+                            perf::time_scope(perf::ProfilePoint::VfsLookupDentryInsert);
+                        dentry_cache::insert_positive(
+                            namespace_id,
+                            parent_node,
+                            token,
+                            component,
+                            node,
+                            kind,
+                        );
+                    }
+                    Ok(DentryLookupResult::Positive { node, kind })
                 }
-                Ok(DentryLookupResult::Positive { node, kind })
-            }
-            Err(FsError::NotFound) => {
-                if let Some(token) = token {
-                    let _profile_scope =
-                        perf::time_scope(perf::ProfilePoint::VfsLookupDentryInsert);
-                    dentry_cache::insert_negative(namespace_id, parent_node, token, component);
+                Err(FsError::NotFound) => {
+                    if let Some(token) = token {
+                        let _profile_scope =
+                            perf::time_scope(perf::ProfilePoint::VfsLookupDentryInsert);
+                        dentry_cache::insert_negative(namespace_id, parent_node, token, component);
+                    }
+                    Ok(DentryLookupResult::Negative)
                 }
-                Ok(DentryLookupResult::Negative)
+                Err(err) => Err(err),
             }
-            Err(err) => Err(err),
-        }
+        })
     };
 
     let cached = cacheable.then(|| {
@@ -453,10 +455,12 @@ fn owned_path_components<'a>(path: &str) -> Vec<PathComponent<'a>> {
 
 fn read_symlink_target(cursor: &VfsCursor) -> FsResult<String> {
     let mut buffer = vec![0u8; SYMLINK_TARGET_MAX + 1];
-    let len = with_mount(cursor.node.mount_id, BackendOp::Readlink, |mount| {
-        mount.readlink(cursor.node.ino, &mut buffer)
-    })
-    .ok_or(FsError::Io)??;
+    let len = inode_state::with_mapping_read(cursor.node, || {
+        with_mount(cursor.node.mount_id, BackendOp::Readlink, |mount| {
+            mount.readlink(cursor.node.ino, &mut buffer)
+        })
+        .ok_or(FsError::Io)?
+    })?;
     if len > SYMLINK_TARGET_MAX {
         return Err(FsError::NameTooLong);
     }

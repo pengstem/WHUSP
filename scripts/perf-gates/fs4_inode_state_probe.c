@@ -15,9 +15,114 @@ enum {
     FINAL_CLOSE_WORKERS = 12,
     REUSE_ATTEMPTS = 512,
     RENAME_ITERATIONS = 200,
+    READ_MUTATION_ITERATIONS = 200,
     DRAIN_STRESS_FILES = 48,
     DRAIN_STRESS_WORKERS = 12,
 };
+
+static int write_exact(int fd, const void *buffer, size_t length);
+static int wait_success(pid_t pid);
+
+static int phase_lookup_stat_vs_namespace_mutation(const char *base)
+{
+    char dir[512];
+    char stable[1024];
+    char changing[1024];
+    snprintf(dir, sizeof(dir), "%s/namespace-race", base);
+    snprintf(stable, sizeof(stable), "%s/stable", dir);
+    snprintf(changing, sizeof(changing), "%s/changing", dir);
+    if (mkdir(dir, 0700) != 0) {
+        return -1;
+    }
+    int fd = open(stable, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (fd < 0 || write_exact(fd, "stable", 6) != 0 || close(fd) != 0) {
+        return -1;
+    }
+    pid_t writer = fork();
+    if (writer == 0) {
+        for (int i = 0; i < READ_MUTATION_ITERATIONS; ++i) {
+            int changing_fd = open(changing, O_CREAT | O_EXCL | O_WRONLY, 0600);
+            if (changing_fd < 0 || close(changing_fd) != 0 || unlink(changing) != 0) {
+                _exit(61);
+            }
+        }
+        _exit(0);
+    }
+    pid_t reader = fork();
+    if (reader == 0) {
+        for (int i = 0; i < READ_MUTATION_ITERATIONS * 4; ++i) {
+            struct stat statbuf;
+            if (stat(stable, &statbuf) != 0 || !S_ISREG(statbuf.st_mode)
+                || statbuf.st_size != 6) {
+                _exit(62);
+            }
+            if (stat(changing, &statbuf) != 0 && errno != ENOENT) {
+                _exit(63);
+            }
+        }
+        _exit(0);
+    }
+    if (writer < 0 || reader < 0 || wait_success(writer) != 0 || wait_success(reader) != 0
+        || unlink(stable) != 0 || rmdir(dir) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int phase_read_vs_mapping_mutation(const char *base)
+{
+    char path[512];
+    unsigned char payload[4096];
+    snprintf(path, sizeof(path), "%s/mapping-race", base);
+    memset(payload, 0x5a, sizeof(payload));
+    int fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0 || write_exact(fd, payload, sizeof(payload)) != 0 || close(fd) != 0) {
+        return -1;
+    }
+    pid_t writer = fork();
+    if (writer == 0) {
+        int write_fd = open(path, O_RDWR);
+        if (write_fd < 0) {
+            _exit(71);
+        }
+        for (int i = 0; i < READ_MUTATION_ITERATIONS; ++i) {
+            memset(payload, i & 1 ? 0xa5 : 0x5a, sizeof(payload));
+            if (pwrite(write_fd, payload, sizeof(payload), 0) != (ssize_t)sizeof(payload)
+                || ftruncate(write_fd, i & 1 ? 2048 : 4096) != 0) {
+                _exit(72);
+            }
+        }
+        if (fsync(write_fd) != 0 || close(write_fd) != 0) {
+            _exit(73);
+        }
+        _exit(0);
+    }
+    pid_t reader = fork();
+    if (reader == 0) {
+        unsigned char observed[4096];
+        int read_fd = open(path, O_RDONLY);
+        if (read_fd < 0) {
+            _exit(74);
+        }
+        for (int i = 0; i < READ_MUTATION_ITERATIONS * 4; ++i) {
+            struct stat statbuf;
+            ssize_t amount = pread(read_fd, observed, sizeof(observed), 0);
+            if (amount < 0 || amount > (ssize_t)sizeof(observed) || fstat(read_fd, &statbuf) != 0
+                || statbuf.st_size < 0 || statbuf.st_size > (off_t)sizeof(observed)) {
+                _exit(75);
+            }
+        }
+        if (close(read_fd) != 0) {
+            _exit(76);
+        }
+        _exit(0);
+    }
+    if (writer < 0 || reader < 0 || wait_success(writer) != 0 || wait_success(reader) != 0
+        || unlink(path) != 0) {
+        return -1;
+    }
+    return 0;
+}
 
 static int write_exact(int fd, const void *buffer, size_t length)
 {
@@ -298,8 +403,10 @@ int main(int argc, char **argv)
     RUN_CASE(concurrent_final_close);
     RUN_CASE(fast_inode_reuse);
     RUN_CASE(cross_directory_rename);
+    RUN_CASE(lookup_stat_vs_namespace_mutation);
+    RUN_CASE(read_vs_mapping_mutation);
     RUN_CASE(shutdown_drain_stress);
 #undef RUN_CASE
-    puts("FS4_INODE_STATE_PROBE_PASS cases=5");
+    puts("FS4_INODE_STATE_PROBE_PASS cases=7");
     return 0;
 }

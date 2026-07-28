@@ -23,6 +23,8 @@ CASES = (
     "concurrent_final_close",
     "fast_inode_reuse",
     "cross_directory_rename",
+    "lookup_stat_vs_namespace_mutation",
+    "read_vs_mapping_mutation",
     "shutdown_drain_stress",
 )
 
@@ -126,7 +128,7 @@ def validate(log: str, args: argparse.Namespace, overlay_root: Path) -> dict[str
     }
     if seen != set(CASES):
         errors.append(f"case matrix mismatch: {sorted(seen)}")
-    if lines.count("FS4_INODE_STATE_PROBE_PASS cases=5") != 1:
+    if lines.count(f"FS4_INODE_STATE_PROBE_PASS cases={len(CASES)}") != 1:
         errors.append("probe pass marker mismatch")
     if any("FS4_INODE_STATE_CASE_FAIL" in line or "FS4_INODE_STATE_FAIL" in line for line in lines):
         errors.append("guest emitted failure marker")
