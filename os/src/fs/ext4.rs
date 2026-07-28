@@ -12,7 +12,7 @@ use super::{FS_STATX_ATTR_FLAGS, FileStat, FileTimestamp};
 use crate::config::MAX_CPUS;
 use crate::drivers::block::VirtIOBlock;
 use crate::perf;
-use crate::sync::{SleepMutex, SleepRwLock};
+use crate::sync::{SleepMutex, SleepMutexGuard};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -372,12 +372,11 @@ impl Ext4Mount {
 /// One writable lwext4 core plus inode-sharded read-only replicas.
 ///
 /// Each C core owns its raw pointers and bcache and is entered by one task at a
-/// time. The lifecycle lock admits concurrent readers but excludes all of them
-/// around a mutation. A successful or partially-completed mutation flushes the
-/// writer and invalidates every clean replica cache before readers are admitted
-/// again, so replicas never publish metadata from an older disk generation.
+/// time. Read operations touch only one replica lock. A mutation first freezes
+/// the replicas in index order, then flushes the writer and invalidates every
+/// clean replica cache before admitting readers again, so replicas never
+/// publish metadata from an older disk generation.
 pub(super) struct ConcurrentExt4Backend {
-    lifecycle: SleepRwLock<()>,
     writer: SleepMutex<Ext4Mount>,
     readers: Vec<SleepMutex<Ext4Mount>>,
     inode_runtime: Arc<Ext4InodeRuntimeTable>,
@@ -393,7 +392,6 @@ impl ConcurrentExt4Backend {
         }
         let inode_runtime = writer.inode_runtime.clone();
         Ok(Self {
-            lifecycle: SleepRwLock::new(()),
             writer: SleepMutex::new(writer),
             readers,
             inode_runtime,
@@ -405,12 +403,13 @@ impl ConcurrentExt4Backend {
         crate::cpu::current_id() % self.readers.len()
     }
 
-    fn with_reader<V>(&self, op: BackendOp, _ino: u32, f: impl FnOnce(&mut Ext4Mount) -> V) -> V {
+    fn lock_core<'a>(
+        core: &'a SleepMutex<Ext4Mount>,
+        op: BackendOp,
+    ) -> SleepMutexGuard<'a, Ext4Mount> {
         let _ = op;
-        #[cfg(feature = "perf-counters")]
-        perf::record_backend_op_call(op);
-        let lifecycle = match self.lifecycle.try_read() {
-            Some(guard) => guard,
+        match core.try_lock() {
+            Some(core) => core,
             None => {
                 #[cfg(feature = "perf-counters")]
                 {
@@ -420,13 +419,19 @@ impl ConcurrentExt4Backend {
                 let wait_scope = perf::time_scope(perf::ProfilePoint::MountBackendContendedWait);
                 #[cfg(feature = "perf-counters")]
                 let op_wait_scope = perf::time_backend_op_wait(op);
-                let guard = self.lifecycle.read();
+                let core = core.lock();
                 #[cfg(feature = "perf-counters")]
                 drop(op_wait_scope);
                 drop(wait_scope);
-                guard
+                core
             }
-        };
+        }
+    }
+
+    fn with_reader<V>(&self, op: BackendOp, _ino: u32, f: impl FnOnce(&mut Ext4Mount) -> V) -> V {
+        let _ = op;
+        #[cfg(feature = "perf-counters")]
+        perf::record_backend_op_call(op);
         let start = self.reader_start();
         let mut available = None;
         for offset in 0..self.readers.len() {
@@ -466,17 +471,15 @@ impl ConcurrentExt4Backend {
             perf::record_backend_op_io(op, reader.io_counters.snapshot().delta_since(io_before));
         }
         drop(reader);
-        drop(lifecycle);
         drop(hold_scope);
         result
     }
 
     fn with_writer_read<V>(&self, op: BackendOp, f: impl FnOnce(&mut Ext4Mount) -> V) -> V {
         let _ = op;
-        let _lifecycle = self.lifecycle.read();
-        let mut writer = self.writer.lock();
         #[cfg(feature = "perf-counters")]
         perf::record_backend_op_call(op);
+        let mut writer = Self::lock_core(&self.writer, op);
         let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
         #[cfg(feature = "perf-counters")]
         let io_before = writer.io_counters.snapshot();
@@ -497,25 +500,13 @@ impl ConcurrentExt4Backend {
         let _ = op;
         #[cfg(feature = "perf-counters")]
         perf::record_backend_op_call(op);
-        let lifecycle = match self.lifecycle.try_write() {
-            Some(guard) => guard,
-            None => {
-                #[cfg(feature = "perf-counters")]
-                {
-                    perf::record_mount_backend_contended_acquisition();
-                    perf::record_backend_op_contended(op);
-                }
-                let wait_scope = perf::time_scope(perf::ProfilePoint::MountBackendContendedWait);
-                #[cfg(feature = "perf-counters")]
-                let op_wait_scope = perf::time_backend_op_wait(op);
-                let guard = self.lifecycle.write();
-                #[cfg(feature = "perf-counters")]
-                drop(op_wait_scope);
-                drop(wait_scope);
-                guard
-            }
-        };
-        let mut writer = self.writer.lock();
+        // Serialize writers before freezing replicas. Readers never acquire the
+        // writer core, so this lock order cannot form a reader/writer cycle.
+        let mut writer = Self::lock_core(&self.writer, op);
+        let mut readers = Vec::with_capacity(self.readers.len());
+        for reader in &self.readers {
+            readers.push(Self::lock_core(reader, op));
+        }
         let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
         #[cfg(feature = "perf-counters")]
         let io_before = writer.io_counters.snapshot();
@@ -523,8 +514,8 @@ impl ConcurrentExt4Backend {
         let op_hold_scope = perf::time_backend_op_hold(op);
         let result = f(&mut writer);
         let visible = writer.flush_for_replica_visibility();
-        for reader in &self.readers {
-            reader.lock().invalidate_read_cache();
+        for reader in &mut readers {
+            reader.invalidate_read_cache();
         }
         #[cfg(feature = "perf-counters")]
         {
@@ -532,7 +523,7 @@ impl ConcurrentExt4Backend {
             perf::record_backend_op_io(op, writer.io_counters.snapshot().delta_since(io_before));
         }
         drop(writer);
-        drop(lifecycle);
+        drop(readers);
         drop(hold_scope);
         (result, visible)
     }
@@ -555,8 +546,11 @@ impl ConcurrentExt4Backend {
         f: impl FnOnce(&mut Ext4Mount) -> FsResult<T>,
     ) -> Option<FsResult<T>> {
         let _ = op;
-        let lifecycle = self.lifecycle.try_write()?;
         let mut writer = self.writer.try_lock()?;
+        let mut readers = Vec::with_capacity(self.readers.len());
+        for reader in &self.readers {
+            readers.push(reader.try_lock()?);
+        }
         #[cfg(feature = "perf-counters")]
         {
             perf::record_backend_op_call(op);
@@ -568,8 +562,8 @@ impl ConcurrentExt4Backend {
         let op_hold_scope = perf::time_backend_op_hold(op);
         let result = f(&mut writer);
         let visible = writer.flush_for_replica_visibility();
-        for reader in &self.readers {
-            reader.lock().invalidate_read_cache();
+        for reader in &mut readers {
+            reader.invalidate_read_cache();
         }
         #[cfg(feature = "perf-counters")]
         {
@@ -577,7 +571,7 @@ impl ConcurrentExt4Backend {
             perf::record_backend_op_io(op, writer.io_counters.snapshot().delta_since(io_before));
         }
         drop(writer);
-        drop(lifecycle);
+        drop(readers);
         Some(match result {
             Ok(value) => visible.map(|()| value),
             Err(err) => Err(err),
