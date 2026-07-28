@@ -877,11 +877,49 @@ pub fn sys_statx_ctx(
         return Err(SysError::EINVAL);
     }
 
+    // LoongArch musl implements fstatat/stat through statx. Give its common
+    // `dirfd + one regular filename` shape the same allocation-free path as
+    // newfstatat, while symlinks, mount crossings, and complex components
+    // continue through the complete resolver below.
+    if dirfd >= 0
+        && dirfd != AT_FDCWD
+        && let Some(path) = try_read_direct_path_component_ctx(ctx, pathname)?
+    {
+        let parent = ctx
+            .process()
+            .directory_working_dir_from_fd(dirfd as usize)
+            .ok_or(SysError::EBADF)?
+            .ok_or(SysError::ENOTDIR)?;
+        if let Some(stat) = stat_direct_regular_child_in(
+            ctx.process().mount_namespace_id(),
+            parent,
+            path.as_str(),
+            true,
+        )? {
+            return write_stat_result_ctx(ctx, statxbuf, stat);
+        }
+    }
+
     let path = read_user_c_string_ctx(ctx, pathname, PATH_MAX)?;
     if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
         return Err(SysError::ENOENT);
     }
     let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
+    if !path.is_empty() && !path.starts_with('/') && dirfd >= 0 && dirfd != AT_FDCWD {
+        let parent = ctx
+            .process()
+            .directory_working_dir_from_fd(dirfd as usize)
+            .ok_or(SysError::EBADF)?
+            .ok_or(SysError::ENOTDIR)?;
+        if let Some(stat) = stat_direct_regular_child_in(
+            ctx.process().mount_namespace_id(),
+            parent,
+            path.as_str(),
+            true,
+        )? {
+            return write_stat_result_ctx(ctx, statxbuf, stat);
+        }
+    }
     let snapshot = ctx.process().path_snapshot();
     if !path.is_empty() {
         check_access_path_prefixes_for_process(ctx.process(), &snapshot, dirfd, path.as_str())?;

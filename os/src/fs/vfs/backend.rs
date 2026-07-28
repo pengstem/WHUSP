@@ -284,9 +284,6 @@ pub(crate) trait LegacyFileSystemBackend: Send {
 /// VFS migrates away from the compatibility execution bridge below.
 #[allow(dead_code)]
 pub(crate) trait ConcurrentFileSystemBackend: Send + Sync {
-    #[cfg(feature = "perf-counters")]
-    fn io_snapshot(&self) -> BackendIoSnapshot;
-
     fn root_ino(&self) -> u32;
     fn overlay_real_node(&self, ino: u32) -> Option<VfsNodeId>;
     fn statfs(&self) -> FileSystemStat;
@@ -303,6 +300,16 @@ pub(crate) trait ConcurrentFileSystemBackend: Send + Sync {
         kind: FsNodeKind,
         mode: u32,
         rdev: u64,
+    ) -> FsResult<u32>;
+    fn create_node_with_owner(
+        &self,
+        parent_ino: u32,
+        leaf_name: &str,
+        kind: FsNodeKind,
+        mode: u32,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
     ) -> FsResult<u32>;
     fn create_dir(&self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32>;
     fn link(&self, parent_ino: u32, leaf_name: &str, child_ino: u32) -> FsResult;
@@ -331,6 +338,9 @@ pub(crate) trait ConcurrentFileSystemBackend: Send + Sync {
     fn set_inode_flags(&self, ino: u32, flags: u32) -> FsResult;
     fn retain_inode(&self, ino: u32) -> FsResult;
     fn release_inode(&self, ino: u32) -> FsResult<InodeRelease>;
+    /// Best-effort drop-time release. `None` means that completing the release
+    /// would block and the caller must enqueue it for a later blocking drain.
+    fn try_release_inode(&self, ino: u32) -> Option<FsResult<InodeRelease>>;
     fn assign_cgroup_pid(&self, dir_ino: u32, pid: usize) -> FsResult;
     fn stat(&self, ino: u32) -> FsResult<FileStat>;
     fn stat_basic(&self, ino: u32) -> FsResult<FileStat>;
@@ -347,23 +357,6 @@ pub(crate) trait ConcurrentFileSystemBackend: Send + Sync {
     fn write_at(&self, ino: u32, buf: &[u8], offset: u64) -> usize;
     fn read_dirent64(&self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)>;
     fn list_root_names(&self) -> Vec<String>;
-
-    /// Compatibility bridge for the existing VFS closure call sites. It keeps
-    /// pending-release drain and operation timing inside one legacy lock hold.
-    fn execute_serialized(
-        &self,
-        _op: BackendOp,
-        before_operation: &mut dyn FnMut(&mut dyn LegacyFileSystemBackend),
-        operation: &mut dyn FnMut(&mut dyn LegacyFileSystemBackend),
-    );
-
-    /// Nonblocking variant used only by drop-time inode cleanup.
-    fn try_execute_serialized(
-        &self,
-        op: BackendOp,
-        before_operation: &mut dyn FnMut(&mut dyn LegacyFileSystemBackend),
-        operation: &mut dyn FnMut(&mut dyn LegacyFileSystemBackend),
-    ) -> bool;
 }
 
 pub(crate) struct SerializedBackend {
@@ -377,23 +370,46 @@ impl SerializedBackend {
         }
     }
 
-    #[allow(dead_code)]
     fn call<V>(&self, op: BackendOp, f: impl FnOnce(&mut dyn LegacyFileSystemBackend) -> V) -> V {
-        let mut f = Some(f);
-        let mut result = None;
-        self.execute_serialized(op, &mut |_| {}, &mut |backend| {
-            result = Some(f.take().expect("serialized backend operation called twice")(backend));
-        });
-        result.expect("serialized backend operation was not called")
+        let _ = op;
+        #[cfg(feature = "perf-counters")]
+        let mut backend = {
+            perf::record_backend_op_call(op);
+            match self.state.try_lock() {
+                Some(backend) => backend,
+                None => {
+                    perf::record_mount_backend_contended_acquisition();
+                    perf::record_backend_op_contended(op);
+                    let wait_scope =
+                        perf::time_scope(perf::ProfilePoint::MountBackendContendedWait);
+                    let op_wait_scope = perf::time_backend_op_wait(op);
+                    let backend = self.state.lock();
+                    drop(op_wait_scope);
+                    drop(wait_scope);
+                    backend
+                }
+            }
+        };
+        #[cfg(not(feature = "perf-counters"))]
+        let mut backend = self.state.lock();
+        let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
+        #[cfg(feature = "perf-counters")]
+        let io_before = backend.io_snapshot();
+        #[cfg(feature = "perf-counters")]
+        let op_hold_scope = perf::time_backend_op_hold(op);
+        let result = f(&mut **backend);
+        #[cfg(feature = "perf-counters")]
+        {
+            drop(op_hold_scope);
+            perf::record_backend_op_io(op, backend.io_snapshot().delta_since(io_before));
+        }
+        drop(backend);
+        drop(hold_scope);
+        result
     }
 }
 
 impl ConcurrentFileSystemBackend for SerializedBackend {
-    #[cfg(feature = "perf-counters")]
-    fn io_snapshot(&self) -> BackendIoSnapshot {
-        self.state.lock().io_snapshot()
-    }
-
     fn root_ino(&self) -> u32 {
         self.call(BackendOp::Lookup, |backend| backend.root_ino())
     }
@@ -432,6 +448,30 @@ impl ConcurrentFileSystemBackend for SerializedBackend {
     ) -> FsResult<u32> {
         self.call(BackendOp::NamespaceMutation, |backend| {
             backend.create_node(parent_ino, leaf_name, kind, mode, rdev)
+        })
+    }
+
+    fn create_node_with_owner(
+        &self,
+        parent_ino: u32,
+        leaf_name: &str,
+        kind: FsNodeKind,
+        mode: u32,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
+    ) -> FsResult<u32> {
+        self.call(BackendOp::NamespaceMutation, |backend| {
+            let parent_stat = backend.stat(parent_ino)?;
+            let ino = backend.create_node(parent_ino, leaf_name, kind, mode, rdev)?;
+            let gid = if parent_stat.mode & 0o2000 != 0 {
+                parent_stat.gid
+            } else {
+                gid
+            };
+            backend.set_owner(ino, Some(uid), Some(gid))?;
+            backend.set_mode(ino, mode)?;
+            Ok(ino)
         })
     }
 
@@ -561,6 +601,29 @@ impl ConcurrentFileSystemBackend for SerializedBackend {
         })
     }
 
+    fn try_release_inode(&self, ino: u32) -> Option<FsResult<InodeRelease>> {
+        let mut backend = self.state.try_lock()?;
+        #[cfg(feature = "perf-counters")]
+        {
+            perf::record_backend_op_call(BackendOp::InodeLifetime);
+            perf::record_backend_try_successful_call();
+        }
+        #[cfg(feature = "perf-counters")]
+        let io_before = backend.io_snapshot();
+        #[cfg(feature = "perf-counters")]
+        let op_hold_scope = perf::time_backend_op_hold(BackendOp::InodeLifetime);
+        let result = backend.release_inode(ino);
+        #[cfg(feature = "perf-counters")]
+        {
+            drop(op_hold_scope);
+            perf::record_backend_op_io(
+                BackendOp::InodeLifetime,
+                backend.io_snapshot().delta_since(io_before),
+            );
+        }
+        Some(result)
+    }
+
     fn assign_cgroup_pid(&self, dir_ino: u32, pid: usize) -> FsResult {
         self.call(BackendOp::NamespaceMutation, |backend| {
             backend.assign_cgroup_pid(dir_ino, pid)
@@ -622,75 +685,5 @@ impl ConcurrentFileSystemBackend for SerializedBackend {
 
     fn list_root_names(&self) -> Vec<String> {
         self.call(BackendOp::Readdir, |backend| backend.list_root_names())
-    }
-
-    fn execute_serialized(
-        &self,
-        _op: BackendOp,
-        before_operation: &mut dyn FnMut(&mut dyn LegacyFileSystemBackend),
-        operation: &mut dyn FnMut(&mut dyn LegacyFileSystemBackend),
-    ) {
-        #[cfg(feature = "perf-counters")]
-        let mut backend = {
-            perf::record_backend_op_call(_op);
-            match self.state.try_lock() {
-                Some(backend) => backend,
-                None => {
-                    perf::record_mount_backend_contended_acquisition();
-                    perf::record_backend_op_contended(_op);
-                    let wait_scope =
-                        perf::time_scope(perf::ProfilePoint::MountBackendContendedWait);
-                    let op_wait_scope = perf::time_backend_op_wait(_op);
-                    let backend = self.state.lock();
-                    drop(op_wait_scope);
-                    drop(wait_scope);
-                    backend
-                }
-            }
-        };
-        #[cfg(not(feature = "perf-counters"))]
-        let mut backend = self.state.lock();
-        let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
-        before_operation(&mut **backend);
-        #[cfg(feature = "perf-counters")]
-        let io_before = backend.io_snapshot();
-        #[cfg(feature = "perf-counters")]
-        let op_hold_scope = perf::time_backend_op_hold(_op);
-        operation(&mut **backend);
-        #[cfg(feature = "perf-counters")]
-        {
-            drop(op_hold_scope);
-            perf::record_backend_op_io(_op, backend.io_snapshot().delta_since(io_before));
-        }
-        drop(backend);
-        drop(hold_scope);
-    }
-
-    fn try_execute_serialized(
-        &self,
-        _op: BackendOp,
-        before_operation: &mut dyn FnMut(&mut dyn LegacyFileSystemBackend),
-        operation: &mut dyn FnMut(&mut dyn LegacyFileSystemBackend),
-    ) -> bool {
-        let Some(mut backend) = self.state.try_lock() else {
-            return false;
-        };
-        #[cfg(feature = "perf-counters")]
-        {
-            perf::record_backend_op_call(_op);
-            perf::record_backend_try_successful_call();
-        }
-        before_operation(&mut **backend);
-        #[cfg(feature = "perf-counters")]
-        let io_before = backend.io_snapshot();
-        #[cfg(feature = "perf-counters")]
-        let op_hold_scope = perf::time_backend_op_hold(_op);
-        operation(&mut **backend);
-        #[cfg(feature = "perf-counters")]
-        {
-            drop(op_hold_scope);
-            perf::record_backend_op_io(_op, backend.io_snapshot().delta_since(io_before));
-        }
-        true
     }
 }

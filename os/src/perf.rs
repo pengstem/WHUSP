@@ -857,7 +857,6 @@ mod enabled {
         timer: PendingReleaseTimer,
         entries: usize,
         released: usize,
-        io: BackendIoSnapshot,
     ) {
         let elapsed_ticks = crate::timer::get_time().wrapping_sub(timer.start_ticks);
         PENDING_RELEASE_DRAIN_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -865,7 +864,6 @@ mod enabled {
         PENDING_RELEASE_DRAIN_RELEASED.fetch_add(released, Ordering::Relaxed);
         PENDING_RELEASE_DRAIN_TICKS.fetch_add(elapsed_ticks, Ordering::Relaxed);
         update_max(&PENDING_RELEASE_DRAIN_MAX_TICKS, elapsed_ticks);
-        BACKEND_LOCK_HELD_METADATA_IO.record(io);
     }
 
     pub(crate) fn record_backend_op_call(op: BackendOp) {

@@ -5,12 +5,14 @@ use super::dirent::{
 #[cfg(feature = "perf-counters")]
 use super::vfs::BackendIoSnapshot;
 use super::vfs::{
-    BackendReadPlan, FileSystemStat, FsError, FsNodeKind, FsResult, InodeRelease,
-    LegacyFileSystemBackend,
+    BackendOp, BackendReadPlan, ConcurrentFileSystemBackend, FileSystemStat, FsError, FsNodeKind,
+    FsResult, InodeRelease, LegacyFileSystemBackend,
 };
 use super::{FS_STATX_ATTR_FLAGS, FileStat, FileTimestamp};
+use crate::config::MAX_CPUS;
 use crate::drivers::block::VirtIOBlock;
 use crate::perf;
+use crate::sync::{SleepMutex, SleepRwLock};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -115,6 +117,7 @@ impl Ext4BlockDevice for KernelDisk {
 type KernelExt4Fs = Ext4Filesystem<KernelHal, KernelDisk>;
 
 const EXT4_CONFIG: FsConfig = FsConfig { bcache_size: 256 };
+const EXT4_INODE_RUNTIME_SHARDS: usize = 32;
 // lwext4_rust::ffi does not export ENAMETOOLONG; define it locally.
 const ENAMETOOLONG: u32 = 36;
 
@@ -170,7 +173,7 @@ pub(super) struct Ext4Mount {
     device: Arc<VirtIOBlock>,
     #[cfg(feature = "perf-counters")]
     io_counters: Arc<Ext4IoCounters>,
-    inode_runtime: BTreeMap<u32, Ext4InodeRuntimeState>,
+    inode_runtime: Arc<Ext4InodeRuntimeTable>,
 }
 
 #[derive(Default)]
@@ -180,15 +183,111 @@ struct Ext4InodeRuntimeState {
     special_rdev: Option<u64>,
 }
 
+struct Ext4InodeRuntimeTable {
+    shards: Vec<SleepMutex<BTreeMap<u32, Ext4InodeRuntimeState>>>,
+}
+
+impl Ext4InodeRuntimeTable {
+    fn new() -> Self {
+        Self {
+            shards: (0..EXT4_INODE_RUNTIME_SHARDS)
+                .map(|_| SleepMutex::new(BTreeMap::new()))
+                .collect(),
+        }
+    }
+
+    #[inline]
+    fn shard(&self, ino: u32) -> &SleepMutex<BTreeMap<u32, Ext4InodeRuntimeState>> {
+        let ino = ino as usize;
+        &self.shards[(ino ^ (ino >> 5)) % self.shards.len()]
+    }
+
+    fn special_rdev(&self, ino: u32) -> Option<u64> {
+        self.shard(ino)
+            .lock()
+            .get(&ino)
+            .and_then(|state| state.special_rdev)
+    }
+
+    fn set_special_rdev(&self, ino: u32, rdev: u64) {
+        self.shard(ino).lock().entry(ino).or_default().special_rdev = Some(rdev);
+    }
+
+    fn has_open_reference(&self, ino: u32) -> bool {
+        self.shard(ino)
+            .lock()
+            .get(&ino)
+            .is_some_and(|state| state.open_count > 0)
+    }
+
+    fn mark_pending_unlink(&self, ino: u32) {
+        self.shard(ino)
+            .lock()
+            .entry(ino)
+            .or_default()
+            .pending_unlink = true;
+    }
+
+    fn remove(&self, ino: u32) {
+        self.shard(ino).lock().remove(&ino);
+    }
+
+    fn retain(&self, ino: u32) {
+        self.shard(ino).lock().entry(ino).or_default().open_count += 1;
+    }
+
+    fn prepare_release(&self, ino: u32) -> Ext4RuntimeRelease {
+        let mut runtime = self.shard(ino).lock();
+        prepare_runtime_release_locked(&mut runtime, ino)
+    }
+
+    fn try_prepare_release(&self, ino: u32) -> Option<Ext4RuntimeRelease> {
+        let mut runtime = self.shard(ino).try_lock()?;
+        Some(prepare_runtime_release_locked(&mut runtime, ino))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Ext4RuntimeRelease {
+    Retained,
+    FreeUnlinked,
+}
+
+fn prepare_runtime_release_locked(
+    runtime: &mut BTreeMap<u32, Ext4InodeRuntimeState>,
+    ino: u32,
+) -> Ext4RuntimeRelease {
+    let Some(state) = runtime.get_mut(&ino) else {
+        return Ext4RuntimeRelease::Retained;
+    };
+    if state.open_count > 1 {
+        state.open_count -= 1;
+        return Ext4RuntimeRelease::Retained;
+    }
+    if state.open_count == 1 {
+        state.open_count = 0;
+    }
+    if state.pending_unlink {
+        // Keep the record until the physical free succeeds. A failed
+        // drop-time try can then be retried from the per-mount release queue.
+        return Ext4RuntimeRelease::FreeUnlinked;
+    }
+    if state.special_rdev.is_none() {
+        runtime.remove(&ino);
+    }
+    Ext4RuntimeRelease::Retained
+}
+
 // SAFETY: the FFI core and its raw pointers move only as one `Ext4Mount`.
-// Every dereference happens behind `SerializedBackend.state`; the core itself
-// is intentionally not `Sync` and must never be entered by two callers.
+// Every dereference happens behind the owning read or writer core mutex; the
+// core itself is intentionally not `Sync` and must never have two callers.
 unsafe impl Send for Ext4Mount {}
 
 impl Ext4Mount {
     pub(super) fn open(device: Arc<VirtIOBlock>) -> Result<Self, Ext4Error> {
         #[cfg(feature = "perf-counters")]
         let io_counters = Arc::new(Ext4IoCounters::default());
+        let inode_runtime = Arc::new(Ext4InodeRuntimeTable::new());
         Ok(Self {
             fs: KernelExt4Fs::new(
                 KernelDisk {
@@ -201,8 +300,41 @@ impl Ext4Mount {
             device,
             #[cfg(feature = "perf-counters")]
             io_counters,
-            inode_runtime: BTreeMap::new(),
+            inode_runtime,
         })
+    }
+
+    pub(super) fn open_read_replica(&self) -> Result<Self, Ext4Error> {
+        #[cfg(feature = "perf-counters")]
+        let io_counters = Arc::new(Ext4IoCounters::default());
+        Ok(Self {
+            fs: KernelExt4Fs::new_read_only(
+                KernelDisk {
+                    dev: self.device.clone(),
+                    #[cfg(feature = "perf-counters")]
+                    io_counters: io_counters.clone(),
+                },
+                EXT4_CONFIG,
+            )?,
+            device: self.device.clone(),
+            #[cfg(feature = "perf-counters")]
+            io_counters,
+            inode_runtime: self.inode_runtime.clone(),
+        })
+    }
+
+    pub(super) fn invalidate_read_cache(&mut self) {
+        self.fs.invalidate_clean_cache();
+    }
+
+    fn flush_for_replica_visibility(&mut self) -> FsResult {
+        self.fs.flush().map_err(map_ext4_error)
+    }
+
+    fn free_unlinked_inode(&mut self, ino: u32) -> FsResult<InodeRelease> {
+        self.fs.free_unlinked_inode(ino).map_err(map_ext4_error)?;
+        self.inode_runtime.remove(ino);
+        Ok(InodeRelease::Freed)
     }
 
     fn stat_from_attr(
@@ -219,11 +351,7 @@ impl Ext4Mount {
             nlink: attr.nlink as u32,
             uid: attr.uid,
             gid: attr.gid,
-            rdev: self
-                .inode_runtime
-                .get(&ino)
-                .and_then(|state| state.special_rdev)
-                .unwrap_or(0),
+            rdev: self.inode_runtime.special_rdev(ino).unwrap_or(0),
             inode_flags,
             inode_flags_supported,
             size: attr.size,
@@ -238,6 +366,222 @@ impl Ext4Mount {
             ctime_sec: attr.ctime.as_secs(),
             ctime_nsec: attr.ctime.subsec_nanos(),
         }
+    }
+}
+
+/// One writable lwext4 core plus inode-sharded read-only replicas.
+///
+/// Each C core owns its raw pointers and bcache and is entered by one task at a
+/// time. The lifecycle lock admits concurrent readers but excludes all of them
+/// around a mutation. A successful or partially-completed mutation flushes the
+/// writer and invalidates every clean replica cache before readers are admitted
+/// again, so replicas never publish metadata from an older disk generation.
+pub(super) struct ConcurrentExt4Backend {
+    lifecycle: SleepRwLock<()>,
+    writer: SleepMutex<Ext4Mount>,
+    readers: Vec<SleepMutex<Ext4Mount>>,
+    inode_runtime: Arc<Ext4InodeRuntimeTable>,
+}
+
+impl ConcurrentExt4Backend {
+    pub(super) fn open(device: Arc<VirtIOBlock>) -> Result<Self, Ext4Error> {
+        let writer = Ext4Mount::open(device)?;
+        let mut readers = Vec::with_capacity(MAX_CPUS);
+        for _ in 0..MAX_CPUS {
+            let reader = writer.open_read_replica()?;
+            readers.push(SleepMutex::new(reader));
+        }
+        let inode_runtime = writer.inode_runtime.clone();
+        Ok(Self {
+            lifecycle: SleepRwLock::new(()),
+            writer: SleepMutex::new(writer),
+            readers,
+            inode_runtime,
+        })
+    }
+
+    #[inline]
+    fn reader_start(&self) -> usize {
+        crate::cpu::current_id() % self.readers.len()
+    }
+
+    fn with_reader<V>(&self, op: BackendOp, _ino: u32, f: impl FnOnce(&mut Ext4Mount) -> V) -> V {
+        let _ = op;
+        #[cfg(feature = "perf-counters")]
+        perf::record_backend_op_call(op);
+        let lifecycle = match self.lifecycle.try_read() {
+            Some(guard) => guard,
+            None => {
+                #[cfg(feature = "perf-counters")]
+                {
+                    perf::record_mount_backend_contended_acquisition();
+                    perf::record_backend_op_contended(op);
+                }
+                let wait_scope = perf::time_scope(perf::ProfilePoint::MountBackendContendedWait);
+                #[cfg(feature = "perf-counters")]
+                let op_wait_scope = perf::time_backend_op_wait(op);
+                let guard = self.lifecycle.read();
+                #[cfg(feature = "perf-counters")]
+                drop(op_wait_scope);
+                drop(wait_scope);
+                guard
+            }
+        };
+        let start = self.reader_start();
+        let mut available = None;
+        for offset in 0..self.readers.len() {
+            let index = (start + offset) % self.readers.len();
+            if let Some(reader) = self.readers[index].try_lock() {
+                available = Some(reader);
+                break;
+            }
+        }
+        let mut reader = match available {
+            Some(reader) => reader,
+            None => {
+                #[cfg(feature = "perf-counters")]
+                {
+                    perf::record_mount_backend_contended_acquisition();
+                    perf::record_backend_op_contended(op);
+                }
+                let wait_scope = perf::time_scope(perf::ProfilePoint::MountBackendContendedWait);
+                #[cfg(feature = "perf-counters")]
+                let op_wait_scope = perf::time_backend_op_wait(op);
+                let guard = self.readers[start].lock();
+                #[cfg(feature = "perf-counters")]
+                drop(op_wait_scope);
+                drop(wait_scope);
+                guard
+            }
+        };
+        let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
+        #[cfg(feature = "perf-counters")]
+        let io_before = reader.io_counters.snapshot();
+        #[cfg(feature = "perf-counters")]
+        let op_hold_scope = perf::time_backend_op_hold(op);
+        let result = f(&mut reader);
+        #[cfg(feature = "perf-counters")]
+        {
+            drop(op_hold_scope);
+            perf::record_backend_op_io(op, reader.io_counters.snapshot().delta_since(io_before));
+        }
+        drop(reader);
+        drop(lifecycle);
+        drop(hold_scope);
+        result
+    }
+
+    fn with_writer_read<V>(&self, op: BackendOp, f: impl FnOnce(&mut Ext4Mount) -> V) -> V {
+        let _ = op;
+        let _lifecycle = self.lifecycle.read();
+        let mut writer = self.writer.lock();
+        #[cfg(feature = "perf-counters")]
+        perf::record_backend_op_call(op);
+        let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
+        #[cfg(feature = "perf-counters")]
+        let io_before = writer.io_counters.snapshot();
+        #[cfg(feature = "perf-counters")]
+        let op_hold_scope = perf::time_backend_op_hold(op);
+        let result = f(&mut writer);
+        #[cfg(feature = "perf-counters")]
+        {
+            drop(op_hold_scope);
+            perf::record_backend_op_io(op, writer.io_counters.snapshot().delta_since(io_before));
+        }
+        drop(writer);
+        drop(hold_scope);
+        result
+    }
+
+    fn with_writer<V>(&self, op: BackendOp, f: impl FnOnce(&mut Ext4Mount) -> V) -> (V, FsResult) {
+        let _ = op;
+        #[cfg(feature = "perf-counters")]
+        perf::record_backend_op_call(op);
+        let lifecycle = match self.lifecycle.try_write() {
+            Some(guard) => guard,
+            None => {
+                #[cfg(feature = "perf-counters")]
+                {
+                    perf::record_mount_backend_contended_acquisition();
+                    perf::record_backend_op_contended(op);
+                }
+                let wait_scope = perf::time_scope(perf::ProfilePoint::MountBackendContendedWait);
+                #[cfg(feature = "perf-counters")]
+                let op_wait_scope = perf::time_backend_op_wait(op);
+                let guard = self.lifecycle.write();
+                #[cfg(feature = "perf-counters")]
+                drop(op_wait_scope);
+                drop(wait_scope);
+                guard
+            }
+        };
+        let mut writer = self.writer.lock();
+        let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
+        #[cfg(feature = "perf-counters")]
+        let io_before = writer.io_counters.snapshot();
+        #[cfg(feature = "perf-counters")]
+        let op_hold_scope = perf::time_backend_op_hold(op);
+        let result = f(&mut writer);
+        let visible = writer.flush_for_replica_visibility();
+        for reader in &self.readers {
+            reader.lock().invalidate_read_cache();
+        }
+        #[cfg(feature = "perf-counters")]
+        {
+            drop(op_hold_scope);
+            perf::record_backend_op_io(op, writer.io_counters.snapshot().delta_since(io_before));
+        }
+        drop(writer);
+        drop(lifecycle);
+        drop(hold_scope);
+        (result, visible)
+    }
+
+    fn mutate<T>(
+        &self,
+        op: BackendOp,
+        f: impl FnOnce(&mut Ext4Mount) -> FsResult<T>,
+    ) -> FsResult<T> {
+        let (result, visible) = self.with_writer(op, f);
+        match result {
+            Ok(value) => visible.map(|()| value),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn try_mutate<T>(
+        &self,
+        op: BackendOp,
+        f: impl FnOnce(&mut Ext4Mount) -> FsResult<T>,
+    ) -> Option<FsResult<T>> {
+        let _ = op;
+        let lifecycle = self.lifecycle.try_write()?;
+        let mut writer = self.writer.try_lock()?;
+        #[cfg(feature = "perf-counters")]
+        {
+            perf::record_backend_op_call(op);
+            perf::record_backend_try_successful_call();
+        }
+        #[cfg(feature = "perf-counters")]
+        let io_before = writer.io_counters.snapshot();
+        #[cfg(feature = "perf-counters")]
+        let op_hold_scope = perf::time_backend_op_hold(op);
+        let result = f(&mut writer);
+        let visible = writer.flush_for_replica_visibility();
+        for reader in &self.readers {
+            reader.lock().invalidate_read_cache();
+        }
+        #[cfg(feature = "perf-counters")]
+        {
+            drop(op_hold_scope);
+            perf::record_backend_op_io(op, writer.io_counters.snapshot().delta_since(io_before));
+        }
+        drop(writer);
+        drop(lifecycle);
+        Some(match result {
+            Ok(value) => visible.map(|()| value),
+            Err(err) => Err(err),
+        })
     }
 }
 
@@ -355,7 +699,7 @@ impl LegacyFileSystemBackend for Ext4Mount {
             // types, but it does not yet expose persistent device major/minor
             // payloads. Keep runtime-created rdevs for stat/statx until the
             // wrapper can read/write the on-disk special inode fields.
-            self.inode_runtime.entry(ino).or_default().special_rdev = Some(rdev);
+            self.inode_runtime.set_special_rdev(ino, rdev);
         }
         Ok(ino)
     }
@@ -392,10 +736,7 @@ impl LegacyFileSystemBackend for Ext4Mount {
             .lookup(parent_ino, leaf_name)
             .map_err(map_ext4_error)?;
         let child_ino = lookup.entry().ino();
-        let defer_free = self
-            .inode_runtime
-            .get(&child_ino)
-            .is_some_and(|state| state.open_count > 0);
+        let defer_free = self.inode_runtime.has_open_reference(child_ino);
         drop(lookup);
 
         // UNFINISHED: Linux also keeps opened directories alive across unlink.
@@ -411,12 +752,12 @@ impl LegacyFileSystemBackend for Ext4Mount {
                 .map_err(map_ext4_error)?;
             let mut attr = lwext4_rust::FileAttr::default();
             if self.fs.get_attr(child_ino, &mut attr).is_err() {
-                self.inode_runtime.remove(&child_ino);
+                self.inode_runtime.remove(child_ino);
             }
             None
         };
         if let Some(ino) = deferred {
-            self.inode_runtime.entry(ino).or_default().pending_unlink = true;
+            self.inode_runtime.mark_pending_unlink(ino);
         }
         Ok(())
     }
@@ -496,38 +837,16 @@ impl LegacyFileSystemBackend for Ext4Mount {
         // existence here so stale VfsNodeId values do not create open counts.
         let mut attr = lwext4_rust::FileAttr::default();
         self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
-        self.inode_runtime.entry(ino).or_default().open_count += 1;
+        self.inode_runtime.retain(ino);
         Ok(())
     }
 
     fn release_inode(&mut self, ino: u32) -> FsResult<InodeRelease> {
-        let Some(state) = self.inode_runtime.get(&ino) else {
-            return Ok(InodeRelease::Retained);
-        };
-        if state.open_count == 0 {
-            return Ok(InodeRelease::Retained);
-        }
-        if state.open_count > 1 {
-            self.inode_runtime
-                .get_mut(&ino)
-                .expect("ext4 inode runtime state disappeared")
-                .open_count -= 1;
-            return Ok(InodeRelease::Retained);
-        }
-        // The final open reference is the point where an unlinked-but-open
-        // inode can be physically freed from the ext4 backend.
-        if state.pending_unlink {
-            self.fs.free_unlinked_inode(ino).map_err(map_ext4_error)?;
-            self.inode_runtime.remove(&ino);
-            return Ok(InodeRelease::Freed);
-        }
-        let state = self
-            .inode_runtime
-            .get_mut(&ino)
-            .expect("ext4 inode runtime state disappeared");
-        state.open_count = 0;
-        if state.special_rdev.is_none() {
-            self.inode_runtime.remove(&ino);
+        if self.inode_runtime.prepare_release(ino) == Ext4RuntimeRelease::FreeUnlinked {
+            // The final open reference is the point where an unlinked-but-open
+            // inode can be physically freed from the ext4 backend. Do not
+            // retain the Rust runtime lock across metadata or device I/O.
+            return self.free_unlinked_inode(ino);
         }
         Ok(InodeRelease::Retained)
     }
@@ -708,5 +1027,270 @@ impl LegacyFileSystemBackend for Ext4Mount {
             reader.step().expect("failed to advance ext4 dir iterator");
         }
         names
+    }
+}
+
+impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
+    fn root_ino(&self) -> u32 {
+        EXT4_ROOT_INO
+    }
+
+    fn overlay_real_node(&self, _ino: u32) -> Option<super::vfs::VfsNodeId> {
+        None
+    }
+
+    fn statfs(&self) -> FileSystemStat {
+        self.with_writer_read(BackendOp::StatFull, |writer| writer.statfs())
+    }
+
+    fn lookup_component_from(
+        &self,
+        parent_ino: u32,
+        component: &str,
+    ) -> FsResult<(u32, FsNodeKind)> {
+        self.with_reader(BackendOp::Lookup, parent_ino, |reader| {
+            reader.lookup_component_from(parent_ino, component)
+        })
+    }
+
+    fn create_node_with_owner(
+        &self,
+        parent_ino: u32,
+        leaf_name: &str,
+        kind: FsNodeKind,
+        mode: u32,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
+    ) -> FsResult<u32> {
+        self.mutate(BackendOp::NamespaceMutation, |writer| {
+            let parent_stat = writer.stat(parent_ino)?;
+            let ino = writer.create_node(parent_ino, leaf_name, kind, mode, rdev)?;
+            let gid = if parent_stat.mode & 0o2000 != 0 {
+                parent_stat.gid
+            } else {
+                gid
+            };
+            writer.set_owner(ino, Some(uid), Some(gid))?;
+            writer.set_mode(ino, mode)?;
+            Ok(ino)
+        })
+    }
+
+    fn create_file(&self, parent_ino: u32, leaf_name: &str) -> FsResult<u32> {
+        self.mutate(BackendOp::NamespaceMutation, |writer| {
+            writer.create_file(parent_ino, leaf_name)
+        })
+    }
+
+    fn create_node(
+        &self,
+        parent_ino: u32,
+        leaf_name: &str,
+        kind: FsNodeKind,
+        mode: u32,
+        rdev: u64,
+    ) -> FsResult<u32> {
+        self.mutate(BackendOp::NamespaceMutation, |writer| {
+            writer.create_node(parent_ino, leaf_name, kind, mode, rdev)
+        })
+    }
+
+    fn create_dir(&self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32> {
+        self.mutate(BackendOp::NamespaceMutation, |writer| {
+            writer.create_dir(parent_ino, leaf_name, mode)
+        })
+    }
+
+    fn link(&self, parent_ino: u32, leaf_name: &str, child_ino: u32) -> FsResult {
+        self.mutate(BackendOp::NamespaceMutation, |writer| {
+            writer.link(parent_ino, leaf_name, child_ino)
+        })
+    }
+
+    fn symlink(&self, parent_ino: u32, leaf_name: &str, target: &[u8]) -> FsResult {
+        self.mutate(BackendOp::NamespaceMutation, |writer| {
+            writer.symlink(parent_ino, leaf_name, target)
+        })
+    }
+
+    fn unlink(&self, parent_ino: u32, leaf_name: &str) -> FsResult {
+        self.mutate(BackendOp::NamespaceMutation, |writer| {
+            writer.unlink(parent_ino, leaf_name)
+        })
+    }
+
+    fn rename(&self, src_dir: u32, src_name: &str, dst_dir: u32, dst_name: &str) -> FsResult {
+        self.mutate(BackendOp::NamespaceMutation, |writer| {
+            writer.rename(src_dir, src_name, dst_dir, dst_name)
+        })
+    }
+
+    fn exchange(&self, src_dir: u32, src_name: &str, dst_dir: u32, dst_name: &str) -> FsResult {
+        self.mutate(BackendOp::NamespaceMutation, |writer| {
+            writer.exchange(src_dir, src_name, dst_dir, dst_name)
+        })
+    }
+
+    fn check_write_at(&self, _ino: u32, _offset: u64, _len: usize) -> FsResult {
+        Ok(())
+    }
+
+    fn check_set_len(&self, _ino: u32, _len: u64) -> FsResult {
+        Ok(())
+    }
+
+    fn set_len(&self, ino: u32, len: u64) -> FsResult {
+        self.mutate(BackendOp::TruncateAllocate, |writer| {
+            writer.set_len(ino, len)
+        })
+    }
+
+    fn allocate_range(&self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
+        self.mutate(BackendOp::TruncateAllocate, |writer| {
+            writer.allocate_range(ino, offset, len, keep_size)
+        })
+    }
+
+    fn zero_range(&self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
+        self.mutate(BackendOp::TruncateAllocate, |writer| {
+            writer.zero_range(ino, offset, len, keep_size)
+        })
+    }
+
+    fn punch_hole(&self, ino: u32, offset: u64, len: u64) -> FsResult {
+        self.mutate(BackendOp::TruncateAllocate, |writer| {
+            writer.punch_hole(ino, offset, len)
+        })
+    }
+
+    fn sync(&self, ino: u32, data_only: bool) -> FsResult {
+        self.mutate(BackendOp::Sync, |writer| writer.sync(ino, data_only))
+    }
+
+    fn shutdown(&self) -> FsResult {
+        self.mutate(BackendOp::Sync, |writer| writer.shutdown())
+    }
+
+    fn set_times(
+        &self,
+        ino: u32,
+        atime: Option<FileTimestamp>,
+        mtime: Option<FileTimestamp>,
+        ctime: FileTimestamp,
+    ) -> FsResult {
+        self.mutate(BackendOp::NamespaceMutation, |writer| {
+            writer.set_times(ino, atime, mtime, ctime)
+        })
+    }
+
+    fn set_mode(&self, ino: u32, mode: u32) -> FsResult {
+        self.mutate(BackendOp::NamespaceMutation, |writer| {
+            writer.set_mode(ino, mode)
+        })
+    }
+
+    fn set_owner(&self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
+        self.mutate(BackendOp::NamespaceMutation, |writer| {
+            writer.set_owner(ino, uid, gid)
+        })
+    }
+
+    fn inode_flags(&self, ino: u32) -> FsResult<u32> {
+        self.with_reader(BackendOp::StatFull, ino, |reader| reader.inode_flags(ino))
+    }
+
+    fn set_inode_flags(&self, ino: u32, flags: u32) -> FsResult {
+        self.mutate(BackendOp::NamespaceMutation, |writer| {
+            writer.set_inode_flags(ino, flags)
+        })
+    }
+
+    fn retain_inode(&self, ino: u32) -> FsResult {
+        self.with_reader(BackendOp::InodeLifetime, ino, |reader| {
+            reader.retain_inode(ino)
+        })
+    }
+
+    fn release_inode(&self, ino: u32) -> FsResult<InodeRelease> {
+        if self.inode_runtime.prepare_release(ino) == Ext4RuntimeRelease::Retained {
+            return Ok(InodeRelease::Retained);
+        }
+        self.mutate(BackendOp::InodeLifetime, |writer| {
+            writer.free_unlinked_inode(ino)
+        })
+    }
+
+    fn try_release_inode(&self, ino: u32) -> Option<FsResult<InodeRelease>> {
+        if self.inode_runtime.try_prepare_release(ino)? == Ext4RuntimeRelease::Retained {
+            #[cfg(feature = "perf-counters")]
+            {
+                perf::record_backend_op_call(BackendOp::InodeLifetime);
+                perf::record_backend_try_successful_call();
+            }
+            return Some(Ok(InodeRelease::Retained));
+        }
+        self.try_mutate(BackendOp::InodeLifetime, |writer| {
+            writer.free_unlinked_inode(ino)
+        })
+    }
+
+    fn assign_cgroup_pid(&self, _dir_ino: u32, _pid: usize) -> FsResult {
+        Err(FsError::InvalidInput)
+    }
+
+    fn stat(&self, ino: u32) -> FsResult<FileStat> {
+        self.with_reader(BackendOp::StatFull, ino, |reader| reader.stat(ino))
+    }
+
+    fn stat_basic(&self, ino: u32) -> FsResult<FileStat> {
+        self.with_reader(BackendOp::StatBasic, ino, |reader| reader.stat_basic(ino))
+    }
+
+    fn readlink(&self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
+        self.with_reader(BackendOp::Readlink, ino, |reader| reader.readlink(ino, buf))
+    }
+
+    fn supports_read_snapshot(&self, _ino: u32) -> bool {
+        false
+    }
+
+    fn read_snapshot(&self, _ino: u32) -> Option<FsResult<Vec<u8>>> {
+        None
+    }
+
+    fn prepare_read_plan(
+        &self,
+        ino: u32,
+        offset: u64,
+        len: usize,
+    ) -> Option<Box<dyn BackendReadPlan>> {
+        self.with_reader(BackendOp::ReadPlan, ino, |reader| {
+            reader.prepare_read_plan(ino, offset, len)
+        })
+    }
+
+    fn read_at(&self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
+        self.with_reader(BackendOp::ReadFallback, ino, |reader| {
+            reader.read_at(ino, buf, offset)
+        })
+    }
+
+    fn write_at(&self, ino: u32, buf: &[u8], offset: u64) -> usize {
+        let (written, visible) =
+            self.with_writer(BackendOp::Write, |writer| writer.write_at(ino, buf, offset));
+        if visible.is_ok() { written } else { 0 }
+    }
+
+    fn read_dirent64(&self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
+        self.with_reader(BackendOp::Readdir, ino, |reader| {
+            reader.read_dirent64(ino, offset, buf)
+        })
+    }
+
+    fn list_root_names(&self) -> Vec<String> {
+        self.with_reader(BackendOp::Readdir, EXT4_ROOT_INO, |reader| {
+            reader.list_root_names()
+        })
     }
 }

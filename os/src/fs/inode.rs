@@ -114,7 +114,6 @@ fn has_trailing_slash(name: &str) -> bool {
 }
 
 const MODE_PERMISSIONS_MASK: u32 = 0o7777;
-const MODE_SETGID: u32 = 0o2000;
 
 fn validate_rename_path(name: &str) -> FsResult {
     match final_component(name) {
@@ -249,22 +248,15 @@ pub(crate) fn create_node_in(
             target.parent.mount_id,
             BackendOp::NamespaceMutation,
             |mount| {
-                let parent_stat = mount.stat(target.parent.ino)?;
-                let ino = mount.create_node(
+                mount.create_node_with_owner(
                     target.parent.ino,
                     target.leaf_name,
                     kind,
                     mode & MODE_PERMISSIONS_MASK,
                     rdev,
-                )?;
-                let gid = if parent_stat.mode & MODE_SETGID != 0 {
-                    parent_stat.gid
-                } else {
-                    gid
-                };
-                mount.set_owner(ino, Some(uid), Some(gid))?;
-                mount.set_mode(ino, mode & MODE_PERMISSIONS_MASK)?;
-                Ok(ino)
+                    uid,
+                    gid,
+                )
             },
         )
         .ok_or(FsError::Io)??;

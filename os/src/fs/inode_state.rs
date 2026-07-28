@@ -1,6 +1,6 @@
 use super::{FileStat, MountNamespaceId, WorkingDir, vfs::VfsNodeId};
 use crate::config::MAX_CPUS;
-use crate::sync::{SleepRwLock, SleepRwLockWriteGuard, UPIntrFreeCell};
+use crate::sync::{SleepRwLock, SleepRwLockWriteGuard, SpinRwLock};
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -59,8 +59,13 @@ impl InodeStateShard {
 }
 
 lazy_static! {
-    static ref SHARDS: Vec<UPIntrFreeCell<InodeStateShard>> = (0..INODE_STATE_SHARDS)
-        .map(|_| unsafe { UPIntrFreeCell::new(InodeStateShard::new()) })
+    // These shards are shared by tasks running on different CPUs. Merely
+    // masking local interrupts (UPIntrFreeCell) does not serialize SMP access
+    // and allowed concurrent BTreeMap mutation to manufacture multiple states
+    // for one inode. Keep the table critical section short and SMP-safe; all
+    // sleeping per-inode work remains below the Arc returned from the shard.
+    static ref SHARDS: Vec<SpinRwLock<InodeStateShard>> = (0..INODE_STATE_SHARDS)
+        .map(|_| SpinRwLock::new(InodeStateShard::new()))
         .collect();
     static ref DIRECT_STAT_CACHES: Vec<DirectStatCpuCache> =
         (0..MAX_CPUS).map(|_| DirectStatCpuCache::new()).collect();
@@ -299,7 +304,11 @@ fn shard_index(node: VfsNodeId) -> usize {
 }
 
 pub(crate) fn state_for(node: VfsNodeId) -> Arc<InodeState> {
-    let mut shard = SHARDS[shard_index(node)].exclusive_access();
+    let shard = &SHARDS[shard_index(node)];
+    if let Some(state) = shard.read().states.get(&node).cloned() {
+        return state;
+    }
+    let mut shard = shard.write();
     if let Some(state) = shard.states.get(&node) {
         return Arc::clone(state);
     }
@@ -314,7 +323,7 @@ pub(crate) fn state_for(node: VfsNodeId) -> Arc<InodeState> {
 /// inode number now denotes a new object.
 pub(crate) fn initialize_new(node: VfsNodeId) -> Arc<InodeState> {
     invalidate_direct_stat_cache();
-    let mut shard = SHARDS[shard_index(node)].exclusive_access();
+    let mut shard = SHARDS[shard_index(node)].write();
     let incarnation = shard
         .states
         .remove(&node)
@@ -498,7 +507,7 @@ pub(crate) fn invalidate_metadata(node: VfsNodeId) {
 /// Removes only the exact incarnation held by a final-release record. A stale
 /// Arc can therefore never erase state installed for a reused inode number.
 pub(crate) fn remove_if_same(node: VfsNodeId, expected: &Arc<InodeState>) -> bool {
-    let mut shard = SHARDS[shard_index(node)].exclusive_access();
+    let mut shard = SHARDS[shard_index(node)].write();
     let matches = shard
         .states
         .get(&node)
@@ -523,7 +532,7 @@ pub(crate) fn remove_if_same(node: VfsNodeId, expected: &Arc<InodeState>) -> boo
 pub(crate) fn is_current(expected: &Arc<InodeState>) -> bool {
     let node = expected.node();
     SHARDS[shard_index(node)]
-        .exclusive_access()
+        .read()
         .states
         .get(&node)
         .is_some_and(|current| Arc::ptr_eq(current, expected))

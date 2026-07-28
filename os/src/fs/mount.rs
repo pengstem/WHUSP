@@ -1,7 +1,7 @@
 use super::cgroupfs::CgroupFs;
 use super::dentry_cache;
 use super::devfs::DevFs;
-use super::ext4::Ext4Mount;
+use super::ext4::ConcurrentExt4Backend;
 use super::fat::FatMount;
 use super::inode_state::{self, InodeState};
 use super::overlayfs::OverlayFs;
@@ -23,7 +23,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::{format, string::String};
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use lazy_static::*;
 use log::{info, warn};
 
@@ -162,6 +162,82 @@ impl DynamicMountFastState {
     }
 }
 
+/// Immutable mounted-backend table for the syscall hot path.
+///
+/// A reader only clones `Arc<MountedFs>` while its CPU-local epoch slot is
+/// active. Rare mount-table writers publish a cloned vector and wait for old
+/// readers before dropping the previous Arc owners. This is the same RCU-style
+/// lifetime rule used by `DynamicMountFastState`, and removes the mount table
+/// mutex from every open/stat/read/close backend access.
+struct MountedFsFastState {
+    sequence: AtomicUsize,
+    current: AtomicPtr<Vec<Option<Arc<MountedFs>>>>,
+    readers: [DynamicMountSnapshotReader; MAX_CPUS],
+}
+
+impl MountedFsFastState {
+    fn new() -> Self {
+        Self {
+            sequence: AtomicUsize::new(0),
+            current: AtomicPtr::new(Box::into_raw(Box::new(Vec::new()))),
+            readers: [const { DynamicMountSnapshotReader::new() }; MAX_CPUS],
+        }
+    }
+
+    fn get(&self, mount_id: MountId) -> Option<Arc<MountedFs>> {
+        let reader = &self.readers[crate::cpu::current_id()];
+        loop {
+            let sequence = self.sequence.load(Ordering::Acquire);
+            if sequence & 1 != 0 {
+                spin_loop();
+                continue;
+            }
+            reader.active.store(1, Ordering::Release);
+            if self.sequence.load(Ordering::Acquire) != sequence {
+                reader.active.store(0, Ordering::Release);
+                continue;
+            }
+            let current = self.current.load(Ordering::Acquire);
+            assert!(!current.is_null(), "mounted filesystem snapshot is missing");
+            let mounted = unsafe { &*current }
+                .get(mount_id.0)
+                .and_then(|mounted| mounted.as_ref().cloned());
+            reader.active.store(0, Ordering::Release);
+            return mounted;
+        }
+    }
+
+    fn publish(&self, updated: Vec<Option<Arc<MountedFs>>>) {
+        let start = self.sequence.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(
+            start & 1,
+            0,
+            "concurrent mounted filesystem snapshot writer"
+        );
+        for reader in &self.readers {
+            while reader.active.load(Ordering::Acquire) != 0 {
+                crate::cpu::handle_remote_sync_ipi();
+                spin_loop();
+            }
+        }
+        let replacement = Box::into_raw(Box::new(updated));
+        let previous = self.current.swap(replacement, Ordering::AcqRel);
+        assert!(
+            !previous.is_null(),
+            "mounted filesystem snapshot is missing"
+        );
+        unsafe {
+            drop(Box::from_raw(previous));
+        }
+        self.sequence.store(
+            start
+                .checked_add(2)
+                .expect("mounted filesystem snapshot sequence exhausted"),
+            Ordering::Release,
+        );
+    }
+}
+
 struct MountedFs {
     source: String,
     fs_type: &'static str,
@@ -173,6 +249,7 @@ struct MountedFs {
 
 struct PendingReleaseQueue {
     entries: UPIntrFreeCell<Vec<PendingInodeRelease>>,
+    nonempty: AtomicBool,
 }
 
 struct PendingInodeRelease {
@@ -185,21 +262,36 @@ impl PendingReleaseQueue {
     fn new() -> Self {
         Self {
             entries: unsafe { UPIntrFreeCell::new(Vec::new()) },
+            nonempty: AtomicBool::new(false),
         }
     }
 
     fn push(&self, entry: PendingInodeRelease) {
-        self.entries.exclusive_access().push(entry);
+        let mut entries = self.entries.exclusive_access();
+        entries.push(entry);
+        self.nonempty.store(true, Ordering::Release);
     }
 
     fn take(&self) -> Vec<PendingInodeRelease> {
-        core::mem::take(&mut *self.entries.exclusive_access())
+        if !self.nonempty.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let mut entries = self.entries.exclusive_access();
+        let pending = core::mem::take(&mut *entries);
+        self.nonempty.store(false, Ordering::Release);
+        pending
     }
 
     fn put_back(&self, entries: Vec<PendingInodeRelease>) {
         if !entries.is_empty() {
-            self.entries.exclusive_access().extend(entries);
+            let mut pending = self.entries.exclusive_access();
+            pending.extend(entries);
+            self.nonempty.store(true, Ordering::Release);
         }
+    }
+
+    fn has_entries(&self) -> bool {
+        self.nonempty.load(Ordering::Acquire)
     }
 }
 
@@ -248,6 +340,7 @@ pub(crate) struct BlockPartition {
 
 lazy_static! {
     static ref MOUNTS: SleepMutex<Vec<Option<Arc<MountedFs>>>> = SleepMutex::new(Vec::new());
+    static ref MOUNTS_FAST: MountedFsFastState = MountedFsFastState::new();
     static ref MOUNTS_INITIALIZED: UPIntrFreeCell<bool> = unsafe { UPIntrFreeCell::new(false) };
     // CONTEXT: Dynamic mount metadata stays under interrupt masking only for
     // short table edits. Do not perform filesystem or block I/O while holding it.
@@ -336,6 +429,7 @@ pub fn init_mounts() {
         let mut mounts = MOUNTS.lock();
         mounts.resize_with(block_mount_count, || None);
         mounts[0] = Some(primary_mount);
+        MOUNTS_FAST.publish(mounts.clone());
     }
     set_mount_metadata_cache_capability(MountId(0), Some("ext4"));
     NEXT_MOUNT_ID.store(block_mount_count, Ordering::SeqCst);
@@ -361,6 +455,26 @@ impl MountedFs {
             options: SleepMutex::new(options),
             stat_flags: SleepMutex::new(stat_flags),
             backend: Arc::new(SerializedBackend::new(backend)),
+            pending_inode_releases: Arc::new(PendingReleaseQueue::new()),
+        })
+    }
+
+    fn new_concurrent(
+        backend: Arc<dyn ConcurrentFileSystemBackend>,
+        source: String,
+        fs_type: &'static str,
+        options: &'static str,
+    ) -> Arc<Self> {
+        let stat_flags = mount_flags_from_options(options);
+        if mount_flags_have_nosymfollow(stat_flags) {
+            NOSYMFOLLOW_MOUNT_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        Arc::new(Self {
+            source,
+            fs_type,
+            options: SleepMutex::new(options),
+            stat_flags: SleepMutex::new(stat_flags),
+            backend,
             pending_inode_releases: Arc::new(PendingReleaseQueue::new()),
         })
     }
@@ -504,10 +618,10 @@ fn open_backend(
     device_index: usize,
 ) -> Result<Arc<MountedFs>, MountError> {
     match kind {
-        BackendKind::Ext4 => Ext4Mount::open(device)
-            .map(|mount| {
-                MountedFs::new(
-                    Box::new(mount),
+        BackendKind::Ext4 => ConcurrentExt4Backend::open(device)
+            .map(|backend| {
+                MountedFs::new_concurrent(
+                    Arc::new(backend),
                     block_source_name(device_index),
                     "ext4",
                     "rw",
@@ -529,6 +643,7 @@ fn register_mount(mounted: Arc<MountedFs>) -> MountId {
         mounts.resize_with(mount_id.0 + 1, || None);
     }
     mounts[mount_id.0] = Some(mounted);
+    MOUNTS_FAST.publish(mounts.clone());
     drop(mounts);
     set_mount_metadata_cache_capability(mount_id, Some(fs_type));
     mount_id
@@ -560,35 +675,30 @@ fn unregister_pending_release_queue(mount_id: MountId) {
 
 /// Runs a backend operation for a mounted filesystem.
 ///
-/// The mount table lock is released before the backend lock is taken, and the
-/// closure may enter filesystem or block I/O. Callers must not hold
-/// interrupt-masked mount metadata locks across this boundary.
+/// The immutable fast mount snapshot is read without holding the mutable mount
+/// table lock. The closure may enter filesystem or block I/O, so callers must
+/// not hold interrupt-masked mount metadata locks across this boundary.
 pub(super) fn with_mount<V>(
     mount_id: MountId,
     op: BackendOp,
-    f: impl FnOnce(&mut dyn LegacyFileSystemBackend) -> V,
+    f: impl FnOnce(&dyn ConcurrentFileSystemBackend) -> V,
 ) -> Option<V> {
-    let (backend, pending_releases) = {
-        let mounts = MOUNTS.lock();
-        mounts
-            .get(mount_id.0)
-            .and_then(|mount| mount.as_ref())
-            .map(|mounted| {
-                (
-                    Arc::clone(&mounted.backend),
-                    Arc::clone(&mounted.pending_inode_releases),
-                )
-            })
-    }?;
-    drain_pending_inode_releases(&pending_releases, backend.as_ref());
-    let mut result = None;
-    let mut f = Some(f);
-    backend.execute_serialized(op, &mut |_| {}, &mut |legacy| {
-        result = Some(f.take().expect("mount backend operation called twice")(
-            legacy,
-        ));
-    });
-    result
+    let mounted = MOUNTS_FAST.get(mount_id)?;
+    let backend = Arc::clone(&mounted.backend);
+    let pending_releases = Arc::clone(&mounted.pending_inode_releases);
+    // A deferred final unlink only has to complete before an operation that
+    // can allocate/reuse an inode or commit filesystem state. Read-only
+    // operations must not inherit unrelated close work or its writer lock.
+    if matches!(
+        op,
+        BackendOp::Write
+            | BackendOp::TruncateAllocate
+            | BackendOp::NamespaceMutation
+            | BackendOp::Sync
+    ) {
+        drain_pending_inode_releases(&pending_releases, backend.as_ref());
+    }
+    Some(f(backend.as_ref()))
 }
 
 pub(crate) fn overlay_real_node(node: VfsNodeId) -> Option<VfsNodeId> {
@@ -598,42 +708,15 @@ pub(crate) fn overlay_real_node(node: VfsNodeId) -> Option<VfsNodeId> {
     .flatten()
 }
 
-/// Best-effort backend access for drop-time cleanup paths.
-///
-/// If either the mount table or backend is busy, the caller should defer the
-/// cleanup instead of blocking while a file destructor is running.
-fn try_with_mount<V>(
-    mount_id: MountId,
-    op: BackendOp,
-    f: impl FnOnce(&mut dyn LegacyFileSystemBackend) -> V,
-) -> Option<V> {
-    let backend = {
-        let mounts = MOUNTS.try_lock()?;
-        mounts
-            .get(mount_id.0)
-            .and_then(|mount| mount.as_ref())
-            .map(|mounted| Arc::clone(&mounted.backend))
-    }?;
-    let mut result = None;
-    let mut f = Some(f);
-    backend
-        .try_execute_serialized(op, &mut |_| {}, &mut |legacy| {
-            result = Some(f.take().expect("mount backend try-operation called twice")(
-                legacy,
-            ));
-        })
-        .then_some(())?;
-    result
-}
-
 fn drain_pending_inode_releases(
     pending_releases: &PendingReleaseQueue,
     backend: &dyn ConcurrentFileSystemBackend,
 ) {
+    if !pending_releases.has_entries() {
+        return;
+    }
     #[cfg(feature = "perf-counters")]
     let timer = perf::time_pending_release_drain();
-    #[cfg(feature = "perf-counters")]
-    let io_before = backend.io_snapshot();
     // Take this mount's queue before backend release calls; release_inode()
     // may enter filesystem code, and this interrupt-masked queue lock must not
     // be held across backend cleanup.
@@ -693,12 +776,10 @@ fn drain_pending_inode_releases(
     }
     pending_releases.put_back(deferred);
     #[cfg(feature = "perf-counters")]
-    perf::record_pending_release_drain(
-        timer,
-        entries,
-        released,
-        backend.io_snapshot().delta_since(io_before),
-    );
+    // release_inode() already attributes its adapter I/O to InodeLifetime.
+    // The drain counters describe queue work only; charging the aggregate I/O
+    // here as well would double-count the same block requests.
+    perf::record_pending_release_drain(timer, entries, released);
 }
 
 /// Releases an inode reference from `VfsFile::drop`.
@@ -710,9 +791,10 @@ pub(super) fn release_inode_from_drop(state: &Arc<InodeState>) {
         return;
     }
     let node = state.node();
-    match try_with_mount(node.mount_id, BackendOp::InodeLifetime, |mount| {
-        mount.release_inode(node.ino)
-    }) {
+    let released = MOUNTS_FAST
+        .get(node.mount_id)
+        .and_then(|mounted| mounted.backend.try_release_inode(node.ino));
+    match released {
         Some(Ok(InodeRelease::Freed)) => {
             inode_state::remove_if_same(node, state);
         }
@@ -776,8 +858,7 @@ pub(super) fn stat_full_cached(node: VfsNodeId) -> FsResult<super::FileStat> {
 }
 
 pub(super) fn mount_exists(mount_id: MountId) -> bool {
-    let mounts = MOUNTS.lock();
-    mounts.get(mount_id.0).is_some_and(Option::is_some)
+    MOUNTS_FAST.get(mount_id).is_some()
 }
 
 pub(crate) fn clone_mount_namespace(source_namespace_id: MountNamespaceId) -> MountNamespaceId {
@@ -827,6 +908,7 @@ fn ensure_mount_open(mount_id: MountId) -> Result<(), MountError> {
     };
     if slot.is_none() {
         *slot = Some(Arc::clone(&mount));
+        MOUNTS_FAST.publish(mounts.clone());
         drop(mounts);
         register_pending_release_queue(mount_id, &mount);
         set_mount_metadata_cache_capability(mount_id, Some(mount.fs_type));
@@ -2581,7 +2663,8 @@ fn release_dynamic_mount_source_if_unused(source_mount_id: MountId) {
     // metadata after unmount starts.
     set_mount_metadata_cache_capability(source_mount_id, None);
     clear_mount_root_ino(source_mount_id);
-    if let Some(slot) = MOUNTS.lock().get_mut(source_mount_id.0) {
+    let mut mounts = MOUNTS.lock();
+    if let Some(slot) = mounts.get_mut(source_mount_id.0) {
         if let Some(mounted) = slot.as_ref() {
             let flags = *mounted.stat_flags.lock();
             if mount_flags_have_nosymfollow(flags) {
@@ -2589,7 +2672,9 @@ fn release_dynamic_mount_source_if_unused(source_mount_id: MountId) {
             }
         }
         *slot = None;
+        MOUNTS_FAST.publish(mounts.clone());
     }
+    drop(mounts);
     unregister_pending_release_queue(source_mount_id);
 }
 
@@ -2787,10 +2872,7 @@ pub fn list_root_apps() -> Vec<String> {
 }
 
 fn mounted_fs(mount_id: MountId) -> Option<Arc<MountedFs>> {
-    let mounts = MOUNTS.lock();
-    mounts
-        .get(mount_id.0)
-        .and_then(|mount| mount.as_ref().cloned())
+    MOUNTS_FAST.get(mount_id)
 }
 
 fn mount_metadata(mount_id: MountId) -> Option<(String, &'static str, &'static str, u64)> {
@@ -2848,6 +2930,13 @@ pub(super) fn mount_supports_metadata_cache(mount_id: MountId) -> bool {
     let fs_type = mount_fs_type(mount_id);
     set_mount_metadata_cache_capability(mount_id, fs_type);
     fs_type == Some("ext4")
+}
+
+/// Returns the immutable backend kind without entering the filesystem. Statx
+/// uses this to advertise direct-I/O alignment; querying full statfs data for
+/// every inode stat would unnecessarily serialize on mutable filesystem state.
+pub(crate) fn mount_is_ext4(mount_id: MountId) -> bool {
+    mount_supports_metadata_cache(mount_id)
 }
 
 pub(crate) fn mount_is_read_only(mount_id: MountId) -> bool {

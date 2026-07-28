@@ -53,11 +53,24 @@ pub struct Ext4Filesystem<Hal: SystemHal, Dev: BlockDevice> {
 
 impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
     pub fn new(dev: Dev, config: FsConfig) -> Ext4Result<Self> {
+        Self::new_with_mode(dev, config, false)
+    }
+
+    /// Opens an independent metadata core that never modifies the filesystem.
+    ///
+    /// This is used by the kernel's sharded read replicas. Each replica owns a
+    /// separate lwext4 block cache, while the writable core remains the only
+    /// instance allowed to dirty metadata or the superblock.
+    pub fn new_read_only(dev: Dev, config: FsConfig) -> Ext4Result<Self> {
+        Self::new_with_mode(dev, config, true)
+    }
+
+    fn new_with_mode(dev: Dev, config: FsConfig, read_only: bool) -> Ext4Result<Self> {
         let mut bdev = Ext4BlockDevice::new(dev)?;
         let mut fs = Box::new(unsafe { mem::zeroed() });
         unsafe {
             let bd = bdev.inner.as_mut();
-            ext4_fs_init(&mut *fs, bd, false).context("ext4_fs_init")?;
+            ext4_fs_init(&mut *fs, bd, read_only).context("ext4_fs_init")?;
 
             let bs = get_block_size(&fs.sb);
             ext4_block_set_lb_size(bd, bs);
@@ -78,6 +91,16 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             let bd = result.bdev.inner.as_mut();
             ext4_block_bind_bcache(bd, bd.bc).context("ext4_block_bind_bcache")?;
             Ok(result)
+        }
+    }
+
+    /// Drops every unreferenced clean metadata buffer owned by this core.
+    ///
+    /// Callers must exclude operations on this exact core. Read-only replicas
+    /// never own dirty buffers, so cleanup cannot write stale metadata back.
+    pub fn invalidate_clean_cache(&mut self) {
+        unsafe {
+            ext4_bcache_cleanup(self.bdev.inner.as_mut().bc);
         }
     }
 
