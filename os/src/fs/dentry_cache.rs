@@ -1,6 +1,8 @@
 use super::inode_state;
 use super::mount::MountNamespaceId;
 use super::vfs::{FsNodeKind, VfsNodeId};
+#[cfg(feature = "perf-counters")]
+use crate::perf::PerCpuCounter;
 use crate::sync::{SleepMutex, SpinRwLock};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -464,15 +466,15 @@ static DENTRY_MOUNT_EPOCH: AtomicUsize = AtomicUsize::new(1);
 static DENTRY_INVALIDATE_PARENT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static DENTRY_INVALIDATE_ALL_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "perf-counters")]
-static DENTRY_POSITIVE_HITS: AtomicUsize = AtomicUsize::new(0);
+static DENTRY_POSITIVE_HITS: PerCpuCounter = PerCpuCounter::new();
 #[cfg(feature = "perf-counters")]
-static DENTRY_NEGATIVE_HITS: AtomicUsize = AtomicUsize::new(0);
+static DENTRY_NEGATIVE_HITS: PerCpuCounter = PerCpuCounter::new();
 #[cfg(feature = "perf-counters")]
-static DENTRY_MISSES: AtomicUsize = AtomicUsize::new(0);
+static DENTRY_MISSES: PerCpuCounter = PerCpuCounter::new();
 #[cfg(feature = "perf-counters")]
-static DENTRY_REVALIDATE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+static DENTRY_REVALIDATE_FAILURES: PerCpuCounter = PerCpuCounter::new();
 #[cfg(feature = "perf-counters")]
-static DENTRY_COLLISION_SCANS: AtomicUsize = AtomicUsize::new(0);
+static DENTRY_COLLISION_SCANS: PerCpuCounter = PerCpuCounter::new();
 
 lazy_static! {
     static ref DENTRY_CACHE_SHARDS: Vec<SpinRwLock<DentryCache>> = (0

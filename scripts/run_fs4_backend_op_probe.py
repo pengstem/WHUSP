@@ -64,7 +64,7 @@ def render_guest(args: argparse.Namespace) -> str:
         "@SMP@": str(args.smp),
         "@MEM@": args.mem,
         "@BLOCK_IO_MODE@": args.block_io_mode,
-        "@PERF_COUNTERS@": "1",
+        "@PERF_COUNTERS@": str(args.perf_counters),
         "@ITERATIONS@": str(args.iterations),
     }
     for placeholder, value in replacements.items():
@@ -175,11 +175,11 @@ def validate_log(log: str, args: argparse.Namespace, overlay_root: Path) -> dict
     errors: list[str] = []
     start = (
         f"FS4_BACKEND_OP_GUEST_START run_id={args.run_id} arch={args.arch} smp={args.smp} "
-        f"mem={args.mem} block_io={args.block_io_mode} perf=1"
+        f"mem={args.mem} block_io={args.block_io_mode} perf={args.perf_counters}"
     )
     passed = (
         f"FS4_BACKEND_OP_PASS run_id={args.run_id} arch={args.arch} smp={args.smp} "
-        f"mem={args.mem} block_io={args.block_io_mode} perf=1"
+        f"mem={args.mem} block_io={args.block_io_mode} perf={args.perf_counters}"
     )
     if lines.count(start) != 1:
         errors.append("missing or duplicate guest start marker")
@@ -224,8 +224,9 @@ def validate_log(log: str, args: argparse.Namespace, overlay_root: Path) -> dict
     after, after_errors = perf_snapshot(lines, "after")
     errors.extend(before_errors)
     errors.extend(after_errors)
-    required = {
-        "perf_counters_enabled",
+    required = {"perf_counters_enabled"}
+    if args.perf_counters == 1:
+        required.update({
         "mount_backend_contended_acquisitions",
         "profile_mount_backend_hold_calls",
         "backend_try_successful_calls",
@@ -240,28 +241,31 @@ def validate_log(log: str, args: argparse.Namespace, overlay_root: Path) -> dict
         "ext4_block_write_calls",
         "ext4_block_write_blocks",
         "ext4_block_write_bytes",
-    }
-    required.update(f"backend_op_{op}_{metric}" for op in OPS for metric in OP_METRICS)
-    for prefix in ("backend_lock_held_data_io", "backend_lock_held_metadata_io"):
-        required.update(
-            f"{prefix}_{metric}"
-            for metric in (
-                "read_calls",
-                "read_blocks",
-                "read_bytes",
-                "write_calls",
-                "write_blocks",
-                "write_bytes",
+        })
+        required.update(f"backend_op_{op}_{metric}" for op in OPS for metric in OP_METRICS)
+        for prefix in ("backend_lock_held_data_io", "backend_lock_held_metadata_io"):
+            required.update(
+                f"{prefix}_{metric}"
+                for metric in (
+                    "read_calls",
+                    "read_blocks",
+                    "read_bytes",
+                    "write_calls",
+                    "write_blocks",
+                    "write_bytes",
+                )
             )
-        )
     missing = sorted(required - before.keys()) + sorted(required - after.keys())
     if missing:
         errors.append(f"missing perf keys: {missing}")
     delta = {key: after[key] - before.get(key, 0) for key in after}
-    if before.get("perf_counters_enabled") != 1 or after.get("perf_counters_enabled") != 1:
-        errors.append("perf counters disabled in guest")
+    if (
+        before.get("perf_counters_enabled") != args.perf_counters
+        or after.get("perf_counters_enabled") != args.perf_counters
+    ):
+        errors.append("perf counter identity mismatch in guest")
 
-    if not missing:
+    if args.perf_counters == 1 and not missing:
         op_calls = sum(delta[f"backend_op_{op}_calls"] for op in OPS)
         expected_calls = (
             delta["profile_mount_backend_hold_calls"] + delta["backend_try_successful_calls"]
@@ -325,7 +329,7 @@ def run(args: argparse.Namespace) -> int:
             "smp": args.smp,
             "mem": args.mem,
             "block_io_mode": args.block_io_mode,
-            "perf_counters": 1,
+            "perf_counters": args.perf_counters,
             "iterations": args.iterations,
         },
         "host_load_before": bench.host_load_snapshot(),
@@ -342,7 +346,7 @@ def run(args: argparse.Namespace) -> int:
             smp=args.smp,
             mem=args.mem,
             block_io_mode=args.block_io_mode,
-            perf_counters=1,
+            perf_counters=args.perf_counters,
             kernel=args.kernel_elf.resolve(),
             disk=args.test_disk.resolve(),
             aux_disk=aux_disk,
@@ -388,6 +392,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smp", type=int, default=8)
     parser.add_argument("--mem", default="8G")
     parser.add_argument("--block-io-mode", choices=("auto", "force-sync"), default="force-sync")
+    parser.add_argument("--perf-counters", type=int, choices=(0, 1), default=1)
     parser.add_argument("--kernel-elf", type=Path, required=True)
     parser.add_argument("--test-disk", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)

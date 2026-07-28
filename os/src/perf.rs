@@ -1,3 +1,78 @@
+#[cfg(feature = "perf-counters")]
+use crate::config::MAX_CPUS;
+#[cfg(feature = "perf-counters")]
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(feature = "perf-counters")]
+#[repr(align(64))]
+struct PerCpuCounterSlot(AtomicUsize);
+
+/// Linux-style per-CPU event counter.
+///
+/// Hot paths update only the current CPU's cache line. Readers aggregate all
+/// slots when exporting `/proc/kperf`, which is intentionally the cold side of
+/// the accounting contract.
+#[cfg(feature = "perf-counters")]
+pub(crate) struct PerCpuCounter {
+    slots: [PerCpuCounterSlot; MAX_CPUS],
+}
+
+#[cfg(feature = "perf-counters")]
+impl PerCpuCounter {
+    pub(crate) const fn new() -> Self {
+        Self {
+            slots: [const { PerCpuCounterSlot(AtomicUsize::new(0)) }; MAX_CPUS],
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn fetch_add(&self, value: usize, _ordering: Ordering) -> usize {
+        self.slots[crate::cpu::current_id() % MAX_CPUS]
+            .0
+            .fetch_add(value, Ordering::Relaxed)
+    }
+
+    pub(crate) fn load(&self, _ordering: Ordering) -> usize {
+        self.slots.iter().fold(0usize, |total, slot| {
+            total.saturating_add(slot.0.load(Ordering::Relaxed))
+        })
+    }
+}
+
+#[cfg(feature = "perf-counters")]
+struct PerCpuMax {
+    slots: [PerCpuCounterSlot; MAX_CPUS],
+}
+
+#[cfg(feature = "perf-counters")]
+impl PerCpuMax {
+    const fn new() -> Self {
+        Self {
+            slots: [const { PerCpuCounterSlot(AtomicUsize::new(0)) }; MAX_CPUS],
+        }
+    }
+
+    #[inline(always)]
+    fn update(&self, value: usize) {
+        let cell = &self.slots[crate::cpu::current_id() % MAX_CPUS].0;
+        let mut current = cell.load(Ordering::Relaxed);
+        while value > current {
+            match cell.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    fn load(&self, _ordering: Ordering) -> usize {
+        self.slots
+            .iter()
+            .map(|slot| slot.0.load(Ordering::Relaxed))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 #[repr(usize)]
@@ -386,7 +461,7 @@ pub(crate) struct KernelPerfSnapshot {
 
 #[cfg(feature = "perf-counters")]
 mod enabled {
-    use super::{KernelPerfSnapshot, PROFILE_POINT_COUNT, ProfilePoint};
+    use super::{KernelPerfSnapshot, PROFILE_POINT_COUNT, PerCpuCounter, PerCpuMax, ProfilePoint};
     use crate::fs::{BackendIoSnapshot, BackendOp};
     use alloc::format;
     use alloc::string::String;
@@ -722,29 +797,29 @@ mod enabled {
 
     struct TimeStat {
         name: &'static str,
-        calls: AtomicUsize,
-        total_ticks: AtomicUsize,
-        max_ticks: AtomicUsize,
+        calls: PerCpuCounter,
+        total_ticks: PerCpuCounter,
+        max_ticks: PerCpuMax,
     }
 
     struct BackendIoStat {
-        read_calls: AtomicUsize,
-        read_blocks: AtomicUsize,
-        read_bytes: AtomicUsize,
-        write_calls: AtomicUsize,
-        write_blocks: AtomicUsize,
-        write_bytes: AtomicUsize,
+        read_calls: PerCpuCounter,
+        read_blocks: PerCpuCounter,
+        read_bytes: PerCpuCounter,
+        write_calls: PerCpuCounter,
+        write_blocks: PerCpuCounter,
+        write_bytes: PerCpuCounter,
     }
 
     impl BackendIoStat {
         const fn new() -> Self {
             Self {
-                read_calls: AtomicUsize::new(0),
-                read_blocks: AtomicUsize::new(0),
-                read_bytes: AtomicUsize::new(0),
-                write_calls: AtomicUsize::new(0),
-                write_blocks: AtomicUsize::new(0),
-                write_bytes: AtomicUsize::new(0),
+                read_calls: PerCpuCounter::new(),
+                read_blocks: PerCpuCounter::new(),
+                read_bytes: PerCpuCounter::new(),
+                write_calls: PerCpuCounter::new(),
+                write_blocks: PerCpuCounter::new(),
+                write_bytes: PerCpuCounter::new(),
             }
         }
 
@@ -763,24 +838,24 @@ mod enabled {
     }
 
     struct BackendOpStat {
-        calls: AtomicUsize,
-        contended: AtomicUsize,
-        wait_ticks: AtomicUsize,
-        wait_max_ticks: AtomicUsize,
-        hold_ticks: AtomicUsize,
-        hold_max_ticks: AtomicUsize,
+        calls: PerCpuCounter,
+        contended: PerCpuCounter,
+        wait_ticks: PerCpuCounter,
+        wait_max_ticks: PerCpuMax,
+        hold_ticks: PerCpuCounter,
+        hold_max_ticks: PerCpuMax,
         io: BackendIoStat,
     }
 
     impl BackendOpStat {
         const fn new() -> Self {
             Self {
-                calls: AtomicUsize::new(0),
-                contended: AtomicUsize::new(0),
-                wait_ticks: AtomicUsize::new(0),
-                wait_max_ticks: AtomicUsize::new(0),
-                hold_ticks: AtomicUsize::new(0),
-                hold_max_ticks: AtomicUsize::new(0),
+                calls: PerCpuCounter::new(),
+                contended: PerCpuCounter::new(),
+                wait_ticks: PerCpuCounter::new(),
+                wait_max_ticks: PerCpuMax::new(),
+                hold_ticks: PerCpuCounter::new(),
+                hold_max_ticks: PerCpuMax::new(),
                 io: BackendIoStat::new(),
             }
         }
@@ -795,7 +870,7 @@ mod enabled {
     static PENDING_RELEASE_DRAIN_RELEASED: AtomicUsize = AtomicUsize::new(0);
     static PENDING_RELEASE_DRAIN_TICKS: AtomicUsize = AtomicUsize::new(0);
     static PENDING_RELEASE_DRAIN_MAX_TICKS: AtomicUsize = AtomicUsize::new(0);
-    static BACKEND_TRY_SUCCESSFUL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static BACKEND_TRY_SUCCESSFUL_CALLS: PerCpuCounter = PerCpuCounter::new();
 
     enum BackendOpTimerKind {
         Wait,
@@ -832,11 +907,11 @@ mod enabled {
             match self.kind {
                 BackendOpTimerKind::Wait => {
                     stat.wait_ticks.fetch_add(elapsed_ticks, Ordering::Relaxed);
-                    update_max(&stat.wait_max_ticks, elapsed_ticks);
+                    stat.wait_max_ticks.update(elapsed_ticks);
                 }
                 BackendOpTimerKind::Hold => {
                     stat.hold_ticks.fetch_add(elapsed_ticks, Ordering::Relaxed);
-                    update_max(&stat.hold_max_ticks, elapsed_ticks);
+                    stat.hold_max_ticks.update(elapsed_ticks);
                 }
             }
         }
@@ -895,9 +970,9 @@ mod enabled {
         const fn new(name: &'static str) -> Self {
             Self {
                 name,
-                calls: AtomicUsize::new(0),
-                total_ticks: AtomicUsize::new(0),
-                max_ticks: AtomicUsize::new(0),
+                calls: PerCpuCounter::new(),
+                total_ticks: PerCpuCounter::new(),
+                max_ticks: PerCpuMax::new(),
             }
         }
     }
@@ -1022,7 +1097,7 @@ mod enabled {
         let stat = &TIME_STATS[point as usize];
         stat.calls.fetch_add(1, Ordering::Relaxed);
         stat.total_ticks.fetch_add(elapsed_ticks, Ordering::Relaxed);
-        update_max(&stat.max_ticks, elapsed_ticks);
+        stat.max_ticks.update(elapsed_ticks);
     }
 
     fn record_syscall_time(syscall_id: usize, elapsed_ticks: usize) {
@@ -1031,7 +1106,7 @@ mod enabled {
         };
         stat.calls.fetch_add(1, Ordering::Relaxed);
         stat.total_ticks.fetch_add(elapsed_ticks, Ordering::Relaxed);
-        update_max(&stat.max_ticks, elapsed_ticks);
+        stat.max_ticks.update(elapsed_ticks);
     }
 
     const USEC_PER_SEC: u128 = 1_000_000;
@@ -1039,17 +1114,17 @@ mod enabled {
     const SYSCALL_TIMING_SLOTS: usize = 512;
 
     struct SyscallTimeStat {
-        calls: AtomicUsize,
-        total_ticks: AtomicUsize,
-        max_ticks: AtomicUsize,
+        calls: PerCpuCounter,
+        total_ticks: PerCpuCounter,
+        max_ticks: PerCpuMax,
     }
 
     impl SyscallTimeStat {
         const fn new() -> Self {
             Self {
-                calls: AtomicUsize::new(0),
-                total_ticks: AtomicUsize::new(0),
-                max_ticks: AtomicUsize::new(0),
+                calls: PerCpuCounter::new(),
+                total_ticks: PerCpuCounter::new(),
+                max_ticks: PerCpuMax::new(),
             }
         }
     }
