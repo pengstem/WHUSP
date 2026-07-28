@@ -1505,9 +1505,21 @@ impl VfsFile {
     ) -> usize {
         let _profile_scope = perf::time_scope(point);
         let Some(read_size) = inode_state::with_mapping_read(self.node, || {
-            with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
-                mount.read_at(self.node.ino, buf, offset as u64)
-            })
+            let read_plan = (self.kind == FsNodeKind::RegularFile && self.supports_page_cache)
+                .then(|| {
+                    with_mount(self.node.mount_id, BackendOp::ReadPlan, |mount| {
+                        mount.prepare_read_plan(self.node.ino, offset as u64, buf.len())
+                    })
+                    .flatten()
+                })
+                .flatten();
+            if let Some(read_plan) = read_plan {
+                Some(read_plan.execute(buf))
+            } else {
+                with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
+                    mount.read_at(self.node.ino, buf, offset as u64)
+                })
+            }
         }) else {
             return 0;
         };
@@ -1732,13 +1744,11 @@ impl VfsFile {
             let block_end = block_start.saturating_add(block_size).min(size);
             let valid_len = block_end - block_start;
             buf[..valid_len].fill(0);
-            let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsSeekScanRead);
-            let read_len = inode_state::with_mapping_read(self.node, || {
-                with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
-                    mount.read_at(self.node.ino, &mut buf[..valid_len], block_start as u64)
-                })
-                .ok_or(FsError::Io)
-            })?;
+            let read_len = self.read_backend_at_profiled(
+                block_start,
+                &mut buf[..valid_len],
+                perf::ProfilePoint::VfsSeekScanRead,
+            );
             if read_len < valid_len {
                 buf[read_len..valid_len].fill(0);
             }
@@ -1906,14 +1916,10 @@ impl VfsFile {
                 staging.as_mut_slice()
             };
             let read_len = inode_state::with_mapping_read(self.node, || {
-                let read_plan = if read_limit % PAGE_SIZE == 0 {
-                    with_mount(self.node.mount_id, BackendOp::ReadPlan, |mount| {
-                        mount.prepare_read_plan(self.node.ino, page_start as u64, read_limit)
-                    })
-                    .flatten()
-                } else {
-                    None
-                };
+                let read_plan = with_mount(self.node.mount_id, BackendOp::ReadPlan, |mount| {
+                    mount.prepare_read_plan(self.node.ino, page_start as u64, read_limit)
+                })
+                .flatten();
                 if let Some(read_plan) = read_plan {
                     read_plan.execute(fill_buf)
                 } else {
@@ -2125,18 +2131,7 @@ impl VfsFile {
         let noatime_snapshot = self.noatime_snapshot();
         while filled < file_size {
             let chunk_len = (file_size - filled).min(VFS_READ_CHUNK_SIZE);
-            let Some(read_size) = inode_state::with_mapping_read(self.node, || {
-                with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
-                    mount.read_at(
-                        self.node.ino,
-                        &mut data[filled..filled + chunk_len],
-                        filled as u64,
-                    )
-                })
-            }) else {
-                self.restore_noatime(noatime_snapshot);
-                return None;
-            };
+            let read_size = self.read_backend_at(filled, &mut data[filled..filled + chunk_len]);
             if read_size == 0 {
                 break;
             }

@@ -25,6 +25,7 @@ CASES = (
     "cross_directory_rename",
     "lookup_stat_vs_namespace_mutation",
     "read_vs_mapping_mutation",
+    "partial_read_plan",
     "shutdown_drain_stress",
 )
 

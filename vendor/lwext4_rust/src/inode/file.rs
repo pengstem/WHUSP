@@ -21,6 +21,8 @@ pub struct Ext4MappedReadRun {
 #[derive(Debug)]
 pub struct Ext4MappedReadPlan {
     pub block_size: usize,
+    pub buffer_len: usize,
+    pub read_offset: usize,
     pub read_len: usize,
     pub runs: Vec<Ext4MappedReadRun>,
 }
@@ -39,29 +41,44 @@ fn take_mut<'a>(buf: &mut &'a mut [u8], cnt: usize) -> &'a mut [u8] {
 }
 
 impl<Hal: SystemHal> InodeRef<Hal> {
-    pub fn plan_aligned_read(
-        &mut self,
-        len: usize,
-        pos: u64,
-    ) -> Ext4Result<Option<Ext4MappedReadPlan>> {
+    pub fn plan_read(&mut self, len: usize, pos: u64) -> Ext4Result<Option<Ext4MappedReadPlan>> {
         let file_size = self.size();
         let block_size = get_block_size(self.superblock()) as usize;
-        let Some(end) = pos.checked_add(len as u64) else {
+        let Some(requested_end) = pos.checked_add(len as u64) else {
             return Ok(None);
         };
         if self.inode_type() != InodeType::RegularFile
             || self.flags() & EXT4_INODE_FLAG_EXTENTS == 0
             || len == 0
             || block_size == 0
-            || pos % block_size as u64 != 0
-            || len % block_size != 0
-            || end > file_size
+            || pos >= file_size
         {
             return Ok(None);
         }
 
-        let logical_start = pos / block_size as u64;
-        let logical_blocks = len / block_size;
+        let end = requested_end.min(file_size);
+        let block_size_u64 = block_size as u64;
+        let aligned_start = pos / block_size_u64 * block_size_u64;
+        let Some(aligned_end) = end
+            .checked_add(block_size_u64 - 1)
+            .map(|value| value / block_size_u64 * block_size_u64)
+        else {
+            return Ok(None);
+        };
+        let logical_start = aligned_start / block_size_u64;
+        let logical_blocks_u64 = (aligned_end - aligned_start) / block_size_u64;
+        let Ok(logical_blocks) = usize::try_from(logical_blocks_u64) else {
+            return Ok(None);
+        };
+        let Some(buffer_len) = logical_blocks.checked_mul(block_size) else {
+            return Ok(None);
+        };
+        let Ok(read_offset) = usize::try_from(pos - aligned_start) else {
+            return Ok(None);
+        };
+        let Ok(read_len) = usize::try_from(end - pos) else {
+            return Ok(None);
+        };
         let Ok(logical_start) = u32::try_from(logical_start) else {
             return Ok(None);
         };
@@ -120,7 +137,9 @@ impl<Hal: SystemHal> InodeRef<Hal> {
 
         Ok(Some(Ext4MappedReadPlan {
             block_size,
-            read_len: len,
+            buffer_len,
+            read_offset,
+            read_len,
             runs,
         }))
     }

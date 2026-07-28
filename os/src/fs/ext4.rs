@@ -18,7 +18,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 use core::str;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
@@ -673,6 +673,8 @@ struct Ext4DeviceReadRun {
 struct Ext4DeviceReadPlan {
     device: Arc<VirtIOBlock>,
     write_sequence: Arc<Ext4Sequence>,
+    buffer_len: usize,
+    read_offset: usize,
     read_len: usize,
     runs: Vec<Ext4DeviceReadRun>,
 }
@@ -682,8 +684,14 @@ impl BackendReadPlan for Ext4DeviceReadPlan {
         if buf.len() < self.read_len {
             return 0;
         }
+        let mut bounce = (self.read_offset != 0 || self.buffer_len != self.read_len)
+            .then(|| vec![0u8; self.buffer_len]);
+        let plan_buf = match bounce.as_deref_mut() {
+            Some(bounce) => bounce,
+            None => &mut buf[..self.buffer_len],
+        };
         for run in &self.runs {
-            let run_buf = &mut buf[run.buffer_start..run.buffer_start + run.byte_len];
+            let run_buf = &mut plan_buf[run.buffer_start..run.buffer_start + run.byte_len];
             if let Some(device_block) = run.device_block {
                 self.write_sequence.read_stable(|| {
                     let io = self
@@ -698,6 +706,10 @@ impl BackendReadPlan for Ext4DeviceReadPlan {
             } else {
                 run_buf.fill(0);
             }
+        }
+        if let Some(bounce) = bounce {
+            buf[..self.read_len]
+                .copy_from_slice(&bounce[self.read_offset..self.read_offset + self.read_len]);
         }
         perf::record_ext4_read_plan_executed(self.read_len);
         self.read_len
@@ -966,7 +978,7 @@ impl LegacyFileSystemBackend for Ext4Mount {
         len: usize,
     ) -> Option<Box<dyn BackendReadPlan>> {
         perf::record_ext4_read_plan_attempt();
-        let Ok(Some(plan)) = self.fs.plan_aligned_read(ino, len, offset) else {
+        let Ok(Some(plan)) = self.fs.plan_read(ino, len, offset) else {
             perf::record_ext4_read_plan_fallback();
             return None;
         };
@@ -991,7 +1003,7 @@ impl LegacyFileSystemBackend for Ext4Mount {
             };
             if buffer_start
                 .checked_add(byte_len)
-                .is_none_or(|end| end > plan.read_len)
+                .is_none_or(|end| end > plan.buffer_len)
             {
                 perf::record_ext4_read_plan_fallback();
                 return None;
@@ -1030,6 +1042,8 @@ impl LegacyFileSystemBackend for Ext4Mount {
         Some(Box::new(Ext4DeviceReadPlan {
             device: self.device.clone(),
             write_sequence: self.write_sequence.clone(),
+            buffer_len: plan.buffer_len,
+            read_offset: plan.read_offset,
             read_len: plan.read_len,
             runs,
         }))

@@ -124,6 +124,38 @@ static int phase_read_vs_mapping_mutation(const char *base)
     return 0;
 }
 
+static int phase_partial_read_plan(const char *base)
+{
+    enum { PAYLOAD_LEN = 3 * 4096 + 333 };
+    char path[512];
+    unsigned char payload[PAYLOAD_LEN];
+    unsigned char observed[5000];
+    snprintf(path, sizeof(path), "%s/partial-read-plan", base);
+    for (size_t i = 0; i < sizeof(payload); ++i) {
+        payload[i] = (unsigned char)(i * 37u + 11u);
+    }
+    int fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0 || write_exact(fd, payload, sizeof(payload)) != 0 || fsync(fd) != 0) {
+        return -1;
+    }
+    if (pread(fd, observed, sizeof(observed), 37) != (ssize_t)sizeof(observed)
+        || memcmp(observed, payload + 37, sizeof(observed)) != 0) {
+        return -1;
+    }
+    if (pread(fd, observed, 511, 4093) != 511
+        || memcmp(observed, payload + 4093, 511) != 0) {
+        return -1;
+    }
+    memset(observed, 0, sizeof(observed));
+    if (pread(fd, observed, 1000, PAYLOAD_LEN - 333) != 333
+        || memcmp(observed, payload + PAYLOAD_LEN - 333, 333) != 0
+        || pread(fd, observed, 1, PAYLOAD_LEN) != 0
+        || close(fd) != 0 || unlink(path) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static int write_exact(int fd, const void *buffer, size_t length)
 {
     const unsigned char *cursor = buffer;
@@ -405,8 +437,9 @@ int main(int argc, char **argv)
     RUN_CASE(cross_directory_rename);
     RUN_CASE(lookup_stat_vs_namespace_mutation);
     RUN_CASE(read_vs_mapping_mutation);
+    RUN_CASE(partial_read_plan);
     RUN_CASE(shutdown_drain_stress);
 #undef RUN_CASE
-    puts("FS4_INODE_STATE_PROBE_PASS cases=7");
+    puts("FS4_INODE_STATE_PROBE_PASS cases=8");
     return 0;
 }
