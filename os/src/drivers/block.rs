@@ -235,6 +235,23 @@ impl VirtIOBlock {
         });
     }
 
+    pub(crate) fn write_blocks_for_file_plan(
+        &self,
+        block_id: usize,
+        buf: &[u8],
+    ) -> block_cache::WriteStats {
+        assert_eq!(buf.len() % 512, 0, "file write plan must use full blocks");
+        assert!(
+            block_id
+                .checked_add(buf.len() / 512)
+                .is_some_and(|end| end <= self.capacity_blocks),
+            "file write plan exceeds block device capacity"
+        );
+        block_cache::write_with_cache(self.cache_key(), block_id, buf, |block_id, buf| {
+            self.write_blocks_uncached(block_id, buf);
+        })
+    }
+
     fn write_blocks_uncached(&self, block_id: usize, buf: &[u8]) {
         let _inflight = DeviceIoInflightGuard::new();
         match choose_block_io_path() {

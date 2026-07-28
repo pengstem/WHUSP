@@ -132,6 +132,12 @@ pub(crate) struct VersionedReadStats {
     pub(crate) device_blocks: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WriteStats {
+    pub(crate) device_calls: usize,
+    pub(crate) device_blocks: usize,
+}
+
 #[derive(Clone, Copy)]
 struct ReadFillToken {
     write_epoch: usize,
@@ -1007,12 +1013,14 @@ pub(crate) fn write_with_cache<F>(
     block_id: usize,
     buf: &[u8],
     mut write_uncached: F,
-) where
+) -> WriteStats
+where
     F: FnMut(usize, &[u8]),
 {
     let _device_write_guard = begin_device_write(device_key);
     let full_blocks = buf.len() / BLOCK_CACHE_LINE_SIZE;
     let full_bytes = full_blocks * BLOCK_CACHE_LINE_SIZE;
+    let mut stats = WriteStats::default();
     let mut index = 0;
     while index < full_blocks {
         let start = index * BLOCK_CACHE_LINE_SIZE;
@@ -1021,6 +1029,8 @@ pub(crate) fn write_with_cache<F>(
             let end = start + blocks * BLOCK_CACHE_LINE_SIZE;
             record_device_write_submit(blocks);
             write_uncached(block_id + index, &buf[start..end]);
+            stats.device_calls += 1;
+            stats.device_blocks += blocks;
             cache_invalidate_read4k_range(device_key, block_id + index, blocks);
             cache_invalidate_legacy_range_after_write(device_key, block_id + index, blocks);
             cache_update_after_write4k_run(device_key, block_id + index, &buf[start..end]);
@@ -1031,6 +1041,8 @@ pub(crate) fn write_with_cache<F>(
             let end = start + READ_CACHE_LINE_SIZE;
             record_device_write_submit(READ_CACHE_LINE_BLOCKS);
             write_uncached(block_id + index, &buf[start..end]);
+            stats.device_calls += 1;
+            stats.device_blocks += READ_CACHE_LINE_BLOCKS;
             cache_invalidate_read4k_range(device_key, block_id + index, READ_CACHE_LINE_BLOCKS);
             cache_invalidate_legacy_range_after_write(
                 device_key,
@@ -1046,6 +1058,8 @@ pub(crate) fn write_with_cache<F>(
         let end = start + blocks * BLOCK_CACHE_LINE_SIZE;
         record_device_write_submit(blocks);
         write_uncached(block_id + index, &buf[start..end]);
+        stats.device_calls += 1;
+        stats.device_blocks += blocks;
         cache_invalidate_read4k_range(device_key, block_id + index, blocks);
         cache_update_after_write_run(device_key, block_id + index, &buf[start..end]);
         index += blocks;
@@ -1057,9 +1071,12 @@ pub(crate) fn write_with_cache<F>(
         record_write4k_fallback();
         record_device_write_submit(1);
         write_uncached(block_id + full_blocks, tail);
+        stats.device_calls += 1;
+        stats.device_blocks += 1;
         cache_invalidate_read4k_range(device_key, block_id + full_blocks, 1);
         cache_invalidate_key_after_write(device_key, block_id + full_blocks);
     }
+    stats
 }
 
 pub(crate) fn stats_snapshot() -> BlockCacheStats {

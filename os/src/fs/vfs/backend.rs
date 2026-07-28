@@ -105,6 +105,13 @@ pub(crate) trait BackendReadPlan: Send {
     fn execute(self: Box<Self>, buf: &mut [u8]) -> usize;
 }
 
+pub(crate) trait BackendWritePlan: Send {
+    // The caller must keep the inode mapping-mutation lease until this object
+    // is executed or dropped. Implementations may own short integer-LBA
+    // reservations, but never a backend/core guard or an FFI pointer.
+    fn execute(self: Box<Self>, buf: &[u8]) -> usize;
+}
+
 pub(crate) struct BackendDirectoryEntry {
     pub(crate) offset: u64,
     pub(crate) ino: u32,
@@ -362,6 +369,14 @@ pub(crate) trait LegacyFileSystemBackend: Send {
         None
     }
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize;
+    fn prepare_write_plan(
+        &mut self,
+        _ino: u32,
+        _offset: u64,
+        _len: usize,
+    ) -> Option<Box<dyn BackendWritePlan>> {
+        None
+    }
     fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize;
     fn prepare_directory_read_plan(
         &mut self,
@@ -452,6 +467,12 @@ pub(crate) trait ConcurrentFileSystemBackend: Send + Sync {
         len: usize,
     ) -> Option<Box<dyn BackendReadPlan>>;
     fn read_at(&self, ino: u32, buf: &mut [u8], offset: u64) -> usize;
+    fn prepare_write_plan(
+        &self,
+        ino: u32,
+        offset: u64,
+        len: usize,
+    ) -> Option<Box<dyn BackendWritePlan>>;
     fn write_at(&self, ino: u32, buf: &[u8], offset: u64) -> usize;
     fn prepare_directory_read_plan(
         &self,
@@ -782,6 +803,17 @@ impl ConcurrentFileSystemBackend for SerializedBackend {
     fn read_at(&self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
         self.call(BackendOp::ReadFallback, |backend| {
             backend.read_at(ino, buf, offset)
+        })
+    }
+
+    fn prepare_write_plan(
+        &self,
+        ino: u32,
+        offset: u64,
+        len: usize,
+    ) -> Option<Box<dyn BackendWritePlan>> {
+        self.call(BackendOp::Write, |backend| {
+            backend.prepare_write_plan(ino, offset, len)
         })
     }
 

@@ -26,11 +26,19 @@ CASES = (
     "lookup_stat_vs_namespace_mutation",
     "read_vs_mapping_mutation",
     "partial_read_plan",
+    "mapped_overwrite_plan",
+    "independent_mapped_overwrite",
     "readlink_plan",
     "readlink_vs_unlink",
     "directory_snapshot",
     "readdir_vs_namespace_mutation",
     "shutdown_drain_stress",
+)
+MAPPED_WRITE_CELL_RE = re.compile(
+    r"FS4_MAPPED_WRITE_CELL workers=(?P<workers>[0-9]+) "
+    r"iterations=(?P<iterations>[0-9]+) bytes=(?P<bytes>[0-9]+) "
+    r"elapsed_ns=(?P<elapsed_ns>[0-9]+) "
+    r"throughput_bytes_per_s=(?P<throughput>[0-9]+) errors=(?P<errors>[0-9]+)"
 )
 
 
@@ -42,6 +50,7 @@ def render_guest(args: argparse.Namespace) -> str:
         "@SMP@": str(args.smp),
         "@MEM@": args.mem,
         "@BLOCK_IO_MODE@": args.block_io_mode,
+        "@PERF_COUNTERS@": str(args.perf_counters),
     }.items():
         bench.validate_token(placeholder, value)
         if source.count(placeholder) != 1:
@@ -113,16 +122,36 @@ def build_disk(args: argparse.Namespace, temp_root: Path, probe: Path, setup: Pa
     return image
 
 
+def perf_snapshot(lines: list[str], point: str) -> tuple[dict[str, int], list[str]]:
+    begin = f"FS4_INODE_STATE_PERF_BEGIN point={point}"
+    end = f"FS4_INODE_STATE_PERF_END point={point}"
+    indexes = ([i for i, line in enumerate(lines) if line == begin],
+               [i for i, line in enumerate(lines) if line == end])
+    if len(indexes[0]) != 1 or len(indexes[1]) != 1 or indexes[0][0] >= indexes[1][0]:
+        return {}, [f"invalid {point} perf snapshot markers"]
+    values: dict[str, int] = {}
+    errors: list[str] = []
+    for line in lines[indexes[0][0] + 1:indexes[1][0]]:
+        match = bench.PERF_VALUE_RE.fullmatch(line)
+        if match is None:
+            continue
+        key = match.group("key")
+        if key in values:
+            errors.append(f"duplicate {point} perf key: {key}")
+        values[key] = int(match.group("value"))
+    return values, errors
+
+
 def validate(log: str, args: argparse.Namespace, overlay_root: Path) -> dict[str, Any]:
     lines = [bench.ANSI_RE.sub("", line.rstrip("\r")) for line in log.splitlines()]
     errors: list[str] = []
     start = (
         f"FS4_INODE_STATE_GUEST_START run_id={args.run_id} arch={args.arch} smp={args.smp} "
-        f"mem={args.mem} block_io={args.block_io_mode}"
+        f"mem={args.mem} block_io={args.block_io_mode} perf={args.perf_counters}"
     )
     passed = (
         f"FS4_INODE_STATE_GUEST_PASS run_id={args.run_id} arch={args.arch} smp={args.smp} "
-        f"mem={args.mem} block_io={args.block_io_mode}"
+        f"mem={args.mem} block_io={args.block_io_mode} perf={args.perf_counters}"
     )
     if lines.count(start) != 1 or lines.count(passed) != 1:
         errors.append("guest start/pass marker mismatch")
@@ -137,17 +166,57 @@ def validate(log: str, args: argparse.Namespace, overlay_root: Path) -> dict[str
         errors.append("probe pass marker mismatch")
     if any("FS4_INODE_STATE_CASE_FAIL" in line or "FS4_INODE_STATE_FAIL" in line for line in lines):
         errors.append("guest emitted failure marker")
+    cells = [match.groupdict() for line in lines if (match := MAPPED_WRITE_CELL_RE.fullmatch(line))]
+    workers = {int(cell["workers"]) for cell in cells}
+    if workers != {1, 2, 4, 8} or any(int(cell["errors"]) != 0 for cell in cells):
+        errors.append(f"mapped-write cell matrix mismatch: {cells}")
     if bench.PANIC_RE.search(log):
         errors.append("kernel panic signature present")
     policies = list(bench.BLOCK_IO_POLICY_RE.finditer(log))
-    if len(policies) != 1 or policies[0].group("block_io") != args.block_io_mode:
+    if (len(policies) != 1 or policies[0].group("block_io") != args.block_io_mode
+            or policies[0].group("perf_counters") != ("true" if args.perf_counters else "false")):
         errors.append("block IO policy identity mismatch")
     shutdowns = list(bench.SHUTDOWN_RE.finditer(log))
     if len(shutdowns) != 1 or shutdowns[0].group("failure") != "false":
         errors.append("clean shutdown marker mismatch")
     overlay_path, overlay_errors = bench.validate_overlay_log(log, overlay_root)
     errors.extend(overlay_errors)
-    return {"valid": not errors, "errors": errors, "cases": sorted(seen), "overlay_path": overlay_path}
+    before, perf_errors = perf_snapshot(lines, "before")
+    after, after_errors = perf_snapshot(lines, "after")
+    errors.extend(perf_errors)
+    errors.extend(after_errors)
+    perf_delta = {
+        key: after[key] - before.get(key, 0)
+        for key in after
+        if key in before and after[key] >= before[key]
+    }
+    if args.perf_counters:
+        attempts = perf_delta.get("ext4_write_plan_attempts", 0)
+        prepared = perf_delta.get("ext4_write_plan_prepared", 0)
+        executed = perf_delta.get("ext4_write_plan_executed", 0)
+        fallbacks = perf_delta.get("ext4_write_plan_fallbacks", 0)
+        if attempts == 0 or attempts != prepared + fallbacks or prepared != executed:
+            errors.append(
+                f"write-plan counter conservation failed: attempts={attempts} "
+                f"prepared={prepared} executed={executed} fallbacks={fallbacks}"
+            )
+        if perf_delta.get("ext4_write_plan_direct_io_blocks", 0) == 0:
+            errors.append("write plan submitted no direct data blocks")
+        if perf_delta.get("ext4_write_plan_rmw_read_blocks", 0) == 0:
+            errors.append("partial mapped overwrite submitted no RMW read")
+        if (args.block_io_mode == "auto"
+                and after.get("block_io_device_inflight_high_watermark", 0) < 2):
+            errors.append("auto block I/O did not reach inflight high-watermark 2")
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "cases": sorted(seen),
+        "mapped_write_cells": cells,
+        "perf_before": before,
+        "perf_after": after,
+        "perf_delta": perf_delta,
+        "overlay_path": overlay_path,
+    }
 
 
 def run(args: argparse.Namespace) -> int:
@@ -169,6 +238,7 @@ def run(args: argparse.Namespace) -> int:
             "smp": args.smp,
             "mem": args.mem,
             "block_io_mode": args.block_io_mode,
+            "perf_counters": args.perf_counters,
         },
         "kernel": bench.file_metadata(args.kernel_elf),
         "test_disk": bench.file_metadata(args.test_disk),
@@ -182,7 +252,7 @@ def run(args: argparse.Namespace) -> int:
             smp=args.smp,
             mem=args.mem,
             block_io_mode=args.block_io_mode,
-            perf_counters=0,
+            perf_counters=args.perf_counters,
             kernel=args.kernel_elf.resolve(),
             disk=args.test_disk.resolve(),
             aux_disk=disk,
@@ -220,6 +290,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smp", type=int, default=8)
     parser.add_argument("--mem", default="8G")
     parser.add_argument("--block-io-mode", choices=("auto", "force-sync"), default="force-sync")
+    parser.add_argument("--perf-counters", type=int, choices=(0, 1), default=0)
     parser.add_argument("--kernel-elf", type=Path, required=True)
     parser.add_argument("--test-disk", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)

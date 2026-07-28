@@ -1,10 +1,10 @@
 use core::{marker::PhantomData, mem, time::Duration};
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
-    DirLookupResult, DirReader, Ext4DirectoryReadPlan, Ext4Error, Ext4MappedReadPlan, Ext4Result,
-    Ext4SymlinkReadPlan, FileAttr, InodeRef, InodeType,
+    DirLookupResult, DirReader, Ext4DirectoryReadPlan, Ext4Error, Ext4MappedReadPlan,
+    Ext4MappedWritePlan, Ext4Result, Ext4SymlinkReadPlan, FileAttr, InodeRef, InodeType,
     blockdev::{BlockDevice, Ext4BlockDevice},
     error::Context,
     ffi::*,
@@ -101,6 +101,45 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
     pub fn invalidate_clean_cache(&mut self) {
         unsafe {
             ext4_bcache_cleanup(self.bdev.inner.as_mut().bc);
+        }
+    }
+
+    /// Invalidates cached aliases only when every matching buffer was clean
+    /// and unreferenced before this call acquired its temporary reference.
+    ///
+    /// `Some(n)` reports the number of aliases removed. `None` leaves every
+    /// acquired buffer valid and tells the caller to keep the overwrite on the
+    /// serialized lwext4 path. The owning core lock must exclude all other
+    /// operations on this exact bcache.
+    pub fn invalidate_clean_unreferenced_blocks(&mut self, blocks: &[u64]) -> Option<usize> {
+        unsafe {
+            let bcache = self.bdev.inner.as_mut().bc;
+            let mut held: Vec<ext4_block> = Vec::with_capacity(blocks.len());
+            let dirty_mask = 1i32 << bcache_state_bits_BC_DIRTY;
+            let mut eligible = true;
+            for &lba in blocks {
+                let mut block: ext4_block = mem::zeroed();
+                let buf = ext4_bcache_find_get(bcache, &mut block, lba);
+                if buf.is_null() {
+                    continue;
+                }
+                eligible &= (*buf).refctr == 1 && (*buf).flags & dirty_mask == 0;
+                held.push(block);
+                if !eligible {
+                    break;
+                }
+            }
+            if eligible {
+                for block in &held {
+                    ext4_bcache_invalidate_buf(bcache, block.buf);
+                }
+            }
+            let found = held.len();
+            for block in &mut held {
+                let rc = ext4_bcache_free(bcache, block);
+                debug_assert_eq!(rc, EOK as i32);
+            }
+            eligible.then_some(found)
         }
     }
 
@@ -224,6 +263,15 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         offset: u64,
     ) -> Ext4Result<Option<Ext4DirectoryReadPlan>> {
         self.inode_ref(parent)?.plan_directory_read(offset)
+    }
+
+    pub fn plan_mapped_overwrite(
+        &mut self,
+        ino: u32,
+        len: usize,
+        offset: u64,
+    ) -> Ext4Result<Option<Ext4MappedWritePlan>> {
+        self.inode_ref(ino)?.plan_mapped_overwrite(len, offset)
     }
 
     pub fn create(&mut self, parent: u32, name: &str, ty: InodeType, mode: u32) -> Ext4Result<u32> {

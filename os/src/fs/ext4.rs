@@ -6,17 +6,17 @@ use super::dirent::{
 use super::vfs::BackendIoSnapshot;
 use super::vfs::{
     BackendDirectoryEntry, BackendDirectoryReadPlan, BackendDirectorySnapshot, BackendOp,
-    BackendReadPlan, ConcurrentFileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult,
-    InodeRelease, LegacyFileSystemBackend,
+    BackendReadPlan, BackendWritePlan, ConcurrentFileSystemBackend, FileSystemStat, FsError,
+    FsNodeKind, FsResult, InodeRelease, LegacyFileSystemBackend,
 };
 use super::{FS_STATX_ATTR_FLAGS, FileStat, FileTimestamp};
 use crate::config::MAX_CPUS;
 use crate::drivers::block::VirtIOBlock;
 use crate::perf;
-use crate::sync::{SleepMutex, SleepMutexGuard};
+use crate::sync::{SleepMutex, SleepMutexGuard, SpinNoIrqLock};
 use crate::task::suspend_current_and_run_next;
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -31,7 +31,8 @@ use lwext4_rust::ffi::{
 use lwext4_rust::{
     BlockDevice as Ext4BlockDevice, EXT4_DEV_BSIZE,
     Ext4DirectoryReadPlan as LwExt4DirectoryReadPlan, Ext4Error, Ext4Filesystem,
-    Ext4MappedReadPlan, Ext4Result, Ext4SymlinkReadPlan, FsConfig, InodeType, SystemHal,
+    Ext4MappedReadPlan, Ext4MappedWritePlan, Ext4Result, Ext4SymlinkReadPlan, FsConfig, InodeType,
+    SystemHal,
 };
 
 pub(super) struct KernelHal;
@@ -569,6 +570,70 @@ impl Ext4Mount {
         }))
     }
 
+    fn prepare_mapped_write_plan(
+        &mut self,
+        ino: u32,
+        offset: u64,
+        len: usize,
+    ) -> Option<Ext4PreparedWritePlan> {
+        let Ext4MappedWritePlan {
+            block_size,
+            buffer_len,
+            write_offset,
+            write_len,
+            runs: mapped_runs,
+        } = self.fs.plan_mapped_overwrite(ino, len, offset).ok()??;
+        if block_size % EXT4_DEV_BSIZE != 0 {
+            return None;
+        }
+        let device_blocks_per_fs_block = block_size / EXT4_DEV_BSIZE;
+        let mut runs = Vec::with_capacity(mapped_runs.len());
+        let mut fs_blocks = Vec::new();
+        for run in mapped_runs {
+            let buffer_start = run.buffer_block.checked_mul(block_size)?;
+            let byte_len = run.block_count.checked_mul(block_size)?;
+            if buffer_start
+                .checked_add(byte_len)
+                .is_none_or(|end| end > buffer_len)
+            {
+                return None;
+            }
+            let device_block = run
+                .fs_block
+                .checked_mul(device_blocks_per_fs_block as u64)
+                .and_then(|block| usize::try_from(block).ok())?;
+            let device_blocks = run.block_count.checked_mul(device_blocks_per_fs_block)?;
+            if device_block
+                .checked_add(device_blocks)
+                .is_none_or(|end| end > self.device.num_blocks() as usize)
+            {
+                return None;
+            }
+            for delta in 0..run.block_count {
+                fs_blocks.push(run.fs_block.checked_add(delta as u64)?);
+            }
+            runs.push(Ext4DeviceWriteRun {
+                buffer_start,
+                byte_len,
+                device_block,
+            });
+        }
+        Some(Ext4PreparedWritePlan {
+            device: self.device.clone(),
+            write_sequence: self.write_sequence.clone(),
+            block_size,
+            buffer_len,
+            write_offset,
+            write_len,
+            runs,
+            fs_blocks,
+        })
+    }
+
+    fn invalidate_mapped_write_aliases(&mut self, fs_blocks: &[u64]) -> Option<usize> {
+        self.fs.invalidate_clean_unreferenced_blocks(fs_blocks)
+    }
+
     fn free_unlinked_inode(&mut self, ino: u32) -> FsResult<InodeRelease> {
         self.fs.free_unlinked_inode(ino).map_err(map_ext4_error)?;
         self.inode_runtime.remove(ino);
@@ -607,6 +672,54 @@ impl Ext4Mount {
     }
 }
 
+struct Ext4WriteLeaseTable {
+    blocks: SpinNoIrqLock<BTreeSet<u64>>,
+}
+
+impl Ext4WriteLeaseTable {
+    fn new() -> Self {
+        Self {
+            blocks: SpinNoIrqLock::new(BTreeSet::new()),
+        }
+    }
+
+    fn reserve(self: &Arc<Self>, blocks: &[u64]) -> Option<Ext4WriteLbaLease> {
+        let mut unique = BTreeSet::new();
+        for &block in blocks {
+            if !unique.insert(block) {
+                return None;
+            }
+        }
+        let mut reserved = self.blocks.lock();
+        if unique.iter().any(|block| reserved.contains(block)) {
+            return None;
+        }
+        reserved.extend(unique.iter().copied());
+        drop(reserved);
+        Some(Ext4WriteLbaLease {
+            table: self.clone(),
+            blocks: unique.into_iter().collect(),
+        })
+    }
+}
+
+struct Ext4WriteLbaLease {
+    table: Arc<Ext4WriteLeaseTable>,
+    blocks: Vec<u64>,
+}
+
+impl Drop for Ext4WriteLbaLease {
+    fn drop(&mut self) {
+        let mut reserved = self.table.blocks.lock();
+        for block in self.blocks.drain(..) {
+            assert!(
+                reserved.remove(&block),
+                "ext4 write LBA lease lost ownership"
+            );
+        }
+    }
+}
+
 /// One writable lwext4 core plus inode-sharded read-only replicas.
 ///
 /// Each C core owns its raw pointers and bcache and is entered by one task at a
@@ -619,6 +732,7 @@ pub(super) struct ConcurrentExt4Backend {
     readers: Vec<SleepMutex<Ext4Mount>>,
     inode_runtime: Arc<Ext4InodeRuntimeTable>,
     cache_generation: Ext4Sequence,
+    write_leases: Arc<Ext4WriteLeaseTable>,
 }
 
 impl ConcurrentExt4Backend {
@@ -635,6 +749,7 @@ impl ConcurrentExt4Backend {
             readers,
             inode_runtime,
             cache_generation: Ext4Sequence::new(),
+            write_leases: Arc::new(Ext4WriteLeaseTable::new()),
         })
     }
 
@@ -838,6 +953,49 @@ struct Ext4DeviceReadRun {
     device_block: Option<usize>,
 }
 
+struct Ext4DeviceWriteRun {
+    buffer_start: usize,
+    byte_len: usize,
+    device_block: usize,
+}
+
+struct Ext4PreparedWritePlan {
+    device: Arc<VirtIOBlock>,
+    write_sequence: Arc<Ext4Sequence>,
+    block_size: usize,
+    buffer_len: usize,
+    write_offset: usize,
+    write_len: usize,
+    runs: Vec<Ext4DeviceWriteRun>,
+    fs_blocks: Vec<u64>,
+}
+
+impl Ext4PreparedWritePlan {
+    fn publish(self, lease: Ext4WriteLbaLease) -> Ext4DeviceWritePlan {
+        Ext4DeviceWritePlan {
+            device: self.device,
+            write_sequence: self.write_sequence,
+            block_size: self.block_size,
+            buffer_len: self.buffer_len,
+            write_offset: self.write_offset,
+            write_len: self.write_len,
+            runs: self.runs,
+            _lease: lease,
+        }
+    }
+}
+
+struct Ext4DeviceWritePlan {
+    device: Arc<VirtIOBlock>,
+    write_sequence: Arc<Ext4Sequence>,
+    block_size: usize,
+    buffer_len: usize,
+    write_offset: usize,
+    write_len: usize,
+    runs: Vec<Ext4DeviceWriteRun>,
+    _lease: Ext4WriteLbaLease,
+}
+
 struct Ext4DeviceReadPlan {
     device: Arc<VirtIOBlock>,
     write_sequence: Arc<Ext4Sequence>,
@@ -1003,6 +1161,58 @@ impl BackendReadPlan for Ext4DeviceReadPlan {
             perf::record_ext4_directory_plan_executed(self.read_len);
         }
         self.read_len
+    }
+}
+
+impl BackendWritePlan for Ext4DeviceWritePlan {
+    fn execute(self: Box<Self>, buf: &[u8]) -> usize {
+        if buf.len() != self.write_len
+            || self.block_size == 0
+            || self.buffer_len % self.block_size != 0
+        {
+            return 0;
+        }
+
+        let mut bounce = (self.write_offset != 0 || self.buffer_len != self.write_len)
+            .then(|| vec![0u8; self.buffer_len]);
+        let mut rmw_calls = 0usize;
+        let mut rmw_blocks = 0usize;
+        if let Some(bounce) = bounce.as_deref_mut() {
+            for run in &self.runs {
+                let run_buf = &mut bounce[run.buffer_start..run.buffer_start + run.byte_len];
+                let io = self.write_sequence.read_stable(|| {
+                    self.device
+                        .read_blocks_versioned_fill_for_file_plan(run.device_block, run_buf)
+                });
+                rmw_calls += io.device_calls;
+                rmw_blocks += io.device_blocks;
+            }
+            bounce[self.write_offset..self.write_offset + self.write_len].copy_from_slice(buf);
+        }
+        perf::record_ext4_write_plan_rmw_read(rmw_calls, rmw_blocks, rmw_blocks * EXT4_DEV_BSIZE);
+
+        // One sequence epoch covers every fragmented physical run. Clean read
+        // plans that overlap this overwrite either finish before the epoch or
+        // discard their private copy and retry after all runs are durable.
+        let _write = self.write_sequence.begin_write();
+        let plan_buf = bounce.as_deref().unwrap_or(buf);
+        let mut direct_calls = 0usize;
+        let mut direct_blocks = 0usize;
+        for run in &self.runs {
+            let io = self.device.write_blocks_for_file_plan(
+                run.device_block,
+                &plan_buf[run.buffer_start..run.buffer_start + run.byte_len],
+            );
+            direct_calls += io.device_calls;
+            direct_blocks += io.device_blocks;
+        }
+        perf::record_ext4_write_plan_executed(
+            self.write_len,
+            direct_calls,
+            direct_blocks,
+            direct_blocks * EXT4_DEV_BSIZE,
+        );
+        self.write_len
     }
 }
 
@@ -1683,6 +1893,45 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         self.with_reader(BackendOp::ReadFallback, ino, |reader, _| {
             reader.read_at(ino, buf, offset)
         })
+    }
+
+    fn prepare_write_plan(
+        &self,
+        ino: u32,
+        offset: u64,
+        len: usize,
+    ) -> Option<Box<dyn BackendWritePlan>> {
+        // Mapping lookup and bcache alias invalidation are short control-core
+        // operations. The returned object owns only integer ranges, the block
+        // device, and an LBA lease; its data I/O runs after every core guard is
+        // released while the VFS still holds this inode's mapping lease.
+        perf::record_ext4_write_plan_attempt();
+        let prepared = self.with_writer_read(BackendOp::Write, |writer| {
+            let prepared = writer.prepare_mapped_write_plan(ino, offset, len)?;
+            let lease = self.write_leases.reserve(&prepared.fs_blocks)?;
+            let aliases = writer.invalidate_mapped_write_aliases(&prepared.fs_blocks)?;
+            Some((prepared, lease, aliases))
+        });
+
+        let Some((prepared, lease, mut aliases)) = prepared else {
+            perf::record_ext4_write_plan_fallback(false);
+            return None;
+        };
+        for reader in &self.readers {
+            let mut reader = Self::lock_core(reader, BackendOp::Write);
+            let Some(invalidated) = reader.invalidate_mapped_write_aliases(&prepared.fs_blocks)
+            else {
+                perf::record_ext4_write_plan_fallback(true);
+                return None;
+            };
+            aliases += invalidated;
+        }
+        perf::record_ext4_write_plan_prepared(
+            prepared.runs.len(),
+            prepared.fs_blocks.len(),
+            aliases,
+        );
+        Some(Box::new(prepared.publish(lease)))
     }
 
     fn write_at(&self, ino: u32, buf: &[u8], offset: u64) -> usize {

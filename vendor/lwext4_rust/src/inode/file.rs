@@ -27,6 +27,22 @@ pub struct Ext4MappedReadPlan {
     pub runs: Vec<Ext4MappedReadRun>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ext4MappedWriteRun {
+    pub buffer_block: usize,
+    pub block_count: usize,
+    pub fs_block: u64,
+}
+
+#[derive(Debug)]
+pub struct Ext4MappedWritePlan {
+    pub block_size: usize,
+    pub buffer_len: usize,
+    pub write_offset: usize,
+    pub write_len: usize,
+    pub runs: Vec<Ext4MappedWriteRun>,
+}
+
 #[derive(Debug)]
 pub enum Ext4SymlinkReadPlan {
     Inline(Vec<u8>),
@@ -186,6 +202,90 @@ impl<Hal: SystemHal> InodeRef<Hal> {
                 runs
             },
         })))
+    }
+
+    /// Maps an overwrite that cannot allocate, extend, or convert extents.
+    ///
+    /// A zero physical block covers both holes and unwritten extents in the
+    /// non-creating lwext4 lookup, so either condition rejects the plan. The
+    /// returned object contains only integer ranges and remains valid only
+    /// while the caller holds the inode mapping-mutation lease.
+    pub fn plan_mapped_overwrite(
+        &mut self,
+        len: usize,
+        pos: u64,
+    ) -> Ext4Result<Option<Ext4MappedWritePlan>> {
+        let file_size = self.size();
+        let block_size = get_block_size(self.superblock()) as usize;
+        let Some(end) = pos.checked_add(len as u64) else {
+            return Ok(None);
+        };
+        if self.inode_type() != InodeType::RegularFile
+            || len == 0
+            || block_size == 0
+            || end > file_size
+        {
+            return Ok(None);
+        }
+
+        let block_size_u64 = block_size as u64;
+        let aligned_start = pos / block_size_u64 * block_size_u64;
+        let Some(aligned_end) = end
+            .checked_add(block_size_u64 - 1)
+            .map(|value| value / block_size_u64 * block_size_u64)
+        else {
+            return Ok(None);
+        };
+        let logical_start_u64 = aligned_start / block_size_u64;
+        let logical_blocks_u64 = (aligned_end - aligned_start) / block_size_u64;
+        let Ok(logical_start) = u32::try_from(logical_start_u64) else {
+            return Ok(None);
+        };
+        let Ok(logical_blocks) = usize::try_from(logical_blocks_u64) else {
+            return Ok(None);
+        };
+        let Ok(logical_blocks_u32) = u32::try_from(logical_blocks) else {
+            return Ok(None);
+        };
+        if logical_start.checked_add(logical_blocks_u32).is_none() {
+            return Ok(None);
+        }
+        let Some(buffer_len) = logical_blocks.checked_mul(block_size) else {
+            return Ok(None);
+        };
+        let Ok(write_offset) = usize::try_from(pos - aligned_start) else {
+            return Ok(None);
+        };
+
+        let mut runs: Vec<Ext4MappedWriteRun> = Vec::new();
+        for buffer_block in 0..logical_blocks {
+            let logical_block = logical_start + buffer_block as u32;
+            let fs_block = self.get_inode_fblock(logical_block)?;
+            if fs_block == 0 {
+                return Ok(None);
+            }
+            let can_merge = runs.last().is_some_and(|last| {
+                last.buffer_block + last.block_count == buffer_block
+                    && last.fs_block + last.block_count as u64 == fs_block
+            });
+            if can_merge {
+                runs.last_mut().unwrap().block_count += 1;
+            } else {
+                runs.push(Ext4MappedWriteRun {
+                    buffer_block,
+                    block_count: 1,
+                    fs_block,
+                });
+            }
+        }
+
+        Ok(Some(Ext4MappedWritePlan {
+            block_size,
+            buffer_len,
+            write_offset,
+            write_len: len,
+            runs,
+        }))
     }
 
     pub(super) fn get_inode_fblock(&mut self, block: u32) -> Ext4Result<u64> {

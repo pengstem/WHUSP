@@ -961,7 +961,32 @@ fn restore_dirty_writeback(node: VfsNodeId, batch: DirtyWritebackBatch) {
     }
 }
 
-fn flush_dirty_regular_file_for_reason(node: VfsNodeId, reason: DirtyFlushReason) -> FsResult {
+fn write_backend_at(node: VfsNodeId, offset: u64, data: &[u8], allow_plan: bool) -> Option<usize> {
+    if allow_plan {
+        let plan = with_mount(node.mount_id, BackendOp::Write, |mount| {
+            mount.prepare_write_plan(node.ino, offset, data.len())
+        })
+        .flatten();
+        if let Some(plan) = plan {
+            return Some(plan.execute(data));
+        }
+    }
+    with_mount(node.mount_id, BackendOp::Write, |mount| {
+        mount.write_at(node.ino, data, offset)
+    })
+}
+
+/// Flushes one dirty file while its inode mapping-mutation lease is held.
+///
+/// `allow_plan` is false only for pressure reclaim of a different inode while
+/// the caller already owns one mapping lease. That compatibility case avoids
+/// cross-inode ABBA; normal explicit flushes and the caller's own dirty data
+/// use the lock-free mapped-overwrite executor.
+fn flush_dirty_regular_file_for_reason_under_mapping(
+    node: VfsNodeId,
+    reason: DirtyFlushReason,
+    allow_plan: bool,
+) -> FsResult {
     if !dirty_regular_file_has_pages(node) {
         return Ok(());
     }
@@ -977,9 +1002,7 @@ fn flush_dirty_regular_file_for_reason(node: VfsNodeId, reason: DirtyFlushReason
     let mut result = Ok(());
     for run in batch.runs.iter() {
         perf::record_vfs_write_backend(run.data.len());
-        let write_size = with_mount(node.mount_id, BackendOp::Write, |mount| {
-            mount.write_at(node.ino, &run.data, run.offset as u64)
-        });
+        let write_size = write_backend_at(node, run.offset as u64, &run.data, allow_plan);
         let write_size = match write_size {
             Some(write_size) => write_size,
             None => {
@@ -1001,6 +1024,15 @@ fn flush_dirty_regular_file_for_reason(node: VfsNodeId, reason: DirtyFlushReason
     record_dirty_cache_flush(reason, pages, bytes);
     release_inode_from_drop(&batch.inode_state);
     Ok(())
+}
+
+fn flush_dirty_regular_file_for_reason(node: VfsNodeId, reason: DirtyFlushReason) -> FsResult {
+    if !dirty_regular_file_has_pages(node) {
+        return Ok(());
+    }
+    inode_state::with_mapping_mutation(node, || {
+        flush_dirty_regular_file_for_reason_under_mapping(node, reason, true)
+    })
 }
 
 pub(crate) fn flush_dirty_regular_file(node: VfsNodeId) -> FsResult {
@@ -1025,14 +1057,32 @@ pub(crate) fn flush_dirty_regular_files_on_mount(mount_id: MountId) -> FsResult 
     result
 }
 
-fn flush_dirty_regular_files_for_pressure() -> FsResult {
+fn flush_dirty_regular_files_for_pressure(mapping_locked: Option<VfsNodeId>) -> FsResult {
     let nodes = {
         let dirty = DIRTY_REGULAR_FILES.lock();
         dirty.keys().copied().collect::<Vec<_>>()
     };
     let mut result = Ok(());
     for node in nodes {
-        if let Err(err) = flush_dirty_regular_file_for_reason(node, DirtyFlushReason::Pressure) {
+        let flush = if mapping_locked == Some(node) {
+            flush_dirty_regular_file_for_reason_under_mapping(
+                node,
+                DirtyFlushReason::Pressure,
+                true,
+            )
+        } else if mapping_locked.is_some() {
+            // Do not acquire a second inode mapping lease while one is held.
+            // The legacy backend path preserves the pre-FS4 locking behavior
+            // for this rare global-pressure case.
+            flush_dirty_regular_file_for_reason_under_mapping(
+                node,
+                DirtyFlushReason::Pressure,
+                false,
+            )
+        } else {
+            flush_dirty_regular_file_for_reason(node, DirtyFlushReason::Pressure)
+        };
+        if let Err(err) = flush {
             result = result.and(Err(err));
         }
     }
@@ -1472,7 +1522,8 @@ impl VfsFile {
                                 break;
                             }
                             DirtyCacheWriteResult::NeedsPressureFlush if !pressure_retried => {
-                                if flush_dirty_regular_files_for_pressure().is_err() {
+                                if flush_dirty_regular_files_for_pressure(Some(self.node)).is_err()
+                                {
                                     break;
                                 }
                                 pressure_retried = true;
@@ -1487,14 +1538,20 @@ impl VfsFile {
                 }
                 if self.kind == FsNodeKind::RegularFile && !chunk.is_empty() {
                     record_dirty_cache_fallback();
-                    if flush_dirty_regular_file(self.node).is_err() {
+                    if flush_dirty_regular_file_for_reason_under_mapping(
+                        self.node,
+                        DirtyFlushReason::Explicit,
+                        true,
+                    )
+                    .is_err()
+                    {
                         break;
                     }
                 }
                 perf::record_vfs_write_backend(chunk.len());
-                let Some(write_size) = with_mount(self.node.mount_id, BackendOp::Write, |mount| {
-                    mount.write_at(self.node.ino, chunk, chunk_offset as u64)
-                }) else {
+                let Some(write_size) =
+                    write_backend_at(self.node, chunk_offset as u64, chunk, true)
+                else {
                     break;
                 };
                 total_write_size = total_write_size.saturating_add(write_size);
@@ -2912,7 +2969,7 @@ impl File for VfsFile {
             match cache_dirty_regular_user_buffer_write(self.node, offset, &buf) {
                 DirtyCacheWriteResult::Cached(write_size) => return Ok(write_size),
                 DirtyCacheWriteResult::NeedsPressureFlush if !pressure_retried => {
-                    flush_dirty_regular_files_for_pressure()?;
+                    flush_dirty_regular_files_for_pressure(None)?;
                     pressure_retried = true;
                 }
                 DirtyCacheWriteResult::NeedsPressureFlush | DirtyCacheWriteResult::Fallback => {
@@ -2955,7 +3012,7 @@ impl File for VfsFile {
             match cache_dirty_regular_user_buffer_write(self.node, write_offset, &buf) {
                 DirtyCacheWriteResult::Cached(write_size) => break write_size,
                 DirtyCacheWriteResult::NeedsPressureFlush if !pressure_retried => {
-                    if flush_dirty_regular_files_for_pressure().is_ok() {
+                    if flush_dirty_regular_files_for_pressure(None).is_ok() {
                         pressure_retried = true;
                         continue;
                     }

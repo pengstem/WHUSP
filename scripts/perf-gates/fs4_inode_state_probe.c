@@ -2,6 +2,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -12,6 +13,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 enum {
@@ -23,6 +25,11 @@ enum {
     DRAIN_STRESS_WORKERS = 12,
     DIRECTORY_SNAPSHOT_FILES = 96,
     DIRECTORY_RACE_STABLE_FILES = 24,
+    MAPPED_WRITE_BLOCK = 4096,
+    MAPPED_WRITE_CHUNK = 64 * 1024,
+    MAPPED_WRITE_FILE = 4 * MAPPED_WRITE_CHUNK,
+    MAPPED_WRITE_WORKERS = 8,
+    MAPPED_WRITE_ITERATIONS = 12,
 };
 
 struct probe_linux_dirent64 {
@@ -35,6 +42,29 @@ struct probe_linux_dirent64 {
 
 static int write_exact(int fd, const void *buffer, size_t length);
 static int wait_success(pid_t pid);
+
+static uint64_t monotonic_ns(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
+static int read_tokens(int fd, int count)
+{
+    char tokens[8];
+    int received = 0;
+    while (received < count) {
+        ssize_t amount = read(fd, tokens + received, (size_t)(count - received));
+        if (amount <= 0) {
+            return -1;
+        }
+        received += (int)amount;
+    }
+    return 0;
+}
 
 static int phase_lookup_stat_vs_namespace_mutation(const char *base)
 {
@@ -165,6 +195,186 @@ static int phase_partial_read_plan(const char *base)
         || pread(fd, observed, 1, PAYLOAD_LEN) != 0
         || close(fd) != 0 || unlink(path) != 0) {
         return -1;
+    }
+    return 0;
+}
+
+static int phase_mapped_overwrite_plan(const char *base)
+{
+    enum { PAYLOAD_LEN = 4 * MAPPED_WRITE_BLOCK };
+    char mapped[512];
+    char sparse[512];
+    unsigned char expected[PAYLOAD_LEN];
+    unsigned char observed[PAYLOAD_LEN];
+    unsigned char full[MAPPED_WRITE_BLOCK];
+    unsigned char partial[777];
+    snprintf(mapped, sizeof(mapped), "%s/mapped-overwrite", base);
+    snprintf(sparse, sizeof(sparse), "%s/mapped-overwrite-sparse", base);
+    for (size_t i = 0; i < sizeof(expected); ++i) {
+        expected[i] = (unsigned char)(i * 29u + 7u);
+    }
+    int fd = open(mapped, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0 || write_exact(fd, expected, sizeof(expected)) != 0 || fsync(fd) != 0
+        || close(fd) != 0) {
+        return -1;
+    }
+
+    memset(full, 0xb6, sizeof(full));
+    memset(partial, 0x3d, sizeof(partial));
+    fd = open(mapped, O_RDWR | O_SYNC);
+    if (fd < 0 || pwrite(fd, full, sizeof(full), MAPPED_WRITE_BLOCK) != (ssize_t)sizeof(full)
+        || pwrite(fd, partial, sizeof(partial), 2 * MAPPED_WRITE_BLOCK + 123)
+               != (ssize_t)sizeof(partial)
+        || close(fd) != 0) {
+        return -1;
+    }
+    memcpy(expected + MAPPED_WRITE_BLOCK, full, sizeof(full));
+    memcpy(expected + 2 * MAPPED_WRITE_BLOCK + 123, partial, sizeof(partial));
+    fd = open(mapped, O_RDONLY);
+    if (fd < 0 || pread(fd, observed, sizeof(observed), 0) != (ssize_t)sizeof(observed)
+        || memcmp(observed, expected, sizeof(expected)) != 0 || close(fd) != 0) {
+        return -1;
+    }
+
+    // Same-size writes into a hole and writes past EOF must reject the plan
+    // and retain the allocating/extending lwext4 transaction path.
+    struct stat sparse_stat;
+    fd = open(sparse, O_CREAT | O_EXCL | O_RDWR | O_SYNC, 0600);
+    if (fd < 0 || ftruncate(fd, 3 * MAPPED_WRITE_BLOCK) != 0
+        || pwrite(fd, partial, sizeof(partial), MAPPED_WRITE_BLOCK + 91)
+               != (ssize_t)sizeof(partial)
+        || pwrite(fd, full, sizeof(full), 3 * MAPPED_WRITE_BLOCK) != (ssize_t)sizeof(full)
+        || fstat(fd, &sparse_stat) != 0 || sparse_stat.st_size != PAYLOAD_LEN || close(fd) != 0) {
+        return -1;
+    }
+    fd = open(sparse, O_RDONLY);
+    memset(observed, 0xa5, sizeof(observed));
+    memset(expected, 0, sizeof(expected));
+    memcpy(expected + MAPPED_WRITE_BLOCK + 91, partial, sizeof(partial));
+    memcpy(expected + 3 * MAPPED_WRITE_BLOCK, full, sizeof(full));
+    if (fd < 0 || pread(fd, observed, sizeof(observed), 0) != (ssize_t)sizeof(observed)
+        || memcmp(observed, expected, sizeof(expected)) != 0
+        || close(fd) != 0 || unlink(mapped) != 0 || unlink(sparse) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int mapped_overwrite_worker(const char *path, int worker, int iterations)
+{
+    unsigned char *payload = malloc(MAPPED_WRITE_CHUNK);
+    if (payload == NULL) {
+        return -1;
+    }
+    int fd = open(path, O_RDWR | O_SYNC);
+    if (fd < 0) {
+        free(payload);
+        return -1;
+    }
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        memset(payload, worker * 17 + iteration, MAPPED_WRITE_CHUNK);
+        off_t offset = (iteration % 4) * MAPPED_WRITE_CHUNK;
+        if (pwrite(fd, payload, MAPPED_WRITE_CHUNK, offset) != MAPPED_WRITE_CHUNK) {
+            close(fd);
+            free(payload);
+            return -1;
+        }
+    }
+    int result = close(fd);
+    free(payload);
+    return result;
+}
+
+static int run_mapped_overwrite_cell(const char *base, int workers)
+{
+    int ready_pipe[2];
+    int start_pipe[2];
+    pid_t children[MAPPED_WRITE_WORKERS];
+    if (pipe(ready_pipe) != 0 || pipe(start_pipe) != 0) {
+        return -1;
+    }
+    for (int worker = 0; worker < workers; ++worker) {
+        pid_t child = fork();
+        if (child < 0) {
+            return -1;
+        }
+        if (child == 0) {
+            char path[512];
+            char token;
+            close(ready_pipe[0]);
+            close(start_pipe[1]);
+            snprintf(path, sizeof(path), "%s/mapped-worker-%d", base, worker);
+            if (write(ready_pipe[1], "r", 1) != 1 || read(start_pipe[0], &token, 1) != 1) {
+                _exit(101);
+            }
+            _exit(mapped_overwrite_worker(path, worker, MAPPED_WRITE_ITERATIONS) == 0 ? 0 : 102);
+        }
+        children[worker] = child;
+    }
+    close(ready_pipe[1]);
+    close(start_pipe[0]);
+    if (read_tokens(ready_pipe[0], workers) != 0) {
+        return -1;
+    }
+    uint64_t start = monotonic_ns();
+    if (start == 0) {
+        return -1;
+    }
+    for (int worker = 0; worker < workers; ++worker) {
+        if (write(start_pipe[1], "s", 1) != 1) {
+            return -1;
+        }
+    }
+    close(ready_pipe[0]);
+    close(start_pipe[1]);
+    int errors = 0;
+    for (int worker = 0; worker < workers; ++worker) {
+        if (wait_success(children[worker]) != 0) {
+            ++errors;
+        }
+    }
+    uint64_t end = monotonic_ns();
+    if (end <= start) {
+        return -1;
+    }
+    uint64_t bytes = (uint64_t)workers * MAPPED_WRITE_ITERATIONS * MAPPED_WRITE_CHUNK;
+    uint64_t throughput = bytes * UINT64_C(1000000000) / (end - start);
+    printf("FS4_MAPPED_WRITE_CELL workers=%d iterations=%d bytes=%" PRIu64
+           " elapsed_ns=%" PRIu64 " throughput_bytes_per_s=%" PRIu64 " errors=%d\n",
+           workers, MAPPED_WRITE_ITERATIONS, bytes, end - start, throughput, errors);
+    fflush(stdout);
+    return errors == 0 ? 0 : -1;
+}
+
+static int phase_independent_mapped_overwrite(const char *base)
+{
+    unsigned char *payload = malloc(MAPPED_WRITE_FILE);
+    if (payload == NULL) {
+        return -1;
+    }
+    memset(payload, 0x51, MAPPED_WRITE_FILE);
+    for (int worker = 0; worker < MAPPED_WRITE_WORKERS; ++worker) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/mapped-worker-%d", base, worker);
+        int fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+        if (fd < 0 || write_exact(fd, payload, MAPPED_WRITE_FILE) != 0 || fsync(fd) != 0
+            || close(fd) != 0) {
+            free(payload);
+            return -1;
+        }
+    }
+    free(payload);
+    for (int workers = 1; workers <= MAPPED_WRITE_WORKERS; workers *= 2) {
+        if (run_mapped_overwrite_cell(base, workers) != 0) {
+            return -1;
+        }
+    }
+    for (int worker = 0; worker < MAPPED_WRITE_WORKERS; ++worker) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/mapped-worker-%d", base, worker);
+        if (unlink(path) != 0) {
+            return -1;
+        }
     }
     return 0;
 }
@@ -717,7 +927,7 @@ int main(int argc, char **argv)
     if (argc != 2) {
         return 2;
     }
-    alarm(45);
+    alarm(180);
     if (mkdir(argv[1], 0700) != 0 && errno != EEXIST) {
         return 2;
     }
@@ -736,12 +946,14 @@ int main(int argc, char **argv)
     RUN_CASE(lookup_stat_vs_namespace_mutation);
     RUN_CASE(read_vs_mapping_mutation);
     RUN_CASE(partial_read_plan);
+    RUN_CASE(mapped_overwrite_plan);
+    RUN_CASE(independent_mapped_overwrite);
     RUN_CASE(readlink_plan);
     RUN_CASE(readlink_vs_unlink);
     RUN_CASE(directory_snapshot);
     RUN_CASE(readdir_vs_namespace_mutation);
     RUN_CASE(shutdown_drain_stress);
 #undef RUN_CASE
-    puts("FS4_INODE_STATE_PROBE_PASS cases=12");
+    puts("FS4_INODE_STATE_PROBE_PASS cases=14");
     return 0;
 }
