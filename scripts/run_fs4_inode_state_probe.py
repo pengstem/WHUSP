@@ -28,6 +28,7 @@ CASES = (
     "partial_read_plan",
     "mapped_overwrite_plan",
     "independent_mapped_overwrite",
+    "independent_inode_metadata",
     "readlink_plan",
     "readlink_vs_unlink",
     "directory_snapshot",
@@ -39,6 +40,12 @@ MAPPED_WRITE_CELL_RE = re.compile(
     r"iterations=(?P<iterations>[0-9]+) bytes=(?P<bytes>[0-9]+) "
     r"elapsed_ns=(?P<elapsed_ns>[0-9]+) "
     r"throughput_bytes_per_s=(?P<throughput>[0-9]+) errors=(?P<errors>[0-9]+)"
+)
+INODE_METADATA_CELL_RE = re.compile(
+    r"FS5_INODE_METADATA_CELL workers=(?P<workers>[0-9]+) "
+    r"iterations=(?P<iterations>[0-9]+) operations=(?P<operations>[0-9]+) "
+    r"elapsed_ns=(?P<elapsed_ns>[0-9]+) "
+    r"throughput_ops_per_s=(?P<throughput>[0-9]+) errors=(?P<errors>[0-9]+)"
 )
 
 
@@ -170,6 +177,16 @@ def validate(log: str, args: argparse.Namespace, overlay_root: Path) -> dict[str
     workers = {int(cell["workers"]) for cell in cells}
     if workers != {1, 2, 4, 8} or any(int(cell["errors"]) != 0 for cell in cells):
         errors.append(f"mapped-write cell matrix mismatch: {cells}")
+    metadata_cells = [
+        match.groupdict()
+        for line in lines
+        if (match := INODE_METADATA_CELL_RE.fullmatch(line))
+    ]
+    metadata_workers = {int(cell["workers"]) for cell in metadata_cells}
+    if metadata_workers != {1, 2, 4, 8} or any(
+        int(cell["errors"]) != 0 for cell in metadata_cells
+    ):
+        errors.append(f"inode-metadata cell matrix mismatch: {metadata_cells}")
     if bench.PANIC_RE.search(log):
         errors.append("kernel panic signature present")
     policies = list(bench.BLOCK_IO_POLICY_RE.finditer(log))
@@ -207,11 +224,29 @@ def validate(log: str, args: argparse.Namespace, overlay_root: Path) -> dict[str
         if (args.block_io_mode == "auto"
                 and after.get("block_io_device_inflight_high_watermark", 0) < 2):
             errors.append("auto block I/O did not reach inflight high-watermark 2")
+        if "ext4_metadata_tx_attempts" in after:
+            tx_attempts = perf_delta.get("ext4_metadata_tx_attempts", 0)
+            tx_commits = perf_delta.get("ext4_metadata_tx_commits", 0)
+            tx_retries = perf_delta.get("ext4_metadata_tx_retries", 0)
+            tx_fallbacks = perf_delta.get("ext4_metadata_tx_fallbacks", 0)
+            if tx_attempts == 0 or tx_attempts != tx_commits + tx_retries + tx_fallbacks:
+                errors.append(
+                    "metadata transaction conservation failed: "
+                    f"attempts={tx_attempts} commits={tx_commits} "
+                    f"retries={tx_retries} fallbacks={tx_fallbacks}"
+                )
+            if perf_delta.get("ext4_metadata_tx_device_write_blocks", 0) == 0:
+                errors.append("metadata transactions submitted no device blocks")
+            if after.get("ext4_metadata_tx_active", 0) != 0:
+                errors.append("metadata transaction active count did not drain")
+            if after.get("ext4_metadata_tx_active_high_watermark", 0) < 2:
+                errors.append("metadata workers did not execute concurrently")
     return {
         "valid": not errors,
         "errors": errors,
         "cases": sorted(seen),
         "mapped_write_cells": cells,
+        "inode_metadata_cells": metadata_cells,
         "perf_before": before,
         "perf_after": after,
         "perf_delta": perf_delta,

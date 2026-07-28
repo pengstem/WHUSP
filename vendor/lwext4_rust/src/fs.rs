@@ -48,6 +48,7 @@ pub struct Ext4Filesystem<Hal: SystemHal, Dev: BlockDevice> {
     inner: Box<ext4_fs>,
     bdev: Ext4BlockDevice<Dev>,
     finalized: bool,
+    owns_superblock_state: bool,
     _phantom: PhantomData<Hal>,
 }
 
@@ -63,6 +64,19 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
     /// instance allowed to dirty metadata or the superblock.
     pub fn new_read_only(dev: Dev, config: FsConfig) -> Ext4Result<Self> {
         Self::new_with_mode(dev, config, true)
+    }
+
+    /// Opens a private mutation worker without claiming mount ownership.
+    ///
+    /// The worker is initialized read-only so it never updates the on-disk
+    /// mount count or superblock state. It is then allowed to dirty its private
+    /// bcache only for transactions whose block-device adapter captures every
+    /// write. Drop intentionally skips `ext4_fs_fini`, which would otherwise
+    /// publish this worker's stale superblock copy.
+    pub fn new_mutation_worker(dev: Dev, config: FsConfig) -> Ext4Result<Self> {
+        let mut result = Self::new_with_mode(dev, config, true)?;
+        result.inner.read_only = false;
+        Ok(result)
     }
 
     fn new_with_mode(dev: Dev, config: FsConfig, read_only: bool) -> Ext4Result<Self> {
@@ -86,6 +100,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
                 inner: fs,
                 bdev,
                 finalized: false,
+                owns_superblock_state: !read_only,
                 _phantom: PhantomData,
             };
             let bd = result.bdev.inner.as_mut();
@@ -486,7 +501,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
 impl<Hal: SystemHal, Dev: BlockDevice> Drop for Ext4Filesystem<Hal, Dev> {
     fn drop(&mut self) {
         unsafe {
-            if !self.finalized {
+            if !self.finalized && self.owns_superblock_state {
                 let r = ext4_fs_fini(self.inner.as_mut());
                 if r != 0 {
                     log::error!("ext4_fs_fini failed: {}", Ext4Error::new(r, None));

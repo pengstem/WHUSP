@@ -13,7 +13,7 @@ use super::{FS_STATX_ATTR_FLAGS, FileStat, FileTimestamp};
 use crate::config::MAX_CPUS;
 use crate::drivers::block::VirtIOBlock;
 use crate::perf;
-use crate::sync::{SleepMutex, SleepMutexGuard, SpinNoIrqLock};
+use crate::sync::{SleepMutex, SleepMutexGuard, SleepRwLock, SpinNoIrqLock};
 use crate::task::suspend_current_and_run_next;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -49,6 +49,8 @@ impl SystemHal for KernelHal {
 pub(super) struct KernelDisk {
     dev: Arc<VirtIOBlock>,
     write_sequence: Arc<Ext4Sequence>,
+    physical_leases: Arc<Ext4PhysicalLeaseTable>,
+    block_versions: Arc<Ext4BlockVersions>,
     #[cfg(feature = "perf-counters")]
     io_counters: Arc<Ext4IoCounters>,
 }
@@ -131,6 +133,102 @@ impl Drop for Ext4SequenceWriteGuard<'_> {
     }
 }
 
+/// Exact physical-sector ownership shared by every EXT4 write path.
+///
+/// Callers reserve sorted integer LBAs only. No FFI pointer, bcache guard, or
+/// filesystem-core guard may be held while waiting for a conflicting range.
+struct Ext4PhysicalLeaseTable {
+    blocks: SpinNoIrqLock<BTreeSet<u64>>,
+}
+
+impl Ext4PhysicalLeaseTable {
+    fn new() -> Self {
+        Self {
+            blocks: SpinNoIrqLock::new(BTreeSet::new()),
+        }
+    }
+
+    fn reserve_wait<I>(self: &Arc<Self>, blocks: I) -> Ext4PhysicalLease
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let unique = blocks.into_iter().collect::<BTreeSet<_>>();
+        loop {
+            let mut reserved = self.blocks.lock();
+            if unique.iter().all(|block| !reserved.contains(block)) {
+                reserved.extend(unique.iter().copied());
+                drop(reserved);
+                return Ext4PhysicalLease {
+                    table: self.clone(),
+                    blocks: unique.iter().copied().collect(),
+                };
+            }
+            drop(reserved);
+            suspend_current_and_run_next();
+        }
+    }
+}
+
+struct Ext4PhysicalLease {
+    table: Arc<Ext4PhysicalLeaseTable>,
+    blocks: Vec<u64>,
+}
+
+impl Drop for Ext4PhysicalLease {
+    fn drop(&mut self) {
+        let mut reserved = self.table.blocks.lock();
+        for block in self.blocks.drain(..) {
+            assert!(
+                reserved.remove(&block),
+                "ext4 physical LBA lease lost ownership"
+            );
+        }
+    }
+}
+
+#[derive(Default)]
+struct Ext4BlockVersionState {
+    next: usize,
+    versions: BTreeMap<u64, usize>,
+}
+
+/// Per-physical-sector commit versions used by optimistic metadata workers.
+struct Ext4BlockVersions {
+    state: SpinNoIrqLock<Ext4BlockVersionState>,
+}
+
+impl Ext4BlockVersions {
+    fn new() -> Self {
+        Self {
+            state: SpinNoIrqLock::new(Ext4BlockVersionState::default()),
+        }
+    }
+
+    fn snapshot(&self, block: u64) -> usize {
+        self.state.lock().versions.get(&block).copied().unwrap_or(0)
+    }
+
+    fn matches(&self, expected: &BTreeMap<u64, usize>) -> bool {
+        let state = self.state.lock();
+        expected
+            .iter()
+            .all(|(block, version)| state.versions.get(block).copied().unwrap_or(0) == *version)
+    }
+
+    fn bump_range(&self, first: u64, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut state = self.state.lock();
+        state.next = state.next.wrapping_add(1);
+        assert_ne!(state.next, 0, "ext4 block version counter wrapped");
+        let version = state.next;
+        for delta in 0..count {
+            state.versions.insert(first + delta as u64, version);
+        }
+    }
+}
+
 #[cfg(feature = "perf-counters")]
 #[derive(Default)]
 struct Ext4IoCounters {
@@ -173,12 +271,16 @@ impl Ext4BlockDevice for KernelDisk {
         if buf.len() % EXT4_DEV_BSIZE != 0 {
             return Err(Ext4Error::new(EIO as _, "unaligned block write"));
         }
+        let blocks = buf.len() / EXT4_DEV_BSIZE;
+        let _physical = self
+            .physical_leases
+            .reserve_wait(block_id..block_id + blocks as u64);
         let _write = self.write_sequence.begin_write();
         self.dev.write_blocks(block_id as usize, buf);
+        self.block_versions.bump_range(block_id, blocks);
         #[cfg(feature = "perf-counters")]
-        self.io_counters
-            .record_write(buf.len() / EXT4_DEV_BSIZE, buf.len());
-        perf::record_ext4_block_write(buf.len() / EXT4_DEV_BSIZE, buf.len());
+        self.io_counters.record_write(blocks, buf.len());
+        perf::record_ext4_block_write(blocks, buf.len());
         Ok(buf.len())
     }
 
@@ -201,7 +303,117 @@ impl Ext4BlockDevice for KernelDisk {
     }
 }
 
+#[derive(Default)]
+struct Ext4TransactionState {
+    active: bool,
+    reads: BTreeMap<u64, usize>,
+    writes: BTreeMap<u64, Box<[u8; EXT4_DEV_BSIZE]>>,
+}
+
+impl Ext4TransactionState {
+    fn begin(&mut self) {
+        assert!(!self.active, "nested ext4 metadata transaction");
+        self.reads.clear();
+        self.writes.clear();
+        self.active = true;
+    }
+
+    fn finish(&mut self) -> Ext4MetadataTransaction {
+        assert!(self.active, "finishing inactive ext4 metadata transaction");
+        self.active = false;
+        Ext4MetadataTransaction {
+            reads: core::mem::take(&mut self.reads),
+            writes: core::mem::take(&mut self.writes),
+        }
+    }
+
+    fn abort(&mut self) {
+        self.active = false;
+        self.reads.clear();
+        self.writes.clear();
+    }
+}
+
+struct Ext4MetadataTransaction {
+    reads: BTreeMap<u64, usize>,
+    writes: BTreeMap<u64, Box<[u8; EXT4_DEV_BSIZE]>>,
+}
+
+#[derive(Clone)]
+struct Ext4TransactionDisk {
+    dev: Arc<VirtIOBlock>,
+    write_sequence: Arc<Ext4Sequence>,
+    block_versions: Arc<Ext4BlockVersions>,
+    state: Arc<SpinNoIrqLock<Ext4TransactionState>>,
+    #[cfg(feature = "perf-counters")]
+    io_counters: Arc<Ext4IoCounters>,
+}
+
+impl Ext4BlockDevice for Ext4TransactionDisk {
+    fn write_blocks(&mut self, block_id: u64, buf: &[u8]) -> Ext4Result<usize> {
+        if buf.len() % EXT4_DEV_BSIZE != 0 {
+            return Err(Ext4Error::new(EIO as _, "unaligned transaction write"));
+        }
+        let mut state = self.state.lock();
+        if !state.active {
+            return Err(Ext4Error::new(EIO as _, "inactive transaction write"));
+        }
+        for (delta, source) in buf.chunks_exact(EXT4_DEV_BSIZE).enumerate() {
+            let mut block = Box::new([0u8; EXT4_DEV_BSIZE]);
+            block.copy_from_slice(source);
+            state.writes.insert(block_id + delta as u64, block);
+        }
+        Ok(buf.len())
+    }
+
+    fn read_blocks(&mut self, block_id: u64, buf: &mut [u8]) -> Ext4Result<usize> {
+        if buf.len() % EXT4_DEV_BSIZE != 0 {
+            return Err(Ext4Error::new(EIO as _, "unaligned transaction read"));
+        }
+        if !self.state.lock().active {
+            let blocks = buf.len() / EXT4_DEV_BSIZE;
+            self.write_sequence.read_stable(|| {
+                self.dev.read_blocks(block_id as usize, buf);
+            });
+            #[cfg(feature = "perf-counters")]
+            self.io_counters.record_read(blocks, buf.len());
+            perf::record_ext4_block_read(blocks, buf.len());
+            return Ok(buf.len());
+        }
+
+        for (delta, target) in buf.chunks_exact_mut(EXT4_DEV_BSIZE).enumerate() {
+            let physical = block_id + delta as u64;
+            let from_write_set = {
+                let state = self.state.lock();
+                state.writes.get(&physical).map(|block| {
+                    target.copy_from_slice(block.as_slice());
+                })
+            };
+            if from_write_set.is_some() {
+                continue;
+            }
+            let version = self.write_sequence.read_stable(|| {
+                self.dev.read_blocks(physical as usize, target);
+                self.block_versions.snapshot(physical)
+            });
+            let mut state = self.state.lock();
+            assert!(state.active, "ext4 transaction stopped during read");
+            state.reads.entry(physical).or_insert(version);
+            drop(state);
+            #[cfg(feature = "perf-counters")]
+            self.io_counters.record_read(1, EXT4_DEV_BSIZE);
+            perf::record_ext4_block_read(1, EXT4_DEV_BSIZE);
+        }
+        Ok(buf.len())
+    }
+
+    fn num_blocks(&self) -> Ext4Result<u64> {
+        Ok(self.dev.num_blocks())
+    }
+}
+
 type KernelExt4Fs = Ext4Filesystem<KernelHal, KernelDisk>;
+type KernelMutationExt4Fs = Ext4Filesystem<KernelHal, Ext4TransactionDisk>;
 
 const EXT4_CONFIG: FsConfig = FsConfig { bcache_size: 256 };
 const EXT4_INODE_RUNTIME_SHARDS: usize = 32;
@@ -259,10 +471,132 @@ pub(super) struct Ext4Mount {
     fs: KernelExt4Fs,
     device: Arc<VirtIOBlock>,
     write_sequence: Arc<Ext4Sequence>,
+    physical_leases: Arc<Ext4PhysicalLeaseTable>,
+    block_versions: Arc<Ext4BlockVersions>,
     cache_generation: usize,
     #[cfg(feature = "perf-counters")]
     io_counters: Arc<Ext4IoCounters>,
     inode_runtime: Arc<Ext4InodeRuntimeTable>,
+}
+
+#[derive(Clone, Copy)]
+enum Ext4InodeMetadataMutation {
+    Times {
+        atime: Option<FileTimestamp>,
+        mtime: Option<FileTimestamp>,
+        ctime: FileTimestamp,
+    },
+    Mode(u32),
+    Owner {
+        uid: Option<u32>,
+        gid: Option<u32>,
+    },
+    Flags(u32),
+}
+
+struct Ext4MutationWorker {
+    fs: KernelMutationExt4Fs,
+    state: Arc<SpinNoIrqLock<Ext4TransactionState>>,
+    #[cfg(feature = "perf-counters")]
+    io_counters: Arc<Ext4IoCounters>,
+}
+
+// SAFETY: one worker and all of its FFI pointers move together and are entered
+// only behind that worker's SleepMutex. Its transaction state contains owned
+// Rust buffers and never exposes C pointers to the commit phase.
+unsafe impl Send for Ext4MutationWorker {}
+
+impl Ext4MutationWorker {
+    fn open(
+        device: Arc<VirtIOBlock>,
+        write_sequence: Arc<Ext4Sequence>,
+        block_versions: Arc<Ext4BlockVersions>,
+    ) -> Result<Self, Ext4Error> {
+        let state = Arc::new(SpinNoIrqLock::new(Ext4TransactionState::default()));
+        #[cfg(feature = "perf-counters")]
+        let io_counters = Arc::new(Ext4IoCounters::default());
+        let fs = KernelMutationExt4Fs::new_mutation_worker(
+            Ext4TransactionDisk {
+                dev: device,
+                write_sequence,
+                block_versions,
+                state: state.clone(),
+                #[cfg(feature = "perf-counters")]
+                io_counters: io_counters.clone(),
+            },
+            EXT4_CONFIG,
+        )?;
+        Ok(Self {
+            fs,
+            state,
+            #[cfg(feature = "perf-counters")]
+            io_counters,
+        })
+    }
+
+    fn run(
+        &mut self,
+        ino: u32,
+        mutation: Ext4InodeMetadataMutation,
+    ) -> FsResult<Ext4MetadataTransaction> {
+        self.fs.invalidate_clean_cache();
+        self.state.lock().begin();
+        let mutation_result = match mutation {
+            Ext4InodeMetadataMutation::Times {
+                atime,
+                mtime,
+                ctime,
+            } => self
+                .fs
+                .set_times(
+                    ino,
+                    atime.map(FileTimestamp::to_duration),
+                    mtime.map(FileTimestamp::to_duration),
+                    Some(ctime.to_duration()),
+                )
+                .map_err(map_ext4_error),
+            Ext4InodeMetadataMutation::Mode(mode) => {
+                let mut attr = lwext4_rust::FileAttr::default();
+                self.fs
+                    .get_attr(ino, &mut attr)
+                    .and_then(|()| {
+                        self.fs
+                            .set_mode(ino, (attr.mode & !0o7777) | (mode & 0o7777))
+                    })
+                    .map_err(map_ext4_error)
+            }
+            Ext4InodeMetadataMutation::Owner { uid, gid } => {
+                let mut attr = lwext4_rust::FileAttr::default();
+                self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
+                let uid = uid.unwrap_or(attr.uid);
+                let gid = gid.unwrap_or(attr.gid);
+                if uid > u16::MAX as u32 || gid > u16::MAX as u32 {
+                    Err(FsError::InvalidInput)
+                } else {
+                    self.fs
+                        .set_owner(ino, uid as u16, gid as u16)
+                        .map_err(map_ext4_error)
+                }
+            }
+            Ext4InodeMetadataMutation::Flags(flags) => {
+                self.fs.set_inode_flags(ino, flags).map_err(map_ext4_error)
+            }
+        };
+        let result = mutation_result.and_then(|()| self.fs.flush().map_err(map_ext4_error));
+        self.fs.invalidate_clean_cache();
+        if let Err(err) = result {
+            self.state.lock().abort();
+            return Err(err);
+        }
+        Ok(self.state.lock().finish())
+    }
+}
+
+impl Drop for Ext4MutationWorker {
+    fn drop(&mut self) {
+        self.state.lock().abort();
+        self.fs.invalidate_clean_cache();
+    }
 }
 
 #[derive(Default)]
@@ -428,16 +762,22 @@ fn prepare_runtime_release_locked(
 unsafe impl Send for Ext4Mount {}
 
 impl Ext4Mount {
-    pub(super) fn open(device: Arc<VirtIOBlock>) -> Result<Self, Ext4Error> {
+    fn open(
+        device: Arc<VirtIOBlock>,
+        write_sequence: Arc<Ext4Sequence>,
+        physical_leases: Arc<Ext4PhysicalLeaseTable>,
+        block_versions: Arc<Ext4BlockVersions>,
+    ) -> Result<Self, Ext4Error> {
         #[cfg(feature = "perf-counters")]
         let io_counters = Arc::new(Ext4IoCounters::default());
         let inode_runtime = Arc::new(Ext4InodeRuntimeTable::new());
-        let write_sequence = Arc::new(Ext4Sequence::new());
         Ok(Self {
             fs: KernelExt4Fs::new(
                 KernelDisk {
                     dev: device.clone(),
                     write_sequence: write_sequence.clone(),
+                    physical_leases: physical_leases.clone(),
+                    block_versions: block_versions.clone(),
                     #[cfg(feature = "perf-counters")]
                     io_counters: io_counters.clone(),
                 },
@@ -445,6 +785,8 @@ impl Ext4Mount {
             )?,
             device,
             write_sequence,
+            physical_leases,
+            block_versions,
             cache_generation: 0,
             #[cfg(feature = "perf-counters")]
             io_counters,
@@ -460,6 +802,8 @@ impl Ext4Mount {
                 KernelDisk {
                     dev: self.device.clone(),
                     write_sequence: self.write_sequence.clone(),
+                    physical_leases: self.physical_leases.clone(),
+                    block_versions: self.block_versions.clone(),
                     #[cfg(feature = "perf-counters")]
                     io_counters: io_counters.clone(),
                 },
@@ -467,6 +811,8 @@ impl Ext4Mount {
             )?,
             device: self.device.clone(),
             write_sequence: self.write_sequence.clone(),
+            physical_leases: self.physical_leases.clone(),
+            block_versions: self.block_versions.clone(),
             cache_generation: self.cache_generation,
             #[cfg(feature = "perf-counters")]
             io_counters,
@@ -621,6 +967,8 @@ impl Ext4Mount {
         Some(Ext4PreparedWritePlan {
             device: self.device.clone(),
             write_sequence: self.write_sequence.clone(),
+            physical_leases: self.physical_leases.clone(),
+            block_versions: self.block_versions.clone(),
             block_size,
             buffer_len,
             write_offset,
@@ -720,7 +1068,7 @@ impl Drop for Ext4WriteLbaLease {
     }
 }
 
-/// One writable lwext4 core plus inode-sharded read-only replicas.
+/// One legacy writable lwext4 core, private metadata workers, and read-only replicas.
 ///
 /// Each C core owns its raw pointers and bcache and is entered by one task at a
 /// time. Read operations touch only one replica lock. Mutations flush the
@@ -730,26 +1078,47 @@ impl Drop for Ext4WriteLbaLease {
 pub(super) struct ConcurrentExt4Backend {
     writer: SleepMutex<Ext4Mount>,
     readers: Vec<SleepMutex<Ext4Mount>>,
+    metadata_workers: Vec<SleepMutex<Option<Ext4MutationWorker>>>,
     inode_runtime: Arc<Ext4InodeRuntimeTable>,
     cache_generation: Ext4Sequence,
     write_leases: Arc<Ext4WriteLeaseTable>,
+    device: Arc<VirtIOBlock>,
+    write_sequence: Arc<Ext4Sequence>,
+    physical_leases: Arc<Ext4PhysicalLeaseTable>,
+    block_versions: Arc<Ext4BlockVersions>,
+    legacy_core_gate: SleepRwLock<()>,
 }
 
 impl ConcurrentExt4Backend {
     pub(super) fn open(device: Arc<VirtIOBlock>) -> Result<Self, Ext4Error> {
-        let writer = Ext4Mount::open(device)?;
+        let write_sequence = Arc::new(Ext4Sequence::new());
+        let physical_leases = Arc::new(Ext4PhysicalLeaseTable::new());
+        let block_versions = Arc::new(Ext4BlockVersions::new());
+        let writer = Ext4Mount::open(
+            device.clone(),
+            write_sequence.clone(),
+            physical_leases.clone(),
+            block_versions.clone(),
+        )?;
         let mut readers = Vec::with_capacity(MAX_CPUS);
         for _ in 0..MAX_CPUS {
             let reader = writer.open_read_replica()?;
             readers.push(SleepMutex::new(reader));
         }
+        let metadata_workers = (0..MAX_CPUS).map(|_| SleepMutex::new(None)).collect();
         let inode_runtime = writer.inode_runtime.clone();
         Ok(Self {
             writer: SleepMutex::new(writer),
             readers,
+            metadata_workers,
             inode_runtime,
             cache_generation: Ext4Sequence::new(),
             write_leases: Arc::new(Ext4WriteLeaseTable::new()),
+            device,
+            write_sequence,
+            physical_leases,
+            block_versions,
+            legacy_core_gate: SleepRwLock::new(()),
         })
     }
 
@@ -854,11 +1223,169 @@ impl ConcurrentExt4Backend {
         }
     }
 
+    fn lock_metadata_worker(
+        &self,
+        op: BackendOp,
+    ) -> SleepMutexGuard<'_, Option<Ext4MutationWorker>> {
+        let _ = op;
+        let start = self.reader_start();
+        for offset in 0..self.metadata_workers.len() {
+            let index = (start + offset) % self.metadata_workers.len();
+            if let Some(worker) = self.metadata_workers[index].try_lock() {
+                return worker;
+            }
+        }
+        #[cfg(feature = "perf-counters")]
+        {
+            perf::record_mount_backend_contended_acquisition();
+            perf::record_backend_op_contended(op);
+        }
+        let wait_scope = perf::time_scope(perf::ProfilePoint::MountBackendContendedWait);
+        #[cfg(feature = "perf-counters")]
+        let op_wait_scope = perf::time_backend_op_wait(op);
+        let worker = self.metadata_workers[start].lock();
+        #[cfg(feature = "perf-counters")]
+        drop(op_wait_scope);
+        drop(wait_scope);
+        worker
+    }
+
+    fn commit_metadata_write_set(
+        &self,
+        writes: &BTreeMap<u64, Box<[u8; EXT4_DEV_BSIZE]>>,
+    ) -> (usize, usize) {
+        let mut calls = 0usize;
+        let mut blocks = 0usize;
+        let mut entries = writes.iter().peekable();
+        while let Some((&first, data)) = entries.next() {
+            let mut run = Vec::from(data.as_slice());
+            while let Some(&(&next, _)) = entries.peek() {
+                if next != first + (run.len() / EXT4_DEV_BSIZE) as u64 {
+                    break;
+                }
+                let (_, data) = entries.next().unwrap();
+                run.extend_from_slice(data.as_slice());
+            }
+            let run_blocks = run.len() / EXT4_DEV_BSIZE;
+            let io = self.device.write_blocks_for_file_plan(first as usize, &run);
+            self.block_versions.bump_range(first, run_blocks);
+            perf::record_ext4_block_write(run_blocks, run.len());
+            calls += io.device_calls;
+            blocks += io.device_blocks;
+        }
+        (calls, blocks)
+    }
+
+    fn mutate_inode_metadata(&self, ino: u32, mutation: Ext4InodeMetadataMutation) -> FsResult {
+        let op = BackendOp::NamespaceMutation;
+        #[cfg(feature = "perf-counters")]
+        perf::record_backend_op_call(op);
+        let _legacy_exclusion = self.legacy_core_gate.read();
+        loop {
+            perf::record_ext4_metadata_transaction_attempt();
+            let mut worker_slot = self.lock_metadata_worker(op);
+            if worker_slot.is_none() {
+                match Ext4MutationWorker::open(
+                    self.device.clone(),
+                    self.write_sequence.clone(),
+                    self.block_versions.clone(),
+                ) {
+                    Ok(worker) => *worker_slot = Some(worker),
+                    Err(err) => {
+                        drop(worker_slot);
+                        perf::record_ext4_metadata_transaction_fallback();
+                        return Err(map_ext4_error(err));
+                    }
+                }
+            }
+            let worker = worker_slot.as_mut().unwrap();
+            let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
+            #[cfg(feature = "perf-counters")]
+            let io_before = worker.io_counters.snapshot();
+            #[cfg(feature = "perf-counters")]
+            let op_hold_scope = perf::time_backend_op_hold(op);
+            perf::record_ext4_metadata_transaction_begin();
+            let transaction = worker.run(ino, mutation);
+            perf::record_ext4_metadata_transaction_end();
+            #[cfg(feature = "perf-counters")]
+            {
+                drop(op_hold_scope);
+                perf::record_backend_op_io(
+                    op,
+                    worker.io_counters.snapshot().delta_since(io_before),
+                );
+            }
+            drop(worker_slot);
+            drop(hold_scope);
+            let transaction = match transaction {
+                Ok(transaction) => transaction,
+                Err(err) => {
+                    perf::record_ext4_metadata_transaction_fallback();
+                    return Err(err);
+                }
+            };
+
+            // These transactions may only publish metadata blocks that their
+            // private core first read from the current filesystem image. This
+            // makes the read-version validation below cover the complete
+            // write set instead of permitting a blind stale block overwrite.
+            if transaction
+                .writes
+                .keys()
+                .any(|block| !transaction.reads.contains_key(block))
+            {
+                perf::record_ext4_metadata_transaction_fallback();
+                return Err(FsError::Io);
+            }
+
+            let touched = transaction
+                .reads
+                .keys()
+                .chain(transaction.writes.keys())
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let _physical = self.physical_leases.reserve_wait(touched);
+            if !self.block_versions.matches(&transaction.reads) {
+                perf::record_ext4_metadata_transaction_retry();
+                continue;
+            }
+
+            let _generation = self.cache_generation.begin_write();
+            let _write = self.write_sequence.begin_write();
+            let (write_calls, write_blocks) = self.commit_metadata_write_set(&transaction.writes);
+            #[cfg(feature = "perf-counters")]
+            perf::record_backend_op_io(
+                op,
+                BackendIoSnapshot {
+                    read_calls: 0,
+                    read_blocks: 0,
+                    read_bytes: 0,
+                    write_calls,
+                    write_blocks,
+                    write_bytes: write_blocks * EXT4_DEV_BSIZE,
+                },
+            );
+            perf::record_ext4_metadata_transaction_commit(
+                transaction.reads.len(),
+                transaction.writes.len(),
+                write_calls,
+                write_blocks,
+            );
+            return Ok(());
+        }
+    }
+
     fn with_writer_read<V>(&self, op: BackendOp, f: impl FnOnce(&mut Ext4Mount) -> V) -> V {
         let _ = op;
         #[cfg(feature = "perf-counters")]
         perf::record_backend_op_call(op);
+        let _legacy_exclusion = self.legacy_core_gate.write();
         let mut writer = Self::lock_core(&self.writer, op);
+        let generation = self.cache_generation.stable_value();
+        if writer.cache_generation != generation {
+            writer.invalidate_read_cache();
+            writer.cache_generation = generation;
+        }
         let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
         #[cfg(feature = "perf-counters")]
         let io_before = writer.io_counters.snapshot();
@@ -882,7 +1409,13 @@ impl ConcurrentExt4Backend {
         // The writer core serializes lwext4 transactions. Per-object VFS
         // leases protect conflicting operations. The odd generation prevents
         // a replica from publishing a result assembled across this transaction.
+        let _legacy_exclusion = self.legacy_core_gate.write();
         let mut writer = Self::lock_core(&self.writer, op);
+        let generation = self.cache_generation.stable_value();
+        if writer.cache_generation != generation {
+            writer.invalidate_read_cache();
+            writer.cache_generation = generation;
+        }
         let generation_write = self.cache_generation.begin_write();
         let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
         #[cfg(feature = "perf-counters")]
@@ -920,7 +1453,13 @@ impl ConcurrentExt4Backend {
         f: impl FnOnce(&mut Ext4Mount) -> FsResult<T>,
     ) -> Option<FsResult<T>> {
         let _ = op;
+        let _legacy_exclusion = self.legacy_core_gate.try_write()?;
         let mut writer = self.writer.try_lock()?;
+        let generation = self.cache_generation.stable_value();
+        if writer.cache_generation != generation {
+            writer.invalidate_read_cache();
+            writer.cache_generation = generation;
+        }
         let generation_write = self.cache_generation.begin_write();
         #[cfg(feature = "perf-counters")]
         {
@@ -962,6 +1501,8 @@ struct Ext4DeviceWriteRun {
 struct Ext4PreparedWritePlan {
     device: Arc<VirtIOBlock>,
     write_sequence: Arc<Ext4Sequence>,
+    physical_leases: Arc<Ext4PhysicalLeaseTable>,
+    block_versions: Arc<Ext4BlockVersions>,
     block_size: usize,
     buffer_len: usize,
     write_offset: usize,
@@ -975,6 +1516,8 @@ impl Ext4PreparedWritePlan {
         Ext4DeviceWritePlan {
             device: self.device,
             write_sequence: self.write_sequence,
+            physical_leases: self.physical_leases,
+            block_versions: self.block_versions,
             block_size: self.block_size,
             buffer_len: self.buffer_len,
             write_offset: self.write_offset,
@@ -988,6 +1531,8 @@ impl Ext4PreparedWritePlan {
 struct Ext4DeviceWritePlan {
     device: Arc<VirtIOBlock>,
     write_sequence: Arc<Ext4Sequence>,
+    physical_leases: Arc<Ext4PhysicalLeaseTable>,
+    block_versions: Arc<Ext4BlockVersions>,
     block_size: usize,
     buffer_len: usize,
     write_offset: usize,
@@ -1173,6 +1718,12 @@ impl BackendWritePlan for Ext4DeviceWritePlan {
             return 0;
         }
 
+        let physical_blocks = self.runs.iter().flat_map(|run| {
+            let blocks = run.byte_len / EXT4_DEV_BSIZE;
+            run.device_block as u64..run.device_block as u64 + blocks as u64
+        });
+        let _physical = self.physical_leases.reserve_wait(physical_blocks);
+
         let mut bounce = (self.write_offset != 0 || self.buffer_len != self.write_len)
             .then(|| vec![0u8; self.buffer_len]);
         let mut rmw_calls = 0usize;
@@ -1203,6 +1754,8 @@ impl BackendWritePlan for Ext4DeviceWritePlan {
                 run.device_block,
                 &plan_buf[run.buffer_start..run.buffer_start + run.byte_len],
             );
+            self.block_versions
+                .bump_range(run.device_block as u64, run.byte_len / EXT4_DEV_BSIZE);
             direct_calls += io.device_calls;
             direct_blocks += io.device_blocks;
         }
@@ -1768,21 +2321,22 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         mtime: Option<FileTimestamp>,
         ctime: FileTimestamp,
     ) -> FsResult {
-        self.mutate(BackendOp::NamespaceMutation, |writer| {
-            writer.set_times(ino, atime, mtime, ctime)
-        })
+        self.mutate_inode_metadata(
+            ino,
+            Ext4InodeMetadataMutation::Times {
+                atime,
+                mtime,
+                ctime,
+            },
+        )
     }
 
     fn set_mode(&self, ino: u32, mode: u32) -> FsResult {
-        self.mutate(BackendOp::NamespaceMutation, |writer| {
-            writer.set_mode(ino, mode)
-        })
+        self.mutate_inode_metadata(ino, Ext4InodeMetadataMutation::Mode(mode))
     }
 
     fn set_owner(&self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
-        self.mutate(BackendOp::NamespaceMutation, |writer| {
-            writer.set_owner(ino, uid, gid)
-        })
+        self.mutate_inode_metadata(ino, Ext4InodeMetadataMutation::Owner { uid, gid })
     }
 
     fn inode_flags(&self, ino: u32) -> FsResult<u32> {
@@ -1792,9 +2346,7 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
     }
 
     fn set_inode_flags(&self, ino: u32, flags: u32) -> FsResult {
-        self.mutate(BackendOp::NamespaceMutation, |writer| {
-            writer.set_inode_flags(ino, flags)
-        })
+        self.mutate_inode_metadata(ino, Ext4InodeMetadataMutation::Flags(flags))
     }
 
     fn retain_inode(&self, ino: u32) -> FsResult {

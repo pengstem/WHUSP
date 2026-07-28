@@ -25,10 +25,12 @@ echo "FS4_INODE_STATE_GUEST_START run_id=$RUN_ID arch=$ARCH smp=$SMP mem=$MEM bl
 echo "FS4_INODE_STATE_PERF_BEGIN point=before"
 $BB cat "$PERF_PATH" || fail perf_before "$?"
 echo "FS4_INODE_STATE_PERF_END point=before"
-"$PROBE" "$BASE" || fail workload "$?"
+"$PROBE" "$BASE"
+WORKLOAD_RC=$?
 echo "FS4_INODE_STATE_PERF_BEGIN point=after"
 $BB cat "$PERF_PATH" || fail perf_after "$?"
 echo "FS4_INODE_STATE_PERF_END point=after"
+[ "$WORKLOAD_RC" -eq 0 ] || fail workload "$WORKLOAD_RC"
 $BB sync || fail sync "$?"
 echo "FS4_INODE_STATE_GUEST_PASS run_id=$RUN_ID arch=$ARCH smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF"
 exit 0

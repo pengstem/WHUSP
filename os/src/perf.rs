@@ -381,6 +381,16 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) ext4_write_plan_direct_io_calls: usize,
     pub(crate) ext4_write_plan_direct_io_blocks: usize,
     pub(crate) ext4_write_plan_direct_io_bytes: usize,
+    pub(crate) ext4_metadata_tx_attempts: usize,
+    pub(crate) ext4_metadata_tx_commits: usize,
+    pub(crate) ext4_metadata_tx_retries: usize,
+    pub(crate) ext4_metadata_tx_fallbacks: usize,
+    pub(crate) ext4_metadata_tx_read_lbas: usize,
+    pub(crate) ext4_metadata_tx_write_lbas: usize,
+    pub(crate) ext4_metadata_tx_device_write_calls: usize,
+    pub(crate) ext4_metadata_tx_device_write_blocks: usize,
+    pub(crate) ext4_metadata_tx_active: usize,
+    pub(crate) ext4_metadata_tx_active_high_watermark: usize,
     pub(crate) eventfd_read_calls: usize,
     pub(crate) eventfd_write_calls: usize,
     pub(crate) eventfd_read_block_yields: usize,
@@ -739,6 +749,16 @@ mod enabled {
     static EXT4_WRITE_PLAN_DIRECT_IO_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EXT4_WRITE_PLAN_DIRECT_IO_BLOCKS: AtomicUsize = AtomicUsize::new(0);
     static EXT4_WRITE_PLAN_DIRECT_IO_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_METADATA_TX_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_METADATA_TX_COMMITS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_METADATA_TX_RETRIES: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_METADATA_TX_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_METADATA_TX_READ_LBAS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_METADATA_TX_WRITE_LBAS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_METADATA_TX_DEVICE_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_METADATA_TX_DEVICE_WRITE_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_METADATA_TX_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_METADATA_TX_ACTIVE_HIGH_WATERMARK: AtomicUsize = AtomicUsize::new(0);
     static EVENTFD_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EVENTFD_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EVENTFD_READ_BLOCK_YIELDS: AtomicUsize = AtomicUsize::new(0);
@@ -1994,6 +2014,41 @@ mod enabled {
         EXT4_WRITE_PLAN_DIRECT_IO_BYTES.fetch_add(direct_bytes, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_ext4_metadata_transaction_attempt() {
+        EXT4_METADATA_TX_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_metadata_transaction_begin() {
+        let active = EXT4_METADATA_TX_ACTIVE.fetch_add(1, Ordering::Relaxed) + 1;
+        EXT4_METADATA_TX_ACTIVE_HIGH_WATERMARK.fetch_max(active, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_metadata_transaction_end() {
+        let previous = EXT4_METADATA_TX_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        assert_ne!(previous, 0, "ext4 metadata transaction active underflow");
+    }
+
+    pub(crate) fn record_ext4_metadata_transaction_retry() {
+        EXT4_METADATA_TX_RETRIES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_metadata_transaction_fallback() {
+        EXT4_METADATA_TX_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_metadata_transaction_commit(
+        read_lbas: usize,
+        write_lbas: usize,
+        device_write_calls: usize,
+        device_write_blocks: usize,
+    ) {
+        EXT4_METADATA_TX_COMMITS.fetch_add(1, Ordering::Relaxed);
+        EXT4_METADATA_TX_READ_LBAS.fetch_add(read_lbas, Ordering::Relaxed);
+        EXT4_METADATA_TX_WRITE_LBAS.fetch_add(write_lbas, Ordering::Relaxed);
+        EXT4_METADATA_TX_DEVICE_WRITE_CALLS.fetch_add(device_write_calls, Ordering::Relaxed);
+        EXT4_METADATA_TX_DEVICE_WRITE_BLOCKS.fetch_add(device_write_blocks, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_eventfd_read_call() {
         EVENTFD_READ_CALLS.fetch_add(1, Ordering::Relaxed);
     }
@@ -2620,6 +2675,19 @@ mod enabled {
                 .load(Ordering::Relaxed),
             ext4_write_plan_direct_io_bytes: EXT4_WRITE_PLAN_DIRECT_IO_BYTES
                 .load(Ordering::Relaxed),
+            ext4_metadata_tx_attempts: EXT4_METADATA_TX_ATTEMPTS.load(Ordering::Relaxed),
+            ext4_metadata_tx_commits: EXT4_METADATA_TX_COMMITS.load(Ordering::Relaxed),
+            ext4_metadata_tx_retries: EXT4_METADATA_TX_RETRIES.load(Ordering::Relaxed),
+            ext4_metadata_tx_fallbacks: EXT4_METADATA_TX_FALLBACKS.load(Ordering::Relaxed),
+            ext4_metadata_tx_read_lbas: EXT4_METADATA_TX_READ_LBAS.load(Ordering::Relaxed),
+            ext4_metadata_tx_write_lbas: EXT4_METADATA_TX_WRITE_LBAS.load(Ordering::Relaxed),
+            ext4_metadata_tx_device_write_calls: EXT4_METADATA_TX_DEVICE_WRITE_CALLS
+                .load(Ordering::Relaxed),
+            ext4_metadata_tx_device_write_blocks: EXT4_METADATA_TX_DEVICE_WRITE_BLOCKS
+                .load(Ordering::Relaxed),
+            ext4_metadata_tx_active: EXT4_METADATA_TX_ACTIVE.load(Ordering::Relaxed),
+            ext4_metadata_tx_active_high_watermark: EXT4_METADATA_TX_ACTIVE_HIGH_WATERMARK
+                .load(Ordering::Relaxed),
             eventfd_read_calls: EVENTFD_READ_CALLS.load(Ordering::Relaxed),
             eventfd_write_calls: EVENTFD_WRITE_CALLS.load(Ordering::Relaxed),
             eventfd_read_block_yields: EVENTFD_READ_BLOCK_YIELDS.load(Ordering::Relaxed),
@@ -2987,6 +3055,16 @@ mod enabled {
          ext4_write_plan_direct_io_calls {}\n\
          ext4_write_plan_direct_io_blocks {}\n\
          ext4_write_plan_direct_io_bytes {}\n\
+         ext4_metadata_tx_attempts {}\n\
+         ext4_metadata_tx_commits {}\n\
+         ext4_metadata_tx_retries {}\n\
+         ext4_metadata_tx_fallbacks {}\n\
+         ext4_metadata_tx_read_lbas {}\n\
+         ext4_metadata_tx_write_lbas {}\n\
+         ext4_metadata_tx_device_write_calls {}\n\
+         ext4_metadata_tx_device_write_blocks {}\n\
+         ext4_metadata_tx_active {}\n\
+         ext4_metadata_tx_active_high_watermark {}\n\
          eventfd_read_calls {}\n\
          eventfd_write_calls {}\n\
          eventfd_read_block_yields {}\n\
@@ -3330,6 +3408,16 @@ mod enabled {
             stats.ext4_write_plan_direct_io_calls,
             stats.ext4_write_plan_direct_io_blocks,
             stats.ext4_write_plan_direct_io_bytes,
+            stats.ext4_metadata_tx_attempts,
+            stats.ext4_metadata_tx_commits,
+            stats.ext4_metadata_tx_retries,
+            stats.ext4_metadata_tx_fallbacks,
+            stats.ext4_metadata_tx_read_lbas,
+            stats.ext4_metadata_tx_write_lbas,
+            stats.ext4_metadata_tx_device_write_calls,
+            stats.ext4_metadata_tx_device_write_blocks,
+            stats.ext4_metadata_tx_active,
+            stats.ext4_metadata_tx_active_high_watermark,
             stats.eventfd_read_calls,
             stats.eventfd_write_calls,
             stats.eventfd_read_block_yields,
@@ -3887,6 +3975,30 @@ mod disabled {
         _direct_calls: usize,
         _direct_blocks: usize,
         _direct_bytes: usize,
+    ) {
+    }
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_metadata_transaction_attempt() {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_metadata_transaction_begin() {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_metadata_transaction_end() {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_metadata_transaction_retry() {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_metadata_transaction_fallback() {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_metadata_transaction_commit(
+        _read_lbas: usize,
+        _write_lbas: usize,
+        _device_write_calls: usize,
+        _device_write_blocks: usize,
     ) {
     }
 
