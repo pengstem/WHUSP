@@ -1,11 +1,49 @@
-use super::{FileStat, vfs::VfsNodeId};
+use super::{FileStat, MountNamespaceId, WorkingDir, vfs::VfsNodeId};
+use crate::config::MAX_CPUS;
 use crate::sync::{SleepRwLock, SleepRwLockWriteGuard, UPIntrFreeCell};
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 
 const INODE_STATE_SHARDS: usize = 32;
+const DIRECT_STAT_CACHE_SLOTS: usize = 16;
+const DIRECT_STAT_NAME_MAX: usize = 255;
 
+static DIRECT_STAT_CACHE_EPOCH: AtomicUsize = AtomicUsize::new(1);
+
+#[derive(Clone, Copy)]
+struct DirectStatCacheEntry {
+    epoch: usize,
+    namespace_id: MountNamespaceId,
+    parent: WorkingDir,
+    name_len: usize,
+    name: [u8; DIRECT_STAT_NAME_MAX],
+    stat: FileStat,
+}
+
+struct DirectStatCacheData {
+    entries: [Option<DirectStatCacheEntry>; DIRECT_STAT_CACHE_SLOTS],
+}
+
+#[repr(align(64))]
+struct DirectStatCpuCache {
+    data: UnsafeCell<DirectStatCacheData>,
+}
+
+unsafe impl Sync for DirectStatCpuCache {}
+
+impl DirectStatCpuCache {
+    fn new() -> Self {
+        Self {
+            data: UnsafeCell::new(DirectStatCacheData {
+                entries: [None; DIRECT_STAT_CACHE_SLOTS],
+            }),
+        }
+    }
+}
+
+#[repr(align(64))]
 struct InodeStateShard {
     states: BTreeMap<VfsNodeId, Arc<InodeState>>,
     next_incarnations: BTreeMap<VfsNodeId, usize>,
@@ -24,15 +62,104 @@ lazy_static! {
     static ref SHARDS: Vec<UPIntrFreeCell<InodeStateShard>> = (0..INODE_STATE_SHARDS)
         .map(|_| unsafe { UPIntrFreeCell::new(InodeStateShard::new()) })
         .collect();
+    static ref DIRECT_STAT_CACHES: Vec<DirectStatCpuCache> =
+        (0..MAX_CPUS).map(|_| DirectStatCpuCache::new()).collect();
 }
 
+fn direct_stat_slot(parent: WorkingDir, name: &str) -> usize {
+    let mut hash = (parent.mount_id().0 as u64).rotate_left(17) ^ parent.ino() as u64;
+    for byte in name.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash as usize & (DIRECT_STAT_CACHE_SLOTS - 1)
+}
+
+pub(crate) fn direct_stat_cache_lookup(
+    namespace_id: MountNamespaceId,
+    parent: WorkingDir,
+    name: &str,
+) -> Option<FileStat> {
+    if name.len() > DIRECT_STAT_NAME_MAX {
+        return None;
+    }
+    let epoch = DIRECT_STAT_CACHE_EPOCH.load(Ordering::Acquire);
+    let slot = direct_stat_slot(parent, name);
+    // Kernel-mode timer/IPI traps do not schedule or migrate the interrupted
+    // syscall, so the current CPU owns this cache for the whole access. Avoid
+    // toggling the interrupt CSR on every metadata hit, especially on LA.
+    let cache = unsafe { &*DIRECT_STAT_CACHES[crate::cpu::current_id()].data.get() };
+    let entry = cache.entries[slot]?;
+    if DIRECT_STAT_CACHE_EPOCH.load(Ordering::Acquire) != epoch
+        || entry.epoch != epoch
+        || entry.namespace_id != namespace_id
+        || entry.parent != parent
+        || entry.name_len != name.len()
+        || entry.name[..entry.name_len] != name.as_bytes()[..]
+    {
+        return None;
+    }
+    Some(entry.stat)
+}
+
+pub(crate) fn direct_stat_cache_insert(
+    expected_epoch: usize,
+    namespace_id: MountNamespaceId,
+    parent: WorkingDir,
+    name: &str,
+    stat: FileStat,
+) {
+    if name.len() > DIRECT_STAT_NAME_MAX {
+        return;
+    }
+    let mut entry = DirectStatCacheEntry {
+        epoch: expected_epoch,
+        namespace_id,
+        parent,
+        name_len: name.len(),
+        name: [0; DIRECT_STAT_NAME_MAX],
+        stat,
+    };
+    entry.name[..name.len()].copy_from_slice(name.as_bytes());
+    let slot = direct_stat_slot(parent, name);
+    // See lookup above: non-preemptible kernel execution keeps this write on
+    // the selected CPU without masking interrupts.
+    if DIRECT_STAT_CACHE_EPOCH.load(Ordering::Acquire) != expected_epoch {
+        return;
+    }
+    let cache = unsafe { &mut *DIRECT_STAT_CACHES[crate::cpu::current_id()].data.get() };
+    cache.entries[slot] = Some(entry);
+}
+
+pub(crate) fn direct_stat_cache_epoch() -> usize {
+    DIRECT_STAT_CACHE_EPOCH.load(Ordering::Acquire)
+}
+
+pub(crate) fn invalidate_direct_stat_cache() {
+    DIRECT_STAT_CACHE_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+#[repr(align(64))]
 pub(crate) struct InodeState {
     node: VfsNodeId,
     incarnation: usize,
-    metadata: SleepRwLock<Option<FileStat>>,
+    alive: AtomicBool,
+    metadata: SleepRwLock<MetadataCache>,
     metadata_version: VersionDomain,
     directory_version: VersionDomain,
     mapping_version: VersionDomain,
+}
+
+#[derive(Clone, Copy)]
+struct CachedMetadata {
+    version: usize,
+    stat: FileStat,
+}
+
+#[derive(Default)]
+struct MetadataCache {
+    basic: Option<CachedMetadata>,
+    full: Option<CachedMetadata>,
 }
 
 struct VersionDomain {
@@ -103,7 +230,8 @@ impl InodeState {
         Self {
             node,
             incarnation,
-            metadata: SleepRwLock::new(None),
+            alive: AtomicBool::new(true),
+            metadata: SleepRwLock::new(MetadataCache::default()),
             metadata_version: VersionDomain::new(),
             directory_version: VersionDomain::new(),
             mapping_version: VersionDomain::new(),
@@ -116,6 +244,14 @@ impl InodeState {
 
     pub(crate) fn incarnation(&self) -> usize {
         self.incarnation
+    }
+
+    pub(crate) fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
+    fn retire(&self) {
+        self.alive.store(false, Ordering::Release);
     }
 
     #[allow(dead_code)]
@@ -145,14 +281,16 @@ impl InodeState {
         self.mapping_version.begin_mutation()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn cached_metadata(&self) -> Option<FileStat> {
-        *self.metadata.read()
+    fn cached_metadata(&self, full: bool, version: usize) -> Option<FileStat> {
+        let metadata = self.metadata.read();
+        let cached = if full { metadata.full } else { metadata.basic };
+        cached
+            .filter(|cached| cached.version == version)
+            .map(|cached| cached.stat)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn set_cached_metadata(&self, metadata: Option<FileStat>) {
-        *self.metadata.write() = metadata;
+    fn clear_cached_metadata(&self) {
+        *self.metadata.write() = MetadataCache::default();
     }
 }
 
@@ -175,10 +313,15 @@ pub(crate) fn state_for(node: VfsNodeId) -> Arc<InodeState> {
 /// an old entry is safe only here: allocation has already established that the
 /// inode number now denotes a new object.
 pub(crate) fn initialize_new(node: VfsNodeId) -> Arc<InodeState> {
+    invalidate_direct_stat_cache();
     let mut shard = SHARDS[shard_index(node)].exclusive_access();
     let incarnation = shard
         .states
         .remove(&node)
+        .map(|state| {
+            state.retire();
+            state
+        })
         .map(|state| {
             state
                 .incarnation()
@@ -189,6 +332,7 @@ pub(crate) fn initialize_new(node: VfsNodeId) -> Arc<InodeState> {
     let state = Arc::new(InodeState::new(node, incarnation));
     shard.next_incarnations.insert(node, incarnation);
     shard.states.insert(node, Arc::clone(&state));
+    invalidate_direct_stat_cache();
     state
 }
 
@@ -196,13 +340,17 @@ pub(crate) fn with_metadata_mutation<V>(
     node: VfsNodeId,
     mutation: impl FnOnce() -> super::vfs::FsResult<V>,
 ) -> super::vfs::FsResult<V> {
+    invalidate_direct_stat_cache();
     let state = state_for(node);
     let mut guard = state.begin_metadata_mutation();
     let result = mutation();
-    if result.is_ok() {
-        state.set_cached_metadata(None);
-        guard.commit();
-    }
+    // A backend transaction may have made a partial visible change before
+    // reporting an error. Conservatively invalidate and advance the epoch for
+    // every attempted mutation so an old snapshot can never become stable
+    // again after such an error.
+    state.clear_cached_metadata();
+    guard.commit();
+    invalidate_direct_stat_cache();
     result
 }
 
@@ -210,13 +358,13 @@ pub(crate) fn with_mapping_mutation<V>(
     node: VfsNodeId,
     mutation: impl FnOnce() -> super::vfs::FsResult<V>,
 ) -> super::vfs::FsResult<V> {
+    invalidate_direct_stat_cache();
     let state = state_for(node);
     let mut guard = state.begin_mapping_mutation();
     let result = mutation();
-    if result.is_ok() {
-        state.set_cached_metadata(None);
-        guard.commit();
-    }
+    state.clear_cached_metadata();
+    guard.commit();
+    invalidate_direct_stat_cache();
     result
 }
 
@@ -224,11 +372,13 @@ pub(crate) fn with_mapping_mutation<V>(
 /// count instead of `FsResult`. A non-empty write attempt conservatively bumps
 /// the mapping epoch because it may allocate, extend, or convert extents.
 pub(crate) fn with_mapping_mutation_value<V>(node: VfsNodeId, mutation: impl FnOnce() -> V) -> V {
+    invalidate_direct_stat_cache();
     let state = state_for(node);
     let mut guard = state.begin_mapping_mutation();
     let result = mutation();
-    state.set_cached_metadata(None);
+    state.clear_cached_metadata();
     guard.commit();
+    invalidate_direct_stat_cache();
     result
 }
 
@@ -236,13 +386,13 @@ pub(crate) fn with_directory_mutation<V>(
     parent: VfsNodeId,
     mutation: impl FnOnce() -> super::vfs::FsResult<V>,
 ) -> super::vfs::FsResult<V> {
+    invalidate_direct_stat_cache();
     let state = state_for(parent);
     let mut guard = state.begin_directory_mutation();
     let result = mutation();
-    if result.is_ok() {
-        state.set_cached_metadata(None);
-        guard.commit();
-    }
+    state.clear_cached_metadata();
+    guard.commit();
+    invalidate_direct_stat_cache();
     result
 }
 
@@ -253,6 +403,7 @@ pub(crate) fn with_directory_mutations<V>(
     second: VfsNodeId,
     mutation: impl FnOnce() -> super::vfs::FsResult<V>,
 ) -> super::vfs::FsResult<V> {
+    invalidate_direct_stat_cache();
     if first == second {
         return with_directory_mutation(first, mutation);
     }
@@ -266,13 +417,82 @@ pub(crate) fn with_directory_mutations<V>(
     let mut low_guard = low_state.begin_directory_mutation();
     let mut high_guard = high_state.begin_directory_mutation();
     let result = mutation();
-    if result.is_ok() {
-        low_state.set_cached_metadata(None);
-        high_state.set_cached_metadata(None);
-        low_guard.commit();
-        high_guard.commit();
-    }
+    low_state.clear_cached_metadata();
+    high_state.clear_cached_metadata();
+    low_guard.commit();
+    high_guard.commit();
+    invalidate_direct_stat_cache();
     result
+}
+
+fn metadata_or_load(
+    node: VfsNodeId,
+    full: bool,
+    load: impl FnOnce() -> super::vfs::FsResult<FileStat>,
+) -> super::vfs::FsResult<FileStat> {
+    let state = state_for(node);
+    if let Some(version) = state.metadata_version.stable_version()
+        && let Some(stat) = state.cached_metadata(full, version)
+    {
+        return Ok(stat);
+    }
+
+    // The metadata cache writer doubles as the per-inode single-flight gate.
+    // It is a sleeping lock and may cover the serialized backend miss, unlike
+    // the short interrupt-masked state-table shard locks.
+    let mut metadata = state.metadata.write();
+    let Some(version) = state.metadata_version.stable_version() else {
+        drop(metadata);
+        return load();
+    };
+    let cached = if full { metadata.full } else { metadata.basic };
+    if let Some(cached) = cached.filter(|cached| cached.version == version) {
+        return Ok(cached.stat);
+    }
+
+    let stat = load()?;
+    if state.metadata_version.stable_version() == Some(version) {
+        let cached = Some(CachedMetadata { version, stat });
+        if full {
+            metadata.full = cached;
+        } else {
+            metadata.basic = cached;
+        }
+    }
+    Ok(stat)
+}
+
+pub(crate) fn stat_basic_or_load(
+    node: VfsNodeId,
+    load: impl FnOnce() -> super::vfs::FsResult<FileStat>,
+) -> super::vfs::FsResult<FileStat> {
+    metadata_or_load(node, false, load)
+}
+
+pub(crate) fn stat_full_or_load(
+    node: VfsNodeId,
+    load: impl FnOnce() -> super::vfs::FsResult<FileStat>,
+) -> super::vfs::FsResult<FileStat> {
+    metadata_or_load(node, true, load)
+}
+
+/// O(1) generation invalidation for dentry entries keyed by this directory.
+pub(crate) fn invalidate_directory(node: VfsNodeId) {
+    invalidate_direct_stat_cache();
+    let state = state_for(node);
+    let mut guard = state.begin_directory_mutation();
+    state.clear_cached_metadata();
+    guard.commit();
+    invalidate_direct_stat_cache();
+}
+
+pub(crate) fn invalidate_metadata(node: VfsNodeId) {
+    invalidate_direct_stat_cache();
+    let state = state_for(node);
+    let mut guard = state.begin_metadata_mutation();
+    state.clear_cached_metadata();
+    guard.commit();
+    invalidate_direct_stat_cache();
 }
 
 /// Removes only the exact incarnation held by a final-release record. A stale
@@ -286,12 +506,15 @@ pub(crate) fn remove_if_same(node: VfsNodeId, expected: &Arc<InodeState>) -> boo
     if !matches {
         return false;
     }
+    invalidate_direct_stat_cache();
+    expected.retire();
     shard.states.remove(&node);
     let next = expected
         .incarnation()
         .checked_add(1)
         .expect("inode incarnation exhausted");
     shard.next_incarnations.insert(node, next);
+    invalidate_direct_stat_cache();
     true
 }
 

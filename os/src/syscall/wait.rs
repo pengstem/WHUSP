@@ -289,7 +289,7 @@ fn scan_wait4_children(
                         idx,
                         pid: child.getpid(),
                         exit_code: child_inner.exit_code,
-                        child_times: child_inner.cpu_times.snapshot(),
+                        child_times: child_inner.cpu_times_snapshot_with_tasks(),
                     });
                 }
                 continue;
@@ -357,7 +357,7 @@ fn scan_waitid_children(
                 idx,
                 pid: child.getpid(),
                 exit_code: child_inner.exit_code,
-                child_times: child_inner.cpu_times.snapshot(),
+                child_times: child_inner.cpu_times_snapshot_with_tasks(),
             });
         }
     }

@@ -51,6 +51,11 @@ pub struct TaskControlBlock {
     // Scheduler-owned hot data that must remain reachable without taking the
     // broad task inner lock.
     sched: TaskSched,
+    // Linux keeps a TIF_SIGPENDING summary in thread flags so the normal trap
+    // return path does not lock signal queues. This conservative bit mirrors
+    // whether any task-local signal is queued; masked signals may cause a slow
+    // check, but false negatives are forbidden.
+    signal_pending: AtomicBool,
     // mutable
     pub inner: UPIntrFreeCell<TaskControlBlockInner>,
 }
@@ -156,6 +161,18 @@ pub struct TaskControlBlockInner {
 }
 
 impl TaskControlBlock {
+    #[inline(always)]
+    pub(crate) fn has_pending_signal_fast(&self) -> bool {
+        self.signal_pending.load(Ordering::Acquire)
+    }
+
+    /// Publishes the exact queue summary while the caller still owns
+    /// `self.inner`; signal enqueue and consume sites use that same lock, so a
+    /// clear cannot overwrite a later enqueue with `false`.
+    pub(crate) fn publish_signal_pending_locked(&self, pending: bool) {
+        self.signal_pending.store(pending, Ordering::Release);
+    }
+
     pub fn new(
         process: Arc<ProcessControlBlock>,
         ustack_base: usize,
@@ -185,6 +202,7 @@ impl TaskControlBlock {
             process: Arc::downgrade(&process),
             kstack,
             sched: TaskSched::new(),
+            signal_pending: AtomicBool::new(false),
             inner: unsafe {
                 UPIntrFreeCell::new(TaskControlBlockInner {
                     res: Some(res),
@@ -424,6 +442,17 @@ impl TaskControlBlock {
 
     pub fn cpu_time_us(&self) -> usize {
         self.inner_exclusive_access().cpu_times.total_us()
+    }
+
+    pub(crate) fn cpu_times_snapshot(&self) -> (usize, usize) {
+        let inner = self.inner_exclusive_access();
+        (inner.cpu_times.user_us, inner.cpu_times.system_us)
+    }
+
+    pub(crate) fn take_cpu_times_snapshot(&self) -> (usize, usize) {
+        let mut inner = self.inner_exclusive_access();
+        let times = core::mem::take(&mut inner.cpu_times);
+        (times.user_us, times.system_us)
     }
 }
 

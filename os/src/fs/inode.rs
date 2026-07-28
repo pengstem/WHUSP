@@ -323,6 +323,7 @@ pub(crate) fn link_file_in(
         )
         .ok_or(FsError::Io)?
     })?;
+    inode_state::invalidate_metadata(old_node);
     dentry_cache::invalidate_parent(new_target.parent);
     Ok(())
 }
@@ -356,6 +357,7 @@ pub(crate) fn link_node_in(
         )
         .ok_or(FsError::Io)?
     })?;
+    inode_state::invalidate_metadata(old_node);
     dentry_cache::invalidate_parent(new_target.parent);
     Ok(())
 }
@@ -485,6 +487,10 @@ pub(crate) fn rename_in(
         )
         .ok_or(FsError::Io)?
     })?;
+    inode_state::invalidate_metadata(old_node);
+    if let Some((node, _)) = replaced_target {
+        inode_state::invalidate_metadata(node);
+    }
     dentry_cache::invalidate_parent(old_target.parent);
     if new_target.parent != old_target.parent {
         dentry_cache::invalidate_parent(new_target.parent);
@@ -561,6 +567,8 @@ pub(crate) fn rename_exchange_in(
         )
         .ok_or(FsError::Io)?
     })?;
+    inode_state::invalidate_metadata(old_node);
+    inode_state::invalidate_metadata(new_node);
     dentry_cache::invalidate_parent(old_target.parent);
     if new_target.parent != old_target.parent {
         dentry_cache::invalidate_parent(new_target.parent);
@@ -598,6 +606,7 @@ pub(crate) fn unlink_file_in(context: PathContext, name: &str) -> FsResult {
         )
         .ok_or(FsError::Io)?
     })?;
+    inode_state::invalidate_metadata(node);
     dentry_cache::invalidate_parent(target.parent);
     Ok(())
 }
@@ -631,6 +640,7 @@ pub(crate) fn rmdir_in(context: PathContext, name: &str) -> FsResult {
         )
         .ok_or(FsError::Io)?
     })?;
+    inode_state::invalidate_metadata(node);
     dentry_cache::invalidate_parent(target.parent);
     Ok(())
 }

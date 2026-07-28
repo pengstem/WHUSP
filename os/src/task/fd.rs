@@ -65,6 +65,10 @@ impl FdTableEntry {
         Arc::clone(&self.file)
     }
 
+    pub(crate) fn file_ref(&self) -> &(dyn File + Send + Sync) {
+        self.file.as_ref()
+    }
+
     pub(crate) fn is_same_file_description(&self, file: &Arc<dyn File + Send + Sync>) -> bool {
         Arc::ptr_eq(&self.file, file)
     }

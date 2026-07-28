@@ -65,11 +65,8 @@ impl RetiredUserPages {
             pte_cleared: _,
         } = self;
         drop(frames);
-        if !page_cache_refs.is_empty() {
-            let mut cache = PAGE_CACHE.exclusive_access();
-            for key in page_cache_refs {
-                cache.dec_ref(key);
-            }
+        for key in page_cache_refs {
+            PAGE_CACHE.write(key.id).dec_ref(key);
         }
         for shmid in shm_attachments {
             let _ = crate::mm::shm::detach_segment(shmid, 0);
@@ -872,7 +869,7 @@ impl MapArea {
                 continue;
             };
             let Some(data) = PAGE_CACHE
-                .exclusive_access()
+                .write(key.id)
                 .take_dirty_page_data(*key, copy_len)
             else {
                 continue;

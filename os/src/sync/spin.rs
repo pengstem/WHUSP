@@ -3,9 +3,7 @@ use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
-#[cfg(debug_assertions)]
-use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A small test-and-test-and-set spin lock for short SMP critical sections.
 pub struct SpinLock<T> {
@@ -177,6 +175,135 @@ impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.note_releasing();
         self.lock.locked.store(false, Ordering::Release);
+    }
+}
+
+const SPIN_RWLOCK_WRITER: usize = 1usize << (usize::BITS - 1);
+const SPIN_RWLOCK_WRITER_PENDING: usize = SPIN_RWLOCK_WRITER >> 1;
+const SPIN_RWLOCK_READERS: usize = SPIN_RWLOCK_WRITER_PENDING - 1;
+
+/// Reader-writer spin lock for short, non-sleeping cache/state lookups.
+///
+/// Callers must not cover filesystem/backend work, allocation, or any other
+/// operation that can sleep. Writers are intentionally rare; this primitive is
+/// optimized for immutable dentry shard hits.
+pub struct SpinRwLock<T> {
+    state: AtomicUsize,
+    value: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Send for SpinRwLock<T> {}
+unsafe impl<T: Send + Sync> Sync for SpinRwLock<T> {}
+
+impl<T> SpinRwLock<T> {
+    pub const fn new(value: T) -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    pub fn read(&self) -> SpinRwLockReadGuard<'_, T> {
+        loop {
+            let state = self.state.load(Ordering::Relaxed);
+            if state & (SPIN_RWLOCK_WRITER | SPIN_RWLOCK_WRITER_PENDING) != 0 {
+                spin_loop();
+                continue;
+            }
+            assert!(state & SPIN_RWLOCK_READERS != SPIN_RWLOCK_READERS);
+            if self
+                .state
+                .compare_exchange_weak(state, state + 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return SpinRwLockReadGuard {
+                    lock: self,
+                    _not_send: PhantomData,
+                };
+            }
+        }
+    }
+
+    pub fn write(&self) -> SpinRwLockWriteGuard<'_, T> {
+        loop {
+            self.state
+                .fetch_or(SPIN_RWLOCK_WRITER_PENDING, Ordering::AcqRel);
+            loop {
+                let state = self.state.load(Ordering::Relaxed);
+                if state == SPIN_RWLOCK_WRITER_PENDING
+                    && self
+                        .state
+                        .compare_exchange_weak(
+                            SPIN_RWLOCK_WRITER_PENDING,
+                            SPIN_RWLOCK_WRITER,
+                            Ordering::Acquire,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
+                    return SpinRwLockWriteGuard {
+                        lock: self,
+                        _not_send: PhantomData,
+                    };
+                }
+                if state == 0 {
+                    break;
+                }
+                spin_loop();
+            }
+        }
+    }
+}
+
+#[must_use = "dropping the guard releases the spin read lock"]
+pub struct SpinRwLockReadGuard<'a, T> {
+    lock: &'a SpinRwLock<T>,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl<T> Deref for SpinRwLockReadGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<T> Drop for SpinRwLockReadGuard<'_, T> {
+    fn drop(&mut self) {
+        let previous = self.lock.state.fetch_sub(1, Ordering::Release);
+        assert!(previous > 0 && previous & SPIN_RWLOCK_WRITER == 0);
+    }
+}
+
+#[must_use = "dropping the guard releases the spin write lock"]
+pub struct SpinRwLockWriteGuard<'a, T> {
+    lock: &'a SpinRwLock<T>,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl<T> Deref for SpinRwLockWriteGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<T> DerefMut for SpinRwLockWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl<T> Drop for SpinRwLockWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        let previous = self.lock.state.swap(0, Ordering::Release);
+        // A contending writer advertises WRITER_PENDING while this writer is
+        // active. Clearing both bits is safe: waiters observe zero, reassert
+        // pending in their outer loop, and exactly one claims the write side.
+        assert!(previous & SPIN_RWLOCK_WRITER != 0);
+        assert_eq!(previous & SPIN_RWLOCK_READERS, 0);
     }
 }
 

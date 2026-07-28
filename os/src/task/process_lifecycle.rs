@@ -2,8 +2,9 @@ use super::exec::{ExecStackInfo, init_user_stack};
 use super::id::RecycleAllocator;
 use super::manager::{register_process, register_task_linux_tid};
 use super::process::{
-    Credentials, KcmpResourceOwners, ProcessControlBlock, ProcessControlBlockInner,
-    ProcessCpuTimes, ProcessFsContext, ProcessResourceLimits, ProcessTimers, comm_from_cmdline,
+    Credentials, CredentialsFastState, FdTableFastState, KcmpResourceOwners, ProcessControlBlock,
+    ProcessControlBlockInner, ProcessCpuTimes, ProcessFsContext, ProcessFsFastState,
+    ProcessMemoryFastState, ProcessResourceLimits, ProcessTimers, comm_from_cmdline,
     empty_process_pkey_rights, fd_allocation_state_from_table,
 };
 use super::{
@@ -109,6 +110,7 @@ impl ProcessControlBlock {
                 OpenFlags::WRONLY,
             )),
         ];
+        let fs = ProcessFsContext::root();
         let (fd_open_bits, next_fd_hint) = fd_allocation_state_from_table(&fd_table);
         let process = Arc::new(Self {
             pid: pid_handle,
@@ -118,13 +120,18 @@ impl ProcessControlBlock {
             inner_owner_cpu: AtomicUsize::new(usize::MAX),
             job_control_stop_generation: AtomicUsize::new(0),
             job_control_stop_pending: AtomicUsize::new(0),
+            ptrace_fast: AtomicUsize::new(0),
+            fs_fast: ProcessFsFastState::new(&fs),
+            fd_table_fast: FdTableFastState::new(&fd_table),
+            credentials_fast: CredentialsFastState::new(&Credentials::root()),
+            memory_access: ProcessMemoryFastState::new(),
             inner: unsafe {
                 UPIntrFreeCell::new(ProcessControlBlockInner {
                     is_zombie: false,
                     memory_set,
                     executable_node,
                     executable_path,
-                    fs: ProcessFsContext::root(),
+                    fs,
                     cmdline: args.clone(),
                     pgid: pid,
                     sid: pid,
@@ -138,6 +145,7 @@ impl ProcessControlBlock {
                     children: Vec::new(),
                     exit_code: 0,
                     fd_table,
+                    fd_table_version: 0,
                     fd_open_bits,
                     next_fd_hint,
                     umask: 0,
@@ -331,6 +339,11 @@ impl ProcessControlBlock {
             inner_owner_cpu: AtomicUsize::new(usize::MAX),
             job_control_stop_generation: AtomicUsize::new(0),
             job_control_stop_pending: AtomicUsize::new(0),
+            ptrace_fast: AtomicUsize::new(0),
+            fs_fast: ProcessFsFastState::new(&fs),
+            fd_table_fast: FdTableFastState::new(&new_fd_table),
+            credentials_fast: CredentialsFastState::new(&credentials),
+            memory_access: ProcessMemoryFastState::new(),
             inner: unsafe {
                 UPIntrFreeCell::new(ProcessControlBlockInner {
                     is_zombie: false,
@@ -351,6 +364,7 @@ impl ProcessControlBlock {
                     children: Vec::new(),
                     exit_code: 0,
                     fd_table: new_fd_table,
+                    fd_table_version: 0,
                     fd_open_bits,
                     next_fd_hint,
                     umask,

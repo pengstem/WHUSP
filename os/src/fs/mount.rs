@@ -13,6 +13,7 @@ use super::vfs::{
     InodeRelease, LegacyFileSystemBackend, SerializedBackend, VfsNodeId,
     mount_has_writable_regular_open,
 };
+use crate::config::MAX_CPUS;
 use crate::drivers::block::BLOCK_DEVICES;
 use crate::perf;
 use crate::sync::{SleepMutex, UPIntrFreeCell};
@@ -21,7 +22,8 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::{format, string::String};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::hint::spin_loop;
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use lazy_static::*;
 use log::{info, warn};
 
@@ -80,6 +82,84 @@ struct DynamicMount {
     // MNT_EXPIRE is stateful: the first umount marks this bit and returns
     // EAGAIN; the next matching umount is allowed to remove the mount.
     expires_on_next_umount: bool,
+}
+
+#[repr(align(64))]
+struct DynamicMountSnapshotReader {
+    active: AtomicUsize,
+}
+
+impl DynamicMountSnapshotReader {
+    const fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Immutable mount overlay graph for store-free path-walk reads.
+///
+/// This mirrors Linux mount traversal under RCU: a lookup writes only its
+/// CPU-local reader slot, while rare mount graph mutations publish a cloned
+/// snapshot after their serialized transaction.
+struct DynamicMountFastState {
+    sequence: AtomicUsize,
+    current: AtomicPtr<Vec<DynamicMount>>,
+    readers: [DynamicMountSnapshotReader; MAX_CPUS],
+}
+
+impl DynamicMountFastState {
+    fn new() -> Self {
+        Self {
+            sequence: AtomicUsize::new(0),
+            current: AtomicPtr::new(Box::into_raw(Box::new(Vec::new()))),
+            readers: [const { DynamicMountSnapshotReader::new() }; MAX_CPUS],
+        }
+    }
+
+    fn read<V>(&self, read: impl FnOnce(&[DynamicMount]) -> V) -> V {
+        let reader = &self.readers[crate::cpu::current_id()];
+        loop {
+            let sequence = self.sequence.load(Ordering::Acquire);
+            if sequence & 1 != 0 {
+                spin_loop();
+                continue;
+            }
+            reader.active.store(1, Ordering::Release);
+            if self.sequence.load(Ordering::Acquire) != sequence {
+                reader.active.store(0, Ordering::Release);
+                continue;
+            }
+            let current = self.current.load(Ordering::Acquire);
+            assert!(!current.is_null(), "dynamic mount snapshot is missing");
+            let value = read(unsafe { &*current });
+            reader.active.store(0, Ordering::Release);
+            return value;
+        }
+    }
+
+    fn publish(&self, updated: Vec<DynamicMount>) {
+        let start = self.sequence.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(start & 1, 0, "concurrent dynamic mount snapshot writer");
+        for reader in &self.readers {
+            while reader.active.load(Ordering::Acquire) != 0 {
+                crate::cpu::handle_remote_sync_ipi();
+                spin_loop();
+            }
+        }
+        let replacement = Box::into_raw(Box::new(updated));
+        let previous = self.current.swap(replacement, Ordering::AcqRel);
+        assert!(!previous.is_null(), "dynamic mount snapshot is missing");
+        unsafe {
+            drop(Box::from_raw(previous));
+        }
+        self.sequence.store(
+            start
+                .checked_add(2)
+                .expect("dynamic mount snapshot sequence exhausted"),
+            Ordering::Release,
+        );
+    }
 }
 
 struct MountedFs {
@@ -173,6 +253,8 @@ lazy_static! {
     // short table edits. Do not perform filesystem or block I/O while holding it.
     static ref DYNAMIC_MOUNTS: UPIntrFreeCell<Vec<DynamicMount>> =
         unsafe { UPIntrFreeCell::new(Vec::new()) };
+    static ref DYNAMIC_MOUNTS_FAST: DynamicMountFastState = DynamicMountFastState::new();
+    static ref DYNAMIC_MOUNTS_FAST_WRITER: SleepMutex<()> = SleepMutex::new(());
     // A short mount-id registry lets drop-time cleanup clone only the target
     // mount's queue without waiting for the sleeping mount/backend locks.
     static ref PENDING_RELEASE_QUEUES: UPIntrFreeCell<Vec<Option<Arc<PendingReleaseQueue>>>> =
@@ -188,6 +270,43 @@ static NEXT_MOUNT_NAMESPACE_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_PROPAGATION_GROUP: AtomicUsize = AtomicUsize::new(1);
 static NEXT_MOUNT_EVENT_ID: AtomicUsize = AtomicUsize::new(1);
 static NOSYMFOLLOW_MOUNT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static DYNAMIC_MOUNT_EXPIRE_PENDING_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+// Metadata cache hits must not reacquire the global mount table merely to
+// rediscover a mount's immutable filesystem type. Mount ids are monotonic, so
+// a compact atomic capability table covers the normal contest/runtime mounts;
+// uncommon larger ids retain the locked lookup fallback.
+const FAST_MOUNT_CAPABILITY_SLOTS: usize = 256;
+const MOUNT_CAPABILITY_UNKNOWN: u8 = 0;
+const MOUNT_CAPABILITY_EXT4: u8 = 1;
+const MOUNT_CAPABILITY_OTHER: u8 = 2;
+const MOUNT_CAPABILITY_ABSENT: u8 = 3;
+static MOUNT_METADATA_CACHE_CAPABILITIES: [AtomicU8; FAST_MOUNT_CAPABILITY_SLOTS] =
+    [const { AtomicU8::new(MOUNT_CAPABILITY_UNKNOWN) }; FAST_MOUNT_CAPABILITY_SLOTS];
+// A mounted filesystem's root inode is immutable for its lifetime. Keep the
+// common lookup beside the capability table so path-walk root checks do not
+// serialize on the backend. Zero means uncached; valid u32 inode numbers are
+// stored as ino + 1 in the wider atomic.
+static MOUNT_ROOT_INOS: [AtomicU64; FAST_MOUNT_CAPABILITY_SLOTS] =
+    [const { AtomicU64::new(0) }; FAST_MOUNT_CAPABILITY_SLOTS];
+
+fn set_mount_metadata_cache_capability(mount_id: MountId, fs_type: Option<&str>) {
+    let Some(capability) = MOUNT_METADATA_CACHE_CAPABILITIES.get(mount_id.0) else {
+        return;
+    };
+    let value = match fs_type {
+        Some("ext4") => MOUNT_CAPABILITY_EXT4,
+        Some(_) => MOUNT_CAPABILITY_OTHER,
+        None => MOUNT_CAPABILITY_ABSENT,
+    };
+    capability.store(value, Ordering::Release);
+}
+
+fn clear_mount_root_ino(mount_id: MountId) {
+    if let Some(root_ino) = MOUNT_ROOT_INOS.get(mount_id.0) {
+        root_ino.store(0, Ordering::Release);
+    }
+}
 
 pub fn init_mounts() {
     let already_initialized = MOUNTS_INITIALIZED.exclusive_session(|initialized| {
@@ -218,6 +337,7 @@ pub fn init_mounts() {
         mounts.resize_with(block_mount_count, || None);
         mounts[0] = Some(primary_mount);
     }
+    set_mount_metadata_cache_capability(MountId(0), Some("ext4"));
     NEXT_MOUNT_ID.store(block_mount_count, Ordering::SeqCst);
 
     mount_extra_block_devices();
@@ -338,8 +458,20 @@ fn mount_options_from_flags(flags: u64) -> &'static str {
     if read_only { "ro" } else { "rw" }
 }
 
+fn refresh_dynamic_mount_snapshot() {
+    let _writer = DYNAMIC_MOUNTS_FAST_WRITER.lock();
+    let mounts = DYNAMIC_MOUNTS.exclusive_session(|mounts| mounts.clone());
+    let expire_pending = mounts
+        .iter()
+        .filter(|mount| mount.expires_on_next_umount)
+        .count();
+    DYNAMIC_MOUNT_EXPIRE_PENDING_COUNT.store(expire_pending, Ordering::Release);
+    DYNAMIC_MOUNTS_FAST.publish(mounts);
+}
+
 fn clear_dentry_cache_on_mount_change<T>(result: Result<T, MountError>) -> Result<T, MountError> {
     if result.is_ok() {
+        refresh_dynamic_mount_snapshot();
         dentry_cache::clear_all();
     }
     result
@@ -391,11 +523,14 @@ fn open_backend(
 fn register_mount(mounted: Arc<MountedFs>) -> MountId {
     let mount_id = MountId(NEXT_MOUNT_ID.fetch_add(1, Ordering::SeqCst));
     register_pending_release_queue(mount_id, &mounted);
+    let fs_type = mounted.fs_type;
     let mut mounts = MOUNTS.lock();
     if mount_id.0 >= mounts.len() {
         mounts.resize_with(mount_id.0 + 1, || None);
     }
     mounts[mount_id.0] = Some(mounted);
+    drop(mounts);
+    set_mount_metadata_cache_capability(mount_id, Some(fs_type));
     mount_id
 }
 
@@ -622,6 +757,36 @@ pub(super) fn retain_inode(node: VfsNodeId) -> FsResult<Arc<InodeState>> {
     Ok(inode_state::state_for(node))
 }
 
+pub(super) fn stat_basic_cached(node: VfsNodeId) -> FsResult<super::FileStat> {
+    if !mount_supports_metadata_cache(node.mount_id) {
+        return with_mount(node.mount_id, BackendOp::StatBasic, |mount| {
+            mount.stat_basic(node.ino)
+        })
+        .ok_or(FsError::Io)?;
+    }
+    inode_state::stat_basic_or_load(node, || {
+        with_mount(node.mount_id, BackendOp::StatBasic, |mount| {
+            mount.stat_basic(node.ino)
+        })
+        .ok_or(FsError::Io)?
+    })
+}
+
+pub(super) fn stat_full_cached(node: VfsNodeId) -> FsResult<super::FileStat> {
+    if !mount_supports_metadata_cache(node.mount_id) {
+        return with_mount(node.mount_id, BackendOp::StatFull, |mount| {
+            mount.stat(node.ino)
+        })
+        .ok_or(FsError::Io)?;
+    }
+    inode_state::stat_full_or_load(node, || {
+        with_mount(node.mount_id, BackendOp::StatFull, |mount| {
+            mount.stat(node.ino)
+        })
+        .ok_or(FsError::Io)?
+    })
+}
+
 pub(super) fn mount_exists(mount_id: MountId) -> bool {
     let mounts = MOUNTS.lock();
     mounts.get(mount_id.0).is_some_and(Option::is_some)
@@ -644,6 +809,7 @@ pub(crate) fn clone_mount_namespace(source_namespace_id: MountNamespaceId) -> Mo
             .collect();
         mounts.extend(cloned_mounts);
     });
+    refresh_dynamic_mount_snapshot();
     namespace_id
 }
 
@@ -675,11 +841,21 @@ fn ensure_mount_open(mount_id: MountId) -> Result<(), MountError> {
         *slot = Some(Arc::clone(&mount));
         drop(mounts);
         register_pending_release_queue(mount_id, &mount);
+        set_mount_metadata_cache_capability(mount_id, Some(mount.fs_type));
     }
     Ok(())
 }
 
 pub(crate) fn root_ino_for(mount_id: MountId) -> Option<u32> {
+    if let Some(cached) = MOUNT_ROOT_INOS.get(mount_id.0) {
+        let encoded = cached.load(Ordering::Acquire);
+        if encoded != 0 {
+            return Some((encoded - 1) as u32);
+        }
+        let root_ino = with_mount(mount_id, BackendOp::Lookup, |mount| mount.root_ino())?;
+        cached.store(u64::from(root_ino) + 1, Ordering::Release);
+        return Some(root_ino);
+    }
     with_mount(mount_id, BackendOp::Lookup, |mount| mount.root_ino())
 }
 
@@ -692,27 +868,46 @@ pub(super) fn mounted_root_for(
     target: VfsNodeId,
     target_path: &str,
 ) -> Option<VfsNodeId> {
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
-        mounts
-            .iter_mut()
-            .rev()
-            .find(|mount| {
-                mount.namespace_id == namespace_id
-                    && mount.target.is_node(target)
-                    && mount.target_path == target_path
-            })
-            .map(|mount| {
-                mount.expires_on_next_umount = false;
-                mount.source_root
-            })
-    })
+    if DYNAMIC_MOUNT_EXPIRE_PENDING_COUNT.load(Ordering::Acquire) == 0 {
+        return DYNAMIC_MOUNTS_FAST.read(|mounts| {
+            mounts
+                .iter()
+                .rev()
+                .find(|mount| {
+                    mount.namespace_id == namespace_id
+                        && mount.target.is_node(target)
+                        && mount.target_path == target_path
+                })
+                .map(|mount| mount.source_root)
+        });
+    }
+
+    // MNT_EXPIRE is the exceptional write-side case: activity on the mount
+    // clears its pending-expire state. Keep that stateful compatibility path
+    // out of ordinary path walk, then republish if it actually changed.
+    let (source_root, cleared_expire) = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+        let Some(mount) = mounts.iter_mut().rev().find(|mount| {
+            mount.namespace_id == namespace_id
+                && mount.target.is_node(target)
+                && mount.target_path == target_path
+        }) else {
+            return (None, false);
+        };
+        let cleared_expire = mount.expires_on_next_umount;
+        mount.expires_on_next_umount = false;
+        (Some(mount.source_root), cleared_expire)
+    });
+    if cleared_expire {
+        refresh_dynamic_mount_snapshot();
+    }
+    source_root
 }
 
 pub(super) fn mounted_root_for_any_path(
     namespace_id: MountNamespaceId,
     target: VfsNodeId,
 ) -> Option<VfsNodeId> {
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    DYNAMIC_MOUNTS_FAST.read(|mounts| {
         mounts
             .iter()
             .rev()
@@ -726,7 +921,7 @@ pub(super) fn mounted_root_for_synthetic_child(
     parent: VfsNodeId,
     target_path: &str,
 ) -> Option<VfsNodeId> {
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    DYNAMIC_MOUNTS_FAST.read(|mounts| {
         mounts
             .iter()
             .rev()
@@ -766,7 +961,7 @@ pub(super) fn synthetic_children_for_dir(
     // still need a visible direct child in getdents64(). Only direct synthetic
     // children are reported here; deeper paths stay hidden until their parent
     // is resolved.
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    DYNAMIC_MOUNTS_FAST.read(|mounts| {
         let mut entries = Vec::new();
         for mount in mounts.iter().rev() {
             if mount.namespace_id != namespace_id {
@@ -805,7 +1000,7 @@ pub(super) fn mounted_root_parent(
     source_root: VfsNodeId,
     target_path: &str,
 ) -> Option<VfsNodeId> {
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    DYNAMIC_MOUNTS_FAST.read(|mounts| {
         // UNFINISHED: VfsNodeId currently names the mounted source node, not a
         // distinct mount instance. If the same source is mounted at multiple
         // targets, `..` from that source root follows the newest dynamic mount
@@ -2202,7 +2397,7 @@ pub(crate) fn set_mount_propagation_at(
     recursive: bool,
     propagation: MountPropagation,
 ) -> Result<(), MountError> {
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    let result = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         let mut changed = false;
         for mount in mounts.iter_mut() {
             if mount.namespace_id != namespace_id {
@@ -2241,11 +2436,15 @@ pub(crate) fn set_mount_propagation_at(
             }
         }
         changed.then_some(()).ok_or(MountError::TargetNotMounted)
-    })
+    });
+    if result.is_ok() {
+        refresh_dynamic_mount_snapshot();
+    }
+    result
 }
 
 fn dynamic_mount_at(namespace_id: MountNamespaceId, target: VfsNodeId) -> Option<MountId> {
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    DYNAMIC_MOUNTS_FAST.read(|mounts| {
         mounts
             .iter()
             .rev()
@@ -2313,7 +2512,7 @@ pub(crate) fn unmount_at(
     if target_is_root && target.mount_id == primary_mount_id() {
         return Err(MountError::StaticRoot);
     }
-    let source_to_release = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    let unmount_result = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         let index = if target_is_root {
             mounts.iter().rposition(|mount| {
                 mount.namespace_id == namespace_id && mount.source_root == target
@@ -2341,7 +2540,11 @@ pub(crate) fn unmount_at(
         mounts.retain(|mount| !is_recursive_bind_child(&event, mount));
         propagate_unmount_event(mounts, &event);
         Ok((!event.is_bind).then_some(source_mount_id))
-    })?;
+    });
+    if unmount_result.is_ok() || matches!(unmount_result, Err(MountError::ExpirePending)) {
+        refresh_dynamic_mount_snapshot();
+    }
+    let source_to_release = unmount_result?;
     if let Some(source_mount_id) = source_to_release {
         release_dynamic_mount_source_if_unused(source_mount_id);
     }
@@ -2385,6 +2588,11 @@ fn release_dynamic_mount_source_if_unused(source_mount_id: MountId) {
     // Drain the mount-local queue before its registry/table ownership is
     // removed. No other process reference is allowed past the checks above.
     let _ = with_mount(source_mount_id, BackendOp::InodeLifetime, |_| ());
+    // Disable cache hits before removing the table entry, so a racing lookup
+    // can only fall back to the mount table/backend and never consume stale
+    // metadata after unmount starts.
+    set_mount_metadata_cache_capability(source_mount_id, None);
+    clear_mount_root_ino(source_mount_id);
     if let Some(slot) = MOUNTS.lock().get_mut(source_mount_id.0) {
         if let Some(mounted) = slot.as_ref() {
             let flags = *mounted.stat_flags.lock();
@@ -2638,6 +2846,20 @@ pub(super) fn mount_supports_dentry_cache(mount_id: MountId) -> bool {
         return true;
     }
     mount_fs_type(mount_id).is_some_and(|fs_type| matches!(fs_type, "ext4" | "vfat" | "tmpfs"))
+}
+
+pub(super) fn mount_supports_metadata_cache(mount_id: MountId) -> bool {
+    if let Some(capability) = MOUNT_METADATA_CACHE_CAPABILITIES.get(mount_id.0) {
+        match capability.load(Ordering::Acquire) {
+            MOUNT_CAPABILITY_EXT4 => return true,
+            MOUNT_CAPABILITY_OTHER | MOUNT_CAPABILITY_ABSENT => return false,
+            MOUNT_CAPABILITY_UNKNOWN => {}
+            _ => unreachable!("invalid mount metadata cache capability"),
+        }
+    }
+    let fs_type = mount_fs_type(mount_id);
+    set_mount_metadata_cache_capability(mount_id, fs_type);
+    fs_type == Some("ext4")
 }
 
 pub(crate) fn mount_is_read_only(mount_id: MountId) -> bool {

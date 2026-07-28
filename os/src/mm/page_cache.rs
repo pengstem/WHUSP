@@ -4,11 +4,13 @@ use super::{FrameTracker, PhysPageNum};
 use crate::config::PAGE_SIZE;
 use crate::fs::MountId;
 use crate::perf;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::{SpinRwLock, SpinRwLockReadGuard, SpinRwLockWriteGuard, UPIntrFreeCell};
 use crate::task::{TaskControlBlock, block_current_task_no_schedule, schedule, wakeup_task};
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::hint::spin_loop;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use lazy_static::*;
 
 // CONTEXT: This is a bounded transition toward watermark-driven reclaim. The
@@ -17,6 +19,7 @@ use lazy_static::*;
 // Cargo working sets without allowing unbounded cache growth. Frames remain
 // demand allocated; this limit does not reserve 512 MiB at boot.
 pub(crate) const PAGE_CACHE_SOFT_MAX_PAGES: usize = 131_072;
+const PAGE_CACHE_SHARDS: usize = 32;
 const SHARED_MMAP_GENERATION: usize = usize::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -79,10 +82,11 @@ pub(crate) struct PageCachePage {
     // that already bounded fault-time EOF reads before insertion.
     pub(crate) file_size_at_load: usize,
     // Dirty pages belong to MAP_SHARED writeback and are not soft-LRU victims.
-    pub(crate) dirty: bool,
+    pub(crate) dirty: AtomicBool,
     // Active page-table mappings, not Arc references. Nonzero pins the frame.
-    pub(crate) ref_count: usize,
-    exec_icache_synced: bool,
+    pub(crate) ref_count: AtomicUsize,
+    // 0 = not synchronized, 1 = one CPU synchronizing, 2 = synchronized.
+    exec_icache_state: AtomicU8,
     lru_stamp: usize,
 }
 
@@ -92,9 +96,9 @@ impl PageCachePage {
             frame,
             key,
             file_size_at_load,
-            dirty: false,
-            ref_count: 0,
-            exec_icache_synced: false,
+            dirty: AtomicBool::new(false),
+            ref_count: AtomicUsize::new(0),
+            exec_icache_state: AtomicU8::new(0),
             lru_stamp: 0,
         }
     }
@@ -103,13 +107,52 @@ impl PageCachePage {
         self.frame.ppn
     }
 
-    fn ensure_exec_icache_synced(&mut self) {
-        if self.exec_icache_synced {
-            return;
+    fn ensure_exec_icache_synced(&self) {
+        loop {
+            match self.exec_icache_state.load(Ordering::Acquire) {
+                2 => return,
+                0 => {
+                    if self
+                        .exec_icache_state
+                        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        crate::arch::mm::publish_pte_barrier();
+                        crate::arch::mm::instruction_barrier();
+                        self.exec_icache_state.store(2, Ordering::Release);
+                        return;
+                    }
+                }
+                1 => spin_loop(),
+                _ => unreachable!("invalid page-cache icache state"),
+            }
         }
-        crate::arch::mm::publish_pte_barrier();
-        crate::arch::mm::instruction_barrier();
-        self.exec_icache_synced = true;
+    }
+
+    fn inc_ref(&self) {
+        let previous = self.ref_count.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            previous != usize::MAX,
+            "page-cache mapping refcount exhausted"
+        );
+    }
+
+    fn dec_ref(&self) -> usize {
+        let previous = self
+            .ref_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_sub(1))
+            })
+            .expect("page-cache mapping refcount update must not fail");
+        previous.saturating_sub(1)
+    }
+
+    fn ref_count(&self) -> usize {
+        self.ref_count.load(Ordering::Relaxed)
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
     }
 }
 
@@ -125,6 +168,10 @@ pub(crate) struct PageCache {
     generations: BTreeMap<PageCacheId, PageCacheGeneration>,
     lru: BTreeSet<PageCacheLruEntry>,
     lru_clock: usize,
+    // A shard may exceed its soft limit entirely because every cached page is
+    // mapped. Avoid rescanning the same pinned LRU on every subsequent fault;
+    // the first unpin clears this bit and retries reclaim.
+    reclaim_stalled: bool,
 }
 
 pub(crate) struct PageCacheLoadGate {
@@ -197,7 +244,7 @@ pub(crate) struct PageCacheMutationGuard {
 
 impl Drop for PageCacheMutationGuard {
     fn drop(&mut self) {
-        PAGE_CACHE.exclusive_access().end_mutation(self.id);
+        PAGE_CACHE.write(self.id).end_mutation(self.id);
     }
 }
 
@@ -209,6 +256,7 @@ impl PageCache {
             generations: BTreeMap::new(),
             lru: BTreeSet::new(),
             lru_clock: 0,
+            reclaim_stalled: false,
         }
     }
 
@@ -218,6 +266,17 @@ impl PageCache {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.pages.is_empty()
+    }
+
+    fn insert_page(&mut self, key: PageCacheKey, page: PageCachePage) {
+        assert!(self.pages.insert(key, page).is_none());
+        PAGE_CACHE.record_insert();
+    }
+
+    fn remove_page(&mut self, key: &PageCacheKey) -> Option<PageCachePage> {
+        let page = self.pages.remove(key)?;
+        PAGE_CACHE.record_remove();
+        Some(page)
     }
 
     pub(crate) fn contains(&self, key: PageCacheKey) -> bool {
@@ -388,13 +447,16 @@ impl PageCache {
             .range(start..=end)
             .filter_map(|(key, page)| {
                 scanned += 1;
-                (page.ref_count == 0 && !page.dirty).then_some((*key, page.lru_stamp))
+                (page.ref_count() == 0 && !page.is_dirty()).then_some((*key, page.lru_stamp))
             })
             .collect();
         let removed = victims.len();
         for (key, stamp) in victims {
-            self.pages.remove(&key);
+            self.remove_page(&key);
             self.lru.remove(&PageCacheLruEntry { stamp, key });
+        }
+        if removed > 0 {
+            self.reclaim_stalled = false;
         }
         (removed, scanned)
     }
@@ -435,20 +497,24 @@ impl PageCache {
     fn evict_one_clean_unpinned(&mut self) -> bool {
         let victim = self.lru.iter().copied().find(|entry| {
             self.pages.get(&entry.key).is_some_and(|page| {
-                page.lru_stamp == entry.stamp && page.ref_count == 0 && !page.dirty
+                page.lru_stamp == entry.stamp && page.ref_count() == 0 && !page.is_dirty()
             })
         });
         let Some(victim) = victim else {
             return false;
         };
         self.lru.remove(&victim);
-        self.pages.remove(&victim.key).is_some()
+        self.remove_page(&victim.key).is_some()
     }
 
-    fn trim_clean_unpinned_to_len(&mut self, max_len: usize) -> usize {
+    fn trim_clean_unpinned_to_global_len(&mut self, max_len: usize) -> usize {
+        if self.reclaim_stalled {
+            return 0;
+        }
         let mut evicted = 0usize;
-        while self.pages.len() > max_len {
+        while PAGE_CACHE.len() > max_len {
             if !self.evict_one_clean_unpinned() {
+                self.reclaim_stalled = true;
                 break;
             }
             evicted += 1;
@@ -460,14 +526,14 @@ impl PageCache {
     ///
     /// Fork uses this for old generations as well as the current one; a stale
     /// key remains valid only while an existing mapping still owns its pin.
-    pub(crate) fn pin_existing_exact(&mut self, key: PageCacheKey) -> Option<PhysPageNum> {
-        let page = self.pages.get_mut(&key)?;
-        page.ref_count += 1;
+    pub(crate) fn pin_existing_exact(&self, key: PageCacheKey) -> Option<PhysPageNum> {
+        let page = self.pages.get(&key)?;
+        page.inc_ref();
         Some(page.ppn())
     }
 
     pub(crate) fn get_and_inc_ref_for_mmap(
-        &mut self,
+        &self,
         key: PageCacheKey,
         exec_fault: bool,
         shared: bool,
@@ -478,8 +544,8 @@ impl PageCache {
         }
         // PERF: mmap exec faults are mostly page-cache hits. Fold the icache
         // sync check into the same tree lookup used to pin the cached frame.
-        let page = self.pages.get_mut(&key)?;
-        page.ref_count += 1;
+        let page = self.pages.get(&key)?;
+        page.inc_ref();
         if exec_fault {
             page.ensure_exec_icache_synced();
         }
@@ -499,14 +565,14 @@ impl PageCache {
             return None;
         }
         if let Some(page) = self.pages.get_mut(&key) {
-            page.ref_count += 1;
+            page.inc_ref();
             return Some(page.ppn());
         }
         let mut page = PageCachePage::new(frame, key, file_size_at_load);
-        page.ref_count = 1;
+        page.ref_count.store(1, Ordering::Relaxed);
         let ppn = page.ppn();
         page.lru_stamp = self.touch(key, None);
-        self.pages.insert(key, page);
+        self.insert_page(key, page);
         Some(ppn)
     }
 
@@ -523,42 +589,45 @@ impl PageCache {
             return None;
         }
         if let Some(page) = self.pages.get_mut(&key) {
-            page.ref_count += 1;
+            page.inc_ref();
             if exec_fault {
                 page.ensure_exec_icache_synced();
             }
             return Some(page.ppn());
         }
         let target_len = PAGE_CACHE_SOFT_MAX_PAGES.saturating_sub(1);
-        self.trim_clean_unpinned_to_len(target_len);
+        self.trim_clean_unpinned_to_global_len(target_len);
         let mut page = PageCachePage::new(frame, key, file_size_at_load);
-        page.ref_count = 1;
+        page.ref_count.store(1, Ordering::Relaxed);
         if exec_fault {
             page.ensure_exec_icache_synced();
         }
         let ppn = page.ppn();
         page.lru_stamp = self.touch(key, None);
-        self.pages.insert(key, page);
+        self.insert_page(key, page);
         Some(ppn)
     }
 
     /// Drops one mapping reference without evicting the cached page.
     pub(crate) fn dec_ref(&mut self, key: PageCacheKey) {
         let current_generation = self.current_generation(key.id);
-        let remove_stale = if let Some(page) = self.pages.get_mut(&key) {
-            page.ref_count = page.ref_count.saturating_sub(1);
-            page.ref_count == 0 && !page.dirty && key.generation != current_generation
+        let remove_stale = if let Some(page) = self.pages.get(&key) {
+            let became_unpinned = page.dec_ref() == 0 && !page.is_dirty();
+            if became_unpinned {
+                self.reclaim_stalled = false;
+            }
+            became_unpinned && key.generation != current_generation
         } else {
             false
         };
-        if remove_stale && let Some(page) = self.pages.remove(&key) {
+        if remove_stale && let Some(page) = self.remove_page(&key) {
             self.lru.remove(&PageCacheLruEntry {
                 stamp: page.lru_stamp,
                 key,
             });
         }
-        if self.pages.len() > PAGE_CACHE_SOFT_MAX_PAGES {
-            self.trim_clean_unpinned_to_len(PAGE_CACHE_SOFT_MAX_PAGES);
+        if PAGE_CACHE.len() > PAGE_CACHE_SOFT_MAX_PAGES {
+            self.trim_clean_unpinned_to_global_len(PAGE_CACHE_SOFT_MAX_PAGES);
         }
     }
 
@@ -567,10 +636,10 @@ impl PageCache {
         &mut self,
         key: PageCacheKey,
     ) -> Option<PageCachePage> {
-        let page = self.pages.get_mut(&key)?;
-        page.ref_count = page.ref_count.saturating_sub(1);
-        if page.ref_count == 0 {
-            let page = self.pages.remove(&key)?;
+        let page = self.pages.get(&key)?;
+        if page.dec_ref() == 0 {
+            self.reclaim_stalled = false;
+            let page = self.remove_page(&key)?;
             self.lru.remove(&PageCacheLruEntry {
                 stamp: page.lru_stamp,
                 key,
@@ -604,7 +673,7 @@ impl PageCache {
         }
         let (old_stamp, len) = {
             let page = self.pages.get(&key)?;
-            if page.dirty || page_offset >= PAGE_SIZE {
+            if page.is_dirty() || page_offset >= PAGE_SIZE {
                 return None;
             }
             let page_valid_len = page
@@ -649,15 +718,15 @@ impl PageCache {
         }
 
         let target_len = PAGE_CACHE_SOFT_MAX_PAGES.saturating_sub(1);
-        let evicted = self.trim_clean_unpinned_to_len(target_len);
-        if self.pages.len() >= PAGE_CACHE_SOFT_MAX_PAGES {
+        let evicted = self.trim_clean_unpinned_to_global_len(target_len);
+        if PAGE_CACHE.len() >= PAGE_CACHE_SOFT_MAX_PAGES {
             perf::record_page_cache_capacity_reject();
             return (evicted, false);
         }
 
         let mut page = PageCachePage::new(frame, key, file_size_at_load);
         page.lru_stamp = self.touch(key, None);
-        self.pages.insert(key, page);
+        self.insert_page(key, page);
         (evicted, true)
     }
 
@@ -666,14 +735,14 @@ impl PageCache {
         let Some(page) = self.pages.get_mut(&key) else {
             return false;
         };
-        page.dirty = true;
-        page.exec_icache_synced = false;
+        page.dirty.store(true, Ordering::Release);
+        page.exec_icache_state.store(0, Ordering::Release);
         true
     }
 
     pub(crate) fn copy_dirty_page_data(&self, key: PageCacheKey, len: usize) -> Option<Vec<u8>> {
         let page = self.pages.get(&key)?;
-        if !page.dirty {
+        if !page.is_dirty() {
             return None;
         }
         let len = len.min(PAGE_SIZE);
@@ -687,21 +756,68 @@ impl PageCache {
         len: usize,
     ) -> Option<Vec<u8>> {
         let page = self.pages.get_mut(&key)?;
-        if !page.dirty {
+        if !page.is_dirty() {
             return None;
         }
-        page.dirty = false;
+        page.dirty.store(false, Ordering::Release);
+        if page.ref_count() == 0 {
+            self.reclaim_stalled = false;
+        }
         let len = len.min(PAGE_SIZE);
         Some(page.ppn().get_bytes_array()[..len].to_vec())
     }
 }
 
 pub(crate) fn begin_page_cache_mutation(id: PageCacheId) -> (PageCacheMutationGuard, usize, usize) {
-    let (removed, scanned) = PAGE_CACHE.exclusive_access().begin_mutation(id);
+    let (removed, scanned) = PAGE_CACHE.write(id).begin_mutation(id);
     (PageCacheMutationGuard { id }, removed, scanned)
 }
 
+pub(crate) struct PageCacheTable {
+    shards: [SpinRwLock<PageCache>; PAGE_CACHE_SHARDS],
+    entries: AtomicUsize,
+}
+
+impl PageCacheTable {
+    fn new() -> Self {
+        Self {
+            shards: core::array::from_fn(|_| SpinRwLock::new(PageCache::new())),
+            entries: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    fn shard_index(id: PageCacheId) -> usize {
+        let ino = id.ino as usize;
+        (ino ^ (ino >> 5) ^ id.mount_id.0.rotate_left(13)) & (PAGE_CACHE_SHARDS - 1)
+    }
+
+    pub(crate) fn read(&self, id: PageCacheId) -> SpinRwLockReadGuard<'_, PageCache> {
+        self.shards[Self::shard_index(id)].read()
+    }
+
+    pub(crate) fn write(&self, id: PageCacheId) -> SpinRwLockWriteGuard<'_, PageCache> {
+        self.shards[Self::shard_index(id)].write()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.load(Ordering::Relaxed)
+    }
+
+    fn record_insert(&self) {
+        self.entries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_remove(&self) {
+        let previous = self.entries.fetch_sub(1, Ordering::Relaxed);
+        assert!(previous > 0, "page-cache entry count underflow");
+    }
+}
+
 lazy_static! {
-    pub(crate) static ref PAGE_CACHE: UPIntrFreeCell<PageCache> =
-        unsafe { UPIntrFreeCell::new(PageCache::new()) };
+    // Linux page-cache hits do not take the address_space tree's exclusive
+    // lock. Keep mutations serialized, but allow cached mmap faults to look up
+    // and pin immutable page entries concurrently. Per-page atomics protect
+    // the only fields changed by this shared hit path.
+    pub(crate) static ref PAGE_CACHE: PageCacheTable = PageCacheTable::new();
 }

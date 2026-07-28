@@ -510,7 +510,7 @@ impl MmapPageCacheFault {
     }
 
     fn release_resolved_ref(&self) {
-        PAGE_CACHE.exclusive_access().dec_ref(self.key);
+        PAGE_CACHE.write(self.key.id).dec_ref(self.key);
     }
 
     fn matches_current_mapping(&self, memory_set: &MemorySet, area: &MapArea) -> bool {
@@ -578,7 +578,7 @@ impl MmapPageCacheFault {
     /// not already cached. A successful return owns one page-cache reference.
     pub fn resolve_ppn(&mut self) -> MmapPageCacheResolve {
         let cached_ppn = {
-            let mut cache = PAGE_CACHE.exclusive_access();
+            let cache = PAGE_CACHE.read(self.key.id);
             if !cache.is_usable_mmap_key(self.key, self.expected_shared, self.observed_generation) {
                 perf::record_page_cache_generation_retry();
                 return MmapPageCacheResolve::Retry;
@@ -605,7 +605,7 @@ impl MmapPageCacheFault {
                 .populate_clean_page_cache_at(self.file_offset)
         {
             let populated_ppn = {
-                let mut cache = PAGE_CACHE.exclusive_access();
+                let cache = PAGE_CACHE.read(self.key.id);
                 if !cache.is_usable_mmap_key(
                     self.key,
                     self.expected_shared,
@@ -653,7 +653,7 @@ impl MmapPageCacheFault {
             frame.ppn.get_bytes_array()[read_len..].fill(0);
         }
 
-        let mut cache = PAGE_CACHE.exclusive_access();
+        let mut cache = PAGE_CACHE.write(self.key.id);
         if !cache.is_usable_mmap_key(self.key, self.expected_shared, self.observed_generation) {
             perf::record_page_cache_generation_retry();
             perf::record_page_cache_stale_fill_drop(1);
@@ -741,7 +741,7 @@ fn current_page_cache_key(
     if file_offset % PAGE_SIZE != 0 {
         return CurrentPageCacheKey::Unaligned;
     }
-    let cache = PAGE_CACHE.exclusive_access();
+    let cache = PAGE_CACHE.read(id);
     let Some((key, generation)) = cache.mmap_key_from_file_offset(id, file_offset, shared) else {
         perf::record_page_cache_generation_retry();
         return CurrentPageCacheKey::Busy;
@@ -879,7 +879,7 @@ impl MemorySet {
                 }
                 for (vpn, key) in area.page_cache_mappings() {
                     let Some(ppn) = ({
-                        let mut cache = PAGE_CACHE.exclusive_access();
+                        let cache = PAGE_CACHE.read(key.id);
                         cache.pin_existing_exact(key)
                     }) else {
                         // Every page_cache_pages entry owns one exact cache
@@ -891,7 +891,7 @@ impl MemorySet {
                     let page_table = &mut memory_set.page_table;
                     let dst_area = &mut memory_set.areas[area_idx];
                     if !dst_area.map_page_cache_frame(page_table, vpn, ppn, key) {
-                        PAGE_CACHE.exclusive_access().dec_ref(key);
+                        PAGE_CACHE.write(key.id).dec_ref(key);
                         return None;
                     }
                 }
@@ -1635,7 +1635,7 @@ impl MemorySet {
                         None
                     }
                 }?;
-                if !PAGE_CACHE.exclusive_access().mark_dirty(key) {
+                if !PAGE_CACHE.write(key.id).mark_dirty(key) {
                     return None;
                 }
                 let pte_flags = crate::mm::page_table::PTEFlags::from_bits_truncate(
@@ -1838,9 +1838,10 @@ impl MemorySet {
             page.release_resolved_ref();
             return MmapPageCacheInstall::Failed;
         }
-        let mut cache = PAGE_CACHE.exclusive_access();
+        let cache = PAGE_CACHE.read(page.key.id);
         if !cache.is_usable_mmap_key(page.key, page.expected_shared, page.observed_generation) {
-            cache.dec_ref(page.key);
+            drop(cache);
+            PAGE_CACHE.write(page.key.id).dec_ref(page.key);
             perf::record_page_cache_generation_retry();
             perf::record_page_cache_stale_install_retry();
             return MmapPageCacheInstall::Retry;
@@ -1858,7 +1859,8 @@ impl MemorySet {
             }
             MmapPageCacheInstall::InstalledOrDuplicate
         } else {
-            cache.dec_ref(page.key);
+            drop(cache);
+            PAGE_CACHE.write(page.key.id).dec_ref(page.key);
             MmapPageCacheInstall::Failed
         }
     }
@@ -1998,11 +2000,8 @@ impl MemorySet {
                 self.synchronize_instruction_stream();
             }
         }
-        if !retired_cache_keys.is_empty() {
-            let mut cache = PAGE_CACHE.exclusive_access();
-            for key in retired_cache_keys {
-                cache.dec_ref(key);
-            }
+        for key in retired_cache_keys {
+            PAGE_CACHE.write(key.id).dec_ref(key);
         }
         if failed {
             return Err(MemoryProtectError::Unmapped);

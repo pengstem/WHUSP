@@ -3,7 +3,7 @@ use crate::fs::{
     S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, VfsNodeId, chmod_in, chown_in, lookup_path_in,
     mount_is_read_only, nfs_compat_source_path, open_file_in, stat_devfs_child,
     stat_devfs_input_child, stat_devfs_misc_child, stat_devfs_net_child, stat_devfs_pts_child,
-    stat_full_in, stat_in, stat_static_path, statfs_for_mount,
+    stat_direct_regular_child_in, stat_full_in, stat_in, stat_static_path, statfs_for_mount,
 };
 use crate::perf;
 use crate::sync::SleepMutex;
@@ -13,7 +13,8 @@ use super::super::SyscallContext;
 use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
     PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, read_user_c_string_ctx,
-    translated_byte_buffer_checked_with_mmap_fault, write_user_value_ctx,
+    translated_byte_buffer_checked_with_mmap_fault, try_read_direct_path_component_ctx,
+    write_user_value_ctx,
 };
 use super::fanotify::fanotify_notify_attrib;
 use super::fd::{get_fd_entry_by_fd, get_fd_entry_by_fd_for_process, get_file_by_fd};
@@ -208,6 +209,26 @@ pub fn sys_newfstatat_ctx(
         return Err(SysError::EINVAL);
     }
 
+    if dirfd >= 0
+        && dirfd != AT_FDCWD
+        && let Some(path) = try_read_direct_path_component_ctx(ctx, pathname)?
+    {
+        let parent = ctx
+            .process()
+            .directory_working_dir_from_fd(dirfd as usize)
+            .ok_or(SysError::EBADF)?
+            .ok_or(SysError::ENOTDIR)?;
+        if let Some(stat) = stat_direct_regular_child_in(
+            ctx.process().mount_namespace_id(),
+            parent,
+            path.as_str(),
+            false,
+        )? {
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::SysNewfstatatWriteback);
+            return write_stat_result_ctx(ctx, statbuf, stat);
+        }
+    }
+
     let path = {
         let _profile_scope = perf::time_scope(perf::ProfilePoint::SysNewfstatatReadPath);
         read_user_c_string_ctx(ctx, pathname, PATH_MAX)?
@@ -216,6 +237,22 @@ pub fn sys_newfstatat_ctx(
         return Err(SysError::ENOENT);
     }
     let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
+    if !path.is_empty() && !path.starts_with('/') && dirfd >= 0 && dirfd != AT_FDCWD {
+        let parent = ctx
+            .process()
+            .directory_working_dir_from_fd(dirfd as usize)
+            .ok_or(SysError::EBADF)?
+            .ok_or(SysError::ENOTDIR)?;
+        if let Some(stat) = stat_direct_regular_child_in(
+            ctx.process().mount_namespace_id(),
+            parent,
+            path.as_str(),
+            false,
+        )? {
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::SysNewfstatatWriteback);
+            return write_stat_result_ctx(ctx, statbuf, stat);
+        }
+    }
     let snapshot = ctx.process().path_snapshot();
     if !path.is_empty() {
         let _profile_scope = perf::time_scope(perf::ProfilePoint::SysNewfstatatAccessCheck);

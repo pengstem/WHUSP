@@ -3,17 +3,19 @@ use super::{
     CloneFlags, FD_LIMIT, FdTableEntry, PidHandle, SIGNAL_INFO_SLOTS, SignalAction,
     TaskControlBlock, TaskStatus, wakeup_task,
 };
-use crate::config::USER_STACK_SIZE;
+use crate::config::{MAX_CPUS, USER_STACK_SIZE};
 use crate::fs::{MountNamespaceId, PathContext, ROOT_MOUNT_NAMESPACE, VfsNodeId, WorkingDir};
 use crate::mm::MemorySet;
 use crate::perf;
 use crate::sync::{UPIntrFreeCell, UPIntrRefMut};
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::{vec, vec::Vec};
+use core::hint::spin_loop;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 pub const RLIM_INFINITY: usize = usize::MAX;
 const RLIMIT_COUNT: usize = RLimitResource::RtTime as usize + 1;
@@ -432,6 +434,403 @@ pub(crate) struct ProcessFsContext {
     mount_namespace_id: MountNamespaceId,
 }
 
+#[repr(align(64))]
+pub(super) struct ProcessFsSnapshotReader {
+    active: AtomicUsize,
+}
+
+impl ProcessFsSnapshotReader {
+    const fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Read-mostly process filesystem state.
+///
+/// Linux starts pathname resolution in RCU-walk so cwd/root reads do not take
+/// the process-wide task lock. This smaller grace-period scheme provides the
+/// same ownership property for our immutable `ProcessFsContext` snapshot:
+/// readers only touch their CPU-local slot, while a rare cwd/root/namespace
+/// writer blocks new readers, waits for old readers, swaps the snapshot, and
+/// then reclaims it.
+pub(super) struct ProcessFsFastState {
+    sequence: AtomicUsize,
+    current: AtomicPtr<ProcessFsContext>,
+    readers: [ProcessFsSnapshotReader; MAX_CPUS],
+}
+
+impl ProcessFsFastState {
+    pub(super) fn new(initial: &ProcessFsContext) -> Self {
+        Self {
+            sequence: AtomicUsize::new(0),
+            current: AtomicPtr::new(Box::into_raw(Box::new(initial.clone()))),
+            readers: [const { ProcessFsSnapshotReader::new() }; MAX_CPUS],
+        }
+    }
+
+    fn read<V>(&self, read: impl FnOnce(&ProcessFsContext) -> V) -> V {
+        let reader = &self.readers[crate::cpu::current_id()];
+        loop {
+            let sequence = self.sequence.load(Ordering::Acquire);
+            if sequence & 1 != 0 {
+                spin_loop();
+                continue;
+            }
+            reader.active.store(1, Ordering::Release);
+            if self.sequence.load(Ordering::Acquire) != sequence {
+                reader.active.store(0, Ordering::Release);
+                continue;
+            }
+            let current = self.current.load(Ordering::Acquire);
+            assert!(!current.is_null(), "process filesystem snapshot is missing");
+            let value = read(unsafe { &*current });
+            reader.active.store(0, Ordering::Release);
+            return value;
+        }
+    }
+
+    fn publish(&self, updated: &ProcessFsContext) {
+        let start = self.sequence.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(
+            start & 1,
+            0,
+            "concurrent process filesystem snapshot writer"
+        );
+        for reader in &self.readers {
+            while reader.active.load(Ordering::Acquire) != 0 {
+                crate::cpu::handle_remote_sync_ipi();
+                spin_loop();
+            }
+        }
+        let replacement = Box::into_raw(Box::new(updated.clone()));
+        let previous = self.current.swap(replacement, Ordering::AcqRel);
+        assert!(
+            !previous.is_null(),
+            "process filesystem snapshot is missing"
+        );
+        unsafe {
+            drop(Box::from_raw(previous));
+        }
+        self.sequence.store(
+            start
+                .checked_add(2)
+                .expect("process filesystem snapshot sequence exhausted"),
+            Ordering::Release,
+        );
+    }
+
+    fn path_snapshot(&self) -> PathSnapshot {
+        self.read(|fs| PathSnapshot {
+            context: fs.path_context(),
+            cwd_path: fs.cwd_path.clone(),
+            root_path: fs.root_path.clone(),
+        })
+    }
+
+    fn mount_namespace_id(&self) -> MountNamespaceId {
+        self.read(|fs| fs.mount_namespace_id)
+    }
+
+    fn references_mount(&self, mount_id: crate::fs::MountId) -> bool {
+        self.read(|fs| fs.references_mount(mount_id))
+    }
+}
+
+impl Drop for ProcessFsFastState {
+    fn drop(&mut self) {
+        let current = *self.current.get_mut();
+        if !current.is_null() {
+            unsafe {
+                drop(Box::from_raw(current));
+            }
+        }
+    }
+}
+
+#[repr(align(64))]
+pub(super) struct FdTableSnapshotReader {
+    active: AtomicUsize,
+}
+
+impl FdTableSnapshotReader {
+    const fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Copy-on-publish fd table used by read-mostly dirfd lookup.
+///
+/// Install/close/dup remain serialized by `ProcessControlBlock.inner`. The
+/// guard publishes one immutable table after the transaction, and readers use
+/// CPU-local grace-period slots so pathname lookup neither takes the PCB lock
+/// nor increments the directory file's shared `Arc` count.
+pub(super) struct FdTableFastState {
+    sequence: AtomicUsize,
+    current: AtomicPtr<Vec<Option<FdTableEntry>>>,
+    readers: [FdTableSnapshotReader; MAX_CPUS],
+}
+
+impl FdTableFastState {
+    pub(super) fn new(initial: &[Option<FdTableEntry>]) -> Self {
+        Self {
+            sequence: AtomicUsize::new(0),
+            current: AtomicPtr::new(Box::into_raw(Box::new(initial.to_vec()))),
+            readers: [const { FdTableSnapshotReader::new() }; MAX_CPUS],
+        }
+    }
+
+    fn read<V>(&self, read: impl FnOnce(&[Option<FdTableEntry>]) -> V) -> V {
+        let reader = &self.readers[crate::cpu::current_id()];
+        loop {
+            let sequence = self.sequence.load(Ordering::Acquire);
+            if sequence & 1 != 0 {
+                spin_loop();
+                continue;
+            }
+            reader.active.store(1, Ordering::Release);
+            if self.sequence.load(Ordering::Acquire) != sequence {
+                reader.active.store(0, Ordering::Release);
+                continue;
+            }
+            let current = self.current.load(Ordering::Acquire);
+            assert!(!current.is_null(), "process fd table snapshot is missing");
+            let value = read(unsafe { &*current });
+            reader.active.store(0, Ordering::Release);
+            return value;
+        }
+    }
+
+    fn publish(&self, updated: &[Option<FdTableEntry>]) {
+        let start = self.sequence.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(start & 1, 0, "concurrent process fd table snapshot writer");
+        for reader in &self.readers {
+            while reader.active.load(Ordering::Acquire) != 0 {
+                crate::cpu::handle_remote_sync_ipi();
+                spin_loop();
+            }
+        }
+        let replacement = Box::into_raw(Box::new(updated.to_vec()));
+        let previous = self.current.swap(replacement, Ordering::AcqRel);
+        assert!(!previous.is_null(), "process fd table snapshot is missing");
+        unsafe {
+            drop(Box::from_raw(previous));
+        }
+        self.sequence.store(
+            start
+                .checked_add(2)
+                .expect("process fd table snapshot sequence exhausted"),
+            Ordering::Release,
+        );
+    }
+
+    fn directory_context(&self, fd: usize) -> Option<(Option<WorkingDir>, Option<String>)> {
+        self.read(|table| {
+            let entry = table.get(fd)?.as_ref()?;
+            Some((
+                entry.file_ref().working_dir(),
+                entry.dir_path().map(String::from),
+            ))
+        })
+    }
+
+    fn directory_working_dir(&self, fd: usize) -> Option<Option<WorkingDir>> {
+        self.read(|table| {
+            let entry = table.get(fd)?.as_ref()?;
+            Some(entry.file_ref().working_dir())
+        })
+    }
+}
+
+impl Drop for FdTableFastState {
+    fn drop(&mut self) {
+        let current = *self.current.get_mut();
+        if !current.is_null() {
+            unsafe {
+                drop(Box::from_raw(current));
+            }
+        }
+    }
+}
+
+/// Immutable process credentials for lock-free DAC/capability reads.
+///
+/// Linux publishes replacement `struct cred` objects and readers dereference
+/// them under RCU. Credential changes here already pass through two explicit
+/// mutation helpers, so the same copy-on-publish ownership model fits without
+/// widening the page-table write side on every pathname permission check.
+pub(super) struct CredentialsFastState {
+    sequence: AtomicUsize,
+    current: AtomicPtr<Credentials>,
+    readers: [ProcessFsSnapshotReader; MAX_CPUS],
+}
+
+impl CredentialsFastState {
+    pub(super) fn new(initial: &Credentials) -> Self {
+        Self {
+            sequence: AtomicUsize::new(0),
+            current: AtomicPtr::new(Box::into_raw(Box::new(initial.clone()))),
+            readers: [const { ProcessFsSnapshotReader::new() }; MAX_CPUS],
+        }
+    }
+
+    fn read<V>(&self, read: impl FnOnce(&Credentials) -> V) -> V {
+        let reader = &self.readers[crate::cpu::current_id()];
+        loop {
+            let sequence = self.sequence.load(Ordering::Acquire);
+            if sequence & 1 != 0 {
+                spin_loop();
+                continue;
+            }
+            reader.active.store(1, Ordering::Release);
+            if self.sequence.load(Ordering::Acquire) != sequence {
+                reader.active.store(0, Ordering::Release);
+                continue;
+            }
+            let current = self.current.load(Ordering::Acquire);
+            assert!(
+                !current.is_null(),
+                "process credentials snapshot is missing"
+            );
+            let value = read(unsafe { &*current });
+            reader.active.store(0, Ordering::Release);
+            return value;
+        }
+    }
+
+    fn publish(&self, updated: &Credentials) {
+        let start = self.sequence.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(start & 1, 0, "concurrent credentials snapshot writer");
+        for reader in &self.readers {
+            while reader.active.load(Ordering::Acquire) != 0 {
+                crate::cpu::handle_remote_sync_ipi();
+                spin_loop();
+            }
+        }
+        let replacement = Box::into_raw(Box::new(updated.clone()));
+        let previous = self.current.swap(replacement, Ordering::AcqRel);
+        assert!(
+            !previous.is_null(),
+            "process credentials snapshot is missing"
+        );
+        unsafe {
+            drop(Box::from_raw(previous));
+        }
+        self.sequence.store(
+            start
+                .checked_add(2)
+                .expect("process credentials snapshot sequence exhausted"),
+            Ordering::Release,
+        );
+    }
+
+    fn snapshot(&self) -> Credentials {
+        self.read(Clone::clone)
+    }
+}
+
+impl Drop for CredentialsFastState {
+    fn drop(&mut self) {
+        let current = *self.current.get_mut();
+        if !current.is_null() {
+            unsafe {
+                drop(Box::from_raw(current));
+            }
+        }
+    }
+}
+
+/// Per-process address-space read-side grace periods.
+///
+/// Resident usercopy touches only the current CPU's reader slot. Rare PCB
+/// writers close the read phase with an odd sequence, wait for prior readers,
+/// then keep it closed until the broad inner guard is released. This mirrors
+/// Linux RCU's important hot-path property: readers do not modify one global
+/// lock word merely to prove that they are readers.
+pub(super) struct ProcessMemoryFastState {
+    sequence: AtomicUsize,
+    readers: [ProcessFsSnapshotReader; MAX_CPUS],
+}
+
+pub(super) struct ProcessMemoryWriteGuard<'a> {
+    state: &'a ProcessMemoryFastState,
+    start: usize,
+}
+
+impl ProcessMemoryFastState {
+    pub(super) fn new() -> Self {
+        Self {
+            sequence: AtomicUsize::new(0),
+            readers: [const { ProcessFsSnapshotReader::new() }; MAX_CPUS],
+        }
+    }
+
+    fn read<V>(&self, read: impl FnOnce() -> V) -> V {
+        // Kernel-mode timer/IPI traps never schedule the interrupted syscall,
+        // and every closure here is non-blocking. The task therefore cannot
+        // migrate between selecting and clearing this CPU-local reader slot;
+        // keeping interrupts enabled lets unrelated TLB/IPI sync complete.
+        let reader = &self.readers[crate::cpu::current_id()];
+        loop {
+            let sequence = self.sequence.load(Ordering::Acquire);
+            if sequence & 1 != 0 {
+                crate::cpu::handle_remote_sync_ipi();
+                spin_loop();
+                continue;
+            }
+            reader.active.store(1, Ordering::Release);
+            if self.sequence.load(Ordering::Acquire) != sequence {
+                reader.active.store(0, Ordering::Release);
+                continue;
+            }
+            let value = read();
+            reader.active.store(0, Ordering::Release);
+            return value;
+        }
+    }
+
+    fn write(&self) -> ProcessMemoryWriteGuard<'_> {
+        let start = loop {
+            let sequence = self.sequence.load(Ordering::Acquire);
+            if sequence & 1 != 0 {
+                spin_loop();
+                continue;
+            }
+            let next = sequence
+                .checked_add(1)
+                .expect("process memory sequence exhausted");
+            if self
+                .sequence
+                .compare_exchange_weak(sequence, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break sequence;
+            }
+        };
+        for reader in &self.readers {
+            while reader.active.load(Ordering::Acquire) != 0 {
+                crate::cpu::handle_remote_sync_ipi();
+                spin_loop();
+            }
+        }
+        ProcessMemoryWriteGuard { state: self, start }
+    }
+}
+
+impl Drop for ProcessMemoryWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.state.sequence.store(
+            self.start
+                .checked_add(2)
+                .expect("process memory sequence exhausted"),
+            Ordering::Release,
+        );
+    }
+}
+
 impl ProcessFsContext {
     /// Builds the initial filesystem view for PID 1.
     pub(crate) fn root() -> Self {
@@ -482,17 +881,15 @@ impl ProcessFsContext {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProcessCpuTimes {
-    // UNFINISHED: CPU accounting is process-wide and trap-boundary based;
-    // exact per-thread aggregation, scheduler tick attribution, and
-    // signal/job-control resource accounting are not modeled yet.
+    // Live CPU time is recorded by each TaskControlBlock and aggregated when
+    // queried. These fields retain time from exited threads plus waited-child
+    // and high-water accounting, so trap entry never writes shared PCB state.
     user_us: usize,
     system_us: usize,
     children_user_us: usize,
     children_system_us: usize,
     self_maxrss_kb: usize,
     children_maxrss_kb: usize,
-    last_user_enter_us: Option<usize>,
-    last_kernel_enter_us: Option<usize>,
 }
 
 impl ProcessCpuTimes {
@@ -501,32 +898,6 @@ impl ProcessCpuTimes {
             self_maxrss_kb,
             ..Self::default()
         }
-    }
-
-    pub fn mark_user_entry(&mut self, now_us: usize) {
-        self.last_user_enter_us = Some(now_us);
-        self.last_kernel_enter_us = None;
-    }
-
-    pub fn mark_kernel_entry(&mut self, now_us: usize) {
-        self.last_kernel_enter_us = Some(now_us);
-        self.last_user_enter_us = None;
-    }
-
-    pub fn account_user_until(&mut self, now_us: usize) {
-        if let Some(start_us) = self.last_user_enter_us.take() {
-            self.user_us = self.user_us.saturating_add(now_us.saturating_sub(start_us));
-        }
-        self.last_kernel_enter_us = Some(now_us);
-    }
-
-    pub fn account_system_until(&mut self, now_us: usize) {
-        if let Some(start_us) = self.last_kernel_enter_us.take() {
-            self.system_us = self
-                .system_us
-                .saturating_add(now_us.saturating_sub(start_us));
-        }
-        self.last_kernel_enter_us = Some(now_us);
     }
 
     pub fn add_waited_child(&mut self, child: ProcessCpuTimesSnapshot) {
@@ -541,6 +912,11 @@ impl ProcessCpuTimes {
         self.children_maxrss_kb = self
             .children_maxrss_kb
             .max(child.self_maxrss_kb.max(child.children_maxrss_kb));
+    }
+
+    pub(crate) fn add_task(&mut self, user_us: usize, system_us: usize) {
+        self.user_us = self.user_us.saturating_add(user_us);
+        self.system_us = self.system_us.saturating_add(system_us);
     }
 
     pub fn record_resident_kb(&mut self, resident_kb: usize) {
@@ -660,12 +1036,25 @@ pub struct ProcessControlBlock {
     pub(super) inner_owner_cpu: AtomicUsize,
     pub(crate) job_control_stop_generation: AtomicUsize,
     pub(crate) job_control_stop_pending: AtomicUsize,
+    // Linux tests ptrace thread flags before taking sighand/tasklist locks on
+    // syscall entry and exit. Bit 0 means traced; bit 1 means syscall stops are
+    // enabled. Mutations publish this summary while holding `inner`.
+    pub(super) ptrace_fast: AtomicUsize,
+    pub(super) fs_fast: ProcessFsFastState,
+    pub(super) fd_table_fast: FdTableFastState,
+    pub(super) credentials_fast: CredentialsFastState,
+    // Page-table readers may run concurrently after retaining the translated
+    // frame. ProcessInnerGuard enters the write side lazily on DerefMut, so
+    // read-only signal/scheduler/credential queries do not close the phase.
+    pub(super) memory_access: ProcessMemoryFastState,
     // mutable
     pub(super) inner: UPIntrFreeCell<ProcessControlBlockInner>,
 }
 
 const NO_EXCLUSIVE_TASK: usize = 0;
 const NO_INNER_OWNER: usize = usize::MAX;
+const PTRACE_FAST_TRACED: usize = 1;
+const PTRACE_FAST_SYSCALL_TRACE: usize = 2;
 
 pub(crate) struct TaskGroupSchedulerGuard<'a> {
     process: &'a ProcessControlBlock,
@@ -695,6 +1084,8 @@ impl Drop for TaskGroupSchedulerGuard<'_> {
 pub struct ProcessInnerGuard<'a> {
     process: &'a ProcessControlBlock,
     inner: Option<UPIntrRefMut<'a, ProcessControlBlockInner>>,
+    memory_access: Option<ProcessMemoryWriteGuard<'a>>,
+    fd_table_version: usize,
 }
 
 impl Deref for ProcessInnerGuard<'_> {
@@ -707,12 +1098,23 @@ impl Deref for ProcessInnerGuard<'_> {
 
 impl DerefMut for ProcessInnerGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        if self.memory_access.is_none() {
+            // UPIntrRefMut already masks local interrupts. The PCB inner also
+            // serializes writers, while address-space readers never acquire
+            // the PCB lock, so waiting for their short grace period cannot
+            // form a lock cycle.
+            self.memory_access = Some(self.process.memory_access.write());
+        }
         self.inner.as_mut().expect("process inner guard released")
     }
 }
 
 impl Drop for ProcessInnerGuard<'_> {
     fn drop(&mut self) {
+        let inner = self.inner.as_ref().expect("process inner guard released");
+        if inner.fd_table_version != self.fd_table_version {
+            self.process.fd_table_fast.publish(&inner.fd_table);
+        }
         let cpu = crate::cpu::current_id();
         self.process
             .inner_owner_cpu
@@ -720,11 +1122,34 @@ impl Drop for ProcessInnerGuard<'_> {
             .unwrap_or_else(|owner| {
                 panic!("process inner owner mismatch: expected={cpu} actual={owner}")
             });
+        drop(self.memory_access.take());
         drop(self.inner.take());
     }
 }
 
 impl ProcessControlBlock {
+    #[inline(always)]
+    pub(crate) fn ptrace_is_traced_fast(&self) -> bool {
+        self.ptrace_fast.load(Ordering::Acquire) & PTRACE_FAST_TRACED != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn ptrace_syscall_trace_fast(&self) -> bool {
+        self.ptrace_fast.load(Ordering::Acquire) & PTRACE_FAST_SYSCALL_TRACE != 0
+    }
+
+    /// Publishes ptrace mode while the caller still owns `self.inner`.
+    pub(crate) fn publish_ptrace_fast_locked(&self, traced: bool, syscall_trace: bool) {
+        let mut flags = 0;
+        if traced {
+            flags |= PTRACE_FAST_TRACED;
+        }
+        if traced && syscall_trace {
+            flags |= PTRACE_FAST_SYSCALL_TRACE;
+        }
+        self.ptrace_fast.store(flags, Ordering::Release);
+    }
+
     fn scheduler_task_id(task: &TaskControlBlock) -> usize {
         task as *const TaskControlBlock as usize
     }
@@ -848,6 +1273,7 @@ pub struct ProcessControlBlockInner {
     pub children: Vec<Arc<ProcessControlBlock>>,
     pub exit_code: i32,
     pub fd_table: Vec<Option<FdTableEntry>>,
+    pub(crate) fd_table_version: usize,
     pub(crate) fd_open_bits: Vec<usize>,
     pub(crate) next_fd_hint: usize,
     pub umask: u32,
@@ -979,6 +1405,13 @@ impl ProcessControlBlockInner {
             .cloned()
     }
 
+    pub(crate) fn note_fd_table_mutation(&mut self) {
+        self.fd_table_version = self
+            .fd_table_version
+            .checked_add(1)
+            .expect("process fd table version exhausted");
+    }
+
     /// Removes an fd entry from the process table for lock-free close cleanup.
     ///
     /// The returned entry must be closed or dropped after releasing
@@ -987,6 +1420,7 @@ impl ProcessControlBlockInner {
         let entry = self.fd_table.get_mut(fd)?.take();
         if entry.is_some() {
             self.clear_fd_open_bit(fd);
+            self.note_fd_table_mutation();
             perf::record_fd_take();
         }
         entry
@@ -1003,6 +1437,7 @@ impl ProcessControlBlockInner {
         }
         let previous = self.fd_table[fd].replace(entry);
         self.set_fd_open_bit(fd);
+        self.note_fd_table_mutation();
         perf::record_fd_install(self.fd_table.len());
         previous
     }
@@ -1021,6 +1456,9 @@ impl ProcessControlBlockInner {
                 self.clear_fd_open_bit(fd);
             }
         }
+        if !closed.is_empty() {
+            self.note_fd_table_mutation();
+        }
         closed
     }
 
@@ -1031,9 +1469,13 @@ impl ProcessControlBlockInner {
                 closed.push(entry);
             }
         }
+        let changed = !closed.is_empty() || !self.fd_table.is_empty();
         self.fd_table.clear();
         self.fd_open_bits.clear();
         self.next_fd_hint = 0;
+        if changed {
+            self.note_fd_table_mutation();
+        }
         closed
     }
 
@@ -1130,6 +1572,23 @@ impl ProcessControlBlockInner {
         self.tasks.iter().filter(|task| task.is_some()).count()
     }
 
+    pub(crate) fn cpu_times_snapshot_with_tasks(&self) -> ProcessCpuTimesSnapshot {
+        let mut snapshot = self.cpu_times.snapshot();
+        for task in self.tasks.iter().flatten() {
+            let (user_us, system_us) = task.cpu_times_snapshot();
+            snapshot.user_us = snapshot.user_us.saturating_add(user_us);
+            snapshot.system_us = snapshot.system_us.saturating_add(system_us);
+        }
+        snapshot
+    }
+
+    pub(crate) fn absorb_task_cpu_times(&mut self) {
+        for task in self.tasks.iter().flatten() {
+            let (user_us, system_us) = task.take_cpu_times_snapshot();
+            self.cpu_times.add_task(user_us, system_us);
+        }
+    }
+
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks
             .get(tid)
@@ -1153,20 +1612,20 @@ pub(crate) fn comm_from_cmdline(cmdline: &[String]) -> String {
 impl ProcessControlBlock {
     pub fn inner_exclusive_access(&self) -> ProcessInnerGuard<'_> {
         let inner = self.inner.exclusive_access();
+        let fd_table_version = inner.fd_table_version;
         self.note_inner_acquired();
         ProcessInnerGuard {
             process: self,
             inner: Some(inner),
+            memory_access: None,
+            fd_table_version,
         }
     }
 
-    pub fn try_inner_exclusive_access(&self) -> Option<ProcessInnerGuard<'_>> {
-        let inner = self.inner.try_exclusive_access()?;
-        self.note_inner_acquired();
-        Some(ProcessInnerGuard {
-            process: self,
-            inner: Some(inner),
-        })
+    /// Runs a resident user-page translation while excluding MemorySet edits.
+    /// The closure must retain every returned physical frame before it exits.
+    pub(crate) fn with_memory_read<V>(&self, read: impl FnOnce() -> V) -> V {
+        self.memory_access.read(read)
     }
 
     fn note_inner_acquired(&self) {
@@ -1181,23 +1640,28 @@ impl ProcessControlBlock {
     }
 
     pub(crate) fn path_snapshot(&self) -> PathSnapshot {
-        // Snapshot lookup identity and visible path strings under the PCB lock,
-        // then let syscall path code release it before touching fd tables or
-        // VFS backends.
-        let inner = self.inner_exclusive_access();
-        PathSnapshot {
-            context: inner.fs.path_context(),
-            cwd_path: inner.fs.cwd_path.clone(),
-            root_path: inner.fs.root_path.clone(),
-        }
+        self.fs_fast.path_snapshot()
+    }
+
+    pub(crate) fn directory_context_from_fd(
+        &self,
+        fd: usize,
+    ) -> Option<(Option<WorkingDir>, Option<String>)> {
+        self.fd_table_fast.directory_context(fd)
+    }
+
+    pub(crate) fn directory_working_dir_from_fd(&self, fd: usize) -> Option<Option<WorkingDir>> {
+        self.fd_table_fast.directory_working_dir(fd)
     }
 
     pub(crate) fn mount_namespace_id(&self) -> MountNamespaceId {
-        self.inner_exclusive_access().fs.mount_namespace_id
+        self.fs_fast.mount_namespace_id()
     }
 
     pub(crate) fn set_mount_namespace_id(&self, mount_namespace_id: MountNamespaceId) {
-        self.inner_exclusive_access().fs.mount_namespace_id = mount_namespace_id;
+        let mut inner = self.inner_exclusive_access();
+        inner.fs.mount_namespace_id = mount_namespace_id;
+        self.fs_fast.publish(&inner.fs);
     }
 
     pub(crate) fn pid_namespace(&self) -> ProcessNamespace {
@@ -1254,16 +1718,18 @@ impl ProcessControlBlock {
     pub fn set_working_dir(&self, cwd: WorkingDir, cwd_path: String) {
         let mut inner = self.inner_exclusive_access();
         inner.fs.set_working_dir(cwd, cwd_path);
+        self.fs_fast.publish(&inner.fs);
     }
 
     pub fn set_root_dir(&self, root: WorkingDir, root_path: String) {
         let mut inner = self.inner_exclusive_access();
         inner.fs.set_root_dir(root, root_path);
+        self.fs_fast.publish(&inner.fs);
     }
 
     pub(crate) fn references_vfs_mount(&self, mount_id: crate::fs::MountId) -> bool {
         let inner = self.inner_exclusive_access();
-        inner.fs.references_mount(mount_id)
+        self.fs_fast.references_mount(mount_id)
             || inner
                 .fd_table
                 .iter()
@@ -1436,7 +1902,7 @@ impl ProcessControlBlock {
             executable_node: inner.executable_node,
             executable_path: inner.executable_path.clone(),
             cmdline: inner.cmdline.clone(),
-            cpu_times: inner.cpu_times.snapshot(),
+            cpu_times: inner.cpu_times_snapshot_with_tasks(),
             credentials: inner.credentials.clone(),
             thread_count: inner.thread_count(),
             mount_namespace_id: inner.fs.mount_namespace_id,
@@ -1500,45 +1966,15 @@ impl ProcessControlBlock {
         output
     }
 
-    pub fn mark_user_time_entry(&self, now_us: usize) {
-        self.inner_exclusive_access()
-            .cpu_times
-            .mark_user_entry(now_us);
-    }
-
-    pub fn mark_kernel_time_entry(&self, now_us: usize) {
-        self.inner_exclusive_access()
-            .cpu_times
-            .mark_kernel_entry(now_us);
-    }
-
-    pub fn account_user_time_until(&self, now_us: usize) {
-        self.inner_exclusive_access()
-            .cpu_times
-            .account_user_until(now_us);
-    }
-
-    pub fn account_system_time_until(&self, now_us: usize) {
-        self.inner_exclusive_access()
-            .cpu_times
-            .account_system_until(now_us);
-    }
-
-    pub fn try_account_system_time_until(&self, now_us: usize) {
-        if let Some(mut inner) = self.try_inner_exclusive_access() {
-            inner.cpu_times.account_system_until(now_us);
-        }
-    }
-
     pub fn cpu_times_snapshot(&self) -> ProcessCpuTimesSnapshot {
         let mut inner = self.inner_exclusive_access();
         let resident_kb = inner.memory_set.resident_bytes() / 1024;
         inner.cpu_times.record_resident_kb(resident_kb);
-        inner.cpu_times.snapshot()
+        inner.cpu_times_snapshot_with_tasks()
     }
 
     pub fn credentials(&self) -> Credentials {
-        self.inner_exclusive_access().credentials.clone()
+        self.credentials_fast.snapshot()
     }
 
     pub fn umask(&self) -> u32 {
@@ -1561,12 +1997,16 @@ impl ProcessControlBlock {
     }
 
     pub fn replace_supplementary_groups(&self, groups: Vec<u32>) {
-        self.inner_exclusive_access().credentials.groups = groups;
+        let mut inner = self.inner_exclusive_access();
+        inner.credentials.groups = groups;
+        self.credentials_fast.publish(&inner.credentials);
     }
 
     pub(crate) fn mutate_credentials<R>(&self, f: impl FnOnce(&mut Credentials) -> R) -> R {
         let mut inner = self.inner_exclusive_access();
-        f(&mut inner.credentials)
+        let result = f(&mut inner.credentials);
+        self.credentials_fast.publish(&inner.credentials);
+        result
     }
 
     pub(crate) fn expire_real_timer(

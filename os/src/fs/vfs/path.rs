@@ -1,8 +1,9 @@
 use super::super::mount::{
-    mount_supports_dentry_cache, mounted_root_for, mounted_root_for_synthetic_child,
-    mounted_root_parent, primary_mount_id, root_ino_for, with_mount,
+    MountNamespaceId, mount_supports_dentry_cache, mounted_root_for,
+    mounted_root_for_synthetic_child, mounted_root_parent, primary_mount_id, root_ino_for,
+    with_mount,
 };
-use super::super::path::PathContext;
+use super::super::path::{PathContext, WorkingDir};
 use super::super::{dentry_cache, dentry_cache::DentryLookupResult};
 use super::{BackendOp, FsError, FsNodeKind, FsResult, VfsNodeId};
 use crate::perf;
@@ -242,6 +243,98 @@ fn parent_visible_path(path: &str) -> String {
     }
 }
 
+fn lookup_cached_child(
+    namespace_id: MountNamespaceId,
+    parent_node: VfsNodeId,
+    component: &str,
+) -> FsResult<DentryLookupResult> {
+    let cacheable = component != ".." && mount_supports_dentry_cache(parent_node.mount_id);
+    let lookup_backend = || -> FsResult<DentryLookupResult> {
+        let token = cacheable
+            .then(|| dentry_cache::version_token(parent_node))
+            .flatten();
+        let result = {
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupBackend);
+            with_mount(parent_node.mount_id, BackendOp::Lookup, |mount| {
+                mount.lookup_component_from(parent_node.ino, component)
+            })
+            .ok_or(FsError::Io)?
+        };
+        match result {
+            Ok((ino, kind)) => {
+                let node = VfsNodeId::new(parent_node.mount_id, ino);
+                if let Some(token) = token {
+                    let _profile_scope =
+                        perf::time_scope(perf::ProfilePoint::VfsLookupDentryInsert);
+                    dentry_cache::insert_positive(
+                        namespace_id,
+                        parent_node,
+                        token,
+                        component,
+                        node,
+                        kind,
+                    );
+                }
+                Ok(DentryLookupResult::Positive { node, kind })
+            }
+            Err(FsError::NotFound) => {
+                if let Some(token) = token {
+                    let _profile_scope =
+                        perf::time_scope(perf::ProfilePoint::VfsLookupDentryInsert);
+                    dentry_cache::insert_negative(namespace_id, parent_node, token, component);
+                }
+                Ok(DentryLookupResult::Negative)
+            }
+            Err(err) => Err(err),
+        }
+    };
+
+    let cached = cacheable.then(|| {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupDentry);
+        dentry_cache::lookup(namespace_id, parent_node, component)
+    });
+    match cached.flatten() {
+        Some(cached) => Ok(cached),
+        None if cacheable => {
+            dentry_cache::with_lookup_single_flight(namespace_id, parent_node, component, || {
+                let cached = {
+                    let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupDentry);
+                    dentry_cache::lookup(namespace_id, parent_node, component)
+                };
+                cached.map_or_else(lookup_backend, Ok)
+            })
+        }
+        None => lookup_backend(),
+    }
+}
+
+/// Resolves the allocation-free numeric subset used by relative metadata
+/// probes. Direct regular children cannot cross a mount or follow a symlink;
+/// every other shape returns `None` so the full visible-path resolver retains
+/// exact Linux-compatible fallback behavior.
+pub(crate) fn resolve_direct_regular_child_in(
+    namespace_id: MountNamespaceId,
+    parent: WorkingDir,
+    component: &str,
+) -> FsResult<Option<VfsNodeId>> {
+    if component.is_empty()
+        || component == "."
+        || component == ".."
+        || component.contains('/')
+        || component.len() > EXT4_NAME_MAX
+    {
+        return Ok(None);
+    }
+    let parent = VfsNodeId::new(parent.mount_id(), parent.ino());
+    match lookup_cached_child(namespace_id, parent, component)? {
+        DentryLookupResult::Positive {
+            node,
+            kind: FsNodeKind::RegularFile,
+        } => Ok(Some(node)),
+        DentryLookupResult::Positive { .. } | DentryLookupResult::Negative => Ok(None),
+    }
+}
+
 fn lookup_child_raw(
     context: &PathContext,
     mut cursor: VfsCursor,
@@ -282,51 +375,10 @@ fn lookup_child_raw(
         });
     }
 
-    let cacheable = component != ".." && mount_supports_dentry_cache(parent_node.mount_id);
-    if cacheable {
-        let cached = {
-            let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupDentry);
-            dentry_cache::lookup(context.namespace_id(), parent_node, component)
-        };
-        match cached {
-            Some(DentryLookupResult::Positive { node, kind }) => {
-                cursor.node = node;
-                cursor.kind = kind;
-                return Ok(VfsChildLookup {
-                    cursor,
-                    parent_node,
-                    parent_kind,
-                    parent_path_len,
-                });
-            }
-            Some(DentryLookupResult::Negative) => return Err(FsError::NotFound),
-            None => {}
-        }
-    }
-
-    let result = {
-        let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupBackend);
-        with_mount(parent_node.mount_id, BackendOp::Lookup, |mount| {
-            mount.lookup_component_from(parent_node.ino, component)
-        })
-        .ok_or(FsError::Io)?
+    let result = lookup_cached_child(context.namespace_id(), parent_node, component)?;
+    let DentryLookupResult::Positive { node, kind } = result else {
+        return Err(FsError::NotFound);
     };
-    let (ino, kind) = match result {
-        Ok(found) => found,
-        Err(FsError::NotFound) => {
-            if cacheable {
-                let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupDentryInsert);
-                dentry_cache::insert_negative(context.namespace_id(), parent_node, component);
-            }
-            return Err(FsError::NotFound);
-        }
-        Err(err) => return Err(err),
-    };
-    let node = VfsNodeId::new(parent_node.mount_id, ino);
-    if cacheable {
-        let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupDentryInsert);
-        dentry_cache::insert_positive(context.namespace_id(), parent_node, component, node, kind);
-    }
     cursor.node = node;
     cursor.kind = kind;
     Ok(VfsChildLookup {

@@ -16,7 +16,9 @@ impl SyscallContext {
         // Snapshot the caller token at syscall entry; user-copy helpers using
         // this context must not re-read a process token after an exec-style
         // image switch changes the PCB memory_set.
-        let user_token = process.inner_exclusive_access().memory_set.token();
+        // The scheduler already pins and caches the active address-space token
+        // per CPU. Reading it avoids a process-wide PCB write on every syscall.
+        let user_token = crate::task::current_user_token();
         Self {
             task,
             process,

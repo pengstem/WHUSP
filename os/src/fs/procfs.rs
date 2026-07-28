@@ -1765,7 +1765,7 @@ fn oskernel_perf_content() -> String {
     let block = block_cache::stats_snapshot();
     let block_io = crate::drivers::block::block_io_stats_snapshot();
     let dentry = dentry_cache::stats_snapshot();
-    let page_cache_entries = crate::mm::page_cache::PAGE_CACHE.exclusive_access().len();
+    let page_cache_entries = crate::mm::page_cache::PAGE_CACHE.len();
     let dirty_writeback = crate::fs::vfs::dirty_writeback_stats_snapshot();
     format!(
         "{}\

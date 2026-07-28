@@ -31,7 +31,7 @@ fn wake_waiters_for_pid(pid: usize) {
 }
 
 pub(crate) fn ptrace_is_traced(process: &Arc<ProcessControlBlock>) -> bool {
-    process.inner_exclusive_access().ptrace.tracer_pid.is_some()
+    process.ptrace_is_traced_fast()
 }
 
 pub(crate) fn ptrace_traceme_current() -> SysResult {
@@ -48,6 +48,7 @@ pub(crate) fn ptrace_traceme_current() -> SysResult {
     inner.ptrace.options = 0;
     inner.ptrace.syscall_trace = false;
     inner.ptrace.syscall_stop = None;
+    process.publish_ptrace_fast_locked(true, false);
     Ok(0)
 }
 
@@ -91,6 +92,7 @@ pub(crate) fn ptrace_attach_process(
         inner.ptrace.options = 0;
         inner.ptrace.syscall_trace = false;
         inner.ptrace.syscall_stop = None;
+        tracee.publish_ptrace_fast_locked(true, false);
     }
     remove_ready_tasks_of_process(tracee.getpid());
     {
@@ -135,6 +137,10 @@ pub(crate) fn ptrace_resume_process(
             inner.ptrace.tracer_pid = None;
             inner.ptrace.options = 0;
         }
+        tracee.publish_ptrace_fast_locked(
+            inner.ptrace.tracer_pid.is_some(),
+            inner.ptrace.syscall_trace,
+        );
     }
     if let Some(signal) = signal
         && !signal.is_empty()
@@ -161,6 +167,7 @@ pub(crate) fn ptrace_kill_process(
         inner.ptrace.wait_stop_status = None;
         inner.ptrace.syscall_trace = false;
         inner.ptrace.syscall_stop = None;
+        tracee.publish_ptrace_fast_locked(inner.ptrace.tracer_pid.is_some(), false);
     }
     queue_signal_to_task(
         Arc::clone(&task),
@@ -189,6 +196,9 @@ fn take_ptrace_stop_signal_for_task(
     task: &Arc<TaskControlBlock>,
     process: &Arc<ProcessControlBlock>,
 ) -> Option<usize> {
+    if !process.ptrace_is_traced_fast() || !task.has_pending_signal_fast() {
+        return None;
+    }
     let tracer_pid = process.inner_exclusive_access().ptrace.tracer_pid?;
     let (signum, signal) = {
         let task_inner = task.inner_exclusive_access();
@@ -211,6 +221,7 @@ fn take_ptrace_stop_signal_for_task(
             return None;
         }
         task_inner.clear_pending(signum);
+        task.publish_signal_pending_locked(!task_inner.pending_signals.is_empty());
     }
     {
         let mut process_inner = process.inner_exclusive_access();
@@ -234,6 +245,11 @@ fn ptrace_syscall_stop_for_task(
     instruction_pointer: usize,
     stack_pointer: usize,
 ) -> bool {
+    // Match Linux's TIF_SYSCALL_TRACE gate: an untraced syscall never touches
+    // the process-wide ptrace state or its lock.
+    if !process.ptrace_syscall_trace_fast() {
+        return false;
+    }
     let tracer_pid = {
         let mut inner = process.inner_exclusive_access();
         let Some(tracer_pid) = inner.ptrace.tracer_pid else {

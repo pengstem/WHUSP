@@ -181,6 +181,7 @@ fn remove_pending_signal_for_task(task: &TaskControlBlock, signum: usize, signal
     let mut task_inner = task.inner_exclusive_access();
     if task_inner.pending_signals.contains(signal) {
         task_inner.clear_pending(signum as u32);
+        task.publish_signal_pending_locked(!task_inner.pending_signals.is_empty());
     }
 }
 
@@ -188,6 +189,9 @@ fn take_pending_user_signal_for_task(
     task: &Arc<TaskControlBlock>,
     process: &Arc<ProcessControlBlock>,
 ) -> Option<PendingUserSignal> {
+    if !task.has_pending_signal_fast() {
+        return None;
+    }
     let (signum, signal) = {
         let task_inner = task.inner_exclusive_access();
         let unmasked_bits = task_inner.pending_signals.bits() & !task_inner.signal_mask.bits();
@@ -241,6 +245,7 @@ fn take_pending_user_signal_for_task(
         .take()
         .unwrap_or(task_inner.signal_mask);
     task_inner.clear_pending(signum as u32);
+    task.publish_signal_pending_locked(!task_inner.pending_signals.is_empty());
     task_inner.signal_mask |= action.mask;
     if action.flags & SA_NODEFER == 0 {
         task_inner.signal_mask |= signal;

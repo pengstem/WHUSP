@@ -449,13 +449,11 @@ pub fn trap_cx_of_task(task: &TaskControlBlock) -> &'static mut TrapContext {
 
 fn account_trap_return_for_task(
     task: &TaskControlBlock,
-    process: &ProcessControlBlock,
+    _process: &ProcessControlBlock,
     now_us: usize,
 ) {
     task.account_system_time_until(now_us);
-    process.account_system_time_until(now_us);
     task.mark_user_time_entry(now_us);
-    process.mark_user_time_entry(now_us);
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -473,7 +471,7 @@ pub fn trap_return_context_after_accounting_for_task(
         .as_ref()
         .expect("current user task must own TaskUserRes")
         .trap_cx_user_va();
-    let user_token = process.inner_exclusive_access().memory_set.token();
+    let user_token = current_user_token();
     (trap_cx_user_va, user_token)
 }
 
@@ -487,7 +485,7 @@ pub fn trap_return_context_after_accounting_for_task(
     account_trap_return_for_task(task, process, now_us);
     prepare_current_address_space_return();
     let trap_cx = task.inner_exclusive_access().get_trap_cx() as *mut TrapContext as usize;
-    let user_token = process.inner_exclusive_access().memory_set.token();
+    let user_token = current_user_token();
     (trap_cx, user_token)
 }
 

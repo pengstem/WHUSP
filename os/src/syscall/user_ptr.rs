@@ -15,6 +15,20 @@ use super::errno::{SysError, SysResult};
 // path still goes through checked_user_pte(), so permissions, COW, and optional
 // fault-in semantics must match the multi-page copy path.
 const USER_COPY_SAME_PAGE_FAST_MAX: usize = 64;
+const DIRECT_PATH_COMPONENT_MAX: usize = 255;
+
+pub(crate) struct DirectPathComponent {
+    bytes: [u8; DIRECT_PATH_COMPONENT_MAX],
+    len: usize,
+}
+
+impl DirectPathComponent {
+    pub(crate) fn as_str(&self) -> &str {
+        // The direct reader rejects every non-ASCII byte before publishing
+        // this value, so the populated prefix is valid UTF-8.
+        unsafe { core::str::from_utf8_unchecked(&self.bytes[..self.len]) }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UserBufferAccess {
@@ -309,26 +323,30 @@ fn checked_and_pin_user_pte(
     if let Some(process) = &fault_handler.current_process {
         const MAX_FAULT_RETRIES: usize = 4;
         for _ in 0..MAX_FAULT_RETRIES {
-            let inner = process.inner_exclusive_access();
-            if inner.memory_set.token() != token {
-                return Err(SysError::EFAULT);
-            }
-            let pte = inner.memory_set.translate(VirtAddr::from(addr).floor());
-            let reject_zero_ppn = fault_handler.can_fault();
-            if let Some(pte) = pte
-                && user_pte_allows(pte, access, reject_zero_ppn)
-            {
-                // Mapping mutation uses this same process lock. Taking the
-                // allocator reference before releasing it closes the
-                // translate -> munmap -> frame-reuse window.
-                let pin = FrameTracker::from_retained(pte.ppn()).ok_or(SysError::EFAULT)?;
-                drop(inner);
-                return Ok((pte, pin));
+            // Linux does not take a process-wide write lock for resident
+            // copy_to/from_user. Traverse the active page table under the
+            // address-space read side and retain the physical frame before
+            // releasing it; munmap/COW writers cannot recycle that frame in
+            // the translate -> retain window.
+            let (ready, pte) = process.with_memory_read(|| {
+                let page_table = PageTable::from_token(token);
+                let pte = page_table.translate(VirtAddr::from(addr).floor());
+                let ready = pte
+                    .filter(|pte| user_pte_allows(*pte, access, fault_handler.can_fault()))
+                    .map(|pte| {
+                        FrameTracker::from_retained(pte.ppn())
+                            .map(|pin| (pte, pin))
+                            .ok_or(SysError::EFAULT)
+                    })
+                    .transpose()?;
+                Ok::<_, SysError>((ready, pte))
+            })?;
+            if let Some(ready) = ready {
+                return Ok(ready);
             }
             let cow = pte.is_some_and(|pte| {
                 access == UserBufferAccess::Write && pte.cow() && !pte.writable()
             });
-            drop(inner);
             let resolved = if cow {
                 fault_handler.resolve_cow(token, addr)
             } else if fault_handler.can_fault() {
@@ -350,6 +368,55 @@ fn checked_and_pin_user_pte(
     let pte = checked_user_pte(&page_table, token, addr, access, fault_handler)?;
     let pin = FrameTracker::from_retained(pte.ppn()).ok_or(SysError::EFAULT)?;
     Ok((pte, pin))
+}
+
+fn with_user_page_ctx<V>(
+    ctx: &SyscallContext,
+    addr: usize,
+    access: UserBufferAccess,
+    fault_handler: Option<UserFaultHandler>,
+    mut access_page: impl FnMut(&mut [u8]) -> V,
+) -> SysResult<V> {
+    let token = ctx.user_token();
+    let process = ctx.process();
+    if process.inner_owned_by_current() {
+        let resolver =
+            fault_handler.map_or_else(UserFaultResolver::none, UserFaultResolver::from_function);
+        let page_table = PageTable::from_token(token);
+        let pte = checked_user_pte(&page_table, token, addr, access, &resolver)?;
+        return Ok(access_page(pte.ppn().get_bytes_array()));
+    }
+
+    const MAX_FAULT_RETRIES: usize = 4;
+    for _ in 0..MAX_FAULT_RETRIES {
+        let (value, pte) = process.with_memory_read(|| {
+            let page_table = PageTable::from_token(token);
+            let pte = page_table.translate(VirtAddr::from(addr).floor());
+            let value = pte
+                .filter(|pte| user_pte_allows(*pte, access, true))
+                .map(|pte| access_page(pte.ppn().get_bytes_array()));
+            (value, pte)
+        });
+        if let Some(value) = value {
+            return Ok(value);
+        }
+        let cow = pte
+            .is_some_and(|pte| access == UserBufferAccess::Write && pte.cow() && !pte.writable());
+        let resolved = if cow {
+            process
+                .inner_exclusive_access()
+                .memory_set
+                .resolve_cow_page_fault(addr)
+        } else if let Some(handler) = fault_handler {
+            handler(addr, access)
+        } else {
+            lazy_framed_user_fault_for_process(process, addr, access)
+        };
+        if !resolved {
+            return Err(SysError::EFAULT);
+        }
+    }
+    Err(SysError::EFAULT)
 }
 
 fn checked_user_pte(
@@ -447,6 +514,62 @@ impl DerefMut for PinnedUserSlice {
     }
 }
 
+fn try_copy_from_user_same_page_ctx(
+    ctx: &SyscallContext,
+    ptr: *const u8,
+    dst: &mut [u8],
+    fault_handler: Option<UserFaultHandler>,
+) -> Option<SysResult<()>> {
+    if dst.is_empty() {
+        return None;
+    }
+    let start = ptr as usize;
+    let end = match start.checked_add(dst.len()) {
+        Some(end) => end,
+        None => return Some(Err(SysError::EFAULT)),
+    };
+    let start_va = VirtAddr::from(start);
+    if start_va.floor() != VirtAddr::from(end - 1).floor() {
+        return None;
+    }
+    let offset = start_va.page_offset();
+    Some(with_user_page_ctx(
+        ctx,
+        start,
+        UserBufferAccess::Read,
+        fault_handler,
+        |page| dst.copy_from_slice(&page[offset..offset + dst.len()]),
+    ))
+}
+
+fn try_copy_to_user_same_page_ctx(
+    ctx: &SyscallContext,
+    ptr: *mut u8,
+    src: &[u8],
+    fault_handler: Option<UserFaultHandler>,
+) -> Option<SysResult<()>> {
+    if src.is_empty() {
+        return None;
+    }
+    let start = ptr as usize;
+    let end = match start.checked_add(src.len()) {
+        Some(end) => end,
+        None => return Some(Err(SysError::EFAULT)),
+    };
+    let start_va = VirtAddr::from(start);
+    if start_va.floor() != VirtAddr::from(end - 1).floor() {
+        return None;
+    }
+    let offset = start_va.page_offset();
+    Some(with_user_page_ctx(
+        ctx,
+        start,
+        UserBufferAccess::Write,
+        fault_handler,
+        |page| page[offset..offset + src.len()].copy_from_slice(src),
+    ))
+}
+
 fn resolve_current_cow_page(token: usize, addr: usize) -> bool {
     // CONTEXT: COW fault resolution may take the current process memory lock
     // and update its page table. Cross-process writers such as ptrace must use
@@ -472,6 +595,67 @@ fn user_pte_allows(
 }
 
 pub(crate) const PATH_MAX: usize = 4096;
+
+/// Tries the allocation-free pathname subset used by dirfd metadata probes.
+/// A non-component shape returns `None` and lets the complete pathname reader
+/// preserve byte conversion, long-name, and multi-component semantics.
+pub(crate) fn try_read_direct_path_component_ctx(
+    ctx: &SyscallContext,
+    ptr: *const u8,
+) -> SysResult<Option<DirectPathComponent>> {
+    if ptr.is_null() {
+        return Err(SysError::EFAULT);
+    }
+    let mut component = DirectPathComponent {
+        bytes: [0; DIRECT_PATH_COMPONENT_MAX],
+        len: 0,
+    };
+    perf::record_user_c_string_call();
+    enum PageScan {
+        Complete,
+        Continue,
+        Fallback,
+    }
+    loop {
+        let addr = (ptr as usize)
+            .checked_add(component.len)
+            .ok_or(SysError::EFAULT)?;
+        let start = VirtAddr::from(addr).page_offset();
+        let scan = with_user_page_ctx(
+            ctx,
+            addr,
+            UserBufferAccess::Read,
+            Some(mmap_user_fault),
+            |page| {
+                for &byte in &page[start..] {
+                    if byte == 0 {
+                        return PageScan::Complete;
+                    }
+                    if byte == b'/'
+                        || !byte.is_ascii()
+                        || component.len == DIRECT_PATH_COMPONENT_MAX
+                    {
+                        return PageScan::Fallback;
+                    }
+                    component.bytes[component.len] = byte;
+                    component.len += 1;
+                }
+                PageScan::Continue
+            },
+        )?;
+        match scan {
+            PageScan::Complete => {
+                perf::record_user_c_string_chunk(component.len + 1, component.len, true);
+                if component.len == 0 || component.as_str() == "." || component.as_str() == ".." {
+                    return Ok(None);
+                }
+                return Ok(Some(component));
+            }
+            PageScan::Continue => {}
+            PageScan::Fallback => return Ok(None),
+        }
+    }
+}
 
 /// Reads a NUL-terminated string from user memory with an explicit length cap.
 ///
@@ -712,6 +896,11 @@ fn copy_from_user_ctx(
     fault_handler: Option<UserFaultHandler>,
 ) -> SysResult<()> {
     let token = ctx.user_token();
+    if let Some(result) = try_copy_from_user_same_page_ctx(ctx, ptr, dst, fault_handler) {
+        result?;
+        perf::record_usercopy_same_page_fast(perf::UsercopyAccess::Read, dst.len());
+        return Ok(());
+    }
     let fault_handler = effective_user_fault_resolver_for_ctx(ctx, token, fault_handler);
     copy_from_user_with_resolver(token, ptr, dst, fault_handler)
 }
@@ -839,8 +1028,17 @@ fn copy_to_user_with_site_ctx(
     site: perf::UsercopySite,
 ) -> SysResult<()> {
     let token = ctx.user_token();
+    perf::record_usercopy_site(site, src.len());
+    if src.is_empty() {
+        return Ok(());
+    }
+    if let Some(result) = try_copy_to_user_same_page_ctx(ctx, ptr, src, fault_handler) {
+        result?;
+        perf::record_usercopy_same_page_fast(perf::UsercopyAccess::Write, src.len());
+        return Ok(());
+    }
     let fault_handler = effective_user_fault_resolver_for_ctx(ctx, token, fault_handler);
-    copy_to_user_with_resolver(token, ptr, src, fault_handler, site)
+    copy_to_user_with_resolver_impl(token, ptr, src, fault_handler, site, false)
 }
 
 fn copy_to_user_with_resolver(
@@ -850,7 +1048,20 @@ fn copy_to_user_with_resolver(
     fault_handler: UserFaultResolver,
     site: perf::UsercopySite,
 ) -> SysResult<()> {
-    perf::record_usercopy_site(site, src.len());
+    copy_to_user_with_resolver_impl(token, ptr, src, fault_handler, site, true)
+}
+
+fn copy_to_user_with_resolver_impl(
+    token: usize,
+    ptr: *mut u8,
+    src: &[u8],
+    fault_handler: UserFaultResolver,
+    site: perf::UsercopySite,
+    record_site: bool,
+) -> SysResult<()> {
+    if record_site {
+        perf::record_usercopy_site(site, src.len());
+    }
     if src.is_empty() {
         return Ok(());
     }

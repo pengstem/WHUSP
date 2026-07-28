@@ -1,13 +1,19 @@
+use super::inode_state;
 use super::mount::MountNamespaceId;
 use super::vfs::{FsNodeKind, VfsNodeId};
-use crate::sync::UPIntrFreeCell;
+use crate::sync::{SleepMutex, SpinRwLock};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::*;
 
 const DEFAULT_DENTRY_CACHE_CAPACITY: usize = 4096;
+const DENTRY_CACHE_SHARD_COUNT: usize = 32;
+const DENTRY_LOOKUP_FLIGHT_COUNT: usize = 64;
+const DENTRY_CACHE_SHARD_CAPACITY: usize = DEFAULT_DENTRY_CACHE_CAPACITY / DENTRY_CACHE_SHARD_COUNT;
 // FNV-1a 64-bit constants. The full component string stays in each bucket, so
 // hash collisions only add a short linear scan and never create false hits.
 const DENTRY_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -51,9 +57,9 @@ fn hash_component(component: &str) -> u64 {
     hash
 }
 
-#[derive(Clone, Debug)]
 struct DentryCacheEntry {
     component: String,
+    parent_state: Arc<inode_state::InodeState>,
     value: DentryCacheValue,
 }
 
@@ -65,10 +71,12 @@ enum DentryCacheValue {
         node: VfsNodeId,
         kind: FsNodeKind,
         parent_generation: usize,
+        mount_epoch: usize,
         lru_stamp: usize,
     },
     Negative {
         parent_generation: usize,
+        mount_epoch: usize,
         lru_stamp: usize,
     },
 }
@@ -91,23 +99,34 @@ impl DentryCacheValue {
         }
     }
 
+    fn mount_epoch(self) -> usize {
+        match self {
+            Self::Positive { mount_epoch, .. } | Self::Negative { mount_epoch, .. } => mount_epoch,
+        }
+    }
+
     fn with_lru_stamp(self, lru_stamp: usize) -> Self {
         match self {
             Self::Positive {
                 node,
                 kind,
                 parent_generation,
+                mount_epoch,
                 ..
             } => Self::Positive {
                 node,
                 kind,
                 parent_generation,
+                mount_epoch,
                 lru_stamp,
             },
             Self::Negative {
-                parent_generation, ..
+                parent_generation,
+                mount_epoch,
+                ..
             } => Self::Negative {
                 parent_generation,
+                mount_epoch,
                 lru_stamp,
             },
         }
@@ -124,6 +143,21 @@ struct DentryCacheLruEntry {
 pub(crate) enum DentryLookupResult {
     Positive { node: VfsNodeId, kind: FsNodeKind },
     Negative,
+}
+
+#[derive(Clone)]
+pub(crate) struct DentryVersionToken {
+    parent_state: Arc<inode_state::InodeState>,
+    parent_version: usize,
+    mount_epoch: usize,
+}
+
+impl DentryVersionToken {
+    fn is_current(&self) -> bool {
+        self.parent_state.is_alive()
+            && self.parent_state.directory_version() == Some(self.parent_version)
+            && DENTRY_MOUNT_EPOCH.load(Ordering::Acquire) == self.mount_epoch
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -151,12 +185,12 @@ pub(crate) struct DentryCacheStats {
     pub(crate) collision_scans: usize,
 }
 
+#[repr(align(64))]
 struct DentryCache {
     enabled: bool,
     capacity: usize,
     entries: BTreeMap<DentryCacheBucketKey, Vec<DentryCacheEntry>>,
     entry_count: usize,
-    parent_generations: BTreeMap<VfsNodeId, usize>,
     lru: BTreeSet<DentryCacheLruEntry>,
     lru_clock: usize,
     stats: DentryCacheStats,
@@ -169,7 +203,6 @@ impl DentryCache {
             capacity,
             entries: BTreeMap::new(),
             entry_count: 0,
-            parent_generations: BTreeMap::new(),
             lru: BTreeSet::new(),
             lru_clock: 0,
             stats: DentryCacheStats {
@@ -178,10 +211,6 @@ impl DentryCache {
                 ..DentryCacheStats::default()
             },
         }
-    }
-
-    fn parent_generation(&self, parent: VfsNodeId) -> usize {
-        self.parent_generations.get(&parent).copied().unwrap_or(0)
     }
 
     #[cfg(feature = "perf-counters")]
@@ -238,45 +267,6 @@ impl DentryCache {
         stamp
     }
 
-    fn touch_hit(&mut self, bucket: DentryCacheBucketKey, stamp: usize) -> usize {
-        // PERF: Exact hit recency only matters once insertions can evict entries.
-        if self.entry_count < self.capacity {
-            return stamp;
-        }
-        self.touch(bucket, Some(stamp))
-    }
-
-    fn remove_entry_at(
-        &mut self,
-        bucket: DentryCacheBucketKey,
-        index: usize,
-        lru_stamp: usize,
-    ) -> bool {
-        let mut remove_bucket = false;
-        let removed = if let Some(entries) = self.entries.get_mut(&bucket) {
-            if index >= entries.len() {
-                false
-            } else {
-                entries.swap_remove(index);
-                self.entry_count = self.entry_count.saturating_sub(1);
-                remove_bucket = entries.is_empty();
-                true
-            }
-        } else {
-            false
-        };
-        if remove_bucket {
-            self.entries.remove(&bucket);
-        }
-        if removed {
-            self.lru.remove(&DentryCacheLruEntry {
-                stamp: lru_stamp,
-                bucket,
-            });
-        }
-        removed
-    }
-
     fn trim_to_capacity(&mut self) {
         while self.entry_count > self.capacity {
             let Some(victim) = self.lru.iter().next().copied() else {
@@ -314,67 +304,54 @@ impl DentryCache {
     }
 
     fn lookup(
-        &mut self,
+        &self,
         bucket: DentryCacheBucketKey,
-        parent: VfsNodeId,
+        mount_epoch: usize,
         component: &str,
-    ) -> Option<DentryLookupResult> {
+    ) -> (Option<DentryLookupResult>, bool, usize) {
         if !self.enabled {
-            return None;
+            return (None, false, 0);
         }
-        let Some(index) = self.find_entry_index(bucket, component) else {
-            record_dentry_stat! {
-                self.stats.miss += 1;
-            }
-            return None;
+        let Some(entries) = self.entries.get(&bucket) else {
+            return (None, false, 0);
         };
-        let Some(value) = self
-            .entries
-            .get(&bucket)
-            .and_then(|entries| entries.get(index))
-            .map(|entry| entry.value)
-        else {
-            record_dentry_stat! {
-                self.stats.miss += 1;
+        let mut collision_scans = 0;
+        let mut found = None;
+        for (index, entry) in entries.iter().enumerate() {
+            if index > 0 {
+                collision_scans += 1;
             }
-            return None;
-        };
-        if value.parent_generation() != self.parent_generation(parent) {
-            self.remove_entry_at(bucket, index, value.lru_stamp());
-            record_dentry_stat! {
-                self.stats.revalidate_fail += 1;
+            if entry.component == component {
+                found = Some(entry);
+                break;
             }
-            return None;
         }
-        let stamp = self.touch_hit(bucket, value.lru_stamp());
-        if stamp != value.lru_stamp()
-            && let Some(entry) = self
-                .entries
-                .get_mut(&bucket)
-                .and_then(|entries| entries.get_mut(index))
+        let Some(entry) = found else {
+            return (None, false, collision_scans);
+        };
+        let value = entry.value;
+        if !entry.parent_state.is_alive()
+            || value.parent_generation()
+                != entry.parent_state.directory_version().unwrap_or(usize::MAX)
+            || value.mount_epoch() != mount_epoch
         {
-            entry.value = value.with_lru_stamp(stamp);
+            return (None, true, collision_scans);
         }
-        match value {
+        let result = match value {
             DentryCacheValue::Positive { node, kind, .. } => {
-                record_dentry_stat! {
-                    self.stats.positive_hit += 1;
-                }
                 Some(DentryLookupResult::Positive { node, kind })
             }
-            DentryCacheValue::Negative { .. } => {
-                record_dentry_stat! {
-                    self.stats.negative_hit += 1;
-                }
-                Some(DentryLookupResult::Negative)
-            }
-        }
+            DentryCacheValue::Negative { .. } => Some(DentryLookupResult::Negative),
+        };
+        (result, false, collision_scans)
     }
 
     fn insert_positive(
         &mut self,
         bucket: DentryCacheBucketKey,
-        parent: VfsNodeId,
+        parent_state: Arc<inode_state::InodeState>,
+        parent_generation: usize,
+        mount_epoch: usize,
         component: &str,
         node: VfsNodeId,
         kind: FsNodeKind,
@@ -385,7 +362,8 @@ impl DentryCache {
         let value = DentryCacheValue::Positive {
             node,
             kind,
-            parent_generation: self.parent_generation(parent),
+            parent_generation,
+            mount_epoch,
             lru_stamp: 0,
         };
         if let Some(index) = self.find_entry_index(bucket, component) {
@@ -400,6 +378,7 @@ impl DentryCache {
                 .get_mut(&bucket)
                 .and_then(|entries| entries.get_mut(index))
             {
+                entry.parent_state = parent_state;
                 entry.value = value.with_lru_stamp(stamp);
             }
         } else {
@@ -410,6 +389,7 @@ impl DentryCache {
                 .or_default()
                 .push(DentryCacheEntry {
                     component: String::from(component),
+                    parent_state,
                     value: value.with_lru_stamp(stamp),
                 });
             self.entry_count += 1;
@@ -423,14 +403,17 @@ impl DentryCache {
     fn insert_negative(
         &mut self,
         bucket: DentryCacheBucketKey,
-        parent: VfsNodeId,
+        parent_state: Arc<inode_state::InodeState>,
+        parent_generation: usize,
+        mount_epoch: usize,
         component: &str,
     ) {
         if !self.enabled || self.capacity == 0 {
             return;
         }
         let value = DentryCacheValue::Negative {
-            parent_generation: self.parent_generation(parent),
+            parent_generation,
+            mount_epoch,
             lru_stamp: 0,
         };
         if let Some(index) = self.find_entry_index(bucket, component) {
@@ -445,6 +428,7 @@ impl DentryCache {
                 .get_mut(&bucket)
                 .and_then(|entries| entries.get_mut(index))
             {
+                entry.parent_state = parent_state;
                 entry.value = value.with_lru_stamp(stamp);
             }
         } else {
@@ -455,6 +439,7 @@ impl DentryCache {
                 .or_default()
                 .push(DentryCacheEntry {
                     component: String::from(component),
+                    parent_state,
                     value: value.with_lru_stamp(stamp),
                 });
             self.entry_count += 1;
@@ -463,29 +448,6 @@ impl DentryCache {
             self.stats.insert_negative += 1;
         }
         self.trim_to_capacity();
-    }
-
-    fn invalidate_parent(&mut self, parent: VfsNodeId) {
-        if !self.enabled {
-            return;
-        }
-        let generation = self.parent_generation(parent).wrapping_add(1);
-        self.parent_generations.insert(parent, generation);
-        record_dentry_stat! {
-            self.stats.invalidate_parent_calls += 1;
-        }
-    }
-
-    fn clear_all(&mut self) {
-        if !self.enabled || self.entry_count == 0 {
-            return;
-        }
-        record_dentry_stat! {
-            self.stats.invalidate_all += self.entry_count;
-        }
-        self.entries.clear();
-        self.entry_count = 0;
-        self.lru.clear();
     }
 
     fn stats_snapshot(&self) -> DentryCacheStats {
@@ -498,9 +460,93 @@ impl DentryCache {
     }
 }
 
+static DENTRY_MOUNT_EPOCH: AtomicUsize = AtomicUsize::new(1);
+static DENTRY_INVALIDATE_PARENT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static DENTRY_INVALIDATE_ALL_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "perf-counters")]
+static DENTRY_POSITIVE_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "perf-counters")]
+static DENTRY_NEGATIVE_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "perf-counters")]
+static DENTRY_MISSES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "perf-counters")]
+static DENTRY_REVALIDATE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "perf-counters")]
+static DENTRY_COLLISION_SCANS: AtomicUsize = AtomicUsize::new(0);
+
 lazy_static! {
-    static ref DENTRY_CACHE: UPIntrFreeCell<DentryCache> =
-        unsafe { UPIntrFreeCell::new(DentryCache::new(DEFAULT_DENTRY_CACHE_CAPACITY)) };
+    static ref DENTRY_CACHE_SHARDS: Vec<SpinRwLock<DentryCache>> = (0
+        ..DENTRY_CACHE_SHARD_COUNT)
+        .map(|_| SpinRwLock::new(DentryCache::new(DENTRY_CACHE_SHARD_CAPACITY)))
+        .collect();
+    // Same-key misses always map to the same sleeping gate. Hash collisions
+    // may conservatively serialize unrelated misses, but never duplicate one
+    // key's backend lookup.
+    static ref DENTRY_LOOKUP_FLIGHTS: Vec<SleepMutex<()>> = (0
+        ..DENTRY_LOOKUP_FLIGHT_COUNT)
+        .map(|_| SleepMutex::new(()))
+        .collect();
+}
+
+#[cfg(feature = "perf-counters")]
+fn record_lookup_result(
+    result: Option<DentryLookupResult>,
+    revalidate_failed: bool,
+    collision_scans: usize,
+) {
+    DENTRY_COLLISION_SCANS.fetch_add(collision_scans, Ordering::Relaxed);
+    match result {
+        Some(DentryLookupResult::Positive { .. }) => {
+            DENTRY_POSITIVE_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(DentryLookupResult::Negative) => {
+            DENTRY_NEGATIVE_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+        None if revalidate_failed => {
+            DENTRY_REVALIDATE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
+        None => {
+            DENTRY_MISSES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(not(feature = "perf-counters"))]
+#[inline(always)]
+fn record_lookup_result(
+    _result: Option<DentryLookupResult>,
+    _revalidate_failed: bool,
+    _collision_scans: usize,
+) {
+}
+
+fn shard_index(bucket: DentryCacheBucketKey, count: usize) -> usize {
+    debug_assert!(count.is_power_of_two());
+    let mixed = bucket.component_hash
+        ^ (bucket.parent.ino as u64).rotate_left(17)
+        ^ (bucket.parent.mount_id.0 as u64).rotate_left(31)
+        ^ (bucket.namespace_id.0 as u64).rotate_left(47);
+    mixed as usize & (count - 1)
+}
+
+pub(crate) fn version_token(parent: VfsNodeId) -> Option<DentryVersionToken> {
+    let parent_state = inode_state::state_for(parent);
+    Some(DentryVersionToken {
+        parent_version: parent_state.directory_version()?,
+        parent_state,
+        mount_epoch: DENTRY_MOUNT_EPOCH.load(Ordering::Acquire),
+    })
+}
+
+pub(crate) fn with_lookup_single_flight<V>(
+    namespace_id: MountNamespaceId,
+    parent: VfsNodeId,
+    component: &str,
+    operation: impl FnOnce() -> V,
+) -> V {
+    let bucket = DentryCacheBucketKey::new(namespace_id, parent, component);
+    let _guard = DENTRY_LOOKUP_FLIGHTS[shard_index(bucket, DENTRY_LOOKUP_FLIGHT_COUNT)].lock();
+    operation()
 }
 
 pub(crate) fn lookup(
@@ -509,41 +555,116 @@ pub(crate) fn lookup(
     component: &str,
 ) -> Option<DentryLookupResult> {
     let bucket = DentryCacheBucketKey::new(namespace_id, parent, component);
-    DENTRY_CACHE
-        .exclusive_access()
-        .lookup(bucket, parent, component)
+    let mount_epoch = DENTRY_MOUNT_EPOCH.load(Ordering::Acquire);
+    let (result, revalidate_failed, collision_scans) = DENTRY_CACHE_SHARDS
+        [shard_index(bucket, DENTRY_CACHE_SHARD_COUNT)]
+    .read()
+    .lookup(bucket, mount_epoch, component);
+    record_lookup_result(result, revalidate_failed, collision_scans);
+    if DENTRY_MOUNT_EPOCH.load(Ordering::Acquire) != mount_epoch {
+        return None;
+    }
+    result
 }
 
 pub(crate) fn insert_positive(
     namespace_id: MountNamespaceId,
     parent: VfsNodeId,
+    expected: DentryVersionToken,
     component: &str,
     node: VfsNodeId,
     kind: FsNodeKind,
 ) {
+    if !expected.is_current() {
+        return;
+    }
     let bucket = DentryCacheBucketKey::new(namespace_id, parent, component);
-    DENTRY_CACHE
-        .exclusive_access()
-        .insert_positive(bucket, parent, component, node, kind);
+    DENTRY_CACHE_SHARDS[shard_index(bucket, DENTRY_CACHE_SHARD_COUNT)]
+        .write()
+        .insert_positive(
+            bucket,
+            Arc::clone(&expected.parent_state),
+            expected.parent_version,
+            expected.mount_epoch,
+            component,
+            node,
+            kind,
+        );
 }
 
-pub(crate) fn insert_negative(namespace_id: MountNamespaceId, parent: VfsNodeId, component: &str) {
+pub(crate) fn insert_negative(
+    namespace_id: MountNamespaceId,
+    parent: VfsNodeId,
+    expected: DentryVersionToken,
+    component: &str,
+) {
+    if !expected.is_current() {
+        return;
+    }
     let bucket = DentryCacheBucketKey::new(namespace_id, parent, component);
-    DENTRY_CACHE
-        .exclusive_access()
-        .insert_negative(bucket, parent, component);
+    DENTRY_CACHE_SHARDS[shard_index(bucket, DENTRY_CACHE_SHARD_COUNT)]
+        .write()
+        .insert_negative(
+            bucket,
+            Arc::clone(&expected.parent_state),
+            expected.parent_version,
+            expected.mount_epoch,
+            component,
+        );
 }
 
 pub(crate) fn invalidate_parent(parent: VfsNodeId) {
-    DENTRY_CACHE.exclusive_access().invalidate_parent(parent);
+    inode_state::invalidate_directory(parent);
+    DENTRY_INVALIDATE_PARENT_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn clear_all() {
-    DENTRY_CACHE.exclusive_access().clear_all();
+    inode_state::invalidate_direct_stat_cache();
+    DENTRY_MOUNT_EPOCH
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+            epoch.checked_add(1)
+        })
+        .expect("dentry mount epoch exhausted");
+    DENTRY_INVALIDATE_ALL_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn stats_snapshot() -> DentryCacheStats {
-    DENTRY_CACHE.exclusive_access().stats_snapshot()
+    let mut total = DentryCacheStats {
+        enabled: true,
+        capacity: DEFAULT_DENTRY_CACHE_CAPACITY,
+        ..DentryCacheStats::default()
+    };
+    for shard in DENTRY_CACHE_SHARDS.iter() {
+        let stats = shard.read().stats_snapshot();
+        total.entries += stats.entries;
+        total.positive_hit += stats.positive_hit;
+        total.negative_hit += stats.negative_hit;
+        total.miss += stats.miss;
+        total.revalidate_fail += stats.revalidate_fail;
+        total.insert_positive += stats.insert_positive;
+        total.insert_negative += stats.insert_negative;
+        total.evict += stats.evict;
+        total.lru_touch += stats.lru_touch;
+        total.lru_scan_slots += stats.lru_scan_slots;
+        #[cfg(feature = "perf-counters")]
+        {
+            total.key_allocs += stats.key_allocs;
+            total.collision_scans += stats.collision_scans;
+        }
+    }
+    let parent_invalidations = DENTRY_INVALIDATE_PARENT_CALLS.load(Ordering::Relaxed);
+    total.invalidate_parent = parent_invalidations;
+    total.invalidate_parent_calls = parent_invalidations;
+    total.invalidate_all = DENTRY_INVALIDATE_ALL_CALLS.load(Ordering::Relaxed);
+    #[cfg(feature = "perf-counters")]
+    {
+        total.positive_hit += DENTRY_POSITIVE_HITS.load(Ordering::Relaxed);
+        total.negative_hit += DENTRY_NEGATIVE_HITS.load(Ordering::Relaxed);
+        total.miss += DENTRY_MISSES.load(Ordering::Relaxed);
+        total.revalidate_fail += DENTRY_REVALIDATE_FAILURES.load(Ordering::Relaxed);
+        total.collision_scans += DENTRY_COLLISION_SCANS.load(Ordering::Relaxed);
+    }
+    total
 }
 
 pub(crate) fn stats_content() -> String {

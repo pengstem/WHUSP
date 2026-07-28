@@ -125,12 +125,17 @@ pub fn sys_close_range(first: usize, last: usize, flags: u32) -> SysResult {
         if first > last {
             Vec::new()
         } else if flags & CLOSE_RANGE_CLOEXEC != 0 {
+            let mut changed = false;
             for fd in first..=last {
                 if let Some(Some(entry)) = inner.fd_table.get_mut(fd) {
                     let mut fd_flags = entry.fd_flags();
                     fd_flags.insert(FdFlags::CLOEXEC);
                     entry.set_fd_flags(fd_flags);
+                    changed = true;
                 }
+            }
+            if changed {
+                inner.note_fd_table_mutation();
             }
             Vec::new()
         } else {
@@ -420,6 +425,7 @@ pub fn sys_fcntl_ctx(ctx: &SyscallContext, fd: usize, op: usize, arg: usize) -> 
             entry.set_fd_flags(FdFlags::from_bits_truncate(
                 (arg as u32) & FdFlags::CLOEXEC.bits(),
             ));
+            inner.note_fd_table_mutation();
             Ok(0)
         }
         F_GETFL => Ok(get_fd_entry_by_fd_for_process(ctx.process(), fd)?

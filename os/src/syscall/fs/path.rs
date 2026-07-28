@@ -140,13 +140,11 @@ fn dirfd_context_from(snapshot: &PathSnapshot, dirfd: isize) -> SysResult<(Worki
     if dirfd < 0 {
         return Err(SysError::EBADF);
     }
-    let entry = get_fd_entry_by_fd(dirfd as usize)?;
-    let file = entry.file();
-    let cwd = file.working_dir().ok_or(SysError::ENOTDIR)?;
-    let cwd_path = entry
-        .dir_path()
-        .map(String::from)
-        .unwrap_or_else(|| snapshot.cwd_path.clone());
+    let (cwd, dir_path) = current_process()
+        .directory_context_from_fd(dirfd as usize)
+        .ok_or(SysError::EBADF)?;
+    let cwd = cwd.ok_or(SysError::ENOTDIR)?;
+    let cwd_path = dir_path.unwrap_or_else(|| snapshot.cwd_path.clone());
     Ok((cwd, cwd_path))
 }
 

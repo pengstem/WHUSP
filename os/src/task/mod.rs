@@ -95,40 +95,24 @@ pub use task::{DEFAULT_TIMER_SLACK_NS, SeccompSockFilter, TaskControlBlock, Task
 const CORE_DUMP_STATUS_BIT: i32 = 0x80;
 const CORE_DUMP_MAX_BYTES: usize = 16 * 1024 * 1024;
 
-fn with_current_task_and_process(
-    task_fn: impl FnOnce(&TaskControlBlock),
-    process_fn: impl FnOnce(&ProcessControlBlock),
-) {
-    let Some(task) = current_task() else {
-        return;
-    };
-    task_fn(&task);
-    if let Some(process) = task.process.upgrade() {
-        process_fn(&process);
-    }
-}
-
 pub fn account_task_user_time_until(
     task: &TaskControlBlock,
-    process: &ProcessControlBlock,
+    _process: &ProcessControlBlock,
     now_us: usize,
 ) {
     task.account_user_time_until(now_us);
-    process.account_user_time_until(now_us);
 }
 
 pub fn account_current_system_time_until(now_us: usize) {
-    with_current_task_and_process(
-        |task| task.account_system_time_until(now_us),
-        |process| process.account_system_time_until(now_us),
-    );
+    if let Some(task) = current_task() {
+        task.account_system_time_until(now_us);
+    }
 }
 
 fn try_account_current_system_time_until(now_us: usize) {
-    with_current_task_and_process(
-        |task| task.try_account_system_time_until(now_us),
-        |process| process.try_account_system_time_until(now_us),
-    );
+    if let Some(task) = current_task() {
+        task.try_account_system_time_until(now_us);
+    }
 }
 
 pub fn account_current_system_time() {
@@ -140,10 +124,9 @@ fn try_account_current_system_time() {
 }
 
 pub fn mark_current_kernel_time_entry(now_us: usize) {
-    with_current_task_and_process(
-        |task| task.mark_kernel_time_entry(now_us),
-        |process| process.mark_kernel_time_entry(now_us),
-    );
+    if let Some(task) = current_task() {
+        task.mark_kernel_time_entry(now_us);
+    }
 }
 
 pub fn timer_tick_should_preempt(current: &Arc<TaskControlBlock>) -> bool {
@@ -472,6 +455,7 @@ pub(crate) fn queue_signal_to_task(
         if let Some(slot) = task_inner.signal_infos.get_mut(info.signo as usize) {
             *slot = Some(info);
         }
+        task.publish_signal_pending_locked(!task_inner.pending_signals.is_empty());
     }
     if signal_should_wake_target(&task, signal) {
         wakeup_task(task);
@@ -720,6 +704,9 @@ pub fn stop_current_task_if_needed() {
     let Some(task) = current_task() else {
         return;
     };
+    if !task.has_pending_signal_fast() {
+        return;
+    }
     let Some(process) = task.process.upgrade() else {
         return;
     };
@@ -891,7 +878,10 @@ fn exit_current(exit_code: i32, group_exit: bool) {
     if tid != 0 {
         let mut process_inner = process.inner_exclusive_access();
         if tid < process_inner.tasks.len() {
-            process_inner.tasks[tid] = None;
+            if let Some(task) = process_inner.tasks[tid].take() {
+                let (user_us, system_us) = task.take_cpu_times_snapshot();
+                process_inner.cpu_times.add_task(user_us, system_us);
+            }
         }
     }
     if process_exit {
@@ -937,6 +927,7 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             process_inner.exit_code = exit_code;
             let resident_kb = process_inner.memory_set.resident_bytes() / 1024;
             process_inner.cpu_times.record_resident_kb(resident_kb);
+            process_inner.absorb_task_cpu_times();
             let parent = process_inner.parent.as_ref().and_then(|p| p.upgrade());
             let exit_signal = process_inner.exit_signal;
             let children = core::mem::take(&mut process_inner.children);
@@ -1102,6 +1093,9 @@ pub fn check_signals_of_task(
     task: &Arc<TaskControlBlock>,
     process: &Arc<ProcessControlBlock>,
 ) -> Option<(i32, &'static str)> {
+    if !task.has_pending_signal_fast() {
+        return None;
+    }
     let pending = {
         let task_inner = task.inner_exclusive_access();
         // CONTEXT: bitflags `!` truncates to named flags unless the flag type
@@ -1136,6 +1130,7 @@ pub fn check_signals_of_task(
     {
         let mut task_inner = task.inner_exclusive_access();
         task_inner.clear_pending(signum as u32);
+        task.publish_signal_pending_locked(!task_inner.pending_signals.is_empty());
         return None;
     }
     if action.has_user_handler() {
@@ -1294,6 +1289,7 @@ fn clear_restartable_wait_heartbeat(
     );
     if unmasked.contains(SignalFlags::SIGUSR1) {
         task_inner.clear_pending(signum as u32);
+        task.publish_signal_pending_locked(!task_inner.pending_signals.is_empty());
     }
 }
 

@@ -94,6 +94,7 @@ fn consume_pending_signal(signum: u32) {
     };
     let mut inner = task.inner_exclusive_access();
     inner.clear_pending(signum);
+    task.publish_signal_pending_locked(!inner.pending_signals.is_empty());
 }
 
 fn try_return_pending_signal(
