@@ -1,10 +1,111 @@
 use core::{mem, slice};
 
+use alloc::vec::Vec;
+
 use crate::{Ext4Result, SystemHal, error::Context, ffi::*, util::revision_tuple};
 
-use super::{InodeRef, InodeType};
+use super::{Ext4MappedReadPlan, Ext4MappedReadRun, InodeRef, InodeType};
+
+#[derive(Debug)]
+pub struct Ext4DirectoryReadPlan {
+    pub mapped: Ext4MappedReadPlan,
+    pub start_offset: u64,
+    pub has_file_type: bool,
+}
 
 impl<Hal: SystemHal> InodeRef<Hal> {
+    pub fn plan_directory_read(
+        &mut self,
+        offset: u64,
+    ) -> Ext4Result<Option<Ext4DirectoryReadPlan>> {
+        let file_size = self.size();
+        let block_size = crate::util::get_block_size(self.superblock()) as usize;
+        if self.inode_type() != InodeType::Directory || block_size == 0 {
+            return Ok(None);
+        }
+        let has_file_type = revision_tuple(self.superblock()) >= (0, 5);
+        if offset >= file_size {
+            return Ok(Some(Ext4DirectoryReadPlan {
+                mapped: Ext4MappedReadPlan {
+                    block_size,
+                    buffer_len: 0,
+                    read_offset: 0,
+                    read_len: 0,
+                    runs: Vec::new(),
+                },
+                start_offset: offset,
+                has_file_type,
+            }));
+        }
+
+        let block_size_u64 = block_size as u64;
+        let aligned_start = offset / block_size_u64 * block_size_u64;
+        let Some(aligned_end) = file_size
+            .checked_add(block_size_u64 - 1)
+            .map(|value| value / block_size_u64 * block_size_u64)
+        else {
+            return Ok(None);
+        };
+        let logical_start_u64 = aligned_start / block_size_u64;
+        let logical_blocks_u64 = (aligned_end - aligned_start) / block_size_u64;
+        let Ok(logical_start) = u32::try_from(logical_start_u64) else {
+            return Ok(None);
+        };
+        let Ok(logical_blocks) = usize::try_from(logical_blocks_u64) else {
+            return Ok(None);
+        };
+        let Some(buffer_len) = logical_blocks.checked_mul(block_size) else {
+            return Ok(None);
+        };
+        let Ok(read_offset) = usize::try_from(offset - aligned_start) else {
+            return Ok(None);
+        };
+        let Ok(read_len) = usize::try_from(file_size - offset) else {
+            return Ok(None);
+        };
+        let mut runs: Vec<Ext4MappedReadRun> = Vec::new();
+        for buffer_block in 0..logical_blocks {
+            let Ok(block_delta) = u32::try_from(buffer_block) else {
+                return Ok(None);
+            };
+            let Some(logical_block) = logical_start.checked_add(block_delta) else {
+                return Ok(None);
+            };
+            let fs_block = self.get_inode_fblock(logical_block)?;
+            let fs_block = (fs_block != 0).then_some(fs_block);
+            let can_merge = runs.last().is_some_and(|last| {
+                last.buffer_block + last.block_count == buffer_block
+                    && match (last.fs_block, fs_block) {
+                        (None, None) => true,
+                        (Some(last_block), Some(next_block)) => {
+                            last_block + last.block_count as u64 == next_block
+                        }
+                        _ => false,
+                    }
+            });
+            if can_merge {
+                runs.last_mut().unwrap().block_count += 1;
+            } else {
+                runs.push(Ext4MappedReadRun {
+                    buffer_block,
+                    block_count: 1,
+                    fs_block,
+                });
+            }
+        }
+        Ok(Some(Ext4DirectoryReadPlan {
+            mapped: Ext4MappedReadPlan {
+                block_size,
+                buffer_len,
+                read_offset,
+                read_len,
+                runs,
+            },
+            start_offset: offset,
+            has_file_type,
+        }))
+    }
+
     pub fn read_dir(mut self, offset: u64) -> Ext4Result<DirReader<Hal>> {
         unsafe {
             let mut iter = mem::zeroed();

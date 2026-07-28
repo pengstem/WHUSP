@@ -450,10 +450,13 @@ pub(crate) fn with_mapping_read<V>(node: VfsNodeId, read: impl FnOnce() -> V) ->
     read()
 }
 
-pub(crate) fn with_directory_read<V>(node: VfsNodeId, read: impl FnOnce() -> V) -> V {
+pub(crate) fn with_directory_read<V>(node: VfsNodeId, read: impl FnOnce(usize) -> V) -> V {
     let state = state_for(node);
     let _lease = state.directory_version.read();
-    read()
+    let version = state
+        .directory_version()
+        .expect("directory version unstable under shared lease");
+    read(version)
 }
 
 fn metadata_or_load(

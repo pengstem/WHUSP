@@ -1,12 +1,15 @@
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -18,6 +21,16 @@ enum {
     READ_MUTATION_ITERATIONS = 200,
     DRAIN_STRESS_FILES = 48,
     DRAIN_STRESS_WORKERS = 12,
+    DIRECTORY_SNAPSHOT_FILES = 96,
+    DIRECTORY_RACE_STABLE_FILES = 24,
+};
+
+struct probe_linux_dirent64 {
+    uint64_t d_ino;
+    int64_t d_off;
+    unsigned short d_reclen;
+    unsigned char d_type;
+    char d_name[];
 };
 
 static int write_exact(int fd, const void *buffer, size_t length);
@@ -243,6 +256,192 @@ static int phase_readlink_vs_unlink(const char *base)
         return -1;
     }
     return 0;
+}
+
+static int phase_directory_snapshot(const char *base)
+{
+    char dir[512];
+    char path[1024];
+    snprintf(dir, sizeof(dir), "%s/directory-snapshot", base);
+    if (mkdir(dir, 0700) != 0) {
+        return -1;
+    }
+    for (int i = 0; i < DIRECTORY_SNAPSHOT_FILES; ++i) {
+        snprintf(path, sizeof(path), "%s/entry-%03d-abcdefghijklmnopqrstuvwxyz", dir, i);
+        int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+        if (fd < 0 || close(fd) != 0) {
+            return -1;
+        }
+    }
+    int dirfd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (dirfd < 0) {
+        return -1;
+    }
+    unsigned char seen[DIRECTORY_SNAPSHOT_FILES];
+    unsigned char buffer[257];
+    memset(seen, 0, sizeof(seen));
+    int dot = 0;
+    int dotdot = 0;
+    int files = 0;
+    for (;;) {
+        long amount = syscall(SYS_getdents64, dirfd, buffer, sizeof(buffer));
+        if (amount < 0) {
+            return -1;
+        }
+        if (amount == 0) {
+            break;
+        }
+        size_t cursor = 0;
+        while (cursor < (size_t)amount) {
+            struct probe_linux_dirent64 *entry = (void *)(buffer + cursor);
+            size_t header = offsetof(struct probe_linux_dirent64, d_name);
+            if (entry->d_reclen < header + 1 || entry->d_reclen % 8 != 0
+                || cursor + entry->d_reclen > (size_t)amount || entry->d_off <= 0) {
+                return -1;
+            }
+            size_t name_capacity = entry->d_reclen - header;
+            size_t name_len = strnlen(entry->d_name, name_capacity);
+            if (name_len == name_capacity) {
+                return -1;
+            }
+            if (strcmp(entry->d_name, ".") == 0) {
+                if (++dot != 1 || entry->d_type != DT_DIR) {
+                    return -1;
+                }
+            } else if (strcmp(entry->d_name, "..") == 0) {
+                if (++dotdot != 1 || entry->d_type != DT_DIR) {
+                    return -1;
+                }
+            } else {
+                int index = -1;
+                char suffix[40];
+                if (sscanf(entry->d_name, "entry-%03d-%39s", &index, suffix) != 2
+                    || index < 0 || index >= DIRECTORY_SNAPSHOT_FILES || seen[index]
+                    || strcmp(suffix, "abcdefghijklmnopqrstuvwxyz") != 0
+                    || entry->d_type != DT_REG) {
+                    return -1;
+                }
+                seen[index] = 1;
+                ++files;
+            }
+            cursor += entry->d_reclen;
+        }
+    }
+    if (dot != 1 || dotdot != 1 || files != DIRECTORY_SNAPSHOT_FILES || close(dirfd) != 0) {
+        return -1;
+    }
+    for (int i = 0; i < DIRECTORY_SNAPSHOT_FILES; ++i) {
+        if (!seen[i]) {
+            return -1;
+        }
+        snprintf(path, sizeof(path), "%s/entry-%03d-abcdefghijklmnopqrstuvwxyz", dir, i);
+        if (unlink(path) != 0) {
+            return -1;
+        }
+    }
+    return rmdir(dir);
+}
+
+static int phase_readdir_vs_namespace_mutation(const char *base)
+{
+    char dir[512];
+    char path[1024];
+    char changing[1024];
+    snprintf(dir, sizeof(dir), "%s/readdir-race", base);
+    snprintf(changing, sizeof(changing), "%s/changing", dir);
+    if (mkdir(dir, 0700) != 0) {
+        return -1;
+    }
+    for (int i = 0; i < DIRECTORY_RACE_STABLE_FILES; ++i) {
+        snprintf(path, sizeof(path), "%s/stable-%02d", dir, i);
+        int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+        if (fd < 0 || close(fd) != 0) {
+            return -1;
+        }
+    }
+    pid_t writer = fork();
+    if (writer == 0) {
+        for (int i = 0; i < READ_MUTATION_ITERATIONS; ++i) {
+            int fd = open(changing, O_CREAT | O_EXCL | O_WRONLY, 0600);
+            if (fd < 0 || close(fd) != 0 || unlink(changing) != 0) {
+                _exit(91);
+            }
+        }
+        _exit(0);
+    }
+    pid_t reader = fork();
+    if (reader == 0) {
+        int dirfd = open(dir, O_RDONLY | O_DIRECTORY);
+        if (dirfd < 0) {
+            _exit(92);
+        }
+        unsigned char buffer[4096];
+        for (int iteration = 0; iteration < READ_MUTATION_ITERATIONS * 2; ++iteration) {
+            unsigned char seen[DIRECTORY_RACE_STABLE_FILES];
+            memset(seen, 0, sizeof(seen));
+            if (lseek(dirfd, 0, SEEK_SET) != 0) {
+                _exit(93);
+            }
+            long amount = syscall(SYS_getdents64, dirfd, buffer, sizeof(buffer));
+            if (amount <= 0) {
+                _exit(94);
+            }
+            int dot = 0;
+            int dotdot = 0;
+            int stable = 0;
+            int changing_count = 0;
+            size_t cursor = 0;
+            while (cursor < (size_t)amount) {
+                struct probe_linux_dirent64 *entry = (void *)(buffer + cursor);
+                size_t header = offsetof(struct probe_linux_dirent64, d_name);
+                if (entry->d_reclen < header + 1 || entry->d_reclen % 8 != 0
+                    || cursor + entry->d_reclen > (size_t)amount) {
+                    _exit(95);
+                }
+                size_t capacity = entry->d_reclen - header;
+                if (strnlen(entry->d_name, capacity) == capacity) {
+                    _exit(96);
+                }
+                if (strcmp(entry->d_name, ".") == 0) {
+                    ++dot;
+                } else if (strcmp(entry->d_name, "..") == 0) {
+                    ++dotdot;
+                } else if (strcmp(entry->d_name, "changing") == 0) {
+                    ++changing_count;
+                } else {
+                    int index = -1;
+                    if (sscanf(entry->d_name, "stable-%02d", &index) != 1 || index < 0
+                        || index >= DIRECTORY_RACE_STABLE_FILES || seen[index]) {
+                        _exit(97);
+                    }
+                    seen[index] = 1;
+                    ++stable;
+                }
+                cursor += entry->d_reclen;
+            }
+            if (dot != 1 || dotdot != 1 || stable != DIRECTORY_RACE_STABLE_FILES
+                || changing_count > 1) {
+                _exit(98);
+            }
+        }
+        if (close(dirfd) != 0) {
+            _exit(99);
+        }
+        _exit(0);
+    }
+    if (writer < 0 || reader < 0 || wait_success(writer) != 0 || wait_success(reader) != 0) {
+        return -1;
+    }
+    for (int i = 0; i < DIRECTORY_RACE_STABLE_FILES; ++i) {
+        snprintf(path, sizeof(path), "%s/stable-%02d", dir, i);
+        if (unlink(path) != 0) {
+            return -1;
+        }
+    }
+    if (unlink(changing) != 0 && errno != ENOENT) {
+        return -1;
+    }
+    return rmdir(dir);
 }
 
 static int write_exact(int fd, const void *buffer, size_t length)
@@ -539,8 +738,10 @@ int main(int argc, char **argv)
     RUN_CASE(partial_read_plan);
     RUN_CASE(readlink_plan);
     RUN_CASE(readlink_vs_unlink);
+    RUN_CASE(directory_snapshot);
+    RUN_CASE(readdir_vs_namespace_mutation);
     RUN_CASE(shutdown_drain_stress);
 #undef RUN_CASE
-    puts("FS4_INODE_STATE_PROBE_PASS cases=10");
+    puts("FS4_INODE_STATE_PROBE_PASS cases=12");
     return 0;
 }

@@ -3,8 +3,8 @@ use core::{marker::PhantomData, mem, time::Duration};
 use alloc::boxed::Box;
 
 use crate::{
-    DirLookupResult, DirReader, Ext4Error, Ext4MappedReadPlan, Ext4Result, Ext4SymlinkReadPlan,
-    FileAttr, InodeRef, InodeType,
+    DirLookupResult, DirReader, Ext4DirectoryReadPlan, Ext4Error, Ext4MappedReadPlan, Ext4Result,
+    Ext4SymlinkReadPlan, FileAttr, InodeRef, InodeType,
     blockdev::{BlockDevice, Ext4BlockDevice},
     error::Context,
     ffi::*,
@@ -217,6 +217,13 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
     }
     pub fn read_dir(&mut self, parent: u32, offset: u64) -> Ext4Result<DirReader<Hal>> {
         self.inode_ref(parent)?.read_dir(offset)
+    }
+    pub fn plan_directory_read(
+        &mut self,
+        parent: u32,
+        offset: u64,
+    ) -> Ext4Result<Option<Ext4DirectoryReadPlan>> {
+        self.inode_ref(parent)?.plan_directory_read(offset)
     }
 
     pub fn create(&mut self, parent: u32, name: &str, ty: InodeType, mode: u32) -> Ext4Result<u32> {

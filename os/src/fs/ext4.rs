@@ -5,8 +5,9 @@ use super::dirent::{
 #[cfg(feature = "perf-counters")]
 use super::vfs::BackendIoSnapshot;
 use super::vfs::{
-    BackendOp, BackendReadPlan, ConcurrentFileSystemBackend, FileSystemStat, FsError, FsNodeKind,
-    FsResult, InodeRelease, LegacyFileSystemBackend,
+    BackendDirectoryEntry, BackendDirectoryReadPlan, BackendDirectorySnapshot, BackendOp,
+    BackendReadPlan, ConcurrentFileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult,
+    InodeRelease, LegacyFileSystemBackend,
 };
 use super::{FS_STATX_ATTR_FLAGS, FileStat, FileTimestamp};
 use crate::config::MAX_CPUS;
@@ -23,11 +24,14 @@ use core::str;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 use lwext4_rust::ffi::{
-    EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, ENOTSUP, EXT4_ROOT_INO,
+    EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, ENOTSUP, EXT4_DE_BLKDEV,
+    EXT4_DE_CHRDEV, EXT4_DE_DIR, EXT4_DE_FIFO, EXT4_DE_REG_FILE, EXT4_DE_SOCK, EXT4_DE_SYMLINK,
+    EXT4_ROOT_INO,
 };
 use lwext4_rust::{
-    BlockDevice as Ext4BlockDevice, EXT4_DEV_BSIZE, Ext4Error, Ext4Filesystem, Ext4MappedReadPlan,
-    Ext4Result, Ext4SymlinkReadPlan, FsConfig, InodeType, SystemHal,
+    BlockDevice as Ext4BlockDevice, EXT4_DEV_BSIZE,
+    Ext4DirectoryReadPlan as LwExt4DirectoryReadPlan, Ext4Error, Ext4Filesystem,
+    Ext4MappedReadPlan, Ext4Result, Ext4SymlinkReadPlan, FsConfig, InodeType, SystemHal,
 };
 
 pub(super) struct KernelHal;
@@ -48,15 +52,21 @@ pub(super) struct KernelDisk {
     io_counters: Arc<Ext4IoCounters>,
 }
 
-/// Sequence counter used where readers copy data into private buffers.
+/// Multi-writer sequence used where readers copy data into private buffers.
 ///
 /// An uncontended read performs two atomic loads and never enters a scheduler
-/// or IRQ-masked lock. A reader that actually overlaps a write discards the
-/// private copy and yields until a stable even sequence is visible. There is
-/// one writable lwext4 core, so writers are already serialized.
+/// or IRQ-masked lock. Low bits count active writers; the last writer advances
+/// the epoch. A reader that overlaps any writer discards its private copy and
+/// yields until the active count returns to zero. Writers do not serialize on
+/// this counter, which keeps the sequence compatible with future independent
+/// mapped-overwrite plans.
 struct Ext4Sequence {
     value: AtomicUsize,
 }
+
+const EXT4_SEQUENCE_WRITER_BITS: usize = 16;
+const EXT4_SEQUENCE_WRITER_LIMIT: usize = 1 << EXT4_SEQUENCE_WRITER_BITS;
+const EXT4_SEQUENCE_WRITER_MASK: usize = EXT4_SEQUENCE_WRITER_LIMIT - 1;
 
 impl Ext4Sequence {
     fn new() -> Self {
@@ -67,14 +77,18 @@ impl Ext4Sequence {
 
     fn begin_write(&self) -> Ext4SequenceWriteGuard<'_> {
         let previous = self.value.fetch_add(1, Ordering::AcqRel);
-        assert_eq!(previous & 1, 0, "concurrent ext4 sequence writers");
+        assert_ne!(
+            previous & EXT4_SEQUENCE_WRITER_MASK,
+            EXT4_SEQUENCE_WRITER_MASK,
+            "ext4 sequence active-writer count exhausted"
+        );
         Ext4SequenceWriteGuard { sequence: self }
     }
 
     fn stable_value(&self) -> usize {
         loop {
             let value = self.value.load(Ordering::Acquire);
-            if value & 1 == 0 {
+            if value & EXT4_SEQUENCE_WRITER_MASK == 0 {
                 return value;
             }
             // The writer may be asleep in VirtIO I/O. Yielding here avoids
@@ -100,8 +114,19 @@ struct Ext4SequenceWriteGuard<'a> {
 
 impl Drop for Ext4SequenceWriteGuard<'_> {
     fn drop(&mut self) {
-        let previous = self.sequence.value.fetch_add(1, Ordering::Release);
-        assert_eq!(previous & 1, 1, "ext4 sequence writer lost ownership");
+        // Adding `2^N - 1` decrements the low-bit writer count and advances
+        // the high-bit epoch in one atomic RMW. This remains correct when
+        // writers overlap: readers keep waiting for a zero low-bit count, and
+        // every completed writer changes the stable epoch they validate.
+        let previous = self
+            .sequence
+            .value
+            .fetch_add(EXT4_SEQUENCE_WRITER_LIMIT - 1, Ordering::Release);
+        assert_ne!(
+            previous & EXT4_SEQUENCE_WRITER_MASK,
+            0,
+            "ext4 sequence writer lost ownership"
+        );
     }
 }
 
@@ -460,11 +485,18 @@ impl Ext4Mount {
         &self,
         plan: Ext4MappedReadPlan,
         record_regular: bool,
+        record_directory: bool,
     ) -> Option<Box<dyn BackendReadPlan>> {
-        if plan.block_size % EXT4_DEV_BSIZE != 0 {
+        let record_fallback = || {
             if record_regular {
                 perf::record_ext4_read_plan_fallback();
             }
+            if record_directory {
+                perf::record_ext4_directory_plan_fallback();
+            }
+        };
+        if plan.block_size % EXT4_DEV_BSIZE != 0 {
+            record_fallback();
             return None;
         }
         let device_blocks_per_fs_block = plan.block_size / EXT4_DEV_BSIZE;
@@ -475,24 +507,18 @@ impl Ext4Mount {
         let mut zero_blocks = 0usize;
         for run in plan.runs {
             let Some(buffer_start) = run.buffer_block.checked_mul(plan.block_size) else {
-                if record_regular {
-                    perf::record_ext4_read_plan_fallback();
-                }
+                record_fallback();
                 return None;
             };
             let Some(byte_len) = run.block_count.checked_mul(plan.block_size) else {
-                if record_regular {
-                    perf::record_ext4_read_plan_fallback();
-                }
+                record_fallback();
                 return None;
             };
             if buffer_start
                 .checked_add(byte_len)
                 .is_none_or(|end| end > plan.buffer_len)
             {
-                if record_regular {
-                    perf::record_ext4_read_plan_fallback();
-                }
+                record_fallback();
                 return None;
             }
             let device_block = if let Some(fs_block) = run.fs_block {
@@ -500,9 +526,7 @@ impl Ext4Mount {
                     .checked_mul(device_blocks_per_fs_block as u64)
                     .and_then(|block| usize::try_from(block).ok())
                 else {
-                    if record_regular {
-                        perf::record_ext4_read_plan_fallback();
-                    }
+                    record_fallback();
                     return None;
                 };
                 let device_blocks = run.block_count * device_blocks_per_fs_block;
@@ -510,9 +534,7 @@ impl Ext4Mount {
                     .checked_add(device_blocks)
                     .is_none_or(|end| end > self.device.num_blocks() as usize)
                 {
-                    if record_regular {
-                        perf::record_ext4_read_plan_fallback();
-                    }
+                    record_fallback();
                     return None;
                 }
                 data_runs += 1;
@@ -532,6 +554,9 @@ impl Ext4Mount {
         if record_regular {
             perf::record_ext4_read_plan_prepared(data_runs, data_blocks, zero_runs, zero_blocks);
         }
+        if record_directory {
+            perf::record_ext4_directory_plan_prepared(data_runs, data_blocks);
+        }
         Some(Box::new(Ext4DeviceReadPlan {
             device: self.device.clone(),
             write_sequence: self.write_sequence.clone(),
@@ -540,6 +565,7 @@ impl Ext4Mount {
             read_len: plan.read_len,
             runs,
             record_regular,
+            record_directory,
         }))
     }
 
@@ -820,10 +846,105 @@ struct Ext4DeviceReadPlan {
     read_len: usize,
     runs: Vec<Ext4DeviceReadRun>,
     record_regular: bool,
+    record_directory: bool,
 }
 
 struct Ext4InlineReadPlan {
     data: Vec<u8>,
+}
+
+struct Ext4DirectoryReadPlan {
+    raw_plan: Box<dyn BackendReadPlan>,
+    raw_len: usize,
+    start_offset: u64,
+    block_size: usize,
+    has_file_type: bool,
+}
+
+impl Ext4DirectoryReadPlan {
+    fn execute_snapshot(self: Box<Self>) -> FsResult<BackendDirectorySnapshot> {
+        let Self {
+            raw_plan,
+            raw_len,
+            start_offset,
+            block_size,
+            has_file_type,
+        } = *self;
+        let mut raw = vec![0u8; raw_len];
+        if raw_plan.execute(&mut raw) != raw_len {
+            return Err(FsError::Io);
+        }
+        let mut entries = Vec::new();
+        let mut cursor = 0usize;
+        let mut absolute = start_offset;
+        while cursor < raw.len() {
+            let offset_in_block = absolute as usize % block_size;
+            if offset_in_block % 4 != 0
+                || offset_in_block > block_size.saturating_sub(8)
+                || raw.len() - cursor < 8
+            {
+                return Err(FsError::Io);
+            }
+            let ino = u32::from_le_bytes(raw[cursor..cursor + 4].try_into().unwrap());
+            let record_len =
+                u16::from_le_bytes(raw[cursor + 4..cursor + 6].try_into().unwrap()) as usize;
+            let name_len = if has_file_type {
+                raw[cursor + 6] as usize
+            } else {
+                raw[cursor + 6] as usize | ((raw[cursor + 7] as usize) << 8)
+            };
+            if record_len < 8
+                || record_len % 4 != 0
+                || offset_in_block
+                    .checked_add(record_len)
+                    .is_none_or(|end| end > block_size)
+                || cursor
+                    .checked_add(record_len)
+                    .is_none_or(|end| end > raw.len())
+                || name_len > record_len - 8
+            {
+                return Err(FsError::Io);
+            }
+            if ino != 0 {
+                let d_type = if has_file_type {
+                    match raw[cursor + 7] as u32 {
+                        EXT4_DE_DIR => DT_DIR,
+                        EXT4_DE_REG_FILE => DT_REG,
+                        EXT4_DE_SYMLINK => DT_LNK,
+                        EXT4_DE_CHRDEV => DT_CHR,
+                        EXT4_DE_BLKDEV => DT_BLK,
+                        EXT4_DE_FIFO => DT_FIFO,
+                        EXT4_DE_SOCK => DT_SOCK,
+                        _ => DT_UNKNOWN,
+                    }
+                } else {
+                    DT_UNKNOWN
+                };
+                let name_start = cursor + 8;
+                perf::record_ext4_dirent_name(name_len, false);
+                entries.push(BackendDirectoryEntry {
+                    offset: absolute,
+                    ino,
+                    d_type,
+                    name_start,
+                    name_len,
+                });
+            }
+            cursor += record_len;
+            absolute = absolute.checked_add(record_len as u64).ok_or(FsError::Io)?;
+        }
+        Ok(BackendDirectorySnapshot {
+            entries,
+            end_offset: absolute,
+            storage: raw,
+        })
+    }
+}
+
+impl BackendDirectoryReadPlan for Ext4DirectoryReadPlan {
+    fn execute(self: Box<Self>) -> FsResult<BackendDirectorySnapshot> {
+        self.execute_snapshot()
+    }
 }
 
 impl BackendReadPlan for Ext4InlineReadPlan {
@@ -859,6 +980,13 @@ impl BackendReadPlan for Ext4DeviceReadPlan {
                             io.device_blocks * EXT4_DEV_BSIZE,
                         );
                     }
+                    if self.record_directory {
+                        perf::record_ext4_directory_plan_direct_io(
+                            io.device_calls,
+                            io.device_blocks,
+                            io.device_blocks * EXT4_DEV_BSIZE,
+                        );
+                    }
                 });
             } else {
                 run_buf.fill(0);
@@ -870,6 +998,9 @@ impl BackendReadPlan for Ext4DeviceReadPlan {
         }
         if self.record_regular {
             perf::record_ext4_read_plan_executed(self.read_len);
+        }
+        if self.record_directory {
+            perf::record_ext4_directory_plan_executed(self.read_len);
         }
         self.read_len
     }
@@ -1153,7 +1284,7 @@ impl LegacyFileSystemBackend for Ext4Mount {
     fn prepare_readlink_plan(&mut self, ino: u32, len: usize) -> Option<Box<dyn BackendReadPlan>> {
         match self.fs.plan_symlink_read(ino, len).ok()?? {
             Ext4SymlinkReadPlan::Inline(data) => Some(Box::new(Ext4InlineReadPlan { data })),
-            Ext4SymlinkReadPlan::Mapped(plan) => self.mapped_read_plan(plan, false),
+            Ext4SymlinkReadPlan::Mapped(plan) => self.mapped_read_plan(plan, false, false),
         }
     }
 
@@ -1168,7 +1299,7 @@ impl LegacyFileSystemBackend for Ext4Mount {
             perf::record_ext4_read_plan_fallback();
             return None;
         };
-        self.mapped_read_plan(plan, true)
+        self.mapped_read_plan(plan, true, false)
     }
 
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
@@ -1180,6 +1311,35 @@ impl LegacyFileSystemBackend for Ext4Mount {
         self.fs
             .write_at(ino, buf, offset)
             .expect("ext4 write failed")
+    }
+
+    fn prepare_directory_read_plan(
+        &mut self,
+        ino: u32,
+        offset: u64,
+    ) -> Option<Box<dyn BackendDirectoryReadPlan>> {
+        perf::record_ext4_directory_plan_attempt();
+        let LwExt4DirectoryReadPlan {
+            mapped,
+            start_offset,
+            has_file_type,
+        } = match self.fs.plan_directory_read(ino, offset) {
+            Ok(Some(plan)) => plan,
+            _ => {
+                perf::record_ext4_directory_plan_fallback();
+                return None;
+            }
+        };
+        let raw_len = mapped.read_len;
+        let block_size = mapped.block_size;
+        let raw_plan = self.mapped_read_plan(mapped, false, true)?;
+        Some(Box::new(Ext4DirectoryReadPlan {
+            raw_plan,
+            raw_len,
+            start_offset,
+            block_size,
+            has_file_type,
+        }))
     }
 
     fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
@@ -1531,6 +1691,16 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         if visible.is_ok() { written } else { 0 }
     }
 
+    fn prepare_directory_read_plan(
+        &self,
+        ino: u32,
+        offset: u64,
+    ) -> Option<Box<dyn BackendDirectoryReadPlan>> {
+        self.with_reader(BackendOp::ReadPlan, ino, |reader, _| {
+            reader.prepare_directory_read_plan(ino, offset)
+        })
+    }
+
     fn read_dirent64(&self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
         self.with_reader(BackendOp::Readdir, ino, |reader, _| {
             reader.read_dirent64(ino, offset, buf)
@@ -1538,6 +1708,14 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
     }
 
     fn list_root_names(&self) -> Vec<String> {
+        if let Some(plan) = self.with_reader(BackendOp::ReadPlan, EXT4_ROOT_INO, |reader, _| {
+            reader.prepare_directory_read_plan(EXT4_ROOT_INO, 0)
+        }) {
+            return plan
+                .execute()
+                .expect("failed to execute ext4 root directory snapshot")
+                .names();
+        }
         self.with_reader(BackendOp::Readdir, EXT4_ROOT_INO, |reader, _| {
             reader.list_root_names()
         })

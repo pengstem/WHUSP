@@ -355,6 +355,17 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) ext4_read_plan_direct_io_calls: usize,
     pub(crate) ext4_read_plan_direct_io_blocks: usize,
     pub(crate) ext4_read_plan_direct_io_bytes: usize,
+    pub(crate) ext4_directory_plan_attempts: usize,
+    pub(crate) ext4_directory_plan_prepared: usize,
+    pub(crate) ext4_directory_plan_executed: usize,
+    pub(crate) ext4_directory_plan_fallbacks: usize,
+    pub(crate) ext4_directory_plan_stale_retries: usize,
+    pub(crate) ext4_directory_plan_data_runs: usize,
+    pub(crate) ext4_directory_plan_data_blocks: usize,
+    pub(crate) ext4_directory_plan_executed_bytes: usize,
+    pub(crate) ext4_directory_plan_direct_io_calls: usize,
+    pub(crate) ext4_directory_plan_direct_io_blocks: usize,
+    pub(crate) ext4_directory_plan_direct_io_bytes: usize,
     pub(crate) eventfd_read_calls: usize,
     pub(crate) eventfd_write_calls: usize,
     pub(crate) eventfd_read_block_yields: usize,
@@ -687,6 +698,17 @@ mod enabled {
     static EXT4_READ_PLAN_DIRECT_IO_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EXT4_READ_PLAN_DIRECT_IO_BLOCKS: AtomicUsize = AtomicUsize::new(0);
     static EXT4_READ_PLAN_DIRECT_IO_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_DIRECTORY_PLAN_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_DIRECTORY_PLAN_PREPARED: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_DIRECTORY_PLAN_EXECUTED: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_DIRECTORY_PLAN_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_DIRECTORY_PLAN_STALE_RETRIES: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_DIRECTORY_PLAN_DATA_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_DIRECTORY_PLAN_DATA_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_DIRECTORY_PLAN_EXECUTED_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_DIRECTORY_PLAN_DIRECT_IO_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_DIRECTORY_PLAN_DIRECT_IO_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_DIRECTORY_PLAN_DIRECT_IO_BYTES: AtomicUsize = AtomicUsize::new(0);
     static EVENTFD_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EVENTFD_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EVENTFD_READ_BLOCK_YIELDS: AtomicUsize = AtomicUsize::new(0);
@@ -1876,6 +1898,31 @@ mod enabled {
         EXT4_READ_PLAN_DIRECT_IO_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_ext4_directory_plan_attempt() {
+        EXT4_DIRECTORY_PLAN_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_directory_plan_prepared(data_runs: usize, data_blocks: usize) {
+        EXT4_DIRECTORY_PLAN_PREPARED.fetch_add(1, Ordering::Relaxed);
+        EXT4_DIRECTORY_PLAN_DATA_RUNS.fetch_add(data_runs, Ordering::Relaxed);
+        EXT4_DIRECTORY_PLAN_DATA_BLOCKS.fetch_add(data_blocks, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_directory_plan_fallback() {
+        EXT4_DIRECTORY_PLAN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_directory_plan_executed(bytes: usize) {
+        EXT4_DIRECTORY_PLAN_EXECUTED.fetch_add(1, Ordering::Relaxed);
+        EXT4_DIRECTORY_PLAN_EXECUTED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_directory_plan_direct_io(calls: usize, blocks: usize, bytes: usize) {
+        EXT4_DIRECTORY_PLAN_DIRECT_IO_CALLS.fetch_add(calls, Ordering::Relaxed);
+        EXT4_DIRECTORY_PLAN_DIRECT_IO_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
+        EXT4_DIRECTORY_PLAN_DIRECT_IO_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_eventfd_read_call() {
         EVENTFD_READ_CALLS.fetch_add(1, Ordering::Relaxed);
     }
@@ -2465,6 +2512,23 @@ mod enabled {
             ext4_read_plan_direct_io_blocks: EXT4_READ_PLAN_DIRECT_IO_BLOCKS
                 .load(Ordering::Relaxed),
             ext4_read_plan_direct_io_bytes: EXT4_READ_PLAN_DIRECT_IO_BYTES.load(Ordering::Relaxed),
+            ext4_directory_plan_attempts: EXT4_DIRECTORY_PLAN_ATTEMPTS.load(Ordering::Relaxed),
+            ext4_directory_plan_prepared: EXT4_DIRECTORY_PLAN_PREPARED.load(Ordering::Relaxed),
+            ext4_directory_plan_executed: EXT4_DIRECTORY_PLAN_EXECUTED.load(Ordering::Relaxed),
+            ext4_directory_plan_fallbacks: EXT4_DIRECTORY_PLAN_FALLBACKS.load(Ordering::Relaxed),
+            ext4_directory_plan_stale_retries: EXT4_DIRECTORY_PLAN_STALE_RETRIES
+                .load(Ordering::Relaxed),
+            ext4_directory_plan_data_runs: EXT4_DIRECTORY_PLAN_DATA_RUNS.load(Ordering::Relaxed),
+            ext4_directory_plan_data_blocks: EXT4_DIRECTORY_PLAN_DATA_BLOCKS
+                .load(Ordering::Relaxed),
+            ext4_directory_plan_executed_bytes: EXT4_DIRECTORY_PLAN_EXECUTED_BYTES
+                .load(Ordering::Relaxed),
+            ext4_directory_plan_direct_io_calls: EXT4_DIRECTORY_PLAN_DIRECT_IO_CALLS
+                .load(Ordering::Relaxed),
+            ext4_directory_plan_direct_io_blocks: EXT4_DIRECTORY_PLAN_DIRECT_IO_BLOCKS
+                .load(Ordering::Relaxed),
+            ext4_directory_plan_direct_io_bytes: EXT4_DIRECTORY_PLAN_DIRECT_IO_BYTES
+                .load(Ordering::Relaxed),
             eventfd_read_calls: EVENTFD_READ_CALLS.load(Ordering::Relaxed),
             eventfd_write_calls: EVENTFD_WRITE_CALLS.load(Ordering::Relaxed),
             eventfd_read_block_yields: EVENTFD_READ_BLOCK_YIELDS.load(Ordering::Relaxed),
@@ -2806,6 +2870,17 @@ mod enabled {
          ext4_read_plan_direct_io_calls {}\n\
          ext4_read_plan_direct_io_blocks {}\n\
          ext4_read_plan_direct_io_bytes {}\n\
+         ext4_directory_plan_attempts {}\n\
+         ext4_directory_plan_prepared {}\n\
+         ext4_directory_plan_executed {}\n\
+         ext4_directory_plan_fallbacks {}\n\
+         ext4_directory_plan_stale_retries {}\n\
+         ext4_directory_plan_data_runs {}\n\
+         ext4_directory_plan_data_blocks {}\n\
+         ext4_directory_plan_executed_bytes {}\n\
+         ext4_directory_plan_direct_io_calls {}\n\
+         ext4_directory_plan_direct_io_blocks {}\n\
+         ext4_directory_plan_direct_io_bytes {}\n\
          eventfd_read_calls {}\n\
          eventfd_write_calls {}\n\
          eventfd_read_block_yields {}\n\
@@ -3123,6 +3198,17 @@ mod enabled {
             stats.ext4_read_plan_direct_io_calls,
             stats.ext4_read_plan_direct_io_blocks,
             stats.ext4_read_plan_direct_io_bytes,
+            stats.ext4_directory_plan_attempts,
+            stats.ext4_directory_plan_prepared,
+            stats.ext4_directory_plan_executed,
+            stats.ext4_directory_plan_fallbacks,
+            stats.ext4_directory_plan_stale_retries,
+            stats.ext4_directory_plan_data_runs,
+            stats.ext4_directory_plan_data_blocks,
+            stats.ext4_directory_plan_executed_bytes,
+            stats.ext4_directory_plan_direct_io_calls,
+            stats.ext4_directory_plan_direct_io_blocks,
+            stats.ext4_directory_plan_direct_io_bytes,
             stats.eventfd_read_calls,
             stats.eventfd_write_calls,
             stats.eventfd_read_block_yields,
@@ -3636,6 +3722,26 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_ext4_read_plan_direct_io(_calls: usize, _blocks: usize, _bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_directory_plan_attempt() {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_directory_plan_prepared(_data_runs: usize, _data_blocks: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_directory_plan_fallback() {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_directory_plan_executed(_bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_directory_plan_direct_io(
+        _calls: usize,
+        _blocks: usize,
+        _bytes: usize,
+    ) {
+    }
 
     #[inline(always)]
     pub(crate) fn record_eventfd_read_call() {}

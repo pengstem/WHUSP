@@ -1,12 +1,17 @@
 use super::super::{FileStat, FileTimestamp};
+use super::super::{
+    align_up,
+    dirent::{LINUX_DIRENT64_ALIGN, LINUX_DIRENT64_HEADER_SIZE},
+};
 use super::FsError;
 use super::FsResult;
 use super::VfsNodeId;
 use crate::perf;
 use crate::sync::SleepMutex;
 use alloc::boxed::Box;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::str;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -98,6 +103,84 @@ pub(crate) trait BackendReadPlan: Send {
     // The caller must validate the VFS content generation before publishing the
     // result because executing a plan intentionally does not hold the backend lock.
     fn execute(self: Box<Self>, buf: &mut [u8]) -> usize;
+}
+
+pub(crate) struct BackendDirectoryEntry {
+    pub(crate) offset: u64,
+    pub(crate) ino: u32,
+    pub(crate) d_type: u8,
+    pub(crate) name_start: usize,
+    pub(crate) name_len: usize,
+}
+
+pub(crate) struct BackendDirectorySnapshot {
+    pub(crate) entries: Vec<BackendDirectoryEntry>,
+    pub(crate) end_offset: u64,
+    pub(crate) storage: Vec<u8>,
+}
+
+impl BackendDirectorySnapshot {
+    fn entry_name(&self, entry: &BackendDirectoryEntry) -> FsResult<&[u8]> {
+        let name_end = entry
+            .name_start
+            .checked_add(entry.name_len)
+            .ok_or(FsError::Io)?;
+        self.storage
+            .get(entry.name_start..name_end)
+            .ok_or(FsError::Io)
+    }
+
+    pub(crate) fn read_dirent64(&self, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
+        if offset == self.end_offset {
+            return Ok((0, offset));
+        }
+        let Some(start) = self.entries.iter().position(|entry| entry.offset == offset) else {
+            return Err(FsError::InvalidInput);
+        };
+        let mut written = 0usize;
+        let mut next_offset = offset;
+        for (index, entry) in self.entries.iter().enumerate().skip(start) {
+            let name = self.entry_name(entry)?;
+            let d_reclen = align_up(
+                LINUX_DIRENT64_HEADER_SIZE + name.len() + 1,
+                LINUX_DIRENT64_ALIGN,
+            );
+            if d_reclen > buf.len().saturating_sub(written) {
+                if written == 0 {
+                    return Err(FsError::InvalidInput);
+                }
+                break;
+            }
+            next_offset = self
+                .entries
+                .get(index + 1)
+                .map_or(self.end_offset, |next| next.offset);
+            let entry_buf = &mut buf[written..written + d_reclen];
+            entry_buf.fill(0);
+            entry_buf[0..8].copy_from_slice(&(entry.ino as u64).to_ne_bytes());
+            entry_buf[8..16].copy_from_slice(&(next_offset as i64).to_ne_bytes());
+            entry_buf[16..18].copy_from_slice(&(d_reclen as u16).to_ne_bytes());
+            entry_buf[18] = entry.d_type;
+            entry_buf[LINUX_DIRENT64_HEADER_SIZE..LINUX_DIRENT64_HEADER_SIZE + name.len()]
+                .copy_from_slice(name);
+            written += d_reclen;
+        }
+        Ok((written, next_offset))
+    }
+
+    pub(crate) fn names(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                let name = str::from_utf8(self.entry_name(entry).ok()?).unwrap_or("<invalid>");
+                (name != "." && name != "..").then(|| name.to_string())
+            })
+            .collect()
+    }
+}
+
+pub(crate) trait BackendDirectoryReadPlan: Send {
+    fn execute(self: Box<Self>) -> FsResult<BackendDirectorySnapshot>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -280,6 +363,13 @@ pub(crate) trait LegacyFileSystemBackend: Send {
     }
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize;
     fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize;
+    fn prepare_directory_read_plan(
+        &mut self,
+        _ino: u32,
+        _offset: u64,
+    ) -> Option<Box<dyn BackendDirectoryReadPlan>> {
+        None
+    }
     fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)>;
     fn list_root_names(&mut self) -> Vec<String>;
 }
@@ -363,6 +453,11 @@ pub(crate) trait ConcurrentFileSystemBackend: Send + Sync {
     ) -> Option<Box<dyn BackendReadPlan>>;
     fn read_at(&self, ino: u32, buf: &mut [u8], offset: u64) -> usize;
     fn write_at(&self, ino: u32, buf: &[u8], offset: u64) -> usize;
+    fn prepare_directory_read_plan(
+        &self,
+        ino: u32,
+        offset: u64,
+    ) -> Option<Box<dyn BackendDirectoryReadPlan>>;
     fn read_dirent64(&self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)>;
     fn list_root_names(&self) -> Vec<String>;
 }
@@ -693,6 +788,16 @@ impl ConcurrentFileSystemBackend for SerializedBackend {
     fn write_at(&self, ino: u32, buf: &[u8], offset: u64) -> usize {
         self.call(BackendOp::Write, |backend| {
             backend.write_at(ino, buf, offset)
+        })
+    }
+
+    fn prepare_directory_read_plan(
+        &self,
+        ino: u32,
+        offset: u64,
+    ) -> Option<Box<dyn BackendDirectoryReadPlan>> {
+        self.call(BackendOp::ReadPlan, |backend| {
+            backend.prepare_directory_read_plan(ino, offset)
         })
     }
 

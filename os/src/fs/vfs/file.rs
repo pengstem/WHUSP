@@ -18,7 +18,9 @@ use super::super::{
     S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, SeekWhence,
 };
 use super::path::{self as vfs_path, LookupMode, VfsOpenTarget};
-use super::{BackendOp, FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath};
+use super::{
+    BackendDirectorySnapshot, BackendOp, FsError, FsNodeKind, FsResult, VfsNodeId, VfsPath,
+};
 use crate::config::PAGE_SIZE;
 use crate::mm::{
     UserBuffer, frame_alloc, frame_alloc_contiguous_uninit, frame_alloc_uninit,
@@ -1291,6 +1293,7 @@ pub(crate) struct VfsFile {
     visible_path: Option<String>,
     offset: SleepMutex<usize>,
     read_snapshot: SleepMutex<Option<Vec<u8>>>,
+    directory_snapshot: SleepMutex<Option<CachedDirectorySnapshot>>,
     read_snapshot_supported: bool,
     supports_page_cache: bool,
     supports_dirty_writeback: bool,
@@ -1298,6 +1301,11 @@ pub(crate) struct VfsFile {
     writable: bool,
     status_flags: StatusFlagsCell,
     suppress_fanotify: bool,
+}
+
+struct CachedDirectorySnapshot {
+    version: usize,
+    snapshot: BackendDirectorySnapshot,
 }
 
 impl VfsFile {
@@ -1332,6 +1340,7 @@ impl VfsFile {
             visible_path,
             offset: SleepMutex::new(0),
             read_snapshot: SleepMutex::new(None),
+            directory_snapshot: SleepMutex::new(None),
             read_snapshot_supported,
             supports_page_cache,
             supports_dirty_writeback,
@@ -3091,12 +3100,38 @@ impl File for VfsFile {
                 &mut kernel_buf,
             )?
         } else {
-            let (read_size, next_offset) = inode_state::with_directory_read(self.node, || {
-                with_mount(self.node.mount_id, BackendOp::Readdir, |mount| {
-                    mount.read_dirent64(self.node.ino, current_offset, &mut kernel_buf)
-                })
-                .ok_or(FsError::Io)?
-            })?;
+            let (read_size, next_offset) =
+                inode_state::with_directory_read(self.node, |directory_version| {
+                    {
+                        let cached = self.directory_snapshot.lock();
+                        if let Some(cached) = cached
+                            .as_ref()
+                            .filter(|cached| cached.version == directory_version)
+                        {
+                            return cached
+                                .snapshot
+                                .read_dirent64(current_offset, &mut kernel_buf);
+                        }
+                    }
+                    let plan = with_mount(self.node.mount_id, BackendOp::ReadPlan, |mount| {
+                        mount.prepare_directory_read_plan(self.node.ino, 0)
+                    })
+                    .flatten();
+                    if let Some(plan) = plan {
+                        let snapshot = plan.execute()?;
+                        let result = snapshot.read_dirent64(current_offset, &mut kernel_buf);
+                        *self.directory_snapshot.lock() = Some(CachedDirectorySnapshot {
+                            version: directory_version,
+                            snapshot,
+                        });
+                        result
+                    } else {
+                        with_mount(self.node.mount_id, BackendOp::Readdir, |mount| {
+                            mount.read_dirent64(self.node.ino, current_offset, &mut kernel_buf)
+                        })
+                        .ok_or(FsError::Io)?
+                    }
+                })?;
             if read_size == 0 {
                 // Synthetic mountpoint dirents are appended after backend EOF
                 // and resume from a disjoint high offset range, so real

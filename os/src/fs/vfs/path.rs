@@ -250,7 +250,7 @@ fn lookup_cached_child(
 ) -> FsResult<DentryLookupResult> {
     let cacheable = component != ".." && mount_supports_dentry_cache(parent_node.mount_id);
     let lookup_backend = || -> FsResult<DentryLookupResult> {
-        inode_state::with_directory_read(parent_node, || {
+        inode_state::with_directory_read(parent_node, |_| {
             let token = cacheable
                 .then(|| dentry_cache::version_token(parent_node))
                 .flatten();

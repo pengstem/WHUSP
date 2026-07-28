@@ -188,7 +188,7 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         })))
     }
 
-    fn get_inode_fblock(&mut self, block: u32) -> Ext4Result<u64> {
+    pub(super) fn get_inode_fblock(&mut self, block: u32) -> Ext4Result<u64> {
         unsafe {
             let mut fblock = 0u64;
             ext4_fs_get_inode_dblk_idx(self.inner.as_mut(), block, &mut fblock, true)

@@ -28,6 +28,8 @@ CASES = (
     "partial_read_plan",
     "readlink_plan",
     "readlink_vs_unlink",
+    "directory_snapshot",
+    "readdir_vs_namespace_mutation",
     "shutdown_drain_stress",
 )
 
