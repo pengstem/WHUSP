@@ -26,10 +26,10 @@ pub(crate) use fanotify::{
 pub use fanotify::{sys_fanotify_init, sys_fanotify_mark};
 pub(crate) use fd::{
     close_detached_fd_entry, close_detached_fd_entry_for_process_teardown, get_file_by_fd,
-    install_file_fd,
+    get_file_by_fd_for_process, install_file_fd,
 };
 pub use fd::{
-    sys_close, sys_close_range, sys_dup, sys_dup3, sys_fcntl_ctx, sys_flock, sys_memfd_create,
+    sys_close_ctx, sys_close_range, sys_dup, sys_dup3, sys_fcntl_ctx, sys_flock, sys_memfd_create,
     sys_pipe2_ctx,
 };
 pub(crate) use fd_compat::io_uring_mmap_region;
@@ -46,7 +46,7 @@ pub(crate) use inotify::{
 pub use inotify::{sys_inotify_add_watch, sys_inotify_init1, sys_inotify_rm_watch};
 pub use io::{
     sys_copy_file_range, sys_fadvise64, sys_fallocate, sys_fdatasync, sys_fsync, sys_ftruncate,
-    sys_lseek, sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2,
+    sys_lseek_ctx, sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2,
     sys_read_ctx, sys_readahead, sys_readv_ctx, sys_sendfile, sys_splice, sys_sync,
     sys_sync_file_range, sys_syncfs, sys_tee, sys_vmsplice_ctx, sys_write_ctx, sys_writev_ctx,
 };

@@ -21,7 +21,7 @@ use super::super::user_ptr::{
     translated_byte_buffer_checked_with_mmap_fault_ctx, write_user_value,
 };
 use super::fanotify::{fanotify_notify_access, fanotify_notify_modify};
-use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
+use super::fd::{get_fd_entry_by_fd, get_file_by_fd, get_file_by_fd_for_process};
 use super::inotify::{inotify_notify_access, inotify_notify_modify};
 use super::uapi::{IOV_MAX, LinuxIovec};
 
@@ -769,7 +769,7 @@ fn fault_in_read_buffers(buffers: &[&'static mut [u8]]) {
     }
 }
 
-pub fn sys_lseek(fd: usize, offset: i64, whence: usize) -> SysResult {
+pub fn sys_lseek_ctx(ctx: &SyscallContext, fd: usize, offset: i64, whence: usize) -> SysResult {
     let whence = match whence {
         0 => SeekWhence::Set,
         1 => SeekWhence::Current,
@@ -781,7 +781,7 @@ pub fn sys_lseek(fd: usize, offset: i64, whence: usize) -> SysResult {
     if matches!(whence, SeekWhence::Data | SeekWhence::Hole) && offset < 0 {
         return Err(SysError::EINVAL);
     }
-    let file = get_file_by_fd(fd)?;
+    let file = get_file_by_fd_for_process(ctx.process(), fd)?;
     let new_offset = file.seek(offset, whence)?;
     if new_offset > isize::MAX as usize {
         return Err(SysError::EINVAL);

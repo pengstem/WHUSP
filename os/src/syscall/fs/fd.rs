@@ -101,8 +101,8 @@ pub(crate) fn install_file_fd(
     Ok(fd as isize)
 }
 
-pub fn sys_close(fd: usize) -> SysResult {
-    let process = current_process();
+pub fn sys_close_ctx(ctx: &SyscallContext, fd: usize) -> SysResult {
+    let process = ctx.process();
     let entry = {
         let mut inner = process.inner_exclusive_access();
         inner.take_fd_entry(fd).ok_or(SysError::EBADF)?

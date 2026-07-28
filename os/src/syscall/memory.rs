@@ -1,15 +1,16 @@
 use crate::config::PAGE_SIZE;
 use crate::mm::shm::{ShmCaller, ShmCreateContext, ShmError, ShmSegmentStat, ShmSetAttrs};
 use crate::mm::{MapPermission, MemoryProtectError, MmapFlush, MmapPrefaultResult};
+use crate::syscall::SyscallContext;
 use crate::syscall::user_ptr::{copy_to_user, read_user_value, write_user_value};
 use crate::task::{
-    CAP_IPC_LOCK, CAP_IPC_OWNER, CAP_SYS_ADMIN, PROCESS_PKEY_COUNT, RLimitResource,
-    current_process, current_user_token, suspend_current_and_run_next,
+    CAP_IPC_LOCK, CAP_IPC_OWNER, CAP_SYS_ADMIN, PROCESS_PKEY_COUNT, ProcessControlBlock,
+    RLimitResource, current_process, current_user_token, suspend_current_and_run_next,
 };
 use alloc::vec::Vec;
 
 use super::errno::{SysError, SysResult};
-use super::fs::{get_file_by_fd, io_uring_mmap_region};
+use super::fs::{get_file_by_fd_for_process, io_uring_mmap_region};
 
 const PROT_READ: usize = 0x1;
 const PROT_WRITE: usize = 0x2;
@@ -145,8 +146,8 @@ struct LinuxShmInfo {
     swap_successes: usize,
 }
 
-pub fn sys_brk(addr: usize) -> SysResult {
-    let process = current_process();
+pub fn sys_brk_ctx(ctx: &SyscallContext, addr: usize) -> SysResult {
+    let process = ctx.process();
     let mut inner = process.inner_exclusive_access();
     Ok(inner.memory_set.set_program_break(addr) as isize)
 }
@@ -287,7 +288,8 @@ pub fn sys_shmdt(shmaddr: usize) -> SysResult {
     Ok(0)
 }
 
-pub fn sys_mmap(
+pub fn sys_mmap_ctx(
+    ctx: &SyscallContext,
     addr: usize,
     len: usize,
     prot: usize,
@@ -295,10 +297,11 @@ pub fn sys_mmap(
     fd: usize,
     offset: usize,
 ) -> SysResult {
-    sys_mmap_impl(addr, len, prot, flags, fd, offset).map(|addr| addr as isize)
+    sys_mmap_impl(ctx, addr, len, prot, flags, fd, offset).map(|addr| addr as isize)
 }
 
 fn sys_mmap_impl(
+    ctx: &SyscallContext,
     addr: usize,
     len: usize,
     prot: usize,
@@ -363,7 +366,7 @@ fn sys_mmap_impl(
         if fd < 0 {
             return Err(SysError::EBADF);
         }
-        let file = get_file_by_fd(fd as usize)?;
+        let file = get_file_by_fd_for_process(ctx.process(), fd as usize)?;
         if len == 0 || offset % PAGE_SIZE != 0 {
             return Err(SysError::EINVAL);
         }
@@ -380,7 +383,7 @@ fn sys_mmap_impl(
             if !shared || fixed || len == 0 || len > max_size {
                 return Err(SysError::EINVAL);
             }
-            let process = current_process();
+            let process = ctx.process();
             let mut inner = process.inner_exclusive_access();
             let mapped_addr = inner
                 .memory_set
@@ -414,7 +417,7 @@ fn sys_mmap_impl(
         None
     };
 
-    let process = current_process();
+    let process = ctx.process();
     let mut inner = process.inner_exclusive_access();
 
     if fixed {
@@ -503,8 +506,8 @@ fn sys_mmap_impl(
     Ok(mapped_addr)
 }
 
-pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> SysResult {
-    sys_mprotect_impl(addr, len, prot, None)
+pub fn sys_mprotect_ctx(ctx: &SyscallContext, addr: usize, len: usize, prot: usize) -> SysResult {
+    sys_mprotect_impl(ctx.process(), addr, len, prot, None)
 }
 
 pub fn sys_pkey_mprotect(addr: usize, len: usize, prot: usize, pkey: isize) -> SysResult {
@@ -514,7 +517,8 @@ pub fn sys_pkey_mprotect(addr: usize, len: usize, prot: usize, pkey: isize) -> S
         value if value > 0 && (value as usize) < PROCESS_PKEY_COUNT => Some(value as usize),
         _ => return Err(SysError::EINVAL),
     };
-    sys_mprotect_impl(addr, len, prot, pkey)
+    let process = current_process();
+    sys_mprotect_impl(&process, addr, len, prot, pkey)
 }
 
 pub fn sys_pkey_alloc(flags: usize, access_rights: usize) -> SysResult {
@@ -552,7 +556,13 @@ pub fn sys_pkey_free(pkey: isize) -> SysResult {
     Ok(0)
 }
 
-fn sys_mprotect_impl(addr: usize, len: usize, prot: usize, pkey: Option<usize>) -> SysResult {
+fn sys_mprotect_impl(
+    process: &ProcessControlBlock,
+    addr: usize,
+    len: usize,
+    prot: usize,
+    pkey: Option<usize>,
+) -> SysResult {
     if addr % PAGE_SIZE != 0 {
         return Err(SysError::EINVAL);
     }
@@ -568,7 +578,6 @@ fn sys_mprotect_impl(addr: usize, len: usize, prot: usize, pkey: Option<usize>) 
     let len = len.checked_add(PAGE_SIZE - 1).ok_or(SysError::ENOMEM)? & !(PAGE_SIZE - 1);
     addr.checked_add(len).ok_or(SysError::ENOMEM)?;
 
-    let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let access_rights = match pkey {
         Some(0) | None => 0,
@@ -590,11 +599,11 @@ fn sys_mprotect_impl(addr: usize, len: usize, prot: usize, pkey: Option<usize>) 
     Ok(0)
 }
 
-pub fn sys_munmap(addr: usize, len: usize) -> SysResult {
+pub fn sys_munmap_ctx(ctx: &SyscallContext, addr: usize, len: usize) -> SysResult {
     if len == 0 || addr % PAGE_SIZE != 0 {
         return Err(SysError::EINVAL);
     }
-    let process = current_process();
+    let process = ctx.process();
     let flushes = {
         let mut inner = process.inner_exclusive_access();
         inner
