@@ -778,6 +778,8 @@ impl ProcessMemoryFastState {
             let sequence = self.sequence.load(Ordering::Acquire);
             if sequence & 1 != 0 {
                 crate::cpu::handle_remote_sync_ipi();
+                #[cfg(target_arch = "loongarch64")]
+                crate::arch::smp::handle_tlb_ipi();
                 spin_loop();
                 continue;
             }
