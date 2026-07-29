@@ -80,6 +80,19 @@ struct ext4_blockdev_iface {
 	 * @param   bdev block device.*/
 	int (*unlock)(struct ext4_blockdev *bdev);
 
+	/**@brief   Lock this filesystem core's block-cache index. The lock
+	 *          protects only cache bookkeeping and must never cover I/O.*/
+	int (*bcache_index_lock)(struct ext4_blockdev *bdev);
+
+	/**@brief   Unlock this filesystem core's block-cache index.*/
+	int (*bcache_index_unlock)(struct ext4_blockdev *bdev);
+
+	/**@brief   Lock the ownership shard for one logical block address.*/
+	int (*bcache_lba_lock)(struct ext4_blockdev *bdev, uint64_t lba);
+
+	/**@brief   Unlock the ownership shard for one logical block address.*/
+	int (*bcache_lba_unlock)(struct ext4_blockdev *bdev, uint64_t lba);
+
 	/**@brief   Block size (bytes): physical*/
 	uint32_t ph_bsize;
 
@@ -142,6 +155,10 @@ struct ext4_blockdev {
 		.close = __close,                                              \
 		.lock = __lock,                                                \
 		.unlock = __unlock,                                            \
+		.bcache_index_lock = NULL,                                     \
+		.bcache_index_unlock = NULL,                                   \
+		.bcache_lba_lock = NULL,                                       \
+		.bcache_lba_unlock = NULL,                                     \
 		.ph_bsize = __bsize,                                           \
 		.ph_bcnt = __bcnt,                                             \
 		.ph_bbuf = __name##_ph_bbuf,                                   \
@@ -173,6 +190,10 @@ int ext4_block_fini(struct ext4_blockdev *bdev);
  * @param   buf buffer
  * @return  standard error code*/
 int ext4_block_flush_buf(struct ext4_blockdev *bdev, struct ext4_buf *buf);
+
+/**@brief Flush a buffer while the caller owns its LBA shard.*/
+int ext4_block_flush_buf_locked(struct ext4_blockdev *bdev,
+				struct ext4_buf *buf);
 
 /**@brief   Flush data in buffer of given lba to disk,
  *          if that buffer exists in block cache.

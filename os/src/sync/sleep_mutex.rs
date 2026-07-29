@@ -1,8 +1,4 @@
-use super::UPIntrFreeCell;
-use crate::task::{
-    TaskContext, TaskControlBlock, block_current_task_no_schedule, schedule, wakeup_task,
-};
-use alloc::{collections::VecDeque, sync::Arc};
+use super::RawSleepLock;
 use core::{
     cell::UnsafeCell,
     ops::{Deref, DerefMut},
@@ -10,12 +6,7 @@ use core::{
 
 pub struct SleepMutex<T> {
     data: UnsafeCell<T>,
-    inner: UPIntrFreeCell<SleepMutexInner>,
-}
-
-struct SleepMutexInner {
-    locked: bool,
-    wait_queue: VecDeque<Arc<TaskControlBlock>>,
+    lock: RawSleepLock,
 }
 
 pub struct SleepMutexGuard<'a, T> {
@@ -29,54 +20,29 @@ impl<T> SleepMutex<T> {
     pub fn new(data: T) -> Self {
         Self {
             data: UnsafeCell::new(data),
-            inner: unsafe {
-                UPIntrFreeCell::new(SleepMutexInner {
-                    locked: false,
-                    wait_queue: VecDeque::new(),
-                })
-            },
+            lock: RawSleepLock::new(),
         }
     }
 
     pub fn lock(&self) -> SleepMutexGuard<'_, T> {
-        let mut inner = self.inner.exclusive_access();
-        if inner.locked {
-            let (task, task_cx_ptr): (Arc<TaskControlBlock>, *mut TaskContext) =
-                block_current_task_no_schedule();
-            inner.wait_queue.push_back(task);
-            drop(inner);
-            schedule(task_cx_ptr);
-        } else {
-            inner.locked = true;
-        }
+        self.lock.lock();
         SleepMutexGuard { mutex: self }
     }
 
     pub fn try_lock(&self) -> Option<SleepMutexGuard<'_, T>> {
-        let mut inner = self.inner.try_exclusive_access()?;
-        if inner.locked {
-            None
-        } else {
-            inner.locked = true;
+        if self.lock.try_lock() {
             Some(SleepMutexGuard { mutex: self })
+        } else {
+            None
         }
     }
 }
 
 impl<T> Drop for SleepMutexGuard<'_, T> {
     fn drop(&mut self) {
-        let waking_task = self.mutex.inner.exclusive_session(|inner| {
-            assert!(inner.locked);
-            if let Some(task) = inner.wait_queue.pop_front() {
-                Some(task)
-            } else {
-                inner.locked = false;
-                None
-            }
-        });
-        if let Some(task) = waking_task {
-            wakeup_task(task);
-        }
+        // SAFETY: construction of this guard follows exactly one successful
+        // lock acquisition and Rust ownership drops the guard exactly once.
+        unsafe { self.mutex.lock.unlock() };
     }
 }
 

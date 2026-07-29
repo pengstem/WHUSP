@@ -130,7 +130,6 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         unsafe {
             let bcache = self.bdev.inner.as_mut().bc;
             let mut held: Vec<ext4_block> = Vec::with_capacity(blocks.len());
-            let dirty_mask = 1i32 << bcache_state_bits_BC_DIRTY;
             let mut eligible = true;
             for &lba in blocks {
                 let mut block: ext4_block = mem::zeroed();
@@ -138,7 +137,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
                 if buf.is_null() {
                     continue;
                 }
-                eligible &= (*buf).refctr == 1 && (*buf).flags & dirty_mask == 0;
+                eligible &= ext4_bcache_block_is_clean_exclusive(bcache, &mut block);
                 held.push(block);
                 if !eligible {
                     break;

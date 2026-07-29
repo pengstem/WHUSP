@@ -65,10 +65,23 @@ struct ext4_block {
 
 struct ext4_bcache;
 
+/**@brief I/O ownership state for one metadata buffer.*/
+enum ext4_bcache_buffer_state {
+	BC_STATE_EMPTY,
+	BC_STATE_LOADING,
+	BC_STATE_UPTODATE,
+	BC_STATE_DIRTY,
+	BC_STATE_WRITEBACK,
+	BC_STATE_ERROR
+};
+
 /**@brief   Single block descriptor*/
 struct ext4_buf {
 	/**@brief   Flags*/
 	int flags;
+
+	/**@brief   Single-flight load/writeback state.*/
+	uint8_t state;
 
 	/**@brief   Logical block address*/
 	uint64_t lba;
@@ -138,6 +151,9 @@ struct ext4_bcache {
 	/**@brief   The cache should not be shaked */
 	bool dont_shake;
 
+	/**@brief   This cache may be entered by concurrent callers. */
+	bool concurrent;
+
 	/**@brief   A tree holding all bufs*/
 	RB_HEAD(ext4_buf_lba, ext4_buf) lba_root;
 
@@ -164,30 +180,86 @@ enum bcache_state_bits {
 	BC_TMP
 };
 
-#define ext4_bcache_set_flag(buf, b)    \
-	(buf)->flags |= 1 << (b)
+static inline void ext4_bcache_flag_set(struct ext4_buf *buf, int bit)
+{
+	if (buf->bc->concurrent)
+		__atomic_fetch_or(&buf->flags, 1 << bit, __ATOMIC_RELEASE);
+	else
+		buf->flags |= 1 << bit;
+}
 
-#define ext4_bcache_clear_flag(buf, b)    \
-	(buf)->flags &= ~(1 << (b))
+static inline void ext4_bcache_flag_clear(struct ext4_buf *buf, int bit)
+{
+	if (buf->bc->concurrent)
+		__atomic_fetch_and(&buf->flags, ~(1 << bit), __ATOMIC_RELEASE);
+	else
+		buf->flags &= ~(1 << bit);
+}
 
-#define ext4_bcache_test_flag(buf, b)    \
-	(((buf)->flags & (1 << (b))) >> (b))
+static inline int ext4_bcache_flag_test(struct ext4_buf *buf, int bit)
+{
+	int flags = buf->bc->concurrent ?
+		__atomic_load_n(&buf->flags, __ATOMIC_ACQUIRE) : buf->flags;
+	return (flags & (1 << bit)) >> bit;
+}
+
+static inline void ext4_bcache_state_set(struct ext4_buf *buf, uint8_t state)
+{
+	if (buf->bc->concurrent)
+		__atomic_store_n(&buf->state, state, __ATOMIC_RELEASE);
+	else
+		buf->state = state;
+}
+
+static inline uint8_t ext4_bcache_state_get(struct ext4_buf *buf)
+{
+	return buf->bc->concurrent ?
+		__atomic_load_n(&buf->state, __ATOMIC_ACQUIRE) : buf->state;
+}
+
+#define ext4_bcache_set_flag(buf, b) ext4_bcache_flag_set((buf), (b))
+#define ext4_bcache_clear_flag(buf, b) ext4_bcache_flag_clear((buf), (b))
+#define ext4_bcache_test_flag(buf, b) ext4_bcache_flag_test((buf), (b))
+#define ext4_bcache_set_state(buf, value) ext4_bcache_state_set((buf), (value))
+#define ext4_bcache_get_state(buf) ext4_bcache_state_get((buf))
 
 static inline void ext4_bcache_set_dirty(struct ext4_buf *buf) {
 	ext4_bcache_set_flag(buf, BC_UPTODATE);
 	ext4_bcache_set_flag(buf, BC_DIRTY);
+	ext4_bcache_set_state(buf, BC_STATE_DIRTY);
 }
 
 static inline void ext4_bcache_clear_dirty(struct ext4_buf *buf) {
 	ext4_bcache_clear_flag(buf, BC_UPTODATE);
 	ext4_bcache_clear_flag(buf, BC_DIRTY);
+	ext4_bcache_set_state(buf, BC_STATE_EMPTY);
 }
 
 /**@brief   Increment reference counter of buf by 1.*/
-#define ext4_bcache_inc_ref(buf) ((buf)->refctr++)
+static inline uint32_t ext4_bcache_ref_inc(struct ext4_buf *buf)
+{
+	if (buf->bc->concurrent)
+		return __atomic_add_fetch(&buf->refctr, 1, __ATOMIC_ACQ_REL);
+	return ++buf->refctr;
+}
 
 /**@brief   Decrement reference counter of buf by 1.*/
-#define ext4_bcache_dec_ref(buf) ((buf)->refctr--)
+static inline uint32_t ext4_bcache_ref_dec(struct ext4_buf *buf)
+{
+	if (buf->bc->concurrent)
+		return __atomic_sub_fetch(&buf->refctr, 1, __ATOMIC_ACQ_REL);
+	return --buf->refctr;
+}
+
+static inline uint32_t ext4_bcache_ref_get(struct ext4_buf *buf)
+{
+	return buf->bc->concurrent ?
+		__atomic_load_n(&buf->refctr, __ATOMIC_ACQUIRE) : buf->refctr;
+}
+
+#define ext4_bcache_inc_ref(buf) ext4_bcache_ref_inc((buf))
+#define ext4_bcache_dec_ref(buf) ext4_bcache_ref_dec((buf))
+#define ext4_bcache_ref_count(buf) ext4_bcache_ref_get((buf))
 
 /**@brief   Insert buffer to dirty cache list
  * @param   bc block cache descriptor
@@ -284,6 +356,56 @@ int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b);
  * @param   bc block cache descriptor
  * @return  full status*/
 bool ext4_bcache_is_full(struct ext4_bcache *bc);
+
+/**@brief Acquire/release the short cache-index lock.*/
+void ext4_bcache_index_lock_impl(struct ext4_bcache *bc);
+void ext4_bcache_index_unlock_impl(struct ext4_bcache *bc);
+
+/**@brief Acquire/release the ownership shard for one LBA.*/
+void ext4_bcache_lba_lock_impl(struct ext4_bcache *bc, uint64_t lba);
+void ext4_bcache_lba_unlock_impl(struct ext4_bcache *bc, uint64_t lba);
+
+#define ext4_bcache_index_lock(bc)                                     \
+	do {                                                               \
+		if ((bc)->concurrent)                                        \
+			ext4_bcache_index_lock_impl((bc));                     \
+	} while (0)
+#define ext4_bcache_index_unlock(bc)                                   \
+	do {                                                               \
+		if ((bc)->concurrent)                                        \
+			ext4_bcache_index_unlock_impl((bc));                   \
+	} while (0)
+#define ext4_bcache_lba_lock(bc, lba)                                  \
+	do {                                                               \
+		if ((bc)->concurrent)                                        \
+			ext4_bcache_lba_lock_impl((bc), (lba));                \
+	} while (0)
+#define ext4_bcache_lba_unlock(bc, lba)                                \
+	do {                                                               \
+		if ((bc)->concurrent)                                        \
+			ext4_bcache_lba_unlock_impl((bc), (lba));              \
+	} while (0)
+
+/**@brief Cache helpers used while the caller owns the matching LBA shard.*/
+struct ext4_buf *
+ext4_bcache_find_get_locked(struct ext4_bcache *bc, struct ext4_block *b,
+			    uint64_t lba);
+int ext4_bcache_alloc_locked(struct ext4_bcache *bc, struct ext4_block *b,
+			     bool *is_new);
+
+/**@brief Reserve one unreferenced LRU buffer for eviction.*/
+struct ext4_buf *ext4_bcache_reserve_lru(struct ext4_bcache *bc);
+bool ext4_bcache_reserved_only(struct ext4_bcache *bc, struct ext4_buf *buf);
+void ext4_bcache_release_reservation(struct ext4_bcache *bc,
+				     struct ext4_buf *buf);
+void ext4_bcache_drop_reserved(struct ext4_bcache *bc, struct ext4_buf *buf);
+
+/**@brief Return one dirty LBA without retaining a raw buffer pointer.*/
+bool ext4_bcache_peek_dirty_lba(struct ext4_bcache *bc, uint64_t *lba);
+
+/**@brief Test whether a retained block is the sole clean reference.*/
+bool ext4_bcache_block_is_clean_exclusive(struct ext4_bcache *bc,
+					  struct ext4_block *b);
 
 #ifdef __cplusplus
 }

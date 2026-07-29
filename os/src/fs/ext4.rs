@@ -13,7 +13,7 @@ use super::{FS_STATX_ATTR_FLAGS, FileStat, FileTimestamp};
 use crate::config::MAX_CPUS;
 use crate::drivers::block::VirtIOBlock;
 use crate::perf;
-use crate::sync::{SleepMutex, SleepMutexGuard, SleepRwLock, SpinNoIrqLock};
+use crate::sync::{RawSleepLock, SleepMutex, SleepMutexGuard, SleepRwLock, SpinNoIrqLock};
 use crate::task::suspend_current_and_run_next;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -45,12 +45,42 @@ impl SystemHal for KernelHal {
     }
 }
 
+const EXT4_BCACHE_LBA_LOCK_SHARDS: usize = 256;
+
+/// Lock domain owned by exactly one lwext4 metadata cache.
+///
+/// The index lock covers only RB-tree/list/refcount bookkeeping. LBA shards
+/// serialize cache fill, eviction, and writeback state for colliding logical
+/// blocks without forcing unrelated device I/O through one global lock.
+struct Ext4BcacheLocks {
+    index: RawSleepLock,
+    lba_shards: Vec<RawSleepLock>,
+}
+
+impl Ext4BcacheLocks {
+    fn new() -> Self {
+        Self {
+            index: RawSleepLock::new(),
+            lba_shards: (0..EXT4_BCACHE_LBA_LOCK_SHARDS)
+                .map(|_| RawSleepLock::new())
+                .collect(),
+        }
+    }
+
+    #[inline]
+    fn lba(&self, lba: u64) -> &RawSleepLock {
+        let mixed = lba ^ (lba >> 17) ^ (lba >> 37);
+        &self.lba_shards[mixed as usize % self.lba_shards.len()]
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct KernelDisk {
     dev: Arc<VirtIOBlock>,
     write_sequence: Arc<Ext4Sequence>,
     physical_leases: Arc<Ext4PhysicalLeaseTable>,
     block_versions: Arc<Ext4BlockVersions>,
+    bcache_locks: Arc<Ext4BcacheLocks>,
     #[cfg(feature = "perf-counters")]
     io_counters: Arc<Ext4IoCounters>,
 }
@@ -267,7 +297,7 @@ impl Ext4IoCounters {
 }
 
 impl Ext4BlockDevice for KernelDisk {
-    fn write_blocks(&mut self, block_id: u64, buf: &[u8]) -> Ext4Result<usize> {
+    fn write_blocks(&self, block_id: u64, buf: &[u8]) -> Ext4Result<usize> {
         if buf.len() % EXT4_DEV_BSIZE != 0 {
             return Err(Ext4Error::new(EIO as _, "unaligned block write"));
         }
@@ -284,7 +314,7 @@ impl Ext4BlockDevice for KernelDisk {
         Ok(buf.len())
     }
 
-    fn read_blocks(&mut self, block_id: u64, buf: &mut [u8]) -> Ext4Result<usize> {
+    fn read_blocks(&self, block_id: u64, buf: &mut [u8]) -> Ext4Result<usize> {
         if buf.len() % EXT4_DEV_BSIZE != 0 {
             return Err(Ext4Error::new(EIO as _, "unaligned block read"));
         }
@@ -300,6 +330,22 @@ impl Ext4BlockDevice for KernelDisk {
 
     fn num_blocks(&self) -> Ext4Result<u64> {
         Ok(self.dev.num_blocks())
+    }
+
+    fn lock_bcache_index(&self) {
+        self.bcache_locks.index.lock();
+    }
+
+    unsafe fn unlock_bcache_index(&self) {
+        unsafe { self.bcache_locks.index.unlock() };
+    }
+
+    fn lock_bcache_lba(&self, lba: u64) {
+        self.bcache_locks.lba(lba).lock();
+    }
+
+    unsafe fn unlock_bcache_lba(&self, lba: u64) {
+        unsafe { self.bcache_locks.lba(lba).unlock() };
     }
 }
 
@@ -345,12 +391,13 @@ struct Ext4TransactionDisk {
     write_sequence: Arc<Ext4Sequence>,
     block_versions: Arc<Ext4BlockVersions>,
     state: Arc<SpinNoIrqLock<Ext4TransactionState>>,
+    bcache_locks: Arc<Ext4BcacheLocks>,
     #[cfg(feature = "perf-counters")]
     io_counters: Arc<Ext4IoCounters>,
 }
 
 impl Ext4BlockDevice for Ext4TransactionDisk {
-    fn write_blocks(&mut self, block_id: u64, buf: &[u8]) -> Ext4Result<usize> {
+    fn write_blocks(&self, block_id: u64, buf: &[u8]) -> Ext4Result<usize> {
         if buf.len() % EXT4_DEV_BSIZE != 0 {
             return Err(Ext4Error::new(EIO as _, "unaligned transaction write"));
         }
@@ -366,7 +413,7 @@ impl Ext4BlockDevice for Ext4TransactionDisk {
         Ok(buf.len())
     }
 
-    fn read_blocks(&mut self, block_id: u64, buf: &mut [u8]) -> Ext4Result<usize> {
+    fn read_blocks(&self, block_id: u64, buf: &mut [u8]) -> Ext4Result<usize> {
         if buf.len() % EXT4_DEV_BSIZE != 0 {
             return Err(Ext4Error::new(EIO as _, "unaligned transaction read"));
         }
@@ -409,6 +456,22 @@ impl Ext4BlockDevice for Ext4TransactionDisk {
 
     fn num_blocks(&self) -> Ext4Result<u64> {
         Ok(self.dev.num_blocks())
+    }
+
+    fn lock_bcache_index(&self) {
+        self.bcache_locks.index.lock();
+    }
+
+    unsafe fn unlock_bcache_index(&self) {
+        unsafe { self.bcache_locks.index.unlock() };
+    }
+
+    fn lock_bcache_lba(&self, lba: u64) {
+        self.bcache_locks.lba(lba).lock();
+    }
+
+    unsafe fn unlock_bcache_lba(&self, lba: u64) {
+        unsafe { self.bcache_locks.lba(lba).unlock() };
     }
 }
 
@@ -521,6 +584,7 @@ impl Ext4MutationWorker {
                 write_sequence,
                 block_versions,
                 state: state.clone(),
+                bcache_locks: Arc::new(Ext4BcacheLocks::new()),
                 #[cfg(feature = "perf-counters")]
                 io_counters: io_counters.clone(),
             },
@@ -778,6 +842,7 @@ impl Ext4Mount {
                     write_sequence: write_sequence.clone(),
                     physical_leases: physical_leases.clone(),
                     block_versions: block_versions.clone(),
+                    bcache_locks: Arc::new(Ext4BcacheLocks::new()),
                     #[cfg(feature = "perf-counters")]
                     io_counters: io_counters.clone(),
                 },
@@ -804,6 +869,7 @@ impl Ext4Mount {
                     write_sequence: self.write_sequence.clone(),
                     physical_leases: self.physical_leases.clone(),
                     block_versions: self.block_versions.clone(),
+                    bcache_locks: Arc::new(Ext4BcacheLocks::new()),
                     #[cfg(feature = "perf-counters")]
                     io_counters: io_counters.clone(),
                 },
