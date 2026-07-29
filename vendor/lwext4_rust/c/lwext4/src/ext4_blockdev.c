@@ -363,6 +363,14 @@ int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b,
 	if (!(lba < bdev->lg_bcnt))
 		return ENXIO;
 
+	/* A stable clean hit needs only a short index/refcount pin. Per-LBA
+	 * ownership remains mandatory for cold fill and all state transitions. */
+	b->lb_id = lba;
+	b->buf = NULL;
+	b->data = NULL;
+	if (ext4_bcache_find_get_uptodate(bdev->bc, b, lba))
+		return EOK;
+
 	r = ext4_block_cache_shake(bdev);
 	if (r != EOK)
 		return r;
@@ -498,6 +506,10 @@ int ext4_block_readbytes(struct ext4_blockdev *bdev, uint64_t off, void *buf,
 	uint8_t *p = (void *)buf;
 
 	ext4_assert(bdev && buf);
+	uint8_t concurrent_buf[bdev->bdif->ph_bsize];
+	uint8_t *ph_bbuf =
+		(bdev->bc && bdev->bc->concurrent) ? concurrent_buf
+						   : bdev->bdif->ph_bbuf;
 
 	if (!bdev->bdif->ph_refctr)
 		return EIO;
@@ -515,11 +527,11 @@ int ext4_block_readbytes(struct ext4_blockdev *bdev, uint64_t off, void *buf,
 				    ? len
 				    : (bdev->bdif->ph_bsize - unalg);
 
-		r = ext4_bdif_bread(bdev, bdev->bdif->ph_bbuf, block_idx, 1);
+		r = ext4_bdif_bread(bdev, ph_bbuf, block_idx, 1);
 		if (r != EOK)
 			return r;
 
-		memcpy(p, bdev->bdif->ph_bbuf + unalg, rlen);
+		memcpy(p, ph_bbuf + unalg, rlen);
 
 		p += rlen;
 		len -= rlen;
@@ -542,11 +554,11 @@ int ext4_block_readbytes(struct ext4_blockdev *bdev, uint64_t off, void *buf,
 
 	/*Rest of the data*/
 	if (len) {
-		r = ext4_bdif_bread(bdev, bdev->bdif->ph_bbuf, block_idx, 1);
+		r = ext4_bdif_bread(bdev, ph_bbuf, block_idx, 1);
 		if (r != EOK)
 			return r;
 
-		memcpy(p, bdev->bdif->ph_bbuf, len);
+		memcpy(p, ph_bbuf, len);
 	}
 
 	return r;

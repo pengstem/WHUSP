@@ -104,6 +104,13 @@ struct ext4_buf {
 	/**@brief   Whether or not buffer is on dirty list.*/
 	bool on_dirty_list;
 
+	/**@brief   Generation of the immutable payload in this buffer.*/
+	uint64_t generation;
+
+	/**@brief   Buffer was detached from the LBA index while an older reader
+	 *          still owned a reference. It is freed by the last owner.*/
+	bool detached;
+
 	/**@brief   LBA tree node*/
 	RB_ENTRY(ext4_buf) lba_node;
 
@@ -335,6 +342,17 @@ void ext4_bcache_invalidate_lba(struct ext4_bcache *bc,
 struct ext4_buf *
 ext4_bcache_find_get(struct ext4_bcache *bc, struct ext4_block *b,
 		     uint64_t lba);
+
+/**@brief   Pin an immutable current-generation cache hit without taking the
+ *          LBA ownership lock. Loading, dirty, stale and temporary buffers are
+ *          reported as misses and must use the normal LBA-locked path.
+ * @param   bc block cache descriptor
+ * @param   b block to retain
+ * @param   lba logical block address
+ * @return  clean up-to-date block cache buffer, or NULL */
+struct ext4_buf *
+ext4_bcache_find_get_uptodate(struct ext4_bcache *bc, struct ext4_block *b,
+			      uint64_t lba);
 
 /**@brief   Allocate block from block cache memory.
  *          Unreferenced block allocation is based on LRU

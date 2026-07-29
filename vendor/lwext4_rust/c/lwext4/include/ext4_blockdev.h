@@ -93,6 +93,10 @@ struct ext4_blockdev_iface {
 	/**@brief   Unlock the ownership shard for one logical block address.*/
 	int (*bcache_lba_unlock)(struct ext4_blockdev *bdev, uint64_t lba);
 
+	/**@brief   Current read-cache generation. Concurrent read-only cores use
+	 *          this to retire stale buffers without a global cache flush.*/
+	uint64_t (*bcache_generation)(struct ext4_blockdev *bdev);
+
 	/**@brief   Block size (bytes): physical*/
 	uint32_t ph_bsize;
 

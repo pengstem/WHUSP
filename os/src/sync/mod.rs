@@ -23,7 +23,7 @@ pub use sleep_rwlock::{
     SleepRwLock, SleepRwLockInterrupted, SleepRwLockReadGuard, SleepRwLockWriteGuard,
 };
 pub use spin::{
-    SpinLock, SpinNoIrqLock, SpinNoIrqLockGuard, SpinRwLock, SpinRwLockReadGuard,
+    RawSpinNoIrqLock, SpinLock, SpinNoIrqLock, SpinNoIrqLockGuard, SpinRwLock, SpinRwLockReadGuard,
     SpinRwLockWriteGuard,
 };
 pub use up::{UPIntrFreeCell, UPIntrRefMut};

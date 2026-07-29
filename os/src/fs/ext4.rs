@@ -13,7 +13,9 @@ use super::{FS_STATX_ATTR_FLAGS, FileStat, FileTimestamp};
 use crate::config::MAX_CPUS;
 use crate::drivers::block::VirtIOBlock;
 use crate::perf;
-use crate::sync::{RawSleepLock, SleepMutex, SleepMutexGuard, SleepRwLock, SpinNoIrqLock};
+use crate::sync::{
+    RawSleepLock, RawSpinNoIrqLock, SleepMutex, SleepMutexGuard, SleepRwLock, SpinNoIrqLock,
+};
 use crate::task::suspend_current_and_run_next;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -53,14 +55,14 @@ const EXT4_BCACHE_LBA_LOCK_SHARDS: usize = 256;
 /// serialize cache fill, eviction, and writeback state for colliding logical
 /// blocks without forcing unrelated device I/O through one global lock.
 struct Ext4BcacheLocks {
-    index: RawSleepLock,
+    index: RawSpinNoIrqLock,
     lba_shards: Vec<RawSleepLock>,
 }
 
 impl Ext4BcacheLocks {
     fn new() -> Self {
         Self {
-            index: RawSleepLock::new(),
+            index: RawSpinNoIrqLock::new(),
             lba_shards: (0..EXT4_BCACHE_LBA_LOCK_SHARDS)
                 .map(|_| RawSleepLock::new())
                 .collect(),
@@ -72,11 +74,62 @@ impl Ext4BcacheLocks {
         let mixed = lba ^ (lba >> 17) ^ (lba >> 37);
         &self.lba_shards[mixed as usize % self.lba_shards.len()]
     }
+
+    #[inline]
+    fn lock_lba(&self, lba: u64) {
+        let lock = self.lba(lba);
+        #[cfg(feature = "perf-counters")]
+        {
+            let contended = !lock.try_lock();
+            if contended {
+                lock.lock();
+            }
+            perf::record_ext4_bcache_lba_lock(contended);
+        }
+        #[cfg(not(feature = "perf-counters"))]
+        lock.lock();
+    }
+
+    /// Releases one matching [`Self::lock_lba`] acquisition.
+    ///
+    /// # Safety
+    ///
+    /// The current task must own the shard selected by `lba` exactly once.
+    #[inline]
+    unsafe fn unlock_lba(&self, lba: u64) {
+        unsafe { self.lba(lba).unlock() };
+    }
+
+    #[inline]
+    fn lock_index(&self) {
+        #[cfg(feature = "perf-counters")]
+        {
+            let contended = !self.index.try_lock();
+            if contended {
+                self.index.lock();
+            }
+            perf::record_ext4_bcache_index_lock(contended);
+        }
+        #[cfg(not(feature = "perf-counters"))]
+        self.index.lock();
+    }
+
+    /// Releases one matching [`Self::lock_index`] acquisition.
+    ///
+    /// # Safety
+    ///
+    /// The current task must own the index lock exactly once.
+    #[inline]
+    unsafe fn unlock_index(&self) {
+        unsafe { self.index.unlock() };
+    }
 }
 
 #[derive(Clone)]
 pub(super) struct KernelDisk {
     dev: Arc<VirtIOBlock>,
+    concurrent_bcache: bool,
+    cache_epoch: Arc<Ext4CacheEpoch>,
     write_sequence: Arc<Ext4Sequence>,
     physical_leases: Arc<Ext4PhysicalLeaseTable>,
     block_versions: Arc<Ext4BlockVersions>,
@@ -100,6 +153,33 @@ struct Ext4Sequence {
 const EXT4_SEQUENCE_WRITER_BITS: usize = 16;
 const EXT4_SEQUENCE_WRITER_LIMIT: usize = 1 << EXT4_SEQUENCE_WRITER_BITS;
 const EXT4_SEQUENCE_WRITER_MASK: usize = EXT4_SEQUENCE_WRITER_LIMIT - 1;
+
+/// Generation observed by the one shared read-only metadata cache.
+///
+/// Writers advance it only after publishing device bytes. A stale buffer is
+/// refilled in place when unowned, or detached and retired after its last old
+/// reader when still referenced. This gives new readers a separate payload
+/// without a mount-wide cache-flush writer phase.
+struct Ext4CacheEpoch {
+    value: AtomicUsize,
+}
+
+impl Ext4CacheEpoch {
+    fn new() -> Self {
+        Self {
+            value: AtomicUsize::new(1),
+        }
+    }
+
+    fn current(&self) -> u64 {
+        self.value.load(Ordering::Acquire) as u64
+    }
+
+    fn advance(&self) {
+        let previous = self.value.fetch_add(1, Ordering::AcqRel);
+        assert_ne!(previous, usize::MAX, "ext4 cache epoch wrapped");
+    }
+}
 
 impl Ext4Sequence {
     fn new() -> Self {
@@ -297,6 +377,14 @@ impl Ext4IoCounters {
 }
 
 impl Ext4BlockDevice for KernelDisk {
+    fn concurrent_bcache(&self) -> bool {
+        self.concurrent_bcache
+    }
+
+    fn bcache_generation(&self) -> u64 {
+        self.cache_epoch.current()
+    }
+
     fn write_blocks(&self, block_id: u64, buf: &[u8]) -> Ext4Result<usize> {
         if buf.len() % EXT4_DEV_BSIZE != 0 {
             return Err(Ext4Error::new(EIO as _, "unaligned block write"));
@@ -308,6 +396,7 @@ impl Ext4BlockDevice for KernelDisk {
         let _write = self.write_sequence.begin_write();
         self.dev.write_blocks(block_id as usize, buf);
         self.block_versions.bump_range(block_id, blocks);
+        self.cache_epoch.advance();
         #[cfg(feature = "perf-counters")]
         self.io_counters.record_write(blocks, buf.len());
         perf::record_ext4_block_write(blocks, buf.len());
@@ -333,19 +422,19 @@ impl Ext4BlockDevice for KernelDisk {
     }
 
     fn lock_bcache_index(&self) {
-        self.bcache_locks.index.lock();
+        self.bcache_locks.lock_index();
     }
 
     unsafe fn unlock_bcache_index(&self) {
-        unsafe { self.bcache_locks.index.unlock() };
+        unsafe { self.bcache_locks.unlock_index() };
     }
 
     fn lock_bcache_lba(&self, lba: u64) {
-        self.bcache_locks.lba(lba).lock();
+        self.bcache_locks.lock_lba(lba);
     }
 
     unsafe fn unlock_bcache_lba(&self, lba: u64) {
-        unsafe { self.bcache_locks.lba(lba).unlock() };
+        unsafe { self.bcache_locks.unlock_lba(lba) };
     }
 }
 
@@ -459,19 +548,19 @@ impl Ext4BlockDevice for Ext4TransactionDisk {
     }
 
     fn lock_bcache_index(&self) {
-        self.bcache_locks.index.lock();
+        self.bcache_locks.lock_index();
     }
 
     unsafe fn unlock_bcache_index(&self) {
-        unsafe { self.bcache_locks.index.unlock() };
+        unsafe { self.bcache_locks.unlock_index() };
     }
 
     fn lock_bcache_lba(&self, lba: u64) {
-        self.bcache_locks.lba(lba).lock();
+        self.bcache_locks.lock_lba(lba);
     }
 
     unsafe fn unlock_bcache_lba(&self, lba: u64) {
-        unsafe { self.bcache_locks.lba(lba).unlock() };
+        unsafe { self.bcache_locks.unlock_lba(lba) };
     }
 }
 
@@ -533,6 +622,7 @@ fn map_ext4_error(err: Ext4Error) -> FsError {
 pub(super) struct Ext4Mount {
     fs: KernelExt4Fs,
     device: Arc<VirtIOBlock>,
+    cache_epoch: Arc<Ext4CacheEpoch>,
     write_sequence: Arc<Ext4Sequence>,
     physical_leases: Arc<Ext4PhysicalLeaseTable>,
     block_versions: Arc<Ext4BlockVersions>,
@@ -821,13 +911,15 @@ fn prepare_runtime_release_locked(
 }
 
 // SAFETY: the FFI core and its raw pointers move only as one `Ext4Mount`.
-// Every dereference happens behind the owning read or writer core mutex; the
-// core itself is intentionally not `Sync` and must never have two callers.
+// Writable instances are entered behind their owning core mutex. The one
+// shared read-only instance is exposed only by `SharedExt4ReadCore`, whose
+// narrower Sync proof audits its callable operations.
 unsafe impl Send for Ext4Mount {}
 
 impl Ext4Mount {
     fn open(
         device: Arc<VirtIOBlock>,
+        cache_epoch: Arc<Ext4CacheEpoch>,
         write_sequence: Arc<Ext4Sequence>,
         physical_leases: Arc<Ext4PhysicalLeaseTable>,
         block_versions: Arc<Ext4BlockVersions>,
@@ -839,6 +931,8 @@ impl Ext4Mount {
             fs: KernelExt4Fs::new(
                 KernelDisk {
                     dev: device.clone(),
+                    concurrent_bcache: false,
+                    cache_epoch: cache_epoch.clone(),
                     write_sequence: write_sequence.clone(),
                     physical_leases: physical_leases.clone(),
                     block_versions: block_versions.clone(),
@@ -849,6 +943,7 @@ impl Ext4Mount {
                 EXT4_CONFIG,
             )?,
             device,
+            cache_epoch,
             write_sequence,
             physical_leases,
             block_versions,
@@ -859,13 +954,15 @@ impl Ext4Mount {
         })
     }
 
-    pub(super) fn open_read_replica(&self) -> Result<Self, Ext4Error> {
+    pub(super) fn open_shared_reader(&self) -> Result<Self, Ext4Error> {
         #[cfg(feature = "perf-counters")]
         let io_counters = Arc::new(Ext4IoCounters::default());
         Ok(Self {
             fs: KernelExt4Fs::new_read_only(
                 KernelDisk {
                     dev: self.device.clone(),
+                    concurrent_bcache: true,
+                    cache_epoch: self.cache_epoch.clone(),
                     write_sequence: self.write_sequence.clone(),
                     physical_leases: self.physical_leases.clone(),
                     block_versions: self.block_versions.clone(),
@@ -876,6 +973,7 @@ impl Ext4Mount {
                 EXT4_CONFIG,
             )?,
             device: self.device.clone(),
+            cache_epoch: self.cache_epoch.clone(),
             write_sequence: self.write_sequence.clone(),
             physical_leases: self.physical_leases.clone(),
             block_versions: self.block_versions.clone(),
@@ -1032,6 +1130,7 @@ impl Ext4Mount {
         }
         Some(Ext4PreparedWritePlan {
             device: self.device.clone(),
+            cache_epoch: self.cache_epoch.clone(),
             write_sequence: self.write_sequence.clone(),
             physical_leases: self.physical_leases.clone(),
             block_versions: self.block_versions.clone(),
@@ -1134,19 +1233,45 @@ impl Drop for Ext4WriteLbaLease {
     }
 }
 
-/// One legacy writable lwext4 core, private metadata workers, and read-only replicas.
+/// One read-only lwext4 core whose audited metadata operations may run in
+/// parallel.
 ///
-/// Each C core owns its raw pointers and bcache and is entered by one task at a
-/// time. Read operations touch only one replica lock. Mutations flush the
-/// writer and advance `cache_generation`; each replica lazily invalidates its
-/// own clean cache before its next operation and retries if a generation
-/// changes while it was reading.
+/// `Ext4Mount` intentionally remains non-`Sync`: writable instances still
+/// require unique entry.  This wrapper is used only for a core opened with
+/// `read_only = true` and concurrent bcache ownership callbacks.  Its shared
+/// methods never mutate the fs/superblock, inode or directory payload; cache
+/// bookkeeping and generation retirement are synchronized inside lwext4.
+struct SharedExt4ReadCore {
+    mount: Ext4Mount,
+}
+
+// SAFETY: shared access is restricted to the audited read-only methods above.
+// The contained bcache owns its index/LBA sleeping locks, block-device counters
+// are atomic, and every caller owns its C inode/directory reference objects.
+// Backend destruction can occur only after the last Arc caller is gone, so
+// drop-time mutable cleanup cannot overlap a shared method.
+unsafe impl Sync for SharedExt4ReadCore {}
+
+impl SharedExt4ReadCore {
+    fn new(mount: Ext4Mount) -> Self {
+        Self { mount }
+    }
+
+    fn mount(&self) -> &Ext4Mount {
+        &self.mount
+    }
+}
+
+/// One legacy writable core, one lock-free-entry shared read-only core, and
+/// private mutation workers. Cache generations retire stale C buffers without
+/// a mount-wide reader lifecycle writer phase.
 pub(super) struct ConcurrentExt4Backend {
     writer: SleepMutex<Ext4Mount>,
-    readers: Vec<SleepMutex<Ext4Mount>>,
+    shared_reader: SharedExt4ReadCore,
     metadata_workers: Vec<SleepMutex<Option<Ext4MutationWorker>>>,
     inode_runtime: Arc<Ext4InodeRuntimeTable>,
     cache_generation: Ext4Sequence,
+    cache_epoch: Arc<Ext4CacheEpoch>,
     write_leases: Arc<Ext4WriteLeaseTable>,
     device: Arc<VirtIOBlock>,
     write_sequence: Arc<Ext4Sequence>,
@@ -1157,28 +1282,27 @@ pub(super) struct ConcurrentExt4Backend {
 
 impl ConcurrentExt4Backend {
     pub(super) fn open(device: Arc<VirtIOBlock>) -> Result<Self, Ext4Error> {
+        let cache_epoch = Arc::new(Ext4CacheEpoch::new());
         let write_sequence = Arc::new(Ext4Sequence::new());
         let physical_leases = Arc::new(Ext4PhysicalLeaseTable::new());
         let block_versions = Arc::new(Ext4BlockVersions::new());
         let writer = Ext4Mount::open(
             device.clone(),
+            cache_epoch.clone(),
             write_sequence.clone(),
             physical_leases.clone(),
             block_versions.clone(),
         )?;
-        let mut readers = Vec::with_capacity(MAX_CPUS);
-        for _ in 0..MAX_CPUS {
-            let reader = writer.open_read_replica()?;
-            readers.push(SleepMutex::new(reader));
-        }
+        let shared_reader = writer.open_shared_reader()?;
         let metadata_workers = (0..MAX_CPUS).map(|_| SleepMutex::new(None)).collect();
         let inode_runtime = writer.inode_runtime.clone();
         Ok(Self {
             writer: SleepMutex::new(writer),
-            readers,
+            shared_reader: SharedExt4ReadCore::new(shared_reader),
             metadata_workers,
             inode_runtime,
             cache_generation: Ext4Sequence::new(),
+            cache_epoch,
             write_leases: Arc::new(Ext4WriteLeaseTable::new()),
             device,
             write_sequence,
@@ -1189,8 +1313,8 @@ impl ConcurrentExt4Backend {
     }
 
     #[inline]
-    fn reader_start(&self) -> usize {
-        crate::cpu::current_id() % self.readers.len()
+    fn worker_start(&self) -> usize {
+        crate::cpu::current_id() % self.metadata_workers.len()
     }
 
     fn lock_core<'a>(
@@ -1222,64 +1346,28 @@ impl ConcurrentExt4Backend {
         &self,
         op: BackendOp,
         _ino: u32,
-        mut f: impl FnMut(&mut Ext4Mount, usize) -> V,
+        mut f: impl FnMut(&Ext4Mount, usize) -> V,
     ) -> V {
         let _ = op;
         loop {
             #[cfg(feature = "perf-counters")]
             perf::record_backend_op_call(op);
             let generation = self.cache_generation.stable_value();
-            let start = self.reader_start();
-            let mut available = None;
-            for offset in 0..self.readers.len() {
-                let index = (start + offset) % self.readers.len();
-                if let Some(reader) = self.readers[index].try_lock() {
-                    available = Some(reader);
-                    break;
-                }
-            }
-            let mut reader = match available {
-                Some(reader) => reader,
-                None => {
-                    #[cfg(feature = "perf-counters")]
-                    {
-                        perf::record_mount_backend_contended_acquisition();
-                        perf::record_backend_op_contended(op);
-                    }
-                    let wait_scope =
-                        perf::time_scope(perf::ProfilePoint::MountBackendContendedWait);
-                    #[cfg(feature = "perf-counters")]
-                    let op_wait_scope = perf::time_backend_op_wait(op);
-                    let guard = self.readers[start].lock();
-                    #[cfg(feature = "perf-counters")]
-                    drop(op_wait_scope);
-                    drop(wait_scope);
-                    guard
-                }
-            };
             if self.cache_generation.value.load(Ordering::Acquire) != generation {
-                drop(reader);
                 continue;
             }
-            if reader.cache_generation != generation {
-                reader.invalidate_read_cache();
-                reader.cache_generation = generation;
-            }
+            let mount = self.shared_reader.mount();
             let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
             #[cfg(feature = "perf-counters")]
-            let io_before = reader.io_counters.snapshot();
+            let io_before = mount.io_counters.snapshot();
             #[cfg(feature = "perf-counters")]
             let op_hold_scope = perf::time_backend_op_hold(op);
-            let result = f(&mut reader, generation);
+            let result = f(mount, generation);
             #[cfg(feature = "perf-counters")]
             {
                 drop(op_hold_scope);
-                perf::record_backend_op_io(
-                    op,
-                    reader.io_counters.snapshot().delta_since(io_before),
-                );
+                perf::record_backend_op_io(op, mount.io_counters.snapshot().delta_since(io_before));
             }
-            drop(reader);
             drop(hold_scope);
             if op == BackendOp::InodeLifetime
                 || self.cache_generation.value.load(Ordering::Acquire) == generation
@@ -1294,7 +1382,7 @@ impl ConcurrentExt4Backend {
         op: BackendOp,
     ) -> SleepMutexGuard<'_, Option<Ext4MutationWorker>> {
         let _ = op;
-        let start = self.reader_start();
+        let start = self.worker_start();
         for offset in 0..self.metadata_workers.len() {
             let index = (start + offset) % self.metadata_workers.len();
             if let Some(worker) = self.metadata_workers[index].try_lock() {
@@ -1416,9 +1504,12 @@ impl ConcurrentExt4Backend {
                 continue;
             }
 
-            let _generation = self.cache_generation.begin_write();
-            let _write = self.write_sequence.begin_write();
+            let generation_write = self.cache_generation.begin_write();
+            let write = self.write_sequence.begin_write();
             let (write_calls, write_blocks) = self.commit_metadata_write_set(&transaction.writes);
+            if write_blocks != 0 {
+                self.cache_epoch.advance();
+            }
             #[cfg(feature = "perf-counters")]
             perf::record_backend_op_io(
                 op,
@@ -1437,6 +1528,8 @@ impl ConcurrentExt4Backend {
                 write_calls,
                 write_blocks,
             );
+            drop(write);
+            drop(generation_write);
             return Ok(());
         }
     }
@@ -1566,6 +1659,7 @@ struct Ext4DeviceWriteRun {
 
 struct Ext4PreparedWritePlan {
     device: Arc<VirtIOBlock>,
+    cache_epoch: Arc<Ext4CacheEpoch>,
     write_sequence: Arc<Ext4Sequence>,
     physical_leases: Arc<Ext4PhysicalLeaseTable>,
     block_versions: Arc<Ext4BlockVersions>,
@@ -1581,6 +1675,7 @@ impl Ext4PreparedWritePlan {
     fn publish(self, lease: Ext4WriteLbaLease) -> Ext4DeviceWritePlan {
         Ext4DeviceWritePlan {
             device: self.device,
+            cache_epoch: self.cache_epoch,
             write_sequence: self.write_sequence,
             physical_leases: self.physical_leases,
             block_versions: self.block_versions,
@@ -1596,6 +1691,7 @@ impl Ext4PreparedWritePlan {
 
 struct Ext4DeviceWritePlan {
     device: Arc<VirtIOBlock>,
+    cache_epoch: Arc<Ext4CacheEpoch>,
     write_sequence: Arc<Ext4Sequence>,
     physical_leases: Arc<Ext4PhysicalLeaseTable>,
     block_versions: Arc<Ext4BlockVersions>,
@@ -1825,6 +1921,9 @@ impl BackendWritePlan for Ext4DeviceWritePlan {
             direct_calls += io.device_calls;
             direct_blocks += io.device_blocks;
         }
+        if direct_blocks != 0 {
+            self.cache_epoch.advance();
+        }
         perf::record_ext4_write_plan_executed(
             self.write_len,
             direct_calls,
@@ -1835,13 +1934,13 @@ impl BackendWritePlan for Ext4DeviceWritePlan {
     }
 }
 
-impl LegacyFileSystemBackend for Ext4Mount {
-    #[cfg(feature = "perf-counters")]
-    fn io_snapshot(&self) -> BackendIoSnapshot {
-        self.io_counters.snapshot()
-    }
-
-    fn statfs(&mut self) -> FileSystemStat {
+/// Audited operations available through the shared read-only lwext4 core.
+///
+/// Every C inode, directory iterator, extent path, and lookup result created
+/// below is caller-local.  The only shared mutation is bcache ownership
+/// bookkeeping, which is protected by the callbacks installed on this core.
+impl Ext4Mount {
+    fn statfs_shared(&self) -> FileSystemStat {
         match self.fs.stat() {
             Ok(st) => FileSystemStat {
                 magic: 0xEF53,
@@ -1868,8 +1967,8 @@ impl LegacyFileSystemBackend for Ext4Mount {
         }
     }
 
-    fn lookup_component_from(
-        &mut self,
+    fn lookup_component_from_shared(
+        &self,
         parent_ino: u32,
         component: &str,
     ) -> FsResult<(u32, FsNodeKind)> {
@@ -1879,6 +1978,183 @@ impl LegacyFileSystemBackend for Ext4Mount {
             .map_err(map_ext4_error)?;
         let entry = result.entry();
         Ok((entry.ino(), into_node_kind(entry.inode_type())))
+    }
+
+    fn inode_flags_shared(&self, ino: u32) -> FsResult<u32> {
+        self.fs.inode_flags(ino).map_err(map_ext4_error)
+    }
+
+    fn stat_shared(&self, ino: u32) -> FsResult<FileStat> {
+        let mut attr = lwext4_rust::FileAttr::default();
+        {
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::Ext4StatGetAttr);
+            self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
+        }
+        let inode_flags = {
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::Ext4StatInodeFlags);
+            self.fs.inode_flags(ino).map_err(map_ext4_error)?
+        };
+        Ok(self.stat_from_attr(ino, attr, inode_flags, FS_STATX_ATTR_FLAGS))
+    }
+
+    fn stat_basic_shared(&self, ino: u32) -> FsResult<FileStat> {
+        let mut attr = lwext4_rust::FileAttr::default();
+        {
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::Ext4StatGetAttr);
+            self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
+        }
+        Ok(self.stat_from_attr(ino, attr, 0, 0))
+    }
+
+    fn readlink_shared(&self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
+        self.fs.read_at(ino, buf, 0).map_err(map_ext4_error)
+    }
+
+    fn prepare_readlink_plan_shared(
+        &self,
+        ino: u32,
+        len: usize,
+    ) -> Option<Box<dyn BackendReadPlan>> {
+        match self.fs.plan_symlink_read(ino, len).ok()?? {
+            Ext4SymlinkReadPlan::Inline(data) => Some(Box::new(Ext4InlineReadPlan { data })),
+            Ext4SymlinkReadPlan::Mapped(plan) => self.mapped_read_plan(plan, false, false),
+        }
+    }
+
+    fn prepare_read_plan_shared(
+        &self,
+        ino: u32,
+        offset: u64,
+        len: usize,
+    ) -> Option<Box<dyn BackendReadPlan>> {
+        perf::record_ext4_read_plan_attempt();
+        let Ok(Some(plan)) = self.fs.plan_read(ino, len, offset) else {
+            perf::record_ext4_read_plan_fallback();
+            return None;
+        };
+        self.mapped_read_plan(plan, true, false)
+    }
+
+    fn read_at_shared(&self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::Ext4Read);
+        self.fs.read_at(ino, buf, offset).expect("ext4 read failed")
+    }
+
+    fn prepare_directory_read_plan_shared(
+        &self,
+        ino: u32,
+        offset: u64,
+    ) -> Option<Box<dyn BackendDirectoryReadPlan>> {
+        perf::record_ext4_directory_plan_attempt();
+        let LwExt4DirectoryReadPlan {
+            mapped,
+            start_offset,
+            has_file_type,
+        } = match self.fs.plan_directory_read(ino, offset) {
+            Ok(Some(plan)) => plan,
+            _ => {
+                perf::record_ext4_directory_plan_fallback();
+                return None;
+            }
+        };
+        let raw_len = mapped.read_len;
+        let block_size = mapped.block_size;
+        let raw_plan = self.mapped_read_plan(mapped, false, true)?;
+        Some(Box::new(Ext4DirectoryReadPlan {
+            raw_plan,
+            raw_len,
+            start_offset,
+            block_size,
+            has_file_type,
+        }))
+    }
+
+    fn read_dirent64_shared(
+        &self,
+        ino: u32,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> FsResult<(usize, u64)> {
+        let mut reader = self.fs.read_dir(ino, offset).map_err(map_ext4_error)?;
+        let mut written = 0usize;
+        let mut next_offset = offset;
+
+        loop {
+            let (entry_start, d_reclen) = {
+                let Some(entry) = reader.current() else {
+                    break;
+                };
+                let d_ino = entry.ino() as u64;
+                let d_type = into_linux_dtype(entry.inode_type());
+                let name = entry.name();
+                perf::record_ext4_dirent_name(name.len(), false);
+                let d_reclen = align_up(
+                    LINUX_DIRENT64_HEADER_SIZE + name.len() + 1,
+                    LINUX_DIRENT64_ALIGN,
+                );
+
+                if d_reclen > buf.len().saturating_sub(written) {
+                    if written == 0 {
+                        return Err(FsError::InvalidInput);
+                    }
+                    break;
+                }
+
+                let entry_start = written;
+                let entry_buf = &mut buf[entry_start..entry_start + d_reclen];
+                entry_buf.fill(0);
+                entry_buf[0..8].copy_from_slice(&d_ino.to_ne_bytes());
+                entry_buf[16..18].copy_from_slice(&(d_reclen as u16).to_ne_bytes());
+                entry_buf[18] = d_type;
+                entry_buf[LINUX_DIRENT64_HEADER_SIZE..LINUX_DIRENT64_HEADER_SIZE + name.len()]
+                    .copy_from_slice(name);
+
+                (entry_start, d_reclen)
+            };
+
+            reader.step().map_err(map_ext4_error)?;
+            next_offset = reader.offset();
+            buf[entry_start + 8..entry_start + 16]
+                .copy_from_slice(&(next_offset as i64).to_ne_bytes());
+            written += d_reclen;
+        }
+
+        Ok((written, next_offset))
+    }
+
+    fn list_root_names_shared(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut reader = self
+            .fs
+            .read_dir(EXT4_ROOT_INO, 0)
+            .expect("failed to iterate ext4 root directory");
+        while let Some(entry) = reader.current() {
+            let name = str::from_utf8(entry.name()).unwrap_or("<invalid>");
+            if name != "." && name != ".." {
+                names.push(name.to_string());
+            }
+            reader.step().expect("failed to advance ext4 dir iterator");
+        }
+        names
+    }
+}
+
+impl LegacyFileSystemBackend for Ext4Mount {
+    #[cfg(feature = "perf-counters")]
+    fn io_snapshot(&self) -> BackendIoSnapshot {
+        self.io_counters.snapshot()
+    }
+
+    fn statfs(&mut self) -> FileSystemStat {
+        self.statfs_shared()
+    }
+
+    fn lookup_component_from(
+        &mut self,
+        parent_ino: u32,
+        component: &str,
+    ) -> FsResult<(u32, FsNodeKind)> {
+        self.lookup_component_from_shared(parent_ino, component)
     }
 
     fn create_file(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult<u32> {
@@ -2037,7 +2313,7 @@ impl LegacyFileSystemBackend for Ext4Mount {
     }
 
     fn inode_flags(&mut self, ino: u32) -> FsResult<u32> {
-        self.fs.inode_flags(ino).map_err(map_ext4_error)
+        self.inode_flags_shared(ino)
     }
 
     fn set_inode_flags(&mut self, ino: u32, flags: u32) -> FsResult {
@@ -2085,36 +2361,19 @@ impl LegacyFileSystemBackend for Ext4Mount {
     }
 
     fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
-        let mut attr = lwext4_rust::FileAttr::default();
-        {
-            let _profile_scope = perf::time_scope(perf::ProfilePoint::Ext4StatGetAttr);
-            self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
-        }
-        let inode_flags = {
-            let _profile_scope = perf::time_scope(perf::ProfilePoint::Ext4StatInodeFlags);
-            self.fs.inode_flags(ino).map_err(map_ext4_error)?
-        };
-        Ok(self.stat_from_attr(ino, attr, inode_flags, FS_STATX_ATTR_FLAGS))
+        self.stat_shared(ino)
     }
 
     fn stat_basic(&mut self, ino: u32) -> FsResult<FileStat> {
-        let mut attr = lwext4_rust::FileAttr::default();
-        {
-            let _profile_scope = perf::time_scope(perf::ProfilePoint::Ext4StatGetAttr);
-            self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
-        }
-        Ok(self.stat_from_attr(ino, attr, 0, 0))
+        self.stat_basic_shared(ino)
     }
 
     fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
-        self.fs.read_at(ino, buf, 0).map_err(map_ext4_error)
+        self.readlink_shared(ino, buf)
     }
 
     fn prepare_readlink_plan(&mut self, ino: u32, len: usize) -> Option<Box<dyn BackendReadPlan>> {
-        match self.fs.plan_symlink_read(ino, len).ok()?? {
-            Ext4SymlinkReadPlan::Inline(data) => Some(Box::new(Ext4InlineReadPlan { data })),
-            Ext4SymlinkReadPlan::Mapped(plan) => self.mapped_read_plan(plan, false, false),
-        }
+        self.prepare_readlink_plan_shared(ino, len)
     }
 
     fn prepare_read_plan(
@@ -2123,17 +2382,11 @@ impl LegacyFileSystemBackend for Ext4Mount {
         offset: u64,
         len: usize,
     ) -> Option<Box<dyn BackendReadPlan>> {
-        perf::record_ext4_read_plan_attempt();
-        let Ok(Some(plan)) = self.fs.plan_read(ino, len, offset) else {
-            perf::record_ext4_read_plan_fallback();
-            return None;
-        };
-        self.mapped_read_plan(plan, true, false)
+        self.prepare_read_plan_shared(ino, offset, len)
     }
 
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
-        let _profile_scope = perf::time_scope(perf::ProfilePoint::Ext4Read);
-        self.fs.read_at(ino, buf, offset).expect("ext4 read failed")
+        self.read_at_shared(ino, buf, offset)
     }
 
     fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize {
@@ -2147,94 +2400,15 @@ impl LegacyFileSystemBackend for Ext4Mount {
         ino: u32,
         offset: u64,
     ) -> Option<Box<dyn BackendDirectoryReadPlan>> {
-        perf::record_ext4_directory_plan_attempt();
-        let LwExt4DirectoryReadPlan {
-            mapped,
-            start_offset,
-            has_file_type,
-        } = match self.fs.plan_directory_read(ino, offset) {
-            Ok(Some(plan)) => plan,
-            _ => {
-                perf::record_ext4_directory_plan_fallback();
-                return None;
-            }
-        };
-        let raw_len = mapped.read_len;
-        let block_size = mapped.block_size;
-        let raw_plan = self.mapped_read_plan(mapped, false, true)?;
-        Some(Box::new(Ext4DirectoryReadPlan {
-            raw_plan,
-            raw_len,
-            start_offset,
-            block_size,
-            has_file_type,
-        }))
+        self.prepare_directory_read_plan_shared(ino, offset)
     }
 
     fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
-        let mut reader = self.fs.read_dir(ino, offset).map_err(map_ext4_error)?;
-        let mut written = 0usize;
-        let mut next_offset = offset;
-
-        loop {
-            let (entry_start, d_reclen) = {
-                let Some(entry) = reader.current() else {
-                    break;
-                };
-                let d_ino = entry.ino() as u64;
-                let d_type = into_linux_dtype(entry.inode_type());
-                let name = entry.name();
-                perf::record_ext4_dirent_name(name.len(), false);
-                let d_reclen = align_up(
-                    LINUX_DIRENT64_HEADER_SIZE + name.len() + 1,
-                    LINUX_DIRENT64_ALIGN,
-                );
-
-                // Linux getdents64 returns EINVAL when one record cannot fit; after
-                // at least one record, returning a short buffer preserves the next offset.
-                if d_reclen > buf.len().saturating_sub(written) {
-                    if written == 0 {
-                        return Err(FsError::InvalidInput);
-                    }
-                    break;
-                }
-
-                let entry_start = written;
-                let entry_buf = &mut buf[entry_start..entry_start + d_reclen];
-                entry_buf.fill(0);
-                entry_buf[0..8].copy_from_slice(&d_ino.to_ne_bytes());
-                entry_buf[16..18].copy_from_slice(&(d_reclen as u16).to_ne_bytes());
-                entry_buf[18] = d_type;
-                entry_buf[LINUX_DIRENT64_HEADER_SIZE..LINUX_DIRENT64_HEADER_SIZE + name.len()]
-                    .copy_from_slice(name);
-
-                (entry_start, d_reclen)
-            };
-
-            reader.step().map_err(map_ext4_error)?;
-            next_offset = reader.offset();
-            buf[entry_start + 8..entry_start + 16]
-                .copy_from_slice(&(next_offset as i64).to_ne_bytes());
-            written += d_reclen;
-        }
-
-        Ok((written, next_offset))
+        self.read_dirent64_shared(ino, offset, buf)
     }
 
     fn list_root_names(&mut self) -> Vec<String> {
-        let mut names = Vec::new();
-        let mut reader = self
-            .fs
-            .read_dir(EXT4_ROOT_INO, 0)
-            .expect("failed to iterate ext4 root directory");
-        while let Some(entry) = reader.current() {
-            let name = str::from_utf8(entry.name()).unwrap_or("<invalid>");
-            if name != "." && name != ".." {
-                names.push(name.to_string());
-            }
-            reader.step().expect("failed to advance ext4 dir iterator");
-        }
-        names
+        self.list_root_names_shared()
     }
 }
 
@@ -2248,7 +2422,9 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
     }
 
     fn statfs(&self) -> FileSystemStat {
-        self.with_writer_read(BackendOp::StatFull, |writer| writer.statfs())
+        // The read-only core's in-memory superblock is a mount-time snapshot;
+        // free inode/block counters are maintained by the writable core.
+        self.with_writer_read(BackendOp::StatFull, |writer| writer.statfs_shared())
     }
 
     fn lookup_component_from(
@@ -2257,7 +2433,7 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         component: &str,
     ) -> FsResult<(u32, FsNodeKind)> {
         self.with_reader(BackendOp::Lookup, parent_ino, |reader, _| {
-            reader.lookup_component_from(parent_ino, component)
+            reader.lookup_component_from_shared(parent_ino, component)
         })
     }
 
@@ -2407,7 +2583,7 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
 
     fn inode_flags(&self, ino: u32) -> FsResult<u32> {
         self.with_reader(BackendOp::StatFull, ino, |reader, _| {
-            reader.inode_flags(ino)
+            reader.inode_flags_shared(ino)
         })
     }
 
@@ -2464,18 +2640,20 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
     }
 
     fn stat(&self, ino: u32) -> FsResult<FileStat> {
-        self.with_reader(BackendOp::StatFull, ino, |reader, _| reader.stat(ino))
+        self.with_reader(BackendOp::StatFull, ino, |reader, _| {
+            reader.stat_shared(ino)
+        })
     }
 
     fn stat_basic(&self, ino: u32) -> FsResult<FileStat> {
         self.with_reader(BackendOp::StatBasic, ino, |reader, _| {
-            reader.stat_basic(ino)
+            reader.stat_basic_shared(ino)
         })
     }
 
     fn readlink(&self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
         self.with_reader(BackendOp::Readlink, ino, |reader, _| {
-            reader.readlink(ino, buf)
+            reader.readlink_shared(ino, buf)
         })
     }
 
@@ -2484,7 +2662,7 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         // is fetched by the returned pointer-free plan after the reader core
         // lock has been released.
         self.with_reader(BackendOp::ReadPlan, ino, |reader, _| {
-            reader.prepare_readlink_plan(ino, len)
+            reader.prepare_readlink_plan_shared(ino, len)
         })
     }
 
@@ -2503,13 +2681,13 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         len: usize,
     ) -> Option<Box<dyn BackendReadPlan>> {
         self.with_reader(BackendOp::ReadPlan, ino, |reader, _| {
-            reader.prepare_read_plan(ino, offset, len)
+            reader.prepare_read_plan_shared(ino, offset, len)
         })
     }
 
     fn read_at(&self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
         self.with_reader(BackendOp::ReadFallback, ino, |reader, _| {
-            reader.read_at(ino, buf, offset)
+            reader.read_at_shared(ino, buf, offset)
         })
     }
 
@@ -2519,10 +2697,10 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         offset: u64,
         len: usize,
     ) -> Option<Box<dyn BackendWritePlan>> {
-        // Mapping lookup and bcache alias invalidation are short control-core
-        // operations. The returned object owns only integer ranges, the block
-        // device, and an LBA lease; its data I/O runs after every core guard is
-        // released while the VFS still holds this inode's mapping lease.
+        // Mapping lookup and writer-core alias invalidation are short control
+        // operations. The shared read core is retired by cache epoch only
+        // after plan I/O publishes new bytes, so its payload is never rewritten
+        // underneath an older reader.
         perf::record_ext4_write_plan_attempt();
         let prepared = self.with_writer_read(BackendOp::Write, |writer| {
             let prepared = writer.prepare_mapped_write_plan(ino, offset, len)?;
@@ -2531,19 +2709,10 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
             Some((prepared, lease, aliases))
         });
 
-        let Some((prepared, lease, mut aliases)) = prepared else {
+        let Some((prepared, lease, aliases)) = prepared else {
             perf::record_ext4_write_plan_fallback(false);
             return None;
         };
-        for reader in &self.readers {
-            let mut reader = Self::lock_core(reader, BackendOp::Write);
-            let Some(invalidated) = reader.invalidate_mapped_write_aliases(&prepared.fs_blocks)
-            else {
-                perf::record_ext4_write_plan_fallback(true);
-                return None;
-            };
-            aliases += invalidated;
-        }
         perf::record_ext4_write_plan_prepared(
             prepared.runs.len(),
             prepared.fs_blocks.len(),
@@ -2564,19 +2733,19 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         offset: u64,
     ) -> Option<Box<dyn BackendDirectoryReadPlan>> {
         self.with_reader(BackendOp::ReadPlan, ino, |reader, _| {
-            reader.prepare_directory_read_plan(ino, offset)
+            reader.prepare_directory_read_plan_shared(ino, offset)
         })
     }
 
     fn read_dirent64(&self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
         self.with_reader(BackendOp::Readdir, ino, |reader, _| {
-            reader.read_dirent64(ino, offset, buf)
+            reader.read_dirent64_shared(ino, offset, buf)
         })
     }
 
     fn list_root_names(&self) -> Vec<String> {
         if let Some(plan) = self.with_reader(BackendOp::ReadPlan, EXT4_ROOT_INO, |reader, _| {
-            reader.prepare_directory_read_plan(EXT4_ROOT_INO, 0)
+            reader.prepare_directory_read_plan_shared(EXT4_ROOT_INO, 0)
         }) {
             return plan
                 .execute()
@@ -2584,7 +2753,7 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
                 .names();
         }
         self.with_reader(BackendOp::Readdir, EXT4_ROOT_INO, |reader, _| {
-            reader.list_root_names()
+            reader.list_root_names_shared()
         })
     }
 }

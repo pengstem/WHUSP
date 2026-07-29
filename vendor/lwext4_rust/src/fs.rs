@@ -53,6 +53,11 @@ pub struct Ext4Filesystem<Hal: SystemHal, Dev: BlockDevice> {
 }
 
 impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
+    #[inline]
+    fn inner_ptr(&self) -> *mut ext4_fs {
+        self.inner.as_ref() as *const ext4_fs as *mut ext4_fs
+    }
+
     pub fn new(dev: Dev, config: FsConfig) -> Ext4Result<Self> {
         Self::new_with_mode(dev, config, false)
     }
@@ -157,15 +162,15 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         }
     }
 
-    fn inode_ref(&mut self, ino: u32) -> Ext4Result<InodeRef<Hal>> {
+    fn inode_ref(&self, ino: u32) -> Ext4Result<InodeRef<Hal>> {
         unsafe {
             let mut result = mem::zeroed();
-            ext4_fs_get_inode_ref(self.inner.as_mut(), ino, &mut result)
+            ext4_fs_get_inode_ref(self.inner_ptr(), ino, &mut result)
                 .context("ext4_fs_get_inode_ref")?;
             Ok(InodeRef::new(result))
         }
     }
-    fn clone_ref(&mut self, inode: &InodeRef<Hal>) -> InodeRef<Hal> {
+    fn clone_ref(&self, inode: &InodeRef<Hal>) -> InodeRef<Hal> {
         self.inode_ref(inode.ino()).expect("inode ref clone failed")
     }
 
@@ -199,16 +204,16 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         }
     }
 
-    pub fn get_attr(&mut self, ino: u32, attr: &mut FileAttr) -> Ext4Result<()> {
+    pub fn get_attr(&self, ino: u32, attr: &mut FileAttr) -> Ext4Result<()> {
         self.inode_ref(ino)?.get_attr(attr);
         Ok(())
     }
 
-    pub fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> Ext4Result<usize> {
+    pub fn read_at(&self, ino: u32, buf: &mut [u8], offset: u64) -> Ext4Result<usize> {
         self.inode_ref(ino)?.read_at(buf, offset)
     }
     pub fn plan_read(
-        &mut self,
+        &self,
         ino: u32,
         len: usize,
         offset: u64,
@@ -216,7 +221,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         self.inode_ref(ino)?.plan_read(len, offset)
     }
     pub fn plan_symlink_read(
-        &mut self,
+        &self,
         ino: u32,
         len: usize,
     ) -> Ext4Result<Option<Ext4SymlinkReadPlan>> {
@@ -232,7 +237,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         self.inode_ref(ino)?.set_mode(mode);
         Ok(())
     }
-    pub fn inode_flags(&mut self, ino: u32) -> Ext4Result<u32> {
+    pub fn inode_flags(&self, ino: u32) -> Ext4Result<u32> {
         Ok(self.inode_ref(ino)?.flags())
     }
     pub fn set_inode_flags(&mut self, ino: u32, flags: u32) -> Ext4Result<()> {
@@ -265,14 +270,14 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
     pub fn set_symlink(&mut self, ino: u32, buf: &[u8]) -> Ext4Result<()> {
         self.inode_ref(ino)?.set_symlink(buf)
     }
-    pub fn lookup(&mut self, parent: u32, name: &str) -> Ext4Result<DirLookupResult<Hal>> {
+    pub fn lookup(&self, parent: u32, name: &str) -> Ext4Result<DirLookupResult<Hal>> {
         self.inode_ref(parent)?.lookup(name)
     }
-    pub fn read_dir(&mut self, parent: u32, offset: u64) -> Ext4Result<DirReader<Hal>> {
+    pub fn read_dir(&self, parent: u32, offset: u64) -> Ext4Result<DirReader<Hal>> {
         self.inode_ref(parent)?.read_dir(offset)
     }
     pub fn plan_directory_read(
-        &mut self,
+        &self,
         parent: u32,
         offset: u64,
     ) -> Ext4Result<Option<Ext4DirectoryReadPlan>> {
@@ -464,8 +469,8 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         Ok(None)
     }
 
-    pub fn stat(&mut self) -> Ext4Result<StatFs> {
-        let sb = &mut self.inner.as_mut().sb;
+    pub fn stat(&self) -> Ext4Result<StatFs> {
+        let sb = &self.inner.as_ref().sb;
         Ok(StatFs {
             inodes_count: u32::from_le(sb.inodes_count),
             free_inodes_count: u32::from_le(sb.free_inodes_count),

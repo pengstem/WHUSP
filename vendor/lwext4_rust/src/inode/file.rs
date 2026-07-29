@@ -382,7 +382,11 @@ impl<Hal: SystemHal> InodeRef<Hal> {
                 block_start += 1;
             }
 
-            let guard = WritebackGuard::new(bdev);
+            // A read-only shared metadata core cannot mutate the block
+            // device's writeback reference count on every legacy read.
+            // Such a core never owns dirty buffers, so this guard is needed
+            // only by writable cores.
+            let guard = (!(*self.inner.fs).read_only).then(|| WritebackGuard::new(bdev));
 
             // Each block corresponds to a fblock, and we can read multiple
             // fblocks at once if they are consecutive.

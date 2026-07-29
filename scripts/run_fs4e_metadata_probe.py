@@ -19,6 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PROBE_SOURCE = REPO_ROOT / "scripts" / "perf-gates" / "fs4e_metadata_probe.c"
 GUEST_TEMPLATE = REPO_ROOT / "scripts" / "perf-gates" / "fs4e-metadata-probe.sh"
 SCALE_WORKERS = (1, 2, 4, 8)
+COLD_FILES_PER_WORKER = 256
 
 
 def render_guest(args: argparse.Namespace) -> str:
@@ -79,6 +80,13 @@ def build_disk(args: argparse.Namespace, temp_root: Path, probe: Path, setup: Pa
     installed = staging / "fs4e_metadata_probe"
     shutil.copy2(probe, installed)
     installed.chmod(0o755)
+    cold_root = staging / "fs5-cold"
+    for workers in SCALE_WORKERS:
+        for worker in range(workers):
+            worker_dir = cold_root / f"cell-{workers}" / f"worker-{worker}"
+            worker_dir.mkdir(parents=True, exist_ok=True)
+            for index in range(COLD_FILES_PER_WORKER):
+                (worker_dir / f"entry-{index:04d}").touch()
     image = temp_root / "fs4e-metadata-probe.img"
     output: list[str] = []
     try:
@@ -160,6 +168,73 @@ def validate(log: str, args: argparse.Namespace, overlay_root: Path) -> dict[str
         cell["elapsed_ns"] <= 0 or cell["ops_per_second"] <= 0 for cell in scaling.values()
     ):
         errors.append(f"scaling matrix mismatch: {sorted(scaling)}")
+    cold_re = re.compile(
+        r"^FS5_SHARED_READ_SCALE workers=(?P<workers>\d+) operations=(?P<operations>\d+) "
+        r"elapsed_ns=(?P<elapsed>\d+) ops_per_second=(?P<throughput>\d+)$"
+    )
+    cold_scaling: dict[int, dict[str, int]] = {}
+    for line in lines:
+        match = cold_re.match(line)
+        if match:
+            workers = int(match.group("workers"))
+            cold_scaling[workers] = {
+                "operations": int(match.group("operations")),
+                "elapsed_ns": int(match.group("elapsed")),
+                "ops_per_second": int(match.group("throughput")),
+            }
+    if tuple(sorted(cold_scaling)) != SCALE_WORKERS or any(
+        cell["operations"] != workers * COLD_FILES_PER_WORKER
+        or cell["elapsed_ns"] <= 0
+        or cell["ops_per_second"] <= 0
+        for workers, cell in cold_scaling.items()
+    ):
+        errors.append(f"cold shared-read scaling matrix mismatch: {sorted(cold_scaling)}")
+    cold_counter_re = re.compile(
+        r"^FS5_SHARED_READ_COUNTERS workers=(?P<workers>\d+) "
+        r"lookup_calls=(?P<lookup_calls>\d+) lookup_contended=(?P<lookup_contended>\d+) "
+        r"lookup_wait_us=(?P<lookup_wait_us>\d+) stat_basic_calls=(?P<stat_basic_calls>\d+) "
+        r"stat_full_calls=(?P<stat_full_calls>\d+) block_read_calls=(?P<block_read_calls>\d+) "
+        r"block_read_blocks=(?P<block_read_blocks>\d+) "
+        r"sync_read_submits=(?P<sync_read_submits>\d+) nb_read_submits=(?P<nb_read_submits>\d+) "
+        r"inflight_before=(?P<inflight_before>\d+) inflight_after=(?P<inflight_after>\d+) "
+        r"inflight_hwm_before=(?P<inflight_hwm_before>\d+) "
+        r"inflight_hwm_after=(?P<inflight_hwm_after>\d+) "
+        r"bcache_lock_counters=(?P<bcache_lock_counters>[01]) "
+        r"index_lock_calls=(?P<index_lock_calls>\d+) "
+        r"index_lock_contended=(?P<index_lock_contended>\d+) "
+        r"lba_lock_calls=(?P<lba_lock_calls>\d+) "
+        r"lba_lock_contended=(?P<lba_lock_contended>\d+)$"
+    )
+    cold_counters: dict[int, dict[str, int]] = {}
+    for line in lines:
+        match = cold_counter_re.match(line)
+        if match:
+            workers = int(match.group("workers"))
+            cold_counters[workers] = {
+                key: int(match.group(key))
+                for key in (
+                    "lookup_calls",
+                    "lookup_contended",
+                    "lookup_wait_us",
+                    "stat_basic_calls",
+                    "stat_full_calls",
+                    "block_read_calls",
+                    "block_read_blocks",
+                    "sync_read_submits",
+                    "nb_read_submits",
+                    "inflight_before",
+                    "inflight_after",
+                    "inflight_hwm_before",
+                    "inflight_hwm_after",
+                    "bcache_lock_counters",
+                    "index_lock_calls",
+                    "index_lock_contended",
+                    "lba_lock_calls",
+                    "lba_lock_contended",
+                )
+            }
+    if args.perf_counters and tuple(sorted(cold_counters)) != SCALE_WORKERS:
+        errors.append(f"cold shared-read counter matrix mismatch: {sorted(cold_counters)}")
     if lines.count("FS4E_METADATA_PROBE_PASS") != 1 or any(
         "FS4E_METADATA_PROBE_FAIL" in line for line in lines
     ):
@@ -178,6 +253,8 @@ def validate(log: str, args: argparse.Namespace, overlay_root: Path) -> dict[str
         "valid": not errors,
         "errors": errors,
         "scaling": scaling,
+        "cold_shared_read_scaling": cold_scaling,
+        "cold_shared_read_counters": cold_counters,
         "cache_hit": cache_hits[0] if cache_hits else None,
         "single_flight": single_flights[0] if single_flights else None,
         "overlay_path": overlay_path,

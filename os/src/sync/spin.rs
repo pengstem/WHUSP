@@ -346,6 +346,136 @@ impl<T> SpinNoIrqLock<T> {
     }
 }
 
+/// Payload-free IRQ-safe spin lock for paired FFI lock/unlock callbacks.
+///
+/// This is restricted to short, non-sleeping bookkeeping sections. The
+/// explicit unlock exists because a C callback pair cannot carry a Rust guard;
+/// ordinary Rust code should use [`SpinNoIrqLock`]. Local interrupts remain
+/// disabled from successful acquisition through the matching unlock, so the
+/// owner cannot be preempted or migrate while the raw ownership is live.
+pub struct RawSpinNoIrqLock {
+    locked: AtomicBool,
+    irq_was_enabled: AtomicBool,
+    #[cfg(debug_assertions)]
+    owner: AtomicUsize,
+}
+
+unsafe impl Send for RawSpinNoIrqLock {}
+unsafe impl Sync for RawSpinNoIrqLock {}
+
+impl RawSpinNoIrqLock {
+    pub const fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            irq_was_enabled: AtomicBool::new(false),
+            #[cfg(debug_assertions)]
+            owner: AtomicUsize::new(LOCK_OWNER_NONE),
+        }
+    }
+
+    pub fn lock(&self) {
+        let was_enabled = crate::arch::interrupt::supervisor_interrupt_enabled();
+        crate::arch::interrupt::disable_supervisor_interrupt();
+        self.assert_not_owned_by_current();
+        loop {
+            while self.locked.load(Ordering::Relaxed) {
+                poll_tlb_while_spinning();
+                spin_loop();
+            }
+            if self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.note_acquired();
+                self.irq_was_enabled.store(was_enabled, Ordering::Relaxed);
+                return;
+            }
+            poll_tlb_while_spinning();
+        }
+    }
+
+    #[cfg(feature = "perf-counters")]
+    pub fn try_lock(&self) -> bool {
+        let was_enabled = crate::arch::interrupt::supervisor_interrupt_enabled();
+        crate::arch::interrupt::disable_supervisor_interrupt();
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.note_acquired();
+            self.irq_was_enabled.store(was_enabled, Ordering::Relaxed);
+            true
+        } else {
+            if was_enabled {
+                crate::arch::interrupt::enable_supervisor_interrupt();
+            }
+            false
+        }
+    }
+
+    /// Releases one acquisition by the current CPU.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must own this lock exactly once, and the protected C
+    /// state must no longer be accessed after this call.
+    pub unsafe fn unlock(&self) {
+        self.note_releasing();
+        let restore_irqs = self.irq_was_enabled.load(Ordering::Relaxed);
+        self.locked.store(false, Ordering::Release);
+        if restore_irqs {
+            crate::arch::interrupt::enable_supervisor_interrupt();
+        }
+    }
+
+    #[inline]
+    fn assert_not_owned_by_current(&self) {
+        #[cfg(debug_assertions)]
+        if let Some(current) = crate::cpu::try_current_id().map(|cpu| cpu + 1) {
+            assert_ne!(
+                self.owner.load(Ordering::Relaxed),
+                current,
+                "recursive raw IRQ-safe spin-lock acquisition"
+            );
+        }
+    }
+
+    #[inline]
+    fn note_acquired(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let owner = crate::cpu::try_current_id()
+                .map(|cpu| cpu + 1)
+                .unwrap_or(LOCK_OWNER_EARLY);
+            let previous = self.owner.swap(owner, Ordering::Relaxed);
+            assert_eq!(previous, LOCK_OWNER_NONE, "corrupt raw spin-lock owner");
+        }
+    }
+
+    #[inline]
+    fn note_releasing(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let owner = self.owner.load(Ordering::Relaxed);
+            if owner != LOCK_OWNER_EARLY {
+                let current = crate::cpu::try_current_id()
+                    .map(|cpu| cpu + 1)
+                    .expect("raw spin lock released without CPU-local identity");
+                assert_eq!(owner, current, "raw spin lock released on another CPU");
+            }
+            self.owner.store(LOCK_OWNER_NONE, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Default for RawSpinNoIrqLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[inline]
 fn poll_tlb_while_spinning() {
     if crate::cpu::try_current_id().is_some() {

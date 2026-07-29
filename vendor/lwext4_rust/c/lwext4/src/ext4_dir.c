@@ -361,9 +361,13 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 			return EOK;
 		}
 
-		/* Needed to clear dir index flag if corrupted */
-		ext4_inode_clear_flag(parent->inode, EXT4_INODE_FLAG_INDEX);
-		parent->dirty = true;
+		/* Needed to clear dir index flag if corrupted.  A read-only core
+		 * still falls back to the linear scan, but must not rewrite its
+		 * shared cached inode merely because an index is malformed. */
+		if (!parent->fs->read_only) {
+			ext4_inode_clear_flag(parent->inode, EXT4_INODE_FLAG_INDEX);
+			parent->dirty = true;
+		}
 	}
 #endif
 
@@ -469,9 +473,11 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 			return EOK;
 		}
 
-		/* Needed to clear dir index flag if corrupted */
-		ext4_inode_clear_flag(parent->inode, EXT4_INODE_FLAG_INDEX);
-		parent->dirty = true;
+		/* Needed to clear dir index flag if corrupted. */
+		if (!parent->fs->read_only) {
+			ext4_inode_clear_flag(parent->inode, EXT4_INODE_FLAG_INDEX);
+			parent->dirty = true;
+		}
 	}
 #endif
 

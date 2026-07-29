@@ -17,11 +17,22 @@
 #define MAX_WORKERS 8
 #define HIT_ITERATIONS 256
 #define SCALE_ITERATIONS 8000
+#define COLD_FILES_PER_WORKER 256
 
 struct worker {
     int dirfd;
     const char *path;
     int iterations;
+    pthread_barrier_t *barrier;
+    int target_cpu;
+    int start_cpu;
+    int end_cpu;
+    uint64_t elapsed_ns;
+    int failed;
+};
+
+struct cold_worker {
+    int dirfd;
     pthread_barrier_t *barrier;
     int target_cpu;
     int start_cpu;
@@ -203,6 +214,176 @@ static int run_workers(
         return -1;
     }
     *elapsed_ns = end - start;
+    return 0;
+}
+
+static void *cold_stat_worker(void *opaque)
+{
+    struct cold_worker *worker = opaque;
+    struct stat statbuf;
+    cpu_set_t affinity;
+    CPU_ZERO(&affinity);
+    CPU_SET(worker->target_cpu, &affinity);
+    if (sched_setaffinity(0, sizeof(affinity), &affinity) != 0) {
+        worker->failed = 1;
+    }
+    int barrier = pthread_barrier_wait(worker->barrier);
+    if (barrier != 0 && barrier != PTHREAD_BARRIER_SERIAL_THREAD) {
+        worker->failed = 1;
+        return NULL;
+    }
+    worker->start_cpu = sched_getcpu();
+    uint64_t start = monotonic_ns();
+    for (int index = 0; !worker->failed && index < COLD_FILES_PER_WORKER; ++index) {
+        char name[32];
+        snprintf(name, sizeof(name), "entry-%04d", index);
+        if (fstatat(worker->dirfd, name, &statbuf, 0) != 0 || !S_ISREG(statbuf.st_mode)) {
+            worker->failed = 1;
+        }
+    }
+    uint64_t end = monotonic_ns();
+    if (start == 0 || end < start) {
+        worker->failed = 1;
+    } else {
+        worker->elapsed_ns = end - start;
+    }
+    worker->end_cpu = sched_getcpu();
+    barrier = pthread_barrier_wait(worker->barrier);
+    if (barrier != 0 && barrier != PTHREAD_BARRIER_SERIAL_THREAD) {
+        worker->failed = 1;
+    }
+    return NULL;
+}
+
+static int phase_cold_shared_read_scaling(void)
+{
+    const int cells[] = {1, 2, 4, 8};
+    for (size_t cell = 0; cell < sizeof(cells) / sizeof(cells[0]); ++cell) {
+        int workers = cells[cell];
+        unsigned long long lookup_before = 0, lookup_after = 0;
+        unsigned long long lookup_contended_before = 0, lookup_contended_after = 0;
+        unsigned long long lookup_wait_before = 0, lookup_wait_after = 0;
+        unsigned long long stat_basic_before = 0, stat_basic_after = 0;
+        unsigned long long stat_full_before = 0, stat_full_after = 0;
+        unsigned long long block_reads_before = 0, block_reads_after = 0;
+        unsigned long long block_read_blocks_before = 0, block_read_blocks_after = 0;
+        unsigned long long sync_reads_before = 0, sync_reads_after = 0;
+        unsigned long long nb_reads_before = 0, nb_reads_after = 0;
+        unsigned long long inflight_before = 0, inflight_after = 0;
+        unsigned long long inflight_hwm_before = 0, inflight_hwm_after = 0;
+        unsigned long long index_locks_before = 0, index_locks_after = 0;
+        unsigned long long index_contended_before = 0, index_contended_after = 0;
+        unsigned long long lba_locks_before = 0, lba_locks_after = 0;
+        unsigned long long lba_contended_before = 0, lba_contended_after = 0;
+        int counters = read_counter("backend_op_lookup_calls", &lookup_before) == 0
+            && read_counter("backend_op_lookup_contended", &lookup_contended_before) == 0
+            && read_counter("backend_op_lookup_wait_us", &lookup_wait_before) == 0
+            && read_counter("backend_op_stat_basic_calls", &stat_basic_before) == 0
+            && read_counter("backend_op_stat_full_calls", &stat_full_before) == 0
+            && read_counter("ext4_block_read_calls", &block_reads_before) == 0
+            && read_counter("ext4_block_read_blocks", &block_read_blocks_before) == 0
+            && read_counter("block_io_sync_read_submits", &sync_reads_before) == 0
+            && read_counter("block_io_nb_read_submits", &nb_reads_before) == 0
+            && read_counter("block_io_device_inflight", &inflight_before) == 0
+            && read_counter("block_io_device_inflight_high_watermark", &inflight_hwm_before) == 0;
+        int bcache_lock_counters =
+            read_counter("ext4_bcache_index_lock_calls", &index_locks_before) == 0
+            && read_counter("ext4_bcache_index_lock_contended", &index_contended_before) == 0
+            && read_counter("ext4_bcache_lba_lock_calls", &lba_locks_before) == 0
+            && read_counter("ext4_bcache_lba_lock_contended", &lba_contended_before) == 0;
+        pthread_t threads[MAX_WORKERS];
+        struct cold_worker args[MAX_WORKERS];
+        pthread_barrier_t barrier;
+        if (pthread_barrier_init(&barrier, NULL, (unsigned)workers + 1) != 0) {
+            return -1;
+        }
+        for (int worker = 0; worker < workers; ++worker) {
+            char path[128];
+            snprintf(path, sizeof(path), "/x1/fs5-cold/cell-%d/worker-%d", workers, worker);
+            int dirfd = open(path, O_RDONLY | O_DIRECTORY);
+            if (dirfd < 0) {
+                return -1;
+            }
+            args[worker] = (struct cold_worker){
+                .dirfd = dirfd,
+                .barrier = &barrier,
+                .target_cpu = worker,
+                .start_cpu = -1,
+                .end_cpu = -1,
+                .elapsed_ns = 0,
+                .failed = 0,
+            };
+            if (pthread_create(&threads[worker], NULL, cold_stat_worker, &args[worker]) != 0) {
+                return -1;
+            }
+        }
+        int barrier_result = pthread_barrier_wait(&barrier);
+        if (barrier_result != 0 && barrier_result != PTHREAD_BARRIER_SERIAL_THREAD) {
+            return -1;
+        }
+        barrier_result = pthread_barrier_wait(&barrier);
+        if (barrier_result != 0 && barrier_result != PTHREAD_BARRIER_SERIAL_THREAD) {
+            return -1;
+        }
+        int failed = 0;
+        uint64_t elapsed = 0;
+        for (int worker = 0; worker < workers; ++worker) {
+            if (pthread_join(threads[worker], NULL) != 0 || args[worker].failed
+                || close(args[worker].dirfd) != 0) {
+                failed = 1;
+            }
+            if (args[worker].elapsed_ns > elapsed) {
+                elapsed = args[worker].elapsed_ns;
+            }
+        }
+        pthread_barrier_destroy(&barrier);
+        if (failed || elapsed == 0) {
+            return -1;
+        }
+        unsigned long long operations =
+            (unsigned long long)workers * COLD_FILES_PER_WORKER;
+        unsigned long long throughput = operations * 1000000000ULL / elapsed;
+        printf("FS5_SHARED_READ_SCALE workers=%d operations=%llu elapsed_ns=%llu ops_per_second=%llu\n",
+            workers, operations, (unsigned long long)elapsed, throughput);
+        printf("FS5_SHARED_READ_CPUS workers=%d", workers);
+        for (int worker = 0; worker < workers; ++worker) {
+            printf(" slot%d=%d->%d:%llu", worker, args[worker].start_cpu,
+                args[worker].end_cpu, (unsigned long long)args[worker].elapsed_ns);
+        }
+        putchar('\n');
+        counters = counters && read_counter("backend_op_lookup_calls", &lookup_after) == 0
+            && read_counter("backend_op_lookup_contended", &lookup_contended_after) == 0
+            && read_counter("backend_op_lookup_wait_us", &lookup_wait_after) == 0
+            && read_counter("backend_op_stat_basic_calls", &stat_basic_after) == 0
+            && read_counter("backend_op_stat_full_calls", &stat_full_after) == 0
+            && read_counter("ext4_block_read_calls", &block_reads_after) == 0
+            && read_counter("ext4_block_read_blocks", &block_read_blocks_after) == 0
+            && read_counter("block_io_sync_read_submits", &sync_reads_after) == 0
+            && read_counter("block_io_nb_read_submits", &nb_reads_after) == 0
+            && read_counter("block_io_device_inflight", &inflight_after) == 0
+            && read_counter("block_io_device_inflight_high_watermark", &inflight_hwm_after) == 0;
+        bcache_lock_counters = bcache_lock_counters
+            && read_counter("ext4_bcache_index_lock_calls", &index_locks_after) == 0
+            && read_counter("ext4_bcache_index_lock_contended", &index_contended_after) == 0
+            && read_counter("ext4_bcache_lba_lock_calls", &lba_locks_after) == 0
+            && read_counter("ext4_bcache_lba_lock_contended", &lba_contended_after) == 0;
+        if (counters) {
+            printf("FS5_SHARED_READ_COUNTERS workers=%d lookup_calls=%llu lookup_contended=%llu lookup_wait_us=%llu stat_basic_calls=%llu stat_full_calls=%llu block_read_calls=%llu block_read_blocks=%llu sync_read_submits=%llu nb_read_submits=%llu inflight_before=%llu inflight_after=%llu inflight_hwm_before=%llu inflight_hwm_after=%llu bcache_lock_counters=%d index_lock_calls=%llu index_lock_contended=%llu lba_lock_calls=%llu lba_lock_contended=%llu\n",
+                workers, lookup_after - lookup_before,
+                lookup_contended_after - lookup_contended_before,
+                lookup_wait_after - lookup_wait_before, stat_basic_after - stat_basic_before,
+                stat_full_after - stat_full_before, block_reads_after - block_reads_before,
+                block_read_blocks_after - block_read_blocks_before,
+                sync_reads_after - sync_reads_before, nb_reads_after - nb_reads_before,
+                inflight_before, inflight_after, inflight_hwm_before, inflight_hwm_after,
+                bcache_lock_counters,
+                bcache_lock_counters ? index_locks_after - index_locks_before : 0,
+                bcache_lock_counters ? index_contended_after - index_contended_before : 0,
+                bcache_lock_counters ? lba_locks_after - lba_locks_before : 0,
+                bcache_lock_counters ? lba_contended_after - lba_contended_before : 0);
+        }
+        fflush(stdout);
+    }
     return 0;
 }
 
@@ -426,7 +607,8 @@ int main(int argc, char **argv)
         }
     }
     int dirfd = open(base, O_RDONLY | O_DIRECTORY);
-    if (dirfd < 0 || phase_syscall_control() != 0 || phase_scaling(dirfd, name_refs) != 0) {
+    if (dirfd < 0 || phase_syscall_control() != 0 || phase_scaling(dirfd, name_refs) != 0
+        || phase_cold_shared_read_scaling() != 0) {
         puts("FS4E_METADATA_PROBE_FAIL stage=scaling");
         return 1;
     }

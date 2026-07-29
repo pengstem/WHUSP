@@ -80,7 +80,7 @@ def main() -> int:
         ]
         subprocess.run(command, cwd=ROOT, env=env, check=True)
 
-    print("LWEXT4_BCACHE_PROBE_PASS cases=4")
+    print("LWEXT4_BCACHE_PROBE_PASS cases=5")
     return 0
 
 

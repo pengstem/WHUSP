@@ -103,6 +103,14 @@ void ext4_bcache_lba_unlock_impl(struct ext4_bcache *bc, uint64_t lba)
 	ext4_assert(r == EOK);
 }
 
+static uint64_t ext4_bcache_generation(struct ext4_bcache *bc)
+{
+	if (!bc || !bc->bdev || !bc->bdev->bdif->bcache_generation)
+		return 0;
+
+	return bc->bdev->bdif->bcache_generation(bc->bdev);
+}
+
 int ext4_bcache_init_dynamic(struct ext4_bcache *bc, uint32_t cnt,
 			     uint32_t itemsize)
 {
@@ -183,6 +191,8 @@ ext4_buf_alloc(struct ext4_bcache *bc, uint64_t lba)
 	buf->lba = lba;
 	buf->data = data;
 	buf->bc = bc;
+	buf->generation = 0;
+	buf->detached = false;
 	ext4_bcache_set_state(buf, BC_STATE_EMPTY);
 	return buf;
 }
@@ -306,6 +316,7 @@ static void ext4_bcache_drop_buf_locked(struct ext4_bcache *bc,
 					struct ext4_buf *buf)
 {
 	ext4_assert(ext4_bcache_ref_count(buf) == 0);
+	ext4_assert(!buf->detached);
 	RB_REMOVE(ext4_buf_lru, &bc->lru_root, buf);
 
 	RB_REMOVE(ext4_buf_lba, &bc->lba_root, buf);
@@ -386,6 +397,27 @@ ext4_bcache_find_get_locked(struct ext4_bcache *bc, struct ext4_block *b,
 	ext4_bcache_index_lock(bc);
 	buf = ext4_buf_lookup(bc, lba);
 	if (buf) {
+		uint64_t generation = ext4_bcache_generation(bc);
+		if (buf->generation != generation) {
+			if (ext4_bcache_ref_count(buf)) {
+				/* Keep the old payload immutable for existing readers,
+				 * but detach it so the new generation allocates a
+				 * different buffer. */
+				ext4_assert(!ext4_bcache_test_flag(buf, BC_DIRTY));
+				RB_REMOVE(ext4_buf_lba, &bc->lba_root, buf);
+				buf->detached = true;
+				buf = NULL;
+			} else {
+				/* With no owner, the allocation can be refilled in place
+				 * after the normal LRU-to-referenced transition below. */
+				if (ext4_bcache_test_flag(buf, BC_DIRTY))
+					ext4_bcache_remove_dirty_node(bc, buf);
+				ext4_bcache_clear_dirty(buf);
+				buf->generation = generation;
+			}
+		}
+	}
+	if (buf) {
 		/* If buffer is not referenced. */
 		if (!ext4_bcache_ref_count(buf)) {
 			/* Assign new value to LRU id and increment LRU counter
@@ -420,6 +452,38 @@ ext4_bcache_find_get(struct ext4_bcache *bc, struct ext4_block *b,
 	return buf;
 }
 
+struct ext4_buf *
+ext4_bcache_find_get_uptodate(struct ext4_bcache *bc, struct ext4_block *b,
+			      uint64_t lba)
+{
+	if (!bc->concurrent)
+		return ext4_bcache_find_get_legacy(bc, b, lba);
+
+	struct ext4_buf *buf;
+	ext4_bcache_index_lock(bc);
+	buf = ext4_buf_lookup(bc, lba);
+	if (!buf || buf->detached ||
+	    buf->generation != ext4_bcache_generation(bc) ||
+	    ext4_bcache_get_state(buf) != BC_STATE_UPTODATE ||
+	    !ext4_bcache_test_flag(buf, BC_UPTODATE) ||
+	    ext4_bcache_test_flag(buf, BC_DIRTY) ||
+	    ext4_bcache_test_flag(buf, BC_FLUSH) ||
+	    ext4_bcache_test_flag(buf, BC_TMP) || buf->end_write) {
+		buf = NULL;
+	} else {
+		if (!ext4_bcache_ref_count(buf)) {
+			buf->lru_id = ++bc->lru_ctr;
+			RB_REMOVE(ext4_buf_lru, &bc->lru_root, buf);
+		}
+		ext4_bcache_inc_ref(buf);
+		b->lb_id = lba;
+		b->buf = buf;
+		b->data = buf->data;
+	}
+	ext4_bcache_index_unlock(bc);
+	return buf;
+}
+
 int ext4_bcache_alloc_locked(struct ext4_bcache *bc, struct ext4_block *b,
 			     bool *is_new)
 {
@@ -439,6 +503,7 @@ int ext4_bcache_alloc_locked(struct ext4_bcache *bc, struct ext4_block *b,
 
 	ext4_bcache_index_lock(bc);
 	ext4_assert(!ext4_buf_lookup(bc, b->lb_id));
+	buf->generation = ext4_bcache_generation(bc);
 	RB_INSERT(ext4_buf_lba, &bc->lba_root, buf);
 	/* One more buffer in bcache now. :-) */
 	bc->ref_blocks++;
@@ -504,6 +569,39 @@ int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b)
 	/*Block should have a valid pointer to ext4_buf.*/
 	ext4_assert(buf);
 
+	/* Immutable cache hits need only serialize the refcount/LRU transition.
+	 * The LBA sleeping lock is reserved for loading, invalidation, dirty
+	 * writeback and buffer-state publication. Detached buffers are no longer
+	 * discoverable, so their last immutable reference may retire them here. */
+	bool clean_fast = false;
+	bool detached_drop = false;
+	ext4_bcache_index_lock(bc);
+	if (ext4_bcache_get_state(buf) == BC_STATE_UPTODATE &&
+	    ext4_bcache_test_flag(buf, BC_UPTODATE) &&
+	    !ext4_bcache_test_flag(buf, BC_DIRTY) &&
+	    !ext4_bcache_test_flag(buf, BC_FLUSH) &&
+	    !ext4_bcache_test_flag(buf, BC_TMP) && !buf->end_write) {
+		ext4_assert(ext4_bcache_ref_count(buf));
+		if (!ext4_bcache_dec_ref(buf)) {
+			if (buf->detached) {
+				bc->ref_blocks--;
+				detached_drop = true;
+			} else {
+				ext4_bcache_zero_ref_locked(bc, buf);
+			}
+		}
+		clean_fast = true;
+	}
+	ext4_bcache_index_unlock(bc);
+	if (clean_fast) {
+		if (detached_drop)
+			ext4_buf_free(buf);
+		b->lb_id = 0;
+		b->buf = 0;
+		b->data = 0;
+		return EOK;
+	}
+
 	ext4_bcache_lba_lock(bc, lba);
 	ext4_bcache_index_lock(bc);
 	/*Check if someone don't try free unreferenced block cache.*/
@@ -511,7 +609,11 @@ int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b)
 
 	/*Just decrease reference counter*/
 	if (!ext4_bcache_dec_ref(buf)) {
-		if (ext4_bcache_test_flag(buf, BC_DIRTY) &&
+		if (buf->detached) {
+			ext4_assert(!ext4_bcache_test_flag(buf, BC_DIRTY));
+			bc->ref_blocks--;
+			drop = true;
+		} else if (ext4_bcache_test_flag(buf, BC_DIRTY) &&
 		    ext4_bcache_test_flag(buf, BC_UPTODATE) &&
 		    (!bc->bdev->cache_write_back ||
 		     ext4_bcache_test_flag(buf, BC_FLUSH) ||

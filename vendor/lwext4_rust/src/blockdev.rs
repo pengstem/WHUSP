@@ -17,6 +17,13 @@ pub trait BlockDevice: Send + Sync {
         false
     }
 
+    /// Returns the current immutable read-cache generation. Only concurrent
+    /// read-only cores consume this value; writable serialized cores leave it
+    /// at zero.
+    fn bcache_generation(&self) -> u64 {
+        0
+    }
+
     /// Writes blocks to the device, starting from the given block ID.
     fn write_blocks(&self, block_id: u64, buf: &[u8]) -> Ext4Result<usize>;
 
@@ -80,6 +87,7 @@ impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
             bcache_index_unlock: concurrent_bcache.then_some(Self::dev_bcache_index_unlock),
             bcache_lba_lock: concurrent_bcache.then_some(Self::dev_bcache_lba_lock),
             bcache_lba_unlock: concurrent_bcache.then_some(Self::dev_bcache_lba_unlock),
+            bcache_generation: concurrent_bcache.then_some(Self::dev_bcache_generation),
             ph_bsize: EXT4_DEV_BSIZE as u32,
             ph_bcnt: 0,
             ph_bbuf: block_buf.as_mut_ptr(),
@@ -218,6 +226,11 @@ impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
         unsafe { dev.unlock_bcache_lba(lba) };
         EOK as _
     }
+
+    unsafe extern "C" fn dev_bcache_generation(bdev: *mut ext4_blockdev) -> u64 {
+        let (_, dev) = unsafe { Self::iface_and_dev(bdev) };
+        dev.bcache_generation()
+    }
 }
 
 impl<Dev: BlockDevice> Drop for Ext4BlockDevice<Dev> {
@@ -281,6 +294,7 @@ mod tests {
         active_reads: AtomicUsize,
         active_read_hwm: AtomicUsize,
         fail_next_read: AtomicBool,
+        cache_generation: AtomicUsize,
     }
 
     impl TestShared {
@@ -298,6 +312,7 @@ mod tests {
                 active_reads: AtomicUsize::new(0),
                 active_read_hwm: AtomicUsize::new(0),
                 fail_next_read: AtomicBool::new(false),
+                cache_generation: AtomicUsize::new(1),
             }
         }
 
@@ -313,6 +328,10 @@ mod tests {
     impl BlockDevice for TestDevice {
         fn concurrent_bcache(&self) -> bool {
             true
+        }
+
+        fn bcache_generation(&self) -> u64 {
+            self.shared.cache_generation.load(Ordering::Acquire) as u64
         }
 
         fn write_blocks(&self, block_id: u64, buf: &[u8]) -> Ext4Result<usize> {
@@ -478,6 +497,36 @@ mod tests {
                 assert_eq!(ext4_block_set(bdev.inner.as_mut(), &mut block), EOK as i32);
                 assert!((*bdev.inner.as_mut().bc).ref_blocks <= 2);
             }
+            finish_bcache(&mut bdev);
+        }
+    }
+
+    #[test]
+    fn generation_change_retires_a_referenced_payload() {
+        let (mut bdev, shared) = test_bcache(4);
+        unsafe {
+            let mut old: ext4_block = mem::zeroed();
+            assert_eq!(ext4_block_get(bdev.inner.as_mut(), &mut old, 9), EOK as i32);
+            assert_eq!(*old.data, 9);
+
+            let start = 9 * EXT4_DEV_BSIZE;
+            shared.storage.lock().unwrap()[start..start + EXT4_DEV_BSIZE].fill(0xa9);
+            shared.cache_generation.fetch_add(1, Ordering::AcqRel);
+
+            let mut current: ext4_block = mem::zeroed();
+            assert_eq!(
+                ext4_block_get(bdev.inner.as_mut(), &mut current, 9),
+                EOK as i32
+            );
+            assert_ne!(old.buf, current.buf);
+            assert_eq!(*old.data, 9, "old reader payload was overwritten");
+            assert_eq!(*current.data, 0xa9);
+            assert_eq!(
+                ext4_block_set(bdev.inner.as_mut(), &mut current),
+                EOK as i32
+            );
+            assert_eq!(ext4_block_set(bdev.inner.as_mut(), &mut old), EOK as i32);
+            assert!((*bdev.inner.as_mut().bc).ref_blocks <= 4);
             finish_bcache(&mut bdev);
         }
     }

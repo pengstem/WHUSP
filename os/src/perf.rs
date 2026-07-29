@@ -337,6 +337,10 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) mount_fast_stat_flags_calls: usize,
     pub(crate) mount_fast_fs_type_calls: usize,
     pub(crate) mount_backend_contended_acquisitions: usize,
+    pub(crate) ext4_bcache_index_lock_calls: usize,
+    pub(crate) ext4_bcache_index_lock_contended: usize,
+    pub(crate) ext4_bcache_lba_lock_calls: usize,
+    pub(crate) ext4_bcache_lba_lock_contended: usize,
     pub(crate) ext4_block_read_calls: usize,
     pub(crate) ext4_block_read_blocks: usize,
     pub(crate) ext4_block_read_bytes: usize,
@@ -705,6 +709,10 @@ mod enabled {
     static MOUNT_FAST_STAT_FLAGS_CALLS: AtomicUsize = AtomicUsize::new(0);
     static MOUNT_FAST_FS_TYPE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static MOUNT_BACKEND_CONTENDED_ACQUISITIONS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_BCACHE_INDEX_LOCK_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_BCACHE_INDEX_LOCK_CONTENDED: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_BCACHE_LBA_LOCK_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_BCACHE_LBA_LOCK_CONTENDED: AtomicUsize = AtomicUsize::new(0);
     static EXT4_BLOCK_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EXT4_BLOCK_READ_BLOCKS: AtomicUsize = AtomicUsize::new(0);
     static EXT4_BLOCK_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -1904,6 +1912,20 @@ mod enabled {
         MOUNT_BACKEND_CONTENDED_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_ext4_bcache_index_lock(contended: bool) {
+        EXT4_BCACHE_INDEX_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
+        if contended {
+            EXT4_BCACHE_INDEX_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_ext4_bcache_lba_lock(contended: bool) {
+        EXT4_BCACHE_LBA_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
+        if contended {
+            EXT4_BCACHE_LBA_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn record_ext4_block_read(blocks: usize, bytes: usize) {
         EXT4_BLOCK_READ_CALLS.fetch_add(1, Ordering::Relaxed);
         EXT4_BLOCK_READ_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
@@ -2619,6 +2641,11 @@ mod enabled {
             mount_fast_fs_type_calls: MOUNT_FAST_FS_TYPE_CALLS.load(Ordering::Relaxed),
             mount_backend_contended_acquisitions: MOUNT_BACKEND_CONTENDED_ACQUISITIONS
                 .load(Ordering::Relaxed),
+            ext4_bcache_index_lock_calls: EXT4_BCACHE_INDEX_LOCK_CALLS.load(Ordering::Relaxed),
+            ext4_bcache_index_lock_contended: EXT4_BCACHE_INDEX_LOCK_CONTENDED
+                .load(Ordering::Relaxed),
+            ext4_bcache_lba_lock_calls: EXT4_BCACHE_LBA_LOCK_CALLS.load(Ordering::Relaxed),
+            ext4_bcache_lba_lock_contended: EXT4_BCACHE_LBA_LOCK_CONTENDED.load(Ordering::Relaxed),
             ext4_block_read_calls: EXT4_BLOCK_READ_CALLS.load(Ordering::Relaxed),
             ext4_block_read_blocks: EXT4_BLOCK_READ_BLOCKS.load(Ordering::Relaxed),
             ext4_block_read_bytes: EXT4_BLOCK_READ_BYTES.load(Ordering::Relaxed),
@@ -3011,6 +3038,10 @@ mod enabled {
          mount_fast_stat_flags_calls {}\n\
          mount_fast_fs_type_calls {}\n\
          mount_backend_contended_acquisitions {}\n\
+         ext4_bcache_index_lock_calls {}\n\
+         ext4_bcache_index_lock_contended {}\n\
+         ext4_bcache_lba_lock_calls {}\n\
+         ext4_bcache_lba_lock_contended {}\n\
          ext4_block_read_calls {}\n\
          ext4_block_read_blocks {}\n\
          ext4_block_read_bytes {}\n\
@@ -3364,6 +3395,10 @@ mod enabled {
             stats.mount_fast_stat_flags_calls,
             stats.mount_fast_fs_type_calls,
             stats.mount_backend_contended_acquisitions,
+            stats.ext4_bcache_index_lock_calls,
+            stats.ext4_bcache_index_lock_contended,
+            stats.ext4_bcache_lba_lock_calls,
+            stats.ext4_bcache_lba_lock_contended,
             stats.ext4_block_read_calls,
             stats.ext4_block_read_blocks,
             stats.ext4_block_read_bytes,
@@ -3904,6 +3939,14 @@ mod disabled {
     #[inline(always)]
     #[allow(dead_code)]
     pub(crate) fn record_mount_backend_contended_acquisition() {}
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn record_ext4_bcache_index_lock(_contended: bool) {}
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn record_ext4_bcache_lba_lock(_contended: bool) {}
 
     #[inline(always)]
     pub(crate) fn record_ext4_block_read(_blocks: usize, _bytes: usize) {}
