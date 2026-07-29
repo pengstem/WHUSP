@@ -393,6 +393,7 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) ext4_metadata_tx_write_lbas: usize,
     pub(crate) ext4_metadata_tx_device_write_calls: usize,
     pub(crate) ext4_metadata_tx_device_write_blocks: usize,
+    pub(crate) ext4_metadata_tx_merge_observed: usize,
     pub(crate) ext4_metadata_tx_active: usize,
     pub(crate) ext4_metadata_tx_active_high_watermark: usize,
     pub(crate) eventfd_read_calls: usize,
@@ -765,6 +766,10 @@ mod enabled {
     static EXT4_METADATA_TX_WRITE_LBAS: AtomicUsize = AtomicUsize::new(0);
     static EXT4_METADATA_TX_DEVICE_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EXT4_METADATA_TX_DEVICE_WRITE_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+    // This is deliberately an observation bit, not a hot-path event count.
+    // The first successful merge publishes 0 -> 1; later merges only read the
+    // already-shared cache line and cannot create cross-CPU write ping-pong.
+    static EXT4_METADATA_TX_MERGE_OBSERVED: AtomicUsize = AtomicUsize::new(0);
     static EXT4_METADATA_TX_ACTIVE: AtomicUsize = AtomicUsize::new(0);
     static EXT4_METADATA_TX_ACTIVE_HIGH_WATERMARK: AtomicUsize = AtomicUsize::new(0);
     static EVENTFD_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -2063,12 +2068,21 @@ mod enabled {
         write_lbas: usize,
         device_write_calls: usize,
         device_write_blocks: usize,
+        merged_lbas: usize,
     ) {
         EXT4_METADATA_TX_COMMITS.fetch_add(1, Ordering::Relaxed);
         EXT4_METADATA_TX_READ_LBAS.fetch_add(read_lbas, Ordering::Relaxed);
         EXT4_METADATA_TX_WRITE_LBAS.fetch_add(write_lbas, Ordering::Relaxed);
         EXT4_METADATA_TX_DEVICE_WRITE_CALLS.fetch_add(device_write_calls, Ordering::Relaxed);
         EXT4_METADATA_TX_DEVICE_WRITE_BLOCKS.fetch_add(device_write_blocks, Ordering::Relaxed);
+        if merged_lbas != 0 && EXT4_METADATA_TX_MERGE_OBSERVED.load(Ordering::Relaxed) == 0 {
+            let _ = EXT4_METADATA_TX_MERGE_OBSERVED.compare_exchange(
+                0,
+                1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
     }
 
     pub(crate) fn record_eventfd_read_call() {
@@ -2712,6 +2726,8 @@ mod enabled {
                 .load(Ordering::Relaxed),
             ext4_metadata_tx_device_write_blocks: EXT4_METADATA_TX_DEVICE_WRITE_BLOCKS
                 .load(Ordering::Relaxed),
+            ext4_metadata_tx_merge_observed: EXT4_METADATA_TX_MERGE_OBSERVED
+                .load(Ordering::Relaxed),
             ext4_metadata_tx_active: EXT4_METADATA_TX_ACTIVE.load(Ordering::Relaxed),
             ext4_metadata_tx_active_high_watermark: EXT4_METADATA_TX_ACTIVE_HIGH_WATERMARK
                 .load(Ordering::Relaxed),
@@ -3094,6 +3110,7 @@ mod enabled {
          ext4_metadata_tx_write_lbas {}\n\
          ext4_metadata_tx_device_write_calls {}\n\
          ext4_metadata_tx_device_write_blocks {}\n\
+         ext4_metadata_tx_merge_observed {}\n\
          ext4_metadata_tx_active {}\n\
          ext4_metadata_tx_active_high_watermark {}\n\
          eventfd_read_calls {}\n\
@@ -3451,6 +3468,7 @@ mod enabled {
             stats.ext4_metadata_tx_write_lbas,
             stats.ext4_metadata_tx_device_write_calls,
             stats.ext4_metadata_tx_device_write_blocks,
+            stats.ext4_metadata_tx_merge_observed,
             stats.ext4_metadata_tx_active,
             stats.ext4_metadata_tx_active_high_watermark,
             stats.eventfd_read_calls,
@@ -4042,6 +4060,7 @@ mod disabled {
         _write_lbas: usize,
         _device_write_calls: usize,
         _device_write_blocks: usize,
+        _merged_lbas: usize,
     ) {
     }
 

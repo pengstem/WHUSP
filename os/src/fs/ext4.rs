@@ -34,7 +34,7 @@ use lwext4_rust::{
     BlockDevice as Ext4BlockDevice, EXT4_DEV_BSIZE,
     Ext4DirectoryReadPlan as LwExt4DirectoryReadPlan, Ext4Error, Ext4Filesystem,
     Ext4MappedReadPlan, Ext4MappedWritePlan, Ext4Result, Ext4SymlinkReadPlan, FsConfig, InodeType,
-    SystemHal,
+    SectorDeltaMerge, SystemHal, merge_sector_delta,
 };
 
 pub(super) struct KernelHal;
@@ -318,11 +318,16 @@ impl Ext4BlockVersions {
         self.state.lock().versions.get(&block).copied().unwrap_or(0)
     }
 
-    fn matches(&self, expected: &BTreeMap<u64, usize>) -> bool {
+    fn matches_read_only(
+        &self,
+        reads: &BTreeMap<u64, Ext4TransactionRead>,
+        writes: &BTreeMap<u64, Box<[u8; EXT4_DEV_BSIZE]>>,
+    ) -> bool {
         let state = self.state.lock();
-        expected
+        reads
             .iter()
-            .all(|(block, version)| state.versions.get(block).copied().unwrap_or(0) == *version)
+            .filter(|(block, _)| !writes.contains_key(block))
+            .all(|(block, read)| state.versions.get(block).copied().unwrap_or(0) == read.version)
     }
 
     fn bump_range(&self, first: u64, count: usize) {
@@ -441,8 +446,13 @@ impl Ext4BlockDevice for KernelDisk {
 #[derive(Default)]
 struct Ext4TransactionState {
     active: bool,
-    reads: BTreeMap<u64, usize>,
+    reads: BTreeMap<u64, Ext4TransactionRead>,
     writes: BTreeMap<u64, Box<[u8; EXT4_DEV_BSIZE]>>,
+}
+
+struct Ext4TransactionRead {
+    version: usize,
+    data: [u8; EXT4_DEV_BSIZE],
 }
 
 impl Ext4TransactionState {
@@ -470,7 +480,7 @@ impl Ext4TransactionState {
 }
 
 struct Ext4MetadataTransaction {
-    reads: BTreeMap<u64, usize>,
+    reads: BTreeMap<u64, Ext4TransactionRead>,
     writes: BTreeMap<u64, Box<[u8; EXT4_DEV_BSIZE]>>,
 }
 
@@ -534,7 +544,11 @@ impl Ext4BlockDevice for Ext4TransactionDisk {
             });
             let mut state = self.state.lock();
             assert!(state.active, "ext4 transaction stopped during read");
-            state.reads.entry(physical).or_insert(version);
+            state.reads.entry(physical).or_insert_with(|| {
+                let mut data = [0u8; EXT4_DEV_BSIZE];
+                data.copy_from_slice(target);
+                Ext4TransactionRead { version, data }
+            });
             drop(state);
             #[cfg(feature = "perf-counters")]
             self.io_counters.record_read(1, EXT4_DEV_BSIZE);
@@ -1277,7 +1291,7 @@ pub(super) struct ConcurrentExt4Backend {
     write_sequence: Arc<Ext4Sequence>,
     physical_leases: Arc<Ext4PhysicalLeaseTable>,
     block_versions: Arc<Ext4BlockVersions>,
-    legacy_core_gate: SleepRwLock<()>,
+    legacy_publication_gate: SleepRwLock<()>,
 }
 
 impl ConcurrentExt4Backend {
@@ -1308,7 +1322,7 @@ impl ConcurrentExt4Backend {
             write_sequence,
             physical_leases,
             block_versions,
-            legacy_core_gate: SleepRwLock::new(()),
+            legacy_publication_gate: SleepRwLock::new(()),
         })
     }
 
@@ -1430,11 +1444,63 @@ impl ConcurrentExt4Backend {
         (calls, blocks)
     }
 
+    /// Rebase a private metadata transaction onto the latest physical sector
+    /// images while the transaction owns every LBA in its read/write set.
+    /// Disjoint inode-table byte updates can merge; a third value in a byte
+    /// changed by this transaction is a real conflict and forces a retry.
+    fn prepare_metadata_write_set(
+        &self,
+        transaction: Ext4MetadataTransaction,
+    ) -> Result<
+        (
+            BTreeMap<u64, Box<[u8; EXT4_DEV_BSIZE]>>,
+            usize,
+            usize,
+            usize,
+        ),
+        (),
+    > {
+        let Ext4MetadataTransaction { reads, writes } = transaction;
+        if !self.block_versions.matches_read_only(&reads, &writes) {
+            return Err(());
+        }
+
+        let read_lbas = reads.len();
+        let mut prepared = BTreeMap::new();
+        let mut merged_lbas = 0usize;
+        let mut reread_lbas = 0usize;
+        for (block, desired) in writes {
+            let read = reads.get(&block).ok_or(())?;
+            if self.block_versions.snapshot(block) == read.version {
+                prepared.insert(block, desired);
+                continue;
+            }
+
+            let mut current = Box::new([0u8; EXT4_DEV_BSIZE]);
+            self.write_sequence.read_stable(|| {
+                self.device
+                    .read_blocks(block as usize, current.as_mut_slice());
+            });
+            reread_lbas += 1;
+            perf::record_ext4_block_read(1, EXT4_DEV_BSIZE);
+            match merge_sector_delta(
+                read.data.as_slice(),
+                desired.as_slice(),
+                current.as_mut_slice(),
+            ) {
+                Ok(SectorDeltaMerge::Exact) => {}
+                Ok(SectorDeltaMerge::Merged) => merged_lbas += 1,
+                Err(()) => return Err(()),
+            }
+            prepared.insert(block, current);
+        }
+        Ok((prepared, read_lbas, merged_lbas, reread_lbas))
+    }
+
     fn mutate_inode_metadata(&self, ino: u32, mutation: Ext4InodeMetadataMutation) -> FsResult {
         let op = BackendOp::NamespaceMutation;
         #[cfg(feature = "perf-counters")]
         perf::record_backend_op_call(op);
-        let _legacy_exclusion = self.legacy_core_gate.read();
         loop {
             perf::record_ext4_metadata_transaction_attempt();
             let mut worker_slot = self.lock_metadata_worker(op);
@@ -1498,15 +1564,26 @@ impl ConcurrentExt4Backend {
                 .chain(transaction.writes.keys())
                 .copied()
                 .collect::<BTreeSet<_>>();
+            // Capture is private and can overlap the legacy C core. Publication
+            // still excludes that core so it cannot later flush a stale clean
+            // alias over this commit. Checkpoint 9 removes this final boundary
+            // after legacy metadata ownership moves into the journal layer.
+            let _legacy_publication = self.legacy_publication_gate.read();
             let _physical = self.physical_leases.reserve_wait(touched);
-            if !self.block_versions.matches(&transaction.reads) {
-                perf::record_ext4_metadata_transaction_retry();
-                continue;
-            }
+            let (prepared_writes, read_lbas, merged_lbas, reread_lbas) =
+                match self.prepare_metadata_write_set(transaction) {
+                    Ok(prepared) => prepared,
+                    Err(()) => {
+                        perf::record_ext4_metadata_transaction_retry();
+                        continue;
+                    }
+                };
+            #[cfg(not(feature = "perf-counters"))]
+            let _ = reread_lbas;
 
             let generation_write = self.cache_generation.begin_write();
             let write = self.write_sequence.begin_write();
-            let (write_calls, write_blocks) = self.commit_metadata_write_set(&transaction.writes);
+            let (write_calls, write_blocks) = self.commit_metadata_write_set(&prepared_writes);
             if write_blocks != 0 {
                 self.cache_epoch.advance();
             }
@@ -1514,19 +1591,20 @@ impl ConcurrentExt4Backend {
             perf::record_backend_op_io(
                 op,
                 BackendIoSnapshot {
-                    read_calls: 0,
-                    read_blocks: 0,
-                    read_bytes: 0,
+                    read_calls: reread_lbas,
+                    read_blocks: reread_lbas,
+                    read_bytes: reread_lbas * EXT4_DEV_BSIZE,
                     write_calls,
                     write_blocks,
                     write_bytes: write_blocks * EXT4_DEV_BSIZE,
                 },
             );
             perf::record_ext4_metadata_transaction_commit(
-                transaction.reads.len(),
-                transaction.writes.len(),
+                read_lbas,
+                prepared_writes.len(),
                 write_calls,
                 write_blocks,
+                merged_lbas,
             );
             drop(write);
             drop(generation_write);
@@ -1538,7 +1616,7 @@ impl ConcurrentExt4Backend {
         let _ = op;
         #[cfg(feature = "perf-counters")]
         perf::record_backend_op_call(op);
-        let _legacy_exclusion = self.legacy_core_gate.write();
+        let _legacy_exclusion = self.legacy_publication_gate.write();
         let mut writer = Self::lock_core(&self.writer, op);
         let generation = self.cache_generation.stable_value();
         if writer.cache_generation != generation {
@@ -1568,7 +1646,7 @@ impl ConcurrentExt4Backend {
         // The writer core serializes lwext4 transactions. Per-object VFS
         // leases protect conflicting operations. The odd generation prevents
         // a replica from publishing a result assembled across this transaction.
-        let _legacy_exclusion = self.legacy_core_gate.write();
+        let _legacy_exclusion = self.legacy_publication_gate.write();
         let mut writer = Self::lock_core(&self.writer, op);
         let generation = self.cache_generation.stable_value();
         if writer.cache_generation != generation {
@@ -1612,7 +1690,7 @@ impl ConcurrentExt4Backend {
         f: impl FnOnce(&mut Ext4Mount) -> FsResult<T>,
     ) -> Option<FsResult<T>> {
         let _ = op;
-        let _legacy_exclusion = self.legacy_core_gate.try_write()?;
+        let _legacy_exclusion = self.legacy_publication_gate.try_write()?;
         let mut writer = self.writer.try_lock()?;
         let generation = self.cache_generation.stable_value();
         if writer.cache_generation != generation {

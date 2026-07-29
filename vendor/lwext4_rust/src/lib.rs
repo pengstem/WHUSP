@@ -22,9 +22,11 @@ mod blockdev;
 mod error;
 mod fs;
 mod inode;
+mod sector_delta;
 mod util;
 
 pub use blockdev::{BlockDevice, EXT4_DEV_BSIZE};
 pub use error::{Ext4Error, Ext4Result};
 pub use fs::*;
 pub use inode::*;
+pub use sector_delta::{SectorDeltaMerge, merge_sector_delta};
