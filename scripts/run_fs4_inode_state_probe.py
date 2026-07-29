@@ -28,6 +28,7 @@ CASES = (
     "partial_read_plan",
     "mapped_overwrite_plan",
     "independent_mapped_overwrite",
+    "independent_create",
     "independent_inode_metadata",
     "readlink_plan",
     "readlink_vs_unlink",
@@ -43,6 +44,12 @@ MAPPED_WRITE_CELL_RE = re.compile(
 )
 INODE_METADATA_CELL_RE = re.compile(
     r"FS5_INODE_METADATA_CELL workers=(?P<workers>[0-9]+) "
+    r"iterations=(?P<iterations>[0-9]+) operations=(?P<operations>[0-9]+) "
+    r"elapsed_ns=(?P<elapsed_ns>[0-9]+) "
+    r"throughput_ops_per_s=(?P<throughput>[0-9]+) errors=(?P<errors>[0-9]+)"
+)
+CREATE_CELL_RE = re.compile(
+    r"FS5_CREATE_CELL workers=(?P<workers>[0-9]+) "
     r"iterations=(?P<iterations>[0-9]+) operations=(?P<operations>[0-9]+) "
     r"elapsed_ns=(?P<elapsed_ns>[0-9]+) "
     r"throughput_ops_per_s=(?P<throughput>[0-9]+) errors=(?P<errors>[0-9]+)"
@@ -187,6 +194,16 @@ def validate(log: str, args: argparse.Namespace, overlay_root: Path) -> dict[str
         int(cell["errors"]) != 0 for cell in metadata_cells
     ):
         errors.append(f"inode-metadata cell matrix mismatch: {metadata_cells}")
+    create_cells = [
+        match.groupdict()
+        for line in lines
+        if (match := CREATE_CELL_RE.fullmatch(line))
+    ]
+    create_workers = {int(cell["workers"]) for cell in create_cells}
+    if create_workers != {1, 2, 4, 8} or any(
+        int(cell["errors"]) != 0 for cell in create_cells
+    ):
+        errors.append(f"create cell matrix mismatch: {create_cells}")
     if bench.PANIC_RE.search(log):
         errors.append("kernel panic signature present")
     policies = list(bench.BLOCK_IO_POLICY_RE.finditer(log))
@@ -254,6 +271,7 @@ def validate(log: str, args: argparse.Namespace, overlay_root: Path) -> dict[str
         "cases": sorted(seen),
         "mapped_write_cells": cells,
         "inode_metadata_cells": metadata_cells,
+        "create_cells": create_cells,
         "perf_before": before,
         "perf_after": after,
         "perf_delta": perf_delta,

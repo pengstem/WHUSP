@@ -17,9 +17,18 @@ pub trait BlockDevice: Send + Sync {
         false
     }
 
-    /// Returns the current immutable read-cache generation. Only concurrent
-    /// read-only cores consume this value; writable serialized cores leave it
-    /// at zero.
+    /// Whether concurrent cache buffers are immutable replicas that must be
+    /// retired when the backing-device generation changes.
+    ///
+    /// Writable cores must leave this disabled: their own writeback advances
+    /// the device generation while other dirty buffers still belong to the
+    /// same cache.
+    fn versioned_bcache(&self) -> bool {
+        false
+    }
+
+    /// Returns the current immutable read-cache generation. Only devices with
+    /// `versioned_bcache()` enabled consume this value.
     fn bcache_generation(&self) -> u64 {
         0
     }
@@ -90,10 +99,20 @@ pub struct Ext4BlockDevice<Dev: BlockDevice> {
 }
 
 impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
+    #[inline]
+    pub(crate) fn inner_ptr(&self) -> *mut ext4_blockdev {
+        self.inner.as_ref() as *const ext4_blockdev as *mut ext4_blockdev
+    }
+
     pub fn new(dev: Dev) -> Ext4Result<Self> {
         let mut dev = Box::new(dev);
         let concurrent_bcache = dev.concurrent_bcache();
+        let versioned_bcache = dev.versioned_bcache();
         let concurrent_metadata = dev.concurrent_metadata();
+        assert!(
+            !versioned_bcache || concurrent_bcache,
+            "versioned lwext4 bcache requires concurrent ownership callbacks"
+        );
 
         // Block size buffer
         let mut block_buf = Box::new([0u8; EXT4_DEV_BSIZE]);
@@ -108,7 +127,7 @@ impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
             bcache_index_unlock: concurrent_bcache.then_some(Self::dev_bcache_index_unlock),
             bcache_lba_lock: concurrent_bcache.then_some(Self::dev_bcache_lba_lock),
             bcache_lba_unlock: concurrent_bcache.then_some(Self::dev_bcache_lba_unlock),
-            bcache_generation: concurrent_bcache.then_some(Self::dev_bcache_generation),
+            bcache_generation: versioned_bcache.then_some(Self::dev_bcache_generation),
             metadata_group_lock: concurrent_metadata.then_some(Self::dev_metadata_group_lock),
             metadata_group_unlock: concurrent_metadata.then_some(Self::dev_metadata_group_unlock),
             metadata_global_lock: concurrent_metadata.then_some(Self::dev_metadata_global_lock),
@@ -307,12 +326,14 @@ mod tests {
 
     struct TestRawLock {
         held: AtomicBool,
+        owner: Mutex<Option<thread::ThreadId>>,
     }
 
     impl TestRawLock {
         fn new() -> Self {
             Self {
                 held: AtomicBool::new(false),
+                owner: Mutex::new(None),
             }
         }
 
@@ -324,9 +345,19 @@ mod tests {
             {
                 thread::yield_now();
             }
+            *self.owner.lock().unwrap() = Some(thread::current().id());
+        }
+
+        fn held_by_current(&self) -> bool {
+            self.owner
+                .lock()
+                .unwrap()
+                .is_some_and(|owner| owner == thread::current().id())
         }
 
         unsafe fn unlock(&self) {
+            let owner = self.owner.lock().unwrap().take();
+            assert_eq!(owner, Some(thread::current().id()));
             assert!(
                 self.held.swap(false, Ordering::Release),
                 "test cache lock released without ownership"
@@ -395,6 +426,10 @@ mod tests {
             true
         }
 
+        fn versioned_bcache(&self) -> bool {
+            true
+        }
+
         fn bcache_generation(&self) -> u64 {
             self.shared.cache_generation.load(Ordering::Acquire) as u64
         }
@@ -405,7 +440,7 @@ mod tests {
 
         fn write_blocks(&self, block_id: u64, buf: &[u8]) -> Ext4Result<usize> {
             assert!(
-                !self.shared.index.held.load(Ordering::Acquire),
+                !self.shared.index.held_by_current(),
                 "device write executed while the bcache index was locked"
             );
             self.shared.write_calls.fetch_add(1, Ordering::SeqCst);
@@ -416,7 +451,7 @@ mod tests {
 
         fn read_blocks(&self, block_id: u64, buf: &mut [u8]) -> Ext4Result<usize> {
             assert!(
-                !self.shared.index.held.load(Ordering::Acquire),
+                !self.shared.index.held_by_current(),
                 "device read executed while the bcache index was locked"
             );
             self.shared.read_calls.fetch_add(1, Ordering::SeqCst);

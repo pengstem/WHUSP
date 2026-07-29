@@ -2343,11 +2343,34 @@ fn open_vfs_file_impl(
             ensure_mount_writable(target.parent.mount_id)?;
             let parent_stat = stat_full_cached(target.parent)?;
             let supports_page_cache = mount_supports_page_cache(target.parent.mount_id);
+            let prepared_attrs = create_attrs.as_ref().map(|attrs| {
+                let gid = if parent_stat.mode & MODE_SETGID != 0 {
+                    parent_stat.gid
+                } else {
+                    attrs.gid
+                };
+                (
+                    attrs.uid,
+                    gid,
+                    prepare_created_file_mode(parent_stat, attrs),
+                )
+            });
             let ino = inode_state::with_directory_mutation(target.parent, || {
                 let ino = with_mount(
                     target.parent.mount_id,
                     BackendOp::NamespaceMutation,
-                    |mount| mount.create_file(target.parent.ino, target.leaf_name),
+                    |mount| match prepared_attrs {
+                        Some((uid, gid, mode)) => mount.create_node_with_owner(
+                            target.parent.ino,
+                            target.leaf_name,
+                            FsNodeKind::RegularFile,
+                            mode,
+                            0,
+                            uid,
+                            gid,
+                        ),
+                        None => mount.create_file(target.parent.ino, target.leaf_name),
+                    },
                 )
                 .ok_or(FsError::Io)??;
                 initialize_regular_file_page_cache_incarnation(
@@ -2357,29 +2380,6 @@ fn open_vfs_file_impl(
                 Ok(ino)
             })?;
             dentry_cache::invalidate_parent(target.parent);
-            if let Some(attrs) = create_attrs {
-                let gid = if parent_stat.mode & MODE_SETGID != 0 {
-                    parent_stat.gid
-                } else {
-                    attrs.gid
-                };
-                let mode = prepare_created_file_mode(parent_stat, &attrs);
-                let node = VfsNodeId::new(target.parent.mount_id, ino);
-                inode_state::with_metadata_mutation(node, || {
-                    with_mount(
-                        target.parent.mount_id,
-                        BackendOp::NamespaceMutation,
-                        |mount| mount.set_owner(ino, Some(attrs.uid), Some(gid)),
-                    )
-                    .ok_or(FsError::Io)??;
-                    with_mount(
-                        target.parent.mount_id,
-                        BackendOp::NamespaceMutation,
-                        |mount| mount.set_mode(ino, mode),
-                    )
-                    .ok_or(FsError::Io)?
-                })?;
-            }
             let (readable, writable) = flags.read_write();
             (
                 VfsPath::with_visible_path(
@@ -2422,6 +2422,18 @@ fn create_tmpfile_inode(
 
     let parent_stat = stat_full_cached(directory.node)?;
     let supports_page_cache = mount_supports_page_cache(directory.node.mount_id);
+    let prepared_attrs = create_attrs.as_ref().map(|attrs| {
+        let gid = if parent_stat.mode & MODE_SETGID != 0 {
+            parent_stat.gid
+        } else {
+            attrs.gid
+        };
+        (
+            attrs.uid,
+            gid,
+            prepare_created_file_mode(parent_stat, attrs),
+        )
+    });
     let (ino, leaf_name) = {
         let mut created = None;
         for _ in 0..TMPFILE_CREATE_ATTEMPTS {
@@ -2431,7 +2443,18 @@ fn create_tmpfile_inode(
                 let ino = with_mount(
                     directory.node.mount_id,
                     BackendOp::NamespaceMutation,
-                    |mount| mount.create_file(directory.node.ino, leaf_name.as_str()),
+                    |mount| match prepared_attrs {
+                        Some((uid, gid, mode)) => mount.create_node_with_owner(
+                            directory.node.ino,
+                            leaf_name.as_str(),
+                            FsNodeKind::RegularFile,
+                            mode,
+                            0,
+                            uid,
+                            gid,
+                        ),
+                        None => mount.create_file(directory.node.ino, leaf_name.as_str()),
+                    },
                 )
                 .ok_or(FsError::Io)??;
                 initialize_regular_file_page_cache_incarnation(
@@ -2452,30 +2475,6 @@ fn create_tmpfile_inode(
         }
         created.ok_or(FsError::AlreadyExists)?
     };
-
-    if let Some(attrs) = create_attrs {
-        let gid = if parent_stat.mode & MODE_SETGID != 0 {
-            parent_stat.gid
-        } else {
-            attrs.gid
-        };
-        let mode = prepare_created_file_mode(parent_stat, &attrs);
-        let node = VfsNodeId::new(directory.node.mount_id, ino);
-        inode_state::with_metadata_mutation(node, || {
-            with_mount(
-                directory.node.mount_id,
-                BackendOp::NamespaceMutation,
-                |mount| mount.set_owner(ino, Some(attrs.uid), Some(gid)),
-            )
-            .ok_or(FsError::Io)??;
-            with_mount(
-                directory.node.mount_id,
-                BackendOp::NamespaceMutation,
-                |mount| mount.set_mode(ino, mode),
-            )
-            .ok_or(FsError::Io)?
-        })?;
-    }
 
     let (readable, writable) = flags.read_write();
     let file = Arc::new(VfsFile::new(

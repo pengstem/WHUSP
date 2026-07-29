@@ -14,7 +14,8 @@ use crate::config::MAX_CPUS;
 use crate::drivers::block::VirtIOBlock;
 use crate::perf;
 use crate::sync::{
-    RawSleepLock, RawSpinNoIrqLock, SleepMutex, SleepMutexGuard, SleepRwLock, SpinNoIrqLock,
+    RawSleepLock, RawSpinNoIrqLock, SleepMutex, SleepMutexGuard, SleepRwLock, SleepRwLockReadGuard,
+    SleepRwLockWriteGuard, SpinNoIrqLock,
 };
 use crate::task::suspend_current_and_run_next;
 use alloc::boxed::Box;
@@ -22,6 +23,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
+use core::cell::UnsafeCell;
 use core::str;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
@@ -156,6 +158,7 @@ impl Ext4AllocatorLocks {
 pub(super) struct KernelDisk {
     dev: Arc<VirtIOBlock>,
     concurrent_bcache: bool,
+    versioned_bcache: bool,
     concurrent_metadata: bool,
     cache_epoch: Arc<Ext4CacheEpoch>,
     write_sequence: Arc<Ext4Sequence>,
@@ -413,6 +416,10 @@ impl Ext4IoCounters {
 impl Ext4BlockDevice for KernelDisk {
     fn concurrent_bcache(&self) -> bool {
         self.concurrent_bcache
+    }
+
+    fn versioned_bcache(&self) -> bool {
+        self.versioned_bcache
     }
 
     fn bcache_generation(&self) -> u64 {
@@ -689,7 +696,6 @@ pub(super) struct Ext4Mount {
     write_sequence: Arc<Ext4Sequence>,
     physical_leases: Arc<Ext4PhysicalLeaseTable>,
     block_versions: Arc<Ext4BlockVersions>,
-    cache_generation: usize,
     #[cfg(feature = "perf-counters")]
     io_counters: Arc<Ext4IoCounters>,
     inode_runtime: Arc<Ext4InodeRuntimeTable>,
@@ -994,7 +1000,8 @@ impl Ext4Mount {
             fs: KernelExt4Fs::new(
                 KernelDisk {
                     dev: device.clone(),
-                    concurrent_bcache: false,
+                    concurrent_bcache: true,
+                    versioned_bcache: false,
                     concurrent_metadata: true,
                     cache_epoch: cache_epoch.clone(),
                     write_sequence: write_sequence.clone(),
@@ -1012,7 +1019,6 @@ impl Ext4Mount {
             write_sequence,
             physical_leases,
             block_versions,
-            cache_generation: 0,
             #[cfg(feature = "perf-counters")]
             io_counters,
             inode_runtime,
@@ -1027,6 +1033,7 @@ impl Ext4Mount {
                 KernelDisk {
                     dev: self.device.clone(),
                     concurrent_bcache: true,
+                    versioned_bcache: true,
                     concurrent_metadata: false,
                     cache_epoch: self.cache_epoch.clone(),
                     write_sequence: self.write_sequence.clone(),
@@ -1044,7 +1051,6 @@ impl Ext4Mount {
             write_sequence: self.write_sequence.clone(),
             physical_leases: self.physical_leases.clone(),
             block_versions: self.block_versions.clone(),
-            cache_generation: self.cache_generation,
             #[cfg(feature = "perf-counters")]
             io_counters,
             inode_runtime: self.inode_runtime.clone(),
@@ -1329,11 +1335,47 @@ impl SharedExt4ReadCore {
     }
 }
 
-/// One legacy writable core, one lock-free-entry shared read-only core, and
-/// private mutation workers. Cache generations retire stale C buffers without
-/// a mount-wide reader lifecycle writer phase.
+/// One writable lwext4 core with a deliberately narrow shared-entry proof.
+///
+/// The containing `SleepRwLock` controls which accessor may be used. Shared
+/// guards are restricted to the audited create family; every legacy method,
+/// cache invalidation, flush, and shutdown requires an exclusive guard.
+struct SharedExt4WriteCore {
+    mount: UnsafeCell<Ext4Mount>,
+}
+
+// SAFETY: `shared()` is called only while the containing writer-core rwlock is
+// read-held and only for audited create methods. Their caller-local inode and
+// directory refs operate on VFS-leased objects; allocator and bcache shared
+// state use the C callbacks installed on the canonical writer. `exclusive()`
+// requires the rwlock write guard, excluding every shared call.
+unsafe impl Sync for SharedExt4WriteCore {}
+
+impl SharedExt4WriteCore {
+    fn new(mount: Ext4Mount) -> Self {
+        Self {
+            mount: UnsafeCell::new(mount),
+        }
+    }
+
+    fn shared(&self) -> &Ext4Mount {
+        // SAFETY: the wrapper's public protocol permits only audited shared
+        // create-family operations through this reference.
+        unsafe { &*self.mount.get() }
+    }
+
+    fn exclusive(&mut self) -> &mut Ext4Mount {
+        // SAFETY: callers can obtain `&mut self` only through the containing
+        // `SleepRwLock` write guard, which excludes every `shared()` caller.
+        unsafe { &mut *self.mount.get() }
+    }
+}
+
+/// One selectively shared writable core, one lock-free-entry shared read-only
+/// core, and private mutation workers. Cache generations retire stale reader
+/// buffers without a mount-wide reader lifecycle writer phase.
 pub(super) struct ConcurrentExt4Backend {
-    writer: SleepMutex<Ext4Mount>,
+    writer: SleepRwLock<SharedExt4WriteCore>,
     shared_reader: SharedExt4ReadCore,
     metadata_workers: Vec<SleepMutex<Option<Ext4MutationWorker>>>,
     inode_runtime: Arc<Ext4InodeRuntimeTable>,
@@ -1344,7 +1386,7 @@ pub(super) struct ConcurrentExt4Backend {
     write_sequence: Arc<Ext4Sequence>,
     physical_leases: Arc<Ext4PhysicalLeaseTable>,
     block_versions: Arc<Ext4BlockVersions>,
-    legacy_publication_gate: SleepRwLock<()>,
+    metadata_publication_gate: SleepRwLock<()>,
 }
 
 impl ConcurrentExt4Backend {
@@ -1364,7 +1406,7 @@ impl ConcurrentExt4Backend {
         let metadata_workers = (0..MAX_CPUS).map(|_| SleepMutex::new(None)).collect();
         let inode_runtime = writer.inode_runtime.clone();
         Ok(Self {
-            writer: SleepMutex::new(writer),
+            writer: SleepRwLock::new(SharedExt4WriteCore::new(writer)),
             shared_reader: SharedExt4ReadCore::new(shared_reader),
             metadata_workers,
             inode_runtime,
@@ -1375,7 +1417,7 @@ impl ConcurrentExt4Backend {
             write_sequence,
             physical_leases,
             block_versions,
-            legacy_publication_gate: SleepRwLock::new(()),
+            metadata_publication_gate: SleepRwLock::new(()),
         })
     }
 
@@ -1384,12 +1426,12 @@ impl ConcurrentExt4Backend {
         crate::cpu::current_id() % self.metadata_workers.len()
     }
 
-    fn lock_core<'a>(
-        core: &'a SleepMutex<Ext4Mount>,
+    fn lock_writer_exclusive(
+        &self,
         op: BackendOp,
-    ) -> SleepMutexGuard<'a, Ext4Mount> {
+    ) -> SleepRwLockWriteGuard<'_, SharedExt4WriteCore> {
         let _ = op;
-        match core.try_lock() {
+        match self.writer.try_write() {
             Some(core) => core,
             None => {
                 #[cfg(feature = "perf-counters")]
@@ -1400,7 +1442,29 @@ impl ConcurrentExt4Backend {
                 let wait_scope = perf::time_scope(perf::ProfilePoint::MountBackendContendedWait);
                 #[cfg(feature = "perf-counters")]
                 let op_wait_scope = perf::time_backend_op_wait(op);
-                let core = core.lock();
+                let core = self.writer.write();
+                #[cfg(feature = "perf-counters")]
+                drop(op_wait_scope);
+                drop(wait_scope);
+                core
+            }
+        }
+    }
+
+    fn lock_writer_shared(&self, op: BackendOp) -> SleepRwLockReadGuard<'_, SharedExt4WriteCore> {
+        let _ = op;
+        match self.writer.try_read() {
+            Some(core) => core,
+            None => {
+                #[cfg(feature = "perf-counters")]
+                {
+                    perf::record_mount_backend_contended_acquisition();
+                    perf::record_backend_op_contended(op);
+                }
+                let wait_scope = perf::time_scope(perf::ProfilePoint::MountBackendContendedWait);
+                #[cfg(feature = "perf-counters")]
+                let op_wait_scope = perf::time_backend_op_wait(op);
+                let core = self.writer.read();
                 #[cfg(feature = "perf-counters")]
                 drop(op_wait_scope);
                 drop(wait_scope);
@@ -1617,11 +1681,16 @@ impl ConcurrentExt4Backend {
                 .chain(transaction.writes.keys())
                 .copied()
                 .collect::<BTreeSet<_>>();
-            // Capture is private and can overlap the legacy C core. Publication
-            // still excludes that core so it cannot later flush a stale clean
-            // alias over this commit. Checkpoint 9 removes this final boundary
-            // after legacy metadata ownership moves into the journal layer.
-            let _legacy_publication = self.legacy_publication_gate.read();
+            // Capture is private and can overlap the canonical C core.
+            // Publication is exclusive: wait for every canonical mutation and
+            // its flush, then retire only clean canonical aliases before
+            // validating and publishing this transaction. Checkpoint 9 moves
+            // this exclusion into dirty-LBA journal reservations.
+            let _metadata_publication = self.metadata_publication_gate.write();
+            {
+                let mut writer = self.lock_writer_exclusive(op);
+                writer.exclusive().invalidate_read_cache();
+            }
             let _physical = self.physical_leases.reserve_wait(touched);
             let (prepared_writes, read_lbas, merged_lbas, reread_lbas) =
                 match self.prepare_metadata_write_set(transaction) {
@@ -1669,23 +1738,19 @@ impl ConcurrentExt4Backend {
         let _ = op;
         #[cfg(feature = "perf-counters")]
         perf::record_backend_op_call(op);
-        let _legacy_exclusion = self.legacy_publication_gate.write();
-        let mut writer = Self::lock_core(&self.writer, op);
-        let generation = self.cache_generation.stable_value();
-        if writer.cache_generation != generation {
-            writer.invalidate_read_cache();
-            writer.cache_generation = generation;
-        }
+        let _metadata_publication = self.metadata_publication_gate.read();
+        let mut writer = self.lock_writer_exclusive(op);
+        let mount = writer.exclusive();
         let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
         #[cfg(feature = "perf-counters")]
-        let io_before = writer.io_counters.snapshot();
+        let io_before = mount.io_counters.snapshot();
         #[cfg(feature = "perf-counters")]
         let op_hold_scope = perf::time_backend_op_hold(op);
-        let result = f(&mut writer);
+        let result = f(mount);
         #[cfg(feature = "perf-counters")]
         {
             drop(op_hold_scope);
-            perf::record_backend_op_io(op, writer.io_counters.snapshot().delta_since(io_before));
+            perf::record_backend_op_io(op, mount.io_counters.snapshot().delta_since(io_before));
         }
         drop(writer);
         drop(hold_scope);
@@ -1696,33 +1761,71 @@ impl ConcurrentExt4Backend {
         let _ = op;
         #[cfg(feature = "perf-counters")]
         perf::record_backend_op_call(op);
-        // The writer core serializes lwext4 transactions. Per-object VFS
-        // leases protect conflicting operations. The odd generation prevents
-        // a replica from publishing a result assembled across this transaction.
-        let _legacy_exclusion = self.legacy_publication_gate.write();
-        let mut writer = Self::lock_core(&self.writer, op);
-        let generation = self.cache_generation.stable_value();
-        if writer.cache_generation != generation {
-            writer.invalidate_read_cache();
-            writer.cache_generation = generation;
-        }
+        // Legacy operations retain exclusive core entry. The publication read
+        // guard excludes private physical commits without serializing them
+        // against other audited canonical operations at the mount boundary.
+        let _metadata_publication = self.metadata_publication_gate.read();
+        let mut writer = self.lock_writer_exclusive(op);
+        let mount = writer.exclusive();
         let generation_write = self.cache_generation.begin_write();
         let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
         #[cfg(feature = "perf-counters")]
-        let io_before = writer.io_counters.snapshot();
+        let io_before = mount.io_counters.snapshot();
         #[cfg(feature = "perf-counters")]
         let op_hold_scope = perf::time_backend_op_hold(op);
-        let result = f(&mut writer);
-        let visible = writer.flush_for_replica_visibility();
+        let result = f(mount);
+        let visible = mount.flush_for_replica_visibility();
         #[cfg(feature = "perf-counters")]
         {
             drop(op_hold_scope);
-            perf::record_backend_op_io(op, writer.io_counters.snapshot().delta_since(io_before));
+            perf::record_backend_op_io(op, mount.io_counters.snapshot().delta_since(io_before));
         }
         drop(writer);
         drop(generation_write);
         drop(hold_scope);
         (result, visible)
+    }
+
+    fn mutate_shared_create<T>(
+        &self,
+        op: BackendOp,
+        f: impl FnOnce(&Ext4Mount) -> FsResult<T>,
+    ) -> FsResult<T> {
+        let _ = op;
+        #[cfg(feature = "perf-counters")]
+        perf::record_backend_op_call(op);
+        let _metadata_publication = self.metadata_publication_gate.read();
+        let generation_write = self.cache_generation.begin_write();
+        let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
+
+        let writer = self.lock_writer_shared(op);
+        let mount = writer.shared();
+        #[cfg(feature = "perf-counters")]
+        let io_before = mount.io_counters.snapshot();
+        #[cfg(feature = "perf-counters")]
+        let op_hold_scope = perf::time_backend_op_hold(op);
+        let result = f(mount);
+        drop(writer);
+
+        // The phase-fair write acquisition waits for every create mutation
+        // that already entered the shared phase. One caller can therefore
+        // flush the complete ready dirty set for the cohort; later writers
+        // observe an empty list instead of repeating device I/O.
+        let mut writer = self.lock_writer_exclusive(op);
+        let mount = writer.exclusive();
+        let visible = mount.flush_for_replica_visibility();
+        #[cfg(feature = "perf-counters")]
+        {
+            drop(op_hold_scope);
+            perf::record_backend_op_io(op, mount.io_counters.snapshot().delta_since(io_before));
+        }
+        drop(writer);
+        drop(generation_write);
+        drop(hold_scope);
+        match result {
+            Ok(value) => visible.map(|()| value),
+            Err(err) => Err(err),
+        }
     }
 
     fn mutate<T>(
@@ -1743,13 +1846,9 @@ impl ConcurrentExt4Backend {
         f: impl FnOnce(&mut Ext4Mount) -> FsResult<T>,
     ) -> Option<FsResult<T>> {
         let _ = op;
-        let _legacy_exclusion = self.legacy_publication_gate.try_write()?;
-        let mut writer = self.writer.try_lock()?;
-        let generation = self.cache_generation.stable_value();
-        if writer.cache_generation != generation {
-            writer.invalidate_read_cache();
-            writer.cache_generation = generation;
-        }
+        let _metadata_publication = self.metadata_publication_gate.try_read()?;
+        let mut writer = self.writer.try_write()?;
+        let mount = writer.exclusive();
         let generation_write = self.cache_generation.begin_write();
         #[cfg(feature = "perf-counters")]
         {
@@ -1757,15 +1856,15 @@ impl ConcurrentExt4Backend {
             perf::record_backend_try_successful_call();
         }
         #[cfg(feature = "perf-counters")]
-        let io_before = writer.io_counters.snapshot();
+        let io_before = mount.io_counters.snapshot();
         #[cfg(feature = "perf-counters")]
         let op_hold_scope = perf::time_backend_op_hold(op);
-        let result = f(&mut writer);
-        let visible = writer.flush_for_replica_visibility();
+        let result = f(mount);
+        let visible = mount.flush_for_replica_visibility();
         #[cfg(feature = "perf-counters")]
         {
             drop(op_hold_scope);
-            perf::record_backend_op_io(op, writer.io_counters.snapshot().delta_since(io_before));
+            perf::record_backend_op_io(op, mount.io_counters.snapshot().delta_since(io_before));
         }
         drop(writer);
         drop(generation_write);
@@ -2137,6 +2236,95 @@ impl Ext4Mount {
         Ok(self.stat_from_attr(ino, attr, 0, 0))
     }
 
+    /// Audited shared mutation used only through `SharedExt4WriteCore`.
+    /// The caller owns the parent-directory VFS mutation lease; allocator and
+    /// bcache state are protected by the canonical writer's callbacks.
+    fn create_file_shared(&self, parent_ino: u32, leaf_name: &str) -> FsResult<u32> {
+        self.fs
+            .create(parent_ino, leaf_name, InodeType::RegularFile, 0o644)
+            .map_err(map_ext4_error)
+    }
+
+    fn create_node_shared(
+        &self,
+        parent_ino: u32,
+        leaf_name: &str,
+        kind: FsNodeKind,
+        mode: u32,
+        rdev: u64,
+    ) -> FsResult<u32> {
+        let inode_type = match kind {
+            FsNodeKind::RegularFile => InodeType::RegularFile,
+            FsNodeKind::Fifo => InodeType::Fifo,
+            FsNodeKind::CharacterDevice => InodeType::CharacterDevice,
+            FsNodeKind::BlockDevice => InodeType::BlockDevice,
+            FsNodeKind::Socket => InodeType::Socket,
+            _ => return Err(FsError::InvalidInput),
+        };
+        let ino = self
+            .fs
+            .create(parent_ino, leaf_name, inode_type, mode)
+            .map_err(map_ext4_error)?;
+        if matches!(kind, FsNodeKind::CharacterDevice | FsNodeKind::BlockDevice) {
+            // UNFINISHED: The vendored wrapper does not expose persistent
+            // device major/minor payloads yet. Runtime state is independently
+            // sharded and safe for different newly allocated inodes.
+            self.inode_runtime.set_special_rdev(ino, rdev);
+        }
+        Ok(ino)
+    }
+
+    fn create_dir_shared(&self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32> {
+        self.fs
+            .create(parent_ino, leaf_name, InodeType::Directory, mode)
+            .map_err(map_ext4_error)
+    }
+
+    fn set_mode_shared(&self, ino: u32, mode: u32) -> FsResult {
+        let mut attr = lwext4_rust::FileAttr::default();
+        self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
+        self.fs
+            .set_mode(ino, (attr.mode & !0o7777) | (mode & 0o7777))
+            .map_err(map_ext4_error)
+    }
+
+    fn set_owner_shared(&self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
+        let mut attr = lwext4_rust::FileAttr::default();
+        self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
+        let uid = uid.unwrap_or(attr.uid);
+        let gid = gid.unwrap_or(attr.gid);
+        if uid > u16::MAX as u32 || gid > u16::MAX as u32 {
+            // UNFINISHED: The wrapper currently exposes only the low 16-bit
+            // ext4 uid/gid fields, not Linux's complete 32-bit ids.
+            return Err(FsError::InvalidInput);
+        }
+        self.fs
+            .set_owner(ino, uid as u16, gid as u16)
+            .map_err(map_ext4_error)
+    }
+
+    fn create_node_with_owner_shared(
+        &self,
+        parent_ino: u32,
+        leaf_name: &str,
+        kind: FsNodeKind,
+        mode: u32,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
+    ) -> FsResult<u32> {
+        let parent = self.stat_basic_shared(parent_ino)?;
+        let ino = self.create_node_shared(parent_ino, leaf_name, kind, mode, rdev)?;
+        let gid = if parent.mode & 0o2000 != 0 {
+            parent.gid
+        } else {
+            gid
+        };
+        self.set_owner_shared(ino, Some(uid), Some(gid))?;
+        self.set_mode_shared(ino, mode)?;
+        Ok(ino)
+    }
+
     fn readlink_shared(&self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
         self.fs.read_at(ino, buf, 0).map_err(map_ext4_error)
     }
@@ -2289,9 +2477,7 @@ impl LegacyFileSystemBackend for Ext4Mount {
     }
 
     fn create_file(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult<u32> {
-        self.fs
-            .create(parent_ino, leaf_name, InodeType::RegularFile, 0o644)
-            .map_err(map_ext4_error)
+        self.create_file_shared(parent_ino, leaf_name)
     }
 
     fn create_node(
@@ -2302,32 +2488,11 @@ impl LegacyFileSystemBackend for Ext4Mount {
         mode: u32,
         rdev: u64,
     ) -> FsResult<u32> {
-        let inode_type = match kind {
-            FsNodeKind::RegularFile => InodeType::RegularFile,
-            FsNodeKind::Fifo => InodeType::Fifo,
-            FsNodeKind::CharacterDevice => InodeType::CharacterDevice,
-            FsNodeKind::BlockDevice => InodeType::BlockDevice,
-            FsNodeKind::Socket => InodeType::Socket,
-            _ => return Err(FsError::InvalidInput),
-        };
-        let ino = self
-            .fs
-            .create(parent_ino, leaf_name, inode_type, mode)
-            .map_err(map_ext4_error)?;
-        if matches!(kind, FsNodeKind::CharacterDevice | FsNodeKind::BlockDevice) {
-            // UNFINISHED: The vendored lwext4 wrapper can create special inode
-            // types, but it does not yet expose persistent device major/minor
-            // payloads. Keep runtime-created rdevs for stat/statx until the
-            // wrapper can read/write the on-disk special inode fields.
-            self.inode_runtime.set_special_rdev(ino, rdev);
-        }
-        Ok(ino)
+        self.create_node_shared(parent_ino, leaf_name, kind, mode, rdev)
     }
 
     fn create_dir(&mut self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32> {
-        self.fs
-            .create(parent_ino, leaf_name, InodeType::Directory, mode)
-            .map_err(map_ext4_error)
+        self.create_dir_shared(parent_ino, leaf_name, mode)
     }
 
     fn link(&mut self, parent_ino: u32, leaf_name: &str, child_ino: u32) -> FsResult {
@@ -2438,9 +2603,7 @@ impl LegacyFileSystemBackend for Ext4Mount {
     }
 
     fn set_mode(&mut self, ino: u32, mode: u32) -> FsResult {
-        let stat = self.stat(ino)?;
-        let mode = (stat.mode & !0o7777) | (mode & 0o7777);
-        self.fs.set_mode(ino, mode).map_err(map_ext4_error)
+        self.set_mode_shared(ino, mode)
     }
 
     fn inode_flags(&mut self, ino: u32) -> FsResult<u32> {
@@ -2452,18 +2615,7 @@ impl LegacyFileSystemBackend for Ext4Mount {
     }
 
     fn set_owner(&mut self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
-        let stat = self.stat(ino)?;
-        let uid = uid.unwrap_or(stat.uid);
-        let gid = gid.unwrap_or(stat.gid);
-        if uid > u16::MAX as u32 || gid > u16::MAX as u32 {
-            // UNFINISHED: The current lwext4 wrapper exposes only the low
-            // 16-bit ext4 uid/gid fields, not the high uid/gid fields used for
-            // full 32-bit Linux ids.
-            return Err(FsError::InvalidInput);
-        }
-        self.fs
-            .set_owner(ino, uid as u16, gid as u16)
-            .map_err(map_ext4_error)
+        self.set_owner_shared(ino, uid, gid)
     }
 
     fn retain_inode(&mut self, ino: u32) -> FsResult {
@@ -2578,23 +2730,14 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         uid: u32,
         gid: u32,
     ) -> FsResult<u32> {
-        self.mutate(BackendOp::NamespaceMutation, |writer| {
-            let parent_stat = writer.stat(parent_ino)?;
-            let ino = writer.create_node(parent_ino, leaf_name, kind, mode, rdev)?;
-            let gid = if parent_stat.mode & 0o2000 != 0 {
-                parent_stat.gid
-            } else {
-                gid
-            };
-            writer.set_owner(ino, Some(uid), Some(gid))?;
-            writer.set_mode(ino, mode)?;
-            Ok(ino)
+        self.mutate_shared_create(BackendOp::NamespaceMutation, |writer| {
+            writer.create_node_with_owner_shared(parent_ino, leaf_name, kind, mode, rdev, uid, gid)
         })
     }
 
     fn create_file(&self, parent_ino: u32, leaf_name: &str) -> FsResult<u32> {
-        self.mutate(BackendOp::NamespaceMutation, |writer| {
-            writer.create_file(parent_ino, leaf_name)
+        self.mutate_shared_create(BackendOp::NamespaceMutation, |writer| {
+            writer.create_file_shared(parent_ino, leaf_name)
         })
     }
 
@@ -2606,14 +2749,14 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         mode: u32,
         rdev: u64,
     ) -> FsResult<u32> {
-        self.mutate(BackendOp::NamespaceMutation, |writer| {
-            writer.create_node(parent_ino, leaf_name, kind, mode, rdev)
+        self.mutate_shared_create(BackendOp::NamespaceMutation, |writer| {
+            writer.create_node_shared(parent_ino, leaf_name, kind, mode, rdev)
         })
     }
 
     fn create_dir(&self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32> {
-        self.mutate(BackendOp::NamespaceMutation, |writer| {
-            writer.create_dir(parent_ino, leaf_name, mode)
+        self.mutate_shared_create(BackendOp::NamespaceMutation, |writer| {
+            writer.create_dir_shared(parent_ino, leaf_name, mode)
         })
     }
 

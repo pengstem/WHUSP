@@ -32,6 +32,8 @@ enum {
     MAPPED_WRITE_ITERATIONS = 12,
     INODE_METADATA_WORKERS = 8,
     INODE_METADATA_ITERATIONS = 128,
+    CREATE_WORKERS = 8,
+    CREATE_ITERATIONS = 32,
 };
 
 struct probe_linux_dirent64 {
@@ -492,6 +494,109 @@ static int phase_independent_inode_metadata(const char *base)
                     "FS5_INODE_METADATA_FINAL_FAIL worker=%d stat_rc=%d errno=%d mode=%04o\n",
                     worker, stat(path, &statbuf), errno,
                     stat(path, &statbuf) == 0 ? (unsigned)(statbuf.st_mode & 0777) : 0u);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int run_create_cell(const char *base, int workers)
+{
+    int ready_pipe[2];
+    int start_pipe[2];
+    pid_t children[CREATE_WORKERS];
+    for (int worker = 0; worker < workers; ++worker) {
+        char dir[512];
+        snprintf(dir, sizeof(dir), "%s/create-cell-%d-worker-%d", base, workers, worker);
+        if (mkdir(dir, 0700) != 0) {
+            return -1;
+        }
+    }
+    if (pipe(ready_pipe) != 0 || pipe(start_pipe) != 0) {
+        return -1;
+    }
+    for (int worker = 0; worker < workers; ++worker) {
+        pid_t child = fork();
+        if (child < 0) {
+            return -1;
+        }
+        if (child == 0) {
+            char token;
+            close(ready_pipe[0]);
+            close(start_pipe[1]);
+            if (write(ready_pipe[1], "r", 1) != 1
+                || read(start_pipe[0], &token, 1) != 1) {
+                _exit(121);
+            }
+            for (int iteration = 0; iteration < CREATE_ITERATIONS; ++iteration) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/create-cell-%d-worker-%d/file-%d", base,
+                         workers, worker, iteration);
+                int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+                if (fd < 0 || close(fd) != 0) {
+                    _exit(122);
+                }
+            }
+            _exit(0);
+        }
+        children[worker] = child;
+    }
+    close(ready_pipe[1]);
+    close(start_pipe[0]);
+    if (read_tokens(ready_pipe[0], workers) != 0) {
+        return -1;
+    }
+    uint64_t start = monotonic_ns();
+    if (start == 0) {
+        return -1;
+    }
+    for (int worker = 0; worker < workers; ++worker) {
+        if (write(start_pipe[1], "s", 1) != 1) {
+            return -1;
+        }
+    }
+    close(ready_pipe[0]);
+    close(start_pipe[1]);
+    int errors = 0;
+    for (int worker = 0; worker < workers; ++worker) {
+        if (wait_success(children[worker]) != 0) {
+            ++errors;
+        }
+    }
+    uint64_t end = monotonic_ns();
+    if (end <= start) {
+        return -1;
+    }
+    for (int worker = 0; worker < workers; ++worker) {
+        char dir[512];
+        snprintf(dir, sizeof(dir), "%s/create-cell-%d-worker-%d", base, workers, worker);
+        for (int iteration = 0; iteration < CREATE_ITERATIONS; ++iteration) {
+            char path[1024];
+            struct stat statbuf;
+            snprintf(path, sizeof(path), "%s/file-%d", dir, iteration);
+            if (stat(path, &statbuf) != 0 || !S_ISREG(statbuf.st_mode)
+                || (statbuf.st_mode & 0777) != 0600 || unlink(path) != 0) {
+                ++errors;
+                break;
+            }
+        }
+        if (errors == 0 && rmdir(dir) != 0) {
+            ++errors;
+        }
+    }
+    uint64_t operations = (uint64_t)workers * CREATE_ITERATIONS;
+    uint64_t throughput = operations * UINT64_C(1000000000) / (end - start);
+    printf("FS5_CREATE_CELL workers=%d iterations=%d operations=%" PRIu64
+           " elapsed_ns=%" PRIu64 " throughput_ops_per_s=%" PRIu64 " errors=%d\n",
+           workers, CREATE_ITERATIONS, operations, end - start, throughput, errors);
+    fflush(stdout);
+    return errors == 0 ? 0 : -1;
+}
+
+static int phase_independent_create(const char *base)
+{
+    for (int workers = 1; workers <= CREATE_WORKERS; workers *= 2) {
+        if (run_create_cell(base, workers) != 0) {
             return -1;
         }
     }
@@ -1071,6 +1176,7 @@ int main(int argc, char **argv)
     RUN_CASE(partial_read_plan);
     RUN_CASE(mapped_overwrite_plan);
     RUN_CASE(independent_mapped_overwrite);
+    RUN_CASE(independent_create);
     RUN_CASE(independent_inode_metadata);
     RUN_CASE(readlink_plan);
     RUN_CASE(readlink_vs_unlink);
@@ -1078,6 +1184,6 @@ int main(int argc, char **argv)
     RUN_CASE(readdir_vs_namespace_mutation);
     RUN_CASE(shutdown_drain_stress);
 #undef RUN_CASE
-    puts("FS4_INODE_STATE_PROBE_PASS cases=15");
+    puts("FS4_INODE_STATE_PROBE_PASS cases=16");
     return 0;
 }

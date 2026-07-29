@@ -183,7 +183,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         f(&mut inode)
     }
 
-    pub(crate) fn alloc_inode(&mut self, ty: InodeType) -> Ext4Result<InodeRef<Hal>> {
+    pub(crate) fn alloc_inode(&self, ty: InodeType) -> Ext4Result<InodeRef<Hal>> {
         unsafe {
             let ty = match ty {
                 InodeType::Fifo => EXT4_DE_FIFO,
@@ -196,10 +196,10 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
                 InodeType::Unknown => EXT4_DE_UNKNOWN,
             };
             let mut result = mem::zeroed();
-            ext4_fs_alloc_inode(self.inner.as_mut(), &mut result, ty as _)
+            ext4_fs_alloc_inode(self.inner_ptr(), &mut result, ty as _)
                 .context("ext4_fs_get_inode_ref")?;
             let mut result = InodeRef::new(result);
-            ext4_fs_inode_blocks_init(self.inner.as_mut(), result.inner.as_mut());
+            ext4_fs_inode_blocks_init(self.inner_ptr(), result.inner.as_mut());
             Ok(result)
         }
     }
@@ -233,7 +233,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
     pub fn set_len(&mut self, ino: u32, len: u64) -> Ext4Result<()> {
         self.inode_ref(ino)?.set_len(len)
     }
-    pub fn set_mode(&mut self, ino: u32, mode: u32) -> Ext4Result<()> {
+    pub fn set_mode(&self, ino: u32, mode: u32) -> Ext4Result<()> {
         self.inode_ref(ino)?.set_mode(mode);
         Ok(())
     }
@@ -244,7 +244,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         self.inode_ref(ino)?.set_flags(flags);
         Ok(())
     }
-    pub fn set_owner(&mut self, ino: u32, uid: u16, gid: u16) -> Ext4Result<()> {
+    pub fn set_owner(&self, ino: u32, uid: u16, gid: u16) -> Ext4Result<()> {
         self.inode_ref(ino)?.set_owner(uid, gid);
         Ok(())
     }
@@ -293,7 +293,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         self.inode_ref(ino)?.plan_mapped_overwrite(len, offset)
     }
 
-    pub fn create(&mut self, parent: u32, name: &str, ty: InodeType, mode: u32) -> Ext4Result<u32> {
+    pub fn create(&self, parent: u32, name: &str, ty: InodeType, mode: u32) -> Ext4Result<u32> {
         let mut child = self.alloc_inode(ty)?;
         let mut parent = self.inode_ref(parent)?;
         parent.add_entry(name, &mut child)?;
@@ -482,9 +482,9 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         })
     }
 
-    pub fn flush(&mut self) -> Ext4Result<()> {
+    pub fn flush(&self) -> Ext4Result<()> {
         unsafe {
-            ext4_block_cache_flush(self.bdev.inner.as_mut()).context("ext4_cache_flush")?;
+            ext4_block_cache_flush(self.bdev.inner_ptr()).context("ext4_cache_flush")?;
         }
         Ok(())
     }
