@@ -7,8 +7,8 @@ use super::super::mount::{
     MountId, MountNamespaceId, mount_any_nosymfollow, mount_exists, mount_is_devfs,
     mount_is_noatime, mount_is_nodev, mount_is_nodiratime, mount_is_nosymfollow,
     mount_is_read_only, mount_supports_dirty_writeback, mount_supports_page_cache,
-    release_inode_from_drop, retain_inode, stat_basic_cached, stat_full_cached,
-    synthetic_children_for_dir, with_mount,
+    release_inode_from_drop, retain_inode, stat_basic_cached, stat_basic_cached_with_state,
+    stat_full_cached, stat_full_cached_with_state, synthetic_children_for_dir, with_mount,
 };
 use super::super::named_fifo::open_named_fifo;
 use super::super::path::{PathContext, WorkingDir};
@@ -1429,7 +1429,7 @@ impl VfsFile {
         }
         let mut offset = self.offset.lock();
         if append {
-            let stat = match stat_full_cached(self.node) {
+            let stat = match stat_full_cached_with_state(&self.inode_state) {
                 Ok(stat) => stat,
                 Err(_) => {
                     return 0;
@@ -1496,7 +1496,7 @@ impl VfsFile {
         if buf.is_empty() {
             return 0;
         }
-        inode_state::with_mapping_mutation_value(self.node, || {
+        inode_state::with_mapping_mutation_value_state(&self.inode_state, || {
             let mut total_write_size = 0usize;
             for chunk in buf.chunks(VFS_WRITE_CHUNK_SIZE) {
                 let Some(chunk_offset) = offset.checked_add(total_write_size) else {
@@ -1570,7 +1570,7 @@ impl VfsFile {
         point: perf::ProfilePoint,
     ) -> usize {
         let _profile_scope = perf::time_scope(point);
-        let Some(read_size) = inode_state::with_mapping_read(self.node, || {
+        let Some(read_size) = inode_state::with_mapping_read_state(&self.inode_state, || {
             let read_plan = (self.kind == FsNodeKind::RegularFile && self.supports_page_cache)
                 .then(|| {
                     with_mount(self.node.mount_id, BackendOp::ReadPlan, |mount| {
@@ -1626,7 +1626,7 @@ impl VfsFile {
             *snapshot = None;
         }
         if snapshot.is_none() {
-            let content = match inode_state::with_mapping_read(self.node, || {
+            let content = match inode_state::with_mapping_read_state(&self.inode_state, || {
                 with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
                     mount.read_snapshot(self.node.ino)
                 })
@@ -1678,7 +1678,7 @@ impl VfsFile {
         {
             return None;
         }
-        let stat = stat_basic_cached(self.node).ok()?;
+        let stat = stat_basic_cached_with_state(&self.inode_state).ok()?;
         let file_size = stat.size as usize;
         if self.read_cache_id_for_size(file_size).is_some() {
             return None;
@@ -1730,7 +1730,7 @@ impl VfsFile {
         {
             return None;
         }
-        let stat = stat_basic_cached(self.node).ok()?;
+        let stat = stat_basic_cached_with_state(&self.inode_state).ok()?;
         Some((
             FileTimestamp {
                 sec: stat.atime_sec,
@@ -1745,12 +1745,20 @@ impl VfsFile {
 
     fn restore_noatime(&self, snapshot: Option<(FileTimestamp, FileTimestamp)>) {
         if let Some((atime, ctime)) = snapshot {
-            let _ = inode_state::with_metadata_mutation(self.node, || {
-                with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
-                    mount.set_times(self.node.ino, Some(atime), None, ctime)
-                })
-                .ok_or(FsError::Io)?
-            });
+            let _ = inode_state::with_metadata_update_state(
+                &self.inode_state,
+                inode_state::MetadataCacheUpdate::Times {
+                    atime: Some(atime),
+                    mtime: None,
+                    ctime,
+                },
+                || {
+                    with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                        mount.set_times(self.node.ino, Some(atime), None, ctime)
+                    })
+                    .ok_or(FsError::Io)?
+                },
+            );
         }
     }
 
@@ -1758,19 +1766,28 @@ impl VfsFile {
         if mount_is_noatime(self.node.mount_id) || mount_is_nodiratime(self.node.mount_id) {
             return;
         }
-        let Ok(stat) = stat_full_cached(self.node) else {
+        let Ok(stat) = stat_full_cached_with_state(&self.inode_state) else {
             return;
         };
         let ctime = FileTimestamp {
             sec: stat.ctime_sec,
             nsec: stat.ctime_nsec,
         };
-        let _ = inode_state::with_metadata_mutation(self.node, || {
-            with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
-                mount.set_times(self.node.ino, Some(FileTimestamp::now()), None, ctime)
-            })
-            .ok_or(FsError::Io)?
-        });
+        let atime = FileTimestamp::now();
+        let _ = inode_state::with_metadata_update_state(
+            &self.inode_state,
+            inode_state::MetadataCacheUpdate::Times {
+                atime: Some(atime),
+                mtime: None,
+                ctime,
+            },
+            || {
+                with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                    mount.set_times(self.node.ino, Some(atime), None, ctime)
+                })
+                .ok_or(FsError::Io)?
+            },
+        );
     }
 
     fn cached_page_cache_id(&self) -> Option<PageCacheId> {
@@ -1788,7 +1805,7 @@ impl VfsFile {
         // from nonzero bytes in filesystem-sized blocks instead of querying
         // backend extent allocation, so allocated zero-filled blocks may be
         // reported as holes.
-        let stat = stat_full_cached(self.node)?;
+        let stat = stat_full_cached_with_state(&self.inode_state)?;
         let size = stat.size as usize;
         if offset > size {
             return Err(FsError::NoDeviceOrAddress);
@@ -1929,7 +1946,7 @@ impl VfsFile {
             let file_size = match cached_file_size {
                 Some(file_size) => file_size,
                 None => {
-                    let stat = stat_basic_cached(self.node).ok()?;
+                    let stat = stat_basic_cached_with_state(&self.inode_state).ok()?;
                     let file_size = stat.size as usize;
                     self.read_cache_id_for_size(file_size)?;
                     cached_file_size = Some(file_size);
@@ -1981,7 +1998,7 @@ impl VfsFile {
             } else {
                 staging.as_mut_slice()
             };
-            let read_len = inode_state::with_mapping_read(self.node, || {
+            let read_len = inode_state::with_mapping_read_state(&self.inode_state, || {
                 let read_plan = with_mount(self.node.mount_id, BackendOp::ReadPlan, |mount| {
                     mount.prepare_read_plan(self.node.ino, page_start as u64, read_limit)
                 })
@@ -2182,7 +2199,7 @@ impl VfsFile {
             return Some(read_size);
         }
 
-        let stat = stat_basic_cached(self.node).ok()?;
+        let stat = stat_basic_cached_with_state(&self.inode_state).ok()?;
         let file_size = stat.size as usize;
         if !(VFS_SMALL_READ_CACHE_MIN_FILE_SIZE..=VFS_READ_CACHE_MAX_FILE_SIZE).contains(&file_size)
         {
@@ -2797,12 +2814,16 @@ pub(crate) fn chmod_in(
         LookupMode::NoFollowFinal
     };
     let path = vfs_path::resolve_existing_in(context, name, lookup_mode)?;
-    inode_state::with_metadata_mutation(path.node, || {
-        with_mount(path.node.mount_id, BackendOp::NamespaceMutation, |mount| {
-            mount.set_mode(path.node.ino, mode)
-        })
-        .ok_or(FsError::Io)?
-    })
+    inode_state::with_metadata_update(
+        path.node,
+        inode_state::MetadataCacheUpdate::Mode(mode),
+        || {
+            with_mount(path.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                mount.set_mode(path.node.ino, mode)
+            })
+            .ok_or(FsError::Io)?
+        },
+    )
 }
 
 pub(crate) fn chown_in(
@@ -2818,12 +2839,16 @@ pub(crate) fn chown_in(
         LookupMode::NoFollowFinal
     };
     let path = vfs_path::resolve_existing_in(context, name, lookup_mode)?;
-    inode_state::with_metadata_mutation(path.node, || {
-        with_mount(path.node.mount_id, BackendOp::NamespaceMutation, |mount| {
-            mount.set_owner(path.node.ino, uid, gid)
-        })
-        .ok_or(FsError::Io)?
-    })
+    inode_state::with_metadata_update(
+        path.node,
+        inode_state::MetadataCacheUpdate::Owner { uid, gid },
+        || {
+            with_mount(path.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                mount.set_owner(path.node.ino, uid, gid)
+            })
+            .ok_or(FsError::Io)?
+        },
+    )
 }
 
 pub(crate) fn truncate_in(context: PathContext, name: &str, len: usize) -> FsResult {
@@ -2901,7 +2926,7 @@ impl File for VfsFile {
     }
 
     fn stat(&self) -> FsResult<FileStat> {
-        let mut stat = stat_full_cached(self.node)?;
+        let mut stat = stat_full_cached_with_state(&self.inode_state)?;
         stat.dev = self.node.mount_id.0 as u64;
         if self.kind == FsNodeKind::RegularFile {
             overlay_dirty_regular_stat(self.node, &mut stat);
@@ -3006,7 +3031,7 @@ impl File for VfsFile {
         let len = buf.len();
         let mut offset = self.offset.lock();
         if append {
-            let stat = stat_full_cached(self.node)?;
+            let stat = stat_full_cached_with_state(&self.inode_state)?;
             *offset = stat_logical_size(self.node, stat.size) as usize;
         }
         let write_offset = *offset;
@@ -3051,7 +3076,7 @@ impl File for VfsFile {
         self.check_set_len(len)?;
         let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         flush_dirty_regular_file(self.node)?;
-        inode_state::with_mapping_mutation(self.node, || {
+        inode_state::with_mapping_mutation_state(&self.inode_state, || {
             with_mount(self.node.mount_id, BackendOp::TruncateAllocate, |mount| {
                 mount.set_len(self.node.ino, len as u64)
             })
@@ -3069,7 +3094,7 @@ impl File for VfsFile {
         self.check_write_at(offset, len)?;
         let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         flush_dirty_regular_file(self.node)?;
-        inode_state::with_mapping_mutation(self.node, || {
+        inode_state::with_mapping_mutation_state(&self.inode_state, || {
             with_mount(self.node.mount_id, BackendOp::TruncateAllocate, |mount| {
                 mount.allocate_range(self.node.ino, offset as u64, len as u64, keep_size)
             })
@@ -3087,7 +3112,7 @@ impl File for VfsFile {
         self.check_write_at(offset, len)?;
         let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         flush_dirty_regular_file(self.node)?;
-        inode_state::with_mapping_mutation(self.node, || {
+        inode_state::with_mapping_mutation_state(&self.inode_state, || {
             with_mount(self.node.mount_id, BackendOp::TruncateAllocate, |mount| {
                 mount.zero_range(self.node.ino, offset as u64, len as u64, keep_size)
             })
@@ -3109,7 +3134,7 @@ impl File for VfsFile {
         }
         let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         flush_dirty_regular_file(self.node)?;
-        inode_state::with_mapping_mutation(self.node, || {
+        inode_state::with_mapping_mutation_state(&self.inode_state, || {
             with_mount(self.node.mount_id, BackendOp::TruncateAllocate, |mount| {
                 mount.punch_hole(self.node.ino, offset as u64, len as u64)
             })
@@ -3131,7 +3156,7 @@ impl File for VfsFile {
             SeekWhence::Set => 0i128,
             SeekWhence::Current => *current as i128,
             SeekWhence::End => {
-                let stat = stat_full_cached(self.node)?;
+                let stat = stat_full_cached_with_state(&self.inode_state)?;
                 stat_logical_size(self.node, stat.size) as i128
             }
             SeekWhence::Data | SeekWhence::Hole => {
@@ -3168,7 +3193,7 @@ impl File for VfsFile {
             )?
         } else {
             let (read_size, next_offset) =
-                inode_state::with_directory_read(self.node, |directory_version| {
+                inode_state::with_directory_read_state(&self.inode_state, |directory_version| {
                     {
                         let cached = self.directory_snapshot.lock();
                         if let Some(cached) = cached
@@ -3224,7 +3249,7 @@ impl File for VfsFile {
         if self.kind != FsNodeKind::Symlink {
             return Err(FsError::InvalidInput);
         }
-        inode_state::with_mapping_read(self.node, || {
+        inode_state::with_mapping_read_state(&self.inode_state, || {
             let plan = with_mount(self.node.mount_id, BackendOp::ReadPlan, |mount| {
                 mount.prepare_readlink_plan(self.node.ino, buf.len())
             })
@@ -3250,30 +3275,46 @@ impl File for VfsFile {
         mtime: Option<FileTimestamp>,
         ctime: FileTimestamp,
     ) -> FsResult {
-        inode_state::with_metadata_mutation(self.node, || {
-            with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
-                mount.set_times(self.node.ino, atime, mtime, ctime)
-            })
-            .ok_or(FsError::Io)?
-        })
+        inode_state::with_metadata_update_state(
+            &self.inode_state,
+            inode_state::MetadataCacheUpdate::Times {
+                atime,
+                mtime,
+                ctime,
+            },
+            || {
+                with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                    mount.set_times(self.node.ino, atime, mtime, ctime)
+                })
+                .ok_or(FsError::Io)?
+            },
+        )
     }
 
     fn set_mode(&self, mode: u32) -> FsResult {
-        inode_state::with_metadata_mutation(self.node, || {
-            with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
-                mount.set_mode(self.node.ino, mode)
-            })
-            .ok_or(FsError::Io)?
-        })
+        inode_state::with_metadata_update_state(
+            &self.inode_state,
+            inode_state::MetadataCacheUpdate::Mode(mode),
+            || {
+                with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                    mount.set_mode(self.node.ino, mode)
+                })
+                .ok_or(FsError::Io)?
+            },
+        )
     }
 
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> FsResult {
-        inode_state::with_metadata_mutation(self.node, || {
-            with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
-                mount.set_owner(self.node.ino, uid, gid)
-            })
-            .ok_or(FsError::Io)?
-        })
+        inode_state::with_metadata_update_state(
+            &self.inode_state,
+            inode_state::MetadataCacheUpdate::Owner { uid, gid },
+            || {
+                with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                    mount.set_owner(self.node.ino, uid, gid)
+                })
+                .ok_or(FsError::Io)?
+            },
+        )
     }
 
     fn inode_flags(&self) -> FsResult<u32> {
@@ -3284,12 +3325,16 @@ impl File for VfsFile {
     }
 
     fn set_inode_flags(&self, flags: u32) -> FsResult {
-        let result = inode_state::with_metadata_mutation(self.node, || {
-            with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
-                mount.set_inode_flags(self.node.ino, flags)
-            })
-            .ok_or(FsError::Io)?
-        });
+        let result = inode_state::with_metadata_update_state(
+            &self.inode_state,
+            inode_state::MetadataCacheUpdate::InodeFlags(flags),
+            || {
+                with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                    mount.set_inode_flags(self.node.ino, flags)
+                })
+                .ok_or(FsError::Io)?
+            },
+        );
         if result.is_ok() {
             update_inode_flags_cache(self.node, flags);
         }
@@ -3306,7 +3351,7 @@ impl File for VfsFile {
             return Err(FsError::PermissionDenied);
         }
         let offset = if append {
-            let stat = stat_full_cached(self.node)?.size;
+            let stat = stat_full_cached_with_state(&self.inode_state)?.size;
             stat_logical_size(self.node, stat)
         } else {
             *self.offset.lock() as u64

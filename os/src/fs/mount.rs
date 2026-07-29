@@ -242,7 +242,7 @@ struct MountedFs {
     source: String,
     fs_type: &'static str,
     options: SleepMutex<&'static str>,
-    stat_flags: SleepMutex<u64>,
+    stat_flags: AtomicU64,
     backend: Arc<dyn ConcurrentFileSystemBackend>,
     pending_inode_releases: Arc<PendingReleaseQueue>,
 }
@@ -376,6 +376,10 @@ const MOUNT_CAPABILITY_OTHER: u8 = 2;
 const MOUNT_CAPABILITY_ABSENT: u8 = 3;
 static MOUNT_METADATA_CACHE_CAPABILITIES: [AtomicU8; FAST_MOUNT_CAPABILITY_SLOTS] =
     [const { AtomicU8::new(MOUNT_CAPABILITY_UNKNOWN) }; FAST_MOUNT_CAPABILITY_SLOTS];
+const MOUNT_STAT_FLAGS_UNKNOWN: u64 = 0;
+const MOUNT_STAT_FLAGS_ABSENT: u64 = u64::MAX;
+static MOUNT_STAT_FLAGS_FAST: [AtomicU64; FAST_MOUNT_CAPABILITY_SLOTS] =
+    [const { AtomicU64::new(MOUNT_STAT_FLAGS_UNKNOWN) }; FAST_MOUNT_CAPABILITY_SLOTS];
 // A mounted filesystem's root inode is immutable for its lifetime. Keep the
 // common lookup beside the capability table so path-walk root checks do not
 // serialize on the backend. Zero means uncached; valid u32 inode numbers are
@@ -393,6 +397,26 @@ fn set_mount_metadata_cache_capability(mount_id: MountId, fs_type: Option<&str>)
         None => MOUNT_CAPABILITY_ABSENT,
     };
     capability.store(value, Ordering::Release);
+}
+
+fn publish_mount_stat_flags(mount_id: MountId, flags: Option<u64>) {
+    let Some(slot) = MOUNT_STAT_FLAGS_FAST.get(mount_id.0) else {
+        return;
+    };
+    slot.store(flags.unwrap_or(MOUNT_STAT_FLAGS_ABSENT), Ordering::Release);
+}
+
+fn refresh_mounted_stat_flags(mounted: &Arc<MountedFs>) {
+    let flags = mounted.stat_flags.load(Ordering::Acquire);
+    let mounts = MOUNTS.lock();
+    for (index, candidate) in mounts.iter().enumerate() {
+        if candidate
+            .as_ref()
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, mounted))
+        {
+            publish_mount_stat_flags(MountId(index), Some(flags));
+        }
+    }
 }
 
 fn clear_mount_root_ino(mount_id: MountId) {
@@ -428,10 +452,14 @@ pub fn init_mounts() {
     {
         let mut mounts = MOUNTS.lock();
         mounts.resize_with(block_mount_count, || None);
-        mounts[0] = Some(primary_mount);
+        mounts[0] = Some(Arc::clone(&primary_mount));
         MOUNTS_FAST.publish(mounts.clone());
     }
     set_mount_metadata_cache_capability(MountId(0), Some("ext4"));
+    publish_mount_stat_flags(
+        MountId(0),
+        Some(primary_mount.stat_flags.load(Ordering::Acquire)),
+    );
     NEXT_MOUNT_ID.store(block_mount_count, Ordering::SeqCst);
 
     mount_extra_block_devices();
@@ -453,7 +481,7 @@ impl MountedFs {
             source,
             fs_type,
             options: SleepMutex::new(options),
-            stat_flags: SleepMutex::new(stat_flags),
+            stat_flags: AtomicU64::new(stat_flags),
             backend: Arc::new(SerializedBackend::new(backend)),
             pending_inode_releases: Arc::new(PendingReleaseQueue::new()),
         })
@@ -473,7 +501,7 @@ impl MountedFs {
             source,
             fs_type,
             options: SleepMutex::new(options),
-            stat_flags: SleepMutex::new(stat_flags),
+            stat_flags: AtomicU64::new(stat_flags),
             backend,
             pending_inode_releases: Arc::new(PendingReleaseQueue::new()),
         })
@@ -481,8 +509,11 @@ impl MountedFs {
 
     fn set_stat_flags(&self, flags: u64) {
         let flags = normalize_mount_stat_flags(flags);
-        let mut stat_flags = self.stat_flags.lock();
-        let old_nosymfollow = mount_flags_have_nosymfollow(*stat_flags);
+        // `options` is the rare-writer lock. Syscall readers consume only the
+        // atomic flags and never enter this critical section.
+        let mut options = self.options.lock();
+        let previous = self.stat_flags.swap(flags, Ordering::AcqRel);
+        let old_nosymfollow = mount_flags_have_nosymfollow(previous);
         let new_nosymfollow = mount_flags_have_nosymfollow(flags);
         if old_nosymfollow != new_nosymfollow {
             if new_nosymfollow {
@@ -491,8 +522,7 @@ impl MountedFs {
                 NOSYMFOLLOW_MOUNT_COUNT.fetch_sub(1, Ordering::Relaxed);
             }
         }
-        *stat_flags = flags;
-        *self.options.lock() = mount_options_from_flags(flags);
+        *options = mount_options_from_flags(flags);
     }
 }
 
@@ -638,6 +668,7 @@ fn register_mount(mounted: Arc<MountedFs>) -> MountId {
     let mount_id = MountId(NEXT_MOUNT_ID.fetch_add(1, Ordering::SeqCst));
     register_pending_release_queue(mount_id, &mounted);
     let fs_type = mounted.fs_type;
+    let stat_flags = mounted.stat_flags.load(Ordering::Acquire);
     let mut mounts = MOUNTS.lock();
     if mount_id.0 >= mounts.len() {
         mounts.resize_with(mount_id.0 + 1, || None);
@@ -646,6 +677,7 @@ fn register_mount(mounted: Arc<MountedFs>) -> MountId {
     MOUNTS_FAST.publish(mounts.clone());
     drop(mounts);
     set_mount_metadata_cache_capability(mount_id, Some(fs_type));
+    publish_mount_stat_flags(mount_id, Some(stat_flags));
     mount_id
 }
 
@@ -844,6 +876,24 @@ pub(super) fn stat_basic_cached(node: VfsNodeId) -> FsResult<super::FileStat> {
     })
 }
 
+pub(super) fn stat_basic_cached_with_state(
+    state: &inode_state::InodeState,
+) -> FsResult<super::FileStat> {
+    let node = state.node();
+    if !mount_supports_metadata_cache(node.mount_id) {
+        return with_mount(node.mount_id, BackendOp::StatBasic, |mount| {
+            mount.stat_basic(node.ino)
+        })
+        .ok_or(FsError::Io)?;
+    }
+    inode_state::stat_basic_or_load_state(state, || {
+        with_mount(node.mount_id, BackendOp::StatBasic, |mount| {
+            mount.stat_basic(node.ino)
+        })
+        .ok_or(FsError::Io)?
+    })
+}
+
 pub(super) fn stat_full_cached(node: VfsNodeId) -> FsResult<super::FileStat> {
     if !mount_supports_metadata_cache(node.mount_id) {
         return with_mount(node.mount_id, BackendOp::StatFull, |mount| {
@@ -852,6 +902,24 @@ pub(super) fn stat_full_cached(node: VfsNodeId) -> FsResult<super::FileStat> {
         .ok_or(FsError::Io)?;
     }
     inode_state::stat_full_or_load(node, || {
+        with_mount(node.mount_id, BackendOp::StatFull, |mount| {
+            mount.stat(node.ino)
+        })
+        .ok_or(FsError::Io)?
+    })
+}
+
+pub(super) fn stat_full_cached_with_state(
+    state: &inode_state::InodeState,
+) -> FsResult<super::FileStat> {
+    let node = state.node();
+    if !mount_supports_metadata_cache(node.mount_id) {
+        return with_mount(node.mount_id, BackendOp::StatFull, |mount| {
+            mount.stat(node.ino)
+        })
+        .ok_or(FsError::Io)?;
+    }
+    inode_state::stat_full_or_load_state(state, || {
         with_mount(node.mount_id, BackendOp::StatFull, |mount| {
             mount.stat(node.ino)
         })
@@ -914,6 +982,7 @@ fn ensure_mount_open(mount_id: MountId) -> Result<(), MountError> {
         drop(mounts);
         register_pending_release_queue(mount_id, &mount);
         set_mount_metadata_cache_capability(mount_id, Some(mount.fs_type));
+        publish_mount_stat_flags(mount_id, Some(mount.stat_flags.load(Ordering::Acquire)));
     }
     Ok(())
 }
@@ -2396,6 +2465,7 @@ pub(crate) fn mount_ext_scratch_at(
                 })
         {
             mounted.set_stat_flags(mount_flags_from_options(options));
+            refresh_mounted_stat_flags(mounted);
             mounted.clone()
         } else {
             let mounted = MountedFs::new(
@@ -2544,7 +2614,7 @@ pub(crate) fn set_mount_stat_flags(mount_id: MountId, flags: u64) -> Result<(), 
     }
     .ok_or(MountError::TargetNotMounted)?;
     let flags = normalize_mount_stat_flags(flags);
-    let current_flags = *mounted.stat_flags.lock();
+    let current_flags = mounted.stat_flags.load(Ordering::Acquire);
     if flags & MOUNT_STAT_RDONLY != 0
         && current_flags & MOUNT_STAT_RDONLY == 0
         && mount_has_writable_regular_open(mount_id)
@@ -2552,6 +2622,7 @@ pub(crate) fn set_mount_stat_flags(mount_id: MountId, flags: u64) -> Result<(), 
         return Err(MountError::TargetBusy);
     }
     mounted.set_stat_flags(flags);
+    refresh_mounted_stat_flags(&mounted);
     Ok(())
 }
 
@@ -2664,11 +2735,12 @@ fn release_dynamic_mount_source_if_unused(source_mount_id: MountId) {
     // can only fall back to the mount table/backend and never consume stale
     // metadata after unmount starts.
     set_mount_metadata_cache_capability(source_mount_id, None);
+    publish_mount_stat_flags(source_mount_id, None);
     clear_mount_root_ino(source_mount_id);
     let mut mounts = MOUNTS.lock();
     if let Some(slot) = mounts.get_mut(source_mount_id.0) {
         if let Some(mounted) = slot.as_ref() {
-            let flags = *mounted.stat_flags.lock();
+            let flags = mounted.stat_flags.load(Ordering::Acquire);
             if mount_flags_have_nosymfollow(flags) {
                 NOSYMFOLLOW_MOUNT_COUNT.fetch_sub(1, Ordering::Relaxed);
             }
@@ -2880,15 +2952,27 @@ fn mounted_fs(mount_id: MountId) -> Option<Arc<MountedFs>> {
 fn mount_metadata(mount_id: MountId) -> Option<(String, &'static str, &'static str, u64)> {
     let mounted = mounted_fs(mount_id)?;
     let options = *mounted.options.lock();
-    let stat_flags = *mounted.stat_flags.lock();
+    let stat_flags = mounted.stat_flags.load(Ordering::Acquire);
     let source = mounted.source.clone();
     perf::record_mount_metadata(source.len());
     Some((source, mounted.fs_type, options, stat_flags))
 }
 
 fn mount_stat_flags(mount_id: MountId) -> Option<u64> {
+    if let Some(slot) = MOUNT_STAT_FLAGS_FAST.get(mount_id.0) {
+        let flags = slot.load(Ordering::Acquire);
+        if flags == MOUNT_STAT_FLAGS_ABSENT {
+            return None;
+        }
+        if flags != MOUNT_STAT_FLAGS_UNKNOWN {
+            debug_assert_ne!(flags & MOUNT_STAT_VALID, 0);
+            perf::record_mount_fast_stat_flags();
+            return Some(flags);
+        }
+    }
     let mounted = mounted_fs(mount_id)?;
-    let stat_flags = *mounted.stat_flags.lock();
+    let stat_flags = mounted.stat_flags.load(Ordering::Acquire);
+    publish_mount_stat_flags(mount_id, Some(stat_flags));
     perf::record_mount_fast_stat_flags();
     Some(stat_flags)
 }

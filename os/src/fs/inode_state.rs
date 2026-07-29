@@ -205,6 +205,54 @@ struct MetadataCache {
     full: Option<CachedMetadata>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum MetadataCacheUpdate {
+    Mode(u32),
+    Owner {
+        uid: Option<u32>,
+        gid: Option<u32>,
+    },
+    Times {
+        atime: Option<super::FileTimestamp>,
+        mtime: Option<super::FileTimestamp>,
+        ctime: super::FileTimestamp,
+    },
+    InodeFlags(u32),
+}
+
+impl MetadataCacheUpdate {
+    fn apply(self, stat: &mut FileStat) {
+        match self {
+            Self::Mode(mode) => stat.mode = (stat.mode & !0o7777) | (mode & 0o7777),
+            Self::Owner { uid, gid } => {
+                if let Some(uid) = uid {
+                    stat.uid = uid;
+                }
+                if let Some(gid) = gid {
+                    stat.gid = gid;
+                }
+            }
+            Self::Times {
+                atime,
+                mtime,
+                ctime,
+            } => {
+                if let Some(atime) = atime {
+                    stat.atime_sec = atime.sec;
+                    stat.atime_nsec = atime.nsec;
+                }
+                if let Some(mtime) = mtime {
+                    stat.mtime_sec = mtime.sec;
+                    stat.mtime_nsec = mtime.nsec;
+                }
+                stat.ctime_sec = ctime.sec;
+                stat.ctime_nsec = ctime.nsec;
+            }
+            Self::InodeFlags(flags) => stat.inode_flags = flags,
+        }
+    }
+}
+
 struct VersionDomain {
     version: AtomicUsize,
     writer: SleepRwLock<()>,
@@ -252,6 +300,12 @@ impl VersionDomain {
 }
 
 impl VersionMutationGuard<'_> {
+    fn committed_version(&self) -> usize {
+        self.start_version
+            .checked_add(2)
+            .expect("inode version domain exhausted")
+    }
+
     fn commit(&mut self) {
         self.committed = true;
     }
@@ -262,9 +316,7 @@ impl Drop for VersionMutationGuard<'_> {
         let current = self.domain.version.load(Ordering::Acquire);
         assert_eq!(current & 1, 1, "inode mutation ended from stable version");
         let next = if self.committed {
-            self.start_version
-                .checked_add(2)
-                .expect("inode version domain exhausted")
+            self.committed_version()
         } else {
             self.start_version
         };
@@ -331,13 +383,51 @@ impl InodeState {
     fn cached_metadata(&self, full: bool, version: usize) -> Option<FileStat> {
         let metadata = self.metadata.read();
         let cached = if full { metadata.full } else { metadata.basic };
-        cached
+        let stat = cached
             .filter(|cached| cached.version == version)
-            .map(|cached| cached.stat)
+            .map(|cached| cached.stat)?;
+        // A mutation publishes an odd version before it can take the cache
+        // writer. Recheck while the cache read guard is still held so this
+        // lockless-version fast path linearizes either wholly before or wholly
+        // after the mutation.
+        (self.metadata_version.stable_version() == Some(version)).then_some(stat)
     }
 
     fn clear_cached_metadata(&self) {
         *self.metadata.write() = MetadataCache::default();
+    }
+
+    fn update_cached_metadata(
+        &self,
+        start_version: usize,
+        committed_version: usize,
+        update: MetadataCacheUpdate,
+    ) {
+        fn update_slot(
+            slot: &mut Option<CachedMetadata>,
+            start_version: usize,
+            committed_version: usize,
+            update: MetadataCacheUpdate,
+        ) {
+            let Some(cached) = slot.as_mut() else {
+                return;
+            };
+            if cached.version != start_version {
+                *slot = None;
+                return;
+            }
+            update.apply(&mut cached.stat);
+            cached.version = committed_version;
+        }
+
+        let mut metadata = self.metadata.write();
+        update_slot(
+            &mut metadata.basic,
+            start_version,
+            committed_version,
+            update,
+        );
+        update_slot(&mut metadata.full, start_version, committed_version, update);
     }
 }
 
@@ -389,19 +479,41 @@ pub(crate) fn initialize_new(node: VfsNodeId) -> Arc<InodeState> {
     state
 }
 
-pub(crate) fn with_metadata_mutation<V>(
+pub(crate) fn with_metadata_update<V>(
     node: VfsNodeId,
+    update: MetadataCacheUpdate,
     mutation: impl FnOnce() -> super::vfs::FsResult<V>,
 ) -> super::vfs::FsResult<V> {
-    invalidate_direct_stat_metadata(node);
     let state = state_for(node);
+    with_metadata_update_state(&state, update, mutation)
+}
+
+pub(crate) fn with_metadata_update_state<V>(
+    state: &InodeState,
+    update: MetadataCacheUpdate,
+    mutation: impl FnOnce() -> super::vfs::FsResult<V>,
+) -> super::vfs::FsResult<V> {
+    with_metadata_update_state_inner(state, update, mutation)
+}
+
+fn with_metadata_update_state_inner<V>(
+    state: &InodeState,
+    update: MetadataCacheUpdate,
+    mutation: impl FnOnce() -> super::vfs::FsResult<V>,
+) -> super::vfs::FsResult<V> {
+    let node = state.node();
+    invalidate_direct_stat_metadata(node);
     let mut guard = state.begin_metadata_mutation();
     let result = mutation();
     // A backend transaction may have made a partial visible change before
     // reporting an error. Conservatively invalidate and advance the epoch for
     // every attempted mutation so an old snapshot can never become stable
     // again after such an error.
-    state.clear_cached_metadata();
+    if result.is_ok() {
+        state.update_cached_metadata(guard.start_version, guard.committed_version(), update);
+    } else {
+        state.clear_cached_metadata();
+    }
     guard.commit();
     invalidate_direct_stat_metadata(node);
     result
@@ -411,8 +523,16 @@ pub(crate) fn with_mapping_mutation<V>(
     node: VfsNodeId,
     mutation: impl FnOnce() -> super::vfs::FsResult<V>,
 ) -> super::vfs::FsResult<V> {
-    invalidate_direct_stat_metadata(node);
     let state = state_for(node);
+    with_mapping_mutation_state(&state, mutation)
+}
+
+pub(crate) fn with_mapping_mutation_state<V>(
+    state: &InodeState,
+    mutation: impl FnOnce() -> super::vfs::FsResult<V>,
+) -> super::vfs::FsResult<V> {
+    let node = state.node();
+    invalidate_direct_stat_metadata(node);
     let mut guard = state.begin_mapping_mutation();
     let result = mutation();
     state.clear_cached_metadata();
@@ -424,9 +544,12 @@ pub(crate) fn with_mapping_mutation<V>(
 /// Variant for write paths whose backend compatibility API reports a byte
 /// count instead of `FsResult`. A non-empty write attempt conservatively bumps
 /// the mapping epoch because it may allocate, extend, or convert extents.
-pub(crate) fn with_mapping_mutation_value<V>(node: VfsNodeId, mutation: impl FnOnce() -> V) -> V {
+pub(crate) fn with_mapping_mutation_value_state<V>(
+    state: &InodeState,
+    mutation: impl FnOnce() -> V,
+) -> V {
+    let node = state.node();
     invalidate_direct_stat_metadata(node);
-    let state = state_for(node);
     let mut guard = state.begin_mapping_mutation();
     let result = mutation();
     state.clear_cached_metadata();
@@ -486,18 +609,30 @@ pub(crate) fn with_directory_mutations<V>(
 
 pub(crate) fn with_metadata_read<V>(node: VfsNodeId, read: impl FnOnce() -> V) -> V {
     let state = state_for(node);
+    with_metadata_read_state(&state, read)
+}
+
+pub(crate) fn with_metadata_read_state<V>(state: &InodeState, read: impl FnOnce() -> V) -> V {
     let _lease = state.metadata_version.read();
     read()
 }
 
 pub(crate) fn with_mapping_read<V>(node: VfsNodeId, read: impl FnOnce() -> V) -> V {
     let state = state_for(node);
+    with_mapping_read_state(&state, read)
+}
+
+pub(crate) fn with_mapping_read_state<V>(state: &InodeState, read: impl FnOnce() -> V) -> V {
     let _lease = state.mapping_version.read();
     read()
 }
 
 pub(crate) fn with_directory_read<V>(node: VfsNodeId, read: impl FnOnce(usize) -> V) -> V {
     let state = state_for(node);
+    with_directory_read_state(&state, read)
+}
+
+pub(crate) fn with_directory_read_state<V>(state: &InodeState, read: impl FnOnce(usize) -> V) -> V {
     let _lease = state.directory_version.read();
     let version = state
         .directory_version()
@@ -506,11 +641,10 @@ pub(crate) fn with_directory_read<V>(node: VfsNodeId, read: impl FnOnce(usize) -
 }
 
 fn metadata_or_load(
-    node: VfsNodeId,
+    state: &InodeState,
     full: bool,
     load: impl FnOnce() -> super::vfs::FsResult<FileStat>,
 ) -> super::vfs::FsResult<FileStat> {
-    let state = state_for(node);
     if let Some(version) = state.metadata_version.stable_version()
         && let Some(stat) = state.cached_metadata(full, version)
     {
@@ -545,14 +679,30 @@ pub(crate) fn stat_basic_or_load(
     node: VfsNodeId,
     load: impl FnOnce() -> super::vfs::FsResult<FileStat>,
 ) -> super::vfs::FsResult<FileStat> {
-    metadata_or_load(node, false, load)
+    let state = state_for(node);
+    stat_basic_or_load_state(&state, load)
+}
+
+pub(crate) fn stat_basic_or_load_state(
+    state: &InodeState,
+    load: impl FnOnce() -> super::vfs::FsResult<FileStat>,
+) -> super::vfs::FsResult<FileStat> {
+    metadata_or_load(state, false, load)
 }
 
 pub(crate) fn stat_full_or_load(
     node: VfsNodeId,
     load: impl FnOnce() -> super::vfs::FsResult<FileStat>,
 ) -> super::vfs::FsResult<FileStat> {
-    metadata_or_load(node, true, load)
+    let state = state_for(node);
+    stat_full_or_load_state(&state, load)
+}
+
+pub(crate) fn stat_full_or_load_state(
+    state: &InodeState,
+    load: impl FnOnce() -> super::vfs::FsResult<FileStat>,
+) -> super::vfs::FsResult<FileStat> {
+    metadata_or_load(state, true, load)
 }
 
 /// O(1) generation invalidation for dentry entries keyed by this directory.
