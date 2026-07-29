@@ -12,7 +12,7 @@ use super::vfs::{
 use super::{FS_STATX_ATTR_FLAGS, FileStat, FileTimestamp};
 use crate::drivers::block::VirtIOBlock;
 use crate::perf;
-use crate::sync::{RawSleepLock, RawSpinNoIrqLock, SleepMutex, SpinNoIrqLock};
+use crate::sync::{RawSleepLock, RawSpinNoIrqLock, SleepMutex, SleepRwLock, SpinNoIrqLock};
 use crate::task::suspend_current_and_run_next;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -33,8 +33,8 @@ use lwext4_rust::ffi::{
 use lwext4_rust::{
     BlockDevice as Ext4BlockDevice, EXT4_DEV_BSIZE,
     Ext4DirectoryReadPlan as LwExt4DirectoryReadPlan, Ext4Error, Ext4Filesystem, Ext4FlushProgress,
-    Ext4MappedReadPlan, Ext4MappedWritePlan, Ext4Result, Ext4SymlinkReadPlan, FsConfig, InodeType,
-    SystemHal,
+    Ext4MappedReadPlan, Ext4MappedWritePlan, Ext4Result, Ext4SymlinkReadPlan, FsConfig,
+    InodeMetadataUpdate, InodeType, SystemHal,
 };
 
 pub(super) struct KernelHal;
@@ -686,6 +686,7 @@ pub(super) struct Ext4Mount {
     #[cfg(feature = "perf-counters")]
     io_counters: Arc<Ext4IoCounters>,
     inode_runtime: Arc<Ext4InodeRuntimeTable>,
+    inode_metadata: Arc<Ext4InodeMetadataTable>,
 }
 
 #[derive(Clone, Copy)]
@@ -701,6 +702,251 @@ enum Ext4InodeMetadataMutation {
         gid: Option<u32>,
     },
     Flags(u32),
+}
+
+const EXT4_METADATA_MODE: u16 = 1 << 0;
+const EXT4_METADATA_UID: u16 = 1 << 1;
+const EXT4_METADATA_GID: u16 = 1 << 2;
+const EXT4_METADATA_ATIME: u16 = 1 << 3;
+const EXT4_METADATA_MTIME: u16 = 1 << 4;
+const EXT4_METADATA_CTIME: u16 = 1 << 5;
+const EXT4_METADATA_FLAGS: u16 = 1 << 6;
+
+#[derive(Default)]
+struct Ext4InodeMetadataShadow {
+    attr: Option<lwext4_rust::FileAttr>,
+    owned_fields: u16,
+    dirty_fields: u16,
+    first_dirty_epoch: u64,
+}
+
+#[repr(align(64))]
+struct Ext4InodeMetadataCell {
+    ino: u32,
+    shadow: SleepMutex<Ext4InodeMetadataShadow>,
+}
+
+impl Ext4InodeMetadataCell {
+    fn new(ino: u32) -> Self {
+        Self {
+            ino,
+            shadow: SleepMutex::new(Ext4InodeMetadataShadow::default()),
+        }
+    }
+}
+
+struct Ext4InodeMetadataShard {
+    populated: AtomicBool,
+    entries: SleepRwLock<BTreeMap<u32, Arc<Ext4InodeMetadataCell>>>,
+}
+
+impl Ext4InodeMetadataShard {
+    fn new() -> Self {
+        Self {
+            populated: AtomicBool::new(false),
+            entries: SleepRwLock::new(BTreeMap::new()),
+        }
+    }
+}
+
+/// Persistent in-core metadata ownership for one ext4 mount.
+///
+/// The shard locks protect only entry lookup/installation. All sleeping inode
+/// work happens after cloning the stable cell `Arc`; independent inodes then
+/// mutate disjoint cache lines even when their raw inodes share one disk block.
+struct Ext4InodeMetadataTable {
+    shards: Vec<Ext4InodeMetadataShard>,
+    dirty_epoch: AtomicU64,
+}
+
+impl Ext4InodeMetadataTable {
+    fn new() -> Self {
+        Self {
+            shards: (0..EXT4_INODE_RUNTIME_SHARDS)
+                .map(|_| Ext4InodeMetadataShard::new())
+                .collect(),
+            dirty_epoch: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn shard(&self, ino: u32) -> &Ext4InodeMetadataShard {
+        let ino = ino as usize;
+        &self.shards[(ino ^ (ino >> 5)) % self.shards.len()]
+    }
+
+    fn cell(&self, ino: u32) -> Arc<Ext4InodeMetadataCell> {
+        let shard = self.shard(ino);
+        if shard.populated.load(Ordering::Acquire)
+            && let Some(cell) = shard.entries.read().get(&ino).cloned()
+        {
+            return cell;
+        }
+        let candidate = Arc::new(Ext4InodeMetadataCell::new(ino));
+        let mut entries = shard.entries.write();
+        let cell = entries.entry(ino).or_insert(candidate).clone();
+        shard.populated.store(true, Ordering::Release);
+        cell
+    }
+
+    fn existing_cell(&self, ino: u32) -> Option<Arc<Ext4InodeMetadataCell>> {
+        let shard = self.shard(ino);
+        if !shard.populated.load(Ordering::Acquire) {
+            return None;
+        }
+        shard.entries.read().get(&ino).cloned()
+    }
+
+    fn mark_dirty(&self, shadow: &mut Ext4InodeMetadataShadow) {
+        if shadow.first_dirty_epoch == 0 {
+            shadow.first_dirty_epoch = self.dirty_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        }
+    }
+
+    fn dirty_ticket(&self) -> u64 {
+        self.dirty_epoch.load(Ordering::Acquire)
+    }
+
+    fn cells_snapshot(&self) -> Vec<Arc<Ext4InodeMetadataCell>> {
+        let mut cells = Vec::new();
+        for shard in &self.shards {
+            if shard.populated.load(Ordering::Acquire) {
+                cells.extend(shard.entries.read().values().cloned());
+            }
+        }
+        cells
+    }
+
+    fn remove(&self, ino: u32) {
+        let shard = self.shard(ino);
+        if !shard.populated.load(Ordering::Acquire) {
+            return;
+        }
+        let mut entries = shard.entries.write();
+        entries.remove(&ino);
+        if entries.is_empty() {
+            shard.populated.store(false, Ordering::Release);
+        }
+    }
+
+    fn overlay_attr(&self, ino: u32, attr: &mut lwext4_rust::FileAttr) {
+        let Some(cell) = self.existing_cell(ino) else {
+            return;
+        };
+        let shadow = cell.shadow.lock();
+        let Some(cached) = shadow.attr.as_ref() else {
+            return;
+        };
+        let fields = shadow.owned_fields;
+        if fields & EXT4_METADATA_MODE != 0 {
+            attr.mode = cached.mode;
+        }
+        if fields & EXT4_METADATA_UID != 0 {
+            attr.uid = cached.uid;
+        }
+        if fields & EXT4_METADATA_GID != 0 {
+            attr.gid = cached.gid;
+        }
+        if fields & EXT4_METADATA_ATIME != 0 {
+            attr.atime = cached.atime;
+        }
+        if fields & EXT4_METADATA_MTIME != 0 {
+            attr.mtime = cached.mtime;
+        }
+        if fields & EXT4_METADATA_CTIME != 0 {
+            attr.ctime = cached.ctime;
+        }
+        if fields & EXT4_METADATA_FLAGS != 0 {
+            attr.flags = cached.flags;
+        }
+    }
+
+    fn cached_flags(&self, ino: u32) -> Option<u32> {
+        let cell = self.existing_cell(ino)?;
+        let shadow = cell.shadow.lock();
+        (shadow.owned_fields & EXT4_METADATA_FLAGS != 0).then(|| {
+            shadow
+                .attr
+                .as_ref()
+                .expect("owned inode flags without shadow")
+                .flags
+        })
+    }
+}
+
+impl Ext4InodeMetadataShadow {
+    fn apply(&mut self, mutation: Ext4InodeMetadataMutation) -> FsResult {
+        let attr = self
+            .attr
+            .as_mut()
+            .expect("ext4 metadata shadow mutated before initialization");
+        let fields = match mutation {
+            Ext4InodeMetadataMutation::Times {
+                atime,
+                mtime,
+                ctime,
+            } => {
+                let mut fields = EXT4_METADATA_CTIME;
+                if let Some(atime) = atime {
+                    attr.atime = atime.to_duration();
+                    fields |= EXT4_METADATA_ATIME;
+                }
+                if let Some(mtime) = mtime {
+                    attr.mtime = mtime.to_duration();
+                    fields |= EXT4_METADATA_MTIME;
+                }
+                attr.ctime = ctime.to_duration();
+                fields
+            }
+            Ext4InodeMetadataMutation::Mode(mode) => {
+                attr.mode = (attr.mode & !0o7777) | (mode & 0o7777);
+                EXT4_METADATA_MODE
+            }
+            Ext4InodeMetadataMutation::Owner { uid, gid } => {
+                if uid.is_some_and(|uid| uid > u16::MAX as u32)
+                    || gid.is_some_and(|gid| gid > u16::MAX as u32)
+                {
+                    // UNFINISHED: The wrapper currently exposes only the low
+                    // 16-bit ext4 uid/gid fields.
+                    return Err(FsError::InvalidInput);
+                }
+                let mut fields = 0;
+                if let Some(uid) = uid {
+                    attr.uid = uid;
+                    fields |= EXT4_METADATA_UID;
+                }
+                if let Some(gid) = gid {
+                    attr.gid = gid;
+                    fields |= EXT4_METADATA_GID;
+                }
+                fields
+            }
+            Ext4InodeMetadataMutation::Flags(flags) => {
+                attr.flags = flags;
+                EXT4_METADATA_FLAGS
+            }
+        };
+        self.owned_fields |= fields;
+        self.dirty_fields |= fields;
+        Ok(())
+    }
+
+    fn writeback_update(&self) -> InodeMetadataUpdate {
+        let attr = self
+            .attr
+            .as_ref()
+            .expect("dirty ext4 metadata fields without a shadow");
+        let dirty = self.dirty_fields;
+        InodeMetadataUpdate {
+            mode: (dirty & EXT4_METADATA_MODE != 0).then_some(attr.mode),
+            uid: (dirty & EXT4_METADATA_UID != 0).then_some(attr.uid as u16),
+            gid: (dirty & EXT4_METADATA_GID != 0).then_some(attr.gid as u16),
+            atime: (dirty & EXT4_METADATA_ATIME != 0).then_some(attr.atime),
+            mtime: (dirty & EXT4_METADATA_MTIME != 0).then_some(attr.mtime),
+            ctime: (dirty & EXT4_METADATA_CTIME != 0).then_some(attr.ctime),
+            flags: (dirty & EXT4_METADATA_FLAGS != 0).then_some(attr.flags),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -859,6 +1105,7 @@ impl Ext4Mount {
         #[cfg(feature = "perf-counters")]
         let io_counters = Arc::new(Ext4IoCounters::default());
         let inode_runtime = Arc::new(Ext4InodeRuntimeTable::new());
+        let inode_metadata = Arc::new(Ext4InodeMetadataTable::new());
         Ok(Self {
             fs: KernelExt4Fs::new(
                 KernelDisk {
@@ -885,6 +1132,7 @@ impl Ext4Mount {
             #[cfg(feature = "perf-counters")]
             io_counters,
             inode_runtime,
+            inode_metadata,
         })
     }
 
@@ -1074,6 +1322,7 @@ impl Ext4Mount {
     fn free_unlinked_inode(&mut self, ino: u32) -> FsResult<InodeRelease> {
         self.fs.free_unlinked_inode(ino).map_err(map_ext4_error)?;
         self.inode_runtime.remove(ino);
+        self.inode_metadata.remove(ino);
         Ok(InodeRelease::Freed)
     }
 
@@ -1373,6 +1622,7 @@ pub(super) struct ConcurrentExt4Backend {
     flush_coordinator: SleepMutex<()>,
     completed_flush_ticket: AtomicU64,
     inode_runtime: Arc<Ext4InodeRuntimeTable>,
+    inode_metadata: Arc<Ext4InodeMetadataTable>,
     write_leases: Arc<Ext4WriteLeaseTable>,
 }
 
@@ -1390,6 +1640,7 @@ impl ConcurrentExt4Backend {
             block_versions.clone(),
         )?;
         let inode_runtime = writer.inode_runtime.clone();
+        let inode_metadata = writer.inode_metadata.clone();
         let writer = SharedExt4WriteCore::new(writer);
         let flush_handle = writer.flush_handle();
         Ok(Self {
@@ -1399,6 +1650,7 @@ impl ConcurrentExt4Backend {
             flush_coordinator: SleepMutex::new(()),
             completed_flush_ticket: AtomicU64::new(0),
             inode_runtime,
+            inode_metadata,
             write_leases: Arc::new(Ext4WriteLeaseTable::new()),
         })
     }
@@ -1508,23 +1760,63 @@ impl ConcurrentExt4Backend {
     fn mutate_inode_metadata(&self, ino: u32, mutation: Ext4InodeMetadataMutation) -> FsResult {
         let op = BackendOp::NamespaceMutation;
         perf::record_ext4_metadata_transaction_attempt();
-        let result = self.mutate_shared(op, |writer| {
-            // Count only callers that entered the canonical shared core, not
-            // tasks sleeping on the rwlock or the cohort flush below.
-            perf::record_ext4_metadata_transaction_begin();
-            let result = writer.mutate_inode_metadata_shared(ino, mutation);
-            perf::record_ext4_metadata_transaction_end();
-            result
-        });
+        #[cfg(feature = "perf-counters")]
+        perf::record_backend_op_call(op);
+        let writer = self.lock_writer_shared(op);
+        let mount = self.writer.shared();
+        let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
+        #[cfg(feature = "perf-counters")]
+        let io_before = mount.io_counters.snapshot();
+        #[cfg(feature = "perf-counters")]
+        let op_hold_scope = perf::time_backend_op_hold(op);
+        let cell = self.inode_metadata.cell(ino);
+        perf::record_ext4_metadata_transaction_begin();
+        let result = (|| {
+            let mut shadow = cell.shadow.lock();
+            if shadow.attr.is_none() {
+                let mut attr = lwext4_rust::FileAttr::default();
+                mount.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
+                shadow.attr = Some(attr);
+            }
+            shadow.apply(mutation)?;
+            if shadow.dirty_fields != 0 {
+                self.inode_metadata.mark_dirty(&mut shadow);
+            }
+            Ok(())
+        })();
+        perf::record_ext4_metadata_transaction_end();
+        #[cfg(feature = "perf-counters")]
+        {
+            drop(op_hold_scope);
+            perf::record_backend_op_io(op, mount.io_counters.snapshot().delta_since(io_before));
+        }
+        drop(writer);
+        drop(hold_scope);
         if result.is_ok() {
-            // The canonical cache owns writeback accounting. These legacy
-            // transaction fields remain zero until the flush-ticket counters
-            // replace them in the next checkpoint.
+            // Per-inode shadows merge into the canonical cache at sync. The
+            // retired private-core transaction fields remain zero.
             perf::record_ext4_metadata_transaction_commit(0, 0, 0, 0, 0);
         } else {
             perf::record_ext4_metadata_transaction_fallback();
         }
         result
+    }
+
+    fn materialize_metadata_shadows(&self, mount: &Ext4Mount, ticket: u64) -> FsResult {
+        for cell in self.inode_metadata.cells_snapshot() {
+            let mut shadow = cell.shadow.lock();
+            if shadow.first_dirty_epoch == 0 || shadow.first_dirty_epoch > ticket {
+                continue;
+            }
+            debug_assert_ne!(shadow.dirty_fields, 0);
+            mount
+                .fs
+                .apply_inode_metadata(cell.ino, shadow.writeback_update())
+                .map_err(map_ext4_error)?;
+            shadow.dirty_fields = 0;
+            shadow.first_dirty_epoch = 0;
+        }
+        Ok(())
     }
 
     fn with_writer_read<V>(&self, op: BackendOp, f: impl FnOnce(&mut Ext4Mount) -> V) -> V {
@@ -1629,13 +1921,24 @@ impl ConcurrentExt4Backend {
         #[cfg(feature = "perf-counters")]
         let io_before = self.flush_handle.io_snapshot();
 
-        // Capture the durability boundary while shared metadata callers are
-        // quiescent only for this short read-side critical section. Device
-        // writeback and all waits happen after the core guard is released.
+        // First capture the in-core inode boundary. Covered shadows are merged
+        // into the canonical bcache while legacy inode removal is excluded;
+        // device writeback and all waits still happen after core admission is
+        // released.
+        let shadow_ticket = self.inode_metadata.dirty_ticket();
         let writer = self.lock_writer_shared(op);
         let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
         #[cfg(feature = "perf-counters")]
         let op_hold_scope = perf::time_backend_op_hold(op);
+        if let Err(err) = self.materialize_metadata_shadows(self.writer.shared(), shadow_ticket) {
+            #[cfg(feature = "perf-counters")]
+            drop(op_hold_scope);
+            drop(writer);
+            drop(hold_scope);
+            #[cfg(feature = "perf-counters")]
+            perf::record_backend_op_io(op, self.flush_handle.io_snapshot().delta_since(io_before));
+            return Err(err);
+        }
         let ticket = self.writer.shared().dirty_ticket();
         #[cfg(feature = "perf-counters")]
         drop(op_hold_scope);
@@ -2022,6 +2325,9 @@ impl Ext4Mount {
     }
 
     fn inode_flags_shared(&self, ino: u32) -> FsResult<u32> {
+        if let Some(flags) = self.inode_metadata.cached_flags(ino) {
+            return Ok(flags);
+        }
         self.fs.inode_flags(ino).map_err(map_ext4_error)
     }
 
@@ -2031,10 +2337,8 @@ impl Ext4Mount {
             let _profile_scope = perf::time_scope(perf::ProfilePoint::Ext4StatGetAttr);
             self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
         }
-        let inode_flags = {
-            let _profile_scope = perf::time_scope(perf::ProfilePoint::Ext4StatInodeFlags);
-            self.fs.inode_flags(ino).map_err(map_ext4_error)?
-        };
+        self.inode_metadata.overlay_attr(ino, &mut attr);
+        let inode_flags = attr.flags;
         Ok(self.stat_from_attr(ino, attr, inode_flags, FS_STATX_ATTR_FLAGS))
     }
 
@@ -2044,6 +2348,7 @@ impl Ext4Mount {
             let _profile_scope = perf::time_scope(perf::ProfilePoint::Ext4StatGetAttr);
             self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
         }
+        self.inode_metadata.overlay_attr(ino, &mut attr);
         Ok(self.stat_from_attr(ino, attr, 0, 0))
     }
 
@@ -2051,9 +2356,12 @@ impl Ext4Mount {
     /// The caller owns the parent-directory VFS mutation lease; allocator and
     /// bcache state are protected by the canonical writer's callbacks.
     fn create_file_shared(&self, parent_ino: u32, leaf_name: &str) -> FsResult<u32> {
-        self.fs
+        let ino = self
+            .fs
             .create(parent_ino, leaf_name, InodeType::RegularFile, 0o644)
-            .map_err(map_ext4_error)
+            .map_err(map_ext4_error)?;
+        self.inode_metadata.remove(ino);
+        Ok(ino)
     }
 
     fn create_node_shared(
@@ -2076,6 +2384,7 @@ impl Ext4Mount {
             .fs
             .create(parent_ino, leaf_name, inode_type, mode)
             .map_err(map_ext4_error)?;
+        self.inode_metadata.remove(ino);
         if matches!(kind, FsNodeKind::CharacterDevice | FsNodeKind::BlockDevice) {
             // UNFINISHED: The vendored wrapper does not expose persistent
             // device major/minor payloads yet. Runtime state is independently
@@ -2086,9 +2395,12 @@ impl Ext4Mount {
     }
 
     fn create_dir_shared(&self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32> {
-        self.fs
+        let ino = self
+            .fs
             .create(parent_ino, leaf_name, InodeType::Directory, mode)
-            .map_err(map_ext4_error)
+            .map_err(map_ext4_error)?;
+        self.inode_metadata.remove(ino);
+        Ok(ino)
     }
 
     fn set_mode_shared(&self, ino: u32, mode: u32) -> FsResult {
@@ -2108,37 +2420,6 @@ impl Ext4Mount {
         self.fs
             .set_owner(ino, uid as u16, gid as u16)
             .map_err(map_ext4_error)
-    }
-
-    /// Audited per-inode mutation used through `SharedExt4WriteCore` while the
-    /// VFS owns that inode's metadata-write lease. Distinct inodes may enter
-    /// concurrently; inode-table blocks and cache entries use the canonical
-    /// writer's narrow lwext4 callback locks.
-    fn mutate_inode_metadata_shared(
-        &self,
-        ino: u32,
-        mutation: Ext4InodeMetadataMutation,
-    ) -> FsResult {
-        match mutation {
-            Ext4InodeMetadataMutation::Times {
-                atime,
-                mtime,
-                ctime,
-            } => self
-                .fs
-                .set_times(
-                    ino,
-                    atime.map(FileTimestamp::to_duration),
-                    mtime.map(FileTimestamp::to_duration),
-                    Some(ctime.to_duration()),
-                )
-                .map_err(map_ext4_error),
-            Ext4InodeMetadataMutation::Mode(mode) => self.set_mode_shared(ino, mode),
-            Ext4InodeMetadataMutation::Owner { uid, gid } => self.set_owner_shared(ino, uid, gid),
-            Ext4InodeMetadataMutation::Flags(flags) => {
-                self.fs.set_inode_flags(ino, flags).map_err(map_ext4_error)
-            }
-        }
     }
 
     fn create_node_with_owner_shared(
@@ -2344,10 +2625,12 @@ impl LegacyFileSystemBackend for Ext4Mount {
             .fs
             .create(parent_ino, leaf_name, InodeType::Symlink, 0o777)
             .map_err(map_ext4_error)?;
+        self.inode_metadata.remove(ino);
         match self.fs.set_symlink(ino, target).map_err(map_ext4_error) {
             Ok(()) => Ok(()),
             Err(err) => {
                 let _ = self.fs.unlink(parent_ino, leaf_name);
+                self.inode_metadata.remove(ino);
                 Err(err)
             }
         }
@@ -2395,6 +2678,9 @@ impl LegacyFileSystemBackend for Ext4Mount {
             let inode_exists = self.fs.get_attr(child_ino, &mut attr).is_ok();
             self.inode_runtime
                 .finish_unlink(child_ino, false, inode_exists);
+            if !inode_exists {
+                self.inode_metadata.remove(child_ino);
+            }
         }
         Ok(())
     }
@@ -2665,6 +2951,7 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
     }
 
     fn shutdown(&self) -> FsResult {
+        self.sync_current()?;
         self.mutate(BackendOp::Sync, |writer| writer.shutdown())
     }
 

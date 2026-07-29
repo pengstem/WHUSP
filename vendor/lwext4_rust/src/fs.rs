@@ -51,6 +51,20 @@ pub struct Ext4FlushProgress {
     pub pending_refs: u32,
 }
 
+/// Fields from one in-core inode shadow that must be merged into its raw
+/// ext4 inode. `None` preserves the value currently stored in the canonical
+/// inode-table buffer.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InodeMetadataUpdate {
+    pub mode: Option<u32>,
+    pub uid: Option<u16>,
+    pub gid: Option<u16>,
+    pub atime: Option<Duration>,
+    pub mtime: Option<Duration>,
+    pub ctime: Option<Duration>,
+    pub flags: Option<u32>,
+}
+
 pub struct Ext4Filesystem<Hal: SystemHal, Dev: BlockDevice> {
     inner: Box<ext4_fs>,
     bdev: Ext4BlockDevice<Dev>,
@@ -288,6 +302,35 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         }
         if let Some(ctime) = ctime {
             inode.set_ctime(&ctime);
+        }
+        Ok(())
+    }
+
+    /// Merge the dirty fields of one in-core inode shadow with a single
+    /// canonical inode-table reference. Unlisted fields, including nlink,
+    /// size, block count, and the extent root, remain untouched.
+    pub fn apply_inode_metadata(&self, ino: u32, update: InodeMetadataUpdate) -> Ext4Result<()> {
+        let mut inode = self.inode_ref(ino)?;
+        if let Some(mode) = update.mode {
+            inode.set_mode(mode);
+        }
+        if update.uid.is_some() || update.gid.is_some() {
+            inode.set_owner(
+                update.uid.unwrap_or_else(|| inode.uid()),
+                update.gid.unwrap_or_else(|| inode.gid()),
+            );
+        }
+        if let Some(atime) = update.atime {
+            inode.set_atime(&atime);
+        }
+        if let Some(mtime) = update.mtime {
+            inode.set_mtime(&mtime);
+        }
+        if let Some(ctime) = update.ctime {
+            inode.set_ctime(&ctime);
+        }
+        if let Some(flags) = update.flags {
+            inode.set_flags(flags);
         }
         Ok(())
     }
