@@ -247,6 +247,36 @@ struct MountedFs {
     pending_inode_releases: Arc<PendingReleaseQueue>,
 }
 
+/// Owned lifetime reference for repeated operations on one mounted backend.
+///
+/// The lease is created while the mount snapshot's CPU-local reader epoch is
+/// active, then owns the `MountedFs` Arc after that short epoch ends. Backend
+/// calls borrow the backend and release queue from this one stable owner, so a
+/// resident open file does not modify shared Arc counts on every syscall.
+pub(super) struct MountedBackendLease {
+    mounted: Arc<MountedFs>,
+}
+
+impl MountedBackendLease {
+    pub(super) fn call<V>(
+        &self,
+        op: BackendOp,
+        f: impl FnOnce(&dyn ConcurrentFileSystemBackend) -> V,
+    ) -> V {
+        let backend = self.mounted.backend.as_ref();
+        if matches!(
+            op,
+            BackendOp::Write
+                | BackendOp::TruncateAllocate
+                | BackendOp::NamespaceMutation
+                | BackendOp::Sync
+        ) {
+            drain_pending_inode_releases(&self.mounted.pending_inode_releases, backend);
+        }
+        f(backend)
+    }
+}
+
 struct PendingReleaseQueue {
     entries: UPIntrFreeCell<Vec<PendingInodeRelease>>,
     nonempty: AtomicBool,
@@ -715,22 +745,14 @@ pub(super) fn with_mount<V>(
     op: BackendOp,
     f: impl FnOnce(&dyn ConcurrentFileSystemBackend) -> V,
 ) -> Option<V> {
-    let mounted = MOUNTS_FAST.get(mount_id)?;
-    let backend = Arc::clone(&mounted.backend);
-    let pending_releases = Arc::clone(&mounted.pending_inode_releases);
-    // A deferred final unlink only has to complete before an operation that
-    // can allocate/reuse an inode or commit filesystem state. Read-only
-    // operations must not inherit unrelated close work or its writer lock.
-    if matches!(
-        op,
-        BackendOp::Write
-            | BackendOp::TruncateAllocate
-            | BackendOp::NamespaceMutation
-            | BackendOp::Sync
-    ) {
-        drain_pending_inode_releases(&pending_releases, backend.as_ref());
-    }
-    Some(f(backend.as_ref()))
+    let lease = mounted_backend_lease(mount_id)?;
+    Some(lease.call(op, f))
+}
+
+pub(super) fn mounted_backend_lease(mount_id: MountId) -> Option<MountedBackendLease> {
+    MOUNTS_FAST
+        .get(mount_id)
+        .map(|mounted| MountedBackendLease { mounted })
 }
 
 pub(crate) fn overlay_real_node(node: VfsNodeId) -> Option<VfsNodeId> {
@@ -849,6 +871,38 @@ pub(super) fn release_inode_from_drop(state: &Arc<InodeState>) {
     }
 }
 
+/// Releases an inode through the mount lifetime already retained by an open
+/// file. This avoids returning to the mount snapshot and lets a failed
+/// try-release use the exact queue owned by the same backend incarnation.
+pub(super) fn release_inode_from_drop_with_lease(
+    state: &Arc<InodeState>,
+    lease: &MountedBackendLease,
+) {
+    if !inode_state::is_current(state) {
+        return;
+    }
+    let node = state.node();
+    match lease.mounted.backend.try_release_inode(node.ino) {
+        Some(Ok(InodeRelease::Freed)) => {
+            inode_state::remove_if_same(node, state);
+        }
+        Some(Ok(InodeRelease::Retained)) => {}
+        Some(Err(FsError::NotFound)) => {
+            inode_state::remove_if_same(node, state);
+        }
+        Some(Err(_)) | None => {
+            lease
+                .mounted
+                .pending_inode_releases
+                .push(PendingInodeRelease {
+                    ino: node.ino,
+                    state: Arc::clone(state),
+                    attempts: 0,
+                });
+        }
+    }
+}
+
 /// Pins an inode and installs its exact-incarnation Rust-side state only after
 /// the backend has confirmed that the inode still exists.
 pub(super) fn retain_inode(node: VfsNodeId) -> FsResult<Arc<InodeState>> {
@@ -857,6 +911,18 @@ pub(super) fn retain_inode(node: VfsNodeId) -> FsResult<Arc<InodeState>> {
             mount.retain_inode(node.ino)
         })
         .ok_or(FsError::Io)?
+    })?;
+    Ok(inode_state::state_for(node))
+}
+
+pub(super) fn retain_inode_with_lease(
+    node: VfsNodeId,
+    lease: &MountedBackendLease,
+) -> FsResult<Arc<InodeState>> {
+    inode_state::with_metadata_read(node, || {
+        lease.call(BackendOp::InodeLifetime, |mount| {
+            mount.retain_inode(node.ino)
+        })
     })?;
     Ok(inode_state::state_for(node))
 }
@@ -876,21 +942,16 @@ pub(super) fn stat_basic_cached(node: VfsNodeId) -> FsResult<super::FileStat> {
     })
 }
 
-pub(super) fn stat_basic_cached_with_state(
+pub(super) fn stat_basic_cached_with_state_and_lease(
     state: &inode_state::InodeState,
+    lease: &MountedBackendLease,
 ) -> FsResult<super::FileStat> {
     let node = state.node();
     if !mount_supports_metadata_cache(node.mount_id) {
-        return with_mount(node.mount_id, BackendOp::StatBasic, |mount| {
-            mount.stat_basic(node.ino)
-        })
-        .ok_or(FsError::Io)?;
+        return lease.call(BackendOp::StatBasic, |mount| mount.stat_basic(node.ino));
     }
     inode_state::stat_basic_or_load_state(state, || {
-        with_mount(node.mount_id, BackendOp::StatBasic, |mount| {
-            mount.stat_basic(node.ino)
-        })
-        .ok_or(FsError::Io)?
+        lease.call(BackendOp::StatBasic, |mount| mount.stat_basic(node.ino))
     })
 }
 
@@ -909,21 +970,16 @@ pub(super) fn stat_full_cached(node: VfsNodeId) -> FsResult<super::FileStat> {
     })
 }
 
-pub(super) fn stat_full_cached_with_state(
+pub(super) fn stat_full_cached_with_state_and_lease(
     state: &inode_state::InodeState,
+    lease: &MountedBackendLease,
 ) -> FsResult<super::FileStat> {
     let node = state.node();
     if !mount_supports_metadata_cache(node.mount_id) {
-        return with_mount(node.mount_id, BackendOp::StatFull, |mount| {
-            mount.stat(node.ino)
-        })
-        .ok_or(FsError::Io)?;
+        return lease.call(BackendOp::StatFull, |mount| mount.stat(node.ino));
     }
     inode_state::stat_full_or_load_state(state, || {
-        with_mount(node.mount_id, BackendOp::StatFull, |mount| {
-            mount.stat(node.ino)
-        })
-        .ok_or(FsError::Io)?
+        lease.call(BackendOp::StatFull, |mount| mount.stat(node.ino))
     })
 }
 

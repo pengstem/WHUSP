@@ -4,11 +4,13 @@ use super::super::dirent::{DT_DIR, RawDirEntry, write_dir_entries_with_offset_ba
 use super::super::inode::{OpenFlags, link_node_in};
 use super::super::inode_state;
 use super::super::mount::{
-    MountId, MountNamespaceId, mount_any_nosymfollow, mount_exists, mount_is_devfs,
-    mount_is_noatime, mount_is_nodev, mount_is_nodiratime, mount_is_nosymfollow,
+    MountId, MountNamespaceId, MountedBackendLease, mount_any_nosymfollow, mount_exists,
+    mount_is_devfs, mount_is_noatime, mount_is_nodev, mount_is_nodiratime, mount_is_nosymfollow,
     mount_is_read_only, mount_supports_dirty_writeback, mount_supports_page_cache,
-    release_inode_from_drop, retain_inode, stat_basic_cached, stat_basic_cached_with_state,
-    stat_full_cached, stat_full_cached_with_state, synthetic_children_for_dir, with_mount,
+    mounted_backend_lease, release_inode_from_drop, release_inode_from_drop_with_lease,
+    retain_inode, retain_inode_with_lease, stat_basic_cached,
+    stat_basic_cached_with_state_and_lease, stat_full_cached,
+    stat_full_cached_with_state_and_lease, synthetic_children_for_dir, with_mount,
 };
 use super::super::named_fifo::open_named_fifo;
 use super::super::path::{PathContext, WorkingDir};
@@ -1337,6 +1339,7 @@ fn prepare_created_file_mode(parent_stat: FileStat, attrs: &FileCreateAttrs) -> 
 pub(crate) struct VfsFile {
     node: VfsNodeId,
     inode_state: Arc<inode_state::InodeState>,
+    mount_backend: MountedBackendLease,
     parent: Option<VfsNodeId>,
     kind: FsNodeKind,
     namespace_id: MountNamespaceId,
@@ -1359,6 +1362,14 @@ struct CachedDirectorySnapshot {
 }
 
 impl VfsFile {
+    fn with_backend<V>(
+        &self,
+        op: BackendOp,
+        f: impl FnOnce(&dyn super::ConcurrentFileSystemBackend) -> V,
+    ) -> V {
+        self.mount_backend.call(op, f)
+    }
+
     fn new(
         path: VfsPath,
         parent: Option<VfsNodeId>,
@@ -1373,17 +1384,18 @@ impl VfsFile {
         let visible_path = path.visible_path;
         // An open file description pins its backend inode even if the path is
         // later unlinked. Keep this retain paired with Drop's release path.
-        let inode_state = retain_inode(node)?;
-        let read_snapshot_supported = with_mount(node.mount_id, BackendOp::ReadPlan, |mount| {
+        let mount_backend = mounted_backend_lease(node.mount_id).ok_or(FsError::Io)?;
+        let inode_state = retain_inode_with_lease(node, &mount_backend)?;
+        let read_snapshot_supported = mount_backend.call(BackendOp::ReadPlan, |mount| {
             mount.supports_read_snapshot(node.ino)
-        })
-        .unwrap_or(false);
+        });
         let supports_page_cache = mount_supports_page_cache(node.mount_id);
         let supports_dirty_writeback = mount_supports_dirty_writeback(node.mount_id);
         track_writable_regular_open(node, kind, writable);
         let file = Self {
             node,
             inode_state,
+            mount_backend,
             parent,
             kind,
             namespace_id,
@@ -1429,12 +1441,14 @@ impl VfsFile {
         }
         let mut offset = self.offset.lock();
         if append {
-            let stat = match stat_full_cached_with_state(&self.inode_state) {
-                Ok(stat) => stat,
-                Err(_) => {
-                    return 0;
-                }
-            };
+            let stat =
+                match stat_full_cached_with_state_and_lease(&self.inode_state, &self.mount_backend)
+                {
+                    Ok(stat) => stat,
+                    Err(_) => {
+                        return 0;
+                    }
+                };
             *offset = stat_logical_size(self.node, stat.size) as usize;
         }
         *self.read_snapshot.lock() = None;
@@ -1570,25 +1584,22 @@ impl VfsFile {
         point: perf::ProfilePoint,
     ) -> usize {
         let _profile_scope = perf::time_scope(point);
-        let Some(read_size) = inode_state::with_mapping_read_state(&self.inode_state, || {
+        let read_size = inode_state::with_mapping_read_state(&self.inode_state, || {
             let read_plan = (self.kind == FsNodeKind::RegularFile && self.supports_page_cache)
                 .then(|| {
-                    with_mount(self.node.mount_id, BackendOp::ReadPlan, |mount| {
+                    self.with_backend(BackendOp::ReadPlan, |mount| {
                         mount.prepare_read_plan(self.node.ino, offset as u64, buf.len())
                     })
-                    .flatten()
                 })
                 .flatten();
             if let Some(read_plan) = read_plan {
-                Some(read_plan.execute(buf))
+                read_plan.execute(buf)
             } else {
-                with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
+                self.with_backend(BackendOp::ReadFallback, |mount| {
                     mount.read_at(self.node.ino, buf, offset as u64)
                 })
             }
-        }) else {
-            return 0;
-        };
+        });
         let read_size =
             if let Some(dirty_len) = dirty_regular_read_len(self.node, offset, buf.len()) {
                 let effective_len = read_size.max(dirty_len);
@@ -1627,10 +1638,10 @@ impl VfsFile {
         }
         if snapshot.is_none() {
             let content = match inode_state::with_mapping_read_state(&self.inode_state, || {
-                with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
+                self.with_backend(BackendOp::ReadFallback, |mount| {
                     mount.read_snapshot(self.node.ino)
                 })
-            })? {
+            }) {
                 Some(Ok(content)) => content,
                 Some(Err(_)) => return Some(0),
                 None => return None,
@@ -1678,7 +1689,8 @@ impl VfsFile {
         {
             return None;
         }
-        let stat = stat_basic_cached_with_state(&self.inode_state).ok()?;
+        let stat =
+            stat_basic_cached_with_state_and_lease(&self.inode_state, &self.mount_backend).ok()?;
         let file_size = stat.size as usize;
         if self.read_cache_id_for_size(file_size).is_some() {
             return None;
@@ -1730,7 +1742,8 @@ impl VfsFile {
         {
             return None;
         }
-        let stat = stat_basic_cached_with_state(&self.inode_state).ok()?;
+        let stat =
+            stat_basic_cached_with_state_and_lease(&self.inode_state, &self.mount_backend).ok()?;
         Some((
             FileTimestamp {
                 sec: stat.atime_sec,
@@ -1753,10 +1766,9 @@ impl VfsFile {
                     ctime,
                 },
                 || {
-                    with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                    self.with_backend(BackendOp::NamespaceMutation, |mount| {
                         mount.set_times(self.node.ino, Some(atime), None, ctime)
                     })
-                    .ok_or(FsError::Io)?
                 },
             );
         }
@@ -1766,7 +1778,9 @@ impl VfsFile {
         if mount_is_noatime(self.node.mount_id) || mount_is_nodiratime(self.node.mount_id) {
             return;
         }
-        let Ok(stat) = stat_full_cached_with_state(&self.inode_state) else {
+        let Ok(stat) =
+            stat_full_cached_with_state_and_lease(&self.inode_state, &self.mount_backend)
+        else {
             return;
         };
         let ctime = FileTimestamp {
@@ -1782,10 +1796,9 @@ impl VfsFile {
                 ctime,
             },
             || {
-                with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                self.with_backend(BackendOp::NamespaceMutation, |mount| {
                     mount.set_times(self.node.ino, Some(atime), None, ctime)
                 })
-                .ok_or(FsError::Io)?
             },
         );
     }
@@ -1805,7 +1818,7 @@ impl VfsFile {
         // from nonzero bytes in filesystem-sized blocks instead of querying
         // backend extent allocation, so allocated zero-filled blocks may be
         // reported as holes.
-        let stat = stat_full_cached_with_state(&self.inode_state)?;
+        let stat = stat_full_cached_with_state_and_lease(&self.inode_state, &self.mount_backend)?;
         let size = stat.size as usize;
         if offset > size {
             return Err(FsError::NoDeviceOrAddress);
@@ -1875,12 +1888,11 @@ impl VfsFile {
             synthetic_children_for_dir(self.namespace_id, self.node, parent_path)
                 .into_iter()
                 .filter(|entry| {
-                    !with_mount(self.node.mount_id, BackendOp::Lookup, |mount| {
+                    !self.with_backend(BackendOp::Lookup, |mount| {
                         mount
                             .lookup_component_from(self.node.ino, entry.name.as_str())
                             .is_ok()
                     })
-                    .unwrap_or(false)
                 })
                 .map(|entry| RawDirEntry {
                     ino: entry.ino,
@@ -1946,7 +1958,11 @@ impl VfsFile {
             let file_size = match cached_file_size {
                 Some(file_size) => file_size,
                 None => {
-                    let stat = stat_basic_cached_with_state(&self.inode_state).ok()?;
+                    let stat = stat_basic_cached_with_state_and_lease(
+                        &self.inode_state,
+                        &self.mount_backend,
+                    )
+                    .ok()?;
                     let file_size = stat.size as usize;
                     self.read_cache_id_for_size(file_size)?;
                     cached_file_size = Some(file_size);
@@ -1999,17 +2015,15 @@ impl VfsFile {
                 staging.as_mut_slice()
             };
             let read_len = inode_state::with_mapping_read_state(&self.inode_state, || {
-                let read_plan = with_mount(self.node.mount_id, BackendOp::ReadPlan, |mount| {
+                let read_plan = self.with_backend(BackendOp::ReadPlan, |mount| {
                     mount.prepare_read_plan(self.node.ino, page_start as u64, read_limit)
-                })
-                .flatten();
+                });
                 if let Some(read_plan) = read_plan {
                     read_plan.execute(fill_buf)
                 } else {
-                    with_mount(self.node.mount_id, BackendOp::ReadFallback, |mount| {
+                    self.with_backend(BackendOp::ReadFallback, |mount| {
                         mount.read_at(self.node.ino, fill_buf, page_start as u64)
                     })
-                    .expect("filesystem mount is missing")
                 }
             });
             self.restore_noatime(noatime_snapshot);
@@ -2199,7 +2213,8 @@ impl VfsFile {
             return Some(read_size);
         }
 
-        let stat = stat_basic_cached_with_state(&self.inode_state).ok()?;
+        let stat =
+            stat_basic_cached_with_state_and_lease(&self.inode_state, &self.mount_backend).ok()?;
         let file_size = stat.size as usize;
         if !(VFS_SMALL_READ_CACHE_MIN_FILE_SIZE..=VFS_READ_CACHE_MAX_FILE_SIZE).contains(&file_size)
         {
@@ -2926,7 +2941,8 @@ impl File for VfsFile {
     }
 
     fn stat(&self) -> FsResult<FileStat> {
-        let mut stat = stat_full_cached_with_state(&self.inode_state)?;
+        let mut stat =
+            stat_full_cached_with_state_and_lease(&self.inode_state, &self.mount_backend)?;
         stat.dev = self.node.mount_id.0 as u64;
         if self.kind == FsNodeKind::RegularFile {
             overlay_dirty_regular_stat(self.node, &mut stat);
@@ -3031,7 +3047,8 @@ impl File for VfsFile {
         let len = buf.len();
         let mut offset = self.offset.lock();
         if append {
-            let stat = stat_full_cached_with_state(&self.inode_state)?;
+            let stat =
+                stat_full_cached_with_state_and_lease(&self.inode_state, &self.mount_backend)?;
             *offset = stat_logical_size(self.node, stat.size) as usize;
         }
         let write_offset = *offset;
@@ -3077,10 +3094,9 @@ impl File for VfsFile {
         let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         flush_dirty_regular_file(self.node)?;
         inode_state::with_mapping_mutation_state(&self.inode_state, || {
-            with_mount(self.node.mount_id, BackendOp::TruncateAllocate, |mount| {
+            self.with_backend(BackendOp::TruncateAllocate, |mount| {
                 mount.set_len(self.node.ino, len as u64)
             })
-            .ok_or(FsError::Io)?
         })
     }
 
@@ -3095,10 +3111,9 @@ impl File for VfsFile {
         let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         flush_dirty_regular_file(self.node)?;
         inode_state::with_mapping_mutation_state(&self.inode_state, || {
-            with_mount(self.node.mount_id, BackendOp::TruncateAllocate, |mount| {
+            self.with_backend(BackendOp::TruncateAllocate, |mount| {
                 mount.allocate_range(self.node.ino, offset as u64, len as u64, keep_size)
             })
-            .ok_or(FsError::Io)?
         })
     }
 
@@ -3113,10 +3128,9 @@ impl File for VfsFile {
         let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         flush_dirty_regular_file(self.node)?;
         inode_state::with_mapping_mutation_state(&self.inode_state, || {
-            with_mount(self.node.mount_id, BackendOp::TruncateAllocate, |mount| {
+            self.with_backend(BackendOp::TruncateAllocate, |mount| {
                 mount.zero_range(self.node.ino, offset as u64, len as u64, keep_size)
             })
-            .ok_or(FsError::Io)?
         })
     }
 
@@ -3135,19 +3149,17 @@ impl File for VfsFile {
         let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         flush_dirty_regular_file(self.node)?;
         inode_state::with_mapping_mutation_state(&self.inode_state, || {
-            with_mount(self.node.mount_id, BackendOp::TruncateAllocate, |mount| {
+            self.with_backend(BackendOp::TruncateAllocate, |mount| {
                 mount.punch_hole(self.node.ino, offset as u64, len as u64)
             })
-            .ok_or(FsError::Io)?
         })
     }
 
     fn sync(&self, data_only: bool) -> FsResult {
         flush_dirty_regular_file(self.node)?;
-        with_mount(self.node.mount_id, BackendOp::Sync, |mount| {
+        self.with_backend(BackendOp::Sync, |mount| {
             mount.sync(self.node.ino, data_only)
         })
-        .ok_or(FsError::Io)?
     }
 
     fn seek(&self, offset: i64, whence: SeekWhence) -> FsResult<usize> {
@@ -3156,7 +3168,8 @@ impl File for VfsFile {
             SeekWhence::Set => 0i128,
             SeekWhence::Current => *current as i128,
             SeekWhence::End => {
-                let stat = stat_full_cached_with_state(&self.inode_state)?;
+                let stat =
+                    stat_full_cached_with_state_and_lease(&self.inode_state, &self.mount_backend)?;
                 stat_logical_size(self.node, stat.size) as i128
             }
             SeekWhence::Data | SeekWhence::Hole => {
@@ -3205,10 +3218,9 @@ impl File for VfsFile {
                                 .read_dirent64(current_offset, &mut kernel_buf);
                         }
                     }
-                    let plan = with_mount(self.node.mount_id, BackendOp::ReadPlan, |mount| {
+                    let plan = self.with_backend(BackendOp::ReadPlan, |mount| {
                         mount.prepare_directory_read_plan(self.node.ino, 0)
-                    })
-                    .flatten();
+                    });
                     if let Some(plan) = plan {
                         let snapshot = plan.execute()?;
                         let result = snapshot.read_dirent64(current_offset, &mut kernel_buf);
@@ -3218,10 +3230,9 @@ impl File for VfsFile {
                         });
                         result
                     } else {
-                        with_mount(self.node.mount_id, BackendOp::Readdir, |mount| {
+                        self.with_backend(BackendOp::Readdir, |mount| {
                             mount.read_dirent64(self.node.ino, current_offset, &mut kernel_buf)
                         })
-                        .ok_or(FsError::Io)?
                     }
                 })?;
             if read_size == 0 {
@@ -3250,17 +3261,15 @@ impl File for VfsFile {
             return Err(FsError::InvalidInput);
         }
         inode_state::with_mapping_read_state(&self.inode_state, || {
-            let plan = with_mount(self.node.mount_id, BackendOp::ReadPlan, |mount| {
+            let plan = self.with_backend(BackendOp::ReadPlan, |mount| {
                 mount.prepare_readlink_plan(self.node.ino, buf.len())
-            })
-            .flatten();
+            });
             if let Some(plan) = plan {
                 Ok(plan.execute(buf))
             } else {
-                with_mount(self.node.mount_id, BackendOp::Readlink, |mount| {
+                self.with_backend(BackendOp::Readlink, |mount| {
                     mount.readlink(self.node.ino, buf)
                 })
-                .ok_or(FsError::Io)?
             }
         })
     }
@@ -3283,10 +3292,9 @@ impl File for VfsFile {
                 ctime,
             },
             || {
-                with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                self.with_backend(BackendOp::NamespaceMutation, |mount| {
                     mount.set_times(self.node.ino, atime, mtime, ctime)
                 })
-                .ok_or(FsError::Io)?
             },
         )
     }
@@ -3296,10 +3304,9 @@ impl File for VfsFile {
             &self.inode_state,
             inode_state::MetadataCacheUpdate::Mode(mode),
             || {
-                with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                self.with_backend(BackendOp::NamespaceMutation, |mount| {
                     mount.set_mode(self.node.ino, mode)
                 })
-                .ok_or(FsError::Io)?
             },
         )
     }
@@ -3309,19 +3316,17 @@ impl File for VfsFile {
             &self.inode_state,
             inode_state::MetadataCacheUpdate::Owner { uid, gid },
             || {
-                with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                self.with_backend(BackendOp::NamespaceMutation, |mount| {
                     mount.set_owner(self.node.ino, uid, gid)
                 })
-                .ok_or(FsError::Io)?
             },
         )
     }
 
     fn inode_flags(&self) -> FsResult<u32> {
-        with_mount(self.node.mount_id, BackendOp::StatFull, |mount| {
+        self.with_backend(BackendOp::StatFull, |mount| {
             mount.inode_flags(self.node.ino)
         })
-        .ok_or(FsError::Io)?
     }
 
     fn set_inode_flags(&self, flags: u32) -> FsResult {
@@ -3329,10 +3334,9 @@ impl File for VfsFile {
             &self.inode_state,
             inode_state::MetadataCacheUpdate::InodeFlags(flags),
             || {
-                with_mount(self.node.mount_id, BackendOp::NamespaceMutation, |mount| {
+                self.with_backend(BackendOp::NamespaceMutation, |mount| {
                     mount.set_inode_flags(self.node.ino, flags)
                 })
-                .ok_or(FsError::Io)?
             },
         );
         if result.is_ok() {
@@ -3351,15 +3355,15 @@ impl File for VfsFile {
             return Err(FsError::PermissionDenied);
         }
         let offset = if append {
-            let stat = stat_full_cached_with_state(&self.inode_state)?.size;
+            let stat =
+                stat_full_cached_with_state_and_lease(&self.inode_state, &self.mount_backend)?.size;
             stat_logical_size(self.node, stat)
         } else {
             *self.offset.lock() as u64
         };
-        with_mount(self.node.mount_id, BackendOp::Write, |mount| {
+        self.with_backend(BackendOp::Write, |mount| {
             mount.check_write_at(self.node.ino, offset, len)
         })
-        .ok_or(FsError::Io)?
     }
 
     fn check_write_at(&self, offset: usize, len: usize) -> FsResult {
@@ -3368,10 +3372,9 @@ impl File for VfsFile {
         if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
             return Err(FsError::PermissionDenied);
         }
-        with_mount(self.node.mount_id, BackendOp::Write, |mount| {
+        self.with_backend(BackendOp::Write, |mount| {
             mount.check_write_at(self.node.ino, offset as u64, len)
         })
-        .ok_or(FsError::Io)?
     }
 
     fn check_set_len(&self, len: usize) -> FsResult {
@@ -3380,10 +3383,9 @@ impl File for VfsFile {
         if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
             return Err(FsError::PermissionDenied);
         }
-        with_mount(self.node.mount_id, BackendOp::TruncateAllocate, |mount| {
+        self.with_backend(BackendOp::TruncateAllocate, |mount| {
             mount.check_set_len(self.node.ino, len as u64)
         })
-        .ok_or(FsError::Io)?
     }
 
     fn working_dir(&self) -> Option<WorkingDir> {
@@ -3463,6 +3465,6 @@ impl Drop for VfsFile {
     fn drop(&mut self) {
         untrack_writable_regular_open(self.node, self.kind, self.writable);
         invalidate_inode_flags_cache(self.node);
-        release_inode_from_drop(&self.inode_state);
+        release_inode_from_drop_with_lease(&self.inode_state, &self.mount_backend);
     }
 }
