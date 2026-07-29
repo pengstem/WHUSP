@@ -97,6 +97,20 @@ struct ext4_blockdev_iface {
 	 *          this to retire stale buffers without a global cache flush.*/
 	uint64_t (*bcache_generation)(struct ext4_blockdev *bdev);
 
+	/**@brief   Lock one filesystem allocation block group. The matching
+	 *          unlock may occur after metadata I/O and must therefore sleep,
+	 *          not spin, in kernel integrations.*/
+	int (*metadata_group_lock)(struct ext4_blockdev *bdev, uint32_t bgid);
+
+	/**@brief   Unlock one filesystem allocation block group.*/
+	int (*metadata_group_unlock)(struct ext4_blockdev *bdev, uint32_t bgid);
+
+	/**@brief   Lock the short mount-global allocator counter state.*/
+	int (*metadata_global_lock)(struct ext4_blockdev *bdev);
+
+	/**@brief   Unlock the short mount-global allocator counter state.*/
+	int (*metadata_global_unlock)(struct ext4_blockdev *bdev);
+
 	/**@brief   Block size (bytes): physical*/
 	uint32_t ph_bsize;
 
@@ -163,6 +177,11 @@ struct ext4_blockdev {
 		.bcache_index_unlock = NULL,                                   \
 		.bcache_lba_lock = NULL,                                       \
 		.bcache_lba_unlock = NULL,                                     \
+		.bcache_generation = NULL,                                     \
+		.metadata_group_lock = NULL,                                   \
+		.metadata_group_unlock = NULL,                                 \
+		.metadata_global_lock = NULL,                                  \
+		.metadata_global_unlock = NULL,                                \
 		.ph_bsize = __bsize,                                           \
 		.ph_bcnt = __bcnt,                                             \
 		.ph_bbuf = __name##_ph_bbuf,                                   \
@@ -188,6 +207,14 @@ int ext4_block_bind_bcache(struct ext4_blockdev *bdev, struct ext4_bcache *bc);
  * @param   bdev block device descriptor
  * @return  standard error code*/
 int ext4_block_fini(struct ext4_blockdev *bdev);
+
+/**@brief Acquire/release allocator ownership callbacks when configured.*/
+void ext4_block_metadata_group_lock(struct ext4_blockdev *bdev,
+				    uint32_t bgid);
+void ext4_block_metadata_group_unlock(struct ext4_blockdev *bdev,
+				      uint32_t bgid);
+void ext4_block_metadata_global_lock(struct ext4_blockdev *bdev);
+void ext4_block_metadata_global_unlock(struct ext4_blockdev *bdev);
 
 /**@brief   Flush data in given buffer to disk.
  * @param   bdev block device descriptor

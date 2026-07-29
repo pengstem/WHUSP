@@ -200,9 +200,11 @@ int ext4_balloc_free_block(struct ext4_inode_ref *inode_ref, ext4_fsblk_t baddr)
 	uint32_t block_size = ext4_sb_get_block_size(sb);
 
 	/* Update superblock free blocks count */
+	ext4_block_metadata_global_lock(inode_ref->fs->bdev);
 	uint64_t sb_free_blocks = ext4_sb_get_free_blocks_cnt(sb);
 	sb_free_blocks++;
 	ext4_sb_set_free_blocks_cnt(sb, sb_free_blocks);
+	ext4_block_metadata_global_unlock(inode_ref->fs->bdev);
 
 	/* Update inode blocks count */
 	uint64_t ino_blocks = ext4_inode_get_blocks_count(sb, inode_ref->inode);
@@ -308,9 +310,11 @@ int ext4_balloc_free_blocks(struct ext4_inode_ref *inode_ref,
 		uint32_t block_size = ext4_sb_get_block_size(sb);
 
 		/* Update superblock free blocks count */
+		ext4_block_metadata_global_lock(inode_ref->fs->bdev);
 		uint64_t sb_free_blocks = ext4_sb_get_free_blocks_cnt(sb);
 		sb_free_blocks += free_cnt;
 		ext4_sb_set_free_blocks_cnt(sb, sb_free_blocks);
+		ext4_block_metadata_global_unlock(inode_ref->fs->bdev);
 
 		/* Update inode blocks count */
 		uint64_t ino_blocks;
@@ -559,9 +563,11 @@ success:
 	uint32_t block_size = ext4_sb_get_block_size(sb);
 
 	/* Update superblock free blocks count */
+	ext4_block_metadata_global_lock(inode_ref->fs->bdev);
 	uint64_t sb_free_blocks = ext4_sb_get_free_blocks_cnt(sb);
-	sb_free_blocks--;
-	ext4_sb_set_free_blocks_cnt(sb, sb_free_blocks);
+	ext4_assert(sb_free_blocks > 0);
+	ext4_sb_set_free_blocks_cnt(sb, sb_free_blocks - 1);
+	ext4_block_metadata_global_unlock(inode_ref->fs->bdev);
 
 	/* Update inode blocks (different block size!) count */
 	uint64_t ino_blocks = ext4_inode_get_blocks_count(sb, inode_ref->inode);
@@ -643,9 +649,11 @@ int ext4_balloc_try_alloc_block(struct ext4_inode_ref *inode_ref,
 	uint32_t block_size = ext4_sb_get_block_size(sb);
 
 	/* Update superblock free blocks count */
+	ext4_block_metadata_global_lock(inode_ref->fs->bdev);
 	uint64_t sb_free_blocks = ext4_sb_get_free_blocks_cnt(sb);
-	sb_free_blocks--;
-	ext4_sb_set_free_blocks_cnt(sb, sb_free_blocks);
+	ext4_assert(sb_free_blocks > 0);
+	ext4_sb_set_free_blocks_cnt(sb, sb_free_blocks - 1);
+	ext4_block_metadata_global_unlock(inode_ref->fs->bdev);
 
 	/* Update inode blocks count */
 	uint64_t ino_blocks = ext4_inode_get_blocks_count(sb, inode_ref->inode);

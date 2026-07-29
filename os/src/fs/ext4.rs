@@ -48,6 +48,7 @@ impl SystemHal for KernelHal {
 }
 
 const EXT4_BCACHE_LBA_LOCK_SHARDS: usize = 256;
+const EXT4_ALLOCATOR_GROUP_LOCK_SHARDS: usize = 128;
 
 /// Lock domain owned by exactly one lwext4 metadata cache.
 ///
@@ -125,15 +126,43 @@ impl Ext4BcacheLocks {
     }
 }
 
+/// Allocation ownership shared by every writable caller of one lwext4 core.
+///
+/// Group shards may sleep across bitmap/GDT metadata I/O. The global lock is
+/// reserved for the in-memory superblock free counters and allocation cursor;
+/// C never holds it while acquiring a group, bcache, or device lock.
+struct Ext4AllocatorLocks {
+    groups: Vec<RawSleepLock>,
+    global: RawSleepLock,
+}
+
+impl Ext4AllocatorLocks {
+    fn new() -> Self {
+        Self {
+            groups: (0..EXT4_ALLOCATOR_GROUP_LOCK_SHARDS)
+                .map(|_| RawSleepLock::new())
+                .collect(),
+            global: RawSleepLock::new(),
+        }
+    }
+
+    #[inline]
+    fn group(&self, bgid: u32) -> &RawSleepLock {
+        &self.groups[bgid as usize % self.groups.len()]
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct KernelDisk {
     dev: Arc<VirtIOBlock>,
     concurrent_bcache: bool,
+    concurrent_metadata: bool,
     cache_epoch: Arc<Ext4CacheEpoch>,
     write_sequence: Arc<Ext4Sequence>,
     physical_leases: Arc<Ext4PhysicalLeaseTable>,
     block_versions: Arc<Ext4BlockVersions>,
     bcache_locks: Arc<Ext4BcacheLocks>,
+    allocator_locks: Arc<Ext4AllocatorLocks>,
     #[cfg(feature = "perf-counters")]
     io_counters: Arc<Ext4IoCounters>,
 }
@@ -390,6 +419,10 @@ impl Ext4BlockDevice for KernelDisk {
         self.cache_epoch.current()
     }
 
+    fn concurrent_metadata(&self) -> bool {
+        self.concurrent_metadata
+    }
+
     fn write_blocks(&self, block_id: u64, buf: &[u8]) -> Ext4Result<usize> {
         if buf.len() % EXT4_DEV_BSIZE != 0 {
             return Err(Ext4Error::new(EIO as _, "unaligned block write"));
@@ -440,6 +473,22 @@ impl Ext4BlockDevice for KernelDisk {
 
     unsafe fn unlock_bcache_lba(&self, lba: u64) {
         unsafe { self.bcache_locks.unlock_lba(lba) };
+    }
+
+    fn lock_metadata_group(&self, bgid: u32) {
+        self.allocator_locks.group(bgid).lock();
+    }
+
+    unsafe fn unlock_metadata_group(&self, bgid: u32) {
+        unsafe { self.allocator_locks.group(bgid).unlock() };
+    }
+
+    fn lock_metadata_global(&self) {
+        self.allocator_locks.global.lock();
+    }
+
+    unsafe fn unlock_metadata_global(&self) {
+        unsafe { self.allocator_locks.global.unlock() };
     }
 }
 
@@ -946,11 +995,13 @@ impl Ext4Mount {
                 KernelDisk {
                     dev: device.clone(),
                     concurrent_bcache: false,
+                    concurrent_metadata: true,
                     cache_epoch: cache_epoch.clone(),
                     write_sequence: write_sequence.clone(),
                     physical_leases: physical_leases.clone(),
                     block_versions: block_versions.clone(),
                     bcache_locks: Arc::new(Ext4BcacheLocks::new()),
+                    allocator_locks: Arc::new(Ext4AllocatorLocks::new()),
                     #[cfg(feature = "perf-counters")]
                     io_counters: io_counters.clone(),
                 },
@@ -976,11 +1027,13 @@ impl Ext4Mount {
                 KernelDisk {
                     dev: self.device.clone(),
                     concurrent_bcache: true,
+                    concurrent_metadata: false,
                     cache_epoch: self.cache_epoch.clone(),
                     write_sequence: self.write_sequence.clone(),
                     physical_leases: self.physical_leases.clone(),
                     block_versions: self.block_versions.clone(),
                     bcache_locks: Arc::new(Ext4BcacheLocks::new()),
+                    allocator_locks: Arc::new(Ext4AllocatorLocks::new()),
                     #[cfg(feature = "perf-counters")]
                     io_counters: io_counters.clone(),
                 },

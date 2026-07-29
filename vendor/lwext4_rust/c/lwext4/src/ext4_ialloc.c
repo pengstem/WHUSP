@@ -175,8 +175,10 @@ int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
 
 	struct ext4_block b;
 	rc = ext4_trans_block_get(fs->bdev, &b, bitmap_block_addr);
-	if (rc != EOK)
+	if (rc != EOK) {
+		ext4_fs_put_block_group_ref(&bg_ref);
 		return rc;
+	}
 
 	if (!ext4_ialloc_verify_bitmap_csum(sb, bg, b.data)) {
 		ext4_dbg(DEBUG_IALLOC,
@@ -220,8 +222,10 @@ int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
 		return rc;
 
 	/* Update superblock free inodes count */
+	ext4_block_metadata_global_lock(fs->bdev);
 	ext4_set32(sb, free_inodes_count,
 		   ext4_get32(sb, free_inodes_count) + 1);
+	ext4_block_metadata_global_unlock(fs->bdev);
 
 	return EOK;
 }
@@ -230,9 +234,10 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
 {
 	struct ext4_sblock *sb = &fs->sb;
 
+	ext4_block_metadata_global_lock(fs->bdev);
 	uint32_t bgid = fs->last_inode_bg_id;
+	ext4_block_metadata_global_unlock(fs->bdev);
 	uint32_t bg_count = ext4_block_group_cnt(sb);
-	uint32_t sb_free_inodes = ext4_get32(sb, free_inodes_count);
 	bool rewind = false;
 
 	/* Try to find free i-node in all block groups */
@@ -241,7 +246,9 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
 		if (bgid == bg_count) {
 			if (rewind)
 				break;
+			ext4_block_metadata_global_lock(fs->bdev);
 			bg_count = fs->last_inode_bg_id;
+			ext4_block_metadata_global_unlock(fs->bdev);
 			bgid = 0;
 			rewind = true;
 			continue;
@@ -342,13 +349,17 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
 				return rc;
 
 			/* Update superblock */
-			sb_free_inodes--;
-			ext4_set32(sb, free_inodes_count, sb_free_inodes);
+			ext4_block_metadata_global_lock(fs->bdev);
+			uint32_t sb_free_inodes =
+			    ext4_get32(sb, free_inodes_count);
+			ext4_assert(sb_free_inodes > 0);
+			ext4_set32(sb, free_inodes_count,
+				   sb_free_inodes - 1);
+			fs->last_inode_bg_id = bgid;
+			ext4_block_metadata_global_unlock(fs->bdev);
 
 			/* Compute the absolute i-nodex number */
 			*idx = ext4_ialloc_bgidx_to_inode(sb, idx_in_bg, bgid);
-
-			fs->last_inode_bg_id = bgid;
 
 			return EOK;
 		}

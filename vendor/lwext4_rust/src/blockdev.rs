@@ -24,6 +24,12 @@ pub trait BlockDevice: Send + Sync {
         0
     }
 
+    /// Whether this device installs allocator ownership callbacks for a
+    /// concurrently callable writable metadata core.
+    fn concurrent_metadata(&self) -> bool {
+        false
+    }
+
     /// Writes blocks to the device, starting from the given block ID.
     fn write_blocks(&self, block_id: u64, buf: &[u8]) -> Ext4Result<usize>;
 
@@ -52,6 +58,20 @@ pub trait BlockDevice: Send + Sync {
     ///
     /// The caller must own the shard selected by `lba` exactly once.
     unsafe fn unlock_bcache_lba(&self, lba: u64);
+
+    /// Acquires/releases one block-group allocator ownership shard.
+    fn lock_metadata_group(&self, _bgid: u32) {}
+
+    /// # Safety
+    /// The caller must own the shard selected by `bgid` exactly once.
+    unsafe fn unlock_metadata_group(&self, _bgid: u32) {}
+
+    /// Acquires/releases the short mount-global allocator counter lock.
+    fn lock_metadata_global(&self) {}
+
+    /// # Safety
+    /// The caller must own the allocator counter lock exactly once.
+    unsafe fn unlock_metadata_global(&self) {}
 }
 
 /// Holds necessary resources for the ext4 block device, and automatically frees
@@ -73,6 +93,7 @@ impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
     pub fn new(dev: Dev) -> Ext4Result<Self> {
         let mut dev = Box::new(dev);
         let concurrent_bcache = dev.concurrent_bcache();
+        let concurrent_metadata = dev.concurrent_metadata();
 
         // Block size buffer
         let mut block_buf = Box::new([0u8; EXT4_DEV_BSIZE]);
@@ -88,6 +109,10 @@ impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
             bcache_lba_lock: concurrent_bcache.then_some(Self::dev_bcache_lba_lock),
             bcache_lba_unlock: concurrent_bcache.then_some(Self::dev_bcache_lba_unlock),
             bcache_generation: concurrent_bcache.then_some(Self::dev_bcache_generation),
+            metadata_group_lock: concurrent_metadata.then_some(Self::dev_metadata_group_lock),
+            metadata_group_unlock: concurrent_metadata.then_some(Self::dev_metadata_group_unlock),
+            metadata_global_lock: concurrent_metadata.then_some(Self::dev_metadata_global_lock),
+            metadata_global_unlock: concurrent_metadata.then_some(Self::dev_metadata_global_unlock),
             ph_bsize: EXT4_DEV_BSIZE as u32,
             ph_bcnt: 0,
             ph_bbuf: block_buf.as_mut_ptr(),
@@ -231,6 +256,30 @@ impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
         let (_, dev) = unsafe { Self::iface_and_dev(bdev) };
         dev.bcache_generation()
     }
+
+    unsafe extern "C" fn dev_metadata_group_lock(bdev: *mut ext4_blockdev, bgid: u32) -> c_int {
+        let (_, dev) = unsafe { Self::iface_and_dev(bdev) };
+        dev.lock_metadata_group(bgid);
+        EOK as _
+    }
+
+    unsafe extern "C" fn dev_metadata_group_unlock(bdev: *mut ext4_blockdev, bgid: u32) -> c_int {
+        let (_, dev) = unsafe { Self::iface_and_dev(bdev) };
+        unsafe { dev.unlock_metadata_group(bgid) };
+        EOK as _
+    }
+
+    unsafe extern "C" fn dev_metadata_global_lock(bdev: *mut ext4_blockdev) -> c_int {
+        let (_, dev) = unsafe { Self::iface_and_dev(bdev) };
+        dev.lock_metadata_global();
+        EOK as _
+    }
+
+    unsafe extern "C" fn dev_metadata_global_unlock(bdev: *mut ext4_blockdev) -> c_int {
+        let (_, dev) = unsafe { Self::iface_and_dev(bdev) };
+        unsafe { dev.unlock_metadata_global() };
+        EOK as _
+    }
 }
 
 impl<Dev: BlockDevice> Drop for Ext4BlockDevice<Dev> {
@@ -289,6 +338,12 @@ mod tests {
         storage: Mutex<Vec<u8>>,
         index: TestRawLock,
         lba: Vec<TestRawLock>,
+        metadata_groups: Vec<TestRawLock>,
+        metadata_global: TestRawLock,
+        metadata_group_locks: AtomicUsize,
+        metadata_group_unlocks: AtomicUsize,
+        metadata_global_locks: AtomicUsize,
+        metadata_global_unlocks: AtomicUsize,
         read_calls: AtomicUsize,
         write_calls: AtomicUsize,
         active_reads: AtomicUsize,
@@ -307,6 +362,12 @@ mod tests {
                 storage: Mutex::new(storage),
                 index: TestRawLock::new(),
                 lba: (0..32).map(|_| TestRawLock::new()).collect(),
+                metadata_groups: (0..8).map(|_| TestRawLock::new()).collect(),
+                metadata_global: TestRawLock::new(),
+                metadata_group_locks: AtomicUsize::new(0),
+                metadata_group_unlocks: AtomicUsize::new(0),
+                metadata_global_locks: AtomicUsize::new(0),
+                metadata_global_unlocks: AtomicUsize::new(0),
                 read_calls: AtomicUsize::new(0),
                 write_calls: AtomicUsize::new(0),
                 active_reads: AtomicUsize::new(0),
@@ -318,6 +379,10 @@ mod tests {
 
         fn lba_lock(&self, lba: u64) -> &TestRawLock {
             &self.lba[lba as usize % self.lba.len()]
+        }
+
+        fn metadata_group(&self, bgid: u32) -> &TestRawLock {
+            &self.metadata_groups[bgid as usize % self.metadata_groups.len()]
         }
     }
 
@@ -332,6 +397,10 @@ mod tests {
 
         fn bcache_generation(&self) -> u64 {
             self.shared.cache_generation.load(Ordering::Acquire) as u64
+        }
+
+        fn concurrent_metadata(&self) -> bool {
+            true
         }
 
         fn write_blocks(&self, block_id: u64, buf: &[u8]) -> Ext4Result<usize> {
@@ -384,6 +453,34 @@ mod tests {
         unsafe fn unlock_bcache_lba(&self, lba: u64) {
             unsafe { self.shared.lba_lock(lba).unlock() };
         }
+
+        fn lock_metadata_group(&self, bgid: u32) {
+            self.shared.metadata_group(bgid).lock();
+            self.shared
+                .metadata_group_locks
+                .fetch_add(1, Ordering::SeqCst);
+        }
+
+        unsafe fn unlock_metadata_group(&self, bgid: u32) {
+            unsafe { self.shared.metadata_group(bgid).unlock() };
+            self.shared
+                .metadata_group_unlocks
+                .fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn lock_metadata_global(&self) {
+            self.shared.metadata_global.lock();
+            self.shared
+                .metadata_global_locks
+                .fetch_add(1, Ordering::SeqCst);
+        }
+
+        unsafe fn unlock_metadata_global(&self) {
+            unsafe { self.shared.metadata_global.unlock() };
+            self.shared
+                .metadata_global_unlocks
+                .fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     fn test_bcache(cache_blocks: u32) -> (Ext4BlockDevice<TestDevice>, Arc<TestShared>) {
@@ -408,6 +505,28 @@ mod tests {
         unsafe {
             ext4_bcache_cleanup(bdev.inner.as_mut().bc);
             assert_eq!(ext4_bcache_fini_dynamic(bdev.inner.as_mut().bc), EOK as i32);
+        }
+    }
+
+    #[test]
+    fn metadata_allocator_callbacks_pair_exactly() {
+        let (mut bdev, shared) = test_bcache(4);
+        unsafe {
+            ext4_block_metadata_group_lock(bdev.inner.as_mut(), 11);
+            assert!(shared.metadata_group(11).held.load(Ordering::Acquire));
+            ext4_block_metadata_group_unlock(bdev.inner.as_mut(), 11);
+            assert!(!shared.metadata_group(11).held.load(Ordering::Acquire));
+
+            ext4_block_metadata_global_lock(bdev.inner.as_mut());
+            assert!(shared.metadata_global.held.load(Ordering::Acquire));
+            ext4_block_metadata_global_unlock(bdev.inner.as_mut());
+            assert!(!shared.metadata_global.held.load(Ordering::Acquire));
+
+            assert_eq!(shared.metadata_group_locks.load(Ordering::SeqCst), 1);
+            assert_eq!(shared.metadata_group_unlocks.load(Ordering::SeqCst), 1);
+            assert_eq!(shared.metadata_global_locks.load(Ordering::SeqCst), 1);
+            assert_eq!(shared.metadata_global_unlocks.load(Ordering::SeqCst), 1);
+            finish_bcache(&mut bdev);
         }
     }
 

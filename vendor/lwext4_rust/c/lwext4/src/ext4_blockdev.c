@@ -65,6 +65,44 @@ static void ext4_bdif_unlock(struct ext4_blockdev *bdev)
 	ext4_assert(r == EOK);
 }
 
+void ext4_block_metadata_group_lock(struct ext4_blockdev *bdev,
+				    uint32_t bgid)
+{
+	if (!bdev->bdif->metadata_group_lock)
+		return;
+
+	int r = bdev->bdif->metadata_group_lock(bdev, bgid);
+	ext4_assert(r == EOK);
+}
+
+void ext4_block_metadata_group_unlock(struct ext4_blockdev *bdev,
+				      uint32_t bgid)
+{
+	if (!bdev->bdif->metadata_group_unlock)
+		return;
+
+	int r = bdev->bdif->metadata_group_unlock(bdev, bgid);
+	ext4_assert(r == EOK);
+}
+
+void ext4_block_metadata_global_lock(struct ext4_blockdev *bdev)
+{
+	if (!bdev->bdif->metadata_global_lock)
+		return;
+
+	int r = bdev->bdif->metadata_global_lock(bdev);
+	ext4_assert(r == EOK);
+}
+
+void ext4_block_metadata_global_unlock(struct ext4_blockdev *bdev)
+{
+	if (!bdev->bdif->metadata_global_unlock)
+		return;
+
+	int r = bdev->bdif->metadata_global_unlock(bdev);
+	ext4_assert(r == EOK);
+}
+
 static int ext4_bdif_bread(struct ext4_blockdev *bdev, void *buf,
 			   uint64_t blk_id, uint32_t blk_cnt)
 {

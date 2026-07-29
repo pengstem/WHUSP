@@ -571,6 +571,8 @@ static bool ext4_fs_verify_bg_csum(struct ext4_sblock *sb,
 int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
 				struct ext4_block_group_ref *ref)
 {
+	ext4_block_metadata_group_lock(fs->bdev, bgid);
+
 	/* Compute number of descriptors, that fits in one data block */
 	uint32_t block_size = ext4_sb_get_block_size(&fs->sb);
 	uint32_t dsc_cnt = block_size / ext4_sb_get_desc_size(&fs->sb);
@@ -582,8 +584,10 @@ int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
 	uint32_t offset = (bgid % dsc_cnt) * ext4_sb_get_desc_size(&fs->sb);
 
 	int rc = ext4_trans_block_get(fs->bdev, &ref->block, block_id);
-	if (rc != EOK)
+	if (rc != EOK) {
+		ext4_block_metadata_group_unlock(fs->bdev, bgid);
 		return rc;
+	}
 
 	ref->block_group = (void *)(ref->block.data + offset);
 	ref->fs = fs;
@@ -603,6 +607,7 @@ int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
 		rc = ext4_fs_init_block_bitmap(ref);
 		if (rc != EOK) {
 			ext4_block_set(fs->bdev, &ref->block);
+			ext4_block_metadata_group_unlock(fs->bdev, bgid);
 			return rc;
 		}
 		ext4_bg_clear_flag(bg, EXT4_BLOCK_GROUP_BLOCK_UNINIT);
@@ -614,6 +619,7 @@ int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
 		rc = ext4_fs_init_inode_bitmap(ref);
 		if (rc != EOK) {
 			ext4_block_set(ref->fs->bdev, &ref->block);
+			ext4_block_metadata_group_unlock(fs->bdev, bgid);
 			return rc;
 		}
 
@@ -623,6 +629,7 @@ int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
 			rc = ext4_fs_init_inode_table(ref);
 			if (rc != EOK) {
 				ext4_block_set(fs->bdev, &ref->block);
+				ext4_block_metadata_group_unlock(fs->bdev, bgid);
 				return rc;
 			}
 
@@ -650,7 +657,9 @@ int ext4_fs_put_block_group_ref(struct ext4_block_group_ref *ref)
 	}
 
 	/* Put back block, that contains block group descriptor */
-	return ext4_block_set(ref->fs->bdev, &ref->block);
+	int rc = ext4_block_set(ref->fs->bdev, &ref->block);
+	ext4_block_metadata_group_unlock(ref->fs->bdev, ref->index);
+	return rc;
 }
 
 #if CONFIG_META_CSUM_ENABLE
