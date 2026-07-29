@@ -252,19 +252,22 @@ def validate(log: str, args: argparse.Namespace, overlay_root: Path) -> dict[str
                     f"attempts={tx_attempts} commits={tx_commits} "
                     f"retries={tx_retries} fallbacks={tx_fallbacks}"
                 )
-            if perf_delta.get("ext4_metadata_tx_device_write_blocks", 0) == 0:
-                errors.append("metadata transactions submitted no device blocks")
+            if tx_retries != 0 or tx_fallbacks != 0:
+                errors.append(
+                    "canonical metadata mutations retried or fell back: "
+                    f"retries={tx_retries} fallbacks={tx_fallbacks}"
+                )
             if "ext4_metadata_tx_merge_observed" in after:
                 merge_observed = after.get("ext4_metadata_tx_merge_observed", 0)
-                if merge_observed != 1:
+                if merge_observed != 0:
                     errors.append(
-                        "metadata sector merge was not exercised: "
+                        "retired private metadata merge path was exercised: "
                         f"commits={tx_commits} merge_observed={merge_observed}"
                     )
             if after.get("ext4_metadata_tx_active", 0) != 0:
                 errors.append("metadata transaction active count did not drain")
             if after.get("ext4_metadata_tx_active_high_watermark", 0) < 2:
-                errors.append("metadata workers did not execute concurrently")
+                errors.append("canonical metadata mutations did not execute concurrently")
     return {
         "valid": not errors,
         "errors": errors,

@@ -71,19 +71,6 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         Self::new_with_mode(dev, config, true)
     }
 
-    /// Opens a private mutation worker without claiming mount ownership.
-    ///
-    /// The worker is initialized read-only so it never updates the on-disk
-    /// mount count or superblock state. It is then allowed to dirty its private
-    /// bcache only for transactions whose block-device adapter captures every
-    /// write. Drop intentionally skips `ext4_fs_fini`, which would otherwise
-    /// publish this worker's stale superblock copy.
-    pub fn new_mutation_worker(dev: Dev, config: FsConfig) -> Ext4Result<Self> {
-        let mut result = Self::new_with_mode(dev, config, true)?;
-        result.inner.read_only = false;
-        Ok(result)
-    }
-
     fn new_with_mode(dev: Dev, config: FsConfig, read_only: bool) -> Ext4Result<Self> {
         let mut bdev = Ext4BlockDevice::new(dev)?;
         let mut fs = Box::new(unsafe { mem::zeroed() });
@@ -240,7 +227,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
     pub fn inode_flags(&self, ino: u32) -> Ext4Result<u32> {
         Ok(self.inode_ref(ino)?.flags())
     }
-    pub fn set_inode_flags(&mut self, ino: u32, flags: u32) -> Ext4Result<()> {
+    pub fn set_inode_flags(&self, ino: u32, flags: u32) -> Ext4Result<()> {
         self.inode_ref(ino)?.set_flags(flags);
         Ok(())
     }
@@ -249,7 +236,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         Ok(())
     }
     pub fn set_times(
-        &mut self,
+        &self,
         ino: u32,
         atime: Option<Duration>,
         mtime: Option<Duration>,

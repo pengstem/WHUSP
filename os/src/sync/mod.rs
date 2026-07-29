@@ -10,7 +10,7 @@ mod up;
 pub use condvar::Condvar;
 pub use irq::LocalIrqGuard;
 pub use raw_sleep_lock::RawSleepLock;
-pub use sleep_mutex::{SleepMutex, SleepMutexGuard};
+pub use sleep_mutex::SleepMutex;
 #[cfg(any(
     feature = "perf-counters",
     debug_assertions,

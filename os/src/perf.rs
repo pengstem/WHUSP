@@ -2055,10 +2055,6 @@ mod enabled {
         assert_ne!(previous, 0, "ext4 metadata transaction active underflow");
     }
 
-    pub(crate) fn record_ext4_metadata_transaction_retry() {
-        EXT4_METADATA_TX_RETRIES.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub(crate) fn record_ext4_metadata_transaction_fallback() {
         EXT4_METADATA_TX_FALLBACKS.fetch_add(1, Ordering::Relaxed);
     }
@@ -4047,9 +4043,6 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_ext4_metadata_transaction_end() {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_metadata_transaction_retry() {}
 
     #[inline(always)]
     pub(crate) fn record_ext4_metadata_transaction_fallback() {}
