@@ -12,10 +12,7 @@ use super::vfs::{
 use super::{FS_STATX_ATTR_FLAGS, FileStat, FileTimestamp};
 use crate::drivers::block::VirtIOBlock;
 use crate::perf;
-use crate::sync::{
-    RawSleepLock, RawSpinNoIrqLock, SleepMutex, SleepRwLock, SleepRwLockReadGuard,
-    SleepRwLockWriteGuard, SpinNoIrqLock,
-};
+use crate::sync::{RawSleepLock, RawSpinNoIrqLock, SleepMutex, SpinNoIrqLock};
 use crate::task::suspend_current_and_run_next;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -23,9 +20,11 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
 use core::cell::UnsafeCell;
+use core::hint::spin_loop;
 use core::str;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
+use log::warn;
 use lwext4_rust::ffi::{
     EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, ENOTSUP, EXT4_DE_BLKDEV,
     EXT4_DE_CHRDEV, EXT4_DE_DIR, EXT4_DE_FIFO, EXT4_DE_REG_FILE, EXT4_DE_SOCK, EXT4_DE_SYMLINK,
@@ -33,7 +32,7 @@ use lwext4_rust::ffi::{
 };
 use lwext4_rust::{
     BlockDevice as Ext4BlockDevice, EXT4_DEV_BSIZE,
-    Ext4DirectoryReadPlan as LwExt4DirectoryReadPlan, Ext4Error, Ext4Filesystem,
+    Ext4DirectoryReadPlan as LwExt4DirectoryReadPlan, Ext4Error, Ext4Filesystem, Ext4FlushProgress,
     Ext4MappedReadPlan, Ext4MappedWritePlan, Ext4Result, Ext4SymlinkReadPlan, FsConfig, InodeType,
     SystemHal,
 };
@@ -51,20 +50,134 @@ impl SystemHal for KernelHal {
 const EXT4_BCACHE_LBA_LOCK_SHARDS: usize = 256;
 const EXT4_ALLOCATOR_GROUP_LOCK_SHARDS: usize = 128;
 
+#[repr(align(64))]
+struct Ext4BcacheIndexReaderSlot {
+    active: AtomicUsize,
+    restore_irqs: AtomicBool,
+}
+
+impl Ext4BcacheIndexReaderSlot {
+    fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            restore_irqs: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Scalable read admission for stable bcache index lookups.
+///
+/// Structural RB/LRU/dirty-list changes retain one IRQ-safe writer lock. A
+/// resident lookup touches only its CPU-local reader slot and atomic buffer
+/// refcount. The C callback pair cannot carry a Rust guard, so local IRQ state
+/// is stored in the slot until the matching unlock on the same CPU.
+struct Ext4BcacheIndexAdmission {
+    writer: RawSpinNoIrqLock,
+    writer_pending: AtomicBool,
+    readers: Vec<Ext4BcacheIndexReaderSlot>,
+}
+
+impl Ext4BcacheIndexAdmission {
+    fn new() -> Self {
+        Self {
+            writer: RawSpinNoIrqLock::new(),
+            writer_pending: AtomicBool::new(false),
+            readers: (0..crate::config::MAX_CPUS)
+                .map(|_| Ext4BcacheIndexReaderSlot::new())
+                .collect(),
+        }
+    }
+
+    #[inline]
+    fn poll_while_spinning() {
+        crate::cpu::handle_remote_sync_ipi();
+        #[cfg(target_arch = "loongarch64")]
+        crate::arch::smp::handle_tlb_ipi();
+        spin_loop();
+    }
+
+    /// Returns whether a writer gate made this reader wait or retry.
+    fn read_lock(&self) -> bool {
+        let restore_irqs = crate::arch::interrupt::supervisor_interrupt_enabled();
+        crate::arch::interrupt::disable_supervisor_interrupt();
+        let cpu = crate::cpu::current_id();
+        let slot = &self.readers[cpu];
+        let previous = slot.active.load(Ordering::SeqCst);
+        assert_eq!(previous, 0, "recursive ext4 bcache index read callback");
+        slot.restore_irqs.store(restore_irqs, Ordering::Relaxed);
+        let mut contended = false;
+        loop {
+            while self.writer_pending.load(Ordering::SeqCst) {
+                contended = true;
+                Self::poll_while_spinning();
+            }
+            slot.active.fetch_add(1, Ordering::SeqCst);
+            if !self.writer_pending.load(Ordering::SeqCst) {
+                return contended;
+            }
+            let previous = slot.active.fetch_sub(1, Ordering::SeqCst);
+            assert_eq!(previous, 1, "ext4 bcache reader retry corrupted slot");
+            contended = true;
+        }
+    }
+
+    unsafe fn read_unlock(&self) {
+        let slot = &self.readers[crate::cpu::current_id()];
+        let previous = slot.active.fetch_sub(1, Ordering::SeqCst);
+        assert_eq!(previous, 1, "ext4 bcache index read callback underflow");
+        if slot.restore_irqs.load(Ordering::Relaxed) {
+            crate::arch::interrupt::enable_supervisor_interrupt();
+        }
+    }
+
+    fn readers_active(&self) -> bool {
+        self.readers
+            .iter()
+            .any(|slot| slot.active.load(Ordering::SeqCst) != 0)
+    }
+
+    fn write_lock(&self) {
+        self.writer.lock();
+        self.writer_pending.store(true, Ordering::SeqCst);
+        while self.readers_active() {
+            Self::poll_while_spinning();
+        }
+    }
+
+    #[cfg(feature = "perf-counters")]
+    fn try_write_lock(&self) -> bool {
+        if !self.writer.try_lock() {
+            return false;
+        }
+        self.writer_pending.store(true, Ordering::SeqCst);
+        if self.readers_active() {
+            self.writer_pending.store(false, Ordering::SeqCst);
+            unsafe { self.writer.unlock() };
+            return false;
+        }
+        true
+    }
+
+    unsafe fn write_unlock(&self) {
+        self.writer_pending.store(false, Ordering::SeqCst);
+        unsafe { self.writer.unlock() };
+    }
+}
+
 /// Lock domain owned by exactly one lwext4 metadata cache.
 ///
 /// The index lock covers only RB-tree/list/refcount bookkeeping. LBA shards
 /// serialize cache fill, eviction, and writeback state for colliding logical
 /// blocks without forcing unrelated device I/O through one global lock.
 struct Ext4BcacheLocks {
-    index: RawSpinNoIrqLock,
+    index: Ext4BcacheIndexAdmission,
     lba_shards: Vec<RawSleepLock>,
 }
 
 impl Ext4BcacheLocks {
     fn new() -> Self {
         Self {
-            index: RawSpinNoIrqLock::new(),
+            index: Ext4BcacheIndexAdmission::new(),
             lba_shards: (0..EXT4_BCACHE_LBA_LOCK_SHARDS)
                 .map(|_| RawSleepLock::new())
                 .collect(),
@@ -106,14 +219,14 @@ impl Ext4BcacheLocks {
     fn lock_index(&self) {
         #[cfg(feature = "perf-counters")]
         {
-            let contended = !self.index.try_lock();
+            let contended = !self.index.try_write_lock();
             if contended {
-                self.index.lock();
+                self.index.write_lock();
             }
             perf::record_ext4_bcache_index_lock(contended);
         }
         #[cfg(not(feature = "perf-counters"))]
-        self.index.lock();
+        self.index.write_lock();
     }
 
     /// Releases one matching [`Self::lock_index`] acquisition.
@@ -123,7 +236,26 @@ impl Ext4BcacheLocks {
     /// The current task must own the index lock exactly once.
     #[inline]
     unsafe fn unlock_index(&self) {
-        unsafe { self.index.unlock() };
+        unsafe { self.index.write_unlock() };
+    }
+
+    #[inline]
+    fn lock_index_read(&self) {
+        let contended = self.index.read_lock();
+        #[cfg(feature = "perf-counters")]
+        perf::record_ext4_bcache_index_lock(contended);
+        #[cfg(not(feature = "perf-counters"))]
+        let _ = contended;
+    }
+
+    /// Releases one matching [`Self::lock_index_read`] acquisition.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must own exactly one index read admission.
+    #[inline]
+    unsafe fn unlock_index_read(&self) {
+        unsafe { self.index.read_unlock() };
     }
 }
 
@@ -457,6 +589,14 @@ impl Ext4BlockDevice for KernelDisk {
         unsafe { self.bcache_locks.unlock_index() };
     }
 
+    fn lock_bcache_index_read(&self) {
+        self.bcache_locks.lock_index_read();
+    }
+
+    unsafe fn unlock_bcache_index_read(&self) {
+        unsafe { self.bcache_locks.unlock_index_read() };
+    }
+
     fn lock_bcache_lba(&self, lba: u64) {
         self.bcache_locks.lock_lba(lba);
     }
@@ -655,23 +795,6 @@ impl Ext4InodeRuntimeTable {
         true
     }
 
-    fn retain_at_generation(&self, ino: u32, generation: usize, sequence: &Ext4Sequence) -> bool {
-        let mut runtime = self.shard(ino).lock();
-        // Check the writer epoch while holding the same inode-runtime shard
-        // that begin_unlink() must acquire. If a writer starts after this
-        // check, it necessarily observes the incremented open_count; if it
-        // started earlier, the odd or changed generation rejects this retain.
-        if sequence.value.load(Ordering::Acquire) != generation {
-            return false;
-        }
-        let state = runtime.entry(ino).or_default();
-        if state.unlinking || state.pending_unlink {
-            return false;
-        }
-        state.open_count += 1;
-        true
-    }
-
     fn prepare_release(&self, ino: u32) -> Ext4RuntimeRelease {
         let mut runtime = self.shard(ino).lock();
         prepare_runtime_release_locked(&mut runtime, ino)
@@ -721,9 +844,8 @@ fn prepare_runtime_release_locked(
 }
 
 // SAFETY: the FFI core and its raw pointers move only as one `Ext4Mount`.
-// Writable instances are entered behind their owning core mutex. The one
-// shared read-only instance is exposed only by `SharedExt4ReadCore`, whose
-// narrower Sync proof audits its callable operations.
+// Concurrent access is exposed only by `SharedExt4WriteCore`, whose narrower
+// Sync proof audits the callable operations and their external lock domains.
 unsafe impl Send for Ext4Mount {}
 
 impl Ext4Mount {
@@ -766,40 +888,16 @@ impl Ext4Mount {
         })
     }
 
-    pub(super) fn open_shared_reader(&self) -> Result<Self, Ext4Error> {
-        #[cfg(feature = "perf-counters")]
-        let io_counters = Arc::new(Ext4IoCounters::default());
-        Ok(Self {
-            fs: KernelExt4Fs::new_read_only(
-                KernelDisk {
-                    dev: self.device.clone(),
-                    concurrent_bcache: true,
-                    versioned_bcache: true,
-                    concurrent_metadata: false,
-                    cache_epoch: self.cache_epoch.clone(),
-                    write_sequence: self.write_sequence.clone(),
-                    physical_leases: self.physical_leases.clone(),
-                    block_versions: self.block_versions.clone(),
-                    bcache_locks: Arc::new(Ext4BcacheLocks::new()),
-                    allocator_locks: Arc::new(Ext4AllocatorLocks::new()),
-                    #[cfg(feature = "perf-counters")]
-                    io_counters: io_counters.clone(),
-                },
-                EXT4_CONFIG,
-            )?,
-            device: self.device.clone(),
-            cache_epoch: self.cache_epoch.clone(),
-            write_sequence: self.write_sequence.clone(),
-            physical_leases: self.physical_leases.clone(),
-            block_versions: self.block_versions.clone(),
-            #[cfg(feature = "perf-counters")]
-            io_counters,
-            inode_runtime: self.inode_runtime.clone(),
-        })
+    fn flush_all(&mut self) -> FsResult {
+        self.fs.flush().map_err(map_ext4_error)
     }
 
-    fn flush_for_replica_visibility(&mut self) -> FsResult {
-        self.fs.flush().map_err(map_ext4_error)
+    fn dirty_ticket(&self) -> u64 {
+        self.fs.dirty_ticket()
+    }
+
+    fn flush_through(&self, ticket: u64) -> FsResult<Ext4FlushProgress> {
+        self.fs.flush_through(ticket).map_err(map_ext4_error)
     }
 
     fn mapped_read_plan(
@@ -826,6 +924,7 @@ impl Ext4Mount {
         let mut data_blocks = 0usize;
         let mut zero_runs = 0usize;
         let mut zero_blocks = 0usize;
+        let mut fs_blocks = Vec::new();
         for run in plan.runs {
             let Some(buffer_start) = run.buffer_block.checked_mul(plan.block_size) else {
                 record_fallback();
@@ -850,7 +949,11 @@ impl Ext4Mount {
                     record_fallback();
                     return None;
                 };
-                let device_blocks = run.block_count * device_blocks_per_fs_block;
+                let Some(device_blocks) = run.block_count.checked_mul(device_blocks_per_fs_block)
+                else {
+                    record_fallback();
+                    return None;
+                };
                 if device_block
                     .checked_add(device_blocks)
                     .is_none_or(|end| end > self.device.num_blocks() as usize)
@@ -860,6 +963,13 @@ impl Ext4Mount {
                 }
                 data_runs += 1;
                 data_blocks += run.block_count;
+                for delta in 0..run.block_count {
+                    let Some(fs_block) = fs_block.checked_add(delta as u64) else {
+                        record_fallback();
+                        return None;
+                    };
+                    fs_blocks.push(fs_block);
+                }
                 Some(device_block)
             } else {
                 zero_runs += 1;
@@ -871,6 +981,10 @@ impl Ext4Mount {
                 byte_len,
                 device_block,
             });
+        }
+        if !self.fs.device_snapshot_blocks_are_clean(&fs_blocks) {
+            record_fallback();
+            return None;
         }
         if record_regular {
             perf::record_ext4_read_plan_prepared(data_runs, data_blocks, zero_runs, zero_blocks);
@@ -1043,80 +1157,222 @@ impl Drop for Ext4WriteLbaLease {
     }
 }
 
-/// One read-only lwext4 core whose audited metadata operations may run in
-/// parallel.
-///
-/// `Ext4Mount` intentionally remains non-`Sync`: writable instances still
-/// require unique entry.  This wrapper is used only for a core opened with
-/// `read_only = true` and concurrent bcache ownership callbacks.  Its shared
-/// methods never mutate the fs/superblock, inode or directory payload; cache
-/// bookkeeping and generation retirement are synchronized inside lwext4.
-struct SharedExt4ReadCore {
-    mount: Ext4Mount,
+#[repr(align(64))]
+struct Ext4CoreReaderSlot {
+    active: AtomicUsize,
 }
 
-// SAFETY: shared access is restricted to the audited read-only methods above.
-// The contained bcache owns its index/LBA sleeping locks, block-device counters
-// are atomic, and every caller owns its C inode/directory reference objects.
-// Backend destruction can occur only after the last Arc caller is gone, so
-// drop-time mutable cleanup cannot overlap a shared method.
-unsafe impl Sync for SharedExt4ReadCore {}
+impl Ext4CoreReaderSlot {
+    fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+        }
+    }
+}
 
-impl SharedExt4ReadCore {
-    fn new(mount: Ext4Mount) -> Self {
-        Self { mount }
+/// Per-CPU shared-core admission with a rare-writer drain protocol.
+///
+/// Shared callers update only their selected cache-line-aligned counter. A
+/// legacy writer closes the global read gate, then waits for every slot to
+/// drain. SeqCst ordering makes the reader recheck and writer scan a simple
+/// total-order proof instead of relying on architecture-specific fences.
+struct Ext4CoreAdmission {
+    writer_lock: RawSleepLock,
+    writer_pending: AtomicBool,
+    waiting_writers: AtomicUsize,
+    readers: Vec<Ext4CoreReaderSlot>,
+}
+
+struct Ext4CoreReadGuard<'a> {
+    admission: &'a Ext4CoreAdmission,
+    slot: usize,
+}
+
+struct Ext4CoreWriteGuard<'a> {
+    admission: &'a Ext4CoreAdmission,
+}
+
+impl Ext4CoreAdmission {
+    fn new() -> Self {
+        Self {
+            writer_lock: RawSleepLock::new(),
+            writer_pending: AtomicBool::new(false),
+            waiting_writers: AtomicUsize::new(0),
+            readers: (0..crate::config::MAX_CPUS)
+                .map(|_| Ext4CoreReaderSlot::new())
+                .collect(),
+        }
     }
 
-    fn mount(&self) -> &Ext4Mount {
-        &self.mount
+    fn try_read(&self) -> Option<Ext4CoreReadGuard<'_>> {
+        if self.writer_pending.load(Ordering::SeqCst) {
+            return None;
+        }
+        let slot = crate::cpu::current_id();
+        self.readers[slot].active.fetch_add(1, Ordering::SeqCst);
+        if self.writer_pending.load(Ordering::SeqCst) {
+            let previous = self.readers[slot].active.fetch_sub(1, Ordering::SeqCst);
+            assert!(previous > 0, "ext4 core reader admission underflow");
+            return None;
+        }
+        Some(Ext4CoreReadGuard {
+            admission: self,
+            slot,
+        })
+    }
+
+    fn read(&self) -> Ext4CoreReadGuard<'_> {
+        loop {
+            if let Some(guard) = self.try_read() {
+                return guard;
+            }
+            suspend_current_and_run_next();
+        }
+    }
+
+    fn readers_active(&self) -> bool {
+        self.readers
+            .iter()
+            .any(|slot| slot.active.load(Ordering::SeqCst) != 0)
+    }
+
+    fn register_writer(&self) {
+        self.waiting_writers.fetch_add(1, Ordering::SeqCst);
+        // Every registrant publishes closed. This also covers the race where
+        // the first registrant is descheduled between increment and store.
+        self.writer_pending.store(true, Ordering::SeqCst);
+    }
+
+    fn unregister_writer(&self) {
+        let previous = self.waiting_writers.fetch_sub(1, Ordering::SeqCst);
+        assert!(previous > 0, "ext4 core writer admission underflow");
+        if previous == 1 {
+            self.writer_pending.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn try_write(&self) -> Option<Ext4CoreWriteGuard<'_>> {
+        if !self.writer_lock.try_lock() {
+            return None;
+        }
+        self.register_writer();
+        if self.readers_active() {
+            self.unregister_writer();
+            unsafe { self.writer_lock.unlock() };
+            return None;
+        }
+        Some(Ext4CoreWriteGuard { admission: self })
+    }
+
+    fn write(&self) -> Ext4CoreWriteGuard<'_> {
+        self.register_writer();
+        self.writer_lock.lock();
+        while self.readers_active() {
+            suspend_current_and_run_next();
+        }
+        Ext4CoreWriteGuard { admission: self }
+    }
+}
+
+impl Drop for Ext4CoreReadGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.admission.readers[self.slot]
+            .active
+            .fetch_sub(1, Ordering::SeqCst);
+        assert!(previous > 0, "ext4 core reader guard underflow");
+    }
+}
+
+impl Drop for Ext4CoreWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.admission.unregister_writer();
+        unsafe { self.admission.writer_lock.unlock() };
     }
 }
 
 /// One writable lwext4 core with a deliberately narrow shared-entry proof.
 ///
-/// The containing `SleepRwLock` controls which accessor may be used. Shared
-/// guards are restricted to audited create and per-inode metadata mutations;
-/// every legacy method, cache invalidation, flush, and shutdown requires an
-/// exclusive guard.
+/// `Ext4CoreAdmission` controls which accessor may be used. Shared guards are
+/// restricted to audited metadata reads, create, and per-inode metadata
+/// mutations; every remaining legacy mutation, cache invalidation, and
+/// shutdown requires an exclusive guard.
 struct SharedExt4WriteCore {
-    mount: UnsafeCell<Ext4Mount>,
+    mount: Box<UnsafeCell<Ext4Mount>>,
 }
 
-// SAFETY: `shared()` is called only while the containing writer-core rwlock is
-// read-held and only for audited shared mutations. Their caller-local inode and
-// directory refs operate on VFS-leased objects; allocator and bcache shared
-// state use the C callbacks installed on the canonical writer. `exclusive()`
-// requires the rwlock write guard, excluding every shared call.
+// SAFETY: `shared()` is called only while a core-admission reader is active and
+// only for audited shared reads/mutations. Their caller-local
+// inode and directory refs operate on VFS-leased objects; allocator and bcache
+// shared state use the C callbacks installed on the canonical writer.
+// `exclusive()` requires core-admission writer ownership after all reader
+// shards drain, excluding every shared call.
 unsafe impl Sync for SharedExt4WriteCore {}
 
 impl SharedExt4WriteCore {
     fn new(mount: Ext4Mount) -> Self {
         Self {
-            mount: UnsafeCell::new(mount),
+            mount: Box::new(UnsafeCell::new(mount)),
+        }
+    }
+
+    fn flush_handle(&self) -> Ext4FlushHandle {
+        Ext4FlushHandle {
+            mount: self.mount.get(),
         }
     }
 
     fn shared(&self) -> &Ext4Mount {
         // SAFETY: the wrapper's public protocol permits only audited shared
-        // mutation operations through this reference.
+        // metadata reads and mutation operations through this reference.
         unsafe { &*self.mount.get() }
     }
 
-    fn exclusive(&mut self) -> &mut Ext4Mount {
-        // SAFETY: callers can obtain `&mut self` only through the containing
-        // `SleepRwLock` write guard, which excludes every `shared()` caller.
+    fn exclusive(&self) -> &mut Ext4Mount {
+        // SAFETY: callers invoke this only while holding the core-admission
+        // write guard, after its gate has excluded and drained shared callers.
         unsafe { &mut *self.mount.get() }
     }
 }
 
-/// One selectively shared writable core and one lock-free-entry read-only core.
-/// Cache generations retire stale reader buffers without a mount-wide reader
-/// lifecycle writer phase.
+/// Stable access to the canonical bcache writeback engine after the writer
+/// core guard has been released. The pointed-to mount is heap allocated and
+/// outlives this handle as a field of the same backend.
+struct Ext4FlushHandle {
+    mount: *const Ext4Mount,
+}
+
+// SAFETY: only `flush_through` is exposed. The kernel serializes handle users
+// with `flush_coordinator`; concurrent metadata callers are protected by the
+// bcache's index/LBA/refcount protocol and only zero-reference payloads can be
+// submitted. Backend destruction requires exclusive ownership, so it cannot
+// overlap an in-flight method call.
+unsafe impl Send for Ext4FlushHandle {}
+unsafe impl Sync for Ext4FlushHandle {}
+
+impl Ext4FlushHandle {
+    fn flush_through(&self, ticket: u64) -> FsResult<Ext4FlushProgress> {
+        // SAFETY: `SharedExt4WriteCore` stores the mount in a stable Box and
+        // remains alive for every call through this sibling backend field.
+        unsafe { &*self.mount }.flush_through(ticket)
+    }
+
+    #[cfg(feature = "perf-counters")]
+    fn io_snapshot(&self) -> BackendIoSnapshot {
+        // SAFETY: the counter fields are atomic and have the same stable-mount
+        // lifetime as `flush_through` above.
+        unsafe { &*self.mount }.io_counters.snapshot()
+    }
+}
+
+/// One canonical lwext4 core with audited concurrent entry and detached
+/// ticketed writeback.
 pub(super) struct ConcurrentExt4Backend {
-    writer: SleepRwLock<SharedExt4WriteCore>,
-    shared_reader: SharedExt4ReadCore,
+    writer: SharedExt4WriteCore,
+    core_admission: Ext4CoreAdmission,
+    flush_handle: Ext4FlushHandle,
+    flush_coordinator: SleepMutex<()>,
+    completed_flush_ticket: AtomicU64,
     inode_runtime: Arc<Ext4InodeRuntimeTable>,
-    cache_generation: Ext4Sequence,
     write_leases: Arc<Ext4WriteLeaseTable>,
 }
 
@@ -1133,23 +1389,23 @@ impl ConcurrentExt4Backend {
             physical_leases.clone(),
             block_versions.clone(),
         )?;
-        let shared_reader = writer.open_shared_reader()?;
         let inode_runtime = writer.inode_runtime.clone();
+        let writer = SharedExt4WriteCore::new(writer);
+        let flush_handle = writer.flush_handle();
         Ok(Self {
-            writer: SleepRwLock::new(SharedExt4WriteCore::new(writer)),
-            shared_reader: SharedExt4ReadCore::new(shared_reader),
+            writer,
+            core_admission: Ext4CoreAdmission::new(),
+            flush_handle,
+            flush_coordinator: SleepMutex::new(()),
+            completed_flush_ticket: AtomicU64::new(0),
             inode_runtime,
-            cache_generation: Ext4Sequence::new(),
             write_leases: Arc::new(Ext4WriteLeaseTable::new()),
         })
     }
 
-    fn lock_writer_exclusive(
-        &self,
-        op: BackendOp,
-    ) -> SleepRwLockWriteGuard<'_, SharedExt4WriteCore> {
+    fn lock_writer_exclusive(&self, op: BackendOp) -> Ext4CoreWriteGuard<'_> {
         let _ = op;
-        match self.writer.try_write() {
+        match self.core_admission.try_write() {
             Some(core) => core,
             None => {
                 #[cfg(feature = "perf-counters")]
@@ -1160,7 +1416,7 @@ impl ConcurrentExt4Backend {
                 let wait_scope = perf::time_scope(perf::ProfilePoint::MountBackendContendedWait);
                 #[cfg(feature = "perf-counters")]
                 let op_wait_scope = perf::time_backend_op_wait(op);
-                let core = self.writer.write();
+                let core = self.core_admission.write();
                 #[cfg(feature = "perf-counters")]
                 drop(op_wait_scope);
                 drop(wait_scope);
@@ -1169,9 +1425,9 @@ impl ConcurrentExt4Backend {
         }
     }
 
-    fn lock_writer_shared(&self, op: BackendOp) -> SleepRwLockReadGuard<'_, SharedExt4WriteCore> {
+    fn lock_writer_shared(&self, op: BackendOp) -> Ext4CoreReadGuard<'_> {
         let _ = op;
-        match self.writer.try_read() {
+        match self.core_admission.try_read() {
             Some(core) => core,
             None => {
                 #[cfg(feature = "perf-counters")]
@@ -1182,7 +1438,7 @@ impl ConcurrentExt4Backend {
                 let wait_scope = perf::time_scope(perf::ProfilePoint::MountBackendContendedWait);
                 #[cfg(feature = "perf-counters")]
                 let op_wait_scope = perf::time_backend_op_wait(op);
-                let core = self.writer.read();
+                let core = self.core_admission.read();
                 #[cfg(feature = "perf-counters")]
                 drop(op_wait_scope);
                 drop(wait_scope);
@@ -1191,39 +1447,62 @@ impl ConcurrentExt4Backend {
         }
     }
 
-    fn with_reader<V>(
-        &self,
-        op: BackendOp,
-        _ino: u32,
-        mut f: impl FnMut(&Ext4Mount, usize) -> V,
-    ) -> V {
-        let _ = op;
+    fn flush_through_ticket(&self, ticket: u64) -> FsResult {
+        let mut waits = 0usize;
         loop {
-            #[cfg(feature = "perf-counters")]
-            perf::record_backend_op_call(op);
-            let generation = self.cache_generation.stable_value();
-            if self.cache_generation.value.load(Ordering::Acquire) != generation {
-                continue;
+            if self.completed_flush_ticket.load(Ordering::Acquire) >= ticket {
+                return Ok(());
             }
-            let mount = self.shared_reader.mount();
-            let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
-            #[cfg(feature = "perf-counters")]
-            let io_before = mount.io_counters.snapshot();
-            #[cfg(feature = "perf-counters")]
-            let op_hold_scope = perf::time_backend_op_hold(op);
-            let result = f(mount, generation);
-            #[cfg(feature = "perf-counters")]
-            {
-                drop(op_hold_scope);
-                perf::record_backend_op_io(op, mount.io_counters.snapshot().delta_since(io_before));
+            if let Some(_coordinator) = self.flush_coordinator.try_lock() {
+                if self.completed_flush_ticket.load(Ordering::Acquire) >= ticket {
+                    return Ok(());
+                }
+                let progress = self.flush_handle.flush_through(ticket)?;
+                if progress.complete {
+                    self.completed_flush_ticket
+                        .fetch_max(ticket, Ordering::AcqRel);
+                    return Ok(());
+                }
+                waits += 1;
+                if waits == 4096 || waits.is_multiple_of(1 << 20) {
+                    warn!(
+                        "ext4 flush ticket stalled: ticket={} completed={} pending_lba={} pending_refs={} waits={}",
+                        ticket,
+                        self.completed_flush_ticket.load(Ordering::Acquire),
+                        progress.pending_lba,
+                        progress.pending_refs,
+                        waits
+                    );
+                }
             }
-            drop(hold_scope);
-            if op == BackendOp::InodeLifetime
-                || self.cache_generation.value.load(Ordering::Acquire) == generation
-            {
-                return result;
-            }
+            // A covered buffer is still referenced by another metadata
+            // caller, or a group-commit leader is already flushing it. Avoid
+            // a FIFO mutex convoy: followers yield and all observe the same
+            // completed-ticket publication when the leader finishes.
+            suspend_current_and_run_next();
         }
+    }
+
+    fn with_reader<V>(&self, op: BackendOp, _ino: u32, f: impl FnOnce(&Ext4Mount) -> V) -> V {
+        let _ = op;
+        #[cfg(feature = "perf-counters")]
+        perf::record_backend_op_call(op);
+        let writer = self.lock_writer_shared(op);
+        let mount = self.writer.shared();
+        let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
+        #[cfg(feature = "perf-counters")]
+        let io_before = mount.io_counters.snapshot();
+        #[cfg(feature = "perf-counters")]
+        let op_hold_scope = perf::time_backend_op_hold(op);
+        let result = f(mount);
+        #[cfg(feature = "perf-counters")]
+        {
+            drop(op_hold_scope);
+            perf::record_backend_op_io(op, mount.io_counters.snapshot().delta_since(io_before));
+        }
+        drop(writer);
+        drop(hold_scope);
+        result
     }
 
     fn mutate_inode_metadata(&self, ino: u32, mutation: Ext4InodeMetadataMutation) -> FsResult {
@@ -1252,8 +1531,8 @@ impl ConcurrentExt4Backend {
         let _ = op;
         #[cfg(feature = "perf-counters")]
         perf::record_backend_op_call(op);
-        let mut writer = self.lock_writer_exclusive(op);
-        let mount = writer.exclusive();
+        let writer = self.lock_writer_exclusive(op);
+        let mount = self.writer.exclusive();
         let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
         #[cfg(feature = "perf-counters")]
         let io_before = mount.io_counters.snapshot();
@@ -1274,23 +1553,30 @@ impl ConcurrentExt4Backend {
         let _ = op;
         #[cfg(feature = "perf-counters")]
         perf::record_backend_op_call(op);
-        let mut writer = self.lock_writer_exclusive(op);
-        let mount = writer.exclusive();
-        let generation_write = self.cache_generation.begin_write();
+        // Legacy/finalization operations still require exclusive core entry.
+        // Serialize them against the detached flush handle so the canonical
+        // bcache cannot be finalized or mutated by a legacy path mid-writeback.
+        let _coordinator = self.flush_coordinator.lock();
+        let writer = self.lock_writer_exclusive(op);
+        let mount = self.writer.exclusive();
         let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
         #[cfg(feature = "perf-counters")]
         let io_before = mount.io_counters.snapshot();
         #[cfg(feature = "perf-counters")]
         let op_hold_scope = perf::time_backend_op_hold(op);
         let result = f(mount);
-        let visible = mount.flush_for_replica_visibility();
+        let ticket = mount.dirty_ticket();
+        let visible = mount.flush_all();
+        if visible.is_ok() {
+            self.completed_flush_ticket
+                .fetch_max(ticket, Ordering::AcqRel);
+        }
         #[cfg(feature = "perf-counters")]
         {
             drop(op_hold_scope);
             perf::record_backend_op_io(op, mount.io_counters.snapshot().delta_since(io_before));
         }
         drop(writer);
-        drop(generation_write);
         drop(hold_scope);
         (result, visible)
     }
@@ -1303,37 +1589,23 @@ impl ConcurrentExt4Backend {
         let _ = op;
         #[cfg(feature = "perf-counters")]
         perf::record_backend_op_call(op);
-        let generation_write = self.cache_generation.begin_write();
         let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
 
         let writer = self.lock_writer_shared(op);
-        let mount = writer.shared();
+        let mount = self.writer.shared();
         #[cfg(feature = "perf-counters")]
         let io_before = mount.io_counters.snapshot();
         #[cfg(feature = "perf-counters")]
         let op_hold_scope = perf::time_backend_op_hold(op);
         let result = f(mount);
-        drop(writer);
-
-        // The phase-fair write acquisition waits for every shared mutation
-        // that already entered the shared phase. One caller can therefore
-        // flush the complete ready dirty set for the cohort; later writers
-        // observe an empty list instead of repeating device I/O.
-        let mut writer = self.lock_writer_exclusive(op);
-        let mount = writer.exclusive();
-        let visible = mount.flush_for_replica_visibility();
         #[cfg(feature = "perf-counters")]
         {
             drop(op_hold_scope);
             perf::record_backend_op_io(op, mount.io_counters.snapshot().delta_since(io_before));
         }
         drop(writer);
-        drop(generation_write);
         drop(hold_scope);
-        match result {
-            Ok(value) => visible.map(|()| value),
-            Err(err) => Err(err),
-        }
+        result
     }
 
     fn mutate<T>(
@@ -1348,15 +1620,43 @@ impl ConcurrentExt4Backend {
         }
     }
 
+    fn sync_current(&self) -> FsResult {
+        let op = BackendOp::Sync;
+        #[cfg(feature = "perf-counters")]
+        {
+            perf::record_backend_op_call(op);
+        }
+        #[cfg(feature = "perf-counters")]
+        let io_before = self.flush_handle.io_snapshot();
+
+        // Capture the durability boundary while shared metadata callers are
+        // quiescent only for this short read-side critical section. Device
+        // writeback and all waits happen after the core guard is released.
+        let writer = self.lock_writer_shared(op);
+        let hold_scope = perf::time_scope(perf::ProfilePoint::MountBackendHold);
+        #[cfg(feature = "perf-counters")]
+        let op_hold_scope = perf::time_backend_op_hold(op);
+        let ticket = self.writer.shared().dirty_ticket();
+        #[cfg(feature = "perf-counters")]
+        drop(op_hold_scope);
+        drop(writer);
+        drop(hold_scope);
+
+        let result = self.flush_through_ticket(ticket);
+        #[cfg(feature = "perf-counters")]
+        perf::record_backend_op_io(op, self.flush_handle.io_snapshot().delta_since(io_before));
+        result
+    }
+
     fn try_mutate<T>(
         &self,
         op: BackendOp,
         f: impl FnOnce(&mut Ext4Mount) -> FsResult<T>,
     ) -> Option<FsResult<T>> {
         let _ = op;
-        let mut writer = self.writer.try_write()?;
-        let mount = writer.exclusive();
-        let generation_write = self.cache_generation.begin_write();
+        let _coordinator = self.flush_coordinator.try_lock()?;
+        let writer = self.core_admission.try_write()?;
+        let mount = self.writer.exclusive();
         #[cfg(feature = "perf-counters")]
         {
             perf::record_backend_op_call(op);
@@ -1367,14 +1667,18 @@ impl ConcurrentExt4Backend {
         #[cfg(feature = "perf-counters")]
         let op_hold_scope = perf::time_backend_op_hold(op);
         let result = f(mount);
-        let visible = mount.flush_for_replica_visibility();
+        let ticket = mount.dirty_ticket();
+        let visible = mount.flush_all();
+        if visible.is_ok() {
+            self.completed_flush_ticket
+                .fetch_max(ticket, Ordering::AcqRel);
+        }
         #[cfg(feature = "perf-counters")]
         {
             drop(op_hold_scope);
             perf::record_backend_op_io(op, mount.io_counters.snapshot().delta_since(io_before));
         }
         drop(writer);
-        drop(generation_write);
         Some(match result {
             Ok(value) => visible.map(|()| value),
             Err(err) => Err(err),
@@ -1788,11 +2092,7 @@ impl Ext4Mount {
     }
 
     fn set_mode_shared(&self, ino: u32, mode: u32) -> FsResult {
-        let mut attr = lwext4_rust::FileAttr::default();
-        self.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
-        self.fs
-            .set_mode(ino, (attr.mode & !0o7777) | (mode & 0o7777))
-            .map_err(map_ext4_error)
+        self.fs.set_mode(ino, mode).map_err(map_ext4_error)
     }
 
     fn set_owner_shared(&self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
@@ -2243,8 +2543,8 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
     }
 
     fn statfs(&self) -> FileSystemStat {
-        // The read-only core's in-memory superblock is a mount-time snapshot;
-        // free inode/block counters are maintained by the writable core.
+        // Allocator counters are maintained by the canonical writable core;
+        // statfs therefore uses the remaining exclusive superblock accessor.
         self.with_writer_read(BackendOp::StatFull, |writer| writer.statfs_shared())
     }
 
@@ -2253,7 +2553,7 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         parent_ino: u32,
         component: &str,
     ) -> FsResult<(u32, FsNodeKind)> {
-        self.with_reader(BackendOp::Lookup, parent_ino, |reader, _| {
+        self.with_reader(BackendOp::Lookup, parent_ino, |reader| {
             reader.lookup_component_from_shared(parent_ino, component)
         })
     }
@@ -2360,8 +2660,8 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         })
     }
 
-    fn sync(&self, ino: u32, data_only: bool) -> FsResult {
-        self.mutate(BackendOp::Sync, |writer| writer.sync(ino, data_only))
+    fn sync(&self, _ino: u32, _data_only: bool) -> FsResult {
+        self.sync_current()
     }
 
     fn shutdown(&self) -> FsResult {
@@ -2394,7 +2694,7 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
     }
 
     fn inode_flags(&self, ino: u32) -> FsResult<u32> {
-        self.with_reader(BackendOp::StatFull, ino, |reader, _| {
+        self.with_reader(BackendOp::StatFull, ino, |reader| {
             reader.inode_flags_shared(ino)
         })
     }
@@ -2404,24 +2704,14 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
     }
 
     fn retain_inode(&self, ino: u32) -> FsResult {
-        loop {
-            let retained =
-                self.with_reader(BackendOp::InodeLifetime, ino, |reader, generation| {
-                    let mut attr = lwext4_rust::FileAttr::default();
-                    reader.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
-                    if attr.nlink == 0 {
-                        return Err(FsError::NotFound);
-                    }
-                    Ok(self.inode_runtime.retain_at_generation(
-                        ino,
-                        generation,
-                        &self.cache_generation,
-                    ))
-                })?;
-            if retained {
-                return Ok(());
+        self.with_reader(BackendOp::InodeLifetime, ino, |reader| {
+            let mut attr = lwext4_rust::FileAttr::default();
+            reader.fs.get_attr(ino, &mut attr).map_err(map_ext4_error)?;
+            if attr.nlink == 0 || !self.inode_runtime.retain(ino) {
+                return Err(FsError::NotFound);
             }
-        }
+            Ok(())
+        })
     }
 
     fn release_inode(&self, ino: u32) -> FsResult<InodeRelease> {
@@ -2452,19 +2742,17 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
     }
 
     fn stat(&self, ino: u32) -> FsResult<FileStat> {
-        self.with_reader(BackendOp::StatFull, ino, |reader, _| {
-            reader.stat_shared(ino)
-        })
+        self.with_reader(BackendOp::StatFull, ino, |reader| reader.stat_shared(ino))
     }
 
     fn stat_basic(&self, ino: u32) -> FsResult<FileStat> {
-        self.with_reader(BackendOp::StatBasic, ino, |reader, _| {
+        self.with_reader(BackendOp::StatBasic, ino, |reader| {
             reader.stat_basic_shared(ino)
         })
     }
 
     fn readlink(&self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
-        self.with_reader(BackendOp::Readlink, ino, |reader, _| {
+        self.with_reader(BackendOp::Readlink, ino, |reader| {
             reader.readlink_shared(ino, buf)
         })
     }
@@ -2473,7 +2761,7 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         // This phase reads only inode/mapping metadata. External target data
         // is fetched by the returned pointer-free plan after the reader core
         // lock has been released.
-        self.with_reader(BackendOp::ReadPlan, ino, |reader, _| {
+        self.with_reader(BackendOp::ReadPlan, ino, |reader| {
             reader.prepare_readlink_plan_shared(ino, len)
         })
     }
@@ -2492,13 +2780,13 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         offset: u64,
         len: usize,
     ) -> Option<Box<dyn BackendReadPlan>> {
-        self.with_reader(BackendOp::ReadPlan, ino, |reader, _| {
+        self.with_reader(BackendOp::ReadPlan, ino, |reader| {
             reader.prepare_read_plan_shared(ino, offset, len)
         })
     }
 
     fn read_at(&self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
-        self.with_reader(BackendOp::ReadFallback, ino, |reader, _| {
+        self.with_reader(BackendOp::ReadFallback, ino, |reader| {
             reader.read_at_shared(ino, buf, offset)
         })
     }
@@ -2509,10 +2797,9 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         offset: u64,
         len: usize,
     ) -> Option<Box<dyn BackendWritePlan>> {
-        // Mapping lookup and writer-core alias invalidation are short control
-        // operations. The shared read core is retired by cache epoch only
-        // after plan I/O publishes new bytes, so its payload is never rewritten
-        // underneath an older reader.
+        // Mapping lookup and canonical-cache alias invalidation are short
+        // control operations. The returned pointer-free plan owns physical
+        // LBA leases while device I/O runs after the core guard is released.
         perf::record_ext4_write_plan_attempt();
         let prepared = self.with_writer_read(BackendOp::Write, |writer| {
             let prepared = writer.prepare_mapped_write_plan(ino, offset, len)?;
@@ -2544,19 +2831,19 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         ino: u32,
         offset: u64,
     ) -> Option<Box<dyn BackendDirectoryReadPlan>> {
-        self.with_reader(BackendOp::ReadPlan, ino, |reader, _| {
+        self.with_reader(BackendOp::ReadPlan, ino, |reader| {
             reader.prepare_directory_read_plan_shared(ino, offset)
         })
     }
 
     fn read_dirent64(&self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
-        self.with_reader(BackendOp::Readdir, ino, |reader, _| {
+        self.with_reader(BackendOp::Readdir, ino, |reader| {
             reader.read_dirent64_shared(ino, offset, buf)
         })
     }
 
     fn list_root_names(&self) -> Vec<String> {
-        if let Some(plan) = self.with_reader(BackendOp::ReadPlan, EXT4_ROOT_INO, |reader, _| {
+        if let Some(plan) = self.with_reader(BackendOp::ReadPlan, EXT4_ROOT_INO, |reader| {
             reader.prepare_directory_read_plan_shared(EXT4_ROOT_INO, 0)
         }) {
             return plan
@@ -2564,7 +2851,7 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
                 .expect("failed to execute ext4 root directory snapshot")
                 .names();
         }
-        self.with_reader(BackendOp::Readdir, EXT4_ROOT_INO, |reader, _| {
+        self.with_reader(BackendOp::Readdir, EXT4_ROOT_INO, |reader| {
             reader.list_root_names_shared()
         })
     }

@@ -44,6 +44,13 @@ pub struct StatFs {
     pub block_size: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Ext4FlushProgress {
+    pub complete: bool,
+    pub pending_lba: u64,
+    pub pending_refs: u32,
+}
+
 pub struct Ext4Filesystem<Hal: SystemHal, Dev: BlockDevice> {
     inner: Box<ext4_fs>,
     bdev: Ext4BlockDevice<Dev>,
@@ -149,6 +156,34 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         }
     }
 
+    /// Returns whether direct device reads can observe the current payload of
+    /// every listed filesystem block.
+    ///
+    /// A missing cache alias is already device-backed. A present alias must be
+    /// clean, up to date, and owned only by this temporary probe; otherwise a
+    /// caller may be modifying it or the newest bytes may exist only in the
+    /// write-back cache. The caller must separately prevent a new mutation of
+    /// the same logical object between this check and device-plan execution.
+    pub fn device_snapshot_blocks_are_clean(&self, blocks: &[u64]) -> bool {
+        unsafe {
+            let bcache = self.bdev.inner.as_ref().bc;
+            for &lba in blocks {
+                let mut block: ext4_block = mem::zeroed();
+                let buf = ext4_bcache_find_get(bcache, &mut block, lba);
+                if buf.is_null() {
+                    continue;
+                }
+                let clean = ext4_bcache_block_is_clean_exclusive(bcache, &mut block);
+                let rc = ext4_bcache_free(bcache, &mut block);
+                debug_assert_eq!(rc, EOK as i32);
+                if rc != EOK as i32 || !clean {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+
     fn inode_ref(&self, ino: u32) -> Ext4Result<InodeRef<Hal>> {
         unsafe {
             let mut result = mem::zeroed();
@@ -221,7 +256,9 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         self.inode_ref(ino)?.set_len(len)
     }
     pub fn set_mode(&self, ino: u32, mode: u32) -> Ext4Result<()> {
-        self.inode_ref(ino)?.set_mode(mode);
+        let mut inode = self.inode_ref(ino)?;
+        let preserved_type = inode.mode() & !0o7777;
+        inode.set_mode(preserved_type | (mode & 0o7777));
         Ok(())
     }
     pub fn inode_flags(&self, ino: u32) -> Ext4Result<u32> {
@@ -474,6 +511,36 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             ext4_block_cache_flush(self.bdev.inner_ptr()).context("ext4_cache_flush")?;
         }
         Ok(())
+    }
+
+    /// Captures a durability boundary for every metadata buffer dirtied by
+    /// this cache before the call.
+    pub fn dirty_ticket(&self) -> u64 {
+        unsafe { ext4_bcache_dirty_ticket(self.bdev.inner.as_ref().bc) }
+    }
+
+    /// Writes every zero-reference buffer covered by `ticket`. `false` means
+    /// at least one covered buffer is still owned by a metadata caller; no
+    /// referenced payload is submitted and the caller may yield before retry.
+    pub fn flush_through(&self, ticket: u64) -> Ext4Result<Ext4FlushProgress> {
+        let mut complete = false;
+        let mut pending_lba = 0;
+        let mut pending_refs = 0;
+        unsafe {
+            ext4_block_cache_flush_through(
+                self.bdev.inner_ptr(),
+                ticket,
+                &mut complete,
+                &mut pending_lba,
+                &mut pending_refs,
+            )
+            .context("ext4_cache_flush_through")?;
+        }
+        Ok(Ext4FlushProgress {
+            complete,
+            pending_lba,
+            pending_refs,
+        })
     }
 
     pub fn shutdown_clean(&mut self) -> Ext4Result<()> {

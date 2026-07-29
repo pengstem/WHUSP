@@ -53,6 +53,12 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 
+/** Mount-lifetime immutable fields copied from one block-group descriptor. */
+struct ext4_inode_group_topology {
+	ext4_fsblk_t inode_table_start;
+	bool valid;
+};
+
 struct ext4_fs {
 	bool read_only;
 
@@ -61,6 +67,8 @@ struct ext4_fs {
 
 	uint64_t inode_block_limits[4];
 	uint64_t inode_blocks_per_level[4];
+	struct ext4_inode_group_topology *inode_group_topology;
+	uint32_t inode_group_topology_count;
 
 	uint32_t last_inode_bg_id;
 

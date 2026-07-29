@@ -85,6 +85,32 @@ void ext4_bcache_index_unlock_impl(struct ext4_bcache *bc)
 	ext4_assert(r == EOK);
 }
 
+void ext4_bcache_index_read_lock_impl(struct ext4_bcache *bc)
+{
+	if (!bc || !bc->bdev)
+		return;
+	if (!bc->bdev->bdif->bcache_index_read_lock) {
+		ext4_bcache_index_lock_impl(bc);
+		return;
+	}
+
+	int r = bc->bdev->bdif->bcache_index_read_lock(bc->bdev);
+	ext4_assert(r == EOK);
+}
+
+void ext4_bcache_index_read_unlock_impl(struct ext4_bcache *bc)
+{
+	if (!bc || !bc->bdev)
+		return;
+	if (!bc->bdev->bdif->bcache_index_read_unlock) {
+		ext4_bcache_index_unlock_impl(bc);
+		return;
+	}
+
+	int r = bc->bdev->bdif->bcache_index_read_unlock(bc->bdev);
+	ext4_assert(r == EOK);
+}
+
 void ext4_bcache_lba_lock_impl(struct ext4_bcache *bc, uint64_t lba)
 {
 	if (!bc || !bc->bdev || !bc->bdev->bdif->bcache_lba_lock)
@@ -484,6 +510,80 @@ ext4_bcache_find_get_uptodate(struct ext4_bcache *bc, struct ext4_block *b,
 	return buf;
 }
 
+struct ext4_buf *
+ext4_bcache_find_get_resident(struct ext4_bcache *bc, struct ext4_block *b,
+			      uint64_t lba)
+{
+	struct ext4_buf *buf;
+	uint8_t state;
+	uint32_t refs;
+
+	if (!bc->concurrent)
+		return ext4_bcache_find_get_legacy(bc, b, lba);
+
+	/* The shared index side may pin only an already referenced buffer: it is
+	 * absent from the zero-ref LRU/dirty containers, so no tree/list mutation
+	 * is required. A writer excludes tree removal while this lookup is live. */
+	ext4_bcache_index_read_lock(bc);
+	buf = ext4_buf_lookup(bc, lba);
+	if (buf)
+		state = ext4_bcache_get_state(buf);
+	if (!buf || buf->detached ||
+	    buf->generation != ext4_bcache_generation(bc) ||
+	    (state != BC_STATE_UPTODATE && state != BC_STATE_DIRTY) ||
+	    !ext4_bcache_test_flag(buf, BC_UPTODATE) ||
+	    ext4_bcache_test_flag(buf, BC_FLUSH) ||
+	    ext4_bcache_test_flag(buf, BC_TMP) || buf->end_write) {
+		buf = NULL;
+	} else {
+		refs = ext4_bcache_ref_count(buf);
+		while (refs) {
+			ext4_assert(refs != UINT32_MAX);
+			if (__atomic_compare_exchange_n(&buf->refctr, &refs, refs + 1,
+							false, __ATOMIC_ACQ_REL,
+							__ATOMIC_ACQUIRE)) {
+				b->lb_id = lba;
+				b->buf = buf;
+				b->data = buf->data;
+				break;
+			}
+		}
+		if (!refs)
+			buf = NULL;
+	}
+	ext4_bcache_index_read_unlock(bc);
+	if (buf)
+		return buf;
+
+	/* A zero-reference buffer requires exclusive ownership to leave its
+	 * LRU/dirty containers before the first active reference is published. */
+	ext4_bcache_index_lock(bc);
+	buf = ext4_buf_lookup(bc, lba);
+	if (buf)
+		state = ext4_bcache_get_state(buf);
+	if (!buf || buf->detached ||
+	    buf->generation != ext4_bcache_generation(bc) ||
+	    (state != BC_STATE_UPTODATE && state != BC_STATE_DIRTY) ||
+	    !ext4_bcache_test_flag(buf, BC_UPTODATE) ||
+	    ext4_bcache_test_flag(buf, BC_FLUSH) ||
+	    ext4_bcache_test_flag(buf, BC_TMP) || buf->end_write) {
+		buf = NULL;
+	} else {
+		if (!ext4_bcache_ref_count(buf)) {
+			buf->lru_id = ++bc->lru_ctr;
+			RB_REMOVE(ext4_buf_lru, &bc->lru_root, buf);
+			if (ext4_bcache_test_flag(buf, BC_DIRTY))
+				ext4_bcache_remove_dirty_node(bc, buf);
+		}
+		ext4_bcache_inc_ref(buf);
+		b->lb_id = lba;
+		b->buf = buf;
+		b->data = buf->data;
+	}
+	ext4_bcache_index_unlock(bc);
+	return buf;
+}
+
 int ext4_bcache_alloc_locked(struct ext4_bcache *bc, struct ext4_block *b,
 			     bool *is_new)
 {
@@ -569,16 +669,46 @@ int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b)
 	/*Block should have a valid pointer to ext4_buf.*/
 	ext4_assert(buf);
 
-	/* Immutable cache hits need only serialize the refcount/LRU transition.
-	 * The LBA sleeping lock is reserved for loading, invalidation, dirty
-	 * writeback and buffer-state publication. Detached buffers are no longer
-	 * discoverable, so their last immutable reference may retire them here. */
-	bool clean_fast = false;
+	/* Stable resident refs need only serialize the refcount/LRU transition.
+	 * Object-level leases exclude overlapping payload writes. The LBA sleeping
+	 * lock is reserved for fill, invalidation, writeback and exceptional state
+	 * transitions. Detached buffers are never dirty or discoverable. */
+	bool resident_fast = false;
 	bool detached_drop = false;
-	ext4_bcache_index_lock(bc);
-	if (ext4_bcache_get_state(buf) == BC_STATE_UPTODATE &&
+	uint8_t state;
+	uint32_t refs;
+
+	/* Multiple active owners can release under shared index admission. CAS
+	 * refuses the 1 -> 0 transition so exactly one exclusive caller performs
+	 * the LRU/dirty-list publication or detached-buffer retirement. */
+	ext4_bcache_index_read_lock(bc);
+	state = ext4_bcache_get_state(buf);
+	if ((state == BC_STATE_UPTODATE || state == BC_STATE_DIRTY) &&
 	    ext4_bcache_test_flag(buf, BC_UPTODATE) &&
-	    !ext4_bcache_test_flag(buf, BC_DIRTY) &&
+	    !ext4_bcache_test_flag(buf, BC_FLUSH) &&
+	    !ext4_bcache_test_flag(buf, BC_TMP) && !buf->end_write) {
+		refs = ext4_bcache_ref_count(buf);
+		while (refs > 1) {
+			if (__atomic_compare_exchange_n(&buf->refctr, &refs, refs - 1,
+							false, __ATOMIC_ACQ_REL,
+							__ATOMIC_ACQUIRE)) {
+				resident_fast = true;
+				break;
+			}
+		}
+	}
+	ext4_bcache_index_read_unlock(bc);
+	if (resident_fast) {
+		b->lb_id = 0;
+		b->buf = 0;
+		b->data = 0;
+		return EOK;
+	}
+
+	ext4_bcache_index_lock(bc);
+	state = ext4_bcache_get_state(buf);
+	if ((state == BC_STATE_UPTODATE || state == BC_STATE_DIRTY) &&
+	    ext4_bcache_test_flag(buf, BC_UPTODATE) &&
 	    !ext4_bcache_test_flag(buf, BC_FLUSH) &&
 	    !ext4_bcache_test_flag(buf, BC_TMP) && !buf->end_write) {
 		ext4_assert(ext4_bcache_ref_count(buf));
@@ -590,10 +720,10 @@ int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b)
 				ext4_bcache_zero_ref_locked(bc, buf);
 			}
 		}
-		clean_fast = true;
+		resident_fast = true;
 	}
 	ext4_bcache_index_unlock(bc);
-	if (clean_fast) {
+	if (resident_fast) {
 		if (detached_drop)
 			ext4_buf_free(buf);
 		b->lb_id = 0;
@@ -728,6 +858,37 @@ bool ext4_bcache_peek_dirty_lba(struct ext4_bcache *bc, uint64_t *lba)
 		*lba = buf->lba;
 	ext4_bcache_index_unlock(bc);
 	return buf != NULL;
+}
+
+uint64_t ext4_bcache_dirty_ticket(struct ext4_bcache *bc)
+{
+	if (bc->concurrent)
+		return __atomic_load_n(&bc->dirty_epoch, __ATOMIC_ACQUIRE);
+	return bc->dirty_epoch;
+}
+
+bool ext4_bcache_peek_dirty_through(struct ext4_bcache *bc,
+				    uint64_t ticket,
+				    uint64_t from,
+				    uint64_t *lba)
+{
+	struct ext4_buf *buf;
+	bool found = false;
+
+	ext4_bcache_index_lock(bc);
+	buf = RB_MIN(ext4_buf_lba, &bc->lba_root);
+	while (buf) {
+		uint64_t first_dirty = ext4_bcache_first_dirty_epoch(buf);
+		if (buf->lba >= from && first_dirty && first_dirty <= ticket &&
+		    ext4_bcache_test_flag(buf, BC_DIRTY)) {
+			*lba = buf->lba;
+			found = true;
+			break;
+		}
+		buf = RB_NEXT(ext4_buf_lba, &bc->lba_root, buf);
+	}
+	ext4_bcache_index_unlock(bc);
+	return found;
 }
 
 bool ext4_bcache_block_is_clean_exclusive(struct ext4_bcache *bc,

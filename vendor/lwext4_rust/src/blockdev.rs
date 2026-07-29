@@ -58,6 +58,21 @@ pub trait BlockDevice: Send + Sync {
     /// The caller must own the cache-index lock exactly once.
     unsafe fn unlock_bcache_index(&self);
 
+    /// Acquires shared ownership for a stable resident-cache lookup. Devices
+    /// without a scalable reader path retain the exclusive callback behavior.
+    fn lock_bcache_index_read(&self) {
+        self.lock_bcache_index();
+    }
+
+    /// Releases one matching shared resident-cache lookup.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own one cache-index read admission.
+    unsafe fn unlock_bcache_index_read(&self) {
+        unsafe { self.unlock_bcache_index() };
+    }
+
     /// Acquires the ownership shard for one logical filesystem block.
     fn lock_bcache_lba(&self, lba: u64);
 
@@ -125,6 +140,9 @@ impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
             unlock: None,
             bcache_index_lock: concurrent_bcache.then_some(Self::dev_bcache_index_lock),
             bcache_index_unlock: concurrent_bcache.then_some(Self::dev_bcache_index_unlock),
+            bcache_index_read_lock: concurrent_bcache.then_some(Self::dev_bcache_index_read_lock),
+            bcache_index_read_unlock: concurrent_bcache
+                .then_some(Self::dev_bcache_index_read_unlock),
             bcache_lba_lock: concurrent_bcache.then_some(Self::dev_bcache_lba_lock),
             bcache_lba_unlock: concurrent_bcache.then_some(Self::dev_bcache_lba_unlock),
             bcache_generation: versioned_bcache.then_some(Self::dev_bcache_generation),
@@ -259,6 +277,18 @@ impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
         EOK as _
     }
 
+    unsafe extern "C" fn dev_bcache_index_read_lock(bdev: *mut ext4_blockdev) -> c_int {
+        let (_, dev) = unsafe { Self::iface_and_dev(bdev) };
+        dev.lock_bcache_index_read();
+        EOK as _
+    }
+
+    unsafe extern "C" fn dev_bcache_index_read_unlock(bdev: *mut ext4_blockdev) -> c_int {
+        let (_, dev) = unsafe { Self::iface_and_dev(bdev) };
+        unsafe { dev.unlock_bcache_index_read() };
+        EOK as _
+    }
+
     unsafe extern "C" fn dev_bcache_lba_lock(bdev: *mut ext4_blockdev, lba: u64) -> c_int {
         let (_, dev) = unsafe { Self::iface_and_dev(bdev) };
         dev.lock_bcache_lba(lba);
@@ -375,6 +405,8 @@ mod tests {
         metadata_group_unlocks: AtomicUsize,
         metadata_global_locks: AtomicUsize,
         metadata_global_unlocks: AtomicUsize,
+        lba_locks: AtomicUsize,
+        lba_unlocks: AtomicUsize,
         read_calls: AtomicUsize,
         write_calls: AtomicUsize,
         active_reads: AtomicUsize,
@@ -399,6 +431,8 @@ mod tests {
                 metadata_group_unlocks: AtomicUsize::new(0),
                 metadata_global_locks: AtomicUsize::new(0),
                 metadata_global_unlocks: AtomicUsize::new(0),
+                lba_locks: AtomicUsize::new(0),
+                lba_unlocks: AtomicUsize::new(0),
                 read_calls: AtomicUsize::new(0),
                 write_calls: AtomicUsize::new(0),
                 active_reads: AtomicUsize::new(0),
@@ -483,10 +517,12 @@ mod tests {
 
         fn lock_bcache_lba(&self, lba: u64) {
             self.shared.lba_lock(lba).lock();
+            self.shared.lba_locks.fetch_add(1, Ordering::SeqCst);
         }
 
         unsafe fn unlock_bcache_lba(&self, lba: u64) {
             unsafe { self.shared.lba_lock(lba).unlock() };
+            self.shared.lba_unlocks.fetch_add(1, Ordering::SeqCst);
         }
 
         fn lock_metadata_group(&self, bgid: u32) {
@@ -590,6 +626,48 @@ mod tests {
         });
         assert_eq!(shared.read_calls.load(Ordering::SeqCst), 1);
         unsafe { finish_bcache(&mut bdev) };
+    }
+
+    #[test]
+    fn dirty_resident_refs_bypass_the_lba_transition_lock() {
+        let (mut bdev, shared) = test_bcache(4);
+        unsafe {
+            let raw = bdev.inner.as_mut();
+            let mut first: ext4_block = mem::zeroed();
+            assert_eq!(ext4_block_get(raw, &mut first, 3), EOK as i32);
+            *first.data = 0xd3;
+            (*raw.bc).dirty_epoch = 1;
+            (*first.buf).first_dirty_epoch = 1;
+            (*first.buf).flags |=
+                (1i32 << bcache_state_bits_BC_UPTODATE) | (1i32 << bcache_state_bits_BC_DIRTY);
+            (*first.buf).state = ext4_bcache_buffer_state_BC_STATE_DIRTY as u8;
+
+            let locks = shared.lba_locks.load(Ordering::SeqCst);
+            let unlocks = shared.lba_unlocks.load(Ordering::SeqCst);
+            let mut second: ext4_block = mem::zeroed();
+            assert_eq!(ext4_block_get(raw, &mut second, 3), EOK as i32);
+            assert_eq!(*second.data, 0xd3);
+            assert_eq!(ext4_block_set(raw, &mut second), EOK as i32);
+            assert_eq!(ext4_block_set(raw, &mut first), EOK as i32);
+            assert_eq!(shared.lba_locks.load(Ordering::SeqCst), locks);
+            assert_eq!(shared.lba_unlocks.load(Ordering::SeqCst), unlocks);
+
+            let mut complete = false;
+            let mut pending_lba = 0;
+            let mut pending_refs = 0;
+            assert_eq!(
+                ext4_block_cache_flush_through(
+                    raw,
+                    1,
+                    &mut complete,
+                    &mut pending_lba,
+                    &mut pending_refs,
+                ),
+                EOK as i32
+            );
+            assert!(complete);
+            finish_bcache(&mut bdev);
+        }
     }
 
     #[test]
@@ -709,6 +787,78 @@ mod tests {
             );
             assert_eq!(shared.write_calls.load(Ordering::SeqCst), 1);
             assert_eq!(shared.storage.lock().unwrap()[EXT4_DEV_BSIZE], 0xa5);
+            finish_bcache(&mut bdev);
+        }
+    }
+
+    #[test]
+    fn flush_ticket_waits_for_covered_owners_and_ignores_future_dirty() {
+        let (mut bdev, shared) = test_bcache(4);
+        unsafe {
+            let raw = bdev.inner.as_mut();
+            let mut covered: ext4_block = mem::zeroed();
+            assert_eq!(ext4_block_get(raw, &mut covered, 1), EOK as i32);
+            *covered.data = 0xb1;
+            (*raw.bc).dirty_epoch = 1;
+            (*covered.buf).first_dirty_epoch = 1;
+            (*covered.buf).flags |=
+                (1i32 << bcache_state_bits_BC_UPTODATE) | (1i32 << bcache_state_bits_BC_DIRTY);
+            (*covered.buf).state = ext4_bcache_buffer_state_BC_STATE_DIRTY as u8;
+
+            let mut complete = true;
+            let mut pending_lba = 0;
+            let mut pending_refs = 0;
+            assert_eq!(
+                ext4_block_cache_flush_through(
+                    raw,
+                    1,
+                    &mut complete,
+                    &mut pending_lba,
+                    &mut pending_refs,
+                ),
+                EOK as i32
+            );
+            assert!(!complete, "referenced target was reported durable");
+            assert_eq!((pending_lba, pending_refs), (1, 1));
+            assert_eq!(shared.write_calls.load(Ordering::SeqCst), 0);
+
+            assert_eq!(ext4_block_set(raw, &mut covered), EOK as i32);
+            assert_eq!(
+                ext4_block_cache_flush_through(
+                    raw,
+                    1,
+                    &mut complete,
+                    &mut pending_lba,
+                    &mut pending_refs,
+                ),
+                EOK as i32
+            );
+            assert!(complete);
+            assert_eq!(shared.write_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(shared.storage.lock().unwrap()[EXT4_DEV_BSIZE], 0xb1);
+
+            let mut future: ext4_block = mem::zeroed();
+            assert_eq!(ext4_block_get(raw, &mut future, 2), EOK as i32);
+            *future.data = 0xb2;
+            (*raw.bc).dirty_epoch = 2;
+            (*future.buf).first_dirty_epoch = 2;
+            (*future.buf).flags |=
+                (1i32 << bcache_state_bits_BC_UPTODATE) | (1i32 << bcache_state_bits_BC_DIRTY);
+            (*future.buf).state = ext4_bcache_buffer_state_BC_STATE_DIRTY as u8;
+            assert_eq!(ext4_block_set(raw, &mut future), EOK as i32);
+
+            assert_eq!(
+                ext4_block_cache_flush_through(
+                    raw,
+                    1,
+                    &mut complete,
+                    &mut pending_lba,
+                    &mut pending_refs,
+                ),
+                EOK as i32
+            );
+            assert!(complete, "future dirty buffer blocked an older ticket");
+            assert_eq!(shared.write_calls.load(Ordering::SeqCst), 1);
             finish_bcache(&mut bdev);
         }
     }

@@ -209,6 +209,7 @@ int ext4_block_flush_buf_locked(struct ext4_blockdev *bdev,
 		ext4_bcache_index_lock(bc);
 		ext4_bcache_remove_dirty_node(bc, buf);
 		ext4_bcache_clear_flag(buf, BC_DIRTY);
+		ext4_bcache_clear_dirty_epoch(buf);
 		ext4_bcache_index_unlock(bc);
 		ext4_bcache_set_state(buf, BC_STATE_UPTODATE);
 		if (buf->end_write) {
@@ -401,12 +402,13 @@ int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b,
 	if (!(lba < bdev->lg_bcnt))
 		return ENXIO;
 
-	/* A stable clean hit needs only a short index/refcount pin. Per-LBA
-	 * ownership remains mandatory for cold fill and all state transitions. */
+	/* A stable resident clean or dirty hit needs only a short index/refcount
+	 * pin. Object-level leases protect payload ranges. Per-LBA ownership
+	 * remains mandatory for cold fill, writeback and state transitions. */
 	b->lb_id = lba;
 	b->buf = NULL;
 	b->data = NULL;
-	if (ext4_bcache_find_get_uptodate(bdev->bc, b, lba))
+	if (ext4_bcache_find_get_resident(bdev->bc, b, lba))
 		return EOK;
 
 	r = ext4_block_cache_shake(bdev);
@@ -610,6 +612,73 @@ int ext4_block_cache_flush(struct ext4_blockdev *bdev)
 		if (r != EOK)
 			return r;
 	}
+	return EOK;
+}
+
+static int ext4_block_flush_lba_through(struct ext4_blockdev *bdev,
+					uint64_t lba,
+					uint64_t ticket,
+					bool *pending,
+					uint64_t *pending_lba,
+					uint32_t *pending_refs)
+{
+	int r = EOK;
+	struct ext4_block block = EXT4_BLOCK_ZERO();
+	struct ext4_buf *buf;
+
+	ext4_bcache_lba_lock(bdev->bc, lba);
+	buf = ext4_bcache_find_get_locked(bdev->bc, &block, lba);
+	if (!buf) {
+		ext4_bcache_lba_unlock(bdev->bc, lba);
+		return EOK;
+	}
+
+	uint64_t first_dirty = ext4_bcache_first_dirty_epoch(buf);
+	if (first_dirty && first_dirty <= ticket &&
+	    ext4_bcache_test_flag(buf, BC_DIRTY)) {
+		if (ext4_bcache_reserved_only(bdev->bc, buf))
+			r = ext4_block_flush_buf_locked(bdev, buf);
+		else {
+			*pending = true;
+			if (!*pending_refs) {
+				*pending_lba = lba;
+				/* Exclude this function's temporary reservation. */
+				*pending_refs = ext4_bcache_ref_count(buf) - 1;
+			}
+		}
+	}
+
+	ext4_bcache_release_reservation(bdev->bc, buf);
+	ext4_bcache_lba_unlock(bdev->bc, lba);
+	return r;
+}
+
+int ext4_block_cache_flush_through(struct ext4_blockdev *bdev,
+				   uint64_t ticket,
+				   bool *complete,
+				   uint64_t *pending_lba,
+				   uint32_t *pending_refs)
+{
+	int r;
+	uint64_t from = 0;
+	uint64_t lba;
+	bool pending = false;
+
+	ext4_assert(bdev && complete && pending_lba && pending_refs);
+	*pending_lba = 0;
+	*pending_refs = 0;
+	while (ext4_bcache_peek_dirty_through(bdev->bc, ticket, from,
+					      &lba)) {
+		r = ext4_block_flush_lba_through(bdev, lba, ticket, &pending,
+						       pending_lba, pending_refs);
+		if (r != EOK)
+			return r;
+		if (lba == UINT64_MAX)
+			break;
+		from = lba + 1;
+	}
+
+	*complete = !pending;
 	return EOK;
 }
 

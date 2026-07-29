@@ -65,10 +65,13 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	int r, i;
 	uint16_t tmp;
 	uint32_t bsize;
+	uint32_t bg_count;
 
 	ext4_assert(fs && bdev);
 
 	fs->bdev = bdev;
+	fs->inode_group_topology = NULL;
+	fs->inode_group_topology_count = 0;
 
 	fs->read_only = read_only;
 
@@ -109,13 +112,25 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 		ext4_dbg(DEBUG_FS, DBG_WARN
 				"last umount error: superblock fs_error flag\n");
 
+	bg_count = ext4_block_group_cnt(&fs->sb);
+	if (!bg_count)
+		return EINVAL;
+	fs->inode_group_topology =
+		ext4_calloc(bg_count, sizeof(*fs->inode_group_topology));
+	if (!fs->inode_group_topology)
+		return ENOMEM;
+	fs->inode_group_topology_count = bg_count;
 
 	if (!fs->read_only) {
 		/* Mark system as mounted */
 		ext4_set16(&fs->sb, state, EXT4_SUPERBLOCK_STATE_ERROR_FS);
 		r = ext4_sb_write(fs->bdev, &fs->sb);
-		if (r != EOK)
+		if (r != EOK) {
+			ext4_free(fs->inode_group_topology);
+			fs->inode_group_topology = NULL;
+			fs->inode_group_topology_count = 0;
 			return r;
+		}
 
 		/*Update mount count*/
 		ext4_set16(&fs->sb, mount_count, ext4_get16(&fs->sb, mount_count) + 1);
@@ -126,15 +141,20 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 
 int ext4_fs_fini(struct ext4_fs *fs)
 {
+	int r = EOK;
+
 	ext4_assert(fs);
 
 	/*Set superblock state*/
 	ext4_set16(&fs->sb, state, EXT4_SUPERBLOCK_STATE_VALID_FS);
 
 	if (!fs->read_only)
-		return ext4_sb_write(fs->bdev, &fs->sb);
+		r = ext4_sb_write(fs->bdev, &fs->sb);
 
-	return EOK;
+	ext4_free(fs->inode_group_topology);
+	fs->inode_group_topology = NULL;
+	fs->inode_group_topology_count = 0;
+	return r;
 }
 
 static void ext4_fs_debug_features_inc(uint32_t features_incompatible)
@@ -568,6 +588,66 @@ static bool ext4_fs_verify_bg_csum(struct ext4_sblock *sb,
 #define ext4_fs_verify_bg_csum(...) true
 #endif
 
+/*
+ * The inode-table address is immutable for the lifetime of an ext4
+ * filesystem.  Do not enter the allocator's block-group transaction on every
+ * inode lookup just to reread this field.  The group lock is retained for the
+ * first descriptor read so it cannot race lazy initialization or descriptor
+ * writeback; release/acquire publication makes later reads lock-free.
+ */
+static int ext4_fs_get_inode_table_start(struct ext4_fs *fs, uint32_t bgid,
+					 ext4_fsblk_t *inode_table_start)
+{
+	struct ext4_inode_group_topology *topology;
+	struct ext4_block block;
+	struct ext4_bgroup *bg;
+	uint32_t block_size;
+	uint32_t dsc_cnt;
+	uint32_t offset;
+	uint64_t block_id;
+	int rc = EOK;
+
+	if (bgid >= fs->inode_group_topology_count)
+		return EINVAL;
+	topology = &fs->inode_group_topology[bgid];
+	if (__atomic_load_n(&topology->valid, __ATOMIC_ACQUIRE)) {
+		*inode_table_start = topology->inode_table_start;
+		return EOK;
+	}
+
+	ext4_block_metadata_group_lock(fs->bdev, bgid);
+	if (__atomic_load_n(&topology->valid, __ATOMIC_RELAXED))
+		goto out_cached;
+
+	block_size = ext4_sb_get_block_size(&fs->sb);
+	dsc_cnt = block_size / ext4_sb_get_desc_size(&fs->sb);
+	block_id = ext4_fs_get_descriptor_block(&fs->sb, bgid, dsc_cnt);
+	offset = (bgid % dsc_cnt) * ext4_sb_get_desc_size(&fs->sb);
+	rc = ext4_trans_block_get(fs->bdev, &block, block_id);
+	if (rc != EOK)
+		goto out_unlock;
+
+	bg = (void *)(block.data + offset);
+	if (!ext4_fs_verify_bg_csum(&fs->sb, bgid, bg)) {
+		ext4_dbg(DEBUG_FS,
+			 DBG_WARN "Block group descriptor checksum failed."
+			 "Block group index: %" PRIu32 "\n",
+			 bgid);
+	}
+	topology->inode_table_start =
+		ext4_bg_get_inode_table_first_block(bg, &fs->sb);
+	rc = ext4_block_set(fs->bdev, &block);
+	if (rc != EOK)
+		goto out_unlock;
+	__atomic_store_n(&topology->valid, true, __ATOMIC_RELEASE);
+
+out_cached:
+	*inode_table_start = topology->inode_table_start;
+out_unlock:
+	ext4_block_metadata_group_unlock(fs->bdev, bgid);
+	return rc;
+}
+
 int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
 				struct ext4_block_group_ref *ref)
 {
@@ -757,23 +837,12 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 	uint32_t block_group = index / inodes_per_group;
 	uint32_t offset_in_group = index % inodes_per_group;
 
-	/* Load block group, where i-node is located */
-	struct ext4_block_group_ref bg_ref;
-
-	int rc = ext4_fs_get_block_group_ref(fs, block_group, &bg_ref);
-	if (rc != EOK) {
+	/* Load the mount-lifetime immutable inode-table address. */
+	ext4_fsblk_t inode_table_start;
+	int rc = ext4_fs_get_inode_table_start(fs, block_group,
+					       &inode_table_start);
+	if (rc != EOK)
 		return rc;
-	}
-
-	/* Load block address, where i-node table is located */
-	ext4_fsblk_t inode_table_start =
-	    ext4_bg_get_inode_table_first_block(bg_ref.block_group, &fs->sb);
-
-	/* Put back block group reference (not needed more) */
-	rc = ext4_fs_put_block_group_ref(&bg_ref);
-	if (rc != EOK) {
-		return rc;
-	}
 
 	/* Compute position of i-node in the block group */
 	uint16_t inode_size = ext4_get16(&fs->sb, inode_size);

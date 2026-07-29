@@ -87,6 +87,12 @@ struct ext4_blockdev_iface {
 	/**@brief   Unlock this filesystem core's block-cache index.*/
 	int (*bcache_index_unlock)(struct ext4_blockdev *bdev);
 
+	/**@brief   Shared lock for stable resident block-cache index lookup.*/
+	int (*bcache_index_read_lock)(struct ext4_blockdev *bdev);
+
+	/**@brief   Unlock one shared block-cache index lookup.*/
+	int (*bcache_index_read_unlock)(struct ext4_blockdev *bdev);
+
 	/**@brief   Lock the ownership shard for one logical block address.*/
 	int (*bcache_lba_lock)(struct ext4_blockdev *bdev, uint64_t lba);
 
@@ -175,6 +181,8 @@ struct ext4_blockdev {
 		.unlock = __unlock,                                            \
 		.bcache_index_lock = NULL,                                     \
 		.bcache_index_unlock = NULL,                                   \
+		.bcache_index_read_lock = NULL,                                \
+		.bcache_index_read_unlock = NULL,                              \
 		.bcache_lba_lock = NULL,                                       \
 		.bcache_lba_unlock = NULL,                                     \
 		.bcache_generation = NULL,                                     \
@@ -298,6 +306,19 @@ int ext4_block_readbytes(struct ext4_blockdev *bdev, uint64_t off, void *buf,
  * @param   bdev block device descriptor
  * @return  standard error code*/
 int ext4_block_cache_flush(struct ext4_blockdev *bdev);
+
+/**@brief   Flush every dirty buffer whose first dirty epoch is covered by a
+ *          ticket. Referenced target buffers are left untouched and reported
+ *          through `complete`, allowing the scheduler to yield before retry.
+ * @param   bdev block device descriptor
+ * @param   ticket dirty epoch durability boundary
+ * @param   complete set when no covered dirty buffer remains
+ * @return  standard error code*/
+int ext4_block_cache_flush_through(struct ext4_blockdev *bdev,
+				   uint64_t ticket,
+				   bool *complete,
+				   uint64_t *pending_lba,
+				   uint32_t *pending_refs);
 
 /**@brief   Enable/disable write back cache mode
  * @param   bdev block device descriptor

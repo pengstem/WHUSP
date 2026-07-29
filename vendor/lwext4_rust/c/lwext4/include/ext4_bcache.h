@@ -111,6 +111,9 @@ struct ext4_buf {
 	 *          still owned a reference. It is freed by the last owner.*/
 	bool detached;
 
+	/**@brief   First dirty epoch not yet covered by successful writeback.*/
+	uint64_t first_dirty_epoch;
+
 	/**@brief   LBA tree node*/
 	RB_ENTRY(ext4_buf) lba_node;
 
@@ -160,6 +163,9 @@ struct ext4_bcache {
 
 	/**@brief   This cache may be entered by concurrent callers. */
 	bool concurrent;
+
+	/**@brief   Last epoch allocated by a dirty-state transition. */
+	uint64_t dirty_epoch;
 
 	/**@brief   A tree holding all bufs*/
 	RB_HEAD(ext4_buf_lba, ext4_buf) lba_root;
@@ -230,15 +236,54 @@ static inline uint8_t ext4_bcache_state_get(struct ext4_buf *buf)
 #define ext4_bcache_set_state(buf, value) ext4_bcache_state_set((buf), (value))
 #define ext4_bcache_get_state(buf) ext4_bcache_state_get((buf))
 
+static inline uint64_t ext4_bcache_first_dirty_epoch(struct ext4_buf *buf) {
+	return buf->bc->concurrent ?
+		__atomic_load_n(&buf->first_dirty_epoch, __ATOMIC_ACQUIRE) :
+		buf->first_dirty_epoch;
+}
+
 static inline void ext4_bcache_set_dirty(struct ext4_buf *buf) {
+	uint64_t epoch;
+	uint64_t first_dirty;
+
+	first_dirty = ext4_bcache_first_dirty_epoch(buf);
+	if (first_dirty && ext4_bcache_test_flag(buf, BC_DIRTY))
+		return;
+
+	if (buf->bc->concurrent) {
+		if (!first_dirty)
+			epoch = __atomic_add_fetch(&buf->bc->dirty_epoch, 1,
+						   __ATOMIC_ACQ_REL);
+		else
+			epoch = first_dirty;
+	} else {
+		epoch = first_dirty ? first_dirty : ++buf->bc->dirty_epoch;
+	}
+
+	if (buf->bc->concurrent && !first_dirty) {
+		uint64_t clean = 0;
+		__atomic_compare_exchange_n(&buf->first_dirty_epoch, &clean,
+					    epoch, false, __ATOMIC_RELEASE,
+					    __ATOMIC_RELAXED);
+	} else if (!buf->bc->concurrent && !first_dirty) {
+		buf->first_dirty_epoch = epoch;
+	}
 	ext4_bcache_set_flag(buf, BC_UPTODATE);
 	ext4_bcache_set_flag(buf, BC_DIRTY);
 	ext4_bcache_set_state(buf, BC_STATE_DIRTY);
 }
 
+static inline void ext4_bcache_clear_dirty_epoch(struct ext4_buf *buf) {
+	if (buf->bc->concurrent)
+		__atomic_store_n(&buf->first_dirty_epoch, 0, __ATOMIC_RELEASE);
+	else
+		buf->first_dirty_epoch = 0;
+}
+
 static inline void ext4_bcache_clear_dirty(struct ext4_buf *buf) {
 	ext4_bcache_clear_flag(buf, BC_UPTODATE);
 	ext4_bcache_clear_flag(buf, BC_DIRTY);
+	ext4_bcache_clear_dirty_epoch(buf);
 	ext4_bcache_set_state(buf, BC_STATE_EMPTY);
 }
 
@@ -354,6 +399,13 @@ struct ext4_buf *
 ext4_bcache_find_get_uptodate(struct ext4_bcache *bc, struct ext4_block *b,
 			      uint64_t lba);
 
+/**@brief Pin an already resident clean or dirty stable buffer without taking
+ *          its LBA transition lock. Object-level callers must separately
+ *          exclude overlapping payload mutation.*/
+struct ext4_buf *
+ext4_bcache_find_get_resident(struct ext4_bcache *bc, struct ext4_block *b,
+			      uint64_t lba);
+
 /**@brief   Allocate block from block cache memory.
  *          Unreferenced block allocation is based on LRU
  *          (Last Recently Used) algorithm.
@@ -379,6 +431,10 @@ bool ext4_bcache_is_full(struct ext4_bcache *bc);
 void ext4_bcache_index_lock_impl(struct ext4_bcache *bc);
 void ext4_bcache_index_unlock_impl(struct ext4_bcache *bc);
 
+/**@brief Acquire/release shared ownership for a stable index lookup.*/
+void ext4_bcache_index_read_lock_impl(struct ext4_bcache *bc);
+void ext4_bcache_index_read_unlock_impl(struct ext4_bcache *bc);
+
 /**@brief Acquire/release the ownership shard for one LBA.*/
 void ext4_bcache_lba_lock_impl(struct ext4_bcache *bc, uint64_t lba);
 void ext4_bcache_lba_unlock_impl(struct ext4_bcache *bc, uint64_t lba);
@@ -392,6 +448,16 @@ void ext4_bcache_lba_unlock_impl(struct ext4_bcache *bc, uint64_t lba);
 	do {                                                               \
 		if ((bc)->concurrent)                                        \
 			ext4_bcache_index_unlock_impl((bc));                   \
+	} while (0)
+#define ext4_bcache_index_read_lock(bc)                                \
+	do {                                                               \
+		if ((bc)->concurrent)                                        \
+			ext4_bcache_index_read_lock_impl((bc));                \
+	} while (0)
+#define ext4_bcache_index_read_unlock(bc)                              \
+	do {                                                               \
+		if ((bc)->concurrent)                                        \
+			ext4_bcache_index_read_unlock_impl((bc));              \
 	} while (0)
 #define ext4_bcache_lba_lock(bc, lba)                                  \
 	do {                                                               \
@@ -420,6 +486,17 @@ void ext4_bcache_drop_reserved(struct ext4_bcache *bc, struct ext4_buf *buf);
 
 /**@brief Return one dirty LBA without retaining a raw buffer pointer.*/
 bool ext4_bcache_peek_dirty_lba(struct ext4_bcache *bc, uint64_t *lba);
+
+/**@brief Snapshot the newest dirty epoch allocated by this cache.*/
+uint64_t ext4_bcache_dirty_ticket(struct ext4_bcache *bc);
+
+/**@brief Find a dirty LBA at or after `from` whose first dirty epoch is no
+ *          newer than `ticket`. Referenced buffers are included so callers
+ *          cannot mistake an in-flight target mutation for durability.*/
+bool ext4_bcache_peek_dirty_through(struct ext4_bcache *bc,
+				    uint64_t ticket,
+				    uint64_t from,
+				    uint64_t *lba);
 
 /**@brief Test whether a retained block is the sole clean reference.*/
 bool ext4_bcache_block_is_clean_exclusive(struct ext4_bcache *bc,

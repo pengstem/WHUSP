@@ -2682,6 +2682,7 @@ pub(crate) fn stat_direct_regular_child_in(
         else {
             return Ok(None);
         };
+        let expected_metadata_epoch = inode_state::direct_stat_metadata_epoch(node);
         let mut stat = if full_stat {
             stat_full_cached(node)?
         } else {
@@ -2689,8 +2690,18 @@ pub(crate) fn stat_direct_regular_child_in(
         };
         stat.dev = node.mount_id.0 as u64;
         overlay_dirty_regular_stat(node, &mut stat);
-        if inode_state::direct_stat_cache_epoch() == expected_epoch {
-            inode_state::direct_stat_cache_insert(expected_epoch, namespace_id, parent, name, stat);
+        if inode_state::direct_stat_cache_epoch() == expected_epoch
+            && inode_state::direct_stat_metadata_epoch(node) == expected_metadata_epoch
+        {
+            inode_state::direct_stat_cache_insert(
+                expected_epoch,
+                expected_metadata_epoch,
+                namespace_id,
+                parent,
+                name,
+                node,
+                stat,
+            );
             return Ok(Some(stat));
         }
     }
