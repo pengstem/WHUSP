@@ -1,5 +1,7 @@
 use crate::sync::UPIntrFreeCell;
-use crate::task::{TaskContext, TaskControlBlock, block_current_task_no_schedule, wakeup_task};
+use crate::task::{
+    TaskContext, TaskControlBlock, block_current_task_no_schedule, wakeup_front_task, wakeup_task,
+};
 use alloc::{collections::VecDeque, sync::Arc};
 
 pub struct Condvar {
@@ -25,6 +27,16 @@ impl Condvar {
         let task = self.inner.exclusive_access().wait_queue.pop_front();
         if let Some(task) = task {
             wakeup_task(task);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn signal_front(&self) -> bool {
+        let task = self.inner.exclusive_access().wait_queue.pop_front();
+        if let Some(task) = task {
+            wakeup_front_task(task);
             true
         } else {
             false

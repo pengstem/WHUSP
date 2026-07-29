@@ -7,8 +7,7 @@ use crate::task::schedule;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-#[cfg(feature = "perf-counters")]
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::*;
 use log::info;
 use virtio_drivers::device::blk::{BlkReq, BlkResp, VirtIOBlk};
@@ -34,6 +33,8 @@ pub(crate) struct BlockIoStats {
     pub(crate) irq_acks: usize,
     pub(crate) completion_signals: usize,
     pub(crate) completion_wakeups: usize,
+    pub(crate) completion_poll_observations: usize,
+    pub(crate) completion_poll_wakeups: usize,
     pub(crate) device_inflight: usize,
     pub(crate) device_inflight_high_watermark: usize,
 }
@@ -59,6 +60,8 @@ mod block_io_perf {
     pub(super) static IRQ_ACKS: AtomicUsize = AtomicUsize::new(0);
     pub(super) static COMPLETION_SIGNALS: AtomicUsize = AtomicUsize::new(0);
     pub(super) static COMPLETION_WAKEUPS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static COMPLETION_POLL_OBSERVATIONS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static COMPLETION_POLL_WAKEUPS: AtomicUsize = AtomicUsize::new(0);
     pub(super) static DEVICE_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
     pub(super) static DEVICE_INFLIGHT_HIGH_WATERMARK: AtomicUsize = AtomicUsize::new(0);
 
@@ -113,6 +116,7 @@ enum BlockIoPath {
 
 pub struct VirtIOBlock {
     state: SpinNoIrqLock<VirtIOBlockState>,
+    async_inflight_hint: AtomicUsize,
     base_addr: usize,
     cache_key: usize,
     irq: usize,
@@ -184,6 +188,7 @@ impl VirtIOBlock {
                     .unwrap()
             };
             state.async_inflight += 1;
+            self.async_inflight_hint.fetch_add(1, Ordering::Release);
             record_nb_read_wait();
             (self.condvars.get(&token).unwrap().wait_no_sched(), token)
         };
@@ -198,6 +203,8 @@ impl VirtIOBlock {
             }
             assert_ne!(state.async_inflight, 0, "VirtIO read inflight underflow");
             state.async_inflight -= 1;
+            let previous = self.async_inflight_hint.fetch_sub(1, Ordering::AcqRel);
+            assert_ne!(previous, 0, "VirtIO read inflight hint underflow");
             record_nb_read_completion();
             state.device.peek_used()
         };
@@ -279,6 +286,7 @@ impl VirtIOBlock {
                     .unwrap()
             };
             state.async_inflight += 1;
+            self.async_inflight_hint.fetch_add(1, Ordering::Release);
             record_nb_write_wait();
             (self.condvars.get(&token).unwrap().wait_no_sched(), token)
         };
@@ -293,6 +301,8 @@ impl VirtIOBlock {
             }
             assert_ne!(state.async_inflight, 0, "VirtIO write inflight underflow");
             state.async_inflight -= 1;
+            let previous = self.async_inflight_hint.fetch_sub(1, Ordering::AcqRel);
+            assert_ne!(previous, 0, "VirtIO write inflight hint underflow");
             record_nb_write_completion();
             state.device.peek_used()
         };
@@ -331,6 +341,26 @@ impl VirtIOBlock {
         self.signal_completed(next_completed);
     }
 
+    #[cfg(target_arch = "loongarch64")]
+    fn poll_completion(&self) {
+        if self.async_inflight_hint.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        // Timer fallback must never wait behind an interrupted submitter. It
+        // only observes the used-ring head; the owning task still retires the
+        // descriptor and performs HAL buffer teardown after being woken.
+        let completed = self
+            .state
+            .try_lock()
+            .and_then(|mut state| state.device.peek_used());
+        if completed.is_some() {
+            record_completion_poll_observation();
+        }
+        if self.signal_completed(completed) {
+            record_completion_poll_wakeup();
+        }
+    }
+
     pub fn num_blocks(&self) -> u64 {
         self.capacity_blocks as u64
     }
@@ -347,17 +377,19 @@ impl VirtIOBlock {
         self.cache_key
     }
 
-    fn signal_completed(&self, token: Option<u16>) {
+    fn signal_completed(&self, token: Option<u16>) -> bool {
         // CONTEXT: Completion is serialized through the virtqueue used ring.
         // Wake only the descriptor head reported by the device; unrelated
         // sleepers must stay blocked until their own token reaches used. Do
         // the scheduler wake only after releasing the IRQ-safe queue lock.
         if let Some(token) = token {
             record_completion_signal();
-            if self.condvars.get(&token).unwrap().signal() {
+            if self.condvars.get(&token).unwrap().signal_front() {
                 record_completion_wakeup();
+                return true;
             }
         }
+        false
     }
 
     pub fn new(device: BlockDeviceConfig) -> Self {
@@ -399,6 +431,7 @@ impl VirtIOBlock {
         }
         Self {
             state,
+            async_inflight_hint: AtomicUsize::new(0),
             base_addr,
             cache_key,
             irq,
@@ -437,7 +470,8 @@ lazy_static! {
 #[cfg(feature = "perf-counters")]
 pub(crate) fn block_io_stats_snapshot() -> BlockIoStats {
     use block_io_perf::{
-        COMPLETION_SIGNALS, COMPLETION_WAKEUPS, DEVICE_INFLIGHT, DEVICE_INFLIGHT_HIGH_WATERMARK,
+        COMPLETION_POLL_OBSERVATIONS, COMPLETION_POLL_WAKEUPS, COMPLETION_SIGNALS,
+        COMPLETION_WAKEUPS, DEVICE_INFLIGHT, DEVICE_INFLIGHT_HIGH_WATERMARK,
         FALLBACK_NO_READY_READS, FALLBACK_NO_READY_WRITES, FALLBACK_SYNC_READS,
         FALLBACK_SYNC_WRITES, FALLBACK_UNSAFE_READS, FALLBACK_UNSAFE_WRITES, IRQ_ACKS,
         NB_READ_COMPLETIONS, NB_READ_SUBMITS, NB_READ_WAITS, NB_WRITE_COMPLETIONS,
@@ -462,6 +496,8 @@ pub(crate) fn block_io_stats_snapshot() -> BlockIoStats {
         irq_acks: IRQ_ACKS.load(Ordering::Relaxed),
         completion_signals: COMPLETION_SIGNALS.load(Ordering::Relaxed),
         completion_wakeups: COMPLETION_WAKEUPS.load(Ordering::Relaxed),
+        completion_poll_observations: COMPLETION_POLL_OBSERVATIONS.load(Ordering::Relaxed),
+        completion_poll_wakeups: COMPLETION_POLL_WAKEUPS.load(Ordering::Relaxed),
         device_inflight: DEVICE_INFLIGHT.load(Ordering::Relaxed),
         device_inflight_high_watermark: DEVICE_INFLIGHT_HIGH_WATERMARK.load(Ordering::Relaxed),
     }
@@ -644,6 +680,26 @@ fn record_completion_wakeup() {
 #[inline(always)]
 fn record_completion_wakeup() {}
 
+#[cfg(all(target_arch = "loongarch64", feature = "perf-counters"))]
+#[inline(always)]
+fn record_completion_poll_observation() {
+    block_io_perf::inc(&block_io_perf::COMPLETION_POLL_OBSERVATIONS);
+}
+
+#[cfg(all(target_arch = "loongarch64", not(feature = "perf-counters")))]
+#[inline(always)]
+fn record_completion_poll_observation() {}
+
+#[cfg(all(target_arch = "loongarch64", feature = "perf-counters"))]
+#[inline(always)]
+fn record_completion_poll_wakeup() {
+    block_io_perf::inc(&block_io_perf::COMPLETION_POLL_WAKEUPS);
+}
+
+#[cfg(all(target_arch = "loongarch64", not(feature = "perf-counters")))]
+#[inline(always)]
+fn record_completion_poll_wakeup() {}
+
 pub fn handle_irq(irq: usize) -> bool {
     // Dispatch across every discovered block device, not just x0. Extra disks
     // can back explicit `/dev/vdX` mounts and have independent virtio IRQs.
@@ -652,5 +708,12 @@ pub fn handle_irq(irq: usize) -> bool {
         true
     } else {
         false
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+pub fn poll_completions() {
+    for device in BLOCK_DEVICES.iter() {
+        device.poll_completion();
     }
 }

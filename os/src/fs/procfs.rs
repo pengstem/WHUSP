@@ -1849,6 +1849,8 @@ fn oskernel_perf_content() -> String {
          block_io_irq_acks {}\n\
          block_io_completion_signals {}\n\
          block_io_completion_wakeups {}\n\
+         block_io_completion_poll_observations {}\n\
+         block_io_completion_poll_wakeups {}\n\
          block_io_device_inflight {}\n\
          block_io_device_inflight_high_watermark {}\n\
          dentry_cache_enabled {}\n\
@@ -1952,6 +1954,8 @@ fn oskernel_perf_content() -> String {
         block_io.irq_acks,
         block_io.completion_signals,
         block_io.completion_wakeups,
+        block_io.completion_poll_observations,
+        block_io.completion_poll_wakeups,
         block_io.device_inflight,
         block_io.device_inflight_high_watermark,
         dentry.enabled as usize,

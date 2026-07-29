@@ -214,6 +214,7 @@ pub fn trap_handler() -> ! {
             ticlr::clear_timer_interrupt();
             set_next_trigger();
             if crate::cpu::is_timer_expiry_owner() {
+                crate::drivers::block::poll_completions();
                 check_timer();
             }
             if timer_tick_should_preempt(&task) {
@@ -417,6 +418,7 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
             // only do that work from the idle loop, where no task kernel code
             // was interrupted and sleeping tasks still need timer wakeups.
             if crate::cpu::is_timer_expiry_owner() && current_task().is_none() {
+                crate::drivers::block::poll_completions();
                 check_timer();
             }
         }
