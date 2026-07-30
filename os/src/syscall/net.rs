@@ -656,3 +656,192 @@ pub fn sys_recvmsg(fd: usize, msg: usize, flags: i32) -> KResult {
     }
     Err(Errno::ENOTSOCK)
 }
+fn read_socket_address(token: usize, ptr: usize, len: u32) -> KResult<SocketAddress> {
+    if ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if (len as usize) < size_of::<u16>() {
+        return Err(Errno::EINVAL);
+    }
+    let family = read_user_value_with_mmap_fault(token, ptr as *const u16)? as i32;
+    match family {
+        AF_INET => {
+            if (len as usize) < size_of::<LinuxSockAddrIn>() {
+                return Err(Errno::EINVAL);
+            }
+            let addr = read_user_value_with_mmap_fault(token, ptr as *const LinuxSockAddrIn)?;
+            Ok(SocketAddress::Inet(sockaddr_to_endpoint(addr)))
+        }
+        AF_INET6 => {
+            if (len as usize) < size_of::<LinuxSockAddrIn6>() {
+                return Err(Errno::EINVAL);
+            }
+            let addr = read_user_value_with_mmap_fault(token, ptr as *const LinuxSockAddrIn6)?;
+            Ok(SocketAddress::Inet6(sockaddr_in6_to_endpoint(addr)?))
+        }
+        AF_UNIX => Ok(SocketAddress::Unix(read_unix_sockaddr(token, ptr, len)?)),
+        AF_NETLINK => {
+            if (len as usize) < size_of::<LinuxSockAddrNl>() {
+                return Err(Errno::EINVAL);
+            }
+            Ok(SocketAddress::Netlink)
+        }
+        _ => Err(Errno::EAFNOSUPPORT),
+    }
+}
+
+fn read_unix_sockaddr(token: usize, ptr: usize, len: u32) -> KResult<UnixSockAddr> {
+    let path_len = (len as usize)
+        .saturating_sub(size_of::<u16>())
+        .min(size_of::<LinuxSockAddrUn>() - size_of::<u16>());
+    if path_len == 0 {
+        return Ok(UnixSockAddr::Unnamed);
+    }
+    let path = copy_user_to_vec(token, ptr + size_of::<u16>(), path_len)?;
+    if path[0] == 0 {
+        return Ok(UnixSockAddr::Named(UnixAddress::Abstract(path)));
+    }
+    let nul = path
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(path.len());
+    if nul == 0 {
+        return Ok(UnixSockAddr::Unnamed);
+    }
+    let path = core::str::from_utf8(&path[..nul]).map_err(|_| Errno::EINVAL)?;
+    Ok(UnixSockAddr::Named(UnixAddress::Pathname(path.to_string())))
+}
+
+fn write_socket_address(
+    token: usize,
+    addr: usize,
+    addrlen: usize,
+    socket_addr: SocketAddress,
+) -> KResult {
+    if addr == 0 || addrlen == 0 {
+        return Ok(0);
+    }
+    let len_ptr = addrlen as *mut u32;
+    let len = read_user_value(token, len_ptr.cast_const())?;
+    match socket_addr {
+        SocketAddress::Inet(endpoint) => {
+            if (len as usize) < size_of::<LinuxSockAddrIn>() {
+                return Err(Errno::EINVAL);
+            }
+            write_user_value(
+                token,
+                addr as *mut LinuxSockAddrIn,
+                &endpoint_to_sockaddr(endpoint),
+            )?;
+            write_user_value(token, len_ptr, &(size_of::<LinuxSockAddrIn>() as u32))?;
+        }
+        SocketAddress::Inet6(endpoint) => {
+            if (len as usize) < size_of::<LinuxSockAddrIn6>() {
+                return Err(Errno::EINVAL);
+            }
+            write_user_value(
+                token,
+                addr as *mut LinuxSockAddrIn6,
+                &endpoint_to_sockaddr_in6(endpoint),
+            )?;
+            write_user_value(token, len_ptr, &(size_of::<LinuxSockAddrIn6>() as u32))?;
+        }
+        SocketAddress::Netlink => {
+            if (len as usize) < size_of::<LinuxSockAddrNl>() {
+                return Err(Errno::EINVAL);
+            }
+            write_user_value(
+                token,
+                addr as *mut LinuxSockAddrNl,
+                &LinuxSockAddrNl {
+                    family: AF_NETLINK as u16,
+                    pad: 0,
+                    pid: 0,
+                    groups: 0,
+                },
+            )?;
+            write_user_value(token, len_ptr, &(size_of::<LinuxSockAddrNl>() as u32))?;
+        }
+        SocketAddress::Unix(unix_addr) => {
+            write_unix_sockaddr(token, addr, len_ptr, len as usize, unix_addr)?;
+        }
+    }
+    Ok(0)
+}
+
+fn write_unix_sockaddr(
+    token: usize,
+    addr: usize,
+    len_ptr: *mut u32,
+    input_len: usize,
+    unix_addr: UnixSockAddr,
+) -> KResult<()> {
+    if input_len < size_of::<u16>() {
+        return Err(Errno::EINVAL);
+    }
+    let mut raw = LinuxSockAddrUn {
+        family: AF_UNIX as u16,
+        path: [0; 108],
+    };
+    let actual_len = match unix_addr {
+        UnixSockAddr::Unnamed => size_of::<u16>(),
+        UnixSockAddr::Named(UnixAddress::Pathname(path)) => {
+            let bytes = path.as_bytes();
+            let copy_len = bytes.len().min(raw.path.len());
+            raw.path[..copy_len].copy_from_slice(&bytes[..copy_len]);
+            size_of::<u16>() + copy_len + usize::from(copy_len < raw.path.len())
+        }
+        UnixSockAddr::Named(UnixAddress::Abstract(bytes)) => {
+            let copy_len = bytes.len().min(raw.path.len());
+            raw.path[..copy_len].copy_from_slice(&bytes[..copy_len]);
+            size_of::<u16>() + copy_len
+        }
+    };
+    let raw_bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&raw as *const LinuxSockAddrUn).cast::<u8>(),
+            size_of::<LinuxSockAddrUn>(),
+        )
+    };
+    let copy_len = input_len.min(actual_len).min(raw_bytes.len());
+    copy_to_user(token, addr as *mut u8, &raw_bytes[..copy_len])?;
+    write_user_value(token, len_ptr, &(actual_len as u32))?;
+    Ok(())
+}
+
+fn copy_to_msg_iovecs(token: usize, iov: usize, iovlen: usize, data: &[u8]) -> KResult<usize> {
+    if iovlen == 0 {
+        return Ok(0);
+    }
+    if iov == 0 || iovlen > 1024 {
+        return Err(Errno::EINVAL);
+    }
+    let mut written = 0usize;
+    for index in 0..iovlen {
+        if written == data.len() {
+            break;
+        }
+        let entry = read_user_array_item(token, iov as *const LinuxIovec, index)?;
+        if entry.len == 0 {
+            continue;
+        }
+        let copy_len = entry.len.min(data.len() - written);
+        copy_to_user(
+            token,
+            entry.base as *mut u8,
+            &data[written..written + copy_len],
+        )?;
+        written += copy_len;
+    }
+    Ok(written)
+}
+
+fn read_sockaddr_alg(token: usize, ptr: usize, len: u32) -> KResult<LinuxSockAddrAlg> {
+    if ptr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if (len as usize) < size_of::<LinuxSockAddrAlg>() {
+        return Err(Errno::EINVAL);
+    }
+    read_user_value(token, ptr as *const LinuxSockAddrAlg)
+}
