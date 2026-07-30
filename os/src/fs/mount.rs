@@ -1,4 +1,5 @@
 mod flags;
+mod release;
 
 use super::cgroupfs::CgroupFs;
 use super::dentry_cache;
@@ -24,7 +25,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::{format, string::String};
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use lazy_static::*;
 use log::{info, warn};
 
@@ -34,6 +35,7 @@ use flags::{
     MOUNT_STAT_RDONLY, MOUNT_STAT_VALID, mount_flags_from_options, mount_flags_have_nosymfollow,
     mount_options_from_flags, normalize_mount_stat_flags,
 };
+use release::{PendingInodeRelease, PendingReleaseQueue};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct MountId(pub(crate) usize);
@@ -213,54 +215,6 @@ impl MountedBackendLease {
             drain_pending_inode_releases(&self.mounted.pending_inode_releases, backend);
         }
         f(backend)
-    }
-}
-
-struct PendingReleaseQueue {
-    entries: UPIntrFreeCell<Vec<PendingInodeRelease>>,
-    nonempty: AtomicBool,
-}
-
-struct PendingInodeRelease {
-    ino: u32,
-    state: Arc<InodeState>,
-    attempts: usize,
-}
-
-impl PendingReleaseQueue {
-    fn new() -> Self {
-        Self {
-            entries: unsafe { UPIntrFreeCell::new(Vec::new()) },
-            nonempty: AtomicBool::new(false),
-        }
-    }
-
-    fn push(&self, entry: PendingInodeRelease) {
-        let mut entries = self.entries.exclusive_access();
-        entries.push(entry);
-        self.nonempty.store(true, Ordering::Release);
-    }
-
-    fn take(&self) -> Vec<PendingInodeRelease> {
-        if !self.nonempty.load(Ordering::Acquire) {
-            return Vec::new();
-        }
-        let mut entries = self.entries.exclusive_access();
-        let pending = core::mem::take(&mut *entries);
-        self.nonempty.store(false, Ordering::Release);
-        pending
-    }
-
-    fn put_back(&self, entries: Vec<PendingInodeRelease>) {
-        if !entries.is_empty() {
-            let mut pending = self.entries.exclusive_access();
-            pending.extend(entries);
-            self.nonempty.store(true, Ordering::Release);
-        }
-    }
-
-    fn has_entries(&self) -> bool {
-        self.nonempty.load(Ordering::Acquire)
     }
 }
 
