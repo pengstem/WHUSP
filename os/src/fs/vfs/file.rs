@@ -2,7 +2,7 @@ use super::super::dentry_cache;
 use super::super::devfs;
 use super::super::dirent::{DT_DIR, RawDirEntry, write_dir_entries_with_offset_base};
 use super::super::inode::{OpenFlags, link_node_in};
-use super::super::inode_state;
+use super::super::inode_state::{self, DIRTY_REGULAR_FILES, DirtyFileCache, DirtyPage};
 use super::super::mount::{
     MountId, MountNamespaceId, MountedBackendLease, mount_any_nosymfollow, mount_exists,
     mount_is_devfs, mount_is_noatime, mount_is_nodev, mount_is_nodiratime, mount_is_nosymfollow,
@@ -72,16 +72,7 @@ const SYNTHETIC_DIRENT_OFFSET_BASE: u64 = 1 << 60;
 
 static TMPFILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
-// CONTEXT: Mirrors DIRTY_REGULAR_FILES.len() so the read hot path can skip the
-// global DIRTY_REGULAR_FILES SleepMutex entirely when no regular file has
-// buffered dirty pages (e.g. iozone's read phase after fsync). Maintained only
-// under the map lock at every mutation site, so a value of 0 reliably means
-// "no dirty data anywhere" — it is never a false negative for an active write.
-static DIRTY_REGULAR_FILE_COUNT: AtomicUsize = AtomicUsize::new(0);
-
 lazy_static! {
-    static ref DIRTY_REGULAR_FILES: SleepMutex<BTreeMap<VfsNodeId, DirtyFileCache>> =
-        SleepMutex::new(BTreeMap::new());
     static ref SMALL_REGULAR_READ_FILES: SmallRegularReadCaches = SmallRegularReadCaches::new();
 }
 
@@ -89,67 +80,6 @@ lazy_static! {
 lazy_static! {
     static ref DIRTY_WRITEBACK_COUNTERS: SleepMutex<DirtyWritebackCounters> =
         SleepMutex::new(DirtyWritebackCounters::new());
-}
-
-#[derive(Debug)]
-struct DirtyPage {
-    data: Vec<u8>,
-    dirty_ranges: Vec<(usize, usize)>,
-}
-
-impl DirtyPage {
-    fn empty() -> Self {
-        Self {
-            data: vec![0u8; PAGE_SIZE],
-            dirty_ranges: Vec::new(),
-        }
-    }
-
-    fn full(mut data: Vec<u8>) -> Self {
-        if data.len() != PAGE_SIZE {
-            data.resize(PAGE_SIZE, 0);
-        }
-        Self {
-            data,
-            dirty_ranges: vec![(0, PAGE_SIZE)],
-        }
-    }
-
-    fn mark_dirty(&mut self, start: usize, end: usize) {
-        debug_assert!(start <= end && end <= PAGE_SIZE);
-        if start == end {
-            return;
-        }
-        let mut merged_start = start;
-        let mut merged_end = end;
-        let mut index = 0usize;
-        while index < self.dirty_ranges.len() {
-            let (range_start, range_end) = self.dirty_ranges[index];
-            if range_end < merged_start {
-                index += 1;
-                continue;
-            }
-            if range_start > merged_end {
-                break;
-            }
-            merged_start = merged_start.min(range_start);
-            merged_end = merged_end.max(range_end);
-            self.dirty_ranges.remove(index);
-        }
-        self.dirty_ranges.insert(index, (merged_start, merged_end));
-    }
-
-    fn dirty_ranges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
-        self.dirty_ranges.iter().copied()
-    }
-}
-
-struct DirtyFileCache {
-    inode_state: Arc<inode_state::InodeState>,
-    logical_size: usize,
-    mtime: FileTimestamp,
-    ctime: FileTimestamp,
-    pages: BTreeMap<usize, DirtyPage>,
 }
 
 #[derive(Debug)]
@@ -234,22 +164,6 @@ impl SmallRegularReadCaches {
         self.shards[Self::shard_index(node)]
             .lock()
             .insert(node, cache);
-    }
-}
-
-impl DirtyFileCache {
-    fn new(
-        inode_state: Arc<inode_state::InodeState>,
-        logical_size: usize,
-        timestamp: FileTimestamp,
-    ) -> Self {
-        Self {
-            inode_state,
-            logical_size,
-            mtime: timestamp,
-            ctime: timestamp,
-            pages: BTreeMap::new(),
-        }
     }
 }
 
@@ -427,12 +341,11 @@ fn dirty_or_backend_logical_size(node: VfsNodeId) -> Option<usize> {
 }
 
 fn any_regular_file_dirty() -> bool {
-    DIRTY_REGULAR_FILE_COUNT.load(Ordering::Relaxed) != 0
+    inode_state::any_regular_file_dirty()
 }
 
 fn sync_dirty_regular_file_count(map: &BTreeMap<VfsNodeId, DirtyFileCache>) {
-    inode_state::invalidate_direct_stat_cache();
-    DIRTY_REGULAR_FILE_COUNT.store(map.len(), Ordering::Relaxed);
+    inode_state::sync_dirty_regular_file_count(map);
 }
 
 fn dirty_regular_file_has_pages(node: VfsNodeId) -> bool {

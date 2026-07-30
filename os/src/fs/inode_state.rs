@@ -1,3 +1,5 @@
+mod dirty;
+
 use super::{FileStat, MountNamespaceId, WorkingDir, vfs::VfsNodeId};
 use crate::config::MAX_CPUS;
 use crate::sync::{
@@ -7,6 +9,11 @@ use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
+
+pub(crate) use dirty::{
+    DIRTY_REGULAR_FILES, DirtyFileCache, DirtyPage, any_regular_file_dirty,
+    sync_dirty_regular_file_count,
+};
 
 const INODE_STATE_SHARDS: usize = 32;
 const DIRECT_STAT_CACHE_SLOTS: usize = 16;
