@@ -1,6 +1,7 @@
 mod condvar;
 mod irq;
 mod raw_sleep_lock;
+mod read_mostly;
 mod sleep_mutex;
 #[allow(dead_code)]
 mod sleep_rwlock;
@@ -10,6 +11,7 @@ mod up;
 pub use condvar::Condvar;
 pub use irq::LocalIrqGuard;
 pub use raw_sleep_lock::RawSleepLock;
+pub(crate) use read_mostly::ReadMostlySnapshot;
 pub use sleep_mutex::SleepMutex;
 #[cfg(any(
     feature = "perf-counters",

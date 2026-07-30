@@ -10,6 +10,8 @@ mod memory;
 pub(crate) mod msg;
 mod net;
 mod process;
+#[cfg(feature = "read-mostly-probe")]
+mod read_mostly_probe;
 #[cfg(feature = "sleep-rwlock-probe")]
 mod rwlock_probe;
 pub(crate) mod sem;
@@ -36,6 +38,8 @@ use memory::*;
 use msg::*;
 use net::*;
 use process::*;
+#[cfg(feature = "read-mostly-probe")]
+use read_mostly_probe::sys_read_mostly_probe;
 #[cfg(feature = "sleep-rwlock-probe")]
 use rwlock_probe::sys_fs4_sleep_rwlock_probe;
 use sem::*;
@@ -238,6 +242,8 @@ pub(crate) fn syscall_with_context(
     args: [usize; 6],
 ) -> Result<isize, Errno> {
     match syscall_id {
+        #[cfg(feature = "read-mostly-probe")]
+        SYSCALL_READ_MOSTLY_PROBE => sys_read_mostly_probe(args[0], args[1]),
         #[cfg(feature = "sleep-rwlock-probe")]
         SYSCALL_FS4_SLEEP_RWLOCK_PROBE => sys_fs4_sleep_rwlock_probe(args[0], args[1], args[2]),
         SYSCALL_IO_SETUP => sys_io_setup(args[0], args[1] as *mut usize),

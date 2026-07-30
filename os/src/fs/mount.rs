@@ -16,7 +16,7 @@ use super::vfs::{
 use crate::config::MAX_CPUS;
 use crate::drivers::block::BLOCK_DEVICES;
 use crate::perf;
-use crate::sync::{SleepMutex, UPIntrFreeCell};
+use crate::sync::{ReadMostlySnapshot, SleepMutex, UPIntrFreeCell};
 use crate::task::any_process_references_mount;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -85,80 +85,15 @@ struct DynamicMount {
 }
 
 #[repr(align(64))]
-struct DynamicMountSnapshotReader {
+struct MountedFsSnapshotReader {
     active: AtomicUsize,
 }
 
-impl DynamicMountSnapshotReader {
+impl MountedFsSnapshotReader {
     const fn new() -> Self {
         Self {
             active: AtomicUsize::new(0),
         }
-    }
-}
-
-/// Immutable mount overlay graph for store-free path-walk reads.
-///
-/// This mirrors Linux mount traversal under RCU: a lookup writes only its
-/// CPU-local reader slot, while rare mount graph mutations publish a cloned
-/// snapshot after their serialized transaction.
-struct DynamicMountFastState {
-    sequence: AtomicUsize,
-    current: AtomicPtr<Vec<DynamicMount>>,
-    readers: [DynamicMountSnapshotReader; MAX_CPUS],
-}
-
-impl DynamicMountFastState {
-    fn new() -> Self {
-        Self {
-            sequence: AtomicUsize::new(0),
-            current: AtomicPtr::new(Box::into_raw(Box::new(Vec::new()))),
-            readers: [const { DynamicMountSnapshotReader::new() }; MAX_CPUS],
-        }
-    }
-
-    fn read<V>(&self, read: impl FnOnce(&[DynamicMount]) -> V) -> V {
-        let reader = &self.readers[crate::cpu::current_id()];
-        loop {
-            let sequence = self.sequence.load(Ordering::Acquire);
-            if sequence & 1 != 0 {
-                spin_loop();
-                continue;
-            }
-            reader.active.store(1, Ordering::Release);
-            if self.sequence.load(Ordering::Acquire) != sequence {
-                reader.active.store(0, Ordering::Release);
-                continue;
-            }
-            let current = self.current.load(Ordering::Acquire);
-            assert!(!current.is_null(), "dynamic mount snapshot is missing");
-            let value = read(unsafe { &*current });
-            reader.active.store(0, Ordering::Release);
-            return value;
-        }
-    }
-
-    fn publish(&self, updated: Vec<DynamicMount>) {
-        let start = self.sequence.fetch_add(1, Ordering::AcqRel);
-        assert_eq!(start & 1, 0, "concurrent dynamic mount snapshot writer");
-        for reader in &self.readers {
-            while reader.active.load(Ordering::Acquire) != 0 {
-                crate::cpu::handle_remote_sync_ipi();
-                spin_loop();
-            }
-        }
-        let replacement = Box::into_raw(Box::new(updated));
-        let previous = self.current.swap(replacement, Ordering::AcqRel);
-        assert!(!previous.is_null(), "dynamic mount snapshot is missing");
-        unsafe {
-            drop(Box::from_raw(previous));
-        }
-        self.sequence.store(
-            start
-                .checked_add(2)
-                .expect("dynamic mount snapshot sequence exhausted"),
-            Ordering::Release,
-        );
     }
 }
 
@@ -167,12 +102,12 @@ impl DynamicMountFastState {
 /// A reader only clones `Arc<MountedFs>` while its CPU-local epoch slot is
 /// active. Rare mount-table writers publish a cloned vector and wait for old
 /// readers before dropping the previous Arc owners. This is the same RCU-style
-/// lifetime rule used by `DynamicMountFastState`, and removes the mount table
+/// lifetime rule used by `ReadMostlySnapshot`, and removes the mount table
 /// mutex from every open/stat/read/close backend access.
 struct MountedFsFastState {
     sequence: AtomicUsize,
     current: AtomicPtr<Vec<Option<Arc<MountedFs>>>>,
-    readers: [DynamicMountSnapshotReader; MAX_CPUS],
+    readers: [MountedFsSnapshotReader; MAX_CPUS],
 }
 
 impl MountedFsFastState {
@@ -180,7 +115,7 @@ impl MountedFsFastState {
         Self {
             sequence: AtomicUsize::new(0),
             current: AtomicPtr::new(Box::into_raw(Box::new(Vec::new()))),
-            readers: [const { DynamicMountSnapshotReader::new() }; MAX_CPUS],
+            readers: [const { MountedFsSnapshotReader::new() }; MAX_CPUS],
         }
     }
 
@@ -376,7 +311,8 @@ lazy_static! {
     // short table edits. Do not perform filesystem or block I/O while holding it.
     static ref DYNAMIC_MOUNTS: UPIntrFreeCell<Vec<DynamicMount>> =
         unsafe { UPIntrFreeCell::new(Vec::new()) };
-    static ref DYNAMIC_MOUNTS_FAST: DynamicMountFastState = DynamicMountFastState::new();
+    static ref DYNAMIC_MOUNTS_FAST: ReadMostlySnapshot<Vec<DynamicMount>> =
+        ReadMostlySnapshot::new(Vec::new());
     static ref DYNAMIC_MOUNTS_FAST_WRITER: SleepMutex<()> = SleepMutex::new(());
     // A short mount-id registry lets drop-time cleanup clone only the target
     // mount's queue without waiting for the sleeping mount/backend locks.

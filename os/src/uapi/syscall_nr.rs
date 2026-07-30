@@ -284,3 +284,5 @@ pub(crate) const SYSCALL_MEMFD_SECRET: usize = 447;
 pub(crate) const SYSCALL_FCHMODAT2: usize = 452;
 #[cfg(feature = "sleep-rwlock-probe")]
 pub(crate) const SYSCALL_FS4_SLEEP_RWLOCK_PROBE: usize = 0x5f54;
+#[cfg(feature = "read-mostly-probe")]
+pub(crate) const SYSCALL_READ_MOSTLY_PROBE: usize = 0x5f55;
