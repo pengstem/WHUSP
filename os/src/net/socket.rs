@@ -40,6 +40,7 @@ use crate::task::{
 use crate::timer::{add_timer, get_time_ms};
 use crate::uapi::errno::{Errno, KResult};
 use crate::uapi::linux::fs::LinuxIovec;
+use crate::uapi::linux::net::*;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
@@ -47,103 +48,10 @@ use alloc::{vec, vec::Vec};
 use core::mem::size_of;
 use lazy_static::lazy_static;
 
-const AF_UNSPEC: i32 = 0;
-const AF_UNIX: i32 = 1;
-const AF_INET: i32 = 2;
-const AF_INET6: i32 = 10;
-const AF_NETLINK: i32 = 16;
-const AF_PACKET: i32 = 17;
-const AF_ALG: i32 = 38;
-const SOCK_STREAM: i32 = 1;
-const SOCK_DGRAM: i32 = 2;
-const SOCK_RAW: i32 = 3;
-const SOCK_SEQPACKET: i32 = 5;
-const SOCK_TYPE_MASK: i32 = 0xf;
 const SOCK_NONBLOCK: i32 = OpenFlags::NONBLOCK.bits() as i32;
 const SOCK_CLOEXEC: i32 = OpenFlags::CLOEXEC.bits() as i32;
 const VALID_SOCKET_TYPE_FLAGS: i32 = SOCK_NONBLOCK | SOCK_CLOEXEC;
 const VALID_ACCEPT4_FLAGS: i32 = SOCK_NONBLOCK | SOCK_CLOEXEC;
-const IPPROTO_IP: i32 = 0;
-const IPPROTO_TCP: i32 = 6;
-const IPPROTO_UDP: i32 = 17;
-const IPPROTO_IPV6: i32 = 41;
-const IPPROTO_SCTP: i32 = 132;
-const IPPROTO_UDPLITE: i32 = 136;
-const IP_BIND_ADDRESS_NO_PORT: i32 = 24;
-const SOL_SOCKET: i32 = 1;
-const SOL_PACKET: i32 = 263;
-const SOL_ALG: i32 = 279;
-const SO_REUSEADDR: i32 = 2;
-const SO_TYPE: i32 = 3;
-const SO_ERROR: i32 = 4;
-const SO_DONTROUTE: i32 = 5;
-const SO_SNDBUF: i32 = 7;
-const SO_RCVBUF: i32 = 8;
-const SO_KEEPALIVE: i32 = 9;
-const SO_OOBINLINE: i32 = 10;
-const SO_NO_CHECK: i32 = 11;
-const SO_LINGER: i32 = 13;
-const SO_RCVTIMEO_OLD: i32 = 20;
-const SO_SNDTIMEO_OLD: i32 = 21;
-const SO_BINDTODEVICE: i32 = 25;
-const SO_SNDBUFFORCE: i32 = 32;
-const SO_RCVTIMEO_NEW: i32 = 66;
-const SO_SNDTIMEO_NEW: i32 = 67;
-const TCP_NODELAY: i32 = 1;
-const TCP_MAXSEG: i32 = 2;
-const IPV6_V6ONLY: i32 = 26;
-const MCAST_JOIN_GROUP: i32 = 42;
-const MCAST_LEAVE_GROUP: i32 = 45;
-const IPT_SO_SET_REPLACE: i32 = 64;
-const NETLINK_ROUTE: i32 = 0;
-const NLMSG_ERROR: u16 = 2;
-const NLMSG_DONE: u16 = 3;
-const RTM_NEWLINK: u16 = 16;
-const RTM_DELLINK: u16 = 17;
-const RTM_GETLINK: u16 = 18;
-const RTM_NEWADDR: u16 = 20;
-const RTM_DELADDR: u16 = 21;
-const RTM_GETADDR: u16 = 22;
-const RTM_NEWROUTE: u16 = 24;
-const RTM_DELROUTE: u16 = 25;
-const RTM_GETROUTE: u16 = 26;
-const IFA_ADDRESS: u16 = 1;
-const IFA_LOCAL: u16 = 2;
-const IFLA_ADDRESS: u16 = 1;
-const IFLA_IFNAME: u16 = 3;
-const IFLA_MTU: u16 = 4;
-const IFLA_LINKINFO: u16 = 18;
-const IFLA_INFO_KIND: u16 = 1;
-const IFLA_INFO_DATA: u16 = 2;
-const VETH_INFO_PEER: u16 = 1;
-const NLM_F_MULTI: u16 = 0x2;
-const IFF_UP: u32 = 0x1;
-const IFF_LOOPBACK: u32 = 0x8;
-const IFF_RUNNING: u32 = 0x40;
-const ARPHRD_ETHER: u16 = 1;
-const ARPHRD_LOOPBACK: u16 = 772;
-const LOOPBACK_IF_INDEX: i32 = 1;
-const IFADDRMSG_LEN: usize = 8;
-const IFINFOMSG_LEN: usize = 16;
-const PACKET_RX_RING: i32 = 5;
-const PACKET_VERSION: i32 = 10;
-const PACKET_RESERVE: i32 = 12;
-const PACKET_VNET_HDR: i32 = 15;
-const PACKET_FANOUT: i32 = 18;
-const PACKET_FANOUT_ROLLOVER: i32 = 3;
-const TPACKET_V1: i32 = 0;
-const TPACKET_V3: i32 = 2;
-const SHUT_RD: i32 = 0;
-const SHUT_WR: i32 = 1;
-const SHUT_RDWR: i32 = 2;
-const MSG_DONTWAIT: i32 = 0x40;
-const MSG_WAITFORONE: i32 = 0x10000;
-const ALG_SET_KEY: i32 = 1;
-const ALG_SET_IV: i32 = 2;
-const ALG_SET_OP: i32 = 3;
-const ALG_SET_AEAD_ASSOCLEN: i32 = 4;
-const ALG_OP_DECRYPT: u32 = 0;
-const ALG_OP_ENCRYPT: u32 = 1;
 const ADDRCONFIG_IF_INDEX: i32 = 2;
 const ADDRCONFIG_IP: [u8; 4] = [10, 0, 2, 15];
 const LOOPBACK_IP: [u8; 4] = [127, 0, 0, 1];
@@ -162,41 +70,6 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(NetDeviceState::new()) };
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct LinuxSockAddrIn {
-    family: u16,
-    port_be: u16,
-    addr: u32,
-    zero: [u8; 8],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct LinuxSockAddrIn6 {
-    family: u16,
-    port_be: u16,
-    flowinfo: u32,
-    addr: [u8; 16],
-    scope_id: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct LinuxSockAddrUn {
-    family: u16,
-    path: [u8; 108],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct LinuxSockAddrNl {
-    family: u16,
-    pad: u16,
-    pid: u32,
-    groups: u32,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SocketDomain {
     Unix,
@@ -210,62 +83,6 @@ enum SocketDomain {
 enum SocketKind {
     Stream,
     Datagram,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct LinuxMsghdr {
-    msg_name: usize,
-    msg_namelen: u32,
-    msg_iov: usize,
-    msg_iovlen: usize,
-    msg_control: usize,
-    msg_controllen: usize,
-    msg_flags: i32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct LinuxMmsghdr {
-    msg_hdr: LinuxMsghdr,
-    msg_len: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct LinuxOldTimespec {
-    tv_sec: isize,
-    tv_nsec: isize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct LinuxCmsghdr {
-    cmsg_len: usize,
-    cmsg_level: i32,
-    cmsg_type: i32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct LinuxSockAddrAlg {
-    family: u16,
-    alg_type: [u8; 14],
-    feat: u32,
-    mask: u32,
-    name: [u8; 64],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct LinuxTPacketReq3 {
-    tp_block_size: u32,
-    tp_block_nr: u32,
-    tp_frame_size: u32,
-    tp_frame_nr: u32,
-    tp_retire_blk_tov: u32,
-    tp_sizeof_priv: u32,
-    tp_feature_req_word: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
