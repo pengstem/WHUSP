@@ -426,7 +426,7 @@ fn sys_mmap_impl(
         if no_replace && inner.memory_set.range_overlaps(addr, end) {
             return Err(Errno::EEXIST);
         }
-        let (mapped_addr, flushes) = inner
+        let (mapped_addr, flushes, retired_files) = inner
             .memory_set
             .mmap_fixed_area(
                 addr,
@@ -447,6 +447,7 @@ fn sys_mmap_impl(
         // memset-heavy LTP probes from taking one page-fault trap per page.
         let prefault = populate || inner.memory_set.future_mlock_prefaults();
         drop(inner);
+        drop(retired_files);
         if prefault {
             loop {
                 let result = process
@@ -604,13 +605,14 @@ pub fn sys_munmap_ctx(ctx: &SyscallContext, addr: usize, len: usize) -> KResult 
         return Err(Errno::EINVAL);
     }
     let process = ctx.process();
-    let flushes = {
+    let (flushes, retired_files) = {
         let mut inner = process.inner_exclusive_access();
         inner
             .memory_set
             .munmap_area(addr, len)
             .ok_or(Errno::EINVAL)?
     };
+    drop(retired_files);
     write_back_mmap_flushes(flushes);
     Ok(0)
 }
@@ -640,11 +642,14 @@ pub fn sys_mremap(
     }
 
     let process = current_process();
-    let (mapped_addr, flushes) = process
-        .inner_exclusive_access()
-        .memory_set
-        .mremap_area(old_addr, old_size, new_size, may_move)
-        .ok_or(Errno::ENOMEM)?;
+    let (mapped_addr, flushes, retired_files) = {
+        let mut inner = process.inner_exclusive_access();
+        inner
+            .memory_set
+            .mremap_area(old_addr, old_size, new_size, may_move)
+            .ok_or(Errno::ENOMEM)?
+    };
+    drop(retired_files);
     write_back_mmap_flushes(flushes);
     Ok(mapped_addr as isize)
 }

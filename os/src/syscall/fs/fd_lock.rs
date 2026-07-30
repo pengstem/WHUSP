@@ -313,6 +313,20 @@ impl RecordLockTable {
         self.take_waiters_for_released(&released)
     }
 
+    fn has_file_description_state(&self, file: &Arc<dyn File + Send + Sync>) -> bool {
+        self.locks.iter().any(|lock| {
+            matches!(
+                &lock.owner,
+                RecordLockOwner::FileDescription(owner) if Arc::ptr_eq(owner, file)
+            )
+        }) || self.waiters.iter().any(|waiter| {
+            matches!(
+                &waiter.owner,
+                RecordLockOwner::FileDescription(owner) if Arc::ptr_eq(owner, file)
+            )
+        })
+    }
+
     fn enqueue_waiter(
         &mut self,
         key: LockKey,
@@ -453,6 +467,16 @@ impl FlockTable {
             }
         });
         self.take_waiters_for_keys(&released_keys)
+    }
+
+    fn has_owner_state(&self, owner: &Arc<dyn File + Send + Sync>) -> bool {
+        self.locks
+            .iter()
+            .any(|lock| Arc::ptr_eq(&lock.owner, owner))
+            || self
+                .waiters
+                .iter()
+                .any(|waiter| Arc::ptr_eq(&waiter.owner, owner))
     }
 
     fn has_conflict(
@@ -806,6 +830,12 @@ pub(super) fn release_record_locks_for_close(entry: &FdTableEntry) {
 
 pub(super) fn release_ofd_record_locks_for_close(entry: &FdTableEntry) {
     let file = entry.file();
+    if !RECORD_LOCK_TABLE
+        .exclusive_access()
+        .has_file_description_state(&file)
+    {
+        return;
+    }
     if file_description_still_referenced(&file) {
         return;
     }
@@ -817,6 +847,9 @@ pub(super) fn release_ofd_record_locks_for_close(entry: &FdTableEntry) {
 
 pub(super) fn release_flock_locks_for_close(entry: &FdTableEntry) {
     let file = entry.file();
+    if !FLOCK_TABLE.exclusive_access().has_owner_state(&file) {
+        return;
+    }
     if file_description_still_referenced(&file) {
         return;
     }

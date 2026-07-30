@@ -347,6 +347,15 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) ext4_block_write_calls: usize,
     pub(crate) ext4_block_write_blocks: usize,
     pub(crate) ext4_block_write_bytes: usize,
+    pub(crate) ext4_sequence_read_calls: usize,
+    pub(crate) ext4_sequence_read_bytes: usize,
+    pub(crate) ext4_sequence_writer_entries: usize,
+    pub(crate) ext4_sequence_reader_wait_yields: usize,
+    pub(crate) ext4_sequence_reader_retries: usize,
+    pub(crate) ext4_sequence_retry_blocks: usize,
+    pub(crate) ext4_sequence_retry_bytes: usize,
+    pub(crate) ext4_sequence_active_writers_max: usize,
+    pub(crate) ext4_sequence_wait_ticks: usize,
     pub(crate) ext4_read_plan_attempts: usize,
     pub(crate) ext4_read_plan_prepared: usize,
     pub(crate) ext4_read_plan_executed: usize,
@@ -710,6 +719,15 @@ mod enabled {
     static EXT4_BLOCK_WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EXT4_BLOCK_WRITE_BLOCKS: AtomicUsize = AtomicUsize::new(0);
     static EXT4_BLOCK_WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_SEQUENCE_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_SEQUENCE_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_SEQUENCE_WRITER_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_SEQUENCE_READER_WAIT_YIELDS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_SEQUENCE_READER_RETRIES: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_SEQUENCE_RETRY_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_SEQUENCE_RETRY_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_SEQUENCE_ACTIVE_WRITERS_MAX: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_SEQUENCE_WAIT_TICKS: AtomicUsize = AtomicUsize::new(0);
     static EXT4_READ_PLAN_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
     static EXT4_READ_PLAN_PREPARED: AtomicUsize = AtomicUsize::new(0);
     static EXT4_READ_PLAN_EXECUTED: AtomicUsize = AtomicUsize::new(0);
@@ -1929,6 +1947,30 @@ mod enabled {
         EXT4_BLOCK_WRITE_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_ext4_sequence_read(bytes: usize) {
+        EXT4_SEQUENCE_READ_CALLS.fetch_add(1, Ordering::Relaxed);
+        EXT4_SEQUENCE_READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_sequence_writer_entry(active_writers: usize) {
+        EXT4_SEQUENCE_WRITER_ENTRIES.fetch_add(1, Ordering::Relaxed);
+        EXT4_SEQUENCE_ACTIVE_WRITERS_MAX.fetch_max(active_writers, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_sequence_reader_wait_yield() {
+        EXT4_SEQUENCE_READER_WAIT_YIELDS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_sequence_reader_retry(blocks: usize, bytes: usize) {
+        EXT4_SEQUENCE_READER_RETRIES.fetch_add(1, Ordering::Relaxed);
+        EXT4_SEQUENCE_RETRY_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
+        EXT4_SEQUENCE_RETRY_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ext4_sequence_wait_ticks(ticks: usize) {
+        EXT4_SEQUENCE_WAIT_TICKS.fetch_add(ticks, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_ext4_read_plan_attempt() {
         EXT4_READ_PLAN_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     }
@@ -2646,6 +2688,17 @@ mod enabled {
             ext4_block_write_calls: EXT4_BLOCK_WRITE_CALLS.load(Ordering::Relaxed),
             ext4_block_write_blocks: EXT4_BLOCK_WRITE_BLOCKS.load(Ordering::Relaxed),
             ext4_block_write_bytes: EXT4_BLOCK_WRITE_BYTES.load(Ordering::Relaxed),
+            ext4_sequence_read_calls: EXT4_SEQUENCE_READ_CALLS.load(Ordering::Relaxed),
+            ext4_sequence_read_bytes: EXT4_SEQUENCE_READ_BYTES.load(Ordering::Relaxed),
+            ext4_sequence_writer_entries: EXT4_SEQUENCE_WRITER_ENTRIES.load(Ordering::Relaxed),
+            ext4_sequence_reader_wait_yields: EXT4_SEQUENCE_READER_WAIT_YIELDS
+                .load(Ordering::Relaxed),
+            ext4_sequence_reader_retries: EXT4_SEQUENCE_READER_RETRIES.load(Ordering::Relaxed),
+            ext4_sequence_retry_blocks: EXT4_SEQUENCE_RETRY_BLOCKS.load(Ordering::Relaxed),
+            ext4_sequence_retry_bytes: EXT4_SEQUENCE_RETRY_BYTES.load(Ordering::Relaxed),
+            ext4_sequence_active_writers_max: EXT4_SEQUENCE_ACTIVE_WRITERS_MAX
+                .load(Ordering::Relaxed),
+            ext4_sequence_wait_ticks: EXT4_SEQUENCE_WAIT_TICKS.load(Ordering::Relaxed),
             ext4_read_plan_attempts: EXT4_READ_PLAN_ATTEMPTS.load(Ordering::Relaxed),
             ext4_read_plan_prepared: EXT4_READ_PLAN_PREPARED.load(Ordering::Relaxed),
             ext4_read_plan_executed: EXT4_READ_PLAN_EXECUTED.load(Ordering::Relaxed),
@@ -3044,6 +3097,15 @@ mod enabled {
          ext4_block_write_calls {}\n\
          ext4_block_write_blocks {}\n\
          ext4_block_write_bytes {}\n\
+         ext4_sequence_read_calls {}\n\
+         ext4_sequence_read_bytes {}\n\
+         ext4_sequence_writer_entries {}\n\
+         ext4_sequence_reader_wait_yields {}\n\
+         ext4_sequence_reader_retries {}\n\
+         ext4_sequence_retry_blocks {}\n\
+         ext4_sequence_retry_bytes {}\n\
+         ext4_sequence_active_writers_max {}\n\
+         ext4_sequence_wait_ticks {}\n\
          ext4_read_plan_attempts {}\n\
          ext4_read_plan_prepared {}\n\
          ext4_read_plan_executed {}\n\
@@ -3402,6 +3464,15 @@ mod enabled {
             stats.ext4_block_write_calls,
             stats.ext4_block_write_blocks,
             stats.ext4_block_write_bytes,
+            stats.ext4_sequence_read_calls,
+            stats.ext4_sequence_read_bytes,
+            stats.ext4_sequence_writer_entries,
+            stats.ext4_sequence_reader_wait_yields,
+            stats.ext4_sequence_reader_retries,
+            stats.ext4_sequence_retry_blocks,
+            stats.ext4_sequence_retry_bytes,
+            stats.ext4_sequence_active_writers_max,
+            stats.ext4_sequence_wait_ticks,
             stats.ext4_read_plan_attempts,
             stats.ext4_read_plan_prepared,
             stats.ext4_read_plan_executed,
@@ -3951,6 +4022,18 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_ext4_block_write(_blocks: usize, _bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_sequence_read(_bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_sequence_writer_entry(_active_writers: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_sequence_reader_wait_yield() {}
+
+    #[inline(always)]
+    pub(crate) fn record_ext4_sequence_reader_retry(_blocks: usize, _bytes: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_ext4_read_plan_attempt() {}

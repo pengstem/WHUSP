@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one dual-architecture-contract clean Rust Hello World benchmark cell."""
+"""Run one validated clean Rust build benchmark cell."""
 
 from __future__ import annotations
 
@@ -27,6 +27,8 @@ GUEST_TEMPLATE = REPO_ROOT / "scripts" / "perf-gates" / "g0-rust-hello.sh"
 TIMER_SOURCE = REPO_ROOT / "scripts" / "perf-gates" / "rust_build_timer.c"
 GUEST_WORKLOAD_PATH = "/x1/g0-rust-hello.sh"
 MAX_CPUS = 12
+MULTICRATE_LEAF_CRATES = 8
+MULTICRATE_FUNCTIONS_PER_CRATE = 1
 PROCESS_STOP_TIMEOUT_SECONDS = 2.0
 TOKEN_RE = re.compile(r"[A-Za-z0-9._-]+")
 MEM_RE = re.compile(r"[1-9][0-9]*[MG]")
@@ -62,7 +64,8 @@ IDENTITY_PATTERN = (
     r"smp=(?P<smp>[0-9]+) "
     r"mem=(?P<mem>[A-Za-z0-9._-]+) "
     r"block_io=(?P<block_io>auto|force-sync) "
-    r"perf=(?P<perf>[01])"
+    r"perf=(?P<perf>[01]) "
+    r"workload=(?P<workload>hello|multicrate)"
 )
 START_RE = re.compile(r"G0_RUST_HELLO_START " + IDENTITY_PATTERN)
 PASS_RE = re.compile(r"G0_RUST_HELLO_PASS " + IDENTITY_PATTERN)
@@ -88,6 +91,10 @@ RESULT_RE = re.compile(
     r" uptime_before=(?P<uptime_before>[0-9]+(?:\.[0-9]+)?)"
     r" uptime_after=(?P<uptime_after>[0-9]+(?:\.[0-9]+)?)"
     r" lock_created=(?P<lock_created>[01])"
+    r" leaf_crates=(?P<leaf_crates>[0-9]+)"
+    r" functions_per_crate=(?P<functions_per_crate>[0-9]+)"
+    r" build_jobs=(?P<build_jobs>[0-9]+)"
+    r" rustc_max_active=(?P<rustc_max_active>[0-9]+)"
     r" artifact_bytes=(?P<artifact_bytes>[0-9]+)"
     r" output_bytes=(?P<output_bytes>[0-9]+)"
     r" output_ok=(?P<output_ok>[01]) ok=(?P<ok>[01])"
@@ -346,10 +353,29 @@ def validate_token(name: str, value: str) -> None:
         raise BenchmarkError(f"{name} is not a safe marker/template token: {value!r}")
 
 
-def render_guest(identity: dict[str, str]) -> str:
+def render_guest(
+    identity: dict[str, str], project_storage: str = "tmpfs"
+) -> str:
     for name, value in identity.items():
         validate_token(name, value)
+    if project_storage not in {"tmpfs", "root-ext4"}:
+        raise BenchmarkError(f"unsupported project storage: {project_storage!r}")
     source = GUEST_TEMPLATE.read_text(encoding="utf-8")
+    if project_storage == "root-ext4":
+        storage_replacements = {
+            "PROJECT=/tmp/minibuild": "PROJECT=/root/minibuild",
+            "CARGO_TARGET_DIR=/tmp/minibuild/target": (
+                "CARGO_TARGET_DIR=/root/minibuild/target"
+            ),
+        }
+        for original, replacement in storage_replacements.items():
+            count = source.count(original)
+            if count != 1:
+                raise BenchmarkError(
+                    f"guest template must contain {original!r} exactly once; "
+                    f"found {count}"
+                )
+            source = source.replace(original, replacement)
     replacements = {
         "@RUN_ID@": identity["run_id"],
         "@ARCH@": identity["arch"],
@@ -359,6 +385,9 @@ def render_guest(identity: dict[str, str]) -> str:
         "@MEM@": identity["mem"],
         "@BLOCK_IO_MODE@": identity["block_io"],
         "@PERF_COUNTERS@": identity["perf"],
+        "@WORKLOAD@": identity["workload"],
+        "@MULTICRATE_LEAF_CRATES@": str(MULTICRATE_LEAF_CRATES),
+        "@MULTICRATE_FUNCTIONS_PER_CRATE@": str(MULTICRATE_FUNCTIONS_PER_CRATE),
     }
     for placeholder, replacement in replacements.items():
         count = source.count(placeholder)
@@ -396,6 +425,7 @@ def marker_identity_errors(
         "mem",
         "block_io",
         "perf",
+        "workload",
     ):
         if groups[field] != expected[field]:
             errors.append(
@@ -820,6 +850,44 @@ def validate_guest_log(
             errors.append("RESULT artifact_bytes must be positive")
         if int(fields["output_bytes"]) != 14:
             errors.append("RESULT output_bytes must be 14")
+        leaf_crates = int(fields["leaf_crates"])
+        functions_per_crate = int(fields["functions_per_crate"])
+        build_jobs = int(fields["build_jobs"])
+        rustc_max_active = int(fields["rustc_max_active"])
+        if identity["workload"] == "hello":
+            if (leaf_crates, functions_per_crate, build_jobs, rustc_max_active) != (
+                0,
+                0,
+                1,
+                1,
+            ):
+                errors.append("RESULT hello workload shape is not the frozen default")
+        else:
+            if leaf_crates != MULTICRATE_LEAF_CRATES:
+                errors.append(
+                    f"RESULT leaf_crates {leaf_crates} != {MULTICRATE_LEAF_CRATES}"
+                )
+            if functions_per_crate != MULTICRATE_FUNCTIONS_PER_CRATE:
+                errors.append(
+                    "RESULT functions_per_crate "
+                    f"{functions_per_crate} != {MULTICRATE_FUNCTIONS_PER_CRATE}"
+                )
+            if build_jobs != smp:
+                errors.append(f"RESULT build_jobs {build_jobs} != SMP {smp}")
+            if rustc_max_active < min(2, smp):
+                errors.append(
+                    f"RESULT rustc_max_active did not prove parallelism: {rustc_max_active}"
+                )
+            if rustc_max_active > smp:
+                errors.append(
+                    f"RESULT rustc_max_active {rustc_max_active} exceeds jobs {smp}"
+                )
+        parsed["workload_shape"] = {
+            "leaf_crates": leaf_crates,
+            "functions_per_crate": functions_per_crate,
+            "build_jobs": build_jobs,
+            "rustc_max_active": rustc_max_active,
+        }
         elapsed_ns = int(fields["elapsed_ns"])
         if elapsed_ns <= 0:
             errors.append("RESULT elapsed_ns must be positive")
@@ -1074,11 +1142,162 @@ def run_setup_command(command: list[str], log: list[str]) -> None:
         )
 
 
+def build_multicrate_fixture(root: Path) -> None:
+    root.mkdir()
+    crates_root = root / "crates"
+    crates_root.mkdir()
+    manifest_lines = [
+        "[package]",
+        'name = "minibuild"',
+        'version = "0.1.0"',
+        'edition = "2024"',
+        "",
+        "[dependencies]",
+    ]
+    main_lines = ["fn main() {", "    let mut digest = 0u64;"]
+    for crate_index in range(MULTICRATE_LEAF_CRATES):
+        suffix = f"{crate_index:02d}"
+        crate_name = f"benchcrate{suffix}"
+        crate_root = crates_root / crate_name
+        source_root = crate_root / "src"
+        source_root.mkdir(parents=True)
+        (crate_root / "Cargo.toml").write_text(
+            "\n".join(
+                (
+                    "[package]",
+                    f'name = "{crate_name}"',
+                    'version = "0.1.0"',
+                    'edition = "2024"',
+                    "",
+                    "[lib]",
+                    'path = "src/lib.rs"',
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        source_lines = [
+            "#![allow(dead_code)]",
+            f"pub static DATA: [u64; 1024] = [{crate_index + 1}u64; 1024];",
+        ]
+        for function in range(MULTICRATE_FUNCTIONS_PER_CRATE):
+            value = crate_index * MULTICRATE_FUNCTIONS_PER_CRATE + function + 1
+            rotate = function % 63 + 1
+            source_lines.extend(
+                (
+                    "#[inline(never)]",
+                    f"pub fn f{function:03d}(v: u64) -> u64 {{ "
+                    f"v.wrapping_add({value}u64).rotate_left({rotate}u32) "
+                    f"^ DATA[{function % 1024}] }}",
+                )
+            )
+        source_lines.extend(
+            (
+                "#[inline(never)]",
+                "pub fn entry(v: u64) -> u64 { "
+                f"f000(v) ^ f{MULTICRATE_FUNCTIONS_PER_CRATE - 1:03d}(v) ^ DATA[0] }}",
+                "",
+            )
+        )
+        (source_root / "lib.rs").write_text(
+            "\n".join(source_lines), encoding="utf-8"
+        )
+        manifest_lines.append(
+            f'{crate_name} = {{ path = "crates/{crate_name}" }}'
+        )
+        main_lines.append(f"    digest ^= {crate_name}::entry(digest);")
+    manifest_lines.append("")
+    main_lines.extend(
+        (
+            "    let _ = std::hint::black_box(digest);",
+            '    println!("Hello, world!");',
+            "}",
+            "",
+        )
+    )
+    source_root = root / "src"
+    source_root.mkdir()
+    (root / "Cargo.toml").write_text("\n".join(manifest_lines), encoding="utf-8")
+    (source_root / "main.rs").write_text("\n".join(main_lines), encoding="utf-8")
+
+
+def prepare_multicrate_primary_disk(
+    *,
+    base: Path,
+    prepared: Path,
+    fixture_root: Path,
+    command_file: Path,
+    setup_log: Path,
+) -> None:
+    build_multicrate_fixture(fixture_root)
+    fixture_paths = [fixture_root, *fixture_root.rglob("*")]
+    if any(any(character.isspace() for character in str(path)) for path in fixture_paths):
+        raise BenchmarkError("multicrate fixture path contains debugfs-unsafe whitespace")
+    commands = [
+        "mkdir /root/minibuild",
+        "mkdir /root/minibuild/src",
+        "mkdir /root/minibuild/crates",
+        f"write {fixture_root / 'Cargo.toml'} /root/minibuild/Cargo.toml",
+        f"write {fixture_root / 'src' / 'main.rs'} /root/minibuild/src/main.rs",
+    ]
+    for crate_index in range(MULTICRATE_LEAF_CRATES):
+        crate_name = f"benchcrate{crate_index:02d}"
+        host_crate = fixture_root / "crates" / crate_name
+        guest_crate = f"/root/minibuild/crates/{crate_name}"
+        commands.extend(
+            (
+                f"mkdir {guest_crate}",
+                f"mkdir {guest_crate}/src",
+                f"write {host_crate / 'Cargo.toml'} {guest_crate}/Cargo.toml",
+                f"write {host_crate / 'src' / 'lib.rs'} {guest_crate}/src/lib.rs",
+            )
+        )
+    command_file.write_text("\n".join(commands) + "\n", encoding="utf-8")
+    output: list[str] = []
+    try:
+        run_setup_command(
+            [
+                require_command("cp"),
+                "--reflink=always",
+                "--sparse=auto",
+                "--",
+                str(base),
+                str(prepared),
+            ],
+            output,
+        )
+        run_setup_command(
+            [
+                require_command("debugfs"),
+                "-w",
+                "-f",
+                str(command_file),
+                str(prepared),
+            ],
+            output,
+        )
+        run_setup_command(
+            [require_command("e2fsck"), "-fn", str(prepared)], output
+        )
+        run_setup_command(
+            [
+                require_command("debugfs"),
+                "-R",
+                "stat /root/minibuild/Cargo.toml",
+                str(prepared),
+            ],
+            output,
+        )
+    finally:
+        setup_log.write_text("".join(output), encoding="utf-8")
+
+
 def build_script_disk(
     *,
     temp_root: Path,
     timer_binary: Path,
     identity: dict[str, str],
+    project_storage: str,
     image_size: str,
     setup_log: Path,
 ) -> Path:
@@ -1088,7 +1307,9 @@ def build_script_disk(
     entry.write_text(render_guest_launcher(), encoding="utf-8")
     entry.chmod(0o755)
     workload = staging / Path(GUEST_WORKLOAD_PATH).name
-    workload.write_text(render_guest(identity), encoding="utf-8")
+    workload.write_text(
+        render_guest(identity, project_storage=project_storage), encoding="utf-8"
+    )
     workload.chmod(0o755)
     installed_timer = staging / "rust_build_timer"
     shutil.copy2(timer_binary, installed_timer)
@@ -1130,8 +1351,9 @@ def qemu_command(
     disk: Path,
     aux_disk: Path,
     overlay_root: Path,
+    gdb_port: int | None,
 ) -> list[str]:
-    return [
+    command = [
         require_command("make"),
         "--no-print-directory",
         "-C",
@@ -1146,8 +1368,11 @@ def qemu_command(
         f"PRIMARY_DISK={disk}",
         f"AUX_DISK={aux_disk}",
         f"QEMU_OVERLAY_ROOT={overlay_root}",
-        "run-inner",
     ]
+    if gdb_port is not None:
+        command.append(f"QEMU_EXTRA_ARGS=-gdb tcp:127.0.0.1:{gdb_port}")
+    command.append("run-inner")
+    return command
 
 
 def run_trial(
@@ -1158,6 +1383,8 @@ def run_trial(
     smp: int,
     mem: str,
     block_io_mode: str,
+    project_storage: str,
+    workload: str,
     perf_counters: int,
     kernel: Path,
     disk: Path,
@@ -1165,9 +1392,14 @@ def run_trial(
     image_size: str,
     timeout: float,
     evidence_dir: Path,
+    gdb_port: int | None,
 ) -> dict[str, Any]:
     if block_io_mode not in {"auto", "force-sync"}:
         raise BenchmarkError(f"unsupported block IO mode: {block_io_mode!r}")
+    if project_storage not in {"tmpfs", "root-ext4"}:
+        raise BenchmarkError(f"unsupported project storage: {project_storage!r}")
+    if workload not in {"hello", "multicrate"}:
+        raise BenchmarkError(f"unsupported workload: {workload!r}")
     if perf_counters not in {0, 1}:
         raise BenchmarkError(f"perf_counters must be 0 or 1: {perf_counters!r}")
     trial_dir = evidence_dir / trial.directory_name
@@ -1181,6 +1413,7 @@ def run_trial(
         "mem": mem,
         "block_io": block_io_mode,
         "perf": str(perf_counters),
+        "workload": workload,
     }
     temp_root: Path | None = None
     overlay_root: Path | None = None
@@ -1207,6 +1440,7 @@ def run_trial(
             temp_root=temp_root,
             timer_binary=timer_binary,
             identity=identity,
+            project_storage=project_storage,
             image_size=image_size,
             setup_log=trial_dir / "setup.log",
         )
@@ -1220,6 +1454,7 @@ def run_trial(
             disk=disk,
             aux_disk=aux_disk,
             overlay_root=overlay_root,
+            gdb_port=gdb_port,
         )
         (trial_dir / "command.txt").write_text(command_text(command), encoding="utf-8")
         process = run_logged(command, trial_dir / "serial.log", timeout)
@@ -1417,6 +1652,10 @@ def run_cell(args: argparse.Namespace) -> int:
     require_command(qemu_command_name)
     require_command("mkfs.ext4")
     require_command("truncate")
+    if args.workload == "multicrate":
+        require_command("cp")
+        require_command("debugfs")
+        require_command("e2fsck")
     output_dir.mkdir(parents=True)
     setup_dir = output_dir / "setup"
     setup_dir.mkdir()
@@ -1433,7 +1672,17 @@ def run_cell(args: argparse.Namespace) -> int:
         "smp": args.smp,
         "mem": args.mem,
         "block_io_mode": args.block_io_mode,
+        "project_storage": args.project_storage,
+        "workload": args.workload,
+        "workload_shape": {
+            "leaf_crates": MULTICRATE_LEAF_CRATES if args.workload == "multicrate" else 0,
+            "functions_per_crate": (
+                MULTICRATE_FUNCTIONS_PER_CRATE if args.workload == "multicrate" else 0
+            ),
+            "build_jobs": args.smp if args.workload == "multicrate" else 1,
+        },
         "perf_counters": args.perf_counters,
+        "gdb_port": args.gdb_port,
         "run_inner_make_parameters": {
             "MODE": "release",
             "BLOCK_IO_MODE": args.block_io_mode,
@@ -1452,7 +1701,11 @@ def run_cell(args: argparse.Namespace) -> int:
         "timeout_seconds": args.timeout,
         "image_size": args.image_size,
         "cache_contract": {
-            "guest_cache": "cold-fresh-qemu-and-tmp-scratch",
+            "guest_cache": (
+                "cold-fresh-qemu-and-root-ext4-overlay"
+                if args.project_storage == "root-ext4"
+                else "cold-fresh-qemu-and-tmp-scratch"
+            ),
             "host_cache": (
                 "warm-after-cell-warmup"
                 if args.warmups > 0
@@ -1462,7 +1715,19 @@ def run_cell(args: argparse.Namespace) -> int:
             "public_prebuild_sequence": [
                 "rustc --version",
                 "cargo --version",
-                "cargo new --vcs none /tmp/minibuild",
+                (
+                    "cargo new --vcs none /root/minibuild"
+                    if args.project_storage == "root-ext4"
+                    else "cargo new --vcs none /tmp/minibuild"
+                ),
+                *(
+                    [
+                        f"generate {MULTICRATE_LEAF_CRATES} independent path crates",
+                        f"generate {MULTICRATE_FUNCTIONS_PER_CRATE} functions per leaf",
+                    ]
+                    if args.workload == "multicrate"
+                    else []
+                ),
             ],
         },
         "input_metadata_before": input_metadata_before,
@@ -1472,6 +1737,8 @@ def run_cell(args: argparse.Namespace) -> int:
     }
     write_json(output_dir / "manifest.json", manifest)
     controller_root: Path | None = None
+    prepared_primary: Path | None = None
+    runtime_disk = disk
     samples: list[dict[str, Any]] = []
     aggregate_path = output_dir / "aggregate.json"
     failure = False
@@ -1480,6 +1747,26 @@ def run_cell(args: argparse.Namespace) -> int:
         write_json(aggregate_path, aggregate(samples, args.warmups, args.samples))
         controller_root = Path(tempfile.mkdtemp(prefix="whusp-g0b-controller-"))
         timer_binary = build_timer(compiler, controller_root, setup_dir)
+        if args.workload == "multicrate":
+            prepared_primary = setup_dir / "multicrate-primary.img"
+            prepare_multicrate_primary_disk(
+                base=disk,
+                prepared=prepared_primary,
+                fixture_root=controller_root / "multicrate-fixture",
+                command_file=setup_dir / "multicrate-debugfs.commands",
+                setup_log=setup_dir / "multicrate-primary-setup.log",
+            )
+            runtime_disk = prepared_primary
+            manifest["prepared_primary_disk"] = {
+                "base": str(disk),
+                "method": "btrfs-reflink-plus-debugfs",
+                "fixture": {
+                    "leaf_crates": MULTICRATE_LEAF_CRATES,
+                    "functions_per_crate": MULTICRATE_FUNCTIONS_PER_CRATE,
+                },
+                "metadata_before_trials": file_metadata(prepared_primary),
+            }
+            write_json(output_dir / "manifest.json", manifest)
         for trial in trial_plan(args.warmups, args.samples):
             print(
                 f"[{utc_now()}] {args.arch} {args.smp}C {args.mem} "
@@ -1493,13 +1780,16 @@ def run_cell(args: argparse.Namespace) -> int:
                 smp=args.smp,
                 mem=args.mem,
                 block_io_mode=args.block_io_mode,
+                project_storage=args.project_storage,
+                workload=args.workload,
                 perf_counters=args.perf_counters,
                 kernel=kernel,
-                disk=disk,
+                disk=runtime_disk,
                 timer_binary=timer_binary,
                 image_size=args.image_size,
                 timeout=args.timeout,
                 evidence_dir=output_dir,
+                gdb_port=args.gdb_port,
             )
             samples.append(sample)
             current = aggregate(samples, args.warmups, args.samples)
@@ -1521,6 +1811,17 @@ def run_cell(args: argparse.Namespace) -> int:
         manifest["setup_or_runner_error"] = str(error)
         print(f"G0-B runner error: {error}", file=sys.stderr, flush=True)
     finally:
+        if prepared_primary is None:
+            prepared_primary_cleanup = True
+        else:
+            try:
+                prepared_primary.unlink(missing_ok=True)
+                prepared_primary_cleanup = not prepared_primary.exists()
+            except OSError as error:
+                prepared_primary_cleanup = False
+                manifest["prepared_primary_cleanup_error"] = str(error)
+                failure = True
+        manifest["prepared_primary_cleanup"] = prepared_primary_cleanup
         if controller_root is None:
             controller_cleanup = True
         else:
@@ -1575,6 +1876,8 @@ def run_cell(args: argparse.Namespace) -> int:
     print(
         f"G0-B cell PASS arch={args.arch} smp={args.smp} mem={args.mem} "
         f"block_io={args.block_io_mode} perf={args.perf_counters} "
+        f"project_storage={args.project_storage} "
+        f"workload={args.workload} "
         f"median_s={final_aggregate['median_elapsed_seconds']} "
         f"goal_met={final_aggregate['goal_met']}",
         flush=True,
@@ -1594,6 +1897,7 @@ def marker_identity_text(identity: dict[str, str]) -> str:
             "mem",
             "block_io",
             "perf",
+            "workload",
         )
     )
 
@@ -1698,7 +2002,15 @@ def synthetic_log(
                 "tmp_mount=1 tmp_writable=1 elapsed_ns=900000000 timer_exited=1 "
                 "timer_exit_code=0 timer_signaled=0 timer_signal=0 timer_rc=0 "
                 "uptime_before=10.00 uptime_after=10.90 lock_created=1 "
-                "artifact_bytes=100 output_bytes=14 output_ok=1 ok=1"
+                + (
+                    f"leaf_crates={MULTICRATE_LEAF_CRATES} "
+                    f"functions_per_crate={MULTICRATE_FUNCTIONS_PER_CRATE} "
+                    f"build_jobs={smp} rustc_max_active={smp} "
+                    if identity["workload"] == "multicrate"
+                    else "leaf_crates=0 functions_per_crate=0 build_jobs=1 "
+                    "rustc_max_active=1 "
+                )
+                + "artifact_bytes=100 output_bytes=14 output_ok=1 ok=1"
             ),
             f"G0_RUST_HELLO_PASS {identity_text}",
             (
@@ -1721,8 +2033,30 @@ def self_test() -> int:
         "mem": "8G",
         "block_io": "auto",
         "perf": "0",
+        "workload": "hello",
     }
-    render_guest(identity)
+    default_guest = render_guest(identity)
+    if "PROJECT=/tmp/minibuild" not in default_guest:
+        raise BenchmarkError("default guest project storage is not tmpfs")
+    root_ext4_guest = render_guest(identity, project_storage="root-ext4")
+    if (
+        "PROJECT=/root/minibuild" not in root_ext4_guest
+        or "CARGO_TARGET_DIR=/root/minibuild/target" not in root_ext4_guest
+        or "PROJECT=/tmp/minibuild" in root_ext4_guest
+    ):
+        raise BenchmarkError("root-ext4 guest project storage rewrite failed")
+    multicrate_identity = {**identity, "workload": "multicrate"}
+    multicrate_guest = render_guest(
+        multicrate_identity, project_storage="root-ext4"
+    )
+    if (
+        "WORKLOAD='multicrate'" not in multicrate_guest
+        or f"MULTICRATE_LEAF_CRATES='{MULTICRATE_LEAF_CRATES}'"
+        not in multicrate_guest
+        or f"MULTICRATE_FUNCTIONS_PER_CRATE='{MULTICRATE_FUNCTIONS_PER_CRATE}'"
+        not in multicrate_guest
+    ):
+        raise BenchmarkError("multicrate guest workload rewrite failed")
     expected_launcher = (
         "#!/musl/busybox sh\nexec /musl/busybox ash /x1/g0-rust-hello.sh || exit 127\n"
     )
@@ -1745,6 +2079,21 @@ def self_test() -> int:
         or parsed.get("block_io_policy", {}).get("mode") != "auto"
     ):
         raise BenchmarkError(f"positive synthetic log failed: {errors}")
+    multicrate_good = synthetic_log(multicrate_identity, architecture, 8, "8G")
+    multicrate_parsed, multicrate_errors = validate_guest_log(
+        multicrate_good,
+        identity=multicrate_identity,
+        architecture=architecture,
+        smp=8,
+        mem="8G",
+    )
+    if (
+        multicrate_errors
+        or multicrate_parsed.get("workload_shape", {}).get("rustc_max_active") != 8
+    ):
+        raise BenchmarkError(
+            f"positive multicrate synthetic log failed: {multicrate_errors}"
+        )
     pass_line = next(
         line for line in good.splitlines() if line.startswith("G0_RUST_HELLO_PASS ")
     )
@@ -1970,7 +2319,7 @@ def self_test() -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run one clean Rust Hello World architecture/SMP cell. Each warmup "
+            "Run one clean Rust build architecture/SMP cell. Each warmup "
             "or measured sample boots an independent guest."
         )
     )
@@ -1981,6 +2330,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--block-io-mode", choices=("auto", "force-sync"), default="auto"
     )
+    parser.add_argument(
+        "--project-storage", choices=("tmpfs", "root-ext4"), default="tmpfs"
+    )
+    parser.add_argument("--workload", choices=("hello", "multicrate"), default="hello")
     parser.add_argument("--perf-counters", type=int, choices=(0, 1), default=0)
     parser.add_argument("--kernel-elf", type=Path)
     parser.add_argument("--test-disk", type=Path)
@@ -1989,6 +2342,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=180.0)
+    parser.add_argument("--gdb-port", type=int)
     parser.add_argument("--image-size", default="64M")
     args = parser.parse_args()
     if args.self_test:
@@ -2011,6 +2365,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--samples must be positive")
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if args.gdb_port is not None and not 1 <= args.gdb_port <= 65535:
+        parser.error("--gdb-port must be in 1..65535")
     if not IMAGE_SIZE_RE.fullmatch(args.image_size):
         parser.error("--image-size must be a positive size ending in M or G")
     if args.run_id is not None and not TOKEN_RE.fullmatch(args.run_id):

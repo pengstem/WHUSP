@@ -10,6 +10,9 @@ SMP='@SMP@'
 MEM='@MEM@'
 BLOCK_IO='@BLOCK_IO_MODE@'
 PERF='@PERF_COUNTERS@'
+WORKLOAD='@WORKLOAD@'
+MULTICRATE_LEAF_CRATES='@MULTICRATE_LEAF_CRATES@'
+MULTICRATE_FUNCTIONS_PER_CRATE='@MULTICRATE_FUNCTIONS_PER_CRATE@'
 
 BB=/musl/busybox
 TIMER=/x1/rust_build_timer
@@ -55,7 +58,7 @@ fail()
     FAIL_REASON=$2
     FAIL_RC=${3:--1}
     printf '%s\n' \
-        "G0_RUST_HELLO_FAIL run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF stage=$FAIL_STAGE reason=$FAIL_REASON rc=$FAIL_RC"
+        "G0_RUST_HELLO_FAIL run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF workload=$WORKLOAD stage=$FAIL_STAGE reason=$FAIL_REASON rc=$FAIL_RC"
     exit 1
 }
 
@@ -130,10 +133,38 @@ emit_perf_snapshot()
     PERF_SOURCE=$2
     [ "$PERF" -eq 1 ] || fail perf emit_disabled
     printf '%s\n' \
-        "G0_RUST_HELLO_PERF_BEGIN run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF point=$PERF_POINT"
+        "G0_RUST_HELLO_PERF_BEGIN run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF workload=$WORKLOAD point=$PERF_POINT"
     $BB cat "$PERF_SOURCE" || fail perf "${PERF_POINT}_snapshot_emit_failed" "$?"
     printf '%s\n' \
-        "G0_RUST_HELLO_PERF_END run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF point=$PERF_POINT"
+        "G0_RUST_HELLO_PERF_END run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF workload=$WORKLOAD point=$PERF_POINT"
+}
+
+prepare_multicrate_monitor()
+{
+    CRATES_DIR="$PROJECT/crates"
+    RUSTC_ACTIVE_DIR=/tmp/g0-rustc-active
+    RUSTC_ACTIVE_SAMPLES=/tmp/g0-rustc-active.samples
+    RUSTC_WRAPPER_PATH=/tmp/g0-rustc-wrapper.sh
+    $BB mkdir "$RUSTC_ACTIVE_DIR" || fail setup rustc_active_mkdir_failed "$?"
+    $BB cat > "$RUSTC_WRAPPER_PATH" <<'EOF'
+#!/musl/busybox ash
+BB=/musl/busybox
+ACTIVE_DIR=/tmp/g0-rustc-active
+SAMPLES=/tmp/g0-rustc-active.samples
+REAL_RUSTC=$1
+shift
+TOKEN="$ACTIVE_DIR/$$"
+: > "$TOKEN" || exit 121
+ACTIVE=$($BB find "$ACTIVE_DIR" -type f | $BB wc -l) || exit 122
+printf '%s\n' "$ACTIVE" >> "$SAMPLES" || exit 123
+"$REAL_RUSTC" "$@"
+RC=$?
+$BB rm -f "$TOKEN"
+exit "$RC"
+EOF
+    $BB chmod 700 "$RUSTC_WRAPPER_PATH" || fail setup rustc_wrapper_chmod_failed "$?"
+    RUSTC_WRAPPER="$RUSTC_WRAPPER_PATH"
+    export RUSTC_WRAPPER
 }
 
 is_marker_token "$RUN_ID" || fail identity invalid_run_id
@@ -144,6 +175,7 @@ is_marker_token "$SMP" || fail identity invalid_smp
 is_marker_token "$MEM" || fail identity invalid_mem
 is_marker_token "$BLOCK_IO" || fail identity invalid_block_io
 is_marker_token "$PERF" || fail identity invalid_perf
+is_marker_token "$WORKLOAD" || fail identity invalid_workload
 
 case "$ARCH" in
     rv) EXPECTED_MACHINE=riscv64 ;;
@@ -166,12 +198,24 @@ case "$PERF" in
     *) fail identity unsupported_perf ;;
 esac
 
+case "$WORKLOAD" in
+    hello|multicrate) ;;
+    *) fail identity unsupported_workload ;;
+esac
+
+is_uint "$MULTICRATE_LEAF_CRATES" || fail identity multicrate_leaf_crates_not_uint
+is_uint "$MULTICRATE_FUNCTIONS_PER_CRATE" \
+    || fail identity multicrate_functions_not_uint
+[ "$MULTICRATE_LEAF_CRATES" -gt 0 ] || fail identity multicrate_leaf_crates_zero
+[ "$MULTICRATE_FUNCTIONS_PER_CRATE" -gt 0 ] \
+    || fail identity multicrate_functions_zero
+
 is_uint "$SAMPLE" || fail identity sample_not_uint
 is_uint "$SMP" || fail identity smp_not_uint
 [ "$SMP" -ge 1 ] || fail identity smp_not_positive
 
 printf '%s\n' \
-    "G0_RUST_HELLO_START run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF"
+    "G0_RUST_HELLO_START run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF workload=$WORKLOAD"
 
 [ -x "$BB" ] || fail preflight busybox_missing
 [ -x "$TIMER" ] || fail preflight timer_missing
@@ -202,7 +246,11 @@ path_exists "$WRITE_PROBE" && fail scratch stale_write_probe
 $BB mkdir "$WRITE_PROBE" || fail scratch tmp_not_writable "$?"
 $BB rmdir "$WRITE_PROBE" || fail scratch probe_cleanup_failed "$?"
 
-path_exists "$PROJECT" && fail setup stale_project
+if [ "$WORKLOAD" = hello ]; then
+    path_exists "$PROJECT" && fail setup stale_project
+else
+    [ -d "$PROJECT" ] || fail setup multicrate_project_missing
+fi
 path_exists "$TIMER_RESULT" && fail setup stale_timer_result
 path_exists "$PROGRAM_OUTPUT" && fail setup stale_program_output
 path_exists "$PROGRAM_STDERR" && fail setup stale_program_stderr
@@ -225,44 +273,60 @@ CARGO_VERSION=$(printf '%s\n' "$CARGO_VERSION_LINE" | $BB awk 'NR == 1 { print $
     || fail metadata cargo_version_parse_failed "$?"
 is_marker_token "$CARGO_VERSION" || fail metadata cargo_version_invalid
 
-$CARGO new --vcs none "$PROJECT" >/dev/null 2>&1
-CARGO_NEW_RC=$?
-[ "$CARGO_NEW_RC" -eq 0 ] || fail setup cargo_new_failed "$CARGO_NEW_RC"
+if [ "$WORKLOAD" = hello ]; then
+    $CARGO new --vcs none "$PROJECT" >/dev/null 2>&1
+    CARGO_NEW_RC=$?
+    [ "$CARGO_NEW_RC" -eq 0 ] || fail setup cargo_new_failed "$CARGO_NEW_RC"
 
-[ -d "$PROJECT" ] || fail setup project_missing
-[ -f "$PROJECT/Cargo.toml" ] || fail setup manifest_missing
-[ -f "$PROJECT/src/main.rs" ] || fail setup source_missing
+    [ -d "$PROJECT" ] || fail setup project_missing
+    [ -f "$PROJECT/Cargo.toml" ] || fail setup manifest_missing
+    [ -f "$PROJECT/src/main.rs" ] || fail setup source_missing
 
-EXPECTED_MANIFEST='[package]
+    EXPECTED_MANIFEST='[package]
 name = "minibuild"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]'
-EXPECTED_SOURCE='fn main() {
+    EXPECTED_SOURCE='fn main() {
     println!("Hello, world!");
 }'
 
-ACTUAL_MANIFEST=$($BB cat "$PROJECT/Cargo.toml") \
-    || fail setup manifest_read_failed "$?"
-ACTUAL_SOURCE=$($BB cat "$PROJECT/src/main.rs") \
-    || fail setup source_read_failed "$?"
-MANIFEST_BYTES=$($BB wc -c < "$PROJECT/Cargo.toml") \
-    || fail setup manifest_size_failed "$?"
-SOURCE_BYTES=$($BB wc -c < "$PROJECT/src/main.rs") \
-    || fail setup source_size_failed "$?"
+    ACTUAL_MANIFEST=$($BB cat "$PROJECT/Cargo.toml") \
+        || fail setup manifest_read_failed "$?"
+    ACTUAL_SOURCE=$($BB cat "$PROJECT/src/main.rs") \
+        || fail setup source_read_failed "$?"
+    MANIFEST_BYTES=$($BB wc -c < "$PROJECT/Cargo.toml") \
+        || fail setup manifest_size_failed "$?"
+    SOURCE_BYTES=$($BB wc -c < "$PROJECT/src/main.rs") \
+        || fail setup source_size_failed "$?"
 
-[ "$ACTUAL_MANIFEST" = "$EXPECTED_MANIFEST" ] || fail setup manifest_content_mismatch
-[ "$ACTUAL_SOURCE" = "$EXPECTED_SOURCE" ] || fail setup source_content_mismatch
-[ "$MANIFEST_BYTES" -eq 80 ] || fail setup manifest_size_mismatch
-[ "$SOURCE_BYTES" -eq 45 ] || fail setup source_size_mismatch
+    [ "$ACTUAL_MANIFEST" = "$EXPECTED_MANIFEST" ] \
+        || fail setup manifest_content_mismatch
+    [ "$ACTUAL_SOURCE" = "$EXPECTED_SOURCE" ] || fail setup source_content_mismatch
+    [ "$MANIFEST_BYTES" -eq 80 ] || fail setup manifest_size_mismatch
+    [ "$SOURCE_BYTES" -eq 45 ] || fail setup source_size_mismatch
 
-PROJECT_ENTRIES=$($BB find "$PROJECT" -mindepth 1 -maxdepth 2 -print | $BB sort) \
-    || fail setup project_inventory_failed "$?"
-EXPECTED_ENTRIES="$PROJECT/Cargo.toml
+    PROJECT_ENTRIES=$($BB find "$PROJECT" -mindepth 1 -maxdepth 2 -print | $BB sort) \
+        || fail setup project_inventory_failed "$?"
+    EXPECTED_ENTRIES="$PROJECT/Cargo.toml
 $PROJECT/src
 $PROJECT/src/main.rs"
-[ "$PROJECT_ENTRIES" = "$EXPECTED_ENTRIES" ] || fail setup unexpected_project_entry
+    [ "$PROJECT_ENTRIES" = "$EXPECTED_ENTRIES" ] \
+        || fail setup unexpected_project_entry
+else
+    [ -f "$PROJECT/Cargo.toml" ] || fail setup multicrate_manifest_missing
+    [ -f "$PROJECT/src/main.rs" ] || fail setup multicrate_source_missing
+    [ -d "$PROJECT/crates" ] || fail setup multicrate_crates_missing
+    LEAF_MANIFESTS=$($BB find "$PROJECT/crates" -name Cargo.toml | $BB wc -l) \
+        || fail setup multicrate_manifest_inventory_failed "$?"
+    LEAF_SOURCES=$($BB find "$PROJECT/crates" -name lib.rs | $BB wc -l) \
+        || fail setup multicrate_source_inventory_failed "$?"
+    [ "$LEAF_MANIFESTS" -eq "$MULTICRATE_LEAF_CRATES" ] \
+        || fail setup multicrate_manifest_count_mismatch
+    [ "$LEAF_SOURCES" -eq "$MULTICRATE_LEAF_CRATES" ] \
+        || fail setup multicrate_source_count_mismatch
+fi
 
 path_exists "$PROJECT/target" && fail prebuild target_present
 path_exists "$PROJECT/Cargo.lock" && fail prebuild lock_present
@@ -273,6 +337,17 @@ path_exists "$PROJECT/.git" && fail prebuild git_present
 [ "${RUSTFLAGS+x}" != x ] || fail prebuild rustflags_present
 [ "${CARGO_ENCODED_RUSTFLAGS+x}" != x ] || fail prebuild encoded_rustflags_present
 [ "${CARGO_BUILD_JOBS+x}" != x ] || fail prebuild cargo_jobs_present
+
+LEAF_CRATES=0
+FUNCTIONS_PER_CRATE=0
+BUILD_JOBS=1
+RUSTC_MAX_ACTIVE=1
+if [ "$WORKLOAD" = multicrate ]; then
+    prepare_multicrate_monitor
+    LEAF_CRATES=$MULTICRATE_LEAF_CRATES
+    FUNCTIONS_PER_CRATE=$MULTICRATE_FUNCTIONS_PER_CRATE
+    BUILD_JOBS=$SMP
+fi
 
 cd "$PROJECT" || fail prebuild chdir_failed "$?"
 
@@ -288,8 +363,28 @@ if [ "$PERF" -eq 1 ]; then
     capture_perf_snapshot before "$PERF_BEFORE"
 fi
 
-$TIMER "$TIMER_RESULT" "$CARGO" build >/dev/null 2>&1
+printf '%s\n' \
+    "G0_RUST_BUILD_BEGIN workload=$WORKLOAD leaf_crates=$LEAF_CRATES build_jobs=$BUILD_JOBS"
+if [ "$WORKLOAD" = multicrate ]; then
+    $TIMER "$TIMER_RESULT" "$CARGO" build --jobs "$BUILD_JOBS"
+else
+    $TIMER "$TIMER_RESULT" "$CARGO" build >/dev/null 2>&1
+fi
 TIMER_RC=$?
+printf '%s\n' \
+    "G0_RUST_BUILD_END workload=$WORKLOAD leaf_crates=$LEAF_CRATES build_jobs=$BUILD_JOBS rc=$TIMER_RC"
+
+if [ "$WORKLOAD" = multicrate ]; then
+    [ -f "$RUSTC_ACTIVE_SAMPLES" ] || fail validate rustc_samples_missing
+    RUSTC_MAX_ACTIVE=$($BB sort -n "$RUSTC_ACTIVE_SAMPLES" | $BB tail -n 1) \
+        || fail validate rustc_max_parse_failed "$?"
+    is_uint "$RUSTC_MAX_ACTIVE" || fail validate rustc_max_not_uint
+    [ "$RUSTC_MAX_ACTIVE" -ge 2 ] || fail validate rustc_not_parallel
+    [ "$RUSTC_MAX_ACTIVE" -le "$BUILD_JOBS" ] || fail validate rustc_exceeds_jobs
+    RUSTC_ACTIVE_REMAINDER=$($BB find "$RUSTC_ACTIVE_DIR" -type f | $BB wc -l) \
+        || fail validate rustc_active_scan_failed "$?"
+    [ "$RUSTC_ACTIVE_REMAINDER" -eq 0 ] || fail validate rustc_active_leak
+fi
 
 if [ "$PERF" -eq 1 ]; then
     capture_perf_snapshot after "$PERF_AFTER"
@@ -368,8 +463,8 @@ if [ "$PERF" -eq 1 ]; then
 fi
 
 printf '%s\n' \
-    "G0_RUST_HELLO_RESULT run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF uname=$MACHINE nproc=$ONLINE_CPUS cargo_version=$CARGO_VERSION rustc_version=$RUSTC_VERSION tmp_mount=1 tmp_writable=1 elapsed_ns=$ELAPSED_NS timer_exited=1 timer_exit_code=0 timer_signaled=0 timer_signal=0 timer_rc=$TIMER_RC uptime_before=$UPTIME_BEFORE uptime_after=$UPTIME_AFTER lock_created=1 artifact_bytes=$ARTIFACT_BYTES output_bytes=$OUTPUT_BYTES output_ok=1 ok=1"
+    "G0_RUST_HELLO_RESULT run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF workload=$WORKLOAD uname=$MACHINE nproc=$ONLINE_CPUS cargo_version=$CARGO_VERSION rustc_version=$RUSTC_VERSION tmp_mount=1 tmp_writable=1 elapsed_ns=$ELAPSED_NS timer_exited=1 timer_exit_code=0 timer_signaled=0 timer_signal=0 timer_rc=$TIMER_RC uptime_before=$UPTIME_BEFORE uptime_after=$UPTIME_AFTER lock_created=1 leaf_crates=$LEAF_CRATES functions_per_crate=$FUNCTIONS_PER_CRATE build_jobs=$BUILD_JOBS rustc_max_active=$RUSTC_MAX_ACTIVE artifact_bytes=$ARTIFACT_BYTES output_bytes=$OUTPUT_BYTES output_ok=1 ok=1"
 printf '%s\n' \
-    "G0_RUST_HELLO_PASS run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF"
+    "G0_RUST_HELLO_PASS run_id=$RUN_ID arch=$ARCH kind=$KIND sample=$SAMPLE smp=$SMP mem=$MEM block_io=$BLOCK_IO perf=$PERF workload=$WORKLOAD"
 
 exit 0

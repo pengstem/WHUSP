@@ -71,7 +71,10 @@ enum FutexKey {
     // backing object identity can be resolved.
     Private { process_id: usize, addr: usize },
     Shared(FutexSharedKey),
-    SharedVirtual { addr: usize },
+    // A non-private futex on a VMA without a process-shared backing object is
+    // still scoped to its process address space. Including process_id avoids
+    // unrelated processes with identical virtual layouts sharing one queue.
+    SharedVirtual { process_id: usize, addr: usize },
 }
 
 struct FutexWaiter {
@@ -140,15 +143,17 @@ impl FutexManager {
             FutexKey::Shared(FutexSharedKey::AnonymousPage { ppn, offset }) => {
                 (offset >> 2) ^ ppn.rotate_left(3)
             }
-            FutexKey::SharedVirtual { addr } => addr >> 2,
+            FutexKey::SharedVirtual { process_id, addr } => (addr >> 2) ^ process_id,
         };
         hash & (FUTEX_BUCKET_COUNT - 1)
     }
 
-    fn private_process_id(key: FutexKey) -> Option<usize> {
+    fn address_space_process_id(key: FutexKey) -> Option<usize> {
         match key {
-            FutexKey::Private { process_id, .. } => Some(process_id),
-            FutexKey::Shared(_) | FutexKey::SharedVirtual { .. } => None,
+            FutexKey::Private { process_id, .. } | FutexKey::SharedVirtual { process_id, .. } => {
+                Some(process_id)
+            }
+            FutexKey::Shared(_) => None,
         }
     }
 
@@ -439,7 +444,7 @@ impl FutexManager {
             let old_waiter_count = bucket.waiter_count;
             let mut waiter_count = 0usize;
             bucket.waiters.retain(|key, queue| {
-                if Self::private_process_id(*key) == Some(process_id) {
+                if Self::address_space_process_id(*key) == Some(process_id) {
                     for waiter in queue.iter() {
                         waiter
                             .state
@@ -503,18 +508,16 @@ pub(super) fn init() {
 
 fn futex_key(addr: usize, private: bool) -> KResult<FutexKey> {
     let process = current_process();
+    let process_id = process.getpid();
     if private {
-        return Ok(FutexKey::Private {
-            process_id: process.getpid(),
-            addr,
-        });
+        return Ok(FutexKey::Private { process_id, addr });
     }
     let inner = process.inner_exclusive_access();
     Ok(inner
         .memory_set
         .futex_shared_key(addr)
         .map(FutexKey::Shared)
-        .unwrap_or(FutexKey::SharedVirtual { addr }))
+        .unwrap_or(FutexKey::SharedVirtual { process_id, addr }))
 }
 
 fn futex_key_for_process(addr: usize, private: bool, process_id: usize) -> FutexKey {
@@ -525,7 +528,7 @@ fn futex_key_for_process(addr: usize, private: bool, process_id: usize) -> Futex
         // virtual address, so they cannot reconstruct file-backed or SHM-backed
         // process-shared futex keys. Normal sys_futex wait/wake paths still use
         // `futex_key()` to resolve backing-object identity when it is available.
-        FutexKey::SharedVirtual { addr }
+        FutexKey::SharedVirtual { process_id, addr }
     }
 }
 

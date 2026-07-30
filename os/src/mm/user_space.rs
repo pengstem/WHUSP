@@ -1301,7 +1301,7 @@ impl MemorySet {
         writable: bool,
         grow_down: bool,
         page_cache_id: Option<PageCacheId>,
-    ) -> Option<(usize, Vec<MmapFlush>)> {
+    ) -> Option<(usize, Vec<MmapFlush>, Vec<Arc<dyn File + Send + Sync>>)> {
         if start % PAGE_SIZE != 0 {
             return None;
         }
@@ -1314,6 +1314,7 @@ impl MemorySet {
         self.split_area_at(end_vpn);
 
         let mut flushes = Vec::new();
+        let mut retired_files = Vec::new();
         let mut retired = RetiredUserPages::new();
         let mut idx = self.first_area_idx_ending_after(start_vpn);
         let index_skips = idx;
@@ -1330,6 +1331,9 @@ impl MemorySet {
                 if area.is_mmap() {
                     flushes.extend(area.take_mmap_flushes(&mut self.page_table, &mut retired));
                     area.release_mmap_refs();
+                    if let Some(file) = area.take_mmap_backing_file() {
+                        retired_files.push(file);
+                    }
                 } else {
                     area.unmap_resident_deferred(&mut self.page_table, &mut retired);
                 }
@@ -1359,7 +1363,7 @@ impl MemorySet {
         });
         apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
         self.insert_area_sorted(area);
-        Some((start, flushes))
+        Some((start, flushes, retired_files))
     }
 
     pub fn mmap_shared_frames_area(
@@ -1876,7 +1880,11 @@ impl MemorySet {
     ///
     /// Returned flush records are deferred filesystem writes and should be
     /// consumed without holding the process memory lock.
-    pub fn munmap_area(&mut self, start: usize, len: usize) -> Option<Vec<MmapFlush>> {
+    pub fn munmap_area(
+        &mut self,
+        start: usize,
+        len: usize,
+    ) -> Option<(Vec<MmapFlush>, Vec<Arc<dyn File + Send + Sync>>)> {
         if len == 0 || start % PAGE_SIZE != 0 {
             return None;
         }
@@ -1889,6 +1897,7 @@ impl MemorySet {
         self.split_area_at(end_vpn);
 
         let mut flushes = Vec::new();
+        let mut retired_files = Vec::new();
         let mut retired = RetiredUserPages::new();
         let mut idx = self.first_area_idx_ending_after(start_vpn);
         let index_skips = idx;
@@ -1904,6 +1913,9 @@ impl MemorySet {
                 let mut area = self.areas.remove(idx);
                 flushes.extend(area.take_mmap_flushes(&mut self.page_table, &mut retired));
                 area.release_mmap_refs();
+                if let Some(file) = area.take_mmap_backing_file() {
+                    retired_files.push(file);
+                }
             } else {
                 idx += 1;
             }
@@ -1913,7 +1925,7 @@ impl MemorySet {
             self.invalidate_tlb_vpn_range(start_vpn, end_vpn);
         }
         retired.release();
-        Some(flushes)
+        Some((flushes, retired_files))
     }
 
     /// Collects dirty MAP_SHARED writeback records for an `msync` range.
@@ -2368,7 +2380,7 @@ impl MemorySet {
         old_len: usize,
         new_len: usize,
         may_move: bool,
-    ) -> Option<(usize, Vec<MmapFlush>)> {
+    ) -> Option<(usize, Vec<MmapFlush>, Vec<Arc<dyn File + Send + Sync>>)> {
         if old_addr % PAGE_SIZE != 0 || old_len == 0 || new_len == 0 {
             return None;
         }
@@ -2383,12 +2395,12 @@ impl MemorySet {
             return None;
         }
         if new_map_len == old_map_len {
-            return Some((old_addr, Vec::new()));
+            return Some((old_addr, Vec::new(), Vec::new()));
         }
         if new_map_len < old_map_len {
             let tail = old_addr.checked_add(new_map_len)?;
-            let flushes = self.munmap_area(tail, old_map_len - new_map_len)?;
-            return Some((old_addr, flushes));
+            let (flushes, retired_files) = self.munmap_area(tail, old_map_len - new_map_len)?;
+            return Some((old_addr, flushes, retired_files));
         }
         if self.range_overlaps(old_end, new_end) {
             if may_move {
@@ -2414,7 +2426,7 @@ impl MemorySet {
         if write_protected {
             self.invalidate_tlb_vpn_range(old_start_vpn, old_end_vpn);
         }
-        Some((old_addr, Vec::new()))
+        Some((old_addr, Vec::new(), Vec::new()))
     }
 
     fn unlocked_pages_in_range(&self, start: super::VirtPageNum, end: super::VirtPageNum) -> usize {

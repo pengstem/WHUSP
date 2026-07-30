@@ -1,5 +1,8 @@
+use crate::perf;
 use crate::sync::SpinNoIrqLock;
 use crate::task::suspend_current_and_run_next;
+#[cfg(feature = "perf-counters")]
+use crate::timer;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -62,28 +65,49 @@ impl Ext4Sequence {
             EXT4_SEQUENCE_WRITER_MASK,
             "ext4 sequence active-writer count exhausted"
         );
+        perf::record_ext4_sequence_writer_entry((previous & EXT4_SEQUENCE_WRITER_MASK) + 1);
         Ext4SequenceWriteGuard { sequence: self }
     }
 
     fn stable_value(&self) -> usize {
+        #[cfg(feature = "perf-counters")]
+        let mut wait_start = None;
         loop {
             let value = self.value.load(Ordering::Acquire);
             if value & EXT4_SEQUENCE_WRITER_MASK == 0 {
+                #[cfg(feature = "perf-counters")]
+                if let Some(wait_start) = wait_start {
+                    perf::record_ext4_sequence_wait_ticks(
+                        timer::get_time().wrapping_sub(wait_start),
+                    );
+                }
                 return value;
             }
             // The writer may be asleep in VirtIO I/O. Yielding here avoids
             // turning a real read/write conflict into an SMP spin convoy.
+            #[cfg(feature = "perf-counters")]
+            if wait_start.is_none() {
+                wait_start = Some(timer::get_time());
+            }
+            perf::record_ext4_sequence_reader_wait_yield();
             suspend_current_and_run_next();
         }
     }
 
-    pub(super) fn read_stable<V>(&self, mut read: impl FnMut() -> V) -> V {
+    pub(super) fn read_stable<V>(
+        &self,
+        blocks: usize,
+        bytes: usize,
+        mut read: impl FnMut() -> V,
+    ) -> V {
+        perf::record_ext4_sequence_read(bytes);
         loop {
             let before = self.stable_value();
             let result = read();
             if self.value.load(Ordering::Acquire) == before {
                 return result;
             }
+            perf::record_ext4_sequence_reader_retry(blocks, bytes);
         }
     }
 }

@@ -28,6 +28,7 @@ CASES = (
     "partial_read_plan",
     "mapped_overwrite_plan",
     "independent_mapped_overwrite",
+    "disjoint_sequence_conflict",
     "independent_create",
     "independent_inode_metadata",
     "readlink_plan",

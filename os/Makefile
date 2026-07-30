@@ -42,6 +42,7 @@ KERNEL_ELF := $(TARGET_DIR)/$(TARGET)/$(MODE)/os
 PRIMARY_DISK ?= $(DEFAULT_DISK)
 AUX_DISK ?=
 QEMU_OVERLAY_ROOT ?= /tmp
+QEMU_EXTRA_ARGS ?=
 COMMA := ,
 ifeq ($(ARCH),riscv64)
 QEMU_SYSTEM := qemu-system-riscv64
@@ -147,6 +148,7 @@ run-inner: check-smp
 		$(AUX_DISK_ARGS) \
 		-no-reboot \
 		$(QEMU_NETWORK_ARGS) \
+		$(QEMU_EXTRA_ARGS) \
 		-rtc base=utc
 
 fmt: prepare-cargo-config

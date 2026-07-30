@@ -384,7 +384,7 @@ impl Ext4BlockDevice for KernelDisk {
             return Err(Ext4Error::new(EIO as _, "unaligned block read"));
         }
         let blocks = buf.len() / EXT4_DEV_BSIZE;
-        self.write_sequence.read_stable(|| {
+        self.write_sequence.read_stable(blocks, buf.len(), || {
             self.dev.read_blocks(block_id as usize, buf);
             #[cfg(feature = "perf-counters")]
             self.io_counters.record_read(blocks, buf.len());
@@ -1994,25 +1994,29 @@ impl BackendReadPlan for Ext4DeviceReadPlan {
         for run in &self.runs {
             let run_buf = &mut plan_buf[run.buffer_start..run.buffer_start + run.byte_len];
             if let Some(device_block) = run.device_block {
-                self.write_sequence.read_stable(|| {
-                    let io = self
-                        .device
-                        .read_blocks_versioned_fill_for_file_plan(device_block, run_buf);
-                    if self.record_regular {
-                        perf::record_ext4_read_plan_direct_io(
-                            io.device_calls,
-                            io.device_blocks,
-                            io.device_blocks * EXT4_DEV_BSIZE,
-                        );
-                    }
-                    if self.record_directory {
-                        perf::record_ext4_directory_plan_direct_io(
-                            io.device_calls,
-                            io.device_blocks,
-                            io.device_blocks * EXT4_DEV_BSIZE,
-                        );
-                    }
-                });
+                self.write_sequence.read_stable(
+                    run.byte_len / EXT4_DEV_BSIZE,
+                    run.byte_len,
+                    || {
+                        let io = self
+                            .device
+                            .read_blocks_versioned_fill_for_file_plan(device_block, run_buf);
+                        if self.record_regular {
+                            perf::record_ext4_read_plan_direct_io(
+                                io.device_calls,
+                                io.device_blocks,
+                                io.device_blocks * EXT4_DEV_BSIZE,
+                            );
+                        }
+                        if self.record_directory {
+                            perf::record_ext4_directory_plan_direct_io(
+                                io.device_calls,
+                                io.device_blocks,
+                                io.device_blocks * EXT4_DEV_BSIZE,
+                            );
+                        }
+                    },
+                );
             } else {
                 run_buf.fill(0);
             }
@@ -2053,10 +2057,14 @@ impl BackendWritePlan for Ext4DeviceWritePlan {
         if let Some(bounce) = bounce.as_deref_mut() {
             for run in &self.runs {
                 let run_buf = &mut bounce[run.buffer_start..run.buffer_start + run.byte_len];
-                let io = self.write_sequence.read_stable(|| {
-                    self.device
-                        .read_blocks_versioned_fill_for_file_plan(run.device_block, run_buf)
-                });
+                let io = self.write_sequence.read_stable(
+                    run.byte_len / EXT4_DEV_BSIZE,
+                    run.byte_len,
+                    || {
+                        self.device
+                            .read_blocks_versioned_fill_for_file_plan(run.device_block, run_buf)
+                    },
+                );
                 rmw_calls += io.device_calls;
                 rmw_blocks += io.device_blocks;
             }

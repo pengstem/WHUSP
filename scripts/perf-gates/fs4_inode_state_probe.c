@@ -30,6 +30,12 @@ enum {
     MAPPED_WRITE_FILE = 4 * MAPPED_WRITE_CHUNK,
     MAPPED_WRITE_WORKERS = 8,
     MAPPED_WRITE_ITERATIONS = 12,
+    SEQUENCE_READERS = 4,
+    SEQUENCE_WRITERS = 4,
+    SEQUENCE_FILE_SIZE = 1024 * 1024,
+    SEQUENCE_WRITE_CHUNK = 64 * 1024,
+    SEQUENCE_READ_ITERATIONS = 4,
+    SEQUENCE_WRITE_ITERATIONS = 32,
     INODE_METADATA_WORKERS = 8,
     INODE_METADATA_ITERATIONS = 1024,
     CREATE_WORKERS = 8,
@@ -381,6 +387,140 @@ static int phase_independent_mapped_overwrite(const char *base)
         }
     }
     return 0;
+}
+
+static int sequence_reader_worker(const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    for (int iteration = 0; iteration < SEQUENCE_READ_ITERATIONS; ++iteration) {
+        off_t hole = lseek(fd, 0, SEEK_HOLE);
+        if (hole != SEQUENCE_FILE_SIZE) {
+            close(fd);
+            return -1;
+        }
+    }
+    return close(fd);
+}
+
+static int sequence_writer_worker(const char *path, int worker)
+{
+    unsigned char *payload = malloc(SEQUENCE_WRITE_CHUNK);
+    if (payload == NULL) {
+        return -1;
+    }
+    int fd = open(path, O_RDWR | O_SYNC);
+    if (fd < 0) {
+        free(payload);
+        return -1;
+    }
+    for (int iteration = 0; iteration < SEQUENCE_WRITE_ITERATIONS; ++iteration) {
+        memset(payload, worker * 29 + iteration + 1, SEQUENCE_WRITE_CHUNK);
+        off_t offset = (iteration * SEQUENCE_WRITE_CHUNK) % SEQUENCE_FILE_SIZE;
+        if (pwrite(fd, payload, SEQUENCE_WRITE_CHUNK, offset) != SEQUENCE_WRITE_CHUNK) {
+            close(fd);
+            free(payload);
+            return -1;
+        }
+    }
+    int result = close(fd);
+    free(payload);
+    return result;
+}
+
+static int phase_disjoint_sequence_conflict(const char *base)
+{
+    enum { WORKERS = SEQUENCE_READERS + SEQUENCE_WRITERS };
+    unsigned char *payload = malloc(SEQUENCE_FILE_SIZE);
+    int ready_pipe[2];
+    int start_pipe[2];
+    pid_t children[WORKERS];
+    if (payload == NULL || pipe(ready_pipe) != 0 || pipe(start_pipe) != 0) {
+        free(payload);
+        return -1;
+    }
+    memset(payload, 0x5d, SEQUENCE_FILE_SIZE);
+    for (int worker = 0; worker < WORKERS; ++worker) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/sequence-%s-%d", base,
+                 worker < SEQUENCE_READERS ? "reader" : "writer", worker);
+        int fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+        if (fd < 0 || write_exact(fd, payload, SEQUENCE_FILE_SIZE) != 0 || fsync(fd) != 0
+            || close(fd) != 0) {
+            free(payload);
+            return -1;
+        }
+    }
+    free(payload);
+
+    for (int worker = 0; worker < WORKERS; ++worker) {
+        pid_t child = fork();
+        if (child < 0) {
+            return -1;
+        }
+        if (child == 0) {
+            char path[512];
+            char token;
+            close(ready_pipe[0]);
+            close(start_pipe[1]);
+            snprintf(path, sizeof(path), "%s/sequence-%s-%d", base,
+                     worker < SEQUENCE_READERS ? "reader" : "writer", worker);
+            if (write(ready_pipe[1], "r", 1) != 1 || read(start_pipe[0], &token, 1) != 1) {
+                _exit(131);
+            }
+            if (worker < SEQUENCE_READERS) {
+                _exit(sequence_reader_worker(path) == 0 ? 0 : 132);
+            }
+            _exit(sequence_writer_worker(path, worker - SEQUENCE_READERS) == 0 ? 0 : 133);
+        }
+        children[worker] = child;
+    }
+    close(ready_pipe[1]);
+    close(start_pipe[0]);
+    if (read_tokens(ready_pipe[0], WORKERS) != 0) {
+        return -1;
+    }
+    uint64_t start = monotonic_ns();
+    if (start == 0) {
+        return -1;
+    }
+    for (int worker = 0; worker < WORKERS; ++worker) {
+        if (write(start_pipe[1], "s", 1) != 1) {
+            return -1;
+        }
+    }
+    close(ready_pipe[0]);
+    close(start_pipe[1]);
+    int errors = 0;
+    for (int worker = 0; worker < WORKERS; ++worker) {
+        if (wait_success(children[worker]) != 0) {
+            ++errors;
+        }
+    }
+    uint64_t end = monotonic_ns();
+    if (end <= start) {
+        return -1;
+    }
+    for (int worker = 0; worker < WORKERS; ++worker) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/sequence-%s-%d", base,
+                 worker < SEQUENCE_READERS ? "reader" : "writer", worker);
+        if (unlink(path) != 0) {
+            return -1;
+        }
+    }
+    printf("FS4_SEQUENCE_CELL readers=%d reader_iterations=%d reader_bytes=%d "
+           "writers=%d writer_iterations=%d writer_bytes=%d elapsed_ns=%" PRIu64
+           " errors=%d\n",
+           SEQUENCE_READERS, SEQUENCE_READ_ITERATIONS,
+           SEQUENCE_READERS * SEQUENCE_READ_ITERATIONS * SEQUENCE_FILE_SIZE,
+           SEQUENCE_WRITERS, SEQUENCE_WRITE_ITERATIONS,
+           SEQUENCE_WRITERS * SEQUENCE_WRITE_ITERATIONS * SEQUENCE_WRITE_CHUNK,
+           end - start, errors);
+    fflush(stdout);
+    return errors == 0 ? 0 : -1;
 }
 
 static int run_inode_metadata_cell(const char *base, int workers)
@@ -1176,6 +1316,7 @@ int main(int argc, char **argv)
     RUN_CASE(partial_read_plan);
     RUN_CASE(mapped_overwrite_plan);
     RUN_CASE(independent_mapped_overwrite);
+    RUN_CASE(disjoint_sequence_conflict);
     RUN_CASE(independent_create);
     RUN_CASE(independent_inode_metadata);
     RUN_CASE(readlink_plan);
@@ -1184,6 +1325,6 @@ int main(int argc, char **argv)
     RUN_CASE(readdir_vs_namespace_mutation);
     RUN_CASE(shutdown_drain_stress);
 #undef RUN_CASE
-    puts("FS4_INODE_STATE_PROBE_PASS cases=16");
+    puts("FS4_INODE_STATE_PROBE_PASS cases=17");
     return 0;
 }

@@ -908,6 +908,12 @@ impl MapArea {
             file.dec_writable_shared_mmap();
         }
     }
+
+    /// Detaches the backing file so its final destructor can run after the
+    /// caller releases the process memory lock.
+    pub(super) fn take_mmap_backing_file(&mut self) -> Option<Arc<dyn File + Send + Sync>> {
+        self.mmap_info.as_mut()?.backing_file.take()
+    }
 }
 
 fn clear_resident_pte(
