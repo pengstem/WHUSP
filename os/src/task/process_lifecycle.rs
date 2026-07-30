@@ -172,10 +172,12 @@ impl ProcessControlBlock {
                     cpu_times: ProcessCpuTimes::default(),
                     timers: ProcessTimers::default(),
                     vfork_parent: None,
-                    pid_namespace_id: 1,
-                    pid_namespace_parent_id: None,
-                    user_namespace_id: 1,
-                    user_namespace_parent_id: None,
+                    namespaces: super::process::ProcessNamespaceState {
+                        pid_id: 1,
+                        pid_parent_id: None,
+                        user_id: 1,
+                        user_parent_id: None,
+                    },
                     kcmp_resources: KcmpResourceOwners::new(pid),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -291,10 +293,10 @@ impl ProcessControlBlock {
         let personality = parent.personality;
         let membarrier_private_expedited_registered =
             parent.membarrier_private_expedited_registered;
-        let pid_namespace_id = parent.pid_namespace_id;
-        let pid_namespace_parent_id = parent.pid_namespace_parent_id;
-        let user_namespace_id = parent.user_namespace_id;
-        let user_namespace_parent_id = parent.user_namespace_parent_id;
+        let pid_namespace_id = parent.namespaces.pid_id;
+        let pid_namespace_parent_id = parent.namespaces.pid_parent_id;
+        let user_namespace_id = parent.namespaces.user_id;
+        let user_namespace_parent_id = parent.namespaces.user_parent_id;
         let kcmp_resources = parent.kcmp_resources;
         let fs = parent.fs.forked(mount_namespace_id);
         let executable_node = parent.executable_node;
@@ -393,10 +395,12 @@ impl ProcessControlBlock {
                     ),
                     timers: ProcessTimers::default(),
                     vfork_parent: None,
-                    pid_namespace_id,
-                    pid_namespace_parent_id,
-                    user_namespace_id,
-                    user_namespace_parent_id,
+                    namespaces: super::process::ProcessNamespaceState {
+                        pid_id: pid_namespace_id,
+                        pid_parent_id: pid_namespace_parent_id,
+                        user_id: user_namespace_id,
+                        user_parent_id: user_namespace_parent_id,
+                    },
                     kcmp_resources: kcmp_resources.forked(child_pid, clone_flags),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),

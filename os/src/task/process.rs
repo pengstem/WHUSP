@@ -1306,13 +1306,17 @@ pub struct ProcessControlBlockInner {
     pub cpu_times: ProcessCpuTimes,
     pub(crate) timers: ProcessTimers,
     pub(crate) vfork_parent: Option<Arc<TaskControlBlock>>,
-    pub(crate) pid_namespace_id: usize,
-    pub(crate) pid_namespace_parent_id: Option<usize>,
-    pub(crate) user_namespace_id: usize,
-    pub(crate) user_namespace_parent_id: Option<usize>,
+    pub(crate) namespaces: ProcessNamespaceState,
     pub(crate) kcmp_resources: KcmpResourceOwners,
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     pub task_res_allocator: RecycleAllocator,
+}
+
+pub(crate) struct ProcessNamespaceState {
+    pub(crate) pid_id: usize,
+    pub(crate) pid_parent_id: Option<usize>,
+    pub(crate) user_id: usize,
+    pub(crate) user_parent_id: Option<usize>,
 }
 
 fn fd_bitmap_word_count(slot_count: usize) -> usize {
@@ -1669,29 +1673,29 @@ impl ProcessControlBlock {
     pub(crate) fn pid_namespace(&self) -> ProcessNamespace {
         let inner = self.inner_exclusive_access();
         ProcessNamespace {
-            id: inner.pid_namespace_id,
-            parent_id: inner.pid_namespace_parent_id,
+            id: inner.namespaces.pid_id,
+            parent_id: inner.namespaces.pid_parent_id,
         }
     }
 
     pub(crate) fn user_namespace(&self) -> ProcessNamespace {
         let inner = self.inner_exclusive_access();
         ProcessNamespace {
-            id: inner.user_namespace_id,
-            parent_id: inner.user_namespace_parent_id,
+            id: inner.namespaces.user_id,
+            parent_id: inner.namespaces.user_parent_id,
         }
     }
 
     pub(crate) fn enter_new_pid_namespace(&self, id: usize) {
         let mut inner = self.inner_exclusive_access();
-        inner.pid_namespace_parent_id = Some(inner.pid_namespace_id);
-        inner.pid_namespace_id = id;
+        inner.namespaces.pid_parent_id = Some(inner.namespaces.pid_id);
+        inner.namespaces.pid_id = id;
     }
 
     pub(crate) fn enter_new_user_namespace(&self, id: usize) {
         let mut inner = self.inner_exclusive_access();
-        inner.user_namespace_parent_id = Some(inner.user_namespace_id);
-        inner.user_namespace_id = id;
+        inner.namespaces.user_parent_id = Some(inner.namespaces.user_id);
+        inner.namespaces.user_id = id;
     }
 
     pub(crate) fn visible_pid(&self) -> usize {
@@ -1704,13 +1708,13 @@ impl ProcessControlBlock {
         if namespace.parent_id.is_none() {
             return Some(self.pid.0);
         }
-        if inner.pid_namespace_id == namespace.id {
-            if inner.pid_namespace_parent_id.is_some() && self.pid.0 == inner.pid_namespace_id {
+        if inner.namespaces.pid_id == namespace.id {
+            if inner.namespaces.pid_parent_id.is_some() && self.pid.0 == inner.namespaces.pid_id {
                 Some(1)
             } else {
                 Some(self.pid.0)
             }
-        } else if inner.pid_namespace_parent_id == Some(namespace.id) {
+        } else if inner.namespaces.pid_parent_id == Some(namespace.id) {
             Some(self.pid.0)
         } else {
             None
@@ -1908,10 +1912,10 @@ impl ProcessControlBlock {
             credentials: inner.credentials.clone(),
             thread_count: inner.thread_count(),
             mount_namespace_id: inner.fs.mount_namespace_id,
-            pid_namespace_id: inner.pid_namespace_id,
-            pid_namespace_parent_id: inner.pid_namespace_parent_id,
-            user_namespace_id: inner.user_namespace_id,
-            user_namespace_parent_id: inner.user_namespace_parent_id,
+            pid_namespace_id: inner.namespaces.pid_id,
+            pid_namespace_parent_id: inner.namespaces.pid_parent_id,
+            user_namespace_id: inner.namespaces.user_id,
+            user_namespace_parent_id: inner.namespaces.user_parent_id,
             resident_kb,
             locked_kb: inner.memory_set.locked_bytes() / 1024,
             no_new_privs: inner.no_new_privs,
