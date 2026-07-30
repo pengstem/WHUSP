@@ -1774,6 +1774,19 @@ fn oskernel_perf_content() -> String {
          vfs_dirty_writeback_pressure_flushed_pages {}\n\
          vfs_dirty_writeback_pressure_flushed_bytes {}\n\
          vfs_dirty_writeback_pressure_flush_failures {}\n\
+         vfs_dirty_overlay_lock_calls {}\n\
+         vfs_dirty_overlay_lock_contended {}\n\
+         vfs_dirty_overlay_lock_wait_ticks {}\n\
+         vfs_dirty_overlay_lock_hold_ticks {}\n\
+         vfs_dirty_overlay_global_scan_calls {}\n\
+         vfs_dirty_overlay_global_scan_files {}\n\
+         vfs_dirty_overlay_global_scan_pages {}\n\
+         vfs_dirty_overlay_locked_alloc_bytes {}\n\
+         vfs_dirty_overlay_locked_copy_bytes {}\n\
+         vfs_dirty_overlay_pressure_candidates {}\n\
+         vfs_dirty_overlay_pressure_batch_inodes_max {}\n\
+         vfs_dirty_overlay_pressure_batch_pages_max {}\n\
+         vfs_dirty_overlay_pressure_budget_stops {}\n\
          block_cache_enabled {}\n\
          block_cache_metrics_enabled {}\n\
          block_cache_entries {}\n\
@@ -1879,6 +1892,19 @@ fn oskernel_perf_content() -> String {
         dirty_writeback.pressure_flushed_pages,
         dirty_writeback.pressure_flushed_bytes,
         dirty_writeback.pressure_flush_failures,
+        dirty_writeback.overlay_lock_calls,
+        dirty_writeback.overlay_lock_contended,
+        dirty_writeback.overlay_lock_wait_ticks,
+        dirty_writeback.overlay_lock_hold_ticks,
+        dirty_writeback.overlay_global_scan_calls,
+        dirty_writeback.overlay_global_scan_files,
+        dirty_writeback.overlay_global_scan_pages,
+        dirty_writeback.overlay_locked_alloc_bytes,
+        dirty_writeback.overlay_locked_copy_bytes,
+        dirty_writeback.pressure_candidates,
+        dirty_writeback.pressure_batch_inodes_max,
+        dirty_writeback.pressure_batch_pages_max,
+        dirty_writeback.pressure_budget_stops,
         block.enabled as usize,
         block.metrics_enabled as usize,
         block.entries,

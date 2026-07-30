@@ -321,6 +321,7 @@ def run(args: argparse.Namespace) -> int:
             disk=args.test_disk.resolve(),
             aux_disk=disk,
             overlay_root=overlay_root,
+            gdb_port=None,
         )
         (output_dir / "command.txt").write_text(bench.command_text(command), encoding="utf-8")
         process = bench.run_logged(command, output_dir / "serial.log", args.timeout)

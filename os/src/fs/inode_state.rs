@@ -11,9 +11,15 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 
 pub(crate) use dirty::{
-    DIRTY_REGULAR_FILES, DirtyFileCache, DirtyPage, any_regular_file_dirty,
-    sync_dirty_regular_file_count,
+    DirtyFileCache, DirtyPage, any_regular_file_dirty, dirty_inode_states_on_mount,
+    dirty_page_count, dirty_pressure_candidates, lock_dirty_file,
+    record_dirty_overlay_locked_alloc, record_dirty_overlay_locked_copy,
+    record_dirty_overlay_pressure_batch, register_dirty_inode, release_dirty_pages,
+    restore_dirty_pages, set_dirty_page_count, take_dirty_inode, total_dirty_pages,
+    try_reserve_dirty_pages,
 };
+#[cfg(feature = "perf-counters")]
+pub(crate) use dirty::{dirty_overlay_stats_snapshot, dirty_regular_file_count};
 
 const INODE_STATE_SHARDS: usize = 32;
 const DIRECT_STAT_CACHE_SLOTS: usize = 16;
@@ -287,6 +293,9 @@ pub(crate) struct InodeState {
     metadata_version: VersionDomain,
     directory_version: VersionDomain,
     mapping_version: VersionDomain,
+    dirty: SleepMutex<DirtyFileCache>,
+    dirty_page_count: AtomicUsize,
+    on_dirty_list: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -430,6 +439,9 @@ impl InodeState {
             metadata_version: VersionDomain::new(),
             directory_version: VersionDomain::new(),
             mapping_version: VersionDomain::new(),
+            dirty: SleepMutex::new(DirtyFileCache::new()),
+            dirty_page_count: AtomicUsize::new(0),
+            on_dirty_list: AtomicBool::new(false),
         }
     }
 

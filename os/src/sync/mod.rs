@@ -12,7 +12,7 @@ pub use condvar::Condvar;
 pub use irq::LocalIrqGuard;
 pub use raw_sleep_lock::RawSleepLock;
 pub(crate) use read_mostly::ReadMostlySnapshot;
-pub use sleep_mutex::SleepMutex;
+pub use sleep_mutex::{SleepMutex, SleepMutexGuard};
 #[cfg(any(
     feature = "perf-counters",
     debug_assertions,
