@@ -41,7 +41,7 @@ pub(super) enum AfAlgSocketKind {
     Request(UPIntrFreeCell<AfAlgRequestState>),
 }
 
-pub(super) struct AfAlgSocket {
+pub(crate) struct AfAlgSocket {
     pub(super) kind: AfAlgSocketKind,
     pub(super) status_flags: UPIntrFreeCell<OpenFlags>,
     write_ignores_data: bool,
@@ -81,7 +81,7 @@ const AF_ALG_VMAC_ALGS: &[&str] = &[
 ];
 
 impl AfAlgSocket {
-    pub(super) fn new_listener(flags: OpenFlags) -> Arc<Self> {
+    pub(crate) fn new_listener(flags: OpenFlags) -> Arc<Self> {
         Arc::new(Self {
             kind: AfAlgSocketKind::Listener(unsafe {
                 UPIntrFreeCell::new(AfAlgListenerState::default())
@@ -111,7 +111,7 @@ impl AfAlgSocket {
         })
     }
 
-    pub(super) fn validate_socket_type(ty: i32, protocol: i32) -> KResult<()> {
+    pub(crate) fn validate_socket_type(ty: i32, protocol: i32) -> KResult<()> {
         if ty & SOCK_TYPE_MASK != SOCK_SEQPACKET {
             return Err(Errno::EPROTONOSUPPORT);
         }
@@ -121,7 +121,7 @@ impl AfAlgSocket {
         Ok(())
     }
 
-    pub(super) fn bind_alg(&self, addr: LinuxSockAddrAlg) -> KResult<()> {
+    pub(crate) fn bind_alg(&self, addr: LinuxSockAddrAlg) -> KResult<()> {
         if addr.family as i32 != AF_ALG {
             return Err(Errno::EAFNOSUPPORT);
         }
@@ -135,7 +135,7 @@ impl AfAlgSocket {
         Ok(())
     }
 
-    pub(super) fn set_key(&self, key: &[u8]) -> KResult<()> {
+    pub(crate) fn set_key(&self, key: &[u8]) -> KResult<()> {
         let AfAlgSocketKind::Listener(state) = &self.kind else {
             return Err(Errno::EINVAL);
         };
@@ -147,7 +147,7 @@ impl AfAlgSocket {
         Ok(())
     }
 
-    pub(super) fn accept_request(&self, flags: OpenFlags) -> KResult<Arc<Self>> {
+    pub(crate) fn accept_request(&self, flags: OpenFlags) -> KResult<Arc<Self>> {
         let AfAlgSocketKind::Listener(state) = &self.kind else {
             return Err(Errno::EINVAL);
         };
@@ -159,7 +159,7 @@ impl AfAlgSocket {
         Ok(Self::new_request(binding, flags))
     }
 
-    pub(super) fn send_msg(&self, msg: LinuxMsghdr) -> KResult<usize> {
+    pub(crate) fn send_msg(&self, msg: LinuxMsghdr) -> KResult<usize> {
         if msg.msg_name != 0 || msg.msg_namelen != 0 {
             return Err(Errno::EINVAL);
         }

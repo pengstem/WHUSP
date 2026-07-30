@@ -1,4 +1,25 @@
-use super::*;
+use super::{close_detached_fd_entry, install_file_fd};
+use crate::fs::{File, OpenFlags};
+use crate::mm::UserBuffer;
+use crate::net::socket::*;
+use crate::syscall::user_ptr::{
+    UserBufferAccess, copy_to_user, read_user_array_item, read_user_value,
+    read_user_value_with_mmap_fault, translated_byte_buffer_checked, write_user_value,
+};
+use crate::task::{
+    FdTableEntry, SignalFlags, current_add_signal, current_process, current_user_token,
+};
+use crate::uapi::errno::{Errno, KResult};
+use crate::uapi::linux::fs::LinuxIovec;
+use crate::uapi::linux::net::*;
+use alloc::string::ToString;
+use alloc::sync::Arc;
+use core::mem::size_of;
+
+const SOCK_NONBLOCK: i32 = OpenFlags::NONBLOCK.bits() as i32;
+const SOCK_CLOEXEC: i32 = OpenFlags::CLOEXEC.bits() as i32;
+const VALID_SOCKET_TYPE_FLAGS: i32 = SOCK_NONBLOCK | SOCK_CLOEXEC;
+const VALID_ACCEPT4_FLAGS: i32 = SOCK_NONBLOCK | SOCK_CLOEXEC;
 
 fn open_flags_from_socket_type(ty: i32) -> KResult<OpenFlags> {
     if ty & !(SOCK_TYPE_MASK | VALID_SOCKET_TYPE_FLAGS) != 0 {
@@ -209,38 +230,7 @@ pub fn sys_socketpair(domain: i32, ty: i32, protocol: i32, sv: usize) -> KResult
     let kind = socket_kind_from_type(ty)?;
     let flags = open_flags_from_socket_type(ty)?;
 
-    let endpoint = InetEndpoint {
-        ip: LOOPBACK_IP,
-        port: 0,
-    };
-    let first_inner = Arc::new(unsafe {
-        UPIntrFreeCell::new(LocalSocketInner::connected(
-            SocketDomain::Unix,
-            kind,
-            endpoint,
-            endpoint,
-            None,
-            ShutdownState::OPEN,
-            None,
-            None,
-        ))
-    });
-    let second_inner = Arc::new(unsafe {
-        UPIntrFreeCell::new(LocalSocketInner::connected(
-            SocketDomain::Unix,
-            kind,
-            endpoint,
-            endpoint,
-            Some(Arc::downgrade(&first_inner)),
-            ShutdownState::OPEN,
-            None,
-            None,
-        ))
-    });
-    first_inner.exclusive_access().peer_socket = Some(Arc::downgrade(&second_inner));
-
-    let first = LocalSocket::from_inner(first_inner, flags);
-    let second = LocalSocket::from_inner(second_inner, flags);
+    let (first, second) = LocalSocket::new_pair(kind, flags);
     let fds = {
         let process = current_process();
         let mut inner = process.inner_exclusive_access();

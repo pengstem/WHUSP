@@ -7,7 +7,7 @@ pub(crate) mod keyring;
 mod kmodule;
 mod memory;
 pub(crate) mod msg;
-pub(crate) use crate::net::socket::syscall_adapter as net;
+mod net;
 mod process;
 #[cfg(feature = "read-mostly-probe")]
 mod read_mostly_probe;

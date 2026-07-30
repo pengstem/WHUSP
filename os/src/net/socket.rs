@@ -11,10 +11,9 @@ mod alg;
 mod file;
 #[path = "netlink.rs"]
 mod netlink;
-#[path = "../syscall/net.rs"]
-pub(crate) mod syscall_adapter;
 
-use alg::{AfAlgSendParams, AfAlgSocket, AfAlgSocketKind};
+pub(crate) use alg::AfAlgSocket;
+use alg::{AfAlgSendParams, AfAlgSocketKind};
 use netlink::build_netlink_route_responses;
 
 use crate::config::PAGE_SIZE;
@@ -26,14 +25,11 @@ use crate::mm::UserBuffer;
 use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::user_ptr::{
-    UserBufferAccess, copy_to_user, read_user_array_item, read_user_value,
-    read_user_value_with_mmap_fault, translated_byte_buffer_checked,
-    translated_byte_buffer_checked_with_mmap_fault, write_user_value,
+    UserBufferAccess, read_user_array_item, read_user_value,
+    translated_byte_buffer_checked_with_mmap_fault,
 };
-use crate::syscall::{close_detached_fd_entry, install_file_fd};
 use crate::task::{
-    FdTableEntry, SignalFlags, TaskControlBlock,
-    block_current_task_no_schedule_unless_unmasked_signal, current_add_signal,
+    TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
     current_has_unmasked_signal, current_process, current_task, current_user_token, schedule,
     wakeup_task,
 };
@@ -48,10 +44,6 @@ use alloc::{vec, vec::Vec};
 use core::mem::size_of;
 use lazy_static::lazy_static;
 
-const SOCK_NONBLOCK: i32 = OpenFlags::NONBLOCK.bits() as i32;
-const SOCK_CLOEXEC: i32 = OpenFlags::CLOEXEC.bits() as i32;
-const VALID_SOCKET_TYPE_FLAGS: i32 = SOCK_NONBLOCK | SOCK_CLOEXEC;
-const VALID_ACCEPT4_FLAGS: i32 = SOCK_NONBLOCK | SOCK_CLOEXEC;
 const ADDRCONFIG_IF_INDEX: i32 = 2;
 const ADDRCONFIG_IP: [u8; 4] = [10, 0, 2, 15];
 const LOOPBACK_IP: [u8; 4] = [127, 0, 0, 1];
@@ -71,7 +63,7 @@ lazy_static! {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SocketDomain {
+pub(crate) enum SocketDomain {
     Unix,
     Inet,
     Inet6,
@@ -80,31 +72,31 @@ enum SocketDomain {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SocketKind {
+pub(crate) enum SocketKind {
     Stream,
     Datagram,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct InetEndpoint {
-    ip: [u8; 4],
-    port: u16,
+pub(crate) struct InetEndpoint {
+    pub(crate) ip: [u8; 4],
+    pub(crate) port: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-enum UnixAddress {
+pub(crate) enum UnixAddress {
     Pathname(String),
     Abstract(Vec<u8>),
 }
 
 #[derive(Clone, Debug)]
-enum UnixSockAddr {
+pub(crate) enum UnixSockAddr {
     Unnamed,
     Named(UnixAddress),
 }
 
 #[derive(Clone, Debug)]
-enum SocketAddress {
+pub(crate) enum SocketAddress {
     Inet(InetEndpoint),
     Inet6(InetEndpoint),
     Netlink,
@@ -644,11 +636,48 @@ fn drain_socket_write_poll_waiters(
 }
 
 impl LocalSocket {
-    fn new(domain: SocketDomain, kind: SocketKind, flags: OpenFlags) -> Arc<Self> {
+    pub(crate) fn new(domain: SocketDomain, kind: SocketKind, flags: OpenFlags) -> Arc<Self> {
         Arc::new(Self {
             inner: Arc::new(unsafe { UPIntrFreeCell::new(LocalSocketInner::new(domain, kind)) }),
             status_flags: unsafe { UPIntrFreeCell::new(flags) },
         })
+    }
+
+    pub(crate) fn new_pair(kind: SocketKind, flags: OpenFlags) -> (Arc<Self>, Arc<Self>) {
+        let endpoint = InetEndpoint {
+            ip: LOOPBACK_IP,
+            port: 0,
+        };
+        let first_inner = Arc::new(unsafe {
+            UPIntrFreeCell::new(LocalSocketInner::connected(
+                SocketDomain::Unix,
+                kind,
+                endpoint,
+                endpoint,
+                None,
+                ShutdownState::OPEN,
+                None,
+                None,
+            ))
+        });
+        let second_inner = Arc::new(unsafe {
+            UPIntrFreeCell::new(LocalSocketInner::connected(
+                SocketDomain::Unix,
+                kind,
+                endpoint,
+                endpoint,
+                Some(Arc::downgrade(&first_inner)),
+                ShutdownState::OPEN,
+                None,
+                None,
+            ))
+        });
+        first_inner.exclusive_access().peer_socket = Some(Arc::downgrade(&second_inner));
+
+        (
+            Self::from_inner(first_inner, flags),
+            Self::from_inner(second_inner, flags),
+        )
     }
 
     fn from_inner(inner: Arc<UPIntrFreeCell<LocalSocketInner>>, flags: OpenFlags) -> Arc<Self> {
@@ -658,15 +687,15 @@ impl LocalSocket {
         })
     }
 
-    fn kind(&self) -> SocketKind {
+    pub(crate) fn kind(&self) -> SocketKind {
         self.inner.exclusive_access().kind
     }
 
-    fn domain(&self) -> SocketDomain {
+    pub(crate) fn domain(&self) -> SocketDomain {
         self.inner.exclusive_access().domain
     }
 
-    fn bind_address(&self, address: SocketAddress) -> KResult {
+    pub(crate) fn bind_address(&self, address: SocketAddress) -> KResult {
         let domain = self.inner.exclusive_access().domain;
         match (domain, address) {
             (SocketDomain::Inet, SocketAddress::Inet(endpoint)) => self.bind_endpoint(endpoint),
@@ -798,7 +827,7 @@ impl LocalSocket {
         Ok(endpoint)
     }
 
-    fn listen(&self, backlog: i32) -> KResult {
+    pub(crate) fn listen(&self, backlog: i32) -> KResult {
         let backlog = backlog.clamp(1, MAX_LISTEN_BACKLOG as i32) as usize;
         let local = self.ensure_bound(SocketKind::Stream)?;
         {
@@ -821,7 +850,7 @@ impl LocalSocket {
         Ok(0)
     }
 
-    fn accept(&self, nonblock: bool) -> KResult<Arc<LocalSocket>> {
+    pub(crate) fn accept(&self, nonblock: bool) -> KResult<Arc<LocalSocket>> {
         loop {
             let task_cx_ptr = {
                 let mut inner = self.inner.exclusive_access();
@@ -879,7 +908,7 @@ impl LocalSocket {
         }
     }
 
-    fn connect(&self, remote: SocketAddress) -> KResult {
+    pub(crate) fn connect(&self, remote: SocketAddress) -> KResult {
         let (remote, unix_peer) = self.resolve_remote_address(remote)?;
         match self.kind() {
             SocketKind::Datagram => {
@@ -997,7 +1026,7 @@ impl LocalSocket {
         }
     }
 
-    fn send_bytes(
+    pub(crate) fn send_bytes(
         &self,
         data: Vec<u8>,
         remote: Option<SocketAddress>,
@@ -1305,7 +1334,7 @@ impl LocalSocket {
         Ok(request.len())
     }
 
-    fn recv_bytes(
+    pub(crate) fn recv_bytes(
         &self,
         buf: UserBuffer,
         nonblock: bool,
@@ -1428,7 +1457,7 @@ impl LocalSocket {
         }
     }
 
-    fn recv_raw_datagram(&self, nonblock: bool) -> KResult<Vec<u8>> {
+    pub(crate) fn recv_raw_datagram(&self, nonblock: bool) -> KResult<Vec<u8>> {
         loop {
             let (packet, writer, write_waiters) = {
                 let mut inner = self.inner.exclusive_access();
@@ -1464,7 +1493,7 @@ impl LocalSocket {
         }
     }
 
-    fn local_address(&self) -> SocketAddress {
+    pub(crate) fn local_address(&self) -> SocketAddress {
         let inner = self.inner.exclusive_access();
         match inner.domain {
             SocketDomain::Inet => SocketAddress::Inet(inner.local.unwrap_or(InetEndpoint {
@@ -1487,7 +1516,7 @@ impl LocalSocket {
         }
     }
 
-    fn peer_address(&self) -> KResult<SocketAddress> {
+    pub(crate) fn peer_address(&self) -> KResult<SocketAddress> {
         let inner = self.inner.exclusive_access();
         let peer = inner.peer.ok_or(Errno::ENOTCONN)?;
         Ok(match inner.domain {
@@ -1502,15 +1531,15 @@ impl LocalSocket {
         })
     }
 
-    fn set_reuse_addr(&self, enabled: bool) {
+    pub(crate) fn set_reuse_addr(&self, enabled: bool) {
         self.inner.exclusive_access().reuse_addr = enabled;
     }
 
-    fn set_bind_address_no_port(&self, enabled: bool) {
+    pub(crate) fn set_bind_address_no_port(&self, enabled: bool) {
         self.inner.exclusive_access().bind_address_no_port = enabled;
     }
 
-    fn set_buffer_size(&self, optname: i32, value: i32) {
+    pub(crate) fn set_buffer_size(&self, optname: i32, value: i32) {
         let mut inner = self.inner.exclusive_access();
         match optname {
             SO_SNDBUF => inner.sndbuf = value,
@@ -1519,13 +1548,13 @@ impl LocalSocket {
         }
     }
 
-    fn ensure_packet_domain(&self) -> KResult<()> {
+    pub(crate) fn ensure_packet_domain(&self) -> KResult<()> {
         (self.inner.exclusive_access().domain == SocketDomain::Packet)
             .then_some(())
             .ok_or(Errno::ENOPROTOOPT)
     }
 
-    fn set_packet_version(&self, version: i32) -> KResult<()> {
+    pub(crate) fn set_packet_version(&self, version: i32) -> KResult<()> {
         self.ensure_packet_domain()?;
         if !(TPACKET_V1..=TPACKET_V3).contains(&version) {
             return Err(Errno::EINVAL);
@@ -1534,7 +1563,7 @@ impl LocalSocket {
         Ok(())
     }
 
-    fn set_packet_reserve(&self, reserve: u32) -> KResult<()> {
+    pub(crate) fn set_packet_reserve(&self, reserve: u32) -> KResult<()> {
         self.ensure_packet_domain()?;
         // CONTEXT: Packet mmap buffers are not allocated by this kernel. Cap
         // the visible reserve to one page so CVE probes cannot observe a
@@ -1543,7 +1572,7 @@ impl LocalSocket {
         Ok(())
     }
 
-    fn set_packet_rx_ring(&self, req: LinuxTPacketReq3) -> KResult<()> {
+    pub(crate) fn set_packet_rx_ring(&self, req: LinuxTPacketReq3) -> KResult<()> {
         self.ensure_packet_domain()?;
         if req.tp_block_size == 0 || req.tp_sizeof_priv >= req.tp_block_size {
             return Err(Errno::EINVAL);
@@ -1560,7 +1589,7 @@ impl LocalSocket {
         Ok(())
     }
 
-    fn get_int_option(&self, level: i32, optname: i32) -> KResult<i32> {
+    pub(crate) fn get_int_option(&self, level: i32, optname: i32) -> KResult<i32> {
         let inner = self.inner.exclusive_access();
         match (level, optname) {
             (SOL_SOCKET, SO_TYPE) => Ok(match inner.kind {
@@ -1591,7 +1620,7 @@ impl LocalSocket {
         }
     }
 
-    fn shutdown(&self, how: i32) -> KResult {
+    pub(crate) fn shutdown(&self, how: i32) -> KResult {
         if !matches!(how, SHUT_RD | SHUT_WR | SHUT_RDWR) {
             return Err(Errno::EINVAL);
         }
@@ -1731,14 +1760,14 @@ fn normalize_remote_endpoint(endpoint: &mut InetEndpoint) -> KResult<()> {
     Ok(())
 }
 
-fn sockaddr_to_endpoint(addr: LinuxSockAddrIn) -> InetEndpoint {
+pub(crate) fn sockaddr_to_endpoint(addr: LinuxSockAddrIn) -> InetEndpoint {
     InetEndpoint {
         ip: addr.addr.to_ne_bytes(),
         port: u16::from_be(addr.port_be),
     }
 }
 
-fn sockaddr_in6_to_endpoint(addr: LinuxSockAddrIn6) -> KResult<InetEndpoint> {
+pub(crate) fn sockaddr_in6_to_endpoint(addr: LinuxSockAddrIn6) -> KResult<InetEndpoint> {
     let ip = if addr.addr == ANY_IPV6 {
         ANY_IP
     } else if addr.addr == LOOPBACK_IPV6 {
@@ -1757,7 +1786,7 @@ fn sockaddr_in6_to_endpoint(addr: LinuxSockAddrIn6) -> KResult<InetEndpoint> {
     })
 }
 
-fn endpoint_to_sockaddr(endpoint: InetEndpoint) -> LinuxSockAddrIn {
+pub(crate) fn endpoint_to_sockaddr(endpoint: InetEndpoint) -> LinuxSockAddrIn {
     LinuxSockAddrIn {
         family: AF_INET as u16,
         port_be: endpoint.port.to_be(),
@@ -1766,7 +1795,7 @@ fn endpoint_to_sockaddr(endpoint: InetEndpoint) -> LinuxSockAddrIn {
     }
 }
 
-fn endpoint_to_sockaddr_in6(endpoint: InetEndpoint) -> LinuxSockAddrIn6 {
+pub(crate) fn endpoint_to_sockaddr_in6(endpoint: InetEndpoint) -> LinuxSockAddrIn6 {
     let mut mapped = [0u8; 16];
     mapped[10] = 0xff;
     mapped[11] = 0xff;
@@ -1820,7 +1849,7 @@ fn lookup_unix_endpoint(address: &UnixAddress) -> KResult<InetEndpoint> {
     }
 }
 
-fn copy_user_to_vec(token: usize, ptr: usize, len: usize) -> KResult<Vec<u8>> {
+pub(crate) fn copy_user_to_vec(token: usize, ptr: usize, len: usize) -> KResult<Vec<u8>> {
     let mut data = Vec::with_capacity(len);
     for slice in translated_byte_buffer_checked_with_mmap_fault(
         token,
@@ -1833,7 +1862,7 @@ fn copy_user_to_vec(token: usize, ptr: usize, len: usize) -> KResult<Vec<u8>> {
     Ok(data)
 }
 
-fn read_msg_iovecs(token: usize, iov: usize, iovlen: usize) -> KResult<Vec<u8>> {
+pub(crate) fn read_msg_iovecs(token: usize, iov: usize, iovlen: usize) -> KResult<Vec<u8>> {
     if iovlen == 0 {
         return Ok(Vec::new());
     }
