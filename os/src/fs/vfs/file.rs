@@ -1365,7 +1365,7 @@ impl VfsFile {
     fn with_backend<V>(
         &self,
         op: BackendOp,
-        f: impl FnOnce(&dyn super::ConcurrentFileSystemBackend) -> V,
+        f: impl FnOnce(&dyn super::FileSystemBackend) -> V,
     ) -> V {
         self.mount_backend.call(op, f)
     }

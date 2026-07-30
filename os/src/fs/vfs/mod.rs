@@ -8,8 +8,9 @@ mod path;
 pub(crate) use backend::BackendIoSnapshot;
 pub(crate) use backend::{
     BackendDirectoryEntry, BackendDirectoryReadPlan, BackendDirectorySnapshot, BackendOp,
-    BackendReadPlan, BackendWritePlan, ConcurrentFileSystemBackend, FileSystemStat, FsNodeKind,
-    InodeRelease, LegacyFileSystemBackend, SerializedBackend,
+    BackendReadPlan, BackendWritePlan, DataOps, FileSystemBackend, FileSystemStat, FsNodeKind,
+    InodeLifecycleOps, InodeRelease, LegacyFileSystemBackend, LookupOps, MetadataOps, NamespaceOps,
+    SerializedBackend, SyncOps,
 };
 pub(crate) use error::{FsError, FsResult};
 #[cfg(feature = "perf-counters")]

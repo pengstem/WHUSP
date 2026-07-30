@@ -6,8 +6,9 @@ use super::dirent::{
 use super::vfs::BackendIoSnapshot;
 use super::vfs::{
     BackendDirectoryEntry, BackendDirectoryReadPlan, BackendDirectorySnapshot, BackendOp,
-    BackendReadPlan, BackendWritePlan, ConcurrentFileSystemBackend, FileSystemStat, FsError,
-    FsNodeKind, FsResult, InodeRelease, LegacyFileSystemBackend,
+    BackendReadPlan, BackendWritePlan, DataOps, FileSystemStat, FsError, FsNodeKind, FsResult,
+    InodeLifecycleOps, InodeRelease, LegacyFileSystemBackend, LookupOps, MetadataOps, NamespaceOps,
+    SyncOps,
 };
 use super::{FS_STATX_ATTR_FLAGS, FileStat, FileTimestamp};
 use crate::drivers::block::VirtIOBlock;
@@ -2819,19 +2820,13 @@ impl LegacyFileSystemBackend for Ext4Mount {
     }
 }
 
-impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
+impl LookupOps for ConcurrentExt4Backend {
     fn root_ino(&self) -> u32 {
         EXT4_ROOT_INO
     }
 
     fn overlay_real_node(&self, _ino: u32) -> Option<super::vfs::VfsNodeId> {
         None
-    }
-
-    fn statfs(&self) -> FileSystemStat {
-        // Allocator counters are maintained by the canonical writable core;
-        // statfs therefore uses the remaining exclusive superblock accessor.
-        self.with_writer_read(BackendOp::StatFull, |writer| writer.statfs_shared())
     }
 
     fn lookup_component_from(
@@ -2844,6 +2839,204 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         })
     }
 
+    fn readlink(&self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
+        self.with_reader(BackendOp::Readlink, ino, |reader| {
+            reader.readlink_shared(ino, buf)
+        })
+    }
+
+    fn prepare_readlink_plan(&self, ino: u32, len: usize) -> Option<Box<dyn BackendReadPlan>> {
+        // This phase reads only inode/mapping metadata. External target data
+        // is fetched by the returned pointer-free plan after the reader core
+        // lock has been released.
+        self.with_reader(BackendOp::ReadPlan, ino, |reader| {
+            reader.prepare_readlink_plan_shared(ino, len)
+        })
+    }
+
+    fn prepare_directory_read_plan(
+        &self,
+        ino: u32,
+        offset: u64,
+    ) -> Option<Box<dyn BackendDirectoryReadPlan>> {
+        self.with_reader(BackendOp::ReadPlan, ino, |reader| {
+            reader.prepare_directory_read_plan_shared(ino, offset)
+        })
+    }
+
+    fn read_dirent64(&self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
+        self.with_reader(BackendOp::Readdir, ino, |reader| {
+            reader.read_dirent64_shared(ino, offset, buf)
+        })
+    }
+
+    fn list_root_names(&self) -> Vec<String> {
+        if let Some(plan) = self.with_reader(BackendOp::ReadPlan, EXT4_ROOT_INO, |reader| {
+            reader.prepare_directory_read_plan_shared(EXT4_ROOT_INO, 0)
+        }) {
+            return plan
+                .execute()
+                .expect("failed to execute ext4 root directory snapshot")
+                .names();
+        }
+        self.with_reader(BackendOp::Readdir, EXT4_ROOT_INO, |reader| {
+            reader.list_root_names_shared()
+        })
+    }
+}
+
+impl MetadataOps for ConcurrentExt4Backend {
+    fn statfs(&self) -> FileSystemStat {
+        // Allocator counters are maintained by the canonical writable core;
+        // statfs therefore uses the remaining exclusive superblock accessor.
+        self.with_writer_read(BackendOp::StatFull, |writer| writer.statfs_shared())
+    }
+
+    fn set_times(
+        &self,
+        ino: u32,
+        atime: Option<FileTimestamp>,
+        mtime: Option<FileTimestamp>,
+        ctime: FileTimestamp,
+    ) -> FsResult {
+        self.mutate_inode_metadata(
+            ino,
+            Ext4InodeMetadataMutation::Times {
+                atime,
+                mtime,
+                ctime,
+            },
+        )
+    }
+
+    fn set_mode(&self, ino: u32, mode: u32) -> FsResult {
+        self.mutate_inode_metadata(ino, Ext4InodeMetadataMutation::Mode(mode))
+    }
+
+    fn set_owner(&self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
+        self.mutate_inode_metadata(ino, Ext4InodeMetadataMutation::Owner { uid, gid })
+    }
+
+    fn inode_flags(&self, ino: u32) -> FsResult<u32> {
+        self.with_reader(BackendOp::StatFull, ino, |reader| {
+            reader.inode_flags_shared(ino)
+        })
+    }
+
+    fn set_inode_flags(&self, ino: u32, flags: u32) -> FsResult {
+        self.mutate_inode_metadata(ino, Ext4InodeMetadataMutation::Flags(flags))
+    }
+
+    fn assign_cgroup_pid(&self, _dir_ino: u32, _pid: usize) -> FsResult {
+        Err(FsError::InvalidInput)
+    }
+
+    fn stat(&self, ino: u32) -> FsResult<FileStat> {
+        self.with_reader(BackendOp::StatFull, ino, |reader| reader.stat_shared(ino))
+    }
+
+    fn stat_basic(&self, ino: u32) -> FsResult<FileStat> {
+        self.with_reader(BackendOp::StatBasic, ino, |reader| {
+            reader.stat_basic_shared(ino)
+        })
+    }
+}
+
+impl DataOps for ConcurrentExt4Backend {
+    fn check_write_at(&self, _ino: u32, _offset: u64, _len: usize) -> FsResult {
+        Ok(())
+    }
+
+    fn check_set_len(&self, _ino: u32, _len: u64) -> FsResult {
+        Ok(())
+    }
+
+    fn set_len(&self, ino: u32, len: u64) -> FsResult {
+        self.mutate(BackendOp::TruncateAllocate, |writer| {
+            writer.set_len(ino, len)
+        })
+    }
+
+    fn allocate_range(&self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
+        self.mutate(BackendOp::TruncateAllocate, |writer| {
+            writer.allocate_range(ino, offset, len, keep_size)
+        })
+    }
+
+    fn zero_range(&self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
+        self.mutate(BackendOp::TruncateAllocate, |writer| {
+            writer.zero_range(ino, offset, len, keep_size)
+        })
+    }
+
+    fn punch_hole(&self, ino: u32, offset: u64, len: u64) -> FsResult {
+        self.mutate(BackendOp::TruncateAllocate, |writer| {
+            writer.punch_hole(ino, offset, len)
+        })
+    }
+
+    fn supports_read_snapshot(&self, _ino: u32) -> bool {
+        false
+    }
+
+    fn read_snapshot(&self, _ino: u32) -> Option<FsResult<Vec<u8>>> {
+        None
+    }
+
+    fn prepare_read_plan(
+        &self,
+        ino: u32,
+        offset: u64,
+        len: usize,
+    ) -> Option<Box<dyn BackendReadPlan>> {
+        self.with_reader(BackendOp::ReadPlan, ino, |reader| {
+            reader.prepare_read_plan_shared(ino, offset, len)
+        })
+    }
+
+    fn read_at(&self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
+        self.with_reader(BackendOp::ReadFallback, ino, |reader| {
+            reader.read_at_shared(ino, buf, offset)
+        })
+    }
+
+    fn prepare_write_plan(
+        &self,
+        ino: u32,
+        offset: u64,
+        len: usize,
+    ) -> Option<Box<dyn BackendWritePlan>> {
+        // Mapping lookup and canonical-cache alias invalidation are short
+        // control operations. The returned pointer-free plan owns physical
+        // LBA leases while device I/O runs after the core guard is released.
+        perf::record_ext4_write_plan_attempt();
+        let prepared = self.with_writer_read(BackendOp::Write, |writer| {
+            let prepared = writer.prepare_mapped_write_plan(ino, offset, len)?;
+            let lease = self.write_leases.reserve(&prepared.fs_blocks)?;
+            let aliases = writer.invalidate_mapped_write_aliases(&prepared.fs_blocks)?;
+            Some((prepared, lease, aliases))
+        });
+
+        let Some((prepared, lease, aliases)) = prepared else {
+            perf::record_ext4_write_plan_fallback(false);
+            return None;
+        };
+        perf::record_ext4_write_plan_prepared(
+            prepared.runs.len(),
+            prepared.fs_blocks.len(),
+            aliases,
+        );
+        Some(Box::new(prepared.publish(lease)))
+    }
+
+    fn write_at(&self, ino: u32, buf: &[u8], offset: u64) -> usize {
+        let (written, visible) =
+            self.with_writer(BackendOp::Write, |writer| writer.write_at(ino, buf, offset));
+        if visible.is_ok() { written } else { 0 }
+    }
+}
+
+impl NamespaceOps for ConcurrentExt4Backend {
     fn create_node_with_owner(
         &self,
         parent_ino: u32,
@@ -2913,39 +3106,9 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
             writer.exchange(src_dir, src_name, dst_dir, dst_name)
         })
     }
+}
 
-    fn check_write_at(&self, _ino: u32, _offset: u64, _len: usize) -> FsResult {
-        Ok(())
-    }
-
-    fn check_set_len(&self, _ino: u32, _len: u64) -> FsResult {
-        Ok(())
-    }
-
-    fn set_len(&self, ino: u32, len: u64) -> FsResult {
-        self.mutate(BackendOp::TruncateAllocate, |writer| {
-            writer.set_len(ino, len)
-        })
-    }
-
-    fn allocate_range(&self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
-        self.mutate(BackendOp::TruncateAllocate, |writer| {
-            writer.allocate_range(ino, offset, len, keep_size)
-        })
-    }
-
-    fn zero_range(&self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
-        self.mutate(BackendOp::TruncateAllocate, |writer| {
-            writer.zero_range(ino, offset, len, keep_size)
-        })
-    }
-
-    fn punch_hole(&self, ino: u32, offset: u64, len: u64) -> FsResult {
-        self.mutate(BackendOp::TruncateAllocate, |writer| {
-            writer.punch_hole(ino, offset, len)
-        })
-    }
-
+impl SyncOps for ConcurrentExt4Backend {
     fn sync(&self, _ino: u32, _data_only: bool) -> FsResult {
         self.sync_current()
     }
@@ -2954,42 +3117,9 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         self.sync_current()?;
         self.mutate(BackendOp::Sync, |writer| writer.shutdown())
     }
+}
 
-    fn set_times(
-        &self,
-        ino: u32,
-        atime: Option<FileTimestamp>,
-        mtime: Option<FileTimestamp>,
-        ctime: FileTimestamp,
-    ) -> FsResult {
-        self.mutate_inode_metadata(
-            ino,
-            Ext4InodeMetadataMutation::Times {
-                atime,
-                mtime,
-                ctime,
-            },
-        )
-    }
-
-    fn set_mode(&self, ino: u32, mode: u32) -> FsResult {
-        self.mutate_inode_metadata(ino, Ext4InodeMetadataMutation::Mode(mode))
-    }
-
-    fn set_owner(&self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
-        self.mutate_inode_metadata(ino, Ext4InodeMetadataMutation::Owner { uid, gid })
-    }
-
-    fn inode_flags(&self, ino: u32) -> FsResult<u32> {
-        self.with_reader(BackendOp::StatFull, ino, |reader| {
-            reader.inode_flags_shared(ino)
-        })
-    }
-
-    fn set_inode_flags(&self, ino: u32, flags: u32) -> FsResult {
-        self.mutate_inode_metadata(ino, Ext4InodeMetadataMutation::Flags(flags))
-    }
-
+impl InodeLifecycleOps for ConcurrentExt4Backend {
     fn retain_inode(&self, ino: u32) -> FsResult {
         self.with_reader(BackendOp::InodeLifetime, ino, |reader| {
             let mut attr = lwext4_rust::FileAttr::default();
@@ -3021,125 +3151,6 @@ impl ConcurrentFileSystemBackend for ConcurrentExt4Backend {
         }
         self.try_mutate(BackendOp::InodeLifetime, |writer| {
             writer.free_unlinked_inode(ino)
-        })
-    }
-
-    fn assign_cgroup_pid(&self, _dir_ino: u32, _pid: usize) -> FsResult {
-        Err(FsError::InvalidInput)
-    }
-
-    fn stat(&self, ino: u32) -> FsResult<FileStat> {
-        self.with_reader(BackendOp::StatFull, ino, |reader| reader.stat_shared(ino))
-    }
-
-    fn stat_basic(&self, ino: u32) -> FsResult<FileStat> {
-        self.with_reader(BackendOp::StatBasic, ino, |reader| {
-            reader.stat_basic_shared(ino)
-        })
-    }
-
-    fn readlink(&self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
-        self.with_reader(BackendOp::Readlink, ino, |reader| {
-            reader.readlink_shared(ino, buf)
-        })
-    }
-
-    fn prepare_readlink_plan(&self, ino: u32, len: usize) -> Option<Box<dyn BackendReadPlan>> {
-        // This phase reads only inode/mapping metadata. External target data
-        // is fetched by the returned pointer-free plan after the reader core
-        // lock has been released.
-        self.with_reader(BackendOp::ReadPlan, ino, |reader| {
-            reader.prepare_readlink_plan_shared(ino, len)
-        })
-    }
-
-    fn supports_read_snapshot(&self, _ino: u32) -> bool {
-        false
-    }
-
-    fn read_snapshot(&self, _ino: u32) -> Option<FsResult<Vec<u8>>> {
-        None
-    }
-
-    fn prepare_read_plan(
-        &self,
-        ino: u32,
-        offset: u64,
-        len: usize,
-    ) -> Option<Box<dyn BackendReadPlan>> {
-        self.with_reader(BackendOp::ReadPlan, ino, |reader| {
-            reader.prepare_read_plan_shared(ino, offset, len)
-        })
-    }
-
-    fn read_at(&self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
-        self.with_reader(BackendOp::ReadFallback, ino, |reader| {
-            reader.read_at_shared(ino, buf, offset)
-        })
-    }
-
-    fn prepare_write_plan(
-        &self,
-        ino: u32,
-        offset: u64,
-        len: usize,
-    ) -> Option<Box<dyn BackendWritePlan>> {
-        // Mapping lookup and canonical-cache alias invalidation are short
-        // control operations. The returned pointer-free plan owns physical
-        // LBA leases while device I/O runs after the core guard is released.
-        perf::record_ext4_write_plan_attempt();
-        let prepared = self.with_writer_read(BackendOp::Write, |writer| {
-            let prepared = writer.prepare_mapped_write_plan(ino, offset, len)?;
-            let lease = self.write_leases.reserve(&prepared.fs_blocks)?;
-            let aliases = writer.invalidate_mapped_write_aliases(&prepared.fs_blocks)?;
-            Some((prepared, lease, aliases))
-        });
-
-        let Some((prepared, lease, aliases)) = prepared else {
-            perf::record_ext4_write_plan_fallback(false);
-            return None;
-        };
-        perf::record_ext4_write_plan_prepared(
-            prepared.runs.len(),
-            prepared.fs_blocks.len(),
-            aliases,
-        );
-        Some(Box::new(prepared.publish(lease)))
-    }
-
-    fn write_at(&self, ino: u32, buf: &[u8], offset: u64) -> usize {
-        let (written, visible) =
-            self.with_writer(BackendOp::Write, |writer| writer.write_at(ino, buf, offset));
-        if visible.is_ok() { written } else { 0 }
-    }
-
-    fn prepare_directory_read_plan(
-        &self,
-        ino: u32,
-        offset: u64,
-    ) -> Option<Box<dyn BackendDirectoryReadPlan>> {
-        self.with_reader(BackendOp::ReadPlan, ino, |reader| {
-            reader.prepare_directory_read_plan_shared(ino, offset)
-        })
-    }
-
-    fn read_dirent64(&self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
-        self.with_reader(BackendOp::Readdir, ino, |reader| {
-            reader.read_dirent64_shared(ino, offset, buf)
-        })
-    }
-
-    fn list_root_names(&self) -> Vec<String> {
-        if let Some(plan) = self.with_reader(BackendOp::ReadPlan, EXT4_ROOT_INO, |reader| {
-            reader.prepare_directory_read_plan_shared(EXT4_ROOT_INO, 0)
-        }) {
-            return plan
-                .execute()
-                .expect("failed to execute ext4 root directory snapshot")
-                .names();
-        }
-        self.with_reader(BackendOp::Readdir, EXT4_ROOT_INO, |reader| {
-            reader.list_root_names_shared()
         })
     }
 }

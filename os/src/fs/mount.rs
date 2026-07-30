@@ -9,9 +9,8 @@ use super::path::WorkingDir;
 use super::procfs::ProcFs;
 use super::tmpfs::{EXT234_SUPER_MAGIC, TmpFs};
 use super::vfs::{
-    BackendOp, ConcurrentFileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult,
-    InodeRelease, LegacyFileSystemBackend, SerializedBackend, VfsNodeId,
-    mount_has_writable_regular_open,
+    BackendOp, FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult, InodeRelease,
+    LegacyFileSystemBackend, SerializedBackend, VfsNodeId, mount_has_writable_regular_open,
 };
 use crate::config::MAX_CPUS;
 use crate::drivers::block::BLOCK_DEVICES;
@@ -178,7 +177,7 @@ struct MountedFs {
     fs_type: &'static str,
     options: SleepMutex<&'static str>,
     stat_flags: AtomicU64,
-    backend: Arc<dyn ConcurrentFileSystemBackend>,
+    backend: Arc<dyn FileSystemBackend>,
     pending_inode_releases: Arc<PendingReleaseQueue>,
 }
 
@@ -193,11 +192,7 @@ pub(super) struct MountedBackendLease {
 }
 
 impl MountedBackendLease {
-    pub(super) fn call<V>(
-        &self,
-        op: BackendOp,
-        f: impl FnOnce(&dyn ConcurrentFileSystemBackend) -> V,
-    ) -> V {
+    pub(super) fn call<V>(&self, op: BackendOp, f: impl FnOnce(&dyn FileSystemBackend) -> V) -> V {
         let backend = self.mounted.backend.as_ref();
         if matches!(
             op,
@@ -454,7 +449,7 @@ impl MountedFs {
     }
 
     fn new_concurrent(
-        backend: Arc<dyn ConcurrentFileSystemBackend>,
+        backend: Arc<dyn FileSystemBackend>,
         source: String,
         fs_type: &'static str,
         options: &'static str,
@@ -679,7 +674,7 @@ fn unregister_pending_release_queue(mount_id: MountId) {
 pub(super) fn with_mount<V>(
     mount_id: MountId,
     op: BackendOp,
-    f: impl FnOnce(&dyn ConcurrentFileSystemBackend) -> V,
+    f: impl FnOnce(&dyn FileSystemBackend) -> V,
 ) -> Option<V> {
     let lease = mounted_backend_lease(mount_id)?;
     Some(lease.call(op, f))
@@ -700,7 +695,7 @@ pub(crate) fn overlay_real_node(node: VfsNodeId) -> Option<VfsNodeId> {
 
 fn drain_pending_inode_releases(
     pending_releases: &PendingReleaseQueue,
-    backend: &dyn ConcurrentFileSystemBackend,
+    backend: &dyn FileSystemBackend,
 ) {
     if !pending_releases.has_entries() {
         return;

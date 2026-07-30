@@ -2,8 +2,8 @@ use super::dirent::{DT_DIR, DT_FIFO, DT_LNK, DT_REG, RawDirEntry, write_dir_entr
 use super::mount::with_mount;
 use super::path::WorkingDir;
 use super::vfs::{
-    BackendOp, ConcurrentFileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult,
-    InodeRelease, LegacyFileSystemBackend, VfsNodeId,
+    BackendOp, FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult, InodeRelease,
+    LegacyFileSystemBackend, VfsNodeId,
 };
 use super::{FileStat, FileTimestamp, S_IFDIR};
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -90,7 +90,7 @@ impl OverlayFs {
         ino: u32,
         real: VfsNodeId,
         op: BackendOp,
-        f: impl FnOnce(&dyn ConcurrentFileSystemBackend, u32) -> V,
+        f: impl FnOnce(&dyn FileSystemBackend, u32) -> V,
     ) -> FsResult<V> {
         with_mount(real.mount_id, op, |mount| f(mount, real.ino)).ok_or({
             if ino == OVERLAY_ROOT_INO {
