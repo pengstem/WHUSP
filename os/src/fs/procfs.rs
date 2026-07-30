@@ -3,10 +3,12 @@
     reason = "procfs directory builders keep entries in display order with conditional additions"
 )]
 
+mod state;
+
 use super::dentry_cache;
 use super::dirent::{DT_DIR, DT_LNK, DT_REG, RawDirEntry, write_dir_entries};
 use super::mount;
-use super::pipe::{PIPE_DEFAULT_CAPACITY, PIPE_MAX_CAPACITY, PIPE_MIN_CAPACITY};
+use super::pipe::{PIPE_MAX_CAPACITY, PIPE_MIN_CAPACITY};
 use super::vfs::{
     FsError, FsNodeKind, FsResult, LegacyDataOps, LegacyInodeLifecycleOps, LegacyLookupOps,
     LegacyMetadataOps, LegacyNamespaceOps, LegacySyncOps,
@@ -19,7 +21,6 @@ use crate::drivers::block_cache;
 use crate::mm::frame_cache_stats;
 use crate::mm::{VirtAddr, exec_load_stats_content, frame_stats};
 use crate::perf;
-use crate::sync::UPIntrFreeCell;
 use crate::syscall::keyring;
 use crate::syscall::{
     INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES,
@@ -35,8 +36,15 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
-use lazy_static::lazy_static;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use state::{
+    DEFAULT_NET_IPV4_CONF_TAG, PROC_CORE_PATTERN, PROC_DOMAINNAME, PROC_IO_READ_BYTES,
+    PROC_IO_READAHEAD_SUPPRESS_READS, PROC_LEASE_BREAK_TIME, PROC_MEMINFO_CACHED_KB,
+    PROC_MEMINFO_OBSERVED_CACHE_KB, PROC_MEMINFO_SWAP_CACHED_KB, PROC_NET_CORE_BUSY_POLL,
+    PROC_NET_CORE_BUSY_READ, PROC_NET_IPV4_CONF_LO_TAG, PROC_OOM_SCORE_ADJ, PROC_PID_MAX,
+    PROC_PIPE_MAX_SIZE, PROC_PIPE_USER_PAGES_SOFT, PROC_VFS_CACHE_PRESSURE,
+};
 
 const ROOT_INO: u32 = 2;
 const MOUNTS_INO: u32 = 3;
@@ -149,15 +157,6 @@ const PID_TASK_PID_SHIFT: usize = 12;
 const PID_TASK_TID_MASK: u32 = (1 << PID_TASK_PID_SHIFT) - 1;
 const PID_TASK_MAX_PID: usize = 1 << (30 - PID_TASK_PID_SHIFT);
 const PID_TASK_MAX_LOCAL_TID: usize = 1 << PID_TASK_PID_SHIFT;
-const DEFAULT_PID_MAX: usize = 4_194_304;
-// CONTEXT: Linux defaults this sysctl to 16384 pages, but this kernel does not
-// account pipe pages per user and still has a smaller fd-table ceiling. Expose
-// one default pipe worth of pages so pipe-limit tests exercise real pipe
-// behavior instead of deriving a zero-pipe workload.
-const DEFAULT_PIPE_USER_PAGES_SOFT: usize = PIPE_DEFAULT_CAPACITY / PAGE_SIZE;
-const DEFAULT_LEASE_BREAK_TIME: usize = 45;
-const DEFAULT_NET_IPV4_CONF_TAG: isize = 0;
-const PROC_MEMINFO_OBSERVED_CACHE_KB: usize = 64 * 1024;
 const PROC_MEMINFO_SWAP_TOTAL_KB: usize = 2 * 1024 * 1024;
 const PROC_NS_MNT_INO_BASE: u64 = 0x7000_0000;
 const PROC_NS_PID_INO_BASE: u64 = 0x7100_0000;
@@ -178,33 +177,6 @@ const PROC_CONFIG_GZ: &[u8] = &[
     0xc1, 0x68, 0xf6, 0x66, 0xc1, 0x0e, 0x0e, 0xae, 0x2e, 0xc9, 0x2d, 0xe8, 0x84, 0xcf, 0xff, 0x6f,
     0xcb, 0x1b, 0xfe, 0x63, 0x48, 0x12, 0x12, 0x01, 0x00, 0x00,
 ];
-
-static PROC_PID_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_PID_MAX);
-static PROC_PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(PIPE_MAX_CAPACITY);
-static PROC_PIPE_USER_PAGES_SOFT: AtomicUsize = AtomicUsize::new(DEFAULT_PIPE_USER_PAGES_SOFT);
-static PROC_LEASE_BREAK_TIME: AtomicUsize = AtomicUsize::new(DEFAULT_LEASE_BREAK_TIME);
-static PROC_NET_IPV4_CONF_LO_TAG: AtomicIsize = AtomicIsize::new(DEFAULT_NET_IPV4_CONF_TAG);
-static PROC_NET_CORE_BUSY_READ: AtomicUsize = AtomicUsize::new(0);
-static PROC_NET_CORE_BUSY_POLL: AtomicUsize = AtomicUsize::new(0);
-static PROC_VFS_CACHE_PRESSURE: AtomicUsize = AtomicUsize::new(100);
-static PROC_MEMINFO_CACHED_KB: AtomicUsize = AtomicUsize::new(0);
-static PROC_MEMINFO_SWAP_CACHED_KB: AtomicUsize = AtomicUsize::new(0);
-static PROC_IO_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
-static PROC_IO_READAHEAD_SUPPRESS_READS: AtomicUsize = AtomicUsize::new(0);
-static PROC_OOM_SCORE_ADJ: AtomicIsize = AtomicIsize::new(0);
-
-lazy_static! {
-    static ref PROC_DOMAINNAME: UPIntrFreeCell<Vec<u8>> = {
-        let mut value = Vec::new();
-        value.extend_from_slice(b"(none)");
-        unsafe { UPIntrFreeCell::new(value) }
-    };
-    static ref PROC_CORE_PATTERN: UPIntrFreeCell<Vec<u8>> = {
-        let mut value = Vec::new();
-        value.extend_from_slice(b"core");
-        unsafe { UPIntrFreeCell::new(value) }
-    };
-}
 
 pub(crate) fn pipe_max_size() -> usize {
     PROC_PIPE_MAX_SIZE.load(Ordering::Relaxed)
