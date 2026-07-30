@@ -1,3 +1,5 @@
+mod loop_device;
+
 use super::dirent::{
     DT_BLK, DT_CHR, DT_DIR, LINUX_DIRENT64_ALIGN, LINUX_DIRENT64_HEADER_SIZE, RawDirEntry,
     write_dir_entries,
@@ -31,16 +33,13 @@ use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
 use lazy_static::lazy_static;
 
+use loop_device::{
+    LOOP_DEVICE_COUNT, LOOP_FLAG_AUTOCLEAR, LOOP_FLAG_DIRECT_IO, LOOP_FLAG_PARTSCAN,
+    LOOP_FLAG_READ_ONLY, LOOP0_STATE, LOOP1_STATE, LoopDeviceState,
+};
+
 const DEVFS_DEV: u64 = 0x646576;
 const DEVFS_MAGIC: i64 = 0x0102_1994;
-const LOOP_DEVICE_COUNT: usize = 2;
-const LOOP_DEVICE_SIZE_FALLBACK: u64 = 300 * 1024 * 1024;
-const LOOP_DEVICE_BLOCK_SIZE_DEFAULT: usize = 512;
-const LOOP_DEVICE_DEFAULT_READ_AHEAD: usize = 128;
-const LOOP_FLAG_READ_ONLY: u32 = 1;
-const LOOP_FLAG_AUTOCLEAR: u32 = 4;
-const LOOP_FLAG_PARTSCAN: u32 = 8;
-const LOOP_FLAG_DIRECT_IO: u32 = 16;
 const PTY_BUFFER_CAPACITY: usize = 8192;
 const PTY_TABLE_SIZE: usize = 64;
 const PTY_INO_BASE: u32 = 0x1000;
@@ -69,66 +68,10 @@ const INPUT_DEFAULT_REP_DELAY_MS: i32 = 250;
 const INPUT_DEFAULT_REP_PERIOD_MS: i32 = 33;
 
 lazy_static! {
-    static ref LOOP0_STATE: UPIntrFreeCell<LoopDeviceState> =
-        unsafe { UPIntrFreeCell::new(LoopDeviceState::new()) };
-    static ref LOOP1_STATE: UPIntrFreeCell<LoopDeviceState> =
-        unsafe { UPIntrFreeCell::new(LoopDeviceState::new()) };
     static ref PTY_TABLE: UPIntrFreeCell<PtyTable> =
         unsafe { UPIntrFreeCell::new(PtyTable::new()) };
     static ref INPUT_STATE: UPIntrFreeCell<InputState> =
         unsafe { UPIntrFreeCell::new(InputState::new()) };
-}
-
-struct LoopDeviceState {
-    backend: Option<Arc<dyn File + Send + Sync>>,
-    backing_path: Option<String>,
-    flags: u32,
-    read_ahead: usize,
-    block_size: usize,
-    size: u64,
-    size_limit: u64,
-    synthetic_write_sectors: u64,
-    synthetic_io_ticks: u64,
-}
-
-impl LoopDeviceState {
-    fn new() -> Self {
-        Self {
-            backend: None,
-            backing_path: None,
-            flags: 0,
-            read_ahead: LOOP_DEVICE_DEFAULT_READ_AHEAD,
-            block_size: LOOP_DEVICE_BLOCK_SIZE_DEFAULT,
-            size: LOOP_DEVICE_SIZE_FALLBACK,
-            size_limit: 0,
-            synthetic_write_sectors: 0,
-            synthetic_io_ticks: 0,
-        }
-    }
-
-    fn reset(&mut self) {
-        *self = Self::new();
-    }
-
-    fn read_only(&self) -> bool {
-        self.flags & LOOP_FLAG_READ_ONLY != 0
-    }
-
-    fn visible_size(&self) -> u64 {
-        if self.size_limit == 0 {
-            self.size
-        } else {
-            self.size.min(self.size_limit)
-        }
-    }
-
-    fn set_flag(&mut self, flag: u32, enabled: bool) {
-        if enabled {
-            self.flags |= flag;
-        } else {
-            self.flags &= !flag;
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
