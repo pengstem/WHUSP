@@ -328,7 +328,7 @@ fn finish_current_switch() {
         }
         SwitchReason::Block => {
             if let Some(front) = enqueue {
-                super::manager::enqueue_woken_task(task, front);
+                super::sched::enqueue_woken_task(task, front);
             }
         }
         SwitchReason::Exit => super::queue_exited_task(task),

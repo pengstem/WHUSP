@@ -4,11 +4,12 @@ mod fd;
 pub(crate) mod futex;
 mod id;
 mod initproc;
-mod manager;
+mod lifecycle;
 mod process;
 mod process_lifecycle;
 mod processor;
 mod ptrace;
+mod sched;
 mod signal;
 mod smp_probe;
 #[allow(clippy::module_inception)]
@@ -28,14 +29,13 @@ use crate::uapi::errno::{Errno, KResult};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::*;
+use lifecycle::{register_task_linux_tid, unregister_task_linux_tid};
 use log::info;
-use manager::{
-    charge_task_after_run, fetch_task, register_task_linux_tid, unregister_task_linux_tid,
-};
 pub(crate) use process::{
     Credentials, PROCESS_PKEY_COUNT, PathSnapshot, ProcessProcSnapshot, RLimit, RLimitResource,
 };
 pub use process::{ProcessControlBlock, ProcessCpuTimesSnapshot};
+use sched::{charge_task_after_run, fetch_task};
 pub(crate) const CAP_IPC_LOCK: usize = process::CapabilitySets::CAP_IPC_LOCK;
 pub(crate) const CAP_IPC_OWNER: usize = process::CapabilitySets::CAP_IPC_OWNER;
 pub(crate) const CAP_SETPCAP: usize = process::CapabilitySets::CAP_SETPCAP;
@@ -50,17 +50,10 @@ pub use crate::arch::TaskContext;
 pub use clone::{CloneArgs, CloneFlags, clone_current_thread};
 pub(crate) use fd::{FD_LIMIT, FdFlags, FdTableEntry};
 pub use id::{IDLE_PID, KernelStack, PidHandle, kstack_alloc, pid_alloc};
-pub(crate) use manager::any_process_references_mount;
-pub(crate) use manager::list_process_snapshots;
-pub(crate) use manager::migrate_ready_task;
-pub(crate) use manager::processes_snapshot;
-pub(crate) use manager::remove_ready_task_for_job_stop;
-use manager::remove_ready_tasks_of_process;
-pub(crate) use manager::reprioritize_ready_task;
-pub(crate) use manager::requeue_task_after_run;
-pub(crate) use manager::task_with_linux_tid;
-pub use manager::{add_task, pid2process, remove_from_pid2process, wakeup_task};
-pub(crate) use manager::{wakeup_front_task, wakeup_timer_task};
+pub(crate) use lifecycle::{
+    any_process_references_mount, list_process_snapshots, processes_snapshot, task_with_linux_tid,
+};
+pub use lifecycle::{pid2process, remove_from_pid2process};
 pub use processor::{
     current_process, current_task, current_trap_cx, current_user_token, process_of_task,
     refresh_current_user_token, run_tasks, schedule, trap_cx_of_task,
@@ -74,6 +67,12 @@ pub(crate) use ptrace::{
     ptrace_stop_task_if_needed, ptrace_syscall_enter_stop_for_task,
     ptrace_syscall_exit_stop_for_task, ptrace_take_wait_status, ptrace_traceme_current,
     ptrace_validate_tracee,
+};
+use sched::remove_ready_tasks_of_process;
+pub use sched::{add_task, wakeup_task};
+pub(crate) use sched::{
+    migrate_ready_task, remove_ready_task_for_job_stop, reprioritize_ready_task,
+    requeue_task_after_run, wakeup_front_task, wakeup_timer_task,
 };
 pub use signal::{
     CLD_CONTINUED, CLD_STOPPED, DefaultSignalAction, MINSIGSTKSZ, SA_NOCLDSTOP, SA_RESTART,
@@ -132,9 +131,9 @@ pub fn mark_current_kernel_time_entry(now_us: usize) {
 pub fn timer_tick_should_preempt(current: &Arc<TaskControlBlock>) -> bool {
     let cpu = crate::cpu::current_id();
     (crate::cpu::scheduler_need_resched(cpu) && crate::cpu::take_scheduler_need_resched(cpu))
-        || manager::remote_wake_pending(cpu)
+        || sched::remote_wake_pending(cpu)
         || current.inner_exclusive_access().job_control_stopped
-        || manager::should_preempt_current_on_tick(current)
+        || sched::should_preempt_current_on_tick(current)
 }
 
 pub fn preempt_current_if_needed_on_user_return() {
@@ -145,7 +144,7 @@ pub fn preempt_current_if_needed_on_user_return() {
 }
 
 pub(crate) fn remote_wake_pending(cpu: crate::cpu::CpuId) -> bool {
-    manager::remote_wake_pending(cpu)
+    sched::remote_wake_pending(cpu)
 }
 
 pub fn suspend_current_and_run_next() {

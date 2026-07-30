@@ -515,7 +515,7 @@ impl ProcessControlBlock {
             crate::task::start_smp_wait_io_probe();
         }
         if smp_run_queue_drain_probe {
-            super::manager::assert_run_queues_drained();
+            super::sched::assert_run_queues_drained();
         }
         Ok(())
     }

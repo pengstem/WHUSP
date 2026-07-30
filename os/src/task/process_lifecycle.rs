@@ -1,6 +1,6 @@
 use super::exec::{ExecStackInfo, init_user_stack};
 use super::id::RecycleAllocator;
-use super::manager::{register_process, register_task_linux_tid};
+use super::lifecycle::{register_process, register_task_linux_tid};
 use super::process::{
     Credentials, CredentialsFastState, FdTableFastState, KcmpResourceOwners, ProcessControlBlock,
     ProcessControlBlockInner, ProcessCpuTimes, ProcessFsContext, ProcessFsFastState,
