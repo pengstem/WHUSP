@@ -1,5 +1,4 @@
 use super::super::SyscallContext;
-use super::super::errno::{SysError, SysResult};
 use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{
     PATH_MAX, UserBufferAccess, copy_to_user_ctx, copy_to_user_with_mmap_fault_ctx,
@@ -38,6 +37,7 @@ use crate::mm::UserBuffer;
 use crate::task::{
     CAP_SYS_CHROOT, PathSnapshot, ProcessControlBlock, current_process, current_user_token,
 };
+use crate::uapi::errno::{Errno, KResult};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -80,8 +80,8 @@ impl EmptyAtPath {
         (self.file, self.dir_path)
     }
 
-    pub(crate) fn working_dir(&self) -> SysResult<WorkingDir> {
-        self.file.working_dir().ok_or(SysError::ENOTDIR)
+    pub(crate) fn working_dir(&self) -> KResult<WorkingDir> {
+        self.file.working_dir().ok_or(Errno::ENOTDIR)
     }
 
     pub(crate) fn dir_path_or_fd(&self, dirfd: isize) -> String {
@@ -105,12 +105,12 @@ pub(crate) fn resolve_at_path<'a>(
     dirfd: isize,
     path: &'a str,
     allow_empty_path: bool,
-) -> SysResult<AtPath<'a>> {
+) -> KResult<AtPath<'a>> {
     if !path.is_empty() {
         return Ok(AtPath::Path(path));
     }
     if !allow_empty_path {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
     if dirfd == AT_FDCWD {
         let file = open_file_in(snapshot.context.clone(), ".", OpenFlags::PATH)?;
@@ -120,7 +120,7 @@ pub(crate) fn resolve_at_path<'a>(
         }));
     }
     if dirfd < 0 {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     let entry = get_fd_entry_by_fd(dirfd as usize)?;
     Ok(AtPath::Empty(EmptyAtPath {
@@ -133,17 +133,17 @@ pub(crate) fn resolve_at_path<'a>(
 ///
 /// `WorkingDir` carries VFS identity; `cwd_path` is only the normalized string
 /// snapshot needed for procfs links, getcwd, and later relative normalization.
-fn dirfd_context_from(snapshot: &PathSnapshot, dirfd: isize) -> SysResult<(WorkingDir, String)> {
+fn dirfd_context_from(snapshot: &PathSnapshot, dirfd: isize) -> KResult<(WorkingDir, String)> {
     if dirfd == AT_FDCWD {
         return Ok((snapshot.context.cwd(), snapshot.cwd_path.clone()));
     }
     if dirfd < 0 {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     let (cwd, dir_path) = current_process()
         .directory_context_from_fd(dirfd as usize)
-        .ok_or(SysError::EBADF)?;
-    let cwd = cwd.ok_or(SysError::ENOTDIR)?;
+        .ok_or(Errno::EBADF)?;
+    let cwd = cwd.ok_or(Errno::ENOTDIR)?;
     let cwd_path = dir_path.unwrap_or_else(|| snapshot.cwd_path.clone());
     Ok((cwd, cwd_path))
 }
@@ -157,20 +157,20 @@ pub(crate) fn normalize_path_from(
     snapshot: &PathSnapshot,
     dirfd: isize,
     path: &str,
-) -> SysResult<String> {
+) -> KResult<String> {
     let base = if path.starts_with('/') {
         snapshot.root_path.clone()
     } else {
         dirfd_context_from(snapshot, dirfd)?.1
     };
-    normalize_path_at_root(snapshot.root_path.as_str(), base.as_str(), path).ok_or(SysError::ENOENT)
+    normalize_path_at_root(snapshot.root_path.as_str(), base.as_str(), path).ok_or(Errno::ENOENT)
 }
 
 pub(crate) fn path_context_from(
     snapshot: &PathSnapshot,
     dirfd: isize,
     path: &str,
-) -> SysResult<PathContext> {
+) -> KResult<PathContext> {
     let root = snapshot.context.root();
     let root_path = snapshot.root_path.clone();
     let (cwd, cwd_path) = if path.starts_with('/') {
@@ -195,7 +195,7 @@ fn process_global_path_for(snapshot: &PathSnapshot, path: &str) -> Option<String
     )
 }
 
-fn visible_working_dir_path(snapshot: &PathSnapshot) -> SysResult<String> {
+fn visible_working_dir_path(snapshot: &PathSnapshot) -> KResult<String> {
     Ok(
         path_inside_root(snapshot.root_path.as_str(), snapshot.cwd_path.as_str())
             .unwrap_or_else(|| alloc::format!("(unreachable){}", snapshot.cwd_path)),
@@ -207,7 +207,7 @@ fn check_access_path_prefixes_from(
     dirfd: isize,
     path: &str,
     subject: AccessSubject<'_>,
-) -> SysResult<()> {
+) -> KResult<()> {
     // CONTEXT: In this kernel's current DAC model, uid 0 bypasses directory
     // search mode checks. Final path resolution still reports ENOTDIR for a
     // non-directory prefix, so the per-prefix stat loop adds no root-visible
@@ -242,7 +242,7 @@ fn check_access_path_prefixes_from(
 
         let stat = resolve_stat_from(snapshot, dirfd, prefix.as_str(), true)?;
         if stat.mode & S_IFDIR != S_IFDIR {
-            return Err(SysError::ENOTDIR);
+            return Err(Errno::ENOTDIR);
         }
         check_access_mode(&stat, X_OK, subject)?;
     }
@@ -267,16 +267,16 @@ fn check_unlink_file_access(
     context: PathContext,
     path: &str,
     subject: AccessSubject<'_>,
-) -> SysResult<()> {
+) -> KResult<()> {
     if path.is_empty() {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
 
     check_access_path_prefixes_from(snapshot, dirfd, path, subject)?;
     let parent_path = parent_path_for_leaf(path);
     let parent_stat = resolve_stat_from(snapshot, dirfd, parent_path, true)?;
     if parent_stat.mode & S_IFMT != S_IFDIR {
-        return Err(SysError::ENOTDIR);
+        return Err(Errno::ENOTDIR);
     }
     check_access_mode(&parent_stat, W_OK | X_OK, subject)?;
 
@@ -287,7 +287,7 @@ fn check_unlink_file_access(
         Err(error) => return Err(error.into()),
     };
     if flags & (FS_IMMUTABLE_FL | FS_APPEND_FL) != 0 {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     Ok(())
 }
@@ -296,24 +296,24 @@ fn check_sticky_rename_access(
     parent_stat: &FileStat,
     target_stat: &FileStat,
     subject: AccessSubject<'_>,
-) -> SysResult<()> {
+) -> KResult<()> {
     if parent_stat.mode & MODE_STICKY == 0 || subject.is_root() {
         return Ok(());
     }
     if subject.uid() == parent_stat.uid || subject.uid() == target_stat.uid {
         return Ok(());
     }
-    Err(SysError::EPERM)
+    Err(Errno::EPERM)
 }
 
 fn resolve_optional_rename_target_stat(
     snapshot: &PathSnapshot,
     dirfd: isize,
     path: &str,
-) -> SysResult<Option<FileStat>> {
+) -> KResult<Option<FileStat>> {
     match resolve_stat_from(snapshot, dirfd, path, false) {
         Ok(stat) => Ok(Some(stat)),
-        Err(SysError::ENOENT) => Ok(None),
+        Err(Errno::ENOENT) => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -325,9 +325,9 @@ fn check_rename_access(
     newdirfd: isize,
     newpath: &str,
     subject: AccessSubject<'_>,
-) -> SysResult<()> {
+) -> KResult<()> {
     if oldpath.is_empty() || newpath.is_empty() {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
 
     check_access_path_prefixes_from(snapshot, olddirfd, oldpath, subject)?;
@@ -336,7 +336,7 @@ fn check_rename_access(
     let old_parent_path = parent_path_for_leaf(oldpath);
     let old_parent_stat = resolve_stat_from(snapshot, olddirfd, old_parent_path, true)?;
     if old_parent_stat.mode & S_IFMT != S_IFDIR {
-        return Err(SysError::ENOTDIR);
+        return Err(Errno::ENOTDIR);
     }
     check_access_mode(&old_parent_stat, W_OK | X_OK, subject)?;
 
@@ -346,7 +346,7 @@ fn check_rename_access(
     let new_parent_path = parent_path_for_leaf(newpath);
     let new_parent_stat = resolve_stat_from(snapshot, newdirfd, new_parent_path, true)?;
     if new_parent_stat.mode & S_IFMT != S_IFDIR {
-        return Err(SysError::ENOTDIR);
+        return Err(Errno::ENOTDIR);
     }
     check_access_mode(&new_parent_stat, W_OK | X_OK, subject)?;
 
@@ -362,15 +362,15 @@ fn check_open_existing_access_from(
     path: &str,
     flags: OpenFlags,
     subject: AccessSubject<'_>,
-) -> SysResult<()> {
+) -> KResult<()> {
     if path.is_empty() {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
     let follow_final_symlink =
         !flags.contains(OpenFlags::NOFOLLOW) || flags.contains(OpenFlags::PATH);
     let stat = match resolve_stat_from(snapshot, dirfd, path, follow_final_symlink) {
         Ok(stat) => stat,
-        Err(SysError::ENOENT) if flags.contains(OpenFlags::CREATE) => return Ok(()),
+        Err(Errno::ENOENT) if flags.contains(OpenFlags::CREATE) => return Ok(()),
         Err(err) => return Err(err),
     };
 
@@ -378,7 +378,7 @@ fn check_open_existing_access_from(
     // kernel's capabilities are still process-wide and not recalculated across
     // setuid transitions, so uid 0 is the current CAP_FOWNER-equivalent check.
     if flags.contains(OpenFlags::NOATIME) && subject.uid() != stat.uid && !subject.is_root() {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
 
     if flags.contains(OpenFlags::PATH) {
@@ -399,7 +399,7 @@ pub(super) fn check_current_access_path_prefixes_from(
     snapshot: &PathSnapshot,
     dirfd: isize,
     path: &str,
-) -> SysResult<()> {
+) -> KResult<()> {
     let credentials = current_process().credentials();
     let subject = AccessSubject::from_fs_credentials(&credentials);
     check_access_path_prefixes_from(snapshot, dirfd, path, subject)
@@ -410,7 +410,7 @@ pub(super) fn check_access_path_prefixes_for_process(
     snapshot: &PathSnapshot,
     dirfd: isize,
     path: &str,
-) -> SysResult<()> {
+) -> KResult<()> {
     let credentials = process.credentials();
     let subject = AccessSubject::from_fs_credentials(&credentials);
     check_access_path_prefixes_from(snapshot, dirfd, path, subject)
@@ -419,7 +419,7 @@ pub(super) fn check_access_path_prefixes_for_process(
 fn parse_utimensat_time(
     time: LinuxTimeSpec,
     now: FileTimestamp,
-) -> SysResult<(Option<FileTimestamp>, bool)> {
+) -> KResult<(Option<FileTimestamp>, bool)> {
     match time.tv_nsec {
         UTIME_NOW => Ok((Some(now), true)),
         UTIME_OMIT => Ok((None, false)),
@@ -428,7 +428,7 @@ fn parse_utimensat_time(
                 // UNFINISHED: Linux accepts negative timestamps on filesystems
                 // that can represent pre-epoch times. This kernel timestamp
                 // model is unsigned for now, so reject them.
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             Ok((
                 Some(FileTimestamp {
@@ -438,7 +438,7 @@ fn parse_utimensat_time(
                 false,
             ))
         }
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -453,7 +453,7 @@ struct UtimensatTimes {
 fn read_utimensat_times(
     times: *const LinuxTimeSpec,
     now: FileTimestamp,
-) -> SysResult<UtimensatTimes> {
+) -> KResult<UtimensatTimes> {
     if times.is_null() {
         return Ok(UtimensatTimes {
             atime: Some(now),
@@ -479,10 +479,10 @@ fn apply_utimensat_to_file(
     file: Arc<dyn File + Send + Sync>,
     times: UtimensatTimes,
     ctime: FileTimestamp,
-) -> SysResult {
+) -> KResult {
     let stat = file.stat()?;
     if mount_is_read_only(MountId(stat.dev as usize)) {
-        return Err(SysError::EROFS);
+        return Err(Errno::EROFS);
     }
 
     let credentials = current_process().credentials();
@@ -491,7 +491,7 @@ fn apply_utimensat_to_file(
         if times.both_now {
             check_access_mode(&stat, W_OK, subject)?;
         } else {
-            return Err(SysError::EPERM);
+            return Err(Errno::EPERM);
         }
     }
 
@@ -501,12 +501,12 @@ fn apply_utimensat_to_file(
         Err(error) => return Err(error.into()),
     };
     if flags & FS_IMMUTABLE_FL != 0 {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     if flags & FS_APPEND_FL != 0 && !times.both_now {
         // CONTEXT: Linux allows append-only files to receive current-time
         // timestamp updates, but rejects explicit or partial timestamp changes.
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     file.set_times(times.atime, times.mtime, ctime)?;
     inotify_notify_attrib(&file);
@@ -518,10 +518,10 @@ fn copy_c_string_to_user_ctx(
     ptr: *mut u8,
     buf_len: usize,
     string: &str,
-) -> SysResult {
+) -> KResult {
     let total_len = string.len() + 1;
     if buf_len < total_len {
-        return Err(SysError::ERANGE);
+        return Err(Errno::ERANGE);
     }
     let mut bytes = Vec::with_capacity(total_len);
     bytes.extend_from_slice(string.as_bytes());
@@ -535,7 +535,7 @@ fn readlink_file_to_user_ctx(
     file: Arc<dyn File + Send + Sync>,
     buf: *mut u8,
     bufsiz: usize,
-) -> SysResult {
+) -> KResult {
     // UNFINISHED: double-buffers through a kernel-side allocation; ideally
     // the VFS readlink would accept a UserBuffer to write into user pages
     // directly and avoid the extra copy.
@@ -546,7 +546,7 @@ fn readlink_file_to_user_ctx(
     Ok(copy_len as isize)
 }
 
-fn openat_dir_path(snapshot: &PathSnapshot, dirfd: isize, path: &str) -> SysResult<Option<String>> {
+fn openat_dir_path(snapshot: &PathSnapshot, dirfd: isize, path: &str) -> KResult<Option<String>> {
     if path.starts_with('/') {
         return Ok(process_global_path_for(snapshot, path));
     }
@@ -554,12 +554,12 @@ fn openat_dir_path(snapshot: &PathSnapshot, dirfd: isize, path: &str) -> SysResu
         return Ok(process_global_path_for(snapshot, path));
     }
     if dirfd < 0 {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
 
     let entry = get_fd_entry_by_fd(dirfd as usize)?;
     if entry.file().working_dir().is_none() {
-        return Err(SysError::ENOTDIR);
+        return Err(Errno::ENOTDIR);
     }
     Ok(entry
         .dir_path()
@@ -577,7 +577,7 @@ fn parse_proc_self_fd_path(path: &str) -> Option<usize> {
 fn reopen_proc_self_fd(
     path: &str,
     flags: OpenFlags,
-) -> SysResult<Option<Arc<dyn File + Send + Sync>>> {
+) -> KResult<Option<Arc<dyn File + Send + Sync>>> {
     let Some(fd) = parse_proc_self_fd_path(path) else {
         return Ok(None);
     };
@@ -593,7 +593,7 @@ fn open_devfs_child_from_dirfd(
     dirfd: isize,
     path: &str,
     flags: OpenFlags,
-) -> SysResult<Option<Arc<dyn File + Send + Sync>>> {
+) -> KResult<Option<Arc<dyn File + Send + Sync>>> {
     if path.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
         return Ok(None);
     }
@@ -615,18 +615,18 @@ fn open_devfs_child_from_dirfd(
     Ok(child)
 }
 
-pub(super) fn open_flags_from_user_bits(flags: u32) -> SysResult<OpenFlags> {
+pub(super) fn open_flags_from_user_bits(flags: u32) -> KResult<OpenFlags> {
     let Some(flags) = OpenFlags::from_bits(flags) else {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     };
     if flags.bits() & 0b11 == 0b11 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags.has_tmpfile_base_bit() && !flags.contains(OpenFlags::TMPFILE) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags.contains(OpenFlags::TMPFILE) && !flags.read_write().1 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(flags)
 }
@@ -637,13 +637,13 @@ fn do_openat_for_process(
     path: &str,
     flags: OpenFlags,
     mode: u32,
-) -> SysResult {
+) -> KResult {
     fn install_opened_file(
         process: &ProcessControlBlock,
         file: Arc<dyn File + Send + Sync>,
         flags: OpenFlags,
         path: Option<String>,
-    ) -> SysResult {
+    ) -> KResult {
         if !flags.contains(OpenFlags::NOCTTY)
             && file.can_acquire_controlling_tty()
             && let Some(tty) = file.tty_id()
@@ -728,17 +728,13 @@ pub fn sys_openat_ctx(
     path: *const u8,
     flags: u32,
     mode: u32,
-) -> SysResult {
+) -> KResult {
     let path = read_user_c_string_ctx(ctx, path, PATH_MAX)?;
     let flags = open_flags_from_user_bits(flags)?;
     do_openat_for_process(ctx.process(), dirfd, path.as_str(), flags, mode)
 }
 
-fn read_open_how_extra_zeros_ctx(
-    ctx: &SyscallContext,
-    how: *const u8,
-    size: usize,
-) -> SysResult<()> {
+fn read_open_how_extra_zeros_ctx(ctx: &SyscallContext, how: *const u8, size: usize) -> KResult<()> {
     let known_size = size_of::<LinuxOpenHow>();
     if size <= known_size {
         return Ok(());
@@ -748,7 +744,7 @@ fn read_open_how_extra_zeros_ctx(
     // silently ignored.
     let extra_ptr = (how as usize)
         .checked_add(known_size)
-        .ok_or(SysError::EFAULT)? as *const u8;
+        .ok_or(Errno::EFAULT)? as *const u8;
     let buffers = translated_byte_buffer_checked_ctx(
         ctx,
         extra_ptr,
@@ -759,7 +755,7 @@ fn read_open_how_extra_zeros_ctx(
         .iter()
         .any(|buffer| buffer.iter().any(|&byte| byte != 0))
     {
-        return Err(SysError::E2BIG);
+        return Err(Errno::E2BIG);
     }
     Ok(())
 }
@@ -798,15 +794,15 @@ fn check_openat2_resolve(
     original_path: &str,
     adjusted_path: &str,
     resolve: u64,
-) -> SysResult<()> {
+) -> KResult<()> {
     if resolve & !VALID_OPENAT2_RESOLVE_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if resolve & RESOLVE_CACHED != 0 {
-        return Err(SysError::EAGAIN);
+        return Err(Errno::EAGAIN);
     }
     if resolve & RESOLVE_BENEATH != 0 && openat2_path_escapes_beneath(original_path) {
-        return Err(SysError::EXDEV);
+        return Err(Errno::EXDEV);
     }
     // UNFINISHED: General openat2 resolve flags are not enforced at every
     // component during VFS path walk yet. The checks below cover current LTP
@@ -814,20 +810,20 @@ fn check_openat2_resolve(
     // CONTEXT: The VFS does not yet annotate every mount crossing during path
     // walk. LTP openat202 exercises /proc as the cross-mount target.
     if resolve & RESOLVE_NO_XDEV != 0 && original_path.starts_with("/proc/") {
-        return Err(SysError::EXDEV);
+        return Err(Errno::EXDEV);
     }
     // CONTEXT: procfs magic-link modeling is currently limited to the LTP
     // openat2 coverage for /proc/self/exe.
     if resolve & (RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS) != 0
         && original_path == "/proc/self/exe"
     {
-        return Err(SysError::ELOOP);
+        return Err(Errno::ELOOP);
     }
     if resolve & RESOLVE_NO_SYMLINKS != 0
         && let Ok(stat) = resolve_stat_from(snapshot, dirfd, adjusted_path, false)
         && stat.mode & S_IFMT == S_IFLNK
     {
-        return Err(SysError::ELOOP);
+        return Err(Errno::ELOOP);
     }
     Ok(())
 }
@@ -838,9 +834,9 @@ pub fn sys_openat2_ctx(
     path: *const u8,
     how: *const u8,
     size: usize,
-) -> SysResult {
+) -> KResult {
     if size < size_of::<LinuxOpenHow>() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let path = read_user_c_string_ctx(ctx, path, PATH_MAX)?;
     let how_value = read_user_value_ctx(ctx, how.cast::<LinuxOpenHow>())?;
@@ -853,17 +849,17 @@ fn do_openat2_for_process(
     dirfd: isize,
     path: &str,
     how_value: LinuxOpenHow,
-) -> SysResult {
+) -> KResult {
     if how_value.flags > u32::MAX as u64
         || how_value.mode & !OPENAT2_MODE_MASK != 0
         || how_value.resolve & !VALID_OPENAT2_RESOLVE_FLAGS != 0
     {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let flags = open_flags_from_user_bits(how_value.flags as u32)?;
     let creates_file = flags.contains(OpenFlags::CREATE) || flags.contains(OpenFlags::TMPFILE);
     if how_value.mode != 0 && !creates_file {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let adjusted_path = openat2_adjusted_path(path, how_value.resolve);
@@ -884,15 +880,15 @@ fn do_openat2_for_process(
     )
 }
 
-pub fn sys_truncate(path: *const u8, len: usize) -> SysResult {
+pub fn sys_truncate(path: *const u8, len: usize) -> KResult {
     if len > isize::MAX as usize {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
     if path.is_empty() {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
 
     let credentials = current_process().credentials();
@@ -912,22 +908,16 @@ pub fn sys_truncate(path: *const u8, len: usize) -> SysResult {
     Ok(0)
 }
 
-fn do_faccessat(
-    dirfd: isize,
-    path: *const u8,
-    mode: i32,
-    flags: i32,
-    valid_flags: i32,
-) -> SysResult {
+fn do_faccessat(dirfd: isize, path: *const u8, mode: i32, flags: i32, valid_flags: i32) -> KResult {
     if mode & !VALID_ACCESS_MODE != 0 || flags & !valid_flags != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let use_effective_ids = flags & AT_EACCESS != 0;
 
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
     if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
 
     let credentials = current_process().credentials();
@@ -944,11 +934,11 @@ fn do_faccessat(
     Ok(0)
 }
 
-pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32) -> SysResult {
+pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32) -> KResult {
     do_faccessat(dirfd, path, mode, 0, VALID_FACCESSAT_FLAGS)
 }
 
-pub fn sys_faccessat2(dirfd: isize, path: *const u8, mode: i32, flags: i32) -> SysResult {
+pub fn sys_faccessat2(dirfd: isize, path: *const u8, mode: i32, flags: i32) -> KResult {
     do_faccessat(dirfd, path, mode, flags, VALID_FACCESSAT2_FLAGS)
 }
 
@@ -957,9 +947,9 @@ pub fn sys_utimensat(
     pathname: *const u8,
     times: *const LinuxTimeSpec,
     flags: i32,
-) -> SysResult {
+) -> KResult {
     if flags & !VALID_UTIMENSAT_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let now = FileTimestamp::now();
@@ -973,13 +963,13 @@ pub fn sys_utimensat(
 
     if pathname.is_null() {
         if flags != 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         if dirfd == AT_FDCWD {
-            return Err(SysError::EFAULT);
+            return Err(Errno::EFAULT);
         }
         if dirfd < 0 {
-            return Err(SysError::EBADF);
+            return Err(Errno::EBADF);
         }
         let file = get_file_by_fd(dirfd as usize)?;
         return apply_utimensat_to_file(file, times, now);
@@ -1013,7 +1003,7 @@ pub fn sys_utimensat(
     apply_utimensat_to_file(file, times, now)
 }
 
-pub fn sys_chdir(path: *const u8) -> SysResult {
+pub fn sys_chdir(path: *const u8) -> KResult {
     let process = current_process();
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
@@ -1037,12 +1027,12 @@ pub fn sys_chdir(path: *const u8) -> SysResult {
     Ok(0)
 }
 
-pub fn sys_chroot(path: *const u8) -> SysResult {
+pub fn sys_chroot(path: *const u8) -> KResult {
     let process = current_process();
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
     if path.is_empty() {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
 
     let credentials = process.credentials();
@@ -1061,31 +1051,31 @@ pub fn sys_chroot(path: *const u8) -> SysResult {
         // namespace. This kernel's capability model is process-wide and does
         // not recalculate capabilities across uid transitions yet, so require
         // both euid 0 and the stored capability bit.
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     let Some(next_path) = process_global_path_for(&snapshot, path.as_str()) else {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     };
     process.set_root_dir(next_root, next_path);
     Ok(0)
 }
 
-pub fn sys_fchdir(fd: usize) -> SysResult {
+pub fn sys_fchdir(fd: usize) -> KResult {
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
     if file.is_devfs_dir() {
         // UNFINISHED: Lightweight devfs directories do not have a WorkingDir
         // representation, so they cannot become the process cwd yet.
-        return Err(SysError::ENOTSUP);
+        return Err(Errno::ENOTSUP);
     }
     let Some(next_cwd) = file.working_dir() else {
-        return Err(SysError::ENOTDIR);
+        return Err(Errno::ENOTDIR);
     };
     let Some(next_path) = entry.dir_path() else {
         // UNFINISHED: Linux fchdir keeps cwd as a directory object even when
         // the original pathname is unavailable. This kernel's getcwd path is
         // still string-backed, so fchdir needs path metadata from openat.
-        return Err(SysError::ENOTSUP);
+        return Err(Errno::ENOTSUP);
     };
     let process = current_process();
     let credentials = process.credentials();
@@ -1095,13 +1085,13 @@ pub fn sys_fchdir(fd: usize) -> SysResult {
     Ok(0)
 }
 
-pub fn sys_getcwd_ctx(ctx: &SyscallContext, buf: *mut u8, size: usize) -> SysResult {
+pub fn sys_getcwd_ctx(ctx: &SyscallContext, buf: *mut u8, size: usize) -> KResult {
     let snapshot = ctx.process().path_snapshot();
     let cwd_path = visible_working_dir_path(&snapshot)?;
     copy_c_string_to_user_ctx(ctx, buf, size, cwd_path.as_str())
 }
 
-pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> SysResult {
+pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> KResult {
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
     let snapshot = current_process().path_snapshot();
@@ -1124,11 +1114,11 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> SysResult {
     Ok(0)
 }
 
-pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, dev: u64) -> SysResult {
+pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, dev: u64) -> KResult {
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
     if path.is_empty() {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
 
     let file_type = mode & S_IFMT;
@@ -1137,13 +1127,13 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, dev: u64) -> SysRes
         S_IFIFO => FsNodeKind::Fifo,
         S_IFCHR => {
             if current_process().credentials().euid != 0 {
-                return Err(SysError::EPERM);
+                return Err(Errno::EPERM);
             }
             FsNodeKind::CharacterDevice
         }
         S_IFBLK => FsNodeKind::BlockDevice,
         S_IFSOCK => FsNodeKind::Socket,
-        _ => return Err(SysError::EINVAL),
+        _ => return Err(Errno::EINVAL),
     };
 
     let process = current_process();
@@ -1167,9 +1157,9 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, dev: u64) -> SysRes
     Ok(0)
 }
 
-pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> SysResult {
+pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> KResult {
     if flags & !AT_REMOVEDIR != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
@@ -1191,7 +1181,7 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> SysResult {
     Ok(0)
 }
 
-pub fn sys_umask(mask: u32) -> SysResult {
+pub fn sys_umask(mask: u32) -> KResult {
     Ok(current_process().set_umask(mask) as isize)
 }
 
@@ -1201,9 +1191,9 @@ pub fn sys_linkat(
     newdirfd: isize,
     newpath: *const u8,
     flags: u32,
-) -> SysResult {
+) -> KResult {
     if flags & !VALID_LINKAT_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let token = current_user_token();
@@ -1233,12 +1223,12 @@ pub fn sys_linkat(
     Ok(0)
 }
 
-pub fn sys_symlinkat(target: *const u8, newdirfd: isize, linkpath: *const u8) -> SysResult {
+pub fn sys_symlinkat(target: *const u8, newdirfd: isize, linkpath: *const u8) -> KResult {
     let token = current_user_token();
     let target = read_user_c_string(token, target, PATH_MAX)?;
     let linkpath = read_user_c_string(token, linkpath, PATH_MAX)?;
     if target.is_empty() || linkpath.is_empty() {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
     let snapshot = current_process().path_snapshot();
     symlink_in(
@@ -1255,19 +1245,19 @@ pub fn sys_readlinkat_ctx(
     path: *const u8,
     buf: *mut u8,
     bufsiz: usize,
-) -> SysResult {
+) -> KResult {
     if bufsiz == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let path = read_user_c_string_ctx(ctx, path, PATH_MAX)?;
     let snapshot = ctx.process().path_snapshot();
     let file = if path.is_empty() {
         if dirfd == AT_FDCWD {
-            return Err(SysError::ENOENT);
+            return Err(Errno::ENOENT);
         }
         if dirfd < 0 {
-            return Err(SysError::EBADF);
+            return Err(Errno::EBADF);
         }
         get_file_by_fd_for_process(ctx.process(), dirfd as usize)?
     } else {
@@ -1287,17 +1277,17 @@ pub fn sys_renameat2(
     newdirfd: isize,
     newpath: *const u8,
     flags: u32,
-) -> SysResult {
+) -> KResult {
     if flags & !VALID_RENAME_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags & RENAME_EXCHANGE != 0 && flags & (RENAME_NOREPLACE | RENAME_WHITEOUT) != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags & RENAME_WHITEOUT != 0 {
         // UNFINISHED: Linux RENAME_WHITEOUT creates an overlay/union whiteout
         // device while renaming. This kernel has no overlay filesystem support.
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let token = current_user_token();
@@ -1337,9 +1327,9 @@ pub fn sys_renameat2(
     Ok(0)
 }
 
-pub fn sys_getdents64_ctx(ctx: &SyscallContext, fd: usize, buf: *mut u8, len: usize) -> SysResult {
+pub fn sys_getdents64_ctx(ctx: &SyscallContext, fd: usize, buf: *mut u8, len: usize) -> KResult {
     if len == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let buffers = translated_byte_buffer_checked_with_mmap_fault_ctx(
         ctx,

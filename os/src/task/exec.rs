@@ -8,9 +8,9 @@ use crate::fs::{File, VfsNodeId, track_regular_file_executable, untrack_regular_
 use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet};
 use crate::perf;
 use crate::syscall::close_detached_fd_entry_for_process_teardown;
-use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::copy_to_user;
 use crate::trap::{TrapContext, trap_handler};
+use crate::uapi::errno::{Errno, KResult};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -121,44 +121,42 @@ struct ExecStackLayout {
     auxv: Vec<(usize, usize)>,
 }
 
-fn stack_low(stack_top: usize) -> SysResult<usize> {
+fn stack_low(stack_top: usize) -> KResult<usize> {
     // UNFINISHED: Linux derives argv/env limits from ARG_MAX, MAX_ARG_STRLEN,
     // and RLIMIT_STACK. This contest path only rejects layouts that cannot fit
     // in the eagerly mapped user stack, so oversized arguments return E2BIG
     // instead of underflowing the stack writer or panicking in kernel space.
-    stack_top
-        .checked_sub(USER_STACK_SIZE)
-        .ok_or(SysError::E2BIG)
+    stack_top.checked_sub(USER_STACK_SIZE).ok_or(Errno::E2BIG)
 }
 
-fn checked_stack_sub(sp: usize, amount: usize, low: usize) -> SysResult<usize> {
-    let next = sp.checked_sub(amount).ok_or(SysError::E2BIG)?;
+fn checked_stack_sub(sp: usize, amount: usize, low: usize) -> KResult<usize> {
+    let next = sp.checked_sub(amount).ok_or(Errno::E2BIG)?;
     if next < low {
-        return Err(SysError::E2BIG);
+        return Err(Errno::E2BIG);
     }
     Ok(next)
 }
 
-fn checked_stack_align_down(sp: usize, align: usize, low: usize) -> SysResult<usize> {
+fn checked_stack_align_down(sp: usize, align: usize, low: usize) -> KResult<usize> {
     let next = align_down(sp, align);
     if next < low {
-        return Err(SysError::E2BIG);
+        return Err(Errno::E2BIG);
     }
     Ok(next)
 }
 
-fn checked_table_size(arg_count: usize, env_count: usize, auxv_count: usize) -> SysResult<usize> {
+fn checked_table_size(arg_count: usize, env_count: usize, auxv_count: usize) -> KResult<usize> {
     let word = core::mem::size_of::<usize>();
     let words = 1usize
-        .checked_add(arg_count.checked_add(1).ok_or(SysError::E2BIG)?)
+        .checked_add(arg_count.checked_add(1).ok_or(Errno::E2BIG)?)
         .and_then(|value| value.checked_add(env_count.checked_add(1)?))
         .and_then(|value| value.checked_add(auxv_count.checked_add(1)?.checked_mul(2)?))
-        .ok_or(SysError::E2BIG)?;
-    words.checked_mul(word).ok_or(SysError::E2BIG)
+        .ok_or(Errno::E2BIG)?;
+    words.checked_mul(word).ok_or(Errno::E2BIG)
 }
 
-fn plan_user_string(user_sp: &mut usize, stack_low: usize, string: &str) -> SysResult<usize> {
-    let string_len = string.len().checked_add(1).ok_or(SysError::E2BIG)?;
+fn plan_user_string(user_sp: &mut usize, stack_low: usize, string: &str) -> KResult<usize> {
+    let string_len = string.len().checked_add(1).ok_or(Errno::E2BIG)?;
     *user_sp = checked_stack_sub(*user_sp, string_len, stack_low)?;
     let addr = *user_sp;
     *user_sp = checked_stack_align_down(*user_sp, core::mem::size_of::<usize>(), stack_low)?;
@@ -169,7 +167,7 @@ fn plan_user_strings(
     user_sp: &mut usize,
     stack_low: usize,
     strings: &[String],
-) -> SysResult<Vec<usize>> {
+) -> KResult<Vec<usize>> {
     let mut ptrs = Vec::with_capacity(strings.len());
     for string in strings {
         ptrs.push(plan_user_string(user_sp, stack_low, string.as_str())?);
@@ -182,7 +180,7 @@ fn plan_user_stack(
     args: &[String],
     envs: &[String],
     stack_info: &ExecStackInfo,
-) -> SysResult<ExecStackLayout> {
+) -> KResult<ExecStackLayout> {
     let stack_low = stack_low(stack_top)?;
     let mut string_sp = stack_top;
     let env_ptrs = plan_user_strings(&mut string_sp, stack_low, envs)?;
@@ -235,15 +233,15 @@ fn plan_user_stack(
     })
 }
 
-fn stack_offset(layout: &ExecStackLayout, addr: usize, len: usize) -> SysResult<usize> {
-    let offset = addr.checked_sub(layout.user_sp).ok_or(SysError::EFAULT)?;
-    let end = offset.checked_add(len).ok_or(SysError::EFAULT)?;
+fn stack_offset(layout: &ExecStackLayout, addr: usize, len: usize) -> KResult<usize> {
+    let offset = addr.checked_sub(layout.user_sp).ok_or(Errno::EFAULT)?;
+    let end = offset.checked_add(len).ok_or(Errno::EFAULT)?;
     let stack_len = layout
         .stack_top
         .checked_sub(layout.user_sp)
-        .ok_or(SysError::EFAULT)?;
+        .ok_or(Errno::EFAULT)?;
     if end > stack_len {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     Ok(offset)
 }
@@ -253,7 +251,7 @@ fn write_stack_bytes(
     layout: &ExecStackLayout,
     addr: usize,
     bytes: &[u8],
-) -> SysResult<()> {
+) -> KResult<()> {
     let offset = stack_offset(layout, addr, bytes.len())?;
     buffer[offset..offset + bytes.len()].copy_from_slice(bytes);
     Ok(())
@@ -264,7 +262,7 @@ fn write_stack_usize(
     layout: &ExecStackLayout,
     addr: usize,
     value: usize,
-) -> SysResult<()> {
+) -> KResult<()> {
     write_stack_bytes(buffer, layout, addr, &value.to_ne_bytes())
 }
 
@@ -273,9 +271,9 @@ fn write_stack_string(
     layout: &ExecStackLayout,
     addr: usize,
     string: &str,
-) -> SysResult<()> {
+) -> KResult<()> {
     write_stack_bytes(buffer, layout, addr, string.as_bytes())?;
-    let nul_addr = addr.checked_add(string.len()).ok_or(SysError::EFAULT)?;
+    let nul_addr = addr.checked_add(string.len()).ok_or(Errno::EFAULT)?;
     write_stack_bytes(buffer, layout, nul_addr, &[0])
 }
 
@@ -284,11 +282,11 @@ fn write_user_stack(
     layout: &ExecStackLayout,
     args: &[String],
     envs: &[String],
-) -> SysResult<()> {
+) -> KResult<()> {
     let stack_len = layout
         .stack_top
         .checked_sub(layout.user_sp)
-        .ok_or(SysError::EFAULT)?;
+        .ok_or(Errno::EFAULT)?;
     let mut stack = vec![0; stack_len];
 
     for (addr, string) in layout.env_ptrs.iter().zip(envs.iter()) {
@@ -357,10 +355,10 @@ pub(super) fn init_user_stack(
     args: &[String],
     envs: &[String],
     stack_info: &ExecStackInfo,
-) -> SysResult<(usize, usize, usize)> {
+) -> KResult<(usize, usize, usize)> {
     let layout = plan_user_stack(stack_top, args, envs, stack_info)?;
     if !memory_set.materialize_framed_range(layout.user_sp, stack_top) {
-        return Err(SysError::ENOMEM);
+        return Err(Errno::ENOMEM);
     }
     let token = memory_set.token();
     write_user_stack(token, &layout, args, envs)?;
@@ -388,13 +386,13 @@ impl ProcessControlBlock {
         envs: Vec<String>,
         executable_path: String,
         executable_node: Option<VfsNodeId>,
-    ) -> SysResult<()> {
+    ) -> KResult<()> {
         let smp_sched_probe = is_smp_sched_probe_path(&executable_path);
         let smp_cpu_probe = is_smp_cpu_probe_path(&executable_path);
         let smp_run_queue_drain_probe = is_smp_run_queue_drain_probe_path(&executable_path);
         let smp_wait_io_probe = is_smp_wait_io_probe_path(&executable_path);
         let smp_phase4_wait_probe = is_smp_phase4_wait_probe_path(&executable_path);
-        let current = current_task().ok_or(SysError::ESRCH)?;
+        let current = current_task().ok_or(Errno::ESRCH)?;
         let _exec_exclusion = self.begin_exec_exclusion(current.as_ref())?;
         let process_token = self.inner_exclusive_access().get_user_token();
         let task = prepare_exec_thread_group(self, current, process_token, self.getpid())?;
@@ -410,7 +408,7 @@ impl ProcessControlBlock {
             interp_base,
             sysinfo_ehdr,
         } = MemorySet::from_elf_lazy(elf, executable_file, executable_file_size, interpreter)
-            .ok_or(SysError::ENOEXEC)?;
+            .ok_or(Errno::ENOEXEC)?;
         let stack_info = ExecStackInfo {
             at_entry: program_entry,
             phdr,
@@ -425,7 +423,7 @@ impl ProcessControlBlock {
         };
         let expected_user_stack_top = ustack_base
             .checked_add(USER_STACK_SIZE)
-            .ok_or(SysError::E2BIG)?;
+            .ok_or(Errno::E2BIG)?;
         // Plan the user stack before committing the new memory set. Argument
         // overflow should fail with E2BIG while the old image is still intact.
         let stack_layout = plan_user_stack(expected_user_stack_top, &args, &envs, &stack_info)?;
@@ -494,7 +492,7 @@ impl ProcessControlBlock {
             .memory_set
             .materialize_framed_range(stack_layout.user_sp, user_stack_top)
             .then_some(())
-            .ok_or(SysError::ENOMEM)?;
+            .ok_or(Errno::ENOMEM)?;
         write_user_stack(new_token, &stack_layout, &args, &envs)?;
         let user_sp = stack_layout.user_sp;
 

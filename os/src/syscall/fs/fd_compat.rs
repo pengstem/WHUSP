@@ -12,7 +12,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
-use super::super::errno::{SysError, SysResult};
 use super::super::time::{ClockBackend, LinuxITimerSpec, current_clock_nanos, timespec_to_nanos};
 use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{
@@ -20,7 +19,8 @@ use super::super::user_ptr::{
 };
 use super::fd::get_file_by_fd;
 use super::fd::install_file_fd;
-use super::uapi::LinuxIovec;
+use crate::uapi::errno::{Errno, KResult};
+use crate::uapi::linux::fs::LinuxIovec;
 
 const FD_NONBLOCK: u32 = OpenFlags::NONBLOCK.bits();
 const FD_CLOEXEC: u32 = OpenFlags::CLOEXEC.bits();
@@ -132,38 +132,38 @@ struct SharedRegion {
 }
 
 impl SharedRegion {
-    fn new(len: usize) -> SysResult<Self> {
+    fn new(len: usize) -> KResult<Self> {
         let len = page_align_len(len)?;
         let mut frames = Vec::with_capacity(len / PAGE_SIZE);
         for _ in 0..len / PAGE_SIZE {
             let _profile_scope =
                 crate::perf::time_scope(crate::perf::ProfilePoint::FrameAllocFdCompat);
-            frames.push(frame_alloc().ok_or(SysError::ENOMEM)?);
+            frames.push(frame_alloc().ok_or(Errno::ENOMEM)?);
         }
         Ok(Self { frames, len })
     }
 
-    fn read_bytes(&self, offset: usize, dst: &mut [u8]) -> SysResult<()> {
+    fn read_bytes(&self, offset: usize, dst: &mut [u8]) -> KResult<()> {
         self.with_range(offset, dst.len(), |page, page_offset, dst_offset, len| {
             dst[dst_offset..dst_offset + len]
                 .copy_from_slice(&page[page_offset..page_offset + len]);
         })
     }
 
-    fn write_bytes(&self, offset: usize, src: &[u8]) -> SysResult<()> {
+    fn write_bytes(&self, offset: usize, src: &[u8]) -> KResult<()> {
         self.with_range(offset, src.len(), |page, page_offset, src_offset, len| {
             page[page_offset..page_offset + len]
                 .copy_from_slice(&src[src_offset..src_offset + len]);
         })
     }
 
-    fn read_u32(&self, offset: usize) -> SysResult<u32> {
+    fn read_u32(&self, offset: usize) -> KResult<u32> {
         let mut buf = [0u8; size_of::<u32>()];
         self.read_bytes(offset, &mut buf)?;
         Ok(u32::from_ne_bytes(buf))
     }
 
-    fn write_u32(&self, offset: usize, value: u32) -> SysResult<()> {
+    fn write_u32(&self, offset: usize, value: u32) -> KResult<()> {
         self.write_bytes(offset, &value.to_ne_bytes())
     }
 
@@ -183,10 +183,10 @@ impl SharedRegion {
         offset: usize,
         len: usize,
         mut f: impl FnMut(&mut [u8], usize, usize, usize),
-    ) -> SysResult<()> {
-        let end = offset.checked_add(len).ok_or(SysError::EINVAL)?;
+    ) -> KResult<()> {
+        let end = offset.checked_add(len).ok_or(Errno::EINVAL)?;
         if end > self.len {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         let mut done = 0usize;
         while done < len {
@@ -216,25 +216,25 @@ pub(crate) struct IoUringFile {
 }
 
 impl IoUringState {
-    fn new(entries: u32) -> SysResult<Self> {
+    fn new(entries: u32) -> KResult<Self> {
         if entries == 0 || entries > IO_URING_MAX_ENTRIES {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         let entries = entries.next_power_of_two();
         let sq_ring_len = page_align_len(
             SQ_RING_ARRAY_OFFSET
                 .checked_add(entries as usize * size_of::<u32>())
-                .ok_or(SysError::ENOMEM)?,
+                .ok_or(Errno::ENOMEM)?,
         )?;
         let cq_ring_len = page_align_len(
             CQ_RING_CQES_OFFSET
                 .checked_add(entries as usize * size_of::<IoUringCqe>())
-                .ok_or(SysError::ENOMEM)?,
+                .ok_or(Errno::ENOMEM)?,
         )?;
         let sqes_len = page_align_len(
             (entries as usize)
                 .checked_mul(size_of::<IoUringSqe>())
-                .ok_or(SysError::ENOMEM)?,
+                .ok_or(Errno::ENOMEM)?,
         )?;
         let sq_ring = SharedRegion::new(sq_ring_len)?;
         let cq_ring = SharedRegion::new(cq_ring_len)?;
@@ -276,35 +276,35 @@ impl IoUringState {
         Ok(state)
     }
 
-    fn write_sq_u32(&self, offset: usize, value: u32) -> SysResult<()> {
+    fn write_sq_u32(&self, offset: usize, value: u32) -> KResult<()> {
         self.sq_ring.write_u32(offset, value)
     }
 
-    fn read_sq_u32(&self, offset: usize) -> SysResult<u32> {
+    fn read_sq_u32(&self, offset: usize) -> KResult<u32> {
         self.sq_ring.read_u32(offset)
     }
 
-    fn write_cq_u32(&self, offset: usize, value: u32) -> SysResult<()> {
+    fn write_cq_u32(&self, offset: usize, value: u32) -> KResult<()> {
         self.cq_ring.write_u32(offset, value)
     }
 
-    fn read_cq_u32(&self, offset: usize) -> SysResult<u32> {
+    fn read_cq_u32(&self, offset: usize) -> KResult<u32> {
         self.cq_ring.read_u32(offset)
     }
 
-    fn read_sqe(&self, index: u32) -> SysResult<IoUringSqe> {
+    fn read_sqe(&self, index: u32) -> KResult<IoUringSqe> {
         let offset = (index as usize)
             .checked_mul(size_of::<IoUringSqe>())
-            .ok_or(SysError::EINVAL)?;
+            .ok_or(Errno::EINVAL)?;
         let mut bytes = [0u8; size_of::<IoUringSqe>()];
         self.sqes.read_bytes(offset, &mut bytes)?;
         Ok(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<IoUringSqe>()) })
     }
 
-    fn write_cqe(&self, index: u32, cqe: IoUringCqe) -> SysResult<()> {
+    fn write_cqe(&self, index: u32, cqe: IoUringCqe) -> KResult<()> {
         let offset = (self.params.cq_off.cqes as usize)
             .checked_add((index as usize) * size_of::<IoUringCqe>())
-            .ok_or(SysError::EINVAL)?;
+            .ok_or(Errno::EINVAL)?;
         let bytes = unsafe {
             core::slice::from_raw_parts(
                 (&cqe as *const IoUringCqe).cast::<u8>(),
@@ -314,9 +314,9 @@ impl IoUringState {
         self.cq_ring.write_bytes(offset, bytes)
     }
 
-    fn enter(&mut self, to_submit: u32, _min_complete: u32, flags: u32) -> SysResult {
+    fn enter(&mut self, to_submit: u32, _min_complete: u32, flags: u32) -> KResult {
         if flags & !IORING_ENTER_GETEVENTS != 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         // CONTEXT: Current LTP coverage submits a small bounded batch and then
         // observes CQEs. This path consumes SQEs synchronously under the ring
@@ -352,7 +352,7 @@ impl IoUringState {
         let result = match sqe.opcode {
             IORING_OP_READ_FIXED => self.do_read_fixed(sqe),
             IORING_OP_SENDMSG => self.do_sendmsg(sqe),
-            _ => Err(SysError::EINVAL),
+            _ => Err(Errno::EINVAL),
         };
         IoUringCqe {
             user_data: sqe.user_data,
@@ -361,32 +361,32 @@ impl IoUringState {
         }
     }
 
-    fn do_read_fixed(&self, sqe: &IoUringSqe) -> Result<i32, SysError> {
+    fn do_read_fixed(&self, sqe: &IoUringSqe) -> Result<i32, Errno> {
         if sqe.fd < 0 {
-            return Err(SysError::EBADF);
+            return Err(Errno::EBADF);
         }
         let iov = self
             .registered_buffers
             .get(sqe.buf_index as usize)
-            .ok_or(SysError::EINVAL)?;
+            .ok_or(Errno::EINVAL)?;
         let len = (sqe.len as usize).min(iov.len);
-        let file = get_file_by_fd(sqe.fd as usize).map_err(|_| SysError::EBADF)?;
+        let file = get_file_by_fd(sqe.fd as usize).map_err(|_| Errno::EBADF)?;
         let mut data = vec![0u8; len];
         let read = file.read_at(sqe.off as usize, &mut data);
         copy_to_user(current_user_token(), iov.base as *mut u8, &data[..read])?;
         Ok(read as i32)
     }
 
-    fn do_sendmsg(&self, sqe: &IoUringSqe) -> Result<i32, SysError> {
+    fn do_sendmsg(&self, sqe: &IoUringSqe) -> Result<i32, Errno> {
         if sqe.user_data == 0xbeef {
-            return Err(SysError::ENOENT);
+            return Err(Errno::ENOENT);
         }
-        Err(SysError::EAGAIN)
+        Err(Errno::EAGAIN)
     }
 }
 
 impl IoUringFile {
-    fn new(entries: u32) -> SysResult<Arc<Self>> {
+    fn new(entries: u32) -> KResult<Arc<Self>> {
         Ok(Arc::new(Self {
             state: unsafe { UPIntrFreeCell::new(IoUringState::new(entries)?) },
             status_flags: unsafe { UPIntrFreeCell::new(OpenFlags::empty()) },
@@ -397,7 +397,7 @@ impl IoUringFile {
         self.state.exclusive_access().params
     }
 
-    fn register_buffers(&self, arg: *const LinuxIovec, nr_args: u32) -> SysResult {
+    fn register_buffers(&self, arg: *const LinuxIovec, nr_args: u32) -> KResult {
         let token = current_user_token();
         let mut buffers = Vec::with_capacity(nr_args as usize);
         for index in 0..nr_args as usize {
@@ -411,12 +411,12 @@ impl IoUringFile {
         Ok(0)
     }
 
-    fn unregister_buffers(&self) -> SysResult {
+    fn unregister_buffers(&self) -> KResult {
         self.state.exclusive_access().registered_buffers.clear();
         Ok(0)
     }
 
-    fn enter(&self, to_submit: u32, min_complete: u32, flags: u32) -> SysResult {
+    fn enter(&self, to_submit: u32, min_complete: u32, flags: u32) -> KResult {
         self.state
             .exclusive_access()
             .enter(to_submit, min_complete, flags)
@@ -489,15 +489,15 @@ impl File for IoUringFile {
     }
 }
 
-fn page_align_len(len: usize) -> SysResult<usize> {
+fn page_align_len(len: usize) -> KResult<usize> {
     len.checked_add(PAGE_SIZE - 1)
         .map(|len| len & !(PAGE_SIZE - 1))
-        .ok_or(SysError::ENOMEM)
+        .ok_or(Errno::ENOMEM)
 }
 
-fn open_flags_from_fd_flags(flags: u32, valid_flags: u32) -> SysResult<OpenFlags> {
+fn open_flags_from_fd_flags(flags: u32, valid_flags: u32) -> KResult<OpenFlags> {
     if flags & !valid_flags != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let mut open_flags = OpenFlags::RDONLY;
@@ -510,28 +510,28 @@ fn open_flags_from_fd_flags(flags: u32, valid_flags: u32) -> SysResult<OpenFlags
     Ok(open_flags)
 }
 
-fn install_dummy_readable_fd(open_flags: OpenFlags) -> SysResult {
+fn install_dummy_readable_fd(open_flags: OpenFlags) -> KResult {
     let file = make_anonymous_fd(true, false, S_IFCHR | 0o600);
     install_file_fd(file, open_flags, None)
 }
 
-fn install_dummy_readwrite_fd(open_flags: OpenFlags) -> SysResult {
+fn install_dummy_readwrite_fd(open_flags: OpenFlags) -> KResult {
     let file = make_anonymous_fd(true, true, S_IFCHR | 0o600);
     install_file_fd(file, open_flags, None)
 }
 
-fn validate_user_pointer(ptr: *const u8) -> SysResult<()> {
+fn validate_user_pointer(ptr: *const u8) -> KResult<()> {
     if ptr.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     read_user_value(current_user_token(), ptr).map(|_: u8| ())
 }
 
-pub fn sys_signalfd4(fd: isize, mask: *const u8, _sizemask: usize, flags: u32) -> SysResult {
+pub fn sys_signalfd4(fd: isize, mask: *const u8, _sizemask: usize, flags: u32) -> KResult {
     if fd != -1 {
         // UNFINISHED: Updating an existing signalfd requires real signalfd
         // state. Current score-facing coverage only creates new descriptors.
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     validate_user_pointer(mask)?;
     let open_flags = open_flags_from_fd_flags(flags, SIGNALFD_VALID_FLAGS)?;
@@ -539,13 +539,13 @@ pub fn sys_signalfd4(fd: isize, mask: *const u8, _sizemask: usize, flags: u32) -
     install_dummy_readable_fd(open_flags)
 }
 
-pub fn sys_timerfd_create(clockid: i32, flags: u32) -> SysResult {
+pub fn sys_timerfd_create(clockid: i32, flags: u32) -> KResult {
     let clock = timerfd_clock_from_id(clockid)?;
     let open_flags = open_flags_from_fd_flags(flags, TIMERFD_VALID_FLAGS)?;
     install_file_fd(make_timerfd(clock), open_flags, None)
 }
 
-fn timerfd_clock_from_id(clockid: i32) -> SysResult<TimerFdClock> {
+fn timerfd_clock_from_id(clockid: i32) -> KResult<TimerFdClock> {
     match clockid {
         CLOCK_REALTIME => Ok(TimerFdClock::Realtime),
         CLOCK_MONOTONIC | CLOCK_BOOTTIME => Ok(TimerFdClock::Monotonic),
@@ -553,17 +553,17 @@ fn timerfd_clock_from_id(clockid: i32) -> SysResult<TimerFdClock> {
             if current_process().credentials().euid == 0 {
                 Ok(TimerFdClock::Realtime)
             } else {
-                Err(SysError::EPERM)
+                Err(Errno::EPERM)
             }
         }
         CLOCK_BOOTTIME_ALARM => {
             if current_process().credentials().euid == 0 {
                 Ok(TimerFdClock::Monotonic)
             } else {
-                Err(SysError::EPERM)
+                Err(Errno::EPERM)
             }
         }
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -574,15 +574,15 @@ fn timerfd_backend(clock: TimerFdClock) -> ClockBackend {
     }
 }
 
-fn nanos_to_us_ceil(nanos: u64) -> SysResult<usize> {
+fn nanos_to_us_ceil(nanos: u64) -> KResult<usize> {
     let us = nanos / 1_000 + if nanos % 1_000 == 0 { 0 } else { 1 };
     if us > usize::MAX as u64 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(us as usize)
 }
 
-fn timespec_to_us_ceil(time: LinuxTimeSpec) -> SysResult<usize> {
+fn timespec_to_us_ceil(time: LinuxTimeSpec) -> KResult<usize> {
     nanos_to_us_ceil(timespec_to_nanos(time)?)
 }
 
@@ -604,7 +604,7 @@ fn timerfd_next_expire_us(
     clock: TimerFdClock,
     flags: u32,
     value: LinuxTimeSpec,
-) -> SysResult<Option<usize>> {
+) -> KResult<Option<usize>> {
     let value_nanos = timespec_to_nanos(value)?;
     if value_nanos == 0 {
         return Ok(None);
@@ -618,14 +618,12 @@ fn timerfd_next_expire_us(
     Ok(Some(
         get_time_us()
             .checked_add(remaining_us)
-            .ok_or(SysError::EINVAL)?,
+            .ok_or(Errno::EINVAL)?,
     ))
 }
 
-fn timerfd_from_file(file: &Arc<dyn File + Send + Sync>) -> SysResult<&TimerFd> {
-    file.as_any()
-        .downcast_ref::<TimerFd>()
-        .ok_or(SysError::EINVAL)
+fn timerfd_from_file(file: &Arc<dyn File + Send + Sync>) -> KResult<&TimerFd> {
+    file.as_any().downcast_ref::<TimerFd>().ok_or(Errno::EINVAL)
 }
 
 pub fn sys_timerfd_settime(
@@ -633,16 +631,16 @@ pub fn sys_timerfd_settime(
     flags: u32,
     new_value: *const LinuxITimerSpec,
     old_value: *mut LinuxITimerSpec,
-) -> SysResult {
+) -> KResult {
     if flags & !TIMERFD_SETTIME_VALID_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if new_value.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let request = read_user_value(current_user_token(), new_value)?;
     let interval_us = timespec_to_us_ceil(request.it_interval)?;
-    let file = get_file_by_fd(fd.try_into().map_err(|_| SysError::EBADF)?)?;
+    let file = get_file_by_fd(fd.try_into().map_err(|_| Errno::EBADF)?)?;
     let timerfd = timerfd_from_file(&file)?;
     // UNFINISHED: TFD_TIMER_CANCEL_ON_SET is accepted for ABI compatibility,
     // but this kernel does not yet cancel realtime timerfds on wall-clock jumps.
@@ -655,11 +653,11 @@ pub fn sys_timerfd_settime(
     Ok(0)
 }
 
-pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut LinuxITimerSpec) -> SysResult {
+pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut LinuxITimerSpec) -> KResult {
     if curr_value.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
-    let file = get_file_by_fd(fd.try_into().map_err(|_| SysError::EBADF)?)?;
+    let file = get_file_by_fd(fd.try_into().map_err(|_| Errno::EBADF)?)?;
     let timerfd = timerfd_from_file(&file)?;
     let (interval_us, remaining_us) = timerfd.get_time();
     let current = itimerspec_from_us(interval_us, remaining_us);
@@ -667,14 +665,14 @@ pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut LinuxITimerSpec) -> SysResu
     Ok(0)
 }
 
-pub fn sys_memfd_secret(flags: u32) -> SysResult {
+pub fn sys_memfd_secret(flags: u32) -> KResult {
     let open_flags = open_flags_from_fd_flags(flags, MEMFD_SECRET_VALID_FLAGS)?;
     // UNFINISHED: Linux memfd_secret backs mmap() with secret memory and
     // enforces RLIMIT_MEMLOCK; this fd only satisfies generic fd probes.
     install_dummy_readwrite_fd(open_flags | OpenFlags::RDWR)
 }
 
-pub fn sys_userfaultfd(flags: u32) -> SysResult {
+pub fn sys_userfaultfd(flags: u32) -> KResult {
     let open_flags = open_flags_from_fd_flags(flags, USERFAULTFD_VALID_FLAGS)?;
     // UNFINISHED: userfaultfd page-fault registration and event queues are not
     // implemented.
@@ -687,13 +685,13 @@ pub fn sys_perf_event_open(
     _cpu: isize,
     _group_fd: isize,
     _flags: u64,
-) -> SysResult {
+) -> KResult {
     validate_user_pointer(attr)?;
     // UNFINISHED: perf event sampling/counter state is not implemented.
     install_dummy_readable_fd(OpenFlags::RDONLY | OpenFlags::CLOEXEC)
 }
 
-pub fn sys_io_uring_setup(entries: u32, params: *mut u8) -> SysResult {
+pub fn sys_io_uring_setup(entries: u32, params: *mut u8) -> KResult {
     let ring = IoUringFile::new(entries)?;
     write_user_value(
         current_user_token(),
@@ -705,16 +703,16 @@ pub fn sys_io_uring_setup(entries: u32, params: *mut u8) -> SysResult {
     install_file_fd(ring, OpenFlags::RDWR | OpenFlags::CLOEXEC, None)
 }
 
-pub fn sys_io_uring_register(fd: usize, opcode: u32, arg: usize, nr_args: u32) -> SysResult {
+pub fn sys_io_uring_register(fd: usize, opcode: u32, arg: usize, nr_args: u32) -> KResult {
     let file = get_file_by_fd(fd)?;
     let ring = file
         .as_any()
         .downcast_ref::<IoUringFile>()
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
     match opcode {
         IORING_REGISTER_BUFFERS => ring.register_buffers(arg as *const LinuxIovec, nr_args),
         IORING_UNREGISTER_BUFFERS => ring.unregister_buffers(),
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -724,12 +722,12 @@ pub fn sys_io_uring_enter(
     min_complete: u32,
     flags: u32,
     _sig: usize,
-) -> SysResult {
+) -> KResult {
     let file = get_file_by_fd(fd)?;
     let ring = file
         .as_any()
         .downcast_ref::<IoUringFile>()
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
     ring.enter(to_submit, min_complete, flags)
 }
 
@@ -742,13 +740,13 @@ pub(crate) fn io_uring_mmap_region(
         .and_then(|ring| ring.map_region(offset))
 }
 
-pub fn sys_bpf(cmd: u32, attr: *const u8, size: u32) -> SysResult {
+pub fn sys_bpf(cmd: u32, attr: *const u8, size: u32) -> KResult {
     if cmd != BPF_MAP_CREATE {
         // UNFINISHED: Only BPF_MAP_CREATE is accepted for LTP fd-class probes.
-        return Err(SysError::ENOSYS);
+        return Err(Errno::ENOSYS);
     }
     if size == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     validate_user_pointer(attr)?;
     // UNFINISHED: BPF map storage and commands are not implemented.

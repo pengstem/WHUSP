@@ -6,7 +6,6 @@ use super::{
 use crate::mm::FutexSharedKey;
 use crate::perf;
 use crate::sync::SpinNoIrqLock;
-use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::time::{
     ClockBackend, current_clock_nanos, relative_timeout_deadline_ms,
     relative_timeout_deadline_ms_from_nanos, timespec_to_nanos, validate_timespec,
@@ -17,6 +16,7 @@ use crate::syscall::user_ptr::{
     write_user_value_with_mmap_fault,
 };
 use crate::timer::{add_timer, get_time_ms};
+use crate::uapi::errno::{Errno, KResult};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -501,7 +501,7 @@ pub(super) fn init() {
     lazy_static::initialize(&FUTEX_MANAGER);
 }
 
-fn futex_key(addr: usize, private: bool) -> SysResult<FutexKey> {
+fn futex_key(addr: usize, private: bool) -> KResult<FutexKey> {
     let process = current_process();
     if private {
         return Ok(FutexKey::Private {
@@ -529,27 +529,27 @@ fn futex_key_for_process(addr: usize, private: bool, process_id: usize) -> Futex
     }
 }
 
-fn validate_futex_addr(addr: usize) -> SysResult {
+fn validate_futex_addr(addr: usize) -> KResult {
     // Linux futex operations address a naturally aligned 32-bit user word.
     // Reject unaligned addresses before any user access so EINVAL is not
     // hidden behind a later EFAULT from the copy helper.
     if addr % core::mem::size_of::<u32>() != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(0)
 }
 
-fn read_futex_word(addr: usize) -> SysResult<u32> {
+fn read_futex_word(addr: usize) -> KResult<u32> {
     validate_futex_addr(addr)?;
     read_user_value_with_mmap_fault(current_user_token(), addr as *const u32)
 }
 
-fn write_futex_word(addr: usize, value: u32) -> SysResult<()> {
+fn write_futex_word(addr: usize, value: u32) -> KResult<()> {
     validate_futex_addr(addr)?;
     write_user_value_with_mmap_fault(current_user_token(), addr as *mut u32, &value)
 }
 
-fn read_futex_word_with_token(token: usize, addr: usize) -> SysResult<u32> {
+fn read_futex_word_with_token(token: usize, addr: usize) -> KResult<u32> {
     validate_futex_addr(addr)?;
     read_user_value(token, addr as *const u32)
 }
@@ -558,24 +558,24 @@ fn write_futex_word_with_current_token_no_fault(
     token: usize,
     addr: usize,
     value: u32,
-) -> SysResult<()> {
+) -> KResult<()> {
     validate_futex_addr(addr)?;
     write_user_value(token, addr as *mut u32, &value)
 }
 
-fn write_futex_word_with_token(token: usize, addr: usize, value: u32) -> SysResult<()> {
+fn write_futex_word_with_token(token: usize, addr: usize, value: u32) -> KResult<()> {
     validate_futex_addr(addr)?;
     write_user_value(token, addr as *mut u32, &value)
 }
 
-fn linux_tid_to_futex_word(tid: usize) -> SysResult<u32> {
+fn linux_tid_to_futex_word(tid: usize) -> KResult<u32> {
     if tid > FUTEX_TID_MASK as usize {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(tid as u32)
 }
 
-fn current_linux_tid_u32() -> SysResult<u32> {
+fn current_linux_tid_u32() -> KResult<u32> {
     linux_tid_to_futex_word(
         current_task()
             .expect("futex syscall must run with a current task")
@@ -586,7 +586,7 @@ fn current_linux_tid_u32() -> SysResult<u32> {
 fn futex_timeout_absolute(
     timeout: *const LinuxTimeSpec,
     backend: ClockBackend,
-) -> SysResult<Option<usize>> {
+) -> KResult<Option<usize>> {
     if timeout.is_null() {
         return Ok(None);
     }
@@ -611,7 +611,7 @@ fn futex_wait(
     expected: u32,
     timeout_ms: Option<usize>,
     bitset: u32,
-) -> SysResult {
+) -> KResult {
     let key = futex_key(addr, private)?;
     let task = current_task().expect("futex wait must run with a current task");
     let token = current_user_token();
@@ -619,13 +619,13 @@ fn futex_wait(
     // Fault the word in before taking its IRQ-safe hash-bucket lock. The second
     // no-fault read under that lock is the compare-and-block point.
     if read_futex_word(addr)? != expected {
-        return Err(SysError::EAGAIN);
+        return Err(Errno::EAGAIN);
     }
     if futex_timeout_expired(timeout_ms) {
-        return Err(SysError::ETIMEDOUT);
+        return Err(Errno::ETIMEDOUT);
     }
     if current_has_deliverable_signal() {
-        return Err(SysError::EINTR);
+        return Err(Errno::EINTR);
     }
 
     let (task_cx_ptr, waiter) = {
@@ -634,14 +634,14 @@ fn futex_wait(
         // after the user word changes must either see the queued waiter or the
         // waiter must return EAGAIN before sleeping.
         if read_futex_word_with_token(token, addr)? != expected {
-            return Err(SysError::EAGAIN);
+            return Err(Errno::EAGAIN);
         }
         if futex_timeout_expired(timeout_ms) {
-            return Err(SysError::ETIMEDOUT);
+            return Err(Errno::ETIMEDOUT);
         }
         FUTEX_MANAGER
             .block_current_on(&mut bucket, key, bitset)
-            .ok_or(SysError::EINTR)?
+            .ok_or(Errno::EINTR)?
     };
 
     if let Some(deadline_ms) = timeout_ms {
@@ -652,23 +652,23 @@ fn futex_wait(
     let cleanup = FUTEX_MANAGER.remove_waiter_for_task(&waiter);
     if futex_timeout_expired(timeout_ms) {
         if cleanup == FutexWaitCleanup::StillQueued {
-            return Err(SysError::ETIMEDOUT);
+            return Err(Errno::ETIMEDOUT);
         }
         if current_has_deliverable_signal() {
-            return Err(SysError::EINTR);
+            return Err(Errno::EINTR);
         }
         return Ok(0);
     }
     if current_has_deliverable_signal() {
-        return Err(SysError::EINTR);
+        return Err(Errno::EINTR);
     }
     if cleanup == FutexWaitCleanup::StillQueued {
-        return Err(SysError::EINTR);
+        return Err(Errno::EINTR);
     }
     Ok(0)
 }
 
-fn futex_wake(addr: usize, private: bool, limit: usize, bitset: u32) -> SysResult<usize> {
+fn futex_wake(addr: usize, private: bool, limit: usize, bitset: u32) -> KResult<usize> {
     let key = futex_key(addr, private)?;
     let tasks = FUTEX_MANAGER.wake(key, limit, bitset);
     Ok(wake_futex_tasks(tasks))
@@ -707,7 +707,7 @@ fn futex_waiters_word(owner_tid: u32, has_waiters: bool) -> u32 {
     }
 }
 
-fn clear_pi_waiters_bit_if_idle(addr: usize, key: FutexKey) -> SysResult {
+fn clear_pi_waiters_bit_if_idle(addr: usize, key: FutexKey) -> KResult {
     if FUTEX_MANAGER.has_waiters(key) {
         return Ok(0);
     }
@@ -718,31 +718,31 @@ fn clear_pi_waiters_bit_if_idle(addr: usize, key: FutexKey) -> SysResult {
     Ok(0)
 }
 
-fn futex_try_lock_pi(addr: usize) -> SysResult {
+fn futex_try_lock_pi(addr: usize) -> KResult {
     let tid = current_linux_tid_u32()?;
     if try_acquire_pi_word(addr, tid)? {
         return Ok(0);
     }
-    Err(SysError::EAGAIN)
+    Err(Errno::EAGAIN)
 }
 
-fn try_acquire_pi_word(addr: usize, tid: u32) -> SysResult<bool> {
+fn try_acquire_pi_word(addr: usize, tid: u32) -> KResult<bool> {
     let word = read_futex_word(addr)?;
     let owner_tid = word & FUTEX_TID_MASK;
     if owner_tid == 0 {
         if word & FUTEX_WAITERS != 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         write_futex_word(addr, tid)?;
         return Ok(true);
     }
     if owner_tid == tid {
-        return Err(SysError::EDEADLK);
+        return Err(Errno::EDEADLK);
     }
     Ok(false)
 }
 
-fn futex_lock_pi(addr: usize, private: bool, timeout_ms: Option<usize>) -> SysResult {
+fn futex_lock_pi(addr: usize, private: bool, timeout_ms: Option<usize>) -> KResult {
     let key = futex_key(addr, private)?;
     let tid = current_linux_tid_u32()?;
     let task = current_task().expect("PI futex lock must run with a current task");
@@ -757,23 +757,23 @@ fn futex_lock_pi(addr: usize, private: bool, timeout_ms: Option<usize>) -> SysRe
         let owner_tid = word & FUTEX_TID_MASK;
         if owner_tid == 0 {
             if word & FUTEX_WAITERS != 0 {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             write_futex_word_with_current_token_no_fault(token, addr, tid)?;
             return Ok(0);
         }
         if owner_tid == tid {
-            return Err(SysError::EDEADLK);
+            return Err(Errno::EDEADLK);
         }
         if futex_timeout_expired(timeout_ms) {
-            return Err(SysError::ETIMEDOUT);
+            return Err(Errno::ETIMEDOUT);
         }
         if word & FUTEX_WAITERS == 0 {
             write_futex_word_with_current_token_no_fault(token, addr, word | FUTEX_WAITERS)?;
         }
         FUTEX_MANAGER
             .block_current_on(&mut bucket, key, FUTEX_BITSET_MATCH_ANY)
-            .ok_or(SysError::EINTR)?
+            .ok_or(Errno::EINTR)?
     };
 
     if let Some(deadline_ms) = timeout_ms {
@@ -785,30 +785,30 @@ fn futex_lock_pi(addr: usize, private: bool, timeout_ms: Option<usize>) -> SysRe
     if futex_timeout_expired(timeout_ms) {
         if cleanup == FutexWaitCleanup::StillQueued {
             clear_pi_waiters_bit_if_idle(addr, key)?;
-            return Err(SysError::ETIMEDOUT);
+            return Err(Errno::ETIMEDOUT);
         }
         if current_has_deliverable_signal() {
-            return Err(SysError::EINTR);
+            return Err(Errno::EINTR);
         }
         return Ok(0);
     }
     if current_has_deliverable_signal() {
         clear_pi_waiters_bit_if_idle(addr, key)?;
-        return Err(SysError::EINTR);
+        return Err(Errno::EINTR);
     }
     if cleanup == FutexWaitCleanup::StillQueued {
         clear_pi_waiters_bit_if_idle(addr, key)?;
-        return Err(SysError::EINTR);
+        return Err(Errno::EINTR);
     }
     Ok(0)
 }
 
-fn futex_unlock_pi(addr: usize, private: bool) -> SysResult {
+fn futex_unlock_pi(addr: usize, private: bool) -> KResult {
     let key = futex_key(addr, private)?;
     let tid = current_linux_tid_u32()?;
     let word = read_futex_word(addr)?;
     if word & FUTEX_TID_MASK != tid {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
 
     let (next_task, has_more_waiters) = FUTEX_MANAGER.wake_one(key);
@@ -826,15 +826,15 @@ fn futex_unlock_pi(addr: usize, private: bool) -> SysResult {
     Ok(0)
 }
 
-fn robust_futex_addr(entry: usize, futex_offset: isize) -> SysResult<usize> {
+fn robust_futex_addr(entry: usize, futex_offset: isize) -> KResult<usize> {
     if futex_offset >= 0 {
         entry
             .checked_add(futex_offset as usize)
-            .ok_or(SysError::EFAULT)
+            .ok_or(Errno::EFAULT)
     } else {
         entry
-            .checked_sub(futex_offset.checked_neg().ok_or(SysError::EFAULT)? as usize)
-            .ok_or(SysError::EFAULT)
+            .checked_sub(futex_offset.checked_neg().ok_or(Errno::EFAULT)? as usize)
+            .ok_or(Errno::EFAULT)
     }
 }
 
@@ -844,7 +844,7 @@ fn handle_robust_futex_death(
     entry: usize,
     futex_offset: isize,
     tid: u32,
-) -> SysResult {
+) -> KResult {
     let addr = robust_futex_addr(entry, futex_offset)?;
     let word = read_futex_word_with_token(token, addr)?;
     if word & FUTEX_TID_MASK != tid {
@@ -862,12 +862,7 @@ fn handle_robust_futex_death(
     Ok(0)
 }
 
-fn exit_robust_list_inner(
-    head_addr: usize,
-    token: usize,
-    process_id: usize,
-    tid: u32,
-) -> SysResult {
+fn exit_robust_list_inner(head_addr: usize, token: usize, process_id: usize, tid: u32) -> KResult {
     let head: LinuxRobustListHead =
         read_user_value(token, head_addr as *const LinuxRobustListHead)?;
     let mut entry = head.list_next;
@@ -875,7 +870,7 @@ fn exit_robust_list_inner(
 
     while entry != 0 && entry != head_addr {
         if remaining == 0 {
-            return Err(SysError::ELOOP);
+            return Err(Errno::ELOOP);
         }
         remaining -= 1;
         let next = read_user_value::<LinuxRobustList>(token, entry as *const LinuxRobustList)?.next;
@@ -931,12 +926,12 @@ fn futex_requeue(
     requeue_limit: usize,
     addr2: usize,
     count_requeued: bool,
-) -> SysResult<usize> {
+) -> KResult<usize> {
     validate_futex_addr(addr2)?;
     let source = futex_key(addr, private)?;
     let target = futex_key(addr2, private)?;
     if source == target {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let (tasks, moved) = FUTEX_MANAGER.requeue(source, target, wake_limit, requeue_limit);
     let woken = wake_futex_tasks(tasks);
@@ -947,9 +942,9 @@ pub(crate) fn remove_process_futex_waiters(process_id: usize) {
     FUTEX_MANAGER.remove_process(process_id);
 }
 
-pub(crate) fn sys_set_robust_list(head: usize, len: usize) -> SysResult {
+pub(crate) fn sys_set_robust_list(head: usize, len: usize) -> KResult {
     if len != size_of::<LinuxRobustListHead>() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     // Robust-list heads are Linux-thread state, not process state. Exit and
     // exec cleanup read this field from the owning TaskControlBlock.
@@ -959,12 +954,12 @@ pub(crate) fn sys_set_robust_list(head: usize, len: usize) -> SysResult {
     Ok(0)
 }
 
-fn robust_list_query_task(pid: isize) -> SysResult<Arc<TaskControlBlock>> {
+fn robust_list_query_task(pid: isize) -> KResult<Arc<TaskControlBlock>> {
     if pid < 0 {
-        return Err(SysError::ESRCH);
+        return Err(Errno::ESRCH);
     }
     if pid == 0 {
-        return current_task().ok_or(SysError::ESRCH);
+        return current_task().ok_or(Errno::ESRCH);
     }
 
     let pid = pid as usize;
@@ -979,14 +974,14 @@ fn robust_list_query_task(pid: isize) -> SysResult<Arc<TaskControlBlock>> {
         .filter_map(|task| task.as_ref())
         .find(|task| task.linux_tid() == pid)
         .map(Arc::clone)
-        .ok_or(SysError::ESRCH)
+        .ok_or(Errno::ESRCH)
 }
 
 pub(crate) fn sys_get_robust_list(
     pid: isize,
     head_ptr: *mut usize,
     len_ptr: *mut usize,
-) -> SysResult {
+) -> KResult {
     let task = robust_list_query_task(pid)?;
     let token = current_user_token();
     write_user_value(token, head_ptr, &task.robust_list_head())?;
@@ -994,14 +989,14 @@ pub(crate) fn sys_get_robust_list(
     Ok(0)
 }
 
-fn futex_count(raw: usize) -> SysResult<usize> {
+fn futex_count(raw: usize) -> KResult<usize> {
     if raw > i32::MAX as usize {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(raw)
 }
 
-fn validate_futex_clock_option(command: u32, futex_op: u32) -> SysResult<()> {
+fn validate_futex_clock_option(command: u32, futex_op: u32) -> KResult<()> {
     if futex_op & FUTEX_CLOCK_REALTIME == 0 {
         return Ok(());
     }
@@ -1010,7 +1005,7 @@ fn validate_futex_clock_option(command: u32, futex_op: u32) -> SysResult<()> {
         // UNFINISHED: FUTEX_WAIT_REQUEUE_PI and FUTEX_LOCK_PI2 also accept
         // FUTEX_CLOCK_REALTIME on Linux. This kernel currently implements only
         // the older FUTEX_LOCK_PI/FUTEX_TRYLOCK_PI/FUTEX_UNLOCK_PI subset.
-        _ => Err(SysError::ENOSYS),
+        _ => Err(Errno::ENOSYS),
     }
 }
 
@@ -1021,17 +1016,17 @@ pub(crate) fn sys_futex(
     timeout: *const LinuxTimeSpec,
     uaddr2: *mut u32,
     val3: u32,
-) -> SysResult {
+) -> KResult {
     let addr = uaddr as usize;
     validate_futex_addr(addr)?;
     if futex_op & !(FUTEX_CMD_MASK | FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME) != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let command = futex_op & FUTEX_CMD_MASK;
     validate_futex_clock_option(command, futex_op)?;
     if matches!(command, FUTEX_WAIT_BITSET | FUTEX_WAKE_BITSET) && val3 == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let private = futex_op & FUTEX_PRIVATE_FLAG != 0;
     let clock_backend = if futex_op & FUTEX_CLOCK_REALTIME != 0 {
@@ -1078,7 +1073,7 @@ pub(crate) fn sys_futex(
             // register to this pointer-typed timeout parameter.
             let requeue_limit = futex_count(timeout as usize)?;
             if command == FUTEX_CMP_REQUEUE && read_futex_word(addr)? != val3 {
-                return Err(SysError::EAGAIN);
+                return Err(Errno::EAGAIN);
             }
             futex_requeue(
                 addr,
@@ -1093,6 +1088,6 @@ pub(crate) fn sys_futex(
         // UNFINISHED: FUTEX_WAKE_OP, futex_waitv, and requeue-PI are not
         // implemented. The libctest pthread paths currently need classic
         // wait/wake/requeue plus the minimal PI mutex subset above.
-        _ => Err(SysError::ENOSYS),
+        _ => Err(Errno::ENOSYS),
     }
 }

@@ -21,10 +21,10 @@ use crate::fs::{
 };
 use crate::shutdown::shutdown;
 use crate::sync::UPIntrFreeCell;
-use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::{
     close_detached_fd_entry_for_process_teardown, release_record_locks_for_process,
 };
+use crate::uapi::errno::{Errno, KResult};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::*;
@@ -289,7 +289,7 @@ fn rebind_non_leader_for_exec(
     current_tid: usize,
     process_token: usize,
     process_id: usize,
-) -> SysResult<()> {
+) -> KResult<()> {
     // A non-leader exec keeps the process PID but moves the caller into slot 0.
     // Do not preserve the caller's old Linux TID handle after rebinding; the
     // post-exec main thread is visible as the process leader.
@@ -308,16 +308,16 @@ fn rebind_non_leader_for_exec(
             .and_then(|slot| slot.as_ref())
             .is_some_and(|task| Arc::ptr_eq(task, current));
         if !current_slot_matches {
-            return Err(SysError::ESRCH);
+            return Err(Errno::ESRCH);
         }
         let leader = process_inner
             .tasks
             .first()
             .and_then(|slot| slot.as_ref())
             .map(Arc::clone)
-            .ok_or(SysError::ESRCH)?;
+            .ok_or(Errno::ESRCH)?;
         if leader.inner_exclusive_access().res.is_none() {
-            return Err(SysError::ESRCH);
+            return Err(Errno::ESRCH);
         }
 
         let mut leader_res = None;
@@ -352,7 +352,7 @@ fn rebind_non_leader_for_exec(
             *task_slot = None;
         }
 
-        let leader_res = leader_res.ok_or(SysError::ESRCH)?;
+        let leader_res = leader_res.ok_or(Errno::ESRCH)?;
         let mut current_inner = current.inner_exclusive_access();
         if let Some(res) = current_inner.res.replace(leader_res) {
             recycle_res.push(res);
@@ -400,7 +400,7 @@ pub(crate) fn prepare_exec_thread_group(
     current: Arc<TaskControlBlock>,
     process_token: usize,
     process_id: usize,
-) -> SysResult<Arc<TaskControlBlock>> {
+) -> KResult<Arc<TaskControlBlock>> {
     // Linux execve() is thread-group destructive: sibling threads disappear
     // and a non-leader caller becomes the new leader for the preserved PID.
     // Return the task whose TaskUserRes and TrapContext will be rebuilt.
@@ -410,7 +410,7 @@ pub(crate) fn prepare_exec_thread_group(
         return if current_tid == 0 {
             Ok(current)
         } else {
-            Err(SysError::ESRCH)
+            Err(Errno::ESRCH)
         };
     }
     if current_tid == 0 {

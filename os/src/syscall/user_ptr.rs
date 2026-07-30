@@ -9,7 +9,7 @@ use core::mem::{MaybeUninit, size_of};
 use core::ops::{Deref, DerefMut};
 
 use super::SyscallContext;
-use super::errno::{SysError, SysResult};
+use crate::uapi::errno::{Errno, KResult};
 
 // This limit affects only allocation behavior for small ABI values. The fast
 // path still goes through checked_user_pte(), so permissions, COW, and optional
@@ -203,7 +203,7 @@ pub(crate) fn translated_byte_buffer_checked(
     ptr: *const u8,
     len: usize,
     access: UserBufferAccess,
-) -> SysResult<TranslatedUserBuffer> {
+) -> KResult<TranslatedUserBuffer> {
     translated_byte_buffer_checked_with_fault(token, ptr, len, access, None)
 }
 
@@ -212,7 +212,7 @@ pub(crate) fn translated_byte_buffer_checked_ctx(
     ptr: *const u8,
     len: usize,
     access: UserBufferAccess,
-) -> SysResult<TranslatedUserBuffer> {
+) -> KResult<TranslatedUserBuffer> {
     translated_byte_buffer_checked_with_fault_ctx(ctx, ptr, len, access, None)
 }
 
@@ -225,7 +225,7 @@ pub(crate) fn translated_byte_buffer_checked_with_mmap_fault(
     ptr: *const u8,
     len: usize,
     access: UserBufferAccess,
-) -> SysResult<TranslatedUserBuffer> {
+) -> KResult<TranslatedUserBuffer> {
     // CONTEXT: plain metadata copy helpers use `translated_byte_buffer_checked`
     // so an unmapped user range still returns `EFAULT` without invoking the
     // mmap fault handler from an unrelated ABI path.
@@ -237,7 +237,7 @@ pub(crate) fn translated_byte_buffer_checked_with_mmap_fault_ctx(
     ptr: *const u8,
     len: usize,
     access: UserBufferAccess,
-) -> SysResult<TranslatedUserBuffer> {
+) -> KResult<TranslatedUserBuffer> {
     translated_byte_buffer_checked_with_fault_ctx(ctx, ptr, len, access, Some(mmap_user_fault))
 }
 
@@ -252,7 +252,7 @@ pub(crate) fn translated_byte_buffer_checked_with_fault(
     len: usize,
     access: UserBufferAccess,
     fault_handler: Option<UserFaultHandler>,
-) -> SysResult<TranslatedUserBuffer> {
+) -> KResult<TranslatedUserBuffer> {
     let fault_handler = effective_user_fault_resolver(token, fault_handler);
     translated_byte_buffer_checked_with_resolver(token, ptr, len, access, fault_handler)
 }
@@ -263,7 +263,7 @@ fn translated_byte_buffer_checked_with_fault_ctx(
     len: usize,
     access: UserBufferAccess,
     fault_handler: Option<UserFaultHandler>,
-) -> SysResult<TranslatedUserBuffer> {
+) -> KResult<TranslatedUserBuffer> {
     let token = ctx.user_token();
     let fault_handler = effective_user_fault_resolver_for_ctx(ctx, token, fault_handler);
     translated_byte_buffer_checked_with_resolver(token, ptr, len, access, fault_handler)
@@ -275,7 +275,7 @@ fn translated_byte_buffer_checked_with_resolver(
     len: usize,
     access: UserBufferAccess,
     fault_handler: UserFaultResolver,
-) -> SysResult<TranslatedUserBuffer> {
+) -> KResult<TranslatedUserBuffer> {
     if len == 0 {
         return Ok(TranslatedUserBuffer::empty());
     }
@@ -283,7 +283,7 @@ fn translated_byte_buffer_checked_with_resolver(
     // current-process syscall copies should fault those framed pages in, while
     // full mmap fault handling remains opt-in through the explicit mmap helper.
     let mut start = ptr as usize;
-    let end = start.checked_add(len).ok_or(SysError::EFAULT)?;
+    let end = start.checked_add(len).ok_or(Errno::EFAULT)?;
     let start_va = VirtAddr::from(start);
     if start_va.floor() == VirtAddr::from(end - 1).floor() {
         let (pte, pin) = checked_and_pin_user_pte(token, start, access, &fault_handler)?;
@@ -319,7 +319,7 @@ fn checked_and_pin_user_pte(
     addr: usize,
     access: UserBufferAccess,
     fault_handler: &UserFaultResolver,
-) -> SysResult<(crate::mm::PageTableEntry, FrameTracker)> {
+) -> KResult<(crate::mm::PageTableEntry, FrameTracker)> {
     if let Some(process) = &fault_handler.current_process {
         const MAX_FAULT_RETRIES: usize = 4;
         for _ in 0..MAX_FAULT_RETRIES {
@@ -336,10 +336,10 @@ fn checked_and_pin_user_pte(
                     .map(|pte| {
                         FrameTracker::from_retained(pte.ppn())
                             .map(|pin| (pte, pin))
-                            .ok_or(SysError::EFAULT)
+                            .ok_or(Errno::EFAULT)
                     })
                     .transpose()?;
-                Ok::<_, SysError>((ready, pte))
+                Ok::<_, Errno>((ready, pte))
             })?;
             if let Some(ready) = ready {
                 return Ok(ready);
@@ -355,10 +355,10 @@ fn checked_and_pin_user_pte(
                 false
             };
             if !resolved {
-                return Err(SysError::EFAULT);
+                return Err(Errno::EFAULT);
             }
         }
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
 
     // Foreign or freshly constructed address spaces are translated only by
@@ -366,7 +366,7 @@ fn checked_and_pin_user_pte(
     // returned carrier still has an explicit physical-page lifetime.
     let page_table = PageTable::from_token(token);
     let pte = checked_user_pte(&page_table, token, addr, access, fault_handler)?;
-    let pin = FrameTracker::from_retained(pte.ppn()).ok_or(SysError::EFAULT)?;
+    let pin = FrameTracker::from_retained(pte.ppn()).ok_or(Errno::EFAULT)?;
     Ok((pte, pin))
 }
 
@@ -376,7 +376,7 @@ fn with_user_page_ctx<V>(
     access: UserBufferAccess,
     fault_handler: Option<UserFaultHandler>,
     mut access_page: impl FnMut(&mut [u8]) -> V,
-) -> SysResult<V> {
+) -> KResult<V> {
     let token = ctx.user_token();
     let process = ctx.process();
     if process.inner_owned_by_current() {
@@ -413,10 +413,10 @@ fn with_user_page_ctx<V>(
             lazy_framed_user_fault_for_process(process, addr, access)
         };
         if !resolved {
-            return Err(SysError::EFAULT);
+            return Err(Errno::EFAULT);
         }
     }
-    Err(SysError::EFAULT)
+    Err(Errno::EFAULT)
 }
 
 fn checked_user_pte(
@@ -425,7 +425,7 @@ fn checked_user_pte(
     addr: usize,
     access: UserBufferAccess,
     fault_handler: &UserFaultResolver,
-) -> SysResult<crate::mm::PageTableEntry> {
+) -> KResult<crate::mm::PageTableEntry> {
     // Passing a fault handler means the copy is allowed to mutate the current
     // process mappings by resolving lazy mmap/COW faults. Cross-address-space
     // copies should use the explicit MemorySet helpers instead.
@@ -435,12 +435,12 @@ fn checked_user_pte(
         Some(pte) => pte,
         None => {
             if !fault_handler.can_fault() {
-                return Err(SysError::EFAULT);
+                return Err(Errno::EFAULT);
             }
             if !fault_handler.resolve(addr, access) {
-                return Err(SysError::EFAULT);
+                return Err(Errno::EFAULT);
             }
-            translate(page_table).ok_or(SysError::EFAULT)?
+            translate(page_table).ok_or(Errno::EFAULT)?
         }
     };
     let reject_zero_ppn = fault_handler.can_fault();
@@ -449,14 +449,14 @@ fn checked_user_pte(
             // COW resolution precedes the generic mmap hook so fork-private
             // pages become writable instead of being reported as EFAULT.
             if !fault_handler.resolve_cow(token, addr) {
-                return Err(SysError::EFAULT);
+                return Err(Errno::EFAULT);
             }
-            pte = translate(page_table).ok_or(SysError::EFAULT)?;
+            pte = translate(page_table).ok_or(Errno::EFAULT)?;
         } else if fault_handler.can_fault() && fault_handler.resolve(addr, access) {
-            pte = translate(page_table).ok_or(SysError::EFAULT)?;
+            pte = translate(page_table).ok_or(Errno::EFAULT)?;
         }
         if !user_pte_allows(pte, access, reject_zero_ppn) {
-            return Err(SysError::EFAULT);
+            return Err(Errno::EFAULT);
         }
     }
     Ok(pte)
@@ -468,7 +468,7 @@ fn try_same_page_user_slice(
     len: usize,
     access: UserBufferAccess,
     fault_handler: &UserFaultResolver,
-) -> Option<SysResult<PinnedUserSlice>> {
+) -> Option<KResult<PinnedUserSlice>> {
     // This is only an allocation-saving fast path for short ABI scalars. It
     // still goes through checked_user_pte(), so permission, COW, and optional
     // mmap-fault behavior match the multi-page copy path.
@@ -478,7 +478,7 @@ fn try_same_page_user_slice(
     let start = ptr as usize;
     let end = match start.checked_add(len) {
         Some(end) => end,
-        None => return Some(Err(SysError::EFAULT)),
+        None => return Some(Err(Errno::EFAULT)),
     };
     let start_va = VirtAddr::from(start);
     if start_va.floor() != VirtAddr::from(end - 1).floor() {
@@ -519,14 +519,14 @@ fn try_copy_from_user_same_page_ctx(
     ptr: *const u8,
     dst: &mut [u8],
     fault_handler: Option<UserFaultHandler>,
-) -> Option<SysResult<()>> {
+) -> Option<KResult<()>> {
     if dst.is_empty() {
         return None;
     }
     let start = ptr as usize;
     let end = match start.checked_add(dst.len()) {
         Some(end) => end,
-        None => return Some(Err(SysError::EFAULT)),
+        None => return Some(Err(Errno::EFAULT)),
     };
     let start_va = VirtAddr::from(start);
     if start_va.floor() != VirtAddr::from(end - 1).floor() {
@@ -547,14 +547,14 @@ fn try_copy_to_user_same_page_ctx(
     ptr: *mut u8,
     src: &[u8],
     fault_handler: Option<UserFaultHandler>,
-) -> Option<SysResult<()>> {
+) -> Option<KResult<()>> {
     if src.is_empty() {
         return None;
     }
     let start = ptr as usize;
     let end = match start.checked_add(src.len()) {
         Some(end) => end,
-        None => return Some(Err(SysError::EFAULT)),
+        None => return Some(Err(Errno::EFAULT)),
     };
     let start_va = VirtAddr::from(start);
     if start_va.floor() != VirtAddr::from(end - 1).floor() {
@@ -602,9 +602,9 @@ pub(crate) const PATH_MAX: usize = 4096;
 pub(crate) fn try_read_direct_path_component_ctx(
     ctx: &SyscallContext,
     ptr: *const u8,
-) -> SysResult<Option<DirectPathComponent>> {
+) -> KResult<Option<DirectPathComponent>> {
     if ptr.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let mut component = DirectPathComponent {
         bytes: [0; DIRECT_PATH_COMPONENT_MAX],
@@ -619,7 +619,7 @@ pub(crate) fn try_read_direct_path_component_ctx(
     loop {
         let addr = (ptr as usize)
             .checked_add(component.len)
-            .ok_or(SysError::EFAULT)?;
+            .ok_or(Errno::EFAULT)?;
         let start = VirtAddr::from(addr).page_offset();
         let scan = with_user_page_ctx(
             ctx,
@@ -661,20 +661,16 @@ pub(crate) fn try_read_direct_path_component_ctx(
 ///
 /// Returns `EFAULT` for invalid user memory and `ENAMETOOLONG` when no NUL byte
 /// is found within `max_len`, matching Linux pathname-style ABI boundaries.
-pub(crate) fn read_user_c_string(
-    token: usize,
-    ptr: *const u8,
-    max_len: usize,
-) -> SysResult<String> {
+pub(crate) fn read_user_c_string(token: usize, ptr: *const u8, max_len: usize) -> KResult<String> {
     if ptr.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
 
     let mut string = String::with_capacity(64);
     let mut offset = 0usize;
     perf::record_user_c_string_call();
     while offset < max_len {
-        let addr = (ptr as usize).checked_add(offset).ok_or(SysError::EFAULT)?;
+        let addr = (ptr as usize).checked_add(offset).ok_or(Errno::EFAULT)?;
         let page_remaining = crate::config::PAGE_SIZE - (addr & (crate::config::PAGE_SIZE - 1));
         let chunk_len = page_remaining.min(max_len - offset);
         let buffers = translated_byte_buffer_checked_with_fault(
@@ -695,23 +691,23 @@ pub(crate) fn read_user_c_string(
         }
         offset += chunk_len;
     }
-    Err(SysError::ENAMETOOLONG)
+    Err(Errno::ENAMETOOLONG)
 }
 
 pub(crate) fn read_user_c_string_ctx(
     ctx: &SyscallContext,
     ptr: *const u8,
     max_len: usize,
-) -> SysResult<String> {
+) -> KResult<String> {
     if ptr.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
 
     let mut string = String::with_capacity(64);
     let mut offset = 0usize;
     perf::record_user_c_string_call();
     while offset < max_len {
-        let addr = (ptr as usize).checked_add(offset).ok_or(SysError::EFAULT)?;
+        let addr = (ptr as usize).checked_add(offset).ok_or(Errno::EFAULT)?;
         let page_remaining = crate::config::PAGE_SIZE - (addr & (crate::config::PAGE_SIZE - 1));
         let chunk_len = page_remaining.min(max_len - offset);
         let buffers = translated_byte_buffer_checked_with_mmap_fault_ctx(
@@ -731,7 +727,7 @@ pub(crate) fn read_user_c_string_ctx(
         }
         offset += chunk_len;
     }
-    Err(SysError::ENAMETOOLONG)
+    Err(Errno::ENAMETOOLONG)
 }
 
 fn scan_c_string_chunk(buffer: &[u8]) -> (usize, bool, bool) {
@@ -763,7 +759,7 @@ fn append_user_string_bytes(string: &mut String, bytes: &[u8], is_ascii: bool) {
     }
 }
 
-pub(crate) fn read_user_usize_ctx(ctx: &SyscallContext, addr: usize) -> SysResult<usize> {
+pub(crate) fn read_user_usize_ctx(ctx: &SyscallContext, addr: usize) -> KResult<usize> {
     read_user_value_with_site_ctx(
         ctx,
         addr as *const usize,
@@ -781,7 +777,7 @@ pub(crate) fn read_user_array_item<T: Copy>(
     token: usize,
     ptr: *const T,
     index: usize,
-) -> SysResult<T> {
+) -> KResult<T> {
     read_user_value_with_site(
         token,
         user_array_item_addr(ptr, index)? as *const T,
@@ -795,12 +791,12 @@ pub(crate) fn read_user_array<T: Copy>(
     token: usize,
     ptr: *const T,
     count: usize,
-) -> SysResult<Vec<T>> {
+) -> KResult<Vec<T>> {
     if count == 0 {
         return Ok(Vec::new());
     }
     if ptr.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
 
     let byte_len = user_array_byte_len::<T>(count)?;
@@ -824,12 +820,12 @@ pub(crate) fn read_user_array_ctx<T: Copy>(
     ctx: &SyscallContext,
     ptr: *const T,
     count: usize,
-) -> SysResult<Vec<T>> {
+) -> KResult<Vec<T>> {
     if count == 0 {
         return Ok(Vec::new());
     }
     if ptr.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
 
     let byte_len = user_array_byte_len::<T>(count)?;
@@ -850,12 +846,12 @@ pub(crate) fn read_user_array_ctx<T: Copy>(
 }
 
 /// Copies a plain ABI array into user memory in one checked user-copy window.
-pub(crate) fn write_user_array<T: Copy>(token: usize, ptr: *mut T, values: &[T]) -> SysResult<()> {
+pub(crate) fn write_user_array<T: Copy>(token: usize, ptr: *mut T, values: &[T]) -> KResult<()> {
     if values.is_empty() {
         return Ok(());
     }
     if ptr.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
 
     let byte_len = user_array_byte_len::<T>(values.len())?;
@@ -869,14 +865,14 @@ pub(crate) fn write_user_array<T: Copy>(token: usize, ptr: *mut T, values: &[T])
     )
 }
 
-fn user_array_item_addr<T>(ptr: *const T, index: usize) -> SysResult<usize> {
+fn user_array_item_addr<T>(ptr: *const T, index: usize) -> KResult<usize> {
     (ptr as usize)
         .checked_add(user_array_byte_len::<T>(index)?)
-        .ok_or(SysError::EFAULT)
+        .ok_or(Errno::EFAULT)
 }
 
-fn user_array_byte_len<T>(count: usize) -> SysResult<usize> {
-    count.checked_mul(size_of::<T>()).ok_or(SysError::EFAULT)
+fn user_array_byte_len<T>(count: usize) -> KResult<usize> {
+    count.checked_mul(size_of::<T>()).ok_or(Errno::EFAULT)
 }
 
 fn copy_from_user(
@@ -884,7 +880,7 @@ fn copy_from_user(
     ptr: *const u8,
     dst: &mut [u8],
     fault_handler: Option<UserFaultHandler>,
-) -> SysResult<()> {
+) -> KResult<()> {
     let fault_handler = effective_user_fault_resolver(token, fault_handler);
     copy_from_user_with_resolver(token, ptr, dst, fault_handler)
 }
@@ -894,7 +890,7 @@ fn copy_from_user_ctx(
     ptr: *const u8,
     dst: &mut [u8],
     fault_handler: Option<UserFaultHandler>,
-) -> SysResult<()> {
+) -> KResult<()> {
     let token = ctx.user_token();
     if let Some(result) = try_copy_from_user_same_page_ctx(ctx, ptr, dst, fault_handler) {
         result?;
@@ -910,7 +906,7 @@ fn copy_from_user_with_resolver(
     ptr: *const u8,
     dst: &mut [u8],
     fault_handler: UserFaultResolver,
-) -> SysResult<()> {
+) -> KResult<()> {
     if dst.is_empty() {
         return Ok(());
     }
@@ -956,22 +952,22 @@ fn resolve_cow_write_range_in_memory_set(
     memory_set: &mut MemorySet,
     ptr: *mut u8,
     len: usize,
-) -> SysResult<()> {
+) -> KResult<()> {
     if len == 0 {
         return Ok(());
     }
     let mut start = ptr as usize;
-    let end = start.checked_add(len).ok_or(SysError::EFAULT)?;
+    let end = start.checked_add(len).ok_or(Errno::EFAULT)?;
     while start < end {
         let start_va = VirtAddr::from(start);
         let vpn = start_va.floor();
-        let pte = memory_set.translate(vpn).ok_or(SysError::EFAULT)?;
+        let pte = memory_set.translate(vpn).ok_or(Errno::EFAULT)?;
         if pte.cow() && !pte.writable() && !memory_set.resolve_cow_page_fault(start) {
-            return Err(SysError::EFAULT);
+            return Err(Errno::EFAULT);
         }
-        let pte = memory_set.translate(vpn).ok_or(SysError::EFAULT)?;
+        let pte = memory_set.translate(vpn).ok_or(Errno::EFAULT)?;
         if !user_pte_allows(pte, UserBufferAccess::Write, false) {
-            return Err(SysError::EFAULT);
+            return Err(Errno::EFAULT);
         }
         let mut next_vpn = vpn;
         next_vpn.step();
@@ -982,11 +978,11 @@ fn resolve_cow_write_range_in_memory_set(
 }
 
 /// Copies kernel bytes into a user buffer after validating write permission.
-pub(crate) fn copy_to_user(token: usize, ptr: *mut u8, src: &[u8]) -> SysResult<()> {
+pub(crate) fn copy_to_user(token: usize, ptr: *mut u8, src: &[u8]) -> KResult<()> {
     copy_to_user_with_site(token, ptr, src, None, perf::UsercopySite::CopyToUser)
 }
 
-pub(crate) fn copy_to_user_ctx(ctx: &SyscallContext, ptr: *mut u8, src: &[u8]) -> SysResult<()> {
+pub(crate) fn copy_to_user_ctx(ctx: &SyscallContext, ptr: *mut u8, src: &[u8]) -> KResult<()> {
     copy_to_user_with_site_ctx(ctx, ptr, src, None, perf::UsercopySite::CopyToUser)
 }
 
@@ -999,7 +995,7 @@ pub(crate) fn copy_to_user_with_mmap_fault_ctx(
     ctx: &SyscallContext,
     ptr: *mut u8,
     src: &[u8],
-) -> SysResult<()> {
+) -> KResult<()> {
     copy_to_user_with_site_ctx(
         ctx,
         ptr,
@@ -1015,7 +1011,7 @@ fn copy_to_user_with_site(
     src: &[u8],
     fault_handler: Option<UserFaultHandler>,
     site: perf::UsercopySite,
-) -> SysResult<()> {
+) -> KResult<()> {
     let fault_handler = effective_user_fault_resolver(token, fault_handler);
     copy_to_user_with_resolver(token, ptr, src, fault_handler, site)
 }
@@ -1026,7 +1022,7 @@ fn copy_to_user_with_site_ctx(
     src: &[u8],
     fault_handler: Option<UserFaultHandler>,
     site: perf::UsercopySite,
-) -> SysResult<()> {
+) -> KResult<()> {
     let token = ctx.user_token();
     perf::record_usercopy_site(site, src.len());
     if src.is_empty() {
@@ -1047,7 +1043,7 @@ fn copy_to_user_with_resolver(
     src: &[u8],
     fault_handler: UserFaultResolver,
     site: perf::UsercopySite,
-) -> SysResult<()> {
+) -> KResult<()> {
     copy_to_user_with_resolver_impl(token, ptr, src, fault_handler, site, true)
 }
 
@@ -1058,7 +1054,7 @@ fn copy_to_user_with_resolver_impl(
     fault_handler: UserFaultResolver,
     site: perf::UsercopySite,
     record_site: bool,
-) -> SysResult<()> {
+) -> KResult<()> {
     if record_site {
         perf::record_usercopy_site(site, src.len());
     }
@@ -1093,7 +1089,7 @@ pub(crate) fn copy_to_user_in_memory_set(
     memory_set: &mut MemorySet,
     ptr: *mut u8,
     src: &[u8],
-) -> SysResult<()> {
+) -> KResult<()> {
     perf::record_usercopy_site(perf::UsercopySite::CopyToUserInMemorySet, src.len());
     // Used for child or freshly exec'd address spaces, not necessarily the
     // current task. Resolve COW against the supplied MemorySet before translating
@@ -1115,18 +1111,15 @@ pub(crate) fn copy_to_user_in_memory_set(
 ///
 /// The value is copied through bytes rather than dereferenced directly, so this
 /// is safe for unaligned user ABI structs as long as `T: Copy`.
-pub(crate) fn read_user_value<T: Copy>(token: usize, ptr: *const T) -> SysResult<T> {
+pub(crate) fn read_user_value<T: Copy>(token: usize, ptr: *const T) -> KResult<T> {
     read_user_value_with_site(token, ptr, None, perf::UsercopySite::ReadValue)
 }
 
-pub(crate) fn read_user_value_ctx<T: Copy>(ctx: &SyscallContext, ptr: *const T) -> SysResult<T> {
+pub(crate) fn read_user_value_ctx<T: Copy>(ctx: &SyscallContext, ptr: *const T) -> KResult<T> {
     read_user_value_with_site_ctx(ctx, ptr, None, perf::UsercopySite::ReadValue)
 }
 
-pub(crate) fn read_user_value_with_mmap_fault<T: Copy>(
-    token: usize,
-    ptr: *const T,
-) -> SysResult<T> {
+pub(crate) fn read_user_value_with_mmap_fault<T: Copy>(token: usize, ptr: *const T) -> KResult<T> {
     read_user_value_with_site(
         token,
         ptr,
@@ -1138,7 +1131,7 @@ pub(crate) fn read_user_value_with_mmap_fault<T: Copy>(
 pub(crate) fn read_user_value_with_mmap_fault_ctx<T: Copy>(
     ctx: &SyscallContext,
     ptr: *const T,
-) -> SysResult<T> {
+) -> KResult<T> {
     read_user_value_with_site_ctx(
         ctx,
         ptr,
@@ -1151,7 +1144,7 @@ pub(crate) fn read_user_value_with_fault<T: Copy>(
     token: usize,
     ptr: *const T,
     fault_handler: Option<UserFaultHandler>,
-) -> SysResult<T> {
+) -> KResult<T> {
     read_user_value_with_site(token, ptr, fault_handler, perf::UsercopySite::ReadValue)
 }
 
@@ -1160,7 +1153,7 @@ fn read_user_value_with_site<T: Copy>(
     ptr: *const T,
     fault_handler: Option<UserFaultHandler>,
     site: perf::UsercopySite,
-) -> SysResult<T> {
+) -> KResult<T> {
     let mut value = MaybeUninit::<T>::uninit();
     let bytes =
         unsafe { core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size_of::<T>()) };
@@ -1174,7 +1167,7 @@ fn read_user_value_with_site_ctx<T: Copy>(
     ptr: *const T,
     fault_handler: Option<UserFaultHandler>,
     site: perf::UsercopySite,
-) -> SysResult<T> {
+) -> KResult<T> {
     let mut value = MaybeUninit::<T>::uninit();
     let bytes =
         unsafe { core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size_of::<T>()) };
@@ -1184,7 +1177,7 @@ fn read_user_value_with_site_ctx<T: Copy>(
 }
 
 /// Writes one plain ABI value into user memory after checking access rights.
-pub(crate) fn write_user_value<T: Copy>(token: usize, ptr: *mut T, value: &T) -> SysResult<()> {
+pub(crate) fn write_user_value<T: Copy>(token: usize, ptr: *mut T, value: &T) -> KResult<()> {
     write_user_value_with_site(token, ptr, value, None, perf::UsercopySite::WriteValue)
 }
 
@@ -1192,7 +1185,7 @@ pub(crate) fn write_user_value_ctx<T: Copy>(
     ctx: &SyscallContext,
     ptr: *mut T,
     value: &T,
-) -> SysResult<()> {
+) -> KResult<()> {
     write_user_value_with_site_ctx(ctx, ptr, value, None, perf::UsercopySite::WriteValue)
 }
 
@@ -1200,7 +1193,7 @@ pub(crate) fn write_user_value_in_memory_set<T: Copy>(
     memory_set: &mut MemorySet,
     ptr: *mut T,
     value: &T,
-) -> SysResult<()> {
+) -> KResult<()> {
     let bytes =
         unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
     copy_to_user_in_memory_set(memory_set, ptr.cast::<u8>(), bytes)
@@ -1210,7 +1203,7 @@ pub(crate) fn write_user_value_with_mmap_fault<T: Copy>(
     token: usize,
     ptr: *mut T,
     value: &T,
-) -> SysResult<()> {
+) -> KResult<()> {
     write_user_value_with_site(
         token,
         ptr,
@@ -1224,7 +1217,7 @@ pub(crate) fn write_user_value_with_mmap_fault_ctx<T: Copy>(
     ctx: &SyscallContext,
     ptr: *mut T,
     value: &T,
-) -> SysResult<()> {
+) -> KResult<()> {
     write_user_value_with_site_ctx(
         ctx,
         ptr,
@@ -1239,7 +1232,7 @@ pub(crate) fn write_user_value_with_fault<T: Copy>(
     ptr: *mut T,
     value: &T,
     fault_handler: Option<UserFaultHandler>,
-) -> SysResult<()> {
+) -> KResult<()> {
     write_user_value_with_site(
         token,
         ptr,
@@ -1255,7 +1248,7 @@ fn write_user_value_with_site<T: Copy>(
     value: &T,
     fault_handler: Option<UserFaultHandler>,
     site: perf::UsercopySite,
-) -> SysResult<()> {
+) -> KResult<()> {
     let bytes =
         unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
     copy_to_user_with_site(token, ptr.cast::<u8>(), bytes, fault_handler, site)
@@ -1267,7 +1260,7 @@ fn write_user_value_with_site_ctx<T: Copy>(
     value: &T,
     fault_handler: Option<UserFaultHandler>,
     site: perf::UsercopySite,
-) -> SysResult<()> {
+) -> KResult<()> {
     let bytes =
         unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
     copy_to_user_with_site_ctx(ctx, ptr.cast::<u8>(), bytes, fault_handler, site)

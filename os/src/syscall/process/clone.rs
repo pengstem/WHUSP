@@ -1,11 +1,11 @@
 use crate::fs::{VfsNodeId, assign_pid_to_cgroup, clone_mount_namespace};
-use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{read_user_value, write_user_value, write_user_value_in_memory_set};
 use crate::task::{
     CloneArgs, CloneFlags, ProcessControlBlock, TaskControlBlock, add_task,
     block_current_task_no_schedule, clone_current_thread, current_process, current_task,
     current_user_token, reap_exited_tasks, schedule, suspend_current_and_run_next,
 };
+use crate::uapi::errno::{Errno, KResult};
 use alloc::sync::Arc;
 use core::mem::size_of;
 
@@ -57,10 +57,10 @@ pub fn sys_clone(
     ptid: usize,
     raw_arg4: usize,
     raw_arg5: usize,
-) -> SysResult {
+) -> KResult {
     let (tls, ctid) = clone_tls_and_ctid_args(raw_arg4, raw_arg5);
     let Some(args) = CloneArgs::parse(flags, stack, ptid, tls, ctid) else {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     };
     if args.is_thread() {
         sys_clone_thread(args)
@@ -73,14 +73,14 @@ pub fn sys_clone(
     }
 }
 
-pub fn sys_clone3(args: *const LinuxCloneArgs, size: usize) -> SysResult {
+pub fn sys_clone3(args: *const LinuxCloneArgs, size: usize) -> KResult {
     if size == 0 || size < CLONE_ARGS_MIN_SIZE {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     // UNFINISHED: Linux accepts larger clone_args when the unknown tail is
     // zeroed. This kernel only understands the current structure size.
     if size > size_of::<LinuxCloneArgs>() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let token = current_user_token();
     let args = read_user_value(token, args)?;
@@ -91,7 +91,7 @@ pub fn sys_clone3(args: *const LinuxCloneArgs, size: usize) -> SysResult {
     } else {
         args.stack
             .checked_add(args.stack_size)
-            .ok_or(SysError::EINVAL)? as usize
+            .ok_or(Errno::EINVAL)? as usize
     };
     let clone_flags = CloneFlags::from_bits_truncate(args.flags as u32);
     let clone_args = CloneArgs::from_parts(
@@ -102,19 +102,19 @@ pub fn sys_clone3(args: *const LinuxCloneArgs, size: usize) -> SysResult {
         args.tls as usize,
         args.child_tid as usize,
     )
-    .ok_or(SysError::EINVAL)?;
+    .ok_or(Errno::EINVAL)?;
     let cgroup = clone3_cgroup_target(args)?;
     if clone_args.is_thread() {
         if cgroup.is_some() {
             // UNFINISHED: CLONE_INTO_CGROUP is currently supported only for
             // process clone3(), because this kernel records cgroup membership
             // at process-id granularity.
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         if args.flags & CLONE_PIDFD != 0 {
             // UNFINISHED: Thread-directed pidfds are not modeled yet because
             // this kernel's pidfd object records process IDs only.
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         sys_clone_thread(clone_args)
     } else if is_vm_vfork_process_clone(clone_args)
@@ -137,27 +137,27 @@ pub fn sys_clone3(args: *const LinuxCloneArgs, size: usize) -> SysResult {
     }
 }
 
-fn validate_clone3_args(args: LinuxCloneArgs, token: usize) -> SysResult<()> {
+fn validate_clone3_args(args: LinuxCloneArgs, token: usize) -> KResult<()> {
     if args.flags & CLONE_SIGHAND != 0 && args.flags & CloneFlags::CLONE_VM.bits() as u64 == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if args.flags & CLONE_THREAD != 0 && args.flags & CLONE_SIGHAND == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if args.flags & CLONE_FS != 0 && args.flags & CLONE_NEWNS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if args.set_tid != 0 || args.set_tid_size != 0 {
         // UNFINISHED: Linux clone3 can request specific PIDs through set_tid
         // arrays across PID namespaces. This kernel allocates Linux-visible
         // PIDs/TIDs internally and does not support caller-selected IDs.
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if args.exit_signal >= SIGNAL_INFO_SLOTS {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if (args.stack == 0) != (args.stack_size == 0) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if args.flags & CLONE_PIDFD != 0 {
         // Probe the pidfd result pointer before allocating or publishing the child.
@@ -167,11 +167,11 @@ fn validate_clone3_args(args: LinuxCloneArgs, token: usize) -> SysResult<()> {
     Ok(())
 }
 
-fn sys_clone_process(args: CloneArgs) -> SysResult {
+fn sys_clone_process(args: CloneArgs) -> KResult {
     sys_clone_process_inner(args, None, None)
 }
 
-fn clone3_cgroup_target(args: LinuxCloneArgs) -> SysResult<Option<VfsNodeId>> {
+fn clone3_cgroup_target(args: LinuxCloneArgs) -> KResult<Option<VfsNodeId>> {
     if args.flags & CLONE_INTO_CGROUP == 0 {
         return Ok(None);
     }
@@ -184,9 +184,9 @@ fn clone3_cgroup_target(args: LinuxCloneArgs) -> SysResult<Option<VfsNodeId>> {
             .get(fd)
             .and_then(|entry| entry.as_ref())
             .map(|entry| entry.file())
-            .ok_or(SysError::EBADF)?
+            .ok_or(Errno::EBADF)?
     };
-    let dir = file.working_dir().ok_or(SysError::EINVAL)?;
+    let dir = file.working_dir().ok_or(Errno::EINVAL)?;
     Ok(Some(VfsNodeId::new(dir.mount_id(), dir.ino())))
 }
 
@@ -194,7 +194,7 @@ fn write_user_value_to_process<T: Copy>(
     process: &Arc<ProcessControlBlock>,
     ptr: *mut T,
     value: &T,
-) -> SysResult<()> {
+) -> KResult<()> {
     // Write clone metadata into the child address space before it can run.
     // Parent and child do not necessarily share VM, so current_user_token()
     // would target the wrong memory set for CLONE_CHILD_SETTID.
@@ -206,8 +206,8 @@ fn sys_clone_process_inner(
     args: CloneArgs,
     pidfd: Option<*mut i32>,
     cgroup: Option<VfsNodeId>,
-) -> SysResult {
-    let calling_task = current_task().ok_or(SysError::ESRCH)?;
+) -> KResult {
+    let calling_task = current_task().ok_or(Errno::ESRCH)?;
     let vfork_parent = if args.flags.contains(CloneFlags::CLONE_VFORK) {
         Some(Arc::clone(&calling_task))
     } else {
@@ -215,7 +215,7 @@ fn sys_clone_process_inner(
     };
     let current_process = current_process();
     let child_parent = if args.flags.contains(CloneFlags::CLONE_PARENT) {
-        current_process.parent_process().ok_or(SysError::EINVAL)?
+        current_process.parent_process().ok_or(Errno::EINVAL)?
     } else {
         Arc::clone(&current_process)
     };
@@ -232,7 +232,7 @@ fn sys_clone_process_inner(
             args.exit_signal,
             args.flags,
         )
-        .ok_or(SysError::ENOMEM)?;
+        .ok_or(Errno::ENOMEM)?;
     let new_pid = new_process.getpid();
     if let Some(parent_task) = vfork_parent {
         new_process.begin_vfork(parent_task);
@@ -323,7 +323,7 @@ fn is_vm_newnet_process_clone(args: CloneArgs) -> bool {
         && !args.is_thread()
 }
 
-fn sys_clone_vm_vfork(args: CloneArgs) -> SysResult {
+fn sys_clone_vm_vfork(args: CloneArgs) -> KResult {
     // UNFINISHED: Linux CLONE_VM without CLONE_THREAD creates a distinct
     // process that shares the mm_struct, and CLONE_VFORK releases the parent
     // on either execve(2) or _exit(2). This contest compatibility path uses a
@@ -333,7 +333,7 @@ fn sys_clone_vm_vfork(args: CloneArgs) -> SysResult {
     sys_clone_process(args)
 }
 
-fn sys_clone_vm_newnet(args: CloneArgs) -> SysResult {
+fn sys_clone_vm_newnet(args: CloneArgs) -> KResult {
     // UNFINISHED: Full network namespaces are not implemented. This path is
     // limited to CLONE_NEWNET|CLONE_VM LTP coverage: run the child as a helper
     // task so CLONE_VM data writes are visible, and mark it so procfs exposes
@@ -341,7 +341,7 @@ fn sys_clone_vm_newnet(args: CloneArgs) -> SysResult {
     sys_clone_vm_helper(args, true)
 }
 
-fn sys_clone_vm_helper(args: CloneArgs, synthetic_newnet: bool) -> SysResult {
+fn sys_clone_vm_helper(args: CloneArgs, synthetic_newnet: bool) -> KResult {
     reap_exited_tasks();
     let process = current_process();
     let cloned = clone_current_thread(args);
@@ -386,7 +386,7 @@ fn sys_clone_vm_helper(args: CloneArgs, synthetic_newnet: bool) -> SysResult {
     Ok(linux_tid as isize)
 }
 
-fn sys_clone_thread(args: CloneArgs) -> SysResult {
+fn sys_clone_thread(args: CloneArgs) -> KResult {
     reap_exited_tasks();
     let process = current_process();
     let cloned = clone_current_thread(args);

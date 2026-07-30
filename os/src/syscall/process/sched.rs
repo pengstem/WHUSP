@@ -1,7 +1,6 @@
 use crate::{
     syscall::{
         SyscallContext,
-        errno::{SysError, SysResult},
         uapi::LinuxTimeSpec,
         user_ptr::{
             read_user_value_with_mmap_fault, read_user_value_with_mmap_fault_ctx,
@@ -14,6 +13,7 @@ use crate::{
         processes_snapshot, reprioritize_ready_task, suspend_current_and_run_next,
         task_with_linux_tid,
     },
+    uapi::errno::{Errno, KResult},
 };
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::mem::size_of;
@@ -65,31 +65,31 @@ const LINUX_SCHED_ATTR_SIZE: u32 = size_of::<LinuxSchedAttr>() as u32;
 const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
 const SCHED_ATTR_SUPPORTED_FLAGS: u64 = SCHED_FLAG_RESET_ON_FORK;
 
-fn sched_target_task(pid: isize) -> SysResult<Arc<TaskControlBlock>> {
+fn sched_target_task(pid: isize) -> KResult<Arc<TaskControlBlock>> {
     if pid < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if pid == 0 {
-        return current_task().ok_or(SysError::ESRCH);
+        return current_task().ok_or(Errno::ESRCH);
     }
-    task_with_linux_tid(pid as usize).ok_or(SysError::ESRCH)
+    task_with_linux_tid(pid as usize).ok_or(Errno::ESRCH)
 }
 
-fn sched_target_task_ctx(ctx: &SyscallContext, pid: isize) -> SysResult<Arc<TaskControlBlock>> {
+fn sched_target_task_ctx(ctx: &SyscallContext, pid: isize) -> KResult<Arc<TaskControlBlock>> {
     if pid < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if pid == 0 {
         return Ok(Arc::clone(ctx.task()));
     }
-    task_with_linux_tid(pid as usize).ok_or(SysError::ESRCH)
+    task_with_linux_tid(pid as usize).ok_or(Errno::ESRCH)
 }
 
-fn sched_priority_bounds(policy: i32) -> SysResult<(isize, isize)> {
+fn sched_priority_bounds(policy: i32) -> KResult<(isize, isize)> {
     match policy {
         SCHED_FIFO | SCHED_RR => Ok((RT_PRIORITY_MIN, RT_PRIORITY_MAX)),
         SCHED_OTHER | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => Ok((0, 0)),
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -105,16 +105,16 @@ fn task_nice(task: &TaskControlBlock) -> i8 {
     task.inner_exclusive_access().nice
 }
 
-fn target_tasks_for_priority(which: i32, who: isize) -> SysResult<Vec<Arc<TaskControlBlock>>> {
+fn target_tasks_for_priority(which: i32, who: isize) -> KResult<Vec<Arc<TaskControlBlock>>> {
     if who < 0 {
-        return Err(SysError::ESRCH);
+        return Err(Errno::ESRCH);
     }
     match which {
         PRIO_PROCESS => {
             let task = if who == 0 {
-                current_task().ok_or(SysError::ESRCH)?
+                current_task().ok_or(Errno::ESRCH)?
             } else {
-                task_with_linux_tid(who as usize).ok_or(SysError::ESRCH)?
+                task_with_linux_tid(who as usize).ok_or(Errno::ESRCH)?
             };
             Ok(vec![task])
         }
@@ -130,7 +130,7 @@ fn target_tasks_for_priority(which: i32, who: isize) -> SysResult<Vec<Arc<TaskCo
                 .flat_map(|process| process.tasks_snapshot())
                 .collect::<Vec<_>>();
             if tasks.is_empty() {
-                Err(SysError::ESRCH)
+                Err(Errno::ESRCH)
             } else {
                 Ok(tasks)
             }
@@ -150,27 +150,27 @@ fn target_tasks_for_priority(which: i32, who: isize) -> SysResult<Vec<Arc<TaskCo
                 .flat_map(|process| process.tasks_snapshot())
                 .collect::<Vec<_>>();
             if tasks.is_empty() {
-                Err(SysError::ESRCH)
+                Err(Errno::ESRCH)
             } else {
                 Ok(tasks)
             }
         }
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
-fn ensure_can_set_task_nice(task: &TaskControlBlock, new_nice: i8) -> SysResult<()> {
+fn ensure_can_set_task_nice(task: &TaskControlBlock, new_nice: i8) -> KResult<()> {
     let caller = current_process().credentials();
-    let target_process = task.process.upgrade().ok_or(SysError::ESRCH)?;
+    let target_process = task.process.upgrade().ok_or(Errno::ESRCH)?;
     let target = target_process.credentials();
     let privileged = caller.euid == 0;
 
     if !privileged && caller.euid != target.ruid && caller.euid != target.euid {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
 
     if !privileged && new_nice < task_nice(task) {
-        return Err(SysError::EACCES);
+        return Err(Errno::EACCES);
     }
 
     Ok(())
@@ -180,9 +180,9 @@ fn current_has_scheduler_privilege() -> bool {
     current_process().credentials().is_root()
 }
 
-fn current_euid_matches_task(task: &TaskControlBlock) -> SysResult<bool> {
+fn current_euid_matches_task(task: &TaskControlBlock) -> KResult<bool> {
     let caller = current_process().credentials();
-    let target_process = task.process.upgrade().ok_or(SysError::ESRCH)?;
+    let target_process = task.process.upgrade().ok_or(Errno::ESRCH)?;
     let target = target_process.credentials();
     Ok(caller.euid == target.ruid || caller.euid == target.euid)
 }
@@ -191,9 +191,9 @@ fn ctx_has_scheduler_privilege(ctx: &SyscallContext) -> bool {
     ctx.process().credentials().is_root()
 }
 
-fn ctx_euid_matches_task(ctx: &SyscallContext, task: &TaskControlBlock) -> SysResult<bool> {
+fn ctx_euid_matches_task(ctx: &SyscallContext, task: &TaskControlBlock) -> KResult<bool> {
     let caller = ctx.process().credentials();
-    let target_process = task.process.upgrade().ok_or(SysError::ESRCH)?;
+    let target_process = task.process.upgrade().ok_or(Errno::ESRCH)?;
     let target = target_process.credentials();
     Ok(caller.euid == target.ruid || caller.euid == target.euid)
 }
@@ -202,15 +202,12 @@ fn policy_change_requires_privilege(policy: i32) -> bool {
     matches!(policy, SCHED_FIFO | SCHED_RR | SCHED_DEADLINE)
 }
 
-fn ensure_can_change_task_sched(
-    task: &TaskControlBlock,
-    requires_privilege: bool,
-) -> SysResult<()> {
+fn ensure_can_change_task_sched(task: &TaskControlBlock, requires_privilege: bool) -> KResult<()> {
     if current_has_scheduler_privilege() {
         return Ok(());
     }
     if requires_privilege || !current_euid_matches_task(task)? {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     Ok(())
 }
@@ -219,54 +216,54 @@ fn ensure_can_change_task_sched_ctx(
     ctx: &SyscallContext,
     task: &TaskControlBlock,
     requires_privilege: bool,
-) -> SysResult<()> {
+) -> KResult<()> {
     if ctx_has_scheduler_privilege(ctx) {
         return Ok(());
     }
     if requires_privilege || !ctx_euid_matches_task(ctx, task)? {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     Ok(())
 }
 
-fn split_settable_policy(policy: i32) -> SysResult<(i32, bool)> {
+fn split_settable_policy(policy: i32) -> KResult<(i32, bool)> {
     let reset_on_fork = policy & SCHED_RESET_ON_FORK != 0;
     let base_policy = policy & !SCHED_RESET_ON_FORK;
     match base_policy {
         SCHED_OTHER | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE => {
             Ok((base_policy, reset_on_fork))
         }
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
-fn validate_priority_for_policy(policy: i32, priority: i32) -> SysResult<()> {
+fn validate_priority_for_policy(policy: i32, priority: i32) -> KResult<()> {
     let (min, max) = sched_priority_bounds(policy)?;
     let priority = priority as isize;
     if priority < min || priority > max {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(())
 }
 
-fn validate_deadline_params(attr: LinuxSchedAttr) -> SysResult<()> {
+fn validate_deadline_params(attr: LinuxSchedAttr) -> KResult<()> {
     if attr.sched_runtime == 0
         || attr.sched_deadline == 0
         || attr.sched_period == 0
         || attr.sched_runtime > attr.sched_deadline
         || attr.sched_deadline > attr.sched_period
     {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(())
 }
 
-fn validate_sched_attr(attr: LinuxSchedAttr) -> SysResult<()> {
+fn validate_sched_attr(attr: LinuxSchedAttr) -> KResult<()> {
     if attr.size < LINUX_SCHED_ATTR_SIZE {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if attr.sched_flags & !SCHED_ATTR_SUPPORTED_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let policy = attr.sched_policy as i32;
     validate_priority_for_policy(policy, attr.sched_priority as i32)?;
@@ -334,14 +331,14 @@ fn sched_attr_for_task(task: &TaskControlBlock) -> LinuxSchedAttr {
     }
 }
 
-pub fn sys_sched_getscheduler(pid: isize) -> SysResult {
+pub fn sys_sched_getscheduler(pid: isize) -> KResult {
     let task = sched_target_task(pid)?;
     Ok(linux_policy_for_task(&task) as isize)
 }
 
-pub fn sys_sched_getparam(pid: isize, param: usize) -> SysResult {
+pub fn sys_sched_getparam(pid: isize, param: usize) -> KResult {
     if param == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let task = sched_target_task(pid)?;
     let sched_param = LinuxSchedParam {
@@ -360,9 +357,9 @@ pub fn sys_sched_getaffinity_ctx(
     pid: isize,
     cpusetsize: usize,
     mask: usize,
-) -> SysResult {
+) -> KResult {
     if cpusetsize < AFFINITY_MASK_BYTES {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let task = sched_target_task_ctx(ctx, pid)?;
     let affinity_mask = task.inner_exclusive_access().allowed_cpus.bits() as usize;
@@ -370,7 +367,7 @@ pub fn sys_sched_getaffinity_ctx(
     Ok(AFFINITY_MASK_BYTES as isize)
 }
 
-pub fn sys_getcpu_ctx(ctx: &SyscallContext, cpu: usize, node: usize) -> SysResult {
+pub fn sys_getcpu_ctx(ctx: &SyscallContext, cpu: usize, node: usize) -> KResult {
     // Linux permits either output pointer to be null. Logical kernel CPU IDs
     // are the userspace-visible CPU numbers; this machine has one NUMA node.
     if cpu != 0 {
@@ -391,16 +388,16 @@ pub fn sys_sched_setaffinity_ctx(
     pid: isize,
     cpusetsize: usize,
     mask: usize,
-) -> SysResult {
+) -> KResult {
     if cpusetsize < AFFINITY_MASK_BYTES {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let task = sched_target_task_ctx(ctx, pid)?;
     let affinity_mask = read_user_value_with_mmap_fault_ctx(ctx, mask as *const usize)?;
     let possible = crate::cpu::topology().possible_mask().bits() as usize;
     let requested = affinity_mask & possible;
     if requested == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     ensure_can_change_task_sched_ctx(ctx, &task, false)?;
     let mut inner = task.inner_exclusive_access();
@@ -434,9 +431,9 @@ pub fn sys_sched_setaffinity_ctx(
     Ok(0)
 }
 
-pub fn sys_sched_setparam(pid: isize, param: usize) -> SysResult {
+pub fn sys_sched_setparam(pid: isize, param: usize) -> KResult {
     if param == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let sched_param =
         read_user_value_with_mmap_fault(current_user_token(), param as *const LinuxSchedParam)?;
@@ -455,9 +452,9 @@ pub fn sys_sched_setparam(pid: isize, param: usize) -> SysResult {
     Ok(0)
 }
 
-pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: usize) -> SysResult {
+pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: usize) -> KResult {
     if param == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let (base_policy, reset_on_fork) = split_settable_policy(policy)?;
     let sched_param =
@@ -496,17 +493,17 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: usize) -> SysResul
     Ok(0)
 }
 
-pub fn sys_sched_get_priority_max(policy: i32) -> SysResult {
+pub fn sys_sched_get_priority_max(policy: i32) -> KResult {
     Ok(sched_priority_bounds(policy)?.1)
 }
 
-pub fn sys_sched_get_priority_min(policy: i32) -> SysResult {
+pub fn sys_sched_get_priority_min(policy: i32) -> KResult {
     Ok(sched_priority_bounds(policy)?.0)
 }
 
-pub fn sys_sched_setattr(pid: isize, attr: usize, flags: u32) -> SysResult {
+pub fn sys_sched_setattr(pid: isize, attr: usize, flags: u32) -> KResult {
     if pid < 0 || attr == 0 || flags != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let sched_attr =
         read_user_value_with_mmap_fault(current_user_token(), attr as *const LinuxSchedAttr)?;
@@ -523,9 +520,9 @@ pub fn sys_sched_setattr(pid: isize, attr: usize, flags: u32) -> SysResult {
     Ok(0)
 }
 
-pub fn sys_sched_getattr(pid: isize, attr: usize, size: usize, flags: u32) -> SysResult {
+pub fn sys_sched_getattr(pid: isize, attr: usize, size: usize, flags: u32) -> KResult {
     if pid < 0 || attr == 0 || flags != 0 || size < LINUX_SCHED_ATTR_SIZE as usize {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let task = sched_target_task(pid)?;
     let sched_attr = sched_attr_for_task(&task);
@@ -537,9 +534,9 @@ pub fn sys_sched_getattr(pid: isize, attr: usize, size: usize, flags: u32) -> Sy
     Ok(0)
 }
 
-pub fn sys_sched_rr_get_interval(pid: isize, interval: *mut LinuxTimeSpec) -> SysResult {
+pub fn sys_sched_rr_get_interval(pid: isize, interval: *mut LinuxTimeSpec) -> KResult {
     if interval.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let task = sched_target_task(pid)?;
     let sched_policy = task.inner_exclusive_access().sched_policy;
@@ -569,9 +566,9 @@ fn ioprio_data(value: u16) -> u16 {
     value & IOPRIO_PRIO_MASK
 }
 
-fn validate_ioprio(value: i32) -> SysResult<u16> {
+fn validate_ioprio(value: i32) -> KResult<u16> {
     if value < 0 || value > u16::MAX as i32 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let value = value as u16;
     let class = ioprio_class(value);
@@ -580,7 +577,7 @@ fn validate_ioprio(value: i32) -> SysResult<u16> {
         IOPRIO_CLASS_NONE if data == 0 => Ok(value),
         IOPRIO_CLASS_BE | IOPRIO_CLASS_IDLE if data < IOPRIO_PRIO_NUM => Ok(value),
         IOPRIO_CLASS_RT if data < IOPRIO_PRIO_NUM => Ok(value),
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -588,9 +585,9 @@ fn ioprio_target_process_ctx(
     ctx: &SyscallContext,
     which: i32,
     who: isize,
-) -> SysResult<Arc<ProcessControlBlock>> {
+) -> KResult<Arc<ProcessControlBlock>> {
     if who < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     match which {
         IOPRIO_WHO_PROCESS => {
@@ -600,12 +597,12 @@ fn ioprio_target_process_ctx(
             {
                 Ok(Arc::clone(ctx.process()))
             } else {
-                pid2process(who as usize).ok_or(SysError::ESRCH)
+                pid2process(who as usize).ok_or(Errno::ESRCH)
             }
         }
         // UNFINISHED: Linux supports process-group and real-UID selectors. The
         // current scoring surface exercises only the current PROCESS selector.
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -613,7 +610,7 @@ fn caller_can_change_ioprio(
     ctx: &SyscallContext,
     target: &Arc<ProcessControlBlock>,
     value: u16,
-) -> SysResult<bool> {
+) -> KResult<bool> {
     let caller = ctx.process().credentials();
     let target_credentials = target.credentials();
     let same_process = ctx.process().getpid() == target.getpid();
@@ -622,23 +619,23 @@ fn caller_can_change_ioprio(
     let has_sys_admin = caller
         .capabilities
         .has_effective(CAP_SYS_ADMIN)
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
     if ioprio_class(value) == IOPRIO_CLASS_RT && !has_sys_admin {
         return Ok(false);
     }
     Ok(same_process || caller.is_root() || owns_target)
 }
 
-pub fn sys_ioprio_get_ctx(ctx: &SyscallContext, which: i32, who: isize) -> SysResult {
+pub fn sys_ioprio_get_ctx(ctx: &SyscallContext, which: i32, who: isize) -> KResult {
     let target = ioprio_target_process_ctx(ctx, which, who)?;
     Ok(target.inner_exclusive_access().io_priority as isize)
 }
 
-pub fn sys_ioprio_set_ctx(ctx: &SyscallContext, which: i32, who: isize, value: i32) -> SysResult {
+pub fn sys_ioprio_set_ctx(ctx: &SyscallContext, which: i32, who: isize, value: i32) -> KResult {
     let value = validate_ioprio(value)?;
     let target = ioprio_target_process_ctx(ctx, which, who)?;
     if !caller_can_change_ioprio(ctx, &target, value)? {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     // CONTEXT: This stores Linux-compatible ioprio state for userspace tests.
     // UNFINISHED: The block layer has no I/O scheduler that consumes it yet.
@@ -646,13 +643,13 @@ pub fn sys_ioprio_set_ctx(ctx: &SyscallContext, which: i32, who: isize, value: i
     Ok(0)
 }
 
-pub fn sys_getpriority(which: i32, who: isize) -> SysResult {
+pub fn sys_getpriority(which: i32, who: isize) -> KResult {
     let targets = target_tasks_for_priority(which, who)?;
     let best_nice = targets
         .iter()
         .map(|task| task_nice(task))
         .min()
-        .ok_or(SysError::ESRCH)?;
+        .ok_or(Errno::ESRCH)?;
 
     // CONTEXT: Linux's raw getpriority syscall returns 40..1 so negative nice
     // values cannot be confused with -errno. libc translates this back to
@@ -660,7 +657,7 @@ pub fn sys_getpriority(which: i32, who: isize) -> SysResult {
     Ok(linux_raw_priority_from_nice(best_nice))
 }
 
-pub fn sys_setpriority(which: i32, who: isize, prio: i32) -> SysResult {
+pub fn sys_setpriority(which: i32, who: isize, prio: i32) -> KResult {
     let new_nice = clamp_nice(prio);
     let targets = target_tasks_for_priority(which, who)?;
 

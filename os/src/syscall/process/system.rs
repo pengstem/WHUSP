@@ -1,7 +1,6 @@
 use crate::shutdown::shutdown;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::SyscallContext;
-use crate::syscall::errno::{SysError, SysResult};
 #[cfg(target_arch = "riscv64")]
 use crate::syscall::user_ptr::read_user_value_ctx;
 use crate::syscall::user_ptr::{
@@ -12,6 +11,7 @@ use crate::task::{
     CAP_SYS_ADMIN, CAP_SYS_TTY_CONFIG, current_process, current_user_token, processes_snapshot,
 };
 use crate::timer::{get_time_clock_ticks, get_time_us};
+use crate::uapi::errno::{Errno, KResult};
 use alloc::format;
 use alloc::string::String;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -174,12 +174,12 @@ fn has_linux_reboot_magic(magic: u32, magic2: u32) -> bool {
         )
 }
 
-pub fn sys_reboot(magic: usize, magic2: usize, op: usize, _arg: usize) -> SysResult {
+pub fn sys_reboot(magic: usize, magic2: usize, op: usize, _arg: usize) -> KResult {
     let magic = magic as u32;
     let magic2 = magic2 as u32;
     let op = op as u32;
     if !has_linux_reboot_magic(magic, magic2) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     // UNFINISHED: Linux requires CAP_SYS_BOOT in the caller's user namespace
@@ -202,18 +202,18 @@ pub fn sys_reboot(magic: usize, magic2: usize, op: usize, _arg: usize) -> SysRes
         }
         // UNFINISHED: RESTART2, KEXEC, and SW_SUSPEND require reboot strings,
         // kernel-image handoff, or suspend support that this kernel lacks.
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
-pub fn sys_vhangup_ctx(ctx: &SyscallContext) -> SysResult {
+pub fn sys_vhangup_ctx(ctx: &SyscallContext) -> KResult {
     let credentials = ctx.process().credentials();
     if !credentials
         .capabilities
         .has_effective(CAP_SYS_TTY_CONFIG)
         .unwrap_or(false)
     {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     // UNFINISHED: The kernel has no controlling-terminal/session tty model.
     // For root-owned LTP and BusyBox compatibility, accepting the call as a
@@ -222,7 +222,7 @@ pub fn sys_vhangup_ctx(ctx: &SyscallContext) -> SysResult {
     Ok(0)
 }
 
-pub fn sys_uname_ctx(ctx: &SyscallContext, name: *mut LinuxUtsName) -> SysResult {
+pub fn sys_uname_ctx(ctx: &SyscallContext, name: *mut LinuxUtsName) -> KResult {
     // UNFINISHED: UTS namespaces are not modeled. Host and domain names are
     // global while Linux stores them per UTS namespace.
     let uts = LinuxUtsName::current_for_personality(ctx.process().personality());
@@ -234,12 +234,12 @@ fn read_uts_name_ctx(
     ctx: &SyscallContext,
     name: *const u8,
     len: usize,
-) -> SysResult<[u8; UTS_FIELD_LEN]> {
+) -> KResult<[u8; UTS_FIELD_LEN]> {
     if len >= UTS_FIELD_LEN {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if len > 0 && name.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
 
     let mut field = [0u8; UTS_FIELD_LEN];
@@ -253,7 +253,7 @@ fn read_uts_name_ctx(
     Ok(field)
 }
 
-fn require_uts_admin(ctx: &SyscallContext) -> SysResult<()> {
+fn require_uts_admin(ctx: &SyscallContext) -> KResult<()> {
     // UNFINISHED: Linux checks CAP_SYS_ADMIN in the caller's UTS user
     // namespace. This kernel has one capability namespace, and setuid paths do
     // not fully recalculate capability sets, so also require root euid.
@@ -262,29 +262,29 @@ fn require_uts_admin(ctx: &SyscallContext) -> SysResult<()> {
         && credentials
             .capabilities
             .has_effective(CAP_SYS_ADMIN)
-            .ok_or(SysError::EINVAL)?
+            .ok_or(Errno::EINVAL)?
     {
         Ok(())
     } else {
-        Err(SysError::EPERM)
+        Err(Errno::EPERM)
     }
 }
 
-pub fn sys_sethostname_ctx(ctx: &SyscallContext, name: *const u8, len: usize) -> SysResult {
+pub fn sys_sethostname_ctx(ctx: &SyscallContext, name: *const u8, len: usize) -> KResult {
     require_uts_admin(ctx)?;
     let nodename = read_uts_name_ctx(ctx, name, len)?;
     UTS_STATE.exclusive_access().nodename = nodename;
     Ok(0)
 }
 
-pub fn sys_setdomainname_ctx(ctx: &SyscallContext, name: *const u8, len: usize) -> SysResult {
+pub fn sys_setdomainname_ctx(ctx: &SyscallContext, name: *const u8, len: usize) -> KResult {
     require_uts_admin(ctx)?;
     let domainname = read_uts_name_ctx(ctx, name, len)?;
     UTS_STATE.exclusive_access().domainname = domainname;
     Ok(0)
 }
 
-pub fn sys_sysinfo_ctx(ctx: &SyscallContext, info: *mut LinuxSysInfo) -> SysResult {
+pub fn sys_sysinfo_ctx(ctx: &SyscallContext, info: *mut LinuxSysInfo) -> KResult {
     let value = LinuxSysInfo {
         uptime: (get_time_us() / 1_000_000) as isize,
         totalram: 1024 * 1024 * 1024,
@@ -300,13 +300,11 @@ pub fn sys_sysinfo_ctx(ctx: &SyscallContext, info: *mut LinuxSysInfo) -> SysResu
 }
 
 #[cfg(target_arch = "riscv64")]
-fn riscv_hwprobe_pair_ptr(pairs: *mut RiscvHwprobe, index: usize) -> SysResult<*mut RiscvHwprobe> {
+fn riscv_hwprobe_pair_ptr(pairs: *mut RiscvHwprobe, index: usize) -> KResult<*mut RiscvHwprobe> {
     let offset = index
         .checked_mul(core::mem::size_of::<RiscvHwprobe>())
-        .ok_or(SysError::EFAULT)?;
-    let addr = (pairs as usize)
-        .checked_add(offset)
-        .ok_or(SysError::EFAULT)?;
+        .ok_or(Errno::EFAULT)?;
+    let addr = (pairs as usize).checked_add(offset).ok_or(Errno::EFAULT)?;
     Ok(addr as *mut RiscvHwprobe)
 }
 
@@ -334,18 +332,18 @@ pub fn sys_riscv_hwprobe_ctx(
     cpuset_size: usize,
     cpus: usize,
     flags: u32,
-) -> SysResult {
+) -> KResult {
     if flags != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if cpuset_size != 0 || cpus != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if pair_count == 0 {
         return Ok(0);
     }
     if pairs.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
 
     let pairs = pairs.cast::<RiscvHwprobe>();
@@ -362,7 +360,7 @@ pub fn sys_riscv_hwprobe_ctx(
     Ok(0)
 }
 
-pub fn sys_personality(persona: usize) -> SysResult {
+pub fn sys_personality(persona: usize) -> KResult {
     let old = current_process().personality();
     if persona == PERSONALITY_QUERY {
         return Ok(old as isize);
@@ -373,22 +371,22 @@ pub fn sys_personality(persona: usize) -> SysResult {
     // now accept only PER_LINUX plus UNAME26, which is the ABI surface needed by
     // uname04 and avoids pretending to support broader personality emulation.
     if persona & !(PER_MASK | UNAME26) != 0 || persona & PER_MASK != PER_LINUX {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     current_process().set_personality(persona);
     Ok(old as isize)
 }
 
-pub fn sys_getrandom_ctx(ctx: &SyscallContext, buf: *mut u8, len: usize, flags: u32) -> SysResult {
+pub fn sys_getrandom_ctx(ctx: &SyscallContext, buf: *mut u8, len: usize, flags: u32) -> KResult {
     if flags & !GRND_SUPPORTED != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if len == 0 {
         return Ok(0);
     }
     if len > isize::MAX as usize {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     // CONTEXT: The contest kernel has no cryptographic entropy pool yet. Use a
@@ -447,17 +445,17 @@ pub(crate) fn write_proc_sys_kernel_printk(buf: &[u8], offset: u64) -> usize {
     buf.len()
 }
 
-fn validate_syslog_size(len: usize) -> SysResult<usize> {
+fn validate_syslog_size(len: usize) -> KResult<usize> {
     if len > i32::MAX as usize {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(len)
 }
 
-fn validate_syslog_read_args(buf: *mut u8, len: usize) -> SysResult<usize> {
+fn validate_syslog_read_args(buf: *mut u8, len: usize) -> KResult<usize> {
     let len = validate_syslog_size(len)?;
     if buf.is_null() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(len)
 }
@@ -473,7 +471,7 @@ fn syslog_action_requires_privilege(log_type: usize) -> bool {
     !matches!(log_type, SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_SIZE_BUFFER)
 }
 
-fn syslog_copy_fake_log(buf: *mut u8, len: usize) -> SysResult {
+fn syslog_copy_fake_log(buf: *mut u8, len: usize) -> KResult {
     if len == 0 {
         return Ok(0);
     }
@@ -482,7 +480,7 @@ fn syslog_copy_fake_log(buf: *mut u8, len: usize) -> SysResult {
     Ok(copy_len as isize)
 }
 
-pub fn sys_syslog(log_type: usize, buf: *mut u8, len: usize) -> SysResult {
+pub fn sys_syslog(log_type: usize, buf: *mut u8, len: usize) -> KResult {
     match log_type {
         SYSLOG_ACTION_CLOSE
         | SYSLOG_ACTION_OPEN
@@ -497,14 +495,14 @@ pub fn sys_syslog(log_type: usize, buf: *mut u8, len: usize) -> SysResult {
         SYSLOG_ACTION_CONSOLE_LEVEL => {
             let level = validate_syslog_size(len)?;
             if !(SYSLOG_MIN_CONSOLE_LEVEL..=SYSLOG_MAX_CONSOLE_LEVEL).contains(&level) {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
         }
-        _ => return Err(SysError::EINVAL),
+        _ => return Err(Errno::EINVAL),
     }
 
     if syslog_action_requires_privilege(log_type) && !current_can_use_privileged_syslog() {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
 
     match log_type {
@@ -529,6 +527,6 @@ pub fn sys_syslog(log_type: usize, buf: *mut u8, len: usize) -> SysResult {
         }
         SYSLOG_ACTION_SIZE_UNREAD => Ok(SYSLOG_FAKE_MSG.len() as isize),
         SYSLOG_ACTION_SIZE_BUFFER => Ok(SYSLOG_BUF_SIZE as isize),
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }

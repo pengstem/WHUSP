@@ -10,7 +10,6 @@ use crate::sync::SleepMutex;
 use crate::task::{PathSnapshot, current_process, current_user_token};
 
 use super::super::SyscallContext;
-use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
     PATH_MAX, UserBufferAccess, copy_to_user, read_user_c_string, read_user_c_string_ctx,
     translated_byte_buffer_checked_with_mmap_fault, try_read_direct_path_component_ctx,
@@ -28,6 +27,7 @@ use super::uapi::{
     LinuxKstat, LinuxStatfs, LinuxStatx, STATX_RESERVED, VALID_FCHMODAT2_FLAGS,
     VALID_FCHOWNAT_FLAGS, VALID_FSTATAT_FLAGS, VALID_STATX_FLAGS,
 };
+use crate::uapi::errno::{Errno, KResult};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -61,12 +61,12 @@ fn write_stat_result_ctx<T: From<FileStat> + Copy>(
     ctx: &SyscallContext,
     buf: *mut T,
     stat: FileStat,
-) -> SysResult {
+) -> KResult {
     write_user_value_ctx(ctx, buf, &stat.into())?;
     Ok(0)
 }
 
-fn reject_proc_self_fd_o_path(path: &str) -> SysResult<()> {
+fn reject_proc_self_fd_o_path(path: &str) -> KResult<()> {
     let Some(fd_text) = path.strip_prefix("/proc/self/fd/") else {
         return Ok(());
     };
@@ -78,7 +78,7 @@ fn reject_proc_self_fd_o_path(path: &str) -> SysResult<()> {
     };
     let entry = get_fd_entry_by_fd(fd)?;
     if entry.status_flags().contains(OpenFlags::PATH) {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     Ok(())
 }
@@ -88,7 +88,7 @@ pub(super) fn resolve_stat_from(
     dirfd: isize,
     path: &str,
     follow_final_symlink: bool,
-) -> SysResult<FileStat> {
+) -> KResult<FileStat> {
     resolve_stat_from_with(snapshot, dirfd, path, follow_final_symlink, false)
 }
 
@@ -97,7 +97,7 @@ fn resolve_full_stat_from(
     dirfd: isize,
     path: &str,
     follow_final_symlink: bool,
-) -> SysResult<FileStat> {
+) -> KResult<FileStat> {
     resolve_stat_from_with(snapshot, dirfd, path, follow_final_symlink, true)
 }
 
@@ -143,7 +143,7 @@ fn resolve_stat_from_with(
     path: &str,
     follow_final_symlink: bool,
     full_stat: bool,
-) -> SysResult<FileStat> {
+) -> KResult<FileStat> {
     let path = {
         let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathResolveAt);
         match resolve_at_path(snapshot, dirfd, path, true)? {
@@ -166,7 +166,7 @@ fn resolve_stat_from_with(
             } else {
                 stat_devfs_child(path)
             };
-            return stat.ok_or(SysError::ENOENT);
+            return stat.ok_or(Errno::ENOENT);
         }
     }
     if static_stat_probe_may_hit(snapshot, dirfd, path) {
@@ -187,9 +187,9 @@ fn resolve_stat_from_with(
     Ok(stat)
 }
 
-pub fn sys_fstat_ctx(ctx: &SyscallContext, fd: usize, statbuf: *mut LinuxKstat) -> SysResult {
+pub fn sys_fstat_ctx(ctx: &SyscallContext, fd: usize, statbuf: *mut LinuxKstat) -> KResult {
     if statbuf.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let file = get_file_by_fd(fd)?;
     write_stat_result_ctx(ctx, statbuf, file.stat()?)
@@ -201,12 +201,12 @@ pub fn sys_newfstatat_ctx(
     pathname: *const u8,
     statbuf: *mut LinuxKstat,
     flags: i32,
-) -> SysResult {
+) -> KResult {
     if statbuf.is_null() || pathname.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     if flags & !VALID_FSTATAT_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     if dirfd >= 0
@@ -216,8 +216,8 @@ pub fn sys_newfstatat_ctx(
         let parent = ctx
             .process()
             .directory_working_dir_from_fd(dirfd as usize)
-            .ok_or(SysError::EBADF)?
-            .ok_or(SysError::ENOTDIR)?;
+            .ok_or(Errno::EBADF)?
+            .ok_or(Errno::ENOTDIR)?;
         if let Some(stat) = stat_direct_regular_child_in(
             ctx.process().mount_namespace_id(),
             parent,
@@ -234,15 +234,15 @@ pub fn sys_newfstatat_ctx(
         read_user_c_string_ctx(ctx, pathname, PATH_MAX)?
     };
     if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
     let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
     if !path.is_empty() && !path.starts_with('/') && dirfd >= 0 && dirfd != AT_FDCWD {
         let parent = ctx
             .process()
             .directory_working_dir_from_fd(dirfd as usize)
-            .ok_or(SysError::EBADF)?
-            .ok_or(SysError::ENOTDIR)?;
+            .ok_or(Errno::EBADF)?
+            .ok_or(Errno::ENOTDIR)?;
         if let Some(stat) = stat_direct_regular_child_in(
             ctx.process().mount_namespace_id(),
             parent,
@@ -266,16 +266,16 @@ pub fn sys_newfstatat_ctx(
     write_stat_result_ctx(ctx, statbuf, stat)
 }
 
-fn prepare_mode_change(stat: FileStat, mode: u32) -> SysResult<u32> {
+fn prepare_mode_change(stat: FileStat, mode: u32) -> KResult<u32> {
     if mount_is_read_only(MountId(stat.dev as usize)) {
-        return Err(SysError::EROFS);
+        return Err(Errno::EROFS);
     }
     let credentials = current_process().credentials();
     // UNFINISHED: Linux chmod checks CAP_FOWNER and filesystem uid in the
     // caller's user namespace. This kernel only has root-equivalent uid 0 plus
     // stored fsuid.
     if credentials.euid != 0 && credentials.fsuid != stat.uid {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     let mut mode = mode;
     if mode & MODE_SETGID != 0
@@ -289,7 +289,7 @@ fn prepare_mode_change(stat: FileStat, mode: u32) -> SysResult<u32> {
     Ok(mode)
 }
 
-fn ensure_can_change_owner(stat: FileStat, uid: Option<u32>, gid: Option<u32>) -> SysResult<()> {
+fn ensure_can_change_owner(stat: FileStat, uid: Option<u32>, gid: Option<u32>) -> KResult<()> {
     let credentials = current_process().credentials();
     if credentials.euid == 0 {
         return Ok(());
@@ -306,7 +306,7 @@ fn ensure_can_change_owner(stat: FileStat, uid: Option<u32>, gid: Option<u32>) -
     {
         return Ok(());
     }
-    Err(SysError::EPERM)
+    Err(Errno::EPERM)
 }
 
 fn mode_after_chown(stat: FileStat, uid: Option<u32>, gid: Option<u32>) -> Option<u32> {
@@ -321,9 +321,9 @@ fn mode_after_chown(stat: FileStat, uid: Option<u32>, gid: Option<u32>) -> Optio
     (mode != stat.mode).then_some(mode)
 }
 
-fn prepare_owner_change(stat: FileStat, uid: Option<u32>, gid: Option<u32>) -> SysResult<()> {
+fn prepare_owner_change(stat: FileStat, uid: Option<u32>, gid: Option<u32>) -> KResult<()> {
     if mount_is_read_only(MountId(stat.dev as usize)) {
-        return Err(SysError::EROFS);
+        return Err(Errno::EROFS);
     }
     ensure_can_change_owner(stat, uid, gid)
 }
@@ -333,7 +333,7 @@ fn finish_file_owner_change(
     stat: FileStat,
     uid: Option<u32>,
     gid: Option<u32>,
-) -> SysResult {
+) -> KResult {
     prepare_owner_change(stat, uid, gid)?;
     file.set_owner(uid, gid)?;
     if let Some(mode) = mode_after_chown(stat, uid, gid) {
@@ -350,7 +350,7 @@ fn finish_path_owner_change(
     stat: FileStat,
     uid: Option<u32>,
     gid: Option<u32>,
-) -> SysResult {
+) -> KResult {
     prepare_owner_change(stat, uid, gid)?;
     let context = path_context_from(snapshot, dirfd, path)?;
     chown_in(context.clone(), path, follow_final_symlink, uid, gid)?;
@@ -360,9 +360,9 @@ fn finish_path_owner_change(
     Ok(0)
 }
 
-pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> SysResult {
+pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> KResult {
     if pathname.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let token = current_user_token();
     let path = read_user_c_string(token, pathname, PATH_MAX)?;
@@ -371,9 +371,9 @@ pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> SysResult {
             && let Ok(entry) = get_fd_entry_by_fd(dirfd as usize)
             && entry.status_flags().contains(OpenFlags::PATH)
         {
-            return Err(SysError::EBADF);
+            return Err(Errno::EBADF);
         }
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
     reject_proc_self_fd_o_path(path.as_str())?;
     let snapshot = current_process().path_snapshot();
@@ -392,12 +392,12 @@ pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> SysResult {
     Ok(0)
 }
 
-pub fn sys_fchmodat2(dirfd: isize, pathname: *const u8, mode: u32, flags: i32) -> SysResult {
+pub fn sys_fchmodat2(dirfd: isize, pathname: *const u8, mode: u32, flags: i32) -> KResult {
     if pathname.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     if flags & !VALID_FCHMODAT2_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let token = current_user_token();
@@ -435,10 +435,10 @@ pub fn sys_fchmodat2(dirfd: isize, pathname: *const u8, mode: u32, flags: i32) -
     }
 }
 
-pub fn sys_fchmod(fd: usize, mode: u32) -> SysResult {
+pub fn sys_fchmod(fd: usize, mode: u32) -> KResult {
     let entry = get_fd_entry_by_fd(fd)?;
     if entry.status_flags().contains(OpenFlags::PATH) {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     let file = entry.file();
     let stat = file.stat()?;
@@ -453,12 +453,12 @@ fn decode_chown_id(raw: u32) -> Option<u32> {
     (raw != UID_GID_NO_CHANGE).then_some(raw)
 }
 
-pub fn sys_fchown(fd: usize, owner: u32, group: u32) -> SysResult {
+pub fn sys_fchown(fd: usize, owner: u32, group: u32) -> KResult {
     let uid = decode_chown_id(owner);
     let gid = decode_chown_id(group);
     let entry = get_fd_entry_by_fd(fd)?;
     if entry.status_flags().contains(OpenFlags::PATH) {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     let file = entry.file();
     let stat = file.stat()?;
@@ -471,12 +471,12 @@ pub fn sys_fchownat(
     owner: u32,
     group: u32,
     flags: i32,
-) -> SysResult {
+) -> KResult {
     if pathname.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     if flags & !VALID_FCHOWNAT_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let uid = decode_chown_id(owner);
     let gid = decode_chown_id(group);
@@ -488,7 +488,7 @@ pub fn sys_fchownat(
 
     if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
-            return Err(SysError::ENOENT);
+            return Err(Errno::ENOENT);
         }
         if dirfd == AT_FDCWD {
             let stat = stat_in(snapshot.context.clone(), ".", follow_final_symlink)?;
@@ -503,11 +503,11 @@ pub fn sys_fchownat(
             );
         }
         if dirfd < 0 {
-            return Err(SysError::EBADF);
+            return Err(Errno::EBADF);
         }
         let entry = get_fd_entry_by_fd(dirfd as usize)?;
         if entry.status_flags().contains(OpenFlags::PATH) {
-            return Err(SysError::EBADF);
+            return Err(Errno::EBADF);
         }
         let file = entry.file();
         let stat = file.stat()?;
@@ -527,23 +527,23 @@ pub fn sys_fchownat(
     )
 }
 
-fn read_xattr_name(token: usize, name: *const u8) -> SysResult<String> {
+fn read_xattr_name(token: usize, name: *const u8) -> KResult<String> {
     let name = read_user_c_string(token, name, XATTR_NAME_MAX + 1)?;
     if !xattr_name_supported(name.as_str()) {
-        return Err(SysError::ENOTSUP);
+        return Err(Errno::ENOTSUP);
     }
     Ok(name)
 }
 
-fn read_xattr_value(token: usize, value: *const u8, size: usize) -> SysResult<Vec<u8>> {
+fn read_xattr_value(token: usize, value: *const u8, size: usize) -> KResult<Vec<u8>> {
     if size > XATTR_SIZE_MAX {
-        return Err(SysError::ERANGE);
+        return Err(Errno::ERANGE);
     }
     if size == 0 {
         return Ok(Vec::new());
     }
     if value.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let buffers =
         translated_byte_buffer_checked_with_mmap_fault(token, value, size, UserBufferAccess::Read)?;
@@ -578,11 +578,11 @@ fn xattr_kind_from_mode(mode: u32) -> FsNodeKind {
     }
 }
 
-fn xattr_target_from_path(path: *const u8, follow_final_symlink: bool) -> SysResult<XattrTarget> {
+fn xattr_target_from_path(path: *const u8, follow_final_symlink: bool) -> KResult<XattrTarget> {
     let token = current_user_token();
     let path = read_user_c_string(token, path, PATH_MAX)?;
     if path.is_empty() {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
     let snapshot = current_process().path_snapshot();
     let context = path_context_from(&snapshot, AT_FDCWD, path.as_str())?;
@@ -593,13 +593,13 @@ fn xattr_target_from_path(path: *const u8, follow_final_symlink: bool) -> SysRes
     })
 }
 
-fn xattr_target_from_fd(fd: usize) -> SysResult<XattrTarget> {
+fn xattr_target_from_fd(fd: usize) -> KResult<XattrTarget> {
     let entry = get_fd_entry_by_fd(fd)?;
     if entry.status_flags().contains(OpenFlags::PATH) {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     let file = entry.file();
-    let node = file.vfs_node_id().ok_or(SysError::ENOTSUP)?;
+    let node = file.vfs_node_id().ok_or(Errno::ENOTSUP)?;
     let stat = file.stat()?;
     Ok(XattrTarget {
         node,
@@ -607,28 +607,28 @@ fn xattr_target_from_fd(fd: usize) -> SysResult<XattrTarget> {
     })
 }
 
-fn xattr_get(target: XattrTarget, name: &str, value: *mut u8, size: usize) -> SysResult {
+fn xattr_get(target: XattrTarget, name: &str, value: *mut u8, size: usize) -> KResult {
     let token = current_user_token();
     if name.starts_with("user.") && !xattr_user_namespace_allowed(target.kind) {
-        return Err(SysError::ENODATA);
+        return Err(Errno::ENODATA);
     }
     let key = (target.node, String::from(name));
     let attrs = XATTRS.lock();
-    let stored = attrs.get(&key).ok_or(SysError::ENODATA)?;
+    let stored = attrs.get(&key).ok_or(Errno::ENODATA)?;
     if size == 0 {
         return Ok(stored.len() as isize);
     }
     if value.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     if size < stored.len() {
-        return Err(SysError::ERANGE);
+        return Err(Errno::ERANGE);
     }
     copy_to_user(token, value, stored)?;
     Ok(stored.len() as isize)
 }
 
-fn copy_xattr_list_to_user(token: usize, list: *mut u8, bytes: &[u8]) -> SysResult {
+fn copy_xattr_list_to_user(token: usize, list: *mut u8, bytes: &[u8]) -> KResult {
     if bytes.is_empty() {
         return Ok(0);
     }
@@ -651,7 +651,7 @@ fn copy_xattr_list_to_user(token: usize, list: *mut u8, bytes: &[u8]) -> SysResu
     Ok(0)
 }
 
-fn xattr_list_bytes(target: XattrTarget) -> SysResult<Vec<u8>> {
+fn xattr_list_bytes(target: XattrTarget) -> KResult<Vec<u8>> {
     let attrs = XATTRS.lock();
     let mut list = Vec::new();
     for ((node, name), _) in attrs.iter() {
@@ -661,9 +661,9 @@ fn xattr_list_bytes(target: XattrTarget) -> SysResult<Vec<u8>> {
         if name.starts_with("user.") && !xattr_user_namespace_allowed(target.kind) {
             continue;
         }
-        let entry_len = name.len().checked_add(1).ok_or(SysError::E2BIG)?;
-        if list.len().checked_add(entry_len).ok_or(SysError::E2BIG)? > XATTR_LIST_MAX {
-            return Err(SysError::E2BIG);
+        let entry_len = name.len().checked_add(1).ok_or(Errno::E2BIG)?;
+        if list.len().checked_add(entry_len).ok_or(Errno::E2BIG)? > XATTR_LIST_MAX {
+            return Err(Errno::E2BIG);
         }
         list.extend_from_slice(name.as_bytes());
         list.push(0);
@@ -671,27 +671,27 @@ fn xattr_list_bytes(target: XattrTarget) -> SysResult<Vec<u8>> {
     Ok(list)
 }
 
-fn xattr_list(target: XattrTarget, list: *mut u8, size: usize) -> SysResult {
+fn xattr_list(target: XattrTarget, list: *mut u8, size: usize) -> KResult {
     let bytes = xattr_list_bytes(target)?;
     if size == 0 {
         return Ok(bytes.len() as isize);
     }
     if list.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     if size < bytes.len() {
-        return Err(SysError::ERANGE);
+        return Err(Errno::ERANGE);
     }
     copy_xattr_list_to_user(current_user_token(), list, bytes.as_slice())?;
     Ok(bytes.len() as isize)
 }
 
-fn xattr_set(target: XattrTarget, name: &str, value: Vec<u8>, flags: u32) -> SysResult {
+fn xattr_set(target: XattrTarget, name: &str, value: Vec<u8>, flags: u32) -> KResult {
     if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 || flags == (XATTR_CREATE | XATTR_REPLACE) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if name.starts_with("user.") && !xattr_user_namespace_allowed(target.kind) {
-        return Err(SysError::ENOTSUP);
+        return Err(Errno::ENOTSUP);
     }
     // UNFINISHED: xattrs are kept in a kernel in-memory VFS side table. They
     // are enough for one-boot LTP syscall semantics but are not persisted into
@@ -700,21 +700,21 @@ fn xattr_set(target: XattrTarget, name: &str, value: Vec<u8>, flags: u32) -> Sys
     let mut attrs = XATTRS.lock();
     let exists = attrs.contains_key(&key);
     if flags & XATTR_CREATE != 0 && exists {
-        return Err(SysError::EEXIST);
+        return Err(Errno::EEXIST);
     }
     if flags & XATTR_REPLACE != 0 && !exists {
-        return Err(SysError::ENODATA);
+        return Err(Errno::ENODATA);
     }
     attrs.insert(key, value);
     Ok(0)
 }
 
-fn xattr_remove(target: XattrTarget, name: &str) -> SysResult {
+fn xattr_remove(target: XattrTarget, name: &str) -> KResult {
     let key = (target.node, String::from(name));
     if XATTRS.lock().remove(&key).is_some() {
         Ok(0)
     } else {
-        Err(SysError::ENODATA)
+        Err(Errno::ENODATA)
     }
 }
 
@@ -724,7 +724,7 @@ pub fn sys_setxattr(
     value: *const u8,
     size: usize,
     flags: u32,
-) -> SysResult {
+) -> KResult {
     let token = current_user_token();
     let name = read_xattr_name(token, name)?;
     let value = read_xattr_value(token, value, size)?;
@@ -738,7 +738,7 @@ pub fn sys_lsetxattr(
     value: *const u8,
     size: usize,
     flags: u32,
-) -> SysResult {
+) -> KResult {
     let token = current_user_token();
     let name = read_xattr_name(token, name)?;
     let value = read_xattr_value(token, value, size)?;
@@ -752,7 +752,7 @@ pub fn sys_fsetxattr(
     value: *const u8,
     size: usize,
     flags: u32,
-) -> SysResult {
+) -> KResult {
     let token = current_user_token();
     let name = read_xattr_name(token, name)?;
     let value = read_xattr_value(token, value, size)?;
@@ -760,57 +760,57 @@ pub fn sys_fsetxattr(
     xattr_set(target, name.as_str(), value, flags)
 }
 
-pub fn sys_getxattr(path: *const u8, name: *const u8, value: *mut u8, size: usize) -> SysResult {
+pub fn sys_getxattr(path: *const u8, name: *const u8, value: *mut u8, size: usize) -> KResult {
     let token = current_user_token();
     let name = read_xattr_name(token, name)?;
     let target = xattr_target_from_path(path, true)?;
     xattr_get(target, name.as_str(), value, size)
 }
 
-pub fn sys_lgetxattr(path: *const u8, name: *const u8, value: *mut u8, size: usize) -> SysResult {
+pub fn sys_lgetxattr(path: *const u8, name: *const u8, value: *mut u8, size: usize) -> KResult {
     let token = current_user_token();
     let name = read_xattr_name(token, name)?;
     let target = xattr_target_from_path(path, false)?;
     xattr_get(target, name.as_str(), value, size)
 }
 
-pub fn sys_fgetxattr(fd: usize, name: *const u8, value: *mut u8, size: usize) -> SysResult {
+pub fn sys_fgetxattr(fd: usize, name: *const u8, value: *mut u8, size: usize) -> KResult {
     let token = current_user_token();
     let name = read_xattr_name(token, name)?;
     let target = xattr_target_from_fd(fd)?;
     xattr_get(target, name.as_str(), value, size)
 }
 
-pub fn sys_listxattr(path: *const u8, list: *mut u8, size: usize) -> SysResult {
+pub fn sys_listxattr(path: *const u8, list: *mut u8, size: usize) -> KResult {
     let target = xattr_target_from_path(path, true)?;
     xattr_list(target, list, size)
 }
 
-pub fn sys_llistxattr(path: *const u8, list: *mut u8, size: usize) -> SysResult {
+pub fn sys_llistxattr(path: *const u8, list: *mut u8, size: usize) -> KResult {
     let target = xattr_target_from_path(path, false)?;
     xattr_list(target, list, size)
 }
 
-pub fn sys_flistxattr(fd: usize, list: *mut u8, size: usize) -> SysResult {
+pub fn sys_flistxattr(fd: usize, list: *mut u8, size: usize) -> KResult {
     let target = xattr_target_from_fd(fd)?;
     xattr_list(target, list, size)
 }
 
-pub fn sys_removexattr(path: *const u8, name: *const u8) -> SysResult {
+pub fn sys_removexattr(path: *const u8, name: *const u8) -> KResult {
     let token = current_user_token();
     let name = read_xattr_name(token, name)?;
     let target = xattr_target_from_path(path, true)?;
     xattr_remove(target, name.as_str())
 }
 
-pub fn sys_lremovexattr(path: *const u8, name: *const u8) -> SysResult {
+pub fn sys_lremovexattr(path: *const u8, name: *const u8) -> KResult {
     let token = current_user_token();
     let name = read_xattr_name(token, name)?;
     let target = xattr_target_from_path(path, false)?;
     xattr_remove(target, name.as_str())
 }
 
-pub fn sys_fremovexattr(fd: usize, name: *const u8) -> SysResult {
+pub fn sys_fremovexattr(fd: usize, name: *const u8) -> KResult {
     let token = current_user_token();
     let name = read_xattr_name(token, name)?;
     let target = xattr_target_from_fd(fd)?;
@@ -821,23 +821,23 @@ pub fn sys_statfs_ctx(
     ctx: &SyscallContext,
     pathname: *const u8,
     statfsbuf: *mut LinuxStatfs,
-) -> SysResult {
+) -> KResult {
     if statfsbuf.is_null() || pathname.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let path = read_user_c_string_ctx(ctx, pathname, PATH_MAX)?;
     if path.is_empty() {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
     let snapshot = ctx.process().path_snapshot();
     check_access_path_prefixes_for_process(ctx.process(), &snapshot, AT_FDCWD, path.as_str())?;
     let stat = resolve_stat_from(&snapshot, AT_FDCWD, path.as_str(), true)?;
-    let fs_stat = statfs_for_mount(MountId(stat.dev as usize)).ok_or(SysError::ENOSYS)?;
+    let fs_stat = statfs_for_mount(MountId(stat.dev as usize)).ok_or(Errno::ENOSYS)?;
     write_user_value_ctx(ctx, statfsbuf, &LinuxStatfs::from(fs_stat))?;
     Ok(0)
 }
 
-pub fn sys_fstatfs_ctx(ctx: &SyscallContext, fd: usize, statfsbuf: *mut LinuxStatfs) -> SysResult {
+pub fn sys_fstatfs_ctx(ctx: &SyscallContext, fd: usize, statfsbuf: *mut LinuxStatfs) -> KResult {
     let entry = get_fd_entry_by_fd_for_process(ctx.process(), fd)?;
     let stat = entry.file().stat()?;
     let fs_stat = statfs_for_mount(MountId(stat.dev as usize)).unwrap_or_else(anonymous_fd_statfs);
@@ -869,12 +869,12 @@ pub fn sys_statx_ctx(
     flags: i32,
     mask: u32,
     statxbuf: *mut LinuxStatx,
-) -> SysResult {
+) -> KResult {
     if statxbuf.is_null() || pathname.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     if flags & !VALID_STATX_FLAGS != 0 || mask & STATX_RESERVED != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     // LoongArch musl implements fstatat/stat through statx. Give its common
@@ -888,8 +888,8 @@ pub fn sys_statx_ctx(
         let parent = ctx
             .process()
             .directory_working_dir_from_fd(dirfd as usize)
-            .ok_or(SysError::EBADF)?
-            .ok_or(SysError::ENOTDIR)?;
+            .ok_or(Errno::EBADF)?
+            .ok_or(Errno::ENOTDIR)?;
         if let Some(stat) = stat_direct_regular_child_in(
             ctx.process().mount_namespace_id(),
             parent,
@@ -902,15 +902,15 @@ pub fn sys_statx_ctx(
 
     let path = read_user_c_string_ctx(ctx, pathname, PATH_MAX)?;
     if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
     let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
     if !path.is_empty() && !path.starts_with('/') && dirfd >= 0 && dirfd != AT_FDCWD {
         let parent = ctx
             .process()
             .directory_working_dir_from_fd(dirfd as usize)
-            .ok_or(SysError::EBADF)?
-            .ok_or(SysError::ENOTDIR)?;
+            .ok_or(Errno::EBADF)?
+            .ok_or(Errno::ENOTDIR)?;
         if let Some(stat) = stat_direct_regular_child_in(
             ctx.process().mount_namespace_id(),
             parent,
@@ -934,7 +934,7 @@ fn resolve_statx_stat(
     path: &str,
     flags: i32,
     follow_final_symlink: bool,
-) -> SysResult<FileStat> {
+) -> KResult<FileStat> {
     // CONTEXT: Linux AT_STATX_FORCE_SYNC / AT_STATX_DONT_SYNC are cache
     // coherency hints. Local contest filesystems resolve stat synchronously;
     // only the NFS compatibility mount has a visible stat cache.

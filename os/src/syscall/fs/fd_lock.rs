@@ -1,11 +1,11 @@
 use crate::fs::{File, SeekWhence};
 use crate::sync::UPIntrFreeCell;
-use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{read_user_value, write_user_value};
 use crate::task::{
     FdTableEntry, TaskControlBlock, block_current_task_no_schedule, current_process,
     current_user_token, processes_snapshot, schedule, wakeup_task,
 };
+use crate::uapi::errno::{Errno, KResult};
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -160,13 +160,13 @@ impl RecordLockTable {
         l_type: i16,
         start: i64,
         end: i64,
-    ) -> SysResult<Vec<Arc<TaskControlBlock>>> {
+    ) -> KResult<Vec<Arc<TaskControlBlock>>> {
         if l_type != F_UNLCK
             && !self
                 .find_conflicts(key, &owner, l_type, start, end)
                 .is_empty()
         {
-            return Err(SysError::EAGAIN);
+            return Err(Errno::EAGAIN);
         }
 
         let released = self.remove_owned_range(key, &owner, start, end);
@@ -421,9 +421,9 @@ impl FlockTable {
         key: LockKey,
         owner: Arc<dyn File + Send + Sync>,
         mode: FlockMode,
-    ) -> SysResult<Vec<Arc<TaskControlBlock>>> {
+    ) -> KResult<Vec<Arc<TaskControlBlock>>> {
         if self.has_conflict(key, &owner, mode) {
-            return Err(SysError::EAGAIN);
+            return Err(Errno::EAGAIN);
         }
         self.remove_owner_lock(key, &owner);
         self.locks.push(FlockLock { key, owner, mode });
@@ -533,7 +533,7 @@ fn ranges_overlap(first_start: i64, first_end: i64, second_start: i64, second_en
     first_start <= second_end && second_start <= first_end
 }
 
-fn lock_key(file: &Arc<dyn File + Send + Sync>) -> SysResult<LockKey> {
+fn lock_key(file: &Arc<dyn File + Send + Sync>) -> KResult<LockKey> {
     let stat = file.stat()?;
     Ok(LockKey {
         dev: stat.dev,
@@ -541,31 +541,29 @@ fn lock_key(file: &Arc<dyn File + Send + Sync>) -> SysResult<LockKey> {
     })
 }
 
-fn flock_range(file: &Arc<dyn File + Send + Sync>, flock: LinuxFlock) -> SysResult<(i64, i64)> {
+fn flock_range(file: &Arc<dyn File + Send + Sync>, flock: LinuxFlock) -> KResult<(i64, i64)> {
     if !valid_flock_whence(flock.l_whence) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let base = match flock.l_whence {
         SEEK_SET => 0,
-        SEEK_CUR => {
-            i64::try_from(file.seek(0, SeekWhence::Current)?).map_err(|_| SysError::EINVAL)?
-        }
-        SEEK_END => i64::try_from(file.stat()?.size).map_err(|_| SysError::EINVAL)?,
+        SEEK_CUR => i64::try_from(file.seek(0, SeekWhence::Current)?).map_err(|_| Errno::EINVAL)?,
+        SEEK_END => i64::try_from(file.stat()?.size).map_err(|_| Errno::EINVAL)?,
         _ => unreachable!(),
     };
-    let mut start = base.checked_add(flock.l_start).ok_or(SysError::EINVAL)?;
+    let mut start = base.checked_add(flock.l_start).ok_or(Errno::EINVAL)?;
     if start < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let end = if flock.l_len > 0 {
-        let len_last = flock.l_len.checked_sub(1).ok_or(SysError::EINVAL)?;
-        start.checked_add(len_last).ok_or(SysError::EINVAL)?
+        let len_last = flock.l_len.checked_sub(1).ok_or(Errno::EINVAL)?;
+        start.checked_add(len_last).ok_or(Errno::EINVAL)?
     } else if flock.l_len < 0 {
-        let end = start.checked_sub(1).ok_or(SysError::EINVAL)?;
-        start = start.checked_add(flock.l_len).ok_or(SysError::EINVAL)?;
+        let end = start.checked_sub(1).ok_or(Errno::EINVAL)?;
+        start = start.checked_add(flock.l_len).ok_or(Errno::EINVAL)?;
         if start < 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         end
     } else {
@@ -583,10 +581,10 @@ fn flock_len(start: i64, end: i64) -> i64 {
     }
 }
 
-fn check_lock_access(file: &Arc<dyn File + Send + Sync>, l_type: i16) -> SysResult<()> {
+fn check_lock_access(file: &Arc<dyn File + Send + Sync>, l_type: i16) -> KResult<()> {
     match l_type {
-        F_RDLCK if !file.readable() => Err(SysError::EBADF),
-        F_WRLCK if !file.writable() => Err(SysError::EBADF),
+        F_RDLCK if !file.readable() => Err(Errno::EBADF),
+        F_WRLCK if !file.writable() => Err(Errno::EBADF),
         _ => Ok(()),
     }
 }
@@ -597,16 +595,16 @@ fn wake_waiters(waiters: Vec<Arc<TaskControlBlock>>) {
     }
 }
 
-fn parse_flock_operation(operation: i32) -> SysResult<(Option<FlockMode>, bool)> {
+fn parse_flock_operation(operation: i32) -> KResult<(Option<FlockMode>, bool)> {
     if operation & !FLOCK_VALID_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let mode_bits = operation & (LOCK_SH | LOCK_EX | LOCK_UN);
     let mode = match mode_bits {
         LOCK_SH => Some(FlockMode::Shared),
         LOCK_EX => Some(FlockMode::Exclusive),
         LOCK_UN => None,
-        _ => return Err(SysError::EINVAL),
+        _ => return Err(Errno::EINVAL),
     };
     Ok((mode, operation & LOCK_NB != 0))
 }
@@ -617,7 +615,7 @@ fn file_description_still_referenced(file: &Arc<dyn File + Send + Sync>) -> bool
         .any(|process| process.references_file_description(file))
 }
 
-pub(super) fn flock_operation(entry: FdTableEntry, operation: i32) -> SysResult {
+pub(super) fn flock_operation(entry: FdTableEntry, operation: i32) -> KResult {
     let owner = entry.file();
     let (mode, nonblocking) = parse_flock_operation(operation)?;
     let key = lock_key(&owner)?;
@@ -632,8 +630,8 @@ pub(super) fn flock_operation(entry: FdTableEntry, operation: i32) -> SysResult 
                     wake_waiters(waiters);
                     return Ok(0);
                 }
-                Err(SysError::EAGAIN) if nonblocking => return Err(SysError::EAGAIN),
-                Err(SysError::EAGAIN) => {}
+                Err(Errno::EAGAIN) if nonblocking => return Err(Errno::EAGAIN),
+                Err(Errno::EAGAIN) => {}
                 Err(error) => return Err(error),
             }
             let (task, task_cx_ptr) = block_current_task_no_schedule();
@@ -648,7 +646,7 @@ pub(super) fn flock_operation(entry: FdTableEntry, operation: i32) -> SysResult 
     }
 }
 
-pub(super) fn fcntl_getlk(entry: FdTableEntry, lock: *mut LinuxFlock) -> SysResult {
+pub(super) fn fcntl_getlk(entry: FdTableEntry, lock: *mut LinuxFlock) -> KResult {
     fcntl_getlk_with_owner(
         entry,
         lock,
@@ -656,7 +654,7 @@ pub(super) fn fcntl_getlk(entry: FdTableEntry, lock: *mut LinuxFlock) -> SysResu
     )
 }
 
-pub(super) fn fcntl_ofd_getlk(entry: FdTableEntry, lock: *mut LinuxFlock) -> SysResult {
+pub(super) fn fcntl_ofd_getlk(entry: FdTableEntry, lock: *mut LinuxFlock) -> KResult {
     let owner = RecordLockOwner::file_description(entry.file());
     fcntl_getlk_with_owner(entry, lock, owner)
 }
@@ -665,12 +663,12 @@ fn fcntl_getlk_with_owner(
     entry: FdTableEntry,
     lock: *mut LinuxFlock,
     owner: RecordLockOwner,
-) -> SysResult {
+) -> KResult {
     let file = entry.file();
     let token = current_user_token();
     let mut flock = read_user_value(token, lock.cast_const())?;
     if !valid_getlk_type(flock.l_type) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let (start, end) = flock_range(&file, flock)?;
@@ -693,7 +691,7 @@ fn fcntl_getlk_with_owner(
     Ok(0)
 }
 
-pub(super) fn fcntl_setlk(entry: FdTableEntry, lock: *const LinuxFlock) -> SysResult {
+pub(super) fn fcntl_setlk(entry: FdTableEntry, lock: *const LinuxFlock) -> KResult {
     fcntl_setlk_with_owner(
         entry,
         lock,
@@ -701,11 +699,11 @@ pub(super) fn fcntl_setlk(entry: FdTableEntry, lock: *const LinuxFlock) -> SysRe
     )
 }
 
-pub(super) fn fcntl_ofd_setlk(entry: FdTableEntry, lock: *const LinuxFlock) -> SysResult {
+pub(super) fn fcntl_ofd_setlk(entry: FdTableEntry, lock: *const LinuxFlock) -> KResult {
     let token = current_user_token();
     let flock = read_user_value(token, lock)?;
     if flock.l_pid != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let owner = RecordLockOwner::file_description(entry.file());
     fcntl_setlk_with_owner(entry, lock, owner)
@@ -715,12 +713,12 @@ fn fcntl_setlk_with_owner(
     entry: FdTableEntry,
     lock: *const LinuxFlock,
     owner: RecordLockOwner,
-) -> SysResult {
+) -> KResult {
     let file = entry.file();
     let token = current_user_token();
     let flock = read_user_value(token, lock)?;
     if !valid_setlk_type(flock.l_type) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     check_lock_access(&file, flock.l_type)?;
 
@@ -734,7 +732,7 @@ fn fcntl_setlk_with_owner(
     Ok(0)
 }
 
-pub(super) fn fcntl_setlkw(entry: FdTableEntry, lock: *const LinuxFlock) -> SysResult {
+pub(super) fn fcntl_setlkw(entry: FdTableEntry, lock: *const LinuxFlock) -> KResult {
     fcntl_setlkw_with_owner(
         entry,
         lock,
@@ -743,11 +741,11 @@ pub(super) fn fcntl_setlkw(entry: FdTableEntry, lock: *const LinuxFlock) -> SysR
     )
 }
 
-pub(super) fn fcntl_ofd_setlkw(entry: FdTableEntry, lock: *const LinuxFlock) -> SysResult {
+pub(super) fn fcntl_ofd_setlkw(entry: FdTableEntry, lock: *const LinuxFlock) -> KResult {
     let token = current_user_token();
     let flock = read_user_value(token, lock)?;
     if flock.l_pid != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let owner = RecordLockOwner::file_description(entry.file());
     fcntl_setlkw_with_owner(entry, lock, owner, false)
@@ -758,12 +756,12 @@ fn fcntl_setlkw_with_owner(
     lock: *const LinuxFlock,
     owner: RecordLockOwner,
     detect_deadlock: bool,
-) -> SysResult {
+) -> KResult {
     let file = entry.file();
     let token = current_user_token();
     let flock = read_user_value(token, lock)?;
     if !valid_setlk_type(flock.l_type) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     check_lock_access(&file, flock.l_type)?;
 
@@ -785,7 +783,7 @@ fn fcntl_setlkw_with_owner(
             return Ok(0);
         }
         if detect_deadlock && table.would_deadlock(&owner, &conflicts) {
-            return Err(SysError::EDEADLK);
+            return Err(Errno::EDEADLK);
         }
         let (task, task_cx_ptr) = block_current_task_no_schedule();
         table.enqueue_waiter(key, owner.clone(), flock.l_type, start, end, task);

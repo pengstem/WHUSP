@@ -1,4 +1,3 @@
-use super::super::errno::{SysError, SysResult};
 use super::super::install_pidfd_for_fanotify;
 use super::super::user_ptr::{PATH_MAX, read_user_c_string};
 use super::fd::{get_file_by_fd, install_file_fd};
@@ -19,6 +18,7 @@ use crate::task::{
     TaskControlBlock, block_current_task_no_schedule, current_has_interrupting_signal,
     current_process, current_task, current_user_token, schedule, wakeup_task,
 };
+use crate::uapi::errno::{Errno, KResult};
 use alloc::collections::btree_map::Entry;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
@@ -306,13 +306,13 @@ impl FanotifyGroup {
         self.inner.exclusive_session(|inner| inner.marks.clear());
     }
 
-    fn update_mark(&self, target: FanotifyMarkTarget, flags: u32, mask: u64) -> SysResult {
+    fn update_mark(&self, target: FanotifyMarkTarget, flags: u32, mask: u64) -> KResult {
         self.inner.exclusive_session(|inner| {
             let existing = inner.marks.iter_mut().find(|mark| mark.target == target);
             match (flags & (FAN_MARK_ADD | FAN_MARK_REMOVE), existing) {
                 (FAN_MARK_ADD, Some(mark)) => {
                     if flags & FAN_MARK_EVICTABLE != 0 && mark.flags & FAN_MARK_EVICTABLE == 0 {
-                        return Err(SysError::EEXIST);
+                        return Err(Errno::EEXIST);
                     }
                     if flags & FAN_MARK_EVICTABLE == 0 {
                         mark.flags &= !FAN_MARK_EVICTABLE;
@@ -361,8 +361,8 @@ impl FanotifyGroup {
                     }
                     Ok(0)
                 }
-                (FAN_MARK_REMOVE, None) => Err(SysError::ENOENT),
-                _ => Err(SysError::EINVAL),
+                (FAN_MARK_REMOVE, None) => Err(Errno::ENOENT),
+                _ => Err(Errno::EINVAL),
             }
         })
     }
@@ -952,12 +952,12 @@ impl File for FanotifyGroupFile {
     }
 }
 
-fn install_event_fd(file: &Arc<dyn File + Send + Sync>, flags: OpenFlags) -> SysResult<i32> {
+fn install_event_fd(file: &Arc<dyn File + Send + Sync>, flags: OpenFlags) -> KResult<i32> {
     let event_file = file.clone_for_fanotify_event(flags)?;
     install_file_fd(event_file, flags, None).map(|fd| fd as i32)
 }
 
-fn validate_init_flags(flags: u32) -> Result<(), SysError> {
+fn validate_init_flags(flags: u32) -> Result<(), Errno> {
     if current_process().credentials().euid != 0 {
         let unprivileged_disallowed = FAN_UNLIMITED_QUEUE
             | FAN_UNLIMITED_MARKS
@@ -965,11 +965,11 @@ fn validate_init_flags(flags: u32) -> Result<(), SysError> {
             | FAN_CLASS_PRE_CONTENT
             | FAN_REPORT_TID;
         if flags & FAN_REPORT_FID == 0 || flags & unprivileged_disallowed != 0 {
-            return Err(SysError::EPERM);
+            return Err(Errno::EPERM);
         }
     }
     if flags & FAN_CLASS_MASK == FAN_CLASS_MASK {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags & (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT) != 0 {
         // UNFINISHED: Content and pre-content permission classes are accepted
@@ -980,7 +980,7 @@ fn validate_init_flags(flags: u32) -> Result<(), SysError> {
     if flags & FILE_HANDLE_REPORT_FLAGS != 0
         && flags & (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT) != 0
     {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags & FAN_UNLIMITED_MARKS != 0 {
         // CONTEXT: This contest subset does not enforce a per-user mark limit,
@@ -991,7 +991,7 @@ fn validate_init_flags(flags: u32) -> Result<(), SysError> {
         // without adding any extra information record encoding.
     }
     if flags & FAN_REPORT_PIDFD != 0 && flags & FAN_REPORT_TID != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags & FAN_REPORT_PIDFD != 0 {
         // CONTEXT: FAN_REPORT_PIDFD is encoded as a single pidfd information
@@ -1004,36 +1004,36 @@ fn validate_init_flags(flags: u32) -> Result<(), SysError> {
         // filesystem-native handle.
     }
     if flags & FAN_REPORT_NAME != 0 && flags & FAN_REPORT_DIR_FID == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags & FAN_REPORT_TARGET_FID != 0
         && flags & (FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME)
             != (FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME)
     {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags & UNSUPPORTED_REPORT_FLAGS != 0 {
         // UNFINISHED: pidfd/mount/error report records are not encoded by this
         // metadata-only implementation.
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags & !SUPPORTED_INIT_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(())
 }
 
-fn validate_event_file_flags(flags: u32) -> SysResult<OpenFlags> {
+fn validate_event_file_flags(flags: u32) -> KResult<OpenFlags> {
     let Some(open_flags) = OpenFlags::from_bits(flags) else {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     };
     if flags & 0b11 == 0b11 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(open_flags)
 }
 
-pub fn sys_fanotify_init(flags: u32, event_f_flags: u32) -> SysResult {
+pub fn sys_fanotify_init(flags: u32, event_f_flags: u32) -> KResult {
     validate_init_flags(flags)?;
     let event_file_flags = validate_event_file_flags(event_f_flags)?;
     let groups_limit_reached = FANOTIFY_GROUPS.exclusive_session(|groups| {
@@ -1041,7 +1041,7 @@ pub fn sys_fanotify_init(flags: u32, event_f_flags: u32) -> SysResult {
         groups.len() >= MAX_USER_GROUPS
     });
     if groups_limit_reached {
-        return Err(SysError::EMFILE);
+        return Err(Errno::EMFILE);
     }
     let mut open_flags = OpenFlags::RDONLY;
     if flags & FAN_CLOEXEC != 0 {
@@ -1058,31 +1058,31 @@ pub fn sys_fanotify_init(flags: u32, event_f_flags: u32) -> SysResult {
     install_file_fd(file, open_flags, None)
 }
 
-fn validate_mark_args(group: &FanotifyGroup, flags: u32, mask: u64) -> Result<(), SysError> {
+fn validate_mark_args(group: &FanotifyGroup, flags: u32, mask: u64) -> Result<(), Errno> {
     if flags & !KNOWN_MARK_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let ops = flags & (FAN_MARK_ADD | FAN_MARK_REMOVE | FAN_MARK_FLUSH);
     if ops.count_ones() != 1 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags & (FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM) == (FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags & FAN_MARK_FLUSH == 0 {
         if mask == 0 || mask & UNSUPPORTED_PERMISSION_EVENTS != 0 || mask & !KNOWN_MARK_MASK != 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         if mask & (SUPPORTED_DIRENT_MARK_EVENTS | SUPPORTED_SELF_MARK_EVENTS) != 0
             && group.init_flags & (FAN_REPORT_FID | FAN_REPORT_DIR_FID) == 0
         {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         if mask & SUPPORTED_DIRENT_MARK_EVENTS != 0 && flags & FAN_MARK_MOUNT != 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         if mask & FAN_RENAME != 0 && group.init_flags & FAN_REPORT_NAME == 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
     }
     Ok(())
@@ -1098,16 +1098,16 @@ fn non_dir_inode_mark_needs_enotdir(group: &FanotifyGroup, flags: u32, mask: u64
     flags & FAN_MARK_IGNORE != 0 || group.init_flags & FAN_REPORT_TARGET_FID != 0
 }
 
-fn group_from_fd(fd: usize) -> SysResult<Arc<FanotifyGroup>> {
+fn group_from_fd(fd: usize) -> KResult<Arc<FanotifyGroup>> {
     let file = get_file_by_fd(fd)?;
     let group_file = file
         .as_any()
         .downcast_ref::<FanotifyGroupFile>()
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
     Ok(Arc::clone(&group_file.group))
 }
 
-fn kind_from_file(file: &Arc<dyn File + Send + Sync>) -> SysResult<FsNodeKind> {
+fn kind_from_file(file: &Arc<dyn File + Send + Sync>) -> KResult<FsNodeKind> {
     let mode = file.stat()?.mode;
     match mode & crate::fs::S_IFMT {
         crate::fs::S_IFDIR => Ok(FsNodeKind::Directory),
@@ -1120,18 +1120,18 @@ fn resolve_mark_target(
     dirfd: isize,
     pathname: *const u8,
     flags: u32,
-) -> SysResult<(VfsNodeId, FsNodeKind, String)> {
+) -> KResult<(VfsNodeId, FsNodeKind, String)> {
     let follow_final_symlink = flags & FAN_MARK_DONT_FOLLOW == 0;
     if pathname.is_null() {
         if dirfd == AT_FDCWD || dirfd < 0 {
-            return Err(SysError::EBADF);
+            return Err(Errno::EBADF);
         }
         let file = get_file_by_fd(dirfd as usize)?;
         let Some(node) = file.vfs_node_id() else {
             if flags & (FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM) != 0 {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
-            return Err(SysError::EBADF);
+            return Err(Errno::EBADF);
         };
         return Ok((node, kind_from_file(&file)?, String::new()));
     }
@@ -1153,19 +1153,19 @@ pub fn sys_fanotify_mark(
     mask: u64,
     dirfd: isize,
     pathname: *const u8,
-) -> SysResult {
+) -> KResult {
     let group = group_from_fd(fanotify_fd)?;
     if group.unprivileged
         && (flags & (FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM) != 0
             || mask & UNSUPPORTED_PERMISSION_EVENTS != 0)
     {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     validate_mark_args(&group, flags, mask)?;
 
     if flags & FAN_MARK_FLUSH != 0 {
         if flags & !(FAN_MARK_FLUSH | FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM) != 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         group.flush();
         return Ok(0);
@@ -1173,17 +1173,17 @@ pub fn sys_fanotify_mark(
 
     let (node, kind, path) = resolve_mark_target(dirfd, pathname, flags)?;
     if flags & FAN_MARK_ONLYDIR != 0 && kind != FsNodeKind::Directory {
-        return Err(SysError::ENOTDIR);
+        return Err(Errno::ENOTDIR);
     }
     if kind != FsNodeKind::Directory && non_dir_inode_mark_needs_enotdir(&group, flags, mask) {
-        return Err(SysError::ENOTDIR);
+        return Err(Errno::ENOTDIR);
     }
     if flags & FAN_MARK_IGNORE != 0 && flags & FAN_MARK_IGNORED_SURV_MODIFY == 0 {
         if flags & (FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM) != 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         if kind == FsNodeKind::Directory {
-            return Err(SysError::EISDIR);
+            return Err(Errno::EISDIR);
         }
     }
     group.update_mark(

@@ -9,8 +9,8 @@ use crate::task::{
 };
 use alloc::vec::Vec;
 
-use super::errno::{SysError, SysResult};
 use super::fs::{get_file_by_fd_for_process, io_uring_mmap_region};
+use crate::uapi::errno::{Errno, KResult};
 
 const PROT_READ: usize = 0x1;
 const PROT_WRITE: usize = 0x2;
@@ -146,13 +146,13 @@ struct LinuxShmInfo {
     swap_successes: usize,
 }
 
-pub fn sys_brk_ctx(ctx: &SyscallContext, addr: usize) -> SysResult {
+pub fn sys_brk_ctx(ctx: &SyscallContext, addr: usize) -> KResult {
     let process = ctx.process();
     let mut inner = process.inner_exclusive_access();
     Ok(inner.memory_set.set_program_break(addr) as isize)
 }
 
-pub fn sys_shmget(key: isize, size: usize, shmflg: i32) -> SysResult {
+pub fn sys_shmget(key: isize, size: usize, shmflg: i32) -> KResult {
     let process = current_process();
     let credentials = process.credentials();
     let caller = shm_caller_from(process.getpid(), &credentials);
@@ -166,7 +166,7 @@ pub fn sys_shmget(key: isize, size: usize, shmflg: i32) -> SysResult {
         .map_err(shm_error_to_sys_error)
 }
 
-pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> SysResult {
+pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> KResult {
     let requested_addr = normalize_shmat_addr(shmaddr, shmflg)?;
     let permission =
         crate::mm::shm::shm_permission_from_flags(shmflg).map_err(shm_error_to_sys_error)?;
@@ -187,12 +187,12 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> SysResult {
         Some(addr) => Ok(addr as isize),
         None => {
             let _ = crate::mm::shm::detach_segment(shmid, pid);
-            Err(SysError::ENOMEM)
+            Err(Errno::ENOMEM)
         }
     }
 }
 
-pub fn sys_shmctl(shmid: usize, cmd: i32, buf: usize) -> SysResult {
+pub fn sys_shmctl(shmid: usize, cmd: i32, buf: usize) -> KResult {
     let process = current_process();
     let credentials = process.credentials();
     let caller = shm_caller_from(process.getpid(), &credentials);
@@ -271,20 +271,20 @@ pub fn sys_shmctl(shmid: usize, cmd: i32, buf: usize) -> SysResult {
                 .map_err(shm_error_to_sys_error)?;
             Ok(0)
         }
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
-pub fn sys_shmdt(shmaddr: usize) -> SysResult {
+pub fn sys_shmdt(shmaddr: usize) -> KResult {
     if shmaddr % PAGE_SIZE != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     inner
         .memory_set
         .detach_shm_area(shmaddr)
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
     Ok(0)
 }
 
@@ -296,7 +296,7 @@ pub fn sys_mmap_ctx(
     flags: usize,
     fd: usize,
     offset: usize,
-) -> SysResult {
+) -> KResult {
     sys_mmap_impl(ctx, addr, len, prot, flags, fd, offset).map(|addr| addr as isize)
 }
 
@@ -308,22 +308,22 @@ fn sys_mmap_impl(
     flags: usize,
     fd: usize,
     offset: usize,
-) -> Result<usize, SysError> {
+) -> Result<usize, Errno> {
     if prot & !PROT_MASK != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags & MAP_SHARED_VALIDATE == MAP_SHARED_VALIDATE {
         // UNFINISHED: Linux MAP_SHARED_VALIDATE behaves like MAP_SHARED while
         // rejecting unknown flags and enabling MAP_SYNC-style validation. This
         // kernel does not implement that validation mode yet.
-        return Err(SysError::ENOTSUP);
+        return Err(Errno::ENOTSUP);
     }
     if flags & !MAP_SUPPORTED != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let map_type = flags & MAP_TYPE_MASK;
     if map_type != MAP_SHARED && map_type != MAP_PRIVATE {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let shared = map_type == MAP_SHARED;
@@ -347,41 +347,41 @@ fn sys_mmap_impl(
         // surface, not a reclaiming allocator. Under a configured memcg limit,
         // fail large private-anonymous pressure mappings after discarding
         // MADV_FREE pages so madvise09 observes low-memory reclamation.
-        return Err(SysError::ENOMEM);
+        return Err(Errno::ENOMEM);
     }
     if fixed && addr % PAGE_SIZE != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if fixed && addr == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let (backing_file, file_size, page_cache_id) = if anonymous {
         if len == 0 || offset % PAGE_SIZE != 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         (None, 0, None)
     } else {
         let fd = fd as isize;
         if fd < 0 {
-            return Err(SysError::EBADF);
+            return Err(Errno::EBADF);
         }
         let file = get_file_by_fd_for_process(ctx.process(), fd as usize)?;
         if len == 0 || offset % PAGE_SIZE != 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         if !file.readable() {
-            return Err(SysError::EACCES);
+            return Err(Errno::EACCES);
         }
         if shared && writable && !file.writable() {
-            return Err(SysError::EACCES);
+            return Err(Errno::EACCES);
         }
         if let Some((pages, max_size)) = io_uring_mmap_region(&file, offset) {
             // CONTEXT: io_uring ring offsets map preallocated kernel-owned
             // frames. They use shared-frame VMA plumbing only to expose the
             // Linux mmap ABI for SQ/CQ rings and SQEs.
             if !shared || fixed || len == 0 || len > max_size {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             let process = ctx.process();
             let mut inner = process.inner_exclusive_access();
@@ -394,11 +394,11 @@ fn sys_mmap_impl(
                     file,
                     &pages,
                 )
-                .ok_or(SysError::ENOMEM)?;
+                .ok_or(Errno::ENOMEM)?;
             return Ok(mapped_addr);
         }
         if shared && writable && file.blocks_shared_writable_mmap() {
-            return Err(SysError::EPERM);
+            return Err(Errno::EPERM);
         }
         let file_size = file.stat()?.size as usize;
         // Shared mappings keep the existing page-cache path. Readonly private
@@ -422,9 +422,9 @@ fn sys_mmap_impl(
 
     if fixed {
         let map_len = page_align_len(len)?;
-        let end = addr.checked_add(map_len).ok_or(SysError::ENOMEM)?;
+        let end = addr.checked_add(map_len).ok_or(Errno::ENOMEM)?;
         if no_replace && inner.memory_set.range_overlaps(addr, end) {
-            return Err(SysError::EEXIST);
+            return Err(Errno::EEXIST);
         }
         let (mapped_addr, flushes) = inner
             .memory_set
@@ -441,7 +441,7 @@ fn sys_mmap_impl(
                 grow_down,
                 page_cache_id,
             )
-            .ok_or(SysError::ENOMEM)?;
+            .ok_or(Errno::ENOMEM)?;
         // CONTEXT: mlockall(MCL_FUTURE) without MCL_ONFAULT makes future
         // mappings resident on Linux. Prefaulting here also keeps large
         // memset-heavy LTP probes from taking one page-fault trap per page.
@@ -456,7 +456,7 @@ fn sys_mmap_impl(
                 match result {
                     MmapPrefaultResult::Complete => break,
                     MmapPrefaultResult::Retry => suspend_current_and_run_next(),
-                    MmapPrefaultResult::Failed => return Err(SysError::ENOMEM),
+                    MmapPrefaultResult::Failed => return Err(Errno::ENOMEM),
                 }
             }
         }
@@ -481,7 +481,7 @@ fn sys_mmap_impl(
             grow_down,
             page_cache_id,
         )
-        .ok_or(SysError::ENOMEM)?;
+        .ok_or(Errno::ENOMEM)?;
     // CONTEXT: mlockall(MCL_FUTURE) without MCL_ONFAULT makes future mappings
     // resident on Linux. Prefaulting here also keeps large memset-heavy LTP
     // probes from taking one page-fault trap per page.
@@ -496,7 +496,7 @@ fn sys_mmap_impl(
             match result {
                 MmapPrefaultResult::Complete => break,
                 MmapPrefaultResult::Retry => suspend_current_and_run_next(),
-                MmapPrefaultResult::Failed => return Err(SysError::ENOMEM),
+                MmapPrefaultResult::Failed => return Err(Errno::ENOMEM),
             }
         }
     }
@@ -506,24 +506,24 @@ fn sys_mmap_impl(
     Ok(mapped_addr)
 }
 
-pub fn sys_mprotect_ctx(ctx: &SyscallContext, addr: usize, len: usize, prot: usize) -> SysResult {
+pub fn sys_mprotect_ctx(ctx: &SyscallContext, addr: usize, len: usize, prot: usize) -> KResult {
     sys_mprotect_impl(ctx.process(), addr, len, prot, None)
 }
 
-pub fn sys_pkey_mprotect(addr: usize, len: usize, prot: usize, pkey: isize) -> SysResult {
+pub fn sys_pkey_mprotect(addr: usize, len: usize, prot: usize, pkey: isize) -> KResult {
     let pkey = match pkey {
         -1 => None,
         0 => Some(0),
         value if value > 0 && (value as usize) < PROCESS_PKEY_COUNT => Some(value as usize),
-        _ => return Err(SysError::EINVAL),
+        _ => return Err(Errno::EINVAL),
     };
     let process = current_process();
     sys_mprotect_impl(&process, addr, len, prot, pkey)
 }
 
-pub fn sys_pkey_alloc(flags: usize, access_rights: usize) -> SysResult {
+pub fn sys_pkey_alloc(flags: usize, access_rights: usize) -> KResult {
     if flags != 0 || access_rights & !PKEY_ACCESS_RIGHTS_MASK != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let process = current_process();
@@ -535,22 +535,22 @@ pub fn sys_pkey_alloc(flags: usize, access_rights: usize) -> SysResult {
         .skip(1)
         .find_map(|(pkey, rights)| rights.is_none().then_some(pkey))
     else {
-        return Err(SysError::ENOSPC);
+        return Err(Errno::ENOSPC);
     };
     inner.pkey_rights[pkey] = Some(access_rights);
     Ok(pkey as isize)
 }
 
-pub fn sys_pkey_free(pkey: isize) -> SysResult {
+pub fn sys_pkey_free(pkey: isize) -> KResult {
     if pkey <= 0 || (pkey as usize) >= PROCESS_PKEY_COUNT {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let pkey = pkey as usize;
     if inner.pkey_rights[pkey].is_none() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     inner.pkey_rights[pkey] = None;
     Ok(0)
@@ -562,9 +562,9 @@ fn sys_mprotect_impl(
     len: usize,
     prot: usize,
     pkey: Option<usize>,
-) -> SysResult {
+) -> KResult {
     if addr % PAGE_SIZE != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if len == 0 {
         return Ok(0);
@@ -572,16 +572,16 @@ fn sys_mprotect_impl(
     // UNFINISHED: Linux also has architecture-specific PROT flags and growable
     // VMA flags; this kernel currently supports only read/write/exec/none.
     if prot & !PROT_MASK != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
-    let len = len.checked_add(PAGE_SIZE - 1).ok_or(SysError::ENOMEM)? & !(PAGE_SIZE - 1);
-    addr.checked_add(len).ok_or(SysError::ENOMEM)?;
+    let len = len.checked_add(PAGE_SIZE - 1).ok_or(Errno::ENOMEM)? & !(PAGE_SIZE - 1);
+    addr.checked_add(len).ok_or(Errno::ENOMEM)?;
 
     let mut inner = process.inner_exclusive_access();
     let access_rights = match pkey {
         Some(0) | None => 0,
-        Some(pkey) => inner.pkey_rights[pkey].ok_or(SysError::EINVAL)?,
+        Some(pkey) => inner.pkey_rights[pkey].ok_or(Errno::EINVAL)?,
     };
     let effective_prot = prot_with_pkey_access_rights(prot, access_rights);
     inner
@@ -593,15 +593,15 @@ fn sys_mprotect_impl(
             prot_to_reported_map_permission(prot),
         )
         .map_err(|err| match err {
-            MemoryProtectError::Unmapped => SysError::ENOMEM,
-            MemoryProtectError::AccessDenied => SysError::EACCES,
+            MemoryProtectError::Unmapped => Errno::ENOMEM,
+            MemoryProtectError::AccessDenied => Errno::EACCES,
         })?;
     Ok(0)
 }
 
-pub fn sys_munmap_ctx(ctx: &SyscallContext, addr: usize, len: usize) -> SysResult {
+pub fn sys_munmap_ctx(ctx: &SyscallContext, addr: usize, len: usize) -> KResult {
     if len == 0 || addr % PAGE_SIZE != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let process = ctx.process();
     let flushes = {
@@ -609,7 +609,7 @@ pub fn sys_munmap_ctx(ctx: &SyscallContext, addr: usize, len: usize) -> SysResul
         inner
             .memory_set
             .munmap_area(addr, len)
-            .ok_or(SysError::EINVAL)?
+            .ok_or(Errno::EINVAL)?
     };
     write_back_mmap_flushes(flushes);
     Ok(0)
@@ -621,12 +621,12 @@ pub fn sys_mremap(
     new_size: usize,
     flags: usize,
     new_addr: usize,
-) -> SysResult {
+) -> KResult {
     if old_addr % PAGE_SIZE != 0 || old_size == 0 || new_size == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags & !MREMAP_SUPPORTED != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let may_move = flags & MREMAP_MAYMOVE != 0;
     let fixed = flags & MREMAP_FIXED != 0;
@@ -634,9 +634,9 @@ pub fn sys_mremap(
         // UNFINISHED: MREMAP_FIXED relocation is not implemented; the current
         // mmap16 scoring path only needs non-fixed in-place growth.
         if !may_move || new_addr % PAGE_SIZE != 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
-        return Err(SysError::ENOMEM);
+        return Err(Errno::ENOMEM);
     }
 
     let process = current_process();
@@ -644,20 +644,20 @@ pub fn sys_mremap(
         .inner_exclusive_access()
         .memory_set
         .mremap_area(old_addr, old_size, new_size, may_move)
-        .ok_or(SysError::ENOMEM)?;
+        .ok_or(Errno::ENOMEM)?;
     write_back_mmap_flushes(flushes);
     Ok(mapped_addr as isize)
 }
 
-pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> SysResult {
+pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> KResult {
     if addr % PAGE_SIZE != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     validate_madvise_advice(advice)?;
     if len == 0 {
         return Ok(0);
     }
-    len.checked_add(PAGE_SIZE - 1).ok_or(SysError::ENOMEM)?;
+    len.checked_add(PAGE_SIZE - 1).ok_or(Errno::ENOMEM)?;
 
     let process = current_process();
     match advice {
@@ -669,12 +669,12 @@ pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> SysResult {
             if !inner
                 .memory_set
                 .madvise_range_is_private_anonymous(addr, len)
-                .ok_or(SysError::ENOMEM)?
+                .ok_or(Errno::ENOMEM)?
             {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             if !inner.memory_set.madvise_mark_lazy_free(addr, len) {
-                return Err(SysError::ENOMEM);
+                return Err(Errno::ENOMEM);
             }
             Ok(0)
         }
@@ -683,12 +683,12 @@ pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> SysResult {
             if !inner
                 .memory_set
                 .madvise_range_is_private_anonymous(addr, len)
-                .ok_or(SysError::ENOMEM)?
+                .ok_or(Errno::ENOMEM)?
             {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             if !inner.memory_set.madvise_set_wipe_on_fork(addr, len, true) {
-                return Err(SysError::ENOMEM);
+                return Err(Errno::ENOMEM);
             }
             Ok(0)
         }
@@ -697,12 +697,12 @@ pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> SysResult {
             if !inner
                 .memory_set
                 .madvise_range_is_private_anonymous(addr, len)
-                .ok_or(SysError::ENOMEM)?
+                .ok_or(Errno::ENOMEM)?
             {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             if !inner.memory_set.madvise_set_wipe_on_fork(addr, len, false) {
-                return Err(SysError::ENOMEM);
+                return Err(Errno::ENOMEM);
             }
             Ok(0)
         }
@@ -711,13 +711,13 @@ pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> SysResult {
             if inner
                 .memory_set
                 .madvise_range_has_locked(addr, len)
-                .ok_or(SysError::ENOMEM)?
+                .ok_or(Errno::ENOMEM)?
                 || !inner
                     .memory_set
                     .madvise_range_is_shared_writable(addr, len)
-                    .ok_or(SysError::ENOMEM)?
+                    .ok_or(Errno::ENOMEM)?
             {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             Ok(0)
         }
@@ -727,12 +727,12 @@ pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> SysResult {
                 if inner
                     .memory_set
                     .madvise_range_has_locked(addr, len)
-                    .ok_or(SysError::ENOMEM)?
+                    .ok_or(Errno::ENOMEM)?
                 {
-                    return Err(SysError::EINVAL);
+                    return Err(Errno::EINVAL);
                 }
                 if !inner.memory_set.madvise_dontneed_range(addr, len) {
-                    return Err(SysError::ENOMEM);
+                    return Err(Errno::ENOMEM);
                 }
                 Vec::new()
             };
@@ -744,13 +744,13 @@ pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> SysResult {
             let private_anonymous = inner
                 .memory_set
                 .madvise_range_is_private_anonymous(addr, len)
-                .ok_or(SysError::ENOMEM)?;
+                .ok_or(Errno::ENOMEM)?;
             let shared_writable = inner
                 .memory_set
                 .madvise_range_is_shared_writable(addr, len)
-                .ok_or(SysError::ENOMEM)?;
+                .ok_or(Errno::ENOMEM)?;
             if !private_anonymous && !shared_writable {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             Ok(0)
         }
@@ -759,10 +759,10 @@ pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> SysResult {
             let private_anonymous = inner
                 .memory_set
                 .madvise_range_is_private_anonymous(addr, len)
-                .ok_or(SysError::ENOMEM)?;
+                .ok_or(Errno::ENOMEM)?;
             if private_anonymous {
                 if !inner.memory_set.madvise_poison_range(addr, len) {
-                    return Err(SysError::ENOMEM);
+                    return Err(Errno::ENOMEM);
                 }
                 return Ok(0);
             }
@@ -773,9 +773,9 @@ pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> SysResult {
             if !inner
                 .memory_set
                 .madvise_range_is_mapped(addr, len)
-                .ok_or(SysError::ENOMEM)?
+                .ok_or(Errno::ENOMEM)?
             {
-                return Err(SysError::ENOMEM);
+                return Err(Errno::ENOMEM);
             }
             Ok(0)
         }
@@ -785,7 +785,7 @@ pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> SysResult {
                 .memory_set
                 .madvise_set_dumpable(addr, len, advice == MADV_DODUMP)
             {
-                return Err(SysError::ENOMEM);
+                return Err(Errno::ENOMEM);
             }
             Ok(0)
         }
@@ -794,9 +794,9 @@ pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> SysResult {
             if !inner
                 .memory_set
                 .madvise_range_is_mapped(addr, len)
-                .ok_or(SysError::ENOMEM)?
+                .ok_or(Errno::ENOMEM)?
             {
-                return Err(SysError::ENOMEM);
+                return Err(Errno::ENOMEM);
             }
             crate::fs::note_madvise_willneed(len);
             Ok(0)
@@ -806,36 +806,36 @@ pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> SysResult {
             if !inner
                 .memory_set
                 .madvise_range_is_mapped(addr, len)
-                .ok_or(SysError::ENOMEM)?
+                .ok_or(Errno::ENOMEM)?
             {
-                return Err(SysError::ENOMEM);
+                return Err(Errno::ENOMEM);
             }
             Ok(0)
         }
     }
 }
 
-fn validate_madvise_advice(advice: i32) -> SysResult<()> {
+fn validate_madvise_advice(advice: i32) -> KResult<()> {
     match advice {
         MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED | MADV_FREE
         | MADV_REMOVE | MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE
         | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP | MADV_WIPEONFORK
         | MADV_KEEPONFORK | MADV_COLD | MADV_PAGEOUT | MADV_HWPOISON | MADV_SOFT_OFFLINE => Ok(()),
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
 // UNFINISHED: The kernel still has no swap or page-reclaim path, so these
 // mlock syscalls provide Linux-compatible validation, prefaulting, RLIMIT
 // checks, and procfs accounting without a real unevictable-page mechanism.
-pub fn sys_mlock(addr: usize, len: usize) -> SysResult {
+pub fn sys_mlock(addr: usize, len: usize) -> KResult {
     let additional = {
         let process = current_process();
         let inner = process.inner_exclusive_access();
         inner
             .memory_set
             .additional_locked_bytes_for_range(addr, len)
-            .ok_or(SysError::ENOMEM)?
+            .ok_or(Errno::ENOMEM)?
     };
     check_memlock_limit(additional)?;
 
@@ -848,15 +848,15 @@ pub fn sys_mlock(addr: usize, len: usize) -> SysResult {
         match result {
             MmapPrefaultResult::Complete => break,
             MmapPrefaultResult::Retry => suspend_current_and_run_next(),
-            MmapPrefaultResult::Failed => return Err(SysError::ENOMEM),
+            MmapPrefaultResult::Failed => return Err(Errno::ENOMEM),
         }
     }
     Ok(0)
 }
 
-pub fn sys_mlock2(addr: usize, len: usize, flags: usize) -> SysResult {
+pub fn sys_mlock2(addr: usize, len: usize, flags: usize) -> KResult {
     if flags & !MLOCK_ONFAULT != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let on_fault = flags & MLOCK_ONFAULT != 0;
     let additional = {
@@ -865,7 +865,7 @@ pub fn sys_mlock2(addr: usize, len: usize, flags: usize) -> SysResult {
         inner
             .memory_set
             .additional_locked_bytes_for_range(addr, len)
-            .ok_or(SysError::ENOMEM)?
+            .ok_or(Errno::ENOMEM)?
     };
     check_memlock_limit(additional)?;
 
@@ -878,24 +878,24 @@ pub fn sys_mlock2(addr: usize, len: usize, flags: usize) -> SysResult {
         match result {
             MmapPrefaultResult::Complete => break,
             MmapPrefaultResult::Retry => suspend_current_and_run_next(),
-            MmapPrefaultResult::Failed => return Err(SysError::ENOMEM),
+            MmapPrefaultResult::Failed => return Err(Errno::ENOMEM),
         }
     }
     Ok(0)
 }
 
-pub fn sys_munlock(addr: usize, len: usize) -> SysResult {
+pub fn sys_munlock(addr: usize, len: usize) -> KResult {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     if !inner.memory_set.munlock_range(addr, len) {
-        return Err(SysError::ENOMEM);
+        return Err(Errno::ENOMEM);
     }
     Ok(0)
 }
 
-pub fn sys_mlockall(flags: usize) -> SysResult {
+pub fn sys_mlockall(flags: usize) -> KResult {
     if flags & !MCL_SUPPORTED != 0 || flags & (MCL_CURRENT | MCL_FUTURE) == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let on_fault = flags & MCL_ONFAULT != 0;
     let lock_current = flags & MCL_CURRENT != 0;
@@ -924,7 +924,7 @@ pub fn sys_mlockall(flags: usize) -> SysResult {
             match result {
                 MmapPrefaultResult::Complete => break,
                 MmapPrefaultResult::Retry => suspend_current_and_run_next(),
-                MmapPrefaultResult::Failed => return Err(SysError::ENOMEM),
+                MmapPrefaultResult::Failed => return Err(Errno::ENOMEM),
             }
         }
     }
@@ -937,7 +937,7 @@ pub fn sys_mlockall(flags: usize) -> SysResult {
     Ok(0)
 }
 
-pub fn sys_munlockall() -> SysResult {
+pub fn sys_munlockall() -> KResult {
     current_process()
         .inner_exclusive_access()
         .memory_set
@@ -945,15 +945,15 @@ pub fn sys_munlockall() -> SysResult {
     Ok(0)
 }
 
-pub fn sys_mincore(addr: usize, len: usize, vec: *mut u8) -> SysResult {
+pub fn sys_mincore(addr: usize, len: usize, vec: *mut u8) -> KResult {
     if addr % PAGE_SIZE != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let resident = current_process()
         .inner_exclusive_access()
         .memory_set
         .mincore_vec(addr, len)
-        .ok_or(SysError::ENOMEM)?;
+        .ok_or(Errno::ENOMEM)?;
     copy_to_user(current_user_token(), vec, &resident)?;
     Ok(0)
 }
@@ -964,7 +964,7 @@ pub fn sys_remap_file_pages(
     prot: i32,
     _pgoff: usize,
     _flags: i32,
-) -> SysResult {
+) -> KResult {
     // CONTEXT: Linux deprecated remap_file_pages() and replaced it with
     // in-kernel emulation. This kernel does not model nonlinear mappings; it
     // exposes the syscall so compatibility probes do not see ENOSYS, reports
@@ -974,32 +974,32 @@ pub fn sys_remap_file_pages(
         return Ok(0);
     }
     if prot != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let shmid = current_process()
         .inner_exclusive_access()
         .memory_set
         .shm_segment_id_for_range(addr, size)
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
     if !crate::mm::shm::segment_remap_available(shmid).unwrap_or(false) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(0)
 }
 
-pub fn sys_msync(addr: usize, len: usize, flags: i32) -> SysResult {
+pub fn sys_msync(addr: usize, len: usize, flags: i32) -> KResult {
     if addr % PAGE_SIZE != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags & !MS_SUPPORTED != 0 || flags & MS_ASYNC != 0 && flags & MS_SYNC != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let flushes = current_process()
         .inner_exclusive_access()
         .memory_set
         .msync_area(addr, len)
-        .ok_or(SysError::ENOMEM)?;
+        .ok_or(Errno::ENOMEM)?;
     // UNFINISHED: Linux MS_INVALIDATE also invalidates other mappings and can
     // fail with EBUSY for locked pages. This kernel tracks mlock only for
     // syscall/procfs compatibility and has no cross-process invalidation model
@@ -1010,9 +1010,9 @@ pub fn sys_msync(addr: usize, len: usize, flags: i32) -> SysResult {
 }
 
 #[cfg(target_arch = "riscv64")]
-pub fn sys_riscv_flush_icache(_start: usize, _end: usize, flags: usize) -> SysResult {
+pub fn sys_riscv_flush_icache(_start: usize, _end: usize, flags: usize) -> KResult {
     if flags & !SYS_RISCV_FLUSH_ICACHE_LOCAL != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     // Linux reserves the address range for forward compatibility. LOCAL
     // affects only the caller; flags=0 synchronizes every CPU currently using
@@ -1028,9 +1028,9 @@ pub fn sys_riscv_flush_icache(_start: usize, _end: usize, flags: usize) -> SysRe
     Ok(0)
 }
 
-pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> SysResult {
+pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> KResult {
     if flags != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     match cmd {
@@ -1045,16 +1045,16 @@ pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> SysResult {
             let process = current_process();
             let inner = process.inner_exclusive_access();
             if !inner.membarrier_private_expedited_registered {
-                return Err(SysError::EPERM);
+                return Err(Errno::EPERM);
             }
             inner.memory_set.synchronize_memory();
             Ok(0)
         }
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
-fn check_memlock_limit(additional_locked_bytes: usize) -> SysResult<()> {
+fn check_memlock_limit(additional_locked_bytes: usize) -> KResult<()> {
     let process = current_process();
     let inner = process.inner_exclusive_access();
     let credentials = &inner.credentials;
@@ -1069,14 +1069,14 @@ fn check_memlock_limit(additional_locked_bytes: usize) -> SysResult<()> {
 
     let limit = inner.resource_limits.get(RLimitResource::MemLock).rlim_cur;
     if limit == 0 {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     let locked = inner.memory_set.locked_bytes();
     if locked
         .checked_add(additional_locked_bytes)
         .is_none_or(|total| total > limit)
     {
-        return Err(SysError::ENOMEM);
+        return Err(Errno::ENOMEM);
     }
     Ok(())
 }
@@ -1087,13 +1087,13 @@ fn write_back_mmap_flushes(flushes: Vec<MmapFlush>) {
     }
 }
 
-fn page_align_len(len: usize) -> Result<usize, SysError> {
+fn page_align_len(len: usize) -> Result<usize, Errno> {
     if len == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     len.checked_add(PAGE_SIZE - 1)
         .map(|len| len & !(PAGE_SIZE - 1))
-        .ok_or(SysError::ENOMEM)
+        .ok_or(Errno::ENOMEM)
 }
 
 fn prot_with_pkey_access_rights(prot: usize, access_rights: usize) -> usize {
@@ -1140,7 +1140,7 @@ fn prot_to_reported_map_permission(prot: usize) -> MapPermission {
     permission
 }
 
-fn normalize_shmat_addr(shmaddr: usize, shmflg: i32) -> Result<usize, SysError> {
+fn normalize_shmat_addr(shmaddr: usize, shmflg: i32) -> Result<usize, Errno> {
     if shmaddr == 0 || shmaddr % PAGE_SIZE == 0 {
         return Ok(shmaddr);
     }
@@ -1148,18 +1148,18 @@ fn normalize_shmat_addr(shmaddr: usize, shmflg: i32) -> Result<usize, SysError> 
     if shmflg & crate::mm::shm::SHM_RND != 0 {
         return Ok(shmaddr & !(PAGE_SIZE - 1));
     }
-    Err(SysError::EINVAL)
+    Err(Errno::EINVAL)
 }
 
-fn shm_error_to_sys_error(error: ShmError) -> SysError {
+fn shm_error_to_sys_error(error: ShmError) -> Errno {
     match error {
-        ShmError::NotFound => SysError::ENOENT,
-        ShmError::Exists => SysError::EEXIST,
-        ShmError::Invalid => SysError::EINVAL,
-        ShmError::NoMem => SysError::ENOMEM,
-        ShmError::NoSpace => SysError::ENOSPC,
-        ShmError::AccessDenied => SysError::EACCES,
-        ShmError::NotPermitted => SysError::EPERM,
+        ShmError::NotFound => Errno::ENOENT,
+        ShmError::Exists => Errno::EEXIST,
+        ShmError::Invalid => Errno::EINVAL,
+        ShmError::NoMem => Errno::ENOMEM,
+        ShmError::NoSpace => Errno::ENOSPC,
+        ShmError::AccessDenied => Errno::EACCES,
+        ShmError::NotPermitted => Errno::EPERM,
     }
 }
 
@@ -1187,7 +1187,7 @@ fn shm_caller_from<'a>(pid: usize, credentials: &'a crate::task::Credentials) ->
     }
 }
 
-fn write_shmid_ds(buf: usize, stat: ShmSegmentStat) -> SysResult<()> {
+fn write_shmid_ds(buf: usize, stat: ShmSegmentStat) -> KResult<()> {
     let ds = LinuxShmid64Ds {
         shm_perm: LinuxIpc64Perm {
             key: stat.key.try_into().unwrap_or(i32::MAX),

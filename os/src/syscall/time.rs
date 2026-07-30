@@ -13,11 +13,11 @@ use crate::timer::{
 };
 use lazy_static::*;
 
-use super::errno::{SysError, SysResult};
 use super::uapi::LinuxTimeSpec;
 use super::user_ptr::{
     read_user_value, read_user_value_ctx, write_user_value, write_user_value_ctx,
 };
+use crate::uapi::errno::{Errno, KResult};
 
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
@@ -236,18 +236,18 @@ enum ClockKind {
 }
 
 impl ItimerKind {
-    fn from_raw(which: i32) -> SysResult<Self> {
+    fn from_raw(which: i32) -> KResult<Self> {
         match which {
             ITIMER_REAL => Ok(Self::Real),
             ITIMER_VIRTUAL => Ok(Self::Virtual),
             ITIMER_PROF => Ok(Self::Prof),
-            _ => Err(SysError::EINVAL),
+            _ => Err(Errno::EINVAL),
         }
     }
 }
 
 impl ClockKind {
-    fn from_raw(clock_id: i32) -> SysResult<Self> {
+    fn from_raw(clock_id: i32) -> KResult<Self> {
         match clock_id {
             CLOCK_REALTIME => Ok(Self::Realtime),
             CLOCK_MONOTONIC => Ok(Self::Monotonic),
@@ -257,34 +257,34 @@ impl ClockKind {
             CLOCK_REALTIME_COARSE => Ok(Self::RealtimeCoarse),
             CLOCK_MONOTONIC_COARSE => Ok(Self::MonotonicCoarse),
             CLOCK_BOOTTIME => Ok(Self::Boottime),
-            _ => Err(SysError::EINVAL),
+            _ => Err(Errno::EINVAL),
         }
     }
 
-    fn gettime_backend(self) -> SysResult<ClockBackend> {
+    fn gettime_backend(self) -> KResult<ClockBackend> {
         match self {
             Self::Realtime | Self::RealtimeCoarse => Ok(ClockBackend::Wall),
             Self::Monotonic | Self::MonotonicRaw | Self::MonotonicCoarse | Self::Boottime => {
                 Ok(ClockBackend::Monotonic)
             }
-            Self::ProcessCpu | Self::ThreadCpu => Err(SysError::EINVAL),
+            Self::ProcessCpu | Self::ThreadCpu => Err(Errno::EINVAL),
         }
     }
 
-    fn nanosleep_backend(self) -> SysResult<ClockBackend> {
+    fn nanosleep_backend(self) -> KResult<ClockBackend> {
         match self {
             Self::Realtime => Ok(ClockBackend::Wall),
             Self::Monotonic | Self::Boottime => Ok(ClockBackend::Monotonic),
             Self::ProcessCpu | Self::ThreadCpu => {
                 // UNFINISHED: CPU-clock sleeps require waking based on consumed
                 // process/thread CPU time rather than wall-clock timer ticks.
-                Err(SysError::ENOTSUP)
+                Err(Errno::ENOTSUP)
             }
             Self::MonotonicRaw | Self::RealtimeCoarse | Self::MonotonicCoarse => {
                 // CONTEXT: Linux exposes these clocks through clock_gettime but
                 // does not support sleeping against them; keep them distinct from
                 // unknown clock IDs by returning ENOTSUP.
-                Err(SysError::ENOTSUP)
+                Err(Errno::ENOTSUP)
             }
         }
     }
@@ -300,7 +300,7 @@ pub(crate) fn current_clock_nanos(backend: ClockBackend) -> u64 {
 pub(crate) fn relative_timeout_deadline_ms(
     token: usize,
     timeout: *const LinuxTimeSpec,
-) -> SysResult<Option<usize>> {
+) -> KResult<Option<usize>> {
     if timeout.is_null() {
         return Ok(None);
     }
@@ -310,59 +310,57 @@ pub(crate) fn relative_timeout_deadline_ms(
     )?))
 }
 
-pub(crate) fn validate_timespec(time: LinuxTimeSpec) -> SysResult<LinuxTimeSpec> {
+pub(crate) fn validate_timespec(time: LinuxTimeSpec) -> KResult<LinuxTimeSpec> {
     if time.tv_sec < 0 || !(0..NSEC_PER_SEC).contains(&time.tv_nsec) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(time)
 }
 
-pub(crate) fn timespec_to_nanos(time: LinuxTimeSpec) -> SysResult<u64> {
+pub(crate) fn timespec_to_nanos(time: LinuxTimeSpec) -> KResult<u64> {
     let time = validate_timespec(time)?;
     let sec_nanos = (time.tv_sec as u64)
         .checked_mul(NSEC_PER_SEC as u64)
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
     sec_nanos
         .checked_add(time.tv_nsec as u64)
-        .ok_or(SysError::EINVAL)
+        .ok_or(Errno::EINVAL)
 }
 
-pub(crate) fn nanos_to_ms_ceil(nanos: u64) -> SysResult<usize> {
+pub(crate) fn nanos_to_ms_ceil(nanos: u64) -> KResult<usize> {
     let nsec_per_msec = NSEC_PER_MSEC as u64;
     let ms = nanos / nsec_per_msec + if nanos % nsec_per_msec == 0 { 0 } else { 1 };
     if ms > usize::MAX as u64 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(ms as usize)
 }
 
-pub(crate) fn timespec_to_ms_ceil(time: LinuxTimeSpec) -> SysResult<usize> {
+pub(crate) fn timespec_to_ms_ceil(time: LinuxTimeSpec) -> KResult<usize> {
     nanos_to_ms_ceil(timespec_to_nanos(time)?)
 }
 
-fn relative_sleep_deadline_ms(time: LinuxTimeSpec) -> SysResult<usize> {
+fn relative_sleep_deadline_ms(time: LinuxTimeSpec) -> KResult<usize> {
     relative_timeout_deadline_ms_from_nanos(timespec_to_nanos(time)?)
 }
 
-fn us_to_ms_ceil(us: usize) -> SysResult<usize> {
-    us.checked_add(999)
-        .map(|us| us / 1000)
-        .ok_or(SysError::EINVAL)
+fn us_to_ms_ceil(us: usize) -> KResult<usize> {
+    us.checked_add(999).map(|us| us / 1000).ok_or(Errno::EINVAL)
 }
 
-fn nanos_to_us_ceil(nanos: u64) -> SysResult<usize> {
+fn nanos_to_us_ceil(nanos: u64) -> KResult<usize> {
     let us = nanos / 1000 + if nanos % 1000 == 0 { 0 } else { 1 };
     if us > usize::MAX as u64 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(us as usize)
 }
 
-pub(crate) fn relative_timeout_deadline_ms_from_nanos(duration_nanos: u64) -> SysResult<usize> {
+pub(crate) fn relative_timeout_deadline_ms_from_nanos(duration_nanos: u64) -> KResult<usize> {
     let duration_us = nanos_to_us_ceil(duration_nanos)?;
     let deadline_us = get_time_us()
         .checked_add(duration_us)
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
     us_to_ms_ceil(deadline_us)
 }
 
@@ -381,14 +379,14 @@ impl LinuxTms {
     }
 }
 
-fn timeval_to_us(time: LinuxTimeVal) -> SysResult<usize> {
+fn timeval_to_us(time: LinuxTimeVal) -> KResult<usize> {
     if time.tv_sec < 0 || time.tv_usec < 0 || time.tv_usec >= USEC_PER_SEC as isize {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     (time.tv_sec as usize)
         .checked_mul(USEC_PER_SEC)
         .and_then(|sec_us| sec_us.checked_add(time.tv_usec as usize))
-        .ok_or(SysError::EINVAL)
+        .ok_or(Errno::EINVAL)
 }
 
 fn us_to_timeval(us: usize) -> LinuxTimeVal {
@@ -405,10 +403,10 @@ fn us_to_timespec(us: usize) -> LinuxTimeSpec {
     }
 }
 
-fn timeval_to_nanos(time: LinuxTimeVal) -> SysResult<u64> {
+fn timeval_to_nanos(time: LinuxTimeVal) -> KResult<u64> {
     (timeval_to_us(time)? as u64)
         .checked_mul(1_000)
-        .ok_or(SysError::EINVAL)
+        .ok_or(Errno::EINVAL)
 }
 
 fn current_can_set_time() -> bool {
@@ -437,7 +435,7 @@ fn itimerval_from_us(interval_us: usize, value_us: usize) -> LinuxITimerVal {
     }
 }
 
-fn decode_sigevent_signal(sevp: *const u8) -> SysResult<u32> {
+fn decode_sigevent_signal(sevp: *const u8) -> KResult<u32> {
     if sevp.is_null() {
         return Ok(SIGALRM);
     }
@@ -446,44 +444,40 @@ fn decode_sigevent_signal(sevp: *const u8) -> SysResult<u32> {
         SIGEV_SIGNAL => {
             let signal = event.signo as u32;
             if signal == 0 || signal as usize >= crate::task::SIGNAL_INFO_SLOTS {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             Ok(signal)
         }
         SIGEV_NONE => Ok(0),
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
-fn itimerspec_to_us(value: LinuxITimerSpec) -> SysResult<(usize, usize)> {
+fn itimerspec_to_us(value: LinuxITimerSpec) -> KResult<(usize, usize)> {
     Ok((
         nanos_to_us_ceil(timespec_to_nanos(value.it_interval)?)?,
         nanos_to_us_ceil(timespec_to_nanos(value.it_value)?)?,
     ))
 }
 
-fn posix_timer_deadline_us(clock_id: i32, flags: i32, value_us: usize) -> SysResult<usize> {
+fn posix_timer_deadline_us(clock_id: i32, flags: i32, value_us: usize) -> KResult<usize> {
     if value_us == 0 {
         return Ok(0);
     }
     if flags & TIMER_ABSTIME as i32 != 0 {
         let now_nanos = current_clock_nanos(ClockKind::from_raw(clock_id)?.gettime_backend()?);
-        let target_nanos = (value_us as u64)
-            .checked_mul(1_000)
-            .ok_or(SysError::EINVAL)?;
+        let target_nanos = (value_us as u64).checked_mul(1_000).ok_or(Errno::EINVAL)?;
         let remaining_us = nanos_to_us_ceil(target_nanos.saturating_sub(now_nanos))?;
-        get_time_us()
-            .checked_add(remaining_us)
-            .ok_or(SysError::EINVAL)
+        get_time_us().checked_add(remaining_us).ok_or(Errno::EINVAL)
     } else {
-        get_time_us().checked_add(value_us).ok_or(SysError::EINVAL)
+        get_time_us().checked_add(value_us).ok_or(Errno::EINVAL)
     }
 }
 
-pub fn sys_getitimer(which: i32, value: *mut u8) -> SysResult {
+pub fn sys_getitimer(which: i32, value: *mut u8) -> KResult {
     let kind = ItimerKind::from_raw(which)?;
     if value.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let now_us = get_time_us();
     let process = current_process();
@@ -504,7 +498,7 @@ pub fn sys_getitimer(which: i32, value: *mut u8) -> SysResult {
     Ok(0)
 }
 
-pub fn sys_setitimer(which: i32, value: *const u8, old_value: *mut u8) -> SysResult {
+pub fn sys_setitimer(which: i32, value: *const u8, old_value: *mut u8) -> KResult {
     let kind = ItimerKind::from_raw(which)?;
     let token = current_user_token();
     // CONTEXT: Linux treats a NULL new_value as a zero itimerval, disabling
@@ -520,7 +514,7 @@ pub fn sys_setitimer(which: i32, value: *const u8, old_value: *mut u8) -> SysRes
     let next_expire_us = if value_us == 0 {
         0
     } else {
-        now_us.checked_add(value_us).ok_or(SysError::EINVAL)?
+        now_us.checked_add(value_us).ok_or(Errno::EINVAL)?
     };
     let process = current_process();
     let old = {
@@ -563,16 +557,16 @@ pub fn sys_setitimer(which: i32, value: *const u8, old_value: *mut u8) -> SysRes
     Ok(0)
 }
 
-pub fn sys_timer_create(clock_id: i32, sevp: *const u8, timerid: *mut i32) -> SysResult {
+pub fn sys_timer_create(clock_id: i32, sevp: *const u8, timerid: *mut i32) -> KResult {
     if timerid.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     // UNFINISHED: POSIX CPU timers, alarm clocks, SIGEV_THREAD, and
     // SIGEV_THREAD_ID are not modeled yet. This covers the signal timers used
     // by LTP clock_settime03 and keeps unsupported clocks fail-loud.
     match ClockKind::from_raw(clock_id)? {
         ClockKind::Realtime | ClockKind::Monotonic | ClockKind::Boottime => {}
-        _ => return Err(SysError::ENOTSUP),
+        _ => return Err(Errno::ENOTSUP),
     }
     let signal = decode_sigevent_signal(sevp)?;
     let id = current_process().create_posix_timer(clock_id, signal);
@@ -585,12 +579,12 @@ pub fn sys_timer_settime(
     flags: i32,
     new_value: *const LinuxITimerSpec,
     old_value: *mut LinuxITimerSpec,
-) -> SysResult {
+) -> KResult {
     if timerid < 0 || flags & !(TIMER_ABSTIME as i32) != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if new_value.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let new_value = read_user_value(current_user_token(), new_value)?;
     let (interval_us, value_us) = itimerspec_to_us(new_value)?;
@@ -598,11 +592,11 @@ pub fn sys_timer_settime(
     let now_us = get_time_us();
     let clock_id = process
         .posix_timer_clock(timerid as usize)
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
     let next_expire_us = posix_timer_deadline_us(clock_id, flags, value_us)?;
     let (old_interval_us, old_remaining_us, generation) = process
         .set_posix_timer(timerid as usize, interval_us, next_expire_us, now_us)
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
     if !old_value.is_null() {
         let old = itimerspec_from_us(old_interval_us, old_remaining_us);
         write_user_value(current_user_token(), old_value, &old)?;
@@ -613,38 +607,38 @@ pub fn sys_timer_settime(
     Ok(0)
 }
 
-pub fn sys_timer_gettime(timerid: i32, curr_value: *mut LinuxITimerSpec) -> SysResult {
+pub fn sys_timer_gettime(timerid: i32, curr_value: *mut LinuxITimerSpec) -> KResult {
     if timerid < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if curr_value.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let (interval_us, remaining_us) = current_process()
         .posix_timer_snapshot(timerid as usize, get_time_us())
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
     let current = itimerspec_from_us(interval_us, remaining_us);
     write_user_value(current_user_token(), curr_value, &current)?;
     Ok(0)
 }
 
-pub fn sys_timer_getoverrun(timerid: i32) -> SysResult {
+pub fn sys_timer_getoverrun(timerid: i32) -> KResult {
     if timerid < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     current_process()
         .posix_timer_snapshot(timerid as usize, get_time_us())
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
     Ok(0)
 }
 
-pub fn sys_timer_delete(timerid: i32) -> SysResult {
+pub fn sys_timer_delete(timerid: i32) -> KResult {
     if timerid < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     current_process()
         .delete_posix_timer(timerid as usize)
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
     Ok(0)
 }
 
@@ -652,7 +646,7 @@ pub fn sys_gettimeofday_ctx(
     ctx: &SyscallContext,
     tv: *mut LinuxTimeVal,
     tz: *mut LinuxTimezone,
-) -> SysResult {
+) -> KResult {
     if !tv.is_null() {
         write_user_value_ctx(ctx, tv, &wall_timeval())?;
     }
@@ -668,7 +662,7 @@ pub fn sys_settimeofday_ctx(
     ctx: &SyscallContext,
     tv: *const LinuxTimeVal,
     tz: *const LinuxTimezone,
-) -> SysResult {
+) -> KResult {
     let new_wall_nanos = if tv.is_null() {
         None
     } else {
@@ -681,7 +675,7 @@ pub fn sys_settimeofday_ctx(
         let _ = read_user_value_ctx(ctx, tz)?;
     }
     if !current_can_set_time() {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     if let Some(new_wall_nanos) = new_wall_nanos {
         set_wall_time_nanos(new_wall_nanos);
@@ -689,7 +683,7 @@ pub fn sys_settimeofday_ctx(
     Ok(0)
 }
 
-pub fn sys_times_ctx(ctx: &SyscallContext, tms: *mut LinuxTms) -> SysResult {
+pub fn sys_times_ctx(ctx: &SyscallContext, tms: *mut LinuxTms) -> KResult {
     if !tms.is_null() {
         let linux_tms = LinuxTms::from_cpu_times(ctx.process().cpu_times_snapshot());
         write_user_value_ctx(ctx, tms, &linux_tms)?;
@@ -697,12 +691,12 @@ pub fn sys_times_ctx(ctx: &SyscallContext, tms: *mut LinuxTms) -> SysResult {
     Ok(clock_ticks_to_isize(get_time_clock_ticks()))
 }
 
-fn sleep_until_ms(expire_ms: usize) -> SysResult {
+fn sleep_until_ms(expire_ms: usize) -> KResult {
     if get_time_ms() >= expire_ms {
         return Ok(0);
     }
     if current_has_deliverable_signal() {
-        return Err(SysError::EINTR);
+        return Err(Errno::EINTR);
     }
     let (task, task_cx_ptr) = block_current_task_no_schedule();
     let force_boundary_wake = task.is_smp_sched_probe_active();
@@ -720,12 +714,12 @@ fn sleep_until_ms(expire_ms: usize) -> SysResult {
     }
     schedule(task_cx_ptr);
     if get_time_ms() < expire_ms && current_has_deliverable_signal() {
-        return Err(SysError::EINTR);
+        return Err(Errno::EINTR);
     }
     Ok(0)
 }
 
-fn sleep_until_clock(backend: ClockBackend, request: LinuxTimeSpec) -> SysResult {
+fn sleep_until_clock(backend: ClockBackend, request: LinuxTimeSpec) -> KResult {
     let deadline_nanos = timespec_to_nanos(request)?;
     let now_nanos = current_clock_nanos(backend);
     if deadline_nanos <= now_nanos {
@@ -760,7 +754,7 @@ fn wall_timeval() -> LinuxTimeVal {
     }
 }
 
-fn clock_getres_resolution(clock_id: i32) -> SysResult<LinuxTimeSpec> {
+fn clock_getres_resolution(clock_id: i32) -> KResult<LinuxTimeSpec> {
     match clock_id {
         CLOCK_REALTIME
         | CLOCK_MONOTONIC
@@ -772,7 +766,7 @@ fn clock_getres_resolution(clock_id: i32) -> SysResult<LinuxTimeSpec> {
         | CLOCK_BOOTTIME
         | CLOCK_REALTIME_ALARM
         | CLOCK_BOOTTIME_ALARM => Ok(nanos_to_timespec(1)),
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -785,33 +779,31 @@ fn process_cpu_timespec_ctx(ctx: &SyscallContext) -> LinuxTimeSpec {
     us_to_timespec(times.user_us.saturating_add(times.system_us))
 }
 
-fn cpu_clock_target_id(clock_id: i32) -> SysResult<(bool, usize)> {
+fn cpu_clock_target_id(clock_id: i32) -> KResult<(bool, usize)> {
     if clock_id >= 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     match clock_id & CPUCLOCK_CLOCK_MASK {
         CPUCLOCK_PROF | CPUCLOCK_VIRT | CPUCLOCK_SCHED => {}
-        _ => return Err(SysError::EINVAL),
+        _ => return Err(Errno::EINVAL),
     }
     let id = !(clock_id >> 3);
     if id < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok((clock_id & CPUCLOCK_PERTHREAD_MASK != 0, id as usize))
 }
 
-fn dynamic_cpu_clock_timespec_ctx(ctx: &SyscallContext, clock_id: i32) -> SysResult<LinuxTimeSpec> {
+fn dynamic_cpu_clock_timespec_ctx(ctx: &SyscallContext, clock_id: i32) -> KResult<LinuxTimeSpec> {
     let (per_thread, id) = cpu_clock_target_id(clock_id)?;
     if per_thread {
-        let task = task_with_linux_tid(id).ok_or(SysError::EINVAL)?;
+        let task = task_with_linux_tid(id).ok_or(Errno::EINVAL)?;
         Ok(us_to_timespec(task.cpu_time_us()))
     } else {
         let times = if id == 0 {
             ctx.process().cpu_times_snapshot()
         } else {
-            pid2process(id)
-                .ok_or(SysError::EINVAL)?
-                .cpu_times_snapshot()
+            pid2process(id).ok_or(Errno::EINVAL)?.cpu_times_snapshot()
         };
         Ok(process_cpu_timespec_from_times(times))
     }
@@ -823,11 +815,7 @@ fn remaining_until_timespec(expire_ms: usize) -> LinuxTimeSpec {
     nanos_to_timespec(remaining_nanos)
 }
 
-fn write_remaining_sleep_time(
-    token: usize,
-    rem: *mut LinuxTimeSpec,
-    expire_ms: usize,
-) -> SysResult {
+fn write_remaining_sleep_time(token: usize, rem: *mut LinuxTimeSpec, expire_ms: usize) -> KResult {
     if rem.is_null() {
         return Ok(0);
     }
@@ -836,9 +824,9 @@ fn write_remaining_sleep_time(
     Ok(0)
 }
 
-pub fn sys_nanosleep(req: *const LinuxTimeSpec, rem: *mut LinuxTimeSpec) -> SysResult {
+pub fn sys_nanosleep(req: *const LinuxTimeSpec, rem: *mut LinuxTimeSpec) -> KResult {
     if req.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let token = current_user_token();
     let request = validate_timespec(read_user_value(token, req)?)?;
@@ -848,9 +836,9 @@ pub fn sys_nanosleep(req: *const LinuxTimeSpec, rem: *mut LinuxTimeSpec) -> SysR
     }
     let expire_ms = relative_sleep_deadline_ms(request)?;
     match sleep_until_ms(expire_ms) {
-        Err(SysError::EINTR) => {
+        Err(Errno::EINTR) => {
             write_remaining_sleep_time(token, rem, expire_ms)?;
-            Err(SysError::EINTR)
+            Err(Errno::EINTR)
         }
         result => result,
     }
@@ -860,9 +848,9 @@ pub fn sys_clock_gettime_ctx(
     ctx: &SyscallContext,
     clock_id: i32,
     tp: *mut LinuxTimeSpec,
-) -> SysResult {
+) -> KResult {
     if tp.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let timespec = if clock_id < 0 {
         dynamic_cpu_clock_timespec_ctx(ctx, clock_id)?
@@ -881,23 +869,23 @@ pub fn sys_clock_gettime_ctx(
             CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
                 monotonic_timespec()
             }
-            _ => return Err(SysError::EINVAL),
+            _ => return Err(Errno::EINVAL),
         }
     };
     write_user_value_ctx(ctx, tp, &timespec)?;
     Ok(0)
 }
 
-pub fn sys_clock_settime(clock_id: i32, tp: *const LinuxTimeSpec) -> SysResult {
+pub fn sys_clock_settime(clock_id: i32, tp: *const LinuxTimeSpec) -> KResult {
     if clock_id != CLOCK_REALTIME {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if tp.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let request = validate_timespec(read_user_value(current_user_token(), tp)?)?;
     if !current_can_set_time() {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     set_wall_time_nanos(timespec_to_nanos(request)?);
     Ok(0)
@@ -907,7 +895,7 @@ pub fn sys_clock_getres_ctx(
     ctx: &SyscallContext,
     clock_id: i32,
     res: *mut LinuxTimeSpec,
-) -> SysResult {
+) -> KResult {
     let resolution = clock_getres_resolution(clock_id)?;
     if !res.is_null() {
         write_user_value_ctx(ctx, res, &resolution)?;
@@ -920,13 +908,13 @@ pub fn sys_clock_nanosleep(
     flags: u32,
     req: *const LinuxTimeSpec,
     rem: *mut LinuxTimeSpec,
-) -> SysResult {
+) -> KResult {
     if flags & !TIMER_ABSTIME != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let backend = ClockKind::from_raw(clock_id)?.nanosleep_backend()?;
     if req.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
 
     let request = validate_timespec(read_user_value(current_user_token(), req)?)?;
@@ -939,9 +927,9 @@ pub fn sys_clock_nanosleep(
         }
         let expire_ms = relative_sleep_deadline_ms(request)?;
         match sleep_until_ms(expire_ms) {
-            Err(SysError::EINTR) => {
+            Err(Errno::EINTR) => {
                 write_remaining_sleep_time(current_user_token(), rem, expire_ms)?;
-                Err(SysError::EINTR)
+                Err(Errno::EINTR)
             }
             result => result,
         }
@@ -994,10 +982,10 @@ fn fill_timex_output(timex: &mut LinuxTimex, state: TimexState) {
     timex.tai = state.tai;
 }
 
-fn update_timex_state(state: &mut TimexState, timex: LinuxTimex) -> SysResult<()> {
+fn update_timex_state(state: &mut TimexState, timex: LinuxTimex) -> KResult<()> {
     let modes = timex.modes;
     if !timex_modes_supported(modes) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if modes & ADJ_MICRO != 0 {
         state.status &= !STA_NANO;
@@ -1007,7 +995,7 @@ fn update_timex_state(state: &mut TimexState, timex: LinuxTimex) -> SysResult<()
     }
     if modes & ADJ_STATUS != 0 {
         if timex.status & !TIMEX_SETTABLE_STATUS_BITS != 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         state.status = (state.status & !TIMEX_SETTABLE_STATUS_BITS)
             | (timex.status & TIMEX_SETTABLE_STATUS_BITS);
@@ -1019,7 +1007,7 @@ fn update_timex_state(state: &mut TimexState, timex: LinuxTimex) -> SysResult<()
             500_000isize
         };
         if timex.offset <= -limit || timex.offset >= limit {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         state.offset = timex.offset;
     }
@@ -1038,7 +1026,7 @@ fn update_timex_state(state: &mut TimexState, timex: LinuxTimex) -> SysResult<()
     if modes & ADJ_TICK != 0 {
         let (min_tick, max_tick) = timex_tick_bounds();
         if timex.tick < min_tick || timex.tick > max_tick {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         state.tick = timex.tick;
     }
@@ -1048,18 +1036,18 @@ fn update_timex_state(state: &mut TimexState, timex: LinuxTimex) -> SysResult<()
     Ok(())
 }
 
-pub fn sys_clock_adjtime(clock_id: i32, timex: *mut LinuxTimex) -> SysResult {
+pub fn sys_clock_adjtime(clock_id: i32, timex: *mut LinuxTimex) -> KResult {
     if clock_id != CLOCK_REALTIME {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if timex.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let token = current_user_token();
     let mut user_timex = read_user_value(token, timex)?;
     let modes = user_timex.modes;
     if !current_can_set_time() && modes != 0 && modes != ADJ_OFFSET_SS_READ {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     let ret = {
         let mut state = TIMEX_STATE.exclusive_access();
@@ -1073,6 +1061,6 @@ pub fn sys_clock_adjtime(clock_id: i32, timex: *mut LinuxTimex) -> SysResult {
     Ok(ret)
 }
 
-pub fn sys_adjtimex(timex: *mut LinuxTimex) -> SysResult {
+pub fn sys_adjtimex(timex: *mut LinuxTimex) -> KResult {
     sys_clock_adjtime(CLOCK_REALTIME, timex)
 }

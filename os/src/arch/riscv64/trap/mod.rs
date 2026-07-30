@@ -5,7 +5,7 @@ use crate::config::TRAMPOLINE;
 use crate::mm::{MmapFaultAccess, MmapFaultResult, MmapPageCacheInstall, MmapPageCacheResolve};
 use crate::perf;
 use crate::syscall::{
-    errno::SysError, syscall_exit_with_current_task, syscall_is_exit, syscall_is_exit_group,
+    syscall_exit_with_current_task, syscall_is_exit, syscall_is_exit_group,
     syscall_with_current_task,
 };
 use crate::task::{
@@ -15,6 +15,7 @@ use crate::task::{
     timer_tick_should_preempt, trap_cx_of_task, trap_return_context_after_accounting_for_task,
 };
 use crate::timer::{check_timer, get_time_us, set_next_trigger};
+use crate::uapi::errno::Errno;
 use alloc::sync::Arc;
 use core::arch::{asm, global_asm};
 use riscv::register::{
@@ -133,7 +134,7 @@ pub fn trap_handler() -> ! {
             cx.x[10] = result as usize;
             let syscall_exit_pc = cx.sepc;
             let syscall_exit_sp = cx.x[2];
-            let syscall_pc_if_interrupted = if result == -(SysError::EINTR as isize) {
+            let syscall_pc_if_interrupted = if result == -(Errno::EINTR as isize) {
                 Some(syscall_pc)
             } else {
                 None

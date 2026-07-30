@@ -3,7 +3,7 @@ use super::{
     TaskControlBlock, TaskStatus, block_current_task_no_schedule, current_process, current_task,
     pid2process, queue_signal_to_task, remove_ready_tasks_of_process, schedule, wakeup_task,
 };
-use crate::syscall::errno::{SysError, SysResult};
+use crate::uapi::errno::{Errno, KResult};
 use alloc::sync::Arc;
 
 const STOPPED_WAIT_LOW_BITS: i32 = 0x7f;
@@ -34,15 +34,15 @@ pub(crate) fn ptrace_is_traced(process: &Arc<ProcessControlBlock>) -> bool {
     process.ptrace_is_traced_fast()
 }
 
-pub(crate) fn ptrace_traceme_current() -> SysResult {
+pub(crate) fn ptrace_traceme_current() -> KResult {
     let process = current_process();
     let tracer_pid = process
         .parent_process()
         .map(|parent| parent.getpid())
-        .ok_or(SysError::EPERM)?;
+        .ok_or(Errno::EPERM)?;
     let mut inner = process.inner_exclusive_access();
     if inner.ptrace.tracer_pid.is_some() {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     inner.ptrace.tracer_pid = Some(tracer_pid);
     inner.ptrace.options = 0;
@@ -56,14 +56,14 @@ pub(crate) fn ptrace_validate_tracee(
     tracee: &Arc<ProcessControlBlock>,
     tracer_pid: usize,
     require_stopped: bool,
-) -> SysResult<Arc<TaskControlBlock>> {
+) -> KResult<Arc<TaskControlBlock>> {
     let task = tracee.main_task();
     let inner = tracee.inner_exclusive_access();
     if inner.is_zombie || inner.ptrace.tracer_pid != Some(tracer_pid) {
-        return Err(SysError::ESRCH);
+        return Err(Errno::ESRCH);
     }
     if require_stopped && !inner.ptrace.stopped {
-        return Err(SysError::ESRCH);
+        return Err(Errno::ESRCH);
     }
     drop(inner);
     Ok(task)
@@ -72,18 +72,18 @@ pub(crate) fn ptrace_validate_tracee(
 pub(crate) fn ptrace_attach_process(
     tracee: &Arc<ProcessControlBlock>,
     tracer_pid: usize,
-) -> SysResult {
+) -> KResult {
     if tracee.getpid() == tracer_pid {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     let task = tracee.main_task();
     {
         let mut inner = tracee.inner_exclusive_access();
         if inner.is_zombie {
-            return Err(SysError::ESRCH);
+            return Err(Errno::ESRCH);
         }
         if inner.ptrace.tracer_pid.is_some() {
-            return Err(SysError::EPERM);
+            return Err(Errno::EPERM);
         }
         inner.ptrace.tracer_pid = Some(tracer_pid);
         inner.ptrace.stopped = true;
@@ -111,7 +111,7 @@ pub(crate) fn ptrace_resume_process(
     signum: u32,
     detach: bool,
     syscall_trace: bool,
-) -> SysResult {
+) -> KResult {
     let signal = if signum == 0 {
         None
     } else if signum == SIGTRAP || signum == (SIGTRAP | 0x80) {
@@ -121,9 +121,9 @@ pub(crate) fn ptrace_resume_process(
         // fatal signal for the tracee.
         None
     } else if signum as usize >= SIGNAL_INFO_SLOTS {
-        return Err(SysError::EIO);
+        return Err(Errno::EIO);
     } else {
-        Some(SignalFlags::from_signum(signum).ok_or(SysError::EIO)?)
+        Some(SignalFlags::from_signum(signum).ok_or(Errno::EIO)?)
     };
     let task = ptrace_validate_tracee(tracee, tracer_pid, true)?;
     {
@@ -155,10 +155,7 @@ pub(crate) fn ptrace_resume_process(
     Ok(0)
 }
 
-pub(crate) fn ptrace_kill_process(
-    tracee: &Arc<ProcessControlBlock>,
-    tracer_pid: usize,
-) -> SysResult {
+pub(crate) fn ptrace_kill_process(tracee: &Arc<ProcessControlBlock>, tracer_pid: usize) -> KResult {
     let task = ptrace_validate_tracee(tracee, tracer_pid, false)?;
     {
         let mut inner = tracee.inner_exclusive_access();

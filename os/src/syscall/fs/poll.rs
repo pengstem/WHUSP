@@ -8,12 +8,12 @@ use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::super::errno::{SysError, SysResult};
 use super::super::time::relative_timeout_deadline_ms;
 use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{read_user_array, write_user_array};
 use super::fd::get_file_by_fd;
 use super::uapi::{LinuxPollFd, PPOLL_MAX_NFDS};
+use crate::uapi::errno::{Errno, KResult};
 
 const SELECT_MAX_NFDS: usize = 1024;
 const FD_SET_WORD_BITS: usize = usize::BITS as usize;
@@ -23,7 +23,7 @@ type PollFile = Arc<dyn File + Send + Sync>;
 #[derive(Clone)]
 enum PollFileSlot {
     File(PollFile),
-    Error(SysError),
+    Error(Errno),
 }
 
 struct ProcSleepGuard {
@@ -31,8 +31,8 @@ struct ProcSleepGuard {
 }
 
 impl ProcSleepGuard {
-    fn new() -> SysResult<Self> {
-        let task = current_task().ok_or(SysError::ESRCH)?;
+    fn new() -> KResult<Self> {
+        let task = current_task().ok_or(Errno::ESRCH)?;
         task.inner_exclusive_access().proc_sleeping = true;
         Ok(Self { task })
     }
@@ -44,7 +44,7 @@ impl Drop for ProcSleepGuard {
     }
 }
 
-fn sleep_until_poll_event(waiter: &Arc<PollWaiter>, deadline_ms: Option<usize>) -> SysResult {
+fn sleep_until_poll_event(waiter: &Arc<PollWaiter>, deadline_ms: Option<usize>) -> KResult {
     if waiter.was_triggered() {
         return Ok(0);
     }
@@ -53,12 +53,12 @@ fn sleep_until_poll_event(waiter: &Arc<PollWaiter>, deadline_ms: Option<usize>) 
         return Ok(0);
     }
     if current_has_interrupting_signal() {
-        return Err(SysError::EINTR);
+        return Err(Errno::EINTR);
     }
 
     let _sleep_guard = ProcSleepGuard::new()?;
     let (task, task_cx_ptr) =
-        block_current_task_no_schedule_unless_unmasked_signal().ok_or(SysError::EINTR)?;
+        block_current_task_no_schedule_unless_unmasked_signal().ok_or(Errno::EINTR)?;
     debug_assert!(waiter.task_matches(&task));
     if let Some(deadline_ms) = deadline_ms {
         add_timer(deadline_ms, Arc::clone(&task));
@@ -71,9 +71,9 @@ fn sleep_until_poll_event(waiter: &Arc<PollWaiter>, deadline_ms: Option<usize>) 
     Ok(0)
 }
 
-fn block_signal_only_waiter() -> SysResult {
+fn block_signal_only_waiter() -> KResult {
     let (blocked_task, task_cx_ptr) =
-        block_current_task_no_schedule_unless_unmasked_signal().ok_or(SysError::EINTR)?;
+        block_current_task_no_schedule_unless_unmasked_signal().ok_or(Errno::EINTR)?;
     drop(blocked_task);
     schedule(task_cx_ptr);
     Ok(0)
@@ -83,21 +83,21 @@ fn read_user_pollfds(
     token: usize,
     fds: *const LinuxPollFd,
     nfds: usize,
-) -> SysResult<Vec<LinuxPollFd>> {
+) -> KResult<Vec<LinuxPollFd>> {
     if nfds == 0 {
         return Ok(Vec::new());
     }
     if fds.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     if nfds > PPOLL_MAX_NFDS {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     read_user_array(token, fds, nfds)
 }
 
-fn write_user_pollfds(token: usize, fds: *mut LinuxPollFd, pollfds: &[LinuxPollFd]) -> SysResult {
+fn write_user_pollfds(token: usize, fds: *mut LinuxPollFd, pollfds: &[LinuxPollFd]) -> KResult {
     write_user_array(token, fds, pollfds)?;
     Ok(0)
 }
@@ -110,7 +110,7 @@ fn poll_events_to_user(events: PollEvents) -> i16 {
     events.bits() as i16
 }
 
-fn poll_get_file_by_fd(fd: usize) -> SysResult<PollFile> {
+fn poll_get_file_by_fd(fd: usize) -> KResult<PollFile> {
     perf::record_poll_fd_table_lookup();
     get_file_by_fd(fd)
 }
@@ -152,7 +152,7 @@ fn scan_pollfds(
                     ready += 1;
                 }
             }
-            Some(PollFileSlot::Error(SysError::EBADF)) => {
+            Some(PollFileSlot::Error(Errno::EBADF)) => {
                 pollfd.revents = poll_events_to_user(PollEvents::POLLNVAL);
                 ready += 1;
             }
@@ -175,7 +175,7 @@ pub fn sys_ppoll(
     timeout: *const LinuxTimeSpec,
     _sigmask: *const u8,
     _sigsetsize: usize,
-) -> SysResult {
+) -> KResult {
     // UNFINISHED: ppoll currently ignores per-call signal-mask installation.
     // CONTEXT: musl implements pause() through ppoll() with a non-null mask on
     // RISC-V. Accepting the mask as a no-op lets LTP namespace helper daemons
@@ -185,7 +185,7 @@ pub fn sys_ppoll(
     let mut pollfds = read_user_pollfds(token, fds.cast_const(), nfds)?;
     let poll_files = snapshot_pollfds(&pollfds);
     let deadline_ms = relative_timeout_deadline_ms(token, timeout)?;
-    let task = current_task().ok_or(SysError::ESRCH)?;
+    let task = current_task().ok_or(Errno::ESRCH)?;
 
     loop {
         let ready = scan_pollfds(&mut pollfds, &poll_files, None);
@@ -199,7 +199,7 @@ pub fn sys_ppoll(
             return Ok(0);
         }
         if current_has_interrupting_signal() {
-            return Err(SysError::EINTR);
+            return Err(Errno::EINTR);
         }
         if pollfds.is_empty() && deadline_ms.is_none() {
             block_signal_only_waiter()?;
@@ -216,7 +216,7 @@ pub fn sys_ppoll(
                 return Ok(0);
             }
             if current_has_interrupting_signal() {
-                return Err(SysError::EINTR);
+                return Err(Errno::EINTR);
             }
             sleep_until_poll_event(&waiter, deadline_ms)?;
         }
@@ -227,7 +227,7 @@ fn fdset_words(nfds: usize) -> usize {
     nfds.div_ceil(FD_SET_WORD_BITS)
 }
 
-fn read_user_fdset(token: usize, ptr: usize, nfds: usize) -> SysResult<Option<Vec<usize>>> {
+fn read_user_fdset(token: usize, ptr: usize, nfds: usize) -> KResult<Option<Vec<usize>>> {
     if ptr == 0 {
         return Ok(None);
     }
@@ -239,7 +239,7 @@ fn read_user_fdset(token: usize, ptr: usize, nfds: usize) -> SysResult<Option<Ve
     )?))
 }
 
-fn write_user_fdset(token: usize, ptr: usize, words: &[usize]) -> SysResult {
+fn write_user_fdset(token: usize, ptr: usize, words: &[usize]) -> KResult {
     if ptr == 0 {
         return Ok(0);
     }
@@ -255,9 +255,9 @@ fn fd_set(words: &mut [usize], fd: usize) {
     }
 }
 
-fn for_each_set_fd<F>(nfds: usize, input: Option<&[usize]>, mut f: F) -> SysResult<usize>
+fn for_each_set_fd<F>(nfds: usize, input: Option<&[usize]>, mut f: F) -> KResult<usize>
 where
-    F: FnMut(usize) -> SysResult,
+    F: FnMut(usize) -> KResult,
 {
     let Some(input) = input else {
         return Ok(0);
@@ -294,7 +294,7 @@ fn snapshot_select_fdsets(
     read_input: Option<&[usize]>,
     write_input: Option<&[usize]>,
     except_input: Option<&[usize]>,
-) -> SysResult<Vec<Option<PollFileSlot>>> {
+) -> KResult<Vec<Option<PollFileSlot>>> {
     let mut files: Vec<Option<PollFileSlot>> =
         Vec::from_iter(core::iter::repeat_with(|| None).take(nfds));
     for_each_set_fd(nfds, read_input, |fd| {
@@ -334,7 +334,7 @@ fn scan_fdset(
     events: PollEvents,
     files: &[Option<PollFileSlot>],
     waiter: Option<&Arc<PollWaiter>>,
-) -> SysResult<usize> {
+) -> KResult<usize> {
     let mut ready = 0usize;
     for_each_set_fd(nfds, input, |fd| {
         match files.get(fd).and_then(Option::as_ref) {
@@ -346,7 +346,7 @@ fn scan_fdset(
                 Ok(0)
             }
             Some(PollFileSlot::Error(err)) => Err(*err),
-            None => Err(SysError::EBADF),
+            None => Err(Errno::EBADF),
         }
     })?;
     Ok(ready)
@@ -362,7 +362,7 @@ fn scan_pselect_fdsets(
     except_output: &mut [usize],
     files: &[Option<PollFileSlot>],
     waiter: Option<&Arc<PollWaiter>>,
-) -> SysResult<usize> {
+) -> KResult<usize> {
     read_output.fill(0);
     write_output.fill(0);
     except_output.fill(0);
@@ -398,12 +398,12 @@ pub fn sys_pselect6(
     exceptfds: usize,
     timeout: *const LinuxTimeSpec,
     _sigmask: usize,
-) -> SysResult {
+) -> KResult {
     // UNFINISHED: pselect6 signal-mask installation is not implemented; the
     // mask argument is accepted as a no-op for libc select() compatibility on
     // the netperf path.
     if nfds > SELECT_MAX_NFDS {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let token = current_user_token();
@@ -421,7 +421,7 @@ pub fn sys_pselect6(
     let mut read_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
     let mut write_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
     let mut except_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
-    let task = current_task().ok_or(SysError::ESRCH)?;
+    let task = current_task().ok_or(Errno::ESRCH)?;
     let fdset_visits = nfds * usize::from(read_input.is_some())
         + nfds * usize::from(write_input.is_some())
         + nfds * usize::from(except_input.is_some());
@@ -447,7 +447,7 @@ pub fn sys_pselect6(
             return Ok(ready as isize);
         }
         if current_has_interrupting_signal() {
-            return Err(SysError::EINTR);
+            return Err(Errno::EINTR);
         }
         if read_input.is_none()
             && write_input.is_none()
@@ -477,7 +477,7 @@ pub fn sys_pselect6(
                 return Ok(ready as isize);
             }
             if current_has_interrupting_signal() {
-                return Err(SysError::EINTR);
+                return Err(Errno::EINTR);
             }
             sleep_until_poll_event(&waiter, deadline_ms)?;
         }

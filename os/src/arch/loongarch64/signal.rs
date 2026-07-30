@@ -1,15 +1,16 @@
 use super::trap::handle_user_page_fault;
 use crate::mm::{MmapFaultAccess, VirtAddr, page_table::PTEFlags};
+use crate::syscall::LinuxSigInfo;
 use crate::syscall::user_ptr::{
     UserBufferAccess, read_user_value_with_fault, write_user_value_with_fault,
 };
-use crate::syscall::{LinuxSigInfo, errno::SysError, errno::SysResult};
 use crate::task::{
     ProcessControlBlock, SIGCHLD, SIGNAL_INFO_SLOTS, SignalAction, SignalFlags, SignalInfo,
     TaskControlBlock, current_add_signal, current_process, current_task, current_trap_cx,
     current_user_token, flags_to_linux_sigset, linux_sigset_to_flags, trap_cx_of_task,
 };
 use crate::trap::TrapContext;
+use crate::uapi::errno::{Errno, KResult};
 use alloc::sync::Arc;
 use core::mem::{offset_of, size_of};
 
@@ -307,7 +308,7 @@ fn force_default_sigsegv() {
     current_add_signal(SignalFlags::SIGSEGV);
 }
 
-pub fn sys_rt_sigreturn() -> SysResult {
+pub fn sys_rt_sigreturn() -> KResult {
     let token = current_user_token();
     let signal_sp = current_trap_cx().x[3];
     let frame: LoongArchSignalFrame = read_user_value_with_fault(
@@ -316,7 +317,7 @@ pub fn sys_rt_sigreturn() -> SysResult {
         Some(signal_user_fault),
     )?;
     if frame.magic != SIGNAL_FRAME_MAGIC {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     if let Some(task) = current_task() {

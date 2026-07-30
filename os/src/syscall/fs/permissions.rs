@@ -1,6 +1,6 @@
 use crate::fs::{FileStat, MountId, S_IFMT, S_IFREG, mount_is_read_only};
-use crate::syscall::errno::{SysError, SysResult};
 use crate::task::Credentials;
+use crate::uapi::errno::{Errno, KResult};
 
 use super::uapi::{F_OK, W_OK, X_OK};
 
@@ -53,13 +53,13 @@ pub(crate) fn check_access_mode(
     stat: &FileStat,
     mode: i32,
     subject: AccessSubject<'_>,
-) -> SysResult<()> {
+) -> KResult<()> {
     if mode == F_OK {
         return Ok(());
     }
 
     if mode & W_OK != 0 && mount_is_read_only(MountId(stat.dev as usize)) {
-        return Err(SysError::EROFS);
+        return Err(Errno::EROFS);
     }
 
     // UNFINISHED: Linux also folds capabilities, ACLs, immutable/append-only
@@ -67,7 +67,7 @@ pub(crate) fn check_access_mode(
     // models the common DAC mode-bit path and treats uid 0 as capability-like.
     if subject.is_root() {
         if mode & X_OK != 0 && stat.mode & S_IFMT == S_IFREG && stat.mode & 0o111 == 0 {
-            return Err(SysError::EACCES);
+            return Err(Errno::EACCES);
         }
         return Ok(());
     }
@@ -82,14 +82,11 @@ pub(crate) fn check_access_mode(
     };
 
     if granted & requested != requested {
-        return Err(SysError::EACCES);
+        return Err(Errno::EACCES);
     }
     Ok(())
 }
 
-pub(crate) fn check_execute_permission(
-    stat: &FileStat,
-    subject: AccessSubject<'_>,
-) -> SysResult<()> {
+pub(crate) fn check_execute_permission(stat: &FileStat, subject: AccessSubject<'_>) -> KResult<()> {
     check_access_mode(stat, X_OK, subject)
 }

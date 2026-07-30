@@ -4,7 +4,7 @@ use crate::fs::{
 };
 use crate::task::{FdTableEntry, current_process};
 
-use super::super::errno::{SysError, SysResult};
+use crate::uapi::errno::{Errno, KResult};
 
 const CLONE_FS: usize = 1 << 9;
 const CLONE_FILES: usize = 1 << 10;
@@ -34,9 +34,9 @@ fn namespace_info_from_fd(entry: &FdTableEntry) -> Option<ProcNamespaceInfo> {
         })
 }
 
-pub fn sys_setns(fd: usize, nstype: usize) -> SysResult {
+pub fn sys_setns(fd: usize, nstype: usize) -> KResult {
     if nstype != 0 && nstype != CLONE_NEWNS && nstype != CLONE_NEWNET {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let entry = {
         let process = current_process();
@@ -46,37 +46,37 @@ pub fn sys_setns(fd: usize, nstype: usize) -> SysResult {
             .get(fd)
             .and_then(|entry| entry.as_ref())
             .cloned()
-            .ok_or(SysError::EBADF)?
+            .ok_or(Errno::EBADF)?
     };
-    let info = namespace_info_from_fd(&entry).ok_or(SysError::EINVAL)?;
+    let info = namespace_info_from_fd(&entry).ok_or(Errno::EINVAL)?;
     match info.kind {
         ProcNamespaceKind::Mnt => {
             if nstype != 0 && nstype != CLONE_NEWNS {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
-            let target_namespace = mount_namespace_id_from_info(info).ok_or(SysError::EINVAL)?;
+            let target_namespace = mount_namespace_id_from_info(info).ok_or(Errno::EINVAL)?;
             current_process().set_mount_namespace_id(target_namespace);
         }
         ProcNamespaceKind::Net => {
             if nstype != 0 && nstype != CLONE_NEWNET {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             // UNFINISHED: Network namespace state is currently global. LTP net
             // setup needs setns(/proc/<pid>/ns/net) to succeed before running
             // helper commands against the synthetic veth devices.
         }
-        _ => return Err(SysError::EINVAL),
+        _ => return Err(Errno::EINVAL),
     }
     Ok(0)
 }
 
-pub fn sys_unshare(flags: usize) -> SysResult {
+pub fn sys_unshare(flags: usize) -> KResult {
     if flags & !UNSHARE_SUPPORTED_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let process = current_process();
     if flags & (CLONE_NEWNS | CLONE_NEWNET) != 0 && !process.credentials().is_root() {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     if flags & CLONE_NEWNS != 0 {
         let namespace = clone_mount_namespace(process.mount_namespace_id());

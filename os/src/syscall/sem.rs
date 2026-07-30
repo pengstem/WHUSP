@@ -1,4 +1,3 @@
-use super::errno::{SysError, SysResult};
 use super::time::relative_timeout_deadline_ms;
 use super::uapi::LinuxTimeSpec;
 use super::user_ptr::{read_user_array, read_user_value, write_user_array, write_user_value};
@@ -10,6 +9,7 @@ use crate::task::{
     exit_current_group_and_run_next, schedule, wakeup_task,
 };
 use crate::timer::{add_timer, get_time_ms};
+use crate::uapi::errno::{Errno, KResult};
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
@@ -672,7 +672,7 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(SemManager::new()) };
 }
 
-pub(super) fn sys_semget(key: isize, nsems: usize, semflg: i32) -> SysResult {
+pub(super) fn sys_semget(key: isize, nsems: usize, semflg: i32) -> KResult {
     let process = current_process();
     let credentials = process.credentials();
     let caller = sem_caller_from(process.getpid(), &credentials);
@@ -687,7 +687,7 @@ pub(super) fn sys_semget(key: isize, nsems: usize, semflg: i32) -> SysResult {
         .map_err(sem_error_to_sys_error)
 }
 
-pub(super) fn sys_semctl(semid: usize, semnum: usize, cmd: i32, arg: usize) -> SysResult {
+pub(super) fn sys_semctl(semid: usize, semnum: usize, cmd: i32, arg: usize) -> KResult {
     let process = current_process();
     let credentials = process.credentials();
     let caller = sem_caller_from(process.getpid(), &credentials);
@@ -757,12 +757,7 @@ pub(super) fn sys_semctl(semid: usize, semnum: usize, cmd: i32, arg: usize) -> S
         SETALL => {
             let nsems = {
                 let manager = SEM_MANAGER.exclusive_access();
-                manager
-                    .sets
-                    .get(&semid)
-                    .ok_or(SysError::EINVAL)?
-                    .values
-                    .len()
+                manager.sets.get(&semid).ok_or(Errno::EINVAL)?.values.len()
             };
             let values = read_user_array(current_user_token(), arg as *const u16, nsems)?;
             SEM_MANAGER
@@ -790,11 +785,11 @@ pub(super) fn sys_semctl(semid: usize, semnum: usize, cmd: i32, arg: usize) -> S
             write_semid_ds(arg, stat)?;
             Ok(real_semid as isize)
         }
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
-pub(super) fn sys_semop(semid: usize, sops: *const LinuxSembuf, nsops: usize) -> SysResult {
+pub(super) fn sys_semop(semid: usize, sops: *const LinuxSembuf, nsops: usize) -> KResult {
     sys_semtimedop(semid, sops, nsops, core::ptr::null())
 }
 
@@ -803,12 +798,12 @@ pub(super) fn sys_semtimedop(
     sops: *const LinuxSembuf,
     nsops: usize,
     timeout: *const LinuxTimeSpec,
-) -> SysResult {
+) -> KResult {
     if nsops == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if nsops > SEMOPM {
-        return Err(SysError::E2BIG);
+        return Err(Errno::E2BIG);
     }
     let token = current_user_token();
     let ops = read_user_array(token, sops, nsops)?;
@@ -817,30 +812,30 @@ pub(super) fn sys_semtimedop(
     let caller = sem_caller_from(process.getpid(), &process.credentials());
     loop {
         if timeout_deadline_ms.is_some_and(|deadline| get_time_ms() >= deadline) {
-            return Err(SysError::EAGAIN);
+            return Err(Errno::EAGAIN);
         }
         match try_or_block_semop(semid, &ops, &caller, timeout_deadline_ms)? {
             SemOpAttempt::Done => return Ok(0),
             SemOpAttempt::Blocked(task_cx_ptr) => schedule(task_cx_ptr),
         }
         let Some(task) = current_task() else {
-            return Err(SysError::EINTR);
+            return Err(Errno::EINTR);
         };
         let mut manager = SEM_MANAGER.exclusive_access();
         let still_waiting = manager.remove_waiter_for_task(&task);
         let set_exists = manager.sets.contains_key(&semid);
         drop(manager);
         if !set_exists {
-            return Err(SysError::EIDRM);
+            return Err(Errno::EIDRM);
         }
         if let Some((exit_code, _message)) = check_signals_of_current() {
             exit_current_group_and_run_next(exit_code);
         }
         if current_has_deliverable_signal() {
-            return Err(SysError::EINTR);
+            return Err(Errno::EINTR);
         }
         if still_waiting && timeout_deadline_ms.is_some_and(|deadline| get_time_ms() >= deadline) {
-            return Err(SysError::EAGAIN);
+            return Err(Errno::EAGAIN);
         }
     }
 }
@@ -850,7 +845,7 @@ fn try_or_block_semop(
     ops: &[LinuxSembuf],
     caller: &SemCaller,
     timeout_deadline_ms: Option<usize>,
-) -> Result<SemOpAttempt, SysError> {
+) -> Result<SemOpAttempt, Errno> {
     let mut manager = SEM_MANAGER.exclusive_access();
     match manager.try_semop(semid, ops, caller) {
         Ok(()) => Ok(SemOpAttempt::Done),
@@ -862,7 +857,7 @@ fn try_or_block_semop(
     }
 }
 
-fn write_semid_ds(buf: usize, stat: SemSetStat) -> SysResult<()> {
+fn write_semid_ds(buf: usize, stat: SemSetStat) -> KResult<()> {
     let ds = LinuxSemid64Ds {
         sem_perm: LinuxIpc64Perm {
             key: stat.key as i32,
@@ -918,18 +913,18 @@ fn sem_caller_from(pid: usize, credentials: &crate::task::Credentials) -> SemCal
     }
 }
 
-fn sem_error_to_sys_error(error: SemError) -> SysError {
+fn sem_error_to_sys_error(error: SemError) -> Errno {
     match error {
-        SemError::NotFound => SysError::ENOENT,
-        SemError::Exists => SysError::EEXIST,
-        SemError::Invalid => SysError::EINVAL,
-        SemError::NoSpace => SysError::ENOSPC,
-        SemError::AccessDenied => SysError::EACCES,
-        SemError::NotPermitted => SysError::EPERM,
-        SemError::Range => SysError::ERANGE,
-        SemError::TooBig => SysError::EFBIG,
-        SemError::WouldBlock => SysError::EAGAIN,
-        SemError::Interrupted => SysError::EINTR,
+        SemError::NotFound => Errno::ENOENT,
+        SemError::Exists => Errno::EEXIST,
+        SemError::Invalid => Errno::EINVAL,
+        SemError::NoSpace => Errno::ENOSPC,
+        SemError::AccessDenied => Errno::EACCES,
+        SemError::NotPermitted => Errno::EPERM,
+        SemError::Range => Errno::ERANGE,
+        SemError::TooBig => Errno::EFBIG,
+        SemError::WouldBlock => Errno::EAGAIN,
+        SemError::Interrupted => Errno::EINTR,
     }
 }
 

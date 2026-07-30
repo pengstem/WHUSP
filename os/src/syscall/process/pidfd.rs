@@ -1,13 +1,13 @@
 use crate::fs::{File, FileStat, OpenFlags};
 use crate::mm::UserBuffer;
 use crate::syscall::LinuxSigInfo;
-use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::install_file_fd;
 use crate::syscall::user_ptr::read_user_value;
 use crate::task::{
     Credentials, FdFlags, FdTableEntry, ProcessControlBlock, SignalFlags, SignalInfo,
     current_process, current_user_token, pid2process, queue_signal_to_task, wakeup_task,
 };
+use crate::uapi::errno::{Errno, KResult};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -51,14 +51,14 @@ impl File for PidFdFile {
     }
 }
 
-fn install_pidfd_with_flags(pid: usize, open_flags: OpenFlags) -> SysResult<usize> {
+fn install_pidfd_with_flags(pid: usize, open_flags: OpenFlags) -> KResult<usize> {
     install_file_fd(Arc::new(PidFdFile::new(pid)), open_flags, None).map(|fd| fd as usize)
 }
 
-pub(super) fn reserve_pidfd_for_current_process() -> SysResult<usize> {
+pub(super) fn reserve_pidfd_for_current_process() -> KResult<usize> {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-    inner.alloc_fd_from(0).ok_or(SysError::EMFILE)
+    inner.alloc_fd_from(0).ok_or(Errno::EMFILE)
 }
 
 pub(super) fn install_reserved_pidfd_for_current_process(fd: usize, pid: usize) {
@@ -71,8 +71,8 @@ pub(super) fn install_reserved_pidfd_for_current_process(fd: usize, pid: usize) 
     debug_assert!(previous.is_none());
 }
 
-pub(crate) fn install_pidfd_for_fanotify(pid: usize) -> SysResult<usize> {
-    pid2process(pid).ok_or(SysError::ESRCH)?;
+pub(crate) fn install_pidfd_for_fanotify(pid: usize) -> KResult<usize> {
+    pid2process(pid).ok_or(Errno::ESRCH)?;
     install_pidfd_with_flags(pid, OpenFlags::CLOEXEC)
 }
 
@@ -84,7 +84,7 @@ pub(crate) fn pidfd_fdinfo(file: &Arc<dyn File + Send + Sync>, flags: u32) -> Op
     ))
 }
 
-fn pid_from_fd(pidfd: usize) -> SysResult<usize> {
+fn pid_from_fd(pidfd: usize) -> KResult<usize> {
     let entry = {
         let process = current_process();
         let inner = process.inner_exclusive_access();
@@ -93,13 +93,13 @@ fn pid_from_fd(pidfd: usize) -> SysResult<usize> {
             .get(pidfd)
             .and_then(|entry| entry.as_ref())
             .cloned()
-            .ok_or(SysError::EBADF)?
+            .ok_or(Errno::EBADF)?
     };
     let file = entry.file();
     file.as_any()
         .downcast_ref::<PidFdFile>()
         .map(|pidfd| pidfd.pid)
-        .ok_or(SysError::EBADF)
+        .ok_or(Errno::EBADF)
 }
 
 fn caller_can_signal_target(caller: &Credentials, target: &Credentials) -> bool {
@@ -139,7 +139,7 @@ fn queue_signal_to_process(
     }
 }
 
-fn signal_info_from_user(signum: u32, info: *const LinuxSigInfo) -> SysResult<SignalInfo> {
+fn signal_info_from_user(signum: u32, info: *const LinuxSigInfo) -> KResult<SignalInfo> {
     let sender_pid = current_process().getpid() as i32;
     if info.is_null() {
         return Ok(SignalInfo::user(signum as i32, sender_pid));
@@ -147,7 +147,7 @@ fn signal_info_from_user(signum: u32, info: *const LinuxSigInfo) -> SysResult<Si
     let info = read_user_value(current_user_token(), info)?;
     let info = info.to_signal_info(signum, sender_pid);
     if info.signo != signum as i32 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(info)
 }
@@ -157,33 +157,33 @@ pub fn sys_pidfd_send_signal(
     signum: u32,
     info: *const LinuxSigInfo,
     flags: u32,
-) -> SysResult {
+) -> KResult {
     if flags != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
-    let signal = SignalFlags::from_signum(signum).ok_or(SysError::EINVAL)?;
+    let signal = SignalFlags::from_signum(signum).ok_or(Errno::EINVAL)?;
     let pid = pid_from_fd(pidfd)?;
-    let target = pid2process(pid).ok_or(SysError::ESRCH)?;
+    let target = pid2process(pid).ok_or(Errno::ESRCH)?;
 
     let sender = current_process();
     if !caller_can_signal_target(&sender.credentials(), &target.credentials()) {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     let info = signal_info_from_user(signum, info)?;
     queue_signal_to_process(&target, signal, info);
     Ok(0)
 }
 
-pub fn sys_pidfd_getfd(pidfd: i32, target_fd: i32, flags: u32) -> SysResult {
+pub fn sys_pidfd_getfd(pidfd: i32, target_fd: i32, flags: u32) -> KResult {
     if flags != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if pidfd < 0 || target_fd < 0 {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
 
     let pid = pid_from_fd(pidfd as usize)?;
-    let target = pid2process(pid).ok_or(SysError::ESRCH)?;
+    let target = pid2process(pid).ok_or(Errno::ESRCH)?;
 
     let caller = current_process();
     // UNFINISHED: Linux gates pidfd_getfd() with a
@@ -191,16 +191,16 @@ pub fn sys_pidfd_getfd(pidfd: i32, target_fd: i32, flags: u32) -> SysResult {
     // ptrace access-mode implementation yet, so reuse the existing pidfd
     // credential check in the single user/PID namespace.
     if !caller_can_signal_target(&caller.credentials(), &target.credentials()) {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
 
     let source_entry = {
         let inner = target.inner_exclusive_access();
-        inner.fd_entry(target_fd as usize).ok_or(SysError::EBADF)?
+        inner.fd_entry(target_fd as usize).ok_or(Errno::EBADF)?
     };
     let new_fd = {
         let mut inner = caller.inner_exclusive_access();
-        let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
+        let fd = inner.alloc_fd_from(0).ok_or(Errno::EMFILE)?;
         let previous = inner.set_fd_entry(fd, source_entry.duplicate(FdFlags::CLOEXEC));
         debug_assert!(previous.is_none());
         fd
@@ -208,11 +208,11 @@ pub fn sys_pidfd_getfd(pidfd: i32, target_fd: i32, flags: u32) -> SysResult {
     Ok(new_fd as isize)
 }
 
-pub fn sys_pidfd_open(pid: usize, flags: u32) -> SysResult {
+pub fn sys_pidfd_open(pid: usize, flags: u32) -> KResult {
     if flags & !PIDFD_NONBLOCK != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
-    pid2process(pid).ok_or(SysError::ESRCH)?;
+    pid2process(pid).ok_or(Errno::ESRCH)?;
     let mut open_flags = OpenFlags::CLOEXEC;
     if flags & PIDFD_NONBLOCK != 0 {
         open_flags |= OpenFlags::NONBLOCK;

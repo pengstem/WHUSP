@@ -1,5 +1,4 @@
 use crate::syscall::LinuxSigInfo;
-use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{
     copy_to_user, read_user_value, write_user_value, write_user_value_in_memory_set,
 };
@@ -8,6 +7,7 @@ use crate::task::{
     current_user_token, pid2process, ptrace_attach_process, ptrace_kill_process,
     ptrace_resume_process, ptrace_traceme_current, ptrace_validate_tracee,
 };
+use crate::uapi::errno::{Errno, KResult};
 use alloc::sync::Arc;
 use core::mem::{size_of, size_of_val};
 
@@ -66,11 +66,11 @@ struct PtraceSyscallInfo {
 
 const MAX_PRSTATUS_WORDS: usize = 64;
 
-fn tracee_from_pid(pid: isize) -> SysResult<Arc<ProcessControlBlock>> {
+fn tracee_from_pid(pid: isize) -> KResult<Arc<ProcessControlBlock>> {
     if pid <= 0 {
-        return Err(SysError::ESRCH);
+        return Err(Errno::ESRCH);
     }
-    pid2process(pid as usize).ok_or(SysError::ESRCH)
+    pid2process(pid as usize).ok_or(Errno::ESRCH)
 }
 
 fn has_sys_ptrace_equivalent(credentials: &Credentials) -> bool {
@@ -91,7 +91,7 @@ fn can_attach(caller: &Credentials, target: &Credentials, target_dumpable: bool)
         && caller.euid == target.suid
 }
 
-fn check_attach_permission(tracee: &Arc<ProcessControlBlock>) -> SysResult<()> {
+fn check_attach_permission(tracee: &Arc<ProcessControlBlock>) -> KResult<()> {
     let caller = current_process();
     let caller_credentials = caller.credentials();
     let (target_credentials, target_dumpable) = {
@@ -101,24 +101,24 @@ fn check_attach_permission(tracee: &Arc<ProcessControlBlock>) -> SysResult<()> {
     if can_attach(&caller_credentials, &target_credentials, target_dumpable) {
         Ok(())
     } else {
-        Err(SysError::EPERM)
+        Err(Errno::EPERM)
     }
 }
 
-fn read_tracee_word(tracee: &Arc<ProcessControlBlock>, addr: usize) -> SysResult {
+fn read_tracee_word(tracee: &Arc<ProcessControlBlock>, addr: usize) -> KResult {
     let token = tracee.inner_exclusive_access().memory_set.token();
     read_user_value::<usize>(token, addr as *const usize).map(|value| value as isize)
 }
 
-fn write_tracee_word(tracee: &Arc<ProcessControlBlock>, addr: usize, data: usize) -> SysResult {
+fn write_tracee_word(tracee: &Arc<ProcessControlBlock>, addr: usize, data: usize) -> KResult {
     let mut inner = tracee.inner_exclusive_access();
     write_user_value_in_memory_set(&mut inner.memory_set, addr as *mut usize, &data)?;
     Ok(0)
 }
 
-fn validate_user_area_offset(addr: usize) -> SysResult {
+fn validate_user_area_offset(addr: usize) -> KResult {
     if addr % size_of::<usize>() != 0 || addr >= PTRACE_USER_AREA_SIZE {
-        return Err(SysError::EIO);
+        return Err(Errno::EIO);
     }
     Ok(0)
 }
@@ -159,16 +159,16 @@ fn audit_arch() -> u32 {
     AUDIT_ARCH_LOONGARCH64
 }
 
-fn ptrace_getregs(task: &Arc<TaskControlBlock>, data: usize) -> SysResult {
+fn ptrace_getregs(task: &Arc<TaskControlBlock>, data: usize) -> KResult {
     let (words, word_len) = collect_prstatus_words(task);
     let bytes = prstatus_bytes(&words[..word_len]);
     copy_to_user(current_user_token(), data as *mut u8, bytes)?;
     Ok(0)
 }
 
-fn ptrace_getregset(task: &Arc<TaskControlBlock>, addr: usize, data: usize) -> SysResult {
+fn ptrace_getregset(task: &Arc<TaskControlBlock>, addr: usize, data: usize) -> KResult {
     if addr != NT_PRSTATUS {
-        return Err(SysError::EIO);
+        return Err(Errno::EIO);
     }
     let token = current_user_token();
     let mut iov = read_user_value::<UserIovec>(token, data as *const UserIovec)?;
@@ -183,7 +183,7 @@ fn ptrace_getregset(task: &Arc<TaskControlBlock>, addr: usize, data: usize) -> S
     Ok(0)
 }
 
-fn ptrace_setregs(data: usize) -> SysResult {
+fn ptrace_setregs(data: usize) -> KResult {
     let _first_word = read_user_value::<usize>(current_user_token(), data as *const usize)?;
     // UNFINISHED: Register writes are accepted as a no-op for strace/LTP
     // compatibility; Linux applies architecture-specific validation and mutates
@@ -191,9 +191,9 @@ fn ptrace_setregs(data: usize) -> SysResult {
     Ok(0)
 }
 
-fn ptrace_setregset(addr: usize, data: usize) -> SysResult {
+fn ptrace_setregset(addr: usize, data: usize) -> KResult {
     if addr != NT_PRSTATUS {
-        return Err(SysError::EIO);
+        return Err(Errno::EIO);
     }
     let iov = read_user_value::<UserIovec>(current_user_token(), data as *const UserIovec)?;
     if iov.len != 0 {
@@ -204,11 +204,7 @@ fn ptrace_setregset(addr: usize, data: usize) -> SysResult {
     Ok(0)
 }
 
-fn ptrace_get_syscall_info(
-    tracee: &Arc<ProcessControlBlock>,
-    size: usize,
-    data: usize,
-) -> SysResult {
+fn ptrace_get_syscall_info(tracee: &Arc<ProcessControlBlock>, size: usize, data: usize) -> KResult {
     let stop = tracee.inner_exclusive_access().ptrace.syscall_stop;
     let mut info = PtraceSyscallInfo {
         op: PTRACE_SYSCALL_INFO_NONE,
@@ -247,9 +243,9 @@ fn ptrace_get_syscall_info(
     Ok(bytes.len() as isize)
 }
 
-fn ptrace_getsiginfo(tracee: &Arc<ProcessControlBlock>, data: *mut LinuxSigInfo) -> SysResult {
+fn ptrace_getsiginfo(tracee: &Arc<ProcessControlBlock>, data: *mut LinuxSigInfo) -> KResult {
     if data.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let stop_signal = tracee
         .inner_exclusive_access()
@@ -273,9 +269,9 @@ fn ptrace_getsiginfo(tracee: &Arc<ProcessControlBlock>, data: *mut LinuxSigInfo)
     Ok(0)
 }
 
-fn ptrace_setsiginfo(data: *const LinuxSigInfo) -> SysResult {
+fn ptrace_setsiginfo(data: *const LinuxSigInfo) -> KResult {
     if data.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let _info = read_user_value(current_user_token(), data)?;
     // UNFINISHED: Linux stores this for the pending signal-delivery stop.
@@ -283,7 +279,7 @@ fn ptrace_setsiginfo(data: *const LinuxSigInfo) -> SysResult {
     Ok(0)
 }
 
-pub fn sys_ptrace(request: usize, pid: isize, addr: usize, data: usize) -> SysResult {
+pub fn sys_ptrace(request: usize, pid: isize, addr: usize, data: usize) -> KResult {
     if request == PTRACE_TRACEME {
         return ptrace_traceme_current();
     }
@@ -348,7 +344,7 @@ pub fn sys_ptrace(request: usize, pid: isize, addr: usize, data: usize) -> SysRe
         PTRACE_SETOPTIONS => {
             ptrace_validate_tracee(&tracee, tracer_pid, true)?;
             if data & !PTRACE_O_MASK != 0 {
-                Err(SysError::EINVAL)
+                Err(Errno::EINVAL)
             } else {
                 tracee.inner_exclusive_access().ptrace.options = data;
                 Ok(0)
@@ -359,6 +355,6 @@ pub fn sys_ptrace(request: usize, pid: isize, addr: usize, data: usize) -> SysRe
             ptrace_validate_tracee(&tracee, tracer_pid, true)?;
             ptrace_get_syscall_info(&tracee, addr, data)
         }
-        _ => Err(SysError::EIO),
+        _ => Err(Errno::EIO),
     }
 }

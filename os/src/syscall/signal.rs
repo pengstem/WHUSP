@@ -11,13 +11,13 @@ use alloc::sync::Arc;
 use core::mem::size_of;
 
 use super::SyscallContext;
-use super::errno::{SysError, SysResult};
 use super::time::relative_timeout_deadline_ms;
 use super::uapi::LinuxTimeSpec;
 use super::user_ptr::{
     copy_to_user_ctx, read_user_value, read_user_value_ctx, write_user_value, write_user_value_ctx,
 };
 use super::wait::LinuxSigInfo;
+use crate::uapi::errno::{Errno, KResult};
 
 const LINUX_RT_SIGSET_SIZE: usize = 8;
 const SIG_BLOCK: usize = 0;
@@ -25,15 +25,15 @@ const SIG_UNBLOCK: usize = 1;
 const SIG_SETMASK: usize = 2;
 const LINUX_SS_AUTODISARM: i32 = 1 << 31;
 
-fn read_signal_set(token: usize, set: *const u8, sigsetsize: usize) -> SysResult<SignalFlags> {
+fn read_signal_set(token: usize, set: *const u8, sigsetsize: usize) -> KResult<SignalFlags> {
     // Linux rt-signal syscalls pass one 64-bit sigset on these ABIs. SIGKILL
     // and SIGSTOP are never blockable, so strip them at the syscall boundary
     // before the mask reaches TaskControlBlockInner.
     if sigsetsize != LINUX_RT_SIGSET_SIZE {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if (set as usize) < size_of::<u64>() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let raw_set = read_user_value(token, set.cast::<u64>())?;
     let mut flags = linux_sigset_to_flags(raw_set);
@@ -46,15 +46,15 @@ fn read_signal_set_ctx(
     ctx: &SyscallContext,
     set: *const u8,
     sigsetsize: usize,
-) -> SysResult<SignalFlags> {
+) -> KResult<SignalFlags> {
     // Linux rt-signal syscalls pass one 64-bit sigset on these ABIs. SIGKILL
     // and SIGSTOP are never blockable, so strip them at the syscall boundary
     // before the mask reaches TaskControlBlockInner.
     if sigsetsize != LINUX_RT_SIGSET_SIZE {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if (set as usize) < size_of::<u64>() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let raw_set = read_user_value_ctx(ctx, set.cast::<u64>())?;
     let mut flags = linux_sigset_to_flags(raw_set);
@@ -101,7 +101,7 @@ fn try_return_pending_signal(
     token: usize,
     wanted: SignalFlags,
     info_ptr: *mut LinuxSigInfo,
-) -> SysResult<Option<isize>> {
+) -> KResult<Option<isize>> {
     let Some((signum, info)) = peek_pending_signal(wanted) else {
         return Ok(None);
     };
@@ -118,7 +118,7 @@ fn try_return_waitable_sigchld(
     token: usize,
     wanted: SignalFlags,
     info_ptr: *mut LinuxSigInfo,
-) -> SysResult<Option<isize>> {
+) -> KResult<Option<isize>> {
     if !wanted.contains(SignalFlags::SIGCHLD) {
         return Ok(None);
     }
@@ -176,16 +176,16 @@ impl LinuxStackT {
         }
     }
 
-    fn into_altstack(self) -> SysResult<SigAltStack> {
+    fn into_altstack(self) -> KResult<SigAltStack> {
         let allowed_flags = SS_DISABLE | LINUX_SS_AUTODISARM;
         if self.flags & !allowed_flags != 0 || self.flags & SS_ONSTACK != 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         if self.flags & SS_DISABLE != 0 {
             return Ok(SigAltStack::disabled());
         }
         if self.size < MINSIGSTKSZ {
-            return Err(SysError::ENOMEM);
+            return Err(Errno::ENOMEM);
         }
         // UNFINISHED: SS_AUTODISARM is accepted for libc compatibility but this
         // kernel does not yet clear the altstack on handler entry.
@@ -220,13 +220,13 @@ fn signal_action_from_linux(raw: LinuxKernelSigAction) -> SignalAction {
     }
 }
 
-fn validate_kill_signum(signum: u32) -> SysResult<SignalFlags> {
-    SignalFlags::from_signum(signum).ok_or(SysError::EINVAL)
+fn validate_kill_signum(signum: u32) -> KResult<SignalFlags> {
+    SignalFlags::from_signum(signum).ok_or(Errno::EINVAL)
 }
 
-fn validate_action_signum(signum: u32) -> SysResult<usize> {
+fn validate_action_signum(signum: u32) -> KResult<usize> {
     if signum == 0 || signum as usize >= SIGNAL_INFO_SLOTS {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(signum as usize)
 }
@@ -246,15 +246,15 @@ fn find_task_in_process_by_linux_tid(tgid: usize, tid: usize) -> Option<Arc<Task
 fn process_by_visible_pid(
     pid: isize,
     caller: &Arc<ProcessControlBlock>,
-) -> SysResult<Arc<ProcessControlBlock>> {
+) -> KResult<Arc<ProcessControlBlock>> {
     if pid <= 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let namespace = caller.pid_namespace();
     processes_snapshot()
         .into_iter()
         .find(|process| process.pid_visible_from_namespace(namespace) == Some(pid as usize))
-        .ok_or(SysError::ESRCH)
+        .ok_or(Errno::ESRCH)
 }
 
 fn caller_can_signal_target(
@@ -303,9 +303,9 @@ fn queue_signal_to_process(
     }
 }
 
-fn sigqueue_info_from_user(signum: u32, info: *const LinuxSigInfo) -> SysResult<SignalInfo> {
+fn sigqueue_info_from_user(signum: u32, info: *const LinuxSigInfo) -> KResult<SignalInfo> {
     if info.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let sender_pid = current_process().getpid() as i32;
     let mut info = read_user_value(current_user_token(), info)?;
@@ -313,14 +313,14 @@ fn sigqueue_info_from_user(signum: u32, info: *const LinuxSigInfo) -> SysResult<
     Ok(info.to_signal_info(signum, sender_pid))
 }
 
-fn validate_sigqueue_info_code(target_is_current: bool, info: &SignalInfo) -> SysResult<()> {
+fn validate_sigqueue_info_code(target_is_current: bool, info: &SignalInfo) -> KResult<()> {
     if !target_is_current && (info.code >= 0 || info.code == SI_TKILL) {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     Ok(())
 }
 
-pub fn sys_rt_sigqueueinfo(pid: isize, signum: u32, info: *const LinuxSigInfo) -> SysResult {
+pub fn sys_rt_sigqueueinfo(pid: isize, signum: u32, info: *const LinuxSigInfo) -> KResult {
     let caller = current_process();
     let target = process_by_visible_pid(pid, &caller)?;
     let info = sigqueue_info_from_user(signum, info)?;
@@ -328,7 +328,7 @@ pub fn sys_rt_sigqueueinfo(pid: isize, signum: u32, info: *const LinuxSigInfo) -
     validate_sigqueue_info_code(caller.getpid() == target.getpid(), &info)?;
 
     if !caller_can_signal_target(&caller, &target, signal) {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     // UNFINISHED: Linux queues multiple realtime siginfo records and can return
     // EAGAIN at RLIMIT_SIGPENDING. This kernel stores one siginfo slot per
@@ -342,13 +342,13 @@ pub fn sys_rt_tgsigqueueinfo(
     tid: isize,
     signum: u32,
     info: *const LinuxSigInfo,
-) -> SysResult {
+) -> KResult {
     if tgid <= 0 || tid <= 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let task =
-        find_task_in_process_by_linux_tid(tgid as usize, tid as usize).ok_or(SysError::ESRCH)?;
-    let target_process = task.process.upgrade().ok_or(SysError::ESRCH)?;
+        find_task_in_process_by_linux_tid(tgid as usize, tid as usize).ok_or(Errno::ESRCH)?;
+    let target_process = task.process.upgrade().ok_or(Errno::ESRCH)?;
     let info = sigqueue_info_from_user(signum, info)?;
     let signal = validate_kill_signum(signum)?;
     let target_is_current = current_task().is_some_and(|task| task.linux_tid() == tid as usize);
@@ -356,7 +356,7 @@ pub fn sys_rt_tgsigqueueinfo(
 
     let caller = current_process();
     if !caller_can_signal_target(&caller, &target_process, signal) {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     // UNFINISHED: See sys_rt_sigqueueinfo(); realtime signal queue capacity is
     // not modeled yet.
@@ -364,12 +364,12 @@ pub fn sys_rt_tgsigqueueinfo(
     Ok(0)
 }
 
-pub fn sys_tkill(tid: isize, signum: u32) -> SysResult {
+pub fn sys_tkill(tid: isize, signum: u32) -> KResult {
     let signal = validate_kill_signum(signum)?;
     if tid < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
-    let (_, task) = find_task_by_linux_tid(tid as usize).ok_or(SysError::ESRCH)?;
+    let (_, task) = find_task_by_linux_tid(tid as usize).ok_or(Errno::ESRCH)?;
     if !signal.is_empty() {
         let sender_pid = current_process().getpid() as i32;
         queue_signal_to_task(task, signal, SignalInfo::tkill(signum as i32, sender_pid));
@@ -377,13 +377,13 @@ pub fn sys_tkill(tid: isize, signum: u32) -> SysResult {
     Ok(0)
 }
 
-pub fn sys_tgkill(tgid: isize, tid: isize, signum: u32) -> SysResult {
+pub fn sys_tgkill(tgid: isize, tid: isize, signum: u32) -> KResult {
     let signal = validate_kill_signum(signum)?;
     if tgid < 0 || tid < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let task =
-        find_task_in_process_by_linux_tid(tgid as usize, tid as usize).ok_or(SysError::ESRCH)?;
+        find_task_in_process_by_linux_tid(tgid as usize, tid as usize).ok_or(Errno::ESRCH)?;
     if !signal.is_empty() {
         let sender_pid = current_process().getpid() as i32;
         queue_signal_to_task(task, signal, SignalInfo::tkill(signum as i32, sender_pid));
@@ -397,13 +397,13 @@ pub fn sys_rt_sigaction_ctx(
     action: *const u8,
     old_action: *mut u8,
     sigsetsize: usize,
-) -> SysResult {
+) -> KResult {
     if sigsetsize != LINUX_RT_SIGSET_SIZE {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let signal_index = validate_action_signum(signum)?;
     if !action.is_null() && (signum == SIGKILL || signum == SIGSTOP) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let new_action = if action.is_null() {
@@ -434,9 +434,9 @@ pub fn sys_rt_sigprocmask_ctx(
     set: *const u8,
     old_set: *mut u8,
     sigsetsize: usize,
-) -> SysResult {
+) -> KResult {
     if sigsetsize != LINUX_RT_SIGSET_SIZE {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let new_set = if set.is_null() {
         None
@@ -457,15 +457,15 @@ pub fn sys_rt_sigprocmask_ctx(
             SIG_BLOCK => task_inner.signal_mask |= new_set,
             SIG_UNBLOCK => task_inner.signal_mask.remove(new_set),
             SIG_SETMASK => task_inner.signal_mask = new_set,
-            _ => return Err(SysError::EINVAL),
+            _ => return Err(Errno::EINVAL),
         }
     }
     Ok(0)
 }
 
-pub fn sys_rt_sigpending_ctx(ctx: &SyscallContext, set: *mut u8, sigsetsize: usize) -> SysResult {
+pub fn sys_rt_sigpending_ctx(ctx: &SyscallContext, set: *mut u8, sigsetsize: usize) -> KResult {
     if sigsetsize > LINUX_RT_SIGSET_SIZE {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let pending = {
         let task = ctx.task();
@@ -486,7 +486,7 @@ pub fn sys_sigaltstack_ctx(
     ctx: &SyscallContext,
     new_stack: *const u8,
     old_stack: *mut u8,
-) -> SysResult {
+) -> KResult {
     let task = ctx.task();
     #[cfg(target_arch = "riscv64")]
     let current_sp = current_trap_cx().x[2];
@@ -499,7 +499,7 @@ pub fn sys_sigaltstack_ctx(
     }
     if !new_stack.is_null() {
         if old.contains(current_sp) {
-            return Err(SysError::EPERM);
+            return Err(Errno::EPERM);
         }
         let new_raw = read_user_value_ctx(ctx, new_stack.cast::<LinuxStackT>())?;
         let new = new_raw.into_altstack()?;
@@ -508,10 +508,10 @@ pub fn sys_sigaltstack_ctx(
     Ok(0)
 }
 
-pub fn sys_rt_sigsuspend(mask: *const u8, sigsetsize: usize) -> SysResult {
+pub fn sys_rt_sigsuspend(mask: *const u8, sigsetsize: usize) -> KResult {
     let token = current_user_token();
     let new_mask = read_signal_set(token, mask, sigsetsize)?;
-    let task = current_task().ok_or(SysError::ESRCH)?;
+    let task = current_task().ok_or(Errno::ESRCH)?;
     let old_mask = {
         let mut task_inner = task.inner_exclusive_access();
         let old_mask = task_inner.signal_mask;
@@ -525,7 +525,7 @@ pub fn sys_rt_sigsuspend(mask: *const u8, sigsetsize: usize) -> SysResult {
             // user signal frame. Restoring here would let the handler run
             // under the wrong mask after sigsuspend returns EINTR.
             task.inner_exclusive_access().sigsuspend_restore_mask = Some(old_mask);
-            return Err(SysError::EINTR);
+            return Err(Errno::EINTR);
         }
         let (blocked_task, task_cx_ptr) = block_current_task_no_schedule();
         drop(blocked_task);
@@ -533,7 +533,7 @@ pub fn sys_rt_sigsuspend(mask: *const u8, sigsetsize: usize) -> SysResult {
     }
 }
 
-pub fn sys_rt_sigreturn() -> SysResult {
+pub fn sys_rt_sigreturn() -> KResult {
     crate::arch::signal::sys_rt_sigreturn()
 }
 
@@ -542,11 +542,11 @@ pub fn sys_rt_sigtimedwait(
     info: *mut LinuxSigInfo,
     timeout: *const LinuxTimeSpec,
     sigsetsize: usize,
-) -> SysResult {
+) -> KResult {
     let token = current_user_token();
     let wanted = read_signal_set(token, set, sigsetsize)?;
     if !timeout.is_null() && (timeout as usize) < size_of::<LinuxTimeSpec>() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let deadline_ms = relative_timeout_deadline_ms(token, timeout)?;
 
@@ -564,13 +564,13 @@ pub fn sys_rt_sigtimedwait(
         }
 
         if current_has_interrupting_signal() {
-            return Err(SysError::EINTR);
+            return Err(Errno::EINTR);
         }
 
         if let Some(deadline_ms) = deadline_ms
             && get_time_ms() >= deadline_ms
         {
-            return Err(SysError::EAGAIN);
+            return Err(Errno::EAGAIN);
         }
 
         let interrupts_enabled = interrupt::supervisor_interrupt_enabled();

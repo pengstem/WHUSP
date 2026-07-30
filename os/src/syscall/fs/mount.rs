@@ -11,7 +11,6 @@ use crate::fs::{
 use crate::task::{CAP_SYS_ADMIN, current_process, current_user_token};
 use alloc::string::String;
 
-use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{PATH_MAX, read_user_c_string};
 use super::fd::{get_file_by_fd, install_file_fd};
 use super::inotify::inotify_notify_unmount;
@@ -20,6 +19,7 @@ use super::path::{
     resolve_at_path,
 };
 use super::uapi::{AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW};
+use crate::uapi::errno::{Errno, KResult};
 
 const MS_RDONLY: usize = 1;
 const MS_REMOUNT: usize = 32;
@@ -100,9 +100,9 @@ struct VirtioBlockSource {
 // Linux-visible `/dev/vd*` names map onto DTB discovery order: `/dev/vda` is
 // contest x0, `/dev/vdb` is x1 if attached. Partition suffixes are 1-based MBR
 // slots and are interpreted by the filesystem mount layer.
-fn parse_virtio_block_source(source: &str) -> SysResult<VirtioBlockSource> {
+fn parse_virtio_block_source(source: &str) -> KResult<VirtioBlockSource> {
     let Some(suffix) = source.strip_prefix("/dev/vd") else {
-        return Err(SysError::ENODEV);
+        return Err(Errno::ENODEV);
     };
     let bytes = suffix.as_bytes();
     if bytes.len() == 1 && bytes[0].is_ascii_lowercase() {
@@ -113,13 +113,13 @@ fn parse_virtio_block_source(source: &str) -> SysResult<VirtioBlockSource> {
     }
     if bytes.len() > 1 && bytes[0].is_ascii_lowercase() && bytes[1..].iter().all(u8::is_ascii_digit)
     {
-        let partition_index = source[8..].parse::<usize>().map_err(|_| SysError::ENODEV)?;
+        let partition_index = source[8..].parse::<usize>().map_err(|_| Errno::ENODEV)?;
         return Ok(VirtioBlockSource {
             device_index: (bytes[0] - b'a') as usize,
             partition_index: Some(partition_index),
         });
     }
-    Err(SysError::ENODEV)
+    Err(Errno::ENODEV)
 }
 
 fn parse_loop_block_source(source: &str) -> Option<usize> {
@@ -130,18 +130,18 @@ fn parse_loop_block_source(source: &str) -> Option<usize> {
     suffix.parse::<usize>().ok()
 }
 
-fn mount_error_to_errno(error: MountError) -> SysError {
+fn mount_error_to_errno(error: MountError) -> Errno {
     match error {
-        MountError::SourceMissing => SysError::ENODEV,
-        MountError::InvalidFilesystem | MountError::InvalidArgument => SysError::EINVAL,
-        MountError::InvalidTarget => SysError::ENOENT,
-        MountError::TargetBusy | MountError::StaticRoot => SysError::EBUSY,
-        MountError::TargetNotMounted => SysError::EINVAL,
-        MountError::ExpirePending => SysError::EAGAIN,
+        MountError::SourceMissing => Errno::ENODEV,
+        MountError::InvalidFilesystem | MountError::InvalidArgument => Errno::EINVAL,
+        MountError::InvalidTarget => Errno::ENOENT,
+        MountError::TargetBusy | MountError::StaticRoot => Errno::EBUSY,
+        MountError::TargetNotMounted => Errno::EINVAL,
+        MountError::ExpirePending => Errno::EAGAIN,
     }
 }
 
-fn apply_mount_stat_flags(mount_id: MountId, flags: usize) -> SysResult {
+fn apply_mount_stat_flags(mount_id: MountId, flags: usize) -> KResult {
     set_mount_stat_flags(mount_id, mount_stat_flags_from_linux_mount_flags(flags))
         .map_err(mount_error_to_errno)
         .map(|_| 0)
@@ -153,9 +153,9 @@ fn source_node_kind(snapshot: &crate::task::PathSnapshot, source: &str) -> Optio
         .map(|path| path.kind)
 }
 
-fn fs_context_error_to_errno(error: FsContextStateError) -> SysError {
+fn fs_context_error_to_errno(error: FsContextStateError) -> Errno {
     match error {
-        FsContextStateError::NotCreated | FsContextStateError::AlreadyMounted => SysError::EBUSY,
+        FsContextStateError::NotCreated | FsContextStateError::AlreadyMounted => Errno::EBUSY,
     }
 }
 
@@ -168,12 +168,12 @@ fn current_has_sys_admin() -> bool {
             .unwrap_or(false)
 }
 
-fn require_sys_admin() -> SysResult<()> {
+fn require_sys_admin() -> KResult<()> {
     if !current_has_sys_admin() {
         // UNFINISHED: Linux checks CAP_SYS_ADMIN in the caller's user
         // namespace. This kernel has one process-wide capability set, so root
         // with the stored CAP_SYS_ADMIN bit is the current privileged model.
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     Ok(())
 }
@@ -191,7 +191,7 @@ fn install_open_tree_path_fd(
     path: &str,
     flags: u32,
     open_flags: OpenFlags,
-) -> SysResult {
+) -> KResult {
     let snapshot = current_process().path_snapshot();
     match resolve_at_path(&snapshot, dirfd, path, flags & AT_EMPTY_PATH as u32 != 0)? {
         AtPath::Empty(empty) => {
@@ -207,7 +207,7 @@ fn install_open_tree_path_fd(
     }
 }
 
-fn open_tree_source_dir(dirfd: isize, path: &str, flags: u32) -> SysResult<(WorkingDir, String)> {
+fn open_tree_source_dir(dirfd: isize, path: &str, flags: u32) -> KResult<(WorkingDir, String)> {
     let snapshot = current_process().path_snapshot();
     match resolve_at_path(&snapshot, dirfd, path, flags & AT_EMPTY_PATH as u32 != 0)? {
         AtPath::Empty(empty) => Ok((empty.working_dir()?, empty.dir_path_or_fd(dirfd))),
@@ -221,7 +221,7 @@ fn open_tree_source_dir(dirfd: isize, path: &str, flags: u32) -> SysResult<(Work
     }
 }
 
-fn move_mount_target(dirfd: isize, path: &str, flags: u32) -> SysResult<(WorkingDir, String)> {
+fn move_mount_target(dirfd: isize, path: &str, flags: u32) -> KResult<(WorkingDir, String)> {
     let snapshot = current_process().path_snapshot();
     match resolve_at_path(&snapshot, dirfd, path, flags & MOVE_MOUNT_T_EMPTY_PATH != 0)? {
         AtPath::Empty(empty) => Ok((empty.working_dir()?, empty.dir_path_or_fd(dirfd))),
@@ -268,12 +268,12 @@ fn propagation_from_flags(flags: usize) -> MountPropagation {
     }
 }
 
-pub fn sys_open_tree(dirfd: isize, path: *const u8, flags: u32) -> SysResult {
+pub fn sys_open_tree(dirfd: isize, path: *const u8, flags: u32) -> KResult {
     if flags & !VALID_OPEN_TREE_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags & AT_RECURSIVE != 0 && flags & OPEN_TREE_CLONE == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let token = current_user_token();
@@ -309,9 +309,9 @@ pub fn sys_move_mount(
     to_dirfd: isize,
     to_path: *const u8,
     flags: u32,
-) -> SysResult {
+) -> KResult {
     if flags & !MOVE_MOUNT_MASK != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     require_sys_admin()?;
 
@@ -322,14 +322,14 @@ pub fn sys_move_mount(
         // UNFINISHED: move_mount() can move attached mount objects selected by
         // pathname. This implementation only supports fd-selected detached
         // mount objects, which is the new-mount-API path used by LTP here.
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
 
     let file = get_file_by_fd(from_dirfd as usize)?;
     let detached = file
         .as_any()
         .downcast_ref::<DetachedMountFile>()
-        .ok_or(SysError::EBADF)?;
+        .ok_or(Errno::EBADF)?;
     let (target, target_path) = move_mount_target(to_dirfd, to_path.as_str(), flags)?;
     detached
         .attach_to(
@@ -341,14 +341,14 @@ pub fn sys_move_mount(
     Ok(0)
 }
 
-pub fn sys_fsopen(fs_name: *const u8, flags: u32) -> SysResult {
+pub fn sys_fsopen(fs_name: *const u8, flags: u32) -> KResult {
     if flags & !FSOPEN_CLOEXEC != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let token = current_user_token();
     let fs_name = read_user_c_string(token, fs_name, PATH_MAX)?;
     if !supported_fs_context(fs_name.as_str()) {
-        return Err(SysError::ENODEV);
+        return Err(Errno::ENODEV);
     }
     let file = FsContextFile::new(fs_name);
     install_file_fd(
@@ -358,53 +358,53 @@ pub fn sys_fsopen(fs_name: *const u8, flags: u32) -> SysResult {
     )
 }
 
-pub fn sys_fsconfig(fd: isize, cmd: u32, key: *const u8, value: *const u8, aux: i32) -> SysResult {
+pub fn sys_fsconfig(fd: isize, cmd: u32, key: *const u8, value: *const u8, aux: i32) -> KResult {
     if fd < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
-    let file = get_file_by_fd(fd as usize).map_err(|_| SysError::EINVAL)?;
+    let file = get_file_by_fd(fd as usize).map_err(|_| Errno::EINVAL)?;
     let context = file
         .as_any()
         .downcast_ref::<FsContextFile>()
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
     let token = current_user_token();
 
     match cmd {
         FSCONFIG_SET_FLAG => {
             if key.is_null() || !value.is_null() || aux != 0 {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             let key = read_user_c_string(token, key, PATH_MAX)?;
             if !context.set_flag(key.as_str()) {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             Ok(0)
         }
         FSCONFIG_SET_STRING => {
             if key.is_null() || value.is_null() || aux != 0 {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             let key = read_user_c_string(token, key, PATH_MAX)?;
             let value = read_user_c_string(token, value, PATH_MAX)?;
             if !context.set_string(key.as_str(), value.as_str()) {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             Ok(0)
         }
         FSCONFIG_SET_BINARY => {
             if key.is_null() || value.is_null() || aux <= 0 {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
-            Err(SysError::ENOTSUP)
+            Err(Errno::ENOTSUP)
         }
         FSCONFIG_SET_PATH | FSCONFIG_SET_PATH_EMPTY => {
             if key.is_null() || value.is_null() || aux < 0 && aux != AT_FDCWD as i32 {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             let key = read_user_c_string(token, key, PATH_MAX)?;
             let value = read_user_c_string(token, value, PATH_MAX)?;
             if key.is_empty() || value.is_empty() && cmd == FSCONFIG_SET_PATH {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             // CONTEXT: The current fs-context object only needs to carry the
             // source string into `fsmount()`. Accept path-valued options as
@@ -414,45 +414,45 @@ pub fn sys_fsconfig(fd: isize, cmd: u32, key: *const u8, value: *const u8, aux: 
         }
         FSCONFIG_SET_FD => {
             if key.is_null() || !value.is_null() || aux < 0 {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             let key = read_user_c_string(token, key, PATH_MAX)?;
             if key.is_empty() {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
-            get_file_by_fd(aux as usize).map_err(|_| SysError::EBADF)?;
+            get_file_by_fd(aux as usize).map_err(|_| Errno::EBADF)?;
             // CONTEXT: fd-valued fsconfig options are accepted for API
             // coverage, but no current in-kernel filesystem consumes them.
             Ok(0)
         }
         FSCONFIG_CMD_CREATE => {
             if !key.is_null() || !value.is_null() || aux != 0 {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             context.mark_created();
             Ok(0)
         }
         FSCONFIG_CMD_RECONFIGURE => {
             if !key.is_null() || !value.is_null() || aux != 0 {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
-            Err(SysError::ENOTSUP)
+            Err(Errno::ENOTSUP)
         }
-        _ => Err(SysError::ENOTSUP),
+        _ => Err(Errno::ENOTSUP),
     }
 }
 
-pub fn sys_fsmount(fd: isize, flags: u32, mount_attrs: u32) -> SysResult {
+pub fn sys_fsmount(fd: isize, flags: u32, mount_attrs: u32) -> KResult {
     if fd < 0 {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     let file = get_file_by_fd(fd as usize)?;
     let context = file
         .as_any()
         .downcast_ref::<FsContextFile>()
-        .ok_or(SysError::EBADF)?;
+        .ok_or(Errno::EBADF)?;
     if flags & !FSMOUNT_CLOEXEC != 0 || mount_attrs & !VALID_FSMOUNT_ATTRS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     require_sys_admin()?;
     // CONTEXT: LTP passes MOUNT_ATTR_* values while checking the fd-based
@@ -471,9 +471,9 @@ pub fn sys_fsmount(fd: isize, flags: u32, mount_attrs: u32) -> SysResult {
     install_file_fd(detached, open_flags, None)
 }
 
-pub fn sys_fspick(dirfd: isize, path: *const u8, flags: u32) -> SysResult {
+pub fn sys_fspick(dirfd: isize, path: *const u8, flags: u32) -> KResult {
     if flags & !FSPICK_VALID_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let token = current_user_token();
@@ -502,7 +502,7 @@ pub fn sys_mount(
     fstype: *const u8,
     flags: usize,
     data: *const u8,
-) -> SysResult {
+) -> KResult {
     let token = current_user_token();
     let target = read_user_c_string(token, target, PATH_MAX)?;
     let read_only = flags & MS_RDONLY != 0;
@@ -519,16 +519,16 @@ pub fn sys_mount(
         snapshot.cwd_path.as_str(),
         target.as_str(),
     )
-    .ok_or(SysError::ENOENT)?;
+    .ok_or(Errno::ENOENT)?;
 
     let propagation_flags = flags & MS_PROPAGATION_MASK;
     let propagation_change = if propagation_flags != 0 {
         if propagation_flags.count_ones() != 1 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         let allowed_flags = MS_PROPAGATION_MASK | MS_PROPAGATION_ALLOWED_EXTRAS | MS_BIND;
         if flags & !allowed_flags != 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         Some(propagation_from_flags(flags))
     } else {
@@ -560,7 +560,7 @@ pub fn sys_mount(
             snapshot.cwd_path.as_str(),
             source.as_str(),
         )
-        .ok_or(SysError::ENOENT)?;
+        .ok_or(Errno::ENOENT)?;
         move_mount_at(
             namespace_id,
             source_dir,
@@ -580,7 +580,7 @@ pub fn sys_mount(
             snapshot.cwd_path.as_str(),
             source.as_str(),
         )
-        .ok_or(SysError::ENOENT)?;
+        .ok_or(Errno::ENOENT)?;
         mount_bind_at(
             namespace_id,
             source_dir,
@@ -612,13 +612,13 @@ pub fn sys_mount(
         return Ok(0);
     }
     if fstype.is_null() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let fstype = read_user_c_string(token, fstype, PATH_MAX)?;
     match fstype.as_str() {
         "ext2" | "ext3" | "ext4" => {
             if source.is_null() {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             let source = read_user_c_string(token, source, PATH_MAX)?;
             let ext_fs_type = match fstype.as_str() {
@@ -628,10 +628,10 @@ pub fn sys_mount(
             };
             if let Some(loop_id) = parse_loop_block_source(source.as_str()) {
                 if !loop_device_is_attached(loop_id) {
-                    return Err(SysError::ENODEV);
+                    return Err(Errno::ENODEV);
                 }
                 if loop_device_is_read_only(loop_id) && !read_only {
-                    return Err(SysError::EACCES);
+                    return Err(Errno::EACCES);
                 }
                 // CONTEXT: LTP all-filesystem syscall tests format a temporary
                 // loop device and then mount it as scratch space. Until this
@@ -658,7 +658,7 @@ pub fn sys_mount(
                 source_node_kind(&snapshot, source.as_str()),
                 Some(FsNodeKind::CharacterDevice)
             ) {
-                return Err(SysError::ENOTBLK);
+                return Err(Errno::ENOTBLK);
             }
             if fstype.as_str() != "ext4" {
                 // CONTEXT: LTP probes kernel filesystem support with
@@ -670,12 +670,12 @@ pub fn sys_mount(
                 // UNFINISHED: real ext2/ext3 block-device mounting is not
                 // implemented; loop-backed scratch mounts use a tmpfs-backed
                 // compatibility mount with ext superblock magic.
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             let block_source =
-                parse_virtio_block_source(source.as_str()).map_err(|_| SysError::EINVAL)?;
+                parse_virtio_block_source(source.as_str()).map_err(|_| Errno::EINVAL)?;
             if block_source.partition_index.is_some() {
-                return Err(SysError::ENOTBLK);
+                return Err(Errno::ENOTBLK);
             }
             mount_block_device_at(
                 namespace_id,
@@ -688,12 +688,12 @@ pub fn sys_mount(
         }
         "vfat" | "fat32" | "fat" => {
             if source.is_null() {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             let source = read_user_c_string(token, source, PATH_MAX)?;
             if let Some(loop_id) = parse_loop_block_source(source.as_str()) {
                 if !loop_device_is_attached(loop_id) {
-                    return Err(SysError::ENODEV);
+                    return Err(Errno::ENODEV);
                 }
                 // CONTEXT: LTP may format a loop device as FAT only to obtain
                 // scratch directory semantics for the syscall under test.
@@ -765,10 +765,8 @@ pub fn sys_mount(
             } else {
                 read_user_c_string(token, data, PATH_MAX)?
             };
-            let lower =
-                overlay_option_value(options.as_str(), "lowerdir=").ok_or(SysError::EINVAL)?;
-            let upper =
-                overlay_option_value(options.as_str(), "upperdir=").ok_or(SysError::EINVAL)?;
+            let lower = overlay_option_value(options.as_str(), "lowerdir=").ok_or(Errno::EINVAL)?;
+            let upper = overlay_option_value(options.as_str(), "upperdir=").ok_or(Errno::EINVAL)?;
             let lower_dir = lookup_existing_dir_in(snapshot.context.clone(), lower)?;
             let upper_dir = lookup_existing_dir_in(snapshot.context.clone(), upper)?;
             mount_overlay_compat_at(
@@ -783,16 +781,16 @@ pub fn sys_mount(
         }
         "nfs" => {
             if source.is_null() {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             let source = read_user_c_string(token, source, PATH_MAX)?;
-            let server_path = source.strip_prefix(':').ok_or(SysError::EINVAL)?;
+            let server_path = source.strip_prefix(':').ok_or(Errno::EINVAL)?;
             let source_path = normalize_path_at_root(
                 snapshot.root_path.as_str(),
                 snapshot.cwd_path.as_str(),
                 server_path,
             )
-            .ok_or(SysError::ENOENT)?;
+            .ok_or(Errno::ENOENT)?;
             let source_dir =
                 lookup_existing_dir_in(snapshot.context.clone(), source_path.as_str())?;
             mount_nfs_compat_at(
@@ -804,7 +802,7 @@ pub fn sys_mount(
             )
             .map_err(mount_error_to_errno)?;
         }
-        "error" => return Err(SysError::ENODEV),
+        "error" => return Err(Errno::ENODEV),
         _ => {
             // CONTEXT: Several BusyBox/LTP setup paths mount scratch or pseudo
             // filesystems by name before using only directory semantics. Keep a
@@ -825,13 +823,13 @@ fn overlay_option_value<'a>(options: &'a str, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
-pub fn sys_umount2(target: *const u8, flags: i32) -> SysResult {
+pub fn sys_umount2(target: *const u8, flags: i32) -> KResult {
     require_sys_admin()?;
     if flags & !VALID_UMOUNT_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags & MNT_EXPIRE != 0 && flags & (MNT_FORCE | MNT_DETACH) != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     // UNFINISHED: MNT_FORCE is accepted but does not force-close remote or
     // busy filesystems because this kernel does not model those backends yet.
@@ -845,7 +843,7 @@ pub fn sys_umount2(target: *const u8, flags: i32) -> SysResult {
         && lookup_path_in(snapshot.context.clone(), target.as_str(), false)?.kind
             == FsNodeKind::Symlink
     {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let target_dir = lookup_mount_target_dir_in(snapshot.context.clone(), target.as_str())?;
     let target_path = normalize_path_at_root(
@@ -853,7 +851,7 @@ pub fn sys_umount2(target: *const u8, flags: i32) -> SysResult {
         snapshot.cwd_path.as_str(),
         target.as_str(),
     )
-    .ok_or(SysError::ENOENT)?;
+    .ok_or(Errno::ENOENT)?;
     let mounted_source = mounted_source_at(snapshot.context.namespace_id(), target_dir);
     unmount_at(
         snapshot.context.namespace_id(),

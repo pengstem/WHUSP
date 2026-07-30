@@ -1,4 +1,3 @@
-use super::errno::{SysError, SysResult};
 use super::user_ptr::{copy_to_user, read_user_array, read_user_value, write_user_value};
 use crate::perf;
 use crate::sync::UPIntrFreeCell;
@@ -8,6 +7,7 @@ use crate::task::{
     current_has_deliverable_signal, current_process, current_task, current_user_token,
     exit_current_group_and_run_next, schedule, wakeup_task,
 };
+use crate::uapi::errno::{Errno, KResult};
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
@@ -561,7 +561,7 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(MsgManager::new()) };
 }
 
-pub(super) fn sys_msgget(key: isize, msgflg: i32) -> SysResult {
+pub(super) fn sys_msgget(key: isize, msgflg: i32) -> KResult {
     let process = current_process();
     let credentials = process.credentials();
     let caller = msg_caller_from(process.getpid(), &credentials);
@@ -576,7 +576,7 @@ pub(super) fn sys_msgget(key: isize, msgflg: i32) -> SysResult {
         .map_err(msg_error_to_sys_error)
 }
 
-pub(super) fn sys_msgctl(msqid: usize, cmd: i32, buf: usize) -> SysResult {
+pub(super) fn sys_msgctl(msqid: usize, cmd: i32, buf: usize) -> KResult {
     let process = current_process();
     let credentials = process.credentials();
     let caller = msg_caller_from(process.getpid(), &credentials);
@@ -634,18 +634,18 @@ pub(super) fn sys_msgctl(msqid: usize, cmd: i32, buf: usize) -> SysResult {
             write_msqid_ds(buf, stat)?;
             Ok(real_msqid as isize)
         }
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
-pub(super) fn sys_msgsnd(msqid: usize, msgp: *const u8, msgsz: usize, msgflg: i32) -> SysResult {
+pub(super) fn sys_msgsnd(msqid: usize, msgp: *const u8, msgsz: usize, msgflg: i32) -> KResult {
     if (msgsz as isize) < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let token = current_user_token();
     let mtype: isize = read_user_value(token, msgp as *const isize)?;
     if mtype <= 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let text = read_user_array(
         token,
@@ -670,9 +670,9 @@ pub(super) fn sys_msgrcv(
     msgsz: usize,
     msgtyp: isize,
     msgflg: i32,
-) -> SysResult {
+) -> KResult {
     if (msgsz as isize) < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let process = current_process();
     let caller = msg_caller_from(process.getpid(), &process.credentials());
@@ -690,7 +690,7 @@ fn try_or_block_msgsnd(
     message: Message,
     flags: i32,
     caller: &MsgCaller,
-) -> Result<MsgAttempt, SysError> {
+) -> Result<MsgAttempt, Errno> {
     let mut manager = MSG_MANAGER.exclusive_access();
     match manager.send(msqid, message, flags, caller) {
         Ok(()) => Ok(MsgAttempt::Done(0)),
@@ -709,7 +709,7 @@ fn try_or_block_msgrcv(
     msgsz: usize,
     flags: i32,
     caller: &MsgCaller,
-) -> Result<MsgAttempt, SysError> {
+) -> Result<MsgAttempt, Errno> {
     let mut manager = MSG_MANAGER.exclusive_access();
     match manager.receive(msqid, msgtyp, msgsz, flags, caller) {
         Ok(message) => {
@@ -725,24 +725,24 @@ fn try_or_block_msgrcv(
     }
 }
 
-fn post_msg_sleep_cleanup(msqid: usize) -> SysResult<()> {
+fn post_msg_sleep_cleanup(msqid: usize) -> KResult<()> {
     let Some(task) = current_task() else {
-        return Err(SysError::EINTR);
+        return Err(Errno::EINTR);
     };
     MSG_MANAGER.exclusive_access().remove_waiter_for_task(&task);
     if let Some((exit_code, _message)) = check_signals_of_current() {
         exit_current_group_and_run_next(exit_code);
     }
     if current_has_deliverable_signal() {
-        return Err(SysError::EINTR);
+        return Err(Errno::EINTR);
     }
     if !MSG_MANAGER.exclusive_access().queues.contains_key(&msqid) {
-        return Err(SysError::EIDRM);
+        return Err(Errno::EIDRM);
     }
     Ok(())
 }
 
-fn write_message_to_user(msgp: *mut u8, message: &Message, copy_len: usize) -> SysResult<isize> {
+fn write_message_to_user(msgp: *mut u8, message: &Message, copy_len: usize) -> KResult<isize> {
     let token = current_user_token();
     write_user_value(token, msgp as *mut isize, &message.mtype)?;
     copy_to_user(
@@ -753,7 +753,7 @@ fn write_message_to_user(msgp: *mut u8, message: &Message, copy_len: usize) -> S
     Ok(copy_len as isize)
 }
 
-fn write_msqid_ds(buf: usize, stat: MsgQueueStat) -> SysResult<()> {
+fn write_msqid_ds(buf: usize, stat: MsgQueueStat) -> KResult<()> {
     let ds = LinuxMsqid64Ds {
         msg_perm: LinuxIpc64Perm {
             key: stat.key as i32,
@@ -866,18 +866,18 @@ fn msg_caller_from(pid: usize, credentials: &crate::task::Credentials) -> MsgCal
     }
 }
 
-fn msg_error_to_sys_error(error: MsgError) -> SysError {
+fn msg_error_to_sys_error(error: MsgError) -> Errno {
     match error {
-        MsgError::NotFound => SysError::ENOENT,
-        MsgError::Exists => SysError::EEXIST,
-        MsgError::Invalid => SysError::EINVAL,
-        MsgError::NoSpace => SysError::ENOSPC,
-        MsgError::AccessDenied => SysError::EACCES,
-        MsgError::NotPermitted => SysError::EPERM,
-        MsgError::TooBig => SysError::E2BIG,
-        MsgError::NoMessage => SysError::ENOMSG,
-        MsgError::WouldBlock => SysError::EAGAIN,
-        MsgError::Interrupted => SysError::EINTR,
+        MsgError::NotFound => Errno::ENOENT,
+        MsgError::Exists => Errno::EEXIST,
+        MsgError::Invalid => Errno::EINVAL,
+        MsgError::NoSpace => Errno::ENOSPC,
+        MsgError::AccessDenied => Errno::EACCES,
+        MsgError::NotPermitted => Errno::EPERM,
+        MsgError::TooBig => Errno::E2BIG,
+        MsgError::NoMessage => Errno::ENOMSG,
+        MsgError::WouldBlock => Errno::EAGAIN,
+        MsgError::Interrupted => Errno::EINTR,
     }
 }
 

@@ -1,4 +1,3 @@
-use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
     PATH_MAX, copy_to_user, read_user_c_string, read_user_value, write_user_value,
 };
@@ -7,6 +6,7 @@ use super::path::{AtPath, open_flags_from_user_bits, path_context_from, resolve_
 use super::uapi::{AT_EMPTY_PATH, AT_FDCWD};
 use crate::fs::{FsError, MountId, VfsNodeId, lookup_path_in, open_file_handle_node};
 use crate::task::{current_process, current_user_token};
+use crate::uapi::errno::{Errno, KResult};
 
 const AT_HANDLE_FID: i32 = 0x200;
 const NAME_TO_HANDLE_AT_SYMLINK_FOLLOW: i32 = 0x400;
@@ -51,11 +51,11 @@ pub(crate) fn write_file_handle_record(record: &mut [u8], node: VfsNodeId) {
     record[FILE_HANDLE_HEADER_LEN..WHUSP_FILE_HANDLE_RECORD_LEN].copy_from_slice(&payload);
 }
 
-fn resolve_handle_node(dirfd: isize, path: &str, flags: i32) -> SysResult<VfsNodeId> {
+fn resolve_handle_node(dirfd: isize, path: &str, flags: i32) -> KResult<VfsNodeId> {
     let follow_final_symlink = flags & NAME_TO_HANDLE_AT_SYMLINK_FOLLOW != 0;
     let snapshot = current_process().path_snapshot();
     match resolve_at_path(&snapshot, dirfd, path, flags & AT_EMPTY_PATH != 0)? {
-        AtPath::Empty(empty) => empty.file().vfs_node_id().ok_or(SysError::EBADF),
+        AtPath::Empty(empty) => empty.file().vfs_node_id().ok_or(Errno::EBADF),
         AtPath::Path(path) => {
             let context = path_context_from(&snapshot, dirfd, path)?;
             Ok(lookup_path_in(context, path, follow_final_symlink)?.node)
@@ -69,12 +69,12 @@ pub fn sys_name_to_handle_at(
     handle: *mut u8,
     mount_id: *mut i32,
     flags: i32,
-) -> SysResult {
+) -> KResult {
     if flags & !VALID_NAME_TO_HANDLE_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if handle.is_null() || mount_id.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
 
     let token = current_user_token();
@@ -83,7 +83,7 @@ pub fn sys_name_to_handle_at(
     let mut header: LinuxFileHandleHeader =
         read_user_value(token, handle as *const LinuxFileHandleHeader)?;
     if header.handle_bytes > MAX_HANDLE_SZ {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let mount_id_value = node.mount_id.0 as i32;
@@ -91,7 +91,7 @@ pub fn sys_name_to_handle_at(
     if header.handle_bytes < WHUSP_FILE_HANDLE_BYTES as u32 {
         header.handle_bytes = WHUSP_FILE_HANDLE_BYTES as u32;
         write_user_value(token, handle as *mut LinuxFileHandleHeader, &header)?;
-        return Err(SysError::EOVERFLOW);
+        return Err(Errno::EOVERFLOW);
     }
 
     header.handle_bytes = WHUSP_FILE_HANDLE_BYTES as u32;
@@ -105,14 +105,14 @@ pub fn sys_name_to_handle_at(
 fn decode_file_handle_node(
     header: LinuxFileHandleHeader,
     payload: [u8; WHUSP_FILE_HANDLE_BYTES],
-) -> SysResult<VfsNodeId> {
+) -> KResult<VfsNodeId> {
     if header.handle_bytes == 0 || header.handle_bytes > MAX_HANDLE_SZ {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if header.handle_type != WHUSP_FILE_HANDLE_TYPE
         || header.handle_bytes != WHUSP_FILE_HANDLE_BYTES as u32
     {
-        return Err(SysError::ESTALE);
+        return Err(Errno::ESTALE);
     }
 
     let mut mount_bytes = [0u8; 8];
@@ -122,14 +122,14 @@ fn decode_file_handle_node(
     ino_bytes.copy_from_slice(&payload[8..16]);
     let ino = u64::from_ne_bytes(ino_bytes);
     if mount_id > usize::MAX as u64 || ino > u32::MAX as u64 {
-        return Err(SysError::ESTALE);
+        return Err(Errno::ESTALE);
     }
     Ok(VfsNodeId::new(MountId(mount_id as usize), ino as u32))
 }
 
-fn read_file_handle_node(token: usize, handle: *const u8) -> SysResult<VfsNodeId> {
+fn read_file_handle_node(token: usize, handle: *const u8) -> KResult<VfsNodeId> {
     if handle.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let header = read_user_value(token, handle as *const LinuxFileHandleHeader)?;
     let payload = read_user_value(
@@ -144,16 +144,16 @@ fn read_file_handle_node(token: usize, handle: *const u8) -> SysResult<VfsNodeId
     decode_file_handle_node(header, payload)
 }
 
-fn mount_id_from_open_by_handle_fd(mount_fd: isize) -> SysResult<MountId> {
+fn mount_id_from_open_by_handle_fd(mount_fd: isize) -> KResult<MountId> {
     if mount_fd == AT_FDCWD {
         return Ok(current_process().path_snapshot().context.cwd().mount_id());
     }
     if mount_fd < 0 {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     get_file_by_fd(mount_fd as usize)?
         .vfs_mount_id()
-        .ok_or(SysError::ESTALE)
+        .ok_or(Errno::ESTALE)
 }
 
 fn current_has_dac_read_search() -> bool {
@@ -165,22 +165,22 @@ fn current_has_dac_read_search() -> bool {
             .unwrap_or(false)
 }
 
-fn open_handle_error(error: FsError) -> SysError {
+fn open_handle_error(error: FsError) -> Errno {
     match error {
-        FsError::NotFound => SysError::ESTALE,
+        FsError::NotFound => Errno::ESTALE,
         error => error.into(),
     }
 }
 
-pub fn sys_open_by_handle_at(mount_fd: isize, handle: *const u8, flags: u32) -> SysResult {
+pub fn sys_open_by_handle_at(mount_fd: isize, handle: *const u8, flags: u32) -> KResult {
     let token = current_user_token();
     let node = read_file_handle_node(token, handle)?;
     let mount_id = mount_id_from_open_by_handle_fd(mount_fd)?;
     if mount_id != node.mount_id {
-        return Err(SysError::ESTALE);
+        return Err(Errno::ESTALE);
     }
     if !current_has_dac_read_search() {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
 
     let flags = open_flags_from_user_bits(flags)?;

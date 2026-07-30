@@ -4,24 +4,24 @@ use crate::task::{current_process, current_user_token};
 use alloc::collections::BTreeSet;
 use lazy_static::lazy_static;
 
-use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{PATH_MAX, read_user_c_string};
 use super::path_context_from;
 use super::uapi::AT_FDCWD;
+use crate::uapi::errno::{Errno, KResult};
 
 lazy_static! {
     static ref ACTIVE_SWAP_FILES: SleepMutex<BTreeSet<(u64, u64)>> =
         SleepMutex::new(BTreeSet::new());
 }
 
-fn resolve_swap_path(pathname: *const u8) -> SysResult<FileStat> {
+fn resolve_swap_path(pathname: *const u8) -> KResult<FileStat> {
     if pathname.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let token = current_user_token();
     let path = read_user_c_string(token, pathname, PATH_MAX)?;
     if path.is_empty() {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
     let snapshot = current_process().path_snapshot();
     let stat = stat_in(
@@ -30,7 +30,7 @@ fn resolve_swap_path(pathname: *const u8) -> SysResult<FileStat> {
         true,
     )?;
     if stat.mode & S_IFMT != S_IFREG {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(stat)
 }
@@ -42,13 +42,13 @@ pub(crate) fn is_active_swap_file(stat: FileStat) -> bool {
 // CONTEXT: The kernel has no paging-to-swap implementation yet. LTP setup only
 // needs swapon/swapoff to mark a regular file as swap-active so later writes,
 // including copy_file_range(), observe Linux's ETXTBSY protection.
-pub fn sys_swapon(pathname: *const u8, _flags: u32) -> SysResult {
+pub fn sys_swapon(pathname: *const u8, _flags: u32) -> KResult {
     let stat = resolve_swap_path(pathname)?;
     ACTIVE_SWAP_FILES.lock().insert((stat.dev, stat.ino));
     Ok(0)
 }
 
-pub fn sys_swapoff(pathname: *const u8) -> SysResult {
+pub fn sys_swapoff(pathname: *const u8) -> KResult {
     let stat = resolve_swap_path(pathname)?;
     ACTIVE_SWAP_FILES.lock().remove(&(stat.dev, stat.ino));
     Ok(0)

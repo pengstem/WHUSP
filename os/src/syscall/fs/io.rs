@@ -14,7 +14,6 @@ use core::mem::size_of;
 use core::ptr::read_volatile;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
     UserBufferAccess, read_user_array, read_user_array_ctx, read_user_value,
     read_user_value_with_mmap_fault, translated_byte_buffer_checked_with_mmap_fault,
@@ -23,7 +22,9 @@ use super::super::user_ptr::{
 use super::fanotify::{fanotify_notify_access, fanotify_notify_modify};
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd, get_file_by_fd_for_process};
 use super::inotify::{inotify_notify_access, inotify_notify_modify};
-use super::uapi::{IOV_MAX, LinuxIovec};
+use super::uapi::IOV_MAX;
+use crate::uapi::errno::{Errno, KResult};
+use crate::uapi::linux::fs::LinuxIovec;
 
 struct UserIovecs {
     entries: Vec<LinuxIovec>,
@@ -74,7 +75,7 @@ impl UserIovecCursor {
         }
     }
 
-    fn validate_all(&mut self, prepare_for_reuse: bool) -> SysResult<()> {
+    fn validate_all(&mut self, prepare_for_reuse: bool) -> KResult<()> {
         // CONTEXT: readv/preadv validate every destination iovec before
         // reading so an early filesystem read cannot partially modify user
         // memory before a later bad iovec reports EFAULT.
@@ -112,7 +113,7 @@ impl UserIovecCursor {
         Ok(())
     }
 
-    fn next_chunk(&mut self) -> Option<SysResult<UserIovecChunk>> {
+    fn next_chunk(&mut self) -> Option<KResult<UserIovecChunk>> {
         if let Some(chunks) = self.prepared_chunks.as_mut() {
             while self.index < chunks.len() {
                 let chunk = chunks[self.index].take();
@@ -150,13 +151,13 @@ impl UserIovecCursor {
 ///
 /// Length overflow and counts beyond Linux `SSIZE_MAX` are reported as
 /// `EINVAL`, preserving the visible readv/writev-family ABI boundary.
-fn read_user_iovecs(token: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult<UserIovecs> {
+fn read_user_iovecs(token: usize, iov: *const LinuxIovec, iovcnt: usize) -> KResult<UserIovecs> {
     let entries = read_user_array(token, iov, iovcnt)?;
     let mut total_len = 0usize;
     for iovec in entries.iter() {
-        total_len = total_len.checked_add(iovec.len).ok_or(SysError::EINVAL)?;
+        total_len = total_len.checked_add(iovec.len).ok_or(Errno::EINVAL)?;
         if total_len > isize::MAX as usize {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
     }
     Ok(UserIovecs { entries, total_len })
@@ -166,19 +167,19 @@ fn read_user_iovecs_ctx(
     ctx: &SyscallContext,
     iov: *const LinuxIovec,
     iovcnt: usize,
-) -> SysResult<UserIovecs> {
+) -> KResult<UserIovecs> {
     let entries = read_user_array_ctx(ctx, iov, iovcnt)?;
     let mut total_len = 0usize;
     for iovec in entries.iter() {
-        total_len = total_len.checked_add(iovec.len).ok_or(SysError::EINVAL)?;
+        total_len = total_len.checked_add(iovec.len).ok_or(Errno::EINVAL)?;
         if total_len > isize::MAX as usize {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
     }
     Ok(UserIovecs { entries, total_len })
 }
 
-fn ensure_nonblocking_ready(entry: &FdTableEntry, events: PollEvents) -> SysResult<()> {
+fn ensure_nonblocking_ready(entry: &FdTableEntry, events: PollEvents) -> KResult<()> {
     if !entry.status_flags().contains(OpenFlags::NONBLOCK) {
         return Ok(());
     }
@@ -186,7 +187,7 @@ fn ensure_nonblocking_ready(entry: &FdTableEntry, events: PollEvents) -> SysResu
     if file.poll(events).intersects(events) {
         Ok(())
     } else {
-        Err(SysError::EAGAIN)
+        Err(Errno::EAGAIN)
     }
 }
 
@@ -219,7 +220,7 @@ fn writev_regular_file_coalesced(
     entry: &FdTableEntry,
     mut cursor: UserIovecCursor,
     mut remaining_len: usize,
-) -> SysResult<usize> {
+) -> KResult<usize> {
     let mut total_written = 0usize;
     let mut bounce = Vec::with_capacity(WRITEV_COALESCE_CHUNK_SIZE);
     while let Some(chunk) = cursor.next_chunk() {
@@ -270,17 +271,17 @@ fn flush_pwritev_bounce(
     offset: &mut usize,
     bounce: &mut Vec<u8>,
     total_written: &mut usize,
-) -> SysResult<bool> {
+) -> KResult<bool> {
     if bounce.is_empty() {
         return Ok(false);
     }
     let intended_len = bounce.len();
     perf::record_pwritev_regular_bounce(intended_len);
     file.check_write_at(*offset, intended_len)
-        .map_err(SysError::from)?;
+        .map_err(Errno::from)?;
     let written = file.write_at(*offset, bounce.as_slice());
     *total_written = total_written.saturating_add(written);
-    *offset = offset.checked_add(written).ok_or(SysError::EINVAL)?;
+    *offset = offset.checked_add(written).ok_or(Errno::EINVAL)?;
     bounce.clear();
     Ok(written < intended_len)
 }
@@ -290,7 +291,7 @@ fn pwritev_regular_file_coalesced(
     mut cursor: UserIovecCursor,
     mut offset: usize,
     mut remaining_len: usize,
-) -> SysResult<usize> {
+) -> KResult<usize> {
     let mut total_written = 0usize;
     let mut bounce = Vec::with_capacity(WRITEV_COALESCE_CHUNK_SIZE);
     while let Some(chunk) = cursor.next_chunk() {
@@ -348,7 +349,7 @@ fn pwrite_regular_file_coalesced(
     file: &(dyn File + Send + Sync),
     mut offset: usize,
     buffers: TranslatedUserBuffer,
-) -> SysResult<usize> {
+) -> KResult<usize> {
     let mut total_written = 0usize;
     let mut bounce = Vec::with_capacity(WRITEV_COALESCE_CHUNK_SIZE);
     for slice in buffers {
@@ -364,7 +365,7 @@ fn pwrite_regular_file_coalesced(
             let intended_len = bounce.len();
             let written = file.write_at(offset, bounce.as_slice());
             total_written = total_written.saturating_add(written);
-            offset = offset.checked_add(written).ok_or(SysError::EINVAL)?;
+            offset = offset.checked_add(written).ok_or(Errno::EINVAL)?;
             bounce.clear();
             if written < intended_len {
                 return Ok(total_written);
@@ -410,7 +411,7 @@ fn pwritev_regular_file_direct_page_slices(
     mut cursor: UserIovecCursor,
     offset: usize,
     mut remaining_len: usize,
-) -> SysResult<usize> {
+) -> KResult<usize> {
     let mut buffers = TranslatedUserBuffer::empty();
     let mut pending_len = 0usize;
     while let Some(chunk) = cursor.next_chunk() {
@@ -419,7 +420,7 @@ fn pwritev_regular_file_direct_page_slices(
             Err(_) if pending_len > 0 => {
                 let written = file
                     .write_at_aligned_user_buffer(offset, UserBuffer::new(buffers))
-                    .map_err(SysError::from)?;
+                    .map_err(Errno::from)?;
                 perf::record_pwritev_regular_direct_user_buffer(written);
                 return Ok(written);
             }
@@ -436,7 +437,7 @@ fn pwritev_regular_file_direct_page_slices(
     }
     let written = file
         .write_at_aligned_user_buffer(offset, UserBuffer::new(buffers))
-        .map_err(SysError::from)?;
+        .map_err(Errno::from)?;
     perf::record_pwritev_regular_direct_user_buffer(written);
     Ok(written)
 }
@@ -446,7 +447,7 @@ fn writev_regular_file_direct_page_slices(
     mut cursor: UserIovecCursor,
     mut remaining_len: usize,
     append: bool,
-) -> SysResult<usize> {
+) -> KResult<usize> {
     let mut buffers = TranslatedUserBuffer::empty();
     let mut pending_len = 0usize;
     while let Some(chunk) = cursor.next_chunk() {
@@ -455,7 +456,7 @@ fn writev_regular_file_direct_page_slices(
             Err(_) if pending_len > 0 => {
                 let written = file
                     .write_aligned_user_buffer(UserBuffer::new(buffers), append)
-                    .map_err(SysError::from)?;
+                    .map_err(Errno::from)?;
                 perf::record_writev_regular_direct_user_buffer(written);
                 return Ok(written);
             }
@@ -472,7 +473,7 @@ fn writev_regular_file_direct_page_slices(
     }
     let written = file
         .write_aligned_user_buffer(UserBuffer::new(buffers), append)
-        .map_err(SysError::from)?;
+        .map_err(Errno::from)?;
     perf::record_writev_regular_direct_user_buffer(written);
     Ok(written)
 }
@@ -480,7 +481,7 @@ fn writev_regular_file_direct_page_slices(
 fn collect_iovec_buffers(
     mut cursor: UserIovecCursor,
     mut remaining_len: usize,
-) -> SysResult<TranslatedUserBuffer> {
+) -> KResult<TranslatedUserBuffer> {
     let mut buffers = TranslatedUserBuffer::empty();
     while let Some(chunk) = cursor.next_chunk() {
         let chunk = chunk?;
@@ -548,7 +549,7 @@ fn preadv_regular_file_coalesced(
     cursor: UserIovecCursor,
     mut offset: usize,
     requested_len: usize,
-) -> SysResult<usize> {
+) -> KResult<usize> {
     let mut buffers = collect_iovec_buffers(cursor, requested_len)?;
     let mut bounce = vec![0u8; PREADV_COALESCE_CHUNK_SIZE];
     let mut buffer_index = 0usize;
@@ -574,7 +575,7 @@ fn preadv_regular_file_coalesced(
             &mut buffer_offset,
             &bounce[..read_size],
         );
-        offset = offset.checked_add(copied).ok_or(SysError::EINVAL)?;
+        offset = offset.checked_add(copied).ok_or(Errno::EINVAL)?;
         total_read = total_read.saturating_add(copied);
         if copied < read_size || read_size < read_limit {
             break;
@@ -607,7 +608,7 @@ fn allowed_write_len_at(
     file: &(dyn File + Send + Sync),
     offset: usize,
     requested_len: usize,
-) -> SysResult<usize> {
+) -> KResult<usize> {
     allowed_write_len_at_with_limit(file, offset, requested_len, current_file_size_limit())
 }
 
@@ -616,7 +617,7 @@ fn allowed_write_len_at_with_limit(
     offset: usize,
     requested_len: usize,
     limit: usize,
-) -> SysResult<usize> {
+) -> KResult<usize> {
     // CONTEXT: RLIMIT_FSIZE is enforced at the resulting file-size boundary.
     // Writes that start below the permitted end may be shortened; writes that
     // start at or beyond it report EFBIG and queue SIGXFSZ.
@@ -630,20 +631,20 @@ fn allowed_write_len_at_with_limit(
     if stat.mode & S_IFMT != S_IFREG {
         return Ok(requested_len);
     }
-    let write_end = offset.checked_add(requested_len).ok_or(SysError::EFBIG)?;
-    let current_size = usize::try_from(stat.size).map_err(|_| SysError::EFBIG)?;
+    let write_end = offset.checked_add(requested_len).ok_or(Errno::EFBIG)?;
+    let current_size = usize::try_from(stat.size).map_err(|_| Errno::EFBIG)?;
     let permitted_end = current_size.max(limit);
     if write_end <= permitted_end {
         return Ok(requested_len);
     }
     if offset >= permitted_end {
         queue_file_size_limit_signal();
-        return Err(SysError::EFBIG);
+        return Err(Errno::EFBIG);
     }
     Ok(permitted_end - offset)
 }
 
-fn allowed_write_len_for_entry(entry: &FdTableEntry, requested_len: usize) -> SysResult<usize> {
+fn allowed_write_len_for_entry(entry: &FdTableEntry, requested_len: usize) -> KResult<usize> {
     allowed_write_len_for_entry_with_limit(entry, requested_len, current_file_size_limit())
 }
 
@@ -651,7 +652,7 @@ fn allowed_write_len_for_entry_for_process(
     process: &ProcessControlBlock,
     entry: &FdTableEntry,
     requested_len: usize,
-) -> SysResult<usize> {
+) -> KResult<usize> {
     allowed_write_len_for_entry_with_limit(
         entry,
         requested_len,
@@ -663,7 +664,7 @@ fn allowed_write_len_for_entry_with_limit(
     entry: &FdTableEntry,
     requested_len: usize,
     limit: usize,
-) -> SysResult<usize> {
+) -> KResult<usize> {
     if requested_len == 0 || limit == usize::MAX {
         return Ok(requested_len);
     }
@@ -673,35 +674,35 @@ fn allowed_write_len_for_entry_with_limit(
         return Ok(requested_len);
     }
     let offset = if entry.status_flags().contains(OpenFlags::APPEND) {
-        usize::try_from(stat.size).map_err(|_| SysError::EFBIG)?
+        usize::try_from(stat.size).map_err(|_| Errno::EFBIG)?
     } else {
         file.seek(0, SeekWhence::Current)?
     };
     allowed_write_len_at_with_limit(file.as_ref(), offset, requested_len, limit)
 }
 
-fn check_file_size_limit_for_len(file: &(dyn File + Send + Sync), len: usize) -> SysResult<()> {
+fn check_file_size_limit_for_len(file: &(dyn File + Send + Sync), len: usize) -> KResult<()> {
     // CONTEXT: ftruncate/fallocate length changes do not have a user-buffer
     // partial-write path, so they validate the whole requested size up front.
     let stat = file.stat()?;
     if stat.mode & S_IFMT != S_IFREG {
         return Ok(());
     }
-    let current_size = usize::try_from(stat.size).map_err(|_| SysError::EFBIG)?;
+    let current_size = usize::try_from(stat.size).map_err(|_| Errno::EFBIG)?;
     if len <= current_size || len <= current_file_size_limit() {
         return Ok(());
     }
     queue_file_size_limit_signal();
-    Err(SysError::EFBIG)
+    Err(Errno::EFBIG)
 }
 
-fn checked_write_result(requested: usize, written: usize) -> SysResult {
+fn checked_write_result(requested: usize, written: usize) -> KResult {
     if requested > 0 && written == 0 {
         // CONTEXT: A no-progress non-empty write makes libc/BusyBox retry loops
         // spin forever. Backends that cannot accept data must reject the write in
         // check_write/check_write_at; if they still report no progress, surface a
         // hard I/O error instead of returning 0 to userspace.
-        Err(SysError::EIO)
+        Err(Errno::EIO)
     } else {
         Ok(written as isize)
     }
@@ -711,23 +712,23 @@ fn checked_write_result_for_entry(
     entry: &FdTableEntry,
     requested: usize,
     written: usize,
-) -> SysResult {
+) -> KResult {
     let file = entry.file();
     if requested > 0
         && written == 0
         && (file.pipe_readers_closed() || file.socket_write_peer_closed())
     {
         current_add_signal(SignalFlags::SIGPIPE);
-        Err(SysError::EPIPE)
+        Err(Errno::EPIPE)
     } else {
         checked_write_result(requested, written)
     }
 }
 
-fn check_pipe_write_peer(entry: &FdTableEntry, has_data: bool) -> SysResult<()> {
+fn check_pipe_write_peer(entry: &FdTableEntry, has_data: bool) -> KResult<()> {
     if has_data && entry.file().pipe_readers_closed() {
         current_add_signal(SignalFlags::SIGPIPE);
-        return Err(SysError::EPIPE);
+        return Err(Errno::EPIPE);
     }
     Ok(())
 }
@@ -736,56 +737,56 @@ fn precheck_eventfd_write_value(
     file: &(dyn File + Send + Sync),
     token: usize,
     buf: *const u8,
-) -> SysResult<()> {
+) -> KResult<()> {
     if !file.is_eventfd() {
         return Ok(());
     }
 
     let value = read_user_value_with_mmap_fault(token, buf.cast::<u64>())?;
     if value == u64::MAX {
-        Err(SysError::EINVAL)
+        Err(Errno::EINVAL)
     } else {
         Ok(())
     }
 }
 
-fn checked_position_offset(offset: usize) -> SysResult<usize> {
+fn checked_position_offset(offset: usize) -> KResult<usize> {
     if offset > isize::MAX as usize {
-        Err(SysError::EINVAL)
+        Err(Errno::EINVAL)
     } else {
         Ok(offset)
     }
 }
 
-fn checked_position_offset_pair(pos_l: usize, pos_h: usize) -> SysResult<usize> {
+fn checked_position_offset_pair(pos_l: usize, pos_h: usize) -> KResult<usize> {
     let offset = if pos_h == 0 {
         pos_l
     } else {
         let combined = ((pos_h as u128) << 32) | ((pos_l as u32) as u128);
         if combined > usize::MAX as u128 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         combined as usize
     };
     checked_position_offset(offset)
 }
 
-fn ensure_positioned_target(file: &(dyn File + Send + Sync)) -> SysResult<()> {
+fn ensure_positioned_target(file: &(dyn File + Send + Sync)) -> KResult<()> {
     let mode_type = file.mode_type()?;
     if mode_type == S_IFDIR {
-        return Err(SysError::EISDIR);
+        return Err(Errno::EISDIR);
     }
     if mode_type != S_IFREG {
-        return Err(SysError::ESPIPE);
+        return Err(Errno::ESPIPE);
     }
     Ok(())
 }
 
-fn ensure_fadvise_target(file: &(dyn File + Send + Sync)) -> SysResult<()> {
+fn ensure_fadvise_target(file: &(dyn File + Send + Sync)) -> KResult<()> {
     if file.mode_type()? == S_IFREG {
         Ok(())
     } else {
-        Err(SysError::ESPIPE)
+        Err(Errno::ESPIPE)
     }
 }
 
@@ -803,39 +804,39 @@ fn fault_in_read_buffers(buffers: &[&'static mut [u8]]) {
     }
 }
 
-pub fn sys_lseek_ctx(ctx: &SyscallContext, fd: usize, offset: i64, whence: usize) -> SysResult {
+pub fn sys_lseek_ctx(ctx: &SyscallContext, fd: usize, offset: i64, whence: usize) -> KResult {
     let whence = match whence {
         0 => SeekWhence::Set,
         1 => SeekWhence::Current,
         2 => SeekWhence::End,
         3 => SeekWhence::Data,
         4 => SeekWhence::Hole,
-        _ => return Err(SysError::EINVAL),
+        _ => return Err(Errno::EINVAL),
     };
     if matches!(whence, SeekWhence::Data | SeekWhence::Hole) && offset < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let file = get_file_by_fd_for_process(ctx.process(), fd)?;
     let new_offset = file.seek(offset, whence)?;
     if new_offset > isize::MAX as usize {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(new_offset as isize)
 }
 
-pub fn sys_ftruncate(fd: usize, len: usize) -> SysResult {
+pub fn sys_ftruncate(fd: usize, len: usize) -> KResult {
     if len > isize::MAX as usize {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let file = get_file_by_fd(fd)?;
     if !file.writable() {
         // CONTEXT: POSIX permits either EBADF or EINVAL for ftruncate() on an
         // fd that is not open for writing; Linux reports EINVAL, and LTP
         // ftruncate03 checks that Linux-visible errno.
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if file.mode_type()? != S_IFREG {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     check_file_size_limit_for_len(file.as_ref(), len)?;
     file.check_set_len(len)?;
@@ -856,31 +857,31 @@ const FALLOC_KNOWN_FLAGS: u32 = FALLOC_FL_KEEP_SIZE
     | FALLOC_FL_INSERT_RANGE
     | FALLOC_FL_UNSHARE_RANGE;
 
-pub fn sys_fallocate(fd: usize, mode: u32, offset: usize, len: usize) -> SysResult {
+pub fn sys_fallocate(fd: usize, mode: u32, offset: usize, len: usize) -> KResult {
     let max_file_size = isize::MAX as usize;
     if offset > max_file_size || len > max_file_size || len == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
-    let end = offset.checked_add(len).ok_or(SysError::EFBIG)?;
+    let end = offset.checked_add(len).ok_or(Errno::EFBIG)?;
     if end > max_file_size {
-        return Err(SysError::EFBIG);
+        return Err(Errno::EFBIG);
     }
 
     let file = get_file_by_fd(fd)?;
     if !file.writable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     ensure_positioned_target(file.as_ref())?;
 
     if mode & !FALLOC_KNOWN_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if mode & FALLOC_FL_PUNCH_HOLE != 0 && mode & FALLOC_FL_KEEP_SIZE == 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if mode & FALLOC_FL_PUNCH_HOLE != 0 && file.is_memfd() {
         if file.blocks_file_write() {
-            return Err(SysError::EPERM);
+            return Err(Errno::EPERM);
         }
         // CONTEXT: memfd punch-hole support is visible to current LTP only
         // through success/failure and unchanged size, so this in-memory file
@@ -893,14 +894,14 @@ pub fn sys_fallocate(fd: usize, mode: u32, offset: usize, len: usize) -> SysResu
         FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_INSERT_RANGE | FALLOC_FL_UNSHARE_RANGE;
     if mode & FALLOC_FL_PUNCH_HOLE != 0 {
         if mode & (FALLOC_FL_ZERO_RANGE | unsupported_range_flags) != 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         file.punch_hole(offset, len)?;
         return Ok(0);
     }
     if mode & FALLOC_FL_ZERO_RANGE != 0 {
         if mode & unsupported_range_flags != 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         if !keep_size {
             check_file_size_limit_for_len(file.as_ref(), end)?;
@@ -910,19 +911,19 @@ pub fn sys_fallocate(fd: usize, mode: u32, offset: usize, len: usize) -> SysResu
     }
     if mode & FALLOC_FL_COLLAPSE_RANGE != 0 {
         if mode != FALLOC_FL_COLLAPSE_RANGE {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         file.collapse_range(offset, len)?;
         return Ok(0);
     }
     if mode & FALLOC_FL_INSERT_RANGE != 0 {
         if mode != FALLOC_FL_INSERT_RANGE {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         let new_size = usize::try_from(file.stat()?.size)
-            .map_err(|_| SysError::EFBIG)?
+            .map_err(|_| Errno::EFBIG)?
             .checked_add(len)
-            .ok_or(SysError::EFBIG)?;
+            .ok_or(Errno::EFBIG)?;
         check_file_size_limit_for_len(file.as_ref(), new_size)?;
         file.insert_range(offset, len)?;
         return Ok(0);
@@ -931,7 +932,7 @@ pub fn sys_fallocate(fd: usize, mode: u32, offset: usize, len: usize) -> SysResu
         // UNFINISHED: Linux fallocate range operations require filesystem
         // extent allocation/deallocation support that this VFS layer does not
         // expose yet.
-        return Err(SysError::ENOTSUP);
+        return Err(Errno::ENOTSUP);
     }
 
     if !keep_size {
@@ -941,14 +942,14 @@ pub fn sys_fallocate(fd: usize, mode: u32, offset: usize, len: usize) -> SysResu
     Ok(0)
 }
 
-pub fn sys_fadvise64(fd: usize, offset: i64, len: i64, advice: i32) -> SysResult {
+pub fn sys_fadvise64(fd: usize, offset: i64, len: i64, advice: i32) -> KResult {
     if offset < 0 || len < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let file = get_file_by_fd(fd)?;
     ensure_fadvise_target(file.as_ref())?;
     if !(0..=5).contains(&advice) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     // CONTEXT: The current VFS has no page-cache advice API. Linux accepts
     // valid POSIX_FADV_* hints as advisory, so the observable contest behavior
@@ -962,46 +963,42 @@ pub fn sys_fadvise64(fd: usize, offset: i64, len: i64, advice: i32) -> SysResult
 const GENERIC_BULK_COPY_CHUNK: usize = 64 * 1024;
 const COPY_FILE_RANGE_CHUNK: usize = GENERIC_BULK_COPY_CHUNK;
 
-fn ensure_copy_file_range_target(file: &(dyn File + Send + Sync)) -> SysResult<FileStat> {
+fn ensure_copy_file_range_target(file: &(dyn File + Send + Sync)) -> KResult<FileStat> {
     let stat = file.stat()?;
     match stat.mode & S_IFMT {
         S_IFREG => Ok(stat),
-        S_IFDIR => Err(SysError::EISDIR),
-        _ => Err(SysError::EINVAL),
+        S_IFDIR => Err(Errno::EISDIR),
+        _ => Err(Errno::EINVAL),
     }
 }
 
-fn read_copy_file_range_offset(token: usize, ptr: *mut i64) -> SysResult<Option<usize>> {
+fn read_copy_file_range_offset(token: usize, ptr: *mut i64) -> KResult<Option<usize>> {
     if ptr.is_null() {
         return Ok(None);
     }
     let offset = read_user_value(token, ptr.cast_const())?;
     if offset < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(Some(checked_position_offset(offset as usize)?))
 }
 
-fn write_copy_file_range_offset(
-    token: usize,
-    ptr: *mut i64,
-    offset: Option<usize>,
-) -> SysResult<()> {
+fn write_copy_file_range_offset(token: usize, ptr: *mut i64, offset: Option<usize>) -> KResult<()> {
     if !ptr.is_null() {
-        let value = offset.ok_or(SysError::EINVAL)? as i64;
+        let value = offset.ok_or(Errno::EINVAL)? as i64;
         write_user_value(token, ptr, &value)?;
     }
     Ok(())
 }
 
-fn current_copy_file_range_offset(file: &(dyn File + Send + Sync)) -> SysResult<usize> {
+fn current_copy_file_range_offset(file: &(dyn File + Send + Sync)) -> KResult<usize> {
     Ok(file.seek(0, SeekWhence::Current)?)
 }
 
-fn checked_copy_file_range_end(start: usize, len: usize) -> SysResult<usize> {
-    let end = start.checked_add(len).ok_or(SysError::EOVERFLOW)?;
+fn checked_copy_file_range_end(start: usize, len: usize) -> KResult<usize> {
+    let end = start.checked_add(len).ok_or(Errno::EOVERFLOW)?;
     if end > isize::MAX as usize {
-        return Err(SysError::EFBIG);
+        return Err(Errno::EFBIG);
     }
     Ok(end)
 }
@@ -1041,9 +1038,9 @@ pub fn sys_copy_file_range(
     off_out: *mut i64,
     len: usize,
     flags: u32,
-) -> SysResult {
+) -> KResult {
     if flags != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let token = current_user_token();
@@ -1058,16 +1055,16 @@ pub fn sys_copy_file_range(
     let out_stat = ensure_copy_file_range_target(out_file.as_ref())?;
 
     if !in_file.readable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     if !out_file.writable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     if out_entry.status_flags().contains(OpenFlags::APPEND) {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     if super::is_active_swap_file(out_stat) {
-        return Err(SysError::ETXTBSY);
+        return Err(Errno::ETXTBSY);
     }
     if len == 0 {
         return Ok(0);
@@ -1085,7 +1082,7 @@ pub fn sys_copy_file_range(
     if same_copy_file_range_file(in_file.as_ref(), out_file.as_ref(), in_stat, out_stat)
         && same_file_range_overlaps(in_offset, out_offset, len)
     {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     if out_offset_arg.is_some() {
@@ -1118,12 +1115,12 @@ pub fn sys_copy_file_range(
         }
 
         crate::perf::record_copy_file_range_chunk(written);
-        copied = copied.checked_add(written).ok_or(SysError::EOVERFLOW)?;
+        copied = copied.checked_add(written).ok_or(Errno::EOVERFLOW)?;
         if in_offset_arg.is_some() {
-            in_offset = in_offset.checked_add(written).ok_or(SysError::EOVERFLOW)?;
+            in_offset = in_offset.checked_add(written).ok_or(Errno::EOVERFLOW)?;
         }
         if out_offset_arg.is_some() {
-            out_offset = out_offset.checked_add(written).ok_or(SysError::EOVERFLOW)?;
+            out_offset = out_offset.checked_add(written).ok_or(Errno::EOVERFLOW)?;
         }
         if read < want || written < read {
             break;
@@ -1151,7 +1148,7 @@ fn kernel_user_buffer(buf: &mut [u8]) -> UserBuffer {
     UserBuffer::from_kernel_slice_for_sync_io(buf)
 }
 
-fn read_sendfile_offset(token: usize, ptr: *mut i64) -> SysResult<Option<usize>> {
+fn read_sendfile_offset(token: usize, ptr: *mut i64) -> KResult<Option<usize>> {
     if ptr.is_null() {
         return Ok(None);
     }
@@ -1163,29 +1160,29 @@ fn read_sendfile_offset(token: usize, ptr: *mut i64) -> SysResult<Option<usize>>
     )?;
     let offset = read_user_value(token, ptr.cast_const())?;
     if offset < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(Some(checked_position_offset(offset as usize)?))
 }
 
-fn write_sendfile_offset(token: usize, ptr: *mut i64, offset: Option<usize>) -> SysResult<()> {
+fn write_sendfile_offset(token: usize, ptr: *mut i64, offset: Option<usize>) -> KResult<()> {
     if let Some(offset) = offset {
         write_user_value(token, ptr, &(offset as i64))?;
     }
     Ok(())
 }
 
-fn ensure_sendfile_input(file: &(dyn File + Send + Sync)) -> SysResult<()> {
+fn ensure_sendfile_input(file: &(dyn File + Send + Sync)) -> KResult<()> {
     if !file.readable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     if file.mode_type()? != S_IFREG {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(())
 }
 
-pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut i64, count: usize) -> SysResult {
+pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut i64, count: usize) -> KResult {
     let token = current_user_token();
     let mut explicit_offset = read_sendfile_offset(token, offset)?;
     let in_entry = get_fd_entry_by_fd(in_fd)?;
@@ -1195,10 +1192,10 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut i64, count: usize)
 
     ensure_sendfile_input(in_file.as_ref())?;
     if !out_file.writable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     if out_entry.status_flags().contains(OpenFlags::APPEND) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if count == 0 {
         write_sendfile_offset(token, offset, explicit_offset)?;
@@ -1232,11 +1229,9 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut i64, count: usize)
         }
 
         crate::perf::record_sendfile_chunk(written);
-        copied = copied.checked_add(written).ok_or(SysError::EOVERFLOW)?;
+        copied = copied.checked_add(written).ok_or(Errno::EOVERFLOW)?;
         if let Some(input_offset) = explicit_offset.as_mut() {
-            *input_offset = input_offset
-                .checked_add(written)
-                .ok_or(SysError::EOVERFLOW)?;
+            *input_offset = input_offset.checked_add(written).ok_or(Errno::EOVERFLOW)?;
         }
         if written < read {
             break;
@@ -1247,48 +1242,44 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut i64, count: usize)
     Ok(copied as isize)
 }
 
-fn read_splice_offset(token: usize, ptr: *mut i64, is_pipe: bool) -> SysResult<Option<i64>> {
+fn read_splice_offset(token: usize, ptr: *mut i64, is_pipe: bool) -> KResult<Option<i64>> {
     if ptr.is_null() {
         return Ok(None);
     }
     if is_pipe {
-        return Err(SysError::ESPIPE);
+        return Err(Errno::ESPIPE);
     }
     let offset = read_user_value(token, ptr.cast_const())?;
     if offset < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(Some(offset))
 }
 
-fn write_splice_offset(token: usize, ptr: *mut i64, offset: Option<i64>) -> SysResult<()> {
+fn write_splice_offset(token: usize, ptr: *mut i64, offset: Option<i64>) -> KResult<()> {
     if let Some(offset) = offset {
         write_user_value(token, ptr, &offset)?;
     }
     Ok(())
 }
 
-fn read_for_splice(entry: &FdTableEntry, offset: Option<i64>, buf: &mut [u8]) -> SysResult<usize> {
+fn read_for_splice(entry: &FdTableEntry, offset: Option<i64>, buf: &mut [u8]) -> KResult<usize> {
     let file = entry.file();
     if let Some(offset) = offset {
         Ok(file.read_at(offset as usize, buf))
     } else {
         if file.is_socket() && !file.poll(PollEvents::POLLIN).contains(PollEvents::POLLIN) {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         ensure_nonblocking_ready(entry, PollEvents::POLLIN)?;
         Ok(file.read(kernel_user_buffer(buf)))
     }
 }
 
-fn write_for_splice(
-    entry: &FdTableEntry,
-    offset: Option<i64>,
-    data: &mut [u8],
-) -> SysResult<usize> {
+fn write_for_splice(entry: &FdTableEntry, offset: Option<i64>, data: &mut [u8]) -> KResult<usize> {
     let file = entry.file();
     if file.is_dev_full() && !data.is_empty() {
-        return Err(SysError::ENOSPC);
+        return Err(Errno::ENOSPC);
     }
     if let Some(offset) = offset {
         Ok(file.write_at(offset as usize, data))
@@ -1306,9 +1297,9 @@ pub fn sys_splice(
     off_out: *mut i64,
     len: usize,
     flags: u32,
-) -> SysResult {
+) -> KResult {
     if flags & !SPLICE_KNOWN_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if len == 0 {
         return Ok(0);
@@ -1320,25 +1311,25 @@ pub fn sys_splice(
     let in_file = in_entry.file();
     let out_file = out_entry.file();
     if !in_file.readable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     if !out_file.writable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     if out_entry.status_flags().contains(OpenFlags::APPEND) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if in_file.mode_type()? == S_IFDIR || out_file.mode_type()? == S_IFDIR {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if !in_file.supports_splice_read() || !out_file.supports_splice_write() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let in_is_pipe = in_file.is_pipe();
     let out_is_pipe = out_file.is_pipe();
     if !in_is_pipe && !out_is_pipe {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let mut in_offset = read_splice_offset(token, off_in, in_is_pipe)?;
@@ -1392,27 +1383,27 @@ pub fn sys_splice(
 fn ensure_tee_nonblocking_ready(
     in_file: &(dyn File + Send + Sync),
     out_file: &(dyn File + Send + Sync),
-) -> SysResult<()> {
-    let input_occupied = in_file.pipe_occupied().ok_or(SysError::EINVAL)?;
+) -> KResult<()> {
+    let input_occupied = in_file.pipe_occupied().ok_or(Errno::EINVAL)?;
     if input_occupied == 0
         && !in_file
             .poll(PollEvents::POLLIN)
             .intersects(PollEvents::POLLIN)
     {
-        return Err(SysError::EAGAIN);
+        return Err(Errno::EAGAIN);
     }
 
-    let output_capacity = out_file.pipe_capacity().ok_or(SysError::EINVAL)?;
-    let output_occupied = out_file.pipe_occupied().ok_or(SysError::EINVAL)?;
+    let output_capacity = out_file.pipe_capacity().ok_or(Errno::EINVAL)?;
+    let output_occupied = out_file.pipe_occupied().ok_or(Errno::EINVAL)?;
     if output_capacity.saturating_sub(output_occupied) == 0 {
-        return Err(SysError::EAGAIN);
+        return Err(Errno::EAGAIN);
     }
     Ok(())
 }
 
-pub fn sys_tee(fd_in: usize, fd_out: usize, len: usize, flags: u32) -> SysResult {
+pub fn sys_tee(fd_in: usize, fd_out: usize, len: usize, flags: u32) -> KResult {
     if flags & !SPLICE_KNOWN_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if len == 0 {
         return Ok(0);
@@ -1423,15 +1414,15 @@ pub fn sys_tee(fd_in: usize, fd_out: usize, len: usize, flags: u32) -> SysResult
     let in_file = in_entry.file();
     let out_file = out_entry.file();
     if !in_file.is_pipe() || !out_file.is_pipe() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if !in_file.readable() || !out_file.writable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     check_pipe_write_peer(&out_entry, true)?;
     in_file
         .tee_pipe_to_pipe(out_file.as_ref(), 0)?
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
 
     let nonblocking = flags & SPLICE_F_NONBLOCK != 0
         || in_entry.status_flags().contains(OpenFlags::NONBLOCK)
@@ -1442,7 +1433,7 @@ pub fn sys_tee(fd_in: usize, fd_out: usize, len: usize, flags: u32) -> SysResult
 
     let copied = in_file
         .tee_pipe_to_pipe(out_file.as_ref(), len)?
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
     Ok(copied as isize)
 }
 
@@ -1451,7 +1442,7 @@ fn vmsplice_nonblock_len(
     events: PollEvents,
     requested_len: usize,
     flags: u32,
-) -> SysResult<usize> {
+) -> KResult<usize> {
     if flags & SPLICE_F_NONBLOCK == 0 {
         ensure_nonblocking_ready(entry, events)?;
         return Ok(requested_len);
@@ -1459,23 +1450,23 @@ fn vmsplice_nonblock_len(
 
     let file = entry.file();
     if events.contains(PollEvents::POLLOUT) {
-        let capacity = file.pipe_capacity().ok_or(SysError::EBADF)?;
-        let occupied = file.pipe_occupied().ok_or(SysError::EBADF)?;
+        let capacity = file.pipe_capacity().ok_or(Errno::EBADF)?;
+        let occupied = file.pipe_occupied().ok_or(Errno::EBADF)?;
         let available = capacity.saturating_sub(occupied);
         if available == 0 {
-            return Err(SysError::EAGAIN);
+            return Err(Errno::EAGAIN);
         }
         return Ok(requested_len.min(available));
     }
     if events.contains(PollEvents::POLLIN) {
-        let occupied = file.pipe_occupied().ok_or(SysError::EBADF)?;
+        let occupied = file.pipe_occupied().ok_or(Errno::EBADF)?;
         if occupied == 0 && !file.poll(events).intersects(events) {
-            return Err(SysError::EAGAIN);
+            return Err(Errno::EAGAIN);
         }
         return Ok(requested_len.min(occupied));
     }
     if !file.poll(events).intersects(events) {
-        return Err(SysError::EAGAIN);
+        return Err(Errno::EAGAIN);
     }
     Ok(requested_len)
 }
@@ -1485,7 +1476,7 @@ fn sys_vmsplice_write(
     entry: FdTableEntry,
     iovecs: UserIovecs,
     flags: u32,
-) -> SysResult {
+) -> KResult {
     let file = entry.file();
     let has_data = iovecs.total_len > 0;
     check_pipe_write_peer(&entry, has_data)?;
@@ -1529,7 +1520,7 @@ fn sys_vmsplice_read(
     entry: FdTableEntry,
     iovecs: UserIovecs,
     flags: u32,
-) -> SysResult {
+) -> KResult {
     let file = entry.file();
     let requested_len = vmsplice_nonblock_len(&entry, PollEvents::POLLIN, iovecs.total_len, flags)?;
     if requested_len == 0 {
@@ -1563,19 +1554,19 @@ pub fn sys_vmsplice_ctx(
     iov: *const LinuxIovec,
     nr_segs: usize,
     flags: u32,
-) -> SysResult {
+) -> KResult {
     if flags & !SPLICE_KNOWN_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let iovecs = validate_user_iovecs_arg_ctx(ctx, iov, nr_segs)?;
     if flags & SPLICE_F_GIFT != 0 && !user_iovecs_are_page_aligned(&iovecs) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
     if !file.is_pipe() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     if iovecs.total_len == 0 {
         return Ok(0);
@@ -1588,41 +1579,41 @@ pub fn sys_vmsplice_ctx(
     } else if file.readable() {
         sys_vmsplice_read(ctx, entry, iovecs, flags)
     } else {
-        Err(SysError::EBADF)
+        Err(Errno::EBADF)
     }
 }
 
-pub fn sys_fsync(fd: usize) -> SysResult {
+pub fn sys_fsync(fd: usize) -> KResult {
     let file = get_file_by_fd(fd)?;
     let mode_type = file.mode_type()?;
     if mode_type != S_IFREG && mode_type != S_IFDIR {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     file.sync(false)?;
     Ok(0)
 }
 
-pub fn sys_fdatasync(fd: usize) -> SysResult {
+pub fn sys_fdatasync(fd: usize) -> KResult {
     let file = get_file_by_fd(fd)?;
     if file.mode_type()? != S_IFREG {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     file.sync(true)?;
     Ok(0)
 }
 
-pub fn sys_sync_file_range(fd: usize, offset: i64, nbytes: i64, flags: u32) -> SysResult {
+pub fn sys_sync_file_range(fd: usize, offset: i64, nbytes: i64, flags: u32) -> KResult {
     let file = get_file_by_fd(fd)?;
     if flags & !VALID_SYNC_FILE_RANGE_FLAGS != 0
         || offset < 0
         || nbytes < 0
         || offset.checked_add(nbytes).is_none()
     {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let mode_type = file.mode_type()?;
     if !matches!(mode_type, S_IFREG | S_IFBLK | S_IFDIR) {
-        return Err(SysError::ESPIPE);
+        return Err(Errno::ESPIPE);
     }
     if flags == 0 {
         return Ok(0);
@@ -1635,12 +1626,12 @@ pub fn sys_sync_file_range(fd: usize, offset: i64, nbytes: i64, flags: u32) -> S
     Ok(0)
 }
 
-pub fn sys_sync() -> SysResult {
+pub fn sys_sync() -> KResult {
     crate::fs::sync_all_mounts()?;
     Ok(0)
 }
 
-pub fn sys_syncfs(fd: usize) -> SysResult {
+pub fn sys_syncfs(fd: usize) -> KResult {
     let file = get_file_by_fd(fd)?;
     // CONTEXT: The current in-kernel filesystems are synchronous enough for
     // LTP's fanotify/drop-caches ordering checks. Validate the fd and flush
@@ -1652,22 +1643,19 @@ pub fn sys_syncfs(fd: usize) -> SysResult {
     Ok(0)
 }
 
-pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> SysResult {
+pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> KResult {
     let offset = checked_position_offset(offset)?;
     let token = current_user_token();
     let file = get_file_by_fd(fd)?;
     ensure_positioned_target(file.as_ref())?;
     if !file.readable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     let buffers =
         translated_byte_buffer_checked_with_mmap_fault(token, buf, len, UserBufferAccess::Write)?;
     let mut total_read = 0usize;
     for slice in buffers {
-        let read = file.read_at(
-            offset.checked_add(total_read).ok_or(SysError::EINVAL)?,
-            slice,
-        );
+        let read = file.read_at(offset.checked_add(total_read).ok_or(Errno::EINVAL)?, slice);
         total_read += read;
         if read < slice.len() {
             break;
@@ -1678,19 +1666,19 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> SysRes
     Ok(total_read as isize)
 }
 
-pub fn sys_pwrite64(fd: usize, buf: *const u8, len: usize, offset: usize) -> SysResult {
+pub fn sys_pwrite64(fd: usize, buf: *const u8, len: usize, offset: usize) -> KResult {
     let mut offset = checked_position_offset(offset)?;
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
     ensure_positioned_target(file.as_ref())?;
     if !file.writable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     if len == 0 {
         return Ok(0);
     }
     if buf.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let token = current_user_token();
     if entry.status_flags().contains(OpenFlags::APPEND) {
@@ -1722,7 +1710,7 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, len: usize, offset: usize) -> Sys
         let mut total_written = 0usize;
         for slice in buffers {
             let written = file.write_at(
-                offset.checked_add(total_written).ok_or(SysError::EINVAL)?,
+                offset.checked_add(total_written).ok_or(Errno::EINVAL)?,
                 slice,
             );
             total_written += written;
@@ -1743,15 +1731,15 @@ pub fn sys_preadv(
     iovcnt: usize,
     pos_l: usize,
     pos_h: usize,
-) -> SysResult {
+) -> KResult {
     if iovcnt == 0 {
         return Ok(0);
     }
     if iovcnt > IOV_MAX {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if iov.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let mut offset = checked_position_offset_pair(pos_l, pos_h)?;
     let token = current_user_token();
@@ -1760,7 +1748,7 @@ pub fn sys_preadv(
     let file = get_file_by_fd(fd)?;
     ensure_positioned_target(file.as_ref())?;
     if !file.readable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
 
     let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Write);
@@ -1778,7 +1766,7 @@ pub fn sys_preadv(
         for slice in chunk?.buffers {
             let read = file.read_at(offset, slice);
             total_read += read;
-            offset = offset.checked_add(read).ok_or(SysError::EINVAL)?;
+            offset = offset.checked_add(read).ok_or(Errno::EINVAL)?;
             if read < slice.len() {
                 fanotify_notify_access(&file, total_read);
                 inotify_notify_access(&file, total_read);
@@ -1801,13 +1789,13 @@ fn sys_preadv2_nowait(
     iovcnt: usize,
     pos_l: usize,
     pos_h: usize,
-) -> SysResult {
+) -> KResult {
     // CONTEXT: The current VFS has no page-cache readiness model. For
     // RWF_NOWAIT, expose the Linux-visible nonblocking outcomes that LTP
     // checks: occasional EAGAIN and otherwise a successful short read.
     let attempt = PREADV2_NOWAIT_COMPAT_COUNTER.fetch_add(1, Ordering::Relaxed);
     if attempt % 8 == 0 {
-        return Err(SysError::EAGAIN);
+        return Err(Errno::EAGAIN);
     }
     let iovcnt = iovcnt.min(1);
     if preadv2_uses_current_offset(pos_l, pos_h) {
@@ -1824,9 +1812,9 @@ pub fn sys_preadv2(
     pos_l: usize,
     pos_h: usize,
     flags: usize,
-) -> SysResult {
+) -> KResult {
     if flags & !PREADV2_SUPPORTED_FLAGS != 0 {
-        return Err(SysError::ENOTSUP);
+        return Err(Errno::ENOTSUP);
     }
     if flags & RWF_NOWAIT != 0 {
         return sys_preadv2_nowait(fd, iov, iovcnt, pos_l, pos_h);
@@ -1843,15 +1831,15 @@ pub fn sys_pwritev(
     iovcnt: usize,
     pos_l: usize,
     pos_h: usize,
-) -> SysResult {
+) -> KResult {
     if iovcnt == 0 {
         return Ok(0);
     }
     if iovcnt > IOV_MAX {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if iov.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let mut offset = checked_position_offset_pair(pos_l, pos_h)?;
     let token = current_user_token();
@@ -1860,7 +1848,7 @@ pub fn sys_pwritev(
     let file = entry.file();
     ensure_positioned_target(file.as_ref())?;
     if !file.writable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     if entry.status_flags().contains(OpenFlags::APPEND) {
         offset = file.stat()?.size as usize;
@@ -1905,7 +1893,7 @@ pub fn sys_pwritev(
             let written = file.write_at(offset, slice);
             total_written += written;
             remaining_len = remaining_len.saturating_sub(written);
-            offset = offset.checked_add(written).ok_or(SysError::EINVAL)?;
+            offset = offset.checked_add(written).ok_or(Errno::EINVAL)?;
             if written < slice.len() {
                 fanotify_notify_modify(&file, total_written);
                 inotify_notify_modify(&file, total_written);
@@ -1928,9 +1916,9 @@ pub fn sys_pwritev2(
     pos_l: usize,
     pos_h: usize,
     flags: usize,
-) -> SysResult {
+) -> KResult {
     if flags != 0 {
-        return Err(SysError::ENOTSUP);
+        return Err(Errno::ENOTSUP);
     }
     if pos_l == usize::MAX {
         return sys_writev(fd, iov, iovcnt);
@@ -1938,15 +1926,15 @@ pub fn sys_pwritev2(
     sys_pwritev(fd, iov, iovcnt, pos_l, pos_h)
 }
 
-pub fn sys_write_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize) -> SysResult {
+pub fn sys_write_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize) -> KResult {
     let _profile_scope = perf::time_scope(perf::ProfilePoint::SysWrite);
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
     if !file.writable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     if file.is_dev_full() && len > 0 {
-        return Err(SysError::ENOSPC);
+        return Err(Errno::ENOSPC);
     }
     check_pipe_write_peer(&entry, len > 0)?;
     let allowed_len = if file.is_eventfd() {
@@ -1987,7 +1975,7 @@ pub fn sys_write_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize
     checked_write_result_for_entry(&entry, allowed_len, written)
 }
 
-pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult {
+pub fn sys_writev(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> KResult {
     let token = current_user_token();
     let process = current_process();
     sys_writev_with_process(&process, token, fd, iov, iovcnt)
@@ -1998,7 +1986,7 @@ pub fn sys_writev_ctx(
     fd: usize,
     iov: *const LinuxIovec,
     iovcnt: usize,
-) -> SysResult {
+) -> KResult {
     let iovecs = validate_user_iovecs_arg_ctx(ctx, iov, iovcnt)?;
     sys_writev_with_iovecs(ctx.process(), ctx.user_token(), fd, iovecs, iovcnt)
 }
@@ -2007,7 +1995,7 @@ fn validate_user_iovecs_arg(
     token: usize,
     iov: *const LinuxIovec,
     iovcnt: usize,
-) -> SysResult<UserIovecs> {
+) -> KResult<UserIovecs> {
     if iovcnt == 0 {
         return Ok(UserIovecs {
             entries: Vec::new(),
@@ -2015,10 +2003,10 @@ fn validate_user_iovecs_arg(
         });
     }
     if iovcnt > IOV_MAX {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if iov.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
 
     read_user_iovecs(token, iov, iovcnt)
@@ -2028,7 +2016,7 @@ fn validate_user_iovecs_arg_ctx(
     ctx: &SyscallContext,
     iov: *const LinuxIovec,
     iovcnt: usize,
-) -> SysResult<UserIovecs> {
+) -> KResult<UserIovecs> {
     if iovcnt == 0 {
         return Ok(UserIovecs {
             entries: Vec::new(),
@@ -2036,10 +2024,10 @@ fn validate_user_iovecs_arg_ctx(
         });
     }
     if iovcnt > IOV_MAX {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if iov.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
 
     read_user_iovecs_ctx(ctx, iov, iovcnt)
@@ -2051,7 +2039,7 @@ fn sys_writev_with_process(
     fd: usize,
     iov: *const LinuxIovec,
     iovcnt: usize,
-) -> SysResult {
+) -> KResult {
     let iovecs = validate_user_iovecs_arg(token, iov, iovcnt)?;
     sys_writev_with_iovecs(process, token, fd, iovecs, iovcnt)
 }
@@ -2062,18 +2050,18 @@ fn sys_writev_with_iovecs(
     fd: usize,
     iovecs: UserIovecs,
     iovcnt: usize,
-) -> SysResult {
+) -> KResult {
     if iovcnt == 0 {
         return Ok(0);
     }
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
     if !file.writable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     let has_data = iovecs.total_len > 0;
     if file.is_dev_full() && has_data {
-        return Err(SysError::ENOSPC);
+        return Err(Errno::ENOSPC);
     }
     check_pipe_write_peer(&entry, has_data)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
@@ -2129,7 +2117,7 @@ fn sys_writev_with_iovecs(
     checked_write_result_for_entry(&entry, requested_len, total_written)
 }
 
-pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> SysResult {
+pub fn sys_readv(fd: usize, iov: *const LinuxIovec, iovcnt: usize) -> KResult {
     let token = current_user_token();
     let iovecs = validate_user_iovecs_arg(token, iov, iovcnt)?;
     sys_readv_with_iovecs(token, fd, iovecs, iovcnt)
@@ -2140,12 +2128,12 @@ pub fn sys_readv_ctx(
     fd: usize,
     iov: *const LinuxIovec,
     iovcnt: usize,
-) -> SysResult {
+) -> KResult {
     let iovecs = validate_user_iovecs_arg_ctx(ctx, iov, iovcnt)?;
     sys_readv_with_iovecs(ctx.user_token(), fd, iovecs, iovcnt)
 }
 
-fn sys_readv_with_iovecs(token: usize, fd: usize, iovecs: UserIovecs, iovcnt: usize) -> SysResult {
+fn sys_readv_with_iovecs(token: usize, fd: usize, iovecs: UserIovecs, iovcnt: usize) -> KResult {
     if iovcnt == 0 {
         return Ok(0);
     }
@@ -2153,10 +2141,10 @@ fn sys_readv_with_iovecs(token: usize, fd: usize, iovecs: UserIovecs, iovcnt: us
     let file = get_file_by_fd(fd)?;
     let mode_type = file.mode_type()?;
     if mode_type == S_IFDIR {
-        return Err(SysError::EISDIR);
+        return Err(Errno::EISDIR);
     }
     if !file.readable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     file.check_read(requested_len)?;
     let entry = get_fd_entry_by_fd(fd)?;
@@ -2188,15 +2176,15 @@ fn sys_readv_with_iovecs(token: usize, fd: usize, iovecs: UserIovecs, iovcnt: us
     Ok(total_read as isize)
 }
 
-pub fn sys_read_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize) -> SysResult {
+pub fn sys_read_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize) -> KResult {
     let _profile_scope = perf::time_scope(perf::ProfilePoint::SysRead);
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
     if file.mode_type()? == S_IFDIR {
-        return Err(SysError::EISDIR);
+        return Err(Errno::EISDIR);
     }
     if !file.readable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     file.check_read(len)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLIN)?;
@@ -2208,20 +2196,20 @@ pub fn sys_read_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize)
     Ok(read as isize)
 }
 
-pub fn sys_readahead(fd: usize, _offset: usize, _count: usize) -> SysResult {
+pub fn sys_readahead(fd: usize, _offset: usize, _count: usize) -> KResult {
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
     if entry.status_flags().contains(OpenFlags::PATH) || !file.readable() {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     if file.is_io_uring() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     match file.mode_type()? {
         S_IFREG => {
             crate::fs::procfs_note_readahead();
             Ok(0)
         }
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }

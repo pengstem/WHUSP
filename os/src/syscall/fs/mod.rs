@@ -72,4 +72,4 @@ pub use stat::{
 pub(crate) use swap::is_active_swap_file;
 pub use swap::{sys_swapoff, sys_swapon};
 pub use tty::sys_ioctl;
-pub use uapi::{LinuxIovec, LinuxKstat, LinuxPollFd, LinuxStatfs, LinuxStatx};
+pub use uapi::{LinuxKstat, LinuxPollFd, LinuxStatfs, LinuxStatx};

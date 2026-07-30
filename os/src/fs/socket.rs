@@ -13,7 +13,6 @@ use crate::config::PAGE_SIZE;
 use crate::mm::UserBuffer;
 use crate::perf;
 use crate::sync::UPIntrFreeCell;
-use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::user_ptr::{
     UserBufferAccess, copy_to_user, read_user_array_item, read_user_value,
     read_user_value_with_mmap_fault, translated_byte_buffer_checked,
@@ -27,6 +26,8 @@ use crate::task::{
     wakeup_task,
 };
 use crate::timer::{add_timer, get_time_ms};
+use crate::uapi::errno::{Errno, KResult};
+use crate::uapi::linux::fs::LinuxIovec;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
@@ -197,13 +198,6 @@ enum SocketDomain {
 enum SocketKind {
     Stream,
     Datagram,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct LinuxIovec {
-    base: usize,
-    len: usize,
 }
 
 #[repr(C)]
@@ -775,7 +769,7 @@ enum TcpConnectWait {
     Blocked(*mut crate::task::TaskContext),
 }
 
-fn find_tcp_listener_or_block(port: u16, deadline_ms: usize) -> SysResult<TcpConnectWait> {
+fn find_tcp_listener_or_block(port: u16, deadline_ms: usize) -> KResult<TcpConnectWait> {
     let mut loopback = LOOPBACK.exclusive_access();
     loopback.prune();
     if let Some(listener) = loopback.tcp_listeners.get(&port).and_then(Weak::upgrade) {
@@ -783,7 +777,7 @@ fn find_tcp_listener_or_block(port: u16, deadline_ms: usize) -> SysResult<TcpCon
     }
     perf::record_local_socket_writer_sleep();
     let (task, task_cx_ptr) =
-        block_current_task_no_schedule_unless_unmasked_signal().ok_or(SysError::EINTR)?;
+        block_current_task_no_schedule_unless_unmasked_signal().ok_or(Errno::EINTR)?;
     let waiters = loopback.tcp_connect_waiters.entry(port).or_default();
     remove_socket_waiter(waiters, &task);
     waiters.push_back(Arc::clone(&task));
@@ -897,7 +891,7 @@ impl LocalSocket {
         self.inner.exclusive_access().domain
     }
 
-    fn bind_address(&self, address: SocketAddress) -> SysResult {
+    fn bind_address(&self, address: SocketAddress) -> KResult {
         let domain = self.inner.exclusive_access().domain;
         match (domain, address) {
             (SocketDomain::Inet, SocketAddress::Inet(endpoint)) => self.bind_endpoint(endpoint),
@@ -905,25 +899,23 @@ impl LocalSocket {
             (SocketDomain::Unix, SocketAddress::Unix(UnixSockAddr::Named(address))) => {
                 self.bind_unix(address)
             }
-            (SocketDomain::Unix, SocketAddress::Unix(UnixSockAddr::Unnamed)) => {
-                Err(SysError::EINVAL)
-            }
+            (SocketDomain::Unix, SocketAddress::Unix(UnixSockAddr::Unnamed)) => Err(Errno::EINVAL),
             (SocketDomain::Netlink, SocketAddress::Netlink) => Ok(0),
-            (SocketDomain::Packet, _) => Err(SysError::EAFNOSUPPORT),
-            _ => Err(SysError::EAFNOSUPPORT),
+            (SocketDomain::Packet, _) => Err(Errno::EAFNOSUPPORT),
+            _ => Err(Errno::EAFNOSUPPORT),
         }
     }
 
-    fn bind_endpoint(&self, mut endpoint: InetEndpoint) -> SysResult {
+    fn bind_endpoint(&self, mut endpoint: InetEndpoint) -> KResult {
         normalize_local_endpoint(&mut endpoint)?;
         if endpoint.port != 0 && endpoint.port < 1024 && current_process().credentials().euid != 0 {
-            return Err(SysError::EACCES);
+            return Err(Errno::EACCES);
         }
         let mut loopback = LOOPBACK.exclusive_access();
         loopback.prune();
         let mut inner = self.inner.exclusive_access();
         if inner.local.is_some() {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         let defer_port = endpoint.port == 0
             && inner.bind_address_no_port
@@ -935,7 +927,7 @@ impl LocalSocket {
         match inner.kind {
             SocketKind::Stream => {
                 if loopback.tcp_listeners.contains_key(&endpoint.port) && !inner.reuse_addr {
-                    return Err(SysError::EADDRINUSE);
+                    return Err(Errno::EADDRINUSE);
                 }
             }
             SocketKind::Datagram => {
@@ -945,7 +937,7 @@ impl LocalSocket {
                     .is_some_and(|sockets| !sockets.is_empty())
                     && !inner.reuse_addr
                 {
-                    return Err(SysError::EADDRINUSE);
+                    return Err(Errno::EADDRINUSE);
                 }
                 loopback
                     .udp_bound
@@ -958,11 +950,11 @@ impl LocalSocket {
         Ok(0)
     }
 
-    fn bind_unix(&self, address: UnixAddress) -> SysResult {
+    fn bind_unix(&self, address: UnixAddress) -> KResult {
         {
             let inner = self.inner.exclusive_access();
             if inner.local.is_some() {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
         }
         {
@@ -973,7 +965,7 @@ impl LocalSocket {
                 .get(&address)
                 .is_some_and(|socket| socket.strong_count() > 0)
             {
-                return Err(SysError::EADDRINUSE);
+                return Err(Errno::EADDRINUSE);
             }
         }
         if let UnixAddress::Pathname(path) = &address {
@@ -1004,14 +996,14 @@ impl LocalSocket {
         Ok(0)
     }
 
-    fn ensure_bound(&self, kind: SocketKind) -> SysResult<InetEndpoint> {
+    fn ensure_bound(&self, kind: SocketKind) -> KResult<InetEndpoint> {
         {
             let inner = self.inner.exclusive_access();
             if let Some(local) = inner.local {
                 return Ok(local);
             }
             if inner.kind != kind {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
         }
         let mut loopback = LOOPBACK.exclusive_access();
@@ -1031,7 +1023,7 @@ impl LocalSocket {
         Ok(endpoint)
     }
 
-    fn listen(&self, backlog: i32) -> SysResult {
+    fn listen(&self, backlog: i32) -> KResult {
         let backlog = backlog.clamp(1, MAX_LISTEN_BACKLOG as i32) as usize;
         let local = self.ensure_bound(SocketKind::Stream)?;
         {
@@ -1054,21 +1046,21 @@ impl LocalSocket {
         Ok(0)
     }
 
-    fn accept(&self, nonblock: bool) -> SysResult<Arc<LocalSocket>> {
+    fn accept(&self, nonblock: bool) -> KResult<Arc<LocalSocket>> {
         loop {
             let task_cx_ptr = {
                 let mut inner = self.inner.exclusive_access();
                 if inner.kind != SocketKind::Stream {
-                    return Err(SysError::ENOTSUP);
+                    return Err(Errno::ENOTSUP);
                 }
                 if !inner.listening {
-                    return Err(SysError::EINVAL);
+                    return Err(Errno::EINVAL);
                 }
                 if let Some(accepted) = inner.accept_queue.pop_front() {
                     return Ok(Self::from_inner(accepted, OpenFlags::RDWR));
                 }
                 if nonblock {
-                    return Err(SysError::EAGAIN);
+                    return Err(Errno::EAGAIN);
                 }
                 if current_has_unmasked_signal() {
                     if let Some(task) = current_task() {
@@ -1112,7 +1104,7 @@ impl LocalSocket {
         }
     }
 
-    fn connect(&self, remote: SocketAddress) -> SysResult {
+    fn connect(&self, remote: SocketAddress) -> KResult {
         let (remote, unix_peer) = self.resolve_remote_address(remote)?;
         match self.kind() {
             SocketKind::Datagram => {
@@ -1126,11 +1118,11 @@ impl LocalSocket {
         }
     }
 
-    fn connect_stream(&self, remote: InetEndpoint, unix_peer: Option<UnixAddress>) -> SysResult {
+    fn connect_stream(&self, remote: InetEndpoint, unix_peer: Option<UnixAddress>) -> KResult {
         {
             let inner = self.inner.exclusive_access();
             if inner.peer.is_some() {
-                return Err(SysError::EISCONN);
+                return Err(Errno::EISCONN);
             }
         }
         let mut local = self.ensure_bound(SocketKind::Stream)?;
@@ -1146,13 +1138,13 @@ impl LocalSocket {
                 if let Some(task) = current_task() {
                     remove_tcp_connect_waiter(remote.port, &task);
                 }
-                return Err(SysError::ECONNREFUSED);
+                return Err(Errno::ECONNREFUSED);
             }
             if current_has_unmasked_signal() {
                 if let Some(task) = current_task() {
                     remove_tcp_connect_waiter(remote.port, &task);
                 }
-                return Err(SysError::EINTR);
+                return Err(Errno::EINTR);
             }
             match find_tcp_listener_or_block(remote.port, connect_deadline_ms)? {
                 TcpConnectWait::Listener(listener) => break listener,
@@ -1184,7 +1176,7 @@ impl LocalSocket {
                 || listener.read_shutdown
                 || listener.accept_queue.len() >= listener.listen_backlog.max(1)
             {
-                return Err(SysError::ECONNREFUSED);
+                return Err(Errno::ECONNREFUSED);
             }
             {
                 let mut client = self.inner.exclusive_access();
@@ -1203,7 +1195,7 @@ impl LocalSocket {
     fn resolve_remote_address(
         &self,
         address: SocketAddress,
-    ) -> SysResult<(InetEndpoint, Option<UnixAddress>)> {
+    ) -> KResult<(InetEndpoint, Option<UnixAddress>)> {
         let domain = self.inner.exclusive_access().domain;
         match (domain, address) {
             (SocketDomain::Inet, SocketAddress::Inet(mut endpoint)) => {
@@ -1217,9 +1209,7 @@ impl LocalSocket {
             (SocketDomain::Unix, SocketAddress::Unix(UnixSockAddr::Named(address))) => {
                 Ok((lookup_unix_endpoint(&address)?, Some(address)))
             }
-            (SocketDomain::Unix, SocketAddress::Unix(UnixSockAddr::Unnamed)) => {
-                Err(SysError::EINVAL)
-            }
+            (SocketDomain::Unix, SocketAddress::Unix(UnixSockAddr::Unnamed)) => Err(Errno::EINVAL),
             (SocketDomain::Netlink, SocketAddress::Netlink) => Ok((
                 InetEndpoint {
                     ip: ANY_IP,
@@ -1227,8 +1217,8 @@ impl LocalSocket {
                 },
                 None,
             )),
-            (SocketDomain::Packet, _) => Err(SysError::EAFNOSUPPORT),
-            _ => Err(SysError::EAFNOSUPPORT),
+            (SocketDomain::Packet, _) => Err(Errno::EAFNOSUPPORT),
+            _ => Err(Errno::EAFNOSUPPORT),
         }
     }
 
@@ -1237,21 +1227,21 @@ impl LocalSocket {
         data: Vec<u8>,
         remote: Option<SocketAddress>,
         nonblock: bool,
-    ) -> SysResult<usize> {
+    ) -> KResult<usize> {
         match self.kind() {
             SocketKind::Stream => self.send_stream(&data, nonblock),
             SocketKind::Datagram => self.send_datagram(data, remote, nonblock),
         }
     }
 
-    fn send_stream(&self, data: &[u8], nonblock: bool) -> SysResult<usize> {
+    fn send_stream(&self, data: &[u8], nonblock: bool) -> KResult<usize> {
         perf::record_local_socket_write_call();
         let mut written = 0usize;
         while written < data.len() {
             let (connected, peer) = {
                 let inner = self.inner.exclusive_access();
                 if inner.write_shutdown {
-                    return Err(SysError::EPIPE);
+                    return Err(Errno::EPIPE);
                 }
                 (
                     inner.peer.is_some() || inner.unix_peer.is_some(),
@@ -1260,30 +1250,30 @@ impl LocalSocket {
             };
             let Some(peer) = peer else {
                 return Err(if connected {
-                    SysError::EPIPE
+                    Errno::EPIPE
                 } else {
-                    SysError::ENOTCONN
+                    Errno::ENOTCONN
                 });
             };
             let mut peer_inner = peer.exclusive_access();
             if peer_inner.read_shutdown {
-                return Err(SysError::EPIPE);
+                return Err(Errno::EPIPE);
             }
             let capacity = (peer_inner.rcvbuf as usize).max(1);
             let available = capacity.saturating_sub(peer_inner.stream_rx.len());
             if available == 0 {
                 if nonblock {
-                    return Err(SysError::EAGAIN);
+                    return Err(Errno::EAGAIN);
                 }
                 if current_has_unmasked_signal() {
                     if let Some(task) = current_task() {
                         peer_inner.remove_writer(&task);
                     }
-                    return Err(SysError::EINTR);
+                    return Err(Errno::EINTR);
                 }
                 perf::record_local_socket_writer_sleep();
                 let Some(task_cx_ptr) = peer_inner.sleep_writer() else {
-                    return Err(SysError::EINTR);
+                    return Err(Errno::EINTR);
                 };
                 drop(peer_inner);
                 schedule(task_cx_ptr);
@@ -1303,7 +1293,7 @@ impl LocalSocket {
         Ok(written)
     }
 
-    fn send_stream_user_buffer(&self, buf: UserBuffer, nonblock: bool) -> SysResult<usize> {
+    fn send_stream_user_buffer(&self, buf: UserBuffer, nonblock: bool) -> KResult<usize> {
         perf::record_local_socket_write_call();
         let buffers = &buf.buffers;
         let total_len = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
@@ -1315,7 +1305,7 @@ impl LocalSocket {
             let (connected, peer) = {
                 let inner = self.inner.exclusive_access();
                 if inner.write_shutdown {
-                    return Err(SysError::EPIPE);
+                    return Err(Errno::EPIPE);
                 }
                 (
                     inner.peer.is_some() || inner.unix_peer.is_some(),
@@ -1324,30 +1314,30 @@ impl LocalSocket {
             };
             let Some(peer) = peer else {
                 return Err(if connected {
-                    SysError::EPIPE
+                    Errno::EPIPE
                 } else {
-                    SysError::ENOTCONN
+                    Errno::ENOTCONN
                 });
             };
             let mut peer_inner = peer.exclusive_access();
             if peer_inner.read_shutdown {
-                return Err(SysError::EPIPE);
+                return Err(Errno::EPIPE);
             }
             let capacity = (peer_inner.rcvbuf as usize).max(1);
             let available = capacity.saturating_sub(peer_inner.stream_rx.len());
             if available == 0 {
                 if nonblock {
-                    return Err(SysError::EAGAIN);
+                    return Err(Errno::EAGAIN);
                 }
                 if current_has_unmasked_signal() {
                     if let Some(task) = current_task() {
                         peer_inner.remove_writer(&task);
                     }
-                    return Err(SysError::EINTR);
+                    return Err(Errno::EINTR);
                 }
                 perf::record_local_socket_writer_sleep();
                 let Some(task_cx_ptr) = peer_inner.sleep_writer() else {
-                    return Err(SysError::EINTR);
+                    return Err(Errno::EINTR);
                 };
                 drop(peer_inner);
                 schedule(task_cx_ptr);
@@ -1413,7 +1403,7 @@ impl LocalSocket {
         data: Vec<u8>,
         remote: Option<SocketAddress>,
         nonblock: bool,
-    ) -> SysResult<usize> {
+    ) -> KResult<usize> {
         perf::record_local_socket_write_call();
         if self.inner.exclusive_access().domain == SocketDomain::Netlink {
             return self.send_netlink_route(&data);
@@ -1434,7 +1424,7 @@ impl LocalSocket {
             loop {
                 let mut peer = peer.exclusive_access();
                 if peer.read_shutdown {
-                    return Err(SysError::EPIPE);
+                    return Err(Errno::EPIPE);
                 }
                 if peer.can_enqueue_datagram(data_len) {
                     peer.enqueue_datagram(Datagram {
@@ -1450,17 +1440,17 @@ impl LocalSocket {
                     return Ok(data_len);
                 }
                 if nonblock {
-                    return Err(SysError::EAGAIN);
+                    return Err(Errno::EAGAIN);
                 }
                 if current_has_unmasked_signal() {
                     if let Some(task) = current_task() {
                         peer.remove_writer(&task);
                     }
-                    return Err(SysError::EINTR);
+                    return Err(Errno::EINTR);
                 }
                 perf::record_local_socket_writer_sleep();
                 let Some(task_cx_ptr) = peer.sleep_writer() else {
-                    return Err(SysError::EINTR);
+                    return Err(Errno::EINTR);
                 };
                 drop(peer);
                 schedule(task_cx_ptr);
@@ -1472,7 +1462,7 @@ impl LocalSocket {
                 .inner
                 .exclusive_access()
                 .peer
-                .ok_or(SysError::EDESTADDRREQ)?,
+                .ok_or(Errno::EDESTADDRREQ)?,
         };
         let candidates = {
             let mut loopback = LOOPBACK.exclusive_access();
@@ -1514,13 +1504,13 @@ impl LocalSocket {
             }
             drop(target);
             if nonblock {
-                return Err(SysError::EAGAIN);
+                return Err(Errno::EAGAIN);
             }
         }
         Ok(data.len())
     }
 
-    fn send_netlink_route(&self, request: &[u8]) -> SysResult<usize> {
+    fn send_netlink_route(&self, request: &[u8]) -> KResult<usize> {
         let responses = build_netlink_route_responses(request)?;
         let read_waiters = {
             let mut inner = self.inner.exclusive_access();
@@ -1544,14 +1534,14 @@ impl LocalSocket {
         &self,
         buf: UserBuffer,
         nonblock: bool,
-    ) -> SysResult<(usize, Option<SocketAddress>)> {
+    ) -> KResult<(usize, Option<SocketAddress>)> {
         match self.kind() {
             SocketKind::Stream => self.recv_stream(buf, nonblock).map(|len| (len, None)),
             SocketKind::Datagram => self.recv_datagram(buf, nonblock),
         }
     }
 
-    fn recv_stream(&self, buf: UserBuffer, nonblock: bool) -> SysResult<usize> {
+    fn recv_stream(&self, buf: UserBuffer, nonblock: bool) -> KResult<usize> {
         perf::record_local_socket_read_call();
         let mut buf = buf;
         let want = buf.len();
@@ -1582,17 +1572,17 @@ impl LocalSocket {
                 return Ok(0);
             }
             if nonblock {
-                return Err(SysError::EAGAIN);
+                return Err(Errno::EAGAIN);
             }
             if current_has_unmasked_signal() {
                 if let Some(task) = current_task() {
                     inner.remove_reader(&task);
                 }
-                return Err(SysError::EINTR);
+                return Err(Errno::EINTR);
             }
             perf::record_local_socket_reader_sleep();
             let Some(task_cx_ptr) = inner.sleep_reader() else {
-                return Err(SysError::EINTR);
+                return Err(Errno::EINTR);
             };
             drop(inner);
             schedule(task_cx_ptr);
@@ -1603,7 +1593,7 @@ impl LocalSocket {
         &self,
         buf: UserBuffer,
         nonblock: bool,
-    ) -> SysResult<(usize, Option<SocketAddress>)> {
+    ) -> KResult<(usize, Option<SocketAddress>)> {
         loop {
             let (packet, peer, writer, write_waiters, domain) = {
                 let mut inner = self.inner.exclusive_access();
@@ -1643,13 +1633,13 @@ impl LocalSocket {
                 return Ok((copied, Some(from)));
             }
             if nonblock {
-                return Err(SysError::EAGAIN);
+                return Err(Errno::EAGAIN);
             }
             if current_has_unmasked_signal() {
                 if let Some(task) = current_task() {
                     self.inner.exclusive_access().remove_reader(&task);
                 }
-                return Err(SysError::EINTR);
+                return Err(Errno::EINTR);
             }
             let task_cx_ptr = {
                 let mut inner = self.inner.exclusive_access();
@@ -1657,13 +1647,13 @@ impl LocalSocket {
                 inner.sleep_reader()
             };
             let Some(task_cx_ptr) = task_cx_ptr else {
-                return Err(SysError::EINTR);
+                return Err(Errno::EINTR);
             };
             schedule(task_cx_ptr);
         }
     }
 
-    fn recv_raw_datagram(&self, nonblock: bool) -> SysResult<Vec<u8>> {
+    fn recv_raw_datagram(&self, nonblock: bool) -> KResult<Vec<u8>> {
         loop {
             let (packet, writer, write_waiters) = {
                 let mut inner = self.inner.exclusive_access();
@@ -1679,13 +1669,13 @@ impl LocalSocket {
                 return Ok(packet.data);
             }
             if nonblock {
-                return Err(SysError::EAGAIN);
+                return Err(Errno::EAGAIN);
             }
             if current_has_unmasked_signal() {
                 if let Some(task) = current_task() {
                     self.inner.exclusive_access().remove_reader(&task);
                 }
-                return Err(SysError::EINTR);
+                return Err(Errno::EINTR);
             }
             let task_cx_ptr = {
                 let mut inner = self.inner.exclusive_access();
@@ -1693,7 +1683,7 @@ impl LocalSocket {
                 inner.sleep_reader()
             };
             let Some(task_cx_ptr) = task_cx_ptr else {
-                return Err(SysError::EINTR);
+                return Err(Errno::EINTR);
             };
             schedule(task_cx_ptr);
         }
@@ -1722,9 +1712,9 @@ impl LocalSocket {
         }
     }
 
-    fn peer_address(&self) -> SysResult<SocketAddress> {
+    fn peer_address(&self) -> KResult<SocketAddress> {
         let inner = self.inner.exclusive_access();
-        let peer = inner.peer.ok_or(SysError::ENOTCONN)?;
+        let peer = inner.peer.ok_or(Errno::ENOTCONN)?;
         Ok(match inner.domain {
             SocketDomain::Inet => SocketAddress::Inet(peer),
             SocketDomain::Inet6 => SocketAddress::Inet6(peer),
@@ -1754,22 +1744,22 @@ impl LocalSocket {
         }
     }
 
-    fn ensure_packet_domain(&self) -> SysResult<()> {
+    fn ensure_packet_domain(&self) -> KResult<()> {
         (self.inner.exclusive_access().domain == SocketDomain::Packet)
             .then_some(())
-            .ok_or(SysError::ENOPROTOOPT)
+            .ok_or(Errno::ENOPROTOOPT)
     }
 
-    fn set_packet_version(&self, version: i32) -> SysResult<()> {
+    fn set_packet_version(&self, version: i32) -> KResult<()> {
         self.ensure_packet_domain()?;
         if !(TPACKET_V1..=TPACKET_V3).contains(&version) {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         self.inner.exclusive_access().packet_version = version;
         Ok(())
     }
 
-    fn set_packet_reserve(&self, reserve: u32) -> SysResult<()> {
+    fn set_packet_reserve(&self, reserve: u32) -> KResult<()> {
         self.ensure_packet_domain()?;
         // CONTEXT: Packet mmap buffers are not allocated by this kernel. Cap
         // the visible reserve to one page so CVE probes cannot observe a
@@ -1778,24 +1768,24 @@ impl LocalSocket {
         Ok(())
     }
 
-    fn set_packet_rx_ring(&self, req: LinuxTPacketReq3) -> SysResult<()> {
+    fn set_packet_rx_ring(&self, req: LinuxTPacketReq3) -> KResult<()> {
         self.ensure_packet_domain()?;
         if req.tp_block_size == 0 || req.tp_sizeof_priv >= req.tp_block_size {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         if req.tp_block_nr == 1 && req.tp_frame_nr == 1 && req.tp_sizeof_priv == 0 {
             // CONTEXT: The packet socket subset does not allocate mmap rings or
             // arm packet timers. Returning EINVAL for the one-block fuzzing
             // shape keeps the CVE race probes on their safe-error path while
             // still accepting the multi-block ring cases that require success.
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         let mut inner = self.inner.exclusive_access();
         inner.packet_reserve = inner.packet_reserve.min(req.tp_block_size);
         Ok(())
     }
 
-    fn get_int_option(&self, level: i32, optname: i32) -> SysResult<i32> {
+    fn get_int_option(&self, level: i32, optname: i32) -> KResult<i32> {
         let inner = self.inner.exclusive_access();
         match (level, optname) {
             (SOL_SOCKET, SO_TYPE) => Ok(match inner.kind {
@@ -1822,13 +1812,13 @@ impl LocalSocket {
                 SO_DONTROUTE | SO_KEEPALIVE | SO_LINGER | SO_RCVTIMEO_OLD | SO_SNDTIMEO_OLD,
             )
             | (SOL_SOCKET, SO_RCVTIMEO_NEW | SO_SNDTIMEO_NEW) => Ok(0),
-            _ => Err(SysError::ENOPROTOOPT),
+            _ => Err(Errno::ENOPROTOOPT),
         }
     }
 
-    fn shutdown(&self, how: i32) -> SysResult {
+    fn shutdown(&self, how: i32) -> KResult {
         if !matches!(how, SHUT_RD | SHUT_WR | SHUT_RDWR) {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         let (peer, readers, writers, read_waiters, write_waiters) = {
             let mut inner = self.inner.exclusive_access();
@@ -1997,57 +1987,57 @@ impl AfAlgSocket {
         })
     }
 
-    fn validate_socket_type(ty: i32, protocol: i32) -> SysResult<()> {
+    fn validate_socket_type(ty: i32, protocol: i32) -> KResult<()> {
         if ty & SOCK_TYPE_MASK != SOCK_SEQPACKET {
-            return Err(SysError::EPROTONOSUPPORT);
+            return Err(Errno::EPROTONOSUPPORT);
         }
         if protocol != 0 {
-            return Err(SysError::EPROTONOSUPPORT);
+            return Err(Errno::EPROTONOSUPPORT);
         }
         Ok(())
     }
 
-    fn bind_alg(&self, addr: LinuxSockAddrAlg) -> SysResult<()> {
+    fn bind_alg(&self, addr: LinuxSockAddrAlg) -> KResult<()> {
         if addr.family as i32 != AF_ALG {
-            return Err(SysError::EAFNOSUPPORT);
+            return Err(Errno::EAFNOSUPPORT);
         }
         let alg_type = parse_alg_field(&addr.alg_type)?;
         let name = parse_alg_field(&addr.name)?;
         let binding = resolve_af_alg_binding(&alg_type, &name)?;
         let AfAlgSocketKind::Listener(state) = &self.kind else {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         };
         state.exclusive_access().binding = Some(binding);
         Ok(())
     }
 
-    fn set_key(&self, key: &[u8]) -> SysResult<()> {
+    fn set_key(&self, key: &[u8]) -> KResult<()> {
         let AfAlgSocketKind::Listener(state) = &self.kind else {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         };
         let mut state = state.exclusive_access();
-        let binding = state.binding.as_mut().ok_or(SysError::EINVAL)?;
+        let binding = state.binding.as_mut().ok_or(Errno::EINVAL)?;
         validate_af_alg_key(binding, key)?;
         binding.key.clear();
         binding.key.extend_from_slice(key);
         Ok(())
     }
 
-    fn accept_request(&self, flags: OpenFlags) -> SysResult<Arc<Self>> {
+    fn accept_request(&self, flags: OpenFlags) -> KResult<Arc<Self>> {
         let AfAlgSocketKind::Listener(state) = &self.kind else {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         };
         let binding = state
             .exclusive_access()
             .binding
             .clone()
-            .ok_or(SysError::EINVAL)?;
+            .ok_or(Errno::EINVAL)?;
         Ok(Self::new_request(binding, flags))
     }
 
-    fn send_msg(&self, msg: LinuxMsghdr) -> SysResult<usize> {
+    fn send_msg(&self, msg: LinuxMsghdr) -> KResult<usize> {
         if msg.msg_name != 0 || msg.msg_namelen != 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         let token = current_user_token();
         let params = parse_af_alg_send_params(token, &msg)?;
@@ -2056,9 +2046,9 @@ impl AfAlgSocket {
         Ok(payload.len())
     }
 
-    fn push_input(&self, data: &[u8], params: AfAlgSendParams) -> SysResult<()> {
+    fn push_input(&self, data: &[u8], params: AfAlgSendParams) -> KResult<()> {
         let AfAlgSocketKind::Request(state) = &self.kind else {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         };
         let mut state = state.exclusive_access();
         state.output = None;
@@ -2079,9 +2069,9 @@ impl AfAlgSocket {
         Ok(())
     }
 
-    fn prepare_output(&self) -> SysResult<()> {
+    fn prepare_output(&self) -> KResult<()> {
         let AfAlgSocketKind::Request(state) = &self.kind else {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         };
         let mut state = state.exclusive_access();
         if state.output.is_some() || state.output_done {
@@ -2093,11 +2083,11 @@ impl AfAlgSocket {
                 "salsa20" => Vec::new(),
                 "cbc(aes-generic)" => {
                     if state.input.len() % 16 != 0 {
-                        return Err(SysError::EINVAL);
+                        return Err(Errno::EINVAL);
                     }
                     state.input.clone()
                 }
-                _ => return Err(SysError::ENOENT),
+                _ => return Err(Errno::ENOENT),
             },
             AfAlgFamily::Aead => state.input.clone(),
         };
@@ -2105,10 +2095,10 @@ impl AfAlgSocket {
         Ok(())
     }
 
-    fn read_output(&self, mut buf: UserBuffer) -> SysResult<usize> {
+    fn read_output(&self, mut buf: UserBuffer) -> KResult<usize> {
         self.prepare_output()?;
         let AfAlgSocketKind::Request(state) = &self.kind else {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         };
         let mut state = state.exclusive_access();
         let output_len = state.output.as_ref().map_or(0, Vec::len);
@@ -2331,7 +2321,7 @@ impl File for LocalSocket {
     }
 }
 
-fn normalize_local_endpoint(endpoint: &mut InetEndpoint) -> SysResult<()> {
+fn normalize_local_endpoint(endpoint: &mut InetEndpoint) -> KResult<()> {
     if endpoint.ip == ANY_IP {
         endpoint.ip = LOOPBACK_IP;
     }
@@ -2339,12 +2329,12 @@ fn normalize_local_endpoint(endpoint: &mut InetEndpoint) -> SysResult<()> {
         // UNFINISHED: only loopback plus addresses configured on the synthetic
         // LTP veth devices are routable; virtio-net packet I/O is not wired
         // into socket syscalls yet.
-        return Err(SysError::EADDRNOTAVAIL);
+        return Err(Errno::EADDRNOTAVAIL);
     }
     Ok(())
 }
 
-fn normalize_remote_endpoint(endpoint: &mut InetEndpoint) -> SysResult<()> {
+fn normalize_remote_endpoint(endpoint: &mut InetEndpoint) -> KResult<()> {
     if endpoint.ip == ANY_IP {
         endpoint.ip = LOOPBACK_IP;
     }
@@ -2352,7 +2342,7 @@ fn normalize_remote_endpoint(endpoint: &mut InetEndpoint) -> SysResult<()> {
         // UNFINISHED: only loopback plus addresses configured on the synthetic
         // LTP veth devices are routable; virtio-net packet I/O is not wired
         // into socket syscalls yet.
-        return Err(SysError::EADDRNOTAVAIL);
+        return Err(Errno::EADDRNOTAVAIL);
     }
     Ok(())
 }
@@ -2364,7 +2354,7 @@ fn sockaddr_to_endpoint(addr: LinuxSockAddrIn) -> InetEndpoint {
     }
 }
 
-fn sockaddr_in6_to_endpoint(addr: LinuxSockAddrIn6) -> SysResult<InetEndpoint> {
+fn sockaddr_in6_to_endpoint(addr: LinuxSockAddrIn6) -> KResult<InetEndpoint> {
     let ip = if addr.addr == ANY_IPV6 {
         ANY_IP
     } else if addr.addr == LOOPBACK_IPV6 {
@@ -2375,7 +2365,7 @@ fn sockaddr_in6_to_endpoint(addr: LinuxSockAddrIn6) -> SysResult<InetEndpoint> {
     {
         [addr.addr[12], addr.addr[13], addr.addr[14], addr.addr[15]]
     } else {
-        return Err(SysError::EADDRNOTAVAIL);
+        return Err(Errno::EADDRNOTAVAIL);
     };
     Ok(InetEndpoint {
         ip,
@@ -2412,25 +2402,25 @@ fn endpoint_to_sockaddr_in6(endpoint: InetEndpoint) -> LinuxSockAddrIn6 {
     }
 }
 
-fn read_socket_address(token: usize, ptr: usize, len: u32) -> SysResult<SocketAddress> {
+fn read_socket_address(token: usize, ptr: usize, len: u32) -> KResult<SocketAddress> {
     if ptr == 0 {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     if (len as usize) < size_of::<u16>() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let family = read_user_value_with_mmap_fault(token, ptr as *const u16)? as i32;
     match family {
         AF_INET => {
             if (len as usize) < size_of::<LinuxSockAddrIn>() {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             let addr = read_user_value_with_mmap_fault(token, ptr as *const LinuxSockAddrIn)?;
             Ok(SocketAddress::Inet(sockaddr_to_endpoint(addr)))
         }
         AF_INET6 => {
             if (len as usize) < size_of::<LinuxSockAddrIn6>() {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             let addr = read_user_value_with_mmap_fault(token, ptr as *const LinuxSockAddrIn6)?;
             Ok(SocketAddress::Inet6(sockaddr_in6_to_endpoint(addr)?))
@@ -2438,15 +2428,15 @@ fn read_socket_address(token: usize, ptr: usize, len: u32) -> SysResult<SocketAd
         AF_UNIX => Ok(SocketAddress::Unix(read_unix_sockaddr(token, ptr, len)?)),
         AF_NETLINK => {
             if (len as usize) < size_of::<LinuxSockAddrNl>() {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             Ok(SocketAddress::Netlink)
         }
-        _ => Err(SysError::EAFNOSUPPORT),
+        _ => Err(Errno::EAFNOSUPPORT),
     }
 }
 
-fn read_unix_sockaddr(token: usize, ptr: usize, len: u32) -> SysResult<UnixSockAddr> {
+fn read_unix_sockaddr(token: usize, ptr: usize, len: u32) -> KResult<UnixSockAddr> {
     let path_len = (len as usize)
         .saturating_sub(size_of::<u16>())
         .min(size_of::<LinuxSockAddrUn>() - size_of::<u16>());
@@ -2464,7 +2454,7 @@ fn read_unix_sockaddr(token: usize, ptr: usize, len: u32) -> SysResult<UnixSockA
     if nul == 0 {
         return Ok(UnixSockAddr::Unnamed);
     }
-    let path = core::str::from_utf8(&path[..nul]).map_err(|_| SysError::EINVAL)?;
+    let path = core::str::from_utf8(&path[..nul]).map_err(|_| Errno::EINVAL)?;
     Ok(UnixSockAddr::Named(UnixAddress::Pathname(path.to_string())))
 }
 
@@ -2473,7 +2463,7 @@ fn write_socket_address(
     addr: usize,
     addrlen: usize,
     socket_addr: SocketAddress,
-) -> SysResult {
+) -> KResult {
     if addr == 0 || addrlen == 0 {
         return Ok(0);
     }
@@ -2482,7 +2472,7 @@ fn write_socket_address(
     match socket_addr {
         SocketAddress::Inet(endpoint) => {
             if (len as usize) < size_of::<LinuxSockAddrIn>() {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             write_user_value(
                 token,
@@ -2493,7 +2483,7 @@ fn write_socket_address(
         }
         SocketAddress::Inet6(endpoint) => {
             if (len as usize) < size_of::<LinuxSockAddrIn6>() {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             write_user_value(
                 token,
@@ -2504,7 +2494,7 @@ fn write_socket_address(
         }
         SocketAddress::Netlink => {
             if (len as usize) < size_of::<LinuxSockAddrNl>() {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             write_user_value(
                 token,
@@ -2531,9 +2521,9 @@ fn write_unix_sockaddr(
     len_ptr: *mut u32,
     input_len: usize,
     unix_addr: UnixSockAddr,
-) -> SysResult<()> {
+) -> KResult<()> {
     if input_len < size_of::<u16>() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let mut raw = LinuxSockAddrUn {
         family: AF_UNIX as u16,
@@ -2565,7 +2555,7 @@ fn write_unix_sockaddr(
     Ok(())
 }
 
-fn create_unix_path_node(path: &str) -> SysResult<()> {
+fn create_unix_path_node(path: &str) -> KResult<()> {
     let process = current_process();
     let snapshot = process.path_snapshot();
     let credentials = process.credentials();
@@ -2579,30 +2569,27 @@ fn create_unix_path_node(path: &str) -> SysResult<()> {
         0,
     )
     .map_err(|err| match err {
-        FsError::AlreadyExists => SysError::EADDRINUSE,
+        FsError::AlreadyExists => Errno::EADDRINUSE,
         other => other.into(),
     })
 }
 
-fn lookup_unix_endpoint(address: &UnixAddress) -> SysResult<InetEndpoint> {
+fn lookup_unix_endpoint(address: &UnixAddress) -> KResult<InetEndpoint> {
     let target = {
         let mut loopback = LOOPBACK.exclusive_access();
         loopback.prune();
         loopback.unix_bound.get(address).and_then(Weak::upgrade)
     };
     match target {
-        Some(socket) => socket
-            .exclusive_access()
-            .local
-            .ok_or(SysError::ECONNREFUSED),
+        Some(socket) => socket.exclusive_access().local.ok_or(Errno::ECONNREFUSED),
         None => match address {
-            UnixAddress::Pathname(_) => Err(SysError::ENOENT),
-            UnixAddress::Abstract(_) => Err(SysError::ECONNREFUSED),
+            UnixAddress::Pathname(_) => Err(Errno::ENOENT),
+            UnixAddress::Abstract(_) => Err(Errno::ECONNREFUSED),
         },
     }
 }
 
-fn copy_user_to_vec(token: usize, ptr: usize, len: usize) -> SysResult<Vec<u8>> {
+fn copy_user_to_vec(token: usize, ptr: usize, len: usize) -> KResult<Vec<u8>> {
     let mut data = Vec::with_capacity(len);
     for slice in translated_byte_buffer_checked_with_mmap_fault(
         token,
@@ -2615,12 +2602,12 @@ fn copy_user_to_vec(token: usize, ptr: usize, len: usize) -> SysResult<Vec<u8>> 
     Ok(data)
 }
 
-fn read_msg_iovecs(token: usize, iov: usize, iovlen: usize) -> SysResult<Vec<u8>> {
+fn read_msg_iovecs(token: usize, iov: usize, iovlen: usize) -> KResult<Vec<u8>> {
     if iovlen == 0 {
         return Ok(Vec::new());
     }
     if iov == 0 || iovlen > 1024 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let mut data = Vec::new();
     for index in 0..iovlen {
@@ -2630,19 +2617,19 @@ fn read_msg_iovecs(token: usize, iov: usize, iovlen: usize) -> SysResult<Vec<u8>
         }
         let next_len = data.checked_len_add(entry.len)?;
         if next_len > isize::MAX as usize {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         data.extend_from_slice(&copy_user_to_vec(token, entry.base, entry.len)?);
     }
     Ok(data)
 }
 
-fn copy_to_msg_iovecs(token: usize, iov: usize, iovlen: usize, data: &[u8]) -> SysResult<usize> {
+fn copy_to_msg_iovecs(token: usize, iov: usize, iovlen: usize, data: &[u8]) -> KResult<usize> {
     if iovlen == 0 {
         return Ok(0);
     }
     if iov == 0 || iovlen > 1024 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let mut written = 0usize;
     for index in 0..iovlen {
@@ -2665,35 +2652,35 @@ fn copy_to_msg_iovecs(token: usize, iov: usize, iovlen: usize, data: &[u8]) -> S
 }
 
 trait VecLenChecked {
-    fn checked_len_add(&self, len: usize) -> SysResult<usize>;
+    fn checked_len_add(&self, len: usize) -> KResult<usize>;
 }
 
 impl VecLenChecked for Vec<u8> {
-    fn checked_len_add(&self, len: usize) -> SysResult<usize> {
-        self.len().checked_add(len).ok_or(SysError::EINVAL)
+    fn checked_len_add(&self, len: usize) -> KResult<usize> {
+        self.len().checked_add(len).ok_or(Errno::EINVAL)
     }
 }
 
-fn read_sockaddr_alg(token: usize, ptr: usize, len: u32) -> SysResult<LinuxSockAddrAlg> {
+fn read_sockaddr_alg(token: usize, ptr: usize, len: u32) -> KResult<LinuxSockAddrAlg> {
     if ptr == 0 {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     if (len as usize) < size_of::<LinuxSockAddrAlg>() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     read_user_value(token, ptr as *const LinuxSockAddrAlg)
 }
 
-fn parse_alg_field(bytes: &[u8]) -> SysResult<String> {
+fn parse_alg_field(bytes: &[u8]) -> KResult<String> {
     let len = bytes
         .iter()
         .position(|&byte| byte == 0)
         .unwrap_or(bytes.len());
-    let raw = core::str::from_utf8(&bytes[..len]).map_err(|_| SysError::EINVAL)?;
+    let raw = core::str::from_utf8(&bytes[..len]).map_err(|_| Errno::EINVAL)?;
     Ok(raw.to_string())
 }
 
-fn resolve_af_alg_binding(alg_type: &str, name: &str) -> SysResult<AfAlgBinding> {
+fn resolve_af_alg_binding(alg_type: &str, name: &str) -> KResult<AfAlgBinding> {
     let family = match alg_type {
         "hash" if has_af_alg_hash(name) => AfAlgFamily::Hash,
         "skcipher" if matches!(name, "salsa20" | "cbc(aes-generic)") => AfAlgFamily::Skcipher,
@@ -2705,7 +2692,7 @@ fn resolve_af_alg_binding(alg_type: &str, name: &str) -> SysResult<AfAlgBinding>
         {
             AfAlgFamily::Aead
         }
-        _ => return Err(SysError::ENOENT),
+        _ => return Err(Errno::ENOENT),
     };
     Ok(AfAlgBinding {
         family,
@@ -2730,69 +2717,67 @@ fn has_af_alg_hash(name: &str) -> bool {
     }
 }
 
-fn validate_af_alg_key(binding: &AfAlgBinding, key: &[u8]) -> SysResult<()> {
+fn validate_af_alg_key(binding: &AfAlgBinding, key: &[u8]) -> KResult<()> {
     if binding.name == "authenc(hmac(sha256),cbc(aes))" && key.len() < 12 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(())
 }
 
-fn parse_af_alg_send_params(token: usize, msg: &LinuxMsghdr) -> SysResult<AfAlgSendParams> {
+fn parse_af_alg_send_params(token: usize, msg: &LinuxMsghdr) -> KResult<AfAlgSendParams> {
     let mut params = AfAlgSendParams::default();
     if msg.msg_control == 0 || msg.msg_controllen == 0 {
         return Ok(params);
     }
     let mut ptr = msg.msg_control;
-    let end = ptr
-        .checked_add(msg.msg_controllen)
-        .ok_or(SysError::EINVAL)?;
+    let end = ptr.checked_add(msg.msg_controllen).ok_or(Errno::EINVAL)?;
     while ptr
         .checked_add(size_of::<LinuxCmsghdr>())
         .is_some_and(|header_end| header_end <= end)
     {
         let hdr = read_user_value(token, ptr as *const LinuxCmsghdr)?;
         if hdr.cmsg_len < size_of::<LinuxCmsghdr>() {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
-        let cmsg_end = ptr.checked_add(hdr.cmsg_len).ok_or(SysError::EINVAL)?;
+        let cmsg_end = ptr.checked_add(hdr.cmsg_len).ok_or(Errno::EINVAL)?;
         if cmsg_end > end || hdr.cmsg_level != SOL_ALG {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         let data_len = hdr.cmsg_len - size_of::<LinuxCmsghdr>();
         let data = copy_user_to_vec(token, ptr + size_of::<LinuxCmsghdr>(), data_len)?;
         match hdr.cmsg_type {
             ALG_SET_OP => {
                 if data.len() != size_of::<u32>() {
-                    return Err(SysError::EINVAL);
+                    return Err(Errno::EINVAL);
                 }
                 let raw = read_u32_ne(&data);
                 params.op = Some(match raw {
                     ALG_OP_DECRYPT => AfAlgOperation::Decrypt,
                     ALG_OP_ENCRYPT => AfAlgOperation::Encrypt,
-                    _ => return Err(SysError::EINVAL),
+                    _ => return Err(Errno::EINVAL),
                 });
             }
             ALG_SET_IV => {
                 if data.len() < size_of::<u32>() {
-                    return Err(SysError::EINVAL);
+                    return Err(Errno::EINVAL);
                 }
                 let ivlen = read_u32_ne(&data[..size_of::<u32>()]) as usize;
                 if data.len() < size_of::<u32>() + ivlen {
-                    return Err(SysError::EINVAL);
+                    return Err(Errno::EINVAL);
                 }
                 params.iv = Some(data[size_of::<u32>()..size_of::<u32>() + ivlen].to_vec());
             }
             ALG_SET_AEAD_ASSOCLEN => {
                 if data.len() != size_of::<u32>() {
-                    return Err(SysError::EINVAL);
+                    return Err(Errno::EINVAL);
                 }
                 params.assoclen = Some(read_u32_ne(&data));
             }
-            _ => return Err(SysError::EINVAL),
+            _ => return Err(Errno::EINVAL),
         }
         ptr = ptr
             .checked_add(cmsg_align(hdr.cmsg_len))
-            .ok_or(SysError::EINVAL)?;
+            .ok_or(Errno::EINVAL)?;
     }
     Ok(params)
 }
@@ -2803,16 +2788,16 @@ fn read_u32_ne(bytes: &[u8]) -> u32 {
     u32::from_ne_bytes(raw)
 }
 
-fn read_u16_ne_at(bytes: &[u8], offset: usize) -> SysResult<u16> {
+fn read_u16_ne_at(bytes: &[u8], offset: usize) -> KResult<u16> {
     if bytes.len() < offset + size_of::<u16>() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(u16::from_ne_bytes([bytes[offset], bytes[offset + 1]]))
 }
 
-fn read_u32_ne_at(bytes: &[u8], offset: usize) -> SysResult<u32> {
+fn read_u32_ne_at(bytes: &[u8], offset: usize) -> KResult<u32> {
     if bytes.len() < offset + size_of::<u32>() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(u32::from_ne_bytes([
         bytes[offset],
@@ -3059,13 +3044,13 @@ fn handle_addr_request(message: &[u8], add: bool) {
     }
 }
 
-fn build_netlink_route_responses(request: &[u8]) -> SysResult<Vec<Vec<u8>>> {
+fn build_netlink_route_responses(request: &[u8]) -> KResult<Vec<Vec<u8>>> {
     if request.len() < size_of::<u32>() * 4 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let msg_len = read_u32_ne_at(request, 0)? as usize;
     if msg_len < size_of::<u32>() * 4 || msg_len > request.len() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let msg_type = read_u16_ne_at(request, 4)?;
     let seq = read_u32_ne_at(request, 8)?;
@@ -3114,7 +3099,7 @@ fn build_netlink_route_responses(request: &[u8]) -> SysResult<Vec<Vec<u8>>> {
         RTM_NEWROUTE | RTM_DELROUTE => {
             responses.push(push_netlink_ack(seq, pid, &request[..msg_len]));
         }
-        _ => return Err(SysError::ENOTSUP),
+        _ => return Err(Errno::ENOTSUP),
     }
     Ok(responses)
 }
@@ -3124,9 +3109,9 @@ fn cmsg_align(len: usize) -> usize {
     (len + align - 1) & !(align - 1)
 }
 
-fn open_flags_from_socket_type(ty: i32) -> SysResult<OpenFlags> {
+fn open_flags_from_socket_type(ty: i32) -> KResult<OpenFlags> {
     if ty & !(SOCK_TYPE_MASK | VALID_SOCKET_TYPE_FLAGS) != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let mut flags = OpenFlags::RDWR;
     if ty & SOCK_NONBLOCK != 0 {
@@ -3138,9 +3123,9 @@ fn open_flags_from_socket_type(ty: i32) -> SysResult<OpenFlags> {
     Ok(flags)
 }
 
-fn open_flags_from_accept4(flags: i32) -> SysResult<OpenFlags> {
+fn open_flags_from_accept4(flags: i32) -> KResult<OpenFlags> {
     if flags & !VALID_ACCEPT4_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let mut open_flags = OpenFlags::RDWR;
     if flags & SOCK_NONBLOCK != 0 {
@@ -3152,18 +3137,18 @@ fn open_flags_from_accept4(flags: i32) -> SysResult<OpenFlags> {
     Ok(open_flags)
 }
 
-fn socket_kind_from_type(ty: i32) -> SysResult<SocketKind> {
+fn socket_kind_from_type(ty: i32) -> KResult<SocketKind> {
     match ty & SOCK_TYPE_MASK {
         SOCK_STREAM => Ok(SocketKind::Stream),
         SOCK_DGRAM => Ok(SocketKind::Datagram),
         // CONTEXT: The bind LTP subset only uses AF_UNIX SOCK_SEQPACKET for
         // connection-oriented local IPC. We reuse the stream queue semantics.
         SOCK_SEQPACKET => Ok(SocketKind::Stream),
-        _ => Err(SysError::EPROTONOSUPPORT),
+        _ => Err(Errno::EPROTONOSUPPORT),
     }
 }
 
-fn validate_protocol(kind: SocketKind, protocol: i32) -> SysResult {
+fn validate_protocol(kind: SocketKind, protocol: i32) -> KResult {
     match (kind, protocol) {
         (_, IPPROTO_IP) => Ok(0),
         (SocketKind::Stream, IPPROTO_TCP) => Ok(0),
@@ -3172,34 +3157,34 @@ fn validate_protocol(kind: SocketKind, protocol: i32) -> SysResult {
         // behavior for SCTP and UDP-Lite, so both reuse the existing queues.
         (SocketKind::Stream, IPPROTO_SCTP) => Ok(0),
         (SocketKind::Datagram, IPPROTO_UDPLITE) => Ok(0),
-        _ => Err(SysError::EPROTONOSUPPORT),
+        _ => Err(Errno::EPROTONOSUPPORT),
     }
 }
 
-fn with_socket<T>(fd: usize, f: impl FnOnce(&LocalSocket) -> SysResult<T>) -> SysResult<T> {
+fn with_socket<T>(fd: usize, f: impl FnOnce(&LocalSocket) -> KResult<T>) -> KResult<T> {
     let file = file_from_fd(fd)?;
     let socket = file
         .as_any()
         .downcast_ref::<LocalSocket>()
-        .ok_or(SysError::ENOTSOCK)?;
+        .ok_or(Errno::ENOTSOCK)?;
     f(socket)
 }
 
-fn file_from_fd(fd: usize) -> SysResult<Arc<dyn File + Send + Sync>> {
+fn file_from_fd(fd: usize) -> KResult<Arc<dyn File + Send + Sync>> {
     let process = current_process();
     let inner = process.inner_exclusive_access();
     let entry = inner
         .fd_table
         .get(fd)
         .and_then(|entry| entry.as_ref())
-        .ok_or(SysError::EBADF)?;
+        .ok_or(Errno::EBADF)?;
     if entry.status_flags().contains(OpenFlags::PATH) {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     Ok(entry.file())
 }
 
-fn alloc_socket_fd(file: Arc<dyn File + Send + Sync>, flags: OpenFlags) -> SysResult<usize> {
+fn alloc_socket_fd(file: Arc<dyn File + Send + Sync>, flags: OpenFlags) -> KResult<usize> {
     install_file_fd(file, flags, None).map(|fd| fd as usize)
 }
 
@@ -3207,42 +3192,42 @@ fn recv_nonblock(flags: i32, socket: &LocalSocket) -> bool {
     flags & MSG_DONTWAIT != 0 || socket.status_flags().contains(OpenFlags::NONBLOCK)
 }
 
-fn read_i32_option(token: usize, val: usize, len: u32) -> SysResult<i32> {
+fn read_i32_option(token: usize, val: usize, len: u32) -> KResult<i32> {
     if val == 0 {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     if (len as usize) < size_of::<i32>() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     read_user_value(token, val as *const i32)
 }
 
-fn read_u32_option(token: usize, val: usize, len: u32) -> SysResult<u32> {
+fn read_u32_option(token: usize, val: usize, len: u32) -> KResult<u32> {
     if val == 0 {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     if (len as usize) < size_of::<u32>() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     read_user_value(token, val as *const u32)
 }
 
-fn read_tpacket_req3_option(token: usize, val: usize, len: u32) -> SysResult<LinuxTPacketReq3> {
+fn read_tpacket_req3_option(token: usize, val: usize, len: u32) -> KResult<LinuxTPacketReq3> {
     if val == 0 {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     if (len as usize) < size_of::<LinuxTPacketReq3>() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     read_user_value(token, val as *const LinuxTPacketReq3)
 }
 
-fn validate_socket_option_buffer(token: usize, val: usize, len: u32) -> SysResult<()> {
+fn validate_socket_option_buffer(token: usize, val: usize, len: u32) -> KResult<()> {
     if len == 0 {
         return Ok(());
     }
     if val == 0 {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     translated_byte_buffer_checked(
         token,
@@ -3261,7 +3246,7 @@ fn forced_socket_buffer_size(raw: u32) -> i32 {
     }
 }
 
-pub fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
+pub fn sys_socket(domain: i32, ty: i32, protocol: i32) -> KResult {
     let flags = open_flags_from_socket_type(ty)?;
     if domain == AF_ALG {
         AfAlgSocket::validate_socket_type(ty, protocol)?;
@@ -3270,17 +3255,17 @@ pub fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
     }
     if domain == AF_NETLINK {
         if !matches!(ty & SOCK_TYPE_MASK, SOCK_RAW | SOCK_DGRAM) {
-            return Err(SysError::EPROTONOSUPPORT);
+            return Err(Errno::EPROTONOSUPPORT);
         }
         if protocol != NETLINK_ROUTE {
-            return Err(SysError::EPROTONOSUPPORT);
+            return Err(Errno::EPROTONOSUPPORT);
         }
         let socket = LocalSocket::new(SocketDomain::Netlink, SocketKind::Datagram, flags);
         return Ok(alloc_socket_fd(socket, flags)? as isize);
     }
     if domain == AF_PACKET {
         if !matches!(ty & SOCK_TYPE_MASK, SOCK_RAW | SOCK_DGRAM) {
-            return Err(SysError::EPROTONOSUPPORT);
+            return Err(Errno::EPROTONOSUPPORT);
         }
         // CONTEXT: LTP packet socket CVE probes only exercise SOL_PACKET
         // metadata and never exchange link-layer frames.
@@ -3292,7 +3277,7 @@ pub fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
     match domain {
         AF_INET | AF_INET6 => {
             if ty & SOCK_TYPE_MASK == SOCK_SEQPACKET {
-                return Err(SysError::EPROTONOSUPPORT);
+                return Err(Errno::EPROTONOSUPPORT);
             }
             validate_protocol(kind, protocol)?;
             let socket = LocalSocket::new(
@@ -3308,7 +3293,7 @@ pub fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
         }
         AF_UNIX => {
             if protocol != 0 {
-                return Err(SysError::EPROTONOSUPPORT);
+                return Err(Errno::EPROTONOSUPPORT);
             }
             // CONTEXT: libc group/passwd lookup probes AF_UNIX nscd first.
             // The local AF_UNIX subset below supports pathname/abstract bind
@@ -3316,19 +3301,19 @@ pub fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
             let socket = LocalSocket::new(SocketDomain::Unix, kind, flags);
             Ok(alloc_socket_fd(socket, flags)? as isize)
         }
-        _ => Err(SysError::EAFNOSUPPORT),
+        _ => Err(Errno::EAFNOSUPPORT),
     }
 }
 
-pub fn sys_socketpair(domain: i32, ty: i32, protocol: i32, sv: usize) -> SysResult {
+pub fn sys_socketpair(domain: i32, ty: i32, protocol: i32, sv: usize) -> KResult {
     if sv == 0 {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     if domain != AF_UNIX {
-        return Err(SysError::EAFNOSUPPORT);
+        return Err(Errno::EAFNOSUPPORT);
     }
     if protocol != 0 {
-        return Err(SysError::EPROTONOSUPPORT);
+        return Err(Errno::EPROTONOSUPPORT);
     }
     let kind = socket_kind_from_type(ty)?;
     let flags = open_flags_from_socket_type(ty)?;
@@ -3368,8 +3353,8 @@ pub fn sys_socketpair(domain: i32, ty: i32, protocol: i32, sv: usize) -> SysResu
     let fds = {
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
-        let first_fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
-        let second_fd = inner.alloc_fd_from(first_fd + 1).ok_or(SysError::EMFILE)?;
+        let first_fd = inner.alloc_fd_from(0).ok_or(Errno::EMFILE)?;
+        let second_fd = inner.alloc_fd_from(first_fd + 1).ok_or(Errno::EMFILE)?;
         let previous = inner.set_fd_entry(first_fd, FdTableEntry::from_file(first, flags));
         debug_assert!(previous.is_none());
         let previous = inner.set_fd_entry(second_fd, FdTableEntry::from_file(second, flags));
@@ -3394,7 +3379,7 @@ pub fn sys_socketpair(domain: i32, ty: i32, protocol: i32, sv: usize) -> SysResu
     Ok(0)
 }
 
-pub fn sys_bind(fd: usize, addr: usize, addrlen: u32) -> SysResult {
+pub fn sys_bind(fd: usize, addr: usize, addrlen: u32) -> KResult {
     let token = current_user_token();
     let file = file_from_fd(fd)?;
     if let Some(socket) = file.as_any().downcast_ref::<AfAlgSocket>() {
@@ -3404,25 +3389,25 @@ pub fn sys_bind(fd: usize, addr: usize, addrlen: u32) -> SysResult {
     let socket = file
         .as_any()
         .downcast_ref::<LocalSocket>()
-        .ok_or(SysError::ENOTSOCK)?;
+        .ok_or(Errno::ENOTSOCK)?;
     let socket_addr = read_socket_address(token, addr, addrlen)?;
     socket.bind_address(socket_addr)
 }
 
-pub fn sys_listen(fd: usize, backlog: i32) -> SysResult {
+pub fn sys_listen(fd: usize, backlog: i32) -> KResult {
     with_socket(fd, |socket| {
         if socket.kind() != SocketKind::Stream {
-            return Err(SysError::ENOTSUP);
+            return Err(Errno::ENOTSUP);
         }
         socket.listen(backlog)
     })
 }
 
-pub fn sys_accept(fd: usize, addr: usize, addrlen: usize) -> SysResult {
+pub fn sys_accept(fd: usize, addr: usize, addrlen: usize) -> KResult {
     sys_accept4(fd, addr, addrlen, 0)
 }
 
-pub fn sys_accept4(fd: usize, addr: usize, addrlen: usize, flags: i32) -> SysResult {
+pub fn sys_accept4(fd: usize, addr: usize, addrlen: usize, flags: i32) -> KResult {
     let open_flags = open_flags_from_accept4(flags)?;
     let token = current_user_token();
     let file = file_from_fd(fd)?;
@@ -3436,27 +3421,27 @@ pub fn sys_accept4(fd: usize, addr: usize, addrlen: usize, flags: i32) -> SysRes
     let socket = file
         .as_any()
         .downcast_ref::<LocalSocket>()
-        .ok_or(SysError::ENOTSOCK)?;
+        .ok_or(Errno::ENOTSOCK)?;
     let accepted = socket.accept(socket.status_flags().contains(OpenFlags::NONBLOCK))?;
     let peer = accepted.peer_address()?;
     write_socket_address(token, addr, addrlen, peer)?;
     Ok(alloc_socket_fd(accepted, open_flags)? as isize)
 }
 
-pub fn sys_connect(fd: usize, addr: usize, addrlen: u32) -> SysResult {
+pub fn sys_connect(fd: usize, addr: usize, addrlen: u32) -> KResult {
     let token = current_user_token();
     let socket_addr = read_socket_address(token, addr, addrlen)?;
     with_socket(fd, |socket| socket.connect(socket_addr))
 }
 
-pub fn sys_getsockname(fd: usize, addr: usize, addrlen: usize) -> SysResult {
+pub fn sys_getsockname(fd: usize, addr: usize, addrlen: usize) -> KResult {
     let token = current_user_token();
     with_socket(fd, |socket| {
         write_socket_address(token, addr, addrlen, socket.local_address())
     })
 }
 
-pub fn sys_getpeername(fd: usize, addr: usize, addrlen: usize) -> SysResult {
+pub fn sys_getpeername(fd: usize, addr: usize, addrlen: usize) -> KResult {
     let token = current_user_token();
     with_socket(fd, |socket| {
         write_socket_address(token, addr, addrlen, socket.peer_address()?)
@@ -3470,7 +3455,7 @@ pub fn sys_sendto(
     flags: i32,
     addr: usize,
     addrlen: u32,
-) -> SysResult {
+) -> KResult {
     let token = current_user_token();
     let data = copy_user_to_vec(token, buf, len)?;
     let remote = if addr == 0 {
@@ -3481,9 +3466,9 @@ pub fn sys_sendto(
     with_socket(fd, |socket| {
         match socket.send_bytes(data, remote, recv_nonblock(flags, socket)) {
             Ok(written) => Ok(written as isize),
-            Err(SysError::EPIPE) => {
+            Err(Errno::EPIPE) => {
                 current_add_signal(SignalFlags::SIGPIPE);
-                Err(SysError::EPIPE)
+                Err(Errno::EPIPE)
             }
             Err(err) => Err(err),
         }
@@ -3497,7 +3482,7 @@ pub fn sys_recvfrom(
     flags: i32,
     addr: usize,
     addrlen: usize,
-) -> SysResult {
+) -> KResult {
     let token = current_user_token();
     let user_buf = UserBuffer::new(translated_byte_buffer_checked(
         token,
@@ -3514,12 +3499,12 @@ pub fn sys_recvfrom(
     })
 }
 
-pub fn sys_setsockopt(fd: usize, level: i32, name: i32, val: usize, len: u32) -> SysResult {
+pub fn sys_setsockopt(fd: usize, level: i32, name: i32, val: usize, len: u32) -> KResult {
     let token = current_user_token();
     let file = file_from_fd(fd)?;
     if let Some(socket) = file.as_any().downcast_ref::<AfAlgSocket>() {
         if level != SOL_ALG || name != ALG_SET_KEY {
-            return Err(SysError::ENOPROTOOPT);
+            return Err(Errno::ENOPROTOOPT);
         }
         let key = copy_user_to_vec(token, val, len as usize)?;
         socket.set_key(&key)?;
@@ -3528,7 +3513,7 @@ pub fn sys_setsockopt(fd: usize, level: i32, name: i32, val: usize, len: u32) ->
     let socket = file
         .as_any()
         .downcast_ref::<LocalSocket>()
-        .ok_or(SysError::ENOTSOCK)?;
+        .ok_or(Errno::ENOTSOCK)?;
     {
         match (level, name) {
             (SOL_SOCKET, SO_REUSEADDR) => {
@@ -3591,12 +3576,12 @@ pub fn sys_setsockopt(fd: usize, level: i32, name: i32, val: usize, len: u32) ->
                 // of the requested group; this is enough to avoid inheriting
                 // fake membership across accept().
                 validate_socket_option_buffer(token, val, len)?;
-                return Err(SysError::EADDRNOTAVAIL);
+                return Err(Errno::EADDRNOTAVAIL);
             }
             (IPPROTO_IP, IPT_SO_SET_REPLACE) => {
                 validate_socket_option_buffer(token, val, len)?;
                 if (len as usize) < size_of::<u32>() {
-                    return Err(SysError::EINVAL);
+                    return Err(Errno::EINVAL);
                 }
             }
             (IPPROTO_IP, optname) if optname >= 0 => {
@@ -3611,22 +3596,22 @@ pub fn sys_setsockopt(fd: usize, level: i32, name: i32, val: usize, len: u32) ->
                 // must stay rejected at UDP level for LTP errno coverage.
                 validate_socket_option_buffer(token, val, len)?;
             }
-            _ => return Err(SysError::ENOPROTOOPT),
+            _ => return Err(Errno::ENOPROTOOPT),
         }
         Ok(0)
     }
 }
 
-pub fn sys_getsockopt(fd: usize, level: i32, name: i32, val: usize, len: usize) -> SysResult {
+pub fn sys_getsockopt(fd: usize, level: i32, name: i32, val: usize, len: usize) -> KResult {
     let token = current_user_token();
     if val == 0 || len == 0 {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     with_socket(fd, |socket| {
         let len_ptr = len as *mut u32;
         let optlen = read_user_value(token, len_ptr.cast_const())?;
         if optlen == 0 {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
         let value = socket.get_int_option(level, name)?;
         let bytes = value.to_ne_bytes();
@@ -3637,11 +3622,11 @@ pub fn sys_getsockopt(fd: usize, level: i32, name: i32, val: usize, len: usize) 
     })
 }
 
-pub fn sys_shutdown(fd: usize, how: i32) -> SysResult {
+pub fn sys_shutdown(fd: usize, how: i32) -> KResult {
     with_socket(fd, |socket| socket.shutdown(how))
 }
 
-pub fn sys_sendmsg(fd: usize, msg: usize, _flags: i32) -> SysResult {
+pub fn sys_sendmsg(fd: usize, msg: usize, _flags: i32) -> KResult {
     let file = file_from_fd(fd)?;
     if let Some(socket) = file.as_any().downcast_ref::<AfAlgSocket>() {
         let token = current_user_token();
@@ -3659,22 +3644,22 @@ pub fn sys_sendmsg(fd: usize, msg: usize, _flags: i32) -> SysResult {
         };
         return match socket.send_bytes(data, remote, recv_nonblock(_flags, socket)) {
             Ok(written) => Ok(written as isize),
-            Err(SysError::EPIPE) => {
+            Err(Errno::EPIPE) => {
                 current_add_signal(SignalFlags::SIGPIPE);
-                Err(SysError::EPIPE)
+                Err(Errno::EPIPE)
             }
             Err(err) => Err(err),
         };
     }
-    Err(SysError::ENOTSOCK)
+    Err(Errno::ENOTSOCK)
 }
 
-pub fn sys_sendmmsg(fd: usize, msgvec: usize, vlen: usize, flags: i32) -> SysResult {
+pub fn sys_sendmmsg(fd: usize, msgvec: usize, vlen: usize, flags: i32) -> KResult {
     if vlen == 0 {
         return Ok(0);
     }
     if vlen > 1024 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let token = current_user_token();
@@ -3682,8 +3667,8 @@ pub fn sys_sendmmsg(fd: usize, msgvec: usize, vlen: usize, flags: i32) -> SysRes
     for index in 0..vlen {
         let offset = index
             .checked_mul(size_of::<LinuxMmsghdr>())
-            .ok_or(SysError::EFAULT)?;
-        let ptr = msgvec.checked_add(offset).ok_or(SysError::EFAULT)?;
+            .ok_or(Errno::EFAULT)?;
+        let ptr = msgvec.checked_add(offset).ok_or(Errno::EFAULT)?;
         match sys_sendmsg(fd, ptr, flags) {
             Ok(len) => {
                 let mut header = read_user_value(token, ptr as *const LinuxMmsghdr)?;
@@ -3698,30 +3683,24 @@ pub fn sys_sendmmsg(fd: usize, msgvec: usize, vlen: usize, flags: i32) -> SysRes
     Ok(sent as isize)
 }
 
-fn validate_recvmmsg_timeout(timeout: usize) -> SysResult<()> {
+fn validate_recvmmsg_timeout(timeout: usize) -> KResult<()> {
     if timeout == 0 {
         return Ok(());
     }
     let token = current_user_token();
     let timeout = read_user_value(token, timeout as *const LinuxOldTimespec)?;
     if timeout.tv_sec < 0 || timeout.tv_nsec < 0 || timeout.tv_nsec >= 1_000_000_000 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(())
 }
 
-pub fn sys_recvmmsg(
-    fd: usize,
-    msgvec: usize,
-    vlen: usize,
-    flags: i32,
-    timeout: usize,
-) -> SysResult {
+pub fn sys_recvmmsg(fd: usize, msgvec: usize, vlen: usize, flags: i32, timeout: usize) -> KResult {
     if vlen == 0 {
         return Ok(0);
     }
     if vlen > 1024 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     validate_recvmmsg_timeout(timeout)?;
 
@@ -3730,8 +3709,8 @@ pub fn sys_recvmmsg(
     for index in 0..vlen {
         let offset = index
             .checked_mul(size_of::<LinuxMmsghdr>())
-            .ok_or(SysError::EFAULT)?;
-        let ptr = msgvec.checked_add(offset).ok_or(SysError::EFAULT)?;
+            .ok_or(Errno::EFAULT)?;
+        let ptr = msgvec.checked_add(offset).ok_or(Errno::EFAULT)?;
         let recv_flags = if received > 0 && flags & MSG_WAITFORONE != 0 {
             flags | MSG_DONTWAIT
         } else {
@@ -3754,12 +3733,12 @@ pub fn sys_recvmmsg(
     Ok(received as isize)
 }
 
-pub fn sys_recvmsg(fd: usize, msg: usize, flags: i32) -> SysResult {
+pub fn sys_recvmsg(fd: usize, msg: usize, flags: i32) -> KResult {
     let file = file_from_fd(fd)?;
     if let Some(socket) = file.as_any().downcast_ref::<LocalSocket>() {
         if socket.kind() != SocketKind::Datagram {
             // UNFINISHED: stream recvmsg scatter/gather is not implemented.
-            return Err(SysError::ENOSYS);
+            return Err(Errno::ENOSYS);
         }
         let token = current_user_token();
         let mut msg_value = read_user_value(token, msg as *const LinuxMsghdr)?;
@@ -3784,5 +3763,5 @@ pub fn sys_recvmsg(fd: usize, msg: usize, flags: i32) -> SysResult {
         write_user_value(token, msg as *mut LinuxMsghdr, &msg_value)?;
         return Ok(copied as isize);
     }
-    Err(SysError::ENOTSOCK)
+    Err(Errno::ENOTSOCK)
 }

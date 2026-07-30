@@ -1,12 +1,12 @@
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::SyscallContext;
-use crate::syscall::errno::{SysError, SysResult};
 use crate::task::{
     ProcessControlBlock, SignalFlags, SignalInfo, current_process, current_task,
     exit_current_and_run_next, exit_current_group_and_run_next,
     notify_if_orphaned_stopped_process_group, pid2process, processes_snapshot,
     queue_signal_to_task, suspend_current_and_run_next, wakeup_task,
 };
+use crate::uapi::errno::{Errno, KResult};
 use alloc::{sync::Arc, vec::Vec};
 
 pub fn sys_exit(exit_code: i32) -> ! {
@@ -129,9 +129,9 @@ fn process_group_from_visible_id(
 // are allocated monotonically and are deliberately not recycled.
 static JOB_CONTROL_IDENTITY_LOCK: SpinNoIrqLock<()> = SpinNoIrqLock::new(());
 
-pub fn sys_setpgid_ctx(ctx: &SyscallContext, pid: isize, pgid: isize) -> SysResult {
+pub fn sys_setpgid_ctx(ctx: &SyscallContext, pid: isize, pgid: isize) -> KResult {
     if pid < 0 || pgid < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let current = ctx.process();
     let target_pid = if pid == 0 {
@@ -142,7 +142,7 @@ pub fn sys_setpgid_ctx(ctx: &SyscallContext, pid: isize, pgid: isize) -> SysResu
     let target = if target_pid == current.getpid() {
         Arc::clone(current)
     } else {
-        process_from_visible_pid(current, target_pid).ok_or(SysError::ESRCH)?
+        process_from_visible_pid(current, target_pid).ok_or(Errno::ESRCH)?
     };
     let target_is_caller = Arc::ptr_eq(&target, current);
     if !target_is_caller
@@ -150,39 +150,39 @@ pub fn sys_setpgid_ctx(ctx: &SyscallContext, pid: isize, pgid: isize) -> SysResu
             .parent_process()
             .is_some_and(|parent| Arc::ptr_eq(&parent, current))
     {
-        return Err(SysError::ESRCH);
+        return Err(Errno::ESRCH);
     }
 
     let identity = JOB_CONTROL_IDENTITY_LOCK.lock();
     let (_, caller_sid, _) = current.job_control_identity();
     let (old_pgid, target_sid, target_did_exec) = target.job_control_identity();
     if !target_is_caller && target_did_exec {
-        return Err(SysError::EACCES);
+        return Err(Errno::EACCES);
     }
     if target_sid != caller_sid {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     if target_sid == target.getpid() {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
 
     let target_visible_pid = target
         .pid_visible_from_namespace(current.pid_namespace())
-        .ok_or(SysError::ESRCH)?;
+        .ok_or(Errno::ESRCH)?;
     let new_pgid = if pgid == 0 || pgid as usize == target_visible_pid {
         target.getpid()
     } else {
         let (existing_pgid, existing_sid) =
-            process_group_from_visible_id(current, pgid as usize).ok_or(SysError::EPERM)?;
+            process_group_from_visible_id(current, pgid as usize).ok_or(Errno::EPERM)?;
         if existing_sid != target_sid {
-            return Err(SysError::EPERM);
+            return Err(Errno::EPERM);
         }
         existing_pgid
     };
     if let Some(existing_sid) = process_group_session(new_pgid)
         && existing_sid != target_sid
     {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     target.set_process_group_identity(new_pgid, target_sid);
     drop(identity);
@@ -193,33 +193,33 @@ pub fn sys_setpgid_ctx(ctx: &SyscallContext, pid: isize, pgid: isize) -> SysResu
     Ok(0)
 }
 
-pub fn sys_getpgid_ctx(ctx: &SyscallContext, pid: isize) -> SysResult {
+pub fn sys_getpgid_ctx(ctx: &SyscallContext, pid: isize) -> KResult {
     if pid < 0 {
-        return Err(SysError::ESRCH);
+        return Err(Errno::ESRCH);
     }
     let current = ctx.process();
     let target = if pid == 0 || pid as usize == current.getpid() {
         Arc::clone(current)
     } else {
-        process_from_visible_pid(current, pid as usize).ok_or(SysError::ESRCH)?
+        process_from_visible_pid(current, pid as usize).ok_or(Errno::ESRCH)?
     };
     Ok(visible_process_group_id(&target, current) as isize)
 }
 
-pub fn sys_getsid_ctx(ctx: &SyscallContext, pid: isize) -> SysResult {
+pub fn sys_getsid_ctx(ctx: &SyscallContext, pid: isize) -> KResult {
     if pid < 0 {
-        return Err(SysError::ESRCH);
+        return Err(Errno::ESRCH);
     }
     let current = ctx.process();
     let target = if pid == 0 || pid as usize == current.getpid() {
         Arc::clone(current)
     } else {
-        process_from_visible_pid(current, pid as usize).ok_or(SysError::ESRCH)?
+        process_from_visible_pid(current, pid as usize).ok_or(Errno::ESRCH)?
     };
     Ok(visible_session_id(&target, current) as isize)
 }
 
-pub fn sys_setsid() -> SysResult {
+pub fn sys_setsid() -> KResult {
     let current = current_process();
     let pid = current.getpid();
     let identity = JOB_CONTROL_IDENTITY_LOCK.lock();
@@ -227,7 +227,7 @@ pub fn sys_setsid() -> SysResult {
         .iter()
         .any(|process| process.process_group_id() == pid)
     {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     let (old_pgid, old_sid, _) = current.job_control_identity();
     current.set_process_group_identity(pid, pid);
@@ -237,7 +237,7 @@ pub fn sys_setsid() -> SysResult {
     Ok(current.visible_pid() as isize)
 }
 
-pub fn sys_set_tid_address_ctx(ctx: &SyscallContext, tidptr: usize) -> SysResult {
+pub fn sys_set_tid_address_ctx(ctx: &SyscallContext, tidptr: usize) -> KResult {
     let tid = ctx.task().linux_tid();
     ctx.task().inner_exclusive_access().clear_child_tid =
         if tidptr == 0 { None } else { Some(tidptr) };
@@ -294,7 +294,7 @@ fn queue_signal_to_process(
 fn kill_targets(
     pid: isize,
     caller: &Arc<ProcessControlBlock>,
-) -> SysResult<Vec<Arc<ProcessControlBlock>>> {
+) -> KResult<Vec<Arc<ProcessControlBlock>>> {
     let caller_namespace = caller.pid_namespace();
     if pid > 0 {
         return Ok(alloc::vec![
@@ -303,7 +303,7 @@ fn kill_targets(
                 .find(|process| {
                     process.pid_visible_from_namespace(caller_namespace) == Some(pid as usize)
                 })
-                .ok_or(SysError::ESRCH)?
+                .ok_or(Errno::ESRCH)?
         ]);
     }
     if pid == 0 {
@@ -328,7 +328,7 @@ fn kill_targets(
             })
             .collect());
     }
-    let pgid = pid.checked_neg().ok_or(SysError::EINVAL)? as usize;
+    let pgid = pid.checked_neg().ok_or(Errno::EINVAL)? as usize;
     Ok(processes_snapshot()
         .into_iter()
         .filter(|process| {
@@ -360,12 +360,12 @@ fn signal_ignored_by_namespace_init(
         && signal.check_error().is_some()
 }
 
-pub fn sys_kill(pid: isize, signal: u32) -> SysResult {
-    let flag = SignalFlags::from_signum(signal).ok_or(SysError::EINVAL)?;
+pub fn sys_kill(pid: isize, signal: u32) -> KResult {
+    let flag = SignalFlags::from_signum(signal).ok_or(Errno::EINVAL)?;
     let current = current_process();
     let targets = kill_targets(pid, &current)?;
     if targets.is_empty() {
-        return Err(SysError::ESRCH);
+        return Err(Errno::ESRCH);
     }
 
     let mut permitted = false;
@@ -382,7 +382,7 @@ pub fn sys_kill(pid: isize, signal: u32) -> SysResult {
     }
 
     if !permitted {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     Ok(0)
 }

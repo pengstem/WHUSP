@@ -1,8 +1,8 @@
-use super::errno::{SysError, SysResult};
 use super::fs::get_file_by_fd;
 use super::user_ptr::{read_user_array_item, read_user_value, write_user_value};
 use crate::sync::UPIntrFreeCell;
 use crate::task::current_user_token;
+use crate::uapi::errno::{Errno, KResult};
 use alloc::collections::{BTreeMap, VecDeque};
 use lazy_static::lazy_static;
 
@@ -71,28 +71,25 @@ impl AioManager {
         id
     }
 
-    fn remove(&mut self, ctx: usize) -> SysResult<()> {
-        self.contexts
-            .remove(&ctx)
-            .map(|_| ())
-            .ok_or(SysError::EINVAL)
+    fn remove(&mut self, ctx: usize) -> KResult<()> {
+        self.contexts.remove(&ctx).map(|_| ()).ok_or(Errno::EINVAL)
     }
 
     fn contains(&self, ctx: usize) -> bool {
         self.contexts.contains_key(&ctx)
     }
 
-    fn push_event(&mut self, ctx: usize, event: LinuxIoEvent) -> SysResult<()> {
-        let context = self.contexts.get_mut(&ctx).ok_or(SysError::EINVAL)?;
+    fn push_event(&mut self, ctx: usize, event: LinuxIoEvent) -> KResult<()> {
+        let context = self.contexts.get_mut(&ctx).ok_or(Errno::EINVAL)?;
         if context.pending.len() >= context.max_events {
-            return Err(SysError::EAGAIN);
+            return Err(Errno::EAGAIN);
         }
         context.pending.push_back(event);
         Ok(())
     }
 
-    fn pop_events(&mut self, ctx: usize, max: usize) -> SysResult<alloc::vec::Vec<LinuxIoEvent>> {
-        let context = self.contexts.get_mut(&ctx).ok_or(SysError::EINVAL)?;
+    fn pop_events(&mut self, ctx: usize, max: usize) -> KResult<alloc::vec::Vec<LinuxIoEvent>> {
+        let context = self.contexts.get_mut(&ctx).ok_or(Errno::EINVAL)?;
         let count = max.min(context.pending.len());
         let mut events = alloc::vec::Vec::with_capacity(count);
         for _ in 0..count {
@@ -113,20 +110,20 @@ pub(crate) fn aio_max_nr_content() -> &'static str {
     "65536\n"
 }
 
-pub fn sys_io_setup(nr_events: usize, ctxp: *mut usize) -> SysResult {
+pub fn sys_io_setup(nr_events: usize, ctxp: *mut usize) -> KResult {
     if ctxp.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     if nr_events == 0 || nr_events == usize::MAX {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if nr_events > AIO_MAX_NR {
-        return Err(SysError::EAGAIN);
+        return Err(Errno::EAGAIN);
     }
 
     let token = current_user_token();
     if read_user_value::<usize>(token, ctxp.cast_const())? != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let ctx = AIO_MANAGER.exclusive_access().create(nr_events);
@@ -134,22 +131,22 @@ pub fn sys_io_setup(nr_events: usize, ctxp: *mut usize) -> SysResult {
     Ok(0)
 }
 
-pub fn sys_io_destroy(ctx: usize) -> SysResult {
+pub fn sys_io_destroy(ctx: usize) -> KResult {
     AIO_MANAGER.exclusive_access().remove(ctx)?;
     Ok(0)
 }
 
-pub fn sys_io_cancel(ctx: usize, iocb: *const LinuxIocb, result: *mut LinuxIoEvent) -> SysResult {
+pub fn sys_io_cancel(ctx: usize, iocb: *const LinuxIocb, result: *mut LinuxIoEvent) -> KResult {
     if iocb.is_null() || result.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let token = current_user_token();
     let _ = read_user_value::<LinuxIocb>(token, iocb)?;
     let _ = read_user_value::<LinuxIoEvent>(token, result.cast_const())?;
     if !AIO_MANAGER.exclusive_access().contains(ctx) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
-    Err(SysError::EINVAL)
+    Err(Errno::EINVAL)
 }
 
 pub fn sys_io_getevents(
@@ -158,12 +155,12 @@ pub fn sys_io_getevents(
     nr: isize,
     events: *mut LinuxIoEvent,
     timeout: *const u8,
-) -> SysResult {
+) -> KResult {
     if !AIO_MANAGER.exclusive_access().contains(ctx) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if min_nr < 0 || nr < 0 || min_nr > nr {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if !timeout.is_null() {
         let _ = read_user_value::<u8>(current_user_token(), timeout)?;
@@ -172,7 +169,7 @@ pub fn sys_io_getevents(
         return Ok(0);
     }
     if events.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
 
     // UNFINISHED: Linux io_getevents() can sleep until min_nr events arrive or
@@ -195,19 +192,19 @@ pub fn sys_io_pgetevents(
     events: *mut LinuxIoEvent,
     timeout: *const u8,
     sigmask: *const u8,
-) -> SysResult {
+) -> KResult {
     if !sigmask.is_null() {
         let _ = read_user_value::<u8>(current_user_token(), sigmask)?;
     }
     sys_io_getevents(ctx, min_nr, nr, events, timeout)
 }
 
-pub fn sys_io_submit(ctx: usize, nr: isize, iocbpp: *const *const LinuxIocb) -> SysResult {
+pub fn sys_io_submit(ctx: usize, nr: isize, iocbpp: *const *const LinuxIocb) -> KResult {
     if !AIO_MANAGER.exclusive_access().contains(ctx) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if nr < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if nr == 0 {
         return Ok(0);
@@ -217,7 +214,7 @@ pub fn sys_io_submit(ctx: usize, nr: isize, iocbpp: *const *const LinuxIocb) -> 
     for index in 0..nr as usize {
         let iocb_ptr = read_user_array_item(token, iocbpp, index)?;
         if iocb_ptr.is_null() {
-            return Err(SysError::EFAULT);
+            return Err(Errno::EFAULT);
         }
         let iocb = read_user_value::<LinuxIocb>(token, iocb_ptr)?;
         validate_iocb(&iocb)?;
@@ -242,24 +239,24 @@ pub fn sys_io_submit(ctx: usize, nr: isize, iocbpp: *const *const LinuxIocb) -> 
     Ok(nr)
 }
 
-fn validate_iocb(iocb: &LinuxIocb) -> SysResult<()> {
+fn validate_iocb(iocb: &LinuxIocb) -> KResult<()> {
     let fd = iocb.aio_fildes as i32;
     if fd < 0 {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
-    let file = get_file_by_fd(fd as usize).map_err(|_| SysError::EBADF)?;
+    let file = get_file_by_fd(fd as usize).map_err(|_| Errno::EBADF)?;
     match iocb.aio_lio_opcode {
         IOCB_CMD_PREAD => {
             if !file.readable() {
-                return Err(SysError::EBADF);
+                return Err(Errno::EBADF);
             }
         }
         IOCB_CMD_PWRITE => {
             if !file.writable() {
-                return Err(SysError::EBADF);
+                return Err(Errno::EBADF);
             }
         }
-        _ => return Err(SysError::EINVAL),
+        _ => return Err(Errno::EINVAL),
     }
     Ok(())
 }

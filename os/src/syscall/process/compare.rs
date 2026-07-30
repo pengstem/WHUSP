@@ -1,12 +1,10 @@
 use crate::{
     fs::File,
-    syscall::{
-        SyscallContext,
-        errno::{SysError, SysResult},
-    },
+    syscall::SyscallContext,
     task::{
         CAP_SYS_PTRACE, Credentials, ProcessControlBlock, processes_snapshot, task_with_linux_tid,
     },
+    uapi::errno::{Errno, KResult},
 };
 use alloc::sync::Arc;
 
@@ -22,9 +20,9 @@ const KCMP_EPOLL_TFD: i32 = 7;
 fn kcmp_target_process(
     caller: &ProcessControlBlock,
     pid: isize,
-) -> SysResult<Arc<ProcessControlBlock>> {
+) -> KResult<Arc<ProcessControlBlock>> {
     if pid <= 0 {
-        return Err(SysError::ESRCH);
+        return Err(Errno::ESRCH);
     }
     let visible_pid = pid as usize;
     let namespace = caller.pid_namespace();
@@ -36,7 +34,7 @@ fn kcmp_target_process(
     }
     task_with_linux_tid(visible_pid)
         .and_then(|task| task.process.upgrade())
-        .ok_or(SysError::ESRCH)
+        .ok_or(Errno::ESRCH)
 }
 
 fn can_kcmp(caller: &Credentials, target: &Credentials) -> bool {
@@ -49,15 +47,12 @@ fn can_kcmp(caller: &Credentials, target: &Credentials) -> bool {
         || target.uid_matches_saved_set(caller.euid)
 }
 
-fn file_for_kcmp(
-    process: &ProcessControlBlock,
-    fd: usize,
-) -> SysResult<Arc<dyn File + Send + Sync>> {
+fn file_for_kcmp(process: &ProcessControlBlock, fd: usize) -> KResult<Arc<dyn File + Send + Sync>> {
     process
         .inner_exclusive_access()
         .fd_entry(fd)
         .map(|entry| entry.file())
-        .ok_or(SysError::EBADF)
+        .ok_or(Errno::EBADF)
 }
 
 fn compare_same_resource(left: usize, right: usize) -> isize {
@@ -71,7 +66,7 @@ pub fn sys_kcmp_ctx(
     kcmp_type: i32,
     idx1: usize,
     idx2: usize,
-) -> SysResult {
+) -> KResult {
     let current = ctx.process();
     let process1 = kcmp_target_process(current, pid1)?;
     let process2 = kcmp_target_process(current, pid2)?;
@@ -79,7 +74,7 @@ pub fn sys_kcmp_ctx(
     if !can_kcmp(&caller_credentials, &process1.credentials())
         || !can_kcmp(&caller_credentials, &process2.credentials())
     {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
 
     match kcmp_type {
@@ -109,8 +104,8 @@ pub fn sys_kcmp_ctx(
         KCMP_EPOLL_TFD => {
             // UNFINISHED: epoll target-file comparison needs epoll-slot
             // decoding and target lookup. No current contest case depends on it.
-            Err(SysError::EINVAL)
+            Err(Errno::EINVAL)
         }
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }

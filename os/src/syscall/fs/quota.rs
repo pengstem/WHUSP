@@ -4,11 +4,11 @@ use crate::task::{CAP_SYS_ADMIN, current_process, current_user_token};
 use alloc::collections::BTreeMap;
 use lazy_static::lazy_static;
 
-use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{PATH_MAX, read_user_c_string, read_user_value, write_user_value};
 use super::fd::get_file_by_fd;
 use super::path_context_from;
 use super::uapi::AT_FDCWD;
+use crate::uapi::errno::{Errno, KResult};
 
 const SUBCMDMASK: u32 = 0x00ff;
 const SUBCMDSHIFT: u32 = 8;
@@ -98,12 +98,12 @@ enum QuotaClass {
 }
 
 impl QuotaClass {
-    fn from_raw(value: u32) -> SysResult<Self> {
+    fn from_raw(value: u32) -> KResult<Self> {
         match value {
             USRQUOTA => Ok(Self::User),
             GRPQUOTA => Ok(Self::Group),
             PRJQUOTA => Ok(Self::Project),
-            _ => Err(SysError::EINVAL),
+            _ => Err(Errno::EINVAL),
         }
     }
 }
@@ -137,8 +137,8 @@ impl QuotaManager {
         self.states.entry(quota_class).or_default()
     }
 
-    fn state(&self, quota_class: QuotaClass) -> SysResult<&QuotaState> {
-        self.states.get(&quota_class).ok_or(SysError::ESRCH)
+    fn state(&self, quota_class: QuotaClass) -> KResult<&QuotaState> {
+        self.states.get(&quota_class).ok_or(Errno::ESRCH)
     }
 }
 
@@ -153,7 +153,7 @@ struct QuotaCommand {
     quota_class: QuotaClass,
 }
 
-fn parse_cmd(cmd: i32) -> SysResult<QuotaCommand> {
+fn parse_cmd(cmd: i32) -> KResult<QuotaCommand> {
     let raw = cmd as u32;
     Ok(QuotaCommand {
         op: raw >> SUBCMDSHIFT,
@@ -170,23 +170,23 @@ fn current_has_sys_admin() -> bool {
             .unwrap_or(false)
 }
 
-fn require_sys_admin() -> SysResult<()> {
+fn require_sys_admin() -> KResult<()> {
     if !current_has_sys_admin() {
         // UNFINISHED: Linux checks CAP_SYS_ADMIN in the caller's user
         // namespace. This kernel has one process-wide capability set, so root
         // with the stored CAP_SYS_ADMIN bit is the current privileged model.
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     Ok(())
 }
 
-fn read_path(ptr: *const u8) -> SysResult<alloc::string::String> {
+fn read_path(ptr: *const u8) -> KResult<alloc::string::String> {
     read_user_c_string(current_user_token(), ptr, PATH_MAX)
 }
 
-fn stat_quota_path(path: &str) -> SysResult<FileStat> {
+fn stat_quota_path(path: &str) -> KResult<FileStat> {
     if path.is_empty() {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
     let snapshot = current_process().path_snapshot();
     Ok(stat_in(
@@ -196,37 +196,37 @@ fn stat_quota_path(path: &str) -> SysResult<FileStat> {
     )?)
 }
 
-fn validate_visible_quota_file(addr: usize) -> SysResult<()> {
+fn validate_visible_quota_file(addr: usize) -> KResult<()> {
     if addr == 0 {
         return Ok(());
     }
     let path = read_path(addr as *const u8)?;
     match stat_quota_path(path.as_str()) {
         Ok(stat) if stat.mode & S_IFMT == S_IFREG => Ok(()),
-        Ok(stat) if stat.mode & S_IFMT == S_IFDIR => Err(SysError::EACCES),
-        Ok(_) => Err(SysError::EACCES),
-        Err(SysError::ENOENT) => Err(SysError::ENOENT),
+        Ok(stat) if stat.mode & S_IFMT == S_IFDIR => Err(Errno::EACCES),
+        Ok(_) => Err(Errno::EACCES),
+        Err(Errno::ENOENT) => Err(Errno::ENOENT),
         Err(err) => Err(err),
     }
 }
 
-fn read_special_path(special: *const u8) -> SysResult<alloc::string::String> {
+fn read_special_path(special: *const u8) -> KResult<alloc::string::String> {
     read_path(special)
 }
 
-fn ensure_special_block_like(special: *const u8) -> SysResult<()> {
+fn ensure_special_block_like(special: *const u8) -> KResult<()> {
     let path = read_special_path(special)?;
     if path == "/dev/null" {
-        return Err(SysError::ENOTBLK);
+        return Err(Errno::ENOTBLK);
     }
     Ok(())
 }
 
-fn validate_quota_fmt(fmt: i32) -> SysResult<()> {
+fn validate_quota_fmt(fmt: i32) -> KResult<()> {
     if matches!(fmt, QFMT_VFS_V0 | QFMT_VFS_V1) {
         Ok(())
     } else {
-        Err(SysError::ESRCH)
+        Err(Errno::ESRCH)
     }
 }
 
@@ -238,15 +238,15 @@ fn quota_limit_in_range(fmt: i32, block_soft_limit: u64) -> bool {
     }
 }
 
-fn require_addr(addr: usize) -> SysResult<()> {
+fn require_addr(addr: usize) -> KResult<()> {
     if addr == 0 {
-        Err(SysError::EFAULT)
+        Err(Errno::EFAULT)
     } else {
         Ok(())
     }
 }
 
-fn quota_on(cmd: QuotaCommand, fmt: i32, addr: usize, special: Option<*const u8>) -> SysResult {
+fn quota_on(cmd: QuotaCommand, fmt: i32, addr: usize, special: Option<*const u8>) -> KResult {
     if let Some(special) = special {
         ensure_special_block_like(special)?;
     }
@@ -257,7 +257,7 @@ fn quota_on(cmd: QuotaCommand, fmt: i32, addr: usize, special: Option<*const u8>
     let mut manager = QUOTA_MANAGER.exclusive_access();
     let state = manager.state_mut(cmd.quota_class);
     if state.enabled {
-        return Err(SysError::EBUSY);
+        return Err(Errno::EBUSY);
     }
     state.enabled = true;
     state.fmt = fmt;
@@ -266,12 +266,12 @@ fn quota_on(cmd: QuotaCommand, fmt: i32, addr: usize, special: Option<*const u8>
     Ok(0)
 }
 
-fn quota_off(cmd: QuotaCommand) -> SysResult {
+fn quota_off(cmd: QuotaCommand) -> KResult {
     require_sys_admin()?;
     let mut manager = QUOTA_MANAGER.exclusive_access();
     let state = manager.state_mut(cmd.quota_class);
     if !state.enabled {
-        return Err(SysError::ESRCH);
+        return Err(Errno::ESRCH);
     }
     state.enabled = false;
     state.quotas.clear();
@@ -279,54 +279,54 @@ fn quota_off(cmd: QuotaCommand) -> SysResult {
     Ok(0)
 }
 
-fn set_quota(cmd: QuotaCommand, id: u32, addr: usize) -> SysResult {
+fn set_quota(cmd: QuotaCommand, id: u32, addr: usize) -> KResult {
     require_addr(addr)?;
     let dqblk = read_user_value(current_user_token(), addr as *const LinuxDqBlk)?;
     let mut manager = QUOTA_MANAGER.exclusive_access();
     let state = manager.state_mut(cmd.quota_class);
     if !state.enabled {
-        return Err(SysError::ESRCH);
+        return Err(Errno::ESRCH);
     }
     if !quota_limit_in_range(state.fmt, dqblk.dqb_bsoftlimit) {
-        return Err(SysError::ERANGE);
+        return Err(Errno::ERANGE);
     }
     state.quotas.insert(id, dqblk);
     Ok(0)
 }
 
-fn get_quota(cmd: QuotaCommand, id: u32, addr: usize) -> SysResult {
+fn get_quota(cmd: QuotaCommand, id: u32, addr: usize) -> KResult {
     require_addr(addr)?;
     let dqblk = {
         let manager = QUOTA_MANAGER.exclusive_access();
         let state = manager.state(cmd.quota_class)?;
         if !state.enabled {
-            return Err(SysError::ESRCH);
+            return Err(Errno::ESRCH);
         }
-        *state.quotas.get(&id).ok_or(SysError::ESRCH)?
+        *state.quotas.get(&id).ok_or(Errno::ESRCH)?
     };
     write_user_value(current_user_token(), addr as *mut LinuxDqBlk, &dqblk)?;
     Ok(0)
 }
 
-fn set_info(cmd: QuotaCommand, addr: usize) -> SysResult {
+fn set_info(cmd: QuotaCommand, addr: usize) -> KResult {
     require_addr(addr)?;
     let info = read_user_value(current_user_token(), addr as *const LinuxDqInfo)?;
     let mut manager = QUOTA_MANAGER.exclusive_access();
     let state = manager.state_mut(cmd.quota_class);
     if !state.enabled {
-        return Err(SysError::ESRCH);
+        return Err(Errno::ESRCH);
     }
     state.info = info;
     Ok(0)
 }
 
-fn get_info(cmd: QuotaCommand, addr: usize) -> SysResult {
+fn get_info(cmd: QuotaCommand, addr: usize) -> KResult {
     require_addr(addr)?;
     let info = {
         let manager = QUOTA_MANAGER.exclusive_access();
         let state = manager.state(cmd.quota_class)?;
         if !state.enabled {
-            return Err(SysError::ESRCH);
+            return Err(Errno::ESRCH);
         }
         state.info
     };
@@ -334,13 +334,13 @@ fn get_info(cmd: QuotaCommand, addr: usize) -> SysResult {
     Ok(0)
 }
 
-fn get_fmt(cmd: QuotaCommand, addr: usize) -> SysResult {
+fn get_fmt(cmd: QuotaCommand, addr: usize) -> KResult {
     require_addr(addr)?;
     let fmt = {
         let manager = QUOTA_MANAGER.exclusive_access();
         let state = manager.state(cmd.quota_class)?;
         if !state.enabled {
-            return Err(SysError::ESRCH);
+            return Err(Errno::ESRCH);
         }
         state.fmt
     };
@@ -348,32 +348,32 @@ fn get_fmt(cmd: QuotaCommand, addr: usize) -> SysResult {
     Ok(0)
 }
 
-fn sync_quota(cmd: QuotaCommand) -> SysResult {
+fn sync_quota(cmd: QuotaCommand) -> KResult {
     let manager = QUOTA_MANAGER.exclusive_access();
     let state = manager.state(cmd.quota_class)?;
     if state.enabled {
         Ok(0)
     } else {
-        Err(SysError::ESRCH)
+        Err(Errno::ESRCH)
     }
 }
 
-fn get_next_quota(cmd: QuotaCommand, id: u32, addr: usize) -> SysResult {
+fn get_next_quota(cmd: QuotaCommand, id: u32, addr: usize) -> KResult {
     require_addr(addr)?;
     let next = {
         let manager = QUOTA_MANAGER.exclusive_access();
         let state = manager.state(cmd.quota_class)?;
         if !state.enabled {
-            return Err(SysError::ESRCH);
+            return Err(Errno::ESRCH);
         }
-        let (&next_id, dqblk) = state.quotas.range(id..).next().ok_or(SysError::ESRCH)?;
+        let (&next_id, dqblk) = state.quotas.range(id..).next().ok_or(Errno::ESRCH)?;
         dqblk.into_next(next_id)
     };
     write_user_value(current_user_token(), addr as *mut LinuxNextDqBlk, &next)?;
     Ok(0)
 }
 
-fn quota_ctl(cmd: QuotaCommand, id: u32, addr: usize, special: Option<*const u8>) -> SysResult {
+fn quota_ctl(cmd: QuotaCommand, id: u32, addr: usize, special: Option<*const u8>) -> KResult {
     match cmd.op {
         Q_SYNC => sync_quota(cmd),
         Q_QUOTAON => quota_on(cmd, id as i32, addr, special),
@@ -389,19 +389,19 @@ fn quota_ctl(cmd: QuotaCommand, id: u32, addr: usize, special: Option<*const u8>
         // for unsupported Q_XGETNEXTQUOTA, while Q_XQUOTARM can be a harmless
         // no-op for its valid-type probe.
         Q_XQUOTARM => Ok(0),
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
-pub fn sys_quotactl(cmd: i32, special: *const u8, id: u32, addr: usize) -> SysResult {
+pub fn sys_quotactl(cmd: i32, special: *const u8, id: u32, addr: usize) -> KResult {
     let cmd = parse_cmd(cmd)?;
     quota_ctl(cmd, id, addr, Some(special))
 }
 
-pub fn sys_quotactl_fd(fd: usize, cmd: i32, id: u32, addr: usize) -> SysResult {
-    let file = get_file_by_fd(fd).map_err(|_| SysError::EBADF)?;
+pub fn sys_quotactl_fd(fd: usize, cmd: i32, id: u32, addr: usize) -> KResult {
+    let file = get_file_by_fd(fd).map_err(|_| Errno::EBADF)?;
     if file.is_socket() {
-        return Err(SysError::ENOSYS);
+        return Err(Errno::ENOSYS);
     }
     let cmd = parse_cmd(cmd)?;
     quota_ctl(cmd, id, addr, None)

@@ -74,13 +74,6 @@ pub(super) const PPOLL_MAX_NFDS: usize = 4096;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct LinuxIovec {
-    pub(super) base: usize,
-    pub(super) len: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
 pub struct LinuxPollFd {
     pub(super) fd: i32,
     pub(super) events: i16,

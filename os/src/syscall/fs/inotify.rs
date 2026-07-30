@@ -1,4 +1,3 @@
-use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{PATH_MAX, read_user_c_string};
 use super::fd::{get_file_by_fd, install_file_fd};
 use super::path::path_context_from;
@@ -14,6 +13,7 @@ use crate::task::{
     TaskControlBlock, block_current_task_no_schedule, current_has_interrupting_signal,
     current_process, current_user_token, schedule, wakeup_task,
 };
+use crate::uapi::errno::{Errno, KResult};
 use alloc::collections::btree_map::Entry;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
@@ -173,11 +173,11 @@ impl InotifyGroup {
         group
     }
 
-    fn add_watch(&self, node: VfsNodeId, kind: FsNodeKind, mask: u32) -> SysResult<i32> {
+    fn add_watch(&self, node: VfsNodeId, kind: FsNodeKind, mask: u32) -> KResult<i32> {
         self.inner.exclusive_session(|inner| {
             if let Some(watch) = inner.watches.iter_mut().find(|watch| watch.node == node) {
                 if mask & IN_MASK_CREATE != 0 {
-                    return Err(SysError::EEXIST);
+                    return Err(Errno::EEXIST);
                 }
                 if mask & IN_MASK_ADD != 0 {
                     watch.mask |= mask;
@@ -200,10 +200,10 @@ impl InotifyGroup {
         })
     }
 
-    fn remove_watch(&self, wd: i32, emit_ignored: bool) -> SysResult {
+    fn remove_watch(&self, wd: i32, emit_ignored: bool) -> KResult {
         let (waiters, poll_waiters) = self.inner.exclusive_session(|inner| {
             let Some(index) = inner.watches.iter().position(|watch| watch.wd == wd) else {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             };
             inner.watches.remove(index);
             if emit_ignored {
@@ -601,21 +601,21 @@ fn lookup_watch_target(
     context: PathContext,
     path: &str,
     mask: u32,
-) -> SysResult<(VfsNodeId, FsNodeKind)> {
+) -> KResult<(VfsNodeId, FsNodeKind)> {
     let follow_final_symlink = mask & IN_DONT_FOLLOW == 0;
     let target = lookup_path_in(context, path, follow_final_symlink)?;
     if mask & IN_ONLYDIR != 0 && target.kind != FsNodeKind::Directory {
-        return Err(SysError::ENOTDIR);
+        return Err(Errno::ENOTDIR);
     }
     Ok((target.node, target.kind))
 }
 
-fn group_from_fd(fd: usize) -> SysResult<Arc<InotifyGroup>> {
+fn group_from_fd(fd: usize) -> KResult<Arc<InotifyGroup>> {
     let file = get_file_by_fd(fd)?;
     file.as_any()
         .downcast_ref::<InotifyFile>()
         .map(|file| Arc::clone(&file.group))
-        .ok_or(SysError::EINVAL)
+        .ok_or(Errno::EINVAL)
 }
 
 fn publish_file_event(
@@ -822,9 +822,9 @@ pub(crate) fn inotify_fdinfo(file: &Arc<dyn File + Send + Sync>) -> Option<Strin
         .map(|file| file.group.fdinfo())
 }
 
-pub fn sys_inotify_init1(flags: u32) -> SysResult {
+pub fn sys_inotify_init1(flags: u32) -> KResult {
     if flags & !(IN_CLOEXEC | IN_NONBLOCK) != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let mut open_flags = OpenFlags::RDONLY;
     if flags & IN_CLOEXEC != 0 {
@@ -840,17 +840,17 @@ pub fn sys_inotify_init1(flags: u32) -> SysResult {
     )
 }
 
-pub fn sys_inotify_add_watch(fd: usize, pathname: *const u8, mask: u32) -> SysResult {
+pub fn sys_inotify_add_watch(fd: usize, pathname: *const u8, mask: u32) -> KResult {
     if pathname.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     if mask == 0 || mask & !VALID_WATCH_MASK != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let token = current_user_token();
     let path = read_user_c_string(token, pathname, PATH_MAX)?;
     if path.is_empty() {
-        return Err(SysError::ENOENT);
+        return Err(Errno::ENOENT);
     }
     let group = group_from_fd(fd)?;
     let snapshot = current_process().path_snapshot();
@@ -860,7 +860,7 @@ pub fn sys_inotify_add_watch(fd: usize, pathname: *const u8, mask: u32) -> SysRe
     group.add_watch(node, kind, mask).map(|wd| wd as isize)
 }
 
-pub fn sys_inotify_rm_watch(fd: usize, wd: i32) -> SysResult {
+pub fn sys_inotify_rm_watch(fd: usize, wd: i32) -> KResult {
     let group = group_from_fd(fd)?;
     group.remove_watch(wd, true)
 }

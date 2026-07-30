@@ -16,9 +16,9 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{copy_to_user, read_user_value, write_user_value};
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd};
+use crate::uapi::errno::{Errno, KResult};
 
 const LOOP_SET_FD: usize = 0x4c00;
 const LOOP_CLR_FD: usize = 0x4c01;
@@ -289,7 +289,7 @@ impl crate::fs::File for NamespaceFile {
     }
 }
 
-pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
+pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> KResult {
     let file = get_file_by_fd(fd)?;
     // CONTEXT: musl-style ioctl callers may sign-extend 32-bit request
     // numbers such as RTC_RD_TIME into the syscall register. Linux ioctl
@@ -305,7 +305,7 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
                 // loop slot, not the full Linux loop-control device model.
                 Ok(crate::fs::find_free_loop_device()? as isize)
             }
-            _ => Err(SysError::EINVAL),
+            _ => Err(Errno::EINVAL),
         };
     }
 
@@ -335,7 +335,7 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
 
     match request {
         TIOCGPTN => {
-            let pty_number = crate::fs::devfs_pty_number(file.as_ref()).ok_or(SysError::ENOTTY)?;
+            let pty_number = crate::fs::devfs_pty_number(file.as_ref()).ok_or(Errno::ENOTTY)?;
             let token = current_user_token();
             write_user_value(token, argp as *mut u32, &pty_number)?;
             return Ok(0);
@@ -344,12 +344,12 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
             let token = current_user_token();
             let locked = read_user_value(token, argp as *const i32)? != 0;
             if !crate::fs::set_devfs_pty_locked(file.as_ref(), locked)? {
-                return Err(SysError::ENOTTY);
+                return Err(Errno::ENOTTY);
             }
             return Ok(0);
         }
         TIOCGPTLCK => {
-            let locked = crate::fs::devfs_pty_lock_state(file.as_ref()).ok_or(SysError::ENOTTY)?;
+            let locked = crate::fs::devfs_pty_lock_state(file.as_ref()).ok_or(Errno::ENOTTY)?;
             let locked = if locked { 1i32 } else { 0i32 };
             let token = current_user_token();
             write_user_value(token, argp as *mut i32, &locked)?;
@@ -374,7 +374,7 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
                 .is_some_and(|tty| tty == crate::fs::TtyId::Console)
                 .then(console_tty_available_bytes)
         });
-        let unread = unread.ok_or(SysError::ENOTTY)? as i32;
+        let unread = unread.ok_or(Errno::ENOTTY)? as i32;
         let token = current_user_token();
         write_user_value(token, argp as *mut i32, &unread)?;
         return Ok(0);
@@ -410,19 +410,19 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
     }
 
     if !file.is_tty() {
-        return Err(SysError::ENOTTY);
+        return Err(Errno::ENOTTY);
     }
 
-    let tty_id = file.tty_id().ok_or(SysError::ENOTTY)?;
+    let tty_id = file.tty_id().ok_or(Errno::ENOTTY)?;
     let token = current_user_token();
     match request {
         TCGETS => {
-            let termios = tty_termios(tty_id).ok_or(SysError::ENOTTY)?;
+            let termios = tty_termios(tty_id).ok_or(Errno::ENOTTY)?;
             write_user_value(token, argp as *mut LinuxTermios, &termios)?;
             Ok(0)
         }
         TCGETS2 => {
-            let termios = tty_termios2(tty_id).ok_or(SysError::ENOTTY)?;
+            let termios = tty_termios2(tty_id).ok_or(Errno::ENOTTY)?;
             write_user_value(token, argp as *mut LinuxTermios2, &termios)?;
             Ok(0)
         }
@@ -431,7 +431,7 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
             // CONTEXT: Linux differentiates drain/flush behavior across TCSETS*, but for the
             // contest shell path we only need the termios state to round-trip and persist.
             if !set_tty_termios(tty_id, termios) {
-                return Err(SysError::ENOTTY);
+                return Err(Errno::ENOTTY);
             }
             Ok(0)
         }
@@ -440,52 +440,52 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
             // CONTEXT: Linux differentiates drain/flush behavior across TCSETS2*, but for the
             // contest shell path we only need the termios state to round-trip and persist.
             if !set_tty_termios2(tty_id, termios) {
-                return Err(SysError::ENOTTY);
+                return Err(Errno::ENOTTY);
             }
             Ok(0)
         }
         TCGETA => {
-            let termio = tty_termio(tty_id).ok_or(SysError::ENOTTY)?;
+            let termio = tty_termio(tty_id).ok_or(Errno::ENOTTY)?;
             write_user_value(token, argp as *mut LinuxTermio, &termio)?;
             Ok(0)
         }
         TCSETA | TCSETAW | TCSETAF => {
             let termio = read_user_value(token, argp as *const LinuxTermio)?;
             if !apply_tty_termio(tty_id, termio) {
-                return Err(SysError::ENOTTY);
+                return Err(Errno::ENOTTY);
             }
             Ok(0)
         }
         TIOCGPGRP => {
             let process = current_process();
             if process.controlling_tty_detached() {
-                return Err(SysError::ENOTTY);
+                return Err(Errno::ENOTTY);
             }
-            let control = tty_control_state(tty_id).ok_or(SysError::ENOTTY)?;
+            let control = tty_control_state(tty_id).ok_or(Errno::ENOTTY)?;
             if control.session != Some(process.session_id()) {
-                return Err(SysError::ENOTTY);
+                return Err(Errno::ENOTTY);
             }
-            let pgid = control.foreground_pgid.ok_or(SysError::ENOTTY)? as i32;
+            let pgid = control.foreground_pgid.ok_or(Errno::ENOTTY)? as i32;
             write_user_value(token, argp as *mut i32, &pgid)?;
             Ok(0)
         }
         TIOCSPGRP => {
             let pgid = read_user_value(token, argp as *const i32)?;
             if pgid <= 0 {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             let process = current_process();
             if process.controlling_tty_detached() {
-                return Err(SysError::ENOTTY);
+                return Err(Errno::ENOTTY);
             }
             let sid = process.session_id();
             let caller_pgid = process.process_group_id();
-            let control = tty_control_state(tty_id).ok_or(SysError::ENOTTY)?;
+            let control = tty_control_state(tty_id).ok_or(Errno::ENOTTY)?;
             if control.session != Some(sid) {
-                return Err(SysError::ENOTTY);
+                return Err(Errno::ENOTTY);
             }
             if control.foreground_pgid != Some(caller_pgid) {
-                let task = current_task().ok_or(SysError::ESRCH)?;
+                let task = current_task().ok_or(Errno::ESRCH)?;
                 let blocked = task
                     .inner_exclusive_access()
                     .signal_mask
@@ -495,14 +495,14 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
                     .is_ignore();
                 if !blocked && !ignored {
                     send_tty_signal_to_process_group(caller_pgid, SignalFlags::SIGTTOU);
-                    return Err(SysError::EINTR);
+                    return Err(Errno::EINTR);
                 }
             }
             let target_exists = processes_snapshot().into_iter().any(|candidate| {
                 candidate.process_group_id() == pgid as usize && candidate.session_id() == sid
             });
             if !target_exists {
-                return Err(SysError::EPERM);
+                return Err(Errno::EPERM);
             }
             set_tty_foreground_pgid(tty_id, sid, pgid as usize)?;
             Ok(0)
@@ -510,40 +510,40 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
         TIOCGSID => {
             let process = current_process();
             if process.controlling_tty_detached() {
-                return Err(SysError::ENOTTY);
+                return Err(Errno::ENOTTY);
             }
-            let control = tty_control_state(tty_id).ok_or(SysError::ENOTTY)?;
+            let control = tty_control_state(tty_id).ok_or(Errno::ENOTTY)?;
             if control.session != Some(process.session_id()) {
-                return Err(SysError::ENOTTY);
+                return Err(Errno::ENOTTY);
             }
             write_user_value(
                 token,
                 argp as *mut i32,
-                &(control.session.ok_or(SysError::ENOTTY)? as i32),
+                &(control.session.ok_or(Errno::ENOTTY)? as i32),
             )?;
             Ok(0)
         }
         TIOCGWINSZ => {
-            let winsize = tty_winsize(tty_id).ok_or(SysError::ENOTTY)?;
+            let winsize = tty_winsize(tty_id).ok_or(Errno::ENOTTY)?;
             write_user_value(token, argp as *mut LinuxWinsize, &winsize)?;
             Ok(0)
         }
         TIOCSWINSZ => {
             let winsize = read_user_value(token, argp as *const LinuxWinsize)?;
             if !set_tty_winsize(tty_id, winsize) && tty_winsize(tty_id).is_none() {
-                return Err(SysError::ENOTTY);
+                return Err(Errno::ENOTTY);
             }
             Ok(0)
         }
         TIOCSCTTY => {
             if argp > 1 {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             let process = current_process();
             let pid = process.getpid();
             let sid = process.session_id();
             if pid != sid {
-                return Err(SysError::EPERM);
+                return Err(Errno::EPERM);
             }
             let force = argp == 1;
             if force
@@ -553,22 +553,21 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
                     .has_effective(CAP_SYS_ADMIN)
                     .unwrap_or(false)
             {
-                return Err(SysError::EPERM);
+                return Err(Errno::EPERM);
             }
-            tty_attach(tty_id, sid, process.process_group_id(), force)
-                .map_err(|_| SysError::EPERM)?;
+            tty_attach(tty_id, sid, process.process_group_id(), force).map_err(|_| Errno::EPERM)?;
             process.set_controlling_tty_detached(false);
             Ok(0)
         }
         TIOCNOTTY => {
             let process = current_process();
             let sid = process.session_id();
-            let control = tty_control_state(tty_id).ok_or(SysError::ENOTTY)?;
+            let control = tty_control_state(tty_id).ok_or(Errno::ENOTTY)?;
             if process.controlling_tty_detached() || control.session != Some(sid) {
-                return Err(SysError::ENOTTY);
+                return Err(Errno::ENOTTY);
             }
             if process.getpid() == sid {
-                let foreground = tty_release(tty_id, sid).map_err(|_| SysError::ENOTTY)?;
+                let foreground = tty_release(tty_id, sid).map_err(|_| Errno::ENOTTY)?;
                 if let Some(pgid) = foreground {
                     send_tty_signal_to_process_group(pgid, SignalFlags::SIGHUP);
                     send_tty_signal_to_process_group(pgid, SignalFlags::SIGCONT);
@@ -586,7 +585,7 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
                 .has_effective(CAP_SYS_ADMIN)
                 .unwrap_or(false)
             {
-                return Err(SysError::EPERM);
+                return Err(Errno::EPERM);
             }
             tty_hangup(tty_id);
             Ok(0)
@@ -594,11 +593,11 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
         TCSBRK | TCSBRKP => Ok(0),
         TCXONC => match argp {
             TCOOFF | TCOON | TCIOFF | TCION => Ok(0),
-            _ => Err(SysError::EINVAL),
+            _ => Err(Errno::EINVAL),
         },
         TCFLSH => match argp {
             TCIFLUSH | TCOFLUSH | TCIOFLUSH => Ok(0),
-            _ => Err(SysError::EINVAL),
+            _ => Err(Errno::EINVAL),
         },
         TIOCGETD => {
             let discipline = N_TTY;
@@ -614,7 +613,7 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
                 // This kernel has no tty line-discipline
                 // subsystem yet, so report EINVAL instead of pretending those
                 // protocol drivers exist.
-                _ => Err(SysError::EINVAL),
+                _ => Err(Errno::EINVAL),
             }
         }
         VT_GETSTATE => {
@@ -632,7 +631,7 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> SysResult {
             // console allocation state to switch or free yet.
             Ok(0)
         }
-        _ => Err(SysError::ENOTTY),
+        _ => Err(Errno::ENOTTY),
     }
 }
 
@@ -652,7 +651,7 @@ fn ioctl_dir(request: usize) -> usize {
     (request >> 30) & 0x3
 }
 
-fn copy_capped_string_to_user(token: usize, argp: usize, bytes: &[u8], size: usize) -> SysResult {
+fn copy_capped_string_to_user(token: usize, argp: usize, bytes: &[u8], size: usize) -> KResult {
     if size == 0 {
         return Ok(0);
     }
@@ -684,7 +683,7 @@ fn namespace_type_value(kind: ProcNamespaceKind) -> isize {
     }
 }
 
-fn install_namespace_fd(info: ProcNamespaceInfo) -> SysResult {
+fn install_namespace_fd(info: ProcNamespaceInfo) -> KResult {
     let file = Arc::new(NamespaceFile::new(info));
     super::fd::install_file_fd(
         file,
@@ -693,13 +692,13 @@ fn install_namespace_fd(info: ProcNamespaceInfo) -> SysResult {
     )
 }
 
-fn handle_namespace_parent_ioctl(info: ProcNamespaceInfo) -> SysResult {
+fn handle_namespace_parent_ioctl(info: ProcNamespaceInfo) -> KResult {
     match info.kind {
         ProcNamespaceKind::Pid => {
             let current = crate::task::current_process().pid_namespace();
-            let parent_id = info.parent_id.ok_or(SysError::EPERM)?;
+            let parent_id = info.parent_id.ok_or(Errno::EPERM)?;
             if info.id == current.id {
-                return Err(SysError::EPERM);
+                return Err(Errno::EPERM);
             }
             install_namespace_fd(ProcNamespaceInfo {
                 kind: ProcNamespaceKind::Pid,
@@ -709,9 +708,9 @@ fn handle_namespace_parent_ioctl(info: ProcNamespaceInfo) -> SysResult {
         }
         ProcNamespaceKind::User => {
             let current = crate::task::current_process().user_namespace();
-            let parent_id = info.parent_id.ok_or(SysError::EPERM)?;
+            let parent_id = info.parent_id.ok_or(Errno::EPERM)?;
             if info.id == current.id {
-                return Err(SysError::EPERM);
+                return Err(Errno::EPERM);
             }
             install_namespace_fd(ProcNamespaceInfo {
                 kind: ProcNamespaceKind::User,
@@ -720,12 +719,12 @@ fn handle_namespace_parent_ioctl(info: ProcNamespaceInfo) -> SysResult {
             })
         }
         ProcNamespaceKind::Mnt | ProcNamespaceKind::Uts | ProcNamespaceKind::Net => {
-            Err(SysError::EINVAL)
+            Err(Errno::EINVAL)
         }
     }
 }
 
-fn handle_namespace_ioctl(info: ProcNamespaceInfo, request: usize, argp: usize) -> SysResult {
+fn handle_namespace_ioctl(info: ProcNamespaceInfo, request: usize, argp: usize) -> KResult {
     match request {
         NS_GET_PARENT => handle_namespace_parent_ioctl(info),
         NS_GET_USERNS => match info.kind {
@@ -733,19 +732,19 @@ fn handle_namespace_ioctl(info: ProcNamespaceInfo, request: usize, argp: usize) 
             // UNFINISHED: The kernel records only process-visible user
             // namespace ancestry. Owning-user-namespace discovery for other
             // namespace types is deferred until full user namespace support.
-            _ => Err(SysError::EPERM),
+            _ => Err(Errno::EPERM),
         },
         NS_GET_NSTYPE => Ok(namespace_type_value(info.kind)),
         NS_GET_OWNER_UID => {
             if info.kind != ProcNamespaceKind::User {
-                return Err(SysError::EINVAL);
+                return Err(Errno::EINVAL);
             }
             let uid = 0u32;
             let token = current_user_token();
             write_user_value(token, argp as *mut u32, &uid)?;
             Ok(0)
         }
-        _ => Err(SysError::ENOTTY),
+        _ => Err(Errno::ENOTTY),
     }
 }
 
@@ -753,7 +752,7 @@ fn handle_uinput_ioctl(
     file: &(dyn crate::fs::File + Send + Sync),
     request: usize,
     argp: usize,
-) -> SysResult {
+) -> KResult {
     match request {
         UI_DEV_CREATE => {
             crate::fs::devfs_uinput_create(file)?;
@@ -790,7 +789,7 @@ fn handle_uinput_ioctl(
             let token = current_user_token();
             copy_capped_string_to_user(token, argp, b"input0", ioctl_size(request))
         }
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -798,7 +797,7 @@ fn handle_input_event_ioctl(
     file: &(dyn crate::fs::File + Send + Sync),
     request: usize,
     argp: usize,
-) -> SysResult {
+) -> KResult {
     match request {
         EVIOCGVERSION => {
             let token = current_user_token();
@@ -830,46 +829,46 @@ fn handle_input_event_ioctl(
             && ioctl_type(request) == b'E' as usize
             && ioctl_nr(request) == 0x06 =>
         {
-            let name = crate::fs::devfs_input_event_name(file).ok_or(SysError::ENOTTY)?;
+            let name = crate::fs::devfs_input_event_name(file).ok_or(Errno::ENOTTY)?;
             let token = current_user_token();
             copy_capped_string_to_user(token, argp, name.as_slice(), ioctl_size(request))
         }
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
-fn handle_tun_ioctl(request: usize, argp: usize) -> SysResult {
+fn handle_tun_ioctl(request: usize, argp: usize) -> KResult {
     match request {
         TUNGETFEATURES => {
             let token = current_user_token();
             write_user_value(token, argp as *mut u32, &TUN_SUPPORTED_FEATURES)?;
             Ok(0)
         }
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
-fn handle_random_ioctl(request: usize, argp: usize) -> SysResult {
+fn handle_random_ioctl(request: usize, argp: usize) -> KResult {
     match request {
         RNDGETENTCNT => {
             let token = current_user_token();
             write_user_value(token, argp as *mut i32, &RANDOM_ENTROPY_AVAIL)?;
             Ok(0)
         }
-        _ => Err(SysError::ENOTTY),
+        _ => Err(Errno::ENOTTY),
     }
 }
 
-fn fs_flag_ioctl_error(error: crate::fs::FsError) -> SysError {
+fn fs_flag_ioctl_error(error: crate::fs::FsError) -> Errno {
     match error {
-        crate::fs::FsError::Unsupported => SysError::ENOTTY,
+        crate::fs::FsError::Unsupported => Errno::ENOTTY,
         _ => error.into(),
     }
 }
 
 fn loop_backend_from_fd(
     fd: usize,
-) -> SysResult<(
+) -> KResult<(
     alloc::sync::Arc<dyn crate::fs::File + Send + Sync>,
     bool,
     Option<String>,
@@ -884,12 +883,12 @@ fn loop_backend_from_fd(
     Ok((file, read_only, path))
 }
 
-fn validate_loop_block_size(block_size: usize, allow_zero: bool) -> SysResult<Option<usize>> {
+fn validate_loop_block_size(block_size: usize, allow_zero: bool) -> KResult<Option<usize>> {
     if block_size == 0 && allow_zero {
         return Ok(None);
     }
     if !(512..=PAGE_SIZE).contains(&block_size) || !block_size.is_power_of_two() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(Some(block_size))
 }
@@ -913,7 +912,7 @@ fn loop_backing_path_from_sysfs() -> Option<String> {
     }
 }
 
-fn make_loop_info(loop_id: usize) -> SysResult<LinuxLoopInfo> {
+fn make_loop_info(loop_id: usize) -> KResult<LinuxLoopInfo> {
     let mut info = LinuxLoopInfo {
         lo_number: loop_id as i32,
         lo_flags: crate::fs::loop_device_flags(loop_id)? as i32,
@@ -923,7 +922,7 @@ fn make_loop_info(loop_id: usize) -> SysResult<LinuxLoopInfo> {
     Ok(info)
 }
 
-fn make_loop_info64(loop_id: usize) -> SysResult<LinuxLoopInfo64> {
+fn make_loop_info64(loop_id: usize) -> KResult<LinuxLoopInfo64> {
     let mut info = LinuxLoopInfo64 {
         lo_number: loop_id as u32,
         lo_flags: crate::fs::loop_device_flags(loop_id)?,
@@ -934,7 +933,7 @@ fn make_loop_info64(loop_id: usize) -> SysResult<LinuxLoopInfo64> {
     Ok(info)
 }
 
-fn handle_loop_ioctl(loop_id: usize, request: usize, argp: usize) -> SysResult {
+fn handle_loop_ioctl(loop_id: usize, request: usize, argp: usize) -> KResult {
     match request {
         LOOP_SET_FD => {
             let (backend, read_only, path) = loop_backend_from_fd(argp)?;
@@ -953,7 +952,7 @@ fn handle_loop_ioctl(loop_id: usize, request: usize, argp: usize) -> SysResult {
         }
         LOOP_GET_STATUS => {
             if !crate::fs::loop_device_is_attached(loop_id) {
-                return Err(SysError::ENXIO);
+                return Err(Errno::ENXIO);
             }
             let token = current_user_token();
             let info = make_loop_info(loop_id)?;
@@ -968,7 +967,7 @@ fn handle_loop_ioctl(loop_id: usize, request: usize, argp: usize) -> SysResult {
         }
         LOOP_GET_STATUS64 => {
             if !crate::fs::loop_device_is_attached(loop_id) {
-                return Err(SysError::ENXIO);
+                return Err(Errno::ENXIO);
             }
             let token = current_user_token();
             let info = make_loop_info64(loop_id)?;
@@ -1062,7 +1061,7 @@ fn handle_loop_ioctl(loop_id: usize, request: usize, argp: usize) -> SysResult {
             write_user_value(token, argp as *mut i32, &sector_size)?;
             Ok(0)
         }
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -1129,20 +1128,20 @@ fn set_ifreq_i16(req: &mut LinuxIfReq, value: i16) {
     req.ifr_data[..2].copy_from_slice(&value.to_ne_bytes());
 }
 
-fn handle_socket_if_ioctl(request: usize, argp: usize) -> SysResult {
+fn handle_socket_if_ioctl(request: usize, argp: usize) -> KResult {
     let token = current_user_token();
     match request {
         SIOCGIFINDEX => {
             let mut req = read_user_value(token, argp as *const LinuxIfReq)?;
             let index =
-                crate::fs::socket::netdev_if_index(ifreq_name(&req)).ok_or(SysError::ENODEV)?;
+                crate::fs::socket::netdev_if_index(ifreq_name(&req)).ok_or(Errno::ENODEV)?;
             set_ifreq_i32(&mut req, index);
             write_user_value(token, argp as *mut LinuxIfReq, &req)?;
             Ok(0)
         }
         SIOCGIFNAME => {
             let mut req = read_user_value(token, argp as *const LinuxIfReq)?;
-            let name = crate::fs::socket::netdev_if_name(ifreq_i32(&req)).ok_or(SysError::ENXIO)?;
+            let name = crate::fs::socket::netdev_if_name(ifreq_i32(&req)).ok_or(Errno::ENXIO)?;
             let name = name.as_bytes();
             req.ifr_name = [0; IFNAMSIZ];
             let copied = name.len().min(IFNAMSIZ.saturating_sub(1));
@@ -1153,7 +1152,7 @@ fn handle_socket_if_ioctl(request: usize, argp: usize) -> SysResult {
         SIOCGIFFLAGS => {
             let mut req = read_user_value(token, argp as *const LinuxIfReq)?;
             let flags =
-                crate::fs::socket::netdev_if_flags(ifreq_name(&req)).ok_or(SysError::ENODEV)?;
+                crate::fs::socket::netdev_if_flags(ifreq_name(&req)).ok_or(Errno::ENODEV)?;
             set_ifreq_i16(&mut req, flags);
             write_user_value(token, argp as *mut LinuxIfReq, &req)?;
             Ok(0)
@@ -1180,11 +1179,11 @@ fn handle_socket_if_ioctl(request: usize, argp: usize) -> SysResult {
             let _ = read_user_value(token, argp as *const u8)?;
             Ok(0)
         }
-        _ => Err(SysError::ENOTTY),
+        _ => Err(Errno::ENOTTY),
     }
 }
 
-fn handle_rtc_ioctl(request: usize, argp: usize) -> SysResult {
+fn handle_rtc_ioctl(request: usize, argp: usize) -> KResult {
     match request {
         RTC_RD_TIME => {
             let nanos = crate::timer::wall_time_nanos();
@@ -1193,7 +1192,7 @@ fn handle_rtc_ioctl(request: usize, argp: usize) -> SysResult {
             write_user_value(token, argp as *mut LinuxRtcTime, &rtc_time)?;
             Ok(0)
         }
-        _ => Err(SysError::ENOTTY),
+        _ => Err(Errno::ENOTTY),
     }
 }
 

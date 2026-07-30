@@ -6,11 +6,11 @@ use crate::fs::{
 };
 use crate::mm::record_exec_metadata_read;
 use crate::syscall::SyscallContext;
-use crate::syscall::errno::{SysError, SysResult};
 use crate::syscall::fs::permissions::{AccessSubject, check_execute_permission};
 use crate::syscall::fs::{fanotify_notify_open_exec_at, path_context_from};
 use crate::syscall::user_ptr::{PATH_MAX, read_user_c_string_ctx, read_user_usize_ctx};
 use crate::task::current_process;
+use crate::uapi::errno::{Errno, KResult};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -77,19 +77,19 @@ struct ElfInterpreterSource {
 }
 
 impl ExecImageSource {
-    fn elf(&self) -> SysResult<xmas_elf::ElfFile<'_>> {
-        xmas_elf::ElfFile::new(self.data.as_slice()).map_err(|_| SysError::ENOEXEC)
+    fn elf(&self) -> KResult<xmas_elf::ElfFile<'_>> {
+        xmas_elf::ElfFile::new(self.data.as_slice()).map_err(|_| Errno::ENOEXEC)
     }
 
-    fn read_exact_at(&self, offset: usize, len: usize) -> SysResult<Vec<u8>> {
-        let end = offset.checked_add(len).ok_or(SysError::ENOEXEC)?;
+    fn read_exact_at(&self, offset: usize, len: usize) -> KResult<Vec<u8>> {
+        let end = offset.checked_add(len).ok_or(Errno::ENOEXEC)?;
         if end > self.file_size {
-            return Err(SysError::ENOEXEC);
+            return Err(Errno::ENOEXEC);
         }
         let mut data = vec![0u8; len];
         let read_len = self.file.read_at(offset, data.as_mut_slice());
         if read_len != len {
-            return Err(SysError::ENOEXEC);
+            return Err(Errno::ENOEXEC);
         }
         Ok(data)
     }
@@ -100,15 +100,15 @@ impl ExecStringBudget {
         Self { bytes: 0, count: 0 }
     }
 
-    fn charge(&mut self, string_len: usize) -> SysResult<()> {
-        self.count = self.count.checked_add(1).ok_or(SysError::E2BIG)?;
+    fn charge(&mut self, string_len: usize) -> KResult<()> {
+        self.count = self.count.checked_add(1).ok_or(Errno::E2BIG)?;
         if self.count > EXEC_ARG_ENV_MAX_COUNT {
-            return Err(SysError::E2BIG);
+            return Err(Errno::E2BIG);
         }
-        let bytes = string_len.checked_add(1).ok_or(SysError::E2BIG)?;
-        self.bytes = self.bytes.checked_add(bytes).ok_or(SysError::E2BIG)?;
+        let bytes = string_len.checked_add(1).ok_or(Errno::E2BIG)?;
+        self.bytes = self.bytes.checked_add(bytes).ok_or(Errno::E2BIG)?;
         if self.bytes > EXEC_ARG_ENV_MAX_BYTES {
-            return Err(SysError::E2BIG);
+            return Err(Errno::E2BIG);
         }
         Ok(())
     }
@@ -118,7 +118,7 @@ fn read_exec_string_array_ctx(
     ctx: &SyscallContext,
     mut ptr: *const usize,
     budget: &mut ExecStringBudget,
-) -> SysResult<Vec<String>> {
+) -> KResult<Vec<String>> {
     if ptr.is_null() {
         return Ok(Vec::new());
     }
@@ -147,7 +147,7 @@ fn read_exec_args_envs_ctx(
     ctx: &SyscallContext,
     args: *const usize,
     envs: *const usize,
-) -> SysResult<(Vec<String>, Vec<String>)> {
+) -> KResult<(Vec<String>, Vec<String>)> {
     // Copy argv/envp while the caller's old address space is still active.
     // After ProcessControlBlock::exec() commits, these user pointers are no
     // longer meaningful.
@@ -169,7 +169,7 @@ fn trim_script_line(line: &[u8]) -> &[u8] {
     &line[..end]
 }
 
-fn parse_shebang(data: &[u8]) -> SysResult<Option<ScriptInterpreter>> {
+fn parse_shebang(data: &[u8]) -> KResult<Option<ScriptInterpreter>> {
     if !data.starts_with(SHEBANG_MAGIC) {
         return Ok(None);
     }
@@ -180,16 +180,16 @@ fn parse_shebang(data: &[u8]) -> SysResult<Option<ScriptInterpreter>> {
         .unwrap_or(data.len());
     let line = trim_script_line(&data[SHEBANG_MAGIC.len()..line_end]);
     let Some(name_start) = line.iter().position(|byte| !is_space_or_tab(*byte)) else {
-        return Err(SysError::ENOEXEC);
+        return Err(Errno::ENOEXEC);
     };
     let rest = &line[name_start..];
     let name_end = rest
         .iter()
         .position(|byte| is_space_or_tab(*byte))
         .unwrap_or(rest.len());
-    let interpreter = str::from_utf8(&rest[..name_end]).map_err(|_| SysError::ENOEXEC)?;
+    let interpreter = str::from_utf8(&rest[..name_end]).map_err(|_| Errno::ENOEXEC)?;
     if interpreter.is_empty() {
-        return Err(SysError::ENOEXEC);
+        return Err(Errno::ENOEXEC);
     }
 
     let optional_arg = rest[name_end..]
@@ -198,7 +198,7 @@ fn parse_shebang(data: &[u8]) -> SysResult<Option<ScriptInterpreter>> {
         .map(|arg_start| {
             str::from_utf8(&rest[name_end + arg_start..])
                 .map(|arg| arg.to_string())
-                .map_err(|_| SysError::ENOEXEC)
+                .map_err(|_| Errno::ENOEXEC)
         })
         .transpose()?;
 
@@ -232,12 +232,12 @@ fn push_missing_library_path(envs: &mut Vec<String>, root: &str) {
     }
 }
 
-fn check_exec_stat(stat: &FileStat) -> SysResult<()> {
+fn check_exec_stat(stat: &FileStat) -> KResult<()> {
     if stat.mode & S_IFMT != S_IFREG {
-        return Err(SysError::EACCES);
+        return Err(Errno::EACCES);
     }
     if mount_is_noexec(MountId(stat.dev as usize)) {
-        return Err(SysError::EACCES);
+        return Err(Errno::EACCES);
     }
 
     // UNFINISHED: Linux also folds path-prefix search permissions, ACLs,
@@ -248,32 +248,28 @@ fn check_exec_stat(stat: &FileStat) -> SysResult<()> {
     check_execute_permission(stat, AccessSubject::from_fs_credentials(&credentials))
 }
 
-fn check_exec_file_in(
-    context: PathContext,
-    path: &str,
-    follow_final_symlink: bool,
-) -> SysResult<()> {
+fn check_exec_file_in(context: PathContext, path: &str, follow_final_symlink: bool) -> KResult<()> {
     if !follow_final_symlink {
         let stat = stat_in(context.clone(), path, false)?;
         if stat.mode & S_IFMT == S_IFLNK {
-            return Err(SysError::ELOOP);
+            return Err(Errno::ELOOP);
         }
     }
     let stat = stat_in(context.clone(), path, true)?;
     check_exec_stat(&stat)?;
     if regular_file_is_open_writable_in(context, path)? {
-        return Err(SysError::ETXTBSY);
+        return Err(Errno::ETXTBSY);
     }
     Ok(())
 }
 
-fn check_exec_open_file(file: &Arc<dyn File + Send + Sync>) -> SysResult<()> {
+fn check_exec_open_file(file: &Arc<dyn File + Send + Sync>) -> KResult<()> {
     let stat = file.stat()?;
     check_exec_stat(&stat)?;
     if let Some(node) = file.vfs_node_id()
         && regular_file_node_is_open_writable(node)
     {
-        return Err(SysError::ETXTBSY);
+        return Err(Errno::ETXTBSY);
     }
     Ok(())
 }
@@ -287,55 +283,53 @@ fn executable_node_in(
     (path.kind == FsNodeKind::RegularFile).then_some(path.node)
 }
 
-fn read_u16_le(data: &[u8], offset: usize) -> SysResult<usize> {
+fn read_u16_le(data: &[u8], offset: usize) -> KResult<usize> {
     let bytes: [u8; 2] = data
         .get(offset..offset + 2)
-        .ok_or(SysError::ENOEXEC)?
+        .ok_or(Errno::ENOEXEC)?
         .try_into()
-        .map_err(|_| SysError::ENOEXEC)?;
+        .map_err(|_| Errno::ENOEXEC)?;
     Ok(u16::from_le_bytes(bytes) as usize)
 }
 
-fn read_u64_le(data: &[u8], offset: usize) -> SysResult<usize> {
+fn read_u64_le(data: &[u8], offset: usize) -> KResult<usize> {
     let bytes: [u8; 8] = data
         .get(offset..offset + 8)
-        .ok_or(SysError::ENOEXEC)?
+        .ok_or(Errno::ENOEXEC)?
         .try_into()
-        .map_err(|_| SysError::ENOEXEC)?;
-    usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| SysError::ENOEXEC)
+        .map_err(|_| Errno::ENOEXEC)?;
+    usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| Errno::ENOEXEC)
 }
 
-fn read_i64_le(data: &[u8], offset: usize) -> SysResult<i64> {
+fn read_i64_le(data: &[u8], offset: usize) -> KResult<i64> {
     let bytes: [u8; 8] = data
         .get(offset..offset + 8)
-        .ok_or(SysError::ENOEXEC)?
+        .ok_or(Errno::ENOEXEC)?
         .try_into()
-        .map_err(|_| SysError::ENOEXEC)?;
+        .map_err(|_| Errno::ENOEXEC)?;
     Ok(i64::from_le_bytes(bytes))
 }
 
-fn elf_metadata_len(probe: &[u8], file_size: usize) -> SysResult<(usize, usize)> {
+fn elf_metadata_len(probe: &[u8], file_size: usize) -> KResult<(usize, usize)> {
     if probe.len() < EXEC_ELF_HEADER_BYTES {
-        return Err(SysError::ENOEXEC);
+        return Err(Errno::ENOEXEC);
     }
     if probe.get(4).copied() != Some(ELFCLASS64) || probe.get(5).copied() != Some(ELFDATA2LSB) {
-        return Err(SysError::ENOEXEC);
+        return Err(Errno::ENOEXEC);
     }
     let ph_offset = read_u64_le(probe, 32)?;
     let ph_entry_size = read_u16_le(probe, 54)?;
     let ph_count = read_u16_le(probe, 56)?;
     if ph_entry_size != core::mem::size_of::<xmas_elf::program::ProgramHeader64>() {
-        return Err(SysError::ENOEXEC);
+        return Err(Errno::ENOEXEC);
     }
-    let phdr_bytes = ph_entry_size
-        .checked_mul(ph_count)
-        .ok_or(SysError::ENOEXEC)?;
-    let metadata_len = ph_offset.checked_add(phdr_bytes).ok_or(SysError::ENOEXEC)?;
+    let phdr_bytes = ph_entry_size.checked_mul(ph_count).ok_or(Errno::ENOEXEC)?;
+    let metadata_len = ph_offset.checked_add(phdr_bytes).ok_or(Errno::ENOEXEC)?;
     if metadata_len < EXEC_ELF_HEADER_BYTES
         || metadata_len > file_size
         || metadata_len > EXEC_METADATA_MAX_BYTES
     {
-        return Err(SysError::ENOEXEC);
+        return Err(Errno::ENOEXEC);
     }
     Ok((metadata_len, phdr_bytes))
 }
@@ -348,7 +342,7 @@ fn read_file_prefix(file: &Arc<dyn File + Send + Sync>, file_size: usize) -> Vec
     data
 }
 
-fn read_exec_source_from_file(file: Arc<dyn File + Send + Sync>) -> SysResult<ExecImageSource> {
+fn read_exec_source_from_file(file: Arc<dyn File + Send + Sync>) -> KResult<ExecImageSource> {
     let file_size = file.stat()?.size as usize;
     let probe = read_file_prefix(&file, file_size);
     if !probe.starts_with(ELF_MAGIC) {
@@ -363,7 +357,7 @@ fn read_exec_source_from_file(file: Arc<dyn File + Send + Sync>) -> SysResult<Ex
     let mut metadata = vec![0u8; metadata_len];
     let read_len = file.read_at(0, metadata.as_mut_slice());
     if read_len != metadata_len {
-        return Err(SysError::ENOEXEC);
+        return Err(Errno::ENOEXEC);
     }
     // CONTEXT: The ELF loader consumes only the bounded header/program-header
     // window here. Segment contents are faulted or copied later, so changing
@@ -381,7 +375,7 @@ fn read_exec_file_in(
     context: PathContext,
     path: &str,
     follow_final_symlink: bool,
-) -> SysResult<ExecImageSource> {
+) -> KResult<ExecImageSource> {
     check_exec_file_in(context.clone(), path, follow_final_symlink)?;
     let event_path = normalize_path_at_root(context.root_path(), context.cwd_path(), path);
     let app_file = open_file_in(context, path, OpenFlags::RDONLY)?;
@@ -396,22 +390,22 @@ fn normalized_exec_path_in(context: &PathContext, path: &str) -> String {
         .unwrap_or_else(|| String::from(path))
 }
 
-fn read_exec_open_file(file: Arc<dyn File + Send + Sync>) -> SysResult<ExecImageSource> {
+fn read_exec_open_file(file: Arc<dyn File + Send + Sync>) -> KResult<ExecImageSource> {
     check_exec_open_file(&file)?;
     read_exec_source_from_file(file)
 }
 
-fn read_exec_file(path: &str) -> SysResult<ExecImageSource> {
+fn read_exec_file(path: &str) -> KResult<ExecImageSource> {
     read_exec_file_in(current_process().path_snapshot().context, path, true)
 }
 
-fn read_elf_exec_file(path: &str) -> SysResult<ExecImageSource> {
+fn read_elf_exec_file(path: &str) -> KResult<ExecImageSource> {
     let source = read_exec_file(path)?;
     source.elf()?;
     Ok(source)
 }
 
-fn read_elf_interpreter(path: &str) -> SysResult<ElfInterpreterSource> {
+fn read_elf_interpreter(path: &str) -> KResult<ElfInterpreterSource> {
     const REDIRECTS: &[(&str, &str)] = &[
         // CONTEXT: libc-test's musl dynamic binary names the soft-float
         // interpreter as a symlink to libc.so. Official test sources state
@@ -447,7 +441,7 @@ fn read_elf_interpreter(path: &str) -> SysResult<ElfInterpreterSource> {
                 compat_root: None,
             });
         }
-        Err(error @ (SysError::ENOENT | SysError::ENOEXEC)) => error,
+        Err(error @ (Errno::ENOENT | Errno::ENOEXEC)) => error,
         Err(error) => return Err(error),
     };
 
@@ -480,7 +474,7 @@ fn dynamic_segment_has_needed(
     source: &ExecImageSource,
     offset: usize,
     len: usize,
-) -> SysResult<bool> {
+) -> KResult<bool> {
     if len == 0 {
         return Ok(false);
     }
@@ -502,20 +496,20 @@ fn dynamic_segment_has_needed(
 fn elf_required_interpreter_path_from_source(
     elf: &xmas_elf::ElfFile<'_>,
     source: &ExecImageSource,
-) -> SysResult<Option<String>> {
+) -> KResult<Option<String>> {
     let mut interpreter_path = None;
     let mut needs_interpreter = false;
     for i in 0..elf.header.pt2.ph_count() {
-        let ph = elf.program_header(i).map_err(|_| SysError::ENOEXEC)?;
-        match ph.get_type().map_err(|_| SysError::ENOEXEC)? {
+        let ph = elf.program_header(i).map_err(|_| Errno::ENOEXEC)?;
+        match ph.get_type().map_err(|_| Errno::ENOEXEC)? {
             Type::Interp => {
                 let offset = ph.offset() as usize;
                 let len = ph.file_size() as usize;
                 let bytes = source.read_exact_at(offset, len)?;
                 let path = CStr::from_bytes_until_nul(bytes.as_slice())
-                    .map_err(|_| SysError::ENOEXEC)?
+                    .map_err(|_| Errno::ENOEXEC)?
                     .to_str()
-                    .map_err(|_| SysError::ENOEXEC)?;
+                    .map_err(|_| Errno::ENOEXEC)?;
                 interpreter_path = Some(path.to_string());
             }
             Type::Dynamic => {
@@ -544,9 +538,9 @@ fn exec_script(
     envs: Vec<String>,
     interpreter: ScriptInterpreter,
     depth: usize,
-) -> SysResult {
+) -> KResult {
     if depth >= SHEBANG_RECURSION_LIMIT {
-        return Err(SysError::ELOOP);
+        return Err(Errno::ELOOP);
     }
 
     let interpreter_path = interpreter.path;
@@ -577,7 +571,7 @@ fn exec_loaded_program(
     depth: usize,
     source: ExecImageSource,
     executable_node: Option<VfsNodeId>,
-) -> SysResult {
+) -> KResult {
     // The open file remains the executable authority; a proc-fd target only
     // supplies the Linux-visible path later exposed through procfs metadata.
     let executable_path = source.file.proc_fd_target().unwrap_or(executable_path);
@@ -651,7 +645,7 @@ fn exec_loaded_program(
     exec_script(path, args, envs, interpreter, depth)
 }
 
-fn exec_path(path: String, args: Vec<String>, envs: Vec<String>) -> SysResult {
+fn exec_path(path: String, args: Vec<String>, envs: Vec<String>) -> KResult {
     let args = normalize_exec_args(args);
     // CONTEXT: CAgent's statically linked command runner invokes `/bin/sh -c`
     // directly. Keep that narrow command-shell ABI on the static BusyBox path
@@ -675,7 +669,7 @@ fn exec_path_in(
     follow_final_symlink: bool,
     args: Vec<String>,
     envs: Vec<String>,
-) -> SysResult {
+) -> KResult {
     let args = normalize_exec_args(args);
     let executable_path = normalized_exec_path_in(&context, path.as_str());
     let executable_node = executable_node_in(context.clone(), path.as_str(), follow_final_symlink);
@@ -688,7 +682,7 @@ fn exec_open_file(
     file: Arc<dyn File + Send + Sync>,
     args: Vec<String>,
     envs: Vec<String>,
-) -> SysResult {
+) -> KResult {
     let args = normalize_exec_args(args);
     let executable_node = file.vfs_node_id();
     let data = read_exec_open_file(file)?;
@@ -722,15 +716,15 @@ pub fn sys_execve_ctx(
     path: *const u8,
     args: *const usize,
     envs: *const usize,
-) -> SysResult {
+) -> KResult {
     let path = read_user_c_string_ctx(ctx, path, PATH_MAX)?;
     let (args_vec, envs_vec) = read_exec_args_envs_ctx(ctx, args, envs)?;
     exec_path(path, args_vec, envs_vec)
 }
 
-fn file_by_fd(fd: isize) -> SysResult<Arc<dyn File + Send + Sync>> {
+fn file_by_fd(fd: isize) -> KResult<Arc<dyn File + Send + Sync>> {
     if fd < 0 {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     let process = current_process();
     let inner = process.inner_exclusive_access();
@@ -739,7 +733,7 @@ fn file_by_fd(fd: isize) -> SysResult<Arc<dyn File + Send + Sync>> {
         .get(fd as usize)
         .and_then(|entry| entry.as_ref())
         .map(|entry| entry.file())
-        .ok_or(SysError::EBADF)
+        .ok_or(Errno::EBADF)
 }
 
 pub fn sys_execveat_ctx(
@@ -749,9 +743,9 @@ pub fn sys_execveat_ctx(
     args: *const usize,
     envs: *const usize,
     flags: usize,
-) -> SysResult {
+) -> KResult {
     if flags & !VALID_EXECVEAT_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let path = read_user_c_string_ctx(ctx, path, PATH_MAX)?;
@@ -759,7 +753,7 @@ pub fn sys_execveat_ctx(
 
     if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
-            return Err(SysError::ENOENT);
+            return Err(Errno::ENOENT);
         }
         if dirfd == AT_FDCWD {
             let file = open_file_in(

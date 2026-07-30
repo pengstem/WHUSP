@@ -25,6 +25,7 @@ mod shutdown;
 mod sync;
 mod syscall;
 mod task;
+mod uapi;
 mod vdso;
 
 pub(crate) use arch::{board, sbi, timer, trap};

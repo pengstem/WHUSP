@@ -11,7 +11,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
-use super::super::errno::{SysError, SysResult};
 use super::super::user_ptr::{
     UserBufferAccess, read_user_c_string, translated_byte_buffer_checked_ctx,
 };
@@ -22,6 +21,7 @@ use super::fd_lock::{
     release_record_locks_for_close,
 };
 use super::inotify::inotify_notify_close;
+use crate::uapi::errno::{Errno, KResult};
 
 const F_DUPFD: usize = 0;
 const F_GETFD: usize = 1;
@@ -55,7 +55,7 @@ const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
 const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
 const VALID_CLOSE_RANGE_FLAGS: u32 = CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC;
 
-pub(super) fn get_fd_entry_by_fd(fd: usize) -> SysResult<FdTableEntry> {
+pub(super) fn get_fd_entry_by_fd(fd: usize) -> KResult<FdTableEntry> {
     let process = current_process();
     get_fd_entry_by_fd_for_process(&process, fd)
 }
@@ -63,19 +63,19 @@ pub(super) fn get_fd_entry_by_fd(fd: usize) -> SysResult<FdTableEntry> {
 pub(super) fn get_fd_entry_by_fd_for_process(
     process: &ProcessControlBlock,
     fd: usize,
-) -> SysResult<FdTableEntry> {
+) -> KResult<FdTableEntry> {
     let inner = process.inner_exclusive_access();
-    inner.fd_entry(fd).ok_or(SysError::EBADF)
+    inner.fd_entry(fd).ok_or(Errno::EBADF)
 }
 
-pub(crate) fn get_file_by_fd(fd: usize) -> SysResult<Arc<dyn File + Send + Sync>> {
+pub(crate) fn get_file_by_fd(fd: usize) -> KResult<Arc<dyn File + Send + Sync>> {
     Ok(get_fd_entry_by_fd(fd)?.file())
 }
 
 pub(crate) fn get_file_by_fd_for_process(
     process: &ProcessControlBlock,
     fd: usize,
-) -> SysResult<Arc<dyn File + Send + Sync>> {
+) -> KResult<Arc<dyn File + Send + Sync>> {
     Ok(get_fd_entry_by_fd_for_process(process, fd)?.file())
 }
 
@@ -88,11 +88,11 @@ pub(crate) fn install_file_fd(
     file: Arc<dyn File + Send + Sync>,
     flags: OpenFlags,
     dir_path: Option<String>,
-) -> SysResult {
+) -> KResult {
     let dir_path = file.working_dir().and(dir_path);
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-    let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
+    let fd = inner.alloc_fd_from(0).ok_or(Errno::EMFILE)?;
     let previous = inner.set_fd_entry(
         fd,
         FdTableEntry::from_file_with_dir_path(file, flags, dir_path),
@@ -101,19 +101,19 @@ pub(crate) fn install_file_fd(
     Ok(fd as isize)
 }
 
-pub fn sys_close_ctx(ctx: &SyscallContext, fd: usize) -> SysResult {
+pub fn sys_close_ctx(ctx: &SyscallContext, fd: usize) -> KResult {
     let process = ctx.process();
     let entry = {
         let mut inner = process.inner_exclusive_access();
-        inner.take_fd_entry(fd).ok_or(SysError::EBADF)?
+        inner.take_fd_entry(fd).ok_or(Errno::EBADF)?
     };
     close_detached_fd_entry(entry);
     Ok(0)
 }
 
-pub fn sys_close_range(first: usize, last: usize, flags: u32) -> SysResult {
+pub fn sys_close_range(first: usize, last: usize, flags: u32) -> KResult {
     if first > last || flags & !VALID_CLOSE_RANGE_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     // UNFINISHED: CLOSE_RANGE_UNSHARE is accepted for Linux compatibility, but
     // this kernel's fd table is process-wide rather than a per-thread
@@ -182,15 +182,15 @@ fn close_detached_fd_entry_inner(entry: FdTableEntry, force_fanotify_release: bo
     drop(entry);
 }
 
-fn pipe2_open_flags(flags: u32) -> SysResult<OpenFlags> {
+fn pipe2_open_flags(flags: u32) -> KResult<OpenFlags> {
     if flags & !VALID_PIPE2_FLAGS != 0 {
         // UNFINISHED: Linux notification pipes are not implemented.
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(OpenFlags::from_bits_truncate(flags))
 }
 
-fn validate_pipefd_ctx(ctx: &SyscallContext, pipefd: *mut i32) -> SysResult<()> {
+fn validate_pipefd_ctx(ctx: &SyscallContext, pipefd: *mut i32) -> KResult<()> {
     translated_byte_buffer_checked_ctx(
         ctx,
         pipefd as *const u8,
@@ -200,7 +200,7 @@ fn validate_pipefd_ctx(ctx: &SyscallContext, pipefd: *mut i32) -> SysResult<()> 
     .map(|_| ())
 }
 
-fn write_pipefd_pair_ctx(ctx: &SyscallContext, pipefd: *mut i32, fds: [i32; 2]) -> SysResult<()> {
+fn write_pipefd_pair_ctx(ctx: &SyscallContext, pipefd: *mut i32, fds: [i32; 2]) -> KResult<()> {
     let mut bytes = [0u8; size_of::<[i32; 2]>()];
     let fd_size = size_of::<i32>();
     bytes[..fd_size].copy_from_slice(&fds[0].to_ne_bytes());
@@ -220,7 +220,7 @@ fn write_pipefd_pair_ctx(ctx: &SyscallContext, pipefd: *mut i32, fds: [i32; 2]) 
     Ok(())
 }
 
-pub fn sys_pipe2_ctx(ctx: &SyscallContext, pipefd: *mut i32, flags: u32) -> SysResult {
+pub fn sys_pipe2_ctx(ctx: &SyscallContext, pipefd: *mut i32, flags: u32) -> KResult {
     let pipe_flags = pipe2_open_flags(flags)?;
     validate_pipefd_ctx(ctx, pipefd)?;
     let pipe_capacity = default_pipe_capacity_for_process(ctx.process());
@@ -230,7 +230,7 @@ pub fn sys_pipe2_ctx(ctx: &SyscallContext, pipefd: *mut i32, flags: u32) -> SysR
     let mut cleanup_entry = None;
     let fds = {
         let mut inner = process.inner_exclusive_access();
-        let read_fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
+        let read_fd = inner.alloc_fd_from(0).ok_or(Errno::EMFILE)?;
         let previous = inner.set_fd_entry(
             read_fd,
             FdTableEntry::from_file(pipe_read, OpenFlags::RDONLY | pipe_flags),
@@ -245,7 +245,7 @@ pub fn sys_pipe2_ctx(ctx: &SyscallContext, pipefd: *mut i32, flags: u32) -> SysR
             Ok([read_fd, write_fd])
         } else {
             cleanup_entry = inner.take_fd_entry(read_fd);
-            Err(SysError::EMFILE)
+            Err(Errno::EMFILE)
         }
     };
     if let Some(entry) = cleanup_entry {
@@ -266,22 +266,22 @@ pub fn sys_pipe2_ctx(ctx: &SyscallContext, pipefd: *mut i32, flags: u32) -> SysR
     Ok(0)
 }
 
-pub fn sys_dup(fd: usize) -> SysResult {
+pub fn sys_dup(fd: usize) -> KResult {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-    let entry = inner.fd_entry(fd).ok_or(SysError::EBADF)?;
-    let new_fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
+    let entry = inner.fd_entry(fd).ok_or(Errno::EBADF)?;
+    let new_fd = inner.alloc_fd_from(0).ok_or(Errno::EMFILE)?;
     let previous = inner.set_fd_entry(new_fd, entry.duplicate(FdFlags::empty()));
     debug_assert!(previous.is_none());
     Ok(new_fd as isize)
 }
 
-pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> SysResult {
+pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> KResult {
     if flags & !VALID_DUP3_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if old_fd == new_fd {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let fd_flags = if flags & OpenFlags::CLOEXEC.bits() != 0 {
@@ -293,9 +293,9 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> SysResult {
     let process = current_process();
     let replaced = {
         let mut inner = process.inner_exclusive_access();
-        let entry = inner.fd_entry(old_fd).ok_or(SysError::EBADF)?;
+        let entry = inner.fd_entry(old_fd).ok_or(Errno::EBADF)?;
         if new_fd >= inner.nofile_limit() {
-            return Err(SysError::EBADF);
+            return Err(Errno::EBADF);
         }
         inner.set_fd_entry(new_fd, entry.duplicate(fd_flags))
     };
@@ -312,39 +312,39 @@ fn fcntl_dup_for_process(
     fd: usize,
     lower_bound: usize,
     fd_flags: FdFlags,
-) -> SysResult {
+) -> KResult {
     let mut inner = process.inner_exclusive_access();
     if lower_bound >= inner.nofile_limit() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
-    let entry = inner.fd_entry(fd).ok_or(SysError::EBADF)?;
-    let new_fd = inner.alloc_fd_from(lower_bound).ok_or(SysError::EMFILE)?;
+    let entry = inner.fd_entry(fd).ok_or(Errno::EBADF)?;
+    let new_fd = inner.alloc_fd_from(lower_bound).ok_or(Errno::EMFILE)?;
     let previous = inner.set_fd_entry(new_fd, entry.duplicate(fd_flags));
     debug_assert!(previous.is_none());
     Ok(new_fd as isize)
 }
 
-fn fcntl_get_pipe_size(fd: usize) -> SysResult {
+fn fcntl_get_pipe_size(fd: usize) -> KResult {
     let file = get_file_by_fd(fd)?;
     file.pipe_capacity()
         .map(|capacity| capacity as isize)
-        .ok_or(SysError::EINVAL)
+        .ok_or(Errno::EINVAL)
 }
 
-fn fcntl_set_pipe_size(fd: usize, requested: usize) -> SysResult {
+fn fcntl_set_pipe_size(fd: usize, requested: usize) -> KResult {
     let file = get_file_by_fd(fd)?;
-    let capacity = file.pipe_capacity().ok_or(SysError::EINVAL)?;
+    let capacity = file.pipe_capacity().ok_or(Errno::EINVAL)?;
     let occupied = file.pipe_occupied().unwrap_or(0);
 
     if requested > MAX_PIPE_SIZE_ARG {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if requested < occupied {
-        return Err(SysError::EBUSY);
+        return Err(Errno::EBUSY);
     }
     let requested = requested.max(PAGE_SIZE);
     if requested > pipe_max_size() {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     if requested == capacity {
         return Ok(capacity as isize);
@@ -352,44 +352,44 @@ fn fcntl_set_pipe_size(fd: usize, requested: usize) -> SysResult {
     Ok(file.set_pipe_capacity(requested)? as isize)
 }
 
-fn fcntl_get_seals(fd: usize) -> SysResult {
+fn fcntl_get_seals(fd: usize) -> KResult {
     Ok(get_file_by_fd(fd)?.seals()? as isize)
 }
 
-fn fcntl_add_seals(fd: usize, seals: u32) -> SysResult {
+fn fcntl_add_seals(fd: usize, seals: u32) -> KResult {
     get_file_by_fd(fd)?.add_seals(seals)?;
     Ok(0)
 }
 
-fn fcntl_set_lease(fd: usize, arg: usize) -> SysResult {
+fn fcntl_set_lease(fd: usize, arg: usize) -> KResult {
     let entry = get_fd_entry_by_fd(fd)?;
     match arg as i16 {
         // CONTEXT: This is a minimal lease compatibility surface for LTP.
         // Full Linux lease breaking, SIGIO notification, and open/truncate
         // blocking are still not implemented.
-        0 if entry.file().writable() => Err(SysError::EAGAIN),
+        0 if entry.file().writable() => Err(Errno::EAGAIN),
         0..=2 => Ok(0),
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
-fn fcntl_get_lease(fd: usize) -> SysResult {
+fn fcntl_get_lease(fd: usize) -> KResult {
     get_fd_entry_by_fd(fd)?;
     Ok(2)
 }
 
-fn read_memfd_name(name: *const u8) -> SysResult {
+fn read_memfd_name(name: *const u8) -> KResult {
     match read_user_c_string(current_user_token(), name, MEMFD_NAME_MAX + 1) {
         Ok(_) => Ok(0),
-        Err(SysError::ENAMETOOLONG) => Err(SysError::EINVAL),
+        Err(Errno::ENAMETOOLONG) => Err(Errno::EINVAL),
         Err(err) => Err(err),
     }
 }
 
-pub fn sys_memfd_create(name: *const u8, flags: u32) -> SysResult {
+pub fn sys_memfd_create(name: *const u8, flags: u32) -> KResult {
     read_memfd_name(name)?;
     if flags & !MFD_VALID_FLAGS != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let open_flags = OpenFlags::RDWR
         | OpenFlags::LARGEFILE
@@ -402,13 +402,13 @@ pub fn sys_memfd_create(name: *const u8, flags: u32) -> SysResult {
 
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-    let fd = inner.alloc_fd_from(0).ok_or(SysError::EMFILE)?;
+    let fd = inner.alloc_fd_from(0).ok_or(Errno::EMFILE)?;
     let previous = inner.set_fd_entry(fd, FdTableEntry::from_file(file, open_flags));
     debug_assert!(previous.is_none());
     Ok(fd as isize)
 }
 
-pub fn sys_fcntl_ctx(ctx: &SyscallContext, fd: usize, op: usize, arg: usize) -> SysResult {
+pub fn sys_fcntl_ctx(ctx: &SyscallContext, fd: usize, op: usize, arg: usize) -> KResult {
     match op {
         F_DUPFD => fcntl_dup_for_process(ctx.process(), fd, arg, FdFlags::empty()),
         F_DUPFD_CLOEXEC => fcntl_dup_for_process(ctx.process(), fd, arg, FdFlags::CLOEXEC),
@@ -421,7 +421,7 @@ pub fn sys_fcntl_ctx(ctx: &SyscallContext, fd: usize, op: usize, arg: usize) -> 
                 .fd_table
                 .get_mut(fd)
                 .and_then(|entry| entry.as_mut())
-                .ok_or(SysError::EBADF)?;
+                .ok_or(Errno::EBADF)?;
             entry.set_fd_flags(FdFlags::from_bits_truncate(
                 (arg as u32) & FdFlags::CLOEXEC.bits(),
             ));
@@ -454,11 +454,11 @@ pub fn sys_fcntl_ctx(ctx: &SyscallContext, fd: usize, op: usize, arg: usize) -> 
         F_SETPIPE_SZ => fcntl_set_pipe_size(fd, arg),
         F_ADD_SEALS => fcntl_add_seals(fd, arg as u32),
         F_GET_SEALS => fcntl_get_seals(fd),
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
-pub fn sys_flock(fd: usize, operation: i32) -> SysResult {
+pub fn sys_flock(fd: usize, operation: i32) -> KResult {
     let entry = get_fd_entry_by_fd(fd)?;
     flock_operation(entry, operation)
 }

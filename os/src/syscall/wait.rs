@@ -10,7 +10,7 @@ use crate::task::{
 };
 use alloc::sync::Arc;
 
-use super::errno::{SysError, SysResult};
+use crate::uapi::errno::{Errno, KResult};
 
 const WNOHANG: i32 = 1;
 const WUNTRACED: i32 = 2;
@@ -145,7 +145,7 @@ fn waitid_child_matches(
     }
 }
 
-fn write_rusage(memory_set: &mut MemorySet, rusage: *mut RUsage) -> SysResult<()> {
+fn write_rusage(memory_set: &mut MemorySet, rusage: *mut RUsage) -> KResult<()> {
     if !rusage.is_null() {
         // UNFINISHED: Linux fills child resource usage here. This kernel only
         // accounts waited-child CPU time internally for times(2), so wait4()
@@ -197,12 +197,12 @@ fn current_thread_rusage() -> RUsage {
     usage
 }
 
-pub fn sys_getrusage(who: i32, usage: *mut RUsage) -> SysResult {
+pub fn sys_getrusage(who: i32, usage: *mut RUsage) -> KResult {
     let rusage = match who {
         RUSAGE_SELF => process_self_rusage(),
         RUSAGE_CHILDREN => process_children_rusage(),
         RUSAGE_THREAD => current_thread_rusage(),
-        _ => return Err(SysError::EINVAL),
+        _ => return Err(Errno::EINVAL),
     };
     write_user_value(current_user_token(), usage, &rusage)?;
     Ok(0)
@@ -223,7 +223,7 @@ fn write_waitid_siginfo(
     child_pid: usize,
     si_code: i32,
     si_status: i32,
-) -> SysResult<()> {
+) -> KResult<()> {
     if !infop.is_null() {
         write_user_value_in_memory_set(
             memory_set,
@@ -370,7 +370,7 @@ pub fn sys_wait4_ctx(
     wstatus: *mut i32,
     options: i32,
     rusage: *mut RUsage,
-) -> SysResult {
+) -> KResult {
     sys_wait4_for_process(ctx.process().clone(), pid, wstatus, options, rusage)
 }
 
@@ -380,17 +380,17 @@ fn sys_wait4_for_process(
     wstatus: *mut i32,
     options: i32,
     rusage: *mut RUsage,
-) -> SysResult {
+) -> KResult {
     // CONTEXT: __WALL is accepted for ptrace/LTP compatibility. This process
     // model stores waitable children in one process child list, so there is no
     // separate thread-vs-process wait domain for the flag to widen.
     if options < 0 || options & !(WNOHANG | WUNTRACED | WCONTINUED | WALL) != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if pid == i32::MIN as isize {
         // CONTEXT: Linux rejects INT_MIN before treating negative pid values as
         // process-group selectors because abs(INT_MIN) cannot be represented.
-        return Err(SysError::ESRCH);
+        return Err(Errno::ESRCH);
     }
 
     loop {
@@ -413,7 +413,7 @@ fn sys_wait4_for_process(
                 write_rusage(&mut inner.memory_set, rusage)?;
                 return Ok(tracee_pid as isize);
             }
-            return Err(SysError::ECHILD);
+            return Err(Errno::ECHILD);
         }
 
         // Exit wins over older stop/continue notifications so an unreaped
@@ -481,7 +481,7 @@ fn sys_wait4_for_process(
         }
         schedule(task_cx_ptr);
         if interrupted {
-            return Err(SysError::EINTR);
+            return Err(Errno::EINTR);
         }
     }
 }
@@ -496,21 +496,21 @@ pub fn sys_waitid(
     infop: *mut LinuxSigInfo,
     options: i32,
     rusage: *mut RUsage,
-) -> SysResult {
+) -> KResult {
     if options < 0
         || options & !(WNOHANG | WEXITED | WNOWAIT | WUNTRACED | WCONTINUED) != 0
         || options & (WEXITED | WUNTRACED | WCONTINUED) == 0
     {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if idtype != P_ALL && idtype != P_PID && idtype != P_PGID {
-        return Err(SysError::ECHILD);
+        return Err(Errno::ECHILD);
     }
     if idtype == P_PID && id <= 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if idtype == P_PGID && id < 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     loop {
@@ -519,7 +519,7 @@ pub fn sys_waitid(
         let mut inner = process.inner_exclusive_access();
         let scan = scan_waitid_children(&inner.children, idtype, id, caller_pgid, options);
         if !scan.matched {
-            return Err(SysError::ECHILD);
+            return Err(Errno::ECHILD);
         }
 
         if let Some(zombie) = scan.zombie {
@@ -595,7 +595,7 @@ pub fn sys_waitid(
         drop(process);
         schedule(task_cx_ptr);
         if interrupted {
-            return Err(SysError::EINTR);
+            return Err(Errno::EINTR);
         }
     }
 }

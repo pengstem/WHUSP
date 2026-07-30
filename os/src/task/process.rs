@@ -1224,9 +1224,9 @@ impl ProcessControlBlock {
     pub(crate) fn begin_exec_exclusion<'a>(
         &'a self,
         task: &TaskControlBlock,
-    ) -> crate::syscall::errno::SysResult<TaskGroupSchedulerGuard<'a>> {
+    ) -> crate::uapi::errno::KResult<TaskGroupSchedulerGuard<'a>> {
         self.try_begin_scheduler_exclusion(task)
-            .ok_or(crate::syscall::errno::SysError::EAGAIN)
+            .ok_or(crate::uapi::errno::Errno::EAGAIN)
     }
 
     pub(crate) fn begin_group_exit_exclusion<'a>(

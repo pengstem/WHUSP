@@ -13,11 +13,11 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
-use super::super::errno::{SysError, SysResult};
 use super::super::time::timespec_to_nanos;
 use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{read_user_value, write_user_value};
 use super::fd::{get_fd_entry_by_fd, install_file_fd};
+use crate::uapi::errno::{Errno, KResult};
 
 const EPOLL_CTL_ADD: i32 = 1;
 const EPOLL_CTL_DEL: i32 = 2;
@@ -66,8 +66,8 @@ struct ProcSleepGuard {
 }
 
 impl ProcSleepGuard {
-    fn new() -> SysResult<Self> {
-        let task = current_task().ok_or(SysError::ESRCH)?;
+    fn new() -> KResult<Self> {
+        let task = current_task().ok_or(Errno::ESRCH)?;
         task.inner_exclusive_access().proc_sleeping = true;
         Ok(Self { task })
     }
@@ -85,8 +85,8 @@ struct TemporarySignalMask {
 }
 
 impl TemporarySignalMask {
-    fn install(mask: SignalFlags) -> SysResult<Self> {
-        let task = current_task().ok_or(SysError::ESRCH)?;
+    fn install(mask: SignalFlags) -> KResult<Self> {
+        let task = current_task().ok_or(Errno::ESRCH)?;
         let old_mask = {
             let mut task_inner = task.inner_exclusive_access();
             let old_mask = task_inner.signal_mask;
@@ -286,9 +286,9 @@ fn epoll_readiness_mask(events: u32) -> u32 {
     events & (EPOLLIN | EPOLLPRI | EPOLLOUT | EPOLLRDHUP) | EPOLLERR | EPOLLHUP
 }
 
-fn read_epoll_event(token: usize, event: *const u8) -> SysResult<LinuxEpollEvent> {
+fn read_epoll_event(token: usize, event: *const u8) -> KResult<LinuxEpollEvent> {
     if event.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let bytes = read_user_value(token, event.cast::<[u8; EPOLL_EVENT_SIZE]>())?;
     let mut event_bytes = [0u8; 4];
@@ -306,17 +306,13 @@ fn write_epoll_event(
     events: *mut u8,
     index: usize,
     event: LinuxEpollEvent,
-) -> SysResult<()> {
+) -> KResult<()> {
     if events.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let addr = (events as usize)
-        .checked_add(
-            index
-                .checked_mul(EPOLL_EVENT_SIZE)
-                .ok_or(SysError::EFAULT)?,
-        )
-        .ok_or(SysError::EFAULT)?;
+        .checked_add(index.checked_mul(EPOLL_EVENT_SIZE).ok_or(Errno::EFAULT)?)
+        .ok_or(Errno::EFAULT)?;
     let mut bytes = [0u8; EPOLL_EVENT_SIZE];
     bytes[..4].copy_from_slice(&event.events.to_ne_bytes());
     bytes[EPOLL_EVENT_DATA_OFFSET..EPOLL_EVENT_DATA_OFFSET + 8]
@@ -328,15 +324,15 @@ fn read_epoll_sigmask(
     token: usize,
     sigmask: *const u8,
     sigsetsize: usize,
-) -> SysResult<Option<SignalFlags>> {
+) -> KResult<Option<SignalFlags>> {
     if sigmask.is_null() {
         return Ok(None);
     }
     if sigsetsize != LINUX_RT_SIGSET_SIZE {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if (sigmask as usize) < size_of::<u64>() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let raw = read_user_value(token, sigmask.cast::<u64>())?;
     let mut mask = linux_sigset_to_flags(raw);
@@ -390,57 +386,57 @@ fn epoll_depth(file: &Arc<dyn File + Send + Sync>, depth: usize) -> usize {
 fn validate_epoll_target(
     epoll_file: &Arc<dyn File + Send + Sync>,
     target_file: &Arc<dyn File + Send + Sync>,
-) -> SysResult<()> {
+) -> KResult<()> {
     if let Some(stat) = target_file.stat().ok()
         && stat.mode & S_IFMT == S_IFDIR
     {
-        return Err(SysError::EPERM);
+        return Err(Errno::EPERM);
     }
     if epoll_file_from(target_file).is_some() {
         if epoll_reaches(target_file, epoll_file, 0) {
-            return Err(SysError::ELOOP);
+            return Err(Errno::ELOOP);
         }
         if epoll_depth(target_file, 0) >= EPOLL_MAX_NEST_DEPTH {
-            return Err(SysError::EINVAL);
+            return Err(Errno::EINVAL);
         }
     }
     Ok(())
 }
 
-fn get_epoll_file(fd: usize) -> SysResult<Arc<dyn File + Send + Sync>> {
+fn get_epoll_file(fd: usize) -> KResult<Arc<dyn File + Send + Sync>> {
     let file = get_fd_entry_by_fd(fd)?.file();
     if epoll_file_from(&file).is_none() {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(file)
 }
 
-pub fn sys_epoll_create1(flags: u32) -> SysResult {
+pub fn sys_epoll_create1(flags: u32) -> KResult {
     if flags & !EPOLL_CLOEXEC != 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let open_flags = OpenFlags::from_bits_truncate(flags & EPOLL_CLOEXEC);
     let file = Arc::new(EpollFile::new());
     install_file_fd(file, open_flags, None)
 }
 
-pub fn sys_epoll_ctl(epfd_raw: usize, op: i32, fd_raw: usize, event: *const u8) -> SysResult {
+pub fn sys_epoll_ctl(epfd_raw: usize, op: i32, fd_raw: usize, event: *const u8) -> KResult {
     if is_negative_fd(epfd_raw) {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     let epoll_file = get_epoll_file(epfd_raw)?;
     if !matches!(op, EPOLL_CTL_ADD | EPOLL_CTL_DEL | EPOLL_CTL_MOD) {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if is_negative_fd(fd_raw) {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     if fd_raw == epfd_raw {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let target_file = get_fd_entry_by_fd(fd_raw)?.file();
-    let epoll = epoll_file_from(&epoll_file).ok_or(SysError::EINVAL)?;
+    let epoll = epoll_file_from(&epoll_file).ok_or(Errno::EINVAL)?;
     let token = current_user_token();
 
     match op {
@@ -450,7 +446,7 @@ pub fn sys_epoll_ctl(epfd_raw: usize, op: i32, fd_raw: usize, event: *const u8) 
             {
                 let interests = &mut *epoll.interests.lock();
                 let result = match interests.entry(fd_raw) {
-                    Entry::Occupied(_) => Err(SysError::EEXIST),
+                    Entry::Occupied(_) => Err(Errno::EEXIST),
                     Entry::Vacant(slot) => {
                         slot.insert(EpollInterest {
                             file: target_file,
@@ -467,7 +463,7 @@ pub fn sys_epoll_ctl(epfd_raw: usize, op: i32, fd_raw: usize, event: *const u8) 
         }
         EPOLL_CTL_DEL => {
             let interests = &mut *epoll.interests.lock();
-            let result = interests.remove(&fd_raw).map(|_| 0).ok_or(SysError::ENOENT);
+            let result = interests.remove(&fd_raw).map(|_| 0).ok_or(Errno::ENOENT);
             perf::record_epoll_ctl(0, 1, interests.len());
             result
         }
@@ -482,49 +478,47 @@ pub fn sys_epoll_ctl(epfd_raw: usize, op: i32, fd_raw: usize, event: *const u8) 
                         interest.disabled = false;
                         Ok(0)
                     }
-                    None => Err(SysError::ENOENT),
+                    None => Err(Errno::ENOENT),
                 };
                 perf::record_epoll_ctl(0, 1, interests.len());
                 result
             }
         }
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
-fn nanos_to_us_ceil(nanos: u64) -> SysResult<usize> {
+fn nanos_to_us_ceil(nanos: u64) -> KResult<usize> {
     let us = nanos / 1_000 + if nanos % 1_000 == 0 { 0 } else { 1 };
     if us > usize::MAX as u64 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     Ok(us as usize)
 }
 
-fn deadline_from_timeout_us(timeout_us: usize) -> SysResult<Option<usize>> {
+fn deadline_from_timeout_us(timeout_us: usize) -> KResult<Option<usize>> {
     Ok(Some(
-        get_time_us()
-            .checked_add(timeout_us)
-            .ok_or(SysError::EINVAL)?,
+        get_time_us().checked_add(timeout_us).ok_or(Errno::EINVAL)?,
     ))
 }
 
-fn deadline_from_timeout_ms(timeout_ms: i32) -> SysResult<Option<usize>> {
+fn deadline_from_timeout_ms(timeout_ms: i32) -> KResult<Option<usize>> {
     if timeout_ms == -1 {
         return Ok(None);
     }
     if timeout_ms < -1 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     let timeout_us = (timeout_ms as usize)
         .checked_mul(1_000)
-        .ok_or(SysError::EINVAL)?;
+        .ok_or(Errno::EINVAL)?;
     deadline_from_timeout_us(timeout_us)
 }
 
 fn deadline_from_timeout_timespec(
     token: usize,
     timeout: *const LinuxTimeSpec,
-) -> SysResult<Option<usize>> {
+) -> KResult<Option<usize>> {
     if timeout.is_null() {
         return Ok(None);
     }
@@ -532,29 +526,29 @@ fn deadline_from_timeout_timespec(
     deadline_from_timeout_us(nanos_to_us_ceil(timespec_to_nanos(timeout)?)?)
 }
 
-fn sleep_until_next_epoll_probe(deadline_us: Option<usize>) -> SysResult {
+fn sleep_until_next_epoll_probe(deadline_us: Option<usize>) -> KResult {
     let now_us = get_time_us();
     if deadline_us.is_some_and(|deadline_us| now_us >= deadline_us) {
         return Ok(0);
     }
     if current_has_interrupting_signal() {
-        return Err(SysError::EINTR);
+        return Err(Errno::EINTR);
     }
 
     let target_us = now_us.saturating_add(EPOLL_POLL_BACKOFF_US);
     let target_us = deadline_us.map_or(target_us, |deadline_us| deadline_us.min(target_us));
     let sleep_us = target_us.saturating_sub(now_us);
     let expire_ms = target_us.div_ceil(1_000);
-    current_task().ok_or(SysError::ESRCH)?;
+    current_task().ok_or(Errno::ESRCH)?;
     let (task, task_cx_ptr) =
-        block_current_task_no_schedule_unless_unmasked_signal().ok_or(SysError::EINTR)?;
+        block_current_task_no_schedule_unless_unmasked_signal().ok_or(Errno::EINTR)?;
     add_timer(expire_ms, task);
     perf::record_epoll_backoff_sleep(sleep_us);
     schedule(task_cx_ptr);
     Ok(0)
 }
 
-fn sleep_until_epoll_event(waiter: &Arc<PollWaiter>, deadline_us: Option<usize>) -> SysResult {
+fn sleep_until_epoll_event(waiter: &Arc<PollWaiter>, deadline_us: Option<usize>) -> KResult {
     if waiter.was_triggered() {
         return Ok(0);
     }
@@ -562,11 +556,11 @@ fn sleep_until_epoll_event(waiter: &Arc<PollWaiter>, deadline_us: Option<usize>)
         return Ok(0);
     }
     if current_has_interrupting_signal() {
-        return Err(SysError::EINTR);
+        return Err(Errno::EINTR);
     }
 
     let (task, task_cx_ptr) =
-        block_current_task_no_schedule_unless_unmasked_signal().ok_or(SysError::EINTR)?;
+        block_current_task_no_schedule_unless_unmasked_signal().ok_or(Errno::EINTR)?;
     debug_assert!(waiter.task_matches(&task));
     if let Some(deadline_us) = deadline_us {
         add_timer(deadline_us.div_ceil(1_000), Arc::clone(&task));
@@ -582,18 +576,18 @@ fn sys_epoll_wait_until(
     events: *mut u8,
     maxevents: i32,
     deadline_us: Option<usize>,
-) -> SysResult {
+) -> KResult {
     if is_negative_fd(epfd_raw) {
-        return Err(SysError::EBADF);
+        return Err(Errno::EBADF);
     }
     if maxevents <= 0 {
-        return Err(SysError::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if events.is_null() {
-        return Err(SysError::EFAULT);
+        return Err(Errno::EFAULT);
     }
     let epoll_file = get_epoll_file(epfd_raw)?;
-    let epoll = epoll_file_from(&epoll_file).ok_or(SysError::EINVAL)?;
+    let epoll = epoll_file_from(&epoll_file).ok_or(Errno::EINVAL)?;
     let token = current_user_token();
     let maxevents = maxevents as usize;
     // CONTEXT: This kernel polls readiness cooperatively instead of parking
@@ -614,7 +608,7 @@ fn sys_epoll_wait_until(
             }
         }
 
-        let waiter = PollWaiter::new(current_task().ok_or(SysError::ESRCH)?);
+        let waiter = PollWaiter::new(current_task().ok_or(Errno::ESRCH)?);
         let scan = epoll.scan_ready_with_waiter(maxevents, Some(&waiter));
         if scan.waiter_registrations > 0 {
             perf::record_epoll_waiter_registrations(scan.waiter_registrations);
@@ -629,7 +623,7 @@ fn sys_epoll_wait_until(
             return Ok(0);
         }
         if current_has_interrupting_signal() {
-            return Err(SysError::EINTR);
+            return Err(Errno::EINTR);
         }
         if scan.waiter_registrations > 0 && !scan.fallback_needed {
             sleep_until_epoll_event(&waiter, deadline_us)?;
@@ -650,7 +644,7 @@ pub fn sys_epoll_pwait(
     timeout_ms: i32,
     sigmask: *const u8,
     sigsetsize: usize,
-) -> SysResult {
+) -> KResult {
     // UNFINISHED: Linux installs the supplied signal mask atomically with
     // entering the wait. This kernel applies it around the cooperative polling
     // loop, which is sufficient for the current single-hart LTP cases.
@@ -675,7 +669,7 @@ pub fn sys_epoll_pwait2(
     timeout: *const LinuxTimeSpec,
     sigmask: *const u8,
     sigsetsize: usize,
-) -> SysResult {
+) -> KResult {
     // UNFINISHED: See sys_epoll_pwait(); the mask is applied around the
     // cooperative wait rather than as a fully atomic sleep transition.
     let token = current_user_token();

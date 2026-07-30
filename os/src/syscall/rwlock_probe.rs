@@ -1,5 +1,5 @@
-use super::errno::{SysError, SysResult};
 use crate::sync::SleepRwLock;
+use crate::uapi::errno::{Errno, KResult};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 
@@ -88,7 +88,7 @@ fn record_writer_entry(tag: usize) {
     }
 }
 
-fn run_reader(duration_us: usize, tag: usize) -> SysResult {
+fn run_reader(duration_us: usize, tag: usize) -> KResult {
     let _guard = PROBE_LOCK.read();
     record_reader_entry(tag);
     hold_for(duration_us);
@@ -97,11 +97,9 @@ fn run_reader(duration_us: usize, tag: usize) -> SysResult {
     Ok(0)
 }
 
-fn run_writer(duration_us: usize, tag: usize, interruptible: bool) -> SysResult {
+fn run_writer(duration_us: usize, tag: usize, interruptible: bool) -> KResult {
     if interruptible {
-        let mut guard = PROBE_LOCK
-            .write_interruptible()
-            .map_err(|_| SysError::EINTR)?;
+        let mut guard = PROBE_LOCK.write_interruptible().map_err(|_| Errno::EINTR)?;
         record_writer_entry(tag);
         *guard = guard.wrapping_add(1);
         hold_for(duration_us);
@@ -117,9 +115,9 @@ fn run_writer(duration_us: usize, tag: usize, interruptible: bool) -> SysResult 
     Ok(0)
 }
 
-fn reset() -> SysResult {
+fn reset() -> KResult {
     let Some(mut guard) = PROBE_LOCK.try_write() else {
-        return Err(SysError::EBUSY);
+        return Err(Errno::EBUSY);
     };
     *guard = 0;
     ACTIVE_READERS.store(0, Ordering::Relaxed);
@@ -134,7 +132,7 @@ fn reset() -> SysResult {
     Ok(0)
 }
 
-fn stat(metric: usize) -> SysResult {
+fn stat(metric: usize) -> KResult {
     let lock = PROBE_LOCK.stats();
     let value = match metric {
         STAT_ACTIVE_READERS => ACTIVE_READERS.load(Ordering::Acquire),
@@ -147,12 +145,12 @@ fn stat(metric: usize) -> SysResult {
         STAT_WAITING_READERS => lock.waiting_readers,
         STAT_WAITING_WRITERS => lock.waiting_writers,
         STAT_MAX_WAITERS => lock.max_waiters,
-        _ => return Err(SysError::EINVAL),
+        _ => return Err(Errno::EINVAL),
     };
-    isize::try_from(value).map_err(|_| SysError::EOVERFLOW)
+    isize::try_from(value).map_err(|_| Errno::EOVERFLOW)
 }
 
-pub(super) fn sys_fs4_sleep_rwlock_probe(command: usize, arg: usize, tag: usize) -> SysResult {
+pub(super) fn sys_fs4_sleep_rwlock_probe(command: usize, arg: usize, tag: usize) -> KResult {
     match command {
         CMD_RESET => reset(),
         CMD_READ => run_reader(arg, tag),
@@ -161,6 +159,6 @@ pub(super) fn sys_fs4_sleep_rwlock_probe(command: usize, arg: usize, tag: usize)
         CMD_STAT => stat(arg),
         CMD_TRY_READ => Ok(PROBE_LOCK.try_read().is_some() as isize),
         CMD_TRY_WRITE => Ok(PROBE_LOCK.try_write().is_some() as isize),
-        _ => Err(SysError::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
