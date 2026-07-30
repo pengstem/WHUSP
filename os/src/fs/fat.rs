@@ -1,6 +1,9 @@
 use super::dirent::{DT_DIR, DT_REG, RawDirEntry, write_dir_entries};
 use super::mount::BlockPartition;
-use super::vfs::{FileSystemStat, FsError, FsNodeKind, FsResult, LegacyFileSystemBackend};
+use super::vfs::{
+    FileSystemStat, FsError, FsNodeKind, FsResult, LegacyDataOps, LegacyInodeLifecycleOps,
+    LegacyLookupOps, LegacyMetadataOps, LegacyNamespaceOps, LegacySyncOps,
+};
 use super::{FileStat, FileTimestamp, S_IFDIR, S_IFREG};
 use crate::drivers::block::VirtIOBlock;
 use alloc::collections::BTreeMap;
@@ -337,11 +340,56 @@ impl FatMount {
     }
 }
 
-impl LegacyFileSystemBackend for FatMount {
+impl LegacyLookupOps for FatMount {
     fn root_ino(&self) -> u32 {
         ROOT_INO
     }
 
+    fn lookup_component_from(
+        &mut self,
+        parent_ino: u32,
+        component: &str,
+    ) -> FsResult<(u32, FsNodeKind)> {
+        let parent = self.path_for_ino(parent_ino)?;
+        match component {
+            "." => Ok((parent_ino, FsNodeKind::Directory)),
+            ".." => {
+                let parent_ino = self.parent_ino_for(&parent);
+                Ok((parent_ino, FsNodeKind::Directory))
+            }
+            _ => self.lookup_child(&parent, component),
+        }
+    }
+
+    fn readlink(&mut self, _ino: u32, _buf: &mut [u8]) -> FsResult<usize> {
+        // UNFINISHED: FAT symlink-like Windows reparse points are not exposed
+        // as Linux symlinks by this adapter.
+        Err(FsError::InvalidInput)
+    }
+
+    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
+        write_dir_entries(&self.dir_entries(ino)?, offset, buf)
+    }
+
+    fn list_root_names(&mut self) -> Vec<String> {
+        let mut names = Vec::new();
+        let Ok(root) = self.dir_for_path("/") else {
+            return names;
+        };
+        for entry in root.iter() {
+            let Ok(entry) = entry else {
+                break;
+            };
+            let name = entry.file_name();
+            if name != "." && name != ".." {
+                names.push(name);
+            }
+        }
+        names
+    }
+}
+
+impl LegacyMetadataOps for FatMount {
     fn statfs(&mut self) -> FileSystemStat {
         match self.fs.stats() {
             Ok(stats) => FileSystemStat {
@@ -366,96 +414,6 @@ impl LegacyFileSystemBackend for FatMount {
                 max_name_len: 255,
                 flags: 0,
             },
-        }
-    }
-
-    fn lookup_component_from(
-        &mut self,
-        parent_ino: u32,
-        component: &str,
-    ) -> FsResult<(u32, FsNodeKind)> {
-        let parent = self.path_for_ino(parent_ino)?;
-        match component {
-            "." => Ok((parent_ino, FsNodeKind::Directory)),
-            ".." => {
-                let parent_ino = self.parent_ino_for(&parent);
-                Ok((parent_ino, FsNodeKind::Directory))
-            }
-            _ => self.lookup_child(&parent, component),
-        }
-    }
-
-    fn create_file(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult<u32> {
-        let parent = self.path_for_ino(parent_ino)?;
-        self.dir_for_path(&parent)
-            .map_err(map_fat_error)?
-            .create_file(leaf_name)
-            .map_err(map_fat_error)?;
-        Ok(self.intern_path(child_path(&parent, leaf_name), FsNodeKind::RegularFile))
-    }
-
-    fn create_dir(&mut self, parent_ino: u32, leaf_name: &str, _mode: u32) -> FsResult<u32> {
-        let parent = self.path_for_ino(parent_ino)?;
-        self.dir_for_path(&parent)
-            .map_err(map_fat_error)?
-            .create_dir(leaf_name)
-            .map_err(map_fat_error)?;
-        Ok(self.intern_path(child_path(&parent, leaf_name), FsNodeKind::Directory))
-    }
-
-    fn link(&mut self, _parent_ino: u32, _leaf_name: &str, _child_ino: u32) -> FsResult {
-        // UNFINISHED: FAT has no Unix hard-link model, and this adapter does
-        // not emulate hard links above the FAT directory-entry layer.
-        Err(FsError::PermissionDenied)
-    }
-
-    fn symlink(&mut self, _parent_ino: u32, _leaf_name: &str, _target: &[u8]) -> FsResult {
-        // UNFINISHED: FAT/VFAT does not provide POSIX symlinks in the format
-        // expected by Linux filesystems, so symlink creation is unsupported.
-        Err(FsError::Unsupported)
-    }
-
-    fn unlink(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult {
-        let parent = self.path_for_ino(parent_ino)?;
-        self.dir_for_path(&parent)
-            .map_err(map_fat_error)?
-            .remove(leaf_name)
-            .map_err(map_fat_error)?;
-        self.forget_path(&child_path(&parent, leaf_name));
-        Ok(())
-    }
-
-    fn rename(&mut self, src_dir: u32, src_name: &str, dst_dir: u32, dst_name: &str) -> FsResult {
-        let src_parent = self.path_for_ino(src_dir)?;
-        let dst_parent = self.path_for_ino(dst_dir)?;
-        let src_path = child_path(&src_parent, src_name);
-        let dst_path = child_path(&dst_parent, dst_name);
-        self.dir_for_path(&src_parent)
-            .map_err(map_fat_error)?
-            .rename(
-                src_name,
-                &self.dir_for_path(&dst_parent).map_err(map_fat_error)?,
-                dst_name,
-            )
-            .map_err(map_fat_error)?;
-        if let Some(ino) = self.path_to_ino.remove(&src_path) {
-            self.path_to_ino.insert(dst_path.clone(), ino);
-            self.ino_to_path.insert(ino, dst_path);
-        }
-        // UNFINISHED: Renaming a populated directory does not remap cached
-        // descendant pseudo-inodes yet; later lookups rebuild entries by path.
-        Ok(())
-    }
-
-    fn set_len(&mut self, ino: u32, len: u64) -> FsResult {
-        let path = self.path_for_ino(ino)?;
-        let mut file = self.file_for_path(&path).map_err(map_fat_error)?;
-        let size = file.size().unwrap_or(0) as u64;
-        if len <= size {
-            file.seek(SeekFrom::Start(len)).map_err(map_fat_error)?;
-            file.truncate().map_err(map_fat_error)
-        } else {
-            Self::grow_file(&mut file, len)
         }
     }
 
@@ -523,11 +481,19 @@ impl LegacyFileSystemBackend for FatMount {
             ..FileStat::default()
         })
     }
+}
 
-    fn readlink(&mut self, _ino: u32, _buf: &mut [u8]) -> FsResult<usize> {
-        // UNFINISHED: FAT symlink-like Windows reparse points are not exposed
-        // as Linux symlinks by this adapter.
-        Err(FsError::InvalidInput)
+impl LegacyDataOps for FatMount {
+    fn set_len(&mut self, ino: u32, len: u64) -> FsResult {
+        let path = self.path_for_ino(ino)?;
+        let mut file = self.file_for_path(&path).map_err(map_fat_error)?;
+        let size = file.size().unwrap_or(0) as u64;
+        if len <= size {
+            file.seek(SeekFrom::Start(len)).map_err(map_fat_error)?;
+            file.truncate().map_err(map_fat_error)
+        } else {
+            Self::grow_file(&mut file, len)
+        }
     }
 
     fn read_at(&mut self, ino: u32, mut buf: &mut [u8], offset: u64) -> usize {
@@ -581,25 +547,72 @@ impl LegacyFileSystemBackend for FatMount {
         }
         written
     }
+}
 
-    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
-        write_dir_entries(&self.dir_entries(ino)?, offset, buf)
+impl LegacyNamespaceOps for FatMount {
+    fn create_file(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult<u32> {
+        let parent = self.path_for_ino(parent_ino)?;
+        self.dir_for_path(&parent)
+            .map_err(map_fat_error)?
+            .create_file(leaf_name)
+            .map_err(map_fat_error)?;
+        Ok(self.intern_path(child_path(&parent, leaf_name), FsNodeKind::RegularFile))
     }
 
-    fn list_root_names(&mut self) -> Vec<String> {
-        let mut names = Vec::new();
-        let Ok(root) = self.dir_for_path("/") else {
-            return names;
-        };
-        for entry in root.iter() {
-            let Ok(entry) = entry else {
-                break;
-            };
-            let name = entry.file_name();
-            if name != "." && name != ".." {
-                names.push(name);
-            }
+    fn create_dir(&mut self, parent_ino: u32, leaf_name: &str, _mode: u32) -> FsResult<u32> {
+        let parent = self.path_for_ino(parent_ino)?;
+        self.dir_for_path(&parent)
+            .map_err(map_fat_error)?
+            .create_dir(leaf_name)
+            .map_err(map_fat_error)?;
+        Ok(self.intern_path(child_path(&parent, leaf_name), FsNodeKind::Directory))
+    }
+
+    fn link(&mut self, _parent_ino: u32, _leaf_name: &str, _child_ino: u32) -> FsResult {
+        // UNFINISHED: FAT has no Unix hard-link model, and this adapter does
+        // not emulate hard links above the FAT directory-entry layer.
+        Err(FsError::PermissionDenied)
+    }
+
+    fn symlink(&mut self, _parent_ino: u32, _leaf_name: &str, _target: &[u8]) -> FsResult {
+        // UNFINISHED: FAT/VFAT does not provide POSIX symlinks in the format
+        // expected by Linux filesystems, so symlink creation is unsupported.
+        Err(FsError::Unsupported)
+    }
+
+    fn unlink(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult {
+        let parent = self.path_for_ino(parent_ino)?;
+        self.dir_for_path(&parent)
+            .map_err(map_fat_error)?
+            .remove(leaf_name)
+            .map_err(map_fat_error)?;
+        self.forget_path(&child_path(&parent, leaf_name));
+        Ok(())
+    }
+
+    fn rename(&mut self, src_dir: u32, src_name: &str, dst_dir: u32, dst_name: &str) -> FsResult {
+        let src_parent = self.path_for_ino(src_dir)?;
+        let dst_parent = self.path_for_ino(dst_dir)?;
+        let src_path = child_path(&src_parent, src_name);
+        let dst_path = child_path(&dst_parent, dst_name);
+        self.dir_for_path(&src_parent)
+            .map_err(map_fat_error)?
+            .rename(
+                src_name,
+                &self.dir_for_path(&dst_parent).map_err(map_fat_error)?,
+                dst_name,
+            )
+            .map_err(map_fat_error)?;
+        if let Some(ino) = self.path_to_ino.remove(&src_path) {
+            self.path_to_ino.insert(dst_path.clone(), ino);
+            self.ino_to_path.insert(ino, dst_path);
         }
-        names
+        // UNFINISHED: Renaming a populated directory does not remap cached
+        // descendant pseudo-inodes yet; later lookups rebuild entries by path.
+        Ok(())
     }
 }
+
+impl LegacySyncOps for FatMount {}
+
+impl LegacyInodeLifecycleOps for FatMount {}

@@ -1,5 +1,8 @@
 use super::dirent::{DT_DIR, DT_REG, RawDirEntry, write_dir_entries};
-use super::vfs::{FileSystemStat, FsError, FsNodeKind, FsResult, LegacyFileSystemBackend};
+use super::vfs::{
+    FileSystemStat, FsError, FsNodeKind, FsResult, LegacyDataOps, LegacyInodeLifecycleOps,
+    LegacyLookupOps, LegacyMetadataOps, LegacyNamespaceOps, LegacySyncOps,
+};
 use super::{FileStat, FileTimestamp, S_IFDIR, S_IFREG};
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -455,23 +458,9 @@ fn discard_madv_free_pages() {
     }
 }
 
-impl LegacyFileSystemBackend for CgroupFs {
+impl LegacyLookupOps for CgroupFs {
     fn root_ino(&self) -> u32 {
         ROOT_INO
-    }
-
-    fn statfs(&mut self) -> FileSystemStat {
-        FileSystemStat {
-            magic: 0x6367_7270,
-            block_size: 4096,
-            blocks: 0,
-            free_blocks: 0,
-            available_blocks: 0,
-            files: 1024,
-            free_files: 1024,
-            max_name_len: 255,
-            flags: 0,
-        }
     }
 
     fn lookup_component_from(
@@ -497,60 +486,33 @@ impl LegacyFileSystemBackend for CgroupFs {
         }
     }
 
-    fn create_file(&mut self, _parent_ino: u32, _leaf_name: &str) -> FsResult<u32> {
-        Err(FsError::PermissionDenied)
+    fn readlink(&mut self, _ino: u32, _buf: &mut [u8]) -> FsResult<usize> {
+        Err(FsError::InvalidInput)
     }
 
-    fn create_dir(&mut self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32> {
-        self.create_dir_node(parent_ino, leaf_name, mode)
+    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
+        write_dir_entries(&self.dir_entries(ino)?, offset, buf)
     }
 
-    fn link(&mut self, _parent_ino: u32, _leaf_name: &str, _child_ino: u32) -> FsResult {
-        Err(FsError::PermissionDenied)
+    fn list_root_names(&mut self) -> Vec<String> {
+        self.dir_children(ROOT_INO)
+            .map(|children| children.keys().cloned().collect())
+            .unwrap_or_default()
     }
+}
 
-    fn symlink(&mut self, _parent_ino: u32, _leaf_name: &str, _target: &[u8]) -> FsResult {
-        Err(FsError::PermissionDenied)
-    }
-
-    fn unlink(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult {
-        if leaf_name.is_empty() || leaf_name == "." || leaf_name == ".." {
-            return Err(FsError::InvalidInput);
-        }
-        let child_ino = *self
-            .dir_children(parent_ino)?
-            .get(leaf_name)
-            .ok_or(FsError::NotFound)?;
-        if child_ino == ROOT_INO {
-            return Err(FsError::Busy);
-        }
-        match self.inode(child_ino)?.kind {
-            CgroupNodeKind::File { .. } => return Err(FsError::PermissionDenied),
-            CgroupNodeKind::Directory { .. } => {
-                if !self.removable_cgroup_dir(child_ino)? {
-                    return Err(FsError::NotEmpty);
-                }
-            }
-        }
-        self.dir_children_mut(parent_ino)?.remove(leaf_name);
-        self.remove_dir_tree(child_ino);
-        Ok(())
-    }
-
-    fn rename(
-        &mut self,
-        _src_dir: u32,
-        _src_name: &str,
-        _dst_dir: u32,
-        _dst_name: &str,
-    ) -> FsResult {
-        Err(FsError::PermissionDenied)
-    }
-
-    fn set_len(&mut self, ino: u32, _len: u64) -> FsResult {
-        match self.inode(ino)?.kind {
-            CgroupNodeKind::File { .. } => Ok(()),
-            CgroupNodeKind::Directory { .. } => Err(FsError::IsDir),
+impl LegacyMetadataOps for CgroupFs {
+    fn statfs(&mut self) -> FileSystemStat {
+        FileSystemStat {
+            magic: 0x6367_7270,
+            block_size: 4096,
+            blocks: 0,
+            free_blocks: 0,
+            available_blocks: 0,
+            files: 1024,
+            free_files: 1024,
+            max_name_len: 255,
+            flags: 0,
         }
     }
 
@@ -600,8 +562,17 @@ impl LegacyFileSystemBackend for CgroupFs {
         })
     }
 
-    fn readlink(&mut self, _ino: u32, _buf: &mut [u8]) -> FsResult<usize> {
-        Err(FsError::InvalidInput)
+    fn assign_cgroup_pid(&mut self, dir_ino: u32, pid: usize) -> FsResult {
+        self.move_pid_to_dir(dir_ino, pid)
+    }
+}
+
+impl LegacyDataOps for CgroupFs {
+    fn set_len(&mut self, ino: u32, _len: u64) -> FsResult {
+        match self.inode(ino)?.kind {
+            CgroupNodeKind::File { .. } => Ok(()),
+            CgroupNodeKind::Directory { .. } => Err(FsError::IsDir),
+        }
     }
 
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
@@ -650,18 +621,60 @@ impl LegacyFileSystemBackend for CgroupFs {
             | CgroupFileKind::MemoryUseHierarchy => buf.len(),
         }
     }
+}
 
-    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
-        write_dir_entries(&self.dir_entries(ino)?, offset, buf)
+impl LegacyNamespaceOps for CgroupFs {
+    fn create_file(&mut self, _parent_ino: u32, _leaf_name: &str) -> FsResult<u32> {
+        Err(FsError::PermissionDenied)
     }
 
-    fn list_root_names(&mut self) -> Vec<String> {
-        self.dir_children(ROOT_INO)
-            .map(|children| children.keys().cloned().collect())
-            .unwrap_or_default()
+    fn create_dir(&mut self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32> {
+        self.create_dir_node(parent_ino, leaf_name, mode)
     }
 
-    fn assign_cgroup_pid(&mut self, dir_ino: u32, pid: usize) -> FsResult {
-        self.move_pid_to_dir(dir_ino, pid)
+    fn link(&mut self, _parent_ino: u32, _leaf_name: &str, _child_ino: u32) -> FsResult {
+        Err(FsError::PermissionDenied)
+    }
+
+    fn symlink(&mut self, _parent_ino: u32, _leaf_name: &str, _target: &[u8]) -> FsResult {
+        Err(FsError::PermissionDenied)
+    }
+
+    fn unlink(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult {
+        if leaf_name.is_empty() || leaf_name == "." || leaf_name == ".." {
+            return Err(FsError::InvalidInput);
+        }
+        let child_ino = *self
+            .dir_children(parent_ino)?
+            .get(leaf_name)
+            .ok_or(FsError::NotFound)?;
+        if child_ino == ROOT_INO {
+            return Err(FsError::Busy);
+        }
+        match self.inode(child_ino)?.kind {
+            CgroupNodeKind::File { .. } => return Err(FsError::PermissionDenied),
+            CgroupNodeKind::Directory { .. } => {
+                if !self.removable_cgroup_dir(child_ino)? {
+                    return Err(FsError::NotEmpty);
+                }
+            }
+        }
+        self.dir_children_mut(parent_ino)?.remove(leaf_name);
+        self.remove_dir_tree(child_ino);
+        Ok(())
+    }
+
+    fn rename(
+        &mut self,
+        _src_dir: u32,
+        _src_name: &str,
+        _dst_dir: u32,
+        _dst_name: &str,
+    ) -> FsResult {
+        Err(FsError::PermissionDenied)
     }
 }
+
+impl LegacySyncOps for CgroupFs {}
+
+impl LegacyInodeLifecycleOps for CgroupFs {}

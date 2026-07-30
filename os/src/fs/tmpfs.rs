@@ -1,7 +1,10 @@
 use super::dirent::{
     DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, RawDirEntry, write_dir_entries,
 };
-use super::vfs::{FsError, FsNodeKind, FsResult, InodeRelease, LegacyFileSystemBackend};
+use super::vfs::{
+    FsError, FsNodeKind, FsResult, InodeRelease, LegacyDataOps, LegacyInodeLifecycleOps,
+    LegacyLookupOps, LegacyMetadataOps, LegacyNamespaceOps, LegacySyncOps,
+};
 use super::{
     FS_ENCRYPT_FL, FS_STATX_ATTR_FLAGS, FS_STATX_COMMON_ATTR_FLAGS, FileStat, FileTimestamp,
     S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK,
@@ -883,11 +886,50 @@ impl TmpFs {
     }
 }
 
-impl LegacyFileSystemBackend for TmpFs {
+impl LegacyLookupOps for TmpFs {
     fn root_ino(&self) -> u32 {
         ROOT_INO
     }
 
+    fn lookup_component_from(
+        &mut self,
+        parent_ino: u32,
+        component: &str,
+    ) -> FsResult<(u32, FsNodeKind)> {
+        let parent = self.ensure_dir(parent_ino)?;
+        match component {
+            "." => Ok((parent_ino, FsNodeKind::Directory)),
+            ".." => Ok((parent.parent_ino, FsNodeKind::Directory)),
+            _ => {
+                let ino = *parent.children.get(component).ok_or(FsError::NotFound)?;
+                Ok((ino, self.inode(ino)?.kind))
+            }
+        }
+    }
+
+    fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
+        let inode = self.inode(ino)?;
+        if inode.kind != FsNodeKind::Symlink {
+            return Err(FsError::InvalidInput);
+        }
+        let len = buf.len().min(inode.size as usize).min(inode.data.len());
+        buf[..len].copy_from_slice(&inode.data[..len]);
+        Ok(len)
+    }
+
+    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
+        write_dir_entries(&self.dir_entries(ino)?, offset, buf)
+    }
+
+    fn list_root_names(&mut self) -> Vec<String> {
+        self.inodes
+            .get(&ROOT_INO)
+            .map(|root| root.children.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+impl LegacyMetadataOps for TmpFs {
     fn statfs(&mut self) -> super::vfs::FileSystemStat {
         let block_size = 4096;
         let (blocks, free_blocks) = if let Some(quota) = self.logical_quota_bytes {
@@ -910,22 +952,304 @@ impl LegacyFileSystemBackend for TmpFs {
         }
     }
 
-    fn lookup_component_from(
-        &mut self,
-        parent_ino: u32,
-        component: &str,
-    ) -> FsResult<(u32, FsNodeKind)> {
-        let parent = self.ensure_dir(parent_ino)?;
-        match component {
-            "." => Ok((parent_ino, FsNodeKind::Directory)),
-            ".." => Ok((parent.parent_ino, FsNodeKind::Directory)),
-            _ => {
-                let ino = *parent.children.get(component).ok_or(FsError::NotFound)?;
-                Ok((ino, self.inode(ino)?.kind))
-            }
-        }
+    fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
+        let inode = self.inode(ino)?;
+        let size = match inode.kind {
+            FsNodeKind::Directory => inode.children.len() as u64,
+            _ => inode.size,
+        };
+        let blocks = match inode.kind {
+            FsNodeKind::Directory => size.div_ceil(512),
+            FsNodeKind::Symlink => 0,
+            _ => inode.allocated_logical_len().div_ceil(512),
+        };
+        Ok(FileStat {
+            ino: ino as u64,
+            mode: inode.mode,
+            nlink: inode.nlink,
+            uid: inode.uid,
+            gid: inode.gid,
+            rdev: inode.rdev,
+            inode_flags: inode.flags,
+            inode_flags_supported: self.statx_supported_inode_flags(),
+            size,
+            blocks,
+            blksize: super::DEFAULT_BLOCK_SIZE,
+            atime_sec: inode.atime.sec,
+            atime_nsec: inode.atime.nsec,
+            btime_sec: inode.btime.sec,
+            btime_nsec: inode.btime.nsec,
+            mtime_sec: inode.mtime.sec,
+            mtime_nsec: inode.mtime.nsec,
+            ctime_sec: inode.ctime.sec,
+            ctime_nsec: inode.ctime.nsec,
+            ..FileStat::default()
+        })
     }
 
+    fn set_times(
+        &mut self,
+        ino: u32,
+        atime: Option<FileTimestamp>,
+        mtime: Option<FileTimestamp>,
+        ctime: FileTimestamp,
+    ) -> FsResult {
+        let inode = self.inode_mut(ino)?;
+        if let Some(atime) = atime {
+            inode.atime = atime;
+        }
+        if let Some(mtime) = mtime {
+            inode.mtime = mtime;
+        }
+        inode.ctime = ctime;
+        Ok(())
+    }
+
+    fn set_mode(&mut self, ino: u32, mode: u32) -> FsResult {
+        let inode = self.inode_mut(ino)?;
+        inode.mode = (inode.mode & !0o7777) | (mode & 0o7777);
+        inode.ctime = FileTimestamp::now();
+        Ok(())
+    }
+
+    fn set_owner(&mut self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
+        let inode = self.inode_mut(ino)?;
+        if let Some(uid) = uid {
+            inode.uid = uid;
+        }
+        if let Some(gid) = gid {
+            inode.gid = gid;
+        }
+        inode.ctime = FileTimestamp::now();
+        Ok(())
+    }
+
+    fn inode_flags(&mut self, ino: u32) -> FsResult<u32> {
+        Ok(self.inode(ino)?.flags)
+    }
+
+    fn set_inode_flags(&mut self, ino: u32, flags: u32) -> FsResult {
+        let inode = self.inode_mut(ino)?;
+        inode.flags = flags;
+        inode.ctime = FileTimestamp::now();
+        Ok(())
+    }
+}
+
+impl LegacyDataOps for TmpFs {
+    fn check_write_at(&mut self, ino: u32, offset: u64, len: usize) -> FsResult {
+        self.write_fits_quota(ino, offset, len)
+    }
+
+    fn check_set_len(&mut self, ino: u32, _len: u64) -> FsResult {
+        self.inode(ino).map(|_| ())
+    }
+
+    fn set_len(&mut self, ino: u32, len: u64) -> FsResult {
+        let inline_file_limit = self.inline_file_limit;
+        let inode = self.inode_mut(ino)?;
+        if inode.kind == FsNodeKind::Directory {
+            return Err(FsError::IsDir);
+        }
+        if len == 0 {
+            inode.clear_payload();
+        } else if len < inode.size {
+            inode.truncate_sparse_to(len);
+            if len as usize <= inline_file_limit {
+                let old_len = inode.data.len();
+                inode.data.resize(len as usize, 0);
+                inode.account_inline_len_change(old_len);
+            } else if inode.data.len() as u64 > len {
+                let old_len = inode.data.len();
+                inode.data.truncate(len as usize);
+                inode.account_inline_len_change(old_len);
+            }
+        } else if inode.data.len() as u64 > len {
+            let old_len = inode.data.len();
+            inode.data.truncate(len as usize);
+            inode.account_inline_len_change(old_len);
+        }
+        if inode.allocated_payload_len() > TMPFS_ALLOCATED_PAYLOAD_LIMIT {
+            return Err(FsError::NoSpace);
+        }
+        inode.size = len;
+        inode.touch();
+        Ok(())
+    }
+
+    fn allocate_range(&mut self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
+        let end = offset.checked_add(len).ok_or(FsError::InvalidInput)?;
+        let len = usize::try_from(len).map_err(|_| FsError::InvalidInput)?;
+        self.write_fits_quota(ino, offset, len)?;
+        let inline_file_limit = self.inline_file_limit;
+        let inode = self.inode_mut(ino)?;
+        if inode.kind != FsNodeKind::RegularFile {
+            return Err(FsError::InvalidInput);
+        }
+        if !inode.reserve_zero_range(offset, end, inline_file_limit) {
+            return Err(FsError::NoSpace);
+        }
+        if !keep_size && end > inode.size {
+            inode.size = end;
+        }
+        inode.touch();
+        Ok(())
+    }
+
+    fn zero_range(&mut self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
+        let end = offset.checked_add(len).ok_or(FsError::InvalidInput)?;
+        let len = usize::try_from(len).map_err(|_| FsError::InvalidInput)?;
+        self.write_fits_quota(ino, offset, len)?;
+        let inline_file_limit = self.inline_file_limit;
+        let inode = self.inode_mut(ino)?;
+        if inode.kind != FsNodeKind::RegularFile {
+            return Err(FsError::InvalidInput);
+        }
+        if !inode.write_zero_range(offset, end, inline_file_limit) {
+            return Err(FsError::NoSpace);
+        }
+        if !keep_size && end > inode.size {
+            inode.size = end;
+        }
+        inode.touch();
+        Ok(())
+    }
+
+    fn punch_hole(&mut self, ino: u32, offset: u64, len: u64) -> FsResult {
+        let end = offset.checked_add(len).ok_or(FsError::InvalidInput)?;
+        let inline_file_limit = self.inline_file_limit;
+        let inode = self.inode_mut(ino)?;
+        if inode.kind != FsNodeKind::RegularFile {
+            return Err(FsError::InvalidInput);
+        }
+        inode.punch_hole_range(offset, end, inline_file_limit);
+        inode.touch();
+        Ok(())
+    }
+
+    fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
+        let Ok(inode) = self.inode_mut(ino) else {
+            return 0;
+        };
+        if inode.kind == FsNodeKind::Directory {
+            return 0;
+        }
+        if !buf.is_empty() {
+            inode.atime = FileTimestamp::now();
+        }
+        if offset >= inode.size {
+            return 0;
+        }
+        let len = buf.len().min((inode.size - offset) as usize);
+        let out = &mut buf[..len];
+        out.fill(0);
+        if offset < inode.data.len() as u64 {
+            let start = offset as usize;
+            let inline_len = out.len().min(inode.data.len() - start);
+            out[..inline_len].copy_from_slice(&inode.data[start..start + inline_len]);
+        }
+        inode.copy_sparse_to(offset, out);
+        len
+    }
+
+    fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize {
+        let write_len = self.quota_limited_write_len(ino, offset, buf.len());
+        if write_len == 0 && !buf.is_empty() {
+            return 0;
+        }
+        let buf = &buf[..write_len];
+        let Some(end) = offset.checked_add(buf.len() as u64) else {
+            return 0;
+        };
+        let inline_file_limit = self.inline_file_limit;
+        let Ok(inode) = self.inode_mut(ino) else {
+            return 0;
+        };
+        if inode.kind != FsNodeKind::RegularFile {
+            return 0;
+        }
+        if buf.iter().all(|byte| *byte == 0) {
+            if offset >= inline_file_limit as u64 {
+                // CONTEXT: user writes can be split at page boundaries. Keeping a
+                // zero tail contiguous lets repeated-page payloads compress.
+                if let Some(appended) = inode.append_sparse_tail(offset, buf) {
+                    if appended == 0 {
+                        return 0;
+                    }
+                    if appended < buf.len() {
+                        let zero_start = offset + appended as u64;
+                        if !inode.write_zero_range(zero_start, end, inline_file_limit) {
+                            return 0;
+                        }
+                    }
+                    if end > inode.size {
+                        inode.size = end;
+                    }
+                    inode.touch();
+                    return buf.len();
+                }
+            }
+            if !inode.write_zero_range(offset, end, inline_file_limit) {
+                return 0;
+            }
+            if end > inode.size {
+                inode.size = end;
+            }
+            inode.touch();
+            return buf.len();
+        }
+
+        let mut sparse_offset = offset;
+        let mut sparse_buf = buf;
+        if offset < inline_file_limit as u64 {
+            let start = offset as usize;
+            let inline_end = end.min(inline_file_limit as u64) as usize;
+            if inline_end > inode.data.len() {
+                let extra = inline_end - inode.data.len();
+                if inode.allocated_payload_len().saturating_add(extra)
+                    > TMPFS_ALLOCATED_PAYLOAD_LIMIT
+                    || inode.data.try_reserve(extra).is_err()
+                {
+                    return 0;
+                }
+                let old_len = inode.data.len();
+                inode.data.resize(inline_end, 0);
+                inode.account_inline_len_change(old_len);
+            }
+            let inline_len = inline_end - start;
+            inode.data[start..inline_end].copy_from_slice(&buf[..inline_len]);
+            inode.remove_sparse_range(offset, inline_end as u64);
+            if inline_end as u64 == end {
+                if end > inode.size {
+                    inode.size = end;
+                }
+                inode.touch();
+                return buf.len();
+            }
+            sparse_offset = inline_end as u64;
+            sparse_buf = &buf[inline_len..];
+        }
+
+        inode.remove_sparse_range(sparse_offset, end);
+        if inode
+            .allocated_payload_len()
+            .saturating_add(sparse_buf.len())
+            > TMPFS_ALLOCATED_PAYLOAD_LIMIT
+        {
+            return 0;
+        }
+        if !inode.write_sparse_data(sparse_offset, sparse_buf) {
+            return 0;
+        }
+        if end > inode.size {
+            inode.size = end;
+        }
+        inode.touch();
+        buf.len()
+    }
+}
+
+impl LegacyNamespaceOps for TmpFs {
     fn create_file(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult<u32> {
         self.create_node(
             parent_ino,
@@ -1119,104 +1443,18 @@ impl LegacyFileSystemBackend for TmpFs {
         }
         Ok(())
     }
+}
 
-    fn check_write_at(&mut self, ino: u32, offset: u64, len: usize) -> FsResult {
-        self.write_fits_quota(ino, offset, len)
-    }
-
-    fn check_set_len(&mut self, ino: u32, _len: u64) -> FsResult {
-        self.inode(ino).map(|_| ())
-    }
-
-    fn set_len(&mut self, ino: u32, len: u64) -> FsResult {
-        let inline_file_limit = self.inline_file_limit;
-        let inode = self.inode_mut(ino)?;
-        if inode.kind == FsNodeKind::Directory {
-            return Err(FsError::IsDir);
-        }
-        if len == 0 {
-            inode.clear_payload();
-        } else if len < inode.size {
-            inode.truncate_sparse_to(len);
-            if len as usize <= inline_file_limit {
-                let old_len = inode.data.len();
-                inode.data.resize(len as usize, 0);
-                inode.account_inline_len_change(old_len);
-            } else if inode.data.len() as u64 > len {
-                let old_len = inode.data.len();
-                inode.data.truncate(len as usize);
-                inode.account_inline_len_change(old_len);
-            }
-        } else if inode.data.len() as u64 > len {
-            let old_len = inode.data.len();
-            inode.data.truncate(len as usize);
-            inode.account_inline_len_change(old_len);
-        }
-        if inode.allocated_payload_len() > TMPFS_ALLOCATED_PAYLOAD_LIMIT {
-            return Err(FsError::NoSpace);
-        }
-        inode.size = len;
-        inode.touch();
-        Ok(())
-    }
-
-    fn allocate_range(&mut self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
-        let end = offset.checked_add(len).ok_or(FsError::InvalidInput)?;
-        let len = usize::try_from(len).map_err(|_| FsError::InvalidInput)?;
-        self.write_fits_quota(ino, offset, len)?;
-        let inline_file_limit = self.inline_file_limit;
-        let inode = self.inode_mut(ino)?;
-        if inode.kind != FsNodeKind::RegularFile {
-            return Err(FsError::InvalidInput);
-        }
-        if !inode.reserve_zero_range(offset, end, inline_file_limit) {
-            return Err(FsError::NoSpace);
-        }
-        if !keep_size && end > inode.size {
-            inode.size = end;
-        }
-        inode.touch();
-        Ok(())
-    }
-
-    fn zero_range(&mut self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
-        let end = offset.checked_add(len).ok_or(FsError::InvalidInput)?;
-        let len = usize::try_from(len).map_err(|_| FsError::InvalidInput)?;
-        self.write_fits_quota(ino, offset, len)?;
-        let inline_file_limit = self.inline_file_limit;
-        let inode = self.inode_mut(ino)?;
-        if inode.kind != FsNodeKind::RegularFile {
-            return Err(FsError::InvalidInput);
-        }
-        if !inode.write_zero_range(offset, end, inline_file_limit) {
-            return Err(FsError::NoSpace);
-        }
-        if !keep_size && end > inode.size {
-            inode.size = end;
-        }
-        inode.touch();
-        Ok(())
-    }
-
-    fn punch_hole(&mut self, ino: u32, offset: u64, len: u64) -> FsResult {
-        let end = offset.checked_add(len).ok_or(FsError::InvalidInput)?;
-        let inline_file_limit = self.inline_file_limit;
-        let inode = self.inode_mut(ino)?;
-        if inode.kind != FsNodeKind::RegularFile {
-            return Err(FsError::InvalidInput);
-        }
-        inode.punch_hole_range(offset, end, inline_file_limit);
-        inode.touch();
-        Ok(())
-    }
-
+impl LegacySyncOps for TmpFs {
     fn sync(&mut self, _ino: u32, _data_only: bool) -> FsResult {
         if let Some(loop_id) = self.synthetic_sync_loop_device {
             let _ = super::devfs::loop_device_note_synthetic_write(loop_id, EXT_SCRATCH_SYNC_BYTES);
         }
         Ok(())
     }
+}
 
+impl LegacyInodeLifecycleOps for TmpFs {
     fn retain_inode(&mut self, ino: u32) -> FsResult {
         let inode = self.inode_mut(ino)?;
         inode.open_count += 1;
@@ -1234,230 +1472,5 @@ impl LegacyFileSystemBackend for TmpFs {
             return Ok(InodeRelease::Freed);
         }
         Ok(InodeRelease::Retained)
-    }
-
-    fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
-        let inode = self.inode(ino)?;
-        let size = match inode.kind {
-            FsNodeKind::Directory => inode.children.len() as u64,
-            _ => inode.size,
-        };
-        let blocks = match inode.kind {
-            FsNodeKind::Directory => size.div_ceil(512),
-            FsNodeKind::Symlink => 0,
-            _ => inode.allocated_logical_len().div_ceil(512),
-        };
-        Ok(FileStat {
-            ino: ino as u64,
-            mode: inode.mode,
-            nlink: inode.nlink,
-            uid: inode.uid,
-            gid: inode.gid,
-            rdev: inode.rdev,
-            inode_flags: inode.flags,
-            inode_flags_supported: self.statx_supported_inode_flags(),
-            size,
-            blocks,
-            blksize: super::DEFAULT_BLOCK_SIZE,
-            atime_sec: inode.atime.sec,
-            atime_nsec: inode.atime.nsec,
-            btime_sec: inode.btime.sec,
-            btime_nsec: inode.btime.nsec,
-            mtime_sec: inode.mtime.sec,
-            mtime_nsec: inode.mtime.nsec,
-            ctime_sec: inode.ctime.sec,
-            ctime_nsec: inode.ctime.nsec,
-            ..FileStat::default()
-        })
-    }
-
-    fn set_times(
-        &mut self,
-        ino: u32,
-        atime: Option<FileTimestamp>,
-        mtime: Option<FileTimestamp>,
-        ctime: FileTimestamp,
-    ) -> FsResult {
-        let inode = self.inode_mut(ino)?;
-        if let Some(atime) = atime {
-            inode.atime = atime;
-        }
-        if let Some(mtime) = mtime {
-            inode.mtime = mtime;
-        }
-        inode.ctime = ctime;
-        Ok(())
-    }
-
-    fn set_mode(&mut self, ino: u32, mode: u32) -> FsResult {
-        let inode = self.inode_mut(ino)?;
-        inode.mode = (inode.mode & !0o7777) | (mode & 0o7777);
-        inode.ctime = FileTimestamp::now();
-        Ok(())
-    }
-
-    fn set_owner(&mut self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
-        let inode = self.inode_mut(ino)?;
-        if let Some(uid) = uid {
-            inode.uid = uid;
-        }
-        if let Some(gid) = gid {
-            inode.gid = gid;
-        }
-        inode.ctime = FileTimestamp::now();
-        Ok(())
-    }
-
-    fn inode_flags(&mut self, ino: u32) -> FsResult<u32> {
-        Ok(self.inode(ino)?.flags)
-    }
-
-    fn set_inode_flags(&mut self, ino: u32, flags: u32) -> FsResult {
-        let inode = self.inode_mut(ino)?;
-        inode.flags = flags;
-        inode.ctime = FileTimestamp::now();
-        Ok(())
-    }
-
-    fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
-        let inode = self.inode(ino)?;
-        if inode.kind != FsNodeKind::Symlink {
-            return Err(FsError::InvalidInput);
-        }
-        let len = buf.len().min(inode.size as usize).min(inode.data.len());
-        buf[..len].copy_from_slice(&inode.data[..len]);
-        Ok(len)
-    }
-
-    fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
-        let Ok(inode) = self.inode_mut(ino) else {
-            return 0;
-        };
-        if inode.kind == FsNodeKind::Directory {
-            return 0;
-        }
-        if !buf.is_empty() {
-            inode.atime = FileTimestamp::now();
-        }
-        if offset >= inode.size {
-            return 0;
-        }
-        let len = buf.len().min((inode.size - offset) as usize);
-        let out = &mut buf[..len];
-        out.fill(0);
-        if offset < inode.data.len() as u64 {
-            let start = offset as usize;
-            let inline_len = out.len().min(inode.data.len() - start);
-            out[..inline_len].copy_from_slice(&inode.data[start..start + inline_len]);
-        }
-        inode.copy_sparse_to(offset, out);
-        len
-    }
-
-    fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize {
-        let write_len = self.quota_limited_write_len(ino, offset, buf.len());
-        if write_len == 0 && !buf.is_empty() {
-            return 0;
-        }
-        let buf = &buf[..write_len];
-        let Some(end) = offset.checked_add(buf.len() as u64) else {
-            return 0;
-        };
-        let inline_file_limit = self.inline_file_limit;
-        let Ok(inode) = self.inode_mut(ino) else {
-            return 0;
-        };
-        if inode.kind != FsNodeKind::RegularFile {
-            return 0;
-        }
-        if buf.iter().all(|byte| *byte == 0) {
-            if offset >= inline_file_limit as u64 {
-                // CONTEXT: user writes can be split at page boundaries. Keeping a
-                // zero tail contiguous lets repeated-page payloads compress.
-                if let Some(appended) = inode.append_sparse_tail(offset, buf) {
-                    if appended == 0 {
-                        return 0;
-                    }
-                    if appended < buf.len() {
-                        let zero_start = offset + appended as u64;
-                        if !inode.write_zero_range(zero_start, end, inline_file_limit) {
-                            return 0;
-                        }
-                    }
-                    if end > inode.size {
-                        inode.size = end;
-                    }
-                    inode.touch();
-                    return buf.len();
-                }
-            }
-            if !inode.write_zero_range(offset, end, inline_file_limit) {
-                return 0;
-            }
-            if end > inode.size {
-                inode.size = end;
-            }
-            inode.touch();
-            return buf.len();
-        }
-
-        let mut sparse_offset = offset;
-        let mut sparse_buf = buf;
-        if offset < inline_file_limit as u64 {
-            let start = offset as usize;
-            let inline_end = end.min(inline_file_limit as u64) as usize;
-            if inline_end > inode.data.len() {
-                let extra = inline_end - inode.data.len();
-                if inode.allocated_payload_len().saturating_add(extra)
-                    > TMPFS_ALLOCATED_PAYLOAD_LIMIT
-                    || inode.data.try_reserve(extra).is_err()
-                {
-                    return 0;
-                }
-                let old_len = inode.data.len();
-                inode.data.resize(inline_end, 0);
-                inode.account_inline_len_change(old_len);
-            }
-            let inline_len = inline_end - start;
-            inode.data[start..inline_end].copy_from_slice(&buf[..inline_len]);
-            inode.remove_sparse_range(offset, inline_end as u64);
-            if inline_end as u64 == end {
-                if end > inode.size {
-                    inode.size = end;
-                }
-                inode.touch();
-                return buf.len();
-            }
-            sparse_offset = inline_end as u64;
-            sparse_buf = &buf[inline_len..];
-        }
-
-        inode.remove_sparse_range(sparse_offset, end);
-        if inode
-            .allocated_payload_len()
-            .saturating_add(sparse_buf.len())
-            > TMPFS_ALLOCATED_PAYLOAD_LIMIT
-        {
-            return 0;
-        }
-        if !inode.write_sparse_data(sparse_offset, sparse_buf) {
-            return 0;
-        }
-        if end > inode.size {
-            inode.size = end;
-        }
-        inode.touch();
-        buf.len()
-    }
-
-    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
-        write_dir_entries(&self.dir_entries(ino)?, offset, buf)
-    }
-
-    fn list_root_names(&mut self) -> Vec<String> {
-        self.inodes
-            .get(&ROOT_INO)
-            .map(|root| root.children.keys().cloned().collect())
-            .unwrap_or_default()
     }
 }

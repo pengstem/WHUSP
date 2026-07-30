@@ -7,7 +7,8 @@ use super::vfs::BackendIoSnapshot;
 use super::vfs::{
     BackendDirectoryEntry, BackendDirectoryReadPlan, BackendDirectorySnapshot, BackendOp,
     BackendReadPlan, BackendWritePlan, DataOps, FileSystemStat, FsError, FsNodeKind, FsResult,
-    InodeLifecycleOps, InodeRelease, LegacyFileSystemBackend, LookupOps, MetadataOps, NamespaceOps,
+    InodeLifecycleOps, InodeRelease, LegacyDataOps, LegacyInodeLifecycleOps, LegacyLookupOps,
+    LegacyMetadataOps, LegacyNamespaceOps, LegacySyncOps, LookupOps, MetadataOps, NamespaceOps,
     SyncOps,
 };
 use super::{FS_STATX_ATTR_FLAGS, FileStat, FileTimestamp};
@@ -2578,16 +2579,7 @@ impl Ext4Mount {
     }
 }
 
-impl LegacyFileSystemBackend for Ext4Mount {
-    #[cfg(feature = "perf-counters")]
-    fn io_snapshot(&self) -> BackendIoSnapshot {
-        self.io_counters.snapshot()
-    }
-
-    fn statfs(&mut self) -> FileSystemStat {
-        self.statfs_shared()
-    }
-
+impl LegacyLookupOps for Ext4Mount {
     fn lookup_component_from(
         &mut self,
         parent_ino: u32,
@@ -2596,6 +2588,109 @@ impl LegacyFileSystemBackend for Ext4Mount {
         self.lookup_component_from_shared(parent_ino, component)
     }
 
+    fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
+        self.readlink_shared(ino, buf)
+    }
+
+    fn prepare_readlink_plan(&mut self, ino: u32, len: usize) -> Option<Box<dyn BackendReadPlan>> {
+        self.prepare_readlink_plan_shared(ino, len)
+    }
+
+    fn prepare_directory_read_plan(
+        &mut self,
+        ino: u32,
+        offset: u64,
+    ) -> Option<Box<dyn BackendDirectoryReadPlan>> {
+        self.prepare_directory_read_plan_shared(ino, offset)
+    }
+
+    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
+        self.read_dirent64_shared(ino, offset, buf)
+    }
+
+    fn list_root_names(&mut self) -> Vec<String> {
+        self.list_root_names_shared()
+    }
+}
+
+impl LegacyMetadataOps for Ext4Mount {
+    fn statfs(&mut self) -> FileSystemStat {
+        self.statfs_shared()
+    }
+
+    fn set_times(
+        &mut self,
+        ino: u32,
+        atime: Option<FileTimestamp>,
+        mtime: Option<FileTimestamp>,
+        ctime: FileTimestamp,
+    ) -> FsResult {
+        self.fs
+            .set_times(
+                ino,
+                atime.map(FileTimestamp::to_duration),
+                mtime.map(FileTimestamp::to_duration),
+                Some(ctime.to_duration()),
+            )
+            .map_err(map_ext4_error)
+    }
+
+    fn set_mode(&mut self, ino: u32, mode: u32) -> FsResult {
+        self.set_mode_shared(ino, mode)
+    }
+
+    fn inode_flags(&mut self, ino: u32) -> FsResult<u32> {
+        self.inode_flags_shared(ino)
+    }
+
+    fn set_inode_flags(&mut self, ino: u32, flags: u32) -> FsResult {
+        self.fs.set_inode_flags(ino, flags).map_err(map_ext4_error)
+    }
+
+    fn set_owner(&mut self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
+        self.set_owner_shared(ino, uid, gid)
+    }
+
+    fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
+        self.stat_shared(ino)
+    }
+
+    fn stat_basic(&mut self, ino: u32) -> FsResult<FileStat> {
+        self.stat_basic_shared(ino)
+    }
+}
+
+impl LegacyDataOps for Ext4Mount {
+    #[cfg(feature = "perf-counters")]
+    fn io_snapshot(&self) -> BackendIoSnapshot {
+        self.io_counters.snapshot()
+    }
+
+    fn set_len(&mut self, ino: u32, len: u64) -> FsResult {
+        self.fs.set_len(ino, len).map_err(map_ext4_error)
+    }
+
+    fn prepare_read_plan(
+        &mut self,
+        ino: u32,
+        offset: u64,
+        len: usize,
+    ) -> Option<Box<dyn BackendReadPlan>> {
+        self.prepare_read_plan_shared(ino, offset, len)
+    }
+
+    fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
+        self.read_at_shared(ino, buf, offset)
+    }
+
+    fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize {
+        self.fs
+            .write_at(ino, buf, offset)
+            .expect("ext4 write failed")
+    }
+}
+
+impl LegacyNamespaceOps for Ext4Mount {
     fn create_file(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult<u32> {
         self.create_file_shared(parent_ino, leaf_name)
     }
@@ -2697,11 +2792,9 @@ impl LegacyFileSystemBackend for Ext4Mount {
             .exchange(src_dir, src_name, dst_dir, dst_name)
             .map_err(map_ext4_error)
     }
+}
 
-    fn set_len(&mut self, ino: u32, len: u64) -> FsResult {
-        self.fs.set_len(ino, len).map_err(map_ext4_error)
-    }
-
+impl LegacySyncOps for Ext4Mount {
     fn sync(&mut self, _ino: u32, _data_only: bool) -> FsResult {
         self.fs.flush().map_err(map_ext4_error)
     }
@@ -2709,40 +2802,9 @@ impl LegacyFileSystemBackend for Ext4Mount {
     fn shutdown(&mut self) -> FsResult {
         self.fs.shutdown_clean().map_err(map_ext4_error)
     }
+}
 
-    fn set_times(
-        &mut self,
-        ino: u32,
-        atime: Option<FileTimestamp>,
-        mtime: Option<FileTimestamp>,
-        ctime: FileTimestamp,
-    ) -> FsResult {
-        self.fs
-            .set_times(
-                ino,
-                atime.map(FileTimestamp::to_duration),
-                mtime.map(FileTimestamp::to_duration),
-                Some(ctime.to_duration()),
-            )
-            .map_err(map_ext4_error)
-    }
-
-    fn set_mode(&mut self, ino: u32, mode: u32) -> FsResult {
-        self.set_mode_shared(ino, mode)
-    }
-
-    fn inode_flags(&mut self, ino: u32) -> FsResult<u32> {
-        self.inode_flags_shared(ino)
-    }
-
-    fn set_inode_flags(&mut self, ino: u32, flags: u32) -> FsResult {
-        self.fs.set_inode_flags(ino, flags).map_err(map_ext4_error)
-    }
-
-    fn set_owner(&mut self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
-        self.set_owner_shared(ino, uid, gid)
-    }
-
+impl LegacyInodeLifecycleOps for Ext4Mount {
     fn retain_inode(&mut self, ino: u32) -> FsResult {
         // VfsFile open lifetime pins the inode after unlink. The backend checks
         // existence here so stale VfsNodeId values do not create open counts.
@@ -2766,57 +2828,6 @@ impl LegacyFileSystemBackend for Ext4Mount {
             return self.free_unlinked_inode(ino);
         }
         Ok(InodeRelease::Retained)
-    }
-
-    fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
-        self.stat_shared(ino)
-    }
-
-    fn stat_basic(&mut self, ino: u32) -> FsResult<FileStat> {
-        self.stat_basic_shared(ino)
-    }
-
-    fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
-        self.readlink_shared(ino, buf)
-    }
-
-    fn prepare_readlink_plan(&mut self, ino: u32, len: usize) -> Option<Box<dyn BackendReadPlan>> {
-        self.prepare_readlink_plan_shared(ino, len)
-    }
-
-    fn prepare_read_plan(
-        &mut self,
-        ino: u32,
-        offset: u64,
-        len: usize,
-    ) -> Option<Box<dyn BackendReadPlan>> {
-        self.prepare_read_plan_shared(ino, offset, len)
-    }
-
-    fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
-        self.read_at_shared(ino, buf, offset)
-    }
-
-    fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize {
-        self.fs
-            .write_at(ino, buf, offset)
-            .expect("ext4 write failed")
-    }
-
-    fn prepare_directory_read_plan(
-        &mut self,
-        ino: u32,
-        offset: u64,
-    ) -> Option<Box<dyn BackendDirectoryReadPlan>> {
-        self.prepare_directory_read_plan_shared(ino, offset)
-    }
-
-    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
-        self.read_dirent64_shared(ino, offset, buf)
-    }
-
-    fn list_root_names(&mut self) -> Vec<String> {
-        self.list_root_names_shared()
     }
 }
 

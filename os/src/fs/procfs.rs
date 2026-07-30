@@ -7,7 +7,10 @@ use super::dentry_cache;
 use super::dirent::{DT_DIR, DT_LNK, DT_REG, RawDirEntry, write_dir_entries};
 use super::mount;
 use super::pipe::{PIPE_DEFAULT_CAPACITY, PIPE_MAX_CAPACITY, PIPE_MIN_CAPACITY};
-use super::vfs::{FsError, FsNodeKind, FsResult, LegacyFileSystemBackend};
+use super::vfs::{
+    FsError, FsNodeKind, FsResult, LegacyDataOps, LegacyInodeLifecycleOps, LegacyLookupOps,
+    LegacyMetadataOps, LegacyNamespaceOps, LegacySyncOps,
+};
 use super::{FileStat, FileTimestamp, S_IFDIR, S_IFLNK, S_IFREG};
 use super::{PathContext, lookup_path_in};
 use crate::config::PAGE_SIZE;
@@ -2734,23 +2737,9 @@ fn snapshot_node_content(node: ProcNode) -> FsResult<Vec<u8>> {
     Ok(content)
 }
 
-impl LegacyFileSystemBackend for ProcFs {
+impl LegacyLookupOps for ProcFs {
     fn root_ino(&self) -> u32 {
         ROOT_INO
-    }
-
-    fn statfs(&mut self) -> super::vfs::FileSystemStat {
-        super::vfs::FileSystemStat {
-            magic: 0x9FA0,
-            block_size: 4096,
-            blocks: 0,
-            free_blocks: 0,
-            available_blocks: 0,
-            files: 1024,
-            free_files: 1024,
-            max_name_len: 255,
-            flags: 0,
-        }
     }
 
     fn lookup_component_from(
@@ -3088,71 +3077,107 @@ impl LegacyFileSystemBackend for ProcFs {
         }
     }
 
-    fn create_file(&mut self, _parent_ino: u32, _leaf_name: &str) -> FsResult<u32> {
-        Err(FsError::ReadOnly)
+    fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
+        let node = decode_node(ino).ok_or(FsError::NotFound)?;
+        let target = match node {
+            ProcNode::SelfSymlink => crate::task::current_process().visible_pid().to_string(),
+            ProcNode::PidExe(pid) => pid_exe_target(lookup_process(pid).ok_or(FsError::NotFound)?)?,
+            ProcNode::PidFdEntry(pid, fd) => {
+                let process = pid2process(pid).ok_or(FsError::NotFound)?;
+                let inner = process.inner_exclusive_access();
+                let entry = inner
+                    .fd_table
+                    .get(fd)
+                    .and_then(Option::as_ref)
+                    .ok_or(FsError::NotFound)?;
+                let file = entry.file();
+                entry
+                    .dir_path()
+                    .map(String::from)
+                    .or_else(|| file.proc_fd_target())
+                    .unwrap_or_else(|| format!("/proc/{pid}/fd/{fd} (deleted)"))
+            }
+            _ => return Err(FsError::InvalidInput),
+        };
+        let len = target.len().min(buf.len());
+        buf[..len].copy_from_slice(&target.as_bytes()[..len]);
+        Ok(len)
     }
 
-    fn create_dir(&mut self, _parent_ino: u32, _leaf_name: &str, _mode: u32) -> FsResult<u32> {
-        Err(FsError::ReadOnly)
+    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
+        match decode_node(ino).ok_or(FsError::NotFound)? {
+            ProcNode::Root => write_dir_entries(&root_entries(), offset, buf),
+            ProcNode::OsKernelDir => write_dir_entries(&oskernel_entries(), offset, buf),
+            ProcNode::SysDir => write_dir_entries(&sys_entries(), offset, buf),
+            ProcNode::SysVipcDir => write_dir_entries(&sysvipc_entries(), offset, buf),
+            ProcNode::SysKernelDir => write_dir_entries(&sys_kernel_entries(), offset, buf),
+            ProcNode::SysKernelKeysDir => {
+                write_dir_entries(&sys_kernel_keys_entries(), offset, buf)
+            }
+            ProcNode::SysUserDir => write_dir_entries(&sys_user_entries(), offset, buf),
+            ProcNode::SysFsDir => write_dir_entries(&sys_fs_entries(), offset, buf),
+            ProcNode::SysFsFanotifyDir => {
+                write_dir_entries(&sys_fs_fanotify_entries(), offset, buf)
+            }
+            ProcNode::SysFsInotifyDir => write_dir_entries(&sys_fs_inotify_entries(), offset, buf),
+            ProcNode::SysVmDir => write_dir_entries(&sys_vm_entries(), offset, buf),
+            ProcNode::SysNetDir => write_dir_entries(&sys_net_entries(), offset, buf),
+            ProcNode::SysNetCoreDir => write_dir_entries(&sys_net_core_entries(), offset, buf),
+            ProcNode::SysNetIpv4Dir => write_dir_entries(&sys_net_ipv4_entries(), offset, buf),
+            ProcNode::SysNetIpv4ConfDir => {
+                write_dir_entries(&sys_net_ipv4_conf_entries(), offset, buf)
+            }
+            ProcNode::SysNetIpv4ConfLoDir => write_dir_entries(
+                &sys_net_ipv4_conf_iface_entries(
+                    SYS_NET_IPV4_CONF_LO_DIR_INO,
+                    SYS_NET_IPV4_CONF_LO_TAG_INO,
+                ),
+                offset,
+                buf,
+            ),
+            ProcNode::SysNetIpv4ConfDefaultDir => write_dir_entries(
+                &sys_net_ipv4_conf_iface_entries(
+                    SYS_NET_IPV4_CONF_DEFAULT_DIR_INO,
+                    SYS_NET_IPV4_CONF_DEFAULT_TAG_INO,
+                ),
+                offset,
+                buf,
+            ),
+            ProcNode::PidDir(pid) => write_dir_entries(&pid_entries(pid), offset, buf),
+            ProcNode::PidFdDir(pid) => write_dir_entries(&pid_fd_entries(pid)?, offset, buf),
+            ProcNode::PidFdInfoDir(pid) => {
+                write_dir_entries(&pid_fdinfo_entries(pid)?, offset, buf)
+            }
+            ProcNode::PidNsDir(pid) => write_dir_entries(&pid_ns_entries(pid), offset, buf),
+            ProcNode::PidTaskDir(pid) => write_dir_entries(&pid_task_entries(pid)?, offset, buf),
+            ProcNode::PidTaskTidDir(pid, local_tid) => {
+                write_dir_entries(&pid_task_tid_entries(pid, local_tid)?, offset, buf)
+            }
+            _ => Err(FsError::NotDir),
+        }
     }
 
-    fn link(&mut self, _parent_ino: u32, _leaf_name: &str, _child_ino: u32) -> FsResult {
-        Err(FsError::ReadOnly)
+    fn list_root_names(&mut self) -> Vec<String> {
+        root_entries()
+            .into_iter()
+            .filter(|entry| entry.name != "." && entry.name != "..")
+            .map(|entry| entry.name)
+            .collect()
     }
+}
 
-    fn symlink(&mut self, _parent_ino: u32, _leaf_name: &str, _target: &[u8]) -> FsResult {
-        Err(FsError::ReadOnly)
-    }
-
-    fn unlink(&mut self, _parent_ino: u32, _leaf_name: &str) -> FsResult {
-        Err(FsError::ReadOnly)
-    }
-
-    fn rename(
-        &mut self,
-        _src_dir: u32,
-        _src_name: &str,
-        _dst_dir: u32,
-        _dst_name: &str,
-    ) -> FsResult {
-        Err(FsError::ReadOnly)
-    }
-
-    fn set_len(&mut self, _ino: u32, _len: u64) -> FsResult {
-        match decode_node(_ino).ok_or(FsError::NotFound)? {
-            ProcNode::PidMax
-            | ProcNode::ShmMax
-            | ProcNode::ShmMni
-            | ProcNode::ShmAll
-            | ProcNode::ShmNextId
-            | ProcNode::MsgMni
-            | ProcNode::MsgMax
-            | ProcNode::MsgMnb
-            | ProcNode::MsgNextId
-            | ProcNode::Printk
-            | ProcNode::KeysGcDelay
-            | ProcNode::KeysMaxkeys
-            | ProcNode::KeysMaxbytes
-            | ProcNode::KeysRootMaxkeys
-            | ProcNode::KeysRootMaxbytes
-            | ProcNode::MaxUserNamespaces
-            | ProcNode::PipeMaxSize
-            | ProcNode::LeaseBreakTime
-            | ProcNode::NetCoreBusyRead
-            | ProcNode::NetCoreBusyPoll
-            | ProcNode::InotifyMaxUserInstances
-            | ProcNode::NetIpv4ConfLoTag
-            | ProcNode::DropCaches
-            | ProcNode::VfsCachePressure
-            | ProcNode::PidOomScoreAdj(_)
-            | ProcNode::PidTimerslack(_)
-            | ProcNode::PidSetgroups(_)
-            | ProcNode::PidUidMap(_)
-            | ProcNode::PidGidMap(_) => Ok(()),
-            ProcNode::PidCoredumpFilter(_) => Ok(()),
-            ProcNode::Domainname => set_domainname_len(_len),
-            ProcNode::CorePattern => set_core_pattern_len(_len),
-            _ => Err(FsError::ReadOnly),
+impl LegacyMetadataOps for ProcFs {
+    fn statfs(&mut self) -> super::vfs::FileSystemStat {
+        super::vfs::FileSystemStat {
+            magic: 0x9FA0,
+            block_size: 4096,
+            blocks: 0,
+            free_blocks: 0,
+            available_blocks: 0,
+            files: 1024,
+            free_files: 1024,
+            max_name_len: 255,
+            flags: 0,
         }
     }
 
@@ -3256,32 +3281,45 @@ impl LegacyFileSystemBackend for ProcFs {
         stat.size = 0;
         Ok(stat)
     }
+}
 
-    fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
-        let node = decode_node(ino).ok_or(FsError::NotFound)?;
-        let target = match node {
-            ProcNode::SelfSymlink => crate::task::current_process().visible_pid().to_string(),
-            ProcNode::PidExe(pid) => pid_exe_target(lookup_process(pid).ok_or(FsError::NotFound)?)?,
-            ProcNode::PidFdEntry(pid, fd) => {
-                let process = pid2process(pid).ok_or(FsError::NotFound)?;
-                let inner = process.inner_exclusive_access();
-                let entry = inner
-                    .fd_table
-                    .get(fd)
-                    .and_then(Option::as_ref)
-                    .ok_or(FsError::NotFound)?;
-                let file = entry.file();
-                entry
-                    .dir_path()
-                    .map(String::from)
-                    .or_else(|| file.proc_fd_target())
-                    .unwrap_or_else(|| format!("/proc/{pid}/fd/{fd} (deleted)"))
-            }
-            _ => return Err(FsError::InvalidInput),
-        };
-        let len = target.len().min(buf.len());
-        buf[..len].copy_from_slice(&target.as_bytes()[..len]);
-        Ok(len)
+impl LegacyDataOps for ProcFs {
+    fn set_len(&mut self, _ino: u32, _len: u64) -> FsResult {
+        match decode_node(_ino).ok_or(FsError::NotFound)? {
+            ProcNode::PidMax
+            | ProcNode::ShmMax
+            | ProcNode::ShmMni
+            | ProcNode::ShmAll
+            | ProcNode::ShmNextId
+            | ProcNode::MsgMni
+            | ProcNode::MsgMax
+            | ProcNode::MsgMnb
+            | ProcNode::MsgNextId
+            | ProcNode::Printk
+            | ProcNode::KeysGcDelay
+            | ProcNode::KeysMaxkeys
+            | ProcNode::KeysMaxbytes
+            | ProcNode::KeysRootMaxkeys
+            | ProcNode::KeysRootMaxbytes
+            | ProcNode::MaxUserNamespaces
+            | ProcNode::PipeMaxSize
+            | ProcNode::LeaseBreakTime
+            | ProcNode::NetCoreBusyRead
+            | ProcNode::NetCoreBusyPoll
+            | ProcNode::InotifyMaxUserInstances
+            | ProcNode::NetIpv4ConfLoTag
+            | ProcNode::DropCaches
+            | ProcNode::VfsCachePressure
+            | ProcNode::PidOomScoreAdj(_)
+            | ProcNode::PidTimerslack(_)
+            | ProcNode::PidSetgroups(_)
+            | ProcNode::PidUidMap(_)
+            | ProcNode::PidGidMap(_) => Ok(()),
+            ProcNode::PidCoredumpFilter(_) => Ok(()),
+            ProcNode::Domainname => set_domainname_len(_len),
+            ProcNode::CorePattern => set_core_pattern_len(_len),
+            _ => Err(FsError::ReadOnly),
+        }
     }
 
     fn supports_read_snapshot(&mut self, ino: u32) -> bool {
@@ -3369,65 +3407,40 @@ impl LegacyFileSystemBackend for ProcFs {
             _ => 0,
         }
     }
+}
 
-    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
-        match decode_node(ino).ok_or(FsError::NotFound)? {
-            ProcNode::Root => write_dir_entries(&root_entries(), offset, buf),
-            ProcNode::OsKernelDir => write_dir_entries(&oskernel_entries(), offset, buf),
-            ProcNode::SysDir => write_dir_entries(&sys_entries(), offset, buf),
-            ProcNode::SysVipcDir => write_dir_entries(&sysvipc_entries(), offset, buf),
-            ProcNode::SysKernelDir => write_dir_entries(&sys_kernel_entries(), offset, buf),
-            ProcNode::SysKernelKeysDir => {
-                write_dir_entries(&sys_kernel_keys_entries(), offset, buf)
-            }
-            ProcNode::SysUserDir => write_dir_entries(&sys_user_entries(), offset, buf),
-            ProcNode::SysFsDir => write_dir_entries(&sys_fs_entries(), offset, buf),
-            ProcNode::SysFsFanotifyDir => {
-                write_dir_entries(&sys_fs_fanotify_entries(), offset, buf)
-            }
-            ProcNode::SysFsInotifyDir => write_dir_entries(&sys_fs_inotify_entries(), offset, buf),
-            ProcNode::SysVmDir => write_dir_entries(&sys_vm_entries(), offset, buf),
-            ProcNode::SysNetDir => write_dir_entries(&sys_net_entries(), offset, buf),
-            ProcNode::SysNetCoreDir => write_dir_entries(&sys_net_core_entries(), offset, buf),
-            ProcNode::SysNetIpv4Dir => write_dir_entries(&sys_net_ipv4_entries(), offset, buf),
-            ProcNode::SysNetIpv4ConfDir => {
-                write_dir_entries(&sys_net_ipv4_conf_entries(), offset, buf)
-            }
-            ProcNode::SysNetIpv4ConfLoDir => write_dir_entries(
-                &sys_net_ipv4_conf_iface_entries(
-                    SYS_NET_IPV4_CONF_LO_DIR_INO,
-                    SYS_NET_IPV4_CONF_LO_TAG_INO,
-                ),
-                offset,
-                buf,
-            ),
-            ProcNode::SysNetIpv4ConfDefaultDir => write_dir_entries(
-                &sys_net_ipv4_conf_iface_entries(
-                    SYS_NET_IPV4_CONF_DEFAULT_DIR_INO,
-                    SYS_NET_IPV4_CONF_DEFAULT_TAG_INO,
-                ),
-                offset,
-                buf,
-            ),
-            ProcNode::PidDir(pid) => write_dir_entries(&pid_entries(pid), offset, buf),
-            ProcNode::PidFdDir(pid) => write_dir_entries(&pid_fd_entries(pid)?, offset, buf),
-            ProcNode::PidFdInfoDir(pid) => {
-                write_dir_entries(&pid_fdinfo_entries(pid)?, offset, buf)
-            }
-            ProcNode::PidNsDir(pid) => write_dir_entries(&pid_ns_entries(pid), offset, buf),
-            ProcNode::PidTaskDir(pid) => write_dir_entries(&pid_task_entries(pid)?, offset, buf),
-            ProcNode::PidTaskTidDir(pid, local_tid) => {
-                write_dir_entries(&pid_task_tid_entries(pid, local_tid)?, offset, buf)
-            }
-            _ => Err(FsError::NotDir),
-        }
+impl LegacyNamespaceOps for ProcFs {
+    fn create_file(&mut self, _parent_ino: u32, _leaf_name: &str) -> FsResult<u32> {
+        Err(FsError::ReadOnly)
     }
 
-    fn list_root_names(&mut self) -> Vec<String> {
-        root_entries()
-            .into_iter()
-            .filter(|entry| entry.name != "." && entry.name != "..")
-            .map(|entry| entry.name)
-            .collect()
+    fn create_dir(&mut self, _parent_ino: u32, _leaf_name: &str, _mode: u32) -> FsResult<u32> {
+        Err(FsError::ReadOnly)
+    }
+
+    fn link(&mut self, _parent_ino: u32, _leaf_name: &str, _child_ino: u32) -> FsResult {
+        Err(FsError::ReadOnly)
+    }
+
+    fn symlink(&mut self, _parent_ino: u32, _leaf_name: &str, _target: &[u8]) -> FsResult {
+        Err(FsError::ReadOnly)
+    }
+
+    fn unlink(&mut self, _parent_ino: u32, _leaf_name: &str) -> FsResult {
+        Err(FsError::ReadOnly)
+    }
+
+    fn rename(
+        &mut self,
+        _src_dir: u32,
+        _src_name: &str,
+        _dst_dir: u32,
+        _dst_name: &str,
+    ) -> FsResult {
+        Err(FsError::ReadOnly)
     }
 }
+
+impl LegacySyncOps for ProcFs {}
+
+impl LegacyInodeLifecycleOps for ProcFs {}

@@ -5,7 +5,10 @@ use super::dirent::{
 use super::mount::MountId;
 use super::path::WorkingDir;
 use super::status_flags::StatusFlagsCell;
-use super::vfs::{FileSystemStat, FsNodeKind, LegacyFileSystemBackend, VfsNodeId};
+use super::vfs::{
+    FileSystemStat, FsNodeKind, LegacyDataOps, LegacyInodeLifecycleOps, LegacyLookupOps,
+    LegacyMetadataOps, LegacyNamespaceOps, LegacySyncOps, VfsNodeId,
+};
 use super::{
     File, FileStat, FsError, FsResult, OpenFlags, PollEvents, PollWaitQueue, PollWaiter, S_IFBLK,
     S_IFCHR, S_IFDIR, SeekWhence, TtyId, console_tty_poll, console_tty_poll_with_wait,
@@ -2402,23 +2405,9 @@ fn raw_pts_entries() -> Vec<RawDirEntry> {
     entries
 }
 
-impl LegacyFileSystemBackend for DevFs {
+impl LegacyLookupOps for DevFs {
     fn root_ino(&self) -> u32 {
         DevNode::Root.ino()
-    }
-
-    fn statfs(&mut self) -> FileSystemStat {
-        FileSystemStat {
-            magic: DEVFS_MAGIC,
-            block_size: 4096,
-            blocks: 0,
-            free_blocks: 0,
-            available_blocks: 0,
-            files: 1024,
-            free_files: 1024,
-            max_name_len: 255,
-            flags: 0,
-        }
     }
 
     fn lookup_component_from(
@@ -2437,58 +2426,8 @@ impl LegacyFileSystemBackend for DevFs {
         Ok((node.ino(), node.kind()))
     }
 
-    fn create_file(&mut self, _parent_ino: u32, _leaf_name: &str) -> FsResult<u32> {
-        Err(FsError::ReadOnly)
-    }
-
-    fn create_dir(&mut self, _parent_ino: u32, _leaf_name: &str, _mode: u32) -> FsResult<u32> {
-        Err(FsError::ReadOnly)
-    }
-
-    fn link(&mut self, _parent_ino: u32, _leaf_name: &str, _child_ino: u32) -> FsResult {
-        Err(FsError::ReadOnly)
-    }
-
-    fn symlink(&mut self, _parent_ino: u32, _leaf_name: &str, _target: &[u8]) -> FsResult {
-        Err(FsError::ReadOnly)
-    }
-
-    fn unlink(&mut self, _parent_ino: u32, _leaf_name: &str) -> FsResult {
-        Err(FsError::ReadOnly)
-    }
-
-    fn rename(
-        &mut self,
-        _src_dir: u32,
-        _src_name: &str,
-        _dst_dir: u32,
-        _dst_name: &str,
-    ) -> FsResult {
-        Err(FsError::ReadOnly)
-    }
-
-    fn set_len(&mut self, _ino: u32, _len: u64) -> FsResult {
-        Err(FsError::InvalidInput)
-    }
-
-    fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
-        if let Some(id) = pty_id_from_ino(ino) {
-            return stat_pty_slave(id).ok_or(FsError::NotFound);
-        }
-        let node = node_from_ino(ino).ok_or(FsError::NotFound)?;
-        Ok(stat_node(node))
-    }
-
     fn readlink(&mut self, _ino: u32, _buf: &mut [u8]) -> FsResult<usize> {
         Err(FsError::InvalidInput)
-    }
-
-    fn read_at(&mut self, _ino: u32, _buf: &mut [u8], _offset: u64) -> usize {
-        0
-    }
-
-    fn write_at(&mut self, _ino: u32, _buf: &[u8], _offset: u64) -> usize {
-        0
     }
 
     fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
@@ -2518,6 +2457,80 @@ impl LegacyFileSystemBackend for DevFs {
             .collect()
     }
 }
+
+impl LegacyMetadataOps for DevFs {
+    fn statfs(&mut self) -> FileSystemStat {
+        FileSystemStat {
+            magic: DEVFS_MAGIC,
+            block_size: 4096,
+            blocks: 0,
+            free_blocks: 0,
+            available_blocks: 0,
+            files: 1024,
+            free_files: 1024,
+            max_name_len: 255,
+            flags: 0,
+        }
+    }
+
+    fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
+        if let Some(id) = pty_id_from_ino(ino) {
+            return stat_pty_slave(id).ok_or(FsError::NotFound);
+        }
+        let node = node_from_ino(ino).ok_or(FsError::NotFound)?;
+        Ok(stat_node(node))
+    }
+}
+
+impl LegacyDataOps for DevFs {
+    fn set_len(&mut self, _ino: u32, _len: u64) -> FsResult {
+        Err(FsError::InvalidInput)
+    }
+
+    fn read_at(&mut self, _ino: u32, _buf: &mut [u8], _offset: u64) -> usize {
+        0
+    }
+
+    fn write_at(&mut self, _ino: u32, _buf: &[u8], _offset: u64) -> usize {
+        0
+    }
+}
+
+impl LegacyNamespaceOps for DevFs {
+    fn create_file(&mut self, _parent_ino: u32, _leaf_name: &str) -> FsResult<u32> {
+        Err(FsError::ReadOnly)
+    }
+
+    fn create_dir(&mut self, _parent_ino: u32, _leaf_name: &str, _mode: u32) -> FsResult<u32> {
+        Err(FsError::ReadOnly)
+    }
+
+    fn link(&mut self, _parent_ino: u32, _leaf_name: &str, _child_ino: u32) -> FsResult {
+        Err(FsError::ReadOnly)
+    }
+
+    fn symlink(&mut self, _parent_ino: u32, _leaf_name: &str, _target: &[u8]) -> FsResult {
+        Err(FsError::ReadOnly)
+    }
+
+    fn unlink(&mut self, _parent_ino: u32, _leaf_name: &str) -> FsResult {
+        Err(FsError::ReadOnly)
+    }
+
+    fn rename(
+        &mut self,
+        _src_dir: u32,
+        _src_name: &str,
+        _dst_dir: u32,
+        _dst_name: &str,
+    ) -> FsResult {
+        Err(FsError::ReadOnly)
+    }
+}
+
+impl LegacySyncOps for DevFs {}
+
+impl LegacyInodeLifecycleOps for DevFs {}
 
 impl File for DevFsFile {
     fn as_any(&self) -> &dyn core::any::Any {

@@ -3,7 +3,8 @@ use super::mount::with_mount;
 use super::path::WorkingDir;
 use super::vfs::{
     BackendOp, FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult, InodeRelease,
-    LegacyFileSystemBackend, VfsNodeId,
+    LegacyDataOps, LegacyInodeLifecycleOps, LegacyLookupOps, LegacyMetadataOps, LegacyNamespaceOps,
+    LegacySyncOps, VfsNodeId,
 };
 use super::{FileStat, FileTimestamp, S_IFDIR};
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -102,23 +103,9 @@ impl OverlayFs {
     }
 }
 
-impl LegacyFileSystemBackend for OverlayFs {
+impl LegacyLookupOps for OverlayFs {
     fn root_ino(&self) -> u32 {
         OVERLAY_ROOT_INO
-    }
-
-    fn statfs(&mut self) -> FileSystemStat {
-        FileSystemStat {
-            magic: OVERLAY_SUPER_MAGIC,
-            block_size: 4096,
-            blocks: 0,
-            free_blocks: 0,
-            available_blocks: 0,
-            files: 1024,
-            free_files: 1024,
-            max_name_len: 255,
-            flags: 0,
-        }
     }
 
     fn overlay_real_node(&mut self, ino: u32) -> Option<VfsNodeId> {
@@ -155,6 +142,180 @@ impl LegacyFileSystemBackend for OverlayFs {
         }
     }
 
+    fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
+        let real = self.real_for_overlay(ino)?;
+        Self::with_real(ino, real, BackendOp::Readlink, |mount, real_ino| {
+            mount.readlink(real_ino, buf)
+        })?
+    }
+
+    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
+        if ino != OVERLAY_ROOT_INO {
+            let real = self.real_for_overlay(ino)?;
+            return Self::with_real(ino, real, BackendOp::Readdir, |mount, real_ino| {
+                mount.read_dirent64(real_ino, offset, buf)
+            })?;
+        }
+
+        let mut names = BTreeSet::new();
+        for root in [self.upper, self.lower] {
+            if let Some(layer_names) = with_mount(root.mount_id, BackendOp::Readdir, |mount| {
+                mount.list_root_names()
+            }) {
+                names.extend(layer_names);
+            }
+        }
+        let mut entries = Vec::new();
+        entries.push(RawDirEntry {
+            ino: OVERLAY_ROOT_INO,
+            name: String::from("."),
+            dtype: DT_DIR,
+        });
+        entries.push(RawDirEntry {
+            ino: OVERLAY_ROOT_INO,
+            name: String::from(".."),
+            dtype: DT_DIR,
+        });
+        for name in names {
+            let (ino, kind) = self.lookup_component_from(OVERLAY_ROOT_INO, name.as_str())?;
+            let dtype = match kind {
+                FsNodeKind::Directory => DT_DIR,
+                FsNodeKind::RegularFile => DT_REG,
+                FsNodeKind::Symlink => DT_LNK,
+                FsNodeKind::Fifo => DT_FIFO,
+                _ => 0,
+            };
+            entries.push(RawDirEntry { ino, name, dtype });
+        }
+        write_dir_entries(&entries, offset, buf)
+    }
+
+    fn list_root_names(&mut self) -> Vec<String> {
+        let mut names = BTreeSet::new();
+        for root in [self.upper, self.lower] {
+            if let Some(layer_names) = with_mount(root.mount_id, BackendOp::Readdir, |mount| {
+                mount.list_root_names()
+            }) {
+                names.extend(layer_names);
+            }
+        }
+        names.into_iter().collect()
+    }
+}
+
+impl LegacyMetadataOps for OverlayFs {
+    fn statfs(&mut self) -> FileSystemStat {
+        FileSystemStat {
+            magic: OVERLAY_SUPER_MAGIC,
+            block_size: 4096,
+            blocks: 0,
+            free_blocks: 0,
+            available_blocks: 0,
+            files: 1024,
+            free_files: 1024,
+            max_name_len: 255,
+            flags: 0,
+        }
+    }
+
+    fn set_times(
+        &mut self,
+        ino: u32,
+        atime: Option<FileTimestamp>,
+        mtime: Option<FileTimestamp>,
+        ctime: FileTimestamp,
+    ) -> FsResult {
+        let real = self.real_for_overlay(ino)?;
+        Self::with_real(
+            ino,
+            real,
+            BackendOp::NamespaceMutation,
+            |mount, real_ino| mount.set_times(real_ino, atime, mtime, ctime),
+        )?
+    }
+
+    fn set_mode(&mut self, ino: u32, mode: u32) -> FsResult {
+        let real = self.real_for_overlay(ino)?;
+        Self::with_real(
+            ino,
+            real,
+            BackendOp::NamespaceMutation,
+            |mount, real_ino| mount.set_mode(real_ino, mode),
+        )?
+    }
+
+    fn set_owner(&mut self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
+        let real = self.real_for_overlay(ino)?;
+        Self::with_real(
+            ino,
+            real,
+            BackendOp::NamespaceMutation,
+            |mount, real_ino| mount.set_owner(real_ino, uid, gid),
+        )?
+    }
+
+    fn inode_flags(&mut self, ino: u32) -> FsResult<u32> {
+        let real = self.real_for_overlay(ino)?;
+        Self::with_real(ino, real, BackendOp::StatFull, |mount, real_ino| {
+            mount.inode_flags(real_ino)
+        })?
+    }
+
+    fn set_inode_flags(&mut self, ino: u32, flags: u32) -> FsResult {
+        let real = self.real_for_overlay(ino)?;
+        Self::with_real(
+            ino,
+            real,
+            BackendOp::NamespaceMutation,
+            |mount, real_ino| mount.set_inode_flags(real_ino, flags),
+        )?
+    }
+
+    fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
+        if ino == OVERLAY_ROOT_INO {
+            let mut stat = FileStat::with_mode(S_IFDIR | 0o755);
+            stat.ino = OVERLAY_ROOT_INO as u64;
+            return Ok(stat);
+        }
+        let real = self.real_for_overlay(ino)?;
+        let mut stat = Self::with_real(ino, real, BackendOp::StatFull, |mount, real_ino| {
+            mount.stat(real_ino)
+        })??;
+        stat.ino = ino as u64;
+        Ok(stat)
+    }
+}
+
+impl LegacyDataOps for OverlayFs {
+    fn set_len(&mut self, ino: u32, len: u64) -> FsResult {
+        let real = self.real_for_overlay(ino)?;
+        Self::with_real(ino, real, BackendOp::TruncateAllocate, |mount, real_ino| {
+            mount.set_len(real_ino, len)
+        })?
+    }
+
+    fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
+        let Ok(real) = self.real_for_overlay(ino) else {
+            return 0;
+        };
+        with_mount(real.mount_id, BackendOp::ReadFallback, |mount| {
+            mount.read_at(real.ino, buf, offset)
+        })
+        .unwrap_or(0)
+    }
+
+    fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize {
+        let Ok(real) = self.real_for_overlay(ino) else {
+            return 0;
+        };
+        with_mount(real.mount_id, BackendOp::Write, |mount| {
+            mount.write_at(real.ino, buf, offset)
+        })
+        .unwrap_or(0)
+    }
+}
+
+impl LegacyNamespaceOps for OverlayFs {
     fn create_file(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult<u32> {
         let parent = self.upper_parent_for_create(parent_ino)?;
         let real_ino = with_mount(parent.mount_id, BackendOp::NamespaceMutation, |mount| {
@@ -218,74 +379,18 @@ impl LegacyFileSystemBackend for OverlayFs {
     ) -> FsResult {
         Err(FsError::Unsupported)
     }
+}
 
-    fn set_len(&mut self, ino: u32, len: u64) -> FsResult {
-        let real = self.real_for_overlay(ino)?;
-        Self::with_real(ino, real, BackendOp::TruncateAllocate, |mount, real_ino| {
-            mount.set_len(real_ino, len)
-        })?
-    }
-
+impl LegacySyncOps for OverlayFs {
     fn sync(&mut self, ino: u32, data_only: bool) -> FsResult {
         let real = self.real_for_overlay(ino)?;
         Self::with_real(ino, real, BackendOp::Sync, |mount, real_ino| {
             mount.sync(real_ino, data_only)
         })?
     }
+}
 
-    fn set_times(
-        &mut self,
-        ino: u32,
-        atime: Option<FileTimestamp>,
-        mtime: Option<FileTimestamp>,
-        ctime: FileTimestamp,
-    ) -> FsResult {
-        let real = self.real_for_overlay(ino)?;
-        Self::with_real(
-            ino,
-            real,
-            BackendOp::NamespaceMutation,
-            |mount, real_ino| mount.set_times(real_ino, atime, mtime, ctime),
-        )?
-    }
-
-    fn set_mode(&mut self, ino: u32, mode: u32) -> FsResult {
-        let real = self.real_for_overlay(ino)?;
-        Self::with_real(
-            ino,
-            real,
-            BackendOp::NamespaceMutation,
-            |mount, real_ino| mount.set_mode(real_ino, mode),
-        )?
-    }
-
-    fn set_owner(&mut self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
-        let real = self.real_for_overlay(ino)?;
-        Self::with_real(
-            ino,
-            real,
-            BackendOp::NamespaceMutation,
-            |mount, real_ino| mount.set_owner(real_ino, uid, gid),
-        )?
-    }
-
-    fn inode_flags(&mut self, ino: u32) -> FsResult<u32> {
-        let real = self.real_for_overlay(ino)?;
-        Self::with_real(ino, real, BackendOp::StatFull, |mount, real_ino| {
-            mount.inode_flags(real_ino)
-        })?
-    }
-
-    fn set_inode_flags(&mut self, ino: u32, flags: u32) -> FsResult {
-        let real = self.real_for_overlay(ino)?;
-        Self::with_real(
-            ino,
-            real,
-            BackendOp::NamespaceMutation,
-            |mount, real_ino| mount.set_inode_flags(real_ino, flags),
-        )?
-    }
-
+impl LegacyInodeLifecycleOps for OverlayFs {
     fn retain_inode(&mut self, ino: u32) -> FsResult {
         let real = self.real_for_overlay(ino)?;
         Self::with_real(ino, real, BackendOp::InodeLifetime, |mount, real_ino| {
@@ -298,99 +403,5 @@ impl LegacyFileSystemBackend for OverlayFs {
         Self::with_real(ino, real, BackendOp::InodeLifetime, |mount, real_ino| {
             mount.release_inode(real_ino)
         })?
-    }
-
-    fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
-        if ino == OVERLAY_ROOT_INO {
-            let mut stat = FileStat::with_mode(S_IFDIR | 0o755);
-            stat.ino = OVERLAY_ROOT_INO as u64;
-            return Ok(stat);
-        }
-        let real = self.real_for_overlay(ino)?;
-        let mut stat = Self::with_real(ino, real, BackendOp::StatFull, |mount, real_ino| {
-            mount.stat(real_ino)
-        })??;
-        stat.ino = ino as u64;
-        Ok(stat)
-    }
-
-    fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
-        let real = self.real_for_overlay(ino)?;
-        Self::with_real(ino, real, BackendOp::Readlink, |mount, real_ino| {
-            mount.readlink(real_ino, buf)
-        })?
-    }
-
-    fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
-        let Ok(real) = self.real_for_overlay(ino) else {
-            return 0;
-        };
-        with_mount(real.mount_id, BackendOp::ReadFallback, |mount| {
-            mount.read_at(real.ino, buf, offset)
-        })
-        .unwrap_or(0)
-    }
-
-    fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize {
-        let Ok(real) = self.real_for_overlay(ino) else {
-            return 0;
-        };
-        with_mount(real.mount_id, BackendOp::Write, |mount| {
-            mount.write_at(real.ino, buf, offset)
-        })
-        .unwrap_or(0)
-    }
-
-    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
-        if ino != OVERLAY_ROOT_INO {
-            let real = self.real_for_overlay(ino)?;
-            return Self::with_real(ino, real, BackendOp::Readdir, |mount, real_ino| {
-                mount.read_dirent64(real_ino, offset, buf)
-            })?;
-        }
-
-        let mut names = BTreeSet::new();
-        for root in [self.upper, self.lower] {
-            if let Some(layer_names) = with_mount(root.mount_id, BackendOp::Readdir, |mount| {
-                mount.list_root_names()
-            }) {
-                names.extend(layer_names);
-            }
-        }
-        let mut entries = Vec::new();
-        entries.push(RawDirEntry {
-            ino: OVERLAY_ROOT_INO,
-            name: String::from("."),
-            dtype: DT_DIR,
-        });
-        entries.push(RawDirEntry {
-            ino: OVERLAY_ROOT_INO,
-            name: String::from(".."),
-            dtype: DT_DIR,
-        });
-        for name in names {
-            let (ino, kind) = self.lookup_component_from(OVERLAY_ROOT_INO, name.as_str())?;
-            let dtype = match kind {
-                FsNodeKind::Directory => DT_DIR,
-                FsNodeKind::RegularFile => DT_REG,
-                FsNodeKind::Symlink => DT_LNK,
-                FsNodeKind::Fifo => DT_FIFO,
-                _ => 0,
-            };
-            entries.push(RawDirEntry { ino, name, dtype });
-        }
-        write_dir_entries(&entries, offset, buf)
-    }
-
-    fn list_root_names(&mut self) -> Vec<String> {
-        let mut names = BTreeSet::new();
-        for root in [self.upper, self.lower] {
-            if let Some(layer_names) = with_mount(root.mount_id, BackendOp::Readdir, |mount| {
-                mount.list_root_names()
-            }) {
-                names.extend(layer_names);
-            }
-        }
-        names.into_iter().collect()
     }
 }

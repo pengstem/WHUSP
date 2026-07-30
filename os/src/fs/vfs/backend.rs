@@ -221,12 +221,7 @@ pub(crate) struct FileSystemStat {
     pub(crate) flags: u64,
 }
 
-pub(crate) trait LegacyFileSystemBackend: Send {
-    #[cfg(feature = "perf-counters")]
-    fn io_snapshot(&self) -> BackendIoSnapshot {
-        BackendIoSnapshot::default()
-    }
-
+pub(crate) trait LegacyLookupOps: Send {
     fn root_ino(&self) -> u32 {
         2
     }
@@ -235,6 +230,31 @@ pub(crate) trait LegacyFileSystemBackend: Send {
         None
     }
 
+    fn lookup_component_from(
+        &mut self,
+        parent_ino: u32,
+        component: &str,
+    ) -> FsResult<(u32, FsNodeKind)>;
+    fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize>;
+    fn prepare_readlink_plan(
+        &mut self,
+        _ino: u32,
+        _len: usize,
+    ) -> Option<Box<dyn BackendReadPlan>> {
+        None
+    }
+    fn prepare_directory_read_plan(
+        &mut self,
+        _ino: u32,
+        _offset: u64,
+    ) -> Option<Box<dyn BackendDirectoryReadPlan>> {
+        None
+    }
+    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)>;
+    fn list_root_names(&mut self) -> Vec<String>;
+}
+
+pub(crate) trait LegacyMetadataOps: Send {
     fn statfs(&mut self) -> FileSystemStat {
         FileSystemStat {
             magic: 0,
@@ -249,11 +269,92 @@ pub(crate) trait LegacyFileSystemBackend: Send {
         }
     }
 
-    fn lookup_component_from(
+    fn set_times(
         &mut self,
-        parent_ino: u32,
-        component: &str,
-    ) -> FsResult<(u32, FsNodeKind)>;
+        _ino: u32,
+        _atime: Option<FileTimestamp>,
+        _mtime: Option<FileTimestamp>,
+        _ctime: FileTimestamp,
+    ) -> FsResult {
+        Err(FsError::Unsupported)
+    }
+    fn set_mode(&mut self, _ino: u32, _mode: u32) -> FsResult {
+        Err(FsError::Unsupported)
+    }
+    fn set_owner(&mut self, _ino: u32, _uid: Option<u32>, _gid: Option<u32>) -> FsResult {
+        Err(FsError::Unsupported)
+    }
+    fn inode_flags(&mut self, _ino: u32) -> FsResult<u32> {
+        Err(FsError::Unsupported)
+    }
+    fn set_inode_flags(&mut self, _ino: u32, _flags: u32) -> FsResult {
+        Err(FsError::Unsupported)
+    }
+    fn assign_cgroup_pid(&mut self, _dir_ino: u32, _pid: usize) -> FsResult {
+        Err(FsError::InvalidInput)
+    }
+    fn stat(&mut self, ino: u32) -> FsResult<FileStat>;
+    fn stat_basic(&mut self, ino: u32) -> FsResult<FileStat> {
+        self.stat(ino)
+    }
+}
+
+pub(crate) trait LegacyDataOps: LegacyMetadataOps {
+    #[cfg(feature = "perf-counters")]
+    fn io_snapshot(&self) -> BackendIoSnapshot {
+        BackendIoSnapshot::default()
+    }
+
+    fn check_write_at(&mut self, _ino: u32, _offset: u64, _len: usize) -> FsResult {
+        Ok(())
+    }
+    fn check_set_len(&mut self, _ino: u32, _len: u64) -> FsResult {
+        Ok(())
+    }
+    fn set_len(&mut self, ino: u32, len: u64) -> FsResult;
+    fn allocate_range(&mut self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
+        let end = offset.checked_add(len).ok_or(FsError::InvalidInput)?;
+        if !keep_size {
+            let stat = self.stat(ino)?;
+            if end > stat.size {
+                self.set_len(ino, end)?;
+            }
+        }
+        Ok(())
+    }
+    fn zero_range(&mut self, _ino: u32, _offset: u64, _len: u64, _keep_size: bool) -> FsResult {
+        Err(FsError::Unsupported)
+    }
+    fn punch_hole(&mut self, _ino: u32, _offset: u64, _len: u64) -> FsResult {
+        Err(FsError::Unsupported)
+    }
+    fn supports_read_snapshot(&mut self, _ino: u32) -> bool {
+        false
+    }
+    fn read_snapshot(&mut self, _ino: u32) -> Option<FsResult<Vec<u8>>> {
+        None
+    }
+    fn prepare_read_plan(
+        &mut self,
+        _ino: u32,
+        _offset: u64,
+        _len: usize,
+    ) -> Option<Box<dyn BackendReadPlan>> {
+        None
+    }
+    fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize;
+    fn prepare_write_plan(
+        &mut self,
+        _ino: u32,
+        _offset: u64,
+        _len: usize,
+    ) -> Option<Box<dyn BackendWritePlan>> {
+        None
+    }
+    fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize;
+}
+
+pub(crate) trait LegacyNamespaceOps: Send {
     fn create_file(&mut self, parent_ino: u32, leaf_name: &str) -> FsResult<u32>;
     fn create_node(
         &mut self,
@@ -282,29 +383,9 @@ pub(crate) trait LegacyFileSystemBackend: Send {
     ) -> FsResult {
         Err(FsError::Unsupported)
     }
-    fn check_write_at(&mut self, _ino: u32, _offset: u64, _len: usize) -> FsResult {
-        Ok(())
-    }
-    fn check_set_len(&mut self, _ino: u32, _len: u64) -> FsResult {
-        Ok(())
-    }
-    fn set_len(&mut self, ino: u32, len: u64) -> FsResult;
-    fn allocate_range(&mut self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
-        let end = offset.checked_add(len).ok_or(FsError::InvalidInput)?;
-        if !keep_size {
-            let stat = self.stat(ino)?;
-            if end > stat.size {
-                self.set_len(ino, end)?;
-            }
-        }
-        Ok(())
-    }
-    fn zero_range(&mut self, _ino: u32, _offset: u64, _len: u64, _keep_size: bool) -> FsResult {
-        Err(FsError::Unsupported)
-    }
-    fn punch_hole(&mut self, _ino: u32, _offset: u64, _len: u64) -> FsResult {
-        Err(FsError::Unsupported)
-    }
+}
+
+pub(crate) trait LegacySyncOps: LegacyLookupOps {
     fn sync(&mut self, _ino: u32, _data_only: bool) -> FsResult {
         Ok(())
     }
@@ -312,81 +393,36 @@ pub(crate) trait LegacyFileSystemBackend: Send {
         let root_ino = self.root_ino();
         self.sync(root_ino, false)
     }
-    fn set_times(
-        &mut self,
-        _ino: u32,
-        _atime: Option<FileTimestamp>,
-        _mtime: Option<FileTimestamp>,
-        _ctime: FileTimestamp,
-    ) -> FsResult {
-        Err(FsError::Unsupported)
-    }
-    fn set_mode(&mut self, _ino: u32, _mode: u32) -> FsResult {
-        Err(FsError::Unsupported)
-    }
-    fn set_owner(&mut self, _ino: u32, _uid: Option<u32>, _gid: Option<u32>) -> FsResult {
-        Err(FsError::Unsupported)
-    }
-    fn inode_flags(&mut self, _ino: u32) -> FsResult<u32> {
-        Err(FsError::Unsupported)
-    }
-    fn set_inode_flags(&mut self, _ino: u32, _flags: u32) -> FsResult {
-        Err(FsError::Unsupported)
-    }
+}
+
+pub(crate) trait LegacyInodeLifecycleOps: LegacyMetadataOps {
     fn retain_inode(&mut self, ino: u32) -> FsResult {
         self.stat(ino).map(|_| ())
     }
     fn release_inode(&mut self, _ino: u32) -> FsResult<InodeRelease> {
         Ok(InodeRelease::Retained)
     }
-    fn assign_cgroup_pid(&mut self, _dir_ino: u32, _pid: usize) -> FsResult {
-        Err(FsError::InvalidInput)
-    }
-    fn stat(&mut self, ino: u32) -> FsResult<FileStat>;
-    fn stat_basic(&mut self, ino: u32) -> FsResult<FileStat> {
-        self.stat(ino)
-    }
-    fn readlink(&mut self, ino: u32, buf: &mut [u8]) -> FsResult<usize>;
-    fn prepare_readlink_plan(
-        &mut self,
-        _ino: u32,
-        _len: usize,
-    ) -> Option<Box<dyn BackendReadPlan>> {
-        None
-    }
-    fn supports_read_snapshot(&mut self, _ino: u32) -> bool {
-        false
-    }
-    fn read_snapshot(&mut self, _ino: u32) -> Option<FsResult<Vec<u8>>> {
-        None
-    }
-    fn prepare_read_plan(
-        &mut self,
-        _ino: u32,
-        _offset: u64,
-        _len: usize,
-    ) -> Option<Box<dyn BackendReadPlan>> {
-        None
-    }
-    fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize;
-    fn prepare_write_plan(
-        &mut self,
-        _ino: u32,
-        _offset: u64,
-        _len: usize,
-    ) -> Option<Box<dyn BackendWritePlan>> {
-        None
-    }
-    fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize;
-    fn prepare_directory_read_plan(
-        &mut self,
-        _ino: u32,
-        _offset: u64,
-    ) -> Option<Box<dyn BackendDirectoryReadPlan>> {
-        None
-    }
-    fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)>;
-    fn list_root_names(&mut self) -> Vec<String>;
+}
+
+pub(crate) trait LegacyFileSystemBackend:
+    LegacyLookupOps
+    + LegacyMetadataOps
+    + LegacyDataOps
+    + LegacyNamespaceOps
+    + LegacySyncOps
+    + LegacyInodeLifecycleOps
+{
+}
+
+impl<T> LegacyFileSystemBackend for T where
+    T: LegacyLookupOps
+        + LegacyMetadataOps
+        + LegacyDataOps
+        + LegacyNamespaceOps
+        + LegacySyncOps
+        + LegacyInodeLifecycleOps
+        + ?Sized
+{
 }
 
 #[allow(dead_code)]

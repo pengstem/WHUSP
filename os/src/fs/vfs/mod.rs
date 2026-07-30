@@ -9,8 +9,9 @@ pub(crate) use backend::BackendIoSnapshot;
 pub(crate) use backend::{
     BackendDirectoryEntry, BackendDirectoryReadPlan, BackendDirectorySnapshot, BackendOp,
     BackendReadPlan, BackendWritePlan, DataOps, FileSystemBackend, FileSystemStat, FsNodeKind,
-    InodeLifecycleOps, InodeRelease, LegacyFileSystemBackend, LookupOps, MetadataOps, NamespaceOps,
-    SerializedBackend, SyncOps,
+    InodeLifecycleOps, InodeRelease, LegacyDataOps, LegacyFileSystemBackend,
+    LegacyInodeLifecycleOps, LegacyLookupOps, LegacyMetadataOps, LegacyNamespaceOps, LegacySyncOps,
+    LookupOps, MetadataOps, NamespaceOps, SerializedBackend, SyncOps,
 };
 pub(crate) use error::{FsError, FsResult};
 #[cfg(feature = "perf-counters")]
