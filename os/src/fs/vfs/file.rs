@@ -80,22 +80,9 @@ static TMPFILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 static DIRTY_REGULAR_FILE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 lazy_static! {
-    // CONTEXT: These counters approximate Linux's open-writer vs executable
-    // exclusion for ETXTBSY without adding per-inode objects to every backend.
-    // They are keyed by VfsNodeId, so callers must update them only at VfsFile
-    // open/drop and exec image lifetime boundaries.
-    static ref WRITABLE_REGULAR_OPEN_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =
-        SleepMutex::new(BTreeMap::new());
-    static ref WRITABLE_SHARED_MMAP_REGULAR_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =
-        SleepMutex::new(BTreeMap::new());
-    static ref EXECUTABLE_REGULAR_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =
-        SleepMutex::new(BTreeMap::new());
     static ref DIRTY_REGULAR_FILES: SleepMutex<BTreeMap<VfsNodeId, DirtyFileCache>> =
         SleepMutex::new(BTreeMap::new());
-    static ref SMALL_REGULAR_READ_FILES: SmallRegularReadCaches =
-        SmallRegularReadCaches::new();
-    static ref INODE_FLAGS_CACHE: SleepMutex<BTreeMap<VfsNodeId, u32>> =
-        SleepMutex::new(BTreeMap::new());
+    static ref SMALL_REGULAR_READ_FILES: SmallRegularReadCaches = SmallRegularReadCaches::new();
 }
 
 #[cfg(feature = "perf-counters")]
@@ -1095,23 +1082,14 @@ fn track_writable_regular_open(node: VfsNodeId, kind: FsNodeKind, writable: bool
     if kind != FsNodeKind::RegularFile || !writable {
         return;
     }
-    let mut counts = WRITABLE_REGULAR_OPEN_COUNTS.lock();
-    *counts.entry(node).or_insert(0) += 1;
+    inode_state::track_writable_open(node);
 }
 
 fn untrack_writable_regular_open(node: VfsNodeId, kind: FsNodeKind, writable: bool) {
     if kind != FsNodeKind::RegularFile || !writable {
         return;
     }
-    let mut counts = WRITABLE_REGULAR_OPEN_COUNTS.lock();
-    let Some(count) = counts.get_mut(&node) else {
-        return;
-    };
-    if *count > 1 {
-        *count -= 1;
-    } else {
-        counts.remove(&node);
-    }
+    inode_state::untrack_writable_open(node);
 }
 
 fn track_writable_shared_regular_mmap(node: VfsNodeId, kind: FsNodeKind) {
@@ -1119,23 +1097,14 @@ fn track_writable_shared_regular_mmap(node: VfsNodeId, kind: FsNodeKind) {
         return;
     }
     invalidate_small_regular_read_cache(node, kind);
-    let mut counts = WRITABLE_SHARED_MMAP_REGULAR_COUNTS.lock();
-    *counts.entry(node).or_insert(0) += 1;
+    inode_state::track_writable_shared_mmap(node);
 }
 
 fn untrack_writable_shared_regular_mmap(node: VfsNodeId, kind: FsNodeKind) {
     if kind != FsNodeKind::RegularFile {
         return;
     }
-    let mut counts = WRITABLE_SHARED_MMAP_REGULAR_COUNTS.lock();
-    let Some(count) = counts.get_mut(&node) else {
-        return;
-    };
-    if *count > 1 {
-        *count -= 1;
-    } else {
-        counts.remove(&node);
-    }
+    inode_state::untrack_writable_shared_mmap(node);
 }
 
 fn ensure_mount_writable(mount_id: MountId) -> FsResult {
@@ -1200,15 +1169,15 @@ fn invalidate_small_regular_read_cache(node: VfsNodeId, kind: FsNodeKind) {
 }
 
 fn cached_inode_flags(node: VfsNodeId) -> Option<u32> {
-    INODE_FLAGS_CACHE.lock().get(&node).copied()
+    inode_state::cached_inode_flags(node)
 }
 
 fn update_inode_flags_cache(node: VfsNodeId, flags: u32) {
-    INODE_FLAGS_CACHE.lock().insert(node, flags);
+    inode_state::update_inode_flags_cache(node, flags);
 }
 
 fn invalidate_inode_flags_cache(node: VfsNodeId) {
-    INODE_FLAGS_CACHE.lock().remove(&node);
+    inode_state::invalidate_inode_flags_cache(node);
 }
 
 pub(crate) fn begin_regular_file_page_cache_mutation(
@@ -1257,54 +1226,27 @@ pub(crate) fn regular_file_is_open_writable_in(context: PathContext, name: &str)
 }
 
 pub(crate) fn regular_file_node_is_open_writable(node: VfsNodeId) -> bool {
-    WRITABLE_REGULAR_OPEN_COUNTS
-        .lock()
-        .get(&node)
-        .copied()
-        .unwrap_or(0)
-        > 0
+    inode_state::is_open_writable(node)
 }
 
 fn regular_file_node_has_writable_shared_mmap(node: VfsNodeId) -> bool {
-    WRITABLE_SHARED_MMAP_REGULAR_COUNTS
-        .lock()
-        .get(&node)
-        .copied()
-        .unwrap_or(0)
-        > 0
+    inode_state::has_writable_shared_mmap(node)
 }
 
 pub(crate) fn mount_has_writable_regular_open(mount_id: MountId) -> bool {
-    WRITABLE_REGULAR_OPEN_COUNTS
-        .lock()
-        .keys()
-        .any(|node| node.mount_id == mount_id)
+    inode_state::mount_has_writable_open(mount_id)
 }
 
 pub(crate) fn track_regular_file_executable(node: VfsNodeId) {
-    let mut counts = EXECUTABLE_REGULAR_COUNTS.lock();
-    *counts.entry(node).or_insert(0) += 1;
+    inode_state::track_executable(node);
 }
 
 pub(crate) fn untrack_regular_file_executable(node: VfsNodeId) {
-    let mut counts = EXECUTABLE_REGULAR_COUNTS.lock();
-    let Some(count) = counts.get_mut(&node) else {
-        return;
-    };
-    if *count > 1 {
-        *count -= 1;
-    } else {
-        counts.remove(&node);
-    }
+    inode_state::untrack_executable(node);
 }
 
 pub(crate) fn regular_file_node_is_executable(node: VfsNodeId) -> bool {
-    EXECUTABLE_REGULAR_COUNTS
-        .lock()
-        .get(&node)
-        .copied()
-        .unwrap_or(0)
-        > 0
+    inode_state::is_executable(node)
 }
 
 #[derive(Clone, Debug)]

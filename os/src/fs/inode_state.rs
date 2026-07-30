@@ -1,6 +1,8 @@
 use super::{FileStat, MountNamespaceId, WorkingDir, vfs::VfsNodeId};
 use crate::config::MAX_CPUS;
-use crate::sync::{SleepRwLock, SleepRwLockReadGuard, SleepRwLockWriteGuard, SpinRwLock};
+use crate::sync::{
+    SleepMutex, SleepRwLock, SleepRwLockReadGuard, SleepRwLockWriteGuard, SpinRwLock,
+};
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -88,6 +90,93 @@ lazy_static! {
         (0..INODE_STATE_SHARDS)
             .map(|_| DirectStatMetadataEpoch::new())
             .collect();
+    // These indexes may outlive a particular InodeState Arc: executable image
+    // tracking, in particular, is not a backend-inode retain. Keep their
+    // VfsNodeId lifetime semantics while making this module their sole owner.
+    static ref WRITABLE_REGULAR_OPEN_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =
+        SleepMutex::new(BTreeMap::new());
+    static ref WRITABLE_SHARED_MMAP_REGULAR_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =
+        SleepMutex::new(BTreeMap::new());
+    static ref EXECUTABLE_REGULAR_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =
+        SleepMutex::new(BTreeMap::new());
+    static ref INODE_FLAGS_CACHE: SleepMutex<BTreeMap<VfsNodeId, u32>> =
+        SleepMutex::new(BTreeMap::new());
+}
+
+fn increment_count(counts: &SleepMutex<BTreeMap<VfsNodeId, usize>>, node: VfsNodeId) {
+    let mut counts = counts.lock();
+    *counts.entry(node).or_insert(0) += 1;
+}
+
+fn decrement_count(counts: &SleepMutex<BTreeMap<VfsNodeId, usize>>, node: VfsNodeId) {
+    let mut counts = counts.lock();
+    let Some(count) = counts.get_mut(&node) else {
+        return;
+    };
+    if *count > 1 {
+        *count -= 1;
+    } else {
+        counts.remove(&node);
+    }
+}
+
+fn has_count(counts: &SleepMutex<BTreeMap<VfsNodeId, usize>>, node: VfsNodeId) -> bool {
+    counts.lock().get(&node).copied().unwrap_or(0) > 0
+}
+
+pub(crate) fn track_writable_open(node: VfsNodeId) {
+    increment_count(&WRITABLE_REGULAR_OPEN_COUNTS, node);
+}
+
+pub(crate) fn untrack_writable_open(node: VfsNodeId) {
+    decrement_count(&WRITABLE_REGULAR_OPEN_COUNTS, node);
+}
+
+pub(crate) fn is_open_writable(node: VfsNodeId) -> bool {
+    has_count(&WRITABLE_REGULAR_OPEN_COUNTS, node)
+}
+
+pub(crate) fn mount_has_writable_open(mount_id: super::MountId) -> bool {
+    WRITABLE_REGULAR_OPEN_COUNTS
+        .lock()
+        .keys()
+        .any(|node| node.mount_id == mount_id)
+}
+
+pub(crate) fn track_writable_shared_mmap(node: VfsNodeId) {
+    increment_count(&WRITABLE_SHARED_MMAP_REGULAR_COUNTS, node);
+}
+
+pub(crate) fn untrack_writable_shared_mmap(node: VfsNodeId) {
+    decrement_count(&WRITABLE_SHARED_MMAP_REGULAR_COUNTS, node);
+}
+
+pub(crate) fn has_writable_shared_mmap(node: VfsNodeId) -> bool {
+    has_count(&WRITABLE_SHARED_MMAP_REGULAR_COUNTS, node)
+}
+
+pub(crate) fn track_executable(node: VfsNodeId) {
+    increment_count(&EXECUTABLE_REGULAR_COUNTS, node);
+}
+
+pub(crate) fn untrack_executable(node: VfsNodeId) {
+    decrement_count(&EXECUTABLE_REGULAR_COUNTS, node);
+}
+
+pub(crate) fn is_executable(node: VfsNodeId) -> bool {
+    has_count(&EXECUTABLE_REGULAR_COUNTS, node)
+}
+
+pub(crate) fn cached_inode_flags(node: VfsNodeId) -> Option<u32> {
+    INODE_FLAGS_CACHE.lock().get(&node).copied()
+}
+
+pub(crate) fn update_inode_flags_cache(node: VfsNodeId, flags: u32) {
+    INODE_FLAGS_CACHE.lock().insert(node, flags);
+}
+
+pub(crate) fn invalidate_inode_flags_cache(node: VfsNodeId) {
+    INODE_FLAGS_CACHE.lock().remove(&node);
 }
 
 fn direct_stat_slot(parent: WorkingDir, name: &str) -> usize {
