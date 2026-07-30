@@ -389,11 +389,131 @@ pub(crate) trait LegacyFileSystemBackend: Send {
     fn list_root_names(&mut self) -> Vec<String>;
 }
 
+#[allow(dead_code)]
+pub(crate) trait LookupOps: Send + Sync {
+    fn root_ino(&self) -> u32;
+    fn overlay_real_node(&self, ino: u32) -> Option<VfsNodeId>;
+    fn lookup_component_from(
+        &self,
+        parent_ino: u32,
+        component: &str,
+    ) -> FsResult<(u32, FsNodeKind)>;
+    fn readlink(&self, ino: u32, buf: &mut [u8]) -> FsResult<usize>;
+    fn prepare_readlink_plan(&self, ino: u32, len: usize) -> Option<Box<dyn BackendReadPlan>>;
+    fn prepare_directory_read_plan(
+        &self,
+        ino: u32,
+        offset: u64,
+    ) -> Option<Box<dyn BackendDirectoryReadPlan>>;
+    fn read_dirent64(&self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)>;
+    fn list_root_names(&self) -> Vec<String>;
+}
+
+#[allow(dead_code)]
+pub(crate) trait MetadataOps: Send + Sync {
+    fn statfs(&self) -> FileSystemStat;
+    fn set_times(
+        &self,
+        ino: u32,
+        atime: Option<FileTimestamp>,
+        mtime: Option<FileTimestamp>,
+        ctime: FileTimestamp,
+    ) -> FsResult;
+    fn set_mode(&self, ino: u32, mode: u32) -> FsResult;
+    fn set_owner(&self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult;
+    fn inode_flags(&self, ino: u32) -> FsResult<u32>;
+    fn set_inode_flags(&self, ino: u32, flags: u32) -> FsResult;
+    fn assign_cgroup_pid(&self, dir_ino: u32, pid: usize) -> FsResult;
+    fn stat(&self, ino: u32) -> FsResult<FileStat>;
+    fn stat_basic(&self, ino: u32) -> FsResult<FileStat>;
+}
+
+#[allow(dead_code)]
+pub(crate) trait DataOps: Send + Sync {
+    fn check_write_at(&self, ino: u32, offset: u64, len: usize) -> FsResult;
+    fn check_set_len(&self, ino: u32, len: u64) -> FsResult;
+    fn set_len(&self, ino: u32, len: u64) -> FsResult;
+    fn allocate_range(&self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult;
+    fn zero_range(&self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult;
+    fn punch_hole(&self, ino: u32, offset: u64, len: u64) -> FsResult;
+    fn supports_read_snapshot(&self, ino: u32) -> bool;
+    fn read_snapshot(&self, ino: u32) -> Option<FsResult<Vec<u8>>>;
+    fn prepare_read_plan(
+        &self,
+        ino: u32,
+        offset: u64,
+        len: usize,
+    ) -> Option<Box<dyn BackendReadPlan>>;
+    fn read_at(&self, ino: u32, buf: &mut [u8], offset: u64) -> usize;
+    fn prepare_write_plan(
+        &self,
+        ino: u32,
+        offset: u64,
+        len: usize,
+    ) -> Option<Box<dyn BackendWritePlan>>;
+    fn write_at(&self, ino: u32, buf: &[u8], offset: u64) -> usize;
+}
+
+#[allow(dead_code)]
+pub(crate) trait NamespaceOps: Send + Sync {
+    fn create_file(&self, parent_ino: u32, leaf_name: &str) -> FsResult<u32>;
+    fn create_node(
+        &self,
+        parent_ino: u32,
+        leaf_name: &str,
+        kind: FsNodeKind,
+        mode: u32,
+        rdev: u64,
+    ) -> FsResult<u32>;
+    fn create_node_with_owner(
+        &self,
+        parent_ino: u32,
+        leaf_name: &str,
+        kind: FsNodeKind,
+        mode: u32,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
+    ) -> FsResult<u32>;
+    fn create_dir(&self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32>;
+    fn link(&self, parent_ino: u32, leaf_name: &str, child_ino: u32) -> FsResult;
+    fn symlink(&self, parent_ino: u32, leaf_name: &str, target: &[u8]) -> FsResult;
+    fn unlink(&self, parent_ino: u32, leaf_name: &str) -> FsResult;
+    fn rename(&self, src_dir: u32, src_name: &str, dst_dir: u32, dst_name: &str) -> FsResult;
+    fn exchange(&self, src_dir: u32, src_name: &str, dst_dir: u32, dst_name: &str) -> FsResult;
+}
+
+#[allow(dead_code)]
+pub(crate) trait SyncOps: Send + Sync {
+    fn sync(&self, ino: u32, data_only: bool) -> FsResult;
+    fn shutdown(&self) -> FsResult;
+}
+
+#[allow(dead_code)]
+pub(crate) trait InodeLifecycleOps: Send + Sync {
+    fn retain_inode(&self, ino: u32) -> FsResult;
+    fn release_inode(&self, ino: u32) -> FsResult<InodeRelease>;
+    /// Best-effort drop-time release. `None` means that completing the release
+    /// would block and the caller must enqueue it for a later blocking drain.
+    fn try_release_inode(&self, ino: u32) -> Option<FsResult<InodeRelease>>;
+}
+
 /// Shared backend facade used by mounted filesystems.
 ///
 /// The logical API takes `&self`; implementations choose their own locking.
-/// `SerializedBackend` keeps every legacy backend fully serialized while the
-/// VFS migrates away from the compatibility execution bridge below.
+#[allow(dead_code)]
+pub(crate) trait FileSystemBackend:
+    LookupOps + MetadataOps + DataOps + NamespaceOps + SyncOps + InodeLifecycleOps
+{
+}
+
+impl<T> FileSystemBackend for T where
+    T: LookupOps + MetadataOps + DataOps + NamespaceOps + SyncOps + InodeLifecycleOps + ?Sized
+{
+}
+
+/// Temporary compatibility interface while implementations and mounted VFS
+/// consumers migrate to the capability traits above.
 #[allow(dead_code)]
 pub(crate) trait ConcurrentFileSystemBackend: Send + Sync {
     fn root_ino(&self) -> u32;
@@ -481,6 +601,232 @@ pub(crate) trait ConcurrentFileSystemBackend: Send + Sync {
     ) -> Option<Box<dyn BackendDirectoryReadPlan>>;
     fn read_dirent64(&self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)>;
     fn list_root_names(&self) -> Vec<String>;
+}
+
+impl<T: ConcurrentFileSystemBackend + ?Sized> LookupOps for T {
+    fn root_ino(&self) -> u32 {
+        ConcurrentFileSystemBackend::root_ino(self)
+    }
+
+    fn overlay_real_node(&self, ino: u32) -> Option<VfsNodeId> {
+        ConcurrentFileSystemBackend::overlay_real_node(self, ino)
+    }
+
+    fn lookup_component_from(
+        &self,
+        parent_ino: u32,
+        component: &str,
+    ) -> FsResult<(u32, FsNodeKind)> {
+        ConcurrentFileSystemBackend::lookup_component_from(self, parent_ino, component)
+    }
+
+    fn readlink(&self, ino: u32, buf: &mut [u8]) -> FsResult<usize> {
+        ConcurrentFileSystemBackend::readlink(self, ino, buf)
+    }
+
+    fn prepare_readlink_plan(&self, ino: u32, len: usize) -> Option<Box<dyn BackendReadPlan>> {
+        ConcurrentFileSystemBackend::prepare_readlink_plan(self, ino, len)
+    }
+
+    fn prepare_directory_read_plan(
+        &self,
+        ino: u32,
+        offset: u64,
+    ) -> Option<Box<dyn BackendDirectoryReadPlan>> {
+        ConcurrentFileSystemBackend::prepare_directory_read_plan(self, ino, offset)
+    }
+
+    fn read_dirent64(&self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
+        ConcurrentFileSystemBackend::read_dirent64(self, ino, offset, buf)
+    }
+
+    fn list_root_names(&self) -> Vec<String> {
+        ConcurrentFileSystemBackend::list_root_names(self)
+    }
+}
+
+impl<T: ConcurrentFileSystemBackend + ?Sized> MetadataOps for T {
+    fn statfs(&self) -> FileSystemStat {
+        ConcurrentFileSystemBackend::statfs(self)
+    }
+
+    fn set_times(
+        &self,
+        ino: u32,
+        atime: Option<FileTimestamp>,
+        mtime: Option<FileTimestamp>,
+        ctime: FileTimestamp,
+    ) -> FsResult {
+        ConcurrentFileSystemBackend::set_times(self, ino, atime, mtime, ctime)
+    }
+
+    fn set_mode(&self, ino: u32, mode: u32) -> FsResult {
+        ConcurrentFileSystemBackend::set_mode(self, ino, mode)
+    }
+
+    fn set_owner(&self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
+        ConcurrentFileSystemBackend::set_owner(self, ino, uid, gid)
+    }
+
+    fn inode_flags(&self, ino: u32) -> FsResult<u32> {
+        ConcurrentFileSystemBackend::inode_flags(self, ino)
+    }
+
+    fn set_inode_flags(&self, ino: u32, flags: u32) -> FsResult {
+        ConcurrentFileSystemBackend::set_inode_flags(self, ino, flags)
+    }
+
+    fn assign_cgroup_pid(&self, dir_ino: u32, pid: usize) -> FsResult {
+        ConcurrentFileSystemBackend::assign_cgroup_pid(self, dir_ino, pid)
+    }
+
+    fn stat(&self, ino: u32) -> FsResult<FileStat> {
+        ConcurrentFileSystemBackend::stat(self, ino)
+    }
+
+    fn stat_basic(&self, ino: u32) -> FsResult<FileStat> {
+        ConcurrentFileSystemBackend::stat_basic(self, ino)
+    }
+}
+
+impl<T: ConcurrentFileSystemBackend + ?Sized> DataOps for T {
+    fn check_write_at(&self, ino: u32, offset: u64, len: usize) -> FsResult {
+        ConcurrentFileSystemBackend::check_write_at(self, ino, offset, len)
+    }
+
+    fn check_set_len(&self, ino: u32, len: u64) -> FsResult {
+        ConcurrentFileSystemBackend::check_set_len(self, ino, len)
+    }
+
+    fn set_len(&self, ino: u32, len: u64) -> FsResult {
+        ConcurrentFileSystemBackend::set_len(self, ino, len)
+    }
+
+    fn allocate_range(&self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
+        ConcurrentFileSystemBackend::allocate_range(self, ino, offset, len, keep_size)
+    }
+
+    fn zero_range(&self, ino: u32, offset: u64, len: u64, keep_size: bool) -> FsResult {
+        ConcurrentFileSystemBackend::zero_range(self, ino, offset, len, keep_size)
+    }
+
+    fn punch_hole(&self, ino: u32, offset: u64, len: u64) -> FsResult {
+        ConcurrentFileSystemBackend::punch_hole(self, ino, offset, len)
+    }
+
+    fn supports_read_snapshot(&self, ino: u32) -> bool {
+        ConcurrentFileSystemBackend::supports_read_snapshot(self, ino)
+    }
+
+    fn read_snapshot(&self, ino: u32) -> Option<FsResult<Vec<u8>>> {
+        ConcurrentFileSystemBackend::read_snapshot(self, ino)
+    }
+
+    fn prepare_read_plan(
+        &self,
+        ino: u32,
+        offset: u64,
+        len: usize,
+    ) -> Option<Box<dyn BackendReadPlan>> {
+        ConcurrentFileSystemBackend::prepare_read_plan(self, ino, offset, len)
+    }
+
+    fn read_at(&self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
+        ConcurrentFileSystemBackend::read_at(self, ino, buf, offset)
+    }
+
+    fn prepare_write_plan(
+        &self,
+        ino: u32,
+        offset: u64,
+        len: usize,
+    ) -> Option<Box<dyn BackendWritePlan>> {
+        ConcurrentFileSystemBackend::prepare_write_plan(self, ino, offset, len)
+    }
+
+    fn write_at(&self, ino: u32, buf: &[u8], offset: u64) -> usize {
+        ConcurrentFileSystemBackend::write_at(self, ino, buf, offset)
+    }
+}
+
+impl<T: ConcurrentFileSystemBackend + ?Sized> NamespaceOps for T {
+    fn create_file(&self, parent_ino: u32, leaf_name: &str) -> FsResult<u32> {
+        ConcurrentFileSystemBackend::create_file(self, parent_ino, leaf_name)
+    }
+
+    fn create_node(
+        &self,
+        parent_ino: u32,
+        leaf_name: &str,
+        kind: FsNodeKind,
+        mode: u32,
+        rdev: u64,
+    ) -> FsResult<u32> {
+        ConcurrentFileSystemBackend::create_node(self, parent_ino, leaf_name, kind, mode, rdev)
+    }
+
+    fn create_node_with_owner(
+        &self,
+        parent_ino: u32,
+        leaf_name: &str,
+        kind: FsNodeKind,
+        mode: u32,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
+    ) -> FsResult<u32> {
+        ConcurrentFileSystemBackend::create_node_with_owner(
+            self, parent_ino, leaf_name, kind, mode, rdev, uid, gid,
+        )
+    }
+
+    fn create_dir(&self, parent_ino: u32, leaf_name: &str, mode: u32) -> FsResult<u32> {
+        ConcurrentFileSystemBackend::create_dir(self, parent_ino, leaf_name, mode)
+    }
+
+    fn link(&self, parent_ino: u32, leaf_name: &str, child_ino: u32) -> FsResult {
+        ConcurrentFileSystemBackend::link(self, parent_ino, leaf_name, child_ino)
+    }
+
+    fn symlink(&self, parent_ino: u32, leaf_name: &str, target: &[u8]) -> FsResult {
+        ConcurrentFileSystemBackend::symlink(self, parent_ino, leaf_name, target)
+    }
+
+    fn unlink(&self, parent_ino: u32, leaf_name: &str) -> FsResult {
+        ConcurrentFileSystemBackend::unlink(self, parent_ino, leaf_name)
+    }
+
+    fn rename(&self, src_dir: u32, src_name: &str, dst_dir: u32, dst_name: &str) -> FsResult {
+        ConcurrentFileSystemBackend::rename(self, src_dir, src_name, dst_dir, dst_name)
+    }
+
+    fn exchange(&self, src_dir: u32, src_name: &str, dst_dir: u32, dst_name: &str) -> FsResult {
+        ConcurrentFileSystemBackend::exchange(self, src_dir, src_name, dst_dir, dst_name)
+    }
+}
+
+impl<T: ConcurrentFileSystemBackend + ?Sized> SyncOps for T {
+    fn sync(&self, ino: u32, data_only: bool) -> FsResult {
+        ConcurrentFileSystemBackend::sync(self, ino, data_only)
+    }
+
+    fn shutdown(&self) -> FsResult {
+        ConcurrentFileSystemBackend::shutdown(self)
+    }
+}
+
+impl<T: ConcurrentFileSystemBackend + ?Sized> InodeLifecycleOps for T {
+    fn retain_inode(&self, ino: u32) -> FsResult {
+        ConcurrentFileSystemBackend::retain_inode(self, ino)
+    }
+
+    fn release_inode(&self, ino: u32) -> FsResult<InodeRelease> {
+        ConcurrentFileSystemBackend::release_inode(self, ino)
+    }
+
+    fn try_release_inode(&self, ino: u32) -> Option<FsResult<InodeRelease>> {
+        ConcurrentFileSystemBackend::try_release_inode(self, ino)
+    }
 }
 
 pub(crate) struct SerializedBackend {
