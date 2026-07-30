@@ -1,4 +1,5 @@
 mod anonfd;
+mod api;
 mod cgroupfs;
 mod console_tty;
 mod dentry_cache;
@@ -39,6 +40,7 @@ use core::{
 };
 
 pub(crate) use anonfd::make_anonymous_fd;
+pub use api::{PipeFileCapability, SocketFileCapability, TtyFileCapability};
 pub(crate) use cgroupfs::{memcg_pressure_active, reclaim_memcg_pressure_pages};
 pub(crate) use console_tty::console_tty_drain_uart;
 pub(crate) use console_tty::{
@@ -617,8 +619,14 @@ pub trait File: Send + Sync {
     fn socket_write_peer_closed(&self) -> bool {
         false
     }
-    fn is_tty(&self) -> bool {
-        false
+    fn as_socket(&self) -> Option<&dyn SocketFileCapability> {
+        None
+    }
+    fn as_pipe(&self) -> Option<&dyn PipeFileCapability> {
+        None
+    }
+    fn as_tty(&self) -> Option<&dyn TtyFileCapability> {
+        None
     }
     fn tty_id(&self) -> Option<TtyId> {
         None
@@ -647,9 +655,6 @@ pub trait File: Send + Sync {
     fn is_dev_random(&self) -> bool {
         false
     }
-    fn is_pipe(&self) -> bool {
-        false
-    }
     fn is_dev_full(&self) -> bool {
         false
     }
@@ -662,14 +667,11 @@ pub trait File: Send + Sync {
     fn is_memfd(&self) -> bool {
         false
     }
-    fn is_socket(&self) -> bool {
-        false
-    }
     fn supports_splice_read(&self) -> bool {
         if !self.readable() {
             return false;
         }
-        if self.is_pipe() || self.is_socket() {
+        if self.as_pipe().is_some() || self.as_socket().is_some() {
             return true;
         }
         match self.stat() {
@@ -681,7 +683,7 @@ pub trait File: Send + Sync {
         if !self.writable() {
             return false;
         }
-        if self.is_pipe() || self.is_socket() {
+        if self.as_pipe().is_some() || self.as_socket().is_some() {
             return true;
         }
         match self.stat() {

@@ -400,7 +400,7 @@ pub fn sys_quotactl(cmd: i32, special: *const u8, id: u32, addr: usize) -> KResu
 
 pub fn sys_quotactl_fd(fd: usize, cmd: i32, id: u32, addr: usize) -> KResult {
     let file = get_file_by_fd(fd).map_err(|_| Errno::EBADF)?;
-    if file.is_socket() {
+    if file.as_socket().is_some() {
         return Err(Errno::ENOSYS);
     }
     let cmd = parse_cmd(cmd)?;

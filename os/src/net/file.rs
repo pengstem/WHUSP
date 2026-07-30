@@ -1,4 +1,9 @@
 use super::*;
+use crate::fs::SocketFileCapability;
+
+impl SocketFileCapability for AfAlgSocket {}
+
+impl SocketFileCapability for LocalSocket {}
 
 impl File for AfAlgSocket {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -61,8 +66,8 @@ impl File for AfAlgSocket {
         *self.status_flags.exclusive_access() = flags;
     }
 
-    fn is_socket(&self) -> bool {
-        true
+    fn as_socket(&self) -> Option<&dyn SocketFileCapability> {
+        Some(self)
     }
 }
 
@@ -188,7 +193,7 @@ impl File for LocalSocket {
     fn set_status_flags(&self, flags: OpenFlags) {
         *self.status_flags.exclusive_access() = flags;
     }
-    fn is_socket(&self) -> bool {
-        true
+    fn as_socket(&self) -> Option<&dyn SocketFileCapability> {
+        Some(self)
     }
 }

@@ -43,6 +43,10 @@ const PTY_TABLE_SIZE: usize = 64;
 const PTY_INO_BASE: u32 = 0x1000;
 const INPUT_DEVICE_NAME: &str = "virtual-device-ltp";
 const INPUT_EVENT_QUEUE_CAPACITY: usize = 512;
+
+impl super::TtyFileCapability for DevFsFile {}
+
+impl super::TtyFileCapability for PtyFile {}
 const INPUT_MICE_QUEUE_CAPACITY: usize = 512;
 const INPUT_EVENT_SIZE: usize = core::mem::size_of::<LinuxInputEvent>();
 const UINPUT_MAX_NAME_SIZE: usize = 80;
@@ -2722,8 +2726,8 @@ impl File for DevFsFile {
         copy_dirents(entries, &mut offset, user_buf)
     }
 
-    fn is_tty(&self) -> bool {
-        self.node.is_tty()
+    fn as_tty(&self) -> Option<&dyn super::TtyFileCapability> {
+        self.node.is_tty().then_some(self)
     }
 
     fn tty_id(&self) -> Option<TtyId> {
@@ -3047,8 +3051,8 @@ impl File for PtyFile {
         )
     }
 
-    fn is_tty(&self) -> bool {
-        true
+    fn as_tty(&self) -> Option<&dyn super::TtyFileCapability> {
+        Some(self)
     }
 
     fn tty_id(&self) -> Option<TtyId> {

@@ -1268,7 +1268,8 @@ fn read_for_splice(entry: &FdTableEntry, offset: Option<i64>, buf: &mut [u8]) ->
     if let Some(offset) = offset {
         Ok(file.read_at(offset as usize, buf))
     } else {
-        if file.is_socket() && !file.poll(PollEvents::POLLIN).contains(PollEvents::POLLIN) {
+        if file.as_socket().is_some() && !file.poll(PollEvents::POLLIN).contains(PollEvents::POLLIN)
+        {
             return Err(Errno::EINVAL);
         }
         ensure_nonblocking_ready(entry, PollEvents::POLLIN)?;
@@ -1326,8 +1327,8 @@ pub fn sys_splice(
         return Err(Errno::EINVAL);
     }
 
-    let in_is_pipe = in_file.is_pipe();
-    let out_is_pipe = out_file.is_pipe();
+    let in_is_pipe = in_file.as_pipe().is_some();
+    let out_is_pipe = out_file.as_pipe().is_some();
     if !in_is_pipe && !out_is_pipe {
         return Err(Errno::EINVAL);
     }
@@ -1367,7 +1368,7 @@ pub fn sys_splice(
         if let Some(offset) = out_offset.as_mut() {
             *offset += written as i64;
         }
-        if read < want && (in_is_pipe || in_file.is_socket()) {
+        if read < want && (in_is_pipe || in_file.as_socket().is_some()) {
             break;
         }
         if written < read {
@@ -1413,7 +1414,7 @@ pub fn sys_tee(fd_in: usize, fd_out: usize, len: usize, flags: u32) -> KResult {
     let out_entry = get_fd_entry_by_fd(fd_out)?;
     let in_file = in_entry.file();
     let out_file = out_entry.file();
-    if !in_file.is_pipe() || !out_file.is_pipe() {
+    if in_file.as_pipe().is_none() || out_file.as_pipe().is_none() {
         return Err(Errno::EINVAL);
     }
     if !in_file.readable() || !out_file.writable() {
@@ -1565,7 +1566,7 @@ pub fn sys_vmsplice_ctx(
 
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
-    if !file.is_pipe() {
+    if file.as_pipe().is_none() {
         return Err(Errno::EBADF);
     }
     if iovecs.total_len == 0 {
