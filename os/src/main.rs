@@ -20,6 +20,7 @@ mod fs;
 mod lang_items;
 mod logging;
 mod mm;
+mod net;
 mod perf;
 mod shutdown;
 mod sync;

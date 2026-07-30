@@ -5,11 +5,11 @@
 //! `127.0.0.1` inside one guest.  Packets never leave the kernel and virtio-net
 //! is not involved.
 
-use super::inode::create_node_in;
-use super::{
-    File, FileStat, FsError, FsNodeKind, OpenFlags, PollEvents, PollWaitQueue, PollWaiter, S_IFIFO,
-};
 use crate::config::PAGE_SIZE;
+use crate::fs::{
+    File, FileStat, FsError, FsNodeKind, OpenFlags, PollEvents, PollWaitQueue, PollWaiter, S_IFIFO,
+    create_node_in,
+};
 use crate::mm::UserBuffer;
 use crate::perf;
 use crate::sync::UPIntrFreeCell;

@@ -17,7 +17,6 @@ mod overlayfs;
 mod path;
 mod pipe;
 mod procfs;
-pub(crate) mod socket;
 mod staticfs;
 mod status_flags;
 mod stdio;

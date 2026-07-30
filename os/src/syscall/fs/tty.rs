@@ -1134,14 +1134,14 @@ fn handle_socket_if_ioctl(request: usize, argp: usize) -> KResult {
         SIOCGIFINDEX => {
             let mut req = read_user_value(token, argp as *const LinuxIfReq)?;
             let index =
-                crate::fs::socket::netdev_if_index(ifreq_name(&req)).ok_or(Errno::ENODEV)?;
+                crate::net::socket::netdev_if_index(ifreq_name(&req)).ok_or(Errno::ENODEV)?;
             set_ifreq_i32(&mut req, index);
             write_user_value(token, argp as *mut LinuxIfReq, &req)?;
             Ok(0)
         }
         SIOCGIFNAME => {
             let mut req = read_user_value(token, argp as *const LinuxIfReq)?;
-            let name = crate::fs::socket::netdev_if_name(ifreq_i32(&req)).ok_or(Errno::ENXIO)?;
+            let name = crate::net::socket::netdev_if_name(ifreq_i32(&req)).ok_or(Errno::ENXIO)?;
             let name = name.as_bytes();
             req.ifr_name = [0; IFNAMSIZ];
             let copied = name.len().min(IFNAMSIZ.saturating_sub(1));
@@ -1152,14 +1152,14 @@ fn handle_socket_if_ioctl(request: usize, argp: usize) -> KResult {
         SIOCGIFFLAGS => {
             let mut req = read_user_value(token, argp as *const LinuxIfReq)?;
             let flags =
-                crate::fs::socket::netdev_if_flags(ifreq_name(&req)).ok_or(Errno::ENODEV)?;
+                crate::net::socket::netdev_if_flags(ifreq_name(&req)).ok_or(Errno::ENODEV)?;
             set_ifreq_i16(&mut req, flags);
             write_user_value(token, argp as *mut LinuxIfReq, &req)?;
             Ok(0)
         }
         SIOCGIFCONF => {
             let mut conf = read_user_value(token, argp as *const LinuxIfConf)?;
-            let ifaces = crate::fs::socket::netdev_ifconf();
+            let ifaces = crate::net::socket::netdev_ifconf();
             let total_len = ifaces.len() * IFREQ_SIZE;
             if conf.ifc_buf != 0 && conf.ifc_len > 0 {
                 let mut bytes = Vec::new();
