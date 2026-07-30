@@ -1,4 +1,4 @@
-use super::super::install_pidfd_for_fanotify;
+use super::super::process::install_pidfd_for_fanotify;
 use super::super::user_ptr::{PATH_MAX, read_user_c_string};
 use super::fd::{get_file_by_fd, install_file_fd};
 use super::file_handle::{
