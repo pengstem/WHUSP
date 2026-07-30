@@ -1,17 +1,20 @@
 #![allow(dead_code)]
 
+mod load_gate;
+
 use super::{FrameTracker, PhysPageNum};
 use crate::config::PAGE_SIZE;
 use crate::fs::MountId;
 use crate::perf;
-use crate::sync::{SpinRwLock, SpinRwLockReadGuard, SpinRwLockWriteGuard, UPIntrFreeCell};
-use crate::task::{TaskControlBlock, block_current_task_no_schedule, schedule, wakeup_task};
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use crate::sync::{SpinRwLock, SpinRwLockReadGuard, SpinRwLockWriteGuard};
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use lazy_static::*;
+
+pub(crate) use load_gate::PageCacheLoadGate;
 
 // CONTEXT: This is a bounded transition toward watermark-driven reclaim. The
 // smallest default run configuration has 12 GiB, so retaining 512 MiB of
@@ -172,54 +175,6 @@ pub(crate) struct PageCache {
     // mapped. Avoid rescanning the same pinned LRU on every subsequent fault;
     // the first unpin clears this bit and retries reclaim.
     reclaim_stalled: bool,
-}
-
-pub(crate) struct PageCacheLoadGate {
-    inner: UPIntrFreeCell<PageCacheLoadGateInner>,
-}
-
-struct PageCacheLoadGateInner {
-    complete: bool,
-    waiters: VecDeque<Arc<TaskControlBlock>>,
-}
-
-impl PageCacheLoadGate {
-    pub(crate) fn new() -> Self {
-        Self {
-            inner: unsafe {
-                UPIntrFreeCell::new(PageCacheLoadGateInner {
-                    complete: false,
-                    waiters: VecDeque::new(),
-                })
-            },
-        }
-    }
-
-    /// Waits for the owner without a completion-before-enqueue lost wake.
-    pub(crate) fn wait(&self) {
-        let mut inner = self.inner.exclusive_access();
-        if inner.complete {
-            return;
-        }
-        let (task, task_cx_ptr) = block_current_task_no_schedule();
-        inner.waiters.push_back(task);
-        drop(inner);
-        schedule(task_cx_ptr);
-    }
-
-    /// Publishes completion and wakes every task that joined this load.
-    pub(crate) fn complete(&self) {
-        let waiters = self.inner.exclusive_session(|inner| {
-            if inner.complete {
-                return VecDeque::new();
-            }
-            inner.complete = true;
-            core::mem::take(&mut inner.waiters)
-        });
-        for task in waiters {
-            wakeup_task(task);
-        }
-    }
 }
 
 pub(crate) enum ReadCacheLoadReservation {
