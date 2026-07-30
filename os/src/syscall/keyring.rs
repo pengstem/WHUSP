@@ -702,7 +702,7 @@ fn create_unlinked_keyring(description: String, owner_uid: u32) -> KResult<i32> 
 
 fn ensure_thread_keyring(create: bool) -> KResult<i32> {
     let task = current_task().ok_or(Errno::ESRCH)?;
-    if let Some(serial) = task.inner_exclusive_access().thread_keyring {
+    if let Some(serial) = task.inner_exclusive_access().security.thread_keyring {
         return Ok(serial);
     }
     if !create {
@@ -710,7 +710,7 @@ fn ensure_thread_keyring(create: bool) -> KResult<i32> {
     }
     let serial =
         create_unlinked_keyring(format!("_tid.{}", task.linux_tid()), current_owner_uid())?;
-    task.inner_exclusive_access().thread_keyring = Some(serial);
+    task.inner_exclusive_access().security.thread_keyring = Some(serial);
     Ok(serial)
 }
 
@@ -781,7 +781,7 @@ fn resolve_key_id(id: i32, create_special: bool) -> KResult<i32> {
 
 fn resolve_default_reqkey_destination() -> KResult<Option<i32>> {
     if let Some(task) = current_task()
-        && let Some(serial) = task.inner_exclusive_access().thread_keyring
+        && let Some(serial) = task.inner_exclusive_access().security.thread_keyring
     {
         return Ok(Some(serial));
     }
@@ -824,7 +824,7 @@ fn resolve_reqkey_destination(dest_keyring_id: i32) -> KResult<Option<i32>> {
 fn optional_current_keyrings() -> Vec<i32> {
     let mut keyrings = Vec::new();
     if let Some(task) = current_task()
-        && let Some(serial) = task.inner_exclusive_access().thread_keyring
+        && let Some(serial) = task.inner_exclusive_access().security.thread_keyring
     {
         keyrings.push(serial);
     }

@@ -236,7 +236,7 @@ fn terminate_sibling_threads(
             if let Some(clear_child_tid) = task_inner.clear_child_tid.take() {
                 clear_child_tids.push(clear_child_tid);
             }
-            if let Some(keyring) = task_inner.thread_keyring.take() {
+            if let Some(keyring) = task_inner.security.thread_keyring.take() {
                 released_thread_keyrings.push(keyring);
             }
             robust_tasks.push(Arc::clone(&task));
@@ -337,7 +337,7 @@ fn rebind_non_leader_for_exec(
             if let Some(clear_child_tid) = task_inner.clear_child_tid.take() {
                 clear_child_tids.push(clear_child_tid);
             }
-            if let Some(keyring) = task_inner.thread_keyring.take() {
+            if let Some(keyring) = task_inner.security.thread_keyring.take() {
                 released_thread_keyrings.push(keyring);
             }
             robust_tasks.push(Arc::clone(&task));
@@ -858,7 +858,7 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             task_inner.tid,
             linux_tid,
             task_inner.clear_child_tid.take(),
-            task_inner.thread_keyring.take(),
+            task_inner.security.thread_keyring.take(),
         )
     };
     unregister_task_linux_tid(linux_tid);

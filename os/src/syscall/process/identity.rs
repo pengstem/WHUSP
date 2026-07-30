@@ -325,8 +325,8 @@ fn set_seccomp_strict_ctx(ctx: &SyscallContext) -> KResult {
     // UNFINISHED: This implements Linux strict seccomp, but does not model
     // ptrace/audit interactions.
     let mut inner = ctx.task().inner_exclusive_access();
-    inner.seccomp_mode = SECCOMP_MODE_STRICT as u8;
-    inner.seccomp_filter = None;
+    inner.security.seccomp_mode = SECCOMP_MODE_STRICT as u8;
+    inner.security.seccomp_filter = None;
     Ok(0)
 }
 
@@ -348,8 +348,8 @@ fn set_seccomp_filter_ctx(ctx: &SyscallContext, filter_ptr: usize) -> KResult {
     // UNFINISHED: This supports the classic BPF instruction subset used by
     // LTP prctl04: LD syscall nr, JEQ, and RET KILL/ALLOW.
     let mut inner = ctx.task().inner_exclusive_access();
-    inner.seccomp_mode = SECCOMP_MODE_FILTER as u8;
-    inner.seccomp_filter = Some(filter);
+    inner.security.seccomp_mode = SECCOMP_MODE_FILTER as u8;
+    inner.security.seccomp_filter = Some(filter);
     Ok(0)
 }
 
@@ -425,7 +425,7 @@ pub fn sys_prctl_ctx(
             write_prctl_name_ctx(ctx, arg2, &name)?;
             Ok(0)
         }
-        PR_GET_SECCOMP => Ok(ctx.task().inner_exclusive_access().seccomp_mode as isize),
+        PR_GET_SECCOMP => Ok(ctx.task().inner_exclusive_access().security.seccomp_mode as isize),
         PR_SET_SECCOMP => match arg2 {
             SECCOMP_MODE_STRICT => set_seccomp_strict_ctx(ctx),
             SECCOMP_MODE_FILTER => set_seccomp_filter_ctx(ctx, arg3),

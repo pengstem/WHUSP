@@ -109,8 +109,8 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     let parent_sched_vruntime = parent_inner.sched_vruntime;
     let parent_allowed_cpus = parent_inner.allowed_cpus;
     let parent_timer_slack_ns = parent_inner.timer_slack_ns;
-    let parent_seccomp_mode = parent_inner.seccomp_mode;
-    let parent_seccomp_filter = parent_inner.seccomp_filter.clone();
+    let parent_seccomp_mode = parent_inner.security.seccomp_mode;
+    let parent_seccomp_filter = parent_inner.security.seccomp_filter.clone();
     drop(parent_inner);
     // CONTEXT: pthread_create() supplies a userspace child stack to clone().
     // In that case the kernel still needs a per-thread TrapContext, but must
@@ -150,8 +150,8 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     new_task_inner.allowed_cpus = parent_allowed_cpus;
     new_task_inner.timer_slack_ns = parent_timer_slack_ns;
     new_task_inner.default_timer_slack_ns = parent_timer_slack_ns;
-    new_task_inner.seccomp_mode = parent_seccomp_mode;
-    new_task_inner.seccomp_filter = parent_seccomp_filter;
+    new_task_inner.security.seccomp_mode = parent_seccomp_mode;
+    new_task_inner.security.seccomp_filter = parent_seccomp_filter;
     let new_trap_cx = new_task_inner.get_trap_cx();
     *new_trap_cx = parent_trap_cx;
     new_trap_cx.set_a0(0);

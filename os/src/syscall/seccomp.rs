@@ -36,7 +36,7 @@ pub(super) fn signal_for_syscall(
     const SECCOMP_MODE_STRICT: u8 = 1;
     const SECCOMP_MODE_FILTER: u8 = 2;
     let inner = task.inner_exclusive_access();
-    match inner.seccomp_mode {
+    match inner.security.seccomp_mode {
         SECCOMP_MODE_STRICT => (!matches!(
             syscall_id,
             SYSCALL_READ | SYSCALL_WRITE | SYSCALL_EXIT | SYSCALL_RT_SIGRETURN
@@ -44,6 +44,7 @@ pub(super) fn signal_for_syscall(
         .then_some(SignalFlags::SIGKILL),
         SECCOMP_MODE_FILTER => {
             if inner
+                .security
                 .seccomp_filter
                 .as_deref()
                 .is_some_and(|filter| filter_allows(filter, syscall_id))
