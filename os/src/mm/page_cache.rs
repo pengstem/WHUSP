@@ -1,11 +1,13 @@
 #![allow(dead_code)]
 
 mod load_gate;
+#[cfg(feature = "perf-counters")]
+pub(crate) mod perf;
 
 use super::{FrameTracker, PhysPageNum};
 use crate::config::PAGE_SIZE;
 use crate::fs::MountId;
-use crate::perf;
+use crate::perf as kernel_perf;
 use crate::sync::{SpinRwLock, SpinRwLockReadGuard, SpinRwLockWriteGuard};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
@@ -389,7 +391,7 @@ impl PageCache {
         if !first_mutation {
             return (0, 0);
         }
-        perf::record_page_cache_generation_epoch_begin();
+        kernel_perf::record_page_cache_generation_epoch_begin();
 
         // The generation is intentionally unstable while the first mutation
         // is active. Drop only unpinned clean pages; pinned old versions keep
@@ -435,7 +437,7 @@ impl PageCache {
             }
         };
         if finished_epoch {
-            perf::record_page_cache_generation_epoch_finish();
+            kernel_perf::record_page_cache_generation_epoch_finish();
         }
     }
 
@@ -675,7 +677,7 @@ impl PageCache {
         let target_len = PAGE_CACHE_SOFT_MAX_PAGES.saturating_sub(1);
         let evicted = self.trim_clean_unpinned_to_global_len(target_len);
         if PAGE_CACHE.len() >= PAGE_CACHE_SOFT_MAX_PAGES {
-            perf::record_page_cache_capacity_reject();
+            kernel_perf::record_page_cache_capacity_reject();
             return (evicted, false);
         }
 
