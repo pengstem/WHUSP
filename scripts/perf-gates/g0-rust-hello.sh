@@ -379,7 +379,12 @@ if [ "$WORKLOAD" = multicrate ]; then
     RUSTC_MAX_ACTIVE=$($BB sort -n "$RUSTC_ACTIVE_SAMPLES" | $BB tail -n 1) \
         || fail validate rustc_max_parse_failed "$?"
     is_uint "$RUSTC_MAX_ACTIVE" || fail validate rustc_max_not_uint
-    [ "$RUSTC_MAX_ACTIVE" -ge 2 ] || fail validate rustc_not_parallel
+    MIN_RUSTC_ACTIVE=1
+    if [ "$SMP" -ge 2 ]; then
+        MIN_RUSTC_ACTIVE=2
+    fi
+    [ "$RUSTC_MAX_ACTIVE" -ge "$MIN_RUSTC_ACTIVE" ] \
+        || fail validate rustc_not_parallel
     [ "$RUSTC_MAX_ACTIVE" -le "$BUILD_JOBS" ] || fail validate rustc_exceeds_jobs
     RUSTC_ACTIVE_REMAINDER=$($BB find "$RUSTC_ACTIVE_DIR" -type f | $BB wc -l) \
         || fail validate rustc_active_scan_failed "$?"

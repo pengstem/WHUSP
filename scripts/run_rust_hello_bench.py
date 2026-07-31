@@ -2094,6 +2094,28 @@ def self_test() -> int:
         raise BenchmarkError(
             f"positive multicrate synthetic log failed: {multicrate_errors}"
         )
+    multicrate_1c_identity = {**multicrate_identity, "smp": "1"}
+    multicrate_1c_good = synthetic_log(
+        multicrate_1c_identity, architecture, 1, "8G"
+    )
+    multicrate_1c_parsed, multicrate_1c_errors = validate_guest_log(
+        multicrate_1c_good,
+        identity=multicrate_1c_identity,
+        architecture=architecture,
+        smp=1,
+        mem="8G",
+    )
+    if (
+        multicrate_1c_errors
+        or multicrate_1c_parsed.get("workload_shape", {}).get(
+            "rustc_max_active"
+        )
+        != 1
+    ):
+        raise BenchmarkError(
+            "positive 1C multicrate synthetic log failed: "
+            f"{multicrate_1c_errors}"
+        )
     pass_line = next(
         line for line in good.splitlines() if line.startswith("G0_RUST_HELLO_PASS ")
     )
