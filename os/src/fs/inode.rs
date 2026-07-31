@@ -165,6 +165,29 @@ fn ensure_create_target_absent(
     Ok(())
 }
 
+pub(crate) fn ensure_backend_create_target_absent(
+    parent: VfsNodeId,
+    leaf_name: &str,
+    trailing_slash: bool,
+) -> FsResult {
+    let lookup = with_mount(parent.mount_id, BackendOp::Lookup, |mount| {
+        mount.lookup_component_from(parent.ino, leaf_name)
+    })
+    .ok_or(FsError::Io)?;
+    match lookup {
+        Ok((_, kind)) => {
+            if trailing_slash && kind != FsNodeKind::Directory {
+                Err(FsError::NotDir)
+            } else {
+                Err(FsError::AlreadyExists)
+            }
+        }
+        Err(FsError::NotFound) if trailing_slash => Err(FsError::NotFound),
+        Err(FsError::NotFound) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 // UNFINISHED: MAX_DEPTH is a defensive bound, not strict Linux semantics;
 // extremely deep but legitimate directory trees would be misreported as ELOOP.
 fn is_descendant_or_self(mut node: VfsNodeId, ancestor: VfsNodeId) -> FsResult<bool> {
@@ -214,6 +237,7 @@ pub(crate) fn mkdir_in(context: PathContext, name: &str, mode: u32) -> FsResult 
     let target = resolve_create_parent_in(context.clone(), trimmed_nonroot_path(name))?;
     ensure_create_target_absent(&context, &target, false)?;
     inode_state::with_directory_mutation(target.parent, || {
+        ensure_backend_create_target_absent(target.parent, target.leaf_name, false)?;
         let ino = with_mount(
             target.parent.mount_id,
             BackendOp::NamespaceMutation,
@@ -246,6 +270,7 @@ pub(crate) fn create_node_in(
     ensure_create_target_absent(&context, &target, trailing_slash)?;
     let supports_page_cache = mount_supports_page_cache(target.parent.mount_id);
     inode_state::with_directory_mutation(target.parent, || {
+        ensure_backend_create_target_absent(target.parent, target.leaf_name, trailing_slash)?;
         let ino = with_mount(
             target.parent.mount_id,
             BackendOp::NamespaceMutation,
@@ -310,6 +335,11 @@ pub(crate) fn link_file_in(
     }
     ensure_create_target_absent(&new_context, &new_target, new_has_trailing_slash)?;
     inode_state::with_directory_mutation(new_target.parent, || {
+        ensure_backend_create_target_absent(
+            new_target.parent,
+            new_target.leaf_name,
+            new_has_trailing_slash,
+        )?;
         with_mount(
             new_target.parent.mount_id,
             BackendOp::NamespaceMutation,
@@ -344,6 +374,11 @@ pub(crate) fn link_node_in(
     }
     ensure_create_target_absent(&new_context, &new_target, new_has_trailing_slash)?;
     inode_state::with_directory_mutation(new_target.parent, || {
+        ensure_backend_create_target_absent(
+            new_target.parent,
+            new_target.leaf_name,
+            new_has_trailing_slash,
+        )?;
         with_mount(
             new_target.parent.mount_id,
             BackendOp::NamespaceMutation,
@@ -367,6 +402,11 @@ pub(crate) fn symlink_in(context: PathContext, target: &str, link_name: &str) ->
     let create_target = resolve_create_parent_in(context.clone(), trimmed_nonroot_path(link_name))?;
     ensure_create_target_absent(&context, &create_target, link_has_trailing_slash)?;
     inode_state::with_directory_mutation(create_target.parent, || {
+        ensure_backend_create_target_absent(
+            create_target.parent,
+            create_target.leaf_name,
+            link_has_trailing_slash,
+        )?;
         let ino = with_mount(
             create_target.parent.mount_id,
             BackendOp::NamespaceMutation,

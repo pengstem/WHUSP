@@ -23,6 +23,8 @@ CASES = (
     "concurrent_final_close",
     "fast_inode_reuse",
     "cross_directory_rename",
+    "random_stream_uniqueness",
+    "exclusive_create",
     "lookup_stat_vs_namespace_mutation",
     "read_vs_mapping_mutation",
     "partial_read_plan",

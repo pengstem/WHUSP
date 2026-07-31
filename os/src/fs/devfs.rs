@@ -20,6 +20,7 @@ use super::{
 use crate::drivers::chardev::UART;
 use crate::mm::UserBuffer;
 use crate::perf;
+use crate::random::CompatibilityRandom;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{
     TaskControlBlock, block_current_task_no_schedule,
@@ -1730,72 +1731,15 @@ fn read_zero(mut user_buf: UserBuffer) -> usize {
     len
 }
 
-const RANDOM_RAMP_WORD_COUNT: usize = 32;
-const RANDOM_RAMP_WORDS: [u64; RANDOM_RAMP_WORD_COUNT] = random_ramp_words();
-
-const fn random_ramp_byte(index: usize) -> u8 {
-    (index as u8).wrapping_mul(37).wrapping_add(0xa5)
-}
-
-const fn random_ramp_word(word_index: usize) -> u64 {
-    let mut word = 0u64;
-    let mut byte = 0usize;
-    while byte < 8 {
-        word |= (random_ramp_byte(word_index * 8 + byte) as u64) << (byte * 8);
-        byte += 1;
-    }
-    word
-}
-
-const fn random_ramp_words() -> [u64; RANDOM_RAMP_WORD_COUNT] {
-    let mut words = [0u64; RANDOM_RAMP_WORD_COUNT];
-    let mut index = 0usize;
-    while index < RANDOM_RAMP_WORD_COUNT {
-        words[index] = random_ramp_word(index);
-        index += 1;
-    }
-    words
-}
-
-fn fill_random_ramp_buffer(buffer: &mut [u8], index: &mut usize) -> (usize, usize) {
-    let mut offset = 0usize;
-    let mut byte_writes = 0usize;
-    let mut word_fill_bytes = 0usize;
-
-    while offset < buffer.len() && (*index & 7) != 0 {
-        buffer[offset] = random_ramp_byte(*index);
-        *index += 1;
-        offset += 1;
-        byte_writes += 1;
-    }
-
-    let word_end = offset + ((buffer.len() - offset) / 8) * 8;
-    while offset < word_end {
-        let word = RANDOM_RAMP_WORDS[(*index & 0xff) >> 3];
-        buffer[offset..offset + 8].copy_from_slice(&word.to_ne_bytes());
-        *index += 8;
-        offset += 8;
-        word_fill_bytes += 8;
-    }
-
-    while offset < buffer.len() {
-        buffer[offset] = random_ramp_byte(*index);
-        *index += 1;
-        offset += 1;
-        byte_writes += 1;
-    }
-
-    (byte_writes, word_fill_bytes)
-}
-
 fn read_random(mut user_buf: UserBuffer) -> usize {
     let len = user_buf.len();
-    let mut index = 0usize;
+    let process = current_process();
+    let context = ((process.getpid() as u64) << 32) ^ len as u64;
+    let mut random = CompatibilityRandom::new(context);
     let mut byte_writes = 0usize;
     let mut word_fill_bytes = 0usize;
     for buffer in user_buf.buffers.iter_mut() {
-        let (buffer_byte_writes, buffer_word_fill_bytes) =
-            fill_random_ramp_buffer(buffer, &mut index);
+        let (buffer_byte_writes, buffer_word_fill_bytes) = random.fill(buffer);
         byte_writes += buffer_byte_writes;
         word_fill_bytes += buffer_word_fill_bytes;
     }

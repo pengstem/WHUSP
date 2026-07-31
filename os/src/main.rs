@@ -22,6 +22,7 @@ mod logging;
 mod mm;
 mod net;
 mod perf;
+mod random;
 mod shutdown;
 mod sync;
 mod syscall;

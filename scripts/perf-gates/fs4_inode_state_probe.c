@@ -40,6 +40,9 @@ enum {
     INODE_METADATA_ITERATIONS = 1024,
     CREATE_WORKERS = 8,
     CREATE_ITERATIONS = 32,
+    RANDOM_STREAM_WORKERS = 16,
+    RANDOM_STREAM_BYTES = 32,
+    EXCLUSIVE_CREATE_WORKERS = 8,
 };
 
 struct probe_linux_dirent64 {
@@ -52,6 +55,28 @@ struct probe_linux_dirent64 {
 
 static int write_exact(int fd, const void *buffer, size_t length);
 static int wait_success(pid_t pid);
+
+struct random_stream_sample {
+    unsigned char getrandom_bytes[RANDOM_STREAM_BYTES];
+    unsigned char urandom_bytes[RANDOM_STREAM_BYTES];
+};
+
+static int read_exact(int fd, void *buffer, size_t length)
+{
+    unsigned char *bytes = buffer;
+    size_t offset = 0;
+    while (offset < length) {
+        ssize_t amount = read(fd, bytes + offset, length - offset);
+        if (amount < 0 && errno == EINTR) {
+            continue;
+        }
+        if (amount <= 0) {
+            return -1;
+        }
+        offset += (size_t)amount;
+    }
+    return 0;
+}
 
 static uint64_t monotonic_ns(void)
 {
@@ -117,6 +142,159 @@ static int phase_lookup_stat_vs_namespace_mutation(const char *base)
     }
     if (writer < 0 || reader < 0 || wait_success(writer) != 0 || wait_success(reader) != 0
         || unlink(stable) != 0 || rmdir(dir) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int phase_random_stream_uniqueness(const char *base)
+{
+    int start[2];
+    if (pipe(start) != 0) {
+        return -1;
+    }
+    pid_t children[RANDOM_STREAM_WORKERS];
+    for (int i = 0; i < RANDOM_STREAM_WORKERS; ++i) {
+        children[i] = fork();
+        if (children[i] < 0) {
+            return -1;
+        }
+        if (children[i] == 0) {
+            close(start[1]);
+            char token;
+            if (read(start[0], &token, 1) != 1) {
+                _exit(80);
+            }
+            struct random_stream_sample sample;
+            if (syscall(SYS_getrandom, sample.getrandom_bytes,
+                        sizeof(sample.getrandom_bytes), 0)
+                    != (ssize_t)sizeof(sample.getrandom_bytes)) {
+                _exit(81);
+            }
+            int fd = open("/dev/urandom", O_RDONLY);
+            if (fd < 0
+                || read_exact(fd, sample.urandom_bytes, sizeof(sample.urandom_bytes)) != 0
+                || close(fd) != 0) {
+                _exit(82);
+            }
+            char path[512];
+            snprintf(path, sizeof(path), "%s/random-stream-%d", base, i);
+            fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+            if (fd < 0 || write_exact(fd, &sample, sizeof(sample)) != 0 || close(fd) != 0) {
+                _exit(83);
+            }
+            _exit(0);
+        }
+    }
+    close(start[0]);
+    for (int i = 0; i < RANDOM_STREAM_WORKERS; ++i) {
+        if (write_exact(start[1], "x", 1) != 0) {
+            return -1;
+        }
+    }
+    close(start[1]);
+    struct random_stream_sample samples[RANDOM_STREAM_WORKERS];
+    for (int i = 0; i < RANDOM_STREAM_WORKERS; ++i) {
+        int status = -1;
+        if (waitpid(children[i], &status, 0) != children[i] || !WIFEXITED(status)
+            || WEXITSTATUS(status) != 0) {
+            printf("FS4_RANDOM_STREAM_FAIL stage=child worker=%d status=%d\n", i, status);
+            return -1;
+        }
+        char path[512];
+        snprintf(path, sizeof(path), "%s/random-stream-%d", base, i);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0 || read_exact(fd, &samples[i], sizeof(samples[i])) != 0
+            || close(fd) != 0 || unlink(path) != 0) {
+            printf("FS4_RANDOM_STREAM_FAIL stage=read-result worker=%d errno=%d\n", i, errno);
+            return -1;
+        }
+        uint64_t getrandom_first;
+        uint64_t urandom_first;
+        memcpy(&getrandom_first, samples[i].getrandom_bytes, sizeof(getrandom_first));
+        memcpy(&urandom_first, samples[i].urandom_bytes, sizeof(urandom_first));
+        printf("FS4_RANDOM_STREAM_CELL worker=%d getrandom_first=%016" PRIx64
+               " urandom_first=%016" PRIx64 "\n",
+               i, getrandom_first, urandom_first);
+        if (memcmp(samples[i].getrandom_bytes, samples[i].urandom_bytes,
+                   RANDOM_STREAM_BYTES) == 0) {
+            printf("FS4_RANDOM_STREAM_FAIL stage=duplicate left=%d right=%d\n", i, i);
+            return -1;
+        }
+        for (int j = 0; j < i; ++j) {
+            if (memcmp(samples[i].getrandom_bytes, samples[j].getrandom_bytes,
+                       RANDOM_STREAM_BYTES) == 0
+                || memcmp(samples[i].urandom_bytes, samples[j].urandom_bytes,
+                          RANDOM_STREAM_BYTES) == 0
+                || memcmp(samples[i].getrandom_bytes, samples[j].urandom_bytes,
+                          RANDOM_STREAM_BYTES) == 0
+                || memcmp(samples[i].urandom_bytes, samples[j].getrandom_bytes,
+                          RANDOM_STREAM_BYTES) == 0) {
+                printf("FS4_RANDOM_STREAM_FAIL stage=duplicate left=%d right=%d\n", i, j);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int phase_exclusive_create(const char *base)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/exclusive-create", base);
+    int start[2];
+    if (pipe(start) != 0) {
+        return -1;
+    }
+    pid_t children[EXCLUSIVE_CREATE_WORKERS];
+    for (int i = 0; i < EXCLUSIVE_CREATE_WORKERS; ++i) {
+        children[i] = fork();
+        if (children[i] < 0) {
+            return -1;
+        }
+        if (children[i] == 0) {
+            close(start[1]);
+            char token;
+            if (read(start[0], &token, 1) != 1) {
+                _exit(83);
+            }
+            int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+            char result = 'X';
+            if (fd >= 0) {
+                result = close(fd) == 0 ? 'W' : 'X';
+            } else if (errno == EEXIST) {
+                result = 'E';
+            }
+            _exit(result == 'W' ? 10 : result == 'E' ? 11 : 85);
+        }
+    }
+    close(start[0]);
+    for (int i = 0; i < EXCLUSIVE_CREATE_WORKERS; ++i) {
+        if (write_exact(start[1], "x", 1) != 0) {
+            return -1;
+        }
+    }
+    close(start[1]);
+    int winners = 0;
+    int existing = 0;
+    for (int i = 0; i < EXCLUSIVE_CREATE_WORKERS; ++i) {
+        int status = -1;
+        if (waitpid(children[i], &status, 0) != children[i] || !WIFEXITED(status)) {
+            return -1;
+        }
+        int code = WEXITSTATUS(status);
+        if (code != 10 && code != 11) {
+            printf("FS4_EXCLUSIVE_CREATE_FAIL worker=%d status=%d code=%d\n", i, status, code);
+            return -1;
+        }
+        printf("FS4_EXCLUSIVE_CREATE_CELL worker=%d result=%s\n",
+               i, code == 10 ? "winner" : "exists");
+        winners += code == 10;
+        existing += code == 11;
+    }
+    if (winners != 1 || existing != EXCLUSIVE_CREATE_WORKERS - 1 || unlink(path) != 0) {
+        printf("FS4_EXCLUSIVE_CREATE_FAIL winners=%d existing=%d errno=%d\n",
+               winners, existing, errno);
         return -1;
     }
     return 0;
@@ -1311,6 +1489,8 @@ int main(int argc, char **argv)
     RUN_CASE(concurrent_final_close);
     RUN_CASE(fast_inode_reuse);
     RUN_CASE(cross_directory_rename);
+    RUN_CASE(random_stream_uniqueness);
+    RUN_CASE(exclusive_create);
     RUN_CASE(lookup_stat_vs_namespace_mutation);
     RUN_CASE(read_vs_mapping_mutation);
     RUN_CASE(partial_read_plan);
@@ -1325,6 +1505,6 @@ int main(int argc, char **argv)
     RUN_CASE(readdir_vs_namespace_mutation);
     RUN_CASE(shutdown_drain_stress);
 #undef RUN_CASE
-    puts("FS4_INODE_STATE_PROBE_PASS cases=17");
+    puts("FS4_INODE_STATE_PROBE_PASS cases=19");
     return 0;
 }

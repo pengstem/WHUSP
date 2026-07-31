@@ -1,7 +1,7 @@
 use super::super::dentry_cache;
 use super::super::devfs;
 use super::super::dirent::{DT_DIR, RawDirEntry, write_dir_entries_with_offset_base};
-use super::super::inode::{OpenFlags, link_node_in};
+use super::super::inode::{OpenFlags, ensure_backend_create_target_absent, link_node_in};
 #[cfg(feature = "perf-counters")]
 use super::super::inode_state::dirty_regular_file_count;
 use super::super::inode_state::{
@@ -75,6 +75,7 @@ const VFS_DIRTY_PRESSURE_MAX_PAGES: usize = 256;
 const MODE_PERMISSIONS_MASK: u32 = 0o7777;
 const MODE_SETGID: u32 = 0o2000;
 const TMPFILE_CREATE_ATTEMPTS: usize = 64;
+const OPEN_CREATE_RACE_ATTEMPTS: usize = 16;
 const SEEK_SCAN_MIN_BLOCK_SIZE: usize = 1;
 // Synthetic mountpoint entries live in a high offset range so they cannot
 // collide with real backend dirent offsets returned by the filesystem.
@@ -2268,7 +2269,7 @@ fn parent_hint_for_open(context: &PathContext, name: &str) -> Option<VfsNodeId> 
         .map(|target| target.parent)
 }
 
-fn open_vfs_file_impl(
+fn open_vfs_file_once(
     context: PathContext,
     name: &str,
     flags: OpenFlags,
@@ -2350,6 +2351,7 @@ fn open_vfs_file_impl(
                 )
             });
             let ino = inode_state::with_directory_mutation(target.parent, || {
+                ensure_backend_create_target_absent(target.parent, target.leaf_name, false)?;
                 let ino = with_mount(
                     target.parent.mount_id,
                     BackendOp::NamespaceMutation,
@@ -2399,6 +2401,27 @@ fn open_vfs_file_impl(
     )?))
 }
 
+fn open_vfs_file_impl(
+    context: PathContext,
+    name: &str,
+    flags: OpenFlags,
+    create_attrs: Option<FileCreateAttrs>,
+) -> FsResult<Arc<VfsFile>> {
+    for _ in 0..OPEN_CREATE_RACE_ATTEMPTS {
+        match open_vfs_file_once(context.clone(), name, flags, create_attrs.clone()) {
+            Err(FsError::AlreadyExists)
+                if flags.contains(OpenFlags::CREATE) && !flags.contains(OpenFlags::EXCL) =>
+            {
+                continue;
+            }
+            result => return result,
+        }
+    }
+    // UNFINISHED: Linux does not expose this bounded internal retry. Under
+    // adversarial create/unlink churn we return EEXIST instead of livelocking.
+    Err(FsError::AlreadyExists)
+}
+
 fn create_tmpfile_inode(
     namespace_id: MountNamespaceId,
     directory: VfsPath,
@@ -2434,6 +2457,7 @@ fn create_tmpfile_inode(
             let seq = TMPFILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let leaf_name = format!(".whusp-tmpfile-{seq:x}");
             let result = inode_state::with_directory_mutation(directory.node, || {
+                ensure_backend_create_target_absent(directory.node, leaf_name.as_str(), false)?;
                 let ino = with_mount(
                     directory.node.mount_id,
                     BackendOp::NamespaceMutation,

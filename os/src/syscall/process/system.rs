@@ -1,3 +1,4 @@
+use crate::random::CompatibilityRandom;
 use crate::shutdown::shutdown;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::SyscallContext;
@@ -10,7 +11,7 @@ use crate::syscall::user_ptr::{
 use crate::task::{
     CAP_SYS_ADMIN, CAP_SYS_TTY_CONFIG, current_process, current_user_token, processes_snapshot,
 };
-use crate::timer::{get_time_clock_ticks, get_time_us};
+use crate::timer::get_time_us;
 use crate::uapi::errno::{Errno, KResult};
 use alloc::format;
 use alloc::string::String;
@@ -389,25 +390,16 @@ pub fn sys_getrandom_ctx(ctx: &SyscallContext, buf: *mut u8, len: usize, flags: 
         return Err(Errno::EINVAL);
     }
 
-    // CONTEXT: The contest kernel has no cryptographic entropy pool yet. Use a
-    // deterministic per-call generator, matching the existing /dev/urandom
-    // compatibility role well enough for libc seeding and getentropy-style
-    // small reads.
-    let mut state = (get_time_clock_ticks() as u64)
-        ^ ((ctx.process().getpid() as u64) << 32)
+    let context = ((ctx.process().getpid() as u64) << 32)
         ^ (buf as usize as u64)
         ^ (len as u64)
         ^ (flags as u64);
+    let mut random = CompatibilityRandom::new(context);
     let mut offset = 0usize;
     while offset < len {
         let chunk_len = (len - offset).min(GETRANDOM_CHUNK);
         let mut chunk = [0u8; GETRANDOM_CHUNK];
-        for byte in &mut chunk[..chunk_len] {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(0x9e37_79b9_7f4a_7c15);
-            *byte = (state >> 32) as u8;
-        }
+        random.fill(&mut chunk[..chunk_len]);
         copy_to_user_ctx(ctx, buf.wrapping_add(offset), &chunk[..chunk_len])?;
         offset += chunk_len;
     }
