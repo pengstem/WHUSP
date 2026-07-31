@@ -233,13 +233,11 @@ __trap_vector_base:
     csrrd   $sp, KSAVE_CTX
     SAVE_REGS
     SAVE_FP_REGS
-    ld.d    $t0, $sp, 34*8
-    # csrwr writes the old CSR value back to its source register.
-    move    $t1, $t0
-    csrwr   $t0, LA_CSR_PGDL
-    csrwr   $t1, LA_CSR_PGDH
-    dbar    0
-    invtlb  0x00, $r0, $r0
+    # __restore leaves PGDL on the user root and PGDH on the kernel root.
+    # Kernel code, stacks, and the direct map all use high addresses, so the
+    # existing PGDH already covers trap execution. Preserve PGDL and its TLB
+    # entries across syscalls and timer interrupts; return-time generation
+    # checks still flush after a PTE edit or an address-space switch.
     ld.d    $t1, $sp, 36*8
     ld.d    $sp, $sp, 35*8
     jirl    $zero, $t1, 0

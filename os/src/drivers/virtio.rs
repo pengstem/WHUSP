@@ -47,7 +47,7 @@ unsafe impl Hal for VirtioHal {
             .min()
             .expect("virtio DMA allocation returned no frames");
         let pa: PhysAddr = ppn_base.into();
-        let ptr = NonNull::new({ pa.0 } as *mut u8).unwrap();
+        let ptr = NonNull::new(crate::arch::mm::phys_to_virt(pa.0) as *mut u8).unwrap();
         QUEUE_FRAMES.exclusive_access().append(&mut trackers);
         (pa.0 as VirtioPhysAddr, ptr)
     }
@@ -69,7 +69,7 @@ unsafe impl Hal for VirtioHal {
     }
 
     unsafe fn mmio_phys_to_virt(paddr: VirtioPhysAddr, _size: usize) -> NonNull<u8> {
-        NonNull::new({ paddr as usize } as *mut u8).unwrap()
+        NonNull::new(crate::arch::mm::phys_to_virt(paddr as usize) as *mut u8).unwrap()
     }
 
     unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> VirtioPhysAddr {
@@ -89,7 +89,9 @@ unsafe impl Hal for VirtioHal {
             .min()
             .expect("virtio bounce allocation returned no frames");
         let pa: PhysAddr = ppn_base.into();
-        let bounce = unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut u8, len) };
+        let bounce = unsafe {
+            core::slice::from_raw_parts_mut(crate::arch::mm::phys_to_virt(pa.0) as *mut u8, len)
+        };
         let mut buffer = buffer;
         let original = unsafe { buffer.as_mut() };
         if matches!(
@@ -114,7 +116,12 @@ unsafe impl Hal for VirtioHal {
             direction,
             BufferDirection::DeviceToDriver | BufferDirection::Both
         ) {
-            let bounce = unsafe { core::slice::from_raw_parts(paddr as *const u8, len) };
+            let bounce = unsafe {
+                core::slice::from_raw_parts(
+                    crate::arch::mm::phys_to_virt(paddr as usize) as *const u8,
+                    len,
+                )
+            };
             let mut buffer = buffer;
             let original = unsafe { buffer.as_mut() };
             original.copy_from_slice(bounce);
