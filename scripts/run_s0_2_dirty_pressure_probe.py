@@ -133,10 +133,11 @@ def validate(log: str, args: argparse.Namespace, overlay_root: Path) -> dict[str
     )
     required = (
         "S0_2_DIRTY_PRESSURE_FILLED files=32 pages_per_file=128 total_pages=4096",
+        "S0_2_DIRTY_PRESSURE_STAT_VISIBILITY observers=4 ok=1",
         "S0_2_DIRTY_PRESSURE_TRIGGER pages=1",
         "S0_2_DIRTY_PRESSURE_VERIFY phase=dirty ok=1",
         "S0_2_DIRTY_PRESSURE_VERIFY phase=synced ok=1",
-        "S0_2_DIRTY_PRESSURE_PROBE_PASS files=33 initial_pages=4096 trigger_pages=1 phases=2",
+        "S0_2_DIRTY_PRESSURE_PROBE_PASS files=33 initial_pages=4096 trigger_pages=1 phases=2 stat_observers=4",
     )
     if lines.count(start) != 1 or lines.count(passed) != 1:
         errors.append("guest start/pass marker mismatch")
@@ -145,6 +146,8 @@ def validate(log: str, args: argparse.Namespace, overlay_root: Path) -> dict[str
             errors.append(f"missing exact marker: {marker}")
     if any("S0_2_DIRTY_PRESSURE_PROBE_FAIL" in line for line in lines):
         errors.append("probe emitted failure marker")
+    if any("S0_2_DIRTY_PRESSURE_STAT_FAIL" in line for line in lines):
+        errors.append("probe observed an unstable dirty-file size")
     if bench.PANIC_RE.search(log):
         errors.append("kernel panic signature present")
     policies = list(bench.BLOCK_IO_POLICY_RE.finditer(log))

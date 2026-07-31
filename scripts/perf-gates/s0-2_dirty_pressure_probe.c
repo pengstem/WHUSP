@@ -1,12 +1,14 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 enum {
@@ -16,6 +18,7 @@ enum {
     FILE_BYTES = PAGE_BYTES * PAGES_PER_FILE,
     WRITE_BYTES = 64 * 1024,
     TRIGGER_BYTES = PAGE_BYTES,
+    STAT_OBSERVERS = 4,
 };
 
 static void fill_pattern(unsigned char *buffer, size_t length, int file_index, size_t offset)
@@ -110,6 +113,95 @@ static int verify_all(const char *base, unsigned char *observed, unsigned char *
     return verify_file(path, DIRTY_FILES, TRIGGER_BYTES, observed, expected);
 }
 
+static int start_stat_observers(const char *base, pid_t *children, int stop_pipes[][2])
+{
+    int fds[DIRTY_FILES];
+    char path[512];
+    for (int file_index = 0; file_index < DIRTY_FILES; ++file_index) {
+        snprintf(path, sizeof(path), "%s/file-%02d", base, file_index);
+        fds[file_index] = open(path, O_RDONLY);
+        struct stat statbuf;
+        if (fds[file_index] < 0 || fstat(fds[file_index], &statbuf) != 0
+            || statbuf.st_size != FILE_BYTES) {
+            return -1;
+        }
+    }
+    for (int observer = 0; observer < STAT_OBSERVERS; ++observer) {
+        if (pipe(stop_pipes[observer]) != 0) {
+            return -1;
+        }
+    }
+    for (int observer = 0; observer < STAT_OBSERVERS; ++observer) {
+        children[observer] = fork();
+        if (children[observer] < 0) {
+            return -1;
+        }
+        if (children[observer] == 0) {
+            for (int pipe_index = 0; pipe_index < STAT_OBSERVERS; ++pipe_index) {
+                close(stop_pipes[pipe_index][1]);
+                if (pipe_index != observer) {
+                    close(stop_pipes[pipe_index][0]);
+                }
+            }
+            int flags = fcntl(stop_pipes[observer][0], F_GETFL);
+            if (flags < 0 || fcntl(stop_pipes[observer][0], F_SETFL, flags | O_NONBLOCK) != 0) {
+                _exit(40);
+            }
+            for (;;) {
+                char stop;
+                ssize_t stopped = read(stop_pipes[observer][0], &stop, 1);
+                if (stopped == 1) {
+                    _exit(0);
+                }
+                if (stopped != -1 || errno != EAGAIN) {
+                    _exit(41);
+                }
+                for (int file_index = 0; file_index < DIRTY_FILES; ++file_index) {
+                    struct stat statbuf = {0};
+                    if (fstat(fds[file_index], &statbuf) != 0
+                        || statbuf.st_size != FILE_BYTES) {
+                        dprintf(STDERR_FILENO,
+                                "S0_2_DIRTY_PRESSURE_STAT_FAIL observer=%d file=%d size=%lld "
+                                "errno=%d\n",
+                                observer, file_index, (long long)statbuf.st_size, errno);
+                        _exit(42);
+                    }
+                }
+            }
+        }
+    }
+    for (int observer = 0; observer < STAT_OBSERVERS; ++observer) {
+        close(stop_pipes[observer][0]);
+    }
+    for (int file_index = 0; file_index < DIRTY_FILES; ++file_index) {
+        close(fds[file_index]);
+    }
+    return 0;
+}
+
+static int stop_stat_observers(pid_t *children, int stop_pipes[][2])
+{
+    int failed = 0;
+    for (int observer = 0; observer < STAT_OBSERVERS; ++observer) {
+        if (write_exact(stop_pipes[observer][1], "x", 1) != 0
+            || close(stop_pipes[observer][1]) != 0) {
+            failed = 1;
+        }
+    }
+    for (int observer = 0; observer < STAT_OBSERVERS; ++observer) {
+        int status = 0;
+        if (waitpid(children[observer], &status, 0) != children[observer]
+            || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            failed = 1;
+        }
+    }
+    if (failed) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
 static int cleanup(const char *base)
 {
     char path[512];
@@ -138,6 +230,7 @@ int main(int argc, char **argv)
         errno = EINVAL;
         return fail("arguments");
     }
+    signal(SIGPIPE, SIG_IGN);
     const char *base = argv[1];
     unsigned char *write_buffer = malloc(WRITE_BYTES);
     unsigned char *observed = malloc(WRITE_BYTES);
@@ -158,10 +251,20 @@ int main(int argc, char **argv)
     }
     puts("S0_2_DIRTY_PRESSURE_FILLED files=32 pages_per_file=128 total_pages=4096");
 
+    pid_t stat_children[STAT_OBSERVERS];
+    int stat_stop_pipes[STAT_OBSERVERS][2];
+    if (start_stat_observers(base, stat_children, stat_stop_pipes) != 0) {
+        return fail("start_stat_observers");
+    }
+
     snprintf(path, sizeof(path), "%s/trigger", base);
     if (write_file(path, DIRTY_FILES, TRIGGER_BYTES, write_buffer) != 0) {
         return fail("trigger");
     }
+    if (stop_stat_observers(stat_children, stat_stop_pipes) != 0) {
+        return fail("stat_visibility");
+    }
+    puts("S0_2_DIRTY_PRESSURE_STAT_VISIBILITY observers=4 ok=1");
     puts("S0_2_DIRTY_PRESSURE_TRIGGER pages=1");
     if (verify_all(base, observed, expected) != 0) {
         return fail("verify_dirty");
@@ -180,6 +283,6 @@ int main(int argc, char **argv)
     free(expected);
     free(observed);
     free(write_buffer);
-    puts("S0_2_DIRTY_PRESSURE_PROBE_PASS files=33 initial_pages=4096 trigger_pages=1 phases=2");
+    puts("S0_2_DIRTY_PRESSURE_PROBE_PASS files=33 initial_pages=4096 trigger_pages=1 phases=2 stat_observers=4");
     return 0;
 }

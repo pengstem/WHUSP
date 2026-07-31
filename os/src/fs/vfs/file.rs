@@ -402,15 +402,11 @@ fn dirty_regular_file_has_pages(node: VfsNodeId) -> bool {
     dirty_regular_file_has_pages_state(&inode_state::state_for(node))
 }
 
-fn overlay_dirty_regular_stat(node: VfsNodeId, stat: &mut FileStat) {
-    if !any_regular_file_dirty() {
+fn overlay_dirty_regular_stat_state(state: &inode_state::InodeState, stat: &mut FileStat) {
+    if !dirty_regular_file_has_pages_state(state) {
         return;
     }
-    let state = inode_state::state_for(node);
-    if !dirty_regular_file_has_pages_state(&state) {
-        return;
-    }
-    let dirty = lock_dirty_file(&state);
+    let dirty = lock_dirty_file(state);
     stat.size = dirty.logical_size as u64;
     let dirty_blocks = dirty.pages.len().saturating_mul(PAGE_SIZE).div_ceil(512) as u64;
     stat.blocks = stat.blocks.max(dirty_blocks);
@@ -2707,14 +2703,19 @@ pub(crate) fn stat_direct_regular_child_in(
         else {
             return Ok(None);
         };
-        let expected_metadata_epoch = inode_state::direct_stat_metadata_epoch(node);
-        let mut stat = if full_stat {
-            stat_full_cached(node)?
-        } else {
-            stat_basic_cached(node)?
-        };
-        stat.dev = node.mount_id.0 as u64;
-        overlay_dirty_regular_stat(node, &mut stat);
+        let state = inode_state::state_for(node);
+        let (stat, expected_metadata_epoch) =
+            inode_state::with_mapping_read_state(&state, || -> FsResult<_> {
+                let expected_metadata_epoch = inode_state::direct_stat_metadata_epoch(node);
+                let mut stat = if full_stat {
+                    stat_full_cached(node)?
+                } else {
+                    stat_basic_cached(node)?
+                };
+                stat.dev = node.mount_id.0 as u64;
+                overlay_dirty_regular_stat_state(&state, &mut stat);
+                Ok((stat, expected_metadata_epoch))
+            })?;
         if inode_state::direct_stat_cache_epoch() == expected_epoch
             && inode_state::direct_stat_metadata_epoch(node) == expected_metadata_epoch
         {
@@ -2750,6 +2751,23 @@ fn stat_in_with(
         let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathLookup);
         vfs_path::resolve_existing_in(context, name, mode)?
     };
+    if path.kind == FsNodeKind::RegularFile {
+        let state = inode_state::state_for(path.node);
+        return inode_state::with_mapping_read_state(&state, || {
+            let mut stat = {
+                let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathBackendStat);
+                if full_stat {
+                    stat_full_cached(path.node)?
+                } else {
+                    stat_basic_cached(path.node)?
+                }
+            };
+            stat.dev = path.node.mount_id.0 as u64;
+            let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathDirtyOverlay);
+            overlay_dirty_regular_stat_state(&state, &mut stat);
+            Ok(stat)
+        });
+    }
     let mut stat = {
         let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathBackendStat);
         if full_stat {
@@ -2759,10 +2777,6 @@ fn stat_in_with(
         }
     };
     stat.dev = path.node.mount_id.0 as u64;
-    if path.kind == FsNodeKind::RegularFile {
-        let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathDirtyOverlay);
-        overlay_dirty_regular_stat(path.node, &mut stat);
-    }
     Ok(stat)
 }
 
@@ -2934,13 +2948,19 @@ impl File for VfsFile {
     }
 
     fn stat(&self) -> FsResult<FileStat> {
-        let mut stat =
-            stat_full_cached_with_state_and_lease(&self.inode_state, &self.mount_backend)?;
-        stat.dev = self.node.mount_id.0 as u64;
-        if self.kind == FsNodeKind::RegularFile {
-            overlay_dirty_regular_stat(self.node, &mut stat);
+        if self.kind != FsNodeKind::RegularFile {
+            let mut stat =
+                stat_full_cached_with_state_and_lease(&self.inode_state, &self.mount_backend)?;
+            stat.dev = self.node.mount_id.0 as u64;
+            return Ok(stat);
         }
-        Ok(stat)
+        inode_state::with_mapping_read_state(&self.inode_state, || {
+            let mut stat =
+                stat_full_cached_with_state_and_lease(&self.inode_state, &self.mount_backend)?;
+            stat.dev = self.node.mount_id.0 as u64;
+            overlay_dirty_regular_stat_state(&self.inode_state, &mut stat);
+            Ok(stat)
+        })
     }
 
     fn mode_type(&self) -> FsResult<u32> {
