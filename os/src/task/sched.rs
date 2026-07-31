@@ -1033,6 +1033,13 @@ fn steal_batch_from(
         if source_ready == 0 {
             return (None, 0);
         }
+        if source_ready == 1
+            && super::processor_is_idle(victim)
+            && (crate::cpu::scheduler_low_concurrency_mode()
+                || crate::cpu::scheduler_surplus_capacity_mode())
+        {
+            return (None, 0);
+        }
         let target_ready = target.ready_len();
         let excess = source_ready.saturating_sub(target_ready);
         let batch_limit = if source_ready > 1 {

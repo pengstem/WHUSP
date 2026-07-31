@@ -25,6 +25,7 @@ use layout::{
 // not grow into an adjacent mapping when handling one-page-at-a-time faults.
 const STACK_GUARD_GAP_PAGES: usize = 256;
 const MMAP_PRIVATE_FAULT_AROUND_PAGES: usize = 6;
+const MMAP_PAGE_CACHE_FAULT_AROUND_PAGES: usize = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryProtectError {
@@ -449,6 +450,10 @@ fn mmap_private_fault_read_ahead_len(
     pages * PAGE_SIZE
 }
 
+fn mmap_page_cache_fault_around_enabled() -> bool {
+    crate::cpu::scheduler_low_concurrency_mode()
+}
+
 pub struct MmapPageCacheFault {
     address_space: Arc<AddressSpaceControl>,
     vpn: VirtPageNum,
@@ -518,6 +523,37 @@ impl MmapPageCacheFault {
 
     fn release_resolved_ref(&self) {
         PAGE_CACHE.write(self.key.id).dec_ref(self.key);
+    }
+
+    fn forward_cached_page(
+        &self,
+        area: &MapArea,
+        page_delta: usize,
+    ) -> Option<(VirtPageNum, PageCacheKey)> {
+        let vpn = VirtPageNum(self.vpn.0.checked_add(page_delta)?);
+        if vpn >= area.vpn_range.get_end() || area.is_poisoned(vpn) {
+            return None;
+        }
+        let info = area.mmap_info.as_ref()?;
+        let area_pages = vpn.0.checked_sub(area.vpn_range.get_start().0)?;
+        let area_offset = area_pages.checked_mul(PAGE_SIZE)?;
+        let file_offset = if let Some(exec_segment) = &info.exec_segment {
+            let fault = exec_segment_fault(exec_segment, area_offset)?;
+            if !exec_fault_can_use_page_cache(info, &fault) {
+                return None;
+            }
+            fault.file_offset
+        } else {
+            let file_offset = info.file_offset.checked_add(area_offset)?;
+            let map_read_len = info.len.saturating_sub(area_offset).min(PAGE_SIZE);
+            let file_read_len = info.file_size.saturating_sub(file_offset).min(PAGE_SIZE);
+            if map_read_len.min(file_read_len) == 0 {
+                return None;
+            }
+            file_offset
+        };
+        let key = PageCacheKey::from_file_offset(self.key.id, self.key.generation, file_offset)?;
+        Some((vpn, key))
     }
 
     fn matches_current_mapping(&self, memory_set: &MemorySet, area: &MapArea) -> bool {
@@ -1849,6 +1885,31 @@ impl MemorySet {
             page.release_resolved_ref();
             return MmapPageCacheInstall::Failed;
         }
+
+        let mut cached_suffix = Vec::new();
+        if mmap_page_cache_fault_around_enabled() {
+            cached_suffix = Vec::with_capacity(MMAP_PAGE_CACHE_FAULT_AROUND_PAGES - 1);
+            for page_delta in 1..MMAP_PAGE_CACHE_FAULT_AROUND_PAGES {
+                let Some((vpn, key)) = page.forward_cached_page(&self.areas[idx], page_delta)
+                else {
+                    break;
+                };
+                let already_resident = self.areas[idx].data_frames.contains_key(&vpn)
+                    || self.areas[idx]
+                        .mmap_info
+                        .as_ref()
+                        .is_some_and(|info| info.page_cache_pages.contains_key(&vpn))
+                    || self
+                        .page_table
+                        .translate(vpn)
+                        .is_some_and(|pte| pte.bits != 0);
+                if already_resident || !self.page_table.prepare_empty_leaf_path(vpn) {
+                    break;
+                }
+                cached_suffix.push((vpn, key));
+            }
+        }
+
         let cache = PAGE_CACHE.read(page.key.id);
         if !cache.is_usable_mmap_key(page.key, page.expected_shared, page.observed_generation) {
             drop(cache);
@@ -1863,8 +1924,28 @@ impl MemorySet {
             page.is_exec_fault() || page.expected_permission.contains(MapPermission::X);
         let installed = area.map_page_cache_frame(page_table, page.vpn, ppn, page.key);
         if installed {
+            let mut invalidation_end = VirtPageNum(page.vpn.0 + 1);
+            let mut unconsumed_key = None;
+            for (vpn, key) in cached_suffix {
+                let Some(ppn) = cache.get_and_inc_ref_for_mmap(
+                    key,
+                    page.is_exec_fault(),
+                    page.expected_shared,
+                    page.observed_generation,
+                ) else {
+                    break;
+                };
+                if !area.map_page_cache_frame(page_table, vpn, ppn, key) {
+                    unconsumed_key = Some(key);
+                    break;
+                }
+                invalidation_end = VirtPageNum(vpn.0 + 1);
+            }
             drop(cache);
-            self.invalidate_tlb_page(usize::from(VirtAddr::from(page.vpn)));
+            if let Some(key) = unconsumed_key {
+                PAGE_CACHE.write(key.id).dec_ref(key);
+            }
+            self.invalidate_tlb_vpn_range(page.vpn, invalidation_end);
             if synchronize_instruction_stream {
                 self.synchronize_instruction_stream();
             }

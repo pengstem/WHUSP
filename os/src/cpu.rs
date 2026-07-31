@@ -461,7 +461,11 @@ static TLB_CROSS_DONE: AtomicCpuMask = AtomicCpuMask::new(CpuMask::empty());
 static SCHEDULER_APS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SCHEDULER_ACTIVE_CPUS: AtomicCpuMask = AtomicCpuMask::new(CpuMask::empty());
 static SCHEDULER_ACTIVE_LOGGED: AtomicBool = AtomicBool::new(false);
+static SCHEDULER_PARALLEL_PRESSURE: AtomicUsize = AtomicUsize::new(0);
+static SCHEDULER_PARALLEL_LATCHED: AtomicBool = AtomicBool::new(false);
+static SCHEDULER_MAX_RUNNING_TASKS: AtomicUsize = AtomicUsize::new(0);
 const SCHEDULER_NO_CURRENT_PRIORITY: usize = usize::MAX;
+const SCHEDULER_PARALLEL_PRESSURE_LIMIT: usize = 1024;
 
 #[repr(C, align(64))]
 struct SchedulerCpuSignals {
@@ -846,6 +850,54 @@ pub(crate) fn scheduler_clear_current_priority() {
     SCHEDULER_SIGNALS[current_id()]
         .current_rt_priority
         .store(SCHEDULER_NO_CURRENT_PRIORITY, Ordering::Release);
+}
+
+pub(crate) fn scheduler_low_concurrency_mode() -> bool {
+    let online_count = online_mask().count();
+    if online_count <= 1 {
+        return false;
+    }
+    let mut running = 0usize;
+    for cpu in 0..topology().possible_count() {
+        if SCHEDULER_SIGNALS[cpu]
+            .current_rt_priority
+            .load(Ordering::Acquire)
+            != SCHEDULER_NO_CURRENT_PRIORITY
+        {
+            running += 1;
+        }
+    }
+    SCHEDULER_MAX_RUNNING_TASKS.fetch_max(running, Ordering::AcqRel);
+    if SCHEDULER_PARALLEL_LATCHED.load(Ordering::Acquire) {
+        return false;
+    }
+    if running >= online_count.min(4) {
+        let pressure = SCHEDULER_PARALLEL_PRESSURE
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                Some(
+                    value
+                        .saturating_add(1)
+                        .min(SCHEDULER_PARALLEL_PRESSURE_LIMIT),
+                )
+            })
+            .unwrap_or(SCHEDULER_PARALLEL_PRESSURE_LIMIT);
+        if pressure + 1 >= SCHEDULER_PARALLEL_PRESSURE_LIMIT {
+            SCHEDULER_PARALLEL_LATCHED.store(true, Ordering::Release);
+            return false;
+        }
+    } else if running <= 2 {
+        let _ = SCHEDULER_PARALLEL_PRESSURE.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |value| Some(value.saturating_sub(1)),
+        );
+    }
+    running <= 2
+}
+
+pub(crate) fn scheduler_surplus_capacity_mode() -> bool {
+    SCHEDULER_PARALLEL_LATCHED.load(Ordering::Acquire)
+        && SCHEDULER_MAX_RUNNING_TASKS.load(Ordering::Acquire) < online_mask().count()
 }
 
 pub(crate) fn scheduler_need_resched(cpu: CpuId) -> bool {
