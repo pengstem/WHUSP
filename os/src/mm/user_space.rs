@@ -4,8 +4,9 @@ use super::address::page_align_up;
 use super::area::{ExecSegmentInfo, MmapInfo, ShmAreaInfo};
 use super::page_table::PTEFlags;
 use super::{
-    AddressSpaceControl, FrameTracker, MapArea, MapPermission, MapType, MemorySet, MmapFlush,
-    PageTable, PageTableEntry, PhysPageNum, RetiredUserPages, VPNRange, VirtAddr,
+    AddressSpaceControl, FaultRetry, FaultRetryReason, FrameTracker, MapArea, MapPermission,
+    MapType, MemorySet, MmapFlush, PageTable, PageTableEntry, PhysPageNum, RetiredUserPages,
+    VPNRange, VirtAddr,
 };
 use super::{VirtPageNum, frame_alloc, frame_alloc_uninit, frame_ref_count};
 use crate::config::{PAGE_SIZE, USER_MMAP_BASE, USER_MMAP_LIMIT};
@@ -51,7 +52,8 @@ impl MmapFaultAccess {
 }
 
 pub enum MmapFaultResult {
-    Handled,
+    Resolved,
+    Retry(FaultRetry),
     Page(MmapFaultPage),
     PageCache(MmapPageCacheFault),
     FatalSigsegv,
@@ -60,13 +62,19 @@ pub enum MmapFaultResult {
 
 pub enum MmapPageCacheResolve {
     Ready(PhysPageNum),
-    Retry,
+    Retry(FaultRetry),
     Failed,
 }
 
 pub enum MmapPageCacheInstall {
     InstalledOrDuplicate,
-    Retry,
+    Retry(FaultRetry),
+    Failed,
+}
+
+pub enum MmapPageInstall {
+    InstalledOrDuplicate,
+    Retry(FaultRetry),
     Failed,
 }
 
@@ -82,7 +90,7 @@ enum CurrentPageCacheKey {
         key: PageCacheKey,
         generation: usize,
     },
-    Busy,
+    Busy(FaultRetry),
     Unaligned,
 }
 
@@ -624,7 +632,9 @@ impl MmapPageCacheFault {
             let cache = PAGE_CACHE.read(self.key.id);
             if !cache.is_usable_mmap_key(self.key, self.expected_shared, self.observed_generation) {
                 perf::record_page_cache_generation_retry();
-                return MmapPageCacheResolve::Retry;
+                return MmapPageCacheResolve::Retry(
+                    cache.generation_fault_retry(self.key.id, FaultRetryReason::GenerationChanged),
+                );
             }
             cache.get_and_inc_ref_for_mmap(
                 self.key,
@@ -647,23 +657,27 @@ impl MmapPageCacheFault {
                 .backing_file
                 .populate_clean_page_cache_at(self.file_offset)
         {
-            let populated_ppn = {
-                let cache = PAGE_CACHE.read(self.key.id);
-                if !cache.is_usable_mmap_key(
-                    self.key,
-                    self.expected_shared,
-                    self.observed_generation,
-                ) {
-                    perf::record_page_cache_generation_retry();
-                    return MmapPageCacheResolve::Retry;
-                }
-                cache.get_and_inc_ref_for_mmap(
-                    self.key,
-                    self.exec_fault,
-                    self.expected_shared,
-                    self.observed_generation,
-                )
-            };
+            let populated_ppn =
+                {
+                    let cache = PAGE_CACHE.read(self.key.id);
+                    if !cache.is_usable_mmap_key(
+                        self.key,
+                        self.expected_shared,
+                        self.observed_generation,
+                    ) {
+                        perf::record_page_cache_generation_retry();
+                        return MmapPageCacheResolve::Retry(cache.generation_fault_retry(
+                            self.key.id,
+                            FaultRetryReason::GenerationChanged,
+                        ));
+                    }
+                    cache.get_and_inc_ref_for_mmap(
+                        self.key,
+                        self.exec_fault,
+                        self.expected_shared,
+                        self.observed_generation,
+                    )
+                };
             if let Some(ppn) = populated_ppn {
                 perf::record_mmap_clean_page_cache_fill();
                 if self.exec_fault {
@@ -700,7 +714,9 @@ impl MmapPageCacheFault {
         if !cache.is_usable_mmap_key(self.key, self.expected_shared, self.observed_generation) {
             perf::record_page_cache_generation_retry();
             perf::record_page_cache_stale_fill_drop(1);
-            return MmapPageCacheResolve::Retry;
+            return MmapPageCacheResolve::Retry(
+                cache.generation_fault_retry(self.key.id, FaultRetryReason::GenerationChanged),
+            );
         }
         // VfsFile::read_at() may already have populated this exact page and
         // adjacent readahead pages. Prefer that frame before publishing the
@@ -725,7 +741,9 @@ impl MmapPageCacheFault {
         let Some(ppn) = ppn else {
             perf::record_page_cache_generation_retry();
             perf::record_page_cache_stale_fill_drop(1);
-            return MmapPageCacheResolve::Retry;
+            return MmapPageCacheResolve::Retry(
+                cache.generation_fault_retry(self.key.id, FaultRetryReason::GenerationChanged),
+            );
         };
         perf::record_mmap_clean_page_cache_fill();
         if self.exec_fault {
@@ -787,7 +805,9 @@ fn current_page_cache_key(
     let cache = PAGE_CACHE.read(id);
     let Some((key, generation)) = cache.mmap_key_from_file_offset(id, file_offset, shared) else {
         perf::record_page_cache_generation_retry();
-        return CurrentPageCacheKey::Busy;
+        return CurrentPageCacheKey::Busy(
+            cache.generation_fault_retry(id, FaultRetryReason::GenerationChanged),
+        );
     };
     CurrentPageCacheKey::Ready { key, generation }
 }
@@ -1693,11 +1713,15 @@ impl MemorySet {
                 }
                 self.invalidate_tlb_page(usize::from(VirtAddr::from(vpn)));
             }
-            return Some(MmapFaultResult::Handled);
+            return Some(MmapFaultResult::Resolved);
         }
         let area = &self.areas[area_idx];
         if area.data_frames.contains_key(&vpn) {
-            return Some(MmapFaultResult::Handled);
+            // A framed mmap page with allowed access must publish its leaf PTE
+            // in the same MemorySet critical section as data-frame ownership.
+            // Treat a persistent ownership/PTE mismatch as fatal instead of
+            // reporting a retry that can never observe external progress.
+            return Some(MmapFaultResult::FatalSigsegv);
         }
 
         let info = area
@@ -1733,7 +1757,9 @@ impl MemorySet {
                             access,
                         )));
                     }
-                    CurrentPageCacheKey::Busy => return Some(MmapFaultResult::Handled),
+                    CurrentPageCacheKey::Busy(retry) => {
+                        return Some(MmapFaultResult::Retry(retry));
+                    }
                     CurrentPageCacheKey::Unaligned => {}
                 }
             }
@@ -1782,7 +1808,9 @@ impl MemorySet {
                         access,
                     )));
                 }
-                CurrentPageCacheKey::Busy => return Some(MmapFaultResult::Handled),
+                CurrentPageCacheKey::Busy(retry) => {
+                    return Some(MmapFaultResult::Retry(retry));
+                }
                 CurrentPageCacheKey::Unaligned => {}
             }
         }
@@ -1814,14 +1842,16 @@ impl MemorySet {
     ///
     /// The VMA is looked up again because the caller may have dropped process
     /// memory state while allocating or reading the backing file.
-    pub fn install_mmap_fault_page(&mut self, page: MmapFaultPage, frame: FrameTracker) -> bool {
+    pub fn install_mmap_fault_page(
+        &mut self,
+        page: MmapFaultPage,
+        frame: FrameTracker,
+    ) -> MmapPageInstall {
         let Some(idx) = self.find_area_idx_containing(page.vpn) else {
-            // The VMA changed while file I/O ran without the process lock.
-            // Resume the instruction so it faults again against current state.
-            return true;
+            return MmapPageInstall::Retry(FaultRetry::immediate(FaultRetryReason::VmaChanged));
         };
         if !page.matches_current_mapping(self, &self.areas[idx]) {
-            return true;
+            return MmapPageInstall::Retry(FaultRetry::immediate(FaultRetryReason::VmaChanged));
         }
         if self.areas[idx].data_frames.contains_key(&page.vpn)
             || self
@@ -1829,7 +1859,7 @@ impl MemorySet {
                 .translate(page.vpn)
                 .is_some_and(|pte| pte.bits != 0)
         {
-            return true;
+            return MmapPageInstall::InstalledOrDuplicate;
         }
         let synchronize_instruction_stream =
             page.exec_fault || page.expected_permission.contains(MapPermission::X);
@@ -1844,7 +1874,11 @@ impl MemorySet {
                 self.synchronize_instruction_stream();
             }
         }
-        installed
+        if installed {
+            MmapPageInstall::InstalledOrDuplicate
+        } else {
+            MmapPageInstall::Failed
+        }
     }
 
     /// Installs a page-cache frame resolved for a file-backed mmap fault.
@@ -1859,11 +1893,15 @@ impl MemorySet {
     ) -> MmapPageCacheInstall {
         let Some(idx) = self.find_area_idx_containing(page.vpn) else {
             page.release_resolved_ref();
-            return MmapPageCacheInstall::Retry;
+            return MmapPageCacheInstall::Retry(FaultRetry::immediate(
+                FaultRetryReason::VmaChanged,
+            ));
         };
         if !page.matches_current_mapping(self, &self.areas[idx]) {
             page.release_resolved_ref();
-            return MmapPageCacheInstall::Retry;
+            return MmapPageCacheInstall::Retry(FaultRetry::immediate(
+                FaultRetryReason::VmaChanged,
+            ));
         }
         let already_resident = self.areas[idx].data_frames.contains_key(&page.vpn)
             || self.areas[idx]
@@ -1912,11 +1950,12 @@ impl MemorySet {
 
         let cache = PAGE_CACHE.read(page.key.id);
         if !cache.is_usable_mmap_key(page.key, page.expected_shared, page.observed_generation) {
+            let retry = cache.generation_fault_retry(page.key.id, FaultRetryReason::StaleInstall);
             drop(cache);
             PAGE_CACHE.write(page.key.id).dec_ref(page.key);
             perf::record_page_cache_generation_retry();
             perf::record_page_cache_stale_install_retry();
-            return MmapPageCacheInstall::Retry;
+            return MmapPageCacheInstall::Retry(retry);
         }
         let page_table = &mut self.page_table;
         let area = &mut self.areas[idx];
@@ -2582,16 +2621,17 @@ impl MemorySet {
             return MmapPrefaultResult::Failed;
         };
         match fault {
-            // A normal trap uses Handled to request an instruction retry while
-            // a file generation is unstable. Prefault callers need a resident
-            // page now, so never turn that transient state into false success.
-            MmapFaultResult::Handled => {
+            // A normal trap returns Retry while a file generation is unstable.
+            // Prefault callers need a resident page now, so never turn that
+            // transient state into false success.
+            MmapFaultResult::Resolved => {
                 if self.vpn_is_resident_for_mlock(vpn) {
                     MmapPrefaultResult::Complete
                 } else {
                     MmapPrefaultResult::Retry
                 }
             }
+            MmapFaultResult::Retry(_) => MmapPrefaultResult::Retry,
             MmapFaultResult::FatalSigsegv | MmapFaultResult::FatalSigbus => {
                 MmapPrefaultResult::Failed
             }
@@ -2602,21 +2642,21 @@ impl MemorySet {
                 let Some(frame) = page.build_frame() else {
                     return MmapPrefaultResult::Failed;
                 };
-                if self.install_mmap_fault_page(page, frame) {
-                    MmapPrefaultResult::Complete
-                } else {
-                    MmapPrefaultResult::Failed
+                match self.install_mmap_fault_page(page, frame) {
+                    MmapPageInstall::InstalledOrDuplicate => MmapPrefaultResult::Complete,
+                    MmapPageInstall::Retry(_) => MmapPrefaultResult::Retry,
+                    MmapPageInstall::Failed => MmapPrefaultResult::Failed,
                 }
             }
             MmapFaultResult::PageCache(mut page) => {
                 let ppn = match page.resolve_ppn() {
                     MmapPageCacheResolve::Ready(ppn) => ppn,
-                    MmapPageCacheResolve::Retry => return MmapPrefaultResult::Retry,
+                    MmapPageCacheResolve::Retry(_) => return MmapPrefaultResult::Retry,
                     MmapPageCacheResolve::Failed => return MmapPrefaultResult::Failed,
                 };
                 match self.install_mmap_page_cache_fault_page(page, ppn) {
                     MmapPageCacheInstall::InstalledOrDuplicate => MmapPrefaultResult::Complete,
-                    MmapPageCacheInstall::Retry => MmapPrefaultResult::Retry,
+                    MmapPageCacheInstall::Retry(_) => MmapPrefaultResult::Retry,
                     MmapPageCacheInstall::Failed => MmapPrefaultResult::Failed,
                 }
             }

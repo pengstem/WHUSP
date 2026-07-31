@@ -3627,6 +3627,7 @@ mod enabled {
         );
         append_timing_stats(&mut content);
         append_backend_op_stats(&mut content);
+        crate::mm::append_fault_perf_stats(&mut content);
         content
     }
 }

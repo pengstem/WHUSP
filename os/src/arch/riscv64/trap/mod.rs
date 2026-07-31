@@ -2,14 +2,16 @@ mod context;
 
 use crate::arch::interrupt::{disable_supervisor_interrupt, enable_supervisor_interrupt};
 use crate::config::TRAMPOLINE;
-use crate::mm::{MmapFaultAccess, MmapFaultResult, MmapPageCacheInstall, MmapPageCacheResolve};
-use crate::perf;
+use crate::mm::{
+    FaultOrigin, MmapFaultAccess, UserFaultFatal, UserFaultOutcome, record_fault_retry,
+    record_fault_retry_chain, record_fault_retry_wait, resolve_user_page_fault,
+};
 use crate::syscall::{
     syscall_exit_with_current_task, syscall_is_exit, syscall_is_exit_group,
     syscall_with_current_task,
 };
 use crate::task::{
-    ProcessControlBlock, SignalAction, SignalFlags, TaskControlBlock, account_task_user_time_until,
+    SignalAction, SignalFlags, TaskControlBlock, account_task_user_time_until,
     check_signals_of_task, current_add_signal, current_process, current_task,
     exit_current_group_and_run_next, process_of_task, suspend_current_and_run_next,
     timer_tick_should_preempt, trap_cx_of_task, trap_return_context_after_accounting_for_task,
@@ -257,98 +259,29 @@ fn init_lazy_fp_for_task(task: &Arc<TaskControlBlock>) {
 }
 
 pub(crate) fn handle_user_page_fault(addr: usize, access: MmapFaultAccess) -> bool {
-    let _profile_scope = perf::time_scope(perf::ProfilePoint::PageFault);
     let process = current_process();
-    let fault = if access == MmapFaultAccess::Write {
-        let mut inner = process.inner_exclusive_access();
-        {
-            let _cow_scope = perf::time_scope(perf::ProfilePoint::PageFaultCow);
-            // Private COW pages are resolved before mmap faults so forked heap
-            // and anonymous mappings preserve copy-on-write semantics.
-            if inner.memory_set.resolve_cow_page_fault(addr) {
-                return true;
+    match resolve_user_page_fault(&process, addr, access) {
+        UserFaultOutcome::Resolved => true,
+        UserFaultOutcome::Retry(retry) => {
+            record_fault_retry(FaultOrigin::Hardware, addr, access, &retry);
+            record_fault_retry_chain(FaultOrigin::Hardware, 1);
+            if let Some(waited_us) = retry.wait() {
+                record_fault_retry_wait(FaultOrigin::Hardware, waited_us);
             }
+            true
         }
-        let _prepare_scope = perf::time_scope(perf::ProfilePoint::PageFaultMmapPrepare);
-        inner.memory_set.prepare_mmap_page_fault(addr, access)
-    } else {
-        prepare_mmap_page_fault(&process, addr, access)
-    };
-    if handle_prepared_mmap_page_fault(&process, fault) {
-        return true;
-    }
-    let _lazy_scope = perf::time_scope(perf::ProfilePoint::PageFaultLazyFramed);
-    process
-        .inner_exclusive_access()
-        .memory_set
-        .resolve_lazy_framed_page_fault(addr, access)
-}
-
-fn prepare_mmap_page_fault(
-    process: &Arc<ProcessControlBlock>,
-    addr: usize,
-    access: MmapFaultAccess,
-) -> Option<MmapFaultResult> {
-    let _prepare_scope = perf::time_scope(perf::ProfilePoint::PageFaultMmapPrepare);
-    let mut inner = process.inner_exclusive_access();
-    inner.memory_set.prepare_mmap_page_fault(addr, access)
-}
-
-fn handle_prepared_mmap_page_fault(
-    process: &Arc<ProcessControlBlock>,
-    fault: Option<MmapFaultResult>,
-) -> bool {
-    let Some(fault) = fault else {
-        return false;
-    };
-    match fault {
-        MmapFaultResult::Handled => true,
-        MmapFaultResult::FatalSigsegv => {
+        UserFaultOutcome::Fatal(UserFaultFatal::ForcedDefaultSegv) => {
             force_default_sigsegv_current();
             false
         }
-        MmapFaultResult::FatalSigbus => {
+        UserFaultOutcome::Fatal(UserFaultFatal::Bus) => {
             // CONTEXT: The access reached a mapped mmap VMA but violated its
             // backing-object rules. Queue SIGBUS and report the fault handled so
             // the outer page-fault path does not also add SIGSEGV.
             current_add_signal(SignalFlags::SIGBUS);
             true
         }
-        MmapFaultResult::Page(page) => {
-            let frame = {
-                let _build_scope = perf::time_scope(perf::ProfilePoint::PageFaultMmapBuildFrame);
-                page.build_frame()
-            };
-            let Some(frame) = frame else {
-                return false;
-            };
-            let _install_scope = perf::time_scope(perf::ProfilePoint::PageFaultMmapInstallFrame);
-            let mut inner = process.inner_exclusive_access();
-            inner.memory_set.install_mmap_fault_page(page, frame)
-        }
-        MmapFaultResult::PageCache(mut page) => {
-            let ppn = {
-                let _resolve_scope =
-                    perf::time_scope(perf::ProfilePoint::PageFaultMmapResolvePageCache);
-                page.resolve_ppn()
-            };
-            let ppn = match ppn {
-                MmapPageCacheResolve::Ready(ppn) => ppn,
-                MmapPageCacheResolve::Retry => return true,
-                MmapPageCacheResolve::Failed => return false,
-            };
-            let _install_scope =
-                perf::time_scope(perf::ProfilePoint::PageFaultMmapInstallPageCache);
-            let mut inner = process.inner_exclusive_access();
-            match inner
-                .memory_set
-                .install_mmap_page_cache_fault_page(page, ppn)
-            {
-                MmapPageCacheInstall::InstalledOrDuplicate => true,
-                MmapPageCacheInstall::Retry => true,
-                MmapPageCacheInstall::Failed => false,
-            }
-        }
+        UserFaultOutcome::Fatal(UserFaultFatal::Segv) => false,
     }
 }
 

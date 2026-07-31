@@ -1,5 +1,6 @@
-use super::trap::handle_user_page_fault;
-use crate::mm::{MmapFaultAccess, VirtAddr, page_table::PTEFlags};
+use crate::mm::{
+    MmapFaultAccess, UserFaultOutcome, VirtAddr, page_table::PTEFlags, resolve_user_page_fault,
+};
 use crate::syscall::LinuxSigInfo;
 use crate::syscall::user_ptr::{
     UserBufferAccess, read_user_value_with_fault, write_user_value_with_fault,
@@ -170,12 +171,12 @@ fn make_trampoline_page_executable(trampoline_ptr: usize) -> bool {
     true
 }
 
-fn signal_user_fault(addr: usize, access: UserBufferAccess) -> bool {
+fn signal_user_fault(addr: usize, access: UserBufferAccess) -> UserFaultOutcome {
     let access = match access {
         UserBufferAccess::Read => MmapFaultAccess::Read,
         UserBufferAccess::Write => MmapFaultAccess::Write,
     };
-    handle_user_page_fault(addr, access)
+    resolve_user_page_fault(&current_process(), addr, access)
 }
 
 fn remove_pending_signal_for_task(task: &TaskControlBlock, signum: usize, signal: SignalFlags) {

@@ -7,6 +7,7 @@ edition = "2024"
 [features]
 block-io-force-sync = []
 perf-counters = []
+fault-trace = []
 read-mostly-probe = []
 sleep-rwlock-probe = []
 

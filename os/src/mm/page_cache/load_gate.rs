@@ -3,20 +3,20 @@ use crate::task::{TaskControlBlock, block_current_task_no_schedule, schedule, wa
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 
-pub(crate) struct PageCacheLoadGate {
-    inner: UPIntrFreeCell<PageCacheLoadGateInner>,
+struct PageCacheWaitGate {
+    inner: UPIntrFreeCell<PageCacheWaitGateInner>,
 }
 
-struct PageCacheLoadGateInner {
+struct PageCacheWaitGateInner {
     complete: bool,
     waiters: VecDeque<Arc<TaskControlBlock>>,
 }
 
-impl PageCacheLoadGate {
-    pub(crate) fn new() -> Self {
+impl PageCacheWaitGate {
+    fn new() -> Self {
         Self {
             inner: unsafe {
-                UPIntrFreeCell::new(PageCacheLoadGateInner {
+                UPIntrFreeCell::new(PageCacheWaitGateInner {
                     complete: false,
                     waiters: VecDeque::new(),
                 })
@@ -25,7 +25,7 @@ impl PageCacheLoadGate {
     }
 
     /// Waits for the owner without a completion-before-enqueue lost wake.
-    pub(crate) fn wait(&self) {
+    fn wait(&self) {
         let mut inner = self.inner.exclusive_access();
         if inner.complete {
             return;
@@ -37,7 +37,7 @@ impl PageCacheLoadGate {
     }
 
     /// Publishes completion and wakes every task that joined this load.
-    pub(crate) fn complete(&self) {
+    fn complete(&self) {
         let waiters = self.inner.exclusive_session(|inner| {
             if inner.complete {
                 return VecDeque::new();
@@ -50,3 +50,30 @@ impl PageCacheLoadGate {
         }
     }
 }
+
+macro_rules! define_page_cache_gate {
+    ($gate:ident) => {
+        pub(crate) struct $gate {
+            gate: PageCacheWaitGate,
+        }
+
+        impl $gate {
+            pub(crate) fn new() -> Self {
+                Self {
+                    gate: PageCacheWaitGate::new(),
+                }
+            }
+
+            pub(crate) fn wait(&self) {
+                self.gate.wait();
+            }
+
+            pub(crate) fn complete(&self) {
+                self.gate.complete();
+            }
+        }
+    };
+}
+
+define_page_cache_gate!(PageCacheLoadGate);
+define_page_cache_gate!(PageCacheGenerationGate);

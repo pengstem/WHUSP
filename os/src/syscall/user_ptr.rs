@@ -1,5 +1,8 @@
 use crate::mm::{
-    FrameTracker, MemorySet, MmapFaultAccess, PageTable, StepByOne, TranslatedUserBuffer, VirtAddr,
+    FaultOrigin, FaultRetryReason, FrameTracker, MemorySet, MmapFaultAccess, PageTable, StepByOne,
+    TranslatedUserBuffer, UserFaultFatal, UserFaultOutcome, VirtAddr, record_fault_retry,
+    record_fault_retry_chain, record_fault_retry_wait, record_fault_retry_yield,
+    record_usercopy_fault_retry_terminal, resolve_user_page_fault,
 };
 use crate::perf;
 use alloc::string::String;
@@ -39,8 +42,9 @@ pub(crate) enum UserBufferAccess {
 /// Optional page-fault hook used while validating a user byte range.
 ///
 /// Callers pass this only when the syscall is allowed to materialize lazy user
-/// mappings before copying. A `false` return is reported as `EFAULT`.
-pub(crate) type UserFaultHandler = fn(usize, UserBufferAccess) -> bool;
+/// mappings before copying. Fatal outcomes are reported as `EFAULT`; retryable
+/// outcomes retain their reason so the current task can wait outside MM locks.
+pub(crate) type UserFaultHandler = fn(usize, UserBufferAccess) -> UserFaultOutcome;
 
 #[derive(Clone)]
 enum EffectiveUserFault {
@@ -91,12 +95,16 @@ impl UserFaultResolver {
         !matches!(self.fault, EffectiveUserFault::None)
     }
 
-    fn resolve(&self, addr: usize, access: UserBufferAccess) -> bool {
+    fn resolve(&self, addr: usize, access: UserBufferAccess) -> UserFaultOutcome {
         match self.fault {
-            EffectiveUserFault::None => false,
+            EffectiveUserFault::None => UserFaultOutcome::Fatal(UserFaultFatal::Segv),
             EffectiveUserFault::Function(handler) => handler(addr, access),
             EffectiveUserFault::CurrentLazyFramed(ref process) => {
-                lazy_framed_user_fault_for_process(process.as_ref(), addr, access)
+                if lazy_framed_user_fault_for_process(process.as_ref(), addr, access) {
+                    UserFaultOutcome::Resolved
+                } else {
+                    UserFaultOutcome::Fatal(UserFaultFatal::Segv)
+                }
             }
         }
     }
@@ -112,12 +120,58 @@ impl UserFaultResolver {
     }
 }
 
-fn mmap_user_fault(addr: usize, access: UserBufferAccess) -> bool {
+#[derive(Default)]
+struct UsercopyFaultRetryState {
+    last_reason: Option<FaultRetryReason>,
+    consecutive: usize,
+    had_retry: bool,
+}
+
+impl UsercopyFaultRetryState {
+    fn wait_or_reschedule(
+        &mut self,
+        addr: usize,
+        access: UserBufferAccess,
+        retry: crate::mm::FaultRetry,
+    ) {
+        let mmap_access = match access {
+            UserBufferAccess::Read => MmapFaultAccess::Read,
+            UserBufferAccess::Write => MmapFaultAccess::Write,
+        };
+        record_fault_retry(FaultOrigin::Usercopy, addr, mmap_access, &retry);
+        let reason = retry.reason();
+        self.had_retry = true;
+        if self.last_reason == Some(reason) {
+            self.consecutive = self.consecutive.saturating_add(1);
+        } else {
+            self.last_reason = Some(reason);
+            self.consecutive = 1;
+        }
+        record_fault_retry_chain(FaultOrigin::Usercopy, self.consecutive);
+        if let Some(waited_us) = retry.wait() {
+            record_fault_retry_wait(FaultOrigin::Usercopy, waited_us);
+            return;
+        }
+        // Generation waits carry a completion gate. Other retry reasons mean
+        // that VMA or install state changed while MM locks were dropped: rewalk
+        // once immediately, then yield only if the same race repeats.
+        if self.consecutive > 1 {
+            record_fault_retry_yield(FaultOrigin::Usercopy);
+            crate::task::suspend_current_and_run_next();
+        }
+    }
+
+    fn record_terminal(&self, resolved: bool) {
+        record_usercopy_fault_retry_terminal(self.had_retry, resolved);
+    }
+}
+
+fn mmap_user_fault(addr: usize, access: UserBufferAccess) -> UserFaultOutcome {
     let access = match access {
         UserBufferAccess::Read => MmapFaultAccess::Read,
         UserBufferAccess::Write => MmapFaultAccess::Write,
     };
-    crate::arch::trap::handle_user_page_fault(addr, access)
+    resolve_user_page_fault(&crate::task::current_process(), addr, access)
 }
 
 fn lazy_framed_user_fault_for_process(
@@ -321,8 +375,8 @@ fn checked_and_pin_user_pte(
     fault_handler: &UserFaultResolver,
 ) -> KResult<(crate::mm::PageTableEntry, FrameTracker)> {
     if let Some(process) = &fault_handler.current_process {
-        const MAX_FAULT_RETRIES: usize = 4;
-        for _ in 0..MAX_FAULT_RETRIES {
+        let mut retry_state = UsercopyFaultRetryState::default();
+        loop {
             // Linux does not take a process-wide write lock for resident
             // copy_to/from_user. Traverse the active page table under the
             // address-space read side and retain the physical frame before
@@ -342,23 +396,34 @@ fn checked_and_pin_user_pte(
                 Ok::<_, Errno>((ready, pte))
             })?;
             if let Some(ready) = ready {
+                retry_state.record_terminal(true);
                 return Ok(ready);
             }
             let cow = pte.is_some_and(|pte| {
                 access == UserBufferAccess::Write && pte.cow() && !pte.writable()
             });
-            let resolved = if cow {
-                fault_handler.resolve_cow(token, addr)
+            let outcome = if cow {
+                if fault_handler.resolve_cow(token, addr) {
+                    UserFaultOutcome::Resolved
+                } else {
+                    UserFaultOutcome::Fatal(UserFaultFatal::Segv)
+                }
             } else if fault_handler.can_fault() {
                 fault_handler.resolve(addr, access)
             } else {
-                false
+                UserFaultOutcome::Fatal(UserFaultFatal::Segv)
             };
-            if !resolved {
-                return Err(Errno::EFAULT);
+            match outcome {
+                UserFaultOutcome::Resolved => {}
+                UserFaultOutcome::Retry(retry) => {
+                    retry_state.wait_or_reschedule(addr, access, retry);
+                }
+                UserFaultOutcome::Fatal(_) => {
+                    retry_state.record_terminal(false);
+                    return Err(Errno::EFAULT);
+                }
             }
         }
-        return Err(Errno::EFAULT);
     }
 
     // Foreign or freshly constructed address spaces are translated only by
@@ -387,8 +452,8 @@ fn with_user_page_ctx<V>(
         return Ok(access_page(pte.ppn().get_bytes_array()));
     }
 
-    const MAX_FAULT_RETRIES: usize = 4;
-    for _ in 0..MAX_FAULT_RETRIES {
+    let mut retry_state = UsercopyFaultRetryState::default();
+    loop {
         let (value, pte) = process.with_memory_read(|| {
             let page_table = PageTable::from_token(token);
             let pte = page_table.translate(VirtAddr::from(addr).floor());
@@ -398,25 +463,39 @@ fn with_user_page_ctx<V>(
             (value, pte)
         });
         if let Some(value) = value {
+            retry_state.record_terminal(true);
             return Ok(value);
         }
         let cow = pte
             .is_some_and(|pte| access == UserBufferAccess::Write && pte.cow() && !pte.writable());
-        let resolved = if cow {
-            process
+        let outcome = if cow {
+            if process
                 .inner_exclusive_access()
                 .memory_set
                 .resolve_cow_page_fault(addr)
+            {
+                UserFaultOutcome::Resolved
+            } else {
+                UserFaultOutcome::Fatal(UserFaultFatal::Segv)
+            }
         } else if let Some(handler) = fault_handler {
             handler(addr, access)
+        } else if lazy_framed_user_fault_for_process(process, addr, access) {
+            UserFaultOutcome::Resolved
         } else {
-            lazy_framed_user_fault_for_process(process, addr, access)
+            UserFaultOutcome::Fatal(UserFaultFatal::Segv)
         };
-        if !resolved {
-            return Err(Errno::EFAULT);
+        match outcome {
+            UserFaultOutcome::Resolved => {}
+            UserFaultOutcome::Retry(retry) => {
+                retry_state.wait_or_reschedule(addr, access, retry);
+            }
+            UserFaultOutcome::Fatal(_) => {
+                retry_state.record_terminal(false);
+                return Err(Errno::EFAULT);
+            }
         }
     }
-    Err(Errno::EFAULT)
 }
 
 fn checked_user_pte(
@@ -437,7 +516,10 @@ fn checked_user_pte(
             if !fault_handler.can_fault() {
                 return Err(Errno::EFAULT);
             }
-            if !fault_handler.resolve(addr, access) {
+            if !matches!(
+                fault_handler.resolve(addr, access),
+                UserFaultOutcome::Resolved
+            ) {
                 return Err(Errno::EFAULT);
             }
             translate(page_table).ok_or(Errno::EFAULT)?
@@ -452,7 +534,13 @@ fn checked_user_pte(
                 return Err(Errno::EFAULT);
             }
             pte = translate(page_table).ok_or(Errno::EFAULT)?;
-        } else if fault_handler.can_fault() && fault_handler.resolve(addr, access) {
+        } else if fault_handler.can_fault() {
+            if !matches!(
+                fault_handler.resolve(addr, access),
+                UserFaultOutcome::Resolved
+            ) {
+                return Err(Errno::EFAULT);
+            }
             pte = translate(page_table).ok_or(Errno::EFAULT)?;
         }
         if !user_pte_allows(pte, access, reject_zero_ppn) {
@@ -577,7 +665,14 @@ fn resolve_current_cow_page(token: usize, addr: usize) -> bool {
     if token != crate::task::current_user_token() {
         return false;
     }
-    crate::arch::trap::handle_user_page_fault(addr, MmapFaultAccess::Write)
+    let process = crate::task::current_process();
+    if process.inner_owned_by_current() {
+        return false;
+    }
+    process
+        .inner_exclusive_access()
+        .memory_set
+        .resolve_cow_page_fault(addr)
 }
 
 fn user_pte_allows(

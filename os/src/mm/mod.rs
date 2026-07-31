@@ -9,6 +9,7 @@ mod memory_set;
 pub(crate) mod page_cache;
 pub mod page_table;
 pub(crate) mod shm;
+mod user_fault;
 mod user_space;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -33,10 +34,17 @@ pub(crate) use kernel_space::{insert_global_kernel_framed_area_uninit, remove_gl
 pub use memory_set::MemorySet;
 pub(crate) use page_table::TranslatedUserBuffer;
 pub use page_table::{PageTable, PageTableEntry, UserBuffer};
+#[cfg(feature = "perf-counters")]
+pub(crate) use user_fault::append_fault_perf_stats;
+pub(crate) use user_fault::{
+    FaultOrigin, FaultRetry, FaultRetryReason, UserFaultFatal, UserFaultOutcome,
+    record_fault_retry, record_fault_retry_chain, record_fault_retry_wait,
+    record_fault_retry_yield, record_usercopy_fault_retry_terminal, resolve_user_page_fault,
+};
 pub(crate) use user_space::FutexSharedKey;
 pub use user_space::{
     MemoryProtectError, MmapFaultAccess, MmapFaultResult, MmapPageCacheInstall,
-    MmapPageCacheResolve, MmapPrefaultResult,
+    MmapPageCacheResolve, MmapPageInstall, MmapPrefaultResult,
 };
 
 static PUBLISHED_KERNEL_TOKEN: AtomicUsize = AtomicUsize::new(0);

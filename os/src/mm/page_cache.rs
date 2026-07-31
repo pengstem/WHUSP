@@ -4,7 +4,7 @@ mod load_gate;
 #[cfg(feature = "perf-counters")]
 pub(crate) mod perf;
 
-use super::{FrameTracker, PhysPageNum};
+use super::{FaultRetry, FaultRetryReason, FrameTracker, PhysPageNum};
 use crate::config::PAGE_SIZE;
 use crate::fs::MountId;
 use crate::perf as kernel_perf;
@@ -16,7 +16,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use lazy_static::*;
 
-pub(crate) use load_gate::PageCacheLoadGate;
+pub(crate) use load_gate::{PageCacheGenerationGate, PageCacheLoadGate};
 
 // CONTEXT: This is a bounded transition toward watermark-driven reclaim. The
 // smallest default run configuration has 12 GiB, so retaining 512 MiB of
@@ -186,10 +186,22 @@ pub(crate) enum ReadCacheLoadReservation {
     StaleGeneration,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
 struct PageCacheGeneration {
     value: usize,
     active_mutations: usize,
+    completion_seq: usize,
+    gate: Option<Arc<PageCacheGenerationGate>>,
+}
+
+impl Default for PageCacheGeneration {
+    fn default() -> Self {
+        Self {
+            value: 0,
+            active_mutations: 0,
+            completion_seq: 0,
+            gate: None,
+        }
+    }
 }
 
 /// Keeps one file-content mutation inside an unstable generation epoch.
@@ -201,7 +213,10 @@ pub(crate) struct PageCacheMutationGuard {
 
 impl Drop for PageCacheMutationGuard {
     fn drop(&mut self) {
-        PAGE_CACHE.write(self.id).end_mutation(self.id);
+        let completed_gate = PAGE_CACHE.write(self.id).end_mutation(self.id);
+        if let Some(gate) = completed_gate {
+            gate.complete();
+        }
     }
 }
 
@@ -319,6 +334,36 @@ impl PageCache {
         }
     }
 
+    pub(crate) fn generation_waiter(
+        &self,
+        id: PageCacheId,
+    ) -> Option<(usize, Arc<PageCacheGenerationGate>)> {
+        let generation = self.generations.get(&id)?;
+        if generation.active_mutations == 0 {
+            return None;
+        }
+        Some((
+            generation.completion_seq,
+            generation
+                .gate
+                .as_ref()
+                .expect("active page-cache generation lost its completion gate")
+                .clone(),
+        ))
+    }
+
+    pub(crate) fn generation_fault_retry(
+        &self,
+        id: PageCacheId,
+        stable_reason: FaultRetryReason,
+    ) -> FaultRetry {
+        if let Some((completion_seq, gate)) = self.generation_waiter(id) {
+            FaultRetry::generation_wait(completion_seq, gate)
+        } else {
+            FaultRetry::immediate(stable_reason)
+        }
+    }
+
     pub(crate) fn current_key_from_file_offset(
         &self,
         id: PageCacheId,
@@ -381,6 +426,11 @@ impl PageCache {
                     .value
                     .checked_add(1)
                     .expect("page-cache inode generation exhausted");
+                assert!(
+                    generation.gate.is_none(),
+                    "stable page-cache generation retained a completion gate"
+                );
+                generation.gate = Some(Arc::new(PageCacheGenerationGate::new()));
             }
             generation.active_mutations = generation
                 .active_mutations
@@ -418,8 +468,8 @@ impl PageCache {
         (removed, scanned)
     }
 
-    fn end_mutation(&mut self, id: PageCacheId) {
-        let finished_epoch = {
+    fn end_mutation(&mut self, id: PageCacheId) -> Option<Arc<PageCacheGenerationGate>> {
+        let completed_gate = {
             let generation = self
                 .generations
                 .get_mut(&id)
@@ -431,14 +481,24 @@ impl PageCache {
                     .value
                     .checked_add(1)
                     .expect("page-cache inode generation exhausted");
-                true
+                generation.completion_seq = generation
+                    .completion_seq
+                    .checked_add(1)
+                    .expect("page-cache generation completion sequence exhausted");
+                Some(
+                    generation
+                        .gate
+                        .take()
+                        .expect("page-cache mutation epoch lost its completion gate"),
+                )
             } else {
-                false
+                None
             }
         };
-        if finished_epoch {
+        if completed_gate.is_some() {
             kernel_perf::record_page_cache_generation_epoch_finish();
         }
+        completed_gate
     }
 
     fn touch(&mut self, key: PageCacheKey, old_stamp: Option<usize>) -> usize {
