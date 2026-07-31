@@ -247,6 +247,7 @@ fn read_uts_name_ctx(
     let buffers = translated_byte_buffer_checked_ctx(ctx, name, len, UserBufferAccess::Read)?;
     let mut offset = 0;
     for buffer in buffers {
+        let buffer = buffer.as_slice();
         let end = offset + buffer.len();
         field[offset..end].copy_from_slice(buffer);
         offset = end;

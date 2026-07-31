@@ -70,7 +70,7 @@ impl Pipe {
                 continue;
             }
             let mut copied = 0usize;
-            for buffer in buf.buffers.iter_mut() {
+            for buffer in buf.segments_mut() {
                 if copied == loop_read {
                     break;
                 }
@@ -122,7 +122,7 @@ impl Pipe {
             let write_len = loop_write.min(want_to_write - already_write);
             let mut skipped = 0usize;
             let mut written = 0usize;
-            for buffer in buf.buffers.iter() {
+            for buffer in buf.segments() {
                 if skipped + buffer.len() <= already_write {
                     skipped += buffer.len();
                     continue;

@@ -97,7 +97,7 @@ impl File for Stdout {
     }
     fn write(&self, user_buf: UserBuffer) -> usize {
         let len = user_buf.len();
-        UART.write_byte_slices(user_buf.buffers.iter().map(|buffer| &(**buffer)[..]));
+        UART.write_byte_slices(user_buf.segments());
         len
     }
     fn poll(&self, events: PollEvents) -> PollEvents {

@@ -650,7 +650,7 @@ fn cache_dirty_regular_user_buffer_write(
     if len == 0 {
         return DirtyCacheWriteResult::Cached(0);
     }
-    if buf.buffers.iter().any(|slice| slice.len() % PAGE_SIZE != 0) {
+    if buf.segments().any(|slice| slice.len() % PAGE_SIZE != 0) {
         return DirtyCacheWriteResult::Fallback;
     }
     let node = state.node();
@@ -711,7 +711,7 @@ fn cache_dirty_regular_user_buffer_write(
     dirty.mtime = timestamp;
     dirty.ctime = timestamp;
     let mut page_index = page_start;
-    for source in buf.buffers.iter() {
+    for source in buf.segments() {
         for chunk in source.chunks(PAGE_SIZE) {
             record_dirty_overlay_locked_alloc(chunk.len());
             dirty
@@ -1401,11 +1401,11 @@ impl VfsFile {
             .then(|| begin_regular_file_page_cache_mutation(self.node, self.kind))
             .flatten();
         let mut total_write_size = 0usize;
-        perf::record_vfs_write_user_buffer(buf.buffers.len());
-        if self.kind == FsNodeKind::RegularFile && buf.buffers.len() > 1 {
+        perf::record_vfs_write_user_buffer(buf.segment_count());
+        if self.kind == FsNodeKind::RegularFile && buf.segment_count() > 1 {
             return self.write_coalesced_user_buffer(&mut offset, &buf);
         }
-        for slice in buf.buffers.iter() {
+        for slice in buf.segments() {
             let write_size = self.write_at_chunks(*offset, slice);
             *offset = offset.checked_add(write_size).unwrap_or(usize::MAX);
             total_write_size = total_write_size.saturating_add(write_size);
@@ -1419,7 +1419,7 @@ impl VfsFile {
     fn write_coalesced_user_buffer(&self, offset: &mut usize, buf: &UserBuffer) -> usize {
         let mut total_write_size = 0usize;
         let mut bounce = Vec::with_capacity(VFS_WRITE_CHUNK_SIZE);
-        for slice in &buf.buffers {
+        for slice in buf.segments() {
             let mut remaining: &[u8] = &slice[..];
             while !remaining.is_empty() {
                 let available = VFS_WRITE_CHUNK_SIZE - bounce.len();
@@ -1627,7 +1627,7 @@ impl VfsFile {
             return None;
         }
         let mut total_read_size = 0usize;
-        for slice in buf.buffers.iter_mut() {
+        for slice in buf.segments_mut() {
             let read_size = self.read_snapshot_at(*offset, slice)?;
             if read_size == 0 {
                 break;
@@ -1647,7 +1647,7 @@ impl VfsFile {
         buf: &mut UserBuffer,
     ) -> Option<usize> {
         if self.kind != FsNodeKind::RegularFile
-            || buf.buffers.len() <= 1
+            || buf.segment_count() <= 1
             || buf.len() <= VFS_READ_CACHE_MAX_FILE_SIZE
         {
             return None;
@@ -1664,12 +1664,8 @@ impl VfsFile {
         let mut buffer_offset = 0usize;
         let mut total_read_size = 0usize;
         loop {
-            let read_limit = user_buffer_chunk_len(
-                buf.buffers.as_slice(),
-                buffer_index,
-                buffer_offset,
-                VFS_READ_CHUNK_SIZE,
-            );
+            let read_limit =
+                user_buffer_chunk_len(buf, buffer_index, buffer_offset, VFS_READ_CHUNK_SIZE);
             if read_limit == 0 {
                 break;
             }
@@ -1685,7 +1681,7 @@ impl VfsFile {
             }
             perf::record_vfs_read_coalesced(read_size);
             let copied = copy_into_user_buffer(
-                buf.buffers.as_mut_slice(),
+                buf,
                 &mut buffer_index,
                 &mut buffer_offset,
                 &bounce[..read_size],
@@ -2218,14 +2214,17 @@ impl VfsFile {
 }
 
 fn user_buffer_chunk_len(
-    buffers: &[&'static mut [u8]],
+    buffers: &UserBuffer,
     mut buffer_index: usize,
     mut buffer_offset: usize,
     limit: usize,
 ) -> usize {
     let mut len = 0usize;
-    while buffer_index < buffers.len() && len < limit {
-        let buffer_len = buffers[buffer_index].len();
+    while buffer_index < buffers.segment_count() && len < limit {
+        let buffer_len = buffers
+            .segment(buffer_index)
+            .expect("user-buffer segment index disappeared")
+            .len();
         if buffer_offset >= buffer_len {
             buffer_index += 1;
             buffer_offset = 0;
@@ -2240,21 +2239,29 @@ fn user_buffer_chunk_len(
 }
 
 fn copy_into_user_buffer(
-    buffers: &mut [&'static mut [u8]],
+    buffers: &mut UserBuffer,
     buffer_index: &mut usize,
     buffer_offset: &mut usize,
     src: &[u8],
 ) -> usize {
     let mut copied = 0usize;
     while copied < src.len() {
-        while *buffer_index < buffers.len() && *buffer_offset >= buffers[*buffer_index].len() {
+        while *buffer_index < buffers.segment_count()
+            && *buffer_offset
+                >= buffers
+                    .segment(*buffer_index)
+                    .expect("user-buffer segment index disappeared")
+                    .len()
+        {
             *buffer_index += 1;
             *buffer_offset = 0;
         }
-        if *buffer_index >= buffers.len() {
+        if *buffer_index >= buffers.segment_count() {
             break;
         }
-        let dst = &mut buffers[*buffer_index][*buffer_offset..];
+        let dst = &mut buffers
+            .segment_mut(*buffer_index)
+            .expect("user-buffer segment index disappeared")[*buffer_offset..];
         let take = dst.len().min(src.len() - copied);
         dst[..take].copy_from_slice(&src[copied..copied + take]);
         copied += take;
@@ -2898,7 +2905,7 @@ impl File for VfsFile {
         } else if let Some(read_size) = self.read_coalesced_user_buffer(&mut offset, &mut buf) {
             total_read_size = read_size;
         } else {
-            for slice in buf.buffers.iter_mut() {
+            for slice in buf.segments_mut() {
                 let read_size = (if has_dirty_pages {
                     None
                 } else {

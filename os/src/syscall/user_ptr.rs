@@ -1,13 +1,13 @@
 use crate::mm::{
     FaultOrigin, FaultRetryReason, FrameTracker, MemorySet, MmapFaultAccess, PageTable, StepByOne,
-    TranslatedUserBuffer, UserFaultFatal, UserFaultOutcome, VirtAddr, record_fault_retry,
-    record_fault_retry_chain, record_fault_retry_wait, record_fault_retry_yield,
-    record_usercopy_fault_retry_terminal, resolve_user_page_fault,
+    TranslatedUserBuffer, UserFaultFatal, UserFaultOutcome, UserSegment, VirtAddr,
+    record_fault_retry, record_fault_retry_chain, record_fault_retry_wait,
+    record_fault_retry_yield, record_usercopy_fault_retry_terminal, resolve_user_page_fault,
 };
 use crate::perf;
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use core::mem::{MaybeUninit, size_of};
 use core::ops::{Deref, DerefMut};
 
@@ -331,6 +331,7 @@ fn translated_byte_buffer_checked_with_resolver(
     fault_handler: UserFaultResolver,
 ) -> KResult<TranslatedUserBuffer> {
     if len == 0 {
+        perf::record_usercopy_translated_shape(0);
         return Ok(TranslatedUserBuffer::empty());
     }
     // CONTEXT: brk growth is VMA-reserved and materialized lazily. Default
@@ -342,30 +343,40 @@ fn translated_byte_buffer_checked_with_resolver(
     if start_va.floor() == VirtAddr::from(end - 1).floor() {
         let (pte, pin) = checked_and_pin_user_pte(token, start, access, &fault_handler)?;
         let offset = start_va.page_offset();
-        let buffers = vec![&mut pte.ppn().get_bytes_array()[offset..offset + len]];
         perf::record_usercopy_checked_range(1, len);
-        return Ok(TranslatedUserBuffer::new(buffers, vec![pin]));
+        perf::record_usercopy_translated_shape(1);
+        return Ok(TranslatedUserBuffer::one(
+            &mut pte.ppn().get_bytes_array()[offset..offset + len],
+            pin,
+        ));
     }
-    let mut buffers = Vec::new();
-    let mut pins = Vec::new();
+    let last_vpn = VirtAddr::from(end - 1).floor();
+    let segment_count = last_vpn.0 - start_va.floor().0 + 1;
+    let mut segments = Vec::new();
+    segments
+        .try_reserve_exact(segment_count)
+        .map_err(|_| Errno::ENOMEM)?;
+    perf::record_usercopy_segment_vec_alloc(segments.capacity());
     while start < end {
         let start_va = VirtAddr::from(start);
         let mut vpn = start_va.floor();
         let (pte, pin) = checked_and_pin_user_pte(token, start, access, &fault_handler)?;
         let ppn = pte.ppn();
-        pins.push(pin);
         vpn.step();
         let mut end_va: VirtAddr = vpn.into();
         end_va = end_va.min(VirtAddr::from(end));
-        if end_va.page_offset() == 0 {
-            buffers.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
+        let slice = if end_va.page_offset() == 0 {
+            &mut ppn.get_bytes_array()[start_va.page_offset()..]
         } else {
-            buffers.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
-        }
+            &mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]
+        };
+        segments.push(UserSegment::new(slice, pin));
         start = end_va.into();
     }
-    perf::record_usercopy_checked_range(buffers.len(), len);
-    Ok(TranslatedUserBuffer::new(buffers, pins))
+    debug_assert_eq!(segments.len(), segment_count);
+    perf::record_usercopy_checked_range(segments.len(), len);
+    perf::record_usercopy_translated_shape(segments.len());
+    Ok(TranslatedUserBuffer::from_segments(segments))
 }
 
 fn checked_and_pin_user_pte(
@@ -1036,7 +1047,8 @@ fn copy_from_user_with_resolver(
 
 fn copy_to_user_buffers(buffers: TranslatedUserBuffer, src: &[u8]) {
     let mut copied = 0usize;
-    for buffer in buffers {
+    for mut buffer in buffers {
+        let buffer = buffer.as_mut_slice();
         let next = copied + buffer.len();
         buffer.copy_from_slice(&src[copied..next]);
         copied = next;

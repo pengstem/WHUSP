@@ -146,7 +146,14 @@ def validate(
     probe_passes = [
         line for line in lines if line.startswith("FAULT_RETRY_PROBE_PASS ")
     ]
-    if len(probe_passes) != 1 or "bad_address=EFAULT" not in probe_passes[0]:
+    if (
+        len(probe_passes) != 1
+        or "bad_address=EFAULT" not in probe_passes[0]
+        or "segments=0,1,2,N" not in probe_passes[0]
+        or "mid_fault=128" not in probe_passes[0]
+        or "append=PASS" not in probe_passes[0]
+        or "truncate=PASS" not in probe_passes[0]
+    ):
         errors.append(f"probe pass marker mismatch: {probe_passes}")
     if any("FAULT_RETRY_PROBE_FAIL" in line or "FAULT_RETRY_GUEST_FAIL" in line for line in lines):
         errors.append("guest emitted a failure marker")
@@ -175,12 +182,26 @@ def validate(
         "fault_usercopy_retry_waits",
         "fault_usercopy_retry_resolved",
         "fault_usercopy_max_consecutive_retry",
+        "usercopy_translated_empty_calls",
+        "usercopy_translated_inline_one_calls",
+        "usercopy_translated_many_calls",
+        "usercopy_translated_many_segments",
+        "usercopy_segment_vec_allocs",
+        "usercopy_segment_vec_slots",
     )
     for key in required_positive:
         if perf_delta.get(key, 0) == 0:
-            errors.append(f"required retry counter did not increase: {key}")
+            errors.append(f"required probe counter did not increase: {key}")
     if perf_delta.get("fault_usercopy_retry_fatal", 0) != 0:
         errors.append("retryable usercopy fault became fatal")
+    if perf_delta.get("usercopy_translated_many_segments", 0) < 2 * perf_delta.get(
+        "usercopy_translated_many_calls", 0
+    ):
+        errors.append("Many carrier shape conservation failed")
+    if perf_delta.get("usercopy_segment_vec_slots", 0) < 2 * perf_delta.get(
+        "usercopy_segment_vec_allocs", 0
+    ):
+        errors.append("segment Vec allocation slot conservation failed")
 
     policies = list(bench.BLOCK_IO_POLICY_RE.finditer(log))
     if (

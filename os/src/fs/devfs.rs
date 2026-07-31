@@ -1289,7 +1289,7 @@ fn write_loop_device_at(id: usize, offset: usize, buf: &[u8]) -> usize {
 fn read_loop_device(id: usize, offset: &UPIntrFreeCell<usize>, mut user_buf: UserBuffer) -> usize {
     let mut current = offset.exclusive_access();
     let mut total = 0usize;
-    for slice in user_buf.buffers.iter_mut() {
+    for slice in user_buf.segments_mut() {
         let read_size = read_loop_device_at(id, *current, slice);
         if read_size == 0 {
             break;
@@ -1303,7 +1303,7 @@ fn read_loop_device(id: usize, offset: &UPIntrFreeCell<usize>, mut user_buf: Use
 fn write_loop_device(id: usize, offset: &UPIntrFreeCell<usize>, user_buf: UserBuffer) -> usize {
     let mut current = offset.exclusive_access();
     let mut total = 0usize;
-    for slice in user_buf.buffers.iter() {
+    for slice in user_buf.segments() {
         let write_size = write_loop_device_at(id, *current, slice);
         if write_size == 0 {
             break;
@@ -1718,13 +1718,13 @@ fn read_console(user_buf: UserBuffer) -> usize {
 
 fn write_console(user_buf: UserBuffer) -> usize {
     let len = user_buf.len();
-    UART.write_byte_slices(user_buf.buffers.iter().map(|buffer| &(**buffer)[..]));
+    UART.write_byte_slices(user_buf.segments());
     len
 }
 
 fn read_zero(mut user_buf: UserBuffer) -> usize {
     let len = user_buf.len();
-    for buffer in user_buf.buffers.iter_mut() {
+    for buffer in user_buf.segments_mut() {
         buffer.fill(0);
     }
     perf::record_dev_zero_read(len, 0, len);
@@ -1738,7 +1738,7 @@ fn read_random(mut user_buf: UserBuffer) -> usize {
     let mut random = CompatibilityRandom::new(context);
     let mut byte_writes = 0usize;
     let mut word_fill_bytes = 0usize;
-    for buffer in user_buf.buffers.iter_mut() {
+    for buffer in user_buf.segments_mut() {
         let (buffer_byte_writes, buffer_word_fill_bytes) = random.fill(buffer);
         byte_writes += buffer_byte_writes;
         word_fill_bytes += buffer_word_fill_bytes;
@@ -1932,7 +1932,7 @@ fn should_deliver_uinput_event(device: &InputDeviceConfig, event: LinuxInputEven
 fn write_uinput(user_buf: UserBuffer, config: &UPIntrFreeCell<UInputConfig>) -> usize {
     let len = user_buf.len();
     let mut data = Vec::with_capacity(len);
-    for slice in user_buf.buffers.iter() {
+    for slice in user_buf.segments() {
         data.extend_from_slice(slice);
     }
 
@@ -2018,7 +2018,7 @@ fn read_pty(
 
         let read_len = available.min(want_to_read);
         let mut copied = 0usize;
-        for buffer in user_buf.buffers.iter_mut() {
+        for buffer in user_buf.segments_mut() {
             if copied == read_len {
                 break;
             }
@@ -2048,8 +2048,7 @@ fn write_pty(
         return 0;
     }
     let data: Vec<u8> = user_buf
-        .buffers
-        .iter()
+        .segments()
         .flat_map(|buffer| buffer.iter().copied())
         .collect();
     let pty_id = TtyId::Pty(pair.exclusive_access().id);

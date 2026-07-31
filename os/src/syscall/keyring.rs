@@ -673,7 +673,7 @@ fn read_payload(payload: *const u8, len: usize) -> KResult<Vec<u8>> {
     )?;
     let mut payload_bytes = Vec::new();
     for buffer in buffers {
-        payload_bytes.extend_from_slice(buffer);
+        payload_bytes.extend_from_slice(buffer.as_slice());
     }
     Ok(payload_bytes)
 }

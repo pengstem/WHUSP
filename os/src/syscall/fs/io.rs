@@ -241,6 +241,7 @@ fn writev_regular_file_coalesced(
         let chunk_len = chunk.len.min(remaining_len);
         let buffers = truncate_user_buffers(chunk.buffers, chunk_len);
         for slice in buffers {
+            let slice = slice.as_slice();
             let mut remaining = &slice[..];
             while !remaining.is_empty() {
                 let available = WRITEV_COALESCE_CHUNK_SIZE - bounce.len();
@@ -320,6 +321,7 @@ fn pwritev_regular_file_coalesced(
         let chunk_len = chunk.len.min(remaining_len);
         let buffers = truncate_user_buffers(chunk.buffers, chunk_len);
         for slice in buffers {
+            let slice = slice.as_slice();
             let mut remaining = &slice[..];
             while !remaining.is_empty() {
                 let available = WRITEV_COALESCE_CHUNK_SIZE - bounce.len();
@@ -353,6 +355,7 @@ fn pwrite_regular_file_coalesced(
     let mut total_written = 0usize;
     let mut bounce = Vec::with_capacity(WRITEV_COALESCE_CHUNK_SIZE);
     for slice in buffers {
+        let slice = slice.as_slice();
         let mut remaining = &slice[..];
         while !remaining.is_empty() {
             let available = WRITEV_COALESCE_CHUNK_SIZE - bounce.len();
@@ -496,14 +499,17 @@ fn collect_iovec_buffers(
 }
 
 fn iovec_buffer_chunk_len(
-    buffers: &[&'static mut [u8]],
+    buffers: &TranslatedUserBuffer,
     mut index: usize,
     mut offset: usize,
     mut limit: usize,
 ) -> usize {
     let mut len = 0usize;
     while limit > 0 && index < buffers.len() {
-        let buffer_len = buffers[index].len();
+        let buffer_len = buffers
+            .segment(index)
+            .expect("translated segment index disappeared")
+            .len();
         if offset >= buffer_len {
             index += 1;
             offset = 0;
@@ -519,14 +525,16 @@ fn iovec_buffer_chunk_len(
 }
 
 fn copy_into_iovec_buffers(
-    buffers: &mut [&'static mut [u8]],
+    buffers: &mut TranslatedUserBuffer,
     index: &mut usize,
     offset: &mut usize,
     src: &[u8],
 ) -> usize {
     let mut copied = 0usize;
     while copied < src.len() && *index < buffers.len() {
-        let buffer = &mut buffers[*index];
+        let buffer = buffers
+            .segment_mut(*index)
+            .expect("translated segment index disappeared");
         if *offset >= buffer.len() {
             *index += 1;
             *offset = 0;
@@ -557,7 +565,7 @@ fn preadv_regular_file_coalesced(
     let mut total_read = 0usize;
     loop {
         let read_limit = iovec_buffer_chunk_len(
-            buffers.as_slice(),
+            &buffers,
             buffer_index,
             buffer_offset,
             PREADV_COALESCE_CHUNK_SIZE,
@@ -570,7 +578,7 @@ fn preadv_regular_file_coalesced(
             break;
         }
         let copied = copy_into_iovec_buffers(
-            buffers.as_mut_slice(),
+            &mut buffers,
             &mut buffer_index,
             &mut buffer_offset,
             &bounce[..read_size],
@@ -792,8 +800,8 @@ fn ensure_fadvise_target(file: &(dyn File + Send + Sync)) -> KResult<()> {
 
 const POSIX_FADV_WILLNEED: i32 = 3;
 
-fn fault_in_read_buffers(buffers: &[&'static mut [u8]]) {
-    for slice in buffers {
+fn fault_in_read_buffers(buffers: &TranslatedUserBuffer) {
+    for slice in buffers.iter() {
         for index in 0..slice.len() {
             // Force the lazy user page to be touched even when a later file
             // permission check makes the syscall fail without copying data.
@@ -1655,7 +1663,8 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> KResul
     let buffers =
         translated_byte_buffer_checked_with_mmap_fault(token, buf, len, UserBufferAccess::Write)?;
     let mut total_read = 0usize;
-    for slice in buffers {
+    for mut slice in buffers {
+        let slice = slice.as_mut_slice();
         let read = file.read_at(offset.checked_add(total_read).ok_or(Errno::EINVAL)?, slice);
         total_read += read;
         if read < slice.len() {
@@ -1710,6 +1719,7 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, len: usize, offset: usize) -> KRe
     } else {
         let mut total_written = 0usize;
         for slice in buffers {
+            let slice = slice.as_slice();
             let written = file.write_at(
                 offset.checked_add(total_written).ok_or(Errno::EINVAL)?,
                 slice,
@@ -1764,7 +1774,8 @@ pub fn sys_preadv(
 
     let mut total_read = 0usize;
     while let Some(chunk) = cursor.next_chunk() {
-        for slice in chunk?.buffers {
+        for mut slice in chunk?.buffers {
+            let slice = slice.as_mut_slice();
             let read = file.read_at(offset, slice);
             total_read += read;
             offset = offset.checked_add(read).ok_or(Errno::EINVAL)?;
@@ -1891,6 +1902,7 @@ pub fn sys_pwritev(
             return Err(err.into());
         }
         for slice in buffers {
+            let slice = slice.as_slice();
             let written = file.write_at(offset, slice);
             total_written += written;
             remaining_len = remaining_len.saturating_sub(written);

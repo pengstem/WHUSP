@@ -549,7 +549,7 @@ fn read_xattr_value(token: usize, value: *const u8, size: usize) -> KResult<Vec<
         translated_byte_buffer_checked_with_mmap_fault(token, value, size, UserBufferAccess::Read)?;
     let mut bytes = Vec::with_capacity(size);
     for buffer in buffers {
-        bytes.extend_from_slice(buffer);
+        bytes.extend_from_slice(buffer.as_slice());
     }
     Ok(bytes)
 }
@@ -639,7 +639,8 @@ fn copy_xattr_list_to_user(token: usize, list: *mut u8, bytes: &[u8]) -> KResult
         UserBufferAccess::Write,
     )?;
     let mut copied = 0usize;
-    for buffer in buffers {
+    for mut buffer in buffers {
+        let buffer = buffer.as_mut_slice();
         let remaining = bytes.len() - copied;
         let count = buffer.len().min(remaining);
         buffer[..count].copy_from_slice(&bytes[copied..copied + count]);

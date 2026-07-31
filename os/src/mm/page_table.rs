@@ -4,7 +4,6 @@ use crate::perf;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
-use core::ops::{Deref, DerefMut};
 
 const PAGE_TABLE_LEVELS: usize = 3;
 const PAGE_TABLE_INDEX_BITS: usize = 9;
@@ -544,116 +543,265 @@ fn largest_fit_kernel_leaf_level(
     0
 }
 
-/// A checked user translation together with allocator references for its pages.
-///
-/// The slices and pins must move together until the copy or File operation is
-/// complete. Keeping this intermediate type separate prevents truncation and
-/// iovec assembly from accidentally dropping a pin before its slice.
-pub(crate) struct TranslatedUserBuffer {
-    buffers: Vec<&'static mut [u8]>,
-    pins: Vec<FrameTracker>,
+/// One translated user-page slice and the allocator reference that keeps its
+/// physical frame alive for the entire syscall or File operation.
+pub(crate) struct UserSegment {
+    slice: &'static mut [u8],
+    _pin: Option<FrameTracker>,
+}
+
+impl UserSegment {
+    pub(crate) fn new(slice: &'static mut [u8], pin: FrameTracker) -> Self {
+        Self {
+            slice,
+            _pin: Some(pin),
+        }
+    }
+
+    fn from_kernel_slice(slice: &'static mut [u8]) -> Self {
+        Self { slice, _pin: None }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.slice.len()
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.slice
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.slice
+    }
+
+    fn truncate(&mut self, len: usize) {
+        assert!(len <= self.slice.len());
+        let ptr = self.slice.as_mut_ptr();
+        self.slice = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+    }
+}
+
+/// A checked user translation with inline storage for its common single-page
+/// shape. Every slice remains paired with its frame pin during append,
+/// truncation, iteration, and conversion to `UserBuffer`.
+pub(crate) enum TranslatedUserBuffer {
+    Empty,
+    One(UserSegment),
+    Many(Vec<UserSegment>),
 }
 
 impl TranslatedUserBuffer {
-    pub(crate) fn new(buffers: Vec<&'static mut [u8]>, pins: Vec<FrameTracker>) -> Self {
-        assert_eq!(
-            buffers.len(),
-            pins.len(),
-            "translated user segments and pins diverged"
-        );
-        Self { buffers, pins }
-    }
-
     pub(crate) fn empty() -> Self {
-        Self {
-            buffers: Vec::new(),
-            pins: Vec::new(),
+        Self::Empty
+    }
+
+    pub(crate) fn one(slice: &'static mut [u8], pin: FrameTracker) -> Self {
+        Self::One(UserSegment::new(slice, pin))
+    }
+
+    pub(crate) fn from_segments(mut segments: Vec<UserSegment>) -> Self {
+        match segments.len() {
+            0 => Self::Empty,
+            1 => Self::One(segments.pop().expect("one translated segment disappeared")),
+            _ => Self::Many(segments),
         }
     }
 
-    pub(crate) fn append(&mut self, mut other: Self) {
-        self.buffers.append(&mut other.buffers);
-        self.pins.append(&mut other.pins);
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(_) => 1,
+            Self::Many(segments) => segments.len(),
+        }
     }
 
-    pub(crate) fn truncate(mut self, mut limit: usize) -> Self {
-        let keep = self
-            .buffers
-            .iter()
-            .position(|buffer| {
-                if limit == 0 {
-                    true
-                } else if buffer.len() <= limit {
-                    limit -= buffer.len();
-                    false
-                } else {
-                    true
+    pub(crate) fn byte_len(&self) -> usize {
+        self.iter().map(<[u8]>::len).sum()
+    }
+
+    pub(crate) fn iter(&self) -> TranslatedUserBufferIter<'_> {
+        match self {
+            Self::Empty => TranslatedUserBufferIter::Empty,
+            Self::One(segment) => TranslatedUserBufferIter::One(Some(segment)),
+            Self::Many(segments) => TranslatedUserBufferIter::Many(segments.iter()),
+        }
+    }
+
+    pub(crate) fn iter_mut(&mut self) -> TranslatedUserBufferIterMut<'_> {
+        match self {
+            Self::Empty => TranslatedUserBufferIterMut::Empty,
+            Self::One(segment) => TranslatedUserBufferIterMut::One(Some(segment)),
+            Self::Many(segments) => TranslatedUserBufferIterMut::Many(segments.iter_mut()),
+        }
+    }
+
+    pub(crate) fn segment(&self, index: usize) -> Option<&[u8]> {
+        match self {
+            Self::Empty => None,
+            Self::One(segment) => (index == 0).then(|| segment.as_slice()),
+            Self::Many(segments) => segments.get(index).map(UserSegment::as_slice),
+        }
+    }
+
+    pub(crate) fn segment_mut(&mut self, index: usize) -> Option<&mut [u8]> {
+        match self {
+            Self::Empty => None,
+            Self::One(segment) => (index == 0).then(|| segment.as_mut_slice()),
+            Self::Many(segments) => segments.get_mut(index).map(UserSegment::as_mut_slice),
+        }
+    }
+
+    pub(crate) fn append(&mut self, other: Self) {
+        let current = core::mem::replace(self, Self::Empty);
+        *self = match (current, other) {
+            (Self::Empty, other) => other,
+            (current, Self::Empty) => current,
+            (Self::One(first), Self::One(second)) => {
+                let mut segments = Vec::with_capacity(2);
+                crate::perf::record_usercopy_segment_vec_alloc(segments.capacity());
+                segments.push(first);
+                segments.push(second);
+                Self::Many(segments)
+            }
+            (Self::One(first), Self::Many(mut segments)) => {
+                let old_capacity = segments.capacity();
+                segments.insert(0, first);
+                if segments.capacity() > old_capacity {
+                    crate::perf::record_usercopy_segment_vec_alloc(segments.capacity());
                 }
-            })
-            .unwrap_or(self.buffers.len());
-        if keep < self.buffers.len() && limit > 0 {
-            let buffer = &mut self.buffers[keep];
-            let ptr = buffer.as_mut_ptr();
-            *buffer = unsafe { core::slice::from_raw_parts_mut(ptr, limit) };
-            self.buffers.truncate(keep + 1);
-            self.pins.truncate(keep + 1);
-        } else {
-            self.buffers.truncate(keep);
-            self.pins.truncate(keep);
+                Self::Many(segments)
+            }
+            (Self::Many(mut segments), Self::One(segment)) => {
+                let old_capacity = segments.capacity();
+                segments.push(segment);
+                if segments.capacity() > old_capacity {
+                    crate::perf::record_usercopy_segment_vec_alloc(segments.capacity());
+                }
+                Self::Many(segments)
+            }
+            (Self::Many(mut segments), Self::Many(mut other)) => {
+                let old_capacity = segments.capacity();
+                segments.append(&mut other);
+                if segments.capacity() > old_capacity {
+                    crate::perf::record_usercopy_segment_vec_alloc(segments.capacity());
+                }
+                Self::Many(segments)
+            }
+        };
+    }
+
+    pub(crate) fn truncate(self, mut limit: usize) -> Self {
+        match self {
+            Self::Empty => Self::Empty,
+            Self::One(mut segment) => {
+                if limit == 0 {
+                    Self::Empty
+                } else {
+                    if limit < segment.len() {
+                        segment.truncate(limit);
+                    }
+                    Self::One(segment)
+                }
+            }
+            Self::Many(mut segments) => {
+                let keep = segments
+                    .iter()
+                    .position(|segment| {
+                        if limit == 0 {
+                            true
+                        } else if segment.len() <= limit {
+                            limit -= segment.len();
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .unwrap_or(segments.len());
+                if keep < segments.len() && limit > 0 {
+                    segments[keep].truncate(limit);
+                    segments.truncate(keep + 1);
+                } else {
+                    segments.truncate(keep);
+                }
+                Self::from_segments(segments)
+            }
         }
-        self
-    }
-
-    fn into_parts(self) -> (Vec<&'static mut [u8]>, Vec<FrameTracker>) {
-        (self.buffers, self.pins)
     }
 }
 
-impl Deref for TranslatedUserBuffer {
-    type Target = Vec<&'static mut [u8]>;
+pub(crate) enum TranslatedUserBufferIter<'a> {
+    Empty,
+    One(Option<&'a UserSegment>),
+    Many(core::slice::Iter<'a, UserSegment>),
+}
 
-    fn deref(&self) -> &Self::Target {
-        &self.buffers
+impl<'a> Iterator for TranslatedUserBufferIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty => None,
+            Self::One(segment) => segment.take().map(UserSegment::as_slice),
+            Self::Many(segments) => segments.next().map(UserSegment::as_slice),
+        }
     }
 }
 
-impl DerefMut for TranslatedUserBuffer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.buffers
+pub(crate) enum TranslatedUserBufferIterMut<'a> {
+    Empty,
+    One(Option<&'a mut UserSegment>),
+    Many(core::slice::IterMut<'a, UserSegment>),
+}
+
+impl<'a> Iterator for TranslatedUserBufferIterMut<'a> {
+    type Item = &'a mut [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty => None,
+            Self::One(segment) => segment.take().map(UserSegment::as_mut_slice),
+            Self::Many(segments) => segments.next().map(UserSegment::as_mut_slice),
+        }
     }
 }
 
-pub(crate) struct TranslatedUserBufferIntoIter {
-    buffers: alloc::vec::IntoIter<&'static mut [u8]>,
-    _pins: Vec<FrameTracker>,
+pub(crate) enum TranslatedUserBufferIntoIter {
+    Empty,
+    One(Option<UserSegment>),
+    Many(alloc::vec::IntoIter<UserSegment>),
 }
 
 impl Iterator for TranslatedUserBufferIntoIter {
-    type Item = &'static mut [u8];
+    type Item = UserSegment;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.buffers.next()
+        match self {
+            Self::Empty => None,
+            Self::One(segment) => segment.take(),
+            Self::Many(segments) => segments.next(),
+        }
     }
 }
 
 impl IntoIterator for TranslatedUserBuffer {
-    type Item = &'static mut [u8];
+    type Item = UserSegment;
     type IntoIter = TranslatedUserBufferIntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        TranslatedUserBufferIntoIter {
-            buffers: self.buffers.into_iter(),
-            _pins: self.pins,
+        match self {
+            Self::Empty => TranslatedUserBufferIntoIter::Empty,
+            Self::One(segment) => TranslatedUserBufferIntoIter::One(Some(segment)),
+            Self::Many(segments) => TranslatedUserBufferIntoIter::Many(segments.into_iter()),
         }
     }
 }
 
 impl<'a> IntoIterator for &'a TranslatedUserBuffer {
-    type Item = &'a &'static mut [u8];
-    type IntoIter = core::slice::Iter<'a, &'static mut [u8]>;
+    type Item = &'a [u8];
+    type IntoIter = TranslatedUserBufferIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.buffers.iter()
+        self.iter()
     }
 }
 
@@ -661,64 +809,71 @@ impl<'a> IntoIterator for &'a TranslatedUserBuffer {
 // this segmented buffer type for legacy in-kernel adapters that still iterate
 // translated slices directly.
 pub struct UserBuffer {
-    pub buffers: Vec<&'static mut [u8]>,
-    // Keep every translated user page allocated for the entire possibly
-    // sleeping File operation. Mapping removal may clear its PTE meanwhile,
-    // but the physical frame cannot be recycled until this buffer is dropped.
-    _pins: Vec<FrameTracker>,
+    translated: TranslatedUserBuffer,
 }
 
 impl UserBuffer {
     pub(crate) fn new(translated: TranslatedUserBuffer) -> Self {
-        let (buffers, pins) = translated.into_parts();
-        Self {
-            buffers,
-            _pins: pins,
-        }
+        Self { translated }
     }
+
     /// Wraps a kernel-owned slice for synchronous in-kernel File trait I/O.
     ///
     /// The returned buffer must be consumed immediately and must not be stored
     /// by the callee. It exists for legacy File::read/write adapters that still
     /// use UserBuffer as their byte carrier even when the source is kernel memory.
     pub fn from_kernel_slice_for_sync_io(buf: &mut [u8]) -> Self {
+        if buf.is_empty() {
+            return Self::new(TranslatedUserBuffer::Empty);
+        }
         let slice = unsafe { core::mem::transmute::<&mut [u8], &'static mut [u8]>(buf) };
-        Self {
-            buffers: vec![slice],
-            _pins: Vec::new(),
-        }
+        Self::new(TranslatedUserBuffer::One(UserSegment::from_kernel_slice(
+            slice,
+        )))
     }
+
     pub fn len(&self) -> usize {
-        let mut total: usize = 0;
-        for b in self.buffers.iter() {
-            total += b.len();
-        }
-        total
+        self.translated.byte_len()
     }
+
+    pub(crate) fn segment_count(&self) -> usize {
+        self.translated.len()
+    }
+
+    pub(crate) fn segments(&self) -> TranslatedUserBufferIter<'_> {
+        self.translated.iter()
+    }
+
+    pub(crate) fn segments_mut(&mut self) -> TranslatedUserBufferIterMut<'_> {
+        self.translated.iter_mut()
+    }
+
+    pub(crate) fn segment(&self, index: usize) -> Option<&[u8]> {
+        self.translated.segment(index)
+    }
+
+    pub(crate) fn segment_mut(&mut self, index: usize) -> Option<&mut [u8]> {
+        self.translated.segment_mut(index)
+    }
+
     pub fn copy_from_slice(&mut self, src: &[u8]) -> usize {
         let mut copied = 0usize;
-        for buffer in self.buffers.iter_mut() {
+        for buffer in self.segments_mut() {
             if copied == src.len() {
                 break;
             }
-            let dst = &mut **buffer;
-            let len = dst.len().min(src.len() - copied);
-            dst[..len].copy_from_slice(&src[copied..copied + len]);
+            let len = buffer.len().min(src.len() - copied);
+            buffer[..len].copy_from_slice(&src[copied..copied + len]);
             copied += len;
         }
         copied
     }
+
     pub fn to_vec(&self) -> Vec<u8> {
         let mut data = Vec::with_capacity(self.len());
-        for buffer in self.buffers.iter() {
+        for buffer in self.segments() {
             data.extend_from_slice(buffer);
         }
         data
     }
-}
-
-// An explicit destructor prevents callers from partially moving `buffers`
-// out and dropping the page pins before the raw slices have been consumed.
-impl Drop for UserBuffer {
-    fn drop(&mut self) {}
 }

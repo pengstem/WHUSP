@@ -207,14 +207,14 @@ fn write_pipefd_pair_ctx(ctx: &SyscallContext, pipefd: *mut i32, fds: [i32; 2]) 
     bytes[fd_size..].copy_from_slice(&fds[1].to_ne_bytes());
 
     let mut copied = 0usize;
-    for buffer in translated_byte_buffer_checked_ctx(
+    for mut buffer in translated_byte_buffer_checked_ctx(
         ctx,
         pipefd as *const u8,
         bytes.len(),
         UserBufferAccess::Write,
     )? {
         let next = copied + buffer.len();
-        buffer.copy_from_slice(&bytes[copied..next]);
+        buffer.as_mut_slice().copy_from_slice(&bytes[copied..next]);
         copied = next;
     }
     Ok(())

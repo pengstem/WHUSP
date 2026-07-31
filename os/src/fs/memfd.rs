@@ -122,7 +122,7 @@ impl File for MemfdFile {
         let mut offset = self.offset.lock();
         let available = inner.data.len().saturating_sub(*offset);
         let mut copied = 0usize;
-        for slice in buf.buffers.iter_mut() {
+        for slice in buf.segments_mut() {
             if copied == available {
                 break;
             }

@@ -469,6 +469,12 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) usercopy_checked_range_calls: usize,
     pub(crate) usercopy_checked_range_pages: usize,
     pub(crate) usercopy_checked_range_bytes: usize,
+    pub(crate) usercopy_translated_empty_calls: usize,
+    pub(crate) usercopy_translated_inline_one_calls: usize,
+    pub(crate) usercopy_translated_many_calls: usize,
+    pub(crate) usercopy_translated_many_segments: usize,
+    pub(crate) usercopy_segment_vec_allocs: usize,
+    pub(crate) usercopy_segment_vec_slots: usize,
     pub(crate) usercopy_range_reuse_hits: usize,
     pub(crate) usercopy_range_reuse_pages: usize,
     pub(crate) usercopy_range_reuse_bytes: usize,
@@ -847,6 +853,12 @@ mod enabled {
     static USERCOPY_CHECKED_RANGE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_CHECKED_RANGE_PAGES: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_CHECKED_RANGE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static USERCOPY_TRANSLATED_EMPTY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static USERCOPY_TRANSLATED_INLINE_ONE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static USERCOPY_TRANSLATED_MANY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static USERCOPY_TRANSLATED_MANY_SEGMENTS: AtomicUsize = AtomicUsize::new(0);
+    static USERCOPY_SEGMENT_VEC_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+    static USERCOPY_SEGMENT_VEC_SLOTS: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_RANGE_REUSE_HITS: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_RANGE_REUSE_PAGES: AtomicUsize = AtomicUsize::new(0);
     static USERCOPY_RANGE_REUSE_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -2325,6 +2337,26 @@ mod enabled {
         USERCOPY_CHECKED_RANGE_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_usercopy_translated_shape(segments: usize) {
+        match segments {
+            0 => {
+                USERCOPY_TRANSLATED_EMPTY_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
+            1 => {
+                USERCOPY_TRANSLATED_INLINE_ONE_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                USERCOPY_TRANSLATED_MANY_CALLS.fetch_add(1, Ordering::Relaxed);
+                USERCOPY_TRANSLATED_MANY_SEGMENTS.fetch_add(segments, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub(crate) fn record_usercopy_segment_vec_alloc(slots: usize) {
+        USERCOPY_SEGMENT_VEC_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        USERCOPY_SEGMENT_VEC_SLOTS.fetch_add(slots, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_usercopy_range_reuse(chunks: usize, pages: usize, bytes: usize) {
         USERCOPY_RANGE_REUSE_HITS.fetch_add(chunks, Ordering::Relaxed);
         USERCOPY_RANGE_REUSE_PAGES.fetch_add(pages, Ordering::Relaxed);
@@ -2834,6 +2866,15 @@ mod enabled {
             usercopy_checked_range_calls: USERCOPY_CHECKED_RANGE_CALLS.load(Ordering::Relaxed),
             usercopy_checked_range_pages: USERCOPY_CHECKED_RANGE_PAGES.load(Ordering::Relaxed),
             usercopy_checked_range_bytes: USERCOPY_CHECKED_RANGE_BYTES.load(Ordering::Relaxed),
+            usercopy_translated_empty_calls: USERCOPY_TRANSLATED_EMPTY_CALLS
+                .load(Ordering::Relaxed),
+            usercopy_translated_inline_one_calls: USERCOPY_TRANSLATED_INLINE_ONE_CALLS
+                .load(Ordering::Relaxed),
+            usercopy_translated_many_calls: USERCOPY_TRANSLATED_MANY_CALLS.load(Ordering::Relaxed),
+            usercopy_translated_many_segments: USERCOPY_TRANSLATED_MANY_SEGMENTS
+                .load(Ordering::Relaxed),
+            usercopy_segment_vec_allocs: USERCOPY_SEGMENT_VEC_ALLOCS.load(Ordering::Relaxed),
+            usercopy_segment_vec_slots: USERCOPY_SEGMENT_VEC_SLOTS.load(Ordering::Relaxed),
             usercopy_range_reuse_hits: USERCOPY_RANGE_REUSE_HITS.load(Ordering::Relaxed),
             usercopy_range_reuse_pages: USERCOPY_RANGE_REUSE_PAGES.load(Ordering::Relaxed),
             usercopy_range_reuse_bytes: USERCOPY_RANGE_REUSE_BYTES.load(Ordering::Relaxed),
@@ -3219,6 +3260,12 @@ mod enabled {
          usercopy_checked_range_calls {}\n\
          usercopy_checked_range_pages {}\n\
          usercopy_checked_range_bytes {}\n\
+         usercopy_translated_empty_calls {}\n\
+         usercopy_translated_inline_one_calls {}\n\
+         usercopy_translated_many_calls {}\n\
+         usercopy_translated_many_segments {}\n\
+         usercopy_segment_vec_allocs {}\n\
+         usercopy_segment_vec_slots {}\n\
          usercopy_range_reuse_hits {}\n\
          usercopy_range_reuse_pages {}\n\
          usercopy_range_reuse_bytes {}\n\
@@ -3586,6 +3633,12 @@ mod enabled {
             stats.usercopy_checked_range_calls,
             stats.usercopy_checked_range_pages,
             stats.usercopy_checked_range_bytes,
+            stats.usercopy_translated_empty_calls,
+            stats.usercopy_translated_inline_one_calls,
+            stats.usercopy_translated_many_calls,
+            stats.usercopy_translated_many_segments,
+            stats.usercopy_segment_vec_allocs,
+            stats.usercopy_segment_vec_slots,
             stats.usercopy_range_reuse_hits,
             stats.usercopy_range_reuse_pages,
             stats.usercopy_range_reuse_bytes,
@@ -4242,6 +4295,12 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_usercopy_checked_range(_pages: usize, _bytes: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_usercopy_translated_shape(_segments: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_usercopy_segment_vec_alloc(_slots: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_usercopy_range_reuse(_chunks: usize, _pages: usize, _bytes: usize) {}

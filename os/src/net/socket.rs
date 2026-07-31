@@ -603,7 +603,7 @@ fn copy_stream_slices_to_user_buffer(
     let source_len = first.len().saturating_add(second.len()).min(limit);
     let mut copied = 0usize;
 
-    for dst in buf.buffers.iter_mut() {
+    for dst in buf.segments_mut() {
         let mut dst_offset = 0usize;
         while dst_offset < dst.len() && copied < source_len {
             let (src, src_offset) = if copied < first.len() {
@@ -1099,8 +1099,7 @@ impl LocalSocket {
 
     fn send_stream_user_buffer(&self, buf: UserBuffer, nonblock: bool) -> KResult<usize> {
         perf::record_local_socket_write_call();
-        let buffers = &buf.buffers;
-        let total_len = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
+        let total_len = buf.len();
         let mut written = 0usize;
         let mut buffer_index = 0usize;
         let mut buffer_offset = 0usize;
@@ -1149,8 +1148,10 @@ impl LocalSocket {
             }
 
             let mut chunk_remaining = available.min(total_len - written);
-            while chunk_remaining > 0 && buffer_index < buffers.len() {
-                let buffer = &buffers[buffer_index];
+            while chunk_remaining > 0 && buffer_index < buf.segment_count() {
+                let buffer = buf
+                    .segment(buffer_index)
+                    .expect("user-buffer segment index disappeared");
                 if buffer_offset >= buffer.len() {
                     buffer_index += 1;
                     buffer_offset = 0;
@@ -1857,7 +1858,7 @@ pub(crate) fn copy_user_to_vec(token: usize, ptr: usize, len: usize) -> KResult<
         len,
         UserBufferAccess::Read,
     )? {
-        data.extend_from_slice(slice);
+        data.extend_from_slice(slice.as_slice());
     }
     Ok(data)
 }
