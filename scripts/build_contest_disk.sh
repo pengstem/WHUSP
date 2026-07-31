@@ -9,6 +9,8 @@ script_dir="${CONTEST_SCRIPT_DIR:-$repo_root/contest-case-commands}"
 tmp_image="${image_path}.tmp"
 lock_path="${CONTEST_SCRIPT_LOCK:-/tmp/whusp-build-contest-disk.lock}"
 interactive="${CONTEST_INTERACTIVE:-0}"
+run_cagent="${CONTEST_RUN_CAGENT:-1}"
+run_buildstorm="${CONTEST_RUN_BUILDSTORM:-1}"
 
 exec 9>"$lock_path"
 flock 9
@@ -28,6 +30,28 @@ case "$interactive" in
         exit 2
         ;;
 esac
+
+append_group_arg() {
+    local value="$1"
+    local enabled_arg="$2"
+    local disabled_arg="$3"
+    local variable_name="$4"
+    case "$value" in
+        1|yes|true|on)
+            exporter_args+=("$enabled_arg")
+            ;;
+        0|no|false|off|"")
+            exporter_args+=("$disabled_arg")
+            ;;
+        *)
+            echo "$variable_name must be one of 0/1, no/yes, false/true, or off/on: $value" >&2
+            exit 2
+            ;;
+    esac
+}
+
+append_group_arg "$run_cagent" --cagent --no-cagent CONTEST_RUN_CAGENT
+append_group_arg "$run_buildstorm" --buildstorm --no-buildstorm CONTEST_RUN_BUILDSTORM
 
 python3 "$repo_root/scripts/export_contest_case_scripts.py" \
     "${exporter_args[@]}"

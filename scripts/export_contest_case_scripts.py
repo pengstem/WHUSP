@@ -43,6 +43,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="enter a BusyBox shell instead of running final-round tests",
     )
+    parser.add_argument(
+        "--cagent",
+        action=argparse.BooleanOptionalAction,
+        default=RUN_CAGENT,
+        help="enable or disable the CAgent group (default: enabled)",
+    )
+    parser.add_argument(
+        "--buildstorm",
+        action=argparse.BooleanOptionalAction,
+        default=RUN_BUILDSTORM,
+        help="enable or disable the BuildStorm group (default: enabled)",
+    )
     return parser.parse_args()
 
 
@@ -226,14 +238,14 @@ def main() -> int:
     write_outputs(
         args.out_dir.resolve(),
         args.force,
-        RUN_CAGENT,
-        RUN_BUILDSTORM,
+        args.cagent,
+        args.buildstorm,
         args.interactive,
     )
     print(
         f"wrote final-round runner to {args.out_dir} "
-        f"(cagent={'on' if RUN_CAGENT else 'off'}, "
-        f"buildstorm={'on' if RUN_BUILDSTORM else 'off'}, "
+        f"(cagent={'on' if args.cagent else 'off'}, "
+        f"buildstorm={'on' if args.buildstorm else 'off'}, "
         f"interactive={'on' if args.interactive else 'off'})"
     )
     return 0

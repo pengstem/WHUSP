@@ -14,6 +14,8 @@ MEM_RV ?= 12G
 MEM_LA ?= 16G
 SMP ?= 8
 INTERACTIVE ?= 0
+RUN_CAGENT ?= 1
+RUN_BUILDSTORM ?= 1
 NO_BUILD ?= 0
 # Must stay in sync with os/src/config.rs and both entry.asm boot stacks.
 MAX_CPUS := 12
@@ -71,7 +73,7 @@ kernel-la:
 	@cp -f $(KERNEL_LA_SRC) kernel-la
 
 contest-disk:
-	@CONTEST_SCRIPT_DISK="$(CONTEST_SCRIPT_DISK)" CONTEST_SCRIPT_DISK_SIZE="$(CONTEST_SCRIPT_DISK_SIZE)" CONTEST_INTERACTIVE="$(INTERACTIVE)" ./scripts/build_contest_disk.sh
+	@CONTEST_SCRIPT_DISK="$(CONTEST_SCRIPT_DISK)" CONTEST_SCRIPT_DISK_SIZE="$(CONTEST_SCRIPT_DISK_SIZE)" CONTEST_INTERACTIVE="$(INTERACTIVE)" CONTEST_RUN_CAGENT="$(RUN_CAGENT)" CONTEST_RUN_BUILDSTORM="$(RUN_BUILDSTORM)" ./scripts/build_contest_disk.sh
 
 check-kernel-rv:
 	@if [ ! -f "$(CURDIR)/kernel-rv" ]; then \
