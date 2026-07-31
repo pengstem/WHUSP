@@ -52,7 +52,8 @@ AUX_DISK_ARGS := $(if $(AUX_DISK),-drive file="$$aux_overlay"$(COMMA)if=none$(CO
 QEMU_NETWORK_ARGS := -device virtio-net-device$(COMMA)netdev=net -netdev user$(COMMA)id=net
 else ifeq ($(ARCH),loongarch64)
 QEMU_SYSTEM := qemu-system-loongarch64
-QEMU_MACHINE_ARGS :=
+LOONGARCH_QEMU_CPU ?= $(shell if $(QEMU_SYSTEM) -machine none -device la464-loongarch-cpu$(COMMA)help 2>&1 | grep -q '^[[:space:]]*ptw=<bool>'; then echo la464$(COMMA)ptw=on; else echo la464; fi)
+QEMU_MACHINE_ARGS := -cpu $(LOONGARCH_QEMU_CPU)
 PRIMARY_DEVICE_ARGS := -device virtio-blk-pci$(COMMA)drive=x0
 AUX_DISK_ARGS := $(if $(AUX_DISK),-drive file="$$aux_overlay"$(COMMA)if=none$(COMMA)format=qcow2$(COMMA)id=x1 -device virtio-blk-pci$(COMMA)drive=x1)
 QEMU_NETWORK_ARGS := -device virtio-net-pci$(COMMA)netdev=net0 -netdev user$(COMMA)id=net0

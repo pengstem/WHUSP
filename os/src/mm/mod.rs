@@ -62,6 +62,7 @@ pub struct KernelMappingStats {
 pub fn init() {
     heap_allocator::init_heap();
     frame_allocator::init_frame_allocator();
+    heap_allocator::enable_slab_allocator();
     let start_us = crate::timer::get_time_us();
     let kernel_space = KERNEL_SPACE.exclusive_access();
     kernel_space.activate();

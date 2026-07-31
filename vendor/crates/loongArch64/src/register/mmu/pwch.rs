@@ -27,6 +27,11 @@ impl Pwch {
     pub fn dir4_width(&self) -> usize {
         self.bits.get_bits(18..=23)
     }
+
+    /// Whether hardware page-table walking is enabled.
+    pub fn hptw_enabled(&self) -> bool {
+        self.bits.get_bit(24)
+    }
 }
 /// Set the starting address of the level 3 directory.
 pub fn set_dir3_base(val: usize) {
@@ -45,6 +50,11 @@ pub fn set_dir4_width(val: usize) {
     set_csr_loong_bits!(0x1d, 18..=23, val);
 }
 
+/// Enable hardware page-table walking when the CPU advertises the feature.
+pub fn set_hptw_enabled(enabled: bool) {
+    set_csr_loong_bit!(0x1d, 24, enabled);
+}
+
 impl Debug for Pwch {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PWCH")
@@ -52,6 +62,7 @@ impl Debug for Pwch {
             .field("dir3_width", &self.dir3_width())
             .field("dir4_base", &self.dir4_base())
             .field("dir4_width", &self.dir3_width())
+            .field("hptw_enabled", &self.hptw_enabled())
             .finish()
     }
 }

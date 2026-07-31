@@ -42,7 +42,7 @@ pub fn init() {
     euen::set_fpe(true);
     euen::set_sxe(lsx);
     euen::set_asxe(lasx);
-    tlb_init();
+    tlb_init(extension_config.get_bit(24));
     set_kernel_trap_entry();
 }
 
@@ -81,7 +81,7 @@ pub fn enable_external_interrupt() {
 const PS_4K: usize = 0x0c;
 const PAGE_SIZE_SHIFT: usize = 12;
 
-fn tlb_init() {
+fn tlb_init(hardware_page_table_walk: bool) {
     unsafe extern "C" {
         safe fn __tlb_refill();
     }
@@ -98,6 +98,7 @@ fn tlb_init() {
     pwcl::set_dir1_width(PAGE_SIZE_SHIFT - 3);
     pwch::set_dir3_base(PAGE_SIZE_SHIFT + PAGE_SIZE_SHIFT - 3 + PAGE_SIZE_SHIFT - 3);
     pwch::set_dir3_width(PAGE_SIZE_SHIFT - 3);
+    pwch::set_hptw_enabled(hardware_page_table_walk);
     tlbrentry::set_tlbrentry(__tlb_refill as usize & 0x0000_ffff_ffff_ffff);
 }
 
