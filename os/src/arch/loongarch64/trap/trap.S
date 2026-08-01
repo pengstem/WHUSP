@@ -10,6 +10,8 @@
     .equ LA_CSR_PGDH, 0x1a
     .equ LA_CSR_PGD, 0x1b
     .equ LA_CSR_TLBRSAVE, 0x8b
+    .equ LA_CSR_TLBRELO0, 0x8c
+    .equ LA_CSR_TLBRELO1, 0x8d
     .equ VECTOR_OFFSET, 40
     .equ FCC_OFFSET, 168
     .equ FCSR_OFFSET, 169
@@ -264,9 +266,20 @@ __tlb_refill:
     csrwr   $t0, LA_CSR_TLBRSAVE
     csrrd   $t0, LA_CSR_PGD
     lddir   $t0, $t0, 3
+    beqz    $t0, .Ltlb_refill_invalid
     lddir   $t0, $t0, 1
+    beqz    $t0, .Ltlb_refill_invalid
     ldpte   $t0, 0
     ldpte   $t0, 1
+.Ltlb_refill_fill:
     tlbfill
     csrrd   $t0, LA_CSR_TLBRSAVE
     ertn
+
+.Ltlb_refill_invalid:
+    # CONTEXT: Missing intermediate page-table entries are zero in this kernel.
+    # Install an invalid pair so the retry raises a normal page fault instead of
+    # letting LDDIR continue at physical address zero and fabricate a valid PTE.
+    csrwr   $r0, LA_CSR_TLBRELO0
+    csrwr   $r0, LA_CSR_TLBRELO1
+    b       .Ltlb_refill_fill
