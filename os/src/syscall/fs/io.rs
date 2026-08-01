@@ -20,7 +20,10 @@ use super::super::user_ptr::{
     translated_byte_buffer_checked_with_mmap_fault_ctx, write_user_value,
 };
 use super::fanotify::{fanotify_notify_access, fanotify_notify_modify};
-use super::fd::{get_fd_entry_by_fd, get_file_by_fd, get_file_by_fd_for_process};
+use super::fd::{
+    get_fd_entry_by_fd, get_fd_entry_with_fsize_limit_for_process, get_file_by_fd,
+    get_file_by_fd_for_process,
+};
 use super::inotify::{inotify_notify_access, inotify_notify_modify};
 use super::uapi::IOV_MAX;
 use crate::uapi::errno::{Errno, KResult};
@@ -600,14 +603,6 @@ fn current_file_size_limit() -> usize {
         .rlim_cur
 }
 
-fn file_size_limit_for_process(process: &ProcessControlBlock) -> usize {
-    process
-        .inner_exclusive_access()
-        .resource_limits
-        .get(RLimitResource::FSize)
-        .rlim_cur
-}
-
 fn queue_file_size_limit_signal() {
     current_add_signal(SignalFlags::SIGXFSZ);
 }
@@ -654,18 +649,6 @@ fn allowed_write_len_at_with_limit(
 
 fn allowed_write_len_for_entry(entry: &FdTableEntry, requested_len: usize) -> KResult<usize> {
     allowed_write_len_for_entry_with_limit(entry, requested_len, current_file_size_limit())
-}
-
-fn allowed_write_len_for_entry_for_process(
-    process: &ProcessControlBlock,
-    entry: &FdTableEntry,
-    requested_len: usize,
-) -> KResult<usize> {
-    allowed_write_len_for_entry_with_limit(
-        entry,
-        requested_len,
-        file_size_limit_for_process(process),
-    )
 }
 
 fn allowed_write_len_for_entry_with_limit(
@@ -1938,7 +1921,7 @@ pub fn sys_pwritev2(
 
 pub fn sys_write_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize) -> KResult {
     let _profile_scope = perf::time_scope(perf::ProfilePoint::SysWrite);
-    let entry = get_fd_entry_by_fd(fd)?;
+    let (entry, fsize_limit) = get_fd_entry_with_fsize_limit_for_process(ctx.process(), fd)?;
     let file = entry.file();
     if !file.writable() {
         return Err(Errno::EBADF);
@@ -1948,7 +1931,7 @@ pub fn sys_write_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize
     }
     check_pipe_write_peer(&entry, len > 0)?;
     let allowed_len = if file.is_eventfd() {
-        let allowed_len = allowed_write_len_for_entry_for_process(ctx.process(), &entry, len)?;
+        let allowed_len = allowed_write_len_for_entry_with_limit(&entry, len, fsize_limit)?;
         file.check_write(
             allowed_len,
             entry.status_flags().contains(OpenFlags::APPEND),
@@ -1958,7 +1941,7 @@ pub fn sys_write_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize
         allowed_len
     } else {
         ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
-        let allowed_len = allowed_write_len_for_entry_for_process(ctx.process(), &entry, len)?;
+        let allowed_len = allowed_write_len_for_entry_with_limit(&entry, len, fsize_limit)?;
         file.check_write(
             allowed_len,
             entry.status_flags().contains(OpenFlags::APPEND),
@@ -2056,7 +2039,7 @@ fn sys_writev_with_iovecs(
     if iovcnt == 0 {
         return Ok(0);
     }
-    let entry = get_fd_entry_by_fd(fd)?;
+    let (entry, fsize_limit) = get_fd_entry_with_fsize_limit_for_process(process, fd)?;
     let file = entry.file();
     if !file.writable() {
         return Err(Errno::EBADF);
@@ -2067,7 +2050,8 @@ fn sys_writev_with_iovecs(
     }
     check_pipe_write_peer(&entry, has_data)?;
     ensure_nonblocking_ready(&entry, PollEvents::POLLOUT)?;
-    let allowed_len = allowed_write_len_for_entry_for_process(process, &entry, iovecs.total_len)?;
+    let allowed_len =
+        allowed_write_len_for_entry_with_limit(&entry, iovecs.total_len, fsize_limit)?;
     file.check_write(
         allowed_len,
         entry.status_flags().contains(OpenFlags::APPEND),

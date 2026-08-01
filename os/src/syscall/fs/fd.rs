@@ -4,7 +4,7 @@ use crate::fs::{
 };
 use crate::syscall::SyscallContext;
 use crate::task::{
-    FdFlags, FdTableEntry, ProcessControlBlock, current_process, current_user_token,
+    FdFlags, FdTableEntry, ProcessControlBlock, RLimitResource, current_process, current_user_token,
 };
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -66,6 +66,17 @@ pub(super) fn get_fd_entry_by_fd_for_process(
 ) -> KResult<FdTableEntry> {
     let inner = process.inner_exclusive_access();
     inner.fd_entry(fd).ok_or(Errno::EBADF)
+}
+
+/// Snapshots the descriptor and write-size limit under one process-inner guard.
+pub(super) fn get_fd_entry_with_fsize_limit_for_process(
+    process: &ProcessControlBlock,
+    fd: usize,
+) -> KResult<(FdTableEntry, usize)> {
+    let inner = process.inner_exclusive_access();
+    let entry = inner.fd_entry(fd).ok_or(Errno::EBADF)?;
+    let fsize_limit = inner.resource_limits.get(RLimitResource::FSize).rlim_cur;
+    Ok((entry, fsize_limit))
 }
 
 pub(crate) fn get_file_by_fd(fd: usize) -> KResult<Arc<dyn File + Send + Sync>> {

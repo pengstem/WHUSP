@@ -135,7 +135,6 @@ madvise03
 madvise05
 madvise07
 madvise08
-madvise09
 madvise10
 madvise11
 faccessat201
@@ -660,7 +659,6 @@ pwrite01
 pipe14
 splice05
 pwrite01_64
-clone303
 pwrite03_64
 open03
 ioctl_ns02
