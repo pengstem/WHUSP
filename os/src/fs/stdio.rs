@@ -14,10 +14,6 @@ pub struct Stdout {
     status_flags: StatusFlagsCell,
 }
 
-impl super::TtyFileCapability for Stdin {}
-
-impl super::TtyFileCapability for Stdout {}
-
 impl Stdin {
     pub fn new() -> Self {
         Self {
@@ -73,8 +69,8 @@ impl File for Stdin {
     fn set_status_flags(&self, flags: OpenFlags) {
         self.status_flags.set(flags);
     }
-    fn as_tty(&self) -> Option<&dyn super::TtyFileCapability> {
-        Some(self)
+    fn is_tty(&self) -> bool {
+        true
     }
     fn tty_id(&self) -> Option<TtyId> {
         Some(TtyId::Console)
@@ -119,8 +115,8 @@ impl File for Stdout {
     fn set_status_flags(&self, flags: OpenFlags) {
         self.status_flags.set(flags);
     }
-    fn as_tty(&self) -> Option<&dyn super::TtyFileCapability> {
-        Some(self)
+    fn is_tty(&self) -> bool {
+        true
     }
     fn tty_id(&self) -> Option<TtyId> {
         Some(TtyId::Console)

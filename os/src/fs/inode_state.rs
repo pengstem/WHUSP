@@ -90,7 +90,7 @@ impl InodeStateShard {
 
 lazy_static! {
     // These shards are shared by tasks running on different CPUs. Merely
-    // masking local interrupts (UPIntrFreeCell) does not serialize SMP access
+    // masking local interrupts (SpinNoIrqLock) does not serialize SMP access
     // and allowed concurrent BTreeMap mutation to manufacture multiple states
     // for one inode. Keep the table critical section short and SMP-safe; all
     // sleeping per-inode work remains below the Arc returned from the shard.

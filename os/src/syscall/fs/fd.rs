@@ -389,9 +389,9 @@ fn fcntl_get_lease(fd: usize) -> KResult {
     Ok(2)
 }
 
-fn read_memfd_name(name: *const u8) -> KResult {
+fn read_memfd_name(name: *const u8) -> KResult<()> {
     match read_user_c_string(current_user_token(), name, MEMFD_NAME_MAX + 1) {
-        Ok(_) => Ok(0),
+        Ok(_) => Ok(()),
         Err(Errno::ENAMETOOLONG) => Err(Errno::EINVAL),
         Err(err) => Err(err),
     }

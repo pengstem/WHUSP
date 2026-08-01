@@ -60,15 +60,15 @@ fn socket_kind_from_type(ty: i32) -> KResult<SocketKind> {
     }
 }
 
-fn validate_protocol(kind: SocketKind, protocol: i32) -> KResult {
+fn validate_protocol(kind: SocketKind, protocol: i32) -> KResult<()> {
     match (kind, protocol) {
-        (_, IPPROTO_IP) => Ok(0),
-        (SocketKind::Stream, IPPROTO_TCP) => Ok(0),
-        (SocketKind::Datagram, IPPROTO_UDP) => Ok(0),
+        (_, IPPROTO_IP) => Ok(()),
+        (SocketKind::Stream, IPPROTO_TCP) => Ok(()),
+        (SocketKind::Datagram, IPPROTO_UDP) => Ok(()),
         // CONTEXT: LTP bind04/bind05 only require local loopback bind/connect
         // behavior for SCTP and UDP-Lite, so both reuse the existing queues.
-        (SocketKind::Stream, IPPROTO_SCTP) => Ok(0),
-        (SocketKind::Datagram, IPPROTO_UDPLITE) => Ok(0),
+        (SocketKind::Stream, IPPROTO_SCTP) => Ok(()),
+        (SocketKind::Datagram, IPPROTO_UDPLITE) => Ok(()),
         _ => Err(Errno::EPROTONOSUPPORT),
     }
 }

@@ -17,7 +17,7 @@ use super::vfs::{
 use crate::config::MAX_CPUS;
 use crate::drivers::block::BLOCK_DEVICES;
 use crate::perf;
-use crate::sync::{ReadMostlySnapshot, SleepMutex, UPIntrFreeCell};
+use crate::sync::{ReadMostlySnapshot, SleepMutex, SpinNoIrqLock};
 use crate::task::any_process_references_mount;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -317,18 +317,18 @@ pub(crate) struct BlockPartition {
 lazy_static! {
     static ref MOUNTS: SleepMutex<Vec<Option<Arc<MountedFs>>>> = SleepMutex::new(Vec::new());
     static ref MOUNTS_FAST: MountedFsFastState = MountedFsFastState::new();
-    static ref MOUNTS_INITIALIZED: UPIntrFreeCell<bool> = unsafe { UPIntrFreeCell::new(false) };
+    static ref MOUNTS_INITIALIZED: SpinNoIrqLock<bool> = SpinNoIrqLock::new(false);
     // CONTEXT: Dynamic mount metadata stays under interrupt masking only for
     // short table edits. Do not perform filesystem or block I/O while holding it.
-    static ref DYNAMIC_MOUNTS: UPIntrFreeCell<Vec<DynamicMount>> =
-        unsafe { UPIntrFreeCell::new(Vec::new()) };
+    static ref DYNAMIC_MOUNTS: SpinNoIrqLock<Vec<DynamicMount>> =
+        SpinNoIrqLock::new(Vec::new());
     static ref DYNAMIC_MOUNTS_FAST: ReadMostlySnapshot<Vec<DynamicMount>> =
         ReadMostlySnapshot::new(Vec::new());
     static ref DYNAMIC_MOUNTS_FAST_WRITER: SleepMutex<()> = SleepMutex::new(());
     // A short mount-id registry lets drop-time cleanup clone only the target
     // mount's queue without waiting for the sleeping mount/backend locks.
-    static ref PENDING_RELEASE_QUEUES: UPIntrFreeCell<Vec<Option<Arc<PendingReleaseQueue>>>> =
-        unsafe { UPIntrFreeCell::new(Vec::new()) };
+    static ref PENDING_RELEASE_QUEUES: SpinNoIrqLock<Vec<Option<Arc<PendingReleaseQueue>>>> =
+        SpinNoIrqLock::new(Vec::new());
     static ref EXT_SCRATCH_MOUNTS: SleepMutex<Vec<(String, &'static str, Arc<MountedFs>)>> =
         SleepMutex::new(Vec::new());
     static ref NFS_COMPAT_MOUNTS: SleepMutex<Vec<(MountNamespaceId, String, String)>> =
@@ -412,7 +412,7 @@ fn clear_mount_root_ino(mount_id: MountId) {
 }
 
 pub fn init_mounts() {
-    let already_initialized = MOUNTS_INITIALIZED.exclusive_session(|initialized| {
+    let already_initialized = MOUNTS_INITIALIZED.with_lock(|initialized| {
         if *initialized {
             true
         } else {
@@ -526,7 +526,7 @@ impl MountTarget {
 
 fn refresh_dynamic_mount_snapshot() {
     let _writer = DYNAMIC_MOUNTS_FAST_WRITER.lock();
-    let mounts = DYNAMIC_MOUNTS.exclusive_session(|mounts| mounts.clone());
+    let mounts = DYNAMIC_MOUNTS.with_lock(|mounts| mounts.clone());
     for mount in &mounts {
         if let Some(active) = DYNAMIC_MOUNT_NAMESPACE_ACTIVE.get(mount.namespace_id.0) {
             active.store(true, Ordering::Release);
@@ -615,7 +615,7 @@ fn register_mount(mounted: Arc<MountedFs>) -> MountId {
 }
 
 fn register_pending_release_queue(mount_id: MountId, mounted: &Arc<MountedFs>) {
-    let mut queues = PENDING_RELEASE_QUEUES.exclusive_access();
+    let mut queues = PENDING_RELEASE_QUEUES.lock();
     if mount_id.0 >= queues.len() {
         queues.resize_with(mount_id.0 + 1, || None);
     }
@@ -624,16 +624,13 @@ fn register_pending_release_queue(mount_id: MountId, mounted: &Arc<MountedFs>) {
 
 fn pending_release_queue(mount_id: MountId) -> Option<Arc<PendingReleaseQueue>> {
     PENDING_RELEASE_QUEUES
-        .exclusive_access()
+        .lock()
         .get(mount_id.0)
         .and_then(|queue| queue.as_ref().cloned())
 }
 
 fn unregister_pending_release_queue(mount_id: MountId) {
-    if let Some(queue) = PENDING_RELEASE_QUEUES
-        .exclusive_access()
-        .get_mut(mount_id.0)
-    {
+    if let Some(queue) = PENDING_RELEASE_QUEUES.lock().get_mut(mount_id.0) {
         *queue = None;
     }
 }
@@ -892,7 +889,7 @@ pub(super) fn mount_exists(mount_id: MountId) -> bool {
 
 pub(crate) fn clone_mount_namespace(source_namespace_id: MountNamespaceId) -> MountNamespaceId {
     let namespace_id = MountNamespaceId(NEXT_MOUNT_NAMESPACE_ID.fetch_add(1, Ordering::SeqCst));
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    DYNAMIC_MOUNTS.with_lock(|mounts| {
         // Namespace cloning duplicates only the overlay graph. MountedFs
         // backends and open files remain shared unless a later mount event
         // installs a different source in the child namespace.
@@ -1008,7 +1005,7 @@ pub(super) fn mounted_root_for(
     // MNT_EXPIRE is the exceptional write-side case: activity on the mount
     // clears its pending-expire state. Keep that stateful compatibility path
     // out of ordinary path walk, then republish if it actually changed.
-    let (source_root, cleared_expire) = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    let (source_root, cleared_expire) = DYNAMIC_MOUNTS.with_lock(|mounts| {
         let Some(mount) = mounts.iter_mut().rev().find(|mount| {
             mount.namespace_id == namespace_id
                 && mount.target.is_node(target)
@@ -1649,7 +1646,7 @@ pub(crate) fn mount_block_device_at(
     }
     let target = MountTarget::node(target_node);
 
-    let target_is_busy = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    let target_is_busy = DYNAMIC_MOUNTS.with_lock(|mounts| {
         mounts
             .iter()
             .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
@@ -1667,7 +1664,7 @@ pub(crate) fn mount_block_device_at(
     );
     let source_path = block_source_name(device_index);
 
-    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.with_lock(|mounts| {
         if mounts
             .iter()
             .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
@@ -1816,7 +1813,7 @@ fn mount_new_fs_on_target(
     mounted: Arc<MountedFs>,
     target_path: &str,
 ) -> Result<MountId, MountError> {
-    let target_is_busy = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    let target_is_busy = DYNAMIC_MOUNTS.with_lock(|mounts| {
         mounts
             .iter()
             .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
@@ -1833,7 +1830,7 @@ fn mount_new_fs_on_target(
         source_mount_id,
         root_ino_for(source_mount_id).ok_or(MountError::SourceMissing)?,
     );
-    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.with_lock(|mounts| {
         if mounts
             .iter()
             .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
@@ -1899,7 +1896,7 @@ fn mount_pseudo_fs_on_target(
     target_path: &str,
     options: &'static str,
 ) -> Result<MountId, MountError> {
-    let target_is_busy = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    let target_is_busy = DYNAMIC_MOUNTS.with_lock(|mounts| {
         mounts
             .iter()
             .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
@@ -1916,7 +1913,7 @@ fn mount_pseudo_fs_on_target(
         root_ino_for(source_mount_id).ok_or(MountError::SourceMissing)?,
     );
     let source_path = fs_type.into();
-    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.with_lock(|mounts| {
         if mounts
             .iter()
             .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
@@ -1979,7 +1976,7 @@ pub(crate) fn mount_detached_fs_at(
     }
     let target = MountTarget::node(target_node);
 
-    let target_is_busy = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    let target_is_busy = DYNAMIC_MOUNTS.with_lock(|mounts| {
         mounts
             .iter()
             .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
@@ -1992,7 +1989,7 @@ pub(crate) fn mount_detached_fs_at(
     let source_path = resolve_mount_path(source_root, source_path);
     let target_path = resolve_mount_path(target_node, target_path);
     ensure_mount_open(source_root.mount_id)?;
-    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.with_lock(|mounts| {
         if mounts
             .iter()
             .any(|mount| mount.namespace_id == namespace_id && mount.target == target)
@@ -2045,7 +2042,7 @@ pub(crate) fn mount_bind_at(
     let covered_parent = covered_parent_for_target(&target)?;
     let source_path = resolve_mount_path(source_root, source_path);
     let target_path = resolve_mount_path(target_node, target_path);
-    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.with_lock(|mounts| {
         let source_propagation_mount =
             nearest_propagation_mount(mounts, namespace_id, source_path.as_str());
         if source_propagation_mount
@@ -2250,7 +2247,7 @@ pub(crate) fn move_mount_at(
     let covered_parent = covered_parent_for_target(&target)?;
     let source_path = resolve_mount_path(source, source_path);
     let target_path = resolve_mount_path(target_node, target_path);
-    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    clear_dentry_cache_on_mount_change(DYNAMIC_MOUNTS.with_lock(|mounts| {
         // CONTEXT: Linux permits multiple mounts to stack on one mount point.
         // fs_bind_move18 moves parent1 over parent2's self-bind and then
         // expects two umount(parent2) calls to peel the stack.
@@ -2426,7 +2423,7 @@ pub(crate) fn set_mount_propagation_at(
     recursive: bool,
     propagation: MountPropagation,
 ) -> Result<(), MountError> {
-    let result = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    let result = DYNAMIC_MOUNTS.with_lock(|mounts| {
         let mut changed = false;
         for mount in mounts.iter_mut() {
             if mount.namespace_id != namespace_id {
@@ -2542,7 +2539,7 @@ pub(crate) fn unmount_at(
     if target_is_root && target.mount_id == primary_mount_id() {
         return Err(MountError::StaticRoot);
     }
-    let unmount_result = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    let unmount_result = DYNAMIC_MOUNTS.with_lock(|mounts| {
         let index = if target_is_root {
             mounts
                 .iter()
@@ -2600,7 +2597,7 @@ fn ensure_extra_mount_target(index: usize) -> Option<WorkingDir> {
 }
 
 fn source_has_dynamic_mount(namespace_id: MountNamespaceId, source_mount_id: MountId) -> bool {
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    DYNAMIC_MOUNTS.with_lock(|mounts| {
         mounts.iter().any(|mount| {
             mount.namespace_id == namespace_id && mount.source_mount_id == source_mount_id
         })
@@ -2608,7 +2605,7 @@ fn source_has_dynamic_mount(namespace_id: MountNamespaceId, source_mount_id: Mou
 }
 
 fn source_has_any_dynamic_mount(source_mount_id: MountId) -> bool {
-    DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    DYNAMIC_MOUNTS.with_lock(|mounts| {
         mounts
             .iter()
             .any(|mount| mount.source_mount_id == source_mount_id)
@@ -2988,7 +2985,7 @@ pub(crate) fn list_mounts(namespace_id: MountNamespaceId) -> Vec<MountInfo> {
         }
     }
 
-    let dynamic_mounts = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
+    let dynamic_mounts = DYNAMIC_MOUNTS.with_lock(|mounts| {
         mounts
             .iter()
             .filter(|mount| mount.namespace_id == namespace_id)

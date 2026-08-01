@@ -6,7 +6,7 @@ use super::{
 #[cfg(target_arch = "riscv64")]
 use crate::config::{KERNEL_STACK_TOP, USER_MMAP_BASE};
 use crate::config::{PAGE_SIZE, TRAMPOLINE, memory_end, mmio_regions};
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use alloc::sync::Arc;
 use lazy_static::*;
 
@@ -24,12 +24,12 @@ unsafe extern "C" {
 }
 
 lazy_static! {
-    pub static ref KERNEL_SPACE: Arc<UPIntrFreeCell<MemorySet>> =
-        Arc::new(unsafe { UPIntrFreeCell::new(MemorySet::new_kernel()) });
+    pub static ref KERNEL_SPACE: Arc<SpinNoIrqLock<MemorySet>> =
+        Arc::new(SpinNoIrqLock::new(MemorySet::new_kernel()));
 }
 
 pub fn kernel_token() -> usize {
-    KERNEL_SPACE.exclusive_access().token()
+    KERNEL_SPACE.lock().token()
 }
 
 #[cfg(not(target_arch = "riscv64"))]
@@ -67,7 +67,7 @@ pub(super) fn install_kernel_mappings_into_user(memory_set: &mut MemorySet) -> b
         "RISC-V MMIO aliases must share one Sv39 root entry"
     );
     {
-        let kernel_space = KERNEL_SPACE.exclusive_access();
+        let kernel_space = KERNEL_SPACE.lock();
         for index in first_ram_root..=last_ram_root {
             let entry = kernel_space.page_table.root_entry(index);
             if !memory_set
@@ -118,32 +118,12 @@ pub(crate) fn insert_global_kernel_framed_area_uninit(
     permission: MapPermission,
 ) -> bool {
     let inserted = KERNEL_SPACE
-        .exclusive_access()
+        .lock()
         .insert_kernel_private_framed_area_uninit_deferred(start_va, end_va, permission);
     let Some((start_vpn, end_vpn)) = inserted else {
         return false;
     };
     invalidate_global_vpn_range(start_vpn, end_vpn);
-    true
-}
-
-/// Removes a dynamically allocated mapping shared by every kernel page table.
-// CONTEXT: Kernel stacks are retained at their live high-water mark, so the
-// first pool stage has no removal caller. Keep this synchronized primitive for
-// a future bounded batch-retirement policy instead of weakening its lifetime
-// guarantees or open-coding global shootdown.
-#[allow(dead_code)]
-pub(crate) fn remove_global_kernel_area(start_vpn: VirtPageNum) -> bool {
-    let removed = KERNEL_SPACE
-        .exclusive_access()
-        .remove_area_with_start_vpn_deferred(start_vpn);
-    let Some((range_start, range_end, retired)) = removed else {
-        return false;
-    };
-    if retired.pte_cleared() {
-        invalidate_global_vpn_range(range_start, range_end);
-    }
-    retired.release();
     true
 }
 

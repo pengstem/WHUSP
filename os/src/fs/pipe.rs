@@ -17,8 +17,6 @@ use crate::task::{
     current_has_unmasked_signal, current_process, schedule, wakeup_task,
 };
 
-impl super::PipeFileCapability for Pipe {}
-
 pub struct Pipe {
     readable: bool,
     writable: bool,
@@ -748,7 +746,7 @@ impl File for Pipe {
         }
         ready
     }
-    fn as_pipe(&self) -> Option<&dyn super::PipeFileCapability> {
-        Some(self)
+    fn is_pipe(&self) -> bool {
+        true
     }
 }

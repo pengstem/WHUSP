@@ -1,5 +1,5 @@
 use super::super::File;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use alloc::string::String;
 use alloc::sync::Arc;
 use lazy_static::lazy_static;
@@ -14,10 +14,10 @@ pub(super) const LOOP_FLAG_PARTSCAN: u32 = 8;
 pub(super) const LOOP_FLAG_DIRECT_IO: u32 = 16;
 
 lazy_static! {
-    pub(super) static ref LOOP0_STATE: UPIntrFreeCell<LoopDeviceState> =
-        unsafe { UPIntrFreeCell::new(LoopDeviceState::new()) };
-    pub(super) static ref LOOP1_STATE: UPIntrFreeCell<LoopDeviceState> =
-        unsafe { UPIntrFreeCell::new(LoopDeviceState::new()) };
+    pub(super) static ref LOOP0_STATE: SpinNoIrqLock<LoopDeviceState> =
+        SpinNoIrqLock::new(LoopDeviceState::new());
+    pub(super) static ref LOOP1_STATE: SpinNoIrqLock<LoopDeviceState> =
+        SpinNoIrqLock::new(LoopDeviceState::new());
 }
 
 pub(super) struct LoopDeviceState {

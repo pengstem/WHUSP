@@ -218,7 +218,7 @@ fn handle_newlink_request(message: &[u8]) {
         }
     });
 
-    let mut state = NETDEV.exclusive_access();
+    let mut state = NETDEV.lock();
     if link_kind.as_deref() == Some("veth") {
         let first = ifname.as_deref().unwrap_or("ltp_ns_veth1");
         let second = peer_name.as_deref().unwrap_or("ltp_ns_veth2");
@@ -248,7 +248,7 @@ fn handle_addr_request(message: &[u8], add: bool) {
     if address.is_empty() {
         return;
     }
-    let mut state = NETDEV.exclusive_access();
+    let mut state = NETDEV.lock();
     if add {
         state.add_addr(index, family, prefix_len, address);
     } else {
@@ -270,7 +270,7 @@ pub(super) fn build_netlink_route_responses(request: &[u8]) -> KResult<Vec<Vec<u
     let mut responses = Vec::new();
     match msg_type {
         RTM_GETLINK => {
-            for iface in NETDEV.exclusive_access().snapshot() {
+            for iface in NETDEV.lock().snapshot() {
                 responses.push(push_link_info(&iface, seq, pid));
             }
             responses.push(push_netlink_done(seq, pid));
@@ -281,7 +281,7 @@ pub(super) fn build_netlink_route_responses(request: &[u8]) -> KResult<Vec<Vec<u
             } else {
                 AF_UNSPEC as u8
             };
-            for iface in NETDEV.exclusive_access().snapshot() {
+            for iface in NETDEV.lock().snapshot() {
                 for addr in &iface.addrs {
                     if family == AF_UNSPEC as u8 || addr.family == family {
                         responses.push(push_addr_info(&iface, addr, seq, pid));

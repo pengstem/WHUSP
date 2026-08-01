@@ -44,13 +44,13 @@ impl Drop for ProcSleepGuard {
     }
 }
 
-fn sleep_until_poll_event(waiter: &Arc<PollWaiter>, deadline_ms: Option<usize>) -> KResult {
+fn sleep_until_poll_event(waiter: &Arc<PollWaiter>, deadline_ms: Option<usize>) -> KResult<()> {
     if waiter.was_triggered() {
-        return Ok(0);
+        return Ok(());
     }
     let now_ms = get_time_ms();
     if deadline_ms.is_some_and(|deadline_ms| now_ms >= deadline_ms) {
-        return Ok(0);
+        return Ok(());
     }
     if current_has_interrupting_signal() {
         return Err(Errno::EINTR);
@@ -68,15 +68,15 @@ fn sleep_until_poll_event(waiter: &Arc<PollWaiter>, deadline_ms: Option<usize>) 
     // wake_pending handoff instead of a lost notification.
     waiter.complete_block_handoff();
     schedule(task_cx_ptr);
-    Ok(0)
+    Ok(())
 }
 
-fn block_signal_only_waiter() -> KResult {
+fn block_signal_only_waiter() -> KResult<()> {
     let (blocked_task, task_cx_ptr) =
         block_current_task_no_schedule_unless_unmasked_signal().ok_or(Errno::EINTR)?;
     drop(blocked_task);
     schedule(task_cx_ptr);
-    Ok(0)
+    Ok(())
 }
 
 fn read_user_pollfds(
@@ -97,9 +97,8 @@ fn read_user_pollfds(
     read_user_array(token, fds, nfds)
 }
 
-fn write_user_pollfds(token: usize, fds: *mut LinuxPollFd, pollfds: &[LinuxPollFd]) -> KResult {
-    write_user_array(token, fds, pollfds)?;
-    Ok(0)
+fn write_user_pollfds(token: usize, fds: *mut LinuxPollFd, pollfds: &[LinuxPollFd]) -> KResult<()> {
+    write_user_array(token, fds, pollfds)
 }
 
 fn poll_events_from_user(events: i16) -> PollEvents {
@@ -239,12 +238,11 @@ fn read_user_fdset(token: usize, ptr: usize, nfds: usize) -> KResult<Option<Vec<
     )?))
 }
 
-fn write_user_fdset(token: usize, ptr: usize, words: &[usize]) -> KResult {
+fn write_user_fdset(token: usize, ptr: usize, words: &[usize]) -> KResult<()> {
     if ptr == 0 {
-        return Ok(0);
+        return Ok(());
     }
-    write_user_array(token, ptr as *mut usize, words)?;
-    Ok(0)
+    write_user_array(token, ptr as *mut usize, words)
 }
 
 fn fd_set(words: &mut [usize], fd: usize) {

@@ -1,6 +1,7 @@
+use super::ipc_util::{now_sec, pid_to_i32};
 use super::user_ptr::{copy_to_user, read_user_array, read_user_value, write_user_value};
 use crate::perf;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::task::check_signals_of_current;
 use crate::task::{
     TaskContext, TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
@@ -557,8 +558,7 @@ fn find_message_index(messages: &[Message], msgtyp: isize, flags: i32) -> Option
 }
 
 lazy_static! {
-    static ref MSG_MANAGER: UPIntrFreeCell<MsgManager> =
-        unsafe { UPIntrFreeCell::new(MsgManager::new()) };
+    static ref MSG_MANAGER: SpinNoIrqLock<MsgManager> = SpinNoIrqLock::new(MsgManager::new());
 }
 
 pub(super) fn sys_msgget(key: isize, msgflg: i32) -> KResult {
@@ -570,7 +570,7 @@ pub(super) fn sys_msgget(key: isize, msgflg: i32) -> KResult {
         gid: credentials.egid,
     };
     MSG_MANAGER
-        .exclusive_access()
+        .lock()
         .get_or_create(key, msgflg, context, &caller)
         .map(|msqid| msqid as isize)
         .map_err(msg_error_to_sys_error)
@@ -583,14 +583,14 @@ pub(super) fn sys_msgctl(msqid: usize, cmd: i32, buf: usize) -> KResult {
     match cmd {
         IPC_RMID => {
             MSG_MANAGER
-                .exclusive_access()
+                .lock()
                 .remove_queue(msqid, &caller)
                 .map_err(msg_error_to_sys_error)?;
             Ok(0)
         }
         IPC_STAT => {
             let stat = MSG_MANAGER
-                .exclusive_access()
+                .lock()
                 .stat_by_id(msqid, &caller)
                 .map_err(msg_error_to_sys_error)?;
             write_msqid_ds(buf, stat)?;
@@ -600,7 +600,7 @@ pub(super) fn sys_msgctl(msqid: usize, cmd: i32, buf: usize) -> KResult {
             let ds: LinuxMsqid64Ds =
                 read_user_value(current_user_token(), buf as *const LinuxMsqid64Ds)?;
             MSG_MANAGER
-                .exclusive_access()
+                .lock()
                 .set_attrs(
                     msqid,
                     MsgSetAttrs {
@@ -615,7 +615,7 @@ pub(super) fn sys_msgctl(msqid: usize, cmd: i32, buf: usize) -> KResult {
             Ok(0)
         }
         IPC_INFO | MSG_INFO => {
-            let usage = MSG_MANAGER.exclusive_access().usage_info();
+            let usage = MSG_MANAGER.lock().usage_info();
             let mut info = base_msginfo();
             if cmd == MSG_INFO {
                 info.msgpool = usage.used_ids.try_into().unwrap_or(i32::MAX);
@@ -628,7 +628,7 @@ pub(super) fn sys_msgctl(msqid: usize, cmd: i32, buf: usize) -> KResult {
         MSG_STAT | MSG_STAT_ANY => {
             let skip_permission = cmd == MSG_STAT_ANY;
             let (real_msqid, stat) = MSG_MANAGER
-                .exclusive_access()
+                .lock()
                 .stat_by_index(msqid, &caller, skip_permission)
                 .map_err(msg_error_to_sys_error)?;
             write_msqid_ds(buf, stat)?;
@@ -691,7 +691,7 @@ fn try_or_block_msgsnd(
     flags: i32,
     caller: &MsgCaller,
 ) -> Result<MsgAttempt, Errno> {
-    let mut manager = MSG_MANAGER.exclusive_access();
+    let mut manager = MSG_MANAGER.lock();
     match manager.send(msqid, message, flags, caller) {
         Ok(()) => Ok(MsgAttempt::Done(0)),
         Err(MsgError::WouldBlock) if flags & IPC_NOWAIT == 0 => manager
@@ -710,7 +710,7 @@ fn try_or_block_msgrcv(
     flags: i32,
     caller: &MsgCaller,
 ) -> Result<MsgAttempt, Errno> {
-    let mut manager = MSG_MANAGER.exclusive_access();
+    let mut manager = MSG_MANAGER.lock();
     match manager.receive(msqid, msgtyp, msgsz, flags, caller) {
         Ok(message) => {
             let copy_len = msgsz.min(message.text.len());
@@ -729,14 +729,14 @@ fn post_msg_sleep_cleanup(msqid: usize) -> KResult<()> {
     let Some(task) = current_task() else {
         return Err(Errno::EINTR);
     };
-    MSG_MANAGER.exclusive_access().remove_waiter_for_task(&task);
+    MSG_MANAGER.lock().remove_waiter_for_task(&task);
     if let Some((exit_code, _message)) = check_signals_of_current() {
         exit_current_group_and_run_next(exit_code);
     }
     if current_has_deliverable_signal() {
         return Err(Errno::EINTR);
     }
-    if !MSG_MANAGER.exclusive_access().queues.contains_key(&msqid) {
+    if !MSG_MANAGER.lock().queues.contains_key(&msqid) {
         return Err(Errno::EIDRM);
     }
     Ok(())
@@ -797,7 +797,7 @@ fn base_msginfo() -> LinuxMsgInfo {
 }
 
 pub(crate) fn proc_sysvipc_msg_content() -> String {
-    MSG_MANAGER.exclusive_access().proc_sysvipc_msg_content()
+    MSG_MANAGER.lock().proc_sysvipc_msg_content()
 }
 
 pub(crate) fn current_msgmni() -> usize {
@@ -879,12 +879,4 @@ fn msg_error_to_sys_error(error: MsgError) -> Errno {
         MsgError::WouldBlock => Errno::EAGAIN,
         MsgError::Interrupted => Errno::EINTR,
     }
-}
-
-fn now_sec() -> i64 {
-    (crate::timer::wall_time_nanos() / 1_000_000_000) as i64
-}
-
-fn pid_to_i32(pid: usize) -> i32 {
-    pid.try_into().unwrap_or(i32::MAX)
 }

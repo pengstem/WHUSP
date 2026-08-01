@@ -1,6 +1,6 @@
 use crate::random::CompatibilityRandom;
 use crate::shutdown::shutdown;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::syscall::SyscallContext;
 #[cfg(target_arch = "riscv64")]
 use crate::syscall::user_ptr::read_user_value_ctx;
@@ -68,8 +68,7 @@ static SYSLOG_CONSOLE_LEVEL: AtomicUsize = AtomicUsize::new(SYSLOG_DEFAULT_CONSO
 static SYSLOG_SAVED_CONSOLE_LEVEL: AtomicUsize = AtomicUsize::new(SYSLOG_DEFAULT_CONSOLE_LEVEL);
 
 lazy_static! {
-    static ref UTS_STATE: UPIntrFreeCell<UtsState> =
-        unsafe { UPIntrFreeCell::new(UtsState::new()) };
+    static ref UTS_STATE: SpinNoIrqLock<UtsState> = SpinNoIrqLock::new(UtsState::new());
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -134,7 +133,7 @@ impl LinuxUtsName {
     }
 
     fn current() -> Self {
-        let state = *UTS_STATE.exclusive_access();
+        let state = *UTS_STATE.lock();
         Self {
             sysname: Self::field("Linux"),
             nodename: state.nodename,
@@ -275,14 +274,14 @@ fn require_uts_admin(ctx: &SyscallContext) -> KResult<()> {
 pub fn sys_sethostname_ctx(ctx: &SyscallContext, name: *const u8, len: usize) -> KResult {
     require_uts_admin(ctx)?;
     let nodename = read_uts_name_ctx(ctx, name, len)?;
-    UTS_STATE.exclusive_access().nodename = nodename;
+    UTS_STATE.lock().nodename = nodename;
     Ok(0)
 }
 
 pub fn sys_setdomainname_ctx(ctx: &SyscallContext, name: *const u8, len: usize) -> KResult {
     require_uts_admin(ctx)?;
     let domainname = read_uts_name_ctx(ctx, name, len)?;
-    UTS_STATE.exclusive_access().domainname = domainname;
+    UTS_STATE.lock().domainname = domainname;
     Ok(0)
 }
 

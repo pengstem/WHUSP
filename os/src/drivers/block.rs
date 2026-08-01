@@ -504,7 +504,7 @@ pub(crate) fn block_io_stats_snapshot() -> BlockIoStats {
 }
 
 fn block_io_nonblocking_requested() -> bool {
-    *DEV_NON_BLOCKING_ACCESS.exclusive_access()
+    *DEV_NON_BLOCKING_ACCESS.lock()
 }
 
 fn choose_block_io_path() -> BlockIoPath {

@@ -12,8 +12,7 @@ mod ptrace;
 mod sched;
 mod signal;
 mod smp_probe;
-#[allow(clippy::module_inception)]
-mod task;
+mod tcb;
 
 use self::id::TaskUserRes;
 use crate::arch::__switch;
@@ -21,7 +20,7 @@ use crate::fs::{
     OpenFlags, PathContext, open_file_in, tty_detach_session, untrack_regular_file_executable,
 };
 use crate::shutdown::shutdown;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::syscall::{
     close_detached_fd_entry_for_process_teardown, release_record_locks_for_process,
 };
@@ -88,17 +87,13 @@ pub(crate) use smp_probe::record_cpu_probe_scheduler_wake as record_smp_cpu_prob
 pub(crate) use smp_probe::record_yield_syscall as record_smp_probe_yield_syscall;
 pub(crate) use smp_probe::start_cpu_probe as start_smp_cpu_probe;
 pub(crate) use smp_probe::start_wait_io_probe as start_smp_wait_io_probe;
-pub(crate) use task::SCHED_RR_INTERVAL_US;
-pub use task::{DEFAULT_TIMER_SLACK_NS, TaskControlBlock, TaskStatus};
+pub(crate) use tcb::SCHED_RR_INTERVAL_US;
+pub use tcb::{DEFAULT_TIMER_SLACK_NS, TaskControlBlock, TaskStatus};
 
 const CORE_DUMP_STATUS_BIT: i32 = 0x80;
 const CORE_DUMP_MAX_BYTES: usize = 16 * 1024 * 1024;
 
-pub fn account_task_user_time_until(
-    task: &TaskControlBlock,
-    _process: &ProcessControlBlock,
-    now_us: usize,
-) {
+pub fn account_task_user_time_until(task: &TaskControlBlock, now_us: usize) {
     task.account_user_time_until(now_us);
 }
 
@@ -187,12 +182,12 @@ static EXITED_DIRTY: AtomicBool = AtomicBool::new(false);
 // __switch boundary so kernel stacks remain mapped until the next
 // scheduling tick completes.
 lazy_static! {
-    static ref EXITED_TASKS: UPIntrFreeCell<Vec<Arc<TaskControlBlock>>> =
-        unsafe { UPIntrFreeCell::new(Vec::new()) };
+    static ref EXITED_TASKS: SpinNoIrqLock<Vec<Arc<TaskControlBlock>>> =
+        SpinNoIrqLock::new(Vec::new());
 }
 
 fn queue_exited_task(task: Arc<TaskControlBlock>) {
-    EXITED_TASKS.exclusive_access().push(task);
+    EXITED_TASKS.lock().push(task);
     EXITED_DIRTY.store(true, Ordering::Release);
 }
 
@@ -201,7 +196,7 @@ pub(crate) fn reap_exited_tasks() {
         return;
     }
     let exited_tasks = {
-        let mut tasks = EXITED_TASKS.exclusive_access();
+        let mut tasks = EXITED_TASKS.lock();
         core::mem::take(&mut *tasks)
     };
     drop(exited_tasks);
@@ -820,7 +815,7 @@ fn write_core_dump(context: PathContext, path: String, bytes: Vec<u8>) {
     let _ = file.write_at(0, bytes.as_slice());
 }
 
-fn exit_current(exit_code: i32, group_exit: bool) {
+fn exit_current(exit_code: i32, group_exit: bool) -> ! {
     let current = current_task().expect("exit_current requires a current task");
     account_current_system_time();
     let process = current
@@ -1028,15 +1023,16 @@ fn exit_current(exit_code: i32, group_exit: bool) {
     // we do not have to save task context
     let mut _unused = TaskContext::zero_init();
     schedule(&mut _unused as *mut _);
+    unreachable!("exited task resumed");
 }
 
 /// Exit the current 'Running' task and run the next task in task list.
-pub fn exit_current_and_run_next(exit_code: i32) {
-    exit_current(exit_code, false);
+pub fn exit_current_and_run_next(exit_code: i32) -> ! {
+    exit_current(exit_code, false)
 }
 
-pub fn exit_current_group_and_run_next(exit_code: i32) {
-    exit_current(exit_code, true);
+pub fn exit_current_group_and_run_next(exit_code: i32) -> ! {
+    exit_current(exit_code, true)
 }
 
 lazy_static! {
@@ -1057,7 +1053,7 @@ pub fn add_initproc() {
     // Build the sharded futex table on the boot CPU before secondary
     // schedulers can race through its lazy initializer on their first wait.
     futex::init();
-    let _initproc = INITPROC.clone();
+    lazy_static::initialize(&INITPROC);
 }
 
 pub fn check_signals_of_task(

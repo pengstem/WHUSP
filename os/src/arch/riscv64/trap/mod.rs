@@ -62,7 +62,7 @@ pub fn trap_handler() -> ! {
     set_kernel_trap_entry();
     let mut task = current_task().expect("trap_handler requires a running task");
     let mut process = process_of_task(&task);
-    account_task_user_time_until(&task, &process, get_time_us());
+    account_task_user_time_until(&task, get_time_us());
     let scause = scause::read();
     let stval = stval::read();
     let is_user_ecall = matches!(scause.cause(), Trap::Exception(Exception::UserEnvCall));
@@ -236,7 +236,6 @@ pub fn trap_handler() -> ! {
         drop(process);
         drop(task);
         exit_current_group_and_run_next(errno);
-        unreachable!("signal-forced exit returned");
     }
     trap_return_for_task(task, process);
 }
@@ -309,8 +308,7 @@ fn trap_return_for_task(
         cx.kernel_tp = crate::cpu::current_ptr();
         cx.user_fp_is_dirty()
     };
-    let (trap_cx_user_va, user_satp) =
-        trap_return_context_after_accounting_for_task(&task, &process, now_us);
+    let (trap_cx_user_va, user_satp) = trap_return_context_after_accounting_for_task(&task, now_us);
     let flush_tlb = crate::arch::mm::should_flush_tlb_on_return(user_satp);
     if restore_fp {
         crate::perf::record_rv_user_fp_restore_call();

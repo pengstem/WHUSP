@@ -1,6 +1,7 @@
 use super::{FrameTracker, MapPermission, PhysPageNum, frame_alloc};
 use crate::config::PAGE_SIZE;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
+use crate::syscall::ipc_util::{now_sec, pid_to_i32};
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
@@ -510,8 +511,7 @@ impl ShmManager {
 }
 
 lazy_static! {
-    static ref SHM_MANAGER: UPIntrFreeCell<ShmManager> =
-        unsafe { UPIntrFreeCell::new(ShmManager::new()) };
+    static ref SHM_MANAGER: SpinNoIrqLock<ShmManager> = SpinNoIrqLock::new(ShmManager::new());
 }
 
 static SHM_MAX_LIMIT: AtomicUsize = AtomicUsize::new(SHM_MAX);
@@ -580,28 +580,28 @@ pub(crate) fn shmget_segment(
     caller: &ShmCaller<'_>,
 ) -> Result<usize, ShmError> {
     SHM_MANAGER
-        .exclusive_access()
+        .lock()
         .get_or_create(key, size, shmflg, context, caller)
 }
 
 pub(crate) fn attach_segment(shmid: usize, pid: usize) -> Result<ShmAttach, ShmError> {
-    SHM_MANAGER.exclusive_access().attach(shmid, pid)
+    SHM_MANAGER.lock().attach(shmid, pid)
 }
 
 pub(crate) fn retain_attached_segment(shmid: usize, pid: usize) -> bool {
-    SHM_MANAGER.exclusive_access().retain_attached(shmid, pid)
+    SHM_MANAGER.lock().retain_attached(shmid, pid)
 }
 
 pub(crate) fn attached_segment_pages(shmid: usize) -> Option<Vec<ShmPageMapping>> {
-    SHM_MANAGER.exclusive_access().page_mappings(shmid)
+    SHM_MANAGER.lock().page_mappings(shmid)
 }
 
 pub(crate) fn detach_segment(shmid: usize, pid: usize) -> Result<(), ShmError> {
-    SHM_MANAGER.exclusive_access().detach(shmid, pid)
+    SHM_MANAGER.lock().detach(shmid, pid)
 }
 
 pub(crate) fn segment_remap_available(shmid: usize) -> Option<bool> {
-    let manager = SHM_MANAGER.exclusive_access();
+    let manager = SHM_MANAGER.lock();
     let segment = manager.segments.get(&shmid)?;
     if segment.marked_for_delete {
         return Some(false);
@@ -616,16 +616,14 @@ pub(crate) fn mark_segment_for_delete(
     shmid: usize,
     caller: &ShmCaller<'_>,
 ) -> Result<(), ShmError> {
-    SHM_MANAGER
-        .exclusive_access()
-        .mark_for_delete(shmid, caller)
+    SHM_MANAGER.lock().mark_for_delete(shmid, caller)
 }
 
 pub(crate) fn stat_segment(
     shmid: usize,
     caller: &ShmCaller<'_>,
 ) -> Result<ShmSegmentStat, ShmError> {
-    SHM_MANAGER.exclusive_access().stat_by_id(shmid, caller)
+    SHM_MANAGER.lock().stat_by_id(shmid, caller)
 }
 
 pub(crate) fn stat_segment_by_index(
@@ -634,7 +632,7 @@ pub(crate) fn stat_segment_by_index(
     skip_permission: bool,
 ) -> Result<(usize, ShmSegmentStat), ShmError> {
     SHM_MANAGER
-        .exclusive_access()
+        .lock()
         .stat_by_index(index, caller, skip_permission)
 }
 
@@ -643,9 +641,7 @@ pub(crate) fn set_segment_attrs(
     attrs: ShmSetAttrs,
     caller: &ShmCaller<'_>,
 ) -> Result<(), ShmError> {
-    SHM_MANAGER
-        .exclusive_access()
-        .set_attrs(shmid, attrs, caller)
+    SHM_MANAGER.lock().set_attrs(shmid, attrs, caller)
 }
 
 pub(crate) fn set_segment_locked(
@@ -653,21 +649,19 @@ pub(crate) fn set_segment_locked(
     locked: bool,
     caller: &ShmCaller<'_>,
 ) -> Result<(), ShmError> {
-    SHM_MANAGER
-        .exclusive_access()
-        .set_locked(shmid, locked, caller)
+    SHM_MANAGER.lock().set_locked(shmid, locked, caller)
 }
 
 pub(crate) fn usage_info() -> ShmUsageInfo {
-    SHM_MANAGER.exclusive_access().usage_info()
+    SHM_MANAGER.lock().usage_info()
 }
 
 pub(crate) fn highest_index() -> usize {
-    SHM_MANAGER.exclusive_access().highest_index()
+    SHM_MANAGER.lock().highest_index()
 }
 
 pub(crate) fn proc_sysvipc_shm_content() -> String {
-    SHM_MANAGER.exclusive_access().proc_sysvipc_shm_content()
+    SHM_MANAGER.lock().proc_sysvipc_shm_content()
 }
 
 pub(crate) fn shm_permission_from_flags(shmflg: i32) -> Result<MapPermission, ShmError> {
@@ -690,12 +684,4 @@ pub(crate) fn shm_permission_from_flags(shmflg: i32) -> Result<MapPermission, Sh
 fn align_up(size: usize) -> Option<usize> {
     size.checked_add(PAGE_SIZE - 1)
         .map(|value| value & !(PAGE_SIZE - 1))
-}
-
-fn now_sec() -> i64 {
-    (crate::timer::wall_time_nanos() / 1_000_000_000) as i64
-}
-
-fn pid_to_i32(pid: usize) -> i32 {
-    pid.try_into().unwrap_or(i32::MAX)
 }

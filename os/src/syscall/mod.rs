@@ -1,7 +1,9 @@
+pub(crate) use crate::task::futex::{sys_futex, sys_get_robust_list, sys_set_robust_list};
+
 mod context;
 mod dispatch;
 mod fs;
-mod futex;
+pub(crate) mod ipc_util;
 mod kmodule;
 mod memory;
 pub(crate) mod msg;
@@ -19,10 +21,7 @@ pub(crate) mod user_ptr;
 mod wait;
 
 pub(crate) use context::SyscallContext;
-#[allow(unused_imports)]
-pub(crate) use dispatch::{
-    SyscallOutcome, syscall_exit_with_current_task, syscall_with_context, syscall_with_current_task,
-};
+pub(crate) use dispatch::{syscall_exit_with_current_task, syscall_with_current_task};
 pub use dispatch::{syscall_is_exit, syscall_is_exit_group};
 pub(crate) use fs::{
     INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES,

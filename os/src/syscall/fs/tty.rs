@@ -380,7 +380,7 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> KResult {
         return Ok(0);
     }
 
-    if file.as_socket().is_some() {
+    if file.is_socket() {
         return handle_socket_if_ioctl(request, argp);
     }
 
@@ -409,7 +409,7 @@ pub fn sys_ioctl(fd: usize, request: usize, argp: usize) -> KResult {
         _ => {}
     }
 
-    if file.as_tty().is_none() {
+    if !file.is_tty() {
         return Err(Errno::ENOTTY);
     }
 

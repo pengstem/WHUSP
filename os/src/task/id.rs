@@ -3,7 +3,7 @@ use crate::config::{
     KERNEL_STACK_SIZE, KERNEL_STACK_TOP, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE,
 };
 use crate::mm::{MapPermission, PhysPageNum, VirtAddr, insert_global_kernel_framed_area_uninit};
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
@@ -42,21 +42,13 @@ impl RecycleAllocator {
         );
         self.recycled.push(id);
     }
-
-    pub fn dealloc_without_reuse(&mut self, id: usize) {
-        assert!(id < self.current);
-        assert!(
-            !self.recycled.contains(&id),
-            "id {id} has been deallocated!"
-        );
-    }
 }
 
 lazy_static! {
-    static ref PID_ALLOCATOR: UPIntrFreeCell<RecycleAllocator> =
-        unsafe { UPIntrFreeCell::new(RecycleAllocator::new_from(1)) };
-    static ref KSTACK_ALLOCATOR: UPIntrFreeCell<KernelStackAllocator> =
-        unsafe { UPIntrFreeCell::new(KernelStackAllocator::new()) };
+    static ref PID_ALLOCATOR: SpinNoIrqLock<RecycleAllocator> =
+        SpinNoIrqLock::new(RecycleAllocator::new_from(1));
+    static ref KSTACK_ALLOCATOR: SpinNoIrqLock<KernelStackAllocator> =
+        SpinNoIrqLock::new(KernelStackAllocator::new());
 }
 
 pub const IDLE_PID: usize = 0;
@@ -64,19 +56,7 @@ pub const IDLE_PID: usize = 0;
 pub struct PidHandle(pub usize);
 
 pub fn pid_alloc() -> PidHandle {
-    PidHandle(PID_ALLOCATOR.exclusive_access().alloc())
-}
-
-impl Drop for PidHandle {
-    fn drop(&mut self) {
-        // CONTEXT: Linux avoids immediately reusing a just-reaped PID; LTP
-        // fork13 checks this because shell scripts can break when consecutive
-        // fork/wait cycles return the same PID. Keep kernel stack and per-process
-        // resource IDs recyclable, but let Linux-visible PIDs advance monotonically.
-        PID_ALLOCATOR
-            .exclusive_access()
-            .dealloc_without_reuse(self.0);
-    }
+    PidHandle(PID_ALLOCATOR.lock().alloc())
 }
 
 /// Return (bottom, top) of a kernel stack in kernel space.
@@ -179,7 +159,7 @@ impl KernelStackAllocator {
 }
 
 pub fn kstack_alloc() -> KernelStack {
-    let allocation = KSTACK_ALLOCATOR.exclusive_access().alloc();
+    let allocation = KSTACK_ALLOCATOR.lock().alloc();
     if allocation.reused {
         return KernelStack(allocation.id);
     }
@@ -190,9 +170,7 @@ pub fn kstack_alloc() -> KernelStack {
         kstack_top.into(),
         MapPermission::R | MapPermission::W,
     ) {
-        KSTACK_ALLOCATOR
-            .exclusive_access()
-            .rollback_fresh(kstack_id);
+        KSTACK_ALLOCATOR.lock().rollback_fresh(kstack_id);
         panic!("failed to allocate kernel stack {kstack_id}");
     }
     KernelStack(kstack_id)
@@ -203,7 +181,7 @@ impl Drop for KernelStack {
         // TaskControlBlock drops are deferred through EXITED_TASKS until the
         // task is off-CPU. Retaining that unreachable stack's frames and PTEs
         // lets the next task reuse the slot without two global TLB shootdowns.
-        KSTACK_ALLOCATOR.exclusive_access().release(self.0);
+        KSTACK_ALLOCATOR.lock().release(self.0);
     }
 }
 

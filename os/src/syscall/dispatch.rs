@@ -1,6 +1,5 @@
 use super::context::SyscallContext;
 use super::fs::*;
-use super::futex::*;
 use super::kmodule::*;
 use super::memory::*;
 use super::msg::*;
@@ -15,6 +14,7 @@ use super::signal::*;
 use super::time::*;
 use super::uapi::LinuxTimeSpec;
 use super::wait::*;
+use super::{sys_futex, sys_get_robust_list, sys_set_robust_list};
 use crate::perf;
 use crate::task::{ProcessControlBlock, RLimit, TaskControlBlock};
 use crate::uapi::errno::{Errno, KResult};

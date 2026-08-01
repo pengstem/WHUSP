@@ -1,5 +1,5 @@
 use crate::fs::{File, SeekWhence};
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::syscall::user_ptr::{read_user_value, write_user_value};
 use crate::task::{
     FdTableEntry, TaskControlBlock, block_current_task_no_schedule, current_process,
@@ -139,10 +139,9 @@ struct FlockTable {
 }
 
 lazy_static! {
-    static ref RECORD_LOCK_TABLE: UPIntrFreeCell<RecordLockTable> =
-        unsafe { UPIntrFreeCell::new(RecordLockTable::new()) };
-    static ref FLOCK_TABLE: UPIntrFreeCell<FlockTable> =
-        unsafe { UPIntrFreeCell::new(FlockTable::new()) };
+    static ref RECORD_LOCK_TABLE: SpinNoIrqLock<RecordLockTable> =
+        SpinNoIrqLock::new(RecordLockTable::new());
+    static ref FLOCK_TABLE: SpinNoIrqLock<FlockTable> = SpinNoIrqLock::new(FlockTable::new());
 }
 
 impl RecordLockTable {
@@ -647,7 +646,7 @@ pub(super) fn flock_operation(entry: FdTableEntry, operation: i32) -> KResult {
         // UNFINISHED: blocking flock waits are not signal-interruptible yet;
         // Linux can return EINTR when an incompatible lock wait is interrupted.
         loop {
-            let mut table = FLOCK_TABLE.exclusive_access();
+            let mut table = FLOCK_TABLE.lock();
             match table.set_lock(key, Arc::clone(&owner), mode) {
                 Ok(waiters) => {
                     drop(table);
@@ -664,7 +663,7 @@ pub(super) fn flock_operation(entry: FdTableEntry, operation: i32) -> KResult {
             schedule(task_cx_ptr);
         }
     } else {
-        let waiters = FLOCK_TABLE.exclusive_access().unlock(key, &owner);
+        let waiters = FLOCK_TABLE.lock().unlock(key, &owner);
         wake_waiters(waiters);
         Ok(0)
     }
@@ -697,10 +696,9 @@ fn fcntl_getlk_with_owner(
 
     let (start, end) = flock_range(&file, flock)?;
     let key = lock_key(&file)?;
-    let conflict =
-        RECORD_LOCK_TABLE
-            .exclusive_access()
-            .find_conflict(key, &owner, flock.l_type, start, end);
+    let conflict = RECORD_LOCK_TABLE
+        .lock()
+        .find_conflict(key, &owner, flock.l_type, start, end);
     if let Some(conflict) = conflict {
         flock.l_type = conflict.l_type;
         flock.l_whence = SEEK_SET;
@@ -748,10 +746,9 @@ fn fcntl_setlk_with_owner(
 
     let (start, end) = flock_range(&file, flock)?;
     let key = lock_key(&file)?;
-    let waiters =
-        RECORD_LOCK_TABLE
-            .exclusive_access()
-            .set_lock(key, owner, flock.l_type, start, end)?;
+    let waiters = RECORD_LOCK_TABLE
+        .lock()
+        .set_lock(key, owner, flock.l_type, start, end)?;
     wake_waiters(waiters);
     Ok(0)
 }
@@ -794,7 +791,7 @@ fn fcntl_setlkw_with_owner(
     // UNFINISHED: F_SETLKW waits are not signal-interruptible yet; Linux can
     // return EINTR when a blocked lock request is interrupted by a signal.
     loop {
-        let mut table = RECORD_LOCK_TABLE.exclusive_access();
+        let mut table = RECORD_LOCK_TABLE.lock();
         let conflicts = if flock.l_type == F_UNLCK {
             Vec::new()
         } else {
@@ -822,44 +819,35 @@ pub(super) fn release_record_locks_for_close(entry: &FdTableEntry) {
         return;
     };
     let pid = current_process().getpid();
-    let waiters = RECORD_LOCK_TABLE
-        .exclusive_access()
-        .release_for_process_file(key, pid);
+    let waiters = RECORD_LOCK_TABLE.lock().release_for_process_file(key, pid);
     wake_waiters(waiters);
 }
 
 pub(super) fn release_ofd_record_locks_for_close(entry: &FdTableEntry) {
     let file = entry.file();
-    if !RECORD_LOCK_TABLE
-        .exclusive_access()
-        .has_file_description_state(&file)
-    {
+    if !RECORD_LOCK_TABLE.lock().has_file_description_state(&file) {
         return;
     }
     if file_description_still_referenced(&file) {
         return;
     }
-    let waiters = RECORD_LOCK_TABLE
-        .exclusive_access()
-        .release_for_file_description(&file);
+    let waiters = RECORD_LOCK_TABLE.lock().release_for_file_description(&file);
     wake_waiters(waiters);
 }
 
 pub(super) fn release_flock_locks_for_close(entry: &FdTableEntry) {
     let file = entry.file();
-    if !FLOCK_TABLE.exclusive_access().has_owner_state(&file) {
+    if !FLOCK_TABLE.lock().has_owner_state(&file) {
         return;
     }
     if file_description_still_referenced(&file) {
         return;
     }
-    let waiters = FLOCK_TABLE.exclusive_access().release_owner(&file);
+    let waiters = FLOCK_TABLE.lock().release_owner(&file);
     wake_waiters(waiters);
 }
 
 pub(crate) fn release_record_locks_for_process(pid: usize) {
-    let waiters = RECORD_LOCK_TABLE
-        .exclusive_access()
-        .release_for_process(pid);
+    let waiters = RECORD_LOCK_TABLE.lock().release_for_process(pid);
     wake_waiters(waiters);
 }

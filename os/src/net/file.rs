@@ -1,7 +1,4 @@
 use super::*;
-use crate::fs::SocketFileCapability;
-
-impl SocketFileCapability for LocalSocket {}
 
 impl File for LocalSocket {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -47,7 +44,7 @@ impl File for LocalSocket {
 
     fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
         let (kind, listening, readable, read_shutdown, peer_write_shutdown, write_shutdown, peer) = {
-            let mut inner = self.inner.exclusive_access();
+            let mut inner = self.inner.lock();
             if let Some(waiter) = waiter {
                 if events
                     .intersects(PollEvents::POLLIN | PollEvents::POLLPRI | PollEvents::POLLRDHUP)
@@ -91,7 +88,7 @@ impl File for LocalSocket {
             match kind {
                 SocketKind::Stream if !listening => {
                     if let Some(peer) = peer.as_ref().and_then(Weak::upgrade) {
-                        let peer = peer.exclusive_access();
+                        let peer = peer.lock();
                         if peer.stream_rx.len() < (peer.rcvbuf as usize).max(1) {
                             ready |= PollEvents::POLLOUT;
                         }
@@ -99,7 +96,7 @@ impl File for LocalSocket {
                 }
                 SocketKind::Datagram => {
                     let writable = if let Some(peer) = peer.as_ref().and_then(Weak::upgrade) {
-                        let peer = peer.exclusive_access();
+                        let peer = peer.lock();
                         peer.datagram_rx_bytes < (peer.rcvbuf as usize).max(1)
                     } else {
                         true
@@ -119,13 +116,13 @@ impl File for LocalSocket {
     }
 
     fn status_flags(&self) -> OpenFlags {
-        *self.status_flags.exclusive_access()
+        *self.status_flags.lock()
     }
 
     fn set_status_flags(&self, flags: OpenFlags) {
-        *self.status_flags.exclusive_access() = flags;
+        *self.status_flags.lock() = flags;
     }
-    fn as_socket(&self) -> Option<&dyn SocketFileCapability> {
-        Some(self)
+    fn is_socket(&self) -> bool {
+        true
     }
 }

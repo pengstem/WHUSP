@@ -1,7 +1,7 @@
 use super::{PollEvents, PollWaitQueue, PollWaiter};
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::UserBuffer;
-use crate::sync::{SpinNoIrqLock, UPIntrFreeCell};
+use crate::sync::SpinNoIrqLock;
 #[cfg(target_arch = "loongarch64")]
 use crate::task::suspend_current_and_run_next;
 use crate::task::{
@@ -222,21 +222,21 @@ impl ConsoleTtyState {
 }
 
 struct ConsoleTty {
-    state: UPIntrFreeCell<ConsoleTtyState>,
+    state: SpinNoIrqLock<ConsoleTtyState>,
     input_drain_lock: SpinNoIrqLock<()>,
-    poll_waiters: UPIntrFreeCell<PollWaitQueue>,
+    poll_waiters: SpinNoIrqLock<PollWaitQueue>,
 }
 
 lazy_static! {
     static ref CONSOLE_TTY: ConsoleTty = ConsoleTty {
-        state: unsafe { UPIntrFreeCell::new(ConsoleTtyState::new()) },
+        state: SpinNoIrqLock::new(ConsoleTtyState::new()),
         input_drain_lock: SpinNoIrqLock::new(()),
-        poll_waiters: unsafe { UPIntrFreeCell::new(PollWaitQueue::new()) },
+        poll_waiters: SpinNoIrqLock::new(PollWaitQueue::new()),
     };
-    static ref PTY_TTY_SETTINGS: UPIntrFreeCell<BTreeMap<u32, ConsoleTtySettings>> =
-        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
-    static ref SESSION_TTYS: UPIntrFreeCell<BTreeMap<usize, TtyId>> =
-        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+    static ref PTY_TTY_SETTINGS: SpinNoIrqLock<BTreeMap<u32, ConsoleTtySettings>> =
+        SpinNoIrqLock::new(BTreeMap::new());
+    static ref SESSION_TTYS: SpinNoIrqLock<BTreeMap<usize, TtyId>> =
+        SpinNoIrqLock::new(BTreeMap::new());
 }
 
 enum ReadAttempt {
@@ -247,37 +247,27 @@ enum ReadAttempt {
 
 fn with_tty_settings<R>(id: TtyId, f: impl FnOnce(&ConsoleTtySettings) -> R) -> Option<R> {
     match id {
-        TtyId::Console => Some(
-            CONSOLE_TTY
-                .state
-                .exclusive_session(|state| f(&state.settings)),
-        ),
-        TtyId::Pty(id) => PTY_TTY_SETTINGS.exclusive_session(|settings| settings.get(&id).map(f)),
+        TtyId::Console => Some(CONSOLE_TTY.state.with_lock(|state| f(&state.settings))),
+        TtyId::Pty(id) => PTY_TTY_SETTINGS.with_lock(|settings| settings.get(&id).map(f)),
     }
 }
 
 fn with_tty_settings_mut<R>(id: TtyId, f: impl FnOnce(&mut ConsoleTtySettings) -> R) -> Option<R> {
     match id {
-        TtyId::Console => Some(
-            CONSOLE_TTY
-                .state
-                .exclusive_session(|state| f(&mut state.settings)),
-        ),
-        TtyId::Pty(id) => {
-            PTY_TTY_SETTINGS.exclusive_session(|settings| settings.get_mut(&id).map(f))
-        }
+        TtyId::Console => Some(CONSOLE_TTY.state.with_lock(|state| f(&mut state.settings))),
+        TtyId::Pty(id) => PTY_TTY_SETTINGS.with_lock(|settings| settings.get_mut(&id).map(f)),
     }
 }
 
 pub(crate) fn register_pty_tty(id: u32) {
-    PTY_TTY_SETTINGS.exclusive_session(|settings| {
+    PTY_TTY_SETTINGS.with_lock(|settings| {
         settings.entry(id).or_insert_with(ConsoleTtySettings::new);
     });
 }
 
 pub(crate) fn unregister_pty_tty(id: u32) {
     tty_hangup(TtyId::Pty(id));
-    PTY_TTY_SETTINGS.exclusive_session(|settings| {
+    PTY_TTY_SETTINGS.with_lock(|settings| {
         settings.remove(&id);
     });
 }
@@ -287,7 +277,7 @@ pub(crate) fn tty_control_state(id: TtyId) -> Option<TtyControlState> {
 }
 
 pub(crate) fn tty_for_session(sid: usize) -> Option<TtyId> {
-    SESSION_TTYS.exclusive_session(|sessions| sessions.get(&sid).copied())
+    SESSION_TTYS.with_lock(|sessions| sessions.get(&sid).copied())
 }
 
 pub(crate) fn tty_attach(
@@ -296,7 +286,7 @@ pub(crate) fn tty_attach(
     foreground_pgid: usize,
     force: bool,
 ) -> super::FsResult {
-    let mut sessions = SESSION_TTYS.exclusive_access();
+    let mut sessions = SESSION_TTYS.lock();
     if sessions.get(&sid).is_some_and(|existing| *existing != id) {
         return Err(super::FsError::PermissionDenied);
     }
@@ -326,7 +316,7 @@ pub(crate) fn tty_release(id: TtyId, sid: usize) -> super::FsResult<Option<usize
     // Keep the session-to-TTY map and the TTY owner fields under one
     // serialization boundary so concurrent release/acquire cannot leave only
     // one side of the relationship installed.
-    let mut sessions = SESSION_TTYS.exclusive_access();
+    let mut sessions = SESSION_TTYS.lock();
     let control = tty_control_state(id).ok_or(super::FsError::NoDeviceOrAddress)?;
     if control.session != Some(sid) || sessions.get(&sid) != Some(&id) {
         return Err(super::FsError::NoDeviceOrAddress);
@@ -342,7 +332,7 @@ pub(crate) fn tty_release(id: TtyId, sid: usize) -> super::FsResult<Option<usize
 }
 
 pub(crate) fn tty_hangup(id: TtyId) {
-    let mut sessions = SESSION_TTYS.exclusive_access();
+    let mut sessions = SESSION_TTYS.lock();
     let Some(control) = tty_control_state(id) else {
         return;
     };
@@ -544,7 +534,7 @@ pub(crate) fn console_tty_available_bytes() -> usize {
     console_tty_drain_uart();
     CONSOLE_TTY
         .state
-        .exclusive_session(|state| state.read_buf.len() + usize::from(state.pending_eof))
+        .with_lock(|state| state.read_buf.len() + usize::from(state.pending_eof))
 }
 
 pub(crate) fn console_tty_poll(events: PollEvents) -> PollEvents {
@@ -560,16 +550,16 @@ pub(crate) fn console_tty_poll_with_wait(
     }
     CONSOLE_TTY
         .state
-        .exclusive_session(|state| state.ensure_foreground_pgid(current_process_group_id()));
+        .with_lock(|state| state.ensure_foreground_pgid(current_process_group_id()));
     if let Some(waiter) = waiter {
         CONSOLE_TTY
             .poll_waiters
-            .exclusive_session(|waiters| waiters.register(waiter));
+            .with_lock(|waiters| waiters.register(waiter));
     }
     console_tty_drain_uart();
     let readable = CONSOLE_TTY
         .state
-        .exclusive_session(|state| !state.read_buf.is_empty() || state.pending_eof);
+        .with_lock(|state| !state.read_buf.is_empty() || state.pending_eof);
     if readable {
         PollEvents::POLLIN
     } else {
@@ -584,11 +574,11 @@ pub(crate) fn console_tty_read(user_buf: UserBuffer) -> usize {
     }
     CONSOLE_TTY
         .state
-        .exclusive_session(|state| state.ensure_foreground_pgid(current_process_group_id()));
+        .with_lock(|state| state.ensure_foreground_pgid(current_process_group_id()));
 
     loop {
         console_tty_drain_uart();
-        let mut state = CONSOLE_TTY.state.exclusive_access();
+        let mut state = CONSOLE_TTY.state.lock();
         match try_read_buffered(&mut state, want_to_read) {
             ReadAttempt::Data(data) => {
                 drop(state);
@@ -641,10 +631,10 @@ pub(crate) fn console_tty_drain_uart() {
     if should_signal {
         let task = CONSOLE_TTY
             .state
-            .exclusive_session(|state| state.read_wait_queue.pop_front());
+            .with_lock(|state| state.read_wait_queue.pop_front());
         let poll_waiters = CONSOLE_TTY
             .poll_waiters
-            .exclusive_session(|waiters| waiters.drain());
+            .with_lock(|waiters| waiters.drain());
         if let Some(task) = task {
             wakeup_task(task);
         }
@@ -672,7 +662,7 @@ fn try_read_buffered(state: &mut ConsoleTtyState, want_to_read: usize) -> ReadAt
 
 fn process_input(mut ch: u8) -> InputAction {
     let current_pgid = current_process_group_id();
-    CONSOLE_TTY.state.exclusive_session(|state| {
+    CONSOLE_TTY.state.with_lock(|state| {
         state.ensure_foreground_pgid(current_pgid);
         let termios = state.settings.termios;
         if ch == b'\r' {
@@ -782,7 +772,7 @@ fn flush_input_after_signal(state: &mut ConsoleTtyState, termios: LinuxTermios) 
 
 fn signal_foreground_process_group(signal: SignalFlags) {
     let current_pgid = current_process_group_id();
-    let pgid = CONSOLE_TTY.state.exclusive_session(|state| {
+    let pgid = CONSOLE_TTY.state.with_lock(|state| {
         state.ensure_foreground_pgid(current_pgid);
         state.settings.control.foreground_pgid.or(current_pgid)
     });

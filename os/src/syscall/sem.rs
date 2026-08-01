@@ -1,7 +1,8 @@
+use super::ipc_util::{now_sec, pid_to_i32};
 use super::time::relative_timeout_deadline_ms;
 use super::uapi::LinuxTimeSpec;
 use super::user_ptr::{read_user_array, read_user_value, write_user_array, write_user_value};
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::task::check_signals_of_current;
 use crate::task::{
     TaskContext, TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
@@ -220,8 +221,7 @@ impl SemSet {
         caller.euid == self.uid || caller.euid == self.cuid || caller.can_override_ipc
     }
 
-    fn stat(&self, id: usize) -> SemSetStat {
-        let _ = id;
+    fn stat(&self) -> SemSetStat {
         SemSetStat {
             key: self.key,
             uid: self.uid,
@@ -372,7 +372,7 @@ impl SemManager {
         if !set.can_read(caller) {
             return Err(SemError::AccessDenied);
         }
-        Ok(set.stat(semid))
+        Ok(set.stat())
     }
 
     fn stat_by_index(
@@ -385,7 +385,7 @@ impl SemManager {
         if !skip_permission && !set.can_read(caller) {
             return Err(SemError::AccessDenied);
         }
-        Ok((index, set.stat(index)))
+        Ok((index, set.stat()))
     }
 
     fn set_attrs(
@@ -668,8 +668,7 @@ fn first_waiting_op(set: &SemSet, ops: &[LinuxSembuf]) -> Option<(usize, SemWait
 }
 
 lazy_static! {
-    static ref SEM_MANAGER: UPIntrFreeCell<SemManager> =
-        unsafe { UPIntrFreeCell::new(SemManager::new()) };
+    static ref SEM_MANAGER: SpinNoIrqLock<SemManager> = SpinNoIrqLock::new(SemManager::new());
 }
 
 pub(super) fn sys_semget(key: isize, nsems: usize, semflg: i32) -> KResult {
@@ -681,7 +680,7 @@ pub(super) fn sys_semget(key: isize, nsems: usize, semflg: i32) -> KResult {
         gid: credentials.egid,
     };
     SEM_MANAGER
-        .exclusive_access()
+        .lock()
         .get_or_create(key, nsems, semflg, context, &caller)
         .map(|semid| semid as isize)
         .map_err(sem_error_to_sys_error)
@@ -694,14 +693,14 @@ pub(super) fn sys_semctl(semid: usize, semnum: usize, cmd: i32, arg: usize) -> K
     match cmd {
         IPC_RMID => {
             SEM_MANAGER
-                .exclusive_access()
+                .lock()
                 .remove_set(semid, &caller)
                 .map_err(sem_error_to_sys_error)?;
             Ok(0)
         }
         IPC_STAT => {
             let stat = SEM_MANAGER
-                .exclusive_access()
+                .lock()
                 .stat_by_id(semid, &caller)
                 .map_err(sem_error_to_sys_error)?;
             write_semid_ds(arg, stat)?;
@@ -711,7 +710,7 @@ pub(super) fn sys_semctl(semid: usize, semnum: usize, cmd: i32, arg: usize) -> K
             let ds: LinuxSemid64Ds =
                 read_user_value(current_user_token(), arg as *const LinuxSemid64Ds)?;
             SEM_MANAGER
-                .exclusive_access()
+                .lock()
                 .set_attrs(
                     semid,
                     SemSetAttrs {
@@ -725,23 +724,23 @@ pub(super) fn sys_semctl(semid: usize, semnum: usize, cmd: i32, arg: usize) -> K
             Ok(0)
         }
         GETVAL => SEM_MANAGER
-            .exclusive_access()
+            .lock()
             .get_value(semid, semnum, &caller)
             .map(|value| value as isize)
             .map_err(sem_error_to_sys_error),
         GETPID => SEM_MANAGER
-            .exclusive_access()
+            .lock()
             .get_pid(semid, semnum, &caller)
             .map(|pid| pid as isize)
             .map_err(sem_error_to_sys_error),
         GETNCNT | GETZCNT => SEM_MANAGER
-            .exclusive_access()
+            .lock()
             .get_wait_count(semid, semnum, cmd == GETZCNT, &caller)
             .map(|count| count as isize)
             .map_err(sem_error_to_sys_error),
         GETALL => {
             let values = SEM_MANAGER
-                .exclusive_access()
+                .lock()
                 .get_all(semid, &caller)
                 .map_err(sem_error_to_sys_error)?;
             write_user_array(current_user_token(), arg as *mut u16, &values)?;
@@ -749,25 +748,25 @@ pub(super) fn sys_semctl(semid: usize, semnum: usize, cmd: i32, arg: usize) -> K
         }
         SETVAL => {
             SEM_MANAGER
-                .exclusive_access()
+                .lock()
                 .set_value(semid, semnum, arg as i32, &caller)
                 .map_err(sem_error_to_sys_error)?;
             Ok(0)
         }
         SETALL => {
             let nsems = {
-                let manager = SEM_MANAGER.exclusive_access();
+                let manager = SEM_MANAGER.lock();
                 manager.sets.get(&semid).ok_or(Errno::EINVAL)?.values.len()
             };
             let values = read_user_array(current_user_token(), arg as *const u16, nsems)?;
             SEM_MANAGER
-                .exclusive_access()
+                .lock()
                 .set_all(semid, &values, &caller)
                 .map_err(sem_error_to_sys_error)?;
             Ok(0)
         }
         IPC_INFO | SEM_INFO => {
-            let usage = SEM_MANAGER.exclusive_access().usage_info();
+            let usage = SEM_MANAGER.lock().usage_info();
             let mut info = base_seminfo();
             if cmd == SEM_INFO {
                 info.semusz = usage.used_ids.try_into().unwrap_or(i32::MAX);
@@ -779,7 +778,7 @@ pub(super) fn sys_semctl(semid: usize, semnum: usize, cmd: i32, arg: usize) -> K
         SEM_STAT | SEM_STAT_ANY => {
             let skip_permission = cmd == SEM_STAT_ANY;
             let (real_semid, stat) = SEM_MANAGER
-                .exclusive_access()
+                .lock()
                 .stat_by_index(semid, &caller, skip_permission)
                 .map_err(sem_error_to_sys_error)?;
             write_semid_ds(arg, stat)?;
@@ -821,7 +820,7 @@ pub(super) fn sys_semtimedop(
         let Some(task) = current_task() else {
             return Err(Errno::EINTR);
         };
-        let mut manager = SEM_MANAGER.exclusive_access();
+        let mut manager = SEM_MANAGER.lock();
         let still_waiting = manager.remove_waiter_for_task(&task);
         let set_exists = manager.sets.contains_key(&semid);
         drop(manager);
@@ -846,7 +845,7 @@ fn try_or_block_semop(
     caller: &SemCaller,
     timeout_deadline_ms: Option<usize>,
 ) -> Result<SemOpAttempt, Errno> {
-    let mut manager = SEM_MANAGER.exclusive_access();
+    let mut manager = SEM_MANAGER.lock();
     match manager.try_semop(semid, ops, caller) {
         Ok(()) => Ok(SemOpAttempt::Done),
         Err(SemError::WouldBlock) => manager
@@ -896,11 +895,11 @@ fn base_seminfo() -> LinuxSeminfo {
 }
 
 pub(crate) fn proc_sysvipc_sem_content() -> String {
-    SEM_MANAGER.exclusive_access().proc_sysvipc_sem_content()
+    SEM_MANAGER.lock().proc_sysvipc_sem_content()
 }
 
 pub(crate) fn sysctl_sem_content() -> String {
-    SEM_MANAGER.exclusive_access().sysctl_sem_content()
+    SEM_MANAGER.lock().sysctl_sem_content()
 }
 
 fn sem_caller_from(pid: usize, credentials: &crate::task::Credentials) -> SemCaller {
@@ -926,12 +925,4 @@ fn sem_error_to_sys_error(error: SemError) -> Errno {
         SemError::WouldBlock => Errno::EAGAIN,
         SemError::Interrupted => Errno::EINTR,
     }
-}
-
-fn now_sec() -> i64 {
-    (crate::timer::wall_time_nanos() / 1_000_000_000) as i64
-}
-
-fn pid_to_i32(pid: usize) -> i32 {
-    pid.try_into().unwrap_or(i32::MAX)
 }

@@ -1,11 +1,11 @@
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::task::{
     TaskContext, TaskControlBlock, block_current_task_no_schedule, wakeup_front_task, wakeup_task,
 };
 use alloc::{collections::VecDeque, sync::Arc};
 
 pub struct Condvar {
-    pub inner: UPIntrFreeCell<CondvarInner>,
+    pub inner: SpinNoIrqLock<CondvarInner>,
 }
 
 pub struct CondvarInner {
@@ -15,16 +15,14 @@ pub struct CondvarInner {
 impl Condvar {
     pub fn new() -> Self {
         Self {
-            inner: unsafe {
-                UPIntrFreeCell::new(CondvarInner {
-                    wait_queue: VecDeque::new(),
-                })
-            },
+            inner: SpinNoIrqLock::new(CondvarInner {
+                wait_queue: VecDeque::new(),
+            }),
         }
     }
 
     pub fn signal(&self) -> bool {
-        let task = self.inner.exclusive_access().wait_queue.pop_front();
+        let task = self.inner.lock().wait_queue.pop_front();
         if let Some(task) = task {
             wakeup_task(task);
             true
@@ -34,7 +32,7 @@ impl Condvar {
     }
 
     pub fn signal_front(&self) -> bool {
-        let task = self.inner.exclusive_access().wait_queue.pop_front();
+        let task = self.inner.lock().wait_queue.pop_front();
         if let Some(task) = task {
             wakeup_front_task(task);
             true
@@ -47,7 +45,7 @@ impl Condvar {
         // Serialize the Blocked publication and queue insertion against
         // signal(). Otherwise a completion can observe an empty queue after
         // the task has committed to sleeping but before it becomes wakeable.
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         let (task, task_cx_ptr) = block_current_task_no_schedule();
         inner.wait_queue.push_back(task);
         task_cx_ptr

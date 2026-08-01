@@ -64,7 +64,7 @@ pub fn init() {
     frame_allocator::init_frame_allocator();
     heap_allocator::enable_slab_allocator();
     let start_us = crate::timer::get_time_us();
-    let kernel_space = KERNEL_SPACE.exclusive_access();
+    let kernel_space = KERNEL_SPACE.lock();
     kernel_space.activate();
     let token = kernel_space.token();
     drop(kernel_space);
@@ -76,7 +76,7 @@ pub fn init() {
 }
 
 pub fn kernel_mapping_stats() -> KernelMappingStats {
-    let page_table = KERNEL_SPACE.exclusive_access().page_table_stats();
+    let page_table = KERNEL_SPACE.lock().page_table_stats();
     KernelMappingStats {
         elapsed_us: KERNEL_MAP_ELAPSED_US.load(Ordering::Relaxed),
         page_table_frames: page_table.frames,

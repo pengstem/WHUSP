@@ -21,7 +21,7 @@ use crate::drivers::chardev::UART;
 use crate::mm::UserBuffer;
 use crate::perf;
 use crate::random::CompatibilityRandom;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::task::{
     TaskControlBlock, block_current_task_no_schedule,
     block_current_task_no_schedule_unless_unmasked_signal, current_has_unmasked_signal,
@@ -47,9 +47,6 @@ const PTY_INO_BASE: u32 = 0x1000;
 const INPUT_DEVICE_NAME: &str = "virtual-device-ltp";
 const INPUT_EVENT_QUEUE_CAPACITY: usize = 512;
 
-impl super::TtyFileCapability for DevFsFile {}
-
-impl super::TtyFileCapability for PtyFile {}
 const INPUT_MICE_QUEUE_CAPACITY: usize = 512;
 const INPUT_EVENT_SIZE: usize = core::mem::size_of::<LinuxInputEvent>();
 const UINPUT_MAX_NAME_SIZE: usize = 80;
@@ -69,10 +66,8 @@ const INPUT_DEFAULT_REP_DELAY_MS: i32 = 250;
 const INPUT_DEFAULT_REP_PERIOD_MS: i32 = 33;
 
 lazy_static! {
-    static ref PTY_TABLE: UPIntrFreeCell<PtyTable> =
-        unsafe { UPIntrFreeCell::new(PtyTable::new()) };
-    static ref INPUT_STATE: UPIntrFreeCell<InputState> =
-        unsafe { UPIntrFreeCell::new(InputState::new()) };
+    static ref PTY_TABLE: SpinNoIrqLock<PtyTable> = SpinNoIrqLock::new(PtyTable::new());
+    static ref INPUT_STATE: SpinNoIrqLock<InputState> = SpinNoIrqLock::new(InputState::new());
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,7 +170,7 @@ struct DevFsFile {
     mount_id: Option<MountId>,
     readable: bool,
     writable: bool,
-    offset: UPIntrFreeCell<usize>,
+    offset: SpinNoIrqLock<usize>,
     status_flags: StatusFlagsCell,
 }
 
@@ -192,7 +187,7 @@ impl DevFsFile {
             mount_id,
             readable,
             writable,
-            offset: unsafe { UPIntrFreeCell::new(0) },
+            offset: SpinNoIrqLock::new(0),
             status_flags: StatusFlagsCell::new(status_flags),
         }
     }
@@ -213,7 +208,7 @@ enum PtyEndpoint {
 }
 
 struct PtyFile {
-    pair: Arc<UPIntrFreeCell<PtyPair>>,
+    pair: Arc<SpinNoIrqLock<PtyPair>>,
     endpoint: PtyEndpoint,
     readable: bool,
     writable: bool,
@@ -318,21 +313,21 @@ impl UInputConfig {
 }
 
 struct UInputFile {
-    config: UPIntrFreeCell<UInputConfig>,
+    config: SpinNoIrqLock<UInputConfig>,
     status_flags: StatusFlagsCell,
 }
 
 impl UInputFile {
     fn new(flags: OpenFlags) -> Self {
         Self {
-            config: unsafe { UPIntrFreeCell::new(UInputConfig::new()) },
+            config: SpinNoIrqLock::new(UInputConfig::new()),
             status_flags: StatusFlagsCell::new(OpenFlags::file_status_flags(flags)),
         }
     }
 }
 
 struct InputEventFile {
-    client: Arc<UPIntrFreeCell<InputClient>>,
+    client: Arc<SpinNoIrqLock<InputClient>>,
     readable: bool,
     writable: bool,
     status_flags: StatusFlagsCell,
@@ -396,7 +391,7 @@ impl InputClient {
 struct InputState {
     device_created: bool,
     device: InputDeviceConfig,
-    clients: Vec<Arc<UPIntrFreeCell<InputClient>>>,
+    clients: Vec<Arc<SpinNoIrqLock<InputClient>>>,
     mice_queue: VecDeque<u8>,
     mice_read_wait_queue: VecDeque<Arc<TaskControlBlock>>,
 }
@@ -422,7 +417,7 @@ impl InputState {
         self.device_created = false;
         self.mice_queue.clear();
         for client in &self.clients {
-            client.exclusive_access().events.clear();
+            client.lock().events.clear();
         }
     }
 
@@ -435,7 +430,7 @@ impl InputState {
 
 impl PtyFile {
     fn new(
-        pair: Arc<UPIntrFreeCell<PtyPair>>,
+        pair: Arc<SpinNoIrqLock<PtyPair>>,
         endpoint: PtyEndpoint,
         readable: bool,
         writable: bool,
@@ -451,15 +446,15 @@ impl PtyFile {
     }
 
     fn id(&self) -> u32 {
-        self.pair.exclusive_access().id
+        self.pair.lock().id
     }
 
     fn lock_state(&self) -> bool {
-        self.pair.exclusive_access().locked
+        self.pair.lock().locked
     }
 
     fn set_locked(&self, locked: bool) {
-        self.pair.exclusive_access().locked = locked;
+        self.pair.lock().locked = locked;
     }
 }
 
@@ -607,7 +602,7 @@ impl PtyPair {
 }
 
 struct PtyTable {
-    slots: Vec<Option<Arc<UPIntrFreeCell<PtyPair>>>>,
+    slots: Vec<Option<Arc<SpinNoIrqLock<PtyPair>>>>,
     next_hint: usize,
 }
 
@@ -619,11 +614,11 @@ impl PtyTable {
         }
     }
 
-    fn allocate(&mut self) -> FsResult<Arc<UPIntrFreeCell<PtyPair>>> {
+    fn allocate(&mut self) -> FsResult<Arc<SpinNoIrqLock<PtyPair>>> {
         for offset in 0..PTY_TABLE_SIZE {
             let id = (self.next_hint + offset) % PTY_TABLE_SIZE;
             if self.slots[id].is_none() {
-                let pair = Arc::new(unsafe { UPIntrFreeCell::new(PtyPair::new(id)) });
+                let pair = Arc::new(SpinNoIrqLock::new(PtyPair::new(id)));
                 self.slots[id] = Some(pair.clone());
                 self.next_hint = (id + 1) % PTY_TABLE_SIZE;
                 return Ok(pair);
@@ -632,7 +627,7 @@ impl PtyTable {
         Err(FsError::NoSpace)
     }
 
-    fn get(&self, id: usize) -> Option<Arc<UPIntrFreeCell<PtyPair>>> {
+    fn get(&self, id: usize) -> Option<Arc<SpinNoIrqLock<PtyPair>>> {
         self.slots.get(id).and_then(|slot| slot.clone())
     }
 
@@ -644,7 +639,7 @@ impl PtyTable {
             .collect()
     }
 
-    fn remove_if_same(&mut self, id: usize, pair: &Arc<UPIntrFreeCell<PtyPair>>) {
+    fn remove_if_same(&mut self, id: usize, pair: &Arc<SpinNoIrqLock<PtyPair>>) {
         if let Some(slot) = self.slots.get_mut(id)
             && let Some(current) = slot
             && Arc::ptr_eq(current, pair)
@@ -969,8 +964,8 @@ fn open_ptmx(flags: OpenFlags) -> FsResult<Arc<dyn File + Send + Sync>> {
         return Err(FsError::NotDir);
     }
     let (readable, writable) = flags.read_write();
-    let pair = PTY_TABLE.exclusive_session(|table| table.allocate())?;
-    let id = pair.exclusive_access().id;
+    let pair = PTY_TABLE.with_lock(|table| table.allocate())?;
+    let id = pair.lock().id;
     register_pty_tty(id);
     Ok(Arc::new(PtyFile::new(
         pair,
@@ -989,10 +984,10 @@ fn open_pty_slave(id: usize, flags: OpenFlags) -> FsResult<Arc<dyn File + Send +
         return Err(FsError::NotDir);
     }
     let pair = PTY_TABLE
-        .exclusive_session(|table| table.get(id))
+        .with_lock(|table| table.get(id))
         .ok_or(FsError::NotFound)?;
     {
-        let mut inner = pair.exclusive_access();
+        let mut inner = pair.lock();
         if inner.locked {
             return Err(FsError::PermissionDenied);
         }
@@ -1209,7 +1204,7 @@ fn stat_node(node: DevNode) -> FileStat {
 }
 
 fn stat_pty_slave(id: usize) -> Option<FileStat> {
-    PTY_TABLE.exclusive_session(|table| table.get(id))?;
+    PTY_TABLE.with_lock(|table| table.get(id))?;
     let mut stat = FileStat::with_mode(S_IFCHR | 0o620);
     stat.dev = DEVFS_DEV;
     stat.ino = PTY_INO_BASE as u64 + id as u64;
@@ -1219,7 +1214,7 @@ fn stat_pty_slave(id: usize) -> Option<FileStat> {
     Some(stat)
 }
 
-fn loop_state(id: usize) -> Option<&'static UPIntrFreeCell<LoopDeviceState>> {
+fn loop_state(id: usize) -> Option<&'static SpinNoIrqLock<LoopDeviceState>> {
     match id {
         0 => Some(&LOOP0_STATE),
         1 => Some(&LOOP1_STATE),
@@ -1238,14 +1233,14 @@ fn loop_node_id(node: DevNode) -> Option<usize> {
 fn loop_device_backend(id: usize) -> FsResult<Arc<dyn File + Send + Sync>> {
     loop_state(id)
         .ok_or(FsError::NoDeviceOrAddress)?
-        .exclusive_session(|state| state.backend.clone())
+        .with_lock(|state| state.backend.clone())
         .ok_or(FsError::NoDeviceOrAddress)
 }
 
 fn loop_device_visible_size(id: usize) -> FsResult<u64> {
     Ok(loop_state(id)
         .ok_or(FsError::NoDeviceOrAddress)?
-        .exclusive_session(|state| state.visible_size()))
+        .with_lock(|state| state.visible_size()))
 }
 
 fn read_loop_device_at(id: usize, offset: usize, buf: &mut [u8]) -> usize {
@@ -1286,8 +1281,8 @@ fn write_loop_device_at(id: usize, offset: usize, buf: &[u8]) -> usize {
     }
 }
 
-fn read_loop_device(id: usize, offset: &UPIntrFreeCell<usize>, mut user_buf: UserBuffer) -> usize {
-    let mut current = offset.exclusive_access();
+fn read_loop_device(id: usize, offset: &SpinNoIrqLock<usize>, mut user_buf: UserBuffer) -> usize {
+    let mut current = offset.lock();
     let mut total = 0usize;
     for slice in user_buf.segments_mut() {
         let read_size = read_loop_device_at(id, *current, slice);
@@ -1300,8 +1295,8 @@ fn read_loop_device(id: usize, offset: &UPIntrFreeCell<usize>, mut user_buf: Use
     total
 }
 
-fn write_loop_device(id: usize, offset: &UPIntrFreeCell<usize>, user_buf: UserBuffer) -> usize {
-    let mut current = offset.exclusive_access();
+fn write_loop_device(id: usize, offset: &SpinNoIrqLock<usize>, user_buf: UserBuffer) -> usize {
+    let mut current = offset.lock();
     let mut total = 0usize;
     for slice in user_buf.segments() {
         let write_size = write_loop_device_at(id, *current, slice);
@@ -1319,11 +1314,11 @@ fn write_loop_device(id: usize, offset: &UPIntrFreeCell<usize>, user_buf: UserBu
 
 fn seek_loop_device(
     id: usize,
-    offset_cell: &UPIntrFreeCell<usize>,
+    offset_cell: &SpinNoIrqLock<usize>,
     offset: i64,
     whence: SeekWhence,
 ) -> FsResult<usize> {
-    let mut current = offset_cell.exclusive_access();
+    let mut current = offset_cell.lock();
     let base = match whence {
         SeekWhence::Set => 0i128,
         SeekWhence::Current => *current as i128,
@@ -1340,8 +1335,8 @@ fn seek_loop_device(
     Ok(*current)
 }
 
-fn seek_null_like(offset_cell: &UPIntrFreeCell<usize>) -> usize {
-    let mut current = offset_cell.exclusive_access();
+fn seek_null_like(offset_cell: &SpinNoIrqLock<usize>) -> usize {
+    let mut current = offset_cell.lock();
     *current = 0;
     0
 }
@@ -1379,7 +1374,7 @@ pub(crate) fn devfs_uinput_set_evbit(file: &(dyn File + Send + Sync), code: usiz
         .as_any()
         .downcast_ref::<UInputFile>()
         .ok_or(FsError::InvalidInput)?;
-    file.config.exclusive_access().device.set_evbit(code)
+    file.config.lock().device.set_evbit(code)
 }
 
 pub(crate) fn devfs_uinput_set_keybit(file: &(dyn File + Send + Sync), code: usize) -> FsResult {
@@ -1387,7 +1382,7 @@ pub(crate) fn devfs_uinput_set_keybit(file: &(dyn File + Send + Sync), code: usi
         .as_any()
         .downcast_ref::<UInputFile>()
         .ok_or(FsError::InvalidInput)?;
-    file.config.exclusive_access().device.set_keybit(code)
+    file.config.lock().device.set_keybit(code)
 }
 
 pub(crate) fn devfs_uinput_set_relbit(file: &(dyn File + Send + Sync), code: usize) -> FsResult {
@@ -1395,7 +1390,7 @@ pub(crate) fn devfs_uinput_set_relbit(file: &(dyn File + Send + Sync), code: usi
         .as_any()
         .downcast_ref::<UInputFile>()
         .ok_or(FsError::InvalidInput)?;
-    file.config.exclusive_access().device.set_relbit(code)
+    file.config.lock().device.set_relbit(code)
 }
 
 pub(crate) fn devfs_uinput_create(file: &(dyn File + Send + Sync)) -> FsResult {
@@ -1403,8 +1398,8 @@ pub(crate) fn devfs_uinput_create(file: &(dyn File + Send + Sync)) -> FsResult {
         .as_any()
         .downcast_ref::<UInputFile>()
         .ok_or(FsError::InvalidInput)?;
-    let device = file.config.exclusive_access().device.clone();
-    INPUT_STATE.exclusive_session(|state| state.create_device(device));
+    let device = file.config.lock().device.clone();
+    INPUT_STATE.with_lock(|state| state.create_device(device));
     Ok(())
 }
 
@@ -1412,13 +1407,13 @@ pub(crate) fn devfs_uinput_destroy(file: &(dyn File + Send + Sync)) -> FsResult 
     file.as_any()
         .downcast_ref::<UInputFile>()
         .ok_or(FsError::InvalidInput)?;
-    INPUT_STATE.exclusive_session(|state| state.destroy_device());
+    INPUT_STATE.with_lock(|state| state.destroy_device());
     Ok(())
 }
 
 pub(crate) fn devfs_input_event_name(file: &(dyn File + Send + Sync)) -> Option<Vec<u8>> {
     file.as_any().downcast_ref::<InputEventFile>()?;
-    Some(INPUT_STATE.exclusive_access().device.name_bytes().to_vec())
+    Some(INPUT_STATE.lock().device.name_bytes().to_vec())
 }
 
 pub(crate) fn devfs_input_event_set_grabbed(
@@ -1429,15 +1424,13 @@ pub(crate) fn devfs_input_event_set_grabbed(
         .as_any()
         .downcast_ref::<InputEventFile>()
         .ok_or(FsError::InvalidInput)?;
-    file.client.exclusive_access().grabbed = grabbed;
+    file.client.lock().grabbed = grabbed;
     Ok(())
 }
 
 pub(crate) fn find_free_loop_device() -> FsResult<usize> {
     for id in 0..LOOP_DEVICE_COUNT {
-        if loop_state(id)
-            .is_some_and(|state| state.exclusive_session(|state| state.backend.is_none()))
-        {
+        if loop_state(id).is_some_and(|state| state.with_lock(|state| state.backend.is_none())) {
             return Ok(id);
         }
     }
@@ -1445,11 +1438,11 @@ pub(crate) fn find_free_loop_device() -> FsResult<usize> {
 }
 
 pub(crate) fn loop_device_is_attached(id: usize) -> bool {
-    loop_state(id).is_some_and(|state| state.exclusive_session(|state| state.backend.is_some()))
+    loop_state(id).is_some_and(|state| state.with_lock(|state| state.backend.is_some()))
 }
 
 pub(crate) fn loop_device_is_read_only(id: usize) -> bool {
-    loop_state(id).is_some_and(|state| state.exclusive_session(|state| state.read_only()))
+    loop_state(id).is_some_and(|state| state.with_lock(|state| state.read_only()))
 }
 
 pub(crate) fn loop_device_set_read_only(id: usize, read_only: bool) -> FsResult {
@@ -1457,7 +1450,7 @@ pub(crate) fn loop_device_set_read_only(id: usize, read_only: bool) -> FsResult 
     if !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    state.exclusive_session(|state| state.set_flag(LOOP_FLAG_READ_ONLY, read_only));
+    state.with_lock(|state| state.set_flag(LOOP_FLAG_READ_ONLY, read_only));
     Ok(())
 }
 
@@ -1466,7 +1459,7 @@ pub(crate) fn loop_device_read_ahead(id: usize) -> FsResult<usize> {
     if !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    Ok(state.exclusive_session(|state| state.read_ahead))
+    Ok(state.with_lock(|state| state.read_ahead))
 }
 
 pub(crate) fn loop_device_set_read_ahead(id: usize, read_ahead: usize) -> FsResult {
@@ -1474,7 +1467,7 @@ pub(crate) fn loop_device_set_read_ahead(id: usize, read_ahead: usize) -> FsResu
     if !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    state.exclusive_session(|state| state.read_ahead = read_ahead);
+    state.with_lock(|state| state.read_ahead = read_ahead);
     Ok(())
 }
 
@@ -1487,7 +1480,7 @@ pub(crate) fn attach_loop_device(
     let state = loop_state(id).ok_or(FsError::NoDeviceOrAddress)?;
     let size = backend.stat().map(|stat| stat.size)?;
     super::mount::reset_ext_scratch_mount(format!("/dev/loop{}", id).as_str());
-    state.exclusive_session(|state| {
+    state.with_lock(|state| {
         state.reset();
         state.backend = Some(backend);
         state.backing_path = backing_path;
@@ -1500,7 +1493,7 @@ pub(crate) fn attach_loop_device(
 pub(crate) fn detach_loop_device(id: usize) -> FsResult {
     loop_state(id)
         .ok_or(FsError::NoDeviceOrAddress)?
-        .exclusive_session(|state| {
+        .with_lock(|state| {
             let backend = state.backend.take();
             if backend.is_some() {
                 state.reset();
@@ -1522,7 +1515,7 @@ pub(crate) fn loop_device_refresh_size(id: usize) -> FsResult<u64> {
     let state = loop_state(id).ok_or(FsError::NoDeviceOrAddress)?;
     let backend = loop_device_backend(id)?;
     let size = backend.stat().map(|stat| stat.size)?;
-    Ok(state.exclusive_session(|state| {
+    Ok(state.with_lock(|state| {
         state.size = size;
         state.visible_size()
     }))
@@ -1533,7 +1526,7 @@ pub(crate) fn loop_device_flags(id: usize) -> FsResult<u32> {
     if !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    Ok(state.exclusive_session(|state| state.flags))
+    Ok(state.with_lock(|state| state.flags))
 }
 
 pub(crate) fn loop_device_size_limit(id: usize) -> FsResult<u64> {
@@ -1541,7 +1534,7 @@ pub(crate) fn loop_device_size_limit(id: usize) -> FsResult<u64> {
     if !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    Ok(state.exclusive_session(|state| state.size_limit))
+    Ok(state.with_lock(|state| state.size_limit))
 }
 
 pub(crate) fn loop_device_set_status(id: usize, flags: u32, size_limit: Option<u64>) -> FsResult {
@@ -1549,7 +1542,7 @@ pub(crate) fn loop_device_set_status(id: usize, flags: u32, size_limit: Option<u
     if !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    state.exclusive_session(|state| {
+    state.with_lock(|state| {
         state.set_flag(LOOP_FLAG_AUTOCLEAR, flags & LOOP_FLAG_AUTOCLEAR != 0);
         if flags & LOOP_FLAG_PARTSCAN != 0 {
             state.set_flag(LOOP_FLAG_PARTSCAN, true);
@@ -1566,14 +1559,14 @@ pub(crate) fn loop_device_set_direct_io(id: usize, enabled: bool) -> FsResult {
     if !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    state.exclusive_session(|state| state.set_flag(LOOP_FLAG_DIRECT_IO, enabled));
+    state.with_lock(|state| state.set_flag(LOOP_FLAG_DIRECT_IO, enabled));
     Ok(())
 }
 
 pub(crate) fn loop_device_set_block_size(id: usize, block_size: usize) -> FsResult {
     loop_state(id)
         .ok_or(FsError::NoDeviceOrAddress)?
-        .exclusive_session(|state| state.block_size = block_size);
+        .with_lock(|state| state.block_size = block_size);
     Ok(())
 }
 
@@ -1582,7 +1575,7 @@ pub(crate) fn loop_device_note_synthetic_write(id: usize, bytes: u64) -> FsResul
     if !loop_device_is_attached(id) {
         return Err(FsError::NoDeviceOrAddress);
     }
-    state.exclusive_session(|state| {
+    state.with_lock(|state| {
         state.synthetic_write_sectors = state
             .synthetic_write_sectors
             .saturating_add(bytes.div_ceil(512));
@@ -1600,12 +1593,12 @@ pub(crate) fn loop_device_change_fd(
     if !loop_device_is_attached(id) || !loop_device_is_read_only(id) {
         return Err(FsError::InvalidInput);
     }
-    let old_size = state.exclusive_session(|state| state.size);
+    let old_size = state.with_lock(|state| state.size);
     let new_size = backend.stat().map(|stat| stat.size)?;
     if new_size != old_size {
         return Err(FsError::InvalidInput);
     }
-    state.exclusive_session(|state| {
+    state.with_lock(|state| {
         state.backend = Some(backend);
         state.backing_path = backing_path;
         state.size = new_size;
@@ -1621,34 +1614,34 @@ pub(crate) fn loop_device_sysfs_content(path: &str) -> Option<Vec<u8>> {
             format!("{read_only}\n")
         }
         "/sys/block/loop0/loop/partscan" => {
-            let value = LOOP0_STATE
-                .exclusive_session(|state| (state.flags & LOOP_FLAG_PARTSCAN != 0) as u8);
+            let value =
+                LOOP0_STATE.with_lock(|state| (state.flags & LOOP_FLAG_PARTSCAN != 0) as u8);
             format!("{value}\n")
         }
         "/sys/block/loop0/loop/autoclear" => {
-            let value = LOOP0_STATE
-                .exclusive_session(|state| (state.flags & LOOP_FLAG_AUTOCLEAR != 0) as u8);
+            let value =
+                LOOP0_STATE.with_lock(|state| (state.flags & LOOP_FLAG_AUTOCLEAR != 0) as u8);
             format!("{value}\n")
         }
         "/sys/block/loop0/loop/backing_file" => {
             LOOP0_STATE
-                .exclusive_session(|state| state.backing_path.clone())
+                .with_lock(|state| state.backing_path.clone())
                 .unwrap_or_default()
                 + "\n"
         }
         "/sys/block/loop0/loop/dio" => {
-            let value = LOOP0_STATE
-                .exclusive_session(|state| (state.flags & LOOP_FLAG_DIRECT_IO != 0) as u8);
+            let value =
+                LOOP0_STATE.with_lock(|state| (state.flags & LOOP_FLAG_DIRECT_IO != 0) as u8);
             format!("{value}\n")
         }
         "/sys/block/loop0/loop/sizelimit" => {
-            let size_limit = LOOP0_STATE.exclusive_session(|state| state.size_limit);
+            let size_limit = LOOP0_STATE.with_lock(|state| state.size_limit);
             format!("{size_limit}\n")
         }
         "/sys/block/loop0/queue/logical_block_size" => "4096\n".into(),
         "/sys/block/loop0/queue/dma_alignment" => "4095\n".into(),
         "/sys/block/loop0/stat" => {
-            let (sectors_written, io_ticks) = LOOP0_STATE.exclusive_session(|state| {
+            let (sectors_written, io_ticks) = LOOP0_STATE.with_lock(|state| {
                 (
                     state.synthetic_write_sectors,
                     state.synthetic_io_ticks.max(1),
@@ -1751,11 +1744,11 @@ fn input_wait_interrupted() -> bool {
     current_has_unmasked_signal()
 }
 
-fn input_open_client() -> Arc<UPIntrFreeCell<InputClient>> {
-    let client = Arc::new(unsafe { UPIntrFreeCell::new(InputClient::new()) });
-    INPUT_STATE.exclusive_session(|state| {
+fn input_open_client() -> Arc<SpinNoIrqLock<InputClient>> {
+    let client = Arc::new(SpinNoIrqLock::new(InputClient::new()));
+    INPUT_STATE.with_lock(|state| {
         if state.device_created && state.device.supports_ev(EV_REP) {
-            let mut inner = client.exclusive_access();
+            let mut inner = client.lock();
             let _ = inner.push_event(linux_input_event(
                 EV_REP,
                 REP_DELAY,
@@ -1814,7 +1807,7 @@ fn input_event_from_bytes(input: &[u8]) -> LinuxInputEvent {
 }
 
 fn read_input_event(
-    client: &Arc<UPIntrFreeCell<InputClient>>,
+    client: &Arc<SpinNoIrqLock<InputClient>>,
     mut user_buf: UserBuffer,
     flags: OpenFlags,
 ) -> usize {
@@ -1823,7 +1816,7 @@ fn read_input_event(
         return 0;
     }
     loop {
-        let mut inner = client.exclusive_access();
+        let mut inner = client.lock();
         let available = inner.available_read();
         if available == 0 {
             if flags.contains(OpenFlags::NONBLOCK) || input_wait_interrupted() {
@@ -1856,7 +1849,7 @@ fn read_input_mice(flags: OpenFlags, mut user_buf: UserBuffer) -> usize {
         return 0;
     }
     loop {
-        let mut state = INPUT_STATE.exclusive_access();
+        let mut state = INPUT_STATE.lock();
         if state.mice_queue.is_empty() {
             if flags.contains(OpenFlags::NONBLOCK) || input_wait_interrupted() {
                 return 0;
@@ -1879,18 +1872,18 @@ fn read_input_mice(flags: OpenFlags, mut user_buf: UserBuffer) -> usize {
 
 fn emit_input_event(event: LinuxInputEvent) {
     let (readers, poll_readers) = {
-        let state = INPUT_STATE.exclusive_access();
+        let state = INPUT_STATE.lock();
         if !state.device_created {
             return;
         }
         let grabbed = state.clients.iter().any(|client| {
-            let client = client.exclusive_access();
+            let client = client.lock();
             !client.closed && client.grabbed
         });
         let mut readers = VecDeque::new();
         let mut poll_readers = Vec::new();
         for client in &state.clients {
-            let mut client = client.exclusive_access();
+            let mut client = client.lock();
             if client.closed || (grabbed && !client.grabbed) {
                 continue;
             }
@@ -1906,7 +1899,7 @@ fn emit_input_event(event: LinuxInputEvent) {
 
 fn emit_mice_packet(buttons: u8) {
     let readers = {
-        let mut state = INPUT_STATE.exclusive_access();
+        let mut state = INPUT_STATE.lock();
         if !state.device_created {
             return;
         }
@@ -1929,7 +1922,7 @@ fn should_deliver_uinput_event(device: &InputDeviceConfig, event: LinuxInputEven
     }
 }
 
-fn write_uinput(user_buf: UserBuffer, config: &UPIntrFreeCell<UInputConfig>) -> usize {
+fn write_uinput(user_buf: UserBuffer, config: &SpinNoIrqLock<UInputConfig>) -> usize {
     let len = user_buf.len();
     let mut data = Vec::with_capacity(len);
     for slice in user_buf.segments() {
@@ -1938,7 +1931,7 @@ fn write_uinput(user_buf: UserBuffer, config: &UPIntrFreeCell<UInputConfig>) -> 
 
     if data.len() >= UINPUT_MAX_NAME_SIZE && data.len() != INPUT_EVENT_SIZE {
         config
-            .exclusive_access()
+            .lock()
             .device
             .set_name_from_user_dev(&data[..UINPUT_MAX_NAME_SIZE]);
         return len;
@@ -1950,7 +1943,7 @@ fn write_uinput(user_buf: UserBuffer, config: &UPIntrFreeCell<UInputConfig>) -> 
 
     for chunk in data.chunks_exact(INPUT_EVENT_SIZE) {
         let event = input_event_from_bytes(chunk);
-        let mut cfg = config.exclusive_access();
+        let mut cfg = config.lock();
         match event.event_type {
             EV_SYN if event.code == SYN_REPORT => {
                 if cfg.packet_has_event {
@@ -1964,7 +1957,7 @@ fn write_uinput(user_buf: UserBuffer, config: &UPIntrFreeCell<UInputConfig>) -> 
                     drop(cfg);
                     emit_input_event(linux_input_event(EV_KEY, KEY_X, 2));
                     emit_input_event(linux_input_event(EV_SYN, SYN_REPORT, 0));
-                    cfg = config.exclusive_access();
+                    cfg = config.lock();
                 }
                 cfg.packet_has_event = true;
                 let code = event.code;
@@ -1989,7 +1982,7 @@ fn write_uinput(user_buf: UserBuffer, config: &UPIntrFreeCell<UInputConfig>) -> 
 }
 
 fn read_pty(
-    pair: &Arc<UPIntrFreeCell<PtyPair>>,
+    pair: &Arc<SpinNoIrqLock<PtyPair>>,
     endpoint: PtyEndpoint,
     mut user_buf: UserBuffer,
     flags: OpenFlags,
@@ -1999,7 +1992,7 @@ fn read_pty(
         return 0;
     }
     loop {
-        let mut inner = pair.exclusive_access();
+        let mut inner = pair.lock();
         let available = inner.input_buffer(endpoint).available_read();
         if available == 0 {
             if !inner.peer_open(endpoint) || flags.contains(OpenFlags::NONBLOCK) {
@@ -2038,7 +2031,7 @@ fn read_pty(
 }
 
 fn write_pty(
-    pair: &Arc<UPIntrFreeCell<PtyPair>>,
+    pair: &Arc<SpinNoIrqLock<PtyPair>>,
     endpoint: PtyEndpoint,
     user_buf: UserBuffer,
     flags: OpenFlags,
@@ -2051,10 +2044,10 @@ fn write_pty(
         .segments()
         .flat_map(|buffer| buffer.iter().copied())
         .collect();
-    let pty_id = TtyId::Pty(pair.exclusive_access().id);
+    let pty_id = TtyId::Pty(pair.lock().id);
     let mut already_written = 0usize;
     loop {
-        if !pair.exclusive_access().peer_open(endpoint) {
+        if !pair.lock().peer_open(endpoint) {
             return already_written;
         }
         if endpoint == PtyEndpoint::Master
@@ -2062,7 +2055,7 @@ fn write_pty(
                 tty_input_signal_action(pty_id, data[already_written])
         {
             let (writers, poll_writers) = if flush {
-                let mut inner = pair.exclusive_access();
+                let mut inner = pair.lock();
                 inner.master_to_slave.data.clear();
                 inner.slave_to_master.data.clear();
                 let mut writers = inner.master_to_slave.wake_all_writers();
@@ -2085,7 +2078,7 @@ fn write_pty(
             continue;
         }
 
-        let mut inner = pair.exclusive_access();
+        let mut inner = pair.lock();
         if !inner.peer_open(endpoint) {
             return already_written;
         }
@@ -2185,7 +2178,7 @@ struct DynamicDirEntry {
 }
 
 fn pts_dir_entries() -> alloc::vec::Vec<DynamicDirEntry> {
-    let ids = PTY_TABLE.exclusive_session(|table| table.active_ids());
+    let ids = PTY_TABLE.with_lock(|table| table.active_ids());
     let mut entries = alloc::vec::Vec::with_capacity(ids.len() + 2);
     entries.push(DynamicDirEntry {
         ino: DevNode::Pts.ino() as u64,
@@ -2269,7 +2262,7 @@ fn raw_static_entries(entries: &[DevDirEntry]) -> Vec<RawDirEntry> {
 }
 
 fn raw_pts_entries() -> Vec<RawDirEntry> {
-    let ids = PTY_TABLE.exclusive_session(|table| table.active_ids());
+    let ids = PTY_TABLE.with_lock(|table| table.active_ids());
     let mut entries = Vec::with_capacity(ids.len() + 2);
     entries.push(RawDirEntry {
         ino: DevNode::Pts.ino(),
@@ -2304,7 +2297,7 @@ impl LegacyLookupOps for DevFs {
         let parent = node_from_ino(parent_ino).ok_or(FsError::NotFound)?;
         if parent == DevNode::Pts
             && let Some(id) = parse_pts_id(component)
-            && PTY_TABLE.exclusive_session(|table| table.get(id)).is_some()
+            && PTY_TABLE.with_lock(|table| table.get(id)).is_some()
         {
             return Ok((PTY_INO_BASE + id as u32, FsNodeKind::CharacterDevice));
         }
@@ -2616,7 +2609,7 @@ impl File for DevFsFile {
     }
 
     fn read_dirent64(&self, user_buf: UserBuffer) -> FsResult<isize> {
-        let mut offset = self.offset.exclusive_access();
+        let mut offset = self.offset.lock();
         if self.node == DevNode::Pts {
             let entries = pts_dir_entries();
             return copy_dynamic_dirents(entries.as_slice(), &mut offset, user_buf);
@@ -2625,8 +2618,8 @@ impl File for DevFsFile {
         copy_dirents(entries, &mut offset, user_buf)
     }
 
-    fn as_tty(&self) -> Option<&dyn super::TtyFileCapability> {
-        self.node.is_tty().then_some(self)
+    fn is_tty(&self) -> bool {
+        self.node.is_tty()
     }
 
     fn tty_id(&self) -> Option<TtyId> {
@@ -2754,7 +2747,7 @@ impl File for InputEventFile {
 
     fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
         let mut ready = PollEvents::empty();
-        let mut client = self.client.exclusive_access();
+        let mut client = self.client.lock();
         if let Some(waiter) = waiter
             && events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI)
         {
@@ -2786,7 +2779,7 @@ impl File for InputEventFile {
 
 impl Drop for InputEventFile {
     fn drop(&mut self) {
-        let mut client = self.client.exclusive_access();
+        let mut client = self.client.lock();
         client.closed = true;
         client.grabbed = false;
         client.events.clear();
@@ -2796,7 +2789,7 @@ impl Drop for InputEventFile {
 impl Drop for PtyFile {
     fn drop(&mut self) {
         let (readers, writers, poll_readers, poll_writers, hangup, remove) = {
-            let mut pair = self.pair.exclusive_access();
+            let mut pair = self.pair.lock();
             match self.endpoint {
                 PtyEndpoint::Master => {
                     pair.master_open = pair.master_open.saturating_sub(1);
@@ -2839,7 +2832,7 @@ impl Drop for PtyFile {
         }
         if remove {
             let id = self.id() as usize;
-            PTY_TABLE.exclusive_session(|table| table.remove_if_same(id, &self.pair));
+            PTY_TABLE.with_lock(|table| table.remove_if_same(id, &self.pair));
             unregister_pty_tty(id as u32);
         }
     }
@@ -2885,7 +2878,7 @@ impl File for PtyFile {
     }
 
     fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
-        let mut pair = self.pair.exclusive_access();
+        let mut pair = self.pair.lock();
         if let Some(waiter) = waiter {
             if self.readable && events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI) {
                 pair.input_buffer_mut(self.endpoint)
@@ -2944,14 +2937,14 @@ impl File for PtyFile {
     fn pipe_occupied(&self) -> Option<usize> {
         Some(
             self.pair
-                .exclusive_access()
+                .lock()
                 .input_buffer(self.endpoint)
                 .available_read(),
         )
     }
 
-    fn as_tty(&self) -> Option<&dyn super::TtyFileCapability> {
-        Some(self)
+    fn is_tty(&self) -> bool {
+        true
     }
 
     fn tty_id(&self) -> Option<TtyId> {

@@ -46,11 +46,10 @@ fn clear_bss() {
 }
 
 use lazy_static::*;
-use sync::UPIntrFreeCell;
+use sync::SpinNoIrqLock;
 
 lazy_static! {
-    pub static ref DEV_NON_BLOCKING_ACCESS: UPIntrFreeCell<bool> =
-        unsafe { UPIntrFreeCell::new(false) };
+    pub static ref DEV_NON_BLOCKING_ACCESS: SpinNoIrqLock<bool> = SpinNoIrqLock::new(false);
 }
 
 #[unsafe(no_mangle)]
@@ -136,7 +135,7 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     let block_io_force_sync = cfg!(feature = "block-io-force-sync");
     let block_io_nonblocking = block_irq_ready && !block_io_force_sync;
     let perf_counters = cfg!(feature = "perf-counters");
-    *DEV_NON_BLOCKING_ACCESS.exclusive_access() = block_io_nonblocking;
+    *DEV_NON_BLOCKING_ACCESS.lock() = block_io_nonblocking;
     info!(
         "KERN: block io policy mode={} irq_ready={} nonblocking={} perf_counters={}",
         if block_io_force_sync {

@@ -1,6 +1,6 @@
 use crate::board::IrqDevice;
 use crate::drivers::virtio::{VirtioHal, VirtioTransport, mmio_transport};
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use alloc::sync::Arc;
 use core::any::Any;
 use virtio_drivers::device::input::VirtIOInput;
@@ -10,7 +10,7 @@ struct VirtIOInputInner {
 }
 
 struct VirtIOInputWrapper {
-    inner: UPIntrFreeCell<VirtIOInputInner>,
+    inner: SpinNoIrqLock<VirtIOInputInner>,
 }
 
 pub trait InputDevice: Send + Sync + Any {
@@ -35,7 +35,7 @@ impl VirtIOInputWrapper {
             .unwrap(),
         };
         Self {
-            inner: unsafe { UPIntrFreeCell::new(inner) },
+            inner: SpinNoIrqLock::new(inner),
         }
     }
 }
@@ -43,7 +43,7 @@ impl VirtIOInputWrapper {
 impl InputDevice for VirtIOInputWrapper {
     #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     fn handle_irq(&self) {
-        self.inner.exclusive_session(|inner| {
+        self.inner.with_lock(|inner| {
             inner.virtio_input.ack_interrupt();
             while inner.virtio_input.pop_pending_event().is_some() {}
         });

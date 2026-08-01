@@ -106,7 +106,7 @@ fn tlb_init(hardware_page_table_walk: bool) {
 pub fn trap_handler() -> ! {
     let mut task = current_task().expect("trap_handler requires a running task");
     let mut process = process_of_task(&task);
-    account_task_user_time_until(&task, &process, get_time_us());
+    account_task_user_time_until(&task, get_time_us());
     let estat = estat::read();
     let badv = badv::read().vaddr();
     let is_syscall = matches!(estat.cause(), Trap::Exception(Exception::Syscall));
@@ -245,7 +245,6 @@ pub fn trap_handler() -> ! {
         drop(process);
         drop(task);
         exit_current_group_and_run_next(errno);
-        unreachable!("signal-forced exit returned");
     }
     trap_return_for_task(task, process);
 }
@@ -301,8 +300,7 @@ fn trap_return_for_task(
 ) -> ! {
     crate::task::preempt_current_if_needed_on_user_return();
     let now_us = get_time_us();
-    let (trap_cx, user_token) =
-        trap_return_context_after_accounting_for_task(&task, &process, now_us);
+    let (trap_cx, user_token) = trap_return_context_after_accounting_for_task(&task, now_us);
     let flush_tlb = crate::arch::mm::should_flush_tlb_on_return(user_token);
     if flush_tlb {
         crate::perf::record_la_return_invtlb_call();

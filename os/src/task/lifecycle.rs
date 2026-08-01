@@ -1,25 +1,25 @@
 use super::{ProcessControlBlock, ProcessProcSnapshot, TaskControlBlock, TaskStatus};
 use crate::perf;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use lazy_static::lazy_static;
 
 lazy_static! {
-    static ref PID2PCB: UPIntrFreeCell<BTreeMap<usize, Arc<ProcessControlBlock>>> =
-        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
-    static ref LINUX_TID2TASK: UPIntrFreeCell<BTreeMap<usize, Weak<TaskControlBlock>>> =
-        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+    static ref PID2PCB: SpinNoIrqLock<BTreeMap<usize, Arc<ProcessControlBlock>>> =
+        SpinNoIrqLock::new(BTreeMap::new());
+    static ref LINUX_TID2TASK: SpinNoIrqLock<BTreeMap<usize, Weak<TaskControlBlock>>> =
+        SpinNoIrqLock::new(BTreeMap::new());
 }
 
 pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
-    let map = PID2PCB.exclusive_access();
+    let map = PID2PCB.lock();
     map.get(&pid).map(Arc::clone)
 }
 
 pub(crate) fn processes_snapshot() -> Vec<Arc<ProcessControlBlock>> {
-    let map = PID2PCB.exclusive_access();
+    let map = PID2PCB.lock();
     map.values().cloned().collect()
 }
 
@@ -27,7 +27,7 @@ pub(crate) fn task_with_linux_tid(tid: usize) -> Option<Arc<TaskControlBlock>> {
     let mut stale_index_entry = false;
 
     let indexed_task = {
-        let map = LINUX_TID2TASK.exclusive_access();
+        let map = LINUX_TID2TASK.lock();
         map.get(&tid).cloned()
     };
     if let Some(task_ref) = indexed_task {
@@ -39,7 +39,7 @@ pub(crate) fn task_with_linux_tid(tid: usize) -> Option<Arc<TaskControlBlock>> {
             return Some(task);
         }
         {
-            let mut map = LINUX_TID2TASK.exclusive_access();
+            let mut map = LINUX_TID2TASK.lock();
             map.remove(&tid);
             stale_index_entry = true;
         }
@@ -72,18 +72,16 @@ pub(crate) fn task_with_linux_tid(tid: usize) -> Option<Arc<TaskControlBlock>> {
 
 pub(super) fn register_task_linux_tid(task: &Arc<TaskControlBlock>) {
     let tid = task.linux_tid();
-    LINUX_TID2TASK
-        .exclusive_access()
-        .insert(tid, Arc::downgrade(task));
+    LINUX_TID2TASK.lock().insert(tid, Arc::downgrade(task));
 }
 
 pub(super) fn unregister_task_linux_tid(tid: usize) {
-    LINUX_TID2TASK.exclusive_access().remove(&tid);
+    LINUX_TID2TASK.lock().remove(&tid);
 }
 
 pub(crate) fn list_process_snapshots() -> Vec<ProcessProcSnapshot> {
     let processes = {
-        let map = PID2PCB.exclusive_access();
+        let map = PID2PCB.lock();
         map.values().cloned().collect::<Vec<_>>()
     };
     processes
@@ -94,7 +92,7 @@ pub(crate) fn list_process_snapshots() -> Vec<ProcessProcSnapshot> {
 
 pub(crate) fn any_process_references_mount(mount_id: crate::fs::MountId) -> bool {
     let processes = {
-        let map = PID2PCB.exclusive_access();
+        let map = PID2PCB.lock();
         map.values().cloned().collect::<Vec<_>>()
     };
     processes
@@ -103,16 +101,14 @@ pub(crate) fn any_process_references_mount(mount_id: crate::fs::MountId) -> bool
 }
 
 pub(super) fn register_process(process: &Arc<ProcessControlBlock>) {
-    PID2PCB
-        .exclusive_access()
-        .insert(process.getpid(), Arc::clone(process));
+    PID2PCB.lock().insert(process.getpid(), Arc::clone(process));
     for task in process.tasks_snapshot() {
         register_task_linux_tid(&task);
     }
 }
 
 pub fn remove_from_pid2process(pid: usize) {
-    let mut map = PID2PCB.exclusive_access();
+    let mut map = PID2PCB.lock();
     let Some(process) = map.remove(&pid) else {
         panic!("cannot find pid {} in pid2task!", pid);
     };

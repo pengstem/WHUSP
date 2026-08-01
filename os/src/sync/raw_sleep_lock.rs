@@ -1,4 +1,4 @@
-use super::UPIntrFreeCell;
+use super::SpinNoIrqLock;
 use crate::task::{
     TaskContext, TaskControlBlock, block_current_task_no_schedule, schedule, wakeup_task,
 };
@@ -11,7 +11,7 @@ use alloc::{collections::VecDeque, sync::Arc};
 /// ownership handoff: the lock remains logically held while the oldest waiter
 /// is woken, so a later caller cannot steal it before that waiter runs.
 pub struct RawSleepLock {
-    inner: UPIntrFreeCell<RawSleepLockInner>,
+    inner: SpinNoIrqLock<RawSleepLockInner>,
 }
 
 struct RawSleepLockInner {
@@ -25,17 +25,15 @@ unsafe impl Sync for RawSleepLock {}
 impl RawSleepLock {
     pub fn new() -> Self {
         Self {
-            inner: unsafe {
-                UPIntrFreeCell::new(RawSleepLockInner {
-                    locked: false,
-                    wait_queue: VecDeque::new(),
-                })
-            },
+            inner: SpinNoIrqLock::new(RawSleepLockInner {
+                locked: false,
+                wait_queue: VecDeque::new(),
+            }),
         }
     }
 
     pub fn lock(&self) {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         if inner.locked {
             let (task, task_cx_ptr): (Arc<TaskControlBlock>, *mut TaskContext) =
                 block_current_task_no_schedule();
@@ -48,7 +46,7 @@ impl RawSleepLock {
     }
 
     pub fn try_lock(&self) -> bool {
-        let Some(mut inner) = self.inner.try_exclusive_access() else {
+        let Some(mut inner) = self.inner.try_lock() else {
             return false;
         };
         if inner.locked {
@@ -69,7 +67,7 @@ impl RawSleepLock {
     /// This explicit operation exists only for paired FFI lock/unlock
     /// callbacks; ordinary Rust state should use [`super::SleepMutex`].
     pub unsafe fn unlock(&self) {
-        let waking_task = self.inner.exclusive_session(|inner| {
+        let waking_task = self.inner.with_lock(|inner| {
             assert!(inner.locked, "raw sleeping lock released without ownership");
             if let Some(task) = inner.wait_queue.pop_front() {
                 Some(task)

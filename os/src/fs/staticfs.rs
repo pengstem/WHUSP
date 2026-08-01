@@ -1,7 +1,7 @@
 use super::dirent::{DT_DIR, DT_REG, RawDirEntry, write_dir_entries};
 use super::{File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFDIR, S_IFREG};
 use crate::mm::UserBuffer;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -104,8 +104,8 @@ enum StaticNode {
 pub struct StaticFile {
     node: StaticNode,
     path: &'static str,
-    offset: UPIntrFreeCell<usize>,
-    status_flags: UPIntrFreeCell<OpenFlags>,
+    offset: SpinNoIrqLock<usize>,
+    status_flags: SpinNoIrqLock<OpenFlags>,
 }
 
 impl StaticFile {
@@ -113,8 +113,8 @@ impl StaticFile {
         Arc::new(Self {
             node,
             path,
-            offset: unsafe { UPIntrFreeCell::new(0) },
-            status_flags: unsafe { UPIntrFreeCell::new(OpenFlags::file_status_flags(flags)) },
+            offset: SpinNoIrqLock::new(0),
+            status_flags: SpinNoIrqLock::new(OpenFlags::file_status_flags(flags)),
         })
     }
 }
@@ -735,7 +735,7 @@ impl File for StaticFile {
         let Some(content) = content(self.node) else {
             return 0;
         };
-        let mut offset = self.offset.exclusive_access();
+        let mut offset = self.offset.lock();
         let start = (*offset).min(content.len());
         let copied = user_buf.copy_from_slice(&content[start..]);
         *offset = start + copied;
@@ -785,7 +785,7 @@ impl File for StaticFile {
         let len = content(self.node).map_or(0, |content| content.len());
         let base = match whence {
             super::SeekWhence::Set => 0,
-            super::SeekWhence::Current => *self.offset.exclusive_access() as i64,
+            super::SeekWhence::Current => *self.offset.lock() as i64,
             super::SeekWhence::End => len as i64,
             super::SeekWhence::Data => {
                 if offset < 0 {
@@ -795,7 +795,7 @@ impl File for StaticFile {
                 if offset >= len {
                     return Err(FsError::NoDeviceOrAddress);
                 }
-                *self.offset.exclusive_access() = offset;
+                *self.offset.lock() = offset;
                 return Ok(offset);
             }
             super::SeekWhence::Hole => {
@@ -806,7 +806,7 @@ impl File for StaticFile {
                 if offset > len {
                     return Err(FsError::NoDeviceOrAddress);
                 }
-                *self.offset.exclusive_access() = len;
+                *self.offset.lock() = len;
                 return Ok(len);
             }
         };
@@ -814,16 +814,16 @@ impl File for StaticFile {
         if next < 0 {
             return Err(FsError::InvalidInput);
         }
-        *self.offset.exclusive_access() = next as usize;
+        *self.offset.lock() = next as usize;
         Ok(next as usize)
     }
 
     fn status_flags(&self) -> OpenFlags {
-        *self.status_flags.exclusive_access()
+        *self.status_flags.lock()
     }
 
     fn set_status_flags(&self, flags: OpenFlags) {
-        *self.status_flags.exclusive_access() = flags;
+        *self.status_flags.lock() = flags;
     }
 
     fn read_dirent64(&self, mut user_buf: UserBuffer) -> FsResult<isize> {
@@ -831,7 +831,7 @@ impl File for StaticFile {
             return Err(FsError::NotDir);
         };
         let mut kernel_buf = vec![0u8; user_buf.len()];
-        let mut offset = self.offset.exclusive_access();
+        let mut offset = self.offset.lock();
         let (written, next_offset) = write_dir_entries(&entries, *offset as u64, &mut kernel_buf)?;
         *offset = next_offset as usize;
         if written == 0 {

@@ -1,6 +1,6 @@
 use super::super::pipe::{PIPE_DEFAULT_CAPACITY, PIPE_MAX_CAPACITY};
 use crate::config::PAGE_SIZE;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicIsize, AtomicUsize};
 use lazy_static::lazy_static;
@@ -32,14 +32,14 @@ pub(super) static PROC_IO_READAHEAD_SUPPRESS_READS: AtomicUsize = AtomicUsize::n
 pub(super) static PROC_OOM_SCORE_ADJ: AtomicIsize = AtomicIsize::new(0);
 
 lazy_static! {
-    pub(super) static ref PROC_DOMAINNAME: UPIntrFreeCell<Vec<u8>> = {
+    pub(super) static ref PROC_DOMAINNAME: SpinNoIrqLock<Vec<u8>> = {
         let mut value = Vec::new();
         value.extend_from_slice(b"(none)");
-        unsafe { UPIntrFreeCell::new(value) }
+        SpinNoIrqLock::new(value)
     };
-    pub(super) static ref PROC_CORE_PATTERN: UPIntrFreeCell<Vec<u8>> = {
+    pub(super) static ref PROC_CORE_PATTERN: SpinNoIrqLock<Vec<u8>> = {
         let mut value = Vec::new();
         value.extend_from_slice(b"core");
-        unsafe { UPIntrFreeCell::new(value) }
+        SpinNoIrqLock::new(value)
     };
 }

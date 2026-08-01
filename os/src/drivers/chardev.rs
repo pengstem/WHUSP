@@ -2,10 +2,7 @@
 //! Ref: ns16550a datasheet: https://datasheetspdf.com/pdf-file/605590/NationalSemiconductor/NS16550A/1
 //! Ref: ns16450 datasheet: https://datasheetspdf.com/pdf-file/1311818/NationalSemiconductor/NS16450/1
 use crate::board::CharDeviceImpl;
-use crate::sync::{Condvar, UPIntrFreeCell};
-use crate::task::schedule;
-#[cfg(target_arch = "loongarch64")]
-use crate::task::suspend_current_and_run_next;
+use crate::sync::{Condvar, SpinNoIrqLock};
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use bitflags::*;
@@ -19,11 +16,7 @@ use volatile::{
 
 pub trait CharDevice {
     fn init(&self);
-    #[allow(dead_code)]
-    fn read(&self) -> u8;
     fn try_read(&self) -> Option<u8>;
-    #[allow(dead_code)]
-    fn has_input(&self) -> bool;
     fn write(&self, ch: u8);
     fn write_bytes(&self, bytes: &[u8]) {
         for &byte in bytes {
@@ -173,7 +166,7 @@ impl NS16550aInner {
 }
 
 pub struct NS16550a {
-    inner: UPIntrFreeCell<NS16550aInner>,
+    inner: SpinNoIrqLock<NS16550aInner>,
     condvar: Condvar,
 }
 
@@ -183,9 +176,8 @@ impl NS16550a {
             ns16550a: NS16550aRaw::new(base_addr),
             read_buffer: VecDeque::new(),
         };
-        //inner.ns16550a.init();
         Self {
-            inner: unsafe { UPIntrFreeCell::new(inner) },
+            inner: SpinNoIrqLock::new(inner),
             condvar: Condvar::new(),
         }
     }
@@ -194,7 +186,7 @@ impl NS16550a {
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         let mut total_bytes = 0usize;
         for bytes in byte_slices {
             total_bytes = total_bytes.saturating_add(bytes.len());
@@ -205,7 +197,7 @@ impl NS16550a {
     }
 
     pub fn write_fmt_record(&self, args: fmt::Arguments<'_>) -> fmt::Result {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         let mut writer = NS16550aFmtWriter {
             raw: &mut inner.ns16550a,
             bytes: 0,
@@ -218,7 +210,7 @@ impl NS16550a {
     }
 
     pub fn emergency_write_fmt(&self, args: fmt::Arguments<'_>) {
-        if let Some(mut inner) = self.inner.try_exclusive_access() {
+        if let Some(mut inner) = self.inner.try_lock() {
             let mut writer = NS16550aFmtWriter {
                 raw: &mut inner.ns16550a,
                 bytes: 0,
@@ -240,59 +232,30 @@ impl NS16550a {
 
 impl CharDevice for NS16550a {
     fn init(&self) {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         inner.ns16550a.init();
         drop(inner);
     }
 
-    fn read(&self) -> u8 {
-        loop {
-            let mut inner = self.inner.exclusive_access();
-            inner.poll_rx();
-            if let Some(ch) = inner.read_buffer.pop_front() {
-                return ch;
-            } else {
-                #[cfg(target_arch = "loongarch64")]
-                {
-                    if !crate::board::external_irq_available() {
-                        // CONTEXT: Early LA bring-up can run without external
-                        // IRQ routing; keep the old polling fallback so a
-                        // missing controller path does not sleep forever.
-                        drop(inner);
-                        suspend_current_and_run_next();
-                        continue;
-                    }
-                }
-                let task_cx_ptr = self.condvar.wait_no_sched();
-                drop(inner);
-                schedule(task_cx_ptr);
-            }
-        }
-    }
     fn try_read(&self) -> Option<u8> {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         inner.poll_rx();
         inner.read_buffer.pop_front()
     }
-    fn has_input(&self) -> bool {
-        let mut inner = self.inner.exclusive_access();
-        inner.poll_rx();
-        !inner.read_buffer.is_empty()
-    }
     fn write(&self, ch: u8) {
         crate::perf::record_uart_write(1);
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         inner.ns16550a.write(ch);
     }
     fn write_bytes(&self, bytes: &[u8]) {
         crate::perf::record_uart_write(bytes.len());
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         inner.ns16550a.write_bytes(bytes);
     }
     #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     fn handle_irq(&self) {
         let mut count = 0;
-        self.inner.exclusive_session(|inner| {
+        self.inner.with_lock(|inner| {
             while let Some(ch) = inner.ns16550a.read() {
                 count += 1;
                 inner.read_buffer.push_back(ch);

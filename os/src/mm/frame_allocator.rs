@@ -1,7 +1,7 @@
 use super::{PhysAddr, PhysPageNum};
 use crate::config::{MAX_CPUS, PAGE_SIZE, memory_end};
 use crate::perf;
-use crate::sync::{SpinNoIrqLock, UPIntrFreeCell};
+use crate::sync::SpinNoIrqLock;
 use alloc::vec::Vec;
 use core::fmt::{self, Debug, Formatter};
 #[cfg(feature = "perf-counters")]
@@ -210,13 +210,6 @@ impl FrameCache {
     }
 }
 
-trait FrameAllocator {
-    fn new() -> Self;
-    fn alloc(&mut self) -> Option<PhysPageNum>;
-    fn alloc_more(&mut self, pages: usize) -> Option<Vec<PhysPageNum>>;
-    fn recycle(&mut self, ppn: PhysPageNum);
-}
-
 pub struct StackFrameAllocator {
     start: usize,
     current: usize,
@@ -225,6 +218,15 @@ pub struct StackFrameAllocator {
 }
 
 impl StackFrameAllocator {
+    fn new() -> Self {
+        Self {
+            start: 0,
+            current: 0,
+            end: 0,
+            recycled: Vec::new(),
+        }
+    }
+
     pub fn init(&mut self, l: PhysPageNum, r: PhysPageNum) {
         self.start = l.0;
         self.current = l.0;
@@ -240,16 +242,7 @@ impl StackFrameAllocator {
             .saturating_add(self.recycled.len());
         (total, free)
     }
-}
-impl FrameAllocator for StackFrameAllocator {
-    fn new() -> Self {
-        Self {
-            start: 0,
-            current: 0,
-            end: 0,
-            recycled: Vec::new(),
-        }
-    }
+
     fn alloc(&mut self) -> Option<PhysPageNum> {
         let ppn = if let Some(ppn) = self.recycled.pop() {
             ppn
@@ -261,22 +254,19 @@ impl FrameAllocator for StackFrameAllocator {
         };
         Some(ppn.into())
     }
+
     fn alloc_more(&mut self, pages: usize) -> Option<Vec<PhysPageNum>> {
-        if pages == 0 || self.current.checked_add(pages)? > self.end {
-            None
-        } else {
-            self.current += pages;
-            let arr: Vec<usize> = (1..pages + 1).collect();
-            let v = arr
-                .iter()
-                .map(|x| {
-                    let ppn = self.current - x;
-                    ppn.into()
-                })
-                .collect();
-            Some(v)
+        if pages == 0 {
+            return None;
         }
+        let end = self.current.checked_add(pages)?;
+        if end > self.end {
+            return None;
+        }
+        self.current = end;
+        Some((1..=pages).map(|delta| (end - delta).into()).collect())
     }
+
     fn recycle(&mut self, ppn: PhysPageNum) {
         let ppn = ppn.0;
         if ppn < self.start || ppn >= self.current {
@@ -286,14 +276,12 @@ impl FrameAllocator for StackFrameAllocator {
     }
 }
 
-type FrameAllocatorImpl = StackFrameAllocator;
-
 // The global lock owns only the bump cursor and globally recycled pages.
 // Per-CPU caches own pages removed from those structures, while stable atomic
 // reference counts preserve COW/pinning semantics independently.
 lazy_static! {
-    static ref FRAME_ALLOCATOR: UPIntrFreeCell<FrameAllocatorImpl> =
-        unsafe { UPIntrFreeCell::new(FrameAllocatorImpl::new()) };
+    static ref FRAME_ALLOCATOR: SpinNoIrqLock<StackFrameAllocator> =
+        SpinNoIrqLock::new(StackFrameAllocator::new());
     static ref FRAME_REF_COUNTS: FrameRefCounts = {
         unsafe extern "C" {
             safe fn ekernel();
@@ -328,7 +316,7 @@ pub fn init_frame_allocator() {
             "frame cache was populated before allocator initialization"
         );
     }
-    FRAME_ALLOCATOR.exclusive_access().init(start, end);
+    FRAME_ALLOCATOR.lock().init(start, end);
 }
 
 pub fn frame_alloc() -> Option<FrameTracker> {
@@ -347,7 +335,7 @@ pub fn frame_alloc_uninit() -> Option<FrameTracker> {
 /// pages; callers such as VirtIO pass the first physical address to hardware.
 pub fn frame_alloc_more(num: usize) -> Option<Vec<FrameTracker>> {
     let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocDma);
-    let pages = FRAME_ALLOCATOR.exclusive_access().alloc_more(num)?;
+    let pages = FRAME_ALLOCATOR.lock().alloc_more(num)?;
     for ppn in pages.iter().copied() {
         FRAME_REF_COUNTS.claim_free(ppn);
     }
@@ -356,7 +344,7 @@ pub fn frame_alloc_more(num: usize) -> Option<Vec<FrameTracker>> {
 
 /// Allocates uninitialized cache-owned frames as one fresh contiguous run.
 pub(crate) fn frame_alloc_contiguous_uninit(pages: usize) -> Option<ContiguousFrameRun> {
-    let Some(mut ppns) = FRAME_ALLOCATOR.exclusive_access().alloc_more(pages) else {
+    let Some(mut ppns) = FRAME_ALLOCATOR.lock().alloc_more(pages) else {
         record_contiguous_read_cache_alloc(false, 0);
         return None;
     };
@@ -396,7 +384,7 @@ pub fn frame_dealloc(ppn: PhysPageNum) {
             // Never nest the per-CPU and global allocator locks. This keeps
             // refill, drain, stats, and interrupt-context frees free of a
             // cache/global lock-order cycle.
-            let mut allocator = FRAME_ALLOCATOR.exclusive_access();
+            let mut allocator = FRAME_ALLOCATOR.lock();
             for drained_ppn in drained {
                 allocator.recycle(drained_ppn);
             }
@@ -405,7 +393,7 @@ pub fn frame_dealloc(ppn: PhysPageNum) {
         return;
     }
 
-    let mut allocator = FRAME_ALLOCATOR.exclusive_access();
+    let mut allocator = FRAME_ALLOCATOR.lock();
     allocator.recycle(ppn);
     let recycled_len = allocator.recycled.len();
     perf::record_frame_dealloc(true, false, 0, recycled_len);
@@ -424,7 +412,7 @@ pub fn frame_stats() -> (usize, usize) {
         .iter()
         .map(|cache| cache.lock().pages.len())
         .sum::<usize>();
-    let (total, global_free) = FRAME_ALLOCATOR.exclusive_access().stats();
+    let (total, global_free) = FRAME_ALLOCATOR.lock().stats();
     (total, global_free.saturating_add(cached))
 }
 
@@ -441,7 +429,7 @@ fn alloc_frame_ppn() -> Option<PhysPageNum> {
             // Reserve a bounded batch under the global lock. Claiming one
             // page, publishing the remainder to the CPU cache, and zeroing
             // the returned page all happen after this guard is released.
-            let mut allocator = FRAME_ALLOCATOR.exclusive_access();
+            let mut allocator = FRAME_ALLOCATOR.lock();
             for _ in 0..FRAME_CACHE_BATCH {
                 let Some(ppn) = allocator.alloc() else {
                     break;
@@ -458,7 +446,7 @@ fn alloc_frame_ppn() -> Option<PhysPageNum> {
         return Some(ppn);
     }
 
-    let ppn = FRAME_ALLOCATOR.exclusive_access().alloc()?;
+    let ppn = FRAME_ALLOCATOR.lock().alloc()?;
     record_frame_cache_global_alloc();
     FRAME_REF_COUNTS.claim_free(ppn);
     Some(ppn)

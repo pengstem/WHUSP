@@ -1,7 +1,7 @@
 use crate::mm::{
     FrameTracker, PageTable, PhysAddr, PhysPageNum, VirtAddr, frame_alloc_more, kernel_token,
 };
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
@@ -27,13 +27,13 @@ pub fn mmio_transport(base_addr: usize, size: usize) -> VirtioTransport {
 lazy_static! {
     // DMA queue frames stay owned here until virtio dealloc; returning them to
     // the general allocator earlier would leave device-visible memory aliased.
-    static ref QUEUE_FRAMES: UPIntrFreeCell<Vec<FrameTracker>> =
-        unsafe { UPIntrFreeCell::new(Vec::new()) };
+    static ref QUEUE_FRAMES: SpinNoIrqLock<Vec<FrameTracker>> =
+        SpinNoIrqLock::new(Vec::new());
     // Bounce frames are keyed by the physical address handed to the device.
     // They must stay live until unshare() copies device-written data back into
     // the original kernel buffer and drops the frame trackers.
-    static ref SHARED_BOUNCES: UPIntrFreeCell<BTreeMap<VirtioPhysAddr, Vec<FrameTracker>>> =
-        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+    static ref SHARED_BOUNCES: SpinNoIrqLock<BTreeMap<VirtioPhysAddr, Vec<FrameTracker>>> =
+        SpinNoIrqLock::new(BTreeMap::new());
 }
 
 pub struct VirtioHal;
@@ -50,14 +50,14 @@ unsafe impl Hal for VirtioHal {
             .expect("virtio DMA allocation returned no frames");
         let pa: PhysAddr = ppn_base.into();
         let ptr = NonNull::new(crate::arch::mm::phys_to_virt(pa.0) as *mut u8).unwrap();
-        QUEUE_FRAMES.exclusive_access().append(&mut trackers);
+        QUEUE_FRAMES.lock().append(&mut trackers);
         (pa.0 as VirtioPhysAddr, ptr)
     }
 
     unsafe fn dma_dealloc(paddr: VirtioPhysAddr, _vaddr: NonNull<u8>, pages: usize) -> i32 {
         let ppn_base: PhysPageNum = PhysAddr::from(paddr as usize).into();
         let ppn_end = ppn_base.0 + pages;
-        let mut frames = QUEUE_FRAMES.exclusive_access();
+        let mut frames = QUEUE_FRAMES.lock();
         let mut index = 0;
         while index < frames.len() {
             let ppn = frames[index].ppn.0;
@@ -103,13 +103,13 @@ unsafe impl Hal for VirtioHal {
             bounce.copy_from_slice(original);
         }
         SHARED_BOUNCES
-            .exclusive_access()
+            .lock()
             .insert(pa.0 as VirtioPhysAddr, trackers);
         pa.0 as VirtioPhysAddr
     }
 
     unsafe fn unshare(paddr: VirtioPhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection) {
-        let frames = SHARED_BOUNCES.exclusive_access().remove(&paddr);
+        let frames = SHARED_BOUNCES.lock().remove(&paddr);
         let Some(frames) = frames else {
             return;
         };

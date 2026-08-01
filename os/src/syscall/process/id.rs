@@ -10,8 +10,7 @@ use crate::uapi::errno::{Errno, KResult};
 use alloc::{sync::Arc, vec::Vec};
 
 pub fn sys_exit(exit_code: i32) -> ! {
-    exit_current_and_run_next(exit_code);
-    panic!("Unreachable in sys_exit!");
+    exit_current_and_run_next(exit_code)
 }
 
 pub fn sys_exit_group(exit_code: i32) -> ! {
@@ -25,8 +24,7 @@ pub fn sys_exit_group(exit_code: i32) -> ! {
         // process alive and release the helper task instead.
         exit_current_and_run_next(exit_code);
     }
-    exit_current_group_and_run_next(exit_code);
-    panic!("Unreachable in sys_exit_group!");
+    exit_current_group_and_run_next(exit_code)
 }
 
 pub fn sys_sched_yield() -> isize {

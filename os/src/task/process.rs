@@ -7,7 +7,7 @@ use crate::config::{MAX_CPUS, USER_STACK_SIZE};
 use crate::fs::{MountNamespaceId, PathContext, ROOT_MOUNT_NAMESPACE, VfsNodeId, WorkingDir};
 use crate::mm::MemorySet;
 use crate::perf;
-use crate::sync::{UPIntrFreeCell, UPIntrRefMut};
+use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -1050,7 +1050,7 @@ pub struct ProcessControlBlock {
     // read-only signal/scheduler/credential queries do not close the phase.
     pub(super) memory_access: ProcessMemoryFastState,
     // mutable
-    pub(super) inner: UPIntrFreeCell<ProcessControlBlockInner>,
+    pub(super) inner: SpinNoIrqLock<ProcessControlBlockInner>,
 }
 
 const NO_EXCLUSIVE_TASK: usize = 0;
@@ -1085,7 +1085,7 @@ impl Drop for TaskGroupSchedulerGuard<'_> {
 
 pub struct ProcessInnerGuard<'a> {
     process: &'a ProcessControlBlock,
-    inner: Option<UPIntrRefMut<'a, ProcessControlBlockInner>>,
+    inner: Option<SpinNoIrqLockGuard<'a, ProcessControlBlockInner>>,
     memory_access: Option<ProcessMemoryWriteGuard<'a>>,
     fd_table_version: usize,
 }
@@ -1101,7 +1101,7 @@ impl Deref for ProcessInnerGuard<'_> {
 impl DerefMut for ProcessInnerGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         if self.memory_access.is_none() {
-            // UPIntrRefMut already masks local interrupts. The PCB inner also
+            // SpinNoIrqLockGuard already masks local interrupts. The PCB inner also
             // serializes writers, while address-space readers never acquire
             // the PCB lock, so waiting for their short grace period cannot
             // form a lock cycle.
@@ -1614,7 +1614,7 @@ pub(crate) fn comm_from_cmdline(cmdline: &[String]) -> String {
 
 impl ProcessControlBlock {
     pub fn inner_exclusive_access(&self) -> ProcessInnerGuard<'_> {
-        let inner = self.inner.exclusive_access();
+        let inner = self.inner.lock();
         let fd_table_version = inner.fd_table_version;
         self.note_inner_acquired();
         ProcessInnerGuard {
@@ -1745,7 +1745,7 @@ impl ProcessControlBlock {
         file: &Arc<dyn crate::fs::File + Send + Sync>,
     ) -> bool {
         self.inner
-            .exclusive_access()
+            .lock()
             .fd_table
             .iter()
             .flatten()
@@ -1757,11 +1757,7 @@ impl ProcessControlBlock {
     }
 
     pub fn parent_process(&self) -> Option<Arc<Self>> {
-        self.inner
-            .exclusive_access()
-            .parent
-            .as_ref()
-            .and_then(Weak::upgrade)
+        self.inner.lock().parent.as_ref().and_then(Weak::upgrade)
     }
 
     pub(crate) fn main_task(&self) -> Arc<TaskControlBlock> {

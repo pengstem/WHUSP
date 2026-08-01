@@ -1,5 +1,5 @@
 use crate::perf;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::syscall::SyscallContext;
 use crate::task::{
     CAP_SYS_TIME, ProcessCpuTimesSnapshot, block_current_task_no_schedule,
@@ -206,8 +206,7 @@ impl TimexState {
 }
 
 lazy_static! {
-    static ref TIMEX_STATE: UPIntrFreeCell<TimexState> =
-        unsafe { UPIntrFreeCell::new(TimexState::new()) };
+    static ref TIMEX_STATE: SpinNoIrqLock<TimexState> = SpinNoIrqLock::new(TimexState::new());
 }
 
 #[derive(Clone, Copy)]
@@ -348,12 +347,16 @@ fn us_to_ms_ceil(us: usize) -> KResult<usize> {
     us.checked_add(999).map(|us| us / 1000).ok_or(Errno::EINVAL)
 }
 
-fn nanos_to_us_ceil(nanos: u64) -> KResult<usize> {
+pub(crate) fn nanos_to_us_ceil(nanos: u64) -> KResult<usize> {
     let us = nanos / 1000 + if nanos % 1000 == 0 { 0 } else { 1 };
     if us > usize::MAX as u64 {
         return Err(Errno::EINVAL);
     }
     Ok(us as usize)
+}
+
+pub(crate) fn timespec_to_us_ceil(time: LinuxTimeSpec) -> KResult<usize> {
+    nanos_to_us_ceil(timespec_to_nanos(time)?)
 }
 
 pub(crate) fn relative_timeout_deadline_ms_from_nanos(duration_nanos: u64) -> KResult<usize> {
@@ -396,7 +399,7 @@ fn us_to_timeval(us: usize) -> LinuxTimeVal {
     }
 }
 
-fn us_to_timespec(us: usize) -> LinuxTimeSpec {
+pub(crate) fn us_to_timespec(us: usize) -> LinuxTimeSpec {
     LinuxTimeSpec {
         tv_sec: (us / USEC_PER_SEC).min(isize::MAX as usize) as isize,
         tv_nsec: ((us % USEC_PER_SEC) * 1_000) as isize,
@@ -1050,7 +1053,7 @@ pub fn sys_clock_adjtime(clock_id: i32, timex: *mut LinuxTimex) -> KResult {
         return Err(Errno::EPERM);
     }
     let ret = {
-        let mut state = TIMEX_STATE.exclusive_access();
+        let mut state = TIMEX_STATE.lock();
         if modes != 0 && modes != ADJ_OFFSET_SS_READ {
             update_timex_state(&mut state, user_timex)?;
         }

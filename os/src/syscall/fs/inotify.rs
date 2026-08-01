@@ -8,7 +8,7 @@ use crate::fs::{
 };
 use crate::mm::UserBuffer;
 use crate::perf;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::task::{
     TaskControlBlock, block_current_task_no_schedule, current_has_interrupting_signal,
     current_process, current_user_token, schedule, wakeup_task,
@@ -76,12 +76,12 @@ static NEXT_MOVE_COOKIE: AtomicU32 = AtomicU32::new(1);
 static LIVE_INOTIFY_GROUPS: AtomicUsize = AtomicUsize::new(0);
 
 lazy_static! {
-    static ref INOTIFY_GROUPS: UPIntrFreeCell<Vec<Weak<InotifyGroup>>> =
-        unsafe { UPIntrFreeCell::new(Vec::new()) };
-    static ref INOTIFY_NODE_NAMES: UPIntrFreeCell<BTreeMap<VfsNodeId, String>> =
-        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
-    static ref INOTIFY_UNLINKED_NODES: UPIntrFreeCell<BTreeSet<VfsNodeId>> =
-        unsafe { UPIntrFreeCell::new(BTreeSet::new()) };
+    static ref INOTIFY_GROUPS: SpinNoIrqLock<Vec<Weak<InotifyGroup>>> =
+        SpinNoIrqLock::new(Vec::new());
+    static ref INOTIFY_NODE_NAMES: SpinNoIrqLock<BTreeMap<VfsNodeId, String>> =
+        SpinNoIrqLock::new(BTreeMap::new());
+    static ref INOTIFY_UNLINKED_NODES: SpinNoIrqLock<BTreeSet<VfsNodeId>> =
+        SpinNoIrqLock::new(BTreeSet::new());
 }
 
 #[derive(Clone)]
@@ -110,12 +110,12 @@ struct InotifyInner {
 }
 
 struct InotifyGroup {
-    inner: UPIntrFreeCell<InotifyInner>,
+    inner: SpinNoIrqLock<InotifyInner>,
 }
 
 pub struct InotifyFile {
     group: Arc<InotifyGroup>,
-    status_flags: UPIntrFreeCell<OpenFlags>,
+    status_flags: SpinNoIrqLock<OpenFlags>,
 }
 
 impl InotifyEvent {
@@ -157,24 +157,22 @@ impl InotifyEvent {
 impl InotifyGroup {
     fn new() -> Arc<Self> {
         let group = Arc::new(Self {
-            inner: unsafe {
-                UPIntrFreeCell::new(InotifyInner {
-                    next_wd: 1,
-                    watches: Vec::new(),
-                    events: VecDeque::new(),
-                    overflow_queued: false,
-                    read_waiters: VecDeque::new(),
-                    poll_waiters: PollWaitQueue::new(),
-                })
-            },
+            inner: SpinNoIrqLock::new(InotifyInner {
+                next_wd: 1,
+                watches: Vec::new(),
+                events: VecDeque::new(),
+                overflow_queued: false,
+                read_waiters: VecDeque::new(),
+                poll_waiters: PollWaitQueue::new(),
+            }),
         });
-        INOTIFY_GROUPS.exclusive_session(|groups| groups.push(Arc::downgrade(&group)));
+        INOTIFY_GROUPS.with_lock(|groups| groups.push(Arc::downgrade(&group)));
         LIVE_INOTIFY_GROUPS.fetch_add(1, Ordering::Relaxed);
         group
     }
 
     fn add_watch(&self, node: VfsNodeId, kind: FsNodeKind, mask: u32) -> KResult<i32> {
-        self.inner.exclusive_session(|inner| {
+        self.inner.with_lock(|inner| {
             if let Some(watch) = inner.watches.iter_mut().find(|watch| watch.node == node) {
                 if mask & IN_MASK_CREATE != 0 {
                     return Err(Errno::EEXIST);
@@ -201,7 +199,7 @@ impl InotifyGroup {
     }
 
     fn remove_watch(&self, wd: i32, emit_ignored: bool) -> KResult {
-        let (waiters, poll_waiters) = self.inner.exclusive_session(|inner| {
+        let (waiters, poll_waiters) = self.inner.with_lock(|inner| {
             let Some(index) = inner.watches.iter().position(|watch| watch.wd == wd) else {
                 return Err(Errno::EINVAL);
             };
@@ -228,7 +226,7 @@ impl InotifyGroup {
         }
 
         loop {
-            let task_cx_ptr = self.inner.exclusive_session(|inner| {
+            let task_cx_ptr = self.inner.with_lock(|inner| {
                 if !inner.events.is_empty() || nonblocking || current_has_interrupting_signal() {
                     None
                 } else {
@@ -245,7 +243,7 @@ impl InotifyGroup {
 
         let mut data = Vec::new();
         loop {
-            let Some(event) = self.inner.exclusive_session(|inner| {
+            let Some(event) = self.inner.with_lock(|inner| {
                 let event = inner.events.front()?;
                 if capacity.saturating_sub(data.len()) < event.record_len() {
                     return None;
@@ -277,7 +275,7 @@ impl InotifyGroup {
         name: Option<&str>,
         include_direct: bool,
     ) {
-        let (waiters, poll_waiters) = self.inner.exclusive_session(|inner| {
+        let (waiters, poll_waiters) = self.inner.with_lock(|inner| {
             let mut emitted = false;
             let real_node = overlay_real_node(node);
             let real_parent = parent.and_then(overlay_real_node);
@@ -335,7 +333,7 @@ impl InotifyGroup {
     }
 
     fn remove_matching_watches(&self, node: VfsNodeId, emit_unmount: bool) {
-        let (waiters, poll_waiters) = self.inner.exclusive_session(|inner| {
+        let (waiters, poll_waiters) = self.inner.with_lock(|inner| {
             let real_node = overlay_real_node(node);
             let targets: Vec<_> = inner
                 .watches
@@ -369,7 +367,7 @@ impl InotifyGroup {
     }
 
     fn remove_watches_on_mount(&self, mount: MountId) {
-        let (waiters, poll_waiters) = self.inner.exclusive_session(|inner| {
+        let (waiters, poll_waiters) = self.inner.with_lock(|inner| {
             let targets: Vec<_> = inner
                 .watches
                 .iter()
@@ -398,7 +396,7 @@ impl InotifyGroup {
     }
 
     fn fdinfo(&self) -> String {
-        self.inner.exclusive_session(|inner| {
+        self.inner.with_lock(|inner| {
             let mut output = String::new();
             for watch in inner.watches.iter() {
                 output.push_str(
@@ -424,7 +422,7 @@ impl InotifyFile {
     fn new(group: Arc<InotifyGroup>) -> Self {
         Self {
             group,
-            status_flags: unsafe { UPIntrFreeCell::new(OpenFlags::empty()) },
+            status_flags: SpinNoIrqLock::new(OpenFlags::empty()),
         }
     }
 }
@@ -456,7 +454,7 @@ impl File for InotifyFile {
     }
 
     fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
-        self.group.inner.exclusive_session(|inner| {
+        self.group.inner.with_lock(|inner| {
             if let Some(waiter) = waiter
                 && events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI)
             {
@@ -485,12 +483,12 @@ impl File for InotifyFile {
     }
 
     fn status_flags(&self) -> OpenFlags {
-        self.status_flags.exclusive_session(|flags| *flags)
+        self.status_flags.with_lock(|flags| *flags)
     }
 
     fn set_status_flags(&self, flags: OpenFlags) {
         self.status_flags
-            .exclusive_session(|status_flags| *status_flags = flags);
+            .with_lock(|status_flags| *status_flags = flags);
     }
 }
 
@@ -528,7 +526,7 @@ fn wake_waiters(waiters: VecDeque<Arc<TaskControlBlock>>) {
 
 fn live_inotify_groups() -> Vec<Arc<InotifyGroup>> {
     perf::record_inotify_live_group_scan();
-    INOTIFY_GROUPS.exclusive_session(|groups| {
+    INOTIFY_GROUPS.with_lock(|groups| {
         groups.retain(|weak| weak.strong_count() > 0);
         groups.iter().filter_map(Weak::upgrade).collect()
     })
@@ -536,26 +534,26 @@ fn live_inotify_groups() -> Vec<Arc<InotifyGroup>> {
 
 fn has_live_inotify_groups() -> bool {
     perf::record_inotify_live_group_scan();
-    INOTIFY_GROUPS.exclusive_session(|groups| {
+    INOTIFY_GROUPS.with_lock(|groups| {
         groups.retain(|weak| weak.strong_count() > 0);
         !groups.is_empty()
     })
 }
 
 fn node_is_unlinked(node: VfsNodeId) -> bool {
-    INOTIFY_UNLINKED_NODES.exclusive_session(|nodes| nodes.contains(&node))
+    INOTIFY_UNLINKED_NODES.with_lock(|nodes| nodes.contains(&node))
 }
 
 fn mark_node_unlinked(node: VfsNodeId) {
     perf::record_inotify_unlinked_node_update();
-    INOTIFY_UNLINKED_NODES.exclusive_session(|nodes| {
+    INOTIFY_UNLINKED_NODES.with_lock(|nodes| {
         nodes.insert(node);
     });
 }
 
 fn clear_node_unlinked(node: VfsNodeId) {
     perf::record_inotify_unlinked_node_update();
-    INOTIFY_UNLINKED_NODES.exclusive_session(|nodes| {
+    INOTIFY_UNLINKED_NODES.with_lock(|nodes| {
         nodes.remove(&node);
     });
 }
@@ -576,7 +574,7 @@ fn remember_node_name(node: VfsNodeId, path: &str) {
         return;
     };
     perf::record_inotify_node_name_remember();
-    INOTIFY_NODE_NAMES.exclusive_session(|names| match names.entry(node) {
+    INOTIFY_NODE_NAMES.with_lock(|names| match names.entry(node) {
         Entry::Occupied(mut entry) => {
             let stored = entry.get_mut();
             stored.clear();
@@ -589,7 +587,7 @@ fn remember_node_name(node: VfsNodeId, path: &str) {
 }
 
 fn remembered_node_name(node: VfsNodeId) -> Option<String> {
-    INOTIFY_NODE_NAMES.exclusive_session(|names| names.get(&node).cloned())
+    INOTIFY_NODE_NAMES.with_lock(|names| names.get(&node).cloned())
 }
 
 fn next_move_cookie() -> u32 {
@@ -794,7 +792,7 @@ pub(super) fn inotify_notify_move(
 }
 
 pub(crate) fn inotify_notify_unmount(mount: MountId) {
-    INOTIFY_GROUPS.exclusive_session(|groups| {
+    INOTIFY_GROUPS.with_lock(|groups| {
         groups.retain(|weak| weak.strong_count() > 0);
         let live_groups: Vec<_> = groups.iter().filter_map(Weak::upgrade).collect();
         for group in live_groups {
@@ -807,7 +805,7 @@ fn remove_matching_watches(file: &Arc<dyn File + Send + Sync>, emit_unmount: boo
     let Some(node) = file.vfs_node_id() else {
         return;
     };
-    INOTIFY_GROUPS.exclusive_session(|groups| {
+    INOTIFY_GROUPS.with_lock(|groups| {
         groups.retain(|weak| weak.strong_count() > 0);
         let live_groups: Vec<_> = groups.iter().filter_map(Weak::upgrade).collect();
         for group in live_groups {

@@ -184,7 +184,7 @@ pub(crate) fn note_madvise_willneed(len: usize) {
 }
 
 pub(crate) fn core_pattern_for_pid(pid: usize) -> String {
-    let pattern = PROC_CORE_PATTERN.exclusive_access().clone();
+    let pattern = PROC_CORE_PATTERN.lock().clone();
     let pattern = core::str::from_utf8(pattern.as_slice())
         .unwrap_or("core")
         .trim_matches(|ch| ch == '\n' || ch == '\0');
@@ -1995,13 +1995,13 @@ fn pid_fdinfo_content(pid: usize, fd: usize) -> FsResult<String> {
 }
 
 fn domainname_content() -> Vec<u8> {
-    let mut output = PROC_DOMAINNAME.exclusive_access().clone();
+    let mut output = PROC_DOMAINNAME.lock().clone();
     output.push(b'\n');
     output
 }
 
 fn core_pattern_content() -> Vec<u8> {
-    let mut output = PROC_CORE_PATTERN.exclusive_access().clone();
+    let mut output = PROC_CORE_PATTERN.lock().clone();
     output.push(b'\n');
     output
 }
@@ -2014,7 +2014,7 @@ fn write_core_pattern(buf: &[u8], offset: u64) -> usize {
         .iter()
         .position(|byte| *byte == b'\n' || *byte == 0)
         .unwrap_or(buf.len());
-    let mut value = PROC_CORE_PATTERN.exclusive_access();
+    let mut value = PROC_CORE_PATTERN.lock();
     if offset > value.len() {
         return 0;
     }
@@ -2027,7 +2027,7 @@ fn set_core_pattern_len(len: u64) -> FsResult {
     let Ok(len) = usize::try_from(len) else {
         return Err(FsError::InvalidInput);
     };
-    let mut value = PROC_CORE_PATTERN.exclusive_access();
+    let mut value = PROC_CORE_PATTERN.lock();
     if len <= value.len() {
         value.truncate(len);
     } else {
@@ -2291,7 +2291,7 @@ fn write_domainname(buf: &[u8], offset: u64) -> usize {
         .iter()
         .position(|byte| *byte == b'\n' || *byte == 0)
         .unwrap_or(buf.len());
-    let mut value = PROC_DOMAINNAME.exclusive_access();
+    let mut value = PROC_DOMAINNAME.lock();
     if offset > value.len() {
         return 0;
     }
@@ -2304,7 +2304,7 @@ fn set_domainname_len(len: u64) -> FsResult {
     let Ok(len) = usize::try_from(len) else {
         return Err(FsError::InvalidInput);
     };
-    let mut value = PROC_DOMAINNAME.exclusive_access();
+    let mut value = PROC_DOMAINNAME.lock();
     if len <= value.len() {
         value.truncate(len);
     } else {

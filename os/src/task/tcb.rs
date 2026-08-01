@@ -6,7 +6,7 @@ use super::{
 use crate::trap::TrapContext;
 use crate::{
     mm::PhysPageNum,
-    sync::{UPIntrFreeCell, UPIntrRefMut},
+    sync::{SpinNoIrqLock, SpinNoIrqLockGuard},
 };
 use alloc::{
     sync::{Arc, Weak},
@@ -49,7 +49,7 @@ pub struct TaskControlBlock {
     // check, but false negatives are forbidden.
     signal_pending: AtomicBool,
     // mutable
-    pub inner: UPIntrFreeCell<TaskControlBlockInner>,
+    pub inner: SpinNoIrqLock<TaskControlBlockInner>,
 }
 
 #[repr(C, align(64))]
@@ -192,58 +192,56 @@ impl TaskControlBlock {
             kstack,
             sched: TaskSched::new(),
             signal_pending: AtomicBool::new(false),
-            inner: unsafe {
-                UPIntrFreeCell::new(TaskControlBlockInner {
-                    res: Some(res),
-                    tid,
-                    trap_cx_ppn,
-                    task_cx: TaskContext::goto_trap_return(kstack_top),
-                    task_status: TaskStatus::Ready,
-                    on_cpu: None,
-                    on_rq: false,
-                    queued_cpu: None,
-                    last_cpu: None,
-                    wake_pending: false,
-                    wake_front: false,
-                    job_control_stopped,
-                    job_control_stop_ack_generation: 0,
-                    allowed_cpus: crate::cpu::topology().possible_mask(),
-                    smp_sched_probe: false,
-                    smp_sched_probe_active: false,
-                    smp_cpu_probe: false,
-                    smp_wait_io_probe: false,
-                    smp_phase4_wait_probe: false,
-                    proc_sleeping: false,
-                    exit_code: None,
-                    linux_tid: None,
-                    clear_child_tid: None,
-                    robust_list_head: 0,
-                    pending_signals: SignalFlags::empty(),
-                    signal_infos: (0..SIGNAL_INFO_SLOTS).map(|_| None).collect(),
-                    signal_mask: SignalFlags::empty(),
-                    sigsuspend_restore_mask: None,
-                    sigaltstack: SigAltStack::disabled(),
-                    sched_policy: 0,
-                    sched_priority: 0,
-                    sched_reset_on_fork: false,
-                    sched_deadline_runtime: 0,
-                    sched_deadline_deadline: 0,
-                    sched_deadline_period: 0,
-                    nice: 0,
-                    sched_vruntime: 0,
-                    sched_run_start_us: None,
-                    cpu_times: TaskCpuTimes::default(),
-                    timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
-                    default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
-                    clone_vm_process_helper: false,
-                    synthetic_newnet: false,
-                })
-            },
+            inner: SpinNoIrqLock::new(TaskControlBlockInner {
+                res: Some(res),
+                tid,
+                trap_cx_ppn,
+                task_cx: TaskContext::goto_trap_return(kstack_top),
+                task_status: TaskStatus::Ready,
+                on_cpu: None,
+                on_rq: false,
+                queued_cpu: None,
+                last_cpu: None,
+                wake_pending: false,
+                wake_front: false,
+                job_control_stopped,
+                job_control_stop_ack_generation: 0,
+                allowed_cpus: crate::cpu::topology().possible_mask(),
+                smp_sched_probe: false,
+                smp_sched_probe_active: false,
+                smp_cpu_probe: false,
+                smp_wait_io_probe: false,
+                smp_phase4_wait_probe: false,
+                proc_sleeping: false,
+                exit_code: None,
+                linux_tid: None,
+                clear_child_tid: None,
+                robust_list_head: 0,
+                pending_signals: SignalFlags::empty(),
+                signal_infos: (0..SIGNAL_INFO_SLOTS).map(|_| None).collect(),
+                signal_mask: SignalFlags::empty(),
+                sigsuspend_restore_mask: None,
+                sigaltstack: SigAltStack::disabled(),
+                sched_policy: 0,
+                sched_priority: 0,
+                sched_reset_on_fork: false,
+                sched_deadline_runtime: 0,
+                sched_deadline_deadline: 0,
+                sched_deadline_period: 0,
+                nice: 0,
+                sched_vruntime: 0,
+                sched_run_start_us: None,
+                cpu_times: TaskCpuTimes::default(),
+                timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
+                default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
+                clone_vm_process_helper: false,
+                synthetic_newnet: false,
+            }),
         }
     }
 
-    pub fn inner_exclusive_access(&self) -> UPIntrRefMut<'_, TaskControlBlockInner> {
-        self.inner.exclusive_access()
+    pub fn inner_exclusive_access(&self) -> SpinNoIrqLockGuard<'_, TaskControlBlockInner> {
+        self.inner.lock()
     }
 
     /// Claims this task's embedded remote-wake node before list publication.
@@ -421,7 +419,7 @@ impl TaskControlBlock {
     }
 
     pub fn try_account_system_time_until(&self, now_us: usize) {
-        if let Some(mut inner) = self.inner.try_exclusive_access() {
+        if let Some(mut inner) = self.inner.try_lock() {
             inner.cpu_times.account_system_until(now_us);
         }
     }

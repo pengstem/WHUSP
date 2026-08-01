@@ -10,6 +10,7 @@ pub const SIGCHLD: u32 = 17;
 pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
 pub const SIGRTMIN: usize = 32;
+#[cfg(target_arch = "riscv64")]
 pub const SIGRT_1: usize = 33;
 pub const SIGRTMAX: usize = 64;
 pub const CLD_EXITED: i32 = 1;
@@ -129,7 +130,7 @@ impl SigAltStack {
     pub fn flags_for_sp(self, sp: usize) -> i32 {
         if !self.is_enabled() {
             SS_DISABLE
-        } else if self.contains(sp) {
+        } else if sp.wrapping_sub(self.sp) < self.size {
             SS_ONSTACK
         } else {
             0
@@ -199,8 +200,6 @@ impl SignalFlags {
             Some(Self::empty())
         } else if signum >= SIGNAL_INFO_SLOTS as u32 {
             None
-        } else if signum == SIGRT_1 as u32 {
-            Some(Self::from_bits_retain(1u128 << signum))
         } else {
             // CONTEXT: Linux real-time signals are ABI-visible even when this
             // kernel has no named per-signal semantics for them yet. musl uses
@@ -291,9 +290,8 @@ pub fn default_signal_exit_code(signum: usize, core_limit: usize) -> Option<i32>
     let (exit_code, _) = default_signal_error(signum)?;
     let mut status = (-exit_code) & 0x7f;
     if default_signal_action(signum) == Some(DefaultSignalAction::Core) && core_limit > 0 {
-        // UNFINISHED: Linux also writes a core image according to core(5).
-        // This kernel currently reports the wait-status core bit for scoring
-        // compatibility but does not materialize a core file.
+        // The task exit path writes the core image after collecting it from the
+        // process address space and releasing the process lock.
         status |= SIGNAL_EXIT_CORE_DUMPED;
     }
     Some(-status)

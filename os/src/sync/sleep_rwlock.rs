@@ -1,4 +1,4 @@
-use super::UPIntrFreeCell;
+use super::SpinNoIrqLock;
 use crate::task::{
     TaskContext, TaskControlBlock, block_current_task_no_schedule,
     block_current_task_no_schedule_unless_unmasked_signal, schedule, wakeup_task,
@@ -111,11 +111,11 @@ impl SleepRwLockInner {
 ///
 /// New readers may join an active reader phase only while no writer is queued.
 /// Ownership is handed to the queue front before wakeup: one writer, or the
-/// contiguous reader batch at the head. The internal `UPIntrFreeCell` protects
+/// contiguous reader batch at the head. The internal `SpinNoIrqLock` protects
 /// only queue/state bookkeeping and is always released before scheduler wakeup.
 pub struct SleepRwLock<T> {
     data: UnsafeCell<T>,
-    inner: UPIntrFreeCell<SleepRwLockInner>,
+    inner: SpinNoIrqLock<SleepRwLockInner>,
 }
 
 pub struct SleepRwLockReadGuard<'a, T> {
@@ -127,15 +127,11 @@ pub struct SleepRwLockWriteGuard<'a, T> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SleepRwLockInterrupted;
+pub(crate) struct SleepRwLockInterrupted;
 
-#[cfg(any(
-    feature = "perf-counters",
-    debug_assertions,
-    feature = "sleep-rwlock-probe"
-))]
+#[cfg(feature = "sleep-rwlock-probe")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SleepRwLockStats {
+pub(crate) struct SleepRwLockStats {
     pub active_readers: usize,
     pub writer_active: bool,
     pub waiting_readers: usize,
@@ -150,16 +146,14 @@ impl<T> SleepRwLock<T> {
     pub fn new(data: T) -> Self {
         Self {
             data: UnsafeCell::new(data),
-            inner: unsafe {
-                UPIntrFreeCell::new(SleepRwLockInner {
-                    active_readers: 0,
-                    writer_active: false,
-                    waiting_readers: 0,
-                    waiting_writers: 0,
-                    max_waiters: 0,
-                    wait_queue: VecDeque::new(),
-                })
-            },
+            inner: SpinNoIrqLock::new(SleepRwLockInner {
+                active_readers: 0,
+                writer_active: false,
+                waiting_readers: 0,
+                waiting_writers: 0,
+                max_waiters: 0,
+                wait_queue: VecDeque::new(),
+            }),
         }
     }
 
@@ -169,28 +163,23 @@ impl<T> SleepRwLock<T> {
         SleepRwLockReadGuard { lock: self }
     }
 
-    pub fn read_interruptible(
-        &self,
-    ) -> Result<SleepRwLockReadGuard<'_, T>, SleepRwLockInterrupted> {
-        self.acquire(WaitKind::Reader, true)?;
-        Ok(SleepRwLockReadGuard { lock: self })
-    }
-
     pub fn write(&self) -> SleepRwLockWriteGuard<'_, T> {
         self.acquire(WaitKind::Writer, false)
             .expect("uninterruptible SleepRwLock write was interrupted");
         SleepRwLockWriteGuard { lock: self }
     }
 
-    pub fn write_interruptible(
+    #[cfg(feature = "sleep-rwlock-probe")]
+    pub(crate) fn write_interruptible(
         &self,
     ) -> Result<SleepRwLockWriteGuard<'_, T>, SleepRwLockInterrupted> {
         self.acquire(WaitKind::Writer, true)?;
         Ok(SleepRwLockWriteGuard { lock: self })
     }
 
-    pub fn try_read(&self) -> Option<SleepRwLockReadGuard<'_, T>> {
-        let mut inner = self.inner.try_exclusive_access()?;
+    #[cfg(feature = "sleep-rwlock-probe")]
+    pub(crate) fn try_read(&self) -> Option<SleepRwLockReadGuard<'_, T>> {
+        let mut inner = self.inner.try_lock()?;
         if !inner.can_read_directly() {
             return None;
         }
@@ -198,8 +187,9 @@ impl<T> SleepRwLock<T> {
         Some(SleepRwLockReadGuard { lock: self })
     }
 
-    pub fn try_write(&self) -> Option<SleepRwLockWriteGuard<'_, T>> {
-        let mut inner = self.inner.try_exclusive_access()?;
+    #[cfg(feature = "sleep-rwlock-probe")]
+    pub(crate) fn try_write(&self) -> Option<SleepRwLockWriteGuard<'_, T>> {
+        let mut inner = self.inner.try_lock()?;
         if !inner.can_write_directly() {
             return None;
         }
@@ -207,13 +197,9 @@ impl<T> SleepRwLock<T> {
         Some(SleepRwLockWriteGuard { lock: self })
     }
 
-    #[cfg(any(
-        feature = "perf-counters",
-        debug_assertions,
-        feature = "sleep-rwlock-probe"
-    ))]
-    pub fn stats(&self) -> SleepRwLockStats {
-        let inner = self.inner.exclusive_access();
+    #[cfg(feature = "sleep-rwlock-probe")]
+    pub(crate) fn stats(&self) -> SleepRwLockStats {
+        let inner = self.inner.lock();
         SleepRwLockStats {
             active_readers: inner.active_readers,
             writer_active: inner.writer_active,
@@ -225,12 +211,12 @@ impl<T> SleepRwLock<T> {
 
     #[cfg(feature = "sleep-rwlock-probe")]
     pub(crate) fn reset_max_waiters_for_probe(&self) {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         inner.max_waiters = inner.wait_queue.len();
     }
 
     fn acquire(&self, kind: WaitKind, interruptible: bool) -> Result<(), SleepRwLockInterrupted> {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         let direct = match kind {
             WaitKind::Reader => inner.can_read_directly(),
             WaitKind::Writer => inner.can_write_directly(),
@@ -256,7 +242,7 @@ impl<T> SleepRwLock<T> {
         schedule(task_cx_ptr);
 
         loop {
-            let mut inner = self.inner.exclusive_access();
+            let mut inner = self.inner.lock();
             if waiter.granted.load(Ordering::Acquire) {
                 return Ok(());
             }
@@ -280,7 +266,7 @@ impl<T> SleepRwLock<T> {
     }
 
     fn release_read(&self) {
-        let waking = self.inner.exclusive_session(|inner| {
+        let waking = self.inner.with_lock(|inner| {
             assert!(inner.active_readers > 0);
             inner.active_readers -= 1;
             if inner.active_readers == 0 {
@@ -293,7 +279,7 @@ impl<T> SleepRwLock<T> {
     }
 
     fn release_write(&self) {
-        let waking = self.inner.exclusive_session(|inner| {
+        let waking = self.inner.with_lock(|inner| {
             assert!(inner.writer_active);
             inner.writer_active = false;
             inner.grant_front_phase()

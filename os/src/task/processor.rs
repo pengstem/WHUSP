@@ -362,7 +362,7 @@ pub fn run_tasks() -> ! {
             // becomes visible as Processor::current.
             let next_task_cx_ptr = task
                 .inner
-                .exclusive_session(|task_inner| &task_inner.task_cx as *const TaskContext);
+                .with_lock(|task_inner| &task_inner.task_cx as *const TaskContext);
             let rt_priority = task.realtime_priority() as usize;
             task.mark_sched_run_start(crate::timer::get_time_us());
             processor.set_current(task);
@@ -431,10 +431,6 @@ pub fn refresh_current_user_token() {
         .expect("refresh_current_user_token requires a running task");
 }
 
-fn prepare_current_address_space_return() {
-    processor().prepare_current_address_space_return();
-}
-
 pub fn current_trap_cx() -> &'static mut TrapContext {
     perf::record_task_current_trap_cx_call();
     let trap_cx_ppn = processor()
@@ -455,11 +451,7 @@ pub fn trap_cx_of_task(task: &TaskControlBlock) -> &'static mut TrapContext {
     task.inner_exclusive_access().get_trap_cx()
 }
 
-fn account_trap_return_for_task(
-    task: &TaskControlBlock,
-    _process: &ProcessControlBlock,
-    now_us: usize,
-) {
+fn account_trap_return_for_task(task: &TaskControlBlock, now_us: usize) {
     task.account_system_time_until(now_us);
     task.mark_user_time_entry(now_us);
 }
@@ -467,12 +459,11 @@ fn account_trap_return_for_task(
 #[cfg(target_arch = "riscv64")]
 pub fn trap_return_context_after_accounting_for_task(
     task: &TaskControlBlock,
-    process: &ProcessControlBlock,
     now_us: usize,
 ) -> (usize, usize) {
     perf::record_task_current_trap_return_context_call();
-    account_trap_return_for_task(task, process, now_us);
-    prepare_current_address_space_return();
+    account_trap_return_for_task(task, now_us);
+    processor().prepare_current_address_space_return();
     let trap_cx_user_va = task
         .inner_exclusive_access()
         .res
@@ -486,12 +477,11 @@ pub fn trap_return_context_after_accounting_for_task(
 #[cfg(target_arch = "loongarch64")]
 pub fn trap_return_context_after_accounting_for_task(
     task: &TaskControlBlock,
-    process: &ProcessControlBlock,
     now_us: usize,
 ) -> (usize, usize) {
     perf::record_task_current_trap_return_context_call();
-    account_trap_return_for_task(task, process, now_us);
-    prepare_current_address_space_return();
+    account_trap_return_for_task(task, now_us);
+    processor().prepare_current_address_space_return();
     let trap_cx = task.inner_exclusive_access().get_trap_cx() as *mut TrapContext as usize;
     let user_token = current_user_token();
     (trap_cx, user_token)

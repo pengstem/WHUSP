@@ -5,7 +5,6 @@ use crate::task::suspend_current_and_run_next;
 use crate::timer;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Multi-writer sequence used where readers copy data into private buffers.
@@ -161,7 +160,7 @@ impl Ext4PhysicalLeaseTable {
                 drop(reserved);
                 return Ext4PhysicalLease {
                     table: self.clone(),
-                    blocks: unique.iter().copied().collect(),
+                    blocks: unique,
                 };
             }
             drop(reserved);
@@ -172,13 +171,13 @@ impl Ext4PhysicalLeaseTable {
 
 pub(super) struct Ext4PhysicalLease {
     table: Arc<Ext4PhysicalLeaseTable>,
-    blocks: Vec<u64>,
+    blocks: BTreeSet<u64>,
 }
 
 impl Drop for Ext4PhysicalLease {
     fn drop(&mut self) {
         let mut reserved = self.table.blocks.lock();
-        for block in self.blocks.drain(..) {
+        for block in self.blocks.iter().copied() {
             assert!(
                 reserved.remove(&block),
                 "ext4 physical LBA lease lost ownership"

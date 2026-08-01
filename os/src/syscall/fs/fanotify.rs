@@ -13,7 +13,7 @@ use crate::fs::{
 };
 use crate::mm::UserBuffer;
 use crate::perf;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::task::{
     TaskControlBlock, block_current_task_no_schedule, current_has_interrupting_signal,
     current_process, current_task, current_user_token, schedule, wakeup_task,
@@ -141,10 +141,10 @@ const KNOWN_MARK_MASK: u64 =
 const UNSUPPORTED_PERMISSION_EVENTS: u64 = FAN_OPEN_PERM | FAN_ACCESS_PERM | FAN_OPEN_EXEC_PERM;
 
 lazy_static! {
-    static ref FANOTIFY_GROUPS: UPIntrFreeCell<Vec<Weak<FanotifyGroup>>> =
-        unsafe { UPIntrFreeCell::new(Vec::new()) };
-    static ref FANOTIFY_NODE_NAMES: UPIntrFreeCell<BTreeMap<VfsNodeId, String>> =
-        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+    static ref FANOTIFY_GROUPS: SpinNoIrqLock<Vec<Weak<FanotifyGroup>>> =
+        SpinNoIrqLock::new(Vec::new());
+    static ref FANOTIFY_NODE_NAMES: SpinNoIrqLock<BTreeMap<VfsNodeId, String>> =
+        SpinNoIrqLock::new(BTreeMap::new());
 }
 
 static LIVE_FANOTIFY_GROUPS: AtomicUsize = AtomicUsize::new(0);
@@ -250,7 +250,7 @@ struct FanotifyGroup {
     owner_pid: i32,
     unprivileged: bool,
     max_queued_events: usize,
-    inner: UPIntrFreeCell<FanotifyInner>,
+    inner: SpinNoIrqLock<FanotifyInner>,
 }
 
 impl FanotifyGroup {
@@ -265,24 +265,22 @@ impl FanotifyGroup {
             } else {
                 MAX_QUEUED_EVENTS
             },
-            inner: unsafe {
-                UPIntrFreeCell::new(FanotifyInner {
-                    marks: Vec::new(),
-                    events: VecDeque::new(),
-                    read_waiters: VecDeque::new(),
-                    poll_waiters: PollWaitQueue::new(),
-                    overflow_queued: false,
-                    closed: false,
-                })
-            },
+            inner: SpinNoIrqLock::new(FanotifyInner {
+                marks: Vec::new(),
+                events: VecDeque::new(),
+                read_waiters: VecDeque::new(),
+                poll_waiters: PollWaitQueue::new(),
+                overflow_queued: false,
+                closed: false,
+            }),
         });
-        FANOTIFY_GROUPS.exclusive_session(|groups| groups.push(Arc::downgrade(&group)));
+        FANOTIFY_GROUPS.with_lock(|groups| groups.push(Arc::downgrade(&group)));
         LIVE_FANOTIFY_GROUPS.fetch_add(1, Ordering::Relaxed);
         group
     }
 
     fn close(&self) {
-        let (read_waiters, poll_waiters, events) = self.inner.exclusive_session(|inner| {
+        let (read_waiters, poll_waiters, events) = self.inner.with_lock(|inner| {
             if inner.closed {
                 return (VecDeque::new(), Vec::new(), VecDeque::new());
             }
@@ -303,11 +301,11 @@ impl FanotifyGroup {
     }
 
     fn flush(&self) {
-        self.inner.exclusive_session(|inner| inner.marks.clear());
+        self.inner.with_lock(|inner| inner.marks.clear());
     }
 
     fn update_mark(&self, target: FanotifyMarkTarget, flags: u32, mask: u64) -> KResult {
-        self.inner.exclusive_session(|inner| {
+        self.inner.with_lock(|inner| {
             let existing = inner.marks.iter_mut().find(|mark| mark.target == target);
             match (flags & (FAN_MARK_ADD | FAN_MARK_REMOVE), existing) {
                 (FAN_MARK_ADD, Some(mark)) => {
@@ -510,7 +508,7 @@ impl FanotifyGroup {
         child_fid_node: Option<VfsNodeId>,
         source: Option<&Arc<dyn File + Send + Sync>>,
     ) {
-        let (read_waiters, poll_waiters) = self.inner.exclusive_session(|inner| {
+        let (read_waiters, poll_waiters) = self.inner.with_lock(|inner| {
             if inner.closed {
                 return (VecDeque::new(), Vec::new());
             }
@@ -698,7 +696,7 @@ impl FanotifyGroup {
             return 0;
         }
         loop {
-            let mut inner = self.inner.exclusive_access();
+            let mut inner = self.inner.lock();
             if inner.closed
                 || !inner.events.is_empty()
                 || nonblocking
@@ -714,7 +712,7 @@ impl FanotifyGroup {
 
         let mut data = Vec::new();
         loop {
-            let Some((event, record_len)) = self.inner.exclusive_session(|inner| {
+            let Some((event, record_len)) = self.inner.with_lock(|inner| {
                 let event = inner.events.front()?;
                 let record_len = self.event_record_len(event);
                 if capacity.saturating_sub(data.len()) < record_len {
@@ -867,14 +865,14 @@ fn append_report_fid_info(
 
 pub struct FanotifyGroupFile {
     group: Arc<FanotifyGroup>,
-    status_flags: UPIntrFreeCell<OpenFlags>,
+    status_flags: SpinNoIrqLock<OpenFlags>,
 }
 
 impl FanotifyGroupFile {
     fn new(group: Arc<FanotifyGroup>) -> Self {
         Self {
             group,
-            status_flags: unsafe { UPIntrFreeCell::new(OpenFlags::empty()) },
+            status_flags: SpinNoIrqLock::new(OpenFlags::empty()),
         }
     }
 }
@@ -915,7 +913,7 @@ impl File for FanotifyGroupFile {
     }
 
     fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
-        self.group.inner.exclusive_session(|inner| {
+        self.group.inner.with_lock(|inner| {
             if inner.closed {
                 return PollEvents::POLLHUP;
             }
@@ -938,11 +936,11 @@ impl File for FanotifyGroupFile {
     }
 
     fn status_flags(&self) -> OpenFlags {
-        self.status_flags.exclusive_session(|flags| *flags)
+        self.status_flags.with_lock(|flags| *flags)
     }
 
     fn set_status_flags(&self, flags: OpenFlags) {
-        self.status_flags.exclusive_session(|status_flags| {
+        self.status_flags.with_lock(|status_flags| {
             *status_flags = flags;
         });
     }
@@ -1036,7 +1034,7 @@ fn validate_event_file_flags(flags: u32) -> KResult<OpenFlags> {
 pub fn sys_fanotify_init(flags: u32, event_f_flags: u32) -> KResult {
     validate_init_flags(flags)?;
     let event_file_flags = validate_event_file_flags(event_f_flags)?;
-    let groups_limit_reached = FANOTIFY_GROUPS.exclusive_session(|groups| {
+    let groups_limit_reached = FANOTIFY_GROUPS.with_lock(|groups| {
         groups.retain(|weak| weak.strong_count() > 0);
         groups.len() >= MAX_USER_GROUPS
     });
@@ -1195,7 +1193,7 @@ pub fn sys_fanotify_mark(
 
 fn live_fanotify_groups() -> Vec<Arc<FanotifyGroup>> {
     perf::record_fanotify_live_group_scan();
-    FANOTIFY_GROUPS.exclusive_session(|groups| {
+    FANOTIFY_GROUPS.with_lock(|groups| {
         groups.retain(|weak| weak.strong_count() > 0);
         groups.iter().filter_map(Weak::upgrade).collect()
     })
@@ -1353,7 +1351,7 @@ fn remember_node_name(node: VfsNodeId, path: &str) {
         return;
     };
     perf::record_fanotify_node_name_remember();
-    FANOTIFY_NODE_NAMES.exclusive_session(|names| match names.entry(node) {
+    FANOTIFY_NODE_NAMES.with_lock(|names| match names.entry(node) {
         Entry::Occupied(mut entry) => {
             let stored = entry.get_mut();
             stored.clear();
@@ -1367,7 +1365,7 @@ fn remember_node_name(node: VfsNodeId, path: &str) {
 
 fn remembered_node_name(node: VfsNodeId) -> Option<String> {
     perf::record_fanotify_node_name_lookup();
-    FANOTIFY_NODE_NAMES.exclusive_session(|names| names.get(&node).cloned())
+    FANOTIFY_NODE_NAMES.with_lock(|names| names.get(&node).cloned())
 }
 
 pub(super) fn fanotify_notify_file(file: &Arc<dyn File + Send + Sync>, event_mask: u64) {
@@ -1383,7 +1381,7 @@ pub(super) fn fanotify_close_group_file(file: &Arc<dyn File + Send + Sync>) {
 pub(crate) fn fanotify_fdinfo(file: &Arc<dyn File + Send + Sync>) -> Option<String> {
     let group_file = file.as_any().downcast_ref::<FanotifyGroupFile>()?;
     let mut output = String::new();
-    group_file.group.inner.exclusive_session(|inner| {
+    group_file.group.inner.with_lock(|inner| {
         for mark in inner.marks.iter() {
             output.push_str(&format!(
                 "fanotify ino:0 sdev:0 mflags:{:x} mask:{:x} ignored_mask:{:x}\n",
@@ -1400,7 +1398,7 @@ pub(crate) fn fanotify_max_queued_events() -> usize {
 
 pub(crate) fn fanotify_evict_evictable_marks() {
     for group in live_fanotify_groups() {
-        group.inner.exclusive_session(|inner| {
+        group.inner.with_lock(|inner| {
             inner
                 .marks
                 .retain(|mark| mark.flags & FAN_MARK_EVICTABLE == 0);

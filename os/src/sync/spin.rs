@@ -344,6 +344,14 @@ impl<T> SpinNoIrqLock<T> {
             irq,
         })
     }
+
+    pub fn with_lock<F, V>(&self, f: F) -> V
+    where
+        F: FnOnce(&mut T) -> V,
+    {
+        let mut guard = self.lock();
+        f(&mut guard)
+    }
 }
 
 /// Payload-free IRQ-safe spin lock for paired FFI lock/unlock callbacks.

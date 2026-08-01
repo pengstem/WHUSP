@@ -4,7 +4,7 @@ use super::{MapArea, MapPermission, MapType, MemorySet, VirtAddr};
 use crate::config::{DL_INTERP_OFFSET, PAGE_SIZE, USER_HEAP_SIZE, USER_MMAP_BASE, USER_STACK_SIZE};
 use crate::fs::File;
 #[cfg(feature = "perf-counters")]
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 #[cfg(feature = "perf-counters")]
 use alloc::format;
 use alloc::string::String;
@@ -43,13 +43,13 @@ pub struct ExecLoadStats {
 
 #[cfg(feature = "perf-counters")]
 lazy_static! {
-    static ref EXEC_LOAD_STATS: UPIntrFreeCell<ExecLoadStats> =
-        unsafe { UPIntrFreeCell::new(ExecLoadStats::default()) };
+    static ref EXEC_LOAD_STATS: SpinNoIrqLock<ExecLoadStats> =
+        SpinNoIrqLock::new(ExecLoadStats::default());
 }
 
 #[cfg(feature = "perf-counters")]
 pub(crate) fn record_exec_metadata_read(header_bytes: usize, phdr_bytes: usize) {
-    let mut stats = EXEC_LOAD_STATS.exclusive_access();
+    let mut stats = EXEC_LOAD_STATS.lock();
     stats.elf_header_bytes_read = stats.elf_header_bytes_read.saturating_add(header_bytes);
     stats.phdr_bytes_read = stats.phdr_bytes_read.saturating_add(phdr_bytes);
 }
@@ -60,7 +60,7 @@ pub(crate) fn record_exec_metadata_read(_header_bytes: usize, _phdr_bytes: usize
 
 #[cfg(feature = "perf-counters")]
 fn record_exec_eager_segment_bytes_read(bytes: usize) {
-    let mut stats = EXEC_LOAD_STATS.exclusive_access();
+    let mut stats = EXEC_LOAD_STATS.lock();
     stats.eager_segment_bytes_read = stats.eager_segment_bytes_read.saturating_add(bytes);
 }
 
@@ -70,7 +70,7 @@ fn record_exec_eager_segment_bytes_read(_bytes: usize) {}
 
 #[cfg(feature = "perf-counters")]
 fn record_exec_lazy_segment_vma() {
-    let mut stats = EXEC_LOAD_STATS.exclusive_access();
+    let mut stats = EXEC_LOAD_STATS.lock();
     stats.lazy_segment_vmas = stats.lazy_segment_vmas.saturating_add(1);
 }
 
@@ -80,7 +80,7 @@ fn record_exec_lazy_segment_vma() {}
 
 #[cfg(feature = "perf-counters")]
 pub(super) fn record_exec_lazy_fault(bytes_read: usize, zero_fill_bytes: usize) {
-    let mut stats = EXEC_LOAD_STATS.exclusive_access();
+    let mut stats = EXEC_LOAD_STATS.lock();
     stats.lazy_segment_faults = stats.lazy_segment_faults.saturating_add(1);
     stats.lazy_segment_bytes_read = stats.lazy_segment_bytes_read.saturating_add(bytes_read);
     stats.zero_fill_bytes = stats.zero_fill_bytes.saturating_add(zero_fill_bytes);
@@ -92,7 +92,7 @@ pub(super) fn record_exec_lazy_fault(_bytes_read: usize, _zero_fill_bytes: usize
 
 #[cfg(feature = "perf-counters")]
 pub(super) fn record_exec_lazy_page_cache_fault(hit: bool, bytes_read: usize) {
-    let mut stats = EXEC_LOAD_STATS.exclusive_access();
+    let mut stats = EXEC_LOAD_STATS.lock();
     stats.lazy_segment_faults = stats.lazy_segment_faults.saturating_add(1);
     stats.lazy_segment_bytes_read = stats.lazy_segment_bytes_read.saturating_add(bytes_read);
     stats.lazy_page_cache_faults = stats.lazy_page_cache_faults.saturating_add(1);
@@ -111,7 +111,7 @@ pub(super) fn record_exec_lazy_page_cache_fault(_hit: bool, _bytes_read: usize) 
 
 #[cfg(feature = "perf-counters")]
 pub(crate) fn exec_load_stats_snapshot() -> ExecLoadStats {
-    *EXEC_LOAD_STATS.exclusive_access()
+    *EXEC_LOAD_STATS.lock()
 }
 
 #[cfg(not(feature = "perf-counters"))]
@@ -154,27 +154,6 @@ pub(crate) fn exec_load_stats_content() -> String {
     String::from("exec_load_stats_enabled 0\n")
 }
 
-fn phdr_address(elf: &xmas_elf::ElfFile<'_>) -> usize {
-    let ph_offset = elf.header.pt2.ph_offset() as usize;
-    let ph_size = elf.header.pt2.ph_entry_size() as usize * elf.header.pt2.ph_count() as usize;
-    let mut phdr = 0usize;
-    for i in 0..elf.header.pt2.ph_count() {
-        let ph = elf.program_header(i).unwrap();
-        let ph_type = ph.get_type().unwrap();
-        if ph_type == Type::Phdr {
-            return ph.virtual_addr() as usize;
-        }
-        if ph_type == Type::Load && phdr == 0 {
-            let load_offset = ph.offset() as usize;
-            let load_file_end = load_offset + ph.file_size() as usize;
-            if ph_offset >= load_offset && ph_offset + ph_size <= load_file_end {
-                phdr = ph.virtual_addr() as usize + (ph_offset - load_offset);
-            }
-        }
-    }
-    phdr
-}
-
 fn main_load_bias(elf: &xmas_elf::ElfFile<'_>) -> usize {
     if elf.header.pt2.type_().as_type() == header::Type::SharedObject {
         USER_MMAP_BASE
@@ -206,17 +185,7 @@ fn map_elf_load_segments(
         let end_va: VirtAddr = (load_bias + (ph.virtual_addr() + ph.mem_size()) as usize).into();
         let segment_end = load_bias + ph.virtual_addr() as usize + ph.mem_size() as usize;
         max_end_va = max_end_va.max(segment_end);
-        let mut map_perm = MapPermission::U;
-        let ph_flags = ph.flags();
-        if ph_flags.is_read() {
-            map_perm |= MapPermission::R;
-        }
-        if ph_flags.is_write() {
-            map_perm |= MapPermission::W;
-        }
-        if ph_flags.is_execute() {
-            map_perm |= MapPermission::X;
-        }
+        let map_perm = map_permission_from_ph_flags(ph);
         let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
         memory_set.push_with_offset(
             map_area,
@@ -355,7 +324,10 @@ impl MemorySet {
         let ph_count = elf_header.pt2.ph_count();
         let ph_entry_size = elf_header.pt2.ph_entry_size();
         let load_bias = main_load_bias(elf);
-        let phdr = bias_nonzero_addr(load_bias, phdr_address(elf));
+        let phdr = bias_nonzero_addr(
+            load_bias,
+            phdr_address_checked(elf).expect("validated ELF must have a valid program header"),
+        );
         let max_end_va = map_elf_load_segments(&mut memory_set, elf, load_bias);
         let program_entry = load_bias + elf.header.pt2.entry_point() as usize;
         let mut entry_point = program_entry;
@@ -364,8 +336,7 @@ impl MemorySet {
             // CONTEXT: The loader is placed far above the normal executable
             // image. Heap placement must stay based on the main program, so the
             // interpreter's max VA is intentionally not folded into max_end_va.
-            let _interp_max_end_va =
-                map_elf_load_segments(&mut memory_set, interpreter, DL_INTERP_OFFSET);
+            map_elf_load_segments(&mut memory_set, interpreter, DL_INTERP_OFFSET);
             entry_point = DL_INTERP_OFFSET + interpreter.header.pt2.entry_point() as usize;
             interp_base = DL_INTERP_OFFSET;
         }
@@ -427,7 +398,7 @@ impl MemorySet {
         let mut entry_point = program_entry;
         let mut interp_base = 0usize;
         if let Some((interpreter, interpreter_file, interpreter_file_size)) = interpreter {
-            let _interp_max_end_va = map_elf_load_segments_lazy(
+            map_elf_load_segments_lazy(
                 &mut memory_set,
                 interpreter,
                 interpreter_file,

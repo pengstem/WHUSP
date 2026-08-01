@@ -21,8 +21,6 @@ struct NamedFifoState {
     writers: usize,
 }
 
-impl super::PipeFileCapability for NamedFifoFile {}
-
 impl NamedFifoState {
     fn new() -> Self {
         let (read_end, write_end) = make_pipe(default_pipe_capacity_for_current_process());
@@ -183,8 +181,8 @@ impl File for NamedFifoFile {
         self.peer_readers_closed()
     }
 
-    fn as_pipe(&self) -> Option<&dyn super::PipeFileCapability> {
-        Some(self)
+    fn is_pipe(&self) -> bool {
+        true
     }
 
     fn vfs_node_id(&self) -> Option<VfsNodeId> {

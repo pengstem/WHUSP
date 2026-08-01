@@ -1,4 +1,3 @@
-mod api;
 mod console_tty;
 mod dentry_cache;
 mod devfs;
@@ -37,7 +36,6 @@ use core::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-pub use api::{PipeFileCapability, SocketFileCapability, TtyFileCapability};
 pub(crate) use console_tty::console_tty_drain_uart;
 pub(crate) use console_tty::{
     LinuxTermio, LinuxTermios, LinuxTermios2, LinuxWinsize, TtyId, apply_tty_termio,
@@ -612,14 +610,14 @@ pub trait File: Send + Sync {
     fn socket_write_peer_closed(&self) -> bool {
         false
     }
-    fn as_socket(&self) -> Option<&dyn SocketFileCapability> {
-        None
+    fn is_socket(&self) -> bool {
+        false
     }
-    fn as_pipe(&self) -> Option<&dyn PipeFileCapability> {
-        None
+    fn is_pipe(&self) -> bool {
+        false
     }
-    fn as_tty(&self) -> Option<&dyn TtyFileCapability> {
-        None
+    fn is_tty(&self) -> bool {
+        false
     }
     fn tty_id(&self) -> Option<TtyId> {
         None
@@ -661,7 +659,7 @@ pub trait File: Send + Sync {
         if !self.readable() {
             return false;
         }
-        if self.as_pipe().is_some() || self.as_socket().is_some() {
+        if self.is_pipe() || self.is_socket() {
             return true;
         }
         match self.stat() {
@@ -673,7 +671,7 @@ pub trait File: Send + Sync {
         if !self.writable() {
             return false;
         }
-        if self.as_pipe().is_some() || self.as_socket().is_some() {
+        if self.is_pipe() || self.is_socket() {
             return true;
         }
         match self.stat() {

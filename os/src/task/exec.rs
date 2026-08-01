@@ -529,7 +529,7 @@ impl ProcessControlBlock {
         let trap_cx = TrapContext::app_init_context(
             entry_point,
             user_sp,
-            KERNEL_SPACE.exclusive_access().token(),
+            KERNEL_SPACE.lock().token(),
             task.kstack.get_top(),
             trap_handler as usize,
         );

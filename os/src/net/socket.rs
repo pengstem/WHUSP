@@ -19,7 +19,7 @@ use crate::fs::{
 };
 use crate::mm::UserBuffer;
 use crate::perf;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::syscall::user_ptr::{
     UserBufferAccess, read_user_array_item, translated_byte_buffer_checked_with_mmap_fault,
 };
@@ -50,10 +50,8 @@ const DEFAULT_SOCKET_BUFFER: i32 = 256 * 1024;
 const MAX_LISTEN_BACKLOG: usize = 128;
 
 lazy_static! {
-    static ref LOOPBACK: UPIntrFreeCell<LoopbackState> =
-        unsafe { UPIntrFreeCell::new(LoopbackState::new()) };
-    static ref NETDEV: UPIntrFreeCell<NetDeviceState> =
-        unsafe { UPIntrFreeCell::new(NetDeviceState::new()) };
+    static ref LOOPBACK: SpinNoIrqLock<LoopbackState> = SpinNoIrqLock::new(LoopbackState::new());
+    static ref NETDEV: SpinNoIrqLock<NetDeviceState> = SpinNoIrqLock::new(NetDeviceState::new());
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -255,15 +253,12 @@ impl NetDeviceState {
 
 pub(crate) fn netdev_if_index(name: &[u8]) -> Option<i32> {
     let name = core::str::from_utf8(name).ok()?;
-    NETDEV
-        .exclusive_access()
-        .find_by_name(name)
-        .map(|iface| iface.index)
+    NETDEV.lock().find_by_name(name).map(|iface| iface.index)
 }
 
 pub(crate) fn netdev_if_name(index: i32) -> Option<String> {
     NETDEV
-        .exclusive_access()
+        .lock()
         .find_by_index(index)
         .map(|iface| iface.name.clone())
 }
@@ -271,14 +266,14 @@ pub(crate) fn netdev_if_name(index: i32) -> Option<String> {
 pub(crate) fn netdev_if_flags(name: &[u8]) -> Option<i16> {
     let name = core::str::from_utf8(name).ok()?;
     NETDEV
-        .exclusive_access()
+        .lock()
         .find_by_name(name)
         .map(|iface| iface.flags as i16)
 }
 
 pub(crate) fn netdev_ifconf() -> Vec<(String, i32)> {
     NETDEV
-        .exclusive_access()
+        .lock()
         .snapshot()
         .into_iter()
         .map(|iface| (iface.name, iface.index))
@@ -286,17 +281,13 @@ pub(crate) fn netdev_ifconf() -> Vec<(String, i32)> {
 }
 
 fn netdev_has_ipv4_address(ip: [u8; 4]) -> bool {
-    NETDEV
-        .exclusive_access()
-        .snapshot()
-        .into_iter()
-        .any(|iface| {
-            iface.addrs.iter().any(|addr| {
-                addr.family == AF_INET as u8
-                    && addr.address.len() == 4
-                    && addr.address.as_slice() == ip.as_slice()
-            })
+    NETDEV.lock().snapshot().into_iter().any(|iface| {
+        iface.addrs.iter().any(|addr| {
+            addr.family == AF_INET as u8
+                && addr.address.len() == 4
+                && addr.address.as_slice() == ip.as_slice()
         })
+    })
 }
 
 #[derive(Clone)]
@@ -313,8 +304,8 @@ struct LocalSocketInner {
     peer: Option<InetEndpoint>,
     unix_local: Option<UnixAddress>,
     unix_peer: Option<UnixAddress>,
-    peer_socket: Option<Weak<UPIntrFreeCell<LocalSocketInner>>>,
-    accept_queue: VecDeque<Arc<UPIntrFreeCell<LocalSocketInner>>>,
+    peer_socket: Option<Weak<SpinNoIrqLock<LocalSocketInner>>>,
+    accept_queue: VecDeque<Arc<SpinNoIrqLock<LocalSocketInner>>>,
     stream_rx: VecDeque<u8>,
     datagram_rx: VecDeque<Datagram>,
     datagram_rx_bytes: usize,
@@ -336,16 +327,16 @@ struct LocalSocketInner {
 }
 
 pub struct LocalSocket {
-    inner: Arc<UPIntrFreeCell<LocalSocketInner>>,
-    status_flags: UPIntrFreeCell<OpenFlags>,
+    inner: Arc<SpinNoIrqLock<LocalSocketInner>>,
+    status_flags: SpinNoIrqLock<OpenFlags>,
 }
 
 struct LoopbackState {
     next_ephemeral: u16,
-    tcp_listeners: BTreeMap<u16, Weak<UPIntrFreeCell<LocalSocketInner>>>,
+    tcp_listeners: BTreeMap<u16, Weak<SpinNoIrqLock<LocalSocketInner>>>,
     tcp_connect_waiters: BTreeMap<u16, VecDeque<Arc<TaskControlBlock>>>,
-    udp_bound: BTreeMap<u16, Vec<Weak<UPIntrFreeCell<LocalSocketInner>>>>,
-    unix_bound: BTreeMap<UnixAddress, Weak<UPIntrFreeCell<LocalSocketInner>>>,
+    udp_bound: BTreeMap<u16, Vec<Weak<SpinNoIrqLock<LocalSocketInner>>>>,
+    unix_bound: BTreeMap<UnixAddress, Weak<SpinNoIrqLock<LocalSocketInner>>>,
 }
 
 impl LoopbackState {
@@ -446,7 +437,7 @@ impl LocalSocketInner {
         kind: SocketKind,
         local: InetEndpoint,
         peer: InetEndpoint,
-        peer_socket: Option<Weak<UPIntrFreeCell<LocalSocketInner>>>,
+        peer_socket: Option<Weak<SpinNoIrqLock<LocalSocketInner>>>,
         shutdown: ShutdownState,
         unix_local: Option<UnixAddress>,
         unix_peer: Option<UnixAddress>,
@@ -526,12 +517,12 @@ fn remove_socket_waiter(queue: &mut VecDeque<Arc<TaskControlBlock>>, task: &Arc<
 }
 
 enum TcpConnectWait {
-    Listener(Arc<UPIntrFreeCell<LocalSocketInner>>),
+    Listener(Arc<SpinNoIrqLock<LocalSocketInner>>),
     Blocked(*mut crate::task::TaskContext),
 }
 
 fn find_tcp_listener_or_block(port: u16, deadline_ms: usize) -> KResult<TcpConnectWait> {
-    let mut loopback = LOOPBACK.exclusive_access();
+    let mut loopback = LOOPBACK.lock();
     loopback.prune();
     if let Some(listener) = loopback.tcp_listeners.get(&port).and_then(Weak::upgrade) {
         return Ok(TcpConnectWait::Listener(listener));
@@ -548,7 +539,7 @@ fn find_tcp_listener_or_block(port: u16, deadline_ms: usize) -> KResult<TcpConne
 }
 
 fn remove_tcp_connect_waiter(port: u16, task: &Arc<TaskControlBlock>) {
-    let mut loopback = LOOPBACK.exclusive_access();
+    let mut loopback = LOOPBACK.lock();
     let remove_empty = if let Some(waiters) = loopback.tcp_connect_waiters.get_mut(&port) {
         remove_socket_waiter(waiters, task);
         waiters.is_empty()
@@ -624,16 +615,16 @@ fn copy_stream_slices_to_user_buffer(
 }
 
 fn drain_socket_write_poll_waiters(
-    socket: &Arc<UPIntrFreeCell<LocalSocketInner>>,
+    socket: &Arc<SpinNoIrqLock<LocalSocketInner>>,
 ) -> Vec<Arc<PollWaiter>> {
-    socket.exclusive_access().write_poll_waiters.drain()
+    socket.lock().write_poll_waiters.drain()
 }
 
 impl LocalSocket {
     pub(crate) fn new(domain: SocketDomain, kind: SocketKind, flags: OpenFlags) -> Arc<Self> {
         Arc::new(Self {
-            inner: Arc::new(unsafe { UPIntrFreeCell::new(LocalSocketInner::new(domain, kind)) }),
-            status_flags: unsafe { UPIntrFreeCell::new(flags) },
+            inner: Arc::new(SpinNoIrqLock::new(LocalSocketInner::new(domain, kind))),
+            status_flags: SpinNoIrqLock::new(flags),
         })
     }
 
@@ -642,31 +633,27 @@ impl LocalSocket {
             ip: LOOPBACK_IP,
             port: 0,
         };
-        let first_inner = Arc::new(unsafe {
-            UPIntrFreeCell::new(LocalSocketInner::connected(
-                SocketDomain::Unix,
-                kind,
-                endpoint,
-                endpoint,
-                None,
-                ShutdownState::OPEN,
-                None,
-                None,
-            ))
-        });
-        let second_inner = Arc::new(unsafe {
-            UPIntrFreeCell::new(LocalSocketInner::connected(
-                SocketDomain::Unix,
-                kind,
-                endpoint,
-                endpoint,
-                Some(Arc::downgrade(&first_inner)),
-                ShutdownState::OPEN,
-                None,
-                None,
-            ))
-        });
-        first_inner.exclusive_access().peer_socket = Some(Arc::downgrade(&second_inner));
+        let first_inner = Arc::new(SpinNoIrqLock::new(LocalSocketInner::connected(
+            SocketDomain::Unix,
+            kind,
+            endpoint,
+            endpoint,
+            None,
+            ShutdownState::OPEN,
+            None,
+            None,
+        )));
+        let second_inner = Arc::new(SpinNoIrqLock::new(LocalSocketInner::connected(
+            SocketDomain::Unix,
+            kind,
+            endpoint,
+            endpoint,
+            Some(Arc::downgrade(&first_inner)),
+            ShutdownState::OPEN,
+            None,
+            None,
+        )));
+        first_inner.lock().peer_socket = Some(Arc::downgrade(&second_inner));
 
         (
             Self::from_inner(first_inner, flags),
@@ -674,23 +661,23 @@ impl LocalSocket {
         )
     }
 
-    fn from_inner(inner: Arc<UPIntrFreeCell<LocalSocketInner>>, flags: OpenFlags) -> Arc<Self> {
+    fn from_inner(inner: Arc<SpinNoIrqLock<LocalSocketInner>>, flags: OpenFlags) -> Arc<Self> {
         Arc::new(Self {
             inner,
-            status_flags: unsafe { UPIntrFreeCell::new(flags) },
+            status_flags: SpinNoIrqLock::new(flags),
         })
     }
 
     pub(crate) fn kind(&self) -> SocketKind {
-        self.inner.exclusive_access().kind
+        self.inner.lock().kind
     }
 
     pub(crate) fn domain(&self) -> SocketDomain {
-        self.inner.exclusive_access().domain
+        self.inner.lock().domain
     }
 
     pub(crate) fn bind_address(&self, address: SocketAddress) -> KResult {
-        let domain = self.inner.exclusive_access().domain;
+        let domain = self.inner.lock().domain;
         match (domain, address) {
             (SocketDomain::Inet, SocketAddress::Inet(endpoint)) => self.bind_endpoint(endpoint),
             (SocketDomain::Inet6, SocketAddress::Inet6(endpoint)) => self.bind_endpoint(endpoint),
@@ -709,9 +696,9 @@ impl LocalSocket {
         if endpoint.port != 0 && endpoint.port < 1024 && current_process().credentials().euid != 0 {
             return Err(Errno::EACCES);
         }
-        let mut loopback = LOOPBACK.exclusive_access();
+        let mut loopback = LOOPBACK.lock();
         loopback.prune();
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         if inner.local.is_some() {
             return Err(Errno::EINVAL);
         }
@@ -750,13 +737,13 @@ impl LocalSocket {
 
     fn bind_unix(&self, address: UnixAddress) -> KResult {
         {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             if inner.local.is_some() {
                 return Err(Errno::EINVAL);
             }
         }
         {
-            let mut loopback = LOOPBACK.exclusive_access();
+            let mut loopback = LOOPBACK.lock();
             loopback.prune();
             if loopback
                 .unix_bound
@@ -769,13 +756,13 @@ impl LocalSocket {
         if let UnixAddress::Pathname(path) = &address {
             create_unix_path_node(path)?;
         }
-        let mut loopback = LOOPBACK.exclusive_access();
+        let mut loopback = LOOPBACK.lock();
         loopback.prune();
         let endpoint = InetEndpoint {
             ip: LOOPBACK_IP,
             port: loopback.alloc_port(),
         };
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         match inner.kind {
             SocketKind::Stream => {}
             SocketKind::Datagram => {
@@ -796,7 +783,7 @@ impl LocalSocket {
 
     fn ensure_bound(&self, kind: SocketKind) -> KResult<InetEndpoint> {
         {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             if let Some(local) = inner.local {
                 return Ok(local);
             }
@@ -804,7 +791,7 @@ impl LocalSocket {
                 return Err(Errno::EINVAL);
             }
         }
-        let mut loopback = LOOPBACK.exclusive_access();
+        let mut loopback = LOOPBACK.lock();
         loopback.prune();
         let endpoint = InetEndpoint {
             ip: LOOPBACK_IP,
@@ -817,7 +804,7 @@ impl LocalSocket {
                 .or_default()
                 .push(Arc::downgrade(&self.inner));
         }
-        self.inner.exclusive_access().local = Some(endpoint);
+        self.inner.lock().local = Some(endpoint);
         Ok(endpoint)
     }
 
@@ -825,12 +812,12 @@ impl LocalSocket {
         let backlog = backlog.clamp(1, MAX_LISTEN_BACKLOG as i32) as usize;
         let local = self.ensure_bound(SocketKind::Stream)?;
         {
-            let mut inner = self.inner.exclusive_access();
+            let mut inner = self.inner.lock();
             inner.listening = true;
             inner.listen_backlog = backlog;
         }
         let connect_waiters = {
-            let mut loopback = LOOPBACK.exclusive_access();
+            let mut loopback = LOOPBACK.lock();
             loopback.prune();
             loopback
                 .tcp_listeners
@@ -847,7 +834,7 @@ impl LocalSocket {
     pub(crate) fn accept(&self, nonblock: bool) -> KResult<Arc<LocalSocket>> {
         loop {
             let task_cx_ptr = {
-                let mut inner = self.inner.exclusive_access();
+                let mut inner = self.inner.lock();
                 if inner.kind != SocketKind::Stream {
                     return Err(Errno::ENOTSUP);
                 }
@@ -877,18 +864,16 @@ impl LocalSocket {
                     // a closed placeholder lets the signal handler run and the
                     // server loop observe `times_up` without leaking a listener.
                     return Ok(Self::from_inner(
-                        Arc::new(unsafe {
-                            UPIntrFreeCell::new(LocalSocketInner::connected(
-                                SocketDomain::Inet,
-                                SocketKind::Stream,
-                                local,
-                                peer,
-                                None,
-                                ShutdownState::CLOSED,
-                                None,
-                                None,
-                            ))
-                        }),
+                        Arc::new(SpinNoIrqLock::new(LocalSocketInner::connected(
+                            SocketDomain::Inet,
+                            SocketKind::Stream,
+                            local,
+                            peer,
+                            None,
+                            ShutdownState::CLOSED,
+                            None,
+                            None,
+                        ))),
                         OpenFlags::RDWR,
                     ));
                 }
@@ -907,7 +892,7 @@ impl LocalSocket {
         match self.kind() {
             SocketKind::Datagram => {
                 self.ensure_bound(SocketKind::Datagram)?;
-                let mut inner = self.inner.exclusive_access();
+                let mut inner = self.inner.lock();
                 inner.peer = Some(remote);
                 inner.unix_peer = unix_peer;
                 Ok(0)
@@ -918,17 +903,17 @@ impl LocalSocket {
 
     fn connect_stream(&self, remote: InetEndpoint, unix_peer: Option<UnixAddress>) -> KResult {
         {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             if inner.peer.is_some() {
                 return Err(Errno::EISCONN);
             }
         }
         let mut local = self.ensure_bound(SocketKind::Stream)?;
         if local.port == 0 {
-            let mut loopback = LOOPBACK.exclusive_access();
+            let mut loopback = LOOPBACK.lock();
             loopback.prune();
             local.port = loopback.alloc_port();
-            self.inner.exclusive_access().local = Some(local);
+            self.inner.lock().local = Some(local);
         }
         let connect_deadline_ms = get_time_ms() + 1000;
         let listener = loop {
@@ -949,27 +934,25 @@ impl LocalSocket {
                 TcpConnectWait::Blocked(task_cx_ptr) => schedule(task_cx_ptr),
             }
         };
-        let listener_unix_local = listener.exclusive_access().unix_local.clone();
+        let listener_unix_local = listener.lock().unix_local.clone();
         let (domain, client_unix_local) = {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             (inner.domain, inner.unix_local.clone())
         };
 
-        let server_inner = Arc::new(unsafe {
-            UPIntrFreeCell::new(LocalSocketInner::connected(
-                domain,
-                SocketKind::Stream,
-                remote,
-                local,
-                Some(Arc::downgrade(&self.inner)),
-                ShutdownState::OPEN,
-                listener_unix_local,
-                client_unix_local,
-            ))
-        });
+        let server_inner = Arc::new(SpinNoIrqLock::new(LocalSocketInner::connected(
+            domain,
+            SocketKind::Stream,
+            remote,
+            local,
+            Some(Arc::downgrade(&self.inner)),
+            ShutdownState::OPEN,
+            listener_unix_local,
+            client_unix_local,
+        )));
 
         let (reader, read_waiters) = {
-            let mut listener = listener.exclusive_access();
+            let mut listener = listener.lock();
             if !listener.listening
                 || listener.read_shutdown
                 || listener.accept_queue.len() >= listener.listen_backlog.max(1)
@@ -977,7 +960,7 @@ impl LocalSocket {
                 return Err(Errno::ECONNREFUSED);
             }
             {
-                let mut client = self.inner.exclusive_access();
+                let mut client = self.inner.lock();
                 client.peer = Some(remote);
                 client.unix_peer = unix_peer;
                 client.peer_socket = Some(Arc::downgrade(&server_inner));
@@ -994,7 +977,7 @@ impl LocalSocket {
         &self,
         address: SocketAddress,
     ) -> KResult<(InetEndpoint, Option<UnixAddress>)> {
-        let domain = self.inner.exclusive_access().domain;
+        let domain = self.inner.lock().domain;
         match (domain, address) {
             (SocketDomain::Inet, SocketAddress::Inet(mut endpoint)) => {
                 normalize_remote_endpoint(&mut endpoint)?;
@@ -1037,7 +1020,7 @@ impl LocalSocket {
         let mut written = 0usize;
         while written < data.len() {
             let (connected, peer) = {
-                let inner = self.inner.exclusive_access();
+                let inner = self.inner.lock();
                 if inner.write_shutdown {
                     return Err(Errno::EPIPE);
                 }
@@ -1053,7 +1036,7 @@ impl LocalSocket {
                     Errno::ENOTCONN
                 });
             };
-            let mut peer_inner = peer.exclusive_access();
+            let mut peer_inner = peer.lock();
             if peer_inner.read_shutdown {
                 return Err(Errno::EPIPE);
             }
@@ -1100,7 +1083,7 @@ impl LocalSocket {
 
         while written < total_len {
             let (connected, peer) = {
-                let inner = self.inner.exclusive_access();
+                let inner = self.inner.lock();
                 if inner.write_shutdown {
                     return Err(Errno::EPIPE);
                 }
@@ -1116,7 +1099,7 @@ impl LocalSocket {
                     Errno::ENOTCONN
                 });
             };
-            let mut peer_inner = peer.exclusive_access();
+            let mut peer_inner = peer.lock();
             if peer_inner.read_shutdown {
                 return Err(Errno::EPIPE);
             }
@@ -1176,7 +1159,7 @@ impl LocalSocket {
 
     fn stream_write_peer_closed(&self) -> bool {
         let (kind, listening, write_shutdown, connected, peer) = {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             (
                 inner.kind,
                 inner.listening,
@@ -1192,7 +1175,7 @@ impl LocalSocket {
             return true;
         }
         match peer {
-            Some(peer) => peer.exclusive_access().read_shutdown,
+            Some(peer) => peer.lock().read_shutdown,
             None => connected,
         }
     }
@@ -1204,14 +1187,14 @@ impl LocalSocket {
         nonblock: bool,
     ) -> KResult<usize> {
         perf::record_local_socket_write_call();
-        if self.inner.exclusive_access().domain == SocketDomain::Netlink {
+        if self.inner.lock().domain == SocketDomain::Netlink {
             return self.send_netlink_route(&data);
         }
         let local = self.ensure_bound(SocketKind::Datagram)?;
-        let local_unix = self.inner.exclusive_access().unix_local.clone();
+        let local_unix = self.inner.lock().unix_local.clone();
         let connected_peer = if remote.is_none() {
             self.inner
-                .exclusive_access()
+                .lock()
                 .peer_socket
                 .as_ref()
                 .and_then(Weak::upgrade)
@@ -1221,7 +1204,7 @@ impl LocalSocket {
         if let Some(peer) = connected_peer {
             let data_len = data.len();
             loop {
-                let mut peer = peer.exclusive_access();
+                let mut peer = peer.lock();
                 if peer.read_shutdown {
                     return Err(Errno::EPIPE);
                 }
@@ -1257,14 +1240,10 @@ impl LocalSocket {
         }
         let remote = match remote {
             Some(remote) => self.resolve_remote_address(remote)?.0,
-            None => self
-                .inner
-                .exclusive_access()
-                .peer
-                .ok_or(Errno::EDESTADDRREQ)?,
+            None => self.inner.lock().peer.ok_or(Errno::EDESTADDRREQ)?,
         };
         let candidates = {
-            let mut loopback = LOOPBACK.exclusive_access();
+            let mut loopback = LOOPBACK.lock();
             loopback.prune();
             loopback
                 .udp_bound
@@ -1275,7 +1254,7 @@ impl LocalSocket {
         let mut fallback = None;
         let mut target = None;
         for candidate in candidates {
-            let peer = { candidate.exclusive_access().peer };
+            let peer = { candidate.lock().peer };
             if peer == Some(local) {
                 target = Some(candidate);
                 break;
@@ -1286,7 +1265,7 @@ impl LocalSocket {
         }
         let target = target.or(fallback);
         if let Some(target) = target {
-            let mut target = target.exclusive_access();
+            let mut target = target.lock();
             let data_len = data.len();
             if target.can_enqueue_datagram(data_len) {
                 target.enqueue_datagram(Datagram {
@@ -1312,7 +1291,7 @@ impl LocalSocket {
     fn send_netlink_route(&self, request: &[u8]) -> KResult<usize> {
         let responses = build_netlink_route_responses(request)?;
         let read_waiters = {
-            let mut inner = self.inner.exclusive_access();
+            let mut inner = self.inner.lock();
             for data in responses {
                 inner.enqueue_datagram(Datagram {
                     data,
@@ -1345,7 +1324,7 @@ impl LocalSocket {
         let mut buf = buf;
         let want = buf.len();
         loop {
-            let mut inner = self.inner.exclusive_access();
+            let mut inner = self.inner.lock();
             if want == 0 {
                 return Ok(0);
             }
@@ -1395,7 +1374,7 @@ impl LocalSocket {
     ) -> KResult<(usize, Option<SocketAddress>)> {
         loop {
             let (packet, peer, writer, write_waiters, domain) = {
-                let mut inner = self.inner.exclusive_access();
+                let mut inner = self.inner.lock();
                 let peer = inner.peer_socket.as_ref().and_then(Weak::upgrade);
                 let peer_is_self = peer
                     .as_ref()
@@ -1436,12 +1415,12 @@ impl LocalSocket {
             }
             if current_has_unmasked_signal() {
                 if let Some(task) = current_task() {
-                    self.inner.exclusive_access().remove_reader(&task);
+                    self.inner.lock().remove_reader(&task);
                 }
                 return Err(Errno::EINTR);
             }
             let task_cx_ptr = {
-                let mut inner = self.inner.exclusive_access();
+                let mut inner = self.inner.lock();
                 perf::record_local_socket_reader_sleep();
                 inner.sleep_reader()
             };
@@ -1455,7 +1434,7 @@ impl LocalSocket {
     pub(crate) fn recv_raw_datagram(&self, nonblock: bool) -> KResult<Vec<u8>> {
         loop {
             let (packet, writer, write_waiters) = {
-                let mut inner = self.inner.exclusive_access();
+                let mut inner = self.inner.lock();
                 (
                     inner.pop_datagram(),
                     inner.wake_writer(),
@@ -1472,12 +1451,12 @@ impl LocalSocket {
             }
             if current_has_unmasked_signal() {
                 if let Some(task) = current_task() {
-                    self.inner.exclusive_access().remove_reader(&task);
+                    self.inner.lock().remove_reader(&task);
                 }
                 return Err(Errno::EINTR);
             }
             let task_cx_ptr = {
-                let mut inner = self.inner.exclusive_access();
+                let mut inner = self.inner.lock();
                 perf::record_local_socket_reader_sleep();
                 inner.sleep_reader()
             };
@@ -1489,7 +1468,7 @@ impl LocalSocket {
     }
 
     pub(crate) fn local_address(&self) -> SocketAddress {
-        let inner = self.inner.exclusive_access();
+        let inner = self.inner.lock();
         match inner.domain {
             SocketDomain::Inet => SocketAddress::Inet(inner.local.unwrap_or(InetEndpoint {
                 ip: ANY_IP,
@@ -1512,7 +1491,7 @@ impl LocalSocket {
     }
 
     pub(crate) fn peer_address(&self) -> KResult<SocketAddress> {
-        let inner = self.inner.exclusive_access();
+        let inner = self.inner.lock();
         let peer = inner.peer.ok_or(Errno::ENOTCONN)?;
         Ok(match inner.domain {
             SocketDomain::Inet => SocketAddress::Inet(peer),
@@ -1527,15 +1506,15 @@ impl LocalSocket {
     }
 
     pub(crate) fn set_reuse_addr(&self, enabled: bool) {
-        self.inner.exclusive_access().reuse_addr = enabled;
+        self.inner.lock().reuse_addr = enabled;
     }
 
     pub(crate) fn set_bind_address_no_port(&self, enabled: bool) {
-        self.inner.exclusive_access().bind_address_no_port = enabled;
+        self.inner.lock().bind_address_no_port = enabled;
     }
 
     pub(crate) fn set_buffer_size(&self, optname: i32, value: i32) {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         match optname {
             SO_SNDBUF => inner.sndbuf = value,
             SO_RCVBUF => inner.rcvbuf = value,
@@ -1544,7 +1523,7 @@ impl LocalSocket {
     }
 
     pub(crate) fn ensure_packet_domain(&self) -> KResult<()> {
-        (self.inner.exclusive_access().domain == SocketDomain::Packet)
+        (self.inner.lock().domain == SocketDomain::Packet)
             .then_some(())
             .ok_or(Errno::ENOPROTOOPT)
     }
@@ -1554,7 +1533,7 @@ impl LocalSocket {
         if !(TPACKET_V1..=TPACKET_V3).contains(&version) {
             return Err(Errno::EINVAL);
         }
-        self.inner.exclusive_access().packet_version = version;
+        self.inner.lock().packet_version = version;
         Ok(())
     }
 
@@ -1563,7 +1542,7 @@ impl LocalSocket {
         // CONTEXT: Packet mmap buffers are not allocated by this kernel. Cap
         // the visible reserve to one page so CVE probes cannot observe a
         // reserve larger than the accepted test ring block.
-        self.inner.exclusive_access().packet_reserve = reserve.min(PAGE_SIZE as u32);
+        self.inner.lock().packet_reserve = reserve.min(PAGE_SIZE as u32);
         Ok(())
     }
 
@@ -1579,13 +1558,13 @@ impl LocalSocket {
             // still accepting the multi-block ring cases that require success.
             return Err(Errno::EINVAL);
         }
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         inner.packet_reserve = inner.packet_reserve.min(req.tp_block_size);
         Ok(())
     }
 
     pub(crate) fn get_int_option(&self, level: i32, optname: i32) -> KResult<i32> {
-        let inner = self.inner.exclusive_access();
+        let inner = self.inner.lock();
         match (level, optname) {
             (SOL_SOCKET, SO_TYPE) => Ok(match inner.kind {
                 SocketKind::Stream => SOCK_STREAM,
@@ -1620,7 +1599,7 @@ impl LocalSocket {
             return Err(Errno::EINVAL);
         }
         let (peer, readers, writers, read_waiters, write_waiters) = {
-            let mut inner = self.inner.exclusive_access();
+            let mut inner = self.inner.lock();
             if matches!(how, SHUT_RD | SHUT_RDWR) {
                 inner.read_shutdown = true;
             }
@@ -1643,7 +1622,7 @@ impl LocalSocket {
             && let Some(peer) = peer
         {
             let (readers, read_waiters) = {
-                let mut peer = peer.exclusive_access();
+                let mut peer = peer.lock();
                 peer.peer_write_shutdown = true;
                 (peer.wake_all_readers(), peer.read_poll_waiters.drain())
             };
@@ -1668,7 +1647,7 @@ impl Drop for LocalSocket {
             read_waiters,
             write_waiters,
         ) = {
-            let mut inner = self.inner.exclusive_access();
+            let mut inner = self.inner.lock();
             inner.read_shutdown = true;
             inner.write_shutdown = true;
             (
@@ -1690,7 +1669,7 @@ impl Drop for LocalSocket {
         PollWaiter::wake_all(write_waiters);
         if let Some(peer) = peer {
             let (readers, read_waiters) = {
-                let mut peer = peer.exclusive_access();
+                let mut peer = peer.lock();
                 peer.peer_write_shutdown = true;
                 (peer.wake_all_readers(), peer.read_poll_waiters.drain())
             };
@@ -1698,7 +1677,7 @@ impl Drop for LocalSocket {
             PollWaiter::wake_all(read_waiters);
         }
         if let Some(local) = local {
-            let mut loopback = LOOPBACK.exclusive_access();
+            let mut loopback = LOOPBACK.lock();
             match kind {
                 SocketKind::Stream if listening => {
                     loopback.tcp_listeners.remove(&local.port);
@@ -1831,12 +1810,12 @@ fn create_unix_path_node(path: &str) -> KResult<()> {
 
 fn lookup_unix_endpoint(address: &UnixAddress) -> KResult<InetEndpoint> {
     let target = {
-        let mut loopback = LOOPBACK.exclusive_access();
+        let mut loopback = LOOPBACK.lock();
         loopback.prune();
         loopback.unix_bound.get(address).and_then(Weak::upgrade)
     };
     match target {
-        Some(socket) => socket.exclusive_access().local.ok_or(Errno::ECONNREFUSED),
+        Some(socket) => socket.lock().local.ok_or(Errno::ECONNREFUSED),
         None => match address {
             UnixAddress::Pathname(_) => Err(Errno::ENOENT),
             UnixAddress::Abstract(_) => Err(Errno::ECONNREFUSED),

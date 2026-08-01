@@ -116,11 +116,11 @@ fn write_tracee_word(tracee: &Arc<ProcessControlBlock>, addr: usize, data: usize
     Ok(0)
 }
 
-fn validate_user_area_offset(addr: usize) -> KResult {
+fn validate_user_area_offset(addr: usize) -> KResult<()> {
     if addr % size_of::<usize>() != 0 || addr >= PTRACE_USER_AREA_SIZE {
         return Err(Errno::EIO);
     }
-    Ok(0)
+    Ok(())
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -310,7 +310,8 @@ pub fn sys_ptrace(request: usize, pid: isize, addr: usize, data: usize) -> KResu
         }
         PTRACE_POKEUSER => {
             ptrace_validate_tracee(&tracee, tracer_pid, true)?;
-            validate_user_area_offset(addr)
+            validate_user_area_offset(addr)?;
+            Ok(0)
         }
         PTRACE_GETREGS => {
             let task = ptrace_validate_tracee(&tracee, tracer_pid, true)?;

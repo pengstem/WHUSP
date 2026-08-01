@@ -1,10 +1,10 @@
-use crate::sync::UPIntrFreeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::task::{TaskControlBlock, block_current_task_no_schedule, schedule, wakeup_task};
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 
 struct PageCacheWaitGate {
-    inner: UPIntrFreeCell<PageCacheWaitGateInner>,
+    inner: SpinNoIrqLock<PageCacheWaitGateInner>,
 }
 
 struct PageCacheWaitGateInner {
@@ -15,18 +15,16 @@ struct PageCacheWaitGateInner {
 impl PageCacheWaitGate {
     fn new() -> Self {
         Self {
-            inner: unsafe {
-                UPIntrFreeCell::new(PageCacheWaitGateInner {
-                    complete: false,
-                    waiters: VecDeque::new(),
-                })
-            },
+            inner: SpinNoIrqLock::new(PageCacheWaitGateInner {
+                complete: false,
+                waiters: VecDeque::new(),
+            }),
         }
     }
 
     /// Waits for the owner without a completion-before-enqueue lost wake.
     fn wait(&self) {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         if inner.complete {
             return;
         }
@@ -38,7 +36,7 @@ impl PageCacheWaitGate {
 
     /// Publishes completion and wakes every task that joined this load.
     fn complete(&self) {
-        let waiters = self.inner.exclusive_session(|inner| {
+        let waiters = self.inner.with_lock(|inner| {
             if inner.complete {
                 return VecDeque::new();
             }

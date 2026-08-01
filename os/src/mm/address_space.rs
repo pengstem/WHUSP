@@ -216,7 +216,7 @@ impl AddressSpaceControl {
             0,
             "fresh TLB publication size is not page aligned"
         );
-        let _generation = self.publish_tlb_generation();
+        self.publish_tlb_generation();
         let active = self.active_cpus.load(Ordering::SeqCst);
         let current = crate::cpu::current_id();
         assert!(

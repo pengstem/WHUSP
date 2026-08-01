@@ -3,7 +3,10 @@ use crate::task::{current_process, current_user_token};
 use crate::timer::get_time_us;
 use alloc::sync::Arc;
 
-use super::super::time::{ClockBackend, LinuxITimerSpec, current_clock_nanos, timespec_to_nanos};
+use super::super::time::{
+    ClockBackend, LinuxITimerSpec, current_clock_nanos, nanos_to_us_ceil, timespec_to_nanos,
+    timespec_to_us_ceil, us_to_timespec,
+};
 use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{read_user_value, write_user_value};
 use super::fd::get_file_by_fd;
@@ -22,8 +25,8 @@ const CLOCK_BOOTTIME: i32 = 7;
 const CLOCK_REALTIME_ALARM: i32 = 8;
 const CLOCK_BOOTTIME_ALARM: i32 = 9;
 
-fn open_flags_from_fd_flags(flags: u32, valid_flags: u32) -> KResult<OpenFlags> {
-    if flags & !valid_flags != 0 {
+fn timerfd_open_flags(flags: u32) -> KResult<OpenFlags> {
+    if flags & !TIMERFD_VALID_FLAGS != 0 {
         return Err(Errno::EINVAL);
     }
 
@@ -39,7 +42,7 @@ fn open_flags_from_fd_flags(flags: u32, valid_flags: u32) -> KResult<OpenFlags> 
 
 pub fn sys_timerfd_create(clockid: i32, flags: u32) -> KResult {
     let clock = timerfd_clock_from_id(clockid)?;
-    let open_flags = open_flags_from_fd_flags(flags, TIMERFD_VALID_FLAGS)?;
+    let open_flags = timerfd_open_flags(flags)?;
     install_file_fd(make_timerfd(clock), open_flags, None)
 }
 
@@ -72,29 +75,10 @@ fn timerfd_backend(clock: TimerFdClock) -> ClockBackend {
     }
 }
 
-fn nanos_to_us_ceil(nanos: u64) -> KResult<usize> {
-    let us = nanos / 1_000 + if nanos % 1_000 == 0 { 0 } else { 1 };
-    if us > usize::MAX as u64 {
-        return Err(Errno::EINVAL);
-    }
-    Ok(us as usize)
-}
-
-fn timespec_to_us_ceil(time: LinuxTimeSpec) -> KResult<usize> {
-    nanos_to_us_ceil(timespec_to_nanos(time)?)
-}
-
-fn timespec_from_us(us: usize) -> LinuxTimeSpec {
-    LinuxTimeSpec {
-        tv_sec: (us / 1_000_000) as isize,
-        tv_nsec: ((us % 1_000_000) * 1_000) as isize,
-    }
-}
-
 fn itimerspec_from_us(interval_us: usize, value_us: usize) -> LinuxITimerSpec {
     LinuxITimerSpec {
-        it_interval: timespec_from_us(interval_us),
-        it_value: timespec_from_us(value_us),
+        it_interval: us_to_timespec(interval_us),
+        it_value: us_to_timespec(value_us),
     }
 }
 
