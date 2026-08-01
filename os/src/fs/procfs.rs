@@ -21,7 +21,6 @@ use crate::drivers::block_cache;
 use crate::mm::frame_cache_stats;
 use crate::mm::{VirtAddr, exec_load_stats_content, frame_stats};
 use crate::perf;
-use crate::syscall::keyring;
 use crate::syscall::{
     INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES,
     fanotify_evict_evictable_marks, fanotify_fdinfo, fanotify_max_queued_events, inotify_fdinfo,
@@ -72,13 +71,6 @@ const SYS_NET_IPV4_CONF_DEFAULT_TAG_INO: u32 = 22;
 const SYS_NET_CORE_DIR_INO: u32 = 80;
 const SYS_NET_CORE_BUSY_READ_INO: u32 = 81;
 const SYS_NET_CORE_BUSY_POLL_INO: u32 = 82;
-const KEY_USERS_INO: u32 = 23;
-const SYS_KERNEL_KEYS_DIR_INO: u32 = 24;
-const KEYS_GC_DELAY_INO: u32 = 25;
-const KEYS_MAXKEYS_INO: u32 = 26;
-const KEYS_MAXBYTES_INO: u32 = 27;
-const KEYS_ROOT_MAXKEYS_INO: u32 = 62;
-const KEYS_ROOT_MAXBYTES_INO: u32 = 63;
 const MODULES_INO: u32 = 64;
 const SYS_USER_DIR_INO: u32 = 65;
 const MAX_USER_NAMESPACES_INO: u32 = 66;
@@ -208,14 +200,12 @@ enum ProcNode {
     Mounts,
     Filesystems,
     Modules,
-    KeyUsers,
     Meminfo,
     Uptime,
     Cpuinfo,
     Stat,
     SysDir,
     SysKernelDir,
-    SysKernelKeysDir,
     SysUserDir,
     SysFsDir,
     SysFsFanotifyDir,
@@ -242,11 +232,6 @@ enum ProcNode {
     NetIpv4ConfDefaultTag,
     NetCoreBusyRead,
     NetCoreBusyPoll,
-    KeysGcDelay,
-    KeysMaxkeys,
-    KeysMaxbytes,
-    KeysRootMaxkeys,
-    KeysRootMaxbytes,
     MaxUserNamespaces,
     CorePattern,
     DropCaches,
@@ -524,14 +509,12 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         MOUNTS_INO => Some(ProcNode::Mounts),
         FILESYSTEMS_INO => Some(ProcNode::Filesystems),
         MODULES_INO => Some(ProcNode::Modules),
-        KEY_USERS_INO => Some(ProcNode::KeyUsers),
         MEMINFO_INO => Some(ProcNode::Meminfo),
         UPTIME_INO => Some(ProcNode::Uptime),
         CPUINFO_INO => Some(ProcNode::Cpuinfo),
         STAT_INO => Some(ProcNode::Stat),
         SYS_DIR_INO => Some(ProcNode::SysDir),
         SYS_KERNEL_DIR_INO => Some(ProcNode::SysKernelDir),
-        SYS_KERNEL_KEYS_DIR_INO => Some(ProcNode::SysKernelKeysDir),
         SYS_USER_DIR_INO => Some(ProcNode::SysUserDir),
         MAX_USER_NAMESPACES_INO => Some(ProcNode::MaxUserNamespaces),
         PID_MAX_INO => Some(ProcNode::PidMax),
@@ -568,11 +551,6 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         SYS_NET_IPV4_CONF_DEFAULT_TAG_INO => Some(ProcNode::NetIpv4ConfDefaultTag),
         SYS_NET_CORE_BUSY_READ_INO => Some(ProcNode::NetCoreBusyRead),
         SYS_NET_CORE_BUSY_POLL_INO => Some(ProcNode::NetCoreBusyPoll),
-        KEYS_GC_DELAY_INO => Some(ProcNode::KeysGcDelay),
-        KEYS_MAXKEYS_INO => Some(ProcNode::KeysMaxkeys),
-        KEYS_MAXBYTES_INO => Some(ProcNode::KeysMaxbytes),
-        KEYS_ROOT_MAXKEYS_INO => Some(ProcNode::KeysRootMaxkeys),
-        KEYS_ROOT_MAXBYTES_INO => Some(ProcNode::KeysRootMaxbytes),
         CORE_PATTERN_INO => Some(ProcNode::CorePattern),
         DROP_CACHES_INO => Some(ProcNode::DropCaches),
         VFS_CACHE_PRESSURE_INO => Some(ProcNode::VfsCachePressure),
@@ -658,7 +636,6 @@ fn node_kind(node: ProcNode) -> FsNodeKind {
         ProcNode::Root
         | ProcNode::SysDir
         | ProcNode::SysKernelDir
-        | ProcNode::SysKernelKeysDir
         | ProcNode::SysUserDir
         | ProcNode::SysFsDir
         | ProcNode::SysFsFanotifyDir
@@ -710,11 +687,6 @@ fn root_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: MODULES_INO,
         name: "modules".into(),
-        dtype: DT_REG,
-    });
-    entries.push(RawDirEntry {
-        ino: KEY_USERS_INO,
-        name: "key-users".into(),
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
@@ -1170,11 +1142,6 @@ fn sys_kernel_entries() -> Vec<RawDirEntry> {
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
-        ino: SYS_KERNEL_KEYS_DIR_INO,
-        name: "keys".into(),
-        dtype: DT_DIR,
-    });
-    entries.push(RawDirEntry {
         ino: DOMAINNAME_INO,
         name: "domainname".into(),
         dtype: DT_REG,
@@ -1197,46 +1164,6 @@ fn sys_kernel_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: EXEC_LOAD_STATS_INO,
         name: "exec_loader".into(),
-        dtype: DT_REG,
-    });
-    entries
-}
-
-fn sys_kernel_keys_entries() -> Vec<RawDirEntry> {
-    let mut entries = Vec::new();
-    entries.push(RawDirEntry {
-        ino: SYS_KERNEL_KEYS_DIR_INO,
-        name: ".".into(),
-        dtype: DT_DIR,
-    });
-    entries.push(RawDirEntry {
-        ino: SYS_KERNEL_DIR_INO,
-        name: "..".into(),
-        dtype: DT_DIR,
-    });
-    entries.push(RawDirEntry {
-        ino: KEYS_GC_DELAY_INO,
-        name: "gc_delay".into(),
-        dtype: DT_REG,
-    });
-    entries.push(RawDirEntry {
-        ino: KEYS_MAXKEYS_INO,
-        name: "maxkeys".into(),
-        dtype: DT_REG,
-    });
-    entries.push(RawDirEntry {
-        ino: KEYS_MAXBYTES_INO,
-        name: "maxbytes".into(),
-        dtype: DT_REG,
-    });
-    entries.push(RawDirEntry {
-        ino: KEYS_ROOT_MAXKEYS_INO,
-        name: "root_maxkeys".into(),
-        dtype: DT_REG,
-    });
-    entries.push(RawDirEntry {
-        ino: KEYS_ROOT_MAXBYTES_INO,
-        name: "root_maxbytes".into(),
         dtype: DT_REG,
     });
     entries
@@ -2533,7 +2460,6 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::Mounts => Ok(mounts_content().into_bytes()),
         ProcNode::Filesystems => Ok(filesystems_content().as_bytes().to_vec()),
         ProcNode::Modules => Ok(Vec::new()),
-        ProcNode::KeyUsers => Ok(keyring::key_users_content().into_bytes()),
         ProcNode::Meminfo => Ok(meminfo_content().into_bytes()),
         ProcNode::Uptime => Ok(uptime_content().into_bytes()),
         ProcNode::Cpuinfo => Ok(cpuinfo_content().into_bytes()),
@@ -2559,11 +2485,6 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::MsgNextId => {
             Ok(format!("{}\n", crate::syscall::msg::current_msg_next_id()).into_bytes())
         }
-        ProcNode::KeysGcDelay => Ok(keyring::key_gc_delay_content().into_bytes()),
-        ProcNode::KeysMaxkeys => Ok(keyring::key_maxkeys_content().into_bytes()),
-        ProcNode::KeysMaxbytes => Ok(keyring::key_maxbytes_content().into_bytes()),
-        ProcNode::KeysRootMaxkeys => Ok(keyring::root_key_maxkeys_content().into_bytes()),
-        ProcNode::KeysRootMaxbytes => Ok(keyring::root_key_maxbytes_content().into_bytes()),
         ProcNode::MaxUserNamespaces => Ok(b"1024\n".to_vec()),
         ProcNode::CorePattern => Ok(core_pattern_content()),
         ProcNode::PipeMaxSize => Ok(pipe_max_size_content().into_bytes()),
@@ -2697,7 +2618,6 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::Root
         | ProcNode::SysDir
         | ProcNode::SysKernelDir
-        | ProcNode::SysKernelKeysDir
         | ProcNode::SysUserDir
         | ProcNode::SysFsDir
         | ProcNode::SysFsFanotifyDir
@@ -2743,7 +2663,6 @@ impl LegacyLookupOps for ProcFs {
                 "mounts" => Ok((MOUNTS_INO, FsNodeKind::RegularFile)),
                 "filesystems" => Ok((FILESYSTEMS_INO, FsNodeKind::RegularFile)),
                 "modules" => Ok((MODULES_INO, FsNodeKind::RegularFile)),
-                "key-users" => Ok((KEY_USERS_INO, FsNodeKind::RegularFile)),
                 "meminfo" => Ok((MEMINFO_INO, FsNodeKind::RegularFile)),
                 "uptime" => Ok((UPTIME_INO, FsNodeKind::RegularFile)),
                 "cpuinfo" => Ok((CPUINFO_INO, FsNodeKind::RegularFile)),
@@ -2849,22 +2768,11 @@ impl LegacyLookupOps for ProcFs {
                 "msgmax" => Ok((MSGMAX_INO, FsNodeKind::RegularFile)),
                 "msgmnb" => Ok((MSGMNB_INO, FsNodeKind::RegularFile)),
                 "msg_next_id" => Ok((MSG_NEXT_ID_INO, FsNodeKind::RegularFile)),
-                "keys" => Ok((SYS_KERNEL_KEYS_DIR_INO, FsNodeKind::Directory)),
                 "domainname" => Ok((DOMAINNAME_INO, FsNodeKind::RegularFile)),
                 "tainted" => Ok((TAINTED_INO, FsNodeKind::RegularFile)),
                 "block_cache" => Ok((BLOCK_CACHE_STATS_INO, FsNodeKind::RegularFile)),
                 "dentry_cache" => Ok((DENTRY_CACHE_STATS_INO, FsNodeKind::RegularFile)),
                 "exec_loader" => Ok((EXEC_LOAD_STATS_INO, FsNodeKind::RegularFile)),
-                _ => Err(FsError::NotFound),
-            },
-            ProcNode::SysKernelKeysDir => match component {
-                "." => Ok((SYS_KERNEL_KEYS_DIR_INO, FsNodeKind::Directory)),
-                ".." => Ok((SYS_KERNEL_DIR_INO, FsNodeKind::Directory)),
-                "gc_delay" => Ok((KEYS_GC_DELAY_INO, FsNodeKind::RegularFile)),
-                "maxkeys" => Ok((KEYS_MAXKEYS_INO, FsNodeKind::RegularFile)),
-                "maxbytes" => Ok((KEYS_MAXBYTES_INO, FsNodeKind::RegularFile)),
-                "root_maxkeys" => Ok((KEYS_ROOT_MAXKEYS_INO, FsNodeKind::RegularFile)),
-                "root_maxbytes" => Ok((KEYS_ROOT_MAXBYTES_INO, FsNodeKind::RegularFile)),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::SysVipcDir => match component {
@@ -3099,9 +3007,6 @@ impl LegacyLookupOps for ProcFs {
             ProcNode::SysDir => write_dir_entries(&sys_entries(), offset, buf),
             ProcNode::SysVipcDir => write_dir_entries(&sysvipc_entries(), offset, buf),
             ProcNode::SysKernelDir => write_dir_entries(&sys_kernel_entries(), offset, buf),
-            ProcNode::SysKernelKeysDir => {
-                write_dir_entries(&sys_kernel_keys_entries(), offset, buf)
-            }
             ProcNode::SysUserDir => write_dir_entries(&sys_user_entries(), offset, buf),
             ProcNode::SysFsDir => write_dir_entries(&sys_fs_entries(), offset, buf),
             ProcNode::SysFsFanotifyDir => {
@@ -3185,7 +3090,6 @@ impl LegacyMetadataOps for ProcFs {
             ProcNode::Root
             | ProcNode::SysDir
             | ProcNode::SysKernelDir
-            | ProcNode::SysKernelKeysDir
             | ProcNode::SysUserDir
             | ProcNode::SysFsDir
             | ProcNode::SysFsFanotifyDir
@@ -3217,11 +3121,6 @@ impl LegacyMetadataOps for ProcFs {
             | ProcNode::MsgMnb
             | ProcNode::MsgNextId
             | ProcNode::Printk
-            | ProcNode::KeysGcDelay
-            | ProcNode::KeysMaxkeys
-            | ProcNode::KeysMaxbytes
-            | ProcNode::KeysRootMaxkeys
-            | ProcNode::KeysRootMaxbytes
             | ProcNode::MaxUserNamespaces
             | ProcNode::PipeMaxSize
             | ProcNode::LeaseBreakTime
@@ -3284,11 +3183,6 @@ impl LegacyDataOps for ProcFs {
             | ProcNode::MsgMnb
             | ProcNode::MsgNextId
             | ProcNode::Printk
-            | ProcNode::KeysGcDelay
-            | ProcNode::KeysMaxkeys
-            | ProcNode::KeysMaxbytes
-            | ProcNode::KeysRootMaxkeys
-            | ProcNode::KeysRootMaxbytes
             | ProcNode::MaxUserNamespaces
             | ProcNode::PipeMaxSize
             | ProcNode::LeaseBreakTime
@@ -3364,11 +3258,6 @@ impl LegacyDataOps for ProcFs {
             }
             Some(ProcNode::MsgNextId) => write_msg_next_id(buf, offset),
             Some(ProcNode::Printk) => crate::syscall::write_proc_sys_kernel_printk(buf, offset),
-            Some(ProcNode::KeysGcDelay) => keyring::write_key_gc_delay(buf, offset),
-            Some(ProcNode::KeysMaxkeys) => keyring::write_key_maxkeys(buf, offset),
-            Some(ProcNode::KeysMaxbytes) => keyring::write_key_maxbytes(buf, offset),
-            Some(ProcNode::KeysRootMaxkeys) => keyring::write_root_key_maxkeys(buf, offset),
-            Some(ProcNode::KeysRootMaxbytes) => keyring::write_root_key_maxbytes(buf, offset),
             Some(ProcNode::MaxUserNamespaces) => buf.len(),
             Some(ProcNode::CorePattern) => write_core_pattern(buf, offset),
             Some(ProcNode::PipeMaxSize) => write_pipe_max_size(buf, offset),

@@ -1,7 +1,6 @@
 use super::context::SyscallContext;
 use super::fs::*;
 use super::futex::*;
-use super::keyring::*;
 use super::kmodule::*;
 use super::memory::*;
 use super::msg::*;
@@ -262,9 +261,6 @@ pub(crate) fn syscall_with_context(
         SYSCALL_SECCOMP => sys_seccomp_ctx(ctx, args[0], args[1], args[2]),
         SYSCALL_GETRANDOM => sys_getrandom_ctx(ctx, args[0] as *mut u8, args[1], args[2] as u32),
         SYSCALL_MEMFD_CREATE => sys_memfd_create(args[0] as *const u8, args[1] as u32),
-        SYSCALL_MEMFD_SECRET => sys_memfd_secret(args[0] as u32),
-        SYSCALL_BPF => sys_bpf(args[0] as u32, args[1] as *const u8, args[2] as u32),
-        SYSCALL_USERFAULTFD => sys_userfaultfd(args[0] as u32),
         SYSCALL_MEMBARRIER => sys_membarrier(args[0] as i32, args[1] as u32, args[2] as i32),
         SYSCALL_UMOUNT2 => sys_umount2(args[0] as *const u8, args[1] as i32),
         SYSCALL_MOUNT => sys_mount(
@@ -406,12 +402,6 @@ pub(crate) fn syscall_with_context(
             args[2] as *const LinuxTimeSpec,
             args[3] as *const u8,
             args[4],
-        ),
-        SYSCALL_SIGNALFD4 => sys_signalfd4(
-            args[0] as isize,
-            args[1] as *const u8,
-            args[2],
-            args[3] as u32,
         ),
         SYSCALL_READLINKAT => sys_readlinkat_ctx(
             ctx,
@@ -691,20 +681,6 @@ pub(crate) fn syscall_with_context(
         SYSCALL_BRK => sys_brk_ctx(ctx, args[0]),
         SYSCALL_MUNMAP => sys_munmap_ctx(ctx, args[0], args[1]),
         SYSCALL_MREMAP => sys_mremap(args[0], args[1], args[2], args[3], args[4]),
-        SYSCALL_ADD_KEY => sys_add_key(
-            args[0] as *const u8,
-            args[1] as *const u8,
-            args[2] as *const u8,
-            args[3],
-            args[4] as i32,
-        ),
-        SYSCALL_REQUEST_KEY => sys_request_key(
-            args[0] as *const u8,
-            args[1] as *const u8,
-            args[2] as *const u8,
-            args[3] as i32,
-        ),
-        SYSCALL_KEYCTL => sys_keyctl(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_MPROTECT => sys_mprotect_ctx(ctx, args[0], args[1], args[2]),
         SYSCALL_MLOCK => sys_mlock(args[0], args[1]),
         SYSCALL_MUNLOCK => sys_munlock(args[0], args[1]),
@@ -774,13 +750,6 @@ pub(crate) fn syscall_with_context(
             args[1] as isize,
             args[2] as u32,
             args[3] as *const LinuxSigInfo,
-        ),
-        SYSCALL_PERF_EVENT_OPEN => sys_perf_event_open(
-            args[0] as *const u8,
-            args[1] as isize,
-            args[2] as isize,
-            args[3] as isize,
-            args[4] as u64,
         ),
         SYSCALL_CLOCK_ADJTIME => sys_clock_adjtime(args[0] as i32, args[1] as *mut LinuxTimex),
         SYSCALL_SETNS => sys_setns(args[0], args[1]),

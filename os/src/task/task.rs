@@ -161,7 +161,6 @@ pub struct TaskControlBlockInner {
 pub struct TaskSecurityState {
     pub seccomp_mode: u8,
     pub seccomp_filter: Option<Vec<SeccompSockFilter>>,
-    pub(crate) thread_keyring: Option<i32>,
 }
 
 impl TaskControlBlock {
@@ -253,7 +252,6 @@ impl TaskControlBlock {
                     security: TaskSecurityState {
                         seccomp_mode: 0,
                         seccomp_filter: None,
-                        thread_keyring: None,
                     },
                     clone_vm_process_helper: false,
                     synthetic_newnet: false,

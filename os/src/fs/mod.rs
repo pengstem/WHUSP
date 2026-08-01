@@ -1,4 +1,3 @@
-mod anonfd;
 mod api;
 mod cgroupfs;
 mod console_tty;
@@ -39,7 +38,6 @@ use core::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-pub(crate) use anonfd::make_anonymous_fd;
 pub use api::{PipeFileCapability, SocketFileCapability, TtyFileCapability};
 pub(crate) use cgroupfs::{memcg_pressure_active, reclaim_memcg_pressure_pages};
 pub(crate) use console_tty::console_tty_drain_uart;

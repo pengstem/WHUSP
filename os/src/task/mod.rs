@@ -218,7 +218,6 @@ fn terminate_sibling_threads(
     let mut recycle_res = Vec::<TaskUserRes>::new();
     let mut robust_tasks = Vec::new();
     let mut exited_threads = Vec::new();
-    let mut released_thread_keyrings = Vec::new();
     let mut exited_linux_tids = Vec::new();
     {
         let mut process_inner = process.inner_exclusive_access();
@@ -235,9 +234,6 @@ fn terminate_sibling_threads(
             task_inner.exit_code = Some(exit_code);
             if let Some(clear_child_tid) = task_inner.clear_child_tid.take() {
                 clear_child_tids.push(clear_child_tid);
-            }
-            if let Some(keyring) = task_inner.security.thread_keyring.take() {
-                released_thread_keyrings.push(keyring);
             }
             robust_tasks.push(Arc::clone(&task));
             if let Some(res) = task_inner.res.take() {
@@ -259,9 +255,6 @@ fn terminate_sibling_threads(
     }
     for clear_child_tid in clear_child_tids {
         futex::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
-    }
-    for keyring in released_thread_keyrings {
-        crate::syscall::keyring::release_keyring_tree(keyring);
     }
     recycle_res.clear();
     for task in exited_threads {
@@ -296,7 +289,6 @@ fn rebind_non_leader_for_exec(
     let mut recycle_res = Vec::<TaskUserRes>::new();
     let mut robust_tasks = Vec::new();
     let mut exited_threads = Vec::new();
-    let mut released_thread_keyrings = Vec::new();
     let mut exited_linux_tids = Vec::new();
     let mut old_current_linux_tid = None;
     {
@@ -336,9 +328,6 @@ fn rebind_non_leader_for_exec(
             task_inner.exit_code = Some(0);
             if let Some(clear_child_tid) = task_inner.clear_child_tid.take() {
                 clear_child_tids.push(clear_child_tid);
-            }
-            if let Some(keyring) = task_inner.security.thread_keyring.take() {
-                released_thread_keyrings.push(keyring);
             }
             robust_tasks.push(Arc::clone(&task));
             if tid == 0 {
@@ -381,9 +370,6 @@ fn rebind_non_leader_for_exec(
     }
     for clear_child_tid in clear_child_tids {
         futex::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
-    }
-    for keyring in released_thread_keyrings {
-        crate::syscall::keyring::release_keyring_tree(keyring);
     }
     recycle_res.clear();
     for task in exited_threads {
@@ -847,19 +833,14 @@ fn exit_current(exit_code: i32, group_exit: bool) {
     let process_exit = group_exit || tid == 0;
     let group_exit_exclusion =
         process_exit.then(|| process.begin_group_exit_exclusion(current.as_ref()));
-    let (tid, linux_tid, clear_child_tid, thread_keyring) = {
+    let (tid, linux_tid, clear_child_tid) = {
         let mut task_inner = current.inner_exclusive_access();
         let linux_tid = task_inner
             .linux_tid
             .as_ref()
             .map(|handle| handle.0)
             .unwrap_or(process_id);
-        (
-            task_inner.tid,
-            linux_tid,
-            task_inner.clear_child_tid.take(),
-            task_inner.security.thread_keyring.take(),
-        )
+        (task_inner.tid, linux_tid, task_inner.clear_child_tid.take())
     };
     unregister_task_linux_tid(linux_tid);
     // Robust-list owner-death and CLONE_CHILD_CLEARTID writes still need the
@@ -868,9 +849,6 @@ fn exit_current(exit_code: i32, group_exit: bool) {
     futex::exit_robust_list(&current, process_token, process_id);
     if let Some(clear_child_tid) = clear_child_tid {
         futex::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
-    }
-    if let Some(keyring) = thread_keyring {
-        crate::syscall::keyring::release_keyring_tree(keyring);
     }
     current.inner_exclusive_access().res = None;
 
@@ -916,7 +894,6 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             flushes,
             executable_node,
             exit_signal,
-            process_keyring,
             core_dump,
         ) = {
             let mut process_inner = process.inner_exclusive_access();
@@ -942,7 +919,6 @@ fn exit_current(exit_code: i32, group_exit: bool) {
             // deallocate other data in user space i.e. program code/data section
             let (flushes, retired_areas) = process_inner.memory_set.recycle_data_pages();
             let executable_node = process_inner.executable_node.take();
-            let process_keyring = process_inner.process_keyring.take();
             // Take fd entries out while the current task is still installed.
             // Close cleanup can re-enter VFS and notification paths, so run it
             // after dropping the PCB lock.
@@ -961,7 +937,6 @@ fn exit_current(exit_code: i32, group_exit: bool) {
                 flushes,
                 executable_node,
                 exit_signal,
-                process_keyring,
                 core_dump,
             )
         };
@@ -972,9 +947,6 @@ fn exit_current(exit_code: i32, group_exit: bool) {
         drop(retired_areas);
         if let Some((context, path, bytes)) = core_dump {
             write_core_dump(context, path, bytes);
-        }
-        if let Some(keyring) = process_keyring {
-            crate::syscall::keyring::release_keyring_tree(keyring);
         }
         for flush in flushes {
             flush.write_back();

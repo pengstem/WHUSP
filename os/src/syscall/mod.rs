@@ -2,7 +2,6 @@ mod context;
 mod dispatch;
 mod fs;
 mod futex;
-pub(crate) mod keyring;
 mod kmodule;
 mod memory;
 pub(crate) mod msg;

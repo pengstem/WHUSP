@@ -9,7 +9,6 @@ waitid08
 readv01
 open_by_handle_at01
 epoll_wait06
-add_key01
 accept4_01
 writev01
 setresgid02
@@ -48,7 +47,6 @@ pipe08
 pipe01
 waitid03
 wait02
-add_key03
 clone03
 mmap19
 ioctl_ns03
@@ -176,7 +174,6 @@ setreuid05
 openat202
 fanotify04
 creat08
-add_key02
 getrandom03
 ioctl06
 prctl04
@@ -244,16 +241,12 @@ posix_fadvise03_64
 posix_fadvise04
 posix_fadvise04_64
 msgsnd02
-request_key01
-request_key02
 symlink01
 symlink02
 symlink03
 symlink04
 getpriority01
 getpriority02
-request_key04
-request_key05
 utime01
 utime02
 utime03
@@ -427,7 +420,6 @@ statx12
 munlock01
 inotify07
 semop02
-add_key05
 statx04
 fcntl13_64
 getxattr02
@@ -472,14 +464,6 @@ setfsuid03
 fork07
 fork08
 fork10
-keyctl01
-keyctl03
-keyctl04
-keyctl05
-keyctl06
-keyctl07
-keyctl08
-keyctl09
 fork11
 getrlimit02
 waitid04
@@ -527,7 +511,6 @@ pwrite04_64
 kill05
 sendfile05
 read03
-add_key04
 nice03
 waitpid13
 sendfile05_64

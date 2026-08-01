@@ -1,4 +1,4 @@
-use crate::fs::{File, OpenFlags, S_IFCHR, TimerFd, TimerFdClock, make_anonymous_fd, make_timerfd};
+use crate::fs::{File, OpenFlags, TimerFd, TimerFdClock, make_timerfd};
 use crate::task::{current_process, current_user_token};
 use crate::timer::get_time_us;
 use alloc::sync::Arc;
@@ -12,7 +12,6 @@ use crate::uapi::errno::{Errno, KResult};
 
 const FD_NONBLOCK: u32 = OpenFlags::NONBLOCK.bits();
 const FD_CLOEXEC: u32 = OpenFlags::CLOEXEC.bits();
-const SIGNALFD_VALID_FLAGS: u32 = FD_NONBLOCK | FD_CLOEXEC;
 const TIMERFD_VALID_FLAGS: u32 = FD_NONBLOCK | FD_CLOEXEC;
 const TFD_TIMER_ABSTIME: u32 = 1;
 const TFD_TIMER_CANCEL_ON_SET: u32 = 2;
@@ -22,10 +21,6 @@ const CLOCK_MONOTONIC: i32 = 1;
 const CLOCK_BOOTTIME: i32 = 7;
 const CLOCK_REALTIME_ALARM: i32 = 8;
 const CLOCK_BOOTTIME_ALARM: i32 = 9;
-const MEMFD_SECRET_VALID_FLAGS: u32 = FD_CLOEXEC;
-const UFFD_USER_MODE_ONLY: u32 = 1;
-const USERFAULTFD_VALID_FLAGS: u32 = FD_NONBLOCK | FD_CLOEXEC | UFFD_USER_MODE_ONLY;
-const BPF_MAP_CREATE: u32 = 0;
 
 fn open_flags_from_fd_flags(flags: u32, valid_flags: u32) -> KResult<OpenFlags> {
     if flags & !valid_flags != 0 {
@@ -40,35 +35,6 @@ fn open_flags_from_fd_flags(flags: u32, valid_flags: u32) -> KResult<OpenFlags> 
         open_flags |= OpenFlags::CLOEXEC;
     }
     Ok(open_flags)
-}
-
-fn install_dummy_readable_fd(open_flags: OpenFlags) -> KResult {
-    let file = make_anonymous_fd(true, false, S_IFCHR | 0o600);
-    install_file_fd(file, open_flags, None)
-}
-
-fn install_dummy_readwrite_fd(open_flags: OpenFlags) -> KResult {
-    let file = make_anonymous_fd(true, true, S_IFCHR | 0o600);
-    install_file_fd(file, open_flags, None)
-}
-
-fn validate_user_pointer(ptr: *const u8) -> KResult<()> {
-    if ptr.is_null() {
-        return Err(Errno::EFAULT);
-    }
-    read_user_value(current_user_token(), ptr).map(|_: u8| ())
-}
-
-pub fn sys_signalfd4(fd: isize, mask: *const u8, _sizemask: usize, flags: u32) -> KResult {
-    if fd != -1 {
-        // UNFINISHED: Updating an existing signalfd requires real signalfd
-        // state. Current score-facing coverage only creates new descriptors.
-        return Err(Errno::EINVAL);
-    }
-    validate_user_pointer(mask)?;
-    let open_flags = open_flags_from_fd_flags(flags, SIGNALFD_VALID_FLAGS)?;
-    // UNFINISHED: pending-signal delivery through signalfd is not modeled yet.
-    install_dummy_readable_fd(open_flags)
 }
 
 pub fn sys_timerfd_create(clockid: i32, flags: u32) -> KResult {
@@ -195,43 +161,4 @@ pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut LinuxITimerSpec) -> KResult
     let current = itimerspec_from_us(interval_us, remaining_us);
     write_user_value(current_user_token(), curr_value, &current)?;
     Ok(0)
-}
-
-pub fn sys_memfd_secret(flags: u32) -> KResult {
-    let open_flags = open_flags_from_fd_flags(flags, MEMFD_SECRET_VALID_FLAGS)?;
-    // UNFINISHED: Linux memfd_secret backs mmap() with secret memory and
-    // enforces RLIMIT_MEMLOCK; this fd only satisfies generic fd probes.
-    install_dummy_readwrite_fd(open_flags | OpenFlags::RDWR)
-}
-
-pub fn sys_userfaultfd(flags: u32) -> KResult {
-    let open_flags = open_flags_from_fd_flags(flags, USERFAULTFD_VALID_FLAGS)?;
-    // UNFINISHED: userfaultfd page-fault registration and event queues are not
-    // implemented.
-    install_dummy_readable_fd(open_flags)
-}
-
-pub fn sys_perf_event_open(
-    attr: *const u8,
-    _pid: isize,
-    _cpu: isize,
-    _group_fd: isize,
-    _flags: u64,
-) -> KResult {
-    validate_user_pointer(attr)?;
-    // UNFINISHED: perf event sampling/counter state is not implemented.
-    install_dummy_readable_fd(OpenFlags::RDONLY | OpenFlags::CLOEXEC)
-}
-
-pub fn sys_bpf(cmd: u32, attr: *const u8, size: u32) -> KResult {
-    if cmd != BPF_MAP_CREATE {
-        // UNFINISHED: Only BPF_MAP_CREATE is accepted for LTP fd-class probes.
-        return Err(Errno::ENOSYS);
-    }
-    if size == 0 {
-        return Err(Errno::EINVAL);
-    }
-    validate_user_pointer(attr)?;
-    // UNFINISHED: BPF map storage and commands are not implemented.
-    install_dummy_readable_fd(OpenFlags::RDWR | OpenFlags::CLOEXEC)
 }
