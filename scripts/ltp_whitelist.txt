@@ -490,12 +490,6 @@ shmget05
 getrusage01
 eventfd2_02
 fanotify23
-io_cancel01
-io_destroy02
-io_getevents01
-io_setup02
-io_submit02
-io_submit03
 io_uring01
 io_uring02
 semctl04

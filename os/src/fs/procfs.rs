@@ -114,7 +114,6 @@ const MSGMNB_INO: u32 = 57;
 const MSG_NEXT_ID_INO: u32 = 58;
 const SEM_SYSCTL_INO: u32 = 59;
 const PRINTK_INO: u32 = 60;
-const AIO_MAX_NR_INO: u32 = 61;
 // CONTEXT: Dynamic /proc inode ranges must stay disjoint even after long test
 // runs allocate five-digit PIDs; LTP probes /proc/<ppid>/stat during waits.
 const PID_DIR_BASE: u32 = 100;
@@ -271,7 +270,6 @@ enum ProcNode {
     MsgMax,
     MsgMnb,
     MsgNextId,
-    AioMaxNr,
     Domainname,
     Tainted,
     PidDir(usize),
@@ -566,7 +564,6 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         MSGMAX_INO => Some(ProcNode::MsgMax),
         MSGMNB_INO => Some(ProcNode::MsgMnb),
         MSG_NEXT_ID_INO => Some(ProcNode::MsgNextId),
-        AIO_MAX_NR_INO => Some(ProcNode::AioMaxNr),
         SYS_NET_IPV4_CONF_LO_TAG_INO => Some(ProcNode::NetIpv4ConfLoTag),
         SYS_NET_IPV4_CONF_DEFAULT_TAG_INO => Some(ProcNode::NetIpv4ConfDefaultTag),
         SYS_NET_CORE_BUSY_READ_INO => Some(ProcNode::NetCoreBusyRead),
@@ -1035,11 +1032,6 @@ fn sys_fs_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: LEASE_BREAK_TIME_INO,
         name: "lease-break-time".into(),
-        dtype: DT_REG,
-    });
-    entries.push(RawDirEntry {
-        ino: AIO_MAX_NR_INO,
-        name: "aio-max-nr".into(),
         dtype: DT_REG,
     });
     entries.push(RawDirEntry {
@@ -2567,7 +2559,6 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::MsgNextId => {
             Ok(format!("{}\n", crate::syscall::msg::current_msg_next_id()).into_bytes())
         }
-        ProcNode::AioMaxNr => Ok(crate::syscall::aio_max_nr_content().as_bytes().to_vec()),
         ProcNode::KeysGcDelay => Ok(keyring::key_gc_delay_content().into_bytes()),
         ProcNode::KeysMaxkeys => Ok(keyring::key_maxkeys_content().into_bytes()),
         ProcNode::KeysMaxbytes => Ok(keyring::key_maxbytes_content().into_bytes()),
@@ -2890,7 +2881,6 @@ impl LegacyLookupOps for ProcFs {
                 "pipe-max-size" => Ok((PIPE_MAX_SIZE_INO, FsNodeKind::RegularFile)),
                 "pipe-user-pages-soft" => Ok((PIPE_USER_PAGES_SOFT_INO, FsNodeKind::RegularFile)),
                 "lease-break-time" => Ok((LEASE_BREAK_TIME_INO, FsNodeKind::RegularFile)),
-                "aio-max-nr" => Ok((AIO_MAX_NR_INO, FsNodeKind::RegularFile)),
                 "fanotify" => Ok((SYS_FS_FANOTIFY_DIR_INO, FsNodeKind::Directory)),
                 "inotify" => Ok((SYS_FS_INOTIFY_DIR_INO, FsNodeKind::Directory)),
                 _ => Err(FsError::NotFound),

@@ -1,4 +1,3 @@
-use super::aio::*;
 use super::context::SyscallContext;
 use super::fs::*;
 use super::futex::*;
@@ -159,17 +158,6 @@ pub(crate) fn syscall_with_context(
         SYSCALL_READ_MOSTLY_PROBE => sys_read_mostly_probe(args[0], args[1]),
         #[cfg(feature = "sleep-rwlock-probe")]
         SYSCALL_FS4_SLEEP_RWLOCK_PROBE => sys_fs4_sleep_rwlock_probe(args[0], args[1], args[2]),
-        SYSCALL_IO_SETUP => sys_io_setup(args[0], args[1] as *mut usize),
-        SYSCALL_IO_DESTROY => sys_io_destroy(args[0]),
-        SYSCALL_IO_SUBMIT => sys_io_submit(args[0], args[1] as isize, args[2] as *const _),
-        SYSCALL_IO_CANCEL => sys_io_cancel(args[0], args[1] as *const _, args[2] as *mut _),
-        SYSCALL_IO_GETEVENTS => sys_io_getevents(
-            args[0],
-            args[1] as isize,
-            args[2] as isize,
-            args[3] as *mut _,
-            args[4] as *const u8,
-        ),
         SYSCALL_SETXATTR => sys_setxattr(
             args[0] as *const u8,
             args[1] as *const u8,
@@ -522,14 +510,6 @@ pub(crate) fn syscall_with_context(
             sys_io_uring_register(args[0], args[1] as u32, args[2], args[3] as u32)
         }
         SYSCALL_QUOTACTL_FD => sys_quotactl_fd(args[0], args[1] as i32, args[2] as u32, args[3]),
-        SYSCALL_IO_PGETEVENTS => sys_io_pgetevents(
-            args[0],
-            args[1] as isize,
-            args[2] as isize,
-            args[3] as *mut _,
-            args[4] as *const u8,
-            args[5] as *const u8,
-        ),
         SYSCALL_WAITID => sys_waitid(
             args[0] as i32,
             args[1] as i32,

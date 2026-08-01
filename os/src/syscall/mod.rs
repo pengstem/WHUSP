@@ -1,4 +1,3 @@
-mod aio;
 mod context;
 mod dispatch;
 mod fs;
@@ -21,7 +20,6 @@ pub(crate) mod uapi;
 pub(crate) mod user_ptr;
 mod wait;
 
-pub(crate) use aio::aio_max_nr_content;
 pub(crate) use context::SyscallContext;
 #[allow(unused_imports)]
 pub(crate) use dispatch::{

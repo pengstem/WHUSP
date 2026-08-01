@@ -1,11 +1,6 @@
 // Linux generic syscall numbers used by both contest RISC-V and LoongArch
 // ABIs. Keep this table aligned with the userspace libc headers, not with
 // local implementation order.
-pub(crate) const SYSCALL_IO_SETUP: usize = 0;
-pub(crate) const SYSCALL_IO_DESTROY: usize = 1;
-pub(crate) const SYSCALL_IO_SUBMIT: usize = 2;
-pub(crate) const SYSCALL_IO_CANCEL: usize = 3;
-pub(crate) const SYSCALL_IO_GETEVENTS: usize = 4;
 pub(crate) const SYSCALL_SETXATTR: usize = 5;
 pub(crate) const SYSCALL_LSETXATTR: usize = 6;
 pub(crate) const SYSCALL_FSETXATTR: usize = 7;
@@ -261,7 +256,6 @@ pub(crate) const SYSCALL_PKEY_MPROTECT: usize = 288;
 pub(crate) const SYSCALL_PKEY_ALLOC: usize = 289;
 pub(crate) const SYSCALL_PKEY_FREE: usize = 290;
 pub(crate) const SYSCALL_STATX: usize = 291;
-pub(crate) const SYSCALL_IO_PGETEVENTS: usize = 292;
 pub(crate) const SYSCALL_PIDFD_SEND_SIGNAL: usize = 424;
 pub(crate) const SYSCALL_IO_URING_SETUP: usize = 425;
 pub(crate) const SYSCALL_IO_URING_ENTER: usize = 426;
