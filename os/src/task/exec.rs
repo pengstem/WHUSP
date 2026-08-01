@@ -431,9 +431,9 @@ impl ProcessControlBlock {
 
         // From this point on, user stack writes must target `new_token`; the old
         // process token may already describe the pre-exec image.
-        let (previous_executable_node, close_on_exec_entries) = {
+        let (retired_memory_set, previous_executable_node, close_on_exec_entries) = {
             let mut inner = self.inner_exclusive_access();
-            inner.memory_set = memory_set;
+            let retired_memory_set = core::mem::replace(&mut inner.memory_set, memory_set);
             inner.pkey_rights = empty_process_pkey_rights();
             let previous = core::mem::replace(&mut inner.executable_node, executable_node);
             inner.executable_path = executable_path;
@@ -447,8 +447,12 @@ impl ProcessControlBlock {
                 }
             }
             let close_on_exec_entries = inner.close_on_exec_fd_entries();
-            (previous, close_on_exec_entries)
+            (retired_memory_set, previous, close_on_exec_entries)
         };
+        // MemorySet owns file-backed MapAreas whose destructors can enter
+        // sleepable VFS paths. Retire the old image under the PCB lock, but do
+        // not destroy it until after the image-commit guard has been released.
+        drop(retired_memory_set);
         // Drop close-on-exec files after releasing the PCB lock. File
         // destructors can enter VFS/mount cleanup paths, which must not run
         // while the exec image-commit state is still locked.
