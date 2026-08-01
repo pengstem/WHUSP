@@ -52,14 +52,8 @@ pub(crate) enum MountPropagation {
     Unbindable,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum MountTarget {
-    Node(VfsNodeId),
-    // Synthetic paths make compatibility mounts visible even when no backing
-    // directory exists on the covered filesystem; getdents64 exposes only the
-    // direct child until lookup resolves the synthetic mount root.
-    SyntheticPath { parent: VfsNodeId, path: String },
-}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MountTarget(VfsNodeId);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DynamicMount {
@@ -92,6 +86,66 @@ struct DynamicMount {
     // EAGAIN; the next matching umount is allowed to remove the mount.
     expires_on_next_umount: bool,
 }
+
+/// Immutable boot-time mount edge used by ordinary path walk.
+///
+/// These entries are global, cannot be unmounted, and are never copied into a
+/// process mount namespace. Keeping the target as `(parent, name)` lets the
+/// common lookup path cross `/proc`, `/tmp`, `/dev`, `/dev/shm`, and
+/// boot-discovered `/xN` filesystems without a namespace snapshot or a visible
+/// path string comparison.
+struct StaticMount {
+    parent: VfsNodeId,
+    name: String,
+    target_path: String,
+    source_root: VfsNodeId,
+}
+
+struct StaticMountTable {
+    current: AtomicPtr<Vec<StaticMount>>,
+}
+
+impl StaticMountTable {
+    const fn new() -> Self {
+        Self {
+            current: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+
+    fn publish(&self, mounts: Vec<StaticMount>) {
+        let mounts = Box::into_raw(Box::new(mounts));
+        if self
+            .current
+            .compare_exchange(
+                core::ptr::null_mut(),
+                mounts,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            // SAFETY: the failed publication did not expose this allocation.
+            unsafe {
+                drop(Box::from_raw(mounts));
+            }
+            panic!("static mount table published twice");
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &StaticMount> {
+        let current = self.current.load(Ordering::Acquire);
+        let mounts = if current.is_null() {
+            &[][..]
+        } else {
+            // SAFETY: init_mounts() publishes this allocation once and never
+            // replaces or frees it. The acquire load observes its initialization.
+            unsafe { &**current }
+        };
+        mounts.iter()
+    }
+}
+
+static STATIC_MOUNTS: StaticMountTable = StaticMountTable::new();
 
 #[repr(align(64))]
 struct MountedFsSnapshotReader {
@@ -288,6 +342,15 @@ static NEXT_MOUNT_EVENT_ID: AtomicUsize = AtomicUsize::new(1);
 static NOSYMFOLLOW_MOUNT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DYNAMIC_MOUNT_EXPIRE_PENDING_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+// Namespace ids are monotonic and ordinary contest workloads stay well below
+// this bound. Once a namespace has published a dynamic mount it remains on the
+// compatibility path; never clearing the bit avoids a removal-side race where
+// lookup could skip a still-published snapshot.
+const FAST_MOUNT_NAMESPACE_SLOTS: usize = 256;
+static DYNAMIC_MOUNT_NAMESPACE_ACTIVE: [core::sync::atomic::AtomicBool;
+    FAST_MOUNT_NAMESPACE_SLOTS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; FAST_MOUNT_NAMESPACE_SLOTS];
+
 // Metadata cache hits must not reacquire the global mount table merely to
 // rediscover a mount's immutable filesystem type. Mount ids are monotonic, so
 // a compact atomic capability table covers the normal contest/runtime mounts;
@@ -385,8 +448,10 @@ pub fn init_mounts() {
     );
     NEXT_MOUNT_ID.store(block_mount_count, Ordering::SeqCst);
 
-    mount_extra_block_devices();
-    mount_kernel_pseudo_filesystems();
+    let mut static_mounts = Vec::new();
+    mount_extra_block_devices(&mut static_mounts);
+    mount_kernel_pseudo_filesystems(&mut static_mounts);
+    STATIC_MOUNTS.publish(static_mounts);
 }
 
 impl MountedFs {
@@ -451,23 +516,34 @@ impl MountedFs {
 
 impl MountTarget {
     fn node(node: VfsNodeId) -> Self {
-        Self::Node(node)
+        Self(node)
     }
 
     fn is_node(&self, node: VfsNodeId) -> bool {
-        matches!(self, Self::Node(target) if *target == node)
+        self.0 == node
     }
 }
 
 fn refresh_dynamic_mount_snapshot() {
     let _writer = DYNAMIC_MOUNTS_FAST_WRITER.lock();
     let mounts = DYNAMIC_MOUNTS.exclusive_session(|mounts| mounts.clone());
+    for mount in &mounts {
+        if let Some(active) = DYNAMIC_MOUNT_NAMESPACE_ACTIVE.get(mount.namespace_id.0) {
+            active.store(true, Ordering::Release);
+        }
+    }
     let expire_pending = mounts
         .iter()
         .filter(|mount| mount.expires_on_next_umount)
         .count();
     DYNAMIC_MOUNT_EXPIRE_PENDING_COUNT.store(expire_pending, Ordering::Release);
     DYNAMIC_MOUNTS_FAST.publish(mounts);
+}
+
+pub(super) fn namespace_has_dynamic_mounts(namespace_id: MountNamespaceId) -> bool {
+    DYNAMIC_MOUNT_NAMESPACE_ACTIVE
+        .get(namespace_id.0)
+        .map_or(true, |active| active.load(Ordering::Acquire))
 }
 
 fn clear_dentry_cache_on_mount_change<T>(result: Result<T, MountError>) -> Result<T, MountError> {
@@ -837,8 +913,8 @@ pub(crate) fn clone_mount_namespace(source_namespace_id: MountNamespaceId) -> Mo
 
 fn ensure_mount_open(mount_id: MountId) -> Result<(), MountError> {
     // CONTEXT: Extra virtio block devices reserve mount ids by DTB order during
-    // init but are opened lazily. This keeps the x0 root disk stable while
-    // allowing explicit `/dev/vdX` mounts to activate x1/x2 only when used.
+    // init but are opened only when their boot-time `/xN` edge or an explicit
+    // `/dev/vdX` mount is installed. This keeps the x0 root disk stable.
     {
         let mounts = MOUNTS.lock();
         let Some(mount) = mounts.get(mount_id.0) else {
@@ -887,11 +963,34 @@ fn primary_root_ino() -> u32 {
     root_ino_for(primary_mount_id()).unwrap_or(2)
 }
 
+fn static_mounted_root_for_child(parent: VfsNodeId, name: &str) -> Option<VfsNodeId> {
+    STATIC_MOUNTS
+        .iter()
+        .find(|mount| mount.parent == parent && mount.name == name)
+        .map(|mount| mount.source_root)
+}
+
+fn static_mounted_root_parent(source_root: VfsNodeId) -> Option<VfsNodeId> {
+    STATIC_MOUNTS
+        .iter()
+        .find(|mount| mount.source_root == source_root)
+        .map(|mount| mount.parent)
+}
+
+fn source_has_static_mount(source_mount_id: MountId) -> bool {
+    STATIC_MOUNTS
+        .iter()
+        .any(|mount| mount.source_root.mount_id == source_mount_id)
+}
+
 pub(super) fn mounted_root_for(
     namespace_id: MountNamespaceId,
     target: VfsNodeId,
     target_path: &str,
 ) -> Option<VfsNodeId> {
+    if !namespace_has_dynamic_mounts(namespace_id) {
+        return None;
+    }
     if DYNAMIC_MOUNT_EXPIRE_PENDING_COUNT.load(Ordering::Acquire) == 0 {
         return DYNAMIC_MOUNTS_FAST.read(|mounts| {
             mounts
@@ -931,6 +1030,9 @@ pub(super) fn mounted_root_for_any_path(
     namespace_id: MountNamespaceId,
     target: VfsNodeId,
 ) -> Option<VfsNodeId> {
+    if !namespace_has_dynamic_mounts(namespace_id) {
+        return None;
+    }
     DYNAMIC_MOUNTS_FAST.read(|mounts| {
         mounts
             .iter()
@@ -940,83 +1042,21 @@ pub(super) fn mounted_root_for_any_path(
     })
 }
 
-pub(super) fn mounted_root_for_synthetic_child(
-    namespace_id: MountNamespaceId,
-    parent: VfsNodeId,
-    target_path: &str,
-) -> Option<VfsNodeId> {
-    DYNAMIC_MOUNTS_FAST.read(|mounts| {
-        mounts
-            .iter()
-            .rev()
-            .find(|mount| {
-                mount.namespace_id == namespace_id
-                    && matches!(
-                        &mount.target,
-                        MountTarget::SyntheticPath { parent: mount_parent, path }
-                            if *mount_parent == parent && path == target_path
-                    )
-            })
-            .map(|mount| mount.source_root)
-    })
+pub(super) fn mounted_root_for_static_child(parent: VfsNodeId, name: &str) -> Option<VfsNodeId> {
+    static_mounted_root_for_child(parent, name)
 }
 
-fn direct_synthetic_child_name<'a>(parent_path: &str, target_path: &'a str) -> Option<&'a str> {
-    let child = if parent_path == "/" {
-        target_path.strip_prefix('/')?
-    } else {
-        target_path
-            .strip_prefix(parent_path)
-            .and_then(|path| path.strip_prefix('/'))?
-    };
-    if child.is_empty() || child.contains('/') {
-        None
-    } else {
-        Some(child)
-    }
-}
-
-pub(super) fn synthetic_children_for_dir(
-    namespace_id: MountNamespaceId,
-    parent: VfsNodeId,
-    parent_path: &str,
-) -> Vec<SyntheticDirEntry> {
-    // CONTEXT: Mounts placed on a path whose backing directory does not exist
-    // still need a visible direct child in getdents64(). Only direct synthetic
-    // children are reported here; deeper paths stay hidden until their parent
-    // is resolved.
-    DYNAMIC_MOUNTS_FAST.read(|mounts| {
-        let mut entries = Vec::new();
-        for mount in mounts.iter().rev() {
-            if mount.namespace_id != namespace_id {
-                continue;
-            }
-            let MountTarget::SyntheticPath {
-                parent: mount_parent,
-                path,
-            } = &mount.target
-            else {
-                continue;
-            };
-            if *mount_parent != parent {
-                continue;
-            }
-            let Some(name) = direct_synthetic_child_name(parent_path, path.as_str()) else {
-                continue;
-            };
-            if entries
-                .iter()
-                .any(|entry: &SyntheticDirEntry| entry.name == name)
-            {
-                continue;
-            }
-            entries.push(SyntheticDirEntry {
-                ino: mount.source_root.ino,
-                name: String::from(name),
-            });
-        }
-        entries
-    })
+pub(super) fn static_mount_children_for_dir(parent: VfsNodeId) -> Vec<SyntheticDirEntry> {
+    // Boot-time mount points remain visible in getdents64 even when the contest
+    // root image does not contain a backing directory entry.
+    STATIC_MOUNTS
+        .iter()
+        .filter(|mount| mount.parent == parent)
+        .map(|mount| SyntheticDirEntry {
+            ino: mount.source_root.ino,
+            name: mount.name.clone(),
+        })
+        .collect()
 }
 
 pub(super) fn mounted_root_parent(
@@ -1024,6 +1064,12 @@ pub(super) fn mounted_root_parent(
     source_root: VfsNodeId,
     target_path: &str,
 ) -> Option<VfsNodeId> {
+    if let Some(parent) = static_mounted_root_parent(source_root) {
+        return Some(parent);
+    }
+    if !namespace_has_dynamic_mounts(namespace_id) {
+        return None;
+    }
     DYNAMIC_MOUNTS_FAST.read(|mounts| {
         // UNFINISHED: VfsNodeId currently names the mounted source node, not a
         // distinct mount instance. If the same source is mounted at multiple
@@ -1060,10 +1106,7 @@ fn lookup_covered_parent(target: VfsNodeId) -> Result<VfsNodeId, MountError> {
 }
 
 fn covered_parent_for_target(target: &MountTarget) -> Result<VfsNodeId, MountError> {
-    match target {
-        MountTarget::Node(node) => lookup_covered_parent(*node),
-        MountTarget::SyntheticPath { parent, .. } => Ok(*parent),
-    }
+    lookup_covered_parent(target.0)
 }
 
 fn path_suffix(base: &str, path: &str) -> Option<String> {
@@ -2501,9 +2544,16 @@ pub(crate) fn unmount_at(
     }
     let unmount_result = DYNAMIC_MOUNTS.exclusive_session(|mounts| {
         let index = if target_is_root {
-            mounts.iter().rposition(|mount| {
-                mount.namespace_id == namespace_id && mount.source_root == target
-            })
+            mounts
+                .iter()
+                .rposition(|mount| {
+                    mount.namespace_id == namespace_id && mount.target.is_node(target)
+                })
+                .or_else(|| {
+                    mounts.iter().rposition(|mount| {
+                        mount.namespace_id == namespace_id && mount.source_root == target
+                    })
+                })
         } else {
             mounts.iter().rposition(|mount| {
                 mount.namespace_id == namespace_id && mount.target_path == target_path
@@ -2596,13 +2646,56 @@ fn release_dynamic_mount_source_if_unused(source_mount_id: MountId) {
     unregister_pending_release_queue(source_mount_id);
 }
 
-fn mount_extra_block_devices() {
+fn install_static_mount(
+    static_mounts: &mut Vec<StaticMount>,
+    parent: WorkingDir,
+    name: String,
+    target_path: String,
+    source_mount_id: MountId,
+) -> Result<(), MountError> {
+    ensure_mount_open(source_mount_id)?;
+    let source_root = VfsNodeId::new(
+        source_mount_id,
+        root_ino_for(source_mount_id).ok_or(MountError::SourceMissing)?,
+    );
+    static_mounts.push(StaticMount {
+        parent: VfsNodeId::new(parent.mount_id(), parent.ino()),
+        name,
+        target_path,
+        source_root,
+    });
+    Ok(())
+}
+
+fn mount_static_pseudo_fs_at(
+    static_mounts: &mut Vec<StaticMount>,
+    parent: WorkingDir,
+    name: &str,
+    target_path: &str,
+    backend: Box<dyn LegacyFileSystemBackend>,
+    fs_type: &'static str,
+    options: &'static str,
+) -> Result<MountId, MountError> {
+    let mount_id = register_mount(MountedFs::new(backend, fs_type.into(), fs_type, options));
+    install_static_mount(
+        static_mounts,
+        parent,
+        name.into(),
+        target_path.into(),
+        mount_id,
+    )?;
+    Ok(mount_id)
+}
+
+fn mount_extra_block_devices(static_mounts: &mut Vec<StaticMount>) {
+    let root = primary_root_dir();
     for index in 1..BLOCK_DEVICES.len() {
-        let Some(target) = ensure_extra_mount_target(index) else {
+        if ensure_extra_mount_target(index).is_none() {
             continue;
-        };
+        }
+        let name = format!("x{index}");
         let target_path = format!("/x{index}");
-        match mount_block_device_at(ROOT_MOUNT_NAMESPACE, target, index, &target_path) {
+        match install_static_mount(static_mounts, root, name, target_path, MountId(index)) {
             Ok(()) => info!("auto-mounted BLOCK_DEVICES[{index}] at /x{index}"),
             Err(MountError::InvalidFilesystem) => {
                 warn!("BLOCK_DEVICES[{index}] is not an ext4 filesystem; leaving /x{index} empty")
@@ -2662,32 +2755,12 @@ fn primary_root_dir() -> WorkingDir {
     WorkingDir::new(primary_mount_id(), primary_root_ino())
 }
 
-fn mount_synthetic_pseudo_fs_at(
-    namespace_id: MountNamespaceId,
-    parent: WorkingDir,
-    target_path: &str,
-    backend: Box<dyn LegacyFileSystemBackend>,
-    fs_type: &'static str,
-    options: &'static str,
-) -> Result<MountId, MountError> {
-    mount_pseudo_fs_on_target(
-        namespace_id,
-        MountTarget::SyntheticPath {
-            parent: VfsNodeId::new(parent.mount_id(), parent.ino()),
-            path: String::from(target_path),
-        },
-        backend,
-        fs_type,
-        target_path,
-        options,
-    )
-}
-
-fn mount_kernel_pseudo_filesystems() {
+fn mount_kernel_pseudo_filesystems(static_mounts: &mut Vec<StaticMount>) {
     let root = primary_root_dir();
-    match mount_synthetic_pseudo_fs_at(
-        ROOT_MOUNT_NAMESPACE,
+    match mount_static_pseudo_fs_at(
+        static_mounts,
         root,
+        "proc",
         "/proc",
         Box::new(ProcFs::new()),
         "proc",
@@ -2701,9 +2774,10 @@ fn mount_kernel_pseudo_filesystems() {
     // needs_tmpdir cases still allocate under /tmp. Back /tmp with the tmpfs
     // implementation for mutability while reporting ext magic so filesystem
     // probes follow the selected contest test filesystem.
-    match mount_synthetic_pseudo_fs_at(
-        ROOT_MOUNT_NAMESPACE,
+    match mount_static_pseudo_fs_at(
+        static_mounts,
         root,
+        "tmp",
         "/tmp",
         Box::new(TmpFs::new_with_statfs_magic(EXT234_SUPER_MAGIC)),
         "ext2",
@@ -2713,9 +2787,10 @@ fn mount_kernel_pseudo_filesystems() {
         Err(err) => warn!("failed to mount ext2 scratch tmpfs at /tmp: {err:?}"),
     }
 
-    match mount_synthetic_pseudo_fs_at(
-        ROOT_MOUNT_NAMESPACE,
+    match mount_static_pseudo_fs_at(
+        static_mounts,
         root,
+        "dev",
         "/dev",
         Box::new(DevFs::new()),
         "devfs",
@@ -2728,9 +2803,10 @@ fn mount_kernel_pseudo_filesystems() {
                 return;
             };
             let dev_root = WorkingDir::new(dev_mount_id, dev_root_ino);
-            match mount_synthetic_pseudo_fs_at(
-                ROOT_MOUNT_NAMESPACE,
+            match mount_static_pseudo_fs_at(
+                static_mounts,
                 dev_root,
+                "shm",
                 "/dev/shm",
                 Box::new(TmpFs::new()),
                 "tmpfs",
@@ -2747,7 +2823,9 @@ fn mount_kernel_pseudo_filesystems() {
 pub fn mount_status_log() {
     info!("filesystem mounted from BLOCK_DEVICES[0] at /");
     for index in 1..BLOCK_DEVICES.len() {
-        if source_has_dynamic_mount(ROOT_MOUNT_NAMESPACE, MountId(index)) {
+        if source_has_static_mount(MountId(index))
+            || source_has_dynamic_mount(ROOT_MOUNT_NAMESPACE, MountId(index))
+        {
             info!("filesystem mounted from BLOCK_DEVICES[{index}] at /x{index}");
         } else if mount_exists(MountId(index)) {
             info!("filesystem on BLOCK_DEVICES[{index}] is open but not mounted");
@@ -2896,6 +2974,18 @@ pub(crate) fn list_mounts(namespace_id: MountNamespaceId) -> Vec<MountInfo> {
             fs_type,
             options,
         });
+    }
+
+    for mount in STATIC_MOUNTS.iter() {
+        if let Some((source, fs_type, options, _)) = mount_metadata(mount.source_root.mount_id) {
+            infos.push(MountInfo {
+                id: mount.source_root.mount_id,
+                source,
+                target: mount.target_path.clone(),
+                fs_type,
+                options,
+            });
+        }
     }
 
     let dynamic_mounts = DYNAMIC_MOUNTS.exclusive_session(|mounts| {

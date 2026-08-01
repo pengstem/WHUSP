@@ -18,7 +18,7 @@ use super::super::mount::{
     mounted_backend_lease, release_inode_from_drop, release_inode_from_drop_with_lease,
     retain_inode, retain_inode_with_lease, stat_basic_cached,
     stat_basic_cached_with_state_and_lease, stat_full_cached,
-    stat_full_cached_with_state_and_lease, synthetic_children_for_dir, with_mount,
+    stat_full_cached_with_state_and_lease, static_mount_children_for_dir, with_mount,
 };
 use super::super::named_fifo::open_named_fifo;
 use super::super::path::{PathContext, WorkingDir};
@@ -1836,25 +1836,21 @@ impl VfsFile {
     }
 
     fn read_synthetic_dirent64(&self, entry_offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
-        let Some(parent_path) = self.visible_path.as_deref() else {
-            return Ok((0, entry_offset));
-        };
-        let entries: Vec<RawDirEntry> =
-            synthetic_children_for_dir(self.namespace_id, self.node, parent_path)
-                .into_iter()
-                .filter(|entry| {
-                    !self.with_backend(BackendOp::Lookup, |mount| {
-                        mount
-                            .lookup_component_from(self.node.ino, entry.name.as_str())
-                            .is_ok()
-                    })
+        let entries: Vec<RawDirEntry> = static_mount_children_for_dir(self.node)
+            .into_iter()
+            .filter(|entry| {
+                !self.with_backend(BackendOp::Lookup, |mount| {
+                    mount
+                        .lookup_component_from(self.node.ino, entry.name.as_str())
+                        .is_ok()
                 })
-                .map(|entry| RawDirEntry {
-                    ino: entry.ino,
-                    name: entry.name,
-                    dtype: DT_DIR,
-                })
-                .collect();
+            })
+            .map(|entry| RawDirEntry {
+                ino: entry.ino,
+                name: entry.name,
+                dtype: DT_DIR,
+            })
+            .collect();
         let (read_size, next_entry_offset) = write_dir_entries_with_offset_base(
             entries.as_slice(),
             entry_offset,

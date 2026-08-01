@@ -1,9 +1,8 @@
 use super::super::mount::{
-    MountNamespaceId, mount_supports_dentry_cache, mounted_root_for,
-    mounted_root_for_synthetic_child, mounted_root_parent, primary_mount_id, root_ino_for,
-    with_mount,
+    MountNamespaceId, mount_supports_dentry_cache, mounted_root_for, mounted_root_for_static_child,
+    mounted_root_parent, namespace_has_dynamic_mounts, primary_mount_id, root_ino_for, with_mount,
 };
-use super::super::path::{PathContext, WorkingDir};
+use super::super::path::{PathContext, WorkingDir, normalize_path_at_root};
 use super::super::{dentry_cache, dentry_cache::DentryLookupResult, inode_state};
 use super::{BackendOp, FsError, FsNodeKind, FsResult, VfsNodeId};
 use crate::perf;
@@ -59,6 +58,7 @@ struct VfsCursor {
     node: VfsNodeId,
     kind: FsNodeKind,
     path: String,
+    tracks_path: bool,
 }
 
 #[derive(Debug)]
@@ -107,13 +107,10 @@ impl VfsPath {
 }
 
 impl VfsCreateTarget<'_> {
-    pub(crate) fn synthetic_child(&self, context: &PathContext) -> Option<VfsPath> {
-        mounted_root_for_synthetic_child(
-            context.namespace_id(),
-            self.parent,
-            self.leaf_path.as_str(),
-        )
-        .map(|node| VfsPath::with_visible_path(node, FsNodeKind::Directory, self.leaf_path.clone()))
+    pub(crate) fn synthetic_child(&self, _context: &PathContext) -> Option<VfsPath> {
+        mounted_root_for_static_child(self.parent, self.leaf_name).map(|node| {
+            VfsPath::with_visible_path(node, FsNodeKind::Directory, self.leaf_path.clone())
+        })
     }
 }
 
@@ -124,6 +121,7 @@ impl VfsCursor {
             node: VfsNodeId::new(root.mount_id(), root.ino()),
             kind: FsNodeKind::Directory,
             path: String::from(context.root_path()),
+            tracks_path: true,
         }
     }
 
@@ -136,6 +134,7 @@ impl VfsCursor {
             node: VfsNodeId::new(root.mount_id(), root.ino()),
             kind: FsNodeKind::Directory,
             path,
+            tracks_path: true,
         }
     }
 
@@ -148,7 +147,63 @@ impl VfsCursor {
             node: VfsNodeId::new(cwd.mount_id(), cwd.ino()),
             kind: FsNodeKind::Directory,
             path,
+            tracks_path: true,
         }
+    }
+
+    fn numeric_start(context: &PathContext, path: &str) -> Self {
+        let working_dir = if path.starts_with('/') {
+            context.root()
+        } else {
+            context.cwd()
+        };
+        Self {
+            node: VfsNodeId::new(working_dir.mount_id(), working_dir.ino()),
+            kind: FsNodeKind::Directory,
+            path: String::new(),
+            tracks_path: false,
+        }
+    }
+
+    fn root_for_tracking(context: &PathContext, tracks_path: bool) -> Self {
+        if tracks_path {
+            Self::root(context)
+        } else {
+            Self::numeric_start(context, "/")
+        }
+    }
+
+    fn materialize_path(&mut self, context: &PathContext, path: &str) -> FsResult {
+        if self.tracks_path {
+            return Ok(());
+        }
+        let base_path = if path.starts_with('/') {
+            context.root_path()
+        } else {
+            context.cwd_path()
+        };
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsLookupVisiblePath);
+        let visible_path = if path == "/" {
+            String::from(context.root_path())
+        } else if path_is_simple(path) {
+            if path.starts_with('/') {
+                if context.root_path() == "/" {
+                    String::from(path)
+                } else {
+                    alloc::format!("{}{path}", context.root_path())
+                }
+            } else if base_path == "/" {
+                alloc::format!("/{path}")
+            } else {
+                alloc::format!("{base_path}/{path}")
+            }
+        } else {
+            normalize_path_at_root(context.root_path(), base_path, path).ok_or(FsError::NotFound)?
+        };
+        perf::record_vfs_visible_path_update(1);
+        self.path = visible_path;
+        self.tracks_path = true;
+        Ok(())
     }
 
     fn into_path(self) -> VfsPath {
@@ -160,6 +215,15 @@ impl VfsCursor {
     }
 }
 
+fn path_is_simple(path: &str) -> bool {
+    let components = path.strip_prefix('/').unwrap_or(path);
+    !components.is_empty()
+        && !components.ends_with('/')
+        && components
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
 impl VfsChildLookup {
     fn into_parent(mut self) -> VfsCursor {
         self.cursor.path.truncate(self.parent_path_len);
@@ -167,6 +231,7 @@ impl VfsChildLookup {
             node: self.parent_node,
             kind: self.parent_kind,
             path: self.cursor.path,
+            tracks_path: self.cursor.tracks_path,
         }
     }
 }
@@ -175,12 +240,17 @@ fn follow_mounted_root(context: &PathContext, cursor: VfsCursor) -> VfsCursor {
     if cursor.kind != FsNodeKind::Directory {
         return cursor;
     }
+    if !cursor.tracks_path {
+        debug_assert!(!namespace_has_dynamic_mounts(context.namespace_id()));
+        return cursor;
+    }
     if let Some(node) = mounted_root_for(context.namespace_id(), cursor.node, cursor.path.as_str())
     {
         return VfsCursor {
             node,
             kind: FsNodeKind::Directory,
             path: cursor.path,
+            tracks_path: true,
         };
     }
     cursor
@@ -352,21 +422,19 @@ fn lookup_child_raw(
     let parent_node = cursor.node;
     let parent_kind = cursor.kind;
     let parent_path_len = cursor.path.len();
-    if component == ".." {
-        truncate_visible_path_parent(&mut cursor.path);
-    } else {
-        push_visible_path_component(&mut cursor.path, component);
-    };
+    if cursor.tracks_path {
+        if component == ".." {
+            truncate_visible_path_parent(&mut cursor.path);
+        } else {
+            push_visible_path_component(&mut cursor.path, component);
+        };
+    }
     if component != ".."
-        && let Some(node) = mounted_root_for_synthetic_child(
-            context.namespace_id(),
-            parent_node,
-            cursor.path.as_str(),
-        )
+        && let Some(node) = mounted_root_for_static_child(parent_node, component)
     {
-        // Synthetic mount targets such as lazy extra block devices are VFS
-        // overlay entries, not backend dirents. Resolve them before backend
-        // lookup so an absent covered directory can still expose the mount.
+        // Static boot mounts are VFS edges, not necessarily backend dirents.
+        // Resolve them before backend lookup so a root image without the
+        // covered directory can still expose the mount point.
         cursor.node = node;
         cursor.kind = FsNodeKind::Directory;
         return Ok(VfsChildLookup {
@@ -394,7 +462,7 @@ fn lookup_child_raw(
 fn lookup_parent(context: &PathContext, cursor: VfsCursor) -> FsResult<VfsCursor> {
     if cursor.is_mount_root() {
         if cursor.node.mount_id == primary_mount_id() {
-            return Ok(VfsCursor::root(context));
+            return Ok(VfsCursor::root_for_tracking(context, cursor.tracks_path));
         }
         if let Some(parent) =
             mounted_root_parent(context.namespace_id(), cursor.node, cursor.path.as_str())
@@ -402,14 +470,18 @@ fn lookup_parent(context: &PathContext, cursor: VfsCursor) -> FsResult<VfsCursor
             return Ok(VfsCursor {
                 node: parent,
                 kind: FsNodeKind::Directory,
-                path: parent_visible_path(cursor.path.as_str()),
+                path: cursor
+                    .tracks_path
+                    .then(|| parent_visible_path(cursor.path.as_str()))
+                    .unwrap_or_default(),
+                tracks_path: cursor.tracks_path,
             });
         }
         // UNFINISHED: This kernel still allows unmounting without mount-user
         // reference checks, so a cwd can point at a detached mounted root. Linux
         // keeps such paths alive through mount references; we currently fall
         // back to `/` for that orphaned case.
-        return Ok(VfsCursor::root(context));
+        return Ok(VfsCursor::root_for_tracking(context, cursor.tracks_path));
     }
     lookup_child_raw(context, cursor, "..").map(|child| child.cursor)
 }
@@ -422,7 +494,10 @@ fn lookup_parent_in_context(cursor: VfsCursor, context: &PathContext) -> FsResul
     lookup_parent(context, cursor)
 }
 
-fn start_cursor(context: &PathContext, path: &str) -> VfsCursor {
+fn start_cursor(context: &PathContext, path: &str, track_path: bool) -> VfsCursor {
+    if !track_path {
+        return VfsCursor::numeric_start(context, path);
+    }
     let capacity_hint = path.len().saturating_add(1);
     if path.starts_with('/') {
         VfsCursor::root_with_capacity(context, capacity_hint)
@@ -484,7 +559,8 @@ fn resolve_path_streaming_no_symlink(
     if path.is_empty() {
         return Err(FsError::NotFound);
     }
-    let mut cursor = start_cursor(context, path);
+    let track_path = namespace_has_dynamic_mounts(context.namespace_id());
+    let mut cursor = start_cursor(context, path, track_path);
     let mut components_seen = 0usize;
     let mut components = path
         .split('/')
@@ -514,6 +590,7 @@ fn resolve_path_streaming_no_symlink(
     if mode.follow_final_mount() && components_seen == 0 {
         cursor = follow_mounted_root(context, cursor);
     }
+    cursor.materialize_path(context, path)?;
     Ok(Some(cursor))
 }
 
@@ -522,7 +599,7 @@ fn resolve_path_with_component_vec(
     path: &str,
     mode: LookupMode,
 ) -> FsResult<VfsCursor> {
-    let mut cursor = start_cursor(&context, path);
+    let mut cursor = start_cursor(&context, path, true);
     let mut components = borrowed_path_components(path);
     let mut index = 0usize;
     let mut symlink_follows = 0usize;
@@ -631,7 +708,7 @@ pub(crate) fn resolve_create_parent_in(
     let (parent_path, leaf_name) = split_parent_path(path)?;
     let parent_path = parent_path_for_lookup(path, parent_path);
     let parent = if parent_path.is_empty() {
-        let cursor = start_cursor(&context, path);
+        let cursor = start_cursor(&context, path, true);
         follow_mounted_root(&context, cursor)
     } else {
         resolve_path_inner(context.clone(), parent_path, LookupMode::FollowFinal)?
