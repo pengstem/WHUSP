@@ -29,8 +29,8 @@ pub(crate) use frame_allocator::frame_cache_stats;
 pub use frame_allocator::{
     FrameTracker, frame_alloc, frame_alloc_more, frame_alloc_uninit, frame_ref_count, frame_stats,
 };
+pub(crate) use kernel_space::insert_global_kernel_framed_area_uninit;
 pub use kernel_space::{KERNEL_SPACE, kernel_token};
-pub(crate) use kernel_space::{insert_global_kernel_framed_area_uninit, remove_global_kernel_area};
 pub use memory_set::MemorySet;
 pub use page_table::{PageTable, PageTableEntry, UserBuffer};
 pub(crate) use page_table::{TranslatedUserBuffer, UserSegment};

@@ -63,6 +63,11 @@ pub(crate) fn insert_global_kernel_framed_area_uninit(
 }
 
 /// Removes a dynamically allocated mapping shared by every kernel page table.
+// CONTEXT: Kernel stacks are retained at their live high-water mark, so the
+// first pool stage has no removal caller. Keep this synchronized primitive for
+// a future bounded batch-retirement policy instead of weakening its lifetime
+// guarantees or open-coding global shootdown.
+#[allow(dead_code)]
 pub(crate) fn remove_global_kernel_area(start_vpn: VirtPageNum) -> bool {
     let removed = KERNEL_SPACE
         .exclusive_access()

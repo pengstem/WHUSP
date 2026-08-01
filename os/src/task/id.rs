@@ -1,9 +1,6 @@
 use super::ProcessControlBlock;
 use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
-use crate::mm::{
-    MapPermission, PhysPageNum, VirtAddr, insert_global_kernel_framed_area_uninit,
-    remove_global_kernel_area,
-};
+use crate::mm::{MapPermission, PhysPageNum, VirtAddr, insert_global_kernel_framed_area_uninit};
 use crate::sync::UPIntrFreeCell;
 use alloc::{
     sync::{Arc, Weak},
@@ -56,8 +53,8 @@ impl RecycleAllocator {
 lazy_static! {
     static ref PID_ALLOCATOR: UPIntrFreeCell<RecycleAllocator> =
         unsafe { UPIntrFreeCell::new(RecycleAllocator::new_from(1)) };
-    static ref KSTACK_ALLOCATOR: UPIntrFreeCell<RecycleAllocator> =
-        unsafe { UPIntrFreeCell::new(RecycleAllocator::new()) };
+    static ref KSTACK_ALLOCATOR: UPIntrFreeCell<KernelStackAllocator> =
+        unsafe { UPIntrFreeCell::new(KernelStackAllocator::new()) };
 }
 
 pub const IDLE_PID: usize = 0;
@@ -89,15 +86,111 @@ pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
 
 pub struct KernelStack(pub usize);
 
+struct KernelStackAllocator {
+    ids: RecycleAllocator,
+    available: Vec<usize>,
+    live: usize,
+    mapped_slots: usize,
+}
+
+struct KernelStackAllocation {
+    id: usize,
+    reused: bool,
+}
+
+impl KernelStackAllocator {
+    fn new() -> Self {
+        Self {
+            ids: RecycleAllocator::new(),
+            available: Vec::new(),
+            live: 0,
+            mapped_slots: 0,
+        }
+    }
+
+    fn alloc(&mut self) -> KernelStackAllocation {
+        let allocation = if let Some(id) = self.available.pop() {
+            KernelStackAllocation { id, reused: true }
+        } else {
+            self.mapped_slots = self
+                .mapped_slots
+                .checked_add(1)
+                .expect("kernel stack slot count overflow");
+            KernelStackAllocation {
+                id: self.ids.alloc(),
+                reused: false,
+            }
+        };
+        self.live = self
+            .live
+            .checked_add(1)
+            .expect("live kernel stack count overflow");
+        self.assert_accounting();
+        crate::perf::record_kernel_stack_alloc(
+            allocation.reused,
+            self.live,
+            self.mapped_slots,
+            self.available.len(),
+        );
+        allocation
+    }
+
+    fn rollback_fresh(&mut self, id: usize) {
+        self.live = self
+            .live
+            .checked_sub(1)
+            .expect("rolling back a kernel stack without a live reservation");
+        self.mapped_slots = self
+            .mapped_slots
+            .checked_sub(1)
+            .expect("rolling back a kernel stack without a mapped reservation");
+        self.ids.dealloc(id);
+        self.assert_accounting();
+        crate::perf::record_kernel_stack_state(self.live, self.mapped_slots, self.available.len());
+    }
+
+    fn release(&mut self, id: usize) {
+        self.live = self
+            .live
+            .checked_sub(1)
+            .expect("dropping a kernel stack when none are live");
+        debug_assert!(
+            !self.available.contains(&id),
+            "kernel stack {id} entered the mapped pool twice"
+        );
+        self.available.push(id);
+        self.assert_accounting();
+        crate::perf::record_kernel_stack_release(
+            self.live,
+            self.mapped_slots,
+            self.available.len(),
+        );
+    }
+
+    fn assert_accounting(&self) {
+        assert_eq!(
+            self.live + self.available.len(),
+            self.mapped_slots,
+            "kernel stack pool accounting diverged"
+        );
+    }
+}
+
 pub fn kstack_alloc() -> KernelStack {
-    let kstack_id = KSTACK_ALLOCATOR.exclusive_access().alloc();
+    let allocation = KSTACK_ALLOCATOR.exclusive_access().alloc();
+    if allocation.reused {
+        return KernelStack(allocation.id);
+    }
+    let kstack_id = allocation.id;
     let (kstack_bottom, kstack_top) = kernel_stack_position(kstack_id);
     if !insert_global_kernel_framed_area_uninit(
         kstack_bottom.into(),
         kstack_top.into(),
         MapPermission::R | MapPermission::W,
     ) {
-        KSTACK_ALLOCATOR.exclusive_access().dealloc(kstack_id);
+        KSTACK_ALLOCATOR
+            .exclusive_access()
+            .rollback_fresh(kstack_id);
         panic!("failed to allocate kernel stack {kstack_id}");
     }
     KernelStack(kstack_id)
@@ -105,16 +198,10 @@ pub fn kstack_alloc() -> KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        let (kernel_stack_bottom, _) = kernel_stack_position(self.0);
-        let kernel_stack_bottom_va: VirtAddr = kernel_stack_bottom.into();
-        assert!(
-            remove_global_kernel_area(kernel_stack_bottom_va.into()),
-            "kernel stack {} was not mapped",
-            self.0
-        );
-        // The stack VA is reusable only after every online CPU has invalidated
-        // the old mapping and the retired backing pages have been released.
-        KSTACK_ALLOCATOR.exclusive_access().dealloc(self.0);
+        // TaskControlBlock drops are deferred through EXITED_TASKS until the
+        // task is off-CPU. Retaining that unreachable stack's frames and PTEs
+        // lets the next task reuse the slot without two global TLB shootdowns.
+        KSTACK_ALLOCATOR.exclusive_access().release(self.0);
     }
 }
 

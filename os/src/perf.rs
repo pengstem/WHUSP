@@ -332,6 +332,14 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) tlb_flush_all_calls: usize,
     pub(crate) tlb_flush_range_calls: usize,
     pub(crate) tlb_flush_range_pages: usize,
+    pub(crate) kernel_stack_fresh_mappings: usize,
+    pub(crate) kernel_stack_pool_reuses: usize,
+    pub(crate) kernel_stack_pool_releases: usize,
+    pub(crate) kernel_stack_live: usize,
+    pub(crate) kernel_stack_live_max: usize,
+    pub(crate) kernel_stack_mapped_slots: usize,
+    pub(crate) kernel_stack_pool_depth: usize,
+    pub(crate) kernel_stack_pool_depth_max: usize,
     pub(crate) mount_metadata_calls: usize,
     pub(crate) mount_metadata_source_clone_bytes: usize,
     pub(crate) mount_fast_stat_flags_calls: usize,
@@ -710,6 +718,14 @@ mod enabled {
     static TLB_FLUSH_ALL_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TLB_FLUSH_RANGE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TLB_FLUSH_RANGE_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static KERNEL_STACK_FRESH_MAPPINGS: AtomicUsize = AtomicUsize::new(0);
+    static KERNEL_STACK_POOL_REUSES: AtomicUsize = AtomicUsize::new(0);
+    static KERNEL_STACK_POOL_RELEASES: AtomicUsize = AtomicUsize::new(0);
+    static KERNEL_STACK_LIVE: AtomicUsize = AtomicUsize::new(0);
+    static KERNEL_STACK_LIVE_MAX: AtomicUsize = AtomicUsize::new(0);
+    static KERNEL_STACK_MAPPED_SLOTS: AtomicUsize = AtomicUsize::new(0);
+    static KERNEL_STACK_POOL_DEPTH: AtomicUsize = AtomicUsize::new(0);
+    static KERNEL_STACK_POOL_DEPTH_MAX: AtomicUsize = AtomicUsize::new(0);
     static MOUNT_METADATA_CALLS: AtomicUsize = AtomicUsize::new(0);
     static MOUNT_METADATA_SOURCE_CLONE_BYTES: AtomicUsize = AtomicUsize::new(0);
     static MOUNT_FAST_STAT_FLAGS_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -1916,6 +1932,37 @@ mod enabled {
         TLB_FLUSH_RANGE_PAGES.fetch_add(pages, Ordering::Relaxed);
     }
 
+    fn record_kernel_stack_state_inner(live: usize, mapped_slots: usize, pool_depth: usize) {
+        KERNEL_STACK_LIVE.store(live, Ordering::Relaxed);
+        update_max(&KERNEL_STACK_LIVE_MAX, live);
+        KERNEL_STACK_MAPPED_SLOTS.store(mapped_slots, Ordering::Relaxed);
+        KERNEL_STACK_POOL_DEPTH.store(pool_depth, Ordering::Relaxed);
+        update_max(&KERNEL_STACK_POOL_DEPTH_MAX, pool_depth);
+    }
+
+    pub(crate) fn record_kernel_stack_alloc(
+        reused: bool,
+        live: usize,
+        mapped_slots: usize,
+        pool_depth: usize,
+    ) {
+        if reused {
+            KERNEL_STACK_POOL_REUSES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            KERNEL_STACK_FRESH_MAPPINGS.fetch_add(1, Ordering::Relaxed);
+        }
+        record_kernel_stack_state_inner(live, mapped_slots, pool_depth);
+    }
+
+    pub(crate) fn record_kernel_stack_release(live: usize, mapped_slots: usize, pool_depth: usize) {
+        KERNEL_STACK_POOL_RELEASES.fetch_add(1, Ordering::Relaxed);
+        record_kernel_stack_state_inner(live, mapped_slots, pool_depth);
+    }
+
+    pub(crate) fn record_kernel_stack_state(live: usize, mapped_slots: usize, pool_depth: usize) {
+        record_kernel_stack_state_inner(live, mapped_slots, pool_depth);
+    }
+
     pub(crate) fn record_mount_metadata(source_len: usize) {
         MOUNT_METADATA_CALLS.fetch_add(1, Ordering::Relaxed);
         MOUNT_METADATA_SOURCE_CLONE_BYTES.fetch_add(source_len, Ordering::Relaxed);
@@ -2702,6 +2749,14 @@ mod enabled {
             tlb_flush_all_calls: TLB_FLUSH_ALL_CALLS.load(Ordering::Relaxed),
             tlb_flush_range_calls: TLB_FLUSH_RANGE_CALLS.load(Ordering::Relaxed),
             tlb_flush_range_pages: TLB_FLUSH_RANGE_PAGES.load(Ordering::Relaxed),
+            kernel_stack_fresh_mappings: KERNEL_STACK_FRESH_MAPPINGS.load(Ordering::Relaxed),
+            kernel_stack_pool_reuses: KERNEL_STACK_POOL_REUSES.load(Ordering::Relaxed),
+            kernel_stack_pool_releases: KERNEL_STACK_POOL_RELEASES.load(Ordering::Relaxed),
+            kernel_stack_live: KERNEL_STACK_LIVE.load(Ordering::Relaxed),
+            kernel_stack_live_max: KERNEL_STACK_LIVE_MAX.load(Ordering::Relaxed),
+            kernel_stack_mapped_slots: KERNEL_STACK_MAPPED_SLOTS.load(Ordering::Relaxed),
+            kernel_stack_pool_depth: KERNEL_STACK_POOL_DEPTH.load(Ordering::Relaxed),
+            kernel_stack_pool_depth_max: KERNEL_STACK_POOL_DEPTH_MAX.load(Ordering::Relaxed),
             mount_metadata_calls: MOUNT_METADATA_CALLS.load(Ordering::Relaxed),
             mount_metadata_source_clone_bytes: MOUNT_METADATA_SOURCE_CLONE_BYTES
                 .load(Ordering::Relaxed),
@@ -3123,6 +3178,14 @@ mod enabled {
          tlb_flush_all_calls {}\n\
          tlb_flush_range_calls {}\n\
          tlb_flush_range_pages {}\n\
+         kernel_stack_fresh_mappings {}\n\
+         kernel_stack_pool_reuses {}\n\
+         kernel_stack_pool_releases {}\n\
+         kernel_stack_live {}\n\
+         kernel_stack_live_max {}\n\
+         kernel_stack_mapped_slots {}\n\
+         kernel_stack_pool_depth {}\n\
+         kernel_stack_pool_depth_max {}\n\
          mount_metadata_calls {}\n\
          mount_metadata_source_clone_bytes {}\n\
          mount_fast_stat_flags_calls {}\n\
@@ -3496,6 +3559,14 @@ mod enabled {
             stats.tlb_flush_all_calls,
             stats.tlb_flush_range_calls,
             stats.tlb_flush_range_pages,
+            stats.kernel_stack_fresh_mappings,
+            stats.kernel_stack_pool_reuses,
+            stats.kernel_stack_pool_releases,
+            stats.kernel_stack_live,
+            stats.kernel_stack_live_max,
+            stats.kernel_stack_mapped_slots,
+            stats.kernel_stack_pool_depth,
+            stats.kernel_stack_pool_depth_max,
             stats.mount_metadata_calls,
             stats.mount_metadata_source_clone_bytes,
             stats.mount_fast_stat_flags_calls,
@@ -4049,6 +4120,31 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_tlb_flush_range(_pages: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_kernel_stack_alloc(
+        _reused: bool,
+        _live: usize,
+        _mapped_slots: usize,
+        _pool_depth: usize,
+    ) {
+    }
+
+    #[inline(always)]
+    pub(crate) fn record_kernel_stack_release(
+        _live: usize,
+        _mapped_slots: usize,
+        _pool_depth: usize,
+    ) {
+    }
+
+    #[inline(always)]
+    pub(crate) fn record_kernel_stack_state(
+        _live: usize,
+        _mapped_slots: usize,
+        _pool_depth: usize,
+    ) {
+    }
 
     #[inline(always)]
     pub(crate) fn record_mount_metadata(_source_len: usize) {}
