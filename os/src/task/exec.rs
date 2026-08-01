@@ -83,14 +83,26 @@ const fn riscv_hwcap(letter: u8) -> usize {
 }
 
 #[cfg(target_arch = "riscv64")]
-const ELF_HWCAP: usize = riscv_hwcap(b'I')
-    | riscv_hwcap(b'M')
-    | riscv_hwcap(b'A')
-    | riscv_hwcap(b'F')
-    | riscv_hwcap(b'D')
-    | riscv_hwcap(b'C');
-#[cfg(not(target_arch = "riscv64"))]
-const ELF_HWCAP: usize = 0;
+fn elf_hwcap() -> usize {
+    riscv_hwcap(b'I')
+        | riscv_hwcap(b'M')
+        | riscv_hwcap(b'A')
+        | riscv_hwcap(b'F')
+        | riscv_hwcap(b'D')
+        | riscv_hwcap(b'C')
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn elf_hwcap() -> usize {
+    const HWCAP_LOONGARCH_CPUCFG: usize = 1 << 0;
+    const HWCAP_LOONGARCH_UAL: usize = 1 << 2;
+
+    let mut hwcap = HWCAP_LOONGARCH_CPUCFG;
+    if loongArch64::cpu::get_ual() {
+        hwcap |= HWCAP_LOONGARCH_UAL;
+    }
+    hwcap
+}
 
 pub(super) struct ExecStackInfo {
     pub(super) at_entry: usize,
@@ -201,7 +213,7 @@ fn plan_user_stack(
     auxv.push((AT_EUID, stack_info.euid as usize));
     auxv.push((AT_GID, stack_info.gid as usize));
     auxv.push((AT_EGID, stack_info.egid as usize));
-    auxv.push((AT_HWCAP, ELF_HWCAP));
+    auxv.push((AT_HWCAP, elf_hwcap()));
     // Keep this in sync with TICKS_PER_SEC so libc converts times(2) clock
     // ticks using the same Linux USER_HZ value the kernel reports.
     auxv.push((AT_CLKTCK, 100));
