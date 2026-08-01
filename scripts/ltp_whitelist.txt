@@ -45,10 +45,8 @@ fcntl27
 getrandom05
 sched_rr_get_interval02
 pipe08
-af_alg06
 pipe01
 waitid03
-af_alg03
 wait02
 add_key03
 clone03
@@ -118,7 +116,6 @@ access03
 mlock201
 fanotify02
 lseek11
-af_alg01
 msgctl01
 prctl08
 setreuid03
@@ -530,7 +527,6 @@ msgget03
 epoll_wait05
 ptrace11
 epoll_wait04
-af_alg05
 msgget01
 write04
 fcntl04
@@ -678,7 +674,6 @@ read01
 waitpid06
 epoll_ctl05
 creat03
-af_alg02
 rename10
 execve04
 rename09

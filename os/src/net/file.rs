@@ -1,75 +1,7 @@
 use super::*;
 use crate::fs::SocketFileCapability;
 
-impl SocketFileCapability for AfAlgSocket {}
-
 impl SocketFileCapability for LocalSocket {}
-
-impl File for AfAlgSocket {
-    fn as_any(&self) -> &dyn core::any::Any {
-        self
-    }
-
-    fn readable(&self) -> bool {
-        true
-    }
-
-    fn writable(&self) -> bool {
-        true
-    }
-
-    fn read(&self, buf: UserBuffer) -> usize {
-        self.read_output(buf).unwrap_or_default()
-    }
-
-    fn write(&self, buf: UserBuffer) -> usize {
-        let len = buf.len();
-        if self.is_hash_request() {
-            return len;
-        }
-        self.push_input(&buf.to_vec(), AfAlgSendParams::default())
-            .map(|_| len)
-            .unwrap_or_default()
-    }
-
-    fn poll(&self, events: PollEvents) -> PollEvents {
-        events & (PollEvents::POLLIN | PollEvents::POLLOUT)
-    }
-
-    fn stat(&self) -> crate::fs::FsResult<FileStat> {
-        // CONTEXT: Match LocalSocket's current visible file type. The generic
-        // read path still has a broad directory bit check that treats S_IFSOCK
-        // as a directory, which would break AF_ALG request reads.
-        Ok(FileStat::with_mode(S_IFIFO | 0o777))
-    }
-
-    fn check_read(&self, _len: usize) -> crate::fs::FsResult {
-        self.prepare_output().map_err(|_| FsError::InvalidInput)
-    }
-
-    fn check_write(&self, _len: usize, _append: bool) -> crate::fs::FsResult {
-        match &self.kind {
-            AfAlgSocketKind::Request(_) => Ok(()),
-            AfAlgSocketKind::Listener(_) => Err(FsError::InvalidInput),
-        }
-    }
-
-    fn write_ignores_user_buffer(&self) -> bool {
-        self.is_hash_request()
-    }
-
-    fn status_flags(&self) -> OpenFlags {
-        *self.status_flags.exclusive_access()
-    }
-
-    fn set_status_flags(&self, flags: OpenFlags) {
-        *self.status_flags.exclusive_access() = flags;
-    }
-
-    fn as_socket(&self) -> Option<&dyn SocketFileCapability> {
-        Some(self)
-    }
-}
 
 impl File for LocalSocket {
     fn as_any(&self) -> &dyn core::any::Any {

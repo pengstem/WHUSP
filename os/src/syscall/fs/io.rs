@@ -1968,14 +1968,6 @@ pub fn sys_write_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize
         )?;
         allowed_len
     };
-    if file.write_ignores_user_buffer() {
-        // CONTEXT: AF_ALG hash request writes in the current contest subset do
-        // not consume payload bytes; skipping the copy keeps af_alg04 from
-        // spending most of its time fault-checking data that is discarded.
-        fanotify_notify_modify(&file, allowed_len);
-        inotify_notify_modify(&file, allowed_len);
-        return Ok(allowed_len as isize);
-    }
     let buffers = translated_byte_buffer_checked_with_mmap_fault_ctx(
         ctx,
         buf,

@@ -6,7 +6,6 @@ pub(crate) const AF_INET: i32 = 2;
 pub(crate) const AF_INET6: i32 = 10;
 pub(crate) const AF_NETLINK: i32 = 16;
 pub(crate) const AF_PACKET: i32 = 17;
-pub(crate) const AF_ALG: i32 = 38;
 pub(crate) const SOCK_STREAM: i32 = 1;
 pub(crate) const SOCK_DGRAM: i32 = 2;
 pub(crate) const SOCK_RAW: i32 = 3;
@@ -21,7 +20,6 @@ pub(crate) const IPPROTO_UDPLITE: i32 = 136;
 pub(crate) const IP_BIND_ADDRESS_NO_PORT: i32 = 24;
 pub(crate) const SOL_SOCKET: i32 = 1;
 pub(crate) const SOL_PACKET: i32 = 263;
-pub(crate) const SOL_ALG: i32 = 279;
 pub(crate) const SO_REUSEADDR: i32 = 2;
 pub(crate) const SO_TYPE: i32 = 3;
 pub(crate) const SO_ERROR: i32 = 4;
@@ -87,12 +85,6 @@ pub(crate) const SHUT_WR: i32 = 1;
 pub(crate) const SHUT_RDWR: i32 = 2;
 pub(crate) const MSG_DONTWAIT: i32 = 0x40;
 pub(crate) const MSG_WAITFORONE: i32 = 0x10000;
-pub(crate) const ALG_SET_KEY: i32 = 1;
-pub(crate) const ALG_SET_IV: i32 = 2;
-pub(crate) const ALG_SET_OP: i32 = 3;
-pub(crate) const ALG_SET_AEAD_ASSOCLEN: i32 = 4;
-pub(crate) const ALG_OP_DECRYPT: u32 = 0;
-pub(crate) const ALG_OP_ENCRYPT: u32 = 1;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LinuxSockAddrIn {
@@ -155,24 +147,6 @@ pub(crate) struct LinuxOldTimespec {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct LinuxCmsghdr {
-    pub(crate) cmsg_len: usize,
-    pub(crate) cmsg_level: i32,
-    pub(crate) cmsg_type: i32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct LinuxSockAddrAlg {
-    pub(crate) family: u16,
-    pub(crate) alg_type: [u8; 14],
-    pub(crate) feat: u32,
-    pub(crate) mask: u32,
-    pub(crate) name: [u8; 64],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LinuxTPacketReq3 {
     pub(crate) tp_block_size: u32,
     pub(crate) tp_block_nr: u32,
@@ -190,6 +164,4 @@ const _: [(); 12] = [(); core::mem::size_of::<LinuxSockAddrNl>()];
 const _: [(); 56] = [(); core::mem::size_of::<LinuxMsghdr>()];
 const _: [(); 64] = [(); core::mem::size_of::<LinuxMmsghdr>()];
 const _: [(); 16] = [(); core::mem::size_of::<LinuxOldTimespec>()];
-const _: [(); 16] = [(); core::mem::size_of::<LinuxCmsghdr>()];
-const _: [(); 88] = [(); core::mem::size_of::<LinuxSockAddrAlg>()];
 const _: [(); 28] = [(); core::mem::size_of::<LinuxTPacketReq3>()];

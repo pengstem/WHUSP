@@ -5,15 +5,11 @@
 //! `127.0.0.1` inside one guest.  Packets never leave the kernel and virtio-net
 //! is not involved.
 
-#[path = "alg.rs"]
-mod alg;
 #[path = "file.rs"]
 mod file;
 #[path = "netlink.rs"]
 mod netlink;
 
-pub(crate) use alg::AfAlgSocket;
-use alg::{AfAlgSendParams, AfAlgSocketKind};
 use netlink::build_netlink_route_responses;
 
 use crate::config::PAGE_SIZE;
@@ -25,13 +21,11 @@ use crate::mm::UserBuffer;
 use crate::perf;
 use crate::sync::UPIntrFreeCell;
 use crate::syscall::user_ptr::{
-    UserBufferAccess, read_user_array_item, read_user_value,
-    translated_byte_buffer_checked_with_mmap_fault,
+    UserBufferAccess, read_user_array_item, translated_byte_buffer_checked_with_mmap_fault,
 };
 use crate::task::{
     TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
-    current_has_unmasked_signal, current_process, current_task, current_user_token, schedule,
-    wakeup_task,
+    current_has_unmasked_signal, current_process, current_task, schedule, wakeup_task,
 };
 use crate::timer::{add_timer, get_time_ms};
 use crate::uapi::errno::{Errno, KResult};
@@ -1893,15 +1887,4 @@ impl VecLenChecked for Vec<u8> {
     fn checked_len_add(&self, len: usize) -> KResult<usize> {
         self.len().checked_add(len).ok_or(Errno::EINVAL)
     }
-}
-
-fn read_u32_ne(bytes: &[u8]) -> u32 {
-    let mut raw = [0u8; size_of::<u32>()];
-    raw.copy_from_slice(&bytes[..size_of::<u32>()]);
-    u32::from_ne_bytes(raw)
-}
-
-fn cmsg_align(len: usize) -> usize {
-    let align = size_of::<usize>();
-    (len + align - 1) & !(align - 1)
 }

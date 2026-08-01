@@ -160,11 +160,6 @@ fn forced_socket_buffer_size(raw: u32) -> i32 {
 
 pub fn sys_socket(domain: i32, ty: i32, protocol: i32) -> KResult {
     let flags = open_flags_from_socket_type(ty)?;
-    if domain == AF_ALG {
-        AfAlgSocket::validate_socket_type(ty, protocol)?;
-        let socket = AfAlgSocket::new_listener(flags);
-        return Ok(alloc_socket_fd(socket, flags)? as isize);
-    }
     if domain == AF_NETLINK {
         if !matches!(ty & SOCK_TYPE_MASK, SOCK_RAW | SOCK_DGRAM) {
             return Err(Errno::EPROTONOSUPPORT);
@@ -263,10 +258,6 @@ pub fn sys_socketpair(domain: i32, ty: i32, protocol: i32, sv: usize) -> KResult
 pub fn sys_bind(fd: usize, addr: usize, addrlen: u32) -> KResult {
     let token = current_user_token();
     let file = file_from_fd(fd)?;
-    if let Some(socket) = file.as_any().downcast_ref::<AfAlgSocket>() {
-        socket.bind_alg(read_sockaddr_alg(token, addr, addrlen)?)?;
-        return Ok(0);
-    }
     let socket = file
         .as_any()
         .downcast_ref::<LocalSocket>()
@@ -292,13 +283,6 @@ pub fn sys_accept4(fd: usize, addr: usize, addrlen: usize, flags: i32) -> KResul
     let open_flags = open_flags_from_accept4(flags)?;
     let token = current_user_token();
     let file = file_from_fd(fd)?;
-    if let Some(socket) = file.as_any().downcast_ref::<AfAlgSocket>() {
-        let accepted = socket.accept_request(open_flags)?;
-        if addr != 0 && addrlen != 0 {
-            write_user_value(token, addrlen as *mut u32, &0)?;
-        }
-        return Ok(alloc_socket_fd(accepted, open_flags)? as isize);
-    }
     let socket = file
         .as_any()
         .downcast_ref::<LocalSocket>()
@@ -383,14 +367,6 @@ pub fn sys_recvfrom(
 pub fn sys_setsockopt(fd: usize, level: i32, name: i32, val: usize, len: u32) -> KResult {
     let token = current_user_token();
     let file = file_from_fd(fd)?;
-    if let Some(socket) = file.as_any().downcast_ref::<AfAlgSocket>() {
-        if level != SOL_ALG || name != ALG_SET_KEY {
-            return Err(Errno::ENOPROTOOPT);
-        }
-        let key = copy_user_to_vec(token, val, len as usize)?;
-        socket.set_key(&key)?;
-        return Ok(0);
-    }
     let socket = file
         .as_any()
         .downcast_ref::<LocalSocket>()
@@ -509,11 +485,6 @@ pub fn sys_shutdown(fd: usize, how: i32) -> KResult {
 
 pub fn sys_sendmsg(fd: usize, msg: usize, _flags: i32) -> KResult {
     let file = file_from_fd(fd)?;
-    if let Some(socket) = file.as_any().downcast_ref::<AfAlgSocket>() {
-        let token = current_user_token();
-        let msg = read_user_value(token, msg as *const LinuxMsghdr)?;
-        return Ok(socket.send_msg(msg)? as isize);
-    }
     if let Some(socket) = file.as_any().downcast_ref::<LocalSocket>() {
         let token = current_user_token();
         let msg = read_user_value(token, msg as *const LinuxMsghdr)?;
@@ -824,14 +795,4 @@ fn copy_to_msg_iovecs(token: usize, iov: usize, iovlen: usize, data: &[u8]) -> K
         written += copy_len;
     }
     Ok(written)
-}
-
-fn read_sockaddr_alg(token: usize, ptr: usize, len: u32) -> KResult<LinuxSockAddrAlg> {
-    if ptr == 0 {
-        return Err(Errno::EFAULT);
-    }
-    if (len as usize) < size_of::<LinuxSockAddrAlg>() {
-        return Err(Errno::EINVAL);
-    }
-    read_user_value(token, ptr as *const LinuxSockAddrAlg)
 }
