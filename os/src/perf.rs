@@ -527,9 +527,214 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) futex_bucket_waiter_count_max: usize,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum UsercopyAccess {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum UsercopySite {
+    ReadValue,
+    ReadUsize,
+    ReadArrayItem,
+    WriteValue,
+    WriteArrayItem,
+    CopyToUser,
+    CopyToUserInMemorySet,
+}
+
+macro_rules! declare_perf_events {
+    ($callback:ident) => {
+        $callback! {
+            fn record_scheduler_fetch(_queue_len: usize, _scanned: usize, _pruned_exited: usize,) => record_scheduler_fetch_impl;
+            fn record_scheduler_rt_priority_probes(_probes: usize) => record_scheduler_rt_priority_probes_impl;
+            fn record_scheduler_placement(_cpu_probes: usize) => record_scheduler_placement_impl;
+            fn record_scheduler_idle_pull(_probes: usize, _stolen_tasks: usize) => record_scheduler_idle_pull_impl;
+            fn record_scheduler_remote_wake_push(_sent_ipi: bool) => record_scheduler_remote_wake_push_impl;
+            fn record_scheduler_remote_wake_drain(_tasks: usize) => record_scheduler_remote_wake_drain_impl;
+            fn record_scheduler_need_resched(_needed: bool, _newly_set: bool) => record_scheduler_need_resched_impl;
+            fn record_scheduler_need_resched_ipi() => record_scheduler_need_resched_ipi_impl;
+            fn record_scheduler_need_resched_consumed() => record_scheduler_need_resched_consumed_impl;
+            fn record_task_wakeup(_front: bool) => record_task_wakeup_impl;
+            fn record_syscall_dispatch_call() => record_syscall_dispatch_call_impl;
+            fn record_syscall_identity_fast_path() => record_syscall_identity_fast_path_impl;
+            fn record_task_current_call() => record_task_current_call_impl;
+            fn record_task_current_process_call() => record_task_current_process_call_impl;
+            fn record_task_current_user_token_call() => record_task_current_user_token_call_impl;
+            fn record_task_current_trap_cx_call() => record_task_current_trap_cx_call_impl;
+            fn record_task_current_trap_return_context_call() => record_task_current_trap_return_context_call_impl;
+            fn record_signal_action_table_lock_call() => record_signal_action_table_lock_call_impl;
+            fn record_time_nanos_to_timespec_call() => record_time_nanos_to_timespec_call_impl;
+            fn record_time_direct_timespec_call() => record_time_direct_timespec_call_impl;
+            fn record_riscv_return_fence_i_call() => record_riscv_return_fence_i_call_impl;
+            fn record_la_return_invtlb_call() => record_la_return_invtlb_call_impl;
+            fn record_rv_user_trap_entry() => record_rv_user_trap_entry_impl;
+            fn record_rv_sbi_set_timer_call() => record_rv_sbi_set_timer_call_impl;
+            fn record_rv_user_fp_save_call() => record_rv_user_fp_save_call_impl;
+            fn record_rv_user_fp_restore_call() => record_rv_user_fp_restore_call_impl;
+            fn record_rv_user_fp_lazy_init_trap() => record_rv_user_fp_lazy_init_trap_impl;
+            fn record_arch_instruction_barrier_call() => record_arch_instruction_barrier_call_impl;
+            fn record_tid_lookup(_process_visits: usize, _task_visits: usize, _hit: bool, _index_hit: bool, _stale_index_entry: bool,) => record_tid_lookup_impl;
+            fn record_exec_stack_copy(_bytes: usize) => record_exec_stack_copy_impl;
+            fn record_wait_child_scan(_child_slots: usize) => record_wait_child_scan_impl;
+            fn record_scheduler_normal_requeue(_vruntime_delta: usize) => record_scheduler_normal_requeue_impl;
+            fn record_fd_alloc(_probed_slots: usize, _expanded_slots: usize, _table_len: usize, _success: bool,) => record_fd_alloc_impl;
+            fn record_fd_bitmap_word_probes(_words: usize) => record_fd_bitmap_word_probes_impl;
+            fn record_fd_install(_table_len: usize) => record_fd_install_impl;
+            fn record_fd_take() => record_fd_take_impl;
+            fn record_epoll_ctl(_linear_probes: usize, _tree_lookups: usize, _interest_count: usize,) => record_epoll_ctl_impl;
+            fn record_epoll_scan(_interest_visits: usize, _ready_events: usize) => record_epoll_scan_impl;
+            fn record_epoll_ready_list(_source_visits: usize, _ready_events: usize) => record_epoll_ready_list_impl;
+            fn record_epoll_backoff_sleep(_duration_us: usize) => record_epoll_backoff_sleep_impl;
+            fn record_epoll_waiter_registrations(_count: usize) => record_epoll_waiter_registrations_impl;
+            fn record_epoll_waiter_sleep() => record_epoll_waiter_sleep_impl;
+            fn record_poll_scan(_fd_visits: usize, _ready_events: usize) => record_poll_scan_impl;
+            fn record_poll_fd_table_lookup() => record_poll_fd_table_lookup_impl;
+            fn record_vfs_read_cache_hit(_bytes: usize) => record_vfs_read_cache_hit_impl;
+            fn record_vfs_read_cache_miss() => record_vfs_read_cache_miss_impl;
+            fn record_vfs_read_cache_backend_read() => record_vfs_read_cache_backend_read_impl;
+            fn record_vfs_read_cache_invalidation(_pages: usize, _scanned_pages: usize) => record_vfs_read_cache_invalidation_impl;
+            fn record_vfs_read_cache_readahead(_pages: usize) => record_vfs_read_cache_readahead_impl;
+            fn record_vfs_read_cache_eligible() => record_vfs_read_cache_eligible_impl;
+            fn record_vfs_read_cache_skip_dirty_pages() => record_vfs_read_cache_skip_dirty_pages_impl;
+            fn record_vfs_read_all_call() => record_vfs_read_all_call_impl;
+            fn record_vfs_read_all_backend_read(_bytes: usize) => record_vfs_read_all_backend_read_impl;
+            fn record_vfs_read_backend(_bytes: usize) => record_vfs_read_backend_impl;
+            fn record_vfs_read_coalesced(_bytes: usize) => record_vfs_read_coalesced_impl;
+            fn record_vfs_path_components(_components: usize, _allocations: usize) => record_vfs_path_components_impl;
+            fn record_vfs_visible_path_update(_allocations: usize) => record_vfs_visible_path_update_impl;
+            fn record_vfs_visible_path_allocation() => record_vfs_visible_path_allocation_impl;
+            fn record_vfs_dirent_read(_user_buffer_bytes: usize, _scratch_bytes: usize, _returned_bytes: usize,) => record_vfs_dirent_read_impl;
+            fn record_ext4_dirent_name(_name_len: usize, _allocated: bool) => record_ext4_dirent_name_impl;
+            fn record_procfs_content_build(_bytes: usize) => record_procfs_content_build_impl;
+            fn record_procfs_snapshot_hit(_bytes: usize) => record_procfs_snapshot_hit_impl;
+            fn record_vfs_write_user_buffer(_slices: usize) => record_vfs_write_user_buffer_impl;
+            fn record_vfs_write_backend(_bytes: usize) => record_vfs_write_backend_impl;
+            fn record_vfs_write_coalesced(_bytes: usize) => record_vfs_write_coalesced_impl;
+            fn record_writev_regular_bounce(_bytes: usize) => record_writev_regular_bounce_impl;
+            fn record_writev_regular_direct_user_buffer(_bytes: usize) => record_writev_regular_direct_user_buffer_impl;
+            fn record_pwritev_regular_bounce(_bytes: usize) => record_pwritev_regular_bounce_impl;
+            fn record_pwritev_regular_direct_user_buffer(_bytes: usize) => record_pwritev_regular_direct_user_buffer_impl;
+            fn record_page_cache_clean_eviction(_pages: usize) => record_page_cache_clean_eviction_impl;
+            fn record_page_cache_generation_epoch_begin() => record_page_cache_generation_epoch_begin_impl;
+            fn record_page_cache_generation_epoch_finish() => record_page_cache_generation_epoch_finish_impl;
+            fn record_page_cache_generation_retry() => record_page_cache_generation_retry_impl;
+            fn record_page_cache_stale_fill_drop(_pages: usize) => record_page_cache_stale_fill_drop_impl;
+            fn record_page_cache_stale_install_retry() => record_page_cache_stale_install_retry_impl;
+            fn record_page_cache_capacity_reject() => record_page_cache_capacity_reject_impl;
+            fn record_mmap_clean_page_cache(_hit: bool) => record_mmap_clean_page_cache_impl;
+            fn record_mmap_clean_page_cache_fill() => record_mmap_clean_page_cache_fill_impl;
+            fn record_tmpfs_allocated_payload_len(_sparse_extents: usize) => record_tmpfs_allocated_payload_len_impl;
+            fn record_tmpfs_allocated_logical_len(_sparse_extents: usize) => record_tmpfs_allocated_logical_len_impl;
+            fn record_sysv_msg_current_bytes(_messages: usize) => record_sysv_msg_current_bytes_impl;
+            fn record_brk_grow(_pages: usize) => record_brk_grow_impl;
+            fn record_brk_eager_mapped(_pages: usize) => record_brk_eager_mapped_impl;
+            fn record_brk_lazy_extended(_pages: usize) => record_brk_lazy_extended_impl;
+            fn record_brk_lazy_fault_page() => record_brk_lazy_fault_page_impl;
+            fn record_frame_alloc(_zeroed: bool) => record_frame_alloc_impl;
+            fn record_mmap_private_fault(_file_backed: bool, _full_file_overwrite: bool, _read_request_bytes: usize, _read_bytes: usize, _file_zero_bytes_needed: usize,) => record_mmap_private_fault_impl;
+            fn record_frame_dealloc(_released: bool, _refcount_drop: bool, _recycled_scan_slots: usize, _recycled_len: usize,) => record_frame_dealloc_impl;
+            fn record_dev_zero_read(_bytes: usize, _byte_writes: usize, _fill_bytes: usize) => record_dev_zero_read_impl;
+            fn record_dev_random_read(_bytes: usize, _byte_writes: usize, _word_fill_bytes: usize,) => record_dev_random_read_impl;
+            fn record_uart_write(_bytes: usize) => record_uart_write_impl;
+            fn record_tlb_flush_all() => record_tlb_flush_all_impl;
+            fn record_tlb_flush_range(_pages: usize) => record_tlb_flush_range_impl;
+            fn record_fresh_tlb_generation_publish(_pages: usize, _remote_targets: usize) => record_fresh_tlb_generation_publish_impl;
+            fn record_kernel_stack_alloc(_reused: bool, _live: usize, _mapped_slots: usize, _pool_depth: usize,) => record_kernel_stack_alloc_impl;
+            fn record_kernel_stack_release(_live: usize, _mapped_slots: usize, _pool_depth: usize,) => record_kernel_stack_release_impl;
+            fn record_kernel_stack_state(_live: usize, _mapped_slots: usize, _pool_depth: usize,) => record_kernel_stack_state_impl;
+            fn record_mount_metadata(_source_len: usize) => record_mount_metadata_impl;
+            fn record_mount_fast_stat_flags() => record_mount_fast_stat_flags_impl;
+            fn record_mount_fast_fs_type() => record_mount_fast_fs_type_impl;
+            fn record_mount_backend_contended_acquisition() => record_mount_backend_contended_acquisition_impl;
+            fn record_ext4_bcache_index_lock(_contended: bool) => record_ext4_bcache_index_lock_impl;
+            fn record_ext4_bcache_lba_lock(_contended: bool) => record_ext4_bcache_lba_lock_impl;
+            fn record_ext4_block_read(_blocks: usize, _bytes: usize) => record_ext4_block_read_impl;
+            fn record_ext4_block_write(_blocks: usize, _bytes: usize) => record_ext4_block_write_impl;
+            fn record_ext4_sequence_read(_bytes: usize) => record_ext4_sequence_read_impl;
+            fn record_ext4_sequence_writer_entry(_active_writers: usize) => record_ext4_sequence_writer_entry_impl;
+            fn record_ext4_sequence_reader_wait_yield() => record_ext4_sequence_reader_wait_yield_impl;
+            fn record_ext4_sequence_reader_retry(_blocks: usize, _bytes: usize) => record_ext4_sequence_reader_retry_impl;
+            fn record_ext4_read_plan_attempt() => record_ext4_read_plan_attempt_impl;
+            fn record_ext4_read_plan_prepared(_data_runs: usize, _data_blocks: usize, _zero_runs: usize, _zero_blocks: usize,) => record_ext4_read_plan_prepared_impl;
+            fn record_ext4_read_plan_fallback() => record_ext4_read_plan_fallback_impl;
+            fn record_ext4_read_plan_executed(_bytes: usize) => record_ext4_read_plan_executed_impl;
+            fn record_ext4_read_plan_direct_io(_calls: usize, _blocks: usize, _bytes: usize) => record_ext4_read_plan_direct_io_impl;
+            fn record_ext4_directory_plan_attempt() => record_ext4_directory_plan_attempt_impl;
+            fn record_ext4_directory_plan_prepared(_data_runs: usize, _data_blocks: usize) => record_ext4_directory_plan_prepared_impl;
+            fn record_ext4_directory_plan_fallback() => record_ext4_directory_plan_fallback_impl;
+            fn record_ext4_directory_plan_executed(_bytes: usize) => record_ext4_directory_plan_executed_impl;
+            fn record_ext4_directory_plan_direct_io(_calls: usize, _blocks: usize, _bytes: usize,) => record_ext4_directory_plan_direct_io_impl;
+            fn record_ext4_write_plan_attempt() => record_ext4_write_plan_attempt_impl;
+            fn record_ext4_write_plan_prepared(_data_runs: usize, _data_blocks: usize, _invalidated_aliases: usize,) => record_ext4_write_plan_prepared_impl;
+            fn record_ext4_write_plan_fallback(_alias_busy: bool) => record_ext4_write_plan_fallback_impl;
+            fn record_ext4_write_plan_rmw_read(_calls: usize, _blocks: usize, _bytes: usize) => record_ext4_write_plan_rmw_read_impl;
+            fn record_ext4_write_plan_executed(_bytes: usize, _direct_calls: usize, _direct_blocks: usize, _direct_bytes: usize,) => record_ext4_write_plan_executed_impl;
+            fn record_ext4_metadata_transaction_attempt() => record_ext4_metadata_transaction_attempt_impl;
+            fn record_ext4_metadata_transaction_begin() => record_ext4_metadata_transaction_begin_impl;
+            fn record_ext4_metadata_transaction_end() => record_ext4_metadata_transaction_end_impl;
+            fn record_ext4_metadata_transaction_fallback() => record_ext4_metadata_transaction_fallback_impl;
+            fn record_ext4_metadata_transaction_commit(_read_lbas: usize, _write_lbas: usize, _device_write_calls: usize, _device_write_blocks: usize, _merged_lbas: usize,) => record_ext4_metadata_transaction_commit_impl;
+            fn record_eventfd_read_call() => record_eventfd_read_call_impl;
+            fn record_eventfd_write_call() => record_eventfd_write_call_impl;
+            fn record_eventfd_reader_sleep() => record_eventfd_reader_sleep_impl;
+            fn record_eventfd_writer_sleep() => record_eventfd_writer_sleep_impl;
+            fn record_eventfd_reader_wakeup() => record_eventfd_reader_wakeup_impl;
+            fn record_eventfd_writer_wakeup() => record_eventfd_writer_wakeup_impl;
+            fn record_local_socket_read_call() => record_local_socket_read_call_impl;
+            fn record_local_socket_write_call() => record_local_socket_write_call_impl;
+            fn record_local_socket_reader_sleep() => record_local_socket_reader_sleep_impl;
+            fn record_local_socket_writer_sleep() => record_local_socket_writer_sleep_impl;
+            fn record_local_socket_reader_wakeup() => record_local_socket_reader_wakeup_impl;
+            fn record_local_socket_writer_wakeup() => record_local_socket_writer_wakeup_impl;
+            fn record_local_socket_write_user_buffer(_bytes: usize, _to_vec_bytes: usize, _stream_direct_bytes: usize,) => record_local_socket_write_user_buffer_impl;
+            fn record_local_socket_stream_recv(_contiguous_bytes: usize, _slice_bytes: usize) => record_local_socket_stream_recv_impl;
+            fn record_pipe_read_call() => record_pipe_read_call_impl;
+            fn record_pipe_write_call() => record_pipe_write_call_impl;
+            fn record_pipe_read_chunk_copy(_bytes: usize) => record_pipe_read_chunk_copy_impl;
+            fn record_pipe_write_chunk_copy(_bytes: usize) => record_pipe_write_chunk_copy_impl;
+            fn record_pipe_reader_sleep() => record_pipe_reader_sleep_impl;
+            fn record_pipe_writer_sleep() => record_pipe_writer_sleep_impl;
+            fn record_copy_file_range_call() => record_copy_file_range_call_impl;
+            fn record_copy_file_range_chunk(_bytes: usize) => record_copy_file_range_chunk_impl;
+            fn record_sendfile_call() => record_sendfile_call_impl;
+            fn record_sendfile_chunk(_bytes: usize) => record_sendfile_chunk_impl;
+            fn record_splice_call() => record_splice_call_impl;
+            fn record_splice_chunk(_bytes: usize) => record_splice_chunk_impl;
+            fn record_mmap_hole_search(_page_probes: usize, _gap_checks: usize, _area_visits: usize, _vma_count: usize,) => record_mmap_hole_search_impl;
+            fn record_vma_lookup(_area_probes: usize, _hit: bool) => record_vma_lookup_impl;
+            fn record_vma_range_scan(_area_visits: usize, _index_skips: usize) => record_vma_range_scan_impl;
+            fn record_user_c_string_call() => record_user_c_string_call_impl;
+            fn record_user_c_string_chunk(_scanned_bytes: usize, _copied_bytes: usize, _ascii: bool,) => record_user_c_string_chunk_impl;
+            fn record_usercopy_same_page_fast(_access: UsercopyAccess, _bytes: usize) => record_usercopy_same_page_fast_impl;
+            fn record_usercopy_slow_path(_page_count: usize) => record_usercopy_slow_path_impl;
+            fn record_usercopy_checked_range(_pages: usize, _bytes: usize) => record_usercopy_checked_range_impl;
+            fn record_usercopy_translated_shape(_segments: usize) => record_usercopy_translated_shape_impl;
+            fn record_usercopy_segment_vec_alloc(_slots: usize) => record_usercopy_segment_vec_alloc_impl;
+            fn record_usercopy_range_reuse(_chunks: usize, _pages: usize, _bytes: usize) => record_usercopy_range_reuse_impl;
+            fn record_usercopy_site(_site: UsercopySite, _bytes: usize) => record_usercopy_site_impl;
+            fn record_inotify_no_live_group_fast_path() => record_inotify_no_live_group_fast_path_impl;
+            fn record_inotify_live_group_scan() => record_inotify_live_group_scan_impl;
+            fn record_inotify_node_name_remember() => record_inotify_node_name_remember_impl;
+            fn record_inotify_unlinked_node_update() => record_inotify_unlinked_node_update_impl;
+            fn record_fanotify_no_live_group_fast_path() => record_fanotify_no_live_group_fast_path_impl;
+            fn record_fanotify_live_group_scan() => record_fanotify_live_group_scan_impl;
+            fn record_fanotify_node_name_remember() => record_fanotify_node_name_remember_impl;
+            fn record_fanotify_node_name_lookup() => record_fanotify_node_name_lookup_impl;
+            fn record_futex_cleanup(_direct_hit: bool, _already_unqueued: bool, _fallback_queue_visits: usize, _fallback_waiter_visits: usize,) => record_futex_cleanup_impl;
+            fn record_futex_wake(_key_hit: bool, _tasks: usize) => record_futex_wake_impl;
+            fn record_futex_manager_state(_queue_count: usize, _waiter_count: usize, _bucket_queue_count: usize, _bucket_waiter_count: usize,) => record_futex_manager_state_impl;
+        }
+    };
+}
+
 #[cfg(feature = "perf-counters")]
 mod enabled {
-    use super::{KernelPerfSnapshot, PROFILE_POINT_COUNT, PerCpuCounter, PerCpuMax, ProfilePoint};
+    use super::{
+        KernelPerfSnapshot, PROFILE_POINT_COUNT, PerCpuCounter, PerCpuMax, ProfilePoint,
+        UsercopyAccess, UsercopySite,
+    };
     use crate::fs::{BackendIoSnapshot, BackendOp};
     use alloc::format;
     use alloc::string::String;
@@ -1427,14 +1632,14 @@ mod enabled {
         }
     }
 
-    pub(crate) fn record_scheduler_fetch(queue_len: usize, scanned: usize, pruned_exited: usize) {
+    fn record_scheduler_fetch_impl(queue_len: usize, scanned: usize, pruned_exited: usize) {
         SCHEDULER_FETCH_CALLS.fetch_add(1, Ordering::Relaxed);
         SCHEDULER_SCANNED_TASKS.fetch_add(scanned, Ordering::Relaxed);
         SCHEDULER_PRUNED_EXITED_TASKS.fetch_add(pruned_exited, Ordering::Relaxed);
         update_max(&SCHEDULER_READY_QUEUE_LEN_MAX, queue_len);
     }
 
-    pub(crate) fn record_scheduler_rt_priority_probes(probes: usize) {
+    fn record_scheduler_rt_priority_probes_impl(probes: usize) {
         SCHEDULER_RT_PRIORITY_PROBES.fetch_add(probes, Ordering::Relaxed);
     }
 
@@ -1447,7 +1652,7 @@ mod enabled {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_scheduler_placement(cpu_probes: usize) {
+    fn record_scheduler_placement_impl(cpu_probes: usize) {
         SCHEDULER_PLACEMENT_CALLS.fetch_add(1, Ordering::Relaxed);
         SCHEDULER_PLACEMENT_CPU_PROBES.fetch_add(cpu_probes, Ordering::Relaxed);
     }
@@ -1456,7 +1661,7 @@ mod enabled {
         SCHEDULER_REMOTE_RQ_LOCK_ACQUIRES.fetch_add(acquires, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_scheduler_idle_pull(probes: usize, stolen_tasks: usize) {
+    fn record_scheduler_idle_pull_impl(probes: usize, stolen_tasks: usize) {
         SCHEDULER_IDLE_PULL_CALLS.fetch_add(1, Ordering::Relaxed);
         SCHEDULER_VICTIM_PROBES.fetch_add(probes, Ordering::Relaxed);
         update_max(&SCHEDULER_IDLE_PULL_PROBE_MAX, probes);
@@ -1467,14 +1672,14 @@ mod enabled {
         }
     }
 
-    pub(crate) fn record_scheduler_remote_wake_push(sent_ipi: bool) {
+    fn record_scheduler_remote_wake_push_impl(sent_ipi: bool) {
         SCHEDULER_REMOTE_WAKE_LIST_PUSHES.fetch_add(1, Ordering::Relaxed);
         if sent_ipi {
             SCHEDULER_REMOTE_WAKE_IPIS.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    pub(crate) fn record_scheduler_remote_wake_drain(tasks: usize) {
+    fn record_scheduler_remote_wake_drain_impl(tasks: usize) {
         if tasks == 0 {
             return;
         }
@@ -1483,7 +1688,7 @@ mod enabled {
         update_max(&SCHEDULER_REMOTE_WAKE_LIST_BATCH_MAX, tasks);
     }
 
-    pub(crate) fn record_scheduler_need_resched(needed: bool, newly_set: bool) {
+    fn record_scheduler_need_resched_impl(needed: bool, newly_set: bool) {
         SCHEDULER_NEED_RESCHED_CHECKS.fetch_add(1, Ordering::Relaxed);
         if !needed {
             return;
@@ -1497,15 +1702,15 @@ mod enabled {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_scheduler_need_resched_ipi() {
+    fn record_scheduler_need_resched_ipi_impl() {
         SCHEDULER_NEED_RESCHED_IPIS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_scheduler_need_resched_consumed() {
+    fn record_scheduler_need_resched_consumed_impl() {
         SCHEDULER_NEED_RESCHED_CONSUMED.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_task_wakeup(front: bool) {
+    fn record_task_wakeup_impl(front: bool) {
         let counter = if front {
             &WAKEUP_FRONT_SUCCESSES
         } else {
@@ -1514,86 +1719,86 @@ mod enabled {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_syscall_dispatch_call() {
+    fn record_syscall_dispatch_call_impl() {
         SYSCALL_DISPATCH_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_syscall_identity_fast_path() {
+    fn record_syscall_identity_fast_path_impl() {
         SYSCALL_IDENTITY_FAST_PATHS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_task_current_call() {
+    fn record_task_current_call_impl() {
         TASK_CURRENT_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_task_current_process_call() {
+    fn record_task_current_process_call_impl() {
         TASK_CURRENT_PROCESS_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_task_current_user_token_call() {
+    fn record_task_current_user_token_call_impl() {
         TASK_CURRENT_USER_TOKEN_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_task_current_trap_cx_call() {
+    fn record_task_current_trap_cx_call_impl() {
         TASK_CURRENT_TRAP_CX_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_task_current_trap_return_context_call() {
+    fn record_task_current_trap_return_context_call_impl() {
         TASK_CURRENT_TRAP_RETURN_CONTEXT_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_signal_action_table_lock_call() {
+    fn record_signal_action_table_lock_call_impl() {
         SIGNAL_ACTION_TABLE_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_time_nanos_to_timespec_call() {
+    fn record_time_nanos_to_timespec_call_impl() {
         TIME_NANOS_TO_TIMESPEC_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_time_direct_timespec_call() {
+    fn record_time_direct_timespec_call_impl() {
         TIME_DIRECT_TIMESPEC_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
-    pub(crate) fn record_riscv_return_fence_i_call() {
+    fn record_riscv_return_fence_i_call_impl() {
         RISCV_RETURN_FENCE_I_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
-    pub(crate) fn record_la_return_invtlb_call() {
+    fn record_la_return_invtlb_call_impl() {
         LA_RETURN_INVTLB_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
-    pub(crate) fn record_rv_user_trap_entry() {
+    fn record_rv_user_trap_entry_impl() {
         RV_USER_TRAP_ENTRIES.fetch_add(1, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
-    pub(crate) fn record_rv_sbi_set_timer_call() {
+    fn record_rv_sbi_set_timer_call_impl() {
         RV_SBI_SET_TIMER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
-    pub(crate) fn record_rv_user_fp_save_call() {
+    fn record_rv_user_fp_save_call_impl() {
         RV_USER_FP_SAVE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
-    pub(crate) fn record_rv_user_fp_restore_call() {
+    fn record_rv_user_fp_restore_call_impl() {
         RV_USER_FP_RESTORE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
-    pub(crate) fn record_rv_user_fp_lazy_init_trap() {
+    fn record_rv_user_fp_lazy_init_trap_impl() {
         RV_USER_FP_LAZY_INIT_TRAPS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_arch_instruction_barrier_call() {
+    fn record_arch_instruction_barrier_call_impl() {
         ARCH_INSTRUCTION_BARRIER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_fd_alloc(
+    fn record_fd_alloc_impl(
         probed_slots: usize,
         expanded_slots: usize,
         table_len: usize,
@@ -1608,135 +1813,131 @@ mod enabled {
         update_max(&FD_TABLE_LEN_MAX, table_len);
     }
 
-    pub(crate) fn record_fd_bitmap_word_probes(words: usize) {
+    fn record_fd_bitmap_word_probes_impl(words: usize) {
         FD_ALLOC_BITMAP_WORD_PROBES.fetch_add(words, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_fd_install(table_len: usize) {
+    fn record_fd_install_impl(table_len: usize) {
         FD_INSTALL_CALLS.fetch_add(1, Ordering::Relaxed);
         update_max(&FD_TABLE_LEN_MAX, table_len);
     }
 
-    pub(crate) fn record_fd_take() {
+    fn record_fd_take_impl() {
         FD_TAKE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_epoll_ctl(
-        linear_probes: usize,
-        tree_lookups: usize,
-        interest_count: usize,
-    ) {
+    fn record_epoll_ctl_impl(linear_probes: usize, tree_lookups: usize, interest_count: usize) {
         EPOLL_CTL_CALLS.fetch_add(1, Ordering::Relaxed);
         EPOLL_CTL_LINEAR_PROBES.fetch_add(linear_probes, Ordering::Relaxed);
         EPOLL_CTL_TREE_LOOKUPS.fetch_add(tree_lookups, Ordering::Relaxed);
         update_max(&EPOLL_INTEREST_COUNT_MAX, interest_count);
     }
 
-    pub(crate) fn record_epoll_scan(interest_visits: usize, ready_events: usize) {
+    fn record_epoll_scan_impl(interest_visits: usize, ready_events: usize) {
         EPOLL_FULL_SCANS.fetch_add(1, Ordering::Relaxed);
         EPOLL_SCAN_INTEREST_VISITS.fetch_add(interest_visits, Ordering::Relaxed);
         EPOLL_READY_EVENTS.fetch_add(ready_events, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_epoll_ready_list(source_visits: usize, ready_events: usize) {
+    fn record_epoll_ready_list_impl(source_visits: usize, ready_events: usize) {
         EPOLL_READY_LIST_CHECKS.fetch_add(1, Ordering::Relaxed);
         EPOLL_READY_LIST_SOURCE_VISITS.fetch_add(source_visits, Ordering::Relaxed);
         EPOLL_READY_LIST_HITS.fetch_add(ready_events, Ordering::Relaxed);
         EPOLL_READY_EVENTS.fetch_add(ready_events, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_epoll_backoff_sleep(duration_us: usize) {
+    fn record_epoll_backoff_sleep_impl(duration_us: usize) {
         EPOLL_BACKOFF_SLEEPS.fetch_add(1, Ordering::Relaxed);
         EPOLL_BACKOFF_US.fetch_add(duration_us, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_epoll_waiter_registrations(count: usize) {
+    fn record_epoll_waiter_registrations_impl(count: usize) {
         EPOLL_WAITER_REGISTRATIONS.fetch_add(count, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_epoll_waiter_sleep() {
+    fn record_epoll_waiter_sleep_impl() {
         EPOLL_WAITER_SLEEPS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_poll_scan(fd_visits: usize, ready_events: usize) {
+    fn record_poll_scan_impl(fd_visits: usize, ready_events: usize) {
         POLL_WAIT_SCANS.fetch_add(1, Ordering::Relaxed);
         POLL_WAIT_FD_VISITS.fetch_add(fd_visits, Ordering::Relaxed);
         POLL_WAIT_READY_EVENTS.fetch_add(ready_events, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_poll_fd_table_lookup() {
+    fn record_poll_fd_table_lookup_impl() {
         POLL_FD_TABLE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_read_cache_hit(bytes: usize) {
+    fn record_vfs_read_cache_hit_impl(bytes: usize) {
         VFS_READ_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
         VFS_READ_CACHE_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_read_cache_miss() {
+    fn record_vfs_read_cache_miss_impl() {
         VFS_READ_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_read_cache_backend_read() {
+    fn record_vfs_read_cache_backend_read_impl() {
         VFS_READ_CACHE_BACKEND_READS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_read_cache_invalidation(pages: usize, scanned_pages: usize) {
+    fn record_vfs_read_cache_invalidation_impl(pages: usize, scanned_pages: usize) {
         VFS_READ_CACHE_INVALIDATION_CALLS.fetch_add(1, Ordering::Relaxed);
         VFS_READ_CACHE_INVALIDATED_PAGES.fetch_add(pages, Ordering::Relaxed);
         VFS_READ_CACHE_INVALIDATION_SCAN_PAGES.fetch_add(scanned_pages, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_read_cache_readahead(pages: usize) {
+    fn record_vfs_read_cache_readahead_impl(pages: usize) {
         VFS_READ_CACHE_READAHEAD_BATCHES.fetch_add(1, Ordering::Relaxed);
         VFS_READ_CACHE_READAHEAD_PAGES.fetch_add(pages, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_read_cache_eligible() {
+    fn record_vfs_read_cache_eligible_impl() {
         VFS_READ_CACHE_ELIGIBLE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_read_cache_skip_dirty_pages() {
+    fn record_vfs_read_cache_skip_dirty_pages_impl() {
         VFS_READ_CACHE_SKIP_DIRTY_PAGES.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_read_all_call() {
+    fn record_vfs_read_all_call_impl() {
         VFS_READ_ALL_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_read_all_backend_read(bytes: usize) {
+    fn record_vfs_read_all_backend_read_impl(bytes: usize) {
         VFS_READ_ALL_BACKEND_READS.fetch_add(1, Ordering::Relaxed);
         VFS_READ_ALL_BYTES.fetch_add(bytes, Ordering::Relaxed);
         update_max(&VFS_READ_ALL_MAX_CHUNK, bytes);
     }
 
-    pub(crate) fn record_vfs_read_backend(bytes: usize) {
+    fn record_vfs_read_backend_impl(bytes: usize) {
         VFS_READ_BACKEND_CALLS.fetch_add(1, Ordering::Relaxed);
         VFS_READ_BACKEND_BYTES.fetch_add(bytes, Ordering::Relaxed);
         update_max(&VFS_READ_BACKEND_MAX_CHUNK, bytes);
     }
 
-    pub(crate) fn record_vfs_read_coalesced(bytes: usize) {
+    fn record_vfs_read_coalesced_impl(bytes: usize) {
         VFS_READ_COALESCED_CALLS.fetch_add(1, Ordering::Relaxed);
         VFS_READ_COALESCED_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_path_components(components: usize, allocations: usize) {
+    fn record_vfs_path_components_impl(components: usize, allocations: usize) {
         VFS_PATH_COMPONENT_SCANS.fetch_add(1, Ordering::Relaxed);
         VFS_PATH_COMPONENTS.fetch_add(components, Ordering::Relaxed);
         VFS_PATH_COMPONENT_ALLOCS.fetch_add(allocations, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_visible_path_update(allocations: usize) {
+    fn record_vfs_visible_path_update_impl(allocations: usize) {
         VFS_VISIBLE_PATH_UPDATES.fetch_add(1, Ordering::Relaxed);
         VFS_VISIBLE_PATH_ALLOCS.fetch_add(allocations, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_visible_path_allocation() {
+    fn record_vfs_visible_path_allocation_impl() {
         VFS_VISIBLE_PATH_ALLOCS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_dirent_read(
+    fn record_vfs_dirent_read_impl(
         user_buffer_bytes: usize,
         scratch_bytes: usize,
         returned_bytes: usize,
@@ -1748,7 +1949,7 @@ mod enabled {
         update_max(&VFS_DIRENT_MAX_SCRATCH_BYTES, scratch_bytes);
     }
 
-    pub(crate) fn record_ext4_dirent_name(name_len: usize, allocated: bool) {
+    fn record_ext4_dirent_name_impl(name_len: usize, allocated: bool) {
         EXT4_DIRENT_ENTRIES.fetch_add(1, Ordering::Relaxed);
         EXT4_DIRENT_NAME_BYTES.fetch_add(name_len, Ordering::Relaxed);
         if allocated {
@@ -1757,120 +1958,120 @@ mod enabled {
         }
     }
 
-    pub(crate) fn record_procfs_content_build(bytes: usize) {
+    fn record_procfs_content_build_impl(bytes: usize) {
         PROCFS_CONTENT_BUILDS.fetch_add(1, Ordering::Relaxed);
         PROCFS_CONTENT_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_procfs_snapshot_hit(bytes: usize) {
+    fn record_procfs_snapshot_hit_impl(bytes: usize) {
         PROCFS_SNAPSHOT_HITS.fetch_add(1, Ordering::Relaxed);
         PROCFS_SNAPSHOT_HIT_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_write_user_buffer(slices: usize) {
+    fn record_vfs_write_user_buffer_impl(slices: usize) {
         VFS_WRITE_USER_BUFFER_CALLS.fetch_add(1, Ordering::Relaxed);
         VFS_WRITE_USER_BUFFER_SLICES.fetch_add(slices, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_write_backend(bytes: usize) {
+    fn record_vfs_write_backend_impl(bytes: usize) {
         VFS_WRITE_BACKEND_CALLS.fetch_add(1, Ordering::Relaxed);
         VFS_WRITE_BACKEND_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_vfs_write_coalesced(bytes: usize) {
+    fn record_vfs_write_coalesced_impl(bytes: usize) {
         VFS_WRITE_COALESCED_CALLS.fetch_add(1, Ordering::Relaxed);
         VFS_WRITE_COALESCED_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_writev_regular_bounce(bytes: usize) {
+    fn record_writev_regular_bounce_impl(bytes: usize) {
         WRITEV_REGULAR_BOUNCE_CALLS.fetch_add(1, Ordering::Relaxed);
         WRITEV_REGULAR_BOUNCE_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_writev_regular_direct_user_buffer(bytes: usize) {
+    fn record_writev_regular_direct_user_buffer_impl(bytes: usize) {
         WRITEV_REGULAR_DIRECT_USER_BUFFER_CALLS.fetch_add(1, Ordering::Relaxed);
         WRITEV_REGULAR_DIRECT_USER_BUFFER_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_pwritev_regular_bounce(bytes: usize) {
+    fn record_pwritev_regular_bounce_impl(bytes: usize) {
         PWRITEV_REGULAR_BOUNCE_CALLS.fetch_add(1, Ordering::Relaxed);
         PWRITEV_REGULAR_BOUNCE_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_pwritev_regular_direct_user_buffer(bytes: usize) {
+    fn record_pwritev_regular_direct_user_buffer_impl(bytes: usize) {
         PWRITEV_REGULAR_DIRECT_USER_BUFFER_CALLS.fetch_add(1, Ordering::Relaxed);
         PWRITEV_REGULAR_DIRECT_USER_BUFFER_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_page_cache_clean_eviction(pages: usize) {
+    fn record_page_cache_clean_eviction_impl(pages: usize) {
         crate::mm::page_cache::perf::record_clean_eviction(pages);
     }
 
-    pub(crate) fn record_page_cache_generation_epoch_begin() {
+    fn record_page_cache_generation_epoch_begin_impl() {
         crate::mm::page_cache::perf::record_generation_epoch_begin();
     }
 
-    pub(crate) fn record_page_cache_generation_epoch_finish() {
+    fn record_page_cache_generation_epoch_finish_impl() {
         crate::mm::page_cache::perf::record_generation_epoch_finish();
     }
 
-    pub(crate) fn record_page_cache_generation_retry() {
+    fn record_page_cache_generation_retry_impl() {
         crate::mm::page_cache::perf::record_generation_retry();
     }
 
-    pub(crate) fn record_page_cache_stale_fill_drop(pages: usize) {
+    fn record_page_cache_stale_fill_drop_impl(pages: usize) {
         crate::mm::page_cache::perf::record_stale_fill_drop(pages);
     }
 
-    pub(crate) fn record_page_cache_stale_install_retry() {
+    fn record_page_cache_stale_install_retry_impl() {
         crate::mm::page_cache::perf::record_stale_install_retry();
     }
 
-    pub(crate) fn record_page_cache_capacity_reject() {
+    fn record_page_cache_capacity_reject_impl() {
         crate::mm::page_cache::perf::record_capacity_reject();
     }
 
-    pub(crate) fn record_mmap_clean_page_cache(hit: bool) {
+    fn record_mmap_clean_page_cache_impl(hit: bool) {
         crate::mm::page_cache::perf::record_clean_mmap(hit);
     }
 
-    pub(crate) fn record_mmap_clean_page_cache_fill() {
+    fn record_mmap_clean_page_cache_fill_impl() {
         crate::mm::page_cache::perf::record_clean_mmap_fill();
     }
 
-    pub(crate) fn record_tmpfs_allocated_payload_len(sparse_extents: usize) {
+    fn record_tmpfs_allocated_payload_len_impl(sparse_extents: usize) {
         TMPFS_ALLOCATED_PAYLOAD_LEN_CALLS.fetch_add(1, Ordering::Relaxed);
         TMPFS_ALLOCATED_PAYLOAD_SPARSE_EXTENTS.fetch_add(sparse_extents, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_tmpfs_allocated_logical_len(sparse_extents: usize) {
+    fn record_tmpfs_allocated_logical_len_impl(sparse_extents: usize) {
         TMPFS_ALLOCATED_LOGICAL_LEN_CALLS.fetch_add(1, Ordering::Relaxed);
         TMPFS_ALLOCATED_LOGICAL_SPARSE_EXTENTS.fetch_add(sparse_extents, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_sysv_msg_current_bytes(messages: usize) {
+    fn record_sysv_msg_current_bytes_impl(messages: usize) {
         SYSV_MSG_CURRENT_BYTES_CALLS.fetch_add(1, Ordering::Relaxed);
         SYSV_MSG_CURRENT_BYTES_SCANNED_MESSAGES.fetch_add(messages, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_brk_grow(pages: usize) {
+    fn record_brk_grow_impl(pages: usize) {
         BRK_GROW_CALLS.fetch_add(1, Ordering::Relaxed);
         BRK_GROW_PAGES.fetch_add(pages, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_brk_eager_mapped(pages: usize) {
+    fn record_brk_eager_mapped_impl(pages: usize) {
         BRK_EAGER_MAPPED_PAGES.fetch_add(pages, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_brk_lazy_extended(pages: usize) {
+    fn record_brk_lazy_extended_impl(pages: usize) {
         BRK_LAZY_EXTENDED_PAGES.fetch_add(pages, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_brk_lazy_fault_page() {
+    fn record_brk_lazy_fault_page_impl() {
         BRK_LAZY_FAULT_PAGES.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_frame_alloc(zeroed: bool) {
+    fn record_frame_alloc_impl(zeroed: bool) {
         if zeroed {
             FRAME_ALLOC_ZEROED_CALLS.fetch_add(1, Ordering::Relaxed);
             FRAME_ALLOC_ZEROED_BYTES.fetch_add(crate::config::PAGE_SIZE, Ordering::Relaxed);
@@ -1880,7 +2081,7 @@ mod enabled {
         }
     }
 
-    pub(crate) fn record_mmap_private_fault(
+    fn record_mmap_private_fault_impl(
         file_backed: bool,
         full_file_overwrite: bool,
         read_request_bytes: usize,
@@ -1905,7 +2106,7 @@ mod enabled {
         MMAP_PRIVATE_FILE_ZERO_BYTES_NEEDED.fetch_add(file_zero_bytes_needed, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_frame_dealloc(
+    fn record_frame_dealloc_impl(
         released: bool,
         refcount_drop: bool,
         recycled_scan_slots: usize,
@@ -1922,35 +2123,35 @@ mod enabled {
         update_max(&FRAME_DEALLOC_RECYCLED_LEN_MAX, recycled_len);
     }
 
-    pub(crate) fn record_dev_zero_read(bytes: usize, byte_writes: usize, fill_bytes: usize) {
+    fn record_dev_zero_read_impl(bytes: usize, byte_writes: usize, fill_bytes: usize) {
         DEV_ZERO_READ_CALLS.fetch_add(1, Ordering::Relaxed);
         DEV_ZERO_READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
         DEV_ZERO_READ_BYTE_WRITES.fetch_add(byte_writes, Ordering::Relaxed);
         DEV_ZERO_READ_FILL_BYTES.fetch_add(fill_bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_dev_random_read(bytes: usize, byte_writes: usize, word_fill_bytes: usize) {
+    fn record_dev_random_read_impl(bytes: usize, byte_writes: usize, word_fill_bytes: usize) {
         DEV_RANDOM_READ_CALLS.fetch_add(1, Ordering::Relaxed);
         DEV_RANDOM_READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
         DEV_RANDOM_BYTE_WRITES.fetch_add(byte_writes, Ordering::Relaxed);
         DEV_RANDOM_WORD_FILL_BYTES.fetch_add(word_fill_bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_uart_write(bytes: usize) {
+    fn record_uart_write_impl(bytes: usize) {
         UART_WRITE_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
         UART_WRITE_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_tlb_flush_all() {
+    fn record_tlb_flush_all_impl() {
         TLB_FLUSH_ALL_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_tlb_flush_range(pages: usize) {
+    fn record_tlb_flush_range_impl(pages: usize) {
         TLB_FLUSH_RANGE_CALLS.fetch_add(1, Ordering::Relaxed);
         TLB_FLUSH_RANGE_PAGES.fetch_add(pages, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_fresh_tlb_generation_publish(pages: usize, remote_targets: usize) {
+    fn record_fresh_tlb_generation_publish_impl(pages: usize, remote_targets: usize) {
         FRESH_TLB_GENERATION_PUBLISH_CALLS.fetch_add(1, Ordering::Relaxed);
         FRESH_TLB_GENERATION_PUBLISH_PAGES.fetch_add(pages, Ordering::Relaxed);
         FRESH_TLB_GENERATION_REMOTE_TARGETS.fetch_add(remote_targets, Ordering::Relaxed);
@@ -1964,7 +2165,7 @@ mod enabled {
         update_max(&KERNEL_STACK_POOL_DEPTH_MAX, pool_depth);
     }
 
-    pub(crate) fn record_kernel_stack_alloc(
+    fn record_kernel_stack_alloc_impl(
         reused: bool,
         live: usize,
         mapped_slots: usize,
@@ -1978,73 +2179,73 @@ mod enabled {
         record_kernel_stack_state_inner(live, mapped_slots, pool_depth);
     }
 
-    pub(crate) fn record_kernel_stack_release(live: usize, mapped_slots: usize, pool_depth: usize) {
+    fn record_kernel_stack_release_impl(live: usize, mapped_slots: usize, pool_depth: usize) {
         KERNEL_STACK_POOL_RELEASES.fetch_add(1, Ordering::Relaxed);
         record_kernel_stack_state_inner(live, mapped_slots, pool_depth);
     }
 
-    pub(crate) fn record_kernel_stack_state(live: usize, mapped_slots: usize, pool_depth: usize) {
+    fn record_kernel_stack_state_impl(live: usize, mapped_slots: usize, pool_depth: usize) {
         record_kernel_stack_state_inner(live, mapped_slots, pool_depth);
     }
 
-    pub(crate) fn record_mount_metadata(source_len: usize) {
+    fn record_mount_metadata_impl(source_len: usize) {
         MOUNT_METADATA_CALLS.fetch_add(1, Ordering::Relaxed);
         MOUNT_METADATA_SOURCE_CLONE_BYTES.fetch_add(source_len, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_mount_fast_stat_flags() {
+    fn record_mount_fast_stat_flags_impl() {
         MOUNT_FAST_STAT_FLAGS_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_mount_fast_fs_type() {
+    fn record_mount_fast_fs_type_impl() {
         MOUNT_FAST_FS_TYPE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_mount_backend_contended_acquisition() {
+    fn record_mount_backend_contended_acquisition_impl() {
         MOUNT_BACKEND_CONTENDED_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_bcache_index_lock(contended: bool) {
+    fn record_ext4_bcache_index_lock_impl(contended: bool) {
         EXT4_BCACHE_INDEX_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
         if contended {
             EXT4_BCACHE_INDEX_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    pub(crate) fn record_ext4_bcache_lba_lock(contended: bool) {
+    fn record_ext4_bcache_lba_lock_impl(contended: bool) {
         EXT4_BCACHE_LBA_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
         if contended {
             EXT4_BCACHE_LBA_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    pub(crate) fn record_ext4_block_read(blocks: usize, bytes: usize) {
+    fn record_ext4_block_read_impl(blocks: usize, bytes: usize) {
         EXT4_BLOCK_READ_CALLS.fetch_add(1, Ordering::Relaxed);
         EXT4_BLOCK_READ_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
         EXT4_BLOCK_READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_block_write(blocks: usize, bytes: usize) {
+    fn record_ext4_block_write_impl(blocks: usize, bytes: usize) {
         EXT4_BLOCK_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
         EXT4_BLOCK_WRITE_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
         EXT4_BLOCK_WRITE_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_sequence_read(bytes: usize) {
+    fn record_ext4_sequence_read_impl(bytes: usize) {
         EXT4_SEQUENCE_READ_CALLS.fetch_add(1, Ordering::Relaxed);
         EXT4_SEQUENCE_READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_sequence_writer_entry(active_writers: usize) {
+    fn record_ext4_sequence_writer_entry_impl(active_writers: usize) {
         EXT4_SEQUENCE_WRITER_ENTRIES.fetch_add(1, Ordering::Relaxed);
         EXT4_SEQUENCE_ACTIVE_WRITERS_MAX.fetch_max(active_writers, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_sequence_reader_wait_yield() {
+    fn record_ext4_sequence_reader_wait_yield_impl() {
         EXT4_SEQUENCE_READER_WAIT_YIELDS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_sequence_reader_retry(blocks: usize, bytes: usize) {
+    fn record_ext4_sequence_reader_retry_impl(blocks: usize, bytes: usize) {
         EXT4_SEQUENCE_READER_RETRIES.fetch_add(1, Ordering::Relaxed);
         EXT4_SEQUENCE_RETRY_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
         EXT4_SEQUENCE_RETRY_BYTES.fetch_add(bytes, Ordering::Relaxed);
@@ -2054,11 +2255,11 @@ mod enabled {
         EXT4_SEQUENCE_WAIT_TICKS.fetch_add(ticks, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_read_plan_attempt() {
+    fn record_ext4_read_plan_attempt_impl() {
         EXT4_READ_PLAN_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_read_plan_prepared(
+    fn record_ext4_read_plan_prepared_impl(
         data_runs: usize,
         data_blocks: usize,
         zero_runs: usize,
@@ -2071,51 +2272,51 @@ mod enabled {
         EXT4_READ_PLAN_ZERO_BLOCKS.fetch_add(zero_blocks, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_read_plan_fallback() {
+    fn record_ext4_read_plan_fallback_impl() {
         EXT4_READ_PLAN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_read_plan_executed(bytes: usize) {
+    fn record_ext4_read_plan_executed_impl(bytes: usize) {
         EXT4_READ_PLAN_EXECUTED.fetch_add(1, Ordering::Relaxed);
         EXT4_READ_PLAN_EXECUTED_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_read_plan_direct_io(calls: usize, blocks: usize, bytes: usize) {
+    fn record_ext4_read_plan_direct_io_impl(calls: usize, blocks: usize, bytes: usize) {
         EXT4_READ_PLAN_DIRECT_IO_CALLS.fetch_add(calls, Ordering::Relaxed);
         EXT4_READ_PLAN_DIRECT_IO_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
         EXT4_READ_PLAN_DIRECT_IO_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_directory_plan_attempt() {
+    fn record_ext4_directory_plan_attempt_impl() {
         EXT4_DIRECTORY_PLAN_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_directory_plan_prepared(data_runs: usize, data_blocks: usize) {
+    fn record_ext4_directory_plan_prepared_impl(data_runs: usize, data_blocks: usize) {
         EXT4_DIRECTORY_PLAN_PREPARED.fetch_add(1, Ordering::Relaxed);
         EXT4_DIRECTORY_PLAN_DATA_RUNS.fetch_add(data_runs, Ordering::Relaxed);
         EXT4_DIRECTORY_PLAN_DATA_BLOCKS.fetch_add(data_blocks, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_directory_plan_fallback() {
+    fn record_ext4_directory_plan_fallback_impl() {
         EXT4_DIRECTORY_PLAN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_directory_plan_executed(bytes: usize) {
+    fn record_ext4_directory_plan_executed_impl(bytes: usize) {
         EXT4_DIRECTORY_PLAN_EXECUTED.fetch_add(1, Ordering::Relaxed);
         EXT4_DIRECTORY_PLAN_EXECUTED_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_directory_plan_direct_io(calls: usize, blocks: usize, bytes: usize) {
+    fn record_ext4_directory_plan_direct_io_impl(calls: usize, blocks: usize, bytes: usize) {
         EXT4_DIRECTORY_PLAN_DIRECT_IO_CALLS.fetch_add(calls, Ordering::Relaxed);
         EXT4_DIRECTORY_PLAN_DIRECT_IO_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
         EXT4_DIRECTORY_PLAN_DIRECT_IO_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_write_plan_attempt() {
+    fn record_ext4_write_plan_attempt_impl() {
         EXT4_WRITE_PLAN_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_write_plan_prepared(
+    fn record_ext4_write_plan_prepared_impl(
         data_runs: usize,
         data_blocks: usize,
         invalidated_aliases: usize,
@@ -2126,20 +2327,20 @@ mod enabled {
         EXT4_WRITE_PLAN_INVALIDATED_ALIASES.fetch_add(invalidated_aliases, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_write_plan_fallback(alias_busy: bool) {
+    fn record_ext4_write_plan_fallback_impl(alias_busy: bool) {
         EXT4_WRITE_PLAN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
         if alias_busy {
             EXT4_WRITE_PLAN_ALIAS_BUSY.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    pub(crate) fn record_ext4_write_plan_rmw_read(calls: usize, blocks: usize, bytes: usize) {
+    fn record_ext4_write_plan_rmw_read_impl(calls: usize, blocks: usize, bytes: usize) {
         EXT4_WRITE_PLAN_RMW_READ_CALLS.fetch_add(calls, Ordering::Relaxed);
         EXT4_WRITE_PLAN_RMW_READ_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
         EXT4_WRITE_PLAN_RMW_READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_write_plan_executed(
+    fn record_ext4_write_plan_executed_impl(
         bytes: usize,
         direct_calls: usize,
         direct_blocks: usize,
@@ -2152,25 +2353,25 @@ mod enabled {
         EXT4_WRITE_PLAN_DIRECT_IO_BYTES.fetch_add(direct_bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_metadata_transaction_attempt() {
+    fn record_ext4_metadata_transaction_attempt_impl() {
         EXT4_METADATA_TX_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_metadata_transaction_begin() {
+    fn record_ext4_metadata_transaction_begin_impl() {
         let active = EXT4_METADATA_TX_ACTIVE.fetch_add(1, Ordering::Relaxed) + 1;
         EXT4_METADATA_TX_ACTIVE_HIGH_WATERMARK.fetch_max(active, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_metadata_transaction_end() {
+    fn record_ext4_metadata_transaction_end_impl() {
         let previous = EXT4_METADATA_TX_ACTIVE.fetch_sub(1, Ordering::Relaxed);
         assert_ne!(previous, 0, "ext4 metadata transaction active underflow");
     }
 
-    pub(crate) fn record_ext4_metadata_transaction_fallback() {
+    fn record_ext4_metadata_transaction_fallback_impl() {
         EXT4_METADATA_TX_FALLBACKS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_ext4_metadata_transaction_commit(
+    fn record_ext4_metadata_transaction_commit_impl(
         read_lbas: usize,
         write_lbas: usize,
         device_write_calls: usize,
@@ -2192,55 +2393,55 @@ mod enabled {
         }
     }
 
-    pub(crate) fn record_eventfd_read_call() {
+    fn record_eventfd_read_call_impl() {
         EVENTFD_READ_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_eventfd_write_call() {
+    fn record_eventfd_write_call_impl() {
         EVENTFD_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_eventfd_reader_sleep() {
+    fn record_eventfd_reader_sleep_impl() {
         EVENTFD_READER_SLEEPS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_eventfd_writer_sleep() {
+    fn record_eventfd_writer_sleep_impl() {
         EVENTFD_WRITER_SLEEPS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_eventfd_reader_wakeup() {
+    fn record_eventfd_reader_wakeup_impl() {
         EVENTFD_READER_WAKEUPS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_eventfd_writer_wakeup() {
+    fn record_eventfd_writer_wakeup_impl() {
         EVENTFD_WRITER_WAKEUPS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_local_socket_read_call() {
+    fn record_local_socket_read_call_impl() {
         LOCAL_SOCKET_READ_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_local_socket_write_call() {
+    fn record_local_socket_write_call_impl() {
         LOCAL_SOCKET_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_local_socket_reader_sleep() {
+    fn record_local_socket_reader_sleep_impl() {
         LOCAL_SOCKET_READER_SLEEPS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_local_socket_writer_sleep() {
+    fn record_local_socket_writer_sleep_impl() {
         LOCAL_SOCKET_WRITER_SLEEPS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_local_socket_reader_wakeup() {
+    fn record_local_socket_reader_wakeup_impl() {
         LOCAL_SOCKET_READER_WAKEUPS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_local_socket_writer_wakeup() {
+    fn record_local_socket_writer_wakeup_impl() {
         LOCAL_SOCKET_WRITER_WAKEUPS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_local_socket_write_user_buffer(
+    fn record_local_socket_write_user_buffer_impl(
         bytes: usize,
         to_vec_bytes: usize,
         stream_direct_bytes: usize,
@@ -2250,12 +2451,12 @@ mod enabled {
         LOCAL_SOCKET_STREAM_DIRECT_BYTES.fetch_add(stream_direct_bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_local_socket_stream_recv(contiguous_bytes: usize, slice_bytes: usize) {
+    fn record_local_socket_stream_recv_impl(contiguous_bytes: usize, slice_bytes: usize) {
         LOCAL_SOCKET_STREAM_RECV_CONTIGUOUS_BYTES.fetch_add(contiguous_bytes, Ordering::Relaxed);
         LOCAL_SOCKET_STREAM_RECV_SLICE_BYTES.fetch_add(slice_bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_tid_lookup(
+    fn record_tid_lookup_impl(
         process_visits: usize,
         task_visits: usize,
         hit: bool,
@@ -2276,75 +2477,75 @@ mod enabled {
         }
     }
 
-    pub(crate) fn record_exec_stack_copy(bytes: usize) {
+    fn record_exec_stack_copy_impl(bytes: usize) {
         EXEC_STACK_COPY_CALLS.fetch_add(1, Ordering::Relaxed);
         EXEC_STACK_COPY_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_wait_child_scan(child_slots: usize) {
+    fn record_wait_child_scan_impl(child_slots: usize) {
         WAIT_CHILD_SCAN_PASSES.fetch_add(1, Ordering::Relaxed);
         WAIT_CHILD_SCAN_SLOTS.fetch_add(child_slots, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_scheduler_normal_requeue(vruntime_delta: usize) {
+    fn record_scheduler_normal_requeue_impl(vruntime_delta: usize) {
         SCHEDULER_NORMAL_REQUEUE_CALLS.fetch_add(1, Ordering::Relaxed);
         SCHEDULER_NORMAL_VRUNTIME_DELTA.fetch_add(vruntime_delta, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_pipe_read_call() {
+    fn record_pipe_read_call_impl() {
         PIPE_READ_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_pipe_write_call() {
+    fn record_pipe_write_call_impl() {
         PIPE_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_pipe_read_chunk_copy(bytes: usize) {
+    fn record_pipe_read_chunk_copy_impl(bytes: usize) {
         PIPE_READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
         PIPE_READ_CHUNK_COPY_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_pipe_write_chunk_copy(bytes: usize) {
+    fn record_pipe_write_chunk_copy_impl(bytes: usize) {
         PIPE_WRITE_BYTES.fetch_add(bytes, Ordering::Relaxed);
         PIPE_WRITE_CHUNK_COPY_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_pipe_reader_sleep() {
+    fn record_pipe_reader_sleep_impl() {
         PIPE_READER_SLEEPS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_pipe_writer_sleep() {
+    fn record_pipe_writer_sleep_impl() {
         PIPE_WRITER_SLEEPS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_copy_file_range_call() {
+    fn record_copy_file_range_call_impl() {
         COPY_FILE_RANGE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_copy_file_range_chunk(bytes: usize) {
+    fn record_copy_file_range_chunk_impl(bytes: usize) {
         COPY_FILE_RANGE_CHUNKS.fetch_add(1, Ordering::Relaxed);
         COPY_FILE_RANGE_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_sendfile_call() {
+    fn record_sendfile_call_impl() {
         SENDFILE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_sendfile_chunk(bytes: usize) {
+    fn record_sendfile_chunk_impl(bytes: usize) {
         SENDFILE_CHUNKS.fetch_add(1, Ordering::Relaxed);
         SENDFILE_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_splice_call() {
+    fn record_splice_call_impl() {
         SPLICE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_splice_chunk(bytes: usize) {
+    fn record_splice_chunk_impl(bytes: usize) {
         SPLICE_CHUNKS.fetch_add(1, Ordering::Relaxed);
         SPLICE_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_mmap_hole_search(
+    fn record_mmap_hole_search_impl(
         page_probes: usize,
         gap_checks: usize,
         area_visits: usize,
@@ -2357,7 +2558,7 @@ mod enabled {
         update_max(&MMAP_VMA_COUNT_MAX, vma_count);
     }
 
-    pub(crate) fn record_vma_lookup(area_probes: usize, hit: bool) {
+    fn record_vma_lookup_impl(area_probes: usize, hit: bool) {
         VMA_LOOKUP_CALLS.fetch_add(1, Ordering::Relaxed);
         VMA_LOOKUP_AREA_PROBES.fetch_add(area_probes, Ordering::Relaxed);
         if hit {
@@ -2365,21 +2566,17 @@ mod enabled {
         }
     }
 
-    pub(crate) fn record_vma_range_scan(area_visits: usize, index_skips: usize) {
+    fn record_vma_range_scan_impl(area_visits: usize, index_skips: usize) {
         VMA_RANGE_SCANS.fetch_add(1, Ordering::Relaxed);
         VMA_RANGE_AREA_VISITS.fetch_add(area_visits, Ordering::Relaxed);
         VMA_RANGE_INDEX_SKIPS.fetch_add(index_skips, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_user_c_string_call() {
+    fn record_user_c_string_call_impl() {
         USER_C_STRING_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_user_c_string_chunk(
-        scanned_bytes: usize,
-        copied_bytes: usize,
-        ascii: bool,
-    ) {
+    fn record_user_c_string_chunk_impl(scanned_bytes: usize, copied_bytes: usize, ascii: bool) {
         USER_C_STRING_PAGE_CHUNKS.fetch_add(1, Ordering::Relaxed);
         USER_C_STRING_SCANNED_BYTES.fetch_add(scanned_bytes, Ordering::Relaxed);
         if ascii {
@@ -2389,7 +2586,7 @@ mod enabled {
         }
     }
 
-    pub(crate) fn record_usercopy_same_page_fast(access: UsercopyAccess, bytes: usize) {
+    fn record_usercopy_same_page_fast_impl(access: UsercopyAccess, bytes: usize) {
         match access {
             UsercopyAccess::Read => USERCOPY_SAME_PAGE_READ_HITS.fetch_add(1, Ordering::Relaxed),
             UsercopyAccess::Write => USERCOPY_SAME_PAGE_WRITE_HITS.fetch_add(1, Ordering::Relaxed),
@@ -2397,18 +2594,18 @@ mod enabled {
         USERCOPY_SAME_PAGE_FAST_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_usercopy_slow_path(page_count: usize) {
+    fn record_usercopy_slow_path_impl(page_count: usize) {
         USERCOPY_SLOW_PATHS.fetch_add(1, Ordering::Relaxed);
         USERCOPY_SLOW_PAGES.fetch_add(page_count, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_usercopy_checked_range(pages: usize, bytes: usize) {
+    fn record_usercopy_checked_range_impl(pages: usize, bytes: usize) {
         USERCOPY_CHECKED_RANGE_CALLS.fetch_add(1, Ordering::Relaxed);
         USERCOPY_CHECKED_RANGE_PAGES.fetch_add(pages, Ordering::Relaxed);
         USERCOPY_CHECKED_RANGE_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_usercopy_translated_shape(segments: usize) {
+    fn record_usercopy_translated_shape_impl(segments: usize) {
         match segments {
             0 => {
                 USERCOPY_TRANSLATED_EMPTY_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -2423,18 +2620,18 @@ mod enabled {
         }
     }
 
-    pub(crate) fn record_usercopy_segment_vec_alloc(slots: usize) {
+    fn record_usercopy_segment_vec_alloc_impl(slots: usize) {
         USERCOPY_SEGMENT_VEC_ALLOCS.fetch_add(1, Ordering::Relaxed);
         USERCOPY_SEGMENT_VEC_SLOTS.fetch_add(slots, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_usercopy_range_reuse(chunks: usize, pages: usize, bytes: usize) {
+    fn record_usercopy_range_reuse_impl(chunks: usize, pages: usize, bytes: usize) {
         USERCOPY_RANGE_REUSE_HITS.fetch_add(chunks, Ordering::Relaxed);
         USERCOPY_RANGE_REUSE_PAGES.fetch_add(pages, Ordering::Relaxed);
         USERCOPY_RANGE_REUSE_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_usercopy_site(site: UsercopySite, bytes: usize) {
+    fn record_usercopy_site_impl(site: UsercopySite, bytes: usize) {
         let (calls, total_bytes) = match site {
             UsercopySite::ReadValue => (&USERCOPY_READ_VALUE_CALLS, &USERCOPY_READ_VALUE_BYTES),
             UsercopySite::ReadUsize => (&USERCOPY_READ_USIZE_CALLS, &USERCOPY_READ_USIZE_BYTES),
@@ -2459,56 +2656,39 @@ mod enabled {
         total_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_inotify_no_live_group_fast_path() {
+    fn record_inotify_no_live_group_fast_path_impl() {
         INOTIFY_NO_LIVE_GROUP_FAST_PATHS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_inotify_live_group_scan() {
+    fn record_inotify_live_group_scan_impl() {
         INOTIFY_LIVE_GROUP_SCANS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_inotify_node_name_remember() {
+    fn record_inotify_node_name_remember_impl() {
         INOTIFY_NODE_NAME_REMEMBER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_inotify_unlinked_node_update() {
+    fn record_inotify_unlinked_node_update_impl() {
         INOTIFY_UNLINKED_NODE_UPDATES.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_fanotify_no_live_group_fast_path() {
+    fn record_fanotify_no_live_group_fast_path_impl() {
         FANOTIFY_NO_LIVE_GROUP_FAST_PATHS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_fanotify_live_group_scan() {
+    fn record_fanotify_live_group_scan_impl() {
         FANOTIFY_LIVE_GROUP_SCANS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_fanotify_node_name_remember() {
+    fn record_fanotify_node_name_remember_impl() {
         FANOTIFY_NODE_NAME_REMEMBER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_fanotify_node_name_lookup() {
+    fn record_fanotify_node_name_lookup_impl() {
         FANOTIFY_NODE_NAME_LOOKUP_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[derive(Clone, Copy)]
-    pub(crate) enum UsercopyAccess {
-        Read,
-        Write,
-    }
-
-    #[derive(Clone, Copy)]
-    pub(crate) enum UsercopySite {
-        ReadValue,
-        ReadUsize,
-        ReadArrayItem,
-        WriteValue,
-        WriteArrayItem,
-        CopyToUser,
-        CopyToUserInMemorySet,
-    }
-
-    pub(crate) fn record_futex_cleanup(
+    fn record_futex_cleanup_impl(
         direct_hit: bool,
         already_unqueued: bool,
         fallback_queue_visits: usize,
@@ -2529,7 +2709,7 @@ mod enabled {
         }
     }
 
-    pub(crate) fn record_futex_wake(key_hit: bool, tasks: usize) {
+    fn record_futex_wake_impl(key_hit: bool, tasks: usize) {
         FUTEX_WAKE_CALLS.fetch_add(1, Ordering::Relaxed);
         if key_hit {
             FUTEX_WAKE_KEY_HITS.fetch_add(1, Ordering::Relaxed);
@@ -2537,7 +2717,7 @@ mod enabled {
         FUTEX_WAKE_TASKS.fetch_add(tasks, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_futex_manager_state(
+    fn record_futex_manager_state_impl(
         queue_count: usize,
         waiter_count: usize,
         bucket_queue_count: usize,
@@ -2548,6 +2728,20 @@ mod enabled {
         update_max(&FUTEX_BUCKET_QUEUE_COUNT_MAX, bucket_queue_count);
         update_max(&FUTEX_BUCKET_WAITER_COUNT_MAX, bucket_waiter_count);
     }
+
+    macro_rules! define_enabled_perf_events {
+        ($(fn $name:ident($($arg:ident : $ty:ty),* $(,)?) => $implementation:ident;)*) => {
+            $(
+                #[allow(dead_code)]
+                #[inline(always)]
+                pub(crate) fn $name($($arg: $ty),*) {
+                    $implementation($($arg),*);
+                }
+            )*
+        };
+    }
+
+    declare_perf_events!(define_enabled_perf_events);
 
     pub(crate) fn snapshot() -> KernelPerfSnapshot {
         let page_cache = crate::mm::page_cache::perf::snapshot();
@@ -3803,704 +3997,33 @@ pub(crate) use enabled::*;
 
 #[cfg(not(feature = "perf-counters"))]
 mod disabled {
-    use super::{KernelPerfSnapshot, ProfilePoint};
+    use super::{KernelPerfSnapshot, ProfilePoint, UsercopyAccess, UsercopySite};
     use alloc::string::String;
 
-    #[derive(Clone, Copy)]
-    pub(crate) enum UsercopyAccess {
-        Read,
-        Write,
-    }
-
-    #[derive(Clone, Copy)]
-    pub(crate) enum UsercopySite {
-        ReadValue,
-        ReadUsize,
-        ReadArrayItem,
-        WriteValue,
-        WriteArrayItem,
-        CopyToUser,
-        CopyToUserInMemorySet,
-    }
-
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) struct ScopeTimer;
 
-    #[allow(dead_code)]
     #[inline(always)]
     pub(crate) fn time_scope(_point: ProfilePoint) -> ScopeTimer {
         ScopeTimer
     }
 
-    #[allow(dead_code)]
     #[inline(always)]
     pub(crate) fn time_syscall(_syscall_id: usize) -> ScopeTimer {
         ScopeTimer
     }
 
-    #[inline(always)]
-    pub(crate) fn record_scheduler_fetch(
-        _queue_len: usize,
-        _scanned: usize,
-        _pruned_exited: usize,
-    ) {
+    macro_rules! define_disabled_perf_events {
+        ($(fn $name:ident($($arg:ident : $ty:ty),* $(,)?) => $implementation:ident;)*) => {
+            $(
+                #[allow(dead_code)]
+                #[inline(always)]
+                pub(crate) fn $name($($arg: $ty),*) {}
+            )*
+        };
     }
 
-    #[inline(always)]
-    pub(crate) fn record_scheduler_rt_priority_probes(_probes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_scheduler_placement(_cpu_probes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_scheduler_idle_pull(_probes: usize, _stolen_tasks: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_scheduler_remote_wake_push(_sent_ipi: bool) {}
-
-    #[inline(always)]
-    pub(crate) fn record_scheduler_remote_wake_drain(_tasks: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_scheduler_need_resched(_needed: bool, _newly_set: bool) {}
-
-    #[inline(always)]
-    pub(crate) fn record_scheduler_need_resched_ipi() {}
-
-    #[inline(always)]
-    pub(crate) fn record_scheduler_need_resched_consumed() {}
-
-    #[inline(always)]
-    pub(crate) fn record_task_wakeup(_front: bool) {}
-
-    #[inline(always)]
-    pub(crate) fn record_syscall_dispatch_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_syscall_identity_fast_path() {}
-
-    #[inline(always)]
-    pub(crate) fn record_task_current_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_task_current_process_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_task_current_user_token_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_task_current_trap_cx_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_task_current_trap_return_context_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_signal_action_table_lock_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_time_nanos_to_timespec_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_time_direct_timespec_call() {}
-
-    #[inline(always)]
-    #[allow(dead_code)]
-    pub(crate) fn record_riscv_return_fence_i_call() {}
-
-    #[inline(always)]
-    #[allow(dead_code)]
-    pub(crate) fn record_la_return_invtlb_call() {}
-
-    #[inline(always)]
-    #[allow(dead_code)]
-    pub(crate) fn record_rv_user_trap_entry() {}
-
-    #[inline(always)]
-    #[allow(dead_code)]
-    pub(crate) fn record_rv_sbi_set_timer_call() {}
-
-    #[inline(always)]
-    #[allow(dead_code)]
-    pub(crate) fn record_rv_user_fp_save_call() {}
-
-    #[inline(always)]
-    #[allow(dead_code)]
-    pub(crate) fn record_rv_user_fp_restore_call() {}
-
-    #[inline(always)]
-    #[allow(dead_code)]
-    pub(crate) fn record_rv_user_fp_lazy_init_trap() {}
-
-    #[inline(always)]
-    pub(crate) fn record_arch_instruction_barrier_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_tid_lookup(
-        _process_visits: usize,
-        _task_visits: usize,
-        _hit: bool,
-        _index_hit: bool,
-        _stale_index_entry: bool,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_exec_stack_copy(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_wait_child_scan(_child_slots: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_scheduler_normal_requeue(_vruntime_delta: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_fd_alloc(
-        _probed_slots: usize,
-        _expanded_slots: usize,
-        _table_len: usize,
-        _success: bool,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_fd_bitmap_word_probes(_words: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_fd_install(_table_len: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_fd_take() {}
-
-    #[inline(always)]
-    pub(crate) fn record_epoll_ctl(
-        _linear_probes: usize,
-        _tree_lookups: usize,
-        _interest_count: usize,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_epoll_scan(_interest_visits: usize, _ready_events: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_epoll_ready_list(_source_visits: usize, _ready_events: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_epoll_backoff_sleep(_duration_us: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_epoll_waiter_registrations(_count: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_epoll_waiter_sleep() {}
-
-    #[inline(always)]
-    pub(crate) fn record_poll_scan(_fd_visits: usize, _ready_events: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_poll_fd_table_lookup() {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_read_cache_hit(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_read_cache_miss() {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_read_cache_backend_read() {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_read_cache_invalidation(_pages: usize, _scanned_pages: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_read_cache_readahead(_pages: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_read_cache_eligible() {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_read_cache_skip_dirty_pages() {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_read_all_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_read_all_backend_read(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_read_backend(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_read_coalesced(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_path_components(_components: usize, _allocations: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_visible_path_update(_allocations: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_visible_path_allocation() {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_dirent_read(
-        _user_buffer_bytes: usize,
-        _scratch_bytes: usize,
-        _returned_bytes: usize,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_dirent_name(_name_len: usize, _allocated: bool) {}
-
-    #[inline(always)]
-    pub(crate) fn record_procfs_content_build(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_procfs_snapshot_hit(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_write_user_buffer(_slices: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_write_backend(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_vfs_write_coalesced(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_writev_regular_bounce(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_writev_regular_direct_user_buffer(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_pwritev_regular_bounce(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_pwritev_regular_direct_user_buffer(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_page_cache_clean_eviction(_pages: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_page_cache_generation_epoch_begin() {}
-
-    #[inline(always)]
-    pub(crate) fn record_page_cache_generation_epoch_finish() {}
-
-    #[inline(always)]
-    pub(crate) fn record_page_cache_generation_retry() {}
-
-    #[inline(always)]
-    pub(crate) fn record_page_cache_stale_fill_drop(_pages: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_page_cache_stale_install_retry() {}
-
-    #[inline(always)]
-    pub(crate) fn record_page_cache_capacity_reject() {}
-
-    #[inline(always)]
-    pub(crate) fn record_mmap_clean_page_cache(_hit: bool) {}
-
-    #[inline(always)]
-    pub(crate) fn record_mmap_clean_page_cache_fill() {}
-
-    #[inline(always)]
-    pub(crate) fn record_tmpfs_allocated_payload_len(_sparse_extents: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_tmpfs_allocated_logical_len(_sparse_extents: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_sysv_msg_current_bytes(_messages: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_brk_grow(_pages: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_brk_eager_mapped(_pages: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_brk_lazy_extended(_pages: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_brk_lazy_fault_page() {}
-
-    #[inline(always)]
-    pub(crate) fn record_frame_alloc(_zeroed: bool) {}
-
-    #[inline(always)]
-    pub(crate) fn record_mmap_private_fault(
-        _file_backed: bool,
-        _full_file_overwrite: bool,
-        _read_request_bytes: usize,
-        _read_bytes: usize,
-        _file_zero_bytes_needed: usize,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_frame_dealloc(
-        _released: bool,
-        _refcount_drop: bool,
-        _recycled_scan_slots: usize,
-        _recycled_len: usize,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_dev_zero_read(_bytes: usize, _byte_writes: usize, _fill_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_dev_random_read(
-        _bytes: usize,
-        _byte_writes: usize,
-        _word_fill_bytes: usize,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_uart_write(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_tlb_flush_all() {}
-
-    #[inline(always)]
-    pub(crate) fn record_tlb_flush_range(_pages: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_fresh_tlb_generation_publish(_pages: usize, _remote_targets: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_kernel_stack_alloc(
-        _reused: bool,
-        _live: usize,
-        _mapped_slots: usize,
-        _pool_depth: usize,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_kernel_stack_release(
-        _live: usize,
-        _mapped_slots: usize,
-        _pool_depth: usize,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_kernel_stack_state(
-        _live: usize,
-        _mapped_slots: usize,
-        _pool_depth: usize,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_mount_metadata(_source_len: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_mount_fast_stat_flags() {}
-
-    #[inline(always)]
-    pub(crate) fn record_mount_fast_fs_type() {}
-
-    #[inline(always)]
-    #[allow(dead_code)]
-    pub(crate) fn record_mount_backend_contended_acquisition() {}
-
-    #[inline(always)]
-    #[allow(dead_code)]
-    pub(crate) fn record_ext4_bcache_index_lock(_contended: bool) {}
-
-    #[inline(always)]
-    #[allow(dead_code)]
-    pub(crate) fn record_ext4_bcache_lba_lock(_contended: bool) {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_block_read(_blocks: usize, _bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_block_write(_blocks: usize, _bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_sequence_read(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_sequence_writer_entry(_active_writers: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_sequence_reader_wait_yield() {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_sequence_reader_retry(_blocks: usize, _bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_read_plan_attempt() {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_read_plan_prepared(
-        _data_runs: usize,
-        _data_blocks: usize,
-        _zero_runs: usize,
-        _zero_blocks: usize,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_read_plan_fallback() {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_read_plan_executed(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_read_plan_direct_io(_calls: usize, _blocks: usize, _bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_directory_plan_attempt() {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_directory_plan_prepared(_data_runs: usize, _data_blocks: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_directory_plan_fallback() {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_directory_plan_executed(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_directory_plan_direct_io(
-        _calls: usize,
-        _blocks: usize,
-        _bytes: usize,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_write_plan_attempt() {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_write_plan_prepared(
-        _data_runs: usize,
-        _data_blocks: usize,
-        _invalidated_aliases: usize,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_write_plan_fallback(_alias_busy: bool) {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_write_plan_rmw_read(_calls: usize, _blocks: usize, _bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_write_plan_executed(
-        _bytes: usize,
-        _direct_calls: usize,
-        _direct_blocks: usize,
-        _direct_bytes: usize,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_metadata_transaction_attempt() {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_metadata_transaction_begin() {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_metadata_transaction_end() {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_metadata_transaction_fallback() {}
-
-    #[inline(always)]
-    pub(crate) fn record_ext4_metadata_transaction_commit(
-        _read_lbas: usize,
-        _write_lbas: usize,
-        _device_write_calls: usize,
-        _device_write_blocks: usize,
-        _merged_lbas: usize,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_eventfd_read_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_eventfd_write_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_eventfd_reader_sleep() {}
-
-    #[inline(always)]
-    pub(crate) fn record_eventfd_writer_sleep() {}
-
-    #[inline(always)]
-    pub(crate) fn record_eventfd_reader_wakeup() {}
-
-    #[inline(always)]
-    pub(crate) fn record_eventfd_writer_wakeup() {}
-
-    #[inline(always)]
-    pub(crate) fn record_local_socket_read_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_local_socket_write_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_local_socket_reader_sleep() {}
-
-    #[inline(always)]
-    pub(crate) fn record_local_socket_writer_sleep() {}
-
-    #[inline(always)]
-    pub(crate) fn record_local_socket_reader_wakeup() {}
-
-    #[inline(always)]
-    pub(crate) fn record_local_socket_writer_wakeup() {}
-
-    #[inline(always)]
-    pub(crate) fn record_local_socket_write_user_buffer(
-        _bytes: usize,
-        _to_vec_bytes: usize,
-        _stream_direct_bytes: usize,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_local_socket_stream_recv(_contiguous_bytes: usize, _slice_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_pipe_read_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_pipe_write_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_pipe_read_chunk_copy(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_pipe_write_chunk_copy(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_pipe_reader_sleep() {}
-
-    #[inline(always)]
-    pub(crate) fn record_pipe_writer_sleep() {}
-
-    #[inline(always)]
-    pub(crate) fn record_copy_file_range_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_copy_file_range_chunk(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_sendfile_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_sendfile_chunk(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_splice_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_splice_chunk(_bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_mmap_hole_search(
-        _page_probes: usize,
-        _gap_checks: usize,
-        _area_visits: usize,
-        _vma_count: usize,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_vma_lookup(_area_probes: usize, _hit: bool) {}
-
-    #[inline(always)]
-    pub(crate) fn record_vma_range_scan(_area_visits: usize, _index_skips: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_user_c_string_call() {}
-
-    #[inline(always)]
-    pub(crate) fn record_user_c_string_chunk(
-        _scanned_bytes: usize,
-        _copied_bytes: usize,
-        _ascii: bool,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_usercopy_same_page_fast(_access: UsercopyAccess, _bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_usercopy_slow_path(_page_count: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_usercopy_checked_range(_pages: usize, _bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_usercopy_translated_shape(_segments: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_usercopy_segment_vec_alloc(_slots: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_usercopy_range_reuse(_chunks: usize, _pages: usize, _bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_usercopy_site(_site: UsercopySite, _bytes: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_inotify_no_live_group_fast_path() {}
-
-    #[inline(always)]
-    pub(crate) fn record_inotify_live_group_scan() {}
-
-    #[inline(always)]
-    pub(crate) fn record_inotify_node_name_remember() {}
-
-    #[inline(always)]
-    pub(crate) fn record_inotify_unlinked_node_update() {}
-
-    #[inline(always)]
-    pub(crate) fn record_fanotify_no_live_group_fast_path() {}
-
-    #[inline(always)]
-    pub(crate) fn record_fanotify_live_group_scan() {}
-
-    #[inline(always)]
-    pub(crate) fn record_fanotify_node_name_remember() {}
-
-    #[inline(always)]
-    pub(crate) fn record_fanotify_node_name_lookup() {}
-
-    #[inline(always)]
-    pub(crate) fn record_futex_cleanup(
-        _direct_hit: bool,
-        _already_unqueued: bool,
-        _fallback_queue_visits: usize,
-        _fallback_waiter_visits: usize,
-    ) {
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_futex_wake(_key_hit: bool, _tasks: usize) {}
-
-    #[inline(always)]
-    pub(crate) fn record_futex_manager_state(
-        _queue_count: usize,
-        _waiter_count: usize,
-        _bucket_queue_count: usize,
-        _bucket_waiter_count: usize,
-    ) {
-    }
+    declare_perf_events!(define_disabled_perf_events);
 
     #[allow(dead_code)]
     #[inline(always)]
