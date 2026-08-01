@@ -12,7 +12,6 @@ mod path;
 pub(crate) mod permissions;
 mod poll;
 mod stat;
-mod swap;
 mod tty;
 mod uapi;
 
@@ -65,7 +64,5 @@ pub use stat::{
     sys_lgetxattr, sys_listxattr, sys_llistxattr, sys_lremovexattr, sys_lsetxattr,
     sys_newfstatat_ctx, sys_removexattr, sys_setxattr, sys_statfs_ctx, sys_statx_ctx,
 };
-pub(crate) use swap::is_active_swap_file;
-pub use swap::{sys_swapoff, sys_swapon};
 pub use tty::sys_ioctl;
 pub use uapi::{LinuxKstat, LinuxPollFd, LinuxStatfs, LinuxStatx};

@@ -1071,9 +1071,6 @@ pub fn sys_copy_file_range(
     if out_entry.status_flags().contains(OpenFlags::APPEND) {
         return Err(Errno::EBADF);
     }
-    if super::is_active_swap_file(out_stat) {
-        return Err(Errno::ETXTBSY);
-    }
     if len == 0 {
         return Ok(0);
     }

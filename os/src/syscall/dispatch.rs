@@ -368,8 +368,6 @@ pub(crate) fn syscall_with_context(
         ),
         SYSCALL_READAHEAD => sys_readahead(args[0], args[1], args[2]),
         SYSCALL_FADVISE64 => sys_fadvise64(args[0], args[1] as i64, args[2] as i64, args[3] as i32),
-        SYSCALL_SWAPON => sys_swapon(args[0] as *const u8, args[1] as u32),
-        SYSCALL_SWAPOFF => sys_swapoff(args[0] as *const u8),
         SYSCALL_COPY_FILE_RANGE => sys_copy_file_range(
             args[0],
             args[1] as *mut i64,
