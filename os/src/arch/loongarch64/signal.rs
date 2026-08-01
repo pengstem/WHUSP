@@ -1,5 +1,6 @@
 use crate::mm::{
-    MmapFaultAccess, UserFaultOutcome, VirtAddr, page_table::PTEFlags, resolve_user_page_fault,
+    FaultOrigin, MmapFaultAccess, UserFaultOutcome, VirtAddr, page_table::PTEFlags,
+    resolve_user_page_fault,
 };
 use crate::syscall::LinuxSigInfo;
 use crate::syscall::user_ptr::{
@@ -162,7 +163,7 @@ fn signal_user_fault(addr: usize, access: UserBufferAccess) -> UserFaultOutcome 
         UserBufferAccess::Read => MmapFaultAccess::Read,
         UserBufferAccess::Write => MmapFaultAccess::Write,
     };
-    resolve_user_page_fault(&current_process(), addr, access)
+    resolve_user_page_fault(&current_process(), addr, access, FaultOrigin::Usercopy)
 }
 
 fn remove_pending_signal_for_task(task: &TaskControlBlock, signum: usize, signal: SignalFlags) {

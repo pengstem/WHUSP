@@ -1847,6 +1847,23 @@ impl MemorySet {
         page: MmapFaultPage,
         frame: FrameTracker,
     ) -> MmapPageInstall {
+        self.install_mmap_fault_page_inner(page, frame, false)
+    }
+
+    pub(crate) fn install_mmap_fault_page_on_user_return(
+        &mut self,
+        page: MmapFaultPage,
+        frame: FrameTracker,
+    ) -> MmapPageInstall {
+        self.install_mmap_fault_page_inner(page, frame, true)
+    }
+
+    fn install_mmap_fault_page_inner(
+        &mut self,
+        page: MmapFaultPage,
+        frame: FrameTracker,
+        publish_on_user_return: bool,
+    ) -> MmapPageInstall {
         let Some(idx) = self.find_area_idx_containing(page.vpn) else {
             return MmapPageInstall::Retry(FaultRetry::immediate(FaultRetryReason::VmaChanged));
         };
@@ -1869,7 +1886,14 @@ impl MemorySet {
             area.map_existing_frame(page_table, page.vpn, frame)
         };
         if installed {
-            self.invalidate_tlb_page(usize::from(VirtAddr::from(page.vpn)));
+            if publish_on_user_return {
+                self.publish_fresh_tlb_vpn_range_on_user_return(
+                    page.vpn,
+                    VirtPageNum(page.vpn.0 + 1),
+                );
+            } else {
+                self.invalidate_tlb_page(usize::from(VirtAddr::from(page.vpn)));
+            }
             if synchronize_instruction_stream {
                 self.synchronize_instruction_stream();
             }
@@ -1890,6 +1914,23 @@ impl MemorySet {
         &mut self,
         page: MmapPageCacheFault,
         ppn: PhysPageNum,
+    ) -> MmapPageCacheInstall {
+        self.install_mmap_page_cache_fault_page_inner(page, ppn, false)
+    }
+
+    pub(crate) fn install_mmap_page_cache_fault_page_on_user_return(
+        &mut self,
+        page: MmapPageCacheFault,
+        ppn: PhysPageNum,
+    ) -> MmapPageCacheInstall {
+        self.install_mmap_page_cache_fault_page_inner(page, ppn, true)
+    }
+
+    fn install_mmap_page_cache_fault_page_inner(
+        &mut self,
+        page: MmapPageCacheFault,
+        ppn: PhysPageNum,
+        publish_on_user_return: bool,
     ) -> MmapPageCacheInstall {
         let Some(idx) = self.find_area_idx_containing(page.vpn) else {
             page.release_resolved_ref();
@@ -1984,7 +2025,11 @@ impl MemorySet {
             if let Some(key) = unconsumed_key {
                 PAGE_CACHE.write(key.id).dec_ref(key);
             }
-            self.invalidate_tlb_vpn_range(page.vpn, invalidation_end);
+            if publish_on_user_return {
+                self.publish_fresh_tlb_vpn_range_on_user_return(page.vpn, invalidation_end);
+            } else {
+                self.invalidate_tlb_vpn_range(page.vpn, invalidation_end);
+            }
             if synchronize_instruction_stream {
                 self.synchronize_instruction_stream();
             }

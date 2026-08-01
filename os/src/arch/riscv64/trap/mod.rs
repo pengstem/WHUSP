@@ -260,7 +260,7 @@ fn init_lazy_fp_for_task(task: &Arc<TaskControlBlock>) {
 
 pub(crate) fn handle_user_page_fault(addr: usize, access: MmapFaultAccess) -> bool {
     let process = current_process();
-    match resolve_user_page_fault(&process, addr, access) {
+    match resolve_user_page_fault(&process, addr, access, FaultOrigin::Hardware) {
         UserFaultOutcome::Resolved => true,
         UserFaultOutcome::Retry(retry) => {
             record_fault_retry(FaultOrigin::Hardware, addr, access, &retry);

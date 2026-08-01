@@ -110,6 +110,27 @@ impl MemorySet {
             .expect("virtual-page invalidation size overflow");
         self.control.invalidate_tlb_range(start, size);
     }
+
+    pub(super) fn publish_fresh_tlb_vpn_range_on_user_return(
+        &self,
+        start_vpn: VirtPageNum,
+        end_vpn: VirtPageNum,
+    ) {
+        assert!(
+            start_vpn < end_vpn,
+            "empty fresh virtual-page publication range"
+        );
+        let start = usize::from(VirtAddr::from(start_vpn));
+        let pages = end_vpn
+            .0
+            .checked_sub(start_vpn.0)
+            .expect("inverted fresh virtual-page publication range");
+        let size = pages
+            .checked_mul(crate::config::PAGE_SIZE)
+            .expect("fresh virtual-page publication size overflow");
+        self.control
+            .publish_fresh_tlb_range_on_user_return(start, size);
+    }
     /// Maps kernel-private framed pages without clearing the new frames.
     ///
     /// Callers must only use this for mappings that are never readable from

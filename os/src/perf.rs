@@ -332,6 +332,9 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) tlb_flush_all_calls: usize,
     pub(crate) tlb_flush_range_calls: usize,
     pub(crate) tlb_flush_range_pages: usize,
+    pub(crate) fresh_tlb_generation_publish_calls: usize,
+    pub(crate) fresh_tlb_generation_publish_pages: usize,
+    pub(crate) fresh_tlb_generation_remote_targets: usize,
     pub(crate) kernel_stack_fresh_mappings: usize,
     pub(crate) kernel_stack_pool_reuses: usize,
     pub(crate) kernel_stack_pool_releases: usize,
@@ -718,6 +721,9 @@ mod enabled {
     static TLB_FLUSH_ALL_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TLB_FLUSH_RANGE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TLB_FLUSH_RANGE_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static FRESH_TLB_GENERATION_PUBLISH_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static FRESH_TLB_GENERATION_PUBLISH_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static FRESH_TLB_GENERATION_REMOTE_TARGETS: AtomicUsize = AtomicUsize::new(0);
     static KERNEL_STACK_FRESH_MAPPINGS: AtomicUsize = AtomicUsize::new(0);
     static KERNEL_STACK_POOL_REUSES: AtomicUsize = AtomicUsize::new(0);
     static KERNEL_STACK_POOL_RELEASES: AtomicUsize = AtomicUsize::new(0);
@@ -1932,6 +1938,12 @@ mod enabled {
         TLB_FLUSH_RANGE_PAGES.fetch_add(pages, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_fresh_tlb_generation_publish(pages: usize, remote_targets: usize) {
+        FRESH_TLB_GENERATION_PUBLISH_CALLS.fetch_add(1, Ordering::Relaxed);
+        FRESH_TLB_GENERATION_PUBLISH_PAGES.fetch_add(pages, Ordering::Relaxed);
+        FRESH_TLB_GENERATION_REMOTE_TARGETS.fetch_add(remote_targets, Ordering::Relaxed);
+    }
+
     fn record_kernel_stack_state_inner(live: usize, mapped_slots: usize, pool_depth: usize) {
         KERNEL_STACK_LIVE.store(live, Ordering::Relaxed);
         update_max(&KERNEL_STACK_LIVE_MAX, live);
@@ -2749,6 +2761,12 @@ mod enabled {
             tlb_flush_all_calls: TLB_FLUSH_ALL_CALLS.load(Ordering::Relaxed),
             tlb_flush_range_calls: TLB_FLUSH_RANGE_CALLS.load(Ordering::Relaxed),
             tlb_flush_range_pages: TLB_FLUSH_RANGE_PAGES.load(Ordering::Relaxed),
+            fresh_tlb_generation_publish_calls: FRESH_TLB_GENERATION_PUBLISH_CALLS
+                .load(Ordering::Relaxed),
+            fresh_tlb_generation_publish_pages: FRESH_TLB_GENERATION_PUBLISH_PAGES
+                .load(Ordering::Relaxed),
+            fresh_tlb_generation_remote_targets: FRESH_TLB_GENERATION_REMOTE_TARGETS
+                .load(Ordering::Relaxed),
             kernel_stack_fresh_mappings: KERNEL_STACK_FRESH_MAPPINGS.load(Ordering::Relaxed),
             kernel_stack_pool_reuses: KERNEL_STACK_POOL_REUSES.load(Ordering::Relaxed),
             kernel_stack_pool_releases: KERNEL_STACK_POOL_RELEASES.load(Ordering::Relaxed),
@@ -3178,6 +3196,9 @@ mod enabled {
          tlb_flush_all_calls {}\n\
          tlb_flush_range_calls {}\n\
          tlb_flush_range_pages {}\n\
+         fresh_tlb_generation_publish_calls {}\n\
+         fresh_tlb_generation_publish_pages {}\n\
+         fresh_tlb_generation_remote_targets {}\n\
          kernel_stack_fresh_mappings {}\n\
          kernel_stack_pool_reuses {}\n\
          kernel_stack_pool_releases {}\n\
@@ -3559,6 +3580,9 @@ mod enabled {
             stats.tlb_flush_all_calls,
             stats.tlb_flush_range_calls,
             stats.tlb_flush_range_pages,
+            stats.fresh_tlb_generation_publish_calls,
+            stats.fresh_tlb_generation_publish_pages,
+            stats.fresh_tlb_generation_remote_targets,
             stats.kernel_stack_fresh_mappings,
             stats.kernel_stack_pool_reuses,
             stats.kernel_stack_pool_releases,
@@ -4120,6 +4144,9 @@ mod disabled {
 
     #[inline(always)]
     pub(crate) fn record_tlb_flush_range(_pages: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn record_fresh_tlb_generation_publish(_pages: usize, _remote_targets: usize) {}
 
     #[inline(always)]
     pub(crate) fn record_kernel_stack_alloc(

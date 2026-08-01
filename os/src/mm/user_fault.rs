@@ -166,6 +166,7 @@ fn resolve_prepared_mmap_fault(
     process: &ProcessControlBlock,
     addr: usize,
     access: MmapFaultAccess,
+    origin: FaultOrigin,
     fault: MmapFaultResult,
 ) -> UserFaultOutcome {
     match fault {
@@ -186,10 +187,15 @@ fn resolve_prepared_mmap_fault(
             };
             let _install_scope =
                 crate::perf::time_scope(crate::perf::ProfilePoint::PageFaultMmapInstallFrame);
-            let install = process
-                .inner_exclusive_access()
-                .memory_set
-                .install_mmap_fault_page(page, frame);
+            let mut inner = process.inner_exclusive_access();
+            let install = if origin == FaultOrigin::Hardware {
+                inner
+                    .memory_set
+                    .install_mmap_fault_page_on_user_return(page, frame)
+            } else {
+                inner.memory_set.install_mmap_fault_page(page, frame)
+            };
+            drop(inner);
             match install {
                 MmapPageInstall::InstalledOrDuplicate => {
                     resolved_or_retry(process, addr, access, FaultRetryReason::DuplicateFault)
@@ -214,10 +220,17 @@ fn resolve_prepared_mmap_fault(
             };
             let _install_scope =
                 crate::perf::time_scope(crate::perf::ProfilePoint::PageFaultMmapInstallPageCache);
-            let install = process
-                .inner_exclusive_access()
-                .memory_set
-                .install_mmap_page_cache_fault_page(page, ppn);
+            let mut inner = process.inner_exclusive_access();
+            let install = if origin == FaultOrigin::Hardware {
+                inner
+                    .memory_set
+                    .install_mmap_page_cache_fault_page_on_user_return(page, ppn)
+            } else {
+                inner
+                    .memory_set
+                    .install_mmap_page_cache_fault_page(page, ppn)
+            };
+            drop(inner);
             match install {
                 MmapPageCacheInstall::InstalledOrDuplicate => {
                     resolved_or_retry(process, addr, access, FaultRetryReason::DuplicateFault)
@@ -233,6 +246,7 @@ pub(crate) fn resolve_user_page_fault(
     process: &Arc<ProcessControlBlock>,
     addr: usize,
     access: MmapFaultAccess,
+    origin: FaultOrigin,
 ) -> UserFaultOutcome {
     let _profile_scope = crate::perf::time_scope(crate::perf::ProfilePoint::PageFault);
     if access == MmapFaultAccess::Write {
@@ -249,7 +263,7 @@ pub(crate) fn resolve_user_page_fault(
         let fault = inner.memory_set.prepare_mmap_page_fault(addr, access);
         drop(inner);
         if let Some(fault) = fault {
-            return resolve_prepared_mmap_fault(process, addr, access, fault);
+            return resolve_prepared_mmap_fault(process, addr, access, origin, fault);
         }
     } else {
         let fault = {
@@ -261,7 +275,7 @@ pub(crate) fn resolve_user_page_fault(
                 .prepare_mmap_page_fault(addr, access)
         };
         if let Some(fault) = fault {
-            return resolve_prepared_mmap_fault(process, addr, access, fault);
+            return resolve_prepared_mmap_fault(process, addr, access, origin, fault);
         }
     }
 

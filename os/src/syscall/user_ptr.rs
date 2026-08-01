@@ -171,7 +171,12 @@ fn mmap_user_fault(addr: usize, access: UserBufferAccess) -> UserFaultOutcome {
         UserBufferAccess::Read => MmapFaultAccess::Read,
         UserBufferAccess::Write => MmapFaultAccess::Write,
     };
-    resolve_user_page_fault(&crate::task::current_process(), addr, access)
+    resolve_user_page_fault(
+        &crate::task::current_process(),
+        addr,
+        access,
+        FaultOrigin::Usercopy,
+    )
 }
 
 fn lazy_framed_user_fault_for_process(

@@ -178,7 +178,7 @@ impl AddressSpaceControl {
         }
     }
 
-    fn invalidate_tlb_range_inner(&self, start: usize, size: usize) {
+    fn publish_tlb_generation(&self) -> usize {
         // Publish the PTE writes before making the new generation visible.
         // enter_cpu() and this snapshot are SeqCst: an enter ordered before
         // the snapshot is targeted below, while an enter ordered afterward
@@ -193,6 +193,47 @@ impl AddressSpaceControl {
             .unwrap_or_else(|_| panic!("address-space TLB generation wrapped: id={}", self.id))
             + 1;
         assert_ne!(generation, 0, "address-space TLB generation is zero");
+        generation
+    }
+
+    /// Publishes a newly valid user leaf without synchronously interrupting
+    /// CPUs already running the same address space.
+    ///
+    /// This is valid only for a hardware-fault `empty -> valid` transition:
+    /// there is no stale physical mapping or retired resource to protect.
+    /// Every CPU observes `tlb_generation` before its next user return. A CPU
+    /// that first hits a stale negative translation merely takes a redundant
+    /// fault and flushes before retrying the user instruction.
+    pub(crate) fn publish_fresh_tlb_range_on_user_return(&self, start: usize, size: usize) {
+        assert_ne!(size, 0, "empty fresh TLB publication");
+        assert_eq!(
+            start % crate::config::PAGE_SIZE,
+            0,
+            "fresh TLB publication start is not page aligned"
+        );
+        assert_eq!(
+            size % crate::config::PAGE_SIZE,
+            0,
+            "fresh TLB publication size is not page aligned"
+        );
+        let _generation = self.publish_tlb_generation();
+        let active = self.active_cpus.load(Ordering::SeqCst);
+        let current = crate::cpu::current_id();
+        assert!(
+            active.contains(current),
+            "fresh TLB publication requires the current address space: id={} active={:#x} current={current}",
+            self.id,
+            active.bits(),
+        );
+        let remote = CpuMask::from_bits(active.bits() & !CpuMask::single(current).bits());
+        crate::perf::record_fresh_tlb_generation_publish(
+            size / crate::config::PAGE_SIZE,
+            remote.count(),
+        );
+    }
+
+    fn invalidate_tlb_range_inner(&self, start: usize, size: usize) {
+        let generation = self.publish_tlb_generation();
 
         let active = self.active_cpus.load(Ordering::SeqCst);
         if active.bits() == 0 {
