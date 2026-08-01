@@ -3,6 +3,8 @@ use super::{
     MapArea, MapPermission, MapType, MemorySet, PhysAddr, VirtAddr, VirtPageNum,
     invalidate_global_tlb_range,
 };
+#[cfg(target_arch = "riscv64")]
+use crate::config::{KERNEL_STACK_TOP, USER_MMAP_BASE};
 use crate::config::{PAGE_SIZE, TRAMPOLINE, memory_end, mmio_regions};
 use crate::sync::UPIntrFreeCell;
 use alloc::sync::Arc;
@@ -28,6 +30,69 @@ lazy_static! {
 
 pub fn kernel_token() -> usize {
     KERNEL_SPACE.exclusive_access().token()
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+pub(super) fn install_kernel_mappings_into_user(_memory_set: &mut MemorySet) -> bool {
+    true
+}
+
+/// Makes the current process root usable in S-mode without a trap-time SATP
+/// switch. Kernel RAM and the kernel-stack subtree are referenced through
+/// kernel-owned root entries. MMIO is exposed through one shared high-address
+/// alias so device leaves cannot occupy the low root entries used by ELF LOAD
+/// segments.
+#[cfg(target_arch = "riscv64")]
+pub(super) fn install_kernel_mappings_into_user(memory_set: &mut MemorySet) -> bool {
+    let first_ram_root = VirtAddr::from(stext as usize).floor().indexes()[0];
+    let last_ram_root = VirtAddr::from(memory_end() - 1).floor().indexes()[0];
+    let kernel_stack_root = VirtAddr::from(KERNEL_STACK_TOP - PAGE_SIZE)
+        .floor()
+        .indexes()[0];
+    let first_mmio = mmio_regions()
+        .first()
+        .expect("single-SATP mode requires at least one MMIO region");
+    let mmio_root = VirtAddr::from(crate::arch::mm::mmio_phys_to_virt(first_mmio.base))
+        .floor()
+        .indexes()[0];
+    assert!(
+        mmio_regions().iter().all(|range| {
+            let start = crate::arch::mm::mmio_phys_to_virt(range.base);
+            let end = start
+                .checked_add(range.size)
+                .expect("RISC-V MMIO virtual range overflow");
+            VirtAddr::from(start).floor().indexes()[0] == mmio_root
+                && VirtAddr::from(end - 1).floor().indexes()[0] == mmio_root
+        }),
+        "RISC-V MMIO aliases must share one Sv39 root entry"
+    );
+    {
+        let kernel_space = KERNEL_SPACE.exclusive_access();
+        for index in first_ram_root..=last_ram_root {
+            let entry = kernel_space.page_table.root_entry(index);
+            if !memory_set
+                .page_table
+                .install_shared_root_entry(index, entry)
+            {
+                return false;
+            }
+        }
+        let stack_entry = kernel_space.page_table.root_entry(kernel_stack_root);
+        if !memory_set
+            .page_table
+            .install_shared_root_entry(kernel_stack_root, stack_entry)
+        {
+            return false;
+        }
+        let mmio_entry = kernel_space.page_table.root_entry(mmio_root);
+        if !memory_set
+            .page_table
+            .install_shared_root_entry(mmio_root, mmio_entry)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn invalidate_global_vpn_range(start_vpn: VirtPageNum, end_vpn: VirtPageNum) {
@@ -139,6 +204,7 @@ impl MemorySet {
             ),
             None,
         );
+        #[cfg(not(target_arch = "riscv64"))]
         for pair in mmio_regions() {
             memory_set.push(
                 MapArea::new(
@@ -148,6 +214,43 @@ impl MemorySet {
                     MapPermission::R | MapPermission::W,
                 ),
                 None,
+            );
+        }
+        #[cfg(target_arch = "riscv64")]
+        for pair in mmio_regions() {
+            let virtual_start = crate::arch::mm::mmio_phys_to_virt(pair.base);
+            let virtual_end = virtual_start
+                .checked_add(pair.size)
+                .expect("RISC-V MMIO virtual range overflow");
+            let start_vpn = VirtAddr::from(virtual_start).floor();
+            let end_vpn = VirtAddr::from(virtual_end).ceil();
+            let start_ppn = PhysAddr::from(pair.base).floor();
+            assert_eq!(
+                start_vpn.indexes()[0],
+                VirtAddr::from(virtual_end - 1).floor().indexes()[0],
+                "RISC-V MMIO alias crossed an Sv39 root boundary"
+            );
+            assert!(
+                memory_set.page_table.try_map_kernel_linear_range(
+                    start_vpn,
+                    start_ppn,
+                    end_vpn,
+                    PTEFlags::R | PTEFlags::W | PTEFlags::G,
+                ),
+                "failed to map RISC-V MMIO high alias"
+            );
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            assert!(
+                memory_end() <= USER_MMAP_BASE,
+                "single-SATP kernel direct map overlaps automatic user mmap range"
+            );
+            assert!(
+                memory_set
+                    .page_table
+                    .prepare_empty_leaf_path(VirtAddr::from(KERNEL_STACK_TOP - PAGE_SIZE).floor()),
+                "failed to prepare shared kernel-stack page-table subtree"
             );
         }
         memory_set

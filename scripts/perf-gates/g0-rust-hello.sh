@@ -246,6 +246,13 @@ path_exists "$WRITE_PROBE" && fail scratch stale_write_probe
 $BB mkdir "$WRITE_PROBE" || fail scratch tmp_not_writable "$?"
 $BB rmdir "$WRITE_PROBE" || fail scratch probe_cleanup_failed "$?"
 
+if [ "$WORKLOAD" = multicrate ] && [ "$PROJECT" = /tmp/minibuild ]; then
+    path_exists "$PROJECT" && fail setup stale_project
+    [ -d /root/minibuild ] || fail setup multicrate_fixture_missing
+    $BB cp -R /root/minibuild "$PROJECT" \
+        || fail setup multicrate_tmpfs_copy_failed "$?"
+fi
+
 if [ "$WORKLOAD" = hello ]; then
     path_exists "$PROJECT" && fail setup stale_project
 else

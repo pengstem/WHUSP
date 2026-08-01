@@ -94,3 +94,18 @@ pub fn activate_kernel_page_table_for_secondary() {
     );
     crate::arch::mm::activate_page_table(token);
 }
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn activate_process_page_table(token: usize) {
+    crate::arch::mm::switch_page_table(token);
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn activate_scheduler_page_table() {
+    let token = PUBLISHED_KERNEL_TOKEN.load(Ordering::Acquire);
+    assert_ne!(
+        token, 0,
+        "scheduler page-table switch preceded kernel-root publication"
+    );
+    crate::arch::mm::switch_page_table(token);
+}

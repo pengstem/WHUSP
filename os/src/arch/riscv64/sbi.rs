@@ -1,9 +1,11 @@
 /// use sbi call to set timer
 pub fn set_timer(timer: usize) {
+    crate::perf::record_rv_sbi_set_timer_call();
     sbi_rt::set_timer(timer as _);
 }
 
 pub fn cancel_timer() {
+    crate::perf::record_rv_sbi_set_timer_call();
     sbi_rt::set_timer(u64::MAX);
 }
 

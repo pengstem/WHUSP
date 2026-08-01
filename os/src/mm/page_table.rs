@@ -7,6 +7,10 @@ use bitflags::*;
 
 const PAGE_TABLE_LEVELS: usize = 3;
 const PAGE_TABLE_INDEX_BITS: usize = 9;
+#[cfg(target_arch = "riscv64")]
+const PAGE_TABLE_ENTRIES: usize = 1 << PAGE_TABLE_INDEX_BITS;
+#[cfg(target_arch = "riscv64")]
+const SHARED_ROOT_MASK_WORDS: usize = PAGE_TABLE_ENTRIES / usize::BITS as usize;
 
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +83,8 @@ pub struct PageTable {
     leaves_4k: usize,
     leaves_2m: usize,
     leaves_1g: usize,
+    #[cfg(target_arch = "riscv64")]
+    shared_root_entries: [usize; SHARED_ROOT_MASK_WORDS],
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -104,6 +110,8 @@ impl PageTable {
             leaves_4k: 0,
             leaves_2m: 0,
             leaves_1g: 0,
+            #[cfg(target_arch = "riscv64")]
+            shared_root_entries: [0; SHARED_ROOT_MASK_WORDS],
         }
     }
     pub fn try_new() -> Option<Self> {
@@ -116,6 +124,8 @@ impl PageTable {
             leaves_4k: 0,
             leaves_2m: 0,
             leaves_1g: 0,
+            #[cfg(target_arch = "riscv64")]
+            shared_root_entries: [0; SHARED_ROOT_MASK_WORDS],
         })
     }
     /// Builds a non-owning view over an existing page-table token.
@@ -130,7 +140,65 @@ impl PageTable {
             leaves_4k: 0,
             leaves_2m: 0,
             leaves_1g: 0,
+            #[cfg(target_arch = "riscv64")]
+            shared_root_entries: [0; SHARED_ROOT_MASK_WORDS],
         }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn root_entry_is_shared(&self, index: usize) -> bool {
+        let bits = usize::BITS as usize;
+        self.shared_root_entries[index / bits] & (1usize << (index % bits)) != 0
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub(super) fn range_intersects_shared_root(&self, start: usize, end: usize) -> bool {
+        if start >= end {
+            return false;
+        }
+        let start_root = VirtAddr::from(start).floor().indexes()[0];
+        let end_root = VirtAddr::from(end - 1).floor().indexes()[0];
+        if start_root <= end_root {
+            (start_root..=end_root).any(|index| self.root_entry_is_shared(index))
+        } else {
+            (start_root..PAGE_TABLE_ENTRIES)
+                .chain(0..=end_root)
+                .any(|index| self.root_entry_is_shared(index))
+        }
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    pub(super) fn range_intersects_shared_root(&self, _start: usize, _end: usize) -> bool {
+        false
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub(super) fn root_entry(&self, index: usize) -> PageTableEntry {
+        assert!(index < PAGE_TABLE_ENTRIES, "page-table root index overflow");
+        self.root_ppn.get_pte_array()[index]
+    }
+
+    /// Installs a non-owning reference to a kernel-owned Sv39 root entry.
+    ///
+    /// The destination does not retain the pointed-to page-table frames. The
+    /// kernel root owns them for the lifetime of every user address space.
+    #[cfg(target_arch = "riscv64")]
+    pub(super) fn install_shared_root_entry(
+        &mut self,
+        index: usize,
+        entry: PageTableEntry,
+    ) -> bool {
+        if index >= PAGE_TABLE_ENTRIES || !entry.is_valid() || self.root_entry_is_shared(index) {
+            return false;
+        }
+        let destination = &mut self.root_ppn.get_pte_array_mut()[index];
+        if destination.bits != 0 {
+            return false;
+        }
+        *destination = entry;
+        let bits = usize::BITS as usize;
+        self.shared_root_entries[index / bits] |= 1usize << (index % bits);
+        true
     }
     fn find_pte_create_at_level(
         &mut self,
@@ -139,6 +207,10 @@ impl PageTable {
     ) -> Option<&mut PageTableEntry> {
         assert!(target_level < PAGE_TABLE_LEVELS);
         let idxs = vpn.indexes();
+        #[cfg(target_arch = "riscv64")]
+        if self.root_entry_is_shared(idxs[0]) {
+            return None;
+        }
         let mut ppn = self.root_ppn;
         let target_depth = PAGE_TABLE_LEVELS - 1 - target_level;
         for (depth, idx) in idxs.iter().enumerate() {
@@ -185,6 +257,10 @@ impl PageTable {
     ) -> Option<&mut PageTableEntry> {
         assert!(target_level < PAGE_TABLE_LEVELS);
         let idxs = vpn.indexes();
+        #[cfg(target_arch = "riscv64")]
+        if self.root_entry_is_shared(idxs[0]) {
+            return None;
+        }
         let mut ppn = self.root_ppn;
         let target_depth = PAGE_TABLE_LEVELS - 1 - target_level;
         for (depth, idx) in idxs.iter().enumerate() {
@@ -269,6 +345,36 @@ impl PageTable {
         }
 
         self.verify_kernel_identical_range(start_vpn, end_vpn, flags);
+        true
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub(super) fn try_map_kernel_linear_range(
+        &mut self,
+        start_vpn: VirtPageNum,
+        start_ppn: PhysPageNum,
+        end_vpn: VirtPageNum,
+        flags: PTEFlags,
+    ) -> bool {
+        assert!(start_vpn <= end_vpn);
+        let pages = end_vpn.0 - start_vpn.0;
+        for offset in 0..pages {
+            let vpn = VirtPageNum(start_vpn.0 + offset);
+            let Some(pte) = self.find_pte_create(vpn) else {
+                return false;
+            };
+            if pte.bits != 0 {
+                return false;
+            }
+        }
+        for offset in 0..pages {
+            let vpn = VirtPageNum(start_vpn.0 + offset);
+            let ppn = PhysPageNum(start_ppn.0 + offset);
+            assert!(
+                self.try_map(vpn, ppn, flags),
+                "preflighted linear kernel mapping changed at {vpn:?}"
+            );
+        }
         true
     }
     pub(super) fn unmap_kernel_identical_range(

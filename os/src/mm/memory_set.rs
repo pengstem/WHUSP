@@ -70,6 +70,20 @@ impl MemorySet {
             mlock_future_on_fault: false,
         })
     }
+
+    /// Creates a process page table, including architecture-owned mappings
+    /// that must remain reachable while that process root is active.
+    pub fn new_user_bare() -> Self {
+        Self::try_new_user_bare().expect("user page-table construction requires free frames")
+    }
+
+    pub fn try_new_user_bare() -> Option<Self> {
+        let mut memory_set = Self::try_new_bare()?;
+        if !super::kernel_space::install_kernel_mappings_into_user(&mut memory_set) {
+            return None;
+        }
+        Some(memory_set)
+    }
     pub fn token(&self) -> usize {
         self.page_table.token()
     }

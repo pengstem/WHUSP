@@ -373,7 +373,7 @@ pub fn mmio_regions() -> &'static [MmioRange] {
 
 pub fn uart_base() -> usize {
     if BOARD_CONFIG.initialized.load(Ordering::Acquire) {
-        board_config().uart.base
+        crate::arch::mm::mmio_phys_to_virt(board_config().uart.base)
     } else {
         EARLY_UART_BASE
     }
@@ -384,7 +384,7 @@ pub fn uart_irq() -> usize {
 }
 
 pub fn plic_base() -> usize {
-    board_config().plic.base
+    crate::arch::mm::mmio_phys_to_virt(board_config().plic.base)
 }
 
 pub fn block_devices() -> &'static [BlockDeviceConfig] {
@@ -421,7 +421,12 @@ pub fn mouse_irq() -> Option<usize> {
 }
 
 pub fn rtc_base() -> usize {
-    board_config().rtc_base
+    let base = board_config().rtc_base;
+    if base == 0 {
+        0
+    } else {
+        crate::arch::mm::mmio_phys_to_virt(base)
+    }
 }
 
 pub fn device_init(hart_id: usize) {

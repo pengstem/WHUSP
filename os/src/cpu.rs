@@ -48,8 +48,6 @@ pub struct CpuLocal {
 #[repr(C)]
 pub(crate) struct CpuMmuFastState {
     last_return_user_token: AtomicUsize,
-    #[cfg(target_arch = "riscv64")]
-    last_entry_kernel_token: AtomicUsize,
     return_tlb_dirty: AtomicBool,
     observed_address_space_id: AtomicUsize,
     observed_tlb_generation: AtomicUsize,
@@ -61,8 +59,6 @@ impl CpuMmuFastState {
     const fn new() -> Self {
         Self {
             last_return_user_token: AtomicUsize::new(0),
-            #[cfg(target_arch = "riscv64")]
-            last_entry_kernel_token: AtomicUsize::new(0),
             return_tlb_dirty: AtomicBool::new(true),
             observed_address_space_id: AtomicUsize::new(0),
             observed_tlb_generation: AtomicUsize::new(0),
@@ -73,11 +69,6 @@ impl CpuMmuFastState {
 
     pub(crate) fn swap_last_return_user_token(&self, token: usize) -> usize {
         self.last_return_user_token.swap(token, Ordering::Relaxed)
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    pub(crate) fn swap_last_entry_kernel_token(&self, token: usize) -> usize {
-        self.last_entry_kernel_token.swap(token, Ordering::Relaxed)
     }
 
     pub(crate) fn take_return_tlb_dirty(&self) -> bool {

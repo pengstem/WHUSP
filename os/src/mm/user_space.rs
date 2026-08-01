@@ -846,7 +846,7 @@ impl MemorySet {
         user_space: &mut MemorySet,
         parent_needs_tlb_flush: &mut bool,
     ) -> Option<MemorySet> {
-        let mut memory_set = Self::try_new_bare()?;
+        let mut memory_set = Self::try_new_user_bare()?;
         memory_set.brk_base = user_space.brk_base;
         memory_set.brk = user_space.brk;
         memory_set.brk_limit = user_space.brk_limit;
@@ -2702,6 +2702,9 @@ impl MemorySet {
     pub(crate) fn range_overlaps(&self, start: usize, end: usize) -> bool {
         if start >= end {
             return false;
+        }
+        if self.page_table.range_intersects_shared_root(start, end) {
+            return true;
         }
         let start_vpn = VirtAddr::from(start).floor();
         let end_vpn = VirtAddr::from(end).floor();

@@ -20,6 +20,8 @@ const VPN_WIDTH: usize = VA_WIDTH - crate::config::PAGE_SIZE_BITS;
 
 pub const MAX_KERNEL_LEAF_LEVEL: usize = 2;
 
+const MMIO_VIRT_BASE: usize = 0xffff_ffff_4000_0000;
+
 const ASID_SUPPORT_NO: usize = 0;
 const ASID_SUPPORT_YES: usize = 1;
 const ASID_SUPPORT_UNKNOWN: usize = 2;
@@ -81,6 +83,17 @@ pub fn activate_page_table(token: usize) {
     flush_tlb_all();
 }
 
+/// Switches between already-published ASID-tagged roots.
+///
+/// An ASID rollover performs the required global shootdown in the allocator.
+/// Hardware without writable ASID bits still needs a local fence here.
+pub fn switch_page_table(token: usize) {
+    satp::write(token);
+    if !asid_supported() {
+        flush_tlb_all();
+    }
+}
+
 pub fn flush_tlb_all() {
     mark_return_tlb_dirty();
     unsafe {
@@ -115,15 +128,6 @@ pub fn should_flush_tlb_on_return(user_token: usize) -> bool {
     let previous = state.swap_last_return_user_token(user_token);
     let dirty = state.take_return_tlb_dirty();
     previous != user_token || dirty
-}
-
-pub fn should_flush_tlb_on_kernel_entry(kernel_token: usize) -> bool {
-    if !asid_supported() {
-        return true;
-    }
-    let state = crate::cpu::current().mmu();
-    let previous = state.swap_last_entry_kernel_token(kernel_token);
-    previous != kernel_token
 }
 
 fn mark_return_tlb_dirty() {
@@ -216,6 +220,12 @@ pub fn sign_extend_virt_addr(addr: usize) -> usize {
 
 pub fn phys_to_virt(addr: usize) -> usize {
     addr
+}
+
+pub fn mmio_phys_to_virt(addr: usize) -> usize {
+    MMIO_VIRT_BASE
+        .checked_add(addr)
+        .expect("RISC-V MMIO virtual alias overflow")
 }
 
 pub fn pte_new_bits(ppn: usize, flags: crate::mm::page_table::PTEFlags) -> usize {

@@ -5,7 +5,9 @@ use super::{
 };
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::{File, VfsNodeId, track_regular_file_executable, untrack_regular_file_executable};
-use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet};
+#[cfg(target_arch = "loongarch64")]
+use crate::mm::KERNEL_SPACE;
+use crate::mm::{ElfLoadInfo, MemorySet};
 use crate::perf;
 use crate::syscall::close_detached_fd_entry_for_process_teardown;
 use crate::syscall::user_ptr::copy_to_user;
@@ -443,6 +445,8 @@ impl ProcessControlBlock {
 
         // From this point on, user stack writes must target `new_token`; the old
         // process token may already describe the pre-exec image.
+        #[cfg(target_arch = "riscv64")]
+        crate::mm::activate_scheduler_page_table();
         let (retired_memory_set, previous_executable_node, close_on_exec_entries) = {
             let mut inner = self.inner_exclusive_access();
             let retired_memory_set = core::mem::replace(&mut inner.memory_set, memory_set);
@@ -461,6 +465,8 @@ impl ProcessControlBlock {
             let close_on_exec_entries = inner.close_on_exec_fd_entries();
             (retired_memory_set, previous, close_on_exec_entries)
         };
+        #[cfg(target_arch = "riscv64")]
+        refresh_current_user_token();
         // MemorySet owns file-backed MapAreas whose destructors can enter
         // sleepable VFS paths. Retire the old image under the PCB lock, but do
         // not destroy it until after the image-commit guard has been released.
@@ -512,6 +518,14 @@ impl ProcessControlBlock {
         write_user_stack(new_token, &stack_layout, &args, &envs)?;
         let user_sp = stack_layout.user_sp;
 
+        #[cfg(target_arch = "riscv64")]
+        let trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            task.kstack.get_top(),
+            trap_handler as usize,
+        );
+        #[cfg(target_arch = "loongarch64")]
         let trap_cx = TrapContext::app_init_context(
             entry_point,
             user_sp,
@@ -521,6 +535,7 @@ impl ProcessControlBlock {
         );
         *task_inner.get_trap_cx() = trap_cx;
         drop(task_inner);
+        #[cfg(not(target_arch = "riscv64"))]
         refresh_current_user_token();
         self.release_vfork_parent();
         ptrace_note_exec_current();

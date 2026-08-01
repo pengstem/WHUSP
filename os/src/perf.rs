@@ -181,6 +181,8 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) time_direct_timespec_calls: usize,
     pub(crate) riscv_return_fence_i_calls: usize,
     pub(crate) la_return_invtlb_calls: usize,
+    pub(crate) rv_user_trap_entries: usize,
+    pub(crate) rv_sbi_set_timer_calls: usize,
     pub(crate) rv_user_fp_save_calls: usize,
     pub(crate) rv_user_fp_restore_calls: usize,
     pub(crate) rv_user_fp_lazy_init_traps: usize,
@@ -576,6 +578,8 @@ mod enabled {
     static TIME_DIRECT_TIMESPEC_CALLS: AtomicUsize = AtomicUsize::new(0);
     static RISCV_RETURN_FENCE_I_CALLS: AtomicUsize = AtomicUsize::new(0);
     static LA_RETURN_INVTLB_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static RV_USER_TRAP_ENTRIES: PerCpuCounter = PerCpuCounter::new();
+    static RV_SBI_SET_TIMER_CALLS: PerCpuCounter = PerCpuCounter::new();
     static RV_USER_FP_SAVE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static RV_USER_FP_RESTORE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static RV_USER_FP_LAZY_INIT_TRAPS: AtomicUsize = AtomicUsize::new(0);
@@ -1558,6 +1562,16 @@ mod enabled {
     #[allow(dead_code)]
     pub(crate) fn record_la_return_invtlb_call() {
         LA_RETURN_INVTLB_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_rv_user_trap_entry() {
+        RV_USER_TRAP_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_rv_sbi_set_timer_call() {
+        RV_SBI_SET_TIMER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
@@ -2590,6 +2604,8 @@ mod enabled {
             time_direct_timespec_calls: TIME_DIRECT_TIMESPEC_CALLS.load(Ordering::Relaxed),
             riscv_return_fence_i_calls: RISCV_RETURN_FENCE_I_CALLS.load(Ordering::Relaxed),
             la_return_invtlb_calls: LA_RETURN_INVTLB_CALLS.load(Ordering::Relaxed),
+            rv_user_trap_entries: RV_USER_TRAP_ENTRIES.load(Ordering::Relaxed),
+            rv_sbi_set_timer_calls: RV_SBI_SET_TIMER_CALLS.load(Ordering::Relaxed),
             rv_user_fp_save_calls: RV_USER_FP_SAVE_CALLS.load(Ordering::Relaxed),
             rv_user_fp_restore_calls: RV_USER_FP_RESTORE_CALLS.load(Ordering::Relaxed),
             rv_user_fp_lazy_init_traps: RV_USER_FP_LAZY_INIT_TRAPS.load(Ordering::Relaxed),
@@ -3044,6 +3060,8 @@ mod enabled {
          time_direct_timespec_calls {}\n\
          riscv_return_fence_i_calls {}\n\
          la_return_invtlb_calls {}\n\
+         rv_user_trap_entries {}\n\
+         rv_sbi_set_timer_calls {}\n\
          rv_user_fp_save_calls {}\n\
          rv_user_fp_restore_calls {}\n\
          rv_user_fp_lazy_init_traps {}\n\
@@ -3428,6 +3446,8 @@ mod enabled {
             stats.time_direct_timespec_calls,
             stats.riscv_return_fence_i_calls,
             stats.la_return_invtlb_calls,
+            stats.rv_user_trap_entries,
+            stats.rv_sbi_set_timer_calls,
             stats.rv_user_fp_save_calls,
             stats.rv_user_fp_restore_calls,
             stats.rv_user_fp_lazy_init_traps,
@@ -3891,6 +3911,14 @@ mod disabled {
     #[inline(always)]
     #[allow(dead_code)]
     pub(crate) fn record_la_return_invtlb_call() {}
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn record_rv_user_trap_entry() {}
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn record_rv_sbi_set_timer_call() {}
 
     #[inline(always)]
     #[allow(dead_code)]

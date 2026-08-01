@@ -18,7 +18,7 @@ pub const TICKS_PER_SEC: usize = 100;
 // CONTEXT: Keep Linux-visible clock ticks at 100 Hz, but drive scheduler
 // timer interrupts at 1 kHz so 1 ms clock_nanosleep workloads can wake on
 // time instead of waiting for the next 10 ms accounting tick.
-const TIMER_INTERRUPTS_PER_SEC: usize = 1000;
+pub const TIMER_INTERRUPTS_PER_SEC: usize = 1000;
 const MSEC_PER_SEC: usize = 1000;
 const USEC_PER_SEC: usize = 1_000_000;
 const NSEC_PER_SEC: u64 = 1_000_000_000;

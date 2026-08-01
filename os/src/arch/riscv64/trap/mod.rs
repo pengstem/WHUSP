@@ -58,6 +58,7 @@ pub fn enable_timer_interrupt() {
 
 #[unsafe(no_mangle)]
 pub fn trap_handler() -> ! {
+    crate::perf::record_rv_user_trap_entry();
     set_kernel_trap_entry();
     let mut task = current_task().expect("trap_handler requires a running task");
     let mut process = process_of_task(&task);
@@ -289,7 +290,7 @@ fn force_default_sigsegv_current() {
 
 #[unsafe(no_mangle)]
 /// set the new addr of __restore asm function in TRAMPOLINE page,
-/// set the reg a0 = trap_cx_ptr, reg a1 = phy addr of usr page table,
+/// set a0 to the user TrapContext and pass the return-time flush decision,
 /// finally, jump to new addr of __restore asm function
 pub fn trap_return() -> ! {
     let task = current_task().expect("trap_return requires a running task");
@@ -306,8 +307,6 @@ fn trap_return_for_task(
     let restore_fp = {
         let cx = trap_cx_of_task(&task);
         cx.kernel_tp = crate::cpu::current_ptr();
-        cx.kernel_entry_flush =
-            crate::arch::mm::should_flush_tlb_on_kernel_entry(cx.kernel_satp) as usize;
         cx.user_fp_is_dirty()
     };
     let (trap_cx_user_va, user_satp) =
@@ -331,7 +330,6 @@ fn trap_return_for_task(
             "jr {restore_va}",
             restore_va = in(reg) restore_va,
             in("a0") trap_cx_user_va,
-            in("a1") user_satp,
             in("a2") restore_fp as usize,
             in("a3") flush_tlb as usize,
             options(noreturn)

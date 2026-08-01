@@ -1,23 +1,28 @@
 use riscv::register::sstatus::{self, FS, SPP, Sstatus};
 
 // Keep this repr(C) field order synchronized with trap.S fixed offsets:
-// x[0..31], sstatus at 32*8, sepc at 33*8, kernel metadata at 34..36*8,
-// FP state at 37..69*8, kernel_entry_flush at 70*8, and kernel_tp at 71*8.
+// x[0..31], sstatus at 32*8, sepc at 33*8, kernel metadata at 34..35*8,
+// FP state at 36..68*8, and kernel_tp at 69*8.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TrapContext {
     pub x: [usize; 32],
     pub sstatus: Sstatus,
     pub sepc: usize,
-    pub kernel_satp: usize,
     pub kernel_sp: usize,
     pub trap_handler: usize,
     pub f: [u64; 32],
     pub fcsr: u32,
     pub fpu_state_valid: u32,
-    pub kernel_entry_flush: usize,
     pub kernel_tp: usize,
 }
+
+const _: () = {
+    assert!(core::mem::offset_of!(TrapContext, f) == 36 * 8);
+    assert!(core::mem::offset_of!(TrapContext, fcsr) == 68 * 8);
+    assert!(core::mem::offset_of!(TrapContext, kernel_tp) == 69 * 8);
+    assert!(core::mem::size_of::<TrapContext>() == 70 * 8);
+};
 
 // RISC-V psABI register indexes used by set_*: x2=sp, x4=tp, x10=a0.
 impl TrapContext {
@@ -65,7 +70,6 @@ impl TrapContext {
     pub fn app_init_context(
         entry: usize,
         sp: usize,
-        kernel_satp: usize,
         kernel_sp: usize,
         trap_handler: usize,
     ) -> Self {
@@ -73,13 +77,11 @@ impl TrapContext {
             x: [0; 32],
             sstatus: Self::app_init_sstatus(),
             sepc: entry,
-            kernel_satp,
             kernel_sp,
             trap_handler,
             f: [0; 32],
             fcsr: 0,
             fpu_state_valid: 0,
-            kernel_entry_flush: 1,
             kernel_tp: 0,
         };
         cx.set_sp(sp);

@@ -2,6 +2,9 @@
 // mmap placement, trampoline/trap-context spacing, and address-space tests.
 pub const USER_STACK_SIZE: usize = 4096 * 1024;
 pub const USER_HEAP_SIZE: usize = 0x20_0000;
+#[cfg(target_arch = "riscv64")]
+pub const USER_MMAP_BASE: usize = 0x8_0000_0000;
+#[cfg(not(target_arch = "riscv64"))]
 pub const USER_MMAP_BASE: usize = 0x6000_0000;
 pub const USER_MMAP_LIMIT: usize = 0x20_0000_0000;
 pub const DL_INTERP_OFFSET: usize = 0x30_0000_0000;
@@ -20,6 +23,13 @@ pub const PAGE_SIZE_BITS: usize = 0xc;
 
 pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
 pub const TRAP_CONTEXT_BASE: usize = TRAMPOLINE - PAGE_SIZE;
+// Keep shared kernel stacks out of the per-process trampoline/trap-context
+// root entry. Sv39 root entry 510 covers [0xffff_ffff_8000_0000,
+// 0xffff_ffff_c000_0000), while the process-private trampoline lives in 511.
+#[cfg(target_arch = "riscv64")]
+pub const KERNEL_STACK_TOP: usize = 0xffff_ffff_c000_0000;
+#[cfg(not(target_arch = "riscv64"))]
+pub const KERNEL_STACK_TOP: usize = TRAMPOLINE;
 
 pub fn clock_freq() -> usize {
     crate::board::clock_freq()

@@ -12,7 +12,9 @@ use super::{
     pid_alloc,
 };
 use crate::fs::{OpenFlags, Stdin, Stdout, track_regular_file_executable};
-use crate::mm::{ElfLoadInfo, KERNEL_SPACE, MemorySet};
+#[cfg(target_arch = "loongarch64")]
+use crate::mm::KERNEL_SPACE;
+use crate::mm::{ElfLoadInfo, MemorySet};
 use crate::sync::UPIntrFreeCell;
 use crate::trap::{TrapContext, trap_handler};
 use alloc::string::String;
@@ -220,6 +222,14 @@ impl ProcessControlBlock {
             )
             .expect("init process stack arguments must fit")
         };
+        #[cfg(target_arch = "riscv64")]
+        let app_trap_cx = TrapContext::app_init_context(
+            entry_point,
+            stack_top,
+            kstack_top,
+            trap_handler as usize,
+        );
+        #[cfg(target_arch = "loongarch64")]
         let app_trap_cx = TrapContext::app_init_context(
             entry_point,
             stack_top,

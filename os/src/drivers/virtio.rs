@@ -17,6 +17,8 @@ use virtio_drivers::{
 pub type VirtioTransport = SomeTransport<'static>;
 
 pub fn mmio_transport(base_addr: usize, size: usize) -> VirtioTransport {
+    #[cfg(target_arch = "riscv64")]
+    let base_addr = crate::arch::mm::mmio_phys_to_virt(base_addr);
     let header = NonNull::new(base_addr as *mut VirtIOHeader).unwrap();
     unsafe { MmioTransport::new(header, size).expect("failed to create virtio MMIO transport") }
         .into()

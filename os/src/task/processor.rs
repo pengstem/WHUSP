@@ -62,6 +62,8 @@ impl Processor {
         self.current_process = Some(process);
         self.current_user_token = user_token;
         self.current_address_space = Some(address_space);
+        #[cfg(target_arch = "riscv64")]
+        crate::mm::activate_process_page_table(user_token);
     }
     pub fn current(&self) -> Option<Arc<TaskControlBlock>> {
         self.current.as_ref().map(Arc::clone)
@@ -97,6 +99,8 @@ impl Processor {
             drop(previous);
         }
         self.current_user_token = token;
+        #[cfg(target_arch = "riscv64")]
+        crate::mm::activate_process_page_table(token);
         Some(token)
     }
 
@@ -221,6 +225,10 @@ fn prepare_current_switch_inner(
 }
 
 fn finish_current_switch() {
+    // A process root may be destroyed after its ActiveAddressSpace guard is
+    // dropped below. Stop using that root before releasing any ownership.
+    #[cfg(target_arch = "riscv64")]
+    crate::mm::activate_scheduler_page_table();
     let cpu = crate::cpu::current_id();
     let (task, process, address_space, reason) = {
         let mut processor = processor();

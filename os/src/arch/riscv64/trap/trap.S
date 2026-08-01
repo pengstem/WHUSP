@@ -7,16 +7,15 @@
     ld x\n, \n*8(sp)
 .endm
 .macro SAVE_FP n
-    fsd f\n, (37+\n)*8(sp)
+    fsd f\n, (36+\n)*8(sp)
 .endm
 .macro LOAD_FP n
-    fld f\n, (37+\n)*8(sp)
+    fld f\n, (36+\n)*8(sp)
 .endm
 .equ SSTATUS_FS_DIRTY, 0x6000
 .equ SSTATUS_FS_MASK, 0x6000
-.equ FCSR_OFFSET, 69
-.equ KERNEL_ENTRY_FLUSH_OFFSET, 70
-.equ KERNEL_TP_OFFSET, 71
+.equ FCSR_OFFSET, 68
+.equ KERNEL_TP_OFFSET, 69
     .section .text.trampoline
     .globl __alltraps
     .globl __restore
@@ -63,28 +62,17 @@ __alltraps:
     li t2, SSTATUS_FS_MASK
     csrc sstatus, t2
 1:
-    # load kernel_satp into t0
-    ld t0, 34*8(sp)
     # load trap_handler into t1
-    ld t1, 36*8(sp)
-    # load return-prepared kernel TLB flush decision into t2
-    ld t2, KERNEL_ENTRY_FLUSH_OFFSET*8(sp)
+    ld t1, 35*8(sp)
     # Restore the CPU-local kernel tp after preserving the user's x4 above.
     ld tp, KERNEL_TP_OFFSET*8(sp)
     # move to kernel_sp
-    ld sp, 35*8(sp)
-    # switch to kernel space (satp: Supervisor Address Translation and Protection)
-    csrw satp, t0
-    beqz t2, .Lalltraps_skip_sfence
-    sfence.vma
-.Lalltraps_skip_sfence:
+    ld sp, 34*8(sp)
     # jump to trap_handler
     jr t1
 
 __restore:
-    # a0: *TrapContext in user space(Constant); a1: user space token; a2: restore FP; a3: flush TLB
-    # switch to user space
-    csrw satp, a1
+    # a0: *TrapContext in user space; a2: restore FP; a3: flush TLB
     beqz a3, .Lrestore_skip_sfence
     sfence.vma
 .Lrestore_skip_sfence:

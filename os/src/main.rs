@@ -148,6 +148,12 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
         block_io_nonblocking,
         perf_counters,
     );
+    info!(
+        "KERN: timer interrupts per second={}",
+        timer::TIMER_INTERRUPTS_PER_SEC,
+    );
+    #[cfg(target_arch = "riscv64")]
+    info!("KERN: RISC-V address-space mode=shared-kernel single-SATP");
     task::run_tasks()
 }
 

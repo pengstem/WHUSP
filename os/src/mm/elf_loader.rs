@@ -347,7 +347,7 @@ impl MemorySet {
         elf: &xmas_elf::ElfFile<'_>,
         interpreter: Option<&xmas_elf::ElfFile<'_>>,
     ) -> ElfLoadInfo {
-        let mut memory_set = Self::new_bare();
+        let mut memory_set = Self::new_user_bare();
         memory_set.map_trampoline();
         let elf_header = elf.header;
         let magic = elf_header.pt1.magic;
@@ -406,7 +406,7 @@ impl MemorySet {
         backing_file_size: usize,
         interpreter: Option<(&xmas_elf::ElfFile<'_>, Arc<dyn File + Send + Sync>, usize)>,
     ) -> Option<ElfLoadInfo> {
-        let mut memory_set = Self::new_bare();
+        let mut memory_set = Self::try_new_user_bare()?;
         memory_set.map_trampoline();
         let elf_header = elf.header;
         if elf_header.pt1.magic != [0x7f, 0x45, 0x4c, 0x46] {
