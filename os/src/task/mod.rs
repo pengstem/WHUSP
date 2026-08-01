@@ -89,7 +89,7 @@ pub(crate) use smp_probe::record_yield_syscall as record_smp_probe_yield_syscall
 pub(crate) use smp_probe::start_cpu_probe as start_smp_cpu_probe;
 pub(crate) use smp_probe::start_wait_io_probe as start_smp_wait_io_probe;
 pub(crate) use task::SCHED_RR_INTERVAL_US;
-pub use task::{DEFAULT_TIMER_SLACK_NS, SeccompSockFilter, TaskControlBlock, TaskStatus};
+pub use task::{DEFAULT_TIMER_SLACK_NS, TaskControlBlock, TaskStatus};
 
 const CORE_DUMP_STATUS_BIT: i32 = 0x80;
 const CORE_DUMP_MAX_BYTES: usize = 16 * 1024 * 1024;

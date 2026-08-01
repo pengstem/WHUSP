@@ -10,16 +10,13 @@ use super::process::*;
 use super::read_mostly_probe::sys_read_mostly_probe;
 #[cfg(feature = "sleep-rwlock-probe")]
 use super::rwlock_probe::sys_fs4_sleep_rwlock_probe;
-use super::seccomp::signal_for_syscall;
 use super::sem::*;
 use super::signal::*;
 use super::time::*;
 use super::uapi::LinuxTimeSpec;
 use super::wait::*;
 use crate::perf;
-use crate::task::{
-    ProcessControlBlock, RLimit, SignalInfo, TaskControlBlock, queue_signal_to_task,
-};
+use crate::task::{ProcessControlBlock, RLimit, TaskControlBlock};
 use crate::uapi::errno::{Errno, KResult};
 use crate::uapi::linux::fs::LinuxIovec;
 use crate::uapi::syscall_nr::*;
@@ -79,24 +76,16 @@ pub(crate) fn syscall_exit_with_current_task(
     current: Arc<TaskControlBlock>,
     syscall_id: usize,
     args: [usize; 6],
-) -> isize {
+) -> ! {
     assert!(
         syscall_is_exit(syscall_id) || syscall_is_exit_group(syscall_id),
         "exit syscall dispatcher received a returning syscall"
     );
     perf::record_syscall_dispatch_call();
+    drop(current);
     if syscall_id == SYSCALL_EXIT {
-        drop(current);
         sys_exit(args[0] as i32);
     }
-    if let Some(signal) = signal_for_syscall(&current, syscall_id) {
-        // UNFINISHED: Filter mode supports only a small classic-BPF subset.
-        // Unsupported or denied filter paths fail closed with SIGSYS.
-        let signum = signal.bits().trailing_zeros() as i32;
-        queue_signal_to_task(Arc::clone(&current), signal, SignalInfo::user(signum, 0));
-        return 0;
-    }
-    drop(current);
     sys_exit_group(args[0] as i32);
 }
 
@@ -116,17 +105,6 @@ pub(crate) fn syscall_with_current_task(
         "returning syscall dispatcher received an exit syscall"
     );
     perf::record_syscall_dispatch_call();
-    if let Some(signal) = signal_for_syscall(&current, syscall_id) {
-        // UNFINISHED: Filter mode supports only a small classic-BPF subset.
-        // Unsupported or denied filter paths fail closed with SIGSYS.
-        let signum = signal.bits().trailing_zeros() as i32;
-        queue_signal_to_task(Arc::clone(&current), signal, SignalInfo::user(signum, 0));
-        return SyscallOutcome {
-            result: 0,
-            task: current,
-            process,
-        };
-    }
     let _profile_scope = perf::time_scope(perf::ProfilePoint::SyscallDispatch);
     let _syscall_profile_scope = perf::time_syscall(syscall_id);
     if let Some(result) = syscall_identity_fast_path(&current, &process, syscall_id) {
@@ -258,7 +236,6 @@ pub(crate) fn syscall_with_context(
             args[3] as *const u8,
             args[4] as u32,
         ),
-        SYSCALL_SECCOMP => sys_seccomp_ctx(ctx, args[0], args[1], args[2]),
         SYSCALL_GETRANDOM => sys_getrandom_ctx(ctx, args[0] as *mut u8, args[1], args[2] as u32),
         SYSCALL_MEMFD_CREATE => sys_memfd_create(args[0] as *const u8, args[1] as u32),
         SYSCALL_MEMBARRIER => sys_membarrier(args[0] as i32, args[1] as u32, args[2] as i32),

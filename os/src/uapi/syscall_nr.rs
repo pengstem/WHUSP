@@ -233,7 +233,6 @@ pub(crate) const SYSCALL_FINIT_MODULE: usize = 273;
 pub(crate) const SYSCALL_SCHED_SETATTR: usize = 274;
 pub(crate) const SYSCALL_SCHED_GETATTR: usize = 275;
 pub(crate) const SYSCALL_RENAMEAT2: usize = 276;
-pub(crate) const SYSCALL_SECCOMP: usize = 277;
 pub(crate) const SYSCALL_GETRANDOM: usize = 278;
 pub(crate) const SYSCALL_MEMFD_CREATE: usize = 279;
 pub(crate) const SYSCALL_EXECVEAT: usize = 281;

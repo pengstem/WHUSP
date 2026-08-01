@@ -319,8 +319,6 @@ impl ProcessControlBlock {
         let parent_nice = parent_task_inner.nice;
         let parent_sched_vruntime = parent_task_inner.sched_vruntime;
         let parent_timer_slack_ns = parent_task_inner.timer_slack_ns;
-        let parent_seccomp_mode = parent_task_inner.security.seccomp_mode;
-        let parent_seccomp_filter = parent_task_inner.security.seccomp_filter.clone();
         // Snapshot task-local inheritance before releasing the parent lock; the
         // child task is built after this point and must not re-enter the parent
         // TCB just to recover fork-time scheduling or signal state.
@@ -416,8 +414,6 @@ impl ProcessControlBlock {
         task_inner.sigaltstack = parent_sigaltstack;
         task_inner.timer_slack_ns = parent_timer_slack_ns;
         task_inner.default_timer_slack_ns = parent_timer_slack_ns;
-        task_inner.security.seccomp_mode = parent_seccomp_mode;
-        task_inner.security.seccomp_filter = parent_seccomp_filter;
         if parent_sched_reset_on_fork {
             task_inner.sched_policy = 0;
             task_inner.sched_priority = 0;

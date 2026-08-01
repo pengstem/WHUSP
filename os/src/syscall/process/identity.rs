@@ -1,8 +1,7 @@
 use crate::syscall::SyscallContext;
 use crate::syscall::user_ptr::{copy_to_user_ctx, read_user_value_ctx, write_user_value_ctx};
 use crate::task::{
-    CAP_SETPCAP, CAP_SYS_ADMIN, ProcessControlBlock, SeccompSockFilter, SignalFlags,
-    TaskControlBlock, current_process, pid2process,
+    CAP_SETPCAP, ProcessControlBlock, SignalFlags, TaskControlBlock, current_process, pid2process,
 };
 use crate::uapi::errno::{Errno, KResult};
 use alloc::string::String;
@@ -22,8 +21,6 @@ const PR_SET_DUMPABLE: usize = 4;
 const PR_SET_TIMING: usize = 14;
 const PR_SET_NAME: usize = 15;
 const PR_GET_NAME: usize = 16;
-const PR_GET_SECCOMP: usize = 21;
-const PR_SET_SECCOMP: usize = 22;
 const PR_CAPBSET_READ: usize = 23;
 const PR_CAPBSET_DROP: usize = 24;
 const PR_GET_SECUREBITS: usize = 27;
@@ -44,15 +41,6 @@ const PR_CAP_AMBIENT_LOWER: usize = 3;
 const PR_CAP_AMBIENT_CLEAR_ALL: usize = 4;
 const PR_SPEC_STORE_BYPASS: usize = 0;
 const PR_NAME_LEN: usize = 16;
-const SECCOMP_MODE_DISABLED: usize = 0;
-const SECCOMP_MODE_STRICT: usize = 1;
-const SECCOMP_MODE_FILTER: usize = 2;
-const SECCOMP_SET_MODE_STRICT: usize = 0;
-const SECCOMP_SET_MODE_FILTER: usize = 1;
-const SECCOMP_FILTER_MAX_INSNS: usize = 4096;
-const BPF_LD_W_ABS: u16 = 0x20;
-const BPF_JMP_JEQ_K: u16 = 0x15;
-const BPF_RET_K: u16 = 0x06;
 const SECBIT_NO_CAP_AMBIENT_RAISE: u32 = 1 << 6;
 
 #[repr(C)]
@@ -68,22 +56,6 @@ pub struct LinuxCapUserData {
     effective: u32,
     permitted: u32,
     inheritable: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct LinuxSockFprog {
-    len: u16,
-    filter: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct LinuxSockFilter {
-    code: u16,
-    jt: u8,
-    jf: u8,
-    k: u32,
 }
 
 pub fn sys_getuid() -> isize {
@@ -285,100 +257,6 @@ fn securebits_block_ambient_raise(securebits: u32) -> bool {
     securebits & SECBIT_NO_CAP_AMBIENT_RAISE != 0 || securebits == 6
 }
 
-fn read_seccomp_filter_ctx(ctx: &SyscallContext, ptr: usize) -> KResult<Vec<SeccompSockFilter>> {
-    let fprog = read_user_value_ctx::<LinuxSockFprog>(ctx, ptr as *const LinuxSockFprog)?;
-    let len = fprog.len as usize;
-    if len == 0 || len > SECCOMP_FILTER_MAX_INSNS || fprog.filter == 0 {
-        return Err(Errno::EINVAL);
-    }
-
-    let mut filters = Vec::new();
-    for index in 0..len {
-        let filter = read_user_value_ctx::<LinuxSockFilter>(
-            ctx,
-            (fprog.filter as *const LinuxSockFilter).wrapping_add(index),
-        )?;
-        // The syscall dispatcher evaluates only validated classic-BPF records
-        // copied here. Keep offset 0 tied to seccomp_data.nr; other offsets
-        // would require modeling the full seccomp_data ABI.
-        if !matches!(filter.code, BPF_LD_W_ABS | BPF_JMP_JEQ_K | BPF_RET_K) {
-            return Err(Errno::EINVAL);
-        }
-        if filter.code == BPF_LD_W_ABS && filter.k != 0 {
-            return Err(Errno::EINVAL);
-        }
-        filters.push(SeccompSockFilter {
-            code: filter.code,
-            jt: filter.jt,
-            jf: filter.jf,
-            k: filter.k,
-        });
-    }
-    if filters.iter().any(|filter| filter.code == BPF_RET_K) {
-        Ok(filters)
-    } else {
-        Err(Errno::EINVAL)
-    }
-}
-
-fn set_seccomp_strict_ctx(ctx: &SyscallContext) -> KResult {
-    // UNFINISHED: This implements Linux strict seccomp, but does not model
-    // ptrace/audit interactions.
-    let mut inner = ctx.task().inner_exclusive_access();
-    inner.security.seccomp_mode = SECCOMP_MODE_STRICT as u8;
-    inner.security.seccomp_filter = None;
-    Ok(0)
-}
-
-fn set_seccomp_filter_ctx(ctx: &SyscallContext, filter_ptr: usize) -> KResult {
-    if filter_ptr == 0 {
-        return Err(Errno::EFAULT);
-    }
-    let filter = read_seccomp_filter_ctx(ctx, filter_ptr)?;
-    let has_sys_admin = ctx
-        .process()
-        .credentials()
-        .capabilities
-        .has_effective(CAP_SYS_ADMIN)
-        .ok_or(Errno::EINVAL)?;
-    let no_new_privs = ctx.process().inner_exclusive_access().no_new_privs;
-    if !has_sys_admin && !no_new_privs {
-        return Err(Errno::EACCES);
-    }
-    // UNFINISHED: This supports the classic BPF instruction subset used by
-    // LTP prctl04: LD syscall nr, JEQ, and RET KILL/ALLOW.
-    let mut inner = ctx.task().inner_exclusive_access();
-    inner.security.seccomp_mode = SECCOMP_MODE_FILTER as u8;
-    inner.security.seccomp_filter = Some(filter);
-    Ok(0)
-}
-
-pub fn sys_seccomp_ctx(
-    ctx: &SyscallContext,
-    operation: usize,
-    flags: usize,
-    args: usize,
-) -> KResult {
-    match operation {
-        SECCOMP_SET_MODE_STRICT => {
-            if flags != 0 || args != 0 {
-                return Err(Errno::EINVAL);
-            }
-            set_seccomp_strict_ctx(ctx)
-        }
-        SECCOMP_SET_MODE_FILTER => {
-            if flags != 0 {
-                return Err(Errno::EINVAL);
-            }
-            set_seccomp_filter_ctx(ctx, args)
-        }
-        // UNFINISHED: seccomp notification/query operations and filter flags
-        // such as TSYNC require cross-thread filter-tree state and user
-        // notification fds. Return an explicit error instead of dummy success.
-        _ => Err(Errno::EINVAL),
-    }
-}
-
 pub fn sys_prctl_ctx(
     ctx: &SyscallContext,
     option: usize,
@@ -425,13 +303,6 @@ pub fn sys_prctl_ctx(
             write_prctl_name_ctx(ctx, arg2, &name)?;
             Ok(0)
         }
-        PR_GET_SECCOMP => Ok(ctx.task().inner_exclusive_access().security.seccomp_mode as isize),
-        PR_SET_SECCOMP => match arg2 {
-            SECCOMP_MODE_STRICT => set_seccomp_strict_ctx(ctx),
-            SECCOMP_MODE_FILTER => set_seccomp_filter_ctx(ctx, arg3),
-            SECCOMP_MODE_DISABLED => Err(Errno::EINVAL),
-            _ => Err(Errno::EINVAL),
-        },
         PR_CAPBSET_READ => ctx
             .process()
             .credentials()

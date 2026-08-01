@@ -144,23 +144,14 @@ pub fn trap_handler() -> ! {
             // process from global lookup tables. Release the trap-local Arc
             // before entering them so cleanup and reap paths do not observe a
             // process kept alive only by this handler frame.
-            if syscall_is_exit(syscall_nr) {
+            if syscall_is_exit(syscall_nr) || syscall_is_exit_group(syscall_nr) {
                 drop(process);
-                let _ = syscall_exit_with_current_task(task, syscall_nr, syscall_args);
-                unreachable!("exit syscall returned");
+                syscall_exit_with_current_task(task, syscall_nr, syscall_args);
             }
-            let result = if syscall_is_exit_group(syscall_nr) {
-                drop(process);
-                let result = syscall_exit_with_current_task(task, syscall_nr, syscall_args);
-                task = current_task().expect("seccomp-blocked exit_group requires a running task");
-                process = process_of_task(&task);
-                result
-            } else {
-                let outcome = syscall_with_current_task(task, process, syscall_nr, syscall_args);
-                task = outcome.task;
-                process = outcome.process;
-                outcome.result
-            };
+            let outcome = syscall_with_current_task(task, process, syscall_nr, syscall_args);
+            task = outcome.task;
+            process = outcome.process;
+            let result = outcome.result;
             let cx = trap_cx_of_task(&task);
             interrupted_pc = cx.era;
             cx.x[4] = result as usize;

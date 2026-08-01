@@ -11,7 +11,6 @@ mod process;
 mod read_mostly_probe;
 #[cfg(feature = "sleep-rwlock-probe")]
 mod rwlock_probe;
-mod seccomp;
 pub(crate) mod sem;
 mod signal;
 pub(crate) mod time;

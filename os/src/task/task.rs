@@ -36,14 +36,6 @@ struct TaskCpuTimes {
     last_kernel_enter_us: Option<usize>,
 }
 
-#[derive(Clone, Copy)]
-pub struct SeccompSockFilter {
-    pub code: u16,
-    pub jt: u8,
-    pub jf: u8,
-    pub k: u32,
-}
-
 pub struct TaskControlBlock {
     // immutable
     pub process: Weak<ProcessControlBlock>,
@@ -148,7 +140,6 @@ pub struct TaskControlBlockInner {
     cpu_times: TaskCpuTimes,
     pub timer_slack_ns: usize,
     pub default_timer_slack_ns: usize,
-    pub security: TaskSecurityState,
     // Same-PCB helper used for CLONE_VM process compatibility paths; it should
     // exit like a child helper, not terminate the whole parent thread group.
     pub clone_vm_process_helper: bool,
@@ -156,11 +147,6 @@ pub struct TaskControlBlockInner {
     // The helper shares the parent PCB, so namespace-visible state that must
     // differ for LTP probes belongs on the task, not the process.
     pub synthetic_newnet: bool,
-}
-
-pub struct TaskSecurityState {
-    pub seccomp_mode: u8,
-    pub seccomp_filter: Option<Vec<SeccompSockFilter>>,
 }
 
 impl TaskControlBlock {
@@ -249,10 +235,6 @@ impl TaskControlBlock {
                     cpu_times: TaskCpuTimes::default(),
                     timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
                     default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
-                    security: TaskSecurityState {
-                        seccomp_mode: 0,
-                        seccomp_filter: None,
-                    },
                     clone_vm_process_helper: false,
                     synthetic_newnet: false,
                 })
