@@ -1422,62 +1422,6 @@ impl MemorySet {
         Some((start, flushes, retired_files))
     }
 
-    pub fn mmap_shared_frames_area(
-        &mut self,
-        len: usize,
-        permission: MapPermission,
-        reported_permission: MapPermission,
-        backing_file: Arc<dyn File + Send + Sync>,
-        pages: &[crate::mm::shm::ShmPageMapping],
-    ) -> Option<usize> {
-        let map_len = checked_page_align_up(len)?;
-        let start = self.alloc_mmap_range(map_len)?;
-        let end = start.checked_add(map_len)?;
-        let start_vpn = VirtAddr::from(start).floor();
-        let mut area = MapArea::new(start.into(), end.into(), MapType::Framed, permission);
-        area.mmap_info = Some(MmapInfo {
-            shared: true,
-            writable: permission.contains(MapPermission::W),
-            grow_down: false,
-            reported_perm: reported_permission,
-            len,
-            file_offset: 0,
-            file_size: len,
-            backing_file: Some(backing_file),
-            page_cache_id: None,
-            page_cache_pages: BTreeMap::new(),
-            exec_segment: None,
-        });
-        apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
-        let candidates: Vec<_> = pages
-            .iter()
-            .filter(|mapping| mapping.page_index < map_len / PAGE_SIZE)
-            .map(|mapping| (VirtPageNum(start_vpn.0 + mapping.page_index), mapping.ppn))
-            .collect();
-        for (vpn, _) in &candidates {
-            if !self.page_table.prepare_empty_leaf_path(*vpn) {
-                return None;
-            }
-        }
-        let mut retained = Vec::new();
-        for (vpn, ppn) in candidates {
-            retained.push((vpn, FrameTracker::from_retained(ppn)?));
-        }
-        let mapped_any = !retained.is_empty();
-        for (vpn, frame) in retained {
-            assert!(
-                area.map_existing_frame(&mut self.page_table, vpn, frame),
-                "preflighted shared frame leaf changed before publication: vpn={vpn:?}"
-            );
-        }
-        self.insert_area_sorted(area);
-        self.mmap_next = next_mmap_hint(end);
-        if mapped_any {
-            self.invalidate_tlb_vpn_range(start_vpn, VirtAddr::from(end).floor());
-        }
-        Some(start)
-    }
-
     #[expect(
         clippy::too_many_arguments,
         reason = "ELF segment mapping keeps loader-provided segment metadata explicit"

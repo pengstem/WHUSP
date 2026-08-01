@@ -2207,9 +2207,6 @@ pub fn sys_readahead(fd: usize, _offset: usize, _count: usize) -> KResult {
     if entry.status_flags().contains(OpenFlags::PATH) || !file.readable() {
         return Err(Errno::EBADF);
     }
-    if file.is_io_uring() {
-        return Err(Errno::EINVAL);
-    }
     match file.mode_type()? {
         S_IFREG => {
             crate::fs::procfs_note_readahead();

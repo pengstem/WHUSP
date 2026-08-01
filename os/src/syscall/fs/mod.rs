@@ -11,7 +11,6 @@ mod mount;
 mod path;
 pub(crate) mod permissions;
 mod poll;
-mod quota;
 mod stat;
 mod swap;
 mod tty;
@@ -32,11 +31,9 @@ pub use fd::{
     sys_close_ctx, sys_close_range, sys_dup, sys_dup3, sys_fcntl_ctx, sys_flock, sys_memfd_create,
     sys_pipe2_ctx,
 };
-pub(crate) use fd_compat::io_uring_mmap_region;
 pub use fd_compat::{
-    sys_bpf, sys_io_uring_enter, sys_io_uring_register, sys_io_uring_setup, sys_memfd_secret,
-    sys_perf_event_open, sys_signalfd4, sys_timerfd_create, sys_timerfd_gettime,
-    sys_timerfd_settime, sys_userfaultfd,
+    sys_bpf, sys_memfd_secret, sys_perf_event_open, sys_signalfd4, sys_timerfd_create,
+    sys_timerfd_gettime, sys_timerfd_settime, sys_userfaultfd,
 };
 pub(crate) use fd_lock::release_record_locks_for_process;
 pub use file_handle::{sys_name_to_handle_at, sys_open_by_handle_at};
@@ -62,7 +59,6 @@ pub use path::{
     sys_utimensat,
 };
 pub use poll::{sys_ppoll, sys_pselect6};
-pub use quota::{sys_quotactl, sys_quotactl_fd};
 pub use stat::{
     sys_fchmod, sys_fchmodat, sys_fchmodat2, sys_fchown, sys_fchownat, sys_fgetxattr,
     sys_flistxattr, sys_fremovexattr, sys_fsetxattr, sys_fstat_ctx, sys_fstatfs_ctx, sys_getxattr,

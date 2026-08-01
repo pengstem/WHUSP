@@ -125,7 +125,6 @@ pub(crate) enum ProfilePoint {
     FrameAllocMmapPrivate,
     FrameAllocShm,
     FrameAllocDma,
-    FrameAllocFdCompat,
     FrameAllocMmapPageCache,
     FrameAllocSharedAnon,
     FrameAllocReadCache,
@@ -135,7 +134,7 @@ pub(crate) enum ProfilePoint {
 }
 
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
-const PROFILE_POINT_COUNT: usize = 55;
+const PROFILE_POINT_COUNT: usize = 54;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(not(feature = "perf-counters"), allow(dead_code))]
@@ -1153,7 +1152,6 @@ mod enabled {
         TimeStat::new("frame_alloc_mmap_private"),
         TimeStat::new("frame_alloc_shm"),
         TimeStat::new("frame_alloc_dma"),
-        TimeStat::new("frame_alloc_fd_compat"),
         TimeStat::new("frame_alloc_mmap_page_cache"),
         TimeStat::new("frame_alloc_shared_anon"),
         TimeStat::new("frame_alloc_read_cache"),

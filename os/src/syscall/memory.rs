@@ -9,7 +9,7 @@ use crate::task::{
 };
 use alloc::vec::Vec;
 
-use super::fs::{get_file_by_fd_for_process, io_uring_mmap_region};
+use super::fs::get_file_by_fd_for_process;
 use crate::uapi::errno::{Errno, KResult};
 
 const PROT_READ: usize = 0x1;
@@ -375,27 +375,6 @@ fn sys_mmap_impl(
         }
         if shared && writable && !file.writable() {
             return Err(Errno::EACCES);
-        }
-        if let Some((pages, max_size)) = io_uring_mmap_region(&file, offset) {
-            // CONTEXT: io_uring ring offsets map preallocated kernel-owned
-            // frames. They use shared-frame VMA plumbing only to expose the
-            // Linux mmap ABI for SQ/CQ rings and SQEs.
-            if !shared || fixed || len == 0 || len > max_size {
-                return Err(Errno::EINVAL);
-            }
-            let process = ctx.process();
-            let mut inner = process.inner_exclusive_access();
-            let mapped_addr = inner
-                .memory_set
-                .mmap_shared_frames_area(
-                    len,
-                    hardware_permission,
-                    reported_permission,
-                    file,
-                    &pages,
-                )
-                .ok_or(Errno::ENOMEM)?;
-            return Ok(mapped_addr);
         }
         if shared && writable && file.blocks_shared_writable_mmap() {
             return Err(Errno::EPERM);

@@ -327,12 +327,6 @@ pub(crate) fn syscall_with_context(
             args[1] as u32 as usize,
             args[2] as u32,
         ),
-        SYSCALL_QUOTACTL => sys_quotactl(
-            args[0] as i32,
-            args[1] as *const u8,
-            args[2] as u32,
-            args[3],
-        ),
         SYSCALL_GETDENTS64 => sys_getdents64_ctx(ctx, args[0], args[1] as *mut u8, args[2]),
         SYSCALL_LSEEK => sys_lseek_ctx(ctx, args[0], args[1] as i64, args[2]),
         SYSCALL_READV => sys_readv_ctx(ctx, args[0], args[1] as *const LinuxIovec, args[2]),
@@ -498,18 +492,6 @@ pub(crate) fn syscall_with_context(
         ),
         SYSCALL_FSMOUNT => sys_fsmount(args[0] as isize, args[1] as u32, args[2] as u32),
         SYSCALL_FSPICK => sys_fspick(args[0] as isize, args[1] as *const u8, args[2] as u32),
-        SYSCALL_IO_URING_SETUP => sys_io_uring_setup(args[0] as u32, args[1] as *mut u8),
-        SYSCALL_IO_URING_ENTER => sys_io_uring_enter(
-            args[0],
-            args[1] as u32,
-            args[2] as u32,
-            args[3] as u32,
-            args[4],
-        ),
-        SYSCALL_IO_URING_REGISTER => {
-            sys_io_uring_register(args[0], args[1] as u32, args[2], args[3] as u32)
-        }
-        SYSCALL_QUOTACTL_FD => sys_quotactl_fd(args[0], args[1] as i32, args[2] as u32, args[3]),
         SYSCALL_WAITID => sys_waitid(
             args[0] as i32,
             args[1] as i32,
