@@ -2760,10 +2760,6 @@ impl MetadataOps for ConcurrentExt4Backend {
         self.mutate_inode_metadata(ino, Ext4InodeMetadataMutation::Flags(flags))
     }
 
-    fn assign_cgroup_pid(&self, _dir_ino: u32, _pid: usize) -> FsResult {
-        Err(FsError::InvalidInput)
-    }
-
     fn stat(&self, ino: u32) -> FsResult<FileStat> {
         self.with_reader(BackendOp::StatFull, ino, |reader| reader.stat_shared(ino))
     }

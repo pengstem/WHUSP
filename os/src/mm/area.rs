@@ -8,8 +8,6 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-const MEMCG_RECLAIM_ANON_SHARED_MIN_LEN: usize = 128 * 1024 * 1024;
-
 pub struct MapArea {
     pub(super) vpn_range: VPNRange,
     pub(super) data_frames: BTreeMap<VirtPageNum, FrameTracker>,
@@ -718,65 +716,6 @@ impl MapArea {
         {
             self.lazy_free_pages.insert(vpn);
         }
-    }
-
-    pub(super) fn discard_lazy_free_pages(
-        &mut self,
-        page_table: &mut PageTable,
-        retired: &mut RetiredUserPages,
-    ) -> bool {
-        let mut discarded = false;
-        let candidates: Vec<_> = self.lazy_free_pages.iter().copied().collect();
-        for vpn in candidates {
-            if !self.vpn_range.into_iter().any(|area_vpn| area_vpn == vpn) {
-                self.lazy_free_pages.remove(&vpn);
-                continue;
-            }
-            let keep_dirty_page = page_table
-                .translate(vpn)
-                .map(|pte| pte.ppn().get_bytes_array()[0] == b'b')
-                .unwrap_or(false);
-            if keep_dirty_page {
-                continue;
-            }
-            self.lazy_free_pages.remove(&vpn);
-            if self.retire_framed_page(page_table, vpn, retired) {
-                discarded = true;
-            }
-        }
-        discarded
-    }
-
-    pub(super) fn discard_memcg_pressure_pages(
-        &mut self,
-        page_table: &mut PageTable,
-        retired: &mut RetiredUserPages,
-    ) -> bool {
-        if self.locked || self.lock_on_fault {
-            return false;
-        }
-        let Some(info) = &self.mmap_info else {
-            return false;
-        };
-        if !info.shared
-            || info.backing_file.is_some()
-            || info.page_cache_id.is_some()
-            || info.len < MEMCG_RECLAIM_ANON_SHARED_MIN_LEN
-        {
-            return false;
-        }
-
-        let vpns: Vec<_> = self.data_frames.keys().copied().collect();
-        if vpns.is_empty() {
-            return false;
-        }
-        // UNFINISHED: This memcg compatibility path drops anonymous MAP_SHARED
-        // contents instead of preserving them in swap. It is intentionally
-        // limited to large pressure mappings used by LTP madvise reclaim tests.
-        for vpn in vpns {
-            self.retire_framed_page(page_table, vpn, retired);
-        }
-        true
     }
 
     pub(super) fn is_private_anonymous_mmap(&self) -> bool {

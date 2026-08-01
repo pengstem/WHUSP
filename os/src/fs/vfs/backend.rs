@@ -290,9 +290,6 @@ pub(crate) trait LegacyMetadataOps: Send {
     fn set_inode_flags(&mut self, _ino: u32, _flags: u32) -> FsResult {
         Err(FsError::Unsupported)
     }
-    fn assign_cgroup_pid(&mut self, _dir_ino: u32, _pid: usize) -> FsResult {
-        Err(FsError::InvalidInput)
-    }
     fn stat(&mut self, ino: u32) -> FsResult<FileStat>;
     fn stat_basic(&mut self, ino: u32) -> FsResult<FileStat> {
         self.stat(ino)
@@ -459,7 +456,6 @@ pub(crate) trait MetadataOps: Send + Sync {
     fn set_owner(&self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult;
     fn inode_flags(&self, ino: u32) -> FsResult<u32>;
     fn set_inode_flags(&self, ino: u32, flags: u32) -> FsResult;
-    fn assign_cgroup_pid(&self, dir_ino: u32, pid: usize) -> FsResult;
     fn stat(&self, ino: u32) -> FsResult<FileStat>;
     fn stat_basic(&self, ino: u32) -> FsResult<FileStat>;
 }
@@ -689,12 +685,6 @@ impl MetadataOps for SerializedBackend {
     fn set_inode_flags(&self, ino: u32, flags: u32) -> FsResult {
         self.call(BackendOp::NamespaceMutation, |backend| {
             backend.set_inode_flags(ino, flags)
-        })
-    }
-
-    fn assign_cgroup_pid(&self, dir_ino: u32, pid: usize) -> FsResult {
-        self.call(BackendOp::NamespaceMutation, |backend| {
-            backend.assign_cgroup_pid(dir_ino, pid)
         })
     }
 

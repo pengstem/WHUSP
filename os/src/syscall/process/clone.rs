@@ -1,4 +1,4 @@
-use crate::fs::{VfsNodeId, assign_pid_to_cgroup, clone_mount_namespace};
+use crate::fs::clone_mount_namespace;
 use crate::syscall::user_ptr::{read_user_value, write_user_value, write_user_value_in_memory_set};
 use crate::task::{
     CloneArgs, CloneFlags, ProcessControlBlock, TaskControlBlock, add_task,
@@ -103,29 +103,16 @@ pub fn sys_clone3(args: *const LinuxCloneArgs, size: usize) -> KResult {
         args.child_tid as usize,
     )
     .ok_or(Errno::EINVAL)?;
-    let cgroup = clone3_cgroup_target(args)?;
     if clone_args.is_thread() {
-        if cgroup.is_some() {
-            // UNFINISHED: CLONE_INTO_CGROUP is currently supported only for
-            // process clone3(), because this kernel records cgroup membership
-            // at process-id granularity.
-            return Err(Errno::EINVAL);
-        }
         if args.flags & CLONE_PIDFD != 0 {
             // UNFINISHED: Thread-directed pidfds are not modeled yet because
             // this kernel's pidfd object records process IDs only.
             return Err(Errno::EINVAL);
         }
         sys_clone_thread(clone_args)
-    } else if is_vm_vfork_process_clone(clone_args)
-        && args.flags & CLONE_PIDFD == 0
-        && cgroup.is_none()
-    {
+    } else if is_vm_vfork_process_clone(clone_args) && args.flags & CLONE_PIDFD == 0 {
         sys_clone_vm_vfork(clone_args)
-    } else if is_vm_newnet_process_clone(clone_args)
-        && args.flags & CLONE_PIDFD == 0
-        && cgroup.is_none()
-    {
+    } else if is_vm_newnet_process_clone(clone_args) && args.flags & CLONE_PIDFD == 0 {
         sys_clone_vm_newnet(clone_args)
     } else {
         let pidfd = if args.flags & CLONE_PIDFD != 0 {
@@ -133,7 +120,7 @@ pub fn sys_clone3(args: *const LinuxCloneArgs, size: usize) -> KResult {
         } else {
             None
         };
-        sys_clone_process_inner(clone_args, pidfd, cgroup)
+        sys_clone_process_inner(clone_args, pidfd)
     }
 }
 
@@ -153,6 +140,12 @@ fn validate_clone3_args(args: LinuxCloneArgs, token: usize) -> KResult<()> {
         // PIDs/TIDs internally and does not support caller-selected IDs.
         return Err(Errno::EINVAL);
     }
+    if args.flags & CLONE_INTO_CGROUP != 0 {
+        return Err(Errno::ENOTSUP);
+    }
+    if args.cgroup != 0 {
+        return Err(Errno::EINVAL);
+    }
     if args.exit_signal >= SIGNAL_INFO_SLOTS {
         return Err(Errno::EINVAL);
     }
@@ -168,26 +161,7 @@ fn validate_clone3_args(args: LinuxCloneArgs, token: usize) -> KResult<()> {
 }
 
 fn sys_clone_process(args: CloneArgs) -> KResult {
-    sys_clone_process_inner(args, None, None)
-}
-
-fn clone3_cgroup_target(args: LinuxCloneArgs) -> KResult<Option<VfsNodeId>> {
-    if args.flags & CLONE_INTO_CGROUP == 0 {
-        return Ok(None);
-    }
-    let fd = args.cgroup as usize;
-    let file = {
-        let process = current_process();
-        let inner = process.inner_exclusive_access();
-        inner
-            .fd_table
-            .get(fd)
-            .and_then(|entry| entry.as_ref())
-            .map(|entry| entry.file())
-            .ok_or(Errno::EBADF)?
-    };
-    let dir = file.working_dir().ok_or(Errno::EINVAL)?;
-    Ok(Some(VfsNodeId::new(dir.mount_id(), dir.ino())))
+    sys_clone_process_inner(args, None)
 }
 
 fn write_user_value_to_process<T: Copy>(
@@ -202,11 +176,7 @@ fn write_user_value_to_process<T: Copy>(
     write_user_value_in_memory_set(&mut inner.memory_set, ptr, value)
 }
 
-fn sys_clone_process_inner(
-    args: CloneArgs,
-    pidfd: Option<*mut i32>,
-    cgroup: Option<VfsNodeId>,
-) -> KResult {
+fn sys_clone_process_inner(args: CloneArgs, pidfd: Option<*mut i32>) -> KResult {
     let calling_task = current_task().ok_or(Errno::ESRCH)?;
     let vfork_parent = if args.flags.contains(CloneFlags::CLONE_VFORK) {
         Some(Arc::clone(&calling_task))
@@ -255,9 +225,6 @@ fn sys_clone_process_inner(
     } else {
         None
     };
-    if let Some(cgroup) = cgroup {
-        assign_pid_to_cgroup(cgroup, new_pid)?;
-    }
     if let (Some(pidfd), Some(fd)) = (pidfd, reserved_pidfd) {
         write_user_value(current_user_token(), pidfd, &(fd as i32))?;
     }

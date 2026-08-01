@@ -2,11 +2,10 @@ use crate::fs::{
     DetachedMountFile, FsContextFile, FsContextStateError, FsNodeKind, MountError, MountId,
     MountPropagation, OpenFlags, WorkingDir, lookup_existing_dir_in, lookup_mount_target_dir_in,
     lookup_path_in, loop_device_is_attached, loop_device_is_read_only, mount_bind_at,
-    mount_block_device_at, mount_cgroup_memory_at, mount_cgroup2_at, mount_ext_scratch_at,
-    mount_fat_device_at, mount_nfs_compat_at, mount_overlay_compat_at, mount_proc_at,
-    mount_stat_flags_from_linux_mount_flags, mount_tmpfs_at, mounted_source_at, move_mount_at,
-    normalize_path_at_root, open_file_in, remount_at, set_mount_propagation_at,
-    set_mount_stat_flags, unmount_at,
+    mount_block_device_at, mount_ext_scratch_at, mount_fat_device_at, mount_nfs_compat_at,
+    mount_overlay_compat_at, mount_proc_at, mount_stat_flags_from_linux_mount_flags,
+    mount_tmpfs_at, mounted_source_at, move_mount_at, normalize_path_at_root, open_file_in,
+    remount_at, set_mount_propagation_at, set_mount_stat_flags, unmount_at,
 };
 use crate::task::{CAP_SYS_ADMIN, current_process, current_user_token};
 use alloc::string::String;
@@ -741,24 +740,6 @@ pub fn sys_mount(
                 .map_err(mount_error_to_errno)?;
             apply_mount_stat_flags(mount_id, flags)?;
         }
-        "cgroup2" => {
-            // CONTEXT: LTP clone3 coverage needs a writable cgroup v2
-            // hierarchy with cgroup.procs. Resource controllers are not
-            // modeled; the cgroup2 backend only tracks process membership.
-            let mount_id =
-                mount_cgroup2_at(namespace_id, target_dir, target_path.as_str(), read_only)
-                    .map_err(mount_error_to_errno)?;
-            apply_mount_stat_flags(mount_id, flags)?;
-        }
-        "cgroup" => {
-            // CONTEXT: Legacy LTP memory-controller tests still probe the
-            // cgroup v1 memory mount. The backend only models membership and
-            // memory-pressure knobs needed by those tests.
-            let mount_id =
-                mount_cgroup_memory_at(namespace_id, target_dir, target_path.as_str(), read_only)
-                    .map_err(mount_error_to_errno)?;
-            apply_mount_stat_flags(mount_id, flags)?;
-        }
         "overlay" => {
             let options = if data.is_null() {
                 String::new()
@@ -802,7 +783,7 @@ pub fn sys_mount(
             )
             .map_err(mount_error_to_errno)?;
         }
-        "error" => return Err(Errno::ENODEV),
+        "error" | "cgroup" | "cgroup2" => return Err(Errno::ENODEV),
         _ => {
             // CONTEXT: Several BusyBox/LTP setup paths mount scratch or pseudo
             // filesystems by name before using only directory semantics. Keep a

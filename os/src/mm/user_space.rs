@@ -230,13 +230,7 @@ impl MmapFaultPage {
                 frame_alloc()
             }
         };
-        match alloc_frame() {
-            Some(frame) => Some(frame),
-            None => {
-                crate::fs::reclaim_memcg_pressure_pages();
-                alloc_frame()
-            }
-        }
+        alloc_frame()
     }
 
     fn read_single_page(&self, frame: &FrameTracker) -> Option<usize> {
@@ -2417,36 +2411,6 @@ impl MemorySet {
         }
         retired.release();
         true
-    }
-
-    pub fn discard_lazy_free_pages(&mut self) -> bool {
-        let mut discarded = false;
-        let mut retired = RetiredUserPages::new();
-        for area in &mut self.areas {
-            if area.discard_lazy_free_pages(&mut self.page_table, &mut retired) {
-                discarded = true;
-            }
-        }
-        if retired.pte_cleared() {
-            self.invalidate_tlb_all();
-        }
-        retired.release();
-        discarded
-    }
-
-    pub fn discard_memcg_pressure_pages(&mut self) -> bool {
-        let mut discarded = false;
-        let mut retired = RetiredUserPages::new();
-        for area in &mut self.areas {
-            if area.discard_memcg_pressure_pages(&mut self.page_table, &mut retired) {
-                discarded = true;
-            }
-        }
-        if retired.pte_cleared() {
-            self.invalidate_tlb_all();
-        }
-        retired.release();
-        discarded
     }
 
     pub fn core_dump_bytes(&self, max_len: usize) -> Vec<u8> {

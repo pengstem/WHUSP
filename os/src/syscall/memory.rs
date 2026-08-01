@@ -338,17 +338,6 @@ fn sys_mmap_impl(
     // targets, but procfs/debug output should report the exact Linux PROT bits
     // requested by userspace.
     let reported_permission = prot_to_reported_map_permission(prot);
-    if crate::fs::memcg_pressure_active()
-        && anonymous
-        && map_type == MAP_PRIVATE
-        && len >= 500 * PAGE_SIZE
-    {
-        // CONTEXT: The current cgroup memory controller is a compatibility
-        // surface, not a reclaiming allocator. Under a configured memcg limit,
-        // fail large private-anonymous pressure mappings after discarding
-        // MADV_FREE pages so madvise09 observes low-memory reclamation.
-        return Err(Errno::ENOMEM);
-    }
     if fixed && addr % PAGE_SIZE != 0 {
         return Err(Errno::EINVAL);
     }
