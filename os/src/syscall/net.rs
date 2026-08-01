@@ -53,8 +53,9 @@ fn socket_kind_from_type(ty: i32) -> KResult<SocketKind> {
     match ty & SOCK_TYPE_MASK {
         SOCK_STREAM => Ok(SocketKind::Stream),
         SOCK_DGRAM => Ok(SocketKind::Datagram),
-        // CONTEXT: The bind LTP subset only uses AF_UNIX SOCK_SEQPACKET for
-        // connection-oriented local IPC. We reuse the stream queue semantics.
+        // CONTEXT: Rust's process launcher uses an AF_UNIX SOCK_SEQPACKET
+        // socketpair to report child exec errors. Reuse the stream queue
+        // semantics for local connection-oriented IPC.
         SOCK_SEQPACKET => Ok(SocketKind::Stream),
         _ => Err(Errno::EPROTONOSUPPORT),
     }
@@ -65,10 +66,6 @@ fn validate_protocol(kind: SocketKind, protocol: i32) -> KResult<()> {
         (_, IPPROTO_IP) => Ok(()),
         (SocketKind::Stream, IPPROTO_TCP) => Ok(()),
         (SocketKind::Datagram, IPPROTO_UDP) => Ok(()),
-        // CONTEXT: LTP bind04/bind05 only require local loopback bind/connect
-        // behavior for SCTP and UDP-Lite, so both reuse the existing queues.
-        (SocketKind::Stream, IPPROTO_SCTP) => Ok(()),
-        (SocketKind::Datagram, IPPROTO_UDPLITE) => Ok(()),
         _ => Err(Errno::EPROTONOSUPPORT),
     }
 }

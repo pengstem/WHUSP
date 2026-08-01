@@ -104,7 +104,6 @@ pub(crate) const SYSCALL_CLOCK_SETTIME: usize = 112;
 pub(crate) const SYSCALL_CLOCK_GETTIME: usize = 113;
 pub(crate) const SYSCALL_CLOCK_GETRES: usize = 114;
 pub(crate) const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
-pub(crate) const SYSCALL_SYSLOG: usize = 116;
 pub(crate) const SYSCALL_PTRACE: usize = 117;
 pub(crate) const SYSCALL_SCHED_SETPARAM: usize = 118;
 pub(crate) const SYSCALL_SCHED_SETSCHEDULER: usize = 119;

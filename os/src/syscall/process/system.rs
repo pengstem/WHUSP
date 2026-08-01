@@ -1,3 +1,5 @@
+use crate::config::PAGE_SIZE;
+use crate::mm::frame_stats;
 use crate::random::CompatibilityRandom;
 use crate::shutdown::shutdown;
 use crate::sync::SpinNoIrqLock;
@@ -5,12 +7,9 @@ use crate::syscall::SyscallContext;
 #[cfg(target_arch = "riscv64")]
 use crate::syscall::user_ptr::read_user_value_ctx;
 use crate::syscall::user_ptr::{
-    UserBufferAccess, copy_to_user, copy_to_user_ctx, translated_byte_buffer_checked_ctx,
-    write_user_value_ctx,
+    UserBufferAccess, copy_to_user_ctx, translated_byte_buffer_checked_ctx, write_user_value_ctx,
 };
-use crate::task::{
-    CAP_SYS_ADMIN, CAP_SYS_TTY_CONFIG, current_process, current_user_token, processes_snapshot,
-};
+use crate::task::{CAP_SYS_ADMIN, CAP_SYS_TTY_CONFIG, current_process, processes_snapshot};
 use crate::timer::get_time_us;
 use crate::uapi::errno::{Errno, KResult};
 use alloc::format;
@@ -35,18 +34,6 @@ const GRND_RANDOM: u32 = 0x0002;
 const GRND_INSECURE: u32 = 0x0004;
 const GRND_SUPPORTED: u32 = GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE;
 const GETRANDOM_CHUNK: usize = 64;
-const SYSLOG_ACTION_CLOSE: usize = 0;
-const SYSLOG_ACTION_OPEN: usize = 1;
-const SYSLOG_ACTION_READ: usize = 2;
-const SYSLOG_ACTION_READ_ALL: usize = 3;
-const SYSLOG_ACTION_READ_CLEAR: usize = 4;
-const SYSLOG_ACTION_CLEAR: usize = 5;
-const SYSLOG_ACTION_CONSOLE_OFF: usize = 6;
-const SYSLOG_ACTION_CONSOLE_ON: usize = 7;
-const SYSLOG_ACTION_CONSOLE_LEVEL: usize = 8;
-const SYSLOG_ACTION_SIZE_UNREAD: usize = 9;
-const SYSLOG_ACTION_SIZE_BUFFER: usize = 10;
-const SYSLOG_BUF_SIZE: usize = 4096;
 const SYSLOG_DEFAULT_MESSAGE_LEVEL: usize = 4;
 const SYSLOG_MIN_CONSOLE_LEVEL: usize = 1;
 const SYSLOG_DEFAULT_CONSOLE_LEVEL: usize = 7;
@@ -63,9 +50,7 @@ const RISCV_HWPROBE_BASE_BEHAVIOR_IMA: u64 = 1 << 0;
 #[cfg(target_arch = "riscv64")]
 const RISCV_HWPROBE_KEY_IMA_EXT_0: i64 = 4;
 
-static SYSLOG_FAKE_MSG: &[u8] = b"<5>[    0.000000] Linux version 5.10.0 (whusp@oscomp)\n";
 static SYSLOG_CONSOLE_LEVEL: AtomicUsize = AtomicUsize::new(SYSLOG_DEFAULT_CONSOLE_LEVEL);
-static SYSLOG_SAVED_CONSOLE_LEVEL: AtomicUsize = AtomicUsize::new(SYSLOG_DEFAULT_CONSOLE_LEVEL);
 
 lazy_static! {
     static ref UTS_STATE: SpinNoIrqLock<UtsState> = SpinNoIrqLock::new(UtsState::new());
@@ -286,14 +271,17 @@ pub fn sys_setdomainname_ctx(ctx: &SyscallContext, name: *const u8, len: usize) 
 }
 
 pub fn sys_sysinfo_ctx(ctx: &SyscallContext, info: *mut LinuxSysInfo) -> KResult {
+    let (total_frames, free_frames) = frame_stats();
     let value = LinuxSysInfo {
         uptime: (get_time_us() / 1_000_000) as isize,
-        totalram: 1024 * 1024 * 1024,
-        freeram: 900 * 1024 * 1024,
-        totalswap: 2 * 1024 * 1024 * 1024,
-        freeswap: 2 * 1024 * 1024 * 1024,
+        totalram: total_frames,
+        freeram: free_frames,
+        // UNFINISHED: The kernel has no swap, shared-memory, buffer, or load
+        // accounting yet; those fields remain zero.
+        totalswap: 0,
+        freeswap: 0,
         procs: processes_snapshot().len().min(u16::MAX as usize) as u16,
-        mem_unit: 1,
+        mem_unit: PAGE_SIZE as u32,
         ..LinuxSysInfo::default()
     };
     write_user_value_ctx(ctx, info, &value)?;
@@ -435,90 +423,4 @@ pub(crate) fn write_proc_sys_kernel_printk(buf: &[u8], offset: u64) -> usize {
     }
     SYSLOG_CONSOLE_LEVEL.store(level, Ordering::Relaxed);
     buf.len()
-}
-
-fn validate_syslog_size(len: usize) -> KResult<usize> {
-    if len > i32::MAX as usize {
-        return Err(Errno::EINVAL);
-    }
-    Ok(len)
-}
-
-fn validate_syslog_read_args(buf: *mut u8, len: usize) -> KResult<usize> {
-    let len = validate_syslog_size(len)?;
-    if buf.is_null() {
-        return Err(Errno::EINVAL);
-    }
-    Ok(len)
-}
-
-fn current_can_use_privileged_syslog() -> bool {
-    // UNFINISHED: Linux checks CAP_SYSLOG or CAP_SYS_ADMIN in the caller's user
-    // namespace. The current credential model uses effective uid 0 as the
-    // visible privileged boundary for LTP set[e]uid transitions.
-    current_process().credentials().euid == 0
-}
-
-fn syslog_action_requires_privilege(log_type: usize) -> bool {
-    !matches!(log_type, SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_SIZE_BUFFER)
-}
-
-fn syslog_copy_fake_log(buf: *mut u8, len: usize) -> KResult {
-    if len == 0 {
-        return Ok(0);
-    }
-    let copy_len = SYSLOG_FAKE_MSG.len().min(len);
-    copy_to_user(current_user_token(), buf, &SYSLOG_FAKE_MSG[..copy_len])?;
-    Ok(copy_len as isize)
-}
-
-pub fn sys_syslog(log_type: usize, buf: *mut u8, len: usize) -> KResult {
-    match log_type {
-        SYSLOG_ACTION_CLOSE
-        | SYSLOG_ACTION_OPEN
-        | SYSLOG_ACTION_CLEAR
-        | SYSLOG_ACTION_CONSOLE_OFF
-        | SYSLOG_ACTION_CONSOLE_ON
-        | SYSLOG_ACTION_SIZE_UNREAD
-        | SYSLOG_ACTION_SIZE_BUFFER => {}
-        SYSLOG_ACTION_READ | SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => {
-            validate_syslog_read_args(buf, len)?;
-        }
-        SYSLOG_ACTION_CONSOLE_LEVEL => {
-            let level = validate_syslog_size(len)?;
-            if !(SYSLOG_MIN_CONSOLE_LEVEL..=SYSLOG_MAX_CONSOLE_LEVEL).contains(&level) {
-                return Err(Errno::EINVAL);
-            }
-        }
-        _ => return Err(Errno::EINVAL),
-    }
-
-    if syslog_action_requires_privilege(log_type) && !current_can_use_privileged_syslog() {
-        return Err(Errno::EPERM);
-    }
-
-    match log_type {
-        SYSLOG_ACTION_CLOSE | SYSLOG_ACTION_OPEN | SYSLOG_ACTION_CLEAR => Ok(0),
-        SYSLOG_ACTION_READ | SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => {
-            syslog_copy_fake_log(buf, validate_syslog_size(len)?)
-        }
-        SYSLOG_ACTION_CONSOLE_OFF => {
-            let previous = SYSLOG_CONSOLE_LEVEL.swap(SYSLOG_MIN_CONSOLE_LEVEL, Ordering::Relaxed);
-            SYSLOG_SAVED_CONSOLE_LEVEL.store(previous, Ordering::Relaxed);
-            Ok(0)
-        }
-        SYSLOG_ACTION_CONSOLE_ON => {
-            let saved = SYSLOG_SAVED_CONSOLE_LEVEL.load(Ordering::Relaxed);
-            SYSLOG_CONSOLE_LEVEL.store(saved, Ordering::Relaxed);
-            Ok(0)
-        }
-        SYSLOG_ACTION_CONSOLE_LEVEL => {
-            let level = validate_syslog_size(len)?;
-            SYSLOG_CONSOLE_LEVEL.store(level, Ordering::Relaxed);
-            Ok(0)
-        }
-        SYSLOG_ACTION_SIZE_UNREAD => Ok(SYSLOG_FAKE_MSG.len() as isize),
-        SYSLOG_ACTION_SIZE_BUFFER => Ok(SYSLOG_BUF_SIZE as isize),
-        _ => Err(Errno::EINVAL),
-    }
 }

@@ -39,6 +39,15 @@ use release::{PendingInodeRelease, PendingReleaseQueue};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct MountId(pub(crate) usize);
 
+/// Returns the stable, boot-local filesystem identifier for a mount source.
+///
+/// Bind mounts retain their source mount id, so they intentionally share the
+/// same fsid with the filesystem they expose.
+pub(crate) fn fsid_for_mount(mount_id: MountId) -> [i32; 2] {
+    let value = (mount_id.0 as u64).wrapping_add(1);
+    [value as i32, (value >> 32) as i32]
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct MountNamespaceId(pub(crate) usize);
 

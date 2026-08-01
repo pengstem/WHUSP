@@ -1,23 +1,21 @@
+use super::super::time::timespec_to_nanos;
+use super::super::uapi::LinuxTimeSpec;
+use super::super::user_ptr::{read_user_value, write_user_value};
+use super::fd::{get_fd_entry_by_fd, install_file_fd};
+use super::poll::{TemporarySignalMask, read_signal_mask};
 use crate::fs::{File, FileStat, OpenFlags, PollEvents, PollWaiter, S_IFDIR, S_IFMT};
 use crate::mm::UserBuffer;
 use crate::perf;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{
-    SignalFlags, block_current_task_no_schedule_unless_unmasked_signal,
-    current_has_interrupting_signal, current_task, current_user_token, linux_sigset_to_flags,
-    schedule,
+    block_current_task_no_schedule_unless_unmasked_signal, current_has_interrupting_signal,
+    current_task, current_user_token, schedule,
 };
 use crate::timer::{add_timer, get_time_us};
+use crate::uapi::errno::{Errno, KResult};
 use alloc::collections::{BTreeMap, btree_map::Entry};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::mem::size_of;
-
-use super::super::time::timespec_to_nanos;
-use super::super::uapi::LinuxTimeSpec;
-use super::super::user_ptr::{read_user_value, write_user_value};
-use super::fd::{get_fd_entry_by_fd, install_file_fd};
-use crate::uapi::errno::{Errno, KResult};
 
 const EPOLL_CTL_ADD: i32 = 1;
 const EPOLL_CTL_DEL: i32 = 2;
@@ -39,7 +37,6 @@ const EPOLL_EVENT_SIZE: usize = 16;
 const EPOLL_EVENT_DATA_OFFSET: usize = 8;
 const EPOLL_MAX_NEST_DEPTH: usize = 5;
 const EPOLL_POLL_BACKOFF_US: usize = 1_000;
-const LINUX_RT_SIGSET_SIZE: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct LinuxEpollEvent {
@@ -76,30 +73,6 @@ impl ProcSleepGuard {
 impl Drop for ProcSleepGuard {
     fn drop(&mut self) {
         self.task.inner_exclusive_access().proc_sleeping = false;
-    }
-}
-
-struct TemporarySignalMask {
-    task: Arc<crate::task::TaskControlBlock>,
-    old_mask: SignalFlags,
-}
-
-impl TemporarySignalMask {
-    fn install(mask: SignalFlags) -> KResult<Self> {
-        let task = current_task().ok_or(Errno::ESRCH)?;
-        let old_mask = {
-            let mut task_inner = task.inner_exclusive_access();
-            let old_mask = task_inner.signal_mask;
-            task_inner.signal_mask = mask;
-            old_mask
-        };
-        Ok(Self { task, old_mask })
-    }
-}
-
-impl Drop for TemporarySignalMask {
-    fn drop(&mut self) {
-        self.task.inner_exclusive_access().signal_mask = self.old_mask;
     }
 }
 
@@ -318,27 +291,6 @@ fn write_epoll_event(
     bytes[EPOLL_EVENT_DATA_OFFSET..EPOLL_EVENT_DATA_OFFSET + 8]
         .copy_from_slice(&event.data.to_ne_bytes());
     write_user_value(token, addr as *mut [u8; EPOLL_EVENT_SIZE], &bytes)
-}
-
-fn read_epoll_sigmask(
-    token: usize,
-    sigmask: *const u8,
-    sigsetsize: usize,
-) -> KResult<Option<SignalFlags>> {
-    if sigmask.is_null() {
-        return Ok(None);
-    }
-    if sigsetsize != LINUX_RT_SIGSET_SIZE {
-        return Err(Errno::EINVAL);
-    }
-    if (sigmask as usize) < size_of::<u64>() {
-        return Err(Errno::EFAULT);
-    }
-    let raw = read_user_value(token, sigmask.cast::<u64>())?;
-    let mut mask = linux_sigset_to_flags(raw);
-    mask.remove(SignalFlags::SIGKILL);
-    mask.remove(SignalFlags::SIGSTOP);
-    Ok(Some(mask))
 }
 
 fn epoll_file_from(file: &Arc<dyn File + Send + Sync>) -> Option<&EpollFile> {
@@ -649,7 +601,7 @@ pub fn sys_epoll_pwait(
     // entering the wait. This kernel applies it around the cooperative polling
     // loop, which is sufficient for the current single-hart LTP cases.
     let token = current_user_token();
-    let sigmask = read_epoll_sigmask(token, sigmask, sigsetsize)?;
+    let sigmask = read_signal_mask(token, sigmask, sigsetsize)?;
     let _mask_guard = match sigmask {
         Some(mask) => Some(TemporarySignalMask::install(mask)?),
         None => None,
@@ -673,7 +625,7 @@ pub fn sys_epoll_pwait2(
     // UNFINISHED: See sys_epoll_pwait(); the mask is applied around the
     // cooperative wait rather than as a fully atomic sleep transition.
     let token = current_user_token();
-    let sigmask = read_epoll_sigmask(token, sigmask, sigsetsize)?;
+    let sigmask = read_signal_mask(token, sigmask, sigsetsize)?;
     let _mask_guard = match sigmask {
         Some(mask) => Some(TemporarySignalMask::install(mask)?),
         None => None,

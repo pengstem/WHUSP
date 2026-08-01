@@ -261,8 +261,8 @@ impl From<FileStat> for LinuxKstat {
 }
 
 /// Converts VFS statfs data into the Linux `struct statfs` ABI layout.
-impl From<crate::fs::FileSystemStat> for LinuxStatfs {
-    fn from(stat: crate::fs::FileSystemStat) -> Self {
+impl LinuxStatfs {
+    pub(crate) fn from_filesystem_stat(stat: crate::fs::FileSystemStat, fsid: [i32; 2]) -> Self {
         Self {
             f_type: stat.magic,
             f_bsize: stat.block_size as i64,
@@ -271,12 +271,18 @@ impl From<crate::fs::FileSystemStat> for LinuxStatfs {
             f_bavail: stat.available_blocks,
             f_files: stat.files,
             f_ffree: stat.free_files,
-            f_fsid: [0; 2],
+            f_fsid: fsid,
             f_namelen: stat.max_name_len as i64,
             f_frsize: stat.block_size as i64,
             f_flags: stat.flags as i64,
             f_spare: [0; 4],
         }
+    }
+}
+
+impl From<crate::fs::FileSystemStat> for LinuxStatfs {
+    fn from(stat: crate::fs::FileSystemStat) -> Self {
+        Self::from_filesystem_stat(stat, [0; 2])
     }
 }
 

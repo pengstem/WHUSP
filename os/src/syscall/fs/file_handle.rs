@@ -4,7 +4,9 @@ use super::super::user_ptr::{
 use super::fd::{get_file_by_fd, install_file_fd};
 use super::path::{AtPath, open_flags_from_user_bits, path_context_from, resolve_at_path};
 use super::uapi::{AT_EMPTY_PATH, AT_FDCWD};
-use crate::fs::{FsError, MountId, VfsNodeId, lookup_path_in, open_file_handle_node};
+use crate::fs::{
+    FsError, MountId, VfsNodeId, fsid_for_mount, lookup_path_in, open_file_handle_node,
+};
 use crate::task::{current_process, current_user_token};
 use crate::uapi::errno::{Errno, KResult};
 
@@ -30,11 +32,8 @@ struct LinuxFileHandleHeader {
     handle_type: i32,
 }
 
-pub(crate) fn file_handle_fsid(_node: VfsNodeId) -> [i32; 2] {
-    // CONTEXT: LinuxStatfs currently reports a zero fsid for all mounted
-    // filesystems in this kernel. Fanotify FID records use the same fsid so
-    // LTP comparisons against statfs(2) remain consistent.
-    [0, 0]
+pub(crate) fn file_handle_fsid(node: VfsNodeId) -> [i32; 2] {
+    fsid_for_mount(node.mount_id)
 }
 
 fn encode_file_handle_payload(node: VfsNodeId) -> [u8; WHUSP_FILE_HANDLE_BYTES] {

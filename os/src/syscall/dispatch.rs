@@ -513,7 +513,6 @@ pub(crate) fn syscall_with_context(
             args[2] as *const LinuxTimeSpec,
             args[3] as *mut LinuxTimeSpec,
         ),
-        SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_PTRACE => sys_ptrace(args[0], args[1] as isize, args[2], args[3]),
         SYSCALL_SCHED_SETPARAM => sys_sched_setparam(args[0] as isize, args[1]),
         SYSCALL_SCHED_SETSCHEDULER => {

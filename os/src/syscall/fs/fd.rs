@@ -372,23 +372,6 @@ fn fcntl_add_seals(fd: usize, seals: u32) -> KResult {
     Ok(0)
 }
 
-fn fcntl_set_lease(fd: usize, arg: usize) -> KResult {
-    let entry = get_fd_entry_by_fd(fd)?;
-    match arg as i16 {
-        // CONTEXT: This is a minimal lease compatibility surface for LTP.
-        // Full Linux lease breaking, SIGIO notification, and open/truncate
-        // blocking are still not implemented.
-        0 if entry.file().writable() => Err(Errno::EAGAIN),
-        0..=2 => Ok(0),
-        _ => Err(Errno::EINVAL),
-    }
-}
-
-fn fcntl_get_lease(fd: usize) -> KResult {
-    get_fd_entry_by_fd(fd)?;
-    Ok(2)
-}
-
 fn read_memfd_name(name: *const u8) -> KResult<()> {
     match read_user_c_string(current_user_token(), name, MEMFD_NAME_MAX + 1) {
         Ok(_) => Ok(()),
@@ -459,8 +442,10 @@ pub fn sys_fcntl_ctx(ctx: &SyscallContext, fd: usize, op: usize, arg: usize) -> 
         F_OFD_GETLK => fcntl_ofd_getlk(get_fd_entry_by_fd(fd)?, arg as *mut _),
         F_OFD_SETLK => fcntl_ofd_setlk(get_fd_entry_by_fd(fd)?, arg as *const _),
         F_OFD_SETLKW => fcntl_ofd_setlkw(get_fd_entry_by_fd(fd)?, arg as *const _),
-        F_SETLEASE => fcntl_set_lease(fd, arg),
-        F_GETLEASE => fcntl_get_lease(fd),
+        F_SETLEASE | F_GETLEASE => {
+            get_fd_entry_by_fd_for_process(ctx.process(), fd)?;
+            Err(Errno::EINVAL)
+        }
         F_GETPIPE_SZ => fcntl_get_pipe_size(fd),
         F_SETPIPE_SZ => fcntl_set_pipe_size(fd, arg),
         F_ADD_SEALS => fcntl_add_seals(fd, arg as u32),

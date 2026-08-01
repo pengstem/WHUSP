@@ -17,20 +17,15 @@ const PTRACE_PEEKDATA: usize = 2;
 const PTRACE_PEEKUSER: usize = 3;
 const PTRACE_POKETEXT: usize = 4;
 const PTRACE_POKEDATA: usize = 5;
-const PTRACE_POKEUSER: usize = 6;
 const PTRACE_CONT: usize = 7;
 const PTRACE_KILL: usize = 8;
 const PTRACE_GETREGS: usize = 12;
-const PTRACE_SETREGS: usize = 13;
 const PTRACE_ATTACH: usize = 16;
 const PTRACE_DETACH: usize = 17;
 const PTRACE_SYSCALL: usize = 24;
 const PTRACE_SETOPTIONS: usize = 0x4200;
-const PTRACE_GETEVENTMSG: usize = 0x4201;
 const PTRACE_GETSIGINFO: usize = 0x4202;
-const PTRACE_SETSIGINFO: usize = 0x4203;
 const PTRACE_GETREGSET: usize = 0x4204;
-const PTRACE_SETREGSET: usize = 0x4205;
 const PTRACE_GET_SYSCALL_INFO: usize = 0x420e;
 
 const NT_PRSTATUS: usize = 1;
@@ -183,27 +178,6 @@ fn ptrace_getregset(task: &Arc<TaskControlBlock>, addr: usize, data: usize) -> K
     Ok(0)
 }
 
-fn ptrace_setregs(data: usize) -> KResult {
-    let _first_word = read_user_value::<usize>(current_user_token(), data as *const usize)?;
-    // UNFINISHED: Register writes are accepted as a no-op for strace/LTP
-    // compatibility; Linux applies architecture-specific validation and mutates
-    // the stopped tracee's saved register file.
-    Ok(0)
-}
-
-fn ptrace_setregset(addr: usize, data: usize) -> KResult {
-    if addr != NT_PRSTATUS {
-        return Err(Errno::EIO);
-    }
-    let iov = read_user_value::<UserIovec>(current_user_token(), data as *const UserIovec)?;
-    if iov.len != 0 {
-        let _first_byte = read_user_value::<u8>(current_user_token(), iov.base as *const u8)?;
-    }
-    // UNFINISHED: See PTRACE_SETREGS above. The iovec is validated but the
-    // tracee register file is not updated yet.
-    Ok(0)
-}
-
 fn ptrace_get_syscall_info(tracee: &Arc<ProcessControlBlock>, size: usize, data: usize) -> KResult {
     let stop = tracee.inner_exclusive_access().ptrace.syscall_stop;
     let mut info = PtraceSyscallInfo {
@@ -269,16 +243,6 @@ fn ptrace_getsiginfo(tracee: &Arc<ProcessControlBlock>, data: *mut LinuxSigInfo)
     Ok(0)
 }
 
-fn ptrace_setsiginfo(data: *const LinuxSigInfo) -> KResult {
-    if data.is_null() {
-        return Err(Errno::EFAULT);
-    }
-    let _info = read_user_value(current_user_token(), data)?;
-    // UNFINISHED: Linux stores this for the pending signal-delivery stop.
-    // Current LTP coverage only checks invalid user pointers.
-    Ok(0)
-}
-
 pub fn sys_ptrace(request: usize, pid: isize, addr: usize, data: usize) -> KResult {
     if request == PTRACE_TRACEME {
         return ptrace_traceme_current();
@@ -308,39 +272,17 @@ pub fn sys_ptrace(request: usize, pid: isize, addr: usize, data: usize) -> KResu
             validate_user_area_offset(addr)?;
             Ok(0)
         }
-        PTRACE_POKEUSER => {
-            ptrace_validate_tracee(&tracee, tracer_pid, true)?;
-            validate_user_area_offset(addr)?;
-            Ok(0)
-        }
         PTRACE_GETREGS => {
             let task = ptrace_validate_tracee(&tracee, tracer_pid, true)?;
             ptrace_getregs(&task, data)
-        }
-        PTRACE_SETREGS => {
-            ptrace_validate_tracee(&tracee, tracer_pid, true)?;
-            ptrace_setregs(data)
         }
         PTRACE_GETREGSET => {
             let task = ptrace_validate_tracee(&tracee, tracer_pid, true)?;
             ptrace_getregset(&task, addr, data)
         }
-        PTRACE_SETREGSET => {
-            ptrace_validate_tracee(&tracee, tracer_pid, true)?;
-            ptrace_setregset(addr, data)
-        }
         PTRACE_GETSIGINFO => {
             ptrace_validate_tracee(&tracee, tracer_pid, true)?;
             ptrace_getsiginfo(&tracee, data as *mut LinuxSigInfo)
-        }
-        PTRACE_SETSIGINFO => {
-            ptrace_validate_tracee(&tracee, tracer_pid, true)?;
-            ptrace_setsiginfo(data as *const LinuxSigInfo)
-        }
-        PTRACE_GETEVENTMSG => {
-            ptrace_validate_tracee(&tracee, tracer_pid, true)?;
-            write_user_value(current_user_token(), data as *mut usize, &0usize)?;
-            Ok(0)
         }
         PTRACE_SETOPTIONS => {
             ptrace_validate_tracee(&tracee, tracer_pid, true)?;

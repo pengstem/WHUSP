@@ -17,8 +17,6 @@ const FD_NONBLOCK: u32 = OpenFlags::NONBLOCK.bits();
 const FD_CLOEXEC: u32 = OpenFlags::CLOEXEC.bits();
 const TIMERFD_VALID_FLAGS: u32 = FD_NONBLOCK | FD_CLOEXEC;
 const TFD_TIMER_ABSTIME: u32 = 1;
-const TFD_TIMER_CANCEL_ON_SET: u32 = 2;
-const TIMERFD_SETTIME_VALID_FLAGS: u32 = TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET;
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
 const CLOCK_BOOTTIME: i32 = 7;
@@ -114,7 +112,7 @@ pub fn sys_timerfd_settime(
     new_value: *const LinuxITimerSpec,
     old_value: *mut LinuxITimerSpec,
 ) -> KResult {
-    if flags & !TIMERFD_SETTIME_VALID_FLAGS != 0 {
+    if flags & !TFD_TIMER_ABSTIME != 0 {
         return Err(Errno::EINVAL);
     }
     if new_value.is_null() {
@@ -124,8 +122,6 @@ pub fn sys_timerfd_settime(
     let interval_us = timespec_to_us_ceil(request.it_interval)?;
     let file = get_file_by_fd(fd.try_into().map_err(|_| Errno::EBADF)?)?;
     let timerfd = timerfd_from_file(&file)?;
-    // UNFINISHED: TFD_TIMER_CANCEL_ON_SET is accepted for ABI compatibility,
-    // but this kernel does not yet cancel realtime timerfds on wall-clock jumps.
     let next_expire_us = timerfd_next_expire_us(timerfd.clock(), flags, request.it_value)?;
     let (old_interval_us, old_remaining_us) = timerfd.set_time(interval_us, next_expire_us);
     if !old_value.is_null() {

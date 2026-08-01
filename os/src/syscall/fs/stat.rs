@@ -1,7 +1,7 @@
 use crate::fs::{
     FileStat, FileSystemStat, FsNodeKind, MountId, OpenFlags, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
-    S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, VfsNodeId, chmod_in, chown_in, lookup_path_in,
-    mount_is_read_only, nfs_compat_source_path, open_file_in, stat_devfs_child,
+    S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, VfsNodeId, chmod_in, chown_in, fsid_for_mount,
+    lookup_path_in, mount_is_read_only, nfs_compat_source_path, open_file_in, stat_devfs_child,
     stat_devfs_input_child, stat_devfs_misc_child, stat_devfs_net_child, stat_devfs_pts_child,
     stat_direct_regular_child_in, stat_full_in, stat_in, stat_static_path, statfs_for_mount,
 };
@@ -833,16 +833,28 @@ pub fn sys_statfs_ctx(
     let snapshot = ctx.process().path_snapshot();
     check_access_path_prefixes_for_process(ctx.process(), &snapshot, AT_FDCWD, path.as_str())?;
     let stat = resolve_stat_from(&snapshot, AT_FDCWD, path.as_str(), true)?;
-    let fs_stat = statfs_for_mount(MountId(stat.dev as usize)).ok_or(Errno::ENOSYS)?;
-    write_user_value_ctx(ctx, statfsbuf, &LinuxStatfs::from(fs_stat))?;
+    let mount_id = MountId(stat.dev as usize);
+    let fs_stat = statfs_for_mount(mount_id).ok_or(Errno::ENOSYS)?;
+    write_user_value_ctx(
+        ctx,
+        statfsbuf,
+        &LinuxStatfs::from_filesystem_stat(fs_stat, fsid_for_mount(mount_id)),
+    )?;
     Ok(0)
 }
 
 pub fn sys_fstatfs_ctx(ctx: &SyscallContext, fd: usize, statfsbuf: *mut LinuxStatfs) -> KResult {
     let entry = get_fd_entry_by_fd_for_process(ctx.process(), fd)?;
     let stat = entry.file().stat()?;
-    let fs_stat = statfs_for_mount(MountId(stat.dev as usize)).unwrap_or_else(anonymous_fd_statfs);
-    write_user_value_ctx(ctx, statfsbuf, &LinuxStatfs::from(fs_stat))?;
+    let mount_id = MountId(stat.dev as usize);
+    let (fs_stat, fsid) = statfs_for_mount(mount_id)
+        .map(|fs_stat| (fs_stat, fsid_for_mount(mount_id)))
+        .unwrap_or_else(|| (anonymous_fd_statfs(), [0; 2]));
+    write_user_value_ctx(
+        ctx,
+        statfsbuf,
+        &LinuxStatfs::from_filesystem_stat(fs_stat, fsid),
+    )?;
     Ok(0)
 }
 

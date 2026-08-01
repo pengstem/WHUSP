@@ -1,8 +1,9 @@
 use crate::fs::{File, PollEvents, PollWaiter};
 use crate::perf;
 use crate::task::{
-    block_current_task_no_schedule_unless_unmasked_signal, current_has_interrupting_signal,
-    current_task, current_user_token, schedule,
+    SignalFlags, block_current_task_no_schedule_unless_unmasked_signal,
+    current_has_interrupting_signal, current_task, current_user_token, linux_sigset_to_flags,
+    schedule,
 };
 use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
@@ -10,13 +11,15 @@ use alloc::vec::Vec;
 
 use super::super::time::relative_timeout_deadline_ms;
 use super::super::uapi::LinuxTimeSpec;
-use super::super::user_ptr::{read_user_array, write_user_array};
+use super::super::user_ptr::{read_user_array, read_user_value, write_user_array};
 use super::fd::get_file_by_fd;
 use super::uapi::{LinuxPollFd, PPOLL_MAX_NFDS};
 use crate::uapi::errno::{Errno, KResult};
+use core::mem::size_of;
 
 const SELECT_MAX_NFDS: usize = 1024;
 const FD_SET_WORD_BITS: usize = usize::BITS as usize;
+const LINUX_RT_SIGSET_SIZE: usize = 8;
 
 type PollFile = Arc<dyn File + Send + Sync>;
 
@@ -42,6 +45,73 @@ impl Drop for ProcSleepGuard {
     fn drop(&mut self) {
         self.task.inner_exclusive_access().proc_sleeping = false;
     }
+}
+
+pub(super) struct TemporarySignalMask {
+    task: Arc<crate::task::TaskControlBlock>,
+    old_mask: SignalFlags,
+}
+
+impl TemporarySignalMask {
+    pub(super) fn install(mask: SignalFlags) -> KResult<Self> {
+        let task = current_task().ok_or(Errno::ESRCH)?;
+        let old_mask = {
+            let mut task_inner = task.inner_exclusive_access();
+            let old_mask = task_inner.signal_mask;
+            task_inner.signal_mask = mask;
+            old_mask
+        };
+        Ok(Self { task, old_mask })
+    }
+}
+
+impl Drop for TemporarySignalMask {
+    fn drop(&mut self) {
+        self.task.inner_exclusive_access().signal_mask = self.old_mask;
+    }
+}
+
+pub(super) fn read_signal_mask(
+    token: usize,
+    sigmask: *const u8,
+    sigsetsize: usize,
+) -> KResult<Option<SignalFlags>> {
+    if sigmask.is_null() {
+        return Ok(None);
+    }
+    if sigsetsize != LINUX_RT_SIGSET_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    if (sigmask as usize) < size_of::<u64>() {
+        return Err(Errno::EFAULT);
+    }
+    let raw = read_user_value(token, sigmask.cast::<u64>())?;
+    let mut mask = linux_sigset_to_flags(raw);
+    mask.remove(SignalFlags::SIGKILL);
+    mask.remove(SignalFlags::SIGSTOP);
+    Ok(Some(mask))
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Pselect6Sigmask {
+    ss: usize,
+    ss_len: usize,
+}
+
+fn read_pselect6_sigmask(token: usize, sigmask: usize) -> KResult<Option<SignalFlags>> {
+    if sigmask == 0 {
+        return Ok(None);
+    }
+    let spec = read_user_value(token, sigmask as *const Pselect6Sigmask)?;
+    if spec.ss == 0 {
+        return if spec.ss_len == 0 {
+            Ok(None)
+        } else {
+            Err(Errno::EFAULT)
+        };
+    }
+    read_signal_mask(token, spec.ss as *const u8, spec.ss_len)
 }
 
 fn sleep_until_poll_event(waiter: &Arc<PollWaiter>, deadline_ms: Option<usize>) -> KResult<()> {
@@ -172,18 +242,18 @@ pub fn sys_ppoll(
     fds: *mut LinuxPollFd,
     nfds: usize,
     timeout: *const LinuxTimeSpec,
-    _sigmask: *const u8,
-    _sigsetsize: usize,
+    sigmask: *const u8,
+    sigsetsize: usize,
 ) -> KResult {
-    // UNFINISHED: ppoll currently ignores per-call signal-mask installation.
-    // CONTEXT: musl implements pause() through ppoll() with a non-null mask on
-    // RISC-V. Accepting the mask as a no-op lets LTP namespace helper daemons
-    // sleep until killed instead of exiting immediately with ENOSYS.
-
     let token = current_user_token();
     let mut pollfds = read_user_pollfds(token, fds.cast_const(), nfds)?;
     let poll_files = snapshot_pollfds(&pollfds);
     let deadline_ms = relative_timeout_deadline_ms(token, timeout)?;
+    let sigmask = read_signal_mask(token, sigmask, sigsetsize)?;
+    let _mask_guard = match sigmask {
+        Some(mask) => Some(TemporarySignalMask::install(mask)?),
+        None => None,
+    };
     let task = current_task().ok_or(Errno::ESRCH)?;
 
     loop {
@@ -395,11 +465,8 @@ pub fn sys_pselect6(
     writefds: usize,
     exceptfds: usize,
     timeout: *const LinuxTimeSpec,
-    _sigmask: usize,
+    sigmask: usize,
 ) -> KResult {
-    // UNFINISHED: pselect6 signal-mask installation is not implemented; the
-    // mask argument is accepted as a no-op for libc select() compatibility on
-    // the netperf path.
     if nfds > SELECT_MAX_NFDS {
         return Err(Errno::EINVAL);
     }
@@ -415,6 +482,11 @@ pub fn sys_pselect6(
         except_input.as_deref(),
     )?;
     let deadline_ms = relative_timeout_deadline_ms(token, timeout)?;
+    let sigmask = read_pselect6_sigmask(token, sigmask)?;
+    let _mask_guard = match sigmask {
+        Some(mask) => Some(TemporarySignalMask::install(mask)?),
+        None => None,
+    };
     let word_count = fdset_words(nfds);
     let mut read_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));
     let mut write_output = Vec::from_iter(core::iter::repeat_n(0usize, word_count));

@@ -40,7 +40,6 @@ ioctl_ns01
 fcntl35
 prctl01
 fanotify08
-fcntl27
 getrandom05
 sched_rr_get_interval02
 pipe08
@@ -77,10 +76,7 @@ llseek03
 prctl02
 chmod01
 fanotify19
-bind04
 mmap04
-syslog11
-syslog12
 semctl01
 stat01_64
 access04
@@ -117,7 +113,6 @@ lseek11
 msgctl01
 prctl08
 setreuid03
-bind05
 statx03
 open_by_handle_at02
 pipe2_01
@@ -363,7 +358,6 @@ splice09
 ptrace03
 sendfile02
 dup01
-fcntl27_64
 flistxattr01
 flistxattr02
 flistxattr03
