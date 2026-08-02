@@ -946,6 +946,7 @@ impl ProcessPosixTimer {
     }
 }
 
+#[cfg(feature = "ptrace")]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PtraceSyscallStop {
     pub(crate) op: u8,
@@ -957,6 +958,7 @@ pub(crate) struct PtraceSyscallStop {
     pub(crate) stack_pointer: usize,
 }
 
+#[cfg(feature = "ptrace")]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PtraceState {
     pub(crate) tracer_pid: Option<usize>,
@@ -991,6 +993,7 @@ pub struct ProcessControlBlock {
     pub(super) inner_owner_cpu: AtomicUsize,
     pub(crate) job_control_stop_generation: AtomicUsize,
     pub(crate) job_control_stop_pending: AtomicUsize,
+    #[cfg(feature = "ptrace")]
     // Linux tests ptrace thread flags before taking sighand/tasklist locks on
     // syscall entry and exit. Bit 0 means traced; bit 1 means syscall stops are
     // enabled. Mutations publish this summary while holding `inner`.
@@ -1008,7 +1011,9 @@ pub struct ProcessControlBlock {
 
 const NO_EXCLUSIVE_TASK: usize = 0;
 const NO_INNER_OWNER: usize = usize::MAX;
+#[cfg(feature = "ptrace")]
 const PTRACE_FAST_TRACED: usize = 1;
+#[cfg(feature = "ptrace")]
 const PTRACE_FAST_SYSCALL_TRACE: usize = 2;
 
 pub(crate) struct TaskGroupSchedulerGuard<'a> {
@@ -1083,16 +1088,19 @@ impl Drop for ProcessInnerGuard<'_> {
 }
 
 impl ProcessControlBlock {
+    #[cfg(feature = "ptrace")]
     #[inline(always)]
     pub(crate) fn ptrace_is_traced_fast(&self) -> bool {
         self.ptrace_fast.load(Ordering::Acquire) & PTRACE_FAST_TRACED != 0
     }
 
+    #[cfg(feature = "ptrace")]
     #[inline(always)]
     pub(crate) fn ptrace_syscall_trace_fast(&self) -> bool {
         self.ptrace_fast.load(Ordering::Acquire) & PTRACE_FAST_SYSCALL_TRACE != 0
     }
 
+    #[cfg(feature = "ptrace")]
     /// Publishes ptrace mode while the caller still owns `self.inner`.
     pub(crate) fn publish_ptrace_fast_locked(&self, traced: bool, syscall_trace: bool) {
         let mut flags = 0;
@@ -1243,6 +1251,7 @@ pub struct ProcessControlBlockInner {
     pub(crate) personality: u32,
     pub(crate) wait_stop_status: Option<i32>,
     pub(crate) wait_continued: bool,
+    #[cfg(feature = "ptrace")]
     pub(crate) ptrace: PtraceState,
     // UNFINISHED: Linux kernel credentials are per-thread, while POSIX
     // user-space expects process-wide synchronization. This first contest

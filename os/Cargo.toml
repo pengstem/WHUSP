@@ -5,8 +5,12 @@ authors = ["Pengsteam <2285566738@qq.com>"]
 edition = "2024"
 
 [features]
+default = []
 block-io-force-sync = []
+fanotify = []
+inotify = []
 perf-counters = []
+ptrace = []
 fault-trace = []
 read-mostly-probe = []
 sleep-rwlock-probe = []

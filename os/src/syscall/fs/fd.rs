@@ -14,12 +14,14 @@ use core::mem::size_of;
 use super::super::user_ptr::{
     UserBufferAccess, read_user_c_string, translated_byte_buffer_checked_ctx,
 };
+#[cfg(feature = "fanotify")]
 use super::fanotify::{fanotify_close_group_file, fanotify_notify_close};
 use super::fd_lock::{
     fcntl_getlk, fcntl_ofd_getlk, fcntl_ofd_setlk, fcntl_ofd_setlkw, fcntl_setlk, fcntl_setlkw,
     flock_operation, release_flock_locks_for_close, release_ofd_record_locks_for_close,
     release_record_locks_for_close,
 };
+#[cfg(feature = "inotify")]
 use super::inotify::inotify_notify_close;
 use crate::uapi::errno::{Errno, KResult};
 
@@ -181,14 +183,20 @@ fn close_detached_fd_entry_inner(entry: FdTableEntry, force_fanotify_release: bo
     release_record_locks_for_close(&entry);
     release_ofd_record_locks_for_close(&entry);
     release_flock_locks_for_close(&entry);
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     let file = entry.file();
+    #[cfg(not(feature = "fanotify"))]
+    let _ = force_fanotify_release;
+    #[cfg(feature = "fanotify")]
     if force_fanotify_release {
         // CONTEXT: process teardown can kill a thread blocked inside read(2)
         // before its suspended Rust stack unwinds. Make the fanotify group
         // inert from the fd close path instead of waiting for the last Arc drop.
         fanotify_close_group_file(&file);
     }
+    #[cfg(feature = "fanotify")]
     fanotify_notify_close(&file, file.writable());
+    #[cfg(feature = "inotify")]
     inotify_notify_close(&file, file.writable());
     drop(entry);
 }

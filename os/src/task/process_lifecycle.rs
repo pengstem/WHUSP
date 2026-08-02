@@ -122,6 +122,7 @@ impl ProcessControlBlock {
             inner_owner_cpu: AtomicUsize::new(usize::MAX),
             job_control_stop_generation: AtomicUsize::new(0),
             job_control_stop_pending: AtomicUsize::new(0),
+            #[cfg(feature = "ptrace")]
             ptrace_fast: AtomicUsize::new(0),
             fs_fast: ProcessFsFastState::new(&fs),
             fd_table_fast: FdTableFastState::new(&fd_table),
@@ -161,6 +162,7 @@ impl ProcessControlBlock {
                 personality: 0,
                 wait_stop_status: None,
                 wait_continued: false,
+                #[cfg(feature = "ptrace")]
                 ptrace: Default::default(),
                 credentials: Credentials::root(),
                 resource_limits: ProcessResourceLimits::new(),
@@ -338,6 +340,7 @@ impl ProcessControlBlock {
             inner_owner_cpu: AtomicUsize::new(usize::MAX),
             job_control_stop_generation: AtomicUsize::new(0),
             job_control_stop_pending: AtomicUsize::new(0),
+            #[cfg(feature = "ptrace")]
             ptrace_fast: AtomicUsize::new(0),
             fs_fast: ProcessFsFastState::new(&fs),
             fd_table_fast: FdTableFastState::new(&new_fd_table),
@@ -377,6 +380,7 @@ impl ProcessControlBlock {
                 personality,
                 wait_stop_status: None,
                 wait_continued: false,
+                #[cfg(feature = "ptrace")]
                 ptrace: Default::default(),
                 credentials,
                 resource_limits,

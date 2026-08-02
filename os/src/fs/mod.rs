@@ -559,6 +559,7 @@ pub trait File: Send + Sync {
     fn vfs_node_id(&self) -> Option<vfs::VfsNodeId> {
         None
     }
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     fn vfs_parent_node_id(&self) -> Option<vfs::VfsNodeId> {
         None
     }
@@ -572,12 +573,14 @@ pub trait File: Send + Sync {
         inode::OpenFlags::empty()
     }
     fn set_status_flags(&self, _flags: inode::OpenFlags) {}
+    #[cfg(feature = "fanotify")]
     fn clone_for_fanotify_event(
         &self,
         _flags: inode::OpenFlags,
     ) -> FsResult<Arc<dyn File + Send + Sync>> {
         Err(FsError::Unsupported)
     }
+    #[cfg(feature = "fanotify")]
     fn suppresses_fanotify(&self) -> bool {
         false
     }
@@ -716,14 +719,18 @@ pub(crate) use inode::{
     rename_exchange_in, rename_in, rmdir_in, symlink_in, unlink_file_in,
 };
 pub(crate) use memfd::make_memfd;
+#[cfg(feature = "inotify")]
+pub(crate) use mount::mounted_source_at;
+#[cfg(any(feature = "fanotify", feature = "inotify"))]
+pub(crate) use mount::overlay_real_node;
 pub(crate) use mount::{
     MountError, MountId, MountNamespaceId, MountPropagation, ROOT_MOUNT_NAMESPACE,
     clone_mount_namespace, fsid_for_mount, mount_bind_at, mount_block_device_at,
     mount_ext_scratch_at, mount_fat_device_at, mount_is_ext4, mount_is_noexec, mount_is_read_only,
     mount_nfs_compat_at, mount_overlay_compat_at, mount_proc_at,
-    mount_stat_flags_from_linux_mount_flags, mount_tmpfs_at, mounted_source_at, move_mount_at,
-    nfs_compat_source_path, overlay_real_node, remount_at, root_ino_for, set_mount_propagation_at,
-    set_mount_stat_flags, shutdown_all_mounts, statfs_for_mount, sync_all_mounts, unmount_at,
+    mount_stat_flags_from_linux_mount_flags, mount_tmpfs_at, move_mount_at, nfs_compat_source_path,
+    remount_at, root_ino_for, set_mount_propagation_at, set_mount_stat_flags, shutdown_all_mounts,
+    statfs_for_mount, sync_all_mounts, unmount_at,
 };
 pub(crate) use path::{PathContext, WorkingDir, normalize_path_at_root, path_inside_root};
 pub(crate) use pipe::default_pipe_capacity_for_process;

@@ -200,10 +200,13 @@ pub(crate) fn syscall_with_context(
         SYSCALL_DUP => sys_dup(args[0]),
         SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2] as u32),
         SYSCALL_FCNTL => sys_fcntl_ctx(ctx, args[0], args[1], args[2]),
+        #[cfg(feature = "inotify")]
         SYSCALL_INOTIFY_INIT1 => sys_inotify_init1(args[0] as u32),
+        #[cfg(feature = "inotify")]
         SYSCALL_INOTIFY_ADD_WATCH => {
             sys_inotify_add_watch(args[0], args[1] as *const u8, args[2] as u32)
         }
+        #[cfg(feature = "inotify")]
         SYSCALL_INOTIFY_RM_WATCH => sys_inotify_rm_watch(args[0], args[1] as i32),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
         SYSCALL_IOPRIO_SET => {
@@ -513,6 +516,7 @@ pub(crate) fn syscall_with_context(
             args[2] as *const LinuxTimeSpec,
             args[3] as *mut LinuxTimeSpec,
         ),
+        #[cfg(feature = "ptrace")]
         SYSCALL_PTRACE => sys_ptrace(args[0], args[1] as isize, args[2], args[3]),
         SYSCALL_SCHED_SETPARAM => sys_sched_setparam(args[0] as isize, args[1]),
         SYSCALL_SCHED_SETSCHEDULER => {
@@ -703,7 +707,9 @@ pub(crate) fn syscall_with_context(
             args[2] as *const RLimit,
             args[3] as *mut RLimit,
         ),
+        #[cfg(feature = "fanotify")]
         SYSCALL_FANOTIFY_INIT => sys_fanotify_init(args[0] as u32, args[1] as u32),
+        #[cfg(feature = "fanotify")]
         SYSCALL_FANOTIFY_MARK => sys_fanotify_mark(
             args[0],
             args[1] as u32,

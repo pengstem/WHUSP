@@ -664,6 +664,7 @@ pub(super) fn mounted_backend_lease(mount_id: MountId) -> Option<MountedBackendL
         .map(|mounted| MountedBackendLease { mounted })
 }
 
+#[cfg(any(feature = "fanotify", feature = "inotify"))]
 pub(crate) fn overlay_real_node(node: VfsNodeId) -> Option<VfsNodeId> {
     with_mount(node.mount_id, BackendOp::Lookup, |mount| {
         mount.overlay_real_node(node.ino)
@@ -2488,6 +2489,7 @@ fn dynamic_mount_at(namespace_id: MountNamespaceId, target: VfsNodeId) -> Option
     })
 }
 
+#[cfg(feature = "inotify")]
 pub(crate) fn mounted_source_at(
     namespace_id: MountNamespaceId,
     target: WorkingDir,

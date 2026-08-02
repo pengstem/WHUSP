@@ -1,10 +1,12 @@
 mod epoll;
 mod eventfd;
+#[cfg(feature = "fanotify")]
 mod fanotify;
 mod fd;
 mod fd_compat;
 mod fd_lock;
 mod file_handle;
+#[cfg(feature = "inotify")]
 mod inotify;
 mod io;
 mod mount;
@@ -17,10 +19,12 @@ mod uapi;
 
 pub use epoll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait, sys_epoll_pwait2};
 pub use eventfd::sys_eventfd2;
+#[cfg(feature = "fanotify")]
 pub(crate) use fanotify::{
     fanotify_evict_evictable_marks, fanotify_fdinfo, fanotify_max_queued_events,
     fanotify_notify_open_exec_at,
 };
+#[cfg(feature = "fanotify")]
 pub use fanotify::{sys_fanotify_init, sys_fanotify_mark};
 pub(crate) use fd::{
     close_detached_fd_entry, close_detached_fd_entry_for_process_teardown, get_file_by_fd,
@@ -33,9 +37,11 @@ pub use fd::{
 pub use fd_compat::{sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime};
 pub(crate) use fd_lock::release_record_locks_for_process;
 pub use file_handle::{sys_name_to_handle_at, sys_open_by_handle_at};
+#[cfg(feature = "inotify")]
 pub(crate) use inotify::{
     INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES, inotify_fdinfo,
 };
+#[cfg(feature = "inotify")]
 pub use inotify::{sys_inotify_add_watch, sys_inotify_init1, sys_inotify_rm_watch};
 pub use io::{
     sys_copy_file_range, sys_fadvise64, sys_fallocate, sys_fdatasync, sys_fsync, sys_ftruncate,

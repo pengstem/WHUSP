@@ -1281,8 +1281,10 @@ pub(crate) struct VfsFile {
     node: VfsNodeId,
     inode_state: Arc<inode_state::InodeState>,
     mount_backend: MountedBackendLease,
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     parent: Option<VfsNodeId>,
     kind: FsNodeKind,
+    #[cfg(feature = "fanotify")]
     namespace_id: MountNamespaceId,
     visible_path: Option<String>,
     offset: SleepMutex<usize>,
@@ -1294,6 +1296,7 @@ pub(crate) struct VfsFile {
     readable: bool,
     writable: bool,
     status_flags: StatusFlagsCell,
+    #[cfg(feature = "fanotify")]
     suppress_fanotify: bool,
 }
 
@@ -1320,6 +1323,12 @@ impl VfsFile {
         namespace_id: MountNamespaceId,
         suppress_fanotify: bool,
     ) -> FsResult<Self> {
+        #[cfg(not(feature = "fanotify"))]
+        let _ = suppress_fanotify;
+        #[cfg(not(any(feature = "fanotify", feature = "inotify")))]
+        let _ = parent;
+        #[cfg(not(feature = "fanotify"))]
+        let _ = namespace_id;
         let node = path.node;
         let kind = path.kind;
         let visible_path = path.visible_path;
@@ -1337,8 +1346,10 @@ impl VfsFile {
             node,
             inode_state,
             mount_backend,
+            #[cfg(any(feature = "fanotify", feature = "inotify"))]
             parent,
             kind,
+            #[cfg(feature = "fanotify")]
             namespace_id,
             visible_path,
             offset: SleepMutex::new(0),
@@ -1350,6 +1361,7 @@ impl VfsFile {
             readable,
             writable,
             status_flags: StatusFlagsCell::new(status_flags),
+            #[cfg(feature = "fanotify")]
             suppress_fanotify,
         };
         Ok(file)
@@ -3414,6 +3426,7 @@ impl File for VfsFile {
         Some(self.node)
     }
 
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     fn vfs_parent_node_id(&self) -> Option<VfsNodeId> {
         self.parent
     }
@@ -3454,6 +3467,7 @@ impl File for VfsFile {
         self.status_flags.set(flags);
     }
 
+    #[cfg(feature = "fanotify")]
     fn clone_for_fanotify_event(&self, flags: OpenFlags) -> FsResult<Arc<dyn File + Send + Sync>> {
         let (readable, writable) = flags.read_write();
         Ok(Arc::new(VfsFile::new(
@@ -3471,6 +3485,7 @@ impl File for VfsFile {
         )?))
     }
 
+    #[cfg(feature = "fanotify")]
     fn suppresses_fanotify(&self) -> bool {
         self.suppress_fanotify
     }

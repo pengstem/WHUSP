@@ -128,9 +128,13 @@ pub fn trap_handler() -> ! {
     let mut interrupted_pc = trap_pc;
     match estat.cause() {
         Trap::Exception(Exception::Syscall) => {
+            #[cfg(feature = "ptrace")]
             let syscall_pc = trap_pc;
             let (syscall_nr, syscall_args, syscall_sp) =
                 syscall_entry.expect("syscall entry snapshot must exist for Syscall");
+            #[cfg(not(feature = "ptrace"))]
+            let _ = syscall_sp;
+            #[cfg(feature = "ptrace")]
             crate::task::ptrace_syscall_enter_stop_for_task(
                 &process,
                 syscall_nr,
@@ -155,8 +159,11 @@ pub fn trap_handler() -> ! {
             let cx = trap_cx_of_task(&task);
             interrupted_pc = cx.era;
             cx.x[4] = result as usize;
+            #[cfg(feature = "ptrace")]
             let syscall_exit_pc = cx.era;
+            #[cfg(feature = "ptrace")]
             let syscall_exit_sp = cx.x[3];
+            #[cfg(feature = "ptrace")]
             if crate::task::ptrace_syscall_exit_stop_for_task(
                 &process,
                 result,
@@ -234,6 +241,7 @@ pub fn trap_handler() -> ! {
             );
         }
     }
+    #[cfg(feature = "ptrace")]
     if crate::task::ptrace_stop_task_if_needed(&task, &process) {
         interrupted_pc = trap_cx_of_task(&task).era;
     }

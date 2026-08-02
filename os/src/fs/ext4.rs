@@ -2658,6 +2658,7 @@ impl LookupOps for ConcurrentExt4Backend {
         EXT4_ROOT_INO
     }
 
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     fn overlay_real_node(&self, _ino: u32) -> Option<super::vfs::VfsNodeId> {
         None
     }

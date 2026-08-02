@@ -1,6 +1,7 @@
 MODE ?= release
 PERF_COUNTERS ?= 0
 BLOCK_IO_MODE ?= force-sync
+CARGO_DEFAULT_FEATURES ?= 1
 EXTRA_FEATURES ?=
 
 ifeq ($(BLOCK_IO_MODE),auto)
@@ -65,11 +66,11 @@ validation:
 validate: validation
 
 kernel-rv:
-	@$(MAKE) --no-print-directory -C os ARCH=riscv64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) BLOCK_IO_MODE=$(BLOCK_IO_MODE) EXTRA_FEATURES="$(EXTRA_FEATURES)" kernel
+	@$(MAKE) --no-print-directory -C os ARCH=riscv64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) BLOCK_IO_MODE=$(BLOCK_IO_MODE) CARGO_DEFAULT_FEATURES=$(CARGO_DEFAULT_FEATURES) EXTRA_FEATURES="$(EXTRA_FEATURES)" kernel
 	@cp -f $(KERNEL_RV_SRC) kernel-rv
 
 kernel-la:
-	@$(MAKE) --no-print-directory -C os ARCH=loongarch64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) BLOCK_IO_MODE=$(BLOCK_IO_MODE) EXTRA_FEATURES="$(EXTRA_FEATURES)" kernel
+	@$(MAKE) --no-print-directory -C os ARCH=loongarch64 MODE=$(MODE) PERF_COUNTERS=$(PERF_COUNTERS) BLOCK_IO_MODE=$(BLOCK_IO_MODE) CARGO_DEFAULT_FEATURES=$(CARGO_DEFAULT_FEATURES) EXTRA_FEATURES="$(EXTRA_FEATURES)" kernel
 	@cp -f $(KERNEL_LA_SRC) kernel-la
 
 contest-disk:

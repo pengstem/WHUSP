@@ -8,6 +8,7 @@ mod lifecycle;
 mod process;
 mod process_lifecycle;
 mod processor;
+#[cfg(feature = "ptrace")]
 mod ptrace;
 mod sched;
 mod signal;
@@ -58,6 +59,7 @@ pub use processor::{
     trap_return_context_after_accounting_for_task, try_current_kstack_bounds,
 };
 pub(crate) use processor::{processor_idle_mask, processor_is_idle, processor_slot_ptr};
+#[cfg(feature = "ptrace")]
 pub(crate) use ptrace::{
     ptrace_attach_process, ptrace_kill_process, ptrace_note_exec_current, ptrace_resume_process,
     ptrace_stop_task_if_needed, ptrace_syscall_enter_stop_for_task,
@@ -70,10 +72,12 @@ pub(crate) use sched::{
     migrate_ready_task, remove_ready_task_for_job_stop, reprioritize_ready_task,
     requeue_task_after_run, wakeup_front_task, wakeup_timer_task,
 };
+#[cfg(feature = "ptrace")]
+pub use signal::SIGTRAP;
 pub use signal::{
     CLD_CONTINUED, CLD_STOPPED, DefaultSignalAction, MINSIGSTKSZ, SA_NOCLDSTOP, SA_RESTART,
-    SI_TKILL, SIGCHLD, SIGCONT, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SIGTRAP, SS_DISABLE,
-    SS_ONSTACK, SigAltStack, SignalAction, SignalFlags, SignalInfo, default_signal_action,
+    SI_TKILL, SIGCHLD, SIGCONT, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SS_DISABLE, SS_ONSTACK,
+    SigAltStack, SignalAction, SignalFlags, SignalInfo, default_signal_action,
     default_signal_error, default_signal_exit_code, signal_child_status, signal_wait_status,
 };
 #[cfg(target_arch = "riscv64")]

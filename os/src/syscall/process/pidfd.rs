@@ -71,6 +71,7 @@ pub(super) fn install_reserved_pidfd_for_current_process(fd: usize, pid: usize) 
     debug_assert!(previous.is_none());
 }
 
+#[cfg(feature = "fanotify")]
 pub(crate) fn install_pidfd_for_fanotify(pid: usize) -> KResult<usize> {
     pid2process(pid).ok_or(Errno::ESRCH)?;
     install_pidfd_with_flags(pid, OpenFlags::CLOEXEC)

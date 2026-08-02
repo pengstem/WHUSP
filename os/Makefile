@@ -2,6 +2,7 @@ ARCH ?= riscv64
 MODE ?= release
 PERF_COUNTERS ?= 0
 BLOCK_IO_MODE ?= force-sync
+CARGO_DEFAULT_FEATURES ?= 1
 EXTRA_FEATURES ?=
 override CARGO_HOME := $(abspath ../vendor)
 export CARGO_HOME
@@ -28,6 +29,13 @@ MODE_ARG := $(if $(filter release,$(MODE)),--release)
 PERF_FEATURE := $(if $(filter 1 yes true on,$(PERF_COUNTERS)),perf-counters)
 CARGO_FEATURES := $(strip $(PERF_FEATURE) $(BLOCK_IO_FEATURE) $(EXTRA_FEATURES))
 CARGO_FEATURE_ARG := $(if $(CARGO_FEATURES),--features "$(CARGO_FEATURES)")
+ifneq ($(filter 1 yes true on,$(CARGO_DEFAULT_FEATURES)),)
+CARGO_DEFAULT_FEATURE_ARG :=
+else ifneq ($(filter 0 no false off,$(CARGO_DEFAULT_FEATURES)),)
+CARGO_DEFAULT_FEATURE_ARG := --no-default-features
+else
+$(error CARGO_DEFAULT_FEATURES must be 0/1, no/yes, false/true, or off/on: $(CARGO_DEFAULT_FEATURES))
+endif
 # Per-arch defaults when this Makefile is invoked directly; root targets pass MEM explicitly.
 ifeq ($(ARCH),loongarch64)
 MEM ?= 16G
@@ -65,7 +73,7 @@ prepare-cargo-config:
 
 kernel:
 	@$(MAKE) --no-print-directory prepare-cargo-config
-	@cargo build $(MODE_ARG) --target $(TARGET) $(CARGO_FEATURE_ARG)
+	@cargo build $(MODE_ARG) --target $(TARGET) $(CARGO_DEFAULT_FEATURE_ARG) $(CARGO_FEATURE_ARG)
 
 run: kernel
 	@$(MAKE) --no-print-directory run-inner

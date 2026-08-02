@@ -6,8 +6,10 @@ use crate::fs::{
 };
 use crate::mm::record_exec_metadata_read;
 use crate::syscall::SyscallContext;
+#[cfg(feature = "fanotify")]
+use crate::syscall::fs::fanotify_notify_open_exec_at;
+use crate::syscall::fs::path_context_from;
 use crate::syscall::fs::permissions::{AccessSubject, check_execute_permission};
-use crate::syscall::fs::{fanotify_notify_open_exec_at, path_context_from};
 use crate::syscall::user_ptr::{PATH_MAX, read_user_c_string_ctx, read_user_usize_ctx};
 use crate::task::current_process;
 use crate::uapi::errno::{Errno, KResult};
@@ -377,8 +379,10 @@ fn read_exec_file_in(
     follow_final_symlink: bool,
 ) -> KResult<ExecImageSource> {
     check_exec_file_in(context.clone(), path, follow_final_symlink)?;
+    #[cfg(feature = "fanotify")]
     let event_path = normalize_path_at_root(context.root_path(), context.cwd_path(), path);
     let app_file = open_file_in(context, path, OpenFlags::RDONLY)?;
+    #[cfg(feature = "fanotify")]
     if let Some(event_path) = event_path.as_deref() {
         fanotify_notify_open_exec_at(&app_file, event_path);
     }

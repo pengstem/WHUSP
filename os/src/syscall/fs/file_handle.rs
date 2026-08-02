@@ -4,9 +4,9 @@ use super::super::user_ptr::{
 use super::fd::{get_file_by_fd, install_file_fd};
 use super::path::{AtPath, open_flags_from_user_bits, path_context_from, resolve_at_path};
 use super::uapi::{AT_EMPTY_PATH, AT_FDCWD};
-use crate::fs::{
-    FsError, MountId, VfsNodeId, fsid_for_mount, lookup_path_in, open_file_handle_node,
-};
+#[cfg(feature = "fanotify")]
+use crate::fs::fsid_for_mount;
+use crate::fs::{FsError, MountId, VfsNodeId, lookup_path_in, open_file_handle_node};
 use crate::task::{current_process, current_user_token};
 use crate::uapi::errno::{Errno, KResult};
 
@@ -22,6 +22,7 @@ const WHUSP_FILE_HANDLE_TYPE: i32 = 0x5753_4855;
 const CAP_DAC_READ_SEARCH: usize = 2;
 
 pub(crate) const WHUSP_FILE_HANDLE_BYTES: usize = 16;
+#[cfg(feature = "fanotify")]
 pub(crate) const WHUSP_FILE_HANDLE_RECORD_LEN: usize =
     FILE_HANDLE_HEADER_LEN + WHUSP_FILE_HANDLE_BYTES;
 
@@ -32,6 +33,7 @@ struct LinuxFileHandleHeader {
     handle_type: i32,
 }
 
+#[cfg(feature = "fanotify")]
 pub(crate) fn file_handle_fsid(node: VfsNodeId) -> [i32; 2] {
     fsid_for_mount(node.mount_id)
 }
@@ -43,6 +45,7 @@ fn encode_file_handle_payload(node: VfsNodeId) -> [u8; WHUSP_FILE_HANDLE_BYTES] 
     payload
 }
 
+#[cfg(feature = "fanotify")]
 pub(crate) fn write_file_handle_record(record: &mut [u8], node: VfsNodeId) {
     let payload = encode_file_handle_payload(node);
     record[0..4].copy_from_slice(&(WHUSP_FILE_HANDLE_BYTES as u32).to_ne_bytes());

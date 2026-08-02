@@ -21,11 +21,13 @@ use crate::drivers::block_cache;
 use crate::mm::frame_cache_stats;
 use crate::mm::{VirtAddr, exec_load_stats_content, frame_stats};
 use crate::perf;
+use crate::syscall::pidfd_fdinfo;
+#[cfg(feature = "inotify")]
 use crate::syscall::{
-    INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES,
-    fanotify_evict_evictable_marks, fanotify_fdinfo, fanotify_max_queued_events, inotify_fdinfo,
-    pidfd_fdinfo,
+    INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES, inotify_fdinfo,
 };
+#[cfg(feature = "fanotify")]
+use crate::syscall::{fanotify_evict_evictable_marks, fanotify_fdinfo, fanotify_max_queued_events};
 use crate::task::{
     ProcessProcSnapshot, TaskControlBlock, TaskStatus, list_process_snapshots, pid2process,
     processes_snapshot,
@@ -77,11 +79,17 @@ const MAX_USER_NAMESPACES_INO: u32 = 66;
 const SYS_VM_DIR_INO: u32 = 28;
 const DROP_CACHES_INO: u32 = 29;
 const VFS_CACHE_PRESSURE_INO: u32 = 31;
+#[cfg(feature = "fanotify")]
 const SYS_FS_FANOTIFY_DIR_INO: u32 = 32;
+#[cfg(feature = "fanotify")]
 const FANOTIFY_MAX_QUEUED_EVENTS_INO: u32 = 33;
+#[cfg(feature = "inotify")]
 const SYS_FS_INOTIFY_DIR_INO: u32 = 34;
+#[cfg(feature = "inotify")]
 const INOTIFY_MAX_QUEUED_EVENTS_INO: u32 = 35;
+#[cfg(feature = "inotify")]
 const INOTIFY_MAX_USER_INSTANCES_INO: u32 = 36;
+#[cfg(feature = "inotify")]
 const INOTIFY_MAX_USER_WATCHES_INO: u32 = 37;
 const BLOCK_CACHE_STATS_INO: u32 = 38;
 const DENTRY_CACHE_STATS_INO: u32 = 39;
@@ -208,7 +216,9 @@ enum ProcNode {
     SysKernelDir,
     SysUserDir,
     SysFsDir,
+    #[cfg(feature = "fanotify")]
     SysFsFanotifyDir,
+    #[cfg(feature = "inotify")]
     SysFsInotifyDir,
     SysNetDir,
     SysNetCoreDir,
@@ -236,9 +246,13 @@ enum ProcNode {
     CorePattern,
     DropCaches,
     VfsCachePressure,
+    #[cfg(feature = "fanotify")]
     FanotifyMaxQueuedEvents,
+    #[cfg(feature = "inotify")]
     InotifyMaxQueuedEvents,
+    #[cfg(feature = "inotify")]
     InotifyMaxUserInstances,
+    #[cfg(feature = "inotify")]
     InotifyMaxUserWatches,
     BlockCacheStats,
     DentryCacheStats,
@@ -519,7 +533,9 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         MAX_USER_NAMESPACES_INO => Some(ProcNode::MaxUserNamespaces),
         PID_MAX_INO => Some(ProcNode::PidMax),
         SYS_FS_DIR_INO => Some(ProcNode::SysFsDir),
+        #[cfg(feature = "fanotify")]
         SYS_FS_FANOTIFY_DIR_INO => Some(ProcNode::SysFsFanotifyDir),
+        #[cfg(feature = "inotify")]
         SYS_FS_INOTIFY_DIR_INO => Some(ProcNode::SysFsInotifyDir),
         PIPE_MAX_SIZE_INO => Some(ProcNode::PipeMaxSize),
         PIPE_USER_PAGES_SOFT_INO => Some(ProcNode::PipeUserPagesSoft),
@@ -554,9 +570,13 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         CORE_PATTERN_INO => Some(ProcNode::CorePattern),
         DROP_CACHES_INO => Some(ProcNode::DropCaches),
         VFS_CACHE_PRESSURE_INO => Some(ProcNode::VfsCachePressure),
+        #[cfg(feature = "fanotify")]
         FANOTIFY_MAX_QUEUED_EVENTS_INO => Some(ProcNode::FanotifyMaxQueuedEvents),
+        #[cfg(feature = "inotify")]
         INOTIFY_MAX_QUEUED_EVENTS_INO => Some(ProcNode::InotifyMaxQueuedEvents),
+        #[cfg(feature = "inotify")]
         INOTIFY_MAX_USER_INSTANCES_INO => Some(ProcNode::InotifyMaxUserInstances),
+        #[cfg(feature = "inotify")]
         INOTIFY_MAX_USER_WATCHES_INO => Some(ProcNode::InotifyMaxUserWatches),
         BLOCK_CACHE_STATS_INO => Some(ProcNode::BlockCacheStats),
         DENTRY_CACHE_STATS_INO => Some(ProcNode::DentryCacheStats),
@@ -633,13 +653,15 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
 
 fn node_kind(node: ProcNode) -> FsNodeKind {
     match node {
+        #[cfg(feature = "fanotify")]
+        ProcNode::SysFsFanotifyDir => FsNodeKind::Directory,
+        #[cfg(feature = "inotify")]
+        ProcNode::SysFsInotifyDir => FsNodeKind::Directory,
         ProcNode::Root
         | ProcNode::SysDir
         | ProcNode::SysKernelDir
         | ProcNode::SysUserDir
         | ProcNode::SysFsDir
-        | ProcNode::SysFsFanotifyDir
-        | ProcNode::SysFsInotifyDir
         | ProcNode::SysNetDir
         | ProcNode::SysNetCoreDir
         | ProcNode::SysNetIpv4Dir
@@ -1006,11 +1028,13 @@ fn sys_fs_entries() -> Vec<RawDirEntry> {
         name: "lease-break-time".into(),
         dtype: DT_REG,
     });
+    #[cfg(feature = "fanotify")]
     entries.push(RawDirEntry {
         ino: SYS_FS_FANOTIFY_DIR_INO,
         name: "fanotify".into(),
         dtype: DT_DIR,
     });
+    #[cfg(feature = "inotify")]
     entries.push(RawDirEntry {
         ino: SYS_FS_INOTIFY_DIR_INO,
         name: "inotify".into(),
@@ -1019,6 +1043,7 @@ fn sys_fs_entries() -> Vec<RawDirEntry> {
     entries
 }
 
+#[cfg(feature = "fanotify")]
 fn sys_fs_fanotify_entries() -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -1039,6 +1064,7 @@ fn sys_fs_fanotify_entries() -> Vec<RawDirEntry> {
     entries
 }
 
+#[cfg(feature = "inotify")]
 fn sys_fs_inotify_entries() -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -1917,18 +1943,22 @@ fn pipe_user_pages_soft_content() -> String {
     format!("{}\n", PROC_PIPE_USER_PAGES_SOFT.load(Ordering::Relaxed))
 }
 
+#[cfg(feature = "fanotify")]
 fn fanotify_max_queued_events_content() -> String {
     format!("{}\n", fanotify_max_queued_events())
 }
 
+#[cfg(feature = "inotify")]
 fn inotify_max_queued_events_content() -> String {
     format!("{INOTIFY_MAX_QUEUED_EVENTS}\n")
 }
 
+#[cfg(feature = "inotify")]
 fn inotify_max_user_instances_content() -> String {
     format!("{INOTIFY_MAX_USER_INSTANCES}\n")
 }
 
+#[cfg(feature = "inotify")]
 fn inotify_max_user_watches_content() -> String {
     format!("{INOTIFY_MAX_USER_WATCHES}\n")
 }
@@ -1972,15 +2002,23 @@ fn pid_fdinfo_content(pid: usize, fd: usize) -> FsResult<String> {
     if let Some(pidfd_info) = pidfd_fdinfo(&file, flags) {
         return Ok(pidfd_info);
     }
-    let fanotify_info = fanotify_fdinfo(&file).unwrap_or_default();
-    let inotify_info = inotify_fdinfo(&file).unwrap_or_default();
+    #[allow(unused_mut)]
+    let mut notification_info = String::new();
+    #[cfg(feature = "fanotify")]
+    if let Some(info) = fanotify_fdinfo(&file) {
+        notification_info.push_str(&info);
+    }
+    #[cfg(feature = "inotify")]
+    if let Some(info) = inotify_fdinfo(&file) {
+        notification_info.push_str(&info);
+    }
     // CONTEXT: Linux exposes fanotify marks through /proc/<pid>/fdinfo/<fd>.
     // This metadata-only subset reports enough mark/ignored_mask fields for
     // LTP fanotify09/fanotify10 to distinguish groups with and without ignore
     // marks; inode and device numbers are still placeholders.
     let mnt_id = file.vfs_mount_id().map(|mount_id| mount_id.0).unwrap_or(0);
     Ok(format!(
-        "pos:\t0\nflags:\t{flags:o}\nmnt_id:\t{mnt_id}\n{fanotify_info}{inotify_info}"
+        "pos:\t0\nflags:\t{flags:o}\nmnt_id:\t{mnt_id}\n{notification_info}"
     ))
 }
 
@@ -2151,6 +2189,7 @@ fn write_lease_break_time(buf: &[u8], offset: u64) -> usize {
     buf.len()
 }
 
+#[cfg(feature = "inotify")]
 fn write_inotify_max_user_instances(buf: &[u8], offset: u64) -> usize {
     if offset != 0 {
         return 0;
@@ -2202,6 +2241,7 @@ fn write_net_core_usize(cell: &AtomicUsize, buf: &[u8], offset: u64) -> usize {
 
 fn write_drop_caches(buf: &[u8], _offset: u64) -> usize {
     PROC_MEMINFO_CACHED_KB.store(0, Ordering::Relaxed);
+    #[cfg(feature = "fanotify")]
     fanotify_evict_evictable_marks();
     buf.len()
 }
@@ -2478,9 +2518,13 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::CorePattern => Ok(core_pattern_content()),
         ProcNode::PipeMaxSize => Ok(pipe_max_size_content().into_bytes()),
         ProcNode::PipeUserPagesSoft => Ok(pipe_user_pages_soft_content().into_bytes()),
+        #[cfg(feature = "fanotify")]
         ProcNode::FanotifyMaxQueuedEvents => Ok(fanotify_max_queued_events_content().into_bytes()),
+        #[cfg(feature = "inotify")]
         ProcNode::InotifyMaxQueuedEvents => Ok(inotify_max_queued_events_content().into_bytes()),
+        #[cfg(feature = "inotify")]
         ProcNode::InotifyMaxUserInstances => Ok(inotify_max_user_instances_content().into_bytes()),
+        #[cfg(feature = "inotify")]
         ProcNode::InotifyMaxUserWatches => Ok(inotify_max_user_watches_content().into_bytes()),
         ProcNode::BlockCacheStats => Ok(block_cache::stats_content().into_bytes()),
         ProcNode::DentryCacheStats => Ok(dentry_cache::stats_content().into_bytes()),
@@ -2604,13 +2648,15 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
                 .map(pid_comm_content)
                 .ok_or(FsError::NotFound)
         }
+        #[cfg(feature = "fanotify")]
+        ProcNode::SysFsFanotifyDir => Err(FsError::IsDir),
+        #[cfg(feature = "inotify")]
+        ProcNode::SysFsInotifyDir => Err(FsError::IsDir),
         ProcNode::Root
         | ProcNode::SysDir
         | ProcNode::SysKernelDir
         | ProcNode::SysUserDir
         | ProcNode::SysFsDir
-        | ProcNode::SysFsFanotifyDir
-        | ProcNode::SysFsInotifyDir
         | ProcNode::SysNetDir
         | ProcNode::SysNetCoreDir
         | ProcNode::SysNetIpv4Dir
@@ -2778,10 +2824,13 @@ impl LegacyLookupOps for ProcFs {
                 "pipe-max-size" => Ok((PIPE_MAX_SIZE_INO, FsNodeKind::RegularFile)),
                 "pipe-user-pages-soft" => Ok((PIPE_USER_PAGES_SOFT_INO, FsNodeKind::RegularFile)),
                 "lease-break-time" => Ok((LEASE_BREAK_TIME_INO, FsNodeKind::RegularFile)),
+                #[cfg(feature = "fanotify")]
                 "fanotify" => Ok((SYS_FS_FANOTIFY_DIR_INO, FsNodeKind::Directory)),
+                #[cfg(feature = "inotify")]
                 "inotify" => Ok((SYS_FS_INOTIFY_DIR_INO, FsNodeKind::Directory)),
                 _ => Err(FsError::NotFound),
             },
+            #[cfg(feature = "fanotify")]
             ProcNode::SysFsFanotifyDir => match component {
                 "." => Ok((SYS_FS_FANOTIFY_DIR_INO, FsNodeKind::Directory)),
                 ".." => Ok((SYS_FS_DIR_INO, FsNodeKind::Directory)),
@@ -2790,6 +2839,7 @@ impl LegacyLookupOps for ProcFs {
                 }
                 _ => Err(FsError::NotFound),
             },
+            #[cfg(feature = "inotify")]
             ProcNode::SysFsInotifyDir => match component {
                 "." => Ok((SYS_FS_INOTIFY_DIR_INO, FsNodeKind::Directory)),
                 ".." => Ok((SYS_FS_DIR_INO, FsNodeKind::Directory)),
@@ -2998,9 +3048,11 @@ impl LegacyLookupOps for ProcFs {
             ProcNode::SysKernelDir => write_dir_entries(&sys_kernel_entries(), offset, buf),
             ProcNode::SysUserDir => write_dir_entries(&sys_user_entries(), offset, buf),
             ProcNode::SysFsDir => write_dir_entries(&sys_fs_entries(), offset, buf),
+            #[cfg(feature = "fanotify")]
             ProcNode::SysFsFanotifyDir => {
                 write_dir_entries(&sys_fs_fanotify_entries(), offset, buf)
             }
+            #[cfg(feature = "inotify")]
             ProcNode::SysFsInotifyDir => write_dir_entries(&sys_fs_inotify_entries(), offset, buf),
             ProcNode::SysVmDir => write_dir_entries(&sys_vm_entries(), offset, buf),
             ProcNode::SysNetDir => write_dir_entries(&sys_net_entries(), offset, buf),
@@ -3076,13 +3128,15 @@ impl LegacyMetadataOps for ProcFs {
     fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
         let node = decode_node(ino).ok_or(FsError::NotFound)?;
         let mut stat = match node {
+            #[cfg(feature = "fanotify")]
+            ProcNode::SysFsFanotifyDir => FileStat::with_mode(S_IFDIR | 0o555),
+            #[cfg(feature = "inotify")]
+            ProcNode::SysFsInotifyDir => FileStat::with_mode(S_IFDIR | 0o555),
             ProcNode::Root
             | ProcNode::SysDir
             | ProcNode::SysKernelDir
             | ProcNode::SysUserDir
             | ProcNode::SysFsDir
-            | ProcNode::SysFsFanotifyDir
-            | ProcNode::SysFsInotifyDir
             | ProcNode::SysNetDir
             | ProcNode::SysNetIpv4Dir
             | ProcNode::SysNetIpv4ConfDir
@@ -3100,6 +3154,8 @@ impl LegacyMetadataOps for ProcFs {
             ProcNode::SelfSymlink | ProcNode::PidExe(_) | ProcNode::PidFdEntry(_, _) => {
                 FileStat::with_mode(S_IFLNK | 0o777)
             }
+            #[cfg(feature = "inotify")]
+            ProcNode::InotifyMaxUserInstances => FileStat::with_mode(S_IFREG | 0o644),
             ProcNode::PidMax
             | ProcNode::ShmMax
             | ProcNode::ShmMni
@@ -3115,7 +3171,6 @@ impl LegacyMetadataOps for ProcFs {
             | ProcNode::LeaseBreakTime
             | ProcNode::NetCoreBusyRead
             | ProcNode::NetCoreBusyPoll
-            | ProcNode::InotifyMaxUserInstances
             | ProcNode::NetIpv4ConfLoTag
             | ProcNode::DropCaches
             | ProcNode::VfsCachePressure
@@ -3162,6 +3217,8 @@ impl LegacyMetadataOps for ProcFs {
 impl LegacyDataOps for ProcFs {
     fn set_len(&mut self, _ino: u32, _len: u64) -> FsResult {
         match decode_node(_ino).ok_or(FsError::NotFound)? {
+            #[cfg(feature = "inotify")]
+            ProcNode::InotifyMaxUserInstances => Ok(()),
             ProcNode::PidMax
             | ProcNode::ShmMax
             | ProcNode::ShmMni
@@ -3177,7 +3234,6 @@ impl LegacyDataOps for ProcFs {
             | ProcNode::LeaseBreakTime
             | ProcNode::NetCoreBusyRead
             | ProcNode::NetCoreBusyPoll
-            | ProcNode::InotifyMaxUserInstances
             | ProcNode::NetIpv4ConfLoTag
             | ProcNode::DropCaches
             | ProcNode::VfsCachePressure
@@ -3251,6 +3307,7 @@ impl LegacyDataOps for ProcFs {
             Some(ProcNode::CorePattern) => write_core_pattern(buf, offset),
             Some(ProcNode::PipeMaxSize) => write_pipe_max_size(buf, offset),
             Some(ProcNode::LeaseBreakTime) => write_lease_break_time(buf, offset),
+            #[cfg(feature = "inotify")]
             Some(ProcNode::InotifyMaxUserInstances) => {
                 write_inotify_max_user_instances(buf, offset)
             }

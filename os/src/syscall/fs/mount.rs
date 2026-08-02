@@ -1,17 +1,20 @@
+#[cfg(feature = "inotify")]
+use crate::fs::mounted_source_at;
 use crate::fs::{
     DetachedMountFile, FsContextFile, FsContextStateError, FsNodeKind, MountError, MountId,
     MountPropagation, OpenFlags, WorkingDir, lookup_existing_dir_in, lookup_mount_target_dir_in,
     lookup_path_in, loop_device_is_attached, loop_device_is_read_only, mount_bind_at,
     mount_block_device_at, mount_ext_scratch_at, mount_fat_device_at, mount_nfs_compat_at,
     mount_overlay_compat_at, mount_proc_at, mount_stat_flags_from_linux_mount_flags,
-    mount_tmpfs_at, mounted_source_at, move_mount_at, normalize_path_at_root, open_file_in,
-    remount_at, set_mount_propagation_at, set_mount_stat_flags, unmount_at,
+    mount_tmpfs_at, move_mount_at, normalize_path_at_root, open_file_in, remount_at,
+    set_mount_propagation_at, set_mount_stat_flags, unmount_at,
 };
 use crate::task::{CAP_SYS_ADMIN, current_process, current_user_token};
 use alloc::string::String;
 
 use super::super::user_ptr::{PATH_MAX, read_user_c_string};
 use super::fd::{get_file_by_fd, install_file_fd};
+#[cfg(feature = "inotify")]
 use super::inotify::inotify_notify_unmount;
 use super::path::{
     AtPath, check_current_access_path_prefixes_from, normalize_path_from, path_context_from,
@@ -833,6 +836,7 @@ pub fn sys_umount2(target: *const u8, flags: i32) -> KResult {
         target.as_str(),
     )
     .ok_or(Errno::ENOENT)?;
+    #[cfg(feature = "inotify")]
     let mounted_source = mounted_source_at(snapshot.context.namespace_id(), target_dir);
     unmount_at(
         snapshot.context.namespace_id(),
@@ -842,6 +846,7 @@ pub fn sys_umount2(target: *const u8, flags: i32) -> KResult {
         flags & MNT_EXPIRE != 0,
     )
     .map_err(mount_error_to_errno)?;
+    #[cfg(feature = "inotify")]
     if let Some(mount) = mounted_source {
         inotify_notify_unmount(mount);
     }

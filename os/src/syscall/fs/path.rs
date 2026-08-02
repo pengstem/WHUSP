@@ -5,11 +5,13 @@ use super::super::user_ptr::{
     read_user_c_string, read_user_c_string_ctx, read_user_value, read_user_value_ctx,
     translated_byte_buffer_checked_ctx, translated_byte_buffer_checked_with_mmap_fault_ctx,
 };
+#[cfg(feature = "fanotify")]
 use super::fanotify::{
     fanotify_notify_create, fanotify_notify_delete, fanotify_notify_modify, fanotify_notify_move,
     fanotify_notify_open, fanotify_notify_open_at,
 };
 use super::fd::{get_fd_entry_by_fd, get_file_by_fd, get_file_by_fd_for_process, install_file_fd};
+#[cfg(feature = "inotify")]
 use super::inotify::{
     inotify_notify_attrib, inotify_notify_create, inotify_notify_delete, inotify_notify_modify,
     inotify_notify_move, inotify_notify_open, inotify_notify_open_at,
@@ -22,12 +24,14 @@ use super::uapi::{
     VALID_ACCESS_MODE, VALID_FACCESSAT_FLAGS, VALID_FACCESSAT2_FLAGS, VALID_LINKAT_FLAGS,
     VALID_RENAME_FLAGS, VALID_UTIMENSAT_FLAGS, W_OK, X_OK,
 };
+#[cfg(any(feature = "fanotify", feature = "inotify"))]
+use crate::fs::lookup_path_in;
 use crate::fs::{
     FS_APPEND_FL, FS_IMMUTABLE_FL, File, FileCreateAttrs, FileStat, FileTimestamp, FsError,
     FsNodeKind, MountId, OpenFlags, PathContext, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK,
     S_IFMT, S_IFREG, S_IFSOCK, WorkingDir, chown_in, create_node_in, link_file_in,
-    link_open_file_in, lookup_dir_with_stat_in, lookup_dir_with_stat_path_in, lookup_path_in,
-    mkdir_in, mount_is_read_only, normalize_path_at_root, open_devfs_child, open_devfs_input_child,
+    link_open_file_in, lookup_dir_with_stat_in, lookup_dir_with_stat_path_in, mkdir_in,
+    mount_is_read_only, normalize_path_at_root, open_devfs_child, open_devfs_input_child,
     open_devfs_misc_child, open_devfs_net_child, open_devfs_pts_child, open_file_in,
     open_file_in_with_attrs, open_static_path, open_tmpfile_in_with_attrs, path_inside_root,
     rename_exchange_in, rename_in, rmdir_in, stat_static_path, symlink_in, truncate_in, tty_attach,
@@ -509,6 +513,7 @@ fn apply_utimensat_to_file(
         return Err(Errno::EPERM);
     }
     file.set_times(times.atime, times.mtime, ctime)?;
+    #[cfg(feature = "inotify")]
     inotify_notify_attrib(&file);
     Ok(0)
 }
@@ -681,6 +686,7 @@ fn do_openat_for_process(
         return install_opened_file(process, file, flags, None);
     }
     let context = path_context_from(&snapshot, dirfd, path)?;
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     let created_file = flags.contains(OpenFlags::CREATE)
         && matches!(
             lookup_path_in(context.clone(), path, !flags.contains(OpenFlags::NOFOLLOW),),
@@ -705,18 +711,28 @@ fn do_openat_for_process(
     } else {
         open_file_in_with_attrs(context, path, flags, create_attrs)?
     };
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     let notify_file = Arc::clone(&file);
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     let notify_path = dir_path.clone();
     let fd = install_opened_file(process, file, flags, dir_path)?;
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     if created_file && let Some(path) = notify_path.as_deref() {
+        #[cfg(feature = "fanotify")]
         fanotify_notify_create(&notify_file, path);
+        #[cfg(feature = "inotify")]
         inotify_notify_create(&notify_file, path);
     }
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     if let Some(path) = notify_path.as_deref() {
+        #[cfg(feature = "fanotify")]
         fanotify_notify_open_at(&notify_file, path);
+        #[cfg(feature = "inotify")]
         inotify_notify_open_at(&notify_file, path);
     } else {
+        #[cfg(feature = "fanotify")]
         fanotify_notify_open(&notify_file);
+        #[cfg(feature = "inotify")]
         inotify_notify_open(&notify_file);
     }
     Ok(fd)
@@ -899,10 +915,14 @@ pub fn sys_truncate(path: *const u8, len: usize) -> KResult {
     check_access_mode(&stat, W_OK, subject)?;
 
     let context = path_context_from(&snapshot, AT_FDCWD, path.as_str())?;
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     let notify_file = open_file_in(context.clone(), path.as_str(), OpenFlags::RDONLY).ok();
     truncate_in(context, path.as_str(), len)?;
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     if let Some(file) = notify_file {
+        #[cfg(feature = "fanotify")]
         fanotify_notify_modify(&file, 1);
+        #[cfg(feature = "inotify")]
         inotify_notify_modify(&file, 1);
     }
     Ok(0)
@@ -1096,6 +1116,7 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> KResult {
     let path = read_user_c_string(token, path, PATH_MAX)?;
     let snapshot = current_process().path_snapshot();
     let context = path_context_from(&snapshot, dirfd, path.as_str())?;
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     let notify_context = context.clone();
     let process = current_process();
     mkdir_in(context.clone(), path.as_str(), mode & !process.umask())?;
@@ -1107,8 +1128,11 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> KResult {
         Some(credentials.fsuid),
         Some(credentials.fsgid),
     )?;
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     if let Ok(file) = open_file_in(notify_context, path.as_str(), OpenFlags::PATH) {
+        #[cfg(feature = "fanotify")]
         fanotify_notify_create(&file, path.as_str());
+        #[cfg(feature = "inotify")]
         inotify_notify_create(&file, path.as_str());
     }
     Ok(0)
@@ -1139,6 +1163,7 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, dev: u64) -> KResul
     let process = current_process();
     let snapshot = process.path_snapshot();
     let context = path_context_from(&snapshot, dirfd, path.as_str())?;
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     let notify_context = context.clone();
     let credentials = process.credentials();
     create_node_in(
@@ -1150,8 +1175,11 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, dev: u64) -> KResul
         credentials.fsgid,
         dev,
     )?;
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     if let Ok(file) = open_file_in(notify_context, path.as_str(), OpenFlags::PATH) {
+        #[cfg(feature = "fanotify")]
         fanotify_notify_create(&file, path.as_str());
+        #[cfg(feature = "inotify")]
         inotify_notify_create(&file, path.as_str());
     }
     Ok(0)
@@ -1165,6 +1193,7 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> KResult {
     let path = read_user_c_string(token, path, PATH_MAX)?;
     let snapshot = current_process().path_snapshot();
     let context = path_context_from(&snapshot, dirfd, path.as_str())?;
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     let notify_file = open_file_in(context.clone(), path.as_str(), OpenFlags::PATH).ok();
     if flags & AT_REMOVEDIR != 0 {
         rmdir_in(context, path.as_str())?;
@@ -1174,8 +1203,11 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> KResult {
         check_unlink_file_access(&snapshot, dirfd, context.clone(), path.as_str(), subject)?;
         unlink_file_in(context, path.as_str())?;
     }
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     if let Some(file) = notify_file {
+        #[cfg(feature = "fanotify")]
         fanotify_notify_delete(&file, path.as_str());
+        #[cfg(feature = "inotify")]
         inotify_notify_delete(&file, path.as_str());
     }
     Ok(0)
@@ -1310,6 +1342,7 @@ pub fn sys_renameat2(
         rename_exchange_in(old_context, oldpath.as_str(), new_context, newpath.as_str())?;
         return Ok(0);
     }
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     let old_notify_file = open_file_in(old_context.clone(), oldpath.as_str(), OpenFlags::PATH).ok();
     rename_in(
         old_context,
@@ -1318,10 +1351,13 @@ pub fn sys_renameat2(
         newpath.as_str(),
         flags & RENAME_NOREPLACE != 0,
     )?;
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     if let Some(old_file) = old_notify_file
         && let Ok(new_file) = open_file_in(new_context, newpath.as_str(), OpenFlags::PATH)
     {
+        #[cfg(feature = "fanotify")]
         fanotify_notify_move(&old_file, oldpath.as_str(), &new_file, newpath.as_str());
+        #[cfg(feature = "inotify")]
         inotify_notify_move(&old_file, oldpath.as_str(), &new_file, newpath.as_str());
     }
     Ok(0)

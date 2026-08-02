@@ -1,7 +1,9 @@
+#[cfg(feature = "ptrace")]
+use super::ptrace_note_exec_current;
 use super::{
     SigAltStack, SignalAction, current_task, prepare_exec_thread_group,
     process::{ProcessControlBlock, comm_from_cmdline, empty_process_pkey_rights},
-    ptrace_note_exec_current, refresh_current_user_token,
+    refresh_current_user_token,
 };
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::{File, VfsNodeId, track_regular_file_executable, untrack_regular_file_executable};
@@ -482,6 +484,7 @@ impl ProcessControlBlock {
         #[cfg(not(target_arch = "riscv64"))]
         refresh_current_user_token();
         self.release_vfork_parent();
+        #[cfg(feature = "ptrace")]
         ptrace_note_exec_current();
         Ok(())
     }

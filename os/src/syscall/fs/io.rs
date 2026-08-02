@@ -18,11 +18,13 @@ use super::super::user_ptr::{
     read_user_value_with_mmap_fault, translated_byte_buffer_checked_with_mmap_fault,
     translated_byte_buffer_checked_with_mmap_fault_ctx, write_user_value,
 };
+#[cfg(feature = "fanotify")]
 use super::fanotify::{fanotify_notify_access, fanotify_notify_modify};
 use super::fd::{
     get_fd_entry_by_fd, get_fd_entry_with_fsize_limit_for_process, get_file_by_fd,
     get_file_by_fd_for_process,
 };
+#[cfg(feature = "inotify")]
 use super::inotify::{inotify_notify_access, inotify_notify_modify};
 use super::uapi::IOV_MAX;
 use crate::uapi::errno::{Errno, KResult};
@@ -1471,7 +1473,9 @@ fn sys_vmsplice_write(
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(_) if total_written > 0 => {
+                #[cfg(feature = "fanotify")]
                 fanotify_notify_modify(&file, total_written);
+                #[cfg(feature = "inotify")]
                 inotify_notify_modify(&file, total_written);
                 return Ok(total_written as isize);
             }
@@ -1487,7 +1491,9 @@ fn sys_vmsplice_write(
         }
     }
 
+    #[cfg(feature = "fanotify")]
     fanotify_notify_modify(&file, total_written);
+    #[cfg(feature = "inotify")]
     inotify_notify_modify(&file, total_written);
     checked_write_result_for_entry(&entry, requested_len, total_written)
 }
@@ -1520,7 +1526,9 @@ fn sys_vmsplice_read(
         }
     }
 
+    #[cfg(feature = "fanotify")]
     fanotify_notify_access(&file, total_read);
+    #[cfg(feature = "inotify")]
     inotify_notify_access(&file, total_read);
     Ok(total_read as isize)
 }
@@ -1632,7 +1640,9 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> KResul
             break;
         }
     }
+    #[cfg(feature = "fanotify")]
     fanotify_notify_access(&file, total_read);
+    #[cfg(feature = "inotify")]
     inotify_notify_access(&file, total_read);
     Ok(total_read as isize)
 }
@@ -1692,7 +1702,9 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, len: usize, offset: usize) -> KRe
         }
         total_written
     };
+    #[cfg(feature = "fanotify")]
     fanotify_notify_modify(&file, total_written);
+    #[cfg(feature = "inotify")]
     inotify_notify_modify(&file, total_written);
     checked_write_result(allowed_len, total_written)
 }
@@ -1728,7 +1740,9 @@ pub fn sys_preadv(
     if iovcnt > 1 {
         let total_read =
             preadv_regular_file_coalesced(file.as_ref(), cursor, offset, requested_len)?;
+        #[cfg(feature = "fanotify")]
         fanotify_notify_access(&file, total_read);
+        #[cfg(feature = "inotify")]
         inotify_notify_access(&file, total_read);
         return Ok(total_read as isize);
     }
@@ -1741,13 +1755,17 @@ pub fn sys_preadv(
             total_read += read;
             offset = offset.checked_add(read).ok_or(Errno::EINVAL)?;
             if read < slice.len() {
+                #[cfg(feature = "fanotify")]
                 fanotify_notify_access(&file, total_read);
+                #[cfg(feature = "inotify")]
                 inotify_notify_access(&file, total_read);
                 return Ok(total_read as isize);
             }
         }
     }
+    #[cfg(feature = "fanotify")]
     fanotify_notify_access(&file, total_read);
+    #[cfg(feature = "inotify")]
     inotify_notify_access(&file, total_read);
     Ok(total_read as isize)
 }
@@ -1816,7 +1834,9 @@ pub fn sys_pwritev(
         } else {
             pwritev_regular_file_coalesced(file.as_ref(), cursor, offset, allowed_len)?
         };
+        #[cfg(feature = "fanotify")]
         fanotify_notify_modify(&file, total_written);
+        #[cfg(feature = "inotify")]
         inotify_notify_modify(&file, total_written);
         return checked_write_result(requested_len, total_written);
     }
@@ -1828,7 +1848,9 @@ pub fn sys_pwritev(
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(_) if total_written > 0 => {
+                #[cfg(feature = "fanotify")]
                 fanotify_notify_modify(&file, total_written);
+                #[cfg(feature = "inotify")]
                 inotify_notify_modify(&file, total_written);
                 return Ok(total_written as isize);
             }
@@ -1847,7 +1869,9 @@ pub fn sys_pwritev(
             remaining_len = remaining_len.saturating_sub(written);
             offset = offset.checked_add(written).ok_or(Errno::EINVAL)?;
             if written < slice.len() {
+                #[cfg(feature = "fanotify")]
                 fanotify_notify_modify(&file, total_written);
+                #[cfg(feature = "inotify")]
                 inotify_notify_modify(&file, total_written);
                 return checked_write_result(requested_len, total_written);
             }
@@ -1856,7 +1880,9 @@ pub fn sys_pwritev(
             break;
         }
     }
+    #[cfg(feature = "fanotify")]
     fanotify_notify_modify(&file, total_written);
+    #[cfg(feature = "inotify")]
     inotify_notify_modify(&file, total_written);
     checked_write_result(requested_len, total_written)
 }
@@ -1914,7 +1940,9 @@ pub fn sys_write_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize
         UserBufferAccess::Read,
     )?;
     let written = write_with_status_flags(&entry, UserBuffer::new(buffers));
+    #[cfg(feature = "fanotify")]
     fanotify_notify_modify(&file, written);
+    #[cfg(feature = "inotify")]
     inotify_notify_modify(&file, written);
     checked_write_result_for_entry(&entry, allowed_len, written)
 }
@@ -2027,7 +2055,9 @@ fn sys_writev_with_iovecs(
         } else {
             writev_regular_file_coalesced(&entry, cursor, allowed_len)?
         };
+        #[cfg(feature = "fanotify")]
         fanotify_notify_modify(&file, total_written);
+        #[cfg(feature = "inotify")]
         inotify_notify_modify(&file, total_written);
         return checked_write_result_for_entry(&entry, requested_len, total_written);
     }
@@ -2039,7 +2069,9 @@ fn sys_writev_with_iovecs(
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(_) if total_written > 0 => {
+                #[cfg(feature = "fanotify")]
                 fanotify_notify_modify(&file, total_written);
+                #[cfg(feature = "inotify")]
                 inotify_notify_modify(&file, total_written);
                 return Ok(total_written as isize);
             }
@@ -2057,7 +2089,9 @@ fn sys_writev_with_iovecs(
             break;
         }
     }
+    #[cfg(feature = "fanotify")]
     fanotify_notify_modify(&file, total_written);
+    #[cfg(feature = "inotify")]
     inotify_notify_modify(&file, total_written);
     checked_write_result_for_entry(&entry, requested_len, total_written)
 }
@@ -2101,7 +2135,9 @@ fn sys_readv_with_iovecs(token: usize, fd: usize, iovecs: UserIovecs, iovcnt: us
     if reuse_checked_range {
         let buffers = collect_iovec_buffers(cursor, requested_len)?;
         let total_read = file.read(UserBuffer::new(buffers));
+        #[cfg(feature = "fanotify")]
         fanotify_notify_access(&file, total_read);
+        #[cfg(feature = "inotify")]
         inotify_notify_access(&file, total_read);
         return Ok(total_read as isize);
     }
@@ -2116,7 +2152,9 @@ fn sys_readv_with_iovecs(token: usize, fd: usize, iovecs: UserIovecs, iovcnt: us
             break;
         }
     }
+    #[cfg(feature = "fanotify")]
     fanotify_notify_access(&file, total_read);
+    #[cfg(feature = "inotify")]
     inotify_notify_access(&file, total_read);
     Ok(total_read as isize)
 }
@@ -2136,7 +2174,9 @@ pub fn sys_read_ctx(ctx: &SyscallContext, fd: usize, buf: *const u8, len: usize)
     let buffers =
         translated_byte_buffer_checked_with_mmap_fault_ctx(ctx, buf, len, UserBufferAccess::Write)?;
     let read = file.read(UserBuffer::new(buffers));
+    #[cfg(feature = "fanotify")]
     fanotify_notify_access(&file, read);
+    #[cfg(feature = "inotify")]
     inotify_notify_access(&file, read);
     Ok(read as isize)
 }

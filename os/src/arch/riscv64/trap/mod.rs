@@ -93,6 +93,9 @@ pub fn trap_handler() -> ! {
             let syscall_pc = trap_pc;
             let (syscall_nr, syscall_args, syscall_sp) =
                 syscall_entry.expect("syscall entry snapshot must exist for UserEnvCall");
+            #[cfg(not(feature = "ptrace"))]
+            let _ = syscall_sp;
+            #[cfg(feature = "ptrace")]
             crate::task::ptrace_syscall_enter_stop_for_task(
                 &process,
                 syscall_nr,
@@ -126,13 +129,16 @@ pub fn trap_handler() -> ! {
             // for restartable handlers.
             interrupted_pc = cx.sepc;
             cx.x[10] = result as usize;
+            #[cfg(feature = "ptrace")]
             let syscall_exit_pc = cx.sepc;
+            #[cfg(feature = "ptrace")]
             let syscall_exit_sp = cx.x[2];
             let syscall_pc_if_interrupted = if result == -(Errno::EINTR as isize) {
                 Some(syscall_pc)
             } else {
                 None
             };
+            #[cfg(feature = "ptrace")]
             if crate::task::ptrace_syscall_exit_stop_for_task(
                 &process,
                 result,
@@ -141,6 +147,7 @@ pub fn trap_handler() -> ! {
             ) {
                 interrupted_pc = trap_cx_of_task(&task).sepc;
             }
+            #[cfg(feature = "ptrace")]
             if crate::task::ptrace_stop_task_if_needed(&task, &process) {
                 interrupted_pc = trap_cx_of_task(&task).sepc;
             }
@@ -223,6 +230,7 @@ pub fn trap_handler() -> ! {
             );
         }
     }
+    #[cfg(feature = "ptrace")]
     if !signal_delivery_attempted && crate::task::ptrace_stop_task_if_needed(&task, &process) {
         interrupted_pc = trap_cx_of_task(&task).sepc;
     }

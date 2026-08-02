@@ -1,7 +1,9 @@
+#[cfg(any(feature = "fanotify", feature = "inotify"))]
+use crate::fs::open_file_in;
 use crate::fs::{
     FileStat, FileSystemStat, FsNodeKind, MountId, OpenFlags, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
     S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, VfsNodeId, chmod_in, chown_in, fsid_for_mount,
-    lookup_path_in, mount_is_read_only, nfs_compat_source_path, open_file_in, stat_devfs_child,
+    lookup_path_in, mount_is_read_only, nfs_compat_source_path, stat_devfs_child,
     stat_devfs_input_child, stat_devfs_misc_child, stat_devfs_net_child, stat_devfs_pts_child,
     stat_direct_regular_child_in, stat_full_in, stat_in, stat_static_path, statfs_for_mount,
 };
@@ -15,8 +17,10 @@ use super::super::user_ptr::{
     translated_byte_buffer_checked_with_mmap_fault, try_read_direct_path_component_ctx,
     write_user_value_ctx,
 };
+#[cfg(feature = "fanotify")]
 use super::fanotify::fanotify_notify_attrib;
 use super::fd::{get_fd_entry_by_fd, get_fd_entry_by_fd_for_process, get_file_by_fd};
+#[cfg(feature = "inotify")]
 use super::inotify::inotify_notify_attrib;
 use super::path::{
     AtPath, check_access_path_prefixes_for_process, check_current_access_path_prefixes_from,
@@ -385,8 +389,11 @@ pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> KResult {
     // visible setgid clearing rule but still lacks full capability handling.
     let context = path_context_from(&snapshot, dirfd, path.as_str())?;
     chmod_in(context.clone(), path.as_str(), true, mode)?;
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     if let Ok(file) = open_file_in(context, path.as_str(), OpenFlags::PATH) {
+        #[cfg(feature = "fanotify")]
         fanotify_notify_attrib(&file);
+        #[cfg(feature = "inotify")]
         inotify_notify_attrib(&file);
     }
     Ok(0)
@@ -410,7 +417,9 @@ pub fn sys_fchmodat2(dirfd: isize, pathname: *const u8, mode: u32, flags: i32) -
             let stat = file.stat()?;
             let mode = prepare_mode_change(stat, mode)?;
             file.set_mode(mode)?;
+            #[cfg(feature = "fanotify")]
             fanotify_notify_attrib(&file);
+            #[cfg(feature = "inotify")]
             inotify_notify_attrib(&file);
             Ok(0)
         }
@@ -421,13 +430,17 @@ pub fn sys_fchmodat2(dirfd: isize, pathname: *const u8, mode: u32, flags: i32) -
             let mode = prepare_mode_change(stat, mode)?;
             let context = path_context_from(&snapshot, dirfd, path)?;
             chmod_in(context.clone(), path, follow_final_symlink, mode)?;
+            #[cfg(any(feature = "fanotify", feature = "inotify"))]
             let open_flags = if follow_final_symlink {
                 OpenFlags::PATH
             } else {
                 OpenFlags::PATH | OpenFlags::NOFOLLOW
             };
+            #[cfg(any(feature = "fanotify", feature = "inotify"))]
             if let Ok(file) = open_file_in(context, path, open_flags) {
+                #[cfg(feature = "fanotify")]
                 fanotify_notify_attrib(&file);
+                #[cfg(feature = "inotify")]
                 inotify_notify_attrib(&file);
             }
             Ok(0)
@@ -444,7 +457,9 @@ pub fn sys_fchmod(fd: usize, mode: u32) -> KResult {
     let stat = file.stat()?;
     let mode = prepare_mode_change(stat, mode)?;
     file.set_mode(mode)?;
+    #[cfg(feature = "fanotify")]
     fanotify_notify_attrib(&file);
+    #[cfg(feature = "inotify")]
     inotify_notify_attrib(&file);
     Ok(0)
 }

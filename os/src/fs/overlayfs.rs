@@ -108,6 +108,7 @@ impl LegacyLookupOps for OverlayFs {
         OVERLAY_ROOT_INO
     }
 
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     fn overlay_real_node(&mut self, ino: u32) -> Option<VfsNodeId> {
         self.overlay_to_real.get(&ino).copied()
     }

@@ -5,6 +5,7 @@ use super::super::{
 };
 use super::FsError;
 use super::FsResult;
+#[cfg(any(feature = "fanotify", feature = "inotify"))]
 use super::VfsNodeId;
 use crate::perf;
 use crate::sync::SleepMutex;
@@ -226,6 +227,7 @@ pub(crate) trait LegacyLookupOps: Send {
         2
     }
 
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     fn overlay_real_node(&mut self, _ino: u32) -> Option<VfsNodeId> {
         None
     }
@@ -425,6 +427,7 @@ impl<T> LegacyFileSystemBackend for T where
 #[allow(dead_code)]
 pub(crate) trait LookupOps: Send + Sync {
     fn root_ino(&self) -> u32;
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     fn overlay_real_node(&self, ino: u32) -> Option<VfsNodeId>;
     fn lookup_component_from(
         &self,
@@ -599,6 +602,7 @@ impl LookupOps for SerializedBackend {
         self.call(BackendOp::Lookup, |backend| backend.root_ino())
     }
 
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
     fn overlay_real_node(&self, ino: u32) -> Option<VfsNodeId> {
         self.call(BackendOp::Lookup, |backend| backend.overlay_real_node(ino))
     }

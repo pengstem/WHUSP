@@ -5,9 +5,11 @@ use crate::syscall::user_ptr::{write_user_value, write_user_value_in_memory_set}
 use crate::task::{
     CLD_CONTINUED, CLD_STOPPED, ProcessControlBlock, ProcessCpuTimesSnapshot, SIGCHLD, SIGCONT,
     SignalInfo, block_current_task_no_schedule, current_process, current_task, current_user_token,
-    pid2process, ptrace_take_wait_status, remove_from_pid2process, schedule, signal_child_status,
-    signal_wait_status, task_has_wait_interrupt_signal, wakeup_task,
+    remove_from_pid2process, schedule, signal_child_status, signal_wait_status,
+    task_has_wait_interrupt_signal, wakeup_task,
 };
+#[cfg(feature = "ptrace")]
+use crate::task::{pid2process, ptrace_take_wait_status};
 use alloc::sync::Arc;
 
 use crate::uapi::errno::{Errno, KResult};
@@ -208,6 +210,7 @@ pub fn sys_getrusage(who: i32, usage: *mut RUsage) -> KResult {
     Ok(0)
 }
 
+#[cfg(feature = "ptrace")]
 fn ptrace_wait4_target(pid: isize, waiter_pid: usize) -> Option<(usize, i32)> {
     if pid <= 0 {
         return None;
@@ -266,6 +269,8 @@ fn scan_wait4_children(
     include_untraced: bool,
     include_continued: bool,
 ) -> Wait4ChildScan {
+    #[cfg(not(feature = "ptrace"))]
+    let _ = waiter_pid;
     // Keep stop and zombie discovery in one parent-child-list pass. Ptrace
     // stop status is observable without reaping, while the zombie record
     // carries the removal index for the later wait4 reap boundary.
@@ -304,6 +309,7 @@ fn scan_wait4_children(
                 scan.continued = Some((idx, child.getpid()));
             }
         }
+        #[cfg(feature = "ptrace")]
         if scan.stopped.is_none()
             && let Some(status) = ptrace_take_wait_status(child, waiter_pid, include_untraced)
         {
@@ -406,6 +412,7 @@ fn sys_wait4_for_process(
             options & WCONTINUED != 0,
         );
         if !scan.matched {
+            #[cfg(feature = "ptrace")]
             if let Some((tracee_pid, status)) = ptrace_wait4_target(pid, waiter_pid) {
                 if !wstatus.is_null() {
                     write_user_value_in_memory_set(&mut inner.memory_set, wstatus, &status)?;
