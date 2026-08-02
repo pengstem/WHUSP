@@ -17,7 +17,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::{vec, vec::Vec};
 use core::hint::spin_loop;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 pub const RLIM_INFINITY: usize = usize::MAX;
 const FD_BITMAP_WORD_BITS: usize = usize::BITS as usize;
@@ -1014,6 +1014,7 @@ pub struct ProcessControlBlock {
     pub(super) fs_fast: ProcessFsFastState,
     pub(super) fd_table_fast: FdTableFastState,
     pub(super) credentials_fast: CredentialsFastState,
+    pub(super) has_posix_record_locks: AtomicBool,
     // Page-table readers may run concurrently after retaining the translated
     // frame. ProcessInnerGuard enters the write side lazily on DerefMut, so
     // read-only signal/scheduler/credential queries do not close the phase.
@@ -1969,6 +1970,14 @@ impl ProcessControlBlock {
 
     pub fn credentials(&self) -> Credentials {
         self.credentials_fast.snapshot()
+    }
+
+    pub(crate) fn has_posix_record_locks(&self) -> bool {
+        self.has_posix_record_locks.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_has_posix_record_locks(&self, active: bool) {
+        self.has_posix_record_locks.store(active, Ordering::Release);
     }
 
     pub fn umask(&self) -> u32 {

@@ -18,8 +18,7 @@ use super::super::user_ptr::{
 use super::fanotify::{fanotify_close_group_file, fanotify_notify_close};
 use super::fd_lock::{
     fcntl_getlk, fcntl_ofd_getlk, fcntl_ofd_setlk, fcntl_ofd_setlkw, fcntl_setlk, fcntl_setlkw,
-    flock_operation, release_flock_locks_for_close, release_ofd_record_locks_for_close,
-    release_record_locks_for_close,
+    flock_operation, release_file_locks_for_close,
 };
 #[cfg(feature = "inotify")]
 use super::inotify::inotify_notify_close;
@@ -180,9 +179,7 @@ pub(crate) fn close_detached_fd_entry_for_process_teardown(entry: FdTableEntry) 
 }
 
 fn close_detached_fd_entry_inner(entry: FdTableEntry, force_fanotify_release: bool) {
-    release_record_locks_for_close(&entry);
-    release_ofd_record_locks_for_close(&entry);
-    release_flock_locks_for_close(&entry);
+    release_file_locks_for_close(&entry);
     #[cfg(any(feature = "fanotify", feature = "inotify"))]
     let file = entry.file();
     #[cfg(not(feature = "fanotify"))]

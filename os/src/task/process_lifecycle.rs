@@ -23,7 +23,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
 impl ProcessControlBlock {
     /// Attaches a newly created task to this process and returns the user token.
@@ -134,6 +134,7 @@ impl ProcessControlBlock {
             fs_fast: ProcessFsFastState::new(&fs),
             fd_table_fast: FdTableFastState::new(&fd_table),
             credentials_fast: CredentialsFastState::new(&Credentials::root()),
+            has_posix_record_locks: AtomicBool::new(false),
             memory_access: ProcessMemoryFastState::new(),
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,
@@ -358,6 +359,8 @@ impl ProcessControlBlock {
             fs_fast: ProcessFsFastState::new(&fs),
             fd_table_fast: FdTableFastState::new(&new_fd_table),
             credentials_fast: CredentialsFastState::new(&credentials),
+            // POSIX record locks are process-owned and are not inherited by fork.
+            has_posix_record_locks: AtomicBool::new(false),
             memory_access: ProcessMemoryFastState::new(),
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,

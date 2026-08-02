@@ -10,6 +10,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 
 const F_RDLCK: i16 = 0;
@@ -142,6 +143,41 @@ lazy_static! {
     static ref RECORD_LOCK_TABLE: SpinNoIrqLock<RecordLockTable> =
         SpinNoIrqLock::new(RecordLockTable::new());
     static ref FLOCK_TABLE: SpinNoIrqLock<FlockTable> = SpinNoIrqLock::new(FlockTable::new());
+}
+
+const POSIX_LOCKS_ACTIVE: usize = 1 << 0;
+const OFD_LOCKS_ACTIVE: usize = 1 << 1;
+const FLOCKS_ACTIVE: usize = 1 << 2;
+const RECORD_LOCKS_ACTIVE: usize = POSIX_LOCKS_ACTIVE | OFD_LOCKS_ACTIVE;
+
+/// One load covers the overwhelmingly common case where no compatibility
+/// lock class is active anywhere in the system.
+static ACTIVE_LOCK_CLASSES: AtomicUsize = AtomicUsize::new(0);
+
+fn publish_record_lock_activity(table: &RecordLockTable) {
+    let mut record_classes = 0usize;
+    for owner in table
+        .locks
+        .iter()
+        .map(|lock| &lock.owner)
+        .chain(table.waiters.iter().map(|waiter| &waiter.owner))
+    {
+        match owner {
+            RecordLockOwner::Process(_) => record_classes |= POSIX_LOCKS_ACTIVE,
+            RecordLockOwner::FileDescription(_) => record_classes |= OFD_LOCKS_ACTIVE,
+        }
+    }
+    let _ = ACTIVE_LOCK_CLASSES.fetch_update(Ordering::Release, Ordering::Relaxed, |active| {
+        Some((active & !RECORD_LOCKS_ACTIVE) | record_classes)
+    });
+}
+
+fn publish_flock_activity(table: &FlockTable) {
+    if table.locks.is_empty() && table.waiters.is_empty() {
+        ACTIVE_LOCK_CLASSES.fetch_and(!FLOCKS_ACTIVE, Ordering::Release);
+    } else {
+        ACTIVE_LOCK_CLASSES.fetch_or(FLOCKS_ACTIVE, Ordering::Release);
+    }
 }
 
 impl RecordLockTable {
@@ -324,6 +360,10 @@ impl RecordLockTable {
                 RecordLockOwner::FileDescription(owner) if Arc::ptr_eq(owner, file)
             )
         })
+    }
+
+    fn has_process_locks(&self, pid: usize) -> bool {
+        self.locks.iter().any(|lock| lock.owner.is_process(pid))
     }
 
     fn enqueue_waiter(
@@ -557,6 +597,12 @@ fn ranges_overlap(first_start: i64, first_end: i64, second_start: i64, second_en
 }
 
 fn lock_key(file: &Arc<dyn File + Send + Sync>) -> KResult<LockKey> {
+    if let Some(node) = file.vfs_node_id() {
+        return Ok(LockKey {
+            dev: node.mount_id.0 as u64,
+            ino: node.ino as u64,
+        });
+    }
     let stat = file.stat()?;
     Ok(LockKey {
         dev: stat.dev,
@@ -649,6 +695,7 @@ pub(super) fn flock_operation(entry: FdTableEntry, operation: i32) -> KResult {
             let mut table = FLOCK_TABLE.lock();
             match table.set_lock(key, Arc::clone(&owner), mode) {
                 Ok(waiters) => {
+                    publish_flock_activity(&table);
                     drop(table);
                     wake_waiters(waiters);
                     return Ok(0);
@@ -659,11 +706,15 @@ pub(super) fn flock_operation(entry: FdTableEntry, operation: i32) -> KResult {
             }
             let (task, task_cx_ptr) = block_current_task_no_schedule();
             table.enqueue_waiter(key, Arc::clone(&owner), task);
+            publish_flock_activity(&table);
             drop(table);
             schedule(task_cx_ptr);
         }
     } else {
-        let waiters = FLOCK_TABLE.lock().unlock(key, &owner);
+        let mut table = FLOCK_TABLE.lock();
+        let waiters = table.unlock(key, &owner);
+        publish_flock_activity(&table);
+        drop(table);
         wake_waiters(waiters);
         Ok(0)
     }
@@ -746,9 +797,16 @@ fn fcntl_setlk_with_owner(
 
     let (start, end) = flock_range(&file, flock)?;
     let key = lock_key(&file)?;
-    let waiters = RECORD_LOCK_TABLE
-        .lock()
-        .set_lock(key, owner, flock.l_type, start, end)?;
+    let mut table = RECORD_LOCK_TABLE.lock();
+    let waiters = table.set_lock(key, owner.clone(), flock.l_type, start, end)?;
+    match &owner {
+        RecordLockOwner::Process(pid) => {
+            current_process().set_has_posix_record_locks(table.has_process_locks(*pid));
+        }
+        RecordLockOwner::FileDescription(_) => {}
+    }
+    publish_record_lock_activity(&table);
+    drop(table);
     wake_waiters(waiters);
     Ok(0)
 }
@@ -799,6 +857,13 @@ fn fcntl_setlkw_with_owner(
         };
         if conflicts.is_empty() {
             let waiters = table.set_lock(key, owner.clone(), flock.l_type, start, end)?;
+            match &owner {
+                RecordLockOwner::Process(pid) => {
+                    current_process().set_has_posix_record_locks(table.has_process_locks(*pid));
+                }
+                RecordLockOwner::FileDescription(_) => {}
+            }
+            publish_record_lock_activity(&table);
             drop(table);
             wake_waiters(waiters);
             return Ok(0);
@@ -808,22 +873,31 @@ fn fcntl_setlkw_with_owner(
         }
         let (task, task_cx_ptr) = block_current_task_no_schedule();
         table.enqueue_waiter(key, owner.clone(), flock.l_type, start, end, task);
+        publish_record_lock_activity(&table);
         drop(table);
         schedule(task_cx_ptr);
     }
 }
 
-pub(super) fn release_record_locks_for_close(entry: &FdTableEntry) {
+fn release_record_locks_for_close(entry: &FdTableEntry) {
+    let process = current_process();
+    if !process.has_posix_record_locks() {
+        return;
+    }
     let file = entry.file();
     let Ok(key) = lock_key(&file) else {
         return;
     };
-    let pid = current_process().getpid();
-    let waiters = RECORD_LOCK_TABLE.lock().release_for_process_file(key, pid);
+    let pid = process.getpid();
+    let mut table = RECORD_LOCK_TABLE.lock();
+    let waiters = table.release_for_process_file(key, pid);
+    process.set_has_posix_record_locks(table.has_process_locks(pid));
+    publish_record_lock_activity(&table);
+    drop(table);
     wake_waiters(waiters);
 }
 
-pub(super) fn release_ofd_record_locks_for_close(entry: &FdTableEntry) {
+fn release_ofd_record_locks_for_close(entry: &FdTableEntry) {
     let file = entry.file();
     if !RECORD_LOCK_TABLE.lock().has_file_description_state(&file) {
         return;
@@ -831,11 +905,14 @@ pub(super) fn release_ofd_record_locks_for_close(entry: &FdTableEntry) {
     if file_description_still_referenced(&file) {
         return;
     }
-    let waiters = RECORD_LOCK_TABLE.lock().release_for_file_description(&file);
+    let mut table = RECORD_LOCK_TABLE.lock();
+    let waiters = table.release_for_file_description(&file);
+    publish_record_lock_activity(&table);
+    drop(table);
     wake_waiters(waiters);
 }
 
-pub(super) fn release_flock_locks_for_close(entry: &FdTableEntry) {
+fn release_flock_locks_for_close(entry: &FdTableEntry) {
     let file = entry.file();
     if !FLOCK_TABLE.lock().has_owner_state(&file) {
         return;
@@ -843,11 +920,33 @@ pub(super) fn release_flock_locks_for_close(entry: &FdTableEntry) {
     if file_description_still_referenced(&file) {
         return;
     }
-    let waiters = FLOCK_TABLE.lock().release_owner(&file);
+    let mut table = FLOCK_TABLE.lock();
+    let waiters = table.release_owner(&file);
+    publish_flock_activity(&table);
+    drop(table);
     wake_waiters(waiters);
 }
 
+pub(super) fn release_file_locks_for_close(entry: &FdTableEntry) {
+    let active = ACTIVE_LOCK_CLASSES.load(Ordering::Acquire);
+    if active & POSIX_LOCKS_ACTIVE != 0 {
+        release_record_locks_for_close(entry);
+    }
+    if active & OFD_LOCKS_ACTIVE != 0 {
+        release_ofd_record_locks_for_close(entry);
+    }
+    if active & FLOCKS_ACTIVE != 0 {
+        release_flock_locks_for_close(entry);
+    }
+}
+
 pub(crate) fn release_record_locks_for_process(pid: usize) {
-    let waiters = RECORD_LOCK_TABLE.lock().release_for_process(pid);
+    if ACTIVE_LOCK_CLASSES.load(Ordering::Acquire) & POSIX_LOCKS_ACTIVE == 0 {
+        return;
+    }
+    let mut table = RECORD_LOCK_TABLE.lock();
+    let waiters = table.release_for_process(pid);
+    publish_record_lock_activity(&table);
+    drop(table);
     wake_waiters(waiters);
 }
