@@ -14,6 +14,7 @@ use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{read_user_array, read_user_value, write_user_array};
 use super::fd::get_file_by_fd;
 use super::uapi::{LinuxPollFd, PPOLL_MAX_NFDS};
+use super::wait_util::ProcSleepGuard;
 use crate::uapi::errno::{Errno, KResult};
 use core::mem::size_of;
 
@@ -27,24 +28,6 @@ type PollFile = Arc<dyn File + Send + Sync>;
 enum PollFileSlot {
     File(PollFile),
     Error(Errno),
-}
-
-struct ProcSleepGuard {
-    task: Arc<crate::task::TaskControlBlock>,
-}
-
-impl ProcSleepGuard {
-    fn new() -> KResult<Self> {
-        let task = current_task().ok_or(Errno::ESRCH)?;
-        task.inner_exclusive_access().proc_sleeping = true;
-        Ok(Self { task })
-    }
-}
-
-impl Drop for ProcSleepGuard {
-    fn drop(&mut self) {
-        self.task.inner_exclusive_access().proc_sleeping = false;
-    }
 }
 
 pub(super) struct TemporarySignalMask {

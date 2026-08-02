@@ -4,8 +4,8 @@ use crate::timer::get_time_us;
 use alloc::sync::Arc;
 
 use super::super::time::{
-    ClockBackend, LinuxITimerSpec, current_clock_nanos, nanos_to_us_ceil, timespec_to_nanos,
-    timespec_to_us_ceil, us_to_timespec,
+    ClockBackend, LinuxITimerSpec, current_clock_nanos, itimerspec_from_us, nanos_to_us_ceil,
+    timespec_to_nanos, timespec_to_us_ceil,
 };
 use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{read_user_value, write_user_value};
@@ -70,13 +70,6 @@ fn timerfd_backend(clock: TimerFdClock) -> ClockBackend {
     match clock {
         TimerFdClock::Realtime => ClockBackend::Wall,
         TimerFdClock::Monotonic => ClockBackend::Monotonic,
-    }
-}
-
-fn itimerspec_from_us(interval_us: usize, value_us: usize) -> LinuxITimerSpec {
-    LinuxITimerSpec {
-        it_interval: us_to_timespec(interval_us),
-        it_value: us_to_timespec(value_us),
     }
 }
 

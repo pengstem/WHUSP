@@ -295,8 +295,6 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) tmpfs_allocated_payload_sparse_extents: usize,
     pub(crate) tmpfs_allocated_logical_len_calls: usize,
     pub(crate) tmpfs_allocated_logical_sparse_extents: usize,
-    pub(crate) sysv_msg_current_bytes_calls: usize,
-    pub(crate) sysv_msg_current_bytes_scanned_messages: usize,
     pub(crate) brk_grow_calls: usize,
     pub(crate) brk_grow_pages: usize,
     pub(crate) brk_eager_mapped_pages: usize,
@@ -627,7 +625,6 @@ macro_rules! declare_perf_events {
             fn record_mmap_clean_page_cache_fill() => record_mmap_clean_page_cache_fill_impl;
             fn record_tmpfs_allocated_payload_len(_sparse_extents: usize) => record_tmpfs_allocated_payload_len_impl;
             fn record_tmpfs_allocated_logical_len(_sparse_extents: usize) => record_tmpfs_allocated_logical_len_impl;
-            fn record_sysv_msg_current_bytes(_messages: usize) => record_sysv_msg_current_bytes_impl;
             fn record_brk_grow(_pages: usize) => record_brk_grow_impl;
             fn record_brk_eager_mapped(_pages: usize) => record_brk_eager_mapped_impl;
             fn record_brk_lazy_extended(_pages: usize) => record_brk_lazy_extended_impl;
@@ -891,8 +888,6 @@ mod enabled {
     static TMPFS_ALLOCATED_PAYLOAD_SPARSE_EXTENTS: AtomicUsize = AtomicUsize::new(0);
     static TMPFS_ALLOCATED_LOGICAL_LEN_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TMPFS_ALLOCATED_LOGICAL_SPARSE_EXTENTS: AtomicUsize = AtomicUsize::new(0);
-    static SYSV_MSG_CURRENT_BYTES_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static SYSV_MSG_CURRENT_BYTES_SCANNED_MESSAGES: AtomicUsize = AtomicUsize::new(0);
     static BRK_GROW_CALLS: AtomicUsize = AtomicUsize::new(0);
     static BRK_GROW_PAGES: AtomicUsize = AtomicUsize::new(0);
     static BRK_EAGER_MAPPED_PAGES: AtomicUsize = AtomicUsize::new(0);
@@ -2049,11 +2044,6 @@ mod enabled {
         TMPFS_ALLOCATED_LOGICAL_SPARSE_EXTENTS.fetch_add(sparse_extents, Ordering::Relaxed);
     }
 
-    fn record_sysv_msg_current_bytes_impl(messages: usize) {
-        SYSV_MSG_CURRENT_BYTES_CALLS.fetch_add(1, Ordering::Relaxed);
-        SYSV_MSG_CURRENT_BYTES_SCANNED_MESSAGES.fetch_add(messages, Ordering::Relaxed);
-    }
-
     fn record_brk_grow_impl(pages: usize) {
         BRK_GROW_CALLS.fetch_add(1, Ordering::Relaxed);
         BRK_GROW_PAGES.fetch_add(pages, Ordering::Relaxed);
@@ -2926,9 +2916,6 @@ mod enabled {
                 .load(Ordering::Relaxed),
             tmpfs_allocated_logical_sparse_extents: TMPFS_ALLOCATED_LOGICAL_SPARSE_EXTENTS
                 .load(Ordering::Relaxed),
-            sysv_msg_current_bytes_calls: SYSV_MSG_CURRENT_BYTES_CALLS.load(Ordering::Relaxed),
-            sysv_msg_current_bytes_scanned_messages: SYSV_MSG_CURRENT_BYTES_SCANNED_MESSAGES
-                .load(Ordering::Relaxed),
             brk_grow_calls: BRK_GROW_CALLS.load(Ordering::Relaxed),
             brk_grow_pages: BRK_GROW_PAGES.load(Ordering::Relaxed),
             brk_eager_mapped_pages: BRK_EAGER_MAPPED_PAGES.load(Ordering::Relaxed),
@@ -3368,8 +3355,6 @@ mod enabled {
          tmpfs_allocated_payload_sparse_extents {}\n\
          tmpfs_allocated_logical_len_calls {}\n\
          tmpfs_allocated_logical_sparse_extents {}\n\
-         sysv_msg_current_bytes_calls {}\n\
-         sysv_msg_current_bytes_scanned_messages {}\n\
          brk_grow_calls {}\n\
          brk_grow_pages {}\n\
          brk_eager_mapped_pages {}\n\
@@ -3754,8 +3739,6 @@ mod enabled {
             stats.tmpfs_allocated_payload_sparse_extents,
             stats.tmpfs_allocated_logical_len_calls,
             stats.tmpfs_allocated_logical_sparse_extents,
-            stats.sysv_msg_current_bytes_calls,
-            stats.sysv_msg_current_bytes_scanned_messages,
             stats.brk_grow_calls,
             stats.brk_grow_pages,
             stats.brk_eager_mapped_pages,

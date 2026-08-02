@@ -1,6 +1,5 @@
 use super::ipc_util::{now_sec, pid_to_i32};
 use super::user_ptr::{copy_to_user, read_user_array, read_user_value, write_user_value};
-use crate::perf;
 use crate::sync::SpinNoIrqLock;
 use crate::task::check_signals_of_current;
 use crate::task::{
@@ -10,10 +9,10 @@ use crate::task::{
 };
 use crate::uapi::errno::{Errno, KResult};
 use alloc::collections::BTreeMap;
-use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt::Write as _;
 use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use lazy_static::*;
 
@@ -230,13 +229,8 @@ impl MsgQueue {
         caller.euid == self.uid || caller.euid == self.cuid || caller.can_override_ipc
     }
 
-    fn current_bytes(&self) -> usize {
-        perf::record_sysv_msg_current_bytes(0);
-        self.cbytes
-    }
-
     fn has_capacity_for(&self, len: usize) -> bool {
-        self.current_bytes().saturating_add(len) <= self.qbytes && self.messages.len() < self.qbytes
+        self.cbytes.saturating_add(len) <= self.qbytes && self.messages.len() < self.qbytes
     }
 
     fn stat(&self) -> MsgQueueStat {
@@ -250,7 +244,7 @@ impl MsgQueue {
             stime: self.stime,
             rtime: self.rtime,
             ctime: self.ctime,
-            cbytes: self.current_bytes(),
+            cbytes: self.cbytes,
             qnum: self.messages.len(),
             qbytes: self.qbytes,
             lspid: self.lspid,
@@ -405,13 +399,7 @@ impl MsgManager {
         Ok(())
     }
 
-    fn send(
-        &mut self,
-        msqid: usize,
-        message: Message,
-        flags: i32,
-        caller: &MsgCaller,
-    ) -> Result<(), MsgError> {
+    fn send(&mut self, msqid: usize, message: Message, caller: &MsgCaller) -> Result<(), MsgError> {
         if message.text.len() > current_msgmax() {
             return Err(MsgError::Invalid);
         }
@@ -421,9 +409,6 @@ impl MsgManager {
         }
         let message_len = message.text.len();
         if !queue.has_capacity_for(message_len) {
-            if flags & IPC_NOWAIT != 0 {
-                return Err(MsgError::WouldBlock);
-            }
             return Err(MsgError::WouldBlock);
         }
         queue.cbytes = queue.cbytes.saturating_add(message_len);
@@ -511,7 +496,8 @@ impl MsgManager {
         );
         for (&msqid, queue) in &self.queues {
             let stat = queue.stat();
-            output.push_str(&format!(
+            writeln!(
+                &mut output,
                 "{:10} {:10} {:5o} {:11} {:10} {:5} {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10}\n",
                 stat.key,
                 msqid,
@@ -527,7 +513,8 @@ impl MsgManager {
                 stat.stime,
                 stat.rtime,
                 stat.ctime,
-            ));
+            )
+            .unwrap();
         }
         output
     }
@@ -639,7 +626,7 @@ pub(super) fn sys_msgctl(msqid: usize, cmd: i32, buf: usize) -> KResult {
 }
 
 pub(super) fn sys_msgsnd(msqid: usize, msgp: *const u8, msgsz: usize, msgflg: i32) -> KResult {
-    if (msgsz as isize) < 0 {
+    if msgsz > isize::MAX as usize {
         return Err(Errno::EINVAL);
     }
     let token = current_user_token();
@@ -671,7 +658,7 @@ pub(super) fn sys_msgrcv(
     msgtyp: isize,
     msgflg: i32,
 ) -> KResult {
-    if (msgsz as isize) < 0 {
+    if msgsz > isize::MAX as usize {
         return Err(Errno::EINVAL);
     }
     let process = current_process();
@@ -692,7 +679,7 @@ fn try_or_block_msgsnd(
     caller: &MsgCaller,
 ) -> Result<MsgAttempt, Errno> {
     let mut manager = MSG_MANAGER.lock();
-    match manager.send(msqid, message, flags, caller) {
+    match manager.send(msqid, message, caller) {
         Ok(()) => Ok(MsgAttempt::Done(0)),
         Err(MsgError::WouldBlock) if flags & IPC_NOWAIT == 0 => manager
             .block_current(msqid)
@@ -742,7 +729,7 @@ fn post_msg_sleep_cleanup(msqid: usize) -> KResult<()> {
     Ok(())
 }
 
-fn write_message_to_user(msgp: *mut u8, message: &Message, copy_len: usize) -> KResult<isize> {
+fn write_message_to_user(msgp: *mut u8, message: &Message, copy_len: usize) -> KResult<()> {
     let token = current_user_token();
     write_user_value(token, msgp as *mut isize, &message.mtype)?;
     copy_to_user(
@@ -750,7 +737,7 @@ fn write_message_to_user(msgp: *mut u8, message: &Message, copy_len: usize) -> K
         msgp.wrapping_add(core::mem::size_of::<isize>()),
         &message.text[..copy_len],
     )?;
-    Ok(copy_len as isize)
+    Ok(())
 }
 
 fn write_msqid_ds(buf: usize, stat: MsgQueueStat) -> KResult<()> {

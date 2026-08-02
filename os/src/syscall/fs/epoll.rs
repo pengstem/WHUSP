@@ -3,6 +3,7 @@ use super::super::uapi::LinuxTimeSpec;
 use super::super::user_ptr::{read_user_value, write_user_value};
 use super::fd::{get_fd_entry_by_fd, install_file_fd};
 use super::poll::{TemporarySignalMask, read_signal_mask};
+use super::wait_util::ProcSleepGuard;
 use crate::fs::{File, FileStat, OpenFlags, PollEvents, PollWaiter, S_IFDIR, S_IFMT};
 use crate::mm::UserBuffer;
 use crate::perf;
@@ -56,24 +57,6 @@ struct EpollScanResult {
     ready_events: Vec<LinuxEpollEvent>,
     waiter_registrations: usize,
     fallback_needed: bool,
-}
-
-struct ProcSleepGuard {
-    task: Arc<crate::task::TaskControlBlock>,
-}
-
-impl ProcSleepGuard {
-    fn new() -> KResult<Self> {
-        let task = current_task().ok_or(Errno::ESRCH)?;
-        task.inner_exclusive_access().proc_sleeping = true;
-        Ok(Self { task })
-    }
-}
-
-impl Drop for ProcSleepGuard {
-    fn drop(&mut self) {
-        self.task.inner_exclusive_access().proc_sleeping = false;
-    }
 }
 
 pub struct EpollFile {
@@ -200,10 +183,6 @@ impl File for EpollFile {
 
     fn write(&self, _buf: UserBuffer) -> usize {
         0
-    }
-
-    fn poll(&self, _events: PollEvents) -> PollEvents {
-        PollEvents::empty()
     }
 
     fn stat(&self) -> crate::fs::FsResult<FileStat> {

@@ -5,7 +5,7 @@ use super::mount::{
 use super::path::WorkingDir;
 use super::status_flags::StatusFlagsCell;
 use super::vfs::{BackendOp, VfsNodeId};
-use super::{File, FileStat, FsError, FsResult, OpenFlags, PollEvents, S_IFREG};
+use super::{File, FileStat, FsError, FsResult, OpenFlags, S_IFREG};
 use crate::mm::UserBuffer;
 use crate::sync::SleepMutex;
 use alloc::string::String;
@@ -67,6 +67,17 @@ pub(crate) struct DetachedMountFile {
 }
 
 impl FsContextFile {
+    fn reserve_config_bytes(state: &mut FsContextState, bytes: usize) -> bool {
+        let Some(next_len) = state.config_len.checked_add(bytes) else {
+            return false;
+        };
+        if next_len > FSCONFIG_LEGACY_BUFFER_LIMIT {
+            return false;
+        }
+        state.config_len = next_len;
+        true
+    }
+
     pub(crate) fn new(fs_type: String) -> Arc<Self> {
         Arc::new(Self {
             inner: SleepMutex::new(FsContextState {
@@ -83,26 +94,15 @@ impl FsContextFile {
     pub(crate) fn set_flag(&self, key: &str) -> bool {
         let entry_len = key.len().saturating_add(2);
         let mut inner = self.inner.lock();
-        let Some(next_len) = inner.config_len.checked_add(entry_len) else {
-            return false;
-        };
-        if next_len > FSCONFIG_LEGACY_BUFFER_LIMIT {
-            return false;
-        }
-        inner.config_len = next_len;
-        true
+        Self::reserve_config_bytes(&mut inner, entry_len)
     }
 
     pub(crate) fn set_string(&self, key: &str, value: &str) -> bool {
         let entry_len = key.len().saturating_add(value.len()).saturating_add(2);
         let mut inner = self.inner.lock();
-        let Some(next_len) = inner.config_len.checked_add(entry_len) else {
-            return false;
-        };
-        if next_len > FSCONFIG_LEGACY_BUFFER_LIMIT {
+        if !Self::reserve_config_bytes(&mut inner, entry_len) {
             return false;
         }
-        inner.config_len = next_len;
         if key == "source" {
             inner.source = Some(String::from(value));
         }
@@ -221,10 +221,6 @@ impl File for FsContextFile {
         Ok(FileStat::with_mode(S_IFREG | 0o600))
     }
 
-    fn poll(&self, _events: PollEvents) -> PollEvents {
-        PollEvents::empty()
-    }
-
     fn status_flags(&self) -> OpenFlags {
         self.status_flags.get()
     }
@@ -261,10 +257,6 @@ impl File for DetachedMountFile {
             mount.stat(node.ino)
         })
         .ok_or(FsError::Io)?
-    }
-
-    fn poll(&self, _events: PollEvents) -> PollEvents {
-        PollEvents::empty()
     }
 
     fn working_dir(&self) -> Option<WorkingDir> {

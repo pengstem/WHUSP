@@ -695,21 +695,17 @@ pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> KResult {
             Ok(0)
         }
         MADV_DONTNEED => {
-            let flushes = {
-                let mut inner = process.inner_exclusive_access();
-                if inner
-                    .memory_set
-                    .madvise_range_has_locked(addr, len)
-                    .ok_or(Errno::ENOMEM)?
-                {
-                    return Err(Errno::EINVAL);
-                }
-                if !inner.memory_set.madvise_dontneed_range(addr, len) {
-                    return Err(Errno::ENOMEM);
-                }
-                Vec::new()
-            };
-            write_back_mmap_flushes(flushes);
+            let mut inner = process.inner_exclusive_access();
+            if inner
+                .memory_set
+                .madvise_range_has_locked(addr, len)
+                .ok_or(Errno::ENOMEM)?
+            {
+                return Err(Errno::EINVAL);
+            }
+            if !inner.memory_set.madvise_dontneed_range(addr, len) {
+                return Err(Errno::ENOMEM);
+            }
             Ok(0)
         }
         MADV_MERGEABLE | MADV_UNMERGEABLE => {

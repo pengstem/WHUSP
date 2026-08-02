@@ -3,9 +3,9 @@ use crate::config::PAGE_SIZE;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::ipc_util::{now_sec, pid_to_i32};
 use alloc::collections::BTreeMap;
-use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt::Write as _;
 use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use lazy_static::*;
 
@@ -486,7 +486,8 @@ impl ShmManager {
         );
         for (&shmid, segment) in &self.segments {
             let stat = segment.stat(shmid);
-            output.push_str(&format!(
+            writeln!(
+                &mut output,
                 "{:10} {:10} {:5o} {:21} {:5} {:5} {:6} {:5} {:5} {:5} {:5} {:10} {:10} {:10} {:5} {:5}\n",
                 stat.key,
                 stat.id,
@@ -504,7 +505,8 @@ impl ShmManager {
                 stat.ctime,
                 segment.aligned_len,
                 0
-            ));
+            )
+            .unwrap();
         }
         output
     }

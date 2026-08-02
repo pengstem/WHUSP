@@ -438,6 +438,33 @@ pub(crate) fn queue_signal_to_task(
     }
 }
 
+pub(crate) fn queue_signal_to_process(
+    process: &Arc<ProcessControlBlock>,
+    signal: SignalFlags,
+    info: SignalInfo,
+) {
+    if signal.is_empty() {
+        return;
+    }
+    let tasks = process.tasks_snapshot();
+    let target = tasks
+        .iter()
+        .find(|task| {
+            let task_inner = task.inner_exclusive_access();
+            !(task_inner.signal_mask & signal).contains(signal)
+        })
+        .cloned()
+        .or_else(|| tasks.first().cloned());
+    if let Some(task) = target {
+        queue_signal_to_task(task, signal, info);
+    }
+    if signal.check_error().is_some() {
+        for task in tasks {
+            wakeup_task(task);
+        }
+    }
+}
+
 fn signal_should_wake_target(task: &Arc<TaskControlBlock>, signal: SignalFlags) -> bool {
     let job_stop_signals =
         SignalFlags::SIGSTOP | SignalFlags::SIGTSTP | SignalFlags::SIGTTIN | SignalFlags::SIGTTOU;
@@ -759,23 +786,7 @@ fn queue_signal_to_process_for_tty(
     signal: SignalFlags,
     info: SignalInfo,
 ) {
-    let tasks = process.tasks_snapshot();
-    let target = tasks
-        .iter()
-        .find(|task| {
-            let task_inner = task.inner_exclusive_access();
-            !(task_inner.signal_mask & signal).contains(signal)
-        })
-        .cloned()
-        .or_else(|| tasks.first().cloned());
-    if let Some(task) = target {
-        queue_signal_to_task(task, signal, info);
-    }
-    if signal.check_error().is_some() {
-        for task in tasks {
-            wakeup_task(task);
-        }
-    }
+    queue_signal_to_process(process, signal, info);
 }
 
 fn nearest_child_reaper(parent: Option<Arc<ProcessControlBlock>>) -> Arc<ProcessControlBlock> {

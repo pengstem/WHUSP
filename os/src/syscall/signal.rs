@@ -4,7 +4,7 @@ use crate::task::{
     SS_ONSTACK, SigAltStack, SignalAction, SignalFlags, SignalInfo, TaskControlBlock,
     block_current_task_no_schedule, current_has_interrupting_signal, current_process, current_task,
     current_trap_cx, current_user_token, flags_to_linux_sigset, linux_sigset_to_flags,
-    processes_snapshot, queue_signal_to_task, schedule, task_with_linux_tid, wakeup_task,
+    processes_snapshot, queue_signal_to_task, schedule, task_with_linux_tid,
 };
 use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
@@ -36,10 +36,13 @@ fn read_signal_set(token: usize, set: *const u8, sigsetsize: usize) -> KResult<S
         return Err(Errno::EFAULT);
     }
     let raw_set = read_user_value(token, set.cast::<u64>())?;
-    let mut flags = linux_sigset_to_flags(raw_set);
-    flags.remove(SignalFlags::SIGKILL);
-    flags.remove(SignalFlags::SIGSTOP);
-    Ok(flags)
+    Ok(signal_flags_from_raw(raw_set))
+}
+
+fn signal_flags_from_raw(raw: u64) -> SignalFlags {
+    let mut flags = linux_sigset_to_flags(raw);
+    flags.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
+    flags
 }
 
 fn read_signal_set_ctx(
@@ -57,10 +60,7 @@ fn read_signal_set_ctx(
         return Err(Errno::EFAULT);
     }
     let raw_set = read_user_value_ctx(ctx, set.cast::<u64>())?;
-    let mut flags = linux_sigset_to_flags(raw_set);
-    flags.remove(SignalFlags::SIGKILL);
-    flags.remove(SignalFlags::SIGSTOP);
-    Ok(flags)
+    Ok(signal_flags_from_raw(raw_set))
 }
 
 fn lowest_signal(flags: SignalFlags) -> Option<u32> {
@@ -269,9 +269,7 @@ fn caller_can_signal_target(
     // This kernel has one credential namespace and process-wide credentials.
     let caller = caller.credentials();
     let target = target.credentials();
-    caller.is_root()
-        || target.uid_matches_saved_set(caller.ruid)
-        || target.uid_matches_saved_set(caller.euid)
+    caller.can_signal(&target)
 }
 
 fn queue_signal_to_process(
@@ -282,25 +280,7 @@ fn queue_signal_to_process(
     if signal.is_empty() {
         return;
     }
-    let target = {
-        let tasks = process.tasks_snapshot();
-        tasks
-            .iter()
-            .find(|task| {
-                let task_inner = task.inner_exclusive_access();
-                !(task_inner.signal_mask & signal).contains(signal)
-            })
-            .cloned()
-            .or_else(|| tasks.first().cloned())
-    };
-    if let Some(task) = target {
-        queue_signal_to_task(task, signal, info);
-    }
-    if signal.check_error().is_some() {
-        for task in process.tasks_snapshot() {
-            wakeup_task(task);
-        }
-    }
+    crate::task::queue_signal_to_process(process, signal, info);
 }
 
 fn sigqueue_info_from_user(signum: u32, info: *const LinuxSigInfo) -> KResult<SignalInfo> {

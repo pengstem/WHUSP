@@ -91,7 +91,7 @@ impl OverlayFs {
         ino: u32,
         real: VfsNodeId,
         op: BackendOp,
-        f: impl FnOnce(&dyn FileSystemBackend, u32) -> V,
+        f: impl FnOnce(&dyn FileSystemBackend, u32) -> FsResult<V>,
     ) -> FsResult<V> {
         with_mount(real.mount_id, op, |mount| f(mount, real.ino)).ok_or({
             if ino == OVERLAY_ROOT_INO {
@@ -99,7 +99,19 @@ impl OverlayFs {
             } else {
                 FsError::NotFound
             }
-        })
+        })?
+    }
+
+    fn merged_root_names(&self) -> Vec<String> {
+        let mut names = BTreeSet::new();
+        for root in [self.upper, self.lower] {
+            if let Some(layer_names) = with_mount(root.mount_id, BackendOp::Readdir, |mount| {
+                mount.list_root_names()
+            }) {
+                names.extend(layer_names);
+            }
+        }
+        names.into_iter().collect()
     }
 }
 
@@ -147,7 +159,7 @@ impl LegacyLookupOps for OverlayFs {
         let real = self.real_for_overlay(ino)?;
         Self::with_real(ino, real, BackendOp::Readlink, |mount, real_ino| {
             mount.readlink(real_ino, buf)
-        })?
+        })
     }
 
     fn read_dirent64(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> FsResult<(usize, u64)> {
@@ -155,17 +167,10 @@ impl LegacyLookupOps for OverlayFs {
             let real = self.real_for_overlay(ino)?;
             return Self::with_real(ino, real, BackendOp::Readdir, |mount, real_ino| {
                 mount.read_dirent64(real_ino, offset, buf)
-            })?;
+            });
         }
 
-        let mut names = BTreeSet::new();
-        for root in [self.upper, self.lower] {
-            if let Some(layer_names) = with_mount(root.mount_id, BackendOp::Readdir, |mount| {
-                mount.list_root_names()
-            }) {
-                names.extend(layer_names);
-            }
-        }
+        let names = self.merged_root_names();
         let mut entries = Vec::new();
         entries.push(RawDirEntry {
             ino: OVERLAY_ROOT_INO,
@@ -192,15 +197,7 @@ impl LegacyLookupOps for OverlayFs {
     }
 
     fn list_root_names(&mut self) -> Vec<String> {
-        let mut names = BTreeSet::new();
-        for root in [self.upper, self.lower] {
-            if let Some(layer_names) = with_mount(root.mount_id, BackendOp::Readdir, |mount| {
-                mount.list_root_names()
-            }) {
-                names.extend(layer_names);
-            }
-        }
-        names.into_iter().collect()
+        self.merged_root_names()
     }
 }
 
@@ -232,7 +229,7 @@ impl LegacyMetadataOps for OverlayFs {
             real,
             BackendOp::NamespaceMutation,
             |mount, real_ino| mount.set_times(real_ino, atime, mtime, ctime),
-        )?
+        )
     }
 
     fn set_mode(&mut self, ino: u32, mode: u32) -> FsResult {
@@ -242,7 +239,7 @@ impl LegacyMetadataOps for OverlayFs {
             real,
             BackendOp::NamespaceMutation,
             |mount, real_ino| mount.set_mode(real_ino, mode),
-        )?
+        )
     }
 
     fn set_owner(&mut self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> FsResult {
@@ -252,14 +249,14 @@ impl LegacyMetadataOps for OverlayFs {
             real,
             BackendOp::NamespaceMutation,
             |mount, real_ino| mount.set_owner(real_ino, uid, gid),
-        )?
+        )
     }
 
     fn inode_flags(&mut self, ino: u32) -> FsResult<u32> {
         let real = self.real_for_overlay(ino)?;
         Self::with_real(ino, real, BackendOp::StatFull, |mount, real_ino| {
             mount.inode_flags(real_ino)
-        })?
+        })
     }
 
     fn set_inode_flags(&mut self, ino: u32, flags: u32) -> FsResult {
@@ -269,7 +266,7 @@ impl LegacyMetadataOps for OverlayFs {
             real,
             BackendOp::NamespaceMutation,
             |mount, real_ino| mount.set_inode_flags(real_ino, flags),
-        )?
+        )
     }
 
     fn stat(&mut self, ino: u32) -> FsResult<FileStat> {
@@ -281,7 +278,7 @@ impl LegacyMetadataOps for OverlayFs {
         let real = self.real_for_overlay(ino)?;
         let mut stat = Self::with_real(ino, real, BackendOp::StatFull, |mount, real_ino| {
             mount.stat(real_ino)
-        })??;
+        })?;
         stat.ino = ino as u64;
         Ok(stat)
     }
@@ -292,7 +289,7 @@ impl LegacyDataOps for OverlayFs {
         let real = self.real_for_overlay(ino)?;
         Self::with_real(ino, real, BackendOp::TruncateAllocate, |mount, real_ino| {
             mount.set_len(real_ino, len)
-        })?
+        })
     }
 
     fn read_at(&mut self, ino: u32, buf: &mut [u8], offset: u64) -> usize {
@@ -387,7 +384,7 @@ impl LegacySyncOps for OverlayFs {
         let real = self.real_for_overlay(ino)?;
         Self::with_real(ino, real, BackendOp::Sync, |mount, real_ino| {
             mount.sync(real_ino, data_only)
-        })?
+        })
     }
 }
 
@@ -396,13 +393,13 @@ impl LegacyInodeLifecycleOps for OverlayFs {
         let real = self.real_for_overlay(ino)?;
         Self::with_real(ino, real, BackendOp::InodeLifetime, |mount, real_ino| {
             mount.retain_inode(real_ino)
-        })?
+        })
     }
 
     fn release_inode(&mut self, ino: u32) -> FsResult<InodeRelease> {
         let real = self.real_for_overlay(ino)?;
         Self::with_real(ino, real, BackendOp::InodeLifetime, |mount, real_ino| {
             mount.release_inode(real_ino)
-        })?
+        })
     }
 }

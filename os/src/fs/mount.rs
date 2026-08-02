@@ -1788,12 +1788,7 @@ pub(crate) fn mount_proc_at(
     mount_new_fs_at(
         namespace_id,
         target,
-        MountedFs::new(
-            Box::new(ProcFs::new()),
-            String::from("proc"),
-            "proc",
-            options,
-        ),
+        MountedFs::new(Box::new(ProcFs), String::from("proc"), "proc", options),
         target_path,
     )
 }
@@ -2770,7 +2765,7 @@ fn mount_kernel_pseudo_filesystems(static_mounts: &mut Vec<StaticMount>) {
         root,
         "proc",
         "/proc",
-        Box::new(ProcFs::new()),
+        Box::new(ProcFs),
         "proc",
         "rw",
     ) {
@@ -2800,7 +2795,7 @@ fn mount_kernel_pseudo_filesystems(static_mounts: &mut Vec<StaticMount>) {
         root,
         "dev",
         "/dev",
-        Box::new(DevFs::new()),
+        Box::new(DevFs),
         "devfs",
         "rw",
     ) {

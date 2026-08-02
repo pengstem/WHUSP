@@ -8,6 +8,7 @@ pub(super) const AT_REMOVEDIR: u32 = 0x200;
 pub(super) const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 pub(super) const AT_EACCESS: i32 = 0x200;
 pub(super) const AT_SYMLINK_FOLLOW: u32 = 0x400;
+// Accepted by path APIs as a no-op; this VFS has no automount triggers.
 pub(super) const AT_NO_AUTOMOUNT: i32 = 0x800;
 pub(super) const AT_EMPTY_PATH: i32 = 0x1000;
 pub(super) const VALID_FSTATAT_FLAGS: i32 = AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH;

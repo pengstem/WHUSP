@@ -48,6 +48,14 @@ impl EventFd {
     }
 }
 
+fn check_io_len(len: usize) -> FsResult {
+    if len < size_of::<u64>() {
+        Err(FsError::InvalidInput)
+    } else {
+        Ok(())
+    }
+}
+
 impl EventFdInner {
     fn sleep_reader(&mut self) -> Option<*mut crate::task::TaskContext> {
         let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
@@ -150,11 +158,9 @@ impl File for EventFd {
                 (value, inner.wake_writer(), inner.write_poll_waiters.drain())
             };
             drop(inner);
-            if value != 0 {
-                wake_eventfd_writer(writer);
-                PollWaiter::wake_all(poll_writers);
-                return buf.copy_from_slice(&value.to_ne_bytes());
-            }
+            wake_eventfd_writer(writer);
+            PollWaiter::wake_all(poll_writers);
+            return buf.copy_from_slice(&value.to_ne_bytes());
         }
     }
 
@@ -233,20 +239,12 @@ impl File for EventFd {
         Ok(FileStat::with_mode(S_IFIFO | 0o600))
     }
 
-    fn check_read(&self, len: usize) -> FsResult {
-        if len < size_of::<u64>() {
-            Err(FsError::InvalidInput)
-        } else {
-            Ok(())
-        }
+    fn check_write(&self, len: usize, _append: bool) -> FsResult {
+        check_io_len(len)
     }
 
-    fn check_write(&self, len: usize, _append: bool) -> FsResult {
-        if len < size_of::<u64>() {
-            Err(FsError::InvalidInput)
-        } else {
-            Ok(())
-        }
+    fn check_read(&self, len: usize) -> FsResult {
+        check_io_len(len)
     }
 
     fn status_flags(&self) -> OpenFlags {

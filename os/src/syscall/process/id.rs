@@ -4,7 +4,7 @@ use crate::task::{
     ProcessControlBlock, SignalFlags, SignalInfo, current_process, current_task,
     exit_current_and_run_next, exit_current_group_and_run_next,
     notify_if_orphaned_stopped_process_group, pid2process, processes_snapshot,
-    queue_signal_to_task, suspend_current_and_run_next, wakeup_task,
+    queue_signal_to_process as task_queue_signal_to_process, suspend_current_and_run_next,
 };
 use crate::uapi::errno::{Errno, KResult};
 use alloc::{sync::Arc, vec::Vec};
@@ -244,9 +244,7 @@ fn caller_can_signal_target(
     // process-wide credentials.
     let caller = caller.credentials();
     let target = target.credentials();
-    caller.is_root()
-        || target.uid_matches_saved_set(caller.ruid)
-        || target.uid_matches_saved_set(caller.euid)
+    caller.can_signal(&target)
 }
 
 fn queue_signal_to_process(
@@ -257,25 +255,7 @@ fn queue_signal_to_process(
     if signal.is_empty() {
         return;
     }
-    let target = {
-        let tasks = process.tasks_snapshot();
-        tasks
-            .iter()
-            .find(|task| {
-                let task_inner = task.inner_exclusive_access();
-                !(task_inner.signal_mask & signal).contains(signal)
-            })
-            .cloned()
-            .or_else(|| tasks.first().cloned())
-    };
-    if let Some(task) = target {
-        queue_signal_to_task(task, signal, info);
-    }
-    if signal.check_error().is_some() {
-        for task in process.tasks_snapshot() {
-            wakeup_task(task);
-        }
-    }
+    task_queue_signal_to_process(process, signal, info);
 }
 
 fn kill_targets(

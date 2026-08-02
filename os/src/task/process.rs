@@ -313,6 +313,12 @@ impl Credentials {
     pub fn gid_matches_saved_set(&self, gid: u32) -> bool {
         gid == self.rgid || gid == self.egid || gid == self.sgid
     }
+
+    pub fn can_signal(&self, target: &Self) -> bool {
+        self.is_root()
+            || target.uid_matches_saved_set(self.ruid)
+            || target.uid_matches_saved_set(self.euid)
+    }
 }
 
 impl Default for Credentials {

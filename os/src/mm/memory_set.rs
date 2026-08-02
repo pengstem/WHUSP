@@ -41,19 +41,7 @@ pub struct MemorySet {
 
 impl MemorySet {
     pub fn new_bare() -> Self {
-        Self {
-            page_table: PageTable::new(),
-            control: AddressSpaceControl::new(),
-            areas: Vec::new(),
-            last_area_idx_containing: Cell::new(None),
-            brk_base: 0,
-            brk: 0,
-            brk_limit: 0,
-            brk_mapped_end: 0,
-            mmap_next: crate::config::USER_MMAP_BASE,
-            mlock_future: false,
-            mlock_future_on_fault: false,
-        }
+        Self::try_new_bare().expect("bare memory-set construction requires free frames")
     }
     pub fn try_new_bare() -> Option<Self> {
         Some(Self {
@@ -114,14 +102,7 @@ impl MemorySet {
 
     pub(super) fn invalidate_tlb_vpn_range(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) {
         assert!(start_vpn < end_vpn, "empty virtual-page invalidation range");
-        let start = usize::from(VirtAddr::from(start_vpn));
-        let pages = end_vpn
-            .0
-            .checked_sub(start_vpn.0)
-            .expect("inverted virtual-page invalidation range");
-        let size = pages
-            .checked_mul(crate::config::PAGE_SIZE)
-            .expect("virtual-page invalidation size overflow");
+        let (start, size) = Self::vpn_range_bytes(start_vpn, end_vpn);
         self.control.invalidate_tlb_range(start, size);
     }
 
@@ -134,16 +115,21 @@ impl MemorySet {
             start_vpn < end_vpn,
             "empty fresh virtual-page publication range"
         );
+        let (start, size) = Self::vpn_range_bytes(start_vpn, end_vpn);
+        self.control
+            .publish_fresh_tlb_range_on_user_return(start, size);
+    }
+
+    fn vpn_range_bytes(start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> (usize, usize) {
         let start = usize::from(VirtAddr::from(start_vpn));
         let pages = end_vpn
             .0
             .checked_sub(start_vpn.0)
-            .expect("inverted fresh virtual-page publication range");
+            .expect("inverted virtual-page range");
         let size = pages
             .checked_mul(crate::config::PAGE_SIZE)
-            .expect("fresh virtual-page publication size overflow");
-        self.control
-            .publish_fresh_tlb_range_on_user_return(start, size);
+            .expect("virtual-page range size overflow");
+        (start, size)
     }
     /// Maps kernel-private framed pages without clearing the new frames.
     ///

@@ -52,18 +52,11 @@ const RWF_HIPRI: usize = 0x0000_0001;
 const RWF_NOWAIT: usize = 0x0000_0008;
 const PREADV_COALESCE_CHUNK_SIZE: usize = 64 * 1024;
 const WRITEV_COALESCE_CHUNK_SIZE: usize = 64 * 1024;
-// CONTEXT: Prepared iovec ranges are syscall-local snapshots of user mappings;
-// do not cache these translated slices beyond the current readv/writev call.
-const USER_IOVEC_RANGE_REUSE: bool = true;
 const SYNC_FILE_RANGE_WAIT_BEFORE: u32 = 0x01;
 const SYNC_FILE_RANGE_WRITE: u32 = 0x02;
 const SYNC_FILE_RANGE_WAIT_AFTER: u32 = 0x04;
 const VALID_SYNC_FILE_RANGE_FLAGS: u32 =
     SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER;
-
-fn truncate_user_buffers(buffers: TranslatedUserBuffer, limit: usize) -> TranslatedUserBuffer {
-    buffers.truncate(limit)
-}
 
 impl UserIovecCursor {
     fn new(token: usize, iovecs: UserIovecs, access: UserBufferAccess) -> Self {
@@ -76,7 +69,7 @@ impl UserIovecCursor {
         }
     }
 
-    fn validate_all(&mut self, prepare_for_reuse: bool) -> KResult<()> {
+    fn validate(&mut self, prepare_for_reuse: bool) -> KResult<()> {
         // CONTEXT: readv/preadv validate every destination iovec before
         // reading so an early filesystem read cannot partially modify user
         // memory before a later bad iovec reports EFAULT.
@@ -112,6 +105,14 @@ impl UserIovecCursor {
             self.prepared_chunks = Some(prepared_chunks);
         }
         Ok(())
+    }
+
+    fn validate_all(&mut self) -> KResult<()> {
+        self.validate(false)
+    }
+
+    fn validate_and_prepare(&mut self) -> KResult<()> {
+        self.validate(true)
     }
 
     fn next_chunk(&mut self) -> Option<KResult<UserIovecChunk>> {
@@ -154,6 +155,10 @@ impl UserIovecCursor {
 /// `EINVAL`, preserving the visible readv/writev-family ABI boundary.
 fn read_user_iovecs(token: usize, iov: *const LinuxIovec, iovcnt: usize) -> KResult<UserIovecs> {
     let entries = read_user_array(token, iov, iovcnt)?;
+    validate_iovec_entries(entries)
+}
+
+fn validate_iovec_entries(entries: Vec<LinuxIovec>) -> KResult<UserIovecs> {
     let mut total_len = 0usize;
     for iovec in entries.iter() {
         total_len = total_len.checked_add(iovec.len).ok_or(Errno::EINVAL)?;
@@ -170,14 +175,7 @@ fn read_user_iovecs_ctx(
     iovcnt: usize,
 ) -> KResult<UserIovecs> {
     let entries = read_user_array_ctx(ctx, iov, iovcnt)?;
-    let mut total_len = 0usize;
-    for iovec in entries.iter() {
-        total_len = total_len.checked_add(iovec.len).ok_or(Errno::EINVAL)?;
-        if total_len > isize::MAX as usize {
-            return Err(Errno::EINVAL);
-        }
-    }
-    Ok(UserIovecs { entries, total_len })
+    validate_iovec_entries(entries)
 }
 
 fn ensure_nonblocking_ready(entry: &FdTableEntry, events: PollEvents) -> KResult<()> {
@@ -240,7 +238,7 @@ fn writev_regular_file_coalesced(
             }
         };
         let chunk_len = chunk.len.min(remaining_len);
-        let buffers = truncate_user_buffers(chunk.buffers, chunk_len);
+        let buffers = chunk.buffers.truncate(chunk_len);
         for slice in buffers {
             let slice = slice.as_slice();
             let mut remaining = &slice[..];
@@ -320,7 +318,7 @@ fn pwritev_regular_file_coalesced(
             }
         };
         let chunk_len = chunk.len.min(remaining_len);
-        let buffers = truncate_user_buffers(chunk.buffers, chunk_len);
+        let buffers = chunk.buffers.truncate(chunk_len);
         for slice in buffers {
             let slice = slice.as_slice();
             let mut remaining = &slice[..];
@@ -424,7 +422,7 @@ fn pwritev_regular_file_direct_page_slices(
             Err(err) => return Err(err),
         };
         let chunk_len = chunk.len.min(remaining_len);
-        let chunk_buffers = truncate_user_buffers(chunk.buffers, chunk_len);
+        let chunk_buffers = chunk.buffers.truncate(chunk_len);
         buffers.append(chunk_buffers);
         pending_len = pending_len.saturating_add(chunk_len);
         remaining_len = remaining_len.saturating_sub(chunk_len);
@@ -460,7 +458,7 @@ fn writev_regular_file_direct_page_slices(
             Err(err) => return Err(err),
         };
         let chunk_len = chunk.len.min(remaining_len);
-        let chunk_buffers = truncate_user_buffers(chunk.buffers, chunk_len);
+        let chunk_buffers = chunk.buffers.truncate(chunk_len);
         buffers.append(chunk_buffers);
         pending_len = pending_len.saturating_add(chunk_len);
         remaining_len = remaining_len.saturating_sub(chunk_len);
@@ -483,7 +481,7 @@ fn collect_iovec_buffers(
     while let Some(chunk) = cursor.next_chunk() {
         let chunk = chunk?;
         let chunk_len = chunk.len.min(remaining_len);
-        buffers.append(truncate_user_buffers(chunk.buffers, chunk_len));
+        buffers.append(chunk.buffers.truncate(chunk_len));
         remaining_len = remaining_len.saturating_sub(chunk_len);
         if remaining_len == 0 {
             break;
@@ -1482,7 +1480,7 @@ fn sys_vmsplice_write(
             Err(err) => return Err(err),
         };
         let chunk_len = chunk.len.min(remaining_len);
-        let buffers = truncate_user_buffers(chunk.buffers, chunk_len);
+        let buffers = chunk.buffers.truncate(chunk_len);
         let written = write_with_status_flags(&entry, UserBuffer::new(buffers));
         total_written += written;
         remaining_len = remaining_len.saturating_sub(written);
@@ -1517,7 +1515,7 @@ fn sys_vmsplice_read(
     while let Some(chunk) = cursor.next_chunk() {
         let chunk = chunk?;
         let chunk_len = chunk.len.min(remaining_len);
-        let buffers = truncate_user_buffers(chunk.buffers, chunk_len);
+        let buffers = chunk.buffers.truncate(chunk_len);
         let read = file.read(UserBuffer::new(buffers));
         total_read += read;
         remaining_len = remaining_len.saturating_sub(read);
@@ -1736,7 +1734,7 @@ pub fn sys_preadv(
     }
 
     let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Write);
-    cursor.validate_all(USER_IOVEC_RANGE_REUSE)?;
+    cursor.validate_and_prepare()?;
     if iovcnt > 1 {
         let total_read =
             preadv_regular_file_coalesced(file.as_ref(), cursor, offset, requested_len)?;
@@ -1857,7 +1855,7 @@ pub fn sys_pwritev(
             Err(err) => return Err(err),
         };
         let chunk_len = chunk.len.min(remaining_len);
-        let buffers = truncate_user_buffers(chunk.buffers, chunk_len);
+        let buffers = chunk.buffers.truncate(chunk_len);
         if let Err(err) = file.check_write_at(offset, chunk_len) {
             fault_in_read_buffers(&buffers);
             return Err(err.into());
@@ -2078,7 +2076,7 @@ fn sys_writev_with_iovecs(
             Err(err) => return Err(err),
         };
         let chunk_len = chunk.len.min(remaining_len);
-        let buffers = truncate_user_buffers(chunk.buffers, chunk_len);
+        let buffers = chunk.buffers.truncate(chunk_len);
         let written = write_with_status_flags(&entry, UserBuffer::new(buffers));
         total_written += written;
         remaining_len = remaining_len.saturating_sub(written);
@@ -2130,8 +2128,12 @@ fn sys_readv_with_iovecs(token: usize, fd: usize, iovecs: UserIovecs, iovcnt: us
     ensure_nonblocking_ready(&entry, PollEvents::POLLIN)?;
 
     let mut cursor = UserIovecCursor::new(token, iovecs, UserBufferAccess::Write);
-    let reuse_checked_range = USER_IOVEC_RANGE_REUSE && iovcnt > 1 && mode_type == S_IFREG;
-    cursor.validate_all(reuse_checked_range)?;
+    let reuse_checked_range = iovcnt > 1 && mode_type == S_IFREG;
+    if reuse_checked_range {
+        cursor.validate_and_prepare()?;
+    } else {
+        cursor.validate_all()?;
+    }
     if reuse_checked_range {
         let buffers = collect_iovec_buffers(cursor, requested_len)?;
         let total_read = file.read(UserBuffer::new(buffers));

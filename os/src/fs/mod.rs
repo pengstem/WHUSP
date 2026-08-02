@@ -182,7 +182,7 @@ impl PollWaiter {
 
     pub fn complete_block_handoff(&self) {
         if self.was_triggered() {
-            let _ = crate::task::wakeup_task(Arc::clone(&self.task));
+            crate::task::wakeup_task(Arc::clone(&self.task));
         }
     }
 

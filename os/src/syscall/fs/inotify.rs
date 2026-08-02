@@ -16,11 +16,11 @@ use crate::task::{
 use crate::uapi::errno::{Errno, KResult};
 use alloc::collections::btree_map::Entry;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
-use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
+use core::fmt::Write as _;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 
@@ -399,13 +399,12 @@ impl InotifyGroup {
         self.inner.with_lock(|inner| {
             let mut output = String::new();
             for watch in inner.watches.iter() {
-                output.push_str(
-                    format!(
-                        "inotify wd:{} ino:{:x} sdev:{:x} mask:{:x}\n",
-                        watch.wd, watch.node.ino, watch.node.mount_id.0, watch.mask
-                    )
-                    .as_str(),
-                );
+                writeln!(
+                    &mut output,
+                    "inotify wd:{} ino:{:x} sdev:{:x} mask:{:x}",
+                    watch.wd, watch.node.ino, watch.node.mount_id.0, watch.mask
+                )
+                .unwrap();
             }
             output
         })

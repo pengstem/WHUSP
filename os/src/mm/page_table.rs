@@ -100,10 +100,8 @@ pub(crate) struct PageTableStats {
 // has already committed to a kernel mapping invariant; failure there is a
 // kernel bug or an unrecoverable boot-path allocation failure.
 impl PageTable {
-    pub fn new() -> Self {
-        let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocPageTable);
-        let frame = frame_alloc().expect("page table root allocation requires a free frame");
-        PageTable {
+    fn from_root_frame(frame: FrameTracker) -> Self {
+        Self {
             root_ppn: frame.ppn,
             asid: arch_mm::alloc_page_table_asid(),
             frames: vec![frame],
@@ -114,19 +112,10 @@ impl PageTable {
             shared_root_entries: [0; SHARED_ROOT_MASK_WORDS],
         }
     }
+
     pub fn try_new() -> Option<Self> {
         let _profile_scope = perf::time_scope(perf::ProfilePoint::FrameAllocPageTable);
-        let frame = frame_alloc()?;
-        Some(PageTable {
-            root_ppn: frame.ppn,
-            asid: arch_mm::alloc_page_table_asid(),
-            frames: vec![frame],
-            leaves_4k: 0,
-            leaves_2m: 0,
-            leaves_1g: 0,
-            #[cfg(target_arch = "riscv64")]
-            shared_root_entries: [0; SHARED_ROOT_MASK_WORDS],
-        })
+        Some(Self::from_root_frame(frame_alloc()?))
     }
     /// Builds a non-owning view over an existing page-table token.
     ///

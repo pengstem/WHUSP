@@ -1,11 +1,12 @@
-use crate::fs::{File, FileStat, OpenFlags};
+use crate::fs::{File, OpenFlags};
 use crate::mm::UserBuffer;
 use crate::syscall::LinuxSigInfo;
 use crate::syscall::install_file_fd;
 use crate::syscall::user_ptr::read_user_value;
 use crate::task::{
     Credentials, FdFlags, FdTableEntry, ProcessControlBlock, SignalFlags, SignalInfo,
-    current_process, current_user_token, pid2process, queue_signal_to_task, wakeup_task,
+    current_process, current_user_token, pid2process,
+    queue_signal_to_process as task_queue_signal_to_process,
 };
 use crate::uapi::errno::{Errno, KResult};
 use alloc::format;
@@ -44,10 +45,6 @@ impl File for PidFdFile {
 
     fn write(&self, _buf: UserBuffer) -> usize {
         0
-    }
-
-    fn stat(&self) -> crate::fs::FsResult<FileStat> {
-        Ok(FileStat::default())
     }
 }
 
@@ -106,9 +103,7 @@ fn pid_from_fd(pidfd: usize) -> KResult<usize> {
 fn caller_can_signal_target(caller: &Credentials, target: &Credentials) -> bool {
     // UNFINISHED: Linux also checks CAP_KILL in the target user namespace and
     // PID namespace reachability. This kernel has one credential/PID namespace.
-    caller.is_root()
-        || target.uid_matches_saved_set(caller.ruid)
-        || target.uid_matches_saved_set(caller.euid)
+    caller.can_signal(target)
 }
 
 fn queue_signal_to_process(
@@ -119,25 +114,7 @@ fn queue_signal_to_process(
     if signal.is_empty() {
         return;
     }
-    let target = {
-        let tasks = process.tasks_snapshot();
-        tasks
-            .iter()
-            .find(|task| {
-                let task_inner = task.inner_exclusive_access();
-                !(task_inner.signal_mask & signal).contains(signal)
-            })
-            .cloned()
-            .or_else(|| tasks.first().cloned())
-    };
-    if let Some(task) = target {
-        queue_signal_to_task(task, signal, info);
-    }
-    if signal.check_error().is_some() {
-        for task in process.tasks_snapshot() {
-            wakeup_task(task);
-        }
-    }
+    task_queue_signal_to_process(process, signal, info);
 }
 
 fn signal_info_from_user(signum: u32, info: *const LinuxSigInfo) -> KResult<SignalInfo> {

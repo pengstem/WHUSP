@@ -195,12 +195,6 @@ impl DevFsFile {
 
 pub(super) struct DevFs;
 
-impl DevFs {
-    pub(super) fn new() -> Self {
-        Self
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PtyEndpoint {
     Master,

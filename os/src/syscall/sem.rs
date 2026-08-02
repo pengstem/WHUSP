@@ -17,6 +17,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::fmt::Write as _;
 use lazy_static::*;
 
 const IPC_PRIVATE: isize = 0;
@@ -622,7 +623,8 @@ impl SemManager {
             "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n",
         );
         for (&semid, set) in &self.sets {
-            output.push_str(&format!(
+            writeln!(
+                &mut output,
                 "{:10} {:10} {:5o} {:10} {:5} {:5} {:5} {:5} {:10} {:10}\n",
                 set.key,
                 semid,
@@ -634,7 +636,8 @@ impl SemManager {
                 set.cgid,
                 set.otime,
                 set.ctime,
-            ));
+            )
+            .unwrap();
         }
         output
     }

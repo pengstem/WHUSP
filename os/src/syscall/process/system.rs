@@ -167,9 +167,8 @@ pub fn sys_reboot(magic: usize, magic2: usize, op: usize, _arg: usize) -> KResul
         return Err(Errno::EINVAL);
     }
 
-    // UNFINISHED: Linux requires CAP_SYS_BOOT in the caller's user namespace
-    // and returns EPERM for unprivileged callers. This kernel has no real
-    // credential or capability model yet and runs contest user tasks as root.
+    // UNFINISHED: CAP_SYS_BOOT and user-namespace capability rules are not
+    // yet wired into reboot permission checks.
     match op {
         LINUX_REBOOT_CMD_CAD_OFF | LINUX_REBOOT_CMD_CAD_ON => Ok(0),
         LINUX_REBOOT_CMD_HALT | LINUX_REBOOT_CMD_POWER_OFF | LINUX_REBOOT_CMD_RESTART => {

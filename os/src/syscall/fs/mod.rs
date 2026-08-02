@@ -16,6 +16,7 @@ mod poll;
 mod stat;
 mod tty;
 mod uapi;
+mod wait_util;
 
 pub use epoll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait, sys_epoll_pwait2};
 pub use eventfd::sys_eventfd2;

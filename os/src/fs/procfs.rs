@@ -1,8 +1,3 @@
-#![expect(
-    clippy::vec_init_then_push,
-    reason = "procfs directory builders keep entries in display order with conditional additions"
-)]
-
 mod state;
 
 use super::dentry_cache;
@@ -319,12 +314,6 @@ pub(crate) struct ProcNamespaceInfo {
     pub(crate) kind: ProcNamespaceKind,
     pub(crate) id: usize,
     pub(crate) parent_id: Option<usize>,
-}
-
-impl ProcFs {
-    pub(super) fn new() -> Self {
-        Self
-    }
 }
 
 fn pid_dir_ino(pid: usize) -> u32 {
@@ -684,6 +673,10 @@ fn node_kind(node: ProcNode) -> FsNodeKind {
     }
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn root_entries() -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -771,6 +764,10 @@ fn root_entries() -> Vec<RawDirEntry> {
     entries
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn oskernel_entries() -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -791,6 +788,10 @@ fn oskernel_entries() -> Vec<RawDirEntry> {
     entries
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn sys_entries() -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -831,6 +832,10 @@ fn sys_entries() -> Vec<RawDirEntry> {
     entries
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn sysvipc_entries() -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -861,6 +866,10 @@ fn sysvipc_entries() -> Vec<RawDirEntry> {
     entries
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn sys_vm_entries() -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -886,6 +895,10 @@ fn sys_vm_entries() -> Vec<RawDirEntry> {
     entries
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn sys_net_entries() -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -911,6 +924,10 @@ fn sys_net_entries() -> Vec<RawDirEntry> {
     entries
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn sys_net_core_entries() -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -936,6 +953,10 @@ fn sys_net_core_entries() -> Vec<RawDirEntry> {
     entries
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn sys_net_ipv4_entries() -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -956,6 +977,10 @@ fn sys_net_ipv4_entries() -> Vec<RawDirEntry> {
     entries
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn sys_net_ipv4_conf_entries() -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -981,6 +1006,10 @@ fn sys_net_ipv4_conf_entries() -> Vec<RawDirEntry> {
     entries
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn sys_net_ipv4_conf_iface_entries(ino: u32, tag_ino: u32) -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -1001,6 +1030,10 @@ fn sys_net_ipv4_conf_iface_entries(ino: u32, tag_ino: u32) -> Vec<RawDirEntry> {
     entries
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn sys_fs_entries() -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -1044,6 +1077,10 @@ fn sys_fs_entries() -> Vec<RawDirEntry> {
 }
 
 #[cfg(feature = "fanotify")]
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn sys_fs_fanotify_entries() -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -1065,6 +1102,10 @@ fn sys_fs_fanotify_entries() -> Vec<RawDirEntry> {
 }
 
 #[cfg(feature = "inotify")]
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn sys_fs_inotify_entries() -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -1095,6 +1136,10 @@ fn sys_fs_inotify_entries() -> Vec<RawDirEntry> {
     entries
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn sys_kernel_entries() -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -1195,6 +1240,10 @@ fn sys_kernel_entries() -> Vec<RawDirEntry> {
     entries
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn sys_user_entries() -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -1215,6 +1264,10 @@ fn sys_user_entries() -> Vec<RawDirEntry> {
     entries
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn pid_entries(pid: usize) -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {
@@ -1335,6 +1388,10 @@ fn pid_entries(pid: usize) -> Vec<RawDirEntry> {
     entries
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn pid_task_entries(pid: usize) -> FsResult<Vec<RawDirEntry>> {
     let process = pid2process(pid).ok_or(FsError::NotFound)?;
     let tasks = process.tasks_snapshot();
@@ -1362,6 +1419,10 @@ fn pid_task_entries(pid: usize) -> FsResult<Vec<RawDirEntry>> {
     Ok(entries)
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn pid_task_tid_entries(pid: usize, local_tid: usize) -> FsResult<Vec<RawDirEntry>> {
     let task_dir_ino = pid_task_tid_dir_ino(pid, local_tid).ok_or(FsError::NotFound)?;
     let stat_ino = pid_task_tid_stat_ino(pid, local_tid).ok_or(FsError::NotFound)?;
@@ -1390,6 +1451,10 @@ fn pid_task_tid_entries(pid: usize, local_tid: usize) -> FsResult<Vec<RawDirEntr
     Ok(entries)
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn pid_fd_entries(pid: usize) -> FsResult<Vec<RawDirEntry>> {
     let process = pid2process(pid).ok_or(FsError::NotFound)?;
     let fd_names: Vec<_> = {
@@ -1426,6 +1491,10 @@ fn pid_fdinfo_entry_ino(pid: usize, fd: usize) -> u32 {
     PID_FDINFO_ENTRY_BASE + pid as u32 * PID_FD_ENTRY_STRIDE + fd as u32
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn pid_fdinfo_entries(pid: usize) -> FsResult<Vec<RawDirEntry>> {
     let process = pid2process(pid).ok_or(FsError::NotFound)?;
     let fd_names: Vec<_> = {
@@ -1458,6 +1527,10 @@ fn pid_fdinfo_entries(pid: usize) -> FsResult<Vec<RawDirEntry>> {
     Ok(entries)
 }
 
+#[expect(
+    clippy::vec_init_then_push,
+    reason = "keep procfs entries in display order"
+)]
 fn pid_ns_entries(pid: usize) -> Vec<RawDirEntry> {
     let mut entries = Vec::new();
     entries.push(RawDirEntry {

@@ -424,7 +424,7 @@ fn current_can_set_time() -> bool {
             .unwrap_or(false)
 }
 
-fn itimerspec_from_us(interval_us: usize, value_us: usize) -> LinuxITimerSpec {
+pub(crate) fn itimerspec_from_us(interval_us: usize, value_us: usize) -> LinuxITimerSpec {
     LinuxITimerSpec {
         it_interval: us_to_timespec(interval_us),
         it_value: us_to_timespec(value_us),

@@ -181,7 +181,6 @@ impl CpuMask {
         self.0
     }
 
-    #[allow(dead_code)]
     pub const fn contains(self, cpu: CpuId) -> bool {
         cpu < u64::BITS as usize && self.0 & (1u64 << cpu) != 0
     }
@@ -190,13 +189,6 @@ impl CpuMask {
         self.0.count_ones() as usize
     }
 
-    #[allow(dead_code)]
-    pub fn insert(&mut self, cpu: CpuId) {
-        assert!(cpu < MAX_CPUS, "CPU ID exceeds MAX_CPUS");
-        self.0 |= 1u64 << cpu;
-    }
-
-    #[allow(dead_code)]
     pub fn remove(&mut self, cpu: CpuId) {
         assert!(cpu < MAX_CPUS, "CPU ID exceeds MAX_CPUS");
         self.0 &= !(1u64 << cpu);
@@ -222,7 +214,6 @@ impl AtomicCpuMask {
         CpuMask(self.0.swap(mask.bits(), order))
     }
 
-    #[allow(dead_code)]
     pub fn insert(&self, cpu: CpuId, order: Ordering) {
         assert!(cpu < MAX_CPUS, "CPU ID exceeds MAX_CPUS");
         self.0.fetch_or(1u64 << cpu, order);
@@ -233,7 +224,6 @@ impl AtomicCpuMask {
         CpuMask(self.0.fetch_or(1u64 << cpu, order))
     }
 
-    #[allow(dead_code)]
     pub fn remove(&self, cpu: CpuId, order: Ordering) {
         assert!(cpu < MAX_CPUS, "CPU ID exceeds MAX_CPUS");
         self.0.fetch_and(!(1u64 << cpu), order);
@@ -315,15 +305,9 @@ impl CpuTopology {
         &self.logical_to_hw_id[..self.possible_count]
     }
 
-    #[allow(dead_code)]
     pub fn hardware_id(&self, cpu: CpuId) -> usize {
         assert!(cpu < self.possible_count, "logical CPU ID is not possible");
         self.logical_to_hw_id[cpu]
-    }
-
-    #[allow(dead_code)]
-    pub fn logical_id(&self, hw_id: usize) -> Option<CpuId> {
-        self.hardware_ids().iter().position(|id| *id == hw_id)
     }
 }
 

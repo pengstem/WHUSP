@@ -282,11 +282,6 @@ pub fn sys_open_tree(dirfd: isize, path: *const u8, flags: u32) -> KResult {
     let path = read_user_c_string(token, path, PATH_MAX)?;
     let cloexec = flags & OPEN_TREE_CLOEXEC != 0;
     let nofollow = flags & AT_SYMLINK_NOFOLLOW as u32 != 0;
-    if flags & AT_NO_AUTOMOUNT as u32 != 0 {
-        // CONTEXT: This kernel does not implement automount triggers, so
-        // AT_NO_AUTOMOUNT is accepted as a no-op for Linux API compatibility.
-    }
-
     let mut open_flags = OpenFlags::PATH | open_flags_from_cloexec(cloexec);
     if nofollow {
         open_flags |= OpenFlags::NOFOLLOW;
