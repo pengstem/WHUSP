@@ -1,7 +1,7 @@
 mod context;
 
 use crate::arch::interrupt::{disable_supervisor_interrupt, enable_supervisor_interrupt};
-use crate::config::TRAMPOLINE;
+use crate::config::{MAX_CPUS, TRAMPOLINE};
 use crate::mm::{
     FaultOrigin, MmapFaultAccess, UserFaultFatal, UserFaultOutcome, record_fault_retry,
     record_fault_retry_chain, record_fault_retry_wait, resolve_user_page_fault,
@@ -11,16 +11,18 @@ use crate::syscall::{
     syscall_with_current_task,
 };
 use crate::task::{
-    SignalAction, SignalFlags, TaskControlBlock, check_signals_of_task, current_add_signal,
-    current_process, current_task, exit_current_group_and_run_next, process_of_task,
-    suspend_current_and_run_next, timer_tick_should_preempt, trap_cx_of_task,
+    SignalAction, SignalFlags, TaskControlBlock, TaskControlBlockInner, check_signals_of_task,
+    current_add_signal, current_process, current_task, exit_current_group_and_run_next,
+    process_of_task, suspend_current_and_run_next, timer_tick_should_preempt, trap_cx_of_task,
     trap_return_context_after_accounting_for_task,
 };
 use crate::timer::{check_timer, set_next_trigger};
 #[cfg(feature = "precise-cpu-accounting")]
 use crate::{task::account_task_user_time_until, timer::get_time_us};
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use loongArch64::cpu::CPUCFG;
 use loongArch64::register::{
     badv, ecfg,
@@ -33,17 +35,35 @@ use loongArch64::register::{pwch, pwcl};
 
 global_asm!(include_str!("trap.S"));
 
+const FP_CAP: u8 = 1 << 0;
+const LSX_CAP: u8 = 1 << 1;
+const LASX_CAP: u8 = 1 << 2;
+const NO_FP_OWNER: usize = 0;
+static USER_FP_CAPS: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(0) }; MAX_CPUS];
+static USER_FP_OWNERS: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(NO_FP_OWNER) }; MAX_CPUS];
+
 pub fn init() {
-    // CONTEXT: The LoongArch contest userland is built with the lp64d ABI.
-    // Enable every vector width implemented by this CPU. trap.S inspects the
-    // same EUEN bits and eagerly preserves the corresponding user state.
     let extension_config = CPUCFG::read(2);
+    let fp = extension_config.get_bit(0);
     let lsx = extension_config.get_bit(6);
     let lasx = extension_config.get_bit(7);
+    assert!(!lsx || fp, "LSX CPUCFG support requires scalar FP support");
     assert!(!lasx || lsx, "LASX CPUCFG support requires LSX support");
-    euen::set_fpe(true);
-    euen::set_sxe(lsx);
-    euen::set_asxe(lasx);
+    let mut caps = 0;
+    if fp {
+        caps |= FP_CAP;
+    }
+    if lsx {
+        caps |= LSX_CAP;
+    }
+    if lasx {
+        caps |= LASX_CAP;
+    }
+    USER_FP_CAPS[crate::cpu::current_id()].store(caps, Ordering::Relaxed);
+    // Leave all user extended units disabled until the matching unavailable
+    // exception proves that the current task actually uses them.
+    disable_user_fp_units();
     tlb_init(extension_config.get_bit(24));
     set_kernel_trap_entry();
 }
@@ -106,6 +126,7 @@ fn tlb_init(hardware_page_table_walk: bool) {
 
 #[unsafe(no_mangle)]
 pub fn trap_handler() -> ! {
+    crate::perf::record_la_user_trap_entry();
     let mut task = current_task().expect("trap_handler requires a running task");
     let mut process = process_of_task(&task);
     #[cfg(feature = "precise-cpu-accounting")]
@@ -203,6 +224,21 @@ pub fn trap_handler() -> ! {
         Trap::Exception(Exception::InstructionNotExist)
         | Trap::Exception(Exception::InstructionPrivilegeIllegal) => {
             current_add_signal(SignalFlags::SIGILL);
+        }
+        Trap::Exception(Exception::FloatingPointUnavailable) => {
+            if !activate_user_fp_for_task(&task, UserFpMode::Scalar) {
+                current_add_signal(SignalFlags::SIGILL);
+            }
+        }
+        Trap::Exception(Exception::LsxUnavailable) => {
+            if !activate_user_fp_for_task(&task, UserFpMode::Lsx) {
+                current_add_signal(SignalFlags::SIGILL);
+            }
+        }
+        Trap::Exception(Exception::LasxUnavailable) => {
+            if !activate_user_fp_for_task(&task, UserFpMode::Lasx) {
+                current_add_signal(SignalFlags::SIGILL);
+            }
         }
         Trap::Interrupt(Interrupt::IPI) => {
             crate::arch::smp::clear_local_ipi();
@@ -319,14 +355,185 @@ fn trap_return_for_task(
     if flush_tlb {
         crate::perf::record_la_return_invtlb_call();
     }
+    disable_supervisor_interrupt();
+    prepare_user_fp_return_for_task(&task);
     drop(process);
     drop(task);
-    disable_supervisor_interrupt();
     set_kernel_trap_entry();
     unsafe extern "C" {
         unsafe fn __restore(trap_cx: usize, user_token: usize, flush_tlb: usize) -> !;
     }
     unsafe { __restore(trap_cx, user_token, flush_tlb as usize) }
+}
+
+#[inline(always)]
+fn user_fp_owner_key(task: &TaskControlBlock) -> usize {
+    task as *const TaskControlBlock as usize
+}
+
+#[inline(always)]
+fn required_fp_cap(mode: UserFpMode) -> u8 {
+    match mode {
+        UserFpMode::Scalar => FP_CAP,
+        UserFpMode::Lsx => FP_CAP | LSX_CAP,
+        UserFpMode::Lasx => FP_CAP | LSX_CAP | LASX_CAP,
+    }
+}
+
+#[inline(always)]
+fn disable_user_fp_units() {
+    euen::set_asxe(false);
+    euen::set_sxe(false);
+    euen::set_fpe(false);
+}
+
+#[inline(always)]
+fn enable_user_fp_mode(mode: UserFpMode) {
+    euen::set_fpe(true);
+    euen::set_sxe(mode >= UserFpMode::Lsx);
+    euen::set_asxe(mode >= UserFpMode::Lasx);
+}
+
+fn save_live_user_fp_state(task: &TaskControlBlock, inner: &mut TaskControlBlockInner) -> bool {
+    let cpu = crate::cpu::current_id();
+    let owner = &USER_FP_OWNERS[cpu];
+    if owner.load(Ordering::Relaxed) != user_fp_owner_key(task) {
+        return false;
+    }
+    let state = inner
+        .loongarch_fp_state
+        .as_deref_mut()
+        .expect("LoongArch FP owner lost its allocated state");
+    let _mode = state
+        .mode()
+        .expect("LoongArch FP owner has an invalid state mode");
+    unsafe extern "C" {
+        unsafe fn __la_save_user_fp_state(state: *mut UserFpState);
+    }
+    unsafe { __la_save_user_fp_state(state) };
+    crate::perf::record_la_user_fp_save();
+    state.mark_saved();
+    disable_user_fp_units();
+    owner.store(NO_FP_OWNER, Ordering::Relaxed);
+    true
+}
+
+/// Flush a live local owner before the task becomes migratable.
+pub(crate) fn leave_user_fp_owner_before_switch(
+    task: &TaskControlBlock,
+    inner: &mut TaskControlBlockInner,
+    preserve: bool,
+) {
+    if preserve {
+        save_live_user_fp_state(task, inner);
+    } else {
+        let cpu = crate::cpu::current_id();
+        let owner = &USER_FP_OWNERS[cpu];
+        if owner.load(Ordering::Relaxed) == user_fp_owner_key(task) {
+            disable_user_fp_units();
+            owner.store(NO_FP_OWNER, Ordering::Relaxed);
+        }
+        inner.loongarch_fp_state = None;
+        task.publish_loongarch_fp_state(false);
+    }
+}
+
+/// Materialize the current task's live registers for fork, clone, or signals.
+pub(crate) fn sync_user_fp_state_for_task(task: &TaskControlBlock) {
+    let mut inner = task.inner_exclusive_access();
+    save_live_user_fp_state(task, &mut inner);
+}
+
+pub(crate) fn snapshot_user_fp_state_for_task(task: &TaskControlBlock) -> Option<UserFpState> {
+    if !task.has_loongarch_fp_state_fast() {
+        return None;
+    }
+    sync_user_fp_state_for_task(task);
+    task.inner_exclusive_access()
+        .loongarch_fp_state
+        .as_deref()
+        .copied()
+}
+
+pub(crate) fn discard_user_fp_state_for_task(task: &TaskControlBlock) {
+    let mut inner = task.inner_exclusive_access();
+    leave_user_fp_owner_before_switch(task, &mut inner, false);
+}
+
+pub(crate) fn install_user_fp_state_for_task(
+    task: &TaskControlBlock,
+    mut state: Option<UserFpState>,
+) -> bool {
+    if state.as_ref().is_some_and(|state| !state.validate()) {
+        return false;
+    }
+    let mut inner = task.inner_exclusive_access();
+    leave_user_fp_owner_before_switch(task, &mut inner, false);
+    if let Some(state) = state.as_mut() {
+        state.mark_saved();
+    }
+    let active = state.is_some();
+    inner.loongarch_fp_state = state.map(Box::new);
+    task.publish_loongarch_fp_state(active);
+    true
+}
+
+fn activate_user_fp_for_task(task: &TaskControlBlock, mode: UserFpMode) -> bool {
+    let cpu = crate::cpu::current_id();
+    let caps = USER_FP_CAPS[cpu].load(Ordering::Relaxed);
+    if caps & required_fp_cap(mode) != required_fp_cap(mode) {
+        return false;
+    }
+
+    let mut inner = task.inner_exclusive_access();
+    // An LSX/LASX disabled trap can upgrade a scalar or LSX owner that is still
+    // live on this CPU. Save the overlapping lower lanes before widening it.
+    save_live_user_fp_state(task, &mut inner);
+    let state = inner
+        .loongarch_fp_state
+        .get_or_insert_with(|| Box::new(UserFpState::new(mode)));
+    state.upgrade(mode);
+    task.publish_loongarch_fp_state(true);
+    crate::perf::record_la_user_fp_lazy_trap(mode as usize);
+    true
+}
+
+fn prepare_user_fp_return_for_task(task: &TaskControlBlock) {
+    let cpu = crate::cpu::current_id();
+    let owner = &USER_FP_OWNERS[cpu];
+    let owner_key = user_fp_owner_key(task);
+    let current_owner = owner.load(Ordering::Relaxed);
+    if current_owner == owner_key {
+        crate::perf::record_la_user_fp_owner_return_hit();
+        return;
+    }
+    assert_eq!(
+        current_owner, NO_FP_OWNER,
+        "LoongArch CPU retained another task's FP owner"
+    );
+    if !task.has_loongarch_fp_state_fast() {
+        return;
+    }
+
+    let mut inner = task.inner_exclusive_access();
+    let Some(state) = inner.loongarch_fp_state.as_deref_mut() else {
+        panic!("LoongArch FP fast state lost its allocation");
+    };
+    assert!(
+        state.needs_restore(),
+        "migratable LoongArch FP state was not materialized"
+    );
+    let mode = state
+        .mode()
+        .expect("LoongArch task has an invalid FP state mode");
+    enable_user_fp_mode(mode);
+    unsafe extern "C" {
+        unsafe fn __la_restore_user_fp_state(state: *const UserFpState);
+    }
+    unsafe { __la_restore_user_fp_state(state) };
+    crate::perf::record_la_user_fp_restore();
+    state.mark_live();
+    owner.store(owner_key, Ordering::Relaxed);
 }
 
 #[unsafe(no_mangle)]
@@ -386,4 +593,4 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
     }
 }
 
-pub use context::TrapContext;
+pub use context::{TrapContext, UserFpMode, UserFpState};

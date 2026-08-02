@@ -181,6 +181,13 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) time_direct_timespec_calls: usize,
     pub(crate) riscv_return_fence_i_calls: usize,
     pub(crate) la_return_invtlb_calls: usize,
+    pub(crate) la_user_trap_entries: usize,
+    pub(crate) la_user_fp_save_calls: usize,
+    pub(crate) la_user_fp_restore_calls: usize,
+    pub(crate) la_user_fp_owner_return_hits: usize,
+    pub(crate) la_user_fp_lazy_scalar_traps: usize,
+    pub(crate) la_user_fp_lazy_lsx_traps: usize,
+    pub(crate) la_user_fp_lazy_lasx_traps: usize,
     pub(crate) rv_user_trap_entries: usize,
     pub(crate) rv_sbi_set_timer_calls: usize,
     pub(crate) rv_user_fp_save_calls: usize,
@@ -567,6 +574,11 @@ macro_rules! declare_perf_events {
             fn record_time_direct_timespec_call() => record_time_direct_timespec_call_impl;
             fn record_riscv_return_fence_i_call() => record_riscv_return_fence_i_call_impl;
             fn record_la_return_invtlb_call() => record_la_return_invtlb_call_impl;
+            fn record_la_user_trap_entry() => record_la_user_trap_entry_impl;
+            fn record_la_user_fp_save() => record_la_user_fp_save_impl;
+            fn record_la_user_fp_restore() => record_la_user_fp_restore_impl;
+            fn record_la_user_fp_owner_return_hit() => record_la_user_fp_owner_return_hit_impl;
+            fn record_la_user_fp_lazy_trap(_mode: usize) => record_la_user_fp_lazy_trap_impl;
             fn record_rv_user_trap_entry() => record_rv_user_trap_entry_impl;
             fn record_rv_sbi_set_timer_call() => record_rv_sbi_set_timer_call_impl;
             fn record_rv_user_fp_save_call() => record_rv_user_fp_save_call_impl;
@@ -780,6 +792,13 @@ mod enabled {
     static TIME_DIRECT_TIMESPEC_CALLS: AtomicUsize = AtomicUsize::new(0);
     static RISCV_RETURN_FENCE_I_CALLS: AtomicUsize = AtomicUsize::new(0);
     static LA_RETURN_INVTLB_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static LA_USER_TRAP_ENTRIES: PerCpuCounter = PerCpuCounter::new();
+    static LA_USER_FP_SAVE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static LA_USER_FP_RESTORE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static LA_USER_FP_OWNER_RETURN_HITS: AtomicUsize = AtomicUsize::new(0);
+    static LA_USER_FP_LAZY_SCALAR_TRAPS: AtomicUsize = AtomicUsize::new(0);
+    static LA_USER_FP_LAZY_LSX_TRAPS: AtomicUsize = AtomicUsize::new(0);
+    static LA_USER_FP_LAZY_LASX_TRAPS: AtomicUsize = AtomicUsize::new(0);
     static RV_USER_TRAP_ENTRIES: PerCpuCounter = PerCpuCounter::new();
     static RV_SBI_SET_TIMER_CALLS: PerCpuCounter = PerCpuCounter::new();
     static RV_USER_FP_SAVE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -1762,6 +1781,36 @@ mod enabled {
     #[allow(dead_code)]
     fn record_la_return_invtlb_call_impl() {
         LA_RETURN_INVTLB_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    fn record_la_user_trap_entry_impl() {
+        LA_USER_TRAP_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    fn record_la_user_fp_save_impl() {
+        LA_USER_FP_SAVE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    fn record_la_user_fp_restore_impl() {
+        LA_USER_FP_RESTORE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    fn record_la_user_fp_owner_return_hit_impl() {
+        LA_USER_FP_OWNER_RETURN_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    fn record_la_user_fp_lazy_trap_impl(mode: usize) {
+        match mode {
+            1 => LA_USER_FP_LAZY_SCALAR_TRAPS.fetch_add(1, Ordering::Relaxed),
+            2 => LA_USER_FP_LAZY_LSX_TRAPS.fetch_add(1, Ordering::Relaxed),
+            3 => LA_USER_FP_LAZY_LASX_TRAPS.fetch_add(1, Ordering::Relaxed),
+            _ => panic!("invalid LoongArch user FP mode {mode}"),
+        };
     }
 
     #[allow(dead_code)]
@@ -2788,6 +2837,13 @@ mod enabled {
             time_direct_timespec_calls: TIME_DIRECT_TIMESPEC_CALLS.load(Ordering::Relaxed),
             riscv_return_fence_i_calls: RISCV_RETURN_FENCE_I_CALLS.load(Ordering::Relaxed),
             la_return_invtlb_calls: LA_RETURN_INVTLB_CALLS.load(Ordering::Relaxed),
+            la_user_trap_entries: LA_USER_TRAP_ENTRIES.load(Ordering::Relaxed),
+            la_user_fp_save_calls: LA_USER_FP_SAVE_CALLS.load(Ordering::Relaxed),
+            la_user_fp_restore_calls: LA_USER_FP_RESTORE_CALLS.load(Ordering::Relaxed),
+            la_user_fp_owner_return_hits: LA_USER_FP_OWNER_RETURN_HITS.load(Ordering::Relaxed),
+            la_user_fp_lazy_scalar_traps: LA_USER_FP_LAZY_SCALAR_TRAPS.load(Ordering::Relaxed),
+            la_user_fp_lazy_lsx_traps: LA_USER_FP_LAZY_LSX_TRAPS.load(Ordering::Relaxed),
+            la_user_fp_lazy_lasx_traps: LA_USER_FP_LAZY_LASX_TRAPS.load(Ordering::Relaxed),
             rv_user_trap_entries: RV_USER_TRAP_ENTRIES.load(Ordering::Relaxed),
             rv_sbi_set_timer_calls: RV_SBI_SET_TIMER_CALLS.load(Ordering::Relaxed),
             rv_user_fp_save_calls: RV_USER_FP_SAVE_CALLS.load(Ordering::Relaxed),
@@ -3241,6 +3297,13 @@ mod enabled {
          time_direct_timespec_calls {}\n\
          riscv_return_fence_i_calls {}\n\
          la_return_invtlb_calls {}\n\
+         la_user_trap_entries {}\n\
+         la_user_fp_save_calls {}\n\
+         la_user_fp_restore_calls {}\n\
+         la_user_fp_owner_return_hits {}\n\
+         la_user_fp_lazy_scalar_traps {}\n\
+         la_user_fp_lazy_lsx_traps {}\n\
+         la_user_fp_lazy_lasx_traps {}\n\
          rv_user_trap_entries {}\n\
          rv_sbi_set_timer_calls {}\n\
          rv_user_fp_save_calls {}\n\
@@ -3625,6 +3688,13 @@ mod enabled {
             stats.time_direct_timespec_calls,
             stats.riscv_return_fence_i_calls,
             stats.la_return_invtlb_calls,
+            stats.la_user_trap_entries,
+            stats.la_user_fp_save_calls,
+            stats.la_user_fp_restore_calls,
+            stats.la_user_fp_owner_return_hits,
+            stats.la_user_fp_lazy_scalar_traps,
+            stats.la_user_fp_lazy_lsx_traps,
+            stats.la_user_fp_lazy_lasx_traps,
             stats.rv_user_trap_entries,
             stats.rv_sbi_set_timer_calls,
             stats.rv_user_fp_save_calls,

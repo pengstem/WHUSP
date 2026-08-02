@@ -38,7 +38,7 @@ export PATH := $(LOONGARCH_TOOLCHAIN_BIN):$(PATH)
 endif
 
 RISCV_TARGET := riscv64gc-unknown-none-elf
-LOONGARCH_TARGET := loongarch64-unknown-none
+LOONGARCH_TARGET := loongarch64-unknown-none-softfloat
 KERNEL_RV_SRC := os/target/$(RISCV_TARGET)/$(MODE)/os
 KERNEL_LA_SRC := os/target/$(LOONGARCH_TARGET)/$(MODE)/os
 

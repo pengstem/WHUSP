@@ -50,6 +50,8 @@ pub struct TaskControlBlock {
     // whether any task-local signal is queued; masked signals may cause a slow
     // check, but false negatives are forbidden.
     signal_pending: AtomicBool,
+    #[cfg(target_arch = "loongarch64")]
+    loongarch_fp_state_active: AtomicBool,
     // mutable
     pub inner: SpinNoIrqLock<TaskControlBlockInner>,
 }
@@ -81,6 +83,8 @@ pub struct TaskControlBlockInner {
     pub res: Option<TaskUserRes>,
     pub tid: usize,
     pub trap_cx_ppn: PhysPageNum,
+    #[cfg(target_arch = "loongarch64")]
+    pub(crate) loongarch_fp_state: Option<alloc::boxed::Box<crate::arch::trap::UserFpState>>,
     pub task_cx: TaskContext,
     pub task_status: TaskStatus,
     // Scheduler ownership is explicit so a task cannot be both running and
@@ -145,6 +149,18 @@ impl TaskControlBlock {
         self.signal_pending.load(Ordering::Acquire)
     }
 
+    #[cfg(target_arch = "loongarch64")]
+    #[inline(always)]
+    pub(crate) fn has_loongarch_fp_state_fast(&self) -> bool {
+        self.loongarch_fp_state_active.load(Ordering::Acquire)
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    pub(crate) fn publish_loongarch_fp_state(&self, active: bool) {
+        self.loongarch_fp_state_active
+            .store(active, Ordering::Release);
+    }
+
     /// Publishes the exact queue summary while the caller still owns
     /// `self.inner`; signal enqueue and consume sites use that same lock, so a
     /// clear cannot overwrite a later enqueue with `false`.
@@ -182,10 +198,14 @@ impl TaskControlBlock {
             kstack,
             sched: TaskSched::new(),
             signal_pending: AtomicBool::new(false),
+            #[cfg(target_arch = "loongarch64")]
+            loongarch_fp_state_active: AtomicBool::new(false),
             inner: SpinNoIrqLock::new(TaskControlBlockInner {
                 res: Some(res),
                 tid,
                 trap_cx_ppn,
+                #[cfg(target_arch = "loongarch64")]
+                loongarch_fp_state: None,
                 task_cx: TaskContext::goto_trap_return(kstack_top),
                 task_status: TaskStatus::Ready,
                 on_cpu: None,

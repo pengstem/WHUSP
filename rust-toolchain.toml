@@ -3,4 +3,8 @@ profile = "minimal"
 # use the nightly version of the last stable toolchain, see <https://forge.rust-lang.org/>
 channel = "nightly-2025-05-20"
 components = ["rust-src", "llvm-tools", "rustfmt", "clippy"]
-targets = ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none"]
+targets = [
+    "riscv64gc-unknown-none-elf",
+    "loongarch64-unknown-none",
+    "loongarch64-unknown-none-softfloat",
+]

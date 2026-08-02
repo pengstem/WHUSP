@@ -12,9 +12,9 @@
     .equ LA_CSR_TLBRSAVE, 0x8b
     .equ LA_CSR_TLBRELO0, 0x8c
     .equ LA_CSR_TLBRELO1, 0x8d
-    .equ VECTOR_OFFSET, 40
-    .equ FCC_OFFSET, 168
-    .equ FCSR_OFFSET, 169
+    .equ VECTOR_OFFSET, 0
+    .equ FCC_OFFSET, 128
+    .equ FCSR_OFFSET, 129
 
     .macro SAVE_REGS
         st.d    $ra, $sp,  1*8
@@ -234,7 +234,6 @@ __trap_vector_base:
 1:
     csrrd   $sp, KSAVE_CTX
     SAVE_REGS
-    SAVE_FP_REGS
     # __restore leaves PGDL on the user root and PGDH on the kernel root.
     # Kernel code, stacks, and the direct map all use high addresses, so the
     # existing PGDH already covers trap execution. Preserve PGDL and its TLB
@@ -257,7 +256,6 @@ __restore:
     invtlb  0x00, $r0, $r0
 2:
     csrrd   $sp, KSAVE_CTX
-    LOAD_FP_REGS
     LOAD_REGS
     ertn
 
@@ -283,3 +281,21 @@ __tlb_refill:
     csrwr   $r0, LA_CSR_TLBRELO0
     csrwr   $r0, LA_CSR_TLBRELO1
     b       .Ltlb_refill_fill
+
+    .section .text
+    .globl __la_save_user_fp_state
+    .globl __la_restore_user_fp_state
+    .align 2
+__la_save_user_fp_state:
+    move    $t8, $sp
+    move    $sp, $a0
+    SAVE_FP_REGS
+    move    $sp, $t8
+    jirl    $zero, $ra, 0
+
+__la_restore_user_fp_state:
+    move    $t8, $sp
+    move    $sp, $a0
+    LOAD_FP_REGS
+    move    $sp, $t8
+    jirl    $zero, $ra, 0

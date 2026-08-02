@@ -77,6 +77,8 @@ impl Estat {
             0xd => Trap::Exception(Exception::InstructionNotExist), //指令不合规
             0xe => Trap::Exception(Exception::InstructionPrivilegeIllegal), //指令特权级不合规
             0xf => Trap::Exception(Exception::FloatingPointUnavailable), //浮点处理器不可用
+            0x10 => Trap::Exception(Exception::LsxUnavailable), // LSX disabled
+            0x11 => Trap::Exception(Exception::LasxUnavailable), // LASX disabled
             _ => Trap::Unknown,
         }
     }
@@ -112,6 +114,8 @@ pub enum Exception {
     InstructionNotExist = 0xD,
     InstructionPrivilegeIllegal = 0xE,
     FloatingPointUnavailable = 0xF,
+    LsxUnavailable = 0x10,
+    LasxUnavailable = 0x11,
     TLBRFill,
 }
 

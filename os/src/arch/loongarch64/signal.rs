@@ -11,7 +11,7 @@ use crate::task::{
     TaskControlBlock, current_add_signal, current_process, current_task, current_trap_cx,
     current_user_token, flags_to_linux_sigset, linux_sigset_to_flags, trap_cx_of_task,
 };
-use crate::trap::TrapContext;
+use crate::trap::{TrapContext, UserFpState};
 use crate::uapi::errno::{Errno, KResult};
 use alloc::sync::Arc;
 use core::mem::{offset_of, size_of};
@@ -127,6 +127,8 @@ struct LoongArchSignalFrame {
     magic: usize,
     trampoline: [u32; 2],
     saved_context: TrapContext,
+    saved_fp_state_valid: usize,
+    saved_fp_state: UserFpState,
     siginfo: LinuxSigInfo,
     ucontext: LinuxUContextCompat,
 }
@@ -257,6 +259,7 @@ pub fn deliver_pending_signal(
     let Some(delivery) = take_pending_user_signal_for_task(task, process) else {
         return false;
     };
+    let saved_fp_state = crate::arch::trap::snapshot_user_fp_state_for_task(task);
     let saved_context = *trap_cx_of_task(task);
     let user_sp = saved_context.x[3];
     let frame_sp = (user_sp - size_of::<LoongArchSignalFrame>()) & !(SIGNAL_STACK_ALIGN - 1);
@@ -264,6 +267,9 @@ pub fn deliver_pending_signal(
         magic: SIGNAL_FRAME_MAGIC,
         trampoline: RT_SIGRETURN_TRAMPOLINE,
         saved_context,
+        saved_fp_state_valid: usize::from(saved_fp_state.is_some()),
+        saved_fp_state: saved_fp_state
+            .unwrap_or_else(|| UserFpState::new(crate::trap::UserFpMode::Scalar)),
         siginfo: LinuxSigInfo::from(delivery.info),
         ucontext: LinuxUContextCompat::new(interrupted_pc, saved_context, delivery.old_mask),
     };
@@ -326,8 +332,15 @@ pub fn sys_rt_sigreturn() -> KResult {
         return Err(Errno::EINVAL);
     }
 
-    if let Some(task) = current_task() {
-        task.inner_exclusive_access().signal_mask = frame.ucontext.sigmask.restored_signal_mask();
+    let task = current_task().expect("rt_sigreturn requires a current task");
+    task.inner_exclusive_access().signal_mask = frame.ucontext.sigmask.restored_signal_mask();
+    let restored_fp_state = match frame.saved_fp_state_valid {
+        0 => None,
+        1 if frame.saved_fp_state.validate() => Some(frame.saved_fp_state),
+        _ => return Err(Errno::EINVAL),
+    };
+    if !crate::arch::trap::install_user_fp_state_for_task(&task, restored_fp_state) {
+        return Err(Errno::EINVAL);
     }
     let mut restored_context = frame.saved_context;
     restored_context.era = frame.ucontext.mcontext.pc;

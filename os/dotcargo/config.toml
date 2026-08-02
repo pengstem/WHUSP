@@ -10,3 +10,8 @@ rustflags = [
 rustflags = [
     "-Cforce-frame-pointers=yes", "-Ctarget-feature=-lsx,-lasx"
 ]
+
+[target.loongarch64-unknown-none-softfloat]
+rustflags = [
+    "-Cforce-frame-pointers=yes"
+]

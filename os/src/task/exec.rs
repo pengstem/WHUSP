@@ -439,6 +439,8 @@ impl ProcessControlBlock {
             track_regular_file_executable(node);
         }
 
+        #[cfg(target_arch = "loongarch64")]
+        crate::arch::trap::discard_user_fp_state_for_task(&task);
         let mut task_inner = task.inner_exclusive_access();
         // UNFINISHED: Linux also notifies robust-futex waiters when the owner
         // thread execve()s. This path currently clears the per-thread robust

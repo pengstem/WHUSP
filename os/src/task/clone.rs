@@ -86,6 +86,8 @@ pub struct ClonedThread {
 /// must be attached to the process task table by the caller.
 pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     let current_task = current_task().expect("clone_current_thread requires a current task");
+    #[cfg(target_arch = "loongarch64")]
+    crate::arch::trap::sync_user_fp_state_for_task(&current_task);
     let process = current_task
         .process
         .upgrade()
@@ -98,6 +100,8 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
         .ustack_base;
     let parent_inner = current_task.inner_exclusive_access();
     let parent_trap_cx = *parent_inner.get_trap_cx();
+    #[cfg(target_arch = "loongarch64")]
+    let parent_fp_state = parent_inner.loongarch_fp_state.clone();
     let parent_signal_mask = parent_inner.signal_mask;
     let parent_sched_policy = parent_inner.sched_policy;
     let parent_sched_priority = parent_inner.sched_priority;
@@ -160,6 +164,12 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
         new_trap_cx.set_tp(args.tls);
     }
     new_trap_cx.kernel_sp = new_task.kstack.get_top();
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let fp_state_active = parent_fp_state.is_some();
+        new_task_inner.loongarch_fp_state = parent_fp_state;
+        new_task.publish_loongarch_fp_state(fp_state_active);
+    }
     if args.flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
         new_task_inner.clear_child_tid = Some(args.ctid);
     }

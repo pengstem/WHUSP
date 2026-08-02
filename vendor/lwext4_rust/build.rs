@@ -148,7 +148,10 @@ fn binding_clang_args(arch: &str) -> Vec<String> {
             args
         }
         "loongarch64" => {
-            let mut args = vec!["--target=loongarch64-unknown-linux-musl".to_string()];
+            let mut args = vec![
+                "--target=loongarch64-unknown-linux-musl".to_string(),
+                "-mabi=lp64s".to_string(),
+            ];
 
             if let Some(sysroot) = compiler_output("loongarch64-linux-musl-gcc", "-print-sysroot") {
                 if sysroot != "/" {

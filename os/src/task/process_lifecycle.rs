@@ -281,6 +281,8 @@ impl ProcessControlBlock {
         mount_namespace_id: crate::fs::MountNamespaceId,
         exit_signal: u32,
     ) -> Option<Arc<Self>> {
+        #[cfg(target_arch = "loongarch64")]
+        crate::arch::trap::sync_user_fp_state_for_task(calling_task);
         let mut parent = self.inner_exclusive_access();
         let parent_resident_kb = parent.memory_set.resident_bytes() / 1024;
         parent.cpu_times.record_resident_kb(parent_resident_kb);
@@ -324,6 +326,8 @@ impl ProcessControlBlock {
             .expect("fork calling task must have TaskUserRes")
             .ustack_base();
         let parent_trap_cx = *parent_task_inner.get_trap_cx();
+        #[cfg(target_arch = "loongarch64")]
+        let parent_fp_state = parent_task_inner.loongarch_fp_state.clone();
         let parent_signal_mask = parent_task_inner.signal_mask;
         let parent_sigaltstack = parent_task_inner.sigaltstack;
         let parent_sched_policy = parent_task_inner.sched_policy;
@@ -430,6 +434,12 @@ impl ProcessControlBlock {
         let trap_cx = task_inner.get_trap_cx();
         *trap_cx = parent_trap_cx;
         trap_cx.kernel_sp = task.kstack.get_top();
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let fp_state_active = parent_fp_state.is_some();
+            task_inner.loongarch_fp_state = parent_fp_state;
+            task.publish_loongarch_fp_state(fp_state_active);
+        }
         task_inner.signal_mask = parent_signal_mask;
         task_inner.sigaltstack = parent_sigaltstack;
         task_inner.timer_slack_ns = parent_timer_slack_ns;

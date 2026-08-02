@@ -210,6 +210,12 @@ fn prepare_current_switch_inner(
                 return None;
             }
         }
+        #[cfg(target_arch = "loongarch64")]
+        crate::arch::trap::leave_user_fp_owner_before_switch(
+            &task,
+            &mut inner,
+            reason != SwitchReason::Exit,
+        );
         if reason == SwitchReason::Block {
             inner.task_status = TaskStatus::Blocked;
         } else if reason == SwitchReason::Exit {

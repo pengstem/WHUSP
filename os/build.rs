@@ -3,7 +3,9 @@ fn main() {
 
     match std::env::var("TARGET").as_deref() {
         Ok("riscv64gc-unknown-none-elf") => use_linker_script("src/linker-qemu.ld"),
-        Ok("loongarch64-unknown-none") => use_linker_script("src/linker-loongarch64.ld"),
+        Ok("loongarch64-unknown-none") | Ok("loongarch64-unknown-none-softfloat") => {
+            use_linker_script("src/linker-loongarch64.ld")
+        }
         _ => {}
     }
 }

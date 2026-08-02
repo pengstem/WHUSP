@@ -19,7 +19,7 @@ ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
 DEFAULT_DISK := ../sdcard-rv.img
 else ifeq ($(ARCH),loongarch64)
-TARGET := loongarch64-unknown-none
+TARGET := loongarch64-unknown-none-softfloat
 DEFAULT_DISK := ../sdcard-la.img
 else
 $(error unsupported ARCH: $(ARCH))

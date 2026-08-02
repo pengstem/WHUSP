@@ -84,6 +84,8 @@ pub use signal::{
 pub use signal::{SIGRT_1, SIGRTMIN};
 pub(crate) use signal::{flags_to_linux_sigset, linux_sigset_to_flags};
 pub(crate) use tcb::SCHED_RR_INTERVAL_US;
+#[cfg(target_arch = "loongarch64")]
+pub(crate) use tcb::TaskControlBlockInner;
 pub use tcb::{DEFAULT_TIMER_SLACK_NS, TaskControlBlock, TaskStatus};
 
 const CORE_DUMP_STATUS_BIT: i32 = 0x80;
