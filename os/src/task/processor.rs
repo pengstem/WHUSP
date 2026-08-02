@@ -1,6 +1,6 @@
 use super::__switch;
 use super::fetch_task;
-use super::{ProcessControlBlock, SignalFlags, TaskContext, TaskControlBlock, TaskStatus};
+use super::{ProcessControlBlock, TaskContext, TaskControlBlock, TaskStatus};
 use crate::arch::hart;
 use crate::config::MAX_CPUS;
 use crate::cpu::{AtomicCpuMask, CpuMask};
@@ -156,18 +156,17 @@ fn publish_processor_idle(cpu: usize, idle: bool) {
 pub(super) fn prepare_current_switch(
     reason: SwitchReason,
 ) -> (Arc<TaskControlBlock>, *mut TaskContext) {
-    prepare_current_switch_inner(reason, None).expect("unconditional context switch was rejected")
+    prepare_current_switch_inner(reason, false).expect("unconditional context switch was rejected")
 }
 
-pub(super) fn prepare_current_block_unless_signals(
-    interrupting_signals: SignalFlags,
-) -> Option<(Arc<TaskControlBlock>, *mut TaskContext)> {
-    prepare_current_switch_inner(SwitchReason::Block, Some(interrupting_signals))
+pub(super) fn prepare_current_block_unless_interrupting_signal()
+-> Option<(Arc<TaskControlBlock>, *mut TaskContext)> {
+    prepare_current_switch_inner(SwitchReason::Block, true)
 }
 
 fn prepare_current_switch_inner(
     reason: SwitchReason,
-    interrupting_signals: Option<SignalFlags>,
+    reject_interrupting_signal: bool,
 ) -> Option<(Arc<TaskControlBlock>, *mut TaskContext)> {
     let cpu = crate::cpu::current_id();
     let mut processor = processor();
@@ -180,6 +179,12 @@ fn prepare_current_switch_inner(
         .as_ref()
         .map(Arc::clone)
         .expect("context switch requires a current task");
+    let interrupting_process = reject_interrupting_signal.then(|| {
+        processor
+            .current_process
+            .as_ref()
+            .expect("context switch lost its current process")
+    });
     let task_cx_ptr = {
         let mut inner = task.inner_exclusive_access();
         assert_eq!(
@@ -194,11 +199,14 @@ fn prepare_current_switch_inner(
         );
         assert!(!inner.on_rq, "current task is also on a run queue");
         assert!(!inner.wake_pending, "running task retained a wakeup");
-        if let Some(interrupting_signals) = interrupting_signals {
-            let pending_unmasked = SignalFlags::from_bits_retain(
-                inner.pending_signals.bits() & !inner.signal_mask.bits(),
-            );
-            if pending_unmasked.intersects(interrupting_signals) {
+        if let Some(process) = interrupting_process {
+            // Load the cached disposition while holding the task lock. This
+            // pairs with sigaction's cache update followed by its pending-task
+            // scan: either this sees the new mask, or that scan sees Blocked.
+            let interrupting_signals = process.signal_wake_mask();
+            let pending_unmasked =
+                ((inner.pending_signals.bits() & !inner.signal_mask.bits()) >> 1) as u64;
+            if pending_unmasked & interrupting_signals != 0 {
                 return None;
             }
         }

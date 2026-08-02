@@ -75,10 +75,10 @@ pub(crate) use sched::{
 #[cfg(feature = "ptrace")]
 pub use signal::SIGTRAP;
 pub use signal::{
-    CLD_CONTINUED, CLD_STOPPED, DefaultSignalAction, MINSIGSTKSZ, SA_NOCLDSTOP, SA_RESTART,
-    SI_TKILL, SIGCHLD, SIGCONT, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SS_DISABLE, SS_ONSTACK,
-    SigAltStack, SignalAction, SignalFlags, SignalInfo, default_signal_action,
-    default_signal_error, default_signal_exit_code, signal_child_status, signal_wait_status,
+    CLD_CONTINUED, CLD_STOPPED, DefaultSignalAction, MINSIGSTKSZ, SA_NOCLDSTOP, SI_TKILL, SIGCHLD,
+    SIGCONT, SIGKILL, SIGNAL_INFO_SLOTS, SIGSTOP, SS_DISABLE, SS_ONSTACK, SigAltStack,
+    SignalAction, SignalFlags, SignalInfo, default_signal_action, default_signal_error,
+    default_signal_exit_code, signal_child_status, signal_wait_status,
 };
 #[cfg(target_arch = "riscv64")]
 pub use signal::{SIGRT_1, SIGRTMIN};
@@ -169,22 +169,7 @@ pub fn block_current_task_no_schedule() -> (Arc<TaskControlBlock>, *mut TaskCont
 pub fn block_current_task_no_schedule_unless_interrupting_signal()
 -> Option<(Arc<TaskControlBlock>, *mut TaskContext)> {
     try_account_current_system_time();
-    // Keep the no-signal hot path free of the process-wide signal-action
-    // lock. This first attempt checks pending state and publishes Blocked under
-    // the task lock. A signal queued afterward observes Blocked and performs
-    // the matching wakeup decision.
-    let all_signals = SignalFlags::from_bits_retain(u128::MAX);
-    if let Some(blocked) = processor::prepare_current_block_unless_signals(all_signals) {
-        return Some(blocked);
-    }
-
-    // At least one unmasked signal was already pending. Classify dispositions
-    // outside the scheduler lock, then repeat the pending check atomically with
-    // the Blocked transition so signals queued during classification are also
-    // covered.
-    let process = current_process();
-    let interrupting_signals = interrupting_signal_mask(&process, |_, _| true);
-    processor::prepare_current_block_unless_signals(interrupting_signals)
+    processor::prepare_current_block_unless_interrupting_signal()
 }
 
 static EXITED_DIRTY: AtomicBool = AtomicBool::new(false);
@@ -440,15 +425,21 @@ pub(crate) fn queue_signal_to_task(
         request_process_job_control_stop(&process, signum);
         return;
     }
-    {
+    let should_wake = {
         let mut task_inner = task.inner_exclusive_access();
         task_inner.pending_signals |= signal;
         if let Some(slot) = task_inner.signal_infos.get_mut(info.signo as usize) {
             *slot = Some(info);
         }
         task.publish_signal_pending_locked(!task_inner.pending_signals.is_empty());
-    }
-    if signal_should_wake_target(&task) {
+        // Read the cached disposition under the same task lock used to queue
+        // the signal. If sigaction publishes afterward, its pending-task scan
+        // performs the matching wakeup.
+        let wake_mask = process.signal_wake_mask();
+        let queued_unmasked = ((signal.bits() & !task_inner.signal_mask.bits()) >> 1) as u64;
+        queued_unmasked & wake_mask != 0
+    };
+    if should_wake {
         wakeup_task(task);
     }
 }
@@ -478,13 +469,6 @@ pub(crate) fn queue_signal_to_process(
             wakeup_task(task);
         }
     }
-}
-
-fn signal_should_wake_target(task: &Arc<TaskControlBlock>) -> bool {
-    let Some(process) = task.process.upgrade() else {
-        return false;
-    };
-    task_has_interrupting_signal_matching(task, &process, |_, _| true)
 }
 
 fn job_control_stop_signum(signal: SignalFlags) -> Option<u32> {
@@ -535,21 +519,29 @@ fn notify_parent_job_control_event(process: &Arc<ProcessControlBlock>, code: i32
     let Some(parent) = process.parent_process() else {
         return;
     };
-    let parent_tasks = parent.tasks_snapshot();
-    let action = parent.inner_exclusive_access().signal_actions[SIGCHLD as usize];
+    let (parent_task, action, child_waiters) = {
+        let mut parent_inner = parent.inner_exclusive_access();
+        (
+            parent_inner.tasks.iter().flatten().next().cloned(),
+            parent_inner.signal_actions[SIGCHLD as usize],
+            core::mem::take(&mut parent_inner.child_waiters),
+        )
+    };
     if action.flags & SA_NOCLDSTOP == 0
-        && let Some(parent_task) = parent_tasks.first()
+        && let Some(parent_task) = parent_task
     {
         let child_pid = process
             .pid_visible_from_namespace(parent.pid_namespace())
             .unwrap_or(0) as i32;
         queue_signal_to_task(
-            Arc::clone(parent_task),
+            parent_task,
             SignalFlags::SIGCHLD,
             SignalInfo::child_job_control(SIGCHLD as i32, child_pid, code, status),
         );
     }
-    wake_parent_waiters(process);
+    for waiter in child_waiters {
+        wakeup_task(waiter);
+    }
 }
 
 fn request_process_job_control_stop(process: &Arc<ProcessControlBlock>, signum: u32) {
@@ -719,18 +711,6 @@ pub fn stop_current_task_if_needed() {
     }
 }
 
-fn wake_parent_waiters(process: &Arc<ProcessControlBlock>) {
-    let Some(parent) = process.parent_process() else {
-        return;
-    };
-    for parent_task in parent.tasks_snapshot() {
-        let is_blocked = parent_task.inner_exclusive_access().task_status == TaskStatus::Blocked;
-        if is_blocked {
-            wakeup_task(parent_task);
-        }
-    }
-}
-
 pub(crate) fn current_process_group_id() -> Option<usize> {
     current_task()
         .and_then(|task| task.process.upgrade())
@@ -815,35 +795,29 @@ fn write_core_dump(context: PathContext, path: String, bytes: Vec<u8>) {
     let _ = file.write_at(0, bytes.as_slice());
 }
 
-fn queue_exit_signal_with_action(
-    task: Arc<TaskControlBlock>,
+fn queue_exit_signal_with_wake_mask(
+    task: &Arc<TaskControlBlock>,
     signal: SignalFlags,
     info: SignalInfo,
-    action: SignalAction,
-    process_is_init: bool,
-) {
+    wake_mask: u64,
+) -> bool {
     let signum = info.signo as usize;
-    let should_wake = {
-        let mut task_inner = task.inner_exclusive_access();
-        task_inner.pending_signals |= signal;
-        if let Some(slot) = task_inner.signal_infos.get_mut(signum) {
-            *slot = Some(info);
-        }
-        task.publish_signal_pending_locked(!task_inner.pending_signals.is_empty());
-        let unmasked = !(task_inner.signal_mask & signal).contains(signal);
-        unmasked && signal_action_interrupts(process_is_init, signum, signal, action, &|_, _| true)
-    };
-    if should_wake {
-        wakeup_task(task);
+    let mut task_inner = task.inner_exclusive_access();
+    task_inner.pending_signals |= signal;
+    if let Some(slot) = task_inner.signal_infos.get_mut(signum) {
+        *slot = Some(info);
     }
+    task.publish_signal_pending_locked(!task_inner.pending_signals.is_empty());
+    let queued_unmasked = ((signal.bits() & !task_inner.signal_mask.bits()) >> 1) as u64;
+    queued_unmasked & wake_mask != 0
 }
 
 /// Publish a completed process exit as one parent-child event.
 ///
 /// wait4()/waitid() scan the child list while holding the parent PCB lock. Keep
 /// that same lock across the zombie transition, signal queueing, and child-wait
-/// wakeups so a waiter cannot reap the child before its exit notification has
-/// been published.
+/// queue drain so a waiter cannot reap the child before its exit notification
+/// has been published. Scheduler wakeups run only after releasing the PCB lock.
 fn publish_process_exit(
     process: &Arc<ProcessControlBlock>,
     parent: Option<Arc<ProcessControlBlock>>,
@@ -859,7 +833,8 @@ fn publish_process_exit(
     };
 
     let mut parent_inner = parent.inner_exclusive_access();
-    let parent_tasks: Vec<_> = parent_inner.tasks.iter().flatten().cloned().collect();
+    let parent_task = parent_inner.tasks.iter().flatten().next().cloned();
+    let child_waiters = core::mem::take(&mut parent_inner.child_waiters);
     let signal = SignalFlags::from_signum(exit_signal).filter(|signal| !signal.is_empty());
     let action = signal.map(|_| parent_inner.signal_actions[exit_signal as usize]);
 
@@ -871,6 +846,9 @@ fn publish_process_exit(
         parent_inner.children.retain(|child| child.getpid() != pid);
         drop(parent_inner);
         remove_from_pid2process(pid);
+        for waiter in child_waiters {
+            wakeup_task(waiter);
+        }
         return;
     }
 
@@ -880,28 +858,34 @@ fn publish_process_exit(
         process_inner.exit_code = exit_code;
     }
 
-    if let (Some(parent_task), Some(signal), Some(action)) = (parent_tasks.first(), signal, action)
-    {
-        queue_exit_signal_with_action(
-            Arc::clone(parent_task),
+    let signal_task_to_wake = if let (Some(parent_task), Some(signal)) = (&parent_task, signal) {
+        queue_exit_signal_with_wake_mask(
+            parent_task,
             signal,
             SignalInfo::child_exit(exit_signal as i32, pid as i32, exit_code),
-            action,
-            Arc::ptr_eq(&parent, &INITPROC),
-        );
-    }
+            parent.signal_wake_mask(),
+        )
+        .then(|| Arc::clone(parent_task))
+    } else {
+        None
+    };
+    drop(parent_inner);
 
     // Signal delivery and wait wakeups are separate contracts. A blocked
     // wait4()/waitid() caller must observe child state even when SIGCHLD is
     // blocked or ignored, but unrelated sleepers in the parent stay asleep.
-    for parent_task in parent_tasks {
-        let waiting_for_child = {
-            let task_inner = parent_task.inner_exclusive_access();
-            task_inner.waiting_for_child && task_inner.task_status == TaskStatus::Blocked
-        };
-        if waiting_for_child {
-            wakeup_task(parent_task);
-        }
+    let signal_task_is_waiter = signal_task_to_wake.as_ref().is_some_and(|signal_task| {
+        child_waiters
+            .iter()
+            .any(|waiter| Arc::ptr_eq(waiter, signal_task))
+    });
+    for waiter in child_waiters {
+        wakeup_task(waiter);
+    }
+    if let Some(signal_task) = signal_task_to_wake
+        && !signal_task_is_waiter
+    {
+        wakeup_task(signal_task);
     }
 }
 
@@ -1229,99 +1213,27 @@ pub fn current_has_interrupting_signal() -> bool {
     let Some(process) = task.process.upgrade() else {
         return false;
     };
-    task_has_interrupting_signal_matching(&task, &process, |_, _| true)
-}
-
-fn signal_action_interrupts(
-    process_is_init: bool,
-    signum: usize,
-    signal: SignalFlags,
-    action: SignalAction,
-    user_handler_interrupts: &impl Fn(SignalFlags, SignalAction) -> bool,
-) -> bool {
-    if action.is_ignore() {
-        return false;
-    }
-    if action.has_user_handler() {
-        return crate::arch::signal::can_deliver_user_signal(signum)
-            && user_handler_interrupts(signal, action);
-    }
-    if process_is_init {
-        return false;
-    }
-    default_signal_error(signum).is_some()
-}
-
-fn interrupting_signal_mask(
-    process: &Arc<ProcessControlBlock>,
-    user_handler_interrupts: impl Fn(SignalFlags, SignalAction) -> bool,
-) -> SignalFlags {
-    crate::perf::record_signal_action_table_lock_call();
-    let process_inner = process.inner_exclusive_access();
-    let process_is_init = Arc::ptr_eq(process, &INITPROC);
-    let mut interrupting = SignalFlags::empty();
-    for signum in 1..SIGNAL_INFO_SLOTS {
-        let Some(signal) = SignalFlags::from_signum(signum as u32) else {
-            continue;
-        };
-        if signal_action_interrupts(
-            process_is_init,
-            signum,
-            signal,
-            process_inner.signal_actions[signum],
-            &user_handler_interrupts,
-        ) {
-            interrupting |= signal;
-        }
-    }
-    interrupting
-}
-
-fn task_has_interrupting_signal_matching(
-    task: &Arc<TaskControlBlock>,
-    process: &Arc<ProcessControlBlock>,
-    user_handler_interrupts: impl Fn(SignalFlags, SignalAction) -> bool,
-) -> bool {
-    let pending = {
-        let inner = task.inner_exclusive_access();
-        SignalFlags::from_bits_retain(inner.pending_signals.bits() & !inner.signal_mask.bits())
-    };
-    if pending.is_empty() {
-        return false;
-    }
-    crate::perf::record_signal_action_table_lock_call();
-    let process_inner = process.inner_exclusive_access();
-    let process_is_init = Arc::ptr_eq(process, &INITPROC);
-    for signum in 1..SIGNAL_INFO_SLOTS {
-        let Some(signal) = SignalFlags::from_signum(signum as u32) else {
-            continue;
-        };
-        if !pending.contains(signal) {
-            continue;
-        }
-        if signal_action_interrupts(
-            process_is_init,
-            signum,
-            signal,
-            process_inner.signal_actions[signum],
-            &user_handler_interrupts,
-        ) {
-            return true;
-        }
-    }
-    false
+    let inner = task.inner_exclusive_access();
+    let wake_mask = process.signal_wake_mask();
+    let pending_unmasked = ((inner.pending_signals.bits() & !inner.signal_mask.bits()) >> 1) as u64;
+    pending_unmasked & wake_mask != 0
 }
 
 pub(crate) fn task_has_wait_interrupt_signal(
     task: &Arc<TaskControlBlock>,
     process: &Arc<ProcessControlBlock>,
 ) -> bool {
-    let interrupted = task_has_interrupting_signal_matching(task, process, |signal, action| {
-        // CONTEXT: LTP uses SIGUSR1 as a musl signal(2) heartbeat, which sets
-        // SA_RESTART. Let wait* keep sleeping for that compatibility signal,
-        // but return to trap delivery for timeout handlers and fatal defaults.
-        !(signal == SignalFlags::SIGUSR1 && action.flags & SA_RESTART != 0)
-    });
+    let pending_unmasked = {
+        let inner = task.inner_exclusive_access();
+        ((inner.pending_signals.bits() & !inner.signal_mask.bits()) >> 1) as u64
+    };
+    let sigusr1 = 1u64 << (SignalFlags::SIGUSR1.bits().trailing_zeros() - 1);
+    let wake_mask = process.signal_wake_mask();
+    let restartable_heartbeat = process.signal_restart_mask() & sigusr1;
+    // CONTEXT: LTP uses SIGUSR1 as a musl signal(2) heartbeat, which sets
+    // SA_RESTART. Let wait* keep sleeping for that compatibility signal, but
+    // return to trap delivery for timeout handlers and fatal defaults.
+    let interrupted = pending_unmasked & wake_mask & !restartable_heartbeat != 0;
     if interrupted {
         clear_restartable_wait_heartbeat(task, process);
     }
@@ -1333,8 +1245,8 @@ fn clear_restartable_wait_heartbeat(
     process: &Arc<ProcessControlBlock>,
 ) {
     let signum = SignalFlags::SIGUSR1.bits().trailing_zeros() as usize;
-    let action = process.inner_exclusive_access().signal_actions[signum];
-    if !action.has_user_handler() || action.flags & SA_RESTART == 0 {
+    let signal_bit = 1u64 << (signum - 1);
+    if process.signal_restart_mask() & signal_bit == 0 {
         return;
     }
     let mut task_inner = task.inner_exclusive_access();

@@ -298,6 +298,38 @@ pub fn default_signal_exit_code(signum: usize, core_limit: usize) -> Option<i32>
     Some(-status)
 }
 
+/// Build Linux-layout signal masks used by interruptible wait hot paths.
+///
+/// Bit zero represents signal 1, matching the userspace sigset layout. Caught
+/// SA_RESTART signals remain in `wake`: they must wake the task so the handler
+/// can run, while `restart` records the later syscall-return policy.
+pub(crate) fn signal_action_masks(
+    actions: &[SignalAction; SIGNAL_INFO_SLOTS],
+    ignore_default_actions: bool,
+) -> (u64, u64) {
+    let mut wake = 0u64;
+    let mut restart = 0u64;
+    for (signum, action) in actions.iter().copied().enumerate().skip(1) {
+        let signal_bit = 1u64 << (signum - 1);
+        if action.is_ignore() {
+            continue;
+        }
+        if action.has_user_handler() {
+            if crate::arch::signal::can_deliver_user_signal(signum) {
+                wake |= signal_bit;
+                if action.flags & SA_RESTART != 0 {
+                    restart |= signal_bit;
+                }
+            }
+            continue;
+        }
+        if !ignore_default_actions && default_signal_error(signum).is_some() {
+            wake |= signal_bit;
+        }
+    }
+    (wake, restart)
+}
+
 pub fn signal_wait_status(status: i32) -> Option<i32> {
     if status < 0 {
         Some((-status) & (0x7f | SIGNAL_EXIT_CORE_DUMPED))

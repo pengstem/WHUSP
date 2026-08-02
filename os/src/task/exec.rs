@@ -416,6 +416,7 @@ impl ProcessControlBlock {
                     *action = SignalAction::default();
                 }
             }
+            self.publish_signal_action_masks_locked(&inner.signal_actions);
             let close_on_exec_entries = inner.close_on_exec_fd_entries();
             (retired_memory_set, previous, close_on_exec_entries)
         };

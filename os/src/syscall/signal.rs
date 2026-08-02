@@ -4,7 +4,7 @@ use crate::task::{
     SS_ONSTACK, SigAltStack, SignalAction, SignalFlags, SignalInfo, TaskControlBlock,
     block_current_task_no_schedule, current_has_interrupting_signal, current_process, current_task,
     current_trap_cx, current_user_token, flags_to_linux_sigset, linux_sigset_to_flags,
-    processes_snapshot, queue_signal_to_task, schedule, task_with_linux_tid,
+    processes_snapshot, queue_signal_to_task, schedule, task_with_linux_tid, wakeup_task,
 };
 use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
@@ -403,7 +403,24 @@ pub fn sys_rt_sigaction_ctx(
         write_user_value_ctx(ctx, old_action.cast::<LinuxKernelSigAction>(), &old)?;
     }
     if let Some(new_action) = new_action {
-        process.inner_exclusive_access().signal_actions[signal_index] = new_action;
+        let mut inner = process.inner_exclusive_access();
+        inner.signal_actions[signal_index] = new_action;
+        process.publish_signal_action_masks_locked(&inner.signal_actions);
+        drop(inner);
+
+        let wake_mask = process.signal_wake_mask();
+        for task in process.tasks_snapshot() {
+            let should_wake = {
+                let task_inner = task.inner_exclusive_access();
+                let pending_unmasked = ((task_inner.pending_signals.bits()
+                    & !task_inner.signal_mask.bits())
+                    >> 1) as u64;
+                pending_unmasked & wake_mask != 0
+            };
+            if should_wake {
+                wakeup_task(task);
+            }
+        }
     }
     Ok(0)
 }

@@ -7,6 +7,7 @@ use super::process::{
     ProcessMemoryFastState, ProcessResourceLimits, ProcessTimers, comm_from_cmdline,
     empty_process_pkey_rights, fd_allocation_state_from_table,
 };
+use super::signal::signal_action_masks;
 use super::{
     CloneArgs, CloneFlags, FdTableEntry, SIGCHLD, SignalAction, TaskControlBlock, add_task,
     pid_alloc,
@@ -17,11 +18,12 @@ use crate::mm::KERNEL_SPACE;
 use crate::mm::{ElfLoadInfo, MemorySet};
 use crate::sync::SpinNoIrqLock;
 use crate::trap::{TrapContext, trap_handler};
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicU64, AtomicUsize};
 
 impl ProcessControlBlock {
     /// Attaches a newly created task to this process and returns the user token.
@@ -114,6 +116,8 @@ impl ProcessControlBlock {
         ];
         let fs = ProcessFsContext::root();
         let (fd_open_bits, next_fd_hint) = fd_allocation_state_from_table(&fd_table);
+        let signal_actions = [SignalAction::default(); super::SIGNAL_INFO_SLOTS];
+        let (signal_wake_mask, signal_restart_mask) = signal_action_masks(&signal_actions, true);
         let process = Arc::new(Self {
             pid: pid_handle,
             running_tasks: AtomicUsize::new(0),
@@ -122,6 +126,9 @@ impl ProcessControlBlock {
             inner_owner_cpu: AtomicUsize::new(usize::MAX),
             job_control_stop_generation: AtomicUsize::new(0),
             job_control_stop_pending: AtomicUsize::new(0),
+            signal_wake_mask: AtomicU64::new(signal_wake_mask),
+            signal_restart_mask: AtomicU64::new(signal_restart_mask),
+            ignore_default_signal_actions: true,
             #[cfg(feature = "ptrace")]
             ptrace_fast: AtomicUsize::new(0),
             fs_fast: ProcessFsFastState::new(&fs),
@@ -145,6 +152,7 @@ impl ProcessControlBlock {
                 exit_signal: SIGCHLD,
                 parent: None,
                 children: Vec::new(),
+                child_waiters: VecDeque::new(),
                 exit_code: 0,
                 fd_table,
                 fd_table_version: 0,
@@ -168,7 +176,7 @@ impl ProcessControlBlock {
                 resource_limits: ProcessResourceLimits::new(),
                 pkey_rights: empty_process_pkey_rights(),
                 membarrier_private_expedited_registered: false,
-                signal_actions: [SignalAction::default(); super::SIGNAL_INFO_SLOTS],
+                signal_actions,
                 cpu_times: ProcessCpuTimes::default(),
                 timers: ProcessTimers::default(),
                 vfork_parent: None,
@@ -332,6 +340,8 @@ impl ProcessControlBlock {
         drop(parent_task_inner);
         drop(parent);
 
+        let (signal_wake_mask, signal_restart_mask) = signal_action_masks(&signal_actions, false);
+
         let child = Arc::new(Self {
             pid,
             running_tasks: AtomicUsize::new(0),
@@ -340,6 +350,9 @@ impl ProcessControlBlock {
             inner_owner_cpu: AtomicUsize::new(usize::MAX),
             job_control_stop_generation: AtomicUsize::new(0),
             job_control_stop_pending: AtomicUsize::new(0),
+            signal_wake_mask: AtomicU64::new(signal_wake_mask),
+            signal_restart_mask: AtomicU64::new(signal_restart_mask),
+            ignore_default_signal_actions: false,
             #[cfg(feature = "ptrace")]
             ptrace_fast: AtomicUsize::new(0),
             fs_fast: ProcessFsFastState::new(&fs),
@@ -363,6 +376,7 @@ impl ProcessControlBlock {
                 exit_signal,
                 parent: Some(Arc::downgrade(&child_parent)),
                 children: Vec::new(),
+                child_waiters: VecDeque::new(),
                 exit_code: 0,
                 fd_table: new_fd_table,
                 fd_table_version: 0,

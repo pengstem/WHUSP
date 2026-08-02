@@ -106,11 +106,6 @@ pub struct TaskControlBlockInner {
     pub(crate) allowed_cpus: crate::cpu::CpuMask,
     // Linux-visible sleep state for cooperative wait loops that stay runnable.
     pub proc_sleeping: bool,
-    /// This task is blocked in wait4()/waitid() on the process child list.
-    ///
-    /// Child exit publication uses this narrower wait channel instead of
-    /// waking unrelated socket, pipe, or futex sleepers in the parent.
-    pub(crate) waiting_for_child: bool,
     pub exit_code: Option<i32>,
     // Main tasks derive their Linux TID from the process PID. Pthreads own a
     // separate PidHandle so futex, tgkill, and robust-list paths never expose
@@ -201,7 +196,6 @@ impl TaskControlBlock {
                 job_control_stop_ack_generation: 0,
                 allowed_cpus: crate::cpu::topology().possible_mask(),
                 proc_sleeping: false,
-                waiting_for_child: false,
                 exit_code: None,
                 linux_tid: None,
                 clear_child_tid: None,

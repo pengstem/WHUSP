@@ -301,7 +301,11 @@ pub fn deliver_pending_signal(
 
 fn force_default_sigsegv() {
     let signum = SignalFlags::SIGSEGV.bits().trailing_zeros() as usize;
-    current_process().inner_exclusive_access().signal_actions[signum] = SignalAction::default();
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    process_inner.signal_actions[signum] = SignalAction::default();
+    process.publish_signal_action_masks_locked(&process_inner.signal_actions);
+    drop(process_inner);
     if let Some(task) = current_task() {
         task.inner_exclusive_access()
             .signal_mask

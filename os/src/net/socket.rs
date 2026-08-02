@@ -24,8 +24,8 @@ use crate::syscall::user_ptr::{
     UserBufferAccess, read_user_array_item, translated_byte_buffer_checked_with_mmap_fault,
 };
 use crate::task::{
-    TaskControlBlock, block_current_task_no_schedule_unless_interrupting_signal,
-    current_has_interrupting_signal, current_process, current_task, schedule, wakeup_task,
+    TaskControlBlock, block_current_task_no_schedule_unless_interrupting_signal, current_process,
+    current_task, schedule, wakeup_task,
 };
 use crate::timer::{add_timer, get_time_ms};
 use crate::uapi::errno::{Errno, KResult};
@@ -454,16 +454,28 @@ impl LocalSocketInner {
         inner
     }
 
-    fn sleep_reader(&mut self) -> Option<*mut crate::task::TaskContext> {
-        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_interrupting_signal()?;
+    fn sleep_reader(&mut self) -> SocketBlockResult {
+        let Some((task, task_cx_ptr)) = block_current_task_no_schedule_unless_interrupting_signal()
+        else {
+            if let Some(task) = current_task() {
+                self.remove_reader(&task);
+            }
+            return SocketBlockResult::Interrupted;
+        };
         self.read_wait_queue.push_back(task);
-        Some(task_cx_ptr)
+        SocketBlockResult::Blocked(task_cx_ptr)
     }
 
-    fn sleep_writer(&mut self) -> Option<*mut crate::task::TaskContext> {
-        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_interrupting_signal()?;
+    fn sleep_writer(&mut self) -> SocketBlockResult {
+        let Some((task, task_cx_ptr)) = block_current_task_no_schedule_unless_interrupting_signal()
+        else {
+            if let Some(task) = current_task() {
+                self.remove_writer(&task);
+            }
+            return SocketBlockResult::Interrupted;
+        };
         self.write_wait_queue.push_back(task);
-        Some(task_cx_ptr)
+        SocketBlockResult::Blocked(task_cx_ptr)
     }
 
     fn wake_reader(&mut self) -> Option<Arc<TaskControlBlock>> {
@@ -507,6 +519,11 @@ impl LocalSocketInner {
     }
 }
 
+enum SocketBlockResult {
+    Blocked(*mut crate::task::TaskContext),
+    Interrupted,
+}
+
 fn remove_socket_waiter(queue: &mut VecDeque<Arc<TaskControlBlock>>, task: &Arc<TaskControlBlock>) {
     if let Some(index) = queue
         .iter()
@@ -528,8 +545,21 @@ fn find_tcp_listener_or_block(port: u16, deadline_ms: usize) -> KResult<TcpConne
         return Ok(TcpConnectWait::Listener(listener));
     }
     perf::record_local_socket_writer_sleep();
-    let (task, task_cx_ptr) =
-        block_current_task_no_schedule_unless_interrupting_signal().ok_or(Errno::EINTR)?;
+    let Some((task, task_cx_ptr)) = block_current_task_no_schedule_unless_interrupting_signal()
+    else {
+        if let Some(task) = current_task() {
+            let remove_empty = if let Some(waiters) = loopback.tcp_connect_waiters.get_mut(&port) {
+                remove_socket_waiter(waiters, &task);
+                waiters.is_empty()
+            } else {
+                false
+            };
+            if remove_empty {
+                loopback.tcp_connect_waiters.remove(&port);
+            }
+        }
+        return Err(Errno::EINTR);
+    };
     let waiters = loopback.tcp_connect_waiters.entry(port).or_default();
     remove_socket_waiter(waiters, &task);
     waiters.push_back(Arc::clone(&task));
@@ -847,41 +877,37 @@ impl LocalSocket {
                 if nonblock {
                     return Err(Errno::EAGAIN);
                 }
-                if current_has_interrupting_signal() {
-                    if let Some(task) = current_task() {
-                        inner.remove_reader(&task);
-                    }
-                    let local = inner.local.unwrap_or(InetEndpoint {
-                        ip: LOOPBACK_IP,
-                        port: 0,
-                    });
-                    let peer = InetEndpoint {
-                        ip: LOOPBACK_IP,
-                        port: 0,
-                    };
-                    // CONTEXT: netperf's timed TCP_CRR server expects a blocking
-                    // accept() to return to user mode when SIGALRM fires. Returning
-                    // a closed placeholder lets the signal handler run and the
-                    // server loop observe `times_up` without leaking a listener.
-                    return Ok(Self::from_inner(
-                        Arc::new(SpinNoIrqLock::new(LocalSocketInner::connected(
-                            SocketDomain::Inet,
-                            SocketKind::Stream,
-                            local,
-                            peer,
-                            None,
-                            ShutdownState::CLOSED,
-                            None,
-                            None,
-                        ))),
-                        OpenFlags::RDWR,
-                    ));
-                }
                 perf::record_local_socket_reader_sleep();
-                inner.sleep_reader()
-            };
-            let Some(task_cx_ptr) = task_cx_ptr else {
-                continue;
+                match inner.sleep_reader() {
+                    SocketBlockResult::Blocked(task_cx_ptr) => task_cx_ptr,
+                    SocketBlockResult::Interrupted => {
+                        let local = inner.local.unwrap_or(InetEndpoint {
+                            ip: LOOPBACK_IP,
+                            port: 0,
+                        });
+                        let peer = InetEndpoint {
+                            ip: LOOPBACK_IP,
+                            port: 0,
+                        };
+                        // CONTEXT: netperf's timed TCP_CRR server expects a blocking
+                        // accept() to return to user mode when SIGALRM fires. Returning
+                        // a closed placeholder lets the signal handler run and the
+                        // server loop observe `times_up` without leaking a listener.
+                        return Ok(Self::from_inner(
+                            Arc::new(SpinNoIrqLock::new(LocalSocketInner::connected(
+                                SocketDomain::Inet,
+                                SocketKind::Stream,
+                                local,
+                                peer,
+                                None,
+                                ShutdownState::CLOSED,
+                                None,
+                                None,
+                            ))),
+                            OpenFlags::RDWR,
+                        ));
+                    }
+                }
             };
             schedule(task_cx_ptr);
         }
@@ -922,12 +948,6 @@ impl LocalSocket {
                     remove_tcp_connect_waiter(remote.port, &task);
                 }
                 return Err(Errno::ECONNREFUSED);
-            }
-            if current_has_interrupting_signal() {
-                if let Some(task) = current_task() {
-                    remove_tcp_connect_waiter(remote.port, &task);
-                }
-                return Err(Errno::EINTR);
             }
             match find_tcp_listener_or_block(remote.port, connect_deadline_ms)? {
                 TcpConnectWait::Listener(listener) => break listener,
@@ -1046,15 +1066,10 @@ impl LocalSocket {
                 if nonblock {
                     return Err(Errno::EAGAIN);
                 }
-                if current_has_interrupting_signal() {
-                    if let Some(task) = current_task() {
-                        peer_inner.remove_writer(&task);
-                    }
-                    return Err(Errno::EINTR);
-                }
                 perf::record_local_socket_writer_sleep();
-                let Some(task_cx_ptr) = peer_inner.sleep_writer() else {
-                    return Err(Errno::EINTR);
+                let task_cx_ptr = match peer_inner.sleep_writer() {
+                    SocketBlockResult::Blocked(task_cx_ptr) => task_cx_ptr,
+                    SocketBlockResult::Interrupted => return Err(Errno::EINTR),
                 };
                 drop(peer_inner);
                 schedule(task_cx_ptr);
@@ -1109,15 +1124,10 @@ impl LocalSocket {
                 if nonblock {
                     return Err(Errno::EAGAIN);
                 }
-                if current_has_interrupting_signal() {
-                    if let Some(task) = current_task() {
-                        peer_inner.remove_writer(&task);
-                    }
-                    return Err(Errno::EINTR);
-                }
                 perf::record_local_socket_writer_sleep();
-                let Some(task_cx_ptr) = peer_inner.sleep_writer() else {
-                    return Err(Errno::EINTR);
+                let task_cx_ptr = match peer_inner.sleep_writer() {
+                    SocketBlockResult::Blocked(task_cx_ptr) => task_cx_ptr,
+                    SocketBlockResult::Interrupted => return Err(Errno::EINTR),
                 };
                 drop(peer_inner);
                 schedule(task_cx_ptr);
@@ -1224,15 +1234,10 @@ impl LocalSocket {
                 if nonblock {
                     return Err(Errno::EAGAIN);
                 }
-                if current_has_interrupting_signal() {
-                    if let Some(task) = current_task() {
-                        peer.remove_writer(&task);
-                    }
-                    return Err(Errno::EINTR);
-                }
                 perf::record_local_socket_writer_sleep();
-                let Some(task_cx_ptr) = peer.sleep_writer() else {
-                    return Err(Errno::EINTR);
+                let task_cx_ptr = match peer.sleep_writer() {
+                    SocketBlockResult::Blocked(task_cx_ptr) => task_cx_ptr,
+                    SocketBlockResult::Interrupted => return Err(Errno::EINTR),
                 };
                 drop(peer);
                 schedule(task_cx_ptr);
@@ -1352,15 +1357,10 @@ impl LocalSocket {
             if nonblock {
                 return Err(Errno::EAGAIN);
             }
-            if current_has_interrupting_signal() {
-                if let Some(task) = current_task() {
-                    inner.remove_reader(&task);
-                }
-                return Err(Errno::EINTR);
-            }
             perf::record_local_socket_reader_sleep();
-            let Some(task_cx_ptr) = inner.sleep_reader() else {
-                return Err(Errno::EINTR);
+            let task_cx_ptr = match inner.sleep_reader() {
+                SocketBlockResult::Blocked(task_cx_ptr) => task_cx_ptr,
+                SocketBlockResult::Interrupted => return Err(Errno::EINTR),
             };
             drop(inner);
             schedule(task_cx_ptr);
@@ -1413,19 +1413,14 @@ impl LocalSocket {
             if nonblock {
                 return Err(Errno::EAGAIN);
             }
-            if current_has_interrupting_signal() {
-                if let Some(task) = current_task() {
-                    self.inner.lock().remove_reader(&task);
-                }
-                return Err(Errno::EINTR);
-            }
             let task_cx_ptr = {
                 let mut inner = self.inner.lock();
                 perf::record_local_socket_reader_sleep();
                 inner.sleep_reader()
             };
-            let Some(task_cx_ptr) = task_cx_ptr else {
-                return Err(Errno::EINTR);
+            let task_cx_ptr = match task_cx_ptr {
+                SocketBlockResult::Blocked(task_cx_ptr) => task_cx_ptr,
+                SocketBlockResult::Interrupted => return Err(Errno::EINTR),
             };
             schedule(task_cx_ptr);
         }
@@ -1449,19 +1444,14 @@ impl LocalSocket {
             if nonblock {
                 return Err(Errno::EAGAIN);
             }
-            if current_has_interrupting_signal() {
-                if let Some(task) = current_task() {
-                    self.inner.lock().remove_reader(&task);
-                }
-                return Err(Errno::EINTR);
-            }
             let task_cx_ptr = {
                 let mut inner = self.inner.lock();
                 perf::record_local_socket_reader_sleep();
                 inner.sleep_reader()
             };
-            let Some(task_cx_ptr) = task_cx_ptr else {
-                return Err(Errno::EINTR);
+            let task_cx_ptr = match task_cx_ptr {
+                SocketBlockResult::Blocked(task_cx_ptr) => task_cx_ptr,
+                SocketBlockResult::Interrupted => return Err(Errno::EINTR),
             };
             schedule(task_cx_ptr);
         }

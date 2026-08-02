@@ -1,4 +1,5 @@
 use super::id::RecycleAllocator;
+use super::signal::signal_action_masks;
 use super::{
     FD_LIMIT, FdTableEntry, PidHandle, SIGNAL_INFO_SLOTS, SignalAction, TaskControlBlock,
     TaskStatus, wakeup_task,
@@ -9,13 +10,14 @@ use crate::mm::MemorySet;
 use crate::perf;
 use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::{vec, vec::Vec};
 use core::hint::spin_loop;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 pub const RLIM_INFINITY: usize = usize::MAX;
 const FD_BITMAP_WORD_BITS: usize = usize::BITS as usize;
@@ -999,6 +1001,11 @@ pub struct ProcessControlBlock {
     pub(super) inner_owner_cpu: AtomicUsize,
     pub(crate) job_control_stop_generation: AtomicUsize,
     pub(crate) job_control_stop_pending: AtomicUsize,
+    /// Linux-layout cached signal sets used without taking the PCB lock.
+    pub(super) signal_wake_mask: AtomicU64,
+    pub(super) signal_restart_mask: AtomicU64,
+    /// PID 1 ignores ordinary default-disposition actions in this kernel.
+    pub(super) ignore_default_signal_actions: bool,
     #[cfg(feature = "ptrace")]
     // Linux tests ptrace thread flags before taking sighand/tasklist locks on
     // syscall entry and exit. Bit 0 means traced; bit 1 means syscall stops are
@@ -1094,6 +1101,26 @@ impl Drop for ProcessInnerGuard<'_> {
 }
 
 impl ProcessControlBlock {
+    #[inline(always)]
+    pub(crate) fn signal_wake_mask(&self) -> u64 {
+        self.signal_wake_mask.load(Ordering::Acquire)
+    }
+
+    #[inline(always)]
+    pub(crate) fn signal_restart_mask(&self) -> u64 {
+        self.signal_restart_mask.load(Ordering::Acquire)
+    }
+
+    /// Publish action-derived masks while the caller owns `self.inner`.
+    pub(crate) fn publish_signal_action_masks_locked(
+        &self,
+        actions: &[SignalAction; SIGNAL_INFO_SLOTS],
+    ) {
+        let (wake, restart) = signal_action_masks(actions, self.ignore_default_signal_actions);
+        self.signal_restart_mask.store(restart, Ordering::Release);
+        self.signal_wake_mask.store(wake, Ordering::Release);
+    }
+
     #[cfg(feature = "ptrace")]
     #[inline(always)]
     pub(crate) fn ptrace_is_traced_fast(&self) -> bool {
@@ -1240,6 +1267,7 @@ pub struct ProcessControlBlockInner {
     pub exit_signal: u32,
     pub parent: Option<Weak<ProcessControlBlock>>,
     pub children: Vec<Arc<ProcessControlBlock>>,
+    pub(crate) child_waiters: VecDeque<Arc<TaskControlBlock>>,
     pub exit_code: i32,
     pub fd_table: Vec<Option<FdTableEntry>>,
     pub(crate) fd_table_version: usize,
