@@ -8,7 +8,6 @@ use alloc::vec::Vec;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use lazy_static::*;
-use log::info;
 
 const RT_PRIORITY_MAX: usize = 99;
 const RT_QUEUE_COUNT: usize = RT_PRIORITY_MAX + 1;
@@ -302,12 +301,6 @@ impl TaskManager {
         inner.on_cpu = Some(cpu);
         inner.last_cpu = Some(cpu);
         inner.task_status = TaskStatus::Running;
-        if inner.smp_sched_probe_active {
-            super::smp_probe::record_run(cpu);
-        }
-        if inner.smp_wait_io_probe {
-            super::smp_probe::record_wait_io_run(cpu);
-        }
         ClaimResult::Claimed
     }
 
@@ -835,21 +828,10 @@ fn publish_run_queue_state(cpu: crate::cpu::CpuId, previous_ready: usize, ready:
 fn with_run_queue<R>(cpu: crate::cpu::CpuId, operation: impl FnOnce(&mut TaskManager) -> R) -> R {
     assert!(cpu < MAX_CPUS, "run-queue CPU exceeds MAX_CPUS");
     record_remote_run_queue_lock(cpu);
-    let probe = super::smp_probe::cpu_probe_active();
-    let wait_start = probe.then(crate::timer::get_time);
     let mut manager = RUN_QUEUES[cpu].inner.lock();
-    let acquired = probe.then(crate::timer::get_time);
     let previous_ready = manager.ready_len();
     let result = operation(&mut manager);
     publish_run_queue_state(cpu, previous_ready, manager.ready_len());
-    drop(manager);
-    if let (Some(wait_start), Some(acquired)) = (wait_start, acquired) {
-        let released = crate::timer::get_time();
-        super::smp_probe::record_cpu_probe_run_queue(
-            acquired.saturating_sub(wait_start),
-            released.saturating_sub(acquired),
-        );
-    }
     result
 }
 
@@ -930,13 +912,9 @@ fn with_run_queue_pair<R>(
     assert!(first_cpu < MAX_CPUS && second_cpu < MAX_CPUS);
     record_remote_run_queue_lock(first_cpu);
     record_remote_run_queue_lock(second_cpu);
-    let probe = super::smp_probe::cpu_probe_active();
-    let wait_start = probe.then(crate::timer::get_time);
-
-    let result = if first_cpu < second_cpu {
+    if first_cpu < second_cpu {
         let mut first = RUN_QUEUES[first_cpu].inner.lock();
         let mut second = RUN_QUEUES[second_cpu].inner.lock();
-        let acquired = probe.then(crate::timer::get_time);
         let first_previous_ready = first.ready_len();
         let second_previous_ready = second.ready_len();
         let result = operation(&mut first, &mut second);
@@ -944,11 +922,10 @@ fn with_run_queue_pair<R>(
         publish_run_queue_state(second_cpu, second_previous_ready, second.ready_len());
         drop(second);
         drop(first);
-        (result, acquired)
+        result
     } else {
         let mut second = RUN_QUEUES[second_cpu].inner.lock();
         let mut first = RUN_QUEUES[first_cpu].inner.lock();
-        let acquired = probe.then(crate::timer::get_time);
         let first_previous_ready = first.ready_len();
         let second_previous_ready = second.ready_len();
         let result = operation(&mut first, &mut second);
@@ -956,17 +933,8 @@ fn with_run_queue_pair<R>(
         publish_run_queue_state(second_cpu, second_previous_ready, second.ready_len());
         drop(first);
         drop(second);
-        (result, acquired)
-    };
-
-    if let (Some(wait_start), Some(acquired)) = (wait_start, result.1) {
-        let released = crate::timer::get_time();
-        super::smp_probe::record_cpu_probe_run_queue(
-            acquired.saturating_sub(wait_start),
-            released.saturating_sub(acquired),
-        );
+        result
     }
-    result.0
 }
 
 #[cfg(feature = "perf-counters")]
@@ -1323,24 +1291,16 @@ fn wakeup_task_with_placement(task: Arc<TaskControlBlock>, front: bool) -> bool 
             }
             task_inner.wake_pending = true;
             task_inner.wake_front = front;
-            let probe = task_inner.smp_sched_probe_active;
             drop(task_inner);
-            if probe {
-                super::smp_probe::record_wake(true);
-            }
             perf::record_task_wakeup(front);
             return true;
         }
         assert!(!task_inner.wake_pending, "off-CPU task retained a wakeup");
         task_inner.task_status = TaskStatus::Ready;
         let stopped = task_inner.job_control_stopped;
-        let probe = task_inner.smp_sched_probe_active;
         drop(task_inner);
         if !stopped {
             enqueue_woken_task(task, front);
-        }
-        if probe {
-            super::smp_probe::record_wake(false);
         }
         perf::record_task_wakeup(front);
         true
@@ -1407,9 +1367,6 @@ pub(super) fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     };
     let (task, stolen_tasks) = steal_batch_from(victim, cpu);
     perf::record_scheduler_idle_pull(probes, stolen_tasks);
-    for _ in 0..stolen_tasks {
-        super::smp_probe::record_cpu_probe_steal();
-    }
     task
 }
 
@@ -1480,31 +1437,8 @@ pub(crate) fn migrate_ready_task(task: Arc<TaskControlBlock>) {
         moved
     };
     if moved {
-        super::smp_probe::record_cpu_probe_migration();
         wake_enqueued_cpu(target);
     }
-}
-
-/// Take one ordered snapshot of every possible CPU's ready queue.
-///
-/// This is a bounded phase-gate assertion, not a scheduler hot path. Holding
-/// every queue in ascending CPU-ID order prevents a concurrent steal or
-/// affinity migration from making an empty snapshot appear accidentally.
-pub(super) fn assert_run_queues_drained() {
-    let cpu_count = crate::cpu::topology().possible_count();
-    let mut queues = Vec::with_capacity(cpu_count);
-    for cpu in 0..cpu_count {
-        queues.push(RUN_QUEUES[cpu].inner.lock());
-    }
-    let ready = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
-        queues.get(cpu).map_or(0, |queue| queue.ready_len())
-    });
-    let total = ready[..cpu_count].iter().sum::<usize>();
-    info!(
-        "smp run-queue drain: ready={:?} total={total}",
-        &ready[..cpu_count]
-    );
-    assert_eq!(total, 0, "Phase 6 gate found runnable tasks on run queues");
 }
 
 fn migrate_ready_task_locked(

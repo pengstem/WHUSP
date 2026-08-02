@@ -13,6 +13,6 @@ pub(crate) use read_mostly::ReadMostlySnapshot;
 pub use sleep_mutex::{SleepMutex, SleepMutexGuard};
 pub use sleep_rwlock::{SleepRwLock, SleepRwLockReadGuard, SleepRwLockWriteGuard};
 pub use spin::{
-    RawSpinNoIrqLock, SpinLock, SpinNoIrqLock, SpinNoIrqLockGuard, SpinRwLock, SpinRwLockReadGuard,
+    RawSpinNoIrqLock, SpinNoIrqLock, SpinNoIrqLockGuard, SpinRwLock, SpinRwLockReadGuard,
     SpinRwLockWriteGuard,
 };

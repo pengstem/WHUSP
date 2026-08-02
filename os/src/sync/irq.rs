@@ -22,10 +22,6 @@ impl LocalIrqGuard {
             _not_send: PhantomData,
         }
     }
-
-    pub fn was_enabled(&self) -> bool {
-        self.was_enabled
-    }
 }
 
 impl Drop for LocalIrqGuard {

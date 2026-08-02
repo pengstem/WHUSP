@@ -31,49 +31,6 @@ const AT_GID: usize = 13;
 const AT_EGID: usize = 14;
 const AT_HWCAP: usize = 16;
 
-fn is_smp_sched_probe_path(path: &str) -> bool {
-    matches!(path, "/x1/smp-sched-life-rv" | "/x1/smp-sched-life-la")
-}
-
-fn is_smp_cpu_probe_path(path: &str) -> bool {
-    matches!(path, "/x1/smp-cpu-sentinel-rv" | "/x1/smp-cpu-sentinel-la")
-}
-
-fn is_smp_run_queue_drain_probe_path(path: &str) -> bool {
-    matches!(path, "/x1/smp-rq-drain-rv" | "/x1/smp-rq-drain-la")
-}
-
-fn is_smp_wait_io_probe_path(path: &str) -> bool {
-    matches!(path, "/x1/smp-wait-io-rv" | "/x1/smp-wait-io-la")
-}
-
-fn is_smp_phase4_wait_probe_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/x1/smp-wait-timer-rv"
-            | "/x1/smp-wait-timer-la"
-            | "/x1/smp-wait-futex-rv"
-            | "/x1/smp-wait-futex-la"
-            | "/x1/smp-wait-pipe-rv"
-            | "/x1/smp-wait-pipe-la"
-            | "/x1/smp-wait-fd-rv"
-            | "/x1/smp-wait-fd-la"
-            | "/x1/smp-wait-socket-rv"
-            | "/x1/smp-wait-socket-la"
-            | "/x1/smp-wait-msg-rv"
-            | "/x1/smp-wait-msg-la"
-            | "/x1/smp-wait-sem-rv"
-            | "/x1/smp-wait-sem-la"
-            | "/x1/smp-wait-tcp-rv"
-            | "/x1/smp-wait-tcp-la"
-            | "/x1/smp-wait-pty-rv"
-            | "/x1/smp-wait-pty-la"
-            | "/x1/smp-wait-console-rv"
-            | "/x1/smp-wait-console-la"
-            | "/x1/smp-wait-exit-rv"
-            | "/x1/smp-wait-exit-la"
-    )
-}
 const AT_CLKTCK: usize = 17;
 const AT_SECURE: usize = 23;
 const AT_RANDOM: usize = 25;
@@ -401,11 +358,6 @@ impl ProcessControlBlock {
         executable_path: String,
         executable_node: Option<VfsNodeId>,
     ) -> KResult<()> {
-        let smp_sched_probe = is_smp_sched_probe_path(&executable_path);
-        let smp_cpu_probe = is_smp_cpu_probe_path(&executable_path);
-        let smp_run_queue_drain_probe = is_smp_run_queue_drain_probe_path(&executable_path);
-        let smp_wait_io_probe = is_smp_wait_io_probe_path(&executable_path);
-        let smp_phase4_wait_probe = is_smp_phase4_wait_probe_path(&executable_path);
         let current = current_task().ok_or(Errno::ESRCH)?;
         let _exec_exclusion = self.begin_exec_exclusion(current.as_ref())?;
         let process_token = self.inner_exclusive_access().get_user_token();
@@ -491,14 +443,6 @@ impl ProcessControlBlock {
         task_inner.robust_list_head = 0;
         task_inner.sigsuspend_restore_mask = None;
         task_inner.sigaltstack = SigAltStack::disabled();
-        task_inner.smp_sched_probe = smp_sched_probe;
-        // Start counting only when the worker explicitly widens its affinity.
-        // Lazy executable page-in can block before the first user instruction
-        // and is outside the bounded scheduler lifecycle workload.
-        task_inner.smp_sched_probe_active = false;
-        task_inner.smp_cpu_probe = smp_cpu_probe;
-        task_inner.smp_wait_io_probe = smp_wait_io_probe;
-        task_inner.smp_phase4_wait_probe = smp_phase4_wait_probe;
         let (trap_cx_ppn, user_stack_top) = {
             let task_res = task_inner
                 .res
@@ -539,15 +483,6 @@ impl ProcessControlBlock {
         refresh_current_user_token();
         self.release_vfork_parent();
         ptrace_note_exec_current();
-        if smp_cpu_probe {
-            crate::task::start_smp_cpu_probe();
-        }
-        if smp_wait_io_probe {
-            crate::task::start_smp_wait_io_probe();
-        }
-        if smp_run_queue_drain_probe {
-            super::sched::assert_run_queues_drained();
-        }
         Ok(())
     }
 }

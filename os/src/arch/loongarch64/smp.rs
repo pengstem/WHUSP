@@ -214,10 +214,6 @@ pub fn handle_tlb_ipi() -> bool {
     }
 }
 
-pub const fn tlb_backend_name() -> &'static str {
-    "ipi-invtlb-ack"
-}
-
 pub fn install_cpu_local(pointer: usize) {
     unsafe {
         core::arch::asm!(

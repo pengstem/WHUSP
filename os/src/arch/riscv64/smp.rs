@@ -112,10 +112,6 @@ pub fn handle_tlb_ipi() -> bool {
     false
 }
 
-pub const fn tlb_backend_name() -> &'static str {
-    "sbi-rfence"
-}
-
 pub fn install_cpu_local(pointer: usize) {
     unsafe {
         asm!("mv tp, {pointer}", pointer = in(reg) pointer, options(nomem, nostack));

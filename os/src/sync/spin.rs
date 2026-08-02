@@ -31,10 +31,6 @@ impl<T> SpinLock<T> {
         }
     }
 
-    pub fn lock(&self) -> SpinLockGuard<'_, T> {
-        self.lock_inner(false)
-    }
-
     fn lock_while_irqs_masked(&self) -> SpinLockGuard<'_, T> {
         self.lock_inner(true)
     }
@@ -62,34 +58,6 @@ impl<T> SpinLock<T> {
             if poll_tlb {
                 poll_tlb_while_spinning();
             }
-        }
-    }
-
-    /// Acquires the lock and returns the number of busy/failed spin polls.
-    /// Normal callers use `lock()` and add no statistics to the hot path.
-    pub fn lock_counted(&self) -> (SpinLockGuard<'_, T>, usize) {
-        self.assert_not_owned_by_current();
-        let mut spins = 0usize;
-        loop {
-            while self.locked.load(Ordering::Relaxed) {
-                spins = spins.saturating_add(1);
-                spin_loop();
-            }
-            if self
-                .locked
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                self.note_acquired();
-                return (
-                    SpinLockGuard {
-                        lock: self,
-                        _not_send: PhantomData,
-                    },
-                    spins,
-                );
-            }
-            spins = spins.saturating_add(1);
         }
     }
 

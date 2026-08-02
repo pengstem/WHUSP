@@ -11,7 +11,6 @@ mod processor;
 mod ptrace;
 mod sched;
 mod signal;
-mod smp_probe;
 mod tcb;
 
 use self::id::TaskUserRes;
@@ -58,9 +57,7 @@ pub use processor::{
     refresh_current_user_token, run_tasks, schedule, trap_cx_of_task,
     trap_return_context_after_accounting_for_task, try_current_kstack_bounds,
 };
-pub(crate) use processor::{
-    current_processor_is_empty, processor_idle_mask, processor_is_idle, processor_slot_ptr,
-};
+pub(crate) use processor::{processor_idle_mask, processor_is_idle, processor_slot_ptr};
 pub(crate) use ptrace::{
     ptrace_attach_process, ptrace_kill_process, ptrace_note_exec_current, ptrace_resume_process,
     ptrace_stop_task_if_needed, ptrace_syscall_enter_stop_for_task,
@@ -82,11 +79,6 @@ pub use signal::{
 #[cfg(target_arch = "riscv64")]
 pub use signal::{SIGRT_1, SIGRTMIN};
 pub(crate) use signal::{flags_to_linux_sigset, linux_sigset_to_flags};
-pub(crate) use smp_probe::record_cpu_probe_scheduler_preemption_ipi as record_smp_cpu_probe_scheduler_preemption_ipi;
-pub(crate) use smp_probe::record_cpu_probe_scheduler_wake as record_smp_cpu_probe_scheduler_wake;
-pub(crate) use smp_probe::record_yield_syscall as record_smp_probe_yield_syscall;
-pub(crate) use smp_probe::start_cpu_probe as start_smp_cpu_probe;
-pub(crate) use smp_probe::start_wait_io_probe as start_smp_wait_io_probe;
 pub(crate) use tcb::SCHED_RR_INTERVAL_US;
 pub use tcb::{DEFAULT_TIMER_SLACK_NS, TaskControlBlock, TaskStatus};
 

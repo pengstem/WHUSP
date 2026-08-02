@@ -137,15 +137,6 @@ pub(crate) fn processor_slot_ptr(cpu: usize) -> usize {
     &PROCESSORS[cpu] as *const PerCpuProcessor as usize
 }
 
-pub(crate) fn current_processor_is_empty() -> bool {
-    let processor = processor();
-    processor.current.is_none()
-        && processor.current_process.is_none()
-        && processor.current_user_token == 0
-        && processor.current_address_space.is_none()
-        && processor.pending_switch.is_none()
-}
-
 pub(crate) fn processor_is_idle(cpu: usize) -> bool {
     PROCESSOR_IDLE.load(Ordering::Acquire).contains(cpu)
 }
@@ -207,9 +198,6 @@ fn prepare_current_switch_inner(
         }
         if reason == SwitchReason::Block {
             inner.task_status = TaskStatus::Blocked;
-            if inner.smp_sched_probe_active {
-                super::smp_probe::record_block();
-            }
         } else if reason == SwitchReason::Exit {
             inner.task_status = TaskStatus::Exited;
         }
@@ -259,14 +247,8 @@ fn finish_current_switch() {
     }
 
     let mut enqueue = None;
-    let probe;
-    let cpu_probe;
-    let wait_io_probe;
     {
         let mut inner = task.inner_exclusive_access();
-        probe = inner.smp_sched_probe;
-        cpu_probe = inner.smp_cpu_probe;
-        wait_io_probe = inner.smp_wait_io_probe;
         assert_eq!(
             inner.on_cpu,
             Some(cpu),
@@ -307,24 +289,8 @@ fn finish_current_switch() {
 
     super::acknowledge_task_job_control_stop(&task);
 
-    if cpu_probe {
-        super::smp_probe::record_cpu_probe_switch(
-            task.sched_runtime_us(crate::timer::get_time_us()),
-        );
-    }
-
     drop(address_space);
     process.release_scheduler_task();
-
-    if probe && reason == SwitchReason::Exit {
-        super::smp_probe::record_exit();
-    }
-    if cpu_probe && reason == SwitchReason::Exit {
-        super::smp_probe::record_cpu_probe_exit();
-    }
-    if wait_io_probe && reason == SwitchReason::Exit {
-        super::smp_probe::record_wait_io_exit();
-    }
 
     match reason {
         SwitchReason::Yield => {

@@ -104,11 +104,6 @@ pub struct TaskControlBlockInner {
     pub(crate) job_control_stop_ack_generation: usize,
     // Linux-visible affinity mask used for placement, stealing, and migration.
     pub(crate) allowed_cpus: crate::cpu::CpuMask,
-    pub(crate) smp_sched_probe: bool,
-    pub(crate) smp_sched_probe_active: bool,
-    pub(crate) smp_cpu_probe: bool,
-    pub(crate) smp_wait_io_probe: bool,
-    pub(crate) smp_phase4_wait_probe: bool,
     // Linux-visible sleep state for cooperative wait loops that stay runnable.
     pub proc_sleeping: bool,
     pub exit_code: Option<i32>,
@@ -207,11 +202,6 @@ impl TaskControlBlock {
                 job_control_stopped,
                 job_control_stop_ack_generation: 0,
                 allowed_cpus: crate::cpu::topology().possible_mask(),
-                smp_sched_probe: false,
-                smp_sched_probe_active: false,
-                smp_cpu_probe: false,
-                smp_wait_io_probe: false,
-                smp_phase4_wait_probe: false,
                 proc_sleeping: false,
                 exit_code: None,
                 linux_tid: None,
@@ -302,10 +292,6 @@ impl TaskControlBlock {
             .linked
             .store(false, Ordering::Release);
         (next, front)
-    }
-
-    pub(crate) fn is_smp_sched_probe_active(&self) -> bool {
-        self.inner_exclusive_access().smp_sched_probe_active
     }
 
     pub fn get_user_token(&self) -> usize {

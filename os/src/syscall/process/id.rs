@@ -28,7 +28,6 @@ pub fn sys_exit_group(exit_code: i32) -> ! {
 }
 
 pub fn sys_sched_yield() -> isize {
-    crate::task::record_smp_probe_yield_syscall();
     suspend_current_and_run_next();
     0
 }
