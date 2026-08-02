@@ -3,7 +3,7 @@ use super::user_ptr::{copy_to_user, read_user_array, read_user_value, write_user
 use crate::sync::SpinNoIrqLock;
 use crate::task::check_signals_of_current;
 use crate::task::{
-    TaskContext, TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
+    TaskContext, TaskControlBlock, block_current_task_no_schedule_unless_interrupting_signal,
     current_has_deliverable_signal, current_process, current_task, current_user_token,
     exit_current_group_and_run_next, schedule, wakeup_task,
 };
@@ -463,8 +463,8 @@ impl MsgManager {
 
     fn block_current(&mut self, msqid: usize) -> Result<*mut TaskContext, MsgError> {
         let queue = self.queues.get_mut(&msqid).ok_or(MsgError::Invalid)?;
-        let (task, task_cx_ptr) =
-            block_current_task_no_schedule_unless_unmasked_signal().ok_or(MsgError::Interrupted)?;
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_interrupting_signal()
+            .ok_or(MsgError::Interrupted)?;
         queue.waiters.push(MsgWaiter { task });
         Ok(task_cx_ptr)
     }

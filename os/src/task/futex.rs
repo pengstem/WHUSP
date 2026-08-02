@@ -1,5 +1,5 @@
 use super::{
-    TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
+    TaskControlBlock, block_current_task_no_schedule_unless_interrupting_signal,
     current_has_deliverable_signal, current_process, current_task, current_user_token, schedule,
     wakeup_front_task, wakeup_task,
 };
@@ -225,7 +225,7 @@ impl FutexManager {
         bitset: u32,
     ) -> Option<(*mut super::TaskContext, Arc<FutexWaiter>)> {
         let bucket_index = Self::bucket_index(key);
-        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_interrupting_signal()?;
         let waiter = Arc::new(FutexWaiter {
             task,
             bitset,

@@ -1,6 +1,6 @@
 use super::__switch;
 use super::fetch_task;
-use super::{ProcessControlBlock, TaskContext, TaskControlBlock, TaskStatus};
+use super::{ProcessControlBlock, SignalFlags, TaskContext, TaskControlBlock, TaskStatus};
 use crate::arch::hart;
 use crate::config::MAX_CPUS;
 use crate::cpu::{AtomicCpuMask, CpuMask};
@@ -156,17 +156,18 @@ fn publish_processor_idle(cpu: usize, idle: bool) {
 pub(super) fn prepare_current_switch(
     reason: SwitchReason,
 ) -> (Arc<TaskControlBlock>, *mut TaskContext) {
-    prepare_current_switch_inner(reason, false).expect("unconditional context switch was rejected")
+    prepare_current_switch_inner(reason, None).expect("unconditional context switch was rejected")
 }
 
-pub(super) fn prepare_current_block_unless_unmasked_signal()
--> Option<(Arc<TaskControlBlock>, *mut TaskContext)> {
-    prepare_current_switch_inner(SwitchReason::Block, true)
+pub(super) fn prepare_current_block_unless_signals(
+    interrupting_signals: SignalFlags,
+) -> Option<(Arc<TaskControlBlock>, *mut TaskContext)> {
+    prepare_current_switch_inner(SwitchReason::Block, Some(interrupting_signals))
 }
 
 fn prepare_current_switch_inner(
     reason: SwitchReason,
-    reject_unmasked_signal: bool,
+    interrupting_signals: Option<SignalFlags>,
 ) -> Option<(Arc<TaskControlBlock>, *mut TaskContext)> {
     let cpu = crate::cpu::current_id();
     let mut processor = processor();
@@ -193,8 +194,13 @@ fn prepare_current_switch_inner(
         );
         assert!(!inner.on_rq, "current task is also on a run queue");
         assert!(!inner.wake_pending, "running task retained a wakeup");
-        if reject_unmasked_signal && !(inner.pending_signals & !inner.signal_mask).is_empty() {
-            return None;
+        if let Some(interrupting_signals) = interrupting_signals {
+            let pending_unmasked = SignalFlags::from_bits_retain(
+                inner.pending_signals.bits() & !inner.signal_mask.bits(),
+            );
+            if pending_unmasked.intersects(interrupting_signals) {
+                return None;
+            }
         }
         if reason == SwitchReason::Block {
             inner.task_status = TaskStatus::Blocked;

@@ -5,7 +5,7 @@ use super::user_ptr::{read_user_array, read_user_value, write_user_array, write_
 use crate::sync::SpinNoIrqLock;
 use crate::task::check_signals_of_current;
 use crate::task::{
-    TaskContext, TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
+    TaskContext, TaskControlBlock, block_current_task_no_schedule_unless_interrupting_signal,
     current_has_deliverable_signal, current_process, current_task, current_user_token,
     exit_current_group_and_run_next, schedule, wakeup_task,
 };
@@ -560,8 +560,8 @@ impl SemManager {
         if ops.iter().any(|op| op.sem_flg & IPC_NOWAIT != 0) {
             return Err(SemError::WouldBlock);
         }
-        let (task, task_cx_ptr) =
-            block_current_task_no_schedule_unless_unmasked_signal().ok_or(SemError::Interrupted)?;
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_interrupting_signal()
+            .ok_or(SemError::Interrupted)?;
         match kind {
             SemWaitKind::NonZero => set.values[semnum].ncnt += 1,
             SemWaitKind::Zero => set.values[semnum].zcnt += 1,

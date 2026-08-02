@@ -10,11 +10,11 @@ use crate::uapi::errno::{Errno, KResult};
 use alloc::{sync::Arc, vec::Vec};
 
 pub fn sys_exit(exit_code: i32) -> ! {
-    exit_current_and_run_next(exit_code)
+    exit_current_and_run_next(exit_code & 0xff)
 }
 
 pub fn sys_exit_group(exit_code: i32) -> ! {
-    exit_current_group_and_run_next(exit_code)
+    exit_current_group_and_run_next(exit_code & 0xff)
 }
 
 pub fn sys_sched_yield() -> isize {

@@ -5,8 +5,8 @@ use super::{
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{
-    TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
-    current_has_unmasked_signal, current_task, schedule, wakeup_task,
+    TaskControlBlock, block_current_task_no_schedule_unless_interrupting_signal,
+    current_has_interrupting_signal, current_task, schedule, wakeup_task,
 };
 use crate::timer::get_time_us;
 use alloc::collections::VecDeque;
@@ -209,7 +209,7 @@ impl File for TimerFd {
                 if self.status_flags().contains(OpenFlags::NONBLOCK) {
                     return 0;
                 }
-                if current_has_unmasked_signal() {
+                if current_has_interrupting_signal() {
                     if let Some(task) = current_task() {
                         inner.remove_reader(&task);
                     }
@@ -217,7 +217,7 @@ impl File for TimerFd {
                 }
 
                 let Some((task, task_cx_ptr)) =
-                    block_current_task_no_schedule_unless_unmasked_signal()
+                    block_current_task_no_schedule_unless_interrupting_signal()
                 else {
                     return 0;
                 };

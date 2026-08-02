@@ -6,8 +6,8 @@ use crate::mm::UserBuffer;
 use crate::perf;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{
-    TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
-    current_has_unmasked_signal, current_task, schedule, wakeup_task,
+    TaskControlBlock, block_current_task_no_schedule_unless_interrupting_signal,
+    current_has_interrupting_signal, current_task, schedule, wakeup_task,
 };
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -58,13 +58,13 @@ fn check_io_len(len: usize) -> FsResult {
 
 impl EventFdInner {
     fn sleep_reader(&mut self) -> Option<*mut crate::task::TaskContext> {
-        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_interrupting_signal()?;
         self.read_wait_queue.push_back(task);
         Some(task_cx_ptr)
     }
 
     fn sleep_writer(&mut self) -> Option<*mut crate::task::TaskContext> {
-        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_interrupting_signal()?;
         self.write_wait_queue.push_back(task);
         Some(task_cx_ptr)
     }
@@ -136,7 +136,7 @@ impl File for EventFd {
                 if self.status_flags().contains(OpenFlags::NONBLOCK) {
                     return 0;
                 }
-                if current_has_unmasked_signal() {
+                if current_has_interrupting_signal() {
                     if let Some(task) = current_task() {
                         inner.remove_reader(&task);
                     }
@@ -189,7 +189,7 @@ impl File for EventFd {
                     if self.status_flags().contains(OpenFlags::NONBLOCK) {
                         return 0;
                     }
-                    if current_has_unmasked_signal() {
+                    if current_has_interrupting_signal() {
                         if let Some(task) = current_task() {
                             inner.remove_writer(&task);
                         }

@@ -24,7 +24,7 @@ use crate::random::CompatibilityRandom;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{
     TaskControlBlock, block_current_task_no_schedule,
-    block_current_task_no_schedule_unless_unmasked_signal, current_has_unmasked_signal,
+    block_current_task_no_schedule_unless_interrupting_signal, current_has_interrupting_signal,
     current_process, schedule, send_tty_signal_to_process_group, wakeup_task,
 };
 use alloc::collections::VecDeque;
@@ -490,13 +490,13 @@ impl PtyBuffer {
     }
 
     fn sleep_reader(&mut self) -> Option<*mut crate::task::TaskContext> {
-        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_interrupting_signal()?;
         self.read_wait_queue.push_back(task);
         Some(task_cx_ptr)
     }
 
     fn sleep_writer(&mut self) -> Option<*mut crate::task::TaskContext> {
-        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_interrupting_signal()?;
         self.write_wait_queue.push_back(task);
         Some(task_cx_ptr)
     }
@@ -950,7 +950,7 @@ fn wake_tasks(tasks: VecDeque<Arc<TaskControlBlock>>) {
 fn pty_wait_interrupted() -> bool {
     // CONTEXT: File::read/write cannot return EINTR yet. Like pipes, a PTY
     // wait must return to the trap path when an unmasked signal is pending.
-    current_has_unmasked_signal()
+    current_has_interrupting_signal()
 }
 
 fn open_ptmx(flags: OpenFlags) -> FsResult<Arc<dyn File + Send + Sync>> {
@@ -1735,7 +1735,7 @@ fn read_random(mut user_buf: UserBuffer) -> usize {
 }
 
 fn input_wait_interrupted() -> bool {
-    current_has_unmasked_signal()
+    current_has_interrupting_signal()
 }
 
 fn input_open_client() -> Arc<SpinNoIrqLock<InputClient>> {

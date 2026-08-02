@@ -13,8 +13,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::task::{
-    ProcessControlBlock, TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
-    current_has_unmasked_signal, current_process, schedule, wakeup_task,
+    ProcessControlBlock, TaskControlBlock,
+    block_current_task_no_schedule_unless_interrupting_signal, current_has_interrupting_signal,
+    current_process, schedule, wakeup_task,
 };
 
 pub struct Pipe {
@@ -526,7 +527,7 @@ impl PipeRingBuffer {
     /// The caller must drop the ring-buffer lock before passing the returned
     /// context pointer to `schedule()`, otherwise writers cannot wake it.
     fn sleep_reader(&mut self) -> Option<*mut crate::task::TaskContext> {
-        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_interrupting_signal()?;
         self.read_wait_queue.push_back(task);
         Some(task_cx_ptr)
     }
@@ -536,7 +537,7 @@ impl PipeRingBuffer {
     /// The caller must drop the ring-buffer lock before passing the returned
     /// context pointer to `schedule()`, otherwise readers cannot wake it.
     fn sleep_writer(&mut self) -> Option<*mut crate::task::TaskContext> {
-        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_interrupting_signal()?;
         self.write_wait_queue.push_back(task);
         Some(task_cx_ptr)
     }
@@ -610,7 +611,7 @@ fn wake_tasks(tasks: VecDeque<Arc<TaskControlBlock>>) {
 fn pipe_wait_interrupted() -> bool {
     // CONTEXT: File::read/write cannot return EINTR yet, but a pipe wait must
     // return to the trap path when a signal wakes it so fatal signals can exit.
-    current_has_unmasked_signal()
+    current_has_interrupting_signal()
 }
 
 impl Drop for Pipe {

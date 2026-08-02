@@ -9,7 +9,7 @@ use crate::mm::UserBuffer;
 use crate::perf;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{
-    block_current_task_no_schedule_unless_unmasked_signal, current_has_interrupting_signal,
+    block_current_task_no_schedule_unless_interrupting_signal, current_has_interrupting_signal,
     current_task, current_user_token, schedule,
 };
 use crate::timer::{add_timer, get_time_us};
@@ -472,7 +472,7 @@ fn sleep_until_next_epoll_probe(deadline_us: Option<usize>) -> KResult {
     let expire_ms = target_us.div_ceil(1_000);
     current_task().ok_or(Errno::ESRCH)?;
     let (task, task_cx_ptr) =
-        block_current_task_no_schedule_unless_unmasked_signal().ok_or(Errno::EINTR)?;
+        block_current_task_no_schedule_unless_interrupting_signal().ok_or(Errno::EINTR)?;
     add_timer(expire_ms, task);
     perf::record_epoll_backoff_sleep(sleep_us);
     schedule(task_cx_ptr);
@@ -491,7 +491,7 @@ fn sleep_until_epoll_event(waiter: &Arc<PollWaiter>, deadline_us: Option<usize>)
     }
 
     let (task, task_cx_ptr) =
-        block_current_task_no_schedule_unless_unmasked_signal().ok_or(Errno::EINTR)?;
+        block_current_task_no_schedule_unless_interrupting_signal().ok_or(Errno::EINTR)?;
     debug_assert!(waiter.task_matches(&task));
     if let Some(deadline_us) = deadline_us {
         add_timer(deadline_us.div_ceil(1_000), Arc::clone(&task));

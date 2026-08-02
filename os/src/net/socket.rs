@@ -24,8 +24,8 @@ use crate::syscall::user_ptr::{
     UserBufferAccess, read_user_array_item, translated_byte_buffer_checked_with_mmap_fault,
 };
 use crate::task::{
-    TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
-    current_has_unmasked_signal, current_process, current_task, schedule, wakeup_task,
+    TaskControlBlock, block_current_task_no_schedule_unless_interrupting_signal,
+    current_has_interrupting_signal, current_process, current_task, schedule, wakeup_task,
 };
 use crate::timer::{add_timer, get_time_ms};
 use crate::uapi::errno::{Errno, KResult};
@@ -455,13 +455,13 @@ impl LocalSocketInner {
     }
 
     fn sleep_reader(&mut self) -> Option<*mut crate::task::TaskContext> {
-        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_interrupting_signal()?;
         self.read_wait_queue.push_back(task);
         Some(task_cx_ptr)
     }
 
     fn sleep_writer(&mut self) -> Option<*mut crate::task::TaskContext> {
-        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_unmasked_signal()?;
+        let (task, task_cx_ptr) = block_current_task_no_schedule_unless_interrupting_signal()?;
         self.write_wait_queue.push_back(task);
         Some(task_cx_ptr)
     }
@@ -529,7 +529,7 @@ fn find_tcp_listener_or_block(port: u16, deadline_ms: usize) -> KResult<TcpConne
     }
     perf::record_local_socket_writer_sleep();
     let (task, task_cx_ptr) =
-        block_current_task_no_schedule_unless_unmasked_signal().ok_or(Errno::EINTR)?;
+        block_current_task_no_schedule_unless_interrupting_signal().ok_or(Errno::EINTR)?;
     let waiters = loopback.tcp_connect_waiters.entry(port).or_default();
     remove_socket_waiter(waiters, &task);
     waiters.push_back(Arc::clone(&task));
@@ -847,7 +847,7 @@ impl LocalSocket {
                 if nonblock {
                     return Err(Errno::EAGAIN);
                 }
-                if current_has_unmasked_signal() {
+                if current_has_interrupting_signal() {
                     if let Some(task) = current_task() {
                         inner.remove_reader(&task);
                     }
@@ -923,7 +923,7 @@ impl LocalSocket {
                 }
                 return Err(Errno::ECONNREFUSED);
             }
-            if current_has_unmasked_signal() {
+            if current_has_interrupting_signal() {
                 if let Some(task) = current_task() {
                     remove_tcp_connect_waiter(remote.port, &task);
                 }
@@ -1046,7 +1046,7 @@ impl LocalSocket {
                 if nonblock {
                     return Err(Errno::EAGAIN);
                 }
-                if current_has_unmasked_signal() {
+                if current_has_interrupting_signal() {
                     if let Some(task) = current_task() {
                         peer_inner.remove_writer(&task);
                     }
@@ -1109,7 +1109,7 @@ impl LocalSocket {
                 if nonblock {
                     return Err(Errno::EAGAIN);
                 }
-                if current_has_unmasked_signal() {
+                if current_has_interrupting_signal() {
                     if let Some(task) = current_task() {
                         peer_inner.remove_writer(&task);
                     }
@@ -1224,7 +1224,7 @@ impl LocalSocket {
                 if nonblock {
                     return Err(Errno::EAGAIN);
                 }
-                if current_has_unmasked_signal() {
+                if current_has_interrupting_signal() {
                     if let Some(task) = current_task() {
                         peer.remove_writer(&task);
                     }
@@ -1352,7 +1352,7 @@ impl LocalSocket {
             if nonblock {
                 return Err(Errno::EAGAIN);
             }
-            if current_has_unmasked_signal() {
+            if current_has_interrupting_signal() {
                 if let Some(task) = current_task() {
                     inner.remove_reader(&task);
                 }
@@ -1413,7 +1413,7 @@ impl LocalSocket {
             if nonblock {
                 return Err(Errno::EAGAIN);
             }
-            if current_has_unmasked_signal() {
+            if current_has_interrupting_signal() {
                 if let Some(task) = current_task() {
                     self.inner.lock().remove_reader(&task);
                 }
@@ -1449,7 +1449,7 @@ impl LocalSocket {
             if nonblock {
                 return Err(Errno::EAGAIN);
             }
-            if current_has_unmasked_signal() {
+            if current_has_interrupting_signal() {
                 if let Some(task) = current_task() {
                     self.inner.lock().remove_reader(&task);
                 }

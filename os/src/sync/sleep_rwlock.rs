@@ -1,7 +1,7 @@
 use super::SpinNoIrqLock;
 use crate::task::{
     TaskContext, TaskControlBlock, block_current_task_no_schedule,
-    block_current_task_no_schedule_unless_unmasked_signal, schedule, wakeup_task,
+    block_current_task_no_schedule_unless_interrupting_signal, schedule, wakeup_task,
 };
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 use core::{
@@ -310,7 +310,7 @@ impl<T> SleepRwLock<T> {
 
 fn block_for_lock(interruptible: bool) -> Option<(Arc<TaskControlBlock>, *mut TaskContext)> {
     if interruptible {
-        block_current_task_no_schedule_unless_unmasked_signal()
+        block_current_task_no_schedule_unless_interrupting_signal()
     } else {
         Some(block_current_task_no_schedule())
     }

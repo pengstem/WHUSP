@@ -5,7 +5,7 @@ use crate::sync::SpinNoIrqLock;
 #[cfg(target_arch = "loongarch64")]
 use crate::task::suspend_current_and_run_next;
 use crate::task::{
-    SignalFlags, TaskControlBlock, block_current_task_no_schedule_unless_unmasked_signal,
+    SignalFlags, TaskControlBlock, block_current_task_no_schedule_unless_interrupting_signal,
     current_has_interrupting_signal, current_process, current_process_group_id, current_task,
     processes_snapshot, schedule, send_tty_signal_to_process_group, wakeup_task,
 };
@@ -603,7 +603,7 @@ pub(crate) fn console_tty_read(user_buf: UserBuffer) -> usize {
             suspend_current_and_run_next();
             continue;
         }
-        let Some((task, task_cx_ptr)) = block_current_task_no_schedule_unless_unmasked_signal()
+        let Some((task, task_cx_ptr)) = block_current_task_no_schedule_unless_interrupting_signal()
         else {
             return 0;
         };

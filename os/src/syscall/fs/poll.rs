@@ -1,7 +1,7 @@
 use crate::fs::{File, PollEvents, PollWaiter};
 use crate::perf;
 use crate::task::{
-    SignalFlags, block_current_task_no_schedule_unless_unmasked_signal,
+    SignalFlags, block_current_task_no_schedule_unless_interrupting_signal,
     current_has_interrupting_signal, current_task, current_user_token, linux_sigset_to_flags,
     schedule,
 };
@@ -111,7 +111,7 @@ fn sleep_until_poll_event(waiter: &Arc<PollWaiter>, deadline_ms: Option<usize>) 
 
     let _sleep_guard = ProcSleepGuard::new()?;
     let (task, task_cx_ptr) =
-        block_current_task_no_schedule_unless_unmasked_signal().ok_or(Errno::EINTR)?;
+        block_current_task_no_schedule_unless_interrupting_signal().ok_or(Errno::EINTR)?;
     debug_assert!(waiter.task_matches(&task));
     if let Some(deadline_ms) = deadline_ms {
         add_timer(deadline_ms, Arc::clone(&task));
@@ -126,7 +126,7 @@ fn sleep_until_poll_event(waiter: &Arc<PollWaiter>, deadline_ms: Option<usize>) 
 
 fn block_signal_only_waiter() -> KResult<()> {
     let (blocked_task, task_cx_ptr) =
-        block_current_task_no_schedule_unless_unmasked_signal().ok_or(Errno::EINTR)?;
+        block_current_task_no_schedule_unless_interrupting_signal().ok_or(Errno::EINTR)?;
     drop(blocked_task);
     schedule(task_cx_ptr);
     Ok(())

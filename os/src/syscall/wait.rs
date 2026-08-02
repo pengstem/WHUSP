@@ -481,12 +481,14 @@ fn sys_wait4_for_process(
         // zombie scan and the sleep transition, causing the child's wakeup to be
         // lost and the parent to sleep forever.
         let (task, task_cx_ptr) = block_current_task_no_schedule();
+        task.inner_exclusive_access().waiting_for_child = true;
         drop(inner);
         let interrupted = task_has_wait_interrupt_signal(&task, &process);
         if interrupted {
-            wakeup_task(task);
+            wakeup_task(Arc::clone(&task));
         }
         schedule(task_cx_ptr);
+        task.inner_exclusive_access().waiting_for_child = false;
         if interrupted {
             return Err(Errno::EINTR);
         }
@@ -594,13 +596,15 @@ pub fn sys_waitid(
         // The blocked state must be published before dropping the child-list
         // lock so exit-time wakeups cannot be missed.
         let (task, task_cx_ptr) = block_current_task_no_schedule();
+        task.inner_exclusive_access().waiting_for_child = true;
         drop(inner);
         let interrupted = task_has_wait_interrupt_signal(&task, &process);
         if interrupted {
-            wakeup_task(task);
+            wakeup_task(Arc::clone(&task));
         }
-        drop(process);
         schedule(task_cx_ptr);
+        task.inner_exclusive_access().waiting_for_child = false;
+        drop(process);
         if interrupted {
             return Err(Errno::EINTR);
         }
