@@ -1288,9 +1288,7 @@ pub(crate) struct VfsFile {
     namespace_id: MountNamespaceId,
     visible_path: Option<String>,
     offset: SleepMutex<usize>,
-    read_snapshot: SleepMutex<Option<Vec<u8>>>,
-    directory_snapshot: SleepMutex<Option<CachedDirectorySnapshot>>,
-    read_snapshot_supported: bool,
+    snapshot_state: VfsFileSnapshotState,
     supports_page_cache: bool,
     supports_dirty_writeback: bool,
     readable: bool,
@@ -1303,6 +1301,12 @@ pub(crate) struct VfsFile {
 struct CachedDirectorySnapshot {
     version: usize,
     snapshot: BackendDirectorySnapshot,
+}
+
+enum VfsFileSnapshotState {
+    None,
+    Read(SleepMutex<Option<Vec<u8>>>),
+    Directory(SleepMutex<Option<CachedDirectorySnapshot>>),
 }
 
 impl VfsFile {
@@ -1336,9 +1340,17 @@ impl VfsFile {
         // later unlinked. Keep this retain paired with Drop's release path.
         let mount_backend = mounted_backend_lease(node.mount_id).ok_or(FsError::Io)?;
         let inode_state = retain_inode_with_lease(node, &mount_backend)?;
-        let read_snapshot_supported = mount_backend.call(BackendOp::ReadPlan, |mount| {
-            mount.supports_read_snapshot(node.ino)
-        });
+        let snapshot_state = if kind == FsNodeKind::Directory {
+            VfsFileSnapshotState::Directory(SleepMutex::new(None))
+        } else if kind == FsNodeKind::RegularFile
+            && mount_backend.call(BackendOp::ReadPlan, |mount| {
+                mount.supports_read_snapshot(node.ino)
+            })
+        {
+            VfsFileSnapshotState::Read(SleepMutex::new(None))
+        } else {
+            VfsFileSnapshotState::None
+        };
         let supports_page_cache = mount_supports_page_cache(node.mount_id);
         let supports_dirty_writeback = mount_supports_dirty_writeback(node.mount_id);
         track_writable_regular_open(node, kind, writable);
@@ -1353,9 +1365,7 @@ impl VfsFile {
             namespace_id,
             visible_path,
             offset: SleepMutex::new(0),
-            read_snapshot: SleepMutex::new(None),
-            directory_snapshot: SleepMutex::new(None),
-            read_snapshot_supported,
+            snapshot_state,
             supports_page_cache,
             supports_dirty_writeback,
             readable,
@@ -1404,7 +1414,7 @@ impl VfsFile {
                 };
             *offset = stat_logical_size(self.node, stat.size) as usize;
         }
-        *self.read_snapshot.lock() = None;
+        self.invalidate_read_snapshot();
         let _mutation = (buf.len() > 0)
             .then(|| begin_regular_file_page_cache_mutation(self.node, self.kind))
             .flatten();
@@ -1600,10 +1610,10 @@ impl VfsFile {
     }
 
     fn read_snapshot_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
-        if !self.read_snapshot_supported {
+        let VfsFileSnapshotState::Read(snapshot) = &self.snapshot_state else {
             return None;
-        }
-        let mut snapshot = self.read_snapshot.lock();
+        };
+        let mut snapshot = snapshot.lock();
         if offset == 0 {
             *snapshot = None;
         }
@@ -1631,7 +1641,7 @@ impl VfsFile {
     }
 
     fn read_snapshot_user_buffer(&self, offset: &mut usize, buf: &mut UserBuffer) -> Option<usize> {
-        if !self.read_snapshot_supported {
+        if !matches!(&self.snapshot_state, VfsFileSnapshotState::Read(_)) {
             return None;
         }
         let mut total_read_size = 0usize;
@@ -1647,6 +1657,13 @@ impl VfsFile {
             }
         }
         Some(total_read_size)
+    }
+
+    #[inline(always)]
+    fn invalidate_read_snapshot(&self) {
+        if let VfsFileSnapshotState::Read(snapshot) = &self.snapshot_state {
+            *snapshot.lock() = None;
+        }
     }
 
     fn read_coalesced_user_buffer(
@@ -3026,7 +3043,7 @@ impl File for VfsFile {
         if self.kind == FsNodeKind::Directory {
             return 0;
         }
-        *self.read_snapshot.lock() = None;
+        self.invalidate_read_snapshot();
         let _mutation = (!buf.is_empty())
             .then(|| begin_regular_file_page_cache_mutation(self.node, self.kind))
             .flatten();
@@ -3049,7 +3066,7 @@ impl File for VfsFile {
             return Err(FsError::Unsupported);
         }
         self.check_write_at(offset, len)?;
-        *self.read_snapshot.lock() = None;
+        self.invalidate_read_snapshot();
         let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         let mut pressure_retried = false;
         loop {
@@ -3095,7 +3112,7 @@ impl File for VfsFile {
             return Err(FsError::Unsupported);
         }
         self.check_write_at(write_offset, len)?;
-        *self.read_snapshot.lock() = None;
+        self.invalidate_read_snapshot();
         let _mutation = begin_regular_file_page_cache_mutation(self.node, self.kind);
         let mut pressure_retried = false;
         let mut offset_advanced = false;
@@ -3237,6 +3254,9 @@ impl File for VfsFile {
         if self.kind != FsNodeKind::Directory {
             return Err(FsError::NotDir);
         }
+        let VfsFileSnapshotState::Directory(directory_snapshot) = &self.snapshot_state else {
+            unreachable!("directory VfsFile missing directory snapshot state");
+        };
         let mut offset = self.offset.lock();
         let user_buf_len = user_buf.len();
         let mut kernel_buf = vec![0u8; user_buf_len.min(VFS_DIRENT_SCRATCH_MAX)];
@@ -3250,7 +3270,7 @@ impl File for VfsFile {
             let (read_size, next_offset) =
                 inode_state::with_directory_read_state(&self.inode_state, |directory_version| {
                     {
-                        let cached = self.directory_snapshot.lock();
+                        let cached = directory_snapshot.lock();
                         if let Some(cached) = cached
                             .as_ref()
                             .filter(|cached| cached.version == directory_version)
@@ -3266,7 +3286,7 @@ impl File for VfsFile {
                     if let Some(plan) = plan {
                         let snapshot = plan.execute()?;
                         let result = snapshot.read_dirent64(current_offset, &mut kernel_buf);
-                        *self.directory_snapshot.lock() = Some(CachedDirectorySnapshot {
+                        *directory_snapshot.lock() = Some(CachedDirectorySnapshot {
                             version: directory_version,
                             snapshot,
                         });
