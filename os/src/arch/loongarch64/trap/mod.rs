@@ -11,12 +11,14 @@ use crate::syscall::{
     syscall_with_current_task,
 };
 use crate::task::{
-    SignalAction, SignalFlags, TaskControlBlock, account_task_user_time_until,
-    check_signals_of_task, current_add_signal, current_process, current_task,
-    exit_current_group_and_run_next, process_of_task, suspend_current_and_run_next,
-    timer_tick_should_preempt, trap_cx_of_task, trap_return_context_after_accounting_for_task,
+    SignalAction, SignalFlags, TaskControlBlock, check_signals_of_task, current_add_signal,
+    current_process, current_task, exit_current_group_and_run_next, process_of_task,
+    suspend_current_and_run_next, timer_tick_should_preempt, trap_cx_of_task,
+    trap_return_context_after_accounting_for_task,
 };
-use crate::timer::{check_timer, get_time_us, set_next_trigger};
+use crate::timer::{check_timer, set_next_trigger};
+#[cfg(feature = "precise-cpu-accounting")]
+use crate::{task::account_task_user_time_until, timer::get_time_us};
 use alloc::sync::Arc;
 use core::arch::global_asm;
 use loongArch64::cpu::CPUCFG;
@@ -106,6 +108,7 @@ fn tlb_init(hardware_page_table_walk: bool) {
 pub fn trap_handler() -> ! {
     let mut task = current_task().expect("trap_handler requires a running task");
     let mut process = process_of_task(&task);
+    #[cfg(feature = "precise-cpu-accounting")]
     account_task_user_time_until(&task, get_time_us());
     let estat = estat::read();
     let badv = badv::read().vaddr();
@@ -311,8 +314,7 @@ fn trap_return_for_task(
     process: Arc<crate::task::ProcessControlBlock>,
 ) -> ! {
     crate::task::preempt_current_if_needed_on_user_return();
-    let now_us = get_time_us();
-    let (trap_cx, user_token) = trap_return_context_after_accounting_for_task(&task, now_us);
+    let (trap_cx, user_token) = trap_return_context_after_accounting_for_task(&task);
     let flush_tlb = crate::arch::mm::should_flush_tlb_on_return(user_token);
     if flush_tlb {
         crate::perf::record_la_return_invtlb_call();

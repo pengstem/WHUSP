@@ -254,11 +254,10 @@ fn finish_current_switch() {
         (task, process, address_space, reason)
     };
 
-    if reason == SwitchReason::Block {
-        // Stop runtime accounting while on_cpu still prevents a concurrent
-        // waker from publishing the task to another CPU.
-        super::charge_task_after_run(&task);
-    }
+    // Stop runtime accounting while on_cpu still prevents a concurrent waker
+    // from publishing the task to another CPU. Fast CPU accounting also uses
+    // this scheduler boundary to charge the task's combined runtime.
+    super::charge_task_after_run(&task);
 
     let mut enqueue = None;
     {
@@ -310,8 +309,6 @@ fn finish_current_switch() {
         SwitchReason::Yield => {
             if enqueue.is_some() {
                 super::requeue_task_after_run(task);
-            } else {
-                super::charge_task_after_run(&task);
             }
         }
         SwitchReason::Block => {
@@ -431,18 +428,21 @@ pub fn trap_cx_of_task(task: &TaskControlBlock) -> &'static mut TrapContext {
     task.inner_exclusive_access().get_trap_cx()
 }
 
-fn account_trap_return_for_task(task: &TaskControlBlock, now_us: usize) {
-    task.account_system_time_until(now_us);
-    task.mark_user_time_entry(now_us);
+fn account_trap_return_for_task(task: &TaskControlBlock) {
+    #[cfg(feature = "precise-cpu-accounting")]
+    {
+        let now_us = crate::timer::get_time_us();
+        task.account_system_time_until(now_us);
+        task.mark_user_time_entry(now_us);
+    }
+    #[cfg(not(feature = "precise-cpu-accounting"))]
+    let _ = task;
 }
 
 #[cfg(target_arch = "riscv64")]
-pub fn trap_return_context_after_accounting_for_task(
-    task: &TaskControlBlock,
-    now_us: usize,
-) -> (usize, usize) {
+pub fn trap_return_context_after_accounting_for_task(task: &TaskControlBlock) -> (usize, usize) {
     perf::record_task_current_trap_return_context_call();
-    account_trap_return_for_task(task, now_us);
+    account_trap_return_for_task(task);
     processor().prepare_current_address_space_return();
     let trap_cx_user_va = task
         .inner_exclusive_access()
@@ -455,12 +455,9 @@ pub fn trap_return_context_after_accounting_for_task(
 }
 
 #[cfg(target_arch = "loongarch64")]
-pub fn trap_return_context_after_accounting_for_task(
-    task: &TaskControlBlock,
-    now_us: usize,
-) -> (usize, usize) {
+pub fn trap_return_context_after_accounting_for_task(task: &TaskControlBlock) -> (usize, usize) {
     perf::record_task_current_trap_return_context_call();
-    account_trap_return_for_task(task, now_us);
+    account_trap_return_for_task(task);
     processor().prepare_current_address_space_return();
     let trap_cx = task.inner_exclusive_access().get_trap_cx() as *mut TrapContext as usize;
     let user_token = current_user_token();
@@ -483,5 +480,6 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     unsafe {
         __switch(switched_task_cx_ptr, idle_task_cx_ptr);
     }
+    #[cfg(feature = "precise-cpu-accounting")]
     super::mark_current_kernel_time_entry(crate::timer::get_time_us());
 }

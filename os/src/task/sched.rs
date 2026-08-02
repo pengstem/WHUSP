@@ -159,10 +159,11 @@ impl TaskManager {
     }
 
     fn charge_normal_runtime(task: &TaskControlBlock) {
-        if Self::rt_priority(task) != 0 {
+        let is_realtime = Self::rt_priority(task) != 0;
+        let runtime_us = task.take_sched_runtime_us(crate::timer::get_time_us());
+        if is_realtime || runtime_us == 0 {
             return;
         }
-        let runtime_us = task.take_sched_runtime_us(crate::timer::get_time_us());
         let delta = Self::vruntime_delta_for_runtime(task, runtime_us);
         task.add_sched_vruntime(delta);
         perf::record_scheduler_normal_requeue(delta as usize);
@@ -195,7 +196,6 @@ impl TaskManager {
     }
 
     fn requeue_after_run(&mut self, task: Arc<TaskControlBlock>) {
-        Self::charge_normal_runtime(&task);
         if Self::mark_queued_on(&task, self.cpu) {
             self.enqueue(task, false);
         }

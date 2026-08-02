@@ -32,7 +32,9 @@ pub enum TaskStatus {
 struct TaskCpuTimes {
     user_us: usize,
     system_us: usize,
+    #[cfg(feature = "precise-cpu-accounting")]
     last_user_enter_us: Option<usize>,
+    #[cfg(feature = "precise-cpu-accounting")]
     last_kernel_enter_us: Option<usize>,
 }
 
@@ -359,10 +361,14 @@ impl TaskControlBlock {
     }
 
     pub(crate) fn take_sched_runtime_us(&self, now_us: usize) -> usize {
-        self.inner_exclusive_access()
+        let mut inner = self.inner_exclusive_access();
+        let runtime_us = inner
             .sched_run_start_us
             .take()
-            .map_or(0, |start_us| now_us.saturating_sub(start_us))
+            .map_or(0, |start_us| now_us.saturating_sub(start_us));
+        #[cfg(not(feature = "precise-cpu-accounting"))]
+        inner.cpu_times.account_scheduler_runtime(runtime_us);
+        runtime_us
     }
 
     pub(crate) fn sched_runtime_us(&self, now_us: usize) -> usize {
@@ -371,30 +377,35 @@ impl TaskControlBlock {
             .map_or(0, |start_us| now_us.saturating_sub(start_us))
     }
 
+    #[cfg(feature = "precise-cpu-accounting")]
     pub fn mark_user_time_entry(&self, now_us: usize) {
         self.inner_exclusive_access()
             .cpu_times
             .mark_user_entry(now_us);
     }
 
+    #[cfg(feature = "precise-cpu-accounting")]
     pub fn mark_kernel_time_entry(&self, now_us: usize) {
         self.inner_exclusive_access()
             .cpu_times
             .mark_kernel_entry(now_us);
     }
 
+    #[cfg(feature = "precise-cpu-accounting")]
     pub fn account_user_time_until(&self, now_us: usize) {
         self.inner_exclusive_access()
             .cpu_times
             .account_user_until(now_us);
     }
 
+    #[cfg(feature = "precise-cpu-accounting")]
     pub fn account_system_time_until(&self, now_us: usize) {
         self.inner_exclusive_access()
             .cpu_times
             .account_system_until(now_us);
     }
 
+    #[cfg(feature = "precise-cpu-accounting")]
     pub fn try_account_system_time_until(&self, now_us: usize) {
         if let Some(mut inner) = self.inner.try_lock() {
             inner.cpu_times.account_system_until(now_us);
@@ -402,12 +413,32 @@ impl TaskControlBlock {
     }
 
     pub fn cpu_time_us(&self) -> usize {
-        self.inner_exclusive_access().cpu_times.total_us()
+        let inner = self.inner_exclusive_access();
+        #[cfg(feature = "precise-cpu-accounting")]
+        return inner.cpu_times.total_us();
+        #[cfg(not(feature = "precise-cpu-accounting"))]
+        {
+            let pending_us = inner.sched_run_start_us.map_or(0, |start_us| {
+                crate::timer::get_time_us().saturating_sub(start_us)
+            });
+            inner.cpu_times.total_us().saturating_add(pending_us)
+        }
     }
 
     pub(crate) fn cpu_times_snapshot(&self) -> (usize, usize) {
         let inner = self.inner_exclusive_access();
-        (inner.cpu_times.user_us, inner.cpu_times.system_us)
+        #[cfg(feature = "precise-cpu-accounting")]
+        return (inner.cpu_times.user_us, inner.cpu_times.system_us);
+        #[cfg(not(feature = "precise-cpu-accounting"))]
+        {
+            let pending_us = inner.sched_run_start_us.map_or(0, |start_us| {
+                crate::timer::get_time_us().saturating_sub(start_us)
+            });
+            (
+                inner.cpu_times.user_us.saturating_add(pending_us),
+                inner.cpu_times.system_us,
+            )
+        }
     }
 
     pub(crate) fn take_cpu_times_snapshot(&self) -> (usize, usize) {
@@ -433,16 +464,19 @@ impl TaskControlBlockInner {
 }
 
 impl TaskCpuTimes {
+    #[cfg(feature = "precise-cpu-accounting")]
     fn mark_user_entry(&mut self, now_us: usize) {
         self.last_user_enter_us = Some(now_us);
         self.last_kernel_enter_us = None;
     }
 
+    #[cfg(feature = "precise-cpu-accounting")]
     fn mark_kernel_entry(&mut self, now_us: usize) {
         self.last_kernel_enter_us = Some(now_us);
         self.last_user_enter_us = None;
     }
 
+    #[cfg(feature = "precise-cpu-accounting")]
     fn account_user_until(&mut self, now_us: usize) {
         if let Some(start_us) = self.last_user_enter_us.take() {
             self.user_us = self.user_us.saturating_add(now_us.saturating_sub(start_us));
@@ -450,6 +484,7 @@ impl TaskCpuTimes {
         self.last_kernel_enter_us = Some(now_us);
     }
 
+    #[cfg(feature = "precise-cpu-accounting")]
     fn account_system_until(&mut self, now_us: usize) {
         if let Some(start_us) = self.last_kernel_enter_us.take() {
             self.system_us = self
@@ -461,5 +496,14 @@ impl TaskCpuTimes {
 
     fn total_us(&self) -> usize {
         self.user_us.saturating_add(self.system_us)
+    }
+
+    #[cfg(not(feature = "precise-cpu-accounting"))]
+    fn account_scheduler_runtime(&mut self, runtime_us: usize) {
+        // UNFINISHED: Fast accounting preserves total task CPU runtime at
+        // context-switch granularity but does not split user and system time.
+        // Charge the combined interval to user time; enable
+        // `precise-cpu-accounting` for trap-boundary attribution.
+        self.user_us = self.user_us.saturating_add(runtime_us);
     }
 }

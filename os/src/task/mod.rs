@@ -89,30 +89,42 @@ pub use tcb::{DEFAULT_TIMER_SLACK_NS, TaskControlBlock, TaskStatus};
 const CORE_DUMP_STATUS_BIT: i32 = 0x80;
 const CORE_DUMP_MAX_BYTES: usize = 16 * 1024 * 1024;
 
+#[cfg(feature = "precise-cpu-accounting")]
 pub fn account_task_user_time_until(task: &TaskControlBlock, now_us: usize) {
     task.account_user_time_until(now_us);
 }
 
+#[cfg(feature = "precise-cpu-accounting")]
 pub fn account_current_system_time_until(now_us: usize) {
     if let Some(task) = current_task() {
         task.account_system_time_until(now_us);
     }
 }
 
+#[cfg(feature = "precise-cpu-accounting")]
 fn try_account_current_system_time_until(now_us: usize) {
     if let Some(task) = current_task() {
         task.try_account_system_time_until(now_us);
     }
 }
 
+#[cfg(feature = "precise-cpu-accounting")]
 pub fn account_current_system_time() {
     account_current_system_time_until(crate::timer::get_time_us());
 }
 
+#[cfg(not(feature = "precise-cpu-accounting"))]
+pub fn account_current_system_time() {}
+
+#[cfg(feature = "precise-cpu-accounting")]
 fn try_account_current_system_time() {
     try_account_current_system_time_until(crate::timer::get_time_us());
 }
 
+#[cfg(not(feature = "precise-cpu-accounting"))]
+fn try_account_current_system_time() {}
+
+#[cfg(feature = "precise-cpu-accounting")]
 pub fn mark_current_kernel_time_entry(now_us: usize) {
     if let Some(task) = current_task() {
         task.mark_kernel_time_entry(now_us);
@@ -892,6 +904,8 @@ fn publish_process_exit(
 fn exit_current(exit_code: i32, group_exit: bool) -> ! {
     let current = current_task().expect("exit_current requires a current task");
     account_current_system_time();
+    #[cfg(not(feature = "precise-cpu-accounting"))]
+    charge_task_after_run(&current);
     let process = current
         .process
         .upgrade()
