@@ -287,8 +287,16 @@ impl ProcessControlBlock {
         #[cfg(target_arch = "loongarch64")]
         crate::arch::trap::sync_user_fp_state_for_task(calling_task);
         let mut parent = self.inner_exclusive_access();
-        let parent_resident_kb = parent.memory_set.resident_bytes() / 1024;
-        parent.cpu_times.record_resident_kb(parent_resident_kb);
+        #[cfg(feature = "precise-rusage")]
+        {
+            let parent_resident_kb = parent.memory_set.resident_bytes() / 1024;
+            parent.cpu_times.record_resident_kb(parent_resident_kb);
+        }
+        // UNFINISHED: The default fast profile samples maxrss when userspace
+        // queries it, procfs takes a process snapshot, or the process exits.
+        // A transient resident peak followed by unmap without any of those
+        // sampling points can therefore be omitted. `precise-rusage` retains
+        // the eager pre-fork page-table scan for compatibility testing.
         let inherited_self_maxrss_kb = parent.cpu_times.snapshot().self_maxrss_kb;
         let memory_set = MemorySet::from_existed_user(&mut parent.memory_set)?;
         let pid = pid_alloc();
