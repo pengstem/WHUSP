@@ -1980,6 +1980,10 @@ impl ProcessControlBlock {
         self.has_posix_record_locks.store(active, Ordering::Release);
     }
 
+    pub(crate) fn fsuid(&self) -> u32 {
+        self.credentials_fast.read(|credentials| credentials.fsuid)
+    }
+
     pub fn umask(&self) -> u32 {
         self.inner_exclusive_access().umask
     }

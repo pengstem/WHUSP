@@ -199,6 +199,48 @@ fn process_global_path_for(snapshot: &PathSnapshot, path: &str) -> Option<String
     )
 }
 
+fn path_component_is_static_root(component: &str) -> bool {
+    matches!(component, "proc" | "sys")
+}
+
+fn path_has_parent_component(path: &str) -> bool {
+    if !path.as_bytes().contains(&b'.') {
+        return false;
+    }
+    path.split('/').any(|component| component == "..")
+}
+
+fn path_under_static_root(path: &str) -> bool {
+    path.starts_with("/proc/") || path == "/proc" || path.starts_with("/sys/") || path == "/sys"
+}
+
+/// Returns whether lexical normalization could reach a static `/proc` or
+/// `/sys` compatibility node.
+///
+/// This deliberately stays conservative for dirfd and `..` paths. The common
+/// EXT4 case (a plain relative path below a non-static cwd) avoids allocating a
+/// process-global path merely to miss staticfs.
+pub(crate) fn static_path_probe_may_hit(snapshot: &PathSnapshot, dirfd: isize, path: &str) -> bool {
+    if path_has_parent_component(path) {
+        return true;
+    }
+    if path.starts_with('/') {
+        return path_under_static_root(snapshot.root_path.as_str())
+            || (snapshot.root_path == "/" && path_under_static_root(path));
+    }
+    if dirfd != AT_FDCWD {
+        return true;
+    }
+    if path_under_static_root(snapshot.cwd_path.as_str()) {
+        return true;
+    }
+    snapshot.cwd_path == "/"
+        && path
+            .split('/')
+            .find(|component| !component.is_empty() && *component != ".")
+            .is_some_and(path_component_is_static_root)
+}
+
 fn visible_working_dir_path(snapshot: &PathSnapshot) -> KResult<String> {
     Ok(
         path_inside_root(snapshot.root_path.as_str(), snapshot.cwd_path.as_str())
@@ -571,6 +613,20 @@ fn openat_dir_path(snapshot: &PathSnapshot, dirfd: isize, path: &str) -> KResult
         .and_then(|base_path| normalize_path_at_root(snapshot.root_path.as_str(), base_path, path)))
 }
 
+/// Root read-only opens need no target DAC decision in the syscall adapter.
+/// Keep create, write, truncate, O_NOATIME, and O_PATH on the compatibility
+/// path until their remaining permission and read-only-mount checks live in the
+/// VFS open result itself.
+fn root_existing_open_precheck_is_redundant(flags: OpenFlags, subject: AccessSubject<'_>) -> bool {
+    subject.is_root()
+        && !flags.contains(OpenFlags::NOATIME)
+        && !flags.contains(OpenFlags::PATH)
+        && !flags.contains(OpenFlags::CREATE)
+        && !flags.contains(OpenFlags::TMPFILE)
+        && !flags.writable_target()
+        && !flags.contains(OpenFlags::TRUNC)
+}
+
 fn parse_proc_self_fd_path(path: &str) -> Option<usize> {
     let fd_text = path.strip_prefix("/proc/self/fd/")?;
     if fd_text.is_empty() || fd_text.contains('/') {
@@ -669,16 +725,25 @@ fn do_openat_for_process(
     if let Some(file) = open_devfs_child_from_dirfd(dirfd, path, flags)? {
         return install_opened_file(process, file, flags, None);
     }
-    let dir_path = openat_dir_path(&snapshot, dirfd, path)?;
-    if let Some(path) = dir_path.as_deref()
+    // Static compatibility lookup and notification features need a normalized
+    // process-global path before VFS open. Ordinary EXT4 opens defer this work
+    // until the opened file is known to be a directory.
+    let eager_path = if static_path_probe_may_hit(&snapshot, dirfd, path)
+        || cfg!(any(feature = "fanotify", feature = "inotify"))
+    {
+        openat_dir_path(&snapshot, dirfd, path)?
+    } else {
+        None
+    };
+    if let Some(path) = eager_path.as_deref()
         && let Some(file) = open_static_path(path, flags)?
     {
-        // CONTEXT: Static proc/dev compatibility files are keyed by the
+        // CONTEXT: Static /proc and /sys compatibility files are keyed by the
         // normalized process-global path before the dynamic VFS lookup. A
         // chrooted process sees only aliases explicitly registered under its
-        // normalized root path, such as the libc-local module metadata used by
-        // BusyBox modprobe.
-        return install_opened_file(process, file, flags, None);
+        // normalized root path and cannot reach host-root compatibility nodes.
+        let dir_path = file.working_dir().map(|_| String::from(path));
+        return install_opened_file(process, file, flags, dir_path);
     }
     if path.starts_with('/')
         && let Some(file) = reopen_proc_self_fd(path, flags)?
@@ -686,26 +751,46 @@ fn do_openat_for_process(
         return install_opened_file(process, file, flags, None);
     }
     let context = path_context_from(&snapshot, dirfd, path)?;
+    let creates_file = flags.contains(OpenFlags::CREATE) || flags.contains(OpenFlags::TMPFILE);
     #[cfg(any(feature = "fanotify", feature = "inotify"))]
     let created_file = flags.contains(OpenFlags::CREATE)
         && matches!(
             lookup_path_in(context.clone(), path, !flags.contains(OpenFlags::NOFOLLOW),),
             Err(FsError::NotFound)
         );
-    let credentials = process.credentials();
-    let subject = AccessSubject::from_fs_credentials(&credentials);
-    check_access_path_prefixes_from(&snapshot, dirfd, path, subject)?;
-    check_open_existing_access_from(&snapshot, dirfd, path, flags, subject)?;
-    let create_attrs = Some(FileCreateAttrs {
-        uid: credentials.fsuid,
-        gid: credentials.fsgid,
-        euid: credentials.euid,
-        egid: credentials.egid,
-        fsgid: credentials.fsgid,
-        mode,
-        umask: process.umask(),
-        groups: credentials.groups.clone(),
-    });
+    // Root existing-file opens only need the scalar fsuid to select the DAC
+    // fast path. Snapshot supplementary groups only when non-root access checks
+    // or file-creation ownership actually consumes them.
+    let credentials = if creates_file || process.fsuid() != 0 {
+        Some(process.credentials())
+    } else {
+        None
+    };
+    let subject = credentials
+        .as_ref()
+        .map(AccessSubject::from_fs_credentials)
+        .unwrap_or_else(AccessSubject::root);
+    if !subject.is_root() {
+        check_access_path_prefixes_from(&snapshot, dirfd, path, subject)?;
+    }
+    if !root_existing_open_precheck_is_redundant(flags, subject) {
+        check_open_existing_access_from(&snapshot, dirfd, path, flags, subject)?;
+    }
+    let create_attrs = if creates_file {
+        let credentials = credentials.expect("create opens snapshot credentials");
+        Some(FileCreateAttrs {
+            uid: credentials.fsuid,
+            gid: credentials.fsgid,
+            euid: credentials.euid,
+            egid: credentials.egid,
+            fsgid: credentials.fsgid,
+            mode,
+            umask: process.umask(),
+            groups: credentials.groups,
+        })
+    } else {
+        None
+    };
     let file = if flags.contains(OpenFlags::TMPFILE) {
         open_tmpfile_in_with_attrs(context, path, flags, create_attrs)?
     } else {
@@ -714,7 +799,15 @@ fn do_openat_for_process(
     #[cfg(any(feature = "fanotify", feature = "inotify"))]
     let notify_file = Arc::clone(&file);
     #[cfg(any(feature = "fanotify", feature = "inotify"))]
-    let notify_path = dir_path.clone();
+    let notify_path = eager_path.clone();
+    let dir_path = if file.working_dir().is_some() {
+        match eager_path {
+            Some(path) => Some(path),
+            None => openat_dir_path(&snapshot, dirfd, path)?,
+        }
+    } else {
+        None
+    };
     let fd = install_opened_file(process, file, flags, dir_path)?;
     #[cfg(any(feature = "fanotify", feature = "inotify"))]
     if created_file && let Some(path) = notify_path.as_deref() {

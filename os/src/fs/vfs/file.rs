@@ -2275,9 +2275,31 @@ fn copy_into_user_buffer(
 }
 
 fn parent_hint_for_open(context: &PathContext, name: &str) -> Option<VfsNodeId> {
-    vfs_path::resolve_create_parent_in(context.clone(), name)
-        .ok()
-        .map(|target| target.parent)
+    #[cfg(any(feature = "fanotify", feature = "inotify"))]
+    {
+        return vfs_path::resolve_create_parent_in(context.clone(), name)
+            .ok()
+            .map(|target| target.parent);
+    }
+    #[cfg(not(any(feature = "fanotify", feature = "inotify")))]
+    {
+        let _ = (context, name);
+        None
+    }
+}
+
+enum OpenedVfsFile {
+    Vfs(Arc<VfsFile>),
+    Special(Arc<dyn File + Send + Sync>),
+}
+
+impl OpenedVfsFile {
+    fn into_file(self) -> Arc<dyn File + Send + Sync> {
+        match self {
+            Self::Vfs(file) => file,
+            Self::Special(file) => file,
+        }
+    }
 }
 
 fn open_vfs_file_once(
@@ -2285,13 +2307,12 @@ fn open_vfs_file_once(
     name: &str,
     flags: OpenFlags,
     create_attrs: Option<FileCreateAttrs>,
-) -> FsResult<Arc<VfsFile>> {
+) -> FsResult<OpenedVfsFile> {
     let namespace_id = context.namespace_id();
-    let parent_hint = parent_hint_for_open(&context, name);
     let follow_final_symlink = !flags.contains(OpenFlags::NOFOLLOW);
     reject_nosymfollow_final_symlink(context.clone(), name, flags)?;
     let resolved = vfs_path::resolve_open_in(
-        context,
+        context.clone(),
         name,
         follow_final_symlink,
         flags.contains(OpenFlags::CREATE),
@@ -2299,6 +2320,20 @@ fn open_vfs_file_once(
 
     let (path, parent, readable, writable) = match resolved {
         VfsOpenTarget::Existing(path) => {
+            if mount_is_devfs(path.node.mount_id) && path.kind != FsNodeKind::Directory {
+                return devfs::open_inode(path.node.mount_id, path.node.ino, flags)
+                    .map(OpenedVfsFile::Special);
+            }
+            if path.kind == FsNodeKind::Fifo {
+                if flags.contains(OpenFlags::CREATE | OpenFlags::EXCL) {
+                    return Err(FsError::AlreadyExists);
+                }
+                if flags.contains(OpenFlags::DIRECTORY) {
+                    return Err(FsError::NotDir);
+                }
+                return open_named_fifo(path.node, OpenFlags::file_status_flags(flags))
+                    .map(OpenedVfsFile::Special);
+            }
             if flags.contains(OpenFlags::CREATE | OpenFlags::EXCL) {
                 return Err(FsError::AlreadyExists);
             }
@@ -2306,7 +2341,8 @@ fn open_vfs_file_once(
                 if !flags.can_open_directory() {
                     return Err(FsError::IsDir);
                 }
-                (path, parent_hint, false, false)
+                let parent = parent_hint_for_open(&context, name);
+                (path, parent, false, false)
             } else {
                 if flags.contains(OpenFlags::DIRECTORY) {
                     return Err(FsError::NotDir);
@@ -2339,7 +2375,8 @@ fn open_vfs_file_once(
                         .ok_or(FsError::Io)?
                     })?;
                 }
-                (path, parent_hint, readable, writable)
+                let parent = parent_hint_for_open(&context, name);
+                (path, parent, readable, writable)
             }
         }
         VfsOpenTarget::Create(target) => {
@@ -2401,7 +2438,7 @@ fn open_vfs_file_once(
         }
     };
 
-    Ok(Arc::new(VfsFile::new(
+    Ok(OpenedVfsFile::Vfs(Arc::new(VfsFile::new(
         path,
         parent,
         readable,
@@ -2409,7 +2446,7 @@ fn open_vfs_file_once(
         OpenFlags::file_status_flags(flags),
         namespace_id,
         false,
-    )?))
+    )?)))
 }
 
 fn open_vfs_file_impl(
@@ -2417,7 +2454,7 @@ fn open_vfs_file_impl(
     name: &str,
     flags: OpenFlags,
     create_attrs: Option<FileCreateAttrs>,
-) -> FsResult<Arc<VfsFile>> {
+) -> FsResult<OpenedVfsFile> {
     for _ in 0..OPEN_CREATE_RACE_ATTEMPTS {
         match open_vfs_file_once(context.clone(), name, flags, create_attrs.clone()) {
             Err(FsError::AlreadyExists)
@@ -2553,7 +2590,10 @@ pub(crate) fn open_tmpfile_in_with_attrs(
 }
 
 pub(crate) fn open_file(name: &str, flags: OpenFlags) -> FsResult<Arc<VfsFile>> {
-    open_vfs_file_impl(PathContext::global_root(), name, flags, None)
+    match open_vfs_file_impl(PathContext::global_root(), name, flags, None)? {
+        OpenedVfsFile::Vfs(file) => Ok(file),
+        OpenedVfsFile::Special(_) => Err(FsError::Unsupported),
+    }
 }
 
 pub(crate) fn open_file_in(
@@ -2570,32 +2610,7 @@ pub(crate) fn open_file_in_with_attrs(
     flags: OpenFlags,
     create_attrs: Option<FileCreateAttrs>,
 ) -> FsResult<Arc<dyn File + Send + Sync>> {
-    let follow_final_symlink = !flags.contains(OpenFlags::NOFOLLOW);
-    let lookup_mode = if follow_final_symlink {
-        LookupMode::FollowFinal
-    } else {
-        LookupMode::NoFollowFinal
-    };
-    if let Ok(path) = vfs_path::resolve_existing_in(context.clone(), name, lookup_mode) {
-        if mount_is_devfs(path.node.mount_id) {
-            if path.kind == FsNodeKind::Directory {
-                return open_vfs_file_impl(context, name, flags, create_attrs)
-                    .map(|file| file as Arc<dyn File + Send + Sync>);
-            }
-            return devfs::open_inode(path.node.mount_id, path.node.ino, flags);
-        }
-        if path.kind == FsNodeKind::Fifo {
-            if flags.contains(OpenFlags::CREATE | OpenFlags::EXCL) {
-                return Err(FsError::AlreadyExists);
-            }
-            if flags.contains(OpenFlags::DIRECTORY) {
-                return Err(FsError::NotDir);
-            }
-            return open_named_fifo(path.node, OpenFlags::file_status_flags(flags));
-        }
-    }
-    open_vfs_file_impl(context, name, flags, create_attrs)
-        .map(|file| file as Arc<dyn File + Send + Sync>)
+    open_vfs_file_impl(context, name, flags, create_attrs).map(OpenedVfsFile::into_file)
 }
 
 fn node_kind_from_mode(mode: u32) -> FsNodeKind {

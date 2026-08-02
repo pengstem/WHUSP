@@ -12,6 +12,14 @@ pub(crate) struct AccessSubject<'a> {
 }
 
 impl<'a> AccessSubject<'a> {
+    pub(crate) fn root() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            groups: &[],
+        }
+    }
+
     pub(crate) fn from_fs_credentials(credentials: &'a Credentials) -> Self {
         Self {
             uid: credentials.fsuid,

@@ -24,7 +24,7 @@ use super::fd::{get_fd_entry_by_fd, get_fd_entry_by_fd_for_process, get_file_by_
 use super::inotify::inotify_notify_attrib;
 use super::path::{
     AtPath, check_access_path_prefixes_for_process, check_current_access_path_prefixes_from,
-    normalize_path_from, path_context_from, resolve_at_path,
+    normalize_path_from, path_context_from, resolve_at_path, static_path_probe_may_hit,
 };
 use super::uapi::{
     AT_EMPTY_PATH, AT_FDCWD, AT_STATX_DONT_SYNC, AT_STATX_FORCE_SYNC, AT_SYMLINK_NOFOLLOW,
@@ -105,42 +105,6 @@ fn resolve_full_stat_from(
     resolve_stat_from_with(snapshot, dirfd, path, follow_final_symlink, true)
 }
 
-fn path_component_is_static_root(component: &str) -> bool {
-    matches!(component, "proc" | "sys")
-}
-
-fn path_has_parent_component(path: &str) -> bool {
-    if !path.as_bytes().iter().any(|byte| *byte == b'.') {
-        return false;
-    }
-    path.split('/').any(|component| component == "..")
-}
-
-fn path_under_static_root(path: &str) -> bool {
-    path.starts_with("/proc/") || path == "/proc" || path.starts_with("/sys/") || path == "/sys"
-}
-
-fn static_stat_probe_may_hit(snapshot: &PathSnapshot, dirfd: isize, path: &str) -> bool {
-    if path_has_parent_component(path) {
-        return true;
-    }
-    if path.starts_with('/') {
-        return path_under_static_root(snapshot.root_path.as_str())
-            || (snapshot.root_path == "/" && path_under_static_root(path));
-    }
-    if dirfd != AT_FDCWD {
-        return true;
-    }
-    if path_under_static_root(snapshot.cwd_path.as_str()) {
-        return true;
-    }
-    snapshot.cwd_path == "/"
-        && path
-            .split('/')
-            .find(|component| !component.is_empty() && *component != ".")
-            .is_some_and(path_component_is_static_root)
-}
-
 fn resolve_stat_from_with(
     snapshot: &PathSnapshot,
     dirfd: isize,
@@ -173,7 +137,7 @@ fn resolve_stat_from_with(
             return stat.ok_or(Errno::ENOENT);
         }
     }
-    if static_stat_probe_may_hit(snapshot, dirfd, path) {
+    if static_path_probe_may_hit(snapshot, dirfd, path) {
         let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathStaticPath);
         if let Ok(global_path) = normalize_path_from(snapshot, dirfd, path)
             && let Some(stat) = stat_static_path(global_path.as_str())
