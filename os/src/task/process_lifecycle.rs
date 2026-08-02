@@ -191,6 +191,9 @@ impl ProcessControlBlock {
                 task_res_allocator: RecycleAllocator::new(),
             }),
         });
+        if let Some(node) = executable_node {
+            track_regular_file_executable(node);
+        }
         crate::fs::tty_attach(crate::fs::TtyId::Console, pid, pid, false)
             .expect("init process must acquire the console tty");
 

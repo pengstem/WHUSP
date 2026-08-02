@@ -7,7 +7,7 @@ use crate::sync::{
 };
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 
 pub(crate) use dirty::{
@@ -103,93 +103,73 @@ lazy_static! {
         (0..INODE_STATE_SHARDS)
             .map(|_| DirectStatMetadataEpoch::new())
             .collect();
-    // These indexes may outlive a particular InodeState Arc: executable image
-    // tracking, in particular, is not a backend-inode retain. Keep their
-    // VfsNodeId lifetime semantics while making this module their sole owner.
-    static ref WRITABLE_REGULAR_OPEN_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =
-        SleepMutex::new(BTreeMap::new());
-    static ref WRITABLE_SHARED_MMAP_REGULAR_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =
-        SleepMutex::new(BTreeMap::new());
-    static ref EXECUTABLE_REGULAR_COUNTS: SleepMutex<BTreeMap<VfsNodeId, usize>> =
-        SleepMutex::new(BTreeMap::new());
-    static ref INODE_FLAGS_CACHE: SleepMutex<BTreeMap<VfsNodeId, u32>> =
-        SleepMutex::new(BTreeMap::new());
 }
 
-fn increment_count(counts: &SleepMutex<BTreeMap<VfsNodeId, usize>>, node: VfsNodeId) {
-    let mut counts = counts.lock();
-    *counts.entry(node).or_insert(0) += 1;
+fn increment_count(count: &AtomicUsize) {
+    count
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_add(1)
+        })
+        .expect("inode compatibility count exhausted");
 }
 
-fn decrement_count(counts: &SleepMutex<BTreeMap<VfsNodeId, usize>>, node: VfsNodeId) {
-    let mut counts = counts.lock();
-    let Some(count) = counts.get_mut(&node) else {
-        return;
-    };
-    if *count > 1 {
-        *count -= 1;
-    } else {
-        counts.remove(&node);
-    }
+fn decrement_count(count: &AtomicUsize) {
+    let previous = count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        value.checked_sub(1)
+    });
+    debug_assert!(previous.is_ok(), "unbalanced inode compatibility count");
 }
 
-fn has_count(counts: &SleepMutex<BTreeMap<VfsNodeId, usize>>, node: VfsNodeId) -> bool {
-    counts.lock().get(&node).copied().unwrap_or(0) > 0
+fn has_count(count: &AtomicUsize) -> bool {
+    count.load(Ordering::Acquire) != 0
 }
 
-pub(crate) fn track_writable_open(node: VfsNodeId) {
-    increment_count(&WRITABLE_REGULAR_OPEN_COUNTS, node);
+pub(crate) fn track_writable_open(state: &InodeState) {
+    increment_count(&state.writable_open_count);
 }
 
-pub(crate) fn untrack_writable_open(node: VfsNodeId) {
-    decrement_count(&WRITABLE_REGULAR_OPEN_COUNTS, node);
+pub(crate) fn untrack_writable_open(state: &InodeState) {
+    decrement_count(&state.writable_open_count);
 }
 
 pub(crate) fn is_open_writable(node: VfsNodeId) -> bool {
-    has_count(&WRITABLE_REGULAR_OPEN_COUNTS, node)
+    has_count(&state_for(node).writable_open_count)
 }
 
-pub(crate) fn mount_has_writable_open(mount_id: super::MountId) -> bool {
-    WRITABLE_REGULAR_OPEN_COUNTS
-        .lock()
-        .keys()
-        .any(|node| node.mount_id == mount_id)
+pub(crate) fn track_writable_shared_mmap(state: &InodeState) {
+    increment_count(&state.writable_shared_mmap_count);
 }
 
-pub(crate) fn track_writable_shared_mmap(node: VfsNodeId) {
-    increment_count(&WRITABLE_SHARED_MMAP_REGULAR_COUNTS, node);
+pub(crate) fn untrack_writable_shared_mmap(state: &InodeState) {
+    decrement_count(&state.writable_shared_mmap_count);
 }
 
-pub(crate) fn untrack_writable_shared_mmap(node: VfsNodeId) {
-    decrement_count(&WRITABLE_SHARED_MMAP_REGULAR_COUNTS, node);
-}
-
-pub(crate) fn has_writable_shared_mmap(node: VfsNodeId) -> bool {
-    has_count(&WRITABLE_SHARED_MMAP_REGULAR_COUNTS, node)
+pub(crate) fn has_writable_shared_mmap(state: &InodeState) -> bool {
+    has_count(&state.writable_shared_mmap_count)
 }
 
 pub(crate) fn track_executable(node: VfsNodeId) {
-    increment_count(&EXECUTABLE_REGULAR_COUNTS, node);
+    increment_count(&state_for(node).executable_count);
 }
 
 pub(crate) fn untrack_executable(node: VfsNodeId) {
-    decrement_count(&EXECUTABLE_REGULAR_COUNTS, node);
+    decrement_count(&state_for(node).executable_count);
 }
 
 pub(crate) fn is_executable(node: VfsNodeId) -> bool {
-    has_count(&EXECUTABLE_REGULAR_COUNTS, node)
+    has_count(&state_for(node).executable_count)
 }
 
-pub(crate) fn cached_inode_flags(node: VfsNodeId) -> Option<u32> {
-    INODE_FLAGS_CACHE.lock().get(&node).copied()
+pub(crate) fn cached_inode_flags(state: &InodeState) -> Option<u32> {
+    state
+        .inode_flags_valid
+        .load(Ordering::Acquire)
+        .then(|| state.inode_flags.load(Ordering::Relaxed))
 }
 
-pub(crate) fn update_inode_flags_cache(node: VfsNodeId, flags: u32) {
-    INODE_FLAGS_CACHE.lock().insert(node, flags);
-}
-
-pub(crate) fn invalidate_inode_flags_cache(node: VfsNodeId) {
-    INODE_FLAGS_CACHE.lock().remove(&node);
+pub(crate) fn update_inode_flags_cache(state: &InodeState, flags: u32) {
+    state.inode_flags.store(flags, Ordering::Relaxed);
+    state.inode_flags_valid.store(true, Ordering::Release);
 }
 
 fn direct_stat_slot(parent: WorkingDir, name: &str) -> usize {
@@ -296,6 +276,11 @@ pub(crate) struct InodeState {
     dirty: SleepMutex<DirtyFileCache>,
     dirty_page_count: AtomicUsize,
     on_dirty_list: AtomicBool,
+    writable_open_count: AtomicUsize,
+    writable_shared_mmap_count: AtomicUsize,
+    executable_count: AtomicUsize,
+    inode_flags: AtomicU32,
+    inode_flags_valid: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -442,6 +427,11 @@ impl InodeState {
             dirty: SleepMutex::new(DirtyFileCache::new()),
             dirty_page_count: AtomicUsize::new(0),
             on_dirty_list: AtomicBool::new(false),
+            writable_open_count: AtomicUsize::new(0),
+            writable_shared_mmap_count: AtomicUsize::new(0),
+            executable_count: AtomicUsize::new(0),
+            inode_flags: AtomicU32::new(0),
+            inode_flags_valid: AtomicBool::new(false),
         }
     }
 

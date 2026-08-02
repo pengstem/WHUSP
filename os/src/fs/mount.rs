@@ -12,7 +12,7 @@ use super::procfs::ProcFs;
 use super::tmpfs::{EXT234_SUPER_MAGIC, TmpFs};
 use super::vfs::{
     BackendOp, FileSystemBackend, FileSystemStat, FsError, FsNodeKind, FsResult, InodeRelease,
-    LegacyFileSystemBackend, SerializedBackend, VfsNodeId, mount_has_writable_regular_open,
+    LegacyFileSystemBackend, SerializedBackend, VfsNodeId,
 };
 use crate::config::MAX_CPUS;
 use crate::drivers::block::BLOCK_DEVICES;
@@ -250,6 +250,7 @@ struct MountedFs {
     fs_type: &'static str,
     options: SleepMutex<&'static str>,
     stat_flags: AtomicU64,
+    writable_regular_opens: AtomicUsize,
     backend: Arc<dyn FileSystemBackend>,
     pending_inode_releases: Arc<PendingReleaseQueue>,
 }
@@ -277,6 +278,24 @@ impl MountedBackendLease {
             drain_pending_inode_releases(&self.mounted.pending_inode_releases, backend);
         }
         f(backend)
+    }
+
+    pub(super) fn track_writable_regular_open(&self) {
+        self.mounted
+            .writable_regular_opens
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .expect("mount writable-open count exhausted");
+    }
+
+    pub(super) fn untrack_writable_regular_open(&self) {
+        let previous = self.mounted.writable_regular_opens.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |value| value.checked_sub(1),
+        );
+        debug_assert!(previous.is_ok(), "unbalanced mount writable-open count");
     }
 }
 
@@ -479,6 +498,7 @@ impl MountedFs {
             fs_type,
             options: SleepMutex::new(options),
             stat_flags: AtomicU64::new(stat_flags),
+            writable_regular_opens: AtomicUsize::new(0),
             backend: Arc::new(SerializedBackend::new(backend)),
             pending_inode_releases: Arc::new(PendingReleaseQueue::new()),
         })
@@ -499,6 +519,7 @@ impl MountedFs {
             fs_type,
             options: SleepMutex::new(options),
             stat_flags: AtomicU64::new(stat_flags),
+            writable_regular_opens: AtomicUsize::new(0),
             backend,
             pending_inode_releases: Arc::new(PendingReleaseQueue::new()),
         })
@@ -2507,7 +2528,7 @@ pub(crate) fn set_mount_stat_flags(mount_id: MountId, flags: u64) -> Result<(), 
     let current_flags = mounted.stat_flags.load(Ordering::Acquire);
     if flags & MOUNT_STAT_RDONLY != 0
         && current_flags & MOUNT_STAT_RDONLY == 0
-        && mount_has_writable_regular_open(mount_id)
+        && mounted.writable_regular_opens.load(Ordering::Acquire) != 0
     {
         return Err(MountError::TargetBusy);
     }

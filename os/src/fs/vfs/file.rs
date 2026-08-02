@@ -1077,33 +1077,49 @@ fn flush_dirty_regular_files_for_pressure() -> FsResult {
     result
 }
 
-fn track_writable_regular_open(node: VfsNodeId, kind: FsNodeKind, writable: bool) {
+fn track_writable_regular_open(
+    state: &inode_state::InodeState,
+    mount_backend: &MountedBackendLease,
+    kind: FsNodeKind,
+    writable: bool,
+) {
     if kind != FsNodeKind::RegularFile || !writable {
         return;
     }
-    inode_state::track_writable_open(node);
+    inode_state::track_writable_open(state);
+    mount_backend.track_writable_regular_open();
 }
 
-fn untrack_writable_regular_open(node: VfsNodeId, kind: FsNodeKind, writable: bool) {
+fn untrack_writable_regular_open(
+    state: &inode_state::InodeState,
+    mount_backend: &MountedBackendLease,
+    kind: FsNodeKind,
+    writable: bool,
+) {
     if kind != FsNodeKind::RegularFile || !writable {
         return;
     }
-    inode_state::untrack_writable_open(node);
+    inode_state::untrack_writable_open(state);
+    mount_backend.untrack_writable_regular_open();
 }
 
-fn track_writable_shared_regular_mmap(node: VfsNodeId, kind: FsNodeKind) {
+fn track_writable_shared_regular_mmap(
+    state: &inode_state::InodeState,
+    node: VfsNodeId,
+    kind: FsNodeKind,
+) {
     if kind != FsNodeKind::RegularFile {
         return;
     }
     invalidate_small_regular_read_cache(node, kind);
-    inode_state::track_writable_shared_mmap(node);
+    inode_state::track_writable_shared_mmap(state);
 }
 
-fn untrack_writable_shared_regular_mmap(node: VfsNodeId, kind: FsNodeKind) {
+fn untrack_writable_shared_regular_mmap(state: &inode_state::InodeState, kind: FsNodeKind) {
     if kind != FsNodeKind::RegularFile {
         return;
     }
-    inode_state::untrack_writable_shared_mmap(node);
+    inode_state::untrack_writable_shared_mmap(state);
 }
 
 fn ensure_mount_writable(mount_id: MountId) -> FsResult {
@@ -1167,16 +1183,12 @@ fn invalidate_small_regular_read_cache(node: VfsNodeId, kind: FsNodeKind) {
     }
 }
 
-fn cached_inode_flags(node: VfsNodeId) -> Option<u32> {
-    inode_state::cached_inode_flags(node)
+fn cached_inode_flags(state: &inode_state::InodeState) -> Option<u32> {
+    inode_state::cached_inode_flags(state)
 }
 
-fn update_inode_flags_cache(node: VfsNodeId, flags: u32) {
-    inode_state::update_inode_flags_cache(node, flags);
-}
-
-fn invalidate_inode_flags_cache(node: VfsNodeId) {
-    inode_state::invalidate_inode_flags_cache(node);
+fn update_inode_flags_cache(state: &inode_state::InodeState, flags: u32) {
+    inode_state::update_inode_flags_cache(state, flags);
 }
 
 pub(crate) fn begin_regular_file_page_cache_mutation(
@@ -1228,12 +1240,8 @@ pub(crate) fn regular_file_node_is_open_writable(node: VfsNodeId) -> bool {
     inode_state::is_open_writable(node)
 }
 
-fn regular_file_node_has_writable_shared_mmap(node: VfsNodeId) -> bool {
-    inode_state::has_writable_shared_mmap(node)
-}
-
-pub(crate) fn mount_has_writable_regular_open(mount_id: MountId) -> bool {
-    inode_state::mount_has_writable_open(mount_id)
+fn regular_file_has_writable_shared_mmap(state: &inode_state::InodeState) -> bool {
+    inode_state::has_writable_shared_mmap(state)
 }
 
 pub(crate) fn track_regular_file_executable(node: VfsNodeId) {
@@ -1353,7 +1361,7 @@ impl VfsFile {
         };
         let supports_page_cache = mount_supports_page_cache(node.mount_id);
         let supports_dirty_writeback = mount_supports_dirty_writeback(node.mount_id);
-        track_writable_regular_open(node, kind, writable);
+        track_writable_regular_open(&inode_state, &mount_backend, kind, writable);
         let file = Self {
             node,
             inode_state,
@@ -1849,7 +1857,7 @@ impl VfsFile {
     }
 
     fn inode_flags_or_empty(&self) -> FsResult<u32> {
-        if let Some(flags) = cached_inode_flags(self.node) {
+        if let Some(flags) = cached_inode_flags(&self.inode_state) {
             return Ok(flags);
         }
         let flags = match self.inode_flags() {
@@ -1860,7 +1868,7 @@ impl VfsFile {
             Err(FsError::Unsupported) => Ok(0),
             Err(err) => Err(err),
         }?;
-        update_inode_flags_cache(self.node, flags);
+        update_inode_flags_cache(&self.inode_state, flags);
         Ok(flags)
     }
 
@@ -2184,7 +2192,7 @@ impl VfsFile {
         }
         if self.kind != FsNodeKind::RegularFile
             || !self.supports_page_cache
-            || regular_file_node_has_writable_shared_mmap(self.node)
+            || regular_file_has_writable_shared_mmap(&self.inode_state)
             || dirty_regular_file_has_pages(self.node)
         {
             return None;
@@ -3402,7 +3410,7 @@ impl File for VfsFile {
             },
         );
         if result.is_ok() {
-            update_inode_flags_cache(self.node, flags);
+            update_inode_flags_cache(&self.inode_state, flags);
         }
         result
     }
@@ -3487,11 +3495,11 @@ impl File for VfsFile {
     }
 
     fn inc_writable_shared_mmap(&self) {
-        track_writable_shared_regular_mmap(self.node, self.kind);
+        track_writable_shared_regular_mmap(&self.inode_state, self.node, self.kind);
     }
 
     fn dec_writable_shared_mmap(&self) {
-        untrack_writable_shared_regular_mmap(self.node, self.kind);
+        untrack_writable_shared_regular_mmap(&self.inode_state, self.kind);
     }
 
     fn status_flags(&self) -> OpenFlags {
@@ -3528,8 +3536,12 @@ impl File for VfsFile {
 
 impl Drop for VfsFile {
     fn drop(&mut self) {
-        untrack_writable_regular_open(self.node, self.kind, self.writable);
-        invalidate_inode_flags_cache(self.node);
+        untrack_writable_regular_open(
+            &self.inode_state,
+            &self.mount_backend,
+            self.kind,
+            self.writable,
+        );
         release_inode_from_drop_with_lease(&self.inode_state, &self.mount_backend);
     }
 }
