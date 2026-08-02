@@ -25,8 +25,10 @@ struct Waiter {
 struct SleepRwLockInner {
     active_readers: usize,
     writer_active: bool,
+    #[cfg(feature = "sleep-rwlock-probe")]
     waiting_readers: usize,
     waiting_writers: usize,
+    #[cfg(feature = "sleep-rwlock-probe")]
     max_waiters: usize,
     wait_queue: VecDeque<Arc<Waiter>>,
 }
@@ -42,11 +44,19 @@ impl SleepRwLockInner {
 
     fn enqueue(&mut self, waiter: Arc<Waiter>) {
         match waiter.kind {
-            WaitKind::Reader => self.waiting_readers += 1,
+            WaitKind::Reader => {
+                #[cfg(feature = "sleep-rwlock-probe")]
+                {
+                    self.waiting_readers += 1;
+                }
+            }
             WaitKind::Writer => self.waiting_writers += 1,
         }
         self.wait_queue.push_back(waiter);
-        self.max_waiters = self.max_waiters.max(self.wait_queue.len());
+        #[cfg(feature = "sleep-rwlock-probe")]
+        {
+            self.max_waiters = self.max_waiters.max(self.wait_queue.len());
+        }
     }
 
     fn remove_waiter(&mut self, waiter: &Arc<Waiter>) {
@@ -61,7 +71,12 @@ impl SleepRwLockInner {
             .expect("SleepRwLock waiter position disappeared");
         debug_assert!(Arc::ptr_eq(&removed, waiter));
         match waiter.kind {
-            WaitKind::Reader => self.waiting_readers -= 1,
+            WaitKind::Reader => {
+                #[cfg(feature = "sleep-rwlock-probe")]
+                {
+                    self.waiting_readers -= 1;
+                }
+            }
             WaitKind::Writer => self.waiting_writers -= 1,
         }
     }
@@ -96,7 +111,10 @@ impl SleepRwLockInner {
                         .wait_queue
                         .pop_front()
                         .expect("SleepRwLock reader front disappeared");
-                    self.waiting_readers -= 1;
+                    #[cfg(feature = "sleep-rwlock-probe")]
+                    {
+                        self.waiting_readers -= 1;
+                    }
                     self.active_readers += 1;
                     waiter.granted.store(true, Ordering::Release);
                     waking.push(Arc::clone(&waiter.task));
@@ -149,8 +167,10 @@ impl<T> SleepRwLock<T> {
             inner: SpinNoIrqLock::new(SleepRwLockInner {
                 active_readers: 0,
                 writer_active: false,
+                #[cfg(feature = "sleep-rwlock-probe")]
                 waiting_readers: 0,
                 waiting_writers: 0,
+                #[cfg(feature = "sleep-rwlock-probe")]
                 max_waiters: 0,
                 wait_queue: VecDeque::new(),
             }),

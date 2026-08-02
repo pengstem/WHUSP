@@ -43,7 +43,7 @@ impl File for LocalSocket {
     }
 
     fn poll_with_wait(&self, events: PollEvents, waiter: Option<&Arc<PollWaiter>>) -> PollEvents {
-        let (kind, listening, readable, read_shutdown, peer_write_shutdown, write_shutdown, peer) = {
+        let (kind, listening, readable, peer_write_shutdown, write_shutdown, peer) = {
             let mut inner = self.inner.lock();
             if let Some(waiter) = waiter {
                 if events
@@ -64,7 +64,6 @@ impl File for LocalSocket {
                 inner.kind,
                 inner.listening,
                 readable,
-                inner.read_shutdown,
                 inner.peer_write_shutdown,
                 inner.write_shutdown,
                 inner.peer_socket.clone(),
@@ -74,11 +73,6 @@ impl File for LocalSocket {
         if events.intersects(PollEvents::POLLIN | PollEvents::POLLPRI | PollEvents::POLLRDHUP) {
             if readable {
                 ready |= PollEvents::POLLIN;
-            }
-            // CONTEXT: LTP epoll_wait05 expects a stream socket to become
-            // RDHUP-ready after userspace shuts down its local read side.
-            if read_shutdown {
-                ready |= PollEvents::POLLRDHUP;
             }
             if peer_write_shutdown {
                 ready |= PollEvents::POLLRDHUP | PollEvents::POLLHUP;

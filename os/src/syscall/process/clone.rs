@@ -3,7 +3,7 @@ use crate::syscall::user_ptr::{read_user_value, write_user_value, write_user_val
 use crate::task::{
     CloneArgs, CloneFlags, ProcessControlBlock, TaskControlBlock, add_task,
     block_current_task_no_schedule, clone_current_thread, current_process, current_task,
-    current_user_token, reap_exited_tasks, schedule, suspend_current_and_run_next,
+    current_user_token, reap_exited_tasks, schedule,
 };
 use crate::uapi::errno::{Errno, KResult};
 use alloc::sync::Arc;
@@ -62,12 +62,14 @@ pub fn sys_clone(
     let Some(args) = CloneArgs::parse(flags, stack, ptid, tls, ctid) else {
         return Err(Errno::EINVAL);
     };
+    if args
+        .flags
+        .contains(CloneFlags::CLONE_VM | CloneFlags::CLONE_NEWNET)
+    {
+        return Err(Errno::ENOTSUP);
+    }
     if args.is_thread() {
         sys_clone_thread(args)
-    } else if is_vm_vfork_process_clone(args) {
-        sys_clone_vm_vfork(args)
-    } else if is_vm_newnet_process_clone(args) {
-        sys_clone_vm_newnet(args)
     } else {
         sys_clone_process(args)
     }
@@ -84,6 +86,11 @@ pub fn sys_clone3(args: *const LinuxCloneArgs, size: usize) -> KResult {
     }
     let token = current_user_token();
     let args = read_user_value(token, args)?;
+    let unsupported_flags =
+        CloneFlags::CLONE_VM.bits() as u64 | CloneFlags::CLONE_NEWNET.bits() as u64;
+    if args.flags & unsupported_flags == unsupported_flags {
+        return Err(Errno::ENOTSUP);
+    }
     validate_clone3_args(args, token)?;
 
     let stack_top = if args.stack == 0 {
@@ -110,10 +117,6 @@ pub fn sys_clone3(args: *const LinuxCloneArgs, size: usize) -> KResult {
             return Err(Errno::EINVAL);
         }
         sys_clone_thread(clone_args)
-    } else if is_vm_vfork_process_clone(clone_args) && args.flags & CLONE_PIDFD == 0 {
-        sys_clone_vm_vfork(clone_args)
-    } else if is_vm_newnet_process_clone(clone_args) && args.flags & CLONE_PIDFD == 0 {
-        sys_clone_vm_newnet(clone_args)
     } else {
         let pidfd = if args.flags & CLONE_PIDFD != 0 {
             Some(args.pidfd as *mut i32)
@@ -200,7 +203,6 @@ fn sys_clone_process_inner(args: CloneArgs, pidfd: Option<*mut i32>) -> KResult 
             Arc::clone(&child_parent),
             mount_namespace_id,
             args.exit_signal,
-            args.flags,
         )
         .ok_or(Errno::ENOMEM)?;
     let new_pid = new_process.getpid();
@@ -276,81 +278,6 @@ fn wait_for_vfork_child(
             break;
         }
     }
-}
-
-fn is_vm_vfork_process_clone(args: CloneArgs) -> bool {
-    args.flags
-        .contains(CloneFlags::CLONE_VM | CloneFlags::CLONE_VFORK)
-        && !args.is_thread()
-}
-
-fn is_vm_newnet_process_clone(args: CloneArgs) -> bool {
-    args.flags
-        .contains(CloneFlags::CLONE_VM | CloneFlags::CLONE_NEWNET)
-        && !args.is_thread()
-}
-
-fn sys_clone_vm_vfork(args: CloneArgs) -> KResult {
-    // UNFINISHED: Linux CLONE_VM without CLONE_THREAD creates a distinct
-    // process that shares the mm_struct, and CLONE_VFORK releases the parent
-    // on either execve(2) or _exit(2). This contest compatibility path uses a
-    // normal copied-address-space process clone because LTP command helpers use
-    // vfork()+execve(), and this kernel cannot exec a same-process helper task
-    // without replacing the parent's PCB.
-    sys_clone_process(args)
-}
-
-fn sys_clone_vm_newnet(args: CloneArgs) -> KResult {
-    // UNFINISHED: Full network namespaces are not implemented. This path is
-    // limited to CLONE_NEWNET|CLONE_VM LTP coverage: run the child as a helper
-    // task so CLONE_VM data writes are visible, and mark it so procfs exposes
-    // default net sysctls while it runs.
-    sys_clone_vm_helper(args, true)
-}
-
-fn sys_clone_vm_helper(args: CloneArgs, synthetic_newnet: bool) -> KResult {
-    reap_exited_tasks();
-    let process = current_process();
-    let cloned = clone_current_thread(args);
-    let linux_tid = cloned.linux_tid;
-    {
-        let mut task_inner = cloned.task.inner_exclusive_access();
-        // CONTEXT: CLONE_VM process-compatibility children have no separate
-        // PCB. Mark them so exit_group(), getpid(), and procfs namespace probes
-        // expose the child-like Linux surface without killing the parent.
-        task_inner.clone_vm_process_helper = true;
-        task_inner.synthetic_newnet = synthetic_newnet;
-    }
-    let process_token = process.attach_task(Arc::clone(&cloned.task));
-
-    // These helper tasks share the parent's PCB and address space. Publish the
-    // Linux-visible TID stores before scheduling so userspace never observes a
-    // helper that can run before its clone metadata is visible.
-    if args.flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
-        write_user_value(
-            process_token,
-            args.ptid as *mut i32,
-            &(cloned.linux_tid as i32),
-        )?;
-    }
-    if args.flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
-        write_user_value(
-            process_token,
-            args.ctid as *mut i32,
-            &(cloned.linux_tid as i32),
-        )?;
-    }
-    add_task(cloned.task);
-    // The helper is a process-compatibility facade, not a detachable pthread.
-    // Keep the caller parked until the task table no longer exposes its TID.
-    while process
-        .tasks_snapshot()
-        .iter()
-        .any(|task| task.linux_tid() == linux_tid)
-    {
-        suspend_current_and_run_next();
-    }
-    Ok(linux_tid as isize)
 }
 
 fn sys_clone_thread(args: CloneArgs) -> KResult {

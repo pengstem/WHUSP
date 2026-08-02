@@ -55,10 +55,6 @@ fn file_for_kcmp(process: &ProcessControlBlock, fd: usize) -> KResult<Arc<dyn Fi
         .ok_or(Errno::EBADF)
 }
 
-fn compare_same_resource(left: usize, right: usize) -> isize {
-    if left == right { 0 } else { 1 }
-}
-
 pub fn sys_kcmp_ctx(
     ctx: &SyscallContext,
     pid1: isize,
@@ -83,28 +79,8 @@ pub fn sys_kcmp_ctx(
             let file2 = file_for_kcmp(&process2, idx2)?;
             Ok(if Arc::ptr_eq(&file1, &file2) { 0 } else { 1 })
         }
-        KCMP_VM | KCMP_FILES | KCMP_FS | KCMP_SIGHAND | KCMP_IO | KCMP_SYSVSEM => {
-            // UNFINISHED: clone currently does not share separate mm/fs/fd/io
-            // objects for every CLONE_* resource. Store a lightweight owner id
-            // so kcmp can report the clone-time sharing contract without
-            // changing those subsystems' actual copy-on-clone behavior.
-            let left = process1.inner_exclusive_access().kcmp_resources;
-            let right = process2.inner_exclusive_access().kcmp_resources;
-            let result = match kcmp_type {
-                KCMP_VM => compare_same_resource(left.vm, right.vm),
-                KCMP_FILES => compare_same_resource(left.files, right.files),
-                KCMP_FS => compare_same_resource(left.fs, right.fs),
-                KCMP_SIGHAND => compare_same_resource(left.sighand, right.sighand),
-                KCMP_IO => compare_same_resource(left.io, right.io),
-                KCMP_SYSVSEM => compare_same_resource(left.sysvsem, right.sysvsem),
-                _ => unreachable!(),
-            };
-            Ok(result)
-        }
-        KCMP_EPOLL_TFD => {
-            // UNFINISHED: epoll target-file comparison needs epoll-slot
-            // decoding and target lookup. No current contest case depends on it.
-            Err(Errno::EINVAL)
+        KCMP_VM | KCMP_FILES | KCMP_FS | KCMP_SIGHAND | KCMP_IO | KCMP_SYSVSEM | KCMP_EPOLL_TFD => {
+            Err(Errno::ENOTSUP)
         }
         _ => Err(Errno::EINVAL),
     }

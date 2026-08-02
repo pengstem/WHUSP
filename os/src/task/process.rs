@@ -1,7 +1,7 @@
 use super::id::RecycleAllocator;
 use super::{
-    CloneFlags, FD_LIMIT, FdTableEntry, PidHandle, SIGNAL_INFO_SLOTS, SignalAction,
-    TaskControlBlock, TaskStatus, wakeup_task,
+    FD_LIMIT, FdTableEntry, PidHandle, SIGNAL_INFO_SLOTS, SignalAction, TaskControlBlock,
+    TaskStatus, wakeup_task,
 };
 use crate::config::{MAX_CPUS, USER_STACK_SIZE};
 use crate::fs::{MountNamespaceId, PathContext, ROOT_MOUNT_NAMESPACE, VfsNodeId, WorkingDir};
@@ -18,7 +18,6 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 pub const RLIM_INFINITY: usize = usize::MAX;
-const RLIMIT_COUNT: usize = RLimitResource::RtTime as usize + 1;
 const FD_BITMAP_WORD_BITS: usize = usize::BITS as usize;
 pub(crate) const PROCESS_PKEY_COUNT: usize = 16;
 pub(crate) type ProcessPKeyRights = [Option<usize>; PROCESS_PKEY_COUNT];
@@ -104,37 +103,49 @@ impl RLimitResource {
             _ => None,
         }
     }
-
-    const fn index(self) -> usize {
-        self as usize
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessResourceLimits {
-    limits: [RLimit; RLIMIT_COUNT],
+    fsize: RLimit,
+    stack: RLimit,
+    core: RLimit,
+    nofile: RLimit,
+    memlock: RLimit,
 }
 
 impl ProcessResourceLimits {
     pub fn new() -> Self {
-        // UNFINISHED: Except RLIMIT_NOFILE, the mlock-visible
-        // RLIMIT_MEMLOCK subset, and the RLIMIT_CORE signal-status bit,
-        // these limits are currently stored for getrlimit/setrlimit
-        // compatibility but are not enforced by the memory, scheduler, or
-        // fork paths yet.
-        let mut limits = [RLimit::infinity(); RLIMIT_COUNT];
-        limits[RLimitResource::Stack.index()] =
-            RLimit::soft_with_hard(USER_STACK_SIZE, RLIM_INFINITY);
-        limits[RLimitResource::NoFile.index()] = RLimit::fixed(FD_LIMIT);
-        Self { limits }
+        Self {
+            fsize: RLimit::infinity(),
+            stack: RLimit::soft_with_hard(USER_STACK_SIZE, RLIM_INFINITY),
+            core: RLimit::infinity(),
+            nofile: RLimit::fixed(FD_LIMIT),
+            memlock: RLimit::infinity(),
+        }
     }
 
     pub fn get(&self, resource: RLimitResource) -> RLimit {
-        self.limits[resource.index()]
+        match resource {
+            RLimitResource::FSize => self.fsize,
+            RLimitResource::Stack => self.stack,
+            RLimitResource::Core => self.core,
+            RLimitResource::NoFile => self.nofile,
+            RLimitResource::MemLock => self.memlock,
+            _ => RLimit::infinity(),
+        }
     }
 
-    pub fn set(&mut self, resource: RLimitResource, limit: RLimit) {
-        self.limits[resource.index()] = limit;
+    pub fn set(&mut self, resource: RLimitResource, limit: RLimit) -> bool {
+        match resource {
+            RLimitResource::FSize => self.fsize = limit,
+            RLimitResource::Stack => self.stack = limit,
+            RLimitResource::Core => self.core = limit,
+            RLimitResource::NoFile => self.nofile = limit,
+            RLimitResource::MemLock => self.memlock = limit,
+            _ => return false,
+        }
+        true
     }
 }
 
@@ -341,64 +352,6 @@ pub(crate) struct ProcessProcSnapshot {
 pub(crate) struct ProcessNamespace {
     pub(crate) id: usize,
     pub(crate) parent_id: Option<usize>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct KcmpResourceOwners {
-    pub(crate) vm: usize,
-    pub(crate) files: usize,
-    pub(crate) fs: usize,
-    pub(crate) sighand: usize,
-    pub(crate) io: usize,
-    pub(crate) sysvsem: usize,
-}
-
-impl KcmpResourceOwners {
-    pub(crate) fn new(process_id: usize) -> Self {
-        Self {
-            vm: process_id,
-            files: process_id,
-            fs: process_id,
-            sighand: process_id,
-            io: process_id,
-            sysvsem: process_id,
-        }
-    }
-
-    pub(crate) fn forked(self, process_id: usize, flags: CloneFlags) -> Self {
-        Self {
-            vm: if flags.contains(CloneFlags::CLONE_VM) {
-                self.vm
-            } else {
-                process_id
-            },
-            files: if flags.contains(CloneFlags::CLONE_FILES) {
-                self.files
-            } else {
-                process_id
-            },
-            fs: if flags.contains(CloneFlags::CLONE_FS) {
-                self.fs
-            } else {
-                process_id
-            },
-            sighand: if flags.contains(CloneFlags::CLONE_SIGHAND) {
-                self.sighand
-            } else {
-                process_id
-            },
-            io: if flags.contains(CloneFlags::CLONE_IO) {
-                self.io
-            } else {
-                process_id
-            },
-            sysvsem: if flags.contains(CloneFlags::CLONE_SYSVSEM) {
-                self.sysvsem
-            } else {
-                process_id
-            },
-        }
-    }
 }
 
 fn proc_task_state(status: TaskStatus, proc_sleeping: bool, job_control_stopped: bool) -> char {
@@ -1304,7 +1257,6 @@ pub struct ProcessControlBlockInner {
     pub(crate) timers: ProcessTimers,
     pub(crate) vfork_parent: Option<Arc<TaskControlBlock>>,
     pub(crate) namespaces: ProcessNamespaceState,
-    pub(crate) kcmp_resources: KcmpResourceOwners,
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     pub task_res_allocator: RecycleAllocator,
 }

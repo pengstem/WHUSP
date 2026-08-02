@@ -12,7 +12,6 @@ use crate::task::{
 use alloc::{vec, vec::Vec};
 use core::mem::size_of;
 use core::ptr::read_volatile;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::user_ptr::{
     UserBufferAccess, read_user_array, read_user_array_ctx, read_user_value,
@@ -49,7 +48,6 @@ struct UserIovecCursor {
 
 const RWF_HIPRI: usize = 0x0000_0001;
 const RWF_NOWAIT: usize = 0x0000_0008;
-const PREADV2_SUPPORTED_FLAGS: usize = RWF_HIPRI | RWF_NOWAIT;
 const PREADV_COALESCE_CHUNK_SIZE: usize = 64 * 1024;
 const WRITEV_COALESCE_CHUNK_SIZE: usize = 64 * 1024;
 // CONTEXT: Prepared iovec ranges are syscall-local snapshots of user mappings;
@@ -60,8 +58,6 @@ const SYNC_FILE_RANGE_WRITE: u32 = 0x02;
 const SYNC_FILE_RANGE_WAIT_AFTER: u32 = 0x04;
 const VALID_SYNC_FILE_RANGE_FLAGS: u32 =
     SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER;
-
-static PREADV2_NOWAIT_COMPAT_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn truncate_user_buffers(buffers: TranslatedUserBuffer, limit: usize) -> TranslatedUserBuffer {
     buffers.truncate(limit)
@@ -403,13 +399,6 @@ fn pwritev_can_use_direct_page_slices(
 
 fn writev_can_use_direct_page_slices(iovecs: &UserIovecs, allowed_len: usize) -> bool {
     user_iovecs_can_use_direct_page_slices(iovecs, allowed_len)
-}
-
-fn user_iovecs_are_page_aligned(iovecs: &UserIovecs) -> bool {
-    iovecs
-        .entries
-        .iter()
-        .all(|iovec| iovec.len == 0 || (iovec.base % PAGE_SIZE == 0 && iovec.len % PAGE_SIZE == 0))
 }
 
 fn pwritev_regular_file_direct_page_slices(
@@ -1546,10 +1535,10 @@ pub fn sys_vmsplice_ctx(
     if flags & !SPLICE_KNOWN_FLAGS != 0 {
         return Err(Errno::EINVAL);
     }
-    let iovecs = validate_user_iovecs_arg_ctx(ctx, iov, nr_segs)?;
-    if flags & SPLICE_F_GIFT != 0 && !user_iovecs_are_page_aligned(&iovecs) {
-        return Err(Errno::EINVAL);
+    if flags & SPLICE_F_GIFT != 0 {
+        return Err(Errno::ENOTSUP);
     }
+    let iovecs = validate_user_iovecs_arg_ctx(ctx, iov, nr_segs)?;
 
     let entry = get_fd_entry_by_fd(fd)?;
     let file = entry.file();
@@ -1560,8 +1549,6 @@ pub fn sys_vmsplice_ctx(
         return Ok(0);
     }
 
-    // CONTEXT: The pipe layer copies user buffers today; accepted
-    // SPLICE_F_GIFT pages are not retained or moved by later splice calls.
     if file.writable() {
         sys_vmsplice_write(ctx, entry, iovecs, flags)
     } else if file.readable() {
@@ -1606,12 +1593,7 @@ pub fn sys_sync_file_range(fd: usize, offset: i64, nbytes: i64, flags: u32) -> K
     if flags == 0 {
         return Ok(0);
     }
-    // UNFINISHED: Linux sync_file_range can separately start writeback and
-    // wait on an exact byte range without flushing metadata. This kernel does
-    // not model range writeback yet, so any nonzero legal flag combination
-    // falls back to the existing whole-file data sync path.
-    file.sync(true)?;
-    Ok(0)
+    Err(Errno::ENOTSUP)
 }
 
 pub fn sys_sync() -> KResult {
@@ -1774,28 +1756,6 @@ fn preadv2_uses_current_offset(pos_l: usize, _pos_h: usize) -> bool {
     pos_l == usize::MAX
 }
 
-fn sys_preadv2_nowait(
-    fd: usize,
-    iov: *const LinuxIovec,
-    iovcnt: usize,
-    pos_l: usize,
-    pos_h: usize,
-) -> KResult {
-    // CONTEXT: The current VFS has no page-cache readiness model. For
-    // RWF_NOWAIT, expose the Linux-visible nonblocking outcomes that LTP
-    // checks: occasional EAGAIN and otherwise a successful short read.
-    let attempt = PREADV2_NOWAIT_COMPAT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    if attempt % 8 == 0 {
-        return Err(Errno::EAGAIN);
-    }
-    let iovcnt = iovcnt.min(1);
-    if preadv2_uses_current_offset(pos_l, pos_h) {
-        sys_readv(fd, iov, iovcnt)
-    } else {
-        sys_preadv(fd, iov, iovcnt, pos_l, pos_h)
-    }
-}
-
 pub fn sys_preadv2(
     fd: usize,
     iov: *const LinuxIovec,
@@ -1804,11 +1764,11 @@ pub fn sys_preadv2(
     pos_h: usize,
     flags: usize,
 ) -> KResult {
-    if flags & !PREADV2_SUPPORTED_FLAGS != 0 {
-        return Err(Errno::ENOTSUP);
+    if flags & !(RWF_HIPRI | RWF_NOWAIT) != 0 {
+        return Err(Errno::EINVAL);
     }
-    if flags & RWF_NOWAIT != 0 {
-        return sys_preadv2_nowait(fd, iov, iovcnt, pos_l, pos_h);
+    if flags != 0 {
+        return Err(Errno::ENOTSUP);
     }
     if preadv2_uses_current_offset(pos_l, pos_h) {
         return sys_readv(fd, iov, iovcnt);

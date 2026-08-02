@@ -107,9 +107,9 @@ pub struct TaskControlBlockInner {
     // Linux-visible sleep state for cooperative wait loops that stay runnable.
     pub proc_sleeping: bool,
     pub exit_code: Option<i32>,
-    // Main tasks derive their Linux TID from the process PID. Pthreads and
-    // CLONE_VM helper tasks own a separate PidHandle so futex, tgkill, and
-    // robust-list paths never expose the internal task-slot index as a TID.
+    // Main tasks derive their Linux TID from the process PID. Pthreads own a
+    // separate PidHandle so futex, tgkill, and robust-list paths never expose
+    // the internal task-slot index as a TID.
     pub linux_tid: Option<PidHandle>,
     // Linux clear_child_tid user address from set_tid_address()/clone().
     // Exit cleanup writes 0 through this task's address space and wakes one
@@ -135,13 +135,6 @@ pub struct TaskControlBlockInner {
     cpu_times: TaskCpuTimes,
     pub timer_slack_ns: usize,
     pub default_timer_slack_ns: usize,
-    // Same-PCB helper used for CLONE_VM process compatibility paths; it should
-    // exit like a child helper, not terminate the whole parent thread group.
-    pub clone_vm_process_helper: bool,
-    // Exposes a synthetic new-net namespace view for CLONE_VM helper tasks.
-    // The helper shares the parent PCB, so namespace-visible state that must
-    // differ for LTP probes belongs on the task, not the process.
-    pub synthetic_newnet: bool,
 }
 
 impl TaskControlBlock {
@@ -224,8 +217,6 @@ impl TaskControlBlock {
                 cpu_times: TaskCpuTimes::default(),
                 timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
                 default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
-                clone_vm_process_helper: false,
-                synthetic_newnet: false,
             }),
         }
     }

@@ -14,16 +14,6 @@ pub fn sys_exit(exit_code: i32) -> ! {
 }
 
 pub fn sys_exit_group(exit_code: i32) -> ! {
-    let is_clone_vm_process_helper = current_task()
-        .map(|task| task.inner_exclusive_access().clone_vm_process_helper)
-        .unwrap_or(false);
-    if is_clone_vm_process_helper {
-        // CONTEXT: CLONE_VM process-compatibility children run as same-process
-        // helper tasks. libc _exit() may issue exit_group(), but Linux would
-        // terminate only the distinct cloned child process, so keep the parent
-        // process alive and release the helper task instead.
-        exit_current_and_run_next(exit_code);
-    }
     exit_current_group_and_run_next(exit_code)
 }
 

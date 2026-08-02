@@ -48,6 +48,18 @@ pub fn sys_prlimit64_ctx(
     } else {
         Some(read_user_value_ctx(ctx, new_limit)?)
     };
+    if new_limit.is_some()
+        && !matches!(
+            resource,
+            RLimitResource::FSize
+                | RLimitResource::Stack
+                | RLimitResource::Core
+                | RLimitResource::NoFile
+                | RLimitResource::MemLock
+        )
+    {
+        return Err(Errno::ENOTSUP);
+    }
     let credentials = ctx.process().credentials();
     let can_raise_hard_limit = credentials.euid == 0
         && credentials
@@ -65,7 +77,9 @@ pub fn sys_prlimit64_ctx(
         write_user_value_ctx(ctx, old_limit, &current)?;
     }
     if let Some(new_limit) = new_limit {
-        inner.resource_limits.set(resource, new_limit);
+        if !inner.resource_limits.set(resource, new_limit) {
+            return Err(Errno::ENOTSUP);
+        }
     }
     Ok(0)
 }

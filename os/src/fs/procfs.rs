@@ -1937,18 +1937,8 @@ fn lease_break_time_content() -> String {
     format!("{}\n", PROC_LEASE_BREAK_TIME.load(Ordering::Relaxed))
 }
 
-fn current_task_uses_synthetic_newnet() -> bool {
-    crate::task::current_task()
-        .map(|task| task.inner_exclusive_access().synthetic_newnet)
-        .unwrap_or(false)
-}
-
 fn net_ipv4_conf_lo_tag_content() -> String {
-    let value = if current_task_uses_synthetic_newnet() {
-        DEFAULT_NET_IPV4_CONF_TAG
-    } else {
-        PROC_NET_IPV4_CONF_LO_TAG.load(Ordering::Relaxed)
-    };
+    let value = PROC_NET_IPV4_CONF_LO_TAG.load(Ordering::Relaxed);
     format!("{value}\n")
 }
 
@@ -2187,9 +2177,8 @@ fn write_net_ipv4_conf_lo_tag(buf: &[u8], offset: u64) -> usize {
     let Ok(value) = text.trim().parse::<isize>() else {
         return 0;
     };
-    // UNFINISHED: Linux stores this under the network namespace. This minimal
-    // sysctl state is global except for CLONE_NEWNET compatibility helpers,
-    // which read the default value through net_ipv4_conf_lo_tag_content().
+    // UNFINISHED: Linux stores this under the network namespace; this minimal
+    // compatibility state is global.
     PROC_NET_IPV4_CONF_LO_TAG.store(value, Ordering::Relaxed);
     buf.len()
 }
