@@ -20,13 +20,12 @@ use crate::fs::{
     OpenFlags, PathContext, open_file_in, tty_detach_session, untrack_regular_file_executable,
 };
 use crate::shutdown::shutdown;
-use crate::sync::SpinNoIrqLock;
 use crate::syscall::{
     close_detached_fd_entry_for_process_teardown, release_record_locks_for_process,
 };
 use crate::uapi::errno::{Errno, KResult};
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::Ordering;
 use lazy_static::*;
 use lifecycle::{register_task_linux_tid, unregister_task_linux_tid};
 use log::info;
@@ -187,32 +186,6 @@ pub fn block_current_task_no_schedule_unless_interrupting_signal()
     processor::prepare_current_block_unless_interrupting_signal()
 }
 
-static EXITED_DIRTY: AtomicBool = AtomicBool::new(false);
-
-// CONTEXT: EXITED_TASKS defers Arc<TaskControlBlock> drops past the
-// __switch boundary so kernel stacks remain mapped until the next
-// scheduling tick completes.
-lazy_static! {
-    static ref EXITED_TASKS: SpinNoIrqLock<Vec<Arc<TaskControlBlock>>> =
-        SpinNoIrqLock::new(Vec::new());
-}
-
-fn queue_exited_task(task: Arc<TaskControlBlock>) {
-    EXITED_TASKS.lock().push(task);
-    EXITED_DIRTY.store(true, Ordering::Release);
-}
-
-pub(crate) fn reap_exited_tasks() {
-    if !EXITED_DIRTY.swap(false, Ordering::Acquire) {
-        return;
-    }
-    let exited_tasks = {
-        let mut tasks = EXITED_TASKS.lock();
-        core::mem::take(&mut *tasks)
-    };
-    drop(exited_tasks);
-}
-
 fn terminate_sibling_threads(
     process: &Arc<ProcessControlBlock>,
     current_tid: usize,
@@ -223,7 +196,6 @@ fn terminate_sibling_threads(
     let mut clear_child_tids = Vec::new();
     let mut recycle_res = Vec::<TaskUserRes>::new();
     let mut robust_tasks = Vec::new();
-    let mut exited_threads = Vec::new();
     let mut exited_linux_tids = Vec::new();
     {
         let mut process_inner = process.inner_exclusive_access();
@@ -247,7 +219,6 @@ fn terminate_sibling_threads(
             }
             drop(task_inner);
             if tid != 0 {
-                exited_threads.push(task);
                 *task_slot = None;
             }
         }
@@ -263,9 +234,6 @@ fn terminate_sibling_threads(
         futex::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
     }
     recycle_res.clear();
-    for task in exited_threads {
-        queue_exited_task(task);
-    }
 }
 
 fn terminate_sibling_threads_for_exec(
@@ -294,7 +262,6 @@ fn rebind_non_leader_for_exec(
     let mut clear_child_tids = Vec::new();
     let mut recycle_res = Vec::<TaskUserRes>::new();
     let mut robust_tasks = Vec::new();
-    let mut exited_threads = Vec::new();
     let mut exited_linux_tids = Vec::new();
     let mut old_current_linux_tid = None;
     {
@@ -342,7 +309,6 @@ fn rebind_non_leader_for_exec(
                 recycle_res.push(res);
             }
             drop(task_inner);
-            exited_threads.push(task);
             *task_slot = None;
         }
 
@@ -378,9 +344,6 @@ fn rebind_non_leader_for_exec(
         futex::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
     }
     recycle_res.clear();
-    for task in exited_threads {
-        queue_exited_task(task);
-    }
     remove_ready_tasks_of_process(process_id);
     futex::remove_process_futex_waiters(process_id);
     Ok(())
@@ -1006,8 +969,8 @@ fn exit_current(exit_code: i32, group_exit: bool) -> ! {
             // after dropping the PCB lock.
             let fd_entries = process_inner.take_all_fd_entries();
             // Keep only the main task in the zombie process for waitpid reaping.
-            // Non-main exiting tasks are parked in EXITED_TASKS until their kernel
-            // stacks are no longer active across the next schedule boundary.
+            // Scheduler exclusion has already stopped every sibling, so their
+            // task references can be released without a global deferred queue.
             while process_inner.tasks.len() > 1 {
                 process_inner.tasks.pop();
             }
@@ -1069,8 +1032,8 @@ fn exit_current(exit_code: i32, group_exit: bool) -> ! {
     drop(task_inner);
     let (switch_task, _task_cx_ptr) =
         processor::prepare_current_switch(processor::SwitchReason::Exit);
-    // Processor::current now keeps the exiting task and its kernel stack alive
-    // through __switch; switch completion transfers that Arc to EXITED_TASKS.
+    // Processor::current keeps the exiting task and its kernel stack alive
+    // through __switch. The idle context releases that Arc after the switch.
     drop(switch_task);
     drop(current);
     drop(task);

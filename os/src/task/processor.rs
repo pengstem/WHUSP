@@ -232,7 +232,7 @@ fn prepare_current_switch_inner(
     Some((task, task_cx_ptr))
 }
 
-fn finish_current_switch() {
+fn finish_current_switch() -> Option<Arc<TaskControlBlock>> {
     // A process root may be destroyed after its ActiveAddressSpace guard is
     // dropped below. Stop using that root before releasing any ownership.
     #[cfg(target_arch = "riscv64")]
@@ -311,20 +311,23 @@ fn finish_current_switch() {
     drop(address_space);
     process.release_scheduler_task();
 
-    match reason {
+    let retired_task = match reason {
         SwitchReason::Yield => {
             if enqueue.is_some() {
                 super::requeue_task_after_run(task);
             }
+            None
         }
         SwitchReason::Block => {
             if let Some(front) = enqueue {
                 super::sched::enqueue_woken_task(task, front);
             }
+            None
         }
-        SwitchReason::Exit => super::queue_exited_task(task),
-    }
+        SwitchReason::Exit => Some(task),
+    };
     process.finish_scheduler_switch();
+    retired_task
 }
 
 pub fn run_tasks() -> ! {
@@ -356,8 +359,9 @@ pub fn run_tasks() -> ! {
                 __switch(idle_task_cx_ptr, next_task_cx_ptr);
             }
             crate::cpu::scheduler_clear_current_priority();
-            finish_current_switch();
-            super::reap_exited_tasks();
+            // Release an exited task only after __switch has returned on the
+            // per-CPU idle stack; no global retire queue is needed here.
+            drop(finish_current_switch());
         } else {
             drop(processor);
             let cpu = crate::cpu::current_id();

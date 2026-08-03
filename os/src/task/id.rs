@@ -178,9 +178,9 @@ pub fn kstack_alloc() -> KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        // TaskControlBlock drops are deferred through EXITED_TASKS until the
-        // task is off-CPU. Retaining that unreachable stack's frames and PTEs
-        // lets the next task reuse the slot without two global TLB shootdowns.
+        // TaskControlBlock drops happen only after the task is off-CPU. Keeping
+        // the unreachable stack's frames and PTEs lets a later task reuse the
+        // slot without two global TLB shootdowns.
         KSTACK_ALLOCATOR.lock().release(self.0);
     }
 }
