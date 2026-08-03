@@ -425,8 +425,10 @@ pub fn sys_fcntl_ctx(ctx: &SyscallContext, fd: usize, op: usize, arg: usize) -> 
             .bits() as isize),
         F_SETFL => {
             let entry = get_fd_entry_by_fd_for_process(ctx.process(), fd)?;
-            if entry.file_ref().is_pipe() && arg as u32 & OpenFlags::DIRECT.bits() != 0 {
-                return Err(Errno::EINVAL);
+            // UNFINISHED: Changing O_DIRECT/O_DSYNC/O_SYNC requires I/O
+            // semantics that this kernel does not implement.
+            if OpenFlags::requests_unsupported_io_status(arg as u32) {
+                return Err(Errno::ENOTSUP);
             }
             let status = entry.status_flags();
             entry.set_status_flags(status.with_fcntl_status_flags(arg as u32));

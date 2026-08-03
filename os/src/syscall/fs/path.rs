@@ -663,6 +663,11 @@ pub(super) fn open_flags_from_user_bits(flags: u32) -> KResult<OpenFlags> {
     let Some(flags) = OpenFlags::from_bits(flags) else {
         return Err(Errno::EINVAL);
     };
+    // UNFINISHED: O_DIRECT, O_DSYNC, and O_SYNC require direct-I/O or
+    // synchronized-write durability semantics that the VFS does not provide.
+    if OpenFlags::requests_unsupported_io_status(flags.bits()) {
+        return Err(Errno::ENOTSUP);
+    }
     if flags.bits() & 0b11 == 0b11 {
         return Err(Errno::EINVAL);
     }
@@ -688,9 +693,6 @@ fn do_openat_for_process(
         flags: OpenFlags,
         path: Option<String>,
     ) -> KResult {
-        if file.is_pipe() && flags.contains(OpenFlags::DIRECT) {
-            return Err(Errno::EINVAL);
-        }
         if !flags.contains(OpenFlags::NOCTTY)
             && file.can_acquire_controlling_tty()
             && let Some(tty) = file.tty_id()

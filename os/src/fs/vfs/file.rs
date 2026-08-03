@@ -325,17 +325,10 @@ fn stat_logical_size(node: VfsNodeId, stat_size: u64) -> u64 {
         .unwrap_or(stat_size)
 }
 
-fn can_cache_dirty_write(
-    kind: FsNodeKind,
-    supports_dirty_writeback: bool,
-    _offset: usize,
-    len: usize,
-    status_flags: OpenFlags,
-) -> bool {
+fn can_cache_dirty_write(kind: FsNodeKind, supports_dirty_writeback: bool, len: usize) -> bool {
     kind == FsNodeKind::RegularFile
         && len > 0
         && len <= VFS_DIRTY_WRITEBACK_MAX_WRITE_SIZE
-        && !status_flags.intersects(OpenFlags::DIRECT | OpenFlags::DSYNC | OpenFlags::SYNC)
         && supports_dirty_writeback
 }
 
@@ -344,9 +337,8 @@ fn can_cache_dirty_user_buffer_write(
     supports_dirty_writeback: bool,
     offset: usize,
     len: usize,
-    status_flags: OpenFlags,
 ) -> bool {
-    can_cache_dirty_write(kind, supports_dirty_writeback, offset, len, status_flags)
+    can_cache_dirty_write(kind, supports_dirty_writeback, len)
         && offset % PAGE_SIZE == 0
         && len % PAGE_SIZE == 0
 }
@@ -1402,13 +1394,7 @@ impl VfsFile {
         force_backend: bool,
     ) -> DirtyChunkWriteResult {
         if !force_backend
-            && can_cache_dirty_write(
-                self.kind,
-                self.supports_dirty_writeback,
-                offset,
-                chunk.len(),
-                self.status_flags.get(),
-            )
+            && can_cache_dirty_write(self.kind, self.supports_dirty_writeback, chunk.len())
         {
             match cache_dirty_regular_write(&self.inode_state, offset, chunk) {
                 DirtyCacheWriteResult::Cached(write_size) => {
@@ -2796,13 +2782,7 @@ impl File for VfsFile {
     }
 
     fn supports_aligned_user_buffer_write_at(&self, offset: usize, len: usize) -> bool {
-        can_cache_dirty_user_buffer_write(
-            self.kind,
-            self.supports_dirty_writeback,
-            offset,
-            len,
-            self.status_flags.get(),
-        )
+        can_cache_dirty_user_buffer_write(self.kind, self.supports_dirty_writeback, offset, len)
     }
 
     fn write_at_aligned_user_buffer(&self, offset: usize, buf: UserBuffer) -> FsResult<usize> {

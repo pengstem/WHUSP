@@ -346,41 +346,6 @@ fn pwritev_regular_file_coalesced(
     Ok(total_written)
 }
 
-fn pwrite_regular_file_coalesced(
-    file: &(dyn File + Send + Sync),
-    mut offset: usize,
-    buffers: TranslatedUserBuffer,
-) -> KResult<usize> {
-    let mut total_written = 0usize;
-    let mut bounce = Vec::with_capacity(WRITEV_COALESCE_CHUNK_SIZE);
-    for slice in buffers {
-        let slice = slice.as_slice();
-        let mut remaining = &slice[..];
-        while !remaining.is_empty() {
-            let available = WRITEV_COALESCE_CHUNK_SIZE - bounce.len();
-            let take = available.min(remaining.len());
-            bounce.extend_from_slice(&remaining[..take]);
-            remaining = &remaining[take..];
-            if bounce.len() < WRITEV_COALESCE_CHUNK_SIZE {
-                continue;
-            }
-            let intended_len = bounce.len();
-            let written = file.write_at(offset, bounce.as_slice());
-            total_written = total_written.saturating_add(written);
-            offset = offset.checked_add(written).ok_or(Errno::EINVAL)?;
-            bounce.clear();
-            if written < intended_len {
-                return Ok(total_written);
-            }
-        }
-    }
-    if !bounce.is_empty() {
-        let written = file.write_at(offset, bounce.as_slice());
-        total_written = total_written.saturating_add(written);
-    }
-    Ok(total_written)
-}
-
 fn user_iovecs_can_use_direct_page_slices(iovecs: &UserIovecs, allowed_len: usize) -> bool {
     allowed_len == iovecs.total_len
         && allowed_len <= WRITEV_COALESCE_CHUNK_SIZE
@@ -1674,32 +1639,18 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, len: usize, offset: usize) -> KRe
         fault_in_read_buffers(&buffers);
         return Err(err.into());
     }
-    // Synchronous regular files would otherwise turn one cross-page pwrite
-    // into one durable backend transaction per translated user-page slice.
-    // Buffered writes already absorb those slices in the dirty page cache, so
-    // keep their zero-bounce path unchanged.
-    let coalesce_regular_sync = buffers.len() > 1
-        && entry
-            .status_flags()
-            .intersects(OpenFlags::DSYNC | OpenFlags::SYNC)
-        && file.mode_type()? == S_IFREG;
-    let total_written = if coalesce_regular_sync {
-        pwrite_regular_file_coalesced(file.as_ref(), offset, buffers)?
-    } else {
-        let mut total_written = 0usize;
-        for slice in buffers {
-            let slice = slice.as_slice();
-            let written = file.write_at(
-                offset.checked_add(total_written).ok_or(Errno::EINVAL)?,
-                slice,
-            );
-            total_written += written;
-            if written < slice.len() {
-                break;
-            }
+    let mut total_written = 0usize;
+    for slice in buffers {
+        let slice = slice.as_slice();
+        let written = file.write_at(
+            offset.checked_add(total_written).ok_or(Errno::EINVAL)?,
+            slice,
+        );
+        total_written += written;
+        if written < slice.len() {
+            break;
         }
-        total_written
-    };
+    }
     #[cfg(feature = "fanotify")]
     fanotify_notify_modify(&file, total_written);
     #[cfg(feature = "inotify")]

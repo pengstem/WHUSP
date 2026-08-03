@@ -40,13 +40,10 @@ bitflags! {
 
 impl OpenFlags {
     const ACCESS_MODE_MASK: u32 = 0b11;
-    const FCNTL_MUTABLE_STATUS_MASK: u32 =
-        OpenFlags::APPEND.bits() | OpenFlags::NONBLOCK.bits() | OpenFlags::DIRECT.bits();
+    const FCNTL_MUTABLE_STATUS_MASK: u32 = OpenFlags::APPEND.bits() | OpenFlags::NONBLOCK.bits();
     const TMPFILE_BASE_MASK: u32 = OpenFlags::TMPFILE.bits() & !OpenFlags::DIRECTORY.bits();
-    // CONTEXT: O_DSYNC/O_SYNC are accepted for libc/LTP compatibility even
-    // though this filesystem layer does not yet provide synchronous writeback
-    // semantics beyond its existing fsync path.
-    const ACCEPTED_SYNC_STATUS_MASK: u32 = OpenFlags::DSYNC.bits() | OpenFlags::SYNC.bits();
+    const UNSUPPORTED_IO_STATUS_MASK: u32 =
+        OpenFlags::DIRECT.bits() | OpenFlags::DSYNC.bits() | OpenFlags::SYNC.bits();
 
     pub fn read_write(&self) -> (bool, bool) {
         if self.contains(Self::PATH) {
@@ -75,14 +72,17 @@ impl OpenFlags {
         self.bits() & Self::TMPFILE_BASE_MASK != 0
     }
 
+    pub fn requests_unsupported_io_status(flags: u32) -> bool {
+        flags & Self::UNSUPPORTED_IO_STATUS_MASK != 0
+    }
+
     pub fn file_status_flags(flags: Self) -> Self {
         Self::from_bits_truncate(
             flags.bits()
                 & (Self::ACCESS_MODE_MASK
                     | Self::PATH.bits()
                     | Self::NOATIME.bits()
-                    | Self::FCNTL_MUTABLE_STATUS_MASK
-                    | Self::ACCEPTED_SYNC_STATUS_MASK),
+                    | Self::FCNTL_MUTABLE_STATUS_MASK),
         )
     }
 
