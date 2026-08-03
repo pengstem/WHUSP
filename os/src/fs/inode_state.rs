@@ -136,18 +136,6 @@ pub(crate) fn is_open_writable(node: VfsNodeId) -> bool {
     has_count(&state_for(node).writable_open_count)
 }
 
-pub(crate) fn track_writable_shared_mmap(state: &InodeState) {
-    increment_count(&state.writable_shared_mmap_count);
-}
-
-pub(crate) fn untrack_writable_shared_mmap(state: &InodeState) {
-    decrement_count(&state.writable_shared_mmap_count);
-}
-
-pub(crate) fn has_writable_shared_mmap(state: &InodeState) -> bool {
-    has_count(&state.writable_shared_mmap_count)
-}
-
 pub(crate) fn track_executable(node: VfsNodeId) {
     increment_count(&state_for(node).executable_count);
 }
@@ -277,7 +265,6 @@ pub(crate) struct InodeState {
     dirty_page_count: AtomicUsize,
     on_dirty_list: AtomicBool,
     writable_open_count: AtomicUsize,
-    writable_shared_mmap_count: AtomicUsize,
     executable_count: AtomicUsize,
     inode_flags: AtomicU32,
     inode_flags_valid: AtomicBool,
@@ -428,7 +415,6 @@ impl InodeState {
             dirty_page_count: AtomicUsize::new(0),
             on_dirty_list: AtomicBool::new(false),
             writable_open_count: AtomicUsize::new(0),
-            writable_shared_mmap_count: AtomicUsize::new(0),
             executable_count: AtomicUsize::new(0),
             inode_flags: AtomicU32::new(0),
             inode_flags_valid: AtomicBool::new(false),

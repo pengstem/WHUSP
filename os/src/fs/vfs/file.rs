@@ -48,7 +48,6 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use lazy_static::lazy_static;
 
 // Bound each backend write while a shared file offset lock is held; large user
 // buffers still progress in order without monopolizing one mount backend.
@@ -56,17 +55,7 @@ const VFS_WRITE_CHUNK_SIZE: usize = 64 * 1024;
 const VFS_READ_CHUNK_SIZE: usize = 64 * 1024;
 const VFS_READ_ALL_CHUNK_SIZE: usize = 64 * 1024;
 const VFS_DIRENT_SCRATCH_MAX: usize = 4 * 1024;
-// CONTEXT: Raised to 8 MiB so that iozone 4 MiB files can use the small‑read cache
-// and the page cache instead of falling through to backend on every read.
-const VFS_READ_CACHE_MAX_FILE_SIZE: usize = 8 * 1024 * 1024;
-const VFS_SMALL_READ_CACHE_MIN_FILE_SIZE: usize = 64 * 1024;
-// CONTEXT: Eight 8 MiB shards bound the cache at 64 MiB. This preserves the
-// existing per-file eligibility limit while allowing eight independent 4 MiB
-// iozone files to remain hot without one global copy lock.
-const VFS_SMALL_READ_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
-const VFS_SMALL_READ_CACHE_SHARDS: usize = 8;
-const VFS_SMALL_READ_CACHE_SHARD_MAX_BYTES: usize =
-    VFS_SMALL_READ_CACHE_MAX_BYTES / VFS_SMALL_READ_CACHE_SHARDS;
+const VFS_READ_COALESCE_MIN_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const VFS_READ_CACHE_READAHEAD_PAGES: usize = 6;
 const VFS_DIRTY_WRITEBACK_MAX_WRITE_SIZE: usize = 64 * 1024;
 const VFS_DIRTY_WRITEBACK_MAX_PAGES: usize = 4096;
@@ -83,99 +72,13 @@ const SYNTHETIC_DIRENT_OFFSET_BASE: u64 = 1 << 60;
 
 static TMPFILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
-lazy_static! {
-    static ref SMALL_REGULAR_READ_FILES: SmallRegularReadCaches = SmallRegularReadCaches::new();
-}
+#[cfg(feature = "perf-counters")]
+use lazy_static::lazy_static;
 
 #[cfg(feature = "perf-counters")]
 lazy_static! {
     static ref DIRTY_WRITEBACK_COUNTERS: SleepMutex<DirtyWritebackCounters> =
         SleepMutex::new(DirtyWritebackCounters::new());
-}
-
-#[derive(Debug)]
-struct SmallRegularReadCache {
-    data: Vec<u8>,
-}
-
-struct SmallRegularReadCacheShard {
-    files: BTreeMap<VfsNodeId, SmallRegularReadCache>,
-    bytes: usize,
-}
-
-struct SmallRegularReadCaches {
-    shards: [SleepMutex<SmallRegularReadCacheShard>; VFS_SMALL_READ_CACHE_SHARDS],
-}
-
-impl SmallRegularReadCache {
-    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
-        if offset >= self.data.len() {
-            return 0;
-        }
-        let len = buf.len().min(self.data.len() - offset);
-        buf[..len].copy_from_slice(&self.data[offset..offset + len]);
-        len
-    }
-}
-
-impl SmallRegularReadCacheShard {
-    fn new() -> Self {
-        Self {
-            files: BTreeMap::new(),
-            bytes: 0,
-        }
-    }
-
-    fn remove(&mut self, node: VfsNodeId) {
-        if let Some(cache) = self.files.remove(&node) {
-            self.bytes = self.bytes.saturating_sub(cache.data.len());
-        }
-    }
-
-    fn insert(&mut self, node: VfsNodeId, cache: SmallRegularReadCache) {
-        let cache_bytes = cache.data.len();
-        if cache_bytes > VFS_SMALL_READ_CACHE_SHARD_MAX_BYTES {
-            return;
-        }
-        self.remove(node);
-        if self.bytes.saturating_add(cache_bytes) > VFS_SMALL_READ_CACHE_SHARD_MAX_BYTES {
-            self.files.clear();
-            self.bytes = 0;
-        }
-        self.bytes += cache_bytes;
-        self.files.insert(node, cache);
-    }
-}
-
-impl SmallRegularReadCaches {
-    fn new() -> Self {
-        Self {
-            shards: core::array::from_fn(|_| SleepMutex::new(SmallRegularReadCacheShard::new())),
-        }
-    }
-
-    fn shard_index(node: VfsNodeId) -> usize {
-        debug_assert!(VFS_SMALL_READ_CACHE_SHARDS.is_power_of_two());
-        (node.ino as usize ^ node.mount_id.0.rotate_left(8)) & (VFS_SMALL_READ_CACHE_SHARDS - 1)
-    }
-
-    fn read_at(&self, node: VfsNodeId, offset: usize, buf: &mut [u8]) -> Option<usize> {
-        let shard = self.shards[Self::shard_index(node)].lock();
-        shard
-            .files
-            .get(&node)
-            .map(|cache| cache.read_at(offset, buf))
-    }
-
-    fn remove(&self, node: VfsNodeId) {
-        self.shards[Self::shard_index(node)].lock().remove(node);
-    }
-
-    fn insert(&self, node: VfsNodeId, cache: SmallRegularReadCache) {
-        self.shards[Self::shard_index(node)]
-            .lock()
-            .insert(node, cache);
-    }
 }
 
 #[cfg(feature = "perf-counters")]
@@ -1103,25 +1006,6 @@ fn untrack_writable_regular_open(
     mount_backend.untrack_writable_regular_open();
 }
 
-fn track_writable_shared_regular_mmap(
-    state: &inode_state::InodeState,
-    node: VfsNodeId,
-    kind: FsNodeKind,
-) {
-    if kind != FsNodeKind::RegularFile {
-        return;
-    }
-    invalidate_small_regular_read_cache(node, kind);
-    inode_state::track_writable_shared_mmap(state);
-}
-
-fn untrack_writable_shared_regular_mmap(state: &inode_state::InodeState, kind: FsNodeKind) {
-    if kind != FsNodeKind::RegularFile {
-        return;
-    }
-    inode_state::untrack_writable_shared_mmap(state);
-}
-
 fn ensure_mount_writable(mount_id: MountId) -> FsResult {
     if mount_is_read_only(mount_id) {
         Err(FsError::ReadOnly)
@@ -1177,12 +1061,6 @@ fn page_cache_id_for_node_with_support(
     Some(PageCacheId::new(node.mount_id, node.ino))
 }
 
-fn invalidate_small_regular_read_cache(node: VfsNodeId, kind: FsNodeKind) {
-    if kind == FsNodeKind::RegularFile {
-        SMALL_REGULAR_READ_FILES.remove(node);
-    }
-}
-
 fn cached_inode_flags(state: &inode_state::InodeState) -> Option<u32> {
     inode_state::cached_inode_flags(state)
 }
@@ -1207,7 +1085,6 @@ fn begin_regular_file_page_cache_mutation_with_support(
     kind: FsNodeKind,
     supports_page_cache: bool,
 ) -> Option<PageCacheMutationGuard> {
-    invalidate_small_regular_read_cache(node, kind);
     let id = page_cache_id_for_node_with_support(node, kind, supports_page_cache)?;
     let (guard, removed, scanned) = begin_page_cache_mutation(id);
     perf::record_vfs_read_cache_invalidation(removed, scanned);
@@ -1238,10 +1115,6 @@ pub(crate) fn regular_file_is_open_writable_in(context: PathContext, name: &str)
 
 pub(crate) fn regular_file_node_is_open_writable(node: VfsNodeId) -> bool {
     inode_state::is_open_writable(node)
-}
-
-fn regular_file_has_writable_shared_mmap(state: &inode_state::InodeState) -> bool {
-    inode_state::has_writable_shared_mmap(state)
 }
 
 pub(crate) fn track_regular_file_executable(node: VfsNodeId) {
@@ -1681,7 +1554,7 @@ impl VfsFile {
     ) -> Option<usize> {
         if self.kind != FsNodeKind::RegularFile
             || buf.segment_count() <= 1
-            || buf.len() <= VFS_READ_CACHE_MAX_FILE_SIZE
+            || buf.len() <= VFS_READ_COALESCE_MIN_BUFFER_SIZE
         {
             return None;
         }
@@ -2183,62 +2056,6 @@ impl VfsFile {
             buf[dst_start..dst_start + len].copy_from_slice(&page.data[src_start..src_start + len]);
         }
         Some(read_len)
-    }
-
-    #[allow(dead_code)]
-    fn read_small_regular_cached_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
-        if buf.is_empty() {
-            return Some(0);
-        }
-        if self.kind != FsNodeKind::RegularFile
-            || !self.supports_page_cache
-            || regular_file_has_writable_shared_mmap(&self.inode_state)
-            || dirty_regular_file_has_pages(self.node)
-        {
-            return None;
-        }
-        if let Some(read_size) = SMALL_REGULAR_READ_FILES.read_at(self.node, offset, buf) {
-            return Some(read_size);
-        }
-
-        let stat =
-            stat_basic_cached_with_state_and_lease(&self.inode_state, &self.mount_backend).ok()?;
-        let file_size = stat.size as usize;
-        if !(VFS_SMALL_READ_CACHE_MIN_FILE_SIZE..=VFS_READ_CACHE_MAX_FILE_SIZE).contains(&file_size)
-        {
-            return None;
-        }
-        if offset >= file_size {
-            return Some(0);
-        }
-
-        let mut data = vec![0u8; file_size];
-        let mut filled = 0usize;
-        let noatime_snapshot = self.noatime_snapshot();
-        while filled < file_size {
-            let chunk_len = (file_size - filled).min(VFS_READ_CHUNK_SIZE);
-            let read_size = self.read_backend_at(filled, &mut data[filled..filled + chunk_len]);
-            if read_size == 0 {
-                break;
-            }
-            filled += read_size;
-            if read_size < chunk_len {
-                break;
-            }
-        }
-        self.restore_noatime(noatime_snapshot);
-        data.truncate(filled);
-        if data.is_empty() {
-            return Some(0);
-        }
-        if dirty_regular_file_has_pages(self.node) {
-            return None;
-        }
-
-        let cache = SmallRegularReadCache { data };
-        let read_size = cache.read_at(offset, buf);
-        SMALL_REGULAR_READ_FILES.insert(self.node, cache);
-        Some(read_size)
     }
 }
 
@@ -3492,14 +3309,6 @@ impl File for VfsFile {
 
     fn page_cache_id(&self) -> Option<PageCacheId> {
         page_cache_id_for_node_with_support(self.node, self.kind, self.supports_page_cache)
-    }
-
-    fn inc_writable_shared_mmap(&self) {
-        track_writable_shared_regular_mmap(&self.inode_state, self.node, self.kind);
-    }
-
-    fn dec_writable_shared_mmap(&self) {
-        untrack_writable_shared_regular_mmap(&self.inode_state, self.kind);
     }
 
     fn status_flags(&self) -> OpenFlags {

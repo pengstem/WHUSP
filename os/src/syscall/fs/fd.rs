@@ -42,19 +42,15 @@ const F_SETPIPE_SZ: usize = 1031;
 const F_GETPIPE_SZ: usize = 1032;
 const F_ADD_SEALS: usize = 1033;
 const F_GET_SEALS: usize = 1034;
-// UNFINISHED: O_DIRECT is accepted as an observable pipe status flag, but
-// packet-mode read/write semantics are still regular byte-stream pipe behavior.
-const VALID_PIPE2_FLAGS: u32 =
-    OpenFlags::NONBLOCK.bits() | OpenFlags::CLOEXEC.bits() | OpenFlags::DIRECT.bits();
+const VALID_PIPE2_FLAGS: u32 = OpenFlags::NONBLOCK.bits() | OpenFlags::CLOEXEC.bits();
 const VALID_DUP3_FLAGS: u32 = OpenFlags::CLOEXEC.bits();
 const MAX_PIPE_SIZE_ARG: usize = 1 << 31;
 const MFD_CLOEXEC: u32 = 0x0001;
 const MFD_ALLOW_SEALING: u32 = 0x0002;
 const MFD_VALID_FLAGS: u32 = MFD_CLOEXEC | MFD_ALLOW_SEALING;
 const MEMFD_NAME_MAX: usize = 249;
-const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
 const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
-const VALID_CLOSE_RANGE_FLAGS: u32 = CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC;
+const VALID_CLOSE_RANGE_FLAGS: u32 = CLOSE_RANGE_CLOEXEC;
 
 pub(super) fn get_fd_entry_by_fd(fd: usize) -> KResult<FdTableEntry> {
     let process = current_process();
@@ -127,9 +123,6 @@ pub fn sys_close_range(first: usize, last: usize, flags: u32) -> KResult {
     if first > last || flags & !VALID_CLOSE_RANGE_FLAGS != 0 {
         return Err(Errno::EINVAL);
     }
-    // UNFINISHED: CLOSE_RANGE_UNSHARE is accepted for Linux compatibility, but
-    // this kernel's fd table is process-wide rather than a per-thread
-    // files_struct, so it cannot currently unshare one thread's descriptors.
     let process = current_process();
     let entries = {
         let mut inner = process.inner_exclusive_access();
@@ -432,9 +425,10 @@ pub fn sys_fcntl_ctx(ctx: &SyscallContext, fd: usize, op: usize, arg: usize) -> 
             .bits() as isize),
         F_SETFL => {
             let entry = get_fd_entry_by_fd_for_process(ctx.process(), fd)?;
+            if entry.file_ref().is_pipe() && arg as u32 & OpenFlags::DIRECT.bits() != 0 {
+                return Err(Errno::EINVAL);
+            }
             let status = entry.status_flags();
-            // UNFINISHED: O_DIRECT is recorded for fcntl compatibility, but direct-I/O
-            // alignment and cache-bypass semantics are not enforced by the filesystem layer.
             entry.set_status_flags(status.with_fcntl_status_flags(arg as u32));
             Ok(0)
         }

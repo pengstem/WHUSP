@@ -83,16 +83,6 @@ impl EmptyAtPath {
     pub(crate) fn into_parts(self) -> (Arc<dyn File + Send + Sync>, Option<String>) {
         (self.file, self.dir_path)
     }
-
-    pub(crate) fn working_dir(&self) -> KResult<WorkingDir> {
-        self.file.working_dir().ok_or(Errno::ENOTDIR)
-    }
-
-    pub(crate) fn dir_path_or_fd(&self, dirfd: isize) -> String {
-        self.dir_path
-            .clone()
-            .unwrap_or_else(|| alloc::format!("<fd:{dirfd}>"))
-    }
 }
 
 pub(crate) enum AtPath<'a> {
@@ -705,6 +695,9 @@ fn do_openat_for_process(
         flags: OpenFlags,
         path: Option<String>,
     ) -> KResult {
+        if file.is_pipe() && flags.contains(OpenFlags::DIRECT) {
+            return Err(Errno::EINVAL);
+        }
         if !flags.contains(OpenFlags::NOCTTY)
             && file.can_acquire_controlling_tty()
             && let Some(tty) = file.tty_id()

@@ -9,7 +9,6 @@ mod inode;
 mod inode_state;
 mod memfd;
 mod mount;
-mod mount_fd;
 mod named_fifo;
 mod overlayfs;
 mod path;
@@ -46,7 +45,6 @@ pub(crate) use console_tty::{
     tty_termios2, tty_winsize, unregister_pty_tty,
 };
 pub(crate) use eventfd::make_eventfd;
-pub(crate) use mount_fd::{DetachedMountFile, FsContextFile, FsContextStateError};
 pub(crate) use timerfd::{TimerFd, TimerFdClock, TimerFdState, make_timerfd};
 #[cfg(feature = "perf-counters")]
 pub(crate) use vfs::BackendIoSnapshot;

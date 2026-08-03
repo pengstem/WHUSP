@@ -1,26 +1,19 @@
 #[cfg(feature = "inotify")]
 use crate::fs::mounted_source_at;
 use crate::fs::{
-    DetachedMountFile, FsContextFile, FsContextStateError, FsNodeKind, MountError, MountId,
-    MountPropagation, OpenFlags, WorkingDir, lookup_existing_dir_in, lookup_mount_target_dir_in,
-    lookup_path_in, loop_device_is_attached, loop_device_is_read_only, mount_bind_at,
-    mount_block_device_at, mount_ext_scratch_at, mount_fat_device_at, mount_nfs_compat_at,
-    mount_overlay_compat_at, mount_proc_at, mount_stat_flags_from_linux_mount_flags,
-    mount_tmpfs_at, move_mount_at, normalize_path_at_root, open_file_in, remount_at,
-    set_mount_propagation_at, set_mount_stat_flags, unmount_at,
+    FsNodeKind, MountError, MountId, MountPropagation, lookup_existing_dir_in,
+    lookup_mount_target_dir_in, lookup_path_in, loop_device_is_attached, loop_device_is_read_only,
+    mount_bind_at, mount_block_device_at, mount_ext_scratch_at, mount_fat_device_at,
+    mount_nfs_compat_at, mount_overlay_compat_at, mount_proc_at,
+    mount_stat_flags_from_linux_mount_flags, mount_tmpfs_at, move_mount_at, normalize_path_at_root,
+    remount_at, set_mount_propagation_at, set_mount_stat_flags, unmount_at,
 };
 use crate::task::{CAP_SYS_ADMIN, current_process, current_user_token};
 use alloc::string::String;
 
 use super::super::user_ptr::{PATH_MAX, read_user_c_string};
-use super::fd::{get_file_by_fd, install_file_fd};
 #[cfg(feature = "inotify")]
 use super::inotify::inotify_notify_unmount;
-use super::path::{
-    AtPath, check_current_access_path_prefixes_from, normalize_path_from, path_context_from,
-    resolve_at_path,
-};
-use super::uapi::{AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW};
 use crate::uapi::errno::{Errno, KResult};
 
 const MS_RDONLY: usize = 1;
@@ -43,55 +36,6 @@ const UMOUNT_NOFOLLOW: i32 = 8;
 // Keep this mask aligned with the flag-specific checks in sys_umount2(); LTP
 // covers both invalid bits and invalid MNT_EXPIRE combinations.
 const VALID_UMOUNT_FLAGS: i32 = MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW;
-const OPEN_TREE_CLONE: u32 = 0x1;
-const OPEN_TREE_CLOEXEC: u32 = OpenFlags::CLOEXEC.bits();
-const AT_RECURSIVE: u32 = 0x8000; // open_tree recursive clone flag, not in older libc headers.
-const VALID_OPEN_TREE_FLAGS: u32 = OPEN_TREE_CLONE
-    | OPEN_TREE_CLOEXEC
-    | AT_SYMLINK_NOFOLLOW as u32
-    | AT_NO_AUTOMOUNT as u32
-    | AT_EMPTY_PATH as u32
-    | AT_RECURSIVE;
-const MOVE_MOUNT_F_SYMLINKS: u32 = 0x0000_0001;
-const MOVE_MOUNT_F_AUTOMOUNTS: u32 = 0x0000_0002;
-const MOVE_MOUNT_F_EMPTY_PATH: u32 = 0x0000_0004;
-const MOVE_MOUNT_T_SYMLINKS: u32 = 0x0000_0010;
-const MOVE_MOUNT_T_AUTOMOUNTS: u32 = 0x0000_0020;
-const MOVE_MOUNT_T_EMPTY_PATH: u32 = 0x0000_0040;
-const MOVE_MOUNT_MASK: u32 = MOVE_MOUNT_F_SYMLINKS
-    | MOVE_MOUNT_F_AUTOMOUNTS
-    | MOVE_MOUNT_F_EMPTY_PATH
-    | MOVE_MOUNT_T_SYMLINKS
-    | MOVE_MOUNT_T_AUTOMOUNTS
-    | MOVE_MOUNT_T_EMPTY_PATH;
-const FSOPEN_CLOEXEC: u32 = 0x0000_0001;
-const FSCONFIG_SET_FLAG: u32 = 0;
-const FSCONFIG_SET_STRING: u32 = 1;
-const FSCONFIG_SET_BINARY: u32 = 2;
-const FSCONFIG_SET_PATH: u32 = 3;
-const FSCONFIG_SET_PATH_EMPTY: u32 = 4;
-const FSCONFIG_SET_FD: u32 = 5;
-const FSCONFIG_CMD_CREATE: u32 = 6;
-const FSCONFIG_CMD_RECONFIGURE: u32 = 7;
-const FSMOUNT_CLOEXEC: u32 = 0x0000_0001;
-const FSPICK_CLOEXEC: u32 = 0x0000_0001;
-const FSPICK_SYMLINK_NOFOLLOW: u32 = 0x0000_0002;
-const FSPICK_NO_AUTOMOUNT: u32 = 0x0000_0004;
-const FSPICK_EMPTY_PATH: u32 = 0x0000_0008;
-const FSPICK_VALID_FLAGS: u32 =
-    FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW | FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH;
-const MOUNT_ATTR_RDONLY: u32 = 0x0000_0001;
-const MOUNT_ATTR_NOSUID: u32 = 0x0000_0002;
-const MOUNT_ATTR_NODEV: u32 = 0x0000_0004;
-const MOUNT_ATTR_NOEXEC: u32 = 0x0000_0008;
-const MOUNT_ATTR_ATIME: u32 = 0x0000_0070;
-const MOUNT_ATTR_NODIRATIME: u32 = 0x0000_0080;
-const VALID_FSMOUNT_ATTRS: u32 = MOUNT_ATTR_RDONLY
-    | MOUNT_ATTR_NOSUID
-    | MOUNT_ATTR_NODEV
-    | MOUNT_ATTR_NOEXEC
-    | MOUNT_ATTR_ATIME
-    | MOUNT_ATTR_NODIRATIME;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct VirtioBlockSource {
@@ -155,12 +99,6 @@ fn source_node_kind(snapshot: &crate::task::PathSnapshot, source: &str) -> Optio
         .map(|path| path.kind)
 }
 
-fn fs_context_error_to_errno(error: FsContextStateError) -> Errno {
-    match error {
-        FsContextStateError::NotCreated | FsContextStateError::AlreadyMounted => Errno::EBUSY,
-    }
-}
-
 fn current_has_sys_admin() -> bool {
     let credentials = current_process().credentials();
     credentials.euid == 0
@@ -180,84 +118,6 @@ fn require_sys_admin() -> KResult<()> {
     Ok(())
 }
 
-fn open_flags_from_cloexec(cloexec: bool) -> OpenFlags {
-    if cloexec {
-        OpenFlags::CLOEXEC
-    } else {
-        OpenFlags::empty()
-    }
-}
-
-fn install_open_tree_path_fd(
-    dirfd: isize,
-    path: &str,
-    flags: u32,
-    open_flags: OpenFlags,
-) -> KResult {
-    let snapshot = current_process().path_snapshot();
-    match resolve_at_path(&snapshot, dirfd, path, flags & AT_EMPTY_PATH as u32 != 0)? {
-        AtPath::Empty(empty) => {
-            let (file, dir_path) = empty.into_parts();
-            return install_file_fd(file, open_flags, dir_path);
-        }
-        AtPath::Path(path) => {
-            check_current_access_path_prefixes_from(&snapshot, dirfd, path)?;
-            let dir_path = normalize_path_from(&snapshot, dirfd, path).ok();
-            let file = open_file_in(path_context_from(&snapshot, dirfd, path)?, path, open_flags)?;
-            install_file_fd(file, open_flags, dir_path)
-        }
-    }
-}
-
-fn open_tree_source_dir(dirfd: isize, path: &str, flags: u32) -> KResult<(WorkingDir, String)> {
-    let snapshot = current_process().path_snapshot();
-    match resolve_at_path(&snapshot, dirfd, path, flags & AT_EMPTY_PATH as u32 != 0)? {
-        AtPath::Empty(empty) => Ok((empty.working_dir()?, empty.dir_path_or_fd(dirfd))),
-        AtPath::Path(path) => {
-            check_current_access_path_prefixes_from(&snapshot, dirfd, path)?;
-            let context = path_context_from(&snapshot, dirfd, path)?;
-            let source = lookup_existing_dir_in(context, path)?;
-            let source_path = normalize_path_from(&snapshot, dirfd, path)?;
-            Ok((source, source_path))
-        }
-    }
-}
-
-fn move_mount_target(dirfd: isize, path: &str, flags: u32) -> KResult<(WorkingDir, String)> {
-    let snapshot = current_process().path_snapshot();
-    match resolve_at_path(&snapshot, dirfd, path, flags & MOVE_MOUNT_T_EMPTY_PATH != 0)? {
-        AtPath::Empty(empty) => Ok((empty.working_dir()?, empty.dir_path_or_fd(dirfd))),
-        AtPath::Path(path) => {
-            let context = path_context_from(&snapshot, dirfd, path)?;
-            let target = lookup_mount_target_dir_in(context, path)?;
-            let target_path = normalize_path_from(&snapshot, dirfd, path)?;
-            Ok((target, target_path))
-        }
-    }
-}
-
-fn supported_fs_context(fs_name: &str) -> bool {
-    // CONTEXT: fsopen(2) accepts filesystem names needed by LTP's new-mount
-    // API probes. The later fsmount()/mount() path decides whether that name
-    // becomes a real backend or a tmpfs-backed compatibility mount.
-    matches!(
-        fs_name,
-        "ext2"
-            | "ext3"
-            | "ext4"
-            | "xfs"
-            | "btrfs"
-            | "bcachefs"
-            | "vfat"
-            | "exfat"
-            | "ntfs"
-            | "tmpfs"
-            | "ramfs"
-            | "fat"
-            | "fat32"
-    )
-}
-
 fn propagation_from_flags(flags: usize) -> MountPropagation {
     if flags & MS_SHARED != 0 {
         MountPropagation::Shared
@@ -268,229 +128,6 @@ fn propagation_from_flags(flags: usize) -> MountPropagation {
     } else {
         MountPropagation::Private
     }
-}
-
-pub fn sys_open_tree(dirfd: isize, path: *const u8, flags: u32) -> KResult {
-    if flags & !VALID_OPEN_TREE_FLAGS != 0 {
-        return Err(Errno::EINVAL);
-    }
-    if flags & AT_RECURSIVE != 0 && flags & OPEN_TREE_CLONE == 0 {
-        return Err(Errno::EINVAL);
-    }
-
-    let token = current_user_token();
-    let path = read_user_c_string(token, path, PATH_MAX)?;
-    let cloexec = flags & OPEN_TREE_CLOEXEC != 0;
-    let nofollow = flags & AT_SYMLINK_NOFOLLOW as u32 != 0;
-    let mut open_flags = OpenFlags::PATH | open_flags_from_cloexec(cloexec);
-    if nofollow {
-        open_flags |= OpenFlags::NOFOLLOW;
-    }
-
-    if flags & OPEN_TREE_CLONE == 0 {
-        return install_open_tree_path_fd(dirfd, path.as_str(), flags, open_flags);
-    }
-
-    require_sys_admin()?;
-    let (source, source_path) = open_tree_source_dir(dirfd, path.as_str(), flags)?;
-    // UNFINISHED: Linux can clone file mount objects and preserve anonymous
-    // mount namespace details. This fd-backed mount subset currently supports
-    // directory bind mounts because the VFS mount overlay is directory-rooted.
-    let file = DetachedMountFile::new_bind(source, source_path, flags & AT_RECURSIVE != 0);
-    install_file_fd(file, open_flags, None)
-}
-
-pub fn sys_move_mount(
-    from_dirfd: isize,
-    from_path: *const u8,
-    to_dirfd: isize,
-    to_path: *const u8,
-    flags: u32,
-) -> KResult {
-    if flags & !MOVE_MOUNT_MASK != 0 {
-        return Err(Errno::EINVAL);
-    }
-    require_sys_admin()?;
-
-    let token = current_user_token();
-    let from_path = read_user_c_string(token, from_path, PATH_MAX)?;
-    let to_path = read_user_c_string(token, to_path, PATH_MAX)?;
-    if !from_path.is_empty() || flags & MOVE_MOUNT_F_EMPTY_PATH == 0 {
-        // UNFINISHED: move_mount() can move attached mount objects selected by
-        // pathname. This implementation only supports fd-selected detached
-        // mount objects, which is the new-mount-API path used by LTP here.
-        return Err(Errno::ENOENT);
-    }
-
-    let file = get_file_by_fd(from_dirfd as usize)?;
-    let detached = file
-        .as_any()
-        .downcast_ref::<DetachedMountFile>()
-        .ok_or(Errno::EBADF)?;
-    let (target, target_path) = move_mount_target(to_dirfd, to_path.as_str(), flags)?;
-    detached
-        .attach_to(
-            current_process().mount_namespace_id(),
-            target,
-            target_path.as_str(),
-        )
-        .map_err(mount_error_to_errno)?;
-    Ok(0)
-}
-
-pub fn sys_fsopen(fs_name: *const u8, flags: u32) -> KResult {
-    if flags & !FSOPEN_CLOEXEC != 0 {
-        return Err(Errno::EINVAL);
-    }
-    let token = current_user_token();
-    let fs_name = read_user_c_string(token, fs_name, PATH_MAX)?;
-    if !supported_fs_context(fs_name.as_str()) {
-        return Err(Errno::ENODEV);
-    }
-    let file = FsContextFile::new(fs_name);
-    install_file_fd(
-        file,
-        open_flags_from_cloexec(flags & FSOPEN_CLOEXEC != 0),
-        None,
-    )
-}
-
-pub fn sys_fsconfig(fd: isize, cmd: u32, key: *const u8, value: *const u8, aux: i32) -> KResult {
-    if fd < 0 {
-        return Err(Errno::EINVAL);
-    }
-    let file = get_file_by_fd(fd as usize).map_err(|_| Errno::EINVAL)?;
-    let context = file
-        .as_any()
-        .downcast_ref::<FsContextFile>()
-        .ok_or(Errno::EINVAL)?;
-    let token = current_user_token();
-
-    match cmd {
-        FSCONFIG_SET_FLAG => {
-            if key.is_null() || !value.is_null() || aux != 0 {
-                return Err(Errno::EINVAL);
-            }
-            let key = read_user_c_string(token, key, PATH_MAX)?;
-            if !context.set_flag(key.as_str()) {
-                return Err(Errno::EINVAL);
-            }
-            Ok(0)
-        }
-        FSCONFIG_SET_STRING => {
-            if key.is_null() || value.is_null() || aux != 0 {
-                return Err(Errno::EINVAL);
-            }
-            let key = read_user_c_string(token, key, PATH_MAX)?;
-            let value = read_user_c_string(token, value, PATH_MAX)?;
-            if !context.set_string(key.as_str(), value.as_str()) {
-                return Err(Errno::EINVAL);
-            }
-            Ok(0)
-        }
-        FSCONFIG_SET_BINARY => {
-            if key.is_null() || value.is_null() || aux <= 0 {
-                return Err(Errno::EINVAL);
-            }
-            Err(Errno::ENOTSUP)
-        }
-        FSCONFIG_SET_PATH | FSCONFIG_SET_PATH_EMPTY => {
-            if key.is_null() || value.is_null() || aux < 0 && aux != AT_FDCWD as i32 {
-                return Err(Errno::EINVAL);
-            }
-            let key = read_user_c_string(token, key, PATH_MAX)?;
-            let value = read_user_c_string(token, value, PATH_MAX)?;
-            if key.is_empty() || value.is_empty() && cmd == FSCONFIG_SET_PATH {
-                return Err(Errno::EINVAL);
-            }
-            // CONTEXT: The current fs-context object only needs to carry the
-            // source string into `fsmount()`. Accept path-valued options as
-            // no-op metadata so LTP can exercise the mount API plumbing; full
-            // per-filesystem option parsing is still outside this VFS model.
-            Ok(0)
-        }
-        FSCONFIG_SET_FD => {
-            if key.is_null() || !value.is_null() || aux < 0 {
-                return Err(Errno::EINVAL);
-            }
-            let key = read_user_c_string(token, key, PATH_MAX)?;
-            if key.is_empty() {
-                return Err(Errno::EINVAL);
-            }
-            get_file_by_fd(aux as usize).map_err(|_| Errno::EBADF)?;
-            // CONTEXT: fd-valued fsconfig options are accepted for API
-            // coverage, but no current in-kernel filesystem consumes them.
-            Ok(0)
-        }
-        FSCONFIG_CMD_CREATE => {
-            if !key.is_null() || !value.is_null() || aux != 0 {
-                return Err(Errno::EINVAL);
-            }
-            context.mark_created();
-            Ok(0)
-        }
-        FSCONFIG_CMD_RECONFIGURE => {
-            if !key.is_null() || !value.is_null() || aux != 0 {
-                return Err(Errno::EINVAL);
-            }
-            Err(Errno::ENOTSUP)
-        }
-        _ => Err(Errno::ENOTSUP),
-    }
-}
-
-pub fn sys_fsmount(fd: isize, flags: u32, mount_attrs: u32) -> KResult {
-    if fd < 0 {
-        return Err(Errno::EBADF);
-    }
-    let file = get_file_by_fd(fd as usize)?;
-    let context = file
-        .as_any()
-        .downcast_ref::<FsContextFile>()
-        .ok_or(Errno::EBADF)?;
-    if flags & !FSMOUNT_CLOEXEC != 0 || mount_attrs & !VALID_FSMOUNT_ATTRS != 0 {
-        return Err(Errno::EINVAL);
-    }
-    require_sys_admin()?;
-    // CONTEXT: LTP passes MOUNT_ATTR_* values while checking the fd-based
-    // mount API. This kernel currently applies MOUNT_ATTR_RDONLY and accepts
-    // the no-op safety attributes for compatibility.
-    // UNFINISHED: MOUNT_ATTR_NOSUID, NODEV, NOEXEC, and atime policy flags are
-    // not enforced by the current VFS permission and timestamp paths.
-    let spec = context.prepare_mount().map_err(fs_context_error_to_errno)?;
-    // CONTEXT: fd-based fsmount() currently returns a detached tmpfs
-    // compatibility mount regardless of the requested fs type; sys_mount()
-    // still owns real block-backed backend selection.
-    let _fs_type = spec.fs_type;
-    let detached = DetachedMountFile::new_tmpfs(spec.source, mount_attrs & MOUNT_ATTR_RDONLY != 0)
-        .map_err(mount_error_to_errno)?;
-    let open_flags = OpenFlags::PATH | open_flags_from_cloexec(flags & FSMOUNT_CLOEXEC != 0);
-    install_file_fd(detached, open_flags, None)
-}
-
-pub fn sys_fspick(dirfd: isize, path: *const u8, flags: u32) -> KResult {
-    if flags & !FSPICK_VALID_FLAGS != 0 {
-        return Err(Errno::EINVAL);
-    }
-
-    let token = current_user_token();
-    let path = read_user_c_string(token, path, PATH_MAX)?;
-    let mut open_tree_flags = 0;
-    if flags & FSPICK_SYMLINK_NOFOLLOW != 0 {
-        open_tree_flags |= AT_SYMLINK_NOFOLLOW as u32;
-    }
-    if flags & FSPICK_NO_AUTOMOUNT != 0 {
-        open_tree_flags |= AT_NO_AUTOMOUNT as u32;
-    }
-    if flags & FSPICK_EMPTY_PATH != 0 {
-        open_tree_flags |= AT_EMPTY_PATH as u32;
-    }
-    // CONTEXT: fspick() should return a mount fd. The current VFS has no
-    // mount-object fd, so this compatibility path exposes the selected path as
-    // an O_PATH fd, which is enough for fd-class syscall probes such as LTP
-    // readahead01 to distinguish it from a regular file.
-    let open_flags = OpenFlags::PATH | open_flags_from_cloexec(flags & FSPICK_CLOEXEC != 0);
-    install_open_tree_path_fd(dirfd, path.as_str(), open_tree_flags, open_flags)
 }
 
 pub fn sys_mount(

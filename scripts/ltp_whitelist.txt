@@ -64,7 +64,6 @@ pkey01
 confstr01
 access01
 open11
-fsconfig02
 clock_getres01
 setregid03
 readahead01
@@ -152,7 +151,6 @@ clock_adjtime02
 readlinkat02
 semctl09
 clock_gettime01
-fsmount01
 sched_getscheduler01
 lseek02
 msgctl06
@@ -256,7 +254,6 @@ in6_02
 ioctl_loop06
 fcntl29_64
 dup07
-move_mount01
 gettimeofday01
 setresuid03
 mlock02
@@ -388,7 +385,6 @@ umount02
 umount03
 umount2_02
 getcwd01
-move_mount02
 rename01
 dup3_02
 wait401
@@ -431,9 +427,7 @@ bind03
 pwritev03_64
 epoll_pwait04
 waitpid03
-open_tree02
 openat04
-fsmount02
 msgget04
 creat04
 stat02
@@ -447,7 +441,6 @@ eventfd2_01
 pipe03
 msgctl03
 uname04
-fsopen02
 fork01
 fork03
 fork04
@@ -583,8 +576,6 @@ llseek02
 ioctl02
 fanotify20
 clone01
-fsopen01
-open_tree01
 getpid02
 fs_bind_move11_sh
 fs_bind_rbind06_sh
@@ -736,10 +727,8 @@ splice04
 pidns32
 write01
 fcntl12
-fsconfig01
 dup206
 fsync04
-fsconfig03
 pread01
 pread01_64
 pread02

@@ -50,10 +50,7 @@ pub use io::{
     sys_read_ctx, sys_readahead, sys_readv_ctx, sys_sendfile, sys_splice, sys_sync,
     sys_sync_file_range, sys_syncfs, sys_tee, sys_vmsplice_ctx, sys_write_ctx, sys_writev_ctx,
 };
-pub use mount::{
-    sys_fsconfig, sys_fsmount, sys_fsopen, sys_fspick, sys_mount, sys_move_mount, sys_open_tree,
-    sys_umount2,
-};
+pub use mount::{sys_mount, sys_umount2};
 pub(crate) use path::path_context_from;
 pub use path::{
     sys_chdir, sys_chroot, sys_faccessat, sys_faccessat2, sys_fchdir, sys_getcwd_ctx,

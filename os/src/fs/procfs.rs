@@ -1619,9 +1619,8 @@ fn mountinfo_content() -> String {
 }
 
 fn filesystems_content() -> &'static str {
-    // CONTEXT: fsopen(2) points userspace at /proc/filesystems to discover
-    // valid fs names. ext2/ext3 are scratch-mount compatibility names backed by
-    // tmpfs for current LTP coverage, not real on-disk ext2/ext3 drivers.
+    // Expose filesystem names accepted by the legacy mount path. ext2/ext3 are
+    // scratch-mount compatibility names backed by tmpfs, not on-disk drivers.
     "nodev\tproc\nnodev\ttmpfs\nnodev\tramfs\next2\next3\next4\nvfat\n"
 }
 
