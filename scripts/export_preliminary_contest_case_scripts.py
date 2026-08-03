@@ -819,8 +819,14 @@ def group_script(
 # current_plan_enabled={"yes" if enabled else "no"}
 # current_plan_skips_this_libc={"yes" if runner_skipped else "no"}
 
+LIBC_ROOT={sh_quote(libc_root)}
 WHUSP_ARCH={sh_quote(arch)}
-export WHUSP_ARCH
+if [ "$LIBC_ROOT" = "/musl" ]; then
+    LD_LIBRARY_PATH="/musl/lib:/glibc/lib:/lib"
+else
+    LD_LIBRARY_PATH="$LIBC_ROOT/lib:/glibc/lib:/musl/lib:/lib"
+fi
+export WHUSP_ARCH LD_LIBRARY_PATH
 
 {source_common("../../../common.sh")}{group_body(arch, libc_root, script, active_filter)}"""
 
@@ -999,6 +1005,34 @@ def entry_script(
         'WHUSP_SCRIPT_ROOT="$script_dir"',
         'export PATH="$WHUSP_SCRIPT_ROOT/bin:/tmp/bin:/musl:/glibc:$PATH"',
         'export TERM="vt220"',
+        "install_rootfs_link() {",
+        '    target="$1"',
+        '    link="$2"',
+        '    if [ ! -e "$link" ] && [ ! -L "$link" ] && [ -e "$target" ]; then',
+        '        /musl/busybox ln -s "$target" "$link" || return $?',
+        "    fi",
+        "}",
+        "",
+        "# Keep historical image layout fixes in the generated guest setup.",
+        "/musl/busybox mkdir -p /bin /lib /lib64",
+        "install_rootfs_link /musl/busybox /bin/sh || exit 127",
+        'machine=$(/musl/busybox uname -m 2>/dev/null)',
+        'case "${WHUSP_ARCH:-$machine}" in',
+        "    la|loongarch64)",
+        '        WHUSP_ARCH="la"',
+        "        install_rootfs_link /musl/lib/libc.so /lib64/ld-musl-loongarch-lp64d.so.1 || exit 127",
+        "        install_rootfs_link /glibc/lib/ld-linux-loongarch-lp64d.so.1 /lib64/ld-linux-loongarch-lp64d.so.1 || exit 127",
+        "        ;;",
+        "    *)",
+        '        WHUSP_ARCH="rv"',
+        "        install_rootfs_link /musl/lib/libc.so /lib/ld-musl-riscv64-sf.so.1 || exit 127",
+        "        install_rootfs_link /musl/lib/libc.so /lib/ld-musl-riscv64.so.1 || exit 127",
+        "        install_rootfs_link /glibc/lib/ld-linux-riscv64-lp64d.so.1 /lib/ld-linux-riscv64-lp64d.so.1 || exit 127",
+        "        ;;",
+        "esac",
+        "export WHUSP_ARCH",
+        "unset machine target link",
+        "",
         "/musl/busybox mkdir -p /tmp/bin",
         "/musl/busybox --install -s /tmp/bin",
     ]
@@ -1020,11 +1054,6 @@ def entry_script(
             "fi",
             '. "$script_dir/common.sh"',
             "",
-            'machine=$(/musl/busybox uname -m 2>/dev/null)',
-            'case "${WHUSP_ARCH:-$machine}" in',
-            '    la|loongarch64) WHUSP_ARCH="la" ;;',
-            '    *) WHUSP_ARCH="rv" ;;',
-            "esac",
             "",
         ]
     )
@@ -1210,6 +1239,10 @@ Current metadata:
 - `TEST_SCRIPTS = {", ".join(test_scripts) if test_scripts else "(empty)"}`
 - `LTP_CASE_FILTER_OPTION = {active_filter}`
 - LTP whitelist cases exported: {len(ltp_cases)}
+
+At boot, `entry.sh` creates missing `/bin/sh` and architecture-specific loader
+symlinks in the writable per-run rootfs overlay without replacing existing
+entries. Generated libc group/LTP scripts set their own library search path.
 
 Layout:
 

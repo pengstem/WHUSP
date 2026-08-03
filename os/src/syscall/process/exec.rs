@@ -35,19 +35,6 @@ const EXEC_ELF_HEADER_BYTES: usize = 64;
 const EXEC_METADATA_MAX_BYTES: usize = 128 * 1024;
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
-const ELF64_DYNAMIC_ENTRY_SIZE: usize = 16;
-const DT_NULL: i64 = 0;
-const DT_NEEDED: i64 = 1;
-fn contest_library_path_env(root: &str) -> &'static str {
-    // CONTEXT: This only supplies shared-library search paths for contest disk
-    // layouts. ELF interpreter path aliases are handled separately in
-    // `read_elf_interpreter()` and must not be hidden through LD_LIBRARY_PATH.
-    match root {
-        "/musl" => "LD_LIBRARY_PATH=/musl/lib:/glibc/lib:/lib",
-        "/glibc" => "LD_LIBRARY_PATH=/glibc/lib:/musl/lib:/lib",
-        _ => "LD_LIBRARY_PATH=/lib",
-    }
-}
 const AT_FDCWD: isize = -100;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_EMPTY_PATH: usize = 0x1000;
@@ -71,11 +58,6 @@ struct ExecImageSource {
     data: Vec<u8>,
     file: Arc<dyn File + Send + Sync>,
     file_size: usize,
-}
-
-struct ElfInterpreterSource {
-    image: ExecImageSource,
-    compat_root: Option<&'static str>,
 }
 
 impl ExecImageSource {
@@ -210,30 +192,6 @@ fn parse_shebang(data: &[u8]) -> KResult<Option<ScriptInterpreter>> {
     }))
 }
 
-fn is_path_under(path: &str, root: &str) -> bool {
-    match path.strip_prefix(root) {
-        Some("") => true,
-        Some(rest) => rest.starts_with('/'),
-        None => false,
-    }
-}
-
-fn libc_test_root(path: &str) -> Option<&'static str> {
-    if is_path_under(path, "/musl") {
-        Some("/musl")
-    } else if is_path_under(path, "/glibc") {
-        Some("/glibc")
-    } else {
-        None
-    }
-}
-
-fn push_missing_library_path(envs: &mut Vec<String>, root: &str) {
-    if !envs.iter().any(|env| env.starts_with("LD_LIBRARY_PATH=")) {
-        envs.push(String::from(contest_library_path_env(root)));
-    }
-}
-
 fn check_exec_stat(stat: &FileStat) -> KResult<()> {
     if stat.mode & S_IFMT != S_IFREG {
         return Err(Errno::EACCES);
@@ -301,15 +259,6 @@ fn read_u64_le(data: &[u8], offset: usize) -> KResult<usize> {
         .try_into()
         .map_err(|_| Errno::ENOEXEC)?;
     usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| Errno::ENOEXEC)
-}
-
-fn read_i64_le(data: &[u8], offset: usize) -> KResult<i64> {
-    let bytes: [u8; 8] = data
-        .get(offset..offset + 8)
-        .ok_or(Errno::ENOEXEC)?
-        .try_into()
-        .map_err(|_| Errno::ENOEXEC)?;
-    Ok(i64::from_le_bytes(bytes))
 }
 
 fn elf_metadata_len(probe: &[u8], file_size: usize) -> KResult<(usize, usize)> {
@@ -409,61 +358,6 @@ fn read_elf_exec_file(path: &str) -> KResult<ExecImageSource> {
     Ok(source)
 }
 
-fn read_elf_interpreter(path: &str) -> KResult<ElfInterpreterSource> {
-    const REDIRECTS: &[(&str, &str)] = &[
-        // CONTEXT: libc-test's musl dynamic binary names the soft-float
-        // interpreter as a symlink to libc.so. Official test sources state
-        // that kernels should redirect this path when the disk image does not
-        // provide the symlink entry.
-        ("/lib/ld-musl-riscv64-sf.so.1", "/musl/lib/libc.so"),
-        ("/lib/ld-musl-riscv64.so.1", "/musl/lib/libc.so"),
-        // CONTEXT: Official-style RISC-V glibc disks keep the real loader under
-        // `/glibc/lib`; the root `/lib` alias may be a plain redirect file in
-        // local test images and must not be treated as the loader payload.
-        (
-            "/lib/ld-linux-riscv64-lp64d.so.1",
-            "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
-        ),
-        // CONTEXT: LoongArch glibc/musl images keep loaders under
-        // `/glibc/lib` and `/musl/lib`; the official ELF INTERP path
-        // `/lib64/...` is not materialized on disk, so redirect it here.
-        (
-            "/lib64/ld-linux-loongarch-lp64d.so.1",
-            "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
-        ),
-        ("/lib64/ld-musl-loongarch-lp64d.so.1", "/musl/lib/libc.so"),
-    ];
-
-    // Respect the executable's PT_INTERP path whenever the mounted root
-    // provides a real ELF loader. Final-round Debian images materialize their
-    // system loader at the standard path, and redirecting those binaries to
-    // the preliminary `/glibc/lib` loader mixes incompatible glibc versions.
-    let direct_error = match read_elf_exec_file(path) {
-        Ok(image) => {
-            return Ok(ElfInterpreterSource {
-                image,
-                compat_root: None,
-            });
-        }
-        Err(error @ (Errno::ENOENT | Errno::ENOEXEC)) => error,
-        Err(error) => return Err(error),
-    };
-
-    for (alias, target) in REDIRECTS {
-        if path == *alias {
-            // CONTEXT: Preliminary images may omit the standard loader or
-            // materialize it as a non-ELF redirect file. Preserve their
-            // established libc-root fallback after the real path is rejected.
-            let image = read_elf_exec_file(target)?;
-            return Ok(ElfInterpreterSource {
-                image,
-                compat_root: libc_test_root(target),
-            });
-        }
-    }
-    Err(direct_error)
-}
-
 fn append_script_args(
     mut args: Vec<String>,
     script_path: String,
@@ -474,66 +368,26 @@ fn append_script_args(
     args
 }
 
-fn dynamic_segment_has_needed(
-    source: &ExecImageSource,
-    offset: usize,
-    len: usize,
-) -> KResult<bool> {
-    if len == 0 {
-        return Ok(false);
-    }
-    let data = source.read_exact_at(offset, len)?;
-    let mut cursor = 0usize;
-    while cursor + ELF64_DYNAMIC_ENTRY_SIZE <= data.len() {
-        let tag = read_i64_le(data.as_slice(), cursor)?;
-        if tag == DT_NULL {
-            return Ok(false);
-        }
-        if tag == DT_NEEDED {
-            return Ok(true);
-        }
-        cursor += ELF64_DYNAMIC_ENTRY_SIZE;
-    }
-    Ok(false)
-}
-
-fn elf_required_interpreter_path_from_source(
+fn elf_interpreter_path_from_source(
     elf: &xmas_elf::ElfFile<'_>,
     source: &ExecImageSource,
 ) -> KResult<Option<String>> {
-    let mut interpreter_path = None;
-    let mut needs_interpreter = false;
+    // PT_INTERP is authoritative. Image layout aliases and library search
+    // policy belong to the mounted rootfs and user environment, not execve.
     for i in 0..elf.header.pt2.ph_count() {
         let ph = elf.program_header(i).map_err(|_| Errno::ENOEXEC)?;
-        match ph.get_type().map_err(|_| Errno::ENOEXEC)? {
-            Type::Interp => {
-                let offset = ph.offset() as usize;
-                let len = ph.file_size() as usize;
-                let bytes = source.read_exact_at(offset, len)?;
-                let path = CStr::from_bytes_until_nul(bytes.as_slice())
-                    .map_err(|_| Errno::ENOEXEC)?
-                    .to_str()
-                    .map_err(|_| Errno::ENOEXEC)?;
-                interpreter_path = Some(path.to_string());
-            }
-            Type::Dynamic => {
-                needs_interpreter |= dynamic_segment_has_needed(
-                    source,
-                    ph.offset() as usize,
-                    ph.file_size() as usize,
-                )?;
-            }
-            _ => {}
-        }
-        if interpreter_path.is_some() && needs_interpreter {
-            break;
+        if ph.get_type().map_err(|_| Errno::ENOEXEC)? == Type::Interp {
+            let offset = ph.offset() as usize;
+            let len = ph.file_size() as usize;
+            let bytes = source.read_exact_at(offset, len)?;
+            let path = CStr::from_bytes_until_nul(bytes.as_slice())
+                .map_err(|_| Errno::ENOEXEC)?
+                .to_str()
+                .map_err(|_| Errno::ENOEXEC)?;
+            return Ok(Some(path.to_string()));
         }
     }
-    Ok(if needs_interpreter {
-        interpreter_path
-    } else {
-        None
-    })
+    Ok(None)
 }
 
 fn exec_script(
@@ -582,44 +436,20 @@ fn exec_loaded_program(
     let executable_node = source.file.vfs_node_id().or(executable_node);
     if source.data.starts_with(ELF_MAGIC) {
         let elf = source.elf()?;
-        let mut envs = envs;
-        // CONTEXT: Some contest basic binaries are PIE and carry PT_INTERP but
-        // have no DT_NEEDED entries. They ran as directly-entered self-contained
-        // test programs before dynamic linker support; keep that compatibility
-        // path while using PT_INTERP for binaries that actually need DSOs.
-        let interpreter_path = elf_required_interpreter_path_from_source(&elf, &source)?;
-        if interpreter_path.is_some()
-            && let Some(root) = libc_test_root(path.as_str())
-        {
-            // CONTEXT: Preliminary libc-root dynamic ELF helpers need their
-            // adjacent DSOs even when a standard loader path is materialized.
-            // Static BusyBox binaries and scripts must not inject this into
-            // descendants that use the final image's Debian runtime.
-            push_missing_library_path(&mut envs, root);
-        }
+        let interpreter_path = elf_interpreter_path_from_source(&elf, &source)?;
         let interpreter_source = interpreter_path
             .as_ref()
-            .map(|path| read_elf_interpreter(path.as_str()))
+            .map(|path| read_elf_exec_file(path.as_str()))
             .transpose()?;
-        if let Some(root) = interpreter_source
-            .as_ref()
-            .and_then(|source| source.compat_root)
-        {
-            // CONTEXT: LTP may copy a dynamically linked libc-root helper into
-            // a temporary mountpoint and exec it with a minimal custom envp.
-            // A compatibility-loader selection still identifies the libc
-            // family even when the executable pathname no longer does.
-            push_missing_library_path(&mut envs, root);
-        }
         let interpreter_elf = interpreter_source
             .as_ref()
-            .map(|source| source.image.elf())
+            .map(ExecImageSource::elf)
             .transpose()?;
         let interpreter = match (interpreter_elf.as_ref(), interpreter_source.as_ref()) {
             (Some(interpreter_elf), Some(interpreter_source)) => Some((
                 interpreter_elf,
-                interpreter_source.image.file.clone(),
-                interpreter_source.image.file_size,
+                interpreter_source.file.clone(),
+                interpreter_source.file_size,
             )),
             _ => None,
         };
@@ -651,15 +481,6 @@ fn exec_loaded_program(
 
 fn exec_path(path: String, args: Vec<String>, envs: Vec<String>) -> KResult {
     let args = normalize_exec_args(args);
-    // CONTEXT: CAgent's statically linked command runner invokes `/bin/sh -c`
-    // directly. Keep that narrow command-shell ABI on the static BusyBox path
-    // until the Debian dash syscall/runtime closure is complete. Shebang
-    // interpreters and `/bin/bash` still resolve exactly as named.
-    let path = if path == "/bin/sh" {
-        String::from("/musl/busybox")
-    } else {
-        path
-    };
     let context = current_process().path_snapshot().context;
     let executable_node = executable_node_in(context.clone(), path.as_str(), true);
     let executable_path = normalized_exec_path_in(&context, path.as_str());

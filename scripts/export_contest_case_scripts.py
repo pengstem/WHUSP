@@ -99,6 +99,33 @@ def entry_script(
 
 export PATH="/tmp/bin:/glibc:/musl:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export TERM="vt220"
+
+install_rootfs_link() {
+    target="$1"
+    link="$2"
+    if [ ! -e "$link" ] && [ ! -L "$link" ] && [ -e "$target" ]; then
+        /musl/busybox ln -s "$target" "$link" || return $?
+    fi
+}
+
+# Historical contest rootfs images omitted standard shell and ELF loader
+# symlinks. Keep that image-layout compatibility in the generated guest setup,
+# without replacing entries already supplied by the mounted rootfs.
+/musl/busybox mkdir -p /bin /lib /lib64
+install_rootfs_link /musl/busybox /bin/sh || exit 127
+machine=$(/musl/busybox uname -m 2>/dev/null)
+case "$machine" in
+    loongarch64)
+        install_rootfs_link /musl/lib/libc.so /lib64/ld-musl-loongarch-lp64d.so.1 || exit 127
+        install_rootfs_link /glibc/lib/ld-linux-loongarch-lp64d.so.1 /lib64/ld-linux-loongarch-lp64d.so.1 || exit 127
+        ;;
+    *)
+        install_rootfs_link /musl/lib/libc.so /lib/ld-musl-riscv64-sf.so.1 || exit 127
+        install_rootfs_link /musl/lib/libc.so /lib/ld-musl-riscv64.so.1 || exit 127
+        install_rootfs_link /glibc/lib/ld-linux-riscv64-lp64d.so.1 /lib/ld-linux-riscv64-lp64d.so.1 || exit 127
+        ;;
+esac
+unset machine target link
 """
     if interactive_shell:
         return (
@@ -200,6 +227,10 @@ Generated defaults:
 - CAgent: {"enabled" if run_cagent else "disabled"}
 - BuildStorm: {"enabled" if run_buildstorm else "disabled"}
 - Interactive shell: {"enabled" if interactive_shell else "disabled"}
+
+At boot, `entry.sh` creates missing `/bin/sh` and architecture-specific loader
+symlinks in the writable per-run rootfs overlay. Existing rootfs entries are
+left untouched; shared-library search remains the rootfs/loader's responsibility.
 
 Edit the switches near the top of the exporter:
 
