@@ -225,26 +225,41 @@ impl FutexManager {
             return Vec::new();
         };
         let mut tasks = Vec::new();
-        let mut kept = VecDeque::new();
-        while let Some(waiter) = queue.pop_front() {
+        let mut index = 0;
+        while index < queue.len() && tasks.len() < limit {
+            let waiter = &queue[index];
             if waiter.state.load(Ordering::Acquire) != FUTEX_WAITER_QUEUED {
+                queue.remove(index);
                 continue;
             }
-            if waiter.bitset & bitset != 0 && tasks.len() < limit {
-                waiter.state.store(FUTEX_WAITER_WOKEN, Ordering::Release);
-                waiter.task.finish_futex_wait(Self::bucket_index(key));
-                tasks.push(Arc::clone(&waiter.task));
-            } else {
-                kept.push_back(waiter);
+            if waiter.bitset & bitset == 0 {
+                index += 1;
+                continue;
             }
+            let waiter = queue.remove(index).expect("futex waiter index disappeared");
+            waiter.state.store(FUTEX_WAITER_WOKEN, Ordering::Release);
+            waiter.task.finish_futex_wait(Self::bucket_index(key));
+            tasks.push(Arc::clone(&waiter.task));
         }
-        *queue = kept;
         self.remove_empty_queue(&mut bucket, key);
         perf::record_futex_wake(true, tasks.len());
         tasks
     }
 
-    fn wake_one(&self, key: FutexKey) -> (Option<Arc<TaskControlBlock>>, bool) {
+    fn wake_one(&self, key: FutexKey, bitset: u32) -> Option<Arc<TaskControlBlock>> {
+        self.wake_one_inner(key, bitset, false).0
+    }
+
+    fn wake_one_with_remaining(&self, key: FutexKey) -> (Option<Arc<TaskControlBlock>>, bool) {
+        self.wake_one_inner(key, FUTEX_BITSET_MATCH_ANY, true)
+    }
+
+    fn wake_one_inner(
+        &self,
+        key: FutexKey,
+        bitset: u32,
+        check_remaining: bool,
+    ) -> (Option<Arc<TaskControlBlock>>, bool) {
         fence(Ordering::SeqCst);
         let mut bucket = self.lock_bucket(key);
         let Some(queue) = bucket.waiters.get_mut(&key) else {
@@ -252,18 +267,27 @@ impl FutexManager {
             return (None, false);
         };
         let mut task = None;
-        while let Some(waiter) = queue.pop_front() {
+        let mut index = 0;
+        while index < queue.len() {
+            let waiter = &queue[index];
             if waiter.state.load(Ordering::Acquire) != FUTEX_WAITER_QUEUED {
+                queue.remove(index);
                 continue;
             }
+            if waiter.bitset & bitset == 0 {
+                index += 1;
+                continue;
+            }
+            let waiter = queue.remove(index).expect("futex waiter index disappeared");
             waiter.state.store(FUTEX_WAITER_WOKEN, Ordering::Release);
             waiter.task.finish_futex_wait(Self::bucket_index(key));
             task = Some(Arc::clone(&waiter.task));
             break;
         }
-        let has_waiters = queue
-            .iter()
-            .any(|waiter| waiter.state.load(Ordering::Acquire) == FUTEX_WAITER_QUEUED);
+        let has_waiters = check_remaining
+            && queue
+                .iter()
+                .any(|waiter| waiter.state.load(Ordering::Acquire) == FUTEX_WAITER_QUEUED);
         self.remove_empty_queue(&mut bucket, key);
         perf::record_futex_wake(true, usize::from(task.is_some()));
         (task, has_waiters)
@@ -581,6 +605,12 @@ fn futex_wait(
 
 fn futex_wake(addr: usize, private: bool, limit: usize, bitset: u32) -> KResult<usize> {
     let key = futex_key(addr, private)?;
+    if limit == 1 {
+        // pthread mutex/condvar handoffs overwhelmingly wake one waiter. Pop
+        // that waiter in place instead of allocating and rebuilding its queue.
+        let task = FUTEX_MANAGER.wake_one(key, bitset);
+        return Ok(wake_futex_task(task));
+    }
     let tasks = FUTEX_MANAGER.wake(key, limit, bitset);
     Ok(wake_futex_tasks(tasks))
 }
@@ -593,8 +623,16 @@ fn futex_wake_for_process(
     bitset: u32,
 ) -> usize {
     let key = futex_key_for_process(addr, private, process_id);
+    if limit == 1 {
+        let task = FUTEX_MANAGER.wake_one(key, bitset);
+        return wake_futex_task(task);
+    }
     let tasks = FUTEX_MANAGER.wake(key, limit, bitset);
     wake_futex_tasks(tasks)
+}
+
+fn wake_futex_task(task: Option<Arc<TaskControlBlock>>) -> usize {
+    usize::from(task.is_some_and(wakeup_front_task))
 }
 
 fn wake_futex_tasks(tasks: Vec<Arc<TaskControlBlock>>) -> usize {
@@ -722,7 +760,7 @@ fn futex_unlock_pi(addr: usize, private: bool) -> KResult {
         return Err(Errno::EPERM);
     }
 
-    let (next_task, has_more_waiters) = FUTEX_MANAGER.wake_one(key);
+    let (next_task, has_more_waiters) = FUTEX_MANAGER.wake_one_with_remaining(key);
     if let Some(task) = next_task {
         let next_tid = linux_tid_to_futex_word(task.linux_tid())?;
         // UNFINISHED: This is PI-futex ownership handoff without scheduler
