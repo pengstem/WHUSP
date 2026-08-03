@@ -86,7 +86,6 @@ struct FutexWaiter {
 
 struct FutexBucket {
     waiters: BTreeMap<FutexKey, VecDeque<Arc<FutexWaiter>>>,
-    waiter_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,15 +98,12 @@ enum FutexWaitCleanup {
 /// Sharded futex wait queues keyed by Linux futex identity.
 struct FutexManager {
     buckets: Vec<SpinNoIrqLock<FutexBucket>>,
-    queue_count: AtomicUsize,
-    waiter_count: AtomicUsize,
 }
 
 impl FutexBucket {
     fn new() -> Self {
         Self {
             waiters: BTreeMap::new(),
-            waiter_count: 0,
         }
     }
 }
@@ -118,11 +114,7 @@ impl FutexManager {
         while buckets.len() < FUTEX_BUCKET_COUNT {
             buckets.push(SpinNoIrqLock::new(FutexBucket::new()));
         }
-        Self {
-            buckets,
-            queue_count: AtomicUsize::new(0),
-            waiter_count: AtomicUsize::new(0),
-        }
+        Self { buckets }
     }
 
     fn bucket_index(key: FutexKey) -> usize {
@@ -181,7 +173,6 @@ impl FutexManager {
             if waiter.bucket.load(Ordering::Acquire) != bucket_index {
                 continue;
             }
-            let old_queue_count = bucket.waiters.len();
             let mut removed = false;
             bucket.waiters.retain(|_, queue| {
                 let old_len = queue.len();
@@ -190,16 +181,9 @@ impl FutexManager {
                 !queue.is_empty()
             });
             if removed {
-                bucket.waiter_count = bucket.waiter_count.saturating_sub(1);
-                self.waiter_count.fetch_sub(1, Ordering::Relaxed);
-                self.queue_count.fetch_sub(
-                    old_queue_count.saturating_sub(bucket.waiters.len()),
-                    Ordering::Relaxed,
-                );
                 waiter
                     .state
                     .store(FUTEX_WAITER_CANCELLED, Ordering::Release);
-                self.record_state_for_bucket(&bucket);
                 perf::record_futex_cleanup(true, false, 0, 0);
                 return FutexWaitCleanup::StillQueued;
             }
@@ -233,14 +217,7 @@ impl FutexManager {
             state: AtomicU8::new(FUTEX_WAITER_QUEUED),
         });
         let queue = bucket.waiters.entry(key).or_default();
-        let created_queue = queue.is_empty();
         queue.push_back(Arc::clone(&waiter));
-        bucket.waiter_count += 1;
-        if created_queue {
-            self.queue_count.fetch_add(1, Ordering::Relaxed);
-        }
-        self.waiter_count.fetch_add(1, Ordering::Relaxed);
-        self.record_state_for_bucket(bucket);
         Some((task_cx_ptr, waiter))
     }
 
@@ -250,12 +227,10 @@ impl FutexManager {
         // mode boundary, especially on weakly ordered RISC-V.
         fence(Ordering::SeqCst);
         let mut bucket = self.lock_bucket(key);
-        let old_queue_count = bucket.waiters.len();
         let Some(queue) = bucket.waiters.get_mut(&key) else {
             perf::record_futex_wake(false, 0);
             return Vec::new();
         };
-        let old_len = queue.len();
         let mut tasks = Vec::new();
         let mut kept = VecDeque::new();
         while let Some(waiter) = queue.pop_front() {
@@ -270,16 +245,7 @@ impl FutexManager {
             }
         }
         *queue = kept;
-        let removed_count = old_len - queue.len();
-        bucket.waiter_count = bucket.waiter_count.saturating_sub(removed_count);
-        self.waiter_count
-            .fetch_sub(removed_count, Ordering::Relaxed);
         self.remove_empty_queue(&mut bucket, key);
-        self.queue_count.fetch_sub(
-            old_queue_count.saturating_sub(bucket.waiters.len()),
-            Ordering::Relaxed,
-        );
-        self.record_state_for_bucket(&bucket);
         perf::record_futex_wake(true, tasks.len());
         tasks
     }
@@ -287,12 +253,10 @@ impl FutexManager {
     fn wake_one(&self, key: FutexKey) -> (Option<Arc<TaskControlBlock>>, bool) {
         fence(Ordering::SeqCst);
         let mut bucket = self.lock_bucket(key);
-        let old_queue_count = bucket.waiters.len();
         let Some(queue) = bucket.waiters.get_mut(&key) else {
             perf::record_futex_wake(false, 0);
             return (None, false);
         };
-        let old_len = queue.len();
         let mut task = None;
         while let Some(waiter) = queue.pop_front() {
             if waiter.state.load(Ordering::Acquire) != FUTEX_WAITER_QUEUED {
@@ -302,19 +266,10 @@ impl FutexManager {
             task = Some(Arc::clone(&waiter.task));
             break;
         }
-        let removed_count = old_len - queue.len();
         let has_waiters = queue
             .iter()
             .any(|waiter| waiter.state.load(Ordering::Acquire) == FUTEX_WAITER_QUEUED);
-        bucket.waiter_count = bucket.waiter_count.saturating_sub(removed_count);
-        self.waiter_count
-            .fetch_sub(removed_count, Ordering::Relaxed);
         self.remove_empty_queue(&mut bucket, key);
-        self.queue_count.fetch_sub(
-            old_queue_count.saturating_sub(bucket.waiters.len()),
-            Ordering::Relaxed,
-        );
-        self.record_state_for_bucket(&bucket);
         perf::record_futex_wake(true, usize::from(task.is_some()));
         (task, has_waiters)
     }
@@ -345,7 +300,6 @@ impl FutexManager {
             let (tasks, moved) =
                 self.take_requeue_source(&mut bucket, source, wake_limit, requeue_limit);
             self.insert_requeued(&mut bucket, target, target_bucket_index, &moved);
-            self.record_state_for_bucket(&bucket);
             (tasks, moved)
         } else if source_bucket_index < target_bucket_index {
             let mut source_bucket = self.buckets[source_bucket_index].lock();
@@ -353,8 +307,6 @@ impl FutexManager {
             let (tasks, moved) =
                 self.take_requeue_source(&mut source_bucket, source, wake_limit, requeue_limit);
             self.insert_requeued(&mut target_bucket, target, target_bucket_index, &moved);
-            self.record_state_for_bucket(&source_bucket);
-            self.record_state_for_bucket(&target_bucket);
             (tasks, moved)
         } else {
             let mut target_bucket = self.buckets[target_bucket_index].lock();
@@ -362,8 +314,6 @@ impl FutexManager {
             let (tasks, moved) =
                 self.take_requeue_source(&mut source_bucket, source, wake_limit, requeue_limit);
             self.insert_requeued(&mut target_bucket, target, target_bucket_index, &moved);
-            self.record_state_for_bucket(&source_bucket);
-            self.record_state_for_bucket(&target_bucket);
             (tasks, moved)
         };
         let moved_len = moved.len();
@@ -378,11 +328,9 @@ impl FutexManager {
         wake_limit: usize,
         requeue_limit: usize,
     ) -> (Vec<Arc<TaskControlBlock>>, VecDeque<Arc<FutexWaiter>>) {
-        let old_queue_count = bucket.waiters.len();
         let Some(queue) = bucket.waiters.get_mut(&source) else {
             return (Vec::new(), VecDeque::new());
         };
-        let old_len = queue.len();
         let mut tasks = Vec::new();
         let mut moved = VecDeque::new();
         let mut kept = VecDeque::new();
@@ -400,16 +348,7 @@ impl FutexManager {
             }
         }
         *queue = kept;
-        let removed_count = old_len - queue.len();
-        bucket.waiter_count = bucket.waiter_count.saturating_sub(removed_count);
-        let permanently_removed = removed_count.saturating_sub(moved.len());
-        self.waiter_count
-            .fetch_sub(permanently_removed, Ordering::Relaxed);
         self.remove_empty_queue(bucket, source);
-        self.queue_count.fetch_sub(
-            old_queue_count.saturating_sub(bucket.waiters.len()),
-            Ordering::Relaxed,
-        );
         (tasks, moved)
     }
 
@@ -424,25 +363,17 @@ impl FutexManager {
             return;
         }
         let queue = bucket.waiters.entry(target).or_default();
-        let created_queue = queue.is_empty();
         for waiter in moved {
             queue.push_back(Arc::clone(waiter));
             // Publish the target only after the waiter is visible there. A
             // cleanup following the old index will miss and retry.
             waiter.bucket.store(target_bucket_index, Ordering::Release);
         }
-        bucket.waiter_count += moved.len();
-        if created_queue {
-            self.queue_count.fetch_add(1, Ordering::Relaxed);
-        }
     }
 
     fn remove_process(&self, process_id: usize) {
         for bucket_lock in &self.buckets {
             let mut bucket = bucket_lock.lock();
-            let old_queue_count = bucket.waiters.len();
-            let old_waiter_count = bucket.waiter_count;
-            let mut waiter_count = 0usize;
             bucket.waiters.retain(|key, queue| {
                 if Self::address_space_process_id(*key) == Some(process_id) {
                     for waiter in queue.iter() {
@@ -466,19 +397,8 @@ impl FutexManager {
                     }
                     keep
                 });
-                waiter_count += queue.len();
                 !queue.is_empty()
             });
-            bucket.waiter_count = waiter_count;
-            self.waiter_count.fetch_sub(
-                old_waiter_count.saturating_sub(waiter_count),
-                Ordering::Relaxed,
-            );
-            self.queue_count.fetch_sub(
-                old_queue_count.saturating_sub(bucket.waiters.len()),
-                Ordering::Relaxed,
-            );
-            self.record_state_for_bucket(&bucket);
         }
     }
 
@@ -486,15 +406,6 @@ impl FutexManager {
         if matches!(bucket.waiters.get(&key), Some(queue) if queue.is_empty()) {
             bucket.waiters.remove(&key);
         }
-    }
-
-    fn record_state_for_bucket(&self, bucket: &FutexBucket) {
-        perf::record_futex_manager_state(
-            self.queue_count.load(Ordering::Relaxed),
-            self.waiter_count.load(Ordering::Relaxed),
-            bucket.waiters.len(),
-            bucket.waiter_count,
-        );
     }
 }
 

@@ -209,10 +209,6 @@ pub(crate) fn syscall_with_context(
         #[cfg(feature = "inotify")]
         SYSCALL_INOTIFY_RM_WATCH => sys_inotify_rm_watch(args[0], args[1] as i32),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
-        SYSCALL_IOPRIO_SET => {
-            sys_ioprio_set_ctx(ctx, args[0] as i32, args[1] as isize, args[2] as i32)
-        }
-        SYSCALL_IOPRIO_GET => sys_ioprio_get_ctx(ctx, args[0] as i32, args[1] as isize),
         SYSCALL_FLOCK => sys_flock(args[0], args[1] as i32),
         SYSCALL_MKNODAT => sys_mknodat(
             args[0] as isize,

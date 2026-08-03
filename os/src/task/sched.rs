@@ -115,9 +115,7 @@ pub struct TaskManager {
 /// One CPU's run queue.
 ///
 /// Realtime tasks use Linux-style static priority buckets, while normal tasks
-/// use a nice-weighted vruntime key. Do not treat this as a full Linux
-/// scheduler class implementation; syscall-visible SCHED_DEADLINE attributes
-/// are stored elsewhere but are not enforced by this picker.
+/// use a nice-weighted vruntime key.
 impl TaskManager {
     pub fn new(cpu: crate::cpu::CpuId) -> Self {
         Self {
@@ -190,12 +188,6 @@ impl TaskManager {
     }
 
     fn add(&mut self, task: Arc<TaskControlBlock>) {
-        if Self::mark_queued_on(&task, self.cpu) {
-            self.enqueue(task, false);
-        }
-    }
-
-    fn requeue_after_run(&mut self, task: Arc<TaskControlBlock>) {
         if Self::mark_queued_on(&task, self.cpu) {
             self.enqueue(task, false);
         }
@@ -1262,7 +1254,7 @@ pub(crate) fn requeue_task_after_run(task: Arc<TaskControlBlock>) {
     };
     #[cfg(feature = "perf-counters")]
     let normal = task.realtime_priority() == 0;
-    with_run_queue(target, |manager| manager.requeue_after_run(task));
+    with_run_queue(target, |manager| manager.add(task));
     wake_enqueued_cpu(target);
     #[cfg(feature = "perf-counters")]
     if normal {

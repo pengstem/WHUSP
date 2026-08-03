@@ -524,10 +524,6 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) futex_wake_calls: usize,
     pub(crate) futex_wake_key_hits: usize,
     pub(crate) futex_wake_tasks: usize,
-    pub(crate) futex_queue_count_max: usize,
-    pub(crate) futex_waiter_count_max: usize,
-    pub(crate) futex_bucket_queue_count_max: usize,
-    pub(crate) futex_bucket_waiter_count_max: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -731,7 +727,6 @@ macro_rules! declare_perf_events {
             fn record_fanotify_node_name_lookup() => record_fanotify_node_name_lookup_impl;
             fn record_futex_cleanup(_direct_hit: bool, _already_unqueued: bool, _fallback_queue_visits: usize, _fallback_waiter_visits: usize,) => record_futex_cleanup_impl;
             fn record_futex_wake(_key_hit: bool, _tasks: usize) => record_futex_wake_impl;
-            fn record_futex_manager_state(_queue_count: usize, _waiter_count: usize, _bucket_queue_count: usize, _bucket_waiter_count: usize,) => record_futex_manager_state_impl;
         }
     };
 }
@@ -1135,10 +1130,6 @@ mod enabled {
     static FUTEX_WAKE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FUTEX_WAKE_KEY_HITS: AtomicUsize = AtomicUsize::new(0);
     static FUTEX_WAKE_TASKS: AtomicUsize = AtomicUsize::new(0);
-    static FUTEX_QUEUE_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
-    static FUTEX_WAITER_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
-    static FUTEX_BUCKET_QUEUE_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
-    static FUTEX_BUCKET_WAITER_COUNT_MAX: AtomicUsize = AtomicUsize::new(0);
 
     struct TimeStat {
         name: &'static str,
@@ -2750,18 +2741,6 @@ mod enabled {
         FUTEX_WAKE_TASKS.fetch_add(tasks, Ordering::Relaxed);
     }
 
-    fn record_futex_manager_state_impl(
-        queue_count: usize,
-        waiter_count: usize,
-        bucket_queue_count: usize,
-        bucket_waiter_count: usize,
-    ) {
-        update_max(&FUTEX_QUEUE_COUNT_MAX, queue_count);
-        update_max(&FUTEX_WAITER_COUNT_MAX, waiter_count);
-        update_max(&FUTEX_BUCKET_QUEUE_COUNT_MAX, bucket_queue_count);
-        update_max(&FUTEX_BUCKET_WAITER_COUNT_MAX, bucket_waiter_count);
-    }
-
     macro_rules! define_enabled_perf_events {
         ($(fn $name:ident($($arg:ident : $ty:ty),* $(,)?) => $implementation:ident;)*) => {
             $(
@@ -3234,10 +3213,6 @@ mod enabled {
             futex_wake_calls: FUTEX_WAKE_CALLS.load(Ordering::Relaxed),
             futex_wake_key_hits: FUTEX_WAKE_KEY_HITS.load(Ordering::Relaxed),
             futex_wake_tasks: FUTEX_WAKE_TASKS.load(Ordering::Relaxed),
-            futex_queue_count_max: FUTEX_QUEUE_COUNT_MAX.load(Ordering::Relaxed),
-            futex_waiter_count_max: FUTEX_WAITER_COUNT_MAX.load(Ordering::Relaxed),
-            futex_bucket_queue_count_max: FUTEX_BUCKET_QUEUE_COUNT_MAX.load(Ordering::Relaxed),
-            futex_bucket_waiter_count_max: FUTEX_BUCKET_WAITER_COUNT_MAX.load(Ordering::Relaxed),
         }
     }
 
@@ -3629,11 +3604,7 @@ mod enabled {
          futex_cleanup_fallback_waiter_visits {}\n\
          futex_wake_calls {}\n\
          futex_wake_key_hits {}\n\
-         futex_wake_tasks {}\n\
-         futex_queue_count_max {}\n\
-         futex_waiter_count_max {}\n\
-         futex_bucket_queue_count_max {}\n\
-         futex_bucket_waiter_count_max {}\n",
+         futex_wake_tasks {}\n",
             stats.scheduler_fetch_calls,
             stats.scheduler_scanned_tasks,
             stats.scheduler_pruned_exited_tasks,
@@ -4019,10 +3990,6 @@ mod enabled {
             stats.futex_wake_calls,
             stats.futex_wake_key_hits,
             stats.futex_wake_tasks,
-            stats.futex_queue_count_max,
-            stats.futex_waiter_count_max,
-            stats.futex_bucket_queue_count_max,
-            stats.futex_bucket_waiter_count_max,
         );
         append_timing_stats(&mut content);
         append_backend_op_stats(&mut content);

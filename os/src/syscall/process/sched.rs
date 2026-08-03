@@ -8,10 +8,9 @@ use crate::{
         },
     },
     task::{
-        CAP_SYS_ADMIN, ProcessControlBlock, SCHED_RR_INTERVAL_US, TaskControlBlock,
-        current_process, current_task, current_user_token, migrate_ready_task, pid2process,
-        processes_snapshot, reprioritize_ready_task, suspend_current_and_run_next,
-        task_with_linux_tid,
+        SCHED_RR_INTERVAL_US, TaskControlBlock, current_process, current_task, current_user_token,
+        migrate_ready_task, processes_snapshot, reprioritize_ready_task,
+        suspend_current_and_run_next, task_with_linux_tid,
     },
     uapi::errno::{Errno, KResult},
 };
@@ -33,14 +32,6 @@ const PRIO_PGRP: i32 = 1;
 const PRIO_USER: i32 = 2;
 const NICE_MIN: i8 = -20;
 const NICE_MAX: i8 = 19;
-const IOPRIO_WHO_PROCESS: i32 = 1;
-const IOPRIO_CLASS_NONE: u16 = 0;
-const IOPRIO_CLASS_RT: u16 = 1;
-const IOPRIO_CLASS_BE: u16 = 2;
-const IOPRIO_CLASS_IDLE: u16 = 3;
-const IOPRIO_CLASS_SHIFT: u16 = 13;
-const IOPRIO_PRIO_MASK: u16 = (1 << IOPRIO_CLASS_SHIFT) - 1;
-const IOPRIO_PRIO_NUM: u16 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -199,7 +190,7 @@ fn ctx_euid_matches_task(ctx: &SyscallContext, task: &TaskControlBlock) -> KResu
 }
 
 fn policy_change_requires_privilege(policy: i32) -> bool {
-    matches!(policy, SCHED_FIFO | SCHED_RR | SCHED_DEADLINE)
+    matches!(policy, SCHED_FIFO | SCHED_RR)
 }
 
 fn ensure_can_change_task_sched(task: &TaskControlBlock, requires_privilege: bool) -> KResult<()> {
@@ -246,18 +237,6 @@ fn validate_priority_for_policy(policy: i32, priority: i32) -> KResult<()> {
     Ok(())
 }
 
-fn validate_deadline_params(attr: LinuxSchedAttr) -> KResult<()> {
-    if attr.sched_runtime == 0
-        || attr.sched_deadline == 0
-        || attr.sched_period == 0
-        || attr.sched_runtime > attr.sched_deadline
-        || attr.sched_deadline > attr.sched_period
-    {
-        return Err(Errno::EINVAL);
-    }
-    Ok(())
-}
-
 fn validate_sched_attr(attr: LinuxSchedAttr) -> KResult<()> {
     if attr.size < LINUX_SCHED_ATTR_SIZE {
         return Err(Errno::EINVAL);
@@ -266,10 +245,10 @@ fn validate_sched_attr(attr: LinuxSchedAttr) -> KResult<()> {
         return Err(Errno::EINVAL);
     }
     let policy = attr.sched_policy as i32;
-    validate_priority_for_policy(policy, attr.sched_priority as i32)?;
     if policy == SCHED_DEADLINE {
-        validate_deadline_params(attr)?;
+        return Err(Errno::ENOTSUP);
     }
+    validate_priority_for_policy(policy, attr.sched_priority as i32)?;
     Ok(())
 }
 
@@ -303,9 +282,6 @@ fn apply_sched_attr(task: &Arc<TaskControlBlock>, attr: LinuxSchedAttr) {
         inner.sched_policy = attr.sched_policy as i32;
         inner.sched_priority = attr.sched_priority as i32;
         inner.sched_reset_on_fork = attr.sched_flags & SCHED_FLAG_RESET_ON_FORK != 0;
-        inner.sched_deadline_runtime = attr.sched_runtime;
-        inner.sched_deadline_deadline = attr.sched_deadline;
-        inner.sched_deadline_period = attr.sched_period;
         if matches!(inner.sched_policy, SCHED_OTHER | SCHED_BATCH) {
             inner.nice = clamp_nice(attr.sched_nice);
         }
@@ -325,9 +301,9 @@ fn sched_attr_for_task(task: &TaskControlBlock) -> LinuxSchedAttr {
         },
         sched_nice: inner.nice as i32,
         sched_priority: inner.sched_priority as u32,
-        sched_runtime: inner.sched_deadline_runtime,
-        sched_deadline: inner.sched_deadline_deadline,
-        sched_period: inner.sched_deadline_period,
+        sched_runtime: 0,
+        sched_deadline: 0,
+        sched_period: 0,
     }
 }
 
@@ -451,33 +427,14 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: usize) -> KResult 
     let task = sched_target_task(pid)?;
     ensure_can_change_task_sched(&task, policy_change_requires_privilege(base_policy))?;
 
-    // CONTEXT: cyclictest only needs Linux ABI-visible scheduling attributes
-    // plus coarse RT priority over normal hackbench load. When the current
-    // thread enters an RT policy, promote sibling threads in the same PCB too
-    // so cyclictest's normal-priority control thread can drive the short test
-    // to completion in this single-run-queue kernel.
-    // UNFINISHED: Linux sched_setscheduler(2) is per-thread for pid 0; this
-    // compatibility promotion should become unnecessary once the scheduler has
-    // a real RT run queue and better synchronization wakeup semantics.
     // UNFINISHED: Linux also considers CAP_SYS_NICE and rlimits. This kernel
     // currently models scheduler privilege with root euid only.
-    if pid == 0 && matches!(base_policy, SCHED_FIFO | SCHED_RR) {
-        for task in current_process().tasks_snapshot() {
-            apply_sched_policy(
-                &task,
-                base_policy,
-                sched_param.sched_priority,
-                reset_on_fork,
-            );
-        }
-    } else {
-        apply_sched_policy(
-            &task,
-            base_policy,
-            sched_param.sched_priority,
-            reset_on_fork,
-        );
-    }
+    apply_sched_policy(
+        &task,
+        base_policy,
+        sched_param.sched_priority,
+        reset_on_fork,
+    );
     Ok(0)
 }
 
@@ -501,9 +458,6 @@ pub fn sys_sched_setattr(pid: isize, attr: usize, flags: u32) -> KResult {
         &task,
         policy_change_requires_privilege(sched_attr.sched_policy as i32),
     )?;
-    // CONTEXT: SCHED_DEADLINE admission control and bandwidth enforcement are
-    // not modeled by this contest scheduler yet. The Linux-visible attributes
-    // are stored so LTP and libc callers can observe the requested policy.
     apply_sched_attr(&task, sched_attr);
     Ok(0)
 }
@@ -543,91 +497,6 @@ pub fn sys_sched_rr_get_interval(pid: isize, interval: *mut LinuxTimeSpec) -> KR
         }
     };
     write_user_value_with_mmap_fault(current_user_token(), interval, &rr_interval)?;
-    Ok(0)
-}
-
-fn ioprio_class(value: u16) -> u16 {
-    value >> IOPRIO_CLASS_SHIFT
-}
-
-fn ioprio_data(value: u16) -> u16 {
-    value & IOPRIO_PRIO_MASK
-}
-
-fn validate_ioprio(value: i32) -> KResult<u16> {
-    if value < 0 || value > u16::MAX as i32 {
-        return Err(Errno::EINVAL);
-    }
-    let value = value as u16;
-    let class = ioprio_class(value);
-    let data = ioprio_data(value);
-    match class {
-        IOPRIO_CLASS_NONE if data == 0 => Ok(value),
-        IOPRIO_CLASS_BE | IOPRIO_CLASS_IDLE if data < IOPRIO_PRIO_NUM => Ok(value),
-        IOPRIO_CLASS_RT if data < IOPRIO_PRIO_NUM => Ok(value),
-        _ => Err(Errno::EINVAL),
-    }
-}
-
-fn ioprio_target_process_ctx(
-    ctx: &SyscallContext,
-    which: i32,
-    who: isize,
-) -> KResult<Arc<ProcessControlBlock>> {
-    if who < 0 {
-        return Err(Errno::EINVAL);
-    }
-    match which {
-        IOPRIO_WHO_PROCESS => {
-            if who == 0
-                || who as usize == ctx.process().getpid()
-                || who as usize == ctx.task().linux_tid()
-            {
-                Ok(Arc::clone(ctx.process()))
-            } else {
-                pid2process(who as usize).ok_or(Errno::ESRCH)
-            }
-        }
-        // UNFINISHED: Linux supports process-group and real-UID selectors. The
-        // current scoring surface exercises only the current PROCESS selector.
-        _ => Err(Errno::EINVAL),
-    }
-}
-
-fn caller_can_change_ioprio(
-    ctx: &SyscallContext,
-    target: &Arc<ProcessControlBlock>,
-    value: u16,
-) -> KResult<bool> {
-    let caller = ctx.process().credentials();
-    let target_credentials = target.credentials();
-    let same_process = ctx.process().getpid() == target.getpid();
-    let owns_target = target_credentials.uid_matches_saved_set(caller.ruid)
-        || target_credentials.uid_matches_saved_set(caller.euid);
-    let has_sys_admin = caller
-        .capabilities
-        .has_effective(CAP_SYS_ADMIN)
-        .ok_or(Errno::EINVAL)?;
-    if ioprio_class(value) == IOPRIO_CLASS_RT && !has_sys_admin {
-        return Ok(false);
-    }
-    Ok(same_process || caller.is_root() || owns_target)
-}
-
-pub fn sys_ioprio_get_ctx(ctx: &SyscallContext, which: i32, who: isize) -> KResult {
-    let target = ioprio_target_process_ctx(ctx, which, who)?;
-    Ok(target.inner_exclusive_access().io_priority as isize)
-}
-
-pub fn sys_ioprio_set_ctx(ctx: &SyscallContext, which: i32, who: isize, value: i32) -> KResult {
-    let value = validate_ioprio(value)?;
-    let target = ioprio_target_process_ctx(ctx, which, who)?;
-    if !caller_can_change_ioprio(ctx, &target, value)? {
-        return Err(Errno::EPERM);
-    }
-    // CONTEXT: This stores Linux-compatible ioprio state for userspace tests.
-    // UNFINISHED: The block layer has no I/O scheduler that consumes it yet.
-    target.inner_exclusive_access().io_priority = value;
     Ok(0)
 }
 

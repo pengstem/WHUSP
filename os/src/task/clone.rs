@@ -106,9 +106,6 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     let parent_sched_policy = parent_inner.sched_policy;
     let parent_sched_priority = parent_inner.sched_priority;
     let parent_sched_reset_on_fork = parent_inner.sched_reset_on_fork;
-    let parent_sched_deadline_runtime = parent_inner.sched_deadline_runtime;
-    let parent_sched_deadline_deadline = parent_inner.sched_deadline_deadline;
-    let parent_sched_deadline_period = parent_inner.sched_deadline_period;
     let parent_nice = parent_inner.nice;
     let parent_sched_vruntime = parent_inner.sched_vruntime;
     let parent_allowed_cpus = parent_inner.allowed_cpus;
@@ -141,9 +138,6 @@ pub fn clone_current_thread(args: CloneArgs) -> ClonedThread {
     new_task_inner.sched_policy = parent_sched_policy;
     new_task_inner.sched_priority = parent_sched_priority;
     new_task_inner.sched_reset_on_fork = parent_sched_reset_on_fork;
-    new_task_inner.sched_deadline_runtime = parent_sched_deadline_runtime;
-    new_task_inner.sched_deadline_deadline = parent_sched_deadline_deadline;
-    new_task_inner.sched_deadline_period = parent_sched_deadline_period;
     new_task_inner.nice = parent_nice;
     new_task_inner.sched_vruntime = parent_sched_vruntime;
     // Linux threads inherit the creator's CPU affinity. This also ensures a

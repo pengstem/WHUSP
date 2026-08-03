@@ -162,7 +162,6 @@ impl ProcessControlBlock {
                 fd_open_bits,
                 next_fd_hint,
                 umask: 0,
-                io_priority: 0,
                 comm: comm_from_cmdline(&args),
                 pdeath_signal: 0,
                 dumpable: true,
@@ -309,7 +308,6 @@ impl ProcessControlBlock {
         let new_fd_table = parent.fd_table.clone();
         let (fd_open_bits, next_fd_hint) = fd_allocation_state_from_table(&new_fd_table);
         let umask = parent.umask;
-        let io_priority = parent.io_priority;
         let credentials = parent.credentials.clone();
         let resource_limits = parent.resource_limits;
         let pkey_rights = parent.pkey_rights;
@@ -347,9 +345,6 @@ impl ProcessControlBlock {
         let parent_sched_policy = parent_task_inner.sched_policy;
         let parent_sched_priority = parent_task_inner.sched_priority;
         let parent_sched_reset_on_fork = parent_task_inner.sched_reset_on_fork;
-        let parent_sched_deadline_runtime = parent_task_inner.sched_deadline_runtime;
-        let parent_sched_deadline_deadline = parent_task_inner.sched_deadline_deadline;
-        let parent_sched_deadline_period = parent_task_inner.sched_deadline_period;
         let parent_nice = parent_task_inner.nice;
         let parent_sched_vruntime = parent_task_inner.sched_vruntime;
         let parent_timer_slack_ns = parent_task_inner.timer_slack_ns;
@@ -404,7 +399,6 @@ impl ProcessControlBlock {
                 fd_open_bits,
                 next_fd_hint,
                 umask,
-                io_priority,
                 comm,
                 pdeath_signal: 0,
                 dumpable,
@@ -463,18 +457,12 @@ impl ProcessControlBlock {
             task_inner.sched_policy = 0;
             task_inner.sched_priority = 0;
             task_inner.sched_reset_on_fork = false;
-            task_inner.sched_deadline_runtime = 0;
-            task_inner.sched_deadline_deadline = 0;
-            task_inner.sched_deadline_period = 0;
             task_inner.nice = parent_nice.max(0);
             task_inner.sched_vruntime = parent_sched_vruntime;
         } else {
             task_inner.sched_policy = parent_sched_policy;
             task_inner.sched_priority = parent_sched_priority;
             task_inner.sched_reset_on_fork = false;
-            task_inner.sched_deadline_runtime = parent_sched_deadline_runtime;
-            task_inner.sched_deadline_deadline = parent_sched_deadline_deadline;
-            task_inner.sched_deadline_period = parent_sched_deadline_period;
             task_inner.nice = parent_nice;
             task_inner.sched_vruntime = parent_sched_vruntime;
         }
