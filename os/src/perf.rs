@@ -299,9 +299,7 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) mmap_clean_page_cache_misses: usize,
     pub(crate) mmap_clean_page_cache_fills: usize,
     pub(crate) tmpfs_allocated_payload_len_calls: usize,
-    pub(crate) tmpfs_allocated_payload_sparse_extents: usize,
     pub(crate) tmpfs_allocated_logical_len_calls: usize,
-    pub(crate) tmpfs_allocated_logical_sparse_extents: usize,
     pub(crate) brk_grow_calls: usize,
     pub(crate) brk_grow_pages: usize,
     pub(crate) brk_eager_mapped_pages: usize,
@@ -635,8 +633,8 @@ macro_rules! declare_perf_events {
             fn record_page_cache_capacity_reject() => record_page_cache_capacity_reject_impl;
             fn record_mmap_clean_page_cache(_hit: bool) => record_mmap_clean_page_cache_impl;
             fn record_mmap_clean_page_cache_fill() => record_mmap_clean_page_cache_fill_impl;
-            fn record_tmpfs_allocated_payload_len(_sparse_extents: usize) => record_tmpfs_allocated_payload_len_impl;
-            fn record_tmpfs_allocated_logical_len(_sparse_extents: usize) => record_tmpfs_allocated_logical_len_impl;
+            fn record_tmpfs_allocated_payload_len() => record_tmpfs_allocated_payload_len_impl;
+            fn record_tmpfs_allocated_logical_len() => record_tmpfs_allocated_logical_len_impl;
             fn record_brk_grow(_pages: usize) => record_brk_grow_impl;
             fn record_brk_eager_mapped(_pages: usize) => record_brk_eager_mapped_impl;
             fn record_brk_lazy_extended(_pages: usize) => record_brk_lazy_extended_impl;
@@ -904,9 +902,7 @@ mod enabled {
     static PWRITEV_REGULAR_DIRECT_USER_BUFFER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PWRITEV_REGULAR_DIRECT_USER_BUFFER_BYTES: AtomicUsize = AtomicUsize::new(0);
     static TMPFS_ALLOCATED_PAYLOAD_LEN_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static TMPFS_ALLOCATED_PAYLOAD_SPARSE_EXTENTS: AtomicUsize = AtomicUsize::new(0);
     static TMPFS_ALLOCATED_LOGICAL_LEN_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static TMPFS_ALLOCATED_LOGICAL_SPARSE_EXTENTS: AtomicUsize = AtomicUsize::new(0);
     static BRK_GROW_CALLS: AtomicUsize = AtomicUsize::new(0);
     static BRK_GROW_PAGES: AtomicUsize = AtomicUsize::new(0);
     static BRK_EAGER_MAPPED_PAGES: AtomicUsize = AtomicUsize::new(0);
@@ -2083,14 +2079,12 @@ mod enabled {
         crate::mm::page_cache::perf::record_clean_mmap_fill();
     }
 
-    fn record_tmpfs_allocated_payload_len_impl(sparse_extents: usize) {
+    fn record_tmpfs_allocated_payload_len_impl() {
         TMPFS_ALLOCATED_PAYLOAD_LEN_CALLS.fetch_add(1, Ordering::Relaxed);
-        TMPFS_ALLOCATED_PAYLOAD_SPARSE_EXTENTS.fetch_add(sparse_extents, Ordering::Relaxed);
     }
 
-    fn record_tmpfs_allocated_logical_len_impl(sparse_extents: usize) {
+    fn record_tmpfs_allocated_logical_len_impl() {
         TMPFS_ALLOCATED_LOGICAL_LEN_CALLS.fetch_add(1, Ordering::Relaxed);
-        TMPFS_ALLOCATED_LOGICAL_SPARSE_EXTENTS.fetch_add(sparse_extents, Ordering::Relaxed);
     }
 
     fn record_brk_grow_impl(pages: usize) {
@@ -2966,11 +2960,7 @@ mod enabled {
             mmap_clean_page_cache_fills: page_cache.clean_mmap_fills,
             tmpfs_allocated_payload_len_calls: TMPFS_ALLOCATED_PAYLOAD_LEN_CALLS
                 .load(Ordering::Relaxed),
-            tmpfs_allocated_payload_sparse_extents: TMPFS_ALLOCATED_PAYLOAD_SPARSE_EXTENTS
-                .load(Ordering::Relaxed),
             tmpfs_allocated_logical_len_calls: TMPFS_ALLOCATED_LOGICAL_LEN_CALLS
-                .load(Ordering::Relaxed),
-            tmpfs_allocated_logical_sparse_extents: TMPFS_ALLOCATED_LOGICAL_SPARSE_EXTENTS
                 .load(Ordering::Relaxed),
             brk_grow_calls: BRK_GROW_CALLS.load(Ordering::Relaxed),
             brk_grow_pages: BRK_GROW_PAGES.load(Ordering::Relaxed),
@@ -3415,9 +3405,7 @@ mod enabled {
          mmap_clean_page_cache_misses {}\n\
          mmap_clean_page_cache_fills {}\n\
          tmpfs_allocated_payload_len_calls {}\n\
-         tmpfs_allocated_payload_sparse_extents {}\n\
          tmpfs_allocated_logical_len_calls {}\n\
-         tmpfs_allocated_logical_sparse_extents {}\n\
          brk_grow_calls {}\n\
          brk_grow_pages {}\n\
          brk_eager_mapped_pages {}\n\
@@ -3806,9 +3794,7 @@ mod enabled {
             stats.mmap_clean_page_cache_misses,
             stats.mmap_clean_page_cache_fills,
             stats.tmpfs_allocated_payload_len_calls,
-            stats.tmpfs_allocated_payload_sparse_extents,
             stats.tmpfs_allocated_logical_len_calls,
-            stats.tmpfs_allocated_logical_sparse_extents,
             stats.brk_grow_calls,
             stats.brk_grow_pages,
             stats.brk_eager_mapped_pages,

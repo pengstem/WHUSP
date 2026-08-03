@@ -937,13 +937,13 @@ fn lookup_child(parent: DevNode, path: &str) -> Option<DevNode> {
 
 fn wake_task(task: Option<Arc<TaskControlBlock>>) {
     if let Some(task) = task {
-        let _ = wakeup_task(task);
+        wakeup_task(task);
     }
 }
 
 fn wake_tasks(tasks: VecDeque<Arc<TaskControlBlock>>) {
     for task in tasks {
-        let _ = wakeup_task(task);
+        wakeup_task(task);
     }
 }
 

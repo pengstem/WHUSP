@@ -660,7 +660,7 @@ fn check_lock_access(file: &Arc<dyn File + Send + Sync>, l_type: i16) -> KResult
 
 fn wake_waiters(waiters: Vec<Arc<TaskControlBlock>>) {
     for task in waiters {
-        let _ = wakeup_task(task);
+        wakeup_task(task);
     }
 }
 

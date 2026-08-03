@@ -266,12 +266,12 @@ impl TmpfsInode {
     }
 
     fn allocated_payload_len(&self) -> usize {
-        crate::perf::record_tmpfs_allocated_payload_len(0);
+        crate::perf::record_tmpfs_allocated_payload_len();
         self.allocated_payload_len
     }
 
     fn allocated_logical_len(&self) -> u64 {
-        crate::perf::record_tmpfs_allocated_logical_len(0);
+        crate::perf::record_tmpfs_allocated_logical_len();
         self.allocated_logical_len
     }
 

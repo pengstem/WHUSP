@@ -519,7 +519,7 @@ fn remove_watch_locked(inner: &mut InotifyInner, wd: i32) -> bool {
 
 fn wake_waiters(waiters: VecDeque<Arc<TaskControlBlock>>) {
     for task in waiters {
-        let _ = wakeup_task(task);
+        wakeup_task(task);
     }
 }
 

@@ -295,7 +295,7 @@ impl FanotifyGroup {
         });
         drop(events);
         for task in read_waiters {
-            let _ = wakeup_task(task);
+            wakeup_task(task);
         }
         PollWaiter::wake_all(poll_waiters);
     }
@@ -665,7 +665,7 @@ impl FanotifyGroup {
             }
         });
         for task in read_waiters {
-            let _ = wakeup_task(task);
+            wakeup_task(task);
         }
         PollWaiter::wake_all(poll_waiters);
     }

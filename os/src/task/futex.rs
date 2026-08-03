@@ -822,7 +822,7 @@ fn futex_unlock_pi(addr: usize, private: bool) -> KResult {
         // musl pthread PRIO_INHERIT mutexes, but it does not implement
         // transitive priority inheritance or priority-ordered waiter selection.
         write_futex_word(addr, futex_waiters_word(next_tid, has_more_waiters))?;
-        let _ = wakeup_task(task);
+        wakeup_task(task);
     } else {
         write_futex_word(addr, 0)?;
     }
