@@ -10,8 +10,8 @@ pub type CpuId = usize;
 // has made each driver queue safe for distributed interrupt handling.
 pub const EXTERNAL_IRQ_OWNER_CPU: CpuId = 0;
 
-// Global sleep, real-time, and POSIX timer heaps have one expiry owner. Every
-// CPU still programs its local timer interrupt for scheduler preemption.
+// The global sleep heap and any enabled compatibility timer heaps have one
+// expiry owner. Every CPU still programs its local timer for preemption.
 pub const TIMER_EXPIRY_OWNER_CPU: CpuId = 0;
 
 const CPU_STATE_OFFLINE: u8 = 0;

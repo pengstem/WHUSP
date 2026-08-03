@@ -1,11 +1,13 @@
 use super::exec::{ExecStackInfo, init_user_stack};
 use super::id::RecycleAllocator;
 use super::lifecycle::{register_process, register_task_linux_tid};
+#[cfg(any(feature = "setitimer", feature = "posix-timers"))]
+use super::process::ProcessTimers;
 use super::process::{
     Credentials, CredentialsFastState, FdTableFastState, ProcessControlBlock,
     ProcessControlBlockInner, ProcessCpuTimes, ProcessFsContext, ProcessFsFastState,
-    ProcessMemoryFastState, ProcessResourceLimits, ProcessTimers, comm_from_cmdline,
-    empty_process_pkey_rights, fd_allocation_state_from_table,
+    ProcessMemoryFastState, ProcessResourceLimits, comm_from_cmdline, empty_process_pkey_rights,
+    fd_allocation_state_from_table,
 };
 use super::signal::signal_action_masks;
 use super::{
@@ -179,6 +181,7 @@ impl ProcessControlBlock {
                 membarrier_private_expedited_registered: false,
                 signal_actions,
                 cpu_times: ProcessCpuTimes::default(),
+                #[cfg(any(feature = "setitimer", feature = "posix-timers"))]
                 timers: ProcessTimers::default(),
                 vfork_parent: None,
                 namespaces: super::process::ProcessNamespaceState {
@@ -420,6 +423,7 @@ impl ProcessControlBlock {
                 membarrier_private_expedited_registered,
                 signal_actions,
                 cpu_times: ProcessCpuTimes::with_inherited_self_maxrss(inherited_self_maxrss_kb),
+                #[cfg(any(feature = "setitimer", feature = "posix-timers"))]
                 timers: ProcessTimers::default(),
                 vfork_parent: None,
                 namespaces: super::process::ProcessNamespaceState {

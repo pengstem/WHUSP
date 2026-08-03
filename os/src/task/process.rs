@@ -23,8 +23,11 @@ pub const RLIM_INFINITY: usize = usize::MAX;
 const FD_BITMAP_WORD_BITS: usize = usize::BITS as usize;
 pub(crate) const PROCESS_PKEY_COUNT: usize = 16;
 pub(crate) type ProcessPKeyRights = [Option<usize>; PROCESS_PKEY_COUNT];
+#[cfg(any(feature = "setitimer", feature = "posix-timers"))]
 type TimerRearm = Option<(usize, u64)>;
+#[cfg(feature = "setitimer")]
 type RealTimerExpiry = (Arc<TaskControlBlock>, TimerRearm);
+#[cfg(feature = "posix-timers")]
 type PosixTimerExpiry = (Arc<TaskControlBlock>, u32, TimerRearm);
 
 pub(crate) fn empty_process_pkey_rights() -> ProcessPKeyRights {
@@ -903,6 +906,7 @@ impl ProcessCpuTimes {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(feature = "setitimer")]
 pub(crate) struct ProcessRealTimer {
     pub(crate) interval_us: usize,
     pub(crate) next_expire_us: usize,
@@ -911,6 +915,7 @@ pub(crate) struct ProcessRealTimer {
     pub(crate) generation: u64,
 }
 
+#[cfg(feature = "setitimer")]
 impl ProcessRealTimer {
     pub(crate) fn is_armed(&self) -> bool {
         self.next_expire_us != 0
@@ -926,6 +931,7 @@ impl ProcessRealTimer {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(feature = "posix-timers")]
 pub(crate) struct ProcessPosixTimer {
     pub(crate) clock_id: i32,
     pub(crate) signal: u32,
@@ -936,6 +942,7 @@ pub(crate) struct ProcessPosixTimer {
     pub(crate) generation: u64,
 }
 
+#[cfg(feature = "posix-timers")]
 impl ProcessPosixTimer {
     pub(crate) fn new(clock_id: i32, signal: u32) -> Self {
         Self {
@@ -983,13 +990,19 @@ pub(crate) struct PtraceState {
 }
 
 #[derive(Debug, Default)]
+#[cfg(any(feature = "setitimer", feature = "posix-timers"))]
 pub(crate) struct ProcessTimers {
+    #[cfg(feature = "setitimer")]
     pub(crate) real: ProcessRealTimer,
+    #[cfg(feature = "setitimer")]
     pub(crate) virtual_timer: ProcessRealTimer,
+    #[cfg(feature = "setitimer")]
     pub(crate) prof: ProcessRealTimer,
+    #[cfg(feature = "posix-timers")]
     pub(crate) posix: Vec<Option<ProcessPosixTimer>>,
 }
 
+#[cfg(feature = "posix-timers")]
 impl ProcessTimers {
     pub(crate) fn clear_posix_after_exec(&mut self) {
         self.posix.clear();
@@ -1302,6 +1315,7 @@ pub struct ProcessControlBlockInner {
     pub membarrier_private_expedited_registered: bool,
     pub signal_actions: [SignalAction; SIGNAL_INFO_SLOTS],
     pub cpu_times: ProcessCpuTimes,
+    #[cfg(any(feature = "setitimer", feature = "posix-timers"))]
     pub(crate) timers: ProcessTimers,
     pub(crate) vfork_parent: Option<Arc<TaskControlBlock>>,
     pub(crate) namespaces: ProcessNamespaceState,
@@ -2020,6 +2034,7 @@ impl ProcessControlBlock {
         result
     }
 
+    #[cfg(feature = "setitimer")]
     pub(crate) fn expire_real_timer(
         &self,
         generation: u64,
@@ -2047,6 +2062,7 @@ impl ProcessControlBlock {
         Some((task, next_timer))
     }
 
+    #[cfg(feature = "posix-timers")]
     pub(crate) fn create_posix_timer(&self, clock_id: i32, signal: u32) -> usize {
         let mut inner = self.inner_exclusive_access();
         if let Some((idx, slot)) = inner
@@ -2067,11 +2083,13 @@ impl ProcessControlBlock {
         }
     }
 
+    #[cfg(feature = "posix-timers")]
     pub(crate) fn posix_timer_clock(&self, timer_id: usize) -> Option<i32> {
         let inner = self.inner_exclusive_access();
         Some(inner.timers.posix.get(timer_id)?.as_ref()?.clock_id)
     }
 
+    #[cfg(feature = "posix-timers")]
     pub(crate) fn set_posix_timer(
         &self,
         timer_id: usize,
@@ -2089,6 +2107,7 @@ impl ProcessControlBlock {
         Some((old_interval_us, old_remaining_us, timer.generation))
     }
 
+    #[cfg(feature = "posix-timers")]
     pub(crate) fn posix_timer_snapshot(
         &self,
         timer_id: usize,
@@ -2099,6 +2118,7 @@ impl ProcessControlBlock {
         Some((timer.interval_us, timer.remaining_us(now_us)))
     }
 
+    #[cfg(feature = "posix-timers")]
     pub(crate) fn delete_posix_timer(&self, timer_id: usize) -> Option<()> {
         let mut inner = self.inner_exclusive_access();
         let slot = inner.timers.posix.get_mut(timer_id)?;
@@ -2106,6 +2126,7 @@ impl ProcessControlBlock {
         Some(())
     }
 
+    #[cfg(feature = "posix-timers")]
     pub(crate) fn expire_posix_timer(
         &self,
         timer_id: usize,

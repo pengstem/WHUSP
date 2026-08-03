@@ -20,6 +20,9 @@ ptrace = []
 fault-trace = []
 read-mostly-probe = []
 sleep-rwlock-probe = []
+timerfd = []
+setitimer = []
+posix-timers = []
 
 [dependencies]
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

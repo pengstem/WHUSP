@@ -18,6 +18,7 @@ mod procfs;
 mod staticfs;
 mod status_flags;
 mod stdio;
+#[cfg(feature = "timerfd")]
 mod timerfd;
 mod tmpfs;
 mod vfs;
@@ -46,6 +47,7 @@ pub(crate) use console_tty::{
     tty_termios2, tty_winsize, unregister_pty_tty,
 };
 pub(crate) use eventfd::make_eventfd;
+#[cfg(feature = "timerfd")]
 pub(crate) use timerfd::{TimerFd, TimerFdClock, TimerFdState, make_timerfd};
 #[cfg(feature = "perf-counters")]
 pub(crate) use vfs::BackendIoSnapshot;

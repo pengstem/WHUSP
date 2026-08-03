@@ -410,6 +410,7 @@ impl ProcessControlBlock {
             inner.did_exec_after_fork = true;
             inner.cmdline = args.clone();
             inner.comm = comm_from_cmdline(&args);
+            #[cfg(feature = "posix-timers")]
             inner.timers.clear_posix_after_exec();
             for action in inner.signal_actions.iter_mut() {
                 if action.has_user_handler() {

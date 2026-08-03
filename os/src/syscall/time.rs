@@ -6,10 +6,13 @@ use crate::task::{
     current_has_deliverable_signal, current_process, current_user_token, pid2process, schedule,
     task_with_linux_tid,
 };
+#[cfg(feature = "posix-timers")]
+use crate::timer::add_posix_timer;
+#[cfg(feature = "setitimer")]
+use crate::timer::add_real_timer;
 use crate::timer::{
-    add_posix_timer, add_real_timer, add_timer, get_time_clock_ticks, get_time_ms, get_time_us,
-    monotonic_time_nanos, monotonic_time_sec_nsec, set_wall_time_nanos, us_to_clock_ticks,
-    wall_time_nanos,
+    add_timer, get_time_clock_ticks, get_time_ms, get_time_us, monotonic_time_nanos,
+    monotonic_time_sec_nsec, set_wall_time_nanos, us_to_clock_ticks, wall_time_nanos,
 };
 use lazy_static::*;
 
@@ -38,11 +41,17 @@ const TIMER_ABSTIME: u32 = 1;
 const NSEC_PER_SEC: isize = 1_000_000_000;
 const NSEC_PER_MSEC: usize = 1_000_000;
 const USEC_PER_SEC: usize = 1_000_000;
+#[cfg(feature = "setitimer")]
 const ITIMER_REAL: i32 = 0;
+#[cfg(feature = "setitimer")]
 const ITIMER_VIRTUAL: i32 = 1;
+#[cfg(feature = "setitimer")]
 const ITIMER_PROF: i32 = 2;
+#[cfg(feature = "posix-timers")]
 const SIGEV_SIGNAL: i32 = 0;
+#[cfg(feature = "posix-timers")]
 const SIGEV_NONE: i32 = 1;
+#[cfg(feature = "posix-timers")]
 const SIGALRM: u32 = 14;
 const ADJ_OFFSET: u32 = 0x0001;
 const ADJ_FREQUENCY: u32 = 0x0002;
@@ -111,6 +120,7 @@ pub struct LinuxTms {
 }
 
 #[repr(C)]
+#[cfg(feature = "setitimer")]
 #[derive(Clone, Copy, Debug, Default)]
 struct LinuxITimerVal {
     it_interval: LinuxTimeVal,
@@ -118,6 +128,7 @@ struct LinuxITimerVal {
 }
 
 #[repr(C)]
+#[cfg(any(feature = "timerfd", feature = "posix-timers"))]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LinuxITimerSpec {
     pub(in crate::syscall) it_interval: LinuxTimeSpec,
@@ -125,6 +136,7 @@ pub(crate) struct LinuxITimerSpec {
 }
 
 #[repr(C)]
+#[cfg(feature = "posix-timers")]
 #[derive(Clone, Copy, Debug, Default)]
 struct LinuxSigeventPrefix {
     value: usize,
@@ -216,6 +228,7 @@ pub(crate) enum ClockBackend {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(feature = "setitimer")]
 enum ItimerKind {
     Real,
     Virtual,
@@ -234,6 +247,7 @@ enum ClockKind {
     Boottime,
 }
 
+#[cfg(feature = "setitimer")]
 impl ItimerKind {
     fn from_raw(which: i32) -> KResult<Self> {
         match which {
@@ -260,6 +274,7 @@ impl ClockKind {
         }
     }
 
+    #[cfg(feature = "posix-timers")]
     fn gettime_backend(self) -> KResult<ClockBackend> {
         match self {
             Self::Realtime | Self::RealtimeCoarse => Ok(ClockBackend::Wall),
@@ -360,6 +375,7 @@ pub(crate) fn nanos_to_us_ceil(nanos: u64) -> KResult<usize> {
     checked_div_ceil_u64(nanos, 1_000)
 }
 
+#[cfg(feature = "timerfd")]
 pub(crate) fn timespec_to_us_ceil(time: LinuxTimeSpec) -> KResult<usize> {
     nanos_to_us_ceil(timespec_to_nanos(time)?)
 }
@@ -397,6 +413,7 @@ fn timeval_to_us(time: LinuxTimeVal) -> KResult<usize> {
         .ok_or(Errno::EINVAL)
 }
 
+#[cfg(feature = "setitimer")]
 fn us_to_timeval(us: usize) -> LinuxTimeVal {
     LinuxTimeVal {
         tv_sec: (us / USEC_PER_SEC) as isize,
@@ -429,6 +446,7 @@ fn current_can_set_time() -> bool {
             .unwrap_or(false)
 }
 
+#[cfg(any(feature = "timerfd", feature = "posix-timers"))]
 pub(crate) fn itimerspec_from_us(interval_us: usize, value_us: usize) -> LinuxITimerSpec {
     LinuxITimerSpec {
         it_interval: us_to_timespec(interval_us),
@@ -436,6 +454,7 @@ pub(crate) fn itimerspec_from_us(interval_us: usize, value_us: usize) -> LinuxIT
     }
 }
 
+#[cfg(feature = "setitimer")]
 fn itimerval_from_us(interval_us: usize, value_us: usize) -> LinuxITimerVal {
     LinuxITimerVal {
         it_interval: us_to_timeval(interval_us),
@@ -443,6 +462,7 @@ fn itimerval_from_us(interval_us: usize, value_us: usize) -> LinuxITimerVal {
     }
 }
 
+#[cfg(feature = "posix-timers")]
 fn decode_sigevent_signal(sevp: *const u8) -> KResult<u32> {
     if sevp.is_null() {
         return Ok(SIGALRM);
@@ -461,6 +481,7 @@ fn decode_sigevent_signal(sevp: *const u8) -> KResult<u32> {
     }
 }
 
+#[cfg(feature = "posix-timers")]
 fn itimerspec_to_us(value: LinuxITimerSpec) -> KResult<(usize, usize)> {
     Ok((
         nanos_to_us_ceil(timespec_to_nanos(value.it_interval)?)?,
@@ -468,6 +489,7 @@ fn itimerspec_to_us(value: LinuxITimerSpec) -> KResult<(usize, usize)> {
     ))
 }
 
+#[cfg(feature = "posix-timers")]
 fn posix_timer_deadline_us(clock_id: i32, flags: i32, value_us: usize) -> KResult<usize> {
     if value_us == 0 {
         return Ok(0);
@@ -482,6 +504,7 @@ fn posix_timer_deadline_us(clock_id: i32, flags: i32, value_us: usize) -> KResul
     }
 }
 
+#[cfg(feature = "setitimer")]
 pub fn sys_getitimer(which: i32, value: *mut u8) -> KResult {
     let kind = ItimerKind::from_raw(which)?;
     if value.is_null() {
@@ -506,6 +529,7 @@ pub fn sys_getitimer(which: i32, value: *mut u8) -> KResult {
     Ok(0)
 }
 
+#[cfg(feature = "setitimer")]
 pub fn sys_setitimer(which: i32, value: *const u8, old_value: *mut u8) -> KResult {
     let kind = ItimerKind::from_raw(which)?;
     let token = current_user_token();
@@ -565,6 +589,7 @@ pub fn sys_setitimer(which: i32, value: *const u8, old_value: *mut u8) -> KResul
     Ok(0)
 }
 
+#[cfg(feature = "posix-timers")]
 pub fn sys_timer_create(clock_id: i32, sevp: *const u8, timerid: *mut i32) -> KResult {
     if timerid.is_null() {
         return Err(Errno::EFAULT);
@@ -582,6 +607,7 @@ pub fn sys_timer_create(clock_id: i32, sevp: *const u8, timerid: *mut i32) -> KR
     Ok(0)
 }
 
+#[cfg(feature = "posix-timers")]
 pub fn sys_timer_settime(
     timerid: i32,
     flags: i32,
@@ -615,6 +641,7 @@ pub fn sys_timer_settime(
     Ok(0)
 }
 
+#[cfg(feature = "posix-timers")]
 pub fn sys_timer_gettime(timerid: i32, curr_value: *mut LinuxITimerSpec) -> KResult {
     if timerid < 0 {
         return Err(Errno::EINVAL);
@@ -630,6 +657,7 @@ pub fn sys_timer_gettime(timerid: i32, curr_value: *mut LinuxITimerSpec) -> KRes
     Ok(0)
 }
 
+#[cfg(feature = "posix-timers")]
 pub fn sys_timer_getoverrun(timerid: i32) -> KResult {
     if timerid < 0 {
         return Err(Errno::EINVAL);
@@ -640,6 +668,7 @@ pub fn sys_timer_getoverrun(timerid: i32) -> KResult {
     Ok(0)
 }
 
+#[cfg(feature = "posix-timers")]
 pub fn sys_timer_delete(timerid: i32) -> KResult {
     if timerid < 0 {
         return Err(Errno::EINVAL);

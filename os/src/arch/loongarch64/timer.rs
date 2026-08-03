@@ -2,13 +2,13 @@ use core::cmp::Ordering;
 use core::sync::atomic::AtomicU64;
 
 use crate::config::clock_freq;
+#[cfg(feature = "timerfd")]
 use crate::fs::TimerFdState;
 use crate::sbi::set_timer;
 use crate::sync::SpinNoIrqLock;
-use crate::task::{
-    ProcessControlBlock, SignalFlags, SignalInfo, TaskControlBlock, queue_signal_to_task,
-    wakeup_timer_task,
-};
+#[cfg(any(feature = "setitimer", feature = "posix-timers"))]
+use crate::task::{ProcessControlBlock, SignalFlags, SignalInfo, queue_signal_to_task};
+use crate::task::{TaskControlBlock, wakeup_timer_task};
 use alloc::collections::BinaryHeap;
 use alloc::sync::{Arc, Weak};
 use lazy_static::*;
@@ -242,18 +242,21 @@ pub struct TimerCondVar {
     pub task: Weak<TaskControlBlock>,
 }
 
+#[cfg(feature = "timerfd")]
 pub struct TimerFdTimerEvent {
     pub expire_us: usize,
     pub generation: u64,
     pub state: Weak<TimerFdState>,
 }
 
+#[cfg(feature = "setitimer")]
 pub struct RealTimerEvent {
     pub expire_us: usize,
     pub generation: u64,
     pub process: Weak<ProcessControlBlock>,
 }
 
+#[cfg(feature = "posix-timers")]
 pub struct PosixTimerEvent {
     pub expire_us: usize,
     pub timer_id: usize,
@@ -281,20 +284,24 @@ impl Ord for TimerCondVar {
     }
 }
 
+#[cfg(feature = "timerfd")]
 impl PartialEq for TimerFdTimerEvent {
     fn eq(&self, other: &Self) -> bool {
         self.expire_us == other.expire_us && self.generation == other.generation
     }
 }
 
+#[cfg(feature = "timerfd")]
 impl Eq for TimerFdTimerEvent {}
 
+#[cfg(feature = "timerfd")]
 impl PartialOrd for TimerFdTimerEvent {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
+#[cfg(feature = "timerfd")]
 impl Ord for TimerFdTimerEvent {
     fn cmp(&self, other: &Self) -> Ordering {
         other
@@ -304,20 +311,24 @@ impl Ord for TimerFdTimerEvent {
     }
 }
 
+#[cfg(feature = "setitimer")]
 impl PartialEq for RealTimerEvent {
     fn eq(&self, other: &Self) -> bool {
         self.expire_us == other.expire_us && self.generation == other.generation
     }
 }
 
+#[cfg(feature = "setitimer")]
 impl Eq for RealTimerEvent {}
 
+#[cfg(feature = "setitimer")]
 impl PartialOrd for RealTimerEvent {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
+#[cfg(feature = "setitimer")]
 impl Ord for RealTimerEvent {
     fn cmp(&self, other: &Self) -> Ordering {
         other
@@ -327,6 +338,7 @@ impl Ord for RealTimerEvent {
     }
 }
 
+#[cfg(feature = "posix-timers")]
 impl PartialEq for PosixTimerEvent {
     fn eq(&self, other: &Self) -> bool {
         self.expire_us == other.expire_us
@@ -335,14 +347,17 @@ impl PartialEq for PosixTimerEvent {
     }
 }
 
+#[cfg(feature = "posix-timers")]
 impl Eq for PosixTimerEvent {}
 
+#[cfg(feature = "posix-timers")]
 impl PartialOrd for PosixTimerEvent {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
+#[cfg(feature = "posix-timers")]
 impl Ord for PosixTimerEvent {
     fn cmp(&self, other: &Self) -> Ordering {
         other
@@ -356,10 +371,22 @@ impl Ord for PosixTimerEvent {
 lazy_static! {
     static ref TIMERS: SpinNoIrqLock<BinaryHeap<TimerCondVar>> =
         SpinNoIrqLock::new(BinaryHeap::<TimerCondVar>::new());
+}
+
+#[cfg(feature = "timerfd")]
+lazy_static! {
     static ref TIMERFD_TIMERS: SpinNoIrqLock<BinaryHeap<TimerFdTimerEvent>> =
         SpinNoIrqLock::new(BinaryHeap::<TimerFdTimerEvent>::new());
+}
+
+#[cfg(feature = "setitimer")]
+lazy_static! {
     static ref REAL_TIMERS: SpinNoIrqLock<BinaryHeap<RealTimerEvent>> =
         SpinNoIrqLock::new(BinaryHeap::<RealTimerEvent>::new());
+}
+
+#[cfg(feature = "posix-timers")]
+lazy_static! {
     static ref POSIX_TIMERS: SpinNoIrqLock<BinaryHeap<PosixTimerEvent>> =
         SpinNoIrqLock::new(BinaryHeap::<PosixTimerEvent>::new());
 }
@@ -372,6 +399,7 @@ pub fn add_timer(expire_ms: usize, task: Arc<TaskControlBlock>) {
     });
 }
 
+#[cfg(feature = "timerfd")]
 pub fn add_timerfd_timer(expire_us: usize, generation: u64, state: Arc<TimerFdState>) {
     TIMERFD_TIMERS.lock().push(TimerFdTimerEvent {
         expire_us,
@@ -380,6 +408,7 @@ pub fn add_timerfd_timer(expire_us: usize, generation: u64, state: Arc<TimerFdSt
     });
 }
 
+#[cfg(feature = "setitimer")]
 pub fn add_real_timer(expire_us: usize, generation: u64, process: Arc<ProcessControlBlock>) {
     let mut timers = REAL_TIMERS.lock();
     timers.push(RealTimerEvent {
@@ -389,6 +418,7 @@ pub fn add_real_timer(expire_us: usize, generation: u64, process: Arc<ProcessCon
     });
 }
 
+#[cfg(feature = "posix-timers")]
 pub fn add_posix_timer(
     expire_us: usize,
     timer_id: usize,
@@ -404,6 +434,7 @@ pub fn add_posix_timer(
     });
 }
 
+#[cfg(feature = "setitimer")]
 fn check_real_timers(current_us: usize) {
     loop {
         let event = {
@@ -430,6 +461,7 @@ fn check_real_timers(current_us: usize) {
     }
 }
 
+#[cfg(feature = "posix-timers")]
 fn check_posix_timers(current_us: usize) {
     loop {
         let event = {
@@ -460,6 +492,28 @@ fn check_posix_timers(current_us: usize) {
     }
 }
 
+#[cfg(feature = "timerfd")]
+fn check_timerfd_timers(current_us: usize) {
+    loop {
+        let event = {
+            let mut timers = TIMERFD_TIMERS.lock();
+            match timers.peek() {
+                Some(event) if event.expire_us <= current_us => timers.pop(),
+                _ => None,
+            }
+        };
+        let Some(event) = event else {
+            break;
+        };
+        let Some(state) = event.state.upgrade() else {
+            continue;
+        };
+        if let Some((next_expire_us, generation)) = state.expire(event.generation, current_us) {
+            add_timerfd_timer(next_expire_us, generation, state);
+        }
+    }
+}
+
 pub fn check_timer() {
     assert!(
         crate::cpu::is_timer_expiry_owner(),
@@ -483,25 +537,12 @@ pub fn check_timer() {
             wakeup_timer_task(task);
         }
     }
+    #[cfg(any(feature = "timerfd", feature = "setitimer", feature = "posix-timers"))]
     let current_us = get_time_us();
-    loop {
-        let event = {
-            let mut timers = TIMERFD_TIMERS.lock();
-            match timers.peek() {
-                Some(event) if event.expire_us <= current_us => timers.pop(),
-                _ => None,
-            }
-        };
-        let Some(event) = event else {
-            break;
-        };
-        let Some(state) = event.state.upgrade() else {
-            continue;
-        };
-        if let Some((next_expire_us, generation)) = state.expire(event.generation, current_us) {
-            add_timerfd_timer(next_expire_us, generation, state);
-        }
-    }
+    #[cfg(feature = "timerfd")]
+    check_timerfd_timers(current_us);
+    #[cfg(feature = "setitimer")]
     check_real_timers(current_us);
+    #[cfg(feature = "posix-timers")]
     check_posix_timers(current_us);
 }

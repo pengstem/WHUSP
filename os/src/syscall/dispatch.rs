@@ -407,13 +407,16 @@ pub(crate) fn syscall_with_context(
         SYSCALL_SYNCFS => sys_syncfs(args[0]),
         SYSCALL_INIT_MODULE => sys_init_module(args[0] as *const u8, args[1], args[2] as *const u8),
         SYSCALL_DELETE_MODULE => sys_delete_module(args[0] as *const u8, args[1] as u32),
+        #[cfg(feature = "timerfd")]
         SYSCALL_TIMERFD_CREATE => sys_timerfd_create(args[0] as i32, args[1] as u32),
+        #[cfg(feature = "timerfd")]
         SYSCALL_TIMERFD_SETTIME => sys_timerfd_settime(
             args[0] as i32,
             args[1] as u32,
             args[2] as *const LinuxITimerSpec,
             args[3] as *mut LinuxITimerSpec,
         ),
+        #[cfg(feature = "timerfd")]
         SYSCALL_TIMERFD_GETTIME => {
             sys_timerfd_gettime(args[0] as i32, args[1] as *mut LinuxITimerSpec)
         }
@@ -469,21 +472,28 @@ pub(crate) fn syscall_with_context(
             args[0] as *const LinuxTimeSpec,
             args[1] as *mut LinuxTimeSpec,
         ),
+        #[cfg(feature = "setitimer")]
         SYSCALL_GETITIMER => sys_getitimer(args[0] as i32, args[1] as *mut u8),
+        #[cfg(feature = "setitimer")]
         SYSCALL_SETITIMER => {
             sys_setitimer(args[0] as i32, args[1] as *const u8, args[2] as *mut u8)
         }
+        #[cfg(feature = "posix-timers")]
         SYSCALL_TIMER_CREATE => {
             sys_timer_create(args[0] as i32, args[1] as *const u8, args[2] as *mut i32)
         }
+        #[cfg(feature = "posix-timers")]
         SYSCALL_TIMER_GETTIME => sys_timer_gettime(args[0] as i32, args[1] as *mut _),
+        #[cfg(feature = "posix-timers")]
         SYSCALL_TIMER_GETOVERRUN => sys_timer_getoverrun(args[0] as i32),
+        #[cfg(feature = "posix-timers")]
         SYSCALL_TIMER_SETTIME => sys_timer_settime(
             args[0] as i32,
             args[1] as i32,
             args[2] as *const _,
             args[3] as *mut _,
         ),
+        #[cfg(feature = "posix-timers")]
         SYSCALL_TIMER_DELETE => sys_timer_delete(args[0] as i32),
         SYSCALL_CLOCK_SETTIME => sys_clock_settime(args[0] as i32, args[1] as *const LinuxTimeSpec),
         SYSCALL_CLOCK_GETTIME => {

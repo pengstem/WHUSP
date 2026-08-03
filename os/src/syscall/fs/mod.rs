@@ -3,6 +3,7 @@ mod eventfd;
 #[cfg(feature = "fanotify")]
 mod fanotify;
 mod fd;
+#[cfg(feature = "timerfd")]
 mod fd_compat;
 mod fd_lock;
 mod file_handle;
@@ -35,6 +36,7 @@ pub use fd::{
     sys_close_ctx, sys_close_range, sys_dup, sys_dup3, sys_fcntl_ctx, sys_flock, sys_memfd_create,
     sys_pipe2_ctx,
 };
+#[cfg(feature = "timerfd")]
 pub use fd_compat::{sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime};
 pub(crate) use fd_lock::release_record_locks_for_process;
 pub use file_handle::{sys_name_to_handle_at, sys_open_by_handle_at};
