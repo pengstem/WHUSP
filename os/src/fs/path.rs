@@ -98,6 +98,7 @@ impl PathContext {
         self.cwd_path.as_str()
     }
 
+    #[cfg(feature = "staticfs")]
     pub(crate) fn is_global_root(&self) -> bool {
         self.namespace_id == ROOT_MOUNT_NAMESPACE && self.root == WorkingDir::root()
     }

@@ -13,27 +13,8 @@ use alloc::vec::Vec;
 use core::any::Any;
 use lazy_static::lazy_static;
 
-// CONTEXT: Staticfs is a small compatibility overlay for procfs/sysfs-style
-// nodes that userspace cannot create on the writable EXT4 root filesystem.
-// Ordinary files such as `/etc/*` and module metadata are installed from the
-// generated script disk instead.
-const PROC_BUS_INPUT_DEVICES: &[u8] =
-    b"I: Bus=0003 Vendor=0001 Product=0001 Version=0001\nN: Name=\"virtual-device-ltp\"\n";
-const SYS_INPUT0_NAME: &[u8] = b"virtual-device-ltp\n";
-const PROC_RANDOM_ENTROPY_AVAIL: &[u8] = b"256\n";
-const SYS_DEV_BLOCK_TMPFS_UEVENT: &[u8] = b"DEVNAME=loop0\n";
-const SYS_NET_LO_ADDRESS: &[u8] = b"00:00:00:00:00:00\n";
-const SYS_NET_VETH1_ADDRESS: &[u8] = b"02:00:00:00:00:0a\n";
-const SYS_NET_VETH2_ADDRESS: &[u8] = b"02:00:00:00:00:0b\n";
-const SYS_NET_LO_MTU: &[u8] = b"65536\n";
-const SYS_NET_VETH_MTU: &[u8] = b"1500\n";
-const SYS_NET_LO_OPERSTATE: &[u8] = b"unknown\n";
-const SYS_NET_VETH_OPERSTATE: &[u8] = b"up\n";
-const SYS_NET_LO_FLAGS: &[u8] = b"0x49\n";
-const SYS_NET_VETH_FLAGS: &[u8] = b"0x41\n";
-const SYS_NET_LO_IFINDEX: &[u8] = b"1\n";
-const SYS_NET_VETH1_IFINDEX: &[u8] = b"10\n";
-const SYS_NET_VETH2_IFINDEX: &[u8] = b"11\n";
+// CONTEXT: The opt-in LTP compatibility overlay exposes only values backed by
+// live kernel state. Ordinary static files belong on the generated script disk.
 
 lazy_static! {
     static ref STATICFS_TIMESTAMP: FileTimestamp = FileTimestamp::now();
@@ -45,17 +26,10 @@ enum StaticNode {
     SysBlockDir,
     SysLoop0Dir,
     SysLoopInnerDir,
-    SysDevDir,
-    SysDevBlockDir,
-    SysDevBlockTmpfsDir,
     SysClassDir,
     SysClassBlockDir,
-    SysClassNetDir,
     SysClassLoop0Dir,
     SysClassLoop0BdiDir,
-    SysClassNetLoDir,
-    SysClassNetVeth1Dir,
-    SysClassNetVeth2Dir,
     SysDevicesDir,
     SysDevicesSystemDir,
     SysCpuRootDir,
@@ -64,12 +38,6 @@ enum StaticNode {
     SysCpuPresent,
     SysCpuKernelMax,
     SysCpuDir(usize),
-    SysDevicesVirtualDir,
-    SysDevicesVirtualInputDir,
-    SysInput0Dir,
-    ProcBusInputDevices,
-    SysInput0Name,
-    ProcRandomEntropyAvail,
     SysLoopSize,
     SysLoopReadOnly,
     SysLoopStat,
@@ -82,22 +50,6 @@ enum StaticNode {
     SysLoopLogicalBlockSize,
     SysLoopDmaAlignment,
     SysLoopReadAheadKb,
-    SysDevBlockTmpfsUevent,
-    SysClassNetLoAddress,
-    SysClassNetLoMtu,
-    SysClassNetLoOperstate,
-    SysClassNetLoFlags,
-    SysClassNetLoIfindex,
-    SysClassNetVeth1Address,
-    SysClassNetVeth1Mtu,
-    SysClassNetVeth1Operstate,
-    SysClassNetVeth1Flags,
-    SysClassNetVeth1Ifindex,
-    SysClassNetVeth2Address,
-    SysClassNetVeth2Mtu,
-    SysClassNetVeth2Operstate,
-    SysClassNetVeth2Flags,
-    SysClassNetVeth2Ifindex,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -254,38 +206,6 @@ const STATIC_NODE_DESCS: &[StaticNodeDesc] = &[
         name: "stat",
     },
     StaticNodeDesc {
-        node: StaticNode::SysDevDir,
-        path: "/sys/dev",
-        ino: 31,
-        kind: StaticNodeKind::Dir,
-        parent: Some(StaticNode::SysDir),
-        name: "dev",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysDevBlockDir,
-        path: "/sys/dev/block",
-        ino: 32,
-        kind: StaticNodeKind::Dir,
-        parent: Some(StaticNode::SysDevDir),
-        name: "block",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysDevBlockTmpfsDir,
-        path: "/sys/dev/block/254:0",
-        ino: 37,
-        kind: StaticNodeKind::Dir,
-        parent: Some(StaticNode::SysDevBlockDir),
-        name: "254:0",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysDevBlockTmpfsUevent,
-        path: "/sys/dev/block/254:0/uevent",
-        ino: 38,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysDevBlockTmpfsDir),
-        name: "uevent",
-    },
-    StaticNodeDesc {
         node: StaticNode::SysClassDir,
         path: "/sys/class",
         ino: 43,
@@ -324,158 +244,6 @@ const STATIC_NODE_DESCS: &[StaticNodeDesc] = &[
         kind: StaticNodeKind::File,
         parent: Some(StaticNode::SysClassLoop0BdiDir),
         name: "read_ahead_kb",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetDir,
-        path: "/sys/class/net",
-        ino: 57,
-        kind: StaticNodeKind::Dir,
-        parent: Some(StaticNode::SysClassDir),
-        name: "net",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetLoDir,
-        path: "/sys/class/net/lo",
-        ino: 58,
-        kind: StaticNodeKind::Dir,
-        parent: Some(StaticNode::SysClassNetDir),
-        name: "lo",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetLoAddress,
-        path: "/sys/class/net/lo/address",
-        ino: 61,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysClassNetLoDir),
-        name: "address",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetLoMtu,
-        path: "/sys/class/net/lo/mtu",
-        ino: 62,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysClassNetLoDir),
-        name: "mtu",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetLoOperstate,
-        path: "/sys/class/net/lo/operstate",
-        ino: 63,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysClassNetLoDir),
-        name: "operstate",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetLoFlags,
-        path: "/sys/class/net/lo/flags",
-        ino: 64,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysClassNetLoDir),
-        name: "flags",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetLoIfindex,
-        path: "/sys/class/net/lo/ifindex",
-        ino: 65,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysClassNetLoDir),
-        name: "ifindex",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetVeth1Dir,
-        path: "/sys/class/net/ltp_ns_veth1",
-        ino: 59,
-        kind: StaticNodeKind::Dir,
-        parent: Some(StaticNode::SysClassNetDir),
-        name: "ltp_ns_veth1",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetVeth1Address,
-        path: "/sys/class/net/ltp_ns_veth1/address",
-        ino: 66,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysClassNetVeth1Dir),
-        name: "address",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetVeth1Mtu,
-        path: "/sys/class/net/ltp_ns_veth1/mtu",
-        ino: 67,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysClassNetVeth1Dir),
-        name: "mtu",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetVeth1Operstate,
-        path: "/sys/class/net/ltp_ns_veth1/operstate",
-        ino: 68,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysClassNetVeth1Dir),
-        name: "operstate",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetVeth1Flags,
-        path: "/sys/class/net/ltp_ns_veth1/flags",
-        ino: 69,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysClassNetVeth1Dir),
-        name: "flags",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetVeth1Ifindex,
-        path: "/sys/class/net/ltp_ns_veth1/ifindex",
-        ino: 70,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysClassNetVeth1Dir),
-        name: "ifindex",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetVeth2Dir,
-        path: "/sys/class/net/ltp_ns_veth2",
-        ino: 60,
-        kind: StaticNodeKind::Dir,
-        parent: Some(StaticNode::SysClassNetDir),
-        name: "ltp_ns_veth2",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetVeth2Address,
-        path: "/sys/class/net/ltp_ns_veth2/address",
-        ino: 71,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysClassNetVeth2Dir),
-        name: "address",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetVeth2Mtu,
-        path: "/sys/class/net/ltp_ns_veth2/mtu",
-        ino: 72,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysClassNetVeth2Dir),
-        name: "mtu",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetVeth2Operstate,
-        path: "/sys/class/net/ltp_ns_veth2/operstate",
-        ino: 73,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysClassNetVeth2Dir),
-        name: "operstate",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetVeth2Flags,
-        path: "/sys/class/net/ltp_ns_veth2/flags",
-        ino: 74,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysClassNetVeth2Dir),
-        name: "flags",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysClassNetVeth2Ifindex,
-        path: "/sys/class/net/ltp_ns_veth2/ifindex",
-        ino: 75,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysClassNetVeth2Dir),
-        name: "ifindex",
     },
     StaticNodeDesc {
         node: StaticNode::SysDevicesDir,
@@ -532,54 +300,6 @@ const STATIC_NODE_DESCS: &[StaticNodeDesc] = &[
         kind: StaticNodeKind::File,
         parent: Some(StaticNode::SysCpuRootDir),
         name: "kernel_max",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysDevicesVirtualDir,
-        path: "/sys/devices/virtual",
-        ino: 34,
-        kind: StaticNodeKind::Dir,
-        parent: Some(StaticNode::SysDevicesDir),
-        name: "virtual",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysDevicesVirtualInputDir,
-        path: "/sys/devices/virtual/input",
-        ino: 35,
-        kind: StaticNodeKind::Dir,
-        parent: Some(StaticNode::SysDevicesVirtualDir),
-        name: "input",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysInput0Dir,
-        path: "/sys/devices/virtual/input/input0",
-        ino: 36,
-        kind: StaticNodeKind::Dir,
-        parent: Some(StaticNode::SysDevicesVirtualInputDir),
-        name: "input0",
-    },
-    StaticNodeDesc {
-        node: StaticNode::SysInput0Name,
-        path: "/sys/devices/virtual/input/input0/name",
-        ino: 13,
-        kind: StaticNodeKind::File,
-        parent: Some(StaticNode::SysInput0Dir),
-        name: "name",
-    },
-    StaticNodeDesc {
-        node: StaticNode::ProcBusInputDevices,
-        path: "/proc/bus/input/devices",
-        ino: 12,
-        kind: StaticNodeKind::File,
-        parent: None,
-        name: "devices",
-    },
-    StaticNodeDesc {
-        node: StaticNode::ProcRandomEntropyAvail,
-        path: "/proc/sys/kernel/random/entropy_avail",
-        ino: 14,
-        kind: StaticNodeKind::File,
-        parent: None,
-        name: "entropy_avail",
     },
 ];
 
@@ -699,9 +419,6 @@ fn content_len(node: StaticNode) -> usize {
             cpu_list_len(crate::cpu::topology().possible_mask())
         }
         StaticNode::SysCpuKernelMax => decimal_len((crate::config::MAX_CPUS - 1) as u64) + 1,
-        StaticNode::ProcBusInputDevices => PROC_BUS_INPUT_DEVICES.len(),
-        StaticNode::SysInput0Name => SYS_INPUT0_NAME.len(),
-        StaticNode::ProcRandomEntropyAvail => PROC_RANDOM_ENTROPY_AVAIL.len(),
         StaticNode::SysLoopSize => {
             super::devfs::loop_device_sysfs_content_len("/sys/block/loop0/size").unwrap_or(0)
         }
@@ -742,22 +459,6 @@ fn content_len(node: StaticNode) -> usize {
             super::devfs::loop_device_sysfs_content_len("/sys/class/block/loop0/bdi/read_ahead_kb")
                 .unwrap_or(0)
         }
-        StaticNode::SysDevBlockTmpfsUevent => SYS_DEV_BLOCK_TMPFS_UEVENT.len(),
-        StaticNode::SysClassNetLoAddress => SYS_NET_LO_ADDRESS.len(),
-        StaticNode::SysClassNetLoMtu => SYS_NET_LO_MTU.len(),
-        StaticNode::SysClassNetLoOperstate => SYS_NET_LO_OPERSTATE.len(),
-        StaticNode::SysClassNetLoFlags => SYS_NET_LO_FLAGS.len(),
-        StaticNode::SysClassNetLoIfindex => SYS_NET_LO_IFINDEX.len(),
-        StaticNode::SysClassNetVeth1Address => SYS_NET_VETH1_ADDRESS.len(),
-        StaticNode::SysClassNetVeth1Mtu => SYS_NET_VETH_MTU.len(),
-        StaticNode::SysClassNetVeth1Operstate => SYS_NET_VETH_OPERSTATE.len(),
-        StaticNode::SysClassNetVeth1Flags => SYS_NET_VETH_FLAGS.len(),
-        StaticNode::SysClassNetVeth1Ifindex => SYS_NET_VETH1_IFINDEX.len(),
-        StaticNode::SysClassNetVeth2Address => SYS_NET_VETH2_ADDRESS.len(),
-        StaticNode::SysClassNetVeth2Mtu => SYS_NET_VETH_MTU.len(),
-        StaticNode::SysClassNetVeth2Operstate => SYS_NET_VETH_OPERSTATE.len(),
-        StaticNode::SysClassNetVeth2Flags => SYS_NET_VETH_FLAGS.len(),
-        StaticNode::SysClassNetVeth2Ifindex => SYS_NET_VETH2_IFINDEX.len(),
         _ => 0,
     }
 }
@@ -771,9 +472,6 @@ fn content(node: StaticNode) -> Option<Cow<'static, [u8]>> {
         StaticNode::SysCpuKernelMax => Some(Cow::Owned(
             format!("{}\n", crate::config::MAX_CPUS - 1).into_bytes(),
         )),
-        StaticNode::ProcBusInputDevices => Some(Cow::Borrowed(PROC_BUS_INPUT_DEVICES)),
-        StaticNode::SysInput0Name => Some(Cow::Borrowed(SYS_INPUT0_NAME)),
-        StaticNode::ProcRandomEntropyAvail => Some(Cow::Borrowed(PROC_RANDOM_ENTROPY_AVAIL)),
         StaticNode::SysLoopSize => {
             super::devfs::loop_device_sysfs_content("/sys/block/loop0/size").map(Cow::Owned)
         }
@@ -814,22 +512,6 @@ fn content(node: StaticNode) -> Option<Cow<'static, [u8]>> {
             super::devfs::loop_device_sysfs_content("/sys/class/block/loop0/bdi/read_ahead_kb")
                 .map(Cow::Owned)
         }
-        StaticNode::SysDevBlockTmpfsUevent => Some(Cow::Borrowed(SYS_DEV_BLOCK_TMPFS_UEVENT)),
-        StaticNode::SysClassNetLoAddress => Some(Cow::Borrowed(SYS_NET_LO_ADDRESS)),
-        StaticNode::SysClassNetLoMtu => Some(Cow::Borrowed(SYS_NET_LO_MTU)),
-        StaticNode::SysClassNetLoOperstate => Some(Cow::Borrowed(SYS_NET_LO_OPERSTATE)),
-        StaticNode::SysClassNetLoFlags => Some(Cow::Borrowed(SYS_NET_LO_FLAGS)),
-        StaticNode::SysClassNetLoIfindex => Some(Cow::Borrowed(SYS_NET_LO_IFINDEX)),
-        StaticNode::SysClassNetVeth1Address => Some(Cow::Borrowed(SYS_NET_VETH1_ADDRESS)),
-        StaticNode::SysClassNetVeth1Mtu => Some(Cow::Borrowed(SYS_NET_VETH_MTU)),
-        StaticNode::SysClassNetVeth1Operstate => Some(Cow::Borrowed(SYS_NET_VETH_OPERSTATE)),
-        StaticNode::SysClassNetVeth1Flags => Some(Cow::Borrowed(SYS_NET_VETH_FLAGS)),
-        StaticNode::SysClassNetVeth1Ifindex => Some(Cow::Borrowed(SYS_NET_VETH1_IFINDEX)),
-        StaticNode::SysClassNetVeth2Address => Some(Cow::Borrowed(SYS_NET_VETH2_ADDRESS)),
-        StaticNode::SysClassNetVeth2Mtu => Some(Cow::Borrowed(SYS_NET_VETH_MTU)),
-        StaticNode::SysClassNetVeth2Operstate => Some(Cow::Borrowed(SYS_NET_VETH_OPERSTATE)),
-        StaticNode::SysClassNetVeth2Flags => Some(Cow::Borrowed(SYS_NET_VETH_FLAGS)),
-        StaticNode::SysClassNetVeth2Ifindex => Some(Cow::Borrowed(SYS_NET_VETH2_IFINDEX)),
         _ => None,
     }
 }

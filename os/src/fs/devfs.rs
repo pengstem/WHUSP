@@ -1600,6 +1600,7 @@ pub(crate) fn loop_device_change_fd(
     Ok(())
 }
 
+#[cfg(feature = "staticfs")]
 fn decimal_len(mut value: u64) -> usize {
     let mut len = 1;
     while value >= 10 {
@@ -1609,6 +1610,7 @@ fn decimal_len(mut value: u64) -> usize {
     len
 }
 
+#[cfg(feature = "staticfs")]
 pub(crate) fn loop_device_sysfs_content_len(path: &str) -> Option<usize> {
     match path {
         "/sys/block/loop0/size" => Some(decimal_len(loop_device_visible_size(0).ok()? / 512) + 1),

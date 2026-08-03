@@ -1,11 +1,13 @@
 #[cfg(any(feature = "fanotify", feature = "inotify"))]
 use crate::fs::open_file_in;
+#[cfg(feature = "staticfs")]
+use crate::fs::stat_static_path;
 use crate::fs::{
     FileStat, FileSystemStat, FsNodeKind, MountId, OpenFlags, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
     S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, VfsNodeId, chmod_in, chown_in, fsid_for_mount,
     lookup_path_in, mount_is_read_only, nfs_compat_source_path, stat_devfs_child,
     stat_devfs_input_child, stat_devfs_misc_child, stat_devfs_net_child, stat_devfs_pts_child,
-    stat_direct_regular_child_in, stat_full_in, stat_in, stat_static_path, statfs_for_mount,
+    stat_direct_regular_child_in, stat_full_in, stat_in, statfs_for_mount,
 };
 use crate::perf;
 use crate::sync::SleepMutex;
@@ -22,9 +24,11 @@ use super::fanotify::fanotify_notify_attrib;
 use super::fd::{get_fd_entry_by_fd, get_fd_entry_by_fd_for_process, get_file_by_fd};
 #[cfg(feature = "inotify")]
 use super::inotify::inotify_notify_attrib;
+#[cfg(feature = "staticfs")]
+use super::path::static_path_probe_may_hit;
 use super::path::{
     AtPath, check_access_path_prefixes_for_process, check_current_access_path_prefixes_from,
-    normalize_path_from, path_context_from, resolve_at_path, static_path_probe_may_hit,
+    normalize_path_from, path_context_from, resolve_at_path,
 };
 use super::uapi::{
     AT_EMPTY_PATH, AT_FDCWD, AT_STATX_DONT_SYNC, AT_STATX_FORCE_SYNC, AT_SYMLINK_NOFOLLOW,
@@ -137,6 +141,7 @@ fn resolve_stat_from_with(
             return stat.ok_or(Errno::ENOENT);
         }
     }
+    #[cfg(feature = "staticfs")]
     if static_path_probe_may_hit(snapshot, dirfd, path) {
         let _profile_scope = perf::time_scope(perf::ProfilePoint::StatPathStaticPath);
         if let Ok(global_path) = normalize_path_from(snapshot, dirfd, path)

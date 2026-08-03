@@ -14,6 +14,7 @@ mod overlayfs;
 mod path;
 mod pipe;
 mod procfs;
+#[cfg(feature = "staticfs")]
 mod staticfs;
 mod status_flags;
 mod stdio;
@@ -683,6 +684,7 @@ pub trait File: Send + Sync {
 }
 
 pub fn init() {
+    #[cfg(feature = "staticfs")]
     staticfs::init();
     mount::init_mounts();
 }
@@ -740,6 +742,7 @@ pub(crate) use procfs::{
     proc_namespace_stat_ino,
 };
 pub(crate) use procfs::{note_readahead as procfs_note_readahead, pipe_max_size};
+#[cfg(feature = "staticfs")]
 pub(crate) use staticfs::{open_path as open_static_path, stat_path as stat_static_path};
 pub use stdio::{Stdin, Stdout};
 pub(crate) use vfs::VfsNodeId;

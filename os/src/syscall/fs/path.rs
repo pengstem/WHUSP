@@ -33,10 +33,11 @@ use crate::fs::{
     link_open_file_in, lookup_dir_with_stat_in, lookup_dir_with_stat_path_in, mkdir_in,
     mount_is_read_only, normalize_path_at_root, open_devfs_child, open_devfs_input_child,
     open_devfs_misc_child, open_devfs_net_child, open_devfs_pts_child, open_file_in,
-    open_file_in_with_attrs, open_static_path, open_tmpfile_in_with_attrs, path_inside_root,
-    rename_exchange_in, rename_in, rmdir_in, stat_static_path, symlink_in, truncate_in, tty_attach,
-    tty_for_session, unlink_file_in,
+    open_file_in_with_attrs, open_tmpfile_in_with_attrs, path_inside_root, rename_exchange_in,
+    rename_in, rmdir_in, symlink_in, truncate_in, tty_attach, tty_for_session, unlink_file_in,
 };
+#[cfg(feature = "staticfs")]
+use crate::fs::{open_static_path, stat_static_path};
 use crate::mm::UserBuffer;
 use crate::task::{
     CAP_SYS_CHROOT, PathSnapshot, ProcessControlBlock, current_process, current_user_token,
@@ -189,10 +190,12 @@ fn process_global_path_for(snapshot: &PathSnapshot, path: &str) -> Option<String
     )
 }
 
+#[cfg(feature = "staticfs")]
 fn path_component_is_static_root(component: &str) -> bool {
-    matches!(component, "proc" | "sys")
+    component == "sys"
 }
 
+#[cfg(feature = "staticfs")]
 fn path_has_parent_component(path: &str) -> bool {
     if !path.as_bytes().contains(&b'.') {
         return false;
@@ -200,16 +203,18 @@ fn path_has_parent_component(path: &str) -> bool {
     path.split('/').any(|component| component == "..")
 }
 
+#[cfg(feature = "staticfs")]
 fn path_under_static_root(path: &str) -> bool {
-    path.starts_with("/proc/") || path == "/proc" || path.starts_with("/sys/") || path == "/sys"
+    path.starts_with("/sys/") || path == "/sys"
 }
 
-/// Returns whether lexical normalization could reach a static `/proc` or
-/// `/sys` compatibility node.
+/// Returns whether lexical normalization could reach a static `/sys`
+/// compatibility node.
 ///
 /// This deliberately stays conservative for dirfd and `..` paths. The common
 /// EXT4 case (a plain relative path below a non-static cwd) avoids allocating a
 /// process-global path merely to miss staticfs.
+#[cfg(feature = "staticfs")]
 pub(crate) fn static_path_probe_may_hit(snapshot: &PathSnapshot, dirfd: isize, path: &str) -> bool {
     if path_has_parent_component(path) {
         return true;
@@ -714,8 +719,9 @@ fn do_openat_for_process(
         return install_opened_file(process, file, flags, None);
     }
     // Static compatibility lookup and notification features need a normalized
-    // process-global path before VFS open. Ordinary EXT4 opens defer this work
-    // until the opened file is known to be a directory.
+    // process-global path before VFS open. Without either feature, ordinary
+    // EXT4 opens defer this work until the opened file is known to be a directory.
+    #[cfg(feature = "staticfs")]
     let eager_path = if static_path_probe_may_hit(&snapshot, dirfd, path)
         || cfg!(any(feature = "fanotify", feature = "inotify"))
     {
@@ -723,10 +729,18 @@ fn do_openat_for_process(
     } else {
         None
     };
+    #[cfg(all(
+        not(feature = "staticfs"),
+        any(feature = "fanotify", feature = "inotify")
+    ))]
+    let eager_path = openat_dir_path(&snapshot, dirfd, path)?;
+    #[cfg(not(any(feature = "staticfs", feature = "fanotify", feature = "inotify")))]
+    let eager_path: Option<String> = None;
+    #[cfg(feature = "staticfs")]
     if let Some(path) = eager_path.as_deref()
         && let Some(file) = open_static_path(path, flags)?
     {
-        // CONTEXT: Static /proc and /sys compatibility files are keyed by the
+        // CONTEXT: Static /sys compatibility files are keyed by the
         // normalized process-global path before the dynamic VFS lookup. A
         // chrooted process sees only aliases explicitly registered under its
         // normalized root path and cannot reach host-root compatibility nodes.
@@ -1112,6 +1126,7 @@ pub fn sys_chdir(path: *const u8) -> KResult {
     let credentials = process.credentials();
     let subject = AccessSubject::from_fs_credentials(&credentials);
     check_access_path_prefixes_from(&snapshot, AT_FDCWD, path.as_str(), subject)?;
+    #[cfg(feature = "staticfs")]
     if snapshot.context.is_global_root()
         && let Some(next_path) = process_global_path_for(&snapshot, path.as_str())
         && let Some(stat) = stat_static_path(next_path.as_str())
