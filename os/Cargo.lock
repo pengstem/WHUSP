@@ -215,25 +215,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "os"
-version = "0.1.1"
-dependencies = [
- "bitflags 2.11.1",
- "buddy_system_allocator",
- "fatfs",
- "fdt",
- "lazy_static",
- "log",
- "loongArch64",
- "lwext4_rust",
- "riscv",
- "sbi-rt",
- "virtio-drivers",
- "volatile",
- "xmas-elf",
-]
-
-[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -441,6 +422,25 @@ name = "volatile"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af8ca9a5d4debca0633e697c88269395493cebf2e10db21ca2dbde37c1356452"
+
+[[package]]
+name = "whusp"
+version = "0.1.1"
+dependencies = [
+ "bitflags 2.11.1",
+ "buddy_system_allocator",
+ "fatfs",
+ "fdt",
+ "lazy_static",
+ "log",
+ "loongArch64",
+ "lwext4_rust",
+ "riscv",
+ "sbi-rt",
+ "virtio-drivers",
+ "volatile",
+ "xmas-elf",
+]
 
 [[package]]
 name = "windows-link"

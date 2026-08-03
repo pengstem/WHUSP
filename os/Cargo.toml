@@ -1,7 +1,10 @@
 [package]
-name = "os"
+name = "whusp"
 version = "0.1.1"
-authors = ["Pengsteam <2285566738@qq.com>"]
+authors = [
+    "Pengsteam <2285566738@qq.com>",
+    "Yifan Wu <shinbokuow@163.com>",
+]
 edition = "2024"
 
 [features]
@@ -51,5 +54,6 @@ codegen-units = 1
 
 [[bin]]
 name = "os"
+path = "src/main.rs"
 test = false
 bench = false
