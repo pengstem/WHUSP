@@ -59,7 +59,7 @@ fn parse_virtio_block_source(source: &str) -> KResult<VirtioBlockSource> {
     }
     if bytes.len() > 1 && bytes[0].is_ascii_lowercase() && bytes[1..].iter().all(u8::is_ascii_digit)
     {
-        let partition_index = source[8..].parse::<usize>().map_err(|_| Errno::ENODEV)?;
+        let partition_index = suffix[1..].parse::<usize>().map_err(|_| Errno::ENODEV)?;
         return Ok(VirtioBlockSource {
             device_index: (bytes[0] - b'a') as usize,
             partition_index: Some(partition_index),
@@ -87,10 +87,9 @@ fn mount_error_to_errno(error: MountError) -> Errno {
     }
 }
 
-fn apply_mount_stat_flags(mount_id: MountId, flags: usize) -> KResult {
+fn apply_mount_stat_flags(mount_id: MountId, flags: usize) -> KResult<()> {
     set_mount_stat_flags(mount_id, mount_stat_flags_from_linux_mount_flags(flags))
         .map_err(mount_error_to_errno)
-        .map(|_| 0)
 }
 
 fn source_node_kind(snapshot: &crate::task::PathSnapshot, source: &str) -> Option<FsNodeKind> {
@@ -284,7 +283,8 @@ pub fn sys_mount(
                 )
                 .map_err(mount_error_to_errno)
                 .and_then(|mount_id| {
-                    apply_mount_stat_flags(MountId(mount_id.0), flags).map(|_| mount_id)
+                    apply_mount_stat_flags(MountId(mount_id.0), flags)?;
+                    Ok(mount_id)
                 })?;
                 return Ok(0);
             }
@@ -393,7 +393,10 @@ pub fn sys_mount(
                 target_path.as_str(),
             )
             .map_err(mount_error_to_errno)
-            .and_then(|mount_id| apply_mount_stat_flags(mount_id, flags).map(|_| mount_id))?;
+            .and_then(|mount_id| {
+                apply_mount_stat_flags(mount_id, flags)?;
+                Ok(mount_id)
+            })?;
         }
         "nfs" => {
             if source.is_null() {

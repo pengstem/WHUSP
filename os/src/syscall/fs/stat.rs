@@ -9,7 +9,7 @@ use crate::fs::{
 };
 use crate::perf;
 use crate::sync::SleepMutex;
-use crate::task::{PathSnapshot, current_process, current_user_token};
+use crate::task::{PathSnapshot, ProcessControlBlock, current_process, current_user_token};
 
 use super::super::SyscallContext;
 use super::super::user_ptr::{
@@ -65,9 +65,9 @@ fn write_stat_result_ctx<T: From<FileStat> + Copy>(
     ctx: &SyscallContext,
     buf: *mut T,
     stat: FileStat,
-) -> KResult {
+) -> KResult<()> {
     write_user_value_ctx(ctx, buf, &stat.into())?;
-    Ok(0)
+    Ok(())
 }
 
 fn reject_proc_self_fd_o_path(path: &str) -> KResult<()> {
@@ -155,12 +155,33 @@ fn resolve_stat_from_with(
     Ok(stat)
 }
 
+fn try_direct_child_stat(
+    process: &ProcessControlBlock,
+    dirfd: isize,
+    path: &str,
+) -> KResult<Option<FileStat>> {
+    if path.is_empty() || path.starts_with('/') || dirfd < 0 || dirfd == AT_FDCWD {
+        return Ok(None);
+    }
+    let parent = process
+        .directory_working_dir_from_fd(dirfd as usize)
+        .ok_or(Errno::EBADF)?
+        .ok_or(Errno::ENOTDIR)?;
+    Ok(stat_direct_regular_child_in(
+        process.mount_namespace_id(),
+        parent,
+        path,
+        false,
+    )?)
+}
+
 pub fn sys_fstat_ctx(ctx: &SyscallContext, fd: usize, statbuf: *mut LinuxKstat) -> KResult {
     if statbuf.is_null() {
         return Err(Errno::EFAULT);
     }
     let file = get_file_by_fd(fd)?;
-    write_stat_result_ctx(ctx, statbuf, file.stat()?)
+    write_stat_result_ctx(ctx, statbuf, file.stat()?)?;
+    Ok(0)
 }
 
 pub fn sys_newfstatat_ctx(
@@ -180,21 +201,11 @@ pub fn sys_newfstatat_ctx(
     if dirfd >= 0
         && dirfd != AT_FDCWD
         && let Some(path) = try_read_direct_path_component_ctx(ctx, pathname)?
+        && let Some(stat) = try_direct_child_stat(ctx.process(), dirfd, path.as_str())?
     {
-        let parent = ctx
-            .process()
-            .directory_working_dir_from_fd(dirfd as usize)
-            .ok_or(Errno::EBADF)?
-            .ok_or(Errno::ENOTDIR)?;
-        if let Some(stat) = stat_direct_regular_child_in(
-            ctx.process().mount_namespace_id(),
-            parent,
-            path.as_str(),
-            false,
-        )? {
-            let _profile_scope = perf::time_scope(perf::ProfilePoint::SysNewfstatatWriteback);
-            return write_stat_result_ctx(ctx, statbuf, stat);
-        }
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::SysNewfstatatWriteback);
+        write_stat_result_ctx(ctx, statbuf, stat)?;
+        return Ok(0);
     }
 
     let path = {
@@ -205,21 +216,10 @@ pub fn sys_newfstatat_ctx(
         return Err(Errno::ENOENT);
     }
     let follow_final_symlink = flags & AT_SYMLINK_NOFOLLOW == 0;
-    if !path.is_empty() && !path.starts_with('/') && dirfd >= 0 && dirfd != AT_FDCWD {
-        let parent = ctx
-            .process()
-            .directory_working_dir_from_fd(dirfd as usize)
-            .ok_or(Errno::EBADF)?
-            .ok_or(Errno::ENOTDIR)?;
-        if let Some(stat) = stat_direct_regular_child_in(
-            ctx.process().mount_namespace_id(),
-            parent,
-            path.as_str(),
-            false,
-        )? {
-            let _profile_scope = perf::time_scope(perf::ProfilePoint::SysNewfstatatWriteback);
-            return write_stat_result_ctx(ctx, statbuf, stat);
-        }
+    if let Some(stat) = try_direct_child_stat(ctx.process(), dirfd, path.as_str())? {
+        let _profile_scope = perf::time_scope(perf::ProfilePoint::SysNewfstatatWriteback);
+        write_stat_result_ctx(ctx, statbuf, stat)?;
+        return Ok(0);
     }
     let snapshot = ctx.process().path_snapshot();
     if !path.is_empty() {
@@ -231,7 +231,8 @@ pub fn sys_newfstatat_ctx(
         resolve_stat_from(&snapshot, dirfd, path.as_str(), follow_final_symlink)?
     };
     let _profile_scope = perf::time_scope(perf::ProfilePoint::SysNewfstatatWriteback);
-    write_stat_result_ctx(ctx, statbuf, stat)
+    write_stat_result_ctx(ctx, statbuf, stat)?;
+    Ok(0)
 }
 
 fn prepare_mode_change(stat: FileStat, mode: u32) -> KResult<u32> {
@@ -301,13 +302,13 @@ fn finish_file_owner_change(
     stat: FileStat,
     uid: Option<u32>,
     gid: Option<u32>,
-) -> KResult {
+) -> KResult<()> {
     prepare_owner_change(stat, uid, gid)?;
     file.set_owner(uid, gid)?;
     if let Some(mode) = mode_after_chown(stat, uid, gid) {
         file.set_mode(mode)?;
     }
-    Ok(0)
+    Ok(())
 }
 
 fn finish_path_owner_change(
@@ -318,14 +319,14 @@ fn finish_path_owner_change(
     stat: FileStat,
     uid: Option<u32>,
     gid: Option<u32>,
-) -> KResult {
+) -> KResult<()> {
     prepare_owner_change(stat, uid, gid)?;
     let context = path_context_from(snapshot, dirfd, path)?;
     chown_in(context.clone(), path, follow_final_symlink, uid, gid)?;
     if let Some(mode) = mode_after_chown(stat, uid, gid) {
         chmod_in(context, path, follow_final_symlink, mode)?;
     }
-    Ok(0)
+    Ok(())
 }
 
 pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> KResult {
@@ -441,7 +442,8 @@ pub fn sys_fchown(fd: usize, owner: u32, group: u32) -> KResult {
     }
     let file = entry.file();
     let stat = file.stat()?;
-    finish_file_owner_change(file.as_ref(), stat, uid, gid)
+    finish_file_owner_change(file.as_ref(), stat, uid, gid)?;
+    Ok(0)
 }
 
 pub fn sys_fchownat(
@@ -471,15 +473,8 @@ pub fn sys_fchownat(
         }
         if dirfd == AT_FDCWD {
             let stat = stat_in(snapshot.context.clone(), ".", follow_final_symlink)?;
-            return finish_path_owner_change(
-                &snapshot,
-                dirfd,
-                ".",
-                follow_final_symlink,
-                stat,
-                uid,
-                gid,
-            );
+            finish_path_owner_change(&snapshot, dirfd, ".", follow_final_symlink, stat, uid, gid)?;
+            return Ok(0);
         }
         if dirfd < 0 {
             return Err(Errno::EBADF);
@@ -490,7 +485,8 @@ pub fn sys_fchownat(
         }
         let file = entry.file();
         let stat = file.stat()?;
-        return finish_file_owner_change(file.as_ref(), stat, uid, gid);
+        finish_file_owner_change(file.as_ref(), stat, uid, gid)?;
+        return Ok(0);
     }
 
     check_current_access_path_prefixes_from(&snapshot, dirfd, path.as_str())?;
@@ -503,7 +499,8 @@ pub fn sys_fchownat(
         stat,
         uid,
         gid,
-    )
+    )?;
+    Ok(0)
 }
 
 fn read_xattr_name(token: usize, name: *const u8) -> KResult<String> {
@@ -888,7 +885,8 @@ pub fn sys_statx_ctx(
             path.as_str(),
             true,
         )? {
-            return write_stat_result_ctx(ctx, statxbuf, stat);
+            write_stat_result_ctx(ctx, statxbuf, stat)?;
+            return Ok(0);
         }
     }
 
@@ -909,7 +907,8 @@ pub fn sys_statx_ctx(
             path.as_str(),
             true,
         )? {
-            return write_stat_result_ctx(ctx, statxbuf, stat);
+            write_stat_result_ctx(ctx, statxbuf, stat)?;
+            return Ok(0);
         }
     }
     let snapshot = ctx.process().path_snapshot();
@@ -917,7 +916,8 @@ pub fn sys_statx_ctx(
         check_access_path_prefixes_for_process(ctx.process(), &snapshot, dirfd, path.as_str())?;
     }
     let stat = resolve_statx_stat(&snapshot, dirfd, path.as_str(), flags, follow_final_symlink)?;
-    write_stat_result_ctx(ctx, statxbuf, stat)
+    write_stat_result_ctx(ctx, statxbuf, stat)?;
+    Ok(0)
 }
 
 fn resolve_statx_stat(

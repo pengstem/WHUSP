@@ -45,4 +45,7 @@ pub use system::{
     LinuxSysInfo, LinuxUtsName, sys_getrandom_ctx, sys_personality, sys_reboot,
     sys_setdomainname_ctx, sys_sethostname_ctx, sys_sysinfo_ctx, sys_uname_ctx, sys_vhangup_ctx,
 };
-pub(crate) use system::{proc_sys_kernel_printk_content, write_proc_sys_kernel_printk};
+pub(crate) use system::{
+    proc_sys_kernel_printk_content, set_uts_domainname_len, uts_domainname_content,
+    write_proc_sys_kernel_printk, write_uts_domainname,
+};

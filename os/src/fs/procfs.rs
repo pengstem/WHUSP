@@ -16,15 +16,18 @@ use crate::drivers::block_cache;
 use crate::mm::frame_cache_stats;
 use crate::mm::{VirtAddr, exec_load_stats_content, frame_stats};
 use crate::perf;
-use crate::syscall::pidfd_fdinfo;
+use crate::sync::SpinNoIrqLock;
 #[cfg(feature = "inotify")]
 use crate::syscall::{
     INOTIFY_MAX_QUEUED_EVENTS, INOTIFY_MAX_USER_INSTANCES, INOTIFY_MAX_USER_WATCHES, inotify_fdinfo,
 };
 #[cfg(feature = "fanotify")]
 use crate::syscall::{fanotify_evict_evictable_marks, fanotify_fdinfo, fanotify_max_queued_events};
+use crate::syscall::{
+    pidfd_fdinfo, set_uts_domainname_len, uts_domainname_content, write_uts_domainname,
+};
 use crate::task::{
-    ProcessProcSnapshot, TaskControlBlock, TaskStatus, list_process_snapshots, pid2process,
+    ProcessProcSnapshot, TaskControlBlock, list_process_snapshots, pid2process, proc_task_state,
     processes_snapshot,
 };
 use crate::timer::{get_time_us, us_to_clock_ticks};
@@ -32,10 +35,11 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::str::FromStr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use state::{
-    DEFAULT_NET_IPV4_CONF_TAG, PROC_CORE_PATTERN, PROC_DOMAINNAME, PROC_IO_READ_BYTES,
+    DEFAULT_NET_IPV4_CONF_TAG, PROC_CORE_PATTERN, PROC_IO_READ_BYTES,
     PROC_IO_READAHEAD_SUPPRESS_READS, PROC_LEASE_BREAK_TIME, PROC_MEMINFO_CACHED_KB,
     PROC_MEMINFO_OBSERVED_CACHE_KB, PROC_MEMINFO_SWAP_CACHED_KB, PROC_NET_CORE_BUSY_POLL,
     PROC_NET_CORE_BUSY_READ, PROC_NET_IPV4_CONF_LO_TAG, PROC_OOM_SCORE_ADJ, PROC_PID_MAX,
@@ -159,18 +163,7 @@ const PROC_NS_UTS_INO_BASE: u64 = 0x7300_0000;
 const PROC_NS_NET_INO_BASE: u64 = 0x7400_0000;
 const PROC_NS_INO_RANGE: u64 = 0x0100_0000;
 const ROOT_UTS_NAMESPACE_ID: usize = 1;
-const PROC_CONFIG_GZ: &[u8] = &[
-    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x5d, 0x8e, 0xc1, 0x0e, 0xc2, 0x30,
-    0x0c, 0x43, 0xef, 0xfc, 0x13, 0x87, 0x2a, 0x75, 0xb7, 0xc0, 0x9a, 0x56, 0x69, 0x36, 0xd8, 0x29,
-    0xdf, 0xc1, 0xdf, 0x53, 0x04, 0x52, 0x37, 0x8e, 0x7e, 0x71, 0x6c, 0x53, 0x91, 0xc4, 0x93, 0xa7,
-    0xe6, 0x1b, 0x94, 0x6d, 0xbf, 0xbe, 0x2e, 0xf4, 0x45, 0x6b, 0x83, 0x7a, 0x04, 0xe9, 0x5e, 0x0d,
-    0xd1, 0x63, 0xb0, 0x30, 0x8e, 0x55, 0x81, 0x5c, 0xcd, 0xd5, 0x06, 0xc3, 0x06, 0xb1, 0x14, 0x07,
-    0xc8, 0xc8, 0x45, 0x77, 0x4f, 0x81, 0x97, 0x55, 0x31, 0xf8, 0xfc, 0xa8, 0x85, 0x5b, 0x11, 0x67,
-    0xb9, 0x81, 0xec, 0xaf, 0x52, 0xda, 0xa1, 0x86, 0xe3, 0x49, 0x0b, 0xec, 0xa4, 0x69, 0x06, 0xdd,
-    0x7b, 0x98, 0xf4, 0x25, 0x68, 0x56, 0x8e, 0x2d, 0xdd, 0x9b, 0x78, 0xb1, 0x9e, 0xf8, 0x34, 0xcf,
-    0xc1, 0x68, 0xf6, 0x66, 0xc1, 0x0e, 0x0e, 0xae, 0x2e, 0xc9, 0x2d, 0xe8, 0x84, 0xcf, 0xff, 0x6f,
-    0xcb, 0x1b, 0xfe, 0x63, 0x48, 0x12, 0x12, 0x01, 0x00, 0x00,
-];
+const PROC_CONFIG_GZ: &[u8] = include_bytes!("../../assets/config.gz");
 
 pub(crate) fn pipe_max_size() -> usize {
     PROC_PIPE_MAX_SIZE.load(Ordering::Relaxed)
@@ -2095,7 +2088,7 @@ fn pid_fdinfo_content(pid: usize, fd: usize) -> FsResult<String> {
 }
 
 fn domainname_content() -> Vec<u8> {
-    let mut output = PROC_DOMAINNAME.lock().clone();
+    let mut output = uts_domainname_content();
     output.push(b'\n');
     output
 }
@@ -2106,7 +2099,7 @@ fn core_pattern_content() -> Vec<u8> {
     output
 }
 
-fn write_core_pattern(buf: &[u8], offset: u64) -> usize {
+fn write_locked_bytes(value: &SpinNoIrqLock<Vec<u8>>, buf: &[u8], offset: u64) -> usize {
     let Ok(offset) = usize::try_from(offset) else {
         return 0;
     };
@@ -2114,7 +2107,7 @@ fn write_core_pattern(buf: &[u8], offset: u64) -> usize {
         .iter()
         .position(|byte| *byte == b'\n' || *byte == 0)
         .unwrap_or(buf.len());
-    let mut value = PROC_CORE_PATTERN.lock();
+    let mut value = value.lock();
     if offset > value.len() {
         return 0;
     }
@@ -2123,11 +2116,11 @@ fn write_core_pattern(buf: &[u8], offset: u64) -> usize {
     buf.len()
 }
 
-fn set_core_pattern_len(len: u64) -> FsResult {
+fn set_locked_bytes_len(value: &SpinNoIrqLock<Vec<u8>>, len: u64) -> FsResult {
     let Ok(len) = usize::try_from(len) else {
         return Err(FsError::InvalidInput);
     };
-    let mut value = PROC_CORE_PATTERN.lock();
+    let mut value = value.lock();
     if len <= value.len() {
         value.truncate(len);
     } else {
@@ -2136,14 +2129,16 @@ fn set_core_pattern_len(len: u64) -> FsResult {
     Ok(())
 }
 
-fn write_pid_max(buf: &[u8], offset: u64) -> usize {
+fn parse_scalar_write<T: FromStr>(buf: &[u8], offset: u64) -> Option<T> {
     if offset != 0 {
-        return 0;
+        return None;
     }
-    let Ok(text) = core::str::from_utf8(buf) else {
-        return 0;
-    };
-    let Ok(value) = text.trim().parse::<usize>() else {
+    let text = core::str::from_utf8(buf).ok()?;
+    text.trim().parse().ok()
+}
+
+fn write_pid_max(buf: &[u8], offset: u64) -> usize {
+    let Some(value) = parse_scalar_write::<usize>(buf, offset) else {
         return 0;
     };
     // UNFINISHED: Linux uses pid_max to control PID allocator wrap. This
@@ -2153,19 +2148,13 @@ fn write_pid_max(buf: &[u8], offset: u64) -> usize {
     buf.len()
 }
 
-fn write_shm_usize_sysctl(buf: &[u8], offset: u64, setter: impl FnOnce(usize) -> bool) -> usize {
-    if offset != 0 {
-        return 0;
-    }
-    let Ok(text) = core::str::from_utf8(buf) else {
+fn write_usize_sysctl(buf: &[u8], offset: u64, setter: impl FnOnce(usize) -> bool) -> usize {
+    let Some(value) = parse_scalar_write::<usize>(buf, offset) else {
         return 0;
     };
-    let Ok(value) = text.trim().parse::<usize>() else {
-        return 0;
-    };
-    // CONTEXT: LTP saves/restores System V shm sysctls before probing error
-    // cases. The backing shm subsystem reads these stored values for the
-    // implemented limits while broader Linux namespace behavior is deferred.
+    // CONTEXT: LTP saves/restores System V IPC sysctls before probing error
+    // cases. The backing subsystems read these stored values for the
+    // implemented limits while broader namespace behavior is deferred.
     if !setter(value) {
         return 0;
     }
@@ -2173,13 +2162,7 @@ fn write_shm_usize_sysctl(buf: &[u8], offset: u64, setter: impl FnOnce(usize) ->
 }
 
 fn write_shm_next_id(buf: &[u8], offset: u64) -> usize {
-    if offset != 0 {
-        return 0;
-    }
-    let Ok(text) = core::str::from_utf8(buf) else {
-        return 0;
-    };
-    let Ok(value) = text.trim().parse::<isize>() else {
+    let Some(value) = parse_scalar_write::<isize>(buf, offset) else {
         return 0;
     };
     if !crate::mm::shm::set_shm_next_id(value) {
@@ -2188,33 +2171,8 @@ fn write_shm_next_id(buf: &[u8], offset: u64) -> usize {
     buf.len()
 }
 
-fn write_msg_usize_sysctl(buf: &[u8], offset: u64, setter: impl FnOnce(usize) -> bool) -> usize {
-    if offset != 0 {
-        return 0;
-    }
-    let Ok(text) = core::str::from_utf8(buf) else {
-        return 0;
-    };
-    let Ok(value) = text.trim().parse::<usize>() else {
-        return 0;
-    };
-    // CONTEXT: LTP saves/restores System V message sysctls and derives
-    // stress sizes from them. The message queue subsystem reads these stored
-    // limits; broader namespace-specific sysctl behavior is deferred.
-    if !setter(value) {
-        return 0;
-    }
-    buf.len()
-}
-
 fn write_msg_next_id(buf: &[u8], offset: u64) -> usize {
-    if offset != 0 {
-        return 0;
-    }
-    let Ok(text) = core::str::from_utf8(buf) else {
-        return 0;
-    };
-    let Ok(value) = text.trim().parse::<isize>() else {
+    let Some(value) = parse_scalar_write::<isize>(buf, offset) else {
         return 0;
     };
     if !crate::syscall::msg::set_msg_next_id(value) {
@@ -2224,13 +2182,7 @@ fn write_msg_next_id(buf: &[u8], offset: u64) -> usize {
 }
 
 fn write_pipe_max_size(buf: &[u8], offset: u64) -> usize {
-    if offset != 0 {
-        return 0;
-    }
-    let Ok(text) = core::str::from_utf8(buf) else {
-        return 0;
-    };
-    let Ok(value) = text.trim().parse::<usize>() else {
+    let Some(value) = parse_scalar_write::<usize>(buf, offset) else {
         return 0;
     };
     if value < PIPE_MIN_CAPACITY {
@@ -2245,13 +2197,7 @@ fn write_pipe_max_size(buf: &[u8], offset: u64) -> usize {
 }
 
 fn write_lease_break_time(buf: &[u8], offset: u64) -> usize {
-    if offset != 0 {
-        return 0;
-    }
-    let Ok(text) = core::str::from_utf8(buf) else {
-        return 0;
-    };
-    let Ok(value) = text.trim().parse::<usize>() else {
+    let Some(value) = parse_scalar_write::<usize>(buf, offset) else {
         return 0;
     };
     // CONTEXT: The kernel does not yet implement timed lease breaking, but
@@ -2263,15 +2209,9 @@ fn write_lease_break_time(buf: &[u8], offset: u64) -> usize {
 
 #[cfg(feature = "inotify")]
 fn write_inotify_max_user_instances(buf: &[u8], offset: u64) -> usize {
-    if offset != 0 {
-        return 0;
-    }
-    let Ok(text) = core::str::from_utf8(buf) else {
+    let Some(_value) = parse_scalar_write::<usize>(buf, offset) else {
         return 0;
     };
-    if text.trim().parse::<usize>().is_err() {
-        return 0;
-    }
     // CONTEXT: inotify06 saves/restores this sysctl while stress-creating
     // instances. The current inotify subset does not enforce per-user limits,
     // but accepting numeric writes keeps the Linux procfs contract visible.
@@ -2279,13 +2219,7 @@ fn write_inotify_max_user_instances(buf: &[u8], offset: u64) -> usize {
 }
 
 fn write_net_ipv4_conf_lo_tag(buf: &[u8], offset: u64) -> usize {
-    if offset != 0 {
-        return 0;
-    }
-    let Ok(text) = core::str::from_utf8(buf) else {
-        return 0;
-    };
-    let Ok(value) = text.trim().parse::<isize>() else {
+    let Some(value) = parse_scalar_write::<isize>(buf, offset) else {
         return 0;
     };
     // UNFINISHED: Linux stores this under the network namespace; this minimal
@@ -2295,13 +2229,7 @@ fn write_net_ipv4_conf_lo_tag(buf: &[u8], offset: u64) -> usize {
 }
 
 fn write_net_core_usize(cell: &AtomicUsize, buf: &[u8], offset: u64) -> usize {
-    if offset != 0 {
-        return 0;
-    }
-    let Ok(text) = core::str::from_utf8(buf) else {
-        return 0;
-    };
-    let Ok(value) = text.trim().parse::<usize>() else {
+    let Some(value) = parse_scalar_write::<usize>(buf, offset) else {
         return 0;
     };
     // CONTEXT: LTP busy-poll tests save and restore these sysctls around a
@@ -2319,13 +2247,7 @@ fn write_drop_caches(buf: &[u8], _offset: u64) -> usize {
 }
 
 fn write_vfs_cache_pressure(buf: &[u8], offset: u64) -> usize {
-    if offset != 0 {
-        return 0;
-    }
-    let Ok(text) = core::str::from_utf8(buf) else {
-        return 0;
-    };
-    let Ok(value) = text.trim().parse::<usize>() else {
+    let Some(value) = parse_scalar_write::<usize>(buf, offset) else {
         return 0;
     };
     // CONTEXT: This kernel does not implement VFS dentry/inode cache pressure,
@@ -2337,13 +2259,7 @@ fn write_vfs_cache_pressure(buf: &[u8], offset: u64) -> usize {
 }
 
 fn write_pid_timerslack(pid: usize, buf: &[u8], offset: u64) -> usize {
-    if offset != 0 {
-        return 0;
-    }
-    let Ok(text) = core::str::from_utf8(buf) else {
-        return 0;
-    };
-    let Ok(value) = text.trim().parse::<usize>() else {
+    let Some(value) = parse_scalar_write::<usize>(buf, offset) else {
         return 0;
     };
     let Some(process) = pid2process(pid) else {
@@ -2368,13 +2284,7 @@ fn oom_score_adj_content() -> Vec<u8> {
 }
 
 fn write_oom_score_adj(buf: &[u8], offset: u64) -> usize {
-    if offset != 0 {
-        return 0;
-    }
-    let Ok(text) = core::str::from_utf8(buf) else {
-        return 0;
-    };
-    let Ok(value) = text.trim().parse::<isize>() else {
+    let Some(value) = parse_scalar_write::<isize>(buf, offset) else {
         return 0;
     };
     if !(-1000..=1000).contains(&value) {
@@ -2382,50 +2292,6 @@ fn write_oom_score_adj(buf: &[u8], offset: u64) -> usize {
     }
     PROC_OOM_SCORE_ADJ.store(value, Ordering::Relaxed);
     buf.len()
-}
-
-fn write_domainname(buf: &[u8], offset: u64) -> usize {
-    let Ok(offset) = usize::try_from(offset) else {
-        return 0;
-    };
-    let end = buf
-        .iter()
-        .position(|byte| *byte == b'\n' || *byte == 0)
-        .unwrap_or(buf.len());
-    let mut value = PROC_DOMAINNAME.lock();
-    if offset > value.len() {
-        return 0;
-    }
-    value.truncate(offset);
-    value.extend_from_slice(&buf[..end]);
-    buf.len()
-}
-
-fn set_domainname_len(len: u64) -> FsResult {
-    let Ok(len) = usize::try_from(len) else {
-        return Err(FsError::InvalidInput);
-    };
-    let mut value = PROC_DOMAINNAME.lock();
-    if len <= value.len() {
-        value.truncate(len);
-    } else {
-        value.resize(len, 0);
-    }
-    Ok(())
-}
-
-fn task_status_char(status: TaskStatus, proc_sleeping: bool, job_control_stopped: bool) -> char {
-    if job_control_stopped {
-        return 'T';
-    }
-    if proc_sleeping {
-        return 'S';
-    }
-    match status {
-        TaskStatus::Ready | TaskStatus::Running => 'R',
-        TaskStatus::Blocked => 'S',
-        TaskStatus::Exited => 'Z',
-    }
 }
 
 fn proc_stat_content(process: ProcessProcSnapshot, stat_pid: usize, state: char) -> String {
@@ -2468,7 +2334,7 @@ fn task_stat_content(pid: usize, local_tid: usize) -> FsResult<Vec<u8>> {
     let task = lookup_task_by_local_tid(pid, local_tid).ok_or(FsError::NotFound)?;
     let state = {
         let task_inner = task.inner_exclusive_access();
-        task_status_char(
+        proc_task_state(
             task_inner.task_status,
             task_inner.proc_sleeping,
             task_inner.job_control_stopped,
@@ -3315,8 +3181,14 @@ impl LegacyDataOps for ProcFs {
             | ProcNode::PidUidMap(_)
             | ProcNode::PidGidMap(_) => Ok(()),
             ProcNode::PidCoredumpFilter(_) => Ok(()),
-            ProcNode::Domainname => set_domainname_len(_len),
-            ProcNode::CorePattern => set_core_pattern_len(_len),
+            ProcNode::Domainname => {
+                if set_uts_domainname_len(_len) {
+                    Ok(())
+                } else {
+                    Err(FsError::InvalidInput)
+                }
+            }
+            ProcNode::CorePattern => set_locked_bytes_len(&PROC_CORE_PATTERN, _len),
             _ => Err(FsError::ReadOnly),
         }
     }
@@ -3354,29 +3226,23 @@ impl LegacyDataOps for ProcFs {
     fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> usize {
         match decode_node(ino) {
             Some(ProcNode::PidMax) => write_pid_max(buf, offset),
-            Some(ProcNode::ShmMax) => {
-                write_shm_usize_sysctl(buf, offset, crate::mm::shm::set_shmmax)
-            }
-            Some(ProcNode::ShmMni) => {
-                write_shm_usize_sysctl(buf, offset, crate::mm::shm::set_shmmni)
-            }
-            Some(ProcNode::ShmAll) => {
-                write_shm_usize_sysctl(buf, offset, crate::mm::shm::set_shmall)
-            }
+            Some(ProcNode::ShmMax) => write_usize_sysctl(buf, offset, crate::mm::shm::set_shmmax),
+            Some(ProcNode::ShmMni) => write_usize_sysctl(buf, offset, crate::mm::shm::set_shmmni),
+            Some(ProcNode::ShmAll) => write_usize_sysctl(buf, offset, crate::mm::shm::set_shmall),
             Some(ProcNode::ShmNextId) => write_shm_next_id(buf, offset),
             Some(ProcNode::MsgMni) => {
-                write_msg_usize_sysctl(buf, offset, crate::syscall::msg::set_msgmni)
+                write_usize_sysctl(buf, offset, crate::syscall::msg::set_msgmni)
             }
             Some(ProcNode::MsgMax) => {
-                write_msg_usize_sysctl(buf, offset, crate::syscall::msg::set_msgmax)
+                write_usize_sysctl(buf, offset, crate::syscall::msg::set_msgmax)
             }
             Some(ProcNode::MsgMnb) => {
-                write_msg_usize_sysctl(buf, offset, crate::syscall::msg::set_msgmnb)
+                write_usize_sysctl(buf, offset, crate::syscall::msg::set_msgmnb)
             }
             Some(ProcNode::MsgNextId) => write_msg_next_id(buf, offset),
             Some(ProcNode::Printk) => crate::syscall::write_proc_sys_kernel_printk(buf, offset),
             Some(ProcNode::MaxUserNamespaces) => buf.len(),
-            Some(ProcNode::CorePattern) => write_core_pattern(buf, offset),
+            Some(ProcNode::CorePattern) => write_locked_bytes(&PROC_CORE_PATTERN, buf, offset),
             Some(ProcNode::PipeMaxSize) => write_pipe_max_size(buf, offset),
             Some(ProcNode::LeaseBreakTime) => write_lease_break_time(buf, offset),
             #[cfg(feature = "inotify")]
@@ -3398,7 +3264,7 @@ impl LegacyDataOps for ProcFs {
             Some(ProcNode::PidSetgroups(_))
             | Some(ProcNode::PidUidMap(_))
             | Some(ProcNode::PidGidMap(_)) => buf.len(),
-            Some(ProcNode::Domainname) => write_domainname(buf, offset),
+            Some(ProcNode::Domainname) => write_uts_domainname(buf, offset),
             _ => 0,
         }
     }

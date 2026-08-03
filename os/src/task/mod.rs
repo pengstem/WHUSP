@@ -32,6 +32,7 @@ use lifecycle::{register_task_linux_tid, unregister_task_linux_tid};
 use log::info;
 pub(crate) use process::{
     Credentials, PROCESS_PKEY_COUNT, PathSnapshot, ProcessProcSnapshot, RLimit, RLimitResource,
+    proc_task_state,
 };
 pub use process::{ProcessControlBlock, ProcessCpuTimesSnapshot};
 use sched::{charge_task_after_run, fetch_task};

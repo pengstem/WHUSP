@@ -231,11 +231,9 @@ pub(crate) fn static_path_probe_may_hit(snapshot: &PathSnapshot, dirfd: isize, p
             .is_some_and(path_component_is_static_root)
 }
 
-fn visible_working_dir_path(snapshot: &PathSnapshot) -> KResult<String> {
-    Ok(
-        path_inside_root(snapshot.root_path.as_str(), snapshot.cwd_path.as_str())
-            .unwrap_or_else(|| alloc::format!("(unreachable){}", snapshot.cwd_path)),
-    )
+fn visible_working_dir_path(snapshot: &PathSnapshot) -> String {
+    path_inside_root(snapshot.root_path.as_str(), snapshot.cwd_path.as_str())
+        .unwrap_or_else(|| alloc::format!("(unreachable){}", snapshot.cwd_path))
 }
 
 fn check_access_path_prefixes_from(
@@ -1193,7 +1191,7 @@ pub fn sys_fchdir(fd: usize) -> KResult {
 
 pub fn sys_getcwd_ctx(ctx: &SyscallContext, buf: *mut u8, size: usize) -> KResult {
     let snapshot = ctx.process().path_snapshot();
-    let cwd_path = visible_working_dir_path(&snapshot)?;
+    let cwd_path = visible_working_dir_path(&snapshot);
     copy_c_string_to_user_ctx(ctx, buf, size, cwd_path.as_str())
 }
 

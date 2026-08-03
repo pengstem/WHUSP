@@ -683,6 +683,7 @@ pub trait File: Send + Sync {
 }
 
 pub fn init() {
+    staticfs::init();
     mount::init_mounts();
 }
 

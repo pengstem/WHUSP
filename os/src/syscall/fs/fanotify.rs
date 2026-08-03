@@ -304,7 +304,7 @@ impl FanotifyGroup {
         self.inner.with_lock(|inner| inner.marks.clear());
     }
 
-    fn update_mark(&self, target: FanotifyMarkTarget, flags: u32, mask: u64) -> KResult {
+    fn update_mark(&self, target: FanotifyMarkTarget, flags: u32, mask: u64) -> KResult<()> {
         self.inner.with_lock(|inner| {
             let existing = inner.marks.iter_mut().find(|mark| mark.target == target);
             match (flags & (FAN_MARK_ADD | FAN_MARK_REMOVE), existing) {
@@ -325,7 +325,7 @@ impl FanotifyGroup {
                     } else {
                         mark.mask |= mask;
                     }
-                    Ok(0)
+                    Ok(())
                 }
                 (FAN_MARK_ADD, None) => {
                     inner.marks.push(FanotifyMark {
@@ -346,7 +346,7 @@ impl FanotifyGroup {
                                 | FAN_MARK_EVICTABLE
                                 | FAN_MARK_IGNORE),
                     });
-                    Ok(0)
+                    Ok(())
                 }
                 (FAN_MARK_REMOVE, Some(mark)) => {
                     if flags & (FAN_MARK_IGNORED_MASK | FAN_MARK_IGNORE) != 0 {
@@ -357,7 +357,7 @@ impl FanotifyGroup {
                     if mark.mask == 0 && mark.ignored_mask == 0 {
                         inner.marks.retain(|mark| mark.target != target);
                     }
-                    Ok(0)
+                    Ok(())
                 }
                 (FAN_MARK_REMOVE, None) => Err(Errno::ENOENT),
                 _ => Err(Errno::EINVAL),
@@ -1188,7 +1188,8 @@ pub fn sys_fanotify_mark(
         FanotifyMarkTarget::from_node(node, flags, path),
         flags,
         mask,
-    )
+    )?;
+    Ok(0)
 }
 
 fn live_fanotify_groups() -> Vec<Arc<FanotifyGroup>> {

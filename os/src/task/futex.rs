@@ -8,7 +8,7 @@ use crate::perf;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::time::{
     ClockBackend, current_clock_nanos, relative_timeout_deadline_ms,
-    relative_timeout_deadline_ms_from_nanos, timespec_to_nanos, validate_timespec,
+    relative_timeout_deadline_ms_from_nanos, timespec_to_nanos,
 };
 use crate::syscall::uapi::LinuxTimeSpec;
 use crate::syscall::user_ptr::{
@@ -593,7 +593,7 @@ fn futex_timeout_absolute(
     if timeout.is_null() {
         return Ok(None);
     }
-    let request = validate_timespec(read_user_value(current_user_token(), timeout)?)?;
+    let request = read_user_value(current_user_token(), timeout)?;
     let deadline_nanos = timespec_to_nanos(request)?;
     let now_nanos = current_clock_nanos(backend);
     if deadline_nanos <= now_nanos {

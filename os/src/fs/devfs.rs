@@ -1600,6 +1600,53 @@ pub(crate) fn loop_device_change_fd(
     Ok(())
 }
 
+fn decimal_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 10 {
+        value /= 10;
+        len += 1;
+    }
+    len
+}
+
+pub(crate) fn loop_device_sysfs_content_len(path: &str) -> Option<usize> {
+    match path {
+        "/sys/block/loop0/size" => Some(decimal_len(loop_device_visible_size(0).ok()? / 512) + 1),
+        "/sys/block/loop0/ro"
+        | "/sys/block/loop0/loop/partscan"
+        | "/sys/block/loop0/loop/autoclear"
+        | "/sys/block/loop0/loop/dio" => Some(2),
+        "/sys/block/loop0/loop/backing_file" => Some(
+            LOOP0_STATE
+                .with_lock(|state| state.backing_path.as_deref().map_or(0, |path| path.len()) + 1),
+        ),
+        "/sys/block/loop0/loop/sizelimit" => {
+            Some(decimal_len(LOOP0_STATE.with_lock(|state| state.size_limit)) + 1)
+        }
+        "/sys/block/loop0/queue/logical_block_size" => Some("4096\n".len()),
+        "/sys/block/loop0/queue/dma_alignment" => Some("4095\n".len()),
+        "/sys/block/loop0/stat" => {
+            let (sectors_written, io_ticks) = LOOP0_STATE.with_lock(|state| {
+                (
+                    state.synthetic_write_sectors,
+                    state.synthetic_io_ticks.max(1),
+                )
+            });
+            Some(
+                "0 0 0 0 0 0 ".len()
+                    + decimal_len(sectors_written)
+                    + " 0 0 ".len()
+                    + decimal_len(io_ticks)
+                    + " 0\n".len(),
+            )
+        }
+        "/sys/class/block/loop0/bdi/read_ahead_kb" => {
+            Some(decimal_len(loop_device_read_ahead(0).ok()? as u64) + 1)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn loop_device_sysfs_content(path: &str) -> Option<Vec<u8>> {
     let content = match path {
         "/sys/block/loop0/size" => format!("{}\n", loop_device_visible_size(0).ok()? / 512),

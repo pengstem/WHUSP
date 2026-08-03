@@ -34,6 +34,9 @@ pub(crate) use fs::{
 #[cfg(feature = "fanotify")]
 pub(crate) use fs::{fanotify_evict_evictable_marks, fanotify_fdinfo, fanotify_max_queued_events};
 pub(crate) use process::pidfd_fdinfo;
-pub(crate) use process::{proc_sys_kernel_printk_content, write_proc_sys_kernel_printk};
+pub(crate) use process::{
+    proc_sys_kernel_printk_content, set_uts_domainname_len, uts_domainname_content,
+    write_proc_sys_kernel_printk, write_uts_domainname,
+};
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 pub(crate) use wait::LinuxSigInfo;

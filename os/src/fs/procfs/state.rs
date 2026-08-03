@@ -32,11 +32,6 @@ pub(super) static PROC_IO_READAHEAD_SUPPRESS_READS: AtomicUsize = AtomicUsize::n
 pub(super) static PROC_OOM_SCORE_ADJ: AtomicIsize = AtomicIsize::new(0);
 
 lazy_static! {
-    pub(super) static ref PROC_DOMAINNAME: SpinNoIrqLock<Vec<u8>> = {
-        let mut value = Vec::new();
-        value.extend_from_slice(b"(none)");
-        SpinNoIrqLock::new(value)
-    };
     pub(super) static ref PROC_CORE_PATTERN: SpinNoIrqLock<Vec<u8>> = {
         let mut value = Vec::new();
         value.extend_from_slice(b"core");

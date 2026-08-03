@@ -362,7 +362,11 @@ pub(crate) struct ProcessNamespace {
     pub(crate) parent_id: Option<usize>,
 }
 
-fn proc_task_state(status: TaskStatus, proc_sleeping: bool, job_control_stopped: bool) -> char {
+pub(crate) fn proc_task_state(
+    status: TaskStatus,
+    proc_sleeping: bool,
+    job_control_stopped: bool,
+) -> char {
     if job_control_stopped {
         return 'T';
     }

@@ -14,6 +14,7 @@ use crate::timer::get_time_us;
 use crate::uapi::errno::{Errno, KResult};
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use log::warn;
@@ -136,6 +137,57 @@ impl LinuxUtsName {
         }
         uts
     }
+}
+
+fn uts_field_content(field: &[u8; UTS_FIELD_LEN]) -> Vec<u8> {
+    let len = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(UTS_FIELD_LEN);
+    field[..len].to_vec()
+}
+
+pub(crate) fn uts_domainname_content() -> Vec<u8> {
+    uts_field_content(&UTS_STATE.lock().domainname)
+}
+
+pub(crate) fn write_uts_domainname(buf: &[u8], offset: u64) -> usize {
+    let Ok(offset) = usize::try_from(offset) else {
+        return 0;
+    };
+    let end = buf
+        .iter()
+        .position(|byte| *byte == b'\n' || *byte == 0)
+        .unwrap_or(buf.len());
+    let Some(end_offset) = offset.checked_add(end) else {
+        return 0;
+    };
+    if end_offset >= UTS_FIELD_LEN {
+        return 0;
+    }
+    let mut state = UTS_STATE.lock();
+    let current_len = state
+        .domainname
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(UTS_FIELD_LEN);
+    if offset > current_len {
+        return 0;
+    }
+    state.domainname[offset..].fill(0);
+    state.domainname[offset..end_offset].copy_from_slice(&buf[..end]);
+    buf.len()
+}
+
+pub(crate) fn set_uts_domainname_len(len: u64) -> bool {
+    let Ok(len) = usize::try_from(len) else {
+        return false;
+    };
+    if len >= UTS_FIELD_LEN {
+        return false;
+    }
+    UTS_STATE.lock().domainname[len..].fill(0);
+    true
 }
 
 #[cfg(target_arch = "loongarch64")]

@@ -303,13 +303,13 @@ pub(crate) fn relative_timeout_deadline_ms(
     if timeout.is_null() {
         return Ok(None);
     }
-    let request = validate_timespec(read_user_value(token, timeout)?)?;
+    let request = read_user_value(token, timeout)?;
     Ok(Some(relative_timeout_deadline_ms_from_nanos(
         timespec_to_nanos(request)?,
     )?))
 }
 
-pub(crate) fn validate_timespec(time: LinuxTimeSpec) -> KResult<LinuxTimeSpec> {
+fn validate_timespec(time: LinuxTimeSpec) -> KResult<LinuxTimeSpec> {
     if time.tv_sec < 0 || !(0..NSEC_PER_SEC).contains(&time.tv_nsec) {
         return Err(Errno::EINVAL);
     }
@@ -326,13 +326,22 @@ pub(crate) fn timespec_to_nanos(time: LinuxTimeSpec) -> KResult<u64> {
         .ok_or(Errno::EINVAL)
 }
 
-pub(crate) fn nanos_to_ms_ceil(nanos: u64) -> KResult<usize> {
-    let nsec_per_msec = NSEC_PER_MSEC as u64;
-    let ms = nanos / nsec_per_msec + if nanos % nsec_per_msec == 0 { 0 } else { 1 };
-    if ms > usize::MAX as u64 {
+fn checked_div_ceil_u64(value: u64, divisor: u64) -> KResult<usize> {
+    if divisor == 0 {
         return Err(Errno::EINVAL);
     }
-    Ok(ms as usize)
+    let quotient = value / divisor;
+    let rounded = quotient
+        .checked_add(if value % divisor == 0 { 0 } else { 1 })
+        .ok_or(Errno::EINVAL)?;
+    if rounded > usize::MAX as u64 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(rounded as usize)
+}
+
+pub(crate) fn nanos_to_ms_ceil(nanos: u64) -> KResult<usize> {
+    checked_div_ceil_u64(nanos, NSEC_PER_MSEC as u64)
 }
 
 pub(crate) fn timespec_to_ms_ceil(time: LinuxTimeSpec) -> KResult<usize> {
@@ -344,15 +353,11 @@ fn relative_sleep_deadline_ms(time: LinuxTimeSpec) -> KResult<usize> {
 }
 
 fn us_to_ms_ceil(us: usize) -> KResult<usize> {
-    us.checked_add(999).map(|us| us / 1000).ok_or(Errno::EINVAL)
+    checked_div_ceil_u64(us as u64, 1_000)
 }
 
 pub(crate) fn nanos_to_us_ceil(nanos: u64) -> KResult<usize> {
-    let us = nanos / 1000 + if nanos % 1000 == 0 { 0 } else { 1 };
-    if us > usize::MAX as u64 {
-        return Err(Errno::EINVAL);
-    }
-    Ok(us as usize)
+    checked_div_ceil_u64(nanos, 1_000)
 }
 
 pub(crate) fn timespec_to_us_ceil(time: LinuxTimeSpec) -> KResult<usize> {
@@ -820,7 +825,7 @@ pub fn sys_nanosleep(req: *const LinuxTimeSpec, rem: *mut LinuxTimeSpec) -> KRes
         return Err(Errno::EFAULT);
     }
     let token = current_user_token();
-    let request = validate_timespec(read_user_value(token, req)?)?;
+    let request = read_user_value(token, req)?;
     let duration_ms = timespec_to_ms_ceil(request)?;
     if duration_ms == 0 {
         return Ok(0);
@@ -874,7 +879,7 @@ pub fn sys_clock_settime(clock_id: i32, tp: *const LinuxTimeSpec) -> KResult {
     if tp.is_null() {
         return Err(Errno::EFAULT);
     }
-    let request = validate_timespec(read_user_value(current_user_token(), tp)?)?;
+    let request = read_user_value(current_user_token(), tp)?;
     if !current_can_set_time() {
         return Err(Errno::EPERM);
     }
@@ -908,7 +913,7 @@ pub fn sys_clock_nanosleep(
         return Err(Errno::EFAULT);
     }
 
-    let request = validate_timespec(read_user_value(current_user_token(), req)?)?;
+    let request = read_user_value(current_user_token(), req)?;
     if flags & TIMER_ABSTIME != 0 {
         sleep_until_clock(backend, request)
     } else {
