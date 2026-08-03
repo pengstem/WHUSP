@@ -679,6 +679,7 @@ impl TaskManager {
                 .saturating_add(NORMAL_PREEMPT_GRANULARITY_US)
     }
 
+    #[cfg(feature = "ptrace")]
     fn remove_process_tasks(&mut self, process_id: usize) {
         self.normal_queue.retain(|_, task| {
             let keep = task
@@ -705,6 +706,7 @@ impl TaskManager {
         self.rebuild_ready_metadata();
     }
 
+    #[cfg(feature = "ptrace")]
     fn rebuild_ready_metadata(&mut self) {
         self.rt_ready_bitmap = 0;
         self.ready_count = self.normal_queue.len();
@@ -1362,9 +1364,36 @@ pub(super) fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     task
 }
 
+#[cfg(feature = "ptrace")]
 pub(super) fn remove_ready_tasks_of_process(process_id: usize) {
     for cpu in 0..crate::cpu::topology().possible_count() {
         with_run_queue(cpu, |manager| manager.remove_process_tasks(process_id));
+    }
+}
+
+pub(super) fn remove_ready_tasks(tasks: &[Arc<TaskControlBlock>]) {
+    for task in tasks {
+        loop {
+            let queued_cpu = task.inner_exclusive_access().queued_cpu;
+            let Some(cpu) = queued_cpu else {
+                break;
+            };
+            let removed = with_run_queue(cpu, |manager| {
+                if manager.remove_ready_task(task) {
+                    TaskManager::clear_queued(task);
+                    true
+                } else {
+                    false
+                }
+            });
+            if removed {
+                break;
+            }
+            // A concurrent fetch or migration may have cleared or changed the
+            // owner before this CPU's rq lock was acquired. Follow the task's
+            // current owner instead of scanning unrelated run queues.
+            core::hint::spin_loop();
+        }
     }
 }
 

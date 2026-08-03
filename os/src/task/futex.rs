@@ -140,15 +140,6 @@ impl FutexManager {
         hash & (FUTEX_BUCKET_COUNT - 1)
     }
 
-    fn address_space_process_id(key: FutexKey) -> Option<usize> {
-        match key {
-            FutexKey::Private { process_id, .. } | FutexKey::SharedVirtual { process_id, .. } => {
-                Some(process_id)
-            }
-            FutexKey::Shared(_) => None,
-        }
-    }
-
     fn lock_bucket(&self, key: FutexKey) -> crate::sync::SpinNoIrqLockGuard<'_, FutexBucket> {
         self.buckets[Self::bucket_index(key)].lock()
     }
@@ -184,6 +175,7 @@ impl FutexManager {
                 waiter
                     .state
                     .store(FUTEX_WAITER_CANCELLED, Ordering::Release);
+                waiter.task.finish_futex_wait(bucket_index);
                 perf::record_futex_cleanup(true, false, 0, 0);
                 return FutexWaitCleanup::StillQueued;
             }
@@ -210,6 +202,7 @@ impl FutexManager {
     ) -> Option<(*mut super::TaskContext, Arc<FutexWaiter>)> {
         let bucket_index = Self::bucket_index(key);
         let (task, task_cx_ptr) = block_current_task_no_schedule_unless_interrupting_signal()?;
+        task.begin_futex_wait(bucket_index);
         let waiter = Arc::new(FutexWaiter {
             task,
             bitset,
@@ -239,6 +232,7 @@ impl FutexManager {
             }
             if waiter.bitset & bitset != 0 && tasks.len() < limit {
                 waiter.state.store(FUTEX_WAITER_WOKEN, Ordering::Release);
+                waiter.task.finish_futex_wait(Self::bucket_index(key));
                 tasks.push(Arc::clone(&waiter.task));
             } else {
                 kept.push_back(waiter);
@@ -263,6 +257,7 @@ impl FutexManager {
                 continue;
             }
             waiter.state.store(FUTEX_WAITER_WOKEN, Ordering::Release);
+            waiter.task.finish_futex_wait(Self::bucket_index(key));
             task = Some(Arc::clone(&waiter.task));
             break;
         }
@@ -340,6 +335,7 @@ impl FutexManager {
             }
             if tasks.len() < wake_limit {
                 waiter.state.store(FUTEX_WAITER_WOKEN, Ordering::Release);
+                waiter.task.finish_futex_wait(Self::bucket_index(source));
                 tasks.push(Arc::clone(&waiter.task));
             } else if moved.len() < requeue_limit {
                 moved.push_back(waiter);
@@ -368,37 +364,38 @@ impl FutexManager {
             // Publish the target only after the waiter is visible there. A
             // cleanup following the old index will miss and retry.
             waiter.bucket.store(target_bucket_index, Ordering::Release);
+            waiter.task.move_futex_wait(target_bucket_index);
         }
     }
 
-    fn remove_process(&self, process_id: usize) {
-        for bucket_lock in &self.buckets {
-            let mut bucket = bucket_lock.lock();
-            bucket.waiters.retain(|key, queue| {
-                if Self::address_space_process_id(*key) == Some(process_id) {
-                    for waiter in queue.iter() {
-                        waiter
-                            .state
-                            .store(FUTEX_WAITER_CANCELLED, Ordering::Release);
-                    }
-                    return false;
+    fn remove_tasks(&self, tasks: &[Arc<TaskControlBlock>]) {
+        for task in tasks {
+            loop {
+                let Some(bucket_index) = task.futex_wait_bucket() else {
+                    break;
+                };
+                let mut bucket = self.buckets[bucket_index].lock();
+                if task.futex_wait_bucket() != Some(bucket_index) {
+                    continue;
                 }
-                queue.retain(|waiter| {
-                    let keep = waiter.state.load(Ordering::Acquire) == FUTEX_WAITER_QUEUED
-                        && waiter
-                            .task
-                            .process
-                            .upgrade()
-                            .is_some_and(|process| process.getpid() != process_id);
-                    if !keep {
-                        waiter
-                            .state
-                            .store(FUTEX_WAITER_CANCELLED, Ordering::Release);
-                    }
-                    keep
+                let mut removed = false;
+                bucket.waiters.retain(|_, queue| {
+                    queue.retain(|waiter| {
+                        let keep = !Arc::ptr_eq(&waiter.task, task);
+                        if !keep {
+                            waiter
+                                .state
+                                .store(FUTEX_WAITER_CANCELLED, Ordering::Release);
+                            removed = true;
+                        }
+                        keep
+                    });
+                    !queue.is_empty()
                 });
-                !queue.is_empty()
-            });
+                debug_assert!(removed, "active futex waiter was absent from its bucket");
+                task.finish_futex_wait(bucket_index);
+                break;
+            }
         }
     }
 
@@ -852,8 +849,8 @@ fn futex_requeue(
     Ok(if count_requeued { moved + woken } else { woken })
 }
 
-pub(crate) fn remove_process_futex_waiters(process_id: usize) {
-    FUTEX_MANAGER.remove_process(process_id);
+pub(crate) fn remove_task_futex_waiters(tasks: &[Arc<TaskControlBlock>]) {
+    FUTEX_MANAGER.remove_tasks(tasks);
 }
 
 pub(crate) fn sys_set_robust_list(head: usize, len: usize) -> KResult {

@@ -66,6 +66,8 @@ pub(crate) use ptrace::{
     ptrace_syscall_exit_stop_for_task, ptrace_take_wait_status, ptrace_traceme_current,
     ptrace_validate_tracee,
 };
+use sched::remove_ready_tasks;
+#[cfg(feature = "ptrace")]
 use sched::remove_ready_tasks_of_process;
 pub use sched::{add_task, wakeup_task};
 pub(crate) use sched::{
@@ -192,10 +194,10 @@ fn terminate_sibling_threads(
     process_token: usize,
     process_id: usize,
     exit_code: i32,
-) {
+) -> Vec<Arc<TaskControlBlock>> {
     let mut clear_child_tids = Vec::new();
     let mut recycle_res = Vec::<TaskUserRes>::new();
-    let mut robust_tasks = Vec::new();
+    let mut exited_tasks = Vec::new();
     let mut exited_linux_tids = Vec::new();
     {
         let mut process_inner = process.inner_exclusive_access();
@@ -213,7 +215,7 @@ fn terminate_sibling_threads(
             if let Some(clear_child_tid) = task_inner.clear_child_tid.take() {
                 clear_child_tids.push(clear_child_tid);
             }
-            robust_tasks.push(Arc::clone(&task));
+            exited_tasks.push(Arc::clone(&task));
             if let Some(res) = task_inner.res.take() {
                 recycle_res.push(res);
             }
@@ -227,13 +229,14 @@ fn terminate_sibling_threads(
     for linux_tid in exited_linux_tids {
         unregister_task_linux_tid(linux_tid);
     }
-    for task in robust_tasks {
-        futex::exit_robust_list(&task, process_token, process_id);
+    for task in &exited_tasks {
+        futex::exit_robust_list(task, process_token, process_id);
     }
     for clear_child_tid in clear_child_tids {
         futex::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
     }
     recycle_res.clear();
+    exited_tasks
 }
 
 fn terminate_sibling_threads_for_exec(
@@ -244,9 +247,10 @@ fn terminate_sibling_threads_for_exec(
 ) {
     // Exec teardown must run before the new image is committed. Sibling tasks
     // still need the old token for robust-list and clear-child-tid cleanup.
-    terminate_sibling_threads(process, current_tid, process_token, process_id, 0);
-    remove_ready_tasks_of_process(process_id);
-    futex::remove_process_futex_waiters(process_id);
+    let exited_tasks =
+        terminate_sibling_threads(process, current_tid, process_token, process_id, 0);
+    remove_ready_tasks(&exited_tasks);
+    futex::remove_task_futex_waiters(&exited_tasks);
 }
 
 fn rebind_non_leader_for_exec(
@@ -261,7 +265,7 @@ fn rebind_non_leader_for_exec(
     // post-exec main thread is visible as the process leader.
     let mut clear_child_tids = Vec::new();
     let mut recycle_res = Vec::<TaskUserRes>::new();
-    let mut robust_tasks = Vec::new();
+    let mut exited_tasks = Vec::new();
     let mut exited_linux_tids = Vec::new();
     let mut old_current_linux_tid = None;
     {
@@ -302,7 +306,7 @@ fn rebind_non_leader_for_exec(
             if let Some(clear_child_tid) = task_inner.clear_child_tid.take() {
                 clear_child_tids.push(clear_child_tid);
             }
-            robust_tasks.push(Arc::clone(&task));
+            exited_tasks.push(Arc::clone(&task));
             if tid == 0 {
                 leader_res = task_inner.res.take();
             } else if let Some(res) = task_inner.res.take() {
@@ -337,15 +341,15 @@ fn rebind_non_leader_for_exec(
         unregister_task_linux_tid(linux_tid);
     }
     register_task_linux_tid(current);
-    for task in robust_tasks {
-        futex::exit_robust_list(&task, process_token, process_id);
+    for task in &exited_tasks {
+        futex::exit_robust_list(task, process_token, process_id);
     }
     for clear_child_tid in clear_child_tids {
         futex::clear_child_tid_and_wake(process_token, process_id, clear_child_tid);
     }
     recycle_res.clear();
-    remove_ready_tasks_of_process(process_id);
-    futex::remove_process_futex_waiters(process_id);
+    remove_ready_tasks(&exited_tasks);
+    futex::remove_task_futex_waiters(&exited_tasks);
     Ok(())
 }
 
@@ -930,9 +934,10 @@ fn exit_current(exit_code: i32, group_exit: bool) -> ! {
                 shutdown(false);
             }
         }
-        terminate_sibling_threads(&process, tid, process_token, process_id, exit_code);
-        remove_ready_tasks_of_process(pid);
-        futex::remove_process_futex_waiters(pid);
+        let exited_tasks =
+            terminate_sibling_threads(&process, tid, process_token, process_id, exit_code);
+        remove_ready_tasks(&exited_tasks);
+        futex::remove_task_futex_waiters(&exited_tasks);
         let core_context =
             signal_status_has_core_dump(exit_code).then(|| process.path_snapshot().context);
         let (

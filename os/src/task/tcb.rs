@@ -13,7 +13,7 @@ use alloc::{
     vec::Vec,
 };
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 pub const DEFAULT_TIMER_SLACK_NS: usize = 50_000;
 pub(crate) const SCHED_RR_INTERVAL_US: usize = 100_000;
@@ -52,9 +52,14 @@ pub struct TaskControlBlock {
     signal_pending: AtomicBool,
     #[cfg(target_arch = "loongarch64")]
     loongarch_fp_state_active: AtomicBool,
+    // Exact bucket ownership for an active futex wait. Process exit uses this
+    // task-local index to avoid scanning every global futex bucket.
+    futex_wait_bucket: AtomicUsize,
     // mutable
     pub inner: SpinNoIrqLock<TaskControlBlockInner>,
 }
+
+const NO_FUTEX_WAIT_BUCKET: usize = usize::MAX;
 
 #[repr(C, align(64))]
 struct TaskSched {
@@ -197,6 +202,7 @@ impl TaskControlBlock {
             signal_pending: AtomicBool::new(false),
             #[cfg(target_arch = "loongarch64")]
             loongarch_fp_state_active: AtomicBool::new(false),
+            futex_wait_bucket: AtomicUsize::new(NO_FUTEX_WAIT_BUCKET),
             inner: SpinNoIrqLock::new(TaskControlBlockInner {
                 res: Some(res),
                 tid,
@@ -239,6 +245,48 @@ impl TaskControlBlock {
 
     pub fn inner_exclusive_access(&self) -> SpinNoIrqLockGuard<'_, TaskControlBlockInner> {
         self.inner.lock()
+    }
+
+    pub(crate) fn begin_futex_wait(&self, bucket: usize) {
+        assert!(
+            self.futex_wait_bucket
+                .compare_exchange(
+                    NO_FUTEX_WAIT_BUCKET,
+                    bucket,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
+                .is_ok(),
+            "task entered a second futex wait"
+        );
+    }
+
+    pub(crate) fn move_futex_wait(&self, bucket: usize) {
+        assert_ne!(
+            self.futex_wait_bucket.load(Ordering::Acquire),
+            NO_FUTEX_WAIT_BUCKET,
+            "unqueued task cannot be requeued on a futex"
+        );
+        self.futex_wait_bucket.store(bucket, Ordering::Release);
+    }
+
+    pub(crate) fn futex_wait_bucket(&self) -> Option<usize> {
+        let bucket = self.futex_wait_bucket.load(Ordering::Acquire);
+        (bucket != NO_FUTEX_WAIT_BUCKET).then_some(bucket)
+    }
+
+    pub(crate) fn finish_futex_wait(&self, bucket: usize) {
+        assert!(
+            self.futex_wait_bucket
+                .compare_exchange(
+                    bucket,
+                    NO_FUTEX_WAIT_BUCKET,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok(),
+            "futex waiter lost its bucket ownership"
+        );
     }
 
     /// Claims this task's embedded remote-wake node before list publication.
