@@ -30,9 +30,9 @@ use log::{info, warn};
 
 pub(crate) use flags::mount_stat_flags_from_linux_mount_flags;
 use flags::{
-    MOUNT_STAT_NOATIME, MOUNT_STAT_NODEV, MOUNT_STAT_NODIRATIME, MOUNT_STAT_NOEXEC,
-    MOUNT_STAT_RDONLY, MOUNT_STAT_VALID, mount_flags_from_options, mount_flags_have_nosymfollow,
-    mount_options_from_flags, normalize_mount_stat_flags,
+    MOUNT_STAT_NODEV, MOUNT_STAT_NOEXEC, MOUNT_STAT_RDONLY, MOUNT_STAT_VALID,
+    mount_flags_from_options, mount_flags_have_nosymfollow, mount_options_from_flags,
+    normalize_mount_stat_flags,
 };
 use release::{PendingInodeRelease, PendingReleaseQueue};
 
@@ -489,14 +489,14 @@ impl MountedFs {
         fs_type: &'static str,
         options: &'static str,
     ) -> Arc<Self> {
-        let stat_flags = mount_flags_from_options(options);
+        let stat_flags = mount_flags_from_options(fs_type, options);
         if mount_flags_have_nosymfollow(stat_flags) {
             NOSYMFOLLOW_MOUNT_COUNT.fetch_add(1, Ordering::Relaxed);
         }
         Arc::new(Self {
             source,
             fs_type,
-            options: SleepMutex::new(options),
+            options: SleepMutex::new(mount_options_from_flags(stat_flags)),
             stat_flags: AtomicU64::new(stat_flags),
             writable_regular_opens: AtomicUsize::new(0),
             backend: Arc::new(SerializedBackend::new(backend)),
@@ -510,14 +510,14 @@ impl MountedFs {
         fs_type: &'static str,
         options: &'static str,
     ) -> Arc<Self> {
-        let stat_flags = mount_flags_from_options(options);
+        let stat_flags = mount_flags_from_options(fs_type, options);
         if mount_flags_have_nosymfollow(stat_flags) {
             NOSYMFOLLOW_MOUNT_COUNT.fetch_add(1, Ordering::Relaxed);
         }
         Arc::new(Self {
             source,
             fs_type,
-            options: SleepMutex::new(options),
+            options: SleepMutex::new(mount_options_from_flags(stat_flags)),
             stat_flags: AtomicU64::new(stat_flags),
             writable_regular_opens: AtomicUsize::new(0),
             backend,
@@ -526,7 +526,7 @@ impl MountedFs {
     }
 
     fn set_stat_flags(&self, flags: u64) {
-        let flags = normalize_mount_stat_flags(flags);
+        let flags = normalize_mount_stat_flags(self.fs_type, flags);
         // `options` is the rare-writer lock. Syscall readers consume only the
         // atomic flags and never enter this critical section.
         let mut options = self.options.lock();
@@ -2337,7 +2337,7 @@ pub(crate) fn mount_ext_scratch_at(
                     existing_source == source && *existing_fs_type == fs_type
                 })
         {
-            mounted.set_stat_flags(mount_flags_from_options(options));
+            mounted.set_stat_flags(mount_flags_from_options(fs_type, options));
             refresh_mounted_stat_flags(mounted);
             mounted.clone()
         } else {
@@ -2448,7 +2448,6 @@ pub(crate) fn set_mount_stat_flags(mount_id: MountId, flags: u64) -> Result<(), 
             .and_then(|mount| mount.as_ref().cloned())
     }
     .ok_or(MountError::TargetNotMounted)?;
-    let flags = normalize_mount_stat_flags(flags);
     let current_flags = mounted.stat_flags.load(Ordering::Acquire);
     if flags & MOUNT_STAT_RDONLY != 0
         && current_flags & MOUNT_STAT_RDONLY == 0
@@ -2880,14 +2879,6 @@ pub(crate) fn mount_is_nodev(mount_id: MountId) -> bool {
 
 pub(crate) fn mount_is_noexec(mount_id: MountId) -> bool {
     mount_stat_flags(mount_id).is_some_and(|flags| flags & MOUNT_STAT_NOEXEC != 0)
-}
-
-pub(crate) fn mount_is_noatime(mount_id: MountId) -> bool {
-    mount_stat_flags(mount_id).is_some_and(|flags| flags & MOUNT_STAT_NOATIME != 0)
-}
-
-pub(crate) fn mount_is_nodiratime(mount_id: MountId) -> bool {
-    mount_stat_flags(mount_id).is_some_and(|flags| flags & MOUNT_STAT_NODIRATIME != 0)
 }
 
 pub(crate) fn mount_is_nosymfollow(mount_id: MountId) -> bool {

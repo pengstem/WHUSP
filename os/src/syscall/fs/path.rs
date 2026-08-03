@@ -408,12 +408,8 @@ fn check_open_existing_access_from(
         Err(err) => return Err(err),
     };
 
-    // CONTEXT: Linux gates O_NOATIME on file ownership or CAP_FOWNER. This
-    // kernel's capabilities are still process-wide and not recalculated across
-    // setuid transitions, so uid 0 is the current CAP_FOWNER-equivalent check.
-    if flags.contains(OpenFlags::NOATIME) && subject.uid() != stat.uid && !subject.is_root() {
-        return Err(Errno::EPERM);
-    }
+    // CONTEXT: O_NOATIME is accepted as a compatibility no-op because ordinary
+    // filesystems already disable atime updates at the backend boundary.
 
     if flags.contains(OpenFlags::PATH) {
         return Ok(());
@@ -602,12 +598,11 @@ fn openat_dir_path(snapshot: &PathSnapshot, dirfd: isize, path: &str) -> KResult
 }
 
 /// Root read-only opens need no target DAC decision in the syscall adapter.
-/// Keep create, write, truncate, O_NOATIME, and O_PATH on the compatibility
+/// Keep create, write, truncate, and O_PATH on the compatibility
 /// path until their remaining permission and read-only-mount checks live in the
 /// VFS open result itself.
 fn root_existing_open_precheck_is_redundant(flags: OpenFlags, subject: AccessSubject<'_>) -> bool {
     subject.is_root()
-        && !flags.contains(OpenFlags::NOATIME)
         && !flags.contains(OpenFlags::PATH)
         && !flags.contains(OpenFlags::CREATE)
         && !flags.contains(OpenFlags::TMPFILE)

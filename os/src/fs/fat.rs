@@ -202,7 +202,10 @@ impl FatMount {
         dev: Arc<VirtIOBlock>,
         partition: BlockPartition,
     ) -> Result<Self, FatError<()>> {
-        let fs = KernelFatFs::new(FatBlockDevice::new(dev, partition), FsOptions::new())?;
+        // Keep the backend-level noatime policy explicit instead of relying on
+        // the fatfs crate's current default.
+        let options = FsOptions::new().update_accessed_date(false);
+        let fs = KernelFatFs::new(FatBlockDevice::new(dev, partition), options)?;
         let mut path_to_ino = BTreeMap::new();
         let mut ino_to_path = BTreeMap::new();
         let mut ino_to_kind = BTreeMap::new();

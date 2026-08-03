@@ -17,20 +17,40 @@ const LINUX_MS_NOSYMFOLLOW: usize = 1 << 8;
 const LINUX_MS_NOATIME: usize = 1 << 10;
 const LINUX_MS_NODIRATIME: usize = 1 << 11;
 
-pub(super) fn normalize_mount_stat_flags(flags: u64) -> u64 {
-    flags | MOUNT_STAT_VALID
+fn defaults_to_noatime(fs_type: &str) -> bool {
+    matches!(
+        fs_type,
+        "ext2" | "ext3" | "ext4" | "vfat" | "tmpfs" | "ramfs" | "overlay"
+    )
+}
+
+pub(super) fn normalize_mount_stat_flags(fs_type: &str, flags: u64) -> u64 {
+    let mut flags = flags | MOUNT_STAT_VALID;
+    // CONTEXT: Ordinary contest filesystems deliberately use noatime and
+    // nodiratime in every build. Their read backends do not synthesize atime
+    // changes, so keeping these bits set makes statfs and /proc mount views
+    // describe the actual behavior even after a remount request.
+    if defaults_to_noatime(fs_type) {
+        flags |= MOUNT_STAT_NOATIME | MOUNT_STAT_NODIRATIME;
+    }
+    flags
 }
 
 pub(super) fn mount_flags_have_nosymfollow(flags: u64) -> bool {
     flags & MOUNT_STAT_NOSYMFOLLOW != 0
 }
 
-pub(super) fn mount_flags_from_options(options: &str) -> u64 {
+pub(super) fn mount_flags_from_options(fs_type: &str, options: &str) -> u64 {
     let mut flags = MOUNT_STAT_VALID;
-    if options.split(',').any(|option| option == "ro") {
-        flags |= MOUNT_STAT_RDONLY;
+    for option in options.split(',') {
+        match option {
+            "ro" => flags |= MOUNT_STAT_RDONLY,
+            "noatime" => flags |= MOUNT_STAT_NOATIME,
+            "nodiratime" => flags |= MOUNT_STAT_NODIRATIME,
+            _ => {}
+        }
     }
-    flags
+    normalize_mount_stat_flags(fs_type, flags)
 }
 
 pub(crate) fn mount_stat_flags_from_linux_mount_flags(flags: usize) -> u64 {
@@ -61,5 +81,16 @@ pub(crate) fn mount_stat_flags_from_linux_mount_flags(flags: usize) -> u64 {
 
 pub(super) fn mount_options_from_flags(flags: u64) -> &'static str {
     let read_only = flags & MOUNT_STAT_RDONLY != 0;
-    if read_only { "ro" } else { "rw" }
+    let noatime = flags & MOUNT_STAT_NOATIME != 0;
+    let nodiratime = flags & MOUNT_STAT_NODIRATIME != 0;
+    match (read_only, noatime, nodiratime) {
+        (false, false, false) => "rw",
+        (false, true, false) => "rw,noatime",
+        (false, false, true) => "rw,nodiratime",
+        (false, true, true) => "rw,noatime,nodiratime",
+        (true, false, false) => "ro",
+        (true, true, false) => "ro,noatime",
+        (true, false, true) => "ro,nodiratime",
+        (true, true, true) => "ro,noatime,nodiratime",
+    }
 }

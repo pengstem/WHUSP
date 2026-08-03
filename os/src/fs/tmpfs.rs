@@ -1134,9 +1134,6 @@ impl LegacyDataOps for TmpFs {
         if inode.kind == FsNodeKind::Directory {
             return 0;
         }
-        if !buf.is_empty() {
-            inode.atime = FileTimestamp::now();
-        }
         if offset >= inode.size {
             return 0;
         }

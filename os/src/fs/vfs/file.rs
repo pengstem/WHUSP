@@ -13,12 +13,12 @@ use super::super::inode_state::{
 };
 use super::super::mount::{
     MountId, MountNamespaceId, MountedBackendLease, mount_any_nosymfollow, mount_exists,
-    mount_is_devfs, mount_is_noatime, mount_is_nodev, mount_is_nodiratime, mount_is_nosymfollow,
-    mount_is_read_only, mount_supports_dirty_writeback, mount_supports_page_cache,
-    mounted_backend_lease, release_inode_from_drop, release_inode_from_drop_with_lease,
-    retain_inode, retain_inode_with_lease, stat_basic_cached,
-    stat_basic_cached_with_state_and_lease, stat_full_cached,
-    stat_full_cached_with_state_and_lease, static_mount_children_for_dir, with_mount,
+    mount_is_devfs, mount_is_nodev, mount_is_nosymfollow, mount_is_read_only,
+    mount_supports_dirty_writeback, mount_supports_page_cache, mounted_backend_lease,
+    release_inode_from_drop, release_inode_from_drop_with_lease, retain_inode,
+    retain_inode_with_lease, stat_basic_cached, stat_basic_cached_with_state_and_lease,
+    stat_full_cached, stat_full_cached_with_state_and_lease, static_mount_children_for_dir,
+    with_mount,
 };
 use super::super::named_fifo::open_named_fifo;
 use super::super::path::{PathContext, WorkingDir};
@@ -1481,15 +1481,6 @@ impl VfsFile {
         self.read_backend_at_profiled(offset, buf, perf::ProfilePoint::VfsReadBackend)
     }
 
-    fn read_backend_at_preserve_noatime(&self, offset: usize, buf: &mut [u8]) -> usize {
-        let noatime_snapshot = self.noatime_snapshot();
-        let read_size = self.read_backend_at(offset, buf);
-        if !buf.is_empty() {
-            self.restore_noatime(noatime_snapshot);
-        }
-        read_size
-    }
-
     fn read_snapshot_at(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
         let VfsFileSnapshotState::Read(snapshot) = &self.snapshot_state else {
             return None;
@@ -1575,13 +1566,11 @@ impl VfsFile {
             if read_limit == 0 {
                 break;
             }
-            let noatime_snapshot = self.noatime_snapshot();
             let read_size = self.read_backend_at_profiled(
                 *offset,
                 &mut bounce[..read_limit],
                 perf::ProfilePoint::VfsReadCoalescedBackend,
             );
-            self.restore_noatime(noatime_snapshot);
             if read_size == 0 {
                 break;
             }
@@ -1599,73 +1588,6 @@ impl VfsFile {
             }
         }
         Some(total_read_size)
-    }
-
-    fn noatime_snapshot(&self) -> Option<(FileTimestamp, FileTimestamp)> {
-        if !self.status_flags.get().contains(OpenFlags::NOATIME)
-            && !mount_is_noatime(self.node.mount_id)
-        {
-            return None;
-        }
-        let stat =
-            stat_basic_cached_with_state_and_lease(&self.inode_state, &self.mount_backend).ok()?;
-        Some((
-            FileTimestamp {
-                sec: stat.atime_sec,
-                nsec: stat.atime_nsec,
-            },
-            FileTimestamp {
-                sec: stat.ctime_sec,
-                nsec: stat.ctime_nsec,
-            },
-        ))
-    }
-
-    fn restore_noatime(&self, snapshot: Option<(FileTimestamp, FileTimestamp)>) {
-        if let Some((atime, ctime)) = snapshot {
-            let _ = inode_state::with_metadata_update_state(
-                &self.inode_state,
-                inode_state::MetadataCacheUpdate::Times {
-                    atime: Some(atime),
-                    mtime: None,
-                    ctime,
-                },
-                || {
-                    self.with_backend(BackendOp::NamespaceMutation, |mount| {
-                        mount.set_times(self.node.ino, Some(atime), None, ctime)
-                    })
-                },
-            );
-        }
-    }
-
-    fn touch_directory_atime(&self) {
-        if mount_is_noatime(self.node.mount_id) || mount_is_nodiratime(self.node.mount_id) {
-            return;
-        }
-        let Ok(stat) =
-            stat_full_cached_with_state_and_lease(&self.inode_state, &self.mount_backend)
-        else {
-            return;
-        };
-        let ctime = FileTimestamp {
-            sec: stat.ctime_sec,
-            nsec: stat.ctime_nsec,
-        };
-        let atime = FileTimestamp::now();
-        let _ = inode_state::with_metadata_update_state(
-            &self.inode_state,
-            inode_state::MetadataCacheUpdate::Times {
-                atime: Some(atime),
-                mtime: None,
-                ctime,
-            },
-            || {
-                self.with_backend(BackendOp::NamespaceMutation, |mount| {
-                    mount.set_times(self.node.ino, Some(atime), None, ctime)
-                })
-            },
-        );
     }
 
     fn cached_page_cache_id(&self) -> Option<PageCacheId> {
@@ -1868,7 +1790,6 @@ impl VfsFile {
                 vec![0u8; read_limit]
             };
 
-            let noatime_snapshot = self.noatime_snapshot();
             let _profile_scope = perf::time_scope(perf::ProfilePoint::VfsReadCacheFill);
             let fill_buf = if let Some(run) = frame_run.as_mut() {
                 &mut run.as_mut_bytes()[..read_limit]
@@ -1887,7 +1808,6 @@ impl VfsFile {
                     })
                 }
             });
-            self.restore_noatime(noatime_snapshot);
             perf::record_vfs_read_cache_backend_read();
             assert!(
                 read_len <= read_limit,
@@ -2792,7 +2712,7 @@ impl File for VfsFile {
                 })
                 .or_else(|| self.read_dirty_regular_at(*offset, slice))
                 .or_else(|| self.read_regular_cached_at(*offset, slice))
-                .unwrap_or_else(|| self.read_backend_at_preserve_noatime(*offset, slice));
+                .unwrap_or_else(|| self.read_backend_at(*offset, slice));
                 if read_size == 0 {
                     break;
                 }
@@ -2853,7 +2773,7 @@ impl File for VfsFile {
         })
         .or_else(|| self.read_dirty_regular_at(offset, buf))
         .or_else(|| self.read_regular_cached_at(offset, buf))
-        .unwrap_or_else(|| self.read_backend_at_preserve_noatime(offset, buf))
+        .unwrap_or_else(|| self.read_backend_at(offset, buf))
     }
 
     fn populate_clean_page_cache_at(&self, offset: usize) -> bool {
@@ -3135,7 +3055,6 @@ impl File for VfsFile {
         if read_size == 0 {
             return Ok(0);
         }
-        self.touch_directory_atime();
         let mut user_buf = user_buf;
         let copied = user_buf.copy_from_slice(&kernel_buf[..read_size]);
         debug_assert_eq!(copied, read_size);

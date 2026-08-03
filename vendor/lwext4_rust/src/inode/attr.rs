@@ -128,11 +128,6 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         self.mark_dirty();
     }
 
-    pub fn update_atime(&mut self) {
-        if let Some(dur) = Hal::now() {
-            self.set_atime(&dur);
-        }
-    }
     pub fn update_mtime(&mut self) {
         if let Some(dur) = Hal::now() {
             self.set_mtime(&dur);
