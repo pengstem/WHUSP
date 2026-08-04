@@ -12,7 +12,7 @@ use lazy_static::*;
 const RT_PRIORITY_MAX: usize = 99;
 const RT_QUEUE_COUNT: usize = RT_PRIORITY_MAX + 1;
 const NICE_0_LOAD: u64 = 1024;
-const NORMAL_PREEMPT_GRANULARITY_US: u64 = 1_000;
+const NORMAL_PREEMPT_GRANULARITY_US: u64 = 8_000;
 const STEAL_VICTIM_PROBE_LIMIT: usize = 4;
 const STEAL_BATCH_MAX: usize = 4;
 const STEAL_TASK_SCAN_BUDGET: usize = 8;
