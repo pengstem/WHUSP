@@ -2,7 +2,7 @@
 use super::ptrace_note_exec_current;
 use super::{
     SigAltStack, SignalAction, current_task, prepare_exec_thread_group,
-    process::{ProcessControlBlock, comm_from_cmdline, empty_process_pkey_rights},
+    process::{ProcessControlBlock, comm_from_cmdline},
     refresh_current_user_token,
 };
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
@@ -404,7 +404,6 @@ impl ProcessControlBlock {
         let (retired_memory_set, previous_executable_node, close_on_exec_entries) = {
             let mut inner = self.inner_exclusive_access();
             let retired_memory_set = core::mem::replace(&mut inner.memory_set, memory_set);
-            inner.pkey_rights = empty_process_pkey_rights();
             let previous = core::mem::replace(&mut inner.executable_node, executable_node);
             inner.executable_path = executable_path;
             inner.did_exec_after_fork = true;

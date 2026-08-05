@@ -739,9 +739,8 @@ pub(crate) use path::{PathContext, WorkingDir, normalize_path_at_root, path_insi
 pub(crate) use pipe::default_pipe_capacity_for_process;
 pub use pipe::make_pipe;
 pub(crate) use procfs::{
-    ProcNamespaceInfo, ProcNamespaceKind, core_pattern_for_pid, note_madvise_willneed,
-    proc_namespace_info_from_path, proc_namespace_info_from_stat_ino, proc_namespace_kind_name,
-    proc_namespace_stat_ino,
+    ProcNamespaceInfo, ProcNamespaceKind, core_pattern_for_pid, proc_namespace_info_from_path,
+    proc_namespace_info_from_stat_ino, proc_namespace_kind_name, proc_namespace_stat_ino,
 };
 pub(crate) use procfs::{note_readahead as procfs_note_readahead, pipe_max_size};
 #[cfg(feature = "staticfs")]

@@ -650,18 +650,11 @@ pub(crate) fn syscall_with_context(
         SYSCALL_MUNMAP => sys_munmap_ctx(ctx, args[0], args[1]),
         SYSCALL_MREMAP => sys_mremap(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_MPROTECT => sys_mprotect_ctx(ctx, args[0], args[1], args[2]),
-        SYSCALL_MLOCK => sys_mlock(args[0], args[1]),
-        SYSCALL_MUNLOCK => sys_munlock(args[0], args[1]),
-        SYSCALL_MLOCKALL => sys_mlockall(args[0]),
-        SYSCALL_MUNLOCKALL => sys_munlockall(),
         SYSCALL_MINCORE => sys_mincore(args[0], args[1], args[2] as *mut u8),
         SYSCALL_MADVISE => sys_madvise(args[0], args[1], args[2] as i32),
         SYSCALL_REMAP_FILE_PAGES => {
             sys_remap_file_pages(args[0], args[1], args[2] as i32, args[3], args[4] as i32)
         }
-        SYSCALL_PKEY_MPROTECT => sys_pkey_mprotect(args[0], args[1], args[2], args[3] as isize),
-        SYSCALL_PKEY_ALLOC => sys_pkey_alloc(args[0], args[1]),
-        SYSCALL_PKEY_FREE => sys_pkey_free(args[0] as isize),
         SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_CLONE3 => sys_clone3(args[0] as *const LinuxCloneArgs, args[1]),
         SYSCALL_EXECVE => sys_execve_ctx(
@@ -680,7 +673,6 @@ pub(crate) fn syscall_with_context(
         ),
         SYSCALL_MMAP => sys_mmap_ctx(ctx, args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2] as i32),
-        SYSCALL_MLOCK2 => sys_mlock2(args[0], args[1], args[2]),
         SYSCALL_WAIT4 => sys_wait4_ctx(
             ctx,
             args[0] as isize,

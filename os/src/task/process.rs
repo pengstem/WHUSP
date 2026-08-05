@@ -21,18 +21,12 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering
 
 pub const RLIM_INFINITY: usize = usize::MAX;
 const FD_BITMAP_WORD_BITS: usize = usize::BITS as usize;
-pub(crate) const PROCESS_PKEY_COUNT: usize = 16;
-pub(crate) type ProcessPKeyRights = [Option<usize>; PROCESS_PKEY_COUNT];
 #[cfg(any(feature = "setitimer", feature = "posix-timers"))]
 type TimerRearm = Option<(usize, u64)>;
 #[cfg(feature = "setitimer")]
 type RealTimerExpiry = (Arc<TaskControlBlock>, TimerRearm);
 #[cfg(feature = "posix-timers")]
 type PosixTimerExpiry = (Arc<TaskControlBlock>, u32, TimerRearm);
-
-pub(crate) fn empty_process_pkey_rights() -> ProcessPKeyRights {
-    [None; PROCESS_PKEY_COUNT]
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,7 +69,6 @@ pub enum RLimitResource {
     Rss = 5,
     NProc = 6,
     NoFile = 7,
-    MemLock = 8,
     As = 9,
     Locks = 10,
     SigPending = 11,
@@ -97,7 +90,6 @@ impl RLimitResource {
             5 => Some(Self::Rss),
             6 => Some(Self::NProc),
             7 => Some(Self::NoFile),
-            8 => Some(Self::MemLock),
             9 => Some(Self::As),
             10 => Some(Self::Locks),
             11 => Some(Self::SigPending),
@@ -116,7 +108,6 @@ pub struct ProcessResourceLimits {
     stack: RLimit,
     core: RLimit,
     nofile: RLimit,
-    memlock: RLimit,
 }
 
 impl ProcessResourceLimits {
@@ -126,7 +117,6 @@ impl ProcessResourceLimits {
             stack: RLimit::soft_with_hard(USER_STACK_SIZE, RLIM_INFINITY),
             core: RLimit::infinity(),
             nofile: RLimit::fixed(FD_LIMIT),
-            memlock: RLimit::infinity(),
         }
     }
 
@@ -136,7 +126,6 @@ impl ProcessResourceLimits {
             RLimitResource::Stack => self.stack,
             RLimitResource::Core => self.core,
             RLimitResource::NoFile => self.nofile,
-            RLimitResource::MemLock => self.memlock,
             _ => RLimit::infinity(),
         }
     }
@@ -147,7 +136,6 @@ impl ProcessResourceLimits {
             RLimitResource::Stack => self.stack = limit,
             RLimitResource::Core => self.core = limit,
             RLimitResource::NoFile => self.nofile = limit,
-            RLimitResource::MemLock => self.memlock = limit,
             _ => return false,
         }
         true
@@ -184,7 +172,6 @@ pub struct CapabilitySets {
 
 impl CapabilitySets {
     pub const CAP_SETPCAP: usize = 8;
-    pub const CAP_IPC_LOCK: usize = 14;
     pub const CAP_IPC_OWNER: usize = 15;
     pub const CAP_SYS_CHROOT: usize = 18;
     pub const CAP_SYS_PTRACE: usize = 19;
@@ -354,7 +341,6 @@ pub(crate) struct ProcessProcSnapshot {
     pub(crate) user_namespace_id: usize,
     pub(crate) user_namespace_parent_id: Option<usize>,
     pub(crate) resident_kb: usize,
-    pub(crate) locked_kb: usize,
     pub(crate) no_new_privs: bool,
     pub(crate) timer_slack_ns: usize,
 }
@@ -1310,7 +1296,6 @@ pub struct ProcessControlBlockInner {
     // all threads in the process.
     pub credentials: Credentials,
     pub resource_limits: ProcessResourceLimits,
-    pub(crate) pkey_rights: ProcessPKeyRights,
     pub membarrier_private_expedited_registered: bool,
     pub signal_actions: [SignalAction; SIGNAL_INFO_SLOTS],
     pub cpu_times: ProcessCpuTimes,
@@ -1923,7 +1908,6 @@ impl ProcessControlBlock {
             user_namespace_id: inner.namespaces.user_id,
             user_namespace_parent_id: inner.namespaces.user_parent_id,
             resident_kb,
-            locked_kb: inner.memory_set.locked_bytes() / 1024,
             no_new_privs: inner.no_new_privs,
             timer_slack_ns,
         }
@@ -1964,15 +1948,13 @@ impl ProcessControlBlock {
             output.push_str(&format!(
                 "{:x}-{:x} {} {:08x} 00:00 0\n\
                  Size:\t{} kB\n\
-                 Rss:\t{} kB\n\
-                 Locked:\t{} kB\n",
+                 Rss:\t{} kB\n",
                 entry.start,
                 entry.end,
                 perms,
                 entry.offset,
                 (entry.end - entry.start) / 1024,
                 entry.resident_kb,
-                entry.locked_kb,
             ));
         }
         output

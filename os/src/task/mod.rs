@@ -30,12 +30,10 @@ use lazy_static::*;
 use lifecycle::{register_task_linux_tid, unregister_task_linux_tid};
 use log::info;
 pub(crate) use process::{
-    Credentials, PROCESS_PKEY_COUNT, PathSnapshot, ProcessProcSnapshot, RLimit, RLimitResource,
-    proc_task_state,
+    Credentials, PathSnapshot, ProcessProcSnapshot, RLimit, RLimitResource, proc_task_state,
 };
 pub use process::{ProcessControlBlock, ProcessCpuTimesSnapshot};
 use sched::{charge_task_after_run, fetch_task};
-pub(crate) const CAP_IPC_LOCK: usize = process::CapabilitySets::CAP_IPC_LOCK;
 pub(crate) const CAP_IPC_OWNER: usize = process::CapabilitySets::CAP_IPC_OWNER;
 pub(crate) const CAP_SETPCAP: usize = process::CapabilitySets::CAP_SETPCAP;
 pub(crate) const CAP_SYS_CHROOT: usize = process::CapabilitySets::CAP_SYS_CHROOT;

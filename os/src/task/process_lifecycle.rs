@@ -6,7 +6,7 @@ use super::process::ProcessTimers;
 use super::process::{
     Credentials, CredentialsFastState, FdTableFastState, ProcessControlBlock,
     ProcessControlBlockInner, ProcessCpuTimes, ProcessFsContext, ProcessFsFastState,
-    ProcessMemoryFastState, ProcessResourceLimits, comm_from_cmdline, empty_process_pkey_rights,
+    ProcessMemoryFastState, ProcessResourceLimits, comm_from_cmdline,
     fd_allocation_state_from_table,
 };
 use super::signal::signal_action_masks;
@@ -176,7 +176,6 @@ impl ProcessControlBlock {
                 ptrace: Default::default(),
                 credentials: Credentials::root(),
                 resource_limits: ProcessResourceLimits::new(),
-                pkey_rights: empty_process_pkey_rights(),
                 membarrier_private_expedited_registered: false,
                 signal_actions,
                 cpu_times: ProcessCpuTimes::default(),
@@ -310,7 +309,6 @@ impl ProcessControlBlock {
         let umask = parent.umask;
         let credentials = parent.credentials.clone();
         let resource_limits = parent.resource_limits;
-        let pkey_rights = parent.pkey_rights;
         let comm = parent.comm.clone();
         let dumpable = parent.dumpable;
         let securebits = parent.securebits;
@@ -413,7 +411,6 @@ impl ProcessControlBlock {
                 ptrace: Default::default(),
                 credentials,
                 resource_limits,
-                pkey_rights,
                 membarrier_private_expedited_registered,
                 signal_actions,
                 cpu_times: ProcessCpuTimes::with_inherited_self_maxrss(inherited_self_maxrss_kb),

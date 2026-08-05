@@ -50,7 +50,6 @@ clone03
 mmap19
 ioctl_ns03
 mmap02
-mlock04
 ioctl_ns04
 pty02
 nice02
@@ -60,7 +59,6 @@ epoll_ctl03
 waitpid01
 fanotify10
 splice08
-pkey01
 confstr01
 access01
 open11
@@ -106,7 +104,6 @@ chown04
 mmap06
 msgrcv02
 access03
-mlock201
 fanotify02
 lseek11
 msgctl01
@@ -123,14 +120,6 @@ fchown02
 fchown03
 fchown04
 fchown05
-madvise01
-madvise02
-madvise03
-madvise05
-madvise07
-madvise08
-madvise10
-madvise11
 faccessat201
 unlinkat01
 setreuid01
@@ -182,7 +171,6 @@ fcntl30
 getrandom01
 setresuid02
 sched_setaffinity01
-mlock202
 fcntl30_64
 sched_rr_get_interval01
 sched_getaffinity01
@@ -190,7 +178,6 @@ chmod03
 ioctl_ns07
 sendfile03_64
 dup203
-mlock03
 pwritev02
 sched_setscheduler01
 pwritev02_64
@@ -256,7 +243,6 @@ fcntl29_64
 dup07
 gettimeofday01
 setresuid03
-mlock02
 write05
 pwritev01
 epoll_ctl01
@@ -302,7 +288,6 @@ dup204
 waitpid09
 inotify_init1_02
 pidns02
-mlock01
 lseek01
 splice06
 clock_settime01
@@ -347,7 +332,6 @@ fchmodat02
 dup207
 pidns30
 open09
-mlock05
 pidns04
 open01
 write06
@@ -649,7 +633,6 @@ open03
 ioctl_ns02
 waitpid11
 splice02
-mlock203
 waitpid07
 pipe10
 mmap08

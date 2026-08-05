@@ -4,7 +4,7 @@ use super::{frame_alloc, frame_alloc_uninit};
 use crate::config::PAGE_SIZE;
 use crate::fs::File;
 use crate::mm::page_cache::{PAGE_CACHE, PageCacheId, PageCacheKey};
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -15,12 +15,6 @@ pub struct MapArea {
     pub(super) map_perm: MapPermission,
     pub(super) mmap_info: Option<MmapInfo>,
     pub(super) shm_info: Option<ShmAreaInfo>,
-    pub(super) locked: bool,
-    pub(super) lock_on_fault: bool,
-    pub(super) wipe_on_fork: bool,
-    pub(super) dumpable: bool,
-    pub(super) poisoned_pages: BTreeSet<VirtPageNum>,
-    pub(super) lazy_free_pages: BTreeSet<VirtPageNum>,
 }
 
 pub struct MmapFlush {
@@ -198,12 +192,6 @@ impl MapArea {
             map_perm,
             mmap_info: None,
             shm_info: None,
-            locked: false,
-            lock_on_fault: false,
-            wipe_on_fork: false,
-            dumpable: true,
-            poisoned_pages: BTreeSet::new(),
-            lazy_free_pages: BTreeSet::new(),
         }
     }
 
@@ -226,12 +214,6 @@ impl MapArea {
                 info.pages.clear();
                 info
             }),
-            locked: false,
-            lock_on_fault: false,
-            wipe_on_fork: another.wipe_on_fork,
-            dumpable: another.dumpable,
-            poisoned_pages: another.poisoned_pages.clone(),
-            lazy_free_pages: another.lazy_free_pages.clone(),
         }
     }
 
@@ -260,12 +242,6 @@ impl MapArea {
             map_perm: self.map_perm,
             mmap_info: right_mmap_info,
             shm_info: right_shm_info,
-            locked: self.locked,
-            lock_on_fault: self.lock_on_fault,
-            wipe_on_fork: self.wipe_on_fork,
-            dumpable: self.dumpable,
-            poisoned_pages: self.poisoned_pages.split_off(&at),
-            lazy_free_pages: self.lazy_free_pages.split_off(&at),
         };
         self.vpn_range = VPNRange::new(start, at);
         Some(right)
@@ -618,18 +594,43 @@ impl MapArea {
         }
     }
 
-    fn retire_framed_page(
+    pub(super) fn discard_mmap_resident_range(
         &mut self,
         page_table: &mut PageTable,
-        vpn: VirtPageNum,
+        start: VirtPageNum,
+        end: VirtPageNum,
         retired: &mut RetiredUserPages,
-    ) -> bool {
-        let Some(frame) = self.data_frames.remove(&vpn) else {
-            return false;
+    ) {
+        let framed: Vec<_> = self
+            .data_frames
+            .range(start..end)
+            .map(|(vpn, _)| *vpn)
+            .collect();
+        for vpn in framed {
+            let frame = self
+                .data_frames
+                .remove(&vpn)
+                .expect("mmap resident frame disappeared during discard");
+            clear_resident_pte(page_table, vpn, retired);
+            retired.frames.push(frame);
+        }
+
+        let Some(info) = self.mmap_info.as_mut() else {
+            return;
         };
-        clear_resident_pte(page_table, vpn, retired);
-        retired.frames.push(frame);
-        true
+        let cached: Vec<_> = info
+            .page_cache_pages
+            .range(start..end)
+            .map(|(vpn, _)| *vpn)
+            .collect();
+        for vpn in cached {
+            let key = info
+                .page_cache_pages
+                .remove(&vpn)
+                .expect("mmap page-cache reference disappeared during discard");
+            clear_resident_pte(page_table, vpn, retired);
+            retired.page_cache_refs.push(key);
+        }
     }
 
     pub(super) fn copy_data(&mut self, page_table: &PageTable, data: &[u8], data_offset: usize) {
@@ -664,77 +665,6 @@ impl MapArea {
 
     pub(super) fn is_executable(&self) -> bool {
         self.map_perm.contains(MapPermission::X)
-    }
-
-    pub(super) fn is_locked(&self) -> bool {
-        self.locked || self.lock_on_fault
-    }
-
-    pub(super) fn is_wipe_on_fork(&self) -> bool {
-        self.wipe_on_fork
-    }
-
-    pub(super) fn set_wipe_on_fork(&mut self, enabled: bool) {
-        self.wipe_on_fork = enabled;
-    }
-
-    pub(super) fn is_dumpable(&self) -> bool {
-        self.dumpable
-    }
-
-    pub(super) fn set_dumpable(&mut self, enabled: bool) {
-        self.dumpable = enabled;
-    }
-
-    pub(super) fn is_poisoned(&self, vpn: VirtPageNum) -> bool {
-        self.poisoned_pages.contains(&vpn)
-    }
-
-    pub(super) fn poison_pages(
-        &mut self,
-        page_table: &mut PageTable,
-        start: VirtPageNum,
-        end: VirtPageNum,
-        retired: &mut RetiredUserPages,
-    ) {
-        for vpn in self
-            .vpn_range
-            .into_iter()
-            .filter(|vpn| *vpn >= start && *vpn < end)
-        {
-            self.poisoned_pages.insert(vpn);
-            self.lazy_free_pages.remove(&vpn);
-            self.retire_framed_page(page_table, vpn, retired);
-        }
-    }
-
-    pub(super) fn mark_lazy_free_pages(&mut self, start: VirtPageNum, end: VirtPageNum) {
-        for vpn in self
-            .vpn_range
-            .into_iter()
-            .filter(|vpn| *vpn >= start && *vpn < end)
-        {
-            self.lazy_free_pages.insert(vpn);
-        }
-    }
-
-    pub(super) fn is_private_anonymous_mmap(&self) -> bool {
-        self.mmap_info.as_ref().is_some_and(|info| {
-            !info.shared && info.backing_file.is_none() && info.page_cache_id.is_none()
-        })
-    }
-
-    pub(super) fn is_shared_writable_mmap(&self) -> bool {
-        self.mmap_info
-            .as_ref()
-            .is_some_and(|info| info.shared && info.writable)
-    }
-
-    pub(super) fn locked_bytes(&self) -> usize {
-        if !self.is_locked() {
-            return 0;
-        }
-        (self.vpn_range.get_end().0 - self.vpn_range.get_start().0) * PAGE_SIZE
     }
 
     pub(super) fn resident_bytes(&self, page_table: &PageTable) -> usize {

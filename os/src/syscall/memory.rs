@@ -4,8 +4,8 @@ use crate::mm::{MapPermission, MemoryProtectError, MmapFlush, MmapPrefaultResult
 use crate::syscall::SyscallContext;
 use crate::syscall::user_ptr::{copy_to_user, read_user_value, write_user_value};
 use crate::task::{
-    CAP_IPC_LOCK, CAP_IPC_OWNER, CAP_SYS_ADMIN, PROCESS_PKEY_COUNT, ProcessControlBlock,
-    RLimitResource, current_process, current_user_token, suspend_current_and_run_next,
+    CAP_IPC_OWNER, CAP_SYS_ADMIN, ProcessControlBlock, current_process, current_user_token,
+    suspend_current_and_run_next,
 };
 use alloc::vec::Vec;
 
@@ -29,7 +29,6 @@ const MAP_GROWSDOWN: usize = 0x100;
 const MAP_NORESERVE: usize = 0x4000;
 const MAP_POPULATE: usize = 0x8000;
 const MAP_STACK: usize = 0x20000;
-const MAP_LOCKED: usize = 0x2000;
 // CONTEXT: Linux keeps MAP_DENYWRITE/MAP_EXECUTABLE as ignored legacy flags,
 // and musl/glibc may pass MAP_NORESERVE or MAP_STACK as advisory flags. The
 // current VM has no reservation accounting or stack VMA metadata, so accepting
@@ -45,8 +44,7 @@ const MAP_SUPPORTED: usize = MAP_SHARED
     | MAP_GROWSDOWN
     | MAP_NORESERVE
     | MAP_POPULATE
-    | MAP_STACK
-    | MAP_LOCKED;
+    | MAP_STACK;
 const MAP_TYPE_MASK: usize = 0x03;
 const MS_ASYNC: i32 = 0x1;
 const MS_INVALIDATE: i32 = 0x2;
@@ -56,15 +54,6 @@ const MREMAP_MAYMOVE: usize = 0x1;
 const MREMAP_FIXED: usize = 0x2;
 const MREMAP_SUPPORTED: usize = MREMAP_MAYMOVE | MREMAP_FIXED;
 
-const MLOCK_ONFAULT: usize = 0x1;
-const MCL_CURRENT: usize = 0x1;
-const MCL_FUTURE: usize = 0x2;
-const MCL_ONFAULT: usize = 0x4;
-const MCL_SUPPORTED: usize = MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT;
-const PKEY_DISABLE_ACCESS: usize = 0x1;
-const PKEY_DISABLE_WRITE: usize = 0x2;
-const PKEY_ACCESS_RIGHTS_MASK: usize = PKEY_DISABLE_ACCESS | PKEY_DISABLE_WRITE;
-
 const MEMBARRIER_CMD_QUERY: i32 = 0;
 const MEMBARRIER_CMD_PRIVATE_EXPEDITED: i32 = 1 << 3;
 const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: i32 = 1 << 4;
@@ -73,27 +62,7 @@ const MEMBARRIER_SUPPORTED_CMDS: isize =
 #[cfg(target_arch = "riscv64")]
 const SYS_RISCV_FLUSH_ICACHE_LOCAL: usize = 1;
 
-const MADV_NORMAL: i32 = 0;
-const MADV_RANDOM: i32 = 1;
-const MADV_SEQUENTIAL: i32 = 2;
-const MADV_WILLNEED: i32 = 3;
 const MADV_DONTNEED: i32 = 4;
-const MADV_FREE: i32 = 8;
-const MADV_REMOVE: i32 = 9;
-const MADV_DONTFORK: i32 = 10;
-const MADV_DOFORK: i32 = 11;
-const MADV_MERGEABLE: i32 = 12;
-const MADV_UNMERGEABLE: i32 = 13;
-const MADV_HUGEPAGE: i32 = 14;
-const MADV_NOHUGEPAGE: i32 = 15;
-const MADV_DONTDUMP: i32 = 16;
-const MADV_DODUMP: i32 = 17;
-const MADV_WIPEONFORK: i32 = 18;
-const MADV_KEEPONFORK: i32 = 19;
-const MADV_COLD: i32 = 20;
-const MADV_PAGEOUT: i32 = 21;
-const MADV_HWPOISON: i32 = 100;
-const MADV_SOFT_OFFLINE: i32 = 101;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -261,16 +230,6 @@ pub fn sys_shmctl(shmid: usize, cmd: i32, buf: usize) -> KResult {
             write_shmid_ds(buf, stat)?;
             Ok(real_shmid as isize)
         }
-        crate::mm::shm::SHM_LOCK => {
-            crate::mm::shm::set_segment_locked(shmid, true, &caller)
-                .map_err(shm_error_to_sys_error)?;
-            Ok(0)
-        }
-        crate::mm::shm::SHM_UNLOCK => {
-            crate::mm::shm::set_segment_locked(shmid, false, &caller)
-                .map_err(shm_error_to_sys_error)?;
-            Ok(0)
-        }
         _ => Err(Errno::EINVAL),
     }
 }
@@ -410,13 +369,9 @@ fn sys_mmap_impl(
                 page_cache_id,
             )
             .ok_or(Errno::ENOMEM)?;
-        // CONTEXT: mlockall(MCL_FUTURE) without MCL_ONFAULT makes future
-        // mappings resident on Linux. Prefaulting here also keeps large
-        // memset-heavy LTP probes from taking one page-fault trap per page.
-        let prefault = populate || inner.memory_set.future_mlock_prefaults();
         drop(inner);
         drop(retired_files);
-        if prefault {
+        if populate {
             loop {
                 let result = process
                     .inner_exclusive_access()
@@ -451,12 +406,8 @@ fn sys_mmap_impl(
             page_cache_id,
         )
         .ok_or(Errno::ENOMEM)?;
-    // CONTEXT: mlockall(MCL_FUTURE) without MCL_ONFAULT makes future mappings
-    // resident on Linux. Prefaulting here also keeps large memset-heavy LTP
-    // probes from taking one page-fault trap per page.
-    let prefault = populate || inner.memory_set.future_mlock_prefaults();
     drop(inner);
-    if prefault {
+    if populate {
         loop {
             let result = process
                 .inner_exclusive_access()
@@ -476,53 +427,7 @@ fn sys_mmap_impl(
 }
 
 pub fn sys_mprotect_ctx(ctx: &SyscallContext, addr: usize, len: usize, prot: usize) -> KResult {
-    sys_mprotect_impl(ctx.process(), addr, len, prot, None)
-}
-
-pub fn sys_pkey_mprotect(addr: usize, len: usize, prot: usize, pkey: isize) -> KResult {
-    let pkey = match pkey {
-        -1 => None,
-        0 => Some(0),
-        value if value > 0 && (value as usize) < PROCESS_PKEY_COUNT => Some(value as usize),
-        _ => return Err(Errno::EINVAL),
-    };
-    let process = current_process();
-    sys_mprotect_impl(&process, addr, len, prot, pkey)
-}
-
-pub fn sys_pkey_alloc(flags: usize, access_rights: usize) -> KResult {
-    if flags != 0 || access_rights & !PKEY_ACCESS_RIGHTS_MASK != 0 {
-        return Err(Errno::EINVAL);
-    }
-
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let Some(pkey) = inner
-        .pkey_rights
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find_map(|(pkey, rights)| rights.is_none().then_some(pkey))
-    else {
-        return Err(Errno::ENOSPC);
-    };
-    inner.pkey_rights[pkey] = Some(access_rights);
-    Ok(pkey as isize)
-}
-
-pub fn sys_pkey_free(pkey: isize) -> KResult {
-    if pkey <= 0 || (pkey as usize) >= PROCESS_PKEY_COUNT {
-        return Err(Errno::EINVAL);
-    }
-
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let pkey = pkey as usize;
-    if inner.pkey_rights[pkey].is_none() {
-        return Err(Errno::EINVAL);
-    }
-    inner.pkey_rights[pkey] = None;
-    Ok(0)
+    sys_mprotect_impl(ctx.process(), addr, len, prot)
 }
 
 fn sys_mprotect_impl(
@@ -530,7 +435,6 @@ fn sys_mprotect_impl(
     addr: usize,
     len: usize,
     prot: usize,
-    pkey: Option<usize>,
 ) -> KResult {
     if addr % PAGE_SIZE != 0 {
         return Err(Errno::EINVAL);
@@ -548,17 +452,12 @@ fn sys_mprotect_impl(
     addr.checked_add(len).ok_or(Errno::ENOMEM)?;
 
     let mut inner = process.inner_exclusive_access();
-    let access_rights = match pkey {
-        Some(0) | None => 0,
-        Some(pkey) => inner.pkey_rights[pkey].ok_or(Errno::EINVAL)?,
-    };
-    let effective_prot = prot_with_pkey_access_rights(prot, access_rights);
     inner
         .memory_set
         .mprotect_area(
             addr,
             len,
-            prot_to_map_permission(effective_prot),
+            prot_to_map_permission(prot),
             prot_to_reported_map_permission(prot),
         )
         .map_err(|err| match err {
@@ -626,291 +525,22 @@ pub fn sys_madvise(addr: usize, len: usize, advice: i32) -> KResult {
     if addr % PAGE_SIZE != 0 {
         return Err(Errno::EINVAL);
     }
-    validate_madvise_advice(advice)?;
+    if advice != MADV_DONTNEED {
+        return Err(Errno::ENOTSUP);
+    }
     if len == 0 {
         return Ok(0);
     }
     len.checked_add(PAGE_SIZE - 1).ok_or(Errno::ENOMEM)?;
 
     let process = current_process();
-    match advice {
-        // CONTEXT: Linux treats these as compatibility hints around reclaim,
-        // backing-store, KSM, THP, and core-dump policy. This kernel records
-        // only the advice that changes observable contest behavior today.
-        MADV_FREE => {
-            let mut inner = process.inner_exclusive_access();
-            if !inner
-                .memory_set
-                .madvise_range_is_private_anonymous(addr, len)
-                .ok_or(Errno::ENOMEM)?
-            {
-                return Err(Errno::EINVAL);
-            }
-            if !inner.memory_set.madvise_mark_lazy_free(addr, len) {
-                return Err(Errno::ENOMEM);
-            }
-            Ok(0)
-        }
-        MADV_WIPEONFORK => {
-            let mut inner = process.inner_exclusive_access();
-            if !inner
-                .memory_set
-                .madvise_range_is_private_anonymous(addr, len)
-                .ok_or(Errno::ENOMEM)?
-            {
-                return Err(Errno::EINVAL);
-            }
-            if !inner.memory_set.madvise_set_wipe_on_fork(addr, len, true) {
-                return Err(Errno::ENOMEM);
-            }
-            Ok(0)
-        }
-        MADV_KEEPONFORK => {
-            let mut inner = process.inner_exclusive_access();
-            if !inner
-                .memory_set
-                .madvise_range_is_private_anonymous(addr, len)
-                .ok_or(Errno::ENOMEM)?
-            {
-                return Err(Errno::EINVAL);
-            }
-            if !inner.memory_set.madvise_set_wipe_on_fork(addr, len, false) {
-                return Err(Errno::ENOMEM);
-            }
-            Ok(0)
-        }
-        MADV_REMOVE => {
-            let inner = process.inner_exclusive_access();
-            if inner
-                .memory_set
-                .madvise_range_has_locked(addr, len)
-                .ok_or(Errno::ENOMEM)?
-                || !inner
-                    .memory_set
-                    .madvise_range_is_shared_writable(addr, len)
-                    .ok_or(Errno::ENOMEM)?
-            {
-                return Err(Errno::EINVAL);
-            }
-            Ok(0)
-        }
-        MADV_DONTNEED => {
-            let mut inner = process.inner_exclusive_access();
-            if inner
-                .memory_set
-                .madvise_range_has_locked(addr, len)
-                .ok_or(Errno::ENOMEM)?
-            {
-                return Err(Errno::EINVAL);
-            }
-            if !inner.memory_set.madvise_dontneed_range(addr, len) {
-                return Err(Errno::ENOMEM);
-            }
-            Ok(0)
-        }
-        MADV_MERGEABLE | MADV_UNMERGEABLE => {
-            let inner = process.inner_exclusive_access();
-            let private_anonymous = inner
-                .memory_set
-                .madvise_range_is_private_anonymous(addr, len)
-                .ok_or(Errno::ENOMEM)?;
-            let shared_writable = inner
-                .memory_set
-                .madvise_range_is_shared_writable(addr, len)
-                .ok_or(Errno::ENOMEM)?;
-            if !private_anonymous && !shared_writable {
-                return Err(Errno::EINVAL);
-            }
-            Ok(0)
-        }
-        MADV_HWPOISON => {
-            let mut inner = process.inner_exclusive_access();
-            let private_anonymous = inner
-                .memory_set
-                .madvise_range_is_private_anonymous(addr, len)
-                .ok_or(Errno::ENOMEM)?;
-            if private_anonymous {
-                if !inner.memory_set.madvise_poison_range(addr, len) {
-                    return Err(Errno::ENOMEM);
-                }
-                return Ok(0);
-            }
-            Ok(0)
-        }
-        MADV_SOFT_OFFLINE => {
-            let inner = process.inner_exclusive_access();
-            if !inner
-                .memory_set
-                .madvise_range_is_mapped(addr, len)
-                .ok_or(Errno::ENOMEM)?
-            {
-                return Err(Errno::ENOMEM);
-            }
-            Ok(0)
-        }
-        MADV_DONTDUMP | MADV_DODUMP => {
-            let mut inner = process.inner_exclusive_access();
-            if !inner
-                .memory_set
-                .madvise_set_dumpable(addr, len, advice == MADV_DODUMP)
-            {
-                return Err(Errno::ENOMEM);
-            }
-            Ok(0)
-        }
-        MADV_WILLNEED => {
-            let inner = process.inner_exclusive_access();
-            if !inner
-                .memory_set
-                .madvise_range_is_mapped(addr, len)
-                .ok_or(Errno::ENOMEM)?
-            {
-                return Err(Errno::ENOMEM);
-            }
-            crate::fs::note_madvise_willneed(len);
-            Ok(0)
-        }
-        _ => {
-            let inner = process.inner_exclusive_access();
-            if !inner
-                .memory_set
-                .madvise_range_is_mapped(addr, len)
-                .ok_or(Errno::ENOMEM)?
-            {
-                return Err(Errno::ENOMEM);
-            }
-            Ok(0)
-        }
-    }
-}
-
-fn validate_madvise_advice(advice: i32) -> KResult<()> {
-    match advice {
-        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED | MADV_FREE
-        | MADV_REMOVE | MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE
-        | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP | MADV_WIPEONFORK
-        | MADV_KEEPONFORK | MADV_COLD | MADV_PAGEOUT | MADV_HWPOISON | MADV_SOFT_OFFLINE => Ok(()),
-        _ => Err(Errno::EINVAL),
-    }
-}
-
-// UNFINISHED: The kernel still has no swap or page-reclaim path, so these
-// mlock syscalls provide Linux-compatible validation, prefaulting, RLIMIT
-// checks, and procfs accounting without a real unevictable-page mechanism.
-pub fn sys_mlock(addr: usize, len: usize) -> KResult {
-    let additional = {
-        let process = current_process();
-        let inner = process.inner_exclusive_access();
-        inner
-            .memory_set
-            .additional_locked_bytes_for_range(addr, len)
-            .ok_or(Errno::ENOMEM)?
-    };
-    check_memlock_limit(additional)?;
-
-    let process = current_process();
-    loop {
-        let result = process
-            .inner_exclusive_access()
-            .memory_set
-            .mlock_range(addr, len, false);
-        match result {
-            MmapPrefaultResult::Complete => break,
-            MmapPrefaultResult::Retry => suspend_current_and_run_next(),
-            MmapPrefaultResult::Failed => return Err(Errno::ENOMEM),
-        }
-    }
-    Ok(0)
-}
-
-pub fn sys_mlock2(addr: usize, len: usize, flags: usize) -> KResult {
-    if flags & !MLOCK_ONFAULT != 0 {
-        return Err(Errno::EINVAL);
-    }
-    let on_fault = flags & MLOCK_ONFAULT != 0;
-    let additional = {
-        let process = current_process();
-        let inner = process.inner_exclusive_access();
-        inner
-            .memory_set
-            .additional_locked_bytes_for_range(addr, len)
-            .ok_or(Errno::ENOMEM)?
-    };
-    check_memlock_limit(additional)?;
-
-    let process = current_process();
-    loop {
-        let result = process
-            .inner_exclusive_access()
-            .memory_set
-            .mlock_range(addr, len, on_fault);
-        match result {
-            MmapPrefaultResult::Complete => break,
-            MmapPrefaultResult::Retry => suspend_current_and_run_next(),
-            MmapPrefaultResult::Failed => return Err(Errno::ENOMEM),
-        }
-    }
-    Ok(0)
-}
-
-pub fn sys_munlock(addr: usize, len: usize) -> KResult {
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    if !inner.memory_set.munlock_range(addr, len) {
-        return Err(Errno::ENOMEM);
-    }
-    Ok(0)
-}
-
-pub fn sys_mlockall(flags: usize) -> KResult {
-    if flags & !MCL_SUPPORTED != 0 || flags & (MCL_CURRENT | MCL_FUTURE) == 0 {
-        return Err(Errno::EINVAL);
-    }
-    let on_fault = flags & MCL_ONFAULT != 0;
-    let lock_current = flags & MCL_CURRENT != 0;
-    let lock_future = flags & MCL_FUTURE != 0;
-    let additional = if lock_current {
-        current_process()
-            .inner_exclusive_access()
-            .memory_set
-            .additional_locked_bytes_for_current()
-    } else {
-        0
-    };
-    check_memlock_limit(additional)?;
-
-    let process = current_process();
-    if lock_current {
-        loop {
-            let result = {
-                let mut inner = process.inner_exclusive_access();
-                let result = inner.memory_set.mlock_current(on_fault);
-                if result == MmapPrefaultResult::Complete && lock_future {
-                    inner.memory_set.set_mlock_future(on_fault);
-                }
-                result
-            };
-            match result {
-                MmapPrefaultResult::Complete => break,
-                MmapPrefaultResult::Retry => suspend_current_and_run_next(),
-                MmapPrefaultResult::Failed => return Err(Errno::ENOMEM),
-            }
-        }
-    }
-    if lock_future && !lock_current {
-        process
-            .inner_exclusive_access()
-            .memory_set
-            .set_mlock_future(on_fault);
-    }
-    Ok(0)
-}
-
-pub fn sys_munlockall() -> KResult {
-    current_process()
+    if !process
         .inner_exclusive_access()
         .memory_set
-        .munlock_all();
+        .madvise_dontneed_range(addr, len)
+    {
+        return Err(Errno::ENOMEM);
+    }
     Ok(0)
 }
 
@@ -1023,33 +653,6 @@ pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> KResult {
     }
 }
 
-fn check_memlock_limit(additional_locked_bytes: usize) -> KResult<()> {
-    let process = current_process();
-    let inner = process.inner_exclusive_access();
-    let credentials = &inner.credentials;
-    let privileged = credentials.euid == 0
-        && credentials
-            .capabilities
-            .has_effective(CAP_IPC_LOCK)
-            .unwrap_or(false);
-    if privileged {
-        return Ok(());
-    }
-
-    let limit = inner.resource_limits.get(RLimitResource::MemLock).rlim_cur;
-    if limit == 0 {
-        return Err(Errno::EPERM);
-    }
-    let locked = inner.memory_set.locked_bytes();
-    if locked
-        .checked_add(additional_locked_bytes)
-        .is_none_or(|total| total > limit)
-    {
-        return Err(Errno::ENOMEM);
-    }
-    Ok(())
-}
-
 fn write_back_mmap_flushes(flushes: Vec<MmapFlush>) {
     for flush in flushes {
         flush.write_back();
@@ -1063,21 +666,6 @@ fn page_align_len(len: usize) -> Result<usize, Errno> {
     len.checked_add(PAGE_SIZE - 1)
         .map(|len| len & !(PAGE_SIZE - 1))
         .ok_or(Errno::ENOMEM)
-}
-
-fn prot_with_pkey_access_rights(prot: usize, access_rights: usize) -> usize {
-    // UNFINISHED: This is a contest compatibility model for pkeys. It rewrites
-    // ordinary PTE permissions instead of storing hardware pkey tags and
-    // per-thread PKRU rights, so it covers pkey_mprotect-style restriction and
-    // restore flows but not cheap userspace PKRU flips or signal-time PKRU
-    // behavior.
-    if access_rights & PKEY_DISABLE_ACCESS != 0 {
-        return prot & !(PROT_READ | PROT_WRITE);
-    }
-    if access_rights & PKEY_DISABLE_WRITE != 0 {
-        return prot & !PROT_WRITE;
-    }
-    prot
 }
 
 fn prot_to_map_permission(prot: usize) -> MapPermission {
@@ -1147,11 +735,6 @@ fn shm_caller_from<'a>(pid: usize, credentials: &'a crate::task::Credentials) ->
             && credentials
                 .capabilities
                 .has_effective(CAP_SYS_ADMIN)
-                .unwrap_or(false),
-        can_lock_ipc: credentials.euid == 0
-            && credentials
-                .capabilities
-                .has_effective(CAP_IPC_LOCK)
                 .unwrap_or(false),
     }
 }

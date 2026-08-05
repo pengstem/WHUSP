@@ -1,6 +1,6 @@
 use super::super::address::page_align_up;
 use super::super::area::ExecSegmentInfo;
-use super::super::{MapArea, MapPermission, VirtAddr, VirtPageNum};
+use super::super::{MapPermission, VirtAddr, VirtPageNum};
 use super::MmapFaultAccess;
 use crate::config::{PAGE_SIZE, USER_MMAP_BASE, USER_MMAP_LIMIT};
 
@@ -52,27 +52,13 @@ pub(super) fn checked_page_range(start: usize, len: usize) -> Option<(VirtPageNu
     Some((start_vpn, VirtAddr::from(end).ceil()))
 }
 
-pub(super) fn mlock_fault_access(permission: MapPermission) -> MmapFaultAccess {
+pub(super) fn prefault_access(permission: MapPermission) -> MmapFaultAccess {
     if permission.contains(MapPermission::R) {
         MmapFaultAccess::Read
     } else if permission.contains(MapPermission::W) {
         MmapFaultAccess::Write
     } else {
         MmapFaultAccess::Execute
-    }
-}
-
-pub(super) fn apply_mlock_flags(area: &mut MapArea, locked: bool, on_fault: bool) {
-    if !locked {
-        return;
-    }
-    if on_fault {
-        if !area.locked {
-            area.lock_on_fault = true;
-        }
-    } else {
-        area.locked = true;
-        area.lock_on_fault = false;
     }
 }
 

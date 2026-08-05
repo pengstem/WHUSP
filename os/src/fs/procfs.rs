@@ -174,11 +174,6 @@ pub(crate) fn note_readahead() {
     PROC_IO_READAHEAD_SUPPRESS_READS.store(2, Ordering::Relaxed);
 }
 
-pub(crate) fn note_madvise_willneed(len: usize) {
-    let delta_kb = (len / 1024).max(1);
-    PROC_MEMINFO_SWAP_CACHED_KB.fetch_add(delta_kb, Ordering::Relaxed);
-}
-
 pub(crate) fn core_pattern_for_pid(pid: usize) -> String {
     let pattern = PROC_CORE_PATTERN.lock().clone();
     let pattern = core::str::from_utf8(pattern.as_slice())
@@ -2358,7 +2353,6 @@ fn pid_status_content(process: ProcessProcSnapshot) -> String {
          Gid:\t{}\t{}\t{}\t{}\n\
          VmRSS:\t{} kB\n\
          VmData:\t{} kB\n\
-         VmLck:\t{} kB\n\
          VmSwap:\t0 kB\n\
          CapInh:\t{:016x}\n\
          CapPrm:\t{:016x}\n\
@@ -2381,7 +2375,6 @@ fn pid_status_content(process: ProcessProcSnapshot) -> String {
         cred.fsgid,
         process.resident_kb,
         process.resident_kb,
-        process.locked_kb,
         capability_hex(cred.capabilities.inheritable),
         capability_hex(cred.capabilities.permitted),
         capability_hex(cred.capabilities.effective),

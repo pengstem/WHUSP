@@ -20,8 +20,6 @@ pub(crate) const IPC_INFO: i32 = 3;
 pub(crate) const SHM_RDONLY: i32 = 0o10000;
 pub(crate) const SHM_RND: i32 = 0o20000;
 pub(crate) const SHM_EXEC: i32 = 0o100000;
-pub(crate) const SHM_LOCK: i32 = 11;
-pub(crate) const SHM_UNLOCK: i32 = 12;
 pub(crate) const SHM_STAT: i32 = 13;
 pub(crate) const SHM_INFO: i32 = 14;
 pub(crate) const SHM_STAT_ANY: i32 = 15;
@@ -31,7 +29,6 @@ pub(crate) const SHM_MAX: usize = 16 * 1024 * 1024;
 pub(crate) const SHMMNI: usize = 4096;
 pub(crate) const SHMALL: usize = (SHM_MAX / PAGE_SIZE) * SHMMNI;
 pub(crate) const SHM_DEST: u32 = 0o1000;
-pub(crate) const SHM_LOCKED: u32 = 0o2000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ShmError {
@@ -59,7 +56,6 @@ pub(crate) struct ShmCaller<'a> {
     pub(crate) groups: &'a [u32],
     pub(crate) can_override_read: bool,
     pub(crate) can_override_owner: bool,
-    pub(crate) can_lock_ipc: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,7 +116,6 @@ struct ShmSegment {
     last_pid: usize,
     attach_count: usize,
     marked_for_delete: bool,
-    locked: bool,
     atime: i64,
     dtime: i64,
     ctime: i64,
@@ -155,7 +150,6 @@ impl ShmSegment {
             last_pid: 0,
             attach_count: 0,
             marked_for_delete: false,
-            locked: false,
             atime: 0,
             dtime: 0,
             ctime: now,
@@ -178,9 +172,6 @@ impl ShmSegment {
         let mut mode = self.mode & 0o777;
         if self.marked_for_delete {
             mode |= SHM_DEST;
-        }
-        if self.locked {
-            mode |= SHM_LOCKED;
         }
         ShmSegmentStat {
             id,
@@ -438,22 +429,6 @@ impl ShmManager {
         Ok(())
     }
 
-    fn set_locked(
-        &mut self,
-        shmid: usize,
-        locked: bool,
-        caller: &ShmCaller<'_>,
-    ) -> Result<(), ShmError> {
-        let Some(segment) = self.segments.get_mut(&shmid) else {
-            return Err(ShmError::Invalid);
-        };
-        if !(segment.is_owner_or_creator(caller) || caller.can_lock_ipc) {
-            return Err(ShmError::NotPermitted);
-        }
-        segment.locked = locked;
-        Ok(())
-    }
-
     fn usage_info(&self) -> ShmUsageInfo {
         let highest_index = self.highest_index();
         let total_pages = self
@@ -646,14 +621,6 @@ pub(crate) fn set_segment_attrs(
     SHM_MANAGER.lock().set_attrs(shmid, attrs, caller)
 }
 
-pub(crate) fn set_segment_locked(
-    shmid: usize,
-    locked: bool,
-    caller: &ShmCaller<'_>,
-) -> Result<(), ShmError> {
-    SHM_MANAGER.lock().set_locked(shmid, locked, caller)
-}
-
 pub(crate) fn usage_info() -> ShmUsageInfo {
     SHM_MANAGER.lock().usage_info()
 }
@@ -667,8 +634,8 @@ pub(crate) fn proc_sysvipc_shm_content() -> String {
 }
 
 pub(crate) fn shm_permission_from_flags(shmflg: i32) -> Result<MapPermission, ShmError> {
-    // UNFINISHED: SHM_RND address rounding, SHM_REMAP, SHM_LOCKED, and
-    // permission checks are deferred; iozone attaches read/write at addr 0.
+    // UNFINISHED: SHM_RND address rounding, SHM_REMAP, and permission checks
+    // are deferred; iozone attaches read/write at addr 0.
     let unsupported = shmflg & !(SHM_RDONLY | SHM_RND | SHM_EXEC);
     if unsupported != 0 {
         return Err(ShmError::Invalid);

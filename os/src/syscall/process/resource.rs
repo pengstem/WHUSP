@@ -55,7 +55,6 @@ pub fn sys_prlimit64_ctx(
                 | RLimitResource::Stack
                 | RLimitResource::Core
                 | RLimitResource::NoFile
-                | RLimitResource::MemLock
         )
     {
         return Err(Errno::ENOTSUP);

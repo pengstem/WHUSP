@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 mod load_gate;
 #[cfg(feature = "perf-counters")]
 pub(crate) mod perf;
@@ -82,7 +80,6 @@ impl PageCacheKey {
 
 pub(crate) struct PageCachePage {
     pub(crate) frame: FrameTracker,
-    pub(crate) key: PageCacheKey,
     // Size observed when this page was loaded; callers pass the mmap snapshot
     // that already bounded fault-time EOF reads before insertion.
     pub(crate) file_size_at_load: usize,
@@ -96,10 +93,9 @@ pub(crate) struct PageCachePage {
 }
 
 impl PageCachePage {
-    pub(crate) fn new(frame: FrameTracker, key: PageCacheKey, file_size_at_load: usize) -> Self {
+    pub(crate) fn new(frame: FrameTracker, file_size_at_load: usize) -> Self {
         Self {
             frame,
-            key,
             file_size_at_load,
             dirty: AtomicBool::new(false),
             ref_count: AtomicUsize::new(0),
@@ -232,14 +228,6 @@ impl PageCache {
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.pages.len()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.pages.is_empty()
-    }
-
     fn insert_page(&mut self, key: PageCacheKey, page: PageCachePage) {
         assert!(self.pages.insert(key, page).is_none());
         PAGE_CACHE.record_insert();
@@ -249,10 +237,6 @@ impl PageCache {
         let page = self.pages.remove(key)?;
         PAGE_CACHE.record_remove();
         Some(page)
-    }
-
-    pub(crate) fn contains(&self, key: PageCacheKey) -> bool {
-        self.pages.contains_key(&key)
     }
 
     /// Reserves one demand page and its uncached readahead suffix for a single
@@ -362,14 +346,6 @@ impl PageCache {
         } else {
             FaultRetry::immediate(stable_reason)
         }
-    }
-
-    pub(crate) fn current_key_from_file_offset(
-        &self,
-        id: PageCacheId,
-        file_offset: usize,
-    ) -> Option<PageCacheKey> {
-        PageCacheKey::from_file_offset(id, self.current_stable_generation(id)?, file_offset)
     }
 
     /// MAP_SHARED keeps one compatibility namespace across file-data epochs.
@@ -569,30 +545,6 @@ impl PageCache {
         Some(page.ppn())
     }
 
-    /// Inserts a freshly loaded file page or reuses an existing one.
-    ///
-    /// The returned PPN is pinned for the caller's mapping in both cases.
-    pub(crate) fn insert_loaded_page_and_inc_ref(
-        &mut self,
-        key: PageCacheKey,
-        frame: FrameTracker,
-        file_size_at_load: usize,
-    ) -> Option<PhysPageNum> {
-        if !self.is_current_key(key) {
-            return None;
-        }
-        if let Some(page) = self.pages.get_mut(&key) {
-            page.inc_ref();
-            return Some(page.ppn());
-        }
-        let mut page = PageCachePage::new(frame, key, file_size_at_load);
-        page.ref_count.store(1, Ordering::Relaxed);
-        let ppn = page.ppn();
-        page.lru_stamp = self.touch(key, None);
-        self.insert_page(key, page);
-        Some(ppn)
-    }
-
     pub(crate) fn insert_loaded_page_and_inc_ref_for_mmap(
         &mut self,
         key: PageCacheKey,
@@ -614,7 +566,7 @@ impl PageCache {
         }
         let target_len = PAGE_CACHE_SOFT_MAX_PAGES.saturating_sub(1);
         self.trim_clean_unpinned_to_global_len(target_len);
-        let mut page = PageCachePage::new(frame, key, file_size_at_load);
+        let mut page = PageCachePage::new(frame, file_size_at_load);
         page.ref_count.store(1, Ordering::Relaxed);
         if exec_fault {
             page.ensure_exec_icache_synced();
@@ -646,31 +598,6 @@ impl PageCache {
         if PAGE_CACHE.len() > PAGE_CACHE_SOFT_MAX_PAGES {
             self.trim_clean_unpinned_to_global_len(PAGE_CACHE_SOFT_MAX_PAGES);
         }
-    }
-
-    /// Drops one mapping reference and removes the page when it is unreferenced.
-    pub(crate) fn dec_ref_and_take_if_unused(
-        &mut self,
-        key: PageCacheKey,
-    ) -> Option<PageCachePage> {
-        let page = self.pages.get(&key)?;
-        if page.dec_ref() == 0 {
-            self.reclaim_stalled = false;
-            let page = self.remove_page(&key)?;
-            self.lru.remove(&PageCacheLruEntry {
-                stamp: page.lru_stamp,
-                key,
-            });
-            Some(page)
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn copy_page_data(&self, key: PageCacheKey, len: usize) -> Option<Vec<u8>> {
-        let page = self.pages.get(&key)?;
-        let len = len.min(PAGE_SIZE);
-        Some(page.ppn().get_bytes_array()[..len].to_vec())
     }
 
     /// Returns data from a page that was cached only for ordinary read(2).
@@ -741,7 +668,7 @@ impl PageCache {
             return (evicted, false);
         }
 
-        let mut page = PageCachePage::new(frame, key, file_size_at_load);
+        let mut page = PageCachePage::new(frame, file_size_at_load);
         page.lru_stamp = self.touch(key, None);
         self.insert_page(key, page);
         (evicted, true)
@@ -755,15 +682,6 @@ impl PageCache {
         page.dirty.store(true, Ordering::Release);
         page.exec_icache_state.store(0, Ordering::Release);
         true
-    }
-
-    pub(crate) fn copy_dirty_page_data(&self, key: PageCacheKey, len: usize) -> Option<Vec<u8>> {
-        let page = self.pages.get(&key)?;
-        if !page.is_dirty() {
-            return None;
-        }
-        let len = len.min(PAGE_SIZE);
-        Some(page.ppn().get_bytes_array()[..len].to_vec())
     }
 
     /// Takes a dirty snapshot for writeback and clears the dirty bit.

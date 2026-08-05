@@ -18,8 +18,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use layout::{
-    ExecSegmentFault, apply_mlock_flags, checked_page_align_up, checked_page_range,
-    exec_segment_fault, mlock_fault_access, next_mmap_hint, normalized_mmap_hint,
+    ExecSegmentFault, checked_page_align_up, checked_page_range, exec_segment_fault,
+    next_mmap_hint, normalized_mmap_hint, prefault_access,
 };
 
 // Leave unmapped space below MAP_GROWSDOWN expansion so a stack-like VMA does
@@ -153,7 +153,6 @@ pub struct MmapFaultPage {
     expected_shared: bool,
     expected_writable: bool,
     expected_grow_down: bool,
-    expected_locked: bool,
     expected_map_len: usize,
     expected_map_file_offset: usize,
     expected_file_size: usize,
@@ -196,7 +195,6 @@ impl MmapFaultPage {
             expected_shared: info.shared,
             expected_writable: info.writable,
             expected_grow_down: info.grow_down,
-            expected_locked: area.is_locked(),
             expected_map_len: info.len,
             expected_map_file_offset: info.file_offset,
             expected_file_size: info.file_size,
@@ -321,8 +319,6 @@ impl MmapFaultPage {
             || area.vpn_range.get_start() != self.expected_area_start
             || area.vpn_range.get_end() != self.expected_area_end
             || area.map_perm != self.expected_permission
-            || area.is_locked() != self.expected_locked
-            || area.is_poisoned(self.vpn)
             || !self.access.is_allowed_by(area.map_perm)
         {
             return false;
@@ -394,7 +390,6 @@ fn mmap_private_fault_read_ahead_len(
         && !info.writable
         && !info.grow_down
         && info.exec_segment.is_none()
-        && !area.is_locked()
         && !area.is_executable()
         && read_len == PAGE_SIZE
         && file_offset % PAGE_SIZE == 0
@@ -421,7 +416,6 @@ fn mmap_private_fault_read_ahead_len(
         let candidate_vpn = VirtPageNum(vpn_delta);
         if candidate_vpn >= area.vpn_range.get_end()
             || area.data_frames.contains_key(&candidate_vpn)
-            || area.is_poisoned(candidate_vpn)
             || page_table
                 .translate(candidate_vpn)
                 .is_some_and(|pte| pte.bits != 0)
@@ -473,7 +467,6 @@ pub struct MmapPageCacheFault {
     expected_shared: bool,
     expected_writable: bool,
     expected_grow_down: bool,
-    expected_locked: bool,
     expected_map_len: usize,
     expected_map_file_offset: usize,
 }
@@ -513,7 +506,6 @@ impl MmapPageCacheFault {
             expected_shared: info.shared,
             expected_writable: info.writable,
             expected_grow_down: info.grow_down,
-            expected_locked: area.is_locked(),
             expected_map_len: info.len,
             expected_map_file_offset: info.file_offset,
         }
@@ -533,7 +525,7 @@ impl MmapPageCacheFault {
         page_delta: usize,
     ) -> Option<(VirtPageNum, PageCacheKey)> {
         let vpn = VirtPageNum(self.vpn.0.checked_add(page_delta)?);
-        if vpn >= area.vpn_range.get_end() || area.is_poisoned(vpn) {
+        if vpn >= area.vpn_range.get_end() {
             return None;
         }
         let info = area.mmap_info.as_ref()?;
@@ -565,8 +557,6 @@ impl MmapPageCacheFault {
             || area.vpn_range.get_start() != self.expected_area_start
             || area.vpn_range.get_end() != self.expected_area_end
             || area.map_perm != self.expected_permission
-            || area.is_locked() != self.expected_locked
-            || area.is_poisoned(self.vpn)
             || !self.access.is_allowed_by(area.map_perm)
         {
             return false;
@@ -852,8 +842,6 @@ impl MemorySet {
         memory_set.brk_limit = user_space.brk_limit;
         memory_set.brk_mapped_end = user_space.brk_mapped_end;
         memory_set.mmap_next = user_space.mmap_next;
-        memory_set.mlock_future = false;
-        memory_set.mlock_future_on_fault = false;
         if !memory_set.map_trampoline() {
             return None;
         }
@@ -887,9 +875,6 @@ impl MemorySet {
                 }
             } else if area.is_mmap() {
                 let area_idx = memory_set.insert_area_sorted(new_area);
-                if area.is_wipe_on_fork() {
-                    continue;
-                }
                 let private_mmap = area_is_private_user_mmap(area);
                 let shared_mmap = area.mmap_info.as_ref().is_some_and(|info| info.shared);
                 let resident_vpns: Vec<_> = area.data_frames.keys().copied().collect();
@@ -1191,29 +1176,6 @@ impl MemorySet {
         let grow_pages = new_end_vpn.0.saturating_sub(old_end_vpn.0);
 
         if new_mapped_end > old_mapped_end {
-            if self.mlock_future {
-                let mut heap_area = MapArea::new(
-                    old_mapped_end.into(),
-                    new_mapped_end.into(),
-                    MapType::Framed,
-                    MapPermission::R | MapPermission::W | MapPermission::U,
-                );
-                apply_mlock_flags(
-                    &mut heap_area,
-                    self.mlock_future,
-                    self.mlock_future_on_fault,
-                );
-                if !heap_area.map(&mut self.page_table) {
-                    return self.brk;
-                }
-                self.insert_area_sorted(heap_area);
-                self.invalidate_tlb_vpn_range(old_end_vpn, new_end_vpn);
-                perf::record_brk_grow(grow_pages);
-                perf::record_brk_eager_mapped(grow_pages);
-                self.brk = addr;
-                self.brk_mapped_end = new_mapped_end;
-                return self.brk;
-            }
             let Some(area_idx) = self.find_brk_extension_area(heap_start_vpn, old_end_vpn) else {
                 // going this way if it is the first time brk was invoked
                 let heap_area = MapArea::new(
@@ -1287,9 +1249,8 @@ impl MemorySet {
 
     /// Creates a non-fixed mmap VMA and returns its chosen start address.
     ///
-    /// No user pages are allocated here unless mlock-future state requests
-    /// later fault accounting; regular mmap contents are populated lazily by
-    /// the page-fault path.
+    /// No user pages are allocated here; regular mmap contents are populated
+    /// lazily by the page-fault path.
     #[expect(
         clippy::too_many_arguments,
         reason = "mmap metadata mirrors syscall arguments and VMA attributes at the mapping boundary"
@@ -1324,7 +1285,6 @@ impl MemorySet {
             page_cache_pages: BTreeMap::new(),
             exec_segment: None,
         });
-        apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
         self.insert_area_sorted(area);
         self.mmap_next = next_mmap_hint(end);
         Some(start)
@@ -1411,7 +1371,6 @@ impl MemorySet {
             page_cache_pages: BTreeMap::new(),
             exec_segment: None,
         });
-        apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
         self.insert_area_sorted(area);
         Some((start, flushes, retired_files))
     }
@@ -1483,7 +1442,6 @@ impl MemorySet {
         let start_vpn = VirtAddr::from(start).floor();
         let mut area = MapArea::new(start.into(), end.into(), MapType::Framed, permission);
         area.shm_info = Some(ShmAreaInfo::new(shmid, len));
-        apply_mlock_flags(&mut area, self.mlock_future, self.mlock_future_on_fault);
         let candidates: Vec<_> = pages
             .iter()
             .filter(|mapping| mapping.page_index < map_len / PAGE_SIZE)
@@ -1616,9 +1574,6 @@ impl MemorySet {
             },
         };
         let area = &self.areas[area_idx];
-        if area.is_poisoned(vpn) {
-            return Some(MmapFaultResult::FatalSigbus);
-        }
         if !access.is_allowed_by(area.map_perm) {
             return None;
         }
@@ -2134,110 +2089,6 @@ impl MemorySet {
         Ok(())
     }
 
-    pub fn additional_locked_bytes_for_range(&self, start: usize, len: usize) -> Option<usize> {
-        let (start_vpn, end_vpn) = checked_page_range(start, len)?;
-        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
-            return None;
-        }
-        Some(self.unlocked_pages_in_range(start_vpn, end_vpn) * PAGE_SIZE)
-    }
-
-    pub fn additional_locked_bytes_for_current(&self) -> usize {
-        self.areas
-            .iter()
-            .filter(|area| !area.is_locked())
-            .map(|area| area.vpn_range.get_end().0 - area.vpn_range.get_start().0)
-            .sum::<usize>()
-            * PAGE_SIZE
-    }
-
-    pub fn locked_bytes(&self) -> usize {
-        self.areas.iter().map(MapArea::locked_bytes).sum()
-    }
-
-    /// Marks a mapped range as locked for mlock/mlock2 accounting.
-    ///
-    /// When `on_fault` is false, mmap pages are faulted in before the lock mark
-    /// is applied so Linux-visible ENOMEM behavior stays deterministic.
-    pub fn mlock_range(&mut self, start: usize, len: usize, on_fault: bool) -> MmapPrefaultResult {
-        let Some((start_vpn, end_vpn)) = checked_page_range(start, len) else {
-            return MmapPrefaultResult::Failed;
-        };
-        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
-            return MmapPrefaultResult::Failed;
-        }
-        if !on_fault {
-            match self.prefault_range_for_mlock(start_vpn, end_vpn) {
-                MmapPrefaultResult::Complete => {}
-                result => return result,
-            }
-        }
-        self.mark_lock_range(start_vpn, end_vpn, on_fault);
-        MmapPrefaultResult::Complete
-    }
-
-    pub fn munlock_range(&mut self, start: usize, len: usize) -> bool {
-        let Some((start_vpn, end_vpn)) = checked_page_range(start, len) else {
-            return false;
-        };
-        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
-            return false;
-        }
-        self.split_area_at(start_vpn);
-        self.split_area_at(end_vpn);
-        for area in &mut self.areas {
-            let area_start = area.vpn_range.get_start();
-            let area_end = area.vpn_range.get_end();
-            if area_start >= start_vpn && area_end <= end_vpn {
-                area.locked = false;
-                area.lock_on_fault = false;
-            }
-        }
-        true
-    }
-
-    /// Applies mlockall(MCL_CURRENT) to every current VMA.
-    ///
-    /// Non-ONFAULT mode prefaults mmap pages first; later mappings are governed
-    /// separately by `set_mlock_future`.
-    pub fn mlock_current(&mut self, on_fault: bool) -> MmapPrefaultResult {
-        if !on_fault {
-            let ranges: Vec<_> = self
-                .areas
-                .iter()
-                .map(|area| (area.vpn_range.get_start(), area.vpn_range.get_end()))
-                .collect();
-            for (start_vpn, end_vpn) in ranges {
-                match self.prefault_range_for_mlock(start_vpn, end_vpn) {
-                    MmapPrefaultResult::Complete => {}
-                    result => return result,
-                }
-            }
-        }
-        for area in &mut self.areas {
-            apply_mlock_flags(area, true, on_fault);
-        }
-        MmapPrefaultResult::Complete
-    }
-
-    pub fn set_mlock_future(&mut self, on_fault: bool) {
-        self.mlock_future = true;
-        self.mlock_future_on_fault = on_fault;
-    }
-
-    pub fn future_mlock_prefaults(&self) -> bool {
-        self.mlock_future && !self.mlock_future_on_fault
-    }
-
-    pub fn munlock_all(&mut self) {
-        for area in &mut self.areas {
-            area.locked = false;
-            area.lock_on_fault = false;
-        }
-        self.mlock_future = false;
-        self.mlock_future_on_fault = false;
-    }
-
     pub fn mincore_vec(&self, start: usize, len: usize) -> Option<Vec<u8>> {
         let map_len = checked_page_align_up(len)?;
         let end = start.checked_add(map_len)?;
@@ -2257,138 +2108,6 @@ impl MemorySet {
         Some(vec)
     }
 
-    pub fn madvise_range_is_mapped(&self, start: usize, len: usize) -> Option<bool> {
-        let (start_vpn, end_vpn) = checked_page_range(start, len)?;
-        Some(self.range_is_mapped_vpn(start_vpn, end_vpn))
-    }
-
-    pub fn madvise_range_has_locked(&self, start: usize, len: usize) -> Option<bool> {
-        let (start_vpn, end_vpn) = checked_page_range(start, len)?;
-        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
-            return None;
-        }
-        Some(self.areas.iter().any(|area| {
-            area.vpn_range.get_start() < end_vpn
-                && area.vpn_range.get_end() > start_vpn
-                && area.is_locked()
-        }))
-    }
-
-    pub fn madvise_range_is_private_anonymous(&self, start: usize, len: usize) -> Option<bool> {
-        let (start_vpn, end_vpn) = checked_page_range(start, len)?;
-        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
-            return None;
-        }
-        Some(
-            self.areas
-                .iter()
-                .filter(|area| {
-                    area.vpn_range.get_start() < end_vpn && area.vpn_range.get_end() > start_vpn
-                })
-                .all(MapArea::is_private_anonymous_mmap),
-        )
-    }
-
-    pub fn madvise_range_is_shared_writable(&self, start: usize, len: usize) -> Option<bool> {
-        let (start_vpn, end_vpn) = checked_page_range(start, len)?;
-        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
-            return None;
-        }
-        Some(
-            self.areas
-                .iter()
-                .filter(|area| {
-                    area.vpn_range.get_start() < end_vpn && area.vpn_range.get_end() > start_vpn
-                })
-                .all(MapArea::is_shared_writable_mmap),
-        )
-    }
-
-    pub fn madvise_set_wipe_on_fork(&mut self, start: usize, len: usize, enabled: bool) -> bool {
-        let Some((start_vpn, end_vpn)) = checked_page_range(start, len) else {
-            return false;
-        };
-        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
-            return false;
-        }
-        self.split_area_at(start_vpn);
-        self.split_area_at(end_vpn);
-        for area in &mut self.areas {
-            let area_start = area.vpn_range.get_start();
-            let area_end = area.vpn_range.get_end();
-            if area_start >= start_vpn && area_end <= end_vpn {
-                area.set_wipe_on_fork(enabled);
-            }
-        }
-        true
-    }
-
-    pub fn madvise_set_dumpable(&mut self, start: usize, len: usize, enabled: bool) -> bool {
-        let Some((start_vpn, end_vpn)) = checked_page_range(start, len) else {
-            return false;
-        };
-        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
-            return false;
-        }
-        self.split_area_at(start_vpn);
-        self.split_area_at(end_vpn);
-        for area in &mut self.areas {
-            let area_start = area.vpn_range.get_start();
-            let area_end = area.vpn_range.get_end();
-            if area_start >= start_vpn && area_end <= end_vpn && area.is_mmap() {
-                area.set_dumpable(enabled);
-            }
-        }
-        true
-    }
-
-    pub fn madvise_poison_range(&mut self, start: usize, len: usize) -> bool {
-        let Some((start_vpn, end_vpn)) = checked_page_range(start, len) else {
-            return false;
-        };
-        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
-            return false;
-        }
-        self.split_area_at(start_vpn);
-        self.split_area_at(end_vpn);
-        let mut poisoned = false;
-        let mut retired = RetiredUserPages::new();
-        for area in &mut self.areas {
-            let area_start = area.vpn_range.get_start();
-            let area_end = area.vpn_range.get_end();
-            if area_start >= start_vpn && area_end <= end_vpn && area.is_private_anonymous_mmap() {
-                area.poison_pages(&mut self.page_table, start_vpn, end_vpn, &mut retired);
-                poisoned = true;
-            }
-        }
-        if retired.pte_cleared() {
-            self.invalidate_tlb_vpn_range(start_vpn, end_vpn);
-        }
-        retired.release();
-        poisoned
-    }
-
-    pub fn madvise_mark_lazy_free(&mut self, start: usize, len: usize) -> bool {
-        let Some((start_vpn, end_vpn)) = checked_page_range(start, len) else {
-            return false;
-        };
-        if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
-            return false;
-        }
-        self.split_area_at(start_vpn);
-        self.split_area_at(end_vpn);
-        let mut marked = false;
-        for area in &mut self.areas {
-            let area_start = area.vpn_range.get_start();
-            let area_end = area.vpn_range.get_end();
-            if area_start >= start_vpn && area_end <= end_vpn && area.is_private_anonymous_mmap() {
-                area.mark_lazy_free_pages(start_vpn, end_vpn);
-                marked = true;
-            }
-        }
-        marked
-    }
-
     pub fn madvise_dontneed_range(&mut self, start: usize, len: usize) -> bool {
         let Some((start_vpn, end_vpn)) = checked_page_range(start, len) else {
             return false;
@@ -2396,14 +2115,17 @@ impl MemorySet {
         if !self.range_is_mapped_vpn(start_vpn, end_vpn) {
             return false;
         }
-        self.split_area_at(start_vpn);
-        self.split_area_at(end_vpn);
         let mut retired = RetiredUserPages::new();
         for area in &mut self.areas {
             let area_start = area.vpn_range.get_start();
             let area_end = area.vpn_range.get_end();
-            if area_start >= start_vpn && area_end <= end_vpn && area.is_mmap() {
-                area.unmap_resident_deferred(&mut self.page_table, &mut retired);
+            if area_start < end_vpn && area_end > start_vpn && area.is_mmap() {
+                area.discard_mmap_resident_range(
+                    &mut self.page_table,
+                    start_vpn.max(area_start),
+                    end_vpn.min(area_end),
+                    &mut retired,
+                );
             }
         }
         if retired.pte_cleared() {
@@ -2416,9 +2138,6 @@ impl MemorySet {
     pub fn core_dump_bytes(&self, max_len: usize) -> Vec<u8> {
         let mut output = Vec::new();
         for area in &self.areas {
-            if !area.is_dumpable() {
-                continue;
-            }
             for vpn in area.vpn_range {
                 if output.len() >= max_len {
                     return output;
@@ -2439,7 +2158,7 @@ impl MemorySet {
             return MmapPrefaultResult::Failed;
         };
         for vpn in VPNRange::new(start_vpn, end_vpn) {
-            match self.ensure_vpn_resident_for_mlock(vpn) {
+            match self.ensure_mmap_vpn_resident(vpn) {
                 MmapPrefaultResult::Complete => {}
                 result => return result,
             }
@@ -2502,36 +2221,7 @@ impl MemorySet {
         Some((old_addr, Vec::new(), Vec::new()))
     }
 
-    fn unlocked_pages_in_range(&self, start: super::VirtPageNum, end: super::VirtPageNum) -> usize {
-        let mut pages = 0;
-        for vpn in VPNRange::new(start, end) {
-            let locked = self.areas.iter().any(|area| {
-                area.vpn_range.get_start() <= vpn
-                    && vpn < area.vpn_range.get_end()
-                    && area.is_locked()
-            });
-            if !locked {
-                pages += 1;
-            }
-        }
-        pages
-    }
-
-    fn prefault_range_for_mlock(
-        &mut self,
-        start: super::VirtPageNum,
-        end: super::VirtPageNum,
-    ) -> MmapPrefaultResult {
-        for vpn in VPNRange::new(start, end) {
-            match self.ensure_vpn_resident_for_mlock(vpn) {
-                MmapPrefaultResult::Complete => {}
-                result => return result,
-            }
-        }
-        MmapPrefaultResult::Complete
-    }
-
-    fn vpn_is_resident_for_mlock(&self, vpn: super::VirtPageNum) -> bool {
+    fn mmap_vpn_is_resident(&self, vpn: super::VirtPageNum) -> bool {
         if self
             .page_table
             .translate(vpn)
@@ -2554,8 +2244,8 @@ impl MemorySet {
         })
     }
 
-    fn ensure_vpn_resident_for_mlock(&mut self, vpn: super::VirtPageNum) -> MmapPrefaultResult {
-        if self.vpn_is_resident_for_mlock(vpn) {
+    fn ensure_mmap_vpn_resident(&mut self, vpn: super::VirtPageNum) -> MmapPrefaultResult {
+        if self.mmap_vpn_is_resident(vpn) {
             return MmapPrefaultResult::Complete;
         }
         let Some(area) = self
@@ -2568,7 +2258,7 @@ impl MemorySet {
         if !area.is_mmap() {
             return MmapPrefaultResult::Failed;
         }
-        let access = mlock_fault_access(area.map_perm);
+        let access = prefault_access(area.map_perm);
         let addr = usize::from(VirtAddr::from(vpn));
         let Some(fault) = self.prepare_mmap_page_fault(addr, access) else {
             return MmapPrefaultResult::Failed;
@@ -2578,7 +2268,7 @@ impl MemorySet {
             // Prefault callers need a resident page now, so never turn that
             // transient state into false success.
             MmapFaultResult::Resolved => {
-                if self.vpn_is_resident_for_mlock(vpn) {
+                if self.mmap_vpn_is_resident(vpn) {
                     MmapPrefaultResult::Complete
                 } else {
                     MmapPrefaultResult::Retry
@@ -2589,8 +2279,8 @@ impl MemorySet {
                 MmapPrefaultResult::Failed
             }
             MmapFaultResult::Page(mut page) => {
-                // MAP_POPULATE/mlock prefaulting runs while the caller holds
-                // process memory state. Keep its existing single-page I/O bound.
+                // MAP_POPULATE runs while the caller holds process memory
+                // state. Keep its existing single-page I/O bound.
                 page.force_single_page();
                 let Some(frame) = page.build_frame() else {
                     return MmapPrefaultResult::Failed;
@@ -2612,23 +2302,6 @@ impl MemorySet {
                     MmapPageCacheInstall::Retry(_) => MmapPrefaultResult::Retry,
                     MmapPageCacheInstall::Failed => MmapPrefaultResult::Failed,
                 }
-            }
-        }
-    }
-
-    fn mark_lock_range(
-        &mut self,
-        start_vpn: super::VirtPageNum,
-        end_vpn: super::VirtPageNum,
-        on_fault: bool,
-    ) {
-        self.split_area_at(start_vpn);
-        self.split_area_at(end_vpn);
-        for area in &mut self.areas {
-            let area_start = area.vpn_range.get_start();
-            let area_end = area.vpn_range.get_end();
-            if area_start >= start_vpn && area_end <= end_vpn {
-                apply_mlock_flags(area, true, on_fault);
             }
         }
     }
