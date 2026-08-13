@@ -214,6 +214,7 @@ pub fn trap_handler() -> ! {
             }
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
+            crate::perf::record_rv_user_timer_interrupt();
             set_next_trigger();
             if crate::cpu::is_timer_expiry_owner() {
                 check_timer();

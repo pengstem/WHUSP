@@ -689,58 +689,84 @@ fn dirty_regular_read_len(node: VfsNodeId, offset: usize, len: usize) -> Option<
     }
 }
 
-#[derive(Debug)]
-struct DirtyWritebackRun {
-    offset: usize,
-    data: Vec<u8>,
-}
-
 struct DirtyWritebackBatch {
     inode_state: Arc<inode_state::InodeState>,
     logical_size: usize,
     mtime: FileTimestamp,
     ctime: FileTimestamp,
     pages: BTreeMap<usize, DirtyPage>,
-    runs: Vec<DirtyWritebackRun>,
     owns_inode_pin: bool,
 }
 
-fn build_dirty_writeback_runs(pages: &BTreeMap<usize, DirtyPage>) -> Vec<DirtyWritebackRun> {
-    let mut runs = Vec::new();
-    let mut current_offset = 0usize;
-    let mut current_data = Vec::new();
+fn write_dirty_writeback_slice(node: VfsNodeId, offset: usize, data: &[u8]) -> FsResult<usize> {
+    perf::record_vfs_write_backend(data.len());
+    let Some(write_size) = write_backend_at_unplanned(node, offset as u64, data) else {
+        return Err(FsError::Io);
+    };
+    if write_size < data.len() {
+        return Err(FsError::Io);
+    }
+    Ok(data.len())
+}
+
+fn write_dirty_writeback_pages(
+    node: VfsNodeId,
+    pages: &BTreeMap<usize, DirtyPage>,
+) -> FsResult<usize> {
+    let mut scratch = Vec::new();
+    if scratch.try_reserve_exact(VFS_WRITE_CHUNK_SIZE).is_err() {
+        let mut bytes = 0usize;
+        for (page_index, page) in pages.iter() {
+            let page_offset = page_index.saturating_mul(PAGE_SIZE);
+            for (dirty_start, dirty_end) in page.dirty_ranges() {
+                bytes = bytes.saturating_add(write_dirty_writeback_slice(
+                    node,
+                    page_offset + dirty_start,
+                    &page.data[dirty_start..dirty_end],
+                )?);
+            }
+        }
+        return Ok(bytes);
+    }
+
+    let mut bytes = 0usize;
+    let mut scratch_offset = 0usize;
     for (page_index, page) in pages.iter() {
         let page_offset = page_index.saturating_mul(PAGE_SIZE);
         for (dirty_start, dirty_end) in page.dirty_ranges() {
-            let dirty_offset = page_offset + dirty_start;
-            let dirty_data = &page.data[dirty_start..dirty_end];
-            if current_data.is_empty() {
-                current_offset = dirty_offset;
-            } else if current_offset + current_data.len() != dirty_offset {
-                runs.push(DirtyWritebackRun {
-                    offset: current_offset,
-                    data: current_data,
-                });
-                current_offset = dirty_offset;
-                current_data = Vec::new();
-            }
-            current_data.extend_from_slice(dirty_data);
-            if current_data.len() >= VFS_WRITE_CHUNK_SIZE {
-                runs.push(DirtyWritebackRun {
-                    offset: current_offset,
-                    data: current_data,
-                });
-                current_data = Vec::new();
+            let mut data_offset = page_offset + dirty_start;
+            let mut dirty_data = &page.data[dirty_start..dirty_end];
+            while !dirty_data.is_empty() {
+                if !scratch.is_empty() && scratch_offset + scratch.len() != data_offset {
+                    bytes = bytes.saturating_add(write_dirty_writeback_slice(
+                        node,
+                        scratch_offset,
+                        &scratch,
+                    )?);
+                    scratch.clear();
+                }
+                if scratch.is_empty() {
+                    scratch_offset = data_offset;
+                }
+                let copy_len = dirty_data.len().min(VFS_WRITE_CHUNK_SIZE - scratch.len());
+                scratch.extend_from_slice(&dirty_data[..copy_len]);
+                dirty_data = &dirty_data[copy_len..];
+                data_offset = data_offset.saturating_add(copy_len);
+                if scratch.len() == VFS_WRITE_CHUNK_SIZE {
+                    bytes = bytes.saturating_add(write_dirty_writeback_slice(
+                        node,
+                        scratch_offset,
+                        &scratch,
+                    )?);
+                    scratch.clear();
+                }
             }
         }
     }
-    if !current_data.is_empty() {
-        runs.push(DirtyWritebackRun {
-            offset: current_offset,
-            data: current_data,
-        });
+    if !scratch.is_empty() {
+        bytes = bytes.saturating_add(write_dirty_writeback_slice(node, scratch_offset, &scratch)?);
     }
-    runs
+    Ok(bytes)
 }
 
 fn collect_dirty_writeback(
@@ -782,7 +808,6 @@ fn collect_dirty_writeback(
     drop(dirty);
     inode_state::invalidate_direct_stat_cache();
 
-    let runs = build_dirty_writeback_runs(&pages);
     let owns_inode_pin = drained_pin.is_some();
     let inode_state = drained_pin.unwrap_or_else(|| Arc::clone(state));
     Some(DirtyWritebackBatch {
@@ -791,7 +816,6 @@ fn collect_dirty_writeback(
         mtime,
         ctime,
         pages,
-        runs,
         owns_inode_pin,
     })
 }
@@ -811,7 +835,6 @@ fn restore_dirty_writeback(batch: DirtyWritebackBatch) {
         mtime,
         ctime,
         pages,
-        runs: _,
         owns_inode_pin,
     } = batch;
     let mut dirty = lock_dirty_file(&inode_state);
@@ -852,6 +875,15 @@ fn write_backend_at(node: VfsNodeId, offset: u64, data: &[u8]) -> Option<usize> 
     })
 }
 
+fn write_backend_at_unplanned(node: VfsNodeId, offset: u64, data: &[u8]) -> Option<usize> {
+    // CONTEXT: Dirty writeback coalesces fragmented logical pages into large
+    // buffers. Keep those multi-block overwrites on lwext4's audited path;
+    // the pointer-free prepared path remains available for ordinary writes.
+    with_mount(node.mount_id, BackendOp::Write, |mount| {
+        mount.write_at(node.ino, data, offset)
+    })
+}
+
 /// Flushes one dirty file while its inode mapping-mutation lease is held.
 ///
 /// The caller must hold this inode's mapping-mutation lease. Cross-inode
@@ -874,29 +906,14 @@ fn flush_dirty_regular_file_for_reason_under_mapping_state(
         return Ok(0);
     };
     let pages = batch.pages.len();
-    let mut bytes = 0usize;
-    let mut result = Ok(());
-    for run in batch.runs.iter() {
-        perf::record_vfs_write_backend(run.data.len());
-        let write_size = write_backend_at(node, run.offset as u64, &run.data);
-        let write_size = match write_size {
-            Some(write_size) => write_size,
-            None => {
-                result = Err(FsError::Io);
-                break;
-            }
-        };
-        if write_size < run.data.len() {
-            result = Err(FsError::Io);
-            break;
+    let bytes = match write_dirty_writeback_pages(node, &batch.pages) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            restore_dirty_writeback(batch);
+            record_dirty_cache_flush_failure(reason);
+            return Err(err);
         }
-        bytes = bytes.saturating_add(run.data.len());
-    }
-    if result.is_err() {
-        restore_dirty_writeback(batch);
-        record_dirty_cache_flush_failure(reason);
-        return result.map(|_| 0);
-    }
+    };
     record_dirty_cache_flush(reason, pages, bytes);
     if batch.owns_inode_pin {
         release_inode_from_drop(&batch.inode_state);

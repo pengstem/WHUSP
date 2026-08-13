@@ -223,10 +223,7 @@ pub fn sys_reboot(magic: usize, magic2: usize, op: usize, _arg: usize) -> KResul
     // yet wired into reboot permission checks.
     match op {
         LINUX_REBOOT_CMD_CAD_OFF | LINUX_REBOOT_CMD_CAD_ON => Ok(0),
-        LINUX_REBOOT_CMD_HALT | LINUX_REBOOT_CMD_POWER_OFF | LINUX_REBOOT_CMD_RESTART => {
-            // UNFINISHED: RESTART should reset and reboot the machine. The
-            // current arch layer exposes only a shutdown/poweroff primitive,
-            // which is the contest-critical behavior under QEMU -no-reboot.
+        LINUX_REBOOT_CMD_HALT | LINUX_REBOOT_CMD_POWER_OFF => {
             // CONTEXT: This path terminates the VM immediately. Finalize
             // mounted backends so lwext4 can mark superblocks clean after
             // user space has issued sync(2); normal sync(2) remains a plain
@@ -235,6 +232,15 @@ pub fn sys_reboot(magic: usize, magic2: usize, op: usize, _arg: usize) -> KResul
                 warn!("shutdown_all_mounts failed: {err:?}");
             }
             shutdown(false)
+        }
+        LINUX_REBOOT_CMD_RESTART => {
+            // BusyBox `reboot -f` reaches this operation. Keep restart distinct
+            // from poweroff so physical RISC-V boards return through OpenSBI
+            // and U-Boot; QEMU `-no-reboot` still terminates the contest run.
+            if let Err(err) = crate::fs::shutdown_all_mounts() {
+                warn!("shutdown_all_mounts failed: {err:?}");
+            }
+            crate::sbi::reboot()
         }
         // UNFINISHED: RESTART2, KEXEC, and SW_SUSPEND require reboot strings,
         // kernel-image handoff, or suspend support that this kernel lacks.

@@ -122,6 +122,13 @@ pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     trap::enable_timer_interrupt();
     timer::set_next_trigger();
     board::device_init(hart_id);
+    #[cfg(all(target_arch = "riscv64", feature = "starfive-recovery-watchdog"))]
+    {
+        // CONTEXT: Diagnostic VisionFive FITs arm this before filesystem block
+        // discovery so a wedged MMC probe returns to U-Boot without RESET.
+        // Normal contest builds omit the feature and carry no watchdog limit.
+        let _ = board::arm_jh7110_recovery_watchdog(240);
+    }
     fs::init();
     fs::list_apps();
     task::add_initproc();

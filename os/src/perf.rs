@@ -574,10 +574,12 @@ macro_rules! declare_perf_events {
             fn record_la_user_fp_owner_return_hit() => record_la_user_fp_owner_return_hit_impl;
             fn record_la_user_fp_lazy_trap(_mode: usize) => record_la_user_fp_lazy_trap_impl;
             fn record_rv_user_trap_entry() => record_rv_user_trap_entry_impl;
+            fn record_rv_user_timer_interrupt() => record_rv_user_timer_interrupt_impl;
             fn record_rv_sbi_set_timer_call() => record_rv_sbi_set_timer_call_impl;
             fn record_rv_user_fp_save_call() => record_rv_user_fp_save_call_impl;
             fn record_rv_user_fp_restore_call() => record_rv_user_fp_restore_call_impl;
             fn record_rv_user_fp_lazy_init_trap() => record_rv_user_fp_lazy_init_trap_impl;
+            fn record_jh7110_mmc_transfer(_command: usize, _blocks: usize, _elapsed_us: usize, _retries: usize, _success: bool,) => record_jh7110_mmc_transfer_impl;
             fn record_arch_instruction_barrier_call() => record_arch_instruction_barrier_call_impl;
             fn record_tid_lookup(_process_visits: usize, _task_visits: usize, _hit: bool, _index_hit: bool, _stale_index_entry: bool,) => record_tid_lookup_impl;
             fn record_exec_stack_copy(_bytes: usize) => record_exec_stack_copy_impl;
@@ -793,10 +795,25 @@ mod enabled {
     static LA_USER_FP_LAZY_LSX_TRAPS: AtomicUsize = AtomicUsize::new(0);
     static LA_USER_FP_LAZY_LASX_TRAPS: AtomicUsize = AtomicUsize::new(0);
     static RV_USER_TRAP_ENTRIES: PerCpuCounter = PerCpuCounter::new();
+    static RV_USER_TIMER_INTERRUPTS: PerCpuCounter = PerCpuCounter::new();
     static RV_SBI_SET_TIMER_CALLS: PerCpuCounter = PerCpuCounter::new();
     static RV_USER_FP_SAVE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static RV_USER_FP_RESTORE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static RV_USER_FP_LAZY_INIT_TRAPS: AtomicUsize = AtomicUsize::new(0);
+    static JH7110_MMC_SINGLE_READ_COMMANDS: PerCpuCounter = PerCpuCounter::new();
+    static JH7110_MMC_MULTI_READ_COMMANDS: PerCpuCounter = PerCpuCounter::new();
+    static JH7110_MMC_SINGLE_WRITE_COMMANDS: PerCpuCounter = PerCpuCounter::new();
+    static JH7110_MMC_MULTI_WRITE_COMMANDS: PerCpuCounter = PerCpuCounter::new();
+    static JH7110_MMC_READ_BLOCKS: PerCpuCounter = PerCpuCounter::new();
+    static JH7110_MMC_WRITE_BLOCKS: PerCpuCounter = PerCpuCounter::new();
+    static JH7110_MMC_READ_US: PerCpuCounter = PerCpuCounter::new();
+    static JH7110_MMC_WRITE_US: PerCpuCounter = PerCpuCounter::new();
+    static JH7110_MMC_READ_RETRIES: PerCpuCounter = PerCpuCounter::new();
+    static JH7110_MMC_WRITE_RETRIES: PerCpuCounter = PerCpuCounter::new();
+    static JH7110_MMC_READ_FAILURES: PerCpuCounter = PerCpuCounter::new();
+    static JH7110_MMC_WRITE_FAILURES: PerCpuCounter = PerCpuCounter::new();
+    static JH7110_MMC_READ_MAX_BLOCKS_PER_TRANSFER: PerCpuMax = PerCpuMax::new();
+    static JH7110_MMC_WRITE_MAX_BLOCKS_PER_TRANSFER: PerCpuMax = PerCpuMax::new();
     static ARCH_INSTRUCTION_BARRIER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TID_LOOKUP_CALLS: AtomicUsize = AtomicUsize::new(0);
     static TID_LOOKUP_PROCESS_VISITS: AtomicUsize = AtomicUsize::new(0);
@@ -1543,6 +1560,42 @@ mod enabled {
         }
     }
 
+    fn append_starfive_diagnostic_stats(content: &mut String) {
+        let _ = write!(
+            content,
+            "rv_user_timer_interrupts {}\n\
+             jh7110_mmc_single_read_commands {}\n\
+             jh7110_mmc_multi_read_commands {}\n\
+             jh7110_mmc_single_write_commands {}\n\
+             jh7110_mmc_multi_write_commands {}\n\
+             jh7110_mmc_read_blocks {}\n\
+             jh7110_mmc_write_blocks {}\n\
+             jh7110_mmc_read_us {}\n\
+             jh7110_mmc_write_us {}\n\
+             jh7110_mmc_read_retries {}\n\
+             jh7110_mmc_write_retries {}\n\
+             jh7110_mmc_read_failures {}\n\
+             jh7110_mmc_write_failures {}\n\
+             jh7110_mmc_read_max_blocks_per_transfer {}\n\
+             jh7110_mmc_write_max_blocks_per_transfer {}\n",
+            RV_USER_TIMER_INTERRUPTS.load(Ordering::Relaxed),
+            JH7110_MMC_SINGLE_READ_COMMANDS.load(Ordering::Relaxed),
+            JH7110_MMC_MULTI_READ_COMMANDS.load(Ordering::Relaxed),
+            JH7110_MMC_SINGLE_WRITE_COMMANDS.load(Ordering::Relaxed),
+            JH7110_MMC_MULTI_WRITE_COMMANDS.load(Ordering::Relaxed),
+            JH7110_MMC_READ_BLOCKS.load(Ordering::Relaxed),
+            JH7110_MMC_WRITE_BLOCKS.load(Ordering::Relaxed),
+            JH7110_MMC_READ_US.load(Ordering::Relaxed),
+            JH7110_MMC_WRITE_US.load(Ordering::Relaxed),
+            JH7110_MMC_READ_RETRIES.load(Ordering::Relaxed),
+            JH7110_MMC_WRITE_RETRIES.load(Ordering::Relaxed),
+            JH7110_MMC_READ_FAILURES.load(Ordering::Relaxed),
+            JH7110_MMC_WRITE_FAILURES.load(Ordering::Relaxed),
+            JH7110_MMC_READ_MAX_BLOCKS_PER_TRANSFER.load(Ordering::Relaxed),
+            JH7110_MMC_WRITE_MAX_BLOCKS_PER_TRANSFER.load(Ordering::Relaxed),
+        );
+    }
+
     fn append_backend_op_stats(content: &mut String) {
         for op in BackendOp::ALL {
             let stat = &BACKEND_OP_STATS[op as usize];
@@ -1806,6 +1859,11 @@ mod enabled {
     }
 
     #[allow(dead_code)]
+    fn record_rv_user_timer_interrupt_impl() {
+        RV_USER_TIMER_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
     fn record_rv_sbi_set_timer_call_impl() {
         RV_SBI_SET_TIMER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
@@ -1823,6 +1881,52 @@ mod enabled {
     #[allow(dead_code)]
     fn record_rv_user_fp_lazy_init_trap_impl() {
         RV_USER_FP_LAZY_INIT_TRAPS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    fn record_jh7110_mmc_transfer_impl(
+        command: usize,
+        blocks: usize,
+        elapsed_us: usize,
+        retries: usize,
+        success: bool,
+    ) {
+        let attempts = retries.saturating_add(1);
+        match command {
+            17 | 18 => {
+                let commands = if command == 17 {
+                    &JH7110_MMC_SINGLE_READ_COMMANDS
+                } else {
+                    &JH7110_MMC_MULTI_READ_COMMANDS
+                };
+                commands.fetch_add(attempts, Ordering::Relaxed);
+                JH7110_MMC_READ_US.fetch_add(elapsed_us, Ordering::Relaxed);
+                JH7110_MMC_READ_RETRIES.fetch_add(retries, Ordering::Relaxed);
+                JH7110_MMC_READ_MAX_BLOCKS_PER_TRANSFER.update(blocks);
+                if success {
+                    JH7110_MMC_READ_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
+                } else {
+                    JH7110_MMC_READ_FAILURES.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            24 | 25 => {
+                let commands = if command == 24 {
+                    &JH7110_MMC_SINGLE_WRITE_COMMANDS
+                } else {
+                    &JH7110_MMC_MULTI_WRITE_COMMANDS
+                };
+                commands.fetch_add(attempts, Ordering::Relaxed);
+                JH7110_MMC_WRITE_US.fetch_add(elapsed_us, Ordering::Relaxed);
+                JH7110_MMC_WRITE_RETRIES.fetch_add(retries, Ordering::Relaxed);
+                JH7110_MMC_WRITE_MAX_BLOCKS_PER_TRANSFER.update(blocks);
+                if success {
+                    JH7110_MMC_WRITE_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
+                } else {
+                    JH7110_MMC_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn record_arch_instruction_barrier_call_impl() {
@@ -3991,6 +4095,7 @@ mod enabled {
             stats.futex_wake_key_hits,
             stats.futex_wake_tasks,
         );
+        append_starfive_diagnostic_stats(&mut content);
         append_timing_stats(&mut content);
         append_backend_op_stats(&mut content);
         crate::mm::append_fault_perf_stats(&mut content);

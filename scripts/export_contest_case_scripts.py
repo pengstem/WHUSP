@@ -55,6 +55,14 @@ def parse_args() -> argparse.Namespace:
         default=RUN_BUILDSTORM,
         help="enable or disable the BuildStorm group (default: enabled)",
     )
+    parser.add_argument(
+        "--starfive-safe-buildstorm",
+        action="store_true",
+        help=(
+            "run BuildStorm from a disposable hard-link workspace on a physical "
+            "StarFive SD card"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -91,8 +99,201 @@ def enabled_default(enabled: bool) -> str:
     return "1" if enabled else "0"
 
 
+def starfive_safe_buildstorm_script() -> str:
+    return r'''#!/musl/busybox sh
+# Keep the physical SD card's reference TGOSKits tree intact. The workspace
+# shares source files and the image's prebuilt host-tool cache through hard
+# links. Directory entries are private to the clone, while target-architecture
+# output, axbuild scratch data, and logs stay below one run-specific directory.
+# This preserves the official workload: its untimed tg-xtask build must reuse
+# target/debug instead of rebuilding the whole TGOSKits framework.
+
+official_script="/glibc/buildstorm_testcode.sh"
+source_workspace="/work/tgoskits"
+runs_root="/work/.whusp-buildstorm-runs"
+minimum_free_kib=6291456
+minimum_free_inodes=100000
+maximum_tmp_cache_kib=65536
+
+fail() {
+    echo "STARFIVE_BUILDSTORM_SAFE_PRECHECK fail reason=$1"
+    /musl/busybox sync
+    exit 1
+}
+
+[ -f "$official_script" ] || fail "missing_official_script"
+[ -d "$source_workspace" ] || fail "missing_source_workspace"
+
+uptime_seconds=$(/musl/busybox cut -d. -f1 /proc/uptime 2>/dev/null)
+case "$uptime_seconds" in
+    ''|*[!0-9]*) uptime_seconds=unknown ;;
+esac
+run_root="$runs_root/run-${uptime_seconds}-$$"
+workspace="$run_root/tgoskits"
+
+/musl/busybox mkdir -p "$run_root" || fail "mkdir_run_root"
+
+set -- $(/musl/busybox df -Pk /work | /musl/busybox tail -n 1)
+free_kib="$4"
+case "$free_kib" in
+    ''|*[!0-9]*) fail "invalid_free_space" ;;
+esac
+[ "$free_kib" -ge "$minimum_free_kib" ] || fail "free_space_${free_kib}KiB"
+
+set -- $(/musl/busybox df -Pi /work | /musl/busybox tail -n 1)
+free_inodes="$4"
+case "$free_inodes" in
+    ''|*[!0-9]*) fail "invalid_free_inodes" ;;
+esac
+[ "$free_inodes" -ge "$minimum_free_inodes" ] || fail "free_inodes_${free_inodes}"
+
+echo probe >"$run_root/hardlink-source" || fail "create_hardlink_probe"
+/musl/busybox ln "$run_root/hardlink-source" "$run_root/hardlink-copy" ||
+    fail "hardlink_unsupported"
+/musl/busybox rm -f "$run_root/hardlink-source" "$run_root/hardlink-copy"
+
+echo "STARFIVE_BUILDSTORM_SAFE_PRECHECK ok run_root=$run_root free_kib=$free_kib free_inodes=$free_inodes"
+echo "STARFIVE_BUILDSTORM_SAFE_CLONE begin source=$source_workspace"
+/musl/busybox mkdir -p "$workspace" || fail "mkdir_workspace"
+for source_entry in \
+    "$source_workspace"/* \
+    "$source_workspace"/.[!.]* \
+    "$source_workspace"/..?*; do
+    if [ ! -e "$source_entry" ] && [ ! -L "$source_entry" ]; then
+        continue
+    fi
+    entry_name=${source_entry##*/}
+    case "$entry_name" in
+        # tmp is installed separately as a private copy. axbuild rewrites
+        # generated config and scratch files below tmp/axbuild, so it must not
+        # share inodes with the reference workspace.
+        # docs is not a Cargo workspace member and contains non-ASCII diagram
+        # names that the current guest cp/link path cannot recreate reliably.
+        tmp|docs) continue ;;
+    esac
+    /musl/busybox cp -al "$source_entry" "$workspace/$entry_name" ||
+        fail "hardlink_clone_$entry_name"
+done
+[ -f "$workspace/Cargo.toml" ] || fail "cloned_workspace_missing_manifest"
+
+# The official image intentionally carries a prebuilt target/debug/tg-xtask.
+# Dropping target here turns its untimed cache check into a full framework
+# rebuild and no longer represents the judge workload.
+[ -x "$workspace/target/debug/tg-xtask" ] ||
+    fail "missing_cached_tg_xtask"
+
+# The official runner preserves tmp/axbuild across its timed build. Rebuild
+# that cache only when the image itself lacks it; dropping it from the safe
+# clone adds contestant-wrapper work after BUILDSTORM_BEGIN. Copy it instead
+# of hard-linking because axbuild may rewrite these files in place.
+[ -d "$source_workspace/tmp/axbuild" ] || fail "missing_axbuild_tmp_cache"
+tmp_cache_kib=$(/musl/busybox du -sk "$source_workspace/tmp" 2>/dev/null |
+    /musl/busybox awk '{print $1}')
+case "$tmp_cache_kib" in
+    ''|*[!0-9]*) fail "invalid_tmp_cache_size" ;;
+esac
+[ "$tmp_cache_kib" -le "$maximum_tmp_cache_kib" ] ||
+    fail "tmp_cache_too_large_${tmp_cache_kib}KiB"
+/musl/busybox cp -a "$source_workspace/tmp" "$workspace/tmp" ||
+    fail "copy_private_tmp_cache"
+
+# Generated linker/prebuild files embed the original absolute workspace path.
+# Patch only textual config/scripts in the private copy; archives stay intact.
+/musl/busybox find "$workspace/tmp" -type f \
+    \( -name '*.toml' -o -name '*.sh' \) \
+    -exec /musl/busybox sed -i "s|/work/tgoskits|$workspace|g" '{}' ';' ||
+    fail "patch_private_tmp_cache"
+if /musl/busybox find "$workspace/tmp" -type f \
+    \( -name '*.toml' -o -name '*.sh' \) \
+    -exec /musl/busybox grep -q '/work/tgoskits' '{}' ';' -print |
+    /musl/busybox grep -q .; then
+    fail "unpatched_tmp_cache_path"
+fi
+echo "STARFIVE_BUILDSTORM_SAFE_TMP_CACHE ok size_kib=$tmp_cache_kib"
+
+# Cargo can rewrite bookkeeping files in place. Give the clone private inodes
+# for the known mutable files while retaining hard-linked immutable artifacts.
+private_index=0
+for mutable_file in \
+    "$workspace/target/.rustc_info.json" \
+    "$workspace/target/debug/.cargo-build-lock" \
+    "$workspace/target/debug/.cargo-lock" \
+    "$workspace/target/debug/.cargo-artifact-lock"; do
+    [ -f "$mutable_file" ] || continue
+    private_index=$((private_index + 1))
+    private_copy="$run_root/target-private-$private_index"
+    /musl/busybox cp "$mutable_file" "$private_copy" ||
+        fail "copy_private_target_metadata_$private_index"
+    /musl/busybox mv "$private_copy" "$mutable_file" ||
+        fail "install_private_target_metadata_$private_index"
+done
+
+# Cargo may refresh Cargo.lock. Give the clone a private inode so such a write
+# cannot affect the reference workspace through the hard link.
+if [ -f "$workspace/Cargo.lock" ]; then
+    /musl/busybox cp "$workspace/Cargo.lock" "$run_root/Cargo.lock.private" ||
+        fail "copy_private_lockfile"
+    /musl/busybox mv "$run_root/Cargo.lock.private" "$workspace/Cargo.lock" ||
+        fail "install_private_lockfile"
+fi
+
+patched_script="$run_root/buildstorm_testcode.sh"
+/musl/busybox sed \
+    -e "s|cd /work/tgoskits|cd $workspace|" \
+    -e "s|/tmp/minibuild|$run_root/minibuild|g" \
+    -e "s|/work/\\.build\\.rc|$run_root/.build.rc|g" \
+    -e "s|/work/buildstorm\\.build\\.out|$run_root/buildstorm.build.out|g" \
+    "$official_script" >"$patched_script" || fail "patch_official_script"
+
+/musl/busybox grep -q "cd $workspace" "$patched_script" ||
+    fail "verify_patched_workspace"
+if /musl/busybox grep -q 'cd /work/tgoskits' "$patched_script"; then
+    fail "unpatched_workspace_path"
+fi
+
+echo "STARFIVE_BUILDSTORM_SAFE_CLONE ok workspace=$workspace"
+echo "STARFIVE_BUILDSTORM_SAFE_POLICY no_auto_cleanup=1 no_auto_reset_on_host_timeout=1"
+/musl/busybox sync
+official_log="$run_root/buildstorm.official.out"
+official_status_file="$run_root/buildstorm.official.status"
+(
+    /musl/busybox sh "$patched_script"
+    echo $? >"$official_status_file"
+) 2>&1 | /musl/busybox tee "$official_log"
+status=$(/musl/busybox cat "$official_status_file" 2>/dev/null)
+case "$status" in
+    ''|*[!0-9]*) status=1 ;;
+esac
+
+# The contestant-facing reference script prints ok=false but still exits zero.
+# Fail closed on its scoring records so the outer FINAL status cannot turn a
+# failed or missing compile into a false success.
+if [ "$status" -eq 0 ]; then
+    success_count=$(/musl/busybox grep -c \
+        '^BUILDSTORM_COMPILE mode=multi ok=true ' "$official_log" 2>/dev/null)
+    [ "$success_count" -eq 1 ] || status=1
+    /musl/busybox grep -q '^BUILDSTORM_TOOLCHAIN ok$' "$official_log" || status=1
+    /musl/busybox grep -q '^BUILDSTORM_MINIBUILD ok$' "$official_log" || status=1
+    /musl/busybox grep -q \
+        '^BUILDSTORM_COMPILE mode=multi ok=true .* arch=riscv64$' \
+        "$official_log" || status=1
+fi
+if [ "$status" -ne 0 ]; then
+    echo "STARFIVE_BUILDSTORM_SAFE_VALIDATION fail official_status=$status"
+else
+    echo "STARFIVE_BUILDSTORM_SAFE_VALIDATION ok"
+fi
+/musl/busybox sync
+echo "STARFIVE_BUILDSTORM_SAFE_RESULT status=$status run_root=$run_root"
+exit "$status"
+'''
+
+
 def entry_script(
-    run_cagent: bool, run_buildstorm: bool, interactive_shell: bool
+    run_cagent: bool,
+    run_buildstorm: bool,
+    interactive_shell: bool,
+    starfive_safe_buildstorm: bool = False,
 ) -> str:
     preamble = """#!/musl/busybox sh
 # Generated final-round runner.
@@ -144,11 +345,19 @@ exec /musl/busybox sh
 """
         )
 
+    buildstorm_runner = (
+        "/x1/starfive-safe-buildstorm.sh"
+        if starfive_safe_buildstorm
+        else "/glibc/buildstorm_testcode.sh"
+    )
+    final_action = "/musl/busybox reboot -f"
+
     return (
         preamble
         + f"""
 run_cagent="{enabled_default(run_cagent)}"
 run_buildstorm="{enabled_default(run_buildstorm)}"
+buildstorm_runner="{buildstorm_runner}"
 
 is_enabled() {{
     case "$1" in
@@ -189,8 +398,11 @@ if is_enabled "$run_buildstorm"; then
     if [ ! -f /glibc/buildstorm_testcode.sh ]; then
         echo "FINAL: buildstorm-glibc skipped: missing /glibc/buildstorm_testcode.sh"
         overall_status=1
+    elif [ ! -x "$buildstorm_runner" ]; then
+        echo "FINAL: buildstorm-glibc skipped: missing $buildstorm_runner"
+        overall_status=1
     else
-        run_case "buildstorm-glibc" /glibc/buildstorm_testcode.sh ||
+        run_case "buildstorm-glibc" "$buildstorm_runner" ||
             overall_status=1
     fi
 else
@@ -206,13 +418,18 @@ if /musl/busybox grep -q '^perf_counters_enabled 1$' /proc/oskernel/perf 2>/dev/
 fi
 
 /musl/busybox sync
-/musl/busybox reboot -f
+{final_action}
 exit "$overall_status"
 """
     )
 
 
-def readme(run_cagent: bool, run_buildstorm: bool, interactive_shell: bool) -> str:
+def readme(
+    run_cagent: bool,
+    run_buildstorm: bool,
+    interactive_shell: bool,
+    starfive_safe_buildstorm: bool = False,
+) -> str:
     return f"""# Final Contest Case Commands
 
 Generated by `scripts/export_contest_case_scripts.py`.
@@ -227,6 +444,7 @@ Generated defaults:
 - CAgent: {"enabled" if run_cagent else "disabled"}
 - BuildStorm: {"enabled" if run_buildstorm else "disabled"}
 - Interactive shell: {"enabled" if interactive_shell else "disabled"}
+- StarFive disposable BuildStorm workspace: {"enabled" if starfive_safe_buildstorm else "disabled"}
 
 At boot, `entry.sh` creates missing `/bin/sh` and architecture-specific loader
 symlinks in the writable per-run rootfs overlay. Existing rootfs entries are
@@ -247,37 +465,60 @@ def write_outputs(
     run_cagent: bool,
     run_buildstorm: bool,
     interactive_shell: bool,
+    starfive_safe_buildstorm: bool = False,
 ) -> None:
     with output_lock(out_dir):
         prepare_out_dir(out_dir, force)
         entry_path = out_dir / "entry.sh"
         entry_path.write_text(
-            entry_script(run_cagent, run_buildstorm, interactive_shell),
+            entry_script(
+                run_cagent,
+                run_buildstorm,
+                interactive_shell,
+                starfive_safe_buildstorm,
+            ),
             encoding="utf-8",
             newline="\n",
         )
         entry_path.chmod(0o755)
         (out_dir / "README.md").write_text(
-            readme(run_cagent, run_buildstorm, interactive_shell),
+            readme(
+                run_cagent,
+                run_buildstorm,
+                interactive_shell,
+                starfive_safe_buildstorm,
+            ),
             encoding="utf-8",
             newline="\n",
         )
+        if starfive_safe_buildstorm:
+            safe_runner = out_dir / "starfive-safe-buildstorm.sh"
+            safe_runner.write_text(
+                starfive_safe_buildstorm_script(), encoding="utf-8", newline="\n"
+            )
+            safe_runner.chmod(0o755)
 
 
 def main() -> int:
     args = parse_args()
+    if args.starfive_safe_buildstorm and not args.buildstorm:
+        raise SystemExit("--starfive-safe-buildstorm requires --buildstorm")
+    if args.starfive_safe_buildstorm and args.interactive:
+        raise SystemExit("--starfive-safe-buildstorm cannot be combined with --interactive")
     write_outputs(
         args.out_dir.resolve(),
         args.force,
         args.cagent,
         args.buildstorm,
         args.interactive,
+        args.starfive_safe_buildstorm,
     )
     print(
         f"wrote final-round runner to {args.out_dir} "
         f"(cagent={'on' if args.cagent else 'off'}, "
         f"buildstorm={'on' if args.buildstorm else 'off'}, "
-        f"interactive={'on' if args.interactive else 'off'})"
+        f"interactive={'on' if args.interactive else 'off'}, "
+        f"starfive-safe-buildstorm={'on' if args.starfive_safe_buildstorm else 'off'})"
     )
     return 0
 

@@ -5,7 +5,7 @@ use super::vfs::{
     LegacyLookupOps, LegacyMetadataOps, LegacyNamespaceOps, LegacySyncOps,
 };
 use super::{FileStat, FileTimestamp, S_IFDIR, S_IFREG};
-use crate::drivers::block::VirtIOBlock;
+use crate::drivers::block::KernelBlockDevice;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -26,7 +26,7 @@ type KernelFatFile<'a> = fatfs::File<'a, FatBlockDevice, DefaultTimeProvider, Lo
 
 #[derive(Clone)]
 struct FatBlockDevice {
-    dev: Arc<VirtIOBlock>,
+    dev: Arc<KernelBlockDevice>,
     start_block: u64,
     block_count: u64,
     position: u64,
@@ -44,7 +44,7 @@ pub(super) struct FatMount {
 }
 
 impl FatBlockDevice {
-    fn new(dev: Arc<VirtIOBlock>, partition: BlockPartition) -> Self {
+    fn new(dev: Arc<KernelBlockDevice>, partition: BlockPartition) -> Self {
         Self {
             dev,
             start_block: partition.start_block,
@@ -199,7 +199,7 @@ fn node_kind(
 
 impl FatMount {
     pub(super) fn open(
-        dev: Arc<VirtIOBlock>,
+        dev: Arc<KernelBlockDevice>,
         partition: BlockPartition,
     ) -> Result<Self, FatError<()>> {
         // Keep the backend-level noatime policy explicit instead of relying on

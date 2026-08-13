@@ -82,3 +82,15 @@ pub fn shutdown(failure: bool) -> ! {
     }
     unreachable!()
 }
+
+/// Reboot the physical machine instead of requesting a shutdown.
+pub fn reboot() -> ! {
+    if crate::board::try_jh7110_watchdog_reboot() {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    use sbi_rt::{ColdReboot, NoReason, system_reset};
+    system_reset(ColdReboot, NoReason);
+    unreachable!()
+}

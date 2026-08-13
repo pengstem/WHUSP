@@ -29,7 +29,14 @@ pub trait CharDevice {
 
 lazy_static! {
     pub static ref UART: Arc<CharDeviceImpl> =
-        Arc::new(CharDeviceImpl::new(crate::board::uart_base()));
+        Arc::new(CharDeviceImpl::new(crate::board::uart_config()));
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct UartConfig {
+    pub base_addr: usize,
+    pub register_shift: usize,
+    pub register_width: usize,
 }
 
 const RBR: usize = 0;
@@ -74,22 +81,42 @@ bitflags! {
 }
 
 pub struct NS16550aRaw {
-    base_addr: usize,
+    config: UartConfig,
 }
 
 impl NS16550aRaw {
     fn read_reg(&self, offset: usize) -> u8 {
-        let ptr = NonNull::new((self.base_addr + offset) as *mut u8).unwrap();
-        unsafe { VolatilePtr::new_restricted(ReadOnly, ptr).read() }
+        let address = self.config.base_addr + (offset << self.config.register_shift);
+        match self.config.register_width {
+            1 => {
+                let ptr = NonNull::new(address as *mut u8).unwrap();
+                unsafe { VolatilePtr::new_restricted(ReadOnly, ptr).read() }
+            }
+            4 => {
+                let ptr = NonNull::new(address as *mut u32).unwrap();
+                unsafe { VolatilePtr::new_restricted(ReadOnly, ptr).read() as u8 }
+            }
+            width => panic!("unsupported UART register width {width}"),
+        }
     }
 
     fn write_reg(&self, offset: usize, value: u8) {
-        let ptr = NonNull::new((self.base_addr + offset) as *mut u8).unwrap();
-        unsafe { VolatilePtr::new_restricted(WriteOnly, ptr).write(value) };
+        let address = self.config.base_addr + (offset << self.config.register_shift);
+        match self.config.register_width {
+            1 => {
+                let ptr = NonNull::new(address as *mut u8).unwrap();
+                unsafe { VolatilePtr::new_restricted(WriteOnly, ptr).write(value) };
+            }
+            4 => {
+                let ptr = NonNull::new(address as *mut u32).unwrap();
+                unsafe { VolatilePtr::new_restricted(WriteOnly, ptr).write(value as u32) };
+            }
+            width => panic!("unsupported UART register width {width}"),
+        }
     }
 
-    pub fn new(base_addr: usize) -> Self {
-        Self { base_addr }
+    pub fn new(config: UartConfig) -> Self {
+        Self { config }
     }
 
     pub fn init(&mut self) {
@@ -171,9 +198,9 @@ pub struct NS16550a {
 }
 
 impl NS16550a {
-    pub fn new(base_addr: usize) -> Self {
+    pub fn new(config: UartConfig) -> Self {
         let inner = NS16550aInner {
-            ns16550a: NS16550aRaw::new(base_addr),
+            ns16550a: NS16550aRaw::new(config),
             read_buffer: VecDeque::new(),
         };
         Self {
@@ -221,7 +248,7 @@ impl NS16550a {
         // CONTEXT: Panic/shutdown cannot wait for a UART lock that may belong
         // to a stopped CPU. Direct output may overlap a final in-flight byte
         // sequence, but it remains bounded and preserves the failure report.
-        let mut raw = NS16550aRaw::new(crate::board::uart_base());
+        let mut raw = NS16550aRaw::new(crate::board::uart_config());
         let mut writer = NS16550aFmtWriter {
             raw: &mut raw,
             bytes: 0,

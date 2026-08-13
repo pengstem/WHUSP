@@ -1,0 +1,39 @@
+/dts-v1/;
+
+/ {
+    description = "WHUSP StarFive VisionFive 2 CAgent bundle";
+    #address-cells = <2>;
+
+    images {
+        kernel {
+            description = "WHUSP RISC-V kernel";
+            data = /incbin/("kernel.bin");
+            type = "kernel";
+            arch = "riscv";
+            os = "linux";
+            compression = "none";
+            load = <0x0 0x80200000>;
+            entry = <0x0 0x80200000>;
+        };
+
+        ramdisk {
+            description = "WHUSP contest runner disk";
+            data = /incbin/("disk.img");
+            type = "ramdisk";
+            arch = "riscv";
+            os = "linux";
+            compression = "none";
+            load = <0x0 0x46100000>;
+        };
+    };
+
+    configurations {
+        default = "conf";
+
+        conf {
+            description = "WHUSP kernel plus in-memory x1 runner";
+            kernel = "kernel";
+            ramdisk = "ramdisk";
+        };
+    };
+};

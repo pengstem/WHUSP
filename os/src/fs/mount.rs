@@ -607,7 +607,7 @@ fn read_le_u32(bytes: &[u8]) -> u32 {
 
 fn open_backend(
     kind: BackendKind,
-    device: Arc<crate::drivers::block::VirtIOBlock>,
+    device: Arc<crate::drivers::block::KernelBlockDevice>,
     device_index: usize,
 ) -> Result<Arc<MountedFs>, MountError> {
     match kind {
@@ -1731,7 +1731,7 @@ pub(crate) fn mount_block_device_at(
 }
 
 fn read_mbr_partition(
-    device: &crate::drivers::block::VirtIOBlock,
+    device: &crate::drivers::block::KernelBlockDevice,
     partition_index: usize,
 ) -> Result<BlockPartition, MountError> {
     if !(1..=4).contains(&partition_index) {

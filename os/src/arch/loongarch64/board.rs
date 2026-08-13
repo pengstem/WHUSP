@@ -1,5 +1,5 @@
 use crate::arch::loongarch64::{irq, mm::phys_to_virt};
-use crate::drivers::chardev::{CharDevice, UART};
+use crate::drivers::chardev::{CharDevice, UART, UartConfig};
 use crate::drivers::{KEYBOARD_DEVICE, MOUSE_DEVICE};
 use core::cell::UnsafeCell;
 use core::mem::size_of;
@@ -29,7 +29,7 @@ const PCI_INTERRUPT_MAP_PARENT_IRQ_CELL: usize = 5;
 const FALLBACK_PCI_INTX_BASE: usize = 0x10;
 const FALLBACK_PCI_INTX_COUNT: usize = 4;
 
-pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
+pub type BlockDeviceImpl = crate::drivers::block::KernelBlockDevice;
 pub type CharDeviceImpl = crate::drivers::chardev::NS16550a;
 
 #[derive(Clone, Copy, Default)]
@@ -558,6 +558,14 @@ pub fn uart_base() -> usize {
         board_config().uart.base
     } else {
         phys_to_virt(EARLY_UART_BASE)
+    }
+}
+
+pub fn uart_config() -> UartConfig {
+    UartConfig {
+        base_addr: uart_base(),
+        register_shift: 0,
+        register_width: 1,
     }
 }
 

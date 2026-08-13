@@ -36,12 +36,8 @@ CARGO_DEFAULT_FEATURE_ARG := --no-default-features
 else
 $(error CARGO_DEFAULT_FEATURES must be 0/1, no/yes, false/true, or off/on: $(CARGO_DEFAULT_FEATURES))
 endif
-# Per-arch defaults when this Makefile is invoked directly; root targets pass MEM explicitly.
-ifeq ($(ARCH),loongarch64)
-MEM ?= 16G
-else
-MEM ?= 12G
-endif
+# Direct invocations use the same profile as the published final-round runner.
+MEM ?= 8G
 SMP ?= 8
 # Must stay in sync with os/src/config.rs and both entry.asm boot stacks.
 MAX_CPUS := 12

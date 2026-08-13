@@ -274,12 +274,7 @@ impl PageTable {
         if pte.bits != 0 {
             return false;
         }
-        let leaf_flags = PTEFlags::R | PTEFlags::W | PTEFlags::X;
-        let flags = if flags.intersects(leaf_flags) {
-            flags | PTEFlags::V
-        } else {
-            flags
-        };
+        let flags = normalized_leaf_flags(flags);
         *pte = PageTableEntry::new_leaf(ppn, flags, 0);
         self.leaves_4k += 1;
         true
@@ -410,12 +405,7 @@ impl PageTable {
         if !pte.is_valid() && pte.bits == 0 {
             return false;
         }
-        let leaf_flags = PTEFlags::R | PTEFlags::W | PTEFlags::X;
-        let flags = if flags.intersects(leaf_flags) {
-            flags | PTEFlags::V
-        } else {
-            flags
-        };
+        let flags = normalized_leaf_flags(flags);
         *pte = PageTableEntry::new(pte.ppn(), flags);
         true
     }
@@ -469,12 +459,7 @@ impl PageTable {
         if !pte.is_valid() || pte.bits == 0 {
             return false;
         }
-        let leaf_flags = PTEFlags::R | PTEFlags::W | PTEFlags::X;
-        let flags = if flags.intersects(leaf_flags) {
-            flags | PTEFlags::V
-        } else {
-            flags
-        };
+        let flags = normalized_leaf_flags(flags);
         *pte = PageTableEntry::new(ppn, flags);
         true
     }
@@ -494,12 +479,7 @@ impl PageTable {
         if pte.bits == 0 || pte.ppn() != expected_ppn {
             return false;
         }
-        let leaf_flags = PTEFlags::R | PTEFlags::W | PTEFlags::X;
-        let flags = if flags.intersects(leaf_flags) {
-            flags | PTEFlags::V
-        } else {
-            flags
-        };
+        let flags = normalized_leaf_flags(flags);
         *pte = PageTableEntry::new(ppn, flags);
         true
     }
@@ -609,7 +589,23 @@ impl PageTable {
 fn normalized_leaf_flags(flags: PTEFlags) -> PTEFlags {
     let leaf_flags = PTEFlags::R | PTEFlags::W | PTEFlags::X;
     if flags.intersects(leaf_flags) {
-        flags | PTEFlags::V
+        let flags = flags | PTEFlags::V;
+        #[cfg(target_arch = "riscv64")]
+        {
+            let mut flags = flags;
+            // CONTEXT: SiFive U74 cores implement the fault-on-clear A/D
+            // scheme. WHUSP does not currently use A/D bits for page-aging or
+            // writeback accounting, so publish accessed leaves and dirty
+            // writable leaves up front instead of requiring an A/D fault path.
+            flags.insert(PTEFlags::A);
+            if flags.contains(PTEFlags::W) {
+                flags.insert(PTEFlags::D);
+            }
+            return flags;
+        }
+
+        #[cfg(not(target_arch = "riscv64"))]
+        flags
     } else {
         flags
     }

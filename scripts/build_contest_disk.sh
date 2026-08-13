@@ -11,6 +11,7 @@ lock_path="${CONTEST_SCRIPT_LOCK:-/tmp/whusp-build-contest-disk.lock}"
 interactive="${CONTEST_INTERACTIVE:-0}"
 run_cagent="${CONTEST_RUN_CAGENT:-1}"
 run_buildstorm="${CONTEST_RUN_BUILDSTORM:-1}"
+starfive_safe_buildstorm="${CONTEST_STARFIVE_SAFE_BUILDSTORM:-0}"
 
 exec 9>"$lock_path"
 flock 9
@@ -52,6 +53,18 @@ append_group_arg() {
 
 append_group_arg "$run_cagent" --cagent --no-cagent CONTEST_RUN_CAGENT
 append_group_arg "$run_buildstorm" --buildstorm --no-buildstorm CONTEST_RUN_BUILDSTORM
+
+case "$starfive_safe_buildstorm" in
+    1|yes|true|on)
+        exporter_args+=(--starfive-safe-buildstorm)
+        ;;
+    0|no|false|off|"")
+        ;;
+    *)
+        echo "CONTEST_STARFIVE_SAFE_BUILDSTORM must be one of 0/1, no/yes, false/true, or off/on: $starfive_safe_buildstorm" >&2
+        exit 2
+        ;;
+esac
 
 python3 "$repo_root/scripts/export_contest_case_scripts.py" \
     "${exporter_args[@]}"

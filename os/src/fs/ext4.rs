@@ -14,7 +14,7 @@ use super::vfs::{
     SyncOps,
 };
 use super::{FS_STATX_ATTR_FLAGS, FileStat, FileTimestamp};
-use crate::drivers::block::VirtIOBlock;
+use crate::drivers::block::KernelBlockDevice;
 use crate::perf;
 use crate::sync::{RawSleepLock, RawSpinNoIrqLock, SleepMutex, SleepRwLock, SpinNoIrqLock};
 use crate::task::suspend_current_and_run_next;
@@ -293,7 +293,7 @@ impl Ext4AllocatorLocks {
 
 #[derive(Clone)]
 pub(super) struct KernelDisk {
-    dev: Arc<VirtIOBlock>,
+    dev: Arc<KernelBlockDevice>,
     concurrent_bcache: bool,
     versioned_bcache: bool,
     concurrent_metadata: bool,
@@ -494,7 +494,7 @@ fn map_ext4_error(err: Ext4Error) -> FsError {
 
 pub(super) struct Ext4Mount {
     fs: KernelExt4Fs,
-    device: Arc<VirtIOBlock>,
+    device: Arc<KernelBlockDevice>,
     cache_epoch: Arc<Ext4CacheEpoch>,
     write_sequence: Arc<Ext4Sequence>,
     physical_leases: Arc<Ext4PhysicalLeaseTable>,
@@ -912,7 +912,7 @@ unsafe impl Send for Ext4Mount {}
 
 impl Ext4Mount {
     fn open(
-        device: Arc<VirtIOBlock>,
+        device: Arc<KernelBlockDevice>,
         cache_epoch: Arc<Ext4CacheEpoch>,
         write_sequence: Arc<Ext4Sequence>,
         physical_leases: Arc<Ext4PhysicalLeaseTable>,
@@ -1443,7 +1443,7 @@ pub(super) struct ConcurrentExt4Backend {
 }
 
 impl ConcurrentExt4Backend {
-    pub(super) fn open(device: Arc<VirtIOBlock>) -> Result<Self, Ext4Error> {
+    pub(super) fn open(device: Arc<KernelBlockDevice>) -> Result<Self, Ext4Error> {
         let cache_epoch = Arc::new(Ext4CacheEpoch::new());
         let write_sequence = Arc::new(Ext4Sequence::new());
         let physical_leases = Arc::new(Ext4PhysicalLeaseTable::new());
@@ -1818,7 +1818,7 @@ struct Ext4DeviceWriteRun {
 }
 
 struct Ext4PreparedWritePlan {
-    device: Arc<VirtIOBlock>,
+    device: Arc<KernelBlockDevice>,
     cache_epoch: Arc<Ext4CacheEpoch>,
     write_sequence: Arc<Ext4Sequence>,
     physical_leases: Arc<Ext4PhysicalLeaseTable>,
@@ -1850,7 +1850,7 @@ impl Ext4PreparedWritePlan {
 }
 
 struct Ext4DeviceWritePlan {
-    device: Arc<VirtIOBlock>,
+    device: Arc<KernelBlockDevice>,
     cache_epoch: Arc<Ext4CacheEpoch>,
     write_sequence: Arc<Ext4Sequence>,
     physical_leases: Arc<Ext4PhysicalLeaseTable>,
@@ -1864,7 +1864,7 @@ struct Ext4DeviceWritePlan {
 }
 
 struct Ext4DeviceReadPlan {
-    device: Arc<VirtIOBlock>,
+    device: Arc<KernelBlockDevice>,
     write_sequence: Arc<Ext4Sequence>,
     buffer_len: usize,
     read_offset: usize,

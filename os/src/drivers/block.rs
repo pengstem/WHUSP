@@ -130,10 +130,6 @@ struct VirtIOBlockState {
 }
 
 impl VirtIOBlock {
-    pub fn read_block(&self, block_id: usize, buf: &mut [u8]) {
-        self.read_blocks(block_id, buf);
-    }
-
     pub fn read_blocks(&self, block_id: usize, buf: &mut [u8]) {
         block_cache::read_with_cache(self.cache_key(), block_id, buf, |block_id, buf| {
             self.read_blocks_uncached(block_id, buf);
@@ -230,10 +226,6 @@ impl VirtIOBlock {
                     err
                 )
             });
-    }
-
-    pub fn write_block(&self, block_id: usize, buf: &[u8]) {
-        self.write_blocks(block_id, buf);
     }
 
     pub fn write_blocks(&self, block_id: usize, buf: &[u8]) {
@@ -414,6 +406,14 @@ impl VirtIOBlock {
                     device.irq,
                 )
             }
+            #[cfg(target_arch = "riscv64")]
+            BlockDeviceConfig::StarFiveMmc(_) => {
+                unreachable!("JH7110 MMC cannot be constructed as VirtIO")
+            }
+            #[cfg(target_arch = "riscv64")]
+            BlockDeviceConfig::RamDisk { .. } => {
+                unreachable!("boot ramdisk cannot be constructed as VirtIO")
+            }
         };
         let virtio_blk = VirtIOBlk::<VirtioHal, _>::new(transport).unwrap();
         let capacity_blocks = virtio_blk.capacity() as usize;
@@ -437,6 +437,133 @@ impl VirtIOBlock {
             irq,
             capacity_blocks,
             condvars,
+        }
+    }
+}
+
+pub enum KernelBlockDevice {
+    VirtIo(VirtIOBlock),
+    #[cfg(target_arch = "riscv64")]
+    StarFiveMmc(crate::drivers::dw_mmc::Jh7110MmcBlock),
+    #[cfg(target_arch = "riscv64")]
+    RamDisk(crate::drivers::ramdisk::RamDiskBlock),
+}
+
+impl KernelBlockDevice {
+    pub fn new(device: BlockDeviceConfig) -> Self {
+        match device {
+            BlockDeviceConfig::Mmio(_) | BlockDeviceConfig::Pci(_) => {
+                Self::VirtIo(VirtIOBlock::new(device))
+            }
+            #[cfg(target_arch = "riscv64")]
+            BlockDeviceConfig::StarFiveMmc(device) => {
+                Self::StarFiveMmc(crate::drivers::dw_mmc::Jh7110MmcBlock::new(device))
+            }
+            #[cfg(target_arch = "riscv64")]
+            BlockDeviceConfig::RamDisk { base, size } => {
+                Self::RamDisk(crate::drivers::ramdisk::RamDiskBlock::new(base, size))
+            }
+        }
+    }
+
+    pub fn read_block(&self, block_id: usize, buf: &mut [u8]) {
+        self.read_blocks(block_id, buf);
+    }
+
+    pub fn read_blocks(&self, block_id: usize, buf: &mut [u8]) {
+        match self {
+            Self::VirtIo(device) => device.read_blocks(block_id, buf),
+            #[cfg(target_arch = "riscv64")]
+            Self::StarFiveMmc(device) => device.read_blocks(block_id, buf),
+            #[cfg(target_arch = "riscv64")]
+            Self::RamDisk(device) => device.read_blocks(block_id, buf),
+        }
+    }
+
+    pub fn write_block(&self, block_id: usize, buf: &[u8]) {
+        self.write_blocks(block_id, buf);
+    }
+
+    pub fn write_blocks(&self, block_id: usize, buf: &[u8]) {
+        match self {
+            Self::VirtIo(device) => device.write_blocks(block_id, buf),
+            #[cfg(target_arch = "riscv64")]
+            Self::StarFiveMmc(device) => device.write_blocks(block_id, buf),
+            #[cfg(target_arch = "riscv64")]
+            Self::RamDisk(device) => device.write_blocks(block_id, buf),
+        }
+    }
+
+    pub(crate) fn read_blocks_versioned_fill_for_file_plan(
+        &self,
+        block_id: usize,
+        buf: &mut [u8],
+    ) -> block_cache::VersionedReadStats {
+        match self {
+            Self::VirtIo(device) => device.read_blocks_versioned_fill_for_file_plan(block_id, buf),
+            #[cfg(target_arch = "riscv64")]
+            Self::StarFiveMmc(device) => {
+                device.read_blocks_versioned_fill_for_file_plan(block_id, buf)
+            }
+            #[cfg(target_arch = "riscv64")]
+            Self::RamDisk(device) => device.read_blocks_versioned_fill_for_file_plan(block_id, buf),
+        }
+    }
+
+    pub(crate) fn write_blocks_for_file_plan(
+        &self,
+        block_id: usize,
+        buf: &[u8],
+    ) -> block_cache::WriteStats {
+        match self {
+            Self::VirtIo(device) => device.write_blocks_for_file_plan(block_id, buf),
+            #[cfg(target_arch = "riscv64")]
+            Self::StarFiveMmc(device) => device.write_blocks_for_file_plan(block_id, buf),
+            #[cfg(target_arch = "riscv64")]
+            Self::RamDisk(device) => device.write_blocks_for_file_plan(block_id, buf),
+        }
+    }
+
+    pub fn num_blocks(&self) -> u64 {
+        match self {
+            Self::VirtIo(device) => device.num_blocks(),
+            #[cfg(target_arch = "riscv64")]
+            Self::StarFiveMmc(device) => device.num_blocks(),
+            #[cfg(target_arch = "riscv64")]
+            Self::RamDisk(device) => device.num_blocks(),
+        }
+    }
+
+    pub fn irq(&self) -> usize {
+        match self {
+            Self::VirtIo(device) => device.irq(),
+            #[cfg(target_arch = "riscv64")]
+            Self::StarFiveMmc(_) | Self::RamDisk(_) => 0,
+        }
+    }
+
+    pub fn base_addr(&self) -> usize {
+        match self {
+            Self::VirtIo(device) => device.base_addr(),
+            #[cfg(target_arch = "riscv64")]
+            Self::StarFiveMmc(device) => device.base_addr(),
+            #[cfg(target_arch = "riscv64")]
+            Self::RamDisk(device) => device.base_addr(),
+        }
+    }
+
+    fn handle_irq(&self) {
+        match self {
+            Self::VirtIo(device) => device.handle_irq(),
+            #[cfg(target_arch = "riscv64")]
+            Self::StarFiveMmc(_) | Self::RamDisk(_) => {}
+        }
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    fn poll_completion(&self) {
+        match self {
+            Self::VirtIo(device) => device.poll_completion(),
         }
     }
 }

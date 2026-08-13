@@ -221,6 +221,31 @@ impl MemorySet {
             );
         }
         #[cfg(target_arch = "riscv64")]
+        if let Some(ramdisk) = crate::board::boot_ramdisk() {
+            let virtual_start =
+                crate::arch::mm::boot_ramdisk_phys_to_virt(ramdisk.base, ramdisk.base);
+            let virtual_end = virtual_start
+                .checked_add(ramdisk.size)
+                .expect("boot ramdisk virtual range overflow");
+            let start_vpn = VirtAddr::from(virtual_start).floor();
+            let end_vpn = VirtAddr::from(virtual_end).ceil();
+            let start_ppn = PhysAddr::from(ramdisk.base).floor();
+            assert_eq!(
+                start_vpn.indexes()[0],
+                VirtAddr::from(virtual_end - 1).floor().indexes()[0],
+                "boot ramdisk alias crossed an Sv39 root boundary"
+            );
+            assert!(
+                memory_set.page_table.try_map_kernel_linear_range(
+                    start_vpn,
+                    start_ppn,
+                    end_vpn,
+                    PTEFlags::R | PTEFlags::W | PTEFlags::G,
+                ),
+                "failed to map boot ramdisk high alias"
+            );
+        }
+        #[cfg(target_arch = "riscv64")]
         {
             assert!(
                 memory_end() <= USER_MMAP_BASE,

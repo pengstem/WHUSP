@@ -79,9 +79,9 @@ oskernel2026-whusp/
   - Targets: `riscv64gc-unknown-none-elf`, `loongarch64-unknown-none`
 - **QEMU** ≥ 10.0.2 with `qemu-system-riscv64` and `qemu-system-loongarch64`
 - **Python 3** and **`mkfs.ext4`** (for building the test script disk)
-- **Test disk images** — download from [oscomp/testsuits-for-oskernel releases](https://github.com/oscomp/testsuits-for-oskernel/releases):
-  - `sdcard-rv.img` (RISC-V, ~4 GiB)
-  - `sdcard-la.img` (LoongArch, ~4 GiB)
+- **Final-round disk images** — follow the current [`final-2026` contract](https://github.com/oscomp/testsuits-for-oskernel/tree/final-2026):
+  - `sdcard-rv-pub.img` (RISC-V, current public image is ~15 GB)
+  - `sdcard-la-pub.img` (LoongArch, current public image is ~15 GB)
 
 ### Build
 
@@ -109,7 +109,7 @@ make run-la                          # Build and boot LoongArch
 # Override test disk or tune resources
 make run-rv TEST_DISK=/path/to/sdcard-rv.img
 make run-rv MEM=2G SMP=4
-# Defaults: RV 12G / LA 16G, SMP=8 (MAX_CPUS=12)
+# Final defaults: RV 8G / LA 8G, SMP=8 (MAX_CPUS=12)
 
 # Reuse an existing root-level kernel artifact
 make run-rv NO_BUILD=1
@@ -146,8 +146,10 @@ make contest-disk INTERACTIVE=1         # Interactive shell runner
 |------|---------|-----------------|
 | `INTERACTIVE` | `0` | `1` creates a script disk that enters a BusyBox shell instead of running tests. |
 | `NO_BUILD` | `0` | `1` reuses `./kernel-rv` or `./kernel-la`; the command fails clearly if the requested artifact is absent. |
-| `RUN_CAGENT` | `True` | Enables the final-round CAgent test in the exporter. |
-| `RUN_BUILDSTORM` | `False` | Enables the final-round BuildStorm test in the exporter. |
+| `RUN_CAGENT` | `1` | Enables the final-round CAgent test in the exporter. |
+| `RUN_BUILDSTORM` | `1` | Enables the final-round BuildStorm test in the exporter. |
+| `MEM_RV` / `MEM_LA` | `8G` | Final-round guest memory; `MEM=...` overrides both for diagnosis. |
+| `SMP` | `8` | Final-round vCPU count. Values up to the kernel's `MAX_CPUS=12` are accepted only for targeted diagnosis. |
 
 #### Common Workflows
 
@@ -157,9 +159,6 @@ make run-rv NO_BUILD=1
 
 # Open a shell with that same kernel
 make shell-rv NO_BUILD=1
-
-# The scorer supports the same fast path
-python3 tools/score_autotest.py --arch rv --no-build
 ```
 
 ---

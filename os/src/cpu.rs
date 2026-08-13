@@ -259,7 +259,7 @@ impl CpuTopology {
             ..Self::empty()
         };
         for cpu in fdt.cpus() {
-            if !cpu_is_enabled(cpu) {
+            if !cpu_is_kernel_compatible(cpu) {
                 continue;
             }
             for hw_id in cpu.ids().all() {
@@ -319,6 +319,55 @@ fn cpu_is_enabled(cpu: fdt::standard_nodes::Cpu<'_, '_>) -> bool {
         return false;
     };
     matches!(status.trim_end_matches('\0'), "ok" | "okay")
+}
+
+fn cpu_is_kernel_compatible(cpu: fdt::standard_nodes::Cpu<'_, '_>) -> bool {
+    if !cpu_is_enabled(cpu) {
+        return false;
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        // CONTEXT: A RISC-V /cpus node may describe management harts that
+        // cannot run an S-mode paged kernel. JH7110 hart 0 is such a SiFive S7
+        // hart, while its U74 application harts advertise an riscv,sv* MMU.
+        let Some(mmu_type) = cpu.property("mmu-type") else {
+            return false;
+        };
+        let Ok(mmu_type) = core::str::from_utf8(mmu_type.value) else {
+            return false;
+        };
+        if !mmu_type.trim_end_matches('\0').starts_with("riscv,sv") {
+            return false;
+        }
+
+        // CONTEXT: The 2023 VisionFive 2 vendor DTB incorrectly marks its
+        // management hart as a U74 with an Sv39 MMU. Its legacy riscv,isa
+        // value still identifies the hart as U-only (rv64imacu), unlike the
+        // S/U-capable application harts. Modern bindings omit both privilege
+        // letters, so only reject the contradictory U-without-S form.
+        if let Some(isa) = cpu.property("riscv,isa") {
+            let Ok(isa) = core::str::from_utf8(isa.value) else {
+                return false;
+            };
+            let base_isa = isa
+                .trim_end_matches('\0')
+                .split('_')
+                .next()
+                .unwrap_or_default();
+            let base_extensions = base_isa
+                .strip_prefix("rv64")
+                .or_else(|| base_isa.strip_prefix("rv32"))
+                .unwrap_or_default();
+            if base_extensions.contains('u') && !base_extensions.contains('s') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    true
 }
 
 struct CpuTopologyCell {

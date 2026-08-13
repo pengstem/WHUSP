@@ -21,6 +21,7 @@ const VPN_WIDTH: usize = VA_WIDTH - crate::config::PAGE_SIZE_BITS;
 pub const MAX_KERNEL_LEAF_LEVEL: usize = 2;
 
 const MMIO_VIRT_BASE: usize = 0xffff_ffff_4000_0000;
+const BOOT_RAMDISK_VIRT_BASE: usize = MMIO_VIRT_BASE + 0x2000_0000;
 
 const ASID_SUPPORT_NO: usize = 0;
 const ASID_SUPPORT_YES: usize = 1;
@@ -226,6 +227,15 @@ pub fn mmio_phys_to_virt(addr: usize) -> usize {
     MMIO_VIRT_BASE
         .checked_add(addr)
         .expect("RISC-V MMIO virtual alias overflow")
+}
+
+pub fn boot_ramdisk_phys_to_virt(addr: usize, physical_base: usize) -> usize {
+    BOOT_RAMDISK_VIRT_BASE
+        .checked_add(
+            addr.checked_sub(physical_base)
+                .expect("boot ramdisk address precedes its physical base"),
+        )
+        .expect("boot ramdisk virtual alias overflow")
 }
 
 pub fn pte_new_bits(ppn: usize, flags: crate::mm::page_table::PTEFlags) -> usize {

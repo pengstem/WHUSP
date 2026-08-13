@@ -26,3 +26,10 @@ pub fn shutdown(_failure: bool) -> ! {
         }
     }
 }
+
+pub fn reboot() -> ! {
+    // UNFINISHED: The current LoongArch board backend exposes only the QEMU
+    // GED poweroff register. Under the contest QEMU `-no-reboot` contract this
+    // still terminates the run; physical reset support needs a board backend.
+    shutdown(false)
+}

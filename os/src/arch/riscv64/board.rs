@@ -1,4 +1,4 @@
-use crate::drivers::chardev::{CharDevice, UART};
+use crate::drivers::chardev::{CharDevice, UART, UartConfig};
 use crate::drivers::plic::{IntrTargetPriority, PLIC};
 use crate::drivers::{KEYBOARD_DEVICE, MOUSE_DEVICE};
 use core::cell::UnsafeCell;
@@ -13,10 +13,10 @@ use virtio_drivers::transport::{
 };
 
 const BLOCK_DEVICE_CAPACITY: usize = 8;
-const MMIO_REGION_CAPACITY: usize = 10;
+const MMIO_REGION_CAPACITY: usize = 12;
 const EARLY_UART_BASE: usize = 0x1000_0000;
 
-pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
+pub type BlockDeviceImpl = crate::drivers::block::KernelBlockDevice;
 pub type CharDeviceImpl = crate::drivers::chardev::NS16550a;
 
 #[derive(Clone, Copy, Default)]
@@ -54,6 +54,11 @@ pub enum BlockDeviceConfig {
     // constructs `Pci`. Variant kept so the type stays symmetric across arches.
     #[allow(dead_code)]
     Pci(PciDevice),
+    StarFiveMmc(IrqDevice),
+    RamDisk {
+        base: usize,
+        size: usize,
+    },
 }
 
 impl Default for BlockDeviceConfig {
@@ -67,6 +72,8 @@ struct BoardConfig {
     clock_freq: usize,
     memory_end: usize,
     uart: IrqDevice,
+    uart_register_shift: usize,
+    uart_register_width: usize,
     plic: MmioRange,
     blocks: [BlockDeviceConfig; BLOCK_DEVICE_CAPACITY],
     block_count: usize,
@@ -75,8 +82,11 @@ struct BoardConfig {
     mouse: Option<IrqDevice>,
     net: Option<IrqDevice>,
     rtc_base: usize,
+    starfive_syscrg: Option<MmioRange>,
+    starfive_watchdog: Option<MmioRange>,
     mmio_regions: [MmioRange; MMIO_REGION_CAPACITY],
     mmio_region_count: usize,
+    boot_ramdisk: Option<MmioRange>,
 }
 
 impl BoardConfig {
@@ -89,6 +99,8 @@ impl BoardConfig {
                 size: 0,
                 irq: 0,
             },
+            uart_register_shift: 0,
+            uart_register_width: 1,
             plic: MmioRange { base: 0, size: 0 },
             blocks: [BlockDeviceConfig::Mmio(IrqDevice {
                 base: 0,
@@ -101,8 +113,11 @@ impl BoardConfig {
             mouse: None,
             net: None,
             rtc_base: 0,
+            starfive_syscrg: None,
+            starfive_watchdog: None,
             mmio_regions: [MmioRange { base: 0, size: 0 }; MMIO_REGION_CAPACITY],
             mmio_region_count: 0,
+            boot_ramdisk: None,
         }
     }
 }
@@ -164,6 +179,21 @@ fn property_str<'a>(node: FdtNode<'_, 'a>, name: &str) -> Option<&'a str> {
         .map(|value| value.trim_end_matches('\0'))
 }
 
+fn property_u32(node: FdtNode<'_, '_>, name: &str) -> Option<u32> {
+    let value = node.property(name)?.value;
+    let bytes: [u8; 4] = value.get(..4)?.try_into().ok()?;
+    Some(u32::from_be_bytes(bytes))
+}
+
+fn property_address(node: FdtNode<'_, '_>, name: &str) -> Option<usize> {
+    let value = node.property(name)?.value;
+    match value.len() {
+        4 => Some(u32::from_be_bytes(value.try_into().ok()?) as usize),
+        8.. => Some(u64::from_be_bytes(value[..8].try_into().ok()?) as usize),
+        _ => None,
+    }
+}
+
 fn first_reg(node: FdtNode<'_, '_>, context: &str) -> MmioRange {
     let region = node
         .reg()
@@ -206,13 +236,17 @@ fn set_required_device(slot: &mut Option<IrqDevice>, value: IrqDevice, context: 
     *slot = Some(value);
 }
 
-fn push_block_device(config: &mut BoardConfig, value: IrqDevice) {
+fn push_block_config(config: &mut BoardConfig, value: BlockDeviceConfig) {
     assert!(
         config.block_count < config.blocks.len(),
-        "too many virtio block devices discovered in DTB"
+        "too many block devices discovered in DTB"
     );
-    config.blocks[config.block_count] = BlockDeviceConfig::Mmio(value);
+    config.blocks[config.block_count] = value;
     config.block_count += 1;
+}
+
+fn push_virtio_block_device(config: &mut BoardConfig, value: IrqDevice) {
+    push_block_config(config, BlockDeviceConfig::Mmio(value));
 }
 
 fn push_device_mmio_region(config: &mut BoardConfig, device: IrqDevice) {
@@ -283,9 +317,25 @@ pub fn init_from_dtb(dtb_addr: usize, boot_hw_id: usize) {
     config.memory_end = memory_region.starting_address as usize + memory_size;
 
     let uart_node = fdt
-        .find_compatible(&["ns16550a"])
-        .unwrap_or_else(|| panic!("DTB is missing ns16550a UART"));
-    config.uart = irq_device(uart_node, "UART");
+        .find_compatible(&["ns16550a", "starfive,jh7110-uart", "snps,dw-apb-uart"])
+        .unwrap_or_else(|| panic!("DTB is missing a supported 16550-compatible UART"));
+    let uart_range = first_reg(uart_node, "UART");
+    config.uart = IrqDevice {
+        base: uart_range.base,
+        size: uart_range.size,
+        // CONTEXT: StarFive Release-31's U-Boot control DT does not provide
+        // enough interrupt-parent metadata for fdt::FdtNode::interrupts().
+        // RISC-V PLIC interrupt specifiers are one u32 cell, so read that cell
+        // directly and retain polling-only UART output when it is absent.
+        irq: property_u32(uart_node, "interrupts").unwrap_or(0) as usize,
+    };
+    config.uart_register_shift = property_u32(uart_node, "reg-shift").unwrap_or(0) as usize;
+    config.uart_register_width = property_u32(uart_node, "reg-io-width").unwrap_or(1) as usize;
+    assert!(
+        matches!(config.uart_register_width, 1 | 4),
+        "unsupported UART reg-io-width {}",
+        config.uart_register_width
+    );
 
     let plic_node = fdt
         .find_compatible(&["sifive,plic-1.0.0", "riscv,plic0"])
@@ -307,7 +357,7 @@ pub fn init_from_dtb(dtb_addr: usize, boot_hw_id: usize) {
         let device = irq_device(node, "virtio-mmio");
         match virtio_device_type(device) {
             Some(DeviceType::Block) => {
-                push_block_device(&mut config, device);
+                push_virtio_block_device(&mut config, device);
                 push_device_mmio_region(&mut config, device);
             }
             Some(DeviceType::GPU) => {
@@ -333,6 +383,75 @@ pub fn init_from_dtb(dtb_addr: usize, boot_hw_id: usize) {
         }
     }
 
+    let is_starfive = fdt
+        .find_node("/")
+        .is_some_and(|root| compatible_contains(root, &["starfive,jh7110"]));
+    if is_starfive {
+        let syscrg = fdt
+            .find_compatible(&["starfive,jh7110-syscrg"])
+            .map(|node| first_reg(node, "JH7110 SYSCRG"))
+            .unwrap_or(MmioRange {
+                base: 0x1302_0000,
+                size: 0x1_0000,
+            });
+        let watchdog = fdt
+            .find_compatible(&["starfive,jh7110-wdt"])
+            .map(|node| first_reg(node, "JH7110 watchdog"))
+            .unwrap_or(MmioRange {
+                base: 0x1307_0000,
+                size: 0x1_0000,
+            });
+        config.starfive_syscrg = Some(syscrg);
+        config.starfive_watchdog = Some(watchdog);
+        push_mmio_region(&mut config, syscrg);
+        push_mmio_region(&mut config, watchdog);
+
+        let mmc_node = fdt
+            .all_nodes()
+            .filter(|node| {
+                compatible_contains(
+                    *node,
+                    &[
+                        "starfive,jh7110-sdio",
+                        "starfive,jh7110-mmc",
+                        "snps,dw-mshc",
+                    ],
+                ) && property_str(*node, "status") != Some("disabled")
+            })
+            .find(|node| first_reg(*node, "JH7110 MMC").base == 0x1602_0000)
+            .unwrap_or_else(|| panic!("DTB is missing the removable JH7110 mmc1 controller"));
+        let mmc_range = first_reg(mmc_node, "JH7110 MMC");
+        let mmc = IrqDevice {
+            base: mmc_range.base,
+            size: mmc_range.size,
+            // The SDK Release-31 U-Boot control DT omits this interrupt. The
+            // current driver deliberately polls command and IDMAC status.
+            irq: mmc_node
+                .interrupts()
+                .and_then(|mut interrupts| interrupts.next())
+                .unwrap_or(0),
+        };
+        push_block_config(&mut config, BlockDeviceConfig::StarFiveMmc(mmc));
+        push_device_mmio_region(&mut config, mmc);
+    }
+
+    if let Some(chosen) = fdt.find_node("/chosen") {
+        let start = property_address(chosen, "linux,initrd-start");
+        let end = property_address(chosen, "linux,initrd-end");
+        match (start, end) {
+            (Some(start), Some(end)) if end > start => {
+                let size = end - start;
+                push_block_config(
+                    &mut config,
+                    BlockDeviceConfig::RamDisk { base: start, size },
+                );
+                config.boot_ramdisk = Some(MmioRange { base: start, size });
+            }
+            (None, None) => {}
+            _ => panic!("DTB has an invalid linux,initrd-start/end range"),
+        }
+    }
+
     // QEMU's MMIO addresses encode the contest disk order. Sorting before
     // publishing keeps `block_devices()[0]` aligned with x0 even if DTB node
     // iteration order changes.
@@ -343,6 +462,8 @@ pub fn init_from_dtb(dtb_addr: usize, boot_hw_id: usize) {
                 | ((device.device as usize) << 8)
                 | device.function as usize
         }
+        BlockDeviceConfig::StarFiveMmc(device) => device.base,
+        BlockDeviceConfig::RamDisk { .. } => usize::MAX,
     });
 
     if let Some(rtc_node) = fdt.find_compatible(&["google,goldfish-rtc"]) {
@@ -351,7 +472,10 @@ pub fn init_from_dtb(dtb_addr: usize, boot_hw_id: usize) {
         push_mmio_region(&mut config, rtc_range);
     }
 
-    assert_ne!(config.block_count, 0, "DTB is missing virtio block device");
+    assert_ne!(
+        config.block_count, 0,
+        "DTB is missing a supported block device"
+    );
     assert_ne!(config.uart.base, 0, "DTB is missing uart base");
     assert_ne!(config.plic.base, 0, "DTB is missing plic base");
 
@@ -371,11 +495,32 @@ pub fn mmio_regions() -> &'static [MmioRange] {
     &config.mmio_regions[..config.mmio_region_count]
 }
 
+pub fn boot_ramdisk() -> Option<MmioRange> {
+    board_config().boot_ramdisk
+}
+
 pub fn uart_base() -> usize {
     if BOARD_CONFIG.initialized.load(Ordering::Acquire) {
         crate::arch::mm::mmio_phys_to_virt(board_config().uart.base)
     } else {
         EARLY_UART_BASE
+    }
+}
+
+pub fn uart_config() -> UartConfig {
+    if BOARD_CONFIG.initialized.load(Ordering::Acquire) {
+        let config = board_config();
+        UartConfig {
+            base_addr: crate::arch::mm::mmio_phys_to_virt(config.uart.base),
+            register_shift: config.uart_register_shift,
+            register_width: config.uart_register_width,
+        }
+    } else {
+        UartConfig {
+            base_addr: EARLY_UART_BASE,
+            register_shift: 0,
+            register_width: 1,
+        }
     }
 }
 
@@ -393,6 +538,141 @@ pub fn block_devices() -> &'static [BlockDeviceConfig] {
 }
 
 pub fn block_irq_available() -> bool {
+    block_devices().iter().any(|device| match device {
+        BlockDeviceConfig::Mmio(device) => device.irq != 0,
+        BlockDeviceConfig::Pci(device) => device.irq != 0,
+        BlockDeviceConfig::StarFiveMmc(_) | BlockDeviceConfig::RamDisk { .. } => false,
+    })
+}
+
+fn arm_jh7110_watchdog(half_timeout_ticks: u32) -> Option<(u32, u32)> {
+    const CLOCK_ENABLE: u32 = 1 << 31;
+    const WDT_APB_CLOCK_ID: usize = 122;
+    const WDT_CORE_CLOCK_ID: usize = 123;
+    const RESET_ASSERT_OFFSET: usize = 0x2f8;
+    const RESET_STATUS_OFFSET: usize = 0x308;
+    const WDT_APB_RESET_ID: usize = 109;
+    const WDT_CORE_RESET_ID: usize = 110;
+
+    const WDT_LOAD: usize = 0x000;
+    const WDT_VALUE: usize = 0x004;
+    const WDT_CONTROL: usize = 0x008;
+    const WDT_INTCLR: usize = 0x00c;
+    const WDT_LOCK: usize = 0xc00;
+    const WDT_UNLOCK_KEY: u32 = 0x1acc_e551;
+    const WDT_ENABLE: u32 = 1 << 0;
+    const WDT_RESET_ENABLE: u32 = 1 << 1;
+    fn read32(base: usize, offset: usize) -> u32 {
+        unsafe { core::ptr::read_volatile((base + offset) as *const u32) }
+    }
+
+    fn write32(base: usize, offset: usize, value: u32) {
+        unsafe { core::ptr::write_volatile((base + offset) as *mut u32, value) };
+    }
+
+    fn device_barrier() {
+        unsafe { core::arch::asm!("fence iorw, iorw") };
+    }
+
+    let config = board_config();
+    let (Some(syscrg), Some(watchdog)) = (config.starfive_syscrg, config.starfive_watchdog) else {
+        return None;
+    };
+    let syscrg = crate::arch::mm::mmio_phys_to_virt(syscrg.base);
+    let watchdog = crate::arch::mm::mmio_phys_to_virt(watchdog.base);
+
+    for clock_id in [WDT_APB_CLOCK_ID, WDT_CORE_CLOCK_ID] {
+        let offset = clock_id * core::mem::size_of::<u32>();
+        write32(syscrg, offset, read32(syscrg, offset) | CLOCK_ENABLE);
+    }
+    device_barrier();
+
+    let reset_word = WDT_APB_RESET_ID / 32;
+    debug_assert_eq!(reset_word, WDT_CORE_RESET_ID / 32);
+    let reset_mask = (1 << (WDT_APB_RESET_ID % 32)) | (1 << (WDT_CORE_RESET_ID % 32));
+    let assert_offset = RESET_ASSERT_OFFSET + reset_word * core::mem::size_of::<u32>();
+    let status_offset = RESET_STATUS_OFFSET + reset_word * core::mem::size_of::<u32>();
+    write32(
+        syscrg,
+        assert_offset,
+        read32(syscrg, assert_offset) & !reset_mask,
+    );
+    device_barrier();
+    let reset_start = crate::timer::get_time_us();
+    while read32(syscrg, status_offset) & reset_mask != reset_mask {
+        if crate::timer::get_time_us().saturating_sub(reset_start) >= 1_000 {
+            log::warn!(
+                "JH7110 watchdog reset deassert timed out: status={:#x}",
+                read32(syscrg, status_offset)
+            );
+            return None;
+        }
+        core::hint::spin_loop();
+    }
+
+    write32(watchdog, WDT_LOCK, WDT_UNLOCK_KEY);
+    device_barrier();
+    let control = read32(watchdog, WDT_CONTROL) & !WDT_ENABLE;
+    write32(watchdog, WDT_CONTROL, control | WDT_RESET_ENABLE);
+    write32(watchdog, WDT_INTCLR, 1);
+    write32(watchdog, WDT_LOAD, half_timeout_ticks);
+    write32(
+        watchdog,
+        WDT_CONTROL,
+        control | WDT_RESET_ENABLE | WDT_ENABLE,
+    );
+    write32(watchdog, WDT_LOCK, !WDT_UNLOCK_KEY);
+    device_barrier();
+
+    let first = read32(watchdog, WDT_VALUE);
+    let verify_start = crate::timer::get_time_us();
+    while crate::timer::get_time_us().saturating_sub(verify_start) < 1_000 {
+        core::hint::spin_loop();
+    }
+    let second = read32(watchdog, WDT_VALUE);
+    if first == 0 || second >= first {
+        log::warn!("JH7110 watchdog did not count down: first={first:#x}, second={second:#x}");
+        return None;
+    }
+    Some((first, second))
+}
+
+/// Arms a boot-progress watchdog for physical-board diagnostic FITs.
+///
+/// The JH7110 watchdog expires in two phases. Its 24 MHz core clock therefore
+/// permits a maximum total timeout of roughly 357 seconds with a u32 load.
+#[cfg(feature = "starfive-recovery-watchdog")]
+pub fn arm_jh7110_recovery_watchdog(timeout_secs: usize) -> bool {
+    const HALF_TIMEOUT_TICKS_PER_SECOND: u64 = 12_000_000;
+
+    let Some(half_timeout_ticks) = (timeout_secs as u64)
+        .checked_mul(HALF_TIMEOUT_TICKS_PER_SECOND)
+        .and_then(|ticks| u32::try_from(ticks).ok())
+    else {
+        log::warn!("JH7110 recovery watchdog timeout is out of range: {timeout_secs}s");
+        return false;
+    };
+    let Some((first, second)) = arm_jh7110_watchdog(half_timeout_ticks) else {
+        return false;
+    };
+    info!(
+        "JH7110 recovery watchdog armed: first={first:#x}, second={second:#x}, reset_secs={timeout_secs}"
+    );
+    true
+}
+
+/// Arms the JH7110 watchdog as a board-local reboot fallback.
+///
+/// Release-31 OpenSBI can return from SRST without resetting this board. The
+/// watchdog path is selected only when the JH7110 DT nodes were discovered;
+/// QEMU therefore continues to use SBI SRST.
+pub fn try_jh7110_watchdog_reboot() -> bool {
+    // The 24 MHz oscillator feeds WDT_CORE. JH7110 needs two expirations, so
+    // this half-count requests a reset about one second after arming.
+    let Some((first, second)) = arm_jh7110_watchdog(12_000_000) else {
+        return false;
+    };
+    info!("JH7110 watchdog reboot armed: first={first:#x}, second={second:#x}, reset_ms=1000");
     true
 }
 
@@ -441,8 +721,10 @@ pub fn device_init(hart_id: usize) {
     plic.set_threshold(hart_id, supervisor, 0);
     plic.set_threshold(hart_id, machine, 1);
 
-    plic.enable(hart_id, supervisor, uart_irq());
-    plic.set_priority(uart_irq(), 1);
+    if uart_irq() != 0 {
+        plic.enable(hart_id, supervisor, uart_irq());
+        plic.set_priority(uart_irq(), 1);
+    }
     for irq in [keyboard_irq(), mouse_irq()].into_iter().flatten() {
         plic.enable(hart_id, supervisor, irq);
         plic.set_priority(irq, 1);
@@ -450,7 +732,7 @@ pub fn device_init(hart_id: usize) {
     let block_irq_delivery_enabled = !cfg!(feature = "block-io-force-sync");
     for block in block_devices() {
         let BlockDeviceConfig::Mmio(block) = block else {
-            unreachable!("RISC-V QEMU uses virtio-mmio block devices");
+            continue;
         };
         if block_irq_delivery_enabled {
             plic.enable(hart_id, supervisor, block.irq);
@@ -487,7 +769,7 @@ pub fn irq_handler() {
         if let Some(device) = MOUSE_DEVICE.as_ref() {
             device.handle_irq();
         }
-    } else if intr_src_id == uart_irq {
+    } else if uart_irq != 0 && intr_src_id == uart_irq {
         UART.handle_irq();
     } else if crate::drivers::block::handle_irq(intr_src_id as usize) {
     } else {
