@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", default="64M")
     parser.add_argument("--perf-counters", type=int, choices=(0, 1), default=0)
     parser.add_argument(
+        "--probe-multiblock-write",
+        action="store_true",
+        help="require the JH7110 startup probe to have enabled CMD25",
+    )
+    parser.add_argument(
         "--reboot-after",
         action="store_true",
         help="request reboot after the final marker (for watchdog/reacquire validation)",
@@ -57,7 +62,9 @@ def identity(
     }
 
 
-def entry_script(*, reboot_after: bool = False) -> str:
+def entry_script(
+    *, reboot_after: bool = False, probe_multiblock_write: bool = False
+) -> str:
     script = """#!/musl/busybox sh
 # StarFive-only staged Rust smoke test. Projects and build artifacts live on
 # the kernel tmpfs; the physical SD supplies only the existing toolchain/cache.
@@ -82,7 +89,21 @@ install_rootfs_link /glibc/lib/ld-linux-riscv64-lp64d.so.1 /lib/ld-linux-riscv64
 
 overall_status=0
 echo "STARFIVE_RUST_SMOKE_STORAGE project=tmpfs fixture=x1 sd_bulk_writes=disabled"
-echo "FINAL: starting rust-hello-cold"
+"""
+    if probe_multiblock_write:
+        script += """echo "STARFIVE_MMC_WRITE_AUTO_CHECK_BEGIN expected_blocks=64"
+mmc_write_knob=/proc/oskernel/starfive_mmc_max_write_blocks
+if [ ! -f "$mmc_write_knob" ] || \
+   [ "$(/musl/busybox cat "$mmc_write_knob")" != 64 ]; then
+    echo "STARFIVE_MMC_WRITE_AUTO_CHECK_RESULT ok=false"
+    echo "FINAL: starfive rust smoke finished (status=1)"
+    /musl/busybox sync
+    /musl/busybox reboot -f
+    exit 1
+fi
+echo "STARFIVE_MMC_WRITE_AUTO_CHECK_RESULT ok=true active_blocks=64"
+"""
+    script += """echo "FINAL: starting rust-hello-cold"
 /musl/busybox ash /x1/g0-rust-hello-cold.sh
 hello_cold_status=$?
 echo "FINAL: finished rust-hello-cold (status=$hello_cold_status)"
@@ -159,6 +180,7 @@ def write_staging(
     *,
     perf_counters: int,
     reboot_after: bool = False,
+    probe_multiblock_write: bool = False,
 ) -> None:
     hello_cold = rust_bench.render_guest(
         identity(
@@ -183,7 +205,13 @@ def write_staging(
     multicrate = multicrate.replace(fixture_source, fixture_target)
 
     for name, contents in (
-        ("entry.sh", entry_script(reboot_after=reboot_after)),
+        (
+            "entry.sh",
+            entry_script(
+                reboot_after=reboot_after,
+                probe_multiblock_write=probe_multiblock_write,
+            ),
+        ),
         ("g0-rust-hello-cold.sh", hello_cold),
         ("g0-rust-hello-warm.sh", hello_warm),
         ("g0-rust-multicrate.sh", multicrate),
@@ -230,6 +258,7 @@ def main() -> int:
             timer,
             perf_counters=args.perf_counters,
             reboot_after=args.reboot_after,
+            probe_multiblock_write=args.probe_multiblock_write,
         )
 
         temp_image = temp_root / "rust-smoke.img"
@@ -276,6 +305,7 @@ def main() -> int:
         "project_storage": "tmpfs",
         "perf_counters": args.perf_counters,
         "reboot_after": args.reboot_after,
+        "probe_multiblock_write": args.probe_multiblock_write,
         "multicrate_leaf_crates": rust_bench.MULTICRATE_LEAF_CRATES,
     }
     manifest_path = args.fit_output.with_suffix(args.fit_output.suffix + ".json")

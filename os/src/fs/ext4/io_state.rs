@@ -164,6 +164,7 @@ impl Ext4PhysicalLeaseTable {
                 };
             }
             drop(reserved);
+            perf::record_ext4_physical_lease_wait_yield();
             suspend_current_and_run_next();
         }
     }

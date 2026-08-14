@@ -85,10 +85,9 @@ const STATUS_FIFO_COUNT_SHIFT: usize = 17;
 const STATUS_FIFO_COUNT_MASK: u32 = 0x1fff;
 
 const MAX_READ_BLOCKS_PER_TRANSFER: usize = 64;
-// UNFINISHED: Keep SD writes on the already-validated CMD24 path until the
-// CMD25 data-busy and recovery sequence has its own non-destructive fixture.
-const MAX_WRITE_BLOCKS_PER_TRANSFER: usize = 1;
+const MAX_WRITE_BLOCKS_PER_TRANSFER: usize = 64;
 const MULTIBLOCK_PROBE_BLOCKS: usize = MAX_READ_BLOCKS_PER_TRANSFER;
+const MULTIBLOCK_WRITE_PROBE_GUARD_BLOCKS: usize = 2048;
 
 #[derive(Clone, Copy)]
 enum ResponseKind {
@@ -103,6 +102,7 @@ struct MmcState {
     high_capacity: bool,
     capacity_blocks: usize,
     max_read_blocks: usize,
+    max_write_blocks: usize,
 }
 
 pub struct Jh7110MmcBlock {
@@ -133,20 +133,26 @@ impl Jh7110MmcBlock {
                 high_capacity: false,
                 capacity_blocks: 0,
                 max_read_blocks: 1,
+                max_write_blocks: 1,
             }),
         };
-        let (capacity_blocks, high_capacity, max_read_blocks) = block.state.with_lock(|state| {
-            block.initialize(state);
-            block.probe_multiblock_read(state);
-            (
-                state.capacity_blocks,
-                state.high_capacity,
-                state.max_read_blocks,
-            )
-        });
+        let (capacity_blocks, high_capacity, max_read_blocks, max_write_blocks) =
+            block.state.with_lock(|state| {
+                block.initialize(state);
+                block.probe_multiblock_read(state);
+                if state.max_read_blocks > 1 && block.probe_multiblock_write(state) {
+                    state.max_write_blocks = MAX_WRITE_BLOCKS_PER_TRANSFER;
+                }
+                (
+                    state.capacity_blocks,
+                    state.high_capacity,
+                    state.max_read_blocks,
+                    state.max_write_blocks,
+                )
+            });
         info!(
-            "JH7110 MMC ready: base={:#x}, sectors={}, high_capacity={}, max_read_blocks={}",
-            block.base_addr, capacity_blocks, high_capacity, max_read_blocks,
+            "JH7110 MMC ready: base={:#x}, sectors={}, high_capacity={}, max_read_blocks={}, max_write_blocks={}",
+            block.base_addr, capacity_blocks, high_capacity, max_read_blocks, max_write_blocks,
         );
         block
     }
@@ -358,7 +364,7 @@ impl Jh7110MmcBlock {
         }
     }
 
-    fn prepare_multiblock_read(&self, block_count: usize) -> Result<(), u32> {
+    fn prepare_multiblock_transfer(&self, block_count: usize) -> Result<(), u32> {
         const R1_ILLEGAL_COMMAND: u32 = 1 << 22;
 
         let response = self.send_command_raw(
@@ -373,7 +379,7 @@ impl Jh7110MmcBlock {
         Ok(())
     }
 
-    fn recover_multiblock_read(&self) {
+    fn recover_multiblock_transfer(&self) {
         let _ = self.send_command_raw(12, 0, ResponseKind::Short, CMD_STOP);
         self.reset_bits(CTRL_FIFO_RESET | CTRL_DMA_RESET);
         self.write_reg(RINTSTS, u32::MAX);
@@ -389,7 +395,7 @@ impl Jh7110MmcBlock {
     ) -> (Result<(), u32>, usize) {
         let mut retries = 0;
         let mut result = self.transfer_data(command, argument, write, SECTOR_SIZE, buffer);
-        if result.is_err() && command != 18 {
+        if result.is_err() && command != 18 && command != 25 {
             retries = 1;
             self.reset_bits(CTRL_FIFO_RESET | CTRL_DMA_RESET);
             result = self.transfer_data(command, argument, write, SECTOR_SIZE, buffer);
@@ -419,14 +425,14 @@ impl Jh7110MmcBlock {
         }
 
         let mut multiple = alloc::vec![0u8; MULTIBLOCK_PROBE_BLOCKS * SECTOR_SIZE];
-        if let Err(status) = self.prepare_multiblock_read(MULTIBLOCK_PROBE_BLOCKS) {
+        if let Err(status) = self.prepare_multiblock_transfer(MULTIBLOCK_PROBE_BLOCKS) {
             warn!("JH7110 MMC CMD18 probe failed: CMD23 status={status:#x}");
             return;
         }
         let argument = Self::block_argument(state, 0);
         let (result, retries) = self.transfer_with_retry(18, argument, false, &mut multiple);
         if let Err(status) = result {
-            self.recover_multiblock_read();
+            self.recover_multiblock_transfer();
             warn!(
                 "JH7110 MMC CMD18 probe failed: blocks={MULTIBLOCK_PROBE_BLOCKS} retries={retries} status={status:#x}; using CMD17"
             );
@@ -443,6 +449,157 @@ impl Jh7110MmcBlock {
         info!(
             "JH7110 MMC CMD18 probe passed: blocks={MULTIBLOCK_PROBE_BLOCKS}, max_read_blocks={MAX_READ_BLOCKS_PER_TRANSFER}"
         );
+    }
+
+    fn read_probe_block(&self, state: &MmcState, block_id: usize, buf: &mut [u8]) -> bool {
+        let argument = Self::block_argument(state, block_id);
+        self.transfer_with_retry(17, argument, false, buf).0.is_ok()
+    }
+
+    fn write_probe_block(&self, state: &MmcState, block_id: usize, buf: &mut [u8]) -> bool {
+        let argument = Self::block_argument(state, block_id);
+        self.transfer_with_retry(24, argument, true, buf).0.is_ok()
+    }
+
+    fn multiblock_write_probe_start(&self, state: &MmcState) -> Option<usize> {
+        const EXT4_SUPERBLOCK_OFFSET: usize = 1024;
+        const EXT4_MAGIC_OFFSET: usize = EXT4_SUPERBLOCK_OFFSET + 0x38;
+        const EXT4_BLOCKS_COUNT_LO_OFFSET: usize = EXT4_SUPERBLOCK_OFFSET + 0x04;
+        const EXT4_LOG_BLOCK_SIZE_OFFSET: usize = EXT4_SUPERBLOCK_OFFSET + 0x18;
+        const EXT4_FEATURE_INCOMPAT_OFFSET: usize = EXT4_SUPERBLOCK_OFFSET + 0x60;
+        const EXT4_BLOCKS_COUNT_HI_OFFSET: usize = EXT4_SUPERBLOCK_OFFSET + 0x150;
+        const EXT4_FEATURE_INCOMPAT_64BIT: u32 = 0x80;
+
+        let mut header = [0u8; 2048];
+        for (block, sector) in header.chunks_exact_mut(SECTOR_SIZE).enumerate() {
+            if !self.read_probe_block(state, block, sector) {
+                warn!("JH7110 MMC CMD25 probe skipped: cannot read filesystem header");
+                return None;
+            }
+        }
+        // Only a partitionless ext4 image has a provably unmanaged region
+        // immediately after its superblock-declared filesystem size. Never
+        // probe a partitioned disk, where a later partition could occupy it.
+        if header[510..512] == [0x55, 0xaa] || &header[512..520] == b"EFI PART" {
+            warn!("JH7110 MMC CMD25 probe skipped: partition table detected");
+            return None;
+        }
+        if u16::from_le_bytes([header[EXT4_MAGIC_OFFSET], header[EXT4_MAGIC_OFFSET + 1]]) != 0xef53
+        {
+            warn!("JH7110 MMC CMD25 probe skipped: raw ext4 superblock not found");
+            return None;
+        }
+        let read_u32 =
+            |offset: usize| u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
+        let blocks_lo = read_u32(EXT4_BLOCKS_COUNT_LO_OFFSET) as u64;
+        let incompat = read_u32(EXT4_FEATURE_INCOMPAT_OFFSET);
+        let blocks_hi = if incompat & EXT4_FEATURE_INCOMPAT_64BIT != 0 {
+            read_u32(EXT4_BLOCKS_COUNT_HI_OFFSET) as u64
+        } else {
+            0
+        };
+        let filesystem_blocks = blocks_lo | blocks_hi << 32;
+        let log_block_size = read_u32(EXT4_LOG_BLOCK_SIZE_OFFSET);
+        let block_size = 1024u64.checked_shl(log_block_size)?;
+        if filesystem_blocks == 0 || !(1024..=65_536).contains(&block_size) {
+            warn!(
+                "JH7110 MMC CMD25 probe skipped: invalid ext4 geometry blocks={filesystem_blocks} block_size={block_size}"
+            );
+            return None;
+        }
+        let filesystem_sectors = filesystem_blocks.checked_mul(block_size)?.div_ceil(512);
+        let start = usize::try_from(filesystem_sectors)
+            .ok()?
+            .checked_add(MULTIBLOCK_WRITE_PROBE_GUARD_BLOCKS)?;
+        let end = start.checked_add(MAX_WRITE_BLOCKS_PER_TRANSFER)?;
+        if end > state.capacity_blocks {
+            warn!(
+                "JH7110 MMC CMD25 probe skipped: no scratch tail fs_sectors={filesystem_sectors} card_sectors={}",
+                state.capacity_blocks
+            );
+            return None;
+        }
+        Some(start)
+    }
+
+    /// Proves bounded CMD25 without touching the ext4 address space. The card
+    /// must contain a partitionless ext4 image followed by at least 1 MiB of
+    /// unowned sectors. The probe restores and verifies those sectors through
+    /// the established CMD24/CMD17 paths before CMD25 can become visible to
+    /// filesystem traffic.
+    fn probe_multiblock_write(&self, state: &mut MmcState) -> bool {
+        let Some(start_block) = self.multiblock_write_probe_start(state) else {
+            return false;
+        };
+        let mut backup = alloc::vec![0u8; MAX_WRITE_BLOCKS_PER_TRANSFER * SECTOR_SIZE];
+        for (offset, sector) in backup.chunks_exact_mut(SECTOR_SIZE).enumerate() {
+            if !self.read_probe_block(state, start_block + offset, sector) {
+                warn!(
+                    "JH7110 MMC CMD25 probe skipped: backup read failed block={}",
+                    start_block + offset
+                );
+                return false;
+            }
+        }
+        let mut pattern = alloc::vec![0u8; backup.len()];
+        for (index, byte) in pattern.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(131).wrapping_add(0x5a);
+        }
+
+        let write_ok = self
+            .prepare_multiblock_transfer(MAX_WRITE_BLOCKS_PER_TRANSFER)
+            .and_then(|_| {
+                let argument = Self::block_argument(state, start_block);
+                self.transfer_with_retry(25, argument, true, &mut pattern).0
+            })
+            .is_ok();
+        if !write_ok {
+            self.recover_multiblock_transfer();
+        }
+
+        let mut observed = alloc::vec![0u8; pattern.len()];
+        let mut readback_ok = write_ok;
+        if readback_ok {
+            for (offset, sector) in observed.chunks_exact_mut(SECTOR_SIZE).enumerate() {
+                if !self.read_probe_block(state, start_block + offset, sector) {
+                    readback_ok = false;
+                    break;
+                }
+            }
+            readback_ok &= observed == pattern;
+        }
+
+        let mut restore_write_ok = true;
+        for (offset, sector) in backup.chunks_exact_mut(SECTOR_SIZE).enumerate() {
+            if !self.write_probe_block(state, start_block + offset, sector) {
+                restore_write_ok = false;
+            }
+        }
+        let mut restored = alloc::vec![0u8; backup.len()];
+        let mut restore_read_ok = true;
+        for (offset, sector) in restored.chunks_exact_mut(SECTOR_SIZE).enumerate() {
+            if !self.read_probe_block(state, start_block + offset, sector) {
+                restore_read_ok = false;
+                break;
+            }
+        }
+        let restore_ok = restore_write_ok && restore_read_ok && restored == backup;
+        if !restore_ok {
+            warn!(
+                "JH7110 MMC CMD25 probe failed to restore scratch sectors: block={start_block}, blocks={MAX_WRITE_BLOCKS_PER_TRANSFER}, write_ok={restore_write_ok}, read_ok={restore_read_ok}; using CMD24"
+            );
+            return false;
+        }
+        if !readback_ok {
+            warn!(
+                "JH7110 MMC CMD25 probe failed: block={start_block}, blocks={MAX_WRITE_BLOCKS_PER_TRANSFER}; using CMD24"
+            );
+            return false;
+        }
+        info!(
+            "JH7110 MMC CMD25 probe passed: block={start_block}, blocks={MAX_WRITE_BLOCKS_PER_TRANSFER}, restored=true"
+        );
+        true
     }
 
     fn transfer_data(
@@ -534,7 +691,7 @@ impl Jh7110MmcBlock {
         let mut completed = 0usize;
         while completed < block_count {
             let max_blocks = if write {
-                MAX_WRITE_BLOCKS_PER_TRANSFER
+                state.max_write_blocks
             } else {
                 state.max_read_blocks
             };
@@ -549,12 +706,19 @@ impl Jh7110MmcBlock {
                 (true, false) => 25,
             };
             let chunk = &mut buffer[completed * SECTOR_SIZE..completed * SECTOR_SIZE + chunk_len];
-            if command == 18 {
-                if let Err(status) = self.prepare_multiblock_read(chunk_blocks) {
-                    warn!(
-                        "JH7110 MMC CMD23 failed: block={first_block}, blocks={chunk_blocks}, status={status:#x}; disabling CMD18"
-                    );
-                    state.max_read_blocks = 1;
+            if chunk_blocks > 1 {
+                if let Err(status) = self.prepare_multiblock_transfer(chunk_blocks) {
+                    if write {
+                        warn!(
+                            "JH7110 MMC CMD23 failed before CMD25: block={first_block}, blocks={chunk_blocks}, status={status:#x}; using CMD24"
+                        );
+                        state.max_write_blocks = 1;
+                    } else {
+                        warn!(
+                            "JH7110 MMC CMD23 failed before CMD18: block={first_block}, blocks={chunk_blocks}, status={status:#x}; using CMD17"
+                        );
+                        state.max_read_blocks = 1;
+                    }
                     continue;
                 }
             }
@@ -568,12 +732,19 @@ impl Jh7110MmcBlock {
                 result.is_ok(),
             );
             if let Err(status) = result {
-                if command == 18 {
-                    self.recover_multiblock_read();
-                    warn!(
-                        "JH7110 MMC CMD18 failed: block={first_block}, blocks={chunk_blocks}, status={status:#x}; falling back to CMD17"
-                    );
-                    state.max_read_blocks = 1;
+                if command == 18 || command == 25 {
+                    self.recover_multiblock_transfer();
+                    if write {
+                        warn!(
+                            "JH7110 MMC CMD25 failed: block={first_block}, blocks={chunk_blocks}, status={status:#x}; falling back to CMD24"
+                        );
+                        state.max_write_blocks = 1;
+                    } else {
+                        warn!(
+                            "JH7110 MMC CMD18 failed: block={first_block}, blocks={chunk_blocks}, status={status:#x}; falling back to CMD17"
+                        );
+                        state.max_read_blocks = 1;
+                    }
                     continue;
                 }
                 panic!(
@@ -632,6 +803,28 @@ impl Jh7110MmcBlock {
 
     pub fn num_blocks(&self) -> u64 {
         self.state.lock().capacity_blocks as u64
+    }
+
+    pub(crate) fn max_write_blocks(&self) -> usize {
+        self.state.lock().max_write_blocks
+    }
+
+    pub(crate) fn set_max_write_blocks(&self, blocks: usize) -> bool {
+        if blocks != 1 && blocks != MAX_WRITE_BLOCKS_PER_TRANSFER {
+            return false;
+        }
+        let mut state = self.state.lock();
+        // The read-only startup probe proves that this card accepts CMD23 and
+        // bounded multi-block transfers before a diagnostic can enable CMD25.
+        if blocks > 1 && state.max_read_blocks == 1 {
+            return false;
+        }
+        if blocks > 1 && state.max_write_blocks == 1 && !self.probe_multiblock_write(&mut state) {
+            return false;
+        }
+        state.max_write_blocks = blocks;
+        info!("JH7110 MMC max write blocks set to {blocks}");
+        true
     }
 
     pub fn base_addr(&self) -> usize {

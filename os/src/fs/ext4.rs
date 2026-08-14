@@ -1291,6 +1291,7 @@ impl Ext4CoreAdmission {
             if let Some(guard) = self.try_read() {
                 return guard;
             }
+            perf::record_ext4_core_reader_wait_yield();
             suspend_current_and_run_next();
         }
     }
@@ -1333,6 +1334,7 @@ impl Ext4CoreAdmission {
         self.register_writer();
         self.writer_lock.lock();
         while self.readers_active() {
+            perf::record_ext4_core_writer_wait_yield();
             suspend_current_and_run_next();
         }
         Ext4CoreWriteGuard { admission: self }
@@ -1547,6 +1549,7 @@ impl ConcurrentExt4Backend {
             // caller, or a group-commit leader is already flushing it. Avoid
             // a FIFO mutex convoy: followers yield and all observe the same
             // completed-ticket publication when the leader finishes.
+            perf::record_ext4_flush_ticket_wait_yield();
             suspend_current_and_run_next();
         }
     }

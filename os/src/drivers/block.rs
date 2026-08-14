@@ -534,6 +534,22 @@ impl KernelBlockDevice {
         }
     }
 
+    #[cfg(target_arch = "riscv64")]
+    pub(crate) fn starfive_mmc_max_write_blocks(&self) -> Option<usize> {
+        match self {
+            Self::StarFiveMmc(device) => Some(device.max_write_blocks()),
+            Self::VirtIo(_) | Self::RamDisk(_) => None,
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub(crate) fn set_starfive_mmc_max_write_blocks(&self, blocks: usize) -> bool {
+        match self {
+            Self::StarFiveMmc(device) => device.set_max_write_blocks(blocks),
+            Self::VirtIo(_) | Self::RamDisk(_) => false,
+        }
+    }
+
     pub fn irq(&self) -> usize {
         match self {
             Self::VirtIo(device) => device.irq(),

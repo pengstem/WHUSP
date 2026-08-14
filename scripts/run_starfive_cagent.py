@@ -52,6 +52,11 @@ RUST_SMOKE_RESULT_PATTERN = re.compile(
     rb"[^\r\n]* ok=1\r?$",
     re.MULTILINE,
 )
+SD_MAINTENANCE_FINAL_PATTERN = re.compile(
+    rb"^STARFIVE_SD_MAINTENANCE_FINAL action=(list|delete) "
+    rb"status=([0-9]+) count=([0-9]+)\r?$",
+    re.MULTILINE,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,8 +69,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fit-name", default="whusp-cagent.itb")
     parser.add_argument(
         "--mode",
-        choices=["cagent", "buildstorm", "rust-smoke", "shell"],
+        choices=["cagent", "buildstorm", "rust-smoke", "sd-maintenance", "shell"],
         default="cagent",
+    )
+    parser.add_argument(
+        "--expect-mmc-name",
+        help="exact U-Boot 'Name:' value; required for sd-maintenance",
+    )
+    parser.add_argument(
+        "--expect-capacity-gib",
+        type=float,
+        help="exact displayed U-Boot GiB capacity; required for sd-maintenance",
     )
     parser.add_argument(
         "--prompt-timeout",
@@ -104,6 +118,19 @@ def parse_args() -> argparse.Namespace:
         parser.error("--prompt-timeout, --boot-timeout, and --reboot-timeout must be positive")
     if args.prompt_only and args.preflight_only:
         parser.error("--prompt-only and --preflight-only are mutually exclusive")
+    if (
+        args.mode == "sd-maintenance"
+        and not args.preflight_only
+        and not args.prompt_only
+    ):
+        if not args.expect_mmc_name or args.expect_capacity_gib is None:
+            parser.error(
+                "sd-maintenance requires --expect-mmc-name and --expect-capacity-gib"
+            )
+        if not SAFE_FILE.fullmatch(args.expect_mmc_name):
+            parser.error("--expect-mmc-name contains unsafe characters")
+        if args.expect_capacity_gib <= 0:
+            parser.error("--expect-capacity-gib must be positive")
     return args
 
 
@@ -299,6 +326,26 @@ def require_text(output: bytes, pattern: bytes, context: str) -> None:
         raise RuntimeError(f"{context} failed; missing {pattern!r}")
 
 
+def require_mmc_identity(
+    output: bytes, expected_name: str, expected_capacity_gib: float
+) -> None:
+    text = output.decode("ascii", errors="replace").replace("\r", "")
+    name_match = re.search(r"^Name:\s*(\S+)\s*$", text, re.MULTILINE)
+    capacity_match = re.search(
+        r"^Capacity:\s*([0-9]+(?:\.[0-9]+)?)\s+GiB\s*$", text, re.MULTILINE
+    )
+    if not name_match or not capacity_match:
+        raise RuntimeError("maintenance MMC identity is not parseable")
+    actual_name = name_match.group(1)
+    actual_capacity_gib = float(capacity_match.group(1))
+    if actual_name != expected_name or actual_capacity_gib != expected_capacity_gib:
+        raise RuntimeError(
+            "maintenance MMC identity mismatch: "
+            f"actual={actual_name}/{actual_capacity_gib:g}GiB "
+            f"expected={expected_name}/{expected_capacity_gib:g}GiB"
+        )
+
+
 def main() -> int:
     args = parse_args()
     fit_path = args.tftp_root / args.fit_name
@@ -317,6 +364,8 @@ def main() -> int:
         "host_ip": args.host_ip,
         "board_ip": args.board_ip,
         "mode": args.mode,
+        "expect_mmc_name": args.expect_mmc_name,
+        "expect_capacity_gib": args.expect_capacity_gib,
         "preflight_only": args.preflight_only,
         "prompt_only": args.prompt_only,
         "reacquire_uboot": args.reacquire_uboot,
@@ -369,11 +418,19 @@ def main() -> int:
         mmc = log.command("mmc rescan", 30.0)
         if b"no card present" in mmc.lower() or b"Card did not respond" in mmc:
             raise RuntimeError("U-Boot did not detect an SD card in mmc1")
-        log.command("mmc info", 10.0)
+        mmc_info = log.command("mmc info", 10.0)
+        if args.mode == "sd-maintenance":
+            require_mmc_identity(
+                mmc_info, args.expect_mmc_name, args.expect_capacity_gib
+            )
         if args.mode == "rust-smoke":
             root = log.command("ext4ls mmc 1:0 /root/.cargo/bin", 30.0)
             require_text(root, b"cargo", "Rust smoke cargo preflight")
             require_text(root, b"rustc", "Rust smoke rustc preflight")
+        elif args.mode == "sd-maintenance":
+            root = log.command("ext4ls mmc 1:0 /work", 30.0)
+            if b"**" in root or b"Failed" in root:
+                raise RuntimeError("maintenance target rootfs is not readable")
         else:
             root = log.command("ext4ls mmc 1:0 /glibc", 30.0)
             required_test_script = (
@@ -393,6 +450,8 @@ def main() -> int:
             log.read_until(b"FINAL: entering interactive BusyBox shell", args.boot_timeout)
         elif args.mode == "rust-smoke":
             log.read_until_pattern(RUST_SMOKE_FINAL_PATTERN, args.boot_timeout)
+        elif args.mode == "sd-maintenance":
+            log.read_until_pattern(SD_MAINTENANCE_FINAL_PATTERN, args.boot_timeout)
         else:
             log.read_until_pattern(FINAL_STATUS_PATTERN, args.boot_timeout)
         reacquire_requested = args.mode != "shell" and args.reacquire_uboot
@@ -450,6 +509,21 @@ def main() -> int:
                 ),
             ):
                 require_text(full_log, required, context)
+        elif args.mode == "sd-maintenance":
+            full_log = bytes(log.all_bytes)
+            records = SD_MAINTENANCE_FINAL_PATTERN.findall(full_log)
+            if len(records) != 1:
+                raise RuntimeError(
+                    "expected one SD maintenance result, "
+                    f"observed {len(records)}"
+                )
+            action, status, count = records[0]
+            if action not in {b"list", b"delete"} or status != b"0":
+                raise RuntimeError(
+                    "SD maintenance failed: "
+                    f"action={action.decode()} status={status.decode()} "
+                    f"count={count.decode()}"
+                )
         elif args.mode == "rust-smoke":
             full_log = bytes(log.all_bytes)
             passes = set(RUST_SMOKE_PASS_PATTERN.findall(full_log))

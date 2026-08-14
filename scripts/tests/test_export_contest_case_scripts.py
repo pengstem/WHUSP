@@ -27,6 +27,15 @@ class StarFiveSafeBuildStormExporterTests(unittest.TestCase):
         runner = EXPORTER.starfive_safe_buildstorm_script()
 
         self.assertIn('runs_root="/work/.whusp-buildstorm-runs"', runner)
+        self.assertIn('run_base="$runs_root/run-${uptime_seconds}-$$"', runner)
+        self.assertIn('while [ -e "$run_root" ] || [ -L "$run_root" ]; do', runner)
+        self.assertIn('run_root="${run_base}-${run_suffix}"', runner)
+        self.assertIn('run_root_collision_limit', runner)
+        self.assertIn('/musl/busybox mkdir "$run_root"', runner)
+        self.assertLess(
+            runner.index('while [ -e "$run_root" ]'),
+            runner.index('/musl/busybox mkdir "$run_root"'),
+        )
         self.assertIn('minimum_free_kib=6291456', runner)
         self.assertIn('maximum_tmp_cache_kib=65536', runner)
         self.assertIn('cp -al "$source_entry" "$workspace/$entry_name"', runner)
@@ -46,6 +55,16 @@ class StarFiveSafeBuildStormExporterTests(unittest.TestCase):
         self.assertNotIn('rm -rf "$source_workspace"', runner)
         self.assertIn("no_auto_cleanup=1", runner)
         self.assertIn('official_log="$run_root/buildstorm.official.out"', runner)
+        self.assertIn('STARFIVE_BUILDSTORM_PERF_BEGIN point=$point', runner)
+        self.assertIn('dump_perf_snapshot before', runner)
+        self.assertIn('dump_perf_snapshot after', runner)
+        self.assertIn("STARFIVE_BUILDSTORM_MMC_WRITE_AUTO active_blocks=$active", runner)
+        self.assertIn("report_starfive_multiblock_write", runner)
+        self.assertNotIn('echo 64 > "$knob"', runner)
+        self.assertLess(
+            runner.index("report_starfive_multiblock_write\n", runner.index("SAFE_PRECHECK ok")),
+            runner.index("STARFIVE_BUILDSTORM_SAFE_CLONE begin"),
+        )
         self.assertIn("STARFIVE_BUILDSTORM_SAFE_VALIDATION fail", runner)
         self.assertIn("'^BUILDSTORM_COMPILE mode=multi ok=true '", runner)
         self.assertIn("'^BUILDSTORM_TOOLCHAIN ok$'", runner)

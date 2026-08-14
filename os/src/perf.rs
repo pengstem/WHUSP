@@ -371,6 +371,10 @@ pub(crate) struct KernelPerfSnapshot {
     pub(crate) ext4_sequence_retry_bytes: usize,
     pub(crate) ext4_sequence_active_writers_max: usize,
     pub(crate) ext4_sequence_wait_ticks: usize,
+    pub(crate) ext4_physical_lease_wait_yields: usize,
+    pub(crate) ext4_core_reader_wait_yields: usize,
+    pub(crate) ext4_core_writer_wait_yields: usize,
+    pub(crate) ext4_flush_ticket_wait_yields: usize,
     pub(crate) ext4_read_plan_attempts: usize,
     pub(crate) ext4_read_plan_prepared: usize,
     pub(crate) ext4_read_plan_executed: usize,
@@ -661,6 +665,10 @@ macro_rules! declare_perf_events {
             fn record_ext4_sequence_writer_entry(_active_writers: usize) => record_ext4_sequence_writer_entry_impl;
             fn record_ext4_sequence_reader_wait_yield() => record_ext4_sequence_reader_wait_yield_impl;
             fn record_ext4_sequence_reader_retry(_blocks: usize, _bytes: usize) => record_ext4_sequence_reader_retry_impl;
+            fn record_ext4_physical_lease_wait_yield() => record_ext4_physical_lease_wait_yield_impl;
+            fn record_ext4_core_reader_wait_yield() => record_ext4_core_reader_wait_yield_impl;
+            fn record_ext4_core_writer_wait_yield() => record_ext4_core_writer_wait_yield_impl;
+            fn record_ext4_flush_ticket_wait_yield() => record_ext4_flush_ticket_wait_yield_impl;
             fn record_ext4_read_plan_attempt() => record_ext4_read_plan_attempt_impl;
             fn record_ext4_read_plan_prepared(_data_runs: usize, _data_blocks: usize, _zero_runs: usize, _zero_blocks: usize,) => record_ext4_read_plan_prepared_impl;
             fn record_ext4_read_plan_fallback() => record_ext4_read_plan_fallback_impl;
@@ -986,6 +994,10 @@ mod enabled {
     static EXT4_SEQUENCE_RETRY_BYTES: AtomicUsize = AtomicUsize::new(0);
     static EXT4_SEQUENCE_ACTIVE_WRITERS_MAX: AtomicUsize = AtomicUsize::new(0);
     static EXT4_SEQUENCE_WAIT_TICKS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_PHYSICAL_LEASE_WAIT_YIELDS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_CORE_READER_WAIT_YIELDS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_CORE_WRITER_WAIT_YIELDS: AtomicUsize = AtomicUsize::new(0);
+    static EXT4_FLUSH_TICKET_WAIT_YIELDS: AtomicUsize = AtomicUsize::new(0);
     static EXT4_READ_PLAN_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
     static EXT4_READ_PLAN_PREPARED: AtomicUsize = AtomicUsize::new(0);
     static EXT4_READ_PLAN_EXECUTED: AtomicUsize = AtomicUsize::new(0);
@@ -2383,6 +2395,22 @@ mod enabled {
         EXT4_SEQUENCE_WAIT_TICKS.fetch_add(ticks, Ordering::Relaxed);
     }
 
+    fn record_ext4_physical_lease_wait_yield_impl() {
+        EXT4_PHYSICAL_LEASE_WAIT_YIELDS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_ext4_core_reader_wait_yield_impl() {
+        EXT4_CORE_READER_WAIT_YIELDS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_ext4_core_writer_wait_yield_impl() {
+        EXT4_CORE_WRITER_WAIT_YIELDS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_ext4_flush_ticket_wait_yield_impl() {
+        EXT4_FLUSH_TICKET_WAIT_YIELDS.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record_ext4_read_plan_attempt_impl() {
         EXT4_READ_PLAN_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     }
@@ -3128,6 +3156,11 @@ mod enabled {
             ext4_sequence_active_writers_max: EXT4_SEQUENCE_ACTIVE_WRITERS_MAX
                 .load(Ordering::Relaxed),
             ext4_sequence_wait_ticks: EXT4_SEQUENCE_WAIT_TICKS.load(Ordering::Relaxed),
+            ext4_physical_lease_wait_yields: EXT4_PHYSICAL_LEASE_WAIT_YIELDS
+                .load(Ordering::Relaxed),
+            ext4_core_reader_wait_yields: EXT4_CORE_READER_WAIT_YIELDS.load(Ordering::Relaxed),
+            ext4_core_writer_wait_yields: EXT4_CORE_WRITER_WAIT_YIELDS.load(Ordering::Relaxed),
+            ext4_flush_ticket_wait_yields: EXT4_FLUSH_TICKET_WAIT_YIELDS.load(Ordering::Relaxed),
             ext4_read_plan_attempts: EXT4_READ_PLAN_ATTEMPTS.load(Ordering::Relaxed),
             ext4_read_plan_prepared: EXT4_READ_PLAN_PREPARED.load(Ordering::Relaxed),
             ext4_read_plan_executed: EXT4_READ_PLAN_EXECUTED.load(Ordering::Relaxed),
@@ -3556,6 +3589,10 @@ mod enabled {
          ext4_sequence_retry_bytes {}\n\
          ext4_sequence_active_writers_max {}\n\
          ext4_sequence_wait_ticks {}\n\
+         ext4_physical_lease_wait_yields {}\n\
+         ext4_core_reader_wait_yields {}\n\
+         ext4_core_writer_wait_yields {}\n\
+         ext4_flush_ticket_wait_yields {}\n\
          ext4_read_plan_attempts {}\n\
          ext4_read_plan_prepared {}\n\
          ext4_read_plan_executed {}\n\
@@ -3941,6 +3978,10 @@ mod enabled {
             stats.ext4_sequence_retry_bytes,
             stats.ext4_sequence_active_writers_max,
             stats.ext4_sequence_wait_ticks,
+            stats.ext4_physical_lease_wait_yields,
+            stats.ext4_core_reader_wait_yields,
+            stats.ext4_core_writer_wait_yields,
+            stats.ext4_flush_ticket_wait_yields,
             stats.ext4_read_plan_attempts,
             stats.ext4_read_plan_prepared,
             stats.ext4_read_plan_executed,

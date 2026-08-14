@@ -104,6 +104,7 @@ const SHMMNI_INO: u32 = 48;
 const SHMALL_INO: u32 = 49;
 const OSKERNEL_DIR_INO: u32 = 50;
 const OSKERNEL_PERF_INO: u32 = 51;
+const OSKERNEL_STARFIVE_MMC_MAX_WRITE_BLOCKS_INO: u32 = 61;
 const CONFIG_GZ_INO: u32 = 52;
 const PROC_SELF_INO: u32 = 53;
 const SHM_NEXT_ID_INO: u32 = 54;
@@ -243,6 +244,7 @@ enum ProcNode {
     Version,
     OsKernelDir,
     OsKernelPerf,
+    OsKernelStarFiveMmcMaxWriteBlocks,
     ConfigGz,
     SelfSymlink,
     SysVipcShm,
@@ -561,6 +563,9 @@ fn decode_node(ino: u32) -> Option<ProcNode> {
         VERSION_INO => Some(ProcNode::Version),
         OSKERNEL_DIR_INO => Some(ProcNode::OsKernelDir),
         OSKERNEL_PERF_INO => Some(ProcNode::OsKernelPerf),
+        OSKERNEL_STARFIVE_MMC_MAX_WRITE_BLOCKS_INO => {
+            Some(ProcNode::OsKernelStarFiveMmcMaxWriteBlocks)
+        }
         CONFIG_GZ_INO => Some(ProcNode::ConfigGz),
         PROC_SELF_INO => Some(ProcNode::SelfSymlink),
         ino if ino >= PID_FDINFO_ENTRY_BASE => {
@@ -771,6 +776,11 @@ fn oskernel_entries() -> Vec<RawDirEntry> {
     entries.push(RawDirEntry {
         ino: OSKERNEL_PERF_INO,
         name: "perf".into(),
+        dtype: DT_REG,
+    });
+    entries.push(RawDirEntry {
+        ino: OSKERNEL_STARFIVE_MMC_MAX_WRITE_BLOCKS_INO,
+        name: "starfive_mmc_max_write_blocks".into(),
         dtype: DT_REG,
     });
     entries
@@ -2427,6 +2437,15 @@ fn node_content(node: ProcNode) -> FsResult<Vec<u8>> {
         ProcNode::Version => Ok(b"Linux version 6.8.0-whusp (oskernel2026)\n".to_vec()),
         ProcNode::ConfigGz => Ok(PROC_CONFIG_GZ.to_vec()),
         ProcNode::OsKernelPerf => Ok(oskernel_perf_content().into_bytes()),
+        ProcNode::OsKernelStarFiveMmcMaxWriteBlocks => {
+            #[cfg(target_arch = "riscv64")]
+            let blocks = crate::drivers::block::BLOCK_DEVICE
+                .starfive_mmc_max_write_blocks()
+                .unwrap_or(1);
+            #[cfg(not(target_arch = "riscv64"))]
+            let blocks = 1;
+            Ok(format!("{blocks}\n").into_bytes())
+        }
         ProcNode::PidMax => Ok(pid_max_content().into_bytes()),
         ProcNode::ShmMax => Ok(format!("{}\n", crate::mm::shm::current_shmmax()).into_bytes()),
         ProcNode::ShmMni => Ok(format!("{}\n", crate::mm::shm::current_shmmni()).into_bytes()),
@@ -2671,6 +2690,10 @@ impl LegacyLookupOps for ProcFs {
                 "." => Ok((OSKERNEL_DIR_INO, FsNodeKind::Directory)),
                 ".." => Ok((ROOT_INO, FsNodeKind::Directory)),
                 "perf" => Ok((OSKERNEL_PERF_INO, FsNodeKind::RegularFile)),
+                "starfive_mmc_max_write_blocks" => Ok((
+                    OSKERNEL_STARFIVE_MMC_MAX_WRITE_BLOCKS_INO,
+                    FsNodeKind::RegularFile,
+                )),
                 _ => Err(FsError::NotFound),
             },
             ProcNode::SysVmDir => match component {
@@ -3113,7 +3136,8 @@ impl LegacyMetadataOps for ProcFs {
             | ProcNode::PidGidMap(_)
             | ProcNode::PidTaskTidComm(_, _)
             | ProcNode::Domainname
-            | ProcNode::CorePattern => FileStat::with_mode(S_IFREG | 0o644),
+            | ProcNode::CorePattern
+            | ProcNode::OsKernelStarFiveMmcMaxWriteBlocks => FileStat::with_mode(S_IFREG | 0o644),
             _ => FileStat::with_mode(S_IFREG | 0o444),
         };
         stat.dev = 0x70726f63;
@@ -3182,6 +3206,7 @@ impl LegacyDataOps for ProcFs {
                 }
             }
             ProcNode::CorePattern => set_locked_bytes_len(&PROC_CORE_PATTERN, _len),
+            ProcNode::OsKernelStarFiveMmcMaxWriteBlocks => Ok(()),
             _ => Err(FsError::ReadOnly),
         }
     }
@@ -3258,6 +3283,16 @@ impl LegacyDataOps for ProcFs {
             | Some(ProcNode::PidUidMap(_))
             | Some(ProcNode::PidGidMap(_)) => buf.len(),
             Some(ProcNode::Domainname) => write_uts_domainname(buf, offset),
+            Some(ProcNode::OsKernelStarFiveMmcMaxWriteBlocks) => {
+                let Some(_blocks) = parse_scalar_write::<usize>(buf, offset) else {
+                    return 0;
+                };
+                #[cfg(target_arch = "riscv64")]
+                if crate::drivers::block::BLOCK_DEVICE.set_starfive_mmc_max_write_blocks(_blocks) {
+                    return buf.len();
+                }
+                0
+            }
             _ => 0,
         }
     }

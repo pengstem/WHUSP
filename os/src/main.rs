@@ -19,6 +19,7 @@ mod drivers;
 mod fs;
 mod lang_items;
 mod logging;
+mod memops;
 mod mm;
 mod net;
 mod perf;
@@ -55,6 +56,7 @@ lazy_static! {
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_main(hart_id: usize, dtb_addr: usize) -> ! {
     clear_bss();
+    memops::self_test();
     cpu::record_boot_entry();
     cpu::record_global_init();
     board::init_from_dtb(dtb_addr, hart_id);

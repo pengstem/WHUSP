@@ -121,6 +121,25 @@ fail() {
     exit 1
 }
 
+dump_perf_snapshot() {
+    point="$1"
+    if /musl/busybox grep -q '^perf_counters_enabled 1$' \
+        /proc/oskernel/perf 2>/dev/null; then
+        echo "STARFIVE_BUILDSTORM_PERF_BEGIN point=$point"
+        /musl/busybox cat /proc/oskernel/perf
+        echo "STARFIVE_BUILDSTORM_PERF_END point=$point"
+    fi
+}
+
+report_starfive_multiblock_write() {
+    knob=/proc/oskernel/starfive_mmc_max_write_blocks
+    if [ ! -f "$knob" ]; then
+        return 0
+    fi
+    active=$(/musl/busybox cat "$knob" 2>/dev/null)
+    echo "STARFIVE_BUILDSTORM_MMC_WRITE_AUTO active_blocks=$active"
+}
+
 [ -f "$official_script" ] || fail "missing_official_script"
 [ -d "$source_workspace" ] || fail "missing_source_workspace"
 
@@ -128,10 +147,18 @@ uptime_seconds=$(/musl/busybox cut -d. -f1 /proc/uptime 2>/dev/null)
 case "$uptime_seconds" in
     ''|*[!0-9]*) uptime_seconds=unknown ;;
 esac
-run_root="$runs_root/run-${uptime_seconds}-$$"
+run_base="$runs_root/run-${uptime_seconds}-$$"
+run_root="$run_base"
+run_suffix=0
+while [ -e "$run_root" ] || [ -L "$run_root" ]; do
+    run_suffix=$((run_suffix + 1))
+    [ "$run_suffix" -le 1024 ] || fail "run_root_collision_limit"
+    run_root="${run_base}-${run_suffix}"
+done
 workspace="$run_root/tgoskits"
 
-/musl/busybox mkdir -p "$run_root" || fail "mkdir_run_root"
+/musl/busybox mkdir -p "$runs_root" || fail "mkdir_runs_root"
+/musl/busybox mkdir "$run_root" || fail "mkdir_run_root"
 
 set -- $(/musl/busybox df -Pk /work | /musl/busybox tail -n 1)
 free_kib="$4"
@@ -153,6 +180,7 @@ echo probe >"$run_root/hardlink-source" || fail "create_hardlink_probe"
 /musl/busybox rm -f "$run_root/hardlink-source" "$run_root/hardlink-copy"
 
 echo "STARFIVE_BUILDSTORM_SAFE_PRECHECK ok run_root=$run_root free_kib=$free_kib free_inodes=$free_inodes"
+report_starfive_multiblock_write
 echo "STARFIVE_BUILDSTORM_SAFE_CLONE begin source=$source_workspace"
 /musl/busybox mkdir -p "$workspace" || fail "mkdir_workspace"
 for source_entry in \
@@ -254,6 +282,7 @@ fi
 echo "STARFIVE_BUILDSTORM_SAFE_CLONE ok workspace=$workspace"
 echo "STARFIVE_BUILDSTORM_SAFE_POLICY no_auto_cleanup=1 no_auto_reset_on_host_timeout=1"
 /musl/busybox sync
+dump_perf_snapshot before
 official_log="$run_root/buildstorm.official.out"
 official_status_file="$run_root/buildstorm.official.status"
 (
@@ -264,6 +293,7 @@ status=$(/musl/busybox cat "$official_status_file" 2>/dev/null)
 case "$status" in
     ''|*[!0-9]*) status=1 ;;
 esac
+dump_perf_snapshot after
 
 # The contestant-facing reference script prints ok=false but still exits zero.
 # Fail closed on its scoring records so the outer FINAL status cannot turn a

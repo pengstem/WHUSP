@@ -36,6 +36,18 @@ class StarFiveRustSmokeTests(unittest.TestCase):
         self.assertIn("/tmp/g0-rust-hello-perf.before", entry)
         self.assertIn("/tmp/g0-rust-hello-perf.after", entry)
 
+    def test_startup_multiblock_write_probe_check_is_opt_in(self) -> None:
+        stable = starfive_smoke.entry_script()
+        candidate = starfive_smoke.entry_script(probe_multiblock_write=True)
+
+        self.assertNotIn("STARFIVE_MMC_WRITE_AUTO_CHECK_BEGIN", stable)
+        self.assertIn(
+            'echo "STARFIVE_MMC_WRITE_AUTO_CHECK_BEGIN expected_blocks=64"', candidate
+        )
+        self.assertIn("/proc/oskernel/starfive_mmc_max_write_blocks", candidate)
+        self.assertNotIn('echo 64 > "$mmc_write_knob"', candidate)
+        self.assertIn("STARFIVE_MMC_WRITE_AUTO_CHECK_RESULT ok=true", candidate)
+
 
 if __name__ == "__main__":
     unittest.main()
