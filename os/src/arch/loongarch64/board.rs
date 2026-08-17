@@ -17,7 +17,12 @@ use virtio_drivers::transport::{
 
 const BLOCK_DEVICE_CAPACITY: usize = 8;
 const MMIO_REGION_CAPACITY: usize = 16;
+#[cfg(feature = "loongarch-board-2k1000")]
+const EARLY_UART_BASE: usize = 0x1fe2_0000;
+#[cfg(not(feature = "loongarch-board-2k1000"))]
 const EARLY_UART_BASE: usize = 0x1fe0_01e0;
+#[cfg(feature = "loongarch-board-2k1000")]
+const LOONGARCH_DMW0_UNCACHED: usize = 0x8000_0000_0000_0000;
 const FALLBACK_CLOCK_FREQ: usize = 100_000_000;
 const FALLBACK_PCI_ECAM_BASE: usize = 0x2000_0000;
 const FALLBACK_PCI_MEM_BASE: usize = 0x4000_0000;
@@ -64,6 +69,8 @@ pub struct PciDevice {
 pub enum BlockDeviceConfig {
     Mmio(IrqDevice),
     Pci(PciDevice),
+    #[cfg(feature = "loongarch-board-2k1000")]
+    Ahci(IrqDevice),
 }
 
 impl Default for BlockDeviceConfig {
@@ -264,6 +271,7 @@ fn push_block_device(config: &mut BoardConfig, value: BlockDeviceConfig) {
 }
 
 unsafe extern "C" {
+    safe fn skernel();
     safe fn ekernel();
 }
 
@@ -465,32 +473,46 @@ pub fn init_from_dtb(dtb_addr: usize, boot_hw_id: usize) {
     let mut config = BoardConfig::empty();
     config.clock_freq = cpu_timer_frequency(&fdt);
 
+    let kernel_start = crate::arch::loongarch64::mm::virt_to_phys(skernel as usize);
     let kernel_end = crate::arch::loongarch64::mm::virt_to_phys(ekernel as usize);
-    let mut memory_region = None;
+    let mut kernel_memory_end = None;
     for node in fdt.all_nodes() {
         let is_memory_node = property_str(node, "device_type") == Some("memory")
             || node.name.split('@').next() == Some("memory");
-        if !is_memory_node {
+        let memory_is_available = matches!(
+            property_str(node, "status"),
+            None | Some("okay") | Some("ok")
+        );
+        if !is_memory_node || !memory_is_available {
             continue;
         }
         if let Some(regions) = node.reg() {
             for region in regions {
-                let start = region.starting_address as usize;
-                let end = start + region.size.unwrap_or(0);
-                if kernel_end >= start && kernel_end < end {
-                    memory_region = Some(region);
-                    break;
+                let size = region
+                    .size
+                    .unwrap_or_else(|| panic!("memory node {} reg is missing size", node.name));
+                let start =
+                    crate::arch::loongarch64::mm::virt_to_phys(region.starting_address as usize);
+                let end = start.checked_add(size).unwrap_or_else(|| {
+                    panic!(
+                        "memory node {} range overflows: start={start:#x} size={size:#x}",
+                        node.name
+                    )
+                });
+                assert!(start < end, "memory node {} has an empty reg", node.name);
+                if kernel_start >= start && kernel_end <= end {
+                    assert!(
+                        kernel_memory_end.is_none(),
+                        "multiple DTB memory ranges contain the loaded kernel"
+                    );
+                    kernel_memory_end = Some(end);
                 }
             }
         }
-        if memory_region.is_some() {
-            break;
-        }
     }
-    let memory_region = memory_region
-        .unwrap_or_else(|| panic!("no memory region in DTB contains ekernel={:#x}", kernel_end));
-    config.memory_end =
-        phys_to_virt(memory_region.starting_address as usize + memory_region.size.unwrap_or(0));
+    config.memory_end = phys_to_virt(kernel_memory_end.unwrap_or_else(|| {
+        panic!("no memory region in DTB contains kernel={kernel_start:#x}..{kernel_end:#x}")
+    }));
 
     let uart_node = fdt
         .find_compatible(&["ns16550a"])
@@ -502,28 +524,56 @@ pub fn init_from_dtb(dtb_addr: usize, boot_hw_id: usize) {
     };
     push_mmio_region(&mut config, uart_range);
 
-    let eiointc_node = fdt
-        .find_compatible(&["loongson,ls2k2000-eiointc"])
-        .unwrap_or_else(|| panic!("DTB is missing LoongArch EIOINTC"));
-    config.eiointc_base = first_physical_reg(eiointc_node, "EIOINTC").base;
-    config.eiointc_irq = first_irq(eiointc_node, "EIOINTC");
+    #[cfg(feature = "loongarch-board-2k1000")]
+    {
+        let icu_node = fdt
+            .find_compatible(&["loongson,2k1000-icu"])
+            .unwrap_or_else(|| panic!("DTB is missing Loongson 2K1000 ICU"));
+        let icu = first_reg(icu_node, "2K1000 ICU");
+        push_mmio_region(&mut config, icu);
 
-    let pch_pic_node = fdt
-        .find_compatible(&["loongson,pch-pic-1.0"])
-        .unwrap_or_else(|| panic!("DTB is missing LoongArch PCH PIC"));
-    let pch_pic = first_reg(pch_pic_node, "PCH PIC");
-    config.pch_pic = pch_pic;
-    push_mmio_region(&mut config, pch_pic);
+        let ahci_node = fdt
+            .find_compatible(&["loongson,ls-ahci", "snps,spear-ahci"])
+            .unwrap_or_else(|| panic!("DTB is missing Loongson 2K1000 AHCI"));
+        let ahci = irq_device(ahci_node, "2K1000 AHCI");
+        push_mmio_region(
+            &mut config,
+            MmioRange {
+                base: ahci.base,
+                size: ahci.size,
+            },
+        );
+        push_block_device(&mut config, BlockDeviceConfig::Ahci(ahci));
+        info!(
+            "KERN: 2K1000 polling devices discovered: icu={:#x}, ahci={:#x}, irq={}",
+            icu.base, ahci.base, ahci.irq
+        );
+    }
+    #[cfg(not(feature = "loongarch-board-2k1000"))]
+    {
+        let eiointc_node = fdt
+            .find_compatible(&["loongson,ls2k2000-eiointc"])
+            .unwrap_or_else(|| panic!("DTB is missing LoongArch EIOINTC"));
+        config.eiointc_base = first_physical_reg(eiointc_node, "EIOINTC").base;
+        config.eiointc_irq = first_irq(eiointc_node, "EIOINTC");
 
-    if let Some(pci_node) = fdt.find_compatible(&["pci-host-ecam-generic"]) {
-        discover_pci_blocks(&mut config, pci_node);
-    } else {
-        warn!("DTB is missing PCI ECAM node; using QEMU fallback");
-        let ecam = MmioRange {
-            base: phys_to_virt(FALLBACK_PCI_ECAM_BASE),
-            size: Cam::Ecam.size() as usize,
-        };
-        push_mmio_region(&mut config, ecam);
+        let pch_pic_node = fdt
+            .find_compatible(&["loongson,pch-pic-1.0"])
+            .unwrap_or_else(|| panic!("DTB is missing LoongArch PCH PIC"));
+        let pch_pic = first_reg(pch_pic_node, "PCH PIC");
+        config.pch_pic = pch_pic;
+        push_mmio_region(&mut config, pch_pic);
+
+        if let Some(pci_node) = fdt.find_compatible(&["pci-host-ecam-generic"]) {
+            discover_pci_blocks(&mut config, pci_node);
+        } else {
+            warn!("DTB is missing PCI ECAM node; using QEMU fallback");
+            let ecam = MmioRange {
+                base: phys_to_virt(FALLBACK_PCI_ECAM_BASE),
+                size: Cam::Ecam.size() as usize,
+            };
+            push_mmio_region(&mut config, ecam);
+        }
     }
 
     if let Some(rtc_node) = fdt.find_compatible(&["loongson,ls7a-rtc"]) {
@@ -532,10 +582,16 @@ pub fn init_from_dtb(dtb_addr: usize, boot_hw_id: usize) {
         push_mmio_region(&mut config, rtc_range);
     }
 
-    assert_ne!(config.block_count, 0, "DTB is missing virtio block device");
+    assert_ne!(
+        config.block_count, 0,
+        "DTB is missing a supported block device"
+    );
     assert_ne!(config.uart.base, 0, "DTB is missing uart base");
-    assert_ne!(config.eiointc_base, 0, "DTB is missing EIOINTC base");
-    assert_ne!(config.pch_pic.base, 0, "DTB is missing PCH PIC base");
+    #[cfg(not(feature = "loongarch-board-2k1000"))]
+    {
+        assert_ne!(config.eiointc_base, 0, "DTB is missing EIOINTC base");
+        assert_ne!(config.pch_pic.base, 0, "DTB is missing PCH PIC base");
+    }
 
     BOARD_CONFIG.init(config);
 }
@@ -554,10 +610,18 @@ pub fn mmio_regions() -> &'static [MmioRange] {
 }
 
 pub fn uart_base() -> usize {
-    if BOARD_CONFIG.initialized.load(Ordering::Acquire) {
+    let base = if BOARD_CONFIG.initialized.load(Ordering::Acquire) {
         board_config().uart.base
     } else {
         phys_to_virt(EARLY_UART_BASE)
+    };
+    #[cfg(feature = "loongarch-board-2k1000")]
+    {
+        LOONGARCH_DMW0_UNCACHED | crate::arch::loongarch64::mm::virt_to_phys(base)
+    }
+    #[cfg(not(feature = "loongarch-board-2k1000"))]
+    {
+        base
     }
 }
 
@@ -596,6 +660,8 @@ pub fn block_irq_available() -> bool {
         && block_devices().iter().any(|device| match device {
             BlockDeviceConfig::Mmio(device) => device.irq != 0,
             BlockDeviceConfig::Pci(device) => device.irq != 0,
+            #[cfg(feature = "loongarch-board-2k1000")]
+            BlockDeviceConfig::Ahci(_) => false,
         })
 }
 
@@ -635,6 +701,14 @@ fn enable_external_irq(eiointc: irq::Eiointc, pch_pic: irq::PchPic, irq: usize) 
     pch_pic.enable(irq);
 }
 
+#[cfg(feature = "loongarch-board-2k1000")]
+pub fn device_init(_hart_id: usize) {
+    // The physical board uses its legacy cascaded ICU. AHCI completes
+    // synchronously and console input is polled during initial bring-up.
+    info!("KERN: 2K1000 external IRQs disabled; UART and AHCI use polling");
+}
+
+#[cfg(not(feature = "loongarch-board-2k1000"))]
 pub fn device_init(hart_id: usize) {
     let config = board_config();
     let owner_hardware_id = crate::cpu::external_irq_owner_hardware_id();
@@ -677,6 +751,12 @@ pub fn device_init(hart_id: usize) {
     );
 }
 
+#[cfg(feature = "loongarch-board-2k1000")]
+pub fn irq_handler() {
+    warn!("unexpected 2K1000 external interrupt while ICU delivery is disabled");
+}
+
+#[cfg(not(feature = "loongarch-board-2k1000"))]
 pub fn irq_handler() {
     let config = board_config();
     let eiointc = irq::Eiointc::new(config.eiointc_base);

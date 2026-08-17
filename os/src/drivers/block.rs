@@ -414,6 +414,10 @@ impl VirtIOBlock {
             BlockDeviceConfig::RamDisk { .. } => {
                 unreachable!("boot ramdisk cannot be constructed as VirtIO")
             }
+            #[cfg(all(target_arch = "loongarch64", feature = "loongarch-board-2k1000"))]
+            BlockDeviceConfig::Ahci(_) => {
+                unreachable!("LS2K1000 AHCI cannot be constructed as VirtIO")
+            }
         };
         let virtio_blk = VirtIOBlk::<VirtioHal, _>::new(transport).unwrap();
         let capacity_blocks = virtio_blk.capacity() as usize;
@@ -443,6 +447,8 @@ impl VirtIOBlock {
 
 pub enum KernelBlockDevice {
     VirtIo(VirtIOBlock),
+    #[cfg(all(target_arch = "loongarch64", feature = "loongarch-board-2k1000"))]
+    Ahci(crate::drivers::ahci::Ls2kAhciBlock),
     #[cfg(target_arch = "riscv64")]
     StarFiveMmc(crate::drivers::dw_mmc::Jh7110MmcBlock),
     #[cfg(target_arch = "riscv64")]
@@ -454,6 +460,10 @@ impl KernelBlockDevice {
         match device {
             BlockDeviceConfig::Mmio(_) | BlockDeviceConfig::Pci(_) => {
                 Self::VirtIo(VirtIOBlock::new(device))
+            }
+            #[cfg(all(target_arch = "loongarch64", feature = "loongarch-board-2k1000"))]
+            BlockDeviceConfig::Ahci(device) => {
+                Self::Ahci(crate::drivers::ahci::Ls2kAhciBlock::new(device))
             }
             #[cfg(target_arch = "riscv64")]
             BlockDeviceConfig::StarFiveMmc(device) => {
@@ -473,6 +483,8 @@ impl KernelBlockDevice {
     pub fn read_blocks(&self, block_id: usize, buf: &mut [u8]) {
         match self {
             Self::VirtIo(device) => device.read_blocks(block_id, buf),
+            #[cfg(all(target_arch = "loongarch64", feature = "loongarch-board-2k1000"))]
+            Self::Ahci(device) => device.read_blocks(block_id, buf),
             #[cfg(target_arch = "riscv64")]
             Self::StarFiveMmc(device) => device.read_blocks(block_id, buf),
             #[cfg(target_arch = "riscv64")]
@@ -487,6 +499,8 @@ impl KernelBlockDevice {
     pub fn write_blocks(&self, block_id: usize, buf: &[u8]) {
         match self {
             Self::VirtIo(device) => device.write_blocks(block_id, buf),
+            #[cfg(all(target_arch = "loongarch64", feature = "loongarch-board-2k1000"))]
+            Self::Ahci(device) => device.write_blocks(block_id, buf),
             #[cfg(target_arch = "riscv64")]
             Self::StarFiveMmc(device) => device.write_blocks(block_id, buf),
             #[cfg(target_arch = "riscv64")]
@@ -501,6 +515,8 @@ impl KernelBlockDevice {
     ) -> block_cache::VersionedReadStats {
         match self {
             Self::VirtIo(device) => device.read_blocks_versioned_fill_for_file_plan(block_id, buf),
+            #[cfg(all(target_arch = "loongarch64", feature = "loongarch-board-2k1000"))]
+            Self::Ahci(device) => device.read_blocks_versioned_fill_for_file_plan(block_id, buf),
             #[cfg(target_arch = "riscv64")]
             Self::StarFiveMmc(device) => {
                 device.read_blocks_versioned_fill_for_file_plan(block_id, buf)
@@ -517,6 +533,8 @@ impl KernelBlockDevice {
     ) -> block_cache::WriteStats {
         match self {
             Self::VirtIo(device) => device.write_blocks_for_file_plan(block_id, buf),
+            #[cfg(all(target_arch = "loongarch64", feature = "loongarch-board-2k1000"))]
+            Self::Ahci(device) => device.write_blocks_for_file_plan(block_id, buf),
             #[cfg(target_arch = "riscv64")]
             Self::StarFiveMmc(device) => device.write_blocks_for_file_plan(block_id, buf),
             #[cfg(target_arch = "riscv64")]
@@ -527,6 +545,8 @@ impl KernelBlockDevice {
     pub fn num_blocks(&self) -> u64 {
         match self {
             Self::VirtIo(device) => device.num_blocks(),
+            #[cfg(all(target_arch = "loongarch64", feature = "loongarch-board-2k1000"))]
+            Self::Ahci(device) => device.num_blocks(),
             #[cfg(target_arch = "riscv64")]
             Self::StarFiveMmc(device) => device.num_blocks(),
             #[cfg(target_arch = "riscv64")]
@@ -553,6 +573,8 @@ impl KernelBlockDevice {
     pub fn irq(&self) -> usize {
         match self {
             Self::VirtIo(device) => device.irq(),
+            #[cfg(all(target_arch = "loongarch64", feature = "loongarch-board-2k1000"))]
+            Self::Ahci(device) => device.irq(),
             #[cfg(target_arch = "riscv64")]
             Self::StarFiveMmc(_) | Self::RamDisk(_) => 0,
         }
@@ -561,6 +583,8 @@ impl KernelBlockDevice {
     pub fn base_addr(&self) -> usize {
         match self {
             Self::VirtIo(device) => device.base_addr(),
+            #[cfg(all(target_arch = "loongarch64", feature = "loongarch-board-2k1000"))]
+            Self::Ahci(device) => device.base_addr(),
             #[cfg(target_arch = "riscv64")]
             Self::StarFiveMmc(device) => device.base_addr(),
             #[cfg(target_arch = "riscv64")]
@@ -571,6 +595,8 @@ impl KernelBlockDevice {
     fn handle_irq(&self) {
         match self {
             Self::VirtIo(device) => device.handle_irq(),
+            #[cfg(all(target_arch = "loongarch64", feature = "loongarch-board-2k1000"))]
+            Self::Ahci(_) => {}
             #[cfg(target_arch = "riscv64")]
             Self::StarFiveMmc(_) | Self::RamDisk(_) => {}
         }
@@ -580,6 +606,8 @@ impl KernelBlockDevice {
     fn poll_completion(&self) {
         match self {
             Self::VirtIo(device) => device.poll_completion(),
+            #[cfg(feature = "loongarch-board-2k1000")]
+            Self::Ahci(_) => {}
         }
     }
 }

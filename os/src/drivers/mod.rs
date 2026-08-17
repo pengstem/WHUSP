@@ -1,3 +1,5 @@
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch-board-2k1000"))]
+pub mod ahci;
 pub mod block;
 pub(crate) mod block_cache;
 pub mod chardev;

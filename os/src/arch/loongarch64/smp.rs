@@ -48,8 +48,20 @@ pub fn start_secondary(_logical_id: CpuId, hardware_id: usize) -> Result<(), usi
     unsafe extern "C" {
         safe fn secondary_entry();
     }
+    // The LS2K1000 U-Boot slave loop loads mailbox 0 and jumps to it as an
+    // already-mapped address.  It does not convert a physical address to the
+    // cached DMW1 alias, so the board must publish the linked DMW1 address.
+    // QEMU's parked AP firmware instead consumes the low physical address.
+    #[cfg(feature = "loongarch-board-2k1000")]
+    let entry = secondary_entry as usize as u64;
+    #[cfg(not(feature = "loongarch-board-2k1000"))]
     let entry = crate::arch::loongarch64::mm::virt_to_phys(secondary_entry as usize) as u64;
+
+    // Publish the early topology before the AP can observe the entry point,
+    // then order the completed mailbox writes before the boot IPI.
+    crate::arch::mm::memory_barrier();
     csr_mail_send(entry, hardware_id, BOOT_MAILBOX);
+    crate::arch::mm::memory_barrier();
     send_ipi_single(hardware_id, BOOT_IPI_ACTION);
     Ok(())
 }

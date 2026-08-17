@@ -33,7 +33,8 @@ high_entry:
     slli.d      $t0, $t0, BOOT_STACK_SHIFT
     add.d       $sp, $sp, $t0
     csrrd       $a0, 0x20
-    li.d        $a1, 0x9000000000100000
+    la.global   $t0, LOONGARCH_BOOT_DTB_ADDRESS
+    ld.d        $a1, $t0, 0
     la.global   $t0, rust_main
     jirl        $zero, $t0, 0
 

@@ -1,4 +1,6 @@
 mod context;
+mod unaligned;
+mod unaligned_decode;
 
 use crate::arch::interrupt::{disable_supervisor_interrupt, enable_supervisor_interrupt};
 use crate::config::{MAX_CPUS, TRAMPOLINE};
@@ -224,6 +226,27 @@ pub fn trap_handler() -> ! {
         Trap::Exception(Exception::InstructionNotExist)
         | Trap::Exception(Exception::InstructionPrivilegeIllegal) => {
             current_add_signal(SignalFlags::SIGILL);
+        }
+        Trap::Exception(Exception::AddressNotAligned) => {
+            // The 2K1000 has no hardware unaligned-access support. Match the
+            // bounded scalar integer subset handled by Linux for userspace.
+            let registers = trap_cx_of_task(&task).x;
+            enable_supervisor_interrupt();
+            match unaligned::emulate_user_unaligned(trap_pc, badv, &registers) {
+                unaligned::UserUnalignedOutcome::Emulated { register_write } => {
+                    unaligned::finish_user_unaligned(
+                        trap_cx_of_task(&task),
+                        trap_pc,
+                        register_write,
+                    );
+                }
+                unaligned::UserUnalignedOutcome::Segv => {
+                    current_add_signal(SignalFlags::SIGSEGV);
+                }
+                unaligned::UserUnalignedOutcome::Bus => {
+                    current_add_signal(SignalFlags::SIGBUS);
+                }
+            }
         }
         Trap::Exception(Exception::FloatingPointUnavailable) => {
             if !activate_user_fp_for_task(&task, UserFpMode::Scalar) {

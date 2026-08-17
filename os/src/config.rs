@@ -16,7 +16,25 @@ pub const KERNEL_STACK_SIZE: usize = 64 * 1024;
 pub const MAX_CPUS: usize = 12;
 pub const BOOT_STACK_SIZE: usize = 4096 * 16;
 
+// The 2K1000LA board has 1 GiB of RAM split across two physical banks. Keep
+// enough space for userspace and the page cache instead of reserving half of
+// the machine for the kernel heap as the larger contest QEMU configuration
+// does.
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch-board-2k1000"))]
+pub const KERNEL_HEAP_SIZE: usize = 128 * 1024 * 1024;
+#[cfg(not(all(target_arch = "loongarch64", feature = "loongarch-board-2k1000")))]
 pub const KERNEL_HEAP_SIZE: usize = 512 * 1024 * 1024;
+
+// U-Boot places the board DTB at this cached DMW address before bootelf. QEMU
+// retains its existing fixed DTB address when the board feature is disabled.
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch-board-2k1000"))]
+#[used]
+#[unsafe(no_mangle)]
+pub static LOONGARCH_BOOT_DTB_ADDRESS: usize = 0x9000_0000_0a00_0000;
+#[cfg(all(target_arch = "loongarch64", not(feature = "loongarch-board-2k1000")))]
+#[used]
+#[unsafe(no_mangle)]
+pub static LOONGARCH_BOOT_DTB_ADDRESS: usize = 0x9000_0000_0010_0000;
 
 pub const PAGE_SIZE: usize = 0x1000;
 pub const PAGE_SIZE_BITS: usize = 0xc;
