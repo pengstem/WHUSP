@@ -455,6 +455,8 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 {
 	int r;
 	struct ext4_sblock *sb = &parent->fs->sb;
+	bool is_dot_entry = name_len == 1 && name[0] == '.';
+	bool is_dotdot_entry = name_len == 2 && name[0] == '.' && name[1] == '.';
 
 	/* Entry clear */
 	result->block.lb_id = 0;
@@ -462,7 +464,9 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 
 #if CONFIG_DIR_INDEX_ENABLE
 	/* Index search */
-	if ((ext4_sb_feature_com(sb, EXT4_FCOM_DIR_INDEX)) &&
+	/* Indexed roots keep "." and ".." before the hashed leaf entries. */
+	if (!is_dot_entry && !is_dotdot_entry &&
+	    (ext4_sb_feature_com(sb, EXT4_FCOM_DIR_INDEX)) &&
 	    (ext4_inode_has_flag(parent->inode, EXT4_INODE_FLAG_INDEX))) {
 		r = ext4_dir_dx_find_entry(result, parent, name_len, name);
 		/* Check if index is not corrupted */
